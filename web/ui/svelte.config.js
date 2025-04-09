@@ -16,7 +16,10 @@ const config = {
 			fallback: undefined,
 			precompress: false,
 			strict: true
-		})
+		}),
+		alias: {
+			$lib: 'src/lib',
+		}
 	},
 	compilerOptions: {
     // disable all warnings coming from node_modules and all accessibility warnings

@@ -17,7 +17,7 @@ import (
 	"go.uber.org/zap"
 )
 
-const downUrlTpl = "https://github.com/banbox/banbot/releases/download/v{tag}/dist.zip"
+const downUrlTpl = "https://github.com/banbox/banbot/releases/download/{tag}/dist.zip"
 
 func ServeStatic(app *fiber.App) error {
 	uiDistDir := filepath.Join(config.GetDataDir(), "uidist")

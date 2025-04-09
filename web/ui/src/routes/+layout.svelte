@@ -1,10 +1,12 @@
 <script lang="ts">
 	import { alerts } from '$lib/stores/alerts';
+	import { page } from '$app/state';
 	import Alert from '$lib/Alert.svelte';
 	import Modal from '$lib/kline/Modal.svelte';
 	import { modals } from '$lib/stores/modals';
 	import { setTimezone } from '$lib/dateutil';
 	import {site} from '$lib/stores/site';
+	import {locales, localizeHref} from "$lib/paraglide/runtime";
 	import "../style.css";
 
 	let { children } = $props();
@@ -28,6 +30,13 @@
 		click={(tag) => modal.resolve(tag)}>{@html modal.text}</Modal>
 {/each}
 {@render children()}
+
+<!--for Static site generation (SSG)-->
+<div style="display:none">
+	{#each locales as locale}
+		<a href={localizeHref(page.url.pathname, { locale })}>{locale}</a>
+	{/each}
+</div>
 
 <style global>
   .alerts-container {

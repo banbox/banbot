@@ -68,7 +68,7 @@ func Run(args []string) error {
 	}
 	core.DevDbPath = ag.DBFile
 	var err2 *errs.Error
-	if err2 = biz.SetupComs(banArg); err2 != nil {
+	if err2 = biz.SetupComsExg(banArg); err2 != nil {
 		return err2
 	}
 	err_ = collectBtResults()

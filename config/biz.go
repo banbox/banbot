@@ -55,11 +55,11 @@ func GetStratDir() string {
 }
 
 func getEnvPath(key string) string {
-	absPath, err := filepath.Abs(os.Getenv(key))
+	absPath, err := filepath.Abs(strings.TrimSpace(os.Getenv(key)))
 	if err != nil {
 		panic(err)
 	}
-	return absPath
+	return strings.TrimSpace(absPath)
 }
 
 func LoadConfig(args *CmdArgs) *errs.Error {

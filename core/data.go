@@ -43,8 +43,8 @@ var (
 	MemProfile bool
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "0.2.8"
-	UIVersion = "0.2.7"
+	Version   = "v0.2.10-beta.3"
+	UIVersion = "v0.2.10-beta.3"
 	LogFile   string
 	DevDbPath string
 )
