@@ -572,7 +572,9 @@ func simMarketPrice(bar *banexg.Kline, rate float64) float64 {
 	highP := bar.High
 	lowP := bar.Low
 	closeP := bar.Close
-
+	if rate == 0 {
+		return openP
+	}
 	if rate >= 0.999 {
 		return closeP
 	}
@@ -584,7 +586,7 @@ func simMarketPrice(bar *banexg.Kline, rate float64) float64 {
 		b = highP - lowP
 		c = highP - closeP
 		totalLen = a + b + c
-		if totalLen == 0 {
+		if totalLen == 0 || a == 0 || (b == 0 && c == 0){
 			return closeP
 		}
 		aEndRate = a / totalLen
@@ -603,7 +605,7 @@ func simMarketPrice(bar *banexg.Kline, rate float64) float64 {
 		b = highP - lowP
 		c = closeP - lowP
 		totalLen = a + b + c
-		if totalLen == 0 {
+		if totalLen == 0 || a == 0 || (b == 0 && c == 0) {
 			return closeP
 		}
 		aEndRate = a / totalLen
