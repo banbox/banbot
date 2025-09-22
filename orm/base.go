@@ -321,11 +321,23 @@ func InitExg(exchange banexg.BanExchange) *errs.Error {
 	if err != nil {
 		return err
 	}
+	lastAcc, validAcc := "", ""
+	for name, acc := range config.Accounts {
+		if !acc.NoTrade {
+			validAcc = name
+		}
+		lastAcc = name
+	}
+	if validAcc == "" {
+		validAcc = lastAcc
+	}
 	marketType := exchange.Info().MarketType
 	if marketType == banexg.MarketLinear || marketType == banexg.MarketInverse {
-		err = exchange.LoadLeverageBrackets(false, nil)
+		err = exchange.LoadLeverageBrackets(false, map[string]interface{}{
+			banexg.ParamAccount: validAcc,
+		})
 		if err != nil {
-			log.Warn("LoadLeverageBrackets fail, skip, maint margin calculation may have large deviation",
+			log.Error("LoadLeverageBrackets fail, skip, maint margin calculation may have large deviation",
 				zap.String("err", err.Short()))
 			err = exchange.InitLeverageBrackets()
 			if err != nil {

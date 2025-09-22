@@ -986,6 +986,7 @@ func (c *RunPolicyConfig) Clone() *RunPolicyConfig {
 		Pairs:         c.Pairs,
 		Params:        make(map[string]float64),
 		PairParams:    make(map[string]map[string]float64),
+		More:          make(map[string]interface{}),
 		defs:          make(map[string]*core.Param),
 	}
 	if len(c.Params) > 0 {
@@ -1000,6 +1001,11 @@ func (c *RunPolicyConfig) Clone() *RunPolicyConfig {
 				pairPms[k2] = v
 			}
 			res.PairParams[k] = pairPms
+		}
+	}
+	if len(c.More) > 0 {
+		for k, v := range c.More {
+			res.More[k] = v
 		}
 	}
 	if len(c.defs) > 0 {

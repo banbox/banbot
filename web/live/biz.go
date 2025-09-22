@@ -344,7 +344,7 @@ func getOrders(c *fiber.Ctx) error {
 			symbols = strings.Split(data.Symbols, ",")
 		}
 		var status = 0
-		if data.Status == "open" {
+		if data.Status == "open" || data.Status == "wait" {
 			status = 1
 		} else if data.Status == "his" {
 			status = 2
@@ -373,7 +373,18 @@ func getOrders(c *fiber.Ctx) error {
 			return err
 		}
 		odList := make([]*OdWrap, 0, len(orders))
+		minStatus, maxStatus := int64(ormo.InOutStatusInit), int64(ormo.InOutStatusDelete)
+		if data.Status == "open" {
+			minStatus = ormo.InOutStatusPartEnter
+			maxStatus = ormo.InOutStatusPartExit
+		} else if data.Status == "wait" {
+			minStatus = ormo.InOutStatusInit
+			maxStatus = ormo.InOutStatusInit
+		}
 		for _, od := range orders {
+			if od.Status < minStatus || od.Status > maxStatus {
+				continue
+			}
 			price := float64(0)
 			if od.ExitTag != "" && od.Exit != nil && od.Exit.Price > 0 {
 				price = od.Exit.Price

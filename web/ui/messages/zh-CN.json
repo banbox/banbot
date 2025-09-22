@@ -268,6 +268,7 @@
   "open": "打开",
   "load": "加载",
   "any_status": "不限状态",
+  "pos_empty": "尚未入场",
   "pos_opened": "已开仓",
   "filled": "已成交",
   "closed": "已退出",

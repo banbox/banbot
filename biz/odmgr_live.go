@@ -1484,7 +1484,7 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 	if err != nil {
 		msg := "submit order fail, local exit"
 		log.Error(msg, zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
-		err = od.LocalExit(0, core.ExitTagFatalErr, od.InitPrice, msg, "")
+		err = od.LocalExit(0, core.ExitTagFatalErr, od.InitPrice, err.Short(), "")
 		strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 		if err != nil {
 			log.Error("local exit order fail", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
@@ -1495,7 +1495,9 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 
 func (o *LiveOrderMgr) forceDelOd(od *ormo.InOutOrder, err *errs.Error) {
 	odKey := od.Key()
-	log.Error("del enter order", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
+	if err != nil {
+		log.Error("del order", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
+	}
 	sess, conn, err := ormo.Conn(orm.DbTrades, true)
 	if err != nil {
 		log.Error("get db sess fail", zap.String("acc", o.Account), zap.Error(err))
@@ -1583,7 +1585,13 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	exchange := exg.Default
 	leverage, maxLeverage := exg.GetLeverage(od.Symbol, od.QuoteCost, o.Account)
 	if isEnter && od.Leverage > 0 && od.Leverage != leverage {
-		newLeverage := min(maxLeverage, od.Leverage)
+		newLeverage := od.Leverage
+		if maxLeverage >= 1 {
+			newLeverage = min(maxLeverage, od.Leverage)
+		} else {
+			log.Warn("get symbol leverage fail", zap.String("pair", od.Symbol),
+				zap.Float64("cur", leverage), zap.Float64("max", maxLeverage))
+		}
 		if newLeverage != leverage {
 			_, err = exchange.SetLeverage(newLeverage, od.Symbol, map[string]interface{}{
 				banexg.ParamAccount: o.Account,
@@ -1659,6 +1667,10 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		} else {
 			params[banexg.ParamTakeProfitPrice] = od.Stop
 		}
+	}
+	retryNum := od.GetInfoInt64(ormo.OdInfoRetry)
+	if retryNum > 0 {
+		params[banexg.ParamRetry] = int(retryNum)
 	}
 	res, err := exchange.CreateOrder(od.Symbol, subOd.OrderType, side, amount, price, params)
 	if err != nil {
@@ -1973,6 +1985,8 @@ func isFarLimitTrigger(pair, side string, price float64) bool {
 	return true
 }
 
+var verifyTriggersLock deadlock.Mutex
+
 /*
 VerifyTriggerOds
 Check if there is a triggerable limit order. If so, submit it to the exchange and it should be called every minute.
@@ -1981,6 +1995,10 @@ Only for real trading
 仅实盘使用
 */
 func VerifyTriggerOds() {
+	if !verifyTriggersLock.TryLock() {
+		return
+	}
+	defer verifyTriggersLock.Unlock()
 	for account := range config.Accounts {
 		verifyAccountTriggerOds(account)
 	}
@@ -2027,7 +2045,14 @@ func verifyAccountTriggerOds(account string) {
 			continue
 		}
 		var leftOds = make(map[int64]*ormo.InOutOrder)
+		var viewKeys = make(map[string]bool)
 		for _, od := range ods {
+			odKey := od.Key()
+			if _, ok := viewKeys[odKey]; ok {
+				log.Error("duplicate order in triggers", zap.String("acc", account), zap.String("key", odKey))
+				continue
+			}
+			viewKeys[odKey] = true
 			if od.Status >= ormo.InOutStatusFullExit {
 				continue
 			}
@@ -2247,6 +2272,10 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 	amt := od.Enter.Amount
 	if tg.Rate > 0 && tg.Rate < 1 {
 		amt *= tg.Rate
+	}
+	retryNum := od.GetInfoInt64(ormo.OdInfoRetry)
+	if retryNum > 0 {
+		params[banexg.ParamRetry] = int(retryNum)
 	}
 	log.Debug("set trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
 		zap.Float64("amt", od.Enter.Amount), zap.Float64("qmt", amt),

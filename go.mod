@@ -9,7 +9,7 @@ go 1.23.0
 
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
-	github.com/banbox/banexg v0.2.34-beta.8
+	github.com/banbox/banexg v0.2.34-beta.10
 	github.com/banbox/banta v0.3.4
 	github.com/c-bata/goptuna v0.9.0
 	github.com/dgraph-io/ristretto v0.2.0
@@ -35,6 +35,7 @@ require (
 	github.com/flopp/go-findfont v0.1.0
 	github.com/fogleman/gg v1.3.0
 	github.com/go-playground/validator/v10 v10.27.0
+	github.com/go-telegram/bot v1.17.0
 	github.com/go-viper/mapstructure/v2 v2.4.0
 	github.com/gofiber/contrib/websocket v1.3.4
 	github.com/gofiber/fiber/v2 v2.52.9
@@ -62,8 +63,6 @@ require (
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
-	github.com/go-telegram/bot v1.17.0 // indirect
-	github.com/go-telegram/ui v0.5.1 // indirect
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
 	github.com/google/pprof v0.0.0-20250317173921-a4b03ec1a45e // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect

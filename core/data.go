@@ -48,8 +48,8 @@ var (
 	NewNumInSim   int  // 撮合时创建新订单的数量
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.2.23-beta.2"
-	UIVersion = "v0.2.22"
+	Version   = "v0.2.23-beta.3"
+	UIVersion = "v0.2.23-beta.3"
 	SysLang   string // language code for current system 当前系统语言设置
 	LogFile   string
 	DevDbPath string

@@ -297,6 +297,7 @@
         {#if tabName === 'bot'}
           <select class="select select-sm focus:outline-none text-sm w-24" bind:value={search.status}>
             <option value="">{m.any_status()}</option>
+            <option value="wait">{m.pos_empty()}</option>
             <option value="open">{m.pos_opened()}</option>
             <option value="his">{m.closed()}</option>
           </select>

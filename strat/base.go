@@ -315,7 +315,9 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	if !s.IsWarmUp {
 		s.Entrys = append(s.Entrys, req)
 		s.OrderNum += 1
-		log.Info("OpenOrder", req.GetZapFields(s)...)
+		if core.LiveMode {
+			log.Info("OpenOrder", req.GetZapFields(s)...)
+		}
 	}
 	return nil
 }
@@ -414,7 +416,9 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 	}
 	if !s.IsWarmUp {
 		s.Exits = append(s.Exits, req)
-		log.Info("CloseOrders", req.GetZapFields(s)...)
+		if core.LiveMode {
+			log.Info("CloseOrders", req.GetZapFields(s)...)
+		}
 	}
 	return nil
 }
