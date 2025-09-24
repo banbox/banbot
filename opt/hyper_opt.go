@@ -374,7 +374,7 @@ func sortOptLogs(path string) {
 	reg := regexp.MustCompile(`^loss:\s*(-?\d+\.\d+)`)
 	lines := utils.SplitLines(string(content))
 	lines = append(lines, "") // 确保末尾是loss行也能触发排序
-	var lossLines []*core.FloatText
+	var lossLines []*core.StrFloat
 	inLossArea := false
 	var result = make([]string, 0, len(lines))
 	for _, line := range lines {
@@ -383,9 +383,9 @@ func sortOptLogs(path string) {
 			if len(matches) > 1 {
 				lossVal, err_ := strconv.ParseFloat(matches[1], 64)
 				if err_ == nil {
-					lossLines = append(lossLines, &core.FloatText{
-						Text: line,
-						Val:  lossVal,
+					lossLines = append(lossLines, &core.StrFloat{
+						Str: line,
+						Val: lossVal,
 					})
 					if !inLossArea {
 						inLossArea = true
@@ -400,7 +400,7 @@ func sortOptLogs(path string) {
 				return lossLines[i].Val < lossLines[j].Val
 			})
 			for _, it := range lossLines {
-				result = append(result, it.Text)
+				result = append(result, it.Str)
 			}
 			lossLines = nil
 		}
