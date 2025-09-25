@@ -76,7 +76,10 @@ func RunBTOverOpt(args *config.CmdArgs) *errs.Error {
 		t.dateRange.StartMS = t.curMs
 		t.dateRange.EndMS = t.curMs + t.runMSecs
 		outDir := filepath.Join(t.outDir, args.Picker)
-		bt := NewBackTest(false, outDir)
+		bt, err := NewBackTest(false, outDir)
+		if err != nil {
+			return err
+		}
 		if lastWal != nil {
 			wallets.SetWallets(lastWal)
 		}
@@ -147,7 +150,10 @@ func RunRollBTPicker(args *config.CmdArgs) *errs.Error {
 			core.BotRunning = true
 			t.dateRange.StartMS = t.curMs
 			t.dateRange.EndMS = t.curMs + t.runMSecs
-			bt := NewBackTest(true, "")
+			bt, err := NewBackTest(true, "")
+			if err != nil {
+				return err
+			}
 			bt.Run()
 			score := bt.Score()
 			scores = append(scores, score)
@@ -607,7 +613,10 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 func runBTOnce() (*BackTest, float64) {
 	core.BotRunning = true
 	biz.ResetVars()
-	bt := NewBackTest(true, "")
+	bt, err := NewBackTest(true, "")
+	if err != nil {
+		panic(err)
+	}
 	bt.Run()
 	var loss = -bt.Score()
 	return bt, loss

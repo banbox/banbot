@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/banbox/banbot/strat"
 	"github.com/sasha-s/go-deadlock"
+	"maps"
 	"math"
 	"sort"
 
@@ -166,10 +167,13 @@ type HistProvider struct {
 	getEnd    FnGetInt64
 	maxTfSecs int
 	pBar      *utils.StagedPrg
+
+	wsLoader *WsDataLoader
+	trades   map[string]*TradeFeeder
 }
 
 func NewHistProvider(callBack FnPairKline, envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) *HistProvider {
-	return &HistProvider{
+	p := &HistProvider{
 		Provider: Provider[IHistKlineFeeder]{
 			holders: make(map[string]IHistKlineFeeder),
 			newFeeder: func(pair string, tfs []string) (IHistKlineFeeder, *errs.Error) {
@@ -190,7 +194,10 @@ func NewHistProvider(callBack FnPairKline, envEnd FuncEnvEnd, getEnd FnGetInt64,
 		},
 		getEnd: getEnd,
 		pBar:   pBar,
+		trades: make(map[string]*TradeFeeder),
 	}
+
+	return p
 }
 
 func (p *HistProvider) downIfNeed() *errs.Error {
@@ -259,6 +266,35 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 		sta := staArr[0]
 		hold.SetSeek(sta.SubNextMS)
 	}
+	// 初始化高频数据订阅
+	pairJobs, _ := strat.WsSubJobs[core.WsSubTrade]
+	if len(pairJobs) > 0 {
+		if p.wsLoader == nil {
+			p.wsLoader, err = NewWsDataLoader()
+			if err != nil {
+				return err
+			}
+		}
+		curMS := btime.TimeMS()
+		tradeMap := maps.Clone(p.trades)
+		for pair := range pairJobs {
+			delete(tradeMap, pair)
+			if _, ok := p.trades[pair]; ok {
+				continue
+			}
+			exs, err := orm.GetExSymbolCur(pair)
+			if err != nil {
+				return err
+			}
+			feed := NewTradeFeeder(exs, p.wsLoader)
+			feed.SetSeek(curMS)
+			p.trades[pair] = feed
+		}
+		// 删除不再使用的
+		for pair := range tradeMap {
+			delete(p.trades, pair)
+		}
+	}
 	// Delete items that are not warmed up
 	// 删除未预热的项
 	p.holders = holders
@@ -268,6 +304,9 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 		endMs := p.getEnd() + int64(p.maxTfSecs*1000*3)
 		endMs = min(endMs, config.TimeRange.EndMS)
 		for _, h := range holders {
+			h.SetEndMS(endMs)
+		}
+		for _, h := range p.trades {
 			h.SetEndMS(endMs)
 		}
 	}
@@ -289,8 +328,17 @@ func (p *HistProvider) LoopMain() *errs.Error {
 	if len(p.holders) == 0 {
 		return errs.NewMsg(core.ErrBadConfig, "no pairs to run")
 	}
-	makeFeeders := func() []IHistKlineFeeder {
-		return utils.ValsOfMap(p.holders)
+	makeFeeders := func() []IHistFeeder {
+		var feeders []IHistFeeder
+
+		for _, klineFeeder := range p.holders {
+			feeders = append(feeders, klineFeeder)
+		}
+		for _, tf := range p.trades {
+			feeders = append(feeders, tf)
+		}
+
+		return feeders
 	}
 	totalMS := (config.TimeRange.EndMS - config.TimeRange.StartMS) / 1000
 	var pBar = utils.NewPrgBar(int(totalMS), "RunHist")
@@ -328,11 +376,11 @@ versions: When an integer greater than the previous value is received, makeFeede
 
 pBar: optional, used to display a progress bar
 */
-func RunHistFeeders(makeFeeders func() []IHistKlineFeeder, versions chan int, pBar *utils.PrgBar) *errs.Error {
-	var hold IHistKlineFeeder
+func RunHistFeeders(makeFeeders func() []IHistFeeder, versions chan int, pBar *utils.PrgBar) *errs.Error {
+	var hold IHistFeeder
 	var lastBarMs int64
 	var oldVer int
-	var holds []IHistKlineFeeder
+	var holds []IHistFeeder
 	var firstInit = true
 	for {
 		var ver = 0
@@ -353,13 +401,14 @@ func RunHistFeeders(makeFeeders func() []IHistKlineFeeder, versions chan int, pB
 			holds = SortFeeders(holds, hold, true)
 		}
 		hold = holds[0]
-		bar := hold.GetBar()
-		if bar == nil {
+		batch := hold.GetBatch()
+		if batch == nil {
 			break
 		}
 		hold.CallNext()
 		holds = holds[1:]
-		if bar.Time > lastBarMs {
+		batchTime := batch.TimeMS()
+		if batchTime > lastBarMs {
 			// 更新进度条
 			if pBar != nil {
 				curMS := btime.TimeMS()
@@ -373,10 +422,10 @@ func RunHistFeeders(makeFeeders func() []IHistKlineFeeder, versions chan int, pB
 					}
 				}
 			}
-			lastBarMs = bar.Time
+			lastBarMs = batchTime
 		}
 		// 这里不要使用多个goroutine加速，反而更慢，且导致多次回测结果略微差异
-		err := hold.RunBar(bar)
+		err := hold.RunBatch(batch)
 		if err != nil {
 			return err
 		}
@@ -384,7 +433,7 @@ func RunHistFeeders(makeFeeders func() []IHistKlineFeeder, versions chan int, pB
 	return nil
 }
 
-func SortFeeders(holds []IHistKlineFeeder, hold IHistKlineFeeder, insert bool) []IHistKlineFeeder {
+func SortFeeders(holds []IHistFeeder, hold IHistFeeder, insert bool) []IHistFeeder {
 	if insert {
 		// 插入排序，说明holds已有序，二分查找位置，最快排序
 		vb := hold.getNextMS()
