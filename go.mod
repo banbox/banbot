@@ -4,12 +4,12 @@ go 1.23.0
 
 //replace (
 //	github.com/banbox/banexg => ../banexg
-//	github.com/banbox/banta => ../banta
+//github.com/banbox/banta => ../banta
 //)
 
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
-	github.com/banbox/banexg v0.2.34-beta.10
+	github.com/banbox/banexg v0.2.34-beta.11
 	github.com/banbox/banta v0.3.4
 	github.com/c-bata/goptuna v0.9.0
 	github.com/dgraph-io/ristretto v0.2.0

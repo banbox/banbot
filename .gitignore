@@ -28,3 +28,6 @@ go.work
 banbot
 bot
 banbot.o
+.claude
+.zed
+bot
