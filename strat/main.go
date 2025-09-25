@@ -575,16 +575,19 @@ func regWsJob(j *StratJob) *errs.Error {
 			WsSubJobs[msgType] = pairMap
 		}
 		pairArr := strings.Split(subPairs, ",")
-		for _, p := range pairArr {
-			if p == "_cur_" || p == "" {
-				p = j.Symbol.Symbol
+		for _, pairs := range pairArr {
+			if pairs == "_cur_" || pairs == "" {
+				pairs = j.Symbol.Symbol
 			}
-			jobMap, ok := pairMap[p]
-			if !ok {
-				jobMap = make(map[*StratJob]bool)
-				pairMap[p] = jobMap
+			arr := strings.Split(pairs, ",")
+			for _, p := range arr {
+				jobMap, ok := pairMap[p]
+				if !ok {
+					jobMap = make(map[*StratJob]bool)
+					pairMap[p] = jobMap
+				}
+				jobMap[j] = true
 			}
-			jobMap[j] = true
 		}
 	}
 	return nil

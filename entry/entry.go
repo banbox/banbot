@@ -44,22 +44,29 @@ func RunBackTest(args *config.CmdArgs) *errs.Error {
 			if err != nil {
 				return err
 			}
-			outDir := runBackTest(fmt.Sprintf("%s%d", args.OutPath, i+1), "")
+			outDir, err := runBackTest(fmt.Sprintf("%s%d", args.OutPath, i+1), "")
+			if err != nil {
+				return err
+			}
 			err_ := utils.CopyDir(outDir, fmt.Sprintf("%s_%d", outDir, i+1))
 			if err_ != nil {
 				return errs.New(errs.CodeIOWriteFail, err_)
 			}
 		}
 	} else {
-		runBackTest(args.OutPath, args.PrgOut)
+		_, err = runBackTest(args.OutPath, args.PrgOut)
+		return err
 	}
 	return nil
 }
 
-func runBackTest(outDir string, prgOut string) string {
+func runBackTest(outDir string, prgOut string) (string, *errs.Error) {
 	core.BotRunning = true
 	biz.ResetVars()
-	b := opt.NewBackTest(false, outDir)
+	b, err := opt.NewBackTest(false, outDir)
+	if err != nil {
+		return "", err
+	}
 	if prgOut != "" {
 		lastSave := btime.UTCStamp()
 		b.PBar.AddTrigger("", func(task string, rate float64) {
@@ -72,7 +79,7 @@ func runBackTest(outDir string, prgOut string) string {
 		})
 	}
 	b.Run()
-	return b.OutDir
+	return b.OutDir, nil
 }
 
 func RunTrade(args *config.CmdArgs) *errs.Error {

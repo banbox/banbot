@@ -134,7 +134,7 @@ func (b *BackTestLite) orderCB(order *ormo.InOutOrder, isEnter bool) {
 	}
 }
 
-func NewBackTest(isOpt bool, outDir string) *BackTest {
+func NewBackTest(isOpt bool, outDir string) (*BackTest, *errs.Error) {
 	stages := []string{"init", "listMs", "loadPairs", "tfScores", "loadJobs", "warmJobs", "downKline", "runBT"}
 	stgWeis := []float64{1, 1, 2, 2, 1, 2, 10, 10}
 	b := &BackTest{
@@ -150,13 +150,13 @@ func NewBackTest(isOpt bool, outDir string) *BackTest {
 	if outDir == "" && !isOpt {
 		hash, err := config.Data.HashCode()
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
 		outDir = fmt.Sprintf("%s/backtest/%s", config.GetDataDir(), hash)
 	}
 	b.OutDir = config.ParsePath(outDir)
 	config.LoadPerfs(config.GetDataDir())
-	return b
+	return b, nil
 }
 
 func (b *BackTest) Init() *errs.Error {

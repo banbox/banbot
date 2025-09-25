@@ -286,8 +286,16 @@ func copyFile(src, dst string) error {
 func WriteCsvFile(path string, rows [][]string, compress bool) *errs.Error {
 	var fileWriter io.Writer
 	var err_ error
+	folder := filepath.Dir(path)
+	err_ = EnsureDir(folder, 0755)
+	if err_ != nil {
+		return errs.New(errs.CodeIOWriteFail, err_)
+	}
+	cleanPath := strings.TrimSuffix(path, filepath.Ext(path))
+	path = cleanPath + ".csv"
 	if compress {
-		zipFile, err_ := os.Create(strings.Replace(path, ".csv", ".zip", 1))
+		zipPath := cleanPath + ".zip"
+		zipFile, err_ := os.Create(zipPath)
 		if err_ != nil {
 			return errs.New(errs.CodeIOWriteFail, err_)
 		}
@@ -612,6 +620,11 @@ func CreateNumFile(outDir string, prefix string, ext string) (*os.File, error) {
 }
 
 func EncodeGob(path string, data any) *errs.Error {
+	folder := filepath.Dir(path)
+	err := EnsureDir(folder, 0755)
+	if err != nil {
+		return errs.New(errs.CodeIOWriteFail, err)
+	}
 	file, err := os.Create(path)
 	if err != nil {
 		return errs.New(errs.CodeIOWriteFail, err)

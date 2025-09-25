@@ -68,7 +68,10 @@ func RunSimBT(args *config.CmdArgs) *errs.Error {
 		// 执行回测
 		core.BotRunning = true
 		biz.ResetVars()
-		bt := NewBackTest(true, "")
+		bt, err := NewBackTest(true, "")
+		if err != nil {
+			return err
+		}
 		bt.Run()
 
 		// 收集订单

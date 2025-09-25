@@ -3,6 +3,11 @@ package data
 import (
 	"context"
 	"fmt"
+	"math"
+	"slices"
+	"strconv"
+	"strings"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -16,10 +21,6 @@ import (
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
-	"math"
-	"slices"
-	"strconv"
-	"strings"
 )
 
 type FnPairKline = func(bar *orm.InfoKline)
@@ -566,21 +567,26 @@ func (f *KlineFeeder) onNewBars(barTfMSecs int64, bars []*banexg.Kline) (bool, *
 	return len(doneBars) > 0, nil
 }
 
+type Batch interface {
+	TimeMS() int64
+}
+
+type IHistFeeder interface {
+	getNextMS() int64
+	SetSeek(since int64)
+	SetEndMS(ms int64)
+	GetBatch() Batch
+	RunBatch(bar Batch) *errs.Error
+	CallNext()
+	Type() string
+	getSymbol() string
+}
+
 type IHistKlineFeeder interface {
 	IKlineFeeder
-	getNextMS() int64
+	IHistFeeder
 	// DownIfNeed Download the entire range of K lines, which needs to be called before SetSeek  下载整个范围的K线，需在SetSeek前调用
 	DownIfNeed(sess *orm.Queries, exchange banexg.BanExchange, pBar *utils.PrgBar) *errs.Error
-	// SetSeek Set the reading position and call it before loop reading   设置读取位置，在循环读取前调用
-	SetSeek(since int64)
-	// SetEndMS  Set the end position for reading 设置读取的结束位置
-	SetEndMS(ms int64)
-	// GetBar Get the current K line, and then call CallNext to move the pointer to the next 获取当前K线，然后可调用CallNext移动指针到下一个
-	GetBar() *banexg.Kline
-	// RunBar Run the callback function corresponding to Bar 运行Bar对应的回调函数
-	RunBar(bar *banexg.Kline) *errs.Error
-	// CallNext Move the pointer to the next K line 移动指针到下一个K线
-	CallNext()
 }
 
 /*
@@ -605,14 +611,6 @@ func (f *DBKlineFeeder) getNextMS() int64 {
 	return f.nextMS
 }
 
-/*
-Get the current bar for invokeBar; callNext should be called afterwards to set the cursor to the next bar.
-获取当前bar，用于invokeBar；之后应调用callNext设置光标到下一个bar
-*/
-func (f *DBKlineFeeder) GetBar() *banexg.Kline {
-	return f.TfKlineLoader.GetBar()
-}
-
 func (f *DBKlineFeeder) SetEndMS(ms int64) {
 	f.EndMS = ms
 	if f.hour != nil {
@@ -620,16 +618,15 @@ func (f *DBKlineFeeder) SetEndMS(ms int64) {
 	}
 }
 
-func (f *DBKlineFeeder) RunBar(bar *banexg.Kline) *errs.Error {
-	_, err := f.onNewBars(f.TFMSecs, []*banexg.Kline{bar})
-	return err
-}
-
 func (f *DBKlineFeeder) SetSeek(since int64) {
 	f.TfKlineLoader.SetSeek(since)
 	if f.hour != nil {
 		f.hour.SetSeek(since)
 	}
+}
+
+func (f *DBKlineFeeder) Type() string {
+	return core.WsSubKLine
 }
 
 /*
@@ -697,6 +694,22 @@ func (f *DBKlineFeeder) setAdjIdx() {
 		f.adjIdx += 1
 	}
 	f.adj = nil
+}
+
+func (f *DBKlineFeeder) GetBatch() Batch {
+	bar := f.GetBar()
+	if bar != nil {
+		return bar
+	}
+	return nil
+}
+
+func (f *DBKlineFeeder) RunBatch(batch Batch) *errs.Error {
+	if bar, ok := batch.(*banexg.Kline); ok {
+		_, err := f.onNewBars(f.TFMSecs, []*banexg.Kline{bar})
+		return err
+	}
+	return nil
 }
 
 func NewDBKlineFeeder(exs *orm.ExSymbol, callBack FnPairKline, showLog bool) (*DBKlineFeeder, *errs.Error) {

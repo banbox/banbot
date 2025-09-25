@@ -527,17 +527,25 @@ func saveYear1m(outDir, year string) {
 	}
 }
 
+// ReadZipCSVs arg is for handle
 func ReadZipCSVs(inPath string, pBar *utils.PrgBar, handle FuncReadZipItem, arg interface{}) *errs.Error {
 	r, err := zip.OpenReader(inPath)
 	if err != nil {
-		pBar.Add(core.StepTotal)
+		if pBar != nil {
+			pBar.Add(core.StepTotal)
+		}
 		return errs.New(errs.CodeIOReadFail, err)
 	}
 	defer r.Close()
-	bar := pBar.NewJob(len(r.File))
-	defer bar.Done()
+	var bar *utils.PrgBarJob
+	if pBar != nil {
+		bar = pBar.NewJob(len(r.File))
+		defer bar.Done()
+	}
 	for i, f := range r.File {
-		bar.Add(1)
+		if bar != nil {
+			bar.Add(1)
+		}
 		if f.FileInfo().IsDir() || !strings.HasSuffix(f.Name, ".csv") {
 			continue
 		}
