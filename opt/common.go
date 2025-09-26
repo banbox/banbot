@@ -415,11 +415,16 @@ func (g *Chart) Dump() ([]byte, *errs.Error) {
 	var err_ error
 	for _, it := range g.Datasets {
 		col := make([]float64, 0, len(it.Data))
-		for _, v := range it.Data {
+		prevId := 0
+		for i, v := range it.Data {
 			if math.IsNaN(v) || math.IsInf(v, 0) {
-				col = append(col, 0)
 				continue
+			} else if prevId+1 < i {
+				for j := prevId + 1; j < i; j++ {
+					col = append(col, v)
+				}
 			}
+			prevId = i
 			if g.Precision > 0 {
 				v, err_ = utils2.PrecFloat64(v, g.Precision, true, utils2.PrecModeSignifDigits)
 				if err_ != nil {

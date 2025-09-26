@@ -86,14 +86,14 @@ func (f *AgeFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Erro
 }
 
 func (f *VolumePairFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	var symbolVols = make([]SymbolVol, 0)
+	var symbolVols = make([]*SymbolVol, 0)
 	backTf, backNum := utils.SecsToTfNum(utils2.TFToSecs(f.BackPeriod))
 	var err *errs.Error
-	symbolVols, err = getSymbolVols(symbols, backTf, backNum, timeMS)
+	symbolVols, err = GetSymbolVols(symbols, backTf, backNum, timeMS, true)
 	if err != nil {
 		return nil, err
 	}
-	slices.SortFunc(symbolVols, func(a, b SymbolVol) int {
+	slices.SortFunc(symbolVols, func(a, b *SymbolVol) int {
 		return int((b.Vol - a.Vol) / 1000)
 	})
 	if !f.AllowEmpty && f.MinValue == 0 {
@@ -125,11 +125,13 @@ type SymbolVol struct {
 	Price  float64
 }
 
-func getSymbolVols(symbols []string, tf string, num int, endMS int64) ([]SymbolVol, *errs.Error) {
-	var symbolVols = make([]SymbolVol, 0)
+func GetSymbolVols(symbols []string, tf string, num int, endMS int64, withEmpty bool) ([]*SymbolVol, *errs.Error) {
+	var symbolVols = make([]*SymbolVol, 0)
 	callBack := func(symbol string, _ string, klines []*banexg.Kline, adjs []*orm.AdjInfo) {
-		if len(klines) == 0 {
-			symbolVols = append(symbolVols, SymbolVol{symbol, 0, 0})
+		if len(klines) == 0 || len(klines) < num {
+			if withEmpty {
+				symbolVols = append(symbolVols, &SymbolVol{symbol, 0, 0})
+			}
 		} else {
 			total := float64(0)
 			slices.Reverse(klines)
@@ -142,7 +144,9 @@ func getSymbolVols(symbols []string, tf string, num int, endMS int64) ([]SymbolV
 			vol := total / float64(len(klines))
 			// 已倒序，选择第一个最近价格；此价格可能不是实时最新价格，但为保持品种刷新历史一致性，应固定使用此价格
 			price := klines[0].Close
-			symbolVols = append(symbolVols, SymbolVol{symbol, vol, price})
+			if withEmpty || vol > 0 {
+				symbolVols = append(symbolVols, &SymbolVol{symbol, vol, price})
+			}
 		}
 	}
 	exchange := exg.Default
@@ -157,7 +161,7 @@ func getSymbolVols(symbols []string, tf string, num int, endMS int64) ([]SymbolV
 	return symbolVols, nil
 }
 
-func filterByMinCost(symbols []SymbolVol) ([]string, map[string]float64) {
+func filterByMinCost(symbols []*SymbolVol) ([]string, map[string]float64) {
 	res := make([]string, 0, len(symbols))
 	skip := make(map[string]float64)
 	exchange := exg.Default

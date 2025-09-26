@@ -174,8 +174,6 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 		if (req.Limit-enterPrice)*dirFlag < 0 {
 			enterPrice = req.Limit
-		} else {
-			req.Limit = 0
 		}
 	}
 	if req.Stop > 0 {

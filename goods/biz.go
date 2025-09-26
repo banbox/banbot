@@ -92,7 +92,7 @@ func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 	var err *errs.Error
 	pairs, _ := config.GetStaticPairs()
 	if len(pairs) > 0 {
-		pairVols, err := getSymbolVols(pairs, "1h", 1, timeMS)
+		pairVols, err := GetSymbolVols(pairs, "1h", 1, timeMS, true)
 		if err != nil {
 			return nil, err
 		}

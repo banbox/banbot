@@ -125,7 +125,7 @@ func NewWsDataLoader() (*WsDataLoader, *errs.Error) {
 		return nil, err
 	}
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 120 * time.Second,
 	}
 	proxy, err_ := url.Parse(proxyUrl)
 	if err_ != nil {
@@ -265,7 +265,6 @@ func (l *WsDataLoader) loadTradeZip(path string, info *WsSymbol) ([]*banexg.Trad
 func (l *WsDataLoader) SplitBigZip(zipPath string, info *WsSymbol) *errs.Error {
 	startTime := time.Now()
 	lineCount := 0
-	dataCount := 0
 
 	log.Debug("try split big zip", zap.String("job", info.String()))
 
@@ -309,7 +308,6 @@ func (l *WsDataLoader) SplitBigZip(zipPath string, info *WsSymbol) *errs.Error {
 					lines = nil
 				}
 				lines = append(lines, item)
-				dataCount++
 			}
 		}
 		if len(lines) > 0 {
@@ -332,11 +330,10 @@ func (l *WsDataLoader) SplitBigZip(zipPath string, info *WsSymbol) *errs.Error {
 	}
 
 	elapsed := time.Since(startTime)
-	log.Info("split ws data ok",
+	log.Debug("split ws data ok",
 		zap.String("symbol", info.Symbol),
 		zap.String("date", info.Date),
 		zap.Int("raw_num", lineCount),
-		zap.Int("data_num", dataCount),
 		zap.Duration("cost_time", elapsed))
 
 	return nil
