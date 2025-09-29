@@ -102,13 +102,20 @@ func walletItems(wallet *biz.BanWallets) []map[string]interface{} {
 	items := make([]map[string]interface{}, 0)
 	for coin, item := range wallet.Items {
 		total := item.Total(true)
+		totalFiat := float64(0)
+		if total > 0 {
+			price := core.GetPriceSafe(coin, "")
+			if price > 0 {
+				totalFiat = total * price
+			}
+		}
 		items = append(items, map[string]interface{}{
 			"symbol":     coin,
 			"total":      total,
 			"upol":       item.UnrealizedPOL,
 			"free":       item.Available,
 			"used":       item.Used(),
-			"total_fiat": total * core.GetPrice(coin, ""),
+			"total_fiat": totalFiat,
 		})
 	}
 	return items
