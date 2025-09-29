@@ -2,8 +2,8 @@ package core
 
 import (
 	"fmt"
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/bntp"
 	"github.com/sasha-s/go-deadlock"
 	"gonum.org/v1/gonum/floats"
 	"strings"
@@ -11,7 +11,7 @@ import (
 
 func getPriceBySide(ask, bid map[string]*Int64Flt, lock *deadlock.RWMutex, symbol string, side string, expMS int64) (float64, bool) {
 	lock.RLock()
-	curMS := btime.UTCStamp()
+	curMS := bntp.UTCStamp()
 	priceArr := make([]float64, 0, 1)
 	if side == banexg.OdSideBuy || side == "" {
 		if item, ok := bid[symbol]; ok && curMS-item.Int <= expMS {
@@ -44,7 +44,7 @@ func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
 	lockBarPrices.RLock()
 	item, ok := barPrices[symbol]
 	lockBarPrices.RUnlock()
-	curMS := btime.UTCStamp()
+	curMS := bntp.UTCStamp()
 	if ok && curMS-item.Int <= expMS {
 		return price
 	}
@@ -69,7 +69,7 @@ func GetPrice(symbol string, side string) float64 {
 
 func setDataPrice(data map[string]*Int64Flt, pair string, price float64) {
 	item := &Int64Flt{
-		Int: btime.UTCStamp(),
+		Int: bntp.UTCStamp(),
 		Val: price,
 	}
 	data[pair] = item
@@ -96,7 +96,7 @@ func IsPriceEmpty() bool {
 
 func SetPrice(pair string, ask, bid float64) {
 	lockPrices.Lock()
-	curMS := btime.UTCStamp()
+	curMS := bntp.UTCStamp()
 	if ask > 0 {
 		askPrices[pair] = &Int64Flt{
 			Int: curMS,
@@ -119,7 +119,7 @@ func SetPrices(data map[string]float64, side string) {
 		panic(fmt.Sprintf("invalid side: %v, use `banexg.OdSideBuy/OdSideSell` or ''", side))
 	}
 	lockPrices.Lock()
-	curMS := btime.UTCStamp()
+	curMS := bntp.UTCStamp()
 	for pair, price := range data {
 		item := &Int64Flt{
 			Int: curMS,
