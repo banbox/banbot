@@ -43,6 +43,7 @@ var (
 		"good3t10": optGood3t10,
 	}
 	DefCalcOptBest = "good3"
+	AfterBacktest  func(bt *BackTest)
 )
 
 type OptGroup struct {

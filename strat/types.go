@@ -53,6 +53,7 @@ type TradeStrat struct {
 	PickTimeFrame       PickTimeFrameFunc                                      // Choose a suitable trading cycle for the specified currency 为指定币选择适合的交易周期
 	OnPostApi           FnOnPostApi                                            // callback for post api PostAPI时的策略回调
 	OnShutDown          func(s *StratJob)                                      // Callback when the robot stops 机器人停止时回调
+	OnStratExit         func()
 }
 
 const (

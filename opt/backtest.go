@@ -244,6 +244,10 @@ func (b *BackTest) Run() {
 		return
 	}
 	b.logPlot(biz.GetWallets(config.DefAcc), btime.TimeMS(), -1, -1)
+	b.Collect()
+	if AfterBacktest != nil {
+		AfterBacktest(b)
+	}
 	if !b.isOpt {
 		log.Info(fmt.Sprintf("Complete! cost: %.1fs, avg: %.1f bar/s", btCost, float64(b.BarNum)/btCost))
 		failOpens := strat.DumpAccFailOpens()
@@ -251,8 +255,6 @@ func (b *BackTest) Run() {
 			log.Info("fail open tag nums:\n" + failOpens)
 		}
 		b.printBtResult()
-	} else {
-		b.Collect()
 	}
 }
 

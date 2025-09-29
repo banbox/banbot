@@ -78,14 +78,15 @@ type BTResult struct {
 }
 
 type PlotData struct {
-	Labels        []string  `json:"labels"`
-	OdNum         []int     `json:"odNum"`
-	JobNum        []int     `json:"jobNum"`
-	Real          []float64 `json:"real"`
-	Available     []float64 `json:"available"`
-	Profit        []float64 `json:"profit"`
-	UnrealizedPOL []float64 `json:"unrealizedPOL"`
-	WithDraw      []float64 `json:"withDraw"`
+	Labels        []string   `json:"labels"`
+	OdNum         []int      `json:"odNum"`
+	JobNum        []int      `json:"jobNum"`
+	Real          []float64  `json:"real"`
+	Available     []float64  `json:"available"`
+	Profit        []float64  `json:"profit"`
+	UnrealizedPOL []float64  `json:"unrealizedPOL"`
+	WithDraw      []float64  `json:"withDraw"`
+	More          []*ChartDs `json:"more"`
 	tmpOdNum      int
 }
 
@@ -123,8 +124,6 @@ func (r *BTResult) printBtResult() {
 	if config.StratPerf != nil && config.StratPerf.Enable {
 		core.DumpPerfs(r.OutDir)
 	}
-
-	r.Collect()
 	log.Info("BackTest Reports:\n" + r.cmdReports(ormo.HistODs))
 	log.Info("Saved", zap.String("at", r.OutDir))
 	if r.CalcDiff > 0.01 {
@@ -832,7 +831,7 @@ func (r *BTResult) DumpCharts() {
 	title := "Real-time Assets/Balances/Unrealized P&L/Withdrawals/Concurrent Orders"
 	tplPath := fmt.Sprintf("%s/lines.html", config.GetDataDir())
 	tplData, _ := os.ReadFile(tplPath)
-	err := DumpChart(outPath, title, r.Plots.Labels, 5, tplData, []*ChartDs{
+	dataList := []*ChartDs{
 		{Label: "Real", Data: r.Plots.Real},
 		{Label: "Available", Data: r.Plots.Available},
 		{Label: "Profit", Data: r.Plots.Profit, Hidden: true},
@@ -840,7 +839,11 @@ func (r *BTResult) DumpCharts() {
 		{Label: "Withdraw", Data: r.Plots.WithDraw, Hidden: true},
 		{Label: "OrderNum", Data: odNum, YAxisID: "yRight", Hidden: true},
 		{Label: "JobNum", Data: jobNum, YAxisID: "yRight", Hidden: true},
-	})
+	}
+	if len(r.Plots.More) > 0 {
+		dataList = append(dataList, r.Plots.More...)
+	}
+	err := DumpChart(outPath, title, r.Plots.Labels, 5, tplData, dataList)
 	if err != nil {
 		log.Error("save assets.html fail", zap.Error(err))
 	}

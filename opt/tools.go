@@ -1054,10 +1054,15 @@ func BacktestToCompare() {
 	curMS := btime.UTCStamp()
 	liveOpens, lock := ormo.GetOpenODs(account)
 	minStartMS := curMS
+	liveOpenQtys := make(map[int64]*ormo.InOutOrder)
 	lock.Lock()
 	openNum := len(liveOpens)
 	for _, od := range liveOpens {
-		minStartMS = min(minStartMS, od.RealEnterMS())
+		holdQty := od.HoldAmount()
+		if holdQty > 0 {
+			liveOpenQtys[od.ID] = od
+			minStartMS = min(minStartMS, od.RealEnterMS())
+		}
 	}
 	lock.Unlock()
 	if openNum == 0 && len(posList) == 0 {
@@ -1133,8 +1138,8 @@ func BacktestToCompare() {
 	liveMore := make(map[string]int64)
 	liveAmts := make(map[string]float64)
 	dupNexts := maps.Clone(odNextMS)
-	lock.Lock()
-	for _, od := range liveOpens {
+	for _, od := range liveOpenQtys {
+		holdQty := od.HoldAmount()
 		odKey := od.KeyAlign()
 		tfMSecs := int64(utils2.TFToSecs(od.Timeframe) * 1000)
 		odNext, _ := odNextMS[odKey]
@@ -1158,9 +1163,8 @@ func BacktestToCompare() {
 			key = od.Symbol + "_short"
 		}
 		cum, _ := liveAmts[key]
-		liveAmts[key] = cum + od.HoldAmount()
+		liveAmts[key] = cum + holdQty
 	}
-	lock.Unlock()
 	// 清理已完成订单的key
 	for key := range dupNexts {
 		delete(odNextMS, key)

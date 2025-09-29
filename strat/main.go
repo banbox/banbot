@@ -315,6 +315,11 @@ func ExitStratJobs() {
 			}
 		}
 	}
+	for _, stg := range cacheStrats {
+		if stg.OnStratExit != nil {
+			stg.OnStratExit()
+		}
+	}
 }
 
 func CallStratSymbols(stgy *TradeStrat, curPairs []string, tfScores map[string]map[string]float64) ([]*orm.ExSymbol, *errs.Error) {
