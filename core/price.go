@@ -2,23 +2,25 @@ package core
 
 import (
 	"fmt"
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banexg"
 	"github.com/sasha-s/go-deadlock"
 	"gonum.org/v1/gonum/floats"
 	"strings"
 )
 
-func getPriceBySide(ask, bid map[string]float64, lock *deadlock.RWMutex, symbol string, side string) (float64, bool) {
+func getPriceBySide(ask, bid map[string]*Int64Flt, lock *deadlock.RWMutex, symbol string, side string, expMS int64) (float64, bool) {
 	lock.RLock()
+	curMS := btime.UTCStamp()
 	priceArr := make([]float64, 0, 1)
 	if side == banexg.OdSideBuy || side == "" {
-		if price, ok := bid[symbol]; ok {
-			priceArr = append(priceArr, price)
+		if item, ok := bid[symbol]; ok && curMS-item.Int <= expMS {
+			priceArr = append(priceArr, item.Val)
 		}
 	}
 	if side == banexg.OdSideSell || side == "" {
-		if price, ok := ask[symbol]; ok {
-			priceArr = append(priceArr, price)
+		if item, ok := ask[symbol]; ok && curMS-item.Int <= expMS {
+			priceArr = append(priceArr, item.Val)
 		}
 	}
 	lock.RUnlock()
@@ -31,36 +33,49 @@ func getPriceBySide(ask, bid map[string]float64, lock *deadlock.RWMutex, symbol 
 	return 0, false
 }
 
-func GetPriceSafe(symbol string, side string) float64 {
+func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
 	if IsFiat(symbol) && !strings.Contains(symbol, "/") {
 		return 1
 	}
-	price, ok := getPriceBySide(askPrices, bidPrices, &lockPrices, symbol, side)
+	price, ok := getPriceBySide(askPrices, bidPrices, &lockPrices, symbol, side, expMS)
 	if ok {
 		return price
 	}
 	lockBarPrices.RLock()
-	price, ok = barPrices[symbol]
+	item, ok := barPrices[symbol]
 	lockBarPrices.RUnlock()
-	if ok {
+	curMS := btime.UTCStamp()
+	if ok && curMS-item.Int <= expMS {
 		return price
 	}
 	return -1
 }
 
-func GetPrice(symbol string, side string) float64 {
-	price := GetPriceSafe(symbol, side)
+func GetPriceSafe(symbol string, side string) float64 {
+	return GetPriceSafeExp(symbol, side, 10000)
+}
+
+func GetPriceExp(symbol string, side string, expMS int64) float64 {
+	price := GetPriceSafeExp(symbol, side, expMS)
 	if price == -1 {
 		panic(fmt.Errorf("invalid symbol for price: %s", symbol))
 	}
 	return price
 }
 
-func setDataPrice(data map[string]float64, pair string, price float64) {
-	data[pair] = price
+func GetPrice(symbol string, side string) float64 {
+	return GetPriceExp(symbol, side, 10000)
+}
+
+func setDataPrice(data map[string]*Int64Flt, pair string, price float64) {
+	item := &Int64Flt{
+		Int: btime.UTCStamp(),
+		Val: price,
+	}
+	data[pair] = item
 	base, quote, settle, _ := SplitSymbol(pair)
 	if IsFiat(quote) && (settle == "" || settle == quote) {
-		data[base] = price
+		data[base] = item
 	}
 }
 
@@ -81,11 +96,18 @@ func IsPriceEmpty() bool {
 
 func SetPrice(pair string, ask, bid float64) {
 	lockPrices.Lock()
+	curMS := btime.UTCStamp()
 	if ask > 0 {
-		askPrices[pair] = ask
+		askPrices[pair] = &Int64Flt{
+			Int: curMS,
+			Val: ask,
+		}
 	}
 	if bid > 0 {
-		bidPrices[pair] = ask
+		bidPrices[pair] = &Int64Flt{
+			Int: curMS,
+			Val: bid,
+		}
 	}
 	lockPrices.Unlock()
 }
@@ -97,20 +119,25 @@ func SetPrices(data map[string]float64, side string) {
 		panic(fmt.Sprintf("invalid side: %v, use `banexg.OdSideBuy/OdSideSell` or ''", side))
 	}
 	lockPrices.Lock()
+	curMS := btime.UTCStamp()
 	for pair, price := range data {
+		item := &Int64Flt{
+			Int: curMS,
+			Val: price,
+		}
 		if updateAsk {
-			askPrices[pair] = price
+			askPrices[pair] = item
 		}
 		if updateBid {
-			bidPrices[pair] = price
+			bidPrices[pair] = item
 		}
 		base, quote, settle, _ := SplitSymbol(pair)
 		if IsFiat(quote) && (settle == "" || settle == quote) {
 			if updateAsk {
-				askPrices[base] = price
+				askPrices[base] = item
 			}
 			if updateBid {
-				bidPrices[base] = price
+				bidPrices[base] = item
 			}
 		}
 	}

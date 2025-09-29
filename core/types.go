@@ -47,6 +47,11 @@ type StrFloat struct {
 	Val float64
 }
 
+type Int64Flt struct {
+	Int int64
+	Val float64
+}
+
 type Param struct {
 	Name  string
 	VType int // VTypeNorm / VTypeUniform
