@@ -128,7 +128,8 @@ func CronKlineDelays() {
 		}
 		stuckCount = 0
 		var fails = make(map[string][]string)
-		for pair, wait := range core.PairCopiedMs {
+		copied := core.GetPairCopieds()
+		for pair, wait := range copied {
 			if wait[0]+wait[1]*2 > curMS {
 				continue
 			}

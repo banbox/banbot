@@ -6,6 +6,7 @@ import (
 	"github.com/banbox/banexg/bntp"
 	"github.com/sasha-s/go-deadlock"
 	"gonum.org/v1/gonum/floats"
+	"maps"
 	"strings"
 )
 
@@ -149,4 +150,31 @@ func IsMaker(pair, side string, price float64) bool {
 	isBuy := side == banexg.OdSideBuy
 	isLow := price < curPrice
 	return isBuy == isLow
+}
+
+func GetPairCopieds() map[string][2]int64 {
+	lockPairCopiedMs.Lock()
+	data := maps.Clone(pairCopiedMs)
+	lockPairCopiedMs.Unlock()
+	return data
+}
+
+func DelPairCopieds(keys ...string) {
+	lockPairCopiedMs.Lock()
+	if len(keys) == 0 {
+		pairCopiedMs = make(map[string][2]int64)
+	} else {
+		for _, k := range keys {
+			delete(pairCopiedMs, k)
+		}
+	}
+	lockPairCopiedMs.Unlock()
+}
+
+func SetPairCopieds(items map[string][2]int64) {
+	lockPairCopiedMs.Lock()
+	for k, v := range items {
+		pairCopiedMs[k] = v
+	}
+	lockPairCopiedMs.Unlock()
 }

@@ -152,7 +152,7 @@ func (w *KLineWatcher) UnWatchJobs(exgName, marketType, jobType string, pairs []
 		}
 		jobKey := fmt.Sprintf("%s_%s", pair, jobType)
 		delete(w.jobs, jobKey)
-		delete(core.PairCopiedMs, pair)
+		core.DelPairCopieds(pair)
 	}
 	if len(tags) == 0 {
 		return nil

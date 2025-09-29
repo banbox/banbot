@@ -261,7 +261,9 @@ update LastBarMs/wait interval from spider
 更新bot端从爬虫收到的标的最新时间和等待间隔
 */
 func SetPairMs(pair string, barMS, waitMS int64) {
-	core.PairCopiedMs[pair] = [2]int64{barMS, waitMS}
+	core.SetPairCopieds(map[string][2]int64{
+		pair: {barMS, waitMS},
+	})
 	core.LastBarMs = max(core.LastBarMs, barMS)
 	core.LastCopiedMs = TimeMS()
 }
