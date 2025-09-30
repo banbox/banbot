@@ -55,7 +55,7 @@ func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
 	lockBarPrices.RUnlock()
 	curMS := btime.TimeMS()
 	if ok && curMS-item.Int <= expMS {
-		return price
+		return item.Val
 	}
 	return -1
 }
