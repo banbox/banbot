@@ -2,6 +2,7 @@ package biz
 
 import (
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
@@ -110,7 +111,7 @@ func TestStratRun(t *testing.T) {
 			envKey := strings.Join([]string{pair, tf}, "_")
 			env, _ := strat.Envs[envKey]
 			env.OnBar(bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, 0)
-			core.SetBarPrice(pair, bar.Close)
+			com.SetBarPrice(pair, bar.Close)
 			jobs, _ := accJobs[envKey]
 			for _, job := range jobs {
 				job.InitBar(nil)

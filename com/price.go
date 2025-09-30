@@ -1,18 +1,26 @@
-package core
+package com
 
 import (
 	"fmt"
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
-	"github.com/banbox/banexg/bntp"
 	"github.com/sasha-s/go-deadlock"
 	"gonum.org/v1/gonum/floats"
-	"maps"
 	"strings"
 )
 
-func getPriceBySide(ask, bid map[string]*Int64Flt, lock *deadlock.RWMutex, symbol string, side string, expMS int64) (float64, bool) {
+var (
+	barPrices     = make(map[string]*core.Int64Flt) // Latest price of each coin from bar, only for backtesting etc. The key can be a trading pair or a coin code 来自bar的每个币的最新价格，仅用于回测等。键可以是交易对，也可以是币的code
+	bidPrices     = make(map[string]*core.Int64Flt) // The latest order book price of the trading pair is only used for real-time simulation or real trading. The key can be a trading pair or a coin code 交易对的最新订单簿价格，仅用于实时模拟或实盘。键可以是交易对，也可以是币的code
+	askPrices     = make(map[string]*core.Int64Flt)
+	lockPrices    deadlock.RWMutex
+	lockBarPrices deadlock.RWMutex
+)
+
+func getPriceBySide(ask, bid map[string]*core.Int64Flt, lock *deadlock.RWMutex, symbol string, side string, expMS int64) (float64, bool) {
 	lock.RLock()
-	curMS := bntp.UTCStamp()
+	curMS := btime.TimeMS()
 	priceArr := make([]float64, 0, 1)
 	if side == banexg.OdSideBuy || side == "" {
 		if item, ok := bid[symbol]; ok && curMS-item.Int <= expMS {
@@ -35,7 +43,7 @@ func getPriceBySide(ask, bid map[string]*Int64Flt, lock *deadlock.RWMutex, symbo
 }
 
 func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
-	if IsFiat(symbol) && !strings.Contains(symbol, "/") {
+	if core.IsFiat(symbol) && !strings.Contains(symbol, "/") {
 		return 1
 	}
 	price, ok := getPriceBySide(askPrices, bidPrices, &lockPrices, symbol, side, expMS)
@@ -45,7 +53,7 @@ func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
 	lockBarPrices.RLock()
 	item, ok := barPrices[symbol]
 	lockBarPrices.RUnlock()
-	curMS := bntp.UTCStamp()
+	curMS := btime.TimeMS()
 	if ok && curMS-item.Int <= expMS {
 		return price
 	}
@@ -68,14 +76,14 @@ func GetPrice(symbol string, side string) float64 {
 	return GetPriceExp(symbol, side, 10000)
 }
 
-func setDataPrice(data map[string]*Int64Flt, pair string, price float64) {
-	item := &Int64Flt{
-		Int: bntp.UTCStamp(),
+func setDataPrice(data map[string]*core.Int64Flt, pair string, price float64) {
+	item := &core.Int64Flt{
+		Int: btime.TimeMS(),
 		Val: price,
 	}
 	data[pair] = item
-	base, quote, settle, _ := SplitSymbol(pair)
-	if IsFiat(quote) && (settle == "" || settle == quote) {
+	base, quote, settle, _ := core.SplitSymbol(pair)
+	if core.IsFiat(quote) && (settle == "" || settle == quote) {
 		data[base] = item
 	}
 }
@@ -97,15 +105,15 @@ func IsPriceEmpty() bool {
 
 func SetPrice(pair string, ask, bid float64) {
 	lockPrices.Lock()
-	curMS := bntp.UTCStamp()
+	curMS := btime.TimeMS()
 	if ask > 0 {
-		askPrices[pair] = &Int64Flt{
+		askPrices[pair] = &core.Int64Flt{
 			Int: curMS,
 			Val: ask,
 		}
 	}
 	if bid > 0 {
-		bidPrices[pair] = &Int64Flt{
+		bidPrices[pair] = &core.Int64Flt{
 			Int: curMS,
 			Val: bid,
 		}
@@ -120,9 +128,9 @@ func SetPrices(data map[string]float64, side string) {
 		panic(fmt.Sprintf("invalid side: %v, use `banexg.OdSideBuy/OdSideSell` or ''", side))
 	}
 	lockPrices.Lock()
-	curMS := bntp.UTCStamp()
+	curMS := btime.TimeMS()
 	for pair, price := range data {
-		item := &Int64Flt{
+		item := &core.Int64Flt{
 			Int: curMS,
 			Val: price,
 		}
@@ -132,8 +140,8 @@ func SetPrices(data map[string]float64, side string) {
 		if updateBid {
 			bidPrices[pair] = item
 		}
-		base, quote, settle, _ := SplitSymbol(pair)
-		if IsFiat(quote) && (settle == "" || settle == quote) {
+		base, quote, settle, _ := core.SplitSymbol(pair)
+		if core.IsFiat(quote) && (settle == "" || settle == quote) {
 			if updateAsk {
 				askPrices[base] = item
 			}
@@ -150,31 +158,4 @@ func IsMaker(pair, side string, price float64) bool {
 	isBuy := side == banexg.OdSideBuy
 	isLow := price < curPrice
 	return isBuy == isLow
-}
-
-func GetPairCopieds() map[string][2]int64 {
-	lockPairCopiedMs.Lock()
-	data := maps.Clone(pairCopiedMs)
-	lockPairCopiedMs.Unlock()
-	return data
-}
-
-func DelPairCopieds(keys ...string) {
-	lockPairCopiedMs.Lock()
-	if len(keys) == 0 {
-		pairCopiedMs = make(map[string][2]int64)
-	} else {
-		for _, k := range keys {
-			delete(pairCopiedMs, k)
-		}
-	}
-	lockPairCopiedMs.Unlock()
-}
-
-func SetPairCopieds(items map[string][2]int64) {
-	lockPairCopiedMs.Lock()
-	for k, v := range items {
-		pairCopiedMs[k] = v
-	}
-	lockPairCopiedMs.Unlock()
 }

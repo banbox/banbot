@@ -3,6 +3,7 @@ package biz
 import (
 	"fmt"
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
@@ -613,7 +614,7 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 				}
 				openOds = utils.RemoveFromArr(openOds, iod, 1)
 			} else if fillAmt < odAmt*0.99 {
-				price := core.GetPrice(pair, "")
+				price := com.GetPrice(pair, "")
 				holdCost := odAmt * price
 				fillPct := math.Round(fillAmt * 100 / odAmt)
 				log.Error("position not match", zap.String("acc", o.Account),
@@ -624,7 +625,7 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 	}
 	if config.TakeOverStrat == "" {
 		if longPosAmt > AmtDust || shortPosAmt > AmtDust {
-			price := core.GetPrice(pair, "")
+			price := com.GetPrice(pair, "")
 			longCost := math.Round(longPosAmt*price*100) / 100
 			shortCost := math.Round(shortPosAmt*price*100) / 100
 			if longCost > 1 {
@@ -1468,7 +1469,7 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 				}
 			}
 		}
-		realPrice := core.GetPrice(od.Symbol, od.Enter.Side)
+		realPrice := com.GetPrice(od.Symbol, od.Enter.Side)
 		// The market price should be used to calculate the quantity here, because the input price may be very different from the market price
 		// 这里应使用市价计算数量，因传入价格可能和市价相差很大
 		od.Enter.Amount, err = exg.PrecAmount(exg.Default, od.Symbol, od.QuoteCost/realPrice)
@@ -1661,7 +1662,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	}
 	if isEnter && od.Stop > 0 {
 		// 设置触发价入场价格
-		curPrice := core.GetPrice(od.Symbol, side)
+		curPrice := com.GetPrice(od.Symbol, side)
 		if (od.Stop >= curPrice) == (side == banexg.OdSideBuy) {
 			params[banexg.ParamStopLossPrice] = od.Stop
 		} else {

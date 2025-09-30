@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/banbox/banbot/com"
 	"math"
 	"math/rand"
 	"slices"
@@ -249,7 +250,7 @@ func (i *InOutOrder) UpdateFee(price float64, forEnter bool) *errs.Error {
 	if !forEnter {
 		exOrder = i.Exit
 	}
-	//  dry-run 不用core.IsMaker最新价格判断是否限价单，因也是bar，会错取取close
+	//  dry-run 不用com.IsMaker最新价格判断是否限价单，因也是bar，会错取取close
 	var maker = strings.Contains(exOrder.OrderType, "limit")
 	if exOrder.OrderType == banexg.OdTypeLimit {
 		if maker {
@@ -337,7 +338,7 @@ When calling this function on a real drive, it will be saved to the database
 */
 func (i *InOutOrder) LocalExit(exitAt int64, tag string, price float64, msg, odType string) *errs.Error {
 	if price == 0 {
-		newPrice := core.GetPrice(i.Symbol, "")
+		newPrice := com.GetPrice(i.Symbol, "")
 		if newPrice > 0 {
 			price = newPrice
 		} else if i.Enter.Average > 0 {
@@ -622,7 +623,7 @@ func (i *InOutOrder) SetExitTrigger(key string, args *ExitTrigger) *errs.Error {
 	} else {
 		side = banexg.OdSideBuy
 	}
-	curPrice := core.GetPrice(i.Symbol, side)
+	curPrice := com.GetPrice(i.Symbol, side)
 	if isStopLoss == (side == banexg.OdSideSell) {
 		// 触发价低于最新价：平多止损、平空止盈
 		if args.Price > curPrice {
@@ -1362,7 +1363,7 @@ func LegalDoneProfits(off int) float64 {
 	for i := off; i < len(HistODs); i++ {
 		od := HistODs[i]
 		_, quote, _, _ := core.SplitSymbol(od.Symbol)
-		price := core.GetPriceSafe(quote, "")
+		price := com.GetPriceSafe(quote, "")
 		if price == -1 {
 			skips = append(skips, quote)
 			continue

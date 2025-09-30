@@ -3,6 +3,7 @@ package biz
 import (
 	"database/sql"
 	"fmt"
+	"github.com/banbox/banbot/com"
 	"math"
 	"strings"
 
@@ -53,7 +54,7 @@ func (t *Trader) OnEnvJobs(bar *orm.InfoKline) (*ta.BarEnv, *errs.Error) {
 
 func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 	tfSecs := utils2.TFToSecs(bar.TimeFrame)
-	core.SetBarPrice(bar.Symbol, bar.Close)
+	com.SetBarPrice(bar.Symbol, bar.Close)
 	// If it exceeds 1 minute and half of the period, the bar is considered delayed and orders cannot be placed.
 	// 超过1分钟且周期的一半，认为bar延迟，不可下单
 	delaySecs := int((btime.TimeMS()-bar.Time)/1000) - tfSecs

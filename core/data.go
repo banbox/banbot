@@ -36,9 +36,6 @@ var (
 	NumTaCache    = 1500                               // The number of historical values cached during indicator calculation, default 1500 指标计算时缓存的历史值数量，默认1500
 	Cron          = cron.New(cron.WithSeconds())       // Use cron to run tasks regularly 使用cron定时运行任务
 
-	pairCopiedMs     = map[string][2]int64{} // The latest time that all targets received K lines from the crawler, as well as the waiting interval, are used to determine whether there are any that have not been received for a long time. 所有标的从爬虫收到K线的最新时间，以及等待间隔，用于判断是否有长期未收到的。
-	lockPairCopiedMs deadlock.RWMutex
-
 	ExitCalls []func() // CALLBACK TO STOP EXECUTION 停止执行的回调
 	CapOut    *log.OutCapture
 
@@ -50,7 +47,7 @@ var (
 	NewNumInSim   int  // 撮合时创建新订单的数量
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.2.23-beta.7"
+	Version   = "v0.2.23-beta.8"
 	UIVersion = "v0.2.23-beta.3"
 	SysLang   string // language code for current system 当前系统语言设置
 	LogFile   string
@@ -129,11 +126,6 @@ const (
 )
 
 var (
-	barPrices      = make(map[string]*Int64Flt) // Latest price of each coin from bar, only for backtesting etc. The key can be a trading pair or a coin code 来自bar的每个币的最新价格，仅用于回测等。键可以是交易对，也可以是币的code
-	bidPrices      = make(map[string]*Int64Flt) // The latest order book price of the trading pair is only used for real-time simulation or real trading. The key can be a trading pair or a coin code 交易对的最新订单簿价格，仅用于实时模拟或实盘。键可以是交易对，也可以是币的code
-	askPrices      = make(map[string]*Int64Flt)
-	lockPrices     deadlock.RWMutex
-	lockBarPrices  deadlock.RWMutex
 	TfPairHitsLock deadlock.RWMutex
 	Ctx            context.Context // Used to stop all goroutines at the same time 用于全部goroutine同时停止
 	StopAll        func()          // Stop all robot threads 停止全部机器人线程

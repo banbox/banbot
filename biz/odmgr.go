@@ -3,6 +3,7 @@ package biz
 import (
 	"fmt"
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
@@ -299,7 +300,7 @@ func (o *OrderMgr) RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *e
 		if !ok {
 			return errs.NewMsg(errs.CodeNoMarketForPair, "%s not found", odr.Symbol)
 		}
-		price := core.GetPrice(odr.Symbol, odr.Enter.Side)
+		price := com.GetPrice(odr.Symbol, odr.Enter.Side)
 		curTime := btime.TimeMS()
 		od := &ormo.InOutOrder{
 			IOrder: &ormo.IOrder{
@@ -392,7 +393,7 @@ func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, 
 	if req.Short {
 		odSide = banexg.OdSideSell
 	}
-	price := core.GetPrice(exs.Symbol, odSide)
+	price := com.GetPrice(exs.Symbol, odSide)
 	curTimeMS := btime.TimeMS()
 	taskId := ormo.GetTaskID(o.Account)
 	od := &ormo.InOutOrder{
@@ -575,7 +576,7 @@ func (o *OrderMgr) ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.E
 		} else if req.Dirt == core.OdDirtShort {
 			odSide = banexg.OdSideBuy
 		}
-		price := core.GetPrice(symbol, odSide)
+		price := com.GetPrice(symbol, odSide)
 		if price > 0 && (req.Limit-price)*float64(req.Dirt) > 0 {
 			isTakeProfit = true
 		}
@@ -684,7 +685,7 @@ func (o *OrderMgr) ExitOrder(sess *ormo.Queries, od *ormo.InOutOrder, req *strat
 		} else if req.Dirt == core.OdDirtShort {
 			odSide = banexg.OdSideBuy
 		}
-		price := core.GetPrice(od.Symbol, odSide)
+		price := com.GetPrice(od.Symbol, odSide)
 		if price > 0 && (req.Limit-price)*float64(req.Dirt) > 0 {
 			// It is a valid limit order, set to take profit
 			// 是有效的限价出场单，设置到止盈中

@@ -3,6 +3,7 @@ package data
 import (
 	"fmt"
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
@@ -114,7 +115,7 @@ func (w *KLineWatcher) WatchJobs(exgName, marketType, jobType string, jobs ...Wa
 			// 尽早启动延迟监听，避免spider始终未发送k线
 			tfMSecs := int64(tfSecs * 1000)
 			alignBarMs := utils2.AlignTfMSecsOffset(btime.UTCStamp(), tfMSecs, alignOffMs)
-			btime.SetPairMs(j.Symbol, alignBarMs, tfMSecs)
+			com.SetPairMs(j.Symbol, alignBarMs, tfMSecs)
 		}
 	}
 	if !strings.HasSuffix(prefix, "_") {
@@ -152,7 +153,7 @@ func (w *KLineWatcher) UnWatchJobs(exgName, marketType, jobType string, pairs []
 		}
 		jobKey := fmt.Sprintf("%s_%s", pair, jobType)
 		delete(w.jobs, jobKey)
-		core.DelPairCopieds(pair)
+		com.DelPairCopieds(pair)
 	}
 	if len(tags) == 0 {
 		return nil
@@ -187,7 +188,7 @@ func (w *KLineWatcher) onSpiderBar(key string, data []byte) {
 	lastBarMS := bars.Arr[len(bars.Arr)-1].Time
 	tfMSecs := int64(bars.TFSecs * 1000)
 	nextBarMS := lastBarMS + tfMSecs
-	btime.SetPairMs(pair, nextBarMS, tfMSecs)
+	com.SetPairMs(pair, nextBarMS, tfMSecs)
 	var msg = &KLineMsg{
 		NotifyKLines: bars,
 		ExgName:      exgName,
@@ -252,7 +253,7 @@ func (w *KLineWatcher) onPriceUpdate(key string, data []byte) {
 		log.Warn("onPriceUpdate receive invalid msg", zap.String("raw", string(data)), zap.Error(err))
 		return
 	}
-	core.SetPrices(msg, "")
+	com.SetPrices(msg, "")
 }
 
 func (w *KLineWatcher) onTrades(key string, data []byte) {
@@ -273,7 +274,7 @@ func (w *KLineWatcher) onTrades(key string, data []byte) {
 	}
 	last := trades[len(trades)-1]
 	if _, ok := core.OdBooks[pair]; !ok {
-		core.SetPrice(pair, last.Price, last.Price)
+		com.SetPrice(pair, last.Price, last.Price)
 	}
 	w.OnTrades(exgName, market, pair, trades)
 }
@@ -299,7 +300,7 @@ func (w *KLineWatcher) onBook(key string, data []byte) {
 	if book.Symbol == "" {
 		return
 	}
-	core.SetPrice(pair, book.Asks.Price[0], book.Bids.Price[0])
+	com.SetPrice(pair, book.Asks.Price[0], book.Bids.Price[0])
 	core.OdBooks[pair] = &book
 	if w.OnDepth != nil {
 		w.OnDepth(&book)

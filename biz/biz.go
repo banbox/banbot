@@ -6,6 +6,7 @@ import (
 	"embed"
 	_ "embed"
 	"fmt"
+	"github.com/banbox/banbot/com"
 	"maps"
 	"os"
 	"path"
@@ -370,7 +371,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 
 func ResetVars() {
 	core.NoEnterUntil = make(map[string]int64)
-	core.DelPairCopieds()
+	com.DelPairCopieds()
 	core.TfPairHits = make(map[string]map[string]int)
 	core.JobPerfs = make(map[string]*core.JobPerf)
 	core.StratPerfSta = make(map[string]*core.PerfSta)
@@ -424,7 +425,7 @@ func BackupVars() *VarsBackup {
 		Pairs:         slices.Clone(core.Pairs),
 		PairMap:       maps.Clone(core.PairsMap),
 		NoEnterUntil:  core.NoEnterUntil,
-		PairCopiedMs:  core.GetPairCopieds(),
+		PairCopiedMs:  com.GetPairCopieds(),
 		TfPairHits:    core.TfPairHits,
 		JobPerfs:      core.JobPerfs,
 		StratPerfSta:  core.StratPerfSta,
@@ -455,8 +456,8 @@ func RestoreVars(backup *VarsBackup) {
 	core.Pairs = backup.Pairs
 	core.PairsMap = backup.PairMap
 	core.NoEnterUntil = backup.NoEnterUntil
-	core.DelPairCopieds()
-	core.SetPairCopieds(backup.PairCopiedMs)
+	com.DelPairCopieds()
+	com.SetPairCopieds(backup.PairCopiedMs)
 	core.TfPairHits = backup.TfPairHits
 	core.JobPerfs = backup.JobPerfs
 	core.StratPerfSta = backup.StratPerfSta

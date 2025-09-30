@@ -3,6 +3,7 @@ package dev
 import (
 	"context"
 	"fmt"
+	"github.com/banbox/banbot/com"
 	"github.com/sasha-s/go-deadlock"
 	"os"
 	"os/exec"
@@ -455,7 +456,7 @@ func collectBtTask(rootDir, relPath string) (*ormu.Task, error) {
 	d["leverage"] = cfg.Leverage
 	walletTot := float64(0)
 	for code, amt := range cfg.WalletAmounts {
-		walletTot += core.GetPriceSafe(code, "") * amt
+		walletTot += com.GetPriceSafe(code, "") * amt
 	}
 	d["walletAmount"] = walletTot
 	d["stakeAmount"] = cfg.StakeAmount

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
@@ -128,7 +129,7 @@ func CronKlineDelays() {
 		}
 		stuckCount = 0
 		var fails = make(map[string][]string)
-		copied := core.GetPairCopieds()
+		copied := com.GetPairCopieds()
 		for pair, wait := range copied {
 			if wait[0]+wait[1]*2 > curMS {
 				continue

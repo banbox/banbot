@@ -2,6 +2,7 @@ package data
 
 import (
 	"fmt"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/strat"
 	"github.com/sasha-s/go-deadlock"
 	"maps"
@@ -681,7 +682,7 @@ func fireWsKlines(msg *KLineMsg) {
 	}
 	last := msg.Arr[len(msg.Arr)-1]
 	if _, ok := core.OdBooks[msg.Pair]; !ok {
-		core.SetPrice(msg.Pair, last.Close, last.Close)
+		com.SetPrice(msg.Pair, last.Close, last.Close)
 	}
 	pairMap, _ := strat.WsSubJobs[core.WsSubKLine]
 	if len(pairMap) == 0 {

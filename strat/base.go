@@ -2,6 +2,7 @@ package strat
 
 import (
 	"fmt"
+	"github.com/banbox/banbot/com"
 	"math"
 	"slices"
 	"strings"
@@ -166,7 +167,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	if s.IsWarmUp {
 		curPrice = s.Env.Close.Get(0)
 	} else {
-		curPrice = core.GetPrice(symbol, odSide)
+		curPrice = com.GetPrice(symbol, odSide)
 	}
 	enterPrice := curPrice
 	isLimit := core.IsLimitOrder(req.OrderType)
@@ -392,7 +393,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 			if s.IsWarmUp {
 				curPrice = s.Env.Close.Get(0)
 			} else {
-				curPrice = core.GetPrice(s.Symbol.Symbol, odSide)
+				curPrice = com.GetPrice(s.Symbol.Symbol, odSide)
 			}
 			sl := &ormo.ExitTrigger{
 				Price: req.Limit,

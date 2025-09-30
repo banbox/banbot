@@ -161,6 +161,7 @@ func delayExecBatch() {
 }
 
 func (t *CryptoTrader) orderCB(od *ormo.InOutOrder, isEnter bool) {
+	log.Warn("live order notify", zap.String("od", od.Key()), zap.String("stack", errs.CallStack(2, 30)))
 	sendOrderMsg(od, isEnter)
 }
 

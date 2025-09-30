@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"github.com/banbox/banbot/com"
 	"math"
 	"os"
 	"path/filepath"
@@ -582,7 +583,7 @@ func CalcMeasureByOrders(ods []*ormo.InOutOrder) (float64, float64, *errs.Error)
 	}
 	initStake := float64(0)
 	for key, val := range config.WalletAmounts {
-		initStake += val * core.GetPriceSafe(key, "")
+		initStake += val * com.GetPriceSafe(key, "")
 	}
 	tf := "1d"
 	tfSecs := utils2.TFToSecs(tf)
@@ -1352,7 +1353,7 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 				break
 			}
 		}
-		core.SetPrices(prices, "")
+		com.SetPrices(prices, "")
 		// 更新当前持仓订单
 		lock.Lock()
 		openList := utils2.ValsOfMap(openOds)
