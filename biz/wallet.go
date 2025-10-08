@@ -115,7 +115,7 @@ func (iw *ItemWallet) Used() float64 {
 FiatValue Get the fiat currency value of this wallet 获取此钱包的法币价值
 */
 func (iw *ItemWallet) FiatValue(withUpol bool) float64 {
-	return iw.Total(withUpol) * com.GetPrice(iw.Coin, "")
+	return iw.Total(withUpol) * com.GetPriceExp(iw.Coin, "", com.Day10MSecs) // 10天内价格均可
 }
 
 /*
@@ -694,7 +694,10 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		if od.Enter == nil || od.Enter.Filled == 0 {
 			continue
 		}
-		curPrice := com.GetPrice(od.Symbol, "")
+		curPrice := com.GetPriceSafe(od.Symbol, "")
+		if curPrice == -1 {
+			continue
+		}
 		// Calculate nominal value
 		// 计算名义价值
 		quoteValue := od.Enter.Filled * curPrice

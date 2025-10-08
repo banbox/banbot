@@ -558,7 +558,7 @@ func (o *LocalOrderMgr) ExitAndFill(sess *ormo.Queries, orders []*ormo.InOutOrde
 	}
 	timeMS := btime.TimeMS()
 	for _, od := range orders {
-		price := com.GetPrice(od.Symbol, "")
+		price := com.GetPriceExp(od.Symbol, "", com.Day10MSecs)
 		err := o.fillPendingExit(od, price, timeMS)
 		if err != nil {
 			return err

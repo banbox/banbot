@@ -338,7 +338,7 @@ When calling this function on a real drive, it will be saved to the database
 */
 func (i *InOutOrder) LocalExit(exitAt int64, tag string, price float64, msg, odType string) *errs.Error {
 	if price == 0 {
-		newPrice := com.GetPrice(i.Symbol, "")
+		newPrice := com.GetPriceExp(i.Symbol, "", com.Day10MSecs)
 		if newPrice > 0 {
 			price = newPrice
 		} else if i.Enter.Average > 0 {
@@ -623,7 +623,7 @@ func (i *InOutOrder) SetExitTrigger(key string, args *ExitTrigger) *errs.Error {
 	} else {
 		side = banexg.OdSideBuy
 	}
-	curPrice := com.GetPrice(i.Symbol, side)
+	curPrice := com.GetPriceExp(i.Symbol, side, com.Day10MSecs)
 	if isStopLoss == (side == banexg.OdSideSell) {
 		// 触发价低于最新价：平多止损、平空止盈
 		if args.Price > curPrice {
