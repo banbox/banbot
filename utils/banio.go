@@ -479,6 +479,8 @@ func (c *BanConn) LoopPing(intvSecs int) {
 }
 
 func (c *BanConn) Close() *errs.Error {
+	c.lockConnect.Lock()
+	defer c.lockConnect.Unlock()
 	if c.Conn != nil {
 		err_ := c.Conn.Close()
 		c.Conn = nil
