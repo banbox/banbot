@@ -194,6 +194,12 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 		res.secret = uuid.New().String()
 	}
 	dashBot.SetData(res.secret, "secret")
+	dashBot.ReInitConn = func() {
+		err2 = initDashBot(res, name, nil)
+		if err2 != nil {
+			log.Error("re-initDashBot fail", zap.Error(err2))
+		}
+	}
 	dashBot.Listens["getSecret"] = func(msg *utils2.IOMsgRaw) {
 		err2 = dashBot.WriteMsg(&utils2.IOMsg{
 			Action: "onGetSecret",
