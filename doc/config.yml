@@ -174,9 +174,10 @@ rpc_channels:  # 支持的全部rpc渠道
     touser: '@all'
   telegram_notify:
     type: telegram
-    disable: true
-    token: "66:AAH-666"  # Telegram Bot Token；在Telegram中找到 @BotFather，发送 /newbot
-    chat_id: "666"       # 聊天ID（用户ID或群组ID）
+    disable: false
+    token: ""
+    chat_id: ""
+    secret: ""
 mail:  # 发送邮件配置
   enable: false
   host: smtp.example.com

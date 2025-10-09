@@ -6,6 +6,7 @@ import (
 	utils2 "github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 	"github.com/google/uuid"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,7 @@ var (
 	orderManager OrderManagerInterface
 	// 钱包信息提供者，由外部注入，避免循环依赖
 	walletProvider WalletInfoProvider
+	reUUID4        = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-4[a-fA-F0-9]{3}-[89abAB][a-fA-F0-9]{3}-[a-fA-F0-9]{12}$`)
 )
 
 // OrderInfo 订单信息结构
@@ -100,6 +102,7 @@ func NewTelegram(name string, item map[string]interface{}) *Telegram {
 	res := &Telegram{
 		WebHook: hook,
 		token:   utils.GetMapVal(item, "token", ""),
+		secret:  utils.GetMapVal(item, "secret", ""),
 	}
 	if hook.Disable {
 		return res
@@ -181,7 +184,15 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 		return err2
 	}
 	dashBot = ioClient
-	res.secret = uuid.New().String()
+	if res.secret != "" {
+		if !reUUID4.MatchString(res.secret) {
+			log.Warn("rpc_channels." + name + ".secret must be uuid v4 format, reset to random")
+			res.secret = ""
+		}
+	}
+	if res.secret == "" {
+		res.secret = uuid.New().String()
+	}
 	dashBot.SetData(res.secret, "secret")
 	dashBot.Listens["getSecret"] = func(msg *utils2.IOMsgRaw) {
 		err2 = dashBot.WriteMsg(&utils2.IOMsg{

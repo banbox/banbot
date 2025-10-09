@@ -119,6 +119,7 @@ rpc_channels:
     disable: false
     token: ""
     chat_id: ""
+    secret: ""
 mail:
   enable: false
   host: smtp.example.com
