@@ -114,6 +114,11 @@ rpc_channels:
     corp_secret: b123456789_1Cx1234YB9K-MuVW1234
     touser: '@all'
     msg_types: [exception]
+  telegram_notify:
+    type: telegram
+    disable: false
+    token: ""
+    chat_id: ""
 mail:
   enable: false
   host: smtp.example.com

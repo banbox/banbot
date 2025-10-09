@@ -806,15 +806,15 @@ func makeInitConn(s *LiveSpider) func(*utils.BanConn) {
 			miner := s.getMiner(arr[0], arr[1])
 			return miner, arr[2:]
 		}
-		c.Listens["watch_pairs"] = func(_ string, data []byte) {
-			miner, arr := handlePairs(data, "watch_pairs")
+		c.Listens["watch_pairs"] = func(msg *utils.IOMsgRaw) {
+			miner, arr := handlePairs(msg.Data, "watch_pairs")
 			err := miner.SubPairs(arr[0], arr[1:]...)
 			if err != nil {
 				log.Error("spider.sub_pairs fail", zap.Error(err))
 			}
 		}
-		c.Listens["unwatch_pairs"] = func(_ string, data []byte) {
-			miner, arr := handlePairs(data, "unwatch_pairs")
+		c.Listens["unwatch_pairs"] = func(msg *utils.IOMsgRaw) {
+			miner, arr := handlePairs(msg.Data, "unwatch_pairs")
 			err := miner.UnSubPairs(arr[0], arr[1:]...)
 			if err != nil {
 				log.Error("spider.unsub_pairs fail", zap.Error(err))

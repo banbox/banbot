@@ -26,7 +26,7 @@ func TestBanServer(t *testing.T) {
 				if conn.IsClosed() {
 					continue
 				}
-				err_ := conn.WriteMsg(&IOMsg{Action: "ping", Data: 1})
+				err_ := conn.WriteMsg(&IOMsg{Action: "ping", Data: 1, NoEncrypt: true})
 				if err_ != nil {
 					log.Warn("broadcast fail", zap.Error(err_))
 				}
@@ -116,7 +116,8 @@ func TestBanConnConcurrentLargeData(t *testing.T) {
 
 	server.InitConn = func(conn *BanConn) {
 		// 处理并发大数据
-		conn.Listens["concurrent_large_data"] = func(action string, data []byte) {
+		conn.Listens["concurrent_large_data"] = func(msg *IOMsgRaw) {
+			data := msg.Data
 			receivedMutex.Lock()
 			receivedCount++ // 每个测试的独立计数器
 			currentCount := receivedCount
@@ -171,8 +172,8 @@ func TestBanConnConcurrentLargeData(t *testing.T) {
 
 	// 统计收到的确认消息
 	receivedAcks := make(chan string, 100)
-	client.Listens["concurrent_ack"] = func(action string, data []byte) {
-		ackData := string(data)
+	client.Listens["concurrent_ack"] = func(msg *IOMsgRaw) {
+		ackData := string(msg.Data)
 		parts := strings.Split(ackData, ":")
 
 		if len(parts) == 2 {

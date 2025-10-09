@@ -161,7 +161,9 @@ func (w *KLineWatcher) UnWatchJobs(exgName, marketType, jobType string, pairs []
 	return w.WriteMsg(&utils.IOMsg{Action: "unsubscribe", Data: tags})
 }
 
-func (w *KLineWatcher) onSpiderBar(key string, data []byte) {
+func (w *KLineWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
+	key := raw.Action
+	data := raw.Data
 	if w.OnKLineMsg == nil {
 		log.Debug("spider bar skipped", zap.String("key", key))
 		return
@@ -241,7 +243,8 @@ func (w *KLineWatcher) onSpiderBar(key string, data []byte) {
 	}
 }
 
-func (w *KLineWatcher) onPriceUpdate(key string, data []byte) {
+func (w *KLineWatcher) onPriceUpdate(raw *utils.IOMsgRaw) {
+	key, data := raw.Action, raw.Data
 	parts := strings.Split(key, "_")
 	exgName, market := parts[1], parts[2]
 	if exgName != core.ExgName || market != core.Market {
@@ -256,10 +259,11 @@ func (w *KLineWatcher) onPriceUpdate(key string, data []byte) {
 	com.SetPrices(msg, "")
 }
 
-func (w *KLineWatcher) onTrades(key string, data []byte) {
+func (w *KLineWatcher) onTrades(msg *utils.IOMsgRaw) {
 	if w.OnTrades == nil {
 		return
 	}
+	key, data := msg.Action, msg.Data
 	parts := strings.Split(key, "_")
 	exgName, market, pair := parts[1], parts[2], parts[3]
 	var trades []*banexg.Trade
@@ -279,7 +283,8 @@ func (w *KLineWatcher) onTrades(key string, data []byte) {
 	w.OnTrades(exgName, market, pair, trades)
 }
 
-func (w *KLineWatcher) onBook(key string, data []byte) {
+func (w *KLineWatcher) onBook(msg *utils.IOMsgRaw) {
+	key, data := msg.Action, msg.Data
 	parts := strings.Split(key, "_")
 	msgType, exgName, market, pair := parts[0], parts[1], parts[2], parts[3]
 	if exgName != core.ExgName || market != core.Market {

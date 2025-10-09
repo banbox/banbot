@@ -24,16 +24,18 @@ import (
 	"time"
 )
 
-type ConnCB = func(string, []byte)
+type ConnCB = func(msg *IOMsgRaw)
 
 type IBanConn interface {
 	WriteMsg(msg *IOMsg) *errs.Error
-	Write(data []byte, doConvert bool) *errs.Error
+	Write(msg *IOMsgRaw) *errs.Error
 	ReadMsg() (*IOMsgRaw, *errs.Error)
 
 	SetData(val interface{}, tags ...string)
 	GetData(key string) (interface{}, bool)
 	DeleteData(tags ...string)
+	SetAesKey(aesKey string)
+	GetAesKey() string
 
 	SetWait(key string, size int) string
 	GetWaitChan(key string) (chan []byte, bool)
@@ -45,6 +47,7 @@ type IBanConn interface {
 	GetRemoteHost() string
 	IsClosed() bool
 	RunForever() *errs.Error
+	Close() *errs.Error
 }
 
 type BanConn struct {
@@ -64,16 +67,20 @@ type BanConn struct {
 	heartBeatMs int64               // Timestamp of the latest received ping/pong
 	DoConnect   func(conn *BanConn) // Reconnect function, no attempt to reconnect provided 重新连接函数，未提供不尝试重新连接
 	ReInitConn  func()              // Initialize callback function after successful reconnection 重新连接成功后初始化回调函数
+	Fallback    ConnCB
+	BadMsgCB    func(err *errs.Error)
 }
 
 type IOMsg struct {
-	Action string      `json:"action"`
-	Data   interface{} `json:"data"`
+	Action    string      `json:"action"`
+	Data      interface{} `json:"data"`
+	NoEncrypt bool        `json:"no_encrypt"`
 }
 
 type IOMsgRaw struct {
-	Action string `json:"action"`
-	Data   []byte `json:"data"`
+	Action    string `json:"action"`
+	Data      []byte `json:"data"`
+	NoEncrypt bool   `json:"no_encrypt"`
 }
 
 var (
@@ -108,22 +115,20 @@ func (c *BanConn) WriteMsg(msg *IOMsg) *errs.Error {
 	if c.Conn == nil {
 		return errs.NewMsg(errs.CodeIOWriteFail, "write fail as disconnected")
 	}
-	data, err := msg.Marshal()
+	data, err := msg.Marshal(c.aesKey)
 	if err != nil {
 		return err
 	}
-	return c.Write(data, true)
+	return c.Write(data)
 }
 
-func (c *BanConn) Write(data []byte, doConvert bool) *errs.Error {
-	if doConvert {
-		var err *errs.Error
-		data, err = convertData(data, c.aesKey)
-		if err != nil {
-			return err
-		}
+func (c *BanConn) Write(msg *IOMsgRaw) *errs.Error {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err_ := enc.Encode(msg); err_ != nil {
+		return errs.New(core.ErrMarshalFail, err_)
 	}
-	return c.write(data)
+	return c.write(buf.Bytes())
 }
 
 func (c *BanConn) write(data []byte) *errs.Error {
@@ -168,11 +173,7 @@ func (c *BanConn) write(data []byte) *errs.Error {
 }
 
 func (c *BanConn) ReadMsg() (*IOMsgRaw, *errs.Error) {
-	compressed, err := c.Read()
-	if err != nil {
-		return nil, err
-	}
-	data, err := deConvertData(compressed, c.aesKey)
+	data, err := c.Read()
 	if err != nil {
 		return nil, err
 	}
@@ -180,6 +181,14 @@ func (c *BanConn) ReadMsg() (*IOMsgRaw, *errs.Error) {
 	dec := gob.NewDecoder(bytes.NewReader(data))
 	if err_ := dec.Decode(&msg); err_ != nil {
 		return nil, errs.New(errs.CodeUnmarshalFail, err_)
+	}
+	aesKey := c.aesKey
+	if msg.NoEncrypt {
+		aesKey = ""
+	}
+	msg.Data, err = deConvertData(msg.Data, aesKey)
+	if err != nil {
+		return nil, err
 	}
 	return &msg, nil
 }
@@ -251,6 +260,14 @@ func (c *BanConn) DeleteData(tags ...string) {
 		delete(c.Data, tag)
 	}
 	c.lockData.Unlock()
+}
+
+func (c *BanConn) SetAesKey(aesKey string) {
+	c.aesKey = aesKey
+}
+
+func (c *BanConn) GetAesKey() string {
+	return c.aesKey
 }
 
 // SetWait set chan for key to wait async
@@ -341,12 +358,11 @@ func (c *BanConn) RunForever() *errs.Error {
 		c.Ready = false
 		c.IsReading = false
 		if c.Conn != nil {
-			err_ := c.Conn.Close()
-			if err_ != nil {
-				log.Error("close conn fail", zap.String("remote", c.Remote), zap.Error(err_))
+			err := c.Close()
+			if err != nil {
+				log.Error("close conn fail", zap.String("remote", c.Remote), zap.Error(err))
 			}
 			log.Info("close banConn as RunForever exit")
-			c.Conn = nil
 		}
 	}()
 	c.IsReading = true
@@ -355,7 +371,11 @@ func (c *BanConn) RunForever() *errs.Error {
 		if err != nil {
 			if err.Code == core.ErrDeCompressFail || err.Code == errs.CodeUnmarshalFail || err.Code == core.ErrDecryptFail {
 				// 无效消息，忽略
-				log.Error("invalid banIO msg", zap.Error(err))
+				if c.BadMsgCB != nil {
+					c.BadMsgCB(err)
+				} else {
+					log.Error("invalid banIO msg", zap.Error(err))
+				}
 				continue
 			}
 			return err
@@ -381,9 +401,13 @@ func (c *BanConn) RunForever() *errs.Error {
 			}
 		}
 		if matchHandle == nil {
-			log.Info("unhandle msg", zap.String("action", msg.Action))
+			if c.Fallback != nil {
+				c.Fallback(msg)
+			} else {
+				log.Info("unhandle msg", zap.String("action", msg.Action))
+			}
 		} else {
-			go matchHandle(msg.Action, msg.Data)
+			go matchHandle(msg)
 		}
 	}
 }
@@ -434,7 +458,7 @@ func (c *BanConn) LoopPing(intvSecs int) {
 			break
 		}
 		id += 1
-		err := c.WriteMsg(&IOMsg{Action: "ping", Data: id})
+		err := c.WriteMsg(&IOMsg{Action: "ping", Data: id, NoEncrypt: true})
 		if err != nil {
 			failNum += 1
 			if failNum >= 2 {
@@ -448,13 +472,21 @@ func (c *BanConn) LoopPing(intvSecs int) {
 			failNum = 0
 		}
 	}
+	err := c.Close()
+	if err != nil {
+		log.Warn("close ban conn error", addrField, zap.Error(err))
+	}
+}
+
+func (c *BanConn) Close() *errs.Error {
 	if c.Conn != nil {
 		err_ := c.Conn.Close()
-		if err_ != nil {
-			log.Warn("close ban conn error", addrField, zap.Error(err_))
-		}
 		c.Conn = nil
+		if err_ != nil {
+			return errs.New(errs.CodeIOWriteFail, err_)
+		}
 	}
+	return nil
 }
 
 func (c *BanConn) initListens() {
@@ -464,14 +496,14 @@ func (c *BanConn) initListens() {
 	c.Listens["unsubscribe"] = makeArrStrHandle(func(arr []string) {
 		c.DeleteData(arr...)
 	})
-	c.Listens["ping"] = func(s string, i []byte) {
+	c.Listens["ping"] = func(msg *IOMsgRaw) {
 		var val int64
-		err_ := utils.Unmarshal(i, &val, utils.JsonNumDefault)
+		err_ := utils.Unmarshal(msg.Data, &val, utils.JsonNumDefault)
 		if err_ != nil {
-			log.Warn("got bad ping", zap.ByteString("data", i))
+			log.Warn("got bad ping", zap.ByteString("data", msg.Data))
 			return
 		}
-		err := c.WriteMsg(&IOMsg{Action: "pong", Data: val + 1})
+		err := c.WriteMsg(&IOMsg{Action: "pong", Data: val + 1, NoEncrypt: true})
 		if err != nil {
 			log.Warn("write pong fail", zap.Int64("v", val), zap.Error(err))
 		} else {
@@ -479,18 +511,18 @@ func (c *BanConn) initListens() {
 			log.Debug("receive ping", zap.String("from", c.Remote), zap.Int64("v", val))
 		}
 	}
-	c.Listens["pong"] = func(s string, i []byte) {
+	c.Listens["pong"] = func(msg *IOMsgRaw) {
 		c.heartBeatMs = btime.UTCStamp()
 		log.Debug("receive pong", zap.String("from", c.Remote))
 	}
 }
 
-func makeArrStrHandle(cb func(arr []string)) func(s string, data []byte) {
-	return func(s string, data []byte) {
+func makeArrStrHandle(cb func(arr []string)) func(msg *IOMsgRaw) {
+	return func(msg *IOMsgRaw) {
 		var tags = make([]string, 0, 8)
-		err := utils.Unmarshal(data, &tags, utils.JsonNumDefault)
+		err := utils.Unmarshal(msg.Data, &tags, utils.JsonNumDefault)
 		if err != nil {
-			log.Error("receive invalid data", zap.String("n", s), zap.String("raw", string(data)),
+			log.Error("receive invalid data", zap.String("n", msg.Action), zap.String("raw", string(msg.Data)),
 				zap.Error(err))
 			return
 		}
@@ -515,37 +547,28 @@ func marshalAny(data interface{}) ([]byte, error) {
 	return byteRaw, nil
 }
 
-func (msg *IOMsg) Marshal() ([]byte, *errs.Error) {
+func (msg *IOMsg) Marshal(aesKey string) (*IOMsgRaw, *errs.Error) {
 	data, err_ := marshalAny(msg.Data)
 	if err_ != nil {
 		return nil, errs.New(core.ErrMarshalFail, err_)
 	}
-	msgRaw := &IOMsgRaw{
-		Action: msg.Action,
-		Data:   data,
-	}
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err_ = enc.Encode(msgRaw); err_ != nil {
-		return nil, errs.New(core.ErrMarshalFail, err_)
-	}
-	return buf.Bytes(), nil
-}
-
-func convertData(data []byte, aesKey string) ([]byte, *errs.Error) {
 	var err *errs.Error
 	data, err = compress(data)
 	if err != nil {
-		return data, err
+		return nil, err
 	}
-	if aesKey != "" {
-		var err_ error
+	if aesKey != "" && !msg.NoEncrypt {
 		data, err_ = EncryptData(data, aesKey)
 		if err_ != nil {
-			return data, errs.New(core.ErrEncryptFail, err_)
+			return nil, errs.New(core.ErrEncryptFail, err_)
 		}
 	}
-	return data, nil
+	msgRaw := &IOMsgRaw{
+		Action:    msg.Action,
+		Data:      data,
+		NoEncrypt: msg.NoEncrypt,
+	}
+	return msgRaw, nil
 }
 
 func deConvertData(compressed []byte, aesKey string) ([]byte, *errs.Error) {
@@ -739,17 +762,22 @@ func (s *ServerIO) Broadcast(msg *IOMsg) *errs.Error {
 	if len(curConns) == 0 {
 		return nil
 	}
-	raw, err := msg.Marshal()
-	if err != nil {
-		return err
-	}
-	compressed, err := convertData(raw, s.aesKey)
+	raw, err := msg.Marshal(s.aesKey)
 	if err != nil {
 		return err
 	}
 	for _, conn := range curConns {
 		go func(c IBanConn) {
-			err = c.Write(compressed, false)
+			aesKey := c.GetAesKey()
+			if aesKey != "" {
+				raw, err = msg.Marshal(aesKey)
+			}
+			if err != nil {
+				log.Warn("marshal fail", zap.String("remote", c.GetRemote()),
+					zap.String("tag", msg.Action), zap.Error(err))
+				return
+			}
+			err = c.Write(raw)
 			if err != nil {
 				log.Warn("broadcast fail", zap.String("remote", c.GetRemote()),
 					zap.String("tag", msg.Action), zap.Error(err))
@@ -770,11 +798,11 @@ func (s *ServerIO) WrapConn(conn net.Conn) *BanConn {
 		Remote:    conn.RemoteAddr().String(),
 		aesKey:    s.aesKey,
 	}
-	res.Listens["onGetVal"] = func(action string, data []byte) {
+	res.Listens["onGetVal"] = func(msg *IOMsgRaw) {
 		var key string
-		err_ := utils.Unmarshal(data, &key, utils.JsonNumDefault)
+		err_ := utils.Unmarshal(msg.Data, &key, utils.JsonNumDefault)
 		if err_ != nil {
-			log.Error("unmarshal fail onGetVal", zap.String("raw", string(data)), zap.Error(err_))
+			log.Error("unmarshal fail onGetVal", zap.String("raw", string(msg.Data)), zap.Error(err_))
 			return
 		}
 		val := s.GetVal(key)
@@ -783,11 +811,11 @@ func (s *ServerIO) WrapConn(conn net.Conn) *BanConn {
 			log.Error("write val res fail", zap.Error(err))
 		}
 	}
-	res.Listens["onSetVal"] = func(action string, data []byte) {
+	res.Listens["onSetVal"] = func(msg *IOMsgRaw) {
 		var args KeyValExpire
-		err := utils.Unmarshal(data, &args, utils.JsonNumDefault)
+		err := utils.Unmarshal(msg.Data, &args, utils.JsonNumDefault)
 		if err != nil {
-			log.Error("unmarshal fail onSetVal", zap.String("raw", string(data)), zap.Error(err))
+			log.Error("unmarshal fail onSetVal", zap.String("raw", string(msg.Data)), zap.Error(err))
 			return
 		}
 		s.SetVal(&args)

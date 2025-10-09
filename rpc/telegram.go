@@ -3,6 +3,9 @@ package rpc
 import (
 	"context"
 	"fmt"
+	utils2 "github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg/errs"
+	"github.com/google/uuid"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +40,7 @@ import (
 var (
 	telegramInstances = make(map[string]*Telegram)
 	telegramMutex     sync.RWMutex
+	dashBot           *utils2.ClientIO // 通过官方机器人管理
 	// 订单管理接口，由外部注入实现，避免循环依赖
 	orderManager OrderManagerInterface
 	// 钱包信息提供者，由外部注入，避免循环依赖
@@ -80,60 +84,151 @@ func SetWalletInfoProvider(p WalletInfoProvider) {
 
 type Telegram struct {
 	*WebHook
-	token  string
-	chatId int64
-	proxy  string
-	bot    *bot.Bot
-	ctx    context.Context
-	cancel context.CancelFunc
+	token    string
+	chatId   int64
+	secret   string
+	bot      *bot.Bot
+	ctx      context.Context
+	cancel   context.CancelFunc
+	chanSend chan *bot.SendMessageParams
 }
 
 // NewTelegram 构造函数，基于通用 WebHook 创建 Telegram 发送实例
 func NewTelegram(name string, item map[string]interface{}) *Telegram {
 	hook := NewWebHook(name, item)
 
-	token := utils.GetMapVal(item, "token", "")
-	if token == "" {
-		panic(name + ": `token` is required")
-	}
-
-	chatIdStr := utils.GetMapVal(item, "chat_id", "")
-	if chatIdStr == "" {
-		panic(name + ": `chat_id` is required")
-	}
-
-	chatId, err := strconv.ParseInt(chatIdStr, 10, 64)
-	if err != nil {
-		panic(name + ": invalid `chat_id`, must be a number: " + err.Error())
-	}
-
-	// 从配置中读取代理设置
-	proxy := utils.GetMapVal(item, "proxy", "")
-
-	// 创建带代理的HTTP客户端
-	httpClient := createWebHookClient(proxy)
-
-	// 创建bot实例
-	ctx, cancel := context.WithCancel(context.Background())
-	botInstance, err := bot.New(token, bot.WithHTTPClient(30*time.Second, httpClient))
-	if err != nil {
-		cancel()
-		panic(name + ": failed to create bot: " + err.Error())
-	}
-
 	res := &Telegram{
 		WebHook: hook,
-		token:   token,
-		chatId:  chatId,
-		proxy:   proxy,
-		bot:     botInstance,
-		ctx:     ctx,
-		cancel:  cancel,
+		token:   utils.GetMapVal(item, "token", ""),
+	}
+	if hook.Disable {
+		return res
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	res.ctx = ctx
+	res.cancel = cancel
+	res.doSendMsgs = makeDoSendMsgTelegram(res)
+	err := initCustomTgBot(res, name, item)
+	if err != nil {
+		if err.Code == errs.CodeParamRequired {
+			err = initDashBot(res, name, item)
+			if err != nil {
+				log.Error("init telegram fail", zap.Error(err))
+				return res
+			}
+		} else {
+			panic(err)
+		}
+	}
+	go res.loopSend()
+	return res
+}
+
+func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.Error {
+	if dashBot != nil {
+		if secretV, ok := dashBot.GetData("secret"); ok {
+			res.secret = secretV.(string)
+		}
+		return nil
+	}
+	genUrl := "https://www.banbot.site/api/banconn/token"
+
+	// 构建请求体
+	reqBody := map[string]string{
+		"name": config.Name,
+	}
+	reqData, err := utils.MarshalString(reqBody)
+	if err != nil {
+		return errs.New(errs.CodeRunTime, err)
 	}
 
-	res.doSendMsgs = makeDoSendMsgTelegram(res)
+	// 发送POST请求
+	client, req, err := prepareRequest("POST", genUrl, reqData, res.Proxy)
+	if err != nil {
+		return errs.New(errs.CodeRunTime, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-	// 设置命令处理器
+	rsp := utils2.DoHttp(client, req)
+	if rsp.Error != nil {
+		return rsp.Error
+	}
+
+	if rsp.Status != 200 {
+		return errs.NewMsg(errs.CodeRunTime, "failed to get banconn token, status: %d", rsp.Status)
+	}
+
+	// 解析响应
+	var result struct {
+		Success bool   `json:"success"`
+		Token   string `json:"token"`
+		IP      string `json:"ip"`
+		Name    string `json:"name"`
+		Expires string `json:"expires"`
+	}
+
+	if err = utils.UnmarshalString(rsp.Content, &result, utils.JsonNumDefault); err != nil {
+		return errs.New(errs.CodeRunTime, err)
+	}
+
+	if !result.Success {
+		return errs.NewMsg(errs.CodeRunTime, "failed to get banconn token")
+	}
+
+	// 创建ClientIO连接
+	ioClient, err2 := utils2.NewClientIO("www.banbot.site:6788", result.Token)
+	if err2 != nil {
+		return err2
+	}
+	dashBot = ioClient
+	res.secret = uuid.New().String()
+	dashBot.SetData(res.secret, "secret")
+	dashBot.Listens["getSecret"] = func(msg *utils2.IOMsgRaw) {
+		err2 = dashBot.WriteMsg(&utils2.IOMsg{
+			Action: "onGetSecret",
+			Data:   res.secret,
+		})
+		if err2 != nil {
+			log.Error("send onGetSecret fail", zap.Error(err2))
+		}
+	}
+	return dashBot.WriteMsg(&utils2.IOMsg{
+		Action:    "init",
+		Data:      config.Name,
+		NoEncrypt: true,
+	})
+}
+
+func initCustomTgBot(res *Telegram, name string, item map[string]interface{}) *errs.Error {
+	if res.token == "" {
+		return errs.NewMsg(errs.CodeParamRequired, "token is required")
+	}
+
+	if chatIdV, ok := item["chat_id"]; ok {
+		if chatIdInt, ok := chatIdV.(int); ok {
+			res.chatId = int64(chatIdInt)
+		} else if chatIdInt64, ok := chatIdV.(int64); ok {
+			res.chatId = chatIdInt64
+		} else if chatIdStr, ok := chatIdV.(string); ok {
+			chatId, err := strconv.ParseInt(chatIdStr, 10, 64)
+			if err != nil {
+				return errs.NewMsg(errs.CodeParamInvalid, "%s.chat_id is invalid, must be a number: %v", name, err)
+			}
+			res.chatId = chatId
+		} else {
+			return errs.NewMsg(errs.CodeParamInvalid, "%s.chat_id must be a number", name)
+		}
+	} else {
+		return errs.NewMsg(errs.CodeParamRequired, "%s.chat_id is required", name)
+	}
+
+	// 创建bot实例
+	httpClient := createWebHookClient(res.Proxy)
+	botInstance, err := bot.New(res.token, bot.WithHTTPClient(30*time.Second, httpClient))
+	if err != nil {
+		return errs.New(errs.CodeRunTime, err)
+	}
+	res.bot = botInstance
 	res.setupCommandHandlers()
 
 	// 注册到全局实例管理器
@@ -141,7 +236,7 @@ func NewTelegram(name string, item map[string]interface{}) *Telegram {
 	telegramInstances[name] = res
 	telegramMutex.Unlock()
 
-	return res
+	return nil
 }
 
 // Close 关闭Telegram客户端
@@ -161,41 +256,76 @@ func (t *Telegram) Close() {
 	telegramMutex.Unlock()
 }
 
+func (t *Telegram) loopSend() {
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case msg := <-t.chanSend:
+			err := t.send(msg)
+			if err != nil {
+				log.Error("send telegram msg fail", zap.Error(err))
+			}
+		}
+	}
+}
+
+func (t *Telegram) send(msg *bot.SendMessageParams) error {
+	// Telegram消息长度限制为4096字符
+	if len(msg.Text) > 4096 {
+		msg.Text = msg.Text[:4093] + "..."
+	}
+	log.Debug("telegram sending message", zap.String("text", msg.Text), zap.Int64("chat_id", t.chatId))
+	var err error
+	if t.bot == nil {
+		// 通过官方机器人发送
+		var msgStr string
+		msgStr, err = utils.MarshalString(msg)
+		if err != nil {
+			return err
+		}
+		err2 := dashBot.WriteMsg(&utils2.IOMsg{
+			Action: "telegram",
+			Data:   msgStr,
+		})
+		if err2 != nil {
+			err = err2
+		}
+	} else {
+		// 使用go-telegram/bot库发送消息
+		_, err = t.bot.SendMessage(t.ctx, msg)
+	}
+	return err
+}
+
 // makeDoSendMsgTelegram 返回批量Telegram消息发送函数，符合 WebHook.doSendMsgs 的签名要求
 func makeDoSendMsgTelegram(t *Telegram) func([]map[string]string) []map[string]string {
 	return func(msgList []map[string]string) []map[string]string {
-		var b strings.Builder
+		if t.bot == nil && dashBot == nil {
+			log.Debug("skip send telegram msg, no valid channel")
+			return nil
+		}
+		var msgArr []string
+		var charLen, offset int
 		for i, msg := range msgList {
 			content, _ := msg["content"]
 			if content == "" {
-				log.Error("telegram get empty msg, skip")
 				continue
 			}
-			if i > 0 {
-				b.WriteString("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+			if i > 0 && charLen+len(content) > 4096 {
+				break
 			}
-			b.WriteString(content)
+			msgArr = append(msgArr, content)
+			charLen += len(content) + 7
+			offset = i + 1
 		}
 
-		if b.Len() == 0 {
-			return nil
-		}
-
-		text := b.String()
-		// Telegram消息长度限制为4096字符
-		if len(text) > 4096 {
-			text = text[:4093] + "..."
-		}
-
-		log.Debug("telegram sending message", zap.String("text", text), zap.Int64("chat_id", t.chatId))
-
-		// 使用go-telegram/bot库发送消息
-		_, err := t.bot.SendMessage(t.ctx, &bot.SendMessageParams{
+		text := strings.Join(msgArr, "\n\n---\n\n")
+		err := t.send(&bot.SendMessageParams{
 			ChatID:    t.chatId,
 			Text:      text,
 			ParseMode: models.ParseModeHTML,
 		})
-
 		if err != nil {
 			log.Error("telegram send msg fail", zap.String("text", text),
 				zap.Int64("chat_id", t.chatId), zap.Error(err))
@@ -203,6 +333,9 @@ func makeDoSendMsgTelegram(t *Telegram) func([]map[string]string) []map[string]s
 		}
 
 		log.Debug("telegram send msg success", zap.Int("count", len(msgList)))
+		if offset < len(msgList) {
+			return msgList[offset:]
+		}
 		return nil
 	}
 }
@@ -264,14 +397,11 @@ func (t *Telegram) handleOrdersCommand(ctx context.Context, b *bot.Bot, update *
 	response := t.getOrdersList()
 	kb := t.buildOrdersInlineKeyboard()
 
-	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
+	t.chanSend <- &bot.SendMessageParams{
 		ChatID:      update.Message.Chat.ID,
 		Text:        response,
 		ParseMode:   models.ParseModeHTML,
 		ReplyMarkup: kb,
-	})
-	if err != nil {
-		log.Error("Failed to send orders message", zap.Error(err))
 	}
 }
 
@@ -399,14 +529,11 @@ func (t *Telegram) handleMenuCommand(ctx context.Context, b *bot.Bot, update *mo
 		menuText = `🎛️ <b>BanBot Menu</b>`
 	}
 
-	_, err = b.SendMessage(ctx, &bot.SendMessageParams{
+	t.chanSend <- &bot.SendMessageParams{
 		ChatID:      update.Message.Chat.ID,
 		Text:        menuText,
 		ParseMode:   models.ParseModeHTML,
 		ReplyMarkup: kb,
-	})
-	if err != nil {
-		log.Error("Failed to send menu", zap.Error(err))
 	}
 }
 
@@ -489,14 +616,10 @@ func (t *Telegram) isAuthorized(update *models.Update) bool {
 
 // sendResponse 发送响应消息
 func (t *Telegram) sendResponse(b *bot.Bot, update *models.Update, response string) {
-	_, err := b.SendMessage(t.ctx, &bot.SendMessageParams{
+	t.chanSend <- &bot.SendMessageParams{
 		ChatID:    update.Message.Chat.ID,
 		Text:      response,
 		ParseMode: models.ParseModeHTML,
-	})
-
-	if err != nil {
-		log.Error("Failed to send telegram response", zap.Error(err))
 	}
 }
 
@@ -1147,14 +1270,11 @@ func (t *Telegram) handleKeyboardOrdersCommand(ctx context.Context, b *bot.Bot, 
 		rows = append(rows, []models.InlineKeyboardButton{{Text: backToMenuBtn, CallbackData: "action:refresh"}})
 	}
 
-	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
+	t.chanSend <- &bot.SendMessageParams{
 		ChatID:      update.Message.Chat.ID,
 		Text:        ordersList,
 		ParseMode:   models.ParseModeHTML,
 		ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: rows},
-	})
-	if err != nil {
-		log.Error("Failed to send orders with inline buttons", zap.Error(err))
 	}
 }
 
@@ -1209,16 +1329,13 @@ func (t *Telegram) handleHideMenuCommand(ctx context.Context, b *bot.Bot, update
 	text := fmt.Sprintf("<b>%s</b>\n\n%s", menuHiddenTitle, menuHiddenTip)
 
 	// 发送隐藏键盘的消息
-	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
+	t.chanSend <- &bot.SendMessageParams{
 		ChatID:    update.Message.Chat.ID,
 		Text:      text,
 		ParseMode: models.ParseModeHTML,
 		ReplyMarkup: &models.ReplyKeyboardRemove{
 			RemoveKeyboard: true,
 		},
-	})
-	if err != nil {
-		log.Error("Failed to hide menu", zap.Error(err))
 	}
 }
 
@@ -1251,14 +1368,11 @@ func (t *Telegram) handleKeyboardWalletCommand(ctx context.Context, b *bot.Bot, 
 		},
 	}
 
-	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
+	t.chanSend <- &bot.SendMessageParams{
 		ChatID:      update.Message.Chat.ID,
 		Text:        response,
 		ParseMode:   models.ParseModeHTML,
 		ReplyMarkup: kb,
-	})
-	if err != nil {
-		log.Error("Failed to send wallet summary", zap.Error(err))
 	}
 }
 
