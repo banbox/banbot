@@ -6,6 +6,7 @@ import (
 	utils2 "github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 	"github.com/google/uuid"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -48,6 +49,12 @@ var (
 	walletProvider WalletInfoProvider
 	reUUID4        = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-4[a-fA-F0-9]{3}-[89abAB][a-fA-F0-9]{3}-[a-fA-F0-9]{12}$`)
 )
+
+type BotSecret struct {
+	Secret string `json:"secret"`
+	Pid    int    `json:"pid"`
+	Port   int    `json:"port"`
+}
 
 // OrderInfo 订单信息结构
 type OrderInfo struct {
@@ -171,9 +178,16 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 		}
 	}
 	dashBot.Listens["getSecret"] = func(msg *utils2.IOMsgRaw) {
+		info := BotSecret{
+			Secret: res.secret,
+			Pid:    os.Getpid(),
+		}
+		if config.APIServer != nil {
+			info.Port = config.APIServer.Port
+		}
 		err2 = ioClient.WriteMsg(&utils2.IOMsg{
 			Action: "onGetSecret",
-			Data:   res.secret,
+			Data:   info,
 		})
 		if err2 != nil {
 			log.Error("send onGetSecret fail", zap.Error(err2))
