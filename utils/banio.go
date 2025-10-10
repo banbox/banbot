@@ -182,13 +182,15 @@ func (c *BanConn) ReadMsg() (*IOMsgRaw, *errs.Error) {
 	if err_ := dec.Decode(&msg); err_ != nil {
 		return nil, errs.New(errs.CodeUnmarshalFail, err_)
 	}
-	aesKey := c.aesKey
-	if msg.NoEncrypt {
-		aesKey = ""
-	}
-	msg.Data, err = deConvertData(msg.Data, aesKey)
-	if err != nil {
-		return nil, err
+	if len(msg.Data) > 0 {
+		aesKey := c.aesKey
+		if msg.NoEncrypt {
+			aesKey = ""
+		}
+		msg.Data, err = deConvertData(msg.Data, aesKey)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &msg, nil
 }
@@ -550,6 +552,13 @@ func marshalAny(data interface{}) ([]byte, error) {
 }
 
 func (msg *IOMsg) Marshal(aesKey string) (*IOMsgRaw, *errs.Error) {
+	msgRaw := &IOMsgRaw{
+		Action:    msg.Action,
+		NoEncrypt: msg.NoEncrypt,
+	}
+	if msg.Data == nil {
+		return msgRaw, nil
+	}
 	data, err_ := marshalAny(msg.Data)
 	if err_ != nil {
 		return nil, errs.New(core.ErrMarshalFail, err_)
@@ -565,11 +574,7 @@ func (msg *IOMsg) Marshal(aesKey string) (*IOMsgRaw, *errs.Error) {
 			return nil, errs.New(core.ErrEncryptFail, err_)
 		}
 	}
-	msgRaw := &IOMsgRaw{
-		Action:    msg.Action,
-		Data:      data,
-		NoEncrypt: msg.NoEncrypt,
-	}
+	msgRaw.Data = data
 	return msgRaw, nil
 }
 
@@ -834,6 +839,7 @@ type ClientIO struct {
 	Addr string
 }
 
+// NewClientIO should call LoopPing & RunForever later
 func NewClientIO(addr, aesKey string) (*ClientIO, *errs.Error) {
 	conn, err_ := net.Dial("tcp", addr)
 	if err_ != nil {

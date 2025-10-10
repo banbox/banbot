@@ -134,52 +134,12 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 		}
 		return nil
 	}
-	genUrl := "https://www.banbot.site/api/banconn/token"
-
-	// 构建请求体
-	reqBody := map[string]string{
-		"name": config.Name,
+	sessionSecret, err2 := getSessionSecret(res.Proxy)
+	if err2 != nil {
+		return err2
 	}
-	reqData, err := utils.MarshalString(reqBody)
-	if err != nil {
-		return errs.New(errs.CodeRunTime, err)
-	}
-
-	// 发送POST请求
-	client, req, err := prepareRequest("POST", genUrl, reqData, res.Proxy)
-	if err != nil {
-		return errs.New(errs.CodeRunTime, err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	rsp := utils2.DoHttp(client, req)
-	if rsp.Error != nil {
-		return rsp.Error
-	}
-
-	if rsp.Status != 200 {
-		return errs.NewMsg(errs.CodeRunTime, "failed to get banconn token, status: %d", rsp.Status)
-	}
-
-	// 解析响应
-	var result struct {
-		Success bool   `json:"success"`
-		Token   string `json:"token"`
-		IP      string `json:"ip"`
-		Name    string `json:"name"`
-		Expires string `json:"expires"`
-	}
-
-	if err = utils.UnmarshalString(rsp.Content, &result, utils.JsonNumDefault); err != nil {
-		return errs.New(errs.CodeRunTime, err)
-	}
-
-	if !result.Success {
-		return errs.NewMsg(errs.CodeRunTime, "failed to get banconn token")
-	}
-
 	// 创建ClientIO连接
-	ioClient, err2 := utils2.NewClientIO("www.banbot.site:6788", result.Token)
+	ioClient, err2 := utils2.NewClientIO("www.banbot.site:6788", sessionSecret)
 	if err2 != nil {
 		return err2
 	}
@@ -195,13 +155,23 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 	}
 	dashBot.SetData(res.secret, "secret")
 	dashBot.ReInitConn = func() {
-		err2 = initDashBot(res, name, nil)
+		sessionSecret, err2 = getSessionSecret(res.Proxy)
+		if err2 != nil {
+			log.Error("re-initDashBot fail, get sess secret fail", zap.Error(err2))
+			return
+		}
+		ioClient.SetAesKey(sessionSecret)
+		err2 = dashBot.WriteMsg(&utils2.IOMsg{
+			Action:    "init",
+			Data:      config.Name,
+			NoEncrypt: true,
+		})
 		if err2 != nil {
 			log.Error("re-initDashBot fail", zap.Error(err2))
 		}
 	}
 	dashBot.Listens["getSecret"] = func(msg *utils2.IOMsgRaw) {
-		err2 = dashBot.WriteMsg(&utils2.IOMsg{
+		err2 = ioClient.WriteMsg(&utils2.IOMsg{
 			Action: "onGetSecret",
 			Data:   res.secret,
 		})
@@ -209,11 +179,65 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 			log.Error("send onGetSecret fail", zap.Error(err2))
 		}
 	}
+	go func() {
+		err := dashBot.RunForever()
+		if err != nil {
+			log.Warn("read client fail", zap.String("remote", dashBot.GetRemote()),
+				zap.String("err", err.Message()))
+		}
+	}()
 	return dashBot.WriteMsg(&utils2.IOMsg{
 		Action:    "init",
 		Data:      config.Name,
 		NoEncrypt: true,
 	})
+}
+
+func getSessionSecret(proxy string) (string, *errs.Error) {
+	genUrl := "https://www.banbot.site/api/banconn/token"
+
+	// 构建请求体
+	reqBody := map[string]string{
+		"name": config.Name,
+	}
+	reqData, err := utils.MarshalString(reqBody)
+	if err != nil {
+		return "", errs.New(errs.CodeRunTime, err)
+	}
+
+	// 发送POST请求
+	client, req, err := prepareRequest("POST", genUrl, reqData, proxy)
+	if err != nil {
+		return "", errs.New(errs.CodeRunTime, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	rsp := utils2.DoHttp(client, req)
+	if rsp.Error != nil {
+		return "", rsp.Error
+	}
+
+	if rsp.Status != 200 {
+		return "", errs.NewMsg(errs.CodeRunTime, "failed to get banconn token, status: %d", rsp.Status)
+	}
+
+	// 解析响应
+	var result struct {
+		Success bool   `json:"success"`
+		Token   string `json:"token"`
+		IP      string `json:"ip"`
+		Name    string `json:"name"`
+		Expires string `json:"expires"`
+	}
+
+	if err = utils.UnmarshalString(rsp.Content, &result, utils.JsonNumDefault); err != nil {
+		return "", errs.New(errs.CodeRunTime, err)
+	}
+
+	if !result.Success {
+		return "", errs.NewMsg(errs.CodeRunTime, "failed to get banconn token")
+	}
+	return result.Token, nil
 }
 
 func initCustomTgBot(res *Telegram, name string, item map[string]interface{}) *errs.Error {
