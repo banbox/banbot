@@ -565,24 +565,18 @@ func initLangFile(dataDir, lang string) *errs.Error {
 			continue
 		}
 
-		// 如果目标文件不存在，直接复制
-		if !utils.Exists(targetPath) {
-			err := utils.WriteFile(targetPath, sourceData)
-			if err != nil {
-				return err
-			}
-			log.Info("copied language file", zap.String("file", targetPath))
-			continue
-		}
-
 		// 对于 messages.json 文件，进行合并更新
 		if fileName == "messages.json" {
 			err := mergeMessagesFile(targetPath, sourceData)
 			if err != nil {
 				return err
 			}
+		} else {
+			err := utils.WriteFile(targetPath, sourceData)
+			if err != nil {
+				return err
+			}
 		}
-		// 对于其他文件（如 .txt 文件），如果已存在则跳过，不覆盖用户的修改
 	}
 
 	return nil

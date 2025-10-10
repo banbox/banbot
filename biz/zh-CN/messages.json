@@ -115,5 +115,13 @@
 	"long_order_label": "多单:",
 	"short_order_label": "空单:",
 	"success_count_label": "成功",
-	"failed_count_label": "失败"
+	"failed_count_label": "失败",
+	"switch_account": "🔄 切换账户",
+	"active_account_label": "🎯 当前账户:",
+	"account_list_title": "📋 账户列表",
+	"available_accounts_label": "可用账户:",
+	"switch_usage": "用法: <code>/switch [账户名]</code>\n\n使用 <code>/account</code> 查看所有可用账户",
+	"account_not_found": "❌ 账户 <code>%s</code> 不存在\n\n使用 <code>/account</code> 查看所有可用账户",
+	"account_switched": "✅ 已切换到账户: <code>%s</code>",
+	"refresh_accounts": "🔄 刷新"
 }

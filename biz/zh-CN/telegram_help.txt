@@ -1,17 +1,21 @@
 🤖 <b>BanBot Telegram 命令帮助</b>
 
+<b>账户管理:</b>
+• <code>/account</code> - 查看账户列表和切换账户
+• <code>/switch [账户名]</code> - 切换到指定账户
+
 <b>订单管理:</b>
 • <code>/menu</code> - 显示操作菜单（推荐）
-• <code>/orders</code> - 查看当前订单列表
+• <code>/orders</code> - 查看当前讦户的订单列表
 • <code>/close [订单ID|all]</code> - 平仓指定订单或所有订单
 
 <b>交易控制:</b>
-• <code>/status</code> - 查看当前交易状态
-• <code>/disable [小时]</code> - 禁止开单(默认1小时)
-• <code>/enable</code> - 重新启用开单
+• <code>/status</code> - 查看当前账户的交易状态
+• <code>/disable [小时]</code> - 禁止当前账户开单(默认1小时)
+• <code>/enable</code> - 重新启用当前账户开单
 
 <b>钱包信息:</b>
-• <code>/wallet</code> - 查看钱包总额/可用/未实现盈亏
+• <code>/wallet</code> - 查看当前账户钱包总额/可用/未实现盈亏
 
 <b>其他:</b>
 • <code>/help</code> - 显示此帮助信息

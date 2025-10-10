@@ -1,17 +1,21 @@
 🤖 <b>BanBot Telegram Command Help</b>
 
+<b>Account Management:</b>
+• <code>/account</code> - View account list and switch accounts
+• <code>/switch [account_name]</code> - Switch to specified account
+
 <b>Order Management:</b>
 • <code>/menu</code> - Show operation menu (recommended)
-• <code>/orders</code> - View current order list
+• <code>/orders</code> - View current account's order list
 • <code>/close [OrderID|all]</code> - Close specified order or all orders
 
 <b>Trading Control:</b>
-• <code>/status</code> - View current trading status
-• <code>/disable [hours]</code> - Disable trading (default 1 hour)
-• <code>/enable</code> - Re-enable trading
+• <code>/status</code> - View current account's trading status
+• <code>/disable [hours]</code> - Disable current account trading (default 1 hour)
+• <code>/enable</code> - Re-enable current account trading
 
 <b>Wallet Information:</b>
-• <code>/wallet</code> - View wallet total/available/unrealized PnL
+• <code>/wallet</code> - View current account wallet total/available/unrealized PnL
 
 <b>Other:</b>
 • <code>/help</code> - Show this help information

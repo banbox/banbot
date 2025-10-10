@@ -115,5 +115,13 @@
 	"long_order_label": "Long:",
 	"short_order_label": "Short:",
 	"success_count_label": "Success",
-	"failed_count_label": "Failed"
+	"failed_count_label": "Failed",
+	"switch_account": "🔄 Switch Account",
+	"active_account_label": "🎯 Active Account:",
+	"account_list_title": "📋 Account List",
+	"available_accounts_label": "Available Accounts:",
+	"switch_usage": "Usage: <code>/switch [account_name]</code>\n\nUse <code>/account</code> to view all available accounts",
+	"account_not_found": "❌ Account <code>%s</code> not found\n\nUse <code>/account</code> to view all available accounts",
+	"account_switched": "✅ Switched to account: <code>%s</code>",
+	"refresh_accounts": "🔄 Refresh"
 }
