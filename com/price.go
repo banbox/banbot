@@ -16,7 +16,11 @@ var (
 	askPrices     = make(map[string]*core.Int64Flt)
 	lockPrices    deadlock.RWMutex
 	lockBarPrices deadlock.RWMutex
-	Day10MSecs    = int64(864000000)
+	PriceExpireMS = int64(60000)
+)
+
+const (
+	Day10MSecs = int64(864000000)
 )
 
 func getPriceBySide(ask, bid map[string]*core.Int64Flt, lock *deadlock.RWMutex, symbol string, side string, expMS int64) (float64, bool) {
@@ -63,7 +67,7 @@ func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
 
 // GetPriceSafe return -1 if price expired or not found
 func GetPriceSafe(symbol string, side string) float64 {
-	return GetPriceSafeExp(symbol, side, 10000)
+	return GetPriceSafeExp(symbol, side, PriceExpireMS)
 }
 
 // GetPriceExp panic if price expired before expMS or not found

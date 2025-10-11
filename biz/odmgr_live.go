@@ -1109,7 +1109,7 @@ func ensureLatestPrice(symbol string) *errs.Error {
 		// 两次请求至少间隔3s
 		return errs.NewMsg(errs.CodeRunTime, "no valid price for %v", symbol)
 	}
-	_, _, err := getAskBidPrice(symbol)
+	_, err := getBookTickers()
 	lastPriceLoadAt = btime.UTCStamp()
 	return err
 }

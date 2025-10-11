@@ -45,7 +45,7 @@ func InitLocalLiveOrderMgr(callBack FnOdCb, showLog bool) {
 	}
 }
 
-func getAskBidPrice(symbol string) (float64, float64, *errs.Error) {
+func getBookTickers() (map[string]*banexg.Ticker, *errs.Error) {
 	key := fmt.Sprintf("%s_%s_bookTicker", core.ExgName, core.Market)
 	cacheVal, exist := core.Cache.Get(key)
 	var tickerMap map[string]*banexg.Ticker
@@ -54,7 +54,7 @@ func getAskBidPrice(symbol string) (float64, float64, *errs.Error) {
 			banexg.ParamMethod: "bookTicker",
 		})
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 		tickerMap = make(map[string]*banexg.Ticker)
 		for _, t := range tickers {
@@ -64,6 +64,14 @@ func getAskBidPrice(symbol string) (float64, float64, *errs.Error) {
 		core.Cache.SetWithTTL(key, tickerMap, 0, time.Millisecond*1500)
 	} else {
 		tickerMap = cacheVal.(map[string]*banexg.Ticker)
+	}
+	return tickerMap, nil
+}
+
+func getAskBidPrice(symbol string) (float64, float64, *errs.Error) {
+	tickerMap, err := getBookTickers()
+	if err != nil {
+		return 0, 0, err
 	}
 	if tick, ok := tickerMap[symbol]; ok {
 		return tick.Ask, tick.Bid, nil

@@ -897,15 +897,9 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 }
 
 func EnsurePricesLoaded() {
-	if com.IsPriceEmpty() {
-		// A one-time refresh if a price is requested when all prices are not loaded
-		// 所有价格都未加载时，如果请求价格，则一次性刷新
-		res, err := exg.Default.FetchTickerPrice("", nil)
-		if err != nil {
-			log.Error("load ticker prices fail", zap.Error(err))
-		} else {
-			com.SetPrices(res, "")
-		}
+	_, err := getBookTickers()
+	if err != nil {
+		log.Error("load ticker prices fail", zap.Error(err))
 	}
 }
 
