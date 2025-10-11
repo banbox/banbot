@@ -165,7 +165,7 @@ func GetOdBook(pair string) (*banexg.OrderBook, *errs.Error) {
 	return book, nil
 }
 
-func GetTickers() (map[string]*banexg.Ticker, *errs.Error) {
+func GetTickers24Hr() (map[string]*banexg.Ticker, *errs.Error) {
 	tickersMap := core.GetCacheVal("tickers", map[string]*banexg.Ticker{})
 	if len(tickersMap) > 0 {
 		return tickersMap, nil

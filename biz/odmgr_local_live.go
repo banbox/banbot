@@ -3,6 +3,7 @@ package biz
 import (
 	"fmt"
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
@@ -58,6 +59,7 @@ func getAskBidPrice(symbol string) (float64, float64, *errs.Error) {
 		tickerMap = make(map[string]*banexg.Ticker)
 		for _, t := range tickers {
 			tickerMap[t.Symbol] = t
+			com.SetPrice(t.Symbol, t.Ask, t.Bid)
 		}
 		core.Cache.SetWithTTL(key, tickerMap, 0, time.Millisecond*1500)
 	} else {

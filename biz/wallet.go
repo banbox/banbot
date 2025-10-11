@@ -449,10 +449,14 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 	}
 	var legalCost float64
 
+	curPrice := com.GetPriceSafe(od.Symbol, od.Enter.Side)
+	if curPrice < 0 {
+		return 0, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", od.Symbol)
+	}
 	if od.Enter.Amount != 0 {
 		price := od.Enter.Average
 		if price == 0 {
-			price = com.GetPrice(od.Symbol, od.Enter.Side)
+			price = curPrice
 		}
 		legalCost = od.Enter.Amount * price
 	} else {

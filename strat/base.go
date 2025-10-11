@@ -167,7 +167,10 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	if s.IsWarmUp {
 		curPrice = s.Env.Close.Get(0)
 	} else {
-		curPrice = com.GetPrice(symbol, odSide)
+		curPrice = com.GetPriceSafe(symbol, odSide)
+		if curPrice < 0 {
+			return errs.NewMsg(errs.CodeParamInvalid, "no valid price: %v", symbol)
+		}
 	}
 	enterPrice := curPrice
 	isLimit := core.IsLimitOrder(req.OrderType)
@@ -393,7 +396,10 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 			if s.IsWarmUp {
 				curPrice = s.Env.Close.Get(0)
 			} else {
-				curPrice = com.GetPrice(s.Symbol.Symbol, odSide)
+				curPrice = com.GetPriceSafe(s.Symbol.Symbol, odSide)
+				if curPrice < 0 {
+					return errs.NewMsg(errs.CodeParamInvalid, "no valid price: %v", s.Symbol.Symbol)
+				}
 			}
 			sl := &ormo.ExitTrigger{
 				Price: req.Limit,

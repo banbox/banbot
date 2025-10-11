@@ -393,7 +393,10 @@ func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, 
 	if req.Short {
 		odSide = banexg.OdSideSell
 	}
-	price := com.GetPrice(exs.Symbol, odSide)
+	price := com.GetPriceSafe(exs.Symbol, odSide)
+	if price < 0 {
+		return nil, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", exs.Symbol)
+	}
 	curTimeMS := btime.TimeMS()
 	taskId := ormo.GetTaskID(o.Account)
 	od := &ormo.InOutOrder{

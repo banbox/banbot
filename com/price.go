@@ -61,11 +61,12 @@ func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
 	return -1
 }
 
-// GetPriceSafe return -1 if not found
+// GetPriceSafe return -1 if price expired or not found
 func GetPriceSafe(symbol string, side string) float64 {
 	return GetPriceSafeExp(symbol, side, 10000)
 }
 
+// GetPriceExp panic if price expired before expMS or not found
 func GetPriceExp(symbol string, side string, expMS int64) float64 {
 	price := GetPriceSafeExp(symbol, side, expMS)
 	if price == -1 {
@@ -74,6 +75,7 @@ func GetPriceExp(symbol string, side string, expMS int64) float64 {
 	return price
 }
 
+// GetPrice panic if price expired or not found
 func GetPrice(symbol string, side string) float64 {
 	return GetPriceExp(symbol, side, 10000)
 }
