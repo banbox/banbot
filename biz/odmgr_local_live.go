@@ -61,6 +61,7 @@ func getBookTickers() (map[string]*banexg.Ticker, *errs.Error) {
 			tickerMap[t.Symbol] = t
 			com.SetPrice(t.Symbol, t.Ask, t.Bid)
 		}
+		log.Info("load book prices", zap.String("mkt", core.Market), zap.Int("num", len(tickerMap)))
 		core.Cache.SetWithTTL(key, tickerMap, 0, time.Millisecond*1500)
 	} else {
 		tickerMap = cacheVal.(map[string]*banexg.Ticker)

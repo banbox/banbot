@@ -371,11 +371,11 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 	var resOdList = make([]*ormo.InOutOrder, 0, len(openOds))
 	lock.Unlock()
 	for pair := range openPairs {
-		curOds := make([]*ormo.InOutOrder, 0, 2)
+		curOds := make(map[int64]*ormo.InOutOrder)
 		lock.Lock()
 		for _, od := range openOds {
 			if od.Symbol == pair {
-				curOds = append(curOds, od)
+				curOds[od.ID] = od
 			}
 		}
 		lock.Unlock()
@@ -392,7 +392,7 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 			}
 		}
 		prevTF, _ := pairLastTfs[pair]
-		curOds, err = o.syncPairOrders(pair, prevTF, longPos, shortPos, lastOrderMS, curOds)
+		err = o.syncPairOrders(pair, prevTF, longPos, shortPos, lastOrderMS, curOds)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -522,7 +522,7 @@ For the specified currency, synchronize the exchange order status to the local m
 sinceMS是本地记录的已处理交易所最新订单时间戳，只获取此后的订单，同步状态到本地。
 */
 func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *banexg.Position, sinceMS int64,
-	openOds []*ormo.InOutOrder) ([]*ormo.InOutOrder, *errs.Error) {
+	openOds map[int64]*ormo.InOutOrder) *errs.Error {
 	var exOrders []*banexg.Order
 	var err *errs.Error
 	var curMS = btime.UTCStamp()
@@ -538,7 +538,7 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 		banexg.ParamDirection: "endToStart",
 	})
 	if err != nil {
-		return openOds, err
+		return err
 	}
 	// 计算机器人仓位，其他端仓位
 	var longPosAmt, shortPosAmt float64
@@ -552,19 +552,28 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 	// 获取交易所订单后再获取连接，减少占用时长
 	sess, conn, err := ormo.Conn(orm.DbTrades, true)
 	if err != nil {
-		return openOds, err
+		return err
 	}
 	defer conn.Close()
 	if len(openOds) > 0 {
+		exIdMap := make(map[string]*ormo.InOutOrder)
+		for _, iod := range openOds {
+			if iod.Enter != nil && iod.Enter.OrderID != "" {
+				exIdMap[iod.Enter.OrderID] = iod
+			}
+			if iod.Exit != nil && iod.Exit.OrderID != "" {
+				exIdMap[iod.Exit.OrderID] = iod
+			}
+		}
 		for _, exod := range exOrders {
 			if !banexg.IsOrderDone(exod.Status) {
 				// Skip uncompleted orders
 				// 跳过未完成订单
 				continue
 			}
-			openOds, err = o.applyHisOrder(sess, openOds, exod, defTF)
+			err = o.applyHisOrder(sess, openOds, exIdMap, exod, defTF)
 			if err != nil {
-				return openOds, err
+				return err
 			}
 		}
 		// Check if the remaining open orders match the position. If not, close the corresponding orders.
@@ -579,9 +588,9 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 					err = iod.LocalExit(0, core.ExitTagCancel, iod.Enter.Price, msg, "")
 					strat.FireOdChange(o.Account, iod, strat.OdChgExitFill)
 					if err != nil {
-						return openOds, err
+						return err
 					}
-					openOds = utils.RemoveFromArr(openOds, iod, 1)
+					delete(openOds, iod.ID)
 				}
 				continue
 			}
@@ -593,10 +602,10 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 					err = iod.LocalExit(0, core.ExitTagFatalErr, iod.InitPrice, msg, "")
 					strat.FireOdChange(o.Account, iod, strat.OdChgExitFill)
 					if err != nil {
-						return openOds, err
+						return err
 					}
 				}
-				openOds = utils.RemoveFromArr(openOds, iod, 1)
+				delete(openOds, iod.ID)
 				continue
 			}
 			var fillAmt = float64(0)
@@ -612,9 +621,9 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 				err = iod.LocalExit(0, core.ExitTagFatalErr, iod.InitPrice, msg, "")
 				strat.FireOdChange(o.Account, iod, strat.OdChgExitFill)
 				if err != nil {
-					return openOds, err
+					return err
 				}
-				openOds = utils.RemoveFromArr(openOds, iod, 1)
+				delete(openOds, iod.ID)
 			} else if fillAmt < odAmt*0.99 {
 				price := com.GetPrice(pair, "")
 				holdCost := odAmt * price
@@ -651,33 +660,33 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 					zap.Float64("shortAmt", shortPosAmt), zap.Strings("local", shortOds))
 			}
 		}
-		return openOds, nil
+		return nil
 	}
 	if longPos != nil && longPosAmt > AmtDust {
 		longPos.Contracts = longPosAmt
 		longOd, err := o.createOdFromPos(longPos, defTF)
 		if err != nil {
-			return openOds, err
+			return err
 		}
-		openOds = append(openOds, longOd)
+		delete(openOds, longOd.ID)
 		err = longOd.Save(sess)
 		if err != nil {
-			return openOds, err
+			return err
 		}
 	}
 	if shortPos != nil && shortPosAmt > AmtDust {
 		shortPos.Contracts = shortPosAmt
 		shortOd, err := o.createOdFromPos(shortPos, defTF)
 		if err != nil {
-			return openOds, err
+			return err
 		}
-		openOds = append(openOds, shortOd)
+		delete(openOds, shortOd.ID)
 		err = shortOd.Save(sess)
 		if err != nil {
-			return openOds, err
+			return err
 		}
 	}
-	return openOds, nil
+	return nil
 }
 
 func getFeeNameCost(fee *banexg.Fee, pair, odType, side string, amount, price float64) (string, float64, float64) {
@@ -698,23 +707,80 @@ func getFeeNameCost(fee *banexg.Fee, pair, odType, side string, amount, price fl
 	return fee.Currency, fee.Cost, fee.QuoteCost
 }
 
-func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods []*ormo.InOutOrder, od *banexg.Order, defTF string) ([]*ormo.InOutOrder, *errs.Error) {
+func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods map[int64]*ormo.InOutOrder, exIdMap map[string]*ormo.InOutOrder, od *banexg.Order, defTF string) *errs.Error {
 	isShort := od.PositionSide == banexg.PosSideShort
 	isSell := od.Side == banexg.OdSideSell
 	exs, err := orm.GetExSymbolCur(od.Symbol)
 	if err != nil {
-		return ods, err
+		return err
 	}
 	feeName, feeCost, feeQuote := getFeeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Filled, od.Average)
 	price, amount, odTime := od.Average, od.Filled, od.Timestamp
 	defTF = config.GetTakeOverTF(od.Symbol, defTF)
 
+	var inOut *ormo.InOutOrder
+	var exOd *ormo.ExOrder
+	if iod, ok := exIdMap[od.ID]; ok {
+		// 通过订单id直接匹配
+		if iod.Enter != nil && iod.Enter.OrderID == od.ID {
+			exOd = iod.Enter
+		} else if iod.Exit != nil && iod.Exit.OrderID == od.ID {
+			exOd = iod.Exit
+		}
+		inOut = iod
+	}
+	if exOd == nil {
+		// 通过ClientOrderID解析目标订单
+		iodID := getClientOrderId(od.ClientOrderID)
+		if iodID > 0 {
+			if iod, ok := ods[iodID]; ok {
+				if isShort == isSell {
+					exOd = iod.Enter
+				} else {
+					exOd = iod.Exit
+				}
+				inOut = iod
+			}
+		}
+	}
+	if exOd != nil {
+		if amount > exOd.Filled*1.01 {
+			exOd.UpdateAt = odTime
+			exOd.Filled = amount
+			exOd.Amount = max(amount, exOd.Amount)
+			exOd.Average = price
+			exOd.FeeQuote = feeQuote
+			exOd.Fee = feeCost
+			exOd.FeeType = feeName
+			if od.Type != "" {
+				exOd.OrderType = od.Type
+			}
+			if od.Status == banexg.OdStatusFilled || amount >= exOd.Amount*0.99 {
+				exOd.Status = ormo.OdStatusClosed
+				exOd.Price = price
+				if exOd.Enter {
+					inOut.Status = ormo.InOutStatusFullEnter
+					inOut.DirtyEnter = true
+				} else {
+					inOut.Status = ormo.InOutStatusFullExit
+					inOut.DirtyExit = true
+				}
+			}
+			inOut.DirtyMain = true
+			inOut.UpdateProfits(price)
+			err = inOut.Save(nil)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if isShort == isSell {
 		// Open long or short 开多或开空
 		if defTF == "" {
 			log.Warn("take over job not found", zap.String("acc", o.Account),
 				zap.String("pair", od.Symbol), zap.String("strat", config.TakeOverStrat))
-			return ods, nil
+			return nil
 		}
 		tag := "[LONG]"
 		if isShort {
@@ -726,9 +792,9 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods []*ormo.InOutOrder,
 			od.ID, defTF)
 		err = iod.Save(sess)
 		if err != nil {
-			return ods, err
+			return err
 		}
-		ods = append(ods, iod)
+		ods[iod.ID] = iod
 	} else {
 		// Close long or short 平多或平空
 		var part *ormo.InOutOrder
@@ -742,7 +808,7 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods []*ormo.InOutOrder,
 			feeQuote *= feeLeft
 			err = part.Save(sess)
 			if err != nil {
-				return ods, err
+				return err
 			}
 			tag := "Close Long"
 			if isShort {
@@ -753,7 +819,7 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods []*ormo.InOutOrder,
 			if iod.Status < ormo.InOutStatusFullExit {
 				err = iod.Save(sess)
 				if err != nil {
-					return ods, err
+					return err
 				}
 			}
 			if amount <= AmtDust {
@@ -765,7 +831,7 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods []*ormo.InOutOrder,
 			if defTF == "" {
 				log.Warn("take over job not found", zap.String("acc", o.Account),
 					zap.String("pair", od.Symbol), zap.String("stagy", config.TakeOverStrat))
-				return ods, nil
+				return nil
 			}
 			tag := "[long]"
 			if isShort {
@@ -777,12 +843,12 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods []*ormo.InOutOrder,
 				od.ID, defTF)
 			err = iod.Save(sess)
 			if err != nil {
-				return ods, err
+				return err
 			}
-			ods = append(ods, iod)
+			ods[iod.ID] = iod
 		}
 	}
-	return ods, nil
+	return nil
 }
 
 func (o *LiveOrderMgr) createInOutOd(exs *orm.ExSymbol, short bool, average, filled float64, odType string,

@@ -7,6 +7,7 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/sasha-s/go-deadlock"
 	"gonum.org/v1/gonum/floats"
+	"math"
 	"strings"
 )
 
@@ -27,13 +28,14 @@ func getPriceBySide(ask, bid map[string]*core.Int64Flt, lock *deadlock.RWMutex, 
 	lock.RLock()
 	curMS := btime.TimeMS()
 	priceArr := make([]float64, 0, 1)
+	expMSFlt := float64(expMS)
 	if side == banexg.OdSideBuy || side == "" {
-		if item, ok := bid[symbol]; ok && curMS-item.Int <= expMS {
+		if item, ok := bid[symbol]; ok && math.Abs(float64(curMS-item.Int)) <= expMSFlt {
 			priceArr = append(priceArr, item.Val)
 		}
 	}
 	if side == banexg.OdSideSell || side == "" {
-		if item, ok := ask[symbol]; ok && curMS-item.Int <= expMS {
+		if item, ok := ask[symbol]; ok && math.Abs(float64(curMS-item.Int)) <= expMSFlt {
 			priceArr = append(priceArr, item.Val)
 		}
 	}
@@ -59,7 +61,7 @@ func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
 	item, ok := barPrices[symbol]
 	lockBarPrices.RUnlock()
 	curMS := btime.TimeMS()
-	if ok && curMS-item.Int <= expMS {
+	if ok && math.Abs(float64(curMS-item.Int)) <= float64(expMS) {
 		return item.Val
 	}
 	return -1
