@@ -208,7 +208,8 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 		if bar == nil {
 			price = com.GetPriceSafeExp(od.Symbol, "", com.Day10MSecs)
 			if price < 0 {
-				return 0, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", od.Symbol)
+				// here return error would cause backtest interrupt
+				return 0, nil
 			}
 		} else if strings.Contains(odType, "limit") && exOrder.Price > 0 {
 			if odIsBuy {
