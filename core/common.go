@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/anyongjin/cron"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/bntp"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
@@ -339,4 +340,17 @@ func SetLogCap(path string) {
 			CapOut.Stop()
 		}
 	})
+}
+
+func GetOdBook(pair string) (*banexg.OrderBook, bool) {
+	lockOdBook.Lock()
+	data, ok := OdBooks[pair]
+	lockOdBook.Unlock()
+	return data, ok
+}
+
+func SetOdBook(pair string, book *banexg.OrderBook) {
+	lockOdBook.Lock()
+	OdBooks[pair] = book
+	lockOdBook.Unlock()
 }

@@ -153,14 +153,14 @@ func GetLeverage(symbol string, notional float64, account string) (float64, floa
 }
 
 func GetOdBook(pair string) (*banexg.OrderBook, *errs.Error) {
-	book, ok := core.OdBooks[pair]
+	book, ok := core.GetOdBook(pair)
 	if !ok || book == nil || book.TimeStamp+config.OdBookTtl < btime.TimeMS() {
 		var err *errs.Error
 		book, err = Default.FetchOrderBook(pair, 1000, nil)
 		if err != nil {
 			return nil, err
 		}
-		core.OdBooks[pair] = book
+		core.SetOdBook(pair, book)
 	}
 	return book, nil
 }

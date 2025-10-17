@@ -681,7 +681,7 @@ func fireWsKlines(msg *KLineMsg) {
 		return
 	}
 	last := msg.Arr[len(msg.Arr)-1]
-	if _, ok := core.OdBooks[msg.Pair]; !ok {
+	if _, ok := core.GetOdBook(msg.Pair); !ok {
 		com.SetPrice(msg.Pair, last.Close, last.Close)
 	}
 	pairMap, _ := strat.WsSubJobs[core.WsSubKLine]

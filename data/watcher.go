@@ -277,7 +277,7 @@ func (w *KLineWatcher) onTrades(msg *utils.IOMsgRaw) {
 		return
 	}
 	last := trades[len(trades)-1]
-	if _, ok := core.OdBooks[pair]; !ok {
+	if _, ok := core.GetOdBook(pair); !ok {
 		com.SetPrice(pair, last.Price, last.Price)
 	}
 	w.OnTrades(exgName, market, pair, trades)
@@ -306,7 +306,7 @@ func (w *KLineWatcher) onBook(msg *utils.IOMsgRaw) {
 		return
 	}
 	com.SetPrice(pair, book.Asks.Price[0], book.Bids.Price[0])
-	core.OdBooks[pair] = &book
+	core.SetOdBook(pair, &book)
 	if w.OnDepth != nil {
 		w.OnDepth(&book)
 	}
