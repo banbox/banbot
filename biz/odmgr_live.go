@@ -1563,6 +1563,10 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 				}
 			}
 		}
+		err = ensureLatestPrice(od.Symbol)
+		if err != nil {
+			return err
+		}
 		realPrice := com.GetPrice(od.Symbol, od.Enter.Side)
 		// The market price should be used to calculate the quantity here, because the input price may be very different from the market price
 		// 这里应使用市价计算数量，因传入价格可能和市价相差很大
