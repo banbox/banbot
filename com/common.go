@@ -3,8 +3,8 @@ package com
 import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
-	"github.com/sasha-s/go-deadlock"
 	"maps"
+	"sync"
 )
 
 /*
@@ -22,7 +22,7 @@ func SetPairMs(pair string, barMS, waitMS int64) {
 
 var (
 	pairCopiedMs     = map[string][2]int64{} // The latest time that all targets received K lines from the crawler, as well as the waiting interval, are used to determine whether there are any that have not been received for a long time. 所有标的从爬虫收到K线的最新时间，以及等待间隔，用于判断是否有长期未收到的。
-	lockPairCopiedMs deadlock.RWMutex
+	lockPairCopiedMs sync.RWMutex            // 确认正确，无需 deadlock
 )
 
 func GetPairCopieds() map[string][2]int64 {

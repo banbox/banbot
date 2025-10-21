@@ -1,15 +1,15 @@
 package btime
 
 import (
-	"github.com/sasha-s/go-deadlock"
 	"math"
+	"sync"
 )
 
 type RetryWaits struct {
 	fails       map[string]int
 	retryAfters map[string]int64
 	sleeps      []int64 // milliseconds
-	lock        deadlock.Mutex
+	lock        sync.Mutex
 }
 
 // NewRetryWaits waits is array of sleep milliseconds while fail

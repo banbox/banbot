@@ -5,18 +5,18 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
-	"github.com/sasha-s/go-deadlock"
 	"gonum.org/v1/gonum/floats"
 	"math"
 	"strings"
+	"sync"
 )
 
 var (
 	barPrices     = make(map[string]*core.Int64Flt) // Latest price of each coin from bar, only for backtesting etc. The key can be a trading pair or a coin code 来自bar的每个币的最新价格，仅用于回测等。键可以是交易对，也可以是币的code
 	bidPrices     = make(map[string]*core.Int64Flt) // The latest order book price of the trading pair is only used for real-time simulation or real trading. The key can be a trading pair or a coin code 交易对的最新订单簿价格，仅用于实时模拟或实盘。键可以是交易对，也可以是币的code
 	askPrices     = make(map[string]*core.Int64Flt)
-	lockPrices    deadlock.RWMutex
-	lockBarPrices deadlock.RWMutex
+	lockPrices    sync.RWMutex // 确认正确，无需deadlock
+	lockBarPrices sync.RWMutex // 确认正确，无需deadlock
 	PriceExpireMS = int64(60000)
 )
 
@@ -24,7 +24,7 @@ const (
 	Day10MSecs = int64(864000000)
 )
 
-func getPriceBySide(ask, bid map[string]*core.Int64Flt, lock *deadlock.RWMutex, symbol string, side string, expMS int64) (float64, bool) {
+func getPriceBySide(ask, bid map[string]*core.Int64Flt, lock *sync.RWMutex, symbol string, side string, expMS int64) (float64, bool) {
 	lock.RLock()
 	curMS := btime.TimeMS()
 	priceArr := make([]float64, 0, 1)

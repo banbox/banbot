@@ -6,6 +6,7 @@
 * 不接受AI生成的大段文档，此代码库中文档应保持精炼；可将示例配置维护到doc/config.yml，将其他文档维护到bandoc（也可发邮件到anyongjin163@163.com）
 * 注意多语言支持，短文本应使用`GetLangMsg`，较长内容应使用`ReadLangFile`；
 * 要合并的提交应保持干净，可使用`git cherry-pick`和`git reset --soft`从最新主分支代码挑选必要的提交，不要包含"Merge xxx"
+* 对于锁的复杂引用应使用deadlock，简单的确定的使用不应使用deadlock，（高频调用deadlock会内存泄漏）
 
 # 常见问题
 ### 如何进行函数性能测试？（不含IO）
@@ -56,6 +57,3 @@ git push origin --tags
 
 ### json
 It is not recommended to replace `encoding/json` with [sonic](https://github.com/bytedance/sonic/issues/574). The binary file will increase by 15M (on Windows)
-
-# TODO
-1. telegram bot改为webhook，使用官网中转，无需用户创建机器人
