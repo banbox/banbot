@@ -8,6 +8,7 @@ import (
 	"maps"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -594,8 +595,8 @@ func makeOnKlineMsg(p *LiveProvider) func(msg *KLineMsg) {
 			return
 		}
 		tfMSecs := int64(msg.TFSecs * 1000)
-		handleNewBars := func(bars []*banexg.Kline) {
-			go func() {
+		handleNewBars := func(bars_ []*banexg.Kline) {
+			go func(bars []*banexg.Kline) {
 				_, err := hold.onNewBars(tfMSecs, bars)
 				if err != nil {
 					log.Error("onNewBars fail", zap.String("p", msg.Pair), zap.Error(err))
@@ -606,7 +607,7 @@ func makeOnKlineMsg(p *LiveProvider) func(msg *KLineMsg) {
 						log.Error("OnMinKlines fail", zap.String("p", msg.Pair), zap.Error(err))
 					}
 				}
-			}()
+			}(bars_)
 		}
 		// The weighting factor has been calculated during the start-up or market break, and the weighting is automatically carried out internally
 		// 已在启动或休市期间计算复权因子，内部会自动进行复权

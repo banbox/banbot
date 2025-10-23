@@ -40,7 +40,7 @@ type KLineMsg struct {
 /** *******************************  Spider 爬虫部分   ****************************
  */
 var (
-	writeQ           = make(chan *SaveKline, 1000)
+	writeQ           = make(chan *SaveKline, 9999)
 	KlineParallelNum = 6 // 抓取K线时的同时并发数
 )
 
@@ -49,6 +49,7 @@ type SaveKline struct {
 	TimeFrame string
 	Arr       []*banexg.Kline
 	MsgAction string
+	ReceiveAt int64
 }
 
 func consumeWriteQ(workNum int) {
@@ -70,14 +71,33 @@ func consumeWriteQ(workNum int) {
 	}
 	mntSta := newPeriodSta("1m")
 	hourSta := newPeriodSta("1h")
+	ema := core.NewEMA(0.1)
+	lastDelayWarn := int64(0)
 	for save := range writeQ {
 		setOne()
+		waitMS := float64(btime.UTCStamp() - save.ReceiveAt)
+		waitMa := ema.Update(waitMS)
+		if waitMa > 1000 && len(writeQ) > 10 && btime.UTCStamp() > lastDelayWarn+60000 {
+			lastDelayWarn = btime.UTCStamp()
+			log.Warn("kline save task consume slowly", zap.Int("waitMS", int(waitMa)), zap.Int("waitNum", len(writeQ)))
+		}
 		go func(job *SaveKline) {
+			start := time.Now()
+			var saveCost, totalCost time.Duration
+			tfSecs := utils2.TFToSecs(job.TimeFrame)
 			defer func() {
+				if totalCost > time.Millisecond*100 {
+					waitCost := btime.UTCStamp() - job.ReceiveAt
+					barEnd := job.Arr[len(job.Arr)-1].Time + int64(tfSecs*1000)
+					barEndStr := btime.ToDateStr(barEnd, core.DefaultDateFmt)
+					log.Info("save kline", zap.Int32("sid", job.Sid), zap.Int64("waitMS", waitCost),
+						zap.Duration("saveDb", saveCost), zap.Duration("send", totalCost-saveCost),
+						zap.String("barEnd", barEndStr))
+				}
 				<-guard
 			}()
-			tfSecs := utils2.TFToSecs(job.TimeFrame)
 			trySaveKlines(job, tfSecs, mntSta, hourSta)
+			saveCost = time.Since(start)
 			// After the K-line is written to the database, a message will be sent to notify the robot to avoid repeated insertion of K-line
 			// 写入K线到数据库后，才发消息通知机器人，避免重复插入K线
 			err := Spider.Broadcast(&utils.IOMsg{
@@ -88,6 +108,7 @@ func consumeWriteQ(workNum int) {
 					Arr:      job.Arr,
 				},
 			})
+			totalCost = time.Since(start)
 			if err != nil {
 				log.Error("broadCast kline fail", zap.String("action", job.MsgAction), zap.Error(err))
 			}
@@ -706,6 +727,7 @@ func (m *Miner) startLoopKLines() {
 							TimeFrame: curTF,
 							Arr:       bars,
 							MsgAction: prefix + p,
+							ReceiveAt: btime.UTCStamp(),
 						}
 					}
 				}

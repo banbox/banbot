@@ -53,8 +53,9 @@ const (
 
 	// other
 
-	ErrAuthFail    = -200
-	ErrServerError = -201
+	ErrAuthFail      = -200
+	ErrServerError   = -201
+	ErrOutOfResource = -202
 )
 
 func init() {
@@ -93,5 +94,6 @@ func init() {
 		ErrNetConnect:        "NetConnect",
 		ErrAuthFail:          "AuthFail",
 		ErrServerError:       "ServerError",
+		ErrOutOfResource:     "OutOfResource",
 	})
 }
