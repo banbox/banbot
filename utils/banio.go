@@ -454,6 +454,15 @@ func (c *BanConn) LoopPing(intvSecs int) {
 		if !c.IsReading {
 			continue
 		}
+		if !c.Ready {
+			if c.lockConnect.TryLock() {
+				// 获取锁成功，未正在连接，可继续ping
+				c.lockConnect.Unlock()
+			} else {
+				// 获取锁失败，正在重新连接，跳过ping
+				continue
+			}
+		}
 		timeouts := float64(btime.UTCStamp()-c.heartBeatMs) / 1000 / float64(intvSecs)
 		if id > 1 && timeouts > 2.2 {
 			log.Error("close conn as ping timeout", addrField, zap.Int64("last", c.heartBeatMs))
