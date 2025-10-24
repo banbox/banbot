@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/banbox/banbot/exg"
 	utils2 "github.com/banbox/banbot/utils"
@@ -193,7 +194,7 @@ func Conn(ctx context.Context) (*Queries, *pgxpool.Conn, *errs.Error) {
 	if err != nil {
 		return nil, nil, errs.New(core.ErrDbConnFail, err)
 	}
-	return New(conn), conn, nil
+	return New(&SubQueries{db: conn}), conn, nil
 }
 
 func SetDbPath(key, path string) {
@@ -277,6 +278,12 @@ func (t *Tx) Close(ctx context.Context, commit bool) *errs.Error {
 	return nil
 }
 
+func (q *Queries) SetShow(allow bool) {
+	if it, ok := q.db.(*SubQueries); ok {
+		it.ShowLog = allow
+	}
+}
+
 func (q *Queries) NewTx(ctx context.Context) (*Tx, *Queries, *errs.Error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -285,7 +292,11 @@ func (q *Queries) NewTx(ctx context.Context) (*Tx, *Queries, *errs.Error) {
 	if err != nil {
 		return nil, nil, errs.New(core.ErrDbConnFail, err)
 	}
-	nq := q.WithTx(tx)
+	allowShow := false
+	if it, ok := q.db.(*SubQueries); ok {
+		allowShow = it.ShowLog
+	}
+	nq := q.WithTx(&SubQueries{db: tx, ShowLog: allowShow})
 	return &Tx{tx: tx}, nq, nil
 }
 
@@ -295,6 +306,96 @@ func (q *Queries) Exec(sql string, args ...interface{}) *errs.Error {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
 	return nil
+}
+
+type SubQueries struct {
+	db      DBTX
+	ShowLog bool
+}
+
+func (q *SubQueries) Begin(ctx context.Context) (pgx.Tx, error) {
+	if tx, ok := q.db.(pgx.Tx); ok {
+		return tx.Begin(ctx)
+	}
+	return nil, fmt.Errorf("db is not pgx.Tx")
+}
+
+func (q *SubQueries) Commit(ctx context.Context) error {
+	if tx, ok := q.db.(pgx.Tx); ok {
+		return tx.Commit(ctx)
+	}
+	return fmt.Errorf("db is not pgx.Tx")
+}
+
+func (q *SubQueries) Rollback(ctx context.Context) error {
+	if tx, ok := q.db.(pgx.Tx); ok {
+		return tx.Rollback(ctx)
+	}
+	return fmt.Errorf("db is not pgx.Tx")
+}
+
+func (q *SubQueries) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	if tx, ok := q.db.(pgx.Tx); ok {
+		return tx.SendBatch(ctx, b)
+	}
+	panic("db is not pgx.Tx")
+}
+
+func (q *SubQueries) LargeObjects() pgx.LargeObjects {
+	if tx, ok := q.db.(pgx.Tx); ok {
+		return tx.LargeObjects()
+	}
+	panic("db is not pgx.Tx")
+}
+
+func (q *SubQueries) Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error) {
+	if tx, ok := q.db.(pgx.Tx); ok {
+		return tx.Prepare(ctx, name, sql)
+	}
+	return nil, fmt.Errorf("db is not pgx.Tx")
+}
+
+func (q *SubQueries) Conn() *pgx.Conn {
+	if tx, ok := q.db.(pgx.Tx); ok {
+		return tx.Conn()
+	}
+	panic("db is not pgx.Tx")
+}
+
+func (q *SubQueries) Exec(ctx context.Context, sql string, params ...interface{}) (pgconn.CommandTag, error) {
+	start := time.Now()
+	res, err := q.db.Exec(ctx, sql, params...)
+	if q.ShowLog {
+		log.Info("db exec", zap.String("sql", sql), zap.Duration("cost", time.Since(start)))
+	}
+	return res, err
+}
+
+func (q *SubQueries) Query(ctx context.Context, sql string, params ...interface{}) (pgx.Rows, error) {
+	start := time.Now()
+	res, err := q.db.Query(ctx, sql, params...)
+	if q.ShowLog {
+		log.Info("db query", zap.String("sql", sql), zap.Duration("cost", time.Since(start)))
+	}
+	return res, err
+}
+
+func (q *SubQueries) QueryRow(ctx context.Context, sql string, params ...interface{}) pgx.Row {
+	start := time.Now()
+	res := q.db.QueryRow(ctx, sql, params...)
+	if q.ShowLog {
+		log.Info("db QueryRow", zap.String("sql", sql), zap.Duration("cost", time.Since(start)))
+	}
+	return res
+}
+
+func (q *SubQueries) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {
+	start := time.Now()
+	res, err := q.db.CopyFrom(ctx, tableName, columnNames, rowSrc)
+	if q.ShowLog {
+		log.Info("db CopyFrom", zap.String("tbl", tableName.Sanitize()), zap.Duration("cost", time.Since(start)))
+	}
+	return res, err
 }
 
 func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *errs.Error) {

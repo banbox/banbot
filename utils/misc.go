@@ -11,8 +11,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/anyongjin/cron"
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/cron/v3"
 	"github.com/felixge/fgprof"
 	"io"
 	"net/http"
@@ -512,7 +513,7 @@ func StartCpuProfile(path string, port int) *errs.Error {
 
 func NewCronScheduler(exp string) (cron.Schedule, error) {
 	parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
-	return parser.Parse(exp)
+	return parser.Parse(exp, btime.LocShow)
 }
 
 func CronPrev(scd cron.Schedule, stamp time.Time) time.Time {

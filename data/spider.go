@@ -3,15 +3,16 @@ package data
 import (
 	"fmt"
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
-	"github.com/banbox/banexg/bntp"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
+	"github.com/banbox/bntp"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 	"maps"
@@ -40,6 +41,8 @@ type KLineMsg struct {
 /** *******************************  Spider 爬虫部分   ****************************
  */
 var (
+	sidMap           = make(map[int32]*SaveKline)
+	sidLock          = sync.Mutex{}
 	writeQ           = make(chan *SaveKline, 9999)
 	KlineParallelNum = 6 // 抓取K线时的同时并发数
 )
@@ -86,16 +89,20 @@ func consumeWriteQ(workNum int) {
 			var saveCost, totalCost time.Duration
 			tfSecs := utils2.TFToSecs(job.TimeFrame)
 			defer func() {
-				if totalCost > time.Millisecond*100 {
+				if totalCost > time.Millisecond*50 {
 					waitCost := btime.UTCStamp() - job.ReceiveAt
 					barEnd := job.Arr[len(job.Arr)-1].Time + int64(tfSecs*1000)
 					barEndStr := btime.ToDateStr(barEnd, core.DefaultDateFmt)
 					log.Info("save kline", zap.Int32("sid", job.Sid), zap.Int64("waitMS", waitCost),
 						zap.Duration("saveDb", saveCost), zap.Duration("send", totalCost-saveCost),
-						zap.String("barEnd", barEndStr))
+						zap.Int("num", len(job.Arr)), zap.String("barEnd", barEndStr))
 				}
 				<-guard
 			}()
+			// Remove from sidMap when job is consumed
+			sidLock.Lock()
+			delete(sidMap, job.Sid)
+			sidLock.Unlock()
 			trySaveKlines(job, tfSecs, mntSta, hourSta)
 			saveCost = time.Since(start)
 			// After the K-line is written to the database, a message will be sent to notify the robot to avoid repeated insertion of K-line
@@ -683,11 +690,12 @@ func (m *Miner) startLoopKLines() {
 	curTF := "1m"
 	prefix := fmt.Sprintf("ohlcv_%s_%s_", m.ExgName, m.Market)
 	// 刷新K线
-	refreshKlines := func(curTimeMS int64) {
+	com.Cron().AddFunc("0 * * * * *", func() {
 		pairs := m.KLineApis.KeyMap()
 		if len(pairs) == 0 {
 			return
 		}
+		curTimeMS := btime.UTCStamp()
 		var pairLock sync.Mutex
 		startMS := utils2.AlignTfMSecs(curTimeMS, mntMSecs)
 		retry := 0
@@ -704,6 +712,7 @@ func (m *Miner) startLoopKLines() {
 				sta, _ := m.klineStates[p]
 				m.lockBarState.Unlock()
 				if sta == nil {
+					log.Warn("no sta to writeQ", zap.String("pair", p))
 					return nil
 				}
 				bars, err := m.exchange.FetchOHLCV(p, curTF, sta.ExpectMS, 0, nil)
@@ -722,14 +731,32 @@ func (m *Miner) startLoopKLines() {
 						sta.ExpectMS = bars[len(bars)-1].Time + mntMSecs
 						// There are completed k-lines, written to the database, and only then the message is broadcast
 						// 有已完成的k线，写入到数据库，然后才广播消息
-						writeQ <- &SaveKline{
-							Sid:       sta.Sid,
-							TimeFrame: curTF,
-							Arr:       bars,
-							MsgAction: prefix + p,
-							ReceiveAt: btime.UTCStamp(),
+						sidLock.Lock()
+						existingJob, exists := sidMap[sta.Sid]
+						if exists {
+							// Append to existing job's Arr
+							existingJob.Arr = append(existingJob.Arr, bars...)
+							sidLock.Unlock()
+							log.Debug("kline appended to existing job", zap.Int32("sid", sta.Sid), zap.String("pair", p),
+								zap.Int("num", len(bars)), zap.Int("total", len(existingJob.Arr)))
+						} else {
+							// Create new job and add to both sidMap and writeQ
+							newJob := &SaveKline{
+								Sid:       sta.Sid,
+								TimeFrame: curTF,
+								Arr:       bars,
+								MsgAction: prefix + p,
+								ReceiveAt: btime.UTCStamp(),
+							}
+							sidMap[sta.Sid] = newJob
+							sidLock.Unlock()
+							writeQ <- newJob
+							log.Debug("kline to writeQ", zap.Int32("sid", sta.Sid), zap.String("pair", p),
+								zap.Int64("time", last.Time), zap.Int("num", len(bars)))
 						}
 					}
+				} else {
+					log.Info("no bars to writeQ", zap.Int32("sid", sta.Sid), zap.String("pair", p))
 				}
 				pairLock.Lock()
 				delete(pairs, p)
@@ -746,24 +773,7 @@ func (m *Miner) startLoopKLines() {
 		fails := utils.KeysOfMap(pairs)
 		log.Info(fmt.Sprintf("fetched kline %d/%d pairs, retried: %d, total kline: %d at %d, fails: %v",
 			initNum-len(pairs), initNum, retry, barNum, curTimeMS, fails))
-	}
-	go func() {
-		defer func() {
-			m.IsLoopKline = false
-		}()
-		curMS := bntp.UTCStamp()
-		waitMS := utils2.AlignTfMSecs(curMS+mntMSecs, mntMSecs) - curMS
-		core.Sleep(time.Duration(waitMS) * time.Millisecond)
-		t := time.NewTicker(time.Duration(mntMSecs) * time.Millisecond)
-		for {
-			select {
-			case <-t.C:
-				refreshKlines(bntp.UTCStamp())
-			case <-core.Ctx.Done():
-				return
-			}
-		}
-	}()
+	})
 }
 
 func RunSpider(addr string) *errs.Error {
@@ -788,6 +798,7 @@ func RunSpider(addr string) *errs.Error {
 	// Start the subscription monitor goroutine
 	go Spider.monitorSubscriptions()
 
+	com.Cron().Start()
 	return Spider.RunForever()
 }
 

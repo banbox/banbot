@@ -6,7 +6,6 @@ import (
 	"github.com/sasha-s/go-deadlock"
 	"sync"
 
-	"github.com/anyongjin/cron"
 	"github.com/banbox/banexg"
 )
 
@@ -35,7 +34,6 @@ var (
 	LastCopiedMs  int64                                // 上次收到爬虫进程推送k线的时间戳
 	OdBooks       = map[string]*banexg.OrderBook{}     // Cache all order books received from crawler 缓存所有从爬虫收到的订单簿
 	NumTaCache    = 1500                               // The number of historical values cached during indicator calculation, default 1500 指标计算时缓存的历史值数量，默认1500
-	Cron          = cron.New(cron.WithSeconds())       // Use cron to run tasks regularly 使用cron定时运行任务
 
 	ExitCalls []func() // CALLBACK TO STOP EXECUTION 停止执行的回调
 	CapOut    *log.OutCapture
@@ -50,7 +48,7 @@ var (
 	lockOdBook sync.Mutex // 确认不冲突，无需用deadlock
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.2.23-beta.26"
+	Version   = "v0.2.23-beta.27"
 	UIVersion = "v0.2.23-beta.3"
 	SysLang   string // language code for current system 当前系统语言设置
 	LogFile   string

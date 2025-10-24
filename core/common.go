@@ -3,33 +3,21 @@ package core
 import (
 	"bytes"
 	"fmt"
-	"github.com/anyongjin/cron"
 	"github.com/banbox/banexg"
-	"github.com/banbox/banexg/bntp"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/dgraph-io/ristretto"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
-	"log/slog"
 	"math"
 	"os"
 	"strings"
-	"time"
 	"unicode"
 )
 
 var (
 	Cache *ristretto.Cache
 )
-
-func init() {
-	// for cron logging
-	slog.SetLogLoggerLevel(slog.LevelWarn)
-	cron.FnTimeNow = func() time.Time {
-		return bntp.Now()
-	}
-}
 
 func Setup() *errs.Error {
 	var err_ error

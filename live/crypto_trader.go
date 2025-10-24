@@ -2,6 +2,7 @@ package live
 
 import (
 	"fmt"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg/utils"
@@ -199,7 +200,7 @@ func (t *CryptoTrader) startJobs() {
 		// 定期更新余额，同步交易所持仓到本地订单
 		StartLoopBalancePositions()
 	}
-	core.Cron.Start()
+	com.Cron().Start()
 }
 
 func (t *CryptoTrader) markUnWarm() {
@@ -220,7 +221,7 @@ func exitCleanUp() {
 		log.Error("clean odMgr fail", zap.Error(err))
 	}
 	strat.ExitStratJobs()
-	core.Cron.Stop()
+	com.Cron().Stop()
 	err = exg.Default.Close()
 	if err != nil {
 		log.Error("close exg fail", zap.Error(err))

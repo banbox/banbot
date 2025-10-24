@@ -9,9 +9,9 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
-	"github.com/banbox/banexg/bntp"
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
+	"github.com/banbox/bntp"
 	"go.uber.org/zap"
 
 	"github.com/banbox/banbot/config"

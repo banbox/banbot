@@ -2,7 +2,7 @@ package btime
 
 import (
 	"fmt"
-	"github.com/banbox/banexg/bntp"
+	"github.com/banbox/bntp"
 	"testing"
 	"time"
 )

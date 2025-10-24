@@ -9,14 +9,14 @@ go 1.23.0
 
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
-	github.com/banbox/banexg v0.2.34-beta.11
+	github.com/banbox/banexg v0.2.34
 	github.com/banbox/banta v0.3.4
 	github.com/c-bata/goptuna v0.9.0
 	github.com/dgraph-io/ristretto v0.2.0
-	github.com/jackc/pgx/v5 v5.7.5
+	github.com/jackc/pgx/v5 v5.7.6
 	github.com/muesli/clusters v0.0.0-20200529215643-2700303c1762
 	github.com/muesli/kmeans v0.3.1
-	github.com/olekukonko/tablewriter v1.0.9
+	github.com/olekukonko/tablewriter v1.1.0
 	// github.com/pkujhd/goloader v0.0.0-20240113094056-ff3a1e01ffcb
 	github.com/schollz/progressbar/v3 v3.18.0
 	github.com/shopspring/decimal v1.4.0
@@ -30,7 +30,8 @@ require (
 )
 
 require (
-	github.com/anyongjin/cron v0.4.1
+	github.com/banbox/bntp v0.1.0
+	github.com/banbox/cron/v3 v3.1.1
 	github.com/felixge/fgprof v0.9.5
 	github.com/flopp/go-findfont v0.1.0
 	github.com/fogleman/gg v1.3.0

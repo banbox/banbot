@@ -3,9 +3,9 @@ package opt
 import (
 	"database/sql"
 	"fmt"
-	"github.com/anyongjin/cron"
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
@@ -15,6 +15,7 @@ import (
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"github.com/banbox/cron/v3"
 	"go.uber.org/zap"
 	"math"
 	"os"
@@ -225,12 +226,12 @@ func (b *BackTest) Run() {
 	}
 	if !b.isOpt {
 		b.cronDumpBtStatus()
-		core.Cron.Start()
+		com.Cron().Start()
 	}
 	btStart := btime.UTCTime()
 	err = b.dp.LoopMain()
 	if !b.isOpt {
-		core.Cron.Stop()
+		com.Cron().Stop()
 	}
 	if err != nil {
 		log.Error("backtest loop fail", zap.Error(err))
@@ -282,7 +283,7 @@ func (b *BackTest) initTaskOut() *errs.Error {
 
 func (b *BackTest) cronDumpBtStatus() {
 	b.lastDumpMs = btime.UTCStamp()
-	_, err_ := core.Cron.Add("30 * * * * *", func() {
+	_, err_ := com.Cron().AddFunc("30 * * * * *", func() {
 		curTime := btime.UTCStamp()
 		if curTime-b.lastDumpMs < 300000 {
 			// 5分钟保存一次回测状态

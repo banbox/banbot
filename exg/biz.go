@@ -7,8 +7,8 @@ import (
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/bex"
-	"github.com/banbox/banexg/bntp"
 	"github.com/banbox/banexg/errs"
+	"github.com/banbox/bntp"
 	"github.com/go-viper/mapstructure/v2"
 	"time"
 )

@@ -8,7 +8,6 @@ import (
 	"maps"
 	"math"
 	"sort"
-	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"

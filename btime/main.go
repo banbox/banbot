@@ -3,7 +3,7 @@ package btime
 import (
 	"fmt"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banexg/bntp"
+	"github.com/banbox/bntp"
 	"strconv"
 	"strings"
 	"time"

@@ -293,7 +293,7 @@ func LoadAllExSymbols() *errs.Error {
 	ctx := context.Background()
 	exgList, err_ := sess.ListExchanges(ctx)
 	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err)
+		return NewDbErr(core.ErrDbReadFail, err_)
 	}
 	for _, exgId := range exgList {
 		err = sess.LoadExgSymbols(exgId)
