@@ -128,10 +128,10 @@ func (c *BanConn) Write(msg *IOMsgRaw) *errs.Error {
 	if err_ := enc.Encode(msg); err_ != nil {
 		return errs.New(core.ErrMarshalFail, err_)
 	}
-	return c.write(buf.Bytes())
+	return c.write(buf.Bytes(), 3)
 }
 
-func (c *BanConn) write(data []byte) *errs.Error {
+func (c *BanConn) write(data []byte, retryNum int) *errs.Error {
 	if c.Conn == nil {
 		return errs.NewMsg(errs.CodeIOWriteFail, "write fail as disconnected")
 	}
@@ -150,12 +150,12 @@ func (c *BanConn) write(data []byte) *errs.Error {
 		if err_ := c.writeFully(lenBt); err_ != nil {
 			c.Ready = false
 			errCode, errType := getErrType(err_)
-			if c.DoConnect != nil && errCode == core.ErrNetConnect {
+			if c.DoConnect != nil && errCode == core.ErrNetConnect && retryNum > 0 {
 				log.Warn("write fail, wait 3s and retry", zap.String("type", errType))
 				c.lockWrite.Unlock()
 				locked = false
 				c.connect()
-				return c.write(data)
+				return c.write(data, retryNum-1)
 			}
 			return errs.New(errCode, err_)
 		}
@@ -445,6 +445,7 @@ func (c *BanConn) connect() {
 	}
 }
 
+// LoopPing should be called from client
 func (c *BanConn) LoopPing(intvSecs int) {
 	id := 0
 	failNum := 0
@@ -452,7 +453,8 @@ func (c *BanConn) LoopPing(intvSecs int) {
 	for {
 		core.Sleep(time.Duration(intvSecs) * time.Second)
 		if !c.IsReading {
-			continue
+			// 不再处理消息，连接失效退出
+			break
 		}
 		if !c.Ready {
 			if c.lockConnect.TryLock() {
@@ -463,30 +465,20 @@ func (c *BanConn) LoopPing(intvSecs int) {
 				continue
 			}
 		}
-		timeouts := float64(btime.UTCStamp()-c.heartBeatMs) / 1000 / float64(intvSecs)
-		if id > 1 && timeouts > 2.2 {
-			log.Error("close conn as ping timeout", addrField, zap.Int64("last", c.heartBeatMs))
-			break
-		}
 		id += 1
 		err := c.WriteMsg(&IOMsg{Action: "ping", Data: id, NoEncrypt: true})
 		if err != nil {
 			failNum += 1
 			if failNum >= 2 {
-				// 连续两次失败退出
-				log.Error("close conn as ping fail", addrField, zap.String("err", err.Short()))
-				break
-			} else {
-				log.Warn("write ping fail", addrField, zap.Error(err))
+				failNum = 0
+				log.Warn("write ping fail twice", addrField, zap.String("err", err.Short()))
 			}
+			// 客户端不应该因为ping失败就退出，网络问题会自动重连
 		} else {
 			failNum = 0
 		}
 	}
-	err := c.Close()
-	if err != nil {
-		log.Warn("close ban conn error", addrField, zap.Error(err))
-	}
+	log.Info("LoopPing exit as IsReading=false", addrField)
 }
 
 func (c *BanConn) Close() *errs.Error {
@@ -699,13 +691,16 @@ func NewBanServer(addr, aesKey string) *ServerIO {
 	return &server
 }
 
-func (s *ServerIO) RunForever() *errs.Error {
+func (s *ServerIO) RunForever(intvSecs, timeoutSecs int) *errs.Error {
 	ln, err_ := net.Listen("tcp", s.Addr)
 	if err_ != nil {
 		return errs.New(core.ErrNetConnect, err_)
 	}
 	defer ln.Close()
 	log.Info("banio started", zap.String("addr", s.Addr))
+	if intvSecs > 0 && timeoutSecs > 0 {
+		go s.loopCheckTimeout(intvSecs, timeoutSecs)
+	}
 	for {
 		conn_, err_ := ln.Accept()
 		if err_ != nil {
@@ -784,35 +779,70 @@ func (s *ServerIO) Broadcast(msg *IOMsg) *errs.Error {
 	}
 	for _, conn := range curConns {
 		go func(c IBanConn) {
+			var msgRaw = raw
+			var writeErr *errs.Error
 			aesKey := c.GetAesKey()
 			if aesKey != "" {
-				raw, err = msg.Marshal(aesKey)
+				msgRaw, writeErr = msg.Marshal(aesKey)
 			}
-			if err != nil {
+			if writeErr != nil {
 				log.Warn("marshal fail", zap.String("remote", c.GetRemote()),
-					zap.String("tag", msg.Action), zap.Error(err))
+					zap.String("tag", msg.Action), zap.Error(writeErr))
 				return
 			}
-			err = c.Write(raw)
-			if err != nil {
+			writeErr = c.Write(msgRaw)
+			if writeErr != nil {
 				log.Warn("broadcast fail", zap.String("remote", c.GetRemote()),
-					zap.String("tag", msg.Action), zap.Error(err))
+					zap.String("tag", msg.Action), zap.Error(writeErr))
 			}
 		}(conn)
 	}
 	return nil
 }
 
+// loopCheckTimeout Server checks ping timeout and closes stale connections
+func (s *ServerIO) loopCheckTimeout(intvSecs, timeoutSecs int) {
+	for {
+		core.Sleep(time.Duration(intvSecs) * time.Second)
+		nowMS := btime.UTCStamp()
+		timeoutMS := int64(timeoutSecs * 1000)
+		
+		aliveConns := make([]IBanConn, 0, len(s.Conns))
+		for _, conn := range s.Conns {
+			if conn.IsClosed() {
+				continue
+			}
+			banConn, ok := conn.(*BanConn)
+			if !ok {
+				aliveConns = append(aliveConns, conn)
+				continue
+			}
+			// Check if heartbeat timeout
+			if banConn.heartBeatMs > 0 && nowMS-banConn.heartBeatMs > timeoutMS {
+				log.Error("close conn as ping timeout", 
+					zap.String("remote", banConn.Remote),
+					zap.Int64("lastHeartbeat", banConn.heartBeatMs),
+					zap.Int64("timeoutMs", timeoutMS))
+				_ = banConn.Close()
+				continue
+			}
+			aliveConns = append(aliveConns, conn)
+		}
+		s.Conns = aliveConns
+	}
+}
+
 func (s *ServerIO) WrapConn(conn net.Conn) *BanConn {
 	res := &BanConn{
-		Conn:      conn,
-		Data:      map[string]interface{}{},
-		Listens:   map[string]ConnCB{},
-		waits:     make(map[string]chan []byte),
-		RefreshMS: btime.TimeMS(),
-		Ready:     true,
-		Remote:    conn.RemoteAddr().String(),
-		aesKey:    s.aesKey,
+		Conn:        conn,
+		Data:        map[string]interface{}{},
+		Listens:     map[string]ConnCB{},
+		waits:       make(map[string]chan []byte),
+		RefreshMS:   btime.TimeMS(),
+		Ready:       true,
+		Remote:      conn.RemoteAddr().String(),
+		aesKey:      s.aesKey,
+		heartBeatMs: btime.UTCStamp(), // Initialize heartbeat timestamp
 	}
 	res.Listens["onGetVal"] = func(msg *IOMsgRaw) {
 		var key string

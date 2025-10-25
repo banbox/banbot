@@ -799,7 +799,7 @@ func RunSpider(addr string) *errs.Error {
 	go Spider.monitorSubscriptions()
 
 	com.Cron().Start()
-	return Spider.RunForever()
+	return Spider.RunForever(30, 600)
 }
 
 func (s *LiveSpider) getMiner(exgName, market string) *Miner {
