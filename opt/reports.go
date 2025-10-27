@@ -76,6 +76,7 @@ type BTResult struct {
 	SharpeRatio     float64        `json:"sharpeRatio"`
 	SortinoRatio    float64        `json:"sortinoRatio"`
 	CalcDiff        float64        `json:"calcDiff"`
+	Stability       float64        `json:"stability"`
 }
 
 type PlotData struct {
@@ -250,6 +251,7 @@ func (r *BTResult) Collect() {
 		r.SharpeRatio, r.SortinoRatio = sharpe, sortino
 	}
 	r.CalcDiff = math.Abs((r.FinBalance-r.TotProfit)/r.TotalInvest - 1)
+	r.Stability = utils.CalcAssetStabilityScore(r.Plots.Real, 0)
 }
 
 func (r *BTResult) textMetrics(orders []*ormo.InOutOrder) string {
