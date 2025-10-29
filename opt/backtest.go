@@ -198,7 +198,7 @@ func (b *BackTest) FeedKLine(bar *orm.InfoKline) {
 	}
 	if ok && b.nextRefresh > 0 && bar.Time >= b.nextRefresh {
 		// 刷新交易对
-		refreshMs := b.nextRefresh
+		refreshMs := bar.Time // 这里bar.Time 可能远大于b.nextRefresh，所以应当用bar.Time
 		b.nextRefresh = b.schedule.Next(time.UnixMilli(bar.Time)).UnixMilli()
 		btime.CurTimeMS = refreshMs
 		err := RefreshPairJobs(b.dp, !b.isOpt, false, nil)

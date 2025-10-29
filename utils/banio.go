@@ -33,6 +33,7 @@ type IBanConn interface {
 
 	SetData(val interface{}, tags ...string)
 	GetData(key string) (interface{}, bool)
+	PopData(key string) (interface{}, bool)
 	DeleteData(tags ...string)
 	SetAesKey(aesKey string)
 	GetAesKey() string
@@ -101,9 +102,18 @@ func (c *BanConn) GetRemoteHost() string {
 func (c *BanConn) IsClosed() bool {
 	return c.Conn == nil || !c.Ready
 }
+
 func (c *BanConn) GetData(key string) (interface{}, bool) {
 	c.lockData.Lock()
 	val, ok := c.Data[key]
+	c.lockData.Unlock()
+	return val, ok
+}
+
+func (c *BanConn) PopData(key string) (interface{}, bool) {
+	c.lockData.Lock()
+	val, ok := c.Data[key]
+	delete(c.Data, key)
 	c.lockData.Unlock()
 	return val, ok
 }
@@ -806,7 +816,7 @@ func (s *ServerIO) loopCheckTimeout(intvSecs, timeoutSecs int) {
 		core.Sleep(time.Duration(intvSecs) * time.Second)
 		nowMS := btime.UTCStamp()
 		timeoutMS := int64(timeoutSecs * 1000)
-		
+
 		aliveConns := make([]IBanConn, 0, len(s.Conns))
 		for _, conn := range s.Conns {
 			if conn.IsClosed() {
@@ -819,7 +829,7 @@ func (s *ServerIO) loopCheckTimeout(intvSecs, timeoutSecs int) {
 			}
 			// Check if heartbeat timeout
 			if banConn.heartBeatMs > 0 && nowMS-banConn.heartBeatMs > timeoutMS {
-				log.Error("close conn as ping timeout", 
+				log.Error("close conn as ping timeout",
 					zap.String("remote", banConn.Remote),
 					zap.Int64("lastHeartbeat", banConn.heartBeatMs),
 					zap.Int64("timeoutMs", timeoutMS))

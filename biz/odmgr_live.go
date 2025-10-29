@@ -2340,7 +2340,7 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 				log.Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
 			tg.OrderId = ""
-			_ = od.SetExitTrigger(prefix, nil)
+			_ = od.SetExitTrigger(prefix, nil, 0)
 		}
 		return
 	}

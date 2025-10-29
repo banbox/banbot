@@ -397,6 +397,12 @@ func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, 
 	if price < 0 {
 		return nil, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", exs.Symbol)
 	}
+	enterPrice := price
+	if !req.Short && req.Stop > price || req.Short && req.Stop < price && req.Stop > 0 {
+		enterPrice = req.Stop
+	} else if !req.Short && req.Limit > 0 && req.Limit < price || req.Short && req.Limit > price {
+		enterPrice = req.Limit
+	}
 	curTimeMS := btime.TimeMS()
 	taskId := ormo.GetTaskID(o.Account)
 	od := &ormo.InOutOrder{
@@ -408,7 +414,7 @@ func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, 
 			Short:     req.Short,
 			Status:    ormo.InOutStatusInit,
 			EnterTag:  req.Tag,
-			InitPrice: price,
+			InitPrice: enterPrice,
 			Stop:      req.Stop,
 			Leverage:  req.Leverage,
 			EnterAt:   curTimeMS,
@@ -446,23 +452,23 @@ func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, 
 	}
 	od.SetInfo(ormo.OdInfoLegalCost, req.LegalCost)
 	if req.StopLoss > 0 {
-		err := od.SetStopLoss(&ormo.ExitTrigger{
+		err := od.SetExitTrigger(ormo.OdInfoStopLoss, &ormo.ExitTrigger{
 			Price: req.StopLoss,
 			Limit: req.StopLossLimit,
 			Rate:  req.StopLossRate,
 			Tag:   req.StopLossTag,
-		})
+		}, enterPrice)
 		if err != nil {
 			return od, err
 		}
 	}
 	if req.TakeProfit > 0 {
-		err := od.SetTakeProfit(&ormo.ExitTrigger{
+		err := od.SetExitTrigger(ormo.OdInfoTakeProfit, &ormo.ExitTrigger{
 			Price: req.TakeProfit,
 			Limit: req.TakeProfitLimit,
 			Rate:  req.TakeProfitRate,
 			Tag:   req.TakeProfitTag,
-		})
+		}, enterPrice)
 		if err != nil {
 			return od, err
 		}

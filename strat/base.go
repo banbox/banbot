@@ -712,7 +712,7 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 	if args == nil {
 		// 取消所有止盈或止损
 		for _, od := range odList {
-			_ = od.SetExitTrigger(key, nil)
+			_ = od.SetExitTrigger(key, nil, 0)
 		}
 		return nil
 	}
@@ -722,7 +722,7 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 	for _, od := range odList {
 		if od.Status >= ormo.InOutStatusPartEnter && od.Status <= ormo.InOutStatusPartExit {
 			if setAll {
-				err := od.SetExitTrigger(key, args)
+				err := od.SetExitTrigger(key, args, 0)
 				if err != nil {
 					return err
 				}
@@ -742,14 +742,14 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 			continue
 		}
 		if setPos < core.AmtDust {
-			_ = od.SetExitTrigger(key, nil)
+			_ = od.SetExitTrigger(key, nil, 0)
 		} else {
 			if setPos >= size+core.AmtDust {
 				err := od.SetExitTrigger(key, &ormo.ExitTrigger{
 					Price: args.Price,
 					Limit: args.Limit,
 					Tag:   args.Tag,
-				})
+				}, 0)
 				if err != nil {
 					return err
 				}
@@ -760,7 +760,7 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 					Limit: args.Limit,
 					Rate:  setPos / size,
 					Tag:   args.Tag,
-				})
+				}, 0)
 				if err != nil {
 					return err
 				}
