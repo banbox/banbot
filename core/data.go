@@ -48,7 +48,7 @@ var (
 	lockOdBook sync.Mutex // 确认不冲突，无需用deadlock
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.2.23-beta.31"
+	Version   = "v0.2.23-beta.32"
 	UIVersion = "v0.2.23-beta.3"
 	SysLang   string // language code for current system 当前系统语言设置
 	LogFile   string
