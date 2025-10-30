@@ -3,6 +3,7 @@ package utils
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"encoding/binary"
 	"encoding/gob"
 	"errors"
@@ -42,7 +43,7 @@ type IBanConn interface {
 	GetWaitChan(key string) (chan []byte, bool)
 	CloseWaitChan(key string)
 	SendWaitRes(key string, data interface{}) *errs.Error
-	WaitResult(key string, timeout time.Duration) ([]byte, *errs.Error)
+	WaitResult(ctx context.Context, key string, timeout time.Duration) ([]byte, *errs.Error)
 
 	GetRemote() string
 	GetRemoteHost() string
@@ -331,7 +332,7 @@ func (c *BanConn) SendWaitRes(key string, data interface{}) *errs.Error {
 }
 
 // WaitResult wait result for key with specified timeout; wait __res__[key] to be trigger
-func (c *BanConn) WaitResult(key string, timeout time.Duration) ([]byte, *errs.Error) {
+func (c *BanConn) WaitResult(ctx context.Context, key string, timeout time.Duration) ([]byte, *errs.Error) {
 	out, ok := c.GetWaitChan(key)
 	if !ok {
 		return nil, errs.NewMsg(errs.CodeRunTime, "key not found: %s", key)
@@ -341,6 +342,9 @@ func (c *BanConn) WaitResult(key string, timeout time.Duration) ([]byte, *errs.E
 	case res = <-out:
 		c.CloseWaitChan(key)
 		return res, nil
+	case <-ctx.Done():
+		c.CloseWaitChan(key)
+		return nil, errs.NewMsg(errs.CodeCancel, "user cancel task")
 	case <-time.After(timeout):
 		c.CloseWaitChan(key)
 		return nil, errs.NewMsg(errs.CodeRunTime, "timeout waiting for key: %s", key)
@@ -951,7 +955,7 @@ func (c *ClientIO) GetVal(key string, timeout int) (string, *errs.Error) {
 	if timeout == 0 {
 		timeout = readTimeout
 	}
-	res, err := c.WaitResult(key, time.Second*time.Duration(timeout))
+	res, err := c.WaitResult(context.Background(), key, time.Second*time.Duration(timeout))
 	if err != nil {
 		return "", err
 	}
