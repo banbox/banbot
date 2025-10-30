@@ -153,7 +153,7 @@ database:
   retention: all
   max_pool_size: 50
   auto_create: true  # ${m.cfg_db_auto_create()}
-  url: postgresql://postgres:123@[127.0.0.1]:5432/ban
+  url: postgresql://postgres:123@127.0.0.1:5432/ban
 spider_addr: 127.0.0.1:6789  # ${m.cfg_spider()}
 rpc_channels:  # ${m.cfg_rpc_channels()}
   wx_notify:  # ${m.cfg_rpc_name()}

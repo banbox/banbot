@@ -4,7 +4,7 @@ sql:
     queries: "sql/pg_query.sql"
     schema: "sql/pg_schema.sql"
     database:
-      uri: postgresql://postgres:123@[host.docker.internal]:5432/bantd3
+      uri: postgresql://postgres:123@host.docker.internal:5432/bantd3
     gen:
       go:
         package: "orm"

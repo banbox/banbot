@@ -683,12 +683,13 @@ func getErrType(err error) (int, string) {
 }
 
 type ServerIO struct {
-	Addr     string
-	aesKey   string
-	Conns    []IBanConn
-	Data     map[string]string // Cache data available for remote access 缓存的数据，可供远程端访问
-	DataExp  map[string]int64  // Cache data expiration timestamp, 13 bits 缓存数据的过期时间戳，13位
-	InitConn func(*BanConn)
+	Addr       string
+	aesKey     string
+	Conns      []IBanConn
+	Data       map[string]string // Cache data available for remote access 缓存的数据，可供远程端访问
+	DataExp    map[string]int64  // Cache data expiration timestamp, 13 bits 缓存数据的过期时间戳，13位
+	InitConn   func(*BanConn)
+	OnConnExit func(*BanConn, *errs.Error)
 }
 
 var (
@@ -728,6 +729,9 @@ func (s *ServerIO) RunForever(intvSecs, timeoutSecs int) *errs.Error {
 			if err != nil {
 				log.Warn("read client fail", zap.String("remote", conn.GetRemote()),
 					zap.String("err", err.Message()))
+			}
+			if s.OnConnExit != nil {
+				s.OnConnExit(conn, err)
 			}
 		}()
 	}

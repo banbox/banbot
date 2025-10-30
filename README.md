@@ -49,7 +49,7 @@ accounts:
         api_key: your_api_key_here
         api_secret: your_secret_here
 database:
-  url: postgresql://postgres:123@[timescaledb]:5432/ban
+  url: postgresql://postgres:123@timescaledb:5432/ban
 ```
 ```bash
 docker run -d --name banbot -p 8000:8000 --network mynet -v /root:/root banbot/banbot:latest -config /root/config.yml
