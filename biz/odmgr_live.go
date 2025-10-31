@@ -1531,6 +1531,7 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 		o.callBack(od, subOd.Enter)
 		strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 	} else {
+		o.callBack(od, subOd.Enter)
 		strat.FireOdChange(o.Account, od, strat.OdChgEnterFill)
 	}
 	return nil
@@ -1809,9 +1810,6 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		// 平仓，取消关联订单
 		cancelTriggerOds(od)
 	}
-	if subOd.Status == ormo.OdStatusClosed {
-		o.callBack(od, isEnter)
-	}
 	return nil
 }
 
@@ -1895,6 +1893,7 @@ func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *
 				return err
 			}
 		} else {
+			o.callBack(od, true)
 			strat.FireOdChange(o.Account, od, strat.OdChgEnterFill)
 		}
 	}
@@ -2281,6 +2280,7 @@ func cancelTimeoutEnter(odMgr *LiveOrderMgr, od *ormo.InOutOrder) {
 		od.Status = ormo.InOutStatusFullEnter
 		od.DirtyMain = true
 		od.DirtyEnter = true
+		odMgr.callBack(od, true)
 		strat.FireOdChange(odMgr.Account, od, strat.OdChgEnterFill)
 	}
 }

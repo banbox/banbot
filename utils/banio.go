@@ -492,7 +492,7 @@ func (c *BanConn) LoopPing(intvSecs int) {
 			failNum = 0
 		}
 	}
-	log.Info("LoopPing exit as IsReading=false", addrField)
+	log.Warn("LoopPing exit as IsReading=false", addrField)
 }
 
 func (c *BanConn) Close() *errs.Error {
