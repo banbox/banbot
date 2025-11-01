@@ -568,14 +568,13 @@ func initLangFile(dataDir, lang string) *errs.Error {
 		// 对于 messages.json 文件，进行合并更新
 		if fileName == "messages.json" {
 			err := mergeMessagesFile(targetPath, sourceData)
-			if err != nil {
-				return err
+			if err == nil {
+				continue
 			}
-		} else {
-			err := utils.WriteFile(targetPath, sourceData)
-			if err != nil {
-				return err
-			}
+		}
+		err := utils.WriteFile(targetPath, sourceData)
+		if err != nil {
+			return err
 		}
 	}
 
