@@ -165,6 +165,7 @@ func (c *BanConn) write(data []byte, retryNum int) *errs.Error {
 				log.Warn("write fail, wait 3s and retry", zap.String("type", errType))
 				c.lockWrite.Unlock()
 				locked = false
+				core.Sleep(time.Second * 3)
 				c.connect()
 				return c.write(data, retryNum-1)
 			}
@@ -242,6 +243,7 @@ func (c *BanConn) Read() ([]byte, *errs.Error) {
 		errCode, errType := getErrType(err_)
 		if c.DoConnect != nil && errCode == core.ErrNetConnect {
 			log.Warn("read fail, wait 3s and retry", zap.String("type", errType))
+			core.Sleep(time.Second * 3)
 			c.connect()
 			return c.Read()
 		}
@@ -446,7 +448,6 @@ func (c *BanConn) connect() {
 		c.Conn = nil
 		log.Info("closed old banConn for reconnect")
 	}
-	core.Sleep(time.Second * 3)
 	c.DoConnect(c)
 	c.RefreshMS = btime.TimeMS()
 	if c.Conn != nil {

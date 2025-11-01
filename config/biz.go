@@ -1123,6 +1123,19 @@ func GetExportConfig(path string) (*ExportConfig, *errs.Error) {
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, errs.New(core.ErrBadConfig, err)
 	}
+	var err2 *errs.Error
+	for _, c := range cfg.Klines {
+		c.Symbols, err2 = ParsePairs(c.Symbols...)
+		if err2 != nil {
+			return nil, err2
+		}
+	}
+	for _, c := range cfg.AdjFactors {
+		c.Symbols, err2 = ParsePairs(c.Symbols...)
+		if err2 != nil {
+			return nil, err2
+		}
+	}
 	return &cfg, nil
 }
 

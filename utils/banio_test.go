@@ -33,7 +33,7 @@ func TestBanServer(t *testing.T) {
 			}
 		}
 	}()
-	err := server.RunForever()
+	err := server.RunForever(0, 0)
 	if err != nil {
 		panic(err)
 	}
@@ -158,7 +158,7 @@ func TestBanConnConcurrentLargeData(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = server.RunForever()
+		_ = server.RunForever(0, 0)
 	}()
 
 	// 等待服务器启动
