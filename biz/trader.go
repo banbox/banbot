@@ -120,21 +120,14 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 			curOrders = append(curOrders, od)
 		}
 	}
-	var sess *ormo.Queries
 	if core.LiveMode && !isWarmup {
 		// Live mode is saved to the database. Non-real-time mode, orders are temporarily saved in memory, no database required
 		// 实时模式保存到数据库。非实时模式，订单临时保存到内存，无需数据库
-		var conn *orm.TrackedDB
-		sess, conn, err = ormo.Conn(orm.DbTrades, true)
-		if err != nil {
-			log.Error("get db sess fail", zap.Error(err))
-			return err
-		}
-		defer conn.Close()
 		numStr := fmt.Sprintf("%d/%d", len(curOrders), len(openOds))
 		log.Info("onAccountKline", zap.String("acc", account), zap.String("pair", bar.Symbol),
 			zap.String("tf", bar.TimeFrame), zap.String("odNum", numStr))
 	}
+	var saveJobs []*strat.StratJob
 	for _, job := range jobs {
 		job.IsWarmUp = isWarmup
 		job.InitBar(curOrders)
@@ -159,11 +152,25 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 			if err != nil {
 				return err
 			}
+			if len(job.Entrys) > 0 || len(job.Exits) > 0 {
+				saveJobs = append(saveJobs, job)
+			}
+		}
+	}
+	if len(saveJobs) > 0 {
+		sess, conn, err := ormo.Conn(orm.DbTrades, true)
+		if err != nil {
+			log.Error("get db sess fail", zap.Error(err))
+			return err
+		}
+		for _, job := range saveJobs {
 			_, _, err = odMgr.ProcessOrders(sess, job)
 			if err != nil {
+				conn.Close()
 				return err
 			}
 		}
+		conn.Close()
 	}
 	// invoke OnInfoBar
 	// 更新辅助订阅数据

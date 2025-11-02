@@ -340,7 +340,7 @@ func monitorTimeout(tracked *TrackedDB) {
 	// Check if connection is still held
 	if !tracked.IsClosed() {
 		holdTime := time.Since(tracked.acquireTime)
-		log.Error("SQLite connection timeout: connection held beyond timeout period",
+		log.Error("SQLite connection held timeout",
 			zap.String("path", tracked.path),
 			zap.Duration("timeout", timeout),
 			zap.Duration("held_for", holdTime),

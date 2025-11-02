@@ -284,50 +284,20 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 	for _, od := range exOdList {
 		exgOdMap[od.ID] = od
 	}
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
+	orders, pairLastTfs, err := loadOpenOrders(task.ID, o.Account)
 	if err != nil {
 		return nil, nil, nil, err
-	}
-	defer conn.Close()
-	// Loading orders from the database
-	// 从数据库加载未平仓订单
-	orders, err := sess.GetOrders(ormo.GetOrdersArgs{
-		TaskID: task.ID,
-		Status: 1,
-		Limit:  10000,
-	})
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if len(orders) >= 10000 {
-		log.Warn("local open orders may be too many to load", zap.String("acc", o.Account),
-			zap.Int("num", len(orders)))
-	}
-	// Query the most recent usage time period of a task
-	// 查询任务的最近使用时间周期
-	var pairLastTfs = make(map[string]string)
-	if config.TakeOverStrat != "" {
-		pairLastTfs, err = sess.GetHistOrderTfs(task.ID, config.TakeOverStrat)
-		if err != nil {
-			return nil, nil, nil, err
-		}
 	}
 	openOds, lock := ormo.GetOpenODs(o.Account)
 	var lastOrderMS int64
 	var openPairs = map[string]struct{}{}
+	var delOds, saveOds []*ormo.InOutOrder
 	for _, od := range orders {
 		if od.Status >= ormo.InOutStatusFullExit {
 			continue
 		}
 		if od.Enter == nil {
-			err = sess.DelOrder(od)
-			fields := []zap.Field{zap.String("acc", o.Account), zap.String("od", od.Key())}
-			if err != nil {
-				fields = append(fields, zap.Error(err))
-				log.Error("del order fail", fields...)
-			} else {
-				log.Warn("del no enter order", fields...)
-			}
+			delOds = append(delOds, od)
 			continue
 		}
 		if od.Enter.OrderID != "" {
@@ -343,10 +313,10 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 			lock.Unlock()
 			openPairs[od.Symbol] = struct{}{}
 		}
-		err = od.Save(sess)
-		if err != nil {
-			log.Error("save order in SyncExgOrders fail", zap.String("acc", o.Account), zap.String("key", od.Key()), zap.Error(err))
-		}
+		saveOds = append(saveOds, od)
+	}
+	if len(delOds) > 0 || len(saveOds) > 0 {
+		delSaveOrders(o.Account, delOds, saveOds)
 	}
 	if !banexg.IsContract(core.Market) {
 		// 非合约市场，无法获取仓位，直接返回
@@ -437,6 +407,63 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		log.Error("SaveDirtyODs fail", zap.String("acc", o.Account), zap.Error(err))
 	}
 	return oldList, newList, delList, nil
+}
+
+func loadOpenOrders(taskID int64, account string) ([]*ormo.InOutOrder, map[string]string, *errs.Error) {
+	sess, conn, err := ormo.Conn(orm.DbTrades, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Close()
+	// Loading orders from the database
+	// 从数据库加载未平仓订单
+	orders, err := sess.GetOrders(ormo.GetOrdersArgs{
+		TaskID: taskID,
+		Status: 1,
+		Limit:  10000,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(orders) >= 10000 {
+		log.Warn("local open orders may be too many to load", zap.String("acc", account),
+			zap.Int("num", len(orders)))
+	}
+	// Query the most recent usage time period of a task
+	// 查询任务的最近使用时间周期
+	var pairLastTfs = make(map[string]string)
+	if config.TakeOverStrat != "" {
+		pairLastTfs, err = sess.GetHistOrderTfs(taskID, config.TakeOverStrat)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return orders, pairLastTfs, nil
+}
+
+func delSaveOrders(account string, delOds, saves []*ormo.InOutOrder) {
+	sess, conn, err := ormo.Conn(orm.DbTrades, true)
+	if err != nil {
+		log.Warn("get conn fail", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+	for _, od := range delOds {
+		fields := []zap.Field{zap.String("acc", account), zap.String("od", od.Key())}
+		err = sess.DelOrder(od)
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+			log.Error("del order fail", fields...)
+		} else {
+			log.Warn("del no enter order", fields...)
+		}
+	}
+	for _, od := range saves {
+		err = od.Save(sess)
+		if err != nil {
+			log.Error("save order in SyncExgOrders fail", zap.String("acc", account), zap.String("key", od.Key()), zap.Error(err))
+		}
+	}
 }
 
 /*

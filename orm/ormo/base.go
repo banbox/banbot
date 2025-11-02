@@ -18,7 +18,7 @@ var (
 )
 
 func Conn(path string, write bool) (*Queries, *orm.TrackedDB, *errs.Error) {
-	db, err := orm.DbLite(orm.DbTrades, path, write, 5000)
+	db, err := orm.DbLite(orm.DbTrades, path, write, 10000)
 	if err != nil {
 		return nil, nil, err
 	}
