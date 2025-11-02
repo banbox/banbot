@@ -22,23 +22,29 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - all.go: 提供测试用的公共数据和函数，如模拟的K线数据。
 
 ### `biz/` (核心业务逻辑)
-- biz.go: 项目核心业务逻辑的启动器和协调器，负责初始化各项服务。
+- biz.go: 项目核心业务逻辑的启动器和协调器，负责初始化各项服务，嵌入默认配置文件。
 - data_server.go: gRPC数据服务器，对外提供特征数据流服务。
 - odmgr.go: 订单管理器接口定义和通用逻辑。
 - odmgr_local.go: 本地/回测模式的订单管理器实现。
 - odmgr_live.go: 实盘模式的订单管理器实现。
 - odmgr_live_exgs.go: 实盘订单管理器针对特定交易所的扩展逻辑。
 - odmgr_local_live.go: 本地模拟实盘的订单管理器。
+- telegram_order_manager.go: Telegram Bot订单管理接口实现,为rpc/telegram.go提供订单操作功能。
 - trader.go: 交易员核心逻辑，处理K线数据并驱动策略执行。
 - wallet.go: 钱包管理，包括余额、冻结、挂单等状态的维护。
-- stgy.go: (文件内容未提供) 可能与策略相关的业务逻辑。
 - tools.go: 提供业务逻辑层的辅助工具函数。
 - aifea.pb.go: Protobuf生成的gRPC消息结构体。
 - aifea_grpc.pb.go: Protobuf生成的gRPC服务客户端和服务器存根。
+- zh-CN/,en-US/: 嵌入式多语言资源文件。
 
 ### `btime/` (时间处理)
-- main.go: 提供统一的时间获取功能，兼容回测和实盘模式。
+- main.go: 提供统一的时间获取功能,兼容回测和实盘模式。
 - common.go: 定义了重试等待的通用结构和逻辑。
+
+### `com/` (公共组件)
+- common.go: 公共数据和函数。
+- price.go: 全局价格管理,支持bar价格和订单簿价格,用于回测和实盘。
+- cron.go: 定时任务管理,基于cron库实现。
 
 ### `config/` (配置管理)
 - biz.go: 负责加载和解析项目配置文件。
@@ -48,9 +54,9 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 
 ### `core/` (核心类型与全局变量)
 - core.go: 定义项目运行模式、环境等核心全局变量和函数。
+- common.go: 公共函数,包括缓存管理(ristretto)、退出回调、键生成等。
 - types.go: 定义了项目中最基础、最核心的数据结构。
-- data.go: 定义了与数据相关的全局变量和状态。
-- price.go: 提供了全局的价格获取和设置功能。
+- data.go: 定义了与数据相关的全局变量和状态,包括运行模式、市场信息、交易对管理、禁单控制等。
 - calc.go: 提供了基础的计算工具，如EMA（指数移动平均）。
 - errors.go: 定义了项目自定义的错误码和错误名称。
 - utils.go: 提供了核心层的工具函数。
@@ -60,6 +66,8 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - feeder.go: 数据喂食器，负责从数据源获取数据并推送到策略。
 - spider.go: 实盘数据爬虫，通过WebSocket或API从交易所获取实时数据。
 - watcher.go: K线数据监听器，用于客户端与爬虫之间的通信。
+- ws_feeder.go: WebSocket数据喂食器,用于实时模式。
+- ws_loader.go: WebSocket数据加载器,管理实时数据流。
 - common.go: 数据处理模块的通用函数和结构。
 - tools.go: 数据处理相关的辅助工具。
 
@@ -127,9 +135,10 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 ### `rpc/` (远程过程调用)
 - notify.go: 统一的通知发送入口。
 - webhook.go: 通用的Webhook实现基类。
+- telegram.go: Telegram Bot通知实现,支持交互式命令(查询订单、余额、关闭订单等)。
 - wework.go: 企业微信机器人的通知实现。
 - email.go: 邮件通知的实现。
-- exc_notify.go: Zap日志钩子，用于将错误日志通过RPC发送通知。
+- exc_notify.go: Zap日志钩子,用于将错误日志通过RPC发送通知。
 
 ### `strat/` (策略)
 - base.go: 策略基类和核心逻辑，定义了策略接口和`StratJob`结构。
@@ -158,6 +167,20 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 ### `web/` (Web服务)
 - main.go: Web服务的启动入口。
 - base/: 提供了Web服务的基础API和公共组件。
-- dev/: 开发模式下的Web服务，提供了策略开发、回测管理等功能。
-- live/: 实盘模式下的Web服务，用于监控和管理实盘机器人。
+  - api_com.go: API公共函数,包括参数验证和错误处理。
+  - api_kline.go: K线数据接口。
+  - api_ws.go: WebSocket路由注册。
+  - websocket.go: WebSocket客户端管理,支持OHLCV数据订阅。
+  - indicators.go: 技术指标计算。
+  - biz_com.go: 业务公共逻辑。
+- dev/: 开发模式下的Web服务,提供了策略开发、回测管理等功能。
+  - main.go: 开发服务器启动入口。
+  - api_dev.go: 开发相关API接口。
+  - strat.go: 策略管理接口。
+  - data_tools.go: 数据工具接口。
+  - websocket.go: 开发模式WebSocket支持。
+- live/: 实盘模式下的Web服务,用于监控和管理实盘机器人。
+  - main.go: 实盘API服务器启动入口。
+  - auth.go: JWT认证中间件,支持用户登录和策略回调接口。
+  - biz.go: 实盘业务API,包括余额、订单、统计、配置等。
 - ui/: 嵌入式的前端UI资源。

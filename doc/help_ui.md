@@ -23,28 +23,27 @@ BanBot UI 是一个为量化交易机器人 BanBot 设计的前端项目。它�
 - **src/style.css**: 全局样式文件，引入TailwindCSS和DaisyUI。
 
 ### 核心服务层
-- **src/lib/netio.ts**: API通信核心，封装了 `getApi` 和 `postApi` 等函数，用于与后端交互。
-- **src/hooks.server.ts**: 服务端钩子，处理国际化路由。
-- **src/hooks.ts**: 客户端钩子，处理国际化路由。
+- **src/lib/netio.ts**: API通信核心,封装了 `getApi`、`postApi`、`getAccApi`、`postAccApi` 等函数,支持开发模式和实盘模式API调用,基于ofetch。
+- **src/hooks.server.ts**: 服务端钩子,处理国际化路由。
+- **src/hooks.ts**: 客户端钩子,处理国际化路由。
 
 ### 状态管理
-- **src/lib/stores/site.ts**: 全站状态管理，如API主机、加载状态等。
+- **src/lib/stores/site.ts**: 全站状态管理,包括API主机、加载状态、构建状态、iframe检测等。
 - **src/lib/stores/alerts.ts**: 全局警告消息管理。
 - **src/lib/stores/modals.ts**: 全局模态框（确认框、提示框）管理。
-- **src/lib/dash/store.ts**: 实盘监控仪表盘的状态管理。
+- **src/lib/dash/store.ts**: 实盘监控仪表盘状态,管理机器人账户列表、当前活动账户、持久化存储。
 
 ### 通用组件库
 - **src/lib/Icon.svelte**: 全局图标组件。
 - **src/lib/Alert.svelte**: 全局警告提示组件。
-- **src/lib/kline/Modal.svelte**: 通用模态框组件。
-- **src/lib/dev/CodeMirror.svelte**: 代码编辑器组件。
-- **src/lib/treeview/**: 文件树视图组件。
+- **src/lib/Snippets.svelte**: 通用代码片段组件.
 - **src/lib/SuggestTags.svelte**: 带建议的标签输入组件。
-- **src/lib/dev/RangeSlider.svelte**: 范围选择滑块组件。
+- **src/lib/treeview/**: 文件树视图组件。
 
 ### 工具函数库
 - **src/lib/common.ts**: 通用数据和函数。
-- **src/lib/dateutil.ts**: 日期和时间处理函数。
+- **src/lib/dateutil.ts**: 日期和时间处理函数,基于dayjs。
+- **src/lib/index.ts**: 库导出入口。
 
 ### 国际化
 - **src/lib/paraglide/**: Paraglide国际化生成文件。
@@ -64,15 +63,21 @@ BanBot UI 是一个为量化交易机器人 BanBot 设计的前端项目。它�
 - **src/lib/kline/MenuBar.svelte**: 图表菜单栏，提供周期、指标、设置等功能。
 - **src/lib/kline/DrawBar.svelte**: 图表绘制工具栏。
 - **src/lib/kline/mydatafeed.ts**: K线图数据源适配器，负责从后端获取数据。
+- **src/lib/kline/chart.ts**: 图表配置和工具函数。
+- **src/lib/kline/coms.ts**: K线图公共组件和工具。
 - **src/lib/kline/indicators/**: 技术指标相关定义。
 - **src/lib/kline/overlays/**: 图表覆盖层（绘图工具）定义。
+- **src/lib/kline/figures/**: 自定义图形组件。
 - **src/lib/kline/Modal*.svelte**: K线图相关的各种设置模态框。
 
 #### 开发与回测 (Dev)
-- **src/lib/dev/CodeMirror.svelte**: 用于策略和配置编辑的代码编辑器。
+- **src/lib/dev/CodeMirror.svelte**: 用于策略和配置编辑的代码编辑器,支持Go和YAML语法高亮。
+- **src/lib/dev/Monaco.svelte**: Monaco编辑器组件,提供更强大的代码编辑功能。
 - **src/lib/dev/AllConfig.svelte**: 展示所有配置项的抽屉组件。
 - **src/lib/dev/DrawerDataTools.svelte**: 数据工具抽屉，提供数据下载、导入、导出等功能。
+- **src/lib/dev/RangeSlider.svelte**: 范围选择滑块组件。
 - **src/lib/dev/websocket.ts**: 用于接收后端实时消息的WebSocket客户端。
+- **src/lib/dev/ban_hints.ts**: BanBot代码提示和自动完成配置。
 - **src/lib/treeview/**: 用于展示策略文件目录的树形组件。
 
 #### 实盘监控 (Dashboard)
@@ -83,10 +88,12 @@ BanBot UI 是一个为量化交易机器人 BanBot 设计的前端项目。它�
 ## 路由页面
 
 #### 开发环境路由 `(dev)`
+- **src/routes/(dev)/+page.svelte**: 开发模式主页，包含快捷入口和文档链接，自动检测实盘模式并跳转。
 - **src/routes/(dev)/strategy/+page.svelte**: 策略开发页面，包含文件树和代码编辑器。
 - **src/routes/(dev)/backtest/new/+page.svelte**: 新建回测任务页面。
 - **src/routes/(dev)/backtest/+page.svelte**: 回测历史列表页面。
 - **src/routes/(dev)/backtest/item/+page.svelte**: 单个回测报告详情页。
+- **src/routes/(dev)/optimize/+page.svelte**: 超参数优化页面。
 - **src/routes/(dev)/data/+page.svelte**: 本地数据管理页面。
 - **src/routes/(dev)/data/item/+page.svelte**: 单个品种的数据详情页。
 - **src/routes/(dev)/setting/+page.svelte**: 全局配置、编译、语言等设置页面。
