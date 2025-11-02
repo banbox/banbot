@@ -1,7 +1,6 @@
 package biz
 
 import (
-	"database/sql"
 	"fmt"
 	"github.com/banbox/banbot/com"
 	"math"
@@ -125,7 +124,7 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 	if core.LiveMode && !isWarmup {
 		// Live mode is saved to the database. Non-real-time mode, orders are temporarily saved in memory, no database required
 		// 实时模式保存到数据库。非实时模式，订单临时保存到内存，无需数据库
-		var conn *sql.DB
+		var conn *orm.TrackedDB
 		sess, conn, err = ormo.Conn(orm.DbTrades, true)
 		if err != nil {
 			log.Error("get db sess fail", zap.Error(err))

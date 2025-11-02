@@ -2,7 +2,6 @@ package ormo
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"github.com/banbox/banbot/com"
 	"math"
@@ -524,7 +523,7 @@ func (i *InOutOrder) saveToDb(sess *Queries) *errs.Error {
 		return err
 	}
 	if sess == nil {
-		var conn *sql.DB
+		var conn *orm.TrackedDB
 		sess, conn, err = Conn(orm.DbTrades, true)
 		if err != nil {
 			return err

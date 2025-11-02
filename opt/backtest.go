@@ -1,7 +1,6 @@
 package opt
 
 import (
-	"database/sql"
 	"fmt"
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
@@ -459,7 +458,7 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 		// 如果是初次执行，检查打开的订单是否已在测试期间平仓，是则自动平仓
 		// 主要针对实盘隔一段时间后重启有未平仓订单场景，需检查订单是否应在机器人停止期间平仓
 		var sess *ormo.Queries
-		var conn *sql.DB
+		var conn *orm.TrackedDB
 		var err *errs.Error
 		if core.LiveMode {
 			sess, conn, err = ormo.Conn(orm.DbTrades, true)
@@ -499,7 +498,7 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 		return nil
 	}
 	var sess *ormo.Queries
-	var conn *sql.DB
+	var conn *orm.TrackedDB
 	var err *errs.Error
 	if core.LiveMode {
 		sess, conn, err = ormo.Conn(orm.DbTrades, true)

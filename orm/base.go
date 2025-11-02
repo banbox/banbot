@@ -30,10 +30,12 @@ import (
 )
 
 var (
-	pool       *pgxpool.Pool
-	dbPathMap  = make(map[string]string)
-	dbPathInit = make(map[string]bool)
-	dbPathLock = deadlock.Mutex{}
+	pool           *pgxpool.Pool
+	dbPathMap      = make(map[string]string)
+	dbPathInit     = make(map[string]bool)
+	dbPathLock     = deadlock.Mutex{}
+	trackedDBs     = make(map[*TrackedDB]bool)
+	trackedDBsLock = deadlock.Mutex{}
 )
 
 //go:embed sql/trade_schema.sql
@@ -203,7 +205,38 @@ func SetDbPath(key, path string) {
 	dbPathLock.Unlock()
 }
 
-func DbLite(src string, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Error) {
+// TrackedDB wraps sql.DB to track connection hold time and detect timeouts
+type TrackedDB struct {
+	*sql.DB
+	acquireTime time.Time
+	timeoutMs   int64
+	path        string
+	stack       string
+	closed      bool
+	mu          deadlock.Mutex
+}
+
+// Close marks the TrackedDB as closed and removes it from tracking
+func (t *TrackedDB) Close() error {
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
+
+	trackedDBsLock.Lock()
+	delete(trackedDBs, t)
+	trackedDBsLock.Unlock()
+
+	return t.DB.Close()
+}
+
+// IsClosed returns whether the TrackedDB has been closed
+func (t *TrackedDB) IsClosed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
+
+func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *errs.Error) {
 	dbPathLock.Lock()
 	defer dbPathLock.Unlock()
 	if target, ok := dbPathMap[path]; ok {
@@ -220,13 +253,13 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*sql.DB, *err
 	}
 	// 添加 WAL 模式和其他性能优化参数
 	openFlag += "&_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000"
-	
+
 	var connStr = fmt.Sprintf("file:%s?%s", path, openFlag)
 	db, err_ := sql.Open("sqlite", connStr)
 	if err_ != nil {
 		return nil, errs.New(core.ErrDbConnFail, err_)
 	}
-	
+
 	// 配置连接池参数以提高并发性能
 	if write {
 		// 写连接：限制为1个
@@ -240,7 +273,27 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*sql.DB, *err
 		db.SetMaxIdleConns(5)
 	}
 	db.SetConnMaxLifetime(time.Hour)
-	
+
+	// Create tracked DB wrapper
+	tracked := &TrackedDB{
+		DB:          db,
+		acquireTime: time.Now(),
+		timeoutMs:   timeoutMs,
+		path:        path,
+		stack:       errs.CallStack(3, 20),
+		closed:      false,
+	}
+
+	// Register for timeout monitoring
+	if timeoutMs > 0 {
+		trackedDBsLock.Lock()
+		trackedDBs[tracked] = true
+		trackedDBsLock.Unlock()
+
+		// Start timeout monitor goroutine
+		go monitorTimeout(tracked)
+	}
+
 	if _, ok := dbPathInit[path]; !ok {
 		ddl, tbl := ddlTrade, "bottask"
 		if src == DbUI {
@@ -272,7 +325,32 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*sql.DB, *err
 		}
 		dbPathInit[path] = true
 	}
-	return db, nil
+	return tracked, nil
+}
+
+// monitorTimeout monitors a TrackedDB and logs an error if it exceeds the timeout
+func monitorTimeout(tracked *TrackedDB) {
+	if tracked.timeoutMs <= 0 {
+		return
+	}
+
+	timeout := time.Duration(tracked.timeoutMs) * time.Millisecond
+	time.Sleep(timeout)
+
+	// Check if connection is still held
+	if !tracked.IsClosed() {
+		holdTime := time.Since(tracked.acquireTime)
+		log.Error("SQLite connection timeout: connection held beyond timeout period",
+			zap.String("path", tracked.path),
+			zap.Duration("timeout", timeout),
+			zap.Duration("held_for", holdTime),
+			zap.String("stack", tracked.stack))
+	}
+
+	// Remove from tracking
+	trackedDBsLock.Lock()
+	delete(trackedDBs, tracked)
+	trackedDBsLock.Unlock()
 }
 
 type Tx struct {

@@ -2,7 +2,6 @@ package biz
 
 import (
 	"context"
-	"database/sql"
 	"embed"
 	_ "embed"
 	"fmt"
@@ -143,7 +142,7 @@ func RefreshJobs(pairs []string, pairTfScores map[string]map[string]float64, sho
 	}
 	if len(accOds) > 0 {
 		var sess *ormo.Queries
-		var conn *sql.DB
+		var conn *orm.TrackedDB
 		if core.LiveMode {
 			sess, conn, err = ormo.Conn(orm.DbTrades, true)
 			if err != nil {
@@ -287,7 +286,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 	lockBatch.Lock()
 	defer lockBatch.Unlock()
 	var sess *ormo.Queries
-	var conn *sql.DB
+	var conn *orm.TrackedDB
 	var err *errs.Error
 	if core.LiveMode && !isWarmUp {
 		// In real-time mode, the order is saved to the database. In non-real-time mode, the order is temporarily saved to the memory without the need for a database.
