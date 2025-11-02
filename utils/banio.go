@@ -465,6 +465,8 @@ func (c *BanConn) LoopPing(intvSecs int) {
 	id := 0
 	failNum := 0
 	addrField := zap.String("addr", c.Remote)
+	// 针对LoopPing早于RunForever很久启动的情况，先设置状态
+	c.IsReading = true
 	for {
 		core.Sleep(time.Duration(intvSecs) * time.Second)
 		if !c.IsReading {
