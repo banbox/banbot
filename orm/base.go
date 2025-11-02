@@ -218,11 +218,29 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*sql.DB, *err
 	} else {
 		openFlag += "&mode=ro"
 	}
+	// 添加 WAL 模式和其他性能优化参数
+	openFlag += "&_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000"
+	
 	var connStr = fmt.Sprintf("file:%s?%s", path, openFlag)
 	db, err_ := sql.Open("sqlite", connStr)
 	if err_ != nil {
 		return nil, errs.New(core.ErrDbConnFail, err_)
 	}
+	
+	// 配置连接池参数以提高并发性能
+	if write {
+		// 写连接：限制为1个
+		// 原因：SQLite WAL模式下同一时刻只允许一个写事务，多个连接会在SQLite层竞争锁
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+	} else {
+		// 读连接：允许多个并发读取
+		// WAL模式支持多个读操作同时进行，不会阻塞
+		db.SetMaxOpenConns(10)
+		db.SetMaxIdleConns(5)
+	}
+	db.SetConnMaxLifetime(time.Hour)
+	
 	if _, ok := dbPathInit[path]; !ok {
 		ddl, tbl := ddlTrade, "bottask"
 		if src == DbUI {
@@ -242,6 +260,10 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*sql.DB, *err
 				if _, err_ = db.Exec(ddl); err_ != nil {
 					return nil, errs.New(core.ErrDbExecFail, err_)
 				}
+				// 重新配置连接池
+				db.SetMaxOpenConns(1)
+				db.SetMaxIdleConns(1)
+				db.SetConnMaxLifetime(time.Hour)
 			} else if err_ != nil {
 				return nil, errs.New(core.ErrDbExecFail, err_)
 			} else {

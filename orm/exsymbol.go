@@ -183,7 +183,7 @@ func EnsureCurSymbols(symbols []string) *errs.Error {
 	for _, symbol := range symbols {
 		mar, ok := marMap[symbol]
 		if !ok {
-			return errs.NewMsg(core.ErrInvalidSymbol, symbol)
+			return errs.NewMsg(core.ErrInvalidSymbol, "symbol %s not found", symbol)
 		}
 		exsList = append(exsList, &ExSymbol{
 			Exchange: exgId,
