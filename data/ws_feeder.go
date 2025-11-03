@@ -153,7 +153,11 @@ func (f *TradeFeeder) CallNext() {
 	f.nextCache = nil
 	f.index = 0
 	f.indexNext = 0
-	f.nextMS = f.cache[0].Timestamp
+	if len(f.cache) == 0 {
+		f.nextMS = f.endMS
+	} else {
+		f.nextMS = f.cache[0].Timestamp
+	}
 	f.waitNext = make(chan int)
 	go f.loadNextBatch()
 }
@@ -176,7 +180,11 @@ func (f *TradeFeeder) loadNextBatch() {
 	}
 	f.nextCache, err = f.loader.LoadTrades(info)
 	if err != nil {
-		log.Error("load ws trades fail", zap.String("item", info.String()), zap.Error(err))
+		if err.Code == errs.CodeDataNotFound {
+			log.Warn("no ws data", zap.String("item", info.String()), zap.String("err", err.Short()))
+		} else {
+			log.Error("load ws trades fail", zap.String("item", info.String()), zap.Error(err))
+		}
 	}
 	if len(f.nextCache) == 0 {
 		f.nextMS = f.endMS

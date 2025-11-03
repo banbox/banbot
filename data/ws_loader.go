@@ -407,6 +407,9 @@ func (l *WsDataLoader) downloadJob(info *WsSymbol) (string, *errs.Error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusNotFound {
+			return "", errs.NewMsg(errs.CodeDataNotFound, "invalid : %s", downUrl)
+		}
 		return "", errs.NewMsg(errs.CodeRunTime, "download failed: %d %s", resp.StatusCode, downUrl)
 	}
 	folder := filepath.Dir(tmpFile)
