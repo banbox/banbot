@@ -676,8 +676,11 @@ For combination varieties, return the unweighted candlestick and the weighting f
 func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame string,
 	startMS, endMS int64, limit int, handler func(string, string, []*banexg.Kline, []*AdjInfo)) *errs.Error {
 	var exsMap, err = MapExSymbols(exchange, symbols)
-	if err != nil {
+	if len(exsMap) == 0 {
 		return err
+	}
+	if err != nil {
+		log.Error("resolve pairs fail", zap.String("err", err.Short()))
 	}
 	sess, conn, err := Conn(nil)
 	if err != nil {
@@ -741,14 +744,31 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 
 func MapExSymbols(exchange banexg.BanExchange, symbols []string) (map[int32]*ExSymbol, *errs.Error) {
 	var exsMap = make(map[int32]*ExSymbol)
+	var fails = make(map[string]*errs.Error)
 	for _, pair := range symbols {
 		exs, err := GetExSymbol(exchange, pair)
 		if err != nil {
-			return exsMap, err
+			fails[pair] = err
+		} else {
+			exsMap[exs.ID] = exs
 		}
-		exsMap[exs.ID] = exs
 	}
-	return exsMap, nil
+	var lastCode int
+	var codeMap = make(map[string][]string)
+	for pair, err := range fails {
+		lastCode = err.Code
+		code := err.CodeName()
+		codeMap[code] = append(codeMap[code], pair)
+	}
+	var b strings.Builder
+	for code, names := range codeMap {
+		b.WriteString(fmt.Sprintf("%s: %s\n", code, strings.Join(names, ", ")))
+	}
+	var err *errs.Error
+	if lastCode != 0 {
+		err = errs.NewMsg(lastCode, "fail pairs: \n%s", b.String())
+	}
+	return exsMap, err
 }
 
 func parseDownArgs(tfMSecs int64, startMS, endMS int64, limit int, withUnFinish bool) (int64, int64) {
