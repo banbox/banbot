@@ -159,12 +159,8 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 		if bar != nil && bar.TimeFrame != od.Timeframe {
 			continue
 		}
-		var exOrder *ormo.ExOrder
-		if od.ExitTag != "" && od.Exit != nil && od.Exit.Status < ormo.OdStatusClosed {
-			exOrder = od.Exit
-		} else if od.Enter.Status < ormo.OdStatusClosed {
-			exOrder = od.Enter
-		} else {
+		exOrder := getPendingSub(od)
+		if exOrder == nil {
 			if od.ExitTag == "" && bar != nil {
 				// 已入场完成，尚未出现出场信号，检查是否触发止损The entry has been completed, but the exit signal has not yet appeared. Check whether the stop loss is triggered.
 				err := o.tryFillTriggers(od, &bar.Kline)
@@ -644,6 +640,15 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 		validOds = append(validOds, od)
 	}
 	ormo.HistODs = validOds
+	return nil
+}
+
+func getPendingSub(od *ormo.InOutOrder) *ormo.ExOrder {
+	if od.ExitTag != "" && od.Exit != nil && od.Exit.Status < ormo.OdStatusClosed {
+		return od.Exit
+	} else if od.Enter != nil && od.Enter.Status < ormo.OdStatusClosed {
+		return od.Enter
+	}
 	return nil
 }
 

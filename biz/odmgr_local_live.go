@@ -175,7 +175,20 @@ func CallLocalLiveOdMgrsKline(msg *data.KLineMsg, bars []*banexg.Kline) *errs.Er
 					TimeFrame: timeFrame,
 				},
 			}
-			_, err := liveMgr.fillPendingOrders(curOds, lastK)
+			barEndMS := k.Time + int64(msg.TFSecs*1000)
+			allodOds := make([]*ormo.InOutOrder, 0, len(curOds))
+			for _, od := range curOds {
+				exod := getPendingSub(od)
+				if exod == nil {
+					exod = od.Enter
+				}
+				if exod != nil && exod.CreateAt >= barEndMS {
+					// 过滤晚于此k线的订单
+					continue
+				}
+				allodOds = append(allodOds, od)
+			}
+			_, err := liveMgr.fillPendingOrders(allodOds, lastK)
 			if err != nil {
 				return err
 			}
