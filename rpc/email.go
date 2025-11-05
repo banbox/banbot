@@ -21,7 +21,7 @@ import (
 //   min_intv_secs = 5
 //
 // 通过 SendMsg -> Queue -> doSendMsgs 的链路实现异步批量发送与失败重试
-// 实际发信调用 utils.SendEmailFrom，from 参数留空即可。
+// 实际发信调用 utils.SendEmailTo 或 utils.SendEmail。
 //
 // 注意：使用前需先在业务启动流程中调用 utils.SetMailSender(...) 完成 SMTP 客户端配置。
 
@@ -59,7 +59,7 @@ func makeDoSendMsgEmail(e *Email) func([]map[string]string) []map[string]string 
 		}
 		body := b.String()
 		subject := fmt.Sprintf("[%d]%s", len(msgList), body[:min(len(body), 50)])
-		if err := utils2.SendEmailFrom("", e.toUser, subject, body); err != nil {
+		if err := utils2.SendEmailTo(subject, body, e.toUser); err != nil {
 			log.Error("email send fail", zap.String("to", e.toUser), zap.Error(err))
 			return msgList
 		}

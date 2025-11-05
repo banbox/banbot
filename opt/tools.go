@@ -1,6 +1,8 @@
 package opt
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/csv"
 	"errors"
 	"flag"
@@ -1175,7 +1177,7 @@ func BacktestToCompare() {
 	// 和交易所仓位对比
 	exgMatch, exgDiff := compareLocalWithExg(posList, localAmts, liveAmts)
 	// 发送对比邮件报告
-	sendPosCompareReport(matchOpens, btMore, liveMore, exgMatch, exgDiff)
+	sendPosCompareReport(matchOpens, btMore, liveMore, exgMatch, exgDiff, outPath)
 }
 
 func compareLocalWithExg(posList []*banexg.Position, localAmts, liveAmts map[string]float64) (map[string]float64, map[string][3]float64) {
@@ -1195,15 +1197,25 @@ func compareLocalWithExg(posList []*banexg.Position, localAmts, liveAmts map[str
 	return matchSizes, diffSizes
 }
 
-func sendPosCompareReport(matchOpens []string, btMore, liveMore map[string]int64, exgMatch map[string]float64, exgDiff map[string][3]float64) {
+func sendPosCompareReport(matchOpens []string, btMore, liveMore map[string]int64, exgMatch map[string]float64, exgDiff map[string][3]float64, btDir string) {
 	title := config.Name + " " + config.GetLangMsg("backtest_regular", "定期回测")
 	liveBadOpen := config.GetLangMsg("live_bad_open", "实盘误开")
 	liveNoOpen := config.GetLangMsg("live_no_open", "实盘未开")
 	liveBadPos := config.GetLangMsg("live_bad_pos", "仓位不符")
 	allMatch := true
+	var attFileData []byte
+	var mail = &utils.EmailTask{}
 	if len(btMore) == 0 && len(liveMore) == 0 && len(exgDiff) == 0 {
 		title += config.GetLangMsg("normal", "正常")
 	} else {
+		const maxFileSize = 30 * 1024 * 1024 // 30MB
+		var err error
+		attFileData, err = ZipBacktestResult(btDir, false, true, maxFileSize)
+		if err != nil {
+			log.Warn("zip backtest fail", zap.Error(err))
+		} else {
+			mail.AttachFileBy("result.zip", attFileData, "")
+		}
 		allMatch = false
 		title += config.GetLangMsg("abnormal", "异常")
 		title += fmt.Sprintf(", %s: %d %s: %d",
@@ -1238,15 +1250,129 @@ func sendPosCompareReport(matchOpens []string, btMore, liveMore map[string]int64
 		b.WriteString(fmt.Sprintf("\t%s with amt: %.6f\n", key, amt))
 	}
 	if len(config.BTInLive.MailTo) > 0 {
-		for _, user := range config.BTInLive.MailTo {
-			err := utils.SendEmailFrom("", user, title, b.String())
-			if err != nil {
-				log.Error("send mail fail", zap.String("to", user), zap.Error(err))
-			}
+		mail.Subject = title
+		mail.Body = b.String()
+		mail.To = config.BTInLive.MailTo
+		err := utils.SendEmail(mail)
+		if err != nil {
+			log.Error("send mail fail", zap.Strings("to", mail.To), zap.Error(err))
 		}
 	} else if !allMatch {
 		log.Error(title, zap.String("detail", b.String()))
 	} else {
 		log.Info(title)
 	}
+}
+
+// collectGoFiles 递归收集指定目录及其子目录下所有的.go文件
+func collectGoFiles(rootPath string) ([]string, error) {
+	var goFiles []string
+	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		// 跳过目录，只处理文件
+		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".go") {
+			goFiles = append(goFiles, path)
+		}
+		return nil
+	})
+	return goFiles, err
+}
+
+// ZipBacktestResult 压缩回测结果为zip数据
+// maxFileSize: 最大允许的文件大小(字节)，超过此大小的文件不添加到zip中，0表示不限制
+func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFileSize int64) ([]byte, error) {
+	if !utils.Exists(resultPath) {
+		return nil, fmt.Errorf("backtest result not exist: %s", resultPath)
+	}
+
+	names := []string{"detail.json", "config.yml", "out.log"}
+	if withOrders {
+		names = append(names, "orders.gob")
+	}
+	var fileList []string
+	for _, name := range names {
+		fileList = append(fileList, filepath.Join(resultPath, name))
+	}
+	// 递归收集所有.go文件
+	goFiles, err := collectGoFiles(resultPath)
+	if err != nil {
+		log.Warn("Failed to find go files", zap.Error(err))
+	} else {
+		for _, goFile := range goFiles {
+			fileList = append(fileList, goFile)
+		}
+	}
+
+	var buf bytes.Buffer
+	zipWriter := zip.NewWriter(&buf)
+	successCount := 0
+	for _, filePath := range fileList {
+		// 计算相对于resultPath的相对路径
+		fileName, err := filepath.Rel(resultPath, filePath)
+		if err != nil {
+			// 如果无法计算相对路径，使用文件名
+			fileName = filepath.Base(filePath)
+		}
+
+		// 跳过不存在的文件
+		if !utils.Exists(filePath) {
+			log.Debug("File not found, skipping", zap.String("file", fileName))
+			continue
+		}
+
+		// 检查文件大小
+		if maxFileSize > 0 {
+			fileInfo, err := os.Stat(filePath)
+			if err != nil {
+				log.Warn("Failed to stat file", zap.String("file", fileName), zap.Error(err))
+				continue
+			}
+			if fileInfo.Size() > maxFileSize {
+				log.Warn("File too large, skipping", zap.String("file", fileName),
+					zap.Int64("size", fileInfo.Size()), zap.Int64("maxSize", maxFileSize))
+				continue
+			}
+		}
+
+		// 读取文件内容
+		fileData, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Warn("Failed to read file", zap.String("file", fileName), zap.Error(err))
+			continue
+		}
+
+		// 创建ZIP文件中的条目
+		zipPath := strings.ReplaceAll(fileName, "\\", "/")
+
+		w, err := zipWriter.Create(zipPath)
+		if err != nil {
+			log.Warn("Failed to create zip entry", zap.String("file", fileName), zap.Error(err))
+			continue
+		}
+
+		// 写入文件内容
+		if _, err = w.Write(fileData); err != nil {
+			log.Warn("Failed to write to zip", zap.String("file", fileName), zap.Error(err))
+			continue
+		}
+		successCount += 1
+	}
+
+	if successCount == 0 {
+		return nil, fmt.Errorf("no valid backtest files to upload")
+	}
+
+	// 关闭ZIP writer
+	if err = zipWriter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close zip writer: %w", err)
+	}
+
+	if cleanIfSuccess {
+		if err = os.RemoveAll(resultPath); err != nil {
+			log.Warn("Failed to delete local backtest files", zap.String("path", resultPath), zap.Error(err))
+		}
+	}
+	return buf.Bytes(), nil
 }

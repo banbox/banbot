@@ -15,5 +15,5 @@ func TestMergeYamlStr(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf(data)
+	fmt.Print(data)
 }

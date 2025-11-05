@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"fmt"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -37,8 +36,7 @@ func DoHttp(client *http.Client, req *http.Request) *banexg.HttpRes {
 		zap.Int("status", result.Status), zap.Int("len", len(result.Content)),
 		zap.Object("head", banexg.HttpHeader(result.Headers)), bodyShort)
 	if result.Status >= 400 {
-		msg := fmt.Sprintf("%s  %v", req.URL, result.Content)
-		result.Error = errs.NewMsg(result.Status, msg)
+		result.Error = errs.NewMsg(result.Status, "%s  %v", req.URL, result.Content)
 	}
 	return &result
 }

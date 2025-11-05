@@ -208,7 +208,7 @@ func MovePath(src, tgt string) error {
 
 	_, err = os.Stat(srcAbs)
 	if os.IsNotExist(err) {
-		return fmt.Errorf("Source Not Exist: %v" + src)
+		return fmt.Errorf("source not exist: %v", src)
 	}
 
 	tgtDir := filepath.Dir(tgtAbs)
