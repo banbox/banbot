@@ -623,7 +623,11 @@ func (i *InOutOrder) SetExitTrigger(key string, args *ExitTrigger, price float64
 		side = banexg.OdSideBuy
 	}
 	if price <= 0 {
-		price = com.GetPriceExp(i.Symbol, side, com.Day10MSecs)
+		if i.Status == InOutStatusInit && i.Enter != nil && strings.Contains(i.Enter.OrderType, "limit") {
+			price = i.Enter.Price
+		} else {
+			price = com.GetPriceExp(i.Symbol, side, com.Day10MSecs)
+		}
 	}
 	if isStopLoss == (side == banexg.OdSideSell) {
 		// 触发价低于最新价：平多止损、平空止盈
@@ -1100,7 +1104,8 @@ type GetHistOrdersArgs struct {
 	CloseAfter  int64 // Start timestamp 开始时间戳
 	CloseBefore int64 // End timestamp 结束时间戳
 	Limit       int
-	AfterID     int // position means after; negative means before
+	AfterID     int  // position means after; negative means before
+	IDAsc       bool // sort by ID asc(default: desc)
 }
 
 type GetOrdersArgs struct {

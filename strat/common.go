@@ -433,6 +433,10 @@ func GetHistOrders(args ormo.GetHistOrdersArgs) ([]*ormo.InOutOrder, *errs.Error
 			return nil, err
 		}
 		defer conn.Close()
+		odBy := "id desc"
+		if args.IDAsc {
+			odBy = "id asc"
+		}
 		orders, err = sess.GetOrders(ormo.GetOrdersArgs{
 			Strategy:    args.Strategy,
 			Pairs:       args.Pairs,
@@ -446,6 +450,7 @@ func GetHistOrders(args ormo.GetHistOrdersArgs) ([]*ormo.InOutOrder, *errs.Error
 			Limit:       args.Limit,
 			AfterID:     args.AfterID,
 			Status:      2,
+			OrderBy:     odBy,
 		})
 		if err != nil {
 			return nil, err
@@ -536,6 +541,12 @@ func GetHistOrders(args ormo.GetHistOrdersArgs) ([]*ormo.InOutOrder, *errs.Error
 				}
 				orders = filtered
 			}
+		}
+
+		if !args.IDAsc {
+			slices.SortFunc(orders, func(a, b *ormo.InOutOrder) int {
+				return int(b.ID - a.ID)
+			})
 		}
 
 		// Apply Limit
