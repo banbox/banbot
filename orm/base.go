@@ -242,7 +242,8 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 	if target, ok := dbPathMap[path]; ok {
 		path = target
 	}
-	openFlag := ""
+	// 添加 WAL 模式和其他性能优化参数
+	openFlag := "_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000"
 	if timeoutMs > 0 {
 		openFlag += fmt.Sprintf("&_busy_timeout=%d", timeoutMs)
 	}
@@ -251,8 +252,6 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 	} else {
 		openFlag += "&mode=ro"
 	}
-	// 添加 WAL 模式和其他性能优化参数
-	openFlag += "&_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000"
 
 	var connStr = fmt.Sprintf("file:%s?%s", path, openFlag)
 	db, err_ := sql.Open("sqlite", connStr)

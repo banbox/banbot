@@ -155,8 +155,7 @@ func GetSymbolVols(symbols []string, tf string, num int, endMS int64, withEmpty 
 		return nil, err
 	}
 	if len(symbolVols) == 0 {
-		msg := fmt.Sprintf("No data found for %d pairs at %v", len(symbols), endMS)
-		return nil, errs.NewMsg(core.ErrRunTime, msg)
+		return nil, errs.NewMsg(core.ErrRunTime, "No data found for %d pairs at %v", len(symbols), endMS)
 	}
 	return symbolVols, nil
 }

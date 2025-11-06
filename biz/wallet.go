@@ -172,8 +172,8 @@ func (iw *ItemWallet) SetMargin(odKey string, amount float64) *errs.Error {
 			//余额不足
 			iw.UsedUPol -= upolCost
 			iw.lock.Unlock()
-			errMsg := "available " + iw.Coin + " Insufficient, frozen require: " + fmt.Sprintf("%.5f", addVal) + ", " + odKey
-			return errs.NewMsg(core.ErrLowFunds, errMsg)
+			return errs.NewMsg(core.ErrLowFunds, "%s Insufficient, frozen require: %s, %s",
+				iw.Coin, fmt.Sprintf("%.5f", addVal), odKey)
 		}
 		iw.Available -= addVal
 	}
@@ -203,8 +203,8 @@ func (iw *ItemWallet) SetFrozen(odKey string, amount float64, withAvailable bool
 	if withAvailable {
 		if addVal > 0 && iw.Available < addVal {
 			iw.lock.Unlock()
-			errMsg := "available " + iw.Coin + " Insufficient, frozen require: " + fmt.Sprintf("%.5f", addVal) + ", " + odKey
-			return errs.NewMsg(core.ErrLowFunds, errMsg)
+			return errs.NewMsg(core.ErrLowFunds, "%s Insufficient, frozen require: %s, %s",
+				iw.Coin, fmt.Sprintf("%.5f", addVal), odKey)
 		}
 		iw.Available -= addVal
 	} else {
@@ -214,8 +214,8 @@ func (iw *ItemWallet) SetFrozen(odKey string, amount float64, withAvailable bool
 		}
 		if addVal > 0 && pendVal < addVal {
 			iw.lock.Unlock()
-			errMsg := "pending " + iw.Coin + " Insufficient, frozen require: " + fmt.Sprintf("%.5f", addVal) + ", " + odKey
-			return errs.NewMsg(core.ErrLowSrcAmount, errMsg)
+			return errs.NewMsg(core.ErrLowFunds, "%s Insufficient, frozen require: %s, %s",
+				iw.Coin, fmt.Sprintf("%.5f", addVal), odKey)
 		}
 		iw.Pendings[odKey] = pendVal - addVal
 	}

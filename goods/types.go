@@ -1,7 +1,9 @@
 package goods
 
 import (
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banexg/errs"
+	"github.com/go-viper/mapstructure/v2"
 )
 
 type IFilter interface {
@@ -103,4 +105,91 @@ type OffsetFilter struct {
 type ShuffleFilter struct {
 	BaseFilter
 	Seed int `yaml:"seed" mapstructure:"seed,omitempty"`
+}
+
+// FilterFactory is a function that creates a new filter instance
+type FilterFactory func(base BaseFilter) IFilter
+
+// FilterRegistry holds all registered filter factories
+var filterRegistry = make(map[string]FilterFactory)
+
+// RegisterFilter registers a custom filter factory with the given name
+// This allows users to create and register their own filters
+// Example:
+//
+//	type MyCustomFilter struct {
+//	    goods.BaseFilter
+//	    MyParam string `yaml:"my_param" mapstructure:"my_param"`
+//	}
+//
+//	func (f *MyCustomFilter) Filter(pairs []string, timeMS int64) ([]string, *errs.Error) {
+//	    // Your custom filter logic here
+//	    return pairs, nil
+//	}
+//
+//	func init() {
+//	    goods.RegisterFilter("MyCustomFilter", func(base goods.BaseFilter) goods.IFilter {
+//	        return &MyCustomFilter{BaseFilter: base}
+//	    })
+//	}
+func RegisterFilter(name string, factory FilterFactory) {
+	filterRegistry[name] = factory
+}
+
+// GetFilterFactory returns the factory function for a given filter name
+func GetFilterFactory(name string) (FilterFactory, bool) {
+	factory, ok := filterRegistry[name]
+	return factory, ok
+}
+
+// CreateFilter creates a filter instance from config using the registry
+func CreateFilter(cfg *config.CommonPairFilter, allowEmpty bool) (IFilter, *errs.Error) {
+	base := BaseFilter{Name: cfg.Name, AllowEmpty: allowEmpty}
+
+	// Try to get from registry first
+	if factory, ok := filterRegistry[cfg.Name]; ok {
+		filter := factory(base)
+		err := mapstructure.Decode(cfg.Items, &filter)
+		if err != nil {
+			return nil, errs.New(errs.CodeUnmarshalFail, err)
+		}
+		return filter, nil
+	}
+
+	return nil, errs.NewMsg(errs.CodeParamInvalid, "unknown symbol filter: %s", cfg.Name)
+}
+
+// init registers all built-in filters
+func init() {
+	// Register all built-in filters
+	RegisterFilter("AgeFilter", func(base BaseFilter) IFilter {
+		return &AgeFilter{BaseFilter: base}
+	})
+	RegisterFilter("VolumePairList", func(base BaseFilter) IFilter {
+		return &VolumePairFilter{BaseFilter: base}
+	})
+	RegisterFilter("PriceFilter", func(base BaseFilter) IFilter {
+		return &PriceFilter{BaseFilter: base}
+	})
+	RegisterFilter("RateOfChangeFilter", func(base BaseFilter) IFilter {
+		return &RateOfChangeFilter{BaseFilter: base}
+	})
+	RegisterFilter("VolatilityFilter", func(base BaseFilter) IFilter {
+		return &VolatilityFilter{BaseFilter: base}
+	})
+	RegisterFilter("SpreadFilter", func(base BaseFilter) IFilter {
+		return &SpreadFilter{BaseFilter: base}
+	})
+	RegisterFilter("OffsetFilter", func(base BaseFilter) IFilter {
+		return &OffsetFilter{BaseFilter: base}
+	})
+	RegisterFilter("ShuffleFilter", func(base BaseFilter) IFilter {
+		return &ShuffleFilter{BaseFilter: base}
+	})
+	RegisterFilter("CorrelationFilter", func(base BaseFilter) IFilter {
+		return &CorrelationFilter{BaseFilter: base}
+	})
+	RegisterFilter("BlockFilter", func(base BaseFilter) IFilter {
+		return &BlockFilter{BaseFilter: base}
+	})
 }

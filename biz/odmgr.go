@@ -821,7 +821,7 @@ func CloseAccOrders(acc string, odList []*ormo.InOutOrder, req *strat.ExitReq) (
 		}
 	}
 	if failNum > 0 {
-		return closeNum, failNum, errs.NewMsg(errs.CodeRunTime, errMsg.String())
+		return closeNum, failNum, errs.NewMsg(errs.CodeRunTime, "%s", errMsg.String())
 	}
 	return closeNum, failNum, nil
 }

@@ -942,8 +942,7 @@ func (o *LiveOrderMgr) createInOutOd(exs *orm.ExSymbol, short bool, average, fil
 
 func (o *LiveOrderMgr) createOdFromPos(pos *banexg.Position, defTF string) (*ormo.InOutOrder, *errs.Error) {
 	if defTF == "" {
-		msg := fmt.Sprintf("take over job not found, %s %s", pos.Symbol, config.TakeOverStrat)
-		return nil, errs.NewMsg(core.ErrBadConfig, msg)
+		return nil, errs.NewMsg(core.ErrBadConfig, "take over job not found, %s %s", pos.Symbol, config.TakeOverStrat)
 	}
 	exs, err := orm.GetExSymbolCur(pos.Symbol)
 	if err != nil {
@@ -1587,7 +1586,7 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 					if err != nil {
 						log.Error("local exit order fail", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
 					}
-					return errs.NewMsg(core.ErrRunTime, msg+odKey)
+					return errs.NewMsg(core.ErrRunTime, "%s, %s", msg, odKey)
 				}
 			}
 		}
@@ -1600,7 +1599,7 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 			msg := "no valid price"
 			err = od.LocalExit(0, core.ExitTagFatalErr, od.InitPrice, msg, "")
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
-			return errs.NewMsg(errs.CodeParamInvalid, msg)
+			return errs.NewMsg(errs.CodeParamInvalid, "no valid price")
 		}
 		// The market price should be used to calculate the quantity here, because the input price may be very different from the market price
 		// 这里应使用市价计算数量，因传入价格可能和市价相差很大
@@ -1762,7 +1761,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	}
 	if subOd.Amount == 0 {
 		if isEnter {
-			return errs.NewMsg(core.ErrRunTime, fmt.Sprintf("amount is required for %s", od.Key()))
+			return errs.NewMsg(core.ErrRunTime, "amount is required for %s", od.Key())
 		}
 		subOd.Amount = od.Enter.Filled
 		if subOd.Amount == 0 {

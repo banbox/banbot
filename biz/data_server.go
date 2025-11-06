@@ -82,7 +82,7 @@ func (s *DataServer) SubFeatures(req *SubReq, rsp FeaFeeder_SubFeaturesServer) e
 	s.feaLock.Unlock()
 	gen, ok := FeaGenerators[req.Task]
 	if !ok {
-		return fmt.Errorf("unsupport data task:" + req.Task)
+		return fmt.Errorf("unsupport data task: %s", req.Task)
 	}
 	return gen(exsList, req, rsp)
 }

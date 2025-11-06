@@ -7,7 +7,6 @@ import (
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
-	"github.com/go-viper/mapstructure/v2"
 )
 
 var (
@@ -37,43 +36,23 @@ func GetPairFilters(items []*config.CommonPairFilter, withInvalid bool) ([]IFilt
 	fts := make([]IFilter, 0, len(items))
 	// 未启用定期刷新，则允许成交量为空的品种
 	allowEmpty := config.PairMgr.Cron == ""
-	var err *errs.Error
+
 	for _, cfg := range items {
-		var output IFilter
-		var base = BaseFilter{Name: cfg.Name, AllowEmpty: allowEmpty}
-		switch cfg.Name {
-		case "AgeFilter":
-			output = &AgeFilter{BaseFilter: base}
-		case "VolumePairList":
-			output = &VolumePairFilter{BaseFilter: base}
-		case "PriceFilter":
-			output = &PriceFilter{BaseFilter: base}
-		case "RateOfChangeFilter":
-			output = &RateOfChangeFilter{BaseFilter: base}
-		case "VolatilityFilter":
-			output = &VolatilityFilter{BaseFilter: base}
-		case "SpreadFilter":
-			output = &SpreadFilter{BaseFilter: base}
-		case "OffsetFilter":
-			output = &OffsetFilter{BaseFilter: base}
-		case "ShuffleFilter":
-			output = &ShuffleFilter{BaseFilter: base}
-		case "CorrelationFilter":
-			output = &CorrelationFilter{BaseFilter: base}
-		case "BlockFilter":
-			blockFts := &BlockFilter{BaseFilter: base}
-			blockFts.Pairs, err = config.ParsePairs(blockFts.Pairs...)
-			if err != nil {
-				return nil, err
+		// Use the new registry system to create filters
+		output, err := CreateFilter(cfg, allowEmpty)
+		if err != nil {
+			return nil, err
+		}
+
+		// Special handling for BlockFilter to parse pairs
+		if blockFts, ok := output.(*BlockFilter); ok {
+			var parseErr *errs.Error
+			blockFts.Pairs, parseErr = config.ParsePairs(blockFts.Pairs...)
+			if parseErr != nil {
+				return nil, parseErr
 			}
-			output = blockFts
-		default:
-			return nil, errs.NewMsg(errs.CodeParamInvalid, "unknown symbol filter: %s", cfg.Name)
 		}
-		err_ := mapstructure.Decode(cfg.Items, &output)
-		if err_ != nil {
-			return nil, errs.New(errs.CodeUnmarshalFail, err_)
-		}
+
 		if withInvalid || !output.IsDisable() {
 			fts = append(fts, output)
 		}
