@@ -6,7 +6,6 @@ import (
 	"github.com/banbox/banbot/com"
 	"math"
 	"math/rand"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1222,11 +1221,13 @@ func (q *Queries) GetOrders(args GetOrdersArgs) ([]*InOutOrder, *errs.Error) {
 	}
 	b.WriteString("and inout_id in (")
 	isFirst := true
+	res := make([]*InOutOrder, 0, len(iorders))
 	for _, od := range iorders {
 		iod := &InOutOrder{
 			IOrder: od,
 		}
 		iod.loadInfo()
+		res = append(res, iod)
 		itemMap[od.ID] = iod
 		if !isFirst {
 			b.WriteString(",")
@@ -1234,7 +1235,6 @@ func (q *Queries) GetOrders(args GetOrdersArgs) ([]*InOutOrder, *errs.Error) {
 		b.WriteString(fmt.Sprintf("$%v", len(sqlParams)+1))
 		sqlParams = append(sqlParams, od.ID)
 		isFirst = false
-
 	}
 	b.WriteString(")")
 	exOrders, err := q.getExOrders(b.String(), sqlParams)
@@ -1252,11 +1252,13 @@ func (q *Queries) GetOrders(args GetOrdersArgs) ([]*InOutOrder, *errs.Error) {
 			iod.Exit = od
 		}
 	}
-	res := utils.ValsOfMap(itemMap)
-	slices.SortFunc(res, func(a, b *InOutOrder) int {
-		return int((a.RealEnterMS() - b.RealEnterMS()) / 1000)
-	})
-	return res, nil
+	result := make([]*InOutOrder, 0, len(iorders))
+	for _, od := range res {
+		if od.Enter != nil {
+			result = append(result, od)
+		}
+	}
+	return result, nil
 }
 
 func (q *Queries) DelOrder(od *InOutOrder) *errs.Error {
