@@ -423,40 +423,140 @@ func GetInfoJobs(account string) map[string]map[string]*StratJob {
 	return jobs
 }
 
-func CalcJobScores(pair, tf, stgy string) *errs.Error {
+func GetHistOrders(args ormo.GetHistOrdersArgs) ([]*ormo.InOutOrder, *errs.Error) {
 	var orders []*ormo.InOutOrder
-	cfg := GetStratPerf(pair, stgy)
 	if core.LiveMode {
 		// Retrieve recent orders from the database
 		// 从数据库查询最近订单
 		sess, conn, err := ormo.Conn(orm.DbTrades, false)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer conn.Close()
-		taskId := ormo.GetTaskID(config.DefAcc)
 		orders, err = sess.GetOrders(ormo.GetOrdersArgs{
-			TaskID:    taskId,
-			Strategy:  stgy,
-			TimeFrame: tf,
-			Pairs:     []string{pair},
-			Status:    2,
-			Limit:     cfg.MaxOdNum,
+			Strategy:    args.Strategy,
+			Pairs:       args.Pairs,
+			TimeFrame:   args.TimeFrame,
+			TaskID:      args.TaskID,
+			Dirt:        args.Dirt,
+			EnterTag:    args.EnterTag,
+			ExitTag:     args.ExitTag,
+			CloseAfter:  args.CloseAfter,
+			CloseBefore: args.CloseBefore,
+			Limit:       args.Limit,
+			AfterID:     args.AfterID,
+			Status:      2,
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		// 从HistODs查询
+		pairMap := make(map[string]bool)
+		for _, pair := range args.Pairs {
+			pairMap[pair] = true
+		}
 		for _, od := range ormo.HistODs {
-			if od.Symbol != pair || od.Timeframe != tf || od.Strategy != stgy {
+			// Filter by TaskID: 0 means all, >0 means specific task
+			if args.TaskID > 0 && od.TaskID != args.TaskID {
 				continue
 			}
+
+			// Filter by Strategy
+			if args.Strategy != "" && od.Strategy != args.Strategy {
+				continue
+			}
+
+			// Filter by Pairs (Symbol)
+			if len(args.Pairs) > 0 {
+				if _, found := pairMap[od.Symbol]; !found {
+					continue
+				}
+			}
+
+			// Filter by TimeFrame
+			if args.TimeFrame != "" && od.Timeframe != args.TimeFrame {
+				continue
+			}
+
+			// Filter by Direction (Dirt): OdDirtLong/OdDirtShort/OdDirtBoth
+			if args.Dirt == core.OdDirtLong && od.Short {
+				continue
+			}
+			if args.Dirt == core.OdDirtShort && !od.Short {
+				continue
+			}
+
+			// Filter by EnterTag
+			if args.EnterTag != "" && od.EnterTag != args.EnterTag {
+				continue
+			}
+
+			// Filter by ExitTag
+			if args.ExitTag != "" && od.ExitTag != args.ExitTag {
+				continue
+			}
+
+			// Filter by CloseAfter (exit_at >= CloseAfter)
+			if args.CloseAfter > 0 && od.ExitAt < args.CloseAfter {
+				continue
+			}
+
+			// Filter by CloseBefore (exit_at < CloseBefore)
+			if args.CloseBefore > 0 && od.ExitAt >= args.CloseBefore {
+				continue
+			}
+
 			orders = append(orders, od)
 		}
-		if len(orders) > cfg.MaxOdNum {
-			orders = orders[len(orders)-cfg.MaxOdNum:]
+
+		// Sort by ID (default order)
+		slices.SortFunc(orders, func(a, b *ormo.InOutOrder) int {
+			return int(a.ID - b.ID)
+		})
+
+		// Handle AfterID pagination
+		if args.AfterID != 0 {
+			var filtered []*ormo.InOutOrder
+			if args.AfterID > 0 {
+				// Get orders after this ID (ascending order)
+				for _, od := range orders {
+					if od.ID > int64(args.AfterID) {
+						filtered = append(filtered, od)
+					}
+				}
+				orders = filtered
+			} else {
+				// Get orders before this ID (descending order)
+				targetID := int64(-args.AfterID)
+				for i := len(orders) - 1; i >= 0; i-- {
+					if orders[i].ID < targetID {
+						filtered = append(filtered, orders[i])
+					}
+				}
+				orders = filtered
+			}
 		}
+
+		// Apply Limit
+		if args.Limit > 0 && len(orders) > args.Limit {
+			orders = orders[:args.Limit]
+		}
+	}
+	return orders, nil
+}
+
+func CalcJobScores(pair, tf, stgy string) *errs.Error {
+	cfg := GetStratPerf(pair, stgy)
+	orders, err := GetHistOrders(ormo.GetHistOrdersArgs{
+		TaskID:    ormo.GetTaskID(config.DefAcc),
+		Strategy:  stgy,
+		TimeFrame: tf,
+		Pairs:     []string{pair},
+		Limit:     cfg.MaxOdNum,
+	})
+	if err != nil {
+		return err
 	}
 	sta := core.GetPerfSta(stgy)
 	sta.OdNum += 1

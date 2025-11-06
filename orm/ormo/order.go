@@ -1089,11 +1089,10 @@ func (q *Queries) getExOrders(sql string, args []interface{}) ([]*ExOrder, *errs
 	return res, nil
 }
 
-type GetOrdersArgs struct {
+type GetHistOrdersArgs struct {
 	Strategy    string
 	Pairs       []string
 	TimeFrame   string
-	Status      int   // 0 represents all, 1 represents open interest, 2 represents historical orders 0表示所有，1表示未平仓，2表示历史订单
 	TaskID      int64 // 0 represents all,>0 represents specified task 0表示所有，>0表示指定任务
 	Dirt        int   // core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth
 	EnterTag    string
@@ -1102,7 +1101,23 @@ type GetOrdersArgs struct {
 	CloseBefore int64 // End timestamp 结束时间戳
 	Limit       int
 	AfterID     int // position means after; negative means before
-	OrderBy     string
+}
+
+type GetOrdersArgs struct {
+	Strategy    string
+	Pairs       []string
+	TimeFrame   string
+	TaskID      int64 // 0 represents all,>0 represents specified task 0表示所有，>0表示指定任务
+	Dirt        int   // core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth
+	EnterTag    string
+	ExitTag     string
+	CloseAfter  int64 // Start timestamp 开始时间戳
+	CloseBefore int64 // End timestamp 结束时间戳
+	Limit       int
+	AfterID     int // position means after; negative means before
+
+	Status  int // 0 represents all, 1 represents open interest, 2 represents historical orders 0表示所有，1表示未平仓，2表示历史订单
+	OrderBy string
 }
 
 func (q *Queries) GetOrders(args GetOrdersArgs) ([]*InOutOrder, *errs.Error) {
