@@ -164,11 +164,11 @@ func CronKlineSummary() {
 			}
 			core.TfPairHits[tf] = make(map[string]int)
 		}
+		core.TfPairHitsLock.Unlock()
 		if len(pairGroups) > 0 {
 			staText := core.GroupByPairQuotes(pairGroups, true)
 			log.Info(fmt.Sprintf("receive bars in 10 mins:\n%s", staText))
 		}
-		core.TfPairHitsLock.Unlock()
 	})
 	if err_ != nil {
 		log.Error("add Receive Klines Summary fail", zap.Error(err_))
@@ -294,6 +294,9 @@ func sendOrderMsg(od *ormo.InOutOrder, isEnter bool) {
 		if od.Short {
 			action = "Open Short"
 		}
+	}
+	if subOd == nil {
+		return
 	}
 	filled, price := subOd.Filled, subOd.Average
 	account := ormo.GetTaskAcc(od.TaskID)

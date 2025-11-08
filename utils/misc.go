@@ -516,14 +516,14 @@ func NewCronScheduler(exp string) (cron.Schedule, error) {
 	return parser.Parse(exp, btime.LocShow)
 }
 
-func CronPrev(scd cron.Schedule, stamp time.Time) time.Time {
+func CronAlign(scd cron.Schedule, stamp time.Time) time.Time {
 	var endTime = stamp
 	for i := 0; i < 5; i++ {
 		endTime = scd.Next(endTime)
 	}
 	curTime := stamp.Add(-endTime.Sub(stamp))
 	var prev = curTime
-	for curTime.Before(stamp) {
+	for curTime.Before(stamp) || curTime.Equal(stamp) {
 		prev = curTime
 		curTime = scd.Next(curTime)
 	}

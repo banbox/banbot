@@ -44,11 +44,12 @@ var (
 
 	SimOrderMatch bool // 是否正处于回测订单撮合
 	NewNumInSim   int  // 撮合时创建新订单的数量
+	ParallelOnBar bool // 是否启用并行OnBar执行
 
 	lockOdBook sync.Mutex // 确认不冲突，无需用deadlock
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.2.24-beta.7"
+	Version   = "v0.2.24-beta.8"
 	UIVersion = "v0.2.23"
 	SysLang   string // language code for current system 当前系统语言设置
 	LogFile   string

@@ -325,7 +325,7 @@ func RefreshPairJobs(dp data.IProvider, showLog, isFirst bool, pBar *utils.Stage
 			if err_ != nil {
 				return errs.New(errs.CodeRunTime, err_)
 			}
-			curTime = utils.CronPrev(schedule, btime.ToTime(curTime)).UnixMilli()
+			curTime = utils.CronAlign(schedule, btime.ToTime(curTime)).UnixMilli()
 		} else if !core.EnvReal && config.PairMgr.UseLatest {
 			// 回测时配置use_latest=true，且cron为空，则使用最新时间刷新交易品种
 			curTime = min(btime.UTCStamp(), config.TimeRange.EndMS)

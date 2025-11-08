@@ -5,6 +5,7 @@ import (
 	"github.com/banbox/banbot/com"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -74,15 +75,33 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 	} else if env == nil {
 		return nil
 	}
+	var wg sync.WaitGroup
 	for account := range config.Accounts {
-		curErr := t.onAccountKline(account, env, bar, barExpired)
-		if curErr != nil {
-			if err != nil {
-				log.Error("onAccountKline fail", zap.String("account", account), zap.Error(curErr))
-			} else {
-				err = curErr
+		if !core.ParallelOnBar {
+			curErr := t.onAccountKline(account, env, bar, barExpired)
+			if curErr != nil {
+				if err != nil {
+					log.Error("onAccountKline fail", zap.String("account", account), zap.Error(curErr))
+				} else {
+					err = curErr
+				}
 			}
+		} else {
+			wg.Add(1)
+			go func(acc string) {
+				defer wg.Done()
+				if curErr := t.onAccountKline(acc, env, bar, barExpired); curErr != nil {
+					if err != nil {
+						log.Error("onAccountKline fail", zap.String("account", acc), zap.Error(curErr))
+					} else {
+						err = curErr
+					}
+				}
+			}(account)
 		}
+	}
+	if core.ParallelOnBar {
+		wg.Wait()
 	}
 	return err
 }
@@ -127,34 +146,31 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 		log.Info("onAccountKline", zap.String("acc", account), zap.String("pair", bar.Symbol),
 			zap.String("tf", bar.TimeFrame), zap.String("odNum", numStr))
 	}
+	var wg sync.WaitGroup
 	for _, job := range jobs {
 		job.IsWarmUp = isWarmup
 		job.InitBar(curOrders)
-		job.Strat.OnBar(job)
-		isBatch := job.Strat.BatchInOut && job.Strat.OnBatchJobs != nil
-		if !barExpired {
-			if isBatch {
-				AddBatchJob(account, bar.TimeFrame, job, nil)
+		if !core.ParallelOnBar {
+			err = t.onAccountKlineJob(odMgr, job, bar, barExpired)
+			if err != nil {
+				return err
 			}
 		} else {
-			entryNum := len(job.Entrys)
-			if core.LiveMode && !isWarmup && entryNum > 0 {
-				log.Info("skip open orders by bar expired", zap.String("acc", account),
-					zap.String("pair", bar.Symbol), zap.String("tf", bar.TimeFrame),
-					zap.Int("num", entryNum))
-				strat.AddAccFailOpens(account, strat.FailOpenBarTooLate, entryNum)
-				job.Entrys = nil
-			}
+			wg.Add(1)
+			go func(j *strat.StratJob) {
+				defer wg.Done()
+				if errCur := t.onAccountKlineJob(odMgr, j, bar, barExpired); errCur != nil {
+					if errCur != nil {
+						err = errCur
+					}
+				}
+			}(job)
 		}
-		if !isWarmup {
-			err = strat.CheckCustomExits(job)
-			if err != nil {
-				return err
-			}
-			_, _, err = odMgr.ProcessOrders(nil, job)
-			if err != nil {
-				return err
-			}
+	}
+	if core.ParallelOnBar {
+		wg.Wait()
+		if err != nil {
+			return err
 		}
 	}
 	// invoke OnInfoBar
@@ -189,6 +205,38 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 		} else {
 			env.Data[keyAt] = env.BarNum
 			env.Data[keyNum] = env.VNum
+		}
+	}
+	return nil
+}
+
+func (t *Trader) onAccountKlineJob(odMgr IOrderMgr, job *strat.StratJob, bar *orm.InfoKline, barExpired bool) *errs.Error {
+	account := job.Account
+	job.Strat.OnBar(job)
+	isWarmup := job.IsWarmUp
+	isBatch := job.Strat.BatchInOut && job.Strat.OnBatchJobs != nil
+	if !barExpired {
+		if isBatch {
+			AddBatchJob(account, bar.TimeFrame, job, nil)
+		}
+	} else {
+		entryNum := len(job.Entrys)
+		if core.LiveMode && !isWarmup && entryNum > 0 {
+			log.Info("skip open orders by bar expired", zap.String("acc", account),
+				zap.String("pair", bar.Symbol), zap.String("tf", bar.TimeFrame),
+				zap.Int("num", entryNum))
+			strat.AddAccFailOpens(account, strat.FailOpenBarTooLate, entryNum)
+			job.Entrys = nil
+		}
+	}
+	if !isWarmup {
+		err := strat.CheckCustomExits(job)
+		if err != nil {
+			return err
+		}
+		_, _, err = odMgr.ProcessOrders(nil, job)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
