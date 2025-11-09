@@ -402,16 +402,13 @@ func initBarEnv(exs *orm.ExSymbol, tf string) *ta.BarEnv {
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
 	env, ok := Envs[envKey]
 	if !ok {
-		tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
-		env = &ta.BarEnv{
-			Exchange:   core.ExgName,
-			MarketType: core.Market,
-			Symbol:     exs.Symbol,
-			TimeFrame:  tf,
-			TFMSecs:    tfMSecs,
-			MaxCache:   core.NumTaCache,
-			Data:       map[string]interface{}{"sid": int64(exs.ID)},
+		var err error
+		env, err = ta.NewBarEnv(core.ExgName, core.Market, exs.Symbol, tf)
+		if err != nil {
+			panic(err)
 		}
+		env.MaxCache = core.NumTaCache
+		env.Data.Store("sid", int64(exs.ID))
 		Envs[envKey] = env
 	}
 	return env

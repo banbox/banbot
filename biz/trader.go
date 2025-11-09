@@ -189,9 +189,10 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 		// Series过多，检查是否有内存泄露
 		keyAt := "first_hit_at"
 		keyNum := "first_hit_vnum"
-		if cacheVal, ok := env.Data[keyAt]; ok {
+		if cacheVal, ok := env.Data.Load(keyAt); ok {
 			firstAt, _ := cacheVal.(int)
-			firstNum, _ := env.Data[keyNum].(int)
+			firstNumVal, _ := env.Data.Load(keyNum)
+			firstNum, _ := firstNumVal.(int)
 			if env.BarNum-firstAt > 10 {
 				if env.VNum-firstNum > 0 {
 					// 相比第一次有Series异常新增
@@ -203,8 +204,8 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 				}
 			}
 		} else {
-			env.Data[keyAt] = env.BarNum
-			env.Data[keyNum] = env.VNum
+			env.Data.Store(keyAt, env.BarNum)
+			env.Data.Store(keyNum, env.VNum)
 		}
 	}
 	return nil
