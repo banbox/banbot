@@ -5,8 +5,8 @@ github.com/anyongjin/go-bayesopt v1.0.2 h1:845NHAdxk4x1FxeOS5McoaWO33ZfE2AR434j9
 github.com/anyongjin/go-bayesopt v1.0.2/go.mod h1:KB64n3O9sPBql6pPnOKh0w8bnOSG1TIMNb+9c/9iQs0=
 github.com/banbox/banexg v0.2.35-beta.2 h1:ictyFW0Brn0ty2lbpgH1luoeKsTvB3sV7U4PRPrqEV4=
 github.com/banbox/banexg v0.2.35-beta.2/go.mod h1:T9JWRGblxAibQjwKK6VABG+r87y1LRnyYe7sz5aBnR4=
-github.com/banbox/banta v0.3.4-beta.6 h1:8sd9CjPlq6o2RsqPhxtrHz5CxlbK0g6xPU0l8naMCjg=
-github.com/banbox/banta v0.3.4-beta.6/go.mod h1:43XoXngLPip/pX1OvohnNUScScqb1/jtKxVqgltwZUU=
+github.com/banbox/banta v0.3.5 h1:hmy7SOdSTK48MBFaNVJfFtCsZqPa2FrfKpfjY/gzJgY=
+github.com/banbox/banta v0.3.5/go.mod h1:43XoXngLPip/pX1OvohnNUScScqb1/jtKxVqgltwZUU=
 github.com/banbox/bntp v0.1.0 h1:kZROpbb3OME8XM8QeM+2SeQWQrHRDFN05okr8OITKAU=
 github.com/banbox/bntp v0.1.0/go.mod h1:w0WP7GROKQo07wHFBm/FVgH4xlZuOYCoro0ky4iTC3M=
 github.com/banbox/cron/v3 v3.1.2 h1:gBNnz/OBxIMU7iBCtObZKhb85rzbaXr8AZLZb40CgeM=
