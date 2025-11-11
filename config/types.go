@@ -122,6 +122,7 @@ type Config struct {
 	TimeStart        string                            `yaml:"time_start,omitempty" mapstructure:"time_start"`
 	TimeEnd          string                            `yaml:"time_end,omitempty" mapstructure:"time_end"`
 	TimeRange        *TimeTuple                        `yaml:"-" json:"-" mapstructure:"-"`
+	TimeFrames       string                            `yaml:"timeframes" mapstructure:"timeframes"`
 	RunTimeframes    []string                          `yaml:"run_timeframes,omitempty,flow" mapstructure:"run_timeframes"`
 	KlineSource      string                            `yaml:"kline_source,omitempty" mapstructure:"kline_source"`
 	WatchJobs        map[string][]string               `yaml:"watch_jobs,omitempty" mapstructure:"watch_jobs"`
@@ -144,7 +145,9 @@ type Config struct {
 type RunPolicyConfig struct {
 	Name          string                        `yaml:"name" mapstructure:"name"`
 	Filters       []*CommonPairFilter           `yaml:"filters,omitempty" mapstructure:"filters"`
+	TimeFrames    string                        `yaml:"timeframes" mapstructure:"timeframes"`
 	RunTimeframes []string                      `yaml:"run_timeframes,omitempty,flow" mapstructure:"run_timeframes"`
+	RefineTF      interface{}                   `yaml:"refine_tf" mapstructure:"refine_tf"`
 	MaxPair       int                           `yaml:"max_pair,omitempty" mapstructure:"max_pair"`
 	MaxOpen       int                           `yaml:"max_open,omitempty" mapstructure:"max_open"`
 	MaxSimulOpen  int                           `yaml:"max_simul_open,omitempty" mapstructure:"max_simul_open"`

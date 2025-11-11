@@ -248,6 +248,10 @@ func (c *Config) Apply(args *CmdArgs) error {
 	if args.StakePct > 0 {
 		c.StakePct = args.StakePct
 	}
+	// Parse TimeFrames field and populate RunTimeframes
+	if c.TimeFrames != "" && len(c.RunTimeframes) == 0 {
+		c.RunTimeframes = SplitTimeFrames(c.TimeFrames)
+	}
 	if len(args.TimeFrames) > 0 {
 		c.RunTimeframes = args.TimeFrames
 	}
@@ -449,6 +453,9 @@ func SetRunPolicy(index bool, items ...*RunPolicyConfig) *errs.Error {
 			pol.Index = num
 		}
 		nameCnts[pol.Name] = num + 1
+		if pol.TimeFrames != "" && len(pol.RunTimeframes) == 0 {
+			pol.RunTimeframes = SplitTimeFrames(pol.TimeFrames)
+		}
 		if len(pol.Pairs) > 0 {
 			pol.Pairs, err = ParsePairs(pol.Pairs...)
 			if err != nil {
@@ -653,7 +660,7 @@ func (c *Config) Strats() []string {
 	return result
 }
 
-func (c *Config) TimeFrames() []string {
+func (c *Config) RunTimeFrames() []string {
 	resMap := make(map[string]bool)
 	var result = make([]string, 0, 4)
 	var requireRoot = false
@@ -799,6 +806,9 @@ func (c *Config) Desensitize() *Config {
 			}
 			if chlType == "wework" {
 				delete(resChannel, "corp_id")
+			} else if chlType == "telegram" {
+				delete(resChannel, "token")
+				delete(resChannel, "chat_id")
 			}
 			res.RPCChannels[channelName] = resChannel
 		}
@@ -1268,6 +1278,22 @@ func GetLangMsgBy(lang, code, defVal string) string {
 		return defVal
 	}
 	return code
+}
+
+// SplitTimeFrames split comma-separated timeframes string to []string
+func SplitTimeFrames(timeframes string) []string {
+	if timeframes == "" {
+		return []string{}
+	}
+	parts := strings.Split(timeframes, ",")
+	result := make([]string, 0, len(parts))
+	for _, tf := range parts {
+		tf = strings.TrimSpace(tf)
+		if tf != "" {
+			result = append(result, tf)
+		}
+	}
+	return result
 }
 
 // ParsePairs parse short pairs to standard pair format

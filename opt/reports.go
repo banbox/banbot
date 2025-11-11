@@ -77,6 +77,7 @@ type BTResult struct {
 	SortinoRatio    float64        `json:"sortinoRatio"`
 	CalcDiff        float64        `json:"calcDiff"`
 	Stability       float64        `json:"stability"`
+	HitSlTp         int            `json:"hitSlTp"`
 }
 
 type PlotData struct {
@@ -127,6 +128,10 @@ func (r *BTResult) printBtResult() {
 		core.DumpPerfs(r.OutDir)
 	}
 	log.Info("BackTest Reports:\n" + r.cmdReports(ormo.HistODs))
+	if r.HitSlTp > 0 {
+		log.Warn("Stop-loss & take-profit triggered in one K-line — set proper `run_policy[i].refine_tf`",
+			zap.Int("bad", r.HitSlTp), zap.Int("total", r.OrderNum))
+	}
 	log.Info("Saved", zap.String("at", r.OutDir))
 	if r.CalcDiff > 0.01 {
 		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github")
@@ -197,6 +202,7 @@ func (r *BTResult) Collect() {
 	sumCost := float64(0)
 	winCount := float64(0)
 	tfHits := make(map[string]int)
+	hitSlTp := 0
 	for _, od := range orders {
 		sumProfit += od.Profit
 		sumFee += od.Enter.FeeQuote
@@ -209,7 +215,11 @@ func (r *BTResult) Collect() {
 		}
 		oldNum, _ := tfHits[od.Timeframe]
 		tfHits[od.Timeframe] = oldNum + 1
+		if od.GetInfoString(ormo.OdInfoSLTP) == "yes" {
+			hitSlTp += 1
+		}
 	}
+	r.HitSlTp = hitSlTp
 	r.TfHits = tfHits
 	r.TotProfit = sumProfit
 	r.TotCost = utils.NanInfTo(sumCost, 0)
@@ -1274,6 +1284,7 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 	var endMS = odList[0].RealExitMS()
 	var tfSecs = utils2.TFToSecs(odList[0].Timeframe)
 	pairOrders := make(map[string][]*ormo.InOutOrder)
+	hitSlTp := 0
 	for _, od := range odList {
 		enterAt := od.RealEnterMS()
 		if enterAt > 0 && enterAt < startMS {
@@ -1284,7 +1295,11 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 		tfSecs = min(tfSecs, curSecs)
 		items, _ := pairOrders[od.Symbol]
 		pairOrders[od.Symbol] = append(items, od)
+		if od.GetInfoString(ormo.OdInfoSLTP) == "yes" {
+			hitSlTp += 1
+		}
 	}
+	btRes.HitSlTp = hitSlTp
 	tfMSecs := int64(tfSecs * 1000)
 	startMS = utils2.AlignTfMSecs(startMS, tfMSecs)
 	endMS = utils2.AlignTfMSecs(endMS, tfMSecs) + tfMSecs

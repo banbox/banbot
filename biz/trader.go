@@ -53,17 +53,29 @@ func (t *Trader) OnEnvJobs(bar *orm.InfoKline) (*ta.BarEnv, *errs.Error) {
 }
 
 func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
-	tfSecs := utils2.TFToSecs(bar.TimeFrame)
+	core.LockOdMatch.RLock()
+	_, odMatch := core.OrderMatchTfs[bar.TimeFrame]
+	core.LockOdMatch.RUnlock()
+	accOrders := make(map[string][]*ormo.InOutOrder)
 	com.SetBarPrice(bar.Symbol, bar.Close)
-	// If it exceeds 1 minute and half of the period, the bar is considered delayed and orders cannot be placed.
-	// 超过1分钟且周期的一半，认为bar延迟，不可下单
-	delaySecs := int((btime.TimeMS()-bar.Time)/1000) - tfSecs
-	barExpired := delaySecs >= max(60, tfSecs/2)
-	if barExpired {
-		if core.LiveMode && !bar.IsWarmUp {
-			log.Warn(fmt.Sprintf("%s/%s delay %v s, open order disabled for this K-line", bar.Symbol, bar.TimeFrame, delaySecs))
-		} else {
-			barExpired = false
+	if odMatch && !bar.IsWarmUp {
+		// 需要执行订单更新
+		for account := range config.Accounts {
+			openOds, lock := ormo.GetOpenODs(account)
+			lock.Lock()
+			allOrders := utils2.ValsOfMap(openOds)
+			lock.Unlock()
+			odMgr := GetOdMgr(account)
+			var err *errs.Error
+			if len(allOrders) > 0 {
+				// The order status may be modified here
+				// 这里可能修改订单状态
+				accOrders[account] = allOrders
+				err = odMgr.UpdateByBar(allOrders, bar)
+				if err != nil {
+					return err
+				}
+			}
 		}
 	}
 	// Update indicator environment
@@ -75,10 +87,29 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 	} else if env == nil {
 		return nil
 	}
+	tfSecs := utils2.TFToSecs(bar.TimeFrame)
+	// If it exceeds 1 minute and half of the period, the bar is considered delayed and orders cannot be placed.
+	// 超过1分钟且周期的一半，认为bar延迟，不可下单
+	delaySecs := int((btime.TimeMS()-bar.Time)/1000) - tfSecs
+	barExpired := delaySecs >= max(60, tfSecs/2)
+	if barExpired {
+		if core.LiveMode && !bar.IsWarmUp {
+			log.Warn(fmt.Sprintf("%s/%s delay %v s, open order disabled for this K-line", bar.Symbol, bar.TimeFrame, delaySecs))
+		} else {
+			barExpired = false
+		}
+	}
 	var wg sync.WaitGroup
 	for account := range config.Accounts {
+		allOrders, _ := accOrders[account]
+		if !odMatch {
+			openOds, lock := ormo.GetOpenODs(account)
+			lock.Lock()
+			allOrders = utils2.ValsOfMap(openOds)
+			lock.Unlock()
+		}
 		if !core.ParallelOnBar {
-			curErr := t.onAccountKline(account, env, bar, barExpired)
+			curErr := t.onAccountKline(account, env, bar, allOrders, barExpired)
 			if curErr != nil {
 				if err != nil {
 					log.Error("onAccountKline fail", zap.String("account", account), zap.Error(curErr))
@@ -88,16 +119,16 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 			}
 		} else {
 			wg.Add(1)
-			go func(acc string) {
+			go func(acc string, ods []*ormo.InOutOrder) {
 				defer wg.Done()
-				if curErr := t.onAccountKline(acc, env, bar, barExpired); curErr != nil {
+				if curErr := t.onAccountKline(acc, env, bar, ods, barExpired); curErr != nil {
 					if err != nil {
 						log.Error("onAccountKline fail", zap.String("account", acc), zap.Error(curErr))
 					} else {
 						err = curErr
 					}
 				}
-			}(account)
+			}(account, allOrders)
 		}
 	}
 	if core.ParallelOnBar {
@@ -106,7 +137,7 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 	return err
 }
 
-func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKline, barExpired bool) *errs.Error {
+func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKline, allOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
 	envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
 	// Get strategy jobs 获取交易任务
 	jobs, _ := strat.GetJobs(account)[envKey]
@@ -115,22 +146,9 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 	if len(jobs) == 0 && len(infoJobs) == 0 {
 		return nil
 	}
-	openOds, lock := ormo.GetOpenODs(account)
-	// Update orders in non-production mode 更新非生产模式的订单
-	lock.Lock()
-	allOrders := utils2.ValsOfMap(openOds)
-	lock.Unlock()
 	odMgr := GetOdMgr(account)
 	var err *errs.Error
 	isWarmup := bar.IsWarmUp
-	if !isWarmup && len(allOrders) > 0 {
-		// The order status may be modified here
-		// 这里可能修改订单状态
-		err = odMgr.UpdateByBar(allOrders, bar)
-		if err != nil {
-			return err
-		}
-	}
 	// retrieve the current open orders after UpdateByBar, filter for closed orders
 	// 要在UpdateByBar后检索当前开放订单，过滤已平仓订单
 	var curOrders []*ormo.InOutOrder
@@ -142,7 +160,7 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 	if core.LiveMode && !isWarmup {
 		// Live mode is saved to the database. Non-real-time mode, orders are temporarily saved in memory, no database required
 		// 实时模式保存到数据库。非实时模式，订单临时保存到内存，无需数据库
-		numStr := fmt.Sprintf("%d/%d", len(curOrders), len(openOds))
+		numStr := fmt.Sprintf("%d/%d", len(curOrders), len(allOrders))
 		log.Info("onAccountKline", zap.String("acc", account), zap.String("pair", bar.Symbol),
 			zap.String("tf", bar.TimeFrame), zap.String("odNum", numStr))
 	}

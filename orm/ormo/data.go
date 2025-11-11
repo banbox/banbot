@@ -53,6 +53,7 @@ const (
 	OdInfoTakeProfit = "TakeProfit"
 	OdInfoClientID   = "ClientID"
 	OdInfoRetry      = "Retry"
+	OdInfoSLTP       = "SL_TP"
 )
 
 const (

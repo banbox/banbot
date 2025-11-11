@@ -473,7 +473,7 @@ func collectBtTask(rootDir, relPath string) (*ormu.Task, error) {
 		Mode:        "backtest",
 		Path:        relPath,
 		Strats:      strings.Join(cfg.Strats(), ","),
-		Periods:     strings.Join(cfg.TimeFrames(), ","),
+		Periods:     strings.Join(cfg.RunTimeFrames(), ","),
 		Pairs:       cfg.ShowPairs(),
 		CreateAt:    createMS,
 		StartAt:     utils.AlignTfMSecs(cfg.TimeRange.StartMS, dayMSecs),

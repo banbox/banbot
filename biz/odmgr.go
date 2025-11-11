@@ -749,7 +749,11 @@ Use the price to update the profit of the order, etc. It may trigger a margin ca
 */
 func (o *OrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error {
 	for _, od := range allOpens {
-		if od.Symbol != bar.Symbol || od.Timeframe != bar.TimeFrame || od.Status >= ormo.InOutStatusFullExit {
+		if od.Symbol != bar.Symbol || od.Status >= ormo.InOutStatusFullExit {
+			continue
+		}
+		matchTf, _ := config.GetStratRefineTF(od.Strategy, od.Timeframe)
+		if bar.TimeFrame != matchTf {
 			continue
 		}
 		od.UpdateProfits(bar.Close)

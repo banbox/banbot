@@ -156,14 +156,15 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 	}()
 	affectNum := 0
 	for _, od := range orders {
-		if bar != nil && bar.TimeFrame != od.Timeframe {
+		matchTf, _ := config.GetStratRefineTF(od.Strategy, od.Timeframe)
+		if bar != nil && bar.TimeFrame != matchTf {
 			continue
 		}
 		exOrder := getPendingSub(od)
 		if exOrder == nil {
 			if od.ExitTag == "" && bar != nil {
 				// 已入场完成，尚未出现出场信号，检查是否触发止损The entry has been completed, but the exit signal has not yet appeared. Check whether the stop loss is triggered.
-				err := o.tryFillTriggers(od, &bar.Kline)
+				err := o.tryFillTriggers(od, &bar.Kline, matchTf)
 				if err != nil {
 					return 0, err
 				}
@@ -175,7 +176,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 			odType = exOrder.OrderType
 		}
 		price := exOrder.Price
-		odTFSecs := utils.TFToSecs(od.Timeframe)
+		odTFSecs := utils.TFToSecs(matchTf)
 		fillMS := exOrder.CreateAt + int64(config.BTNetCost*1000)
 		barStartMS := utils.AlignTfMSecs(fillMS, int64(odTFSecs*1000))
 		odIsBuy := exOrder.Side == banexg.OdSideBuy
@@ -241,7 +242,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 			if err == nil && bar != nil {
 				// 入场后可能立刻触发止损/止盈
 				endBar := cutKlineFromRate(&bar.Kline, int64(odTFSecs*1000), fillBarRate)
-				err = o.tryFillTriggers(od, endBar)
+				err = o.tryFillTriggers(od, endBar, matchTf)
 			}
 		} else {
 			err = o.fillPendingExit(od, price, fillMS)
@@ -385,7 +386,7 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 	return nil
 }
 
-func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline) *errs.Error {
+func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline, tf string) *errs.Error {
 	sl := od.GetStopLoss()
 	tp := od.GetTakeProfit()
 	if sl == nil && tp == nil {
@@ -405,15 +406,17 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline) 
 		// Long order stop profit, the highest price breaks through the stop profit price to trigger
 		tp.Hit = od.Short && bar.Low <= tp.Price || !od.Short && bar.High >= tp.Price
 	}
-	if (sl == nil || !sl.Hit) && (tp == nil || !tp.Hit) {
+	hitSL := sl != nil && sl.Hit
+	hitTP := tp != nil && tp.Hit
+	if !hitSL && !hitTP {
 		// 止损和止盈都未触发
 		return nil
 	}
 	od.DirtyInfo = true
-	tfSecs := float64(utils.TFToSecs(od.Timeframe))
+	tfSecs := float64(utils.TFToSecs(tf))
 	var fillPrice, trigPrice, amtRate float64
 	var exitTag string
-	if sl != nil && sl.Hit {
+	if hitSL {
 		// Trigger stop loss and calculate execution price
 		// 触发止损，计算执行价格
 		trigPrice = sl.Price
@@ -428,7 +431,7 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline) 
 				exitTag = core.ExitTagSLTake
 			}
 		}
-	} else if tp != nil && tp.Hit {
+	} else if hitTP {
 		// Trigger take profit and calculate execution price
 		// 触发止盈，计算执行价格
 		trigPrice = tp.Price
@@ -479,6 +482,9 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline) 
 			log.Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
 		}
 		od = part
+	}
+	if hitSL && hitTP {
+		od.SetInfo(ormo.OdInfoSLTP, "yes")
 	}
 	cutSecs := tfSecs * (1 - rate)
 	exitAt := curMS - int64(cutSecs*1000)

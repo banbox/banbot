@@ -715,12 +715,15 @@ func (m *Miner) startLoopKLines() {
 					log.Warn("no sta to writeQ", zap.String("pair", p))
 					return nil
 				}
+				log.Debug("try fetch kline", zap.Int32("sid", sta.Sid), zap.String("pair", p),
+					zap.Int64("time", sta.ExpectMS))
 				bars, err := m.exchange.FetchOHLCV(p, curTF, sta.ExpectMS, 0, nil)
 				if err != nil {
 					code := fmt.Sprintf("%s.%s.%s", m.ExgName, m.Market, p)
 					log.Error("FetchOHLCV fail", zap.String("exg", code), zap.Error(err))
 					return nil
 				}
+				log.Debug("fetch kline done", zap.Int32("sid", sta.Sid), zap.Int("num", len(bars)))
 				if len(bars) > 0 {
 					last := bars[len(bars)-1]
 					if last.Time >= startMS {
@@ -750,9 +753,11 @@ func (m *Miner) startLoopKLines() {
 							}
 							sidMap[sta.Sid] = newJob
 							sidLock.Unlock()
+							start := time.Now()
 							writeQ <- newJob
 							log.Debug("kline to writeQ", zap.Int32("sid", sta.Sid), zap.String("pair", p),
-								zap.Int64("time", last.Time), zap.Int("num", len(bars)))
+								zap.Int64("time", last.Time), zap.Int("num", len(bars)),
+								zap.Duration("waitQ", time.Since(start)))
 						}
 					}
 				} else {

@@ -128,6 +128,8 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 	}
 	if err != nil {
 		log.Error("consumeWriteQ: fail", zap.Int32("sid", sid), zap.Error(err))
+	} else {
+		log.Debug("save kline ok", zap.Int32("sid", sid), zap.Int("num", len(job.Arr)))
 	}
 }
 

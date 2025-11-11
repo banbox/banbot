@@ -743,7 +743,7 @@ func handleRunBacktest(c *fiber.Ctx) error {
 		Args:     btArgs,
 		Config:   string(cfgData),
 		Strats:   strings.Join(cfg.Strats(), ","),
-		Periods:  strings.Join(cfg.TimeFrames(), ","),
+		Periods:  strings.Join(cfg.RunTimeFrames(), ","),
 		Pairs:    cfg.ShowPairs(),
 		CreateAt: btime.UTCStamp(),
 		StartAt:  cfg.TimeRange.StartMS,

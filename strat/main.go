@@ -45,6 +45,10 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 	// 将涉及的全局变量置为空，下面会更新
 	core.TFSecs = make(map[string]int)
 	core.StgPairTfs = make(map[string]map[string]string)
+	core.LockOdMatch.Lock()
+	core.OrderMatchTfs = make(map[string]bool)
+	core.LockOdMatch.Unlock()
+	config.ClearRefineMap()
 	resetJobs()
 	pairTfWarms := make(Warms)
 	// 记录每个账户下，每个策略的任务数量，防止超过账户要求数量
@@ -147,9 +151,6 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 			holdNum += 1
 			// 初始化BarEnv
 			env := initBarEnv(exs, tf)
-			// Record the data that needs to be preheated; Record subscription information
-			// 记录需要预热的数据；记录订阅信息
-			pairTfWarms.Update(exs.Symbol, tf, curStgy.WarmupNum)
 			ensureStratJob(curStgy, tf, exs, env, dirt, pairTfWarms.Update, accLimits)
 		}
 		printFailTfScores(polID, failTfScores)
@@ -211,6 +212,8 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 							return nil, nil, err
 						}
 					}
+					matchTf, _ := config.GetStratRefineTF(j.Strat.Name, tf)
+					pairTfs.Update(pair, matchTf, 0)
 				}
 				envKeys[envKey] = true
 				pairTfs.Update(pair, tf, 0)
@@ -244,6 +247,8 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 			for name, job := range stgMap {
 				if _, ok := exitJobs[job]; !ok {
 					newStgMap[name] = job
+					matchTf, _ := config.GetStratRefineTF(job.Strat.Name, job.TimeFrame)
+					pairTfs.Update(job.Symbol.Symbol, matchTf, 0)
 				}
 			}
 			if len(newStgMap) > 0 {
@@ -450,6 +455,17 @@ func markStratJob(tf, polID string, exs *orm.ExSymbol, dirt int, accLimits accSt
 
 func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarEnv, dirt int,
 	logWarm func(pair, tf string, num int), accLimits accStratLimits) {
+	logWarm(exs.Symbol, tf, stgy.WarmupNum)
+	if stgy.Policy.RefineTF == nil && stgy.RefineTF != nil {
+		stgy.Policy.RefineTF = stgy.RefineTF
+	}
+	matchTf := config.EnsureStratRefineTF(stgy.Name, tf)
+	if matchTf != tf {
+		logWarm(exs.Symbol, matchTf, 0)
+	}
+	core.LockOdMatch.Lock()
+	core.OrderMatchTfs[matchTf] = true
+	core.LockOdMatch.Unlock()
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
 	for account, jobs := range AccJobs {
 		envJobs, ok := jobs[envKey]

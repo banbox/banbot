@@ -34,6 +34,7 @@ var (
 	LastCopiedMs  int64                                // 上次收到爬虫进程推送k线的时间戳
 	OdBooks       = map[string]*banexg.OrderBook{}     // Cache all order books received from crawler 缓存所有从爬虫收到的订单簿
 	NumTaCache    = 1500                               // The number of historical values cached during indicator calculation, default 1500 指标计算时缓存的历史值数量，默认1500
+	OrderMatchTfs = make(map[string]bool)              // Timeframes to match for order 订单撮合的周期
 
 	ExitCalls []func() // CALLBACK TO STOP EXECUTION 停止执行的回调
 	CapOut    *log.OutCapture
@@ -46,7 +47,8 @@ var (
 	NewNumInSim   int  // 撮合时创建新订单的数量
 	ParallelOnBar bool // 是否启用并行OnBar执行
 
-	lockOdBook sync.Mutex // 确认不冲突，无需用deadlock
+	lockOdBook  sync.Mutex // 确认不冲突，无需用deadlock
+	LockOdMatch sync.RWMutex
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
 	Version   = "v0.2.24-beta.10"

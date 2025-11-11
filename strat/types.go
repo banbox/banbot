@@ -30,11 +30,13 @@ type TradeStrat struct {
 	StakeRate       float64 // Relative basic amount billing rate 相对基础金额开单倍率
 	StopLoss        float64 // Default stoploss without leverage 此策略默认止损比率，不带杠杆
 	StopEnterBars   int
-	OrderOnRotation string   // close/hold/open 品种切换时旧的job：立刻平仓，允许持有不许开单，允许开单和持有
-	EachMaxLong     int      // max number of long open orders for one pair, -1 for disable, 0 for no limit
-	EachMaxShort    int      // max number of short open orders for one pair, -1 for disable, 0 for no limit
-	RunTimeFrames   []string // Allow running time period, use global configuration when not provided 允许运行的时间周期，不提供时使用全局配置
-	Outputs         []string // The content of the text file output by the strategy, where each string is one line 策略输出的文本文件内容，每个字符串是一行
+	OrderOnRotation string      // close/hold/open 品种切换时旧的job：立刻平仓，允许持有不许开单，允许开单和持有
+	EachMaxLong     int         // max number of long open orders for one pair, -1 for disable, 0 for no limit
+	EachMaxShort    int         // max number of short open orders for one pair, -1 for disable, 0 for no limit
+	TimeFrames      string      // Comma separated time period 逗号分割的时间周期
+	RunTimeFrames   []string    // Allow running time period, use global configuration when not provided 允许运行的时间周期，不提供时使用全局配置
+	RefineTF        interface{} // specific the matching timeframe 指定撮合周期，如"5m", "3-6", 5
+	Outputs         []string    // The content of the text file output by the strategy, where each string is one line 策略输出的文本文件内容，每个字符串是一行
 	Policy          *config.RunPolicyConfig
 
 	OnPairInfos         func(s *StratJob) []*PairSub

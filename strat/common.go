@@ -52,6 +52,13 @@ func New(pol *config.RunPolicyConfig) *TradeStrat {
 	if pol.OrderBarMax > 0 {
 		stgy.OdBarMax = pol.OrderBarMax
 	}
+	if len(pol.RunTimeframes) > 0 {
+		stgy.RunTimeFrames = pol.RunTimeframes
+	} else if len(stgy.RunTimeFrames) == 0 {
+		if len(stgy.TimeFrames) > 0 {
+			stgy.RunTimeFrames = config.SplitTimeFrames(stgy.TimeFrames)
+		}
+	}
 	if pol.StopLoss != nil {
 		slRate, isFlt := pol.StopLoss.(float64)
 		if isFlt {
