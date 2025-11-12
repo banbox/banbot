@@ -224,15 +224,7 @@ func (i *InOutOrder) UpdateProfits(price float64) {
 	if i.ProfitRate > i.MaxPftRate {
 		i.MaxPftRate = i.ProfitRate
 	} else {
-		if i.MaxPftRate > 0 {
-			// When there is a profit in history, calculate the maximum drawdown based on the best profit
-			// 历史有盈利时，基于最佳盈利计算最大回撤
-			i.MaxDrawDown = (i.MaxPftRate - i.ProfitRate) / i.MaxPftRate
-		} else {
-			// Continuous loss in the order, use current profitRate as the maximum drawdown
-			// 订单持续亏损，以当前亏损作为最大回撤
-			i.MaxDrawDown = -i.ProfitRate
-		}
+		i.MaxDrawDown = min(i.MaxDrawDown, i.Profit, 0)
 	}
 	i.DirtyMain = true
 }

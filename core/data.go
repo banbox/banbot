@@ -51,7 +51,7 @@ var (
 	LockOdMatch sync.RWMutex
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.2.24-beta.10"
+	Version   = "v0.2.24-beta.11"
 	UIVersion = "v0.2.23"
 	SysLang   string // language code for current system 当前系统语言设置
 	LogFile   string

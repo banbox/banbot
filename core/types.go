@@ -70,3 +70,11 @@ type ApiClient struct {
 	AccRoles  map[string]string
 	Token     string
 }
+
+type TimeValueRange struct {
+	StartMS    int64   `json:"startMS"`
+	StopMS     int64   `json:"stopMS"`
+	StartValue float64 `json:"startValue"`
+	StopValue  float64 `json:"stopValue"`
+	ValueChg   float64 `json:"-"`
+}

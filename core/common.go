@@ -342,3 +342,9 @@ func SetOdBook(pair string, book *banexg.OrderBook) {
 	OdBooks[pair] = book
 	lockOdBook.Unlock()
 }
+
+func (t *TimeValueRange) SetEnd(timeMS int64, val float64) {
+	t.StopMS = timeMS
+	t.StopValue = val
+	t.ValueChg = val - t.StartValue
+}

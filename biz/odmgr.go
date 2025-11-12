@@ -503,6 +503,7 @@ func (o *OrderMgr) ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.E
 		if !ok {
 			return nil, errs.NewMsg(errs.CodeParamInvalid, "req orderId not found: %d", req.OrderID)
 		}
+		req.Force = true
 		matches = append(matches, od)
 	} else {
 		parts := strings.Split(pairs, ",")

@@ -36,48 +36,50 @@ import (
 )
 
 type BTResult struct {
-	MaxOpenOrders   int            `json:"maxOpenOrders"`
-	MinReal         float64        `json:"minReal"`
-	MaxReal         float64        `json:"maxReal"`         // Maximum Assets 最大资产
-	MaxDrawDownPct  float64        `json:"maxDrawDownPct"`  // Maximum drawdown percentage 最大回撤百分比
-	ShowDrawDownPct float64        `json:"showDrawDownPct"` // Displays the maximum drawdown percentage 显示最大回撤百分比
-	MaxDrawDownVal  float64        `json:"maxDrawDownVal"`  // Maximum drawdown percentage 最大回撤金额
-	ShowDrawDownVal float64        `json:"showDrawDownVal"` // Displays the maximum drawdown percentage 显示最大回撤金额
-	MaxFundOccup    float64        `json:"maxFundOccup"`
-	MaxOccupForPair float64        `json:"maxOccupForPair"`
-	BarNum          int            `json:"barNum"`
-	TimeNum         int            `json:"timeNum"`
-	OrderNum        int            `json:"orderNum"`
-	lastTime        int64          // 上次bar的时间戳
-	histOdOff       int            // 计算已完成订单利润的偏移
-	donePftLegal    float64        // 已完成订单利润
-	Plots           *PlotData      `json:"plots"`
-	EntLabels       []string       `json:"entLabels"`
-	EntDatasets     []*ChartDs     `json:"entDatasets"`
-	CreateMS        int64          `json:"createMS"`
-	StartMS         int64          `json:"startMS"`
-	EndMS           int64          `json:"endMS"`
-	PlotEvery       int            `json:"plotEvery"`
-	TotalInvest     float64        `json:"totalInvest"`
-	OutDir          string         `json:"outDir"`
-	PairGrps        []*RowItem     `json:"pairGrps"`
-	DateGrps        []*RowItem     `json:"dateGrps"`
-	EnterGrps       []*RowItem     `json:"enterGrps"`
-	ExitGrps        []*RowItem     `json:"exitGrps"`
-	ProfitGrps      []*RowItem     `json:"profitGrps"`
-	TotProfit       float64        `json:"totProfit"`
-	TotCost         float64        `json:"totCost"`
-	TotFee          float64        `json:"totFee"`
-	TotProfitPct    float64        `json:"totProfitPct"`
-	TfHits          map[string]int `json:"tfHits"`
-	WinRatePct      float64        `json:"winRatePct"`
-	FinBalance      float64        `json:"finBalance"`
-	FinWithdraw     float64        `json:"finWithdraw"`
-	SharpeRatio     float64        `json:"sharpeRatio"`
-	SortinoRatio    float64        `json:"sortinoRatio"`
-	CalcDiff        float64        `json:"calcDiff"`
-	Stability       float64        `json:"stability"`
-	HitSlTp         int            `json:"hitSlTp"`
+	MaxOpenOrders   int                    `json:"maxOpenOrders"`
+	MinReal         float64                `json:"minReal"`
+	MaxReal         float64                `json:"maxReal"`         // Maximum Assets 最大资产
+	MaxDrawDownPct  float64                `json:"maxDrawDownPct"`  // Maximum drawdown percentage 最大回撤百分比
+	ShowDrawDownPct float64                `json:"showDrawDownPct"` // Displays the maximum drawdown percentage 显示最大回撤百分比
+	MaxDrawDownVal  float64                `json:"maxDrawDownVal"`  // Maximum drawdown percentage 最大回撤金额
+	ShowDrawDownVal float64                `json:"showDrawDownVal"` // Displays the maximum drawdown percentage 显示最大回撤金额
+	MaxFundOccup    float64                `json:"maxFundOccup"`
+	MaxOccupForPair float64                `json:"maxOccupForPair"`
+	BarNum          int                    `json:"barNum"`
+	TimeNum         int                    `json:"timeNum"`
+	OrderNum        int                    `json:"orderNum"`
+	lastTime        int64                  // 上次bar的时间戳
+	histOdOff       int                    // 计算已完成订单利润的偏移
+	donePftLegal    float64                // 已完成订单利润
+	Plots           *PlotData              `json:"plots"`
+	EntLabels       []string               `json:"entLabels"`
+	EntDatasets     []*ChartDs             `json:"entDatasets"`
+	CreateMS        int64                  `json:"createMS"`
+	StartMS         int64                  `json:"startMS"`
+	EndMS           int64                  `json:"endMS"`
+	PlotEvery       int                    `json:"plotEvery"`
+	TotalInvest     float64                `json:"totalInvest"`
+	OutDir          string                 `json:"outDir"`
+	PairGrps        []*RowItem             `json:"pairGrps"`
+	DateGrps        []*RowItem             `json:"dateGrps"`
+	EnterGrps       []*RowItem             `json:"enterGrps"`
+	ExitGrps        []*RowItem             `json:"exitGrps"`
+	ProfitGrps      []*RowItem             `json:"profitGrps"`
+	DrawDowns       []*core.TimeValueRange `json:"drawDowns"`
+	TmpDrawDown     *core.TimeValueRange   `json:"-"`
+	TotProfit       float64                `json:"totProfit"`
+	TotCost         float64                `json:"totCost"`
+	TotFee          float64                `json:"totFee"`
+	TotProfitPct    float64                `json:"totProfitPct"`
+	TfHits          map[string]int         `json:"tfHits"`
+	WinRatePct      float64                `json:"winRatePct"`
+	FinBalance      float64                `json:"finBalance"`
+	FinWithdraw     float64                `json:"finWithdraw"`
+	SharpeRatio     float64                `json:"sharpeRatio"`
+	SortinoRatio    float64                `json:"sortinoRatio"`
+	CalcDiff        float64                `json:"calcDiff"`
+	Stability       float64                `json:"stability"`
+	HitSlTp         int                    `json:"hitSlTp"`
 }
 
 type PlotData struct {
@@ -152,6 +154,7 @@ func (r *BTResult) cmdReports(orders []*ormo.InOutOrder) string {
 			{Title: " Profit Ranges ", Handle: textGroupProfitRanges},
 			{Title: " Enter Tag ", Handle: textGroupEntTags},
 			{Title: " Exit Tag ", Handle: textGroupExitTags},
+			{Title: " Drawdowns Top 10 ", Handle: textDrawdowns},
 		}
 		for _, item := range items {
 			tblText = item.Handle(r)
@@ -219,6 +222,11 @@ func (r *BTResult) Collect() {
 			hitSlTp += 1
 		}
 	}
+	for tf := range core.OrderMatchTfs {
+		if _, ok := tfHits[tf]; !ok {
+			tfHits[tf] = 0
+		}
+	}
 	r.HitSlTp = hitSlTp
 	r.TfHits = tfHits
 	r.TotProfit = sumProfit
@@ -227,6 +235,12 @@ func (r *BTResult) Collect() {
 	r.TotProfitPct = r.TotProfit * 100 / r.TotalInvest
 	if r.MinReal > r.MaxReal {
 		r.MinReal = r.MaxReal
+	}
+	sort.Slice(r.DrawDowns, func(i, j int) bool {
+		return r.DrawDowns[i].ValueChg < r.DrawDowns[j].ValueChg
+	})
+	if len(r.DrawDowns) > 10 {
+		r.DrawDowns = r.DrawDowns[:10]
 	}
 	// Calculate the maximum drawdown on the chart
 	// 计算图表上的最大回撤
@@ -381,6 +395,29 @@ func (r *BTResult) groupByExits(orders []*ormo.InOutOrder) {
 
 func textGroupExitTags(r *BTResult) string {
 	return printGroups(r.ExitGrps, "Exit Tag", true, nil, nil)
+}
+
+func textDrawdowns(r *BTResult) string {
+	if len(r.DrawDowns) == 0 {
+		return ""
+	}
+	heads := []string{"Start Time", "Start Value", "Lowest Time", "Lowest Value", "Drawdown Value"}
+	var rows [][]string
+	for _, dd := range r.DrawDowns {
+		if dd.ValueChg >= 0 {
+			continue
+		}
+		startTime := btime.ToDateStr(dd.StartMS, core.DefaultDateFmt)
+		startVal := strconv.FormatFloat(dd.StartValue, 'f', 2, 64)
+		stopTime := btime.ToDateStr(dd.StopMS, core.DefaultDateFmt)
+		stopVal := strconv.FormatFloat(dd.StopValue, 'f', 2, 64)
+		ddVal := strconv.FormatFloat(dd.ValueChg, 'f', 2, 64)
+		rows = append(rows, []string{startTime, startVal, stopTime, stopVal, ddVal})
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	return renderTable(heads, rows, tw.AlignCenter)
 }
 
 func (r *BTResult) groupByProfits(orders []*ormo.InOutOrder) {
@@ -915,11 +952,21 @@ func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 	wallets := biz.GetWallets(config.DefAcc)
 	totalLegal := wallets.TotalLegal(nil, true)
 	r.MinReal = min(r.MinReal, totalLegal)
-	if totalLegal >= r.MaxReal {
+	if totalLegal > r.MaxReal {
 		r.MaxReal = totalLegal
-	} else {
+		r.TmpDrawDown = &core.TimeValueRange{
+			StartMS:    timeMS,
+			StartValue: totalLegal,
+			StopMS:     timeMS,
+			StopValue:  totalLegal,
+		}
+		r.DrawDowns = append(r.DrawDowns, r.TmpDrawDown)
+	} else if totalLegal < r.MaxReal {
 		drawDownPct := (r.MaxReal - totalLegal) * 100 / r.MaxReal
 		r.MaxDrawDownPct = max(r.MaxDrawDownPct, drawDownPct)
+		if r.TmpDrawDown != nil && totalLegal < r.TmpDrawDown.StopValue {
+			r.TmpDrawDown.SetEnd(timeMS, totalLegal)
+		}
 		r.MaxDrawDownVal = max(r.MaxDrawDownVal, r.MaxReal-totalLegal)
 		maxOccupy := r.MaxReal - wallets.AvaLegal(nil)
 		r.MaxFundOccup = max(r.MaxFundOccup, maxOccupy)
@@ -1031,7 +1078,11 @@ func CalcMeasuresByReal(real []float64, rangeSecs int64, tf string, factor int, 
 	cumRets := make([]float64, 0, smpNum+1)
 	for i := step; i < inLen; i += step {
 		curVal := real[i]
-		inReturns = append(inReturns, (curVal-prevVal)/prevVal)
+		retVal := (curVal - prevVal) / prevVal
+		if math.IsInf(retVal, 0) || math.IsNaN(retVal) {
+			retVal = 0
+		}
+		inReturns = append(inReturns, retVal)
 		prevVal = curVal
 		cumRets = append(cumRets, curVal)
 	}

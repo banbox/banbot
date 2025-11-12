@@ -290,6 +290,7 @@ func (b *BackTest) cronDumpBtStatus() {
 		}
 		b.lastDumpMs = curTime
 		log.Info("dump backTest status to files...")
+		b.Collect()
 		b.printBtResult()
 	})
 	if err_ != nil {

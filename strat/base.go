@@ -222,7 +222,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 				req.LegalCost = minCost * 1.1
 			} else {
 				AddAccFailOpen(s.Account, FailOpenCostTooLess)
-				return errs.NewMsg(errs.CodeParamInvalid, "legal cost must >= %d", minCost)
+				return errs.NewMsg(errs.CodeParamInvalid, "legal cost must >= %.2f", minCost)
 			}
 		}
 	}
