@@ -465,22 +465,16 @@ func updateUnFinish(sess *Queries, agg *KlineAgg, sid int32, subTF string, start
 
 func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
 	whereSql := fmt.Sprintf("where sid=%v and timeframe='%v';", sid, tf)
-	fromWhere := "from kline_un " + whereSql
-	tx, sess, err := q.NewTx(context.Background())
-	if err != nil {
-		return err
-	}
-	_, err_ := sess.db.Exec(context.Background(), "delete "+fromWhere)
+	updSql := fmt.Sprintf("update kline_un set start_ms=%v,stop_ms=%v,open=%v,high=%v,low=%v,close=%v,volume=%v,info=%v %s",
+		bar.Time, endMS, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Info, whereSql)
+	res, err_ := q.db.Exec(context.Background(), updSql)
+	var err *errs.Error
 	if err_ != nil {
 		err = NewDbErr(core.ErrDbExecFail, err_)
-	} else {
-		err = sess.Exec(`insert into kline_un (sid, start_ms, stop_ms, open, high, low, close, volume, info, timeframe) 
+	} else if res.RowsAffected() == 0 {
+		err = q.Exec(`insert into kline_un (sid, start_ms, stop_ms, open, high, low, close, volume, info, timeframe) 
 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, sid, bar.Time, endMS, bar.Open, bar.High, bar.Low,
 			bar.Close, bar.Volume, bar.Info, tf)
-	}
-	err2 := tx.Close(context.Background(), err == nil)
-	if err2 != nil {
-		log.Error("SetUnfinish Tx close fail", zap.Bool("commit", err == nil), zap.Error(err2))
 	}
 	return err
 }

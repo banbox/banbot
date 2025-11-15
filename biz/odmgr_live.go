@@ -1263,7 +1263,7 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 		if iod == nil {
 			if orderId > 0 {
 				// 可能订单已完成，从OpenODs中移除了
-				log.Error("no order found in OpenODs", zap.String("acc", o.Account),
+				log.Warn("no order found in OpenODs, skip handleMyTrade", zap.String("acc", o.Account),
 					zap.String("clientID", trade.ClientID), zap.Int64("inoutId", orderId))
 			} else {
 				// No matching order, recorded in unMatchTrades
@@ -2168,43 +2168,43 @@ func verifyAccountTriggerOds(account string) {
 			fails = append(fails, pair)
 			log.Error("VerifyTriggerOds fail", zap.String("pair", pair), zap.Error(err))
 		}
+		var leftOds = make(map[int64]*ormo.InOutOrder)
 		if book == nil {
 			for _, od := range ods {
-				resOds = append(resOds, od)
+				leftOds[od.ID] = od
 			}
-			continue
-		}
-		var leftOds = make(map[int64]*ormo.InOutOrder)
-		var viewKeys = make(map[string]bool)
-		for _, od := range ods {
-			odKey := od.Key()
-			if _, ok := viewKeys[odKey]; ok {
-				log.Error("duplicate order in triggers", zap.String("acc", account), zap.String("key", odKey))
-				continue
-			}
-			viewKeys[odKey] = true
-			if od.Status >= ormo.InOutStatusFullExit {
-				continue
-			}
-			subOd := od.Enter
-			if od.Exit != nil {
-				subOd = od.Exit
-			}
-			// Calculate the amount to be purchased and the price ratio to reach the specified price
-			// 计算到指定价格，需要吃进的量，以及价格比例
-			waitVol, rate := book.SumVolTo(subOd.Side, subOd.Price)
-			// Fastest transaction time = total volume / transaction volume per second
-			// 最快成交时间 = 总吃进量 / 每秒成交量
-			waitSecs := int(math.Round(waitVol / secsVol))
-			if waitSecs < config.PutLimitSecs && rate >= 0.8 {
-				resOds = append(resOds, od)
-			} else {
-				stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
-				if stopAfter <= btime.TimeMS() {
-					cancelTimeoutEnter(odMgr, od)
-					saves = append(saves, od)
+		} else {
+			var viewKeys = make(map[string]bool)
+			for _, od := range ods {
+				odKey := od.Key()
+				if _, ok := viewKeys[odKey]; ok {
+					log.Error("duplicate order in triggers", zap.String("acc", account), zap.String("key", odKey))
+					continue
+				}
+				viewKeys[odKey] = true
+				if od.Status >= ormo.InOutStatusFullExit {
+					continue
+				}
+				subOd := od.Enter
+				if od.Exit != nil {
+					subOd = od.Exit
+				}
+				// Calculate the amount to be purchased and the price ratio to reach the specified price
+				// 计算到指定价格，需要吃进的量，以及价格比例
+				waitVol, rate := book.SumVolTo(subOd.Side, subOd.Price)
+				// Fastest transaction time = total volume / transaction volume per second
+				// 最快成交时间 = 总吃进量 / 每秒成交量
+				waitSecs := int(math.Round(waitVol / secsVol))
+				if waitSecs < config.PutLimitSecs && rate >= 0.8 {
+					resOds = append(resOds, od)
 				} else {
-					leftOds[od.ID] = od
+					stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
+					if stopAfter <= btime.TimeMS() {
+						cancelTimeoutEnter(odMgr, od)
+						saves = append(saves, od)
+					} else {
+						leftOds[od.ID] = od
+					}
 				}
 			}
 		}
@@ -2443,11 +2443,15 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		od.DirtyInfo = true
 	}
 	if orderId != "" && (res == nil || res.Status == "open") {
-		_, err = exg.Default.CancelOrder(orderId, od.Symbol, map[string]interface{}{
+		res, err = exg.Default.CancelOrder(orderId, od.Symbol, map[string]interface{}{
 			banexg.ParamAccount: o.Account,
 		})
 		if err != nil {
 			log.Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
+		} else if res != nil {
+			o.lockDoneKeys.Lock()
+			o.doneKeys[od.Symbol+orderId] = res.Timestamp
+			o.lockDoneKeys.Unlock()
 		}
 	}
 }

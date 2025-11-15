@@ -254,7 +254,7 @@ func (b *BackTest) Run() {
 		if failOpens != "" {
 			log.Info("fail open tag nums:\n" + failOpens)
 		}
-		b.printBtResult()
+		b.printBtResult(true)
 	}
 }
 
@@ -291,7 +291,7 @@ func (b *BackTest) cronDumpBtStatus() {
 		b.lastDumpMs = curTime
 		log.Info("dump backTest status to files...")
 		b.Collect()
-		b.printBtResult()
+		b.printBtResult(false)
 	})
 	if err_ != nil {
 		log.Error("add Dump BackTest Status fail", zap.Error(err_))

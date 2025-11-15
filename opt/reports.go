@@ -125,7 +125,7 @@ func NewBTResult() *BTResult {
 	return res
 }
 
-func (r *BTResult) printBtResult() {
+func (r *BTResult) printBtResult(reset bool) {
 	if config.StratPerf != nil && config.StratPerf.Enable {
 		core.DumpPerfs(r.OutDir)
 	}
@@ -138,7 +138,7 @@ func (r *BTResult) printBtResult() {
 	if r.CalcDiff > 0.01 {
 		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github")
 	}
-	r.dumpBtFiles()
+	r.dumpBtFiles(reset)
 }
 
 func (r *BTResult) cmdReports(orders []*ormo.InOutOrder) string {
@@ -174,7 +174,7 @@ func (r *BTResult) cmdReports(orders []*ormo.InOutOrder) string {
 	return b.String()
 }
 
-func (r *BTResult) dumpBtFiles() {
+func (r *BTResult) dumpBtFiles(reset bool) {
 	csvPath := fmt.Sprintf("%s/orders.csv", r.OutDir)
 	err_ := DumpOrdersCSV(ormo.HistODs, csvPath)
 	if err_ != nil {
@@ -188,9 +188,11 @@ func (r *BTResult) dumpBtFiles() {
 
 	r.dumpConfig()
 
-	r.dumpStrategy()
+	if reset {
+		r.dumpStrategy()
+	}
 
-	r.dumpStratOutputs()
+	r.dumpStratOutputs(reset)
 
 	r.DumpCharts()
 
@@ -837,7 +839,7 @@ func (r *BTResult) dumpStrategy() {
 	}
 }
 
-func (r *BTResult) dumpStratOutputs() {
+func (r *BTResult) dumpStratOutputs(reset bool) {
 	groups := make(map[string][]string)
 	for _, items := range strat.PairStrats {
 		for _, stgy := range items {
@@ -846,7 +848,9 @@ func (r *BTResult) dumpStratOutputs() {
 			}
 			rows, _ := groups[stgy.Name]
 			groups[stgy.Name] = append(rows, stgy.Outputs...)
-			stgy.Outputs = nil
+			if reset {
+				stgy.Outputs = nil
+			}
 		}
 	}
 	for name, rows := range groups {
@@ -1497,7 +1501,7 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 	log.Info("BackTest Reports:\n" + btRes.cmdReports(odList))
 	if outDir != "" {
 		btRes.OutDir = outDir
-		btRes.dumpBtFiles()
+		btRes.dumpBtFiles(true)
 		log.Info("Saved", zap.String("at", outDir))
 	}
 	if btRes.CalcDiff > 0.01 {

@@ -48,6 +48,7 @@ run_timeframes: [5m]  # ${m.cfg_run_timeframes()}
 run_policy:  # ${m.cfg_run_policy()}
   - name: Demo  # ${m.cfg_run_policy_name()}
     run_timeframes: [5m]  # ${m.cfg_run_policy_timeframes()}
+    refine_tf: 1m  # ${m.cfg_run_policy_refine_tf()}
     filters:  # ${m.cfg_run_policy_filters()}
     - name: OffsetFilter
       offset: 10

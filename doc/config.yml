@@ -45,6 +45,7 @@ run_timeframes: [5m]  # 机器人允许运行的所有时间周期。策略会�
 run_policy:  # 运行的策略，可以多个策略同时运行；也可以一个策略配置不同参数同时运行多个版本
   - name: Demo  # 策略名称
     run_timeframes: [5m]  # 此策略支持的时间周期，提供时覆盖根层级的run_timeframes
+    refine_tf: 1m  # 撮合周期，字符串或数字，数字表示相对timeframes减少倍数：'1m', '5m', '3-6', 5
     filters:  # 可使用pairlists中的所有过滤器
     - name: OffsetFilter  # 偏移限定数量选择。一般用在最后
       offset: 10  # 从第10个开始取

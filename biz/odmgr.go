@@ -448,6 +448,7 @@ func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, 
 		if req.StopBars > 0 {
 			stopAfter := btime.TimeMS() + int64(req.StopBars*utils.TFToSecs(od.Timeframe))*1000
 			od.SetInfo(ormo.OdInfoStopAfter, stopAfter)
+			od.SetInfo(ormo.OdInfoStopBars, req.StopBars)
 		}
 	}
 	od.SetInfo(ormo.OdInfoLegalCost, req.LegalCost)

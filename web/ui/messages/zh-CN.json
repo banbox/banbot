@@ -576,6 +576,7 @@
   "cfg_run_policy": "要运行的策略，可以同时运行多个策略或一个策略使用不同参数运行",
   "cfg_run_policy_name": "策略名称",
   "cfg_run_policy_timeframes": "此策略支持的时间周期，提供时会覆盖根级别的run_timeframes",
+  "cfg_run_policy_refine_tf": "撮合周期，字符串或数字，数字表示相对timeframes减少倍数：'1m', '5m', '3-6', 5",
   "cfg_run_policy_filters": "可以使用pairlists中的所有过滤器",
   "cfg_run_policy_max_pair": "此策略允许的最大币种数量",
   "cfg_run_policy_max_open": "此策略的最大开单数量",

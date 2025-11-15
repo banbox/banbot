@@ -161,6 +161,11 @@ func (i *InOutOrder) SetEnterLimit(price float64) *errs.Error {
 	if i.Enter.Price != price {
 		i.Enter.Price = price
 		i.DirtyEnter = true
+		stopBars := i.GetInfoInt64(OdInfoStopBars)
+		if stopBars > 0 {
+			stopAfter := btime.TimeMS() + stopBars*int64(utils2.TFToSecs(i.Timeframe))*1000
+			i.SetInfo(OdInfoStopAfter, stopAfter)
+		}
 		fireOdEdit(i, OdActionLimitEnter)
 	}
 	return nil

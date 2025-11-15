@@ -55,6 +55,13 @@ database:
 docker run -d --name banbot -p 8000:8000 --network mynet -v /root:/root banbot/banbot:latest -config /root/config.yml
 ```
 
+### Work with AI
+Download the [banbot.md](doc/banbot.md) file, then attach this file to any AI conversation to tell it the strategy you want to test.
+
+[中文版 banbot.md](doc/banbot_cn.md)
+
+Or immediately test your idea using the [Banbot Workflow](https://www.banbot.site/zh-CN/ai).
+
 ### Document
 Please go to [BanBot Website](https://www.banbot.site/) for documents.
 
