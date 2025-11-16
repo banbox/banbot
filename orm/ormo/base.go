@@ -206,14 +206,9 @@ func SaveDirtyODs(path string, account string) *errs.Error {
 	if len(dirtyOds) == 0 {
 		return nil
 	}
-	sess, conn, err := Conn(path, true)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
 	var odErr *errs.Error
 	for _, od := range dirtyOds {
-		err = od.Save(sess)
+		err := od.Save()
 		if err != nil {
 			odErr = err
 			log.Error("save unMatch od fail", zap.String("key", od.Key()), zap.Error(err))

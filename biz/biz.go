@@ -141,18 +141,9 @@ func RefreshJobs(pairs []string, pairTfScores map[string]map[string]float64, sho
 		return nil, err
 	}
 	if len(accOds) > 0 {
-		var sess *ormo.Queries
-		var conn *orm.TrackedDB
-		if core.LiveMode {
-			sess, conn, err = ormo.Conn(orm.DbTrades, true)
-			if err != nil {
-				return nil, err
-			}
-			defer conn.Close()
-		}
 		for acc, odList := range accOds {
 			odMgr := GetOdMgr(acc)
-			err = odMgr.ExitAndFill(sess, odList, &strat.ExitReq{Tag: core.ExitTagPairDel})
+			err = odMgr.ExitAndFill(odList, &strat.ExitReq{Tag: core.ExitTagPairDel})
 			if err != nil {
 				return nil, err
 			}
@@ -219,7 +210,7 @@ func InitOdSubs() {
 					stgy.OnOrderChange(job, od, evt)
 				}
 				if len(job.Entrys) > 0 || len(job.Exits) > 0 {
-					_, _, err := GetOdMgr(acc).ProcessOrders(nil, job)
+					_, _, err := GetOdMgr(acc).ProcessOrders(job)
 					if err != nil {
 						log.Error("process orders fail", zap.Error(err))
 					}
@@ -285,19 +276,7 @@ func AddBatchJob(account, tf string, job *strat.StratJob, infoEnv *ta.BarEnv) {
 func TryFireBatches(currMS int64, isWarmUp bool) int {
 	lockBatch.Lock()
 	defer lockBatch.Unlock()
-	var sess *ormo.Queries
-	var conn *orm.TrackedDB
 	var err *errs.Error
-	if core.LiveMode && !isWarmUp {
-		// In real-time mode, the order is saved to the database. In non-real-time mode, the order is temporarily saved to the memory without the need for a database.
-		// 实时模式保存到数据库。非实时模式，订单临时保存到内存，无需数据库
-		sess, conn, err = ormo.Conn(orm.DbTrades, true)
-		if err != nil {
-			log.Error("get db sess fail", zap.Error(err))
-			return 0
-		}
-		defer conn.Close()
-	}
 	var waitNum = 0
 	for key, tasks := range strat.BatchTasks {
 		if currMS < tasks.ExecMS {
@@ -357,7 +336,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 			if !isWarmUp {
 				odMgr := GetOdMgr(account)
 				for _, job := range mainJobs {
-					_, _, err = odMgr.ProcessOrders(sess, job)
+					_, _, err = odMgr.ProcessOrders(job)
 					if err != nil {
 						log.Error("process orders fail", zap.Error(err))
 					}

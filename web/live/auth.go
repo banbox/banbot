@@ -7,7 +7,6 @@ import (
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
@@ -94,16 +93,10 @@ func postStratCall(c *fiber.Ctx) error {
 		if err_ != nil {
 			log.Warn("OnPostApi fail", zap.String("strategy", strategy), zap.Any("msg", req), zap.Error(err_))
 		} else {
-			sess, conn, err := ormo.Conn(orm.DbTrades, true)
-			if err != nil {
-				log.Error("get db sess fail", zap.Error(err))
-				return err
-			}
-			defer conn.Close()
 			for acc, jobMap := range jobs {
 				odMgr := biz.GetOdMgr(acc)
 				for _, job := range jobMap {
-					_, _, err = odMgr.ProcessOrders(sess, job)
+					_, _, err := odMgr.ProcessOrders(job)
 					if err != nil {
 						log.Error("process orders fail", zap.String("acc", acc), zap.Error(err))
 						return err

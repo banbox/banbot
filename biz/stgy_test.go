@@ -65,15 +65,8 @@ func TestStratRun(t *testing.T) {
 			panic(err)
 		}
 		envKey := strings.Join([]string{symbol, tf}, "_")
-		env := &ta.BarEnv{
-			Exchange:   core.ExgName,
-			MarketType: core.Market,
-			Symbol:     symbol,
-			TimeFrame:  tf,
-			TFMSecs:    tfMSecs,
-			MaxCache:   core.NumTaCache,
-			Data:       map[string]interface{}{"sid": int64(exs.ID)},
-		}
+		env, _ := ta.NewBarEnv(core.ExgName, core.Market, symbol, tf)
+		env.MaxCache = core.NumTaCache
 		strat.Envs[envKey] = env
 		job := &strat.StratJob{
 			Strat:         stagy,

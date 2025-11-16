@@ -36,6 +36,9 @@ var (
 	dbPathLock     = deadlock.Mutex{}
 	trackedDBs     = make(map[*TrackedDB]bool)
 	trackedDBsLock = deadlock.Mutex{}
+	// SQLite 连接池缓存：每个数据库路径对应一个 sql.DB 实例
+	sqlitePools     = make(map[string]*sql.DB)
+	sqlitePoolsLock = deadlock.Mutex{}
 )
 
 //go:embed sql/trade_schema.sql
@@ -217,6 +220,7 @@ type TrackedDB struct {
 }
 
 // Close marks the TrackedDB as closed and removes it from tracking
+// 注意：不关闭底层 sql.DB，因为它是共享的连接池
 func (t *TrackedDB) Close() error {
 	t.mu.Lock()
 	t.closed = true
@@ -226,7 +230,7 @@ func (t *TrackedDB) Close() error {
 	delete(trackedDBs, t)
 	trackedDBsLock.Unlock()
 
-	return t.DB.Close()
+	return nil
 }
 
 // IsClosed returns whether the TrackedDB has been closed
@@ -238,17 +242,65 @@ func (t *TrackedDB) IsClosed() bool {
 
 func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *errs.Error) {
 	dbPathLock.Lock()
-	defer dbPathLock.Unlock()
 	if target, ok := dbPathMap[path]; ok {
 		path = target
 	}
+	dbPathLock.Unlock()
+
+	// 构建缓存键：路径+读写模式
+	cacheKey := path
+	if write {
+		cacheKey += ":write"
+	} else {
+		cacheKey += ":read"
+	}
+
+	// 从缓存获取或创建连接池
+	sqlitePoolsLock.Lock()
+	db, exists := sqlitePools[cacheKey]
+	if !exists {
+		var err *errs.Error
+		db, err = newDbLite(src, path, write, timeoutMs)
+		if err != nil {
+			sqlitePoolsLock.Unlock()
+			return nil, err
+		}
+		// 缓存连接池
+		sqlitePools[cacheKey] = db
+	}
+	sqlitePoolsLock.Unlock()
+
+	// Create tracked DB wrapper
+	tracked := &TrackedDB{
+		DB:          db,
+		acquireTime: time.Now(),
+		timeoutMs:   timeoutMs,
+		path:        path,
+		stack:       errs.CallStack(3, 20),
+		closed:      false,
+	}
+
+	// Register for timeout monitoring
+	if timeoutMs > 0 {
+		trackedDBsLock.Lock()
+		trackedDBs[tracked] = true
+		trackedDBsLock.Unlock()
+
+		// Start timeout monitor goroutine
+		go monitorTimeout(tracked)
+	}
+
+	return tracked, nil
+}
+
+func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Error) {
 	// 添加 WAL 模式和其他性能优化参数
 	openFlag := "_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000"
 	if timeoutMs > 0 {
 		openFlag += fmt.Sprintf("&_busy_timeout=%d", timeoutMs)
 	}
 	if write {
-		openFlag += "&cache=shared&mode=rw"
+		openFlag += "&cache=shared&mode=rwc"
 	} else {
 		openFlag += "&mode=ro"
 	}
@@ -273,26 +325,9 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 	}
 	db.SetConnMaxLifetime(time.Hour)
 
-	// Create tracked DB wrapper
-	tracked := &TrackedDB{
-		DB:          db,
-		acquireTime: time.Now(),
-		timeoutMs:   timeoutMs,
-		path:        path,
-		stack:       errs.CallStack(3, 20),
-		closed:      false,
-	}
-
-	// Register for timeout monitoring
-	if timeoutMs > 0 {
-		trackedDBsLock.Lock()
-		trackedDBs[tracked] = true
-		trackedDBsLock.Unlock()
-
-		// Start timeout monitor goroutine
-		go monitorTimeout(tracked)
-	}
-
+	// 初始化数据库结构（如果需要）
+	dbPathLock.Lock()
+	defer dbPathLock.Unlock()
 	if _, ok := dbPathInit[path]; !ok {
 		ddl, tbl := ddlTrade, "bottask"
 		if src == DbUI {
@@ -304,18 +339,10 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 		if err_ != nil || count == 0 {
 			if write {
 				// 数据库不存在，创建表
-				db, err_ = sql.Open("sqlite", connStr+"c")
-				if err_ != nil {
-					return nil, errs.New(core.ErrDbConnFail, err_)
-				}
 				log.Info("init sqlite structure", zap.String("path", path))
 				if _, err_ = db.Exec(ddl); err_ != nil {
 					return nil, errs.New(core.ErrDbExecFail, err_)
 				}
-				// 重新配置连接池
-				db.SetMaxOpenConns(1)
-				db.SetMaxIdleConns(1)
-				db.SetConnMaxLifetime(time.Hour)
 			} else if err_ != nil {
 				return nil, errs.New(core.ErrDbExecFail, err_)
 			} else {
@@ -324,7 +351,7 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 		}
 		dbPathInit[path] = true
 	}
-	return tracked, nil
+	return db, nil
 }
 
 // monitorTimeout monitors a TrackedDB and logs an error if it exceeds the timeout

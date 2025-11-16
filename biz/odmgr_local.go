@@ -44,8 +44,8 @@ func InitLocalOrderMgr(callBack FnOdCb, showLog bool) {
 	}
 }
 
-func (o *LocalOrderMgr) ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
-	return o.OrderMgr.ProcessOrders(sess, job)
+func (o *LocalOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
+	return o.OrderMgr.ProcessOrders(job)
 }
 
 func (o *LocalOrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error {
@@ -341,7 +341,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	od.DirtyEnter = true
 	od.DirtyMain = true
 	if core.LiveMode {
-		err = od.Save(nil)
+		err = od.Save()
 		if err != nil {
 			log.Error("save order fail", zap.String("acc", o.Account),
 				zap.String("key", od.Key()), zap.Error(err))
@@ -372,10 +372,10 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 	od.Status = ormo.InOutStatusFullExit
 	od.DirtyMain = true
 	od.DirtyExit = true
-	_ = o.finishOrder(od, nil)
+	_ = o.finishOrder(od)
 	wallets.ConfirmOdExit(od, price)
 	if core.LiveMode {
-		err = od.Save(nil)
+		err = od.Save()
 		if err != nil {
 			log.Error("save order fail", zap.String("acc", o.Account),
 				zap.String("key", od.Key()), zap.Error(err))
@@ -477,7 +477,7 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline, 
 		} else {
 			_ = od.SetTakeProfit(nil)
 		}
-		err := od.Save(nil)
+		err := od.Save()
 		if err != nil {
 			log.Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
 		}
@@ -491,7 +491,7 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline, 
 	err := od.LocalExit(exitAt, exitTag, fillPrice, "", odType)
 	wallets := GetWallets(o.Account)
 	wallets.ExitOd(od, od.Exit.Amount)
-	_ = o.finishOrder(od, nil)
+	_ = o.finishOrder(od)
 	wallets.ConfirmOdExit(od, od.Exit.Price)
 	o.callBack(od, false)
 	strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
@@ -515,19 +515,19 @@ func (o *LocalOrderMgr) onLowFunds() {
 }
 
 func (o *LocalOrderMgr) OnEnvEnd(bar *banexg.PairTFKline, adj *orm.AdjInfo) *errs.Error {
-	err := o.exitAndFill(nil, &strat.ExitReq{
+	err := o.exitAndFill(&strat.ExitReq{
 		Tag:  core.ExitTagEnvEnd,
 		Dirt: core.OdDirtBoth,
 	}, &orm.InfoKline{PairTFKline: bar, Adj: adj}, true)
 	return err
 }
 
-func (o *LocalOrderMgr) exitAndFill(sess *ormo.Queries, req *strat.ExitReq, bar *orm.InfoKline, noEnter bool) *errs.Error {
+func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, bar *orm.InfoKline, noEnter bool) *errs.Error {
 	pairs := ""
 	if bar != nil {
 		pairs = bar.Symbol
 	}
-	orders, err := o.ExitOpenOrders(sess, pairs, req)
+	orders, err := o.ExitOpenOrders(pairs, req)
 	if err != nil {
 		return err
 	}
@@ -555,9 +555,9 @@ func (o *LocalOrderMgr) exitAndFill(sess *ormo.Queries, req *strat.ExitReq, bar 
 	return nil
 }
 
-func (o *LocalOrderMgr) ExitAndFill(sess *ormo.Queries, orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
+func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
 	for _, od := range orders {
-		_, err := o.exitOrder(sess, od, req)
+		_, err := o.exitOrder(od, req)
 		if err != nil {
 			return err
 		}
@@ -583,7 +583,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 	lock.Lock()
 	oldOpens := maps.Clone(openOds)
 	lock.Unlock()
-	err := o.exitAndFill(nil, exitReq, nil, false)
+	err := o.exitAndFill(exitReq, nil, false)
 	if err != nil {
 		return err
 	}
@@ -606,7 +606,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 		odMap := make(map[int64]bool)
 		var iod *ormo.InOutOrder
 		for _, od := range openOdList {
-			iod, err = o.exitOrder(nil, od, exitReq)
+			iod, err = o.exitOrder(od, exitReq)
 			if err != nil {
 				break
 			}

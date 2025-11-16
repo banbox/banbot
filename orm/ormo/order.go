@@ -370,7 +370,7 @@ func (i *InOutOrder) LocalExit(exitAt int64, tag string, price float64, msg, odT
 	if msg != "" {
 		i.SetInfo(KeyStatusMsg, msg)
 	}
-	return i.Save(nil)
+	return i.Save()
 }
 
 /*
@@ -449,7 +449,7 @@ func (i *InOutOrder) IsDirty() bool {
 	return i.DirtyExit || i.DirtyMain || i.DirtyEnter || i.DirtyInfo
 }
 
-func (i *InOutOrder) Save(sess *Queries) *errs.Error {
+func (i *InOutOrder) Save() *errs.Error {
 	if i.ID == 0 && core.SimOrderMatch {
 		core.NewNumInSim += 1
 	}
@@ -466,7 +466,7 @@ func (i *InOutOrder) Save(sess *Queries) *errs.Error {
 		}
 		lock.Unlock()
 		oldId := i.ID
-		err := i.saveToDb(sess)
+		err := i.saveToDb()
 		if i.ID != oldId && i.Status < InOutStatusFullExit {
 			lock.Lock()
 			delete(openOds, oldId)
@@ -509,7 +509,7 @@ func (i *InOutOrder) saveToMem() {
 	lock.Unlock()
 }
 
-func (i *InOutOrder) saveToDb(sess *Queries) *errs.Error {
+func (i *InOutOrder) saveToDb() *errs.Error {
 	if i.Status == InOutStatusDelete {
 		return nil
 	}
@@ -518,14 +518,13 @@ func (i *InOutOrder) saveToDb(sess *Queries) *errs.Error {
 	if err != nil {
 		return err
 	}
-	if sess == nil {
-		var conn *orm.TrackedDB
-		sess, conn, err = Conn(orm.DbTrades, true)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
+	var sess *Queries
+	var conn *orm.TrackedDB
+	sess, conn, err = Conn(orm.DbTrades, true)
+	if err != nil {
+		return err
 	}
+	defer conn.Close()
 	i.NanInfTo(0)
 	if i.ID == 0 {
 		err = i.IOrder.saveAdd(sess)

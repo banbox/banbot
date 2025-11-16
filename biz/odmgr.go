@@ -27,14 +27,14 @@ var (
 )
 
 type IOrderMgr interface {
-	ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
+	ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
 	EditOrder(od *ormo.InOutOrder, action string)
-	RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *errs.Error
-	EnterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder, *errs.Error)
-	ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error)
-	ExitOrder(sess *ormo.Queries, od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error)
+	RelayOrders(orders []*ormo.InOutOrder) *errs.Error
+	EnterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder, *errs.Error)
+	ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error)
+	ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error)
 	UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error
-	ExitAndFill(sess *ormo.Queries, orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error
+	ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error
 	OnEnvEnd(bar *banexg.PairTFKline, adj *orm.AdjInfo) *errs.Error
 	CleanUp() *errs.Error
 }
@@ -236,7 +236,7 @@ Live trading: monitor the exchange to return the order status to update the entr
 回测：调用方根据下一个bar执行入场/出场订单，更新状态
 实盘：监听交易所返回订单状态更新入场出场
 */
-func (o *OrderMgr) ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
+func (o *OrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
 	enters, exits := job.Entrys, job.Exits
 	if len(enters) == 0 && len(exits) == 0 {
 		return nil, nil, nil
@@ -253,7 +253,7 @@ func (o *OrderMgr) ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*or
 			log.Info("skip enters by allowOrderEnter", zap.Any("tags", reasons))
 		}
 		for _, ent := range enters {
-			iorder, err := o.enterOrder(sess, exs, job.TimeFrame, ent, false)
+			iorder, err := o.enterOrder(exs, job.TimeFrame, ent, false)
 			if err != nil {
 				return entOrders, extOrders, err
 			}
@@ -262,7 +262,7 @@ func (o *OrderMgr) ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*or
 	}
 	if len(exits) > 0 {
 		for _, exit := range exits {
-			iorders, err := o.ExitOpenOrders(sess, exs.Symbol, exit)
+			iorders, err := o.ExitOpenOrders(exs.Symbol, exit)
 			if err != nil {
 				return entOrders, extOrders, err
 			}
@@ -277,7 +277,7 @@ func (o *OrderMgr) ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*or
 			job.Strat.OnOrderChange(job, od, strat.OdChgExit)
 		}
 		if len(job.Entrys) > 0 || len(job.Exits) > 0 {
-			ents, exts, err := o.ProcessOrders(sess, job)
+			ents, exts, err := o.ProcessOrders(job)
 			if err != nil {
 				return entOrders, extOrders, err
 			}
@@ -292,7 +292,7 @@ func (o *LocalOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
 
 }
 
-func (o *OrderMgr) RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *errs.Error {
+func (o *OrderMgr) RelayOrders(orders []*ormo.InOutOrder) *errs.Error {
 	symbolMap := orm.GetExSymbolMap(core.ExgName, core.Market)
 	taskId := ormo.GetTaskID(o.Account)
 	for _, odr := range orders {
@@ -347,7 +347,7 @@ func (o *OrderMgr) RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *e
 		if len(odr.Info) > 0 {
 			maps.Copy(od.Info, odr.Info)
 		}
-		err := od.Save(sess)
+		err := od.Save()
 		if err == nil {
 			if o.afterEnter != nil {
 				err = o.afterEnter(od)
@@ -360,11 +360,11 @@ func (o *OrderMgr) RelayOrders(sess *ormo.Queries, orders []*ormo.InOutOrder) *e
 	return nil
 }
 
-func (o *OrderMgr) EnterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder, *errs.Error) {
-	return o.enterOrder(sess, exs, tf, req, true)
+func (o *OrderMgr) EnterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder, *errs.Error) {
+	return o.enterOrder(exs, tf, req, true)
 }
 
-func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, req *strat.EnterReq, doCheck bool) (*ormo.InOutOrder, *errs.Error) {
+func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq, doCheck bool) (*ormo.InOutOrder, *errs.Error) {
 	isSpot := core.Market == banexg.MarketSpot
 	if req.Short && isSpot {
 		return nil, errs.NewMsg(core.ErrRunTime, "short oder is invalid for spot")
@@ -482,7 +482,7 @@ func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, 
 			od.SetInfo(k, v)
 		}
 	}
-	err := od.Save(sess)
+	err := od.Save()
 	if err != nil {
 		return od, err
 	}
@@ -492,7 +492,7 @@ func (o *OrderMgr) enterOrder(sess *ormo.Queries, exs *orm.ExSymbol, tf string, 
 	return od, err
 }
 
-func (o *OrderMgr) ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error) {
+func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error) {
 	// Filter matching orders 筛选匹配的订单
 	var matches []*ormo.InOutOrder
 	openOds, lock := ormo.GetOpenODs(o.Account)
@@ -635,7 +635,7 @@ func (o *OrderMgr) ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.E
 					if err != nil {
 						return result, err
 					}
-					_, err = o.postOrderExit(sess, odr)
+					_, err = o.postOrderExit(odr)
 					if err != nil {
 						return result, err
 					}
@@ -648,7 +648,7 @@ func (o *OrderMgr) ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.E
 			// 只退出已入场的订单，当前订单部分入场，切分成子订单
 			cutAmt := min(exitAmount, od.Enter.Filled)
 			part = od.CutPart(cutAmt, 0)
-			err = od.Save(sess)
+			err = od.Save()
 			if err != nil {
 				return result, err
 			}
@@ -666,9 +666,9 @@ func (o *OrderMgr) ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.E
 			if err != nil {
 				return result, err
 			}
-			part, err = o.postOrderExit(sess, od)
+			part, err = o.postOrderExit(od)
 		} else {
-			part, err = o.exitOrder(sess, od, q)
+			part, err = o.exitOrder(od, q)
 		}
 		if err != nil {
 			return result, err
@@ -681,7 +681,7 @@ func (o *OrderMgr) ExitOpenOrders(sess *ormo.Queries, pairs string, req *strat.E
 	return result, nil
 }
 
-func (o *OrderMgr) ExitOrder(sess *ormo.Queries, od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error) {
+func (o *OrderMgr) ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error) {
 	if od.ExitTag != "" || (od.Exit != nil && od.Exit.Amount > 0) {
 		// Exit一旦有值，表示全部退出
 		return nil, nil
@@ -705,13 +705,13 @@ func (o *OrderMgr) ExitOrder(sess *ormo.Queries, od *ormo.InOutOrder, req *strat
 				Rate:  req.ExitRate,
 				Tag:   req.Tag,
 			})
-			return o.postOrderExit(sess, od)
+			return o.postOrderExit(od)
 		}
 	}
-	return o.exitOrder(sess, od, req)
+	return o.exitOrder(od, req)
 }
 
-func (o *OrderMgr) exitOrder(sess *ormo.Queries, od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error) {
+func (o *OrderMgr) exitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error) {
 	// It has been confirmed externally that it is not a limit price stop profit
 	// 外部已确认不是限价止盈
 	odType := core.OrderTypeEnums[req.OrderType]
@@ -723,18 +723,18 @@ func (o *OrderMgr) exitOrder(sess *ormo.Queries, od *ormo.InOutOrder, req *strat
 		// 要退出的部分不足99%，分割出一个小订单，用于退出。
 		part := o.CutOrder(od, req.ExitRate, 0)
 		req.ExitRate = 1
-		err := od.Save(sess)
+		err := od.Save()
 		if err != nil {
 			log.Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
 		}
-		return o.exitOrder(sess, part, req)
+		return o.exitOrder(part, req)
 	}
 	od.SetExit(0, req.Tag, odType, req.Limit)
-	return o.postOrderExit(sess, od)
+	return o.postOrderExit(od)
 }
 
-func (o *OrderMgr) postOrderExit(sess *ormo.Queries, od *ormo.InOutOrder) (*ormo.InOutOrder, *errs.Error) {
-	err := od.Save(sess)
+func (o *OrderMgr) postOrderExit(od *ormo.InOutOrder) (*ormo.InOutOrder, *errs.Error) {
+	err := od.Save()
 	if err != nil {
 		return od, err
 	}
@@ -781,9 +781,9 @@ sess 可为nil
 It will be saved internally to the database during the actual trading.
 实盘时内部会保存到数据库。
 */
-func (o *OrderMgr) finishOrder(od *ormo.InOutOrder, sess *ormo.Queries) *errs.Error {
+func (o *OrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 	od.UpdateProfits(0)
-	err := od.Save(sess)
+	err := od.Save()
 	cfg := strat.GetStratPerf(od.Symbol, od.Strategy)
 	if cfg != nil && cfg.Enable && o.Account == config.DefAcc {
 		err2 := strat.CalcJobScores(od.Symbol, od.Timeframe, od.Strategy)
@@ -807,18 +807,13 @@ func CloseAccOrders(acc string, odList []*ormo.InOutOrder, req *strat.ExitReq) (
 		odMgr = GetOdMgr(acc)
 	}
 
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer conn.Close()
 	closeNum, failNum := 0, 0
 	var errMsg strings.Builder
 	for _, od := range odList {
 		r := req.Clone()
 		r.StratName = od.Strategy
 		r.OrderID = od.ID
-		_, err2 := odMgr.ExitOrder(sess, od, r)
+		_, err2 := odMgr.ExitOrder(od, r)
 		if err2 != nil {
 			failNum += 1
 			errMsg.WriteString(fmt.Sprintf("Order %v: %v\n", od.ID, err2.Short()))

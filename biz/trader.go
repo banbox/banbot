@@ -253,7 +253,7 @@ func (t *Trader) onAccountKlineJob(odMgr IOrderMgr, job *strat.StratJob, bar *or
 		if err != nil {
 			return err
 		}
-		_, _, err = odMgr.ProcessOrders(nil, job)
+		_, _, err = odMgr.ProcessOrders(job)
 		if err != nil {
 			return err
 		}

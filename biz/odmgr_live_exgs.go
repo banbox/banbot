@@ -61,15 +61,9 @@ func bnbExitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 		if len(doneParts) == 0 && !createInv {
 			return true
 		}
-		sess, conn, err := ormo.Conn(orm.DbTrades, true)
-		if err != nil {
-			log.Error("get sess fail bnbExitByMyOrder.tryFillExit", zap.Error(err))
-			return true
-		}
-		defer conn.Close()
 		for _, part = range doneParts {
 			lock2 := part.Lock()
-			err = o.finishOrder(part, sess)
+			err = o.finishOrder(part)
 			lock2.Unlock()
 			if err != nil {
 				log.Error("finish order fail", zap.String("key", part.Key()), zap.Error(err))
@@ -79,7 +73,7 @@ func bnbExitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 			o.callBack(part, false)
 		}
 		if createInv {
-			iod := o.makeInOutOd(sess, od.Symbol, isShort, od.Average, filled, od.Type, feeCost, feeQuote, feeName,
+			iod := o.makeInOutOd(od.Symbol, isShort, od.Average, filled, od.Type, feeCost, feeQuote, feeName,
 				od.Timestamp, ormo.OdStatusClosed, od.ID)
 			if iod != nil {
 				o.callBack(iod, true)
@@ -89,7 +83,7 @@ func bnbExitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 	}
 }
 
-func (o *LiveOrderMgr) makeInOutOd(sess *ormo.Queries, pair string, short bool, average, filled float64, odType string,
+func (o *LiveOrderMgr) makeInOutOd(pair string, short bool, average, filled float64, odType string,
 	feeCost float64, feeQuote float64, feeName string, enterAt int64, entStatus int, entOdId string) *ormo.InOutOrder {
 	exs, err := orm.GetExSymbolCur(pair)
 	if err != nil {
@@ -104,7 +98,7 @@ func (o *LiveOrderMgr) makeInOutOd(sess *ormo.Queries, pair string, short bool, 
 	}
 	iod := o.createInOutOd(exs, short, average, filled, odType, feeCost, feeQuote, feeName, enterAt,
 		entStatus, entOdId, defTF)
-	err = iod.Save(sess)
+	err = iod.Save()
 	if err != nil {
 		log.Error("save third order fail", zap.String("key", iod.Key()), zap.Error(err))
 		return nil
@@ -132,14 +126,8 @@ func bnbTraceExgOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 			// 现货市场卖出即平仓，忽略平仓
 			return false
 		}
-		sess, conn, err := ormo.Conn(orm.DbTrades, true)
-		if err != nil {
-			log.Error("get sess fail bnbTraceExgOrder", zap.Error(err))
-			return true
-		}
-		defer conn.Close()
 		feeName, feeCost, feeQuote := getFeeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Amount, od.Average)
-		iod := o.makeInOutOd(sess, od.Symbol, isShort, od.Average, od.Filled, od.Type, feeCost, feeQuote, feeName,
+		iod := o.makeInOutOd(od.Symbol, isShort, od.Average, od.Filled, od.Type, feeCost, feeQuote, feeName,
 			od.Timestamp, ormo.OdStatusClosed, od.ID)
 		if iod != nil {
 			o.callBack(iod, true)

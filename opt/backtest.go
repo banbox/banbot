@@ -458,15 +458,7 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 	if isFirst {
 		// 如果是初次执行，检查打开的订单是否已在测试期间平仓，是则自动平仓
 		// 主要针对实盘隔一段时间后重启有未平仓订单场景，需检查订单是否应在机器人停止期间平仓
-		var sess *ormo.Queries
-		var conn *orm.TrackedDB
 		var err *errs.Error
-		if core.LiveMode {
-			sess, conn, err = ormo.Conn(orm.DbTrades, true)
-			if err != nil {
-				return err
-			}
-		}
 		closeNums := make(map[string]int)
 		for acc := range config.Accounts {
 			odMgr := biz.GetOdMgr(acc)
@@ -480,7 +472,7 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 			}
 			lock.Unlock()
 			if len(exitOds) > 0 {
-				err = odMgr.ExitAndFill(sess, exitOds, &strat.ExitReq{Tag: core.ExitTagExitDelay})
+				err = odMgr.ExitAndFill(exitOds, &strat.ExitReq{Tag: core.ExitTagExitDelay})
 				if err != nil {
 					log.Error("close delayed order fail", zap.Int("num", len(exitOds)), zap.Error(err))
 				} else {
@@ -491,23 +483,11 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 		if len(closeNums) > 0 {
 			log.Info("closed delayed order", zap.Any("nums", closeNums))
 		}
-		if conn != nil {
-			conn.Close()
-		}
 	}
 	if len(relayOpens) == 0 {
 		return nil
 	}
-	var sess *ormo.Queries
-	var conn *orm.TrackedDB
 	var err *errs.Error
-	if core.LiveMode {
-		sess, conn, err = ormo.Conn(orm.DbTrades, true)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-	}
 	for acc := range config.Accounts {
 		odMgr := biz.GetOdMgr(acc)
 		jobs := strat.GetJobs(acc)
@@ -535,7 +515,7 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 			// 此账户未订阅此策略任务，忽略即可
 		}
 		if len(allowOds) > 0 {
-			err = odMgr.RelayOrders(sess, allowOds)
+			err = odMgr.RelayOrders(allowOds)
 			if err != nil {
 				return err
 			}

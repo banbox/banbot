@@ -132,7 +132,7 @@ func tryFillLocalLiveOrder(o *LocalLiveOrderMgr, od *ormo.InOutOrder, isEnter bo
 		return err
 	}
 	if od.IsDirty() {
-		err = od.Save(nil)
+		err = od.Save()
 		if err != nil {
 			log.Error("save order fail", zap.String("acc", o.Account),
 				zap.String("key", od.Key()), zap.Error(err))
@@ -222,7 +222,7 @@ func (o *LocalLiveOrderMgr) CleanUp() *errs.Error {
 	// 保存所有需要保存的订单到数据库
 	if len(needSaveOds) > 0 {
 		for _, od := range needSaveOds {
-			err := od.Save(nil)
+			err := od.Save()
 			if err != nil {
 				log.Warn("save order fail", zap.String("acc", o.Account),
 					zap.String("key", od.Key()), zap.Error(err))

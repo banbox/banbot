@@ -102,7 +102,7 @@ func (m *TelegramOrderManager) CloseOrder(account string, orderID int64) error {
 	}
 
 	// 执行平仓
-	_, exitErr := mgr.ExitOpenOrders(sess, order.Symbol, exitReq)
+	_, exitErr := mgr.ExitOpenOrders(order.Symbol, exitReq)
 	if exitErr != nil {
 		return exitErr
 	}
@@ -143,7 +143,7 @@ func (m *TelegramOrderManager) CloseAllOrders(account string) (int, int, error) 
 			Force:   true,
 		}
 
-		_, exitErr := mgr.ExitOpenOrders(sess, order.Symbol, exitReq)
+		_, exitErr := mgr.ExitOpenOrders(order.Symbol, exitReq)
 		if exitErr != nil {
 			log.Error("Failed to close order", zap.Int64("order_id", order.ID), zap.Error(exitErr))
 			failedCount++

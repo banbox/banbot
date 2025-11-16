@@ -459,7 +459,7 @@ func delSaveOrders(account string, delOds, saves []*ormo.InOutOrder) {
 		}
 	}
 	for _, od := range saves {
-		err = od.Save(sess)
+		err = od.Save()
 		if err != nil {
 			log.Error("save order in SyncExgOrders fail", zap.String("acc", account), zap.String("key", od.Key()), zap.Error(err))
 		}
@@ -575,13 +575,6 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 	if shortPos != nil {
 		shortPosAmt = shortPos.Contracts
 	}
-	// Get the exchange order before getting the connection to reduce the time taken
-	// 获取交易所订单后再获取连接，减少占用时长
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
 	if len(openOds) > 0 {
 		exIdMap := make(map[string]*ormo.InOutOrder)
 		for _, iod := range openOds {
@@ -598,7 +591,7 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 				// 跳过未完成订单
 				continue
 			}
-			err = o.applyHisOrder(sess, openOds, exIdMap, exod, defTF)
+			err = o.applyHisOrder(openOds, exIdMap, exod, defTF)
 			if err != nil {
 				return err
 			}
@@ -696,7 +689,7 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 			return err
 		}
 		delete(openOds, longOd.ID)
-		err = longOd.Save(sess)
+		err = longOd.Save()
 		if err != nil {
 			return err
 		}
@@ -708,7 +701,7 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 			return err
 		}
 		delete(openOds, shortOd.ID)
-		err = shortOd.Save(sess)
+		err = shortOd.Save()
 		if err != nil {
 			return err
 		}
@@ -734,7 +727,7 @@ func getFeeNameCost(fee *banexg.Fee, pair, odType, side string, amount, price fl
 	return fee.Currency, fee.Cost, fee.QuoteCost
 }
 
-func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods map[int64]*ormo.InOutOrder, exIdMap map[string]*ormo.InOutOrder, od *banexg.Order, defTF string) *errs.Error {
+func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map[string]*ormo.InOutOrder, od *banexg.Order, defTF string) *errs.Error {
 	isShort := od.PositionSide == banexg.PosSideShort
 	isSell := od.Side == banexg.OdSideSell
 	exs, err := orm.GetExSymbolCur(od.Symbol)
@@ -795,7 +788,7 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods map[int64]*ormo.InO
 			}
 			inOut.DirtyMain = true
 			inOut.UpdateProfits(price)
-			err = inOut.Save(nil)
+			err = inOut.Save()
 			if err != nil {
 				return err
 			}
@@ -817,7 +810,7 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods map[int64]*ormo.InO
 			o.Account, tag, price, amount, od.Type, feeCost, odTime, od.ID))
 		iod := o.createInOutOd(exs, isShort, price, amount, od.Type, feeCost, feeQuote, feeName, odTime, ormo.OdStatusClosed,
 			od.ID, defTF)
-		err = iod.Save(sess)
+		err = iod.Save()
 		if err != nil {
 			return err
 		}
@@ -833,7 +826,7 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods map[int64]*ormo.InO
 			amount, feeLeft, part = o.tryFillExit(iod, amount, price, odTime, od.ID, od.Type, feeName, feeCost, feeQuote)
 			feeCost *= feeLeft
 			feeQuote *= feeLeft
-			err = part.Save(sess)
+			err = part.Save()
 			if err != nil {
 				return err
 			}
@@ -844,7 +837,7 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods map[int64]*ormo.InO
 			log.Info(fmt.Sprintf("%s %v: price:%.5f, amount: %.5f, %v, %v id: %v",
 				o.Account, tag, price, part.Exit.Filled, od.Type, odTime, od.ID))
 			if iod.Status < ormo.InOutStatusFullExit {
-				err = iod.Save(sess)
+				err = iod.Save()
 				if err != nil {
 					return err
 				}
@@ -868,7 +861,7 @@ func (o *LiveOrderMgr) applyHisOrder(sess *ormo.Queries, ods map[int64]*ormo.InO
 				o.Account, tag, price, amount, od.Type, feeCost, odTime, od.ID))
 			iod := o.createInOutOd(exs, isShort, price, amount, od.Type, feeCost, feeQuote, feeName, odTime, ormo.OdStatusClosed,
 				od.ID, defTF)
-			err = iod.Save(sess)
+			err = iod.Save()
 			if err != nil {
 				return err
 			}
@@ -1050,13 +1043,13 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 	return filled, feeCost / orgFeeCost, part
 }
 
-func (o *LiveOrderMgr) ProcessOrders(sess *ormo.Queries, job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
+func (o *LiveOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
 	if len(job.Entrys) == 0 && len(job.Exits) == 0 {
 		return nil, nil, nil
 	}
 	log.Info("ProcessOrders", zap.String("acc", o.Account), zap.String("pair", job.Symbol.Symbol),
 		zap.Any("enters", job.Entrys), zap.Any("exits", job.Exits))
-	return o.OrderMgr.ProcessOrders(sess, job)
+	return o.OrderMgr.ProcessOrders(job)
 }
 
 func (o *LiveOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
@@ -1161,7 +1154,7 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 			zap.String("action", action), zap.Error(err))
 	}
 	if od.IsDirty() {
-		err = od.Save(nil)
+		err = od.Save()
 		if err != nil {
 			log.Error("save od for exg status fail", zap.String("acc", o.Account),
 				zap.String("key", od.Key()), zap.Error(err))
@@ -1309,7 +1302,7 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 			o.editTriggerOd(iod, ormo.OdActionStopLoss)
 			o.editTriggerOd(iod, ormo.OdActionTakeProfit)
 		}
-		err = iod.Save(nil)
+		err = iod.Save()
 		if err != nil {
 			log.Error("save od from myTrade fail", zap.String("acc", o.Account),
 				zap.String("key", iod.Key()), zap.Error(err))
@@ -1549,7 +1542,7 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 			tp.OrderId = ""
 			od.DirtyInfo = true
 		}
-		err := o.finishOrder(od, nil)
+		err := o.finishOrder(od)
 		if err != nil {
 			return err
 		}
@@ -1672,7 +1665,7 @@ func (o *LiveOrderMgr) tryExitPendingEnter(od *ormo.InOutOrder) *errs.Error {
 		od.Exit.Status = ormo.OdStatusClosed
 		od.DirtyMain = true
 		od.DirtyExit = true
-		err := o.finishOrder(od, nil)
+		err := o.finishOrder(od)
 		if err != nil {
 			return err
 		}
@@ -1771,7 +1764,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 			subOd.Price = od.Enter.Price
 			od.DirtyExit = true
 			od.DirtyMain = true
-			err = o.finishOrder(od, nil)
+			err = o.finishOrder(od)
 			if err != nil {
 				return err
 			}
@@ -1912,7 +1905,7 @@ func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *
 			od.DirtyMain = true
 		}
 		if od.Status == ormo.InOutStatusFullExit {
-			err := o.finishOrder(od, nil)
+			err := o.finishOrder(od)
 			o.callBack(od, false)
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 			if err != nil {
@@ -2261,14 +2254,8 @@ func getSecsByLimit(pair, side string, price float64) (int, float64, *errs.Error
 func saveIOrders(saveOds []*ormo.InOutOrder) {
 	// There are orders that need to be saved
 	// 有需要保存的订单
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
-	if err != nil {
-		log.Error("get sess to save old limits fail", zap.Error(err))
-		return
-	}
-	defer conn.Close()
 	for _, od := range saveOds {
-		err = od.Save(sess)
+		err := od.Save()
 		if err != nil {
 			log.Error("save od fail", zap.String("key", od.Key()), zap.Error(err))
 		}
@@ -2426,7 +2413,7 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 			if err != nil {
 				log.Error("exit order by trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
-			err = od.Save(nil)
+			err = od.Save()
 			if err != nil {
 				log.Error("save order by trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
@@ -2518,7 +2505,7 @@ sess 可为nil
 When the transaction is in progress, it will be saved to the database internally.
 实盘时，内部会保存到数据库
 */
-func (o *LiveOrderMgr) finishOrder(od *ormo.InOutOrder, sess *ormo.Queries) *errs.Error {
+func (o *LiveOrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 	curMS := btime.UTCStamp()
 	if od.Enter != nil && od.Enter.OrderID != "" {
 		o.lockDoneKeys.Lock()
@@ -2532,7 +2519,7 @@ func (o *LiveOrderMgr) finishOrder(od *ormo.InOutOrder, sess *ormo.Queries) *err
 	}
 	log.Info("Finish Order", zap.String("acc", o.Account), zap.String("key", od.Key()),
 		zap.String("tag", od.ExitTag))
-	return o.OrderMgr.finishOrder(od, sess)
+	return o.OrderMgr.finishOrder(od)
 }
 
 func (o *LiveOrderMgr) WatchLeverages() {
@@ -2630,21 +2617,16 @@ func calcFatalLoss(wallets *BanWallets, orders []*ormo.InOutOrder, backMins int)
 }
 
 func (o *LiveOrderMgr) OnEnvEnd(bar *banexg.PairTFKline, adj *orm.AdjInfo) *errs.Error {
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	_, err = o.ExitOpenOrders(sess, bar.Symbol, &strat.ExitReq{
+	_, err := o.ExitOpenOrders(bar.Symbol, &strat.ExitReq{
 		Tag:  core.ExitTagEnvEnd,
 		Dirt: core.OdDirtBoth,
 	})
 	return err
 }
 
-func (o *LiveOrderMgr) ExitAndFill(sess *ormo.Queries, orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
+func (o *LiveOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
 	for _, od := range orders {
-		_, err := o.exitOrder(sess, od, req)
+		_, err := o.exitOrder(od, req)
 		if err != nil {
 			return err
 		}
