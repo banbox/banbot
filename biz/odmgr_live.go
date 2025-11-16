@@ -728,6 +728,9 @@ func getFeeNameCost(fee *banexg.Fee, pair, odType, side string, amount, price fl
 }
 
 func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map[string]*ormo.InOutOrder, od *banexg.Order, defTF string) *errs.Error {
+	if od.Filled == 0 {
+		return nil
+	}
 	isShort := od.PositionSide == banexg.PosSideShort
 	isSell := od.Side == banexg.OdSideSell
 	exs, err := orm.GetExSymbolCur(od.Symbol)

@@ -295,9 +295,9 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 
 func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Error) {
 	// 添加 WAL 模式和其他性能优化参数
-	openFlag := "_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000"
+	openFlag := "_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-64000)"
 	if timeoutMs > 0 {
-		openFlag += fmt.Sprintf("&_busy_timeout=%d", timeoutMs)
+		openFlag += fmt.Sprintf("&_pragma=busy_timeout(%d)", timeoutMs)
 	}
 	if write {
 		openFlag += "&cache=shared&mode=rwc"

@@ -116,7 +116,7 @@ rpc_channels:
     msg_types: [exception]
   telegram_notify:
     type: telegram
-    disable: false
+    disable: true
     token: ""
     chat_id: ""
     secret: ""
