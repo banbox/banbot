@@ -996,7 +996,6 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 	curFeeCost := feeCost * curPartRate
 	curFeeQuote := feeQuote * curPartRate
 	feeCost -= curFeeCost
-	feeQuote -= curFeeQuote
 	if part.Exit == nil {
 		exitSide := banexg.OdSideSell
 		if part.Short {
@@ -1250,7 +1249,7 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 		if orderId > 0 {
 			openOds, lock := ormo.GetOpenODs(o.Account)
 			lock.Lock()
-			iod, ok = openOds[orderId]
+			iod, _ = openOds[orderId]
 			lock.Unlock()
 		}
 		if iod == nil {

@@ -453,6 +453,9 @@ func (i *InOutOrder) Save() *errs.Error {
 	if i.ID == 0 && core.SimOrderMatch {
 		core.NewNumInSim += 1
 	}
+	if i.Status == InOutStatusFullExit && (i.Enter == nil || i.Enter.Filled == 0) && (i.Exit == nil || i.Exit.Filled == 0) {
+		i.Status = InOutStatusDelete
+	}
 	if core.LiveMode {
 		openOds, lock := GetOpenODs(GetTaskAcc(i.TaskID))
 		lock.Lock()
@@ -510,7 +513,7 @@ func (i *InOutOrder) saveToMem() {
 }
 
 func (i *InOutOrder) saveToDb() *errs.Error {
-	if i.Status == InOutStatusDelete {
+	if i.Status == InOutStatusDelete && i.ID == 0 {
 		return nil
 	}
 	var err *errs.Error
@@ -525,6 +528,9 @@ func (i *InOutOrder) saveToDb() *errs.Error {
 		return err
 	}
 	defer conn.Close()
+	if i.Status == InOutStatusDelete {
+		return sess.DelOrder(i)
+	}
 	i.NanInfTo(0)
 	if i.ID == 0 {
 		err = i.IOrder.saveAdd(sess)
@@ -1257,6 +1263,32 @@ func (q *Queries) GetOrders(args GetOrdersArgs) ([]*InOutOrder, *errs.Error) {
 	return result, nil
 }
 
+// deleteExOrderById deletes an exorder record by ID
+func (q *Queries) deleteExOrderById(ctx context.Context, exId int64) *errs.Error {
+	if exId == 0 {
+		return nil
+	}
+	sql := fmt.Sprintf("delete from exorder where id=%v", exId)
+	_, err_ := q.db.ExecContext(ctx, sql)
+	if err_ != nil {
+		return errs.New(core.ErrDbExecFail, err_)
+	}
+	return nil
+}
+
+// deleteIOrderById deletes an iorder record by ID
+func (q *Queries) deleteIOrderById(ctx context.Context, iorderId int64) *errs.Error {
+	if iorderId == 0 {
+		return nil
+	}
+	sql := fmt.Sprintf("delete from iorder where id=%v", iorderId)
+	_, err_ := q.db.ExecContext(ctx, sql)
+	if err_ != nil {
+		return errs.New(core.ErrDbExecFail, err_)
+	}
+	return nil
+}
+
 func (q *Queries) DelOrder(od *InOutOrder) *errs.Error {
 	if od == nil || od.ID == 0 {
 		return nil
@@ -1269,27 +1301,18 @@ func (q *Queries) DelOrder(od *InOutOrder) *errs.Error {
 	// 设置已完成，防止其他地方错误使用
 	od.Status = InOutStatusDelete
 	ctx := context.Background()
-	sql := fmt.Sprintf("delete from iorder where id=%v", od.ID)
-	_, err_ := q.db.ExecContext(ctx, sql)
-	if err_ != nil {
-		return errs.New(core.ErrDbExecFail, err_)
-	}
-	delExOrder := func(exId int64) *errs.Error {
-		sql = fmt.Sprintf("delete from exorder where id=%v", exId)
-		_, err_ = q.db.ExecContext(ctx, sql)
-		if err_ != nil {
-			return errs.New(core.ErrDbExecFail, err_)
-		}
-		return nil
+	err := q.deleteIOrderById(ctx, od.ID)
+	if err != nil {
+		return err
 	}
 	if od.Enter != nil && od.Enter.ID > 0 {
-		err := delExOrder(od.Enter.ID)
+		err = q.deleteExOrderById(ctx, od.Enter.ID)
 		if err != nil {
 			return err
 		}
 	}
 	if od.Exit != nil && od.Exit.ID > 0 {
-		return delExOrder(od.Exit.ID)
+		return q.deleteExOrderById(ctx, od.Exit.ID)
 	}
 	return nil
 }

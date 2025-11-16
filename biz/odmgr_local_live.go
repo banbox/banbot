@@ -25,7 +25,7 @@ type LocalLiveOrderMgr struct {
 
 func InitLocalLiveOrderMgr(callBack FnOdCb, showLog bool) {
 	for account := range config.Accounts {
-		mgr, ok := accOdMgrs[account]
+		_, ok := accOdMgrs[account]
 		if !ok {
 			odMgr := &LocalLiveOrderMgr{
 				LocalOrderMgr: LocalOrderMgr{
@@ -39,8 +39,7 @@ func InitLocalLiveOrderMgr(callBack FnOdCb, showLog bool) {
 			}
 			odMgr.afterEnter = makeAfterEnterLocalLive(odMgr)
 			odMgr.afterExit = makeAfterExitLocalLive(odMgr)
-			mgr = odMgr
-			accOdMgrs[account] = mgr
+			accOdMgrs[account] = odMgr
 		}
 	}
 }

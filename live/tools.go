@@ -12,6 +12,7 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
 	"math/rand"
@@ -53,6 +54,10 @@ func RunTradeClose(args []string) error {
 	}
 
 	// 查找符合要求的订单并平仓
+	err = cancelPendingOrders(accMap, pairMap)
+	if err != nil {
+		log.Error("cancelPendingOrders fail", zap.Error(err))
+	}
 	if isExg {
 		return closeOrdersByPos(accMap, pairMap)
 	} else {
@@ -116,6 +121,66 @@ func closeOrdersByPos(accMap map[string]bool, pairMap map[string]bool) error {
 		}
 	}
 	log.Info("try close exchange positions", zap.Int("num", closeNum))
+	return nil
+}
+
+// cancelPendingOrders 取消所有账户在交易所的未成交挂单
+func cancelPendingOrders(accMap map[string]bool, pairMap map[string]bool) *errs.Error {
+	exchange := exg.Default
+	cancelNum := 0
+	for account := range config.Accounts {
+		if len(accMap) > 0 {
+			if _, accOk := accMap[account]; !accOk {
+				continue
+			}
+		}
+		// 获取账户的所有未成交挂单
+		openOrders, err := exchange.FetchOpenOrders("", 0, 1000, map[string]interface{}{
+			banexg.ParamAccount: account,
+		})
+		if err != nil {
+			return err
+		}
+		log.Info("fetch account open orders", zap.String("acc", account), zap.Int("num", len(openOrders)))
+
+		// 筛选需要取消的订单
+		cancelOrders := make([]*banexg.Order, 0, len(openOrders))
+		for _, order := range openOrders {
+			if _, ok := pairMap[order.Symbol]; !ok && len(pairMap) > 0 {
+				continue
+			}
+			// 只取消未成交或部分成交的订单
+			if order.Status == "open" || order.Status == "partially_filled" {
+				cancelOrders = append(cancelOrders, order)
+			}
+		}
+
+		// 取消订单
+		if len(cancelOrders) > 0 {
+			for _, order := range cancelOrders {
+				cancelNum += 1
+				res, err := exchange.CancelOrder(order.ID, order.Symbol, map[string]interface{}{
+					banexg.ParamAccount: account,
+				})
+				if err != nil {
+					log.Error("cancel order fail", zap.String("acc", account),
+						zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
+						zap.Error(err))
+					continue
+				}
+				if res.Status == "canceled" || res.Status == "cancelled" {
+					log.Info("cancel order ok", zap.String("acc", account),
+						zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
+						zap.String("side", order.Side), zap.Float64("amount", order.Amount))
+				} else {
+					log.Warn("cancel order unexpected status", zap.String("acc", account),
+						zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
+						zap.String("status", res.Status))
+				}
+			}
+		}
+	}
+	log.Info("try cancel pending orders", zap.Int("num", cancelNum))
 	return nil
 }
 

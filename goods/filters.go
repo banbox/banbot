@@ -86,7 +86,7 @@ func (f *AgeFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Erro
 }
 
 func (f *VolumePairFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	var symbolVols = make([]*SymbolVol, 0)
+	var symbolVols []*SymbolVol
 	backTf, backNum := utils.SecsToTfNum(utils2.TFToSecs(f.BackPeriod))
 	var err *errs.Error
 	symbolVols, err = GetSymbolVols(symbols, backTf, backNum, timeMS, true)
@@ -205,9 +205,8 @@ func filterByMinCost(symbols []*SymbolVol) ([]string, map[string]float64) {
 }
 
 func (f *VolumePairFilter) GenSymbols(timeMS int64) ([]string, *errs.Error) {
-	symbols := make([]string, 0)
 	markets := exg.Default.GetCurMarkets()
-	symbols = utils.KeysOfMap(markets)
+	symbols := utils.KeysOfMap(markets)
 	pairs := make([]string, 0, len(symbols))
 	for _, pair := range symbols {
 		_, quote, _, _ := core.SplitSymbol(pair)

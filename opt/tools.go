@@ -79,7 +79,7 @@ func CompareExgBTOrders(args []string) error {
 		return err
 	}
 	outDir := filepath.Join(config.GetDataDir(), "exgOrders")
-	exgOrders := make([]*banexg.Order, 0)
+	var exgOrders []*banexg.Order
 	exgOrders, err = loadExgOrders(account, exs.Exchange, exs.Market, startMS, endMS, pairNums)
 	if err != nil {
 		return err
@@ -504,7 +504,7 @@ func buildExgOrders(ods []*banexg.Order, clientPrefix string) map[string][]*ormo
 		// 对每个未配对订单执行原来的逻辑
 		for _, od := range temps {
 			odList, _ := jobMap[od.Symbol]
-			newList := make([]*ormo.InOutOrder, 0, len(odList))
+			var newList []*ormo.InOutOrder
 			remainFilled := od.Filled
 
 			// 尝试平仓现有持仓

@@ -100,6 +100,7 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 		}
 	}
 	var wg sync.WaitGroup
+	var accOdArr = make([]string, 0, len(config.Accounts))
 	for account := range config.Accounts {
 		allOrders, _ := accOrders[account]
 		if !odMatch {
@@ -107,6 +108,18 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 			lock.Lock()
 			allOrders = utils2.ValsOfMap(openOds)
 			lock.Unlock()
+		}
+		// retrieve the current open orders after UpdateByBar, filter for closed orders
+		// 要在UpdateByBar后检索当前开放订单，过滤已平仓订单
+		var curOrders []*ormo.InOutOrder
+		for _, od := range allOrders {
+			if od.Status < ormo.InOutStatusFullExit && od.Symbol == bar.Symbol && od.Timeframe == bar.TimeFrame {
+				curOrders = append(curOrders, od)
+			}
+		}
+		if core.LiveMode && !bar.IsWarmUp {
+			numStr := fmt.Sprintf("%s: %d/%d", account, len(curOrders), len(allOrders))
+			accOdArr = append(accOdArr, numStr)
 		}
 		if !core.ParallelOnBar {
 			curErr := t.onAccountKline(account, env, bar, allOrders, barExpired)
@@ -134,10 +147,14 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 	if core.ParallelOnBar {
 		wg.Wait()
 	}
+	if core.LiveMode && len(accOdArr) > 0 {
+		log.Info("OnBar", zap.String("pair", bar.Symbol), zap.String("tf", bar.TimeFrame),
+			zap.Strings("accOdNums", accOdArr))
+	}
 	return err
 }
 
-func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKline, allOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
+func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKline, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
 	envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
 	// Get strategy jobs 获取交易任务
 	jobs, _ := strat.GetJobs(account)[envKey]
@@ -149,21 +166,6 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 	odMgr := GetOdMgr(account)
 	var err *errs.Error
 	isWarmup := bar.IsWarmUp
-	// retrieve the current open orders after UpdateByBar, filter for closed orders
-	// 要在UpdateByBar后检索当前开放订单，过滤已平仓订单
-	var curOrders []*ormo.InOutOrder
-	for _, od := range allOrders {
-		if od.Status < ormo.InOutStatusFullExit && od.Symbol == bar.Symbol && od.Timeframe == bar.TimeFrame {
-			curOrders = append(curOrders, od)
-		}
-	}
-	if core.LiveMode && !isWarmup {
-		// Live mode is saved to the database. Non-real-time mode, orders are temporarily saved in memory, no database required
-		// 实时模式保存到数据库。非实时模式，订单临时保存到内存，无需数据库
-		numStr := fmt.Sprintf("%d/%d", len(curOrders), len(allOrders))
-		log.Info("onAccountKline", zap.String("acc", account), zap.String("pair", bar.Symbol),
-			zap.String("tf", bar.TimeFrame), zap.String("odNum", numStr))
-	}
 	var wg sync.WaitGroup
 	for _, job := range jobs {
 		job.IsWarmUp = isWarmup

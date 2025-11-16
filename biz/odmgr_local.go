@@ -723,7 +723,7 @@ func simPriceByRate(bar *banexg.Kline, rate float64) (float64, float64, float64)
 			start, end, posRate = openP-pa, highP, (rate-paEndRate)/(aEndRate-paEndRate)
 		} else if rate <= bEndRate {
 			start, end, posRate = highP, lowP, (rate-aEndRate)/(bEndRate-aEndRate)
-			highP = closeP
+			newHigh = closeP
 		} else {
 			start, end, posRate = lowP, closeP, (rate-bEndRate)/(1-bEndRate)
 			newHigh, newLow = closeP, closeP

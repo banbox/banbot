@@ -657,7 +657,7 @@ func (m *Miner) loopKLines(pairs []string) {
 		startMs := utils2.AlignTfMSecs(bntp.UTCStamp(), 60000)
 		for _, p := range newPairs {
 			m.lockBarState.Lock()
-			state, ok := m.klineStates[p]
+			_, ok := m.klineStates[p]
 			m.lockBarState.Unlock()
 			if !ok {
 				exs, err := orm.GetExSymbol(m.exchange, p)
@@ -666,7 +666,7 @@ func (m *Miner) loopKLines(pairs []string) {
 					log.Error("invalid symbol", zap.String("pair", code), zap.Error(err))
 					continue
 				}
-				state = &KLineState{
+				state := &KLineState{
 					Sid:      exs.ID,
 					ExpectMS: startMs,
 				}

@@ -232,6 +232,9 @@ func (p *HistProvider) downIfNeed() *errs.Error {
 
 func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bool) *errs.Error {
 	newHolds, sinceMap, _, err := p.Provider.SubWarmPairs(items, delOther, p.pBar)
+	if err != nil {
+		return err
+	}
 	maxSince := int64(0)
 	holders := make(map[string]IHistKlineFeeder)
 	defSince := btime.TimeMS()
