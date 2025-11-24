@@ -2,6 +2,12 @@ package biz
 
 import (
 	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
@@ -17,11 +23,6 @@ import (
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
-	"math"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
 )
 
 type FuncApplyMyTrade = func(od *ormo.InOutOrder, subOd *ormo.ExOrder, trade *banexg.MyTrade) *errs.Error
@@ -1148,7 +1149,6 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 	case ormo.OdActionLimitEnter, ormo.OdActionLimitExit:
 		err = o.editLimitOd(od, action)
 	case ormo.OdActionTrailing:
-		// 尚未启用，入场单成交后自动调用
 		o.setTrailingStop(od)
 	default:
 		log.Error("unknown od action", zap.String("action", action), zap.String("key", od.Key()))
@@ -2383,6 +2383,15 @@ func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 	if err != nil {
 		log.Error("put trigger fail", zap.String("key", od.Key()), zap.Error(err))
 	} else {
+		oldID := od.GetInfoString(ormo.OdInfoTrailingID)
+		if oldID != "" {
+			_, err = exg.Default.CancelOrder(oldID, od.Symbol, map[string]interface{}{
+				banexg.ParamAccount: o.Account,
+			})
+			if err != nil {
+				log.Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
+			}
+		}
 		od.SetInfo(ormo.OdInfoTrailingID, res.ID)
 	}
 	err = od.Save()

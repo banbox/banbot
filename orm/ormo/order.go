@@ -3,13 +3,14 @@ package ormo
 import (
 	"context"
 	"fmt"
-	"github.com/banbox/banbot/com"
 	"math"
 	"math/rand"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/banbox/banbot/com"
 
 	"github.com/sasha-s/go-deadlock"
 
@@ -681,6 +682,19 @@ func (i *InOutOrder) GetStopLoss() *TriggerState {
 
 func (i *InOutOrder) GetTakeProfit() *TriggerState {
 	return i.GetExitTrigger(OdInfoTakeProfit)
+}
+
+// SetTrailingStop 设置跟踪止损；callbackPct回撤百分比；activationPrice：0立即生效，-1不修改
+func (i *InOutOrder) SetTrailingStop(callbackPct, activationPrice float64) {
+	callPct := i.GetInfoFloat64(OdInfoCallbackPct)
+	if callPct == callbackPct {
+		return
+	}
+	i.SetInfo(OdInfoCallbackPct, callbackPct)
+	if activationPrice >= 0 {
+		i.SetInfo(OdInfoActivePrice, activationPrice)
+	}
+	fireOdEdit(i, OdActionTrailing)
 }
 
 // UpdateTrailing for local order
