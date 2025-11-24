@@ -138,6 +138,8 @@ type EnterReq struct {
 	StopLossLimit   float64 // Stop loss limit price, does not provide the use of StopLoss 止损限制价格，不提供使用StopLoss
 	StopLossRate    float64 // Stop loss exit ratio, 0 means all exits, needs to be between (0,1) 止损退出比例，0表示全部退出，需介于(0,1]之间
 	StopLossTag     string  // Reason for Stop Loss 止损原因
+	ActivationPrice float64 // Activation Price for Trailing Stop 追踪止损激活价格
+	CallbackPct     float64 // Callback Percentage for Trailing Stop 追踪止损回调百分比, [0.1, 10]
 	TakeProfitVal   float64 // The distance from the entry price to the take profit price is used to calculate TakeProfit 入场价格到止盈价格的距离，用于计算TakeProfit
 	TakeProfit      float64 // When the take profit trigger price is not empty, submit a take profit order on the exchange. 止盈触发价格，不为空时在交易所提交一个止盈单。
 	TakeProfitLimit float64 // Profit taking limit price, TakeProfit is not available for use 止盈限制价格，不提供使用TakeProfit

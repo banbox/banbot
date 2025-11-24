@@ -47,14 +47,18 @@ const (
 )
 
 const (
-	OdInfoLegalCost  = "LegalCost"
-	OdInfoStopAfter  = "StopAfter"
-	OdInfoStopBars   = "StopBars"
-	OdInfoStopLoss   = "StopLoss"
-	OdInfoTakeProfit = "TakeProfit"
-	OdInfoClientID   = "ClientID"
-	OdInfoRetry      = "Retry"
-	OdInfoSLTP       = "SL_TP"
+	OdInfoLegalCost    = "LegalCost"
+	OdInfoStopAfter    = "StopAfter"
+	OdInfoStopBars     = "StopBars"
+	OdInfoStopLoss     = "StopLoss"
+	OdInfoCallbackPct  = "CallbackPct"  // 跟踪止损回撤幅度，单位:百分之
+	OdInfoActivePrice  = "ActivePrice"  // 跟踪止损激活价格
+	OdInfoTrailingBest = "TrailingBest" // 跟踪止损利润最大时价格
+	OdInfoTrailingID   = "TrailingID"   // 跟踪止损ID
+	OdInfoTakeProfit   = "TakeProfit"
+	OdInfoClientID     = "ClientID"
+	OdInfoRetry        = "Retry"
+	OdInfoSLTP         = "SL_TP"
 )
 
 const (
@@ -64,4 +68,5 @@ const (
 	OdActionLimitExit  = "LimitExit"
 	OdActionStopLoss   = "StopLoss"
 	OdActionTakeProfit = "TakeProfit"
+	OdActionTrailing   = "Trailing"
 )

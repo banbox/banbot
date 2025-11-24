@@ -400,6 +400,10 @@ func getOrders(c *fiber.Ctx) error {
 				price = com.GetPriceSafe(od.Symbol, "")
 				if price > 0 {
 					od.UpdateProfits(price)
+					err = od.UpdateTrailing(price)
+					if err != nil {
+						return err
+					}
 				}
 			}
 			od.NanInfTo(0)
@@ -491,6 +495,10 @@ func postCalcProfits(c *fiber.Ctx) error {
 		for _, od := range openOds {
 			if price, ok := prices[od.Symbol]; ok {
 				od.UpdateProfits(price)
+				err = od.UpdateTrailing(price)
+				if err != nil {
+					return err
+				}
 			} else {
 				fails[od.Symbol] = true
 			}

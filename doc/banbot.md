@@ -137,6 +137,7 @@ func MyExample(obj *Series, period int) *Series {
 * When checking valid data length, you can use `e.Close.Len()`
 * All banta code executes once per K-line. All indicators should be executed unconditionally at the top of the user's `OnBar`, and additional conditional logic can be defined through `if` statements only after indicator calculations are complete
 * Use `Series.To` to create new series: `BarEnv.NewSeries` will unconditionally create new series, which can cause memory leaks when used inside indicators or `OnBar`. `To` internally prioritizes returning existing Series, and only calls `NewSeries` when it doesn't exist.
+* When comparing the closing price Close with HigherHigh or LowerLow, or performing a Cross, a Back(1) should generally be performed first to take the previous value; otherwise, the closing price will always be lower than HigherHigh or higher than LowerLow, and no signal will be triggered.
 
 
 ### github.com/banbox/banbot/core

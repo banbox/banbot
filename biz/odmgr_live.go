@@ -1147,6 +1147,9 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 		o.editTriggerOd(od, action)
 	case ormo.OdActionLimitEnter, ormo.OdActionLimitExit:
 		err = o.editLimitOd(od, action)
+	case ormo.OdActionTrailing:
+		// 尚未启用，入场单成交后自动调用
+		o.setTrailingStop(od)
 	default:
 		log.Error("unknown od action", zap.String("action", action), zap.String("key", od.Key()))
 		return
@@ -1301,6 +1304,7 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 		if iod.Status == ormo.InOutStatusFullEnter {
 			// Place stop loss and take profit orders only after full entry
 			// 仅在完全入场后，下止损止盈单
+			o.setTrailingStop(iod)
 			o.editTriggerOd(iod, ormo.OdActionStopLoss)
 			o.editTriggerOd(iod, ormo.OdActionTakeProfit)
 		}
@@ -1469,11 +1473,17 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 		} else if isTakeProfit {
 			od.SetExit(0, core.ExitTagTakeProfit, banexg.OdTypeTakeProfit, 0)
 		} else {
-			// TODO: 检查是否是用户主动平仓，用户可能一次性平仓多个，需要更新相关订单状态
-			log.Error(fmt.Sprintf("%s %s subOd %s nil, trade state: %s", o.Account, od.Key(), dirtTag, trade.State))
-			return nil
+			trialID := od.GetInfoString(ormo.OdInfoTrailingID)
+			if trialID == trade.Order {
+				od.SetExit(0, core.ExitTagTrailingStop, banexg.OdTypeMarket, 0)
+			} else {
+				// TODO: 检查是否是用户主动平仓，用户可能一次性平仓多个，需要更新相关订单状态
+				log.Error(fmt.Sprintf("%s %s subOd %s nil, trade state: %s", o.Account, od.Key(), dirtTag, trade.State))
+				return nil
+			}
 		}
 		subOd = od.Exit
+		subOd.UpdateAt = trade.Timestamp
 	}
 	if trade.Timestamp < subOd.UpdateAt {
 		// 收到的订单更新不一定按服务器端顺序。故早于已处理的时间戳的跳过
@@ -1823,6 +1833,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		if od.Status == ormo.InOutStatusFullEnter {
 			// Place stop loss and take profit orders only after full entry
 			// 仅在完全入场后，下止损止盈单
+			o.setTrailingStop(od)
 			o.editTriggerOd(od, ormo.OdActionStopLoss)
 			o.editTriggerOd(od, ormo.OdActionTakeProfit)
 		}
@@ -2334,6 +2345,52 @@ func (o *LiveOrderMgr) editLimitOd(od *ormo.InOutOrder, action string) *errs.Err
 	return o.updateOdByExgRes(od, subOd.Enter, res)
 }
 
+func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
+	callRate := od.GetInfoFloat64(ormo.OdInfoCallbackPct)
+	if callRate <= 0 {
+		return
+	}
+	params := map[string]interface{}{
+		banexg.ParamAccount:       o.Account,
+		banexg.ParamClientOrderId: od.ClientId(true),
+	}
+	if core.IsContract {
+		params[banexg.ParamPositionSide] = "LONG"
+		if od.Short {
+			params[banexg.ParamPositionSide] = "SHORT"
+		}
+	}
+	// 追踪止损
+	odType := banexg.OdTypeTrailingStopMarket
+	activePrice := od.GetInfoFloat64(ormo.OdInfoActivePrice)
+	if activePrice > 0 {
+		params[banexg.ParamActivationPrice] = activePrice
+	}
+	params[banexg.ParamCallbackRate] = callRate
+	retryNum := od.GetInfoInt64(ormo.OdInfoRetry)
+	if retryNum > 0 {
+		params[banexg.ParamRetry] = int(retryNum)
+	}
+	side := banexg.OdSideSell
+	if od.Short {
+		side = banexg.OdSideBuy
+	}
+	amt := od.Enter.Amount
+	log.Debug("set trailing trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
+		zap.Float64("callbackRate", callRate), zap.Float64("qty", amt),
+		zap.Float64("activePrice", activePrice))
+	res, err := exg.Default.CreateOrder(od.Symbol, odType, side, amt, 0, params)
+	if err != nil {
+		log.Error("put trigger fail", zap.String("key", od.Key()), zap.Error(err))
+	} else {
+		od.SetInfo(ormo.OdInfoTrailingID, res.ID)
+	}
+	err = od.Save()
+	if err != nil {
+		log.Error("save order fail", zap.String("key", od.Key()), zap.Error(err))
+	}
+}
+
 func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 	if od.Status >= ormo.InOutStatusFullExit {
 		return
@@ -2378,6 +2435,9 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 	// 这里不应设置ClosePosition仓位止盈止损，否则多策略或多个订单止盈止损会互相覆盖
 	// 双向持仓无需设置ReduceOnly
 	if prefix == ormo.OdActionStopLoss {
+		if tg.Tag == core.ExitTagTrailingStop {
+			return
+		}
 		params[banexg.ParamStopLossPrice] = tg.Price
 	} else if prefix == ormo.OdActionTakeProfit {
 		params[banexg.ParamTakeProfitPrice] = tg.Price

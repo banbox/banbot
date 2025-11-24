@@ -154,6 +154,9 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		AddAccFailOpen(s.Account, FailOpenNanNum)
 		return errs.NewMsg(errs.CodeParamInvalid, "nan in EnterReq")
 	}
+	if req.CallbackPct > 0 && (req.CallbackPct < 0.1 || req.CallbackPct > 10) {
+		return errs.NewMsg(errs.CodeParamInvalid, "CallbackPct should be in [0.1, 10]")
+	}
 	// 检查价格是否有效
 	dirFlag := 1.0
 	if req.Short {

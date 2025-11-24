@@ -137,6 +137,7 @@ func MyExample(obj *Series, period int) *Series {
 * 检查有效数据长度时，可使用`e.Close.Len()`
 * banta的所有代码都是每个K线执行一次，所有指标应该在用户的`OnBar`顶部无条件执行，指标计算完之后才可通过`if`等定义额外条件逻辑
 * 创建新序列使用`Series.To`：`BarEnv.NewSeries`会无条件创建新序列，在指标内或`OnBar`中使用会导致内存泄露。而`To`内部会优先返回已存在的Series，不存在时才调用`NewSeries`。
+* 当需要将收盘价Close与HighestHigh或LowesLow比较或进行Cross时，一般应先进行Back(1)，取前一个，否则收盘价永远低于HighestHigh或高于LowesLow不会触发信号
 
 ### github.com/banbox/banbot/core
 ```go

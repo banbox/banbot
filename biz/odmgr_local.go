@@ -340,6 +340,10 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	od.Status = ormo.InOutStatusFullEnter
 	od.DirtyEnter = true
 	od.DirtyMain = true
+	err = od.UpdateTrailing(entPrice)
+	if err != nil {
+		return err
+	}
 	if core.LiveMode {
 		err = od.Save()
 		if err != nil {

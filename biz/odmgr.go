@@ -452,6 +452,12 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 		}
 	}
 	od.SetInfo(ormo.OdInfoLegalCost, req.LegalCost)
+	if req.CallbackPct > 0 {
+		od.SetInfo(ormo.OdInfoCallbackPct, req.CallbackPct)
+		if req.ActivationPrice > 0 {
+			od.SetInfo(ormo.OdInfoActivePrice, req.ActivationPrice)
+		}
+	}
 	if req.StopLoss > 0 {
 		err := od.SetExitTrigger(ormo.OdInfoStopLoss, &ormo.ExitTrigger{
 			Price: req.StopLoss,
@@ -759,6 +765,18 @@ func (o *OrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) 
 			continue
 		}
 		od.UpdateProfits(bar.Close)
+		activePrice := od.GetInfoFloat64(ormo.OdInfoActivePrice)
+		if activePrice > 0 {
+			if od.Short && activePrice >= bar.Close || !od.Short && activePrice <= bar.High {
+				od.SetInfo(ormo.OdInfoActivePrice, 0)
+			} else {
+				continue
+			}
+		}
+		err := od.UpdateTrailing(bar.Close)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

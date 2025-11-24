@@ -51,7 +51,7 @@ var (
 	LockOdMatch sync.RWMutex
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.2.26-beta.1"
+	Version   = "v0.2.27"
 	UIVersion = "v0.2.24"
 	SysLang   string // language code for current system 当前系统语言设置
 	LogFile   string
@@ -107,26 +107,27 @@ const (
 )
 
 const (
-	ExitTagUnknown     = "unknown"
-	ExitTagCancel      = "cancel"
-	ExitTagHedgeOff    = "hedge_off"
-	ExitTagBotStop     = "bot_stop"
-	ExitTagForceExit   = "force_exit"
-	ExitTagNoMatch     = "no_match"
-	ExitTagUserExit    = "user_exit"
-	ExitTagThird       = "third"
-	ExitTagCli         = "cli"
-	ExitTagFatalErr    = "fatal_err"
-	ExitTagPairDel     = "pair_del"
-	ExitTagStopLoss    = "stop_loss"
-	ExitTagSLTake      = "sl_take"
-	ExitTagTakeProfit  = "take_profit"
-	ExitTagDrawDown    = "draw_down"
-	ExitTagDataStuck   = "data_stuck"
-	ExitTagLiquidation = "liquidation"
-	ExitTagEnvEnd      = "env_end"
-	ExitTagEntExp      = "ent_expire" // enter limit expired
-	ExitTagExitDelay   = "exit_delay"
+	ExitTagUnknown      = "unknown"
+	ExitTagCancel       = "cancel"
+	ExitTagHedgeOff     = "hedge_off"
+	ExitTagBotStop      = "bot_stop"
+	ExitTagForceExit    = "force_exit"
+	ExitTagNoMatch      = "no_match"
+	ExitTagUserExit     = "user_exit"
+	ExitTagThird        = "third"
+	ExitTagCli          = "cli"
+	ExitTagFatalErr     = "fatal_err"
+	ExitTagPairDel      = "pair_del"
+	ExitTagStopLoss     = "stop_loss"
+	ExitTagSLTake       = "sl_take"
+	ExitTagTrailingStop = "trailing_stop"
+	ExitTagTakeProfit   = "take_profit"
+	ExitTagDrawDown     = "draw_down"
+	ExitTagDataStuck    = "data_stuck"
+	ExitTagLiquidation  = "liquidation"
+	ExitTagEnvEnd       = "env_end"
+	ExitTagEntExp       = "ent_expire" // enter limit expired
+	ExitTagExitDelay    = "exit_delay"
 )
 
 var (

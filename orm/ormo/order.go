@@ -683,6 +683,64 @@ func (i *InOutOrder) GetTakeProfit() *TriggerState {
 	return i.GetExitTrigger(OdInfoTakeProfit)
 }
 
+// UpdateTrailing for local order
+func (i *InOutOrder) UpdateTrailing(price float64) *errs.Error {
+	callPct := i.GetInfoFloat64(OdInfoCallbackPct)
+	if callPct > 0 {
+		// 有跟踪止损
+		activePrice := i.GetInfoFloat64(OdInfoActivePrice)
+		if activePrice > 0 {
+			if i.Short && activePrice < price || !i.Short && activePrice > price {
+				return nil
+			}
+			i.SetInfo(OdInfoActivePrice, 0)
+		}
+		trailBest := i.GetInfoFloat64(OdInfoTrailingBest)
+		if trailBest <= 0 {
+			trailBest = price
+		} else if i.Short {
+			if trailBest <= price {
+				return nil
+			}
+			trailBest = price
+		} else {
+			if trailBest >= price {
+				return nil
+			}
+			trailBest = price
+		}
+		i.SetInfo(OdInfoTrailingBest, trailBest)
+		if i.Short {
+			callPct = -callPct
+		}
+		slPrice := trailBest * (1 - callPct/100)
+		sl := i.GetStopLoss()
+		var err *errs.Error
+		if sl == nil {
+			err = i.SetExitTrigger(OdInfoStopLoss, &ExitTrigger{
+				Price: slPrice,
+				Tag:   core.ExitTagTrailingStop,
+			}, price)
+			if err != nil {
+				return err
+			}
+		} else if i.Short {
+			if sl.Price <= 0 || slPrice < sl.Price {
+				sl.Price = slPrice
+				if sl.Limit != 0 {
+					sl.Limit = min(slPrice, sl.Limit)
+				}
+			}
+		} else if sl.Price <= 0 || slPrice > sl.Price {
+			sl.Price = slPrice
+			if sl.Limit != 0 {
+				sl.Limit = max(slPrice, sl.Limit)
+			}
+		}
+	}
+	return nil
+}
+
 /*
 ClientId
 Generate the exchange's ClientOrderId
