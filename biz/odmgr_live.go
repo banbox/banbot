@@ -2348,6 +2348,20 @@ func (o *LiveOrderMgr) editLimitOd(od *ormo.InOutOrder, action string) *errs.Err
 func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 	callRate := od.GetInfoFloat64(ormo.OdInfoCallbackPct)
 	if callRate <= 0 {
+		// 取消跟踪止损
+		oldID := od.GetInfoString(ormo.OdInfoTrailingID)
+		if oldID != "" {
+			_, err := exg.Default.CancelOrder(oldID, od.Symbol, map[string]interface{}{
+				banexg.ParamAccount: o.Account,
+			})
+			if err != nil {
+				log.Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
+			}
+			od.SetInfo(ormo.OdInfoCallbackPct, 0.0)
+			od.SetInfo(ormo.OdInfoActivePrice, nil)
+			od.SetInfo(ormo.OdInfoTrailingID, "")
+			od.SetInfo(ormo.OdInfoTrailingBest, nil)
+		}
 		return
 	}
 	params := map[string]interface{}{

@@ -684,17 +684,23 @@ func (i *InOutOrder) GetTakeProfit() *TriggerState {
 	return i.GetExitTrigger(OdInfoTakeProfit)
 }
 
-// SetTrailingStop 设置跟踪止损；callbackPct回撤百分比；activationPrice：0立即生效，-1不修改
-func (i *InOutOrder) SetTrailingStop(callbackPct, activationPrice float64) {
+// SetTrailingStop 设置跟踪止损
+// callbackPct回撤百分比；0取消，有效值[0.1, 10]
+// activationPrice：0立即生效，-1不修改，>0具体激活价格
+func (i *InOutOrder) SetTrailingStop(callbackPct, activationPrice float64) *errs.Error {
 	callPct := i.GetInfoFloat64(OdInfoCallbackPct)
 	if callPct == callbackPct {
-		return
+		return nil
+	}
+	if callbackPct > 0 && (callbackPct < 0.1 || callbackPct > 10) {
+		return errs.NewMsg(errs.CodeParamInvalid, "callbackPct should be in [0.1, 10]")
 	}
 	i.SetInfo(OdInfoCallbackPct, callbackPct)
 	if activationPrice >= 0 {
 		i.SetInfo(OdInfoActivePrice, activationPrice)
 	}
 	fireOdEdit(i, OdActionTrailing)
+	return nil
 }
 
 // UpdateTrailing for local order
