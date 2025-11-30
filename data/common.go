@@ -2,6 +2,9 @@ package data
 
 import (
 	"context"
+	"time"
+
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
@@ -12,7 +15,6 @@ import (
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
-	"time"
 )
 
 type periodSta struct {
@@ -74,7 +76,7 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 				return
 			}
 			var newEndMS int64
-			newEndMS, err = downKlineTo(sess, sid, "1m", prevMS, mntAlign)
+			newEndMS, _, err = downKlineTo(sess, sid, "1m", prevMS, mntAlign)
 			if err != nil {
 				mntSta.reset(sid, newEndMS)
 				log.Error("down kline 1m fail", zap.Int32("sid", sid), zap.Error(err))
@@ -91,7 +93,7 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 			mntAlign, prevMS := mntSta.alignAndLast(sess, sid, "1m", expEndMS)
 			if mntAlign > prevMS {
 				// 有缺口，需要先下载缺失部分
-				nextMS, err = downKlineTo(sess, sid, job.TimeFrame, prevMS, expEndMS)
+				nextMS, _, err = downKlineTo(sess, sid, job.TimeFrame, prevMS, expEndMS)
 				if nextMS < expEndMS {
 					log.Warn("fetch lack 1m bad", zap.Int32("sid", sid), zap.Int64("end", endMS),
 						zap.Int64("expEnd", expEndMS))
@@ -122,7 +124,7 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 			// 下载1h及以上周期K线数据
 			hourAlign, lastMS := hourSta.alignAndLast(sess, sid, "1h", endMS)
 			if hourAlign > lastMS {
-				_, err = downKlineTo(sess, sid, "1h", lastMS, hourAlign)
+				_, _, err = downKlineTo(sess, sid, "1h", lastMS, hourAlign)
 			}
 		}
 	}
@@ -133,7 +135,7 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 	}
 }
 
-func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int64) (int64, *errs.Error) {
+func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int64) (int64, *banexg.Kline, *errs.Error) {
 	if oldEndMS == 0 {
 		_, oldEndMS = sess.GetKlineRange(sid, tf)
 	}
@@ -142,14 +144,14 @@ func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int6
 	if oldEndMS == 0 || toEndMS <= oldEndMS {
 		// The new coin has no historical data, or the current bar and the inserted data are continuous, and the subsequent new bar can be directly inserted
 		// 新的币无历史数据、或当前bar和已插入数据连续，直接插入后续新bar即可
-		return oldEndMS, nil
+		return oldEndMS, nil, nil
 	}
 	exs := orm.GetSymbolByID(sid)
 	tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 	tryCount := 0
 	exchange, err := exg.GetWith(exs.Exchange, exs.Market, "")
 	if err != nil {
-		return oldEndMS, err
+		return oldEndMS, nil, err
 	}
 	var newEndMS = oldEndMS
 	var saveNum int
@@ -159,21 +161,23 @@ func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int6
 			orm.DebugDownKLine = false
 		}()
 	}
+	var last *banexg.Kline
 	for tryCount <= 5 {
 		tryCount += 1
 		saveNum, err = sess.DownOHLCV2DB(exchange, exs, tf, oldEndMS, toEndMS, nil)
 		if err != nil {
 			_, oldEndMS = sess.GetKlineRange(sid, tf)
-			return oldEndMS, err
+			return oldEndMS, nil, err
 		}
 		saveBars, err := sess.QueryOHLCV(exs, tf, 0, 0, 1, false)
 		if err != nil {
 			_, oldEndMS = sess.GetKlineRange(sid, tf)
-			return oldEndMS, err
+			return oldEndMS, nil, err
 		}
 		var lastMS = int64(0)
 		if len(saveBars) > 0 {
-			lastMS = saveBars[len(saveBars)-1].Time
+			last = saveBars[len(saveBars)-1]
+			lastMS = last.Time
 			newEndMS = lastMS + tfMSecs
 		}
 		if newEndMS >= toEndMS {
@@ -188,7 +192,43 @@ func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int6
 			core.Sleep(time.Second * 2)
 		}
 	}
-	return newEndMS, nil
+	return newEndMS, last, nil
+}
+
+func DownEmitHourKlines(dp *LiveProvider, endsMap map[int32]int64) {
+	sess, conn, err := orm.Conn(nil)
+	if err != nil {
+		log.Error("get kline Conn fail", zap.Error(err))
+		return
+	}
+	defer conn.Release()
+	curMS := btime.UTCStamp()
+	curEndMS := utils2.AlignTfMSecs(curMS, 3600000)
+	for exsID, lastEnd := range endsMap {
+		exs := orm.GetSymbolByID(exsID)
+		if exs == nil {
+			continue
+		}
+		newEnd, last, err := downKlineTo(sess, exs.ID, "1h", lastEnd, curEndMS)
+		if err != nil {
+			log.Error("downKlineTo 1h fail", zap.Int32("sid", exs.ID), zap.Error(err))
+			continue
+		}
+		endsMap[exsID] = newEnd
+		if last == nil {
+			continue
+		}
+		dp.OnKLineMsg(&KLineMsg{
+			NotifyKLines: NotifyKLines{
+				TFSecs:   3600,
+				Interval: 3600,
+				Arr:      []*banexg.Kline{last},
+			},
+			ExgName: core.ExgName,
+			Market:  core.Market,
+			Pair:    exs.Symbol,
+		})
+	}
 }
 
 /*

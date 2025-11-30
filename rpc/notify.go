@@ -2,22 +2,22 @@ package rpc
 
 import (
 	"fmt"
+	"maps"
+	"sync"
+
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	utils2 "github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
-	"maps"
+	"go.uber.org/zap"
 )
 
 var (
 	channels = make([]IWebHook, 0, 2)
+	initOnce sync.Once
 )
-
-func InitRPC() *errs.Error {
-	return initWebHooks()
-}
 
 func initWebHooks() *errs.Error {
 	if len(config.RPCChannels) == 0 {
@@ -77,6 +77,12 @@ func initWebHooks() *errs.Error {
 }
 
 func SendMsg(msg map[string]interface{}) {
+	initOnce.Do(func() {
+		err := initWebHooks()
+		if err != nil {
+			log.Error("init rpc fail", zap.Error(err))
+		}
+	})
 	if len(channels) == 0 {
 		return
 	}

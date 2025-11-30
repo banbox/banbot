@@ -21,10 +21,6 @@ func TestTrySendExc(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	err = InitRPC()
-	if err != nil {
-		panic(err)
-	}
 	key := "testMsg"
 	text := "this is tpl:"
 	count := 0

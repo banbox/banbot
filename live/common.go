@@ -2,6 +2,13 @@ package live
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
@@ -18,12 +25,6 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
-	"os"
-	"path/filepath"
-	"slices"
-	"strconv"
-	"strings"
-	"time"
 )
 
 var (
@@ -47,6 +48,31 @@ func CronRefreshPairs(dp data.IProvider) {
 		if err_ != nil {
 			log.Error("add RefreshPairList fail", zap.Error(err_))
 		}
+	}
+}
+
+func FetchHourKlines(dp *data.LiveProvider) {
+	endMap := make(map[int32]int64)
+	_, err := com.Cron().AddFunc("0 0 * * * *", func() {
+		exsList := orm.GetHourOnlySymbols()
+		if len(exsList) == 0 {
+			return
+		}
+		log.Info("FetchHourKlines", zap.Int("num", len(exsList)))
+		for sid := range exsList {
+			if _, ok := endMap[sid]; !ok {
+				endMap[sid] = 0
+			}
+		}
+		for sid := range endMap {
+			if _, ok := exsList[sid]; !ok {
+				delete(endMap, sid)
+			}
+		}
+		data.DownEmitHourKlines(dp, endMap)
+	})
+	if err != nil {
+		log.Error("add FetchHourKlines fail", zap.Error(err))
 	}
 }
 

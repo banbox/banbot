@@ -2,6 +2,8 @@ package data
 
 import (
 	"fmt"
+	"strings"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/core"
@@ -13,7 +15,6 @@ import (
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
-	"strings"
 )
 
 type KLineWatcher struct {

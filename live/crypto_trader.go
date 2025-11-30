@@ -2,12 +2,13 @@ package live
 
 import (
 	"fmt"
+	"strings"
+	"time"
+
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg/utils"
-	"strings"
-	"time"
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
@@ -47,10 +48,6 @@ func (t *CryptoTrader) Init() *errs.Error {
 	// Trading pair initialization
 	// 交易对初始化
 	err = orm.InitListDates()
-	if err != nil {
-		return err
-	}
-	err = rpc.InitRPC()
 	if err != nil {
 		return err
 	}
@@ -175,6 +172,8 @@ func (t *CryptoTrader) startJobs() {
 	// Refresh trading pairs regularly
 	// 定期刷新交易对
 	CronRefreshPairs(t.dp)
+	// 定时加载1h及以上周期K线
+	FetchHourKlines(t.dp)
 	// Refresh the market regularly
 	// 定时刷新市场行情
 	CronLoadMarkets()

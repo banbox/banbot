@@ -2,6 +2,10 @@ package opt
 
 import (
 	"fmt"
+	"math"
+	"os"
+	"time"
+
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
@@ -16,9 +20,6 @@ import (
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/cron/v3"
 	"go.uber.org/zap"
-	"math"
-	"os"
-	"time"
 )
 
 const (
@@ -357,6 +358,7 @@ func RefreshPairJobs(dp data.IProvider, showLog, isFirst bool, pBar *utils.Stage
 	if err != nil {
 		return err
 	}
+	orm.ResetSubSymbol()
 	// warm up for new symbols
 	return dp.SubWarmPairs(warms, true)
 }

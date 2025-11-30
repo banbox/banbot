@@ -3,6 +3,8 @@ package orm
 import (
 	"context"
 	"fmt"
+	"strings"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -13,16 +15,18 @@ import (
 	"github.com/banbox/banexg/log"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
-	"strings"
 )
 
 var (
-	keySymbolMap = make(map[string]*ExSymbol)
-	idSymbolMap  = make(map[int32]*ExSymbol)
-	marketMap    = make(map[string]int)
-	symbolLock   deadlock.Mutex
-	tryListIds   = make(map[int32]bool)
-	tryListLock  deadlock.Mutex
+	keySymbolMap  = make(map[string]*ExSymbol)
+	idSymbolMap   = make(map[int32]*ExSymbol)
+	marketMap     = make(map[string]int)
+	pairsMap      = make(map[string]*ExSymbol) // 获取1m的品种
+	hourPairsMap  = make(map[string]*ExSymbol) // 只获取1h及以上的品种
+	symbolLock    deadlock.Mutex
+	tryListIds    = make(map[int32]bool)
+	tryListLock   deadlock.Mutex
+	hourPairsLock deadlock.Mutex
 )
 
 func (q *Queries) LoadExgSymbols(exgName string) *errs.Error {
@@ -517,4 +521,35 @@ func ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
 		return nil, err
 	}
 	return item, nil
+}
+
+func AddHourSymbol(exs *ExSymbol) {
+	hourPairsLock.Lock()
+	hourPairsMap[exs.Symbol] = exs
+	hourPairsLock.Unlock()
+}
+
+func Sub1mSymbol(pair string) {
+	hourPairsLock.Lock()
+	pairsMap[pair] = nil
+	hourPairsLock.Unlock()
+}
+
+func ResetSubSymbol() {
+	hourPairsLock.Lock()
+	hourPairsMap = make(map[string]*ExSymbol)
+	pairsMap = make(map[string]*ExSymbol)
+	hourPairsLock.Unlock()
+}
+
+func GetHourOnlySymbols() map[int32]*ExSymbol {
+	hourPairsLock.Lock()
+	res := make(map[int32]*ExSymbol)
+	for _, exs := range hourPairsMap {
+		if _, ok := pairsMap[exs.Symbol]; !ok {
+			res[exs.ID] = exs
+		}
+	}
+	hourPairsLock.Unlock()
+	return res
 }

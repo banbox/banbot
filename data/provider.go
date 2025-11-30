@@ -2,12 +2,13 @@ package data
 
 import (
 	"fmt"
-	"github.com/banbox/banbot/com"
-	"github.com/banbox/banbot/strat"
-	"github.com/sasha-s/go-deadlock"
 	"maps"
 	"math"
 	"sort"
+
+	"github.com/banbox/banbot/com"
+	"github.com/banbox/banbot/strat"
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -516,7 +517,6 @@ func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 	}
 	if len(newHolds) > 0 {
 		var jobs []WatchJob
-		var down1mPairs = make(map[int32]*orm.ExSymbol)
 		var minSince = btime.UTCStamp()
 		for _, h := range newHolds {
 			sta := h.getStates()[0]
@@ -534,18 +534,9 @@ func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 				if err != nil {
 					return err
 				}
-				down1mPairs[exs.ID] = exs
-			}
-		}
-		if len(down1mPairs) > 0 {
-			// 对1h及以上大周期，也需要对1m的K线数据提前下载到最新，避免spider下载耗时过久
-			exchange, err := exg.GetWith(core.ExgName, core.Market, "")
-			if err != nil {
-				return err
-			}
-			err = orm.BulkDownOHLCV(exchange, down1mPairs, "1m", minSince, btime.UTCStamp(), 0, nil)
-			if err != nil {
-				return err
+				orm.AddHourSymbol(exs)
+			} else {
+				orm.Sub1mSymbol(symbol)
 			}
 		}
 		err = p.WatchJobs(core.ExgName, core.Market, "ohlcv", jobs...)

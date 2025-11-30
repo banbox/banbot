@@ -2,11 +2,12 @@ package btime
 
 import (
 	"fmt"
-	"github.com/banbox/banbot/core"
-	"github.com/banbox/bntp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/bntp"
 )
 
 var (
@@ -243,8 +244,8 @@ func ToDateStrLoc(timestamp int64, format string) string {
 
 func ToTime(timestamp int64) time.Time {
 	var t time.Time
-	if timestamp > 1000000000000 {
-		// 13位毫秒时间戳
+	if timestamp >= 1e11 {
+		// 13位毫秒时间戳(至少12位数)
 		seconds := timestamp / 1000             // 秒
 		nanoseconds := (timestamp % 1000) * 1e6 // 毫秒转为纳秒
 		t = time.Unix(seconds, nanoseconds)
