@@ -104,7 +104,7 @@ func CronFatalLossCheck() {
 	}
 }
 
-func CronKlineDelays() {
+func CronKlineDelays(dp *data.LiveProvider) {
 	logDelay := func(msgText string) {
 		curMS := btime.TimeMS()
 		log.Warn(msgText)
@@ -120,6 +120,10 @@ func CronKlineDelays() {
 	}
 	stuckCount := 0
 	_, err_ := com.Cron().AddFunc("30 * * * * *", func() {
+		jobs := dp.GetJobs("ohlcv")
+		if len(jobs) == 0 {
+			return
+		}
 		curMS := btime.TimeMS()
 		delaySecs := int((curMS - core.LastCopiedMs) / 1000)
 		if delaySecs > 120 {

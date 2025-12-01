@@ -521,12 +521,8 @@ func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 		for _, h := range newHolds {
 			sta := h.getStates()[0]
 			symbol := h.getSymbol()
-			if since, ok := sinceMap[symbol]; ok {
-				jobs = append(jobs, WatchJob{
-					Symbol:    symbol,
-					TimeFrame: sta.TimeFrame,
-					Since:     since,
-				})
+			since, ok := sinceMap[symbol]
+			if ok {
 				minSince = min(minSince, since)
 			}
 			if sta.TFSecs >= 3600 {
@@ -536,12 +532,21 @@ func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 				}
 				orm.AddHourSymbol(exs)
 			} else {
+				if ok {
+					jobs = append(jobs, WatchJob{
+						Symbol:    symbol,
+						TimeFrame: sta.TimeFrame,
+						Since:     since,
+					})
+				}
 				orm.Sub1mSymbol(symbol)
 			}
 		}
-		err = p.WatchJobs(core.ExgName, core.Market, "ohlcv", jobs...)
-		if err != nil {
-			return err
+		if len(jobs) > 0 {
+			err = p.WatchJobs(core.ExgName, core.Market, "ohlcv", jobs...)
+			if err != nil {
+				return err
+			}
 		}
 		for msgType, pairMap := range strat.WsSubJobs {
 			jobs = make([]WatchJob, 0, len(pairMap))

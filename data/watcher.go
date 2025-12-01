@@ -2,7 +2,9 @@ package data
 
 import (
 	"fmt"
+	"maps"
 	"strings"
+	"sync"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
@@ -19,7 +21,8 @@ import (
 
 type KLineWatcher struct {
 	*utils.ClientIO
-	jobs       map[string]*PairTFCache
+	jobs       map[string]map[string]*PairTFCache
+	jobLock    sync.RWMutex
 	initMsgs   []*utils.IOMsg
 	OnKLineMsg func(msg *KLineMsg) // 收到爬虫K线消息
 	OnTrades   func(exgName, market, pair string, trades []*banexg.Trade)
@@ -51,7 +54,7 @@ func NewKlineWatcher(addr string) (*KLineWatcher, *errs.Error) {
 	}
 	res := &KLineWatcher{
 		ClientIO: client,
-		jobs:     make(map[string]*PairTFCache),
+		jobs:     make(map[string]map[string]*PairTFCache),
 	}
 	res.Listens[core.WsSubKLine] = res.onSpiderBar
 	res.Listens["ohlcv"] = res.onSpiderBar
@@ -83,6 +86,45 @@ func (w *KLineWatcher) getPrefix(exgName, marketType, jobType string) string {
 	return fmt.Sprintf("%s_%s_%s_", jobType, exgName, marketType)
 }
 
+func (w *KLineWatcher) GetJob(msgType, symbol string) *PairTFCache {
+	w.jobLock.RLock()
+	pairMap, ok := w.jobs[msgType]
+	if ok {
+		job, _ := pairMap[symbol]
+		w.jobLock.RUnlock()
+		return job
+	}
+	w.jobLock.RUnlock()
+	return nil
+}
+
+func (w *KLineWatcher) GetJobs(msgType string) map[string]*PairTFCache {
+	w.jobLock.RLock()
+	pairMap, _ := w.jobs[msgType]
+	var res map[string]*PairTFCache
+	if len(pairMap) > 0 {
+		res = maps.Clone(pairMap)
+	}
+	w.jobLock.RUnlock()
+	return res
+}
+
+// job=nil means delete
+func (w *KLineWatcher) setJob(msgType, symbol string, job *PairTFCache) {
+	w.jobLock.Lock()
+	pairMap, ok := w.jobs[msgType]
+	if job != nil {
+		if !ok {
+			pairMap = make(map[string]*PairTFCache)
+			w.jobs[msgType] = pairMap
+		}
+		pairMap[symbol] = job
+	} else if len(pairMap) > 0 {
+		delete(pairMap, symbol)
+	}
+	w.jobLock.Unlock()
+}
+
 /*
 WatchJobs
 Subscribe data from crawlers.
@@ -99,8 +141,8 @@ func (w *KLineWatcher) WatchJobs(exgName, marketType, jobType string, jobs ...Wa
 	}
 	exgID := exchange.Info().ID
 	for _, j := range jobs {
-		jobKey := fmt.Sprintf("%s_%s", j.Symbol, jobType)
-		if _, ok := w.jobs[jobKey]; ok {
+		job := w.GetJob(jobType, j.Symbol)
+		if job != nil {
 			continue
 		}
 		tfSecs := utils2.TFToSecs(j.TimeFrame)
@@ -110,8 +152,8 @@ func (w *KLineWatcher) WatchJobs(exgName, marketType, jobType string, jobs ...Wa
 		}
 		pairs = append(pairs, j.Symbol)
 		alignOffMs := int64(exg.GetAlignOff(exgID, tfSecs) * 1000)
-		w.jobs[jobKey] = &PairTFCache{TimeFrame: j.TimeFrame, TFSecs: tfSecs, SubNextMS: j.Since,
-			AlignOffMS: alignOffMs}
+		w.setJob(jobType, j.Symbol, &PairTFCache{TimeFrame: j.TimeFrame, TFSecs: tfSecs, SubNextMS: j.Since,
+			AlignOffMS: alignOffMs})
 		if j.Since > 0 {
 			// 尽早启动延迟监听，避免spider始终未发送k线
 			tfMSecs := int64(tfSecs * 1000)
@@ -152,8 +194,7 @@ func (w *KLineWatcher) UnWatchJobs(exgName, marketType, jobType string, pairs []
 		if strings.HasSuffix(prefix, "_") {
 			tags = append(tags, prefix+pair)
 		}
-		jobKey := fmt.Sprintf("%s_%s", pair, jobType)
-		delete(w.jobs, jobKey)
+		w.setJob(jobType, pair, nil)
 		com.DelPairCopieds(pair)
 	}
 	if len(tags) == 0 {
@@ -171,8 +212,8 @@ func (w *KLineWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
 	}
 	parts := strings.Split(key, "_")
 	msgType, exgName, market, pair := parts[0], parts[1], parts[2], parts[3]
-	job, ok := w.jobs[fmt.Sprintf("%s_%s", pair, msgType)]
-	if !ok {
+	job := w.GetJob(msgType, pair)
+	if job == nil {
 		// 未监听，忽略
 		log.Debug("spider bar ignored", zap.String("key", key))
 		return
@@ -291,8 +332,8 @@ func (w *KLineWatcher) onBook(msg *utils.IOMsgRaw) {
 	if exgName != core.ExgName || market != core.Market {
 		return
 	}
-	_, ok := w.jobs[fmt.Sprintf("%s_%s", pair, msgType)]
-	if !ok {
+	job := w.GetJob(msgType, pair)
+	if job == nil {
 		// 未监听，忽略
 		return
 	}

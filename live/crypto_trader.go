@@ -182,7 +182,7 @@ func (t *CryptoTrader) startJobs() {
 	CronFatalLossCheck()
 	// Regularly check the candlestick timeout, updated every minute
 	// 定期检查K线超时，每分钟更新
-	CronKlineDelays()
+	CronKlineDelays(t.dp)
 	// The timer output is executed every 5 minutes: 01:30 06:30 11:30
 	// 定时输出收到K线情况，每5分钟执行：01:30  06:30  11:30
 	CronKlineSummary()
