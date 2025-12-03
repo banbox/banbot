@@ -2,10 +2,11 @@ package biz
 
 import (
 	"fmt"
-	"github.com/banbox/banbot/com"
 	"math"
 	"strings"
 	"sync"
+
+	"github.com/banbox/banbot/com"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -70,11 +71,18 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 			if len(allOrders) > 0 {
 				// The order status may be modified here
 				// 这里可能修改订单状态
-				accOrders[account] = allOrders
 				err = odMgr.UpdateByBar(allOrders, bar)
 				if err != nil {
 					return err
 				}
+				// 筛选仍然未平仓的订单
+				newOpens := make([]*ormo.InOutOrder, 0, len(allOrders))
+				for _, od := range allOrders {
+					if od.Status < ormo.InOutStatusFullExit {
+						newOpens = append(newOpens, od)
+					}
+				}
+				accOrders[account] = newOpens
 			}
 		}
 	}
