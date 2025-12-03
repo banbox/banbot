@@ -123,6 +123,35 @@ func GetConfig(args *CmdArgs, showLog bool) (*Config, *errs.Error) {
 			paths = append(paths, configPaths...)
 		}
 	}
+
+	// Handle ConfigData if provided
+	if args.ConfigData != "" {
+		// Create temporary file for ConfigData
+		tmpFile, err := os.CreateTemp("", "config_data_*.yml")
+		if err != nil {
+			return nil, errs.New(errs.CodeIOReadFail, err)
+		}
+		tmpPath := tmpFile.Name()
+
+		// Write ConfigData to temporary file
+		if _, err := tmpFile.WriteString(args.ConfigData); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return nil, errs.New(errs.CodeIOWriteFail, err)
+		}
+		tmpFile.Close()
+
+		// Add temporary file path to paths
+		paths = append(paths, tmpPath)
+
+		// Defer removal of temporary file
+		defer func() {
+			if err := os.Remove(tmpPath); err != nil {
+				log.Warn("Failed to remove temporary config file: " + err.Error())
+			}
+		}()
+	}
+
 	res, err2 := ParseConfigs(paths, showLog)
 	if err2 != nil {
 		return nil, err2

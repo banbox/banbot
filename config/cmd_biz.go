@@ -2,9 +2,10 @@ package config
 
 import (
 	"flag"
+	"time"
+
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
-	"time"
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
@@ -76,6 +77,7 @@ func (a *CmdArgs) BindToFlag(cmd *flag.FlagSet, disables []string) {
 	cmd.StringVar(&a.DataDir, "datadir", "", "Path to data dir.")
 	cmd.Var(&a.Configs, "config", "config path to use, Multiple -config options may be used")
 	cmd.BoolVar(&a.NoDefault, "no-default", false, "ignore default: config.yml, config.local.yml")
+	cmd.StringVar(&a.ConfigData, "config-data", "", "yaml config string")
 	cmd.StringVar(&a.Logfile, "logfile", "", "Log to the file specified")
 	cmd.StringVar(&a.LogLevel, "level", "info", "set logging level to debug")
 	//cmd.BoolVar(&a.NoCompress, "no-compress", false, "disable compress for hyper table")

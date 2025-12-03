@@ -13,6 +13,7 @@ func (i *ArrString) Set(value string) error {
 
 type CmdArgs struct {
 	Configs       ArrString
+	ConfigData    string
 	Logfile       string
 	DataDir       string
 	NoCompress    bool
