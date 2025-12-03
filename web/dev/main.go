@@ -37,6 +37,7 @@ func Run(args []string) error {
 	f.StringVar(&ag.LogLevel, "level", "info", "log level")
 	f.StringVar(&ag.TimeZone, "tz", "", "timezone")
 	f.StringVar(&ag.DataDir, "datadir", "", "Path to data dir.")
+	f.StringVar(&ag.ConfigData, "config-data", "", "yaml config string")
 	f.Var(&ag.Configs, "config", "config path to use, Multiple -config options may be used")
 	f.StringVar(&ag.LogFile, "logfile", "", "log file path, default: system temp dir")
 	f.StringVar(&ag.DBFile, "db", "dev.db", "db file path")
@@ -66,10 +67,11 @@ func Run(args []string) error {
 	// 初始化基础数据
 	core.SetRunMode(core.RunModeLive)
 	banArg := &config.CmdArgs{
-		DataDir:  ag.DataDir,
-		LogLevel: ag.LogLevel,
-		TimeZone: ag.TimeZone,
-		Configs:  ag.Configs,
+		DataDir:    ag.DataDir,
+		LogLevel:   ag.LogLevel,
+		TimeZone:   ag.TimeZone,
+		Configs:    ag.Configs,
+		ConfigData: ag.ConfigData,
 	}
 	core.DevDbPath = ag.DBFile
 	var err2 *errs.Error

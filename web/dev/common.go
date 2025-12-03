@@ -3,8 +3,6 @@ package dev
 import (
 	"context"
 	"fmt"
-	"github.com/banbox/banbot/com"
-	"github.com/sasha-s/go-deadlock"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/banbox/banbot/com"
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/orm/ormo"
 
@@ -29,14 +30,15 @@ import (
 )
 
 type CmdArgs struct {
-	Port     int
-	Host     string
-	Configs  config.ArrString
-	DataDir  string
-	LogLevel string
-	LogFile  string
-	TimeZone string
-	DBFile   string
+	Port       int
+	Host       string
+	Configs    config.ArrString
+	ConfigData string
+	DataDir    string
+	LogLevel   string
+	LogFile    string
+	TimeZone   string
+	DBFile     string
 }
 
 var (
