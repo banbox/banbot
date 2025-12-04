@@ -185,24 +185,37 @@ Find unsaved orders from open orders and save them all to the database
 */
 func SaveDirtyODs(path string, account string) *errs.Error {
 	var dirtyOds []*InOutOrder
+	// 避免在持有 mOpenLock 时获取 lockOpenMap 锁导致死锁
+	type accData struct {
+		accKey string
+		ods    map[int64]*InOutOrder
+		lock   *deadlock.Mutex
+	}
+	var accList []accData
 	mOpenLock.Lock()
 	for accKey, ods := range accOpenODs {
 		if account != "" && accKey != account {
 			continue
 		}
 		lock, _ := lockOpenMap[accKey]
-		lock.Lock()
-		for key, od := range ods {
+		accList = append(accList, accData{accKey: accKey, ods: ods, lock: lock})
+	}
+	mOpenLock.Unlock()
+
+	// 在 mOpenLock 释放后，逐个处理每个账户
+	for _, acc := range accList {
+		acc.lock.Lock()
+		for key, od := range acc.ods {
 			if od.IsDirty() {
 				dirtyOds = append(dirtyOds, od)
 			}
 			if od.Status >= InOutStatusFullExit {
-				delete(ods, key)
+				delete(acc.ods, key)
 			}
 		}
-		lock.Unlock()
+		acc.lock.Unlock()
 	}
-	mOpenLock.Unlock()
+
 	if len(dirtyOds) == 0 {
 		return nil
 	}
