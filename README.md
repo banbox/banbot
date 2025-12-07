@@ -22,6 +22,8 @@ banbot is a high-performance, easy-to-use, multi-symbol, multi-strategy, multi-p
 * scalable: trade multiple exchange accounts simultaneously.
 * hyper opt: support bayes/tpe/random/cmaes/ipop-cmaes/bipop-cmaes
 
+![image](https://docs.banbot.site/uidev.gif)
+
 ### Supported Exchanges
 banbot support exchanges powered by [banexg](https://github.com/banbox/banexg):
 
@@ -30,30 +32,8 @@ banbot support exchanges powered by [banexg](https://github.com/banbox/banexg):
 | ![binance](https://user-images.githubusercontent.com/1294454/29604020-d5483cdc-87ee-11e7-94c7-d1a8d9169293.jpg) | binance | spot/usd-m/coin-m | *   | Y         |
 
 ### Quick start
-![image](https://docs.banbot.site/uidev.gif)
-#### 1. start timescaledb
-```bash
-docker network create mynet
-docker run -d --name timescaledb --network mynet -p 127.0.0.1:5432:5432 \
-  -v /opt/pgdata:/var/lib/postgresql/data \
-  -e POSTGRES_PASSWORD=123 timescale/timescaledb:latest-pg17
-```
 
-#### 2. start banbot 
-create your `/root/config.yml`:
-```yaml
-accounts:
-  user1:  # you can change this
-    binance:
-      prod:
-        api_key: your_api_key_here
-        api_secret: your_secret_here
-database:
-  url: postgresql://postgres:123@timescaledb:5432/ban
-```
-```bash
-docker run -d --name banbot -p 8000:8000 --network mynet -v /root:/root banbot/banbot:latest -config /root/config.yml
-```
+go [runbanbot](https://github.com/banbox/runbanbot) to get started with Docker in minutes!
 
 ### Work with AI
 Download the [banbot.md](doc/banbot.md) file, then attach this file to any AI conversation to tell it the strategy you want to test.
