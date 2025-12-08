@@ -1,6 +1,8 @@
 package ormo
 
 import (
+	"maps"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -9,7 +11,6 @@ import (
 	"github.com/banbox/banexg/log"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
-	"maps"
 )
 
 var (
@@ -59,6 +60,7 @@ func GetOpenODs(account string) (map[int64]*InOutOrder, *deadlock.Mutex) {
 	if core.LiveMode {
 		cfg, ok := config.Accounts[account]
 		if ok && cfg.NoTrade {
+			mOpenLock.Unlock()
 			return make(map[int64]*InOutOrder), &deadlock.Mutex{}
 		}
 		curMS := btime.UTCStamp()
@@ -74,20 +76,19 @@ func GetOpenODs(account string) (map[int64]*InOutOrder, *deadlock.Mutex) {
 		val = make(map[int64]*InOutOrder)
 		accOpenODs[account] = val
 	}
-	mOpenLock.Unlock()
-	if isReload {
-		err := loadOpenODs(account, val)
-		if err != nil {
-			log.Error("loadOpenODs fail", zap.String("acc", account), zap.Error(err))
-		}
-	}
-	mOpenLock.Lock()
 	lock, ok2 := lockOpenMap[account]
 	if !ok2 {
 		lock = &deadlock.Mutex{}
 		lockOpenMap[account] = lock
 	}
 	mOpenLock.Unlock()
+
+	if isReload {
+		err := loadOpenODs(account, val)
+		if err != nil {
+			log.Error("loadOpenODs fail", zap.String("acc", account), zap.Error(err))
+		}
+	}
 	return val, lock
 }
 
@@ -135,6 +136,7 @@ func GetTriggerODs(account string) (map[string]map[int64]*InOutOrder, *deadlock.
 	if !core.EnvReal {
 		account = config.DefAcc
 	}
+	mTriggerLock.Lock()
 	val, ok := accTriggerODs[account]
 	if !ok {
 		val = make(map[string]map[int64]*InOutOrder)
@@ -145,6 +147,7 @@ func GetTriggerODs(account string) (map[string]map[int64]*InOutOrder, *deadlock.
 		lock = &deadlock.Mutex{}
 		lockTriggerMap[account] = lock
 	}
+	mTriggerLock.Unlock()
 	return val, lock
 }
 
