@@ -141,6 +141,15 @@ func cancelPendingOrders(accMap map[string]bool, pairMap map[string]bool) *errs.
 		if err != nil {
 			return err
 		}
+		openAlgoOrders, err := exchange.FetchOpenOrders("", 0, 1000, map[string]interface{}{
+			banexg.ParamAccount:   account,
+			banexg.ParamAlgoOrder: true,
+		})
+		if err != nil {
+			log.Error("fetch open algo orders fail", zap.Error(err))
+		} else {
+			openOrders = append(openOrders, openAlgoOrders...)
+		}
 		log.Info("fetch account open orders", zap.String("acc", account), zap.Int("num", len(openOrders)))
 
 		// 筛选需要取消的订单

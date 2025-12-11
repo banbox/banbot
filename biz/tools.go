@@ -1042,14 +1042,17 @@ func (s *ExgOrderSet) Download(startMS, endMS int64, pairs []string, force bool)
 		}
 
 		// 执行下载
-		var limit = 500
-		for _, r := range downloadRanges {
-			start, end := r[0], r[1]
+		fetchBatch := func(isAlgo bool, start, end int64) *errs.Error {
 			offsetMS := start
+			limit := 500
+			params := map[string]interface{}{
+				banexg.ParamAccount: s.Account,
+			}
+			if isAlgo {
+				params[banexg.ParamAlgoOrder] = true
+			}
 			for offsetMS < end {
-				newOrders, err := s.exchange.FetchOrders(pair, offsetMS, limit, map[string]interface{}{
-					banexg.ParamAccount: s.Account,
-				})
+				newOrders, err := s.exchange.FetchOrders(pair, offsetMS, limit, params)
 				if err != nil {
 					return err
 				}
@@ -1066,11 +1069,22 @@ func (s *ExgOrderSet) Download(startMS, endMS int64, pairs []string, force bool)
 				endStr := btime.ToDateStr(end, "")
 				log.Info("download orders",
 					zap.String("pair", pair),
+					zap.Bool("algo", isAlgo),
 					zap.String("range", fmt.Sprintf("%s - %s", startStr, endStr)),
 					zap.Int("num", len(newOrders)))
 				if len(newOrders) < limit {
 					break
 				}
+			}
+			return nil
+		}
+
+		for _, r := range downloadRanges {
+			if err := fetchBatch(false, r[0], r[1]); err != nil {
+				return err
+			}
+			if err := fetchBatch(true, r[0], r[1]); err != nil {
+				return err
 			}
 		}
 

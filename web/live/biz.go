@@ -426,6 +426,15 @@ func getOrders(c *fiber.Ctx) error {
 		if err != nil {
 			return err
 		}
+		algoOrders, err := exg.Default.FetchOrders(data.Symbols, data.StartMs, data.Limit, map[string]interface{}{
+			banexg.ParamAccount:   acc,
+			banexg.ParamAlgoOrder: true,
+		})
+		if err != nil {
+			log.Error("fetch algo orders fail", zap.Error(err))
+		} else {
+			orders = append(orders, algoOrders...)
+		}
 		if data.Dirt != "" {
 			filtered := make([]*banexg.Order, 0, len(orders))
 			for _, od := range orders {
