@@ -96,32 +96,7 @@ func GetConfig(args *CmdArgs, showLog bool) (*Config, *errs.Error) {
 	}
 	configPaths := args.Configs
 	if len(configPaths) > 0 {
-		if !outSaved && utils2.IsDocker() {
-			outSaved = true
-			// 对于docker中启动，且传入了额外yml配置的，合并写入到config.local.yml，方便WebUI启动回测时保留额外的yml配置
-			items := make([]string, 0, len(configPaths)+1)
-			localCfgPath := filepath.Join(GetDataDir(), "config.local.yml")
-			if _, err := os.Stat(localCfgPath); err == nil {
-				items = append(items, localCfgPath)
-			}
-			for _, item := range configPaths {
-				items = append(items, ParsePath(item))
-			}
-			content, err := MergeConfigPaths(items)
-			if err != nil {
-				return nil, errs.New(errs.CodeIOReadFail, err)
-			}
-			err2 := utils2.WriteFile(localCfgPath, []byte(content))
-			if err2 != nil {
-				return nil, err2
-			}
-			args.Configs = nil
-			if args.NoDefault {
-				paths = append(paths, localCfgPath)
-			}
-		} else {
-			paths = append(paths, configPaths...)
-		}
+		paths = append(paths, configPaths...)
 	}
 
 	// Handle ConfigData if provided
@@ -146,7 +121,7 @@ func GetConfig(args *CmdArgs, showLog bool) (*Config, *errs.Error) {
 
 		// Defer removal of temporary file
 		defer func() {
-			if err := os.Remove(tmpPath); err != nil {
+			if err = os.Remove(tmpPath); err != nil {
 				log.Warn("Failed to remove temporary config file: " + err.Error())
 			}
 		}()
@@ -161,6 +136,50 @@ func GetConfig(args *CmdArgs, showLog bool) (*Config, *errs.Error) {
 		return nil, errs.New(errs.CodeRunTime, err)
 	}
 	return res, nil
+}
+
+func UpdateLocal(configPaths []string, configData string, noDefault bool) *errs.Error {
+	// 对于docker中启动，且传入了额外yml配置的，合并写入到config.local.yml，方便WebUI启动回测时保留额外的yml配置
+	items := make([]string, 0, len(configPaths)+1)
+	localCfgPath := filepath.Join(GetDataDir(), "config.local.yml")
+	if _, err := os.Stat(localCfgPath); err == nil && !noDefault {
+		items = append(items, localCfgPath)
+	}
+	rawNum := len(items)
+	if configData != "" {
+		tmpFile, err := os.CreateTemp("", "config_data_*.yml")
+		if err != nil {
+			return errs.New(errs.CodeIOReadFail, err)
+		}
+		tmpPath := tmpFile.Name()
+		items = append(items, tmpPath)
+
+		// Write ConfigData to temporary file
+		if _, err = tmpFile.WriteString(configData); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return errs.New(errs.CodeIOWriteFail, err)
+		}
+		tmpFile.Close()
+		defer os.Remove(tmpPath)
+	}
+	if len(configPaths) > 0 {
+		for _, item := range configPaths {
+			items = append(items, ParsePath(item))
+		}
+	}
+	if len(items) == rawNum {
+		return nil
+	}
+	content, err := MergeConfigPaths(items)
+	if err != nil {
+		return errs.New(errs.CodeIOReadFail, err)
+	}
+	err2 := utils2.WriteFile(localCfgPath, []byte(content))
+	if err2 != nil {
+		return err2
+	}
+	return nil
 }
 
 func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {

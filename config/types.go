@@ -63,8 +63,6 @@ var (
 	RPCChannels      map[string]map[string]interface{}
 	Mail             *MailConfig
 	Webhook          map[string]map[string]string
-
-	outSaved = false // Docker外部传入配置是否已保存到config.local.yml
 )
 
 const (

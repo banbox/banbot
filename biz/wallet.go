@@ -2,12 +2,13 @@ package biz
 
 import (
 	"fmt"
-	"github.com/banbox/banbot/btime"
-	"github.com/banbox/banbot/com"
-	"github.com/sasha-s/go-deadlock"
 	"math"
 	"slices"
 	"strings"
+
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -874,7 +875,8 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 	if config.StakePct > 0 {
 		acc, ok := config.Accounts[w.Account]
 		if ok {
-			legalValue := w.TotalLegal(nil, true)
+			rawLegal := w.TotalLegal(nil, true)
+			legalValue := rawLegal
 			if banexg.IsContract(core.Market) && config.Leverage > 1 {
 				// 对于合约市场，百分比开单应基于带杠杆的名义资产价值
 				legalValue *= config.Leverage
@@ -883,6 +885,8 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 			// 四舍五入到十位
 			pctAmt := math.Round(legalValue*config.StakePct/1000) * 10
 			if acc.StakePctAmt == 0 {
+				log.Debug("set StakePctAmt by stake_pct", zap.Float64("totalLegal", rawLegal),
+					zap.Float64("amount", pctAmt))
 				acc.StakePctAmt = pctAmt
 			} else if math.Abs(pctAmt/acc.StakePctAmt-1) >= 0.2 {
 				// Update only if total assets change by more than 20%
