@@ -148,7 +148,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		return errs.NewMsg(errs.CodeParamInvalid, "open order disabled")
 	}
 
-	if math.IsNaN(req.Limit+req.Amount+req.Leverage+req.CostRate+req.LegalCost) ||
+	if math.IsNaN(req.Limit+req.Quantity+req.Leverage+req.CostRate+req.LegalCost) ||
 		math.IsNaN(req.StopLoss+req.StopLossVal+req.StopLossLimit+req.StopLossRate) ||
 		math.IsNaN(req.TakeProfit+req.TakeProfitVal+req.TakeProfitLimit+req.TakeProfitRate) {
 		AddAccFailOpen(s.Account, FailOpenNanNum)
@@ -204,7 +204,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 			req.Stop = 0
 		}
 	}
-	if req.Amount == 0 && req.LegalCost == 0 {
+	if req.Quantity == 0 && req.LegalCost == 0 {
 		if req.CostRate == 0 {
 			req.CostRate = 1
 		}

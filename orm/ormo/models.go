@@ -26,7 +26,7 @@ type ExOrder struct {
 	CreateAt  int64   `json:"create_at"`
 	Price     float64 `json:"price"`
 	Average   float64 `json:"average"`
-	Amount    float64 `json:"amount"`
+	Quantity  float64 `json:"quantity"`
 	Filled    float64 `json:"filled"`
 	Status    int64   `json:"status"`
 	Fee       float64 `json:"fee"`

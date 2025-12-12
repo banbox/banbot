@@ -132,7 +132,7 @@ type EnterReq struct {
 	CostRate        float64 // The opening ratio is set to 1 times by default according to the configuration. Used for calculating LegalList 开仓倍率、默认按配置1倍。用于计算LegalCost
 	LegalCost       float64 // Spend the amount in fiat currency. Ignore CostRate when specified 花费法币金额。指定时忽略CostRate
 	Leverage        float64 // Leverage ratio 杠杆倍数
-	Amount          float64 // The number of admission targets is calculated by LegalList and price 入场标的数量，由LegalCost和price计算
+	Quantity        float64 // quantity to open; if not provided, calculated using LegalCost and price. 开仓数量，未提供时由LegalCost和price计算
 	StopLossVal     float64 // The distance from the entry price to the stop loss price is used to calculate StopLoss 入场价格到止损价格的距离，用于计算StopLoss
 	StopLoss        float64 // Stop loss trigger price, submit a stop loss order on the exchange when it is not empty 止损触发价格，不为空时在交易所提交一个止损单
 	StopLossLimit   float64 // Stop loss limit price, does not provide the use of StopLoss 止损限制价格，不提供使用StopLoss
@@ -163,7 +163,7 @@ type ExitReq struct {
 	OrderType  int     // 订单类型, core.OrderType*
 	Limit      float64 // Limit order exit price, the order will be submitted as a limit order when specified 限价单退出价格，指定时订单将作为限价单提交
 	ExitRate   float64 // Exit rate, default is 100%, which means all orders are exited 退出比率，默认100%即所有订单全部退出
-	Amount     float64 // The number of targets to be exited. ExitRate is invalid when specified 要退出的标的数量。指定时ExitRate无效
+	Quantity   float64 // quantity to exit; ExitRate is invalid when specified.. 平仓数量，指定时ExitRate无效
 	OrderID    int64   // Only exit specified orders 只退出指定订单
 	UnFillOnly bool    // When True, exit orders which hasn't been filled only. True时只退出尚未入场的部分
 	FilledOnly bool    // Only exit orders that have already entered when True True时只退出已入场的订单

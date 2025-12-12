@@ -30,7 +30,7 @@ CREATE TABLE exorder
     create_at  INTEGER NOT NULL,
     price      REAL    NOT NULL,
     average    REAL    NOT NULL,
-    amount     REAL    NOT NULL,
+    quantity   REAL    NOT NULL,
     filled     REAL    NOT NULL,
     status     INTEGER NOT NULL,
     fee        REAL    NOT NULL,

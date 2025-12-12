@@ -76,7 +76,7 @@ WHERE id = ?;
 
 -- name: AddExOrder :one
 insert into exorder ("task_id", "inout_id", "symbol", "enter", "order_type", "order_id", "side",
-                     "create_at", "price", "average", "amount", "filled", "status", "fee", "fee_quote", "fee_type", "update_at")
+                     "create_at", "price", "average", "quantity", "filled", "status", "fee", "fee_quote", "fee_type", "update_at")
 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     RETURNING id;
 
@@ -92,7 +92,7 @@ update exorder set
                    "create_at" = ?,
                    "price" = ?,
                    "average" = ?,
-                   "amount" = ?,
+                   "quantity" = ?,
                    "filled" = ?,
                    "status" = ?,
                    "fee" = ?,

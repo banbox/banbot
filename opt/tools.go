@@ -101,7 +101,7 @@ func CompareExgBTOrders(args []string) error {
 	defer file.Close()
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
-	heads := []string{"tag", "symbol", "timeFrame", "dirt", "entAt", "exitAt", "entPrice", "exitPrice", "Amount",
+	heads := []string{"tag", "symbol", "timeFrame", "dirt", "entAt", "exitAt", "entPrice", "exitPrice", "quantity",
 		"Fee", "Profit", "entDelay", "exitDelay", "priceDiff %", "amtDiff %", "feeDiff %",
 		"profitDiff %", "profitDf", "reason"}
 	if err_ = writer.Write(heads); err_ != nil {
@@ -352,14 +352,14 @@ func handleExitOrders(remainFilled float64, od *banexg.Order, odList []*ormo.InO
 			continue
 		}
 		part := iod
-		exitAmount := iod.Enter.Amount
+		exitAmount := iod.Enter.Quantity
 		var rate float64
-		if remainFilled < iod.Enter.Amount*0.99 {
+		if remainFilled < iod.Enter.Quantity*0.99 {
 			exitAmount = remainFilled
 			part = iod.CutPart(remainFilled, remainFilled)
 			rate = remainFilled / od.Filled
 		} else {
-			rate = iod.Enter.Amount / od.Filled
+			rate = iod.Enter.Quantity / od.Filled
 		}
 		curFee := od.Fee.Cost * rate
 		curFeeQuote := od.Fee.QuoteCost * rate
@@ -370,7 +370,7 @@ func handleExitOrders(remainFilled float64, od *banexg.Order, odList []*ormo.InO
 			UpdateAt: od.LastUpdateTimestamp,
 			Price:    od.Price,
 			Average:  od.Average,
-			Amount:   part.Enter.Amount,
+			Quantity: part.Enter.Quantity,
 			Filled:   part.Enter.Filled,
 			Fee:      curFee,
 			FeeQuote: curFeeQuote,
@@ -447,7 +447,7 @@ func buildExgOrders(ods []*banexg.Order, clientPrefix string) map[string][]*ormo
 				UpdateAt: ent.LastTradeTimestamp,
 				Price:    ent.Price,
 				Average:  ent.Average,
-				Amount:   ent.Filled,
+				Quantity: ent.Filled,
 				Filled:   ent.Filled,
 				Fee:      ent.Fee.Cost,
 				FeeQuote: ent.Fee.QuoteCost,
@@ -459,7 +459,7 @@ func buildExgOrders(ods []*banexg.Order, clientPrefix string) map[string][]*ormo
 				UpdateAt: exit.LastTradeTimestamp,
 				Price:    exit.Price,
 				Average:  exit.Average,
-				Amount:   exit.Filled, // 使用入场订单的数量
+				Quantity: exit.Filled, // 使用入场订单的数量
 				Filled:   exit.Filled,
 				Fee:      exit.Fee.Cost,
 				FeeQuote: exit.Fee.QuoteCost,
@@ -476,7 +476,7 @@ func buildExgOrders(ods []*banexg.Order, clientPrefix string) map[string][]*ormo
 			remainOrder.Filled = exit.Filled - ent.Filled
 			remainOrder.Fee.Cost = exit.Fee.Cost * (remainOrder.Filled / exit.Filled)
 			temps = append(temps, &remainOrder)
-			iod.Exit.Amount = ent.Filled
+			iod.Exit.Quantity = ent.Filled
 			iod.Exit.Filled = ent.Filled
 			iod.Exit.Fee = exit.Fee.Cost * (ent.Fee.Cost / exit.Fee.Cost)
 			iod.Exit.FeeQuote = exit.Fee.QuoteCost * (ent.Fee.QuoteCost / exit.Fee.QuoteCost)
@@ -486,7 +486,7 @@ func buildExgOrders(ods []*banexg.Order, clientPrefix string) map[string][]*ormo
 			remainOrder.Filled = ent.Filled - exit.Filled
 			remainOrder.Fee.Cost = ent.Fee.Cost * (remainOrder.Filled / ent.Filled)
 			temps = append(temps, &remainOrder)
-			iod.Enter.Amount = exit.Filled
+			iod.Enter.Quantity = exit.Filled
 			iod.Enter.Filled = exit.Filled
 			iod.Enter.Fee = ent.Fee.Cost * (exit.Fee.Cost / ent.Fee.Cost)
 			iod.Enter.FeeQuote = ent.Fee.QuoteCost * (exit.Fee.QuoteCost / ent.Fee.QuoteCost)
@@ -533,7 +533,7 @@ func buildExgOrders(ods []*banexg.Order, clientPrefix string) map[string][]*ormo
 					UpdateAt: od.LastTradeTimestamp,
 					Price:    od.Price,
 					Average:  od.Average,
-					Amount:   remainFilled,
+					Quantity: remainFilled,
 					Filled:   remainFilled,
 					Fee:      od.Fee.Cost * (remainFilled / od.Filled),
 					FeeQuote: od.Fee.QuoteCost * (remainFilled / od.Filled),
@@ -972,7 +972,7 @@ func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[stri
 					curAmt := od.EnterCost() / priceOpen
 					amtRate = curAmt / od.Enter.Filled
 					od.Enter.Filled = curAmt
-					od.Enter.Amount = curAmt
+					od.Enter.Quantity = curAmt
 					od.Enter.CreateAt = openMS
 					od.Enter.UpdateAt = openMS
 					od.Enter.Price = priceOpen
@@ -981,7 +981,7 @@ func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[stri
 			}
 			if od.Exit != nil {
 				if amtRate != 1 {
-					od.Exit.Amount *= amtRate
+					od.Exit.Quantity *= amtRate
 					od.Exit.Filled *= amtRate
 				}
 				if od.RealExitMS() > closeMS {

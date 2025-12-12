@@ -771,7 +771,7 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 		if amount > exOd.Filled*1.01 {
 			exOd.UpdateAt = odTime
 			exOd.Filled = amount
-			exOd.Amount = max(amount, exOd.Amount)
+			exOd.Quantity = max(amount, exOd.Quantity)
 			exOd.Average = price
 			exOd.FeeQuote = feeQuote
 			exOd.Fee = feeCost
@@ -779,7 +779,7 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 			if od.Type != "" {
 				exOd.OrderType = od.Type
 			}
-			if od.Status == banexg.OdStatusFilled || amount >= exOd.Amount*0.99 {
+			if od.Status == banexg.OdStatusFilled || amount >= exOd.Quantity*0.99 {
 				exOd.Status = ormo.OdStatusClosed
 				exOd.Price = price
 				if exOd.Enter {
@@ -918,7 +918,7 @@ func (o *LiveOrderMgr) createInOutOd(exs *orm.ExSymbol, short bool, average, fil
 			CreateAt:  enterAt,
 			Price:     average,
 			Average:   average,
-			Amount:    filled,
+			Quantity:  filled,
 			Filled:    filled,
 			Status:    int64(entStatus),
 			Fee:       feeCost,
@@ -981,9 +981,9 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 	var avaAmount float64
 	// Should a small order be split?
 	var doCut = false // 是否应该分割一个小订单
-	if iod.Exit != nil && iod.Exit.Amount > 0 {
-		avaAmount = iod.Exit.Amount - iod.Exit.Filled
-		doCut = avaAmount/iod.Exit.Amount < 0.99
+	if iod.Exit != nil && iod.Exit.Quantity > 0 {
+		avaAmount = iod.Exit.Quantity - iod.Exit.Filled
+		doCut = avaAmount/iod.Exit.Quantity < 0.99
 	} else {
 		avaAmount = iod.Enter.Filled
 	}
@@ -1017,7 +1017,7 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 			CreateAt:  odTime,
 			Price:     price,
 			Average:   price,
-			Amount:    part.Enter.Amount,
+			Quantity:  part.Enter.Quantity,
 			Filled:    fillAmt,
 			Status:    ormo.OdStatusClosed,
 			Fee:       curFeeCost,
@@ -1499,8 +1499,8 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 		od.DirtyExit = true
 	}
 	subOd.UpdateAt = trade.Timestamp
-	if subOd.Amount == 0 {
-		subOd.Amount = trade.Amount
+	if subOd.Quantity == 0 {
+		subOd.Quantity = trade.Amount
 	}
 	state := trade.State
 	if state == banexg.OdStatusFilled || state == banexg.OdStatusPartFilled {
@@ -1576,7 +1576,7 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 	odKey := od.Key()
 
 	var err *errs.Error
-	if od.Enter.Amount == 0 {
+	if od.Enter.Quantity == 0 {
 		if od.QuoteCost == 0 {
 			wallets := GetWallets(o.Account)
 			_, err = wallets.EnterOd(od)
@@ -1608,11 +1608,11 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 		}
 		// The market price should be used to calculate the quantity here, because the input price may be very different from the market price
 		// 这里应使用市价计算数量，因传入价格可能和市价相差很大
-		od.Enter.Amount, err = exg.PrecAmount(exg.Default, od.Symbol, od.QuoteCost/realPrice)
+		od.Enter.Quantity, err = exg.PrecAmount(exg.Default, od.Symbol, od.QuoteCost/realPrice)
 		if err != nil {
 			o.forceDelOd(od, err)
 			return nil
-		} else if od.Enter.Amount == 0 {
+		} else if od.Enter.Quantity == 0 {
 			o.forceDelOd(od, errs.NewMsg(core.ErrRunTime, "amount too small"))
 			return nil
 		}
@@ -1740,7 +1740,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 			// 此币种杠杆比较小，对应缩小金额
 			rate := newLeverage / od.Leverage
 			od.Leverage = newLeverage
-			subOd.Amount *= rate
+			subOd.Quantity *= rate
 			od.QuoteCost *= rate
 			od.DirtyMain = true
 			setDirty()
@@ -1764,12 +1764,12 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		}
 		setDirty()
 	}
-	if subOd.Amount == 0 {
+	if subOd.Quantity == 0 {
 		if isEnter {
 			return errs.NewMsg(core.ErrRunTime, "amount is required for %s", od.Key())
 		}
-		subOd.Amount = od.Enter.Filled
-		if subOd.Amount == 0 {
+		subOd.Quantity = od.Enter.Filled
+		if subOd.Quantity == 0 {
 			// No amount, direct local exit.
 			// 没有入场，直接本地退出。
 			od.Status = ormo.InOutStatusFullExit
@@ -1785,7 +1785,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 			return nil
 		}
 	}
-	side, amount, price := subOd.Side, subOd.Amount, subOd.Price
+	side, amount, price := subOd.Side, subOd.Quantity, subOd.Price
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
 		banexg.ParamClientOrderId: od.ClientId(true),
@@ -1867,8 +1867,8 @@ func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *
 	o.lockExgIdMap.Unlock()
 	if o.hasNewTrades(res) && subOd.UpdateAt <= res.Timestamp {
 		subOd.UpdateAt = res.Timestamp
-		if subOd.Amount == 0 {
-			subOd.Amount = res.Amount
+		if subOd.Quantity == 0 {
+			subOd.Quantity = res.Amount
 		}
 		if res.Filled > 0 {
 			fillPrice := subOd.Price
@@ -2338,7 +2338,7 @@ func (o *LiveOrderMgr) editLimitOd(od *ormo.InOutOrder, action string) *errs.Err
 	}
 	// Only U-based & coin-based, modify order
 	// 只有U本位 & 币本位，修改订单
-	res, err := exchange.EditOrder(od.Symbol, subOd.OrderID, subOd.Side, subOd.Amount, subOd.Price, args)
+	res, err := exchange.EditOrder(od.Symbol, subOd.OrderID, subOd.Side, subOd.Quantity, subOd.Price, args)
 	if err != nil {
 		return err
 	}
@@ -2389,7 +2389,7 @@ func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 	if od.Short {
 		side = banexg.OdSideBuy
 	}
-	amt := od.Enter.Amount
+	amt := od.Enter.Quantity
 	log.Debug("set trailing trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
 		zap.Float64("callbackRate", callRate), zap.Float64("qty", amt),
 		zap.Float64("activePrice", activePrice))
@@ -2472,7 +2472,7 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 	if od.Short {
 		side = banexg.OdSideBuy
 	}
-	amt := od.Enter.Amount
+	amt := od.Enter.Quantity
 	if tg.Rate > 0 && tg.Rate < 1 {
 		amt *= tg.Rate
 	}
@@ -2481,7 +2481,7 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		params[banexg.ParamRetry] = int(retryNum)
 	}
 	log.Debug("set trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
-		zap.Float64("amt", od.Enter.Amount), zap.Float64("qmt", amt),
+		zap.Float64("amt", od.Enter.Quantity), zap.Float64("qmt", amt),
 		zap.Float64("price", od.Enter.Average))
 	res, err := exg.Default.CreateOrder(od.Symbol, odType, side, amt, price, params)
 	if err != nil {

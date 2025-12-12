@@ -743,7 +743,7 @@ func DumpOrdersCSV(orders []*ormo.InOutOrder, outPath string) error {
 		if a.EnterTag != b.EnterTag {
 			return a.EnterTag < b.EnterTag
 		}
-		return a.Enter.Amount < b.Enter.Amount
+		return a.Enter.Quantity < b.Enter.Quantity
 	})
 	file, err_ := os.Create(outPath)
 	if err_ != nil {

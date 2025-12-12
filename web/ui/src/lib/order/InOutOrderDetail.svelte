@@ -310,10 +310,10 @@
         <div class="space-y-0.5">
           <div class="text-xs text-base-content/70">{m.amount()}</div>
           {#if isEditable}
-            <input type="text" class="input input-xs w-full h-6" value={currentOrder.enter.amount?.toFixed(5) ?? ''}/>
+            <input type="text" class="input input-xs w-full h-6" value={currentOrder.enter.quantity?.toFixed(5) ?? ''}/>
           {:else}
             <div class="bg-base-200/30 p-1.5 rounded border border-base-300 text-xs font-mono">
-              {currentOrder.enter.amount?.toFixed(5) ?? '-'}
+              {currentOrder.enter.quantity?.toFixed(5) ?? '-'}
             </div>
           {/if}
         </div>
@@ -449,10 +449,10 @@
         <div class="space-y-0.5">
           <div class="text-xs text-base-content/70">{m.amount()}</div>
           {#if isEditable}
-            <input type="text" class="input input-xs w-full h-6" value={currentOrder.exit.amount?.toFixed(5) ?? ''}/>
+            <input type="text" class="input input-xs w-full h-6" value={currentOrder.exit.quantity?.toFixed(5) ?? ''}/>
           {:else}
             <div class="bg-base-200/30 p-1.5 rounded border border-base-300 text-xs font-mono">
-              {currentOrder.exit.amount?.toFixed(5) ?? '-'}
+              {currentOrder.exit.quantity?.toFixed(5) ?? '-'}
             </div>
           {/if}
         </div>

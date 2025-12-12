@@ -296,15 +296,15 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 		return err
 	}
 	exOrder := od.Enter
-	if exOrder.Amount == 0 {
+	if exOrder.Quantity == 0 {
 		if od.Short && !core.IsContract {
 			// Spot short order, quantity must be given
 			// 现货空单，必须给定数量
 			return errs.NewMsg(core.ErrInvalidCost, "EnterAmount is required")
 		}
 		entAmount := od.QuoteCost / entPrice
-		exOrder.Amount, err = exchange.PrecAmount(market, entAmount)
-		if err != nil || exOrder.Amount == 0 {
+		exOrder.Quantity, err = exchange.PrecAmount(market, entAmount)
+		if err != nil || exOrder.Quantity == 0 {
 			if err != nil {
 				if o.showLog {
 					log.Warn("prec enter amount fail", zap.String("symbol", od.Symbol),
@@ -329,7 +329,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	if exOrder.CreateAt == 0 {
 		exOrder.CreateAt = updateTime
 	}
-	exOrder.Filled = exOrder.Amount
+	exOrder.Filled = exOrder.Quantity
 	exOrder.Average = entPrice
 	exOrder.Status = ormo.OdStatusClosed
 	err = od.UpdateFee(entPrice, true)
@@ -359,7 +359,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fillMS int64) *errs.Error {
 	wallets := GetWallets(o.Account)
 	exOrder := od.Exit
-	wallets.ExitOd(od, exOrder.Amount)
+	wallets.ExitOd(od, exOrder.Quantity)
 	if exOrder.Filled == 0 {
 		od.ExitAt = fillMS
 	}
@@ -367,7 +367,7 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 	exOrder.CreateAt = fillMS
 	exOrder.Status = ormo.OdStatusClosed
 	exOrder.Price = price
-	exOrder.Filled = exOrder.Amount
+	exOrder.Filled = exOrder.Quantity
 	exOrder.Average = price
 	err := od.UpdateFee(price, false)
 	if err != nil {
@@ -494,7 +494,7 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline, 
 	exitAt := curMS - int64(cutSecs*1000)
 	err := od.LocalExit(exitAt, exitTag, fillPrice, "", odType)
 	wallets := GetWallets(o.Account)
-	wallets.ExitOd(od, od.Exit.Amount)
+	wallets.ExitOd(od, od.Exit.Quantity)
 	_ = o.finishOrder(od)
 	wallets.ConfirmOdExit(od, od.Exit.Price)
 	o.callBack(od, false)

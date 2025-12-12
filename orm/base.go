@@ -17,6 +17,7 @@ import (
 	utils2 "github.com/banbox/banbot/utils"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -113,9 +114,11 @@ func Setup() *errs.Error {
 		}
 	} else {
 		// 执行数据库迁移
-		err2 = runMigrations(ctx, pool)
-		if err2 != nil {
-			return err2
+		db := stdlib.OpenDBFromPool(pool)
+		err = Migrate(db, "postgres")
+		defer db.Close()
+		if err != nil {
+			return errs.New(core.ErrDbExecFail, err)
 		}
 	}
 	log.Info("connect db ok", zap.String("url", utils2.MaskDBUrl(dbCfg.Url)), zap.Int("pool", dbCfg.MaxPoolSize))
@@ -347,6 +350,14 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 				return nil, errs.New(core.ErrDbExecFail, err_)
 			} else {
 				return nil, errs.NewMsg(core.ErrDbExecFail, "db is empty: %v", path)
+			}
+		}
+		// Run migrations for SQLite
+		if write {
+			// goose uses "sqlite3" dialect for sqlite
+			// map "sqlite" driver to "sqlite3" dialect logic if needed, but usually just passing "sqlite3" works if standard sql
+			if err := Migrate(db, "sqlite3"); err != nil {
+				return nil, errs.New(core.ErrDbExecFail, err)
 			}
 		}
 		dbPathInit[path] = true

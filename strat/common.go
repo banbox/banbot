@@ -189,7 +189,7 @@ func (q *EnterReq) Clone() *EnterReq {
 		CostRate:        q.CostRate,
 		LegalCost:       q.LegalCost,
 		Leverage:        q.Leverage,
-		Amount:          q.Amount,
+		Quantity:        q.Quantity,
 		StopLossVal:     q.StopLossVal,
 		StopLoss:        q.StopLoss,
 		StopLossLimit:   q.StopLossLimit,
@@ -251,8 +251,8 @@ func (q *EnterReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 	if q.Leverage > 0 {
 		fields = append(fields, zap.Float64("leverage", q.Leverage))
 	}
-	if q.Amount > 0 {
-		fields = append(fields, zap.Float64("amt", q.Amount))
+	if q.Quantity > 0 {
+		fields = append(fields, zap.Float64("amt", q.Quantity))
 	}
 	if q.StopLossVal > 0 {
 		fields = append(fields, zap.Float64("slVal", q.StopLossVal))
@@ -285,7 +285,7 @@ func (q *ExitReq) Clone() *ExitReq {
 		OrderType:  q.OrderType,
 		Limit:      q.Limit,
 		ExitRate:   q.ExitRate,
-		Amount:     q.Amount,
+		Quantity:   q.Quantity,
 		OrderID:    q.OrderID,
 		UnFillOnly: q.UnFillOnly,
 		FilledOnly: q.FilledOnly,
@@ -323,8 +323,8 @@ func (q *ExitReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 	if q.ExitRate > 0 && q.ExitRate < 1 {
 		fields = append(fields, zap.Float64("exitRate", q.ExitRate))
 	}
-	if q.Amount > 0 {
-		fields = append(fields, zap.Float64("amt", q.Amount))
+	if q.Quantity > 0 {
+		fields = append(fields, zap.Float64("amt", q.Quantity))
 	}
 	if q.OrderID != 0 {
 		fields = append(fields, zap.Int64("orderId", q.OrderID))

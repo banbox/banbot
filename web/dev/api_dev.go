@@ -958,14 +958,14 @@ func getBtOrders(c *fiber.Ctx) error {
 					if orders[i].Enter.Filled > 0 {
 						enterAmountI = orders[i].Enter.Filled
 					} else {
-						enterAmountI = orders[i].Enter.Amount
+						enterAmountI = orders[i].Enter.Quantity
 					}
 				}
 				if orders[j].Enter != nil {
 					if orders[j].Enter.Filled > 0 {
 						enterAmountJ = orders[j].Enter.Filled
 					} else {
-						enterAmountJ = orders[j].Enter.Amount
+						enterAmountJ = orders[j].Enter.Quantity
 					}
 				}
 				less = enterAmountI < enterAmountJ
@@ -998,14 +998,14 @@ func getBtOrders(c *fiber.Ctx) error {
 					if orders[i].Exit.Filled > 0 {
 						exitAmountI = orders[i].Exit.Filled
 					} else {
-						exitAmountI = orders[i].Exit.Amount
+						exitAmountI = orders[i].Exit.Quantity
 					}
 				}
 				if orders[j].Exit != nil {
 					if orders[j].Exit.Filled > 0 {
 						exitAmountJ = orders[j].Exit.Filled
 					} else {
-						exitAmountJ = orders[j].Exit.Amount
+						exitAmountJ = orders[j].Exit.Quantity
 					}
 				}
 				less = exitAmountI < exitAmountJ

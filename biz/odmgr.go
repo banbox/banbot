@@ -333,7 +333,7 @@ func (o *OrderMgr) RelayOrders(orders []*ormo.InOutOrder) *errs.Error {
 				CreateAt: curTime,
 				UpdateAt: curTime,
 				Price:    price,
-				Amount:   odr.Enter.Amount,
+				Quantity: odr.Enter.Quantity,
 				Status:   ormo.OdStatusInit,
 			},
 			Info:       make(map[string]interface{}),
@@ -341,8 +341,8 @@ func (o *OrderMgr) RelayOrders(orders []*ormo.InOutOrder) *errs.Error {
 			DirtyEnter: true,
 		}
 		if odr.Exit != nil && odr.Exit.Filled > 0 {
-			od.Enter.Amount -= odr.Exit.Filled
-			od.QuoteCost = od.Enter.Price * od.Enter.Amount
+			od.Enter.Quantity -= odr.Exit.Filled
+			od.QuoteCost = od.Enter.Price * od.Enter.Quantity
 		}
 		if len(odr.Info) > 0 {
 			maps.Copy(od.Info, odr.Info)
@@ -428,7 +428,7 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 			OrderType: core.OrderTypeEnums[req.OrderType],
 			Side:      odSide,
 			Price:     req.Limit,
-			Amount:    req.Amount,
+			Quantity:  req.Quantity,
 			Status:    ormo.OdStatusInit,
 			CreateAt:  curTimeMS,
 			UpdateAt:  curTimeMS,
@@ -539,11 +539,11 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 			if req.EnterTag != "" && od.EnterTag != req.EnterTag {
 				continue
 			}
-			if od.ExitTag != "" || (od.Exit != nil && od.Exit.Amount > 0) {
+			if od.ExitTag != "" || (od.Exit != nil && od.Exit.Quantity > 0) {
 				// Order Exited 订单已退出
 				continue
 			}
-			if req.UnFillOnly && od.Enter.Filled >= od.Enter.Amount {
+			if req.UnFillOnly && od.Enter.Filled >= od.Enter.Quantity {
 				continue
 			}
 			if req.FilledOnly && od.Enter.Filled < core.AmtDust {
@@ -563,13 +563,13 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 	}
 	var exitAmount float64
 	useRate := req.ExitRate > 0 && req.ExitRate < 1
-	if useRate || req.Amount <= 0 {
+	if useRate || req.Quantity <= 0 {
 		// Calculate the amount to withdraw 计算要退出的数量
 		allAmount := float64(0)
 		for _, od := range matches {
-			allAmount += od.Enter.Amount
+			allAmount += od.Enter.Quantity
 			if od.Exit != nil {
-				allAmount -= od.Exit.Amount
+				allAmount -= od.Exit.Quantity
 			}
 		}
 		exitAmount = allAmount
@@ -577,7 +577,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 			exitAmount = allAmount * req.ExitRate
 		}
 	} else {
-		exitAmount = req.Amount
+		exitAmount = req.Quantity
 	}
 	isTakeProfit := false
 	if req.Limit > 0 && core.IsLimitOrder(req.OrderType) {
@@ -608,9 +608,9 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 			// 止盈单，优先按入场金额倒序
 			return -fillChg
 		}
-		costA := a.Enter.Amount * a.InitPrice
+		costA := a.Enter.Quantity * a.InitPrice
 		unfillA := costA - fillA
-		costB := b.Enter.Amount * b.InitPrice
+		costB := b.Enter.Quantity * b.InitPrice
 		unfillB := costB - fillB
 		// First, in descending order by unsold amount. 首先按未成交金额倒序
 		res := int(math.Round((unfillB - unfillA) * 100))
@@ -631,7 +631,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 		if !req.Force && !od.CanClose() {
 			continue
 		}
-		dust := od.Enter.Amount * 0.01
+		dust := od.Enter.Quantity * 0.01
 		if exitAmount < dust {
 			if isTakeProfit {
 				// reset TakeProfit for remaining orders
@@ -649,7 +649,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 			}
 			break
 		}
-		if req.FilledOnly && od.Enter.Filled < od.Enter.Amount {
+		if req.FilledOnly && od.Enter.Filled < od.Enter.Quantity {
 			// Only exit the entered orders, the current order is partially entered and divided into sub-orders
 			// 只退出已入场的订单，当前订单部分入场，切分成子订单
 			cutAmt := min(exitAmount, od.Enter.Filled)
@@ -661,7 +661,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 			od = part
 		}
 		q := req.Clone()
-		q.ExitRate = min(1, exitAmount/od.Enter.Amount)
+		q.ExitRate = min(1, exitAmount/od.Enter.Quantity)
 		if isTakeProfit && od.Status >= ormo.InOutStatusPartEnter {
 			err = od.SetTakeProfit(&ormo.ExitTrigger{
 				Price: q.Limit,
@@ -680,7 +680,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 			return result, err
 		}
 		if part != nil {
-			exitAmount -= part.Enter.Amount * q.ExitRate
+			exitAmount -= part.Enter.Quantity * q.ExitRate
 			result = append(result, part)
 		}
 	}
@@ -688,7 +688,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 }
 
 func (o *OrderMgr) ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error) {
-	if od.ExitTag != "" || (od.Exit != nil && od.Exit.Amount > 0) {
+	if od.ExitTag != "" || (od.Exit != nil && od.Exit.Quantity > 0) {
 		// Exit一旦有值，表示全部退出
 		return nil, nil
 	}
@@ -782,7 +782,7 @@ func (o *OrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) 
 }
 
 func (o *OrderMgr) CutOrder(od *ormo.InOutOrder, enterRate, exitRate float64) *ormo.InOutOrder {
-	part := od.CutPart(od.Enter.Amount*enterRate, od.Enter.Amount*exitRate)
+	part := od.CutPart(od.Enter.Quantity*enterRate, od.Enter.Quantity*exitRate)
 	// Here the key of part is the same as the original one, so part is used as src_key
 	// 这里part的key和原始的一样，所以part作为src_key
 	tgtKey, srcKey := od.Key(), part.Key()

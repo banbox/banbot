@@ -2,12 +2,13 @@ package biz
 
 import (
 	"fmt"
-	"github.com/banbox/banbot/btime"
-	"github.com/banbox/banbot/com"
-	"github.com/sasha-s/go-deadlock"
 	"math"
 	"slices"
 	"strings"
+
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -453,12 +454,12 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 	if curPrice < 0 {
 		return 0, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", od.Symbol)
 	}
-	if od.Enter.Amount != 0 {
+	if od.Enter.Quantity != 0 {
 		price := od.Enter.Average
 		if price == 0 {
 			price = curPrice
 		}
-		legalCost = od.Enter.Amount * price
+		legalCost = od.Enter.Quantity * price
 	} else {
 		legalCost = od.GetInfoFloat64(ormo.OdInfoLegalCost)
 	}
@@ -507,7 +508,7 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 		if err != nil {
 			return 0, err
 		}
-		od.Enter.Amount = baseCost
+		od.Enter.Quantity = baseCost
 	}
 
 	return legalCost, nil
@@ -522,7 +523,7 @@ func (w *BanWallets) ConfirmOdEnter(od *ormo.InOutOrder, enterPrice float64) {
 		panic(fmt.Sprintf("EnterOd invalid sid of order: %v", od.Sid))
 	}
 	subOd := od.Enter
-	quoteAmount := enterPrice * subOd.Amount
+	quoteAmount := enterPrice * subOd.Quantity
 	curFee := subOd.FeeQuote
 
 	baseCode, quoteCode, _, _ := core.SplitSymbol(exs.Symbol)
@@ -536,11 +537,11 @@ func (w *BanWallets) ConfirmOdEnter(od *ormo.InOutOrder, enterPrice float64) {
 		// Sold in stock, handling fee deducted
 		// 现货卖，手续费扣U
 		gotAmt := quoteAmount - curFee
-		w.ConfirmPending(od.Key(), baseCode, subOd.Amount, quoteCode, gotAmt, true)
+		w.ConfirmPending(od.Key(), baseCode, subOd.Quantity, quoteCode, gotAmt, true)
 	} else {
 		// Buy in spot, handling fee will be deducted
 		// 现货买，手续费扣币
-		baseAmt := subOd.Amount - curFee/enterPrice
+		baseAmt := subOd.Quantity - curFee/enterPrice
 		w.ConfirmPending(od.Key(), quoteCode, quoteAmount, baseCode, baseAmt, false)
 	}
 }
@@ -621,8 +622,8 @@ func (w *BanWallets) ConfirmOdExit(od *ormo.InOutOrder, exitPrice float64) {
 	} else {
 		//For long orders, sell from the base's availability and exchange it for the quote's availability.
 		//多单，从base的avaiable卖，兑换为quote的available
-		quoteAmount := exitPrice*subOd.Amount - curFee
-		w.ConfirmPending(odKey, baseCode, subOd.Amount, quoteCode, quoteAmount, false)
+		quoteAmount := exitPrice*subOd.Quantity - curFee
+		w.ConfirmPending(odKey, baseCode, subOd.Quantity, quoteCode, quoteAmount, false)
 	}
 }
 func (w *BanWallets) CutPart(srcKey string, tgtKey string, symbol string, rate float64) {

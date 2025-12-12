@@ -29,7 +29,7 @@ import (
 
 const (
 	iOrderFields  = "id, task_id, symbol, sid, timeframe, short, status, enter_tag, init_price, quote_cost, exit_tag, leverage, enter_at, exit_at, strategy, stg_ver, max_pft_rate, max_draw_down, profit_rate, profit, info"
-	exOrderFields = "id, task_id, inout_id, symbol, enter, order_type, order_id, side, create_at, price, average, amount, filled, status, fee, fee_quote, fee_type, update_at"
+	exOrderFields = "id, task_id, inout_id, symbol, enter, order_type, order_id, side, create_at, price, average, quantity, filled, status, fee, fee_quote, fee_type, update_at"
 )
 
 type InOutOrder struct {
@@ -309,7 +309,7 @@ func (i *InOutOrder) SetExit(exitAt int64, tag, orderType string, limit float64)
 			CreateAt:  exitAt,
 			UpdateAt:  exitAt,
 			Price:     limit,
-			Amount:    i.Enter.Filled,
+			Quantity:  i.Enter.Filled,
 			Status:    OdStatusInit,
 		}
 		i.DirtyExit = true
@@ -380,10 +380,10 @@ Split a small InOutOrder from the current order to solve the problem of one buy 
 从当前订单分割出一个小的InOutOrder，解决一次买入，多次卖出问题
 */
 func (i *InOutOrder) CutPart(enterAmt, exitAmt float64) *InOutOrder {
-	enterRate := enterAmt / i.Enter.Amount
+	enterRate := enterAmt / i.Enter.Quantity
 	exitRate := float64(0)
 	if i.Exit != nil && exitAmt > 0 {
-		exitRate = exitAmt / i.Exit.Amount
+		exitRate = exitAmt / i.Exit.Quantity
 	}
 	part := &InOutOrder{
 		IOrder: &IOrder{
@@ -424,8 +424,8 @@ func (i *InOutOrder) CutPart(enterAmt, exitAmt float64) *InOutOrder {
 	if i.Enter.Status == OdStatusInit && i.Status > InOutStatusInit {
 		i.Status = InOutStatusInit
 	}
-	if exitRate == 0 && i.Exit != nil && i.Exit.Amount > i.Enter.Amount {
-		exitRate = (i.Exit.Amount - i.Enter.Amount) / i.Exit.Amount
+	if exitRate == 0 && i.Exit != nil && i.Exit.Quantity > i.Enter.Quantity {
+		exitRate = (i.Exit.Quantity - i.Enter.Quantity) / i.Exit.Quantity
 	}
 	if exitRate > 0 && i.Exit != nil {
 		i.DirtyExit = true
@@ -976,7 +976,7 @@ func (i *ExOrder) saveAdd(sess *Queries) *errs.Error {
 		CreateAt:  i.CreateAt,
 		Price:     i.Price,
 		Average:   i.Average,
-		Amount:    i.Amount,
+		Quantity:  i.Quantity,
 		Filled:    i.Filled,
 		Status:    i.Status,
 		Fee:       i.Fee,
@@ -1002,7 +1002,7 @@ func (i *ExOrder) saveUpdate(sess *Queries) *errs.Error {
 		CreateAt:  i.CreateAt,
 		Price:     i.Price,
 		Average:   i.Average,
-		Amount:    i.Amount,
+		Quantity:  i.Quantity,
 		Filled:    i.Filled,
 		Status:    i.Status,
 		Fee:       i.Fee,
@@ -1028,33 +1028,33 @@ func (i *ExOrder) CutPart(rate float64, fill bool) *ExOrder {
 		CreateAt:  i.CreateAt,
 		Price:     i.Price,
 		Average:   i.Average,
-		Amount:    i.Amount * rate,
+		Quantity:  i.Quantity * rate,
 		Fee:       i.Fee,
 		FeeQuote:  i.FeeQuote,
 		FeeType:   i.FeeType,
 		UpdateAt:  i.UpdateAt,
 	}
-	i.Amount -= part.Amount
+	i.Quantity -= part.Quantity
 	if fill && i.Filled > 0 {
-		if i.Filled <= part.Amount {
+		if i.Filled <= part.Quantity {
 			part.Filled = i.Filled
 			i.Filled = 0
 		} else {
-			part.Filled = part.Amount
+			part.Filled = part.Quantity
 			i.Filled -= part.Filled
 		}
-	} else if i.Filled > i.Amount {
-		part.Filled = i.Filled - i.Amount
-		i.Filled = i.Amount
+	} else if i.Filled > i.Quantity {
+		part.Filled = i.Filled - i.Quantity
+		i.Filled = i.Quantity
 	}
-	if part.Filled >= part.Amount {
+	if part.Filled >= part.Quantity {
 		part.Status = OdStatusClosed
 	} else if part.Filled > 0 {
 		part.Status = OdStatusPartOK
 	} else {
 		part.Status = OdStatusInit
 	}
-	if i.Filled >= i.Amount {
+	if i.Filled >= i.Quantity {
 		i.Status = OdStatusClosed
 	}
 	return part
@@ -1085,7 +1085,7 @@ func (i *ExOrder) Clone() *ExOrder {
 		CreateAt:  i.CreateAt,
 		Price:     i.Price,
 		Average:   i.Average,
-		Amount:    i.Amount,
+		Quantity:  i.Quantity,
 		Filled:    i.Filled,
 		Status:    i.Status,
 		Fee:       i.Fee,
@@ -1156,7 +1156,7 @@ func (q *Queries) getExOrders(sql string, args []interface{}) ([]*ExOrder, *errs
 			&iod.CreateAt,
 			&iod.Price,
 			&iod.Average,
-			&iod.Amount,
+			&iod.Quantity,
 			&iod.Filled,
 			&iod.Status,
 			&iod.Fee,

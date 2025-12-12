@@ -11,7 +11,7 @@ import (
 
 const addExOrder = `-- name: AddExOrder :one
 insert into exorder ("task_id", "inout_id", "symbol", "enter", "order_type", "order_id", "side",
-                     "create_at", "price", "average", "amount", "filled", "status", "fee", "fee_quote", "fee_type", "update_at")
+                     "create_at", "price", "average", "quantity", "filled", "status", "fee", "fee_quote", "fee_type", "update_at")
 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     RETURNING id
 `
@@ -27,7 +27,7 @@ type AddExOrderParams struct {
 	CreateAt  int64   `json:"create_at"`
 	Price     float64 `json:"price"`
 	Average   float64 `json:"average"`
-	Amount    float64 `json:"amount"`
+	Quantity  float64 `json:"quantity"`
 	Filled    float64 `json:"filled"`
 	Status    int64   `json:"status"`
 	Fee       float64 `json:"fee"`
@@ -48,7 +48,7 @@ func (q *Queries) AddExOrder(ctx context.Context, arg AddExOrderParams) (int64, 
 		arg.CreateAt,
 		arg.Price,
 		arg.Average,
-		arg.Amount,
+		arg.Quantity,
 		arg.Filled,
 		arg.Status,
 		arg.Fee,
@@ -189,7 +189,7 @@ func (q *Queries) FindTask(ctx context.Context, arg FindTaskParams) (*BotTask, e
 }
 
 const getExOrders = `-- name: GetExOrders :many
-select id, task_id, inout_id, symbol, enter, order_type, order_id, side, create_at, price, average, amount, filled, status, fee, fee_quote, fee_type, update_at from exorder
+select id, task_id, inout_id, symbol, enter, order_type, order_id, side, create_at, price, average, quantity, filled, status, fee, fee_quote, fee_type, update_at from exorder
 where inout_id=?
 `
 
@@ -214,7 +214,7 @@ func (q *Queries) GetExOrders(ctx context.Context, inoutID int64) ([]*ExOrder, e
 			&i.CreateAt,
 			&i.Price,
 			&i.Average,
-			&i.Amount,
+			&i.Quantity,
 			&i.Filled,
 			&i.Status,
 			&i.Fee,
@@ -408,7 +408,7 @@ update exorder set
                    "create_at" = ?,
                    "price" = ?,
                    "average" = ?,
-                   "amount" = ?,
+                   "quantity" = ?,
                    "filled" = ?,
                    "status" = ?,
                    "fee" = ?,
@@ -429,7 +429,7 @@ type SetExOrderParams struct {
 	CreateAt  int64   `json:"create_at"`
 	Price     float64 `json:"price"`
 	Average   float64 `json:"average"`
-	Amount    float64 `json:"amount"`
+	Quantity  float64 `json:"quantity"`
 	Filled    float64 `json:"filled"`
 	Status    int64   `json:"status"`
 	Fee       float64 `json:"fee"`
@@ -451,7 +451,7 @@ func (q *Queries) SetExOrder(ctx context.Context, arg SetExOrderParams) error {
 		arg.CreateAt,
 		arg.Price,
 		arg.Average,
-		arg.Amount,
+		arg.Quantity,
 		arg.Filled,
 		arg.Status,
 		arg.Fee,

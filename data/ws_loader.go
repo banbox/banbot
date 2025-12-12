@@ -492,7 +492,7 @@ func parseWsTradeRow(fields []string) *banexg.Trade {
 // Trade二进制格式 (固定长度，便于快速读取)
 // ID: 8 bytes (uint64)
 // Price: 8 bytes (float64)
-// Amount: 8 bytes (float64)
+// Quantity: 8 bytes (float64)
 // Timestamp: 8 bytes (int64)
 // Side: 1 byte (0=buy, 1=sell)
 // Total: 33 bytes per trade
