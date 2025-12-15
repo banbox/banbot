@@ -3,10 +3,11 @@ package dev
 import (
 	"flag"
 	"fmt"
-	utils2 "github.com/banbox/banexg/utils"
 	"os"
 	"path/filepath"
 	"time"
+
+	utils2 "github.com/banbox/banexg/utils"
 
 	"github.com/banbox/banbot/utils"
 
@@ -77,6 +78,13 @@ func Run(args []string) error {
 	var err2 *errs.Error
 	if err2 = biz.SetupComsExg(banArg); err2 != nil {
 		return err2
+	}
+	if utils.IsDocker() {
+		// docker内运行banbot时，启动时外部传入了额外配置，更新到config.local.yml
+		err2 = config.UpdateLocal(ag.Configs, ag.ConfigData, false)
+		if err2 != nil {
+			return err2
+		}
 	}
 	err_ = collectBtResults()
 	if err_ != nil {

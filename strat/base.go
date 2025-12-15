@@ -2,10 +2,11 @@ package strat
 
 import (
 	"fmt"
-	"github.com/banbox/banbot/com"
 	"math"
 	"slices"
 	"strings"
+
+	"github.com/banbox/banbot/com"
 
 	utils2 "github.com/banbox/banexg/utils"
 
@@ -61,6 +62,9 @@ func (s *TradeStrat) pickTimeFrame(symbol string, tfScores map[string]float64) s
 	tfList := s.RunTimeFrames
 	if len(s.Policy.RunTimeframes) > 0 {
 		tfList = s.Policy.RunTimeframes
+	}
+	if len(tfList) == 0 {
+		tfList = config.RunTimeframes
 	}
 	for _, tf := range tfList {
 		useTfs[tf] = true
