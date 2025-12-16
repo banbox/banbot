@@ -27,6 +27,9 @@ func initWebHooks() *errs.Error {
 	// 解析accounts中的rpc配置
 	accChls := make([]map[string]interface{}, 0)
 	for accName, acc := range config.Accounts {
+		if acc.NoTrade {
+			continue
+		}
 		for i, chl := range acc.RPCChannels {
 			chlName := utils.GetMapVal(chl, "name", "")
 			if chlName == "" {

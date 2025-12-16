@@ -976,7 +976,10 @@ WatchLiveBalances
 币安推送的余额经常不够及时导致不准确，推荐定期主动拉取更新
 */
 func WatchLiveBalances() {
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		wallets := GetWallets(account)
 		if wallets.IsWatch {
 			continue

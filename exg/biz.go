@@ -59,6 +59,9 @@ func create(name, market, contractType string) (banexg.BanExchange, *errs.Error)
 		defAcc = key
 	}
 	for key, acc := range config.Accounts {
+		if acc.NoTrade {
+			continue
+		}
 		sec := acc.GetApiSecret()
 		accs[key] = map[string]interface{}{
 			banexg.OptApiKey:    sec.APIKey,

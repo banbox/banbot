@@ -165,7 +165,10 @@ func filterByMinCost(symbols []*SymbolVol) ([]string, map[string]float64) {
 	skip := make(map[string]float64)
 	exchange := exg.Default
 	accCost := float64(0)
-	for name := range config.Accounts {
+	for name, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		curCost := config.GetStakeAmount(name)
 		if curCost > accCost {
 			accCost = curCost

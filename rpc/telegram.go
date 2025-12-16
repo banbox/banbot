@@ -1190,7 +1190,10 @@ func (t *Telegram) getAccountList() string {
 	availableAccountsLabel := config.GetLangMsg("available_accounts_label", "可用账户:")
 	response.WriteString(fmt.Sprintf("<b>%s</b>\n", availableAccountsLabel))
 
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		if account == t.activeAccount {
 			response.WriteString(fmt.Sprintf("  ✅ <code>%s</code> (当前)\n", account))
 		} else {
@@ -1206,7 +1209,10 @@ func (t *Telegram) getAccountList() string {
 func (t *Telegram) buildAccountInlineKeyboard() *models.InlineKeyboardMarkup {
 	var rows = make([][]models.InlineKeyboardButton, 0)
 
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		if account != t.activeAccount {
 			rows = append(rows, []models.InlineKeyboardButton{{
 				Text:         fmt.Sprintf("🔄 切换到 %s", account),

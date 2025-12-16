@@ -837,6 +837,9 @@ func newAccStratLimits() (accStratLimits, int) {
 	res := make(accStratLimits)
 	maxJobNum := 1
 	for acc, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		res[acc] = &stgLimits{
 			limit:  cfg.MaxPair,
 			strats: make(map[string]int),

@@ -61,7 +61,10 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 	com.SetBarPrice(bar.Symbol, bar.Close)
 	if odMatch && !bar.IsWarmUp {
 		// 需要执行订单更新
-		for account := range config.Accounts {
+		for account, cfg := range config.Accounts {
+			if cfg.NoTrade {
+				continue
+			}
 			openOds, lock := ormo.GetOpenODs(account)
 			lock.Lock()
 			allOrders := utils2.ValsOfMap(openOds)
@@ -109,7 +112,10 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 	}
 	var wg sync.WaitGroup
 	var accOdArr = make([]string, 0, len(config.Accounts))
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		allOrders, _ := accOrders[account]
 		if !odMatch {
 			openOds, lock := ormo.GetOpenODs(account)

@@ -27,7 +27,10 @@ type LocalOrderMgr struct {
 type FnOdCb = func(od *ormo.InOutOrder, isEnter bool)
 
 func InitLocalOrderMgr(callBack FnOdCb, showLog bool) {
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		_, ok := accOdMgrs[account]
 		if !ok {
 			odMgr := &LocalOrderMgr{

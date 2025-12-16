@@ -1206,7 +1206,7 @@ func (tr *TimeTuple) Clone() *TimeTuple {
 func GetApiUsers() []*UserConfig {
 	res := make([]*UserConfig, 0)
 	for name, acc := range Accounts {
-		if acc.APIServer == nil {
+		if acc.APIServer == nil || acc.NoTrade {
 			continue
 		}
 		res = append(res, &UserConfig{
@@ -1240,6 +1240,9 @@ func MergeAccounts() map[string]*AccountConfig {
 	if merge.MaxPair > 0 || merge.MaxOpenOrders > 0 {
 		// 限制品种数量，查找允许的最大数量
 		for _, a := range Accounts {
+			if a.NoTrade {
+				continue
+			}
 			if merge.MaxPair > 0 && a.MaxPair > merge.MaxPair {
 				merge.MaxPair = a.MaxPair
 			}

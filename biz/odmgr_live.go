@@ -72,7 +72,10 @@ type PairValItem struct {
 }
 
 func InitLiveOrderMgr(callBack func(od *ormo.InOutOrder, isEnter bool)) {
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		mgr, ok := accLiveOdMgrs[account]
 		if !ok {
 			odMgr := newLiveOrderMgr(account, callBack)
@@ -2136,7 +2139,10 @@ func VerifyTriggerOds() {
 		return
 	}
 	defer verifyTriggersLock.Unlock()
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		verifyAccountTriggerOds(account)
 	}
 }
@@ -2637,7 +2643,10 @@ Check if the global stop loss is triggered. This method should be called regular
 */
 func MakeCheckFatalStop(maxIntv int) func() {
 	return func() {
-		for account := range config.Accounts {
+		for account, cfg := range config.Accounts {
+			if cfg.NoTrade {
+				continue
+			}
 			checkAccFatalStop(account, maxIntv)
 		}
 	}
@@ -2728,7 +2737,10 @@ func StartLiveOdMgr() {
 	if !core.EnvReal {
 		panic("StartLiveOdMgr for FakeEnv is forbidden:" + core.RunEnv)
 	}
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		odMgr := GetLiveOdMgr(account)
 		// Monitor account order flow 监听账户订单流
 		odMgr.WatchMyTrades()

@@ -462,7 +462,10 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 		// 主要针对实盘隔一段时间后重启有未平仓订单场景，需检查订单是否应在机器人停止期间平仓
 		var err *errs.Error
 		closeNums := make(map[string]int)
-		for acc := range config.Accounts {
+		for acc, cfg := range config.Accounts {
+			if cfg.NoTrade {
+				continue
+			}
 			odMgr := biz.GetOdMgr(acc)
 			odMap, lock := ormo.GetOpenODs(acc)
 			var exitOds []*ormo.InOutOrder
@@ -490,7 +493,10 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 		return nil
 	}
 	var err *errs.Error
-	for acc := range config.Accounts {
+	for acc, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		odMgr := biz.GetOdMgr(acc)
 		jobs := strat.GetJobs(acc)
 		allowOds := make([]*ormo.InOutOrder, 0, len(relayOpens))

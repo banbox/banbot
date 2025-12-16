@@ -133,7 +133,10 @@ func CronKlineDelays(dp *data.LiveProvider) {
 			stuckCount += 1
 			if stuckCount > config.CloseOnStuck {
 				// 超时未收到K线，全部平仓
-				for account := range config.Accounts {
+				for account, cfg := range config.Accounts {
+					if cfg.NoTrade {
+						continue
+					}
 					openOds, lock := ormo.GetOpenODs(account)
 					lock.Lock()
 					var odList = utils.ValsOfMap(openOds)
@@ -262,7 +265,10 @@ func CronBacktestInLive() {
 }
 
 func StartLoopBalancePositions() {
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		updateAccBalance(account)
 	}
 	go func() {
@@ -278,7 +284,10 @@ func StartLoopBalancePositions() {
 }
 
 func updateBalancePos() {
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		odList, lock := ormo.GetOpenODs(account)
 		lock.Lock()
 		odNum := len(odList)

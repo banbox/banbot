@@ -86,7 +86,10 @@ func (t *CryptoTrader) initOdMgr() *errs.Error {
 		return nil
 	}
 	biz.InitLiveOrderMgr(t.orderCB)
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		odMgr := biz.GetLiveOdMgr(account)
 		oldList, newList, delList, err := odMgr.SyncExgOrders()
 		if err != nil {
@@ -224,7 +227,10 @@ func exitCleanUp() {
 	if err != nil {
 		log.Error("close exg fail", zap.Error(err))
 	}
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		openOds, lock := ormo.GetOpenODs(account)
 		lock.Lock()
 		openNum := len(openOds)

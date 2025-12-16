@@ -69,7 +69,10 @@ func closeOrdersByPos(accMap map[string]bool, pairMap map[string]bool) error {
 	exchange := exg.Default
 	odType := banexg.OdTypeMarket
 	closeNum := 0
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		if len(accMap) > 0 {
 			if _, accOk := accMap[account]; !accOk {
 				continue
@@ -128,7 +131,10 @@ func closeOrdersByPos(accMap map[string]bool, pairMap map[string]bool) error {
 func cancelPendingOrders(accMap map[string]bool, pairMap map[string]bool) *errs.Error {
 	exchange := exg.Default
 	cancelNum := 0
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		if len(accMap) > 0 {
 			if _, accOk := accMap[account]; !accOk {
 				continue
@@ -202,7 +208,10 @@ func closeOrdersByLocal(accMap map[string]bool, pairMap map[string]bool, stratMa
 	biz.StartLiveOdMgr()
 	checkAccs := make(map[string][]*ormo.InOutOrder)
 	closeNum := 0
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		if len(accMap) > 0 {
 			if _, accOk := accMap[account]; !accOk {
 				continue

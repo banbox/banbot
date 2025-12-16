@@ -119,7 +119,10 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 				if jobType > 1 && !pairAdded {
 					// 任务禁止，但增加占位
 					holdNum += 1
-					for acc := range config.Accounts {
+					for acc, cfg := range config.Accounts {
+						if cfg.NoTrade {
+							continue
+						}
 						accLimits.tryAdd(acc, polID)
 					}
 				}
@@ -546,7 +549,10 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 将jobs的MaxOpenLong,MacOpenShort都置为-1，禁止开单，并更新附加订单
 */
 func resetJobs() {
-	for account := range config.Accounts {
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
 		openOds, lock := ormo.GetOpenODs(account)
 		lock.Lock()
 		odList := make([]*ormo.InOutOrder, 0, len(openOds))
