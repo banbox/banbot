@@ -501,7 +501,8 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 			exOd, err = exg.Default.FetchOrder(od.Symbol, tryOd.OrderID, map[string]interface{}{
 				banexg.ParamAccount: o.Account,
 			})
-			if err != nil {
+			if err != nil && err.BizCode != -2013 {
+				// 跳过错误 -2013 订单不存在
 				return err
 			}
 		}

@@ -1,6 +1,8 @@
 package exg
 
 import (
+	"time"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -10,7 +12,6 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/bntp"
 	"github.com/go-viper/mapstructure/v2"
-	"time"
 )
 
 func Setup() *errs.Error {
@@ -48,15 +49,16 @@ func create(name, market, contractType string) (banexg.BanExchange, *errs.Error)
 	}
 	accs := map[string]map[string]interface{}{}
 	var defAcc string
-	for key, acc := range config.Accounts {
+	for key, acc := range config.BakAccounts {
 		sec := acc.GetApiSecret()
 		accs[key] = map[string]interface{}{
 			banexg.OptApiKey:    sec.APIKey,
 			banexg.OptApiSecret: sec.APISecret,
+			banexg.OptNoTrade:   true,
 		}
 		defAcc = key
 	}
-	for key, acc := range config.BakAccounts {
+	for key, acc := range config.Accounts {
 		sec := acc.GetApiSecret()
 		accs[key] = map[string]interface{}{
 			banexg.OptApiKey:    sec.APIKey,

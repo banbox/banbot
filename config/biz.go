@@ -456,7 +456,6 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 	}
 	PairMgr = c.PairMgr
 	PairFilters = c.PairFilters
-	Accounts = c.Accounts
 	Exchange = c.Exchange
 	if Exchange == nil {
 		Exchange = &ExchangeConfig{
@@ -464,7 +463,7 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 			Items: make(map[string]map[string]interface{}),
 		}
 	}
-	err = initExgAccs(args)
+	err = initExgAccs(args, c.Accounts)
 	if err != nil {
 		return err
 	}
@@ -582,7 +581,7 @@ func GetAccLeverage(account string) float64 {
 	}
 }
 
-func initExgAccs(args *CmdArgs) *errs.Error {
+func initExgAccs(args *CmdArgs, accs map[string]*AccountConfig) *errs.Error {
 	loc, err := args.parseTimeZone()
 	if err != nil {
 		return err
@@ -594,7 +593,6 @@ func initExgAccs(args *CmdArgs) *errs.Error {
 	} else {
 		btime.LocShow = btime.UTCLocale
 	}
-	var accs = Accounts
 	Accounts = make(map[string]*AccountConfig)
 	BakAccounts = make(map[string]*AccountConfig)
 	if core.EnvReal {
