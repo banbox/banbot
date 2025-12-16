@@ -1276,6 +1276,20 @@ var (
 	langMsgs = map[string]map[string]string{}
 )
 
+// SetLangMsgs 设置多语言消息，用于外部模块注入自己的多语言文本
+// msgs 格式: map[code]map[lang]text
+func SetLangMsgs(msgs map[string]map[string]string) {
+	for code, langMap := range msgs {
+		if existing, ok := langMsgs[code]; ok {
+			for lang, text := range langMap {
+				existing[lang] = text
+			}
+		} else {
+			langMsgs[code] = langMap
+		}
+	}
+}
+
 func LoadLangMessages() {
 	langCodes := []string{"zh-CN", "en-US"}
 	for _, lang := range langCodes {
