@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/banbox/banbot/com"
-	"github.com/banbox/banbot/opt"
-	"github.com/banbox/banexg/binance"
 	"math"
 	"math/rand"
 	"slices"
@@ -14,6 +11,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/banbox/banbot/com"
+	"github.com/banbox/banbot/opt"
+	"github.com/banbox/banexg/binance"
 
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg/log"
@@ -1046,10 +1047,11 @@ func getLog(c *fiber.Ctx) error {
 	if err_ := base.VerifyArg(c, args, base.ArgQuery); err_ != nil {
 		return err_
 	}
-	if core.LogFile == "" {
+	logFile := log.LogFilePath()
+	if logFile == "" {
 		return c.JSON(fiber.Map{"code": 400, "msg": "no log file"})
 	}
-	data, pos, err := utils.ReadFileTail(core.LogFile, args.Limit, args.End)
+	data, pos, err := utils.ReadFileTail(logFile, args.Limit, args.End)
 	if err != nil {
 		return err
 	}

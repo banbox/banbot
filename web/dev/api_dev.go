@@ -3,7 +3,6 @@ package dev
 import (
 	"context"
 	"fmt"
-	"github.com/sasha-s/go-deadlock"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banexg"
 	utils2 "github.com/banbox/banexg/utils"
@@ -437,7 +438,11 @@ func getLogs(c *fiber.Ctx) error {
 		return err
 	}
 
-	data, pos, err := utils.ReadFileTail(core.LogFile, args.Limit, args.End)
+	logFile := log.LogFilePath()
+	if logFile == "" {
+		return c.JSON(fiber.Map{"code": 400, "msg": "no log file"})
+	}
+	data, pos, err := utils.ReadFileTail(logFile, args.Limit, args.End)
 	if err != nil {
 		return err
 	}

@@ -7,7 +7,6 @@ import (
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 
-	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
@@ -61,11 +60,16 @@ func (a *CmdArgs) SetLog(showLog bool, handlers ...zapcore.Core) {
 	}
 	logFile := a.Logfile
 	if logFile != "" {
-		core.SetLogCap(logFile)
+		logCfg.File = &log.FileLogConfig{
+			LogPath:    logFile,
+			MaxSize:    300,
+			MaxBackups: 10,
+			MaxDays:    30,
+		}
 	}
 	log.SetupLogger(logCfg)
-	if showLog && core.LogFile != "" {
-		log.Info("Log To", zap.String("path", core.LogFile))
+	if showLog && logFile != "" {
+		log.Info("Log To", zap.String("path", logFile))
 	}
 }
 

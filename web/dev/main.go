@@ -63,8 +63,6 @@ func Run(args []string) error {
 		logFileName := time.Now().Format("20060102150405") + ".log"
 		ag.LogFile = filepath.Join(logDir, logFileName)
 	}
-	core.SetLogCap(ag.LogFile)
-
 	// 初始化基础数据
 	core.SetRunMode(core.RunModeLive)
 	banArg := &config.CmdArgs{
@@ -73,6 +71,7 @@ func Run(args []string) error {
 		TimeZone:   ag.TimeZone,
 		Configs:    ag.Configs,
 		ConfigData: ag.ConfigData,
+		Logfile:    ag.LogFile,
 	}
 	core.DevDbPath = ag.DBFile
 	var err2 *errs.Error

@@ -7,8 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/utils"
 	"maps"
 	"math"
 	"os"
@@ -19,6 +17,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/utils"
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
@@ -735,17 +736,19 @@ func BtFactors(args []string) error {
 	if err_ != nil {
 		return err_
 	}
+	var logFile string
 	if outDir != "" {
 		outDir = config.ParsePath(outDir)
 		err_ = utils.EnsureDir(outDir, 0755)
 		if err_ != nil {
 			return err_
 		}
-		core.SetLogCap(filepath.Join(outDir, "out.log"))
+		logFile = filepath.Join(outDir, "out.log")
 	}
 	core.SetRunMode(core.RunModeBackTest)
 	err := biz.SetupComsExg(&config.CmdArgs{
 		Configs: configPaths,
+		Logfile: logFile,
 	})
 	if err != nil {
 		return err
@@ -1008,7 +1011,7 @@ func BuildBtResult(args *config.CmdArgs) *errs.Error {
 		if err_ != nil {
 			return errs.New(errs.CodeIOWriteFail, err_)
 		}
-		core.SetLogCap(filepath.Join(outDir, "out.log"))
+		args.Logfile = filepath.Join(outDir, "out.log")
 	}
 	err := biz.SetupComsExg(args)
 	if err != nil {

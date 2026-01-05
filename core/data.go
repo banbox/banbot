@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 
-	"github.com/banbox/banexg/log"
 	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banexg"
@@ -38,7 +37,6 @@ var (
 	OrderMatchTfs = make(map[string]bool)              // Timeframes to match for order 订单撮合的周期
 
 	ExitCalls []func() // CALLBACK TO STOP EXECUTION 停止执行的回调
-	CapOut    *log.OutCapture
 
 	CPUProfile bool
 	MemProfile bool
@@ -55,7 +53,6 @@ var (
 	Version   = "v0.2.29-beta.6"
 	UIVersion = "v0.2.24"
 	SysLang   string // language code for current system 当前系统语言设置
-	LogFile   string
 	DevDbPath string
 )
 

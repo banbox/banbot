@@ -3,16 +3,17 @@ package core
 import (
 	"bytes"
 	"fmt"
+	"math"
+	"os"
+	"strings"
+	"unicode"
+
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/dgraph-io/ristretto"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
-	"math"
-	"os"
-	"strings"
-	"unicode"
 )
 
 var (
@@ -295,39 +296,6 @@ func SplitDigits(s string) []string {
 	}
 
 	return result
-}
-
-func SetLogCap(path string) {
-	if LogFile == path {
-		return
-	}
-	LogFile = ""
-	if CapOut != nil {
-		CapOut.Stop()
-		CapOut = nil
-	}
-	var flags = os.O_CREATE | os.O_WRONLY
-	if LiveMode {
-		// 实时模式日志追加保存
-		flags = os.O_APPEND | os.O_CREATE | os.O_WRONLY
-	}
-	file, err := os.OpenFile(path, flags, 0644)
-	if err != nil {
-		log.Error("open file to write log fail", zap.Error(err))
-		return
-	}
-	CapOut, err = log.NewOutCapture(file, file)
-	if err != nil {
-		log.Error("new out capture fail", zap.Error(err))
-	} else {
-		CapOut.Start()
-		LogFile = path
-	}
-	ExitCalls = append(ExitCalls, func() {
-		if CapOut != nil {
-			CapOut.Stop()
-		}
-	})
 }
 
 func GetOdBook(pair string) (*banexg.OrderBook, bool) {
