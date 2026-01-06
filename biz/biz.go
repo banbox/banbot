@@ -5,13 +5,14 @@ import (
 	"embed"
 	_ "embed"
 	"fmt"
-	"github.com/banbox/banbot/com"
 	"maps"
 	"os"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/banbox/banbot/com"
 
 	"github.com/sasha-s/go-deadlock"
 
@@ -469,10 +470,10 @@ func replaceDockerHosts(data []byte) []byte {
 
 func InitDataDir() *errs.Error {
 	dataDir := config.GetDataDir()
-	err_ := utils.EnsureDir(dataDir, 0755)
 	if dataDir == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "-datadir or env `BanDataDir` is required")
 	}
+	err_ := utils.EnsureDir(dataDir, 0755)
 	if err_ != nil {
 		return errs.New(errs.CodeIOWriteFail, err_)
 	}
