@@ -31,7 +31,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - odmgr_local_live.go: 本地模拟实盘的订单管理器。
 - telegram_order_manager.go: Telegram Bot订单管理接口实现,为rpc/telegram.go提供订单操作功能。
 - trader.go: 交易员核心逻辑，处理K线数据并驱动策略执行。
-- wallet.go: 钱包管理，包括余额、冻结、挂单等状态的维护。
+- wallet.go: 钱包管理，包括余额、冻结、挂单等状态的维护；dry-run 钱包快照保存与7天后按小时压缩清理。
 - tools.go: 提供业务逻辑层的辅助工具函数。
 - aifea.pb.go: Protobuf生成的gRPC消息结构体。
 - aifea_grpc.pb.go: Protobuf生成的gRPC服务客户端和服务器存根。

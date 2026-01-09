@@ -199,6 +199,11 @@ func CallLocalLiveOdMgrsKline(msg *data.KLineMsg, bars []*banexg.Kline) *errs.Er
 		if err != nil {
 			return err
 		}
+		if core.RunEnv == core.RunEnvDryRun {
+			if err := SaveDryRunWalletSnapshot(account, btime.TimeMS(), false); err != nil {
+				log.Warn("save dry_run wallet snapshot fail", zap.Error(err))
+			}
+		}
 		for _, od := range curOds {
 			oldStatus := curOdMap[od.ID]
 			if od.Status != oldStatus {
@@ -211,6 +216,9 @@ func CallLocalLiveOdMgrsKline(msg *data.KLineMsg, bars []*banexg.Kline) *errs.Er
 }
 
 func (o *LocalLiveOrderMgr) CleanUp() *errs.Error {
+	if err := SaveDryRunWalletSnapshot(o.Account, 0, true); err != nil {
+		log.Warn("save dry_run wallet state fail", zap.Error(err))
+	}
 	openOds, lock := ormo.GetOpenODs(o.Account)
 	lock.Lock()
 	var needSaveOds []*ormo.InOutOrder

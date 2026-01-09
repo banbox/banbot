@@ -2,9 +2,9 @@ package biz
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"slices"
-	"strings"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
@@ -42,6 +42,17 @@ type BanWallets struct {
 	IsWatch bool
 }
 
+var (
+	lastWalletSnapshotMS        = make(map[string]int64)
+	lastWalletSnapshotCompactMS = make(map[string]int64)
+	walletSnapshotLock          deadlock.Mutex
+	walletSnapshotCompactLock   deadlock.Mutex
+	dryRunSnapshotIntervalMS    = int64(300000)
+	dryRunSnapshotCompactAgeMS  = int64(7 * 24 * 60 * 60 * 1000)
+	dryRunSnapshotCompactCheck  = int64(60 * 60 * 1000)
+	dryRunSnapshotCompactHourMS = int64(60 * 60 * 1000)
+)
+
 /*
 InitFakeWallets
 Initialize a wallet object from a configuration file
@@ -77,6 +88,179 @@ func GetWallets(account string) *BanWallets {
 		accWallets[account] = val
 	}
 	return val
+}
+
+func (w *BanWallets) snapshotItems() []*ormo.WalletSnapshotItem {
+	items := make([]*ormo.WalletSnapshotItem, 0, len(w.Items))
+	for code, item := range w.Items {
+		item.lock.Lock()
+		pendings := maps.Clone(item.Pendings)
+		frozens := maps.Clone(item.Frozens)
+		snap := &ormo.WalletSnapshotItem{
+			Coin:          item.Coin,
+			Available:     item.Available,
+			Pendings:      pendings,
+			Frozens:       frozens,
+			UnrealizedPOL: item.UnrealizedPOL,
+			UsedUPol:      item.UsedUPol,
+			Withdraw:      item.Withdraw,
+		}
+		item.lock.Unlock()
+		if snap.Coin == "" {
+			snap.Coin = code
+		}
+		items = append(items, snap)
+	}
+	return items
+}
+
+func (w *BanWallets) restoreFromItems(items []*ormo.WalletSnapshotItem) {
+	if len(items) == 0 {
+		return
+	}
+	walletItems := make(map[string]*ItemWallet, len(items))
+	for _, snap := range items {
+		coin := snap.Coin
+		if coin == "" {
+			continue
+		}
+		item := &ItemWallet{
+			Coin:          coin,
+			Available:     snap.Available,
+			Pendings:      map[string]float64{},
+			Frozens:       map[string]float64{},
+			UnrealizedPOL: snap.UnrealizedPOL,
+			UsedUPol:      snap.UsedUPol,
+			Withdraw:      snap.Withdraw,
+		}
+		if len(snap.Pendings) > 0 {
+			item.Pendings = maps.Clone(snap.Pendings)
+		}
+		if len(snap.Frozens) > 0 {
+			item.Frozens = maps.Clone(snap.Frozens)
+		}
+		walletItems[coin] = item
+	}
+	if len(walletItems) > 0 {
+		w.Items = walletItems
+	}
+}
+
+func SaveDryRunWalletSnapshot(account string, timeMS int64, force bool) *errs.Error {
+	if core.RunEnv != core.RunEnvDryRun {
+		return nil
+	}
+	task := ormo.GetTask(account)
+	if task == nil {
+		return errs.NewMsg(core.ErrRunTime, "task not found for account %s", account)
+	}
+	if timeMS == 0 {
+		timeMS = btime.TimeMS()
+	}
+	walletSnapshotLock.Lock()
+	lastMS := lastWalletSnapshotMS[account]
+	if !force && timeMS-lastMS < dryRunSnapshotIntervalMS {
+		walletSnapshotLock.Unlock()
+		return nil
+	}
+	lastWalletSnapshotMS[account] = timeMS
+	walletSnapshotLock.Unlock()
+	wallets := GetWallets(account)
+	items := wallets.snapshotItems()
+	if len(items) == 0 {
+		return nil
+	}
+	baseCurrency := ""
+	if len(config.StakeCurrency) > 0 {
+		baseCurrency = config.StakeCurrency[0]
+	}
+	summary := &ormo.WalletSnapshotSummary{
+		BaseCurrency:       baseCurrency,
+		TotalLegal:         wallets.TotalLegal(nil, false),
+		AvailableLegal:     wallets.AvaLegal(nil),
+		UnrealizedPOLLegal: wallets.UnrealizedPOLLegal(nil),
+		WithdrawLegal:      wallets.GetWithdrawLegal(nil),
+	}
+	if err := ormo.SaveWalletSnapshot(task.ID, account, timeMS, items, summary); err != nil {
+		return err
+	}
+	maybeCompactDryRunWalletSnapshots(task.ID, account, timeMS)
+	return nil
+}
+
+func maybeCompactDryRunWalletSnapshots(taskID int64, account string, nowMS int64) {
+	if nowMS == 0 {
+		nowMS = btime.TimeMS()
+	}
+	walletSnapshotCompactLock.Lock()
+	lastCheck := lastWalletSnapshotCompactMS[account]
+	if nowMS-lastCheck < dryRunSnapshotCompactCheck {
+		walletSnapshotCompactLock.Unlock()
+		return
+	}
+	lastWalletSnapshotCompactMS[account] = nowMS
+	walletSnapshotCompactLock.Unlock()
+
+	cutoffMS := nowMS - dryRunSnapshotCompactAgeMS
+	if cutoffMS <= 0 {
+		return
+	}
+	endMS := cutoffMS - (cutoffMS % dryRunSnapshotCompactHourMS)
+	if endMS <= 0 {
+		return
+	}
+	compactedUntilMS, err := ormo.LoadWalletSnapshotCompactUntil(taskID, account)
+	if err != nil {
+		log.Warn("load wallet snapshot compact time fail", zap.Error(err), zap.String("account", account))
+		return
+	}
+	startMS := compactedUntilMS
+	if startMS == 0 {
+		earliestMS, err := ormo.FindEarliestWalletSnapshotTime(taskID, account, endMS)
+		if err != nil {
+			log.Warn("load wallet snapshot earliest time fail", zap.Error(err), zap.String("account", account))
+			return
+		}
+		if earliestMS == 0 {
+			if err := ormo.SaveWalletSnapshotCompactUntil(taskID, account, endMS); err != nil {
+				log.Warn("save wallet snapshot compact time fail", zap.Error(err), zap.String("account", account))
+			}
+			return
+		}
+		startMS = earliestMS - (earliestMS % dryRunSnapshotCompactHourMS)
+	}
+	if startMS >= endMS {
+		return
+	}
+	if _, err := ormo.CompactWalletSnapshotsByHour(taskID, account, startMS, endMS); err != nil {
+		log.Warn("compact wallet snapshots fail", zap.Error(err), zap.String("account", account))
+		return
+	}
+	if err := ormo.SaveWalletSnapshotCompactUntil(taskID, account, endMS); err != nil {
+		log.Warn("save wallet snapshot compact time fail", zap.Error(err), zap.String("account", account))
+	}
+}
+
+func RestoreDryRunWalletSnapshot(account string) bool {
+	if core.RunEnv != core.RunEnvDryRun {
+		return false
+	}
+	task := ormo.GetTask(account)
+	if task == nil {
+		return false
+	}
+	items, _, err := ormo.LoadLatestWalletSnapshot(task.ID, account)
+	if err != nil || len(items) == 0 {
+		if err != nil {
+			log.Warn("load dry_run wallet snapshot fail, fallback to config wallet", zap.Error(err))
+		}
+		return false
+	}
+	wallets := GetWallets(account)
+	wallets.restoreFromItems(items)
+	wallets.TryUpdateStakePctAmt()
+	log.Info("dry_run wallet restored", zap.Int("coins", len(wallets.Items)))
+	return true
 }
 
 // Total: Available+Pendings+Frozens+[UnrealizedPOL]

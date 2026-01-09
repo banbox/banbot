@@ -75,3 +75,58 @@ CREATE TABLE iorder
 
 CREATE INDEX idx_io_status  ON iorder (status);
 CREATE INDEX idx_io_task_id ON iorder (task_id);
+
+-- ----------------------------
+-- Table structure for wallet snapshots
+-- ----------------------------
+CREATE TABLE wallet_snapshot
+(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    INTEGER NOT NULL,
+    account    TEXT    NOT NULL,
+    time_ms    INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_ws_task_time ON wallet_snapshot (task_id, time_ms);
+CREATE INDEX idx_ws_account_time ON wallet_snapshot (account, time_ms);
+
+CREATE TABLE wallet_snapshot_item
+(
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id    INTEGER NOT NULL,
+    coin           TEXT    NOT NULL,
+    available      REAL    NOT NULL,
+    pendings       TEXT    NOT NULL,
+    frozens        TEXT    NOT NULL,
+    unrealized_pol REAL    NOT NULL,
+    used_upol      REAL    NOT NULL,
+    withdraw       REAL    NOT NULL
+);
+
+CREATE INDEX idx_wsi_snapshot ON wallet_snapshot_item (snapshot_id);
+CREATE INDEX idx_wsi_coin ON wallet_snapshot_item (coin);
+
+CREATE TABLE wallet_snapshot_summary
+(
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id        INTEGER NOT NULL,
+    base_currency      TEXT    NOT NULL,
+    total_legal        REAL    NOT NULL,
+    available_legal    REAL    NOT NULL,
+    unrealized_pol_legal REAL  NOT NULL,
+    withdraw_legal     REAL    NOT NULL
+);
+
+CREATE INDEX idx_wss_snapshot ON wallet_snapshot_summary (snapshot_id);
+
+CREATE TABLE wallet_snapshot_compact
+(
+    task_id            INTEGER NOT NULL,
+    account            TEXT    NOT NULL,
+    compacted_until_ms INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (task_id, account)
+);
+
+CREATE INDEX idx_wsc_task_account ON wallet_snapshot_compact (task_id, account);

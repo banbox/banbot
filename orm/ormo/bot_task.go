@@ -3,6 +3,9 @@ package ormo
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -10,8 +13,6 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
-	"path/filepath"
-	"strings"
 )
 
 func InitTask(showLog bool, outDir string) *errs.Error {
