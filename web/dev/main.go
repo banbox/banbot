@@ -106,6 +106,7 @@ func Run(args []string) error {
 
 	// 注册API路由
 	base.RegApiKline(app.Group("/api/kline"))
+	base.RegApiCsv(app.Group("/api/kline"))
 	base.RegApiWebsocket(app.Group("/api/ws"))
 	regApiDev(app.Group("/api/dev"))
 

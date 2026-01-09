@@ -9,7 +9,14 @@
   import {ActionType} from 'klinecharts';
   import { IndFieldsMap } from './coms';
   import KlineIcon from './Icon.svelte';
+  import { postApi, getApi } from '$lib/netio';
+  import { alerts } from '$lib/stores/alerts';
+  import { makeCsvIndicator } from './indicators/cloudInds';
+  import { registerIndicator } from 'klinecharts';
   let { show = $bindable() } = $props();
+  
+  let fileInput: HTMLInputElement;
+  let uploading = $state(false);
   
   const ctx = getContext('ctx') as Writable<ChartCtx>;
   const save = getContext('save') as Writable<ChartSave>;
@@ -50,6 +57,10 @@
   export function createIndicator(name: string, params?: any[], isStack?: boolean, paneOptions?: PaneOptions): Nullable<any> {
     const chartObj = $chart;
     if (!chartObj) return null;
+    // CSV indicators need to be registered before creating
+    if (name.endsWith('.csv')) {
+      registerIndicator(makeCsvIndicator(name));
+    }
     if (name === 'VOL') {
       paneOptions = { axis: {gap: { bottom: 2 }}, ...paneOptions }
     }
@@ -124,16 +135,91 @@
     })
   })
 
+  async function handleFileSelect(event: Event) {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    
+    if (!file.name.toLowerCase().endsWith('.csv')) {
+      alerts.error('Only .csv files are allowed');
+      return;
+    }
+
+    uploading = true;
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const rsp = await postApi('/kline/csv/upload', formData);
+    uploading = false;
+    
+    if (rsp.code === 200) {
+      alerts.success(m.upload_csv_success());
+      await refreshCsvList();
+    } else {
+      alerts.error(m.upload_csv_failed() + ': ' + (rsp.msg || ''));
+    }
+    
+    // Reset the input so the same file can be selected again
+    input.value = '';
+  }
+
+  export async function refreshCsvList() {
+    const rsp = await getApi('/kline/csv/list');
+    if (rsp.code === 200 && rsp.data) {
+      // Remove old CSV indicators and add new ones
+      ctx.update(c => {
+        c.allInds = c.allInds.filter(ind => !ind.name.endsWith('.csv'));
+        for (const csvInd of rsp.data) {
+          c.allInds.push({
+            name: csvInd.name,
+            title: csvInd.title,
+            cloud: true,
+            is_main: false
+          });
+          // Register CSV indicator with klinecharts
+          registerIndicator(makeCsvIndicator(csvInd.name));
+        }
+        return c;
+      });
+    }
+  }
+
 </script>
 
 <Modal title={m.indicator()} width={550} bind:show={show}>
   <div class="flex flex-col gap-4">
-    <input
-      type="text"
-      class="input w-full"
-      placeholder={m.search()}
-      bind:value={keyword}
-    />
+    <div class="flex gap-2">
+      <input
+        type="text"
+        class="input flex-1"
+        placeholder={m.search()}
+        bind:value={keyword}
+      />
+      <input
+        type="file"
+        accept=".csv"
+        class="hidden"
+        bind:this={fileInput}
+        onchange={handleFileSelect}
+      />
+      <button 
+        class="btn btn-outline btn-sm"
+        onclick={() => fileInput?.click()}
+        disabled={uploading}
+      >
+        {#if uploading}
+          <span class="loading loading-spinner loading-xs"></span>
+        {/if}
+        {m.import_csv()}
+      </button>
+      <button 
+        class="btn btn-outline btn-sm btn-square"
+        onclick={() => refreshCsvList()}
+        title={m.refresh_cloud_inds()}
+      >
+        ↻
+      </button>
+    </div>
     
     <div class="flex h-[400px]">
       <div class="flex-1 overflow-y-auto">

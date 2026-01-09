@@ -2,8 +2,9 @@ package live
 
 import (
 	"fmt"
-	"github.com/banbox/banexg/utils"
 	"strings"
+
+	"github.com/banbox/banexg/utils"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/web/base"
@@ -36,6 +37,7 @@ func StartApi() *errs.Error {
 
 	// register routes 注册路由
 	base.RegApiKline(app.Group("/api/kline"))
+	base.RegApiCsv(app.Group("/api/kline"))
 	base.RegApiWebsocket(app.Group("/api/ws"))
 	regApiBiz(app.Group("/api/bot", AuthMiddleware(cfg.JWTSecretKey)))
 	regApiPub(app.Group("/api"))
