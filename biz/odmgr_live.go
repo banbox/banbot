@@ -1059,6 +1059,31 @@ func (o *LiveOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, [
 	return o.OrderMgr.ProcessOrders(job)
 }
 
+func (o *LiveOrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error {
+	if err := o.OrderMgr.UpdateByBar(allOpens, bar); err != nil {
+		return err
+	}
+	// Enforce StopBars for submitted limit entry orders in live mode.
+	curMS := btime.TimeMS()
+	for _, od := range allOpens {
+		if od.Status > ormo.InOutStatusInit || od.Enter == nil || od.Enter.Price == 0 {
+			continue
+		}
+		if !strings.Contains(od.Enter.OrderType, banexg.OdTypeLimit) {
+			continue
+		}
+		if od.Enter.OrderID == "" {
+			// Trigger orders (not yet submitted) are handled by VerifyTriggerOds.
+			continue
+		}
+		stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
+		if stopAfter > 0 && stopAfter <= curMS {
+			cancelTimeoutEnter(o, od)
+		}
+	}
+	return nil
+}
+
 func (o *LiveOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
 	if isFarEnter(od) {
 		ormo.AddTriggerOd(o.Account, od)
