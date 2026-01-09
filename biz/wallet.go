@@ -360,11 +360,11 @@ func StartLiveWalletSnapshots() {
 	}()
 }
 
-// Total: Available+Pendings+Frozens+[UnrealizedPOL]
+// Total: Available+Withdraw+Pendings+Frozens+[UnrealizedPOL]
 func (iw *ItemWallet) Total(withUpol bool) float64 {
 	sumVal := iw.Used()
 	iw.lock.Lock()
-	sumVal += iw.Available
+	sumVal += iw.Available + iw.Withdraw
 	if withUpol {
 		sumVal += iw.UnrealizedPOL
 	}

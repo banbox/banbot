@@ -6,7 +6,6 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
-	"github.com/banbox/banbot/com"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/banbox/banbot/com"
 
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg"
@@ -267,8 +268,8 @@ func (r *BTResult) Collect() {
 		}
 	}
 	wallets := biz.GetWallets(config.DefAcc)
-	r.FinBalance = wallets.AvaLegal(nil)
 	r.FinWithdraw = wallets.GetWithdrawLegal(nil)
+	r.FinBalance = wallets.AvaLegal(nil) + r.FinWithdraw
 	rangeSecs := (r.EndMS - r.StartMS) / 1000
 	sharpe, sortino, err := CalcMeasuresByReal(r.Plots.Real, rangeSecs, "", 0, 0)
 	if err != nil {
