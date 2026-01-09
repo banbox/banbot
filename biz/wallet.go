@@ -5,6 +5,8 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"strings"
+	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
@@ -42,15 +44,61 @@ type BanWallets struct {
 	IsWatch bool
 }
 
+type walletSnapshotCompactCfg struct {
+	lastCheckMS   map[string]int64
+	lastCheckLock *deadlock.Mutex
+	compactCheck  int64
+	compactAgeMS  int64
+	compactHourMS int64
+}
+
+type walletSnapshotCfg struct {
+	lastSnapshotMS   map[string]int64
+	lastSnapshotLock *deadlock.Mutex
+	intervalMS       int64
+	compactCfg       *walletSnapshotCompactCfg
+}
+
+const (
+	walletSnapshotIntervalMS   = int64(300000)
+	walletSnapshotCompactAgeMS = int64(7 * 24 * 60 * 60 * 1000)
+	walletSnapshotCompactCheck = int64(60 * 60 * 1000)
+	walletSnapshotCompactHour  = int64(60 * 60 * 1000)
+)
+
 var (
-	lastWalletSnapshotMS        = make(map[string]int64)
-	lastWalletSnapshotCompactMS = make(map[string]int64)
-	walletSnapshotLock          deadlock.Mutex
-	walletSnapshotCompactLock   deadlock.Mutex
-	dryRunSnapshotIntervalMS    = int64(300000)
-	dryRunSnapshotCompactAgeMS  = int64(7 * 24 * 60 * 60 * 1000)
-	dryRunSnapshotCompactCheck  = int64(60 * 60 * 1000)
-	dryRunSnapshotCompactHourMS = int64(60 * 60 * 1000)
+	lastWalletSnapshotMS          = make(map[string]int64)
+	lastWalletSnapshotCompactMS   = make(map[string]int64)
+	walletSnapshotLock            deadlock.Mutex
+	walletSnapshotCompactLock     deadlock.Mutex
+	liveWalletSnapshotMS          = make(map[string]int64)
+	liveWalletSnapshotCompactMS   = make(map[string]int64)
+	liveWalletSnapshotLock        deadlock.Mutex
+	liveWalletSnapshotCompactLock deadlock.Mutex
+	dryRunSnapshotCfg             = walletSnapshotCfg{
+		lastSnapshotMS:   lastWalletSnapshotMS,
+		lastSnapshotLock: &walletSnapshotLock,
+		intervalMS:       walletSnapshotIntervalMS,
+		compactCfg: &walletSnapshotCompactCfg{
+			lastCheckMS:   lastWalletSnapshotCompactMS,
+			lastCheckLock: &walletSnapshotCompactLock,
+			compactCheck:  walletSnapshotCompactCheck,
+			compactAgeMS:  walletSnapshotCompactAgeMS,
+			compactHourMS: walletSnapshotCompactHour,
+		},
+	}
+	liveSnapshotCfg = walletSnapshotCfg{
+		lastSnapshotMS:   liveWalletSnapshotMS,
+		lastSnapshotLock: &liveWalletSnapshotLock,
+		intervalMS:       walletSnapshotIntervalMS,
+		compactCfg: &walletSnapshotCompactCfg{
+			lastCheckMS:   liveWalletSnapshotCompactMS,
+			lastCheckLock: &liveWalletSnapshotCompactLock,
+			compactCheck:  walletSnapshotCompactCheck,
+			compactAgeMS:  walletSnapshotCompactAgeMS,
+			compactHourMS: walletSnapshotCompactHour,
+		},
+	}
 )
 
 /*
@@ -146,10 +194,21 @@ func (w *BanWallets) restoreFromItems(items []*ormo.WalletSnapshotItem) {
 	}
 }
 
-func SaveDryRunWalletSnapshot(account string, timeMS int64, force bool) *errs.Error {
-	if core.RunEnv != core.RunEnvDryRun {
-		return nil
+func buildWalletSnapshotSummary(wallets *BanWallets) *ormo.WalletSnapshotSummary {
+	baseCurrency := ""
+	if len(config.StakeCurrency) > 0 {
+		baseCurrency = config.StakeCurrency[0]
 	}
+	return &ormo.WalletSnapshotSummary{
+		BaseCurrency:       baseCurrency,
+		TotalLegal:         wallets.LegalValue(LegalValueTotal, nil, false),
+		AvailableLegal:     wallets.LegalValue(LegalValueAvailable, nil, false),
+		UnrealizedPOLLegal: wallets.LegalValue(LegalValueUnrealizedPOL, nil, false),
+		WithdrawLegal:      wallets.LegalValue(LegalValueWithdraw, nil, false),
+	}
+}
+
+func saveWalletSnapshot(account string, timeMS int64, force bool, cfg *walletSnapshotCfg) *errs.Error {
 	task := ormo.GetTask(account)
 	if task == nil {
 		return errs.NewMsg(core.ErrRunTime, "task not found for account %s", account)
@@ -157,55 +216,54 @@ func SaveDryRunWalletSnapshot(account string, timeMS int64, force bool) *errs.Er
 	if timeMS == 0 {
 		timeMS = btime.TimeMS()
 	}
-	walletSnapshotLock.Lock()
-	lastMS := lastWalletSnapshotMS[account]
-	if !force && timeMS-lastMS < dryRunSnapshotIntervalMS {
-		walletSnapshotLock.Unlock()
+	cfg.lastSnapshotLock.Lock()
+	lastMS := cfg.lastSnapshotMS[account]
+	if !force && timeMS-lastMS < cfg.intervalMS {
+		cfg.lastSnapshotLock.Unlock()
 		return nil
 	}
-	lastWalletSnapshotMS[account] = timeMS
-	walletSnapshotLock.Unlock()
+	cfg.lastSnapshotMS[account] = timeMS
+	cfg.lastSnapshotLock.Unlock()
 	wallets := GetWallets(account)
 	items := wallets.snapshotItems()
 	if len(items) == 0 {
 		return nil
 	}
-	baseCurrency := ""
-	if len(config.StakeCurrency) > 0 {
-		baseCurrency = config.StakeCurrency[0]
-	}
-	summary := &ormo.WalletSnapshotSummary{
-		BaseCurrency:       baseCurrency,
-		TotalLegal:         wallets.TotalLegal(nil, false),
-		AvailableLegal:     wallets.AvaLegal(nil),
-		UnrealizedPOLLegal: wallets.UnrealizedPOLLegal(nil),
-		WithdrawLegal:      wallets.GetWithdrawLegal(nil),
-	}
+	summary := buildWalletSnapshotSummary(wallets)
 	if err := ormo.SaveWalletSnapshot(task.ID, account, timeMS, items, summary); err != nil {
 		return err
 	}
-	maybeCompactDryRunWalletSnapshots(task.ID, account, timeMS)
+	if cfg.compactCfg != nil {
+		maybeCompactWalletSnapshots(task.ID, account, timeMS, cfg.compactCfg)
+	}
 	return nil
 }
 
-func maybeCompactDryRunWalletSnapshots(taskID int64, account string, nowMS int64) {
+func SaveDryRunWalletSnapshot(account string, timeMS int64, force bool) *errs.Error {
+	if core.RunEnv != core.RunEnvDryRun {
+		return nil
+	}
+	return saveWalletSnapshot(account, timeMS, force, &dryRunSnapshotCfg)
+}
+
+func maybeCompactWalletSnapshots(taskID int64, account string, nowMS int64, cfg *walletSnapshotCompactCfg) {
 	if nowMS == 0 {
 		nowMS = btime.TimeMS()
 	}
-	walletSnapshotCompactLock.Lock()
-	lastCheck := lastWalletSnapshotCompactMS[account]
-	if nowMS-lastCheck < dryRunSnapshotCompactCheck {
-		walletSnapshotCompactLock.Unlock()
+	cfg.lastCheckLock.Lock()
+	lastCheck := cfg.lastCheckMS[account]
+	if nowMS-lastCheck < cfg.compactCheck {
+		cfg.lastCheckLock.Unlock()
 		return
 	}
-	lastWalletSnapshotCompactMS[account] = nowMS
-	walletSnapshotCompactLock.Unlock()
+	cfg.lastCheckMS[account] = nowMS
+	cfg.lastCheckLock.Unlock()
 
-	cutoffMS := nowMS - dryRunSnapshotCompactAgeMS
+	cutoffMS := nowMS - cfg.compactAgeMS
 	if cutoffMS <= 0 {
 		return
 	}
-	endMS := cutoffMS - (cutoffMS % dryRunSnapshotCompactHourMS)
+	endMS := cutoffMS - (cutoffMS % cfg.compactHourMS)
 	if endMS <= 0 {
 		return
 	}
@@ -227,7 +285,7 @@ func maybeCompactDryRunWalletSnapshots(taskID int64, account string, nowMS int64
 			}
 			return
 		}
-		startMS = earliestMS - (earliestMS % dryRunSnapshotCompactHourMS)
+		startMS = earliestMS - (earliestMS % cfg.compactHourMS)
 	}
 	if startMS >= endMS {
 		return
@@ -261,6 +319,45 @@ func RestoreDryRunWalletSnapshot(account string) bool {
 	wallets.TryUpdateStakePctAmt()
 	log.Info("dry_run wallet restored", zap.Int("coins", len(wallets.Items)))
 	return true
+}
+
+func SaveLiveWalletSnapshot(account string, timeMS int64, force bool) *errs.Error {
+	if !core.EnvReal {
+		return nil
+	}
+	return saveWalletSnapshot(account, timeMS, force, &liveSnapshotCfg)
+}
+
+func SaveLiveWalletSnapshots(force bool) {
+	if !core.EnvReal {
+		return
+	}
+	timeMS := btime.TimeMS()
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
+		if err := SaveLiveWalletSnapshot(account, timeMS, force); err != nil {
+			log.Warn("save live wallet snapshot fail", zap.Error(err), zap.String("account", account))
+		}
+	}
+}
+
+func StartLiveWalletSnapshots() {
+	if !core.EnvReal {
+		return
+	}
+	SaveLiveWalletSnapshots(true)
+	go func() {
+		ticker := time.NewTicker(time.Duration(liveSnapshotCfg.intervalMS) * time.Millisecond)
+		core.ExitCalls = append(core.ExitCalls, ticker.Stop)
+		for {
+			select {
+			case <-ticker.C:
+				SaveLiveWalletSnapshots(false)
+			}
+		}
+	}()
 }
 
 // Total: Available+Pendings+Frozens+[UnrealizedPOL]
@@ -936,7 +1033,16 @@ func (w *BanWallets) GetAmountByLegal(symbol string, legalCost float64) float64 
 	return legalCost / com.GetPrice(symbol, "")
 }
 
-func (w *BanWallets) calcLegal(itemAmt func(item *ItemWallet) float64, symbols []string) ([]float64, []string, []float64) {
+type LegalValueKind uint8
+
+const (
+	LegalValueAvailable LegalValueKind = iota
+	LegalValueTotal
+	LegalValueUnrealizedPOL
+	LegalValueWithdraw
+)
+
+func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol bool) ([]float64, []string, []float64) {
 	var data map[string]*ItemWallet
 	if len(symbols) > 0 {
 		data = make(map[string]*ItemWallet)
@@ -960,7 +1066,20 @@ func (w *BanWallets) calcLegal(itemAmt func(item *ItemWallet) float64, symbols [
 			skips = append(skips, key)
 			continue
 		}
-		amounts = append(amounts, itemAmt(item)*price)
+		var amount float64
+		switch kind {
+		case LegalValueAvailable:
+			amount = item.Available
+		case LegalValueTotal:
+			amount = item.Total(withUPol)
+		case LegalValueUnrealizedPOL:
+			amount = item.UnrealizedPOL
+		case LegalValueWithdraw:
+			amount = item.Withdraw
+		default:
+			continue
+		}
+		amounts = append(amounts, amount*price)
 		coins = append(coins, key)
 		prices = append(prices, price)
 	}
@@ -972,8 +1091,8 @@ func (w *BanWallets) calcLegal(itemAmt func(item *ItemWallet) float64, symbols [
 	return amounts, coins, prices
 }
 
-func (w *BanWallets) calculateTotalLegal(valueExtractor func(*ItemWallet) float64, symbols []string) float64 {
-	amounts, _, _ := w.calcLegal(valueExtractor, symbols)
+func (w *BanWallets) LegalValue(kind LegalValueKind, symbols []string, withUPol bool) float64 {
+	amounts, _, _ := w.calcLegal(kind, symbols, withUPol)
 	total := 0.0
 	for _, amt := range amounts {
 		total += amt
@@ -982,19 +1101,19 @@ func (w *BanWallets) calculateTotalLegal(valueExtractor func(*ItemWallet) float6
 }
 
 func (w *BanWallets) AvaLegal(symbols []string) float64 {
-	return w.calculateTotalLegal(func(x *ItemWallet) float64 { return x.Available }, symbols)
+	return w.LegalValue(LegalValueAvailable, symbols, false)
 }
 
 func (w *BanWallets) TotalLegal(symbols []string, withUPol bool) float64 {
-	return w.calculateTotalLegal(func(x *ItemWallet) float64 { return x.Total(withUPol) }, symbols)
+	return w.LegalValue(LegalValueTotal, symbols, withUPol)
 }
 
 func (w *BanWallets) UnrealizedPOLLegal(symbols []string) float64 {
-	return w.calculateTotalLegal(func(x *ItemWallet) float64 { return x.UnrealizedPOL }, symbols)
+	return w.LegalValue(LegalValueUnrealizedPOL, symbols, false)
 }
 
 func (w *BanWallets) GetWithdrawLegal(symbols []string) float64 {
-	return w.calculateTotalLegal(func(x *ItemWallet) float64 { return x.Withdraw }, symbols)
+	return w.LegalValue(LegalValueWithdraw, symbols, false)
 }
 
 /*
@@ -1003,7 +1122,7 @@ Withdraw cash from the balance, thereby prohibiting a portion of the money from 
 从余额提现，从而禁止一部分钱开单。
 */
 func (w *BanWallets) WithdrawLegal(amount float64, symbols []string) {
-	amounts, coins, prices := w.calcLegal(func(x *ItemWallet) float64 { return x.Available }, symbols)
+	amounts, coins, prices := w.calcLegal(LegalValueAvailable, symbols, false)
 	total := 0.0
 	for _, amt := range amounts {
 		total += amt

@@ -202,6 +202,8 @@ func (t *CryptoTrader) startJobs() {
 		// Regularly update balance and synchronize exchange positions with local orders
 		// 定期更新余额，同步交易所持仓到本地订单
 		StartLoopBalancePositions()
+		// 定期保存实盘钱包快照
+		biz.StartLiveWalletSnapshots()
 	}
 	com.Cron().Start()
 }

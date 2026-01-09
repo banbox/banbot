@@ -15,6 +15,11 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 
 ## 核心文件索引
 
+### 文件命名约定
+- main.go: 模块/服务入口（无特殊说明时）
+- common.go: 模块内通用逻辑或共享结构
+- tools.go: 模块辅助工具函数
+
 ### `.` (项目根目录)
 - main.go: 应用程序主入口，解析命令行参数并启动相应服务。
 
@@ -31,8 +36,8 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - odmgr_local_live.go: 本地模拟实盘的订单管理器。
 - telegram_order_manager.go: Telegram Bot订单管理接口实现,为rpc/telegram.go提供订单操作功能。
 - trader.go: 交易员核心逻辑，处理K线数据并驱动策略执行。
-- wallet.go: 钱包管理，包括余额、冻结、挂单等状态的维护；dry-run 钱包快照保存与7天后按小时压缩清理。
-- tools.go: 提供业务逻辑层的辅助工具函数。
+- wallet.go: 钱包管理，包括余额、冻结、挂单等状态的维护；dry-run/实盘 钱包快照保存与7天后按小时压缩清理。
+- tools.go
 - aifea.pb.go: Protobuf生成的gRPC消息结构体。
 - aifea_grpc.pb.go: Protobuf生成的gRPC服务客户端和服务器存根。
 - zh-CN/,en-US/: 嵌入式多语言资源文件。
@@ -69,7 +74,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - ws_feeder.go: WebSocket数据喂食器,用于实时模式。
 - ws_loader.go: WebSocket数据加载器,管理实时数据流。
 - common.go: 数据处理模块的通用函数和结构。
-- tools.go: 数据处理相关的辅助工具。
+- tools.go
 
 ### `entry/` (程序入口)
 - main.go: (文件内容未提供) 可能的程序主入口。
@@ -89,7 +94,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 ### `live/` (实盘交易)
 - crypto_trader.go: 加密货币实盘交易的主逻辑，负责启动和管理整个实盘流程。
 - common.go: 实盘模式下的定时任务和公共函数。
-- tools.go: 实盘交易相关的辅助工具。
+- tools.go
 
 ### `opt/` (回测与优化)
 - backtest.go: 回测引擎的核心实现。
@@ -97,7 +102,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - reports.go: 生成回测报告和图表的逻辑。
 - sim_bt.go: 从日志运行滚动模拟回测的逻辑。
 - common.go: 回测和优化模块的通用函数和结构。
-- tools.go: 回测和优化相关的辅助工具。
+- tools.go
 
 ### `orm/` (数据库交互)
 - base.go: 数据库连接池的初始化和基础操作。
@@ -111,7 +116,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - kinfo.go: K线信息（如数据范围）的查询逻辑。
 - kline.go: K线数据的聚合、下载、修正等高级操作。
 - models.go: sqlc生成的数据库表结构体。
-- tools.go: ORM层的辅助工具。
+- tools.go
 - types.go: ORM层自定义的数据结构。
 
 ### `orm/ormo/` (订单数据库)
@@ -165,7 +170,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - yaml_merge.go: YAML文件合并工具。
 
 ### `web/` (Web服务)
-- main.go: Web服务的启动入口。
+- main.go
 - base/: 提供了Web服务的基础API和公共组件。
   - api_com.go: API公共函数,包括参数验证和错误处理。
   - api_kline.go: K线数据接口。
@@ -174,13 +179,13 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
   - indicators.go: 技术指标计算。
   - biz_com.go: 业务公共逻辑。
 - dev/: 开发模式下的Web服务,提供了策略开发、回测管理等功能。
-  - main.go: 开发服务器启动入口。
+  - main.go
   - api_dev.go: 开发相关API接口。
   - strat.go: 策略管理接口。
   - data_tools.go: 数据工具接口。
   - websocket.go: 开发模式WebSocket支持。
 - live/: 实盘模式下的Web服务,用于监控和管理实盘机器人。
-  - main.go: 实盘API服务器启动入口。
+  - main.go
   - auth.go: JWT认证中间件,支持用户登录和策略回调接口。
   - biz.go: 实盘业务API,包括余额、订单、统计、配置等。
 - ui/: 嵌入式的前端UI资源。
