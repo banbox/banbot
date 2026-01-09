@@ -238,6 +238,7 @@
   "end_time": "结束时间",
   "win_total_num": "盈利/全部",
   "profit_rate": "盈亏率",
+  "annualized_return": "年化收益率",
   "date": "日期",
   "init_balance": "初始余额",
   "win_duration": "盈利时长",

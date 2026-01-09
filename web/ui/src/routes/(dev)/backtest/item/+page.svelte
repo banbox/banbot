@@ -359,6 +359,14 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
     return num.toFixed(decimals) + '%';
   }
 
+  function calcAnnualizedReturnPct(startMS: number, endMS: number, totalReturnPct: number) {
+    const durationDays = (endMS - startMS) / (24 * 60 * 60 * 1000);
+    if (durationDays <= 0) return 0;
+    const base = 1 + totalReturnPct / 100;
+    if (base <= 0) return -100;
+    return (Math.pow(base, 365 / durationDays) - 1) * 100;
+  }
+
   function formatDuration(ms: number) {
     const hours = Math.floor(ms / (3600 * 1000));
     const minutes = Math.floor((ms % (3600 * 1000)) / (60 * 1000));
@@ -593,6 +601,10 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
       {#if activeTab === 'overview' && detail}
         {#if task?.status == 3}
         <!-- 重要统计信息 -->
+        {@const startMS = detail.startMS || task?.startAt || 0}
+        {@const endMS = detail.endMS || task?.stopAt || 0}
+        {@const durationDays = (endMS - startMS) / (24 * 60 * 60 * 1000)}
+        {@const annualizedReturnPct = calcAnnualizedReturnPct(startMS, endMS, detail.totProfitPct)}
         <div class="stats bg-base-100 stats-vertical lg:stats-horizontal shadow mb-6">
           {@render statCard(
             m.init_amount(),
@@ -606,6 +618,13 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
             'text-success',
             formatPercent(detail.totProfitPct, 1),
             `${m.tot_profit()} ${formatNumber(detail.totProfit, 2)}`
+          )}
+
+          {@render statCard(
+            m.annualized_return(),
+            'text-success',
+            formatPercent(annualizedReturnPct, 1),
+            durationDays > 0 ? `${formatNumber(durationDays, 1)}d` : ''
           )}
 
           {@render statCard(

@@ -238,6 +238,7 @@
     "end_time": "End Time",
     "win_total_num": "Win/Total",
     "profit_rate": "Profit Rate",
+    "annualized_return": "Annualized Return",
     "date": "Date",
     "init_balance": "Init Balance",
     "win_duration": "Win Duration",
