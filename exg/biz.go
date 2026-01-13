@@ -54,6 +54,7 @@ func create(name, market, contractType string) (banexg.BanExchange, *errs.Error)
 		accs[key] = map[string]interface{}{
 			banexg.OptApiKey:    sec.APIKey,
 			banexg.OptApiSecret: sec.APISecret,
+			banexg.OptPassword:  sec.Password,
 			banexg.OptNoTrade:   true,
 		}
 		defAcc = key
@@ -66,6 +67,7 @@ func create(name, market, contractType string) (banexg.BanExchange, *errs.Error)
 		accs[key] = map[string]interface{}{
 			banexg.OptApiKey:    sec.APIKey,
 			banexg.OptApiSecret: sec.APISecret,
+			banexg.OptPassword:  sec.Password,
 		}
 		defAcc = key
 	}
@@ -132,7 +134,18 @@ func precNum(exchange banexg.BanExchange, symbol string, num float64, source str
 	} else if source == "price" {
 		res, err = exchange.PrecPrice(market, num)
 	} else if source == "amount" {
-		res, err = exchange.PrecAmount(market, num)
+		// For contract markets with ContractSize != 1, convert coin amount to contracts,
+		// apply precision, then convert back to coins.
+		// OKX uses contract units for derivatives (sz = number of contracts)
+		if market.Contract && market.ContractSize > 0 && market.ContractSize != 1 {
+			num = num / market.ContractSize
+			res, err = exchange.PrecAmount(market, num)
+			if err == nil {
+				res = res * market.ContractSize
+			}
+		} else {
+			res, err = exchange.PrecAmount(market, num)
+		}
 	} else if source == "fee" {
 		res, err = exchange.PrecFee(market, num)
 	} else {

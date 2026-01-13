@@ -37,6 +37,41 @@ func TestCopyDir(t *testing.T) {
 	}
 }
 
+func TestHashToAlphaNum(t *testing.T) {
+	tests := []struct {
+		input  string
+		length int
+	}{
+		{"banbot", 6},
+		{"test", 6},
+		{"mybot", 6},
+		{"", 6},
+	}
+	for _, tt := range tests {
+		result := HashToAlphaNum(tt.input, tt.length)
+		if len(result) != tt.length {
+			t.Errorf("HashToAlphaNum(%q, %d) length = %d; want %d", tt.input, tt.length, len(result), tt.length)
+		}
+		// Verify only alphanumeric
+		for _, c := range result {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')) {
+				t.Errorf("HashToAlphaNum(%q, %d) contains invalid char %c", tt.input, tt.length, c)
+			}
+		}
+		// Verify deterministic
+		result2 := HashToAlphaNum(tt.input, tt.length)
+		if result != result2 {
+			t.Errorf("HashToAlphaNum(%q, %d) not deterministic: %s vs %s", tt.input, tt.length, result, result2)
+		}
+	}
+	// Verify different inputs produce different outputs
+	h1 := HashToAlphaNum("banbot", 6)
+	h2 := HashToAlphaNum("test", 6)
+	if h1 == h2 {
+		t.Errorf("Different inputs should produce different hashes: %s == %s", h1, h2)
+	}
+}
+
 func TestRoundSecsTF(t *testing.T) {
 	tests := []struct {
 		secs     int

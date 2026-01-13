@@ -181,6 +181,22 @@ func SplitLines(text string) []string {
 	return strings.Split(text, "\n")
 }
 
+// HashToAlphaNum converts a string to a fixed-length alphanumeric hash
+// Used for OKX clientOrderId which only allows alphanumeric characters
+func HashToAlphaNum(s string, length int) string {
+	const alphaNum = "0123456789abcdefghijklmnopqrstuvwxyz"
+	var hash uint64
+	for _, c := range s {
+		hash = hash*31 + uint64(c)
+	}
+	result := make([]byte, length)
+	for i := length - 1; i >= 0; i-- {
+		result[i] = alphaNum[hash%36]
+		hash /= 36
+	}
+	return string(result)
+}
+
 // MaskDBUrl 将数据库连接字符串中的敏感信息（用户名和密码）替换为***
 func MaskDBUrl(url string) string {
 	// 处理postgresql格式：postgresql://user:pass@host:port/dbname

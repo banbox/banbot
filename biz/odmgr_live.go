@@ -109,12 +109,8 @@ func newLiveOrderMgr(account string, callBack func(od *ormo.InOutOrder, isEnter 
 	}
 	res.afterEnter = makeAfterEnter(res)
 	res.afterExit = makeAfterExit(res)
-	if core.ExgName == "binance" {
-		res.exitByMyOrder = bnbExitByMyOrder(res)
-		res.traceExgOrder = bnbTraceExgOrder(res)
-	} else {
-		panic("unsupport exchange for LiveOrderMgr: " + core.ExgName)
-	}
+	res.exitByMyOrder = exitByMyOrder(res)
+	res.traceExgOrder = traceExgOrder(res)
 	if exg.AfterCreateOrder == nil {
 		exg.AfterCreateOrder = logPutOrder
 	}
@@ -1346,19 +1342,37 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 }
 
 /*
-Parse the order ClientID passed into the exchange, generally in the form of: botName_inOutId_randNum
-解析传入交易所的订单ClientID，一般形如：botName_inOutId_randNum_
+Parse the order ClientID passed into the exchange
+For Binance: botName_inOutId_randNum (underscore separated)
+For OKX: {nameHash6}{orderId12}{rand4} (fixed-length alphanumeric)
+解析传入交易所的订单ClientID
 */
 func getClientOrderId(clientId string) int64 {
-	arr := strings.Split(clientId, "_")
-	if len(arr) < 2 || arr[0] != config.Name {
-		return 0
+	if strings.Contains(clientId, "_") {
+		// Binance format: underscore separated
+		arr := strings.Split(clientId, "_")
+		if len(arr) < 2 || arr[0] != config.Name {
+			return 0
+		}
+		val, err := strconv.ParseInt(arr[1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return val
 	}
-	val, err := strconv.ParseInt(arr[1], 10, 64)
-	if err != nil {
-		return 0
+	// OKX format: fixed-length {nameHash6}{orderId12}{rand4}
+	if len(clientId) >= 18 {
+		nameHash := utils.HashToAlphaNum(config.Name, 6)
+		if strings.HasPrefix(clientId, nameHash) {
+			orderIdStr := clientId[6:18]
+			val, err := strconv.ParseInt(orderIdStr, 10, 64)
+			if err != nil {
+				return 0
+			}
+			return val
+		}
 	}
-	return val
+	return 0
 }
 
 func (o *LiveOrderMgr) TrialUnMatchesForever() {

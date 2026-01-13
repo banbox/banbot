@@ -11,7 +11,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func bnbExitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
+func exitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 	return func(od *banexg.Order) bool {
 		if od.Filled == 0 {
 			return false
@@ -110,7 +110,7 @@ func (o *LiveOrderMgr) makeInOutOd(pair string, short bool, average, filled floa
 	return iod
 }
 
-func bnbTraceExgOrder(o *LiveOrderMgr) FuncHandleMyOrder {
+func traceExgOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 	return func(od *banexg.Order) bool {
 		if od.ReduceOnly || od.Status != banexg.OdStatusFilled {
 			// 忽略只减仓订单  只对完全入场的尝试跟踪Ignore Reduction Only Orders Only track attempts for full entry

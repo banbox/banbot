@@ -264,6 +264,7 @@ type ExgApiSecrets struct {
 type ApiSecretConfig struct {
 	APIKey    string `yaml:"api_key,omitempty" mapstructure:"api_key"`
 	APISecret string `yaml:"api_secret,omitempty" mapstructure:"api_secret"`
+	Password  string `yaml:"password,omitempty" mapstructure:"password"`
 }
 
 type AccPwdRole struct {

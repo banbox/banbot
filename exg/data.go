@@ -11,6 +11,7 @@ var exgMap = map[string]banexg.BanExchange{}
 var exgMapLock deadlock.Mutex
 var AllowExgIds = map[string]bool{
 	"binance": true,
+	"okx":     true,
 	"bybit":   true,
 	"china":   true,
 }

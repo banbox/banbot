@@ -765,8 +765,21 @@ func (i *InOutOrder) UpdateTrailing(price float64) *errs.Error {
 ClientId
 Generate the exchange's ClientOrderId
 生成交易所的ClientOrderId
+For OKX: only alphanumeric, max 32 chars, use fixed-length format: {nameHash6}{orderId12}{rand4}
+For others: use underscore separator format: {name}_{orderId}_{rand}_{clientId}
 */
 func (i *InOutOrder) ClientId(random bool) string {
+	if core.ExgName == "okx" {
+		// OKX: alphanumeric only, max 32 chars
+		// Format: {nameHash6}{orderId12}{rand4} = 22 chars
+		nameHash := utils.HashToAlphaNum(config.Name, 6)
+		randNum := 0
+		if random {
+			randNum = rand.Intn(10000)
+		}
+		return fmt.Sprintf("%s%012d%04d", nameHash, i.ID, randNum)
+	}
+	// Binance and others: use underscore separator
 	client := i.GetInfoString(OdInfoClientID)
 	if random {
 		return fmt.Sprintf("%s_%v_%v_%v", config.Name, i.ID, rand.Intn(1000), client)
