@@ -2,7 +2,8 @@ module github.com/banbox/banbot
 
 go 1.24.0
 
-replace	github.com/banbox/banexg => ../banexg
+// replace github.com/banbox/banexg => ../banexg
+
 // replace	github.com/banbox/banta => ../banta
 
 require (
