@@ -1272,6 +1272,18 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 	}
 	o.lockExgIdMap.Lock()
 	iod, ok := o.exgIdMap[odKey]
+	// OKX: When a trigger/algo order fires, it creates a new order with different ordId.
+	// The original algo order is stored with key "algo:XXX", try matching by AlgoId.
+	// OKX触发单触发后会生成新的ordId，原始algo订单以"algo:XXX"为key存储，需要用AlgoId匹配
+	if !ok && trade.AlgoId != "" {
+		algoKey := trade.Symbol + "algo:" + trade.AlgoId
+		iod, ok = o.exgIdMap[algoKey]
+		if ok {
+			// Update exgIdMap to use the new ordId for subsequent trades
+			// 更新exgIdMap使用新的ordId，以便后续交易能匹配
+			o.exgIdMap[odKey] = iod
+		}
+	}
 	o.lockExgIdMap.Unlock()
 	if !ok {
 		// Check whether the order is placed by a robot
@@ -1841,11 +1853,31 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	}
 	if isEnter && od.Stop > 0 {
 		// 设置触发价入场价格
-		curPrice := com.GetPrice(od.Symbol, side)
-		if (od.Stop >= curPrice) == (side == banexg.OdSideBuy) {
-			params[banexg.ParamStopLossPrice] = od.Stop
+		curPrice := com.GetPriceSafe(od.Symbol, side)
+		if curPrice <= 0 {
+			// 价格缓存过期，从订单簿获取
+			book, err := exg.GetOdBook(od.Symbol)
+			if err == nil && book != nil {
+				if side == banexg.OdSideBuy && len(book.Asks.Price) > 0 {
+					curPrice = book.Asks.Price[0]
+				} else if len(book.Bids.Price) > 0 {
+					curPrice = book.Bids.Price[0]
+				}
+			}
+		}
+		if curPrice > 0 {
+			if (od.Stop >= curPrice) == (side == banexg.OdSideBuy) {
+				params[banexg.ParamStopLossPrice] = od.Stop
+			} else {
+				params[banexg.ParamTakeProfitPrice] = od.Stop
+			}
 		} else {
-			params[banexg.ParamTakeProfitPrice] = od.Stop
+			// 无法获取价格，根据方向默认设置
+			if side == banexg.OdSideBuy {
+				params[banexg.ParamStopLossPrice] = od.Stop
+			} else {
+				params[banexg.ParamTakeProfitPrice] = od.Stop
+			}
 		}
 	}
 	retryNum := od.GetInfoInt64(ormo.OdInfoRetry)
@@ -2121,19 +2153,14 @@ func getPairMinsVol(pair string, num int) (float64, float64, *errs.Error) {
 	return avg, last, err
 }
 
-func isFarEnter(od *ormo.InOutOrder) bool {
-	if od.Status > ormo.InOutStatusPartEnter {
-		// 跳过已完全入场
-		return false
+func getEnterTriggerTarget(od *ormo.InOutOrder) (string, float64, bool) {
+	if od == nil || od.Enter == nil {
+		return "", 0, false
 	}
 	isLimit := od.Enter.Price > 0 && strings.Contains(od.Enter.OrderType, banexg.OdTypeLimit)
 	if !isLimit && od.Stop <= 0 {
 		// 跳过非限价单、非触发单
-		return false
-	}
-	stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
-	if stopAfter == 0 || stopAfter <= btime.TimeMS() {
-		return false
+		return "", 0, false
 	}
 	if od.Stop > 0 {
 		// 检查触发价格是否耗时较长
@@ -2142,9 +2169,25 @@ func isFarEnter(od *ormo.InOutOrder) bool {
 			// 触发价格方向与订单入场方向相反
 			side = banexg.OdSideBuy
 		}
-		return isFarLimitTrigger(od.Symbol, side, od.Stop)
+		return side, od.Stop, od.Stop > 0
 	}
-	return isFarLimitTrigger(od.Symbol, od.Enter.Side, od.Enter.Price)
+	return od.Enter.Side, od.Enter.Price, od.Enter.Price > 0
+}
+
+func isFarEnter(od *ormo.InOutOrder) bool {
+	if od.Status > ormo.InOutStatusPartEnter {
+		// 跳过已完全入场
+		return false
+	}
+	side, price, ok := getEnterTriggerTarget(od)
+	if !ok {
+		return false
+	}
+	stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
+	if stopAfter == 0 || stopAfter <= btime.TimeMS() {
+		return false
+	}
+	return isFarLimitTrigger(od.Symbol, side, price)
 }
 
 /*
@@ -2186,6 +2229,39 @@ func VerifyTriggerOds() {
 	}
 }
 
+func getSubmittedEnterOdsByPair(account string) map[string][]*ormo.InOutOrder {
+	openOds, lock := ormo.GetOpenODs(account)
+	lock.Lock()
+	list := make([]*ormo.InOutOrder, 0, len(openOds))
+	for _, od := range openOds {
+		list = append(list, od)
+	}
+	lock.Unlock()
+	submitOds := make(map[string][]*ormo.InOutOrder)
+	for _, od := range list {
+		if od == nil || od.Exit != nil {
+			continue
+		}
+		if od.Status > ormo.InOutStatusPartEnter {
+			continue
+		}
+		if od.Enter == nil || od.Enter.OrderID == "" {
+			continue
+		}
+		if od.Enter.Filled > 0 {
+			// Skip partial filled to avoid overbuy when re-submit
+			// 部分成交跳过，避免重新提交时超量
+			continue
+		}
+		_, price, ok := getEnterTriggerTarget(od)
+		if !ok || price <= 0 {
+			continue
+		}
+		submitOds[od.Symbol] = append(submitOds[od.Symbol], od)
+	}
+	return submitOds
+}
+
 func verifyAccountTriggerOds(account string) {
 	triggerOds, lock := ormo.GetTriggerODs(account)
 	var resOds []*ormo.InOutOrder
@@ -2199,10 +2275,16 @@ func verifyAccountTriggerOds(account string) {
 	var fails []string
 	odMgr := GetLiveOdMgr(account)
 	var saves []*ormo.InOutOrder
-	for pair, ods := range copyTriggers {
-		if len(ods) == 0 {
-			continue
-		}
+	submitOds := getSubmittedEnterOdsByPair(account)
+	pairs := make(map[string]struct{})
+	for pair := range copyTriggers {
+		pairs[pair] = struct{}{}
+	}
+	for pair := range submitOds {
+		pairs[pair] = struct{}{}
+	}
+	for pair := range pairs {
+		ods := copyTriggers[pair]
 		var secsVol float64
 		var book *banexg.OrderBook
 		// Calculate the past 50 minutes, average volume, and last minute volume
@@ -2220,49 +2302,79 @@ func verifyAccountTriggerOds(account string) {
 			fails = append(fails, pair)
 			log.Error("VerifyTriggerOds fail", zap.String("pair", pair), zap.Error(err))
 		}
+		calcWait := func(side string, price float64) (int, float64) {
+			waitVol, rate := book.SumVolTo(side, price)
+			waitSecs := int(math.Round(waitVol / secsVol))
+			return waitSecs, rate
+		}
 		var leftOds = make(map[int64]*ormo.InOutOrder)
-		if book == nil {
-			for _, od := range ods {
-				leftOds[od.ID] = od
-			}
-		} else {
-			var viewKeys = make(map[string]bool)
-			for _, od := range ods {
-				odKey := od.Key()
-				if _, ok := viewKeys[odKey]; ok {
-					log.Error("duplicate order in triggers", zap.String("acc", account), zap.String("key", odKey))
-					continue
+		if len(ods) > 0 {
+			if book == nil {
+				for _, od := range ods {
+					leftOds[od.ID] = od
 				}
-				viewKeys[odKey] = true
-				if od.Status >= ormo.InOutStatusFullExit {
-					continue
-				}
-				subOd := od.Enter
-				if od.Exit != nil {
-					subOd = od.Exit
-				}
-				// Calculate the amount to be purchased and the price ratio to reach the specified price
-				// 计算到指定价格，需要吃进的量，以及价格比例
-				waitVol, rate := book.SumVolTo(subOd.Side, subOd.Price)
-				// Fastest transaction time = total volume / transaction volume per second
-				// 最快成交时间 = 总吃进量 / 每秒成交量
-				waitSecs := int(math.Round(waitVol / secsVol))
-				if waitSecs < config.PutLimitSecs && rate >= 0.8 {
-					resOds = append(resOds, od)
-				} else {
-					stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
-					if stopAfter <= btime.TimeMS() {
-						cancelTimeoutEnter(odMgr, od)
-						saves = append(saves, od)
+			} else {
+				var viewKeys = make(map[string]bool)
+				for _, od := range ods {
+					odKey := od.Key()
+					if _, ok := viewKeys[odKey]; ok {
+						log.Error("duplicate order in triggers", zap.String("acc", account), zap.String("key", odKey))
+						continue
+					}
+					viewKeys[odKey] = true
+					if od.Status >= ormo.InOutStatusFullExit {
+						continue
+					}
+					subOd := od.Enter
+					if od.Exit != nil {
+						subOd = od.Exit
+					}
+					// Calculate the amount to be purchased and the price ratio to reach the specified price
+					// 计算到指定价格，需要吃进的量，以及价格比例
+					waitSecs, rate := calcWait(subOd.Side, subOd.Price)
+					if waitSecs < config.PutLimitSecs && rate >= 0.8 {
+						resOds = append(resOds, od)
 					} else {
-						leftOds[od.ID] = od
+						stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
+						if stopAfter > 0 && stopAfter <= btime.TimeMS() {
+							cancelTimeoutEnter(odMgr, od)
+							saves = append(saves, od)
+						} else {
+							leftOds[od.ID] = od
+						}
 					}
 				}
 			}
 		}
-		lock.Lock()
-		triggerOds[pair] = leftOds
-		lock.Unlock()
+		if len(ods) > 0 {
+			lock.Lock()
+			triggerOds[pair] = leftOds
+			lock.Unlock()
+		}
+		subList := submitOds[pair]
+		if len(subList) == 0 || book == nil || secsVol == 0 {
+			continue
+		}
+		for _, od := range subList {
+			stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
+			if stopAfter > 0 && stopAfter <= btime.TimeMS() {
+				cancelTimeoutEnter(odMgr, od)
+				saves = append(saves, od)
+				continue
+			}
+			side, price, ok := getEnterTriggerTarget(od)
+			if !ok || price <= 0 {
+				continue
+			}
+			waitSecs, _ := calcWait(side, price)
+			if waitSecs > config.PutLimitSecs*5 {
+				// Far from execution, rollback to local trigger to avoid fund occupation
+				// 距离成交过远，撤回到本地触发，避免资金占用
+				if cancelEnterToLocalTrigger(odMgr, od, waitSecs) {
+					saves = append(saves, od)
+				}
+			}
+		}
 	}
 	if len(zeros)+len(fails) > 0 {
 		log.Warn("calc vols for triggers fail", zap.Strings("zeros", zeros), zap.Strings("fail", fails))
@@ -2319,6 +2431,46 @@ func saveIOrders(saveOds []*ormo.InOutOrder) {
 			log.Error("save od fail", zap.String("key", od.Key()), zap.Error(err))
 		}
 	}
+}
+
+func cancelEnterToLocalTrigger(odMgr *LiveOrderMgr, od *ormo.InOutOrder, waitSecs int) bool {
+	lock := od.Lock()
+	defer lock.Unlock()
+	if od.Enter == nil || od.Enter.OrderID == "" {
+		return false
+	}
+	if od.Enter.Filled > 0 || od.Status > ormo.InOutStatusPartEnter {
+		return false
+	}
+	orderId := od.Enter.OrderID
+	res, err := exg.Default.CancelOrder(orderId, od.Symbol, map[string]interface{}{
+		banexg.ParamAccount: odMgr.Account,
+	})
+	if err != nil {
+		log.Error("cancel enter order fail", zap.String("acc", odMgr.Account),
+			zap.String("key", od.Key()), zap.Error(err))
+		return false
+	}
+	if res != nil {
+		odMgr.lockDoneKeys.Lock()
+		odMgr.doneKeys[od.Symbol+orderId] = res.Timestamp
+		odMgr.lockDoneKeys.Unlock()
+	}
+	odMgr.lockExgIdMap.Lock()
+	delete(odMgr.exgIdMap, od.Symbol+orderId)
+	odMgr.lockExgIdMap.Unlock()
+	od.Enter.OrderID = ""
+	od.Enter.Status = ormo.OdStatusInit
+	od.Enter.UpdateAt = btime.UTCStamp()
+	od.DirtyEnter = true
+	if od.Status != ormo.InOutStatusInit && od.Enter.Filled == 0 {
+		od.Status = ormo.InOutStatusInit
+		od.DirtyMain = true
+	}
+	ormo.AddTriggerOd(odMgr.Account, od)
+	log.Info("rollback enter to local trigger", zap.String("acc", odMgr.Account),
+		zap.String("key", od.Key()), zap.String("orderId", orderId), zap.Int("waitSecs", waitSecs))
+	return true
 }
 
 func cancelTimeoutEnter(odMgr *LiveOrderMgr, od *ormo.InOutOrder) {

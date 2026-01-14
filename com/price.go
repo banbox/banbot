@@ -2,13 +2,14 @@ package com
 
 import (
 	"fmt"
+	"math"
+	"strings"
+	"sync"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
 	"gonum.org/v1/gonum/floats"
-	"math"
-	"strings"
-	"sync"
 )
 
 var (
@@ -116,16 +117,28 @@ func IsPriceEmpty() bool {
 func SetPrice(pair string, ask, bid float64) {
 	lockPrices.Lock()
 	curMS := btime.TimeMS()
+	var askItem, bidItem *core.Int64Flt
 	if ask > 0 {
-		askPrices[pair] = &core.Int64Flt{
+		askItem = &core.Int64Flt{
 			Int: curMS,
 			Val: ask,
 		}
+		askPrices[pair] = askItem
 	}
 	if bid > 0 {
-		bidPrices[pair] = &core.Int64Flt{
+		bidItem = &core.Int64Flt{
 			Int: curMS,
 			Val: bid,
+		}
+		bidPrices[pair] = bidItem
+	}
+	base, quote, settle, _ := core.SplitSymbol(pair)
+	if core.IsFiat(quote) && (settle == "" || settle == quote) {
+		if askItem != nil {
+			askPrices[base] = askItem
+		}
+		if bidItem != nil {
+			bidPrices[base] = bidItem
 		}
 	}
 	lockPrices.Unlock()
