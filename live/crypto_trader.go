@@ -57,6 +57,9 @@ func (t *CryptoTrader) Init() *errs.Error {
 	if err != nil {
 		return err
 	}
+	if core.EnvReal {
+		CheckLiveAccounts()
+	}
 	// Order Manager initialization
 	// 订单管理器初始化
 	err = t.initOdMgr()
