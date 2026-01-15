@@ -731,13 +731,19 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 	}
 	var legalCost float64
 
-	curPrice := com.GetPriceSafe(od.Symbol, od.Enter.Side)
-	if curPrice < 0 {
-		return 0, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", od.Symbol)
-	}
 	if od.Enter.Amount != 0 {
 		price := od.Enter.Average
 		if price == 0 {
+			if core.LiveMode {
+				err := ensureLatestPrice(od.Symbol)
+				if err != nil {
+					return 0, err
+				}
+			}
+			curPrice := com.GetPriceSafe(od.Symbol, od.Enter.Side)
+			if curPrice < 0 {
+				return 0, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", od.Symbol)
+			}
 			price = curPrice
 		}
 		legalCost = od.Enter.Amount * price

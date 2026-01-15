@@ -176,7 +176,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	} else {
 		curPrice = com.GetPriceSafe(symbol, odSide)
 		if curPrice < 0 {
-			return errs.NewMsg(errs.CodeParamInvalid, "no valid price: %v", symbol)
+			curPrice = s.Env.Close.Get(0)
 		}
 	}
 	enterPrice := curPrice
@@ -405,7 +405,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 			} else {
 				curPrice = com.GetPriceSafe(s.Symbol.Symbol, odSide)
 				if curPrice < 0 {
-					return errs.NewMsg(errs.CodeParamInvalid, "no valid price: %v", s.Symbol.Symbol)
+					curPrice = s.Env.Close.Get(0)
 				}
 			}
 			sl := &ormo.ExitTrigger{

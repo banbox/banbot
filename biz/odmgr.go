@@ -2,6 +2,11 @@ package biz
 
 import (
 	"fmt"
+	"maps"
+	"math"
+	"slices"
+	"strings"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
@@ -15,10 +20,6 @@ import (
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
-	"maps"
-	"math"
-	"slices"
-	"strings"
 )
 
 var (
@@ -392,6 +393,12 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 	odSide := banexg.OdSideBuy
 	if req.Short {
 		odSide = banexg.OdSideSell
+	}
+	if core.LiveMode {
+		err := ensureLatestPrice(exs.Symbol)
+		if err != nil {
+			return nil, err
+		}
 	}
 	price := com.GetPriceSafe(exs.Symbol, odSide)
 	if price < 0 {
