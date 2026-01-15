@@ -161,9 +161,60 @@ export function getThemeStyles(theme: string): Record<string, any> {
   }
 }
 
+export type IndFieldType = 'number' | 'text' | 'select' | 'switch'
+export type IndFieldOption = {
+  label: string
+  value: string | number | boolean
+}
+export type IndField = {
+  title: string
+  type?: IndFieldType
+  default?: string | number | boolean
+  options?: Array<IndFieldOption | string | number | boolean>
+  min?: number
+  max?: number
+  step?: number
+  precision?: number
+  placeholder?: string
+  styleKey?: string
+  valueType?: 'number' | 'string' | 'boolean'
+}
+
+export function normalizeIndFieldOptions(options?: IndField['options']): IndFieldOption[] {
+  if (!options || options.length === 0) return []
+  return options.map((opt) => {
+    if (typeof opt === 'object' && opt !== null && 'value' in opt) {
+      return opt as IndFieldOption
+    }
+    return { label: String(opt), value: opt as string | number | boolean }
+  })
+}
+
+export function inferIndFieldType(field: IndField, value?: unknown): IndFieldType {
+  if (field.type) return field.type
+  if (field.options && field.options.length > 0) return 'select'
+  if (typeof value === 'boolean') return 'switch'
+  if (typeof value === 'string') return 'text'
+  return 'number'
+}
+
+export function getIndFieldDefaultValue(field: IndField): string | number | boolean {
+  if (field.default !== undefined) return field.default
+  const options = normalizeIndFieldOptions(field.options)
+  if (options.length > 0) return options[0].value
+  const fieldType = inferIndFieldType(field)
+  if (fieldType === 'switch') return false
+  if (fieldType === 'text') return ''
+  return 0
+}
+
+export function getIndCalcParams(fields: IndField[]): Array<string | number | boolean> {
+  return fields.map((field) => getIndFieldDefaultValue(field))
+}
+
 const param = m.param();
   
-export const IndFieldsMap: Record<string, Record<string, any>[]> = {
+export const IndFieldsMap: Record<string, IndField[]> = {
   AO: [
     { title: param + '1', precision: 0, min: 1, default: 5 },
     { title: param + '2', precision: 0, min: 1, default: 34 }

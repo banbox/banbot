@@ -7,7 +7,7 @@
   import type { Chart, Nullable, PaneOptions } from 'klinecharts';
   import { derived } from "svelte/store";
   import {ActionType} from 'klinecharts';
-  import { IndFieldsMap } from './coms';
+  import { IndFieldsMap, getIndCalcParams } from './coms';
   import KlineIcon from './Icon.svelte';
   import { postApi, getApi } from '$lib/netio';
   import { alerts } from '$lib/stores/alerts';
@@ -53,6 +53,40 @@
       delInd(paneId, name)
     }
   }
+
+  function resolveIndicatorFeature(data: any) {
+    const iconId = data?.iconId ?? data?.feature?.id ?? '';
+    const indicatorName = data?.indicatorName ?? data?.indicator?.name ?? '';
+    const paneId = data?.paneId ?? data?.indicator?.paneId ?? '';
+    if (!iconId || !indicatorName || !paneId) return null;
+    return { iconId, indicatorName, paneId }
+  }
+
+  function handleIndicatorFeatureClick(data: any) {
+    const resolved = resolveIndicatorFeature(data)
+    if (!resolved) return
+    const { iconId, indicatorName, paneId } = resolved
+    switch (iconId) {
+      case 'visible': {
+        $chart?.overrideIndicator({ name: indicatorName, visible: true, paneId })
+        break
+      }
+      case 'invisible': {
+        $chart?.overrideIndicator({ name: indicatorName, visible: false, paneId })
+        break
+      }
+      case 'setting': {
+        $ctx.editIndName = indicatorName
+        $ctx.editPaneId = paneId
+        $ctx.modalIndCfg = true
+        break
+      }
+      case 'close': {
+        delInd(paneId, indicatorName)
+        break
+      }
+    }
+  }
   
   export function createIndicator(name: string, params?: any[], isStack?: boolean, paneOptions?: PaneOptions): Nullable<any> {
     const chartObj = $chart;
@@ -68,7 +102,7 @@
     if (!calcParams || calcParams.length === 0) {
       const fields = IndFieldsMap[name] || [];
       if (fields.length > 0) {
-        calcParams = fields.map(f => f.default);
+        calcParams = getIndCalcParams(fields);
       }
     }
     const ind_id = chartObj.createIndicator({
@@ -79,7 +113,11 @@
         const styles = chartObj.getStyles().indicator.tooltip;
         const features = icon_ids.map(i => styles.features[i])
         return { features }
-      }
+      },
+      onClick: (evt: any) => {
+        if (evt?.target !== 'feature' && !evt?.feature) return;
+        handleIndicatorFeatureClick(evt);
+      },
     }, isStack, paneOptions)
     if(!ind_id)return null
     const pane_id = paneOptions?.id ?? ''
@@ -109,29 +147,7 @@
   const initDone = derived(ctx, ($ctx) => $ctx.initDone);
   initDone.subscribe((new_val) => {
     $chart?.subscribeAction(ActionType.OnCandleTooltipFeatureClick, data => {
-      console.log('OnCandleTooltipFeatureClick', data)
-      const item = data as {indicatorName: string, paneId: string, iconId: string}
-      if (item.indicatorName) {
-        switch (item.iconId) {
-          case 'visible': {
-            $chart?.overrideIndicator({ name: item.indicatorName, visible: true, paneId: item.paneId })
-            break
-          }
-          case 'invisible': {
-            $chart?.overrideIndicator({ name: item.indicatorName, visible: false, paneId: item.paneId })
-            break
-          }
-          case 'setting': {
-            $ctx.editIndName = item.indicatorName
-            $ctx.editPaneId = item.paneId
-            $ctx.modalIndCfg = true
-            break
-          }
-          case 'close': {
-            delInd(item.paneId, item.indicatorName)
-          }
-        }
-      }
+      handleIndicatorFeatureClick(data)
     })
   })
 
