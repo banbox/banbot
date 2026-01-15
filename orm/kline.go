@@ -581,12 +581,19 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 	if err != nil || insId == 0 {
 		return 0, err
 	}
+	defer func() {
+		if insId == 0 {
+			return
+		}
+		if err_ := q.DelInsKline(context.Background(), insId); err_ != nil {
+			log.Warn("DelInsKline fail", zap.Int32("id", insId), zap.Error(err_))
+		}
+	}()
 	num, err := q.InsertKLines(timeFrame, exs.ID, arr, true)
 	if err != nil {
 		return num, err
 	}
 	err = q.UpdateKRange(exs, timeFrame, startMS, endMS, arr, aggBig)
-	_ = q.DelInsKline(context.Background(), insId)
 	return num, err
 }
 
