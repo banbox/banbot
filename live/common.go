@@ -339,6 +339,11 @@ func sendOrderMsg(od *ormo.InOutOrder, isEnter bool) {
 	}
 	filled, price := subOd.Filled, subOd.Average
 	account := ormo.GetTaskAcc(od.TaskID)
+	if account == "" {
+		log.Info("skip send rpc msg, unknown account", zap.Int64("task_id", od.TaskID), zap.String("key", od.Key()),
+			zap.Int64("status", subOd.Status), zap.Float64("filled", filled))
+		return
+	}
 	if subOd.Status != ormo.OdStatusClosed || filled == 0 {
 		log.Info("skip send rpc msg", zap.String("acc", account), zap.String("key", od.Key()),
 			zap.Int64("status", subOd.Status), zap.Float64("filled", filled))

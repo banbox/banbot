@@ -1613,7 +1613,7 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 		if err != nil {
 			return err
 		}
-		cancelTriggerOds(od)
+		cancelTriggerOds(od, o.Account)
 		o.callBack(od, subOd.Enter)
 		strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 	} else {
@@ -1736,7 +1736,7 @@ func (o *LiveOrderMgr) tryExitPendingEnter(od *ormo.InOutOrder) *errs.Error {
 		if err != nil {
 			return err
 		}
-		cancelTriggerOds(od)
+		cancelTriggerOds(od, o.Account)
 		strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 		o.forceDelOd(od, nil)
 		return nil
@@ -1835,7 +1835,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 			if err != nil {
 				return err
 			}
-			cancelTriggerOds(od)
+			cancelTriggerOds(od, o.Account)
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 			return nil
 		}
@@ -1893,7 +1893,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 			if err != nil {
 				return err
 			}
-			cancelTriggerOds(od)
+			cancelTriggerOds(od, o.Account)
 			o.callBack(od, isEnter)
 			return nil
 		} else {
@@ -1915,7 +1915,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	} else {
 		// Close a position and cancel associated orders
 		// 平仓，取消关联订单
-		cancelTriggerOds(od)
+		cancelTriggerOds(od, o.Account)
 	}
 	return nil
 }
@@ -2745,15 +2745,22 @@ cancelTriggerOds
 Cancel the associated order of the order. When the order is closed, the associated stop loss order and take profit order will not be automatically exited, and this method needs to be called to exit
 取消订单的关联订单。订单在平仓时，关联的止损单止盈单不会自动退出，需要调用此方法退出
 */
-func cancelTriggerOds(od *ormo.InOutOrder) {
+func cancelTriggerOds(od *ormo.InOutOrder, account string) {
 	sl := od.GetStopLoss()
 	tp := od.GetTakeProfit()
 	if sl == nil && tp == nil {
 		return
 	}
 	odKey := od.Key()
+	if account == "" {
+		account = ormo.GetTaskAcc(od.TaskID)
+		if account == "" {
+			log.Error("cancel trigger order fail, unknown account", zap.String("key", odKey))
+			return
+		}
+	}
 	args := map[string]interface{}{
-		banexg.ParamAccount: ormo.GetTaskAcc(od.TaskID),
+		banexg.ParamAccount: account,
 	}
 	var logFields []zap.Field
 	if sl != nil && sl.OrderId != "" {

@@ -54,6 +54,9 @@ func GetTaskAcc(id int64) string {
 func GetOpenODs(account string) (map[int64]*InOutOrder, *deadlock.Mutex) {
 	if !core.EnvReal {
 		account = config.DefAcc
+	} else if account == "" {
+		log.Warn("get open ods fail, unknown account")
+		return make(map[int64]*InOutOrder), &deadlock.Mutex{}
 	}
 	isReload := false
 	mOpenLock.Lock()

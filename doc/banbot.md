@@ -21,7 +21,6 @@ type Series struct {
 	Time int64; More interface{}
 	Subs map[string]map[int]*Series // Derived series
 	XLogs map[int]*CrossLog // Cross records
-	subLock *sync.Mutex
 }
 type CrossLog struct {
 	Time int64; PrevVal float64

@@ -21,7 +21,6 @@ type Series struct {
 	Time int64; More interface{}
 	Subs map[string]map[int]*Series // 派生序列
 	XLogs map[int]*CrossLog // 交叉记录
-	subLock *sync.Mutex
 }
 type CrossLog struct {
 	Time int64; PrevVal float64
