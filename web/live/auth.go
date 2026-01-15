@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/banbox/banbot/biz"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/log"
@@ -89,6 +90,24 @@ func postStratCall(c *fiber.Ctx) error {
 		return errors.New("no job running with strategy: " + strategy)
 	}
 	if stg.OnPostApi != nil {
+		if core.LiveMode {
+			seen := make(map[string]bool)
+			for _, jobMap := range jobs {
+				for _, job := range jobMap {
+					if job == nil || job.IsWarmUp {
+						continue
+					}
+					symbol := job.Symbol.Symbol
+					if seen[symbol] {
+						continue
+					}
+					seen[symbol] = true
+					if err := com.RefreshLatestPrice(symbol); err != nil {
+						log.Warn("refresh latest price fail", zap.String("pair", symbol), zap.Error(err))
+					}
+				}
+			}
+		}
 		err_ := stg.OnPostApi(client, req, jobs)
 		if err_ != nil {
 			log.Warn("OnPostApi fail", zap.String("strategy", strategy), zap.Any("msg", req), zap.Error(err_))

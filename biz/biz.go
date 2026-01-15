@@ -197,6 +197,11 @@ func InitOdSubs() {
 			}
 			job, _ := its[od.Strategy]
 			if job != nil {
+				if core.LiveMode && !job.IsWarmUp {
+					if err := com.RefreshLatestPrice(job.Symbol.Symbol); err != nil {
+						log.Warn("refresh latest price fail", zap.String("pair", job.Symbol.Symbol), zap.Error(err))
+					}
+				}
 				if stgy.HedgeOff && evt == strat.OdChgEnterFill {
 					// 策略为单向持仓，成交时尝试关闭另一侧订单
 					closeSideOrders(job, !od.Short)

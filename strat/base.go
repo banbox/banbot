@@ -174,6 +174,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	if s.IsWarmUp {
 		curPrice = s.Env.Close.Get(0)
 	} else {
+		_ = com.EnsureLatestPrice(symbol)
 		curPrice = com.GetPriceSafe(symbol, odSide)
 		if curPrice < 0 {
 			curPrice = s.Env.Close.Get(0)
@@ -403,6 +404,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 			if s.IsWarmUp {
 				curPrice = s.Env.Close.Get(0)
 			} else {
+				_ = com.EnsureLatestPrice(s.Symbol.Symbol)
 				curPrice = com.GetPriceSafe(s.Symbol.Symbol, odSide)
 				if curPrice < 0 {
 					curPrice = s.Env.Close.Get(0)

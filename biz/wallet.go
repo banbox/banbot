@@ -735,7 +735,7 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 		price := od.Enter.Average
 		if price == 0 {
 			if core.LiveMode {
-				err := ensureLatestPrice(od.Symbol)
+				err := com.EnsureLatestPrice(od.Symbol)
 				if err != nil {
 					return 0, err
 				}
@@ -1210,7 +1210,7 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 }
 
 func EnsurePricesLoaded() {
-	_, err := getBookTickers()
+	_, err := com.GetBookTickers()
 	if err != nil {
 		log.Error("load ticker prices fail", zap.Error(err))
 	}

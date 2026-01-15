@@ -1,13 +1,13 @@
 package biz
 
 import (
-	"fmt"
+	"strings"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
-	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
@@ -15,8 +15,6 @@ import (
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
-	"strings"
-	"time"
 )
 
 type LocalLiveOrderMgr struct {
@@ -47,32 +45,8 @@ func InitLocalLiveOrderMgr(callBack FnOdCb, showLog bool) {
 	}
 }
 
-func getBookTickers() (map[string]*banexg.Ticker, *errs.Error) {
-	key := fmt.Sprintf("%s_%s_bookTicker", core.ExgName, core.Market)
-	cacheVal, exist := core.Cache.Get(key)
-	var tickerMap map[string]*banexg.Ticker
-	if !exist {
-		tickers, err := exg.Default.FetchTickers(nil, map[string]interface{}{
-			banexg.ParamMethod: "bookTicker",
-		})
-		if err != nil {
-			return nil, err
-		}
-		tickerMap = make(map[string]*banexg.Ticker)
-		for _, t := range tickers {
-			tickerMap[t.Symbol] = t
-			com.SetPrice(t.Symbol, t.Ask, t.Bid)
-		}
-		log.Info("load book prices", zap.String("mkt", core.Market), zap.Int("num", len(tickerMap)))
-		core.Cache.SetWithTTL(key, tickerMap, 0, time.Millisecond*1500)
-	} else {
-		tickerMap = cacheVal.(map[string]*banexg.Ticker)
-	}
-	return tickerMap, nil
-}
-
 func getAskBidPrice(symbol string) (float64, float64, *errs.Error) {
-	tickerMap, err := getBookTickers()
+	tickerMap, err := com.GetBookTickers()
 	if err != nil {
 		return 0, 0, err
 	}

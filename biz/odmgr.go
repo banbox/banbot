@@ -395,7 +395,7 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 		odSide = banexg.OdSideSell
 	}
 	if core.LiveMode {
-		err := ensureLatestPrice(exs.Symbol)
+		err := com.EnsureLatestPrice(exs.Symbol)
 		if err != nil {
 			return nil, err
 		}

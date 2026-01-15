@@ -57,12 +57,10 @@ const (
 )
 
 var (
-	pairVolMap      = map[string]*PairValItem{}
-	volPrices       = map[string]*VolPrice{}
-	lockPairVolMap  deadlock.Mutex
-	lockVolPrices   deadlock.Mutex
-	lockLoadPrice   deadlock.Mutex
-	lastPriceLoadAt int64
+	pairVolMap     = map[string]*PairValItem{}
+	volPrices      = map[string]*VolPrice{}
+	lockPairVolMap deadlock.Mutex
+	lockVolPrices  deadlock.Mutex
 )
 
 type PairValItem struct {
@@ -1155,7 +1153,7 @@ func (o *LiveOrderMgr) ConsumeOrderQueue() {
 }
 
 func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
-	err := ensureLatestPrice(od.Symbol)
+	err := com.EnsureLatestPrice(od.Symbol)
 	if err != nil {
 		log.Error("ensureLatestPrice fail", zap.String("od", od.Key()), zap.Error(err))
 		if action == ormo.OdActionEnter {
@@ -1207,26 +1205,6 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 			log.Info("Exit Order Closed", logFields...)
 		}
 	}
-}
-
-func ensureLatestPrice(symbol string) *errs.Error {
-	price := com.GetPriceSafe(symbol, "")
-	if price > 0 {
-		return nil
-	}
-	lockLoadPrice.Lock()
-	defer lockLoadPrice.Unlock()
-	price = com.GetPriceSafe(symbol, "")
-	if price > 0 {
-		return nil
-	}
-	if btime.UTCStamp()-lastPriceLoadAt < 3000 {
-		// 两次请求至少间隔3s
-		return errs.NewMsg(errs.CodeRunTime, "no valid price for %v", symbol)
-	}
-	_, err := getBookTickers()
-	lastPriceLoadAt = btime.UTCStamp()
-	return err
 }
 
 func (o *LiveOrderMgr) WatchMyTrades() {
@@ -1650,7 +1628,7 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 				}
 			}
 		}
-		err = ensureLatestPrice(od.Symbol)
+		err = com.EnsureLatestPrice(od.Symbol)
 		if err != nil {
 			return err
 		}
