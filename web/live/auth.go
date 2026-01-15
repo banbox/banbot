@@ -1,6 +1,8 @@
 package live
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/web/base"
 	"github.com/gofiber/fiber/v2"
@@ -156,11 +159,19 @@ func postLogin(c *fiber.Ctx) error {
 		if err != nil {
 			return err
 		}
-		// 只返回正在运行的交易账户
+		// 只返回有交易历史的账户
 		var accRoles = make(map[string]string)
+		sess, conn, err2 := ormo.Conn(orm.DbTrades, false)
+		if err2 != nil {
+			return err2
+		}
+		defer conn.Close()
 		for acc, role := range u.AccRoles {
-			task := ormo.GetTask(acc)
-			if task != nil && task.StopAt == 0 {
+			hasHistory, err := accountHasTradeHistory(sess, acc)
+			if err != nil {
+				return err
+			}
+			if hasHistory {
 				accRoles[acc] = role
 			}
 		}
@@ -169,10 +180,43 @@ func postLogin(c *fiber.Ctx) error {
 			"token":    token,
 			"env":      core.RunEnv,
 			"market":   core.Market,
-			"accounts": u.AccRoles,
+			"accounts": accRoles,
 		})
 	}
 	return fiber.NewError(fiber.StatusUnauthorized, "invalid username or password")
+}
+
+func accountHasTradeHistory(sess *ormo.Queries, account string) (bool, error) {
+	taskID := ormo.GetTaskID(account)
+	if taskID <= 0 {
+		taskName := config.Name
+		if core.EnvReal {
+			taskName += "/" + account
+		}
+		task, err := sess.FindTask(context.Background(), ormo.FindTaskParams{
+			Mode: core.RunMode,
+			Name: taskName,
+		})
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		taskID = task.ID
+	}
+	if taskID <= 0 {
+		return false, nil
+	}
+	orders, err := sess.GetOrders(ormo.GetOrdersArgs{
+		TaskID: taskID,
+		Status: 2, // 已完成订单
+		Limit:  1,
+	})
+	if err != nil {
+		return false, err
+	}
+	return len(orders) > 0, nil
 }
 
 type AuthClaims struct {
