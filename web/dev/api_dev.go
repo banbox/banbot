@@ -465,6 +465,7 @@ func getBtTasks(c *fiber.Ctx) error {
 		MaxStart int64  `query:"maxStart"`
 		MaxID    int64  `query:"maxId"`
 		Limit    int64  `query:"limit"`
+		Assets   bool   `query:"assets"`
 	}
 
 	var args = new(TaskArgs)
@@ -506,12 +507,117 @@ func getBtTasks(c *fiber.Ctx) error {
 	// 处理返回数据
 	result := make([]map[string]interface{}, 0, len(tasks))
 	for _, task := range tasks {
-		result = append(result, task.ToMap())
+		taskMap := task.ToMap()
+		if args.Assets {
+			appendTaskAssets(task, taskMap)
+		}
+		result = append(result, taskMap)
 	}
 
 	return c.JSON(fiber.Map{
 		"data": result,
 	})
+}
+
+const btCardAssetPoints = 160
+
+type assetChartDataset struct {
+	Label string    `json:"label"`
+	Data  []float64 `json:"data"`
+}
+
+type assetChartData struct {
+	Labels   []string            `json:"labels"`
+	Datasets []assetChartDataset `json:"datasets"`
+}
+
+func appendTaskAssets(task *ormu.Task, taskMap map[string]interface{}) {
+	if task == nil || task.Path == "" || task.Status < int64(ormu.BtStatusDone) {
+		return
+	}
+	assetPath := filepath.Join(config.GetDataDir(), "backtest", task.Path, "assets.html")
+	if !utils.Exists(assetPath) {
+		return
+	}
+	reals, used, err := readAssetLines(assetPath, btCardAssetPoints)
+	if err != nil || len(reals) == 0 {
+		return
+	}
+	taskMap["reals"] = reals
+	if len(used) > 0 {
+		taskMap["used"] = used
+	}
+}
+
+func readAssetLines(file string, maxPoints int) ([]float64, []float64, error) {
+	content, err := os.ReadFile(file)
+	if err != nil {
+		return nil, nil, err
+	}
+	text := string(content)
+	start := strings.Index(text, "chartData = ")
+	keyLen := len("chartData = ")
+	if start < 0 {
+		start = strings.Index(text, "chartData=")
+		keyLen = len("chartData=")
+	}
+	if start < 0 {
+		return nil, nil, fmt.Errorf("chart data not found")
+	}
+	start += keyLen
+	end := strings.Index(text[start:], "\n")
+	if end < 0 {
+		end = strings.Index(text[start:], ";")
+	}
+	if end < 0 {
+		end = strings.Index(text[start:], "</script>")
+	}
+	if end < 0 {
+		return nil, nil, fmt.Errorf("chart data not terminated")
+	}
+	jsonStr := strings.TrimSpace(text[start : start+end])
+
+	var data assetChartData
+	if err := utils2.UnmarshalString(jsonStr, &data, utils2.JsonNumDefault); err != nil {
+		return nil, nil, err
+	}
+
+	var reals []float64
+	var used []float64
+	for _, ds := range data.Datasets {
+		switch ds.Label {
+		case "Real":
+			reals = ds.Data
+		case "Available":
+			used = ds.Data
+		}
+	}
+	if len(reals) == 0 && len(data.Datasets) > 0 {
+		reals = data.Datasets[0].Data
+	}
+
+	reals = downsampleSeries(reals, maxPoints)
+	used = downsampleSeries(used, maxPoints)
+	return reals, used, nil
+}
+
+func downsampleSeries(values []float64, maxPoints int) []float64 {
+	if maxPoints <= 0 || len(values) <= maxPoints {
+		return values
+	}
+	if maxPoints == 1 {
+		return []float64{values[len(values)-1]}
+	}
+	step := float64(len(values)-1) / float64(maxPoints-1)
+	result := make([]float64, 0, maxPoints)
+	for i := 0; i < maxPoints; i++ {
+		idx := int(step*float64(i) + 0.5)
+		if idx >= len(values) {
+			idx = len(values) - 1
+		}
+		result = append(result, values[idx])
+	}
+	return result
 }
 
 // getBtOptions 获取回测选项列表

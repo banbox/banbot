@@ -10,6 +10,7 @@
   import {addListener} from '$lib/dev/websocket';
   import {site} from "$lib/stores/site";
   import Icon from "$lib/Icon.svelte";
+  import LinePath from "$lib/LinePath.svelte";
   import {localizeHref} from "$lib/paraglide/runtime";
   import {modals} from "$lib/stores/modals";
   import type {StrVal} from "$lib/common";
@@ -73,6 +74,7 @@
       strat: selectedStrat,
       period: selectedPeriod,
       range: selectedRange,
+      assets: true,
       limit: pageSize,
       maxId: maxId || 0
     });
@@ -310,14 +312,23 @@ Error: ${task.info}`
   <!-- 结果列表 -->
   <div class="grid grid-cols-3 gap-6 mb-6">
     {#each tasks as task, tidx}
-      <div class="card bg-base-100 shadow hover:shadow-lg transition-shadow duration-200 cursor-pointer relative {isTaskSelected(task) ? 'ring-2 ring-primary' : ''}"
+      <div class="card bg-base-100 shadow hover:shadow-lg transition-shadow duration-200 cursor-pointer relative overflow-hidden {isTaskSelected(task) ? 'ring-2 ring-primary' : ''}"
            onclick={(e) => isMultiSelect ? toggleTaskSelection(task, e) : clickTask(task)} 
            onmouseenter={() => hoveredCard = tidx}
            onmouseleave={() => hoveredCard = null}>
+        {#if task.reals && task.reals.length > 0}
+          <LinePath
+            reals={task.reals}
+            used={task.used || []}
+            realsColor="#36A2EB"
+            usedColor="#FF6384"
+            strokeWidth={1}
+          />
+        {/if}
         {#if hoveredCard === tidx}
           <div class="custom-tooltip {tidx >= 3 ? 'loc-top' : ''}">{taskTooltip(task)}</div>
         {/if}
-        <div class="card-body p-5">
+        <div class="card-body p-5 relative" style="z-index: 1;">
           <!-- 第一行 -->
           <div class="flex justify-between items-center mb-3">
             <div class="flex items-center gap-3">

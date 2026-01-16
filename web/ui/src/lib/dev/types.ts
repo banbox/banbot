@@ -18,6 +18,9 @@ export interface BtTask {
   maxDrawdown: number; // 最大回撤
   sharpe: number; // 夏普比率
 
+  reals?: number[];
+  used?: number[];
+
   maxOpenOrders?: number; // 最大开单数
   showDrawDownPct?: number; // 显示的回撤百分比
   barNum?: number; // 数据柱数量

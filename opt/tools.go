@@ -658,12 +658,28 @@ func readAssetHtml(file, prefix string, useRate bool) (*AssetData, *errs.Error) 
 	}
 
 	// 提取JSON数据
-	start := strings.Index(string(content), "var chartData = ") + 15
-	end := strings.Index(string(content)[start:], "\n")
-	if start < 15 || end < 0 {
+	text := string(content)
+	start := strings.Index(text, "chartData = ")
+	keyLen := len("chartData = ")
+	if start < 0 {
+		start = strings.Index(text, "chartData=")
+		keyLen = len("chartData=")
+	}
+	if start < 0 {
 		return nil, errs.New(errs.CodeInvalidData, fmt.Errorf("invalid html format in file %s", file))
 	}
-	jsonStr := string(content)[start : start+end]
+	start += keyLen
+	end := strings.Index(text[start:], "\n")
+	if end < 0 {
+		end = strings.Index(text[start:], ";")
+	}
+	if end < 0 {
+		end = strings.Index(text[start:], "</script>")
+	}
+	if end < 0 {
+		return nil, errs.New(errs.CodeInvalidData, fmt.Errorf("invalid html format in file %s", file))
+	}
+	jsonStr := text[start : start+end]
 
 	var data AssetData
 	if err = utils2.UnmarshalString(jsonStr, &data, utils2.JsonNumDefault); err != nil {
