@@ -232,7 +232,7 @@ func (p *HistProvider) downIfNeed() *errs.Error {
 }
 
 func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bool) *errs.Error {
-	newHolds, sinceMap, _, err := p.Provider.SubWarmPairs(items, delOther, p.pBar)
+	newHolds, sinceMap, delPairs, err := p.Provider.SubWarmPairs(items, delOther, p.pBar)
 	if err != nil {
 		return err
 	}
@@ -320,6 +320,9 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 	err = p.downIfNeed()
 	if err != nil {
 		return err
+	}
+	if len(newHolds) > 0 || len(delPairs) > 0 {
+		p.SetDirty()
 	}
 	return err
 }

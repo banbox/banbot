@@ -92,7 +92,12 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		return nil, err
 	}
 	lockJobs.Lock()
-	defer lockJobs.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			lockJobs.Unlock()
+		}
+	}()
 	curMap, ok := core.StgPairTfs[req.Strat.Name]
 	if !ok {
 		curMap = map[string]string{}
@@ -258,12 +263,14 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		}
 		res.Removed = append(res.Removed, pair)
 	}
+	allWarms := collectAllWarmsLocked()
+	lockJobs.Unlock()
+	locked = false
 	if req.CloseOnRemove && hooks.ExitOrders != nil {
 		for acc, orders := range res.ExitOrders {
 			_ = hooks.ExitOrders(acc, orders, &ExitReq{Tag: core.ExitTagPairDel})
 		}
 	}
-	allWarms := collectAllWarmsLocked()
 	if err := hooks.SubWarmPairs(allWarms, true); err != nil {
 		return nil, err
 	}
