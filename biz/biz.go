@@ -178,6 +178,7 @@ func InitOdSubs() {
 	if len(subStgys) == 0 {
 		return
 	}
+	strat.LockJobsRead()
 	for acc := range strat.AccJobs {
 		strat.AddOdSub(acc, func(acc string, od *ormo.InOutOrder, evt int) {
 			stgy, ok := subStgys[od.Strategy]
@@ -186,16 +187,20 @@ func InitOdSubs() {
 				// 当前策略未监听订单状态
 				return
 			}
+			strat.LockJobsRead()
 			items, _ := strat.AccJobs[acc]
 			if len(items) == 0 {
+				strat.UnlockJobsRead()
 				return
 			}
 			pairTF := strings.Join([]string{od.Symbol, od.Timeframe}, "_")
 			its, _ := items[pairTF]
 			if len(its) == 0 {
+				strat.UnlockJobsRead()
 				return
 			}
 			job, _ := its[od.Strategy]
+			strat.UnlockJobsRead()
 			if job != nil {
 				if core.LiveMode && !job.IsWarmUp {
 					if err := com.RefreshLatestPrice(job.Symbol.Symbol); err != nil {
@@ -224,6 +229,7 @@ func InitOdSubs() {
 			}
 		})
 	}
+	strat.UnlockJobsRead()
 }
 
 func closeSideOrders(s *strat.StratJob, isShort bool) {

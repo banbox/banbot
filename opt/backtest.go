@@ -59,6 +59,12 @@ func NewBackTestLite(isOpt bool, onBar data.FnPairKline, getEnd data.FnGetInt64,
 		}
 	}
 	b.dp = data.NewHistProvider(onBar, b.OnEnvEnd, getEnd, !isOpt, pBar)
+	strat.SetPairUpdateHooks(strat.PairUpdateHooks{
+		SubWarmPairs: b.dp.SubWarmPairs,
+		ExitOrders: func(acc string, orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
+			return biz.GetOdMgr(acc).ExitAndFill(orders, req)
+		},
+	})
 	biz.InitLocalOrderMgr(b.orderCB, !isOpt)
 	return b
 }

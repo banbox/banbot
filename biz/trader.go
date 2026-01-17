@@ -171,9 +171,11 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKline, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
 	envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
 	// Get strategy jobs 获取交易任务
+	strat.LockJobsRead()
 	jobs, _ := strat.GetJobs(account)[envKey]
 	// jobs which subscript info timeframes  辅助订阅的任务
 	infoJobs, _ := strat.GetInfoJobs(account)[envKey]
+	strat.UnlockJobsRead()
 	if len(jobs) == 0 && len(infoJobs) == 0 {
 		return nil
 	}

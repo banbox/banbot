@@ -401,6 +401,22 @@ func CheckCustomExits(job *StratJob) *errs.Error {
 	return nil
 }
 
+func LockJobsRead() {
+	lockJobs.RLock()
+}
+
+func UnlockJobsRead() {
+	lockJobs.RUnlock()
+}
+
+func LockJobsWrite() {
+	lockJobs.Lock()
+}
+
+func UnlockJobsWrite() {
+	lockJobs.Unlock()
+}
+
 /*
 GetJobs 返回：pair_tf: [stratID]StratJob
 */

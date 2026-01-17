@@ -2,6 +2,7 @@
 .vscode
 .zed
 .claude
+.worktrees
 *.db
 *.db-shm
 *.db-wal

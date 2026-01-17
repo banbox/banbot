@@ -75,6 +75,7 @@ func postStratCall(c *fiber.Ctx) error {
 	jobs := make(map[string]map[string]*strat.StratJob)
 	var stg *strat.TradeStrat
 	for acc := range client.AccRoles {
+		strat.LockJobsRead()
 		jobMap := strat.GetJobs(acc)
 		items := make(map[string]*strat.StratJob)
 		for pairTf, m := range jobMap {
@@ -85,6 +86,7 @@ func postStratCall(c *fiber.Ctx) error {
 				}
 			}
 		}
+		strat.UnlockJobsRead()
 		if len(items) > 0 {
 			jobs[acc] = items
 		}

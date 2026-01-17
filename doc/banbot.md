@@ -348,9 +348,26 @@ type ExitReq struct {
 	Log bool // Whether to automatically log errors
 }
 
+type PairUpdateReq struct {
+	Add []string
+	Remove []string
+	CloseOnRemove bool
+	ForceAdd bool
+	Reason string
+}
+
+type PairUpdateResult struct {
+	Added []string
+	Removed []string
+	Skipped []string
+	ExitOrders map[string][]*ormo.InOutOrder
+	Warnings []string
+}
+
 // Core methods
 func GetJobs(account string) map[string]map[string]*StratJob
 func GetInfoJobs(account string) map[string]map[string]*StratJob
+func (s *TradeStrat) UpdatePairs(req PairUpdateReq) (*PairUpdateResult, *errs.Error)
 func (s *TradeStrat) GetStakeAmount(j *StratJob) float64
 func (s *StratJob) OpenOrder(req *EnterReq) *errs.Error
 func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error

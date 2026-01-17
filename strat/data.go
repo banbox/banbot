@@ -22,6 +22,7 @@ var (
 	BatchTasks  = map[string]*BatchMap{} // tf_account_strat: pair: task 每个bar周期更新（只适用于单交易所单市场）
 	LastBatchMS = int64(0)               // timeMS The timestamp of the last batch execution is only used for backtesting 上次批量执行的时间戳，仅用于回测
 
+	lockJobs     deadlock.RWMutex
 	lockInfoJobs deadlock.Mutex
 	lockTmpEnv   deadlock.Mutex
 

@@ -41,6 +41,12 @@ func (t *CryptoTrader) Init() *errs.Error {
 		return err
 	}
 	t.dp = dp
+	strat.SetPairUpdateHooks(strat.PairUpdateHooks{
+		SubWarmPairs: t.dp.SubWarmPairs,
+		ExitOrders: func(acc string, orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
+			return biz.GetOdMgr(acc).ExitAndFill(orders, req)
+		},
+	})
 	err = ormo.InitTask(true, config.GetDataDir())
 	if err != nil {
 		return err
@@ -212,6 +218,7 @@ func (t *CryptoTrader) startJobs() {
 }
 
 func (t *CryptoTrader) markUnWarm() {
+	strat.LockJobsRead()
 	for _, accMap := range strat.AccJobs {
 		for _, jobMap := range accMap {
 			for _, job := range jobMap {
@@ -219,6 +226,7 @@ func (t *CryptoTrader) markUnWarm() {
 			}
 		}
 	}
+	strat.UnlockJobsRead()
 }
 
 func exitCleanUp() {
