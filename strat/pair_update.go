@@ -100,7 +100,23 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	}
 	allowedSet := map[string]bool{}
 	if !req.ForceAdd {
-		allowedPairs, err := getPolicyPairs(req.Strat.Policy, core.Pairs)
+		candidates := make([]string, 0, len(core.Pairs)+len(adds))
+		seen := map[string]bool{}
+		for _, pair := range core.Pairs {
+			if !seen[pair] {
+				seen[pair] = true
+				candidates = append(candidates, pair)
+			}
+		}
+		for _, pair := range adds {
+			if !seen[pair] {
+				seen[pair] = true
+				candidates = append(candidates, pair)
+			}
+		}
+		pol := *req.Strat.Policy
+		pol.Pairs = nil
+		allowedPairs, err := getPolicyPairs(&pol, candidates)
 		if err != nil {
 			return nil, err
 		}

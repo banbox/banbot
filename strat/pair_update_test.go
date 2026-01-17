@@ -91,6 +91,31 @@ func TestUpdatePairs_AddCreatesJobs(t *testing.T) {
 	}
 }
 
+func TestUpdatePairs_AddIgnoresPolicyPairs(t *testing.T) {
+	resetStratGlobals()
+	setTestHooks()
+	config.RunTimeframes = []string{"1s"}
+	core.Pairs = []string{"ETH/USDT"}
+	stg := &TradeStrat{
+		Name:       "stg",
+		WarmupNum:  50,
+		MinTfScore: 0.1,
+		Policy:     &config.RunPolicyConfig{RunTimeframes: []string{"1s"}, Pairs: []string{"ETH/USDT"}},
+	}
+	res, err := stg.UpdatePairs(PairUpdateReq{Add: []string{"BTC/USDT"}})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(res.Added) != 1 || res.Added[0] != "BTC/USDT" {
+		t.Fatalf("expected BTC/USDT added, got %v", res.Added)
+	}
+	envKey := "BTC/USDT_1s"
+	jobs := AccJobs[config.DefAcc][envKey]
+	if jobs == nil || jobs[stg.Name] == nil {
+		t.Fatalf("expected job created for %s", envKey)
+	}
+}
+
 func seedJobWithOrder(pair, tf, stratName string, entered bool) {
 	exs := &orm.ExSymbol{ID: 1, Symbol: pair}
 	stg := &TradeStrat{Name: stratName, WarmupNum: 10, Policy: &config.RunPolicyConfig{}}
