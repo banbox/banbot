@@ -1,6 +1,10 @@
 package biz
 
 import (
+	"maps"
+	"sort"
+	"strings"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
@@ -14,8 +18,6 @@ import (
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
-	"maps"
-	"strings"
 )
 
 type LocalOrderMgr struct {
@@ -131,6 +133,7 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 		}
 		lock.Unlock()
 		if len(newOds) > 0 {
+			sortOrdersForBacktest(newOds)
 			_, err = o.fillPendingOrders(newOds, bar)
 			if err != nil {
 				return orders, err
@@ -144,6 +147,16 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 		}
 	}
 	return orders, nil
+}
+
+// sortOrdersForBacktest enforces deterministic order iteration only in backtests.
+func sortOrdersForBacktest(orders []*ormo.InOutOrder) {
+	if !core.BackTestMode || len(orders) < 2 {
+		return
+	}
+	sort.Slice(orders, func(i, j int) bool {
+		return orders[i].ID < orders[j].ID
+	})
 }
 
 /*

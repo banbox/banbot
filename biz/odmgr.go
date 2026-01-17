@@ -628,8 +628,21 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 		if fillChg != 0 {
 			return res
 		}
-		// Last entry time ascending 最后按入场时间升序
-		return int((a.RealEnterMS() - b.RealEnterMS()) / 1000)
+		// Last entry time ascending, tie-break by ID for determinism
+		enterDiff := a.RealEnterMS() - b.RealEnterMS()
+		if enterDiff < 0 {
+			return -1
+		}
+		if enterDiff > 0 {
+			return 1
+		}
+		if a.ID < b.ID {
+			return -1
+		}
+		if a.ID > b.ID {
+			return 1
+		}
+		return 0
 	})
 	var result []*ormo.InOutOrder
 	var part *ormo.InOutOrder
