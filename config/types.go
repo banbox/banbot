@@ -2,6 +2,7 @@ package config
 
 import (
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/llm"
 )
 
 var (
@@ -137,6 +138,7 @@ type Config struct {
 	RPCChannels      map[string]map[string]interface{} `yaml:"rpc_channels,omitempty" mapstructure:"rpc_channels"`
 	Mail             *MailConfig                       `yaml:"mail,omitempty" mapstructure:"mail"`
 	Webhook          map[string]map[string]string      `yaml:"webhook,omitempty" mapstructure:"webhook"`
+	LLMModels        map[string]*llm.LLMModelConfig    `yaml:"llm_models" mapstructure:"llm_models"`
 }
 
 // The strategy to run, multiple strategies can be run at the same time 运行的策略，可以多个策略同时运行

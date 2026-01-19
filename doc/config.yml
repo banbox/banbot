@@ -204,3 +204,23 @@ api_server:  # 供外部通过api控制机器人
       pwd: 123
       allow_ips: []
       acc_roles: {user1: admin}
+
+llm_models:
+  base:
+    api_type: openai
+    timeout: 180
+    timeout_rate: 1.0
+  gpt4:
+    name: gpt-4
+    extend: base
+    api_type: openai
+    api_key: ${OPENAI_API_KEY}
+    base_url: https://api.openai.com/v1
+    timeout: 300
+    timeout_rate: 1
+    temperature: 0.7
+    concurrency: 10
+    prompt_price: 30.0
+    completion_price: 60.0
+    cache_price: 10
+    payload: {}

@@ -5,12 +5,14 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/llm"
 	utils2 "github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -189,15 +191,27 @@ func UpdateLocal(configPaths []string, configData string, noDefault bool) *errs.
 func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {
 	var res Config
 	var merged = make(map[string]interface{})
+	var llmMerged map[string]interface{}
 	for _, path := range paths {
 		if showLog {
 			log.Info("Using " + path)
 		}
-		fileData, err := os.ReadFile(ParsePath(path))
+		rawData, err := os.ReadFile(ParsePath(path))
 		if err != nil {
 			return nil, errs.NewFull(core.ErrIOReadFail, err, "Read %s Fail", path)
 		}
-		fileData = []byte(os.ExpandEnv(string(fileData)))
+		llmSection, err := extractLLMSection(rawData)
+		if err != nil {
+			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Parse LLM config from %s Fail", path)
+		}
+		if llmSection != nil {
+			if llmMerged == nil {
+				llmMerged = make(map[string]interface{})
+			}
+			utils2.DeepCopyMap(llmMerged, llmSection)
+		}
+
+		fileData := []byte(os.ExpandEnv(string(rawData)))
 		var unpak map[string]interface{}
 		err = yaml.Unmarshal(fileData, &unpak)
 		if err != nil {
@@ -214,6 +228,14 @@ func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {
 	if err != nil {
 		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode Config Fail")
 	}
+	if llmMerged != nil {
+		if err := applyLLMConfig(llmMerged, &res); err != nil {
+			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode LLM config Fail")
+		}
+	}
+	if err := llm.ResolveModels(res.LLMModels); err != nil {
+		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "resolve LLM config Fail")
+	}
 	return &res, nil
 }
 
@@ -227,9 +249,13 @@ func ParseConfig(path string) (*Config, *errs.Error) {
 
 func ParseYmlConfig(fileData []byte, path string) (*Config, *errs.Error) {
 	var res Config
+	llmSection, err := extractLLMSection(fileData)
+	if err != nil {
+		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Parse LLM config from %s Fail", path)
+	}
 	fileData = []byte(os.ExpandEnv(string(fileData)))
 	var unpak map[string]interface{}
-	err := yaml.Unmarshal(fileData, &unpak)
+	err = yaml.Unmarshal(fileData, &unpak)
 	if err != nil {
 		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Unmarshal %s Fail", path)
 	}
@@ -237,7 +263,77 @@ func ParseYmlConfig(fileData []byte, path string) (*Config, *errs.Error) {
 	if err != nil {
 		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode Config Fail")
 	}
+	if llmSection != nil {
+		if err := applyLLMConfig(llmSection, &res); err != nil {
+			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode LLM config Fail")
+		}
+	}
+	if err := llm.ResolveModels(res.LLMModels); err != nil {
+		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "resolve LLM config Fail")
+	}
 	return &res, nil
+}
+
+func extractLLMSection(rawData []byte) (map[string]interface{}, error) {
+	var unpak map[string]interface{}
+	if err := yaml.Unmarshal(rawData, &unpak); err != nil {
+		return nil, err
+	}
+	if len(unpak) == 0 {
+		return nil, nil
+	}
+	llmSection := make(map[string]interface{})
+	if v, ok := unpak["llm_models"]; ok {
+		llmSection["llm_models"] = llm.SubstituteEnvValue(v)
+	}
+	if len(llmSection) == 0 {
+		return nil, nil
+	}
+	return llmSection, nil
+}
+
+func applyLLMConfig(llmSection map[string]interface{}, res *Config) error {
+	if llmSection == nil || res == nil {
+		return nil
+	}
+	var cfg struct {
+		LLMModels   map[string]*llm.LLMModelConfig `mapstructure:"llm_models"`
+	}
+	if err := mapstructure.Decode(llmSection, &cfg); err != nil {
+		return err
+	}
+	if cfg.LLMModels != nil {
+		res.LLMModels = cfg.LLMModels
+	}
+	return nil
+}
+
+// GetLLMModel returns LLM model configuration by name.
+func (c *Config) GetLLMModel(name string) (*llm.LLMModelConfig, error) {
+	if c == nil || c.LLMModels == nil {
+		return nil, fmt.Errorf("LLM model '%s' not found", name)
+	}
+	model, ok := c.LLMModels[name]
+	if !ok {
+		return nil, fmt.Errorf("LLM model '%s' not found", name)
+	}
+	return model, nil
+}
+
+// GetLLMModelNames returns LLM model names sorted in ascending order.
+func (c *Config) GetLLMModelNames() []string {
+	if c == nil || len(c.LLMModels) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(c.LLMModels))
+	for name := range c.LLMModels {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func MergeConfigPaths(paths []string, skips ...string) (string, error) {

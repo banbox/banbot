@@ -1035,19 +1035,42 @@ func parseOptLine(line string) *OptInfo {
 		paraEnd = len(line)
 	}
 	res := &OptInfo{Params: make(map[string]float64), Ints: make(map[string]bool), BTResult: &BTResult{}}
-	loss, _ := strconv.ParseFloat(strings.TrimSpace(line[5:paraStart]), 64)
+	lossEnd := paraStart
+	if lossEnd < 0 {
+		lossEnd = len(line)
+	}
+	loss, _ := strconv.ParseFloat(strings.TrimSpace(line[5:lossEnd]), 64)
 	res.Score = -loss
-	paraArr := strings.Split(strings.TrimSpace(line[paraStart:paraEnd]), ",")
-	for _, str := range paraArr {
-		arr := strings.Split(strings.TrimSpace(str), ":")
-		res.Params[arr[0]], _ = strconv.ParseFloat(strings.TrimSpace(arr[1]), 64)
+	if paraStart >= 0 && paraStart < paraEnd {
+		paramStr := strings.TrimSpace(line[paraStart:paraEnd])
+		if len(paramStr) > 0 {
+			paraArr := strings.Split(paramStr, ",")
+			for _, str := range paraArr {
+				str = strings.TrimSpace(str)
+				if str == "" {
+					continue
+				}
+				arr := strings.SplitN(str, ":", 2)
+				if len(arr) < 2 {
+					continue
+				}
+				res.Params[strings.TrimSpace(arr[0])], _ = strconv.ParseFloat(strings.TrimSpace(arr[1]), 64)
+			}
+		}
 	}
 	prefStr := strings.TrimSpace(line[paraEnd:])
 	if len(prefStr) > 0 {
 		prefArr := strings.Split(prefStr, ",")
 		for _, str := range prefArr {
-			arr := strings.Split(strings.TrimSpace(str), ":")
-			key, val := arr[0], strings.TrimSpace(arr[1])
+			str = strings.TrimSpace(str)
+			if str == "" {
+				continue
+			}
+			arr := strings.SplitN(str, ":", 2)
+			if len(arr) < 2 {
+				continue
+			}
+			key, val := strings.TrimSpace(arr[0]), strings.TrimSpace(arr[1])
 			if key == "odNum" {
 				res.OrderNum, _ = strconv.Atoi(val)
 			} else if key == "profit" {
