@@ -123,7 +123,8 @@ SyncLocalOrders 将交易所仓位和本地仓位对比，关闭本地多余仓�
 func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 	// 获取交易所所有持仓
 	posList, err := exg.Default.FetchAccountPositions(nil, map[string]interface{}{
-		banexg.ParamAccount: o.Account,
+		banexg.ParamAccount:     o.Account,
+		banexg.ParamSettleCoins: config.StakeCurrency,
 	})
 	if err != nil {
 		return nil, err
@@ -273,7 +274,8 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 	// Get the exchange order
 	// 获取交易所挂单
 	exOdList, err := exchange.FetchOpenOrders("", task.CreateAt, 1000, map[string]interface{}{
-		banexg.ParamAccount: o.Account,
+		banexg.ParamAccount:     o.Account,
+		banexg.ParamSettleCoins: config.StakeCurrency,
 	})
 	if err != nil {
 		return nil, nil, nil, err
@@ -326,7 +328,8 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 	// Get exchange positions
 	// 获取交易所仓位
 	posList, err := exchange.FetchAccountPositions(nil, map[string]interface{}{
-		banexg.ParamAccount: o.Account,
+		banexg.ParamAccount:     o.Account,
+		banexg.ParamSettleCoins: config.StakeCurrency,
 	})
 	if err != nil {
 		return nil, nil, nil, err
@@ -1289,9 +1292,19 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 		}
 	}
 	if strings.Contains(trade.Type, banexg.OdTypeStop) || strings.Contains(trade.Type, banexg.OdTypeTakeProfit) {
-		// Ignore stop loss and take profit orders
-		// 忽略止损止盈订单
-		return
+		// Ignore stop loss / take profit trigger trades unless they are the tracked enter/exit order.
+		// 忽略止损/止盈触发单，但允许处理已追踪的入场/出场订单
+		enterID := ""
+		exitID := ""
+		if iod != nil && iod.Enter != nil {
+			enterID = iod.Enter.OrderID
+		}
+		if iod != nil && iod.Exit != nil {
+			exitID = iod.Exit.OrderID
+		}
+		if trade.Order == "" || (trade.Order != enterID && trade.Order != exitID) {
+			return
+		}
 	}
 	lock := iod.Lock()
 	defer lock.Unlock()
@@ -1986,8 +1999,10 @@ func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *
 }
 
 func (o *LiveOrderMgr) hasNewTrades(res *banexg.Order) bool {
-	if core.IsContract {
-		// 期货市场未返回trades，直接认为需要更新
+	if res == nil {
+		return false
+	}
+	if banexg.IsOrderDone(res.Status) || res.Filled > 0 {
 		return true
 	}
 	if len(res.Trades) == 0 {
@@ -2792,6 +2807,9 @@ func (o *LiveOrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 
 func (o *LiveOrderMgr) WatchLeverages() {
 	if !core.IsContract || o.isWatchAccConfig {
+		return
+	}
+	if !exg.Default.HasApi(banexg.ApiWatchAccountConfig, core.Market) {
 		return
 	}
 	out, err := exg.Default.WatchAccountConfig(map[string]interface{}{

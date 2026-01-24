@@ -1064,7 +1064,8 @@ func BacktestToCompare() {
 		return
 	}
 	posList, err2 := exg.Default.FetchAccountPositions(nil, map[string]interface{}{
-		banexg.ParamAccount: account,
+		banexg.ParamAccount:     account,
+		banexg.ParamSettleCoins: config.StakeCurrency,
 	})
 	if err2 != nil {
 		log.Error("FetchAccountPositions fail", zap.Error(err2))

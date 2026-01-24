@@ -523,7 +523,7 @@ func saveYear1m(outDir, year string) {
 		for syl, tup := range sylDupMap {
 			b.WriteString(fmt.Sprintf("%s num=%v dup=%v\t\t", syl, tup[0], tup[1]))
 		}
-		fmt.Printf(b.String())
+		fmt.Print(b.String())
 	}
 }
 
@@ -717,7 +717,7 @@ func CalcFilePerfs(args *config.CmdArgs) *errs.Error {
 	} else if ext == ".xlsx" {
 		rows, err = utils.ReadXlsx(path, "")
 	} else {
-		return errs.NewMsg(errs.CodeRunTime, fmt.Sprintf("invalid file type: %s, expect csv/xlsx", ext))
+		return errs.NewMsg(errs.CodeRunTime, "invalid file type: %s, expect csv/xlsx", ext)
 	}
 	if err != nil {
 		return err

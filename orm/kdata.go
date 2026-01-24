@@ -3,11 +3,12 @@ package orm
 import (
 	"context"
 	"fmt"
-	"github.com/sasha-s/go-deadlock"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
@@ -82,10 +83,13 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 		if err != nil {
 			return err
 		}
+		retSize := len(data)
 		// Remove the K-line whose end is out of range 移除末尾超出范围的K线
 		for len(data) > 0 && data[len(data)-1].Time >= until {
 			data = data[:len(data)-1]
 		}
+		log.Debug("fetch kline", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Int("curSize", curSize), zap.Int64("since", since),
+			zap.Int("rawSize", retSize), zap.Int("saveSize", len(data)))
 		since, until = nextRange(since, until)
 		if len(data) > 0 {
 			select {

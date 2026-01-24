@@ -245,7 +245,8 @@ func boolSummary(val bool, known bool, yes string, no string) string {
 
 func fetchMarginModeFromPositions(account string) string {
 	posList, err := exg.Default.FetchAccountPositions(nil, map[string]interface{}{
-		banexg.ParamAccount: account,
+		banexg.ParamAccount:     account,
+		banexg.ParamSettleCoins: config.StakeCurrency,
 	})
 	if err != nil {
 		return ""

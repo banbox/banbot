@@ -3,6 +3,9 @@ package live
 import (
 	"flag"
 	"fmt"
+	"math/rand"
+	"time"
+
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -15,8 +18,6 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
-	"math/rand"
-	"time"
 )
 
 func RunTradeClose(args []string) error {
@@ -79,7 +80,8 @@ func closeOrdersByPos(accMap map[string]bool, pairMap map[string]bool) error {
 			}
 		}
 		posList, err := exchange.FetchAccountPositions(nil, map[string]interface{}{
-			banexg.ParamAccount: account,
+			banexg.ParamAccount:     account,
+			banexg.ParamSettleCoins: config.StakeCurrency,
 		})
 		if err != nil {
 			return err
@@ -142,14 +144,16 @@ func cancelPendingOrders(accMap map[string]bool, pairMap map[string]bool) *errs.
 		}
 		// 获取账户的所有未成交挂单
 		openOrders, err := exchange.FetchOpenOrders("", 0, 1000, map[string]interface{}{
-			banexg.ParamAccount: account,
+			banexg.ParamAccount:     account,
+			banexg.ParamSettleCoins: config.StakeCurrency,
 		})
 		if err != nil {
 			return err
 		}
 		openAlgoOrders, err := exchange.FetchOpenOrders("", 0, 1000, map[string]interface{}{
-			banexg.ParamAccount:   account,
-			banexg.ParamAlgoOrder: true,
+			banexg.ParamAccount:     account,
+			banexg.ParamAlgoOrder:   true,
+			banexg.ParamSettleCoins: config.StakeCurrency,
 		})
 		if err != nil {
 			log.Error("fetch open algo orders fail", zap.Error(err))

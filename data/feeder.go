@@ -489,8 +489,7 @@ func (f *KlineFeeder) onNewBars(barTfMSecs int64, bars []*banexg.Kline) (bool, *
 		ohlcvs, lastOk = bars, true
 	} else {
 		barTf := utils2.SecsToTF(int(barTfMSecs / 1000))
-		msg := fmt.Sprintf("bar intv invalid, %v expect %v, cur: %v", f.Symbol, state.TimeFrame, barTf)
-		return false, errs.NewMsg(core.ErrInvalidBars, msg)
+		return false, errs.NewMsg(core.ErrInvalidBars, "bar intv invalid, %v expect %v, cur: %v", f.Symbol, state.TimeFrame, barTf)
 	}
 	if len(ohlcvs) == 0 {
 		return false, nil

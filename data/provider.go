@@ -239,6 +239,7 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 	maxSince := int64(0)
 	holders := make(map[string]IHistKlineFeeder)
 	defSince := btime.TimeMS()
+	needSeek := make(map[string]int64)
 	for pair, since := range sinceMap {
 		hold, ok := p.holders[pair]
 		if !ok {
@@ -251,7 +252,7 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 		if hold.getNextMS() == 0 || hold.getStates()[0].SubNextMS != since {
 			// Ignore here the targets that still exist after refreshing the trading pairs.
 			// 这里忽略刷新交易对后，仍然存在的标的
-			hold.SetSeek(since)
+			needSeek[pair] = since
 		}
 		maxSince = max(maxSince, since)
 	}
@@ -269,7 +270,7 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 		}
 		holders[pair] = hold
 		sta := staArr[0]
-		hold.SetSeek(sta.SubNextMS)
+		needSeek[pair] = sta.SubNextMS
 	}
 	// 初始化高频数据订阅
 	pairJobs, _ := strat.WsSubJobs[core.WsSubTrade]
@@ -320,6 +321,14 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 	err = p.downIfNeed()
 	if err != nil {
 		return err
+	}
+	// After data is ensured in DB, initialize/refresh loaders.
+	for pair, since := range needSeek {
+		hold, ok := p.holders[pair]
+		if !ok {
+			continue
+		}
+		hold.SetSeek(since)
 	}
 	if len(newHolds) > 0 || len(delPairs) > 0 {
 		p.SetDirty()
