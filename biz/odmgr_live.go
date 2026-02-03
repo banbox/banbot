@@ -1767,7 +1767,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	var err *errs.Error
 	exchange := exg.Default
 	leverage, maxLeverage := exg.GetLeverage(od.Symbol, od.QuoteCost, o.Account)
-	if isEnter && od.Leverage > 0 && od.Leverage != leverage {
+	if isEnter && od.Leverage > 0 && od.Leverage != leverage && banexg.IsContract(core.Market) {
 		newLeverage := od.Leverage
 		if maxLeverage >= 1 {
 			newLeverage = min(maxLeverage, od.Leverage)
