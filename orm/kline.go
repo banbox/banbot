@@ -175,7 +175,7 @@ order by sid,time`, startMs, finishEndMS, sidText)
 	subTF, rows, err_ := queryHyper(q, timeframe, dctSql, 0)
 	arrs, err_ := mapToItems(rows, err_, func() (*KlineSid, []any) {
 		var i KlineSid
-		return &i, []any{&i.Time, &i.Open, &i.High, &i.Low, &i.Close, &i.Volume, &i.Info, &i.Sid}
+		return &i, []any{&i.Time, &i.Open, &i.High, &i.Low, &i.Close, &i.Volume, &i.BuyVolume, &i.Sid}
 	})
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
@@ -216,7 +216,7 @@ order by sid,time`, startMs, finishEndMS, sidText)
 			klineArr = make([]*banexg.Kline, 0, initCap)
 		}
 		klineArr = append(klineArr, &banexg.Kline{Time: k.Time, Open: k.Open, High: k.High, Low: k.Low,
-			Close: k.Close, Volume: k.Volume, Info: k.Info})
+			Close: k.Close, Volume: k.Volume, BuyVolume: k.BuyVolume})
 	}
 	if curSid > 0 && len(klineArr) > 0 {
 		callBack()
@@ -274,7 +274,7 @@ func queryHyper(sess *Queries, timeFrame, sql string, limit int, args ...interfa
 func mapToKlines(rows pgx.Rows, err_ error) ([]*banexg.Kline, error) {
 	return mapToItems(rows, err_, func() (*banexg.Kline, []any) {
 		var i banexg.Kline
-		return &i, []any{&i.Time, &i.Open, &i.High, &i.Low, &i.Close, &i.Volume, &i.Info}
+		return &i, []any{&i.Time, &i.Open, &i.High, &i.Low, &i.Close, &i.Volume, &i.BuyVolume}
 	})
 }
 
@@ -342,7 +342,7 @@ where sid=%d and time >= %v and time < %v`, aggFrom, sid, startMS, endMS)
 	row := sess.db.QueryRow(ctx, sql)
 	var unbar = &banexg.Kline{}
 	var unToMS = int64(0)
-	err_ := row.Scan(&unbar.Time, &unbar.Open, &unbar.High, &unbar.Low, &unbar.Close, &unbar.Volume, &unbar.Info, &unToMS)
+	err_ := row.Scan(&unbar.Time, &unbar.Open, &unbar.High, &unbar.Low, &unbar.Close, &unbar.Volume, &unbar.BuyVolume, &unToMS)
 	if err_ != nil {
 		return nil, 0, err_
 	} else if unbar.Volume > 0 {
@@ -363,7 +363,7 @@ where sid=%d and time >= %v and time < %v`, aggFrom, sid, startMS, endMS)
 		}
 		last := bigKlines[len(bigKlines)-1]
 		res.Close = last.Close
-		res.Info = last.Info
+		res.BuyVolume = last.BuyVolume
 		return res, barEndMS, nil
 	}
 }
@@ -411,6 +411,7 @@ func updateUnFinish(sess *Queries, agg *KlineAgg, sid int32, subTF string, start
 	whereSql := fmt.Sprintf("where sid=%v and timeframe='%v';", sid, agg.TimeFrame)
 	fromWhere := "from kline_un " + whereSql
 	ctx := context.Background()
+	infoBy := GetSymbolByID(sid).InfoBy()
 	if finished {
 		_, err_ := sess.db.Exec(ctx, "delete "+fromWhere)
 		if err_ != nil {
@@ -440,7 +441,7 @@ func updateUnFinish(sess *Queries, agg *KlineAgg, sid int32, subTF string, start
 		sql := "select start_ms,open,high,low,close,volume,info,stop_ms " + fromWhere
 		row := sess.db.QueryRow(ctx, sql)
 		var unBar KlineUn
-		err_ := row.Scan(&unBar.StartMs, &unBar.Open, &unBar.High, &unBar.Low, &unBar.Close, &unBar.Volume, &unBar.StopMs)
+		err_ := row.Scan(&unBar.StartMs, &unBar.Open, &unBar.High, &unBar.Low, &unBar.Close, &unBar.Volume, &unBar.Info, &unBar.StopMs)
 		if err_ == nil && unBar.StopMs == startMS {
 			//When the start timestamp of this insertion matches exactly with the end timestamp of the unfinished bar, it is considered valid
 			//当本次插入开始时间戳，和未完成bar结束时间戳完全匹配时，认为有效
@@ -448,6 +449,11 @@ func updateUnFinish(sess *Queries, agg *KlineAgg, sid int32, subTF string, start
 			unBar.Low = min(unBar.Low, unFinish.Low)
 			unBar.Close = unFinish.Close
 			unBar.Volume += unFinish.Volume
+			if infoBy == "sum" {
+				unBar.Info += unFinish.BuyVolume
+			} else {
+				unBar.Info = unFinish.BuyVolume
+			}
 			unBar.StopMs = endMS
 			updSql := fmt.Sprintf("update kline_un set high=%v,low=%v,close=%v,volume=%v,info=%v,stop_ms=%v %s",
 				unBar.High, unBar.Low, unBar.Close, unBar.Volume, unBar.Info, unBar.StopMs, whereSql)
@@ -466,7 +472,7 @@ func updateUnFinish(sess *Queries, agg *KlineAgg, sid int32, subTF string, start
 func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
 	whereSql := fmt.Sprintf("where sid=%v and timeframe='%v';", sid, tf)
 	updSql := fmt.Sprintf("update kline_un set start_ms=%v,stop_ms=%v,open=%v,high=%v,low=%v,close=%v,volume=%v,info=%v %s",
-		bar.Time, endMS, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Info, whereSql)
+		bar.Time, endMS, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.BuyVolume, whereSql)
 	res, err_ := q.db.Exec(context.Background(), updSql)
 	var err *errs.Error
 	if err_ != nil {
@@ -474,7 +480,7 @@ func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kli
 	} else if res.RowsAffected() == 0 {
 		err = q.Exec(`insert into kline_un (sid, start_ms, stop_ms, open, high, low, close, volume, info, timeframe) 
 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, sid, bar.Time, endMS, bar.Open, bar.High, bar.Low,
-			bar.Close, bar.Volume, bar.Info, tf)
+			bar.Close, bar.Volume, bar.BuyVolume, tf)
 	}
 	return err
 }
@@ -506,7 +512,7 @@ func (r iterForAddKLines) Values() ([]interface{}, error) {
 		r.rows[0].Low,
 		r.rows[0].Close,
 		r.rows[0].Volume,
-		r.rows[0].Info,
+		r.rows[0].BuyVolume,
 	}, nil
 }
 
@@ -1950,10 +1956,10 @@ func writeAdjChg(sid1, sid2 int32, hit, width int, data map[int64]map[int32]*ban
 		if k1 != nil || k2 != nil {
 			var p1, v1, i1, p2, v2, i2 float64
 			if k1 != nil {
-				p1, v1, i1 = k1.Close, k1.Volume, k1.Info
+				p1, v1, i1 = k1.Close, k1.Volume, k1.BuyVolume
 			}
 			if k2 != nil {
-				p2, v2, i2 = k2.Close, k2.Volume, k2.Info
+				p2, v2, i2 = k2.Close, k2.Volume, k2.BuyVolume
 			}
 			text := fmt.Sprintf("%v/%v\t%v/%v\t%v/%v", p1, p2, v1, v2, i1, i2)
 			line := dateStr + "   " + text
@@ -1987,16 +1993,16 @@ func findMaxVols(vols map[int32]*banexg.Kline) (*PriceVol, *PriceVol) {
 			vol.Vol = k.Volume
 			hold.Sid = sid
 			hold.Price = k.Close
-			hold.Vol = k.Info
+			hold.Vol = k.BuyVolume
 		} else if k.Volume > vol.Vol {
 			vol.Sid = sid
 			vol.Price = k.Close
 			vol.Vol = k.Volume
 		}
-		if k.Info > hold.Vol {
+		if k.BuyVolume > hold.Vol {
 			hold.Sid = sid
 			hold.Price = k.Close
-			hold.Vol = k.Info
+			hold.Vol = k.BuyVolume
 		}
 	}
 	return &vol, &hold

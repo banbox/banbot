@@ -72,9 +72,9 @@ func BuildOHLCV(arr []*banexg.Kline, toTFMSecs int64, preFire float64, resOHLCV 
 				big.Close = bar.Close
 				big.Volume += bar.Volume
 				if infoBy == "last" {
-					big.Info = bar.Info
+					big.BuyVolume = bar.BuyVolume
 				} else if infoBy == "sum" {
-					big.Info += bar.Info
+					big.BuyVolume += bar.BuyVolume
 				} else {
 					panic("unsupported infoBy for BuildOHLCV: " + infoBy)
 				}

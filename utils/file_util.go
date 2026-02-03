@@ -359,7 +359,7 @@ func KlineToStr(klines []*banexg.Kline, loc *time.Location) [][]string {
 			strconv.FormatFloat(k.Low, 'f', -1, 64),
 			strconv.FormatFloat(k.Close, 'f', -1, 64),
 			strconv.FormatFloat(k.Volume, 'f', -1, 64),
-			strconv.FormatFloat(k.Info, 'f', -1, 64),
+			strconv.FormatFloat(k.BuyVolume, 'f', -1, 64),
 		}
 		rows = append(rows, row)
 	}

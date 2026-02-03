@@ -46,7 +46,7 @@ func (t *Trader) OnEnvJobs(bar *orm.InfoKline) (*ta.BarEnv, *errs.Error) {
 	}
 	// Update BarEnv status
 	// 更新BarEnv状态
-	err := env.OnBar(bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Info)
+	err := env.OnBar(bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.BuyVolume)
 	if err != nil {
 		return nil, errs.New(errs.CodeRunTime, err)
 	}

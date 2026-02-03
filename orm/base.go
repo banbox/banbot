@@ -595,7 +595,7 @@ func (a *AdjInfo) Apply(bars []*banexg.Kline, adj int) []*banexg.Kline {
 		k.Low *= factor
 		k.Close *= factor
 		k.Volume *= factor
-		k.Info *= factor
+		k.BuyVolume *= factor
 		result = append(result, k)
 	}
 	return result

@@ -88,13 +88,13 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 			tfMSecs = timeDiff
 		}
 		klines = append(klines, &banexg.Kline{
-			Time:   barTime,
-			Open:   o,
-			High:   h,
-			Low:    l,
-			Close:  c,
-			Volume: v,
-			Info:   d,
+			Time:      barTime,
+			Open:      o,
+			High:      h,
+			Low:       l,
+			Close:     c,
+			Volume:    v,
+			BuyVolume: d,
 		})
 	}
 	sort.Slice(klines, func(i, j int) bool {
@@ -196,7 +196,7 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 						}
 						p.Close = k.Close
 						p.Volume += k.Volume
-						p.Info = k.Info
+						p.BuyVolume = k.BuyVolume
 					}
 				}
 			}
@@ -1230,7 +1230,7 @@ func TestKLineConsistency(args []string) error {
 				lowDiff := math.Abs(k.Low-ka.Low) / max(k.Low, ka.Low)
 				closeDiff := math.Abs(k.Close-ka.Close) / max(k.Close, ka.Close)
 				volDiff := math.Abs(k.Volume-ka.Volume) / max(k.Volume, ka.Volume)
-				infoDiff := math.Abs(k.Info-ka.Info) / max(k.Info, ka.Info)
+				buyVolDiff := math.Abs(k.BuyVolume-ka.BuyVolume) / max(k.BuyVolume, ka.BuyVolume)
 				var fields []string
 				if openDiff > 0.01 {
 					fields = append(fields, fmt.Sprintf("open: %f - %f", k.Open, ka.Open))
@@ -1247,8 +1247,8 @@ func TestKLineConsistency(args []string) error {
 				if volDiff > 0.01 {
 					fields = append(fields, fmt.Sprintf("vol: %f - %f", k.Volume, ka.Volume))
 				}
-				if infoDiff > 0.01 {
-					fields = append(fields, fmt.Sprintf("info: %f - %f", k.Info, ka.Info))
+				if buyVolDiff > 0.01 {
+					fields = append(fields, fmt.Sprintf("buyVol: %f - %f", k.BuyVolume, ka.BuyVolume))
 				}
 				if len(fields) > 0 {
 					curDateStr := btime.ToDateStr(ka.Time, core.DefaultDateFmt)

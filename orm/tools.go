@@ -501,7 +501,7 @@ func (b *KlineBlock) Append(klines []*banexg.Kline, tfMSec int64, hasInfo bool) 
 			b.Close = append(b.Close, k.Close)
 			b.Volume = append(b.Volume, k.Volume)
 			if hasInfo {
-				b.Info = append(b.Info, k.Info)
+				b.Info = append(b.Info, k.BuyVolume)
 			}
 		} else {
 			return klines[i:]
@@ -893,7 +893,7 @@ func importKlines(sess *Queries, ctx context.Context, sid int32, block *KlineBlo
 			Volume: block.Volume[i],
 		}
 		if len(block.Info) > i {
-			bar.Info = block.Info[i]
+			bar.BuyVolume = block.Info[i]
 		}
 		klines = append(klines, bar)
 		if len(klines) >= batchSize {
