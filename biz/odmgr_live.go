@@ -1436,7 +1436,7 @@ func (o *LiveOrderMgr) TrialUnMatchesForever() {
 				if ok {
 					if o.checkOrderDone(odKey) {
 						// 订单已完成
-						return
+						continue
 					}
 					lock := iod.Lock()
 					err := o.updateByMyTrade(iod, trade)
