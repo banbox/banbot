@@ -24,15 +24,16 @@ func initApp() *errs.Error {
 }
 
 func TestGetKrange(t *testing.T) {
+	t.Skip("integration test (requires database)")
 	err := initApp()
 	if err != nil {
 		panic(err)
 	}
-	sess, conn, err := Conn(nil)
+	_, conn, err := Conn(nil)
 	if err != nil {
 		panic(err)
 	}
 	defer conn.Release()
-	start, stop := sess.GetKlineRange(12, "1m")
+	start, stop := PubQ().GetKlineRange(12, "1m")
 	log.Info("krange", zap.Int64("start", start), zap.Int64("stop", stop))
 }

@@ -499,7 +499,7 @@
     "edit_config": "Edit Config",
     "run_banbot": "Run Banbot",
     "dashboard": "DashBoard",
-    "database_desc": "Install and start TimescaleDb, and note the connection string",
+    "database_desc": "Install and start QuestDB, and note the PGWire connection string",
     "trade_edit_config_desc": "Execute `bot init` command to initialize global config, Set api key & secret, dbConnStr, single transaction amount, market, trading pairs, message notification, Dashboard password, etc.",
     "run_banbot_desc": "Start spider process & trader: `bot spider & bot trade`",
     "dashboard_desc": "Go to Dashboard to view and manage your trading robot",

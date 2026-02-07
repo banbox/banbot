@@ -673,7 +673,7 @@ func (s *StratJob) GetAvgCostPrice(odList ...*ormo.InOutOrder) float64 {
 	return totalCost / totalAmt
 }
 
-func (s *StratJob) GetTmpEnv(stamp int64, o, h, l, c, v, i float64) *ta.BarEnv {
+func (s *StratJob) GetTmpEnv(stamp int64, o, h, l, c, v, quote, buyVolume float64, tradeNum int64) *ta.BarEnv {
 	envKey := strings.Join([]string{s.Symbol.Symbol, s.TimeFrame}, "_")
 	lockTmpEnv.Lock()
 	e, ok := TmpEnvs[envKey]
@@ -691,7 +691,7 @@ func (s *StratJob) GetTmpEnv(stamp int64, o, h, l, c, v, i float64) *ta.BarEnv {
 			lockTmpEnv.Lock()
 			TmpEnvs[envKey] = e
 			lockTmpEnv.Unlock()
-			e.OnBar2(barMs, stamp, o, o, o, o, 0, 0)
+			e.OnBar2(barMs, stamp, o, o, o, o, 0, 0, 0, 0)
 		} else {
 			e.ResetTo(s.Env)
 		}
@@ -704,7 +704,9 @@ func (s *StratJob) GetTmpEnv(stamp int64, o, h, l, c, v, i float64) *ta.BarEnv {
 		}
 		e.Close.Data[len(e.Close.Data)-1] = c
 		e.Volume.Data[len(e.Volume.Data)-1] = v
-		e.Info.Data[len(e.Info.Data)-1] = i
+		e.Quote.Data[len(e.Quote.Data)-1] = quote
+		e.BuyVolume.Data[len(e.BuyVolume.Data)-1] = buyVolume
+		e.TradeNum.Data[len(e.TradeNum.Data)-1] = float64(tradeNum)
 		e.TimeStop = stamp
 	}
 	return e

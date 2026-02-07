@@ -3,15 +3,17 @@ package orm
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/sasha-s/go-deadlock"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -23,55 +25,24 @@ import (
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 )
 
 var (
 	aggList = []*KlineAgg{
-		// All use hypertables, and update dependent tables by themselves when inserting. Since continuous aggregation cannot be refreshed by sid, the performance is poor when refreshing after inserting historical data in batches by sid.
-		//全部使用超表，自行在插入时更新依赖表。因连续聚合无法按sid刷新，在按sid批量插入历史数据后刷新时性能较差
+		// Update dependent tables by ourselves when inserting (QuestDB).
 		NewKlineAgg("1m", "kline_1m", "", "", "", "", "2 months", "12 months"),
 		NewKlineAgg("5m", "kline_5m", "1m", "20m", "1m", "1m", "2 months", "12 months"),
 		NewKlineAgg("15m", "kline_15m", "5m", "1h", "5m", "5m", "3 months", "16 months"),
 		NewKlineAgg("1h", "kline_1h", "", "", "", "", "6 months", "3 years"),
 		NewKlineAgg("1d", "kline_1d", "1h", "3d", "1h", "1h", "3 years", "20 years"),
 	}
-	aggMap  = make(map[string]*KlineAgg)
-	downTfs = map[string]struct{}{"1m": {}, "15m": {}, "1h": {}, "1d": {}}
-)
-
-const (
-	aggFields = `
-  first(open, time) AS open,  
-  max(high) AS high,
-  min(low) AS low, 
-  last(close, time) AS close,
-  sum(volume) AS volume`
-	klineInsConflict = `
-ON CONFLICT (sid, time)
-DO UPDATE SET 
-open = EXCLUDED.open,
-high = EXCLUDED.high,
-low = EXCLUDED.low,
-close = EXCLUDED.close,
-volume = EXCLUDED.volume,
-info = EXCLUDED.info`
+	aggMap = make(map[string]*KlineAgg)
 )
 
 func init() {
 	for _, agg := range aggList {
 		aggMap[agg.TimeFrame] = agg
-	}
-}
-
-func aggCol(name, by string) string {
-	if by == "first" || by == "last" {
-		return fmt.Sprintf("%s(%s, time) AS %s", by, name, name)
-	} else if by == "max" || by == "min" || by == "sum" {
-		return fmt.Sprintf("%s(%s) AS %s", by, name, name)
-	} else {
-		panic("unknown agg by: " + by)
 	}
 }
 
@@ -94,7 +65,7 @@ func (q *Queries) QueryOHLCV(exs *ExSymbol, timeframe string, startMs, endMs int
 		// No start time provided, quantity limit provided, search in reverse chronological order
 		// 未提供开始时间，提供了数量限制，按时间倒序搜索
 		dctSql = fmt.Sprintf(`
-select time,open,high,low,close,volume,info from $tbl
+select time,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
 where sid=%d and time < %v
 order by time desc`, exs.ID, finishEndMS)
 	} else {
@@ -102,7 +73,7 @@ order by time desc`, exs.ID, finishEndMS)
 			limit = int((finishEndMS-startMs)/tfMSecs) + 1
 		}
 		dctSql = fmt.Sprintf(`
-select time,open,high,low,close,volume,info from $tbl
+select time,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
 where sid=%d and time >= %v and time < %v
 order by time`, exs.ID, startMs, finishEndMS)
 	}
@@ -169,13 +140,13 @@ func (q *Queries) QueryOHLCVBatch(exsMap map[int32]*ExSymbol, timeframe string, 
 	}
 	sidText := strings.Join(sidTA, ", ")
 	dctSql := fmt.Sprintf(`
-select time,open,high,low,close,volume,info,sid from $tbl
+select time,open,high,low,close,volume,quote,buy_volume,trade_num,sid from $tbl
 where time >= %v and time < %v and sid in (%v)
 order by sid,time`, startMs, finishEndMS, sidText)
 	subTF, rows, err_ := queryHyper(q, timeframe, dctSql, 0)
 	arrs, err_ := mapToItems(rows, err_, func() (*KlineSid, []any) {
 		var i KlineSid
-		return &i, []any{&i.Time, &i.Open, &i.High, &i.Low, &i.Close, &i.Volume, &i.Info, &i.Sid}
+		return &i, []any{&i.Time, &i.Open, &i.High, &i.Low, &i.Close, &i.Volume, &i.Quote, &i.BuyVolume, &i.TradeNum, &i.Sid}
 	})
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
@@ -216,7 +187,7 @@ order by sid,time`, startMs, finishEndMS, sidText)
 			klineArr = make([]*banexg.Kline, 0, initCap)
 		}
 		klineArr = append(klineArr, &banexg.Kline{Time: k.Time, Open: k.Open, High: k.High, Low: k.Low,
-			Close: k.Close, Volume: k.Volume, Info: k.Info})
+			Close: k.Close, Volume: k.Volume, Quote: k.Quote, BuyVolume: k.BuyVolume, TradeNum: k.TradeNum})
 	}
 	if curSid > 0 && len(klineArr) > 0 {
 		callBack()
@@ -249,6 +220,135 @@ order by time`, tblName, sid, startMs, endMs)
 	return resList, nil
 }
 
+func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64, isCont bool) *errs.Error {
+	_ = isCont
+	if startMS <= 0 || endMS <= startMS {
+		return nil
+	}
+	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
+	barTimes, err := q.getKLineTimes(sid, timeFrame, startMS, endMS)
+	if err != nil {
+		return err
+	}
+	holes := make([]MSRange, 0)
+	if len(barTimes) == 0 {
+		holes = append(holes, MSRange{Start: startMS, Stop: endMS})
+	} else {
+		if barTimes[0] > startMS {
+			holes = append(holes, MSRange{Start: startMS, Stop: barTimes[0]})
+		}
+		prevTime := barTimes[0]
+		for _, t := range barTimes[1:] {
+			intv := t - prevTime
+			if intv > tfMSecs {
+				holes = append(holes, MSRange{Start: prevTime + tfMSecs, Stop: t})
+			} else if intv < tfMSecs {
+				log.Warn("invalid timeframe or kline", zap.Int32("sid", sid), zap.String("tf", timeFrame),
+					zap.Int64("intv", intv/1000), zap.Int64("tfmsecs", tfMSecs/1000), zap.Int64("time", t))
+			}
+			prevTime = t
+		}
+		maxEnd := utils2.AlignTfMSecs(btime.UTCStamp(), tfMSecs) - tfMSecs
+		if maxEnd-prevTime > tfMSecs*5 && endMS-prevTime > tfMSecs {
+			holes = append(holes, MSRange{Start: prevTime + tfMSecs, Stop: min(endMS, maxEnd)})
+		}
+	}
+	if len(holes) == 0 {
+		return nil
+	}
+
+	// Filter out non-trading time ranges.
+	exs := GetSymbolByID(sid)
+	if exs == nil {
+		log.Warn("no ExSymbol found", zap.Int32("sid", sid))
+		return nil
+	}
+	exchange, err := exg.GetWith(exs.Exchange, exs.Market, "")
+	if err != nil {
+		return err
+	}
+	susp, err := GetExSHoles(exchange, exs, startMS, endMS, true)
+	if err != nil {
+		return err
+	}
+	if len(susp) > 0 {
+		filtered := make([]MSRange, 0, len(holes))
+		si := 0
+		for _, h := range holes {
+			for si < len(susp) && susp[si][1] <= h.Start {
+				si++
+			}
+			if si >= len(susp) {
+				filtered = append(filtered, h)
+				continue
+			}
+			cur := h
+			for si < len(susp) {
+				s := susp[si]
+				if s[0] >= cur.Stop {
+					break
+				}
+				if s[1] <= cur.Start {
+					si++
+					continue
+				}
+				// left part
+				if s[0] > cur.Start {
+					filtered = append(filtered, MSRange{Start: cur.Start, Stop: min(cur.Stop, s[0])})
+				}
+				// shrink to right remainder
+				cur.Start = max(cur.Start, s[1])
+				if cur.Start >= cur.Stop {
+					break
+				}
+				si++
+			}
+			if cur.Start < cur.Stop {
+				filtered = append(filtered, cur)
+			}
+		}
+		holes = filtered
+	}
+
+	// Filter out tiny 1m holes.
+	if tfMSecs == 60000 {
+		exInfo := exchange.Info()
+		hs := holes[:0]
+		for _, h := range holes {
+			num := int((h.Stop - h.Start) / tfMSecs)
+			if num <= exInfo.Min1mHole {
+				continue
+			}
+			hs = append(hs, h)
+		}
+		holes = hs
+	}
+	if len(holes) == 0 {
+		return nil
+	}
+
+	// Merge with already recorded holes (sranges has_data=false) to reduce fragmentation.
+	ctx := context.Background()
+	exists, err_ := PubQ().ListSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, startMS, endMS)
+	if err_ != nil {
+		return NewDbErr(core.ErrDbReadFail, err_)
+	}
+	for _, r := range exists {
+		if r.HasData {
+			continue
+		}
+		holes = append(holes, MSRange{Start: r.StartMs, Stop: r.StopMs})
+	}
+	holes = mergeMSRanges(holes)
+
+	for _, h := range holes {
+		if err := PubQ().UpdateSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, h.Start, h.Stop, false); err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
+	}
+	return nil
+}
+
 func queryHyper(sess *Queries, timeFrame, sql string, limit int, args ...interface{}) (string, pgx.Rows, error) {
 	agg, ok := aggMap[timeFrame]
 	var subTF, table string
@@ -272,10 +372,18 @@ func queryHyper(sess *Queries, timeFrame, sql string, limit int, args ...interfa
 }
 
 func mapToKlines(rows pgx.Rows, err_ error) ([]*banexg.Kline, error) {
-	return mapToItems(rows, err_, func() (*banexg.Kline, []any) {
+	items, err := mapToItems(rows, err_, func() (*banexg.Kline, []any) {
 		var i banexg.Kline
-		return &i, []any{&i.Time, &i.Open, &i.High, &i.Low, &i.Close, &i.Volume, &i.Info}
+		return &i, []any{&i.Time, &i.Open, &i.High, &i.Low, &i.Close, &i.Volume, &i.Quote, &i.BuyVolume, &i.TradeNum}
 	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*banexg.Kline, 0, len(items))
+	for _, it := range items {
+		out = append(out, it)
+	}
+	return out, nil
 }
 
 func getSubTf(timeFrame string) (string, string, int) {
@@ -292,11 +400,6 @@ func getSubTf(timeFrame string) (string, string, int) {
 	return "", "", 0
 }
 
-func (q *Queries) PurgeKlineUn() *errs.Error {
-	sql := "delete from kline_un"
-	return q.Exec(sql)
-}
-
 /*
 getUnFinish
 Query the unfinished bars for a given period. The given period can be a preservation period of 1m, 5m, 15m, 1h, 1d; It can also be an aggregation period such as 4h, 3d
@@ -310,62 +413,214 @@ func getUnFinish(sess *Queries, sid int32, timeFrame string, startMS, endMS int6
 	if mode != "calc" && mode != "query" {
 		panic(fmt.Sprintf("`mode` of getUnFinish must be calc/query, current: %s", mode))
 	}
-	ctx := context.Background()
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-	barEndMS := int64(0)
-	fromTF := timeFrame
-	var bigKlines = make([]*banexg.Kline, 0)
-	if _, ok := aggMap[timeFrame]; mode == "calc" || !ok {
-		// Collect data from completed sub cycles
-		// 从已完成的子周期中归集数据
-		fromTF, _, _ = getSubTf(timeFrame)
-		aggFrom := "kline_" + fromTF
-		sql := fmt.Sprintf(`select time,open,high,low,close,volume,info from %s
-where sid=%d and time >= %v and time < %v`, aggFrom, sid, startMS, endMS)
-		rows, err_ := sess.db.Query(ctx, sql)
-		klines, err_ := mapToKlines(rows, err_)
-		if err_ != nil {
-			return nil, 0, err_
+	barEndMS := endMS
+	if barEndMS <= startMS && tfMSecs > 0 {
+		barEndMS = startMS + tfMSecs
+	}
+
+	nowMS := btime.UTCStamp()
+	if barEndMS > 0 {
+		nowMS = min(nowMS, barEndMS)
+	}
+
+	// 1) Read cached unfinish (kline_un) first. Only recompute when expired.
+	cached, cachedStop, cachedExpire, err := queryUnfinish(sid, timeFrame, startMS)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, 0, err
+	}
+	if cached != nil && cachedExpire != nil && *cachedExpire > nowMS {
+		return cached, cachedStop, nil
+	}
+	if tfMSecs <= 60000 || mode != "query" {
+		if cached != nil {
+			return cached, cachedStop, nil
 		}
-		offMS := GetAlignOff(sid, tfMSecs)
-		infoBy := GetSymbolByID(sid).InfoBy()
-		bigKlines, _ = utils.BuildOHLCV(klines, tfMSecs, 0, nil, 0, offMS, infoBy)
-		if len(klines) > 0 {
-			barEndMS = klines[len(klines)-1].Time + int64(utils2.TFToSecs(fromTF)*1000)
+		return nil, 0, nil
+	}
+
+	// 2) Recompute from smaller timeframes (15m -> 5m -> 1m ...), then write back with expire_ms.
+	bar, stopMS, err := calcUnfinishFromSubs(sess, sid, timeFrame, startMS, barEndMS, nowMS)
+	if err != nil {
+		return nil, 0, err
+	}
+	if bar == nil {
+		return nil, stopMS, nil
+	}
+	bar.Time = startMS
+
+	// Best-effort cache update.
+	if stopMS <= 0 {
+		stopMS = nowMS
+	}
+	if err2 := PubQ().SetUnfinish(sid, timeFrame, stopMS, bar); err2 != nil {
+		log.Warn("set unfinish fail", zap.Int32("sid", sid), zap.String("tf", timeFrame), zap.String("err", err2.Short()))
+	}
+	return bar, stopMS, nil
+}
+
+func queryUnfinish(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline, int64, *int64, error) {
+	ctx := context.Background()
+	db, err := BanPubConn(false)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	defer db.Close()
+	row := db.QueryRowContext(ctx, `
+select start_ms,open,high,low,close,volume,quote,buy_volume,trade_num,stop_ms,expire_ms
+from kline_un
+where sid=? and timeframe=? and start_ms >= ?
+limit 1`,
+		sid, timeFrame, barStartMS,
+	)
+	var (
+		startMs                    int64
+		open, high, low            float64
+		closeP, vol, quote, buyVol float64
+		tradeNum                   int64
+		stopMs                     int64
+		expireMsVal                int64
+	)
+	if err := row.Scan(&startMs, &open, &high, &low, &closeP, &vol, &quote, &buyVol, &tradeNum, &stopMs, &expireMsVal); err != nil {
+		return nil, 0, nil, err
+	}
+	bar := &banexg.Kline{
+		Time:      startMs,
+		Open:      open,
+		High:      high,
+		Low:       low,
+		Close:     closeP,
+		Volume:    vol,
+		Quote:     quote,
+		BuyVolume: buyVol,
+		TradeNum:  tradeNum,
+	}
+	return bar, stopMs, &expireMsVal, nil
+}
+
+func unfinishChain(timeFrame string) []string {
+	if utils2.TFToSecs(timeFrame) <= utils2.SecsMin {
+		return nil
+	}
+	out := make([]string, 0, 4)
+	cur := timeFrame
+	for {
+		sub, _, _ := getSubTf(cur)
+		if sub == "" {
+			return out
+		}
+		out = append(out, sub)
+		if sub == "1m" {
+			return out
+		}
+		cur = sub
+	}
+}
+
+func queryKlinesRange(sess *Queries, sid int32, timeFrame string, startMS, endMS int64) ([]*banexg.Kline, error) {
+	if startMS <= 0 || endMS <= startMS {
+		return nil, nil
+	}
+	sql := fmt.Sprintf(`
+select time,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
+where sid=%d and time >= %v and time < %v
+order by time`, sid, startMS, endMS)
+	subTF, rows, err_ := queryHyper(sess, timeFrame, sql, 0)
+	klines, err := mapToKlines(rows, err_)
+	if err != nil {
+		return nil, err
+	}
+	if subTF == "" || len(klines) == 0 {
+		return klines, nil
+	}
+	// Safety: if queryHyper fell back to a smaller table, aggregate to requested timeframe.
+	toTfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
+	fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
+	offMS := GetAlignOff(sid, toTfMSecs)
+	infoBy := GetSymbolByID(sid).InfoBy()
+	var lastFinish bool
+	klines, lastFinish = utils.BuildOHLCV(klines, toTfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
+	if !lastFinish && len(klines) > 0 {
+		klines = klines[:len(klines)-1]
+	}
+	return klines, nil
+}
+
+func calcUnfinishFromSubs(sess *Queries, sid int32, timeFrame string, startMS, endMS, nowMS int64) (*banexg.Kline, int64, error) {
+	chain := unfinishChain(timeFrame)
+	if len(chain) == 0 {
+		return nil, 0, nil
+	}
+
+	infoBy := GetSymbolByID(sid).InfoBy()
+	parts := make([]*banexg.Kline, 0, 32)
+	curStart := startMS
+	lastToMS := int64(0)
+
+	for _, tf := range chain {
+		tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
+		winEnd := utils2.AlignTfMSecs(nowMS, tfMSecs)
+		if winEnd <= curStart {
+			continue
+		}
+		klines, err := queryKlinesRange(sess, sid, tf, curStart, winEnd)
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(klines) == 0 {
+			continue
+		}
+		parts = append(parts, klines...)
+		curStart = klines[len(klines)-1].Time + tfMSecs
+		lastToMS = max(lastToMS, curStart)
+		if curStart >= nowMS {
+			break
 		}
 	}
-	// Querying data from unfinished cycles/sub cycles
-	// 从未完成的周期/子周期中查询数据
-	sql := fmt.Sprintf(`SELECT start_ms,open,high,low,close,volume,info,stop_ms FROM kline_un
-						where sid=%d and timeframe='%s' and start_ms >= %d
-						limit 1`, sid, fromTF, startMS)
-	row := sess.db.QueryRow(ctx, sql)
-	var unbar = &banexg.Kline{}
-	var unToMS = int64(0)
-	err_ := row.Scan(&unbar.Time, &unbar.Open, &unbar.High, &unbar.Low, &unbar.Close, &unbar.Volume, &unbar.Info, &unToMS)
-	if err_ != nil {
-		return nil, 0, err_
-	} else if unbar.Volume > 0 {
-		bigKlines = append(bigKlines, unbar)
-		barEndMS = max(barEndMS, unToMS)
+
+	// Include the unfinished bar of the smallest timeframe (typically 1m) if present.
+	smallTF := chain[len(chain)-1]
+	smallMSecs := int64(utils2.TFToSecs(smallTF) * 1000)
+	unStart := utils2.AlignTfMSecs(nowMS, smallMSecs)
+	if unStart >= curStart && unStart < endMS {
+		unbar, unTo, _, err := queryUnfinish(sid, smallTF, unStart)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, 0, err
+		}
+		if unbar != nil && unbar.Volume > 0 && unTo > unStart {
+			parts = append(parts, unbar)
+			lastToMS = max(lastToMS, unTo)
+		}
 	}
-	if len(bigKlines) == 0 {
-		return nil, barEndMS, nil
+
+	if len(parts) == 0 {
+		return nil, lastToMS, nil
 	}
-	if len(bigKlines) == 1 {
-		return bigKlines[0], barEndMS, nil
+
+	res := &banexg.Kline{
+		Time:   startMS,
+		Open:   parts[0].Open,
+		High:   parts[0].High,
+		Low:    parts[0].Low,
+		Close:  parts[len(parts)-1].Close,
+		Volume: 0,
+		Quote:  0,
+	}
+	var infoSum float64
+	for _, p := range parts {
+		res.High = max(res.High, p.High)
+		res.Low = min(res.Low, p.Low)
+		res.Volume += p.Volume
+		res.Quote += p.Quote
+		res.TradeNum += p.TradeNum
+		infoSum += p.BuyVolume
+	}
+	if infoBy == "sum" {
+		res.BuyVolume = infoSum
 	} else {
-		var res = bigKlines[0]
-		for _, bar := range bigKlines[1:] {
-			res.High = max(res.High, bar.High)
-			res.Low = min(res.Low, bar.Low)
-			res.Volume += bar.Volume
-		}
-		last := bigKlines[len(bigKlines)-1]
-		res.Close = last.Close
-		res.Info = last.Info
-		return res, barEndMS, nil
+		res.BuyVolume = parts[len(parts)-1].BuyVolume
 	}
+	return res, lastToMS, nil
 }
 
 var alignOffs = make(map[int32]map[int64]int64)
@@ -389,94 +644,34 @@ func GetAlignOff(sid int32, toTfMSecs int64) int64 {
 	return offMS
 }
 
-/*
-calcUnFinish
-Calculate the unfinished bars of large cycles from sub cycles
-从子周期计算大周期的未完成bar
-*/
-func calcUnFinish(sid int32, tfMSecs, fromTfMSecs int64, arr []*banexg.Kline) *banexg.Kline {
-	offMS := GetAlignOff(sid, tfMSecs)
-	infoBy := GetSymbolByID(sid).InfoBy()
-	merged, _ := utils.BuildOHLCV(arr, tfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
-	if len(merged) == 0 {
-		return nil
+func (q *PubQueries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
+	expireMS := utils2.AlignTfMSecs(btime.UTCStamp(), 60000) + 60000
+	db, err := BanPubConn(true)
+	if err != nil {
+		return err
 	}
-	out := merged[len(merged)-1]
-	return out
-}
-
-func updateUnFinish(sess *Queries, agg *KlineAgg, sid int32, subTF string, startMS, endMS int64, klines []*banexg.Kline) *errs.Error {
-	tfMSecs := int64(utils2.TFToSecs(agg.TimeFrame) * 1000)
-	finished := endMS%tfMSecs == 0
-	whereSql := fmt.Sprintf("where sid=%v and timeframe='%v';", sid, agg.TimeFrame)
-	fromWhere := "from kline_un " + whereSql
-	ctx := context.Background()
-	if finished {
-		_, err_ := sess.db.Exec(ctx, "delete "+fromWhere)
-		if err_ != nil {
-			return NewDbErr(core.ErrDbExecFail, err_)
-		}
-		return nil
-	}
-	if len(klines) == 0 {
-		log.Warn("skip unFinish for empty", zap.Int64("s", startMS), zap.Int64("e", endMS))
-		return nil
-	}
-	fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
-	unFinish := calcUnFinish(sid, tfMSecs, fromTfMSecs, klines)
-	if unFinish == nil {
-		_, err_ := sess.db.Exec(ctx, "delete "+fromWhere)
-		if err_ != nil {
-			return NewDbErr(core.ErrDbExecFail, err_)
-		}
-		return nil
-	}
-	unFinish.Time = startMS
-	barStartMS := utils2.AlignTfMSecs(startMS, tfMSecs)
-	barEndMS := utils2.AlignTfMSecs(endMS, tfMSecs)
-	if barStartMS == barEndMS {
-		// When inserting the start and end timestamps of a sub cycle, corresponding to the current cycle and belonging to the same bar, fast updates are executed
-		// 当子周期插入开始结束时间戳，对应到当前周期，属于同一个bar时，才执行快速更新
-		sql := "select start_ms,open,high,low,close,volume,info,stop_ms " + fromWhere
-		row := sess.db.QueryRow(ctx, sql)
-		var unBar KlineUn
-		err_ := row.Scan(&unBar.StartMs, &unBar.Open, &unBar.High, &unBar.Low, &unBar.Close, &unBar.Volume, &unBar.StopMs)
-		if err_ == nil && unBar.StopMs == startMS {
-			//When the start timestamp of this insertion matches exactly with the end timestamp of the unfinished bar, it is considered valid
-			//当本次插入开始时间戳，和未完成bar结束时间戳完全匹配时，认为有效
-			unBar.High = max(unBar.High, unFinish.High)
-			unBar.Low = min(unBar.Low, unFinish.Low)
-			unBar.Close = unFinish.Close
-			unBar.Volume += unFinish.Volume
-			unBar.StopMs = endMS
-			updSql := fmt.Sprintf("update kline_un set high=%v,low=%v,close=%v,volume=%v,info=%v,stop_ms=%v %s",
-				unBar.High, unBar.Low, unBar.Close, unBar.Volume, unBar.Info, unBar.StopMs, whereSql)
-			_, err_ = sess.db.Exec(ctx, updSql)
-			if err_ != nil {
-				return NewDbErr(core.ErrDbExecFail, err_)
-			}
-			return nil
-		}
-	}
-	//When rapid updates are unavailable, collect from sub cycles
-	//当快速更新不可用时，从子周期归集
-	return sess.SetUnfinish(sid, agg.TimeFrame, endMS, unFinish)
-}
-
-func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
-	whereSql := fmt.Sprintf("where sid=%v and timeframe='%v';", sid, tf)
-	updSql := fmt.Sprintf("update kline_un set start_ms=%v,stop_ms=%v,open=%v,high=%v,low=%v,close=%v,volume=%v,info=%v %s",
-		bar.Time, endMS, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Info, whereSql)
-	res, err_ := q.db.Exec(context.Background(), updSql)
-	var err *errs.Error
+	defer db.Close()
+	_, err_ := db.ExecContext(context.Background(), `
+insert into kline_un (sid, timeframe, start_ms, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+on conflict(sid, timeframe) do update set
+  start_ms=excluded.start_ms,
+  stop_ms=excluded.stop_ms,
+  expire_ms=excluded.expire_ms,
+  open=excluded.open,
+  high=excluded.high,
+  low=excluded.low,
+  close=excluded.close,
+  volume=excluded.volume,
+  quote=excluded.quote,
+  buy_volume=excluded.buy_volume,
+  trade_num=excluded.trade_num`,
+		sid, tf, bar.Time, endMS, expireMS, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Quote, bar.BuyVolume, bar.TradeNum,
+	)
 	if err_ != nil {
-		err = NewDbErr(core.ErrDbExecFail, err_)
-	} else if res.RowsAffected() == 0 {
-		err = q.Exec(`insert into kline_un (sid, start_ms, stop_ms, open, high, low, close, volume, info, timeframe) 
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, sid, bar.Time, endMS, bar.Open, bar.High, bar.Low,
-			bar.Close, bar.Volume, bar.Info, tf)
+		return NewDbErr(core.ErrDbExecFail, err_)
 	}
-	return err
+	return nil
 }
 
 // iterForAddKLines implements pgx.CopyFromSource.
@@ -506,7 +701,9 @@ func (r iterForAddKLines) Values() ([]interface{}, error) {
 		r.rows[0].Low,
 		r.rows[0].Close,
 		r.rows[0].Volume,
-		r.rows[0].Info,
+		r.rows[0].Quote,
+		r.rows[0].BuyVolume,
+		r.rows[0].TradeNum,
 	}, nil
 }
 
@@ -529,33 +726,45 @@ func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline,
 	log.Debug("insert klines", zap.String("tf", timeFrame), zap.Int32("sid", sid),
 		zap.Int("num", arrLen), zap.Int64("start", startMS), zap.Int64("end", endMS))
 	tblName := "kline_" + timeFrame
-	var adds = make([]*KlineSid, arrLen)
-	for i, v := range arr {
-		adds[i] = &KlineSid{
-			Kline: *v,
-			Sid:   sid,
-		}
-	}
 	ctx := context.Background()
-	cols := []string{"sid", "time", "open", "high", "low", "close", "volume", "info"}
-	num, err_ := q.db.CopyFrom(ctx, []string{tblName}, cols, &iterForAddKLines{rows: adds})
-	if err_ != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err_, &pgErr) {
-			if pgErr.Code == "23505" {
-				if delOnDump {
-					// 报错插入重复数据，删除重试
-					err := q.DelKLines(sid, timeFrame, startMS, endMS)
-					if err == nil {
-						return q.InsertKLines(timeFrame, sid, arr, false)
-					}
-				}
-				return 0, NewDbErr(core.ErrDbUniqueViolation, err_)
+	const colsPerRow = 11
+	const batchRows = 500
+	var total int64
+	for i := 0; i < arrLen; i += batchRows {
+		j := min(arrLen, i+batchRows)
+		var b strings.Builder
+		b.WriteString("insert into ")
+		b.WriteString(tblName)
+		b.WriteString(" (sid, ts, time, open, high, low, close, volume, quote, buy_volume, trade_num) values ")
+		args := make([]any, 0, (j-i)*colsPerRow)
+		for k := i; k < j; k++ {
+			if k > i {
+				b.WriteByte(',')
 			}
+			p := (k-i)*colsPerRow + 1
+			b.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)", p, p+1, p+2, p+3, p+4, p+5, p+6, p+7, p+8, p+9, p+10))
+			kk := arr[k]
+			args = append(args,
+				sid,
+				time.UnixMilli(kk.Time).UTC(),
+				kk.Time,
+				kk.Open,
+				kk.High,
+				kk.Low,
+				kk.Close,
+				kk.Volume,
+				kk.Quote,
+				kk.BuyVolume,
+				kk.TradeNum,
+			)
 		}
-		return 0, NewDbErr(core.ErrDbExecFail, err_)
+		_, err := q.db.Exec(ctx, b.String(), args...)
+		if err != nil {
+			return total, NewDbErr(core.ErrDbExecFail, err)
+		}
+		total += int64(j - i)
 	}
-	return num, nil
+	return total, nil
 }
 
 /*
@@ -572,7 +781,7 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 	startMS := arr[0].Time
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	endMS := arr[len(arr)-1].Time + tfMSecs
-	insId, err := q.AddInsJob(AddInsKlineParams{
+	insId, err := AddInsJob(AddInsKlineParams{
 		Sid:       exs.ID,
 		Timeframe: timeFrame,
 		StartMs:   startMS,
@@ -585,11 +794,11 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 		if insId == 0 {
 			return
 		}
-		if err_ := q.DelInsKline(context.Background(), insId); err_ != nil {
-			log.Warn("DelInsKline fail", zap.Int32("id", insId), zap.Error(err_))
+		if err_ := PubQ().DelInsKline(context.Background(), insId); err_ != nil {
+			log.Warn("DelInsKline fail", zap.Int64("id", insId), zap.Error(err_))
 		}
 	}()
-	num, err := q.InsertKLines(timeFrame, exs.ID, arr, true)
+	num, err := q.InsertKLines(timeFrame, exs.ID, arr, false)
 	if err != nil {
 		return num, err
 	}
@@ -607,16 +816,12 @@ UpdateKRange
 3. 更新更大周期的连续聚合
 */
 func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS int64, klines []*banexg.Kline, aggBig bool) *errs.Error {
-	// Update the effective range of intervals
-	// 更新有效区间范围
-	err := q.updateKLineRange(exs.ID, timeFrame, startMS, endMS)
-	if err != nil {
+	// Record data ranges in sranges (non-contiguous allowed).
+	if err := updateKLineRange(exs.ID, timeFrame, startMS, endMS); err != nil {
 		return err
 	}
-	// Search for holes, update khole
-	// 搜索空洞，更新khole
-	err = q.updateKHoles(exs.ID, timeFrame, startMS, endMS, true)
-	if err != nil {
+	// Search for holes and update sranges (has_data=false).
+	if err := q.updateKHoles(exs.ID, timeFrame, startMS, endMS, true); err != nil {
 		return err
 	}
 	if !aggBig {
@@ -624,7 +829,7 @@ func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS i
 	}
 	// Update a larger super table
 	// 更新更大的超表
-	return q.updateBigHyper(exs, timeFrame, startMS, endMS, klines)
+	return q.updateBigHyper(exs, timeFrame, startMS, endMS)
 }
 
 /*
@@ -700,244 +905,21 @@ func (q *Queries) CalcKLineRanges(timeFrame string, sids map[int32]bool) (map[in
 	return res, nil
 }
 
-func (q *Queries) updateKLineRange(sid int32, timeFrame string, startMS, endMS int64) *errs.Error {
-	// 更新有效区间范围
-	var err_ error
-	ctx := context.Background()
-	realStart, realEnd, err := q.CalcKLineRange(sid, timeFrame, 0, 0)
-	if err != nil {
-		if startMS > 0 && endMS > 0 {
-			_, err_ = q.AddKInfo(ctx, AddKInfoParams{Sid: sid, Timeframe: timeFrame, Start: startMS, Stop: endMS})
-			if err_ != nil {
-				return NewDbErr(core.ErrDbExecFail, err_)
-			}
-			log.Debug("add kinfo", zap.Int32("sid", sid), zap.String("tf", timeFrame),
-				zap.Int64("start", startMS), zap.Int64("end", endMS))
-		}
+func updateKLineRange(sid int32, timeFrame string, startMS, endMS int64) *errs.Error {
+	// QuestDB + sranges: record the data range (non-contiguous allowed).
+	if startMS <= 0 || endMS <= startMS {
 		return nil
 	}
-	if realStart == 0 || realEnd == 0 {
-		if startMS == 0 || endMS == 0 {
-			return nil
-		}
-		realStart, realEnd = startMS, endMS
-	} else if startMS > 0 && endMS > 0 {
-		realStart = min(realStart, startMS)
-		realEnd = max(realEnd, endMS)
-	}
-	oldStart, oldEnd := q.GetKlineRange(sid, timeFrame)
-	if oldStart == 0 && oldEnd == 0 {
-		_, err_ = q.AddKInfo(ctx, AddKInfoParams{Sid: sid, Timeframe: timeFrame, Start: realStart, Stop: realEnd})
-	} else {
-		err_ = q.SetKInfo(ctx, SetKInfoParams{Sid: sid, Timeframe: timeFrame, Start: realStart, Stop: realEnd})
-	}
-	if err_ != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err_, &pgErr) {
-			if pgErr.Code == "23505" {
-				err_ = q.SetKInfo(ctx, SetKInfoParams{Sid: sid, Timeframe: timeFrame, Start: realStart, Stop: realEnd})
-			}
-		}
-		if err_ != nil {
-			return NewDbErr(core.ErrDbExecFail, err_)
-		}
-	}
-	log.Debug("set kinfo", zap.Int32("sid", sid), zap.String("tf", timeFrame),
-		zap.Int64("start", startMS), zap.Int64("end", endMS))
-	return nil
-}
-
-func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64, isCont bool) *errs.Error {
-	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-	barTimes, err := q.getKLineTimes(sid, timeFrame, startMS, endMS)
-	if err != nil {
-		return err
-	}
-	// Find the missing kholes from all bar times
-	// 从所有bar时间中找到缺失的kholes
-	holes := make([][2]int64, 0)
-	if len(barTimes) == 0 {
-		holes = append(holes, [2]int64{startMS, endMS})
-	} else {
-		if barTimes[0] > startMS {
-			holes = append(holes, [2]int64{startMS, barTimes[0]})
-		}
-		prevTime := barTimes[0]
-		for _, time := range barTimes[1:] {
-			intv := time - prevTime
-			if intv > tfMSecs {
-				holes = append(holes, [2]int64{prevTime + tfMSecs, time})
-			} else if intv < tfMSecs {
-				log.Warn("invalid timeframe or kline", zap.Int32("sid", sid), zap.String("tf", timeFrame),
-					zap.Int64("intv", intv/1000), zap.Int64("tfmsecs", tfMSecs/1000), zap.Int64("time", time))
-			}
-			prevTime = time
-		}
-		maxEnd := utils2.AlignTfMSecs(btime.UTCStamp(), tfMSecs) - tfMSecs
-		if maxEnd-prevTime > tfMSecs*5 && endMS-prevTime > tfMSecs {
-			holes = append(holes, [2]int64{prevTime + tfMSecs, min(endMS, maxEnd)})
-		}
-	}
-	if len(holes) == 0 {
-		return nil
-	}
-	// Check the statutory rest periods and filter out non trading periods
-	// 检查法定休息时间段，过滤非交易时间段
-	exs := GetSymbolByID(sid)
-	if exs == nil {
-		log.Warn("no ExSymbol found", zap.Int32("sid", sid))
-		return nil
-	}
-	exchange, err := exg.GetWith(exs.Exchange, exs.Market, "")
-	if err != nil {
-		return err
-	}
-	// Due to the fact that some trading days in the historical data have not been entered, the filtering of K-line in the trading calendar is not applicable
-	// 由于历史数据中部分交易日未录入，故不适用交易日历过滤K线
-	susp, err := q.GetExSHoles(exchange, exs, startMS, endMS, true)
-	if err != nil {
-		return err
-	}
-	if len(susp) > 0 {
-		// Filter out non trading time periods
-		// 过滤掉非交易时间段
-		hs := make([][2]int64, 0, len(holes))
-		si, hi := 0, -1
-		for hi+1 < len(holes) {
-			hi += 1
-			h := holes[hi]
-			for si < len(susp) && susp[si][1] <= h[0] {
-				si += 1
-			}
-			if si >= len(susp) {
-				hs = append(hs, holes[hi:]...)
-				break
-			}
-			s := susp[si]
-			if s[0] > h[0] {
-				// 空洞左侧是有效区间
-				hs = append(hs, [2]int64{h[0], min(h[1], s[0])})
-			}
-			if h[1] > s[1] {
-				// 右侧有可能溢出
-				holes[hi][0] = s[1]
-				hi -= 1
-			}
-		}
-		holes = hs
-	}
-	// Filter out holes that are too small
-	// 过滤太小的空洞
-	if tfMSecs == 60000 {
-		exInfo := exchange.Info()
-		hs := make([][2]int64, 0, len(holes))
-		wids := make(map[int]int)
-		for _, h := range holes {
-			num := int((h[1] - h[0]) / tfMSecs)
-			if num <= exInfo.Min1mHole {
-				continue
-			}
-			cnt, _ := wids[num]
-			wids[num] = cnt + 1
-			hs = append(hs, h)
-		}
-		//if len(wids) > 0 {
-		//	var as = make([]string, 0, len(wids))
-		//	for k, v := range wids {
-		//		as = append(as, fmt.Sprintf("%v:%v", k, v))
-		//	}
-		//	log.Info("hole widths", zap.Int32("sid", sid), zap.String("d", strings.Join(as, " ")))
-		//}
-		holes = hs
-	}
-	// Query the recorded kholes and merge them
-	// 查询已记录的khole，进行合并
-	ctx := context.Background()
-	resHoles, err_ := q.GetKHoles(ctx, GetKHolesParams{Sid: sid, Timeframe: timeFrame, Start: startMS, Stop: endMS})
-	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
-	}
-	for _, h := range holes {
-		resHoles = append(resHoles, &KHole{Sid: sid, Timeframe: timeFrame, Start: h[0], Stop: h[1], NoData: isCont})
-	}
-	slices.SortFunc(resHoles, func(a, b *KHole) int {
-		if a.Start != b.Start {
-			return int((a.Start - b.Start) / 1000)
-		}
-		if a.NoData == b.NoData {
-			return 0
-		}
-		if a.NoData {
-			// 优先将NoData的放在前面
-			return -1
-		} else {
-			return 1
-		}
-	})
-	merged := make([]*KHole, 0)
-	delIDs := make([]int64, 0)
-	var prev *KHole
-	for _, h := range resHoles {
-		if h.Start >= h.Stop {
-			if h.ID > 0 {
-				delIDs = append(delIDs, h.ID)
-			}
-			continue
-		}
-		if prev == nil || prev.Stop < h.Start {
-			//与前一个洞不连续，出现缺口
-			merged = append(merged, h)
-			prev = h
-		} else {
-			// 与前一个洞连续，可能重合
-			if prev.NoData == h.NoData || prev.Stop >= h.Stop {
-				// 当与前一个洞NoData一致，或者完全被前一个包含
-				if h.Stop > prev.Stop {
-					prev.Stop = h.Stop
-				}
-				if h.ID > 0 {
-					delIDs = append(delIDs, h.ID)
-				}
-			} else {
-				// NoData不一致(前true后false)，且当前有超出
-				h.Start = prev.Stop
-				merged = append(merged, h)
-				prev = h
-			}
-		}
-	}
-	// Update or insert the merged kholes into the database
-	// 将合并后的kholes更新或插入到数据库
-	err = q.DelKHoleIDs(delIDs...)
-	if err != nil {
-		return err
-	}
-	var adds []AddKHolesParams
-	for _, h := range merged {
-		if h.ID == 0 {
-			adds = append(adds, AddKHolesParams{Sid: h.Sid, Timeframe: h.Timeframe, Start: h.Start, Stop: h.Stop, NoData: h.NoData})
-		} else {
-			err_ = q.SetKHole(ctx, SetKHoleParams{ID: h.ID, Start: h.Start, Stop: h.Stop, NoData: h.NoData})
-			if err_ != nil {
-				return NewDbErr(core.ErrDbExecFail, err_)
-			}
-		}
-	}
-	if len(adds) > 0 {
-		_, err_ = q.AddKHoles(ctx, adds)
-		if err_ != nil {
-			return NewDbErr(core.ErrDbExecFail, err_)
-		}
+	if err := PubQ().UpdateSRanges(context.Background(), sid, "kline_"+timeFrame, timeFrame, startMS, endMS, true); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
 }
 
-func (q *Queries) updateBigHyper(exs *ExSymbol, timeFrame string, startMS, endMS int64, klines []*banexg.Kline) *errs.Error {
+func (q *Queries) updateBigHyper(exs *ExSymbol, timeFrame string, startMS, endMS int64) *errs.Error {
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	aggTfs := map[string]bool{timeFrame: true}
 	aggJobs := make([]*KlineAgg, 0)
-	unFinishJobs := make([]*KlineAgg, 0)
-	curMS := btime.TimeMS()
 	for _, item := range aggList {
 		if item.MSecs <= tfMSecs {
 			//Skipping small dimensions; Skip irrelevant continuous aggregation
@@ -950,31 +932,6 @@ func (q *Queries) updateBigHyper(exs *ExSymbol, timeFrame string, startMS, endMS
 			// startAlign < endAlign说明：插入的数据所属bar刚好完成
 			aggTfs[item.TimeFrame] = true
 			aggJobs = append(aggJobs, item)
-		}
-		unBarStartMs := utils2.AlignTfMSecs(curMS, item.MSecs)
-		if endAlignMS >= unBarStartMs && endMS >= endAlignMS {
-			// Only attempt to update when the data involves bars that have not been completed in the current cycle; Only pass in relevant bars to improve efficiency
-			// 仅当数据涉及当前周期未完成bar时，才尝试更新；仅传入相关的bar，提高效率
-			unFinishJobs = append(unFinishJobs, item)
-		}
-	}
-	if len(unFinishJobs) > 0 {
-		var err *errs.Error
-		if len(klines) == 0 {
-			// Take the first time after aligning the maximum cycle as the starting time
-			// 取最大周期的对齐后第一个时间作为开始时间
-			msecs := unFinishJobs[len(unFinishJobs)-1].MSecs
-			startAlign := utils2.AlignTfMSecs(startMS, msecs)
-			klines, err = q.QueryOHLCV(exs, timeFrame, startAlign, endMS, 0, true)
-			if err != nil {
-				return err
-			}
-		}
-		for _, item := range unFinishJobs {
-			err = updateUnFinish(q, item, exs.ID, timeFrame, startMS, endMS, klines)
-			if err != nil {
-				return err
-			}
 		}
 	}
 	if len(aggJobs) > 0 {
@@ -1001,7 +958,7 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	// It is possible that startMs happens to be the beginning of the next bar, and the previous one requires -1
 	// 有可能startMs刚好是下一个bar的开始，前一个需要-1
 	aggStart := startMS - tfMSecs
-	oldStart, oldEnd := q.GetKlineRange(sid, item.TimeFrame)
+	oldStart, oldEnd := PubQ().GetKlineRange(sid, item.TimeFrame)
 	if oldStart > 0 && oldEnd > oldStart {
 		// Avoid voids or data errors
 		// 避免出现空洞或数据错误
@@ -1011,28 +968,58 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	if aggFrom == "" {
 		aggFrom = item.AggFrom
 	}
-	tblName := "kline_" + aggFrom
-	infoCol := aggCol("info", infoBy)
-	sql := fmt.Sprintf(`
-select sid,"time"/%d*%d as atime,%s,%s
-from %s where sid=%d and time>=%v and time<%v
-GROUP BY sid, 2 
-ORDER BY sid, 2`, tfMSecs, tfMSecs, aggFields, infoCol, tblName, sid, aggStart, endMS)
-	finalSql := fmt.Sprintf(`
-insert into %s (sid, time, open, high, low, close, volume, info)
-%s %s`, item.Table, sql, klineInsConflict)
-	_, err_ := q.db.Exec(context.Background(), finalSql)
+	if aggFrom == "" {
+		return nil
+	}
+	fromTbl := "kline_" + aggFrom
+	ctx := context.Background()
+	rows, err_ := q.db.Query(ctx, fmt.Sprintf(`
+select time,open,high,low,close,volume,quote,buy_volume,trade_num
+from %s
+where sid=$1 and time >= $2 and time < $3
+order by time`, fromTbl), sid, aggStart, endMS)
+	src, err_ := mapToKlines(rows, err_)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
-	// Update the effective range of intervals
-	// 更新有效区间范围
-	err := q.updateKLineRange(sid, item.TimeFrame, startMS, endMS)
+	if len(src) == 0 {
+		return nil
+	}
+	fromTfMSecs := int64(utils2.TFToSecs(aggFrom) * 1000)
+	offMS := GetAlignOff(sid, tfMSecs)
+	aggBars, lastFinish := utils.BuildOHLCV(src, tfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
+	if !lastFinish && len(aggBars) > 0 {
+		aggBars = aggBars[:len(aggBars)-1]
+	}
+	if len(aggBars) == 0 {
+		return nil
+	}
+	// Keep only complete bars within [aggStart, endMS).
+	cut := aggBars[:0]
+	for _, b := range aggBars {
+		if b.Time < aggStart {
+			continue
+		}
+		if b.Time+tfMSecs > endMS {
+			break
+		}
+		cut = append(cut, b)
+	}
+	aggBars = cut
+	if len(aggBars) == 0 {
+		return nil
+	}
+	_, err := q.InsertKLines(item.TimeFrame, sid, aggBars, true)
 	if err != nil {
 		return err
 	}
-	// Search for holes, update khole
-	// 搜索空洞，更新khole
+	// Update the effective range of intervals
+	// 更新有效区间范围
+	err = updateKLineRange(sid, item.TimeFrame, startMS, endMS)
+	if err != nil {
+		return err
+	}
+	// Search for holes, update sranges.
 	err = q.updateKHoles(sid, item.TimeFrame, startMS, endMS, isCont)
 	if err != nil {
 		return err
@@ -1085,11 +1072,6 @@ func GetDownTF(timeFrame string) (string, *errs.Error) {
 	return "1m", nil
 }
 
-func (q *Queries) DelKInfo(sid int32, timeFrame string) *errs.Error {
-	sql := fmt.Sprintf("delete from kinfo where sid=%v and timeframe=$1", sid)
-	return q.Exec(sql, timeFrame)
-}
-
 func (q *Queries) DelKLines(sid int32, timeFrame string, startMS, endMS int64) *errs.Error {
 	sql := fmt.Sprintf("delete from kline_%s where sid=%v", timeFrame, sid)
 	if startMS > 0 {
@@ -1099,81 +1081,6 @@ func (q *Queries) DelKLines(sid int32, timeFrame string, startMS, endMS int64) *
 		sql += fmt.Sprintf(" and time < %v", endMS)
 	}
 	return q.Exec(sql)
-}
-
-func (q *Queries) GetKlineRange(sid int32, timeFrame string) (int64, int64) {
-	sql := fmt.Sprintf("select start,stop from kinfo where sid=%v and timeframe=$1 limit 1", sid)
-	row := q.db.QueryRow(context.Background(), sql, timeFrame)
-	var start, stop int64
-	_ = row.Scan(&start, &stop)
-	return start, stop
-}
-
-func (q *Queries) GetKlineRanges(sidList []int32, timeFrame string) map[int32][2]int64 {
-	var texts = make([]string, len(sidList))
-	for i, sid := range sidList {
-		texts[i] = fmt.Sprintf("%v", sid)
-	}
-	sidText := strings.Join(texts, ", ")
-	sql := fmt.Sprintf("select sid,start,stop from kinfo where timeframe=$1 and sid in (%v)", sidText)
-	rows, err_ := q.db.Query(context.Background(), sql, timeFrame)
-	if err_ != nil {
-		return map[int32][2]int64{}
-	}
-	res := make(map[int32][2]int64)
-	defer rows.Close()
-	for rows.Next() {
-		var start, stop int64
-		var sid int32
-		err_ = rows.Scan(&sid, &start, &stop)
-		if err_ != nil {
-			continue
-		}
-		res[sid] = [2]int64{start, stop}
-	}
-	return res
-}
-
-func (q *Queries) DelFactors(sid int32, startMS, endMS int64) *errs.Error {
-	sql := fmt.Sprintf("delete from adj_factors where sid=%v or sub_id=%v", sid, sid)
-	if startMS > 0 {
-		sql += fmt.Sprintf(" and start_ms >= %v", startMS)
-	}
-	if endMS > 0 {
-		sql += fmt.Sprintf(" and start_ms < %v", endMS)
-	}
-	return q.Exec(sql)
-}
-
-func (q *Queries) DelKLineUn(sid int32, timeFrame string) *errs.Error {
-	sql := fmt.Sprintf("delete from kline_un where sid=%v and timeframe=$1", sid)
-	return q.Exec(sql, timeFrame)
-}
-
-func (q *Queries) DelKHoles(sid int32, timeFrame string, startMS, endMS int64) *errs.Error {
-	sql := fmt.Sprintf("delete from khole where sid=%v and timeframe=$1", sid)
-	if startMS > 0 {
-		sql += fmt.Sprintf(" and start >= %v", startMS)
-	}
-	if endMS > 0 {
-		sql += fmt.Sprintf(" and stop <= %v", endMS)
-	}
-	return q.Exec(sql, timeFrame)
-}
-
-func (q *Queries) DelKHoleIDs(ids ...int64) *errs.Error {
-	if len(ids) == 0 {
-		return nil
-	}
-	var builder strings.Builder
-	builder.WriteString("delete from khole where id in (")
-	arr := make([]string, len(ids))
-	for i, id := range ids {
-		arr[i] = strconv.Itoa(int(id))
-	}
-	builder.WriteString(strings.Join(arr, ","))
-	builder.WriteString(")")
-	return q.Exec(builder.String())
 }
 
 func mapToItems[T any](rows pgx.Rows, err_ error, assign func() (T, []any)) ([]T, error) {
@@ -1200,26 +1107,32 @@ FixKInfoZeros
 修复kinfo表中start=0或stop=0的记录。通过查询实际K线数据范围来更新正确的start和stop值。
 */
 func (q *Queries) FixKInfoZeros() *errs.Error {
-	// 查询所有stop=0或start=0的记录
-	sql := `SELECT sid, timeframe FROM kinfo WHERE stop = 0 or start = 0`
-	rows, err_ := q.db.Query(context.Background(), sql)
+	ctx := context.Background()
+	db, err := BanPubConn(false)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	rows, err_ := db.QueryContext(ctx, `select sid,tbl,timeframe from sranges where has_data=1 and (stop_ms=0 or start_ms=0)`)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
 	defer rows.Close()
 
-	// 按TimeFrame分组记录sid
 	tfGroups := make(map[string]map[int32]bool)
 	for rows.Next() {
 		var sid int32
-		var timeframe string
-		if err_ := rows.Scan(&sid, &timeframe); err_ != nil {
+		var tbl, tf string
+		if err_ := rows.Scan(&sid, &tbl, &tf); err_ != nil {
 			return NewDbErr(core.ErrDbReadFail, err_)
 		}
-		if tfGroups[timeframe] == nil {
-			tfGroups[timeframe] = make(map[int32]bool)
+		if tbl != "kline_"+tf {
+			continue
 		}
-		tfGroups[timeframe][sid] = true
+		if tfGroups[tf] == nil {
+			tfGroups[tf] = make(map[int32]bool)
+		}
+		tfGroups[tf][sid] = true
 	}
 	if err_ := rows.Err(); err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
@@ -1228,35 +1141,37 @@ func (q *Queries) FixKInfoZeros() *errs.Error {
 		return nil
 	}
 
-	// 记录处理结果
 	var totalFixed int
-
-	// 对每个TimeFrame分组进行处理
 	for tf, sids := range tfGroups {
-		log.Info("fixing kinfo zeros",
-			zap.String("timeframe", tf),
-			zap.Int("count", len(sids)))
-
-		// 计算实际的K线范围
+		log.Info("fixing sranges zeros", zap.String("timeframe", tf), zap.Int("count", len(sids)))
 		ranges, err := q.CalcKLineRanges(tf, sids)
 		if err != nil {
 			return err
 		}
-
-		// 更新每个sid的范围
 		for sid, r := range ranges {
 			start, stop := r[0], r[1]
-			if stop > 0 && start > 0 {
-				err := q.updateKLineRange(sid, tf, start, stop)
+			if start <= 0 || stop <= start {
+				continue
+			}
+			{
+				dbw, err := BanPubConn(true)
 				if err != nil {
 					return err
 				}
-				totalFixed++
+				_, err_ := dbw.ExecContext(ctx, `delete from sranges where sid=? and tbl=? and timeframe=? and has_data=1 and (stop_ms=0 or start_ms=0)`,
+					sid, "kline_"+tf, tf)
+				dbw.Close()
+				if err_ != nil {
+					return NewDbErr(core.ErrDbExecFail, err_)
+				}
 			}
+			if err := updateKLineRange(sid, tf, start, stop); err != nil {
+				return err
+			}
+			totalFixed++
 		}
 	}
-
-	log.Info("fixed kinfo complete", zap.Int("total", totalFixed), zap.Int("timeframes", len(tfGroups)))
+	log.Info("fixed sranges zeros complete", zap.Int("total", totalFixed), zap.Int("timeframes", len(tfGroups)))
 	return nil
 }
 
@@ -1295,7 +1210,6 @@ func SyncKlineTFs(args *config.CmdArgs, pb *utils.StagedPrg) *errs.Error {
 	if pb != nil {
 		pb.SetProgress("fixKInfoZeros", 1)
 	}
-	// load all markets
 	exsList := GetAllExSymbols()
 	cache := map[string]map[string]bool{}
 	sidMap := make(map[int32]string)
@@ -1325,314 +1239,92 @@ func SyncKlineTFs(args *config.CmdArgs, pb *utils.StagedPrg) *errs.Error {
 	}
 	err = syncKlineInfos(sess, sidMap, func(done int, total int) {
 		if pb != nil {
-			pb.SetProgress("syncTfKinfo", float64(done)/float64(total))
+			pb.SetProgress("syncTfRanges", float64(done)/float64(total))
 		}
 	})
-	if err != nil {
-		return err
-	}
-	log.Info("try filling KLine Holes ...")
-	return tryFillHoles(sess, sidMap, func(done int, total int) {
-		if pb != nil {
-			pb.SetProgress("fillKHole", float64(done)/float64(total))
-		}
-	})
-}
-
-type KHoleExt struct {
-	*KHole
-	TfMSecs int64
-}
-
-func tryFillHoles(sess *Queries, sids map[int32]string, prg utils.PrgCB) *errs.Error {
-	ctx := context.Background()
-	sidList := utils2.KeysOfMap(sids)
-	holes, err_ := sess.ListKHoles(ctx, sidList)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
-	}
-	rows := make([]*KHoleExt, len(holes))
-	for i, h := range holes {
-		rows[i] = &KHoleExt{
-			KHole:   h,
-			TfMSecs: int64(utils2.TFToSecs(h.Timeframe) * 1000),
-		}
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		a, b := rows[i], rows[j]
-		if a.Sid != b.Sid {
-			return a.Sid < b.Sid
-		}
-		if a.Start != b.Start {
-			return a.Start < b.Start
-		}
-		return a.TfMSecs < b.TfMSecs
-	})
-	pBar := utils.NewPrgBar(len(rows), "FillHoles")
-	if prg != nil {
-		pBar.PrgCbs = append(pBar.PrgCbs, prg)
-	}
-	defer pBar.Close()
-	// The kholes that need to be deleted have been filled in
-	// 已填充需要删除的khole
-	badIds := make([]int64, 0, len(rows)/10)
-	curSid := int32(0)
-	var exs *ExSymbol
-	var editNum int
-	var newHoles [][4]int64 // 需要新增的记录[]sid,tfMSecs,start,stop
-	for _, row := range rows {
-		pBar.Add(1)
-		if row.Sid != curSid {
-			curSid = row.Sid
-			exs = GetSymbolByID(curSid)
-		}
-		if exs == nil {
-			log.Warn("symbol id invalid", zap.Int32("sid", curSid))
-			continue
-		}
-		exchange, err := exg.GetWith(exs.Exchange, exs.Market, "")
-		if err != nil {
-			return err
-		}
-		if !exchange.HasApi(banexg.ApiFetchOHLCV, exs.Market) {
-			// Not supporting downloading K-line, skip
-			// 不支持下载K线，跳过
-			continue
-		}
-		start, stop := row.Start, row.Stop
-		//There was originally a logic here to skip the large cycle KHole if the small cycle check has been filled, but it was cancelled because larger cycles cannot be collected from extra small cycles.
-		//Each cycle should independently retrieve the actual K-line range to ensure that the range is correct
-		// 这里本来有从小周期检查已填充则跳过大周期KHole的逻辑，但因较大周期无法从特小周期归集，故这里取消。
-		// 每个周期应独立检索实际K线范围，确保范围正确
-		updateKHole := func(newStart, newStop int64) bool {
-			if newStart == 0 || newStop == 0 {
-				return false
-			}
-			if newStart == start && newStop == stop {
-				// This interval is completely filled and added to the deletion list
-				// 此区间被完全填充，添加到删除列表
-				badIds = append(badIds, row.ID)
-				return true
-			}
-			if newStart == start {
-				start = newStop
-			} else if newStop == stop {
-				stop = newStart
-			} else {
-				// Include, delete current, add two KHoles before and after
-				// 被包含，删除当前，新增前后两个KHole
-				badIds = append(badIds, row.ID)
-				newHoles = append(newHoles, [4]int64{int64(row.Sid), row.TfMSecs, start, newStart},
-					[4]int64{int64(row.Sid), row.TfMSecs, newStop, stop})
-				return true
-			}
-			return false
-		}
-		// First check if it already exists
-		// 先检查是否已存在
-		oldStart, oldStop, err := sess.CalcKLineRange(exs.ID, row.Timeframe, start, stop)
-		if err != nil {
-			return err
-		}
-		if updateKHole(oldStart, oldStop) {
-			continue
-		}
-		// Download K-lines and also collect higher cycle K-lines
-		// 下载K线，同时也会归集更高周期K线
-		saveNum, err := downOHLCV2DBRange(sess, exchange, exs, row.Timeframe, start, stop, 0, 0, 2, nil)
-		if err != nil {
-			if err.Code == errs.CodeNoMarketForPair {
-				log.Info("skip down no market symbol", zap.Int32("sid", exs.ID),
-					zap.String("symbol", exs.Symbol))
-			} else {
-				log.Warn("down ohlcv to fill fail", zap.Int32("sid", exs.ID),
-					zap.String("symbol", exs.Symbol), zap.Error(err))
-			}
-			continue
-		}
-		// Query the actual updated interval
-		// 查询实际更新的区间
-		if saveNum == 0 {
-			continue
-		}
-		resStart, resStop, err := sess.CalcKLineRange(exs.ID, row.Timeframe, start, stop)
-		if err != nil {
-			return err
-		}
-		if updateKHole(resStart, resStop) {
-			continue
-		}
-		if start != row.Start || stop != row.Stop {
-			// 此区间被更新
-			editNum += 1
-			err_ = sess.SetKHole(ctx, SetKHoleParams{ID: row.ID, Start: start, Stop: stop})
-			if err_ != nil {
-				return NewDbErr(core.ErrDbExecFail, err_)
-			}
-		}
-	}
-	// Delete filled IDs
-	// 删除已填充的id
-	if len(badIds) > 0 {
-		err := sess.DelKHoleIDs(badIds...)
-		if err != nil {
-			return err
-		}
-	}
-	// 新增kHoles
-	if len(newHoles) > 0 {
-		var items = make([]AddKHolesParams, len(newHoles))
-		for i, h := range newHoles {
-			items[i] = AddKHolesParams{
-				Sid:       int32(h[0]),
-				Timeframe: utils2.SecsToTF(int(h[1] / 1000)),
-				Start:     h[2],
-				Stop:      h[3],
-				NoData:    true,
-			}
-		}
-		_, err_ = sess.AddKHoles(ctx, items)
-		if err_ != nil {
-			return NewDbErr(core.ErrDbExecFail, err_)
-		}
-	}
-	log.Info(fmt.Sprintf("find kHoles %v, filled: %v, add: %v, edit: %v", len(holes),
-		len(badIds), len(newHoles), editNum))
-	return nil
-}
-
-type KInfoExt struct {
-	KInfo
-	TfMSecs int64
+	return err
 }
 
 func syncKlineInfos(sess *Queries, sids map[int32]string, prg utils.PrgCB) *errs.Error {
-	infos, err_ := sess.ListKInfos(context.Background())
-	if err_ != nil {
-		return NewDbErr(core.ErrDbExecFail, err_)
+	// Build sid filter for CalcKLineRanges.
+	sidFilter := make(map[int32]bool)
+	for sid := range sids {
+		sidFilter[sid] = true
 	}
+	calcs := make(map[string]map[int32][2]int64)
+	for _, agg := range aggList {
+		ranges, err := sess.CalcKLineRanges(agg.TimeFrame, sidFilter)
+		if err != nil {
+			return err
+		}
+		calcs[agg.TimeFrame] = ranges
+	}
+	// Decide which sids to process.
+	sidList := make([]int32, 0)
 	if len(sids) > 0 {
-		infoRes := make([]*KInfo, 0, len(sids)*6)
-		for _, info := range infos {
-			if _, ok := sids[info.Sid]; ok {
-				infoRes = append(infoRes, info)
+		for sid := range sids {
+			sidList = append(sidList, sid)
+		}
+	} else {
+		seen := make(map[int32]bool)
+		for _, m := range calcs {
+			for sid := range m {
+				if seen[sid] {
+					continue
+				}
+				seen[sid] = true
+				sidList = append(sidList, sid)
 			}
 		}
-		infos = infoRes
 	}
-	// 显示进度条
-	pgTotal := len(infos) + len(aggList)*10
+	sort.Slice(sidList, func(i, j int) bool { return sidList[i] < sidList[j] })
+
+	pgTotal := max(1, len(sidList)*len(aggList))
 	pBar := utils.NewPrgBar(pgTotal, "sync tf")
 	if prg != nil {
 		pBar.PrgCbs = append(pBar.PrgCbs, prg)
 	}
 	defer pBar.Close()
-	// 加载计算的区间
-	sidMap := make(map[int32]bool)
-	for k := range sids {
-		sidMap[k] = true
-	}
-	calcs := make(map[string]map[int32][2]int64)
-	for _, agg := range aggList {
-		ranges, err := sess.CalcKLineRanges(agg.TimeFrame, sidMap)
-		if err != nil {
-			return err
-		}
-		calcs[agg.TimeFrame] = ranges
-		pBar.Add(10)
-	}
-	infoList := make([]*KInfoExt, 0, len(infos))
-	for _, info := range infos {
-		infoList = append(infoList, &KInfoExt{
-			KInfo:   *info,
-			TfMSecs: int64(utils2.TFToSecs(info.Timeframe) * 1000),
-		})
-	}
-	slices.SortFunc(infoList, func(a, b *KInfoExt) int {
-		return int(a.Sid - b.Sid)
-	})
-	var groups []map[string]*KInfoExt
-	var curSid int32
-	tfMap := make(map[string]*KInfoExt)
-	for _, info := range infoList {
-		if info.Sid != curSid {
-			if len(tfMap) > 0 {
-				groups = append(groups, tfMap)
-			}
-			tfMap = make(map[string]*KInfoExt)
-			curSid = info.Sid
-		}
-		tfMap[info.Timeframe] = info
-	}
-	if len(tfMap) > 0 {
-		groups = append(groups, tfMap)
-	}
-	return utils.ParallelRun(groups, 20, func(i int, m map[string]*KInfoExt) *errs.Error {
-		sid := int32(0)
-		for _, info := range m {
-			sid = info.Sid
-			break
-		}
+
+	return utils.ParallelRun(sidList, 20, func(_ int, sid int32) *errs.Error {
 		sess2, conn, err := Conn(nil)
 		if err != nil {
 			return err
 		}
 		defer conn.Release()
-		err = sess2.syncKlineSid(sid, sids[sid], m, calcs)
-		pBar.Add(len(m))
+		infoBy := sids[sid]
+		if infoBy == "" {
+			if exs := GetSymbolByID(sid); exs != nil {
+				infoBy = exs.InfoBy()
+			}
+		}
+		err = sess2.syncKlineSid(sid, infoBy, calcs)
+		pBar.Add(len(aggList))
 		return err
 	})
 }
 
-func (q *Queries) syncKlineSid(sid int32, infoBy string, tfMap map[string]*KInfoExt, calcs map[string]map[int32][2]int64) *errs.Error {
-	var err *errs.Error
-	var err_ error
-	tfRanges := make(map[string][2]int64)
+func (q *Queries) syncKlineSid(sid int32, infoBy string, calcs map[string]map[int32][2]int64) *errs.Error {
 	ctx := context.Background()
+	tfRanges := make(map[string][2]int64)
 	for _, agg := range aggList {
-		var oldStart, oldEnd int64
-		if info, ok := tfMap[agg.TimeFrame]; ok {
-			oldStart, oldEnd = info.Start, info.Stop
+		rg, ok := calcs[agg.TimeFrame][sid]
+		if !ok || rg[0] == 0 || rg[1] == 0 {
+			if err := PubQ().DelKInfo(sid, agg.TimeFrame); err != nil {
+				return err
+			}
+			continue
 		}
-		if ranges, ok := calcs[agg.TimeFrame][sid]; ok {
-			tfRanges[agg.TimeFrame] = ranges
-			newStart, newEnd := ranges[0], ranges[1]
-			err_ = nil
-			if oldStart == 0 && oldEnd == 0 {
-				_, err_ = q.AddKInfo(ctx, AddKInfoParams{
-					Sid:       sid,
-					Timeframe: agg.TimeFrame,
-					Start:     newStart,
-					Stop:      newEnd,
-				})
-			} else if newStart != oldStart || oldEnd != newEnd {
-				err_ = q.SetKInfo(ctx, SetKInfoParams{
-					Sid:       sid,
-					Timeframe: agg.TimeFrame,
-					Start:     newStart,
-					Stop:      newEnd,
-				})
-			}
-			if err_ != nil {
-				return NewDbErr(core.ErrDbExecFail, err_)
-			}
-			// Update KHoles to avoid holes that are not recorded
-			// 更新KHoles，避免有空洞但未记录
-			err = q.updateKHoles(sid, agg.TimeFrame, newStart, newEnd, false)
-			if err != nil {
-				return err
-			}
-		} else if oldStart > 0 {
-			// No data, but there are range records
-			// 没有数据，但有范围记录
-			err = q.DelKInfo(sid, agg.TimeFrame)
-			if err != nil {
-				return err
-			}
+		newStart, newEnd := rg[0], rg[1]
+		tfRanges[agg.TimeFrame] = rg
+		if err := PubQ().UpdateSRanges(ctx, sid, "kline_"+agg.TimeFrame, agg.TimeFrame, newStart, newEnd, true); err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
+		if err := q.updateKHoles(sid, agg.TimeFrame, newStart, newEnd, false); err != nil {
+			return err
 		}
 	}
-	// Attempt to aggregate updates from subintervals
-	// 尝试从子区间聚合更新
+	// Attempt to aggregate updates from subintervals.
 	for _, agg := range aggList[1:] {
 		if agg.AggFrom == "" {
 			continue
@@ -1646,18 +1338,22 @@ func (q *Queries) syncKlineSid(sid int32, infoBy string, tfMap map[string]*KInfo
 		if curRange, ok := tfRanges[agg.TimeFrame]; ok {
 			curStart, curEnd = curRange[0], curRange[1]
 		}
+		if curStart == 0 || curEnd == 0 {
+			if err := q.refreshAgg(agg, sid, subStart, subEnd, "", infoBy, false); err != nil {
+				return err
+			}
+			continue
+		}
 		tfMSecs := int64(utils2.TFToSecs(agg.TimeFrame) * 1000)
 		subAlignStart := utils2.AlignTfMSecs(subStart, tfMSecs)
 		subAlignEnd := utils2.AlignTfMSecs(subEnd, tfMSecs)
 		if subAlignStart < curStart {
-			err = q.refreshAgg(agg, sid, subStart, min(subEnd, curStart), "", infoBy, false)
-			if err != nil {
+			if err := q.refreshAgg(agg, sid, subStart, min(subEnd, curStart), "", infoBy, false); err != nil {
 				return err
 			}
 		}
 		if subAlignEnd > curEnd {
-			err = q.refreshAgg(agg, sid, max(curEnd, subStart), subEnd, "", infoBy, false)
-			if err != nil {
+			if err := q.refreshAgg(agg, sid, max(curEnd, subStart), subEnd, "", infoBy, false); err != nil {
 				return err
 			}
 		}
@@ -1679,7 +1375,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 		defer utils.DelNetLock("UpdatePendingIns", lockVal)
 	}
 	ctx := context.Background()
-	items, err_ := q.GetAllInsKlines(ctx)
+	items, err_ := PubQ().GetAllInsKlines(ctx)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -1695,13 +1391,14 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 			}
 			if start > 0 && end > 0 {
 				exs := GetSymbolByID(i.Sid)
-				err = q.UpdateKRange(exs, i.Timeframe, start, end, nil, true)
-				if err != nil {
-					return err
+				if exs != nil {
+					if err := q.UpdateKRange(exs, i.Timeframe, start, end, nil, true); err != nil {
+						return err
+					}
 				}
 			}
 		}
-		err_ = q.DelInsKline(ctx, i.ID)
+		err_ = PubQ().DelInsKline(ctx, i.ID)
 		if err_ != nil {
 			return NewDbErr(core.ErrDbExecFail, err_)
 		}
@@ -1709,28 +1406,19 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 	return nil
 }
 
-func (q *Queries) AddInsJob(add AddInsKlineParams) (int32, *errs.Error) {
+func AddInsJob(add AddInsKlineParams) (int64, *errs.Error) {
 	ctx := context.Background()
-	ins, err_ := q.GetInsKline(ctx, add.Sid)
-	if err_ != nil && !errors.Is(err_, pgx.ErrNoRows) {
+	ins, err_ := PubQ().GetInsKline(ctx, add.Sid)
+	if err_ != nil && !errors.Is(err_, sql.ErrNoRows) {
 		return 0, NewDbErr(core.ErrDbReadFail, err_)
 	}
 	if ins != nil && ins.ID > 0 {
 		log.Warn("insert candles for symbol locked, skip", zap.Int32("sid", add.Sid), zap.String("tf", add.Timeframe))
 		return 0, nil
 	}
-	tx, sess, err := q.NewTx(ctx)
-	if err != nil {
-		return 0, err
-	}
-	newId, err_ := sess.AddInsKline(ctx, add)
+	newId, err_ := PubQ().AddInsKline(ctx, add)
 	if err_ != nil {
-		_ = tx.Close(ctx, false)
 		return 0, NewDbErr(core.ErrDbExecFail, err_)
-	}
-	err = tx.Close(ctx, true)
-	if err != nil {
-		return 0, err
 	}
 	return newId, nil
 }
@@ -1822,7 +1510,7 @@ func calcCnFutureFactors(sess *Queries, args *config.CmdArgs) *errs.Error {
 			continue
 		}
 		if lastCode != parts[0].Val {
-			err = saveAdjFactors(dateSidVols, lastCode, lastExs, sess, args.OutPath)
+			err = saveAdjFactors(dateSidVols, lastCode, lastExs, args.OutPath)
 			if err != nil {
 				return err
 			}
@@ -1844,10 +1532,10 @@ func calcCnFutureFactors(sess *Queries, args *config.CmdArgs) *errs.Error {
 			vols[exs.ID] = k
 		}
 	}
-	return saveAdjFactors(dateSidVols, lastCode, lastExs, sess, args.OutPath)
+	return saveAdjFactors(dateSidVols, lastCode, lastExs, args.OutPath)
 }
 
-func saveAdjFactors(data map[int64]map[int32]*banexg.Kline, pCode string, pExs *ExSymbol, sess *Queries, outDir string) *errs.Error {
+func saveAdjFactors(data map[int64]map[int32]*banexg.Kline, pCode string, pExs *ExSymbol, outDir string) *errs.Error {
 	if pCode == "" {
 		return nil
 	}
@@ -1865,7 +1553,7 @@ func saveAdjFactors(data map[int64]map[int32]*banexg.Kline, pCode string, pExs *
 	// Delete the old main continuous contract compounding factor
 	// 删除旧的主力连续合约复权因子
 	ctx := context.Background()
-	err_ := sess.DelAdjFactors(ctx, exs.ID)
+	err_ := PubQ().DelAdjFactors(ctx, exs.ID)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
@@ -1928,7 +1616,7 @@ func saveAdjFactors(data map[int64]map[int32]*banexg.Kline, pCode string, pExs *
 	}
 	outPath := filepath.Join(outDir, exs.Symbol+"_adjs.txt")
 	_ = utils2.WriteFile(outPath, []byte(strings.Join(lines, "\n")))
-	_, err_ = sess.AddAdjFactors(ctx, adds)
+	_, err_ = PubQ().AddAdjFactors(ctx, adds)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
@@ -1950,10 +1638,10 @@ func writeAdjChg(sid1, sid2 int32, hit, width int, data map[int64]map[int32]*ban
 		if k1 != nil || k2 != nil {
 			var p1, v1, i1, p2, v2, i2 float64
 			if k1 != nil {
-				p1, v1, i1 = k1.Close, k1.Volume, k1.Info
+				p1, v1, i1 = k1.Close, k1.Volume, k1.BuyVolume
 			}
 			if k2 != nil {
-				p2, v2, i2 = k2.Close, k2.Volume, k2.Info
+				p2, v2, i2 = k2.Close, k2.Volume, k2.BuyVolume
 			}
 			text := fmt.Sprintf("%v/%v\t%v/%v\t%v/%v", p1, p2, v1, v2, i1, i2)
 			line := dateStr + "   " + text
@@ -1987,16 +1675,16 @@ func findMaxVols(vols map[int32]*banexg.Kline) (*PriceVol, *PriceVol) {
 			vol.Vol = k.Volume
 			hold.Sid = sid
 			hold.Price = k.Close
-			hold.Vol = k.Info
+			hold.Vol = k.BuyVolume
 		} else if k.Volume > vol.Vol {
 			vol.Sid = sid
 			vol.Price = k.Close
 			vol.Vol = k.Volume
 		}
-		if k.Info > hold.Vol {
+		if k.BuyVolume > hold.Vol {
 			hold.Sid = sid
 			hold.Price = k.Close
-			hold.Vol = k.Info
+			hold.Vol = k.BuyVolume
 		}
 	}
 	return &vol, &hold

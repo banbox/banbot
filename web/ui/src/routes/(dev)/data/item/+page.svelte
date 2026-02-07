@@ -13,9 +13,9 @@
   import { pagination } from '$lib/Snippets.svelte';
 
   let symbol = $state<ExSymbol | null>(null);
-  let kinfos = $state<any[]>([]);
+  let sranges = $state<any[]>([]);
   let adjFactors = $state<any[]>([]);
-  let activeTab = $state('kinfos');
+  let activeTab = $state('sranges');
   let id = $state('');
 
   // 过滤条件
@@ -43,11 +43,15 @@
       return;
     }
     symbol = rsp.symbol;
-    kinfos = rsp.kinfos;
+    sranges = rsp.sranges || [];
     adjFactors = rsp.adjFactors;
   }
 
   async function loadGaps() {
+    if(!timeframe) {
+      alerts.error(m.timeframe() + " is required");
+      return;
+    }
     const rsp = await getApi('/dev/symbol_gaps', {
       id,
       tf: timeframe,
@@ -123,10 +127,8 @@
   }
 
   function setMenuItem(item: string) {
-    if(item === 'data' && !timeframe) {
-      timeframe = '1d';
-    }else if (item === 'gaps' && timeframe) {
-      timeframe = '';
+    if((item === 'data' || item === 'gaps') && !timeframe) {
+      timeframe = getTimeframes()[0] || '1d';
     }
     currentPage = 1;
     total = 0;
@@ -136,11 +138,9 @@
   // 获取所有可用的时间周期
   function getTimeframes() {
     const tfs = new Set<string>();
-    kinfos.forEach(k => {
-      if(k.timeframe) {
-        tfs.add(k.timeframe);
-      }
-    });
+    sranges
+      .filter(r => r?.table?.startsWith('kline_') && r?.timeframe)
+      .forEach(r => tfs.add(r.timeframe));
     return Array.from(tfs).sort((a, b) => {
       return makePeriod(a).secs - makePeriod(b).secs;
     });
@@ -176,7 +176,7 @@
     <div class="w-[15%]">
       <ul class="menu w-full bg-base-200 rounded-box">
         <li>
-          <button class:menu-active={activeTab === 'kinfos'} onclick={() => setMenuItem('kinfos')}>
+          <button class:menu-active={activeTab === 'sranges'} onclick={() => setMenuItem('sranges')}>
             <Icon name="info" />
             {m.kline_range()}
           </button>
@@ -206,7 +206,7 @@
 
     <!-- 右侧内容 -->
     <div class="flex-1">
-      {#if activeTab === 'kinfos'}
+      {#if activeTab === 'sranges'}
         <div class="overflow-x-auto">
           <table class="table">
             <thead>
@@ -218,12 +218,12 @@
               </tr>
             </thead>
             <tbody>
-              {#each kinfos as info}
+              {#each sranges.filter(r => r?.table?.startsWith('kline_') && r?.has_data) as info}
                 <tr>
                   <td>{info.timeframe}</td>
-                  <td>{fmtDateStr(info.start)}</td>
-                  <td>{fmtDateStr(info.stop)}</td>
-                  <td>{fmtDurationDays((info.stop - info.start)/1000)}</td>
+                  <td>{fmtDateStr(info.start_ms)}</td>
+                  <td>{fmtDateStr(info.stop_ms)}</td>
+                  <td>{fmtDurationDays((info.stop_ms - info.start_ms)/1000)}</td>
                 </tr>
               {/each}
             </tbody>
@@ -303,10 +303,10 @@
                 <tr>
                   {#if activeTab === 'gaps'}
                     <td>{item.timeframe}</td>
-                    <td>{fmtDateStr(item.start)}</td>
-                    <td>{fmtDateStr(item.stop)}</td>
-                    <td>{Math.round((item.stop - item.start)/1000/TFToSecs(item.timeframe))}</td>
-                    <td>{item.no_data}</td>
+                    <td>{fmtDateStr(item.start_ms)}</td>
+                    <td>{fmtDateStr(item.stop_ms)}</td>
+                    <td>{Math.round((item.stop_ms - item.start_ms)/1000/TFToSecs(item.timeframe))}</td>
+                    <td>{!item.has_data}</td>
                   {:else}
                     <td>{fmtDateStr(item[0])}</td>
                     <td>{item[0]}</td>

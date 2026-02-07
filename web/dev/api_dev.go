@@ -1472,13 +1472,7 @@ func getSymbolInfo(c *fiber.Ctx) error {
 	}
 
 	// 获取K线信息
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-
-	kinfos, err_ := sess.FindKInfos(context.Background(), args.ID)
+	sranges, err_ := orm.PubQ().ListSRangesBySid(context.Background(), args.ID)
 	if err_ != nil {
 		return err_
 	}
@@ -1486,7 +1480,8 @@ func getSymbolInfo(c *fiber.Ctx) error {
 	// 获取复权因子
 	var adjFactors []*orm.AdjInfo
 	if symbol.Combined {
-		adjFactors, err = sess.GetAdjs(args.ID)
+		var err *errs.Error
+		adjFactors, err = orm.GetAdjs(args.ID)
 		if err != nil {
 			return err
 		}
@@ -1494,7 +1489,7 @@ func getSymbolInfo(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{
 		"symbol":     symbol,
-		"kinfos":     kinfos,
+		"sranges":    sranges,
 		"adjFactors": adjFactors,
 	})
 }
@@ -1518,28 +1513,24 @@ func getSymbolGaps(c *fiber.Ctx) error {
 		args.Limit = 20
 	}
 
-	// 获取数据库连接
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-
-	// 查询空洞数据
-	holes, total, err2 := sess.FindKHoles(orm.FindKHolesArgs{
+	// 查询范围数据（has_data=false表示空洞/无数据区间）
+	hasData := false
+	ranges, total, err2 := orm.PubQ().FindSRanges(orm.FindSRangesArgs{
 		Sid:       args.ID,
+		Table:     "kline_" + args.TimeFrame,
 		TimeFrame: args.TimeFrame,
 		Start:     args.StartMS,
 		Stop:      args.EndMS,
 		Offset:    args.Offset,
 		Limit:     args.Limit,
+		HasData:   &hasData,
 	})
 	if err2 != nil {
 		return err2
 	}
 
 	return c.JSON(fiber.Map{
-		"data":  holes,
+		"data":  ranges,
 		"total": total,
 	})
 }

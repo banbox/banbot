@@ -498,7 +498,7 @@ func saveYear1m(outDir, year string) {
 			}
 			afterVol = true
 			lastMS = bar1m.Time
-			fltArr := []float64{bar1m.Open, bar1m.High, bar1m.Low, bar1m.Close, bar1m.Volume, bar1m.Info}
+			fltArr := []float64{bar1m.Open, bar1m.High, bar1m.Low, bar1m.Close, bar1m.Volume, bar1m.BuyVolume}
 			row := make([]string, 0, 7)
 			row = append(row, strconv.FormatInt(bar1m.Time, 10))
 			for _, val := range fltArr {
@@ -665,7 +665,7 @@ func build1mSymbolTick(inPath string, fid int, file *zip.File, dones map[string]
 			}
 			oldMinMS = curMinMS
 			bar1m = &banexg.Kline{Time: curMinMS, Open: price, High: price, Low: price, Close: price,
-				Volume: volume, Info: t.openInt}
+				Volume: volume, BuyVolume: t.openInt}
 		} else {
 			if volume < sumVol {
 				if volume == 0 && t.avgPrice == 0 && t.turnOver == 0 {
@@ -690,7 +690,7 @@ func build1mSymbolTick(inPath string, fid int, file *zip.File, dones map[string]
 				}
 				bar1m.Close = price
 				bar1m.Volume = volume
-				bar1m.Info = t.openInt
+				bar1m.BuyVolume = t.openInt
 			}
 		}
 	}

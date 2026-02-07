@@ -6,12 +6,14 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"github.com/sasha-s/go-deadlock"
 	"net"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/exg"
 	utils2 "github.com/banbox/banbot/utils"
@@ -44,38 +46,31 @@ var (
 //go:embed sql/trade_schema.sql
 var ddlTrade string
 
-//go:embed sql/ui_schema.sql
-var ddlUi string
+//go:embed sql/banpub_schema.sql
+var ddlBanpub string
 
-//go:embed sql/pg_schema.sql
-var ddlPg1 string
-
-//go:embed sql/pg_schema2.sql
-var ddlPg2 string
-
-//go:embed sql/pg_migrations.sql
-var ddlMigrations string
-
-var ddlDbConf = `DO $$ 
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'dbconf') THEN
-        CREATE TABLE dbconf (
-            key varchar(50) PRIMARY KEY not null,
-            value text not null
-        );
-        INSERT INTO dbconf (key,value) VALUES ('schema_version', '0');
-    END IF;
-END $$;`
+//go:embed sql/qdb_migrations.sql
+var ddlQdbMigrations string
 
 var (
 	DbTrades = "trades"
-	DbUI     = "ui"
+	// DbPub stores mutable relational/meta data (calendars/adj_factors/sranges/ins_kline/kline_un + ui task).
+	DbPub = "banpub"
 )
 
 func Setup() *errs.Error {
 	if pool != nil {
 		pool.Close()
 		pool = nil
+	}
+	initSQLitePaths()
+	{
+		// Ensure banpub.db exists and schema is initialized before any read-only opens.
+		db, err := BanPubConn(true)
+		if err != nil {
+			return err
+		}
+		_ = db.Close()
 	}
 	var err2 *errs.Error
 	pool, err2 = pgConnPool()
@@ -84,38 +79,9 @@ func Setup() *errs.Error {
 	}
 	dbCfg := config.Database
 	ctx := context.Background()
-	row := pool.QueryRow(ctx, "SELECT COUNT(*) FROM pg_class WHERE relname = 'kinfo'")
-	var kInfoCnt int64
-	err := row.Scan(&kInfoCnt)
-	if err != nil {
-		dbErr := NewDbErr(core.ErrDbReadFail, err)
-		if dbCfg.AutoCreate && dbErr.Code == core.ErrDbConnFail && dbErr.Message() == "db not exist" {
-			// 数据库不存在，需要创建
-			log.Warn("database not exist, creating...")
-			err2 = createPgDb(dbCfg.Url)
-			if err2 != nil {
-				return err2
-			}
-		} else {
-			return dbErr
-		}
-	}
-	if kInfoCnt == 0 {
-		// 表不存在，创建
-		log.Warn("initializing database schema for kline ...")
-		_, err = pool.Exec(ctx, ddlPg1)
-		if err != nil {
-			return NewDbErr(core.ErrDbReadFail, err)
-		}
-		_, err = pool.Exec(ctx, ddlPg2)
-		if err != nil {
-			return NewDbErr(core.ErrDbReadFail, err)
-		}
-	} else {
-		// 执行数据库迁移
-		err2 = runMigrations(ctx, pool)
-		if err2 != nil {
-			return err2
+	if dbCfg != nil && dbCfg.AutoCreate {
+		if err := runMigrations(ctx, pool); err != nil {
+			return err
 		}
 	}
 	log.Info("connect db ok", zap.String("url", utils2.MaskDBUrl(dbCfg.Url)), zap.Int("pool", dbCfg.MaxPoolSize))
@@ -137,6 +103,25 @@ func Setup() *errs.Error {
 	return sess.UpdatePendingIns()
 }
 
+func initSQLitePaths() {
+	dataDir := config.GetDataDir()
+	SetDbPath(DbPub, filepath.Join(dataDir, "banpub.db"))
+}
+
+func execMultiSQL(ctx context.Context, pool *pgxpool.Pool, sqlText string) error {
+	stmts := strings.Split(sqlText, ";")
+	for _, st := range stmts {
+		s := strings.TrimSpace(st)
+		if s == "" {
+			continue
+		}
+		if _, err := pool.Exec(ctx, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	dbCfg := config.Database
 	if dbCfg == nil {
@@ -146,6 +131,24 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	if err_ != nil {
 		return nil, errs.New(core.ErrBadConfig, err_)
 	}
+	if poolCfg.ConnConfig != nil {
+		host := strings.TrimSpace(poolCfg.ConnConfig.Host)
+		if host != "" && !isLocalHost(host) {
+			return nil, errs.NewMsg(core.ErrBadConfig, "questdb must be local-only (host=%s)", host)
+		}
+		for _, fb := range poolCfg.ConnConfig.Fallbacks {
+			h := strings.TrimSpace(fb.Host)
+			if h != "" && !isLocalHost(h) {
+				return nil, errs.NewMsg(core.ErrBadConfig, "questdb must be local-only (fallback host=%s)", h)
+			}
+		}
+	}
+	// QuestDB uses the PostgreSQL wire protocol, but (unlike Postgres/TimescaleDB) it doesn't benefit from
+	// pgx's statement cache when our SQL strings are dynamic. Disable the statement/describe cache and run
+	// in non-caching exec mode to reduce per-query overhead (especially under concurrency).
+	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+	poolCfg.ConnConfig.StatementCacheCapacity = 0
+	poolCfg.ConnConfig.DescriptionCacheCapacity = 0
 	if dbCfg.MaxPoolSize == 0 {
 		dbCfg.MaxPoolSize = max(40, runtime.NumCPU()*4)
 	} else if dbCfg.MaxPoolSize < 30 {
@@ -167,28 +170,35 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	if err_ != nil {
 		return nil, errs.New(core.ErrDbConnFail, err_)
 	}
+	// Ping to verify connectivity; if QuestDB is not reachable, try to auto-start it.
+	if err_ = dbPool.Ping(context.Background()); err_ != nil {
+		dbPool.Close()
+		if !utils2.IsDocker() {
+			if ensureErr := ensureQuestDB(poolCfg.ConnConfig.Port); ensureErr != nil {
+				return nil, ensureErr
+			}
+			// Retry after QuestDB is started.
+			dbPool, err_ = pgxpool.NewWithConfig(context.Background(), poolCfg)
+			if err_ != nil {
+				return nil, errs.New(core.ErrDbConnFail, err_)
+			}
+		} else {
+			return nil, errs.New(core.ErrDbConnFail, err_)
+		}
+	}
 	return dbPool, nil
 }
 
-func createPgDb(dbUrl string) *errs.Error {
-	// 连接到默认的postgres数据库
-	tmpConfig, err_ := pgx.ParseConfig(dbUrl)
-	if err_ != nil {
-		return errs.New(core.ErrBadConfig, err_)
+func isLocalHost(host string) bool {
+	host = strings.TrimSpace(host)
+	host = strings.Trim(host, "[]") // tolerate IPv6 literals like [::1]
+	if host == "" {
+		return false
 	}
-	dbName := tmpConfig.Database
-	tmpConfig.Database = "postgres"
-	conn, err_ := pgx.ConnectConfig(context.Background(), tmpConfig)
-	if err_ != nil {
-		return errs.New(core.ErrDbConnFail, err_)
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
 	}
-	defer conn.Close(context.Background())
-
-	_, err_ = conn.Exec(context.Background(), fmt.Sprintf("CREATE DATABASE %s", dbName))
-	if err_ != nil {
-		return errs.New(core.ErrDbExecFail, err_)
-	}
-	return nil
+	return false
 }
 
 func Conn(ctx context.Context) (*Queries, *pgxpool.Conn, *errs.Error) {
@@ -330,8 +340,8 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 	defer dbPathLock.Unlock()
 	if _, ok := dbPathInit[path]; !ok {
 		ddl, tbl := ddlTrade, "bottask"
-		if src == DbUI {
-			ddl, tbl = ddlUi, "task"
+		if src == DbPub {
+			ddl, tbl = ddlBanpub, "calendars"
 		}
 		checkSql := "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?;"
 		var count int
@@ -347,6 +357,11 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 				return nil, errs.New(core.ErrDbExecFail, err_)
 			} else {
 				return nil, errs.NewMsg(core.ErrDbExecFail, "db is empty: %v", path)
+			}
+		} else if write && src == DbPub {
+			// Best-effort: ensure new tables/indexes are created when upgrading.
+			if _, err_ = db.Exec(ddlBanpub); err_ != nil {
+				return nil, errs.New(core.ErrDbExecFail, err_)
 			}
 		}
 		dbPathInit[path] = true
@@ -595,7 +610,7 @@ func (a *AdjInfo) Apply(bars []*banexg.Kline, adj int) []*banexg.Kline {
 		k.Low *= factor
 		k.Close *= factor
 		k.Volume *= factor
-		k.Info *= factor
+		k.BuyVolume *= factor
 		result = append(result, k)
 	}
 	return result
@@ -617,86 +632,74 @@ func NewDbErr(code int, err_ error) *errs.Error {
 	return errs.New(code, err_)
 }
 
-// 执行数据库迁移
+// runMigrations executes QuestDB schema migrations (best-effort, non-transactional).
 func runMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
-	// 1. 检查dbconf表是否存在
-	var exists bool
-	err := pool.QueryRow(ctx, `
-		SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'dbconf')`).Scan(&exists)
-	if err != nil {
-		return NewDbErr(core.ErrDbReadFail, err)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
-	// 2. 如果表不存在，执行第一个迁移脚本创建表
-	if !exists {
-		_, err = pool.Exec(ctx, ddlDbConf)
-		if err != nil {
-			return NewDbErr(core.ErrDbExecFail, err)
+	// Detect QuestDB (PGWire-compatible) vs Postgres/Timescale to avoid executing QuestDB-only DDL on Postgres.
+	// QuestDB supports `count()` and `tables()`, while Postgres does not.
+	{
+		var n int64
+		if err := pool.QueryRow(ctx, `select count() from tables()`).Scan(&n); err != nil {
+			log.Warn("skip questdb migrations (non-questdb backend detected)", zap.Error(err))
+			return nil
 		}
 	}
 
-	// 3. 获取当前版本
-	var currentVersion int
-	err = pool.QueryRow(ctx, "SELECT value::int FROM dbconf WHERE key = 'schema_version'").Scan(&currentVersion)
-	if err != nil && !strings.Contains(err.Error(), "no rows") {
+	log.Warn("running database migrations (questdb) ...")
+	_, err := pool.Exec(ctx, `
+create table if not exists schema_migrations (
+  version long,
+  applied_ts timestamp
+) timestamp(applied_ts) partition by day;
+`)
+	if err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	var cur *int64
+	if err := pool.QueryRow(ctx, `select max(version) from schema_migrations`).Scan(&cur); err != nil {
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
-
-	// 4. 解析迁移脚本
-	migrations := strings.Split(ddlMigrations, "-- version")
+	var currentVersion int64
+	if cur != nil {
+		currentVersion = *cur
+	}
 	initVersion := currentVersion
 
+	migrations := strings.Split(ddlQdbMigrations, "-- version")
 	for _, migration := range migrations {
-		if strings.TrimSpace(migration) == "" {
+		migration = strings.TrimSpace(migration)
+		if migration == "" {
 			continue
 		}
-
-		// 提取版本号
 		lines := strings.SplitN(migration, "\n", 2)
 		if len(lines) < 2 {
 			continue
 		}
-		versionStr := strings.TrimSpace(lines[0])
-		version, err := strconv.Atoi(versionStr)
-		if err != nil {
-			log.Warn("invalid migration version", zap.String("version", versionStr))
-			continue
-		}
+			versionStr := strings.TrimSpace(lines[0])
+			version, err := strconv.ParseInt(versionStr, 10, 64)
+			if err != nil {
+				if strings.HasPrefix(versionStr, "--") {
+					// Header comments before the first "-- version N" section.
+					continue
+				}
+				log.Warn("invalid migration version", zap.String("version", versionStr))
+				continue
+			}
 		if version <= currentVersion {
 			continue
 		}
-
-		// 在事务中执行迁移
-		tx, err := pool.Begin(ctx)
-		if err != nil {
+		if err := execMultiSQL(ctx, pool, lines[1]); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
-
-		// 执行迁移脚本
-		_, err = tx.Exec(ctx, lines[1])
-		if err != nil {
-			tx.Rollback(ctx)
+		if _, err := pool.Exec(ctx, `insert into schema_migrations (version, applied_ts) values ($1,$2)`, version, time.Now().UTC()); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
-
-		// 更新版本号
-		_, err = tx.Exec(ctx, "UPDATE dbconf SET value = $1 WHERE key = 'schema_version'", versionStr)
-		if err != nil {
-			tx.Rollback(ctx)
-			return NewDbErr(core.ErrDbExecFail, err)
-		}
-
-		// 提交事务
-		err = tx.Commit(ctx)
-		if err != nil {
-			return NewDbErr(core.ErrDbExecFail, err)
-		}
-
 		currentVersion = version
 	}
-
 	if initVersion < currentVersion {
-		log.Info("database migration completed", zap.Int("from", initVersion), zap.Int("to", currentVersion))
+		log.Info("database migration completed", zap.Int64("from", initVersion), zap.Int64("to", currentVersion))
 	}
 	return nil
 }

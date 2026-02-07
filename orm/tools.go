@@ -4,15 +4,16 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"github.com/banbox/banexg/log"
-	"github.com/sasha-s/go-deadlock"
-	"go.uber.org/zap"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/banbox/banexg/log"
+	"github.com/sasha-s/go-deadlock"
+	"go.uber.org/zap"
 
 	"github.com/banbox/banbot/core"
 
@@ -68,7 +69,7 @@ func ExportKData(configFile string, outputDir string, numWorkers int, pb *utils2
 	return runExportKlines(task.jobs, outputDir, numWorkers, pb)
 }
 
-func genExpAdjFactors(sess *Queries, items []*config.MarketSymbolsRange) ([]*AdjFactorBlock, *errs.Error) {
+func genExpAdjFactors(items []*config.MarketSymbolsRange) ([]*AdjFactorBlock, *errs.Error) {
 	var adjFactors []*AdjFactorBlock
 
 	for _, adjCfg := range items {
@@ -85,7 +86,7 @@ func genExpAdjFactors(sess *Queries, items []*config.MarketSymbolsRange) ([]*Adj
 					return nil, err
 				}
 				for _, exs := range exsList {
-					facs, err_ := sess.GetAdjFactors(context.Background(), exs.ID)
+					facs, err_ := PubQ().GetAdjFactors(context.Background(), exs.ID)
 					if err_ != nil {
 						return nil, errs.New(core.ErrDbReadFail, err_)
 					}
@@ -106,7 +107,7 @@ func genExpAdjFactors(sess *Queries, items []*config.MarketSymbolsRange) ([]*Adj
 	return adjFactors, nil
 }
 
-func genExpCalendars(sess *Queries, items []*config.MarketRange) ([]*CalendarBlock, *errs.Error) {
+func genExpCalendars(items []*config.MarketRange) ([]*CalendarBlock, *errs.Error) {
 	var calendars []*CalendarBlock
 
 	for _, calCfg := range items {
@@ -143,7 +144,7 @@ func genExpCalendars(sess *Queries, items []*config.MarketRange) ([]*CalendarBlo
 			}
 		}
 		for exchange := range realExgs {
-			cals, err := sess.GetCalendars(exchange, startMS, stopMS)
+			cals, err := PubQ().GetCalendars(exchange, startMS, stopMS)
 			if err != nil {
 				return nil, err
 			}
@@ -164,18 +165,12 @@ func genExpCalendars(sess *Queries, items []*config.MarketRange) ([]*CalendarBlo
 }
 
 func genExportTask(cfg *config.ExportConfig, pb *utils2.StagedPrg) (*ExportTask, *errs.Error) {
-	sess, conn, err := Conn(nil)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Release()
-
-	adjFactors, err := genExpAdjFactors(sess, cfg.AdjFactors)
+	adjFactors, err := genExpAdjFactors(cfg.AdjFactors)
 	if err != nil {
 		return nil, err
 	}
 
-	calendars, err := genExpCalendars(sess, cfg.Calendars)
+	calendars, err := genExpCalendars(cfg.Calendars)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +194,7 @@ func genExportTask(cfg *config.ExportConfig, pb *utils2.StagedPrg) (*ExportTask,
 	}
 
 	// Generate kHoles for each ExSymbol+TimeFrame combination
-	kHoles, err := genExpKHoles(sess, jobs, pb)
+	kHoles, err := genExpKHoles(jobs, pb)
 	if err != nil {
 		return nil, err
 	}
@@ -292,7 +287,7 @@ func genExportKlines(items []*config.MarketTFSymbolsRange, adjs []*AdjFactorBloc
 	return tasks, exsResMap, nil
 }
 
-func genExpKHoles(sess *Queries, jobs []*ExportKlineJob, pb *utils2.StagedPrg) ([]*KHoleBlock, *errs.Error) {
+func genExpKHoles(jobs []*ExportKlineJob, pb *utils2.StagedPrg) ([]*KHoleBlock, *errs.Error) {
 	rangeMap := make(map[string]*config.TimeTuple)
 	var kHoles []*KHoleBlock
 
@@ -325,24 +320,19 @@ func genExpKHoles(sess *Queries, jobs []*ExportKlineJob, pb *utils2.StagedPrg) (
 		pBar.Add(1)
 		key := fmt.Sprintf("%d_%s", task.ID, task.TimeFrame)
 		r := rangeMap[key]
-		holes, err := sess.GetKHoles(context.Background(), GetKHolesParams{
-			Sid:       task.ID,
-			Timeframe: task.TimeFrame,
-			Start:     r.StartMS,
-			Stop:      r.EndMS,
-		})
+		ranges, err := PubQ().ListSRanges(context.Background(), task.ID, "kline_"+task.TimeFrame, task.TimeFrame, r.StartMS, r.EndMS)
 		if err != nil {
 			return nil, errs.New(core.ErrDbReadFail, err)
 		}
-		if len(holes) == 0 {
+		if len(ranges) == 0 {
 			continue
 		}
-		items := make([]int64, 0, len(holes)/10)
-		for _, hole := range holes {
-			if !hole.NoData {
+		items := make([]int64, 0, len(ranges)/10)
+		for _, rg := range ranges {
+			if rg.HasData {
 				continue
 			}
-			items = append(items, hole.Start, hole.Stop)
+			items = append(items, rg.StartMs, rg.StopMs)
 		}
 		if len(items) > 0 {
 			kHoles = append(kHoles, &KHoleBlock{
@@ -501,7 +491,7 @@ func (b *KlineBlock) Append(klines []*banexg.Kline, tfMSec int64, hasInfo bool) 
 			b.Close = append(b.Close, k.Close)
 			b.Volume = append(b.Volume, k.Volume)
 			if hasInfo {
-				b.Info = append(b.Info, k.Info)
+				b.Info = append(b.Info, k.BuyVolume)
 			}
 		} else {
 			return klines[i:]
@@ -646,10 +636,10 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 	}
 	defer conn.Release()
 
-	if err = importAdjFactors(sess, idMap, exInfo.AdjFactors); err != nil {
+	if err = importAdjFactors(idMap, exInfo.AdjFactors); err != nil {
 		return err
 	}
-	if err = importCalendars(sess, exInfo.Calendars); err != nil {
+	if err = importCalendars(exInfo.Calendars); err != nil {
 		return err
 	}
 
@@ -667,7 +657,7 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 	var wg sync.WaitGroup
 	taskCh := make(chan string)
 	errCh := make(chan error, numWorkers+2)
-	insRanges := make(map[int32]map[string][2]int64)
+	insRanges := make(map[int32]map[string][]MSRange)
 	insLock := deadlock.Mutex{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -680,25 +670,17 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 	defer pBar.Close()
 
 	updateRange := func(sid int32, tf string, start, end int64) {
+		if start <= 0 || end <= start {
+			return
+		}
 		insLock.Lock()
 		defer insLock.Unlock()
-		tfMap, _ := insRanges[sid]
+		tfMap := insRanges[sid]
 		if tfMap == nil {
-			tfMap = make(map[string][2]int64)
+			tfMap = make(map[string][]MSRange)
 			insRanges[sid] = tfMap
 		}
-		tup, ok := tfMap[tf]
-		if !ok {
-			tup = [2]int64{start, end}
-		} else {
-			if start < tup[0] {
-				tup[0] = start
-			}
-			if end > tup[1] {
-				tup[1] = end
-			}
-		}
-		tfMap[tf] = tup
+		tfMap[tf] = append(tfMap[tf], MSRange{Start: start, Stop: end})
 	}
 
 	runFile := func(path string) {
@@ -779,47 +761,37 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 	}
 	pBar2 := utils2.NewPrgBar(itemNum, "kRange")
 	if pb != nil {
-		pBar.PrgCbs = append(pBar.PrgCbs, func(done int, total int) {
+		pBar2.PrgCbs = append(pBar2.PrgCbs, func(done int, total int) {
 			pb.SetProgress("range", float64(done)/float64(total))
 		})
 	}
 	defer pBar2.Close()
 	for sid, tfMap := range insRanges {
-		for tf, tup := range tfMap {
-			oldStart, oldEnd := sess.GetKlineRange(sid, tf)
-			newStart, newEnd := tup[0], tup[1]
+		for tf, rawRanges := range tfMap {
+			newRanges := mergeMSRanges(rawRanges)
+			if len(newRanges) == 0 {
+				pBar2.Add(1)
+				continue
+			}
+			newStart, newEnd := newRanges[0].Start, newRanges[len(newRanges)-1].Stop
+			oldStart, oldEnd := PubQ().GetKlineRange(sid, tf)
 
-			if oldStart == 0 && oldEnd == 0 {
-				// 如果没有旧数据，直接添加新区间
-				_, err_ := sess.AddKInfo(context.Background(), AddKInfoParams{
-					Sid:       sid,
-					Timeframe: tf,
-					Start:     newStart,
-					Stop:      newEnd,
-				})
-				if err_ != nil {
-					return errs.New(core.ErrDbExecFail, err_)
-				}
-			} else {
-				// 如果有旧数据，需要处理区间关系
-				if newEnd < oldStart || newStart > oldEnd {
-					// 新区间与旧区间不重合，需要添加khole
-					err := sess.updateKHoles(sid, tf, min(newStart, oldStart), max(newEnd, oldEnd), false)
-					if err != nil {
-						return err
-					}
-				}
-				// 区间重合，直接更新为大区间
-				err_ := sess.SetKInfo(context.Background(), SetKInfoParams{
-					sid, tf, min(newStart, oldStart), max(newEnd, oldEnd),
-				})
-				if err_ != nil {
-					return errs.New(core.ErrDbExecFail, err_)
+			// sranges replaces kinfo/khole: record imported data ranges (non-contiguous allowed).
+			for _, r := range newRanges {
+				if err := PubQ().UpdateSRanges(context.Background(), sid, "kline_"+tf, tf, r.Start, r.Stop, true); err != nil {
+					return errs.New(core.ErrDbExecFail, err)
 				}
 			}
-			err := sess.updateKHoles(sid, tf, newStart, newEnd, false)
-			if err != nil {
+			// Scan the whole imported span to record holes (including gaps between non-contiguous blocks).
+			if err := sess.updateKHoles(sid, tf, newStart, newEnd, false); err != nil {
 				return err
+			}
+
+			// If new data is disjoint from existing data, mark holes in the gap between them.
+			if oldStart > 0 && oldEnd > 0 && (newEnd < oldStart || newStart > oldEnd) {
+				if err := sess.updateKHoles(sid, tf, min(newStart, oldStart), max(newEnd, oldEnd), false); err != nil {
+					return err
+				}
 			}
 			pBar2.Add(1)
 		}
@@ -893,7 +865,7 @@ func importKlines(sess *Queries, ctx context.Context, sid int32, block *KlineBlo
 			Volume: block.Volume[i],
 		}
 		if len(block.Info) > i {
-			bar.Info = block.Info[i]
+			bar.BuyVolume = block.Info[i]
 		}
 		klines = append(klines, bar)
 		if len(klines) >= batchSize {
@@ -962,7 +934,7 @@ func importSymbols(items []*ExSymbolBlock) (map[int32]int32, *errs.Error) {
 	return idMap, nil
 }
 
-func importAdjFactors(sess *Queries, idMap map[int32]int32, items []*AdjFactorBlock) *errs.Error {
+func importAdjFactors(idMap map[int32]int32, items []*AdjFactorBlock) *errs.Error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -987,7 +959,7 @@ func importAdjFactors(sess *Queries, idMap map[int32]int32, items []*AdjFactorBl
 	addNum := 0
 	defer log.Info("adjFactors import ok", zap.Int("num", addNum))
 	for sid, arr := range idArr {
-		olds, err := sess.GetAdjs(sid)
+		olds, err := GetAdjs(sid)
 		if err != nil {
 			return err
 		}
@@ -1013,7 +985,7 @@ func importAdjFactors(sess *Queries, idMap map[int32]int32, items []*AdjFactorBl
 			})
 		}
 		if len(adds) > 0 {
-			_, err_ := sess.AddAdjFactors(context.Background(), adds)
+			_, err_ := PubQ().AddAdjFactors(context.Background(), adds)
 			if err_ != nil {
 				return errs.New(core.ErrDbExecFail, err_)
 			}
@@ -1023,7 +995,7 @@ func importAdjFactors(sess *Queries, idMap map[int32]int32, items []*AdjFactorBl
 	return nil
 }
 
-func importCalendars(sess *Queries, cals []*CalendarBlock) *errs.Error {
+func importCalendars(cals []*CalendarBlock) *errs.Error {
 	if len(cals) == 0 {
 		return nil
 	}
@@ -1031,7 +1003,7 @@ func importCalendars(sess *Queries, cals []*CalendarBlock) *errs.Error {
 		if len(cal.Times) == 0 {
 			continue
 		}
-		items, err := sess.GetCalendars(cal.Name, cal.Times[0], cal.Times[len(cal.Times)-1])
+		items, err := PubQ().GetCalendars(cal.Name, cal.Times[0], cal.Times[len(cal.Times)-1])
 		if err != nil {
 			return err
 		}
@@ -1060,7 +1032,7 @@ func importCalendars(sess *Queries, cals []*CalendarBlock) *errs.Error {
 
 		// 添加新的日历数据
 		if len(newCalendars) > 0 {
-			_, err_ := sess.AddCalendars(context.Background(), newCalendars)
+			_, err_ := PubQ().AddCalendars(context.Background(), newCalendars)
 			if err_ != nil {
 				return errs.New(core.ErrDbExecFail, err_)
 			}

@@ -327,12 +327,7 @@ type KlineFeeder struct {
 }
 
 func NewKlineFeeder(exs *orm.ExSymbol, callBack FnPairKline, showLog bool) (*KlineFeeder, *errs.Error) {
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Release()
-	adjs, err := sess.GetAdjs(exs.ID)
+	adjs, err := orm.GetAdjs(exs.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -898,6 +893,10 @@ func (f *TfKlineLoader) SetNext() {
 	}
 	defer conn.Release()
 	batchSize := 3000
+	if core.BackTestMode {
+		// QuestDB performs better with fewer, larger range queries than many small ones.
+		batchSize = 20000
+	}
 	_, bars, err := sess.GetOHLCV(f.ExSymbol, f.Timeframe, f.offsetMS, endMS, batchSize, true)
 	if err != nil || len(bars) == 0 {
 		f.rowIdx = -1

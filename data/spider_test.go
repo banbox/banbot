@@ -3,6 +3,8 @@ package data
 import (
 	"context"
 	"fmt"
+	"testing"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -14,7 +16,6 @@ import (
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
-	"testing"
 )
 
 func TestWatchOhlcv(t *testing.T) {
@@ -109,13 +110,20 @@ delete from kline_5m where sid=%v;
 delete from kline_15m where sid=%v;
 delete from kline_1h where sid=%v;
 delete from kline_1d where sid=%v;
-delete from kline_un where sid=%v;
-delete from kinfo where sid=%v;
-delete from khole where sid=%v;`, sid, sid, sid, sid, sid, sid, sid, sid))
+`, sid, sid, sid, sid, sid))
 	if err != nil {
 		panic(err)
 	}
 	conn.Release()
+	{
+		db, err := orm.BanPubConn(true)
+		if err != nil {
+			panic(err)
+		}
+		_, _ = db.ExecContext(context.Background(), "delete from kline_un where sid=?", sid)
+		_, _ = db.ExecContext(context.Background(), "delete from sranges where sid=?", sid)
+		_ = db.Close()
+	}
 	core.SetRunMode(core.RunModeBackTest)
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	exs := orm.GetSymbolByID(sid)

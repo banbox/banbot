@@ -47,7 +47,7 @@ func BenchmarkSingleThreadIndicators(b *testing.B) {
 
 		// 模拟真实使用场景：逐个添加K线并计算指标
 		for _, bar := range bars {
-			env.OnBar(bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Info)
+			env.OnBar(bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, 0, 0, 0)
 
 			// 每个K线都计算常用指标
 			_ = ta.SMA(env.Close, 5)

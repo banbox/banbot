@@ -2,10 +2,11 @@ package orm
 
 import (
 	"fmt"
+	"testing"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
-	"testing"
 )
 
 func TestAutoFetchOhlcv(t *testing.T) {
@@ -67,12 +68,7 @@ func TestBulkDownOHLCV(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	sess, conn, err := Conn(nil)
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Release()
-	err = sess.LoadExgSymbols(core.ExgName)
+	err = PubQ().LoadExgSymbols(core.ExgName)
 	if err != nil {
 		panic(err)
 	}

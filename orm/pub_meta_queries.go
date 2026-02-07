@@ -1,0 +1,349 @@
+package orm
+
+import (
+	"context"
+	"time"
+)
+
+type AddAdjFactorsParams struct {
+	Sid     int32   `json:"sid"`
+	SubID   int32   `json:"sub_id"`
+	StartMs int64   `json:"start_ms"`
+	Factor  float64 `json:"factor"`
+}
+
+type AddCalendarsParams struct {
+	Name    string `json:"name"`
+	StartMs int64  `json:"start_ms"`
+	StopMs  int64  `json:"stop_ms"`
+}
+
+type AddInsKlineParams struct {
+	Sid       int32  `json:"sid"`
+	Timeframe string `json:"timeframe"`
+	StartMs   int64  `json:"start_ms"`
+	StopMs    int64  `json:"stop_ms"`
+}
+
+func (q *PubQueries) AddCalendars(ctx context.Context, arg []AddCalendarsParams) (int64, error) {
+	if len(arg) == 0 {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(true)
+	if err2 != nil {
+		return 0, err2
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	commit := false
+	defer func() {
+		if !commit {
+			_ = tx.Rollback()
+		}
+	}()
+	maxID, err := getMaxID(ctx, tx, "calendars", "id")
+	if err != nil {
+		return 0, err
+	}
+	stmt, err := tx.PrepareContext(ctx, `insert into calendars (id,name,start_ms,stop_ms) values (?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	for i, c := range arg {
+		id := maxID + int64(i) + 1
+		if _, err := stmt.ExecContext(ctx, id, c.Name, c.StartMs, c.StopMs); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	commit = true
+	return int64(len(arg)), nil
+}
+
+func (q *PubQueries) AddAdjFactors(ctx context.Context, arg []AddAdjFactorsParams) (int64, error) {
+	if len(arg) == 0 {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(true)
+	if err2 != nil {
+		return 0, err2
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	commit := false
+	defer func() {
+		if !commit {
+			_ = tx.Rollback()
+		}
+	}()
+	maxID, err := getMaxID(ctx, tx, "adj_factors", "id")
+	if err != nil {
+		return 0, err
+	}
+	stmt, err := tx.PrepareContext(ctx, `insert into adj_factors (id,sid,sub_id,start_ms,factor) values (?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	for i, f := range arg {
+		id := maxID + int64(i) + 1
+		if _, err := stmt.ExecContext(ctx, id, f.Sid, f.SubID, f.StartMs, f.Factor); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	commit = true
+	return int64(len(arg)), nil
+}
+
+func (q *PubQueries) GetAdjFactors(ctx context.Context, sid int32) ([]*AdjFactor, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(false)
+	if err2 != nil {
+		return nil, err2
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `select id,sid,sub_id,start_ms,factor from adj_factors where sid=? order by start_ms`, sid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*AdjFactor
+	for rows.Next() {
+		var i AdjFactor
+		if err := rows.Scan(&i.ID, &i.Sid, &i.SubID, &i.StartMs, &i.Factor); err != nil {
+			return nil, err
+		}
+		out = append(out, &i)
+	}
+	return out, rows.Err()
+}
+
+func (q *PubQueries) DelAdjFactors(ctx context.Context, sid int32) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(true)
+	if err2 != nil {
+		return err2
+	}
+	defer db.Close()
+	_, err := db.ExecContext(ctx, `delete from adj_factors where sid=?`, sid)
+	return err
+}
+
+func (q *PubQueries) GetInsKline(ctx context.Context, sid int32) (*InsKline, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(false)
+	if err2 != nil {
+		return nil, err2
+	}
+	defer db.Close()
+	row := db.QueryRowContext(ctx, `select id,sid,timeframe,start_ms,stop_ms from ins_kline where sid=? limit 1`, sid)
+	var i InsKline
+	if err := row.Scan(&i.ID, &i.Sid, &i.Timeframe, &i.StartMs, &i.StopMs); err != nil {
+		return nil, err
+	}
+	return &i, nil
+}
+
+func (q *PubQueries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(false)
+	if err2 != nil {
+		return nil, err2
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `select id,sid,timeframe,start_ms,stop_ms from ins_kline`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*InsKline
+	for rows.Next() {
+		var i InsKline
+		if err := rows.Scan(&i.ID, &i.Sid, &i.Timeframe, &i.StartMs, &i.StopMs); err != nil {
+			return nil, err
+		}
+		out = append(out, &i)
+	}
+	return out, rows.Err()
+}
+
+func (q *PubQueries) DelInsKline(ctx context.Context, id int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(true)
+	if err2 != nil {
+		return err2
+	}
+	defer db.Close()
+	_, err := db.ExecContext(ctx, `delete from ins_kline where id=?`, id)
+	return err
+}
+
+func (q *PubQueries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(true)
+	if err2 != nil {
+		return 0, err2
+	}
+	defer db.Close()
+	id := time.Now().UnixNano()
+	_, err := db.ExecContext(ctx, `insert into ins_kline (id,sid,timeframe,start_ms,stop_ms,created_ms) values (?,?,?,?,?,?)`,
+		id, arg.Sid, arg.Timeframe, arg.StartMs, arg.StopMs, time.Now().UTC().UnixMilli())
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+type AddSymbolsParams struct {
+	Exchange string `json:"exchange"`
+	ExgReal  string `json:"exg_real"`
+	Market   string `json:"market"`
+	Symbol   string `json:"symbol"`
+}
+
+type SetListMSParams struct {
+	ID       int32 `json:"id"`
+	ListMs   int64 `json:"list_ms"`
+	DelistMs int64 `json:"delist_ms"`
+}
+
+func (q *PubQueries) ListExchanges(ctx context.Context) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(false)
+	if err2 != nil {
+		return nil, err2
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `select distinct exchange from exsymbol order by exchange`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+func (q *PubQueries) ListSymbols(ctx context.Context, exchange string) ([]*ExSymbol, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(false)
+	if err2 != nil {
+		return nil, err2
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `
+select id,exchange,exg_real,market,symbol,combined,list_ms,delist_ms
+from exsymbol
+where exchange = ?
+order by id`, exchange)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*ExSymbol
+	for rows.Next() {
+		var i ExSymbol
+		if err := rows.Scan(&i.ID, &i.Exchange, &i.ExgReal, &i.Market, &i.Symbol, &i.Combined, &i.ListMs, &i.DelistMs); err != nil {
+			return nil, err
+		}
+		out = append(out, &i)
+	}
+	return out, rows.Err()
+}
+
+func (q *PubQueries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64, error) {
+	if len(arg) == 0 {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(true)
+	if err2 != nil {
+		return 0, err2
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	commit := false
+	defer func() {
+		if !commit {
+			_ = tx.Rollback()
+		}
+	}()
+	maxID, err := getMaxID(ctx, tx, "exsymbol", "id")
+	if err != nil {
+		return 0, err
+	}
+	stmt, err := tx.PrepareContext(ctx, `insert into exsymbol (id,exchange,exg_real,market,symbol,combined,list_ms,delist_ms) values (?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	for i, s := range arg {
+		id := maxID + int64(i) + 1
+		if _, err := stmt.ExecContext(ctx, id, s.Exchange, s.ExgReal, s.Market, s.Symbol, 0, int64(0), int64(0)); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	commit = true
+	return int64(len(arg)), nil
+}
+
+func (q *PubQueries) SetListMS(ctx context.Context, arg SetListMSParams) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err2 := BanPubConn(true)
+	if err2 != nil {
+		return err2
+	}
+	defer db.Close()
+	_, err := db.ExecContext(ctx, `update exsymbol set list_ms = ?, delist_ms = ? where id = ?`, arg.ListMs, arg.DelistMs, arg.ID)
+	return err
+}

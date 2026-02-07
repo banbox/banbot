@@ -188,7 +188,13 @@ var (
 						Volume: k[5],
 					}
 					if len(k) > 6 {
-						b.Info = k[6]
+						b.BuyVolume = k[6]
+					}
+					if len(k) > 7 {
+						b.Quote = k[7]
+					}
+					if len(k) > 8 {
+						b.TradeNum = int64(k[8])
 					}
 					cg.AddBars(i+1, b)
 				}
@@ -263,11 +269,19 @@ func (d *DrawInd) Calc(kline [][]float64, params []float64) ([]map[string]float6
 	}
 	res := make([]map[string]float64, 0, len(kline))
 	for _, k := range kline {
-		var info = float64(0)
+		var buyVolume = float64(0)
+		var quote = float64(0)
+		var tradeNum int64
 		if len(k) > 6 {
-			info = k[6]
+			buyVolume = k[6]
 		}
-		err := env.OnBar(int64(k[0]), k[1], k[2], k[3], k[4], k[5], info)
+		if len(k) > 7 {
+			quote = k[7]
+		}
+		if len(k) > 8 {
+			tradeNum = int64(k[8])
+		}
+		err := env.OnBar(int64(k[0]), k[1], k[2], k[3], k[4], k[5], quote, buyVolume, tradeNum)
 		if err != nil {
 			return nil, err
 		}

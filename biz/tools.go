@@ -54,6 +54,12 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 	if err != nil {
 		return err
 	}
+	ctx := context.Background()
+	sess, conn, err := orm.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
 	fReader, err_ := file.Open()
 	if err_ != nil {
 		return errs.New(errs.CodeIOReadFail, err_)
@@ -88,13 +94,13 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 			tfMSecs = timeDiff
 		}
 		klines = append(klines, &banexg.Kline{
-			Time:   barTime,
-			Open:   o,
-			High:   h,
-			Low:    l,
-			Close:  c,
-			Volume: v,
-			Info:   d,
+			Time:      barTime,
+			Open:      o,
+			High:      h,
+			Low:       l,
+			Close:     c,
+			Volume:    v,
+			BuyVolume: d,
 		})
 	}
 	sort.Slice(klines, func(i, j int) bool {
@@ -109,17 +115,11 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 		return nil
 	}
 	tfMSecs = int64(utils2.TFToSecs(timeFrame) * 1000)
-	ctx := context.Background()
-	sess, conn, err := orm.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
 	// Filter non-trading time periods and trading volumes of 0
 	// Since some trading days are not recorded in the historical data, the trading calendar is not applicable to filter K-lines
 	// 过滤非交易时间段，成交量为0的
 	// 由于历史数据中部分交易日未录入，故不适用交易日历过滤K线
-	holes, err := sess.GetExSHoles(exchange, exs, startMS, endMS, true)
+	holes, err := orm.GetExSHoles(exchange, exs, startMS, endMS, true)
 	if err != nil {
 		return err
 	}
@@ -196,7 +196,7 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 						}
 						p.Close = k.Close
 						p.Volume += k.Volume
-						p.Info = k.Info
+						p.BuyVolume = k.BuyVolume
 					}
 				}
 			}
@@ -206,7 +206,7 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 		}
 		klines = newKlines
 	}
-	oldStart, oldEnd := sess.GetKlineRange(exs.ID, timeFrame)
+	oldStart, oldEnd := orm.PubQ().GetKlineRange(exs.ID, timeFrame)
 	if oldStart <= startMS && endMS <= oldEnd {
 		// 都已存在，无需写入
 		return nil
@@ -345,12 +345,6 @@ func LoadCalendars(args *config.CmdArgs) *errs.Error {
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	sess, conn, err := orm.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
 	lastExg := ""
 	dateList := make([][2]int64, 0)
 	dtLay := "2006-01-02"
@@ -368,7 +362,7 @@ func LoadCalendars(args *config.CmdArgs) *errs.Error {
 		}
 		if lastExg != row[0] {
 			if len(dateList) > 0 {
-				err = sess.SetCalendars(lastExg, dateList)
+				err = orm.PubQ().SetCalendars(lastExg, dateList)
 				if err != nil {
 					log.Error("save calendars fail", zap.String("exg", lastExg), zap.Error(err))
 				}
@@ -379,7 +373,7 @@ func LoadCalendars(args *config.CmdArgs) *errs.Error {
 		dateList = append(dateList, [2]int64{startMS, stopMS})
 	}
 	if len(dateList) > 0 {
-		err = sess.SetCalendars(lastExg, dateList)
+		err = orm.PubQ().SetCalendars(lastExg, dateList)
 		if err != nil {
 			log.Error("save calendars fail", zap.String("exg", lastExg), zap.Error(err))
 		}
@@ -571,11 +565,6 @@ func ExportAdjFactors(args *config.CmdArgs) *errs.Error {
 		return errs.NewMsg(errs.CodeParamRequired, "--pairs is required")
 	}
 	ctx := context.Background()
-	sess, conn, err := orm.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
 	err_ := utils.EnsureDir(args.OutPath, 0755)
 	if err_ != nil {
 		return errs.New(errs.CodeIOWriteFail, err_)
@@ -586,7 +575,7 @@ func ExportAdjFactors(args *config.CmdArgs) *errs.Error {
 		if err != nil {
 			return err
 		}
-		facs, err_ := sess.GetAdjFactors(ctx, exs.ID)
+		facs, err_ := orm.PubQ().GetAdjFactors(ctx, exs.ID)
 		if err_ != nil {
 			return orm.NewDbErr(core.ErrDbReadFail, err_)
 		}
@@ -1230,7 +1219,7 @@ func TestKLineConsistency(args []string) error {
 				lowDiff := math.Abs(k.Low-ka.Low) / max(k.Low, ka.Low)
 				closeDiff := math.Abs(k.Close-ka.Close) / max(k.Close, ka.Close)
 				volDiff := math.Abs(k.Volume-ka.Volume) / max(k.Volume, ka.Volume)
-				infoDiff := math.Abs(k.Info-ka.Info) / max(k.Info, ka.Info)
+				infoDiff := math.Abs(k.BuyVolume-ka.BuyVolume) / max(k.BuyVolume, ka.BuyVolume)
 				var fields []string
 				if openDiff > 0.01 {
 					fields = append(fields, fmt.Sprintf("open: %f - %f", k.Open, ka.Open))
@@ -1248,7 +1237,7 @@ func TestKLineConsistency(args []string) error {
 					fields = append(fields, fmt.Sprintf("vol: %f - %f", k.Volume, ka.Volume))
 				}
 				if infoDiff > 0.01 {
-					fields = append(fields, fmt.Sprintf("info: %f - %f", k.Info, ka.Info))
+					fields = append(fields, fmt.Sprintf("info: %f - %f", k.BuyVolume, ka.BuyVolume))
 				}
 				if len(fields) > 0 {
 					curDateStr := btime.ToDateStr(ka.Time, core.DefaultDateFmt)

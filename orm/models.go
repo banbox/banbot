@@ -5,7 +5,7 @@
 package orm
 
 type AdjFactor struct {
-	ID      int32   `json:"id"`
+	ID      int64   `json:"id"`
 	Sid     int32   `json:"sid"`
 	SubID   int32   `json:"sub_id"`
 	StartMs int64   `json:"start_ms"`
@@ -13,7 +13,7 @@ type AdjFactor struct {
 }
 
 type Calendar struct {
-	ID      int32  `json:"id"`
+	ID      int64  `json:"id"`
 	Name    string `json:"name"`
 	StartMs int64  `json:"start_ms"`
 	StopMs  int64  `json:"stop_ms"`
@@ -31,38 +31,35 @@ type ExSymbol struct {
 }
 
 type InsKline struct {
-	ID        int32  `json:"id"`
+	ID        int64  `json:"id"`
 	Sid       int32  `json:"sid"`
 	Timeframe string `json:"timeframe"`
 	StartMs   int64  `json:"start_ms"`
 	StopMs    int64  `json:"stop_ms"`
 }
 
-type KHole struct {
+type SRange struct {
 	ID        int64  `json:"id"`
 	Sid       int32  `json:"sid"`
+	Table     string `json:"table"`
 	Timeframe string `json:"timeframe"`
-	Start     int64  `json:"start"`
-	Stop      int64  `json:"stop"`
-	NoData    bool   `json:"no_data"`
-}
-
-type KInfo struct {
-	Sid       int32  `json:"sid"`
-	Timeframe string `json:"timeframe"`
-	Start     int64  `json:"start"`
-	Stop      int64  `json:"stop"`
+	StartMs   int64  `json:"start_ms"`
+	StopMs    int64  `json:"stop_ms"`
+	HasData   bool   `json:"has_data"`
 }
 
 type KlineUn struct {
 	Sid       int32   `json:"sid"`
 	StartMs   int64   `json:"start_ms"`
 	StopMs    int64   `json:"stop_ms"`
+	ExpireMs  int64   `json:"expire_ms"`
 	Timeframe string  `json:"timeframe"`
 	Open      float64 `json:"open"`
 	High      float64 `json:"high"`
 	Low       float64 `json:"low"`
 	Close     float64 `json:"close"`
 	Volume    float64 `json:"volume"`
-	Info      float64 `json:"info"`
+	Quote     float64 `json:"quote"`
+	BuyVolume float64 `json:"buy_volume"`
+	TradeNum  int64   `json:"trade_num"`
 }

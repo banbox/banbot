@@ -38,7 +38,7 @@
           <h3 class="step-title text-xl font-bold w-[13rem]">{m.database()}</h3>
           <div class="content-block flex-1 p-6 bg-base-200 rounded-lg">
             <p>{m.database_desc()}</p>
-            <a href="https://docs.timescale.com/self-hosted/latest/install/" class="btn btn-primary mt-2 btn-outline btn-sm">{m.document()}</a>
+            <a href="https://questdb.io/docs/" class="btn btn-primary mt-2 btn-outline btn-sm">{m.document()}</a>
           </div>
         </div>
       </div>

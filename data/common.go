@@ -37,7 +37,7 @@ func (p *periodSta) alignAndLast(sess *orm.Queries, sid int32, tf string, curMS 
 	// 上一个小时对齐时间戳
 	lastMS, _ := p.stamps[sid]
 	if lastMS == 0 {
-		_, kinfoEnd := sess.GetKlineRange(sid, tf)
+		_, kinfoEnd := orm.PubQ().GetKlineRange(sid, tf)
 		if kinfoEnd > 0 {
 			lastMS = kinfoEnd - p.msecs
 		}
@@ -137,7 +137,7 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 
 func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int64) (int64, *banexg.Kline, *errs.Error) {
 	if oldEndMS == 0 {
-		_, oldEndMS = sess.GetKlineRange(sid, tf)
+		_, oldEndMS = orm.PubQ().GetKlineRange(sid, tf)
 	}
 
 	var err *errs.Error
@@ -166,12 +166,12 @@ func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int6
 		tryCount += 1
 		saveNum, err = sess.DownOHLCV2DB(exchange, exs, tf, oldEndMS, toEndMS, nil)
 		if err != nil {
-			_, oldEndMS = sess.GetKlineRange(sid, tf)
+			_, oldEndMS = orm.PubQ().GetKlineRange(sid, tf)
 			return oldEndMS, nil, err
 		}
 		saveBars, err := sess.QueryOHLCV(exs, tf, 0, 0, 1, false)
 		if err != nil {
-			_, oldEndMS = sess.GetKlineRange(sid, tf)
+			_, oldEndMS = orm.PubQ().GetKlineRange(sid, tf)
 			return oldEndMS, nil, err
 		}
 		var lastMS = int64(0)

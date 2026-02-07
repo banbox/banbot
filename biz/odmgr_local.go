@@ -765,7 +765,7 @@ func cutKlineFromRate(bar *banexg.Kline, tfMSecs int64, rate float64) *banexg.Kl
 	start, high, low := simPriceByRate(bar, rate)
 	return &banexg.Kline{
 		Time: bar.Time + int64(float64(tfMSecs)*rate),
-		Open: start, High: high, Low: low, Close: bar.Close, Volume: bar.Volume * (1 - rate), Info: bar.Info,
+		Open: start, High: high, Low: low, Close: bar.Close, Volume: bar.Volume * (1 - rate), BuyVolume: bar.BuyVolume,
 	}
 }
 

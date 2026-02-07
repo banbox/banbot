@@ -38,7 +38,6 @@ type CmdArgs struct {
 	LogLevel   string
 	LogFile    string
 	TimeZone   string
-	DBFile     string
 }
 
 var (

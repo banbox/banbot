@@ -789,16 +789,10 @@ func RunSpider(addr string) *errs.Error {
 	}
 	server.InitConn = makeInitConn(Spider)
 	go consumeWriteQ(5)
-	sess, conn, err := orm.Conn(nil)
+	err := orm.PubQ().PurgeKlineUn()
 	if err != nil {
 		return err
 	}
-	err = sess.PurgeKlineUn()
-	if err != nil {
-		conn.Release()
-		return err
-	}
-	conn.Release()
 
 	// Start the subscription monitor goroutine
 	go Spider.monitorSubscriptions()

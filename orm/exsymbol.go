@@ -29,7 +29,7 @@ var (
 	hourPairsLock deadlock.Mutex
 )
 
-func (q *Queries) LoadExgSymbols(exgName string) *errs.Error {
+func (q *PubQueries) LoadExgSymbols(exgName string) *errs.Error {
 	ctx := context.Background()
 	exsList, err := q.ListSymbols(ctx, exgName)
 	if err != nil {
@@ -155,14 +155,9 @@ func EnsureExgSymbols(exchange banexg.BanExchange) *errs.Error {
 			}
 		}
 		if len(editList) > 0 {
-			ctx := context.Background()
-			sess, conn, err := Conn(ctx)
-			if err != nil {
-				return err
-			}
-			defer conn.Release()
+			pq := PubQ()
 			for _, exs := range editList {
-				err_ := sess.SetListMS(context.Background(), SetListMSParams{
+				err_ := pq.SetListMS(context.Background(), SetListMSParams{
 					ID:       exs.ID,
 					ListMs:   exs.ListMs,
 					DelistMs: exs.DelistMs,
@@ -210,16 +205,12 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 	for _, name := range exchanges {
 		exgNames[name] = true
 	}
-	sess, conn, err := Conn(nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
+	pq := PubQ()
 	if len(keySymbolMap) == 0 {
 		// Not yet loaded, load the information of all the underlying assets of the specified exchange
 		// 尚未加载，加载指定交易所所有标的信息
 		for exgId := range exgNames {
-			err = sess.LoadExgSymbols(exgId)
+			err = pq.LoadExgSymbols(exgId)
 			if err != nil {
 				return err
 			}
@@ -247,7 +238,7 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 	symbolLock.Lock()
 	defer symbolLock.Unlock()
 	for exgId := range exgNames {
-		err = sess.LoadExgSymbols(exgId)
+		err = pq.LoadExgSymbols(exgId)
 		if err != nil {
 			return err
 		}
@@ -261,7 +252,7 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 		argList = append(argList, AddSymbolsParams{Exchange: item.Exchange, ExgReal: item.ExgReal,
 			Market: item.Market, Symbol: item.Symbol})
 	}
-	_, err_ := sess.AddSymbols(context.Background(), argList)
+	_, err_ := pq.AddSymbols(context.Background(), argList)
 	if err_ != nil {
 		errMsg := err_.Error()
 		if strings.Contains(errMsg, "SQLSTATE 22001") {
@@ -270,7 +261,7 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
 	for exgId := range exgNames {
-		err = sess.LoadExgSymbols(exgId)
+		err = pq.LoadExgSymbols(exgId)
 		if err != nil {
 			return err
 		}
@@ -289,18 +280,14 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 }
 
 func LoadAllExSymbols() *errs.Error {
-	sess, conn, err := Conn(nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
+	pq := PubQ()
 	ctx := context.Background()
-	exgList, err_ := sess.ListExchanges(ctx)
+	exgList, err_ := pq.ListExchanges(ctx)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
 	for _, exgId := range exgList {
-		err = sess.LoadExgSymbols(exgId)
+		err := pq.LoadExgSymbols(exgId)
 		if err != nil {
 			return err
 		}
@@ -355,11 +342,7 @@ func (s *ExSymbol) InfoBy() string {
 }
 
 func InitListDates() *errs.Error {
-	sess, conn, err := Conn(context.Background())
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
+	pq := PubQ()
 	exchange := exg.Default
 	exInfo := exchange.Info()
 	exsList := GetExSymbols(exInfo.ID, exInfo.MarketType)
@@ -383,7 +366,7 @@ func InitListDates() *errs.Error {
 			changed = true
 		}
 		if changed {
-			err_ := sess.SetListMS(context.Background(), SetListMSParams{
+			err_ := pq.SetListMS(context.Background(), SetListMSParams{
 				ID:       exs.ID,
 				ListMs:   exs.ListMs,
 				DelistMs: exs.DelistMs,
@@ -449,7 +432,7 @@ func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int3
 		}
 		if len(klines) > 0 {
 			exs.ListMs = klines[0].Time
-			err_ := sess.SetListMS(context.Background(), SetListMSParams{
+			err_ := PubQ().SetListMS(context.Background(), SetListMSParams{
 				ID:       exs.ID,
 				ListMs:   exs.ListMs,
 				DelistMs: exs.DelistMs,
@@ -502,12 +485,7 @@ func ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
 		exgMarket := fmt.Sprintf("%s:%s", exgName, market)
 		pairNum, _ := marketMap[exgMarket]
 		if pairNum == 0 {
-			sess, conn, err := Conn(nil)
-			if err != nil {
-				return nil, err
-			}
-			defer conn.Release()
-			err = sess.LoadExgSymbols(exgName)
+			err := PubQ().LoadExgSymbols(exgName)
 			if err != nil {
 				return nil, err
 			}

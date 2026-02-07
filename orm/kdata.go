@@ -17,7 +17,6 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
@@ -115,8 +114,7 @@ func (q *Queries) DownOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, timeF
 func (q *Queries) downOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
 	retry int, pBar *utils.PrgBar) (int, *errs.Error) {
 	startMS = exs.GetValidStart(startMS)
-	oldStart, oldEnd := q.GetKlineRange(exs.ID, timeFrame)
-	return downOHLCV2DBRange(q, exchange, exs, timeFrame, startMS, endMS, oldStart, oldEnd, retry, pBar)
+	return downOHLCV2DBRange(q, exchange, exs, timeFrame, startMS, endMS, retry, pBar)
 }
 
 /*
@@ -126,12 +124,10 @@ stepCB is used to update the progress. The total value is fixed at 1000 to preve
 此函数会用于多线程下载，一个数据库会话只能用于一个线程，所以不能传入Queries
 stepCB 用于更新进度，总值固定1000，避免内部下载区间大于传入区间
 */
-func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS,
-	oldStart, oldEnd int64, retry int, pBar *utils.PrgBar) (int, *errs.Error) {
-	if oldStart <= startMS && endMS <= oldEnd || startMS <= exs.ListMs && endMS <= exs.ListMs ||
-		exs.Combined || exs.DelistMs > 0 || core.NetDisable {
-		// If you are completely in the downloaded interval or the download interval is less than the time of availability, you don't need to download it
-		// 完全处于已下载的区间 或 下载区间小于上市时间，无需下载
+func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
+	retry int, pBar *utils.PrgBar) (int, *errs.Error) {
+	_ = retry
+	if startMS >= endMS || exs.Combined || exs.DelistMs > 0 || core.NetDisable {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
 		}
@@ -150,37 +146,56 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		defer conn.Release()
 	}
 	tfSecs := utils2.TFToSecs(timeFrame)
-	var totalNum int
-	chanDown := make(chan *core.DownRange, 10)
-	curStart, curEnd := int64(0), int64(0)
-	if oldStart == 0 {
-		// The data does not exist, and all intervals are downloaded
-		// 数据不存在，下载全部区间
-		curStart, curEnd = startMS, endMS
-		chanDown <- &core.DownRange{Start: startMS, End: endMS}
-		totalNum = int((endMS-startMS)/1000) / tfSecs
-	} else {
-		if endMS > oldEnd {
-			// The rear part exceeds the downloaded range, and the download is behind
-			// 后部超过已下载范围，下载后面
-			curStart, curEnd = oldEnd, endMS
-			chanDown <- &core.DownRange{Start: oldEnd, End: endMS}
-			totalNum += int((endMS-oldEnd)/1000) / tfSecs
+	tfMSecs := int64(tfSecs * 1000)
+
+	covered, err_ := PubQ().getCoveredRanges(context.Background(), exs.ID, "kline_"+timeFrame, timeFrame, startMS, endMS)
+	if err_ != nil {
+		return 0, NewDbErr(core.ErrDbReadFail, err_)
+	}
+	missing := subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered)
+	if len(missing) == 0 {
+		// If metadata says covered but no actual bars exist in the target range,
+		// force a full-range redownload to self-heal stale sranges records.
+		probe, probeErr := sess.QueryOHLCV(exs, timeFrame, startMS, endMS, 1, false)
+		if probeErr != nil {
+			return 0, probeErr
 		}
-		if startMS < oldStart {
-			// The front part exceeds the downloaded range, and the front part is downloaded
-			// 前部超过已下载范围，下载前面
-			if curStart == 0 {
-				curStart, curEnd = startMS, oldStart
-			} else {
-				curStart = startMS
-			}
-			chanDown <- &core.DownRange{Start: startMS, End: oldStart, Reverse: true}
-			totalNum += int((oldStart-startMS)/1000) / tfSecs
+		if len(probe) == 0 {
+			log.Warn("sranges covered but no kline rows, force redownload",
+				zap.Int32("sid", exs.ID),
+				zap.String("symbol", exs.Symbol),
+				zap.String("tf", timeFrame),
+				zap.Int64("start", startMS),
+				zap.Int64("end", endMS),
+			)
+			missing = []MSRange{{Start: startMS, Stop: endMS}}
+		}
+	}
+	if len(missing) == 0 {
+		if pBar != nil {
+			pBar.Add(core.StepTotal)
+		}
+		return 0, nil
+	}
+
+	var (
+		totalNum int
+		curStart int64
+		curEnd   int64
+	)
+	chanDown := make(chan *core.DownRange, len(missing))
+	for _, r := range missing {
+		chanDown <- &core.DownRange{Start: r.Start, End: r.Stop}
+		totalNum += int((r.Stop-r.Start)/1000) / tfSecs
+		if curStart == 0 || r.Start < curStart {
+			curStart = r.Start
+		}
+		if r.Stop > curEnd {
+			curEnd = r.Stop
 		}
 	}
 	close(chanDown)
-	insId, err := sess.AddInsJob(AddInsKlineParams{
+	insId, err := AddInsJob(AddInsKlineParams{
 		Sid:       exs.ID,
 		Timeframe: timeFrame,
 		StartMs:   curStart,
@@ -192,6 +207,15 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		}
 		return 0, err
 	}
+	defer func() {
+		if insId == 0 {
+			return
+		}
+		if err_ := PubQ().DelInsKline(context.Background(), insId); err_ != nil {
+			log.Warn("DelInsKline fail", zap.Int64("id", insId), zap.Error(err_))
+		}
+	}()
+
 	if pBar == nil && totalNum > 10000 {
 		pBar = utils.NewPrgBar(core.StepTotal, exs.Symbol)
 		defer pBar.Close()
@@ -201,16 +225,30 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		bar = pBar.NewJob(totalNum)
 		defer bar.Done()
 	}
+
 	chanKline := make(chan []*banexg.Kline, 1000)
 	var wg sync.WaitGroup
 	wg.Add(2)
-	var outErr *errs.Error
+	var (
+		outErr   *errs.Error
+		outErrMu sync.Mutex
+	)
+	setOutErr := func(err *errs.Error) {
+		if err == nil {
+			return
+		}
+		outErrMu.Lock()
+		if outErr == nil {
+			outErr = err
+		}
+		outErrMu.Unlock()
+	}
 	saveNum := 0
+	succDown := make([]MSRange, 0, len(missing))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start a goroutine to download the candlestick and write it to chanDown
-	// 启动一个goroutine下载K线，写入到chanDown
+	// downloader goroutine
 	go func() {
 		defer func() {
 			wg.Done()
@@ -228,27 +266,23 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 				if job.Reverse {
 					start, stop = job.End, job.Start
 				}
-				barNum := int((job.End-job.Start)/1000) / tfSecs
-				if barNum > 10000 {
-					startText := btime.ToDateStr(job.Start, "")
-					endText := btime.ToDateStr(job.End, "")
-					log.Info(fmt.Sprintf("fetch %s %s  %s - %s, num: %d", exs.Symbol, timeFrame, startText, endText, barNum))
-				}
-				err = FetchApiOHLCV(ctx, exchange, exs.Symbol, timeFrame, start, stop, chanKline)
+				err := FetchApiOHLCV(ctx, exchange, exs.Symbol, timeFrame, start, stop, chanKline)
 				if err != nil {
-					outErr = err
+					setOutErr(err)
 					cancel()
 					return
 				}
+				if ctx.Err() != nil {
+					return
+				}
+				succDown = append(succDown, MSRange{Start: min(start, stop), Stop: max(start, stop)})
 			}
 		}
 	}()
-	// Start a goroutine to save the candlestick to the database
-	// 启动一个goroutine将K线保存到数据库
+	// saver goroutine (db session is single-threaded)
 	realStart, realEnd := int64(0), int64(0)
 	go func() {
 		defer wg.Done()
-		var num int64
 		for {
 			select {
 			case <-ctx.Done():
@@ -257,70 +291,66 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 				if !ok {
 					return
 				}
-				num, err = sess.InsertKLines(timeFrame, exs.ID, batch, true)
+				num, err := sess.InsertKLines(timeFrame, exs.ID, batch, false)
 				if err != nil {
-					outErr = err
+					setOutErr(err)
 					cancel()
 					return
-				} else {
-					curNum := int(num)
-					if bar != nil {
-						bar.Add(curNum)
-					}
-					saveNum += curNum
-					if realStart == 0 || batch[0].Time < realStart {
-						realStart = batch[0].Time
-					}
-					curEnd = batch[len(batch)-1].Time
-					if curEnd > realEnd {
-						realEnd = curEnd
-					}
+				}
+				curNum := int(num)
+				if bar != nil {
+					bar.Add(curNum)
+				}
+				saveNum += curNum
+				if realStart == 0 || batch[0].Time < realStart {
+					realStart = batch[0].Time
+				}
+				last := batch[len(batch)-1].Time
+				if last > realEnd {
+					realEnd = last
 				}
 			}
 		}
 	}()
 
 	wg.Wait()
-	// 检查是否需要下载未完成bar
+
+	// Unfinished bar (best-effort).
 	curMS := btime.UTCStamp()
-	tfMSecs := int64(tfSecs * 1000)
 	curAlignMS := utils2.AlignTfMSecs(curMS, tfMSecs)
 	if endMS > curAlignMS {
-		data, err := exchange.FetchOHLCV(exs.Symbol, timeFrame, curAlignMS, 1, nil)
-		if err != nil {
-			log.Warn("fetch unfinish bar fail", zap.Error(err))
+		data, fetchErr := exchange.FetchOHLCV(exs.Symbol, timeFrame, curAlignMS, 1, nil)
+		if fetchErr != nil {
+			log.Warn("fetch unfinish bar fail", zap.Error(fetchErr))
 		}
 		if len(data) > 0 {
-			err = sess.SetUnfinish(exs.ID, timeFrame, curMS, data[0])
-			if err != nil {
+			if err := PubQ().SetUnfinish(exs.ID, timeFrame, curMS, data[0]); err != nil {
 				log.Warn("set unfinish fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame), zap.Error(err))
 			}
 		}
 	}
-	err_ := sess.DelInsKline(context.Background(), insId)
-	if err_ != nil {
-		log.Warn("DelInsKline fail", zap.Int32("id", insId), zap.Error(err_))
-	}
-	err = nil
-	if outErr != nil && outErr.Code == core.ErrDbUniqueViolation && retry > 0 {
-		err = sess.updateKLineRange(exs.ID, timeFrame, 0, 0)
-		if err == nil {
-			log.Info("retry downOHLCV2DB after ErrDbUniqueViolation", zap.Int32("sid", exs.ID),
-				zap.String("tf", timeFrame))
-			return sess.downOHLCV2DB(exchange, exs, timeFrame, startMS, endMS, retry-1, pBar)
-		} else {
-			log.Warn("updateKLineRange after ErrDbUniqueViolation fail", zap.Int32("sid", exs.ID),
-				zap.String("tf", timeFrame), zap.Error(err))
+
+	if saveNum > 0 {
+		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, nil, true)
+		if updErr != nil {
+			if outErr == nil {
+				outErr = updErr
+			} else {
+				log.Warn("UpdateKRange fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame),
+					zap.String("err", updErr.Short()))
+			}
 		}
-	} else if saveNum > 0 {
-		err = sess.UpdateKRange(exs, timeFrame, realStart, realEnd, nil, true)
 	}
-	if err != nil {
-		if outErr == nil {
-			outErr = err
-		} else {
-			log.Warn("UpdateKRange fail", zap.Int32("exs", exs.ID), zap.String("tf", timeFrame),
-				zap.String("err", err.Short()))
+	if len(succDown) > 0 {
+		for _, r := range mergeMSRanges(succDown) {
+			if err := sess.updateKHoles(exs.ID, timeFrame, r.Start, r.Stop, false); err != nil {
+				if outErr == nil {
+					outErr = err
+				} else {
+					log.Warn("updateKHoles fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame),
+						zap.Int64("start", r.Start), zap.Int64("stop", r.Stop), zap.String("err", err.Short()))
+				}
+			}
 		}
 	}
 	return saveNum, outErr
@@ -401,7 +431,7 @@ func (q *Queries) GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64
 			if p2val == "888" {
 				// Futures 888 is the main continuous contract, while 000 is the index contract
 				// 期货888是主力连续合约，000是指数合约
-				adjs, err := q.GetAdjs(exs.ID)
+				adjs, err := GetAdjs(exs.ID)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -414,7 +444,7 @@ func (q *Queries) GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64
 	return nil, klines, err
 }
 
-func (q *Queries) GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
+func GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
 	amLock.Lock()
 	cache, hasOld := adjMap[sid]
 	amLock.Unlock()
@@ -422,7 +452,7 @@ func (q *Queries) GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
 		return cache, nil
 	}
 	ctx := context.Background()
-	rows, err_ := q.GetAdjFactors(ctx, sid)
+	rows, err_ := PubQ().GetAdjFactors(ctx, sid)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -644,26 +674,14 @@ func BulkDownOHLCV(exchange banexg.BanExchange, exsList map[int32]*ExSymbol, tim
 			pBar.PrgCbs = append(pBar.PrgCbs, prg)
 		}
 	}
-	sess, conn, err := Conn(nil)
-	if err != nil {
-		return err
-	}
 	sidList := utils.KeysOfMap(exsList)
-	// A smaller downTF should be used here
-	// 这里应该使用更小的downTF
-	kRanges := sess.GetKlineRanges(sidList, downTF)
-	conn.Release()
 	return utils.ParallelRun(sidList, core.ConcurNum, func(_ int, i int32) *errs.Error {
 		exs, _ := exsList[i]
 		if exs.DelistMs > 0 {
 			return nil
 		}
-		var oldStart, oldEnd = int64(0), int64(0)
-		if krange, ok := kRanges[exs.ID]; ok {
-			oldStart, oldEnd = krange[0], krange[1]
-		}
-		_, err = downOHLCV2DBRange(nil, exchange, exs, downTF, startMS, endMS, oldStart, oldEnd, 2, pBar)
-		return err
+		_, dlErr := downOHLCV2DBRange(nil, exchange, exs, downTF, startMS, endMS, 2, pBar)
+		return dlErr
 	})
 }
 
@@ -799,24 +817,34 @@ func parseDownArgs(tfMSecs int64, startMS, endMS int64, limit int, withUnFinish 
 	return startMS, endMS
 }
 
-func (q *Queries) getCalendars(name string, startMS, stopMS int64, fields string) (pgx.Rows, error) {
+func buildCalendarsSQL(fields string, startMS, stopMS int64) (string, []any) {
 	var b strings.Builder
 	b.WriteString("select ")
 	b.WriteString(fields)
-	b.WriteString(" from calendars where name=$1 ")
+	b.WriteString(" from calendars where name=? ")
+	args := make([]any, 0, 3)
+	args = append(args, nil)
 	if startMS > 0 {
-		b.WriteString(fmt.Sprintf("and stop_ms > %v ", startMS))
+		b.WriteString("and stop_ms > ? ")
+		args = append(args, startMS)
 	}
 	if stopMS > 0 {
-		b.WriteString(fmt.Sprintf("and start_ms < %v ", stopMS))
+		b.WriteString("and start_ms < ? ")
+		args = append(args, stopMS)
 	}
 	b.WriteString("order by start_ms")
-	ctx := context.Background()
-	return q.db.Query(ctx, b.String(), name)
+	return b.String(), args
 }
 
-func (q *Queries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, *errs.Error) {
-	rows, err_ := q.getCalendars(name, startMS, stopMS, "start_ms,stop_ms")
+func (q *PubQueries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, *errs.Error) {
+	db, err2 := BanPubConn(false)
+	if err2 != nil {
+		return nil, err2
+	}
+	defer db.Close()
+	sqlText, args := buildCalendarsSQL("start_ms,stop_ms", startMS, stopMS)
+	args[0] = name
+	rows, err_ := db.QueryContext(context.Background(), sqlText, args...)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -824,35 +852,57 @@ func (q *Queries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, 
 	result := make([][2]int64, 0)
 	for rows.Next() {
 		var start, stop int64
-		err_ = rows.Scan(&start, &stop)
-		if err_ != nil {
-			return result, NewDbErr(core.ErrDbReadFail, err_)
+		if err := rows.Scan(&start, &stop); err != nil {
+			return result, NewDbErr(core.ErrDbReadFail, err)
 		}
 		result = append(result, [2]int64{start, stop})
 	}
 	return result, nil
 }
 
-func (q *Queries) SetCalendars(name string, items [][2]int64) *errs.Error {
+func (q *PubQueries) SetCalendars(name string, items [][2]int64) *errs.Error {
 	if len(items) == 0 {
 		return nil
 	}
 	startMS, stopMS := items[0][0], items[len(items)-1][1]
-	rows, err_ := q.getCalendars(name, startMS, stopMS, "id,start_ms,stop_ms")
+	db, err2 := BanPubConn(true)
+	if err2 != nil {
+		return err2
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	tx, err_ := db.BeginTx(ctx, nil)
+	if err_ != nil {
+		return NewDbErr(core.ErrDbConnFail, err_)
+	}
+	commit := false
+	defer func() {
+		if !commit {
+			_ = tx.Rollback()
+		}
+	}()
+
+	sqlText, args := buildCalendarsSQL("id,start_ms,stop_ms", startMS, stopMS)
+	args[0] = name
+	rows, err_ := tx.QueryContext(ctx, sqlText, args...)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
 	defer rows.Close()
+
 	olds := make([]*Calendar, 0)
 	for rows.Next() {
 		var cal = &Calendar{}
-		err_ = rows.Scan(&cal.ID, &cal.StartMs, &cal.StopMs)
-		if err_ != nil {
-			return NewDbErr(core.ErrDbReadFail, err_)
+		if err := rows.Scan(&cal.ID, &cal.StartMs, &cal.StopMs); err != nil {
+			return NewDbErr(core.ErrDbReadFail, err)
 		}
 		olds = append(olds, cal)
 	}
-	ctx := context.Background()
+	if err := rows.Err(); err != nil {
+		return NewDbErr(core.ErrDbReadFail, err)
+	}
+
 	if len(olds) > 0 {
 		items[0][0] = olds[0].StartMs
 		items[len(items)-1][1] = olds[len(olds)-1].StopMs
@@ -860,20 +910,32 @@ func (q *Queries) SetCalendars(name string, items [][2]int64) *errs.Error {
 		for i, o := range olds {
 			ids[i] = strconv.Itoa(int(o.ID))
 		}
-		sql := fmt.Sprintf("delete from calendars where id in (%s)", strings.Join(ids, ","))
-		_, err_ = q.db.Exec(ctx, sql)
-		if err_ != nil {
+		delSQL := fmt.Sprintf("delete from calendars where id in (%s)", strings.Join(ids, ","))
+		if _, err_ := tx.ExecContext(ctx, delSQL); err_ != nil {
 			return NewDbErr(core.ErrDbExecFail, err_)
 		}
 	}
-	adds := make([]AddCalendarsParams, 0, len(items))
-	for _, tu := range items {
-		adds = append(adds, AddCalendarsParams{Name: name, StartMs: tu[0], StopMs: tu[1]})
+
+	maxID, err := getMaxID(ctx, tx, "calendars", "id")
+	if err != nil {
+		return NewDbErr(core.ErrDbReadFail, err)
 	}
-	_, err_ = q.AddCalendars(ctx, adds)
+	stmt, err_ := tx.PrepareContext(ctx, `insert into calendars (id,name,start_ms,stop_ms) values (?,?,?,?)`)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
+	defer stmt.Close()
+	for i, tu := range items {
+		id := maxID + int64(i) + 1
+		if _, err := stmt.ExecContext(ctx, id, name, tu[0], tu[1]); err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	commit = true
 	return nil
 }
 
@@ -884,7 +946,7 @@ For the 365 * 24 coin circle, it will not stop and return empty
 获取指定Sid在某个时间段内，所有非交易时间范围。
 对于币圈365*24不休，返回空
 */
-func (q *Queries) GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start, stop int64, full bool) ([][2]int64, *errs.Error) {
+func GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start, stop int64, full bool) ([][2]int64, *errs.Error) {
 	exInfo := exchange.Info()
 	if exInfo.FullDay && exInfo.NoHoliday {
 		// 365天全年无休，且24小时可交易，不存在休息时间段
@@ -906,7 +968,7 @@ func (q *Queries) GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start,
 		}
 	} else {
 		// 获取交易日
-		dtList, err = q.GetCalendars(mar.ExgReal, start, stop)
+		dtList, err = PubQ().GetCalendars(mar.ExgReal, start, stop)
 		if err != nil {
 			return nil, err
 		}
@@ -948,35 +1010,34 @@ func (q *Queries) DelKData(exs *ExSymbol, tfList []string, startMS, endMS int64)
 		if err != nil {
 			return err
 		}
-		err = q.DelKInfo(exs.ID, tf)
-		if err != nil {
+		// QuestDB: kinfo/khole are replaced by sranges, delete sranges metadata first.
+		if err = PubQ().DelKInfo(exs.ID, tf); err != nil {
 			return err
 		}
+		// For partial deletes, rebuild sranges based on remaining data (similar to TimescaleDB's
+		// "recalc kinfo + update kholes" behavior).
 		if startMS > 0 || endMS > 0 {
-			realStart, realEnd, err := q.CalcKLineRange(exs.ID, tf, 0, 0)
-			if err != nil {
-				return err
+			realStart, realEnd, err2 := q.CalcKLineRange(exs.ID, tf, 0, 0)
+			if err2 != nil {
+				return err2
 			}
-			if realStart > 0 && realEnd > 0 {
-				ctx := context.Background()
-				_, err_ := q.AddKInfo(ctx, AddKInfoParams{Sid: exs.ID, Timeframe: tf, Start: realStart, Stop: realEnd})
-				if err_ != nil {
-					return NewDbErr(core.ErrDbExecFail, err_)
+			if realStart > 0 && realEnd > realStart {
+				if err3 := PubQ().UpdateSRanges(context.Background(), exs.ID, "kline_"+tf, tf, realStart, realEnd, true); err3 != nil {
+					return NewDbErr(core.ErrDbExecFail, err3)
+				}
+				if err2 := q.updateKHoles(exs.ID, tf, realStart, realEnd, false); err2 != nil {
+					return err2
 				}
 			}
 		}
-		err = q.DelKHoles(exs.ID, tf, startMS, endMS)
-		if err != nil {
-			return err
-		}
 		if endMS == 0 {
-			err = q.DelKLineUn(exs.ID, tf)
+			err = PubQ().DelKLineUn(exs.ID, tf)
 			if err != nil {
 				return err
 			}
 		}
 	}
-	err := q.DelFactors(exs.ID, startMS, endMS)
+	err := PubQ().DelFactors(exs.ID, startMS, endMS)
 	if err != nil {
 		return err
 	}

@@ -103,7 +103,7 @@ func TestStratRun(t *testing.T) {
 			bar.Symbol = pair
 			envKey := strings.Join([]string{pair, tf}, "_")
 			env, _ := strat.Envs[envKey]
-			env.OnBar(bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, 0)
+			env.OnBar(bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, 0, 0, 0)
 			com.SetBarPrice(pair, bar.Close)
 			jobs, _ := accJobs[envKey]
 			for _, job := range jobs {

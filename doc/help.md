@@ -5,11 +5,11 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 
 ## 技术架构与实现方案
 - 核心框架: 自定义事件驱动框架，支持回测与实盘模式。
-- 数据库: PostgreSQL，通过自定义ORM层进行数据交互。
+- 数据库: SQLite（`banpub.db`）用于公共元数据（K线索引、日历、复权因子、范围管理、未完成K线等）；QuestDB（PGWire）可选用于大规模时序K线存储；交易/任务数据使用SQLite文件（`orders_ban.db`）。
 - 数据处理: 包含数据爬虫、清洗、存储及gRPC服务，为策略提供数据支持。
 - 订单管理: 支持本地模拟和实盘交易两种模式，精细化管理订单生命周期。
-- 策略系统: 支持多种交易策略，通过配置文件动态加载和管理。
-- 配置管理: 使用YAML文件进行灵活配置。
+- 策略系统: 支持多种交易策略，通过配置文件动态加载和管理；支持运行时动态增删交易对。
+- 配置管理: 使用YAML文件进行灵活配置，支持LLM模型配置继承和环境变量替换。
 - 日志: 使用Zap进行高性能结构化日志记录。
 - RPC: 支持通过gRPC和Webhook进行外部通信和通知。
 
@@ -48,20 +48,21 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 
 ### `com/` (公共组件)
 - common.go: 公共数据和函数。
-- price.go: 全局价格管理,支持bar价格和订单簿价格,用于回测和实盘。
+- price.go: 全局价格管理,支持bar价格和订单簿(bid/ask)价格,提供带过期检查的安全价格获取,用于回测和实盘。
+- price_live.go: 实盘价格管理,从交易所获取最新BookTicker并更新价格缓存,内置节流机制防止频繁请求。
 - cron.go: 定时任务管理,基于cron库实现。
 
 ### `config/` (配置管理)
-- biz.go: 负责加载和解析项目配置文件。
-- types.go: 定义了项目的所有配置项结构体。
+- biz.go: 负责加载和解析项目配置文件,支持YAML合并、命令行参数覆盖、LLM模型配置应用、敏感信息脱敏、本地配置更新。
+- types.go: 定义了项目的所有配置项结构体,包括策略性能评估(`StratPerfConfig`)、回测实盘(`BtInLiveConfig`)等。
 - cmd_types.go: 定义了命令行参数相关的结构体。
 - cmd_biz.go: 命令行参数的业务逻辑处理。
 
 ### `core/` (核心类型与全局变量)
-- core.go: 定义项目运行模式、环境等核心全局变量和函数。
+- core.go: 设置运行模式(`live`/`backtest`)和环境(`prod`/`test`/`dry_run`),提供上下文感知的Sleep函数。
 - common.go: 公共函数,包括缓存管理(ristretto)、退出回调、键生成等。
 - types.go: 定义了项目中最基础、最核心的数据结构。
-- data.go: 定义了与数据相关的全局变量和状态,包括运行模式、市场信息、交易对管理、禁单控制等。
+- data.go: 定义了与数据相关的全局变量和状态,包括运行模式、市场信息、交易对管理、禁单控制、订单方向/类型/退出标签常量等。使用`deadlock.RWMutex`进行并发保护。
 - calc.go: 提供了基础的计算工具，如EMA（指数移动平均）。
 - errors.go: 定义了项目自定义的错误码和错误名称。
 - utils.go: 提供了核心层的工具函数。
@@ -92,9 +93,10 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - types.go: 定义了筛选器相关的配置结构。
 
 ### `live/` (实盘交易)
-- crypto_trader.go: 加密货币实盘交易的主逻辑，负责启动和管理整个实盘流程。
-- common.go: 实盘模式下的定时任务和公共函数。
-- tools.go
+- crypto_trader.go: 加密货币实盘交易的主逻辑，负责初始化数据提供者、订单管理器、交易对更新钩子、任务管理、API服务等。
+- common.go: 实盘模式下的定时任务和公共函数,包括定时刷新交易对、延迟通知等。
+- account_check.go: 实盘账户检查,验证交易/提现权限、IP设置、持仓模式、保证金模式,汇总账户余额。
+- tools.go: 提供`trade_close`命令实现,支持按账户/交易对/策略筛选并平仓,支持交易所直接平仓和本地订单平仓两种模式。
 
 ### `llm/` (LLM集成)
 - config.go: LLM模型配置管理，支持模型继承、环境变量替换、定价计算。
@@ -110,24 +112,29 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - tools.go
 
 ### `orm/` (数据库交互)
-- base.go: 数据库连接池的初始化和基础操作。
-- db.go: sqlc生成的数据库查询接口。
-- kdata.go: K线数据的数据库操作封装。
+- base.go: 数据库连接池初始化,管理QuestDB(PGWire)连接池和SQLite连接池(`banpub.db`/`orders_ban.db`),支持连接追踪。
+- db.go: sqlc生成的DBTX/Queries基础封装（QuestDB PGWire接口）。
+- banpub.go: `banpub.db`（SQLite）连接和事务管理,存储公共元数据。
+- pub_queries.go: `PubQueries`入口,提供banpub.db的查询接口。
+- pub_kline_queries.go: banpub.db中K线索引(`ins_kline`)和未完成K线(`kline_un`)的查询操作。
+- pub_meta_queries.go: banpub.db中日历(`calendars`)、复权因子(`adj_factors`)等元数据的批量写入操作。
+- questdb.go: QuestDB的自动安装、启动和管理,支持Linux/macOS/Windows多平台。
+- kdata.go: K线数据的API下载和数据库操作封装。
+- kline.go: K线数据的聚合、下载、修正等高级操作,定义了多周期聚合规则。
 - exsymbol.go: 交易对信息的数据库操作封装。
 - dump.go: 用于在实盘时转储关键数据到文件，供调试和分析。
-- copyfrom.go: sqlc生成的PostgreSQL `COPY FROM` 功能，用于批量数据导入。
-- pg_query.sql.go: sqlc根据SQL查询生成的Go代码。
+- qdb_queries.go: QuestDB（PGWire）手写查询（symbols/calendars/adj/sranges等）。
 - kdata.pb.go: K线数据块的Protobuf定义。
-- kinfo.go: K线信息（如数据范围）的查询逻辑。
-- kline.go: K线数据的聚合、下载、修正等高级操作。
-- models.go: sqlc生成的数据库表结构体。
+- srange.go / srange_query.go: `sranges` 范围管理（支持不连续）。
+- models.go: 表结构体（含 `SRange` 等）。
 - tools.go
 - types.go: ORM层自定义的数据结构。
 
 ### `orm/ormo/` (订单数据库)
-- base.go: 订单相关数据库的基础操作和全局变量。
-- order.go: `InOutOrder`（出入场订单）的核心逻辑，包括状态管理、利润计算等。
+- base.go: 订单相关数据库的基础操作,包括任务管理、开放订单获取(带同步间隔控制)、多账户支持。
+- order.go: `InOutOrder`（出入场订单）的核心逻辑，包括状态管理、利润计算、Info字段懒加载等。
 - bot_task.go: 交易任务（回测/实盘）的数据库管理。
+- wallet_snapshot.go: 钱包快照的保存与查询,支持按小时压缩历史快照,7天后自动清理。
 - data.go: 定义了订单相关的常量和枚举。
 - db.go: sqlc生成的订单数据库查询接口。
 - models.go: sqlc生成的订单数据库表结构体。
@@ -151,11 +158,12 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - exc_notify.go: Zap日志钩子,用于将错误日志通过RPC发送通知。
 
 ### `strat/` (策略)
-- base.go: 策略基类和核心逻辑，定义了策略接口和`StratJob`结构。
+- base.go: 策略基类和核心逻辑，定义了`TradeStrat`和`StratJob`结构,包括仓位计算、时间周期选择、订单bar上限等。
 - main.go: 策略的加载和管理。
-- common.go: 策略相关的通用函数和全局变量。
-- data.go: 定义了策略模块使用的全局数据结构。
-- goods.go: 策略相关的交易对处理逻辑。
+- common.go: 策略相关的通用函数,包括策略创建/获取、性能评估(`CalcJobScores`)、订单变更订阅、历史订单查询、失败开单统计等。
+- data.go: 定义了策略模块使用的全局数据结构,包括策略版本、bar环境、账户任务、WebSocket订阅任务等。
+- pair_update.go: 运行时动态交易对管理,`PairUpdateManager`支持按策略增删交易对,处理关联订单平仓、WebSocket订阅注册/注销。
+- goods.go: 策略相关的交易对处理逻辑,包括策略分组接力和交易对评分。
 - types.go: 策略相关的自定义类型定义。
 
 ### `utils/` (通用工具)
@@ -179,12 +187,13 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - base/: 提供了Web服务的基础API和公共组件。
   - api_com.go: API公共函数,包括参数验证和错误处理。
   - api_kline.go: K线数据接口。
+  - api_csv.go: CSV数据上传、列表查询和数据读取接口。
   - api_ws.go: WebSocket路由注册。
   - websocket.go: WebSocket客户端管理,支持OHLCV数据订阅。
   - indicators.go: 技术指标计算。
   - biz_com.go: 业务公共逻辑。
-- dev/: 开发模式下的Web服务,提供了策略开发、回测管理等功能。
-  - main.go
+- dev/: 开发模式下的Web服务,提供了策略开发、回测管理等功能。自动检测日志文件路径,Docker环境下自动更新本地配置。
+  - main.go: 开发Web服务入口,初始化配置、交易所、路由注册和静态文件服务。
   - api_dev.go: 开发相关API接口。
   - strat.go: 策略管理接口。
   - data_tools.go: 数据工具接口。

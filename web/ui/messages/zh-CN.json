@@ -499,7 +499,7 @@
   "edit_config": "编辑配置",
   "run_banbot": "运行banbot",
   "dashboard": "Dashboard",
-  "database_desc": "安装并启动TimescaleDb，记录数据库连接字符串",
+  "database_desc": "安装并启动QuestDB，记录PGWire连接字符串",
   "trade_edit_config_desc": "执行`bot init`初始化全局配置，设置api key & secret, 数据库连接字符串, 单笔交易金额，市场，交易品种，消息通知，Dashboard密码等信息",
   "run_banbot_desc": "启动爬虫进程&机器人: `bot spider & bot trade`",
   "dashboard_desc": "去Dashboard查看并管理您的交易机器人",

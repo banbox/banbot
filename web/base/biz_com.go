@@ -53,7 +53,7 @@ func GetExg(name, market, ctType string, load bool) (banexg.BanExchange, *errs.E
 func ArrKLines(klines []*banexg.Kline) [][]float64 {
 	res := make([][]float64, 0, len(klines))
 	for _, k := range klines {
-		res = append(res, []float64{float64(k.Time), k.Open, k.High, k.Low, k.Close, k.Volume, k.Info})
+		res = append(res, []float64{float64(k.Time), k.Open, k.High, k.Low, k.Close, k.Volume, k.BuyVolume})
 	}
 	return res
 }

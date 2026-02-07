@@ -1,13 +1,13 @@
 version: '3.8'
 
 services:
-  timescaledb:
-    container_name: timescaledb
-    image: timescale/timescaledb:latest-pg17
+  questdb:
+    container_name: questdb
+    image: questdb/questdb:latest
     ports:
-      - "5432:5432"
+      - "9000:9000" # Web console + REST
+      - "8812:8812" # PGWire
+      - "9009:9009" # ILP (line protocol)
     volumes:
-      - /opt/pgdata:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_PASSWORD=123
-    restart: unless-stopped 
+      - /opt/qdb:/var/lib/questdb
+    restart: unless-stopped  

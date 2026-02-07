@@ -41,7 +41,6 @@ func Run(args []string) error {
 	f.StringVar(&ag.ConfigData, "config-data", "", "yaml config string")
 	f.Var(&ag.Configs, "config", "config path to use, Multiple -config options may be used")
 	f.StringVar(&ag.LogFile, "logfile", "", "log file path, default: system temp dir")
-	f.StringVar(&ag.DBFile, "db", "dev.db", "db file path")
 	if args == nil {
 		args = os.Args[1:]
 	}
@@ -73,7 +72,6 @@ func Run(args []string) error {
 		ConfigData: ag.ConfigData,
 		Logfile:    ag.LogFile,
 	}
-	core.DevDbPath = ag.DBFile
 	var err2 *errs.Error
 	if err2 = biz.SetupComsExg(banArg); err2 != nil {
 		return err2

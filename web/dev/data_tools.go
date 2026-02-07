@@ -88,8 +88,7 @@ func RunDataTools(args *DataToolsArgs) *errs.Error {
 	case "purge":
 		return runDataTask(runPurgeData, args, []string{"purge"}, []float64{1})
 	case "correct":
-		return runDataTask(runCorrectData, args, []string{"fixKInfoZeros", "syncTfKinfo", "fillKHole"},
-			[]float64{1, 5, 5})
+		return runDataTask(runCorrectData, args, []string{"syncTFs"}, []float64{1})
 	default:
 		return errs.NewMsg(errs.CodeParamInvalid, "invalid action")
 	}
