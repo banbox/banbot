@@ -118,13 +118,27 @@ func qdbPaths() (bin string, dataDir string) {
 
 // startAndWait starts QuestDB and waits for the PGWire port to become reachable.
 func startAndWait(bin, dataDir string, port uint16) *errs.Error {
-	args := []string{"start", "-d", dataDir}
 	log.Info("starting QuestDB ...", zap.String("bin", bin), zap.String("dataDir", dataDir))
-	cmd := exec.Command(bin, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return errs.NewMsg(core.ErrDbConnFail, "failed to start QuestDB: %v", err)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return errs.NewMsg(core.ErrDbConnFail, "mkdir dataDir %s: %v", dataDir, err)
+	}
+	if runtime.GOOS == "windows" {
+		// On Windows, "questdb.exe start" installs a service requiring Administrator.
+		// Run interactively as a background process instead; it uses cwd as root dir.
+		cmd := exec.Command(bin)
+		cmd.Dir = dataDir
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			return errs.NewMsg(core.ErrDbConnFail, "failed to start QuestDB: %v", err)
+		}
+	} else {
+		cmd := exec.Command(bin, "start", "-d", dataDir)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return errs.NewMsg(core.ErrDbConnFail, "failed to start QuestDB: %v", err)
+		}
 	}
 	return waitForPort(port)
 }
