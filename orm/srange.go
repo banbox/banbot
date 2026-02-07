@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 )
 
 type MSRange struct {
@@ -266,19 +265,17 @@ order by start_ms, stop_ms`,
 		commit = true
 		return nil
 	}
-	baseID := time.Now().UnixNano()
-	stmt, err := tx.PrepareContext(ctx, `insert into sranges (id,sid,tbl,timeframe,start_ms,stop_ms,has_data) values (?,?,?,?,?,?,?)`)
+	stmt, err := tx.PrepareContext(ctx, `insert into sranges (sid,tbl,timeframe,start_ms,stop_ms,has_data) values (?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-	for i, s := range segs {
-		id := baseID + int64(i)
+	for _, s := range segs {
 		hd := 0
 		if s.HasData {
 			hd = 1
 		}
-		if _, err := stmt.ExecContext(ctx, id, sid, table, timeframe, s.StartMs, s.StopMs, hd); err != nil {
+		if _, err := stmt.ExecContext(ctx, sid, table, timeframe, s.StartMs, s.StopMs, hd); err != nil {
 			return err
 		}
 	}

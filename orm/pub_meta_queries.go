@@ -5,6 +5,14 @@ import (
 	"time"
 )
 
+type PubQueries struct{}
+
+var defaultPubQueries = &PubQueries{}
+
+func PubQ() *PubQueries {
+	return defaultPubQueries
+}
+
 type AddAdjFactorsParams struct {
 	Sid     int32   `json:"sid"`
 	SubID   int32   `json:"sub_id"`
@@ -47,18 +55,13 @@ func (q *PubQueries) AddCalendars(ctx context.Context, arg []AddCalendarsParams)
 			_ = tx.Rollback()
 		}
 	}()
-	maxID, err := getMaxID(ctx, tx, "calendars", "id")
-	if err != nil {
-		return 0, err
-	}
-	stmt, err := tx.PrepareContext(ctx, `insert into calendars (id,name,start_ms,stop_ms) values (?,?,?,?)`)
+	stmt, err := tx.PrepareContext(ctx, `insert into calendars (name,start_ms,stop_ms) values (?,?,?)`)
 	if err != nil {
 		return 0, err
 	}
 	defer stmt.Close()
-	for i, c := range arg {
-		id := maxID + int64(i) + 1
-		if _, err := stmt.ExecContext(ctx, id, c.Name, c.StartMs, c.StopMs); err != nil {
+	for _, c := range arg {
+		if _, err := stmt.ExecContext(ctx, c.Name, c.StartMs, c.StopMs); err != nil {
 			return 0, err
 		}
 	}
@@ -91,18 +94,13 @@ func (q *PubQueries) AddAdjFactors(ctx context.Context, arg []AddAdjFactorsParam
 			_ = tx.Rollback()
 		}
 	}()
-	maxID, err := getMaxID(ctx, tx, "adj_factors", "id")
-	if err != nil {
-		return 0, err
-	}
-	stmt, err := tx.PrepareContext(ctx, `insert into adj_factors (id,sid,sub_id,start_ms,factor) values (?,?,?,?,?)`)
+	stmt, err := tx.PrepareContext(ctx, `insert into adj_factors (sid,sub_id,start_ms,factor) values (?,?,?,?)`)
 	if err != nil {
 		return 0, err
 	}
 	defer stmt.Close()
-	for i, f := range arg {
-		id := maxID + int64(i) + 1
-		if _, err := stmt.ExecContext(ctx, id, f.Sid, f.SubID, f.StartMs, f.Factor); err != nil {
+	for _, f := range arg {
+		if _, err := stmt.ExecContext(ctx, f.Sid, f.SubID, f.StartMs, f.Factor); err != nil {
 			return 0, err
 		}
 	}
@@ -215,13 +213,12 @@ func (q *PubQueries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (in
 		return 0, err2
 	}
 	defer db.Close()
-	id := time.Now().UnixNano()
-	_, err := db.ExecContext(ctx, `insert into ins_kline (id,sid,timeframe,start_ms,stop_ms,created_ms) values (?,?,?,?,?,?)`,
-		id, arg.Sid, arg.Timeframe, arg.StartMs, arg.StopMs, time.Now().UTC().UnixMilli())
+	res, err := db.ExecContext(ctx, `insert into ins_kline (sid,timeframe,start_ms,stop_ms,created_ms) values (?,?,?,?,?)`,
+		arg.Sid, arg.Timeframe, arg.StartMs, arg.StopMs, time.Now().UTC().UnixMilli())
 	if err != nil {
 		return 0, err
 	}
-	return id, nil
+	return res.LastInsertId()
 }
 
 type AddSymbolsParams struct {
@@ -313,18 +310,13 @@ func (q *PubQueries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (in
 			_ = tx.Rollback()
 		}
 	}()
-	maxID, err := getMaxID(ctx, tx, "exsymbol", "id")
-	if err != nil {
-		return 0, err
-	}
-	stmt, err := tx.PrepareContext(ctx, `insert into exsymbol (id,exchange,exg_real,market,symbol,combined,list_ms,delist_ms) values (?,?,?,?,?,?,?,?)`)
+	stmt, err := tx.PrepareContext(ctx, `insert into exsymbol (exchange,exg_real,market,symbol,combined,list_ms,delist_ms) values (?,?,?,?,?,?,?)`)
 	if err != nil {
 		return 0, err
 	}
 	defer stmt.Close()
-	for i, s := range arg {
-		id := maxID + int64(i) + 1
-		if _, err := stmt.ExecContext(ctx, id, s.Exchange, s.ExgReal, s.Market, s.Symbol, 0, int64(0), int64(0)); err != nil {
+	for _, s := range arg {
+		if _, err := stmt.ExecContext(ctx, s.Exchange, s.ExgReal, s.Market, s.Symbol, 0, int64(0), int64(0)); err != nil {
 			return 0, err
 		}
 	}

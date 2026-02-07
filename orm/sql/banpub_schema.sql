@@ -6,7 +6,7 @@
 -- ----------------------------
 CREATE TABLE IF NOT EXISTS exsymbol
 (
-    id        INTEGER PRIMARY KEY,
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
     exchange  TEXT    NOT NULL,
     exg_real  TEXT    NOT NULL DEFAULT '',
     market    TEXT    NOT NULL,
@@ -23,7 +23,7 @@ CREATE INDEX IF NOT EXISTS idx_exs_exg_market_symbol ON exsymbol (exchange, mark
 -- ----------------------------
 CREATE TABLE IF NOT EXISTS calendars
 (
-    id       INTEGER PRIMARY KEY,
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
     name     TEXT    NOT NULL,
     start_ms INTEGER NOT NULL,
     stop_ms  INTEGER NOT NULL
@@ -36,7 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_cal_name_stop  ON calendars (name, stop_ms);
 -- ----------------------------
 CREATE TABLE IF NOT EXISTS adj_factors
 (
-    id       INTEGER PRIMARY KEY,
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
     sid      INTEGER NOT NULL,
     sub_id   INTEGER NOT NULL DEFAULT 0,
     start_ms INTEGER NOT NULL,
@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_adj_subid_start ON adj_factors (sub_id, start_ms)
 -- ----------------------------
 CREATE TABLE IF NOT EXISTS sranges
 (
-    id          INTEGER PRIMARY KEY,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
     sid         INTEGER NOT NULL,
     tbl         TEXT    NOT NULL,
     timeframe   TEXT    NOT NULL,
@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_srange_sid_hasdata ON sranges (sid, has_data);
 -- ----------------------------
 CREATE TABLE IF NOT EXISTS ins_kline
 (
-    id         INTEGER PRIMARY KEY,
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
     sid        INTEGER NOT NULL,
     timeframe  TEXT    NOT NULL,
     start_ms   INTEGER NOT NULL,

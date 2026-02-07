@@ -916,18 +916,13 @@ func (q *PubQueries) SetCalendars(name string, items [][2]int64) *errs.Error {
 		}
 	}
 
-	maxID, err := getMaxID(ctx, tx, "calendars", "id")
-	if err != nil {
-		return NewDbErr(core.ErrDbReadFail, err)
-	}
-	stmt, err_ := tx.PrepareContext(ctx, `insert into calendars (id,name,start_ms,stop_ms) values (?,?,?,?)`)
+	stmt, err_ := tx.PrepareContext(ctx, `insert into calendars (name,start_ms,stop_ms) values (?,?,?)`)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
 	defer stmt.Close()
-	for i, tu := range items {
-		id := maxID + int64(i) + 1
-		if _, err := stmt.ExecContext(ctx, id, name, tu[0], tu[1]); err != nil {
+	for _, tu := range items {
+		if _, err := stmt.ExecContext(ctx, name, tu[0], tu[1]); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
 	}
