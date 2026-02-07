@@ -169,11 +169,11 @@ func postLogin(c *fiber.Ctx) error {
 		}
 		defer conn.Close()
 		for acc, role := range u.AccRoles {
-			hasHistory, err := accountHasTradeHistory(sess, acc)
+			isShow, err := accountToShow(sess, acc)
 			if err != nil {
 				return err
 			}
-			if hasHistory {
+			if isShow {
 				accRoles[acc] = role
 			}
 		}
@@ -188,7 +188,11 @@ func postLogin(c *fiber.Ctx) error {
 	return fiber.NewError(fiber.StatusUnauthorized, "invalid username or password")
 }
 
-func accountHasTradeHistory(sess *ormo.Queries, account string) (bool, error) {
+func accountToShow(sess *ormo.Queries, account string) (bool, error) {
+	if _, ok := config.Accounts[account]; ok {
+		// 活跃账户，直接显示
+		return true, nil
+	}
 	taskID := ormo.GetTaskID(account)
 	if taskID <= 0 {
 		taskName := config.Name
