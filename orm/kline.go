@@ -333,13 +333,7 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
-	for _, r := range exists {
-		if r.HasData {
-			continue
-		}
-		holes = append(holes, MSRange{Start: r.StartMs, Stop: r.StopMs})
-	}
-	holes = mergeMSRanges(holes)
+	holes = mergeExistingHoleRanges(holes, exists, startMS, endMS)
 
 	for _, h := range holes {
 		if err := PubQ().UpdateSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, h.Start, h.Stop, false); err != nil {
@@ -347,6 +341,21 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 		}
 	}
 	return nil
+}
+
+func mergeExistingHoleRanges(holes []MSRange, exists []*SRange, startMS, endMS int64) []MSRange {
+	for _, r := range exists {
+		if r.HasData {
+			continue
+		}
+		start := max(r.StartMs, startMS)
+		stop := min(r.StopMs, endMS)
+		if stop <= start {
+			continue
+		}
+		holes = append(holes, MSRange{Start: start, Stop: stop})
+	}
+	return mergeMSRanges(holes)
 }
 
 func queryHyper(sess *Queries, timeFrame, sql string, limit int, args ...interface{}) (string, pgx.Rows, error) {

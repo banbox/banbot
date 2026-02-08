@@ -42,11 +42,8 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 	if startMS < 1000000000000 {
 		panic(fmt.Sprintf("startMS should be milli seconds, cur: %v", startMS))
 	}
-	// 1 downloads from front to back, -1 downloads from back to front
-	dirt := 1 // 1从前往后下载， -1从后往前下载
 	if startMS > endMS {
 		startMS, endMS = endMS, startMS
-		dirt = -1
 	}
 	// 交易所返回的最后一个可能是未完成bar，需要过滤掉
 	endMS = utils2.AlignTfMSecs(min(endMS, btime.UTCStamp()), tfMSecs)
@@ -54,51 +51,70 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 	if fetchNum == 0 {
 		return nil
 	}
-	rangeMSecs := int64(min(core.KBatchSize, fetchNum+5)) * tfMSecs
-	nextRange := func(start, stop int64) (int64, int64) {
-		if dirt == 1 {
-			if stop >= endMS {
-				return 0, 0
-			}
-			return stop, min(endMS, stop+rangeMSecs)
-		} else {
-			// downloads from back to front 从后往前下载
-			if start <= startMS {
-				return 0, 0
-			}
-			return max(startMS, start-rangeMSecs), start
+	batchSize := int64(min(core.KBatchSize, fetchNum+5))
+	if batchSize <= 0 {
+		batchSize = 1
+	}
+	curSince := startMS
+	lastSent := int64(0)
+	for curSince < endMS {
+		leftNum := (endMS - curSince) / tfMSecs
+		if leftNum <= 0 {
+			break
 		}
-	}
-	since, until := nextRange(startMS, startMS)
-	if dirt == -1 {
-		// downloads from front to back 从后往前下载
-		since, until = nextRange(endMS, endMS)
-	}
-	for since > 0 && until > since {
-		curSize := int((until - since) / tfMSecs)
-		data, err := exchange.FetchOHLCV(pair, timeFrame, since, curSize, map[string]interface{}{
+		curSize := int(min(batchSize, leftNum))
+		data, err := exchange.FetchOHLCV(pair, timeFrame, curSince, curSize, map[string]interface{}{
 			banexg.ParamDebug: DebugDownKLine,
 		})
 		if err != nil {
 			return err
 		}
 		retSize := len(data)
-		// Remove the K-line whose end is out of range 移除末尾超出范围的K线
-		for len(data) > 0 && data[len(data)-1].Time >= until {
-			data = data[:len(data)-1]
-		}
-		log.Debug("fetch kline", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Int("curSize", curSize), zap.Int64("since", since),
-			zap.Int("rawSize", retSize), zap.Int("saveSize", len(data)))
-		since, until = nextRange(since, until)
-		if len(data) > 0 {
+		clean := cleanFetchedKlines(data, curSince, endMS, lastSent)
+		log.Debug("fetch kline", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Int("curSize", curSize), zap.Int64("since", curSince),
+			zap.Int("rawSize", retSize), zap.Int("saveSize", len(clean)))
+		if len(clean) > 0 {
+			lastSent = clean[len(clean)-1].Time
 			select {
 			case <-ctx.Done():
 				return nil
-			case out <- data:
+			case out <- clean:
 			}
 		}
+		curSince = nextFetchSince(curSince, curSize, tfMSecs, clean)
 	}
 	return nil
+}
+
+func cleanFetchedKlines(data []*banexg.Kline, curSince, endMS, lastSent int64) []*banexg.Kline {
+	clean := make([]*banexg.Kline, 0, len(data))
+	for _, row := range data {
+		if row.Time < curSince || row.Time >= endMS {
+			continue
+		}
+		if lastSent > 0 && row.Time <= lastSent {
+			continue
+		}
+		if len(clean) > 0 && row.Time <= clean[len(clean)-1].Time {
+			continue
+		}
+		clean = append(clean, row)
+	}
+	return clean
+}
+
+func nextFetchSince(curSince int64, curSize int, tfMSecs int64, clean []*banexg.Kline) int64 {
+	if len(clean) > 0 {
+		nextSince := clean[len(clean)-1].Time + tfMSecs
+		if nextSince <= curSince {
+			nextSince = curSince + tfMSecs
+		}
+		return nextSince
+	}
+	if curSize <= 0 {
+		return curSince + tfMSecs
+	}
+	return curSince + int64(curSize)*tfMSecs
 }
 
 /*
