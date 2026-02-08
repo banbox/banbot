@@ -170,6 +170,13 @@ func init() {
 		Help:    "sync klines between timeframes",
 	})
 	AddCmdJob(&CmdJob{
+		Name:    "verify",
+		Parent:  "kline",
+		Run:     RunVerifyData,
+		Options: []string{"pairs", "tables", "batch_size"},
+		Help:    "verify kline data matches sranges metadata",
+	})
+	AddCmdJob(&CmdJob{
 		Name:    "adj_calc",
 		Parent:  "kline",
 		Run:     RunKlineAdjFactors,

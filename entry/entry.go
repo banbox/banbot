@@ -166,6 +166,23 @@ func RunKlineAdjFactors(args *config.CmdArgs) *errs.Error {
 	return orm.CalcAdjFactors(args)
 }
 
+func RunVerifyData(args *config.CmdArgs) *errs.Error {
+	err := biz.SetupComs(args)
+	if err != nil {
+		return err
+	}
+	vArgs, err := orm.ParseVerifyArgs(args)
+	if err != nil {
+		return err
+	}
+	results, err := orm.VerifyDataRanges(vArgs)
+	if err != nil {
+		return err
+	}
+	orm.PrintVerifyResults(results)
+	return nil
+}
+
 func RunSpider(args *config.CmdArgs) *errs.Error {
 	core.SetRunMode(core.RunModeLive)
 	if args.Logfile == "" {
