@@ -323,39 +323,27 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 		}
 		holes = hs
 	}
-	if len(holes) == 0 {
-		return nil
-	}
-
-	// Merge with already recorded holes (sranges has_data=false) to reduce fragmentation.
 	ctx := context.Background()
-	exists, err_ := PubQ().ListSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, startMS, endMS)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
-	}
-	holes = mergeExistingHoleRanges(holes, exists, startMS, endMS)
-
-	for _, h := range holes {
-		if err := PubQ().UpdateSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, h.Start, h.Stop, false); err != nil {
-			return NewDbErr(core.ErrDbExecFail, err)
-		}
+	if err := rewriteHoleRangesInWindow(ctx, sid, timeFrame, startMS, endMS, holes); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
 }
 
-func mergeExistingHoleRanges(holes []MSRange, exists []*SRange, startMS, endMS int64) []MSRange {
-	for _, r := range exists {
-		if r.HasData {
-			continue
-		}
-		start := max(r.StartMs, startMS)
-		stop := min(r.StopMs, endMS)
-		if stop <= start {
-			continue
-		}
-		holes = append(holes, MSRange{Start: start, Stop: stop})
+func rewriteHoleRangesInWindow(ctx context.Context, sid int32, timeFrame string, startMS, endMS int64, holes []MSRange) error {
+	tbl := "kline_" + timeFrame
+	if err := PubQ().UpdateSRanges(ctx, sid, tbl, timeFrame, startMS, endMS, true); err != nil {
+		return err
 	}
-	return mergeMSRanges(holes)
+	for _, h := range holes {
+		if h.Stop <= h.Start {
+			continue
+		}
+		if err := PubQ().UpdateSRanges(ctx, sid, tbl, timeFrame, h.Start, h.Stop, false); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func queryHyper(sess *Queries, timeFrame, sql string, limit int, args ...interface{}) (string, pgx.Rows, error) {
