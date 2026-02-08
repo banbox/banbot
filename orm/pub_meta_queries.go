@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -31,6 +32,7 @@ type AddInsKlineParams struct {
 	Timeframe string `json:"timeframe"`
 	StartMs   int64  `json:"start_ms"`
 	StopMs    int64  `json:"stop_ms"`
+	Timeout   int64  `json:"timeout"` // busy_timeout in ms, default 5000
 }
 
 func (q *PubQueries) AddCalendars(ctx context.Context, arg []AddCalendarsParams) (int64, error) {
@@ -213,10 +215,29 @@ func (q *PubQueries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (in
 		return 0, err2
 	}
 	defer db.Close()
-	res, err := db.ExecContext(ctx, `insert into ins_kline (sid,timeframe,start_ms,stop_ms,created_ms) values (?,?,?,?,?)`,
-		arg.Sid, arg.Timeframe, arg.StartMs, arg.StopMs, time.Now().UTC().UnixMilli())
+	timeout := arg.Timeout
+	if timeout <= 0 {
+		timeout = 5000
+	}
+	_, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", timeout))
 	if err != nil {
 		return 0, err
+	}
+	defer db.ExecContext(ctx, "PRAGMA busy_timeout = 10000")
+	nowMs := time.Now().UTC().UnixMilli()
+	res, err := db.ExecContext(ctx, `
+insert or ignore into ins_kline (sid,timeframe,start_ms,stop_ms,created_ms)
+values (?, ?, ?, ?, ?)`,
+		arg.Sid, arg.Timeframe, arg.StartMs, arg.StopMs, nowMs)
+	if err != nil {
+		return 0, err
+	}
+	aff, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if aff == 0 {
+		return 0, nil
 	}
 	return res.LastInsertId()
 }

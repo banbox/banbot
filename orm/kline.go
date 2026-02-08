@@ -1408,17 +1408,13 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 
 func AddInsJob(add AddInsKlineParams) (int64, *errs.Error) {
 	ctx := context.Background()
-	ins, err_ := PubQ().GetInsKline(ctx, add.Sid, add.Timeframe)
-	if err_ != nil && !errors.Is(err_, sql.ErrNoRows) {
-		return 0, NewDbErr(core.ErrDbReadFail, err_)
-	}
-	if ins != nil && ins.ID > 0 {
-		log.Warn("insert candles for symbol locked, skip", zap.Int32("sid", add.Sid), zap.String("tf", add.Timeframe))
-		return 0, nil
-	}
 	newId, err_ := PubQ().AddInsKline(ctx, add)
 	if err_ != nil {
 		return 0, NewDbErr(core.ErrDbExecFail, err_)
+	}
+	if newId == 0 {
+		log.Warn("insert candles for symbol locked, skip", zap.Int32("sid", add.Sid), zap.String("tf", add.Timeframe))
+		return 0, nil
 	}
 	return newId, nil
 }

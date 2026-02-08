@@ -74,6 +74,14 @@ CREATE TABLE IF NOT EXISTS ins_kline
     stop_ms    INTEGER NOT NULL,
     created_ms INTEGER NOT NULL
 );
+-- Keep only one lock row per sid+timeframe before enforcing uniqueness.
+DELETE FROM ins_kline
+WHERE id NOT IN (
+    SELECT MIN(id)
+    FROM ins_kline
+    GROUP BY sid, timeframe
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ins_sid_tf ON ins_kline (sid, timeframe);
 CREATE INDEX IF NOT EXISTS idx_ins_sid_tf ON ins_kline (sid, timeframe);
 CREATE INDEX IF NOT EXISTS idx_ins_created ON ins_kline (created_ms);
 
