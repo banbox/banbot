@@ -43,28 +43,31 @@ func ParseVerifyArgs(args *config.CmdArgs) (*VerifyArgs, *errs.Error) {
 	return vArgs, nil
 }
 
-type VerifyResult struct {
+// VerifyIssue 单个具体问题
+type VerifyIssue struct {
+	Type    string // gap_no_hole, duplicate, orphan
+	StartMs int64
+	StopMs  int64
+	Count   int // 重复次数或gap中缺失bar数
+}
+
+// VerifyTFResult 单个sid+timeframe的检查结果
+type VerifyTFResult struct {
 	Sid       int32
 	Symbol    string
-	Table     string
 	TimeFrame string
-	SRangeID  int64
-	StartMs   int64
-	StopMs    int64
-	Expected  int
-	Actual    int
-	Problem   string
+	Issues    []*VerifyIssue
 }
 
 type VerifyArgs struct {
 	Sids      []int32
 	Tables    []string // 留空默认检查kline
-	BatchSize int      // 分批读取大小，默认50000
+	BatchSize int      // 分批读取时间戳数量，默认500000
 }
 
-func VerifyDataRanges(args *VerifyArgs) ([]*VerifyResult, *errs.Error) {
+func VerifyDataRanges(args *VerifyArgs) ([]*VerifyTFResult, *errs.Error) {
 	if args.BatchSize <= 0 {
-		args.BatchSize = 50000
+		args.BatchSize = 500000
 	}
 	tables := args.Tables
 	if len(tables) == 0 {
@@ -72,7 +75,6 @@ func VerifyDataRanges(args *VerifyArgs) ([]*VerifyResult, *errs.Error) {
 	}
 	sids := args.Sids
 	if len(sids) == 0 {
-		// 检查所有有sranges记录的sid
 		allSids, err := listSRangeSids(tables)
 		if err != nil {
 			return nil, err
@@ -95,7 +97,7 @@ func VerifyDataRanges(args *VerifyArgs) ([]*VerifyResult, *errs.Error) {
 	pBar := utils.NewPrgBar(totalJobs, "verify")
 	defer pBar.Close()
 
-	var results []*VerifyResult
+	var results []*VerifyTFResult
 	for _, sid := range sids {
 		exs := GetSymbolByID(sid)
 		symbol := fmt.Sprintf("sid:%d", sid)
@@ -104,32 +106,24 @@ func VerifyDataRanges(args *VerifyArgs) ([]*VerifyResult, *errs.Error) {
 		}
 		for _, tblPrefix := range tables {
 			pBar.Add(1)
-			sranges, err_ := PubQ().ListSRangesBySid(context.Background(), sid)
+			allRanges, err_ := PubQ().ListSRangesBySid(context.Background(), sid)
 			if err_ != nil {
 				return results, NewDbErr(core.ErrDbReadFail, err_)
 			}
-			// 按table+timeframe分组
-			type tfKey struct {
-				Table     string
-				TimeFrame string
-			}
-			grouped := make(map[tfKey][]*SRange)
-			for _, r := range sranges {
+			// 按timeframe分组，只处理匹配tblPrefix的
+			tfRanges := make(map[string][]*SRange)
+			for _, r := range allRanges {
 				if !strings.HasPrefix(r.Table, tblPrefix+"_") {
 					continue
 				}
-				k := tfKey{Table: r.Table, TimeFrame: r.Timeframe}
-				grouped[k] = append(grouped[k], r)
+				tfRanges[r.Timeframe] = append(tfRanges[r.Timeframe], r)
 			}
-			for key, ranges := range grouped {
-				for _, r := range ranges {
-					if !r.HasData {
-						continue
-					}
-					res := verifySRange(sess, sid, symbol, key.Table, key.TimeFrame, r, args.BatchSize)
-					if res != nil {
-						results = append(results, res)
-					}
+			for tf, ranges := range tfRanges {
+				issues := verifyTFRanges(sess, sid, tf, ranges, args.BatchSize)
+				if len(issues) > 0 {
+					results = append(results, &VerifyTFResult{
+						Sid: sid, Symbol: symbol, TimeFrame: tf, Issues: issues,
+					})
 				}
 			}
 		}
@@ -137,53 +131,153 @@ func VerifyDataRanges(args *VerifyArgs) ([]*VerifyResult, *errs.Error) {
 	return results, nil
 }
 
-func verifySRange(sess *Queries, sid int32, symbol, table, timeFrame string, r *SRange, batchSize int) *VerifyResult {
+// verifyTFRanges 对单个sid+timeframe的所有sranges和实际k线做逐bar比较
+func verifyTFRanges(sess *Queries, sid int32, timeFrame string, ranges []*SRange, batchSize int) []*VerifyIssue {
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	if tfMSecs <= 0 {
-		return &VerifyResult{
-			Sid: sid, Symbol: symbol, Table: table, TimeFrame: timeFrame,
-			SRangeID: r.ID, StartMs: r.StartMs, StopMs: r.StopMs,
-			Problem: "invalid timeframe",
-		}
+		return []*VerifyIssue{{Type: "error", StartMs: 0, StopMs: 0, Count: 0}}
 	}
-	maxBars := int((r.StopMs - r.StartMs) / tfMSecs)
-	if maxBars <= 0 {
-		return &VerifyResult{
-			Sid: sid, Symbol: symbol, Table: table, TimeFrame: timeFrame,
-			SRangeID: r.ID, StartMs: r.StartMs, StopMs: r.StopMs,
-			Expected: maxBars, Problem: "invalid range (stop <= start)",
+	// 按start_ms排序
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].StartMs < ranges[j].StartMs })
+
+	// 计算整体范围
+	minStart := ranges[0].StartMs
+	maxStop := ranges[0].StopMs
+	for _, r := range ranges[1:] {
+		if r.StopMs > maxStop {
+			maxStop = r.StopMs
 		}
 	}
 
-	// 分批次统计实际k线数量
-	actual := 0
-	curStart := r.StartMs
-	for curStart < r.StopMs {
-		curEnd := curStart + int64(batchSize)*tfMSecs
-		if curEnd > r.StopMs {
-			curEnd = r.StopMs
+	// 构建has_data和no_data的区间集合
+	var dataRanges, holeRanges []MSRange
+	for _, r := range ranges {
+		if r.HasData {
+			dataRanges = append(dataRanges, MSRange{Start: r.StartMs, Stop: r.StopMs})
+		} else {
+			holeRanges = append(holeRanges, MSRange{Start: r.StartMs, Stop: r.StopMs})
 		}
-		num := sess.GetKlineNum(sid, timeFrame, curStart, curEnd)
-		actual += num
+	}
+	dataRanges = mergeMSRanges(dataRanges)
+	holeRanges = mergeMSRanges(holeRanges)
+
+	// 分批读取实际k线时间戳，逐bar检查
+	var issues []*VerifyIssue
+	var lastTime int64 // 跨批次跟踪上一个时间戳
+	curStart := minStart
+	for curStart < maxStop {
+		curEnd := curStart + int64(batchSize)*tfMSecs
+		if curEnd > maxStop {
+			curEnd = maxStop
+		}
+		times, err := sess.getKLineTimes(sid, timeFrame, curStart, curEnd)
+		if err != nil {
+			log.Warn("read kline times fail", zap.Int32("sid", sid), zap.String("tf", timeFrame), zap.String("err", err.Short()))
+			break
+		}
+		batchIssues, newLast := checkTimestamps(times, lastTime, tfMSecs, dataRanges, holeRanges)
+		issues = append(issues, batchIssues...)
+		if newLast > 0 {
+			lastTime = newLast
+		}
 		curStart = curEnd
 	}
+	return mergeIssues(issues)
+}
 
-	if actual == maxBars {
-		return nil
+// checkTimestamps 检查一批时间戳，发现gap/duplicate/orphan。prevTime为上一批最后的时间戳
+func checkTimestamps(times []int64, prevTime, tfMSecs int64, dataRanges, holeRanges []MSRange) ([]*VerifyIssue, int64) {
+	var issues []*VerifyIssue
+	for _, t := range times {
+		// 检查重复
+		if prevTime > 0 && t == prevTime {
+			issues = append(issues, &VerifyIssue{Type: "duplicate", StartMs: t, StopMs: t + tfMSecs, Count: 1})
+			continue
+		}
+		// 检查是否在has_data范围外（orphan）
+		if !msInRanges(t, dataRanges) {
+			issues = append(issues, &VerifyIssue{Type: "orphan", StartMs: t, StopMs: t + tfMSecs, Count: 1})
+			prevTime = t
+			continue
+		}
+		// 检查与前一个bar之间的gap
+		if prevTime > 0 {
+			prevEnd := prevTime + tfMSecs
+			if prevEnd < t {
+				gapIssues := checkGap(prevEnd, t, tfMSecs, dataRanges, holeRanges)
+				issues = append(issues, gapIssues...)
+			}
+		}
+		prevTime = t
 	}
-	var problem string
-	if actual == 0 {
-		problem = fmt.Sprintf("no data: srange has_data=true but 0 bars (max %d)", maxBars)
-	} else if actual > maxBars {
-		problem = fmt.Sprintf("duplicate bars: actual %d > max %d (extra %d)", actual, maxBars, actual-maxBars)
-	} else {
-		problem = fmt.Sprintf("missing bars: actual %d / max %d (gap %d)", actual, maxBars, maxBars-actual)
+	return issues, prevTime
+}
+
+// checkGap 检查[gapStart, gapEnd)之间缺失的bar，是否被has_data=false的hole覆盖
+func checkGap(gapStart, gapEnd, tfMSecs int64, dataRanges, holeRanges []MSRange) []*VerifyIssue {
+	var issues []*VerifyIssue
+	var issueStart int64
+	for t := gapStart; t < gapEnd; t += tfMSecs {
+		inData := msInRanges(t, dataRanges)
+		inHole := msInRanges(t, holeRanges)
+		if inData && !inHole {
+			// 在has_data范围内但没有hole记录，是真正的问题
+			if issueStart == 0 {
+				issueStart = t
+			}
+		} else {
+			// 不在data范围内，或被hole覆盖，正常
+			if issueStart > 0 {
+				count := int((t - issueStart) / tfMSecs)
+				issues = append(issues, &VerifyIssue{Type: "gap_no_hole", StartMs: issueStart, StopMs: t, Count: count})
+				issueStart = 0
+			}
+		}
 	}
-	return &VerifyResult{
-		Sid: sid, Symbol: symbol, Table: table, TimeFrame: timeFrame,
-		SRangeID: r.ID, StartMs: r.StartMs, StopMs: r.StopMs,
-		Expected: maxBars, Actual: actual, Problem: problem,
+	if issueStart > 0 {
+		count := int((gapEnd - issueStart) / tfMSecs)
+		issues = append(issues, &VerifyIssue{Type: "gap_no_hole", StartMs: issueStart, StopMs: gapEnd, Count: count})
 	}
+	return issues
+}
+
+// msInRanges 检查时间戳t是否在任一[Start, Stop)区间内
+func msInRanges(t int64, ranges []MSRange) bool {
+	// 二分查找
+	lo, hi := 0, len(ranges)-1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		r := ranges[mid]
+		if t < r.Start {
+			hi = mid - 1
+		} else if t >= r.Stop {
+			lo = mid + 1
+		} else {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeIssues 合并相邻的同类型issue
+func mergeIssues(issues []*VerifyIssue) []*VerifyIssue {
+	if len(issues) <= 1 {
+		return issues
+	}
+	var merged []*VerifyIssue
+	cur := *issues[0]
+	for _, it := range issues[1:] {
+		if it.Type == cur.Type && it.StartMs == cur.StopMs {
+			cur.StopMs = it.StopMs
+			cur.Count += it.Count
+		} else {
+			c := cur
+			merged = append(merged, &c)
+			cur = *it
+		}
+	}
+	merged = append(merged, &cur)
+	return merged
 }
 
 func listSRangeSids(tables []string) ([]int32, *errs.Error) {
@@ -219,16 +313,31 @@ func listSRangeSids(tables []string) ([]int32, *errs.Error) {
 	return sids, nil
 }
 
-func PrintVerifyResults(results []*VerifyResult) {
+func PrintVerifyResults(results []*VerifyTFResult) {
 	if len(results) == 0 {
 		log.Info("all data ranges verified OK")
 		return
 	}
-	log.Warn("data range verification found issues", zap.Int("count", len(results)))
+	total := 0
 	for _, r := range results {
-		startStr := btime.ToDateStr(r.StartMs, "")
-		stopStr := btime.ToDateStr(r.StopMs, "")
-		fmt.Printf("  [%s] sid=%d tf=%s range=[%s ~ %s] %s\n",
-			r.Symbol, r.Sid, r.TimeFrame, startStr, stopStr, r.Problem)
+		total += len(r.Issues)
+	}
+	log.Warn("data range verification found issues", zap.Int("symbols", len(results)), zap.Int("issues", total))
+	for _, r := range results {
+		fmt.Printf("\n[%s] sid=%d tf=%s  (%d issues)\n", r.Symbol, r.Sid, r.TimeFrame, len(r.Issues))
+		for _, it := range r.Issues {
+			startStr := btime.ToDateStr(it.StartMs, "")
+			stopStr := btime.ToDateStr(it.StopMs, "")
+			switch it.Type {
+			case "gap_no_hole":
+				fmt.Printf("  GAP  [%s ~ %s] missing %d bars, no hole in sranges\n", startStr, stopStr, it.Count)
+			case "duplicate":
+				fmt.Printf("  DUP  [%s] %d duplicate bar(s)\n", startStr, it.Count)
+			case "orphan":
+				fmt.Printf("  ORPH [%s ~ %s] %d bar(s) outside has_data sranges\n", startStr, stopStr, it.Count)
+			default:
+				fmt.Printf("  ERR  [%s ~ %s] %s\n", startStr, stopStr, it.Type)
+			}
+		}
 	}
 }
