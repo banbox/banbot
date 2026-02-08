@@ -1408,7 +1408,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 
 func AddInsJob(add AddInsKlineParams) (int64, *errs.Error) {
 	ctx := context.Background()
-	ins, err_ := PubQ().GetInsKline(ctx, add.Sid)
+	ins, err_ := PubQ().GetInsKline(ctx, add.Sid, add.Timeframe)
 	if err_ != nil && !errors.Is(err_, sql.ErrNoRows) {
 		return 0, NewDbErr(core.ErrDbReadFail, err_)
 	}

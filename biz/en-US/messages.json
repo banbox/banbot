@@ -150,5 +150,7 @@
 	"no_trade_permission": "No trading permission",
 	"withdraw_permission_enabled": "Withdrawals enabled",
 	"ip_any_warning": "IP restriction: any",
-	"balance_below_wallet_amounts_third": "Balance below 1/3 of wallet_amounts: %s %.8g < %.8g"
+	"balance_below_wallet_amounts_third": "Balance below 1/3 of wallet_amounts: %s %.8g < %.8g",
+	"sqlite_empty_questdb_stale": "SQLite is empty but QuestDB already has data (stale references). Clear all QuestDB data?",
+	"sqlite_questdb_abort": "User declined to clear stale QuestDB data, aborting."
 }

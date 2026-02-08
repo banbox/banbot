@@ -150,5 +150,7 @@
 	"no_trade_permission": "无交易权限",
 	"withdraw_permission_enabled": "有提现权限",
 	"ip_any_warning": "IP任意",
-	"balance_below_wallet_amounts_third": "余额不足wallet_amounts的1/3: %s %.8g < %.8g"
+	"balance_below_wallet_amounts_third": "余额不足wallet_amounts的1/3: %s %.8g < %.8g",
+	"sqlite_empty_questdb_stale": "SQLite数据为空，但QuestDB已有数据（引用已失效），确认清空QuestDB所有数据？",
+	"sqlite_questdb_abort": "用户拒绝清空QuestDB数据，程序终止。"
 }

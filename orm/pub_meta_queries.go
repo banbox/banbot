@@ -149,7 +149,7 @@ func (q *PubQueries) DelAdjFactors(ctx context.Context, sid int32) error {
 	return err
 }
 
-func (q *PubQueries) GetInsKline(ctx context.Context, sid int32) (*InsKline, error) {
+func (q *PubQueries) GetInsKline(ctx context.Context, sid int32, timeframe string) (*InsKline, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -158,7 +158,7 @@ func (q *PubQueries) GetInsKline(ctx context.Context, sid int32) (*InsKline, err
 		return nil, err2
 	}
 	defer db.Close()
-	row := db.QueryRowContext(ctx, `select id,sid,timeframe,start_ms,stop_ms from ins_kline where sid=? limit 1`, sid)
+	row := db.QueryRowContext(ctx, `select id,sid,timeframe,start_ms,stop_ms from ins_kline where sid=? and timeframe=? limit 1`, sid, timeframe)
 	var i InsKline
 	if err := row.Scan(&i.ID, &i.Sid, &i.Timeframe, &i.StartMs, &i.StopMs); err != nil {
 		return nil, err

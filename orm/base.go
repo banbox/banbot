@@ -1,12 +1,14 @@
 package orm
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	_ "embed"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -55,13 +57,25 @@ var ddlQdbMigrations string
 var (
 	DbTrades = "trades"
 	// DbPub stores mutable relational/meta data (calendars/adj_factors/sranges/ins_kline/kline_un + ui task).
-	DbPub = "banpub"
+	DbPub      = "banpub"
 )
 
 func Setup() *errs.Error {
 	if pool != nil {
 		pool.Close()
 		pool = nil
+	}
+	var err2 *errs.Error
+	pool, err2 = pgConnPool()
+	if err2 != nil {
+		return err2
+	}
+	dataDir := config.GetDataDir()
+	dbPath := filepath.Join(dataDir, "banpub.db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		if err2 := checkQuestDBStale(pool); err2 != nil {
+			return err2
+		}
 	}
 	initSQLitePaths()
 	{
@@ -71,11 +85,6 @@ func Setup() *errs.Error {
 			return err
 		}
 		_ = db.Close()
-	}
-	var err2 *errs.Error
-	pool, err2 = pgConnPool()
-	if err2 != nil {
-		return err2
 	}
 	dbCfg := config.Database
 	ctx := context.Background()
@@ -105,7 +114,62 @@ func Setup() *errs.Error {
 
 func initSQLitePaths() {
 	dataDir := config.GetDataDir()
-	SetDbPath(DbPub, filepath.Join(dataDir, "banpub.db"))
+	dbPath := filepath.Join(dataDir, "banpub.db")
+	SetDbPath(DbPub, dbPath)
+}
+
+// checkQuestDBStale is called when banpub.db was freshly created. If QuestDB
+// already contains data the sid references are now invalid; ask the user
+// whether to wipe QuestDB or abort.
+func checkQuestDBStale(p *pgxpool.Pool) *errs.Error {
+	ctx := context.Background()
+	// List user tables in QuestDB via the tables() system function.
+	rows, err := p.Query(ctx, `select table_name from tables()`, pgx.QueryExecModeDescribeExec)
+	if err != nil {
+		// Non-QuestDB backend or empty instance – nothing to do.
+		return nil
+	}
+	defer rows.Close()
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err == nil {
+			tables = append(tables, name)
+		}
+	}
+	if len(tables) == 0 {
+		return nil
+	}
+	// Check whether any table actually has rows.
+	hasData := false
+	for _, tbl := range tables {
+		var n int64
+		if err := p.QueryRow(ctx, fmt.Sprintf(`select count() from '%s'`, tbl)).Scan(&n); err == nil && n > 0 {
+			hasData = true
+			break
+		}
+	}
+	if !hasData {
+		return nil
+	}
+	// Prompt user.
+	msg := config.GetLangMsg("sqlite_empty_questdb_stale", "SQLite is empty but QuestDB has data (stale). Clear all QuestDB data?")
+	fmt.Printf("\n%s [y/N]: ", msg)
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
+	answer := strings.TrimSpace(strings.ToLower(scanner.Text()))
+	if answer != "y" && answer != "yes" {
+		panic(config.GetLangMsg("sqlite_questdb_abort", "User declined to clear stale QuestDB data, aborting."))
+	}
+	// Drop all tables.
+	log.Warn("dropping all QuestDB tables ...", zap.Int("count", len(tables)))
+	for _, tbl := range tables {
+		if _, err := p.Exec(ctx, fmt.Sprintf(`DROP TABLE '%s'`, tbl)); err != nil {
+			log.Error("drop QuestDB table failed", zap.String("table", tbl), zap.Error(err))
+		}
+	}
+	log.Info("QuestDB tables cleared")
+	return nil
 }
 
 func execMultiSQL(ctx context.Context, pool *pgxpool.Pool, sqlText string) error {
@@ -166,19 +230,25 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	//poolCfg.BeforeClose = func(conn *pgx.Conn) {
 	//	log.Info(fmt.Sprintf("close conn: %v", conn))
 	//}
-	dbPool, err_ := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	connCtx, connCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer connCancel()
+	dbPool, err_ := pgxpool.NewWithConfig(connCtx, poolCfg)
 	if err_ != nil {
 		return nil, errs.New(core.ErrDbConnFail, err_)
 	}
 	// Ping to verify connectivity; if QuestDB is not reachable, try to auto-start it.
-	if err_ = dbPool.Ping(context.Background()); err_ != nil {
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err_ = dbPool.Ping(pingCtx); err_ != nil {
 		dbPool.Close()
 		if !utils2.IsDocker() {
 			if ensureErr := ensureQuestDB(poolCfg.ConnConfig.Port); ensureErr != nil {
 				return nil, ensureErr
 			}
 			// Retry after QuestDB is started.
-			dbPool, err_ = pgxpool.NewWithConfig(context.Background(), poolCfg)
+			retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer retryCancel()
+			dbPool, err_ = pgxpool.NewWithConfig(retryCtx, poolCfg)
 			if err_ != nil {
 				return nil, errs.New(core.ErrDbConnFail, err_)
 			}
@@ -677,16 +747,16 @@ create table if not exists schema_migrations (
 		if len(lines) < 2 {
 			continue
 		}
-			versionStr := strings.TrimSpace(lines[0])
-			version, err := strconv.ParseInt(versionStr, 10, 64)
-			if err != nil {
-				if strings.HasPrefix(versionStr, "--") {
-					// Header comments before the first "-- version N" section.
-					continue
-				}
-				log.Warn("invalid migration version", zap.String("version", versionStr))
+		versionStr := strings.TrimSpace(lines[0])
+		version, err := strconv.ParseInt(versionStr, 10, 64)
+		if err != nil {
+			if strings.HasPrefix(versionStr, "--") {
+				// Header comments before the first "-- version N" section.
 				continue
 			}
+			log.Warn("invalid migration version", zap.String("version", versionStr))
+			continue
+		}
 		if version <= currentVersion {
 			continue
 		}
