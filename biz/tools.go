@@ -256,11 +256,6 @@ func aggBigKlines(sess *orm.Queries, klines []*banexg.Kline, tfMSecs int64, exs 
 		if len(klines) == 0 {
 			continue
 		}
-		endMs := klines[len(klines)-1].Time + agg.MSecs
-		err = sess.DelKLines(exs.ID, agg.TimeFrame, klines[0].Time, endMs)
-		if err != nil {
-			return err
-		}
 		num, err = sess.InsertKLinesAuto(agg.TimeFrame, exs, klines, false)
 		if err != nil {
 			return err

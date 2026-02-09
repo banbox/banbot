@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sasha-s/go-deadlock"
@@ -37,7 +38,7 @@ var (
 		NewKlineAgg("1h", "kline_1h", "", "", "", "", "6 months", "3 years"),
 		NewKlineAgg("1d", "kline_1d", "1h", "3d", "1h", "1h", "3 years", "20 years"),
 	}
-	aggMap = make(map[string]*KlineAgg)
+	aggMap          = make(map[string]*KlineAgg)
 )
 
 func init() {
@@ -220,6 +221,20 @@ order by time`, tblName, sid, startMs, endMs)
 	return resList, nil
 }
 
+func (q *Queries) getKLineTimeRange(sid int32, timeframe string) (int64, int64, *errs.Error) {
+	tblName := "kline_" + timeframe
+	sql := fmt.Sprintf("select min(time), max(time) from %s where sid=%d", tblName, sid)
+	row := q.db.QueryRow(context.Background(), sql)
+	var minTime, maxTime *int64
+	if err := row.Scan(&minTime, &maxTime); err != nil {
+		return 0, 0, NewDbErr(core.ErrDbReadFail, err)
+	}
+	if minTime == nil || maxTime == nil {
+		return 0, 0, nil
+	}
+	return *minTime, *maxTime, nil
+}
+
 func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64, isCont bool) *errs.Error {
 	_ = isCont
 	if startMS <= 0 || endMS <= startMS {
@@ -323,27 +338,24 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 		}
 		holes = hs
 	}
-	if len(holes) == 0 {
-		return nil
-	}
-
-	// Merge with already recorded holes (sranges has_data=false) to reduce fragmentation.
 	ctx := context.Background()
-	exists, err_ := PubQ().ListSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, startMS, endMS)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
+	if err := rewriteHoleRangesInWindow(ctx, sid, timeFrame, startMS, endMS, holes); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
 	}
-	for _, r := range exists {
-		if r.HasData {
+	return nil
+}
+
+func rewriteHoleRangesInWindow(ctx context.Context, sid int32, timeFrame string, startMS, endMS int64, holes []MSRange) error {
+	tbl := "kline_" + timeFrame
+	if err := PubQ().UpdateSRanges(ctx, sid, tbl, timeFrame, startMS, endMS, true); err != nil {
+		return err
+	}
+	for _, h := range holes {
+		if h.Stop <= h.Start {
 			continue
 		}
-		holes = append(holes, MSRange{Start: r.StartMs, Stop: r.StopMs})
-	}
-	holes = mergeMSRanges(holes)
-
-	for _, h := range holes {
-		if err := PubQ().UpdateSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, h.Start, h.Stop, false); err != nil {
-			return NewDbErr(core.ErrDbExecFail, err)
+		if err := PubQ().UpdateSRanges(ctx, sid, tbl, timeFrame, h.Start, h.Stop, false); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -716,7 +728,7 @@ InsertKLines
 Only batch insert K-lines. To update associated information simultaneously, please use InsertKLinesAuto
 只批量插入K线，如需同时更新关联信息，请使用InsertKLinesAuto
 */
-func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline, delOnDump bool) (int64, *errs.Error) {
+func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline) (int64, *errs.Error) {
 	arrLen := len(arr)
 	if arrLen == 0 {
 		return 0, nil
@@ -798,7 +810,7 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 			log.Warn("DelInsKline fail", zap.Int64("id", insId), zap.Error(err_))
 		}
 	}()
-	num, err := q.InsertKLines(timeFrame, exs.ID, arr, false)
+	num, err := q.InsertKLines(timeFrame, exs.ID, arr)
 	if err != nil {
 		return num, err
 	}
@@ -815,14 +827,18 @@ UpdateKRange
 2. 搜索空洞，更新Khole
 3. 更新更大周期的连续聚合
 */
-func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS int64, klines []*banexg.Kline, aggBig bool) *errs.Error {
+func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS int64, klines []*banexg.Kline, aggBig bool, skipHoles ...bool) *errs.Error {
 	// Record data ranges in sranges (non-contiguous allowed).
 	if err := updateKLineRange(exs.ID, timeFrame, startMS, endMS); err != nil {
 		return err
 	}
 	// Search for holes and update sranges (has_data=false).
-	if err := q.updateKHoles(exs.ID, timeFrame, startMS, endMS, true); err != nil {
-		return err
+	// Skip when caller handles holes separately (e.g. downOHLCV2DBRange),
+	// to avoid QuestDB WAL lag causing freshly inserted bars to appear missing.
+	if len(skipHoles) == 0 || !skipHoles[0] {
+		if err := q.updateKHoles(exs.ID, timeFrame, startMS, endMS, true); err != nil {
+			return err
+		}
 	}
 	if !aggBig {
 		return nil
@@ -1009,18 +1025,17 @@ order by time`, fromTbl), sid, aggStart, endMS)
 	if len(aggBars) == 0 {
 		return nil
 	}
-	_, err := q.InsertKLines(item.TimeFrame, sid, aggBars, true)
+	_, err := q.InsertKLines(item.TimeFrame, sid, aggBars)
 	if err != nil {
 		return err
 	}
+	// Use actual inserted bar range for srange update
+	// 使用实际插入的bar范围更新srange
+	saveStart := aggBars[0].Time
+	saveEnd := aggBars[len(aggBars)-1].Time + tfMSecs
 	// Update the effective range of intervals
 	// 更新有效区间范围
-	err = updateKLineRange(sid, item.TimeFrame, startMS, endMS)
-	if err != nil {
-		return err
-	}
-	// Search for holes, update sranges.
-	err = q.updateKHoles(sid, item.TimeFrame, startMS, endMS, isCont)
+	err = updateKLineRange(sid, item.TimeFrame, saveStart, saveEnd)
 	if err != nil {
 		return err
 	}
@@ -1080,7 +1095,10 @@ func (q *Queries) DelKLines(sid int32, timeFrame string, startMS, endMS int64) *
 	if endMS > 0 {
 		sql += fmt.Sprintf(" and time < %v", endMS)
 	}
-	return q.Exec(sql)
+	if _, err := q.db.Exec(context.Background(), sql); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	return nil
 }
 
 func mapToItems[T any](rows pgx.Rows, err_ error, assign func() (T, []any)) ([]T, error) {

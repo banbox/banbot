@@ -148,6 +148,16 @@ func verifyTFRanges(sess *Queries, sid int32, timeFrame string, ranges []*SRange
 			maxStop = r.StopMs
 		}
 	}
+	realMin, realMax, rangeErr := sess.getKLineTimeRange(sid, timeFrame)
+	if rangeErr == nil && realMin > 0 {
+		if realMin < minStart {
+			minStart = realMin
+		}
+		realMaxStop := realMax + tfMSecs
+		if realMaxStop > maxStop {
+			maxStop = realMaxStop
+		}
+	}
 
 	// 构建has_data和no_data的区间集合
 	var dataRanges, holeRanges []MSRange
