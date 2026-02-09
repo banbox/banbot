@@ -72,5 +72,5 @@ create table if not exists kline_1d (
   quote double,
   buy_volume double,
   trade_num long
-) timestamp(ts) partition by NONE dedup upsert keys(sid, ts);
+) timestamp(ts) partition by year dedup upsert keys(sid, ts);
 
