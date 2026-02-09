@@ -220,6 +220,20 @@ order by time`, tblName, sid, startMs, endMs)
 	return resList, nil
 }
 
+func (q *Queries) getKLineTimeRange(sid int32, timeframe string) (int64, int64, *errs.Error) {
+	tblName := "kline_" + timeframe
+	sql := fmt.Sprintf("select min(time), max(time) from %s where sid=%d", tblName, sid)
+	row := q.db.QueryRow(context.Background(), sql)
+	var minTime, maxTime *int64
+	if err := row.Scan(&minTime, &maxTime); err != nil {
+		return 0, 0, NewDbErr(core.ErrDbReadFail, err)
+	}
+	if minTime == nil || maxTime == nil {
+		return 0, 0, nil
+	}
+	return *minTime, *maxTime, nil
+}
+
 func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64, isCont bool) *errs.Error {
 	_ = isCont
 	if startMS <= 0 || endMS <= startMS {
@@ -326,6 +340,23 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 	ctx := context.Background()
 	if err := rewriteHoleRangesInWindow(ctx, sid, timeFrame, startMS, endMS, holes); err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	if exs := GetSymbolByID(sid); allowKlineDiag(sid, func() string {
+		if exs == nil {
+			return ""
+		}
+		return exs.Symbol
+	}(), timeFrame) {
+		holeNum, holeStart, holeStop := summarizeRangeBounds(holes)
+		log.Warn("kline diag rewrite holes",
+			zap.Int32("sid", sid),
+			zap.String("tf", timeFrame),
+			zap.Int64("start", startMS),
+			zap.Int64("end", endMS),
+			zap.Int("hole_num", holeNum),
+			zap.Int64("hole_start", holeStart),
+			zap.Int64("hole_stop", holeStop),
+		)
 	}
 	return nil
 }
@@ -708,12 +739,65 @@ func (r iterForAddKLines) Err() error {
 	return nil
 }
 
+func normalizeInsertKlines(arr []*banexg.Kline) ([]*banexg.Kline, int) {
+	if len(arr) <= 1 {
+		return arr, 0
+	}
+	items := make([]*banexg.Kline, len(arr))
+	copy(items, arr)
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Time < items[j].Time
+	})
+	out := make([]*banexg.Kline, 0, len(items))
+	dupNum := 0
+	for _, k := range items {
+		if len(out) == 0 || out[len(out)-1].Time != k.Time {
+			out = append(out, k)
+			continue
+		}
+		dupNum++
+		out[len(out)-1] = k
+	}
+	return out, dupNum
+}
+
+func (q *Queries) delKLinesByTimes(sid int32, timeFrame string, times []int64) *errs.Error {
+	if len(times) == 0 {
+		return nil
+	}
+	tblName := "kline_" + timeFrame
+	ctx := context.Background()
+	const batchRows = 500
+	for i := 0; i < len(times); i += batchRows {
+		j := min(len(times), i+batchRows)
+		var b strings.Builder
+		b.WriteString("delete from ")
+		b.WriteString(tblName)
+		b.WriteString(" where sid=$1 and time in (")
+		args := make([]any, 0, 1+(j-i))
+		args = append(args, sid)
+		for k := i; k < j; k++ {
+			if k > i {
+				b.WriteByte(',')
+			}
+			b.WriteString(fmt.Sprintf("$%d", (k-i)+2))
+			args = append(args, times[k])
+		}
+		b.WriteByte(')')
+		if _, err := q.db.Exec(ctx, b.String(), args...); err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
+	}
+	return nil
+}
+
 /*
 InsertKLines
 Only batch insert K-lines. To update associated information simultaneously, please use InsertKLinesAuto
 只批量插入K线，如需同时更新关联信息，请使用InsertKLinesAuto
 */
 func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline, delOnDump bool) (int64, *errs.Error) {
+	arr, dedupNum := normalizeInsertKlines(arr)
 	arrLen := len(arr)
 	if arrLen == 0 {
 		return 0, nil
@@ -721,7 +805,31 @@ func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline,
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	startMS, endMS := arr[0].Time, arr[arrLen-1].Time+tfMSecs
 	log.Debug("insert klines", zap.String("tf", timeFrame), zap.Int32("sid", sid),
-		zap.Int("num", arrLen), zap.Int64("start", startMS), zap.Int64("end", endMS))
+		zap.Int("num", arrLen), zap.Int("dedup", dedupNum), zap.Int64("start", startMS), zap.Int64("end", endMS))
+	if delOnDump {
+		if err := q.DelKLines(sid, timeFrame, startMS, endMS); err != nil {
+			return 0, err
+		}
+	} else {
+		times := make([]int64, 0, arrLen)
+		for _, row := range arr {
+			times = append(times, row.Time)
+		}
+		if err := q.delKLinesByTimes(sid, timeFrame, times); err != nil {
+			return 0, err
+		}
+	}
+	if allowKlineDiag(sid, "", timeFrame) {
+		log.Warn("kline diag insert prepare",
+			zap.Int32("sid", sid),
+			zap.String("tf", timeFrame),
+			zap.Int64("start", startMS),
+			zap.Int64("end", endMS),
+			zap.Int("arr_len", arrLen),
+			zap.Int("dedup", dedupNum),
+			zap.Bool("del_on_dump", delOnDump),
+		)
+	}
 	tblName := "kline_" + timeFrame
 	ctx := context.Background()
 	const colsPerRow = 11
@@ -1020,6 +1128,25 @@ order by time`, fromTbl), sid, aggStart, endMS)
 	err = q.updateKHoles(sid, item.TimeFrame, startMS, endMS, isCont)
 	if err != nil {
 		return err
+	}
+	if exs := GetSymbolByID(sid); allowKlineDiag(sid, func() string {
+		if exs == nil {
+			return ""
+		}
+		return exs.Symbol
+	}(), item.TimeFrame) {
+		log.Warn("kline diag refresh agg",
+			zap.Int32("sid", sid),
+			zap.String("tf", item.TimeFrame),
+			zap.String("from", aggFrom),
+			zap.Int("src_num", len(src)),
+			zap.Int("agg_num", len(aggBars)),
+			zap.Int64("org_start", orgStartMS),
+			zap.Int64("org_end", orgEndMS),
+			zap.Int64("agg_start", aggStart),
+			zap.Int64("save_start", startMS),
+			zap.Int64("save_end", endMS),
+		)
 	}
 	return nil
 }

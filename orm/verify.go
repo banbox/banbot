@@ -119,6 +119,31 @@ func VerifyDataRanges(args *VerifyArgs) ([]*VerifyTFResult, *errs.Error) {
 				tfRanges[r.Timeframe] = append(tfRanges[r.Timeframe], r)
 			}
 			for tf, ranges := range tfRanges {
+				if allowKlineDiag(sid, symbol, tf) {
+					var dataRanges, holeRanges []MSRange
+					for _, r := range ranges {
+						if r.HasData {
+							dataRanges = append(dataRanges, MSRange{Start: r.StartMs, Stop: r.StopMs})
+						} else {
+							holeRanges = append(holeRanges, MSRange{Start: r.StartMs, Stop: r.StopMs})
+						}
+					}
+					dataRanges = mergeMSRanges(dataRanges)
+					holeRanges = mergeMSRanges(holeRanges)
+					dNum, dStart, dStop := summarizeRangeBounds(dataRanges)
+					hNum, hStart, hStop := summarizeRangeBounds(holeRanges)
+					log.Warn("kline diag verify sranges",
+						zap.Int32("sid", sid),
+						zap.String("symbol", symbol),
+						zap.String("tf", tf),
+						zap.Int("data_num", dNum),
+						zap.Int64("data_start", dStart),
+						zap.Int64("data_stop", dStop),
+						zap.Int("hole_num", hNum),
+						zap.Int64("hole_start", hStart),
+						zap.Int64("hole_stop", hStop),
+					)
+				}
 				issues := verifyTFRanges(sess, sid, tf, ranges, args.BatchSize)
 				if len(issues) > 0 {
 					results = append(results, &VerifyTFResult{
@@ -146,6 +171,16 @@ func verifyTFRanges(sess *Queries, sid int32, timeFrame string, ranges []*SRange
 	for _, r := range ranges[1:] {
 		if r.StopMs > maxStop {
 			maxStop = r.StopMs
+		}
+	}
+	realMin, realMax, rangeErr := sess.getKLineTimeRange(sid, timeFrame)
+	if rangeErr == nil && realMin > 0 {
+		if realMin < minStart {
+			minStart = realMin
+		}
+		realMaxStop := realMax + tfMSecs
+		if realMaxStop > maxStop {
+			maxStop = realMaxStop
 		}
 	}
 

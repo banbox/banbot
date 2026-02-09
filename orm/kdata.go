@@ -211,6 +211,23 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		}
 	}
 	close(chanDown)
+	if allowKlineDiag(exs.ID, exs.Symbol, timeFrame) {
+		coverNum, coverStart, coverStop := summarizeRangeBounds(covered)
+		missNum, missStart, missStop := summarizeRangeBounds(missing)
+		log.Warn("kline diag down ranges",
+			zap.Int32("sid", exs.ID),
+			zap.String("symbol", exs.Symbol),
+			zap.String("tf", timeFrame),
+			zap.Int64("req_start", startMS),
+			zap.Int64("req_end", endMS),
+			zap.Int("covered_num", coverNum),
+			zap.Int64("covered_start", coverStart),
+			zap.Int64("covered_stop", coverStop),
+			zap.Int("missing_num", missNum),
+			zap.Int64("missing_start", missStart),
+			zap.Int64("missing_stop", missStop),
+		)
+	}
 	insId, err := AddInsJob(AddInsKlineParams{
 		Sid:       exs.ID,
 		Timeframe: timeFrame,
@@ -356,6 +373,23 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 					zap.String("err", updErr.Short()))
 			}
 		}
+	}
+	if allowKlineDiag(exs.ID, exs.Symbol, timeFrame) {
+		log.Warn("kline diag down result",
+			zap.Int32("sid", exs.ID),
+			zap.String("symbol", exs.Symbol),
+			zap.String("tf", timeFrame),
+			zap.Int("save_num", saveNum),
+			zap.Int64("real_start", realStart),
+			zap.Int64("real_end", realEnd),
+			zap.Int("succ_down", len(succDown)),
+			zap.String("out_err", func() string {
+				if outErr == nil {
+					return ""
+				}
+				return outErr.Short()
+			}()),
+		)
 	}
 	if len(succDown) > 0 {
 		for _, r := range mergeMSRanges(succDown) {
