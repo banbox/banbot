@@ -835,18 +835,8 @@ func tryInsertKlines(sess *Queries, tf string, sid int32, klines []*banexg.Kline
 	if len(klines) == 0 {
 		return nil
 	}
-	start := klines[0].Time
-	end := klines[len(klines)-1].Time + int64(utils.TFToSecs(tf)*1000)
-	oldNum := sess.GetKlineNum(sid, tf, start, end)
-	if oldNum >= len(klines) {
-		return nil
-	} else if oldNum > 0 {
-		err := sess.DelKLines(sid, tf, start, end)
-		if err != nil {
-			return err
-		}
-	}
-	_, err := sess.InsertKLines(tf, sid, klines, true)
+	// insert would update if duplicate in questdb
+	_, err := sess.InsertKLines(tf, sid, klines)
 	return err
 }
 

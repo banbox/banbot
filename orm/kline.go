@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sasha-s/go-deadlock"
@@ -37,7 +38,8 @@ var (
 		NewKlineAgg("1h", "kline_1h", "", "", "", "", "6 months", "3 years"),
 		NewKlineAgg("1d", "kline_1d", "1h", "3d", "1h", "1h", "3 years", "20 years"),
 	}
-	aggMap = make(map[string]*KlineAgg)
+	aggMap          = make(map[string]*KlineAgg)
+	klineDedupCache sync.Map // map[string]bool, key is table name like kline_1m
 )
 
 func init() {
@@ -775,49 +777,13 @@ func shouldIgnoreDeleteErr(err error) bool {
 	return false
 }
 
-func (q *Queries) delKLinesByTimes(sid int32, timeFrame string, times []int64) *errs.Error {
-	if len(times) == 0 {
-		return nil
-	}
-	tblName := "kline_" + timeFrame
-	ctx := context.Background()
-	const batchRows = 500
-	for i := 0; i < len(times); i += batchRows {
-		j := min(len(times), i+batchRows)
-		var b strings.Builder
-		b.WriteString("delete from ")
-		b.WriteString(tblName)
-		b.WriteString(" where sid=")
-		b.WriteString(strconv.FormatInt(int64(sid), 10))
-		b.WriteString(" and time in (")
-		for k := i; k < j; k++ {
-			if k > i {
-				b.WriteByte(',')
-			}
-			b.WriteString(strconv.FormatInt(times[k], 10))
-		}
-		b.WriteByte(')')
-		if _, err := q.db.Exec(ctx, b.String()); err != nil {
-			if shouldIgnoreDeleteErr(err) {
-				log.Warn("skip kline overwrite delete due to backend SQL limitation",
-					zap.Int32("sid", sid),
-					zap.String("tf", timeFrame),
-					zap.Error(err),
-				)
-				return nil
-			}
-			return NewDbErr(core.ErrDbExecFail, err)
-		}
-	}
-	return nil
-}
 
 /*
 InsertKLines
 Only batch insert K-lines. To update associated information simultaneously, please use InsertKLinesAuto
 只批量插入K线，如需同时更新关联信息，请使用InsertKLinesAuto
 */
-func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline, delOnDump bool) (int64, *errs.Error) {
+func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline) (int64, *errs.Error) {
 	arr, dedupNum := normalizeInsertKlines(arr)
 	arrLen := len(arr)
 	if arrLen == 0 {
@@ -826,20 +792,8 @@ func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline,
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	startMS, endMS := arr[0].Time, arr[arrLen-1].Time+tfMSecs
 	log.Debug("insert klines", zap.String("tf", timeFrame), zap.Int32("sid", sid),
-		zap.Int("num", arrLen), zap.Int("dedup", dedupNum), zap.Int64("start", startMS), zap.Int64("end", endMS))
-	if delOnDump {
-		if err := q.DelKLines(sid, timeFrame, startMS, endMS); err != nil {
-			return 0, err
-		}
-	} else {
-		times := make([]int64, 0, arrLen)
-		for _, row := range arr {
-			times = append(times, row.Time)
-		}
-		if err := q.delKLinesByTimes(sid, timeFrame, times); err != nil {
-			return 0, err
-		}
-	}
+		zap.Int("num", arrLen), zap.Int("dedup", dedupNum), 
+		zap.Int64("start", startMS), zap.Int64("end", endMS))
 	if allowKlineDiag(sid, "", timeFrame) {
 		log.Warn("kline diag insert prepare",
 			zap.Int32("sid", sid),
@@ -848,7 +802,6 @@ func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline,
 			zap.Int64("end", endMS),
 			zap.Int("arr_len", arrLen),
 			zap.Int("dedup", dedupNum),
-			zap.Bool("del_on_dump", delOnDump),
 		)
 	}
 	tblName := "kline_" + timeFrame
@@ -924,7 +877,7 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 			log.Warn("DelInsKline fail", zap.Int64("id", insId), zap.Error(err_))
 		}
 	}()
-	num, err := q.InsertKLines(timeFrame, exs.ID, arr, false)
+	num, err := q.InsertKLines(timeFrame, exs.ID, arr)
 	if err != nil {
 		return num, err
 	}
@@ -1135,7 +1088,7 @@ order by time`, fromTbl), sid, aggStart, endMS)
 	if len(aggBars) == 0 {
 		return nil
 	}
-	_, err := q.InsertKLines(item.TimeFrame, sid, aggBars, true)
+	_, err := q.InsertKLines(item.TimeFrame, sid, aggBars)
 	if err != nil {
 		return err
 	}

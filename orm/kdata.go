@@ -324,7 +324,7 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 				if !ok {
 					return
 				}
-				num, err := sess.InsertKLines(timeFrame, exs.ID, batch, false)
+				num, err := sess.InsertKLines(timeFrame, exs.ID, batch)
 				if err != nil {
 					setOutErr(err)
 					cancel()
