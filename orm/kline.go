@@ -761,6 +761,20 @@ func normalizeInsertKlines(arr []*banexg.Kline) ([]*banexg.Kline, int) {
 	return out, dupNum
 }
 
+func shouldIgnoreDeleteErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := strings.ToLower(err.Error())
+	if strings.Contains(errMsg, "unexpected token [from]") {
+		return true
+	}
+	if strings.Contains(errMsg, "where= from .") {
+		return true
+	}
+	return false
+}
+
 func (q *Queries) delKLinesByTimes(sid int32, timeFrame string, times []int64) *errs.Error {
 	if len(times) == 0 {
 		return nil
@@ -773,18 +787,25 @@ func (q *Queries) delKLinesByTimes(sid int32, timeFrame string, times []int64) *
 		var b strings.Builder
 		b.WriteString("delete from ")
 		b.WriteString(tblName)
-		b.WriteString(" where sid=$1 and time in (")
-		args := make([]any, 0, 1+(j-i))
-		args = append(args, sid)
+		b.WriteString(" where sid=")
+		b.WriteString(strconv.FormatInt(int64(sid), 10))
+		b.WriteString(" and time in (")
 		for k := i; k < j; k++ {
 			if k > i {
 				b.WriteByte(',')
 			}
-			b.WriteString(fmt.Sprintf("$%d", (k-i)+2))
-			args = append(args, times[k])
+			b.WriteString(strconv.FormatInt(times[k], 10))
 		}
 		b.WriteByte(')')
-		if _, err := q.db.Exec(ctx, b.String(), args...); err != nil {
+		if _, err := q.db.Exec(ctx, b.String()); err != nil {
+			if shouldIgnoreDeleteErr(err) {
+				log.Warn("skip kline overwrite delete due to backend SQL limitation",
+					zap.Int32("sid", sid),
+					zap.String("tf", timeFrame),
+					zap.Error(err),
+				)
+				return nil
+			}
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
 	}
