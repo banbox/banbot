@@ -894,14 +894,18 @@ UpdateKRange
 2. 搜索空洞，更新Khole
 3. 更新更大周期的连续聚合
 */
-func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS int64, klines []*banexg.Kline, aggBig bool) *errs.Error {
+func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS int64, klines []*banexg.Kline, aggBig bool, skipHoles ...bool) *errs.Error {
 	// Record data ranges in sranges (non-contiguous allowed).
 	if err := updateKLineRange(exs.ID, timeFrame, startMS, endMS); err != nil {
 		return err
 	}
 	// Search for holes and update sranges (has_data=false).
-	if err := q.updateKHoles(exs.ID, timeFrame, startMS, endMS, true); err != nil {
-		return err
+	// Skip when caller handles holes separately (e.g. downOHLCV2DBRange),
+	// to avoid QuestDB WAL lag causing freshly inserted bars to appear missing.
+	if len(skipHoles) == 0 || !skipHoles[0] {
+		if err := q.updateKHoles(exs.ID, timeFrame, startMS, endMS, true); err != nil {
+			return err
+		}
 	}
 	if !aggBig {
 		return nil
@@ -1092,14 +1096,13 @@ order by time`, fromTbl), sid, aggStart, endMS)
 	if err != nil {
 		return err
 	}
+	// Use actual inserted bar range for srange update
+	// 使用实际插入的bar范围更新srange
+	saveStart := aggBars[0].Time
+	saveEnd := aggBars[len(aggBars)-1].Time + tfMSecs
 	// Update the effective range of intervals
 	// 更新有效区间范围
-	err = updateKLineRange(sid, item.TimeFrame, startMS, endMS)
-	if err != nil {
-		return err
-	}
-	// Search for holes, update sranges.
-	err = q.updateKHoles(sid, item.TimeFrame, startMS, endMS, isCont)
+	err = updateKLineRange(sid, item.TimeFrame, saveStart, saveEnd)
 	if err != nil {
 		return err
 	}
@@ -1118,8 +1121,8 @@ order by time`, fromTbl), sid, aggStart, endMS)
 			zap.Int64("org_start", orgStartMS),
 			zap.Int64("org_end", orgEndMS),
 			zap.Int64("agg_start", aggStart),
-			zap.Int64("save_start", startMS),
-			zap.Int64("save_end", endMS),
+			zap.Int64("save_start", saveStart),
+			zap.Int64("save_end", saveEnd),
 		)
 	}
 	return nil

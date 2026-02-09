@@ -364,7 +364,7 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	}
 
 	if saveNum > 0 {
-		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, nil, true)
+		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, nil, true, true)
 		if updErr != nil {
 			if outErr == nil {
 				outErr = updErr
@@ -390,18 +390,6 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 				return outErr.Short()
 			}()),
 		)
-	}
-	if len(succDown) > 0 {
-		for _, r := range mergeMSRanges(succDown) {
-			if err := sess.updateKHoles(exs.ID, timeFrame, r.Start, r.Stop, false); err != nil {
-				if outErr == nil {
-					outErr = err
-				} else {
-					log.Warn("updateKHoles fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame),
-						zap.Int64("start", r.Start), zap.Int64("stop", r.Stop), zap.String("err", err.Short()))
-				}
-			}
-		}
 	}
 	return saveNum, outErr
 }
