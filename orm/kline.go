@@ -1225,7 +1225,20 @@ func (q *Queries) DelKLines(sid int32, timeFrame string, startMS, endMS int64) *
 	if endMS > 0 {
 		sql += fmt.Sprintf(" and time < %v", endMS)
 	}
-	return q.Exec(sql)
+	if _, err := q.db.Exec(context.Background(), sql); err != nil {
+		if shouldIgnoreDeleteErr(err) {
+			log.Warn("skip kline range delete due to backend SQL limitation",
+				zap.Int32("sid", sid),
+				zap.String("tf", timeFrame),
+				zap.Int64("start", startMS),
+				zap.Int64("end", endMS),
+				zap.Error(err),
+			)
+			return nil
+		}
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	return nil
 }
 
 func mapToItems[T any](rows pgx.Rows, err_ error, assign func() (T, []any)) ([]T, error) {
