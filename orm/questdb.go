@@ -2,6 +2,7 @@ package orm
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -11,9 +12,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
@@ -122,6 +125,9 @@ func startAndWait(bin, dataDir string, port uint16) *errs.Error {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return errs.NewMsg(core.ErrDbConnFail, "mkdir dataDir %s: %v", dataDir, err)
 	}
+	if err := applyQdbMemConfig(dataDir); err != nil {
+		return err
+	}
 	if runtime.GOOS == "windows" {
 		// On Windows, "questdb.exe start" installs a service requiring Administrator.
 		// Run interactively as a background process instead; it uses cwd as root dir.
@@ -141,6 +147,161 @@ func startAndWait(bin, dataDir string, port uint16) *errs.Error {
 		}
 	}
 	return waitForPort(port)
+}
+
+const (
+	qdbMemPctDefault   = 0.3
+	qdbMaxMemMBDefault = 16384
+	qdbMinMemMB        = 500
+)
+
+// applyQdbMemConfig detects system memory and writes QuestDB server.conf with
+// appropriate JVM heap and O3 column memory settings.
+func applyQdbMemConfig(dataDir string) *errs.Error {
+	totalMB := sysTotalMemMB()
+	if totalMB <= 0 {
+		log.Warn("cannot detect system memory, skip QuestDB memory tuning")
+		return nil
+	}
+	dbCfg := config.Database
+	memPct := qdbMemPctDefault
+	maxMemMB := qdbMaxMemMBDefault
+	if dbCfg != nil {
+		if dbCfg.QdbMemPct > 0 && dbCfg.QdbMemPct <= 1 {
+			memPct = dbCfg.QdbMemPct
+		}
+		if dbCfg.QdbMaxMemMB > 0 {
+			maxMemMB = dbCfg.QdbMaxMemMB
+		}
+	}
+	allocMB := int(float64(totalMB) * memPct)
+	if allocMB < qdbMinMemMB {
+		allocMB = qdbMinMemMB
+	}
+	if allocMB > maxMemMB {
+		allocMB = maxMemMB
+	}
+	// JVM heap = 1/3 of allocated memory (rest for off-heap / OS page cache)
+	heapMB := allocMB / 3
+	if heapMB < 128 {
+		heapMB = 128
+	}
+	// O3 column memory size: scale down on small machines
+	o3ColMem := "8M"
+	if totalMB <= 4096 {
+		o3ColMem = "1M"
+	} else if totalMB <= 8192 {
+		o3ColMem = "4M"
+	}
+	// Worker count: limit on small machines
+	workers := runtime.NumCPU()
+	if workers > 4 && totalMB <= 4096 {
+		workers = 2
+	}
+
+	confDir := filepath.Join(dataDir, "conf")
+	if err := os.MkdirAll(confDir, 0755); err != nil {
+		return errs.NewMsg(core.ErrDbConnFail, "mkdir conf %s: %v", confDir, err)
+	}
+	confPath := filepath.Join(confDir, "server.conf")
+	// Read existing config, update only managed keys
+	managed := map[string]string{
+		"cairo.o3.column.memory.size": o3ColMem,
+		"shared.worker.count":         strconv.Itoa(workers),
+	}
+	existing := readConfFile(confPath)
+	for k, v := range managed {
+		existing[k] = v
+	}
+	if err := writeConfFile(confPath, existing); err != nil {
+		return errs.NewMsg(core.ErrDbConnFail, "write server.conf: %v", err)
+	}
+	// Set JVM heap via environment variable
+	javaOpts := fmt.Sprintf("-Xms%dm -Xmx%dm", heapMB, heapMB)
+	os.Setenv("QDB_JAVA_OPTS", javaOpts)
+	log.Info("QuestDB memory config applied",
+		zap.Int("totalMB", totalMB), zap.Int("allocMB", allocMB),
+		zap.Int("heapMB", heapMB), zap.String("o3ColMem", o3ColMem),
+		zap.Int("workers", workers))
+	return nil
+}
+
+// sysTotalMemMB returns total physical memory in MB. Returns 0 on failure.
+func sysTotalMemMB() int {
+	switch runtime.GOOS {
+	case "linux":
+		data, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			return 0
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					kb, _ := strconv.Atoi(fields[1])
+					return kb / 1024
+				}
+			}
+		}
+	case "darwin":
+		out, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
+		if err != nil {
+			return 0
+		}
+		b, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+		return int(b / 1024 / 1024)
+	case "windows":
+		out, err := exec.Command("wmic", "ComputerSystem", "get", "TotalPhysicalMemory").Output()
+		if err != nil {
+			return 0
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "Total") {
+				continue
+			}
+			b, _ := strconv.ParseInt(line, 10, 64)
+			if b > 0 {
+				return int(b / 1024 / 1024)
+			}
+		}
+	}
+	return 0
+}
+
+// readConfFile reads a QuestDB server.conf into a key=value map.
+func readConfFile(path string) map[string]string {
+	result := make(map[string]string)
+	f, err := os.Open(path)
+	if err != nil {
+		return result
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if idx := strings.IndexByte(line, '='); idx > 0 {
+			result[strings.TrimSpace(line[:idx])] = strings.TrimSpace(line[idx+1:])
+		}
+	}
+	return result
+}
+
+// writeConfFile writes a key=value map to a QuestDB server.conf file.
+func writeConfFile(path string, kv map[string]string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	for k, v := range kv {
+		fmt.Fprintf(w, "%s=%s\n", k, v)
+	}
+	return w.Flush()
 }
 
 // waitForPort polls the PGWire port until it is reachable or timeout.

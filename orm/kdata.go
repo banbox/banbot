@@ -983,42 +983,30 @@ func GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start, stop int64, 
 	return res, nil
 }
 
-func (q *Queries) DelKData(exs *ExSymbol, tfList []string, startMS, endMS int64) *errs.Error {
+func (q *Queries) DelKData(exsList []*ExSymbol, tfList []string, startMS, endMS int64) *errs.Error {
+	pq := PubQ()
 	for _, tf := range tfList {
-		err := q.DelKLines(exs.ID, tf, startMS, endMS)
-		if err != nil {
-			return err
-		}
-		// QuestDB: kinfo/khole are replaced by sranges, delete sranges metadata first.
-		if err = PubQ().DelKInfo(exs.ID, tf); err != nil {
-			return err
-		}
-		// For partial deletes, rebuild sranges based on remaining data (similar to TimescaleDB's
-		// "recalc kinfo + update kholes" behavior).
-		if startMS > 0 || endMS > 0 {
-			realStart, realEnd, err2 := q.CalcKLineRange(exs.ID, tf, 0, 0)
-			if err2 != nil {
-				return err2
-			}
-			if realStart > 0 && realEnd > realStart {
-				if err3 := PubQ().UpdateSRanges(context.Background(), exs.ID, "kline_"+tf, tf, realStart, realEnd, true); err3 != nil {
-					return NewDbErr(core.ErrDbExecFail, err3)
-				}
-				if err2 := q.updateKHoles(exs.ID, tf, realStart, realEnd, false); err2 != nil {
-					return err2
-				}
-			}
-		}
-		if endMS == 0 {
-			err = PubQ().DelKLineUn(exs.ID, tf)
-			if err != nil {
+		for _, exs := range exsList {
+			if err := pq.DelKInfo(exs.ID, tf); err != nil {
 				return err
+			}
+			if endMS == 0 {
+				if err := pq.DelKLineUn(exs.ID, tf); err != nil {
+					return err
+				}
 			}
 		}
 	}
-	err := PubQ().DelFactors(exs.ID, startMS, endMS)
-	if err != nil {
-		return err
+	for _, tf := range tfList {
+		err := q.DelKLines(tf)
+		if err != nil {
+			return err
+		}
+	}
+	for _, exs := range exsList {
+		if err := pq.DelFactors(exs.ID, startMS, endMS); err != nil {
+			return err
+		}
 	}
 	return nil
 }

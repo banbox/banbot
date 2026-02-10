@@ -209,26 +209,22 @@ func runPurgeData(args *DataToolsArgs, pb *utils.StagedPrg) *errs.Error {
 	}
 	defer conn.Release()
 
-	pBar := utils.NewPrgBar(len(args.Pairs), "Purge")
-	pBar.PrgCbs = append(pBar.PrgCbs, func(done int, total int) {
-		pb.SetProgress("purge", float64(done)/float64(total))
-	})
-	defer pBar.Close()
 	exsMap := make(map[string]bool)
+	var exsList []*orm.ExSymbol
 	for _, pair := range args.Pairs {
-		if _, ok := exsMap[pair]; ok {
-			pBar.Add(1)
+		if exsMap[pair] {
 			continue
 		}
 		exsMap[pair] = true
 		exs := orm.GetExSymbol2(args.Exchange, args.Market, pair)
-		err = sess.DelKData(exs, args.Periods, args.StartMs, args.EndMs)
-		if err != nil {
-			return err
+		if exs != nil {
+			exsList = append(exsList, exs)
 		}
-		pBar.Add(1)
 	}
-
+	err = sess.DelKData(exsList, args.Periods, args.StartMs, args.EndMs)
+	if err != nil {
+		return err
+	}
 	log.Info("purge data completed")
 	return nil
 }

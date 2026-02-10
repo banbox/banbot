@@ -535,14 +535,9 @@ func PurgeKlines(args *config.CmdArgs) *errs.Error {
 	}
 	// 删除符合要求的数据
 	// Delete the data that meets the requirements
-	pBar := utils.NewPrgBar(len(exsList), "purge")
-	defer pBar.Close()
-	for _, exs := range exsList {
-		pBar.Add(1)
-		err := sess.DelKData(exs, tfList, 0, 0)
-		if err != nil {
-			return err
-		}
+	err = sess.DelKData(exsList, tfList, 0, 0)
+	if err != nil {
+		return err
 	}
 	log.Info("all purge complete")
 	return nil

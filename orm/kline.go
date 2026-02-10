@@ -847,38 +847,6 @@ func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS i
 	return q.updateBigHyper(exs, timeFrame, startMS, endMS)
 }
 
-/*
-CalcKLineRange
-Calculate the effective range of the specified period K-line within the specified range.
-计算指定周期K线在指定范围内，有效区间。
-*/
-func (q *Queries) CalcKLineRange(sid int32, timeFrame string, start, end int64) (int64, int64, *errs.Error) {
-	tblName := "kline_" + timeFrame
-	sql := fmt.Sprintf("select min(time),max(time) from %s where sid=%v", tblName, sid)
-	if start > 0 {
-		sql += fmt.Sprintf(" and time>=%v", start)
-	}
-	if end > 0 {
-		sql += fmt.Sprintf(" and time<%v", end)
-	}
-	ctx := context.Background()
-	row := q.db.QueryRow(ctx, sql)
-	var realStart, realEnd *int64
-	err_ := row.Scan(&realStart, &realEnd)
-	if err_ != nil {
-		return 0, 0, NewDbErr(core.ErrDbReadFail, err_)
-	}
-	if realEnd == nil {
-		realStart = new(int64)
-		realEnd = new(int64)
-	}
-	if *realEnd > 0 {
-		// 修正为实际结束时间
-		*realEnd += int64(utils2.TFToSecs(timeFrame) * 1000)
-	}
-	return *realStart, *realEnd, nil
-}
-
 func (q *Queries) CalcKLineRanges(timeFrame string, sids map[int32]bool) (map[int32][2]int64, *errs.Error) {
 	tblName := "kline_" + timeFrame
 	if len(sids) > 0 {
@@ -1086,17 +1054,123 @@ func GetDownTF(timeFrame string) (string, *errs.Error) {
 	return "1m", nil
 }
 
-func (q *Queries) DelKLines(sid int32, timeFrame string, startMS, endMS int64) *errs.Error {
-	sql := fmt.Sprintf("delete from kline_%s where sid=%v", timeFrame, sid)
-	if startMS > 0 {
-		sql += fmt.Sprintf(" and time >= %v", startMS)
+/*
+DelKLines
+通过重写表的方式删除不在sranges和exsymbol中的K线数据。
+先计算涵盖的K线数量占比，不足50%时才执行删除，否则跳过。
+*/
+func (q *Queries) DelKLines(timeFrame string) *errs.Error {
+	tblName := "kline_" + timeFrame
+	ctx := context.Background()
+	// 1. 获取sranges中有数据的sid集合
+	db, err := BanPubConn(false)
+	if err != nil {
+		return err
 	}
-	if endMS > 0 {
-		sql += fmt.Sprintf(" and time < %v", endMS)
+	rows, err_ := db.QueryContext(ctx, `select distinct sid from sranges where tbl=? and has_data=1`, tblName)
+	if err_ != nil {
+		db.Close()
+		return NewDbErr(core.ErrDbReadFail, err_)
 	}
-	if _, err := q.db.Exec(context.Background(), sql); err != nil {
-		return NewDbErr(core.ErrDbExecFail, err)
+	srangeSids := make(map[int32]bool)
+	for rows.Next() {
+		var sid int32
+		if err_ = rows.Scan(&sid); err_ != nil {
+			rows.Close()
+			db.Close()
+			return NewDbErr(core.ErrDbReadFail, err_)
+		}
+		srangeSids[sid] = true
 	}
+	rows.Close()
+	// 2. 获取exsymbol中所有sid集合
+	rows, err_ = db.QueryContext(ctx, `select id from exsymbol`)
+	if err_ != nil {
+		db.Close()
+		return NewDbErr(core.ErrDbReadFail, err_)
+	}
+	exsSids := make(map[int32]bool)
+	for rows.Next() {
+		var sid int32
+		if err_ = rows.Scan(&sid); err_ != nil {
+			rows.Close()
+			db.Close()
+			return NewDbErr(core.ErrDbReadFail, err_)
+		}
+		exsSids[sid] = true
+	}
+	rows.Close()
+	db.Close()
+	// 3. 取交集：同时在sranges和exsymbol中的sid
+	var validSids []string
+	for sid := range srangeSids {
+		if exsSids[sid] {
+			validSids = append(validSids, strconv.Itoa(int(sid)))
+		}
+	}
+	if len(validSids) == 0 {
+		log.Info("DelKLines: no valid sids, skip", zap.String("tf", timeFrame))
+		return nil
+	}
+	sidIn := strings.Join(validSids, ",")
+	// 4. 统计总数据量和涵盖的数据量
+	row := q.db.QueryRow(ctx, fmt.Sprintf("select count(0) from %s", tblName))
+	var totalCount int64
+	if err_ = row.Scan(&totalCount); err_ != nil {
+		return NewDbErr(core.ErrDbReadFail, err_)
+	}
+	if totalCount == 0 {
+		return nil
+	}
+	row = q.db.QueryRow(ctx, fmt.Sprintf("select count(0) from %s where sid in (%s)", tblName, sidIn))
+	var coveredCount int64
+	if err_ = row.Scan(&coveredCount); err_ != nil {
+		return NewDbErr(core.ErrDbReadFail, err_)
+	}
+	ratio := float64(coveredCount) / float64(totalCount)
+	if ratio >= 0.5 {
+		log.Info("DelKLines: covered ratio >= 50%, skip rewrite",
+			zap.String("tf", timeFrame), zap.Int64("total", totalCount),
+			zap.Int64("covered", coveredCount), zap.String("ratio", fmt.Sprintf("%.1f%%", ratio*100)))
+		return nil
+	}
+	// 5. 估算时间并输出日志
+	// QuestDB大约每秒处理100万行复制
+	estSecs := float64(coveredCount) / 1_000_000
+	if estSecs < 1 {
+		estSecs = 1
+	}
+	log.Info("DelKLines: rewriting table, please wait...",
+		zap.String("tf", timeFrame), zap.Int64("total", totalCount),
+		zap.Int64("keep", coveredCount), zap.Int64("remove", totalCount-coveredCount),
+		zap.String("ratio", fmt.Sprintf("%.1f%%", ratio*100)),
+		zap.Int("est_secs", int(estSecs)))
+	// 6. 重写表：创建新表 -> 复制数据 -> 删除旧表 -> 重命名
+	partMap := map[string]string{
+		"1m": "week", "5m": "month", "15m": "month", "1h": "year", "1d": "year",
+	}
+	partBy, ok := partMap[timeFrame]
+	if !ok {
+		return errs.NewMsg(core.ErrInvalidTF, "unsupported tf for rewrite: %s", timeFrame)
+	}
+	tmpTbl := tblName + "_new"
+	createSQL := fmt.Sprintf(`create table %s as (
+select sid,ts,time,open,high,low,close,volume,quote,buy_volume,trade_num
+from %s where sid in (%s)
+) timestamp(ts) partition by %s dedup upsert keys(sid, ts)`, tmpTbl, tblName, sidIn, partBy)
+	if _, err_ = q.db.Exec(ctx, createSQL); err_ != nil {
+		return NewDbErr(core.ErrDbExecFail, err_)
+	}
+	if _, err_ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tblName)); err_ != nil {
+		// 尝试清理临时表
+		_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
+		return NewDbErr(core.ErrDbExecFail, err_)
+	}
+	if _, err_ = q.db.Exec(ctx, fmt.Sprintf("rename table %s to %s", tmpTbl, tblName)); err_ != nil {
+		return NewDbErr(core.ErrDbExecFail, err_)
+	}
+	log.Info("DelKLines: table rewrite done",
+		zap.String("tf", timeFrame), zap.Int64("kept", coveredCount))
 	return nil
 }
 
@@ -1263,18 +1337,14 @@ func SyncKlineTFs(args *config.CmdArgs, pb *utils.StagedPrg) *errs.Error {
 }
 
 func syncKlineInfos(sess *Queries, sids map[int32]string, prg utils.PrgCB) *errs.Error {
-	// Build sid filter for CalcKLineRanges.
-	sidFilter := make(map[int32]bool)
+	// Build sid filter for GetKlineRanges (sranges-based, avoids soft-deleted data in QuestDB).
+	sidFilter := make([]int32, 0, len(sids))
 	for sid := range sids {
-		sidFilter[sid] = true
+		sidFilter = append(sidFilter, sid)
 	}
 	calcs := make(map[string]map[int32][2]int64)
 	for _, agg := range aggList {
-		ranges, err := sess.CalcKLineRanges(agg.TimeFrame, sidFilter)
-		if err != nil {
-			return err
-		}
-		calcs[agg.TimeFrame] = ranges
+		calcs[agg.TimeFrame] = PubQ().GetKlineRanges(sidFilter, agg.TimeFrame)
 	}
 	// Decide which sids to process.
 	sidList := make([]int32, 0)
@@ -1290,6 +1360,10 @@ func syncKlineInfos(sess *Queries, sids map[int32]string, prg utils.PrgCB) *errs
 					continue
 				}
 				seen[sid] = true
+				// Skip sids not in exsymbol to avoid reviving soft-deleted data
+				if GetSymbolByID(sid) == nil {
+					continue
+				}
 				sidList = append(sidList, sid)
 			}
 		}
@@ -1402,10 +1476,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 	log.Info("Updating pending insert jobs", zap.Int("num", len(items)))
 	for _, i := range items {
 		if i.StartMs > 0 && i.StopMs > 0 {
-			start, end, err := q.CalcKLineRange(i.Sid, i.Timeframe, i.StartMs, i.StopMs)
-			if err != nil {
-				return err
-			}
+			start, end := PubQ().GetKlineRange(i.Sid, i.Timeframe)
 			if start > 0 && end > 0 {
 				exs := GetSymbolByID(i.Sid)
 				if exs != nil {

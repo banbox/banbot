@@ -112,6 +112,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - tools.go
 
 ### `orm/` (数据库交互)
+- questdb已启用插入重复时更新，不支持删除，实现了DelKLines支持根据sranges判断软删除的数据过多时重建表。
 - base.go: 数据库连接池初始化,管理QuestDB(PGWire)连接池和SQLite连接池(`banpub.db`/`orders_ban.db`),支持连接追踪。
 - db.go: sqlc生成的DBTX/Queries基础封装（QuestDB PGWire接口）。
 - banpub.go: `banpub.db`（SQLite）连接和事务管理,存储公共元数据。
@@ -127,7 +128,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - kdata.pb.go: K线数据块的Protobuf定义。
 - srange.go / srange_query.go: `sranges` 范围管理（支持不连续）。
 - models.go: 表结构体（含 `SRange` 等）。
-- tools.go
+- tools.go: 工具函数：导入导出K线、时序数据、关系数据等
 - types.go: ORM层自定义的数据结构。
 
 ### `orm/ormo/` (订单数据库)

@@ -936,6 +936,8 @@ func (c *Config) Desensitize() *Config {
 			Retention:   c.Database.Retention,
 			MaxPoolSize: c.Database.MaxPoolSize,
 			AutoCreate:  c.Database.AutoCreate,
+			QdbMemPct:   c.Database.QdbMemPct,
+			QdbMaxMemMB: c.Database.QdbMaxMemMB,
 		}
 	}
 
