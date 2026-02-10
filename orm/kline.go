@@ -65,17 +65,17 @@ func (q *Queries) QueryOHLCV(exs *ExSymbol, timeframe string, startMs, endMs int
 		// No start time provided, quantity limit provided, search in reverse chronological order
 		// 未提供开始时间，提供了数量限制，按时间倒序搜索
 		dctSql = fmt.Sprintf(`
-select time,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
-where sid=%d and time < %v
-order by time desc`, exs.ID, finishEndMS)
+select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
+where sid=%d and ts < cast(%v as timestamp)
+order by ts desc`, exs.ID, finishEndMS*1000)
 	} else {
 		if limit == 0 {
 			limit = int((finishEndMS-startMs)/tfMSecs) + 1
 		}
 		dctSql = fmt.Sprintf(`
-select time,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
-where sid=%d and time >= %v and time < %v
-order by time`, exs.ID, startMs, finishEndMS)
+select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
+where sid=%d and ts >= cast(%v as timestamp) and ts < cast(%v as timestamp)
+order by ts`, exs.ID, startMs*1000, finishEndMS*1000)
 	}
 	subTF, rows, err_ := queryHyper(q, timeframe, dctSql, limit)
 	klines, err_ := mapToKlines(rows, err_)
@@ -140,9 +140,9 @@ func (q *Queries) QueryOHLCVBatch(exsMap map[int32]*ExSymbol, timeframe string, 
 	}
 	sidText := strings.Join(sidTA, ", ")
 	dctSql := fmt.Sprintf(`
-select time,open,high,low,close,volume,quote,buy_volume,trade_num,sid from $tbl
-where time >= %v and time < %v and sid in (%v)
-order by sid,time`, startMs, finishEndMS, sidText)
+select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num,sid from $tbl
+where ts >= cast(%v as timestamp) and ts < cast(%v as timestamp) and sid in (%v)
+order by sid,ts`, startMs*1000, finishEndMS*1000, sidText)
 	subTF, rows, err_ := queryHyper(q, timeframe, dctSql, 0)
 	arrs, err_ := mapToItems(rows, err_, func() (*KlineSid, []any) {
 		var i KlineSid
@@ -202,9 +202,9 @@ order by sid,time`, startMs, finishEndMS, sidText)
 func (q *Queries) getKLineTimes(sid int32, timeframe string, startMs, endMs int64) ([]int64, *errs.Error) {
 	tblName := "kline_" + timeframe
 	dctSql := fmt.Sprintf(`
-select time from %s
-where sid=%d and time >= %v and time < %v
-order by time`, tblName, sid, startMs, endMs)
+select cast(ts as long)/1000 from %s
+where sid=%d and ts >= cast(%v as timestamp) and ts < cast(%v as timestamp)
+order by ts`, tblName, sid, startMs*1000, endMs*1000)
 	rows, err_ := q.db.Query(context.Background(), dctSql)
 	res, err_ := mapToItems(rows, err_, func() (*int64, []any) {
 		var t int64
@@ -222,7 +222,7 @@ order by time`, tblName, sid, startMs, endMs)
 
 func (q *Queries) getKLineTimeRange(sid int32, timeframe string) (int64, int64, *errs.Error) {
 	tblName := "kline_" + timeframe
-	sql := fmt.Sprintf("select min(time), max(time) from %s where sid=%d", tblName, sid)
+	sql := fmt.Sprintf("select min(cast(ts as long)/1000), max(cast(ts as long)/1000) from %s where sid=%d", tblName, sid)
 	row := q.db.QueryRow(context.Background(), sql)
 	var minTime, maxTime *int64
 	if err := row.Scan(&minTime, &maxTime); err != nil {
@@ -533,9 +533,9 @@ func queryKlinesRange(sess *Queries, sid int32, timeFrame string, startMS, endMS
 		return nil, nil
 	}
 	sql := fmt.Sprintf(`
-select time,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
-where sid=%d and time >= %v and time < %v
-order by time`, sid, startMS, endMS)
+select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
+where sid=%d and ts >= cast(%v as timestamp) and ts < cast(%v as timestamp)
+order by ts`, sid, startMS*1000, endMS*1000)
 	subTF, rows, err_ := queryHyper(sess, timeFrame, sql, 0)
 	klines, err := mapToKlines(rows, err_)
 	if err != nil {
@@ -738,7 +738,7 @@ func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline)
 		zap.Int("num", arrLen), zap.Int64("start", startMS), zap.Int64("end", endMS))
 	tblName := "kline_" + timeFrame
 	ctx := context.Background()
-	const colsPerRow = 11
+	const colsPerRow = 10
 	const batchRows = 500
 	var total int64
 	for i := 0; i < arrLen; i += batchRows {
@@ -746,19 +746,18 @@ func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline)
 		var b strings.Builder
 		b.WriteString("insert into ")
 		b.WriteString(tblName)
-		b.WriteString(" (sid, ts, time, open, high, low, close, volume, quote, buy_volume, trade_num) values ")
+		b.WriteString(" (sid, ts, open, high, low, close, volume, quote, buy_volume, trade_num) values ")
 		args := make([]any, 0, (j-i)*colsPerRow)
 		for k := i; k < j; k++ {
 			if k > i {
 				b.WriteByte(',')
 			}
 			p := (k-i)*colsPerRow + 1
-			b.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)", p, p+1, p+2, p+3, p+4, p+5, p+6, p+7, p+8, p+9, p+10))
+			b.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)", p, p+1, p+2, p+3, p+4, p+5, p+6, p+7, p+8, p+9))
 			kk := arr[k]
 			args = append(args,
 				sid,
 				time.UnixMilli(kk.Time).UTC(),
-				kk.Time,
 				kk.Open,
 				kk.High,
 				kk.Low,
@@ -863,7 +862,7 @@ func (q *Queries) CalcKLineRanges(timeFrame string, sids map[int32]bool) (map[in
 		b.WriteRune(')')
 		tblName += b.String()
 	}
-	sql := fmt.Sprintf("select sid,min(time),max(time) from %s group by sid", tblName)
+	sql := fmt.Sprintf("select sid,min(cast(ts as long)/1000),max(cast(ts as long)/1000) from %s group by sid", tblName)
 	ctx := context.Background()
 	rows, err_ := q.db.Query(ctx, sql)
 	if err_ != nil {
@@ -957,10 +956,10 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	fromTbl := "kline_" + aggFrom
 	ctx := context.Background()
 	rows, err_ := q.db.Query(ctx, fmt.Sprintf(`
-select time,open,high,low,close,volume,quote,buy_volume,trade_num
+select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num
 from %s
-where sid=$1 and time >= $2 and time < $3
-order by time`, fromTbl), sid, aggStart, endMS)
+where sid=$1 and ts >= $2 and ts < $3
+order by ts`, fromTbl), sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endMS).UTC())
 	src, err_ := mapToKlines(rows, err_)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
@@ -1015,8 +1014,8 @@ func NewKlineAgg(TimeFrame, Table, AggFrom, AggStart, AggEnd, AggEvery, CpsBefor
 }
 
 func (q *Queries) GetKlineNum(sid int32, timeFrame string, start, end int64) int {
-	sql := fmt.Sprintf("select count(0) from kline_%s where sid=%v and time>=%v and time<%v",
-		timeFrame, sid, start, end)
+	sql := fmt.Sprintf("select count(0) from kline_%s where sid=%v and ts>=cast(%v as timestamp) and ts<cast(%v as timestamp)",
+		timeFrame, sid, start*1000, end*1000)
 	row := q.db.QueryRow(context.Background(), sql)
 	var num int
 	_ = row.Scan(&num)
@@ -1155,7 +1154,7 @@ func (q *Queries) DelKLines(timeFrame string) *errs.Error {
 	}
 	tmpTbl := tblName + "_new"
 	createSQL := fmt.Sprintf(`create table %s as (
-select sid,ts,time,open,high,low,close,volume,quote,buy_volume,trade_num
+select sid,ts,open,high,low,close,volume,quote,buy_volume,trade_num
 from %s where sid in (%s)
 ) timestamp(ts) partition by %s dedup upsert keys(sid, ts)`, tmpTbl, tblName, sidIn, partBy)
 	if _, err_ = q.db.Exec(ctx, createSQL); err_ != nil {

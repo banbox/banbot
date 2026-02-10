@@ -7,7 +7,6 @@
 create table if not exists kline_1m (
   sid int,
   ts timestamp,
-  time long,
   open double,
   high double,
   low double,
@@ -21,7 +20,6 @@ create table if not exists kline_1m (
 create table if not exists kline_5m (
   sid int,
   ts timestamp,
-  time long,
   open double,
   high double,
   low double,
@@ -35,7 +33,6 @@ create table if not exists kline_5m (
 create table if not exists kline_15m (
   sid int,
   ts timestamp,
-  time long,
   open double,
   high double,
   low double,
@@ -49,7 +46,6 @@ create table if not exists kline_15m (
 create table if not exists kline_1h (
   sid int,
   ts timestamp,
-  time long,
   open double,
   high double,
   low double,
@@ -63,7 +59,6 @@ create table if not exists kline_1h (
 create table if not exists kline_1d (
   sid int,
   ts timestamp,
-  time long,
   open double,
   high double,
   low double,
@@ -73,4 +68,3 @@ create table if not exists kline_1d (
   buy_volume double,
   trade_num long
 ) timestamp(ts) partition by year dedup upsert keys(sid, ts);
-
