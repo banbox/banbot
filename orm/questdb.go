@@ -20,6 +20,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"github.com/schollz/progressbar/v3"
 	"go.uber.org/zap"
 )
 
@@ -365,9 +366,13 @@ func installQdbBinary(platform string) *errs.Error {
 
 	installDir := qdbInstallPath()
 
-	if err2 := extractTarGz(resp.Body, installDir); err2 != nil {
+	bar := progressbar.DefaultBytes(resp.ContentLength, "downloading QuestDB")
+	reader := io.TeeReader(resp.Body, bar)
+
+	if err2 := extractTarGz(reader, installDir); err2 != nil {
 		return err2
 	}
+	_ = bar.Close()
 	log.Info("QuestDB installed", zap.String("dir", installDir))
 	return nil
 }
