@@ -265,7 +265,7 @@ func isLocalHost(host string) bool {
 	if host == "" {
 		return false
 	}
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "host.docker.internal" {
 		return true
 	}
 	return false
