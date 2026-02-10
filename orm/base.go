@@ -244,18 +244,14 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	defer pingCancel()
 	if err_ = dbPool.Ping(pingCtx); err_ != nil {
 		dbPool.Close()
-		if !utils2.IsDocker() {
-			if ensureErr := ensureQuestDB(poolCfg.ConnConfig.Port); ensureErr != nil {
-				return nil, ensureErr
-			}
-			// Retry after QuestDB is started.
-			retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer retryCancel()
-			dbPool, err_ = pgxpool.NewWithConfig(retryCtx, poolCfg)
-			if err_ != nil {
-				return nil, errs.New(core.ErrDbConnFail, err_)
-			}
-		} else {
+		if ensureErr := ensureQuestDB(poolCfg.ConnConfig.Port); ensureErr != nil {
+			return nil, ensureErr
+		}
+		// Retry after QuestDB is started.
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer retryCancel()
+		dbPool, err_ = pgxpool.NewWithConfig(retryCtx, poolCfg)
+		if err_ != nil {
 			return nil, errs.New(core.ErrDbConnFail, err_)
 		}
 	}
