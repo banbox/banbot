@@ -8,7 +8,7 @@ go 1.24.0
 
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
-	github.com/banbox/banexg v0.2.51
+	github.com/banbox/banexg v0.2.52
 	github.com/banbox/banta v0.3.7
 	github.com/c-bata/goptuna v0.9.0
 	github.com/cloudwego/eino v0.6.0
