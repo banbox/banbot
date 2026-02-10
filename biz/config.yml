@@ -94,7 +94,7 @@ database:
   retention: all
   max_pool_size: 50
   auto_create: true
-  url: postgresql://postgres:123@127.0.0.1:5432/ban
+  url: postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable
 spider_addr: 127.0.0.1:6789
 rpc_channels:
   mail1:

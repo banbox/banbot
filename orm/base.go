@@ -196,6 +196,9 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 		return nil, errs.New(core.ErrBadConfig, err_)
 	}
 	if poolCfg.ConnConfig != nil {
+		if poolCfg.ConnConfig.Port == 5432 {
+			return nil, errs.NewMsg(core.ErrBadConfig, "port 5432 is old TimescaleDB, please update database.url to: postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable")
+		}
 		host := strings.TrimSpace(poolCfg.ConnConfig.Host)
 		if host != "" && !isLocalHost(host) {
 			return nil, errs.NewMsg(core.ErrBadConfig, "questdb must be local-only (host=%s)", host)
@@ -265,7 +268,7 @@ func isLocalHost(host string) bool {
 	if host == "" {
 		return false
 	}
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "host.docker.internal" {
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
 		return true
 	}
 	return false

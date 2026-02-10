@@ -469,16 +469,6 @@ func RestoreVars(backup *VarsBackup) {
 	ormo.RestoreVars(backup.OrmoBackup)
 }
 
-func replaceDockerHosts(data []byte) []byte {
-	if !utils.IsDocker() {
-		return data
-	}
-	content := string(data)
-	content = strings.ReplaceAll(content, "127.0.0.1", "host.docker.internal")
-	content = strings.ReplaceAll(content, "localhost", "host.docker.internal")
-	return []byte(content)
-}
-
 func InitDataDir() *errs.Error {
 	dataDir := config.GetDataDir()
 	if dataDir == "" {
@@ -492,12 +482,12 @@ func InitDataDir() *errs.Error {
 	configLocalPath := filepath.Join(dataDir, "config.local.yml")
 	if !utils.Exists(configPath) && !utils.Exists(configLocalPath) {
 		// dont init config in dataDir if any of config.yml/config.local.yml exist
-		err := utils.WriteFile(configPath, replaceDockerHosts(configData))
+		err := utils.WriteFile(configPath, configData)
 		if err != nil {
 			return err
 		}
 		log.Info("init done", zap.String("p", configPath))
-		err = utils.WriteFile(configLocalPath, replaceDockerHosts(configLocalData))
+		err = utils.WriteFile(configLocalPath, configLocalData)
 		log.Info("init done", zap.String("p", configLocalPath))
 		if err != nil {
 			return err

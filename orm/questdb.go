@@ -85,11 +85,7 @@ func ensureQuestDB(port uint16) *errs.Error {
 // qdbPaths returns the QuestDB binary path and data directory if QuestDB is
 // installed, or ("", "") otherwise.
 func qdbPaths() (bin string, dataDir string) {
-	dataDir = "/opt/qdb"
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		home, _ := os.UserHomeDir()
-		dataDir = filepath.Join(home, ".local", "share", "qdb")
-	}
+	dataDir = filepath.Join(config.GetDataDir(), "qdbdata")
 	switch runtime.GOOS {
 	case "darwin":
 		// Homebrew
@@ -113,7 +109,7 @@ func qdbPaths() (bin string, dataDir string) {
 		home, _ := os.UserHomeDir()
 		exe := filepath.Join(home, "questdb", "bin", "questdb.exe")
 		if _, err := os.Stat(exe); err == nil {
-			return exe, filepath.Join(home, ".questdb")
+			return exe, dataDir
 		}
 	}
 	return "", ""

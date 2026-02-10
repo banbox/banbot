@@ -153,7 +153,7 @@ database:  # 数据库配置
   retention: all
   max_pool_size: 50  # 连接池最大大小
   auto_create: true  # 数据库不存在时，是否自动创建
-  url: postgresql://postgres:123@127.0.0.1:5432/bantd3
+  url: postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable
 spider_addr: 127.0.0.1:6789  # 爬虫监听的端口和地址
 rpc_channels:  # 支持的全部rpc渠道
   mail1:
