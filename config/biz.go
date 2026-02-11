@@ -563,6 +563,12 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 			Items: make(map[string]map[string]interface{}),
 		}
 	}
+	// 解析交易所代理配置，设置全局代理，后续所有banexg.NewHttpClient()自动继承
+	if proxyUrl, proxyErr := GetExchangeProxy(Exchange.Name); proxyErr == nil && proxyUrl != "" {
+		if setErr := banexg.SetProxy(proxyUrl); setErr != nil {
+			return setErr
+		}
+	}
 	err = initExgAccs(args, c.Accounts)
 	if err != nil {
 		return err

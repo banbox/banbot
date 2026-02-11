@@ -18,6 +18,7 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/schollz/progressbar/v3"
@@ -352,12 +353,30 @@ func installQdbBinary(platform string) *errs.Error {
 		assetName = fmt.Sprintf("questdb-%s-no-jre-bin.tar.gz", qdbVersion)
 	}
 
-	url := fmt.Sprintf("https://github.com/questdb/questdb/releases/download/%s/%s", qdbVersion, assetName)
-	log.Info("downloading QuestDB ...", zap.String("url", url))
+	downUrl := fmt.Sprintf("https://github.com/questdb/questdb/releases/download/%s/%s", qdbVersion, assetName)
 
-	resp, err := http.Get(url)
-	if err != nil {
-		return errs.NewMsg(core.ErrDbConnFail, "failed to download QuestDB: %v", err)
+	// Use banexg global proxy (set during config init via banexg.SetProxy).
+	proxyUrl := banexg.GetProxy()
+	client := banexg.NewHttpClient()
+	client.Timeout = 300 * time.Second
+	if proxyUrl != "" {
+		log.Info("downloading QuestDB via proxy ...", zap.String("url", downUrl), zap.String("proxy", proxyUrl))
+	} else {
+		log.Info("downloading QuestDB ...", zap.String("url", downUrl))
+	}
+
+	resp, err_ := client.Get(downUrl)
+	if err_ != nil {
+		if proxyUrl == "" {
+			exgName := ""
+			if config.Exchange != nil {
+				exgName = config.Exchange.Name
+			}
+			return errs.NewMsg(core.ErrDbConnFail,
+				"failed to download QuestDB: %v\nPlease configure `proxy` in your exchange config (e.g. exchange.%s.proxy) or set HTTPS_PROXY env",
+				err_, exgName)
+		}
+		return errs.NewMsg(core.ErrDbConnFail, "failed to download QuestDB (proxy=%s): %v", proxyUrl, err_)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

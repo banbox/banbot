@@ -16,7 +16,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -120,20 +119,8 @@ func (info *WsSymbol) DownUrl() string {
 }
 
 func NewWsDataLoader() (*WsDataLoader, *errs.Error) {
-	proxyUrl, err := config.GetExchangeProxy(config.Exchange.Name)
-	if err != nil {
-		return nil, err
-	}
-	client := &http.Client{
-		Timeout: 120 * time.Second,
-	}
-	proxy, err_ := url.Parse(proxyUrl)
-	if err_ != nil {
-		return nil, errs.New(errs.CodeParamInvalid, err_)
-	}
-	client.Transport = &http.Transport{
-		Proxy: http.ProxyURL(proxy),
-	}
+	client := banexg.NewHttpClient()
+	client.Timeout = 120 * time.Second
 	loader := &WsDataLoader{
 		cacheDir:   filepath.Join(config.GetDataDir(), "wscache"),
 		httpClient: client,
