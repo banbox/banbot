@@ -3,10 +3,12 @@ package dev
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"time"
 	"sort"
 	"strconv"
 	"strings"
@@ -400,10 +402,20 @@ func handleBuild(c *fiber.Ctx) error {
 		outputPath = outputPath + ".exe"
 	}
 
+	// 检测是否为国内网络环境，如果是则设置国内Go代理加速
+	conn, err := net.DialTimeout("tcp", "google.com:443", 3*time.Second)
+	isChinaNet := err != nil
+	if conn != nil {
+		conn.Close()
+	}
+
 	// 准备编译命令
 	cmd := exec.Command("go", "build", "-o", outputPath)
 	env := append(os.Environ(), fmt.Sprintf("GOARCH=%s", targetArch))
 	env = append(env, fmt.Sprintf("GOOS=%s", targetOS))
+	if isChinaNet && os.Getenv("GOPROXY") == "" {
+		env = append(env, "GO111MODULE=on", "GOPROXY=https://goproxy.cn,direct")
+	}
 	cmd.Env = env
 
 	// 捕获命令输出

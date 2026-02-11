@@ -7,6 +7,8 @@ ENV BanDataDir=/ban/data \
 
 RUN git clone https://github.com/banbox/banstrats /ban/strats
 
+RUN git config --global --add safe.directory "*"
+
 WORKDIR /ban/strats
 RUN go mod tidy && \
     go build -o ../bot
