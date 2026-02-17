@@ -57,7 +57,7 @@ var ddlQdbMigrations string
 var (
 	DbTrades = "trades"
 	// DbPub stores mutable relational/meta data (calendars/adj_factors/sranges/ins_kline/kline_un + ui task).
-	DbPub      = "banpub"
+	DbPub = "banpub"
 )
 
 func Setup() *errs.Error {
@@ -390,19 +390,21 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 		return nil, errs.New(core.ErrDbConnFail, err_)
 	}
 
-	// 配置连接池参数以提高并发性能
+	// 配置连接池参数以支持多进程并发访问
 	if write {
 		// 写连接：限制为1个
 		// 原因：SQLite WAL模式下同一时刻只允许一个写事务，多个连接会在SQLite层竞争锁
 		db.SetMaxOpenConns(1)
-		db.SetMaxIdleConns(1)
+		db.SetMaxIdleConns(0) // 写连接不保持空闲，用完立即释放，避免阻塞其他进程
 	} else {
 		// 读连接：允许多个并发读取
 		// WAL模式支持多个读操作同时进行，不会阻塞
-		db.SetMaxOpenConns(10)
-		db.SetMaxIdleConns(5)
+		db.SetMaxOpenConns(4)
+		db.SetMaxIdleConns(1)
 	}
-	db.SetConnMaxLifetime(time.Hour)
+	// 多进程场景：缩短连接生命周期，让其他进程有机会获取锁
+	db.SetConnMaxLifetime(30 * time.Second)
+	db.SetConnMaxIdleTime(1 * time.Second)
 
 	// 初始化数据库结构（如果需要）
 	dbPathLock.Lock()

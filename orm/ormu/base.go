@@ -6,7 +6,7 @@ import (
 )
 
 func Conn() (*Queries, *orm.TrackedDB, *errs.Error) {
-	db, err := orm.DbLite(orm.DbPub, orm.DbPub, true, 5000)
+	db, err := orm.DbLite(orm.DbPub, orm.DbPub, true, 10000)
 	if err != nil {
 		return nil, nil, err
 	}
