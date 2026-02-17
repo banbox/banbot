@@ -1,13 +1,14 @@
 package utils
 
 import (
+	"io"
+	"net/http"
+
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
-	"io"
-	"net/http"
 )
 
 func DoHttp(client *http.Client, req *http.Request) *banexg.HttpRes {
@@ -15,16 +16,9 @@ func DoHttp(client *http.Client, req *http.Request) *banexg.HttpRes {
 	if err_ != nil {
 		return &banexg.HttpRes{Error: errs.New(core.ErrNetReadFail, err_)}
 	}
+	defer rsp.Body.Close()
 	var result = banexg.HttpRes{Status: rsp.StatusCode, Headers: rsp.Header}
 	rspData, err := io.ReadAll(rsp.Body)
-	defer func() {
-		cerr := rsp.Body.Close()
-		// Only overwrite the retured error if the original error was nil and an
-		// error occurred while closing the body.
-		if err == nil && cerr != nil {
-			err = cerr
-		}
-	}()
 	if err != nil {
 		result.Error = errs.New(core.ErrNetReadFail, err)
 		return &result
