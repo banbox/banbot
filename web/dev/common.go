@@ -13,16 +13,14 @@ import (
 
 	"github.com/banbox/banbot/com"
 	"github.com/sasha-s/go-deadlock"
+	"go.uber.org/zap"
 
 	"github.com/banbox/banbot/orm/ormo"
 
 	utils2 "github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 
-	"github.com/banbox/banbot/core"
-
 	"github.com/banbox/banexg/log"
-	"go.uber.org/zap"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/orm/ormu"
@@ -52,7 +50,20 @@ var (
 	cacheOrders []*ormo.InOutOrder
 	cachePath   string
 	ordersLock  deadlock.Mutex
+
+	// 任务状态更新缓存，避免频繁写入数据库
+	taskStatusCache      = make(map[int64]*taskStatusInfo)
+	taskStatusCacheMutex deadlock.Mutex
+
+	// 任务通知channel，用于通知调度器有新任务
+	taskNotifyChan = make(chan *ormu.Task, 100)
 )
+
+type taskStatusInfo struct {
+	status       int64
+	progress     float64
+	lastUpdateAt time.Time
+}
 
 func init() {
 	for _, k := range btInfoKeyList {
@@ -101,14 +112,7 @@ func executeBtTask(task *ormu.Task) {
 	runBtTasks[task.ID] = cmd
 	runBtTasksMutex.Unlock()
 
-	qu, conn, err2 := ormu.Conn()
-	if err2 != nil {
-		log.Error("connect to db failed", zap.Error(err2))
-		return
-	}
-	err = updateTaskStatus(qu, task.ID, int64(ormu.BtStatusRunning), 0)
-	_ = conn.Close()
-	if err != nil {
+	if err := updateTaskStatus(task.ID, int64(ormu.BtStatusRunning), 0); err != nil {
 		return
 	}
 
@@ -118,17 +122,53 @@ func executeBtTask(task *ormu.Task) {
 	updateBtTaskResult(task, err)
 }
 
-// 更新任务状态
-func updateTaskStatus(qu *ormu.Queries, taskID int64, status int64, progress float64) error {
-	err := qu.UpdateTask(context.Background(), ormu.UpdateTaskParams{
+// 更新任务状态，基于taskID进行缓存，每个task间隔5s才更新一次数据库
+func updateTaskStatus(taskID int64, status int64, progress float64) error {
+	taskStatusCacheMutex.Lock()
+	cached, exists := taskStatusCache[taskID]
+	now := time.Now()
+
+	// 检查是否需要更新数据库
+	needUpdate := false
+	if !exists {
+		needUpdate = true
+		taskStatusCache[taskID] = &taskStatusInfo{
+			status:       status,
+			progress:     progress,
+			lastUpdateAt: now,
+		}
+	} else {
+		// 状态或进度有变化，且距离上次更新超过5秒
+		if (cached.status != status || cached.progress != progress) && now.Sub(cached.lastUpdateAt) >= 5*time.Second {
+			needUpdate = true
+			cached.status = status
+			cached.progress = progress
+			cached.lastUpdateAt = now
+		}
+	}
+	taskStatusCacheMutex.Unlock()
+
+	if !needUpdate {
+		return nil
+	}
+
+	// 获取数据库连接并更新
+	qu, conn, err := ormu.Conn()
+	if err != nil {
+		log.Error("connect to db failed", zap.Error(err))
+		return err
+	}
+	defer conn.Close()
+
+	err2 := qu.UpdateTask(context.Background(), ormu.UpdateTaskParams{
 		Status:   status,
 		Progress: progress,
 		ID:       taskID,
 	})
-	if err != nil {
-		log.Error("update task status failed", zap.Error(err))
+	if err2 != nil {
+		log.Error("update task status failed", zap.Error(err2))
 	}
-	return err
+	return err2
 }
 
 // 执行回测命令并处理输出
@@ -214,11 +254,6 @@ func runBtCommand(cmd *exec.Cmd, task *ormu.Task) error {
 
 // 处理进度更新
 func handleProgress(progressStr string, taskID int64) error {
-	qu, conn, err2 := ormu.Conn()
-	if err2 != nil {
-		return err2
-	}
-	defer conn.Close()
 	prgVal, err := strconv.ParseFloat(progressStr, 64)
 	if err != nil {
 		log.Warn("invalid progress", zap.String("progress", progressStr))
@@ -229,7 +264,7 @@ func handleProgress(progressStr string, taskID int64) error {
 		"taskId":   taskID,
 		"progress": prgVal,
 	})
-	return updateTaskStatus(qu, taskID, int64(ormu.BtStatusRunning), prgVal)
+	return updateTaskStatus(taskID, int64(ormu.BtStatusRunning), prgVal)
 }
 
 // 更新回测任务结果
@@ -288,40 +323,25 @@ func updateBtTaskResult(task *ormu.Task, errTask error) {
 // 启动后台任务处理
 func startBtTaskScheduler() {
 	go func() {
-		for {
-			core.Sleep(300 * time.Millisecond)
-
+		for task := range taskNotifyChan {
 			runBtTasksMutex.Lock()
 			runningCount := len(runBtTasks)
 			runBtTasksMutex.Unlock()
 
 			if runningCount >= maxBtTasks {
+				// 队列已满，将任务放回channel等待处理
+				go func(t *ormu.Task) {
+					time.Sleep(500 * time.Millisecond)
+					taskNotifyChan <- t
+				}(task)
 				continue
 			}
 
-			// 获取待执行的任务
-			qu, conn, err := ormu.Conn()
-			if err != nil {
-				log.Error("connect to db failed", zap.Error(err))
+			// 检查任务状态是否为待执行
+			if task.Status != int64(ormu.BtStatusInit) {
 				continue
 			}
 
-			tasks, err := qu.FindTasks(context.Background(), ormu.FindTasksParams{
-				Mode:   "backtest",
-				Status: int64(ormu.BtStatusInit),
-				Limit:  1,
-			})
-			_ = conn.Close()
-			if err != nil {
-				log.Warn("find tasks failed", zap.Error(err))
-				continue
-			}
-
-			if len(tasks) == 0 {
-				continue
-			}
-
-			task := tasks[0]
 			runBtTasksMutex.Lock()
 			_, exist := runBtTasks[task.ID]
 			if !exist {

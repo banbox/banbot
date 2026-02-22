@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
@@ -144,7 +145,8 @@ func (q *PubQueries) UpdateSRanges(ctx context.Context, sid int32, table, timefr
 	}
 	defer db.Close()
 
-	tx, err := db.BeginTx(ctx, nil)
+	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 	if err != nil {
 		return err
 	}

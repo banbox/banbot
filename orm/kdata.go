@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -856,7 +857,8 @@ func (q *PubQueries) SetCalendars(name string, items [][2]int64) *errs.Error {
 	defer db.Close()
 
 	ctx := context.Background()
-	tx, err_ := db.BeginTx(ctx, nil)
+	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
+	tx, err_ := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 	if err_ != nil {
 		return NewDbErr(core.ErrDbConnFail, err_)
 	}

@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -47,7 +48,8 @@ func (q *PubQueries) AddCalendars(ctx context.Context, arg []AddCalendarsParams)
 		return 0, err2
 	}
 	defer db.Close()
-	tx, err := db.BeginTx(ctx, nil)
+	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 	if err != nil {
 		return 0, err
 	}
@@ -86,7 +88,8 @@ func (q *PubQueries) AddAdjFactors(ctx context.Context, arg []AddAdjFactorsParam
 		return 0, err2
 	}
 	defer db.Close()
-	tx, err := db.BeginTx(ctx, nil)
+	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 	if err != nil {
 		return 0, err
 	}
@@ -321,7 +324,8 @@ func (q *PubQueries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (in
 		return 0, err2
 	}
 	defer db.Close()
-	tx, err := db.BeginTx(ctx, nil)
+	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 	if err != nil {
 		return 0, err
 	}

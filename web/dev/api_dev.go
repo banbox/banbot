@@ -8,10 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"time"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sasha-s/go-deadlock"
 
@@ -878,6 +878,9 @@ func handleRunBacktest(c *fiber.Ctx) error {
 		return err
 	}
 	log.Info("add backtest", zap.Int64("id", task.ID), zap.String("hash", hashVal))
+
+	// 通知任务调度器有新任务
+	taskNotifyChan <- task
 
 	return c.JSON(fiber.Map{
 		"code": 200,

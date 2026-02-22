@@ -375,9 +375,13 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Error) {
 	// 添加 WAL 模式和其他性能优化参数
 	openFlag := "_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-64000)"
-	if timeoutMs > 0 {
-		openFlag += fmt.Sprintf("&_pragma=busy_timeout(%d)", timeoutMs)
+	// 设置 mmap_size 为 300MB，利用内存映射 I/O 减少磁盘读写
+	openFlag += "&_pragma=mmap_size(300000000)"
+	// 确保 busy_timeout 始终设置，避免多进程锁冲突
+	if timeoutMs <= 0 {
+		timeoutMs = 5000 // 默认5秒超时
 	}
+	openFlag += fmt.Sprintf("&_pragma=busy_timeout(%d)", timeoutMs)
 	if write {
 		openFlag += "&cache=shared&mode=rwc"
 	} else {

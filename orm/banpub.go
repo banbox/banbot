@@ -22,7 +22,8 @@ func WithBanPubTx(ctx context.Context, fn func(tx *sql.Tx) error) *errs.Error {
 	}
 	defer db.Close()
 
-	tx, err_ := db.BeginTx(ctx, nil)
+	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
+	tx, err_ := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 	if err_ != nil {
 		return errs.New(core.ErrDbConnFail, err_)
 	}
