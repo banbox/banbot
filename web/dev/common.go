@@ -138,13 +138,14 @@ func updateTaskStatus(taskID int64, status int64, progress float64) error {
 			lastUpdateAt: now,
 		}
 	} else {
-		// 状态或进度有变化，且距离上次更新超过5秒
+		// 检查是否需要更新数据库：状态或进度有变化，且距离上次更新超过5秒
 		if (cached.status != status || cached.progress != progress) && now.Sub(cached.lastUpdateAt) >= 5*time.Second {
 			needUpdate = true
-			cached.status = status
-			cached.progress = progress
 			cached.lastUpdateAt = now
 		}
+		// 始终更新缓存为最新值，即使不写数据库
+		cached.status = status
+		cached.progress = progress
 	}
 	taskStatusCacheMutex.Unlock()
 
