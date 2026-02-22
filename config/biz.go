@@ -297,7 +297,7 @@ func applyLLMConfig(llmSection map[string]interface{}, res *Config) error {
 		return nil
 	}
 	var cfg struct {
-		LLMModels   map[string]*llm.LLMModelConfig `mapstructure:"llm_models"`
+		LLMModels map[string]*llm.LLMModelConfig `mapstructure:"llm_models"`
 	}
 	if err := mapstructure.Decode(llmSection, &cfg); err != nil {
 		return err
@@ -648,10 +648,6 @@ func SetRunPolicy(index bool, items ...*RunPolicyConfig) *errs.Error {
 
 // GetStaticPairs 合并pairs和run_policy.pairs返回，bool表示是否需要动态计算
 func GetStaticPairs() ([]string, bool) {
-	if len(Pairs) == 0 {
-		// 多策略时，某个策略固定品种，其他策略使用pairlists
-		return nil, false
-	}
 	var res = make([]string, 0, len(Pairs))
 	res = append(res, Pairs...)
 	needCalc := false
@@ -664,6 +660,9 @@ func GetStaticPairs() ([]string, bool) {
 	}
 	if len(Pairs) > 0 {
 		needCalc = false
+	}
+	if len(res) == 0 {
+		return nil, false
 	}
 	res, _ = utils2.UniqueItems(res)
 	return res, needCalc

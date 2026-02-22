@@ -109,7 +109,30 @@ func SetupComsExg(args *config.CmdArgs) *errs.Error {
 	return orm.InitExg(exg.Default)
 }
 
+var refreshPairsCache struct {
+	timeMS       int64
+	pairs        []string
+	pairTfScores map[string]map[string]float64
+	corePairs    []string
+	pairsMap     map[string]bool
+}
+
 func RefreshPairs(showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]string, map[string]map[string]float64, *errs.Error) {
+	c := &refreshPairsCache
+	if core.BackTestMode && c.timeMS == timeMS && c.pairTfScores != nil {
+		core.Pairs = slices.Clone(c.corePairs)
+		core.PairsMap = maps.Clone(c.pairsMap)
+		for pair := range core.BanPairsUntil {
+			if _, ok := core.PairsMap[pair]; !ok {
+				delete(core.BanPairsUntil, pair)
+			}
+		}
+		if pBar != nil {
+			pBar.SetProgress("loadPairs", 1)
+			pBar.SetProgress("tfScores", 1)
+		}
+		return c.pairs, c.pairTfScores, nil
+	}
 	goods.ShowLog = showLog
 	pairs, err := goods.RefreshPairList(timeMS)
 	if err != nil {
@@ -132,6 +155,13 @@ func RefreshPairs(showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]string, 
 	}
 	if pBar != nil {
 		pBar.SetProgress("tfScores", 1)
+	}
+	if core.BackTestMode {
+		c.timeMS = timeMS
+		c.pairs = pairs
+		c.pairTfScores = pairTfScores
+		c.corePairs = slices.Clone(core.Pairs)
+		c.pairsMap = maps.Clone(core.PairsMap)
 	}
 	return pairs, pairTfScores, nil
 }
