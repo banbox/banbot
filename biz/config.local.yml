@@ -1,15 +1,18 @@
-market_type: spot
+market_type: linear
 time_start: "20230701"
-time_end: "20250101"
-pairs: ['ETH/USDT']
+time_end: "20260101"
+stake_amount: 200
+wallet_amounts:
+  USDT: 3000
+pairs: [ETH]
 run_policy:
   - name: ma:demo
-    run_timeframes: [15m]
-    # pairs: [BTC/USDT:USDT]
+    run_timeframes: [8h]
+    # pairs: [BTC]
     params: {atr: 15}
 accounts:
   user1:
     binance:
       prod:
-        api_key: vvv
-        api_secret: vvv
+        api_key: ${BNB_API_KEY}
+        api_secret: ${BNB_API_SECRET}

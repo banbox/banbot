@@ -24,7 +24,7 @@ relay_sim_unfinish: false
 order_bar_max: 500
 ntp_lang_code: none
 time_start: '20230701'
-time_end: '20250101'
+time_end: '20260101'
 wallet_amounts:
   USDT: 3000
 stake_currency: [USDT]

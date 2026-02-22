@@ -598,10 +598,10 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 		best.ID = utils.RandomStr(6)
 		best.runGetBtResult(pol)
 		best.dumpDetail(filepath.Join(detailDir, best.ID+".json"))
-		line := fmt.Sprintf("[%s] %s", picker, best.ToLine())
-		flog.WriteString(line + "\n")
-		log.Warn(line)
 	}
+	line := fmt.Sprintf("[%s] %s", picker, best.ToLine())
+	flog.WriteString(line + "\n")
+	log.Warn(line)
 	if err != nil {
 		log.Error("optimize fail", zap.String("job", title), zap.Error(err))
 	}
