@@ -1487,7 +1487,12 @@ func getSymbolInfo(c *fiber.Ctx) error {
 	}
 
 	// 获取K线信息
-	sranges, err_ := orm.PubQ().ListSRangesBySid(context.Background(), args.ID)
+	sess, conn, err := orm.Conn(nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	sranges, err_ := sess.ListSRangesBySid(context.Background(), args.ID)
 	if err_ != nil {
 		return err_
 	}
@@ -1529,8 +1534,13 @@ func getSymbolGaps(c *fiber.Ctx) error {
 	}
 
 	// 查询范围数据（has_data=false表示空洞/无数据区间）
+	sess, conn, err := orm.Conn(nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
 	hasData := false
-	ranges, total, err2 := orm.PubQ().FindSRanges(orm.FindSRangesArgs{
+	ranges, total, err2 := sess.FindSRanges(orm.FindSRangesArgs{
 		Sid:       args.ID,
 		Table:     "kline_" + args.TimeFrame,
 		TimeFrame: args.TimeFrame,

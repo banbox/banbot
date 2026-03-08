@@ -2,9 +2,7 @@ package orm
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -145,7 +143,7 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	tfSecs := utils2.TFToSecs(timeFrame)
 	tfMSecs := int64(tfSecs * 1000)
 
-	covered, err_ := PubQ().getCoveredRanges(context.Background(), exs.ID, "kline_"+timeFrame, timeFrame, startMS, endMS)
+	covered, err_ := sess.getCoveredRanges(context.Background(), exs.ID, "kline_"+timeFrame, timeFrame, startMS, endMS)
 	if err_ != nil {
 		return 0, NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -192,24 +190,24 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		}
 	}
 	close(chanDown)
-	insId, err := AddInsJob(AddInsKlineParams{
+	insTs, err := AddInsJob(AddInsKlineParams{
 		Sid:       exs.ID,
 		Timeframe: timeFrame,
 		StartMs:   curStart,
 		StopMs:    curEnd,
 	})
-	if err != nil || insId == 0 {
+	if err != nil || insTs.IsZero() {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
 		}
 		return 0, err
 	}
 	defer func() {
-		if insId == 0 {
+		if insTs.IsZero() {
 			return
 		}
-		if err_ := PubQ().DelInsKline(context.Background(), insId); err_ != nil {
-			log.Warn("DelInsKline fail", zap.Int64("id", insId), zap.Error(err_))
+		if err_ := sess.DelInsKline(context.Background(), exs.ID, timeFrame, insTs); err_ != nil {
+			log.Warn("DelInsKline fail", zap.Int32("sid", exs.ID), zap.Error(err_))
 		}
 	}()
 
@@ -321,9 +319,9 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 			log.Warn("fetch unfinish bar fail", zap.Error(fetchErr))
 		}
 		if len(data) > 0 {
-			if err := PubQ().SetUnfinish(exs.ID, timeFrame, curMS, data[0]); err != nil {
-				log.Warn("set unfinish fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame), zap.Error(err))
-			}
+		if err := sess.SetUnfinish(exs.ID, timeFrame, curMS, data[0]); err != nil {
+			log.Warn("set unfinish fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame), zap.Error(err))
+		}
 		}
 	}
 
@@ -437,7 +435,12 @@ func GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
 		return cache, nil
 	}
 	ctx := context.Background()
-	rows, err_ := PubQ().GetAdjFactors(ctx, sid)
+	sess, conn, err2 := Conn(ctx)
+	if err2 != nil {
+		return nil, err2
+	}
+	defer conn.Release()
+	rows, err_ := sess.GetAdjFactors(ctx, sid)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -802,36 +805,23 @@ func parseDownArgs(tfMSecs int64, startMS, endMS int64, limit int, withUnFinish 
 	return startMS, endMS
 }
 
-func buildCalendarsSQL(fields string, startMS, stopMS int64) (string, []any) {
-	var b strings.Builder
-	b.WriteString("select ")
-	b.WriteString(fields)
-	b.WriteString(" from calendars where name=? ")
-	args := make([]any, 0, 3)
-	args = append(args, nil)
+func (q *Queries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, *errs.Error) {
+	ctx := context.Background()
+	sqlText := `SELECT start_ms, stop_ms
+FROM calendars_q
+LATEST BY market, start_ms
+WHERE market = $1 AND coalesce(is_deleted, false) = false`
+	args := []any{name}
 	if startMS > 0 {
-		b.WriteString("and stop_ms > ? ")
-		args = append(args, startMS)
+		sqlText += fmt.Sprintf(" AND stop_ms > %d", startMS)
 	}
 	if stopMS > 0 {
-		b.WriteString("and start_ms < ? ")
-		args = append(args, stopMS)
+		sqlText += fmt.Sprintf(" AND start_ms < %d", stopMS)
 	}
-	b.WriteString("order by start_ms")
-	return b.String(), args
-}
-
-func (q *PubQueries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, *errs.Error) {
-	db, err2 := BanPubConn(false)
-	if err2 != nil {
-		return nil, err2
-	}
-	defer db.Close()
-	sqlText, args := buildCalendarsSQL("start_ms,stop_ms", startMS, stopMS)
-	args[0] = name
-	rows, err_ := db.QueryContext(context.Background(), sqlText, args...)
-	if err_ != nil {
-		return nil, NewDbErr(core.ErrDbReadFail, err_)
+	sqlText += " ORDER BY start_ms"
+	rows, err := q.db.Query(ctx, sqlText, args...)
+	if err != nil {
+		return nil, NewDbErr(core.ErrDbReadFail, err)
 	}
 	defer rows.Close()
 	result := make([][2]int64, 0)
@@ -845,42 +835,34 @@ func (q *PubQueries) GetCalendars(name string, startMS, stopMS int64) ([][2]int6
 	return result, nil
 }
 
-func (q *PubQueries) SetCalendars(name string, items [][2]int64) *errs.Error {
+func (q *Queries) SetCalendars(name string, items [][2]int64) *errs.Error {
 	if len(items) == 0 {
 		return nil
 	}
 	startMS, stopMS := items[0][0], items[len(items)-1][1]
-	db, err2 := BanPubConn(true)
-	if err2 != nil {
-		return err2
-	}
-	defer db.Close()
-
 	ctx := context.Background()
-	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
-	tx, err_ := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
-	if err_ != nil {
-		return NewDbErr(core.ErrDbConnFail, err_)
-	}
-	commit := false
-	defer func() {
-		if !commit {
-			_ = tx.Rollback()
-		}
-	}()
 
-	sqlText, args := buildCalendarsSQL("id,start_ms,stop_ms", startMS, stopMS)
-	args[0] = name
-	rows, err_ := tx.QueryContext(ctx, sqlText, args...)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
+	sqlText := `SELECT market, start_ms, stop_ms
+FROM calendars_q
+LATEST BY market, start_ms
+WHERE market = $1 AND coalesce(is_deleted, false) = false`
+	if startMS > 0 {
+		sqlText += fmt.Sprintf(" AND stop_ms > %d", startMS)
+	}
+	if stopMS > 0 {
+		sqlText += fmt.Sprintf(" AND start_ms < %d", stopMS)
+	}
+	sqlText += " ORDER BY start_ms"
+	rows, err := q.db.Query(ctx, sqlText, name)
+	if err != nil {
+		return NewDbErr(core.ErrDbReadFail, err)
 	}
 	defer rows.Close()
 
 	olds := make([]*Calendar, 0)
 	for rows.Next() {
 		var cal = &Calendar{}
-		if err := rows.Scan(&cal.ID, &cal.StartMs, &cal.StopMs); err != nil {
+		if err := rows.Scan(&cal.Market, &cal.StartMs, &cal.StopMs); err != nil {
 			return NewDbErr(core.ErrDbReadFail, err)
 		}
 		olds = append(olds, cal)
@@ -889,34 +871,33 @@ func (q *PubQueries) SetCalendars(name string, items [][2]int64) *errs.Error {
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
 
+	now := time.Now().UTC()
+	microOff := 0
+
 	if len(olds) > 0 {
 		items[0][0] = olds[0].StartMs
 		items[len(items)-1][1] = olds[len(olds)-1].StopMs
-		ids := make([]string, len(olds))
-		for i, o := range olds {
-			ids[i] = strconv.Itoa(int(o.ID))
+		for _, o := range olds {
+			ts := now.Add(time.Duration(microOff) * time.Microsecond)
+			microOff++
+			_, err := q.db.Exec(ctx, `INSERT INTO calendars_q (ts, market, start_ms, stop_ms, is_deleted, deleted_at)
+VALUES ($1, $2, $3, $4, true, $1)`, ts, name, o.StartMs, o.StopMs)
+			if err != nil {
+				return NewDbErr(core.ErrDbExecFail, err)
+			}
 		}
-		delSQL := fmt.Sprintf("delete from calendars where id in (%s)", strings.Join(ids, ","))
-		if _, err_ := tx.ExecContext(ctx, delSQL); err_ != nil {
-			return NewDbErr(core.ErrDbExecFail, err_)
-		}
+		MaybeCompact("calendars_q")
 	}
 
-	stmt, err_ := tx.PrepareContext(ctx, `insert into calendars (name,start_ms,stop_ms) values (?,?,?)`)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbExecFail, err_)
-	}
-	defer stmt.Close()
 	for _, tu := range items {
-		if _, err := stmt.ExecContext(ctx, name, tu[0], tu[1]); err != nil {
+		ts := now.Add(time.Duration(microOff) * time.Microsecond)
+		microOff++
+		_, err := q.db.Exec(ctx, `INSERT INTO calendars_q (ts, market, start_ms, stop_ms, is_deleted)
+VALUES ($1, $2, $3, $4, false)`, ts, name, tu[0], tu[1])
+		if err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return NewDbErr(core.ErrDbExecFail, err)
-	}
-	commit = true
 	return nil
 }
 
@@ -949,7 +930,14 @@ func GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start, stop int64, 
 		}
 	} else {
 		// 获取交易日
-		dtList, err = PubQ().GetCalendars(mar.ExgReal, start, stop)
+		var calSess *Queries
+		var calConn *pgxpool.Conn
+		calSess, calConn, err = Conn(nil)
+		if err != nil {
+			return nil, err
+		}
+		defer calConn.Release()
+		dtList, err = calSess.GetCalendars(mar.ExgReal, start, stop)
 		if err != nil {
 			return nil, err
 		}
@@ -986,14 +974,13 @@ func GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start, stop int64, 
 }
 
 func (q *Queries) DelKData(exsList []*ExSymbol, tfList []string, startMS, endMS int64) *errs.Error {
-	pq := PubQ()
 	for _, tf := range tfList {
 		for _, exs := range exsList {
-			if err := pq.DelKInfo(exs.ID, tf); err != nil {
+			if err := q.DelKInfo(exs.ID, tf); err != nil {
 				return err
 			}
 			if endMS == 0 {
-				if err := pq.DelKLineUn(exs.ID, tf); err != nil {
+				if err := q.DelKLineUn(exs.ID, tf); err != nil {
 					return err
 				}
 			}
@@ -1006,7 +993,7 @@ func (q *Queries) DelKData(exsList []*ExSymbol, tfList []string, startMS, endMS 
 		}
 	}
 	for _, exs := range exsList {
-		if err := pq.DelFactors(exs.ID, startMS, endMS); err != nil {
+		if err := q.DelFactors(exs.ID, startMS, endMS); err != nil {
 			return err
 		}
 	}

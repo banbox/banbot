@@ -106,7 +106,7 @@ func VerifyDataRanges(args *VerifyArgs) ([]*VerifyTFResult, *errs.Error) {
 		}
 		for _, tblPrefix := range tables {
 			pBar.Add(1)
-			allRanges, err_ := PubQ().ListSRangesBySid(context.Background(), sid)
+			allRanges, err_ := sess.ListSRangesBySid(context.Background(), sid)
 			if err_ != nil {
 				return results, NewDbErr(core.ErrDbReadFail, err_)
 			}
@@ -291,23 +291,20 @@ func mergeIssues(issues []*VerifyIssue) []*VerifyIssue {
 }
 
 func listSRangeSids(tables []string) ([]int32, *errs.Error) {
-	db, err := BanPubConn(false)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
+	ctx := context.Background()
 	var whereClause string
-	args := make([]any, 0, len(tables))
 	if len(tables) > 0 {
 		pats := make([]string, 0, len(tables))
 		for _, t := range tables {
-			pats = append(pats, "tbl like ?")
-			args = append(args, t+"_%")
+			pats = append(pats, fmt.Sprintf("tbl ~ '%s_.*'", t))
 		}
-		whereClause = "where " + strings.Join(pats, " or ")
+		whereClause = "AND (" + strings.Join(pats, " OR ") + ")"
 	}
-	sqlText := fmt.Sprintf("select distinct sid from sranges %s order by sid", whereClause)
-	rows, err_ := db.QueryContext(context.Background(), sqlText, args...)
+	sqlText := fmt.Sprintf(`SELECT DISTINCT sid FROM (
+  SELECT sid, tbl FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms
+  WHERE coalesce(is_deleted, false) = false %s
+) ORDER BY sid`, whereClause)
+	rows, err_ := pool.Query(ctx, sqlText)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}

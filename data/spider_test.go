@@ -116,13 +116,13 @@ delete from kline_1d where sid=%v;
 	}
 	conn.Release()
 	{
-		db, err := orm.BanPubConn(true)
+		sess, conn, err = orm.Conn(nil)
 		if err != nil {
 			panic(err)
 		}
-		_, _ = db.ExecContext(context.Background(), "delete from kline_un where sid=?", sid)
-		_, _ = db.ExecContext(context.Background(), "delete from sranges where sid=?", sid)
-		_ = db.Close()
+		_ = sess.DelKLineUn(sid, timeFrame)
+		_ = sess.DelKInfo(sid, timeFrame)
+		conn.Release()
 	}
 	core.SetRunMode(core.RunModeBackTest)
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)

@@ -3,9 +3,9 @@ package orm
 import (
 	"context"
 	"math/rand"
-	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 type srangeSnapshot struct {
@@ -14,29 +14,67 @@ type srangeSnapshot struct {
 	HasData bool
 }
 
-func useIsolatedBanPubDB(t *testing.T) {
+func ensureQDBPool(t *testing.T) {
 	t.Helper()
-	SetDbPath(DbPub, filepath.Join(t.TempDir(), "banpub.db"))
-	db, err := BanPubConn(true)
+	if pool == nil {
+		t.Skip("QuestDB pool not available, skipping integration test")
+	}
+}
+
+func cleanSRanges(t *testing.T, sid int32, tbl, tf string) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := pool.Query(ctx, `SELECT start_ms, stop_ms, has_data
+FROM sranges_q
+LATEST BY sid, tbl, timeframe, start_ms
+WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND coalesce(is_deleted, false) = false`, sid, tbl, tf)
 	if err != nil {
-		t.Fatalf("BanPubConn write fail: %v", err)
+		return
 	}
-	defer db.Close()
-	if _, err := db.ExecContext(context.Background(), `delete from sranges`); err != nil {
-		t.Fatalf("clear sranges fail: %v", err)
+	defer rows.Close()
+	type item struct {
+		startMs int64
+		stopMs  int64
+		hasData bool
 	}
+	var items []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.startMs, &it.stopMs, &it.hasData); err != nil {
+			return
+		}
+		items = append(items, it)
+	}
+	now := time.Now().UTC()
+	for i, it := range items {
+		ts := now.Add(time.Duration(i) * time.Microsecond)
+		_, _ = pool.Exec(ctx, `INSERT INTO sranges_q (sid, ts, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted, deleted_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, true, $2)`, sid, ts, tbl, tf, it.startMs, it.stopMs, it.hasData)
+	}
+	time.Sleep(200 * time.Millisecond)
 }
 
 func mustUpdateRange(t *testing.T, sid int32, tbl, tf string, startMs, stopMs int64, hasData bool) {
 	t.Helper()
-	if err := PubQ().UpdateSRanges(context.Background(), sid, tbl, tf, startMs, stopMs, hasData); err != nil {
+	sess, conn, err2 := Conn(nil)
+	if err2 != nil {
+		t.Fatalf("Conn fail: %v", err2)
+	}
+	defer conn.Release()
+	if err := sess.UpdateSRanges(context.Background(), sid, tbl, tf, startMs, stopMs, hasData); err != nil {
 		t.Fatalf("UpdateSRanges(%d,%d,%v) fail: %v", startMs, stopMs, hasData, err)
 	}
+	time.Sleep(150 * time.Millisecond)
 }
 
 func listSnapshots(t *testing.T, sid int32, tbl, tf string) []srangeSnapshot {
 	t.Helper()
-	rows, err := PubQ().ListSRanges(context.Background(), sid, tbl, tf, 0, 1<<62)
+	sess, conn, err2 := Conn(nil)
+	if err2 != nil {
+		t.Fatalf("Conn fail: %v", err2)
+	}
+	defer conn.Release()
+	rows, err := sess.ListSRanges(context.Background(), sid, tbl, tf, 0, 1<<62)
 	if err != nil {
 		t.Fatalf("ListSRanges fail: %v", err)
 	}
@@ -61,12 +99,13 @@ func assertNoOverlapAndNoSameStateTouch(t *testing.T, rows []srangeSnapshot) {
 }
 
 func TestUpdateSRangesMergeOutOfOrderTouching(t *testing.T) {
-	useIsolatedBanPubDB(t)
+	ensureQDBPool(t)
 	const (
-		sid = int32(1001)
+		sid = int32(90001)
 		tbl = "kline_1m"
 		tf  = "1m"
 	)
+	cleanSRanges(t, sid, tbl, tf)
 
 	mustUpdateRange(t, sid, tbl, tf, 600, 1000, true)
 	mustUpdateRange(t, sid, tbl, tf, 100, 600, true)
@@ -80,12 +119,13 @@ func TestUpdateSRangesMergeOutOfOrderTouching(t *testing.T) {
 }
 
 func TestUpdateSRangesSplitByDifferentHasData(t *testing.T) {
-	useIsolatedBanPubDB(t)
+	ensureQDBPool(t)
 	const (
-		sid = int32(1002)
+		sid = int32(90002)
 		tbl = "kline_1m"
 		tf  = "1m"
 	)
+	cleanSRanges(t, sid, tbl, tf)
 
 	mustUpdateRange(t, sid, tbl, tf, 100, 300, true)
 	mustUpdateRange(t, sid, tbl, tf, 180, 220, false)
@@ -103,12 +143,13 @@ func TestUpdateSRangesSplitByDifferentHasData(t *testing.T) {
 }
 
 func TestUpdateSRangesMixedUpdatesInvariant(t *testing.T) {
-	useIsolatedBanPubDB(t)
+	ensureQDBPool(t)
 	const (
-		sid = int32(1003)
+		sid = int32(90003)
 		tbl = "kline_1m"
 		tf  = "1m"
 	)
+	cleanSRanges(t, sid, tbl, tf)
 
 	mustUpdateRange(t, sid, tbl, tf, 100, 200, true)
 	mustUpdateRange(t, sid, tbl, tf, 140, 160, false)
@@ -131,19 +172,25 @@ func TestUpdateSRangesMixedUpdatesInvariant(t *testing.T) {
 }
 
 func TestGetCoveredRangesOnlyHasData(t *testing.T) {
-	useIsolatedBanPubDB(t)
+	ensureQDBPool(t)
 	const (
-		sid = int32(1004)
+		sid = int32(90004)
 		tbl = "kline_1m"
 		tf  = "1m"
 	)
+	cleanSRanges(t, sid, tbl, tf)
 
 	mustUpdateRange(t, sid, tbl, tf, 100, 150, false)
 	mustUpdateRange(t, sid, tbl, tf, 150, 200, true)
 	mustUpdateRange(t, sid, tbl, tf, 200, 240, true)
 	mustUpdateRange(t, sid, tbl, tf, 240, 300, false)
 
-	covered, err := PubQ().getCoveredRanges(context.Background(), sid, tbl, tf, 100, 300)
+	covSess, covConn, err2 := Conn(nil)
+	if err2 != nil {
+		t.Fatalf("Conn fail: %v", err2)
+	}
+	defer covConn.Release()
+	covered, err := covSess.getCoveredRanges(context.Background(), sid, tbl, tf, 100, 300)
 	if err != nil {
 		t.Fatalf("getCoveredRanges fail: %v", err)
 	}
@@ -154,12 +201,13 @@ func TestGetCoveredRangesOnlyHasData(t *testing.T) {
 }
 
 func TestUpdateSRangesRandomInvariant(t *testing.T) {
-	useIsolatedBanPubDB(t)
+	ensureQDBPool(t)
 	const (
-		sid = int32(1005)
+		sid = int32(90005)
 		tbl = "kline_1m"
 		tf  = "1m"
 	)
+	cleanSRanges(t, sid, tbl, tf)
 
 	rng := rand.New(rand.NewSource(20260207))
 	for i := 0; i < 200; i++ {
@@ -182,12 +230,126 @@ func TestUpdateSRangesRandomInvariant(t *testing.T) {
 				wantCovered = append(wantCovered, MSRange{Start: r.StartMs, Stop: r.StopMs})
 			}
 		}
-		gotCovered, err := PubQ().getCoveredRanges(context.Background(), sid, tbl, tf, 0, 1<<62)
+		covSess, covConn, err2 := Conn(nil)
+		if err2 != nil {
+			t.Fatalf("Conn fail: %v", err2)
+		}
+		defer covConn.Release()
+		gotCovered, err := covSess.getCoveredRanges(context.Background(), sid, tbl, tf, 0, 1<<62)
 		if err != nil {
 			t.Fatalf("getCoveredRanges fail: %v", err)
 		}
 		if !reflect.DeepEqual(gotCovered, wantCovered) {
 			t.Fatalf("covered mismatch at step=%d\nwant=%+v\ngot =%+v", i, wantCovered, gotCovered)
 		}
+	}
+}
+
+// mustUpdateWithHoles calls UpdateSRangesWithHoles and waits for WAL to commit.
+func mustUpdateWithHoles(t *testing.T, sid int32, tbl, tf string, startMs, stopMs int64, holes []MSRange) {
+	t.Helper()
+	sess, conn, err2 := Conn(nil)
+	if err2 != nil {
+		t.Fatalf("Conn fail: %v", err2)
+	}
+	defer conn.Release()
+	if err := sess.UpdateSRangesWithHoles(context.Background(), sid, tbl, tf, startMs, stopMs, holes); err != nil {
+		t.Fatalf("UpdateSRangesWithHoles fail: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+}
+
+// TestUpdateSRangesWithHolesNoHoles verifies that the entire window is marked has_data=true
+// when no holes are provided.
+func TestUpdateSRangesWithHolesNoHoles(t *testing.T) {
+	ensureQDBPool(t)
+	const (
+		sid = int32(90010)
+		tbl = "kline_1h"
+		tf  = "1h"
+	)
+	cleanSRanges(t, sid, tbl, tf)
+
+	mustUpdateWithHoles(t, sid, tbl, tf, 1000, 5000, nil)
+
+	got := listSnapshots(t, sid, tbl, tf)
+	want := []srangeSnapshot{{StartMs: 1000, StopMs: 5000, HasData: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("want=%+v got=%+v", want, got)
+	}
+}
+
+// TestUpdateSRangesWithHolesSingleHole is the exact scenario that was broken:
+// a window with one hole produces [true, false, true] in a single atomic write,
+// so that LATEST BY always returns the correct has_data=true for non-hole regions.
+func TestUpdateSRangesWithHolesSingleHole(t *testing.T) {
+	ensureQDBPool(t)
+	const (
+		sid = int32(90011)
+		tbl = "kline_1h"
+		tf  = "1h"
+	)
+	cleanSRanges(t, sid, tbl, tf)
+
+	// Window [1000, 9000), hole in the middle [4000, 5000).
+	mustUpdateWithHoles(t, sid, tbl, tf, 1000, 9000, []MSRange{{Start: 4000, Stop: 5000}})
+
+	got := listSnapshots(t, sid, tbl, tf)
+	want := []srangeSnapshot{
+		{StartMs: 1000, StopMs: 4000, HasData: true},
+		{StartMs: 4000, StopMs: 5000, HasData: false},
+		{StartMs: 5000, StopMs: 9000, HasData: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("want=%+v\ngot =%+v", want, got)
+	}
+	assertNoOverlapAndNoSameStateTouch(t, got)
+}
+
+// TestUpdateSRangesWithHolesHoleCoversAll ensures that when the single hole equals the
+// entire window the result is one has_data=false segment (no spurious true segments).
+func TestUpdateSRangesWithHolesHoleCoversAll(t *testing.T) {
+	ensureQDBPool(t)
+	const (
+		sid = int32(90012)
+		tbl = "kline_1h"
+		tf  = "1h"
+	)
+	cleanSRanges(t, sid, tbl, tf)
+
+	mustUpdateWithHoles(t, sid, tbl, tf, 1000, 9000, []MSRange{{Start: 1000, Stop: 9000}})
+
+	got := listSnapshots(t, sid, tbl, tf)
+	want := []srangeSnapshot{{StartMs: 1000, StopMs: 9000, HasData: false}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("want=%+v got=%+v", want, got)
+	}
+}
+
+// TestUpdateSRangesWithHolesOverwritesPrevious verifies that a second call correctly
+// overwrites the previous state (the bug scenario: previous false spans being read and
+// the new true spans surviving in LATEST BY).
+func TestUpdateSRangesWithHolesOverwritesPrevious(t *testing.T) {
+	ensureQDBPool(t)
+	const (
+		sid = int32(90013)
+		tbl = "kline_1h"
+		tf  = "1h"
+	)
+	cleanSRanges(t, sid, tbl, tf)
+
+	// First call: entire window is a hole (no data downloaded yet).
+	mustUpdateWithHoles(t, sid, tbl, tf, 1000, 9000, []MSRange{{Start: 1000, Stop: 9000}})
+	got := listSnapshots(t, sid, tbl, tf)
+	if len(got) != 1 || got[0].HasData {
+		t.Fatalf("after first call want single false span, got=%+v", got)
+	}
+
+	// Second call: data is now downloaded, no holes remain.
+	mustUpdateWithHoles(t, sid, tbl, tf, 1000, 9000, nil)
+	got = listSnapshots(t, sid, tbl, tf)
+	want := []srangeSnapshot{{StartMs: 1000, StopMs: 9000, HasData: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("after second call want=%+v got=%+v", want, got)
 	}
 }

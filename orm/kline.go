@@ -3,7 +3,6 @@ package orm
 import (
 	"bufio"
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -37,7 +36,7 @@ var (
 		NewKlineAgg("1h", "kline_1h", "", "", "", "", "6 months", "3 years"),
 		NewKlineAgg("1d", "kline_1d", "1h", "3d", "1h", "1h", "3 years", "20 years"),
 	}
-	aggMap          = make(map[string]*KlineAgg)
+	aggMap = make(map[string]*KlineAgg)
 )
 
 func init() {
@@ -268,6 +267,17 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 		}
 	}
 	if len(holes) == 0 {
+		// No holes found – mark the entire window as has_data=true in one atomic call.
+		ctx := context.Background()
+		tbl := "kline_" + timeFrame
+		sess, conn, err2 := Conn(ctx)
+		if err2 != nil {
+			return NewDbErr(core.ErrDbExecFail, err2)
+		}
+		defer conn.Release()
+		if err := sess.UpdateSRangesWithHoles(ctx, sid, tbl, timeFrame, startMS, endMS, nil); err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
 		return nil
 	}
 
@@ -345,19 +355,15 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 }
 
 func rewriteHoleRangesInWindow(ctx context.Context, sid int32, timeFrame string, startMS, endMS int64, holes []MSRange) error {
+	sess, conn, err2 := Conn(ctx)
+	if err2 != nil {
+		return err2
+	}
+	defer conn.Release()
 	tbl := "kline_" + timeFrame
-	if err := PubQ().UpdateSRanges(ctx, sid, tbl, timeFrame, startMS, endMS, true); err != nil {
-		return err
-	}
-	for _, h := range holes {
-		if h.Stop <= h.Start {
-			continue
-		}
-		if err := PubQ().UpdateSRanges(ctx, sid, tbl, timeFrame, h.Start, h.Stop, false); err != nil {
-			return err
-		}
-	}
-	return nil
+	// Use a single read+write cycle so QuestDB WAL commit lag between two consecutive
+	// UpdateSRanges calls cannot lose the has_data=true regions.
+	return sess.UpdateSRangesWithHoles(ctx, sid, tbl, timeFrame, startMS, endMS, holes)
 }
 
 func queryHyper(sess *Queries, timeFrame, sql string, limit int, args ...interface{}) (string, pgx.Rows, error) {
@@ -437,7 +443,7 @@ func getUnFinish(sess *Queries, sid int32, timeFrame string, startMS, endMS int6
 
 	// 1) Read cached unfinish (kline_un) first. Only recompute when expired.
 	cached, cachedStop, cachedExpire, err := queryUnfinish(sid, timeFrame, startMS)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, 0, err
 	}
 	if cached != nil && cachedExpire != nil && *cachedExpire > nowMS {
@@ -464,7 +470,7 @@ func getUnFinish(sess *Queries, sid int32, timeFrame string, startMS, endMS int6
 	if stopMS <= 0 {
 		stopMS = nowMS
 	}
-	if err2 := PubQ().SetUnfinish(sid, timeFrame, stopMS, bar); err2 != nil {
+	if err2 := sess.SetUnfinish(sid, timeFrame, stopMS, bar); err2 != nil {
 		log.Warn("set unfinish fail", zap.Int32("sid", sid), zap.String("tf", timeFrame), zap.String("err", err2.Short()))
 	}
 	return bar, stopMS, nil
@@ -472,16 +478,11 @@ func getUnFinish(sess *Queries, sid int32, timeFrame string, startMS, endMS int6
 
 func queryUnfinish(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline, int64, *int64, error) {
 	ctx := context.Background()
-	db, err := BanPubConn(false)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	defer db.Close()
-	row := db.QueryRowContext(ctx, `
-select start_ms,open,high,low,close,volume,quote,buy_volume,trade_num,stop_ms,expire_ms
-from kline_un
-where sid=? and timeframe=? and start_ms >= ?
-limit 1`,
+	row := pool.QueryRow(ctx, `SELECT cast(ts as long)/1000, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
+FROM kline_un_q
+LATEST BY sid, timeframe
+WHERE sid = $1 AND timeframe = $2 AND coalesce(is_deleted, false) = false
+  AND cast(ts as long)/1000 >= $3`,
 		sid, timeFrame, barStartMS,
 	)
 	var (
@@ -595,7 +596,7 @@ func calcUnfinishFromSubs(sess *Queries, sid int32, timeFrame string, startMS, e
 	unStart := utils2.AlignTfMSecs(nowMS, smallMSecs)
 	if unStart >= curStart && unStart < endMS {
 		unbar, unTo, _, err := queryUnfinish(sid, smallTF, unStart)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return nil, 0, err
 		}
 		if unbar != nil && unbar.Volume > 0 && unTo > unStart {
@@ -655,32 +656,18 @@ func GetAlignOff(sid int32, toTfMSecs int64) int64 {
 	return offMS
 }
 
-func (q *PubQueries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
+func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
 	expireMS := utils2.AlignTfMSecs(btime.UTCStamp(), 60000) + 60000
-	db, err := BanPubConn(true)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	_, err_ := db.ExecContext(context.Background(), `
-insert into kline_un (sid, timeframe, start_ms, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num)
-values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-on conflict(sid, timeframe) do update set
-  start_ms=excluded.start_ms,
-  stop_ms=excluded.stop_ms,
-  expire_ms=excluded.expire_ms,
-  open=excluded.open,
-  high=excluded.high,
-  low=excluded.low,
-  close=excluded.close,
-  volume=excluded.volume,
-  quote=excluded.quote,
-  buy_volume=excluded.buy_volume,
-  trade_num=excluded.trade_num`,
-		sid, tf, bar.Time, endMS, expireMS, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Quote, bar.BuyVolume, bar.TradeNum,
+	ts := time.UnixMilli(bar.Time).UTC()
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `INSERT INTO kline_un_q
+(sid, timeframe, ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false)`,
+		sid, tf, ts, endMS, expireMS,
+		bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Quote, bar.BuyVolume, bar.TradeNum,
 	)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbExecFail, err_)
+	if err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
 }
@@ -791,21 +778,21 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 	startMS := arr[0].Time
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	endMS := arr[len(arr)-1].Time + tfMSecs
-	insId, err := AddInsJob(AddInsKlineParams{
+	insTs, err := AddInsJob(AddInsKlineParams{
 		Sid:       exs.ID,
 		Timeframe: timeFrame,
 		StartMs:   startMS,
 		StopMs:    endMS,
 	})
-	if err != nil || insId == 0 {
+	if err != nil || insTs.IsZero() {
 		return 0, err
 	}
 	defer func() {
-		if insId == 0 {
+		if insTs.IsZero() {
 			return
 		}
-		if err_ := PubQ().DelInsKline(context.Background(), insId); err_ != nil {
-			log.Warn("DelInsKline fail", zap.Int64("id", insId), zap.Error(err_))
+		if err_ := q.DelInsKline(context.Background(), exs.ID, timeFrame, insTs); err_ != nil {
+			log.Warn("DelInsKline fail", zap.Int32("sid", exs.ID), zap.Error(err_))
 		}
 	}()
 	num, err := q.InsertKLines(timeFrame, exs.ID, arr)
@@ -892,7 +879,13 @@ func updateKLineRange(sid int32, timeFrame string, startMS, endMS int64) *errs.E
 	if startMS <= 0 || endMS <= startMS {
 		return nil
 	}
-	if err := PubQ().UpdateSRanges(context.Background(), sid, "kline_"+timeFrame, timeFrame, startMS, endMS, true); err != nil {
+	ctx := context.Background()
+	sess, conn, err2 := Conn(ctx)
+	if err2 != nil {
+		return err2
+	}
+	defer conn.Release()
+	if err := sess.UpdateSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, startMS, endMS, true); err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
@@ -940,7 +933,7 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	// It is possible that startMs happens to be the beginning of the next bar, and the previous one requires -1
 	// 有可能startMs刚好是下一个bar的开始，前一个需要-1
 	aggStart := startMS - tfMSecs
-	oldStart, oldEnd := PubQ().GetKlineRange(sid, item.TimeFrame)
+	oldStart, oldEnd := q.GetKlineRange(sid, item.TimeFrame)
 	if oldStart > 0 && oldEnd > oldStart {
 		// Avoid voids or data errors
 		// 避免出现空洞或数据错误
@@ -1061,14 +1054,12 @@ DelKLines
 func (q *Queries) DelKLines(timeFrame string) *errs.Error {
 	tblName := "kline_" + timeFrame
 	ctx := context.Background()
-	// 1. 获取sranges中有数据的sid集合
-	db, err := BanPubConn(false)
-	if err != nil {
-		return err
-	}
-	rows, err_ := db.QueryContext(ctx, `select distinct sid from sranges where tbl=? and has_data=1`, tblName)
+	// 1. 获取sranges_q中有数据的sid集合
+	rows, err_ := pool.Query(ctx, `SELECT DISTINCT sid FROM (
+  SELECT sid FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms
+  WHERE tbl = $1 AND has_data = true AND coalesce(is_deleted, false) = false
+)`, tblName)
 	if err_ != nil {
-		db.Close()
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
 	srangeSids := make(map[int32]bool)
@@ -1076,16 +1067,14 @@ func (q *Queries) DelKLines(timeFrame string) *errs.Error {
 		var sid int32
 		if err_ = rows.Scan(&sid); err_ != nil {
 			rows.Close()
-			db.Close()
 			return NewDbErr(core.ErrDbReadFail, err_)
 		}
 		srangeSids[sid] = true
 	}
 	rows.Close()
-	// 2. 获取exsymbol中所有sid集合
-	rows, err_ = db.QueryContext(ctx, `select id from exsymbol`)
+	// 2. 获取exsymbol_q中所有sid集合
+	rows, err_ = pool.Query(ctx, `SELECT sid FROM exsymbol_q LATEST BY sid WHERE coalesce(is_deleted, false) = false`)
 	if err_ != nil {
-		db.Close()
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
 	exsSids := make(map[int32]bool)
@@ -1093,13 +1082,11 @@ func (q *Queries) DelKLines(timeFrame string) *errs.Error {
 		var sid int32
 		if err_ = rows.Scan(&sid); err_ != nil {
 			rows.Close()
-			db.Close()
 			return NewDbErr(core.ErrDbReadFail, err_)
 		}
 		exsSids[sid] = true
 	}
 	rows.Close()
-	db.Close()
 	// 3. 取交集：同时在sranges和exsymbol中的sid
 	var validSids []string
 	for sid := range srangeSids {
@@ -1198,12 +1185,10 @@ FixKInfoZeros
 */
 func (q *Queries) FixKInfoZeros() *errs.Error {
 	ctx := context.Background()
-	db, err := BanPubConn(false)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	rows, err_ := db.QueryContext(ctx, `select sid,tbl,timeframe from sranges where has_data=1 and (stop_ms=0 or start_ms=0)`)
+	rows, err_ := pool.Query(ctx, `SELECT sid, tbl, timeframe
+FROM sranges_q
+LATEST BY sid, tbl, timeframe, start_ms
+WHERE has_data = true AND coalesce(is_deleted, false) = false AND (stop_ms = 0 OR start_ms = 0)`)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -1243,17 +1228,8 @@ func (q *Queries) FixKInfoZeros() *errs.Error {
 			if start <= 0 || stop <= start {
 				continue
 			}
-			{
-				dbw, err := BanPubConn(true)
-				if err != nil {
-					return err
-				}
-				_, err_ := dbw.ExecContext(ctx, `delete from sranges where sid=? and tbl=? and timeframe=? and has_data=1 and (stop_ms=0 or start_ms=0)`,
-					sid, "kline_"+tf, tf)
-				dbw.Close()
-				if err_ != nil {
-					return NewDbErr(core.ErrDbExecFail, err_)
-				}
+			if err := q.DelKInfo(sid, tf); err != nil {
+				return err
 			}
 			if err := updateKLineRange(sid, tf, start, stop); err != nil {
 				return err
@@ -1343,7 +1319,7 @@ func syncKlineInfos(sess *Queries, sids map[int32]string, prg utils.PrgCB) *errs
 	}
 	calcs := make(map[string]map[int32][2]int64)
 	for _, agg := range aggList {
-		calcs[agg.TimeFrame] = PubQ().GetKlineRanges(sidFilter, agg.TimeFrame)
+		calcs[agg.TimeFrame] = sess.GetKlineRanges(sidFilter, agg.TimeFrame)
 	}
 	// Decide which sids to process.
 	sidList := make([]int32, 0)
@@ -1395,21 +1371,27 @@ func syncKlineInfos(sess *Queries, sids map[int32]string, prg utils.PrgCB) *errs
 }
 
 func (q *Queries) syncKlineSid(sid int32, infoBy string, calcs map[string]map[int32][2]int64) *errs.Error {
-	ctx := context.Background()
 	tfRanges := make(map[string][2]int64)
 	for _, agg := range aggList {
 		rg, ok := calcs[agg.TimeFrame][sid]
 		if !ok || rg[0] == 0 || rg[1] == 0 {
-			if err := PubQ().DelKInfo(sid, agg.TimeFrame); err != nil {
+			// sranges may be corrupted; fall back to querying the actual kline table.
+			minT, maxT, err := q.getKLineTimeRange(sid, agg.TimeFrame)
+			if err != nil {
 				return err
 			}
-			continue
+			if minT == 0 || maxT == 0 {
+				if err := q.DelKInfo(sid, agg.TimeFrame); err != nil {
+					return err
+				}
+				continue
+			}
+			// maxT is the last bar's open time; stop_ms convention requires adding one tfMSecs.
+			tfMSecs := int64(utils2.TFToSecs(agg.TimeFrame) * 1000)
+			rg = [2]int64{minT, maxT + tfMSecs}
 		}
 		newStart, newEnd := rg[0], rg[1]
 		tfRanges[agg.TimeFrame] = rg
-		if err := PubQ().UpdateSRanges(ctx, sid, "kline_"+agg.TimeFrame, agg.TimeFrame, newStart, newEnd, true); err != nil {
-			return NewDbErr(core.ErrDbExecFail, err)
-		}
 		if err := q.updateKHoles(sid, agg.TimeFrame, newStart, newEnd, false); err != nil {
 			return err
 		}
@@ -1465,7 +1447,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 		defer utils.DelNetLock("UpdatePendingIns", lockVal)
 	}
 	ctx := context.Background()
-	items, err_ := PubQ().GetAllInsKlines(ctx)
+	items, err_ := q.GetAllInsKlines(ctx)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -1475,7 +1457,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 	log.Info("Updating pending insert jobs", zap.Int("num", len(items)))
 	for _, i := range items {
 		if i.StartMs > 0 && i.StopMs > 0 {
-			start, end := PubQ().GetKlineRange(i.Sid, i.Timeframe)
+			start, end := q.GetKlineRange(i.Sid, i.Timeframe)
 			if start > 0 && end > 0 {
 				exs := GetSymbolByID(i.Sid)
 				if exs != nil {
@@ -1485,7 +1467,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 				}
 			}
 		}
-		err_ = PubQ().DelInsKline(ctx, i.ID)
+		err_ = q.DelInsKline(ctx, i.Sid, i.Timeframe, i.Ts)
 		if err_ != nil {
 			return NewDbErr(core.ErrDbExecFail, err_)
 		}
@@ -1493,17 +1475,22 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 	return nil
 }
 
-func AddInsJob(add AddInsKlineParams) (int64, *errs.Error) {
+func AddInsJob(add AddInsKlineParams) (time.Time, *errs.Error) {
 	ctx := context.Background()
-	newId, err_ := PubQ().AddInsKline(ctx, add)
+	sess, conn, err2 := Conn(ctx)
+	if err2 != nil {
+		return time.Time{}, err2
+	}
+	defer conn.Release()
+	ts, err_ := sess.AddInsKline(ctx, add)
 	if err_ != nil {
-		return 0, NewDbErr(core.ErrDbExecFail, err_)
+		return time.Time{}, NewDbErr(core.ErrDbExecFail, err_)
 	}
-	if newId == 0 {
+	if ts.IsZero() {
 		log.Warn("insert candles for symbol locked, skip", zap.Int32("sid", add.Sid), zap.String("tf", add.Timeframe))
-		return 0, nil
+		return time.Time{}, nil
 	}
-	return newId, nil
+	return ts, nil
 }
 
 func GetKlineAggs() []*KlineAgg {
@@ -1636,7 +1623,12 @@ func saveAdjFactors(data map[int64]map[int32]*banexg.Kline, pCode string, pExs *
 	// Delete the old main continuous contract compounding factor
 	// 删除旧的主力连续合约复权因子
 	ctx := context.Background()
-	err_ := PubQ().DelAdjFactors(ctx, exs.ID)
+	sess, conn, err2 := Conn(ctx)
+	if err2 != nil {
+		return err2
+	}
+	defer conn.Release()
+	err_ := sess.DelAdjFactors(ctx, exs.ID)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
@@ -1699,7 +1691,7 @@ func saveAdjFactors(data map[int64]map[int32]*banexg.Kline, pCode string, pExs *
 	}
 	outPath := filepath.Join(outDir, exs.Symbol+"_adjs.txt")
 	_ = utils2.WriteFile(outPath, []byte(strings.Join(lines, "\n")))
-	_, err_ = PubQ().AddAdjFactors(ctx, adds)
+	_, err_ = sess.AddAdjFactors(ctx, adds)
 	if err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}

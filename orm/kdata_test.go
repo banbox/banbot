@@ -68,7 +68,12 @@ func TestBulkDownOHLCV(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	err = PubQ().LoadExgSymbols(core.ExgName)
+	ldSess, ldConn, err := Conn(nil)
+	if err != nil {
+		panic(err)
+	}
+	err = ldSess.LoadExgSymbols(core.ExgName)
+	ldConn.Release()
 	if err != nil {
 		panic(err)
 	}

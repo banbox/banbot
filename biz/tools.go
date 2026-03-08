@@ -206,7 +206,7 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 		}
 		klines = newKlines
 	}
-	oldStart, oldEnd := orm.PubQ().GetKlineRange(exs.ID, timeFrame)
+	oldStart, oldEnd := sess.GetKlineRange(exs.ID, timeFrame)
 	if oldStart <= startMS && endMS <= oldEnd {
 		// 都已存在，无需写入
 		return nil
@@ -340,6 +340,11 @@ func LoadCalendars(args *config.CmdArgs) *errs.Error {
 	if err != nil {
 		return err
 	}
+	sess, conn, err := orm.Conn(nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
 	lastExg := ""
 	dateList := make([][2]int64, 0)
 	dtLay := "2006-01-02"
@@ -357,7 +362,7 @@ func LoadCalendars(args *config.CmdArgs) *errs.Error {
 		}
 		if lastExg != row[0] {
 			if len(dateList) > 0 {
-				err = orm.PubQ().SetCalendars(lastExg, dateList)
+				err = sess.SetCalendars(lastExg, dateList)
 				if err != nil {
 					log.Error("save calendars fail", zap.String("exg", lastExg), zap.Error(err))
 				}
@@ -368,7 +373,7 @@ func LoadCalendars(args *config.CmdArgs) *errs.Error {
 		dateList = append(dateList, [2]int64{startMS, stopMS})
 	}
 	if len(dateList) > 0 {
-		err = orm.PubQ().SetCalendars(lastExg, dateList)
+		err = sess.SetCalendars(lastExg, dateList)
 		if err != nil {
 			log.Error("save calendars fail", zap.String("exg", lastExg), zap.Error(err))
 		}
@@ -559,13 +564,18 @@ func ExportAdjFactors(args *config.CmdArgs) *errs.Error {
 	if err_ != nil {
 		return errs.New(errs.CodeIOWriteFail, err_)
 	}
+	sess, conn, err := orm.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
 	for _, symbol := range args.Pairs {
 		log.Info("handle", zap.String("symbol", symbol))
 		exs, err := orm.GetExSymbolCur(symbol)
 		if err != nil {
 			return err
 		}
-		facs, err_ := orm.PubQ().GetAdjFactors(ctx, exs.ID)
+		facs, err_ := sess.GetAdjFactors(ctx, exs.ID)
 		if err_ != nil {
 			return orm.NewDbErr(core.ErrDbReadFail, err_)
 		}

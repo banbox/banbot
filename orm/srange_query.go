@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/banbox/banbot/core"
@@ -19,53 +20,37 @@ type FindSRangesArgs struct {
 	Offset    int
 }
 
-func (q *PubQueries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Error) {
+func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Error) {
 	if args.Sid == 0 {
 		return nil, 0, errs.NewMsg(core.ErrDbReadFail, "sid is required")
 	}
 	ctx := context.Background()
-	db, err2 := BanPubConn(false)
-	if err2 != nil {
-		return nil, 0, err2
-	}
-	defer db.Close()
-	sqlParams := make([]any, 0, 8)
-	var whereClause strings.Builder
-	add := func(expr string, val any) {
-		if whereClause.Len() == 0 {
-			whereClause.WriteString("where ")
-		} else {
-			whereClause.WriteString("and ")
-		}
-		whereClause.WriteString(expr)
-		whereClause.WriteByte(' ')
-		sqlParams = append(sqlParams, val)
-	}
 
-	add("sid=?", args.Sid)
+	var whereParts []string
+	whereParts = append(whereParts, fmt.Sprintf("sid = %d", args.Sid))
 	if args.Table != "" {
-		add("tbl=?", args.Table)
+		whereParts = append(whereParts, fmt.Sprintf("tbl = '%s'", args.Table))
 	}
 	if args.TimeFrame != "" {
-		add("timeframe=?", args.TimeFrame)
+		whereParts = append(whereParts, fmt.Sprintf("timeframe = '%s'", args.TimeFrame))
 	}
 	if args.Start > 0 {
-		add("start_ms >= ?", args.Start)
+		whereParts = append(whereParts, fmt.Sprintf("start_ms >= %d", args.Start))
 	}
 	if args.Stop > 0 {
-		add("stop_ms <= ?", args.Stop)
+		whereParts = append(whereParts, fmt.Sprintf("stop_ms <= %d", args.Stop))
 	}
 	if args.HasData != nil {
-		val := 0
-		if *args.HasData {
-			val = 1
-		}
-		add("has_data = ?", val)
+		whereParts = append(whereParts, fmt.Sprintf("has_data = %v", *args.HasData))
 	}
+	whereParts = append(whereParts, "coalesce(is_deleted, false) = false")
+	whereClause := strings.Join(whereParts, " AND ")
 
-	countSQL := "select count(*) from sranges " + whereClause.String()
+	countSQL := fmt.Sprintf(`SELECT count(*) FROM (
+  SELECT sid FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms WHERE %s
+)`, whereClause)
 	var total int64
-	if err := db.QueryRowContext(ctx, countSQL, sqlParams...).Scan(&total); err != nil {
+	if err := q.db.QueryRow(ctx, countSQL).Scan(&total); err != nil {
 		return nil, 0, NewDbErr(core.ErrDbReadFail, err)
 	}
 
@@ -73,18 +58,17 @@ func (q *PubQueries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.
 	if args.Limit > 0 {
 		limit = args.Limit
 	}
-	var b strings.Builder
-	b.WriteString("select id,sid,tbl,timeframe,start_ms,stop_ms,has_data from sranges ")
-	b.WriteString(whereClause.String())
-	b.WriteString("order by start_ms desc ")
+	dataSQL := fmt.Sprintf(`SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
+FROM sranges_q
+LATEST BY sid, tbl, timeframe, start_ms
+WHERE %s
+ORDER BY start_ms DESC`, whereClause)
 	if args.Offset > 0 {
-		b.WriteString("offset ? ")
-		sqlParams = append(sqlParams, args.Offset)
+		dataSQL += fmt.Sprintf(" OFFSET %d", args.Offset)
 	}
-	b.WriteString("limit ?")
-	sqlParams = append(sqlParams, limit)
+	dataSQL += fmt.Sprintf(" LIMIT %d", limit)
 
-	rows, err := db.QueryContext(ctx, b.String(), sqlParams...)
+	rows, err := q.db.Query(ctx, dataSQL)
 	if err != nil {
 		return nil, 0, NewDbErr(core.ErrDbReadFail, err)
 	}
@@ -93,11 +77,9 @@ func (q *PubQueries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.
 	var out []*SRange
 	for rows.Next() {
 		var r SRange
-		var hasData int64
-		if err := rows.Scan(&r.ID, &r.Sid, &r.Table, &r.Timeframe, &r.StartMs, &r.StopMs, &hasData); err != nil {
+		if err := rows.Scan(&r.Sid, &r.Table, &r.Timeframe, &r.StartMs, &r.StopMs, &r.HasData); err != nil {
 			return nil, 0, NewDbErr(core.ErrDbReadFail, err)
 		}
-		r.HasData = hasData != 0
 		out = append(out, &r)
 	}
 	if err := rows.Err(); err != nil {
@@ -106,20 +88,15 @@ func (q *PubQueries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.
 	return out, total, nil
 }
 
-func (q *PubQueries) ListSRangesBySid(ctx context.Context, sid int32) ([]*SRange, error) {
+func (q *Queries) ListSRangesBySid(ctx context.Context, sid int32) ([]*SRange, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(false)
-	if err2 != nil {
-		return nil, err2
-	}
-	defer db.Close()
-	rows, err := db.QueryContext(ctx, `
-select id,sid,tbl,timeframe,start_ms,stop_ms,has_data
-from sranges
-where sid=?
-order by tbl,timeframe,start_ms`, sid)
+	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
+FROM sranges_q
+LATEST BY sid, tbl, timeframe, start_ms
+WHERE sid = $1 AND coalesce(is_deleted, false) = false
+ORDER BY tbl, timeframe, start_ms`, sid)
 	if err != nil {
 		return nil, err
 	}
@@ -127,11 +104,9 @@ order by tbl,timeframe,start_ms`, sid)
 	var out []*SRange
 	for rows.Next() {
 		var r SRange
-		var hasData int64
-		if err := rows.Scan(&r.ID, &r.Sid, &r.Table, &r.Timeframe, &r.StartMs, &r.StopMs, &hasData); err != nil {
+		if err := rows.Scan(&r.Sid, &r.Table, &r.Timeframe, &r.StartMs, &r.StopMs, &r.HasData); err != nil {
 			return nil, err
 		}
-		r.HasData = hasData != 0
 		out = append(out, &r)
 	}
 	return out, rows.Err()

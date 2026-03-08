@@ -2,18 +2,28 @@ package orm
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
+	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
-type PubQueries struct{}
+// insKlineLocks is an in-process lock map for active kline insert jobs.
+// Key format: "<sid>/<timeframe>"  Value: ts assigned during AddInsKline.
+// This avoids false "locked" detection caused by QuestDB WAL async commit lag:
+// DelInsKline writes is_deleted=true to QuestDB but the WAL row may not be
+// visible to LATEST BY queries immediately, making a subsequent GetInsKline
+// see the old lock row and incorrectly block the next insert.
+var (
+	insKlineLocks   = make(map[string]time.Time)
+	insKlineLocksmu sync.Mutex
+)
 
-var defaultPubQueries = &PubQueries{}
-
-func PubQ() *PubQueries {
-	return defaultPubQueries
+func insKlineLockKey(sid int32, timeframe string) string {
+	return fmt.Sprintf("%d/%s", sid, timeframe)
 }
+
 
 type AddAdjFactorsParams struct {
 	Sid     int32   `json:"sid"`
@@ -33,99 +43,55 @@ type AddInsKlineParams struct {
 	Timeframe string `json:"timeframe"`
 	StartMs   int64  `json:"start_ms"`
 	StopMs    int64  `json:"stop_ms"`
-	Timeout   int64  `json:"timeout"` // busy_timeout in ms, default 5000
 }
 
-func (q *PubQueries) AddCalendars(ctx context.Context, arg []AddCalendarsParams) (int64, error) {
+func (q *Queries) AddCalendars(ctx context.Context, arg []AddCalendarsParams) (int64, error) {
 	if len(arg) == 0 {
 		return 0, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(true)
-	if err2 != nil {
-		return 0, err2
-	}
-	defer db.Close()
-	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
-	if err != nil {
-		return 0, err
-	}
-	commit := false
-	defer func() {
-		if !commit {
-			_ = tx.Rollback()
-		}
-	}()
-	stmt, err := tx.PrepareContext(ctx, `insert into calendars (name,start_ms,stop_ms) values (?,?,?)`)
-	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
-	for _, c := range arg {
-		if _, err := stmt.ExecContext(ctx, c.Name, c.StartMs, c.StopMs); err != nil {
-			return 0, err
+	now := time.Now().UTC()
+	for i, c := range arg {
+		ts := now.Add(time.Duration(i) * time.Microsecond)
+		_, err := q.db.Exec(ctx, `INSERT INTO calendars_q (ts, market, start_ms, stop_ms, is_deleted)
+VALUES ($1, $2, $3, $4, false)`, ts, c.Name, c.StartMs, c.StopMs)
+		if err != nil {
+			return int64(i), err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	commit = true
 	return int64(len(arg)), nil
 }
 
-func (q *PubQueries) AddAdjFactors(ctx context.Context, arg []AddAdjFactorsParams) (int64, error) {
+func (q *Queries) AddAdjFactors(ctx context.Context, arg []AddAdjFactorsParams) (int64, error) {
 	if len(arg) == 0 {
 		return 0, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(true)
-	if err2 != nil {
-		return 0, err2
-	}
-	defer db.Close()
-	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
-	if err != nil {
-		return 0, err
-	}
-	commit := false
-	defer func() {
-		if !commit {
-			_ = tx.Rollback()
-		}
-	}()
-	stmt, err := tx.PrepareContext(ctx, `insert into adj_factors (sid,sub_id,start_ms,factor) values (?,?,?,?)`)
-	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
-	for _, f := range arg {
-		if _, err := stmt.ExecContext(ctx, f.Sid, f.SubID, f.StartMs, f.Factor); err != nil {
-			return 0, err
+	now := time.Now().UTC()
+	for i, f := range arg {
+		ts := now.Add(time.Duration(i) * time.Microsecond)
+		_, err := q.db.Exec(ctx, `INSERT INTO adj_factors_q (ts, sid, sub_id, start_ms, factor, is_deleted)
+VALUES ($1, $2, $3, $4, $5, false)`, ts, f.Sid, f.SubID, f.StartMs, f.Factor)
+		if err != nil {
+			return int64(i), err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	commit = true
 	return int64(len(arg)), nil
 }
 
-func (q *PubQueries) GetAdjFactors(ctx context.Context, sid int32) ([]*AdjFactor, error) {
+func (q *Queries) GetAdjFactors(ctx context.Context, sid int32) ([]*AdjFactor, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(false)
-	if err2 != nil {
-		return nil, err2
-	}
-	defer db.Close()
-	rows, err := db.QueryContext(ctx, `select id,sid,sub_id,start_ms,factor from adj_factors where sid=? order by start_ms`, sid)
+	rows, err := q.db.Query(ctx, `SELECT sid, sub_id, start_ms, factor
+FROM adj_factors_q
+LATEST BY sid, sub_id, start_ms
+WHERE sid = $1 AND coalesce(is_deleted, false) = false
+ORDER BY start_ms`, sid)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +99,7 @@ func (q *PubQueries) GetAdjFactors(ctx context.Context, sid int32) ([]*AdjFactor
 	var out []*AdjFactor
 	for rows.Next() {
 		var i AdjFactor
-		if err := rows.Scan(&i.ID, &i.Sid, &i.SubID, &i.StartMs, &i.Factor); err != nil {
+		if err := rows.Scan(&i.Sid, &i.SubID, &i.StartMs, &i.Factor); err != nil {
 			return nil, err
 		}
 		out = append(out, &i)
@@ -141,46 +107,53 @@ func (q *PubQueries) GetAdjFactors(ctx context.Context, sid int32) ([]*AdjFactor
 	return out, rows.Err()
 }
 
-func (q *PubQueries) DelAdjFactors(ctx context.Context, sid int32) error {
+func (q *Queries) DelAdjFactors(ctx context.Context, sid int32) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(true)
-	if err2 != nil {
-		return err2
+	factors, err := q.GetAdjFactors(ctx, sid)
+	if err != nil {
+		return err
 	}
-	defer db.Close()
-	_, err := db.ExecContext(ctx, `delete from adj_factors where sid=?`, sid)
-	return err
+	now := time.Now().UTC()
+	for i, f := range factors {
+		ts := now.Add(time.Duration(i) * time.Microsecond)
+		_, err := q.db.Exec(ctx, `INSERT INTO adj_factors_q (ts, sid, sub_id, start_ms, factor, is_deleted, deleted_at)
+VALUES ($1, $2, $3, $4, $5, true, $1)`, ts, f.Sid, f.SubID, f.StartMs, f.Factor)
+		if err != nil {
+			return err
+		}
+	}
+	MaybeCompact("adj_factors_q")
+	return nil
 }
 
-func (q *PubQueries) GetInsKline(ctx context.Context, sid int32, timeframe string) (*InsKline, error) {
+func (q *Queries) GetInsKline(ctx context.Context, sid int32, timeframe string) (*InsKline, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(false)
-	if err2 != nil {
-		return nil, err2
-	}
-	defer db.Close()
-	row := db.QueryRowContext(ctx, `select id,sid,timeframe,start_ms,stop_ms from ins_kline where sid=? and timeframe=? limit 1`, sid, timeframe)
+	row := q.db.QueryRow(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
+FROM ins_kline_q
+LATEST BY sid, timeframe
+WHERE sid = $1 AND timeframe = $2 AND coalesce(is_deleted, false) = false`, sid, timeframe)
 	var i InsKline
-	if err := row.Scan(&i.ID, &i.Sid, &i.Timeframe, &i.StartMs, &i.StopMs); err != nil {
+	if err := row.Scan(&i.Sid, &i.Timeframe, &i.Ts, &i.StartMs, &i.StopMs); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &i, nil
 }
 
-func (q *PubQueries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
+func (q *Queries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(false)
-	if err2 != nil {
-		return nil, err2
-	}
-	defer db.Close()
-	rows, err := db.QueryContext(ctx, `select id,sid,timeframe,start_ms,stop_ms from ins_kline`)
+	rows, err := q.db.Query(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
+FROM ins_kline_q
+LATEST BY sid, timeframe
+WHERE coalesce(is_deleted, false) = false`)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +161,7 @@ func (q *PubQueries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
 	var out []*InsKline
 	for rows.Next() {
 		var i InsKline
-		if err := rows.Scan(&i.ID, &i.Sid, &i.Timeframe, &i.StartMs, &i.StopMs); err != nil {
+		if err := rows.Scan(&i.Sid, &i.Timeframe, &i.Ts, &i.StartMs, &i.StopMs); err != nil {
 			return nil, err
 		}
 		out = append(out, &i)
@@ -196,53 +169,47 @@ func (q *PubQueries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
 	return out, rows.Err()
 }
 
-func (q *PubQueries) DelInsKline(ctx context.Context, id int64) error {
+func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, ts time.Time) error {
+	key := insKlineLockKey(sid, timeframe)
+	insKlineLocksmu.Lock()
+	delete(insKlineLocks, key)
+	insKlineLocksmu.Unlock()
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(true)
-	if err2 != nil {
-		return err2
+	delTs := time.Now().UTC()
+	_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted, deleted_at)
+VALUES ($1, $2, $3, 0, 0, true, $4)`, sid, timeframe, ts, delTs)
+	if err == nil {
+		MaybeCompact("ins_kline_q")
 	}
-	defer db.Close()
-	_, err := db.ExecContext(ctx, `delete from ins_kline where id=?`, id)
 	return err
 }
 
-func (q *PubQueries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (int64, error) {
+func (q *Queries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (time.Time, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(true)
-	if err2 != nil {
-		return 0, err2
+	key := insKlineLockKey(arg.Sid, arg.Timeframe)
+	insKlineLocksmu.Lock()
+	if _, locked := insKlineLocks[key]; locked {
+		insKlineLocksmu.Unlock()
+		return time.Time{}, nil
 	}
-	defer db.Close()
-	timeout := arg.Timeout
-	if timeout <= 0 {
-		timeout = 5000
-	}
-	_, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", timeout))
+	ts := time.Now().UTC()
+	insKlineLocks[key] = ts
+	insKlineLocksmu.Unlock()
+
+	_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
+VALUES ($1, $2, $3, $4, $5, false)`, arg.Sid, arg.Timeframe, ts, arg.StartMs, arg.StopMs)
 	if err != nil {
-		return 0, err
+		insKlineLocksmu.Lock()
+		delete(insKlineLocks, key)
+		insKlineLocksmu.Unlock()
+		return time.Time{}, err
 	}
-	defer db.ExecContext(ctx, "PRAGMA busy_timeout = 10000")
-	nowMs := time.Now().UTC().UnixMilli()
-	res, err := db.ExecContext(ctx, `
-insert or ignore into ins_kline (sid,timeframe,start_ms,stop_ms,created_ms)
-values (?, ?, ?, ?, ?)`,
-		arg.Sid, arg.Timeframe, arg.StartMs, arg.StopMs, nowMs)
-	if err != nil {
-		return 0, err
-	}
-	aff, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	if aff == 0 {
-		return 0, nil
-	}
-	return res.LastInsertId()
+	return ts, nil
 }
 
 type AddSymbolsParams struct {
@@ -258,45 +225,43 @@ type SetListMSParams struct {
 	DelistMs int64 `json:"delist_ms"`
 }
 
-func (q *PubQueries) ListExchanges(ctx context.Context) ([]string, error) {
+func (q *Queries) ListExchanges(ctx context.Context) ([]string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(false)
-	if err2 != nil {
-		return nil, err2
-	}
-	defer db.Close()
-	rows, err := db.QueryContext(ctx, `select distinct exchange from exsymbol order by exchange`)
+	rows, err := q.db.Query(ctx, `SELECT DISTINCT exchange
+FROM exsymbol_q
+LATEST BY sid
+WHERE coalesce(is_deleted, false) = false
+ORDER BY exchange`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	seen := make(map[string]bool)
 	var out []string
 	for rows.Next() {
 		var v string
 		if err := rows.Scan(&v); err != nil {
 			return nil, err
 		}
-		out = append(out, v)
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
 	}
 	return out, rows.Err()
 }
 
-func (q *PubQueries) ListSymbols(ctx context.Context, exchange string) ([]*ExSymbol, error) {
+func (q *Queries) ListSymbols(ctx context.Context, exchange string) ([]*ExSymbol, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(false)
-	if err2 != nil {
-		return nil, err2
-	}
-	defer db.Close()
-	rows, err := db.QueryContext(ctx, `
-select id,exchange,exg_real,market,symbol,combined,list_ms,delist_ms
-from exsymbol
-where exchange = ?
-order by id`, exchange)
+	rows, err := q.db.Query(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms
+FROM exsymbol_q
+LATEST BY sid
+WHERE exchange = $1 AND coalesce(is_deleted, false) = false
+ORDER BY sid`, exchange)
 	if err != nil {
 		return nil, err
 	}
@@ -312,55 +277,57 @@ order by id`, exchange)
 	return out, rows.Err()
 }
 
-func (q *PubQueries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64, error) {
+func (q *Queries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64, error) {
 	if len(arg) == 0 {
 		return 0, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(true)
-	if err2 != nil {
-		return 0, err2
+	if latest := queryMaxSidFromQDB(ctx); latest > maxSid {
+		maxSid = latest
 	}
-	defer db.Close()
-	// 使用 IMMEDIATE 模式，在事务开始时就获取写锁，避免后续锁升级冲突
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
-	if err != nil {
-		return 0, err
-	}
-	commit := false
-	defer func() {
-		if !commit {
-			_ = tx.Rollback()
-		}
-	}()
-	stmt, err := tx.PrepareContext(ctx, `insert into exsymbol (exchange,exg_real,market,symbol,combined,list_ms,delist_ms) values (?,?,?,?,?,?,?)`)
-	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
-	for _, s := range arg {
-		if _, err := stmt.ExecContext(ctx, s.Exchange, s.ExgReal, s.Market, s.Symbol, 0, int64(0), int64(0)); err != nil {
-			return 0, err
+	now := time.Now().UTC()
+	for i, s := range arg {
+		maxSid++
+		sid := maxSid
+		ts := now.Add(time.Duration(i) * time.Microsecond)
+		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, is_deleted)
+VALUES ($1, $2, $3, $4, $5, $6, false, 0, 0, false)`, sid, ts, s.Exchange, s.ExgReal, s.Market, s.Symbol)
+		if err != nil {
+			return int64(i), err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	commit = true
 	return int64(len(arg)), nil
 }
 
-func (q *PubQueries) SetListMS(ctx context.Context, arg SetListMSParams) error {
+func queryMaxSidFromQDB(ctx context.Context) int32 {
+	var maxVal *int32
+	row := pool.QueryRow(ctx, `SELECT max(sid) FROM exsymbol_q`)
+	if err := row.Scan(&maxVal); err != nil || maxVal == nil {
+		return 0
+	}
+	return *maxVal
+}
+
+func (q *Queries) SetListMS(ctx context.Context, arg SetListMSParams) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, err2 := BanPubConn(true)
-	if err2 != nil {
-		return err2
+	row := q.db.QueryRow(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms
+FROM exsymbol_q
+LATEST BY sid
+WHERE sid = $1 AND coalesce(is_deleted, false) = false`, arg.ID)
+	var i ExSymbol
+	if err := row.Scan(&i.ID, &i.Exchange, &i.ExgReal, &i.Market, &i.Symbol, &i.Combined, &i.ListMs, &i.DelistMs); err != nil {
+		return fmt.Errorf("SetListMS: sid %d not found: %w", arg.ID, err)
 	}
-	defer db.Close()
-	_, err := db.ExecContext(ctx, `update exsymbol set list_ms = ?, delist_ms = ? where id = ?`, arg.ListMs, arg.DelistMs, arg.ID)
+	ts := time.Now().UTC()
+	_, err := q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, is_deleted)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
+		i.ID, ts, i.Exchange, i.ExgReal, i.Market, i.Symbol, i.Combined, arg.ListMs, arg.DelistMs)
+	if err == nil {
+		MaybeCompact("exsymbol_q")
+	}
 	return err
 }

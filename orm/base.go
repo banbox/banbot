@@ -1,14 +1,12 @@
 package orm
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	_ "embed"
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -48,7 +46,7 @@ var (
 //go:embed sql/trade_schema.sql
 var ddlTrade string
 
-//go:embed sql/banpub_schema.sql
+//go:embed sql/ui_schema.sql
 var ddlBanpub string
 
 //go:embed sql/qdb_migrations.sql
@@ -70,16 +68,9 @@ func Setup() *errs.Error {
 	if err2 != nil {
 		return err2
 	}
-	dataDir := config.GetDataDir()
-	dbPath := filepath.Join(dataDir, "banpub.db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		if err2 := checkQuestDBStale(pool); err2 != nil {
-			return err2
-		}
-	}
 	initSQLitePaths()
 	{
-		// Ensure banpub.db exists and schema is initialized before any read-only opens.
+		// Ensure banpub.db exists and schema is initialized (task table only).
 		db, err := BanPubConn(true)
 		if err != nil {
 			return err
@@ -118,60 +109,6 @@ func initSQLitePaths() {
 	SetDbPath(DbPub, dbPath)
 }
 
-// checkQuestDBStale is called when banpub.db was freshly created. If QuestDB
-// already contains data the sid references are now invalid; ask the user
-// whether to wipe QuestDB or abort.
-func checkQuestDBStale(p *pgxpool.Pool) *errs.Error {
-	ctx := context.Background()
-	// List user tables in QuestDB via the tables() system function.
-	rows, err := p.Query(ctx, `select table_name from tables()`, pgx.QueryExecModeDescribeExec)
-	if err != nil {
-		// Non-QuestDB backend or empty instance – nothing to do.
-		return nil
-	}
-	defer rows.Close()
-	var tables []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err == nil {
-			tables = append(tables, name)
-		}
-	}
-	if len(tables) == 0 {
-		return nil
-	}
-	// Check whether any table actually has rows.
-	hasData := false
-	for _, tbl := range tables {
-		var n int64
-		if err := p.QueryRow(ctx, fmt.Sprintf(`select count() from '%s'`, tbl)).Scan(&n); err == nil && n > 0 {
-			hasData = true
-			break
-		}
-	}
-	if !hasData {
-		return nil
-	}
-	// Prompt user.
-	msg := config.GetLangMsg("sqlite_empty_questdb_stale", "SQLite is empty but QuestDB has data (stale). Clear all QuestDB data?")
-	fmt.Printf("\n%s [y/N]: ", msg)
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Scan()
-	answer := strings.TrimSpace(strings.ToLower(scanner.Text()))
-	if answer != "y" && answer != "yes" {
-		panic(config.GetLangMsg("sqlite_questdb_abort", "User declined to clear stale QuestDB data, aborting."))
-	}
-	// Drop all tables.
-	log.Warn("dropping all QuestDB tables ...", zap.Int("count", len(tables)))
-	for _, tbl := range tables {
-		if _, err := p.Exec(ctx, fmt.Sprintf(`DROP TABLE '%s'`, tbl)); err != nil {
-			log.Error("drop QuestDB table failed", zap.String("table", tbl), zap.Error(err))
-		}
-	}
-	log.Info("QuestDB tables cleared")
-	return nil
-}
-
 func execMultiSQL(ctx context.Context, pool *pgxpool.Pool, sqlText string) error {
 	stmts := strings.Split(sqlText, ";")
 	for _, st := range stmts {
@@ -198,16 +135,6 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	if poolCfg.ConnConfig != nil {
 		if poolCfg.ConnConfig.Port == 5432 {
 			return nil, errs.NewMsg(core.ErrBadConfig, "port 5432 is old TimescaleDB, please update database.url to: postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable")
-		}
-		host := strings.TrimSpace(poolCfg.ConnConfig.Host)
-		if host != "" && !isLocalHost(host) {
-			return nil, errs.NewMsg(core.ErrBadConfig, "questdb must be local-only (host=%s)", host)
-		}
-		for _, fb := range poolCfg.ConnConfig.Fallbacks {
-			h := strings.TrimSpace(fb.Host)
-			if h != "" && !isLocalHost(h) {
-				return nil, errs.NewMsg(core.ErrBadConfig, "questdb must be local-only (fallback host=%s)", h)
-			}
 		}
 	}
 	// QuestDB uses the PostgreSQL wire protocol, but (unlike Postgres/TimescaleDB) it doesn't benefit from
@@ -416,7 +343,7 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 	if _, ok := dbPathInit[path]; !ok {
 		ddl, tbl := ddlTrade, "bottask"
 		if src == DbPub {
-			ddl, tbl = ddlBanpub, "calendars"
+			ddl, tbl = ddlBanpub, "task"
 		}
 		checkSql := "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?;"
 		var count int

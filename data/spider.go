@@ -789,7 +789,12 @@ func RunSpider(addr string) *errs.Error {
 	}
 	server.InitConn = makeInitConn(Spider)
 	go consumeWriteQ(5)
-	err := orm.PubQ().PurgeKlineUn()
+	sess, conn, err := orm.Conn(nil)
+	if err != nil {
+		return err
+	}
+	err = sess.PurgeKlineUn()
+	conn.Release()
 	if err != nil {
 		return err
 	}

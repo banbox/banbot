@@ -29,11 +29,11 @@ func TestGetKrange(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	_, conn, err := Conn(nil)
+	sess, conn, err := Conn(nil)
 	if err != nil {
 		panic(err)
 	}
 	defer conn.Release()
-	start, stop := PubQ().GetKlineRange(12, "1m")
+	start, stop := sess.GetKlineRange(12, "1m")
 	log.Info("krange", zap.Int64("start", start), zap.Int64("stop", stop))
 }
