@@ -1,5 +1,4 @@
-DROP TABLE IF EXISTS task;
-CREATE TABLE task
+CREATE TABLE IF NOT EXISTS task
 (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     mode      TEXT    NOT NULL, -- backtest, inner
