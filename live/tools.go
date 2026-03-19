@@ -181,12 +181,17 @@ func cancelPendingOrders(accMap map[string]bool, pairMap map[string]bool) *errs.
 				res, err := exchange.CancelOrder(order.ID, order.Symbol, map[string]interface{}{
 					banexg.ParamAccount: account,
 				})
-				if err != nil {
+			if err != nil {
+				if err.BizCode == -2011 {
+					log.Warn("cancel order skip, already cancelled on exchange", zap.String("acc", account),
+						zap.String("pair", order.Symbol), zap.String("orderId", order.ID))
+				} else {
 					log.Error("cancel order fail", zap.String("acc", account),
 						zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
 						zap.Error(err))
-					continue
 				}
+				continue
+			}
 				if res.Status == "canceled" || res.Status == "cancelled" {
 					log.Info("cancel order ok", zap.String("acc", account),
 						zap.String("pair", order.Symbol), zap.String("orderId", order.ID),

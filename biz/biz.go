@@ -315,11 +315,21 @@ func AddBatchJob(account, tf string, job *strat.StratJob, infoEnv *ta.BarEnv) {
 	tasks.Map[pairKey] = &strat.JobEnv{Job: job, Env: infoEnv, Symbol: pair}
 }
 
+type batchReadyItem struct {
+	timeframe string
+	account   string
+	mainJobs  []*strat.StratJob
+	infoJobs  map[string]*strat.JobEnv
+	stgy      *strat.TradeStrat
+}
+
 func TryFireBatches(currMS int64, isWarmUp bool) int {
-	lockBatch.Lock()
-	defer lockBatch.Unlock()
-	var err *errs.Error
+	// Collect ready items and remove them from BatchTasks while holding lockBatch,
+	// then execute callbacks outside the lock to avoid deadlock when strategy
+	// callbacks call AddBatchJob (which also acquires lockBatch).
+	var readyItems []batchReadyItem
 	var waitNum = 0
+	lockBatch.Lock()
 	for key, tasks := range strat.BatchTasks {
 		if currMS < tasks.ExecMS {
 			if tasks.ExecMS-currMS < tasks.TFMSecs/2 {
@@ -345,23 +355,35 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 		}
 		arr := strings.Split(key, "_")
 		timeframe, account := arr[0], arr[1]
-		openOds, lock := ormo.GetOpenODs(account)
+		delete(strat.BatchTasks, key)
+		readyItems = append(readyItems, batchReadyItem{
+			timeframe: timeframe,
+			account:   account,
+			mainJobs:  mainJobs,
+			infoJobs:  infoJobs,
+			stgy:      stgy,
+		})
+	}
+	lockBatch.Unlock()
+
+	var err *errs.Error
+	for _, item := range readyItems {
+		openOds, lock := ormo.GetOpenODs(item.account)
 		lock.Lock()
 		allOrders := utils.ValsOfMap(openOds)
 		lock.Unlock()
-		delete(strat.BatchTasks, key)
-		for _, job := range mainJobs {
+		for _, job := range item.mainJobs {
 			job.InitBar(allOrders)
 		}
-		if len(infoJobs) > 0 {
+		if len(item.infoJobs) > 0 {
 			num1, num2 := 0, 0
-			for _, j := range infoJobs {
+			for _, j := range item.infoJobs {
 				num1 += len(j.Job.Entrys)
 				num2 += len(j.Job.Exits)
 			}
-			stgy.OnBatchInfos(timeframe, infoJobs)
+			item.stgy.OnBatchInfos(item.timeframe, item.infoJobs)
 			num3, num4 := 0, 0
-			for _, j := range infoJobs {
+			for _, j := range item.infoJobs {
 				num3 += len(j.Job.Entrys)
 				num4 += len(j.Job.Exits)
 			}
@@ -369,15 +391,15 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 				log.Warn("Open/Close order in OnBatchInfos not support, please call `biz.GetOdMgr(s.Account).ProcessOrders(nil, s)` manually")
 			}
 		}
-		if len(mainJobs) > 0 {
+		if len(item.mainJobs) > 0 {
 			// Check all batch tasks at this time and decide which ones to enter or exit
 			// 检查此时间所有批量任务，决定哪些入场或那些出场
-			stgy.OnBatchJobs(mainJobs)
+			item.stgy.OnBatchJobs(item.mainJobs)
 			// Perform entry/exit tasks
 			// 执行入场/出场任务
 			if !isWarmUp {
-				odMgr := GetOdMgr(account)
-				for _, job := range mainJobs {
+				odMgr := GetOdMgr(item.account)
+				for _, job := range item.mainJobs {
 					_, _, err = odMgr.ProcessOrders(job)
 					if err != nil {
 						log.Error("process orders fail", zap.Error(err))

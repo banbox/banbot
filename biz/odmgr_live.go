@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/banbox/banbot/btime"
@@ -37,10 +38,10 @@ type LiveOrderMgr struct {
 	lockDoneKeys     deadlock.Mutex
 	lockExgIdMap     deadlock.Mutex
 	lockDoneTrades   deadlock.Mutex
-	isWatchMyTrade   bool                       // Is the account transaction flow being monitored? 是否正在监听账户交易流
-	isTrialUnMatches bool                       // Is monitoring unmatched transactions? 是否正在监听未匹配交易
-	isConsumeOrderQ  bool                       // Is it consuming from the order queue? 是否正在从订单队列消费
-	isWatchAccConfig bool                       // Is the leverage ratio being monitored? 是否正在监听杠杆倍数变化
+	isWatchMyTrade   int32                      // atomic flag: Is the account transaction flow being monitored? 是否正在监听账户交易流
+	isTrialUnMatches int32                      // atomic flag: Is monitoring unmatched transactions? 是否正在监听未匹配交易
+	isConsumeOrderQ  int32                      // atomic flag: Is it consuming from the order queue? 是否正在从订单队列消费
+	isWatchAccConfig int32                      // atomic flag: Is the leverage ratio being monitored? 是否正在监听杠杆倍数变化
 	unMatchTrades    map[string]*banexg.MyTrade // Transactions received from ws that have no matching orders 从ws收到的暂无匹配的订单的交易
 	lockUnMatches    deadlock.Mutex             // Prevent concurrent reading and writing of unMatchTrades 防止并发读写unMatchTrades
 	exitByMyOrder    FuncHandleMyOrder          // Try to use the transaction results of other end operations to update the current order status 尝试使用其他端操作的交易结果，更新当前订单状态
@@ -646,19 +647,27 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 					return err
 				}
 				delete(openOds, iod.ID)
-			} else if fillAmt < odAmt*0.99 {
-				price := com.GetPrice(pair, "")
-				holdCost := odAmt * price
-				fillPct := math.Round(fillAmt * 100 / odAmt)
-				log.Error("position not match", zap.String("acc", o.Account),
-					zap.String("pair", pair), zap.String("key", iod.Key()),
-					zap.Float64("holdCost", holdCost), zap.Float64("fillPct", fillPct))
+		} else if fillAmt < odAmt*0.99 {
+			price := com.GetPriceSafe(pair, "")
+			if price == -1 {
+				log.Warn("price not available, skip position mismatch check", zap.String("pair", pair))
+				continue
 			}
+			holdCost := odAmt * price
+			fillPct := math.Round(fillAmt * 100 / odAmt)
+			log.Error("position not match", zap.String("acc", o.Account),
+				zap.String("pair", pair), zap.String("key", iod.Key()),
+				zap.Float64("holdCost", holdCost), zap.Float64("fillPct", fillPct))
+		}
 		}
 	}
 	if config.TakeOverStrat == "" {
 		if longPosAmt > AmtDust || shortPosAmt > AmtDust {
-			price := com.GetPrice(pair, "")
+			price := com.GetPriceSafe(pair, "")
+			if price == -1 {
+				log.Warn("price not available, skip unknown position check", zap.String("pair", pair))
+				return nil
+			}
 			longCost := math.Round(longPosAmt*price*100) / 100
 			shortCost := math.Round(shortPosAmt*price*100) / 100
 			if longCost > 1 {
@@ -1134,13 +1143,12 @@ func makeAfterExit(o *LiveOrderMgr) FuncHandleIOrder {
 }
 
 func (o *LiveOrderMgr) ConsumeOrderQueue() {
-	if o.isConsumeOrderQ {
+	if !atomic.CompareAndSwapInt32(&o.isConsumeOrderQ, 0, 1) {
 		return
 	}
-	o.isConsumeOrderQ = true
 	go func() {
 		defer func() {
-			o.isConsumeOrderQ = false
+			atomic.StoreInt32(&o.isConsumeOrderQ, 0)
 		}()
 		for {
 			var item *OdQItem
@@ -1211,9 +1219,6 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 }
 
 func (o *LiveOrderMgr) WatchMyTrades() {
-	if o.isWatchMyTrade {
-		return
-	}
 	out, err := exg.Default.WatchMyTrades(map[string]interface{}{
 		banexg.ParamAccount: o.Account,
 	})
@@ -1221,10 +1226,12 @@ func (o *LiveOrderMgr) WatchMyTrades() {
 		log.Error("WatchMyTrades fail", zap.String("acc", o.Account), zap.Error(err))
 		return
 	}
-	o.isWatchMyTrade = true
+	if !atomic.CompareAndSwapInt32(&o.isWatchMyTrade, 0, 1) {
+		return
+	}
 	go func() {
 		defer func() {
-			o.isWatchMyTrade = false
+			atomic.StoreInt32(&o.isWatchMyTrade, 0)
 		}()
 		for trade := range out {
 			orm.AddDumpRow(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
@@ -1379,13 +1386,15 @@ func getClientOrderId(clientId string) int64 {
 }
 
 func (o *LiveOrderMgr) TrialUnMatchesForever() {
-	if !core.EnvReal || o.isTrialUnMatches {
+	if !core.EnvReal {
 		return
 	}
-	o.isTrialUnMatches = true
+	if !atomic.CompareAndSwapInt32(&o.isTrialUnMatches, 0, 1) {
+		return
+	}
 	go func() {
 		defer func() {
-			o.isTrialUnMatches = false
+			atomic.StoreInt32(&o.isTrialUnMatches, 0)
 		}()
 		for {
 			if !core.Sleep(time.Second * 3) {
@@ -2806,23 +2815,26 @@ func (o *LiveOrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 }
 
 func (o *LiveOrderMgr) WatchLeverages() {
-	if !core.IsContract || o.isWatchAccConfig {
+	if !core.IsContract {
 		return
 	}
 	if !exg.Default.HasApi(banexg.ApiWatchAccountConfig, core.Market) {
+		return
+	}
+	if !atomic.CompareAndSwapInt32(&o.isWatchAccConfig, 0, 1) {
 		return
 	}
 	out, err := exg.Default.WatchAccountConfig(map[string]interface{}{
 		banexg.ParamAccount: o.Account,
 	})
 	if err != nil {
+		atomic.StoreInt32(&o.isWatchAccConfig, 0)
 		log.Error("WatchLeverages error", zap.Error(err))
 		return
 	}
-	o.isWatchAccConfig = true
 	go func() {
 		defer func() {
-			o.isWatchAccConfig = false
+			atomic.StoreInt32(&o.isWatchAccConfig, 0)
 		}()
 		for range out {
 			continue

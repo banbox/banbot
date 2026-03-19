@@ -125,11 +125,15 @@ func loadOpenODs(account string, odMap map[int64]*InOutOrder) *errs.Error {
 			dupKeys[key] = od.Key()
 		}
 	}
-	if len(missKeys) > 0 || len(dupKeys) > 0 {
-		if btime.UTCStamp()-core.StartAt > 180000 {
-			// 启动超过3分钟，才打印日志，避免启动时的噪声
+	if btime.UTCStamp()-core.StartAt > 180000 {
+		// 启动超过3分钟，才打印日志，避免启动时的噪声
+		if len(dupKeys) > 0 {
+			// dup: 内存有但DB没有，属于真正的数据不一致
 			log.Error("loadOpenODs diff", zap.String("acc", account), zap.Any("dup", dupKeys),
 				zap.Any("miss", missKeys))
+		} else if len(missKeys) > 0 {
+			// miss: DB有但内存没有，属于正常的同步补充行为，已添加到内存
+			log.Info("loadOpenODs sync", zap.String("acc", account), zap.Any("miss", missKeys))
 		}
 	}
 	return nil
