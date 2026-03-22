@@ -33,8 +33,7 @@ func (q *Queries) PurgeKlineUn() *errs.Error {
   quote      DOUBLE,
   buy_volume DOUBLE,
   trade_num  LONG,
-  is_deleted BOOLEAN,
-  deleted_at TIMESTAMP
+  is_deleted BOOLEAN
 ) TIMESTAMP(ts) PARTITION BY MONTH WAL
 DEDUP UPSERT KEYS(sid, timeframe, ts)`)
 	if err != nil {
@@ -200,11 +199,14 @@ WHERE (sid = $1 OR sub_id = $1) AND coalesce(is_deleted, false) = false`
 	}
 
 	now := time.Now().UTC()
-	for i, k := range items {
-		ts := now.Add(time.Duration(i) * time.Microsecond)
-		_, err := q.db.Exec(ctx, `INSERT INTO adj_factors_q (ts, sid, sub_id, start_ms, factor, is_deleted, deleted_at)
-VALUES ($1, $2, $3, $4, $5, true, $1)`, ts, k.sid, k.subId, k.startMs, k.factor)
-		if err != nil {
+	if len(items) > 0 {
+		const cols = 5
+		batchArgs := make([]any, 0, len(items)*cols)
+		for i, k := range items {
+			batchArgs = append(batchArgs, now.Add(time.Duration(i)*time.Microsecond), k.sid, k.subId, k.startMs, k.factor)
+		}
+		batchSQL := "INSERT INTO adj_factors_q (ts,sid,sub_id,start_ms,factor,is_deleted) VALUES " + buildBatchValues(len(items), cols, ",true")
+		if _, err := q.db.Exec(ctx, batchSQL, batchArgs...); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
 	}
@@ -219,8 +221,8 @@ func (q *Queries) DelKLineUn(sid int32, timeFrame string) *errs.Error {
 	}
 	ts := time.Now().UTC()
 	_, err := q.db.Exec(ctx, `INSERT INTO kline_un_q (sid, timeframe, ts, stop_ms, expire_ms,
-open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted, deleted_at)
-VALUES ($1, $2, $3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, true, $3)`, sid, timeFrame, ts)
+open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted)
+VALUES ($1, $2, $3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, true)`, sid, timeFrame, ts)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}

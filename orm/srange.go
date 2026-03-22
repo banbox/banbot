@@ -529,55 +529,33 @@ ORDER BY start_ms, stop_ms`,
 }
 
 // batchInsertSrangesDeleted inserts logical-delete markers for each span in one multi-row INSERT.
-// Each row gets a distinct microsecond timestamp so QuestDB LATEST BY works correctly.
-// has_data is inlined as a SQL literal because QuestDB's PGWire does not reliably handle
-// Go bool parameters.
 func batchInsertSrangesDeleted(ctx context.Context, q *Queries, sid int32, tbl, tf string, spans []srangeSpan, now time.Time, microOff *int) error {
-	const colsPerRow = 6 // sid, ts, tbl, tf, start_ms, stop_ms  (has_data inlined, is_deleted=true, deleted_at=$2)
-	var b strings.Builder
-	args := make([]any, 0, len(spans)*colsPerRow)
-	for i, s := range spans {
-		ts := now.Add(time.Duration(*microOff) * time.Microsecond)
-		(*microOff)++
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		p := i*colsPerRow + 1
-		hasDataLit := "false"
-		if s.HasData {
-			hasDataLit = "true"
-		}
-		b.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,%s,true,$%d)", p, p+1, p+2, p+3, p+4, p+5, hasDataLit, p+1))
-		args = append(args, sid, ts, tbl, tf, s.StartMs, s.StopMs)
-	}
-	sql := "INSERT INTO sranges_q (sid,ts,tbl,timeframe,start_ms,stop_ms,has_data,is_deleted,deleted_at) VALUES " + b.String()
-	_, err := q.db.Exec(ctx, sql, args...)
-	return err
+	return batchInsertSrangesRows(ctx, q, sid, tbl, tf, spans, now, microOff, true)
 }
 
 // batchInsertSranges inserts new active srange rows in one multi-row INSERT.
-// has_data is inlined as a SQL literal (true/false) rather than a bound parameter
-// because QuestDB's PGWire implementation does not reliably handle Go bool parameters
-// and always reads them back as false.
+// has_data is inlined as a SQL literal rather than a bound parameter because
+// QuestDB's PGWire does not reliably handle Go bool parameters.
 func batchInsertSranges(ctx context.Context, q *Queries, sid int32, tbl, tf string, spans []srangeSpan, now time.Time, microOff *int) error {
-	const colsPerRow = 6 // sid, ts, tbl, tf, start_ms, stop_ms  (has_data inlined as literal)
-	var b strings.Builder
+	return batchInsertSrangesRows(ctx, q, sid, tbl, tf, spans, now, microOff, false)
+}
+
+// batchInsertSrangesRows is the shared implementation for batchInsertSranges and
+// batchInsertSrangesDeleted. deleted controls the is_deleted literal written for
+// every row; has_data per-span is also inlined as a SQL literal.
+func batchInsertSrangesRows(ctx context.Context, q *Queries, sid int32, tbl, tf string, spans []srangeSpan, now time.Time, microOff *int, deleted bool) error {
+	const colsPerRow = 6 // sid, ts, tbl, tf, start_ms, stop_ms
+	deletedLit := boolLit(deleted)
 	args := make([]any, 0, len(spans)*colsPerRow)
+	valueParts := make([]string, len(spans))
 	for i, s := range spans {
 		ts := now.Add(time.Duration(*microOff) * time.Microsecond)
 		(*microOff)++
-		if i > 0 {
-			b.WriteByte(',')
-		}
 		p := i*colsPerRow + 1
-		hasDataLit := "false"
-		if s.HasData {
-			hasDataLit = "true"
-		}
-		b.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,%s,false)", p, p+1, p+2, p+3, p+4, p+5, hasDataLit))
+		valueParts[i] = fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,%s,%s)", p, p+1, p+2, p+3, p+4, p+5, boolLit(s.HasData), deletedLit)
 		args = append(args, sid, ts, tbl, tf, s.StartMs, s.StopMs)
 	}
-	sql := "INSERT INTO sranges_q (sid,ts,tbl,timeframe,start_ms,stop_ms,has_data,is_deleted) VALUES " + b.String()
+	sql := "INSERT INTO sranges_q (sid,ts,tbl,timeframe,start_ms,stop_ms,has_data,is_deleted) VALUES " + strings.Join(valueParts, ",")
 	_, err := q.db.Exec(ctx, sql, args...)
 	return err
 }

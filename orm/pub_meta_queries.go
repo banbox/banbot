@@ -55,13 +55,14 @@ func (q *Queries) AddCalendars(ctx context.Context, arg []AddCalendarsParams) (i
 		return q.addCalendarsPg(ctx, arg)
 	}
 	now := time.Now().UTC()
+	const cols = 4
+	args := make([]any, 0, len(arg)*cols)
 	for i, c := range arg {
-		ts := now.Add(time.Duration(i) * time.Microsecond)
-		_, err := q.db.Exec(ctx, `INSERT INTO calendars_q (ts, market, start_ms, stop_ms, is_deleted)
-VALUES ($1, $2, $3, $4, false)`, ts, c.Name, c.StartMs, c.StopMs)
-		if err != nil {
-			return int64(i), err
-		}
+		args = append(args, now.Add(time.Duration(i)*time.Microsecond), c.Name, c.StartMs, c.StopMs)
+	}
+	sql := "INSERT INTO calendars_q (ts,market,start_ms,stop_ms,is_deleted) VALUES " + buildBatchValues(len(arg), cols, ",false")
+	if _, err := q.db.Exec(ctx, sql, args...); err != nil {
+		return 0, err
 	}
 	return int64(len(arg)), nil
 }
@@ -77,13 +78,14 @@ func (q *Queries) AddAdjFactors(ctx context.Context, arg []AddAdjFactorsParams) 
 		return q.addAdjFactorsPg(ctx, arg)
 	}
 	now := time.Now().UTC()
+	const cols = 5
+	args := make([]any, 0, len(arg)*cols)
 	for i, f := range arg {
-		ts := now.Add(time.Duration(i) * time.Microsecond)
-		_, err := q.db.Exec(ctx, `INSERT INTO adj_factors_q (ts, sid, sub_id, start_ms, factor, is_deleted)
-VALUES ($1, $2, $3, $4, $5, false)`, ts, f.Sid, f.SubID, f.StartMs, f.Factor)
-		if err != nil {
-			return int64(i), err
-		}
+		args = append(args, now.Add(time.Duration(i)*time.Microsecond), f.Sid, f.SubID, f.StartMs, f.Factor)
+	}
+	sql := "INSERT INTO adj_factors_q (ts,sid,sub_id,start_ms,factor,is_deleted) VALUES " + buildBatchValues(len(arg), cols, ",false")
+	if _, err := q.db.Exec(ctx, sql, args...); err != nil {
+		return 0, err
 	}
 	return int64(len(arg)), nil
 }
@@ -126,17 +128,27 @@ func (q *Queries) DelAdjFactors(ctx context.Context, sid int32) error {
 	if err != nil {
 		return err
 	}
+	if len(factors) == 0 {
+		return nil
+	}
 	now := time.Now().UTC()
-	for i, f := range factors {
-		ts := now.Add(time.Duration(i) * time.Microsecond)
-		_, err := q.db.Exec(ctx, `INSERT INTO adj_factors_q (ts, sid, sub_id, start_ms, factor, is_deleted, deleted_at)
-VALUES ($1, $2, $3, $4, $5, true, $1)`, ts, f.Sid, f.SubID, f.StartMs, f.Factor)
-		if err != nil {
-			return err
-		}
+	if err = batchInsertAdjFactorsDeleted(ctx, q, factors, now); err != nil {
+		return err
 	}
 	MaybeCompact("adj_factors_q")
 	return nil
+}
+
+// batchInsertAdjFactorsDeleted marks a list of adj_factor rows as deleted in one multi-row INSERT.
+func batchInsertAdjFactorsDeleted(ctx context.Context, q *Queries, factors []*AdjFactor, now time.Time) error {
+	const cols = 5 // ts, sid, sub_id, start_ms, factor
+	args := make([]any, 0, len(factors)*cols)
+	for i, f := range factors {
+		args = append(args, now.Add(time.Duration(i)*time.Microsecond), f.Sid, f.SubID, f.StartMs, f.Factor)
+	}
+	sql := "INSERT INTO adj_factors_q (ts,sid,sub_id,start_ms,factor,is_deleted) VALUES " + buildBatchValues(len(factors), cols, ",true")
+	_, err := q.db.Exec(ctx, sql, args...)
+	return err
 }
 
 func (q *Queries) GetInsKline(ctx context.Context, sid int32, timeframe string) (*InsKline, error) {
@@ -198,9 +210,8 @@ func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, 
 	if !IsQuestDB {
 		return q.delInsKlinePg(ctx, sid, timeframe)
 	}
-	delTs := time.Now().UTC()
-	_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted, deleted_at)
-VALUES ($1, $2, $3, 0, 0, true, $4)`, sid, timeframe, ts, delTs)
+	_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
+VALUES ($1, $2, $3, 0, 0, true)`, sid, timeframe, ts)
 	if err == nil {
 		MaybeCompact("ins_kline_q")
 	}
@@ -264,17 +275,13 @@ ORDER BY exchange`)
 		return nil, err
 	}
 	defer rows.Close()
-	seen := make(map[string]bool)
 	var out []string
 	for rows.Next() {
 		var v string
 		if err := rows.Scan(&v); err != nil {
 			return nil, err
 		}
-		if !seen[v] {
-			seen[v] = true
-			out = append(out, v)
-		}
+		out = append(out, v)
 	}
 	return out, rows.Err()
 }

@@ -84,8 +84,7 @@ CREATE TABLE IF NOT EXISTS exsymbol_q (
   combined   BOOLEAN,
   list_ms    LONG,
   delist_ms  LONG,
-  is_deleted BOOLEAN,
-  deleted_at TIMESTAMP
+  is_deleted BOOLEAN
 ) TIMESTAMP(ts) PARTITION BY YEAR WAL
 DEDUP UPSERT KEYS(sid, ts);
 
@@ -94,8 +93,7 @@ CREATE TABLE IF NOT EXISTS calendars_q (
   market     SYMBOL,
   start_ms   LONG,
   stop_ms    LONG,
-  is_deleted BOOLEAN,
-  deleted_at TIMESTAMP
+  is_deleted BOOLEAN
 ) TIMESTAMP(ts) PARTITION BY YEAR WAL
 DEDUP UPSERT KEYS(market, start_ms, ts);
 
@@ -105,8 +103,7 @@ CREATE TABLE IF NOT EXISTS adj_factors_q (
   sub_id     INT,
   start_ms   LONG,
   factor     DOUBLE,
-  is_deleted BOOLEAN,
-  deleted_at TIMESTAMP
+  is_deleted BOOLEAN
 ) TIMESTAMP(ts) PARTITION BY MONTH WAL
 DEDUP UPSERT KEYS(sid, sub_id, start_ms, ts);
 
@@ -118,8 +115,7 @@ CREATE TABLE IF NOT EXISTS sranges_q (
   start_ms   LONG,
   stop_ms    LONG,
   has_data   BOOLEAN,
-  is_deleted BOOLEAN,
-  deleted_at TIMESTAMP
+  is_deleted BOOLEAN
 ) TIMESTAMP(ts) PARTITION BY MONTH WAL
 DEDUP UPSERT KEYS(sid, tbl, timeframe, start_ms, ts);
 
@@ -129,8 +125,7 @@ CREATE TABLE IF NOT EXISTS ins_kline_q (
   ts         TIMESTAMP,
   start_ms   LONG,
   stop_ms    LONG,
-  is_deleted BOOLEAN,
-  deleted_at TIMESTAMP
+  is_deleted BOOLEAN
 ) TIMESTAMP(ts) PARTITION BY DAY WAL
 DEDUP UPSERT KEYS(sid, timeframe, ts);
 
@@ -148,7 +143,6 @@ CREATE TABLE IF NOT EXISTS kline_un_q (
   quote      DOUBLE,
   buy_volume DOUBLE,
   trade_num  LONG,
-  is_deleted BOOLEAN,
-  deleted_at TIMESTAMP
+  is_deleted BOOLEAN
 ) TIMESTAMP(ts) PARTITION BY MONTH WAL
 DEDUP UPSERT KEYS(sid, timeframe, ts)

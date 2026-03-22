@@ -48,8 +48,8 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND coalesce(is_deleted, false) =
 	now := time.Now().UTC()
 	for i, it := range items {
 		ts := now.Add(time.Duration(i) * time.Microsecond)
-		_, _ = pool.Exec(ctx, `INSERT INTO sranges_q (sid, ts, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted, deleted_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, true, $2)`, sid, ts, tbl, tf, it.startMs, it.stopMs, it.hasData)
+		_, _ = pool.Exec(ctx, `INSERT INTO sranges_q (sid, ts, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted)
+VALUES ($1, $2, $3, $4, $5, $6, $7, true)`, sid, ts, tbl, tf, it.startMs, it.stopMs, it.hasData)
 	}
 	time.Sleep(200 * time.Millisecond)
 }

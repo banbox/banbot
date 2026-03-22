@@ -99,7 +99,7 @@ PostgreSQL `sranges` 表设计与 `sranges_q` 的主要差异：
 ### 1.4 未完成 K 线（kline_un）差异
 
 - TimescaleDB（banbotraw）：`kline_un` 是独立 PostgreSQL 表，字段为 `(sid, start_ms, stop_ms, timeframe, open, high, low, close, volume, info)`，通过 `UPDATE … WHERE sid=? AND timeframe=?` 或 `INSERT` 实现 upsert，通过 `DELETE` 物理删除
-- QuestDB（v0.3.7）：`kline_un_q` 是独立 QuestDB 表，字段拆分为 `(sid, timeframe, ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted, deleted_at)`，使用 `LATEST BY sid, timeframe` + `is_deleted=false` 软删除，新增 `expire_ms` 字段用于缓存有效期控制
+- QuestDB（v0.3.7）：`kline_un_q` 是独立 QuestDB 表，字段拆分为 `(sid, timeframe, ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted)`，使用 `LATEST BY sid, timeframe` + `is_deleted=false` 软删除，新增 `expire_ms` 字段用于缓存有效期控制
 
 **新方案决策：** TimescaleDB 版的 `kline_un` 表也统一采用拆分字段（`quote, buy_volume, trade_num`），去除 `info`，同时保留 `expire_ms` 字段（用于与 QuestDB 版共享 `getUnFinish` 的过期判断逻辑）。删除方式使用 PostgreSQL 原生 `DELETE/UPDATE`，无需软删除。
 
@@ -246,7 +246,7 @@ sranges(
 )
 ```
 
-与 QuestDB 的 `sranges_q` 相比：去掉 `ts`、`is_deleted`、`deleted_at` 列；加入 UNIQUE 约束支持 upsert；依赖事务保证原子性，无需 `srangesCache`。
+与 QuestDB 的 `sranges_q` 相比：去掉 `ts`、`is_deleted` 列；加入 UNIQUE 约束支持 upsert；依赖事务保证原子性，无需 `srangesCache`。
 
 **需要新增 PG 原生实现的函数（在 `orm/pg_srange.go` 中实现）：**
 

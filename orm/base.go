@@ -840,3 +840,43 @@ func runPgMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 	}
 	return nil
 }
+
+// buildBatchValues builds a multi-row VALUES clause for a batch INSERT.
+//
+// n is the number of rows, cols is the number of bound parameters per row.
+// suffix is an optional string of literal SQL tokens appended after the bound
+// parameters of every row (e.g. ",true" to add a literal boolean column).
+// It returns the VALUES string ready to be concatenated after the INSERT header.
+//
+// Example: buildBatchValues(2, 3, ",false")
+//
+//	→ "($1,$2,$3,false),($4,$5,$6,false)"
+func buildBatchValues(n, cols int, suffix string) string {
+	var b strings.Builder
+	b.Grow(n * (cols*4 + len(suffix) + 3))
+	for i := range n {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('(')
+		base := i*cols + 1
+		for c := range cols {
+			if c > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteByte('$')
+			b.WriteString(strconv.Itoa(base + c))
+		}
+		b.WriteString(suffix)
+		b.WriteByte(')')
+	}
+	return b.String()
+}
+
+// boolLit returns the SQL literal for a Go bool.
+func boolLit(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
+}

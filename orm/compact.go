@@ -17,7 +17,7 @@ import (
 // statement without hardcoding SQL per table.
 type TableCompactMeta struct {
 	LatestByKeys string        // e.g. "sid, tbl, timeframe, start_ms"
-	SelectCols   string        // columns to copy (excluding is_deleted/deleted_at)
+	SelectCols   string        // columns to copy (excluding is_deleted)
 	PartitionBy  string        // e.g. "MONTH"
 	DedupKeys    string        // e.g. "sid, tbl, timeframe, start_ms, ts"
 	Cooldown     time.Duration // per-table cooldown between checks
@@ -161,8 +161,7 @@ func execCompact(ctx context.Context, tableName string, meta *TableCompactMeta, 
 
 	createSQL := fmt.Sprintf(`CREATE TABLE %s AS (
   SELECT %s,
-         cast(false as boolean) as is_deleted,
-         cast(null as timestamp) as deleted_at
+         cast(false as boolean) as is_deleted
   FROM %s
   LATEST BY %s
   WHERE coalesce(is_deleted, false) = false

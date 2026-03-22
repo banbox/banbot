@@ -910,26 +910,26 @@ WHERE market = $1 AND coalesce(is_deleted, false) = false`
 	if len(olds) > 0 {
 		items[0][0] = olds[0].StartMs
 		items[len(items)-1][1] = olds[len(olds)-1].StopMs
+		const cols = 4
+		delArgs := make([]any, 0, len(olds)*cols)
 		for _, o := range olds {
-			ts := now.Add(time.Duration(microOff) * time.Microsecond)
+			delArgs = append(delArgs, now.Add(time.Duration(microOff)*time.Microsecond), name, o.StartMs, o.StopMs)
 			microOff++
-			_, err := q.db.Exec(ctx, `INSERT INTO calendars_q (ts, market, start_ms, stop_ms, is_deleted, deleted_at)
-VALUES ($1, $2, $3, $4, true, $1)`, ts, name, o.StartMs, o.StopMs)
-			if err != nil {
-				return NewDbErr(core.ErrDbExecFail, err)
-			}
+		}
+		if _, err := q.db.Exec(ctx, "INSERT INTO calendars_q (ts,market,start_ms,stop_ms,is_deleted) VALUES "+buildBatchValues(len(olds), cols, ",true"), delArgs...); err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
 		}
 		MaybeCompact("calendars_q")
 	}
 
+	const cols = 4
+	insArgs := make([]any, 0, len(items)*cols)
 	for _, tu := range items {
-		ts := now.Add(time.Duration(microOff) * time.Microsecond)
+		insArgs = append(insArgs, now.Add(time.Duration(microOff)*time.Microsecond), name, tu[0], tu[1])
 		microOff++
-		_, err := q.db.Exec(ctx, `INSERT INTO calendars_q (ts, market, start_ms, stop_ms, is_deleted)
-VALUES ($1, $2, $3, $4, false)`, ts, name, tu[0], tu[1])
-		if err != nil {
-			return NewDbErr(core.ErrDbExecFail, err)
-		}
+	}
+	if _, err := q.db.Exec(ctx, "INSERT INTO calendars_q (ts,market,start_ms,stop_ms,is_deleted) VALUES "+buildBatchValues(len(items), cols, ",false"), insArgs...); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
 }
