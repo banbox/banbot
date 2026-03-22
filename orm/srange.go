@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -128,6 +129,9 @@ func (q *Queries) ListSRanges(ctx context.Context, sid int32, table, timeframe s
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !IsQuestDB {
+		return q.listSRangesPg(ctx, sid, table, timeframe, startMs, stopMs)
+	}
 	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
 FROM sranges_q
 LATEST BY sid, tbl, timeframe, start_ms
@@ -153,6 +157,9 @@ ORDER BY start_ms`,
 }
 
 func (q *Queries) getCoveredRanges(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]MSRange, error) {
+	if !IsQuestDB {
+		return q.getCoveredRangesPg(ctx, sid, table, timeframe, startMs, stopMs)
+	}
 	rows, err := q.ListSRanges(ctx, sid, table, timeframe, startMs, stopMs)
 	if err != nil {
 		return nil, err
@@ -213,6 +220,13 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !IsQuestDB {
+		return q.UpdateSRangesWithHolesPg(ctx, sid, table, timeframe, startMs, stopMs, holes)
+	}
+
+	// Sort holes ascending by Start so the cur-pointer sweep below is correct.
+	// Callers are expected to pass non-overlapping holes, but ordering is not guaranteed.
+	sort.Slice(holes, func(i, j int) bool { return holes[i].Start < holes[j].Start })
 
 	// Build the complete desired seg list in memory first:
 	// everything inside [startMs, stopMs) is has_data=true unless it falls in a hole.
@@ -224,7 +238,7 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 	wantSegs := make([]seg, 0, len(holes)*2+1)
 	cur := startMs
 	for _, h := range holes {
-		if h.Start > h.Stop || h.Stop <= startMs || h.Start >= stopMs {
+		if h.Start >= h.Stop || h.Stop <= startMs || h.Start >= stopMs {
 			continue
 		}
 		hs := max(h.Start, startMs)
@@ -280,61 +294,99 @@ ORDER BY start_ms`,
 	now := time.Now().UTC()
 	microOff := 0
 
-	// Logically delete all existing spans that overlap the window.
+	// Recover parts of overlapping spans that extend beyond [startMs, stopMs).
+	// The SQL query uses stop_ms >= startMs AND start_ms <= stopMs, so it can return spans
+	// that only partially overlap the window. Those spans will be fully deleted below, but
+	// the portions outside the window must be re-inserted as new segments.
+	var overhangSegs []srangeSpan
+	for _, s := range spans {
+		if s.StartMs < startMs {
+			overhangSegs = append(overhangSegs, srangeSpan{StartMs: s.StartMs, StopMs: startMs, HasData: s.HasData})
+		}
+		if s.StopMs > stopMs {
+			overhangSegs = append(overhangSegs, srangeSpan{StartMs: stopMs, StopMs: s.StopMs, HasData: s.HasData})
+		}
+	}
+
+	// Logically delete all existing spans that overlap the window in one batch INSERT.
 	if len(spans) > 0 {
-		for _, s := range spans {
-			ts := now.Add(time.Duration(microOff) * time.Microsecond)
-			microOff++
-			_, err = q.db.Exec(ctx, `INSERT INTO sranges_q (sid, ts, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted, deleted_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, true, $2)`,
-				sid, ts, table, timeframe, s.StartMs, s.StopMs, s.HasData)
-			if err != nil {
-				return fmt.Errorf("logical delete srange: %w", err)
-			}
+		if err = batchInsertSrangesDeleted(ctx, q, sid, table, timeframe, spans, now, &microOff); err != nil {
+			return fmt.Errorf("logical delete srange: %w", err)
 		}
 		MaybeCompact("sranges_q")
 	}
 
-	if len(wantSegs) == 0 {
-		srangesCacheDel(sid, table, timeframe)
+	// Build the final insert list: window segments + overhang segments from outside the window.
+	newSpansFromWant := make([]srangeSpan, len(wantSegs)+len(overhangSegs))
+	for i, s := range wantSegs {
+		newSpansFromWant[i] = srangeSpan{StartMs: s.StartMs, StopMs: s.StopMs, HasData: s.HasData}
+	}
+	for i, s := range overhangSegs {
+		newSpansFromWant[len(wantSegs)+i] = s
+	}
+	if len(newSpansFromWant) == 0 {
+		// Nothing to insert; update cache to remove the window interior only.
+		key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
+		srangesCacheLock.Lock()
+		entry := srangesCache[key]
+		if entry != nil {
+			kept := entry.spans[:0]
+			for _, s := range entry.spans {
+				if s.StopMs <= startMs || s.StartMs >= stopMs {
+					kept = append(kept, s)
+				}
+			}
+			if len(kept) == 0 {
+				delete(srangesCache, key)
+			} else {
+				srangesCache[key] = &srangesCacheEntry{spans: kept}
+			}
+		}
+		srangesCacheLock.Unlock()
 		return nil
 	}
 
-	// Insert the new complete set of segs in one batch.
-	for _, s := range wantSegs {
-		ts := now.Add(time.Duration(microOff) * time.Microsecond)
-		microOff++
-		_, err = q.db.Exec(ctx, `INSERT INTO sranges_q (sid, ts, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted)
-VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
-			sid, ts, table, timeframe, s.StartMs, s.StopMs, s.HasData)
-		if err != nil {
-			return fmt.Errorf("insert srange seg: %w", err)
-		}
+	if err = batchInsertSranges(ctx, q, sid, table, timeframe, newSpansFromWant, now, &microOff); err != nil {
+		return fmt.Errorf("insert srange seg: %w", err)
 	}
 
-	// Update in-process cache.
-	srangesCacheLock.RLock()
+	// Update in-process cache: replace the window interior while keeping spans outside.
 	key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
-	entry, ok := srangesCache[key]
-	var existingSpans []srangeSpan
-	if ok {
-		existingSpans = make([]srangeSpan, len(entry.spans))
-		copy(existingSpans, entry.spans)
+	srangesCacheLock.Lock()
+	entry := srangesCache[key]
+	var newSpans []srangeSpan
+	if entry != nil {
+		newSpans = make([]srangeSpan, 0, len(entry.spans)+len(newSpansFromWant))
+		for _, s := range entry.spans {
+			if s.StopMs <= startMs || s.StartMs >= stopMs {
+				newSpans = append(newSpans, s)
+			}
+		}
+	} else {
+		newSpans = make([]srangeSpan, 0, len(newSpansFromWant))
 	}
-	srangesCacheLock.RUnlock()
+	newSpans = append(newSpans, newSpansFromWant...)
+	sort.Slice(newSpans, func(i, j int) bool { return newSpans[i].StartMs < newSpans[j].StartMs })
+	srangesCache[key] = &srangesCacheEntry{spans: newSpans}
+	srangesCacheLock.Unlock()
+	return nil
+}
 
-	newSpans := make([]srangeSpan, 0, len(existingSpans)+len(wantSegs))
-	for _, s := range existingSpans {
-		if s.StopMs <= startMs || s.StartMs >= stopMs {
-			newSpans = append(newSpans, s)
+// coveredAt returns true if point a falls inside any span described by the sorted
+// starts/stops arrays (non-overlapping spans, sorted by StartMs). It replaces the
+// O(N) linear-scan coveredBy closure with an O(log N) binary search.
+// Precondition: starts and stops are sorted in ascending order and represent non-overlapping spans.
+func coveredAt(a int64, starts, stops []int64) bool {
+	lo, hi := 0, len(starts)
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		if starts[mid] <= a {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	for _, s := range wantSegs {
-		newSpans = append(newSpans, srangeSpan{StartMs: s.StartMs, StopMs: s.StopMs, HasData: s.HasData})
-	}
-	sort.Slice(newSpans, func(i, j int) bool { return newSpans[i].StartMs < newSpans[j].StartMs })
-	srangesCacheUpdate(sid, table, timeframe, newSpans)
-	return nil
+	return lo > 0 && stops[lo-1] > a
 }
 
 func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64, hasData bool) error {
@@ -343,6 +395,9 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if !IsQuestDB {
+		return q.UpdateSRangesPg(ctx, sid, table, timeframe, startMs, stopMs, hasData)
 	}
 
 	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
@@ -356,7 +411,6 @@ ORDER BY start_ms, stop_ms`,
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
 	spans := make([]srangeSpan, 0, 16)
 	points := make([]int64, 0, 64)
@@ -364,6 +418,7 @@ ORDER BY start_ms, stop_ms`,
 	for rows.Next() {
 		var s srangeSpan
 		if err := rows.Scan(&s.StartMs, &s.StopMs, &s.HasData); err != nil {
+			rows.Close()
 			return err
 		}
 		if s.StopMs <= s.StartMs {
@@ -372,22 +427,26 @@ ORDER BY start_ms, stop_ms`,
 		spans = append(spans, s)
 		points = append(points, s.StartMs, s.StopMs)
 	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
 
 	sort.Slice(points, func(i, j int) bool { return points[i] < points[j] })
-	uniq := points[:0]
-	var lastVal int64
-	var hasLast bool
-	for _, p := range points {
-		if !hasLast || p != lastVal {
-			uniq = append(uniq, p)
-			lastVal = p
-			hasLast = true
+	points = deduplicateInt64(points)
+
+	// Build per-hasData sorted start/stop arrays for O(log N) coverage lookup.
+	// spans are sorted by StartMs (ORDER BY start_ms in the query above).
+	var trueStarts, trueStops, falseStarts, falseStops []int64
+	for _, s := range spans {
+		if s.HasData {
+			trueStarts = append(trueStarts, s.StartMs)
+			trueStops = append(trueStops, s.StopMs)
+		} else {
+			falseStarts = append(falseStarts, s.StartMs)
+			falseStops = append(falseStops, s.StopMs)
 		}
 	}
-	points = uniq
 
 	type seg struct {
 		StartMs int64
@@ -395,33 +454,19 @@ ORDER BY start_ms, stop_ms`,
 		HasData bool
 	}
 	segs := make([]seg, 0, len(points))
-	inNew := func(a, b int64) bool {
-		return a < stopMs && b > startMs
-	}
-	coveredBy := func(a, b int64, want bool) bool {
-		for _, s := range spans {
-			if s.HasData != want {
-				continue
-			}
-			if s.StartMs < b && s.StopMs > a {
-				return true
-			}
-		}
-		return false
-	}
-
 	for i := 0; i+1 < len(points); i++ {
 		a, b := points[i], points[i+1]
 		if b <= a {
 			continue
 		}
 		var state *bool
-		if inNew(a, b) {
+		if a < stopMs && b > startMs {
+			// Interval overlaps the new window: overwrite with the requested hasData value.
 			state = &hasData
-		} else if coveredBy(a, b, true) {
+		} else if coveredAt(a, trueStarts, trueStops) {
 			t := true
 			state = &t
-		} else if coveredBy(a, b, false) {
+		} else if coveredAt(a, falseStarts, falseStops) {
 			f := false
 			state = &f
 		}
@@ -439,15 +484,8 @@ ORDER BY start_ms, stop_ms`,
 	microOff := 0
 
 	if len(spans) > 0 {
-		for _, s := range spans {
-			ts := now.Add(time.Duration(microOff) * time.Microsecond)
-			microOff++
-			_, err = q.db.Exec(ctx, `INSERT INTO sranges_q (sid, ts, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted, deleted_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, true, $2)`,
-				sid, ts, table, timeframe, s.StartMs, s.StopMs, s.HasData)
-			if err != nil {
-				return fmt.Errorf("logical delete srange: %w", err)
-			}
+		if err = batchInsertSrangesDeleted(ctx, q, sid, table, timeframe, spans, now, &microOff); err != nil {
+			return fmt.Errorf("logical delete srange: %w", err)
 		}
 		MaybeCompact("sranges_q")
 	}
@@ -458,48 +496,88 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, true, $2)`,
 		return nil
 	}
 
-	for _, s := range segs {
-		ts := now.Add(time.Duration(microOff) * time.Microsecond)
-		microOff++
-		_, err = q.db.Exec(ctx, `INSERT INTO sranges_q (sid, ts, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted)
-VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
-			sid, ts, table, timeframe, s.StartMs, s.StopMs, s.HasData)
-		if err != nil {
-			return fmt.Errorf("insert srange seg: %w", err)
-		}
+	segSpans := make([]srangeSpan, len(segs))
+	for i, s := range segs {
+		segSpans[i] = srangeSpan{StartMs: s.StartMs, StopMs: s.StopMs, HasData: s.HasData}
+	}
+	if err = batchInsertSranges(ctx, q, sid, table, timeframe, segSpans, now, &microOff); err != nil {
+		return fmt.Errorf("insert srange seg: %w", err)
 	}
 
 	// Synchronously update in-process cache so subsequent reads in the same
 	// process are not affected by QuestDB WAL commit lag (<100 ms).
-	// We first load the full existing cache for this key (outside the window),
-	// then merge in the new segs to produce the complete snapshot.
-	cacheCopy := func() []srangeSpan {
-		srangesCacheLock.RLock()
-		key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
-		entry, ok := srangesCache[key]
-		srangesCacheLock.RUnlock()
-		if !ok {
-			return nil
+	// Keep existing spans outside [startMs, stopMs), replace interior with newly computed segs.
+	key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
+	srangesCacheLock.Lock()
+	entry := srangesCache[key]
+	var newSpans []srangeSpan
+	if entry != nil {
+		newSpans = make([]srangeSpan, 0, len(entry.spans)+len(segSpans))
+		for _, s := range entry.spans {
+			if s.StopMs <= startMs || s.StartMs >= stopMs {
+				newSpans = append(newSpans, s)
+			}
 		}
-		out := make([]srangeSpan, len(entry.spans))
-		copy(out, entry.spans)
-		return out
+	} else {
+		newSpans = make([]srangeSpan, 0, len(segSpans))
 	}
-
-	// Build updated full span list: keep existing spans outside [startMs, stopMs),
-	// replace interior with the newly computed segs.
-	existing := cacheCopy()
-	newSpans := make([]srangeSpan, 0, len(existing)+len(segs))
-	for _, s := range existing {
-		if s.StopMs <= startMs || s.StartMs >= stopMs {
-			newSpans = append(newSpans, s)
-		}
-	}
-	for _, s := range segs {
-		newSpans = append(newSpans, srangeSpan{StartMs: s.StartMs, StopMs: s.StopMs, HasData: s.HasData})
-	}
-	// Sort by StartMs
+	newSpans = append(newSpans, segSpans...)
 	sort.Slice(newSpans, func(i, j int) bool { return newSpans[i].StartMs < newSpans[j].StartMs })
-	srangesCacheUpdate(sid, table, timeframe, newSpans)
+	srangesCache[key] = &srangesCacheEntry{spans: newSpans}
+	srangesCacheLock.Unlock()
 	return nil
+}
+
+// batchInsertSrangesDeleted inserts logical-delete markers for each span in one multi-row INSERT.
+// Each row gets a distinct microsecond timestamp so QuestDB LATEST BY works correctly.
+// has_data is inlined as a SQL literal because QuestDB's PGWire does not reliably handle
+// Go bool parameters.
+func batchInsertSrangesDeleted(ctx context.Context, q *Queries, sid int32, tbl, tf string, spans []srangeSpan, now time.Time, microOff *int) error {
+	const colsPerRow = 6 // sid, ts, tbl, tf, start_ms, stop_ms  (has_data inlined, is_deleted=true, deleted_at=$2)
+	var b strings.Builder
+	args := make([]any, 0, len(spans)*colsPerRow)
+	for i, s := range spans {
+		ts := now.Add(time.Duration(*microOff) * time.Microsecond)
+		(*microOff)++
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		p := i*colsPerRow + 1
+		hasDataLit := "false"
+		if s.HasData {
+			hasDataLit = "true"
+		}
+		b.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,%s,true,$%d)", p, p+1, p+2, p+3, p+4, p+5, hasDataLit, p+1))
+		args = append(args, sid, ts, tbl, tf, s.StartMs, s.StopMs)
+	}
+	sql := "INSERT INTO sranges_q (sid,ts,tbl,timeframe,start_ms,stop_ms,has_data,is_deleted,deleted_at) VALUES " + b.String()
+	_, err := q.db.Exec(ctx, sql, args...)
+	return err
+}
+
+// batchInsertSranges inserts new active srange rows in one multi-row INSERT.
+// has_data is inlined as a SQL literal (true/false) rather than a bound parameter
+// because QuestDB's PGWire implementation does not reliably handle Go bool parameters
+// and always reads them back as false.
+func batchInsertSranges(ctx context.Context, q *Queries, sid int32, tbl, tf string, spans []srangeSpan, now time.Time, microOff *int) error {
+	const colsPerRow = 6 // sid, ts, tbl, tf, start_ms, stop_ms  (has_data inlined as literal)
+	var b strings.Builder
+	args := make([]any, 0, len(spans)*colsPerRow)
+	for i, s := range spans {
+		ts := now.Add(time.Duration(*microOff) * time.Microsecond)
+		(*microOff)++
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		p := i*colsPerRow + 1
+		hasDataLit := "false"
+		if s.HasData {
+			hasDataLit = "true"
+		}
+		b.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,%s,false)", p, p+1, p+2, p+3, p+4, p+5, hasDataLit))
+		args = append(args, sid, ts, tbl, tf, s.StartMs, s.StopMs)
+	}
+	sql := "INSERT INTO sranges_q (sid,ts,tbl,timeframe,start_ms,stop_ms,has_data,is_deleted) VALUES " + b.String()
+	_, err := q.db.Exec(ctx, sql, args...)
+	return err
 }

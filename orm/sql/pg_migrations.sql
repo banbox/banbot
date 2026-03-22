@@ -1,0 +1,3 @@
+-- TimescaleDB schema migrations for banbot v0.3+
+-- Each migration section starts with: -- version <n>
+-- Migrations are applied in a transaction with schema_migrations version tracking.

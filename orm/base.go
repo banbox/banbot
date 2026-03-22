@@ -41,6 +41,9 @@ var (
 	// SQLite 连接池缓存：每个数据库路径对应一个 sql.DB 实例
 	sqlitePools     = make(map[string]*sql.DB)
 	sqlitePoolsLock = deadlock.Mutex{}
+
+	// IsQuestDB QuestDB (PGWire, port 8812). TimescaleDB (standard PostgreSQL, port 5432).
+	IsQuestDB = true
 )
 
 //go:embed sql/trade_schema.sql
@@ -51,6 +54,15 @@ var ddlBanpub string
 
 //go:embed sql/qdb_migrations.sql
 var ddlQdbMigrations string
+
+//go:embed sql/pg_schema.sql
+var ddlPgSchema string
+
+//go:embed sql/pg_schema2.sql
+var ddlPgSchema2 string
+
+//go:embed sql/pg_migrations.sql
+var ddlPgMigrations string
 
 var (
 	DbTrades = "trades"
@@ -80,11 +92,18 @@ func Setup() *errs.Error {
 	dbCfg := config.Database
 	ctx := context.Background()
 	if dbCfg != nil && dbCfg.AutoCreate {
-		if err := runMigrations(ctx, pool); err != nil {
-			return err
+		if IsQuestDB {
+			if err := runQdbMigrations(ctx, pool); err != nil {
+				return err
+			}
+		} else {
+			if err := runPgMigrations(ctx, pool); err != nil {
+				return err
+			}
 		}
 	}
-	log.Info("connect db ok", zap.String("url", utils2.MaskDBUrl(dbCfg.Url)), zap.Int("pool", dbCfg.MaxPoolSize))
+	log.Info("connect db ok", zap.String("url", utils2.MaskDBUrl(dbCfg.Url)), zap.Int("pool", dbCfg.MaxPoolSize),
+		zap.Bool("questdb", IsQuestDB))
 	err2 = LoadAllExSymbols()
 	if err2 != nil {
 		return err2
@@ -110,17 +129,37 @@ func initSQLitePaths() {
 }
 
 func execMultiSQL(ctx context.Context, pool *pgxpool.Pool, sqlText string) error {
-	stmts := strings.Split(sqlText, ";")
-	for _, st := range stmts {
-		s := strings.TrimSpace(st)
-		if s == "" {
-			continue
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	// Use pgconn.Exec (simple query protocol) to avoid prepared-statement
+	// restrictions on DDL statements (e.g. CREATE TABLE IF NOT EXISTS).
+	mrr := conn.Conn().PgConn().Exec(ctx, sqlText)
+	for mrr.NextResult() {
+		_, err2 := mrr.ResultReader().Close()
+		if err2 != nil {
+			_ = mrr.Close()
+			return err2
 		}
-		if _, err := pool.Exec(ctx, s); err != nil {
+	}
+	return mrr.Close()
+}
+
+// execMultiSQLTx executes multiple semicolon-separated SQL statements inside a pgx.Tx.
+func execMultiSQLTx(ctx context.Context, tx pgx.Tx, sqlText string) error {
+	// Use pgconn.Exec (simple query protocol) to avoid prepared-statement
+	// restrictions on DDL statements.
+	mrr := tx.Conn().PgConn().Exec(ctx, sqlText)
+	for mrr.NextResult() {
+		_, err := mrr.ResultReader().Close()
+		if err != nil {
+			_ = mrr.Close()
 			return err
 		}
 	}
-	return nil
+	return mrr.Close()
 }
 
 func pgConnPool() (*pgxpool.Pool, *errs.Error) {
@@ -132,17 +171,32 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	if err_ != nil {
 		return nil, errs.New(core.ErrBadConfig, err_)
 	}
+
+	// Detect DB type from explicit config or port heuristic.
+	dbType := strings.ToLower(strings.TrimSpace(dbCfg.DbType))
+	port := uint16(0)
 	if poolCfg.ConnConfig != nil {
-		if poolCfg.ConnConfig.Port == 5432 {
-			return nil, errs.NewMsg(core.ErrBadConfig, "port 5432 is old TimescaleDB, please update database.url to: postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable")
-		}
+		port = poolCfg.ConnConfig.Port
 	}
-	// QuestDB uses the PostgreSQL wire protocol, but (unlike Postgres/TimescaleDB) it doesn't benefit from
-	// pgx's statement cache when our SQL strings are dynamic. Disable the statement/describe cache and run
-	// in non-caching exec mode to reduce per-query overhead (especially under concurrency).
-	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
-	poolCfg.ConnConfig.StatementCacheCapacity = 0
-	poolCfg.ConnConfig.DescriptionCacheCapacity = 0
+	switch dbType {
+	case "questdb":
+		IsQuestDB = true
+	case "timescale", "timescaledb", "postgres", "postgresql":
+		IsQuestDB = false
+	default:
+		// Auto-detect by port: 8812 = QuestDB default, 5432 = PostgreSQL default.
+		IsQuestDB = port != 5432
+	}
+
+	if IsQuestDB {
+		// QuestDB uses the PostgreSQL wire protocol, but (unlike Postgres/TimescaleDB) it doesn't benefit from
+		// pgx's statement cache when our SQL strings are dynamic. Disable the statement/describe cache and run
+		// in non-caching exec mode to reduce per-query overhead (especially under concurrency).
+		poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+		poolCfg.ConnConfig.StatementCacheCapacity = 0
+		poolCfg.ConnConfig.DescriptionCacheCapacity = 0
+	}
+
 	if dbCfg.MaxPoolSize == 0 {
 		dbCfg.MaxPoolSize = max(40, runtime.NumCPU()*4)
 	} else if dbCfg.MaxPoolSize < 30 {
@@ -150,16 +204,6 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 			zap.Int("cur", dbCfg.MaxPoolSize))
 	}
 	poolCfg.MaxConns = int32(dbCfg.MaxPoolSize)
-	//poolCfg.BeforeAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
-	//	return true
-	//}
-	//poolCfg.AfterRelease = func(conn *pgx.Conn) bool {
-	//  // 此函数不是在调用Release时必定被调用，连接可能直接被Destroy而不释放到池
-	//	return true
-	//}
-	//poolCfg.BeforeClose = func(conn *pgx.Conn) {
-	//	log.Info(fmt.Sprintf("close conn: %v", conn))
-	//}
 	connCtx, connCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer connCancel()
 	dbPool, err_ := pgxpool.NewWithConfig(connCtx, poolCfg)
@@ -171,8 +215,12 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	defer pingCancel()
 	if err_ = dbPool.Ping(pingCtx); err_ != nil {
 		dbPool.Close()
-		if ensureErr := ensureQuestDB(poolCfg.ConnConfig.Port); ensureErr != nil {
-			return nil, ensureErr
+		if IsQuestDB {
+			if ensureErr := ensureQuestDB(port); ensureErr != nil {
+				return nil, ensureErr
+			}
+		} else {
+			return nil, errs.New(core.ErrDbConnFail, err_)
 		}
 		// Retry after QuestDB is started.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -182,19 +230,19 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 			return nil, errs.New(core.ErrDbConnFail, err_)
 		}
 	}
-	return dbPool, nil
-}
 
-func isLocalHost(host string) bool {
-	host = strings.TrimSpace(host)
-	host = strings.Trim(host, "[]") // tolerate IPv6 literals like [::1]
-	if host == "" {
-		return false
+	// When auto-detect is still ambiguous (non-5432, non-8812), probe QuestDB-specific syntax.
+	if dbType == "" && port != 5432 && port != 8812 {
+		var n int64
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer probeCancel()
+		if probeErr := dbPool.QueryRow(probeCtx, `select count() from tables()`).Scan(&n); probeErr != nil {
+			// QuestDB probe failed – treat as TimescaleDB/PostgreSQL.
+			IsQuestDB = false
+		}
 	}
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-		return true
-	}
-	return false
+
+	return dbPool, nil
 }
 
 func Conn(ctx context.Context) (*Queries, *pgxpool.Conn, *errs.Error) {
@@ -634,8 +682,8 @@ func NewDbErr(code int, err_ error) *errs.Error {
 	return errs.New(code, err_)
 }
 
-// runMigrations executes QuestDB schema migrations (best-effort, non-transactional).
-func runMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
+// runQdbMigrations executes QuestDB schema migrations (best-effort, non-transactional).
+func runQdbMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -702,6 +750,93 @@ create table if not exists schema_migrations (
 	}
 	if initVersion < currentVersion {
 		log.Info("database migration completed", zap.Int64("from", initVersion), zap.Int64("to", currentVersion))
+	}
+	return nil
+}
+
+// runPgMigrations executes TimescaleDB/PostgreSQL schema migrations using schema_migrations table.
+func runPgMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	log.Warn("running database migrations (timescaledb) ...")
+
+	// Check if sranges table already exists (base schema was applied).
+	var tblCount int
+	err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM pg_class WHERE relname = 'sranges'`).Scan(&tblCount)
+	if err != nil {
+		return NewDbErr(core.ErrDbReadFail, err)
+	}
+	if tblCount == 0 {
+		log.Info("initializing timescaledb base schema...")
+		if err2 := execMultiSQL(ctx, pool, ddlPgSchema); err2 != nil {
+			return NewDbErr(core.ErrDbExecFail, err2)
+		}
+		if err2 := execMultiSQL(ctx, pool, ddlPgSchema2); err2 != nil {
+			return NewDbErr(core.ErrDbExecFail, err2)
+		}
+	}
+
+	// Ensure schema_migrations table exists.
+	if _, err2 := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+  version     bigint PRIMARY KEY,
+  applied_at  timestamptz NOT NULL DEFAULT now()
+)`); err2 != nil {
+		return NewDbErr(core.ErrDbExecFail, err2)
+	}
+
+	var cur *int64
+	if err2 := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&cur); err2 != nil {
+		return NewDbErr(core.ErrDbReadFail, err2)
+	}
+	var currentVersion int64
+	if cur != nil {
+		currentVersion = *cur
+	}
+	initVersion := currentVersion
+
+	migrations := strings.Split(ddlPgMigrations, "-- version")
+	for _, migration := range migrations {
+		migration = strings.TrimSpace(migration)
+		if migration == "" {
+			continue
+		}
+		lines := strings.SplitN(migration, "\n", 2)
+		if len(lines) < 2 {
+			continue
+		}
+		versionStr := strings.TrimSpace(lines[0])
+		version, err2 := strconv.ParseInt(versionStr, 10, 64)
+		if err2 != nil {
+			if strings.HasPrefix(versionStr, "--") {
+				continue
+			}
+			log.Warn("invalid pg migration version", zap.String("version", versionStr))
+			continue
+		}
+		if version <= currentVersion {
+			continue
+		}
+		tx, err2 := pool.Begin(ctx)
+		if err2 != nil {
+			return NewDbErr(core.ErrDbExecFail, err2)
+		}
+		// Execute DDL statements inside the transaction (pgx.Tx also implements Exec).
+		if err2 = execMultiSQLTx(ctx, tx, lines[1]); err2 != nil {
+			_ = tx.Rollback(ctx)
+			return NewDbErr(core.ErrDbExecFail, err2)
+		}
+		if _, err2 = tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, version); err2 != nil {
+			_ = tx.Rollback(ctx)
+			return NewDbErr(core.ErrDbExecFail, err2)
+		}
+		if err2 = tx.Commit(ctx); err2 != nil {
+			return NewDbErr(core.ErrDbExecFail, err2)
+		}
+		currentVersion = version
+	}
+	if initVersion < currentVersion {
+		log.Info("pg migration completed", zap.Int64("from", initVersion), zap.Int64("to", currentVersion))
 	}
 	return nil
 }

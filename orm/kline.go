@@ -59,6 +59,57 @@ func (q *Queries) QueryOHLCV(exs *ExSymbol, timeframe string, startMs, endMs int
 			finishEndMS = unFinishMS
 		}
 	}
+
+	var klines []*banexg.Kline
+	if !IsQuestDB {
+		// TimescaleDB: time column is int8 ms.
+		var subTF string
+		var err_ error
+		if revRead {
+			klines, err_ = q.queryOHLCVPg(exs.ID, timeframe, 0, finishEndMS, limit, true)
+		} else {
+			if limit == 0 {
+				limit = int((finishEndMS-startMs)/tfMSecs) + 1
+			}
+			klines, err_ = q.queryOHLCVPg(exs.ID, timeframe, startMs, finishEndMS, limit, false)
+		}
+		tblName, subTF2, _ := resolveTablePg(timeframe)
+		_ = tblName
+		subTF = subTF2
+		if err_ != nil {
+			return nil, NewDbErr(core.ErrDbReadFail, err_)
+		}
+		if revRead {
+			utils.ReverseArr(klines)
+		}
+		if subTF != "" && len(klines) > 0 {
+			fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
+			var lastFinish bool
+			offMS := GetAlignOff(exs.ID, tfMSecs)
+			infoBy := exs.InfoBy()
+			klines, lastFinish = utils.BuildOHLCV(klines, tfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
+			if !lastFinish && len(klines) > 0 {
+				klines = klines[:len(klines)-1]
+			}
+		}
+		if len(klines) > limit && limit > 0 {
+			if revRead {
+				klines = klines[len(klines)-limit:]
+			} else {
+				klines = klines[:limit]
+			}
+		}
+		if len(klines) == 0 && maxEndMs-endMs > tfMSecs {
+			return q.QueryOHLCV(exs, timeframe, endMs, maxEndMs, limit, withUnFinish)
+		} else if withUnFinish && len(klines) > 0 && klines[len(klines)-1].Time+tfMSecs == unFinishMS {
+			unbar, _, _ := getUnFinish(q, exs.ID, timeframe, unFinishMS, unFinishMS+tfMSecs, "query")
+			if unbar != nil {
+				klines = append(klines, unbar)
+			}
+		}
+		return klines, nil
+	}
+
 	var dctSql string
 	if revRead {
 		// No start time provided, quantity limit provided, search in reverse chronological order
@@ -77,7 +128,7 @@ where sid=%d and ts >= cast(%v as timestamp) and ts < cast(%v as timestamp)
 order by ts`, exs.ID, startMs*1000, finishEndMS*1000)
 	}
 	subTF, rows, err_ := queryHyper(q, timeframe, dctSql, limit)
-	klines, err_ := mapToKlines(rows, err_)
+	klines, err_ = mapToKlines(rows, err_)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -132,6 +183,9 @@ func (q *Queries) QueryOHLCVBatch(exsMap map[int32]*ExSymbol, timeframe string, 
 		if finishEndMS > unFinishMS {
 			finishEndMS = unFinishMS
 		}
+	}
+	if !IsQuestDB {
+		return q.queryOHLCVBatchPg(exsMap, timeframe, startMs, finishEndMS, tfMSecs, handle)
 	}
 	sidTA := make([]string, 0, len(exsMap))
 	for _, exs := range exsMap {
@@ -199,6 +253,9 @@ order by sid,ts`, startMs*1000, finishEndMS*1000, sidText)
 }
 
 func (q *Queries) getKLineTimes(sid int32, timeframe string, startMs, endMs int64) ([]int64, *errs.Error) {
+	if !IsQuestDB {
+		return q.getKLineTimesPg(sid, timeframe, startMs, endMs)
+	}
 	tblName := "kline_" + timeframe
 	dctSql := fmt.Sprintf(`
 select cast(ts as long)/1000 from %s
@@ -220,6 +277,9 @@ order by ts`, tblName, sid, startMs*1000, endMs*1000)
 }
 
 func (q *Queries) getKLineTimeRange(sid int32, timeframe string) (int64, int64, *errs.Error) {
+	if !IsQuestDB {
+		return q.getKLineTimeRangePg(sid, timeframe)
+	}
 	tblName := "kline_" + timeframe
 	sql := fmt.Sprintf("select min(cast(ts as long)/1000), max(cast(ts as long)/1000) from %s where sid=%d", tblName, sid)
 	row := q.db.QueryRow(context.Background(), sql)
@@ -245,6 +305,20 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 	}
 	holes := make([]MSRange, 0)
 	if len(barTimes) == 0 {
+		// **QuestDB WAL 延迟防护**：防止 WAL 延迟导致读取结果为空。
+		// 若 `srangesCache` 已覆盖该区间，此处空值即为「假阴性」。
+		// 严禁写入 `has_data=false`，否则其新时间戳会使 `LATEST BY` 永久覆盖旧的正确记录，导致回测时重复下载。
+		if IsQuestDB {
+			tbl := "kline_" + timeFrame
+			cachedTrue := srangesCacheGet(sid, tbl, timeFrame)
+			if len(cachedTrue) > 0 {
+				uncovered := subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, cachedTrue)
+				if len(uncovered) == 0 {
+					// Fully covered by in-process has_data=true cache: skip hole detection.
+					return nil
+				}
+			}
+		}
 		holes = append(holes, MSRange{Start: startMS, Stop: endMS})
 	} else {
 		if barTimes[0] > startMS {
@@ -477,6 +551,9 @@ func getUnFinish(sess *Queries, sid int32, timeFrame string, startMS, endMS int6
 }
 
 func queryUnfinish(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline, int64, *int64, error) {
+	if !IsQuestDB {
+		return queryUnfinishPg(sid, timeFrame, barStartMS)
+	}
 	ctx := context.Background()
 	row := pool.QueryRow(ctx, `SELECT cast(ts as long)/1000, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
 FROM kline_un_q
@@ -532,6 +609,9 @@ func unfinishChain(timeFrame string) []string {
 func queryKlinesRange(sess *Queries, sid int32, timeFrame string, startMS, endMS int64) ([]*banexg.Kline, error) {
 	if startMS <= 0 || endMS <= startMS {
 		return nil, nil
+	}
+	if !IsQuestDB {
+		return sess.queryOHLCVPg(sid, timeFrame, startMS, endMS, 0, false)
 	}
 	sql := fmt.Sprintf(`
 select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
@@ -657,6 +737,9 @@ func GetAlignOff(sid int32, toTfMSecs int64) int64 {
 }
 
 func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
+	if !IsQuestDB {
+		return setUnfinishPg(sid, tf, endMS, bar)
+	}
 	expireMS := utils2.AlignTfMSecs(btime.UTCStamp(), 60000) + 60000
 	ts := time.UnixMilli(bar.Time).UTC()
 	ctx := context.Background()
@@ -672,43 +755,6 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false)`,
 	return nil
 }
 
-// iterForAddKLines implements pgx.CopyFromSource.
-type iterForAddKLines struct {
-	rows                 []*KlineSid
-	skippedFirstNextCall bool
-}
-
-func (r *iterForAddKLines) Next() bool {
-	if len(r.rows) == 0 {
-		return false
-	}
-	if !r.skippedFirstNextCall {
-		r.skippedFirstNextCall = true
-		return true
-	}
-	r.rows = r.rows[1:]
-	return len(r.rows) > 0
-}
-
-func (r iterForAddKLines) Values() ([]interface{}, error) {
-	return []interface{}{
-		r.rows[0].Sid,
-		r.rows[0].Time,
-		r.rows[0].Open,
-		r.rows[0].High,
-		r.rows[0].Low,
-		r.rows[0].Close,
-		r.rows[0].Volume,
-		r.rows[0].Quote,
-		r.rows[0].BuyVolume,
-		r.rows[0].TradeNum,
-	}, nil
-}
-
-func (r iterForAddKLines) Err() error {
-	return nil
-}
-
 /*
 InsertKLines
 Only batch insert K-lines. To update associated information simultaneously, please use InsertKLinesAuto
@@ -718,6 +764,9 @@ func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline)
 	arrLen := len(arr)
 	if arrLen == 0 {
 		return 0, nil
+	}
+	if !IsQuestDB {
+		return insertKLinesPg(q, timeFrame, sid, arr)
 	}
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	startMS, endMS := arr[0].Time, arr[arrLen-1].Time+tfMSecs
@@ -834,6 +883,9 @@ func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS i
 }
 
 func (q *Queries) CalcKLineRanges(timeFrame string, sids map[int32]bool) (map[int32][2]int64, *errs.Error) {
+	if !IsQuestDB {
+		return q.calcKLineRangesPg(timeFrame, sids)
+	}
 	tblName := "kline_" + timeFrame
 	if len(sids) > 0 {
 		var b strings.Builder
@@ -946,6 +998,9 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	if aggFrom == "" {
 		return nil
 	}
+	if !IsQuestDB {
+		return q.refreshAggPg(item, sid, aggStart, endMS, aggFrom, infoBy)
+	}
 	fromTbl := "kline_" + aggFrom
 	ctx := context.Background()
 	rows, err_ := q.db.Query(ctx, fmt.Sprintf(`
@@ -1007,6 +1062,9 @@ func NewKlineAgg(TimeFrame, Table, AggFrom, AggStart, AggEnd, AggEvery, CpsBefor
 }
 
 func (q *Queries) GetKlineNum(sid int32, timeFrame string, start, end int64) int {
+	if !IsQuestDB {
+		return q.getKLineNumPg(sid, timeFrame, start, end)
+	}
 	sql := fmt.Sprintf("select count(0) from kline_%s where sid=%v and ts>=cast(%v as timestamp) and ts<cast(%v as timestamp)",
 		timeFrame, sid, start*1000, end*1000)
 	row := q.db.QueryRow(context.Background(), sql)
@@ -1048,90 +1106,22 @@ func GetDownTF(timeFrame string) (string, *errs.Error) {
 
 /*
 DelKLines
-通过重写表的方式删除不在sranges和exsymbol中的K线数据。
-先计算涵盖的K线数量占比，不足50%时才执行删除，否则跳过。
+通过重写表的方式删除指定sid的K线数据（QuestDB不支持对WAL表直接DELETE）。
+delSids为本次需要删除的sid集合；validSids = 表中已有sids - delSids。
+
+调用此函数前，DelKData已经通过DelKInfo对delSids的sranges做了soft-delete。
+由于kline表的任何读取路径都必须先查sranges确认数据范围，sranges已删除意味着
+这些"幽灵行"永远不会被读到。因此：
+- 若删除比例 < 50%（删除量偏少），跳过重写，sranges层面的删除已足够保证正确性；
+- 若删除比例 >= 50%（删除量较多），执行重写以回收磁盘空间。
 */
-func (q *Queries) DelKLines(timeFrame string) *errs.Error {
+func (q *Queries) DelKLines(timeFrame string, delSids map[int32]bool) *errs.Error {
+	if !IsQuestDB {
+		return q.delKLinesPgBySid(timeFrame, delSids)
+	}
 	tblName := "kline_" + timeFrame
 	ctx := context.Background()
-	// 1. 获取sranges_q中有数据的sid集合
-	rows, err_ := pool.Query(ctx, `SELECT DISTINCT sid FROM (
-  SELECT sid FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms
-  WHERE tbl = $1 AND has_data = true AND coalesce(is_deleted, false) = false
-)`, tblName)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
-	}
-	srangeSids := make(map[int32]bool)
-	for rows.Next() {
-		var sid int32
-		if err_ = rows.Scan(&sid); err_ != nil {
-			rows.Close()
-			return NewDbErr(core.ErrDbReadFail, err_)
-		}
-		srangeSids[sid] = true
-	}
-	rows.Close()
-	// 2. 获取exsymbol_q中所有sid集合
-	rows, err_ = pool.Query(ctx, `SELECT sid FROM exsymbol_q LATEST BY sid WHERE coalesce(is_deleted, false) = false`)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
-	}
-	exsSids := make(map[int32]bool)
-	for rows.Next() {
-		var sid int32
-		if err_ = rows.Scan(&sid); err_ != nil {
-			rows.Close()
-			return NewDbErr(core.ErrDbReadFail, err_)
-		}
-		exsSids[sid] = true
-	}
-	rows.Close()
-	// 3. 取交集：同时在sranges和exsymbol中的sid
-	var validSids []string
-	for sid := range srangeSids {
-		if exsSids[sid] {
-			validSids = append(validSids, strconv.Itoa(int(sid)))
-		}
-	}
-	if len(validSids) == 0 {
-		log.Info("DelKLines: no valid sids, skip", zap.String("tf", timeFrame))
-		return nil
-	}
-	sidIn := strings.Join(validSids, ",")
-	// 4. 统计总数据量和涵盖的数据量
-	row := q.db.QueryRow(ctx, fmt.Sprintf("select count(0) from %s", tblName))
-	var totalCount int64
-	if err_ = row.Scan(&totalCount); err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
-	}
-	if totalCount == 0 {
-		return nil
-	}
-	row = q.db.QueryRow(ctx, fmt.Sprintf("select count(0) from %s where sid in (%s)", tblName, sidIn))
-	var coveredCount int64
-	if err_ = row.Scan(&coveredCount); err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
-	}
-	ratio := float64(coveredCount) / float64(totalCount)
-	if ratio >= 0.5 {
-		log.Info("DelKLines: covered ratio >= 50%, skip rewrite",
-			zap.String("tf", timeFrame), zap.Int64("total", totalCount),
-			zap.Int64("covered", coveredCount), zap.String("ratio", fmt.Sprintf("%.1f%%", ratio*100)))
-		return nil
-	}
-	// 5. 估算时间并输出日志
-	// QuestDB大约每秒处理100万行复制
-	estSecs := float64(coveredCount) / 1_000_000
-	if estSecs < 1 {
-		estSecs = 1
-	}
-	log.Info("DelKLines: rewriting table, please wait...",
-		zap.String("tf", timeFrame), zap.Int64("total", totalCount),
-		zap.Int64("keep", coveredCount), zap.Int64("remove", totalCount-coveredCount),
-		zap.String("ratio", fmt.Sprintf("%.1f%%", ratio*100)),
-		zap.Int("est_secs", int(estSecs)))
-	// 6. 重写表：创建新表 -> 复制数据 -> 删除旧表 -> 重命名
+
 	partMap := map[string]string{
 		"1m": "week", "5m": "month", "15m": "month", "1h": "year", "1d": "year",
 	}
@@ -1139,6 +1129,85 @@ func (q *Queries) DelKLines(timeFrame string) *errs.Error {
 	if !ok {
 		return errs.NewMsg(core.ErrInvalidTF, "unsupported tf for rewrite: %s", timeFrame)
 	}
+
+	// 1. 一次扫描同时获取所有 sid 及其行数，避免两次全表扫描。
+	//    不依赖 sranges，避免 WAL 延迟导致刚删除的 sid 仍被查到。
+	sidRows, err_ := q.db.Query(ctx, fmt.Sprintf("SELECT sid, count(*) FROM %s GROUP BY sid", tblName))
+	if err_ != nil {
+		return NewDbErr(core.ErrDbReadFail, err_)
+	}
+	var validSids []string
+	var totalCount, keepCount int64
+	for sidRows.Next() {
+		var sid int32
+		var cnt int64
+		if err_ = sidRows.Scan(&sid, &cnt); err_ != nil {
+			sidRows.Close()
+			return NewDbErr(core.ErrDbReadFail, err_)
+		}
+		totalCount += cnt
+		if !delSids[sid] {
+			validSids = append(validSids, strconv.Itoa(int(sid)))
+			keepCount += cnt
+		}
+	}
+	sidRows.Close()
+	if err_ = sidRows.Err(); err_ != nil {
+		return NewDbErr(core.ErrDbReadFail, err_)
+	}
+
+	if totalCount == 0 {
+		return nil
+	}
+
+	// 2. 当 validSids 为空时，全部数据需要清除，执行 DROP+RECREATE（QuestDB WAL表不支持 TRUNCATE）。
+	if len(validSids) == 0 {
+		log.Info("DelKLines: no valid sids, truncating table",
+			zap.String("tf", timeFrame), zap.Int64("total", totalCount))
+		tmpTbl := tblName + "_new"
+		createSQL := fmt.Sprintf(`create table %s as (
+select sid,ts,open,high,low,close,volume,quote,buy_volume,trade_num
+from %s where 1=0
+) timestamp(ts) partition by %s dedup upsert keys(sid, ts)`, tmpTbl, tblName, partBy)
+		if _, err_ = q.db.Exec(ctx, createSQL); err_ != nil {
+			return NewDbErr(core.ErrDbExecFail, err_)
+		}
+		if _, err_ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tblName)); err_ != nil {
+			_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
+			return NewDbErr(core.ErrDbExecFail, err_)
+		}
+		if _, err_ = q.db.Exec(ctx, fmt.Sprintf("rename table %s to %s", tmpTbl, tblName)); err_ != nil {
+			return NewDbErr(core.ErrDbExecFail, err_)
+		}
+		log.Info("DelKLines: table truncated", zap.String("tf", timeFrame))
+		return nil
+	}
+
+	// 3. 决定是否需要物理重写：
+	//    删除比例 < 50% 时，重写性价比低；sranges soft-delete已足够屏蔽这些幽灵行。
+	deleteCount := totalCount - keepCount
+	deleteRatio := float64(deleteCount) / float64(totalCount)
+	if deleteRatio < 0.5 {
+		log.Info("DelKLines: delete ratio < 50%, skip rewrite (sranges already cleaned)",
+			zap.String("tf", timeFrame), zap.Int64("total", totalCount),
+			zap.Int64("delete", deleteCount), zap.Int64("keep", keepCount),
+			zap.String("deleteRatio", fmt.Sprintf("%.1f%%", deleteRatio*100)))
+		return nil
+	}
+
+	// 4. 估算重写耗时并输出日志（QuestDB大约每秒处理100万行复制）
+	estSecs := float64(keepCount) / 1_000_000
+	if estSecs < 1 {
+		estSecs = 1
+	}
+	log.Info("DelKLines: rewriting table, please wait...",
+		zap.String("tf", timeFrame), zap.Int64("total", totalCount),
+		zap.Int64("keep", keepCount), zap.Int64("remove", deleteCount),
+		zap.String("deleteRatio", fmt.Sprintf("%.1f%%", deleteRatio*100)),
+		zap.Int("est_secs", int(estSecs)))
+
+	// 5. 重写表：创建新表 -> 复制保留数据 -> 删除旧表 -> 重命名
+	sidIn := strings.Join(validSids, ",")
 	tmpTbl := tblName + "_new"
 	createSQL := fmt.Sprintf(`create table %s as (
 select sid,ts,open,high,low,close,volume,quote,buy_volume,trade_num
@@ -1148,7 +1217,6 @@ from %s where sid in (%s)
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
 	if _, err_ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tblName)); err_ != nil {
-		// 尝试清理临时表
 		_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
@@ -1156,7 +1224,7 @@ from %s where sid in (%s)
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
 	log.Info("DelKLines: table rewrite done",
-		zap.String("tf", timeFrame), zap.Int64("kept", coveredCount))
+		zap.String("tf", timeFrame), zap.Int64("kept", keepCount))
 	return nil
 }
 
@@ -1185,10 +1253,18 @@ FixKInfoZeros
 */
 func (q *Queries) FixKInfoZeros() *errs.Error {
 	ctx := context.Background()
-	rows, err_ := pool.Query(ctx, `SELECT sid, tbl, timeframe
+	var rows pgx.Rows
+	var err_ error
+	if IsQuestDB {
+		rows, err_ = pool.Query(ctx, `SELECT sid, tbl, timeframe
 FROM sranges_q
 LATEST BY sid, tbl, timeframe, start_ms
 WHERE has_data = true AND coalesce(is_deleted, false) = false AND (stop_ms = 0 OR start_ms = 0)`)
+	} else {
+		rows, err_ = pool.Query(ctx, `SELECT sid, tbl, timeframe
+FROM sranges
+WHERE has_data = true AND (stop_ms = 0 OR start_ms = 0)`)
+	}
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}

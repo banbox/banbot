@@ -319,9 +319,9 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 			log.Warn("fetch unfinish bar fail", zap.Error(fetchErr))
 		}
 		if len(data) > 0 {
-		if err := sess.SetUnfinish(exs.ID, timeFrame, curMS, data[0]); err != nil {
-			log.Warn("set unfinish fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame), zap.Error(err))
-		}
+			if err := sess.SetUnfinish(exs.ID, timeFrame, curMS, data[0]); err != nil {
+				log.Warn("set unfinish fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame), zap.Error(err))
+			}
 		}
 	}
 
@@ -807,6 +807,23 @@ func parseDownArgs(tfMSecs int64, startMS, endMS int64, limit int, withUnFinish 
 
 func (q *Queries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, *errs.Error) {
 	ctx := context.Background()
+	if !IsQuestDB {
+		cals, err := q.getCalendarsPg(ctx, name)
+		if err != nil {
+			return nil, NewDbErr(core.ErrDbReadFail, err)
+		}
+		result := make([][2]int64, 0, len(cals))
+		for _, c := range cals {
+			if startMS > 0 && c.StopMs <= startMS {
+				continue
+			}
+			if stopMS > 0 && c.StartMs >= stopMS {
+				continue
+			}
+			result = append(result, [2]int64{c.StartMs, c.StopMs})
+		}
+		return result, nil
+	}
 	sqlText := `SELECT start_ms, stop_ms
 FROM calendars_q
 LATEST BY market, start_ms
@@ -841,6 +858,22 @@ func (q *Queries) SetCalendars(name string, items [][2]int64) *errs.Error {
 	}
 	startMS, stopMS := items[0][0], items[len(items)-1][1]
 	ctx := context.Background()
+
+	if !IsQuestDB {
+		// TimescaleDB: DELETE old rows for this market, then INSERT new.
+		if err := q.delCalendarsPg(ctx, name); err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
+		adds := make([]AddCalendarsParams, 0, len(items))
+		for _, it := range items {
+			adds = append(adds, AddCalendarsParams{Name: name, StartMs: it[0], StopMs: it[1]})
+		}
+		_, err := q.addCalendarsPg(ctx, adds)
+		if err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
+		return nil
+	}
 
 	sqlText := `SELECT market, start_ms, stop_ms
 FROM calendars_q
@@ -974,6 +1007,10 @@ func GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start, stop int64, 
 }
 
 func (q *Queries) DelKData(exsList []*ExSymbol, tfList []string, startMS, endMS int64) *errs.Error {
+	delSids := make(map[int32]bool, len(exsList))
+	for _, exs := range exsList {
+		delSids[exs.ID] = true
+	}
 	for _, tf := range tfList {
 		for _, exs := range exsList {
 			if err := q.DelKInfo(exs.ID, tf); err != nil {
@@ -987,7 +1024,7 @@ func (q *Queries) DelKData(exsList []*ExSymbol, tfList []string, startMS, endMS 
 		}
 	}
 	for _, tf := range tfList {
-		err := q.DelKLines(tf)
+		err := q.DelKLines(tf, delSids)
 		if err != nil {
 			return err
 		}

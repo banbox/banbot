@@ -24,7 +24,6 @@ func insKlineLockKey(sid int32, timeframe string) string {
 	return fmt.Sprintf("%d/%s", sid, timeframe)
 }
 
-
 type AddAdjFactorsParams struct {
 	Sid     int32   `json:"sid"`
 	SubID   int32   `json:"sub_id"`
@@ -52,6 +51,9 @@ func (q *Queries) AddCalendars(ctx context.Context, arg []AddCalendarsParams) (i
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !IsQuestDB {
+		return q.addCalendarsPg(ctx, arg)
+	}
 	now := time.Now().UTC()
 	for i, c := range arg {
 		ts := now.Add(time.Duration(i) * time.Microsecond)
@@ -71,6 +73,9 @@ func (q *Queries) AddAdjFactors(ctx context.Context, arg []AddAdjFactorsParams) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !IsQuestDB {
+		return q.addAdjFactorsPg(ctx, arg)
+	}
 	now := time.Now().UTC()
 	for i, f := range arg {
 		ts := now.Add(time.Duration(i) * time.Microsecond)
@@ -86,6 +91,9 @@ VALUES ($1, $2, $3, $4, $5, false)`, ts, f.Sid, f.SubID, f.StartMs, f.Factor)
 func (q *Queries) GetAdjFactors(ctx context.Context, sid int32) ([]*AdjFactor, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if !IsQuestDB {
+		return q.getAdjFactorsPg(ctx, sid)
 	}
 	rows, err := q.db.Query(ctx, `SELECT sid, sub_id, start_ms, factor
 FROM adj_factors_q
@@ -111,6 +119,9 @@ func (q *Queries) DelAdjFactors(ctx context.Context, sid int32) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !IsQuestDB {
+		return q.delAdjFactorsPg(ctx, sid)
+	}
 	factors, err := q.GetAdjFactors(ctx, sid)
 	if err != nil {
 		return err
@@ -132,6 +143,9 @@ func (q *Queries) GetInsKline(ctx context.Context, sid int32, timeframe string) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !IsQuestDB {
+		return q.getInsKlinePg(ctx, sid, timeframe)
+	}
 	row := q.db.QueryRow(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
 FROM ins_kline_q
 LATEST BY sid, timeframe
@@ -149,6 +163,9 @@ WHERE sid = $1 AND timeframe = $2 AND coalesce(is_deleted, false) = false`, sid,
 func (q *Queries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if !IsQuestDB {
+		return q.getAllInsKlinesPg(ctx)
 	}
 	rows, err := q.db.Query(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
 FROM ins_kline_q
@@ -178,6 +195,9 @@ func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !IsQuestDB {
+		return q.delInsKlinePg(ctx, sid, timeframe)
+	}
 	delTs := time.Now().UTC()
 	_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted, deleted_at)
 VALUES ($1, $2, $3, 0, 0, true, $4)`, sid, timeframe, ts, delTs)
@@ -190,6 +210,9 @@ VALUES ($1, $2, $3, 0, 0, true, $4)`, sid, timeframe, ts, delTs)
 func (q *Queries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (time.Time, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if !IsQuestDB {
+		return q.addInsKlinePg(ctx, arg)
 	}
 	key := insKlineLockKey(arg.Sid, arg.Timeframe)
 	insKlineLocksmu.Lock()
@@ -229,6 +252,9 @@ func (q *Queries) ListExchanges(ctx context.Context) ([]string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !IsQuestDB {
+		return q.listExchangesPg(ctx)
+	}
 	rows, err := q.db.Query(ctx, `SELECT DISTINCT exchange
 FROM exsymbol_q
 LATEST BY sid
@@ -257,6 +283,9 @@ func (q *Queries) ListSymbols(ctx context.Context, exchange string) ([]*ExSymbol
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !IsQuestDB {
+		return q.listSymbolsPg(ctx, exchange)
+	}
 	rows, err := q.db.Query(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms
 FROM exsymbol_q
 LATEST BY sid
@@ -283,6 +312,9 @@ func (q *Queries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if !IsQuestDB {
+		return q.addSymbolsPg(ctx, arg)
 	}
 	if latest := queryMaxSidFromQDB(ctx); latest > maxSid {
 		maxSid = latest
@@ -313,6 +345,9 @@ func queryMaxSidFromQDB(ctx context.Context) int32 {
 func (q *Queries) SetListMS(ctx context.Context, arg SetListMSParams) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if !IsQuestDB {
+		return q.setListMSPg(ctx, arg)
 	}
 	row := q.db.QueryRow(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms
 FROM exsymbol_q

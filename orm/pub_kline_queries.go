@@ -11,6 +11,9 @@ import (
 )
 
 func (q *Queries) PurgeKlineUn() *errs.Error {
+	if !IsQuestDB {
+		return purgeKlineUnPg()
+	}
 	ctx := context.Background()
 	_, err := q.db.Exec(ctx, `DROP TABLE IF EXISTS kline_un_q`)
 	if err != nil {
@@ -43,6 +46,12 @@ DEDUP UPSERT KEYS(sid, timeframe, ts)`)
 func (q *Queries) DelKInfo(sid int32, timeFrame string) *errs.Error {
 	ctx := context.Background()
 	tbl := "kline_" + timeFrame
+	if !IsQuestDB {
+		if err := delKInfoPg(ctx, sid, tbl, timeFrame); err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
+		return nil
+	}
 	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
 FROM sranges_q
 LATEST BY sid, tbl, timeframe, start_ms
@@ -71,12 +80,14 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND coalesce(is_deleted, false) =
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
 
-	now := time.Now().UTC()
-	for i, k := range items {
-		ts := now.Add(time.Duration(i) * time.Microsecond)
-		_, err := q.db.Exec(ctx, `INSERT INTO sranges_q (sid, ts, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted, deleted_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, true, $2)`, sid, ts, tbl, timeFrame, k.startMs, k.stopMs, k.hasData)
-		if err != nil {
+	if len(items) > 0 {
+		now := time.Now().UTC()
+		microOff := 0
+		spans := make([]srangeSpan, len(items))
+		for i, k := range items {
+			spans[i] = srangeSpan{StartMs: k.startMs, StopMs: k.stopMs, HasData: k.hasData}
+		}
+		if err := batchInsertSrangesDeleted(ctx, q, sid, tbl, timeFrame, spans, now, &microOff); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
 	}
@@ -89,6 +100,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, true, $2)`, sid, ts, tbl, timeFrame, k.start
 func (q *Queries) GetKlineRange(sid int32, timeFrame string) (int64, int64) {
 	ctx := context.Background()
 	tbl := "kline_" + timeFrame
+	if !IsQuestDB {
+		return getKlineRangePg(ctx, sid, tbl, timeFrame)
+	}
 	row := q.db.QueryRow(ctx, `SELECT min(start_ms), max(stop_ms)
 FROM (
   SELECT start_ms, stop_ms
@@ -110,6 +124,9 @@ func (q *Queries) GetKlineRanges(sidList []int32, timeFrame string) map[int32][2
 	}
 	ctx := context.Background()
 	tbl := "kline_" + timeFrame
+	if !IsQuestDB {
+		return getKlineRangesPg(ctx, sidList, tbl, timeFrame)
+	}
 
 	var texts = make([]string, len(sidList))
 	for i, sid := range sidList {
@@ -144,6 +161,9 @@ GROUP BY sid`, sidText)
 
 func (q *Queries) DelFactors(sid int32, startMS, endMS int64) *errs.Error {
 	ctx := context.Background()
+	if !IsQuestDB {
+		return delFactorsPg(ctx, sid, startMS, endMS)
+	}
 	sqlText := `SELECT sid, sub_id, start_ms, factor
 FROM adj_factors_q
 LATEST BY sid, sub_id, start_ms
@@ -194,6 +214,9 @@ VALUES ($1, $2, $3, $4, $5, true, $1)`, ts, k.sid, k.subId, k.startMs, k.factor)
 
 func (q *Queries) DelKLineUn(sid int32, timeFrame string) *errs.Error {
 	ctx := context.Background()
+	if !IsQuestDB {
+		return delKLineUnPg(ctx, sid, timeFrame)
+	}
 	ts := time.Now().UTC()
 	_, err := q.db.Exec(ctx, `INSERT INTO kline_un_q (sid, timeframe, ts, stop_ms, expire_ms,
 open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted, deleted_at)
