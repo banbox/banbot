@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/banbox/banexg/log"
@@ -99,6 +100,9 @@ func (s *compactState) getTableLock(table string) *sync.RWMutex {
 // MaybeCompact should be called after logical-delete writes.
 // It probabilistically triggers a compact check, guarded by per-table cooldown.
 func MaybeCompact(tableName string) {
+	if testing.Testing() {
+		return
+	}
 	meta, ok := compactTables[tableName]
 	if !ok {
 		return

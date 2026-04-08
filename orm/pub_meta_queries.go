@@ -327,15 +327,32 @@ func (q *Queries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64
 		maxSid = latest
 	}
 	now := time.Now().UTC()
+	lastSID := maxSid
 	for i, s := range arg {
 		maxSid++
 		sid := maxSid
+		lastSID = sid
 		ts := now.Add(time.Duration(i) * time.Microsecond)
 		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, is_deleted)
 VALUES ($1, $2, $3, $4, $5, $6, false, 0, 0, false)`, sid, ts, s.Exchange, s.ExgReal, s.Market, s.Symbol)
 		if err != nil {
 			return int64(i), err
 		}
+		cacheExSymbol(&ExSymbol{
+			ID:       sid,
+			Exchange: s.Exchange,
+			ExgReal:  s.ExgReal,
+			Market:   s.Market,
+			Symbol:   s.Symbol,
+		})
+	}
+	// QuestDB WAL commits are async. EnsureSymbols reloads immediately after
+	// AddSymbols, so wait briefly until the latest assigned sid is visible.
+	for range 10 {
+		if queryMaxSidFromQDB(ctx) >= lastSID {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	return int64(len(arg)), nil
 }

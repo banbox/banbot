@@ -10,12 +10,15 @@ import (
 	"time"
 
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
+	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/jackc/pgx/v5"
+	"go.uber.org/zap"
 )
 
 // ─────────────────────────────────────────────
@@ -101,8 +104,11 @@ func buildPgTimeFilter(startMs, endMs int64) string {
 
 // queryOHLCVPg queries K-lines from TimescaleDB (time column = int8 ms).
 func (q *Queries) queryOHLCVPg(sid int32, timeframe string, startMs, endMs int64, limit int, revRead bool) ([]*banexg.Kline, error) {
-	tblName, subTF, _ := resolveTablePg(timeframe)
-	_ = subTF
+	tblName, subTF, rate := resolveTablePg(timeframe)
+	rawLimit := limit
+	if limit > 0 && subTF != "" && rate > 1 {
+		limit = rate * (limit + 1)
+	}
 
 	var sqlText string
 	if revRead {
@@ -118,7 +124,29 @@ ORDER BY time`, tblName, sid, buildPgTimeFilter(startMs, endMs))
 		sqlText += fmt.Sprintf(" LIMIT %d", limit)
 	}
 	rows, err := q.db.Query(context.Background(), sqlText)
-	return mapToKlines(rows, err)
+	items, err := mapToKlines(rows, err)
+	if core.BackTestMode && config.Args != nil && strings.EqualFold(config.Args.LogLevel, "debug") {
+		var firstMS, lastMS int64
+		if len(items) > 0 {
+			firstMS = items[0].Time
+			lastMS = items[len(items)-1].Time
+		}
+		log.Debug("timescale query ohlcv",
+			zap.Int32("sid", sid),
+			zap.String("timeframe", timeframe),
+			zap.String("table", tblName),
+			zap.String("sub_tf", subTF),
+			zap.Int("agg_rate", rate),
+			zap.Int64("start_ms", startMs),
+			zap.Int64("end_ms", endMs),
+			zap.Int("raw_limit", rawLimit),
+			zap.Int("sql_limit", limit),
+			zap.Bool("rev_read", revRead),
+			zap.Int("rows", len(items)),
+			zap.Int64("first_bar_ms", firstMS),
+			zap.Int64("last_bar_ms", lastMS))
+	}
+	return items, err
 }
 
 // resolveTablePg returns the actual table name, sub-timeframe (if aggregating), and rate for TimescaleDB.

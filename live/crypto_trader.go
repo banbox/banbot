@@ -36,7 +36,7 @@ func NewCryptoTrader() *CryptoTrader {
 
 func (t *CryptoTrader) Init() *errs.Error {
 	config.LoadPerfs(config.GetDataDir())
-	dp, err := data.NewLiveProvider(t.FeedKLine, t.OnEnvEnd)
+	dp, err := data.NewLiveProvider(t.FeedDataSeries, t.OnEnvEnd)
 	if err != nil {
 		return err
 	}
@@ -133,7 +133,14 @@ func (t *CryptoTrader) Run() *errs.Error {
 	return nil
 }
 
-func (t *CryptoTrader) FeedKLine(bar *orm.InfoKline) {
+func (t *CryptoTrader) FeedDataSeries(evt *orm.DataSeries) {
+	bar, errConv := orm.AsKline(evt, evt.ExSymbol)
+	if errConv != nil {
+		if err := t.Trader.FeedDataSeries(evt); err != nil {
+			log.Error("handle data series fail", zap.Int32("sid", evt.Sid), zap.Error(err))
+		}
+		return
+	}
 	if bar.IsWarmUp {
 		tfMSecs := int64(utils.TFToSecs(bar.TimeFrame) * 1000)
 		barEndMS := bar.Time + tfMSecs
@@ -152,9 +159,9 @@ func (t *CryptoTrader) FeedKLine(bar *orm.InfoKline) {
 		envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
 		orm.AddDumpRow(orm.DumpKline, envKey, bar.Kline)
 	}
-	err := t.Trader.FeedKline(bar)
+	err := t.Trader.FeedDataSeries(evt)
 	if err != nil {
-		log.Error("handle bar fail", zap.String("pair", bar.Symbol), zap.Error(err))
+		log.Error("handle data series fail", zap.String("pair", bar.Symbol), zap.Error(err))
 		return
 	}
 }

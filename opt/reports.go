@@ -1227,6 +1227,7 @@ func CalcGroupCumProfits(odList []*ormo.InOutOrder, genKey func(o *ormo.InOutOrd
 		return nil, nil, nil
 	}
 	groups := make(map[string]map[string][]*ormo.InOutOrder)
+	groupOrder := make([]string, 0, 8)
 	minTimeMS, maxTimeMS := int64(math.MaxInt64), int64(0)
 	for _, od := range odList {
 		key := genKey(od)
@@ -1234,6 +1235,7 @@ func CalcGroupCumProfits(odList []*ormo.InOutOrder, genKey func(o *ormo.InOutOrd
 		if !ok1 {
 			odMap = make(map[string][]*ormo.InOutOrder)
 			groups[key] = odMap
+			groupOrder = append(groupOrder, key)
 		}
 		old, _ := odMap[od.Symbol]
 		odMap[od.Symbol] = append(old, od)
@@ -1247,7 +1249,8 @@ func CalcGroupCumProfits(odList []*ormo.InOutOrder, genKey func(o *ormo.InOutOrd
 	endMS := utils2.AlignTfMSecs(maxTimeMS, tfMSecs) + tfMSecs
 	var result []*ChartDs
 	maxXNum := 0
-	for key, pairMap := range groups {
+	for _, key := range groupOrder {
+		pairMap := groups[key]
 		cumRets, err := calcCumCurve(pairMap, startMS, endMS, tf, 0)
 		if err != nil {
 			return nil, nil, err
@@ -1276,7 +1279,13 @@ func CalcGroupCumProfits(odList []*ormo.InOutOrder, genKey func(o *ormo.InOutOrd
 func calcCumCurve(pairOrders map[string][]*ormo.InOutOrder, startMS, endMS int64, tf string, baseVal float64) ([]float64, *errs.Error) {
 	var glbRets []float64
 	tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
-	for pair, orders := range pairOrders {
+	pairs := make([]string, 0, len(pairOrders))
+	for pair := range pairOrders {
+		pairs = append(pairs, pair)
+	}
+	sort.Strings(pairs)
+	for _, pair := range pairs {
+		orders := pairOrders[pair]
 		exs := orm.GetExSymbol2(core.ExgName, core.Market, pair)
 		_, closes, err := getOHLCVNoLack(exs, tf, startMS, endMS, tfMSecs)
 		if err != nil {
@@ -1522,7 +1531,13 @@ type PairStat struct {
 func CalcPairStats(pairOrders map[string][]*ormo.InOutOrder, startMS, endMS int64, tf string) ([]*PairStat, *errs.Error) {
 	tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 	var result = make([]*PairStat, 0, len(pairOrders))
-	for pair, orders := range pairOrders {
+	pairs := make([]string, 0, len(pairOrders))
+	for pair := range pairOrders {
+		pairs = append(pairs, pair)
+	}
+	sort.Strings(pairs)
+	for _, pair := range pairs {
+		orders := pairOrders[pair]
 		exs := orm.GetExSymbol2(core.ExgName, core.Market, pair)
 		bars, closes, err := getOHLCVNoLack(exs, tf, startMS, endMS, tfMSecs)
 		if err != nil {

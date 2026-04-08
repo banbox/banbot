@@ -47,12 +47,13 @@ func RelayPolicyGroups() []*PolicyGroup {
 			continue
 		}
 		minTfSecs := utils2.TFToSecs(tf)
-		if stgy.OnPairInfos != nil {
+		if stgy.OnPairInfos != nil || stgy.OnDataSubs != nil {
 			job := &StratJob{
 				Strat:     stgy,
+				DataHub:   NewDataHub(),
 				TimeFrame: tf,
 			}
-			infos := stgy.OnPairInfos(job)
+			infos := CollectDataSubs(job)
 			for _, it := range infos {
 				curSecs := utils2.TFToSecs(it.TimeFrame)
 				if curSecs < minTfSecs {

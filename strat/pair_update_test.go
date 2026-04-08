@@ -203,3 +203,46 @@ func TestUpdatePairs_RebuildsAllWarms(t *testing.T) {
 		t.Fatalf("expected existing pairs to be included in allWarms")
 	}
 }
+
+func TestUpdatePairs_RebuildsWarmsFromCurrentDataSubs(t *testing.T) {
+	resetStratGlobals()
+	setTestHooks()
+	config.RunTimeframes = []string{"1s"}
+	core.Pairs = []string{"BTC/USDT", "ETH/USDT"}
+
+	job := &StratJob{
+		Strat: &TradeStrat{
+			Name:      "stg",
+			WarmupNum: 20,
+			Policy:    &config.RunPolicyConfig{RunTimeframes: []string{"1s"}},
+			OnData: func(s *StratJob, evt *orm.DataSeries) {
+			},
+			OnDataSubs: func(s *StratJob) []*DataSub {
+				return []*DataSub{
+					{Source: "kline", TimeFrame: "15m", WarmupNum: 9},
+					{Source: "macro", TimeFrame: "1d", WarmupNum: 3},
+				}
+			},
+		},
+		Symbol:    &orm.ExSymbol{ID: 1, Symbol: "BTC/USDT"},
+		TimeFrame: "1s",
+		Account:   config.DefAcc,
+		TPMaxs:    map[int64]float64{},
+	}
+	AccJobs[config.DefAcc]["BTC/USDT_1s"] = map[string]*StratJob{"stg": job}
+	PairStrats["BTC/USDT"] = map[string]*TradeStrat{"stg": job.Strat}
+	core.StgPairTfs["stg"] = map[string]string{"BTC/USDT": "1s"}
+	core.PairsMap["BTC/USDT"] = true
+
+	stg := job.Strat
+	_, err := stg.UpdatePairs(PairUpdateReq{Add: []string{"ETH/USDT"}})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if lastWarmPairs["BTC/USDT"]["15m"] != 9 {
+		t.Fatalf("expected current-symbol kline side input warmup to be preserved, got %+v", lastWarmPairs["BTC/USDT"])
+	}
+	if _, ok := lastWarmPairs["BTC/USDT"]["1d"]; ok {
+		t.Fatalf("non-kline side inputs should not be added to warm kline subscriptions: %+v", lastWarmPairs["BTC/USDT"])
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1493,8 +1494,24 @@ Calculate the fiat value of realized profits
 func LegalDoneProfits(off int) float64 {
 	var total = float64(0)
 	var skips []string
-	for i := off; i < len(HistODs); i++ {
-		od := HistODs[i]
+	items := append(make([]*InOutOrder, 0, max(0, len(HistODs)-off)), HistODs[off:]...)
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if ta, tb := a.RealExitMS(), b.RealExitMS(); ta != tb {
+			return ta < tb
+		}
+		if a.Symbol != b.Symbol {
+			return a.Symbol < b.Symbol
+		}
+		if a.Strategy != b.Strategy {
+			return a.Strategy < b.Strategy
+		}
+		if a.EnterTag != b.EnterTag {
+			return a.EnterTag < b.EnterTag
+		}
+		return a.Enter.Amount < b.Enter.Amount
+	})
+	for _, od := range items {
 		_, quote, _, _ := core.SplitSymbol(od.Symbol)
 		price := com.GetPriceSafe(quote, "")
 		if price == -1 {

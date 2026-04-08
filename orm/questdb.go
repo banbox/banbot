@@ -120,6 +120,10 @@ func qdbPaths() (bin string, dataDir string) {
 // startAndWait starts QuestDB and waits for the PGWire port to become reachable.
 func startAndWait(bin, dataDir string, port uint16) *errs.Error {
 	log.Info("starting QuestDB ...", zap.String("bin", bin), zap.String("dataDir", dataDir))
+	if err := waitForPortReady(port, 250*time.Millisecond); err == nil {
+		log.Info("QuestDB already reachable, skip start", zap.Uint16("port", port))
+		return nil
+	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return errs.NewMsg(core.ErrDbConnFail, "mkdir dataDir %s: %v", dataDir, err)
 	}
@@ -141,6 +145,10 @@ func startAndWait(bin, dataDir string, port uint16) *errs.Error {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
+			if readyErr := waitForPortReady(port, 5*time.Second); readyErr == nil {
+				log.Info("QuestDB became reachable after start warning, continue", zap.Error(err))
+				return nil
+			}
 			return errs.NewMsg(core.ErrDbConnFail, "failed to start QuestDB: %v", err)
 		}
 	}
@@ -304,9 +312,13 @@ func writeConfFile(path string, kv map[string]string) error {
 
 // waitForPort polls the PGWire port until it is reachable or timeout.
 func waitForPort(port uint16) *errs.Error {
+	log.Info("waiting for QuestDB to be ready ...", zap.String("addr", fmt.Sprintf("127.0.0.1:%d", port)))
+	return waitForPortReady(port, 30*time.Second)
+}
+
+func waitForPortReady(port uint16, timeout time.Duration) *errs.Error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	log.Info("waiting for QuestDB to be ready ...", zap.String("addr", addr))
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, time.Second)
 		if err == nil {
@@ -316,7 +328,7 @@ func waitForPort(port uint16) *errs.Error {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return errs.NewMsg(core.ErrDbConnFail, "QuestDB did not become ready within 30s on %s", addr)
+	return errs.NewMsg(core.ErrDbConnFail, "QuestDB did not become ready within %s on %s", timeout, addr)
 }
 
 // installQdbDarwin installs QuestDB on macOS via Homebrew.

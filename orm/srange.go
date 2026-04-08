@@ -44,6 +44,16 @@ func srangesCacheGet(sid int32, tbl, tf string) []MSRange {
 	return out
 }
 
+func srangesCacheGetSpans(sid int32, tbl, tf string) ([]srangeSpan, bool) {
+	srangesCacheLock.RLock()
+	entry, ok := srangesCache[srangesCacheKey{sid: sid, tbl: tbl, timeframe: tf}]
+	srangesCacheLock.RUnlock()
+	if !ok || entry == nil {
+		return nil, false
+	}
+	return append([]srangeSpan(nil), entry.spans...), true
+}
+
 // srangesCacheUpdate replaces the cached segment list for a key.
 func srangesCacheUpdate(sid int32, tbl, tf string, segs []srangeSpan) {
 	key := srangesCacheKey{sid: sid, tbl: tbl, timeframe: tf}
@@ -125,6 +135,52 @@ func subtractMSRanges(target MSRange, covered []MSRange) []MSRange {
 	return out
 }
 
+func filterSRangesSpans(spans []srangeSpan, startMs, stopMs int64) []srangeSpan {
+	if len(spans) == 0 {
+		return nil
+	}
+	out := make([]srangeSpan, 0, len(spans))
+	for _, s := range spans {
+		if s.StopMs <= s.StartMs {
+			continue
+		}
+		if s.StopMs < startMs || s.StartMs > stopMs {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func (q *Queries) loadSRangesSpans(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]srangeSpan, error) {
+	if cached, ok := srangesCacheGetSpans(sid, table, timeframe); ok {
+		return filterSRangesSpans(cached, startMs, stopMs), nil
+	}
+	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
+FROM sranges_q
+LATEST BY sid, tbl, timeframe, start_ms
+WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <= $5
+  AND coalesce(is_deleted, false) = false
+ORDER BY start_ms, stop_ms`,
+		sid, table, timeframe, startMs, stopMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	spans := make([]srangeSpan, 0, 16)
+	for rows.Next() {
+		var s srangeSpan
+		if err := rows.Scan(&s.StartMs, &s.StopMs, &s.HasData); err != nil {
+			return nil, err
+		}
+		if s.StopMs > s.StartMs {
+			spans = append(spans, s)
+		}
+	}
+	return spans, rows.Err()
+}
+
 func (q *Queries) ListSRanges(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]*SRange, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -132,28 +188,22 @@ func (q *Queries) ListSRanges(ctx context.Context, sid int32, table, timeframe s
 	if !IsQuestDB {
 		return q.listSRangesPg(ctx, sid, table, timeframe, startMs, stopMs)
 	}
-	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
-FROM sranges_q
-LATEST BY sid, tbl, timeframe, start_ms
-WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <= $5
-  AND coalesce(is_deleted, false) = false
-ORDER BY start_ms`,
-		sid, table, timeframe, startMs, stopMs,
-	)
+	spans, err := q.loadSRangesSpans(ctx, sid, table, timeframe, startMs, stopMs)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []*SRange
-	for rows.Next() {
-		var r SRange
-		if err := rows.Scan(&r.Sid, &r.Table, &r.Timeframe, &r.StartMs, &r.StopMs, &r.HasData); err != nil {
-			return nil, err
-		}
-		out = append(out, &r)
+	out := make([]*SRange, 0, len(spans))
+	for _, s := range spans {
+		out = append(out, &SRange{
+			Sid:       sid,
+			Table:     table,
+			Timeframe: timeframe,
+			StartMs:   s.StartMs,
+			StopMs:    s.StopMs,
+			HasData:   s.HasData,
+		})
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (q *Queries) getCoveredRanges(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]MSRange, error) {
@@ -264,30 +314,8 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 	wantSegs = merged
 
 	// Read existing spans that overlap [startMs, stopMs) from DB.
-	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
-FROM sranges_q
-LATEST BY sid, tbl, timeframe, start_ms
-WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <= $5
-  AND coalesce(is_deleted, false) = false
-ORDER BY start_ms`,
-		sid, table, timeframe, startMs, stopMs,
-	)
+	spans, err := q.loadSRangesSpans(ctx, sid, table, timeframe, startMs, stopMs)
 	if err != nil {
-		return err
-	}
-	spans := make([]srangeSpan, 0, 16)
-	for rows.Next() {
-		var s srangeSpan
-		if err := rows.Scan(&s.StartMs, &s.StopMs, &s.HasData); err != nil {
-			rows.Close()
-			return err
-		}
-		if s.StopMs > s.StartMs {
-			spans = append(spans, s)
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return err
 	}
 
@@ -295,9 +323,9 @@ ORDER BY start_ms`,
 	microOff := 0
 
 	// Recover parts of overlapping spans that extend beyond [startMs, stopMs).
-	// The SQL query uses stop_ms >= startMs AND start_ms <= stopMs, so it can return spans
-	// that only partially overlap the window. Those spans will be fully deleted below, but
-	// the portions outside the window must be re-inserted as new segments.
+	// The SQL query includes spans that touch the window boundaries so adjacent
+	// same-state spans can be merged; portions outside the window are reinserted
+	// as new segments below.
 	var overhangSegs []srangeSpan
 	for _, s := range spans {
 		if s.StartMs < startMs {
@@ -324,6 +352,8 @@ ORDER BY start_ms`,
 	for i, s := range overhangSegs {
 		newSpansFromWant[len(wantSegs)+i] = s
 	}
+	sort.Slice(newSpansFromWant, func(i, j int) bool { return newSpansFromWant[i].StartMs < newSpansFromWant[j].StartMs })
+	newSpansFromWant = mergeSRangeSpans(newSpansFromWant)
 	if len(newSpansFromWant) == 0 {
 		// Nothing to insert; update cache to remove the window interior only.
 		key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
@@ -332,7 +362,7 @@ ORDER BY start_ms`,
 		if entry != nil {
 			kept := entry.spans[:0]
 			for _, s := range entry.spans {
-				if s.StopMs <= startMs || s.StartMs >= stopMs {
+				if s.StopMs < startMs || s.StartMs > stopMs {
 					kept = append(kept, s)
 				}
 			}
@@ -358,7 +388,7 @@ ORDER BY start_ms`,
 	if entry != nil {
 		newSpans = make([]srangeSpan, 0, len(entry.spans)+len(newSpansFromWant))
 		for _, s := range entry.spans {
-			if s.StopMs <= startMs || s.StartMs >= stopMs {
+			if s.StopMs < startMs || s.StartMs > stopMs {
 				newSpans = append(newSpans, s)
 			}
 		}
@@ -367,7 +397,7 @@ ORDER BY start_ms`,
 	}
 	newSpans = append(newSpans, newSpansFromWant...)
 	sort.Slice(newSpans, func(i, j int) bool { return newSpans[i].StartMs < newSpans[j].StartMs })
-	srangesCache[key] = &srangesCacheEntry{spans: newSpans}
+	srangesCache[key] = &srangesCacheEntry{spans: mergeSRangeSpans(newSpans)}
 	srangesCacheLock.Unlock()
 	return nil
 }
@@ -400,36 +430,14 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 		return q.UpdateSRangesPg(ctx, sid, table, timeframe, startMs, stopMs, hasData)
 	}
 
-	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
-FROM sranges_q
-LATEST BY sid, tbl, timeframe, start_ms
-WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <= $5
-  AND coalesce(is_deleted, false) = false
-ORDER BY start_ms, stop_ms`,
-		sid, table, timeframe, startMs, stopMs,
-	)
+	spans, err := q.loadSRangesSpans(ctx, sid, table, timeframe, startMs, stopMs)
 	if err != nil {
 		return err
 	}
-
-	spans := make([]srangeSpan, 0, 16)
 	points := make([]int64, 0, 64)
 	points = append(points, startMs, stopMs)
-	for rows.Next() {
-		var s srangeSpan
-		if err := rows.Scan(&s.StartMs, &s.StopMs, &s.HasData); err != nil {
-			rows.Close()
-			return err
-		}
-		if s.StopMs <= s.StartMs {
-			continue
-		}
-		spans = append(spans, s)
+	for _, s := range spans {
 		points = append(points, s.StartMs, s.StopMs)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
 	}
 
 	sort.Slice(points, func(i, j int) bool { return points[i] < points[j] })
@@ -514,7 +522,7 @@ ORDER BY start_ms, stop_ms`,
 	if entry != nil {
 		newSpans = make([]srangeSpan, 0, len(entry.spans)+len(segSpans))
 		for _, s := range entry.spans {
-			if s.StopMs <= startMs || s.StartMs >= stopMs {
+			if s.StopMs < startMs || s.StartMs > stopMs {
 				newSpans = append(newSpans, s)
 			}
 		}
@@ -523,9 +531,27 @@ ORDER BY start_ms, stop_ms`,
 	}
 	newSpans = append(newSpans, segSpans...)
 	sort.Slice(newSpans, func(i, j int) bool { return newSpans[i].StartMs < newSpans[j].StartMs })
-	srangesCache[key] = &srangesCacheEntry{spans: newSpans}
+	srangesCache[key] = &srangesCacheEntry{spans: mergeSRangeSpans(newSpans)}
 	srangesCacheLock.Unlock()
 	return nil
+}
+
+func mergeSRangeSpans(spans []srangeSpan) []srangeSpan {
+	if len(spans) < 2 {
+		return spans
+	}
+	out := spans[:1]
+	for _, cur := range spans[1:] {
+		last := &out[len(out)-1]
+		if cur.HasData == last.HasData && cur.StartMs <= last.StopMs {
+			if cur.StopMs > last.StopMs {
+				last.StopMs = cur.StopMs
+			}
+			continue
+		}
+		out = append(out, cur)
+	}
+	return out
 }
 
 // batchInsertSrangesDeleted inserts logical-delete markers for each span in one multi-row INSERT.

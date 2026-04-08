@@ -16,13 +16,17 @@ type srangeSnapshot struct {
 
 func ensureQDBPool(t *testing.T) {
 	t.Helper()
+	if !IsQuestDB {
+		t.Skip("QuestDB backend is not active, skipping QuestDB integration test")
+	}
 	if pool == nil {
-		t.Skip("QuestDB pool not available, skipping integration test")
+		t.Skip("QuestDB pool not available, skipping QuestDB integration test")
 	}
 }
 
 func cleanSRanges(t *testing.T, sid int32, tbl, tf string) {
 	t.Helper()
+	srangesCacheDel(sid, tbl, tf)
 	ctx := context.Background()
 	rows, err := pool.Query(ctx, `SELECT start_ms, stop_ms, has_data
 FROM sranges_q
@@ -52,6 +56,7 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND coalesce(is_deleted, false) =
 VALUES ($1, $2, $3, $4, $5, $6, $7, true)`, sid, ts, tbl, tf, it.startMs, it.stopMs, it.hasData)
 	}
 	time.Sleep(200 * time.Millisecond)
+	srangesCacheDel(sid, tbl, tf)
 }
 
 func mustUpdateRange(t *testing.T, sid int32, tbl, tf string, startMs, stopMs int64, hasData bool) {
@@ -234,8 +239,8 @@ func TestUpdateSRangesRandomInvariant(t *testing.T) {
 		if err2 != nil {
 			t.Fatalf("Conn fail: %v", err2)
 		}
-		defer covConn.Release()
 		gotCovered, err := covSess.getCoveredRanges(context.Background(), sid, tbl, tf, 0, 1<<62)
+		covConn.Release()
 		if err != nil {
 			t.Fatalf("getCoveredRanges fail: %v", err)
 		}

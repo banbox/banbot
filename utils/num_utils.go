@@ -3,11 +3,10 @@ package utils
 import (
 	"cmp"
 	"fmt"
-	"github.com/muesli/clusters"
-	"github.com/muesli/kmeans"
-	"gonum.org/v1/gonum/stat"
 	"math"
 	"slices"
+
+	"gonum.org/v1/gonum/stat"
 )
 
 const thresFloat64Eq = 1e-9
@@ -161,7 +160,7 @@ func KMeansVals(vals []float64, num int) *ClusterRes {
 	if len(vals) == 0 {
 		return nil
 	}
-	if num == 1 {
+	if num <= 1 || len(vals) == 1 {
 		sumVal := float64(0)
 		for _, v := range vals {
 			sumVal += v
@@ -172,63 +171,99 @@ func KMeansVals(vals []float64, num int) *ClusterRes {
 			RowGIds:  make([]int, len(vals)),
 		}
 	}
-	// The input value range is between 0 and 1
-	// 输入值域在0~1之间
-	minVal := slices.Min(vals)
-	scale := 1 / (slices.Max(vals) - minVal)
-	if len(vals) == 1 {
-		scale = 1 / minVal
+	if num > len(vals) {
+		num = len(vals)
 	}
-	offset := 0 - minVal*scale
-	var d clusters.Observations
-	for _, val := range vals {
-		d = append(d, clusters.Coordinates{val*scale + offset})
+
+	type pair struct {
+		idx int
+		val float64
 	}
-	// Perform clustering
-	// 进行聚类
-	km := kmeans.New()
-	groups, err_ := km.Partition(d, num)
-	if err_ != nil {
-		return nil
+	sortedVals := make([]pair, len(vals))
+	for i, v := range vals {
+		sortedVals[i] = pair{idx: i, val: v}
 	}
-	slices.SortFunc(groups, func(a, b clusters.Cluster) int {
-		return int((a.Center[0] - b.Center[0]) * 1000)
+	slices.SortFunc(sortedVals, func(a, b pair) int {
+		return cmp.Compare(a.val, b.val)
 	})
-	// Generate return result
-	// 生成返回结果
-	resList := make([]*Cluster, 0, len(groups))
-	seps := make([]float64, 0, len(groups))
-	for i, group := range groups {
-		var center = (group.Center[0] - offset) / scale
-		var items = make([]float64, 0, len(group.Observations))
-		for _, it := range group.Observations {
-			coords := it.Coordinates()
-			items = append(items, (coords[0]-offset)/scale)
+
+	initCenters := func() []float64 {
+		centers := make([]float64, num)
+		if num == 1 {
+			centers[0] = sortedVals[len(sortedVals)/2].val
+			return centers
 		}
-		resList = append(resList, &Cluster{
-			Center: center,
-			Items:  items,
-		})
-		curMax := slices.Max(items)
-		curMin := slices.Min(items)
-		if len(seps) > 0 {
-			seps[i-1] = (seps[i-1] + curMin) / 2
+		last := len(sortedVals) - 1
+		for i := range centers {
+			pos := int(math.Round(float64(i*last) / float64(num-1)))
+			centers[i] = sortedVals[pos].val
 		}
-		seps = append(seps, curMax)
+		return centers
 	}
-	// Calculate the grouping to which each item belongs
-	// 计算每个项所属的分组
-	rowGids := make([]int, 0, len(vals))
-	for _, v := range vals {
-		gid := len(groups) - 1
-		for i, end := range seps {
-			if v < end {
-				gid = i
-				break
+
+	centers := initCenters()
+	assignments := make([]int, len(vals))
+	counts := make([]int, num)
+	sums := make([]float64, num)
+	for iter := 0; iter < 64; iter++ {
+		clear(counts)
+		clear(sums)
+		for i, v := range vals {
+			best := 0
+			bestDist := math.Abs(v - centers[0])
+			for j := 1; j < len(centers); j++ {
+				dist := math.Abs(v - centers[j])
+				if dist < bestDist-thresFloat64Eq || (EqualNearly(dist, bestDist) && centers[j] < centers[best]) {
+					best = j
+					bestDist = dist
+				}
+			}
+			assignments[i] = best
+			counts[best]++
+			sums[best] += v
+		}
+		changed := false
+		for j := range centers {
+			if counts[j] == 0 {
+				pos := int(math.Round((float64(j) + 0.5) * float64(len(sortedVals)-1) / float64(len(centers))))
+				next := sortedVals[pos].val
+				if !EqualNearly(next, centers[j]) {
+					centers[j] = next
+					changed = true
+				}
+				continue
+			}
+			next := sums[j] / float64(counts[j])
+			if !EqualNearly(next, centers[j]) {
+				centers[j] = next
+				changed = true
 			}
 		}
-		rowGids = append(rowGids, gid)
+		slices.Sort(centers)
+		if !changed {
+			break
+		}
 	}
+
+	resList := make([]*Cluster, num)
+	for i, center := range centers {
+		resList[i] = &Cluster{Center: center, Items: make([]float64, 0, counts[i])}
+	}
+	rowGids := make([]int, len(vals))
+	for i, v := range vals {
+		best := 0
+		bestDist := math.Abs(v - centers[0])
+		for j := 1; j < len(centers); j++ {
+			dist := math.Abs(v - centers[j])
+			if dist < bestDist-thresFloat64Eq || (EqualNearly(dist, bestDist) && centers[j] < centers[best]) {
+				best = j
+				bestDist = dist
+			}
+		}
+		rowGids[i] = best
+		resList[best].Items = append(resList[best].Items, v)
+	}
+
 	return &ClusterRes{
 		Clusters: resList,
 		RowGIds:  rowGids,

@@ -23,7 +23,11 @@ import (
 	"go.uber.org/zap"
 )
 
-type FnPairKline = func(bar *orm.InfoKline)
+func shouldLogBacktestSeriesDebug() bool {
+	return core.BackTestMode && config.Args != nil && strings.EqualFold(config.Args.LogLevel, "debug")
+}
+
+type FnDataSeries = func(evt *orm.DataSeries)
 type FuncEnvEnd = func(bar *banexg.PairTFKline, adj *orm.AdjInfo)
 type FnGetInt64 = func() int64
 
@@ -58,8 +62,8 @@ type Feeder struct {
 	*orm.ExSymbol
 	States   []*PairTFCache
 	hour     *TfKlineLoader
-	WaitBar  *banexg.Kline
-	CallBack FnPairKline
+	WaitData *orm.DataSeries
+	CallBack FnDataSeries
 	OnEnvEnd FuncEnvEnd                 // If the futures main force switches or the stock is ex-rights, the position needs to be closed first 期货主力切换或股票除权，需先平仓
 	tfBars   map[string][]*banexg.Kline // Cache the original K-line of each cycle (not restored) 缓存各周期的原始K线（未复权）
 	adjs     []*orm.AdjInfo             // List of weighting factors 复权因子列表
@@ -75,12 +79,12 @@ func (f *Feeder) getSymbol() string {
 	return f.Symbol
 }
 
-func (f *Feeder) getWaitBar() *banexg.Kline {
-	return f.WaitBar
+func (f *Feeder) getWaitData() *orm.DataSeries {
+	return f.WaitData
 }
 
-func (f *Feeder) setWaitBar(bar *banexg.Kline) {
-	f.WaitBar = bar
+func (f *Feeder) setWaitData(evt *orm.DataSeries) {
+	f.WaitData = evt
 }
 
 /*
@@ -264,11 +268,7 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, bars []*banexg.K
 		if !isLive || f.isWarmUp {
 			btime.CurTimeMS = bar.Time + tfMSecs
 		}
-		f.CallBack(&orm.InfoKline{
-			PairTFKline: &banexg.PairTFKline{Kline: *bar, Symbol: pair, TimeFrame: timeFrame},
-			Adj:         adj,
-			IsWarmUp:    f.isWarmUp,
-		})
+		f.CallBack(orm.NewDataSeriesFromKline(f.ExSymbol, timeFrame, bar, adj, f.isWarmUp, true))
 	}
 	if isLive && !f.isWarmUp {
 		// 检查是否延迟
@@ -281,10 +281,10 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, bars []*banexg.K
 	}
 }
 
-type IKlineFeeder interface {
+type IDataFeeder interface {
 	getSymbol() string
-	getWaitBar() *banexg.Kline
-	setWaitBar(bar *banexg.Kline)
+	getWaitData() *orm.DataSeries
+	setWaitData(evt *orm.DataSeries)
 	/*
 		SubTfs Subscribe to data for a specified time period for the current target. Multiple 为当前标的订阅指定时间周期的数据，可多个
 	*/
@@ -293,7 +293,7 @@ type IKlineFeeder interface {
 		WarmTfs The preheating time period gives the number of K lines to the specified time. 预热时间周期给定K线数量到指定时间
 	*/
 	WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.PrgBar) (int64, map[string][2]int, *errs.Error)
-	onNewBars(barTfMSecs int64, bars []*banexg.Kline) (bool, *errs.Error)
+	onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool, *errs.Error)
 	getStates() []*PairTFCache
 }
 
@@ -326,7 +326,7 @@ type KlineFeeder struct {
 	showLog  bool
 }
 
-func NewKlineFeeder(exs *orm.ExSymbol, callBack FnPairKline, showLog bool) (*KlineFeeder, *errs.Error) {
+func NewKlineFeeder(exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*KlineFeeder, *errs.Error) {
 	adjs, err := orm.GetAdjs(exs.ID)
 	if err != nil {
 		return nil, err
@@ -355,6 +355,7 @@ func (f *KlineFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.Pr
 	maxEndMs := int64(0)
 	skips := make(map[string][2]int)
 	hourDone := f.hour == nil
+	debugWarm := shouldLogBacktestSeriesDebug()
 	for tf, warmNum := range tfNums {
 		tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 		endMS := utils2.AlignTfMSecs(curMS, tfMSecs)
@@ -365,6 +366,23 @@ func (f *KlineFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.Pr
 		bars, err := f.getTfKlines(tf, endMS, warmNum, pBar)
 		if err != nil {
 			return 0, nil, err
+		}
+		if debugWarm {
+			var firstMS, lastMS int64
+			if len(bars) > 0 {
+				firstMS = bars[0].Time
+				lastMS = bars[len(bars)-1].Time
+			}
+			log.Debug("warm tf fetch",
+				zap.Bool("questdb", orm.IsQuestDB),
+				zap.String("pair", f.Symbol),
+				zap.String("tf", tf),
+				zap.Int("warm_num", warmNum),
+				zap.Int64("cur_ms", curMS),
+				zap.Int64("end_ms", endMS),
+				zap.Int("got", len(bars)),
+				zap.Int64("first_bar_ms", firstMS),
+				zap.Int64("last_bar_ms", lastMS))
 		}
 		if len(bars) == 0 && f.showLog {
 			skips[fmt.Sprintf("%s_%s", f.Symbol, tf)] = [2]int{warmNum, 0}
@@ -468,7 +486,14 @@ bars are K lines that have not been re-righted and will be re-righted internally
 有新完成的子周期蜡烛数据，尝试更新
 bars 是未复权的K线，内部会进行复权
 */
-func (f *KlineFeeder) onNewBars(barTfMSecs int64, bars []*banexg.Kline) (bool, *errs.Error) {
+func (f *KlineFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool, *errs.Error) {
+	bars, err := dataSeriesToKlines(f.ExSymbol, rows)
+	if err != nil {
+		return false, err
+	}
+	if len(bars) == 0 {
+		return false, nil
+	}
 	state := f.States[0]
 	staMSecs := int64(state.TFSecs * 1000)
 	var ohlcvs []*banexg.Kline
@@ -576,8 +601,8 @@ type IHistFeeder interface {
 	getSymbol() string
 }
 
-type IHistKlineFeeder interface {
-	IKlineFeeder
+type IHistDataFeeder interface {
+	IDataFeeder
 	IHistFeeder
 	// DownIfNeed Download the entire range of K lines, which needs to be called before SetSeek  下载整个范围的K线，需在SetSeek前调用
 	DownIfNeed(sess *orm.Queries, exchange banexg.BanExchange, pBar *utils.PrgBar) *errs.Error
@@ -700,13 +725,33 @@ func (f *DBKlineFeeder) GetBatch() Batch {
 
 func (f *DBKlineFeeder) RunBatch(batch Batch) *errs.Error {
 	if bar, ok := batch.(*banexg.Kline); ok {
-		_, err := f.onNewBars(f.TFMSecs, []*banexg.Kline{bar})
+		evt := orm.NewDataSeriesFromKline(f.ExSymbol, f.Timeframe, bar, f.adj, f.isWarmUp, true)
+		_, err := f.onNewData(f.TFMSecs, []*orm.DataSeries{evt})
 		return err
 	}
 	return nil
 }
 
-func NewDBKlineFeeder(exs *orm.ExSymbol, callBack FnPairKline, showLog bool) (*DBKlineFeeder, *errs.Error) {
+func dataSeriesToKlines(exs *orm.ExSymbol, rows []*orm.DataSeries) ([]*banexg.Kline, *errs.Error) {
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	items := make([]*banexg.Kline, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		bar, err := orm.AsKline(row, exs)
+		if err != nil {
+			return nil, errs.New(core.ErrInvalidBars, err)
+		}
+		kline := bar.Kline
+		items = append(items, &kline)
+	}
+	return items, nil
+}
+
+func NewDBKlineFeeder(exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*DBKlineFeeder, *errs.Error) {
 	exchange, err := exg.GetWith(exs.Exchange, exs.Market, "")
 	if err != nil {
 		return nil, err
@@ -897,15 +942,42 @@ func (f *TfKlineLoader) SetNext() {
 		// QuestDB performs better with fewer, larger range queries than many small ones.
 		batchSize = 20000
 	}
+	debugLoad := shouldLogBacktestSeriesDebug()
+	if debugLoad {
+		log.Debug("load tf bars request",
+			zap.Bool("questdb", orm.IsQuestDB),
+			zap.String("pair", f.Symbol),
+			zap.String("tf", f.Timeframe),
+			zap.Int64("offset_ms", f.offsetMS),
+			zap.Int64("end_ms", endMS),
+			zap.Int("batch_size", batchSize))
+	}
 	_, bars, err := sess.GetOHLCV(f.ExSymbol, f.Timeframe, f.offsetMS, endMS, batchSize, true)
 	if err != nil || len(bars) == 0 {
 		f.rowIdx = -1
 		f.offsetMS = max(f.offsetMS, f.nextMS)
 		f.nextMS = math.MaxInt64
+		if debugLoad {
+			log.Debug("load tf bars result",
+				zap.Bool("questdb", orm.IsQuestDB),
+				zap.String("pair", f.Symbol),
+				zap.String("tf", f.Timeframe),
+				zap.Int("got", len(bars)),
+				zap.Error(err))
+		}
 		if err != nil {
 			log.Error("load kline fail", zap.Error(err))
 		}
 		return
+	}
+	if debugLoad {
+		log.Debug("load tf bars result",
+			zap.Bool("questdb", orm.IsQuestDB),
+			zap.String("pair", f.Symbol),
+			zap.String("tf", f.Timeframe),
+			zap.Int("got", len(bars)),
+			zap.Int64("first_bar_ms", bars[0].Time),
+			zap.Int64("last_bar_ms", bars[len(bars)-1].Time))
 	}
 	f.caches = bars
 	f.rowIdx = 0

@@ -103,6 +103,22 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <=
 	allSegs := make([]srangeSpan, 0, len(wantSegs)+len(overhangSegs))
 	allSegs = append(allSegs, wantSegs...)
 	allSegs = append(allSegs, overhangSegs...)
+	// Normalize before INSERT because overhang segments can share the same start_ms
+	// as a window segment. Without sorting+merging first, a later ON CONFLICT update
+	// can shrink a previously extended has_data span and leave stale coverage.
+	sort.Slice(allSegs, func(i, j int) bool {
+		if allSegs[i].StartMs != allSegs[j].StartMs {
+			return allSegs[i].StartMs < allSegs[j].StartMs
+		}
+		if allSegs[i].StopMs != allSegs[j].StopMs {
+			return allSegs[i].StopMs < allSegs[j].StopMs
+		}
+		if allSegs[i].HasData == allSegs[j].HasData {
+			return false
+		}
+		return allSegs[i].HasData && !allSegs[j].HasData
+	})
+	allSegs = mergeSRangeSpans(allSegs)
 	for _, s := range allSegs {
 		_, err = txq.db.Exec(ctx, `INSERT INTO sranges (sid, tbl, timeframe, start_ms, stop_ms, has_data)
 VALUES ($1, $2, $3, $4, $5, $6)

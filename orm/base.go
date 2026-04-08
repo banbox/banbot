@@ -808,7 +808,7 @@ func runPgMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 		versionStr := strings.TrimSpace(lines[0])
 		version, err2 := strconv.ParseInt(versionStr, 10, 64)
 		if err2 != nil {
-			if strings.HasPrefix(versionStr, "--") {
+			if strings.HasPrefix(versionStr, "--") || strings.Contains(versionStr, "<") {
 				continue
 			}
 			log.Warn("invalid pg migration version", zap.String("version", versionStr))

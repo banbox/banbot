@@ -26,6 +26,7 @@ type AdjInfo struct {
 
 type InfoKline struct {
 	*banexg.PairTFKline
+	Sid      int32
 	Adj      *AdjInfo
 	IsWarmUp bool
 }

@@ -798,7 +798,11 @@ func RunHistKline(args *RunHistArgs) *errs.Error {
 	}
 	var futures = make(map[string][]*tfFuts)
 	var lock deadlock.Mutex
-	onItemBar := func(b *orm.InfoKline) {
+	onItemBar := func(evt *orm.DataSeries) {
+		b, errConv := orm.AsKline(evt, evt.ExSymbol)
+		if errConv != nil {
+			return
+		}
 		if args.ViewNextNum <= 0 || b.IsWarmUp {
 			args.OnBar(b, nil)
 			return
@@ -824,7 +828,7 @@ func RunHistKline(args *RunHistArgs) *errs.Error {
 			args.OnBar(old, state.Futs)
 		}
 	}
-	var holds = make([]data.IHistKlineFeeder, 0, len(args.ExsList))
+	var holds = make([]data.IHistDataFeeder, 0, len(args.ExsList))
 	var skipWarms = make(map[string][2]int)
 	var skips map[string][2]int
 	for i, exs := range args.ExsList {

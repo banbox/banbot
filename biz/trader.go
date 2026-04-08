@@ -53,7 +53,76 @@ func (t *Trader) OnEnvJobs(bar *orm.InfoKline) (*ta.BarEnv, *errs.Error) {
 	return env, nil
 }
 
-func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
+func (t *Trader) FeedDataSeries(evt *orm.DataSeries) *errs.Error {
+	if evt == nil {
+		return nil
+	}
+	exs := evt.ExSymbol
+	if exs == nil {
+		exs = orm.GetSymbolByID(evt.Sid)
+	}
+	if exs == nil && orm.NormalizeSeriesSource(evt.Source) == orm.SeriesSourceKline {
+		return errs.NewMsg(core.ErrInvalidSymbol, "series sid %d not found", evt.Sid)
+	}
+	bar, err := orm.AsKline(evt, exs, nil)
+	if err != nil {
+		return t.feedDataOnlySeries(evt)
+	}
+	evt.ExSymbol = exs
+	evt.Sid = bar.Sid
+	return t.feedClosedSeries(evt)
+}
+
+func (t *Trader) FeedSeries(evt *orm.DataSeries) *errs.Error {
+	return t.FeedDataSeries(evt)
+}
+
+func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries) *errs.Error {
+	if evt == nil {
+		return nil
+	}
+	subKey := strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)
+	dispatched := false
+	for account, cfg := range config.Accounts {
+		if cfg.NoTrade {
+			continue
+		}
+		dispatched = true
+		strat.LockJobsRead()
+		jobMap, _ := strat.GetInfoJobs(account)[subKey]
+		strat.UnlockJobsRead()
+		deliverDataOnlySeries(jobMap, evt)
+	}
+	if !dispatched {
+		strat.LockJobsRead()
+		jobMap, _ := strat.GetInfoJobs(config.DefAcc)[subKey]
+		strat.UnlockJobsRead()
+		deliverDataOnlySeries(jobMap, evt)
+	}
+	return nil
+}
+
+func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSeries) {
+	for _, job := range jobMap {
+		if job.DataHub == nil {
+			job.DataHub = strat.NewDataHub()
+		}
+		job.DataHub.Set(evt)
+		job.IsWarmUp = evt.IsWarmUp
+		if job.Strat.OnData == nil {
+			continue
+		}
+		num1, num2 := strat.GetJobInOutNum(job)
+		job.Strat.OnData(job, evt)
+		strat.CheckJobInOutNum(job, "OnData", num1, num2)
+	}
+}
+
+func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
+	bar, convErr := orm.AsKline(evt, evt.ExSymbol)
+	if convErr != nil {
+		return errs.New(core.ErrInvalidBars, convErr)
+	}
 	core.LockOdMatch.RLock()
 	_, odMatch := core.OrderMatchTfs[bar.TimeFrame]
 	core.LockOdMatch.RUnlock()
@@ -136,10 +205,10 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 			accOdArr = append(accOdArr, numStr)
 		}
 		if !core.ParallelOnBar {
-			curErr := t.onAccountKline(account, env, bar, allOrders, barExpired)
+			curErr := t.onAccountDataSeries(account, env, evt, bar, allOrders, barExpired)
 			if curErr != nil {
 				if err != nil {
-					log.Error("onAccountKline fail", zap.String("account", account), zap.Error(curErr))
+					log.Error("onAccountDataSeries fail", zap.String("account", account), zap.Error(curErr))
 				} else {
 					err = curErr
 				}
@@ -148,9 +217,9 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 			wg.Add(1)
 			go func(acc string, ods []*ormo.InOutOrder) {
 				defer wg.Done()
-				if curErr := t.onAccountKline(acc, env, bar, ods, barExpired); curErr != nil {
+				if curErr := t.onAccountDataSeries(acc, env, evt, bar, ods, barExpired); curErr != nil {
 					if err != nil {
-						log.Error("onAccountKline fail", zap.String("account", acc), zap.Error(curErr))
+						log.Error("onAccountDataSeries fail", zap.String("account", acc), zap.Error(curErr))
 					} else {
 						err = curErr
 					}
@@ -168,13 +237,17 @@ func (t *Trader) FeedKline(bar *orm.InfoKline) *errs.Error {
 	return err
 }
 
-func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKline, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
+func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.DataSeries, bar *orm.InfoKline, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
 	envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
+	infoKey := envKey
+	if evt != nil {
+		infoKey = strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)
+	}
 	// Get strategy jobs 获取交易任务
 	strat.LockJobsRead()
 	jobs, _ := strat.GetJobs(account)[envKey]
 	// jobs which subscript info timeframes  辅助订阅的任务
-	infoJobs, _ := strat.GetInfoJobs(account)[envKey]
+	infoJobs, _ := strat.GetInfoJobs(account)[infoKey]
 	strat.UnlockJobsRead()
 	if len(jobs) == 0 && len(infoJobs) == 0 {
 		return nil
@@ -184,10 +257,16 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 	isWarmup := bar.IsWarmUp
 	var wg sync.WaitGroup
 	for _, job := range jobs {
+		if job.DataHub == nil {
+			job.DataHub = strat.NewDataHub()
+		}
+		if evt != nil {
+			job.DataHub.Set(evt)
+		}
 		job.IsWarmUp = isWarmup
 		job.InitBar(curOrders)
 		if !core.ParallelOnBar {
-			err = t.onAccountKlineJob(odMgr, job, bar, barExpired)
+			err = t.onAccountDataSeriesJob(odMgr, job, evt, bar, barExpired)
 			if err != nil {
 				return err
 			}
@@ -195,7 +274,7 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 			wg.Add(1)
 			go func(j *strat.StratJob) {
 				defer wg.Done()
-				if errCur := t.onAccountKlineJob(odMgr, j, bar, barExpired); errCur != nil {
+				if errCur := t.onAccountDataSeriesJob(odMgr, j, evt, bar, barExpired); errCur != nil {
 					if errCur != nil {
 						err = errCur
 					}
@@ -213,10 +292,21 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 	// 更新辅助订阅数据
 	// 此处不应允许开平仓或更新止盈止损等，否则订单的TimeFrame会出现歧义
 	for _, job := range infoJobs {
+		if job.DataHub == nil {
+			job.DataHub = strat.NewDataHub()
+		}
+		if evt != nil {
+			job.DataHub.Set(evt)
+		}
 		job.IsWarmUp = isWarmup
 		num1, num2 := strat.GetJobInOutNum(job)
-		job.Strat.OnInfoBar(job, env, bar.Symbol, bar.TimeFrame)
-		strat.CheckJobInOutNum(job, "OnInfoBar", num1, num2)
+		if evt != nil && job.Strat.OnData != nil {
+			job.Strat.OnData(job, evt)
+			strat.CheckJobInOutNum(job, "OnData", num1, num2)
+		} else if job.Strat.OnInfoBar != nil {
+			job.Strat.OnInfoBar(job, env, bar.Symbol, bar.TimeFrame)
+			strat.CheckJobInOutNum(job, "OnInfoBar", num1, num2)
+		}
 		if job.Strat.BatchInfo && job.Strat.OnBatchInfos != nil {
 			AddBatchJob(account, bar.TimeFrame, job, env)
 		}
@@ -247,9 +337,13 @@ func (t *Trader) onAccountKline(account string, env *ta.BarEnv, bar *orm.InfoKli
 	return nil
 }
 
-func (t *Trader) onAccountKlineJob(odMgr IOrderMgr, job *strat.StratJob, bar *orm.InfoKline, barExpired bool) *errs.Error {
+func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, evt *orm.DataSeries, bar *orm.InfoKline, barExpired bool) *errs.Error {
 	account := job.Account
-	job.Strat.OnBar(job)
+	if evt != nil && job.Strat.OnData != nil {
+		job.Strat.OnData(job, evt)
+	} else {
+		job.Strat.OnBar(job)
+	}
 	isWarmup := job.IsWarmUp
 	isBatch := job.Strat.BatchInOut && job.Strat.OnBatchJobs != nil
 	if !barExpired {

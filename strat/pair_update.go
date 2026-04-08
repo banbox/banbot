@@ -287,14 +287,11 @@ func collectAllWarmsLocked() Warms {
 				all.Update(pair, tf, job.Strat.WarmupNum)
 				matchTf, _ := config.GetStratRefineTF(job.Strat.Name, tf)
 				all.Update(pair, matchTf, 0)
-				if job.Strat.OnPairInfos != nil {
-					for _, sub := range job.Strat.OnPairInfos(job) {
-						p := sub.Pair
-						if p == "_cur_" {
-							p = pair
-						}
-						all.Update(p, sub.TimeFrame, sub.WarmupNum)
+				for _, sub := range CollectDataSubs(job) {
+					if sub == nil || orm.NormalizeSeriesSource(sub.Source) != orm.SeriesSourceKline || sub.ExSymbol == nil {
+						continue
 					}
+					all.Update(sub.ExSymbol.Symbol, sub.TimeFrame, sub.WarmupNum)
 				}
 			}
 		}

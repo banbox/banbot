@@ -19,6 +19,7 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	utils2 "github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
 )
 
@@ -29,7 +30,7 @@ type IProvider interface {
 	SetDirty()
 }
 
-type Provider[T IKlineFeeder] struct {
+type Provider[T IDataFeeder] struct {
 	holders   map[string]T
 	newFeeder func(pair string, tfs []string) (T, *errs.Error)
 	dirtyVers chan int
@@ -37,7 +38,7 @@ type Provider[T IKlineFeeder] struct {
 	showLog   bool
 }
 
-func (p *Provider[IKlineFeeder]) UnSubPairs(pairs ...string) []string {
+func (p *Provider[IDataFeeder]) UnSubPairs(pairs ...string) []string {
 	var removed []string
 	for _, pair := range pairs {
 		if _, ok := p.holders[pair]; ok {
@@ -48,13 +49,13 @@ func (p *Provider[IKlineFeeder]) UnSubPairs(pairs ...string) []string {
 	return removed
 }
 
-func (p *Provider[IKlineFeeder]) SetDirty() {
+func (p *Provider[IDataFeeder]) SetDirty() {
 	p.dirtyLast += 1
 	p.dirtyVers <- p.dirtyLast
 }
 
 type WarmJob struct {
-	hold    IKlineFeeder
+	hold    IDataFeeder
 	timeMS  int64
 	tfWarms map[string]int
 }
@@ -70,8 +71,8 @@ Return the trading pairs with the smallest period change (new/old pairs new peri
 	items: pair[timeFrame]warmNum
 	返回最小周期变化的交易对(新增/旧对新周期)、预热任务
 */
-func (p *Provider[IKlineFeeder]) SubWarmPairs(items map[string]map[string]int, delOther bool, pBar *utils.StagedPrg) ([]IKlineFeeder, map[string]int64, []string, *errs.Error) {
-	var newHolds []IKlineFeeder
+func (p *Provider[IDataFeeder]) SubWarmPairs(items map[string]map[string]int, delOther bool, pBar *utils.StagedPrg) ([]IDataFeeder, map[string]int64, []string, *errs.Error) {
+	var newHolds []IDataFeeder
 	var warmJobs []*WarmJob
 	var oldSince = make(map[string]int64)
 	var err *errs.Error
@@ -120,7 +121,7 @@ func (p *Provider[IKlineFeeder]) SubWarmPairs(items map[string]map[string]int, d
 	return newHolds, sinceMap, delPairs, err
 }
 
-func (p *Provider[IKlineFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPrg) (map[string]int64, *errs.Error) {
+func (p *Provider[IDataFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPrg) (map[string]int64, *errs.Error) {
 	sinceMap := make(map[string]int64)
 	lockMap := deadlock.Mutex{}
 	jobNum := 0
@@ -165,7 +166,7 @@ func (p *Provider[IKlineFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedP
 }
 
 type HistProvider struct {
-	Provider[IHistKlineFeeder]
+	Provider[IHistDataFeeder]
 	getEnd    FnGetInt64
 	maxTfSecs int
 	pBar      *utils.StagedPrg
@@ -174,11 +175,11 @@ type HistProvider struct {
 	trades   map[string]*TradeFeeder
 }
 
-func NewHistProvider(callBack FnPairKline, envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) *HistProvider {
+func NewHistProvider(callBack FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) *HistProvider {
 	p := &HistProvider{
-		Provider: Provider[IHistKlineFeeder]{
-			holders: make(map[string]IHistKlineFeeder),
-			newFeeder: func(pair string, tfs []string) (IHistKlineFeeder, *errs.Error) {
+		Provider: Provider[IHistDataFeeder]{
+			holders: make(map[string]IHistDataFeeder),
+			newFeeder: func(pair string, tfs []string) (IHistDataFeeder, *errs.Error) {
 				exs, err := orm.GetExSymbolCur(pair)
 				if err != nil {
 					return nil, err
@@ -237,7 +238,7 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 		return err
 	}
 	maxSince := int64(0)
-	holders := make(map[string]IHistKlineFeeder)
+	holders := make(map[string]IHistDataFeeder)
 	defSince := btime.TimeMS()
 	needSeek := make(map[string]int64)
 	for pair, since := range sinceMap {
@@ -479,20 +480,20 @@ func SortFeeders(holds []IHistFeeder, hold IHistFeeder, insert bool) []IHistFeed
 }
 
 type LiveProvider struct {
-	Provider[IKlineFeeder]
+	Provider[IDataFeeder]
 	*KLineWatcher
 	OnMinKlines func(msg *KLineMsg, bars []*banexg.Kline) *errs.Error
 }
 
-func NewLiveProvider(callBack FnPairKline, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error) {
+func NewLiveProvider(callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error) {
 	watcher, err := NewKlineWatcher(config.SpiderAddr)
 	if err != nil {
 		return nil, err
 	}
 	provider := &LiveProvider{
-		Provider: Provider[IKlineFeeder]{
-			holders: make(map[string]IKlineFeeder),
-			newFeeder: func(pair string, tfs []string) (IKlineFeeder, *errs.Error) {
+		Provider: Provider[IDataFeeder]{
+			holders: make(map[string]IDataFeeder),
+			newFeeder: func(pair string, tfs []string) (IDataFeeder, *errs.Error) {
 				exs, err := orm.GetExSymbol(exg.Default, pair)
 				if err != nil {
 					return nil, err
@@ -605,19 +606,27 @@ func makeOnKlineMsg(p *LiveProvider) func(msg *KLineMsg) {
 			return
 		}
 		tfMSecs := int64(msg.TFSecs * 1000)
+		exs := orm.GetExSymbol2(msg.ExgName, msg.Market, msg.Pair)
 		handleNewBars := func(bars_ []*banexg.Kline) {
-			go func(bars []*banexg.Kline) {
-				_, err := hold.onNewBars(tfMSecs, bars)
+			if exs == nil {
+				return
+			}
+			rows := make([]*orm.DataSeries, 0, len(bars_))
+			for _, bar := range bars_ {
+				rows = append(rows, orm.NewDataSeriesFromKline(exs, utils2.SecsToTF(msg.TFSecs), bar, nil, false, true))
+			}
+			go func(dataRows []*orm.DataSeries, rawBars []*banexg.Kline) {
+				_, err := hold.onNewData(tfMSecs, dataRows)
 				if err != nil {
-					log.Error("onNewBars fail", zap.String("p", msg.Pair), zap.Error(err))
+					log.Error("onNewData fail", zap.String("p", msg.Pair), zap.Error(err))
 				}
 				if p.OnMinKlines != nil {
-					err = p.OnMinKlines(msg, bars)
+					err = p.OnMinKlines(msg, rawBars)
 					if err != nil {
 						log.Error("OnMinKlines fail", zap.String("p", msg.Pair), zap.Error(err))
 					}
 				}
-			}(bars_)
+			}(rows, bars_)
 		}
 		// The weighting factor has been calculated during the start-up or market break, and the weighting is automatically carried out internally
 		// 已在启动或休市期间计算复权因子，内部会自动进行复权
@@ -629,10 +638,13 @@ func makeOnKlineMsg(p *LiveProvider) func(msg *KLineMsg) {
 		// 更新频率低于bar周期，收到的可能未完成
 		lastIdx := len(msg.Arr) - 1
 		doneArr, lastBar := msg.Arr[:lastIdx], msg.Arr[lastIdx]
-		waitBar := hold.getWaitBar()
-		if waitBar != nil && waitBar.Time < lastBar.Time {
-			doneArr = append([]*banexg.Kline{waitBar}, doneArr...)
-			hold.setWaitBar(nil)
+		waitData := hold.getWaitData()
+		if waitData != nil && waitData.TimeMS < lastBar.Time {
+			waitBar, err := orm.AsKline(waitData, exs)
+			if err == nil {
+				doneArr = append([]*banexg.Kline{&waitBar.Kline}, doneArr...)
+			}
+			hold.setWaitData(nil)
 		}
 		if len(doneArr) > 0 {
 			handleNewBars(doneArr)
@@ -641,7 +653,7 @@ func makeOnKlineMsg(p *LiveProvider) func(msg *KLineMsg) {
 		if msg.Interval <= 5 && hold.getStates()[0].TFSecs >= 60 {
 			// The update is fast, and the cycle required is relatively long, so it is required to be considered complete when the next bar occurs (follow the above logic)
 			// 更新很快，需要的周期相对较长，则要求出现下一个bar时认为完成（走上面逻辑）
-			hold.setWaitBar(lastBar)
+			hold.setWaitData(orm.NewDataSeriesFromKline(exs, utils2.SecsToTF(msg.TFSecs), lastBar, nil, false, false))
 			return
 		}
 		// The frequency of updates is relatively low, or the proportion of the required cycle is large, and the approximate completion is considered complete
@@ -652,7 +664,7 @@ func makeOnKlineMsg(p *LiveProvider) func(msg *KLineMsg) {
 			// 缺少的时间不足更新间隔的一半，认为完成。
 			handleNewBars([]*banexg.Kline{lastBar})
 		} else {
-			hold.setWaitBar(lastBar)
+			hold.setWaitData(orm.NewDataSeriesFromKline(exs, utils2.SecsToTF(msg.TFSecs), lastBar, nil, false, false))
 		}
 	}
 }
@@ -700,9 +712,19 @@ func fireWsKlines(msg *KLineMsg) {
 		return
 	}
 	jobMap, _ := pairMap[msg.Pair]
+	exs := orm.GetExSymbol2(msg.ExgName, msg.Market, msg.Pair)
+	var evt *orm.DataSeries
+	if exs != nil {
+		evt = orm.NewDataSeriesFromKline(exs, utils2.SecsToTF(msg.TFSecs), last, nil, false, false)
+	}
 	for job := range jobMap {
 		num1, num2 := strat.GetJobInOutNum(job)
-		job.Strat.OnWsKline(job, msg.Pair, last)
-		strat.CheckJobInOutNum(job, "OnWsKline", num1, num2)
+		if evt != nil && job.Strat.OnWsData != nil {
+			job.Strat.OnWsData(job, evt)
+			strat.CheckJobInOutNum(job, "OnWsData", num1, num2)
+		} else {
+			job.Strat.OnWsKline(job, msg.Pair, last)
+			strat.CheckJobInOutNum(job, "OnWsKline", num1, num2)
+		}
 	}
 }

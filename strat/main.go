@@ -245,7 +245,7 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 	lockInfoJobs.Lock()
 	for acc, jobMap := range AccInfoJobs {
 		newJobMap := make(map[string]map[string]*StratJob)
-		for pairTf, stgMap := range jobMap {
+		for subKey, stgMap := range jobMap {
 			newStgMap := make(map[string]*StratJob)
 			for name, job := range stgMap {
 				if _, ok := exitJobs[job]; !ok {
@@ -255,15 +255,18 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 				}
 			}
 			if len(newStgMap) > 0 {
-				newJobMap[pairTf] = newStgMap
-				envKeys[pairTf] = true
-				arr := strings.Split(pairTf, "_")
-				pair, tf := arr[0], arr[1]
-				if _, ok := core.TFSecs[tf]; !ok {
-					core.TFSecs[tf] = utils2.TFToSecs(tf)
+				newJobMap[subKey] = newStgMap
+				source, sid, tf, ok := ParseDataSubKey(subKey)
+				if ok {
+					if _, ok = core.TFSecs[tf]; !ok {
+						core.TFSecs[tf] = utils2.TFToSecs(tf)
+					}
+					if source == "kline" {
+						if exs := orm.GetSymbolByID(sid); exs != nil {
+							pairTfs.Update(exs.Symbol, tf, 0)
+						}
+					}
 				}
-				// 确保添加到pairTfWarms中
-				pairTfs.Update(pair, tf, 0)
 			}
 		}
 		AccInfoJobs[acc] = newJobMap
@@ -485,6 +488,7 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 			job = &StratJob{
 				Strat:         stgy,
 				Env:           env,
+				DataHub:       NewDataHub(),
 				Symbol:        exs,
 				TimeFrame:     tf,
 				Account:       account,
@@ -510,26 +514,20 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 		}
 		// Load subscription information for other targets
 		// 加载订阅其他标的信息
-		if stgy.OnPairInfos != nil {
+		if stgy.OnPairInfos != nil || stgy.OnDataSubs != nil {
 			infoJobs := GetInfoJobs(account)
 			hasInfoSubs := false
-			for _, s := range stgy.OnPairInfos(job) {
-				pair := s.Pair
-				if pair == "_cur_" {
-					pair = exs.Symbol
-					initBarEnv(exs, s.TimeFrame)
-				} else {
-					curExs, err := orm.GetExSymbolCur(pair)
-					if err != nil {
-						log.Warn("skip invalid pair", zap.String("strat", job.Strat.Name),
-							zap.String("pair", pair))
-						continue
-					}
-					initBarEnv(curExs, s.TimeFrame)
+			for _, s := range CollectDataSubs(job) {
+				if s == nil || s.ExSymbol == nil {
+					continue
 				}
 				hasInfoSubs = true
-				logWarm(pair, s.TimeFrame, s.WarmupNum)
-				jobKey := strings.Join([]string{pair, s.TimeFrame}, "_")
+				if orm.NormalizeSeriesSource(s.Source) == orm.SeriesSourceKline {
+					pair := s.ExSymbol.Symbol
+					initBarEnv(s.ExSymbol, s.TimeFrame)
+					logWarm(pair, s.TimeFrame, s.WarmupNum)
+				}
+				jobKey := DataSubKey(s.Source, s.ExSymbol.ID, s.TimeFrame)
 				items, ok := infoJobs[jobKey]
 				if !ok {
 					items = make(map[string]*StratJob)
@@ -538,8 +536,8 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 				// 这里需要stratID+pair作为键，否则多个品种订阅同一个额外品种数据时，只记录了最后一个
 				items[strings.Join([]string{stgy.Name, exs.Symbol}, "_")] = job
 			}
-			if hasInfoSubs && stgy.OnInfoBar == nil {
-				panic(fmt.Sprintf("%s: `OnInfoBar` is required for OnPairInfos", stgy.Name))
+			if hasInfoSubs && stgy.OnData == nil && stgy.OnInfoBar == nil {
+				panic(fmt.Sprintf("%s: `OnData` or `OnInfoBar` is required for side-input subscriptions", stgy.Name))
 			}
 		}
 	}
@@ -649,7 +647,7 @@ func unRegWsJob(j *StratJob) {
 var polFilters = make(map[string][]goods.IFilter)
 
 func getPolicyPairs(pol *config.RunPolicyConfig, pairs []string) ([]string, *errs.Error) {
-	// According to pol Pair determines the subject of the transaction
+	// According to pol.Pairs determine the tradable symbols
 	// 根据pol.Pairs确定交易的标的
 	if len(pol.Pairs) > 0 {
 		pairs = pol.Pairs

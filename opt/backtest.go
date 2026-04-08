@@ -45,7 +45,7 @@ type BackTest struct {
 NewBackTestLite 创建一个临时内部回测，仅用于寻找回测未平仓订单来接力
 Create a temporary internal backtest, solely for the purpose of finding backtest open orders to relay.
 */
-func NewBackTestLite(isOpt bool, onBar data.FnPairKline, getEnd data.FnGetInt64, pBar *utils.StagedPrg) *BackTestLite {
+func NewBackTestLite(isOpt bool, onBar data.FnDataSeries, getEnd data.FnGetInt64, pBar *utils.StagedPrg) *BackTestLite {
 	b := &BackTestLite{
 		BTResult: NewBTResult(),
 		isOpt:    isOpt,
@@ -54,8 +54,8 @@ func NewBackTestLite(isOpt bool, onBar data.FnPairKline, getEnd data.FnGetInt64,
 	wallets := biz.GetWallets(config.DefAcc)
 	b.TotalInvest = wallets.TotalLegal(nil, false)
 	if onBar == nil {
-		onBar = func(bar *orm.InfoKline) {
-			b.FeedKLine(bar)
+		onBar = func(evt *orm.DataSeries) {
+			b.FeedDataSeries(evt)
 		}
 	}
 	b.dp = data.NewHistProvider(onBar, b.OnEnvEnd, getEnd, !isOpt, pBar)
@@ -69,7 +69,15 @@ func NewBackTestLite(isOpt bool, onBar data.FnPairKline, getEnd data.FnGetInt64,
 	return b
 }
 
-func (b *BackTestLite) FeedKLine(bar *orm.InfoKline) bool {
+func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
+	bar, errConv := orm.AsKline(evt, evt.ExSymbol)
+	if errConv != nil {
+		if err := b.Trader.FeedDataSeries(evt); err != nil {
+			log.Error("FeedDataSeries fail", zap.Int32("sid", evt.Sid), zap.Error(err))
+			return false
+		}
+		return true
+	}
 	b.BarNum += 1
 	curTime := btime.TimeMS()
 	if curTime > strat.LastBatchMS {
@@ -90,12 +98,12 @@ func (b *BackTestLite) FeedKLine(bar *orm.InfoKline) bool {
 			core.CheckWallets = true
 		}
 	}
-	err := b.Trader.FeedKline(bar)
+	err := b.Trader.FeedDataSeries(evt)
 	if err != nil {
 		if err.Code == core.ErrLiquidation {
 			b.onLiquidation(bar.Symbol)
 		} else {
-			log.Error("FeedKline fail", zap.String("p", bar.Symbol), zap.Error(err))
+			log.Error("FeedDataSeries fail", zap.String("p", bar.Symbol), zap.Error(err))
 		}
 		return false
 	}
@@ -153,7 +161,7 @@ func NewBackTest(isOpt bool, outDir string) (*BackTest, *errs.Error) {
 		}
 		return config.TimeRange.EndMS
 	}
-	b.BackTestLite = NewBackTestLite(isOpt, b.FeedKLine, getEnd, b.PBar)
+	b.BackTestLite = NewBackTestLite(isOpt, b.FeedDataSeries, getEnd, b.PBar)
 	if outDir == "" && !isOpt {
 		hash, err := config.Data.HashCode()
 		if err != nil {
@@ -169,6 +177,20 @@ func NewBackTest(isOpt bool, outDir string) (*BackTest, *errs.Error) {
 func (b *BackTest) Init() *errs.Error {
 	btime.CurTimeMS = config.TimeRange.StartMS
 	b.MinReal = math.MaxFloat64
+	log.Info("backtest config summary",
+		zap.Bool("questdb", orm.IsQuestDB),
+		zap.String("data_dir", config.GetDataDirSafe()),
+		zap.String("timerange", config.Data.TimeRangeRaw),
+		zap.String("time_start", config.Data.TimeStart),
+		zap.String("time_end", config.Data.TimeEnd),
+		zap.Int("pair_count", len(config.Pairs)),
+		zap.Int("run_policy_count", len(config.RunPolicy)),
+		zap.Int("pair_filter_count", len(config.PairFilters)),
+		zap.Int("run_tf_count", len(config.RunTimeframes)),
+		zap.Float64("stake_amount", config.StakeAmount),
+		zap.Float64("bt_net_cost", config.BTNetCost),
+		zap.Int("order_bar_max", config.OrderBarMax),
+		zap.String("out_dir", b.OutDir))
 	if b.OutDir != "" {
 		err_ := os.MkdirAll(b.OutDir, 0755)
 		if err_ != nil {
@@ -194,9 +216,14 @@ func (b *BackTest) Init() *errs.Error {
 	return err
 }
 
-func (b *BackTest) FeedKLine(bar *orm.InfoKline) {
+func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
+	bar, errConv := orm.AsKline(evt, evt.ExSymbol)
+	if errConv != nil {
+		_ = b.BackTestLite.FeedDataSeries(evt)
+		return
+	}
 	curTime := btime.TimeMS()
-	ok := b.BackTestLite.FeedKLine(bar)
+	ok := b.BackTestLite.FeedDataSeries(evt)
 	if !bar.IsWarmUp && core.CheckWallets {
 		core.CheckWallets = false
 		odNum := ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)

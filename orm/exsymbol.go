@@ -30,6 +30,36 @@ var (
 	maxSid        int32 // in-memory sid counter, protected by symbolLock
 )
 
+func cacheExSymbol(exs *ExSymbol) {
+	if exs == nil {
+		return
+	}
+	if exs.ID > maxSid {
+		maxSid = exs.ID
+	}
+	idSymbolMap[exs.ID] = exs
+	key := exSymbolKey(exs.Exchange, exs.Market, exs.Symbol, exs.ExgReal)
+	if cur, ok := keySymbolMap[key]; ok {
+		if cur.ExgReal == "" || exs.ExgReal != "" {
+			return
+		}
+	}
+	keySymbolMap[key] = exs
+	market := fmt.Sprintf("%s:%s", exs.Exchange, exs.Market)
+	marketMap[market] = marketMap[market] + 1
+}
+
+func exSymbolKey(exchange, market, symbol string, _ ...string) string {
+	return fmt.Sprintf("%s:%s:%s", exchange, market, symbol)
+}
+
+func findExSymbol(exchange, market, symbol string) *ExSymbol {
+	if item, ok := keySymbolMap[exSymbolKey(exchange, market, symbol)]; ok {
+		return item
+	}
+	return nil
+}
+
 func (q *Queries) LoadExgSymbols(exgName string) *errs.Error {
 	ctx := context.Background()
 	exsList, err := q.ListSymbols(ctx, exgName)
@@ -37,18 +67,7 @@ func (q *Queries) LoadExgSymbols(exgName string) *errs.Error {
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
 	for _, exs := range exsList {
-		if exs.ID > maxSid {
-			maxSid = exs.ID
-		}
-		key := fmt.Sprintf("%s:%s:%s", exs.Exchange, exs.Market, exs.Symbol)
-		if _, ok := keySymbolMap[key]; ok {
-			continue
-		}
-		keySymbolMap[key] = exs
-		idSymbolMap[exs.ID] = exs
-		market := fmt.Sprintf("%s:%s", exs.Exchange, exs.Market)
-		pairNum, _ := marketMap[market]
-		marketMap[market] = pairNum + 1
+		cacheExSymbol(exs)
 	}
 	return nil
 }
@@ -76,7 +95,9 @@ func GetExSymbolMap(exgName, market string) map[string]*ExSymbol {
 		if market != "" && exs.Market != market {
 			continue
 		}
-		res[exs.Symbol] = exs
+		if cur, ok := res[exs.Symbol]; !ok || cur.ExgReal != "" && exs.ExgReal == "" {
+			res[exs.Symbol] = exs
+		}
 	}
 	return res
 }
@@ -102,9 +123,8 @@ func GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.E
 	if market != nil {
 		marketType = market.Type
 	}
-	key := fmt.Sprintf("%s:%s:%s", exgInfo.ID, marketType, symbol)
-	item, ok := keySymbolMap[key]
-	if !ok {
+	item := findExSymbol(exgInfo.ID, marketType, symbol)
+	if item == nil {
 		if err == nil {
 			err = errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, len(keySymbolMap))
 		}
@@ -113,10 +133,8 @@ func GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.E
 	return item, nil
 }
 
-func GetExSymbol2(exgName, market, symbol string) *ExSymbol {
-	key := fmt.Sprintf("%s:%s:%s", exgName, market, symbol)
-	item, _ := keySymbolMap[key]
-	return item
+func GetExSymbol2(exgName, market, symbol string, exgReal ...string) *ExSymbol {
+	return findExSymbol(exgName, market, symbol)
 }
 
 func EnsureExgSymbols(exchange banexg.BanExchange) *errs.Error {
@@ -228,11 +246,11 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 			}
 		}
 	}
-	// Check the subject matter that needs to be inserted
+	// Check symbols that need to be inserted
 	// 检查需要插入的标的
 	adds := map[string]*ExSymbol{}
 	for _, exs := range symbols {
-		key := fmt.Sprintf("%s:%s:%s", exs.Exchange, exs.Market, exs.Symbol)
+		key := exSymbolKey(exs.Exchange, exs.Market, exs.Symbol)
 		if item, ok := keySymbolMap[key]; !ok {
 			adds[key] = exs
 		} else {
@@ -257,7 +275,7 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 	}
 	argList := make([]AddSymbolsParams, 0, len(adds))
 	for _, item := range adds {
-		key := fmt.Sprintf("%s:%s:%s", item.Exchange, item.Market, item.Symbol)
+		key := exSymbolKey(item.Exchange, item.Market, item.Symbol)
 		if _, ok := keySymbolMap[key]; ok {
 			continue
 		}
@@ -279,14 +297,15 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 		}
 	}
 	// 刷新Sid
-	for key, exs := range adds {
-		item, _ := keySymbolMap[key]
-		if item != nil {
-			exs.ID = item.ID
-			exs.ListMs = item.ListMs
-			exs.DelistMs = item.DelistMs
-			exs.Combined = item.Combined
+	for _, exs := range symbols {
+		item := findExSymbol(exs.Exchange, exs.Market, exs.Symbol)
+		if item == nil {
+			continue
 		}
+		exs.ID = item.ID
+		exs.ListMs = item.ListMs
+		exs.DelistMs = item.DelistMs
+		exs.Combined = item.Combined
 	}
 	return nil
 }
@@ -499,9 +518,8 @@ func ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
 	} else {
 		symbol = short
 	}
-	key := fmt.Sprintf("%s:%s:%s", exgName, market, symbol)
-	item, ok := keySymbolMap[key]
-	if !ok {
+	item := findExSymbol(exgName, market, symbol)
+	if item == nil {
 		exgMarket := fmt.Sprintf("%s:%s", exgName, market)
 		pairNum, _ := marketMap[exgMarket]
 		if pairNum == 0 {
@@ -514,8 +532,8 @@ func ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
 			if err != nil {
 				return nil, err
 			}
-			item, ok = keySymbolMap[key]
-			if ok {
+			item = findExSymbol(exgName, market, symbol)
+			if item != nil {
 				return item, nil
 			}
 			pairNum, _ = marketMap[exgMarket]
