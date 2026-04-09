@@ -14,7 +14,6 @@ import (
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
-	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
@@ -25,28 +24,52 @@ import (
 type Trader struct {
 }
 
-func (t *Trader) OnEnvJobs(bar *orm.InfoKline) (*ta.BarEnv, *errs.Error) {
-	envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
+func (t *Trader) OnEnvSeries(evt *orm.DataSeries) (*ta.BarEnv, *errs.Error) {
+	if evt == nil {
+		return nil, nil
+	}
+	symbol := evt.Symbol()
+	if symbol == "" {
+		return nil, errs.NewMsg(core.ErrInvalidSymbol, "series sid %d not found", evt.Sid)
+	}
+	envKey := strings.Join([]string{symbol, evt.TimeFrame}, "_")
 	env, ok := strat.Envs[envKey]
 	if !ok {
 		// 额外订阅1h没有对应的env，无需处理
 		return nil, nil
 	}
 	if core.LiveMode {
-		if env.TimeStop > bar.Time {
+		if env.TimeStop > evt.TimeMS {
 			// This bar has expired, ignore it, the crawler may push the processed expired bar when starting
-			// 此bar已过期，忽略，启动时爬虫可能会推已处理的过期bar
 			return nil, nil
-		} else if env.TimeStop > 0 && env.TimeStop < bar.Time {
-			lackNum := int(math.Round(float64(bar.Time-env.TimeStop) / float64(env.TFMSecs)))
+		} else if env.TimeStop > 0 && env.TimeStop < evt.TimeMS {
+			lackNum := int(math.Round(float64(evt.TimeMS-env.TimeStop) / float64(env.TFMSecs)))
 			if lackNum > 0 {
 				log.Warn("taEnv bar lack", zap.Int("num", lackNum), zap.String("env", envKey))
 			}
 		}
 	}
-	// Update BarEnv status
-	// 更新BarEnv状态
-	err := env.OnBar(bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Quote, bar.BuyVolume, bar.TradeNum)
+	openVal, err := evt.OpenValue()
+	if err != nil {
+		return nil, errs.New(core.ErrInvalidBars, err)
+	}
+	highVal, err := evt.HighValue()
+	if err != nil {
+		return nil, errs.New(core.ErrInvalidBars, err)
+	}
+	lowVal, err := evt.LowValue()
+	if err != nil {
+		return nil, errs.New(core.ErrInvalidBars, err)
+	}
+	closeVal, err := evt.CloseValue()
+	if err != nil {
+		return nil, errs.New(core.ErrInvalidBars, err)
+	}
+	volumeVal, err := evt.VolumeValue()
+	if err != nil {
+		return nil, errs.New(core.ErrInvalidBars, err)
+	}
+	err = env.OnBar(evt.TimeMS, openVal, highVal, lowVal, closeVal, volumeVal, evt.QuoteValue(), evt.BuyVolumeValue(), evt.TradeNumValue())
 	if err != nil {
 		return nil, errs.New(errs.CodeRunTime, err)
 	}
@@ -57,19 +80,13 @@ func (t *Trader) FeedDataSeries(evt *orm.DataSeries) *errs.Error {
 	if evt == nil {
 		return nil
 	}
-	exs := evt.ExSymbol
-	if exs == nil {
-		exs = orm.GetSymbolByID(evt.Sid)
-	}
+	exs := evt.EnsureExSymbol()
 	if exs == nil && orm.NormalizeSeriesSource(evt.Source) == orm.SeriesSourceKline {
 		return errs.NewMsg(core.ErrInvalidSymbol, "series sid %d not found", evt.Sid)
 	}
-	bar, err := orm.AsKline(evt, exs, nil)
-	if err != nil {
+	if !evt.HasOHLCV() {
 		return t.feedDataOnlySeries(evt)
 	}
-	evt.ExSymbol = exs
-	evt.Sid = bar.Sid
 	return t.feedClosedSeries(evt)
 }
 
@@ -119,17 +136,20 @@ func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSerie
 }
 
 func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
-	bar, convErr := orm.AsKline(evt, evt.ExSymbol)
-	if convErr != nil {
-		return errs.New(core.ErrInvalidBars, convErr)
+	symbol := evt.Symbol()
+	if symbol == "" {
+		return errs.NewMsg(core.ErrInvalidSymbol, "series sid %d not found", evt.Sid)
+	}
+	closeVal, closeErr := evt.CloseValue()
+	if closeErr != nil {
+		return errs.New(core.ErrInvalidBars, closeErr)
 	}
 	core.LockOdMatch.RLock()
-	_, odMatch := core.OrderMatchTfs[bar.TimeFrame]
+	_, odMatch := core.OrderMatchTfs[evt.TimeFrame]
 	core.LockOdMatch.RUnlock()
 	accOrders := make(map[string][]*ormo.InOutOrder)
-	com.SetBarPrice(bar.Symbol, bar.Close)
-	if odMatch && !bar.IsWarmUp {
-		// 需要执行订单更新
+	com.SetBarPrice(symbol, closeVal)
+	if odMatch && !evt.IsWarmUp {
 		for account, cfg := range config.Accounts {
 			if cfg.NoTrade {
 				continue
@@ -139,15 +159,10 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 			allOrders := utils2.ValsOfMap(openOds)
 			lock.Unlock()
 			odMgr := GetOdMgr(account)
-			var err *errs.Error
 			if len(allOrders) > 0 {
-				// The order status may be modified here
-				// 这里可能修改订单状态
-				err = odMgr.UpdateByBar(allOrders, bar)
-				if err != nil {
-					return err
+				if updateErr := odMgr.UpdateByDataSeries(allOrders, evt); updateErr != nil {
+					return updateErr
 				}
-				// 筛选仍然未平仓的订单
 				newOpens := make([]*ormo.InOutOrder, 0, len(allOrders))
 				for _, od := range allOrders {
 					if od.Status < ormo.InOutStatusFullExit {
@@ -158,28 +173,25 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 			}
 		}
 	}
-	// Update indicator environment
-	// 更新指标环境
-	env, err := t.OnEnvJobs(bar)
-	if err != nil {
-		log.Error(fmt.Sprintf("%s/%s OnEnvJobs fail", bar.Symbol, bar.TimeFrame), zap.Error(err))
-		return err
+	env, errEnv := t.OnEnvSeries(evt)
+	if errEnv != nil {
+		log.Error(fmt.Sprintf("%s/%s OnEnvSeries fail", symbol, evt.TimeFrame), zap.Error(errEnv))
+		return errEnv
 	} else if env == nil {
 		return nil
 	}
-	tfSecs := utils2.TFToSecs(bar.TimeFrame)
-	// If it exceeds 1 minute and half of the period, the bar is considered delayed and orders cannot be placed.
-	// 超过1分钟且周期的一半，认为bar延迟，不可下单
-	delaySecs := int((btime.TimeMS()-bar.Time)/1000) - tfSecs
+	tfSecs := utils2.TFToSecs(evt.TimeFrame)
+	delaySecs := int((btime.TimeMS()-evt.TimeMS)/1000) - tfSecs
 	barExpired := delaySecs >= max(60, tfSecs/2)
 	if barExpired {
-		if core.LiveMode && !bar.IsWarmUp {
-			log.Warn(fmt.Sprintf("%s/%s delay %v s, open order disabled for this K-line", bar.Symbol, bar.TimeFrame, delaySecs))
+		if core.LiveMode && !evt.IsWarmUp {
+			log.Warn(fmt.Sprintf("%s/%s delay %v s, open order disabled for this data series", symbol, evt.TimeFrame, delaySecs))
 		} else {
 			barExpired = false
 		}
 	}
 	var wg sync.WaitGroup
+	var runErr *errs.Error
 	var accOdArr = make([]string, 0, len(config.Accounts))
 	for account, cfg := range config.Accounts {
 		if cfg.NoTrade {
@@ -192,36 +204,34 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 			allOrders = utils2.ValsOfMap(openOds)
 			lock.Unlock()
 		}
-		// retrieve the current open orders after UpdateByBar, filter for closed orders
-		// 要在UpdateByBar后检索当前开放订单，过滤已平仓订单
 		var curOrders []*ormo.InOutOrder
 		for _, od := range allOrders {
-			if od.Status < ormo.InOutStatusFullExit && od.Symbol == bar.Symbol && od.Timeframe == bar.TimeFrame {
+			if od.Status < ormo.InOutStatusFullExit && od.Symbol == symbol && od.Timeframe == evt.TimeFrame {
 				curOrders = append(curOrders, od)
 			}
 		}
-		if core.LiveMode && !bar.IsWarmUp {
+		if core.LiveMode && !evt.IsWarmUp {
 			numStr := fmt.Sprintf("%s: %d/%d", account, len(curOrders), len(allOrders))
 			accOdArr = append(accOdArr, numStr)
 		}
 		if !core.ParallelOnBar {
-			curErr := t.onAccountDataSeries(account, env, evt, bar, allOrders, barExpired)
+			curErr := t.onAccountDataSeries(account, env, evt, allOrders, barExpired)
 			if curErr != nil {
-				if err != nil {
+				if runErr != nil {
 					log.Error("onAccountDataSeries fail", zap.String("account", account), zap.Error(curErr))
 				} else {
-					err = curErr
+					runErr = curErr
 				}
 			}
 		} else {
 			wg.Add(1)
 			go func(acc string, ods []*ormo.InOutOrder) {
 				defer wg.Done()
-				if curErr := t.onAccountDataSeries(acc, env, evt, bar, ods, barExpired); curErr != nil {
-					if err != nil {
+				if curErr := t.onAccountDataSeries(acc, env, evt, ods, barExpired); curErr != nil {
+					if runErr != nil {
 						log.Error("onAccountDataSeries fail", zap.String("account", acc), zap.Error(curErr))
 					} else {
-						err = curErr
+						runErr = curErr
 					}
 				}
 			}(account, allOrders)
@@ -231,22 +241,18 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 		wg.Wait()
 	}
 	if core.LiveMode && len(accOdArr) > 0 {
-		log.Info("OnBar", zap.String("pair", bar.Symbol), zap.String("tf", bar.TimeFrame),
+		log.Info("OnSeries", zap.String("pair", symbol), zap.String("tf", evt.TimeFrame),
 			zap.Strings("accOdNums", accOdArr))
 	}
-	return err
+	return runErr
 }
 
-func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.DataSeries, bar *orm.InfoKline, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
-	envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
-	infoKey := envKey
-	if evt != nil {
-		infoKey = strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)
-	}
-	// Get strategy jobs 获取交易任务
+func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.DataSeries, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
+	symbol := evt.Symbol()
+	envKey := strings.Join([]string{symbol, evt.TimeFrame}, "_")
+	infoKey := strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)
 	strat.LockJobsRead()
 	jobs, _ := strat.GetJobs(account)[envKey]
-	// jobs which subscript info timeframes  辅助订阅的任务
 	infoJobs, _ := strat.GetInfoJobs(account)[infoKey]
 	strat.UnlockJobsRead()
 	if len(jobs) == 0 && len(infoJobs) == 0 {
@@ -254,19 +260,17 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 	}
 	odMgr := GetOdMgr(account)
 	var err *errs.Error
-	isWarmup := bar.IsWarmUp
+	isWarmup := evt.IsWarmUp
 	var wg sync.WaitGroup
 	for _, job := range jobs {
 		if job.DataHub == nil {
 			job.DataHub = strat.NewDataHub()
 		}
-		if evt != nil {
-			job.DataHub.Set(evt)
-		}
+		job.DataHub.Set(evt)
 		job.IsWarmUp = isWarmup
 		job.InitBar(curOrders)
 		if !core.ParallelOnBar {
-			err = t.onAccountDataSeriesJob(odMgr, job, evt, bar, barExpired)
+			err = t.onAccountDataSeriesJob(odMgr, job, evt, barExpired)
 			if err != nil {
 				return err
 			}
@@ -274,7 +278,7 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 			wg.Add(1)
 			go func(j *strat.StratJob) {
 				defer wg.Done()
-				if errCur := t.onAccountDataSeriesJob(odMgr, j, evt, bar, barExpired); errCur != nil {
+				if errCur := t.onAccountDataSeriesJob(odMgr, j, evt, barExpired); errCur != nil {
 					if errCur != nil {
 						err = errCur
 					}
@@ -288,31 +292,25 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 			return err
 		}
 	}
-	// invoke OnInfoBar
-	// 更新辅助订阅数据
-	// 此处不应允许开平仓或更新止盈止损等，否则订单的TimeFrame会出现歧义
 	for _, job := range infoJobs {
 		if job.DataHub == nil {
 			job.DataHub = strat.NewDataHub()
 		}
-		if evt != nil {
-			job.DataHub.Set(evt)
-		}
+		job.DataHub.Set(evt)
 		job.IsWarmUp = isWarmup
 		num1, num2 := strat.GetJobInOutNum(job)
-		if evt != nil && job.Strat.OnData != nil {
+		if job.Strat.OnData != nil {
 			job.Strat.OnData(job, evt)
 			strat.CheckJobInOutNum(job, "OnData", num1, num2)
 		} else if job.Strat.OnInfoBar != nil {
-			job.Strat.OnInfoBar(job, env, bar.Symbol, bar.TimeFrame)
+			job.Strat.OnInfoBar(job, env, symbol, evt.TimeFrame)
 			strat.CheckJobInOutNum(job, "OnInfoBar", num1, num2)
 		}
 		if job.Strat.BatchInfo && job.Strat.OnBatchInfos != nil {
-			AddBatchJob(account, bar.TimeFrame, job, env)
+			AddBatchJob(account, evt.TimeFrame, job, env)
 		}
 	}
 	if env.VNum > 1000 && !isWarmup {
-		// Series过多，检查是否有内存泄露
 		keyAt := "first_hit_at"
 		keyNum := "first_hit_vnum"
 		if cacheVal, ok := env.Data.Load(keyAt); ok {
@@ -321,7 +319,6 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 			firstNum, _ := firstNumVal.(int)
 			if env.BarNum-firstAt > 10 {
 				if env.VNum-firstNum > 0 {
-					// 相比第一次有Series异常新增
 					addNum := env.VNum - firstNum
 					addFor := env.BarNum - firstAt
 					errMsg := "series too many (total %v), new add %v in %v bars, try replace `NewSeries` with `Series.To`"
@@ -337,9 +334,9 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 	return nil
 }
 
-func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, evt *orm.DataSeries, bar *orm.InfoKline, barExpired bool) *errs.Error {
+func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, evt *orm.DataSeries, barExpired bool) *errs.Error {
 	account := job.Account
-	if evt != nil && job.Strat.OnData != nil {
+	if job.Strat.OnData != nil {
 		job.Strat.OnData(job, evt)
 	} else {
 		job.Strat.OnBar(job)
@@ -348,13 +345,13 @@ func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, ev
 	isBatch := job.Strat.BatchInOut && job.Strat.OnBatchJobs != nil
 	if !barExpired {
 		if isBatch {
-			AddBatchJob(account, bar.TimeFrame, job, nil)
+			AddBatchJob(account, evt.TimeFrame, job, nil)
 		}
 	} else {
 		entryNum := len(job.Entrys)
 		if core.LiveMode && !isWarmup && entryNum > 0 {
 			log.Info("skip open orders by bar expired", zap.String("acc", account),
-				zap.String("pair", bar.Symbol), zap.String("tf", bar.TimeFrame),
+				zap.String("pair", evt.Symbol()), zap.String("tf", evt.TimeFrame),
 				zap.Int("num", entryNum))
 			strat.AddAccFailOpens(account, strat.FailOpenBarTooLate, entryNum)
 			job.Entrys = nil
@@ -373,15 +370,18 @@ func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, ev
 	return nil
 }
 
-func (t *Trader) OnEnvEnd(bar *banexg.PairTFKline, adj *orm.AdjInfo) {
+func (t *Trader) OnEnvEnd(evt *orm.DataSeries) {
 	mgrs := GetAllOdMgr()
 	for acc, mgr := range mgrs {
-		err := mgr.OnEnvEnd(bar, adj)
+		err := mgr.OnEnvEnd(evt)
 		if err != nil {
 			log.Warn("close orders on env end fail", zap.String("acc", acc), zap.Error(err))
 		}
 	}
-	envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
+	if evt == nil {
+		return
+	}
+	envKey := strings.Join([]string{evt.Symbol(), evt.TimeFrame}, "_")
 	env, ok := strat.Envs[envKey]
 	if ok {
 		env.Reset()

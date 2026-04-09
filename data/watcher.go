@@ -19,14 +19,14 @@ import (
 	"go.uber.org/zap"
 )
 
-type KLineWatcher struct {
+type SeriesWatcher struct {
 	*utils.ClientIO
-	jobs       map[string]map[string]*PairTFCache
-	jobLock    sync.RWMutex
-	initMsgs   []*utils.IOMsg
-	OnKLineMsg func(msg *KLineMsg) // 收到爬虫K线消息
-	OnTrades   func(exgName, market, pair string, trades []*banexg.Trade)
-	OnDepth    func(dep *banexg.OrderBook)
+	jobs      map[string]map[string]*PairTFCache
+	jobLock   sync.RWMutex
+	initMsgs  []*utils.IOMsg
+	OnDataMsg func(msg *SeriesMsg) // 收到爬虫K线消息
+	OnTrades  func(exgName, market, pair string, trades []*banexg.Trade)
+	OnDepth   func(dep *banexg.OrderBook)
 }
 
 type WatchJob struct {
@@ -35,24 +35,24 @@ type WatchJob struct {
 	Since     int64
 }
 
-func (j *PairTFCache) getFinishes(ohlcvs []*banexg.Kline, lastFinish bool) []*banexg.Kline {
-	if len(ohlcvs) == 0 {
-		return ohlcvs
+func (j *PairTFCache) getFinishes(rows []*orm.DataSeries, lastFinish bool) []*orm.DataSeries {
+	if len(rows) == 0 {
+		return rows
 	}
 	j.WaitBar = nil
 	if !lastFinish {
-		j.WaitBar = ohlcvs[len(ohlcvs)-1]
-		ohlcvs = ohlcvs[:len(ohlcvs)-1]
+		j.WaitBar = rows[len(rows)-1]
+		rows = rows[:len(rows)-1]
 	}
-	return ohlcvs
+	return rows
 }
 
-func NewKlineWatcher(addr string) (*KLineWatcher, *errs.Error) {
+func NewSeriesWatcher(addr string) (*SeriesWatcher, *errs.Error) {
 	client, err := utils.NewClientIO(addr, "")
 	if err != nil {
 		return nil, err
 	}
-	res := &KLineWatcher{
+	res := &SeriesWatcher{
 		ClientIO: client,
 		jobs:     make(map[string]map[string]*PairTFCache),
 	}
@@ -78,7 +78,7 @@ func NewKlineWatcher(addr string) (*KLineWatcher, *errs.Error) {
 	return res, nil
 }
 
-func (w *KLineWatcher) getPrefix(exgName, marketType, jobType string) string {
+func (w *SeriesWatcher) getPrefix(exgName, marketType, jobType string) string {
 	if jobType == "price" {
 		// price不按品种订阅
 		return fmt.Sprintf("%s_%s_%s", jobType, exgName, marketType)
@@ -86,7 +86,7 @@ func (w *KLineWatcher) getPrefix(exgName, marketType, jobType string) string {
 	return fmt.Sprintf("%s_%s_%s_", jobType, exgName, marketType)
 }
 
-func (w *KLineWatcher) GetJob(msgType, symbol string) *PairTFCache {
+func (w *SeriesWatcher) GetJob(msgType, symbol string) *PairTFCache {
 	w.jobLock.RLock()
 	pairMap, ok := w.jobs[msgType]
 	if ok {
@@ -98,7 +98,7 @@ func (w *KLineWatcher) GetJob(msgType, symbol string) *PairTFCache {
 	return nil
 }
 
-func (w *KLineWatcher) GetJobs(msgType string) map[string]*PairTFCache {
+func (w *SeriesWatcher) GetJobs(msgType string) map[string]*PairTFCache {
 	w.jobLock.RLock()
 	pairMap, _ := w.jobs[msgType]
 	var res map[string]*PairTFCache
@@ -110,7 +110,7 @@ func (w *KLineWatcher) GetJobs(msgType string) map[string]*PairTFCache {
 }
 
 // job=nil means delete
-func (w *KLineWatcher) setJob(msgType, symbol string, job *PairTFCache) {
+func (w *SeriesWatcher) setJob(msgType, symbol string, job *PairTFCache) {
 	w.jobLock.Lock()
 	pairMap, ok := w.jobs[msgType]
 	if job != nil {
@@ -130,7 +130,7 @@ WatchJobs
 Subscribe data from crawlers.
 从爬虫订阅数据。ohlcv/uohlcv/trade/depth
 */
-func (w *KLineWatcher) WatchJobs(exgName, marketType, jobType string, jobs ...WatchJob) *errs.Error {
+func (w *SeriesWatcher) WatchJobs(exgName, marketType, jobType string, jobs ...WatchJob) *errs.Error {
 	prefix := w.getPrefix(exgName, marketType, jobType)
 	tags := make([]string, 0, len(jobs))
 	pairs := make([]string, 0, len(jobs))
@@ -177,7 +177,7 @@ func (w *KLineWatcher) WatchJobs(exgName, marketType, jobType string, jobs ...Wa
 	return w.SendMsg("watch_pairs", args)
 }
 
-func (w *KLineWatcher) SendMsg(action string, data interface{}) *errs.Error {
+func (w *SeriesWatcher) SendMsg(action string, data interface{}) *errs.Error {
 	msg := &utils.IOMsg{Action: action, Data: data}
 	err := w.WriteMsg(msg)
 	if err != nil {
@@ -187,7 +187,7 @@ func (w *KLineWatcher) SendMsg(action string, data interface{}) *errs.Error {
 	return nil
 }
 
-func (w *KLineWatcher) UnWatchJobs(exgName, marketType, jobType string, pairs []string) *errs.Error {
+func (w *SeriesWatcher) UnWatchJobs(exgName, marketType, jobType string, pairs []string) *errs.Error {
 	prefix := w.getPrefix(exgName, marketType, jobType)
 	tags := make([]string, 0, len(pairs))
 	for _, pair := range pairs {
@@ -203,10 +203,10 @@ func (w *KLineWatcher) UnWatchJobs(exgName, marketType, jobType string, pairs []
 	return w.WriteMsg(&utils.IOMsg{Action: "unsubscribe", Data: tags})
 }
 
-func (w *KLineWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
+func (w *SeriesWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
 	key := raw.Action
 	data := raw.Data
-	if w.OnKLineMsg == nil {
+	if w.OnDataMsg == nil {
 		log.Debug("spider bar skipped", zap.String("key", key))
 		return
 	}
@@ -218,7 +218,7 @@ func (w *KLineWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
 		log.Debug("spider bar ignored", zap.String("key", key))
 		return
 	}
-	var bars NotifyKLines
+	var bars NotifySeries
 	err_ := utils2.Unmarshal(data, &bars, utils2.JsonNumDefault)
 	if err_ != nil {
 		log.Debug("onSpiderBar spider bar decode fail", zap.String("key", key))
@@ -233,8 +233,8 @@ func (w *KLineWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
 	tfMSecs := int64(bars.TFSecs * 1000)
 	nextBarMS := lastBarMS + tfMSecs
 	com.SetPairMs(pair, nextBarMS, tfMSecs)
-	var msg = &KLineMsg{
-		NotifyKLines: bars,
+	var msg = &SeriesMsg{
+		NotifySeries: bars,
 		ExgName:      exgName,
 		Market:       market,
 		Pair:         pair,
@@ -243,7 +243,7 @@ func (w *KLineWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
 		zap.Int64("nextMS", nextBarMS)}
 	if msgType == core.WsSubKLine {
 		log.Debug("spider uohlcv", logFields...)
-		w.OnKLineMsg(msg)
+		w.OnDataMsg(msg)
 		return
 	}
 	log.Debug("spider ohlcv", logFields...)
@@ -265,27 +265,38 @@ func (w *KLineWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
 		return
 	}
 	// 归集更新指定的周期
-	var finishes []*banexg.Kline
+	var finishes []*orm.DataSeries
 	if bars.TFSecs < job.TFSecs {
 		//和旧的bar_row合并更新，判断是否有完成的bar
+		curRows := orm.BarsToSeries(orm.GetExSymbol2(exgName, market, pair), utils2.SecsToTF(bars.TFSecs), bars.Arr, nil, false, true)
 		if job.WaitBar != nil {
 			olds = append(olds, job.WaitBar)
 		}
 		jobMSecs := int64(job.TFSecs * 1000)
 		infoBy := orm.GetExSymbol2(exgName, market, pair).InfoBy()
-		finishes = job.getFinishes(utils.BuildOHLCV(bars.Arr, jobMSecs, 0, olds, tfMSecs, job.AlignOffMS, infoBy))
+		aggRows, lastDone, err := buildOHLCVSeries(orm.GetExSymbol2(exgName, market, pair), utils2.SecsToTF(job.TFSecs), curRows, jobMSecs, 0, olds, tfMSecs, job.AlignOffMS, infoBy, false)
+		if err != nil {
+			log.Error("build series fail", zap.String("pair", pair), zap.Error(err))
+			return
+		}
+		finishes = job.getFinishes(aggRows, lastDone)
 	} else {
-		finishes = bars.Arr
+		finishes = orm.BarsToSeries(orm.GetExSymbol2(exgName, market, pair), utils2.SecsToTF(job.TFSecs), bars.Arr, nil, false, true)
 	}
 	if len(finishes) > 0 {
+		finishBars, err := orm.SeriesToBars(orm.GetExSymbol2(exgName, market, pair), finishes)
+		if err != nil {
+			log.Error("series to bars fail", zap.String("pair", pair), zap.Error(err))
+			return
+		}
 		msg.TFSecs = job.TFSecs
 		msg.Interval = job.TFSecs
-		msg.Arr = finishes
-		w.OnKLineMsg(msg)
+		msg.Arr = finishBars
+		w.OnDataMsg(msg)
 	}
 }
 
-func (w *KLineWatcher) onPriceUpdate(raw *utils.IOMsgRaw) {
+func (w *SeriesWatcher) onPriceUpdate(raw *utils.IOMsgRaw) {
 	key, data := raw.Action, raw.Data
 	parts := strings.Split(key, "_")
 	exgName, market := parts[1], parts[2]
@@ -301,7 +312,7 @@ func (w *KLineWatcher) onPriceUpdate(raw *utils.IOMsgRaw) {
 	com.SetPrices(msg, "")
 }
 
-func (w *KLineWatcher) onTrades(msg *utils.IOMsgRaw) {
+func (w *SeriesWatcher) onTrades(msg *utils.IOMsgRaw) {
 	if w.OnTrades == nil {
 		return
 	}
@@ -325,7 +336,7 @@ func (w *KLineWatcher) onTrades(msg *utils.IOMsgRaw) {
 	w.OnTrades(exgName, market, pair, trades)
 }
 
-func (w *KLineWatcher) onBook(msg *utils.IOMsgRaw) {
+func (w *SeriesWatcher) onBook(msg *utils.IOMsgRaw) {
 	key, data := msg.Action, msg.Data
 	parts := strings.Split(key, "_")
 	msgType, exgName, market, pair := parts[0], parts[1], parts[2], parts[3]

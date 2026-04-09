@@ -44,7 +44,7 @@ func TestOnDataTakesPrecedenceOverOnBar(t *testing.T) {
 	evt := orm.KlineToDataSeries(bar)
 
 	trader := &Trader{}
-	if err := trader.onAccountDataSeriesJob(nil, job, evt, bar, false); err != nil {
+	if err := trader.onAccountDataSeriesJob(nil, job, evt, false); err != nil {
 		t.Fatalf("onAccountDataSeriesJob returned error: %v", err)
 	}
 	if called != 1 {

@@ -8,7 +8,6 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
-	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
@@ -59,14 +58,14 @@ func (p *periodSta) reset(sid int32, timeMS int64) {
 	p.lock.Unlock()
 }
 
-func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *periodSta) {
+func trySaveSeries(job *SaveSeries, tfSecs int, mntSta *periodSta, hourSta *periodSta) {
 	ctx := context.Background()
 	sess, conn, err := orm.Conn(ctx)
 	sid := job.Sid
 	if err == nil {
 		defer conn.Release()
-		var addBars = job.Arr
-		endMS := addBars[len(addBars)-1].Time + int64(tfSecs*1000)
+		addRows := job.Rows
+		endMS := addRows[len(addRows)-1].EndMS
 		savedNewBars := false
 		if tfSecs < 60 {
 			// 最小保存1m级别k线
@@ -76,7 +75,7 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 				return
 			}
 			var newEndMS int64
-			newEndMS, _, err = downKlineTo(sess, sid, "1m", prevMS, mntAlign)
+			newEndMS, _, err = ensureSeriesTo(sess, sid, "1m", prevMS, mntAlign)
 			if err != nil {
 				mntSta.reset(sid, newEndMS)
 				log.Error("down kline 1m fail", zap.Int32("sid", sid), zap.Error(err))
@@ -88,12 +87,12 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 			savedNewBars = newEndMS > prevMS
 		} else {
 			// 1m级别，可直接入库
-			expEndMS := addBars[0].Time
+			expEndMS := addRows[0].TimeMS
 			var nextMS int64
 			mntAlign, prevMS := mntSta.alignAndLast(sess, sid, "1m", expEndMS)
 			if mntAlign > prevMS {
 				// 有缺口，需要先下载缺失部分
-				nextMS, _, err = downKlineTo(sess, sid, job.TimeFrame, prevMS, expEndMS)
+				nextMS, _, err = ensureSeriesTo(sess, sid, job.TimeFrame, prevMS, expEndMS)
 				if nextMS < expEndMS {
 					log.Warn("fetch lack 1m bad", zap.Int32("sid", sid), zap.Int64("end", endMS),
 						zap.Int64("expEnd", expEndMS))
@@ -102,18 +101,18 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 			if nextMS > expEndMS {
 				// 待插入的k线头部有冗余
 				var cutIdx = 0
-				for i, bar := range addBars {
-					if bar.Time < nextMS {
+				for i, row := range addRows {
+					if row.TimeMS < nextMS {
 						cutIdx = i + 1
 					} else {
 						break
 					}
 				}
-				addBars = addBars[cutIdx:]
+				addRows = addRows[cutIdx:]
 			}
-			if err == nil && len(addBars) > 0 {
+			if err == nil && len(addRows) > 0 {
 				exs := orm.GetSymbolByID(sid)
-				_, err = sess.InsertKLinesAuto(job.TimeFrame, exs, addBars, true)
+				_, err = sess.InsertSeries(job.TimeFrame, exs, addRows, true)
 				if err == nil {
 					savedNewBars = true
 					mntSta.reset(sid, endMS)
@@ -124,18 +123,18 @@ func trySaveKlines(job *SaveKline, tfSecs int, mntSta *periodSta, hourSta *perio
 			// 下载1h及以上周期K线数据
 			hourAlign, lastMS := hourSta.alignAndLast(sess, sid, "1h", endMS)
 			if hourAlign > lastMS {
-				_, _, err = downKlineTo(sess, sid, "1h", lastMS, hourAlign)
+				_, _, err = ensureSeriesTo(sess, sid, "1h", lastMS, hourAlign)
 			}
 		}
 	}
 	if err != nil {
-		log.Error("consumeWriteQ: fail", zap.Int32("sid", sid), zap.Error(err))
+		log.Error("consumeSeriesWriteQ: fail", zap.Int32("sid", sid), zap.Error(err))
 	} else {
-		log.Debug("save kline ok", zap.Int32("sid", sid), zap.Int("num", len(job.Arr)))
+		log.Debug("save series ok", zap.Int32("sid", sid), zap.Int("num", len(job.Rows)))
 	}
 }
 
-func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int64) (int64, *banexg.Kline, *errs.Error) {
+func ensureSeriesTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int64) (int64, *orm.DataSeries, *errs.Error) {
 	if oldEndMS == 0 {
 		_, oldEndMS = sess.GetKlineRange(sid, tf)
 	}
@@ -161,7 +160,7 @@ func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int6
 			orm.DebugDownKLine = false
 		}()
 	}
-	var last *banexg.Kline
+	var last *orm.DataSeries
 	for tryCount <= 5 {
 		tryCount += 1
 		saveNum, err = sess.DownOHLCV2DB(exchange, exs, tf, oldEndMS, toEndMS, nil)
@@ -169,15 +168,15 @@ func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int6
 			_, oldEndMS = sess.GetKlineRange(sid, tf)
 			return oldEndMS, nil, err
 		}
-		saveBars, err := sess.QueryOHLCV(exs, tf, 0, 0, 1, false)
+		saveRows, err := sess.QuerySeries(exs, tf, 0, 0, 1, false)
 		if err != nil {
 			_, oldEndMS = sess.GetKlineRange(sid, tf)
 			return oldEndMS, nil, err
 		}
 		var lastMS = int64(0)
-		if len(saveBars) > 0 {
-			last = saveBars[len(saveBars)-1]
-			lastMS = last.Time
+		if len(saveRows) > 0 {
+			last = saveRows[len(saveRows)-1]
+			lastMS = last.TimeMS
 			newEndMS = lastMS + tfMSecs
 		}
 		if newEndMS >= toEndMS {
@@ -185,7 +184,7 @@ func downKlineTo(sess *orm.Queries, sid int32, tf string, oldEndMS, toEndMS int6
 		} else {
 			//If the latest bar is not obtained, wait for 2s to try again
 			//如果未成功获取最新的bar，等待2s重试
-			log.Warn("downKlineTo not complete, wait 2s, Your system time may be inaccurate, "+
+			log.Warn("ensureSeriesTo not complete, wait 2s, Your system time may be inaccurate, "+
 				"you may need delete ban_ntp.json in Temp directory and retry",
 				zap.String("pair", exs.Symbol), zap.Int("ins", saveNum),
 				zap.Int64("last", lastMS), zap.Int64("newEnd", newEndMS))
@@ -209,20 +208,27 @@ func DownEmitHourKlines(dp *LiveProvider, endsMap map[int32]int64) {
 		if exs == nil {
 			continue
 		}
-		newEnd, last, err := downKlineTo(sess, exs.ID, "1h", lastEnd, curEndMS)
+		newEnd, last, err := ensureSeriesTo(sess, exs.ID, "1h", lastEnd, curEndMS)
 		if err != nil {
-			log.Error("downKlineTo 1h fail", zap.Int32("sid", exs.ID), zap.Error(err))
+			log.Error("ensureSeriesTo 1h fail", zap.Int32("sid", exs.ID), zap.Error(err))
 			continue
 		}
 		endsMap[exsID] = newEnd
 		if last == nil {
 			continue
 		}
-		dp.OnKLineMsg(&KLineMsg{
-			NotifyKLines: NotifyKLines{
+		bars, convErr := orm.SeriesToBars(exs, []*orm.DataSeries{last})
+		if convErr != nil || len(bars) == 0 {
+			if convErr != nil {
+				log.Error("convert hour series fail", zap.Int32("sid", exs.ID), zap.Error(convErr))
+			}
+			continue
+		}
+		dp.OnDataMsg(&SeriesMsg{
+			NotifySeries: NotifySeries{
 				TFSecs:   3600,
 				Interval: 3600,
-				Arr:      []*banexg.Kline{last},
+				Arr:      bars,
 			},
 			ExgName: core.ExgName,
 			Market:  core.Market,
@@ -235,7 +241,7 @@ func DownEmitHourKlines(dp *LiveProvider, endsMap map[int32]int64) {
 Check whether there are any missing K lines, and automatically query and update if there are any.
 检查是否有缺失的K线，有则自动查询更新（一般在刚启动时，收到的爬虫推送1mK线不含前面的，需要下载前面的并保存到WaitBar中）
 */
-func (j *PairTFCache) fillLacks(pair string, subTfSecs int, startMS, endMS int64) ([]*banexg.Kline, *errs.Error) {
+func (j *PairTFCache) fillLacks(pair string, subTfSecs int, startMS, endMS int64) ([]*orm.DataSeries, *errs.Error) {
 	if j.SubNextMS == 0 || j.SubNextMS >= startMS {
 		j.SubNextMS = endMS
 		return nil, nil
@@ -248,15 +254,18 @@ func (j *PairTFCache) fillLacks(pair string, subTfSecs int, startMS, endMS int64
 	if err != nil {
 		return nil, err
 	}
-	_, preBars, err := autoFetchOhlcv(exs, fetchTF, bigStartMS, startMS)
+	_, preRows, err := autoFetchOhlcv(exs, fetchTF, bigStartMS, startMS)
 	if err != nil {
 		return nil, err
 	}
-	var doneBars []*banexg.Kline
+	var doneBars []*orm.DataSeries
 	j.WaitBar = nil
-	if len(preBars) > 0 {
+	if len(preRows) > 0 {
 		fromTFMS := int64(subTfSecs * 1000)
-		oldBars, _ := utils.BuildOHLCV(preBars, tfMSecs, 0, nil, fromTFMS, j.AlignOffMS, exs.InfoBy())
+		oldBars, _, err := buildOHLCVSeries(exs, j.TimeFrame, preRows, tfMSecs, 0, nil, fromTFMS, j.AlignOffMS, exs.InfoBy(), false)
+		if err != nil {
+			return nil, err
+		}
 		if len(oldBars) > 0 {
 			j.WaitBar = oldBars[len(oldBars)-1]
 			doneBars = oldBars[:len(oldBars)-1]
@@ -266,12 +275,12 @@ func (j *PairTFCache) fillLacks(pair string, subTfSecs int, startMS, endMS int64
 	return doneBars, nil
 }
 
-func autoFetchOhlcv(exs *orm.ExSymbol, tf string, startMS, endMS int64) ([]*orm.AdjInfo, []*banexg.Kline, *errs.Error) {
+func autoFetchOhlcv(exs *orm.ExSymbol, tf string, startMS, endMS int64) ([]*orm.AdjInfo, []*orm.DataSeries, *errs.Error) {
 	exchange := exg.Default
 	if !exchange.HasApi(banexg.ApiFetchOHLCV, exs.Market) {
 		// Downloading K lines is currently not allowed, skip
 		// 当前不允许下载K线，跳过
 		return nil, nil, nil
 	}
-	return orm.AutoFetchOHLCV(exchange, exs, tf, startMS, endMS, 0, false, nil)
+	return orm.AutoFetchSeries(exchange, exs, tf, startMS, endMS, 0, false, nil)
 }

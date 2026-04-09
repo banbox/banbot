@@ -214,7 +214,7 @@ func LoadKLinesToDB(args *config.CmdArgs) *errs.Error {
 	zArgs := []string{core.ExgName, core.Market, core.ContractType}
 	for _, name := range names {
 		fileInPath := filepath.Join(dirPath, name)
-		err = data.ReadZipCSVs(fileInPath, pBar, biz.LoadZipKline, zArgs)
+		err = data.ReadZipCSVs(fileInPath, pBar, biz.LoadZipSeries, zArgs)
 		if err != nil {
 			return err
 		}

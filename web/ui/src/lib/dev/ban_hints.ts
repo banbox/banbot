@@ -566,7 +566,7 @@ const banCompletions: PackageCompletions = {
       label: "IOrderMgr",
       type: "struct",
       detail: m.iorder_mgr(),
-      info: `Defines basic order management methods: ProcessOrders, EnterOrder, ExitOpenOrders, ExitOrder, UpdateByBar, OnEnvEnd, CleanUp`
+      info: `Defines basic order management methods: ProcessOrders, EnterOrder, ExitOpenOrders, ExitOrder, UpdateByDataSeries, OnEnvEnd, CleanUp`
     },
     {
       label: "IOrderMgrLive",

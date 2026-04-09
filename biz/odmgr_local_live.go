@@ -117,8 +117,8 @@ func tryFillLocalLiveOrder(o *LocalLiveOrderMgr, od *ormo.InOutOrder, isEnter bo
 	return nil
 }
 
-func CallLocalLiveOdMgrsKline(msg *data.KLineMsg, bars []*banexg.Kline) *errs.Error {
-	if len(bars) == 0 {
+func CallLocalLiveOdMgrsData(msg *data.SeriesMsg, rows []*orm.DataSeries) *errs.Error {
+	if len(rows) == 0 {
 		return nil
 	}
 	for account, mgr := range accOdMgrs {
@@ -141,17 +141,10 @@ func CallLocalLiveOdMgrsKline(msg *data.KLineMsg, bars []*banexg.Kline) *errs.Er
 		if len(curOds) == 0 {
 			continue
 		}
-		var lastK *orm.InfoKline
-		timeFrame := utils.SecsToTF(msg.TFSecs)
-		for _, k := range bars {
-			lastK = &orm.InfoKline{
-				PairTFKline: &banexg.PairTFKline{
-					Kline:     *k,
-					Symbol:    msg.Pair,
-					TimeFrame: timeFrame,
-				},
-			}
-			barEndMS := k.Time + int64(msg.TFSecs*1000)
+		var lastEvt *orm.DataSeries
+		for _, row := range rows {
+			lastEvt = row.CloneWithExSymbol(&orm.ExSymbol{Symbol: msg.Pair})
+			barEndMS := row.EndMS
 			allodOds := make([]*ormo.InOutOrder, 0, len(curOds))
 			for _, od := range curOds {
 				exod := getPendingSub(od)
@@ -164,12 +157,12 @@ func CallLocalLiveOdMgrsKline(msg *data.KLineMsg, bars []*banexg.Kline) *errs.Er
 				}
 				allodOds = append(allodOds, od)
 			}
-			_, err := liveMgr.fillPendingOrders(allodOds, lastK)
+			_, err := liveMgr.fillPendingOrders(allodOds, lastEvt)
 			if err != nil {
 				return err
 			}
 		}
-		err := liveMgr.updateProfitAndWallets(allOpens, curOds, lastK)
+		err := liveMgr.updateProfitAndWallets(allOpens, curOds, lastEvt)
 		if err != nil {
 			return err
 		}
@@ -187,6 +180,10 @@ func CallLocalLiveOdMgrsKline(msg *data.KLineMsg, bars []*banexg.Kline) *errs.Er
 		}
 	}
 	return nil
+}
+
+func CallLocalLiveOdMgrsSeries(msg *data.SeriesMsg, rows []*orm.DataSeries) *errs.Error {
+	return CallLocalLiveOdMgrsData(msg, rows)
 }
 
 func (o *LocalLiveOrderMgr) CleanUp() *errs.Error {

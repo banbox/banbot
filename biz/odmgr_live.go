@@ -647,18 +647,18 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 					return err
 				}
 				delete(openOds, iod.ID)
-		} else if fillAmt < odAmt*0.99 {
-			price := com.GetPriceSafe(pair, "")
-			if price == -1 {
-				log.Warn("price not available, skip position mismatch check", zap.String("pair", pair))
-				continue
+			} else if fillAmt < odAmt*0.99 {
+				price := com.GetPriceSafe(pair, "")
+				if price == -1 {
+					log.Warn("price not available, skip position mismatch check", zap.String("pair", pair))
+					continue
+				}
+				holdCost := odAmt * price
+				fillPct := math.Round(fillAmt * 100 / odAmt)
+				log.Error("position not match", zap.String("acc", o.Account),
+					zap.String("pair", pair), zap.String("key", iod.Key()),
+					zap.Float64("holdCost", holdCost), zap.Float64("fillPct", fillPct))
 			}
-			holdCost := odAmt * price
-			fillPct := math.Round(fillAmt * 100 / odAmt)
-			log.Error("position not match", zap.String("acc", o.Account),
-				zap.String("pair", pair), zap.String("key", iod.Key()),
-				zap.Float64("holdCost", holdCost), zap.Float64("fillPct", fillPct))
-		}
 		}
 	}
 	if config.TakeOverStrat == "" {
@@ -1065,8 +1065,8 @@ func (o *LiveOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, [
 	return o.OrderMgr.ProcessOrders(job)
 }
 
-func (o *LiveOrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error {
-	if err := o.OrderMgr.UpdateByBar(allOpens, bar); err != nil {
+func (o *LiveOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
+	if err := o.OrderMgr.UpdateByDataSeries(allOpens, evt); err != nil {
 		return err
 	}
 	// Enforce StopBars for submitted limit entry orders in live mode.
@@ -2134,18 +2134,19 @@ func getPairMinsVol(pair string, num int) (float64, float64, *errs.Error) {
 		if err != nil {
 			return 0, 0, err
 		}
-		_, bars, err := orm.AutoFetchOHLCV(exg.Default, exs, "1m", 0, 0, num, false, nil)
+		_, rows, err := orm.AutoFetchSeries(exg.Default, exs, "1m", 0, 0, num, false, nil)
 		if err != nil {
 			return 0, 0, err
-		} else if len(bars) == 0 {
+		} else if len(rows) == 0 {
 			return 0, 0, nil
 		}
 		sumVol := float64(0)
-		for _, bar := range bars {
-			sumVol += bar.Volume
+		for _, row := range rows {
+			vol, _ := row.VolumeValue()
+			sumVol += vol
 		}
-		lastMinVol := bars[len(bars)-1].Volume
-		return sumVol / float64(len(bars)), lastMinVol, nil
+		lastMinVol, _ := rows[len(rows)-1].VolumeValue()
+		return sumVol / float64(len(rows)), lastMinVol, nil
 	}
 	avg, last, err := calc()
 	expireMS := utils2.AlignTfMSecs(curMs+60000, 60000)
@@ -2917,8 +2918,11 @@ func calcFatalLoss(wallets *BanWallets, orders []*ormo.InOutOrder, backMins int)
 	return lossVal / (lossVal + totalLegal)
 }
 
-func (o *LiveOrderMgr) OnEnvEnd(bar *banexg.PairTFKline, adj *orm.AdjInfo) *errs.Error {
-	_, err := o.ExitOpenOrders(bar.Symbol, &strat.ExitReq{
+func (o *LiveOrderMgr) OnEnvEnd(evt *orm.DataSeries) *errs.Error {
+	if evt == nil {
+		return nil
+	}
+	_, err := o.ExitOpenOrders(evt.Symbol(), &strat.ExitReq{
 		Tag:  core.ExitTagEnvEnd,
 		Dirt: core.OdDirtBoth,
 	})

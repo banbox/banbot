@@ -34,7 +34,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs.Error {
+func LoadZipSeries(inPath string, fid int, file *zip.File, arg interface{}) *errs.Error {
 	cleanName := strings.Split(filepath.Base(file.Name), ".")[0]
 	exArgs := arg.([]string)
 	exgName, market := exArgs[0], exArgs[1]
@@ -230,7 +230,8 @@ func LoadZipKline(inPath string, fid int, file *zip.File, arg interface{}) *errs
 		zap.Int("num", len(klines)), zap.String("start", startDt), zap.String("end", endDt))
 	// 这里不可使用数据库默认的归集策略，因有些bar成交量为0；应调用BuildOHLCVOff归集
 	// the database default aggregation strategy cannot be used here, because some bar volumes are 0; BuildOHLCVOff aggregation should be called
-	num, err := sess.InsertKLinesAuto(timeFrame, exs, klines, false)
+	rowsToSave := orm.BarsToSeries(exs, timeFrame, klines, nil, false, true)
+	num, err := sess.InsertSeries(timeFrame, exs, rowsToSave, false)
 	if err == nil && num > 0 {
 		// insert data for big timeframes 插入更大周期
 		return aggBigKlines(sess, klines, tfMSecs, exs)
@@ -256,7 +257,7 @@ func aggBigKlines(sess *orm.Queries, klines []*banexg.Kline, tfMSecs int64, exs 
 		if len(klines) == 0 {
 			continue
 		}
-		num, err = sess.InsertKLinesAuto(agg.TimeFrame, exs, klines, false)
+		num, err = sess.InsertSeries(agg.TimeFrame, exs, orm.BarsToSeries(exs, agg.TimeFrame, klines, nil, false, true), false)
 		if err != nil {
 			return err
 		}
@@ -753,29 +754,29 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
-type RunHistArgs struct {
+type RunHistSeriesArgs struct {
 	ExsList     []*orm.ExSymbol
 	Start       int64
 	End         int64
 	ViewNextNum int // number of future bars to get
 	TfWarms     map[string]int
-	OnEnvEnd    func(bar *banexg.PairTFKline, adj *orm.AdjInfo)
+	OnEnvEnd    func(evt *orm.DataSeries)
 	VerCh       chan int // write -1 to exit;
-	OnBar       func(bar *orm.InfoKline, nexts []*orm.InfoKline)
+	OnData      func(evt *orm.DataSeries, nexts []*orm.DataSeries)
 }
 
 type tfFuts struct {
 	TF    string
 	MSecs int64
-	Futs  []*orm.InfoKline
+	Futs  []*orm.DataSeries
 }
 
 /*
-RunHistKline
-RePlay of K-lines within a specified time range for multiple symbols, supporting multiple timeFrames and returning n min-timeFrame bars.
-对多个品种回放指定时间范围的K线，支持多周期，支持返回未来n个最小周期bar。
+RunHistSeries
+Replay OHLCV-shaped DataSeries within a specified time range for multiple symbols, supporting multiple timeFrames and returning n future min-timeframe events.
+对多个品种回放指定时间范围的 DataSeries，支持多周期，支持返回未来 n 个最小周期事件。
 */
-func RunHistKline(args *RunHistArgs) *errs.Error {
+func RunHistSeries(args *RunHistSeriesArgs) *errs.Error {
 	if args.VerCh == nil {
 		args.VerCh = make(chan int, 5)
 	}
@@ -799,33 +800,32 @@ func RunHistKline(args *RunHistArgs) *errs.Error {
 	var futures = make(map[string][]*tfFuts)
 	var lock deadlock.Mutex
 	onItemBar := func(evt *orm.DataSeries) {
-		b, errConv := orm.AsKline(evt, evt.ExSymbol)
-		if errConv != nil {
+		if evt == nil {
 			return
 		}
-		if args.ViewNextNum <= 0 || b.IsWarmUp {
-			args.OnBar(b, nil)
+		if args.ViewNextNum <= 0 || evt.IsWarmUp {
+			args.OnData(evt, nil)
 			return
 		}
 		lock.Lock()
-		lv := tfIdxs[b.TimeFrame]
-		tfArr := futures[b.Symbol]
+		lv := tfIdxs[evt.TimeFrame]
+		tfArr := futures[evt.Symbol()]
 		lock.Unlock()
 		state := tfArr[lv]
-		state.Futs = append(state.Futs, b)
+		state.Futs = append(state.Futs, evt)
 		if lv == 0 && len(state.Futs) > args.ViewNextNum {
 			old := state.Futs[0]
 			state.Futs = state.Futs[1:]
-			barEndMs := old.Time + state.MSecs
+			barEndMs := old.TimeMS + state.MSecs
 			for i := len(tfIdxs) - 1; i > 0; i-- {
 				big := tfArr[i]
-				if len(big.Futs) > 0 && big.Futs[0].Time+big.MSecs <= barEndMs {
+				if len(big.Futs) > 0 && big.Futs[0].TimeMS+big.MSecs <= barEndMs {
 					oldBig := big.Futs[0]
 					big.Futs = big.Futs[1:]
-					args.OnBar(oldBig, big.Futs)
+					args.OnData(oldBig, big.Futs)
 				}
 			}
-			args.OnBar(old, state.Futs)
+			args.OnData(old, state.Futs)
 		}
 	}
 	var holds = make([]data.IHistDataFeeder, 0, len(args.ExsList))
@@ -837,19 +837,19 @@ func RunHistKline(args *RunHistArgs) *errs.Error {
 			tfList = append(tfList, &tfFuts{
 				TF:    it.TF,
 				MSecs: it.MSecs,
-				Futs:  make([]*orm.InfoKline, 0, args.ViewNextNum),
+				Futs:  make([]*orm.DataSeries, 0, args.ViewNextNum),
 			})
 		}
 		futures[exs.Symbol] = tfList
-		feeder, err := data.NewDBKlineFeeder(exs, onItemBar, true)
+		feeder, err := data.NewDBSeriesFeeder(exs, onItemBar, true)
 		if err != nil {
 			return err
 		}
 		holds = append(holds, feeder)
 		feeder.SetEndMS(args.End)
-		feeder.OnEnvEnd = func(bar *banexg.PairTFKline, adj *orm.AdjInfo) {
+		feeder.OnEnvEnd = func(evt *orm.DataSeries) {
 			if args.OnEnvEnd != nil {
-				args.OnEnvEnd(bar, adj)
+				args.OnEnvEnd(evt)
 			}
 		}
 		feeder.SubTfs(utils.KeysOfMap(args.TfWarms), true)
@@ -878,14 +878,14 @@ func RunHistKline(args *RunHistArgs) *errs.Error {
 	}
 	makeFeeders := func() []data.IHistFeeder {
 		var feeders []data.IHistFeeder
-		for _, klineFeeder := range holds {
-			feeders = append(feeders, klineFeeder)
+		for _, feeder := range holds {
+			feeders = append(feeders, feeder)
 		}
 		return feeders
 	}
 	err := data.RunHistFeeders(makeFeeders, args.VerCh, nil)
 	if args.OnEnvEnd != nil {
-		args.OnEnvEnd(nil, nil)
+		args.OnEnvEnd(nil)
 	}
 	return err
 }

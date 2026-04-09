@@ -184,7 +184,7 @@ func NewHistProvider(callBack FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64
 				if err != nil {
 					return nil, err
 				}
-				feeder, err := NewDBKlineFeeder(exs, callBack, showLog)
+				feeder, err := NewDBSeriesFeeder(exs, callBack, showLog)
 				if err != nil {
 					return nil, err
 				}
@@ -481,12 +481,12 @@ func SortFeeders(holds []IHistFeeder, hold IHistFeeder, insert bool) []IHistFeed
 
 type LiveProvider struct {
 	Provider[IDataFeeder]
-	*KLineWatcher
-	OnMinKlines func(msg *KLineMsg, bars []*banexg.Kline) *errs.Error
+	*SeriesWatcher
+	OnDataSeries func(msg *SeriesMsg, rows []*orm.DataSeries) *errs.Error
 }
 
 func NewLiveProvider(callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error) {
-	watcher, err := NewKlineWatcher(config.SpiderAddr)
+	watcher, err := NewSeriesWatcher(config.SpiderAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +498,7 @@ func NewLiveProvider(callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *
 				if err != nil {
 					return nil, err
 				}
-				feeder, err := NewKlineFeeder(exs, callBack, true)
+				feeder, err := NewSeriesFeeder(exs, callBack, true)
 				if err != nil {
 					return nil, err
 				}
@@ -508,9 +508,9 @@ func NewLiveProvider(callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *
 			},
 			dirtyVers: make(chan int, 5),
 		},
-		KLineWatcher: watcher,
+		SeriesWatcher: watcher,
 	}
-	watcher.OnKLineMsg = makeOnKlineMsg(provider)
+	watcher.OnDataMsg = makeOnSeriesMsg(provider)
 	watcher.OnTrades = makeOnTrade(provider)
 	watcher.OnDepth = makeOnDepth(provider)
 	// 立刻订阅实时价格
@@ -593,13 +593,13 @@ func (p *LiveProvider) LoopMain() *errs.Error {
 	return p.RunForever()
 }
 
-func makeOnKlineMsg(p *LiveProvider) func(msg *KLineMsg) {
-	return func(msg *KLineMsg) {
+func makeOnSeriesMsg(p *LiveProvider) func(msg *SeriesMsg) {
+	return func(msg *SeriesMsg) {
 		if msg.ExgName != core.ExgName || msg.Market != core.Market {
 			return
 		}
 		if msg.Interval < msg.TFSecs {
-			fireWsKlines(msg)
+			fireWsSeries(msg)
 		}
 		hold, ok := p.holders[msg.Pair]
 		if !ok {
@@ -611,22 +611,19 @@ func makeOnKlineMsg(p *LiveProvider) func(msg *KLineMsg) {
 			if exs == nil {
 				return
 			}
-			rows := make([]*orm.DataSeries, 0, len(bars_))
-			for _, bar := range bars_ {
-				rows = append(rows, orm.NewDataSeriesFromKline(exs, utils2.SecsToTF(msg.TFSecs), bar, nil, false, true))
-			}
-			go func(dataRows []*orm.DataSeries, rawBars []*banexg.Kline) {
+			rows := orm.BarsToSeries(exs, utils2.SecsToTF(msg.TFSecs), bars_, nil, false, true)
+			go func(dataRows []*orm.DataSeries) {
 				_, err := hold.onNewData(tfMSecs, dataRows)
 				if err != nil {
 					log.Error("onNewData fail", zap.String("p", msg.Pair), zap.Error(err))
 				}
-				if p.OnMinKlines != nil {
-					err = p.OnMinKlines(msg, rawBars)
+				if p.OnDataSeries != nil {
+					err = p.OnDataSeries(msg, dataRows)
 					if err != nil {
-						log.Error("OnMinKlines fail", zap.String("p", msg.Pair), zap.Error(err))
+						log.Error("OnDataSeries fail", zap.String("p", msg.Pair), zap.Error(err))
 					}
 				}
-			}(rows, bars_)
+			}(rows)
 		}
 		// The weighting factor has been calculated during the start-up or market break, and the weighting is automatically carried out internally
 		// 已在启动或休市期间计算复权因子，内部会自动进行复权
@@ -640,9 +637,9 @@ func makeOnKlineMsg(p *LiveProvider) func(msg *KLineMsg) {
 		doneArr, lastBar := msg.Arr[:lastIdx], msg.Arr[lastIdx]
 		waitData := hold.getWaitData()
 		if waitData != nil && waitData.TimeMS < lastBar.Time {
-			waitBar, err := orm.AsKline(waitData, exs)
+			waitView, err := waitData.OHLCV(exs)
 			if err == nil {
-				doneArr = append([]*banexg.Kline{&waitBar.Kline}, doneArr...)
+				doneArr = append([]*banexg.Kline{waitView.Bar()}, doneArr...)
 			}
 			hold.setWaitData(nil)
 		}
@@ -699,7 +696,7 @@ func makeOnDepth(p *LiveProvider) func(dep *banexg.OrderBook) {
 	}
 }
 
-func fireWsKlines(msg *KLineMsg) {
+func fireWsSeries(msg *SeriesMsg) {
 	if len(msg.Arr) == 0 {
 		return
 	}

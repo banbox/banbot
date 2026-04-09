@@ -83,7 +83,7 @@ func (c *WsClient) Subscribe(msg map[string]interface{}) {
 	}
 	key := fmt.Sprintf("%s_%s_%s", exs.Exchange, exs.Market, exs.Symbol)
 	c.Subs[key] = true
-	SetKlineSub(c, true, true, key)
+	SetSeriesSub(c, true, true, key)
 }
 
 func parseExSymbol(msg map[string]interface{}) *orm.ExSymbol {
@@ -104,14 +104,14 @@ func (c *WsClient) UnSubscribe(msg map[string]interface{}) {
 	}
 	key := fmt.Sprintf("%s_%s_%s", exs.Exchange, exs.Market, exs.Symbol)
 	if _, ok := c.Subs[key]; ok {
-		SetKlineSub(c, false, true, key)
+		SetSeriesSub(c, false, true, key)
 		delete(c.Subs, key)
 	}
 }
 
 func (c *WsClient) Close(lock bool) {
 	keys := utils2.KeysOfMap(c.Subs)
-	SetKlineSub(c, false, lock, keys...)
+	SetSeriesSub(c, false, lock, keys...)
 	c.Subs = nil
 	_ = c.Conn.Close()
 	c.Conn = nil

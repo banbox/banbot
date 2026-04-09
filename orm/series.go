@@ -51,6 +51,129 @@ type DataSeries struct {
 	Adj       *AdjInfo
 }
 
+func ResolveSeriesExSymbol(evt *DataSeries, extras ...*ExSymbol) *ExSymbol {
+	if evt == nil {
+		return nil
+	}
+	if evt.ExSymbol != nil {
+		return evt.ExSymbol
+	}
+	for _, exs := range extras {
+		if exs != nil {
+			return exs
+		}
+	}
+	if evt.Sid > 0 {
+		return GetSymbolByID(evt.Sid)
+	}
+	return nil
+}
+
+func (evt *DataSeries) CloneWithExSymbol(exs *ExSymbol) *DataSeries {
+	if evt == nil {
+		return nil
+	}
+	cp := *evt
+	if exs == nil {
+		exs = ResolveSeriesExSymbol(evt)
+	}
+	cp.ExSymbol = exs
+	if cp.Sid == 0 && exs != nil {
+		cp.Sid = exs.ID
+	}
+	return &cp
+}
+
+func (evt *DataSeries) Symbol() string {
+	exs := ResolveSeriesExSymbol(evt)
+	if exs == nil {
+		return ""
+	}
+	return exs.Symbol
+}
+
+func (evt *DataSeries) EnsureExSymbol(extras ...*ExSymbol) *ExSymbol {
+	if evt == nil {
+		return nil
+	}
+	exs := ResolveSeriesExSymbol(evt, extras...)
+	if exs != nil {
+		evt.ExSymbol = exs
+		if evt.Sid == 0 {
+			evt.Sid = exs.ID
+		}
+	}
+	return exs
+}
+
+func (evt *DataSeries) FloatValue(key string) (float64, error) {
+	if evt == nil {
+		return 0, fmt.Errorf("series event is nil")
+	}
+	return seriesFloatValue(evt.Values, key)
+}
+
+func (evt *DataSeries) FloatValueDefault(key string) (float64, bool) {
+	if evt == nil {
+		return 0, false
+	}
+	return seriesFloatValueDefault(evt.Values, key)
+}
+
+func (evt *DataSeries) IntValueDefault(key string) (int64, bool) {
+	if evt == nil {
+		return 0, false
+	}
+	return seriesIntValueDefault(evt.Values, key)
+}
+
+func (evt *DataSeries) OpenValue() (float64, error) {
+	return evt.FloatValue("open")
+}
+
+func (evt *DataSeries) HighValue() (float64, error) {
+	return evt.FloatValue("high")
+}
+
+func (evt *DataSeries) LowValue() (float64, error) {
+	return evt.FloatValue("low")
+}
+
+func (evt *DataSeries) CloseValue() (float64, error) {
+	return evt.FloatValue("close")
+}
+
+func (evt *DataSeries) VolumeValue() (float64, error) {
+	return evt.FloatValue("volume")
+}
+
+func (evt *DataSeries) QuoteValue() float64 {
+	val, _ := evt.FloatValueDefault("quote")
+	return val
+}
+
+func (evt *DataSeries) BuyVolumeValue() float64 {
+	val, _ := evt.FloatValueDefault("buy_volume")
+	return val
+}
+
+func (evt *DataSeries) TradeNumValue() int64 {
+	val, _ := evt.IntValueDefault("trade_num")
+	return val
+}
+
+func (evt *DataSeries) HasOHLCV() bool {
+	if evt == nil {
+		return false
+	}
+	for _, key := range []string{"open", "high", "low", "close", "volume"} {
+		if _, ok := evt.Values[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func NormalizeSeriesSource(source string) string {
 	if source == "" {
 		return SeriesSourceKline
@@ -108,68 +231,68 @@ func KlineToDataSeries(bar *InfoKline) *DataSeries {
 	return NewDataSeriesFromInfoKline(bar)
 }
 
-func AsKline(evt *DataSeries, extras ...any) (*InfoKline, error) {
+func (evt *DataSeries) OHLCV(extras ...*ExSymbol) (*SeriesOHLCV, error) {
 	if evt == nil {
 		return nil, fmt.Errorf("series event is nil")
 	}
-	exs := evt.ExSymbol
-	if exs == nil {
-		for _, item := range extras {
-			if val, ok := item.(*ExSymbol); ok && val != nil {
-				exs = val
-				break
-			}
-		}
-	}
-	if exs == nil && evt.Sid > 0 {
-		exs = GetSymbolByID(evt.Sid)
-	}
+	exs := ResolveSeriesExSymbol(evt, extras...)
 	if exs == nil {
 		return nil, fmt.Errorf("series event sid %d has no exsymbol", evt.Sid)
 	}
-	open, err := seriesFloatValue(evt.Values, "open")
+	open, err := evt.OpenValue()
 	if err != nil {
 		return nil, err
 	}
-	high, err := seriesFloatValue(evt.Values, "high")
+	high, err := evt.HighValue()
 	if err != nil {
 		return nil, err
 	}
-	low, err := seriesFloatValue(evt.Values, "low")
+	low, err := evt.LowValue()
 	if err != nil {
 		return nil, err
 	}
-	closeVal, err := seriesFloatValue(evt.Values, "close")
+	closeVal, err := evt.CloseValue()
 	if err != nil {
 		return nil, err
 	}
-	volume, err := seriesFloatValue(evt.Values, "volume")
+	volume, err := evt.VolumeValue()
 	if err != nil {
 		return nil, err
 	}
-	quote, _ := seriesFloatValueDefault(evt.Values, "quote")
-	buyVolume, _ := seriesFloatValueDefault(evt.Values, "buy_volume")
-	tradeNum, _ := seriesIntValueDefault(evt.Values, "trade_num")
-	return &InfoKline{
-		PairTFKline: &banexg.PairTFKline{
-			Symbol:    exs.Symbol,
-			TimeFrame: evt.TimeFrame,
-			Kline: banexg.Kline{
-				Time:      evt.TimeMS,
-				Open:      open,
-				High:      high,
-				Low:       low,
-				Close:     closeVal,
-				Volume:    volume,
-				Quote:     quote,
-				BuyVolume: buyVolume,
-				TradeNum:  tradeNum,
-			},
-		},
-		Sid:      exs.ID,
-		Adj:      evt.Adj,
-		IsWarmUp: evt.IsWarmUp,
+	return &SeriesOHLCV{
+		Sid:       exs.ID,
+		ExSymbol:  exs,
+		Source:    evt.Source,
+		Time:      evt.TimeMS,
+		EndMS:     evt.EndMS,
+		TimeFrame: evt.TimeFrame,
+		Open:      open,
+		High:      high,
+		Low:       low,
+		Close:     closeVal,
+		Volume:    volume,
+		Quote:     evt.QuoteValue(),
+		BuyVolume: evt.BuyVolumeValue(),
+		TradeNum:  evt.TradeNumValue(),
+		Adj:       evt.Adj,
+		IsWarmUp:  evt.IsWarmUp,
+		Closed:    evt.Closed,
 	}, nil
+}
+
+func AsKline(evt *DataSeries, extras ...any) (*InfoKline, error) {
+	var extraExs *ExSymbol
+	for _, item := range extras {
+		if val, ok := item.(*ExSymbol); ok && val != nil {
+			extraExs = val
+			break
+		}
+	}
+	view, err := evt.OHLCV(extraExs)
+	if err != nil {
+		return nil, err
+	}
+	return view.ToInfoKline(), nil
 }
 
 func KlineToSeries(bar *InfoKline) *DataSeries {

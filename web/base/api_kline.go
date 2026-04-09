@@ -58,7 +58,7 @@ func getHist(c *fiber.Ctx) error {
 	}
 	return c.JSON(fiber.Map{
 		"adjs": adjs,
-		"data": ArrKLines(klines),
+		"data": ArrSeriesBars(klines),
 	})
 }
 

@@ -93,7 +93,7 @@ func (t *CryptoTrader) initOdMgr() *errs.Error {
 			biz.InitFakeWallets()
 		}
 		biz.InitLocalLiveOrderMgr(t.orderCB, true)
-		t.dp.OnMinKlines = biz.CallLocalLiveOdMgrsKline
+		t.dp.OnDataSeries = biz.CallLocalLiveOdMgrsData
 		return nil
 	}
 	biz.InitLiveOrderMgr(t.orderCB)
@@ -134,21 +134,21 @@ func (t *CryptoTrader) Run() *errs.Error {
 }
 
 func (t *CryptoTrader) FeedDataSeries(evt *orm.DataSeries) {
-	bar, errConv := orm.AsKline(evt, evt.ExSymbol)
-	if errConv != nil {
+	view, errView := evt.OHLCV(evt.ExSymbol)
+	if errView != nil {
 		if err := t.Trader.FeedDataSeries(evt); err != nil {
 			log.Error("handle data series fail", zap.Int32("sid", evt.Sid), zap.Error(err))
 		}
 		return
 	}
-	if bar.IsWarmUp {
-		tfMSecs := int64(utils.TFToSecs(bar.TimeFrame) * 1000)
-		barEndMS := bar.Time + tfMSecs
+	if view.IsWarmUp {
+		tfMSecs := int64(utils.TFToSecs(view.TimeFrame) * 1000)
+		barEndMS := view.Time + tfMSecs
 		if barEndMS > strat.LastBatchMS {
 			// Enter the next timeframe and trigger the batch entry callback
 			// 进入下一个时间帧，触发批量入场回调
 			execMS := barEndMS + core.DelayBatchMS + 1
-			waitNum := biz.TryFireBatches(execMS, bar.IsWarmUp)
+			waitNum := biz.TryFireBatches(execMS, view.IsWarmUp)
 			if waitNum > 0 {
 				log.Warn(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
 			}
@@ -156,12 +156,13 @@ func (t *CryptoTrader) FeedDataSeries(evt *orm.DataSeries) {
 		}
 	} else {
 		delayExecBatch()
-		envKey := strings.Join([]string{bar.Symbol, bar.TimeFrame}, "_")
-		orm.AddDumpRow(orm.DumpKline, envKey, bar.Kline)
+		envKey := strings.Join([]string{view.Symbol(), view.TimeFrame}, "_")
+		if bar := view.Bar(); bar != nil {
+			orm.AddDumpRow(orm.DumpKline, envKey, *bar)
+		}
 	}
-	err := t.Trader.FeedDataSeries(evt)
-	if err != nil {
-		log.Error("handle data series fail", zap.String("pair", bar.Symbol), zap.Error(err))
+	if errRun := t.Trader.FeedDataSeries(evt); errRun != nil {
+		log.Error("handle data series fail", zap.String("pair", view.Symbol()), zap.Error(errRun))
 		return
 	}
 }

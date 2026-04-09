@@ -53,16 +53,20 @@ func (o *LocalOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, 
 	return o.OrderMgr.ProcessOrders(job)
 }
 
-func (o *LocalOrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error {
+func (o *LocalOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
 	if len(allOpens) == 0 || core.EnvReal || core.LiveMode {
 		return nil
 	}
+	if evt == nil {
+		return nil
+	}
+	symbol := evt.Symbol()
 	// Simulate order entry and exit, which are usually executed at the beginning of the bar
 	// 模拟订单入场出场，入场出场一般在bar开始时执行
 	var curOrders []*ormo.InOutOrder
 	var curMap = make(map[int64]bool)
 	for _, od := range allOpens {
-		if od.Symbol == bar.Symbol {
+		if od.Symbol == symbol {
 			curOrders = append(curOrders, od)
 			curMap[od.ID] = true
 			if od.Exit != nil {
@@ -73,24 +77,24 @@ func (o *LocalOrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKl
 	if len(curOrders) == 0 && !core.CheckWallets {
 		return nil
 	}
-	curOrders, err := o.fillPendingOrdersAll(curOrders, curMap, bar)
+	curOrders, err := o.fillPendingOrdersAll(curOrders, curMap, evt)
 	if err != nil {
 		return err
 	}
-	return o.updateProfitAndWallets(allOpens, curOrders, bar)
+	return o.updateProfitAndWallets(allOpens, curOrders, evt)
 }
 
-func (o *LocalOrderMgr) updateProfitAndWallets(allOpens, curOrders []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error {
+func (o *LocalOrderMgr) updateProfitAndWallets(allOpens, curOrders []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
 	// Update all orders to profit at the end of the bar
 	// 更新所有订单在bar结束时利润
-	err := o.OrderMgr.UpdateByBar(curOrders, bar)
+	err := o.OrderMgr.UpdateByDataSeries(curOrders, evt)
 	if err != nil {
 		return err
 	}
 	if core.IsContract && core.CheckWallets {
 		// Update all order margins and wallet status of this pricing currency for the contract
 		// 为合约更新此定价币的所有订单保证金和钱包情况
-		_, _, code, _ := core.SplitSymbol(bar.Symbol)
+		_, _, code, _ := core.SplitSymbol(evt.Symbol())
 		var orders []*ormo.InOutOrder
 		for _, od := range allOpens {
 			_, _, odSettle, _ := core.SplitSymbol(od.Symbol)
@@ -104,8 +108,8 @@ func (o *LocalOrderMgr) updateProfitAndWallets(allOpens, curOrders []*ormo.InOut
 	return err
 }
 
-func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap map[int64]bool, bar *orm.InfoKline) ([]*ormo.InOutOrder, *errs.Error) {
-	_, err := o.fillPendingOrders(orders, bar)
+func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap map[int64]bool, evt *orm.DataSeries) ([]*ormo.InOutOrder, *errs.Error) {
+	_, err := o.fillPendingOrders(orders, evt)
 	if err != nil {
 		return orders, err
 	}
@@ -116,7 +120,7 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 		var newOds []*ormo.InOutOrder
 		lock.Lock()
 		for _, od := range openOds {
-			if !(bar == nil || od.Symbol == bar.Symbol) {
+			if !(evt == nil || od.Symbol == evt.Symbol()) {
 				continue
 			}
 			if _, ok := curMap[od.ID]; !ok {
@@ -134,7 +138,7 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 		lock.Unlock()
 		if len(newOds) > 0 {
 			sortOrdersForBacktest(newOds)
-			_, err = o.fillPendingOrders(newOds, bar)
+			_, err = o.fillPendingOrders(newOds, evt)
 			if err != nil {
 				return orders, err
 			}
@@ -164,7 +168,7 @@ fillPendingOrders
 Fills orders waiting for exchange response. Cannot be used for real trading; can be used for backtesting, simulated real trading, etc.
 填充等待交易所响应的订单。不可用于实盘；可用于回测、模拟实盘等。
 */
-func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.InfoKline) (int, *errs.Error) {
+func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.DataSeries) (int, *errs.Error) {
 	core.SimOrderMatch = true
 	core.NewNumInSim = 0
 	defer func() {
@@ -173,14 +177,14 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 	affectNum := 0
 	for _, od := range orders {
 		matchTf, _ := config.GetStratRefineTF(od.Strategy, od.Timeframe)
-		if bar != nil && bar.TimeFrame != matchTf {
+		if evt != nil && evt.TimeFrame != matchTf {
 			continue
 		}
 		exOrder := getPendingSub(od)
 		if exOrder == nil {
-			if od.ExitTag == "" && bar != nil {
+			if od.ExitTag == "" && evt != nil {
 				// 已入场完成，尚未出现出场信号，检查是否触发止损The entry has been completed, but the exit signal has not yet appeared. Check whether the stop loss is triggered.
-				err := o.tryFillTriggers(od, &bar.Kline, matchTf)
+				err := o.tryFillTriggers(od, seriesOHLCVCompat(evt), matchTf)
 				if err != nil {
 					return 0, err
 				}
@@ -199,10 +203,12 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 		var minRate float64
 		var fillBarRate float64
 		var isStopEnter bool
-		if exOrder.Enter && od.Stop > 0 && bar != nil {
+		if exOrder.Enter && od.Stop > 0 && evt != nil {
 			// 使用触发价格，enterOrder中已判断有效性
 			trigPrice := od.Stop
-			if trigPrice < bar.Low || trigPrice > bar.High {
+			lowVal, _ := evt.LowValue()
+			highVal, _ := evt.HighValue()
+			if trigPrice < lowVal || trigPrice > highVal {
 				// 不处于bar的范围，无法触发
 				continue
 			}
@@ -213,51 +219,54 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, bar *orm.In
 				price = exOrder.Price
 			}
 			minRate = float64((exOrder.CreateAt-barStartMS)/1000) / float64(odTFSecs)
-			minRate = simMarketRate(&bar.Kline, trigPrice, odIsBuy, true, minRate)
+			minRate = simMarketRate(seriesOHLCVCompat(evt), trigPrice, odIsBuy, true, minRate)
 			fillBarRate = minRate
-			fillMS = bar.Time + int64(float64(odTFSecs)*minRate)*1000
+			fillMS = evt.TimeMS + int64(float64(odTFSecs)*minRate)*1000
 			isStopEnter = true
 		}
-		if bar == nil {
+		if evt == nil {
 			price = com.GetPriceSafeExp(od.Symbol, "", com.Day10MSecs)
 			if price < 0 {
 				// here return error would cause backtest interrupt
 				return 0, nil
 			}
 		} else if strings.Contains(odType, "limit") && exOrder.Price > 0 {
+			lowVal, _ := evt.LowValue()
+			highVal, _ := evt.HighValue()
+			openVal, _ := evt.OpenValue()
 			if odIsBuy {
-				if price < bar.Low {
+				if price < lowVal {
 					continue
-				} else if price > bar.Open {
+				} else if price > openVal {
 					// 买价高于市价，以市价成交
 					// If the purchase price is higher than the market price, the transaction will be completed at the market price.
-					price = bar.Open
+					price = openVal
 				}
 			} else {
-				if price > bar.High {
+				if price > highVal {
 					continue
-				} else if price < bar.Open {
+				} else if price < openVal {
 					// If the selling price is lower than the market price, the transaction will be done at the market price.
 					// 卖价低于市价，以市价成交
-					price = bar.Open
+					price = openVal
 				}
 			}
 			if minRate == 0 {
 				minRate = float64((exOrder.CreateAt-barStartMS)/1000) / float64(odTFSecs)
 			}
-			fillBarRate = simMarketRate(&bar.Kline, exOrder.Price, odIsBuy, false, minRate)
-			fillMS = bar.Time + int64(float64(odTFSecs)*fillBarRate)*1000
+			fillBarRate = simMarketRate(seriesOHLCVCompat(evt), exOrder.Price, odIsBuy, false, minRate)
+			fillMS = evt.TimeMS + int64(float64(odTFSecs)*fillBarRate)*1000
 		} else if !isStopEnter {
 			// 按网络延迟，模拟成交价格，和开盘价接近According to the network delay, the simulated transaction price is close to the opening price
 			fillBarRate = float64((fillMS-barStartMS)/1000) / float64(odTFSecs)
-			price = simMarketPrice(&bar.Kline, fillBarRate)
+			price = simMarketPrice(seriesOHLCVCompat(evt), fillBarRate)
 		}
 		var err *errs.Error
 		if exOrder.Enter {
 			err = o.fillPendingEnter(od, price, fillMS)
-			if err == nil && bar != nil {
+			if err == nil && evt != nil {
 				// 入场后可能立刻触发止损/止盈
-				endBar := cutKlineFromRate(&bar.Kline, int64(odTFSecs*1000), fillBarRate)
+				endBar := cutSeriesFromRate(seriesOHLCVCompat(evt), int64(odTFSecs*1000), fillBarRate)
 				err = o.tryFillTriggers(od, endBar, matchTf)
 			}
 		} else {
@@ -406,7 +415,10 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 	return nil
 }
 
-func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *banexg.Kline, tf string) *errs.Error {
+func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLCV, tf string) *errs.Error {
+	if bar == nil {
+		return nil
+	}
 	sl := od.GetStopLoss()
 	tp := od.GetTakeProfit()
 	if sl == nil && tp == nil {
@@ -534,18 +546,18 @@ func (o *LocalOrderMgr) onLowFunds() {
 	}
 }
 
-func (o *LocalOrderMgr) OnEnvEnd(bar *banexg.PairTFKline, adj *orm.AdjInfo) *errs.Error {
+func (o *LocalOrderMgr) OnEnvEnd(evt *orm.DataSeries) *errs.Error {
 	err := o.exitAndFill(&strat.ExitReq{
 		Tag:  core.ExitTagEnvEnd,
 		Dirt: core.OdDirtBoth,
-	}, &orm.InfoKline{PairTFKline: bar, Adj: adj}, true)
+	}, evt, true)
 	return err
 }
 
-func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, bar *orm.InfoKline, noEnter bool) *errs.Error {
+func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noEnter bool) *errs.Error {
 	pairs := ""
-	if bar != nil {
-		pairs = bar.Symbol
+	if evt != nil {
+		pairs = evt.Symbol()
 	}
 	orders, err := o.ExitOpenOrders(pairs, req)
 	if err != nil {
@@ -564,7 +576,7 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, bar *orm.InfoKline, noEn
 			backUntil, _ = core.NoEnterUntil[o.Account]
 			core.NoEnterUntil[o.Account] = btime.TimeMS() + 72*3600*1000
 		}
-		_, err = o.fillPendingOrdersAll(orders, odMap, bar)
+		_, err = o.fillPendingOrdersAll(orders, odMap, evt)
 		if noEnter {
 			core.NoEnterUntil[o.Account] = backUntil
 		}
@@ -678,7 +690,7 @@ func getPendingSub(od *ormo.InOutOrder) *ormo.ExOrder {
 	return nil
 }
 
-func simPriceByRate(bar *banexg.Kline, rate float64) (float64, float64, float64) {
+func simPriceByRate(bar *orm.SeriesOHLCV, rate float64) (float64, float64, float64) {
 	var (
 		a, b, c, pa, totalLen float64
 		aEndRate, bEndRate    float64
@@ -756,20 +768,38 @@ func simPriceByRate(bar *banexg.Kline, rate float64) (float64, float64, float64)
 	return newOpen, newHigh, newLow
 }
 
-func simMarketPrice(bar *banexg.Kline, rate float64) float64 {
+func simMarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {
 	start, _, _ := simPriceByRate(bar, rate)
 	return start
 }
 
-func cutKlineFromRate(bar *banexg.Kline, tfMSecs int64, rate float64) *banexg.Kline {
+func cutSeriesFromRate(bar *orm.SeriesOHLCV, tfMSecs int64, rate float64) *orm.SeriesOHLCV {
 	start, high, low := simPriceByRate(bar, rate)
-	return &banexg.Kline{
-		Time: bar.Time + int64(float64(tfMSecs)*rate),
-		Open: start, High: high, Low: low, Close: bar.Close, Volume: bar.Volume * (1 - rate), BuyVolume: bar.BuyVolume,
+	return &orm.SeriesOHLCV{
+		Sid:       bar.Sid,
+		ExSymbol:  bar.ExSymbol,
+		Source:    bar.Source,
+		Time:      bar.Time + int64(float64(tfMSecs)*rate),
+		EndMS:     bar.EndMS,
+		TimeFrame: bar.TimeFrame,
+		Open:      start,
+		High:      high,
+		Low:       low,
+		Close:     bar.Close,
+		Volume:    bar.Volume * (1 - rate),
+		Quote:     bar.Quote,
+		BuyVolume: bar.BuyVolume,
+		TradeNum:  bar.TradeNum,
+		Adj:       bar.Adj,
+		IsWarmUp:  bar.IsWarmUp,
+		Closed:    bar.Closed,
 	}
 }
 
-func simMarketRate(bar *banexg.Kline, price float64, isBuy, isTrigger bool, minRate float64) float64 {
+func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, minRate float64) float64 {
+	if bar == nil {
+		return minRate
+	}
 	if isTrigger {
 		// For the order that triggers the price, it is not a pending order. If it is judged that it is not within the bar range, it is considered to be completed immediately.
 		// 对于触发价格的订单，不是挂单，判断如果未在bar范围内，则认为立刻成交
@@ -940,7 +970,10 @@ func simMarketRate(bar *banexg.Kline, price float64, isBuy, isTrigger bool, minR
 计算平仓成交价格，0市价，-1不平仓，>0指定价格
 Calculate the transaction price for closing the position, 0 market price, -1 for not closing the position, >0 specified price
 */
-func getExcPrice(od *ormo.InOutOrder, bar *banexg.Kline, trigPrice, limit, afterRate, tfSecs float64) float64 {
+func getExcPrice(od *ormo.InOutOrder, bar *orm.SeriesOHLCV, trigPrice, limit, afterRate, tfSecs float64) float64 {
+	if bar == nil {
+		return -1
+	}
 	if limit > 0 {
 		if od.Short && limit < bar.Low || !od.Short && limit > bar.High {
 			// 空单，平仓限价低于bar最低，不触发

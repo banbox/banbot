@@ -25,14 +25,14 @@ var (
 	retryWaits = btime.NewRetryWaits(0, nil)
 )
 
-type NotifyKLines struct {
+type NotifySeries struct {
 	TFSecs   int
 	Interval int // 推送更新间隔, <= TFSecs
 	Arr      []*banexg.Kline
 }
 
-type KLineMsg struct {
-	NotifyKLines
+type SeriesMsg struct {
+	NotifySeries
 	ExgName string // The name of the exchange 交易所名称
 	Market  string // market 市场
 	Pair    string // symbol  币种
@@ -41,21 +41,21 @@ type KLineMsg struct {
 /** *******************************  Spider 爬虫部分   ****************************
  */
 var (
-	sidMap           = make(map[int32]*SaveKline)
+	sidMap           = make(map[int32]*SaveSeries)
 	sidLock          = sync.Mutex{}
-	writeQ           = make(chan *SaveKline, 9999)
+	writeQ           = make(chan *SaveSeries, 9999)
 	KlineParallelNum = 6 // 抓取K线时的同时并发数
 )
 
-type SaveKline struct {
+type SaveSeries struct {
 	Sid       int32
 	TimeFrame string
-	Arr       []*banexg.Kline
+	Rows      []*orm.DataSeries
 	MsgAction string
 	ReceiveAt int64
 }
 
-func consumeWriteQ(workNum int) {
+func consumeSeriesWriteQ(workNum int) {
 	guard := make(chan struct{}, workNum)
 	defer close(guard)
 	setOne := func() {
@@ -82,20 +82,20 @@ func consumeWriteQ(workNum int) {
 		waitMa := ema.Update(waitMS)
 		if waitMa > 1000 && len(writeQ) > 10 && btime.UTCStamp() > lastDelayWarn+60000 {
 			lastDelayWarn = btime.UTCStamp()
-			log.Warn("kline save task consume slowly", zap.Int("waitMS", int(waitMa)), zap.Int("waitNum", len(writeQ)))
+			log.Warn("series save task consume slowly", zap.Int("waitMS", int(waitMa)), zap.Int("waitNum", len(writeQ)))
 		}
-		go func(job *SaveKline) {
+		go func(job *SaveSeries) {
 			start := time.Now()
 			var saveCost, totalCost time.Duration
 			tfSecs := utils2.TFToSecs(job.TimeFrame)
 			defer func() {
 				if totalCost > time.Millisecond*50 {
 					waitCost := btime.UTCStamp() - job.ReceiveAt
-					barEnd := job.Arr[len(job.Arr)-1].Time + int64(tfSecs*1000)
+					barEnd := job.Rows[len(job.Rows)-1].EndMS
 					barEndStr := btime.ToDateStr(barEnd, core.DefaultDateFmt)
-					log.Info("save kline", zap.Int32("sid", job.Sid), zap.Int64("waitMS", waitCost),
+					log.Info("save series", zap.Int32("sid", job.Sid), zap.Int64("waitMS", waitCost),
 						zap.Duration("saveDb", saveCost), zap.Duration("send", totalCost-saveCost),
-						zap.Int("num", len(job.Arr)), zap.String("barEnd", barEndStr))
+						zap.Int("num", len(job.Rows)), zap.String("barEnd", barEndStr))
 				}
 				<-guard
 			}()
@@ -103,16 +103,22 @@ func consumeWriteQ(workNum int) {
 			sidLock.Lock()
 			delete(sidMap, job.Sid)
 			sidLock.Unlock()
-			trySaveKlines(job, tfSecs, mntSta, hourSta)
+			trySaveSeries(job, tfSecs, mntSta, hourSta)
 			saveCost = time.Since(start)
 			// After the K-line is written to the database, a message will be sent to notify the robot to avoid repeated insertion of K-line
 			// 写入K线到数据库后，才发消息通知机器人，避免重复插入K线
-			err := Spider.Broadcast(&utils.IOMsg{
+			bars, err := orm.SeriesToBars(orm.GetSymbolByID(job.Sid), job.Rows)
+			if err != nil {
+				log.Error("convert series to bars fail", zap.Int32("sid", job.Sid), zap.Error(err))
+				totalCost = time.Since(start)
+				return
+			}
+			err = Spider.Broadcast(&utils.IOMsg{
 				Action: job.MsgAction,
-				Data: NotifyKLines{
+				Data: NotifySeries{
 					TFSecs:   tfSecs,
 					Interval: tfSecs,
-					Arr:      job.Arr,
+					Arr:      bars,
 				},
 			})
 			totalCost = time.Since(start)
@@ -584,7 +590,7 @@ func (m *Miner) watchKLines(pairs []string) {
 		// 发送uohlcv订阅消息
 		err_ := m.spider.Broadcast(&utils.IOMsg{
 			Action: unPrefix + pair,
-			Data: NotifyKLines{
+			Data: NotifySeries{
 				TFSecs:   tfSecs,
 				Interval: 1,
 				Arr:      arr,
@@ -738,16 +744,16 @@ func (m *Miner) startLoopKLines() {
 						existingJob, exists := sidMap[sta.Sid]
 						if exists {
 							// Append to existing job's Arr
-							existingJob.Arr = append(existingJob.Arr, bars...)
+							existingJob.Rows = append(existingJob.Rows, orm.BarsToSeries(orm.GetSymbolByID(sta.Sid), curTF, bars, nil, false, true)...)
 							sidLock.Unlock()
 							log.Debug("kline appended to existing job", zap.Int32("sid", sta.Sid), zap.String("pair", p),
-								zap.Int("num", len(bars)), zap.Int("total", len(existingJob.Arr)))
+								zap.Int("num", len(bars)), zap.Int("total", len(existingJob.Rows)))
 						} else {
 							// Create new job and add to both sidMap and writeQ
-							newJob := &SaveKline{
+							newJob := &SaveSeries{
 								Sid:       sta.Sid,
 								TimeFrame: curTF,
-								Arr:       bars,
+								Rows:      orm.BarsToSeries(orm.GetSymbolByID(sta.Sid), curTF, bars, nil, false, true),
 								MsgAction: prefix + p,
 								ReceiveAt: btime.UTCStamp(),
 							}
@@ -788,7 +794,7 @@ func RunSpider(addr string) *errs.Error {
 		miners:   map[string]*Miner{},
 	}
 	server.InitConn = makeInitConn(Spider)
-	go consumeWriteQ(5)
+	go consumeSeriesWriteQ(5)
 	sess, conn, err := orm.Conn(nil)
 	if err != nil {
 		return err

@@ -24,11 +24,11 @@ func TestWatchOhlcv(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	client, err := NewKlineWatcher("127.0.0.1:6789")
+	client, err := NewSeriesWatcher("127.0.0.1:6789")
 	if err != nil {
 		panic(err)
 	}
-	client.OnKLineMsg = func(msg *KLineMsg) {
+	client.OnDataMsg = func(msg *SeriesMsg) {
 		if len(msg.Arr) == 0 {
 			return
 		}

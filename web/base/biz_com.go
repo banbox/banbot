@@ -20,7 +20,7 @@ import (
 var (
 	exgInits    = map[banexg.BanExchange]bool{}
 	exgInitLock deadlock.Mutex
-	receiver    *data.KLineWatcher
+	receiver    *data.SeriesWatcher
 	wsSubs      = map[string]map[*WsClient]bool{}
 	wsSubLock   deadlock.Mutex
 )
@@ -50,15 +50,15 @@ func GetExg(name, market, ctType string, load bool) (banexg.BanExchange, *errs.E
 	return exchange, InitExg(exchange)
 }
 
-func ArrKLines(klines []*banexg.Kline) [][]float64 {
-	res := make([][]float64, 0, len(klines))
-	for _, k := range klines {
+func ArrSeriesBars(bars []*banexg.Kline) [][]float64 {
+	res := make([][]float64, 0, len(bars))
+	for _, k := range bars {
 		res = append(res, []float64{float64(k.Time), k.Open, k.High, k.Low, k.Close, k.Volume, k.BuyVolume})
 	}
 	return res
 }
 
-func SetKlineSub(client *WsClient, isSub, lock bool, keys ...string) {
+func SetSeriesSub(client *WsClient, isSub, lock bool, keys ...string) {
 	if lock {
 		wsSubLock.Lock()
 		defer wsSubLock.Unlock()
@@ -79,12 +79,12 @@ func SetKlineSub(client *WsClient, isSub, lock bool, keys ...string) {
 
 func RunReceiver() {
 	var err *errs.Error
-	receiver, err = data.NewKlineWatcher(config.SpiderAddr)
+	receiver, err = data.NewSeriesWatcher(config.SpiderAddr)
 	if err != nil {
 		log.Warn("connect spider fail", zap.String("addr", config.SpiderAddr), zap.String("err", err.Short()))
 		return
 	}
-	receiver.OnKLineMsg = klineHandler
+	receiver.OnDataMsg = seriesHandler
 	// 暂时只监听默认交易所的默认市场
 	exsList := orm.GetExSymbols(core.ExgName, core.Market)
 	if len(exsList) == 0 {
@@ -99,14 +99,14 @@ func RunReceiver() {
 	if err != nil {
 		log.Error("subscribe spider fail", zap.Int("num", len(jobs)), zap.Error(err))
 	}
-	log.Info("subscribe kline from spider success")
+	log.Info("subscribe series from spider success")
 	err = receiver.RunForever()
 	if err != nil {
 		log.Error("receive spider fail", zap.Error(err))
 	}
 }
 
-func klineHandler(msg *data.KLineMsg) {
+func seriesHandler(msg *data.SeriesMsg) {
 	if len(msg.Arr) == 0 {
 		return
 	}
@@ -119,13 +119,13 @@ func klineHandler(msg *data.KLineMsg) {
 	}
 	wsMsg := map[string]interface{}{
 		"a":    "subscribe",
-		"bars": ArrKLines(msg.Arr),
+		"bars": ArrSeriesBars(msg.Arr),
 		"secs": msg.TFSecs,
 		"upd":  msg.Interval,
 	}
 	raw, err := utils2.Marshal(wsMsg)
 	if err != nil {
-		log.Warn("marshal ws kline fail", zap.Error(err))
+		log.Warn("marshal ws series fail", zap.Error(err))
 		return
 	}
 

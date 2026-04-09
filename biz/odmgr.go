@@ -34,9 +34,9 @@ type IOrderMgr interface {
 	EnterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder, *errs.Error)
 	ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error)
 	ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error)
-	UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error
+	UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error
 	ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error
-	OnEnvEnd(bar *banexg.PairTFKline, adj *orm.AdjInfo) *errs.Error
+	OnEnvEnd(evt *orm.DataSeries) *errs.Error
 	CleanUp() *errs.Error
 }
 
@@ -771,34 +771,58 @@ func (o *OrderMgr) postOrderExit(od *ormo.InOutOrder) (*ormo.InOutOrder, *errs.E
 }
 
 /*
-UpdateByBar
+UpdateByDataSeries
 Use the price to update the profit of the order, etc. It may trigger a margin call
 使用价格更新订单的利润等。可能会触发爆仓
 */
-func (o *OrderMgr) UpdateByBar(allOpens []*ormo.InOutOrder, bar *orm.InfoKline) *errs.Error {
+func (o *OrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
+	if evt == nil {
+		return nil
+	}
+	closeVal, err := evt.CloseValue()
+	if err != nil {
+		return errs.New(core.ErrInvalidBars, err)
+	}
+	highVal, err := evt.HighValue()
+	if err != nil {
+		return errs.New(core.ErrInvalidBars, err)
+	}
+	symbol := evt.Symbol()
+	tf := evt.TimeFrame
 	for _, od := range allOpens {
-		if od.Symbol != bar.Symbol || od.Status >= ormo.InOutStatusFullExit {
+		if od.Symbol != symbol || od.Status >= ormo.InOutStatusFullExit {
 			continue
 		}
 		matchTf, _ := config.GetStratRefineTF(od.Strategy, od.Timeframe)
-		if bar.TimeFrame != matchTf {
+		if tf != matchTf {
 			continue
 		}
-		od.UpdateProfits(bar.Close)
+		od.UpdateProfits(closeVal)
 		activePrice := od.GetInfoFloat64(ormo.OdInfoActivePrice)
 		if activePrice > 0 {
-			if od.Short && activePrice >= bar.Close || !od.Short && activePrice <= bar.High {
+			if od.Short && activePrice >= closeVal || !od.Short && activePrice <= highVal {
 				od.SetInfo(ormo.OdInfoActivePrice, 0)
 			} else {
 				continue
 			}
 		}
-		err := od.UpdateTrailing(bar.Close)
+		err := od.UpdateTrailing(closeVal)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func seriesOHLCVCompat(evt *orm.DataSeries) *orm.SeriesOHLCV {
+	if evt == nil {
+		return nil
+	}
+	view, err := evt.OHLCV(evt.ExSymbol)
+	if err != nil {
+		return nil
+	}
+	return view
 }
 
 func (o *OrderMgr) CutOrder(od *ormo.InOutOrder, enterRate, exitRate float64) *ormo.InOutOrder {
