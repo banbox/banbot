@@ -158,18 +158,31 @@ func (q *Queries) GetInsKline(ctx context.Context, sid int32, timeframe string) 
 	if !IsQuestDB {
 		return q.getInsKlinePg(ctx, sid, timeframe)
 	}
-	row := q.db.QueryRow(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
+	load := func() (*InsKline, error) {
+		row := q.db.QueryRow(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
 FROM ins_kline_q
 LATEST BY sid, timeframe
 WHERE sid = $1 AND timeframe = $2 AND coalesce(is_deleted, false) = false`, sid, timeframe)
-	var i InsKline
-	if err := row.Scan(&i.Sid, &i.Timeframe, &i.Ts, &i.StartMs, &i.StopMs); err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, nil
+		var i InsKline
+		if err := row.Scan(&i.Sid, &i.Timeframe, &i.Ts, &i.StartMs, &i.StopMs); err != nil {
+			if err == pgx.ErrNoRows {
+				return nil, nil
+			}
+			return nil, err
 		}
-		return nil, err
+		return &i, nil
 	}
-	return &i, nil
+	item, err := load()
+	if err != nil {
+		repaired, repairErr := tryRepairQuestDBMissingPartition(ctx, q.db, err, "GetInsKline")
+		if repairErr != nil {
+			return nil, repairErr
+		}
+		if repaired {
+			return load()
+		}
+	}
+	return item, err
 }
 
 func (q *Queries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
@@ -179,23 +192,39 @@ func (q *Queries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
 	if !IsQuestDB {
 		return q.getAllInsKlinesPg(ctx)
 	}
-	rows, err := q.db.Query(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
+	load := func() ([]*InsKline, error) {
+		rows, err := q.db.Query(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
 FROM ins_kline_q
 LATEST BY sid, timeframe
 WHERE coalesce(is_deleted, false) = false`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []*InsKline
-	for rows.Next() {
-		var i InsKline
-		if err := rows.Scan(&i.Sid, &i.Timeframe, &i.Ts, &i.StartMs, &i.StopMs); err != nil {
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, &i)
+		defer rows.Close()
+		var out []*InsKline
+		for rows.Next() {
+			var i InsKline
+			if err := rows.Scan(&i.Sid, &i.Timeframe, &i.Ts, &i.StartMs, &i.StopMs); err != nil {
+				return nil, err
+			}
+			out = append(out, &i)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return out, nil
 	}
-	return out, rows.Err()
+	items, err := load()
+	if err != nil {
+		repaired, repairErr := tryRepairQuestDBMissingPartition(ctx, q.db, err, "GetAllInsKlines")
+		if repairErr != nil {
+			return nil, repairErr
+		}
+		if repaired {
+			return load()
+		}
+	}
+	return items, err
 }
 
 func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, ts time.Time) error {
@@ -210,8 +239,22 @@ func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, 
 	if !IsQuestDB {
 		return q.delInsKlinePg(ctx, sid, timeframe)
 	}
-	_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
-VALUES ($1, $2, $3, 0, 0, true)`, sid, timeframe, ts)
+	delTs := time.Now().UTC()
+	write := func() error {
+		_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted, deleted_at)
+VALUES ($1, $2, $3, 0, 0, true, $4)`, sid, timeframe, ts, delTs)
+		return err
+	}
+	err := write()
+	if err != nil {
+		repaired, repairErr := tryRepairQuestDBMissingPartition(ctx, q.db, err, "DelInsKline")
+		if repairErr != nil {
+			return repairErr
+		}
+		if repaired {
+			err = write()
+		}
+	}
 	if err == nil {
 		MaybeCompact("ins_kline_q")
 	}
@@ -235,8 +278,20 @@ func (q *Queries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (time.
 	insKlineLocks[key] = ts
 	insKlineLocksmu.Unlock()
 
-	_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
+	write := func() error {
+		_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
 VALUES ($1, $2, $3, $4, $5, false)`, arg.Sid, arg.Timeframe, ts, arg.StartMs, arg.StopMs)
+		return err
+	}
+	err := write()
+	if err != nil {
+		repaired, repairErr := tryRepairQuestDBMissingPartition(ctx, q.db, err, "AddInsKline")
+		if repairErr != nil {
+			err = repairErr
+		} else if repaired {
+			err = write()
+		}
+	}
 	if err != nil {
 		insKlineLocksmu.Lock()
 		delete(insKlineLocks, key)

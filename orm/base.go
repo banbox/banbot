@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -44,6 +45,13 @@ var (
 
 	// IsQuestDB QuestDB (PGWire, port 8812). TimescaleDB (standard PostgreSQL, port 5432).
 	IsQuestDB = true
+)
+
+var (
+	qdbMissingPartitionErrRe = regexp.MustCompile("Partition [`'\"]([^`'\"]+)[`'\"] does not exist in table [`'\"]([^`'\"]+)[`'\"] directory")
+	qdbRepairStmtErrRe       = regexp.MustCompile(`(?i)ALTER TABLE ([A-Za-z0-9_]+) FORCE DROP PARTITION LIST ['"]([^'"]+)['"]`)
+	qdbRepairTableNameRe     = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+	qdbRepairPartitionRe     = regexp.MustCompile(`^[A-Za-z0-9:_.-]+$`)
 )
 
 //go:embed sql/trade_schema.sql
@@ -680,6 +688,63 @@ func NewDbErr(code int, err_ error) *errs.Error {
 		}
 	}
 	return errs.New(code, err_)
+}
+
+type qdbPartitionRepair struct {
+	Table     string
+	Partition string
+}
+
+func (r qdbPartitionRepair) SQL() string {
+	return fmt.Sprintf("ALTER TABLE %s FORCE DROP PARTITION LIST '%s'", r.Table, r.Partition)
+}
+
+func parseQuestDBMissingPartitionRepair(err error) *qdbPartitionRepair {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	match := qdbMissingPartitionErrRe.FindStringSubmatch(msg)
+	if len(match) != 3 {
+		return nil
+	}
+	repair := &qdbPartitionRepair{
+		Partition: match[1],
+		Table:     match[2],
+	}
+	if !qdbRepairTableNameRe.MatchString(repair.Table) || !qdbRepairPartitionRe.MatchString(repair.Partition) {
+		return nil
+	}
+	stmtMatch := qdbRepairStmtErrRe.FindStringSubmatch(msg)
+	if len(stmtMatch) == 3 {
+		if stmtMatch[1] != repair.Table || stmtMatch[2] != repair.Partition {
+			return nil
+		}
+	}
+	return repair
+}
+
+func tryRepairQuestDBMissingPartition(ctx context.Context, db DBTX, err error, reason string) (bool, error) {
+	if !IsQuestDB || db == nil {
+		return false, nil
+	}
+	repair := parseQuestDBMissingPartitionRepair(err)
+	if repair == nil {
+		return false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	log.Warn("repairing questdb missing partition",
+		zap.String("table", repair.Table),
+		zap.String("partition", repair.Partition),
+		zap.String("reason", reason),
+		zap.Error(err))
+	_, execErr := db.Exec(ctx, repair.SQL())
+	if execErr != nil {
+		return false, execErr
+	}
+	return true, nil
 }
 
 // runQdbMigrations executes QuestDB schema migrations (best-effort, non-transactional).

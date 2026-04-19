@@ -190,7 +190,17 @@ func (q *Queries) ListSRanges(ctx context.Context, sid int32, table, timeframe s
 	}
 	spans, err := q.loadSRangesSpans(ctx, sid, table, timeframe, startMs, stopMs)
 	if err != nil {
-		return nil, err
+		repaired, repairErr := tryRepairQuestDBMissingPartition(ctx, q.db, err, "ListSRanges")
+		if repairErr != nil {
+			return nil, repairErr
+		}
+		if !repaired {
+			return nil, err
+		}
+		spans, err = q.loadSRangesSpans(ctx, sid, table, timeframe, startMs, stopMs)
+		if err != nil {
+			return nil, err
+		}
 	}
 	out := make([]*SRange, 0, len(spans))
 	for _, s := range spans {
