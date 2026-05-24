@@ -1172,6 +1172,10 @@ from %s where 1=0
 		if _, err_ = q.db.Exec(ctx, createSQL); err_ != nil {
 			return NewDbErr(core.ErrDbExecFail, err_)
 		}
+		if verifyErr := verifyQuestRewriteCount(ctx, q, tmpTbl, 0); verifyErr != nil {
+			_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
+			return verifyErr
+		}
 		if _, err_ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tblName)); err_ != nil {
 			_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
 			return NewDbErr(core.ErrDbExecFail, err_)
@@ -1215,6 +1219,10 @@ from %s where sid in (%s)
 ) timestamp(ts) partition by %s dedup upsert keys(sid, ts)`, tmpTbl, tblName, sidIn, partBy)
 	if _, err_ = q.db.Exec(ctx, createSQL); err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
+	}
+	if verifyErr := verifyQuestRewriteCount(ctx, q, tmpTbl, keepCount); verifyErr != nil {
+		_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
+		return verifyErr
 	}
 	if _, err_ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tblName)); err_ != nil {
 		_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
@@ -1534,6 +1542,13 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 	for _, i := range items {
 		if i.StartMs > 0 && i.StopMs > 0 {
 			start, end := q.GetKlineRange(i.Sid, i.Timeframe)
+			if IsQuestDB && (start == 0 || end == 0) {
+				var waitErr *errs.Error
+				start, end, waitErr = waitForQuestKlineRangeVisible(ctx, q, i.Sid, i.Timeframe)
+				if waitErr != nil {
+					return waitErr
+				}
+			}
 			if start > 0 && end > 0 {
 				exs := GetSymbolByID(i.Sid)
 				if exs != nil {
@@ -1541,6 +1556,13 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 						return err
 					}
 				}
+			} else if IsQuestDB {
+				log.Warn("pending insert rows still not visible; keep job for next recovery",
+					zap.Int32("sid", i.Sid),
+					zap.String("tf", i.Timeframe),
+					zap.Int64("job_start", i.StartMs),
+					zap.Int64("job_stop", i.StopMs))
+				continue
 			}
 		}
 		err_ = q.DelInsKline(ctx, i.Sid, i.Timeframe, i.Ts)

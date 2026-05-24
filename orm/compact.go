@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/banbox/banexg/log"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 )
 
@@ -73,6 +75,11 @@ const (
 	compactCheckProb   = 0.02
 	compactRatioThresh = 0.35
 	compactMinRows     = 500
+)
+
+var (
+	compactVerifyTimeout      = 30 * time.Second
+	compactVerifyPollInterval = 100 * time.Millisecond
 )
 
 type compactState struct {
@@ -156,12 +163,52 @@ func doCompactCheck(tableName string, meta *TableCompactMeta) {
 		zap.Int64("total", totalRows), zap.Int64("valid", validRows),
 		zap.String("ratio", fmt.Sprintf("%.3f", ratio)), zap.String("action", "compact"))
 
-	execCompact(ctx, tableName, meta, totalRows)
+	execCompact(ctx, tableName, meta, totalRows, validRows)
 }
 
-func execCompact(ctx context.Context, tableName string, meta *TableCompactMeta, beforeTotal int64) {
+type compactDB interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func queryCompactRowCount(ctx context.Context, db compactDB, tableName string) (int64, error) {
+	var count int64
+	err := db.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", tableName)).Scan(&count)
+	return count, err
+}
+
+func waitCompactVisibleCount(ctx context.Context, db compactDB, tableName string, expected int64) (int64, error) {
+	// QuestDB WAL tables acknowledge writes before rows are fully applied/visible.
+	// Poll until the compact snapshot reaches the expected visible row count.
+	deadline := time.Now().Add(compactVerifyTimeout)
+	var lastCount int64
+	for {
+		count, err := queryCompactRowCount(ctx, db, tableName)
+		if err != nil {
+			return 0, err
+		}
+		lastCount = count
+		if count == expected {
+			return count, nil
+		}
+		if count > expected {
+			return count, fmt.Errorf("new table row count exceeded expected snapshot: got=%d expected=%d", count, expected)
+		}
+		if time.Now().After(deadline) {
+			return count, fmt.Errorf("new WAL table rows not fully visible before timeout: got=%d expected=%d timeout=%s", count, expected, compactVerifyTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return lastCount, ctx.Err()
+		case <-time.After(compactVerifyPollInterval):
+		}
+	}
+}
+
+func execCompact(ctx context.Context, tableName string, meta *TableCompactMeta, beforeTotal, expectedRows int64) {
 	start := time.Now()
 	tmpTable := tableName + "_new"
+	db := compactDB(pool)
 
 	createSQL := fmt.Sprintf(`CREATE TABLE %s AS (
   SELECT %s,
@@ -173,24 +220,19 @@ func execCompact(ctx context.Context, tableName string, meta *TableCompactMeta, 
 DEDUP UPSERT KEYS(%s)`,
 		tmpTable, meta.SelectCols, tableName, meta.LatestByKeys, meta.PartitionBy, meta.DedupKeys)
 
-	if _, err := pool.Exec(ctx, createSQL); err != nil {
+	if _, err := db.Exec(ctx, createSQL); err != nil {
 		log.Error("compact_error", zap.String("table", tableName),
 			zap.String("step", "create_new"), zap.Error(err))
 		return
 	}
 
-	var newCount int64
-	if err := pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", tmpTable)).Scan(&newCount); err != nil {
+	newCount, err := waitCompactVisibleCount(ctx, db, tmpTable, expectedRows)
+	if err != nil {
 		log.Error("compact_error", zap.String("table", tableName),
-			zap.String("step", "verify_count"), zap.Error(err))
-		_, _ = pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tmpTable))
-		return
-	}
-	if newCount == 0 && beforeTotal > compactMinRows {
-		log.Error("compact_error", zap.String("table", tableName),
-			zap.String("step", "verify_empty"),
-			zap.String("msg", "new table has 0 rows but old table had data, aborting"))
-		_, _ = pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tmpTable))
+			zap.String("step", "verify_count"),
+			zap.Int64("expected", expectedRows),
+			zap.Error(err))
+		_, _ = db.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tmpTable))
 		return
 	}
 
@@ -198,12 +240,12 @@ DEDUP UPSERT KEYS(%s)`,
 	tblLock.Lock()
 	defer tblLock.Unlock()
 
-	if _, err := pool.Exec(ctx, fmt.Sprintf("DROP TABLE %s", tableName)); err != nil {
+	if _, err := db.Exec(ctx, fmt.Sprintf("DROP TABLE %s", tableName)); err != nil {
 		log.Error("compact_error", zap.String("table", tableName),
 			zap.String("step", "drop_old"), zap.Error(err))
 		return
 	}
-	if _, err := pool.Exec(ctx, fmt.Sprintf("RENAME TABLE %s TO %s", tmpTable, tableName)); err != nil {
+	if _, err := db.Exec(ctx, fmt.Sprintf("RENAME TABLE %s TO %s", tmpTable, tableName)); err != nil {
 		log.Error("compact_error", zap.String("table", tableName),
 			zap.String("step", "rename"),
 			zap.Error(err),

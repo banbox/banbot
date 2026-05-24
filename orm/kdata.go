@@ -150,13 +150,25 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	missing := subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered)
 	if len(missing) == 0 {
 		// If metadata says covered but no actual bars exist in the target range,
-		// force a full-range redownload to self-heal stale sranges records.
+		// wait briefly for QuestDB WAL visibility before forcing a redownload.
 		probe, probeErr := sess.QueryOHLCV(exs, timeFrame, startMS, endMS, 1, false)
 		if probeErr != nil {
 			return 0, probeErr
 		}
 		if len(probe) == 0 {
-			log.Warn("sranges covered but no kline rows, force redownload",
+			if IsQuestDB {
+				visible, waitErr := waitForQuestKlineWindowVisible(context.Background(), sess, exs.ID, timeFrame, startMS, endMS)
+				if waitErr != nil {
+					return 0, waitErr
+				}
+				if visible {
+					if pBar != nil {
+						pBar.Add(core.StepTotal)
+					}
+					return 0, nil
+				}
+			}
+			log.Warn("sranges covered but no kline rows after visibility wait, force redownload",
 				zap.Int32("sid", exs.ID),
 				zap.String("symbol", exs.Symbol),
 				zap.String("tf", timeFrame),
@@ -924,12 +936,20 @@ WHERE market = $1 AND coalesce(is_deleted, false) = false`
 
 	const cols = 4
 	insArgs := make([]any, 0, len(items)*cols)
+	var lastWriteTS time.Time
 	for _, tu := range items {
-		insArgs = append(insArgs, now.Add(time.Duration(microOff)*time.Microsecond), name, tu[0], tu[1])
+		ts := now.Add(time.Duration(microOff) * time.Microsecond)
+		lastWriteTS = ts
+		insArgs = append(insArgs, ts, name, tu[0], tu[1])
 		microOff++
 	}
 	if _, err := q.db.Exec(ctx, "INSERT INTO calendars_q (ts,market,start_ms,stop_ms,is_deleted) VALUES "+buildBatchValues(len(items), cols, ",false"), insArgs...); err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	if !lastWriteTS.IsZero() {
+		if err := waitForQuestCalendarTimestampVisible(ctx, q, name, lastWriteTS); err != nil {
+			return NewDbErr(core.ErrDbReadFail, err)
+		}
 	}
 	return nil
 }

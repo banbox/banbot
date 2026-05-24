@@ -401,12 +401,9 @@ VALUES ($1, $2, $3, $4, $5, $6, false, 0, 0, false)`, sid, ts, s.Exchange, s.Exg
 		})
 	}
 	// QuestDB WAL commits are async. EnsureSymbols reloads immediately after
-	// AddSymbols, so wait briefly until the latest assigned sid is visible.
-	for range 10 {
-		if queryMaxSidFromQDB(ctx) >= lastSID {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	// AddSymbols, so wait until the last inserted row is actually visible.
+	if _, err := waitForQuestExsymbolVisible(ctx, q, lastSID); err != nil {
+		return int64(len(arg)), err
 	}
 	return int64(len(arg)), nil
 }
@@ -427,19 +424,18 @@ func (q *Queries) SetListMS(ctx context.Context, arg SetListMSParams) error {
 	if !IsQuestDB {
 		return q.setListMSPg(ctx, arg)
 	}
-	row := q.db.QueryRow(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms
-FROM exsymbol_q
-LATEST BY sid
-WHERE sid = $1 AND coalesce(is_deleted, false) = false`, arg.ID)
-	var i ExSymbol
-	if err := row.Scan(&i.ID, &i.Exchange, &i.ExgReal, &i.Market, &i.Symbol, &i.Combined, &i.ListMs, &i.DelistMs); err != nil {
+	item, err := waitForQuestExsymbolVisible(ctx, q, arg.ID)
+	if err != nil || item == nil {
 		return fmt.Errorf("SetListMS: sid %d not found: %w", arg.ID, err)
 	}
 	ts := time.Now().UTC()
-	_, err := q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, is_deleted)
+	_, err = q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, is_deleted)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
-		i.ID, ts, i.Exchange, i.ExgReal, i.Market, i.Symbol, i.Combined, arg.ListMs, arg.DelistMs)
+		item.ID, ts, item.Exchange, item.ExgReal, item.Market, item.Symbol, item.Combined, arg.ListMs, arg.DelistMs)
 	if err == nil {
+		if err = waitForQuestExsymbolTimestampVisible(ctx, q, item.ID, ts); err != nil {
+			return err
+		}
 		MaybeCompact("exsymbol_q")
 	}
 	return err
