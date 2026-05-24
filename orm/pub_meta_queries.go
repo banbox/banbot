@@ -239,10 +239,9 @@ func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, 
 	if !IsQuestDB {
 		return q.delInsKlinePg(ctx, sid, timeframe)
 	}
-	delTs := time.Now().UTC()
 	write := func() error {
-		_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted, deleted_at)
-VALUES ($1, $2, $3, 0, 0, true, $4)`, sid, timeframe, ts, delTs)
+		_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
+	VALUES ($1, $2, $3, 0, 0, true)`, sid, timeframe, ts)
 		return err
 	}
 	err := write()
