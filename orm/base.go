@@ -32,6 +32,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+type questExecer interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+}
+
 var (
 	pool           *pgxpool.Pool
 	dbPathMap      = make(map[string]string)
@@ -816,7 +820,49 @@ create table if not exists schema_migrations (
 	if initVersion < currentVersion {
 		log.Info("database migration completed", zap.Int64("from", initVersion), zap.Int64("to", currentVersion))
 	}
+	if err := ensureQuestDBCreateTables(ctx, pool, ddlQdbMigrations); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
 	return nil
+}
+
+func ensureQuestDBCreateTables(ctx context.Context, db questExecer, ddl string) error {
+	for _, stmt := range splitQuestDBStatements(ddl) {
+		trimmed := strings.TrimSpace(stmt)
+		lower := strings.ToLower(trimmed)
+		if !strings.HasPrefix(lower, "create table if not exists ") {
+			continue
+		}
+		if _, err := db.Exec(ctx, trimmed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitQuestDBStatements(ddl string) []string {
+	parts := strings.Split(ddl, ";")
+	stmts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		lines := strings.Split(trimmed, "\n")
+		kept := make([]string, 0, len(lines))
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "--") {
+				continue
+			}
+			kept = append(kept, line)
+		}
+		if len(kept) == 0 {
+			continue
+		}
+		stmts = append(stmts, strings.Join(kept, "\n"))
+	}
+	return stmts
 }
 
 // runPgMigrations executes TimescaleDB/PostgreSQL schema migrations using schema_migrations table.

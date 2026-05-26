@@ -3,6 +3,7 @@ package orm
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -96,5 +97,38 @@ func TestTryRepairQuestDBMissingPartitionIgnoresOtherErrors(t *testing.T) {
 	}
 	if len(db.execSQL) != 0 {
 		t.Fatalf("unexpected repair sql: %v", db.execSQL)
+	}
+}
+
+func TestEnsureQuestDBCreateTablesExecutesOnlyCreateStatements(t *testing.T) {
+	db := &repairDBStub{}
+
+	err := ensureQuestDBCreateTables(context.Background(), db, ddlQdbMigrations)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(db.execSQL) == 0 {
+		t.Fatal("expected create statements to run")
+	}
+
+	for _, sql := range db.execSQL {
+		lower := strings.ToLower(strings.TrimSpace(sql))
+		if !strings.HasPrefix(lower, "create table if not exists ") {
+			t.Fatalf("unexpected non-create statement executed: %s", sql)
+		}
+	}
+
+	wantTables := []string{"kline_1m", "kline_5m", "kline_15m", "kline_1h", "kline_1d", "exsymbol_q", "calendars_q", "adj_factors_q", "sranges_q", "ins_kline_q", "kline_un_q"}
+	for _, name := range wantTables {
+		found := false
+		for _, sql := range db.execSQL {
+			if strings.Contains(strings.ToLower(sql), "create table if not exists "+name) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected create statement for %s", name)
+		}
 	}
 }
