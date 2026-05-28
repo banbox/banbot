@@ -121,6 +121,58 @@ func TestWaitForQuestKlineWindowVisiblePolls(t *testing.T) {
 	}
 }
 
+func TestWaitForQuestExsymbolTimestampVisibleNormalizesToMicroseconds(t *testing.T) {
+	oldTimeout := questReadAfterWriteTimeout
+	oldPoll := questReadAfterWritePollInterval
+	questReadAfterWriteTimeout = 20 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		questReadAfterWriteTimeout = oldTimeout
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	want := time.Date(2026, time.May, 27, 0, 56, 2, 336_789_123, time.UTC)
+	db := &visibilityDBStub{
+		queryRow: func(sql string, args ...interface{}) pgx.Row {
+			return visibilityRowStub{scan: func(dest ...interface{}) error {
+				maxTS := normalizeQuestTimestamp(want)
+				*dest[0].(**time.Time) = &maxTS
+				return nil
+			}}
+		},
+	}
+
+	if err := waitForQuestExsymbolTimestampVisible(context.Background(), New(db), 1337, want); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestWaitForQuestCalendarTimestampVisibleNormalizesToMicroseconds(t *testing.T) {
+	oldTimeout := questReadAfterWriteTimeout
+	oldPoll := questReadAfterWritePollInterval
+	questReadAfterWriteTimeout = 20 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		questReadAfterWriteTimeout = oldTimeout
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	want := time.Date(2026, time.May, 27, 17, 4, 23, 129_654_321, time.UTC)
+	db := &visibilityDBStub{
+		queryRow: func(sql string, args ...interface{}) pgx.Row {
+			return visibilityRowStub{scan: func(dest ...interface{}) error {
+				maxTS := normalizeQuestTimestamp(want)
+				*dest[0].(**time.Time) = &maxTS
+				return nil
+			}}
+		},
+	}
+
+	if err := waitForQuestCalendarTimestampVisible(context.Background(), New(db), "spot", want); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestWaitForQuestKlineRangeVisibleTimeoutKeepsPending(t *testing.T) {
 	oldTimeout := questReadAfterWriteTimeout
 	oldPoll := questReadAfterWritePollInterval

@@ -14,6 +14,10 @@ var (
 	questReadAfterWritePollInterval = 50 * time.Millisecond
 )
 
+func normalizeQuestTimestamp(ts time.Time) time.Time {
+	return ts.UTC().Truncate(time.Microsecond)
+}
+
 func waitForQuestCondition(ctx context.Context, timeout, interval time.Duration, check func() (bool, error)) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -67,6 +71,7 @@ func waitForQuestExsymbolVisible(ctx context.Context, q *Queries, sid int32) (*E
 }
 
 func waitForQuestExsymbolTimestampVisible(ctx context.Context, q *Queries, sid int32, want time.Time) error {
+	want = normalizeQuestTimestamp(want)
 	ok, err := waitForQuestCondition(ctx, questReadAfterWriteTimeout, questReadAfterWritePollInterval, func() (bool, error) {
 		var maxTS *time.Time
 		if err := q.db.QueryRow(ctx, `SELECT max(ts) FROM exsymbol_q WHERE sid = $1`, sid).Scan(&maxTS); err != nil {
@@ -84,6 +89,7 @@ func waitForQuestExsymbolTimestampVisible(ctx context.Context, q *Queries, sid i
 }
 
 func waitForQuestCalendarTimestampVisible(ctx context.Context, q *Queries, market string, want time.Time) error {
+	want = normalizeQuestTimestamp(want)
 	ok, err := waitForQuestCondition(ctx, questReadAfterWriteTimeout, questReadAfterWritePollInterval, func() (bool, error) {
 		var maxTS *time.Time
 		if err := q.db.QueryRow(ctx, `SELECT max(ts) FROM calendars_q WHERE market = $1`, market).Scan(&maxTS); err != nil {
