@@ -12,11 +12,15 @@ import (
 )
 
 type visibilityDBStub struct {
+	exec     func(sql string, args ...interface{}) (pgconn.CommandTag, error)
 	queryRow func(sql string, args ...interface{}) pgx.Row
 }
 
-func (s *visibilityDBStub) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
-	panic("unexpected Exec call")
+func (s *visibilityDBStub) Exec(_ context.Context, sql string, args ...interface{}) (pgconn.CommandTag, error) {
+	if s.exec == nil {
+		panic("unexpected Exec call")
+	}
+	return s.exec(sql, args...)
 }
 
 func (s *visibilityDBStub) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
@@ -37,6 +41,84 @@ type visibilityRowStub struct {
 
 func (r visibilityRowStub) Scan(dest ...interface{}) error {
 	return r.scan(dest...)
+}
+
+func TestAddSymbolsQuestVisibilityTimeoutKeepsCachedIdentity(t *testing.T) {
+	oldQuest := IsQuestDB
+	oldTimeout := questReadAfterWriteTimeout
+	oldPoll := questReadAfterWritePollInterval
+	oldMaxSID := maxSid
+	oldKey := keySymbolMap
+	oldID := idSymbolMap
+	oldMarket := marketMap
+	IsQuestDB = true
+	questReadAfterWriteTimeout = 5 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	maxSid = 41
+	keySymbolMap = map[string]*ExSymbol{}
+	idSymbolMap = map[int32]*ExSymbol{}
+	marketMap = map[string]int{}
+	defer func() {
+		IsQuestDB = oldQuest
+		questReadAfterWriteTimeout = oldTimeout
+		questReadAfterWritePollInterval = oldPoll
+		maxSid = oldMaxSID
+		keySymbolMap = oldKey
+		idSymbolMap = oldID
+		marketMap = oldMarket
+	}()
+
+	var insertArgs []interface{}
+	db := &visibilityDBStub{
+		exec: func(_ string, args ...interface{}) (pgconn.CommandTag, error) {
+			insertArgs = append([]interface{}{}, args...)
+			return pgconn.NewCommandTag("INSERT 0 1"), nil
+		},
+		queryRow: func(sql string, args ...interface{}) pgx.Row {
+			switch {
+			case strings.Contains(sql, "SELECT max(sid) FROM exsymbol_q"):
+				return visibilityRowStub{scan: func(dest ...interface{}) error {
+					var maxVal *int32
+					*dest[0].(**int32) = maxVal
+					return nil
+				}}
+			case strings.Contains(sql, "LATEST BY sid"):
+				return visibilityRowStub{scan: func(dest ...interface{}) error {
+					return errors.New("not visible yet")
+				}}
+			default:
+				t.Fatalf("unexpected sql: %s", sql)
+				return visibilityRowStub{scan: func(dest ...interface{}) error { return nil }}
+			}
+		},
+	}
+
+	n, err := New(db).AddSymbols(context.Background(), []AddSymbolsParams{{
+		Exchange: "binance",
+		ExgReal:  "binance",
+		Market:   "spot",
+		Symbol:   "BTC/USDT",
+		Combined: true,
+		ListMs:   123,
+		DelistMs: 456,
+	}})
+	if err != nil {
+		t.Fatalf("AddSymbols returned error: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected one inserted row, got %d", n)
+	}
+	if len(insertArgs) != 9 {
+		t.Fatalf("expected full metadata insert args, got %d", len(insertArgs))
+	}
+
+	got := GetExSymbol2("binance", "spot", "BTC/USDT")
+	if got == nil {
+		t.Fatal("expected cached symbol after insert timeout")
+	}
+	if got.ID != 42 || !got.Combined || got.ListMs != 123 || got.DelistMs != 456 {
+		t.Fatalf("cached symbol lost canonical metadata: %+v", got)
+	}
 }
 
 func TestWaitForQuestExsymbolVisiblePollsUntilRowVisible(t *testing.T) {

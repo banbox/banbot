@@ -280,7 +280,7 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 			continue
 		}
 		argList = append(argList, AddSymbolsParams{Exchange: item.Exchange, ExgReal: item.ExgReal,
-			Market: item.Market, Symbol: item.Symbol})
+			Market: item.Market, Symbol: item.Symbol, Combined: item.Combined, ListMs: item.ListMs, DelistMs: item.DelistMs})
 	}
 	_, err_ := pq.AddSymbols(context.Background(), argList)
 	if err_ != nil {

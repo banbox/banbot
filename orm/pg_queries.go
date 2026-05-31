@@ -371,16 +371,16 @@ func (q *Queries) addSymbolsPg(ctx context.Context, arg []AddSymbolsParams) (int
 		return 0, nil
 	}
 	// Sync maxSid from DB before assigning new IDs.
-	if latest := queryMaxSidFromPg(ctx); latest > maxSid {
+	if latest := queryMaxSidFromPg(ctx, q.db); latest > maxSid {
 		maxSid = latest
 	}
 	for i, s := range arg {
 		maxSid++
 		sid := maxSid
 		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol (id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms)
-VALUES ($1, $2, $3, $4, $5, false, 0, 0)
-ON CONFLICT (exchange, market, symbol) DO NOTHING`,
-			sid, s.Exchange, s.ExgReal, s.Market, s.Symbol)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	ON CONFLICT (exchange, market, symbol) DO NOTHING`,
+			sid, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs)
 		if err != nil {
 			return int64(i), err
 		}
@@ -388,9 +388,9 @@ ON CONFLICT (exchange, market, symbol) DO NOTHING`,
 	return int64(len(arg)), nil
 }
 
-func queryMaxSidFromPg(ctx context.Context) int32 {
+func queryMaxSidFromPg(ctx context.Context, db DBTX) int32 {
 	var maxVal *int32
-	row := pool.QueryRow(ctx, `SELECT max(id) FROM exsymbol`)
+	row := db.QueryRow(ctx, `SELECT max(id) FROM exsymbol`)
 	if err := row.Scan(&maxVal); err != nil || maxVal == nil {
 		return 0
 	}

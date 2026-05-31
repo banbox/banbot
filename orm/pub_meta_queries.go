@@ -6,7 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/banbox/banexg/log"
 	"github.com/jackc/pgx/v5"
+	"go.uber.org/zap"
 )
 
 // insKlineLocks is an in-process lock map for active kline insert jobs.
@@ -305,6 +307,9 @@ type AddSymbolsParams struct {
 	ExgReal  string `json:"exg_real"`
 	Market   string `json:"market"`
 	Symbol   string `json:"symbol"`
+	Combined bool   `json:"combined"`
+	ListMs   int64  `json:"list_ms"`
+	DelistMs int64  `json:"delist_ms"`
 }
 
 type SetListMSParams struct {
@@ -377,40 +382,44 @@ func (q *Queries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64
 	if !IsQuestDB {
 		return q.addSymbolsPg(ctx, arg)
 	}
-	if latest := queryMaxSidFromQDB(ctx); latest > maxSid {
+	if latest := queryMaxSidFromQDB(ctx, q.db); latest > maxSid {
 		maxSid = latest
 	}
 	now := time.Now().UTC()
 	lastSID := maxSid
+	var lastSymbol AddSymbolsParams
 	for i, s := range arg {
 		maxSid++
 		sid := maxSid
 		lastSID = sid
+		lastSymbol = s
 		ts := now.Add(time.Duration(i) * time.Microsecond)
 		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, is_deleted)
-VALUES ($1, $2, $3, $4, $5, $6, false, 0, 0, false)`, sid, ts, s.Exchange, s.ExgReal, s.Market, s.Symbol)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`, sid, ts, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs)
 		if err != nil {
 			return int64(i), err
 		}
-		cacheExSymbol(&ExSymbol{
-			ID:       sid,
-			Exchange: s.Exchange,
-			ExgReal:  s.ExgReal,
-			Market:   s.Market,
-			Symbol:   s.Symbol,
-		})
+		cacheExSymbol(makeExSymbolFromAdd(sid, s))
 	}
-	// QuestDB WAL commits are async. EnsureSymbols reloads immediately after
-	// AddSymbols, so wait until the last inserted row is actually visible.
-	if _, err := waitForQuestExsymbolVisible(ctx, q, lastSID); err != nil {
+	// QuestDB WAL commits are async. The caller already has canonical in-process
+	// state from cacheExSymbol, so visibility lag is informational rather than fatal.
+	visible, err := questExsymbolVisible(ctx, q, lastSID)
+	if err != nil {
 		return int64(len(arg)), err
+	}
+	if !visible {
+		log.Warn("questdb exsymbol row still not visible after timeout; continue with cached symbol state",
+			zap.Int32("sid", lastSID),
+			zap.String("exchange", lastSymbol.Exchange),
+			zap.String("market", lastSymbol.Market),
+			zap.String("symbol", lastSymbol.Symbol))
 	}
 	return int64(len(arg)), nil
 }
 
-func queryMaxSidFromQDB(ctx context.Context) int32 {
+func queryMaxSidFromQDB(ctx context.Context, db DBTX) int32 {
 	var maxVal *int32
-	row := pool.QueryRow(ctx, `SELECT max(sid) FROM exsymbol_q`)
+	row := db.QueryRow(ctx, `SELECT max(sid) FROM exsymbol_q`)
 	if err := row.Scan(&maxVal); err != nil || maxVal == nil {
 		return 0
 	}

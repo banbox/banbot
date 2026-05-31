@@ -51,7 +51,12 @@ WHERE sid = $1 AND coalesce(is_deleted, false) = false`, sid)
 	return &item, nil
 }
 
-func waitForQuestExsymbolVisible(ctx context.Context, q *Queries, sid int32) (*ExSymbol, error) {
+func questExsymbolVisible(ctx context.Context, q *Queries, sid int32) (bool, error) {
+	_, visible, err := pollQuestExsymbolVisible(ctx, q, sid)
+	return visible, err
+}
+
+func pollQuestExsymbolVisible(ctx context.Context, q *Queries, sid int32) (*ExSymbol, bool, error) {
 	var item *ExSymbol
 	ok, err := waitForQuestCondition(ctx, questReadAfterWriteTimeout, questReadAfterWritePollInterval, func() (bool, error) {
 		got, err := questExsymbolBySID(ctx, q, sid)
@@ -61,6 +66,14 @@ func waitForQuestExsymbolVisible(ctx context.Context, q *Queries, sid int32) (*E
 		item = got
 		return true, nil
 	})
+	if err != nil {
+		return nil, false, err
+	}
+	return item, ok, nil
+}
+
+func waitForQuestExsymbolVisible(ctx context.Context, q *Queries, sid int32) (*ExSymbol, error) {
+	item, ok, err := pollQuestExsymbolVisible(ctx, q, sid)
 	if err != nil {
 		return nil, err
 	}
