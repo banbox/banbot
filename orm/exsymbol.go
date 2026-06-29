@@ -137,6 +137,19 @@ func GetExSymbol2(exgName, market, symbol string, exgReal ...string) *ExSymbol {
 	return findExSymbol(exgName, market, symbol)
 }
 
+func makeExSymbolFromAdd(id int32, item AddSymbolsParams) *ExSymbol {
+	return &ExSymbol{
+		ID:       id,
+		Exchange: item.Exchange,
+		ExgReal:  item.ExgReal,
+		Market:   item.Market,
+		Symbol:   item.Symbol,
+		Combined: item.Combined,
+		ListMs:   item.ListMs,
+		DelistMs: item.DelistMs,
+	}
+}
+
 func EnsureExgSymbols(exchange banexg.BanExchange) *errs.Error {
 	_, err := LoadMarkets(exchange, false)
 	if err != nil {
