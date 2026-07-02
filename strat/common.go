@@ -678,7 +678,15 @@ func CalcJobPerfs(cfg *config.StratPerfConfig, p *core.PerfSta, perfs []*core.Jo
 	})
 	var maxList = make([]float64, 0, len(groups))
 	for _, gp := range groups {
-		maxList = append(maxList, slices.Max(gp.Items))
+		if len(gp.Items) > 0 {
+			maxList = append(maxList, slices.Max(gp.Items))
+		}
+	}
+	// K-means may yield fewer than 5 non-empty clusters when there are few jobs;
+	// skip updating splits rather than indexing out of range.
+	// 当job较少时K-means可能产生少于5个非空簇，此时跳过更新而不是越界访问
+	if len(maxList) < 4 {
+		return
 	}
 	// Calculate the upper and lower bounds of the rate of return for each group
 	// 计算每组的收益率上下界
