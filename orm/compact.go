@@ -205,9 +205,13 @@ func waitCompactVisibleCount(ctx context.Context, db compactDB, tableName string
 	}
 }
 
+func compactTempTableName(tableName string) string {
+	return fmt.Sprintf("%s_compact_%d_%06d", tableName, time.Now().UnixNano(), rand.Intn(1000000))
+}
+
 func execCompact(ctx context.Context, tableName string, meta *TableCompactMeta, beforeTotal, expectedRows int64) {
 	start := time.Now()
-	tmpTable := tableName + "_new"
+	tmpTable := compactTempTableName(tableName)
 	db := compactDB(pool)
 
 	createSQL := fmt.Sprintf(`CREATE TABLE %s AS (

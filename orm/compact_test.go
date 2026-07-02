@@ -3,6 +3,7 @@ package orm
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,5 +104,21 @@ func TestWaitCompactVisibleCountFailsOnPermanentMismatch(t *testing.T) {
 	_, err := waitCompactVisibleCount(context.Background(), db, "sranges_q_new", 2)
 	if err == nil {
 		t.Fatal("expected timeout error")
+	}
+}
+
+func TestCompactTempTableNameIsUniqueAndNotLegacyNewName(t *testing.T) {
+	const table = "sranges_q"
+	first := compactTempTableName(table)
+	second := compactTempTableName(table)
+
+	if first == table+"_new" || second == table+"_new" {
+		t.Fatalf("compact temp table must not use legacy fixed _new name: %q %q", first, second)
+	}
+	if first == second {
+		t.Fatalf("compact temp table names must be unique: %q", first)
+	}
+	if !strings.HasPrefix(first, table+"_compact_") || !strings.HasPrefix(second, table+"_compact_") {
+		t.Fatalf("compact temp table name prefix mismatch: %q %q", first, second)
 	}
 }
