@@ -43,12 +43,12 @@ func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Err
 	if args.HasData != nil {
 		whereParts = append(whereParts, fmt.Sprintf("has_data = %v", *args.HasData))
 	}
-	whereParts = append(whereParts, "coalesce(is_deleted, false) = false")
 	whereClause := strings.Join(whereParts, " AND ")
 
 	countSQL := fmt.Sprintf(`SELECT count(*) FROM (
-  SELECT sid FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms WHERE %s
-)`, whereClause)
+  SELECT sid, is_deleted FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms WHERE %s
+) WHERE coalesce(is_deleted, false) = false
+`, whereClause)
 	var total int64
 	if err := q.db.QueryRow(ctx, countSQL).Scan(&total); err != nil {
 		return nil, 0, NewDbErr(core.ErrDbReadFail, err)
@@ -59,9 +59,13 @@ func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Err
 		limit = args.Limit
 	}
 	dataSQL := fmt.Sprintf(`SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
-FROM sranges_q
-LATEST BY sid, tbl, timeframe, start_ms
-WHERE %s
+FROM (
+  SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted
+  FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms
+  WHERE %s
+)
+WHERE coalesce(is_deleted, false) = false
 ORDER BY start_ms DESC`, whereClause)
 	if args.Offset > 0 {
 		dataSQL += fmt.Sprintf(" OFFSET %d", args.Offset)
@@ -93,9 +97,13 @@ func (q *Queries) ListSRangesBySid(ctx context.Context, sid int32) ([]*SRange, e
 		ctx = context.Background()
 	}
 	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
-FROM sranges_q
-LATEST BY sid, tbl, timeframe, start_ms
-WHERE sid = $1 AND coalesce(is_deleted, false) = false
+FROM (
+  SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted
+  FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms
+  WHERE sid = $1
+)
+WHERE coalesce(is_deleted, false) = false
 ORDER BY tbl, timeframe, start_ms`, sid)
 	if err != nil {
 		return nil, err

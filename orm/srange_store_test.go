@@ -6,6 +6,9 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type srangeSnapshot struct {
@@ -29,9 +32,13 @@ func cleanSRanges(t *testing.T, sid int32, tbl, tf string) {
 	srangesCacheDel(sid, tbl, tf)
 	ctx := context.Background()
 	rows, err := pool.Query(ctx, `SELECT start_ms, stop_ms, has_data
-FROM sranges_q
-LATEST BY sid, tbl, timeframe, start_ms
-WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND coalesce(is_deleted, false) = false`, sid, tbl, tf)
+FROM (
+  SELECT start_ms, stop_ms, has_data, is_deleted
+  FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms
+  WHERE sid = $1 AND tbl = $2 AND timeframe = $3
+)
+WHERE coalesce(is_deleted, false) = false`, sid, tbl, tf)
 	if err != nil {
 		return
 	}
@@ -91,14 +98,18 @@ func listSnapshots(t *testing.T, sid int32, tbl, tf string) []srangeSnapshot {
 }
 
 func assertNoOverlapAndNoSameStateTouch(t *testing.T, rows []srangeSnapshot) {
+	assertNoOverlapAndNoSameStateTouchAt(t, -1, rows)
+}
+
+func assertNoOverlapAndNoSameStateTouchAt(t *testing.T, step int, rows []srangeSnapshot) {
 	t.Helper()
 	for i := 1; i < len(rows); i++ {
 		prev, cur := rows[i-1], rows[i]
 		if cur.StartMs < prev.StopMs {
-			t.Fatalf("overlap found: prev=%+v cur=%+v", prev, cur)
+			t.Fatalf("overlap found at step=%d: prev=%+v cur=%+v rows=%+v", step, prev, cur, rows)
 		}
 		if cur.StartMs == prev.StopMs && cur.HasData == prev.HasData {
-			t.Fatalf("touching ranges with same has_data should be merged: prev=%+v cur=%+v", prev, cur)
+			t.Fatalf("touching ranges with same has_data should be merged at step=%d: prev=%+v cur=%+v rows=%+v", step, prev, cur, rows)
 		}
 	}
 }
@@ -205,6 +216,126 @@ func TestGetCoveredRangesOnlyHasData(t *testing.T) {
 	}
 }
 
+func TestGetCoveredRangesCacheFalseSpanMasksStaleDB(t *testing.T) {
+	if !IsQuestDB {
+		t.Skip("QuestDB backend is not active, skipping QuestDB cache semantics test")
+	}
+	const (
+		sid = int32(90040)
+		tbl = "kline_1m"
+		tf  = "1m"
+	)
+	srangesCacheUpdate(sid, tbl, tf, []srangeSpan{{StartMs: 100, StopMs: 200, HasData: false}})
+	t.Cleanup(func() { srangesCacheDel(sid, tbl, tf) })
+
+	covSess := &Queries{db: staleCoveredRangeDB{}}
+	covered, err := covSess.getCoveredRanges(context.Background(), sid, tbl, tf, 100, 200)
+	if err != nil {
+		t.Fatalf("getCoveredRanges fail: %v", err)
+	}
+	if len(covered) != 0 {
+		t.Fatalf("expected false cache span to hide stale DB coverage, got %+v", covered)
+	}
+}
+
+func TestGetCoveredRangesCacheTouchingBoundaryDoesNotMaskDB(t *testing.T) {
+	if !IsQuestDB {
+		t.Skip("QuestDB backend is not active, skipping QuestDB cache semantics test")
+	}
+	const (
+		sid = int32(90041)
+		tbl = "kline_1m"
+		tf  = "1m"
+	)
+	srangesCacheUpdate(sid, tbl, tf, []srangeSpan{{StartMs: 100, StopMs: 200, HasData: false}})
+	t.Cleanup(func() { srangesCacheDel(sid, tbl, tf) })
+
+	covSess := &Queries{db: staleCoveredRangeDB{}}
+	covered, err := covSess.getCoveredRanges(context.Background(), sid, tbl, tf, 200, 300)
+	if err != nil {
+		t.Fatalf("getCoveredRanges fail: %v", err)
+	}
+	want := []MSRange{{Start: 200, Stop: 300}}
+	if !reflect.DeepEqual(covered, want) {
+		t.Fatalf("expected touching false cache span not to mask DB coverage\nwant=%+v\ngot =%+v", want, covered)
+	}
+}
+
+func TestLoadSRangesSpansFromDBDoesNotRollbackCache(t *testing.T) {
+	if !IsQuestDB {
+		t.Skip("QuestDB backend is not active, skipping QuestDB cache semantics test")
+	}
+	const (
+		sid = int32(90042)
+		tbl = "kline_1m"
+		tf  = "1m"
+	)
+	wantCache := []srangeSpan{{StartMs: 100, StopMs: 200, HasData: false}}
+	srangesCacheUpdate(sid, tbl, tf, wantCache)
+	t.Cleanup(func() { srangesCacheDel(sid, tbl, tf) })
+
+	covSess := &Queries{db: staleCoveredRangeDB{}}
+	if _, err := covSess.loadSRangesSpansFromDB(context.Background(), sid, tbl, tf, 200, 300); err != nil {
+		t.Fatalf("loadSRangesSpansFromDB fail: %v", err)
+	}
+	got, ok := srangesCacheGetSpans(sid, tbl, tf)
+	if !ok || !reflect.DeepEqual(got, wantCache) {
+		t.Fatalf("expected DB-only load to leave cache intact\nwant=%+v\ngot =%+v ok=%v", wantCache, got, ok)
+	}
+}
+
+type staleCoveredRangeDB struct{}
+
+func (staleCoveredRangeDB) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+
+func (staleCoveredRangeDB) Query(_ context.Context, _ string, args ...interface{}) (pgx.Rows, error) {
+	return &staleCoveredRows{
+		idx:     -1,
+		startMS: args[3].(int64),
+		stopMS:  args[4].(int64),
+	}, nil
+}
+
+func (staleCoveredRangeDB) QueryRow(context.Context, string, ...interface{}) pgx.Row {
+	return staleCoveredRow{}
+}
+
+func (staleCoveredRangeDB) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
+	return 0, nil
+}
+
+type staleCoveredRow struct{}
+
+func (staleCoveredRow) Scan(...interface{}) error { return nil }
+
+type staleCoveredRows struct {
+	idx     int
+	startMS int64
+	stopMS  int64
+}
+
+func (r *staleCoveredRows) Close()                                       {}
+func (r *staleCoveredRows) Err() error                                   { return nil }
+func (r *staleCoveredRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *staleCoveredRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *staleCoveredRows) RawValues() [][]byte                          { return nil }
+func (r *staleCoveredRows) Conn() *pgx.Conn                              { return nil }
+func (r *staleCoveredRows) Values() ([]any, error)                       { return []any{r.startMS, r.stopMS, true}, nil }
+
+func (r *staleCoveredRows) Next() bool {
+	r.idx++
+	return r.idx == 0
+}
+
+func (r *staleCoveredRows) Scan(dest ...any) error {
+	*(dest[0].(*int64)) = r.startMS
+	*(dest[1].(*int64)) = r.stopMS
+	*(dest[2].(*bool)) = true
+	return nil
+}
+
 func TestUpdateSRangesRandomInvariant(t *testing.T) {
 	ensureQDBPool(t)
 	const (
@@ -222,7 +353,7 @@ func TestUpdateSRangesRandomInvariant(t *testing.T) {
 		mustUpdateRange(t, sid, tbl, tf, start, stop, hasData)
 
 		rows := listSnapshots(t, sid, tbl, tf)
-		assertNoOverlapAndNoSameStateTouch(t, rows)
+		assertNoOverlapAndNoSameStateTouchAt(t, i, rows)
 		for _, r := range rows {
 			if r.StartMs >= r.StopMs {
 				t.Fatalf("invalid range found: %+v", r)

@@ -30,6 +30,27 @@ type SeriesInfo struct {
 	Binding   SeriesBinding
 }
 
+func SeriesTableName(name, timeFrame string) string {
+	if timeFrame == "" {
+		return name
+	}
+	return fmt.Sprintf("%s_%s", name, timeFrame)
+}
+
+func NewSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo {
+	return &SeriesInfo{
+		Name:      name,
+		TimeFrame: timeFrame,
+		Binding: SeriesBinding{
+			Table:      SeriesTableName(name, timeFrame),
+			TimeColumn: "ts",
+			EndColumn:  "end_ms",
+			SIDColumn:  "sid",
+			Fields:     fields,
+		},
+	}
+}
+
 type DataRecord struct {
 	Sid    int32
 	TimeMS int64

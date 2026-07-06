@@ -33,10 +33,40 @@ type SeriesRepo interface {
     EnsureSeriesTable(ctx context.Context, info *SeriesInfo) *errs.Error
     InsertSeriesBatch(ctx context.Context, info *SeriesInfo, rows []*DataRecord) *errs.Error
     QuerySeriesRange(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64, limit int) ([]*DataRecord, *errs.Error)
+    DeleteSeriesRange(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64) *errs.Error
     UpdateSeriesRange(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64) *errs.Error
+    UpdateSeriesCoverage(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64, rows []*DataRecord) *errs.Error
     GetSeriesRange(ctx context.Context, info *SeriesInfo, sid int32) (int64, int64, *errs.Error)
 }
 ```
+
+业务代码优先使用更高层的 `orm.SeriesStore`：
+
+```go
+store := orm.DefaultSeriesStore()
+target, err := orm.EnsureExSymbol("custom", "funding", "BTCUSDT", "binance")
+info := orm.NewSeriesInfo("funding_rate", "1h", []orm.SeriesField{
+    {Name: "rate", Type: "float", Role: "value"},
+})
+
+_ = store.Write(ctx, info, target, &orm.DataRecord{
+    TimeMS: ts,
+    EndMS:  ts + 3600_000,
+    Values: map[string]any{"rate": 0.0001},
+})
+rows, _ := store.Read(ctx, info, target, startMS, endMS, 500)
+_ = store.Delete(ctx, info, target, startMS, endMS)
+```
+
+`SeriesStore` 统一处理：
+
+- 单条写入：`Write`
+- 批量写入：`WriteBatch`
+- 读取并转成运行时事件：`Read`
+- 删除：`Delete`
+- 覆盖范围查询：`Coverage`
+- `Sid=0` 行自动补成目标 `ExSymbol.ID`
+- 写入后通过 `SeriesRepo.UpdateSeriesCoverage(...)` 更新覆盖范围
 
 ### 2.3 `ExSymbol` / source 身份只由 `exchange + market + symbol` 确定
 
@@ -51,6 +81,14 @@ type SeriesRepo interface {
 因此当前规则是：
 
 > 一个 source / ExSymbol 由 `exchange + market + symbol` 唯一确定；`exg_real` 只是附带元数据，不再是身份维度。
+
+自定义/抽象标的通过 `orm.EnsureExSymbol(exchange, market, symbol, exgReal...)` 创建或复用：
+
+```go
+macroTarget, err := orm.EnsureExSymbol("custom", "macro", "CPI_US", "fred")
+```
+
+它和交易所交易对共用同一个 `ExSymbol`/sid 注册表，因此资金费率、持仓、宏观指标、用户自定义指标都可以挂到统一 sid 上。
 
 ### 2.4 `SeriesBinding.SIDColumn` 可留空，默认 `sid`
 
@@ -135,6 +173,7 @@ type SeriesInfo struct {
 - `TimeFrame`：该 source 的基础周期
 - `Binding`：表名、时间列、sid 列、字段列定义
 - `Fields`：声明列名、类型、语义角色
+- `orm.NewSeriesInfo(name, timeframe, fields)` 会按 `name + "_" + timeframe` 生成默认表名，例如 `funding_rate_1h`，并默认使用 `ts` / `end_ms` / `sid`
 
 当前支持的字段类型：
 
@@ -272,6 +311,8 @@ type DataSub struct {
 
 这意味着自定义时序和内置 OHLCV 走同一套覆盖范围管理。
 
+覆盖范围更新已经归入 `SeriesRepo.UpdateSeriesCoverage(...)`，调用者不再需要在写入后直接拼装 `sranges` 更新逻辑。
+
 ### 4.5 运行时管理：`SeriesRuntime` / `SeriesPlan`
 
 回测和实盘启动时不再各自拼装自定义数据补齐逻辑，而是统一由 `data.SeriesRuntime` 管理：
@@ -301,8 +342,28 @@ type DataSub struct {
 
 - TimescaleDB 中 `json` 会落 `JSONB`
 - QuestDB 中 `json` 第一阶段按字符串保存
-- QuestDB 建表使用 `timestamp(...) PARTITION BY MONTH WAL DEDUP UPSERT KEYS(sid, time)`
+- QuestDB 建表使用 `timestamp(...) ... WAL DEDUP UPSERT KEYS(sid, time)`；分区粒度按 timeframe 选择（如 `1m` 用 `WEEK`，`1h` / `1d` 用 `YEAR`，其他默认 `MONTH`）
 - PostgreSQL/TimescaleDB 使用 `(sid, time)` 主键 upsert
+
+### 4.7 QuestDB 删除语义：先 `sranges`，超过阈值再物理整理
+
+QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删除都立即重写表。
+
+当前规则必须保持为混合删除：
+
+1. 删除请求先写入 `sranges`，把目标 `(sid, table, timeframe, start, stop)` 范围标记为 `has_data=false`。
+2. 读取路径必须按 `sranges` 覆盖范围过滤，因此旧 WAL 行即使还留在物理表里，也不会再作为有效数据返回。
+3. 当本次删除命中的物理行数占该 sid 在该表总物理行数的比例达到阈值时，才触发物理整理。
+4. 物理整理通过创建新表并复制仍然有效的数据来回收空间；新表行数验证通过后，才进行表替换。
+
+当前阈值是 `50%`（`seriesQuestRewriteDeleteRatio = 0.5`）。
+
+重点约束：
+
+- 不要把 QuestDB 自定义时序删除改成始终只依赖 `sranges` 的逻辑删除。
+- 不要在低删除比例时频繁创建新表、复制数据、替换表。
+- 不要在新表未验证之前删除或替换旧表。
+- `sranges` 是删除语义的第一来源；物理整理只是达到阈值后的空间回收手段。
 
 ---
 

@@ -90,11 +90,13 @@ type stubDataSink struct{}
 type stubSeriesRepo struct {
 	ensureTableCalls int
 	insertCalls      int
+	deleteCalls      int
 	updateCalls      int
 	queryRows        []*orm.DataRecord
 	ensureTableErr   *errs.Error
 	insertErr        *errs.Error
 	queryErr         *errs.Error
+	deleteErr        *errs.Error
 	updateErr        *errs.Error
 }
 
@@ -115,7 +117,17 @@ func (s *stubSeriesRepo) QuerySeriesRange(ctx context.Context, info *orm.SeriesI
 	return append([]*orm.DataRecord(nil), s.queryRows...), nil
 }
 
+func (s *stubSeriesRepo) DeleteSeriesRange(ctx context.Context, info *orm.SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
+	s.deleteCalls++
+	return s.deleteErr
+}
+
 func (s *stubSeriesRepo) UpdateSeriesRange(ctx context.Context, info *orm.SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
+	s.updateCalls++
+	return s.updateErr
+}
+
+func (s *stubSeriesRepo) UpdateSeriesCoverage(ctx context.Context, info *orm.SeriesInfo, sid int32, startMS, endMS int64, rows []*orm.DataRecord) *errs.Error {
 	s.updateCalls++
 	return s.updateErr
 }
@@ -552,8 +564,9 @@ func TestEnsureThirdPartySeriesRangePropagatesFetchFailure(t *testing.T) {
 	if !strings.Contains(msg, "source="+src.info.Name) || !strings.Contains(msg, "sid=77") || !strings.Contains(msg, "tf=1d") || !strings.Contains(msg, "phase=ensure") || !strings.Contains(msg, "fetch timeout") {
 		t.Fatalf("expected startup-visible fetch failure, got %q", msg)
 	}
-	if repo.ensureTableCalls != 1 {
-		t.Fatalf("expected ensure path to reach table setup before fetch, got %d calls", repo.ensureTableCalls)
+	if repo.ensureTableCalls != 0 || repo.insertCalls != 0 || repo.updateCalls != 0 {
+		t.Fatalf("expected fetch failure before store writes, got ensure=%d insert=%d update=%d",
+			repo.ensureTableCalls, repo.insertCalls, repo.updateCalls)
 	}
 }
 
@@ -594,7 +607,8 @@ func TestEnsureThirdPartySeriesRangePropagatesRepoFailure(t *testing.T) {
 		}},
 		Symbol: &orm.ExSymbol{ID: 99, Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"},
 	}}
-	repo := &stubSeriesRepo{ensureTableErr: errs.NewMsg(core.ErrDbExecFail, "repo boom")}
+	src.rows = []*orm.DataRecord{{TimeMS: 100, EndMS: 200, Values: map[string]any{"value": 1.0}}}
+	repo := &stubSeriesRepo{insertErr: errs.NewMsg(core.ErrDbExecFail, "repo boom")}
 
 	_, err := EnsureThirdPartySeriesRange(context.Background(), repo, jobs, 100, 200)
 	if err == nil {

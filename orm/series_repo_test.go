@@ -116,7 +116,76 @@ func runSeriesRepoRoundTrip(t *testing.T, backend string) {
 	} else if start != rows[0].TimeMS || stop != rows[len(rows)-1].EndMS {
 		t.Fatalf("unexpected series range: start=%d stop=%d", start, stop)
 	}
+	if err := repo.DeleteSeriesRange(ctx, info, sid, rows[0].TimeMS, rows[0].EndMS); err != nil {
+		t.Fatalf("DeleteSeriesRange failed: %v", err)
+	}
+	got, err = repo.QuerySeriesRange(ctx, info, sid, rows[0].TimeMS, rows[len(rows)-1].EndMS, 10)
+	if err != nil {
+		t.Fatalf("QuerySeriesRange after delete failed: %v", err)
+	}
+	if len(got) != 1 || got[0].TimeMS != rows[1].TimeMS {
+		t.Fatalf("expected only second row after delete, got %+v", got)
+	}
+	if backend == "quest" {
+		assertQuestSeriesPhysicalRows(t, info, sid, 1)
+	}
 	cleanupSeriesRepoTestTable(t, info)
+}
+
+func TestSeriesRepoQuestDBDeleteHidesMiddleHole(t *testing.T) {
+	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.yml"))
+	repo := DefaultSeriesRepo()
+	tableName := fmt.Sprintf("series_repo_quest_hole_%d", time.Now().UnixNano())
+	info := &SeriesInfo{
+		Name:      "macro_test",
+		TimeFrame: "1d",
+		Binding: SeriesBinding{
+			Table:      tableName,
+			TimeColumn: "ts",
+			EndColumn:  "end_ms",
+			SIDColumn:  "sid",
+			Fields: []SeriesField{
+				{Name: "value", Type: "float", Role: "value"},
+			},
+		},
+	}
+	ctx := context.Background()
+	if err := repo.EnsureSeriesTable(ctx, info); err != nil {
+		t.Fatalf("EnsureSeriesTable failed: %v", err)
+	}
+	defer cleanupSeriesRepoTestTable(t, info)
+
+	sid := int32(time.Now().UnixNano() % 1_000_000)
+	startMS := int64(1_700_000_000_000)
+	dayMS := int64(86_400_000)
+	rows := make([]*DataRecord, 0, 3)
+	for i := 0; i < 3; i++ {
+		ts := startMS + int64(i)*dayMS
+		rows = append(rows, &DataRecord{
+			Sid:    sid,
+			TimeMS: ts,
+			EndMS:  ts + dayMS,
+			Closed: true,
+			Values: map[string]any{"value": float64(i)},
+		})
+	}
+	if err := repo.InsertSeriesBatch(ctx, info, rows); err != nil {
+		t.Fatalf("InsertSeriesBatch failed: %v", err)
+	}
+	if err := repo.UpdateSeriesRange(ctx, info, sid, rows[0].TimeMS, rows[len(rows)-1].EndMS); err != nil {
+		t.Fatalf("UpdateSeriesRange failed: %v", err)
+	}
+	if err := repo.DeleteSeriesRange(ctx, info, sid, rows[1].TimeMS, rows[1].EndMS); err != nil {
+		t.Fatalf("DeleteSeriesRange failed: %v", err)
+	}
+	got, err := repo.QuerySeriesRange(ctx, info, sid, rows[0].TimeMS, rows[len(rows)-1].EndMS, 10)
+	if err != nil {
+		t.Fatalf("QuerySeriesRange after middle delete failed: %v", err)
+	}
+	if len(got) != 2 || got[0].TimeMS != rows[0].TimeMS || got[1].TimeMS != rows[2].TimeMS {
+		t.Fatalf("expected first and third rows after middle delete, got %+v", got)
+	}
+	assertQuestSeriesPhysicalRows(t, info, sid, 3)
 }
 
 func initSeriesRepoTestApp(t *testing.T, cfgPath string) {
@@ -161,6 +230,25 @@ func cleanupSeriesRepoTestTable(t *testing.T, info *SeriesInfo) {
 		if _, err_ := q.db.Exec(ctx, `DELETE FROM sranges WHERE tbl = $1 AND timeframe = $2`, info.Binding.Table, info.TimeFrame); err_ != nil {
 			t.Fatalf("cleanup sranges failed: %v", err_)
 		}
+	}
+}
+
+func assertQuestSeriesPhysicalRows(t *testing.T, info *SeriesInfo, sid int32, want int64) {
+	t.Helper()
+	ctx := context.Background()
+	q, conn, err := Conn(ctx)
+	if err != nil {
+		t.Fatalf("Conn failed during physical row assertion: %v", err)
+	}
+	defer conn.Release()
+	binding := normalizedSeriesBinding(info.Binding)
+	var got int64
+	sqlText := fmt.Sprintf("SELECT count(*) FROM %s WHERE %s = $1", quoteIdent(binding.Table), quoteIdent(binding.SIDColumn))
+	if err := q.db.QueryRow(ctx, sqlText, sid).Scan(&got); err != nil {
+		t.Fatalf("count physical rows failed: %v", err)
+	}
+	if got != want {
+		t.Fatalf("expected %d physical rows, got %d", want, got)
 	}
 }
 

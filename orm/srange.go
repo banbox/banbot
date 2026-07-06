@@ -62,6 +62,28 @@ func srangesCacheUpdate(sid int32, tbl, tf string, segs []srangeSpan) {
 	srangesCacheLock.Unlock()
 }
 
+func keepSRangeSpanOutsideWindow(s srangeSpan, startMs, stopMs int64) []srangeSpan {
+	if s.StopMs <= startMs || s.StartMs >= stopMs {
+		return []srangeSpan{s}
+	}
+	out := make([]srangeSpan, 0, 2)
+	if s.StartMs < startMs {
+		left := s
+		left.StopMs = startMs
+		if left.StopMs > left.StartMs {
+			out = append(out, left)
+		}
+	}
+	if s.StopMs > stopMs {
+		right := s
+		right.StartMs = stopMs
+		if right.StopMs > right.StartMs {
+			out = append(out, right)
+		}
+	}
+	return out
+}
+
 // srangesCacheDel removes the cache entry for a key (used when sranges are deleted).
 func srangesCacheDel(sid int32, tbl, tf string) {
 	key := srangesCacheKey{sid: sid, tbl: tbl, timeframe: tf}
@@ -136,31 +158,47 @@ func subtractMSRanges(target MSRange, covered []MSRange) []MSRange {
 }
 
 func filterSRangesSpans(spans []srangeSpan, startMs, stopMs int64) []srangeSpan {
+	out, _ := filterSRangesSpansWithOverlap(spans, startMs, stopMs)
+	return out
+}
+
+func filterSRangesSpansWithOverlap(spans []srangeSpan, startMs, stopMs int64) ([]srangeSpan, bool) {
 	if len(spans) == 0 {
-		return nil
+		return nil, false
 	}
 	out := make([]srangeSpan, 0, len(spans))
+	hasOverlap := false
 	for _, s := range spans {
 		if s.StopMs <= s.StartMs {
 			continue
 		}
-		if s.StopMs < startMs || s.StartMs > stopMs {
+		if s.StopMs <= startMs || s.StartMs >= stopMs {
 			continue
 		}
+		hasOverlap = true
 		out = append(out, s)
 	}
-	return out
+	return out, hasOverlap
 }
 
 func (q *Queries) loadSRangesSpans(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]srangeSpan, error) {
 	if cached, ok := srangesCacheGetSpans(sid, table, timeframe); ok {
-		return filterSRangesSpans(cached, startMs, stopMs), nil
+		if filtered, hasOverlap := filterSRangesSpansWithOverlap(cached, startMs, stopMs); hasOverlap {
+			return normalizeSRangeSpans(filtered), nil
+		}
 	}
+	return q.loadSRangesSpansFromDB(ctx, sid, table, timeframe, startMs, stopMs)
+}
+
+func (q *Queries) loadSRangesSpansFromDB(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]srangeSpan, error) {
 	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
-FROM sranges_q
-LATEST BY sid, tbl, timeframe, start_ms
-WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <= $5
-  AND coalesce(is_deleted, false) = false
+FROM (
+  SELECT start_ms, stop_ms, has_data, is_deleted
+  FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms
+  WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms > $4 AND start_ms < $5
+)
+WHERE coalesce(is_deleted, false) = false
 ORDER BY start_ms, stop_ms`,
 		sid, table, timeframe, startMs, stopMs,
 	)
@@ -178,7 +216,50 @@ ORDER BY start_ms, stop_ms`,
 			spans = append(spans, s)
 		}
 	}
-	return spans, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return normalizeSRangeSpans(filterSRangesSpans(spans, startMs, stopMs)), nil
+}
+
+func normalizeSRangeSpans(spans []srangeSpan) []srangeSpan {
+	if len(spans) < 2 {
+		return spans
+	}
+	points := make([]int64, 0, len(spans)*2)
+	for _, s := range spans {
+		if s.StopMs > s.StartMs {
+			points = append(points, s.StartMs, s.StopMs)
+		}
+	}
+	sort.Slice(points, func(i, j int) bool { return points[i] < points[j] })
+	points = deduplicateInt64(points)
+	out := make([]srangeSpan, 0, len(points))
+	for i := 0; i+1 < len(points); i++ {
+		a, b := points[i], points[i+1]
+		if b <= a {
+			continue
+		}
+		var chosen *srangeSpan
+		for j := range spans {
+			s := &spans[j]
+			if s.StartMs <= a && s.StopMs >= b {
+				if chosen == nil || s.StartMs > chosen.StartMs {
+					chosen = s
+				}
+			}
+		}
+		if chosen == nil {
+			continue
+		}
+		cur := srangeSpan{StartMs: a, StopMs: b, HasData: chosen.HasData}
+		if len(out) > 0 && out[len(out)-1].HasData == cur.HasData && out[len(out)-1].StopMs == cur.StartMs {
+			out[len(out)-1].StopMs = cur.StopMs
+			continue
+		}
+		out = append(out, cur)
+	}
+	return out
 }
 
 func (q *Queries) ListSRanges(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]*SRange, error) {
@@ -226,35 +307,32 @@ func (q *Queries) getCoveredRanges(ctx context.Context, sid int32, table, timefr
 	}
 	covered := make([]MSRange, 0, len(rows))
 	for _, r := range rows {
-		if !r.HasData {
-			continue
-		}
-		if r.StopMs > r.StartMs {
+		if r.HasData && r.StopMs > r.StartMs {
 			covered = append(covered, MSRange{Start: r.StartMs, Stop: r.StopMs})
 		}
 	}
 	merged := mergeMSRanges(covered)
 
-	// WAL delay guard: if DB returned nothing for this (sid, tbl, tf) window but
-	// the in-process cache has data (written in the same process run), use the
-	// cache to avoid spurious re-downloads caused by QuestDB WAL commit lag.
-	if len(merged) == 0 {
-		cached := srangesCacheGet(sid, table, timeframe)
-		if len(cached) > 0 {
-			// Filter to the requested window
-			var inWindow []MSRange
-			for _, r := range cached {
-				if r.Stop <= startMs || r.Start >= stopMs {
-					continue
-				}
+	// WAL delay guard: in-process cache is synchronously updated by UpdateSRanges.
+	// Prefer it when present so same-process reads after QuestDB WAL writes do not
+	// see stale DB coverage, including freshly deleted holes.
+	if cachedSpans, ok := srangesCacheGetSpans(sid, table, timeframe); ok {
+		var inWindow []MSRange
+		hasOverlap := false
+		for _, r := range cachedSpans {
+			if r.StopMs <= startMs || r.StartMs >= stopMs {
+				continue
+			}
+			hasOverlap = true
+			if r.HasData {
 				inWindow = append(inWindow, MSRange{
-					Start: max(r.Start, startMs),
-					Stop:  min(r.Stop, stopMs),
+					Start: max(r.StartMs, startMs),
+					Stop:  min(r.StopMs, stopMs),
 				})
 			}
-			if len(inWindow) > 0 {
-				return mergeMSRanges(inWindow), nil
-			}
+		}
+		if hasOverlap {
+			return mergeMSRanges(inWindow), nil
 		}
 	}
 	return merged, nil
@@ -372,9 +450,7 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 		if entry != nil {
 			kept := entry.spans[:0]
 			for _, s := range entry.spans {
-				if s.StopMs < startMs || s.StartMs > stopMs {
-					kept = append(kept, s)
-				}
+				kept = append(kept, keepSRangeSpanOutsideWindow(s, startMs, stopMs)...)
 			}
 			if len(kept) == 0 {
 				delete(srangesCache, key)
@@ -398,9 +474,7 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 	if entry != nil {
 		newSpans = make([]srangeSpan, 0, len(entry.spans)+len(newSpansFromWant))
 		for _, s := range entry.spans {
-			if s.StopMs < startMs || s.StartMs > stopMs {
-				newSpans = append(newSpans, s)
-			}
+			newSpans = append(newSpans, keepSRangeSpanOutsideWindow(s, startMs, stopMs)...)
 		}
 	} else {
 		newSpans = make([]srangeSpan, 0, len(newSpansFromWant))
@@ -509,8 +583,21 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 	}
 
 	if len(segs) == 0 {
-		// All spans deleted, nothing new – clear the cache for this key.
-		srangesCacheDel(sid, table, timeframe)
+		key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
+		srangesCacheLock.Lock()
+		entry := srangesCache[key]
+		if entry != nil {
+			kept := entry.spans[:0]
+			for _, s := range entry.spans {
+				kept = append(kept, keepSRangeSpanOutsideWindow(s, startMs, stopMs)...)
+			}
+			if len(kept) == 0 {
+				delete(srangesCache, key)
+			} else {
+				srangesCache[key] = &srangesCacheEntry{spans: kept}
+			}
+		}
+		srangesCacheLock.Unlock()
 		return nil
 	}
 
@@ -532,9 +619,7 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 	if entry != nil {
 		newSpans = make([]srangeSpan, 0, len(entry.spans)+len(segSpans))
 		for _, s := range entry.spans {
-			if s.StopMs < startMs || s.StartMs > stopMs {
-				newSpans = append(newSpans, s)
-			}
+			newSpans = append(newSpans, keepSRangeSpanOutsideWindow(s, startMs, stopMs)...)
 		}
 	} else {
 		newSpans = make([]srangeSpan, 0, len(segSpans))

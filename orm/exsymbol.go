@@ -137,6 +137,36 @@ func GetExSymbol2(exgName, market, symbol string, exgReal ...string) *ExSymbol {
 	return findExSymbol(exgName, market, symbol)
 }
 
+func EnsureExSymbol(exchange, market, symbol string, exgReal ...string) (*ExSymbol, error) {
+	if exchange == "" {
+		return nil, fmt.Errorf("exchange is required")
+	}
+	if market == "" {
+		return nil, fmt.Errorf("market is required")
+	}
+	if symbol == "" {
+		return nil, fmt.Errorf("symbol is required")
+	}
+	if item := GetExSymbol2(exchange, market, symbol, exgReal...); item != nil {
+		return item, nil
+	}
+	exs := &ExSymbol{
+		Exchange: exchange,
+		Market:   market,
+		Symbol:   symbol,
+	}
+	if len(exgReal) > 0 {
+		exs.ExgReal = exgReal[0]
+	}
+	if err := EnsureSymbols([]*ExSymbol{exs}, exchange); err != nil {
+		return nil, err
+	}
+	if item := GetExSymbol2(exchange, market, symbol, exgReal...); item != nil {
+		return item, nil
+	}
+	return nil, fmt.Errorf("ensure exsymbol failed for %s:%s:%s", exchange, market, symbol)
+}
+
 func makeExSymbolFromAdd(id int32, item AddSymbolsParams) *ExSymbol {
 	return &ExSymbol{
 		ID:       id,

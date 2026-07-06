@@ -547,56 +547,21 @@ func EnsureSeriesRangeWithRepo(ctx context.Context, repo orm.SeriesRepo, src Dat
 	if err != nil || len(missing) == 0 {
 		return err
 	}
-	if err := repo.EnsureSeriesTable(ctx, info); err != nil {
-		return err
-	}
+	store := orm.NewSeriesStore(repo)
 	for _, gap := range missing {
 		rows, err_ := src.FetchHistory(ctx, sub, gap.Start, gap.Stop)
 		if err_ != nil {
 			return errs.New(core.ErrRunTime, err_)
 		}
-		rows, err = normalizeSeriesRows(sub.ExSymbol.ID, rows)
-		if err != nil {
-			return err
-		}
 		if len(rows) > 0 {
-			if err = repo.InsertSeriesBatch(ctx, info, rows); err != nil {
+			if err = store.WriteBatch(ctx, info, sub.ExSymbol, rows); err != nil {
 				return err
 			}
+			continue
 		}
-		if err = orm.UpdateSeriesCoverage(ctx, info, sub.ExSymbol.ID, gap.Start, gap.Stop, rows); err != nil {
+		if err = store.UpdateCoverage(ctx, info, sub.ExSymbol, gap.Start, gap.Stop, rows); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func normalizeSeriesRows(sid int32, rows []*orm.DataRecord) ([]*orm.DataRecord, *errs.Error) {
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	items := make([]*orm.DataRecord, 0, len(rows))
-	for _, row := range rows {
-		if row == nil {
-			continue
-		}
-		cp := *row
-		if cp.Sid == 0 {
-			cp.Sid = sid
-		}
-		if cp.Sid != sid {
-			return nil, errs.NewMsg(core.ErrBadConfig, "series row sid %d does not match target sid %d", cp.Sid, sid)
-		}
-		if cp.EndMS <= cp.TimeMS {
-			return nil, errs.NewMsg(core.ErrBadConfig, "series row end_ms must be greater than time_ms")
-		}
-		items = append(items, &cp)
-	}
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].TimeMS == items[j].TimeMS {
-			return items[i].EndMS < items[j].EndMS
-		}
-		return items[i].TimeMS < items[j].TimeMS
-	})
-	return items, nil
 }
