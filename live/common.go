@@ -32,7 +32,7 @@ var (
 	lastRefreshMS   = int64(0)
 )
 
-func CronRefreshPairs(dp data.IProvider) {
+func CronRefreshPairs(dp data.IProvider, afterRefresh ...func() error) {
 	if config.PairMgr.Cron != "" {
 		_, err_ := com.Cron().AddFunc(config.PairMgr.Cron, func() {
 			curMS := btime.TimeMS()
@@ -43,6 +43,12 @@ func CronRefreshPairs(dp data.IProvider) {
 			err := opt.RefreshPairJobs(dp, true, false, nil)
 			if err != nil {
 				log.Error("RefreshPairJobs fail", zap.Error(err))
+				return
+			}
+			if len(afterRefresh) > 0 && afterRefresh[0] != nil {
+				if err := afterRefresh[0](); err != nil {
+					log.Error("RefreshPairJobs post-refresh fail", zap.Error(err))
+				}
 			}
 		})
 		if err_ != nil {

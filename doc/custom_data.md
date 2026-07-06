@@ -272,7 +272,20 @@ type DataSub struct {
 
 这意味着自定义时序和内置 OHLCV 走同一套覆盖范围管理。
 
-### 4.5 TimescaleDB / QuestDB 的字段映射
+### 4.5 运行时管理：`SeriesRuntime` / `SeriesPlan`
+
+回测和实盘启动时不再各自拼装自定义数据补齐逻辑，而是统一由 `data.SeriesRuntime` 管理：
+
+- `NewSeriesPlan(...)` 从已加载的 `StratJob` 收集非 `kline` 的 `DataSub`
+- 按 `(source, sid, timeframe)` 去重
+- 重复订阅保留最大的 `WarmupNum`
+- 根据最大预热需求计算统一 `StartMS`
+- 回测调用 `SeriesRuntime.Ensure(...)`，只补齐历史
+- 实盘调用 `SeriesRuntime.SyncLive(...)`，先补历史，再通过 `ActivateDataSources(...)` 激活实时源
+
+实盘定时刷新交易对后会重新生成计划并补齐新增订阅；`SeriesRuntime` 会记住已激活的 `(source, sid, timeframe)`，避免重复订阅。旧的 `ThirdPartySeriesBootstrap` 名称保留为 `SeriesPlan` 的兼容 alias。
+
+### 4.6 TimescaleDB / QuestDB 的字段映射
 
 当前 `SeriesRepo` 两端统一支持：
 
@@ -480,11 +493,14 @@ func init() {
 
 每次继续扩展 custom data 时，至少按下面顺序回归：
 
-1. `go test ./orm ./data ./biz ./strat`
-2. 针对 TimescaleDB / QuestDB 分别执行 series round-trip 与 coverage 测试
-3. 进入 `../banstrats` 完成策略编译
-4. 用同一组配置分别跑基线回测与改造后回测
-5. 对比订单、资金曲线、报表摘要是否一致
+1. 在 `banstrats` 仓库根目录执行 `bash scripts/verify_third_party_regression.sh`
+2. 如需单独查看某一层失败，再按脚本打印出的原始 `go test` 命令逐层重跑
+3. 针对 TimescaleDB / QuestDB 的真实 round-trip，只在需要数据库验证时单独执行对应测试
+4. 进入 `../banstrats` 完成策略编译
+5. 用同一组配置分别跑基线回测与改造后回测
+6. 对比订单、资金曲线、报表摘要是否一致
+
+这份脚本是当前第三方时序接入回归的**规范入口**：默认只跑 hermetic proof layers，不依赖 `BANBOT_TEST_DATA_SERVER`、`BANBOT_TEST_STRAT_RUN` 或外部实时网络。脚本会在每一层开始前打印层名和完整命令，并在首个失败处停止，便于直接定位是示例注册/抓取/策略行为、框架启动激活链路，还是 legacy OHLCV/DataHub 兼容语义发生了回归。
 
 ### 8.3 回归目标
 
@@ -500,12 +516,11 @@ func init() {
 
 ## 9. 最终规范
 
-1. **统一数据模型使用 `DataSeries`，不是 `DataSeries`。**
-2. **统一仓储名称使用 `SeriesRepo`，不是 `SeriesRepo`。**
+1. **统一数据模型使用 `DataSeries`，不是 `Kline` / `InfoKline`。**
+2. **统一仓储名称使用 `SeriesRepo`。**
 3. **source / ExSymbol 身份只认 `exchange + market + symbol`。**
 4. **`exg_real` 仅保留为元信息，不参与 sid 身份判定。**
 5. **`SeriesBinding.SIDColumn` 可为空，默认 `sid`。**
 6. **内部通用数据链路一律使用 `DataSeries` / `DataRecord` / `SeriesInfo` / `SeriesBinding`。**
 7. **旧 Kline 接口只保留在 `TradeStrat` / `StratJob` 的兼容层，不再作为新功能设计基准。**
 8. **所有新接入的第三方时序数据都应先注册 source，再通过 `DataSub + ExSymbol.sid` 接入统一主链路。**
-

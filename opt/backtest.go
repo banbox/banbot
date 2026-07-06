@@ -1,9 +1,11 @@
 package opt
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/banbox/banbot/biz"
@@ -35,10 +37,12 @@ type BackTestLite struct {
 
 type BackTest struct {
 	*BackTestLite
-	lastDumpMs  int64 // The last time the backtest status was saved 上一次保存回测状态的时间
-	PBar        *utils.StagedPrg
-	nextRefresh int64 // The time of the next refresh of the trading pair 下一次刷新交易对的时间
-	schedule    cron.Schedule
+	lastDumpMs    int64 // The last time the backtest status was saved 上一次保存回测状态的时间
+	PBar          *utils.StagedPrg
+	nextRefresh   int64 // The time of the next refresh of the trading pair 下一次刷新交易对的时间
+	schedule      cron.Schedule
+	seriesRuntime *data.SeriesRuntime
+	loopMainFn    func() *errs.Error
 }
 
 /*
@@ -212,7 +216,81 @@ func (b *BackTest) Init() *errs.Error {
 	b.PBar.SetProgress("listMs", 1)
 	// 交易对初始化
 	err = RefreshPairJobs(b.dp, !b.isOpt, true, b.PBar)
-	return err
+	if err != nil {
+		return err
+	}
+	_, err = b.syncThirdPartySeriesRange()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b *BackTest) syncThirdPartySeriesRange() (*data.SeriesPlan, *errs.Error) {
+	plan, err := backtestBootstrapPlan(collectBacktestJobs(), config.TimeRange)
+	if err != nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "%v", err)
+	}
+	if err := b.thirdPartyRuntime().Ensure(backtestSeriesContext(), plan); err != nil {
+		return plan, errs.New(core.ErrRunTime, err)
+	}
+	return plan, nil
+}
+
+func (b *BackTest) ensureThirdPartySeriesRange() (*data.SeriesPlan, *errs.Error) {
+	return b.syncThirdPartySeriesRange()
+}
+
+func (b *BackTest) thirdPartyRuntime() *data.SeriesRuntime {
+	if b.seriesRuntime == nil {
+		b.seriesRuntime = data.NewSeriesRuntime(nil)
+	}
+	return b.seriesRuntime
+}
+
+func backtestSeriesContext() context.Context {
+	if core.Ctx != nil {
+		return core.Ctx
+	}
+	return context.Background()
+}
+
+func collectBacktestJobs() []*strat.StratJob {
+	jobsByEnv := strat.GetJobs(config.DefAcc)
+	seen := make(map[*strat.StratJob]bool)
+	var jobs []*strat.StratJob
+	envKeys := make([]string, 0, len(jobsByEnv))
+	for envKey := range jobsByEnv {
+		envKeys = append(envKeys, envKey)
+	}
+	sort.Strings(envKeys)
+	for _, envKey := range envKeys {
+		stgMap := jobsByEnv[envKey]
+		stgNames := make([]string, 0, len(stgMap))
+		for stgName := range stgMap {
+			stgNames = append(stgNames, stgName)
+		}
+		sort.Strings(stgNames)
+		for _, stgName := range stgNames {
+			job := stgMap[stgName]
+			if job == nil || seen[job] {
+				continue
+			}
+			seen[job] = true
+			jobs = append(jobs, job)
+		}
+	}
+	return jobs
+}
+
+func backtestBootstrapPlan(jobs []*strat.StratJob, tr *config.TimeTuple) (*data.SeriesPlan, error) {
+	if tr == nil {
+		return nil, fmt.Errorf("bootstrap collect phase=collect: time range is required")
+	}
+	if tr.StartMS >= tr.EndMS {
+		return nil, fmt.Errorf("bootstrap collect phase=collect: invalid time range")
+	}
+	return data.NewSeriesPlan(jobs, tr.StartMS, tr.EndMS)
 }
 
 func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
@@ -239,6 +317,9 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 		if err != nil {
 			log.Error("RefreshPairJobs", zap.String("date", dateStr), zap.Error(err))
 		} else {
+			if _, err := b.syncThirdPartySeriesRange(); err != nil {
+				log.Error("ensure third-party series after pair refresh", zap.String("date", dateStr), zap.Error(err))
+			}
 			log.Info("refreshed pairs at", zap.String("date", dateStr))
 		}
 		b.dp.SetDirty()
@@ -261,7 +342,11 @@ func (b *BackTest) Run() {
 		com.Cron().Start()
 	}
 	btStart := btime.UTCTime()
-	err = b.dp.LoopMain()
+	loopMainFn := b.loopMainFn
+	if loopMainFn == nil {
+		loopMainFn = b.dp.LoopMain
+	}
+	err = loopMainFn()
 	if !b.isOpt {
 		com.Cron().Stop()
 	}

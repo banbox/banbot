@@ -1,7 +1,12 @@
 package data
 
 import (
+	"context"
 	"fmt"
+	"maps"
+	"sync"
+	"time"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/core"
@@ -15,9 +20,6 @@ import (
 	"github.com/banbox/bntp"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
-	"maps"
-	"sync"
-	"time"
 )
 
 var (
@@ -150,7 +152,7 @@ type Miner struct {
 	IsWatchPrice bool
 	IsLoopKline  bool
 	klineStates  map[string]*KLineState
-	klineLasts   map[string]int64 //ws订阅k线的上次时间戳
+	klineLasts   map[string]int64 // ws订阅k线的上次时间戳
 	lockBarState deadlock.Mutex
 	lockBarLasts deadlock.Mutex
 }
@@ -235,6 +237,85 @@ func (s *PairSubs) KeyMap() map[string]bool {
 type LiveSpider struct {
 	*utils.ServerIO
 	miners map[string]*Miner
+}
+
+type SpiderStartupHook func(ctx context.Context, spider *LiveSpider) error
+
+type SpiderOption func(*spiderOptions)
+
+type spiderOptions struct {
+	ctx          context.Context
+	startupHooks []SpiderStartupHook
+}
+
+func WithSpiderStartupHook(hook SpiderStartupHook) SpiderOption {
+	return func(opts *spiderOptions) {
+		if hook != nil {
+			opts.startupHooks = append(opts.startupHooks, hook)
+		}
+	}
+}
+
+type spiderRuntimeDeps struct {
+	newServer    func(addr, aesKey string) *utils.ServerIO
+	startWriteQ  func(workNum int)
+	ormConn      func(ctx context.Context) (spiderQueries, spiderConnRelease, *errs.Error)
+	runForever   func(spider *LiveSpider) *errs.Error
+	startMonitor func(spider *LiveSpider)
+	startCron    func()
+}
+
+type spiderQueries interface {
+	PurgeKlineUn() *errs.Error
+}
+
+type spiderConnRelease interface {
+	Release()
+}
+
+var defaultSpiderRuntimeDeps = spiderRuntimeDeps{
+	newServer: utils.NewBanServer,
+	startWriteQ: func(workNum int) {
+		go consumeSeriesWriteQ(workNum)
+	},
+	ormConn: func(ctx context.Context) (spiderQueries, spiderConnRelease, *errs.Error) {
+		sess, conn, err := orm.Conn(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return sess, conn, nil
+	},
+	runForever: func(spider *LiveSpider) *errs.Error {
+		return spider.RunForever(0, 0)
+	},
+	startMonitor: func(spider *LiveSpider) {
+		go spider.monitorSubscriptions()
+	},
+	startCron: func() {
+		com.Cron().Start()
+	},
+}
+
+func (d spiderRuntimeDeps) withDefaults() spiderRuntimeDeps {
+	if d.newServer == nil {
+		d.newServer = defaultSpiderRuntimeDeps.newServer
+	}
+	if d.startWriteQ == nil {
+		d.startWriteQ = defaultSpiderRuntimeDeps.startWriteQ
+	}
+	if d.ormConn == nil {
+		d.ormConn = defaultSpiderRuntimeDeps.ormConn
+	}
+	if d.runForever == nil {
+		d.runForever = defaultSpiderRuntimeDeps.runForever
+	}
+	if d.startMonitor == nil {
+		d.startMonitor = defaultSpiderRuntimeDeps.startMonitor
+	}
+	if d.startCron == nil {
+		d.startCron = defaultSpiderRuntimeDeps.startCron
+	}
+	return d
 }
 
 // monitorSubscriptions periodically checks all miners for failed subscriptions and restarts them
@@ -787,29 +868,80 @@ func (m *Miner) startLoopKLines() {
 	})
 }
 
-func RunSpider(addr string) *errs.Error {
-	server := utils.NewBanServer(addr, "")
+func RunSpider(addr string, opts ...SpiderOption) *errs.Error {
+	return runSpiderWithDeps(addr, defaultSpiderRuntimeDeps, opts...)
+}
+
+func runSpiderWithDeps(addr string, deps spiderRuntimeDeps, opts ...SpiderOption) *errs.Error {
+	cfg := newSpiderOptions(opts...)
+	ctx := cfg.ctx
+	if ctx == nil {
+		ctx = spiderContext()
+	}
+	deps = deps.withDefaults()
+	server := deps.newServer(addr, "")
+	if server == nil {
+		return errs.NewMsg(core.ErrRunTime, "spider server is nil")
+	}
 	Spider = &LiveSpider{
 		ServerIO: server,
 		miners:   map[string]*Miner{},
 	}
 	server.InitConn = makeInitConn(Spider)
-	go consumeSeriesWriteQ(5)
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
+	if err := purgeSpiderKlineUn(ctx, deps); err != nil {
 		return err
 	}
-	err = sess.PurgeKlineUn()
-	conn.Release()
-	if err != nil {
+	if err := runSpiderStartupHooks(ctx, Spider, cfg.startupHooks); err != nil {
 		return err
 	}
 
-	// Start the subscription monitor goroutine
-	go Spider.monitorSubscriptions()
+	deps.startWriteQ(5)
+	deps.startMonitor(Spider)
+	deps.startCron()
+	return deps.runForever(Spider)
+}
 
-	com.Cron().Start()
-	return Spider.RunForever(0, 0)
+func purgeSpiderKlineUn(ctx context.Context, deps spiderRuntimeDeps) *errs.Error {
+	sess, conn, err := deps.ormConn(ctx)
+	if err != nil {
+		return err
+	}
+	if conn != nil {
+		defer conn.Release()
+	}
+	if sess == nil {
+		return errs.NewMsg(core.ErrRunTime, "spider orm session is nil")
+	}
+	return sess.PurgeKlineUn()
+}
+
+func newSpiderOptions(opts ...SpiderOption) spiderOptions {
+	cfg := spiderOptions{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	return cfg
+}
+
+func spiderContext() context.Context {
+	if core.Ctx != nil {
+		return core.Ctx
+	}
+	return context.Background()
+}
+
+func runSpiderStartupHooks(ctx context.Context, spider *LiveSpider, hooks []SpiderStartupHook) *errs.Error {
+	for i, hook := range hooks {
+		if hook == nil {
+			continue
+		}
+		if err := hook(ctx, spider); err != nil {
+			return errs.New(core.ErrRunTime, fmt.Errorf("spider startup hook %d: %w", i+1, err))
+		}
+	}
+	return nil
 }
 
 func (s *LiveSpider) getMiner(exgName, market string) *Miner {
@@ -835,7 +967,7 @@ func (s *LiveSpider) getMiner(exgName, market string) *Miner {
 func makeInitConn(s *LiveSpider) func(*utils.BanConn) {
 	return func(c *utils.BanConn) {
 		handlePairs := func(data []byte, name string) (*Miner, []string) {
-			var arr = make([]string, 0, 8)
+			arr := make([]string, 0, 8)
 			err := utils2.Unmarshal(data, &arr, utils2.JsonNumDefault)
 			if err != nil {
 				log.Warn("receive invalid pairs", zap.String("n", name),

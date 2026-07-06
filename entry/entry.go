@@ -4,6 +4,9 @@ import (
 	_ "embed"
 	"flag"
 	"fmt"
+	"os"
+	"path/filepath"
+
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -18,8 +21,6 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
-	"os"
-	"path/filepath"
 )
 
 func RunBackTest(args *config.CmdArgs) *errs.Error {
@@ -83,6 +84,10 @@ func runBackTest(outDir string, prgOut string) (string, *errs.Error) {
 }
 
 func RunTrade(args *config.CmdArgs) *errs.Error {
+	return RunTradeWith(args, nil)
+}
+
+func RunTradeWith(args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *errs.Error {
 	core.SetRunMode(core.RunModeLive)
 	err := biz.SetupComsExg(args)
 	if err != nil {
@@ -98,7 +103,7 @@ func RunTrade(args *config.CmdArgs) *errs.Error {
 	}
 	core.BotRunning = true
 	core.StartAt = btime.UTCStamp()
-	t := live.NewCryptoTrader()
+	t := live.NewCryptoTraderWith(startup)
 	return t.Run()
 }
 
@@ -184,6 +189,10 @@ func RunVerifyData(args *config.CmdArgs) *errs.Error {
 }
 
 func RunSpider(args *config.CmdArgs) *errs.Error {
+	return RunSpiderWith(args, nil)
+}
+
+func RunSpiderWith(args *config.CmdArgs, startup data.SpiderStartupHook) *errs.Error {
 	core.SetRunMode(core.RunModeLive)
 	if args.Logfile == "" {
 		args.Logfile = filepath.Join(config.GetLogsDir(), "spider.log")
@@ -192,7 +201,7 @@ func RunSpider(args *config.CmdArgs) *errs.Error {
 	if err != nil {
 		return err
 	}
-	return data.RunSpider(config.SpiderAddr)
+	return data.RunSpider(config.SpiderAddr, data.WithSpiderStartupHook(startup))
 }
 
 func LoadKLinesToDB(args *config.CmdArgs) *errs.Error {
@@ -207,7 +216,7 @@ func LoadKLinesToDB(args *config.CmdArgs) *errs.Error {
 	if err != nil {
 		return err
 	}
-	var dirPath = names[0]
+	dirPath := names[0]
 	names = names[1:]
 	totalNum := len(names) * core.StepTotal
 	pBar := utils.NewPrgBar(totalNum, "load1m")

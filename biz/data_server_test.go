@@ -11,11 +11,15 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"io"
+	"os"
 	"testing"
 	"time"
 )
 
 func TestDataServer(t *testing.T) {
+	if os.Getenv("BANBOT_TEST_DATA_SERVER") == "" {
+		t.Skip("set BANBOT_TEST_DATA_SERVER=1 to run external gRPC data server integration test")
+	}
 	const maxMsgSize = 100 * 1024 * 1024
 	addr := "127.0.0.1:6789"
 	creds := grpc.WithTransportCredentials(insecure.NewCredentials())

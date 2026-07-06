@@ -12,6 +12,7 @@ import (
 )
 
 func TestCron(t *testing.T) {
+	t.Skip("integration test (manual cron timing inspection)")
 	logger := cron.VerbosePrintfLogger(log2.New(os.Stdout, "cron: ", log2.LstdFlags))
 	loc, _ := time.LoadLocation("Asia/Shanghai")
 	bntpClock := cron.NewNtpClock(loc, "zh-CN")

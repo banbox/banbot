@@ -1,7 +1,9 @@
 package live
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,11 +29,24 @@ import (
 
 type CryptoTrader struct {
 	biz.Trader
-	dp *data.LiveProvider
+	dp            *data.LiveProvider
+	startup       CryptoTraderStartupFunc
+	initFn        func() *errs.Error
+	startJobsFn   func()
+	loopMainFn    func() *errs.Error
+	seriesRuntime *data.SeriesRuntime
+	nowMSFn       func() int64
+	collectJobsFn func() []*strat.StratJob
 }
+
+type CryptoTraderStartupFunc func(ctx context.Context, trader *CryptoTrader) error
 
 func NewCryptoTrader() *CryptoTrader {
 	return &CryptoTrader{}
+}
+
+func NewCryptoTraderWith(startup CryptoTraderStartupFunc) *CryptoTrader {
+	return &CryptoTrader{startup: startup}
 }
 
 func (t *CryptoTrader) Init() *errs.Error {
@@ -120,12 +135,98 @@ func (t *CryptoTrader) initOdMgr() *errs.Error {
 }
 
 func (t *CryptoTrader) Run() *errs.Error {
-	err := t.Init()
+	return t.runWithDeps()
+}
+
+func (t *CryptoTrader) bootstrapThirdPartySources(ctx context.Context) error {
+	_, err := t.thirdPartyRuntime().SyncLive(ctx, t.runtimeJobs(), t.currentTimeMS())
+	return err
+}
+
+func (t *CryptoTrader) runtimeJobs() []*strat.StratJob {
+	if t.collectJobsFn != nil {
+		return t.collectJobsFn()
+	}
+	seen := make(map[*strat.StratJob]bool)
+	var jobs []*strat.StratJob
+	strat.LockJobsRead()
+	defer strat.UnlockJobsRead()
+	accounts := make([]string, 0, len(strat.AccJobs))
+	for acc := range strat.AccJobs {
+		accounts = append(accounts, acc)
+	}
+	sort.Strings(accounts)
+	for _, acc := range accounts {
+		jobMap := strat.AccJobs[acc]
+		envKeys := make([]string, 0, len(jobMap))
+		for envKey := range jobMap {
+			envKeys = append(envKeys, envKey)
+		}
+		sort.Strings(envKeys)
+		for _, envKey := range envKeys {
+			stgMap := jobMap[envKey]
+			stgNames := make([]string, 0, len(stgMap))
+			for stgName := range stgMap {
+				stgNames = append(stgNames, stgName)
+			}
+			sort.Strings(stgNames)
+			for _, stgName := range stgNames {
+				job := stgMap[stgName]
+				if job == nil || seen[job] {
+					continue
+				}
+				seen[job] = true
+				jobs = append(jobs, job)
+			}
+		}
+	}
+	return jobs
+}
+
+func (t *CryptoTrader) currentTimeMS() int64 {
+	if t.nowMSFn != nil {
+		return t.nowMSFn()
+	}
+	return btime.TimeMS()
+}
+
+func (t *CryptoTrader) thirdPartyRuntime() *data.SeriesRuntime {
+	if t.seriesRuntime == nil {
+		t.seriesRuntime = data.NewSeriesRuntime(t)
+	}
+	if t.seriesRuntime.Sink == nil {
+		t.seriesRuntime.Sink = t
+	}
+	return t.seriesRuntime
+}
+
+func (t *CryptoTrader) runWithDeps() *errs.Error {
+	initFn := t.initFn
+	if initFn == nil {
+		initFn = t.Init
+	}
+	err := initFn()
 	if err != nil {
 		return err
 	}
-	t.startJobs()
-	err = t.dp.LoopMain()
+	if t.startup != nil {
+		if errRun := t.startup(context.Background(), t); errRun != nil {
+			return errs.New(core.ErrRunTime, errRun)
+		}
+	}
+	if errRun := t.bootstrapThirdPartySources(context.Background()); errRun != nil {
+		return errs.New(core.ErrRunTime, errRun)
+	}
+	startJobsFn := t.startJobsFn
+	if startJobsFn == nil {
+		startJobsFn = t.startJobs
+	}
+	startJobsFn()
+	loopMainFn := t.loopMainFn
+	if loopMainFn == nil {
+		loopMainFn = t.dp.LoopMain
+	}
+	err = loopMainFn()
 	if err != nil {
 		return err
 	}
@@ -142,29 +243,113 @@ func (t *CryptoTrader) FeedDataSeries(evt *orm.DataSeries) {
 		return
 	}
 	if view.IsWarmUp {
-		tfMSecs := int64(utils.TFToSecs(view.TimeFrame) * 1000)
-		barEndMS := view.Time + tfMSecs
-		if barEndMS > strat.LastBatchMS {
-			// Enter the next timeframe and trigger the batch entry callback
-			// 进入下一个时间帧，触发批量入场回调
-			execMS := barEndMS + core.DelayBatchMS + 1
-			waitNum := biz.TryFireBatches(execMS, view.IsWarmUp)
-			if waitNum > 0 {
-				log.Warn(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
-			}
-			strat.LastBatchMS = barEndMS
-		}
+		t.handleWarmupSeries(view)
 	} else {
-		delayExecBatch()
-		envKey := strings.Join([]string{view.Symbol(), view.TimeFrame}, "_")
-		if bar := view.Bar(); bar != nil {
-			orm.AddDumpRow(orm.DumpKline, envKey, *bar)
-		}
+		t.handleLiveSeries(view)
 	}
 	if errRun := t.Trader.FeedDataSeries(evt); errRun != nil {
 		log.Error("handle data series fail", zap.String("pair", view.Symbol()), zap.Error(errRun))
 		return
 	}
+}
+
+func (t *CryptoTrader) Emit(sub *strat.DataSub, rows []*orm.DataRecord) error {
+	if t == nil {
+		return fmt.Errorf("crypto trader is required")
+	}
+	if t.dp == nil {
+		return fmt.Errorf("live provider is required")
+	}
+	if sub == nil {
+		return fmt.Errorf("data sub is required")
+	}
+	if sub.ExSymbol == nil || sub.ExSymbol.ID <= 0 {
+		return fmt.Errorf("data sub exsymbol is required")
+	}
+	if sub.TimeFrame == "" {
+		return fmt.Errorf("data sub timeframe is required")
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	msg := &data.SeriesMsg{
+		ExgName: core.ExgName,
+		Market:  core.Market,
+		Pair:    sub.ExSymbol.Symbol,
+		NotifySeries: data.NotifySeries{
+			TFSecs:   utils.TFToSecs(sub.TimeFrame),
+			Interval: utils.TFToSecs(sub.TimeFrame),
+		},
+	}
+	seriesRows := make([]*orm.DataSeries, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		evt := &orm.DataSeries{
+			Source:    orm.NormalizeSeriesSource(sub.Source),
+			Sid:       sub.ExSymbol.ID,
+			TimeMS:    row.TimeMS,
+			EndMS:     row.EndMS,
+			TimeFrame: sub.TimeFrame,
+			Closed:    row.Closed,
+			Values:    cloneSeriesValues(row.Values),
+			ExSymbol:  sub.ExSymbol,
+		}
+		seriesRows = append(seriesRows, evt)
+	}
+	if len(seriesRows) == 0 {
+		return nil
+	}
+	for _, evt := range seriesRows {
+		t.FeedDataSeries(evt)
+	}
+	if t.dp.OnDataSeries != nil {
+		if err := t.dp.OnDataSeries(msg, seriesRows); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *CryptoTrader) handleWarmupSeries(view *orm.SeriesOHLCV) {
+	if view == nil {
+		return
+	}
+	tfMSecs := int64(utils.TFToSecs(view.TimeFrame) * 1000)
+	barEndMS := view.Time + tfMSecs
+	if barEndMS > strat.LastBatchMS {
+		// Enter the next timeframe and trigger the batch entry callback
+		// 进入下一个时间帧，触发批量入场回调
+		execMS := barEndMS + core.DelayBatchMS + 1
+		waitNum := biz.TryFireBatches(execMS, view.IsWarmUp)
+		if waitNum > 0 {
+			log.Warn(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
+		}
+		strat.LastBatchMS = barEndMS
+	}
+}
+
+func (t *CryptoTrader) handleLiveSeries(view *orm.SeriesOHLCV) {
+	if view == nil {
+		return
+	}
+	delayExecBatch()
+	envKey := strings.Join([]string{view.Symbol(), view.TimeFrame}, "_")
+	if bar := view.Bar(); bar != nil {
+		orm.AddDumpRow(orm.DumpKline, envKey, *bar)
+	}
+}
+
+func cloneSeriesValues(values map[string]any) map[string]any {
+	if len(values) == 0 {
+		return nil
+	}
+	cp := make(map[string]any, len(values))
+	for key, val := range values {
+		cp[key] = val
+	}
+	return cp
 }
 
 func delayExecBatch() {
@@ -193,7 +378,9 @@ func (t *CryptoTrader) startJobs() {
 	t.markUnWarm()
 	// Refresh trading pairs regularly
 	// 定期刷新交易对
-	CronRefreshPairs(t.dp)
+	CronRefreshPairs(t.dp, func() error {
+		return t.bootstrapThirdPartySources(context.Background())
+	})
 	// 定时加载1h及以上周期K线
 	FetchHourKlines(t.dp)
 	// Refresh the market regularly

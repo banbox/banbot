@@ -49,3 +49,34 @@ func TestEnsureSymbolsReusesIdentityAcrossExgReal(t *testing.T) {
 		t.Fatalf("failed to load symbol back from cache: %+v", got)
 	}
 }
+
+func TestEnsureExSymbolMatchesEnsureSymbolsIdentity(t *testing.T) {
+	if err := initApp(); err != nil {
+		t.Fatalf("initApp failed: %v", err)
+	}
+	exchange := fmt.Sprintf("macro_cross_seam_%d", time.Now().UnixNano())
+
+	ensured, err := EnsureExSymbol(exchange, "macro", "PMI_CN", "fred")
+	if err != nil {
+		t.Fatalf("EnsureExSymbol failed: %v", err)
+	}
+	if ensured == nil || ensured.ID == 0 {
+		t.Fatalf("expected EnsureExSymbol to materialize a canonical sid, got %+v", ensured)
+	}
+
+	manual := &ExSymbol{Exchange: exchange, Market: "macro", Symbol: "PMI_CN", ExgReal: "wind"}
+	if err := EnsureSymbols([]*ExSymbol{manual}); err != nil {
+		t.Fatalf("EnsureSymbols failed: %v", err)
+	}
+	if manual.ID == 0 {
+		t.Fatalf("expected EnsureSymbols to populate sid, got %+v", manual)
+	}
+	if manual.ID != ensured.ID {
+		t.Fatalf("expected helper and manual ensure paths to converge on the same sid, helper=%+v manual=%+v", ensured, manual)
+	}
+
+	cached := GetExSymbol2(exchange, "macro", "PMI_CN", "ignored")
+	if cached == nil || cached.ID != ensured.ID {
+		t.Fatalf("expected canonical cache lookup to return the shared sid, got %+v", cached)
+	}
+}
