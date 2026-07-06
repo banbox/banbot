@@ -14,8 +14,13 @@ type stubStoreRepo struct {
 	queryCalls    int
 	deleteCalls   int
 	coverageCalls int
+	missingCalls  int
 	inserted      []*DataRecord
 	queryRows     []*DataRecord
+	missing       []MSRange
+	coverageRows  []*DataRecord
+	coverageStart int64
+	coverageEnd   int64
 }
 
 func (s *stubStoreRepo) EnsureSeriesTable(ctx context.Context, info *SeriesInfo) *errs.Error {
@@ -39,6 +44,11 @@ func (s *stubStoreRepo) DeleteSeriesRange(ctx context.Context, info *SeriesInfo,
 	return nil
 }
 
+func (s *stubStoreRepo) MissingSeriesRanges(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64) ([]MSRange, *errs.Error) {
+	s.missingCalls++
+	return append([]MSRange(nil), s.missing...), nil
+}
+
 func (s *stubStoreRepo) UpdateSeriesRange(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
 	s.coverageCalls++
 	return nil
@@ -46,6 +56,9 @@ func (s *stubStoreRepo) UpdateSeriesRange(ctx context.Context, info *SeriesInfo,
 
 func (s *stubStoreRepo) UpdateSeriesCoverage(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64, rows []*DataRecord) *errs.Error {
 	s.coverageCalls++
+	s.coverageStart = startMS
+	s.coverageEnd = endMS
+	s.coverageRows = append([]*DataRecord(nil), rows...)
 	return nil
 }
 
@@ -118,6 +131,27 @@ func TestSeriesStoreReadConvertsRecordsToEvents(t *testing.T) {
 	}
 }
 
+func TestSeriesStoreWriteSeriesBatchNormalizesEvents(t *testing.T) {
+	repo := &stubStoreRepo{}
+	store := NewSeriesStore(repo)
+	info := testSeriesInfo("funding_rate")
+	target := &ExSymbol{ID: 9, Exchange: "custom", Market: "funding", Symbol: "BTCUSDT"}
+	rows := []*DataSeries{
+		{Source: info.Name, TimeMS: 60_000, EndMS: 120_000, TimeFrame: info.TimeFrame, Values: map[string]any{"value": 0.2}},
+		{Source: info.Name, TimeMS: 0, EndMS: 60_000, TimeFrame: info.TimeFrame, Values: map[string]any{"value": 0.1}},
+	}
+
+	if err := store.WriteSeriesBatch(context.Background(), info, target, rows); err != nil {
+		t.Fatalf("WriteSeriesBatch failed: %v", err)
+	}
+	if repo.insertCalls != 1 || repo.coverageCalls != 1 {
+		t.Fatalf("expected one insert and coverage update, got insert=%d coverage=%d", repo.insertCalls, repo.coverageCalls)
+	}
+	if len(repo.inserted) != 2 || repo.inserted[0].Sid != target.ID || repo.inserted[0].TimeMS != 0 {
+		t.Fatalf("expected events converted to sorted target records, got %+v", repo.inserted)
+	}
+}
+
 func TestSeriesStoreDeleteUsesRepositoryContract(t *testing.T) {
 	repo := &stubStoreRepo{}
 	store := NewSeriesStore(repo)
@@ -143,6 +177,73 @@ func TestSeriesStoreUpdateCoverageUsesRepositoryContract(t *testing.T) {
 	}
 	if repo.coverageCalls != 1 {
 		t.Fatalf("expected repository coverage call, got %d", repo.coverageCalls)
+	}
+}
+
+func TestSeriesStoreFillMissingFetchesOnlyRepositoryGaps(t *testing.T) {
+	repo := &stubStoreRepo{missing: []MSRange{
+		{Start: 100, Stop: 200},
+		{Start: 300, Stop: 400},
+	}}
+	store := NewSeriesStore(repo)
+	info := testSeriesInfo("macro")
+	target := &ExSymbol{ID: 4, Exchange: "custom", Market: "macro", Symbol: "CPI_US"}
+	var fetched []MSRange
+
+	err := store.FillMissing(context.Background(), info, target, 0, 500,
+		func(ctx context.Context, got *ExSymbol, startMS, endMS int64) ([]*DataRecord, error) {
+			if got != target {
+				t.Fatalf("expected target exsymbol to be passed through")
+			}
+			fetched = append(fetched, MSRange{Start: startMS, Stop: endMS})
+			return []*DataRecord{{TimeMS: startMS, EndMS: endMS, Values: map[string]any{"value": 1.0}}}, nil
+		})
+	if err != nil {
+		t.Fatalf("FillMissing failed: %v", err)
+	}
+	if repo.missingCalls != 1 || repo.insertCalls != 2 || repo.coverageCalls != 2 {
+		t.Fatalf("expected missing once plus write per gap, got missing=%d insert=%d coverage=%d",
+			repo.missingCalls, repo.insertCalls, repo.coverageCalls)
+	}
+	if len(fetched) != 2 || fetched[0].Start != 100 || fetched[1].Start != 300 {
+		t.Fatalf("unexpected fetched gaps: %+v", fetched)
+	}
+}
+
+func TestSeriesStoreFillMissingMarksEmptyFetchAsCoverageHole(t *testing.T) {
+	repo := &stubStoreRepo{missing: []MSRange{{Start: 100, Stop: 200}}}
+	store := NewSeriesStore(repo)
+	info := testSeriesInfo("macro")
+	target := &ExSymbol{ID: 4, Exchange: "custom", Market: "macro", Symbol: "CPI_US"}
+
+	err := store.FillMissing(context.Background(), info, target, 0, 500,
+		func(ctx context.Context, got *ExSymbol, startMS, endMS int64) ([]*DataRecord, error) {
+			return nil, nil
+		})
+	if err != nil {
+		t.Fatalf("FillMissing failed: %v", err)
+	}
+	if repo.insertCalls != 0 {
+		t.Fatalf("expected empty fetch to skip insert, got %d insert calls", repo.insertCalls)
+	}
+	if repo.coverageCalls != 1 || repo.coverageStart != 100 || repo.coverageEnd != 200 || len(repo.coverageRows) != 0 {
+		t.Fatalf("expected empty fetch to mark gap as coverage hole, got calls=%d start=%d end=%d rows=%+v",
+			repo.coverageCalls, repo.coverageStart, repo.coverageEnd, repo.coverageRows)
+	}
+}
+
+type seriesRepoOnly struct {
+	SeriesRepo
+}
+
+func TestSeriesStoreMissingRejectsRepoWithoutRangeSupport(t *testing.T) {
+	store := NewSeriesStore(seriesRepoOnly{SeriesRepo: &stubStoreRepo{}})
+	info := testSeriesInfo("macro")
+	target := &ExSymbol{ID: 4, Exchange: "custom", Market: "macro", Symbol: "CPI_US"}
+
+	_, err := store.Missing(context.Background(), info, target, 0, 500)
+	if err == nil || !strings.Contains(err.Short(), "does not support missing range queries") {
+		t.Fatalf("expected unsupported range repository error, got %v", err)
 	}
 }
 

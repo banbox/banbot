@@ -206,7 +206,7 @@ func (p *SeriesPlan) Ensure(ctx context.Context, repo orm.SeriesRepo) *errs.Erro
 	if p == nil {
 		return nil
 	}
-	return EnsureThirdPartySeriesSubsRange(ctx, repo, p.Subs, p.StartMS, p.EndMS)
+	return EnsureSeriesSubsRange(ctx, repo, p.Subs, p.StartMS, p.EndMS)
 }
 
 func (p *SeriesPlan) Activate(ctx context.Context, sink DataSink) ([]*strat.DataSub, error) {
@@ -371,6 +371,10 @@ func mergeDataSub(seen map[string]*strat.DataSub, sub *strat.DataSub) {
 }
 
 func EnsureThirdPartySeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {
+	return EnsureRuntimeSeriesRange(ctx, repo, jobs, startMS, endMS)
+}
+
+func EnsureRuntimeSeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {
 	if startMS >= endMS {
 		return nil, nil
 	}
@@ -378,13 +382,17 @@ func EnsureThirdPartySeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs 
 	if err != nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "%v", err)
 	}
-	if err := EnsureThirdPartySeriesSubsRange(ctx, repo, subs, startMS, endMS); err != nil {
+	if err := EnsureSeriesSubsRange(ctx, repo, subs, startMS, endMS); err != nil {
 		return nil, err
 	}
 	return subs, nil
 }
 
 func EnsureThirdPartySeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*strat.DataSub, startMS, endMS int64) *errs.Error {
+	return EnsureSeriesSubsRange(ctx, repo, subs, startMS, endMS)
+}
+
+func EnsureSeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*strat.DataSub, startMS, endMS int64) *errs.Error {
 	if startMS >= endMS {
 		return nil
 	}
@@ -543,25 +551,9 @@ func EnsureSeriesRangeWithRepo(ctx context.Context, repo orm.SeriesRepo, src Dat
 	if sub.Source != "" && sub.Source != info.Name {
 		return errs.NewMsg(core.ErrBadConfig, "sub source %s does not match data source %s", sub.Source, info.Name)
 	}
-	missing, err := orm.MissingSeriesRanges(ctx, info, sub.ExSymbol.ID, startMS, endMS)
-	if err != nil || len(missing) == 0 {
-		return err
-	}
 	store := orm.NewSeriesStore(repo)
-	for _, gap := range missing {
-		rows, err_ := src.FetchHistory(ctx, sub, gap.Start, gap.Stop)
-		if err_ != nil {
-			return errs.New(core.ErrRunTime, err_)
-		}
-		if len(rows) > 0 {
-			if err = store.WriteBatch(ctx, info, sub.ExSymbol, rows); err != nil {
-				return err
-			}
-			continue
-		}
-		if err = store.UpdateCoverage(ctx, info, sub.ExSymbol, gap.Start, gap.Stop, rows); err != nil {
-			return err
-		}
-	}
-	return nil
+	return store.FillMissing(ctx, info, sub.ExSymbol, startMS, endMS,
+		func(ctx context.Context, _ *orm.ExSymbol, gapStartMS, gapEndMS int64) ([]*orm.DataRecord, error) {
+			return src.FetchHistory(ctx, sub, gapStartMS, gapEndMS)
+		})
 }

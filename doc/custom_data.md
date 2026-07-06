@@ -54,7 +54,15 @@ _ = store.Write(ctx, info, target, &orm.DataRecord{
     EndMS:  ts + 3600_000,
     Values: map[string]any{"rate": 0.0001},
 })
+_ = store.WriteSeries(ctx, info, target, &orm.DataSeries{
+    Source:    info.Name,
+    TimeMS:    ts,
+    EndMS:     ts + 3600_000,
+    TimeFrame: info.TimeFrame,
+    Values:    map[string]any{"rate": 0.0001},
+})
 rows, _ := store.Read(ctx, info, target, startMS, endMS, 500)
+missing, _ := store.Missing(ctx, info, target, startMS, endMS)
 _ = store.Delete(ctx, info, target, startMS, endMS)
 ```
 
@@ -62,8 +70,11 @@ _ = store.Delete(ctx, info, target, startMS, endMS)
 
 - 单条写入：`Write`
 - 批量写入：`WriteBatch`
+- 运行时事件写入：`WriteSeries` / `WriteSeriesBatch`
 - 读取并转成运行时事件：`Read`
 - 删除：`Delete`
+- 缺口查询：`Missing`
+- 缺口补齐：`FillMissing`
 - 覆盖范围查询：`Coverage`
 - `Sid=0` 行自动补成目标 `ExSymbol.ID`
 - 写入后通过 `SeriesRepo.UpdateSeriesCoverage(...)` 更新覆盖范围
@@ -295,11 +306,14 @@ type DataSub struct {
 
 1. 读取 `src.Info()`
 2. 校验 `sub.Source` / `sub.TimeFrame` 与 source 定义一致
-3. 通过 `sranges` 计算缺口
+3. 通过 `SeriesStore.Missing(...)` / `SeriesRangeRepo.MissingSeriesRanges(...)` 计算缺口
 4. 调 `FetchHistory(...)`
 5. 归一化 `DataRecord`
-6. 通过 `SeriesRepo.InsertSeriesBatch(...)` 入库
-7. 通过 `UpdateSeriesCoverage(...)` 更新覆盖范围
+6. 通过 `SeriesStore.WriteBatch(...)` 入库
+7. 通过 `SeriesStore.UpdateCoverage(...)` 记录空洞或覆盖范围
+
+`data.EnsureRuntimeSeriesRange(...)` / `data.EnsureSeriesSubsRange(...)` 是当前中性的运行时补齐入口；旧的
+`EnsureThirdPartySeriesRange(...)` / `EnsureThirdPartySeriesSubsRange(...)` 仍保留为兼容 alias。
 
 ### 4.4 `sranges` 仍然复用 `(sid, table, timeframe)`
 
@@ -311,7 +325,7 @@ type DataSub struct {
 
 这意味着自定义时序和内置 OHLCV 走同一套覆盖范围管理。
 
-覆盖范围更新已经归入 `SeriesRepo.UpdateSeriesCoverage(...)`，调用者不再需要在写入后直接拼装 `sranges` 更新逻辑。
+覆盖范围更新已经归入 `SeriesStore` / `SeriesRepo`，调用者不再需要在写入后直接拼装 `sranges` 更新逻辑。
 
 ### 4.5 运行时管理：`SeriesRuntime` / `SeriesPlan`
 

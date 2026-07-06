@@ -12,6 +12,8 @@ type SeriesStore struct {
 	repo SeriesRepo
 }
 
+type SeriesFetchFunc func(ctx context.Context, target *ExSymbol, startMS, endMS int64) ([]*DataRecord, error)
+
 func NewSeriesStore(repo SeriesRepo) *SeriesStore {
 	if repo == nil {
 		repo = DefaultSeriesRepo()
@@ -67,6 +69,31 @@ func (s *SeriesStore) WriteBatch(ctx context.Context, info *SeriesInfo, target *
 	return repo.UpdateSeriesCoverage(ctx, info, target.ID, startMS, endMS, items)
 }
 
+func (s *SeriesStore) WriteSeries(ctx context.Context, info *SeriesInfo, target *ExSymbol, evt *DataSeries) *errs.Error {
+	if evt == nil {
+		return errs.NewMsg(core.ErrBadConfig, "series event is nil")
+	}
+	return s.WriteSeriesBatch(ctx, info, target, []*DataSeries{evt})
+}
+
+func (s *SeriesStore) WriteSeriesBatch(ctx context.Context, info *SeriesInfo, target *ExSymbol, rows []*DataSeries) *errs.Error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if target == nil || target.ID <= 0 {
+		return errs.NewMsg(core.ErrBadConfig, "series target exsymbol is required")
+	}
+	records := make([]*DataRecord, 0, len(rows))
+	for _, evt := range rows {
+		if evt == nil {
+			continue
+		}
+		cp := evt.CloneWithExSymbol(target)
+		records = append(records, SeriesToRecord(cp))
+	}
+	return s.WriteBatch(ctx, info, target, records)
+}
+
 func (s *SeriesStore) Read(ctx context.Context, info *SeriesInfo, target *ExSymbol, startMS, endMS int64, limit int) ([]*DataSeries, *errs.Error) {
 	if target == nil || target.ID <= 0 {
 		return nil, errs.NewMsg(core.ErrBadConfig, "series target exsymbol is required")
@@ -86,6 +113,47 @@ func (s *SeriesStore) Delete(ctx context.Context, info *SeriesInfo, target *ExSy
 		return errs.NewMsg(core.ErrBadConfig, "series target exsymbol is required")
 	}
 	return s.repoOrDefault().DeleteSeriesRange(ctx, info, target.ID, startMS, endMS)
+}
+
+func (s *SeriesStore) Missing(ctx context.Context, info *SeriesInfo, target *ExSymbol, startMS, endMS int64) ([]MSRange, *errs.Error) {
+	if target == nil || target.ID <= 0 {
+		return nil, errs.NewMsg(core.ErrBadConfig, "series target exsymbol is required")
+	}
+	if err := validateSeriesInfo(info); err != nil {
+		return nil, err
+	}
+	repo := s.repoOrDefault()
+	rangeRepo, ok := repo.(SeriesRangeRepo)
+	if !ok {
+		return nil, errs.NewMsg(core.ErrBadConfig, "series repository does not support missing range queries")
+	}
+	return rangeRepo.MissingSeriesRanges(ctx, info, target.ID, startMS, endMS)
+}
+
+func (s *SeriesStore) FillMissing(ctx context.Context, info *SeriesInfo, target *ExSymbol, startMS, endMS int64, fetch SeriesFetchFunc) *errs.Error {
+	if fetch == nil {
+		return errs.NewMsg(core.ErrBadConfig, "series fetch function is required")
+	}
+	missing, err := s.Missing(ctx, info, target, startMS, endMS)
+	if err != nil || len(missing) == 0 {
+		return err
+	}
+	for _, gap := range missing {
+		rows, err_ := fetch(ctx, target, gap.Start, gap.Stop)
+		if err_ != nil {
+			return errs.New(core.ErrRunTime, err_)
+		}
+		if len(rows) > 0 {
+			if err = s.WriteBatch(ctx, info, target, rows); err != nil {
+				return err
+			}
+			continue
+		}
+		if err = s.UpdateCoverage(ctx, info, target, gap.Start, gap.Stop, rows); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *SeriesStore) UpdateCoverage(ctx context.Context, info *SeriesInfo, target *ExSymbol, startMS, endMS int64, rows []*DataRecord) *errs.Error {

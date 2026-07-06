@@ -92,7 +92,12 @@ type stubSeriesRepo struct {
 	insertCalls      int
 	deleteCalls      int
 	updateCalls      int
+	missingCalls     int
 	queryRows        []*orm.DataRecord
+	missing          []orm.MSRange
+	coverageRows     []*orm.DataRecord
+	coverageStart    int64
+	coverageEnd      int64
 	ensureTableErr   *errs.Error
 	insertErr        *errs.Error
 	queryErr         *errs.Error
@@ -122,6 +127,17 @@ func (s *stubSeriesRepo) DeleteSeriesRange(ctx context.Context, info *orm.Series
 	return s.deleteErr
 }
 
+func (s *stubSeriesRepo) MissingSeriesRanges(ctx context.Context, info *orm.SeriesInfo, sid int32, startMS, endMS int64) ([]orm.MSRange, *errs.Error) {
+	s.missingCalls++
+	if s.queryErr != nil {
+		return nil, s.queryErr
+	}
+	if s.missing != nil {
+		return append([]orm.MSRange(nil), s.missing...), nil
+	}
+	return []orm.MSRange{{Start: startMS, Stop: endMS}}, nil
+}
+
 func (s *stubSeriesRepo) UpdateSeriesRange(ctx context.Context, info *orm.SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
 	s.updateCalls++
 	return s.updateErr
@@ -129,6 +145,9 @@ func (s *stubSeriesRepo) UpdateSeriesRange(ctx context.Context, info *orm.Series
 
 func (s *stubSeriesRepo) UpdateSeriesCoverage(ctx context.Context, info *orm.SeriesInfo, sid int32, startMS, endMS int64, rows []*orm.DataRecord) *errs.Error {
 	s.updateCalls++
+	s.coverageStart = startMS
+	s.coverageEnd = endMS
+	s.coverageRows = append([]*orm.DataRecord(nil), rows...)
 	return s.updateErr
 }
 
@@ -567,6 +586,65 @@ func TestEnsureThirdPartySeriesRangePropagatesFetchFailure(t *testing.T) {
 	if repo.ensureTableCalls != 0 || repo.insertCalls != 0 || repo.updateCalls != 0 {
 		t.Fatalf("expected fetch failure before store writes, got ensure=%d insert=%d update=%d",
 			repo.ensureTableCalls, repo.insertCalls, repo.updateCalls)
+	}
+}
+
+func TestEnsureRuntimeSeriesRangeUsesInjectedRepositoryCoverage(t *testing.T) {
+	resetDataSourcesForTest(t)
+	src := newStubRegistrySource("macro_injected_repo_test")
+	src.rows = []*orm.DataRecord{{TimeMS: 300, EndMS: 400, Values: map[string]any{"value": 1.0}}}
+	if err := RegisterDataSource(src); err != nil {
+		t.Fatalf("RegisterDataSource failed: %v", err)
+	}
+	repo := &stubSeriesRepo{missing: []orm.MSRange{{Start: 300, Stop: 400}}}
+	jobs := []*strat.StratJob{{
+		Strat: &strat.TradeStrat{OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			return []*strat.DataSub{{Source: src.info.Name, ExSymbol: s.Symbol, TimeFrame: src.info.TimeFrame}}
+		}},
+		Symbol: &orm.ExSymbol{ID: 55, Exchange: "custom", Market: "macro", Symbol: "CPI_US"},
+	}}
+
+	subs, err := EnsureRuntimeSeriesRange(context.Background(), repo, jobs, 100, 500)
+	if err != nil {
+		t.Fatalf("EnsureRuntimeSeriesRange failed: %v", err)
+	}
+	if len(subs) != 1 {
+		t.Fatalf("expected one ensured sub, got %+v", subs)
+	}
+	if repo.missingCalls != 1 || repo.insertCalls != 1 || repo.updateCalls != 1 {
+		t.Fatalf("expected injected repo to drive missing/write/coverage, got missing=%d insert=%d update=%d",
+			repo.missingCalls, repo.insertCalls, repo.updateCalls)
+	}
+	if src.fetchCount != 1 {
+		t.Fatalf("expected one fetch for injected missing range, got %d", src.fetchCount)
+	}
+}
+
+func TestEnsureRuntimeSeriesRangeMarksEmptyFetchAsHole(t *testing.T) {
+	resetDataSourcesForTest(t)
+	src := newStubRegistrySource("macro_empty_fetch_test")
+	src.rows = nil
+	if err := RegisterDataSource(src); err != nil {
+		t.Fatalf("RegisterDataSource failed: %v", err)
+	}
+	repo := &stubSeriesRepo{missing: []orm.MSRange{{Start: 300, Stop: 400}}}
+	jobs := []*strat.StratJob{{
+		Strat: &strat.TradeStrat{OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			return []*strat.DataSub{{Source: src.info.Name, ExSymbol: s.Symbol, TimeFrame: src.info.TimeFrame}}
+		}},
+		Symbol: &orm.ExSymbol{ID: 56, Exchange: "custom", Market: "macro", Symbol: "PMI_CN"},
+	}}
+
+	_, err := EnsureRuntimeSeriesRange(context.Background(), repo, jobs, 100, 500)
+	if err != nil {
+		t.Fatalf("EnsureRuntimeSeriesRange failed: %v", err)
+	}
+	if repo.insertCalls != 0 {
+		t.Fatalf("expected empty fetch to skip insert, got %d insert calls", repo.insertCalls)
+	}
+	if repo.updateCalls != 1 || repo.coverageStart != 300 || repo.coverageEnd != 400 || len(repo.coverageRows) != 0 {
+		t.Fatalf("expected empty fetch to mark a coverage hole, got updates=%d start=%d end=%d rows=%+v",
+			repo.updateCalls, repo.coverageStart, repo.coverageEnd, repo.coverageRows)
 	}
 }
 

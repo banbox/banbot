@@ -25,6 +25,10 @@ type SeriesRepo interface {
 	GetSeriesRange(ctx context.Context, info *SeriesInfo, sid int32) (int64, int64, *errs.Error)
 }
 
+type SeriesRangeRepo interface {
+	MissingSeriesRanges(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64) ([]MSRange, *errs.Error)
+}
+
 var defaultSeriesRepo SeriesRepo = &dbSeriesRepo{}
 
 const seriesQuestRewriteDeleteRatio = 0.5
@@ -328,6 +332,29 @@ func (r *dbSeriesRepo) DeleteSeriesRange(ctx context.Context, info *SeriesInfo, 
 		return err_
 	}
 	return nil
+}
+
+func (r *dbSeriesRepo) MissingSeriesRanges(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64) ([]MSRange, *errs.Error) {
+	if startMS >= endMS {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateSeriesInfo(info); err != nil {
+		return nil, err
+	}
+	q, conn, err := Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+	binding := normalizedSeriesBinding(info.Binding)
+	covered, err_ := q.getCoveredRanges(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS)
+	if err_ != nil {
+		return nil, NewDbErr(core.ErrDbReadFail, err_)
+	}
+	return subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered), nil
 }
 
 func seriesRangeCovered(timeMS int64, covered []MSRange) bool {
