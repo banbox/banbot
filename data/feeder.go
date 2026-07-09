@@ -292,15 +292,7 @@ func applyAdjSeries(adj *orm.AdjInfo, rows []*orm.DataSeries) []*orm.DataSeries 
 	if !latestSeriesOHLCV(rows) {
 		return rows
 	}
-	exs := adj.ExSymbol
-	if exs == nil {
-		exs = orm.ResolveSeriesExSymbol(rows[0])
-	}
-	bars, err := orm.SeriesToBars(exs, rows)
-	if err != nil {
-		return rows
-	}
-	return orm.BarsToSeries(exs, rows[0].TimeFrame, adj.Apply(bars, core.AdjFront), adj, rows[0].IsWarmUp, true)
+	return applyAdjToDataSeries(adj, rows, core.AdjFront)
 }
 
 func applyAdjSeriesList(exs *orm.ExSymbol, adjs []*orm.AdjInfo, rows []*orm.DataSeries, adjMode int, cutEnd int64, limit int) []*orm.DataSeries {
@@ -316,11 +308,119 @@ func applyAdjSeriesList(exs *orm.ExSymbol, adjs []*orm.AdjInfo, rows []*orm.Data
 		}
 		return rows
 	}
-	bars, err := orm.SeriesToBars(exs, rows)
-	if err != nil {
+	doCutSeriesEnd := true
+	if cutEnd == 0 {
+		cutEnd = rows[len(rows)-1].TimeMS + 1000
+		doCutSeriesEnd = false
+	}
+	match := false
+	for i := len(adjs) - 1; i >= 0; i-- {
+		if adjs[i].StartMS < cutEnd {
+			adjs = adjs[:i+1]
+			match = true
+			break
+		}
+	}
+	if !match {
+		adjs = nil
+	}
+	if doCutSeriesEnd {
+		rows = trimSeriesEnd(rows, cutEnd)
+		if len(rows) == 0 {
+			return rows
+		}
+	}
+	if limit > 0 && len(rows) > limit {
+		rows = rows[len(rows)-limit:]
+	}
+	if len(adjs) > 0 {
+		startMS := rows[0].TimeMS
+		match = false
+		for i := len(adjs) - 1; i >= 0; i-- {
+			if adjs[i].StartMS <= startMS {
+				adjs = adjs[i:]
+				match = true
+				break
+			}
+		}
+		if !match {
+			return rows
+		}
+	} else {
 		return rows
 	}
-	return orm.BarsToSeries(exs, rows[0].TimeFrame, orm.ApplyAdj(adjs, bars, adjMode, cutEnd, limit), nil, rows[0].IsWarmUp, true)
+	if adjMode == core.AdjBehind {
+		lastFac := float64(1)
+		for _, f := range adjs {
+			f.CumFactor = lastFac * f.Factor
+			lastFac = f.CumFactor
+		}
+	} else if adjMode == core.AdjFront {
+		lastFac := float64(1)
+		for i := len(adjs) - 1; i >= 0; i-- {
+			f := adjs[i]
+			f.CumFactor = lastFac
+			lastFac *= f.Factor
+		}
+	}
+	result := make([]*orm.DataSeries, 0, len(rows))
+	cache := make([]*orm.DataSeries, 0, len(rows)/3)
+	item := adjs[0]
+	ai := 1
+	saveBatch := func() {
+		if len(cache) == 0 {
+			return
+		}
+		result = append(result, applyAdjToDataSeries(item, cache, adjMode)...)
+		cache = make([]*orm.DataSeries, 0, len(rows)/3)
+	}
+	for i, row := range rows {
+		if row.TimeMS >= item.StopMS {
+			saveBatch()
+			if ai+1 < len(adjs) {
+				ai += 1
+				item = adjs[ai]
+			} else {
+				item = nil
+				cache = rows[i:]
+				break
+			}
+		}
+		cache = append(cache, row)
+	}
+	saveBatch()
+	return result
+}
+
+func applyAdjToDataSeries(adj *orm.AdjInfo, rows []*orm.DataSeries, adjMode int) []*orm.DataSeries {
+	if adj == nil || adj.CumFactor == 1 || adj.CumFactor == 0 {
+		return rows
+	}
+	factor := adj.CumFactor
+	if adjMode == core.AdjBehind {
+		factor = 1 / factor
+	} else if adjMode != core.AdjFront {
+		return rows
+	}
+	out := make([]*orm.DataSeries, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		cp := *row
+		cp.Values = make(map[string]any, len(row.Values))
+		for k, v := range row.Values {
+			cp.Values[k] = v
+		}
+		for _, key := range []string{"open", "high", "low", "close", "volume", "buy_volume"} {
+			if val, ok := row.FloatValueDefault(key); ok {
+				cp.Values[key] = val * factor
+			}
+		}
+		cp.Adj = adj
+		out = append(out, &cp)
+	}
+	return out
 }
 
 func latestSeriesOHLCV(rows []*orm.DataSeries) bool {
