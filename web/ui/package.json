@@ -48,13 +48,11 @@
 		"@codemirror/theme-one-dark": "^6.1.2",
 		"@codemirror/view": "^6.36.5",
 		"@sveltejs/adapter-static": "^3.0.8",
-		"@types/lodash": "^4.17.16",
 		"dayjs": "^1.11.13",
 		"klinecharts": "^10.0.0-alpha5",
 		"lodash": "^4.17.21",
 		"ofetch": "^1.4.1",
 		"papaparse": "^5.5.2",
-		"svelte-persisted-store": "^0.12.0",
-		"ui": "file:"
+		"svelte-persisted-store": "^0.12.0"
 	}
 }

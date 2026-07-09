@@ -13,9 +13,62 @@
 
 ---
 
-## 2. 当前实现结论
+## 2. 快速接入入口
 
-### 2.1 统一运行时事件：`DataSeries`
+banbot 推荐两种接入方式：
+
+- 数据天然和 K 线一一对齐：使用 `orm.KLineSeriesStore` 写入已有 `kline_<timeframe>` 表的扩展列。
+- 数据有自己的发布频率或字段结构：使用 `orm.SeriesStore` 创建独立时序表，并注册为 `data.DataSource`。
+
+### 2.1 写入已有 kline 表扩展列
+
+适用场景：
+
+- 每条记录对应某个已存在的 K 线时间戳。
+- 不希望新增一张表，只想把字段挂在 `kline_1h` / `kline_1d` 等表上。
+- 数据用于研究、图表、side input；原有 OHLCV 查询和回测撮合仍只读取内置 OHLCV 字段。
+
+外部示例见 `../banstrats/openinterest/store.go`：`Info` 使用 `orm.NewKLineSeriesInfo(...)`，写入和读取通过 `orm.NewKLineSeriesStore(Info).Write/Read(...)` 完成。
+
+`KLineSeriesStore` 会做这些事：
+
+- `Ensure` / `Write` 时自动给目标表增加扩展列。
+- TimescaleDB 的 kline 表使用 `time`，QuestDB 的 kline 表使用 `ts`，`NewKLineSeriesInfo` 会按后端选择。
+- 按 `(sid, time)` 更新已有行；如果目标行不存在，会返回错误，避免静默插入一条不完整 OHLCV。
+- QuestDB 写入后会等待目标行可见，避免 WAL read-after-write 立即读取为空。
+
+注意：
+
+- kline 扩展列名不能和内置列冲突：`sid`、`time`、`ts`、`open`、`high`、`low`、`close`、`volume`、`quote`、`buy_volume`、`trade_num`。
+- 这种方式不会改变 `GetOHLCV` 的返回值。如果策略要读取扩展字段，使用 `KLineSeriesStore.Read` 或把它包装成独立 `DataSource` side input。
+
+### 2.2 独立时序表 + 函数式数据源
+
+适用场景：
+
+- 数据频率独立，例如每 8 小时一条。
+- 字段不属于 OHLCV 本体。
+- 希望回测和实盘启动时由 banbot 自动补齐、缓存，并通过 `OnData` / `DataHub` 进入策略。
+
+简单数据源示例见 `../banstrats/fundingrate/source.go`：定义 `orm.SeriesInfo`，再用 `data.RegisterFuncDataSource(...)` 注册 `FetchHistory`。
+
+复杂数据源示例见 `../banstrats/longshort/source.go`：把分页、限流、解析校验和可选 live 订阅封装在 `Source` 中，再注册到同一个 `DataSource` 入口。
+
+#### 2.2.1 手动写入和读取
+
+不需要接入策略运行时、只想自己存取时，直接使用 `orm.DefaultSeriesStore().Write/Read(...)`。如果写入的是抽象标的，而不是交易所真实交易对，先用 `orm.EnsureExSymbol(...)` 注册或复用 sid。
+
+#### 2.2.2 策略中订阅
+
+策略订阅示例见 `../banstrats/fundingrate/strategy.go`：在 `OnDataSubs` 返回 `strat.DataSub`，在 `OnData` 中读取 `orm.DataSeries`，需要最新缓存时走 `job.DataHub.Latest(...)`。
+
+回测和实盘启动时，banbot 会从 `OnDataSubs` 收集订阅，按 `(source, sid, timeframe)` 去重，根据 `WarmupNum` 计算预热起点，再调用已注册的 `DataSource.FetchHistory` 补齐缺口。
+
+---
+
+## 3. 当前实现结论
+
+### 3.1 统一运行时事件：`DataSeries`
 
 banbot 内部主链路已经统一改为 `orm.DataSeries`：
 
@@ -24,7 +77,7 @@ banbot 内部主链路已经统一改为 `orm.DataSeries`：
 - `live.CryptoTrader`、`opt.BackTestLite`、`opt.BackTest` 统一消费 `DataSeries`
 - `strat.DataHub` 统一缓存 `DataSeries`
 
-### 2.2 统一仓储名称：`SeriesRepo`
+### 3.2 统一仓储名称：`SeriesRepo`
 
 仓储接口规范名称已切换为 `SeriesRepo`：
 
@@ -79,7 +132,7 @@ _ = store.Delete(ctx, info, target, startMS, endMS)
 - `Sid=0` 行自动补成目标 `ExSymbol.ID`
 - 写入后通过 `SeriesRepo.UpdateSeriesCoverage(...)` 更新覆盖范围
 
-### 2.3 `ExSymbol` / source 身份只由 `exchange + market + symbol` 确定
+### 3.3 `ExSymbol` / source 身份只由 `exchange + market + symbol` 确定
 
 当前实现中，`ExSymbol` 的 sid 解析、缓存 key、查询接口均以三元组为准：
 
@@ -101,7 +154,7 @@ macroTarget, err := orm.EnsureExSymbol("custom", "macro", "CPI_US", "fred")
 
 它和交易所交易对共用同一个 `ExSymbol`/sid 注册表，因此资金费率、持仓、宏观指标、用户自定义指标都可以挂到统一 sid 上。
 
-### 2.4 `SeriesBinding.SIDColumn` 可留空，默认 `sid`
+### 3.4 `SeriesBinding.SIDColumn` 可留空，默认 `sid`
 
 `SeriesBinding` 已支持省略 `SIDColumn`，内部归一化时默认补成 `sid`：
 
@@ -116,7 +169,7 @@ func normalizedSeriesBinding(binding SeriesBinding) SeriesBinding {
 
 因此自定义数据只要表结构遵循默认 sid 列，即可不显式填写 `SIDColumn`。
 
-### 2.5 Kline 已降级为内置适配能力，不再是内核唯一数据本体
+### 3.5 Kline 已降级为内置适配能力，不再是内核唯一数据本体
 
 框架内部不再要求所有事件都必须先变成 `InfoKline` 才能流转。
 
@@ -130,7 +183,7 @@ func normalizedSeriesBinding(binding SeriesBinding) SeriesBinding {
 
 > `Kline` 现在是内置 OHLCV 适配层，而不是统一数据抽象。
 
-### 2.6 策略兼容边界已收敛到 `TradeStrat` / `StratJob`
+### 3.6 策略兼容边界已收敛到 `TradeStrat` / `StratJob`
 
 当前策略层同时支持新旧两套接口，但旧接口只保留在策略兼容层：
 
@@ -152,9 +205,9 @@ func normalizedSeriesBinding(binding SeriesBinding) SeriesBinding {
 
 ---
 
-## 3. 当前核心数据模型
+## 4. 当前核心数据模型
 
-### 3.1 描述数据表结构：`SeriesInfo` / `SeriesBinding`
+### 4.1 描述数据表结构：`SeriesInfo` / `SeriesBinding`
 
 ```go
 type SeriesField struct {
@@ -194,7 +247,7 @@ type SeriesInfo struct {
 - `bool`
 - `json`
 
-### 3.2 存储行：`DataRecord`
+### 4.2 存储行：`DataRecord`
 
 ```go
 type DataRecord struct {
@@ -214,7 +267,7 @@ type DataRecord struct {
 
 `EnsureSeriesRange(...)` 会自动把 `Sid=0` 的记录补成目标 `sub.ExSymbol.ID`，但最终入库前 sid 必须确定。
 
-### 3.3 运行时事件：`DataSeries`
+### 4.3 运行时事件：`DataSeries`
 
 ```go
 type DataSeries struct {
@@ -238,7 +291,7 @@ type DataSeries struct {
 - `ExSymbol` 在 kline/交易路径下可直接带上标的信息
 - `Adj` 仅对内置 OHLCV 适配链路有意义
 
-### 3.4 OHLCV 兼容适配：`AsKline`
+### 4.4 OHLCV 兼容适配：`AsKline`
 
 当 `Values` 至少包含以下字段时，可被兼容投影成 `InfoKline`：
 
@@ -258,9 +311,9 @@ type DataSeries struct {
 
 ---
 
-## 4. 自定义数据源与存储
+## 5. 自定义数据源与存储
 
-### 4.1 数据源接口
+### 5.1 数据源接口
 
 ```go
 type DataSource interface {
@@ -282,7 +335,7 @@ func RegisterDataSource(src DataSource) error
 - `Name` 非空
 - source 名称不能重复
 
-### 4.2 数据订阅模型：`DataSub`
+### 5.2 数据订阅模型：`DataSub`
 
 ```go
 type DataSub struct {
@@ -300,7 +353,7 @@ type DataSub struct {
 - `TimeFrame`：订阅周期
 - `WarmupNum`：回测 / 实盘初始化预热量
 
-### 4.3 历史补齐：`EnsureSeriesRange`
+### 5.3 历史补齐：`EnsureSeriesRange`
 
 统一补齐流程：
 
@@ -315,7 +368,7 @@ type DataSub struct {
 `data.EnsureRuntimeSeriesRange(...)` / `data.EnsureSeriesSubsRange(...)` 是当前中性的运行时补齐入口；旧的
 `EnsureThirdPartySeriesRange(...)` / `EnsureThirdPartySeriesSubsRange(...)` 仍保留为兼容 alias。
 
-### 4.4 `sranges` 仍然复用 `(sid, table, timeframe)`
+### 5.4 `sranges` 仍然复用 `(sid, table, timeframe)`
 
 当前实现没有为 custom data 另建覆盖范围系统，而是继续复用现有 `sranges` 机制：
 
@@ -327,7 +380,7 @@ type DataSub struct {
 
 覆盖范围更新已经归入 `SeriesStore` / `SeriesRepo`，调用者不再需要在写入后直接拼装 `sranges` 更新逻辑。
 
-### 4.5 运行时管理：`SeriesRuntime` / `SeriesPlan`
+### 5.5 运行时管理：`SeriesRuntime` / `SeriesPlan`
 
 回测和实盘启动时不再各自拼装自定义数据补齐逻辑，而是统一由 `data.SeriesRuntime` 管理：
 
@@ -340,7 +393,7 @@ type DataSub struct {
 
 实盘定时刷新交易对后会重新生成计划并补齐新增订阅；`SeriesRuntime` 会记住已激活的 `(source, sid, timeframe)`，避免重复订阅。旧的 `ThirdPartySeriesBootstrap` 名称保留为 `SeriesPlan` 的兼容 alias。
 
-### 4.6 TimescaleDB / QuestDB 的字段映射
+### 5.6 TimescaleDB / QuestDB 的字段映射
 
 当前 `SeriesRepo` 两端统一支持：
 
@@ -359,7 +412,7 @@ type DataSub struct {
 - QuestDB 建表使用 `timestamp(...) ... WAL DEDUP UPSERT KEYS(sid, time)`；分区粒度按 timeframe 选择（如 `1m` 用 `WEEK`，`1h` / `1d` 用 `YEAR`，其他默认 `MONTH`）
 - PostgreSQL/TimescaleDB 使用 `(sid, time)` 主键 upsert
 
-### 4.7 QuestDB 删除语义：先 `sranges`，超过阈值再物理整理
+### 5.7 QuestDB 删除语义：先 `sranges`，超过阈值再物理整理
 
 QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删除都立即重写表。
 
@@ -381,9 +434,9 @@ QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删
 
 ---
 
-## 5. 运行时主链路
+## 6. 运行时主链路
 
-### 5.1 Built-in OHLCV 也先转成 `DataSeries`
+### 6.1 Built-in OHLCV 也先转成 `DataSeries`
 
 交易所 Kline 当前仍然是系统内置 source，但进入主链路时已经先转换成 `DataSeries`：
 
@@ -393,7 +446,7 @@ QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删
 
 因此无论来源是内置 kline 还是第三方数据，进入 `Trader` 之后都先按统一 `DataSeries` 处理。
 
-### 5.2 `Trader` 的分发规则
+### 6.2 `Trader` 的分发规则
 
 `biz.Trader.FeedDataSeries(...)` 当前逻辑：
 
@@ -406,7 +459,7 @@ QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删
 - **纯通用数据**：进入 `OnData` + `DataHub`
 - **bar 形态数据**：既可进入 `OnData`，也可继续兼容旧 `OnBar` / `OnInfoBar`
 
-### 5.3 新旧策略回调优先级
+### 6.3 新旧策略回调优先级
 
 当前实现遵循：
 
@@ -424,7 +477,7 @@ QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删
 
 > 新接口优先，旧接口只做兼容兜底。
 
-### 5.4 `DataHub` 作为统一运行时缓存
+### 6.4 `DataHub` 作为统一运行时缓存
 
 `StratJob.DataHub` 统一缓存按 `(source, sid, timeframe)` 索引的运行时数据：
 
@@ -440,9 +493,9 @@ type DataHub interface {
 
 ---
 
-## 6. 策略层使用规范
+## 7. 策略层使用规范
 
-### 6.1 新策略应优先使用的新接口
+### 7.1 新策略应优先使用的新接口
 
 推荐使用：
 
@@ -478,7 +531,7 @@ func init() {
 }
 ```
 
-### 6.2 旧策略兼容边界
+### 7.2 旧策略兼容边界
 
 以下接口保留，仅用于兼容老策略：
 
@@ -492,7 +545,7 @@ func init() {
 - `OnPairInfos` 会在内部桥接为 `DataSub{Source: "kline", ...}`
 - `OnInfoBar` 仅在 side-input 能适配成 kline 且策略未实现 `OnData` 时触发
 
-### 6.3 新代码不要再把 Kline 当作通用自定义数据契约
+### 7.3 新代码不要再把 Kline 当作通用自定义数据契约
 
 当前规范是：
 
@@ -504,9 +557,9 @@ func init() {
 
 ---
 
-## 7. 回测与实盘说明
+## 8. 回测与实盘说明
 
-### 7.1 回测链路
+### 8.1 回测链路
 
 `BackTestLite` / `BackTest` 已统一改为消费 `DataSeries`：
 
@@ -514,7 +567,7 @@ func init() {
 - 对可 `AsKline` 的事件，继续执行原有撮合、账户、报表逻辑
 - 对纯通用数据，直接进入 `Trader` 的 `OnData` 分发链路
 
-### 7.2 实盘链路
+### 8.2 实盘链路
 
 `CryptoTrader` 已统一改为消费 `DataSeries`：
 
@@ -522,7 +575,7 @@ func init() {
 - websocket 闭合/未闭合事件优先走 `OnWsData`
 - 旧 `OnWsKline` 仅作为兼容回退
 
-### 7.3 策略编译与回测验证位置
+### 8.3 策略编译与回测验证位置
 
 策略编译和回测仍应在 `../banstrats` 侧完成，以确保：
 
@@ -532,9 +585,9 @@ func init() {
 
 ---
 
-## 8. 当前测试与回归关注点
+## 9. 当前测试与回归关注点
 
-### 8.1 已覆盖的关键回归点
+### 9.1 已覆盖的关键回归点
 
 当前仓库中已有针对这次重构的关键测试：
 
@@ -564,7 +617,7 @@ func init() {
 - `TestCollectDataSubsBridgesLegacyPairInfos`
 - `TestUpdatePairs_RebuildsWarmsFromCurrentDataSubs`
 
-### 8.2 推荐回归顺序
+### 9.2 推荐回归顺序
 
 每次继续扩展 custom data 时，至少按下面顺序回归：
 
@@ -577,7 +630,7 @@ func init() {
 
 这份脚本是当前第三方时序接入回归的**规范入口**：默认只跑 hermetic proof layers，不依赖 `BANBOT_TEST_DATA_SERVER`、`BANBOT_TEST_STRAT_RUN` 或外部实时网络。脚本会在每一层开始前打印层名和完整命令，并在首个失败处停止，便于直接定位是示例注册/抓取/策略行为、框架启动激活链路，还是 legacy OHLCV/DataHub 兼容语义发生了回归。
 
-### 8.3 回归目标
+### 9.3 回归目标
 
 重点确认：
 
@@ -589,7 +642,7 @@ func init() {
 
 ---
 
-## 9. 最终规范
+## 10. 最终规范
 
 1. **统一数据模型使用 `DataSeries`，不是 `Kline` / `InfoKline`。**
 2. **统一仓储名称使用 `SeriesRepo`。**
