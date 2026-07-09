@@ -19,7 +19,6 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
-	utils2 "github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
 )
 
@@ -598,6 +597,9 @@ func makeOnSeriesMsg(p *LiveProvider) func(msg *SeriesMsg) {
 		if msg.ExgName != core.ExgName || msg.Market != core.Market {
 			return
 		}
+		if len(msg.Rows) == 0 {
+			return
+		}
 		if msg.Interval < msg.TFSecs {
 			fireWsSeries(msg)
 		}
@@ -607,11 +609,7 @@ func makeOnSeriesMsg(p *LiveProvider) func(msg *SeriesMsg) {
 		}
 		tfMSecs := int64(msg.TFSecs * 1000)
 		exs := orm.GetExSymbol2(msg.ExgName, msg.Market, msg.Pair)
-		handleNewBars := func(bars_ []*banexg.Kline) {
-			if exs == nil {
-				return
-			}
-			rows := orm.BarsToSeries(exs, utils2.SecsToTF(msg.TFSecs), bars_, nil, false, true)
+		handleNewRows := func(rows []*orm.DataSeries) {
 			go func(dataRows []*orm.DataSeries) {
 				_, err := hold.onNewData(tfMSecs, dataRows)
 				if err != nil {
@@ -628,40 +626,37 @@ func makeOnSeriesMsg(p *LiveProvider) func(msg *SeriesMsg) {
 		// The weighting factor has been calculated during the start-up or market break, and the weighting is automatically carried out internally
 		// 已在启动或休市期间计算复权因子，内部会自动进行复权
 		if msg.Interval >= msg.TFSecs {
-			handleNewBars(msg.Arr)
+			handleNewRows(msg.Rows)
 			return
 		}
 		// The frequency of updates is lower than the bar cycle, and what is received may not be completed
 		// 更新频率低于bar周期，收到的可能未完成
-		lastIdx := len(msg.Arr) - 1
-		doneArr, lastBar := msg.Arr[:lastIdx], msg.Arr[lastIdx]
+		lastIdx := len(msg.Rows) - 1
+		doneRows, lastRow := msg.Rows[:lastIdx], msg.Rows[lastIdx]
 		waitData := hold.getWaitData()
-		if waitData != nil && waitData.TimeMS < lastBar.Time {
-			waitView, err := waitData.OHLCV(exs)
-			if err == nil {
-				doneArr = append([]*banexg.Kline{waitView.Bar()}, doneArr...)
-			}
+		if waitData != nil && waitData.TimeMS < lastRow.TimeMS {
+			doneRows = append([]*orm.DataSeries{waitData}, doneRows...)
 			hold.setWaitData(nil)
 		}
-		if len(doneArr) > 0 {
-			handleNewBars(doneArr)
+		if len(doneRows) > 0 {
+			handleNewRows(doneRows)
 			return
 		}
 		if msg.Interval <= 5 && hold.getStates()[0].TFSecs >= 60 {
 			// The update is fast, and the cycle required is relatively long, so it is required to be considered complete when the next bar occurs (follow the above logic)
 			// 更新很快，需要的周期相对较长，则要求出现下一个bar时认为完成（走上面逻辑）
-			hold.setWaitData(orm.NewDataSeriesFromKline(exs, utils2.SecsToTF(msg.TFSecs), lastBar, nil, false, false))
+			hold.setWaitData(lastRow.CloneWithExSymbol(exs))
 			return
 		}
 		// The frequency of updates is relatively low, or the proportion of the required cycle is large, and the approximate completion is considered complete
 		// 更新频率相对不高，或占需要的周期比率较大，近似完成认为完成
-		endLackSecs := int((lastBar.Time + tfMSecs - btime.TimeMS()) / 1000)
+		endLackSecs := int((lastRow.TimeMS + tfMSecs - btime.TimeMS()) / 1000)
 		if endLackSecs*2 < msg.Interval {
 			// The missing time is less than half of the update interval and is considered complete.
 			// 缺少的时间不足更新间隔的一半，认为完成。
-			handleNewBars([]*banexg.Kline{lastBar})
+			handleNewRows([]*orm.DataSeries{lastRow})
 		} else {
-			hold.setWaitData(orm.NewDataSeriesFromKline(exs, utils2.SecsToTF(msg.TFSecs), lastBar, nil, false, false))
+			hold.setWaitData(lastRow.CloneWithExSymbol(exs))
 		}
 	}
 }
@@ -697,30 +692,30 @@ func makeOnDepth(p *LiveProvider) func(dep *banexg.OrderBook) {
 }
 
 func fireWsSeries(msg *SeriesMsg) {
-	if len(msg.Arr) == 0 {
+	if len(msg.Rows) == 0 {
 		return
 	}
-	last := msg.Arr[len(msg.Arr)-1]
+	last := msg.Rows[len(msg.Rows)-1]
+	view, err := last.OHLCV(orm.GetExSymbol2(msg.ExgName, msg.Market, msg.Pair))
+	if err != nil {
+		log.Error("ws series missing OHLCV", zap.String("p", msg.Pair), zap.Error(err))
+		return
+	}
 	if _, ok := core.GetOdBook(msg.Pair); !ok {
-		com.SetPrice(msg.Pair, last.Close, last.Close)
+		com.SetPrice(msg.Pair, view.Close, view.Close)
 	}
 	pairMap, _ := strat.WsSubJobs[core.WsSubKLine]
 	if len(pairMap) == 0 {
 		return
 	}
 	jobMap, _ := pairMap[msg.Pair]
-	exs := orm.GetExSymbol2(msg.ExgName, msg.Market, msg.Pair)
-	var evt *orm.DataSeries
-	if exs != nil {
-		evt = orm.NewDataSeriesFromKline(exs, utils2.SecsToTF(msg.TFSecs), last, nil, false, false)
-	}
 	for job := range jobMap {
 		num1, num2 := strat.GetJobInOutNum(job)
-		if evt != nil && job.Strat.OnWsData != nil {
-			job.Strat.OnWsData(job, evt)
+		if job.Strat.OnWsData != nil {
+			job.Strat.OnWsData(job, last)
 			strat.CheckJobInOutNum(job, "OnWsData", num1, num2)
 		} else {
-			job.Strat.OnWsKline(job, msg.Pair, last)
+			job.Strat.OnWsKline(job, msg.Pair, view.Bar())
 			strat.CheckJobInOutNum(job, "OnWsKline", num1, num2)
 		}
 	}

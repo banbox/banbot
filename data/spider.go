@@ -30,7 +30,7 @@ var (
 type NotifySeries struct {
 	TFSecs   int
 	Interval int // 推送更新间隔, <= TFSecs
-	Arr      []*banexg.Kline
+	Rows     []*orm.DataSeries
 }
 
 type SeriesMsg struct {
@@ -107,20 +107,14 @@ func consumeSeriesWriteQ(workNum int) {
 			sidLock.Unlock()
 			trySaveSeries(job, tfSecs, mntSta, hourSta)
 			saveCost = time.Since(start)
-			// After the K-line is written to the database, a message will be sent to notify the robot to avoid repeated insertion of K-line
-			// 写入K线到数据库后，才发消息通知机器人，避免重复插入K线
-			bars, err := orm.SeriesToBars(orm.GetSymbolByID(job.Sid), job.Rows)
-			if err != nil {
-				log.Error("convert series to bars fail", zap.Int32("sid", job.Sid), zap.Error(err))
-				totalCost = time.Since(start)
-				return
-			}
-			err = Spider.Broadcast(&utils.IOMsg{
+			// After the series is written to the database, notify robots to avoid repeated insertion.
+			// 写入时序数据到数据库后，才发消息通知机器人，避免重复插入。
+			err := Spider.Broadcast(&utils.IOMsg{
 				Action: job.MsgAction,
 				Data: NotifySeries{
 					TFSecs:   tfSecs,
 					Interval: tfSecs,
-					Arr:      bars,
+					Rows:     job.Rows,
 				},
 			})
 			totalCost = time.Since(start)
@@ -674,7 +668,7 @@ func (m *Miner) watchKLines(pairs []string) {
 			Data: NotifySeries{
 				TFSecs:   tfSecs,
 				Interval: 1,
-				Arr:      arr,
+				Rows:     orm.BarsToSeries(orm.GetExSymbol2(m.ExgName, m.Market, pair), "1m", arr, nil, false, false),
 			},
 		})
 		curTS := btime.UTCStamp()

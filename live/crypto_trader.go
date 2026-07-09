@@ -301,6 +301,7 @@ func (t *CryptoTrader) Emit(sub *strat.DataSub, rows []*orm.DataRecord) error {
 	if len(seriesRows) == 0 {
 		return nil
 	}
+	msg.Rows = seriesRows
 	for _, evt := range seriesRows {
 		t.FeedDataSeries(evt)
 	}

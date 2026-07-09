@@ -56,8 +56,8 @@ func NewSeriesWatcher(addr string) (*SeriesWatcher, *errs.Error) {
 		ClientIO: client,
 		jobs:     make(map[string]map[string]*PairTFCache),
 	}
-	res.Listens[core.WsSubKLine] = res.onSpiderBar
-	res.Listens["ohlcv"] = res.onSpiderBar
+	res.Listens[core.WsSubKLine] = res.onSpiderSeries
+	res.Listens["ohlcv"] = res.onSpiderSeries
 	res.Listens["price"] = res.onPriceUpdate
 	res.Listens[core.WsSubTrade] = res.onTrades
 	res.Listens[core.WsSubDepth] = res.onBook
@@ -203,43 +203,47 @@ func (w *SeriesWatcher) UnWatchJobs(exgName, marketType, jobType string, pairs [
 	return w.WriteMsg(&utils.IOMsg{Action: "unsubscribe", Data: tags})
 }
 
-func (w *SeriesWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
+func (w *SeriesWatcher) onSpiderSeries(raw *utils.IOMsgRaw) {
 	key := raw.Action
 	data := raw.Data
 	if w.OnDataMsg == nil {
-		log.Debug("spider bar skipped", zap.String("key", key))
+		log.Debug("spider series skipped", zap.String("key", key))
 		return
 	}
 	parts := strings.Split(key, "_")
-	msgType, exgName, market, pair := parts[0], parts[1], parts[2], parts[3]
+	if len(parts) < 4 {
+		log.Debug("spider series invalid key", zap.String("key", key))
+		return
+	}
+	msgType, exgName, market, pair := parts[0], parts[1], parts[2], strings.Join(parts[3:], "_")
 	job := w.GetJob(msgType, pair)
 	if job == nil {
 		// 未监听，忽略
-		log.Debug("spider bar ignored", zap.String("key", key))
+		log.Debug("spider series ignored", zap.String("key", key))
 		return
 	}
-	var bars NotifySeries
-	err_ := utils2.Unmarshal(data, &bars, utils2.JsonNumDefault)
+	var series NotifySeries
+	err_ := utils2.Unmarshal(data, &series, utils2.JsonNumDefault)
 	if err_ != nil {
-		log.Debug("onSpiderBar spider bar decode fail", zap.String("key", key))
+		log.Debug("onSpiderSeries spider series decode fail", zap.String("key", key))
 		return
 	}
-	if len(bars.Arr) == 0 {
-		log.Debug("spider bar empty", zap.String("key", key))
+	if len(series.Rows) == 0 {
+		log.Debug("spider series empty", zap.String("key", key))
 		return
 	}
 	// 更新收到的时间戳
-	lastBarMS := bars.Arr[len(bars.Arr)-1].Time
-	tfMSecs := int64(bars.TFSecs * 1000)
-	nextBarMS := lastBarMS + tfMSecs
+	lastRowMS := series.Rows[len(series.Rows)-1].TimeMS
+	tfMSecs := int64(series.TFSecs * 1000)
+	nextBarMS := lastRowMS + tfMSecs
 	com.SetPairMs(pair, nextBarMS, tfMSecs)
 	var msg = &SeriesMsg{
-		NotifySeries: bars,
+		NotifySeries: series,
 		ExgName:      exgName,
 		Market:       market,
 		Pair:         pair,
 	}
-	logFields := []zap.Field{zap.String("key", key), zap.Int("num", len(bars.Arr)),
+	logFields := []zap.Field{zap.String("key", key), zap.Int("num", len(series.Rows)),
 		zap.Int64("nextMS", nextBarMS)}
 	if msgType == core.WsSubKLine {
 		log.Debug("spider uohlcv", logFields...)
@@ -249,26 +253,26 @@ func (w *SeriesWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
 	log.Debug("spider ohlcv", logFields...)
 	// 记录收到的bar数量
 	core.TfPairHitsLock.Lock()
-	timeFrame := utils2.SecsToTF(bars.TFSecs)
+	timeFrame := utils2.SecsToTF(series.TFSecs)
 	hits, ok := core.TfPairHits[timeFrame]
 	if !ok {
 		hits = make(map[string]int)
 		core.TfPairHits[timeFrame] = hits
 	}
 	num, _ := hits[pair]
-	hits[pair] = num + len(bars.Arr)
+	hits[pair] = num + len(series.Rows)
 	core.TfPairHitsLock.Unlock()
 	// 检测并填充缺失的K线
-	olds, err := job.fillLacks(pair, bars.TFSecs, bars.Arr[0].Time, nextBarMS)
+	olds, err := job.fillLacks(pair, series.TFSecs, series.Rows[0].TimeMS, nextBarMS)
 	if err != nil {
 		log.Error("fillLacks fail", zap.String("pair", pair), zap.Error(err))
 		return
 	}
 	// 归集更新指定的周期
 	var finishes []*orm.DataSeries
-	if bars.TFSecs < job.TFSecs {
+	if series.TFSecs < job.TFSecs {
 		//和旧的bar_row合并更新，判断是否有完成的bar
-		curRows := orm.BarsToSeries(orm.GetExSymbol2(exgName, market, pair), utils2.SecsToTF(bars.TFSecs), bars.Arr, nil, false, true)
+		curRows := series.Rows
 		if job.WaitBar != nil {
 			olds = append(olds, job.WaitBar)
 		}
@@ -280,17 +284,12 @@ func (w *SeriesWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
 		}
 		finishes = job.getFinishes(aggRows, lastDone)
 	} else {
-		finishes = orm.BarsToSeries(orm.GetExSymbol2(exgName, market, pair), utils2.SecsToTF(job.TFSecs), bars.Arr, nil, false, true)
+		finishes = series.Rows
 	}
 	if len(finishes) > 0 {
-		finishBars, err := orm.SeriesToBars(orm.GetExSymbol2(exgName, market, pair), finishes)
-		if err != nil {
-			log.Error("series to bars fail", zap.String("pair", pair), zap.Error(err))
-			return
-		}
 		msg.TFSecs = job.TFSecs
 		msg.Interval = job.TFSecs
-		msg.Arr = finishBars
+		msg.Rows = finishes
 		w.OnDataMsg(msg)
 	}
 }

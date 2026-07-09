@@ -31,14 +31,17 @@ func TestWatchOhlcv(t *testing.T) {
 		panic(err)
 	}
 	client.OnDataMsg = func(msg *SeriesMsg) {
-		if len(msg.Arr) == 0 {
+		if len(msg.Rows) == 0 {
 			return
 		}
 		code := fmt.Sprintf("%s.%s.%s", msg.ExgName, msg.Market, msg.Pair)
-		k := msg.Arr[0]
+		k, err := msg.Rows[0].OHLCV()
+		if err != nil {
+			return
+		}
 		dateStr := btime.ToDateStr(k.Time, core.DefaultDateFmt)
 		barStr := fmt.Sprintf("%f %f %f %f %f", k.Open, k.High, k.Low, k.Close, k.Volume)
-		log.Info("receive", zap.String("code", code), zap.Int("num", len(msg.Arr)),
+		log.Info("receive", zap.String("code", code), zap.Int("num", len(msg.Rows)),
 			zap.Int("tfSecs", msg.TFSecs), zap.Int("intv", msg.Interval),
 			zap.String("date", dateStr), zap.String("bar", barStr))
 	}
@@ -88,6 +91,38 @@ func initApp() *errs.Error {
 		return err
 	}
 	return orm.Setup()
+}
+
+func TestSeriesWatcherOnSpiderSeriesKeepsDataSeriesRows(t *testing.T) {
+	exs := &orm.ExSymbol{ID: 7, Exchange: "custom", Market: "macro", Symbol: "CPI_US"}
+	row := &orm.DataSeries{
+		Source:    "macro",
+		Sid:       exs.ID,
+		TimeMS:    100,
+		EndMS:     200,
+		TimeFrame: "1d",
+		Closed:    true,
+		Values:    map[string]any{"value": 3.14},
+		ExSymbol:  exs,
+	}
+	raw, err := utils2.Marshal(NotifySeries{TFSecs: 86400, Interval: 86400, Rows: []*orm.DataSeries{row}})
+	if err != nil {
+		t.Fatalf("marshal notify series: %v", err)
+	}
+	w := &SeriesWatcher{jobs: map[string]map[string]*PairTFCache{
+		"ohlcv": {"CPI_US": {TimeFrame: "1d", TFSecs: 86400}},
+	}}
+	var got *SeriesMsg
+	w.OnDataMsg = func(msg *SeriesMsg) { got = msg }
+
+	w.onSpiderSeries(&utils.IOMsgRaw{Action: "ohlcv_custom_macro_CPI_US", Data: raw})
+
+	if got == nil || len(got.Rows) != 1 {
+		t.Fatalf("expected one data series row, got %+v", got)
+	}
+	if got.Rows[0].Source != "macro" || got.Rows[0].Values["value"] != 3.14 {
+		t.Fatalf("unexpected data series row: %+v", got.Rows[0])
+	}
 }
 
 func TestSaveKlines(t *testing.T) {

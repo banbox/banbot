@@ -217,18 +217,11 @@ func DownEmitHourKlines(dp *LiveProvider, endsMap map[int32]int64) {
 		if last == nil {
 			continue
 		}
-		bars, convErr := orm.SeriesToBars(exs, []*orm.DataSeries{last})
-		if convErr != nil || len(bars) == 0 {
-			if convErr != nil {
-				log.Error("convert hour series fail", zap.Int32("sid", exs.ID), zap.Error(convErr))
-			}
-			continue
-		}
 		dp.OnDataMsg(&SeriesMsg{
 			NotifySeries: NotifySeries{
 				TFSecs:   3600,
 				Interval: 3600,
-				Arr:      bars,
+				Rows:     []*orm.DataSeries{last},
 			},
 			ExgName: core.ExgName,
 			Market:  core.Market,

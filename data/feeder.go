@@ -289,6 +289,9 @@ func applyAdjSeries(adj *orm.AdjInfo, rows []*orm.DataSeries) []*orm.DataSeries 
 	if adj == nil || len(rows) == 0 {
 		return rows
 	}
+	if !latestSeriesOHLCV(rows) {
+		return rows
+	}
 	exs := adj.ExSymbol
 	if exs == nil {
 		exs = orm.ResolveSeriesExSymbol(rows[0])
@@ -304,11 +307,33 @@ func applyAdjSeriesList(exs *orm.ExSymbol, adjs []*orm.AdjInfo, rows []*orm.Data
 	if len(rows) == 0 {
 		return rows
 	}
+	if !latestSeriesOHLCV(rows) {
+		if cutEnd > 0 {
+			rows = trimSeriesEnd(rows, cutEnd)
+		}
+		if limit > 0 && len(rows) > limit {
+			rows = rows[len(rows)-limit:]
+		}
+		return rows
+	}
 	bars, err := orm.SeriesToBars(exs, rows)
 	if err != nil {
 		return rows
 	}
 	return orm.BarsToSeries(exs, rows[0].TimeFrame, orm.ApplyAdj(adjs, bars, adjMode, cutEnd, limit), nil, rows[0].IsWarmUp, true)
+}
+
+func latestSeriesOHLCV(rows []*orm.DataSeries) bool {
+	return len(rows) > 0 && rows[len(rows)-1] != nil && rows[len(rows)-1].HasOHLCV()
+}
+
+func trimSeriesEnd(rows []*orm.DataSeries, cutEnd int64) []*orm.DataSeries {
+	for i := len(rows) - 1; i >= 0; i-- {
+		if rows[i] != nil && rows[i].TimeMS <= cutEnd {
+			return rows[:i+1]
+		}
+	}
+	return nil
 }
 
 func buildAggSeries(exs *orm.ExSymbol, tf string, rows []*orm.DataSeries, toTFMSecs int64, preFire float64, prev []*orm.DataSeries, fromTFMS, offMS int64, opts ...bool) ([]*orm.DataSeries, bool, *errs.Error) {
