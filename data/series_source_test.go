@@ -19,6 +19,7 @@ import (
 
 type stubSeriesSource struct {
 	info           *orm.SeriesInfo
+	version        string
 	fetchCount     int
 	subscribeCount int
 	rows           []*orm.DataRecord
@@ -63,6 +64,10 @@ func resetDataSourcesForTest(t *testing.T) {
 
 func (s *stubSeriesSource) Info() *orm.SeriesInfo {
 	return s.info
+}
+
+func (s *stubSeriesSource) Version() string {
+	return s.version
 }
 
 func (s *stubSeriesSource) FetchHistory(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error) {
@@ -233,6 +238,30 @@ func TestGetAndListDataSources(t *testing.T) {
 	}
 	if status[0].Health != "registered" || status[0].TimeFrame != "1d" || status[0].Table != alpha.info.Binding.Table {
 		t.Fatalf("unexpected registered source status: %+v", status[0])
+	}
+}
+
+func TestRegisterDataSourceStatusIncludesGovernanceMetadata(t *testing.T) {
+	resetDataSourcesForTest(t)
+	src := newStubRegistrySource("macro_status_metadata_test")
+	src.version = "v1-test"
+	if err := RegisterDataSource(src); err != nil {
+		t.Fatalf("RegisterDataSource failed: %v", err)
+	}
+
+	status := ListDataSourceStatus()
+	if len(status) != 1 {
+		t.Fatalf("expected one status item, got %+v", status)
+	}
+	got := status[0]
+	if got.Health != "registered" || got.Version != "v1-test" || got.RegisteredAtMS == 0 || got.RegisterSource == "" {
+		t.Fatalf("expected registration governance metadata, got %+v", got)
+	}
+	if !strings.Contains(got.RegisterSource, "series_source_test.go") {
+		t.Fatalf("expected register source to point at caller, got %q", got.RegisterSource)
+	}
+	if got.LastBackfill.State != "idle" || got.Subscription.State != "idle" {
+		t.Fatalf("expected idle runtime states, got %+v", got)
 	}
 }
 

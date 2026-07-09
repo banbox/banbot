@@ -54,6 +54,7 @@ func regApiDev(api fiber.Router) {
 	api.Get("/symbol_info", getSymbolInfo)
 	api.Get("/symbol_gaps", getSymbolGaps)
 	api.Get("/symbol_data", getSymbolData)
+	api.Get("/series_ranges", getSeriesRanges)
 	api.Post("/file_op", handleFileOp)
 	api.Post("/new_strat", handleNewStrat)
 	api.Get("/text", getText)
@@ -1610,6 +1611,45 @@ func getSymbolData(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"data": result,
 	})
+}
+
+func getSeriesRanges(c *fiber.Ctx) error {
+	type Args struct {
+		Source    string `query:"source"`
+		Table     string `query:"table"`
+		TimeFrame string `query:"tf"`
+		Sid       int32  `query:"sid"`
+		HasData   string `query:"has_data"`
+		Offset    int    `query:"offset"`
+		Limit     int    `query:"limit"`
+	}
+	var args Args
+	if err := base.VerifyArg(c, &args, base.ArgQuery); err != nil {
+		return err
+	}
+	var hasData *bool
+	if args.HasData != "" && args.HasData != "all" {
+		val := args.HasData == "true" || args.HasData == "1"
+		hasData = &val
+	}
+	sess, conn, err := orm.Conn(nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	ranges, total, err2 := sess.ListSeriesRangeSummaries(orm.ListSeriesRangeSummariesArgs{
+		Source:    args.Source,
+		Table:     args.Table,
+		TimeFrame: args.TimeFrame,
+		Sid:       args.Sid,
+		HasData:   hasData,
+		Offset:    args.Offset,
+		Limit:     args.Limit,
+	})
+	if err2 != nil {
+		return err2
+	}
+	return c.JSON(fiber.Map{"data": ranges, "total": total})
 }
 
 // getBuildEnvs 获取Go支持的所有构建环境

@@ -5,13 +5,17 @@
   import * as m from '$lib/paraglide/messages.js';
   import DrawerDataTools from '$lib/dev/DrawerDataTools.svelte';
   import { exchanges, getMarkets } from '$lib/common';
-  import {curTZ, fmtDateStr} from '$lib/dateutil';
+  import {curTZ, fmtDateStr, TFToSecs} from '$lib/dateutil';
   import { pagination } from '$lib/Snippets.svelte';
   import {localizeHref} from "$lib/paraglide/runtime";
 
   // 状态变量
   let symbols: ExSymbol[] = $state([]);
   let dataSources: DataSourceStatus[] = $state([]);
+  let seriesRanges: SeriesRangeSummary[] = $state([]);
+  let seriesTotal = $state(0);
+  let seriesPage = $state(1);
+  let seriesPageSize = $state(20);
   let totalCount = $state(0);
   let currentPage = $state(1);
   let pageSize = $state(20);
@@ -26,6 +30,11 @@
   let selectedMarket = $state('');
   let symbolFilter = $state('');
   let lastId = $state(0);
+  let seriesSource = $state('');
+  let seriesTable = $state('');
+  let seriesTimeframe = $state('');
+  let seriesSid = $state('');
+  let seriesHasData = $state('all');
 
   type OpStatus = {
     state: string;
@@ -54,6 +63,18 @@
     subscription: OpStatus;
   }
 
+  type SeriesRangeSummary = {
+    sid: number;
+    table: string;
+    source: string;
+    timeframe: string;
+    start_ms: number;
+    stop_ms: number;
+    has_data: boolean;
+    segments: number;
+    symbol?: ExSymbol;
+  }
+
   // 获取数据
   async function fetchSymbols() {
     const rsp = await getApi(`/dev/symbols`, {
@@ -74,6 +95,20 @@
     dataSources = rsp.data ?? [];
   }
 
+  async function fetchSeriesRanges() {
+    const rsp = await getApi('/dev/series_ranges', {
+      source: seriesSource,
+      table: seriesTable,
+      tf: seriesTimeframe,
+      sid: Number(seriesSid) || 0,
+      has_data: seriesHasData,
+      offset: (seriesPage - 1) * seriesPageSize,
+      limit: seriesPageSize,
+    });
+    seriesRanges = rsp.data ?? [];
+    seriesTotal = rsp.total ?? 0;
+  }
+
   function badgeClass(state: string) {
     if (state === 'ok' || state === 'subscribed') return 'badge-success';
     if (state === 'error') return 'badge-error';
@@ -86,10 +121,21 @@
     const bits = [op.state];
     if (op.sid) bits.push(`sid ${op.sid}`);
     if (op.timeframe) bits.push(op.timeframe);
-    if (op.rows) bits.push(`${op.rows} rows`);
-    if (op.subs) bits.push(`${op.subs} subs`);
+    if (op.rows !== undefined) bits.push(`${op.rows} rows`);
+    if (op.subs !== undefined) bits.push(`${op.subs} subs`);
     if (op.error) bits.push(op.error);
     return bits.join(' · ');
+  }
+
+  function rangeRows(row: SeriesRangeSummary) {
+    const tfSecs = TFToSecs(row.timeframe);
+    if (!tfSecs) return '-';
+    return Math.round((row.stop_ms - row.start_ms) / 1000 / tfSecs).toString();
+  }
+
+  function applySeriesFilters() {
+    seriesPage = 1;
+    fetchSeriesRanges();
   }
 
   // 应用筛选
@@ -114,12 +160,74 @@
     isDrawerOpen = !isDrawerOpen;
   }
   onMount(() => {
+    fetchSeriesRanges()
     fetchDataSources()
     fetchSymbols()
   });
 </script>
 
 <div class="container mx-auto p-4">
+    <div class="mb-6">
+        <div class="flex items-center justify-between mb-2">
+            <h2 class="text-base font-semibold">Series Ranges</h2>
+            <button class="btn btn-xs btn-outline" onclick={fetchSeriesRanges}>Refresh</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 mb-3">
+            <input class="input input-sm w-28" placeholder="source" bind:value={seriesSource} />
+            <input class="input input-sm w-36" placeholder="table" bind:value={seriesTable} />
+            <input class="input input-sm w-24" placeholder="tf" bind:value={seriesTimeframe} />
+            <input class="input input-sm w-24" placeholder="sid" bind:value={seriesSid} />
+            <select class="select select-sm w-28" bind:value={seriesHasData}>
+                <option value="all">all</option>
+                <option value="true">data</option>
+                <option value="false">holes</option>
+            </select>
+            <button class="btn btn-sm btn-primary" onclick={applySeriesFilters}>Query</button>
+        </div>
+        <div class="overflow-x-auto w-full">
+            <table class="table table-sm w-full">
+                <thead>
+                    <tr>
+                        <th>Source</th>
+                        <th>Table</th>
+                        <th>TF</th>
+                        <th>Symbol</th>
+                        <th>Start ({curTZ()})</th>
+                        <th>End ({curTZ()})</th>
+                        <th>Rows</th>
+                        <th>Segments</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {#if seriesRanges.length === 0}
+                        <tr><td colspan="9" class="text-base-content/60">No series ranges found.</td></tr>
+                    {:else}
+                        {#each seriesRanges as row}
+                            <tr class="hover:bg-base-300">
+                                <td>{row.source}</td>
+                                <td>{row.table}</td>
+                                <td>{row.timeframe}</td>
+                                <td>
+                                    <a class="link link-hover" href={localizeHref(`/data/item?id=${row.sid}`)}>
+                                        {row.symbol?.symbol || row.sid}
+                                    </a>
+                                    <div class="text-xs text-base-content/60">{row.symbol?.exchange || ''} {row.symbol?.market || ''}</div>
+                                </td>
+                                <td>{fmtDateStr(row.start_ms)}</td>
+                                <td>{fmtDateStr(row.stop_ms)}</td>
+                                <td>{rangeRows(row)}</td>
+                                <td>{row.segments}</td>
+                                <td><span class="badge badge-sm {row.has_data ? 'badge-success' : 'badge-warning'}">{row.has_data ? 'data' : 'hole'}</span></td>
+                            </tr>
+                        {/each}
+                    {/if}
+                </tbody>
+            </table>
+        </div>
+        {@render pagination(seriesTotal, seriesPageSize, seriesPage, i => {seriesPage = i; fetchSeriesRanges()}, i => {seriesPageSize = i; seriesPage = 1; fetchSeriesRanges()})}
+    </div>
+
     <div class="mb-6">
         <div class="flex items-center justify-between mb-2">
             <h2 class="text-base font-semibold">Data Sources</h2>
@@ -165,7 +273,8 @@
                                     <div class="text-xs text-base-content/60">{fmtDateStr(src.subscription?.at_ms ?? 0)}</div>
                                 </td>
                                 <td title={src.register_source}>
-                                    {fmtDateStr(src.registered_at_ms)}
+                                    <div>{fmtDateStr(src.registered_at_ms)}</div>
+                                    <div class="text-xs text-base-content/60 truncate max-w-64">{src.register_source || '-'}</div>
                                 </td>
                             </tr>
                         {/each}

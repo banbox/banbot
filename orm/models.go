@@ -43,6 +43,18 @@ type SRange struct {
 	HasData   bool   `json:"has_data"`
 }
 
+type SeriesRangeSummary struct {
+	Sid       int32     `json:"sid"`
+	Table     string    `json:"table"`
+	Source    string    `json:"source"`
+	Timeframe string    `json:"timeframe"`
+	StartMs   int64     `json:"start_ms"`
+	StopMs    int64     `json:"stop_ms"`
+	HasData   bool      `json:"has_data"`
+	Segments  int64     `json:"segments"`
+	Symbol    *ExSymbol `json:"symbol,omitempty"`
+}
+
 type KlineUn struct {
 	Sid       int32   `json:"sid"`
 	StartMs   int64   `json:"start_ms"`

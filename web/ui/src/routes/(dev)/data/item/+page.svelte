@@ -139,7 +139,7 @@
   function getTimeframes() {
     const tfs = new Set<string>();
     sranges
-      .filter(r => r?.table?.startsWith('kline_') && r?.timeframe)
+      .filter(r => r?.timeframe)
       .forEach(r => tfs.add(r.timeframe));
     return Array.from(tfs).sort((a, b) => {
       return makePeriod(a).secs - makePeriod(b).secs;
@@ -212,18 +212,22 @@
             <thead>
               <tr>
                 <th>{m.timeframe()}</th>
+                <th>Table</th>
                 <th>{m.start_time()}({curTZ()})</th>
                 <th>{m.end_time()}({curTZ()})</th>
                 <th>{m.duration()}</th>
+                <th>Status</th>
               </tr>
             </thead>
             <tbody>
-              {#each sranges.filter(r => r?.table?.startsWith('kline_') && r?.has_data) as info}
+              {#each sranges as info}
                 <tr>
                   <td>{info.timeframe}</td>
+                  <td>{info.table}</td>
                   <td>{fmtDateStr(info.start_ms)}</td>
                   <td>{fmtDateStr(info.stop_ms)}</td>
                   <td>{fmtDurationDays((info.stop_ms - info.start_ms)/1000)}</td>
+                  <td>{info.has_data ? 'data' : 'hole'}</td>
                 </tr>
               {/each}
             </tbody>
