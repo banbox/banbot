@@ -262,7 +262,7 @@ func (j *PairTFCache) fillLacks(pair string, subTfSecs int, startMS, endMS int64
 	j.WaitBar = nil
 	if len(preRows) > 0 {
 		fromTFMS := int64(subTfSecs * 1000)
-		oldBars, _, err := buildOHLCVSeries(exs, j.TimeFrame, preRows, tfMSecs, 0, nil, fromTFMS, j.AlignOffMS, false)
+		oldBars, _, err := buildAggSeries(exs, j.TimeFrame, preRows, tfMSecs, 0, nil, fromTFMS, j.AlignOffMS, false)
 		if err != nil {
 			return nil, err
 		}

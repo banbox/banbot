@@ -111,6 +111,28 @@ func TestResampleSeriesRecordsUsesAggRules(t *testing.T) {
 	}
 }
 
+func TestResampleDataSeriesUsesAggRulesForGenericSeries(t *testing.T) {
+	exs := &ExSymbol{ID: 3, AggRules: `{"rate":"avg","volume":"sum"}`}
+	rows := []*DataSeries{
+		{Source: "funding", Sid: 3, TimeMS: 1_700_000_040_000, EndMS: 1_700_000_100_000, Closed: true, Values: map[string]any{"rate": 1.0, "volume": 2.0}},
+		{Source: "funding", Sid: 3, TimeMS: 1_700_000_100_000, EndMS: 1_700_000_160_000, Closed: true, Values: map[string]any{"rate": 3.0, "volume": 5.0}},
+	}
+
+	got, done, err := ResampleDataSeries(exs, "2m", rows, nil, 120_000, 0, 60_000, 0, true)
+	if err != nil {
+		t.Fatalf("ResampleDataSeries returned error: %v", err)
+	}
+	if !done || len(got) != 1 {
+		t.Fatalf("expected one finished row, done=%v len=%d", done, len(got))
+	}
+	if got[0].Source != "funding" || got[0].TimeFrame != "2m" || !got[0].IsWarmUp {
+		t.Fatalf("unexpected series header: %+v", got[0])
+	}
+	if got[0].Values["rate"] != 2.0 || got[0].Values["volume"] != 7.0 {
+		t.Fatalf("unexpected values: %+v", got[0].Values)
+	}
+}
+
 func testPairTFKline(symbol, tf string, ts int64) *banexg.PairTFKline {
 	return &banexg.PairTFKline{
 		Kline:     banexg.Kline{Time: ts},

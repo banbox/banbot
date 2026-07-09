@@ -2,6 +2,7 @@ package orm
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/banbox/banexg"
@@ -342,10 +343,7 @@ func ResampleSeriesRecords(info *SeriesInfo, exs *ExSymbol, rows []*DataRecord, 
 		}
 		values := make(map[string]any, len(fields))
 		for _, field := range fields {
-			fn, ok := GetAggRuleFunc("last")
-			if exs != nil {
-				fn, ok = GetAggRuleFunc(exs.AggRule(field.Name))
-			}
+			fn, ok := GetAggRuleFunc(seriesAggRule(info, exs, field.Name))
 			if !ok {
 				fn, _ = GetAggRuleFunc("last")
 			}
@@ -384,6 +382,109 @@ func ResampleSeriesRecords(info *SeriesInfo, exs *ExSymbol, rows []*DataRecord, 
 		return nil, err
 	}
 	return out, nil
+}
+
+func ResampleDataSeries(exs *ExSymbol, tf string, rows, prev []*DataSeries, toTFMS int64, preFire float64, fromTFMS, offMS int64, isWarmUp bool) ([]*DataSeries, bool, error) {
+	if len(rows) == 0 {
+		return nil, false, nil
+	}
+	if tf == "" {
+		tf = utils2.SecsToTF(int(toTFMS / 1000))
+	}
+	source := NormalizeSeriesSource(rows[0].Source)
+	info := NewSeriesInfo(source, tf, inferSeriesFields(prev, rows))
+	records := make([]*DataRecord, 0, len(prev)+len(rows))
+	for _, row := range prev {
+		if rec := SeriesToRecord(row); rec != nil {
+			records = append(records, rec)
+		}
+	}
+	for _, row := range rows {
+		if rec := SeriesToRecord(row); rec != nil {
+			records = append(records, rec)
+		}
+	}
+	offsetMS := int64(float64(toTFMS)*preFire) + offMS
+	aggRecords, err := ResampleSeriesRecords(info, exs, records, toTFMS, offsetMS)
+	if err != nil {
+		return nil, false, err
+	}
+	out := RecordsToSeries(info, exs, aggRecords)
+	for _, row := range out {
+		row.IsWarmUp = isWarmUp
+	}
+	lastFinished := false
+	if fromTFMS > 0 && len(out) > 0 {
+		_, offset := utils2.GetTfAlignOrigin(int(toTFMS / 1000))
+		alignOffMS := int64(offset * 1000)
+		finishMS := utils2.AlignTfMSecsOffset(rows[len(rows)-1].TimeMS+fromTFMS+offsetMS, toTFMS, alignOffMS)
+		lastFinished = finishMS > out[len(out)-1].TimeMS
+	}
+	return out, lastFinished, nil
+}
+
+func inferSeriesFields(groups ...[]*DataSeries) []SeriesField {
+	seen := make(map[string]any)
+	for _, rows := range groups {
+		for _, row := range rows {
+			if row == nil {
+				continue
+			}
+			for key, val := range row.Values {
+				if _, ok := seen[key]; !ok {
+					seen[key] = val
+				}
+			}
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	fields := make([]SeriesField, 0, len(keys))
+	for _, key := range keys {
+		fields = append(fields, SeriesField{Name: key, Type: inferSeriesFieldType(seen[key])})
+	}
+	return fields
+}
+
+func inferSeriesFieldType(val any) string {
+	switch val.(type) {
+	case bool:
+		return "bool"
+	case string:
+		return "string"
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return "int"
+	case float32, float64:
+		return "float"
+	default:
+		return "json"
+	}
+}
+
+func seriesAggRule(info *SeriesInfo, exs *ExSymbol, field string) string {
+	if exs != nil {
+		if rule, ok := exs.AggRuleMap()[field]; ok {
+			return rule
+		}
+	}
+	if info != nil && NormalizeSeriesSource(info.Name) == SeriesSourceKline {
+		switch field {
+		case "open":
+			return "first"
+		case "high":
+			return "max"
+		case "low":
+			return "min"
+		case "close":
+			return "last"
+		case "volume", "quote", "buy_volume", "trade_num":
+			return "sum"
+		}
+	}
+	return "last"
 }
 
 func seriesFloatValue(values map[string]any, key string) (float64, error) {
