@@ -3,9 +3,12 @@ package data
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
@@ -22,6 +25,37 @@ type DataSource interface {
 	Info() *orm.SeriesInfo
 	FetchHistory(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error)
 	SubscribeLive(ctx context.Context, subs []*strat.DataSub, sink DataSink) error
+}
+
+type DataSourceVersioner interface {
+	Version() string
+}
+
+type DataSourceOpStatus struct {
+	State     string `json:"state"`
+	Error     string `json:"error,omitempty"`
+	AtMS      int64  `json:"at_ms,omitempty"`
+	Sid       int32  `json:"sid,omitempty"`
+	TimeFrame string `json:"timeframe,omitempty"`
+	StartMS   int64  `json:"start_ms,omitempty"`
+	EndMS     int64  `json:"end_ms,omitempty"`
+	Rows      int    `json:"rows,omitempty"`
+	Subs      int    `json:"subs,omitempty"`
+}
+
+type DataSourceStatus struct {
+	Name                   string             `json:"name"`
+	Health                 string             `json:"health"`
+	RegisteredAtMS         int64              `json:"registered_at_ms"`
+	RegisterSource         string             `json:"register_source"`
+	Version                string             `json:"version,omitempty"`
+	Type                   string             `json:"type"`
+	TimeFrame              string             `json:"timeframe"`
+	Table                  string             `json:"table"`
+	DuplicateRegistrations int                `json:"duplicate_registrations,omitempty"`
+	LastError              string             `json:"last_error,omitempty"`
+	LastBackfill           DataSourceOpStatus `json:"last_backfill"`
+	Subscription           DataSourceOpStatus `json:"subscription"`
 }
 
 type SeriesRuntime struct {
@@ -219,6 +253,7 @@ func (p *SeriesPlan) Activate(ctx context.Context, sink DataSink) ([]*strat.Data
 var (
 	dataSourcesMu sync.RWMutex
 	dataSources   = make(map[string]DataSource)
+	dataSourceSta = make(map[string]*DataSourceStatus)
 )
 
 func RegisterDataSource(src DataSource) error {
@@ -235,9 +270,15 @@ func RegisterDataSource(src DataSource) error {
 	dataSourcesMu.Lock()
 	defer dataSourcesMu.Unlock()
 	if _, ok := dataSources[info.Name]; ok {
+		updateDataSourceStatusLocked(info.Name, func(st *DataSourceStatus) {
+			st.DuplicateRegistrations++
+			st.LastError = dataSourceLastError(st, "duplicate registration")
+			st.Health = dataSourceHealth(st)
+		})
 		return fmt.Errorf("data source %q already registered", info.Name)
 	}
 	dataSources[info.Name] = src
+	dataSourceSta[info.Name] = newDataSourceStatus(src, info)
 	return nil
 }
 
@@ -255,6 +296,22 @@ func ListDataSources() []string {
 		items = append(items, name)
 	}
 	sort.Strings(items)
+	return items
+}
+
+func ListDataSourceStatus() []*DataSourceStatus {
+	dataSourcesMu.RLock()
+	defer dataSourcesMu.RUnlock()
+	names := make([]string, 0, len(dataSourceSta))
+	for name := range dataSourceSta {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	items := make([]*DataSourceStatus, 0, len(names))
+	for _, name := range names {
+		cp := *dataSourceSta[name]
+		items = append(items, &cp)
+	}
 	return items
 }
 
@@ -290,10 +347,26 @@ func ActivateDataSources(ctx context.Context, subs []*strat.DataSub, sink DataSi
 	}
 	activated := make([]*strat.DataSub, 0, len(seen))
 	for _, name := range sortedSourceNames(grouped) {
+		markDataSourceSubscription(name, DataSourceOpStatus{
+			State: "subscribing",
+			AtMS:  time.Now().UnixMilli(),
+			Subs:  len(grouped[name]),
+		}, "")
 		if err := GetDataSource(name).SubscribeLive(ctx, grouped[name], sink); err != nil {
+			markDataSourceSubscription(name, DataSourceOpStatus{
+				State: "error",
+				Error: err.Error(),
+				AtMS:  time.Now().UnixMilli(),
+				Subs:  len(grouped[name]),
+			}, err.Error())
 			return activated, fmt.Errorf("activate data source %q: %w", name, err)
 		}
 		activated = append(activated, grouped[name]...)
+		markDataSourceSubscription(name, DataSourceOpStatus{
+			State: "subscribed",
+			AtMS:  time.Now().UnixMilli(),
+			Subs:  len(grouped[name]),
+		}, "")
 	}
 	return activated, nil
 }
@@ -552,8 +625,119 @@ func EnsureSeriesRangeWithRepo(ctx context.Context, repo orm.SeriesRepo, src Dat
 		return errs.NewMsg(core.ErrBadConfig, "sub source %s does not match data source %s", sub.Source, info.Name)
 	}
 	store := orm.NewSeriesStore(repo)
-	return store.FillMissing(ctx, info, sub.ExSymbol, startMS, endMS,
+	rows := 0
+	err := store.FillMissing(ctx, info, sub.ExSymbol, startMS, endMS,
 		func(ctx context.Context, _ *orm.ExSymbol, gapStartMS, gapEndMS int64) ([]*orm.DataRecord, error) {
-			return src.FetchHistory(ctx, sub, gapStartMS, gapEndMS)
+			got, err := src.FetchHistory(ctx, sub, gapStartMS, gapEndMS)
+			rows += len(got)
+			return got, err
 		})
+	status := DataSourceOpStatus{
+		State:     "ok",
+		AtMS:      time.Now().UnixMilli(),
+		Sid:       sub.ExSymbol.ID,
+		TimeFrame: tf,
+		StartMS:   startMS,
+		EndMS:     endMS,
+		Rows:      rows,
+	}
+	errText := ""
+	if err != nil {
+		status.State = "error"
+		status.Error = err.Short()
+		errText = err.Short()
+	}
+	markDataSourceBackfill(info.Name, status, errText)
+	return err
+}
+
+func newDataSourceStatus(src DataSource, info *orm.SeriesInfo) *DataSourceStatus {
+	version := ""
+	if v, ok := src.(DataSourceVersioner); ok {
+		version = v.Version()
+	}
+	return &DataSourceStatus{
+		Name:           info.Name,
+		Health:         "registered",
+		RegisteredAtMS: time.Now().UnixMilli(),
+		RegisterSource: callerSource(),
+		Version:        version,
+		Type:           reflect.TypeOf(src).String(),
+		TimeFrame:      info.TimeFrame,
+		Table:          info.Binding.Table,
+		LastBackfill:   DataSourceOpStatus{State: "idle"},
+		Subscription:   DataSourceOpStatus{State: "idle"},
+	}
+}
+
+func callerSource() string {
+	for i := 2; i < 12; i++ {
+		pc, file, line, ok := runtime.Caller(i)
+		if !ok {
+			continue
+		}
+		fn := runtime.FuncForPC(pc)
+		if fn == nil || strings.Contains(fn.Name(), "github.com/banbox/banbot/data.RegisterDataSource") || strings.Contains(fn.Name(), "github.com/banbox/banbot/data.RegisterFuncDataSource") {
+			continue
+		}
+		return fmt.Sprintf("%s:%d", file, line)
+	}
+	return ""
+}
+
+func markDataSourceBackfill(name string, status DataSourceOpStatus, lastErr string) {
+	dataSourcesMu.Lock()
+	defer dataSourcesMu.Unlock()
+	updateDataSourceStatusLocked(name, func(st *DataSourceStatus) {
+		st.LastBackfill = status
+		st.LastError = dataSourceLastError(st, lastErr)
+		st.Health = dataSourceHealth(st)
+	})
+}
+
+func markDataSourceSubscription(name string, status DataSourceOpStatus, lastErr string) {
+	dataSourcesMu.Lock()
+	defer dataSourcesMu.Unlock()
+	updateDataSourceStatusLocked(name, func(st *DataSourceStatus) {
+		st.Subscription = status
+		st.LastError = dataSourceLastError(st, lastErr)
+		st.Health = dataSourceHealth(st)
+	})
+}
+
+func updateDataSourceStatusLocked(name string, cb func(*DataSourceStatus)) {
+	st := dataSourceSta[name]
+	if st == nil {
+		return
+	}
+	cb(st)
+}
+
+func dataSourceHealth(st *DataSourceStatus) string {
+	if st == nil {
+		return "unknown"
+	}
+	if st.LastBackfill.State == "error" || st.Subscription.State == "error" {
+		return "error"
+	}
+	if st.Subscription.State == "subscribing" {
+		return "starting"
+	}
+	if st.LastBackfill.State == "ok" || st.Subscription.State == "subscribed" {
+		return "ok"
+	}
+	return "registered"
+}
+
+func dataSourceLastError(st *DataSourceStatus, latest string) string {
+	if latest != "" {
+		return latest
+	}
+	if st == nil {
+		return ""
+	}
+	if st.Subscription.Error != "" {
+		return st.Subscription.Error
+	}
+	return st.LastBackfill.Error
 }

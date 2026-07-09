@@ -3,15 +3,21 @@ package base
 import (
 	"errors"
 
+	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/orm"
 	"github.com/gofiber/fiber/v2"
 )
 
 func RegApiKline(api fiber.Router) {
 	api.Get("/symbols", getSymbols)
+	api.Get("/data_sources", getDataSources)
 	api.Get("/hist", getHist)
 	api.Get("/all_inds", getTaInds)
 	api.Post("/calc_ind", postCalcInd)
+}
+
+func getDataSources(c *fiber.Ctx) error {
+	return c.JSON(fiber.Map{"data": data.ListDataSourceStatus()})
 }
 
 func getSymbols(c *fiber.Ctx) error {

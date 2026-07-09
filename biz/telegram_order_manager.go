@@ -1,13 +1,10 @@
 package biz
 
 import (
-	"fmt"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/rpc"
-	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/log"
-	"go.uber.org/zap"
 )
 
 // TelegramOrderManager 实现 rpc.OrderManagerInterface 接口
@@ -59,100 +56,56 @@ func (m *TelegramOrderManager) GetActiveOrders(account string) ([]*rpc.OrderInfo
 
 // CloseOrder 平仓指定订单
 func (m *TelegramOrderManager) CloseOrder(account string, orderID int64) error {
-	mgr := GetOdMgr(account)
-	if mgr == nil {
-		return fmt.Errorf("account invalid: %v", account)
-	}
-
-	sess, conn, err := ormo.Conn(orm.DbTrades, false)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	// 查找订单
-	taskId := ormo.GetTaskID(account)
-	orders, getErr := sess.GetOrders(ormo.GetOrdersArgs{
-		TaskID: taskId,
-		Status: 1, // 1表示未平仓
+	_, err := CloseBotOrdersRemote(RemoteCommand{
+		Source:    RemoteSourceTelegram,
+		Actor:     "telegram",
+		Account:   account,
+		OrderID:   orderID,
+		ExitTag:   "telegram_close",
+		Confirmed: true,
 	})
-
-	if getErr != nil {
-		return getErr
-	}
-
-	// 在订单列表中查找指定ID的订单
-	var order *ormo.InOutOrder
-	for _, o := range orders {
-		if o.ID == orderID {
-			order = o
-			break
-		}
-	}
-
-	if order == nil {
-		return fmt.Errorf("order not found: %v", orderID)
-	}
-
-	// 创建平仓请求
-	exitReq := &strat.ExitReq{
-		Tag:     "telegram_close",
-		OrderID: order.ID,
-		Force:   true,
-	}
-
-	// 执行平仓
-	_, exitErr := mgr.ExitOpenOrders(order.Symbol, exitReq)
-	if exitErr != nil {
-		return exitErr
-	}
-	return nil
+	return err
 }
 
 // CloseAllOrders 平仓所有订单
 func (m *TelegramOrderManager) CloseAllOrders(account string) (int, int, error) {
-	mgr := GetOdMgr(account)
-	if mgr == nil {
-		return 0, 0, fmt.Errorf("account invalid: %v", account)
-	}
-
-	sess, conn, err := ormo.Conn(orm.DbTrades, false)
+	res, err := CloseBotOrdersRemote(RemoteCommand{
+		Source:    RemoteSourceTelegram,
+		Actor:     "telegram",
+		Account:   account,
+		All:       true,
+		ExitTag:   "telegram_close_all",
+		Confirmed: true,
+	})
 	if err != nil {
 		return 0, 0, err
 	}
-	defer conn.Close()
+	return res.CloseNum, res.FailNum, nil
+}
 
-	// 获取所有活跃订单
-	taskId := ormo.GetTaskID(account)
-	orders, getErr := sess.GetOrders(ormo.GetOrdersArgs{
-		TaskID: taskId,
-		Status: 1, // 1表示未平仓
+func (m *TelegramOrderManager) DisableTrading(account string, hours int) (int64, error) {
+	res, err := RunRemoteCommand(RemoteCommand{
+		Source:       RemoteSourceTelegram,
+		Actor:        "telegram",
+		Account:      account,
+		Action:       RemoteActionTradingSwitch,
+		DisableHours: hours,
 	})
-
-	if getErr != nil {
-		return 0, 0, getErr
+	if err != nil {
+		return 0, err
 	}
+	return res.UntilMS, nil
+}
 
-	successCount := 0
-	failedCount := 0
-
-	for _, order := range orders {
-		exitReq := &strat.ExitReq{
-			Tag:     "telegram_close_all",
-			OrderID: order.ID,
-			Force:   true,
-		}
-
-		_, exitErr := mgr.ExitOpenOrders(order.Symbol, exitReq)
-		if exitErr != nil {
-			log.Error("Failed to close order", zap.Int64("order_id", order.ID), zap.Error(exitErr))
-			failedCount++
-		} else {
-			successCount++
-		}
-	}
-
-	return successCount, failedCount, nil
+func (m *TelegramOrderManager) EnableTrading(account string) error {
+	_, err := RunRemoteCommand(RemoteCommand{
+		Source:  RemoteSourceTelegram,
+		Actor:   "telegram",
+		Account: account,
+		Action:  RemoteActionTradingSwitch,
+		Enable:  true,
+	})
+	return err
 }
 
 // GetOrderStats 获取订单统计信息

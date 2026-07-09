@@ -60,10 +60,40 @@ func RunTradeClose(args []string) error {
 		log.Error("cancelPendingOrders fail", zap.Error(err))
 	}
 	if isExg {
-		return closeOrdersByPos(accMap, pairMap)
+		_, err = biz.RunRemoteCommand(biz.RemoteCommand{
+			Source:    biz.RemoteSourceCLI,
+			Actor:     "cli",
+			Account:   config.DefAcc,
+			Action:    biz.RemoteActionCloseOrder,
+			All:       true,
+			Confirmed: true,
+			ExitTag:   core.ExitTagCli,
+			ExecClose: func() (int, int, *errs.Error) {
+				if err := closeOrdersByPos(accMap, pairMap); err != nil {
+					return 0, 0, errs.New(errs.CodeRunTime, err)
+				}
+				return 0, 0, nil
+			},
+		})
 	} else {
-		return closeOrdersByLocal(accMap, pairMap, stratMap)
+		_, err = biz.RunRemoteCommand(biz.RemoteCommand{
+			Source:    biz.RemoteSourceCLI,
+			Actor:     "cli",
+			Account:   config.DefAcc,
+			Action:    biz.RemoteActionCloseOrder,
+			All:       true,
+			Confirmed: true,
+			ExitTag:   core.ExitTagCli,
+			ExecClose: func() (int, int, *errs.Error) {
+				closeNum, err := closeOrdersByLocal(accMap, pairMap, stratMap)
+				if err != nil {
+					return closeNum, 0, errs.New(errs.CodeRunTime, err)
+				}
+				return closeNum, 0, nil
+			},
+		})
 	}
+	return err
 }
 
 func closeOrdersByPos(accMap map[string]bool, pairMap map[string]bool) error {
@@ -181,17 +211,17 @@ func cancelPendingOrders(accMap map[string]bool, pairMap map[string]bool) *errs.
 				res, err := exchange.CancelOrder(order.ID, order.Symbol, map[string]interface{}{
 					banexg.ParamAccount: account,
 				})
-			if err != nil {
-				if err.BizCode == -2011 {
-					log.Warn("cancel order skip, already cancelled on exchange", zap.String("acc", account),
-						zap.String("pair", order.Symbol), zap.String("orderId", order.ID))
-				} else {
-					log.Error("cancel order fail", zap.String("acc", account),
-						zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
-						zap.Error(err))
+				if err != nil {
+					if err.BizCode == -2011 {
+						log.Warn("cancel order skip, already cancelled on exchange", zap.String("acc", account),
+							zap.String("pair", order.Symbol), zap.String("orderId", order.ID))
+					} else {
+						log.Error("cancel order fail", zap.String("acc", account),
+							zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
+							zap.Error(err))
+					}
+					continue
 				}
-				continue
-			}
 				if res.Status == "canceled" || res.Status == "cancelled" {
 					log.Info("cancel order ok", zap.String("acc", account),
 						zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
@@ -208,10 +238,10 @@ func cancelPendingOrders(accMap map[string]bool, pairMap map[string]bool) *errs.
 	return nil
 }
 
-func closeOrdersByLocal(accMap map[string]bool, pairMap map[string]bool, stratMap map[string]bool) error {
+func closeOrdersByLocal(accMap map[string]bool, pairMap map[string]bool, stratMap map[string]bool) (int, error) {
 	err := ormo.InitTask(true, config.GetDataDir())
 	if err != nil {
-		return err
+		return 0, err
 	}
 	biz.InitLiveOrderMgr(sendOrderMsg)
 	biz.StartLiveOdMgr()
@@ -229,7 +259,7 @@ func closeOrdersByLocal(accMap map[string]bool, pairMap map[string]bool, stratMa
 		odMgr := biz.GetLiveOdMgr(account)
 		oldList, newList, delList, err := odMgr.SyncExgOrders()
 		if err != nil {
-			return err
+			return closeNum, err
 		}
 		openOds, lock := ormo.GetOpenODs(account)
 		var exitOds []*ormo.InOutOrder
@@ -251,7 +281,7 @@ func closeOrdersByLocal(accMap map[string]bool, pairMap map[string]bool, stratMa
 			log.Info("try exit orders", zap.String("acc", account), zap.Int("num", len(exitOds)))
 			exit_, _, err := biz.CloseAccOrders(account, exitOds, &strat.ExitReq{Tag: core.ExitTagCli})
 			if err != nil {
-				return err
+				return closeNum, err
 			}
 			closeNum += exit_
 		}
@@ -259,7 +289,7 @@ func closeOrdersByLocal(accMap map[string]bool, pairMap map[string]bool, stratMa
 	log.Info("closed orders", zap.Int("num", closeNum))
 	if len(checkAccs) == 0 {
 		log.Info("no match open orders to close")
-		return nil
+		return closeNum, nil
 	}
 	// 5s 超时
 	timeout := btime.TimeMS() + 5000
@@ -283,5 +313,5 @@ func closeOrdersByLocal(accMap map[string]bool, pairMap map[string]bool, stratMa
 			break
 		}
 	}
-	return nil
+	return closeNum, nil
 }

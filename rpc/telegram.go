@@ -73,6 +73,8 @@ type OrderManagerInterface interface {
 	CloseOrder(account string, orderID int64) error
 	CloseAllOrders(account string) (int, int, error) // success count, failed count, error
 	GetOrderStats(account string) (longCount, shortCount int, err error)
+	DisableTrading(account string, hours int) (int64, error)
+	EnableTrading(account string) error
 }
 
 // SetOrderManager 设置订单管理器（由外部调用）
@@ -1065,10 +1067,16 @@ func (t *Telegram) getTradingStatus() string {
 
 // disableTrading 禁用交易
 func (t *Telegram) disableTrading(hours int) string {
-	untilMS := btime.TimeMS() + int64(hours)*3600*1000
-
-	// 只对当前激活账户禁用交易
-	core.NoEnterUntil[t.activeAccount] = untilMS
+	if orderManager == nil {
+		errorLabel := config.GetLangMsg("error_label", "❌ 错误")
+		notInitialized := config.GetLangMsg("order_manager_not_initialized", "订单管理器未初始化")
+		return fmt.Sprintf("%s: %s", errorLabel, notInitialized)
+	}
+	untilMS, err := orderManager.DisableTrading(t.activeAccount, hours)
+	if err != nil {
+		errorLabel := config.GetLangMsg("error_label", "❌ 错误")
+		return fmt.Sprintf("%s: %s", errorLabel, err.Error())
+	}
 
 	format := config.GetLangMsg("trading_disabled_format", "🚫 <b>开单已禁用</b>\n\n🎯 <b>账户:</b> <code>%s</code>\n⏰ <b>禁用时长:</b> %d 小时\n📅 <b>恢复时间:</b> %s\n\n使用 <code>/enable</code> 可提前恢复开单")
 	disabledUntil := time.Unix(untilMS/1000, (untilMS%1000)*1000000)
@@ -1077,8 +1085,15 @@ func (t *Telegram) disableTrading(hours int) string {
 
 // enableTrading 启用交易
 func (t *Telegram) enableTrading() string {
-	// 清除当前激活账户的禁用状态
-	delete(core.NoEnterUntil, t.activeAccount)
+	if orderManager == nil {
+		errorLabel := config.GetLangMsg("error_label", "❌ 错误")
+		notInitialized := config.GetLangMsg("order_manager_not_initialized", "订单管理器未初始化")
+		return fmt.Sprintf("%s: %s", errorLabel, notInitialized)
+	}
+	if err := orderManager.EnableTrading(t.activeAccount); err != nil {
+		errorLabel := config.GetLangMsg("error_label", "❌ 错误")
+		return fmt.Sprintf("%s: %s", errorLabel, err.Error())
+	}
 
 	format := config.GetLangMsg("trading_enabled_message", "✅ <b>开单已恢复</b>\n\n🎯 <b>账户:</b> <code>%s</code>\n\n该账户的交易功能已重新启用")
 	return fmt.Sprintf(format, t.activeAccount)

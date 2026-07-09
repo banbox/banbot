@@ -30,6 +30,7 @@ import (
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banbot/web/base"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/gofiber/fiber/v2"
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -531,44 +532,38 @@ func postExitOrder(c *fiber.Ctx) error {
 	}
 
 	return wrapAccount(c, func(acc string) error {
-		openOds, lock := ormo.GetOpenODs(acc)
-		lock.Lock()
-
-		var targetOrders []*ormo.InOutOrder
+		var orderID int64
+		all := data.OrderID == "all"
 		if data.OrderID == "all" {
-			targetOrders = utils2.ValsOfMap(openOds)
+			orderID = 0
 		} else {
-			orderID, err := strconv.ParseInt(data.OrderID, 10, 64)
+			parsed, err := strconv.ParseInt(data.OrderID, 10, 64)
 			if err != nil {
-				lock.Unlock()
 				return fiber.NewError(fiber.StatusBadRequest, "invalid order id")
 			}
-			for _, od := range openOds {
-				if od.ID == orderID {
-					targetOrders = append(targetOrders, od)
-					break
-				}
-			}
-			if len(targetOrders) == 0 {
-				lock.Unlock()
-				return fiber.NewError(fiber.StatusNotFound, "order not found")
-			}
+			orderID = parsed
 		}
-		lock.Unlock()
-
-		closeNum, failNum, err := biz.CloseAccOrders(acc, targetOrders, &strat.ExitReq{
-			Tag:   core.ExitTagUserExit,
-			Force: true,
+		res, err := biz.CloseBotOrdersRemote(biz.RemoteCommand{
+			Source:      biz.RemoteSourceWeb,
+			Actor:       c.IP(),
+			Account:     acc,
+			Idempotency: c.Get("Idempotency-Key"),
+			OrderID:     orderID,
+			All:         all,
+			Confirmed:   true,
+			ExitTag:     core.ExitTagUserExit,
 		})
 		var errMsg string
 		if err != nil {
 			errMsg = err.Short()
+			res = &biz.RemoteCommandResult{}
 		}
 
 		return c.JSON(fiber.Map{
-			"closeNum": closeNum,
-			"failNum":  failNum,
-			"errMsg":   errMsg,
+			"closeNum":   res.CloseNum,
+			"failNum":    res.FailNum,
+			"idempotent": res.Idempotent,
+			"errMsg":     errMsg,
 		})
 	})
 }
@@ -586,52 +581,73 @@ func postCloseExgPos(c *fiber.Ctx) error {
 		return err
 	}
 	return wrapAccount(c, func(acc string) error {
-		var reqs []*CloseArgs
-		if data.Symbol == "all" {
-			posList, err := exg.Default.FetchPositions(nil, map[string]interface{}{
-				banexg.ParamAccount: acc,
-			})
-			if err != nil {
-				return err
-			}
-			for _, p := range posList {
-				reqs = append(reqs, &CloseArgs{
-					Symbol:    p.Symbol,
-					Side:      p.Side,
-					Amount:    p.Contracts,
-					OrderType: banexg.OdTypeMarket,
-				})
-			}
-		} else {
-			reqs = append(reqs, data)
-		}
-		closeNum, doneNum := 0, 0
-		for _, q := range reqs {
-			side := "sell"
-			if q.Side == "short" {
-				side = "buy"
-			}
-			params := map[string]interface{}{
-				banexg.ParamAccount:       acc,
-				banexg.ParamClientOrderId: fmt.Sprintf("bandash_%v", rand.Intn(1000)),
-			}
-			if banexg.IsContract(core.Market) {
-				params[banexg.ParamPositionSide] = strings.ToUpper(q.Side)
-			}
-			res, err := exg.Default.CreateOrder(q.Symbol, q.OrderType, side, q.Amount, q.Price, params)
-			if err != nil {
-				return err
-			}
-			if res.ID != "" {
-				closeNum += 1
-				if res.Filled == res.Amount {
-					doneNum += 1
+		doneNum := 0
+		res, err := biz.RunRemoteCommand(biz.RemoteCommand{
+			Source:      biz.RemoteSourceWeb,
+			Actor:       c.IP(),
+			Account:     acc,
+			Action:      biz.RemoteActionCloseOrder,
+			Idempotency: c.Get("Idempotency-Key"),
+			All:         data.Symbol == "all",
+			Confirmed:   true,
+			ExitTag:     core.ExitTagUserExit,
+			ExecClose: func() (int, int, *errs.Error) {
+				var reqs []*CloseArgs
+				if data.Symbol == "all" {
+					posList, err := exg.Default.FetchPositions(nil, map[string]interface{}{
+						banexg.ParamAccount: acc,
+					})
+					if err != nil {
+						return 0, 0, err
+					}
+					for _, p := range posList {
+						reqs = append(reqs, &CloseArgs{
+							Symbol:    p.Symbol,
+							Side:      p.Side,
+							Amount:    p.Contracts,
+							OrderType: banexg.OdTypeMarket,
+						})
+					}
+				} else {
+					reqs = append(reqs, data)
 				}
+				closeNum := 0
+				for _, q := range reqs {
+					side := "sell"
+					if q.Side == "short" {
+						side = "buy"
+					}
+					params := map[string]interface{}{
+						banexg.ParamAccount:       acc,
+						banexg.ParamClientOrderId: fmt.Sprintf("bandash_%v", rand.Intn(1000)),
+					}
+					if banexg.IsContract(core.Market) {
+						params[banexg.ParamPositionSide] = strings.ToUpper(q.Side)
+					}
+					res, err := exg.Default.CreateOrder(q.Symbol, q.OrderType, side, q.Amount, q.Price, params)
+					if err != nil {
+						return closeNum, 0, err
+					}
+					if res.ID != "" {
+						closeNum += 1
+						if res.Filled == res.Amount {
+							doneNum += 1
+						}
+					}
+				}
+				return closeNum, 0, nil
+			},
+		})
+		if err != nil {
+			if res == nil {
+				res = &biz.RemoteCommandResult{}
 			}
+			return err
 		}
 		return c.JSON(fiber.Map{
-			"closeNum": closeNum,
-			"doneNum":  doneNum,
+			"closeNum":   res.CloseNum,
+			"doneNum":    doneNum,
+			"idempotent": res.Idempotent,
 		})
 	})
 }
@@ -668,9 +684,20 @@ func postDelayEntry(c *fiber.Ctx) error {
 	}
 	return wrapAccount(c, func(acc string) error {
 		untilMS := btime.UTCStamp() + int64(data.Secs*1000)
-		core.NoEnterUntil[acc] = untilMS
+		res, err := biz.RunRemoteCommand(biz.RemoteCommand{
+			Source:      biz.RemoteSourceWeb,
+			Actor:       c.IP(),
+			Account:     acc,
+			Action:      biz.RemoteActionTradingSwitch,
+			Idempotency: c.Get("Idempotency-Key"),
+			UntilMS:     untilMS,
+		})
+		if err != nil {
+			return err
+		}
 		return c.JSON(fiber.Map{
-			"allowTradeAt": untilMS,
+			"allowTradeAt": res.UntilMS,
+			"idempotent":   res.Idempotent,
 		})
 	})
 }

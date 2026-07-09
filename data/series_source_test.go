@@ -49,11 +49,14 @@ func resetDataSourcesForTest(t *testing.T) {
 	t.Helper()
 	dataSourcesMu.Lock()
 	old := dataSources
+	oldSta := dataSourceSta
 	dataSources = make(map[string]DataSource)
+	dataSourceSta = make(map[string]*DataSourceStatus)
 	dataSourcesMu.Unlock()
 	t.Cleanup(func() {
 		dataSourcesMu.Lock()
 		dataSources = old
+		dataSourceSta = oldSta
 		dataSourcesMu.Unlock()
 	})
 }
@@ -168,6 +171,10 @@ func TestRegisterDataSourceRejectsDuplicates(t *testing.T) {
 	if err := RegisterDataSource(src); err == nil {
 		t.Fatalf("expected duplicate data source registration to fail")
 	}
+	status := ListDataSourceStatus()
+	if len(status) != 1 || status[0].DuplicateRegistrations != 1 {
+		t.Fatalf("expected duplicate registration to be visible, got %+v", status)
+	}
 }
 
 func TestRegisterDataSourceRejectsNil(t *testing.T) {
@@ -219,6 +226,13 @@ func TestGetAndListDataSources(t *testing.T) {
 		if gotNames[i] != want {
 			t.Fatalf("expected sorted source names %v, got %v", wantNames, gotNames)
 		}
+	}
+	status := ListDataSourceStatus()
+	if len(status) != 2 || status[0].Name != alpha.info.Name || status[1].Name != beta.info.Name {
+		t.Fatalf("expected sorted source status, got %+v", status)
+	}
+	if status[0].Health != "registered" || status[0].TimeFrame != "1d" || status[0].Table != alpha.info.Binding.Table {
+		t.Fatalf("unexpected registered source status: %+v", status[0])
 	}
 }
 
@@ -290,6 +304,28 @@ func TestActivateDataSourcesFailsForUnknownSource(t *testing.T) {
 		TimeFrame: "1d",
 	}}, stubDataSink{}); err == nil {
 		t.Fatalf("expected ActivateDataSources to fail for an unknown source")
+	}
+}
+
+func TestActivateDataSourcesRecordsSubscriptionFailure(t *testing.T) {
+	resetDataSourcesForTest(t)
+	src := newStubRegistrySource("macro_subscribe_fail_test")
+	src.subscribeErr = fmt.Errorf("subscribe failed")
+	if err := RegisterDataSource(src); err != nil {
+		t.Fatalf("RegisterDataSource failed: %v", err)
+	}
+
+	_, err := ActivateDataSources(context.Background(), []*strat.DataSub{{
+		Source:    src.info.Name,
+		ExSymbol:  &orm.ExSymbol{ID: 101},
+		TimeFrame: src.info.TimeFrame,
+	}}, stubDataSink{})
+	if err == nil {
+		t.Fatalf("expected subscription failure")
+	}
+	status := ListDataSourceStatus()
+	if len(status) != 1 || status[0].Health != "error" || status[0].Subscription.State != "error" || !strings.Contains(status[0].Subscription.Error, "subscribe failed") {
+		t.Fatalf("expected subscription error status, got %+v", status)
 	}
 }
 
@@ -586,6 +622,10 @@ func TestEnsureThirdPartySeriesRangePropagatesFetchFailure(t *testing.T) {
 	if repo.ensureTableCalls != 0 || repo.insertCalls != 0 || repo.updateCalls != 0 {
 		t.Fatalf("expected fetch failure before store writes, got ensure=%d insert=%d update=%d",
 			repo.ensureTableCalls, repo.insertCalls, repo.updateCalls)
+	}
+	status := ListDataSourceStatus()
+	if len(status) != 1 || status[0].Health != "error" || status[0].LastBackfill.State != "error" || !strings.Contains(status[0].LastBackfill.Error, "fetch timeout") {
+		t.Fatalf("expected backfill error status, got %+v", status)
 	}
 }
 
