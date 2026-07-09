@@ -110,10 +110,6 @@ func seriesHandler(msg *data.SeriesMsg) {
 	if len(msg.Rows) == 0 {
 		return
 	}
-	bars, convErr := orm.SeriesToBars(orm.GetExSymbol2(msg.ExgName, msg.Market, msg.Pair), msg.Rows)
-	if convErr != nil {
-		return
-	}
 	wsSubLock.Lock()
 	defer wsSubLock.Unlock()
 	key := fmt.Sprintf("%s_%s_%s", msg.ExgName, msg.Market, msg.Pair)
@@ -122,10 +118,10 @@ func seriesHandler(msg *data.SeriesMsg) {
 		return
 	}
 	wsMsg := map[string]interface{}{
-		"a":    "subscribe",
-		"bars": ArrSeriesBars(bars),
-		"secs": msg.TFSecs,
-		"upd":  msg.Interval,
+		"a":      "subscribe",
+		"series": msg.Rows,
+		"secs":   msg.TFSecs,
+		"upd":    msg.Interval,
 	}
 	raw, marshalErr := utils2.Marshal(wsMsg)
 	if marshalErr != nil {

@@ -3,6 +3,18 @@ import {getApi} from "../netio";
 import {site} from "$lib/stores/site";
 import {get} from "svelte/store";
 
+function seriesToBar(row: any): BarArr {
+  const values = row.Values ?? row.values ?? {}
+  return [
+    row.TimeMS ?? row.timeMS ?? row.time_ms,
+    values.open,
+    values.high,
+    values.low,
+    values.close,
+    values.volume ?? 0
+  ]
+}
+
 export default class MyDatafeed implements Datafeed {
 
   private _prevSymbol?: SymbolInfo
@@ -74,7 +86,8 @@ export default class MyDatafeed implements Datafeed {
     this._ws.onmessage = event => {
       const result = JSON.parse(event.data)
       const action = result.a as string
-      if (action == 'subscribe' && result.bars && result.bars.length) {
+      if (action == 'subscribe' && result.series && result.series.length) {
+        result.bars = result.series.map(seriesToBar)
         const first = result.bars[0] as BarArr
         if (last_bar && first[0] == last_bar[0]) {
           // 如果和上一个推送的bar时间戳相同，则认为是其更新，减去上一个的volume，避免调用方错误累加
