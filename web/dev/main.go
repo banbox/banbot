@@ -12,6 +12,7 @@ import (
 	"github.com/banbox/banbot/utils"
 
 	"github.com/banbox/banbot/web/ui"
+	"github.com/gofiber/fiber/v2/middleware/basicauth"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 
 	"github.com/banbox/banbot/biz"
@@ -38,6 +39,7 @@ func Run(args []string) error {
 	f.StringVar(&ag.LogLevel, "level", "info", "log level")
 	f.StringVar(&ag.TimeZone, "tz", "", "timezone")
 	f.StringVar(&ag.DataDir, "datadir", "", "Path to data dir.")
+	f.StringVar(&ag.Password, "password", "", "password required to access WebUI")
 	f.StringVar(&ag.ConfigData, "config-data", "", "yaml config string")
 	f.Var(&ag.Configs, "config", "config path to use, Multiple -config options may be used")
 	f.StringVar(&ag.LogFile, "logfile", "", "log file path, default: system temp dir")
@@ -46,6 +48,9 @@ func Run(args []string) error {
 	}
 	err_ := f.Parse(args)
 	if err_ != nil {
+		return err_
+	}
+	if err_ = validateWebAuth(ag.Host, ag.Password); err_ != nil {
 		return err_
 	}
 
@@ -101,6 +106,12 @@ func Run(args []string) error {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 	}))
+	if ag.Password != "" {
+		app.Use(basicauth.New(basicauth.Config{
+			Users: map[string]string{"banbot": ag.Password},
+			Realm: "BanBot WebUI",
+		}))
+	}
 
 	// 注册API路由
 	base.RegApiKline(app.Group("/api/kline"))

@@ -3,6 +3,7 @@ package dev
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +37,15 @@ type CmdArgs struct {
 	LogLevel   string
 	LogFile    string
 	TimeZone   string
+	Password   string
+}
+
+func validateWebAuth(host, password string) error {
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip != nil && ip.IsUnspecified() && password == "" {
+		return fmt.Errorf("web password is required when binding to %s", host)
+	}
+	return nil
 }
 
 var (
