@@ -145,4 +145,7 @@ CREATE TABLE IF NOT EXISTS kline_un_q (
   trade_num  LONG,
   is_deleted BOOLEAN
 ) TIMESTAMP(ts) PARTITION BY MONTH WAL
-DEDUP UPSERT KEYS(sid, timeframe, ts)
+DEDUP UPSERT KEYS(sid, timeframe, ts);
+
+-- version 4
+ALTER TABLE exsymbol_q ADD COLUMN agg_rules STRING;

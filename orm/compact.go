@@ -29,7 +29,7 @@ type TableCompactMeta struct {
 var compactTables = map[string]*TableCompactMeta{
 	"exsymbol_q": {
 		LatestByKeys: "sid",
-		SelectCols:   "sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms",
+		SelectCols:   "sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules",
 		PartitionBy:  "YEAR",
 		DedupKeys:    "sid, ts",
 		Cooldown:     12 * time.Hour,

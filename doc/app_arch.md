@@ -489,7 +489,13 @@ K 线落库流程强调“先写库、后广播”，使 live provider 收到的
 
 QuestDB 支持自动安装和启动，并根据配置调整内存参数。PostgreSQL/Timescale 路径保留标准连接池语义。
 
-### 9.3 K 线和覆盖范围
+### 9.3 ExSymbol 与列级聚合
+
+`ExSymbol` 是 K 线和自定义时序共用的 sid 元数据。除 `exchange + market + symbol` 身份字段外，`agg_rules` 用 JSON 文本保存列级聚合方式，例如 `{"high":"max","low":"min","close":"last","volume":"sum","rate":"avg"}`。
+
+支持规则为 `min`、`max`、`last`、`first`、`sum`、`avg`、`mid`，以及通过 `orm.RegisterAggRule(name, fn)` 注册的自定义方法；未配置、未注册或非法值默认 `last`。K 线不再有特殊 `info` 字段，扩展列和其他自定义时序一样按列级规则处理。
+
+### 9.4 K 线和覆盖范围
 
 K 线表按周期拆分，例如 1m、5m、1h、1d 等。系统使用 `ExSymbol` 的 sid 统一识别交易所、市场、真实交易所和 symbol。
 
@@ -497,13 +503,13 @@ K 线表按周期拆分，例如 1m、5m、1h、1d 等。系统使用 `ExSymbol`
 
 在 QuestDB 下，sranges 使用 append-only 和软删除配合 LATEST BY；在 PostgreSQL 下，sranges 可以使用事务、更新和唯一约束表达同样语义。
 
-### 9.4 QuestDB WAL 可见性
+### 9.5 QuestDB WAL 可见性
 
 QuestDB WAL 表存在写入成功但立即读取不可见的问题。项目已有专门的可见性等待逻辑，用于 exsymbol、calendar、K 线窗口、K 线范围、series 写入和表重写校验。
 
 架构上应把 QuestDB 视为最终一致读模型：任何会在写入后立刻做判断、删除、rename 或清理恢复状态的流程，都必须先等待目标行、范围或计数可见。
 
-### 9.5 SeriesRepo 与自定义时序
+### 9.6 SeriesRepo 与自定义时序
 
 `SeriesRepo` 为自定义时序数据提供统一仓储能力：
 

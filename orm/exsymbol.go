@@ -2,8 +2,10 @@ package orm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -28,7 +30,19 @@ var (
 	tryListLock   deadlock.Mutex
 	hourPairsLock deadlock.Mutex
 	maxSid        int32 // in-memory sid counter, protected by symbolLock
+	aggRulesMu    sync.RWMutex
+	aggRules      = map[string]AggRuleFunc{
+		"min":   nil,
+		"max":   nil,
+		"last":  nil,
+		"first": nil,
+		"sum":   nil,
+		"avg":   nil,
+		"mid":   nil,
+	}
 )
+
+type AggRuleFunc func(rows []*DataRecord, field SeriesField) (any, error)
 
 func cacheExSymbol(exs *ExSymbol) {
 	if exs == nil {
@@ -177,6 +191,7 @@ func makeExSymbolFromAdd(id int32, item AddSymbolsParams) *ExSymbol {
 		Combined: item.Combined,
 		ListMs:   item.ListMs,
 		DelistMs: item.DelistMs,
+		AggRules: item.AggRules,
 	}
 }
 
@@ -301,6 +316,7 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 			exs.ListMs = item.ListMs
 			exs.DelistMs = item.DelistMs
 			exs.Combined = item.Combined
+			exs.AggRules = item.AggRules
 		}
 	}
 	if len(adds) == 0 {
@@ -323,7 +339,8 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 			continue
 		}
 		argList = append(argList, AddSymbolsParams{Exchange: item.Exchange, ExgReal: item.ExgReal,
-			Market: item.Market, Symbol: item.Symbol, Combined: item.Combined, ListMs: item.ListMs, DelistMs: item.DelistMs})
+			Market: item.Market, Symbol: item.Symbol, Combined: item.Combined, ListMs: item.ListMs, DelistMs: item.DelistMs,
+			AggRules: item.AggRules})
 	}
 	_, err_ := pq.AddSymbols(context.Background(), argList)
 	if err_ != nil {
@@ -349,6 +366,7 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 		exs.ListMs = item.ListMs
 		exs.DelistMs = item.DelistMs
 		exs.Combined = item.Combined
+		exs.AggRules = item.AggRules
 	}
 	return nil
 }
@@ -410,13 +428,85 @@ func (s *ExSymbol) ToShort() string {
 	}
 }
 
-func (s *ExSymbol) InfoBy() string {
-	if s.Exchange == "china" && s.Market != banexg.MarketSpot {
-		// 中国非股票现货市场，K线的info字段存储持仓量，使用last归集
-		return "last"
+func (s *ExSymbol) AggRule(col string) string {
+	rules := s.AggRuleMap()
+	if rule, ok := rules[col]; ok {
+		return normalizeAggRule(rule)
 	}
-	// 加密货币，info存储主动买入量，使用sum归集
-	return "sum"
+	return "last"
+}
+
+func (s *ExSymbol) AggRuleMap() map[string]string {
+	if s == nil || strings.TrimSpace(s.AggRules) == "" {
+		return nil
+	}
+	var rules map[string]string
+	if err := json.Unmarshal([]byte(s.AggRules), &rules); err != nil {
+		return nil
+	}
+	for col, rule := range rules {
+		rules[col] = normalizeAggRule(rule)
+	}
+	return rules
+}
+
+func (s *ExSymbol) SetAggRules(rules map[string]string) error {
+	if len(rules) == 0 {
+		s.AggRules = ""
+		return nil
+	}
+	clean := make(map[string]string, len(rules))
+	for col, rule := range rules {
+		col = strings.TrimSpace(col)
+		if col == "" {
+			continue
+		}
+		rule = strings.ToLower(strings.TrimSpace(rule))
+		if rule == "" {
+			rule = "last"
+		}
+		clean[col] = rule
+	}
+	data, err := json.Marshal(clean)
+	if err != nil {
+		return err
+	}
+	s.AggRules = string(data)
+	return nil
+}
+
+func normalizeAggRule(rule string) string {
+	rule = strings.ToLower(strings.TrimSpace(rule))
+	aggRulesMu.RLock()
+	_, ok := aggRules[rule]
+	aggRulesMu.RUnlock()
+	if ok {
+		return rule
+	}
+	return "last"
+}
+
+func RegisterAggRule(name string, fn AggRuleFunc) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" || fn == nil {
+		return false
+	}
+	aggRulesMu.Lock()
+	aggRules[name] = fn
+	aggRulesMu.Unlock()
+	return true
+}
+
+func GetAggRuleFunc(name string) (AggRuleFunc, bool) {
+	raw := strings.ToLower(strings.TrimSpace(name))
+	name = normalizeAggRule(raw)
+	if name != raw {
+		return nil, false
+	}
+	aggRulesMu.RLock()
+	fn, ok := aggRules[name]
+	aggRulesMu.RUnlock()
+	return fn, ok
 }
 
 func InitListDates() *errs.Error {

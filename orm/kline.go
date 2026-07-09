@@ -86,8 +86,7 @@ func (q *Queries) QueryOHLCV(exs *ExSymbol, timeframe string, startMs, endMs int
 			fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
 			var lastFinish bool
 			offMS := GetAlignOff(exs.ID, tfMSecs)
-			infoBy := exs.InfoBy()
-			klines, lastFinish = utils.BuildOHLCV(klines, tfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
+			klines, lastFinish = utils.BuildOHLCV(klines, tfMSecs, 0, nil, fromTfMSecs, offMS)
 			if !lastFinish && len(klines) > 0 {
 				klines = klines[:len(klines)-1]
 			}
@@ -141,8 +140,7 @@ order by ts`, exs.ID, startMs*1000, finishEndMS*1000)
 		fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
 		var lastFinish bool
 		offMS := GetAlignOff(exs.ID, tfMSecs)
-		infoBy := exs.InfoBy()
-		klines, lastFinish = utils.BuildOHLCV(klines, tfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
+		klines, lastFinish = utils.BuildOHLCV(klines, tfMSecs, 0, nil, fromTfMSecs, offMS)
 		if !lastFinish && len(klines) > 0 {
 			klines = klines[:len(klines)-1]
 		}
@@ -219,8 +217,7 @@ order by sid,ts`, startMs*1000, finishEndMS*1000, sidText)
 		if fromTfMSecs > 0 {
 			var lastDone bool
 			offMS := GetAlignOff(curSid, tfMSecs)
-			infoBy := exsMap[curSid].InfoBy()
-			klineArr, lastDone = utils.BuildOHLCV(klineArr, tfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
+			klineArr, lastDone = utils.BuildOHLCV(klineArr, tfMSecs, 0, nil, fromTfMSecs, offMS)
 			if !lastDone && len(klineArr) > 0 {
 				klineArr = klineArr[:len(klineArr)-1]
 			}
@@ -629,9 +626,8 @@ order by ts`, sid, startMS*1000, endMS*1000)
 	toTfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
 	offMS := GetAlignOff(sid, toTfMSecs)
-	infoBy := GetSymbolByID(sid).InfoBy()
 	var lastFinish bool
-	klines, lastFinish = utils.BuildOHLCV(klines, toTfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
+	klines, lastFinish = utils.BuildOHLCV(klines, toTfMSecs, 0, nil, fromTfMSecs, offMS)
 	if !lastFinish && len(klines) > 0 {
 		klines = klines[:len(klines)-1]
 	}
@@ -643,8 +639,6 @@ func calcUnfinishFromSubs(sess *Queries, sid int32, timeFrame string, startMS, e
 	if len(chain) == 0 {
 		return nil, 0, nil
 	}
-
-	infoBy := GetSymbolByID(sid).InfoBy()
 	parts := make([]*banexg.Kline, 0, 32)
 	curStart := startMS
 	lastToMS := int64(0)
@@ -698,19 +692,13 @@ func calcUnfinishFromSubs(sess *Queries, sid int32, timeFrame string, startMS, e
 		Volume: 0,
 		Quote:  0,
 	}
-	var infoSum float64
 	for _, p := range parts {
 		res.High = max(res.High, p.High)
 		res.Low = min(res.Low, p.Low)
 		res.Volume += p.Volume
 		res.Quote += p.Quote
 		res.TradeNum += p.TradeNum
-		infoSum += p.BuyVolume
-	}
-	if infoBy == "sum" {
-		res.BuyVolume = infoSum
-	} else {
-		res.BuyVolume = parts[len(parts)-1].BuyVolume
+		res.BuyVolume += p.BuyVolume
 	}
 	return res, lastToMS, nil
 }
@@ -963,7 +951,7 @@ func (q *Queries) updateBigHyper(exs *ExSymbol, timeFrame string, startMS, endMS
 	}
 	if len(aggJobs) > 0 {
 		for _, item := range aggJobs {
-			err := q.refreshAgg(item, exs.ID, startMS, endMS, "", exs.InfoBy(), true)
+			err := q.refreshAgg(item, exs.ID, startMS, endMS, "", true)
 			if err != nil {
 				return err
 			}
@@ -972,7 +960,7 @@ func (q *Queries) updateBigHyper(exs *ExSymbol, timeFrame string, startMS, endMS
 	return nil
 }
 
-func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int64, aggFrom, infoBy string, isCont bool) *errs.Error {
+func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int64, aggFrom string, isCont bool) *errs.Error {
 	tfMSecs := item.MSecs
 	startMS := utils2.AlignTfMSecs(orgStartMS, tfMSecs)
 	endMS := utils2.AlignTfMSecs(orgEndMS, tfMSecs)
@@ -999,7 +987,7 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 		return nil
 	}
 	if !IsQuestDB {
-		return q.refreshAggPg(item, sid, aggStart, endMS, aggFrom, infoBy)
+		return q.refreshAggPg(item, sid, aggStart, endMS, aggFrom)
 	}
 	fromTbl := "kline_" + aggFrom
 	ctx := context.Background()
@@ -1017,7 +1005,7 @@ order by ts`, fromTbl), sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endM
 	}
 	fromTfMSecs := int64(utils2.TFToSecs(aggFrom) * 1000)
 	offMS := GetAlignOff(sid, tfMSecs)
-	aggBars, lastFinish := utils.BuildOHLCV(src, tfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
+	aggBars, lastFinish := utils.BuildOHLCV(src, tfMSecs, 0, nil, fromTfMSecs, offMS)
 	if !lastFinish && len(aggBars) > 0 {
 		aggBars = aggBars[:len(aggBars)-1]
 	}
@@ -1362,13 +1350,13 @@ func SyncKlineTFs(args *config.CmdArgs, pb *utils.StagedPrg) *errs.Error {
 	}
 	exsList := GetAllExSymbols()
 	cache := map[string]map[string]bool{}
-	sidMap := make(map[int32]string)
+	sidMap := make(map[int32]bool)
 	for _, exs := range exsList {
 		if len(pairs) > 0 {
 			if _, ok := pairs[exs.Symbol]; !ok {
 				continue
 			}
-			sidMap[exs.ID] = exs.InfoBy()
+			sidMap[exs.ID] = true
 		}
 		cc, _ := cache[exs.Exchange]
 		if cc == nil {
@@ -1395,7 +1383,7 @@ func SyncKlineTFs(args *config.CmdArgs, pb *utils.StagedPrg) *errs.Error {
 	return err
 }
 
-func syncKlineInfos(sess *Queries, sids map[int32]string, prg utils.PrgCB) *errs.Error {
+func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.Error {
 	// Build sid filter for GetKlineRanges (sranges-based, avoids soft-deleted data in QuestDB).
 	sidFilter := make([]int32, 0, len(sids))
 	for sid := range sids {
@@ -1442,19 +1430,13 @@ func syncKlineInfos(sess *Queries, sids map[int32]string, prg utils.PrgCB) *errs
 			return err
 		}
 		defer conn.Release()
-		infoBy := sids[sid]
-		if infoBy == "" {
-			if exs := GetSymbolByID(sid); exs != nil {
-				infoBy = exs.InfoBy()
-			}
-		}
-		err = sess2.syncKlineSid(sid, infoBy, calcs)
+		err = sess2.syncKlineSid(sid, calcs)
 		pBar.Add(len(aggList))
 		return err
 	})
 }
 
-func (q *Queries) syncKlineSid(sid int32, infoBy string, calcs map[string]map[int32][2]int64) *errs.Error {
+func (q *Queries) syncKlineSid(sid int32, calcs map[string]map[int32][2]int64) *errs.Error {
 	tfRanges := make(map[string][2]int64)
 	for _, agg := range aggList {
 		rg, ok := calcs[agg.TimeFrame][sid]
@@ -1495,7 +1477,7 @@ func (q *Queries) syncKlineSid(sid int32, infoBy string, calcs map[string]map[in
 			curStart, curEnd = curRange[0], curRange[1]
 		}
 		if curStart == 0 || curEnd == 0 {
-			if err := q.refreshAgg(agg, sid, subStart, subEnd, "", infoBy, false); err != nil {
+			if err := q.refreshAgg(agg, sid, subStart, subEnd, "", false); err != nil {
 				return err
 			}
 			continue
@@ -1504,12 +1486,12 @@ func (q *Queries) syncKlineSid(sid int32, infoBy string, calcs map[string]map[in
 		subAlignStart := utils2.AlignTfMSecs(subStart, tfMSecs)
 		subAlignEnd := utils2.AlignTfMSecs(subEnd, tfMSecs)
 		if subAlignStart < curStart {
-			if err := q.refreshAgg(agg, sid, subStart, min(subEnd, curStart), "", infoBy, false); err != nil {
+			if err := q.refreshAgg(agg, sid, subStart, min(subEnd, curStart), "", false); err != nil {
 				return err
 			}
 		}
 		if subAlignEnd > curEnd {
-			if err := q.refreshAgg(agg, sid, max(curEnd, subStart), subEnd, "", infoBy, false); err != nil {
+			if err := q.refreshAgg(agg, sid, max(curEnd, subStart), subEnd, "", false); err != nil {
 				return err
 			}
 		}

@@ -24,6 +24,7 @@ type ExSymbol struct {
 	Combined bool   `json:"combined"`
 	ListMs   int64  `json:"list_ms"`
 	DelistMs int64  `json:"delist_ms"`
+	AggRules string `json:"agg_rules"`
 }
 
 type InsKline struct {

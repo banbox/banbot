@@ -310,12 +310,18 @@ type AddSymbolsParams struct {
 	Combined bool   `json:"combined"`
 	ListMs   int64  `json:"list_ms"`
 	DelistMs int64  `json:"delist_ms"`
+	AggRules string `json:"agg_rules"`
 }
 
 type SetListMSParams struct {
 	ID       int32 `json:"id"`
 	ListMs   int64 `json:"list_ms"`
 	DelistMs int64 `json:"delist_ms"`
+}
+
+type SetAggRulesParams struct {
+	ID       int32  `json:"id"`
+	AggRules string `json:"agg_rules"`
 }
 
 func (q *Queries) ListExchanges(ctx context.Context) ([]string, error) {
@@ -352,7 +358,7 @@ func (q *Queries) ListSymbols(ctx context.Context, exchange string) ([]*ExSymbol
 	if !IsQuestDB {
 		return q.listSymbolsPg(ctx, exchange)
 	}
-	rows, err := q.db.Query(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms
+	rows, err := q.db.Query(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, coalesce(agg_rules, '')
 FROM exsymbol_q
 LATEST BY sid
 WHERE exchange = $1 AND coalesce(is_deleted, false) = false
@@ -364,7 +370,7 @@ ORDER BY sid`, exchange)
 	var out []*ExSymbol
 	for rows.Next() {
 		var i ExSymbol
-		if err := rows.Scan(&i.ID, &i.Exchange, &i.ExgReal, &i.Market, &i.Symbol, &i.Combined, &i.ListMs, &i.DelistMs); err != nil {
+		if err := rows.Scan(&i.ID, &i.Exchange, &i.ExgReal, &i.Market, &i.Symbol, &i.Combined, &i.ListMs, &i.DelistMs, &i.AggRules); err != nil {
 			return nil, err
 		}
 		out = append(out, &i)
@@ -394,8 +400,8 @@ func (q *Queries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64
 		lastSID = sid
 		lastSymbol = s
 		ts := now.Add(time.Duration(i) * time.Microsecond)
-		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, is_deleted)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`, sid, ts, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs)
+		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules, is_deleted)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`, sid, ts, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs, s.AggRules)
 		if err != nil {
 			return int64(i), err
 		}
@@ -438,10 +444,36 @@ func (q *Queries) SetListMS(ctx context.Context, arg SetListMSParams) error {
 		return fmt.Errorf("SetListMS: sid %d not found: %w", arg.ID, err)
 	}
 	ts := time.Now().UTC()
-	_, err = q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, is_deleted)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
-		item.ID, ts, item.Exchange, item.ExgReal, item.Market, item.Symbol, item.Combined, arg.ListMs, arg.DelistMs)
+	_, err = q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules, is_deleted)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
+		item.ID, ts, item.Exchange, item.ExgReal, item.Market, item.Symbol, item.Combined, arg.ListMs, arg.DelistMs, item.AggRules)
 	if err == nil {
+		if err = waitForQuestExsymbolTimestampVisible(ctx, q, item.ID, ts); err != nil {
+			return err
+		}
+		MaybeCompact("exsymbol_q")
+	}
+	return err
+}
+
+func (q *Queries) SetAggRules(ctx context.Context, arg SetAggRulesParams) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !IsQuestDB {
+		return q.setAggRulesPg(ctx, arg)
+	}
+	item, err := waitForQuestExsymbolVisible(ctx, q, arg.ID)
+	if err != nil || item == nil {
+		return fmt.Errorf("SetAggRules: sid %d not found: %w", arg.ID, err)
+	}
+	ts := time.Now().UTC()
+	_, err = q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules, is_deleted)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
+		item.ID, ts, item.Exchange, item.ExgReal, item.Market, item.Symbol, item.Combined, item.ListMs, item.DelistMs, arg.AggRules)
+	if err == nil {
+		item.AggRules = arg.AggRules
+		cacheExSymbol(item)
 		if err = waitForQuestExsymbolTimestampVisible(ctx, q, item.ID, ts); err != nil {
 			return err
 		}

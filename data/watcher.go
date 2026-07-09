@@ -273,8 +273,7 @@ func (w *SeriesWatcher) onSpiderBar(raw *utils.IOMsgRaw) {
 			olds = append(olds, job.WaitBar)
 		}
 		jobMSecs := int64(job.TFSecs * 1000)
-		infoBy := orm.GetExSymbol2(exgName, market, pair).InfoBy()
-		aggRows, lastDone, err := buildOHLCVSeries(orm.GetExSymbol2(exgName, market, pair), utils2.SecsToTF(job.TFSecs), curRows, jobMSecs, 0, olds, tfMSecs, job.AlignOffMS, infoBy, false)
+		aggRows, lastDone, err := buildOHLCVSeries(orm.GetExSymbol2(exgName, market, pair), utils2.SecsToTF(job.TFSecs), curRows, jobMSecs, 0, olds, tfMSecs, job.AlignOffMS, false)
 		if err != nil {
 			log.Error("build series fail", zap.String("pair", pair), zap.Error(err))
 			return

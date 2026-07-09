@@ -247,7 +247,24 @@ type SeriesInfo struct {
 - `bool`
 - `json`
 
-### 4.2 存储行：`DataRecord`
+### 4.2 列级聚合规则：`ExSymbol.AggRules`
+
+`ExSymbol` 现在带有 `agg_rules` 文本列，两套后端均支持：
+
+- TimescaleDB / PostgreSQL：`exsymbol.agg_rules`
+- QuestDB：`exsymbol_q.agg_rules`
+
+字段内容是 JSON 对象，key 为列名，value 为聚合规则：
+
+```json
+{"open":"first","high":"max","low":"min","close":"last","volume":"sum","rate":"avg"}
+```
+
+支持规则：`min`、`max`、`last`、`first`、`sum`、`avg`、`mid`，也可以通过 `orm.RegisterAggRule(name, fn)` 注册自定义聚合方法后在 JSON 中使用。未配置、未注册或非法值默认按 `last` 处理。
+
+K 线不再有特殊 `info` 字段，也没有按市场分支的 `InfoBy()` 兼容层。内置 OHLCV 字段仍按固定 K 线语义聚合；自定义扩展列按 `AggRule(field)` 读取列级规则。
+
+### 4.3 存储行：`DataRecord`
 
 ```go
 type DataRecord struct {
@@ -267,7 +284,7 @@ type DataRecord struct {
 
 `EnsureSeriesRange(...)` 会自动把 `Sid=0` 的记录补成目标 `sub.ExSymbol.ID`，但最终入库前 sid 必须确定。
 
-### 4.3 运行时事件：`DataSeries`
+### 4.4 运行时事件：`DataSeries`
 
 ```go
 type DataSeries struct {
@@ -291,7 +308,7 @@ type DataSeries struct {
 - `ExSymbol` 在 kline/交易路径下可直接带上标的信息
 - `Adj` 仅对内置 OHLCV 适配链路有意义
 
-### 4.4 OHLCV 兼容适配：`AsKline`
+### 4.5 OHLCV 兼容适配：`AsKline`
 
 当 `Values` 至少包含以下字段时，可被兼容投影成 `InfoKline`：
 

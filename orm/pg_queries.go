@@ -209,7 +209,7 @@ func (q *Queries) getKLineNumPg(sid int32, timeFrame string, start, end int64) i
 // ─────────────────────────────────────────────
 
 // refreshAggPg uses an in-DB INSERT … SELECT … GROUP BY for efficient aggregation in TimescaleDB.
-func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64, aggFrom, infoBy string) *errs.Error {
+func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64, aggFrom string) *errs.Error {
 	if aggFrom == "" {
 		aggFrom = item.AggFrom
 	}
@@ -219,16 +219,6 @@ func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64,
 	fromTbl := "kline_" + aggFrom
 	toTbl := item.Table
 	tfMSecs := item.MSecs
-
-	// Determine aggregation expression for buy_volume based on infoBy.
-	var buyVolAgg string
-	if infoBy == "last" {
-		// PostgreSQL doesn't support LAST_VALUE in GROUP BY aggregates directly;
-		// fall back to application-side aggregation for infoBy="last" case.
-		return q.refreshAggPgAppSide(item, sid, aggStart, endMS, aggFrom, infoBy)
-	}
-	buyVolAgg = "SUM(buy_volume)"
-
 	// Align windows (accounting for exchange-specific offset).
 	offMS := GetAlignOff(sid, tfMSecs)
 	alignedStart := utils2.AlignTfMSecs(aggStart-offMS, tfMSecs) + offMS
@@ -250,7 +240,7 @@ SELECT $1,
        (array_agg(close ORDER BY time DESC))[1],
        SUM(volume),
        SUM(quote),
-       %s,
+       SUM(buy_volume),
        SUM(trade_num)
 FROM %s
 WHERE sid = $1 AND time >= $2 AND time < $3
@@ -259,57 +249,13 @@ HAVING COUNT(*) > 0
 ON CONFLICT (sid, time) DO UPDATE SET
   open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
   volume = EXCLUDED.volume, quote = EXCLUDED.quote, buy_volume = EXCLUDED.buy_volume, trade_num = EXCLUDED.trade_num`,
-		toTbl, groupExpr, buyVolAgg, fromTbl)
+		toTbl, groupExpr, fromTbl)
 
 	_, err := q.db.Exec(context.Background(), insertSQL, sid, alignedStart, alignedEnd)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
-}
-
-// refreshAggPgAppSide performs application-side aggregation for TimescaleDB (used for infoBy="last").
-func (q *Queries) refreshAggPgAppSide(item *KlineAgg, sid int32, aggStart, endMS int64, aggFrom, infoBy string) *errs.Error {
-	tfMSecs := item.MSecs
-	fromTbl := "kline_" + aggFrom
-	ctx := context.Background()
-	rows, err_ := q.db.Query(ctx, fmt.Sprintf(`
-SELECT time,open,high,low,close,volume,quote,buy_volume,trade_num
-FROM %s
-WHERE sid=$1 AND time >= $2 AND time < $3
-ORDER BY time`, fromTbl), sid, aggStart, endMS)
-	src, err_ := mapToKlines(rows, err_)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
-	}
-	if len(src) == 0 {
-		return nil
-	}
-	fromTfMSecs := int64(utils2.TFToSecs(aggFrom) * 1000)
-	offMS := GetAlignOff(sid, tfMSecs)
-	aggBars, lastFinish := utils.BuildOHLCV(src, tfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
-	if !lastFinish && len(aggBars) > 0 {
-		aggBars = aggBars[:len(aggBars)-1]
-	}
-	if len(aggBars) == 0 {
-		return nil
-	}
-	cut := aggBars[:0]
-	for _, b := range aggBars {
-		if b.Time < aggStart {
-			continue
-		}
-		if b.Time+tfMSecs > endMS {
-			break
-		}
-		cut = append(cut, b)
-	}
-	aggBars = cut
-	if len(aggBars) == 0 {
-		return nil
-	}
-	_, err := insertKLinesPg(q, item.TimeFrame, sid, aggBars)
-	return err
 }
 
 // ─────────────────────────────────────────────
@@ -323,11 +269,11 @@ func (q *Queries) listSymbolsPg(ctx context.Context, exchange string) ([]*ExSymb
 	var sqlText string
 	var args []any
 	if exchange != "" {
-		sqlText = `SELECT id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms
+		sqlText = `SELECT id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, coalesce(agg_rules, '')
 FROM exsymbol WHERE exchange = $1 ORDER BY id`
 		args = []any{exchange}
 	} else {
-		sqlText = `SELECT id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms
+		sqlText = `SELECT id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, coalesce(agg_rules, '')
 FROM exsymbol ORDER BY id`
 	}
 	rows, err := q.db.Query(ctx, sqlText, args...)
@@ -338,7 +284,7 @@ FROM exsymbol ORDER BY id`
 	var out []*ExSymbol
 	for rows.Next() {
 		var i ExSymbol
-		if err := rows.Scan(&i.ID, &i.Exchange, &i.ExgReal, &i.Market, &i.Symbol, &i.Combined, &i.ListMs, &i.DelistMs); err != nil {
+		if err := rows.Scan(&i.ID, &i.Exchange, &i.ExgReal, &i.Market, &i.Symbol, &i.Combined, &i.ListMs, &i.DelistMs, &i.AggRules); err != nil {
 			return nil, err
 		}
 		out = append(out, &i)
@@ -377,10 +323,10 @@ func (q *Queries) addSymbolsPg(ctx context.Context, arg []AddSymbolsParams) (int
 	for i, s := range arg {
 		maxSid++
 		sid := maxSid
-		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol (id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol (id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	ON CONFLICT (exchange, market, symbol) DO NOTHING`,
-			sid, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs)
+			sid, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs, s.AggRules)
 		if err != nil {
 			return int64(i), err
 		}
@@ -403,6 +349,19 @@ func (q *Queries) setListMSPg(ctx context.Context, arg SetListMSParams) error {
 	}
 	_, err := q.db.Exec(ctx, `UPDATE exsymbol SET list_ms = $1, delist_ms = $2 WHERE id = $3`,
 		arg.ListMs, arg.DelistMs, arg.ID)
+	return err
+}
+
+func (q *Queries) setAggRulesPg(ctx context.Context, arg SetAggRulesParams) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, err := q.db.Exec(ctx, `UPDATE exsymbol SET agg_rules = $1 WHERE id = $2`, arg.AggRules, arg.ID)
+	if err == nil {
+		if exs := GetSymbolByID(arg.ID); exs != nil {
+			exs.AggRules = arg.AggRules
+		}
+	}
 	return err
 }
 
@@ -791,8 +750,7 @@ ORDER BY sid, time`, tblName, buildPgTimeFilter(startMs, finishEndMS), sidText)
 		if fromTfMSecs > 0 {
 			var lastDone bool
 			offMS := GetAlignOff(curSid, tfMSecs)
-			infoBy := exsMap[curSid].InfoBy()
-			klineArr, lastDone = utils.BuildOHLCV(klineArr, tfMSecs, 0, nil, fromTfMSecs, offMS, infoBy)
+			klineArr, lastDone = utils.BuildOHLCV(klineArr, tfMSecs, 0, nil, fromTfMSecs, offMS)
 			if !lastDone && len(klineArr) > 0 {
 				klineArr = klineArr[:len(klineArr)-1]
 			}

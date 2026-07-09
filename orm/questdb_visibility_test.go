@@ -108,7 +108,7 @@ func TestAddSymbolsQuestVisibilityTimeoutKeepsCachedIdentity(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("expected one inserted row, got %d", n)
 	}
-	if len(insertArgs) != 9 {
+	if len(insertArgs) != 10 {
 		t.Fatalf("expected full metadata insert args, got %d", len(insertArgs))
 	}
 

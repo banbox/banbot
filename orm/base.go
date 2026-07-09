@@ -159,6 +159,14 @@ func execMultiSQL(ctx context.Context, pool *pgxpool.Pool, sqlText string) error
 	return mrr.Close()
 }
 
+func isQuestDuplicateColumnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "column 'agg_rules' already exists")
+}
+
 // execMultiSQLTx executes multiple semicolon-separated SQL statements inside a pgx.Tx.
 func execMultiSQLTx(ctx context.Context, tx pgx.Tx, sqlText string) error {
 	// Use pgconn.Exec (simple query protocol) to avoid prepared-statement
@@ -810,7 +818,11 @@ create table if not exists schema_migrations (
 			continue
 		}
 		if err := execMultiSQL(ctx, pool, lines[1]); err != nil {
-			return NewDbErr(core.ErrDbExecFail, err)
+			if isQuestDuplicateColumnErr(err) {
+				log.Warn("questdb migration column already exists, marking migration applied", zap.Int64("version", version), zap.Error(err))
+			} else {
+				return NewDbErr(core.ErrDbExecFail, err)
+			}
 		}
 		if _, err := pool.Exec(ctx, `insert into schema_migrations (version, applied_ts) values ($1,$2)`, version, time.Now().UTC()); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)

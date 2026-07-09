@@ -30,7 +30,7 @@ resOHLCV: 已有的待更新数组
 fromTFSecs: 传入的arr子数组间隔，未提供时计算，单位：毫秒
 offMS: 对齐时间的偏移
 */
-func BuildOHLCV(arr []*banexg.Kline, toTFMSecs int64, preFire float64, resOHLCV []*banexg.Kline, fromTFMS, offMS int64, infoBy string) ([]*banexg.Kline, bool) {
+func BuildOHLCV(arr []*banexg.Kline, toTFMSecs int64, preFire float64, resOHLCV []*banexg.Kline, fromTFMS, offMS int64) ([]*banexg.Kline, bool) {
 	_, offset := utils.GetTfAlignOrigin(int(toTFMSecs / 1000))
 	alignOffMS := int64(offset * 1000)
 	offsetMS := int64(float64(toTFMSecs)*preFire) + offMS
@@ -71,13 +71,9 @@ func BuildOHLCV(arr []*banexg.Kline, toTFMSecs int64, preFire float64, resOHLCV 
 				}
 				big.Close = bar.Close
 				big.Volume += bar.Volume
-				if infoBy == "last" {
-					big.BuyVolume = bar.BuyVolume
-				} else if infoBy == "sum" {
-					big.BuyVolume += bar.BuyVolume
-				} else {
-					panic("unsupported infoBy for BuildOHLCV: " + infoBy)
-				}
+				big.Quote += bar.Quote
+				big.BuyVolume += bar.BuyVolume
+				big.TradeNum += bar.TradeNum
 			}
 			aggCnt += 1
 		} else {

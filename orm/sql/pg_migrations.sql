@@ -63,3 +63,7 @@ $$;
 
 ALTER TABLE exsymbol
     ADD CONSTRAINT ix_exsymbol_unique UNIQUE (exchange, market, symbol);
+
+-- version 4
+ALTER TABLE exsymbol
+    ADD COLUMN IF NOT EXISTS agg_rules text NOT NULL DEFAULT '';

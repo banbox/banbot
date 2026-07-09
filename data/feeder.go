@@ -311,7 +311,7 @@ func applyAdjSeriesList(exs *orm.ExSymbol, adjs []*orm.AdjInfo, rows []*orm.Data
 	return orm.BarsToSeries(exs, rows[0].TimeFrame, orm.ApplyAdj(adjs, bars, adjMode, cutEnd, limit), nil, rows[0].IsWarmUp, true)
 }
 
-func buildOHLCVSeries(exs *orm.ExSymbol, tf string, rows []*orm.DataSeries, toTFMSecs int64, preFire float64, prev []*orm.DataSeries, fromTFMS, offMS int64, infoBy string, opts ...bool) ([]*orm.DataSeries, bool, *errs.Error) {
+func buildOHLCVSeries(exs *orm.ExSymbol, tf string, rows []*orm.DataSeries, toTFMSecs int64, preFire float64, prev []*orm.DataSeries, fromTFMS, offMS int64, opts ...bool) ([]*orm.DataSeries, bool, *errs.Error) {
 	isWarmUp := false
 	if len(opts) > 0 {
 		isWarmUp = opts[len(opts)-1]
@@ -324,7 +324,7 @@ func buildOHLCVSeries(exs *orm.ExSymbol, tf string, rows []*orm.DataSeries, toTF
 	if err != nil {
 		return nil, false, err
 	}
-	aggBars, lastOk := utils.BuildOHLCV(bars, toTFMSecs, preFire, prevBars, fromTFMS, offMS, infoBy)
+	aggBars, lastOk := utils.BuildOHLCV(bars, toTFMSecs, preFire, prevBars, fromTFMS, offMS)
 	targetTF := tf
 	if targetTF == "" {
 		targetTF = utils2.SecsToTF(int(toTFMSecs / 1000))
@@ -546,13 +546,12 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 	staMSecs := int64(state.TFSecs * 1000)
 	var ohlcvs []*orm.DataSeries
 	var lastOk bool
-	infoBy := f.InfoBy()
 	if barTfMSecs < staMSecs {
 		var olds []*orm.DataSeries
 		if state.WaitBar != nil {
 			olds = append(olds, state.WaitBar)
 		}
-		ohlcvs, lastOk, err = buildOHLCVSeries(f.ExSymbol, state.TimeFrame, rows, staMSecs, f.PreFire, olds, barTfMSecs, state.AlignOffMS, infoBy, false, f.isWarmUp)
+		ohlcvs, lastOk, err = buildOHLCVSeries(f.ExSymbol, state.TimeFrame, rows, staMSecs, f.PreFire, olds, barTfMSecs, state.AlignOffMS, false, f.isWarmUp)
 		if err != nil {
 			return false, err
 		}
@@ -585,7 +584,7 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 		if barTfMSecs < staMSecs {
 			// The last unfinished data should be kept here
 			// 这里应该保留最后未完成的数据
-			ohlcvs, _, err = buildOHLCVSeries(f.ExSymbol, state.TimeFrame, rows, staMSecs, f.PreFire, nil, barTfMSecs, state.AlignOffMS, infoBy, false, f.isWarmUp)
+			ohlcvs, _, err = buildOHLCVSeries(f.ExSymbol, state.TimeFrame, rows, staMSecs, f.PreFire, nil, barTfMSecs, state.AlignOffMS, false, f.isWarmUp)
 			if err != nil {
 				return false, err
 			}
@@ -613,7 +612,7 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 				olds = append(olds, state.WaitBar)
 			}
 			bigTfMSecs := int64(state.TFSecs * 1000)
-			curOhlcvs, lastDone, err := buildOHLCVSeries(f.ExSymbol, state.TimeFrame, curRows, bigTfMSecs, f.PreFire, olds, srcMSecs, srcAlignOff, infoBy, false, f.isWarmUp)
+			curOhlcvs, lastDone, err := buildOHLCVSeries(f.ExSymbol, state.TimeFrame, curRows, bigTfMSecs, f.PreFire, olds, srcMSecs, srcAlignOff, false, f.isWarmUp)
 			if err != nil {
 				return false, err
 			}

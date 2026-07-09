@@ -247,13 +247,12 @@ func aggBigKlines(sess *orm.Queries, klines []*banexg.Kline, tfMSecs int64, exs 
 	klines1m := klines
 	var err *errs.Error
 	var num int64
-	infoBy := exs.InfoBy()
 	for _, agg := range aggList[1:] {
 		if agg.MSecs <= tfMSecs {
 			continue
 		}
 		offMS := int64(exg.GetAlignOff(exs.Exchange, int(agg.MSecs/1000)) * 1000)
-		klines, _ = utils.BuildOHLCV(klines1m, agg.MSecs, 0, nil, tfMSecs, offMS, infoBy)
+		klines, _ = utils.BuildOHLCV(klines1m, agg.MSecs, 0, nil, tfMSecs, offMS)
 		if len(klines) == 0 {
 			continue
 		}

@@ -40,12 +40,12 @@ func waitForQuestCondition(ctx context.Context, timeout, interval time.Duration,
 }
 
 func questExsymbolBySID(ctx context.Context, q *Queries, sid int32) (*ExSymbol, error) {
-	row := q.db.QueryRow(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms
+	row := q.db.QueryRow(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, coalesce(agg_rules, '')
 FROM exsymbol_q
 LATEST BY sid
 WHERE sid = $1 AND coalesce(is_deleted, false) = false`, sid)
 	var item ExSymbol
-	if err := row.Scan(&item.ID, &item.Exchange, &item.ExgReal, &item.Market, &item.Symbol, &item.Combined, &item.ListMs, &item.DelistMs); err != nil {
+	if err := row.Scan(&item.ID, &item.Exchange, &item.ExgReal, &item.Market, &item.Symbol, &item.Combined, &item.ListMs, &item.DelistMs, &item.AggRules); err != nil {
 		return nil, err
 	}
 	return &item, nil

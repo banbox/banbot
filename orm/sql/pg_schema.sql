@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS "public"."exsymbol"
     "combined"  boolean     NOT NULL DEFAULT false,
     "list_ms"   int8        NOT NULL DEFAULT 0,
     "delist_ms" int8        NOT NULL DEFAULT 0,
+    "agg_rules" text        NOT NULL DEFAULT '',
     CONSTRAINT "ix_exsymbol_unique" UNIQUE ("exchange", "market", "symbol")
 );
 
