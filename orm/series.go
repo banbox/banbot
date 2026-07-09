@@ -320,6 +320,72 @@ func KlineToSeries(bar *InfoKline) *DataSeries {
 	return KlineToDataSeries(bar)
 }
 
+func ResampleSeriesRecords(info *SeriesInfo, exs *ExSymbol, rows []*DataRecord, toTFMS, offMS int64) ([]*DataRecord, error) {
+	if info == nil {
+		return nil, fmt.Errorf("series info is required")
+	}
+	if toTFMS <= 0 {
+		return nil, fmt.Errorf("target timeframe must be greater than zero")
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	_, offset := utils2.GetTfAlignOrigin(int(toTFMS / 1000))
+	alignOffMS := int64(offset * 1000)
+	fields := normalizedSeriesBinding(info.Binding).Fields
+	var out []*DataRecord
+	var bucket []*DataRecord
+	var bucketTime int64
+	flush := func() error {
+		if len(bucket) == 0 {
+			return nil
+		}
+		values := make(map[string]any, len(fields))
+		for _, field := range fields {
+			fn, ok := GetAggRuleFunc("last")
+			if exs != nil {
+				fn, ok = GetAggRuleFunc(exs.AggRule(field.Name))
+			}
+			if !ok {
+				fn, _ = GetAggRuleFunc("last")
+			}
+			val, err := fn(bucket, field)
+			if err != nil {
+				return err
+			}
+			values[field.Name] = val
+		}
+		out = append(out, &DataRecord{
+			Sid:    bucket[0].Sid,
+			TimeMS: bucketTime,
+			EndMS:  bucketTime + toTFMS,
+			Closed: bucket[len(bucket)-1].Closed,
+			Values: values,
+		})
+		bucket = nil
+		return nil
+	}
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		timeAlign := utils2.AlignTfMSecsOffset(row.TimeMS+offMS, toTFMS, alignOffMS)
+		if len(bucket) > 0 && timeAlign != bucketTime {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+		if len(bucket) == 0 {
+			bucketTime = timeAlign
+		}
+		bucket = append(bucket, row)
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func seriesFloatValue(values map[string]any, key string) (float64, error) {
 	if values == nil {
 		return 0, fmt.Errorf("series event missing field %q", key)

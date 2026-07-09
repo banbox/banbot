@@ -61,6 +61,56 @@ func TestAsKlineRequiresOHLCV(t *testing.T) {
 	}
 }
 
+func TestResampleSeriesRecordsUsesAggRules(t *testing.T) {
+	if !RegisterAggRule("test_span", func(rows []*DataRecord, field SeriesField) (any, error) {
+		first, err := aggFirst(rows, field)
+		if err != nil {
+			return nil, err
+		}
+		last, err := aggLast(rows, field)
+		if err != nil {
+			return nil, err
+		}
+		firstVal, err := seriesFloatAny(first)
+		if err != nil {
+			return nil, err
+		}
+		lastVal, err := seriesFloatAny(last)
+		if err != nil {
+			return nil, err
+		}
+		return lastVal - firstVal, nil
+	}) {
+		t.Fatal("expected custom agg rule registration to succeed")
+	}
+
+	info := NewSeriesInfo("metric", "1m", []SeriesField{
+		{Name: "price", Type: "float"},
+		{Name: "volume", Type: "float"},
+		{Name: "count", Type: "int"},
+		{Name: "state", Type: "string"},
+		{Name: "spread", Type: "float"},
+	})
+	exs := &ExSymbol{ID: 3, AggRules: `{"price":"mid","volume":"sum","count":"sum","spread":"test_span"}`}
+	rows := []*DataRecord{
+		{Sid: 3, TimeMS: 1_700_000_040_000, EndMS: 1_700_000_100_000, Values: map[string]any{"price": 10.0, "volume": 3.0, "count": int64(2), "state": "open", "spread": 100.0}},
+		{Sid: 3, TimeMS: 1_700_000_100_000, EndMS: 1_700_000_160_000, Closed: true, Values: map[string]any{"price": 14.0, "volume": 7.0, "count": int64(5), "state": "close", "spread": 130.0}},
+	}
+
+	got, err := ResampleSeriesRecords(info, exs, rows, 120_000, 0)
+	if err != nil {
+		t.Fatalf("ResampleSeriesRecords returned error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one row, got %d", len(got))
+	}
+	values := got[0].Values
+	if values["price"] != 12.0 || values["volume"] != 10.0 || values["count"] != int64(7) ||
+		values["state"] != "close" || values["spread"] != 30.0 {
+		t.Fatalf("unexpected values: %+v", values)
+	}
+}
+
 func testPairTFKline(symbol, tf string, ts int64) *banexg.PairTFKline {
 	return &banexg.PairTFKline{
 		Kline:     banexg.Kline{Time: ts},

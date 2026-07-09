@@ -32,13 +32,13 @@ var (
 	maxSid        int32 // in-memory sid counter, protected by symbolLock
 	aggRulesMu    sync.RWMutex
 	aggRules      = map[string]AggRuleFunc{
-		"min":   nil,
-		"max":   nil,
-		"last":  nil,
-		"first": nil,
-		"sum":   nil,
-		"avg":   nil,
-		"mid":   nil,
+		"min":   aggMin,
+		"max":   aggMax,
+		"last":  aggLast,
+		"first": aggFirst,
+		"sum":   aggSum,
+		"avg":   aggAvg,
+		"mid":   aggMid,
 	}
 )
 
@@ -507,6 +507,158 @@ func GetAggRuleFunc(name string) (AggRuleFunc, bool) {
 	fn, ok := aggRules[name]
 	aggRulesMu.RUnlock()
 	return fn, ok
+}
+
+func aggFirst(rows []*DataRecord, field SeriesField) (any, error) {
+	return aggEdge(rows, field, true)
+}
+
+func aggLast(rows []*DataRecord, field SeriesField) (any, error) {
+	return aggEdge(rows, field, false)
+}
+
+func aggEdge(rows []*DataRecord, field SeriesField, first bool) (any, error) {
+	for i := 0; i < len(rows); i++ {
+		idx := i
+		if !first {
+			idx = len(rows) - 1 - i
+		}
+		if rows[idx] == nil || rows[idx].Values == nil {
+			continue
+		}
+		if val, ok := rows[idx].Values[field.Name]; ok {
+			return val, nil
+		}
+	}
+	return nil, fmt.Errorf("series field %q has no values", field.Name)
+}
+
+func aggMin(rows []*DataRecord, field SeriesField) (any, error) {
+	val, ok, err := aggFloatSeed(rows, field)
+	if err != nil || !ok {
+		return val, err
+	}
+	for _, row := range rows {
+		cur, ok, err := aggFloatValue(row, field)
+		if err != nil {
+			return nil, err
+		}
+		if ok && cur < val {
+			val = cur
+		}
+	}
+	return aggNumericResult(field, val), nil
+}
+
+func aggMax(rows []*DataRecord, field SeriesField) (any, error) {
+	val, ok, err := aggFloatSeed(rows, field)
+	if err != nil || !ok {
+		return val, err
+	}
+	for _, row := range rows {
+		cur, ok, err := aggFloatValue(row, field)
+		if err != nil {
+			return nil, err
+		}
+		if ok && cur > val {
+			val = cur
+		}
+	}
+	return aggNumericResult(field, val), nil
+}
+
+func aggSum(rows []*DataRecord, field SeriesField) (any, error) {
+	total := 0.0
+	seen := false
+	for _, row := range rows {
+		val, ok, err := aggFloatValue(row, field)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			total += val
+			seen = true
+		}
+	}
+	if !seen {
+		return nil, fmt.Errorf("series field %q has no values", field.Name)
+	}
+	return aggNumericResult(field, total), nil
+}
+
+func aggAvg(rows []*DataRecord, field SeriesField) (any, error) {
+	total := 0.0
+	count := 0
+	for _, row := range rows {
+		val, ok, err := aggFloatValue(row, field)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			total += val
+			count++
+		}
+	}
+	if count == 0 {
+		return nil, fmt.Errorf("series field %q has no values", field.Name)
+	}
+	return total / float64(count), nil
+}
+
+func aggMid(rows []*DataRecord, field SeriesField) (any, error) {
+	minVal, ok, err := aggFloatSeed(rows, field)
+	if err != nil || !ok {
+		return minVal, err
+	}
+	maxVal := minVal
+	for _, row := range rows {
+		val, ok, err := aggFloatValue(row, field)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		if val < minVal {
+			minVal = val
+		}
+		if val > maxVal {
+			maxVal = val
+		}
+	}
+	return (minVal + maxVal) / 2, nil
+}
+
+func aggFloatSeed(rows []*DataRecord, field SeriesField) (float64, bool, error) {
+	for _, row := range rows {
+		val, ok, err := aggFloatValue(row, field)
+		if err != nil || ok {
+			return val, ok, err
+		}
+	}
+	return 0, false, fmt.Errorf("series field %q has no values", field.Name)
+}
+
+func aggFloatValue(row *DataRecord, field SeriesField) (float64, bool, error) {
+	if row == nil || row.Values == nil {
+		return 0, false, nil
+	}
+	val, ok := row.Values[field.Name]
+	if !ok {
+		return 0, false, nil
+	}
+	num, err := seriesFloatAny(val)
+	if err != nil {
+		return 0, false, err
+	}
+	return num, true, nil
+}
+
+func aggNumericResult(field SeriesField, val float64) any {
+	if field.Type == "int" {
+		return int64(val)
+	}
+	return val
 }
 
 func InitListDates() *errs.Error {
