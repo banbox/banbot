@@ -154,7 +154,7 @@ Manage Your Bot On https://t.me/trade_banbot?start=xxxxxxxx-xxxx-xxxx-xxxx-xxxxx
 点击链接或在Telegram中搜索`@trade_banbot`，发送`/start xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`即可绑定。
 
 ::: tip 提示
-官方机器人方式无需配置代理，通过加密通道连接，适合网络受限环境。
+官方机器人通过加密中转通道连接。网络受限环境必须放通到 `www.banbot.site` 的 HTTPS 出站访问和 `www.banbot.site:6788` 的 TCP 连接。
 :::
 
 **方式二：自定义机器人**

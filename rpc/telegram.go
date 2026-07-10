@@ -58,13 +58,16 @@ type BotSecret struct {
 
 // OrderInfo 订单信息结构
 type OrderInfo struct {
-	ID       int64   `json:"id"`
-	Symbol   string  `json:"symbol"`
-	Short    bool    `json:"short"`
-	Price    float64 `json:"price"`
-	Amount   float64 `json:"amount"`
-	EnterTag string  `json:"enter_tag"`
-	Account  string  `json:"account"`
+	ID          int64   `json:"id"`
+	Symbol      string  `json:"symbol"`
+	Short       bool    `json:"short"`
+	Price       float64 `json:"price"`
+	Amount      float64 `json:"amount"`
+	Profit      float64 `json:"profit"`
+	ProfitRate  float64 `json:"profit_rate"`
+	ProfitValid bool    `json:"profit_valid"`
+	EnterTag    string  `json:"enter_tag"`
+	Account     string  `json:"account"`
 }
 
 // OrderManagerInterface 订单管理接口，避免循环依赖
@@ -161,6 +164,7 @@ func NewTelegram(name string, item map[string]interface{}) *Telegram {
 	res.ctx = ctx
 	res.cancel = cancel
 	res.doSendMsgs = makeDoSendMsgTelegram(res)
+	res.setupUpdateHandlers()
 	err := initCustomTgBot(res, name, item)
 	if err != nil {
 		if err.Code == errs.CodeParamRequired {
@@ -182,8 +186,6 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 		if secretV, ok := dashBot.GetData("secret"); ok {
 			res.secret = secretV.(string)
 		}
-		// 设置处理器
-		res.setupDashBotHandlers()
 		return nil
 	}
 	sessionSecret, err2 := getSessionSecret(res.Proxy)
@@ -248,21 +250,22 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 			log.Error("parse telegram_cmd fail", zap.Error(err))
 			return
 		}
-		// 路由消息到对应的处理器
-		if update.Message == nil || update.Message.From == nil {
+		if update.Message == nil && update.CallbackQuery == nil {
 			log.Warn("invalid tg msg", zap.String("str", string(msg.Data)))
 			return
 		}
-		res.chatId = update.Message.From.ID
-		handler := res.findUpdateHandler(&update)
-		if handler != nil {
-			handler(res.ctx, nil, &update)
+		if update.Message != nil {
+			res.chatId = update.Message.Chat.ID
 		} else {
-			log.Warn("no handler for tg msg", zap.String("str", string(msg.Data)))
+			chatID, _, _, _ := callbackMessageTarget(&update)
+			if chatID != 0 {
+				res.chatId = chatID
+			} else {
+				res.chatId = update.CallbackQuery.From.ID
+			}
 		}
+		res.routeUpdate(res.ctx, nil, &update)
 	}
-	// 设置处理器
-	res.setupDashBotHandlers()
 
 	go func() {
 		err := dashBot.RunForever()
@@ -469,8 +472,8 @@ func (t *Telegram) findUpdateHandler(update *models.Update) handlerFunc {
 	return nil
 }
 
-// setupDashBotHandlers 为dashBot设置处理器
-func (t *Telegram) setupDashBotHandlers() {
+// setupUpdateHandlers registers handlers shared by the official and custom bots.
+func (t *Telegram) setupUpdateHandlers() {
 	// 注册命令处理器
 	t.registerHandler(handlerTypeMessageText, "/orders", matchTypeExact, t.handleOrdersCommand)
 	t.registerHandler(handlerTypeMessageText, "/close", matchTypePrefix, t.handleCloseCommand)
@@ -588,11 +591,11 @@ func makeDoSendMsgTelegram(t *Telegram) func([]map[string]string) []map[string]s
 
 // setupCommandHandlers 设置Telegram Bot命令处理器
 func (t *Telegram) setupCommandHandlers() {
-	t.bot.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypePrefix, func(ctx context.Context, bot *bot.Bot, update *models.Update) {
-		handler := t.findUpdateHandler(update)
-		if handler != nil {
-			handler(t.ctx, t.bot, update)
-		}
+	t.bot.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypePrefix, func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		t.routeUpdate(ctx, b, update)
+	})
+	t.bot.RegisterHandler(bot.HandlerTypeCallbackQueryData, "", bot.MatchTypePrefix, func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		t.routeUpdate(ctx, b, update)
 	})
 	// 启动Bot更新监听
 	go func() {
@@ -605,6 +608,21 @@ func (t *Telegram) setupCommandHandlers() {
 		t.bot.Start(t.ctx)
 		log.Info("Telegram bot stopped")
 	}()
+}
+
+func (t *Telegram) routeUpdate(ctx context.Context, b *bot.Bot, update *models.Update) {
+	if update == nil {
+		return
+	}
+	if update.Message == nil && update.CallbackQuery != nil {
+		update.Message = update.CallbackQuery.Message.Message
+	}
+	handler := t.findUpdateHandler(update)
+	if handler == nil {
+		log.Warn("no handler for telegram update")
+		return
+	}
+	handler(ctx, b, update)
 }
 
 // handleOrdersCommand 处理 /orders 命令 - 获取订单列表
@@ -761,16 +779,27 @@ func (t *Telegram) handleCallbackQuery(ctx context.Context, b *bot.Bot, update *
 	if update.CallbackQuery == nil {
 		return
 	}
-	userID := update.CallbackQuery.From.ID
-	if userID != t.chatId {
+	if !t.isAuthorized(update) {
 		return
 	}
+	if b != nil {
+		_, err := b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+			CallbackQueryID: update.CallbackQuery.ID,
+		})
+		if err != nil {
+			log.Warn("answer telegram callback fail", zap.Error(err))
+		}
+	}
 	data := update.CallbackQuery.Data
+	if data != "action:orders" && update.Message == nil {
+		log.Warn("telegram callback message is inaccessible", zap.String("data", data))
+		return
+	}
 
 	// 处理不同的回调数据
 	switch data {
 	case "action:orders":
-		t.handleOrdersCommand(ctx, b, update)
+		t.handleOrdersCallback(ctx, b, update)
 	case "action:status":
 		t.handleStatusCommand(ctx, b, update)
 	case "action:disable":
@@ -803,8 +832,78 @@ func (t *Telegram) handleCallbackQuery(ctx context.Context, b *bot.Bot, update *
 	}
 }
 
+func (t *Telegram) handleOrdersCallback(ctx context.Context, b *bot.Bot, update *models.Update) {
+	response := t.getOrdersList()
+	kb := t.buildOrdersInlineKeyboard()
+	chatID, messageID, inlineMessageID, ok := callbackMessageTarget(update)
+	if b != nil && ok {
+		params := &bot.EditMessageTextParams{
+			InlineMessageID: inlineMessageID,
+			Text:            response,
+			ParseMode:       models.ParseModeHTML,
+			ReplyMarkup:     kb,
+		}
+		if chatID != 0 {
+			params.ChatID = chatID
+			params.MessageID = messageID
+		}
+		_, err := b.EditMessageText(ctx, params)
+		if err == nil || isTelegramMessageNotModified(err) {
+			return
+		}
+		log.Warn("refresh telegram orders in place fail", zap.Error(err))
+	}
+	if chatID == 0 {
+		log.Warn("refresh telegram orders fail: callback has no chat")
+		return
+	}
+	t.chanSend <- &bot.SendMessageParams{
+		ChatID:      chatID,
+		Text:        response,
+		ParseMode:   models.ParseModeHTML,
+		ReplyMarkup: kb,
+	}
+}
+
+func isTelegramMessageNotModified(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "message is not modified")
+}
+
+func callbackMessageTarget(update *models.Update) (int64, int, string, bool) {
+	if update == nil || update.CallbackQuery == nil {
+		return 0, 0, "", false
+	}
+	query := update.CallbackQuery
+	if query.Message.Message != nil {
+		return query.Message.Message.Chat.ID, query.Message.Message.ID, "", true
+	}
+	if query.Message.InaccessibleMessage != nil {
+		msg := query.Message.InaccessibleMessage
+		return msg.Chat.ID, msg.MessageID, "", true
+	}
+	if query.InlineMessageID != "" {
+		return 0, 0, query.InlineMessageID, true
+	}
+	return 0, 0, "", false
+}
+
 // isAuthorized 检查用户是否有权限使用命令
 func (t *Telegram) isAuthorized(update *models.Update) bool {
+	if update == nil {
+		return false
+	}
+	if update.CallbackQuery != nil {
+		userID := update.CallbackQuery.From.ID
+		chatID, _, _, _ := callbackMessageTarget(update)
+		if chatID == t.chatId || userID == t.chatId {
+			return true
+		}
+		log.Warn("Unauthorized telegram callback attempt",
+			zap.Int64("user_id", userID),
+			zap.Int64("chat_id", chatID),
+			zap.Int64("authorized_chat_id", t.chatId))
+		return false
+	}
 	if update.Message == nil || update.Message.From == nil {
 		return false
 	}
@@ -881,6 +980,10 @@ func (t *Telegram) getOrdersList() string {
 				direction = directionShort
 			}
 
+			pnl := calculating
+			if order.ProfitValid {
+				pnl = fmt.Sprintf("%+.2f (%+.2f%%)", order.Profit, order.ProfitRate*100)
+			}
 			response.WriteString(fmt.Sprintf(
 				"• <code>%d</code> %s <code>%s</code>\n"+
 					"  %s <code>%.5f</code> | %s <code>%.4f</code>\n"+
@@ -889,7 +992,7 @@ func (t *Telegram) getOrdersList() string {
 				direction,
 				order.Symbol,
 				priceLabel, order.Price, quantityLabel, order.Amount,
-				pnlLabel, calculating, tagLabel, order.EnterTag,
+				pnlLabel, pnl, tagLabel, order.EnterTag,
 			))
 		}
 

@@ -155,7 +155,7 @@ Manage Your Bot On https://t.me/trade_banbot?start=xxxxxxxx-xxxx-xxxx-xxxx-xxxxx
 Click the link or search for `@trade_banbot` in Telegram, send `/start xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` to bind.
 
 ::: tip Tip
-The official bot method requires no proxy configuration, connects through encrypted channels, suitable for network-restricted environments.
+The official bot method connects through an encrypted relay. Network-restricted deployments must allow outbound HTTPS to `www.banbot.site` and TCP connections to `www.banbot.site:6788`.
 :::
 
 **Method 2: Custom Bot**

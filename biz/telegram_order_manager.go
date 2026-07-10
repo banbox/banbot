@@ -1,10 +1,12 @@
 package biz
 
 import (
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/rpc"
 	"github.com/banbox/banexg/log"
+	"go.uber.org/zap"
 )
 
 // TelegramOrderManager 实现 rpc.OrderManagerInterface 接口
@@ -35,23 +37,43 @@ func (m *TelegramOrderManager) GetActiveOrders(account string) ([]*rpc.OrderInfo
 
 	var result []*rpc.OrderInfo
 	for _, order := range orders {
-		orderInfo := &rpc.OrderInfo{
-			ID:       order.ID,
-			Symbol:   order.Symbol,
-			Short:    order.Short,
-			EnterTag: order.EnterTag,
-			Account:  account,
+		currentPrice := com.GetPriceSafe(order.Symbol, "")
+		if currentPrice <= 0 {
+			if priceErr := com.EnsureLatestPrice(order.Symbol); priceErr != nil {
+				log.Debug("refresh telegram order price fail", zap.String("symbol", order.Symbol), zap.Error(priceErr))
+			}
+			currentPrice = com.GetPriceSafe(order.Symbol, "")
 		}
-
-		if order.Enter != nil {
-			orderInfo.Price = order.Enter.Average
-			orderInfo.Amount = order.Enter.Filled
-		}
-
-		result = append(result, orderInfo)
+		result = append(result, buildTelegramOrderInfo(order, account, currentPrice))
 	}
 
 	return result, nil
+}
+
+func buildTelegramOrderInfo(order *ormo.InOutOrder, account string, currentPrice float64) *rpc.OrderInfo {
+	info := &rpc.OrderInfo{
+		ID:       order.ID,
+		Symbol:   order.Symbol,
+		Short:    order.Short,
+		EnterTag: order.EnterTag,
+		Account:  account,
+	}
+	if order.Enter == nil {
+		return info
+	}
+	info.Price = order.Enter.Average
+	if info.Price <= 0 {
+		info.Price = order.Enter.Price
+	}
+	info.Amount = order.Enter.Filled
+	if currentPrice <= 0 || order.Enter.Average <= 0 || order.Enter.Filled <= 0 {
+		return info
+	}
+	order.UpdateProfits(currentPrice)
+	info.Profit = order.Profit
+	info.ProfitRate = order.ProfitRate
+	info.ProfitValid = true
+	return info
 }
 
 // CloseOrder 平仓指定订单

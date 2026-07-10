@@ -23,6 +23,7 @@ bt_net_cost: 15
 relay_sim_unfinish: false
 order_bar_max: 500
 ntp_lang_code: none
+show_lang_code: en-US
 time_start: '20230701'
 time_end: '20260101'
 wallet_amounts:
