@@ -26,7 +26,7 @@ banbot 推荐两种接入方式：
 
 - 每条记录对应某个已存在的 K 线时间戳。
 - 不希望新增一张表，只想把字段挂在 `kline_1h` / `kline_1d` 等表上。
-- 数据用于研究、图表、side input；原有 OHLCV 查询和回测撮合仍只读取内置 OHLCV 字段。
+- 数据用于研究、图表或策略计算，并希望和对应 K 线在同一个 `DataSeries` 事件中消费。
 
 外部示例见 `../banstrats/openinterest/store.go`：`Info` 使用 `orm.NewKLineSeriesInfo(...)`，写入和读取通过 `orm.NewKLineSeriesStore(Info).Write/Read(...)` 完成。
 
@@ -40,7 +40,9 @@ banbot 推荐两种接入方式：
 注意：
 
 - kline 扩展列名不能和内置列冲突：`sid`、`time`、`ts`、`open`、`high`、`low`、`close`、`volume`、`quote`、`buy_volume`、`trade_num`。
-- 这种方式不会改变 `GetOHLCV` 的返回值。如果策略要读取扩展字段，使用 `KLineSeriesStore.Read` 或把它包装成独立 `DataSource` side input。
+- 未指定字段的旧 `GetOHLCV` / K 线订阅仍只读取默认字段，保持兼容。
+- 策略可在 `OnDataSubs` 的 `DataSub.Fields` 中声明扩展列；运行时会把相同 `(source, sid, timeframe)` 的字段合并后一次查询，完整结果通过 `OnData` 和 `DataHub` 提供。
+- `OnBar` 只消费框架支持的 OHLCV 字段，扩展字段不会改变指标环境的结构。
 
 ### 2.2 独立时序表 + 函数式数据源
 
@@ -62,7 +64,11 @@ banbot 推荐两种接入方式：
 
 策略订阅示例见 `../banstrats/fundingrate/strategy.go`：在 `OnDataSubs` 返回 `strat.DataSub`，在 `OnData` 中读取 `orm.DataSeries`，需要最新缓存时走 `job.DataHub.Latest(...)`。
 
-回测和实盘启动时，banbot 会从 `OnDataSubs` 收集订阅，按 `(source, sid, timeframe)` 去重，根据 `WarmupNum` 计算预热起点，再调用已注册的 `DataSource.FetchHistory` 补齐缺口。
+回测和实盘启动时，banbot 会从 `OnDataSubs` 收集订阅，按 `(source, sid, timeframe)` 去重，取最大的 `WarmupNum` 并合并 `Fields` 字段并集，再调用已注册的 `DataSource.FetchHistory` 补齐缺口。
+
+`Fields` 为空时，kline 使用 `open, high, low, close, volume, quote, buy_volume, trade_num`，独立数据源使用其 `SeriesInfo.Binding.Fields`。多个策略订阅同一数据流的不同字段时，数据源只收到一个合并后的订阅，所有订阅策略的 `OnData` 都收到该字段并集。
+
+读取 kline 扩展列时仍使用同一个订阅入口，例如 `DataSub{Source: "kline", Fields: []string{"open_interest"}, ...}`。主 kline 的默认字段会和显式字段合并，因此 `OnData` 可读取 `evt.Values["open_interest"]`，`OnBar` 继续正常消费 OHLCV。
 
 ---
 
@@ -534,6 +540,7 @@ func init() {
                     ExSymbol:  job.Symbol,
                     TimeFrame: "1d",
                     WarmupNum: 30,
+                    Fields:    []string{"value", "revision"},
                 },
             }
         },
@@ -561,6 +568,7 @@ func init() {
 
 - `OnPairInfos` 会在内部桥接为 `DataSub{Source: "kline", ...}`
 - `OnInfoBar` 仅在 side-input 能适配成 kline 且策略未实现 `OnData` 时触发
+- 主 kline 事件会分别尝试触发 `OnData` 和 `OnBar`：`OnData` 获得完整 `DataSeries.Values`，`OnBar` 使用可识别的 OHLCV 字段
 
 ### 7.3 新代码不要再把 Kline 当作通用自定义数据契约
 
@@ -583,12 +591,14 @@ func init() {
 - `FeedDataSeries(evt *orm.DataSeries)` 成为回测主入口
 - 对可 `AsKline` 的事件，继续执行原有撮合、账户、报表逻辑
 - 对纯通用数据，直接进入 `Trader` 的 `OnData` 分发链路
+- 独立时序表通过通用历史 feeder 读取，并和 kline feeder 一起按事件结束时间排序回放
 
 ### 8.2 实盘链路
 
 `CryptoTrader` 已统一改为消费 `DataSeries`：
 
 - 闭合 kline 仍通过内置 OHLCV 适配器进入 `FeedDataSeries`
+- 有 kline 扩展字段订阅时，闭合行会按字段并集从数据库回读并合并到 `DataSeries.Values`
 - websocket 闭合/未闭合事件优先走 `OnWsData`
 - 旧 `OnWsKline` 仅作为兼容回退
 
@@ -621,10 +631,12 @@ func init() {
 - `TestRegisterDataSourceRejectsDuplicates`
 - `TestEnsureSeriesRangeTimescale`
 - `TestEnsureSeriesRangeQuestDB`
+- `TestHistSeriesFeederJoinsUnifiedTimeline`
 
 #### `biz`
 
-- `TestOnDataTakesPrecedenceOverOnBar`
+- `TestOHLCVSeriesTriggersOnDataAndOnBar`
+- `TestNonKlineOHLCVShapeTriggersOnlyOnData`
 - `TestFeedSeriesRoutesNonKlineDataSubs`
 - `TestFeedSeriesFallsBackToOnInfoBarForLegacyKlineSubs`
 

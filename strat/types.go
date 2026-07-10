@@ -97,6 +97,7 @@ type DataSub struct {
 	ExSymbol  *orm.ExSymbol
 	TimeFrame string
 	WarmupNum int
+	Fields    []string
 }
 
 type StratJob struct {

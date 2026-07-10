@@ -263,6 +263,7 @@ func (f *Feeder) addTfKlines(tf string, rows []*orm.DataSeries) {
 func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.DataSeries, adj *orm.AdjInfo) {
 	isLive := core.LiveMode
 	pair := f.Symbol
+	rows = enrichStoredKlineFields(f.ExSymbol, timeFrame, rows)
 	for _, row := range rows {
 		if !isLive || f.isWarmUp {
 			btime.CurTimeMS = row.TimeMS + tfMSecs
@@ -1126,7 +1127,8 @@ func (f *TfSeriesLoader) SetNext() {
 			zap.Int64("end_ms", endMS),
 			zap.Int("batch_size", batchSize))
 	}
-	_, rows, err := sess.GetSeries(f.ExSymbol, f.Timeframe, f.offsetMS, endMS, batchSize, true)
+	fields := strat.CollectKlineSubFields(f.ExSymbol.ID, f.Timeframe)
+	_, rows, err := sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields, f.offsetMS, endMS, batchSize, true)
 	if err != nil || len(rows) == 0 {
 		f.rowIdx = -1
 		f.offsetMS = max(f.offsetMS, f.nextMS)

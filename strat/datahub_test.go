@@ -1,6 +1,7 @@
 package strat
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/banbox/banbot/orm"
@@ -22,6 +23,23 @@ func TestCollectDataSubsNormalizesThirdPartySource(t *testing.T) {
 	}
 	if subs[0].Source != "kline" {
 		t.Fatalf("expected empty source normalized to kline, got %+v", subs[0])
+	}
+	if !reflect.DeepEqual(subs[0].Fields, orm.DefaultKlineFields()) {
+		t.Fatalf("expected default kline fields, got %v", subs[0].Fields)
+	}
+}
+
+func TestCollectDataSubsPreservesRequestedFields(t *testing.T) {
+	job := &StratJob{
+		Symbol: &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"},
+		Strat: &TradeStrat{OnDataSubs: func(s *StratJob) []*DataSub {
+			return []*DataSub{{Source: "kline", ExSymbol: s.Symbol, TimeFrame: "1h", Fields: []string{"close", "signal", "close"}}}
+		}},
+	}
+	subs := CollectDataSubs(job)
+	want := []string{"close", "signal"}
+	if len(subs) != 1 || !reflect.DeepEqual(subs[0].Fields, want) {
+		t.Fatalf("expected requested fields %v, got %+v", want, subs)
 	}
 }
 

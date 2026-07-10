@@ -64,7 +64,7 @@ type SeriesRuntime struct {
 	EnsureFunc func(ctx context.Context, plan *SeriesPlan) *errs.Error
 	ActivateFn func(ctx context.Context, subs []*strat.DataSub, sink DataSink) ([]*strat.DataSub, error)
 
-	active map[string]bool
+	active map[string][]string
 }
 
 func NewSeriesRuntime(sink DataSink) *SeriesRuntime {
@@ -134,7 +134,8 @@ func (r *SeriesRuntime) Active(key string) bool {
 	if r == nil || len(r.active) == 0 {
 		return false
 	}
-	return r.active[key]
+	_, ok := r.active[key]
+	return ok
 }
 
 func (r *SeriesRuntime) repo() orm.SeriesRepo {
@@ -149,12 +150,13 @@ func (r *SeriesRuntime) newSubs(subs []*strat.DataSub) []*strat.DataSub {
 		return nil
 	}
 	if r.active == nil {
-		r.active = make(map[string]bool)
+		r.active = make(map[string][]string)
 	}
 	items := make([]*strat.DataSub, 0, len(subs))
 	for _, sub := range subs {
 		key, ok := runtimeSubKey(sub)
-		if !ok || r.active[key] {
+		have, active := r.active[key]
+		if !ok || active && fieldsContain(have, sub.Fields) {
 			continue
 		}
 		items = append(items, sub)
@@ -167,14 +169,30 @@ func (r *SeriesRuntime) markActive(subs []*strat.DataSub) {
 		return
 	}
 	if r.active == nil {
-		r.active = make(map[string]bool)
+		r.active = make(map[string][]string)
 	}
 	for _, sub := range subs {
 		key, ok := runtimeSubKey(sub)
 		if ok {
-			r.active[key] = true
+			r.active[key] = orm.MergeSeriesFields(r.active[key], sub.Fields)
 		}
 	}
+}
+
+func fieldsContain(have, want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	seen := make(map[string]bool, len(have))
+	for _, field := range have {
+		seen[field] = true
+	}
+	for _, field := range want {
+		if !seen[field] {
+			return false
+		}
+	}
+	return true
 }
 
 func runtimeSubKey(sub *strat.DataSub) (string, bool) {
@@ -339,6 +357,9 @@ func ActivateDataSources(ctx context.Context, subs []*strat.DataSub, sink DataSi
 		if normalized.TimeFrame != info.TimeFrame {
 			return nil, fmt.Errorf("sub timeframe %s does not match source timeframe %s", normalized.TimeFrame, info.TimeFrame)
 		}
+		if err = normalizeDataSubFields(info, normalized); err != nil {
+			return nil, err
+		}
 		mergeDataSub(seen, normalized)
 	}
 	grouped := make(map[string][]*strat.DataSub)
@@ -394,6 +415,13 @@ func validateBootstrapSub(sub *strat.DataSub) (*strat.DataSub, error) {
 	if normalized.Source == "" {
 		return nil, fmt.Errorf("data sub source is required")
 	}
+	if normalized.Source != orm.SeriesSourceKline {
+		if src := GetDataSource(normalized.Source); src != nil {
+			if err := normalizeDataSubFields(src.Info(), normalized); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return normalized, nil
 }
 
@@ -438,9 +466,12 @@ func mergeDataSub(seen map[string]*strat.DataSub, sub *strat.DataSub) {
 		if sub.WarmupNum > existing.WarmupNum {
 			existing.WarmupNum = sub.WarmupNum
 		}
+		existing.Fields = orm.MergeSeriesFields(existing.Fields, sub.Fields)
 		return
 	}
-	seen[key] = sub
+	cp := *sub
+	cp.Fields = append([]string(nil), sub.Fields...)
+	seen[key] = &cp
 }
 
 func EnsureThirdPartySeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {

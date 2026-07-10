@@ -2,6 +2,7 @@ package data
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -21,6 +22,9 @@ func TestNormalizeDataSub(t *testing.T) {
 	}
 	if got.Source != info.Name || got.TimeFrame != info.TimeFrame || got.ExSymbol != sub.ExSymbol {
 		t.Fatalf("unexpected normalized sub: %+v", got)
+	}
+	if !reflect.DeepEqual(got.Fields, []string{"value"}) {
+		t.Fatalf("expected source fields as default projection, got %v", got.Fields)
 	}
 }
 

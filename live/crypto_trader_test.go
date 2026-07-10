@@ -196,7 +196,11 @@ func TestCryptoTraderRunEnsuresThirdPartyBeforeActivateAndLoop(t *testing.T) {
 			},
 		},
 	}
-	collected := []*strat.DataSub{{Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 101, Symbol: "BTC/USDT"}, TimeFrame: alpha.info.TimeFrame, WarmupNum: 4}}
+	collected := []*strat.DataSub{{
+		Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 101, Symbol: "BTC/USDT"},
+		TimeFrame: alpha.info.TimeFrame, WarmupNum: 4,
+		Fields: []string{"open", "high", "low", "close", "volume"},
+	}}
 	trader := NewCryptoTrader()
 	steps := make([]string, 0, 4)
 	trader.initFn = func() *errs.Error {

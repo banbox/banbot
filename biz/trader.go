@@ -84,7 +84,7 @@ func (t *Trader) FeedDataSeries(evt *orm.DataSeries) *errs.Error {
 	if exs == nil && orm.NormalizeSeriesSource(evt.Source) == orm.SeriesSourceKline {
 		return errs.NewMsg(core.ErrInvalidSymbol, "series sid %d not found", evt.Sid)
 	}
-	if !evt.HasOHLCV() {
+	if orm.NormalizeSeriesSource(evt.Source) != orm.SeriesSourceKline || !evt.HasOHLCV() {
 		return t.feedDataOnlySeries(evt)
 	}
 	return t.feedClosedSeries(evt)
@@ -262,7 +262,9 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 	var err *errs.Error
 	isWarmup := evt.IsWarmUp
 	var wg sync.WaitGroup
+	handledJobs := make(map[*strat.StratJob]bool, len(jobs))
 	for _, job := range jobs {
+		handledJobs[job] = true
 		if job.DataHub == nil {
 			job.DataHub = strat.NewDataHub()
 		}
@@ -293,6 +295,9 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 		}
 	}
 	for _, job := range infoJobs {
+		if handledJobs[job] {
+			continue
+		}
 		if job.DataHub == nil {
 			job.DataHub = strat.NewDataHub()
 		}
@@ -338,7 +343,8 @@ func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, ev
 	account := job.Account
 	if job.Strat.OnData != nil {
 		job.Strat.OnData(job, evt)
-	} else {
+	}
+	if job.Strat.OnBar != nil {
 		job.Strat.OnBar(job)
 	}
 	isWarmup := job.IsWarmUp

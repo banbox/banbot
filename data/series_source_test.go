@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -127,7 +128,17 @@ func (s *stubSeriesRepo) QuerySeriesRange(ctx context.Context, info *orm.SeriesI
 	if s.queryErr != nil {
 		return nil, s.queryErr
 	}
-	return append([]*orm.DataRecord(nil), s.queryRows...), nil
+	var out []*orm.DataRecord
+	for _, row := range s.queryRows {
+		if row == nil || row.TimeMS < startMS || row.TimeMS >= endMS {
+			continue
+		}
+		out = append(out, row)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 func (s *stubSeriesRepo) DeleteSeriesRange(ctx context.Context, info *orm.SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
@@ -440,6 +451,28 @@ func TestSeriesRuntimePartialActivationKeepsFailedSubsRetryable(t *testing.T) {
 	}
 }
 
+func TestSeriesRuntimeReactivatesExpandedFields(t *testing.T) {
+	rt := NewSeriesRuntime(stubDataSink{})
+	var calls [][]string
+	rt.ActivateFn = func(ctx context.Context, subs []*strat.DataSub, sink DataSink) ([]*strat.DataSub, error) {
+		calls = append(calls, append([]string(nil), subs[0].Fields...))
+		return subs, nil
+	}
+	exs := &orm.ExSymbol{ID: 9}
+	if err := rt.ActivateNew(context.Background(), []*strat.DataSub{{Source: "macro", ExSymbol: exs, TimeFrame: "1d", Fields: []string{"value"}}}); err != nil {
+		t.Fatalf("first activation failed: %v", err)
+	}
+	if err := rt.ActivateNew(context.Background(), []*strat.DataSub{{Source: "macro", ExSymbol: exs, TimeFrame: "1d", Fields: []string{"value"}}}); err != nil {
+		t.Fatalf("duplicate activation failed: %v", err)
+	}
+	if err := rt.ActivateNew(context.Background(), []*strat.DataSub{{Source: "macro", ExSymbol: exs, TimeFrame: "1d", Fields: []string{"value", "revision"}}}); err != nil {
+		t.Fatalf("expanded activation failed: %v", err)
+	}
+	if len(calls) != 2 || !reflect.DeepEqual(calls[1], []string{"value", "revision"}) {
+		t.Fatalf("expected one initial and one expanded activation, got %v", calls)
+	}
+}
+
 func TestCollectRuntimeDataSubsFiltersKlinesAndDeduplicates(t *testing.T) {
 	jobs := []*strat.StratJob{
 		{
@@ -475,6 +508,23 @@ func TestCollectRuntimeDataSubsFiltersKlinesAndDeduplicates(t *testing.T) {
 	}
 	if subs[0].WarmupNum != 9 {
 		t.Fatalf("expected dedupe to preserve max warmup depth, got %+v", subs[0])
+	}
+}
+
+func TestMergeDataSubUnionsFieldsWithoutMutatingInput(t *testing.T) {
+	exs := &orm.ExSymbol{ID: 7}
+	first := &strat.DataSub{Source: "macro", ExSymbol: exs, TimeFrame: "1d", WarmupNum: 2, Fields: []string{"close", "signal_a"}}
+	second := &strat.DataSub{Source: "macro", ExSymbol: exs, TimeFrame: "1d", WarmupNum: 5, Fields: []string{"volume", "signal_b", "close"}}
+	seen := make(map[string]*strat.DataSub)
+	mergeDataSub(seen, first)
+	mergeDataSub(seen, second)
+	got := seen[strat.DataSubKey("macro", 7, "1d")]
+	want := []string{"close", "signal_a", "volume", "signal_b"}
+	if got == first || got.WarmupNum != 5 || !reflect.DeepEqual(got.Fields, want) {
+		t.Fatalf("unexpected merged subscription: %+v", got)
+	}
+	if !reflect.DeepEqual(first.Fields, []string{"close", "signal_a"}) {
+		t.Fatalf("merge mutated input: %v", first.Fields)
 	}
 }
 

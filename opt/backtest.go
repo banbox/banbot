@@ -234,6 +234,11 @@ func (b *BackTest) syncThirdPartySeriesRange() (*data.SeriesPlan, *errs.Error) {
 	if err := b.thirdPartyRuntime().Ensure(backtestSeriesContext(), plan); err != nil {
 		return plan, errs.New(core.ErrRunTime, err)
 	}
+	if b.BackTestLite != nil && b.dp != nil {
+		if err := b.dp.SetSeriesSubs(plan.Subs); err != nil {
+			return plan, err
+		}
+	}
 	return plan, nil
 }
 

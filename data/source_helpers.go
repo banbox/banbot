@@ -32,7 +32,33 @@ func NormalizeDataSub(info *orm.SeriesInfo, sub *strat.DataSub) (*strat.DataSub,
 	cp := *sub
 	cp.Source = info.Name
 	cp.TimeFrame = info.TimeFrame
+	if err := normalizeDataSubFields(info, &cp); err != nil {
+		return nil, err
+	}
 	return &cp, nil
+}
+
+func normalizeDataSubFields(info *orm.SeriesInfo, sub *strat.DataSub) error {
+	if info == nil || sub == nil {
+		return nil
+	}
+	available := make(map[string]bool, len(info.Binding.Fields))
+	defaults := make([]string, 0, len(info.Binding.Fields))
+	for _, field := range info.Binding.Fields {
+		available[field.Name] = true
+		defaults = append(defaults, field.Name)
+	}
+	fields := orm.NormalizeSeriesFields(info.Name, sub.Fields)
+	if len(fields) == 0 {
+		fields = defaults
+	}
+	for _, field := range fields {
+		if !available[field] {
+			return fmt.Errorf("unsupported field %q", field)
+		}
+	}
+	sub.Fields = fields
+	return nil
 }
 
 func ParseJSONFloat(raw []byte, field string) (float64, error) {

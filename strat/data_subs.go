@@ -50,6 +50,7 @@ func CollectDataSubs(job *StratJob) []*DataSub {
 				ExSymbol:  exs,
 				TimeFrame: sub.TimeFrame,
 				WarmupNum: sub.WarmupNum,
+				Fields:    orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil),
 			})
 		}
 	}
@@ -65,13 +66,41 @@ func CollectDataSubs(job *StratJob) []*DataSub {
 			if exs == nil {
 				continue
 			}
+			source := orm.NormalizeSeriesSource(sub.Source)
 			out = append(out, &DataSub{
-				Source:    orm.NormalizeSeriesSource(sub.Source),
+				Source:    source,
 				ExSymbol:  exs,
 				TimeFrame: sub.TimeFrame,
 				WarmupNum: sub.WarmupNum,
+				Fields:    orm.NormalizeSeriesFields(source, sub.Fields),
 			})
 		}
 	}
 	return out
+}
+
+// CollectKlineSubFields returns the projection needed by every strategy that
+// consumes the same K-line stream. The default fields keep the primary OnBar
+// path valid, while side-input subscriptions may extend the projection.
+func CollectKlineSubFields(sid int32, tf string) []string {
+	fields := orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil)
+	key := DataSubKey(orm.SeriesSourceKline, sid, tf)
+	lockInfoJobs.Lock()
+	seenJobs := make(map[*StratJob]bool)
+	for _, accJobs := range AccInfoJobs {
+		for _, job := range accJobs[key] {
+			seenJobs[job] = true
+		}
+	}
+	lockInfoJobs.Unlock()
+	for job := range seenJobs {
+		for _, sub := range CollectDataSubs(job) {
+			if sub == nil || sub.ExSymbol == nil || sub.ExSymbol.ID != sid || sub.TimeFrame != tf ||
+				orm.NormalizeSeriesSource(sub.Source) != orm.SeriesSourceKline {
+				continue
+			}
+			fields = orm.MergeSeriesFields(fields, sub.Fields)
+		}
+	}
+	return fields
 }

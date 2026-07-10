@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/banbox/banexg"
 	utils2 "github.com/banbox/banexg/utils"
@@ -16,6 +17,47 @@ type SeriesField struct {
 }
 
 const SeriesSourceKline = "kline"
+
+var klineDefaultFields = []string{
+	"open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num",
+}
+
+func DefaultKlineFields() []string {
+	return append([]string(nil), klineDefaultFields...)
+}
+
+func NormalizeSeriesFields(source string, fields []string) []string {
+	if len(fields) == 0 && NormalizeSeriesSource(source) == SeriesSourceKline {
+		return DefaultKlineFields()
+	}
+	seen := make(map[string]bool, len(fields))
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" || seen[field] {
+			continue
+		}
+		seen[field] = true
+		out = append(out, field)
+	}
+	return out
+}
+
+func MergeSeriesFields(groups ...[]string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, fields := range groups {
+		for _, field := range fields {
+			field = strings.TrimSpace(field)
+			if field == "" || seen[field] {
+				continue
+			}
+			seen[field] = true
+			out = append(out, field)
+		}
+	}
+	return out
+}
 
 type SeriesBinding struct {
 	Table      string

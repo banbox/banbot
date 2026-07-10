@@ -1,6 +1,7 @@
 package orm
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/banbox/banexg"
@@ -123,6 +124,38 @@ func TestOHLCVSeriesValuesPreserveFieldsAndUseTargetSID(t *testing.T) {
 	if got.open != 1 || got.high != 2 || got.low != 0.5 || got.close != 1.5 ||
 		got.volume != 10 || got.quote != 15 || got.buyVolume != 6 || got.tradeNum != 8 {
 		t.Fatalf("unexpected values: %+v", got)
+	}
+}
+
+func TestOHLCVSeriesValuesPreserveExtraFieldsForWrite(t *testing.T) {
+	row := NewDataSeriesFromKline(&ExSymbol{ID: 11}, "1m", &banexg.Kline{Time: 123_000}, nil, false, true)
+	row.Values["signal_b"] = "sell"
+	row.Values["signal_a"] = 1.25
+	got, err := normalizeOHLCVSeries([]*DataSeries{row}, 11)
+	if err != nil {
+		t.Fatalf("normalizeOHLCVSeries returned error: %v", err)
+	}
+	wantFields := []string{"signal_a", "signal_b"}
+	if len(got) != 1 || !reflect.DeepEqual(klineExtraFields(got), wantFields) {
+		t.Fatalf("unexpected extra fields: %+v", got)
+	}
+	if got[0].extras["signal_a"] != 1.25 || got[0].extras["signal_b"] != "sell" {
+		t.Fatalf("extra values were dropped: %+v", got[0].extras)
+	}
+	wantCols := []string{"sid", "ts", "open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num", "signal_a", "signal_b"}
+	if cols := klineInsertColumns("ts", wantFields); !reflect.DeepEqual(cols, wantCols) {
+		t.Fatalf("unexpected insert columns: %v", cols)
+	}
+}
+
+func TestKlineSelectProjectionUsesDefaultsOrRequestedFields(t *testing.T) {
+	wantDefault := `"open","high","low","close","volume","quote","buy_volume","trade_num"`
+	if got := klineSelectProjection(nil, false); got != wantDefault {
+		t.Fatalf("unexpected default projection: %s", got)
+	}
+	wantRequested := `"close","signal","sid"`
+	if got := klineSelectProjection([]string{"close", "signal", "close"}, true); got != wantRequested {
+		t.Fatalf("unexpected requested projection: %s", got)
 	}
 }
 

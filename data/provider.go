@@ -166,9 +166,12 @@ func (p *Provider[IDataFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPr
 
 type HistProvider struct {
 	Provider[IHistDataFeeder]
-	getEnd    FnGetInt64
-	maxTfSecs int
-	pBar      *utils.StagedPrg
+	getEnd     FnGetInt64
+	maxTfSecs  int
+	pBar       *utils.StagedPrg
+	series     map[string]*HistSeriesFeeder
+	seriesCB   FnDataSeries
+	seriesRepo orm.SeriesRepo
 
 	wsLoader *WsDataLoader
 	trades   map[string]*TradeFeeder
@@ -194,12 +197,93 @@ func NewHistProvider(callBack FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64
 			dirtyVers: make(chan int, 5),
 			showLog:   showLog,
 		},
-		getEnd: getEnd,
-		pBar:   pBar,
-		trades: make(map[string]*TradeFeeder),
+		getEnd:   getEnd,
+		pBar:     pBar,
+		trades:   make(map[string]*TradeFeeder),
+		series:   make(map[string]*HistSeriesFeeder),
+		seriesCB: callBack,
 	}
 
 	return p
+}
+
+func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
+	if len(subs) == 0 {
+		p.series = make(map[string]*HistSeriesFeeder)
+		return nil
+	}
+	if config.TimeRange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "time range is required for historical series subscriptions")
+	}
+	items := make(map[string]*HistSeriesFeeder)
+	for _, sub := range subs {
+		if sub == nil || sub.ExSymbol == nil || orm.NormalizeSeriesSource(sub.Source) == orm.SeriesSourceKline {
+			continue
+		}
+		src := GetDataSource(sub.Source)
+		if src == nil {
+			return errs.NewMsg(core.ErrBadConfig, "data source %q is not registered", sub.Source)
+		}
+		info := src.Info()
+		if info == nil {
+			return errs.NewMsg(core.ErrBadConfig, "data source %q has no series info", sub.Source)
+		}
+		if sub.TimeFrame != info.TimeFrame {
+			return errs.NewMsg(core.ErrBadConfig, "sub timeframe %s does not match source timeframe %s", sub.TimeFrame, info.TimeFrame)
+		}
+		key := strat.DataSubKey(info.Name, sub.ExSymbol.ID, info.TimeFrame)
+		feeder, err := NewHistSeriesFeeder(p.seriesRepo, info, sub, p.seriesCB, config.TimeRange.StartMS)
+		if err != nil {
+			return errs.New(core.ErrBadConfig, err)
+		}
+		if old := p.series[key]; old != nil && old.sameProjection(feeder) {
+			old.SetEndMS(config.TimeRange.EndMS)
+			items[key] = old
+			continue
+		}
+		startMS, err_ := ThirdPartyWarmupStart([]*strat.DataSub{sub}, config.TimeRange.StartMS)
+		if err_ != nil {
+			return errs.New(core.ErrBadConfig, err_)
+		}
+		curMS := btime.TimeMS()
+		if curMS > config.TimeRange.StartMS {
+			startMS, err_ = ThirdPartyWarmupStart([]*strat.DataSub{sub}, curMS)
+			if err_ != nil {
+				return errs.New(core.ErrBadConfig, err_)
+			}
+			feeder.warmEndMS = curMS
+			feeder.SetEndMS(curMS)
+			feeder.SetSeek(startMS)
+			err := drainHistSeriesFeeder(feeder)
+			btime.CurTimeMS = curMS
+			if err != nil {
+				return err
+			}
+			feeder.warmEndMS = config.TimeRange.StartMS
+			startMS = curMS
+		}
+		feeder.SetEndMS(config.TimeRange.EndMS)
+		feeder.SetSeek(startMS)
+		if feeder.loadErr != nil {
+			return feeder.loadErr
+		}
+		items[key] = feeder
+	}
+	p.series = items
+	return nil
+}
+
+func drainHistSeriesFeeder(feeder *HistSeriesFeeder) *errs.Error {
+	for {
+		batch := feeder.GetBatch()
+		if batch == nil {
+			return nil
+		}
+		feeder.CallNext()
+		if err := feeder.RunBatch(batch); err != nil {
+			return err
+		}
+	}
 }
 
 func (p *HistProvider) downIfNeed() *errs.Error {
@@ -342,7 +426,7 @@ func (p *HistProvider) UnSubPairs(pairs ...string) *errs.Error {
 }
 
 func (p *HistProvider) LoopMain() *errs.Error {
-	if len(p.holders) == 0 {
+	if len(p.holders) == 0 && len(p.series) == 0 && len(p.trades) == 0 {
 		return errs.NewMsg(core.ErrBadConfig, "no pairs to run")
 	}
 	makeFeeders := func() []IHistFeeder {
@@ -353,6 +437,9 @@ func (p *HistProvider) LoopMain() *errs.Error {
 		}
 		for _, tf := range p.trades {
 			feeders = append(feeders, tf)
+		}
+		for _, seriesFeeder := range p.series {
+			feeders = append(feeders, seriesFeeder)
 		}
 
 		return feeders
@@ -658,6 +745,115 @@ func makeOnSeriesMsg(p *LiveProvider) func(msg *SeriesMsg) {
 		} else {
 			hold.setWaitData(lastRow.CloneWithExSymbol(exs))
 		}
+	}
+}
+
+func enrichStoredKlineFields(exs *orm.ExSymbol, tf string, rows []*orm.DataSeries) []*orm.DataSeries {
+	if exs == nil || len(rows) == 0 {
+		return rows
+	}
+	fields := strat.CollectKlineSubFields(exs.ID, tf)
+	if !hasExtraKlineFields(fields) {
+		return rows
+	}
+	allPresent := true
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		for _, field := range fields {
+			if isDefaultKlineField(field) {
+				continue
+			}
+			if _, ok := row.Values[field]; !ok {
+				allPresent = false
+				break
+			}
+		}
+		if !allPresent {
+			break
+		}
+	}
+	if allPresent {
+		return rows
+	}
+	sess, conn, err := orm.Conn(nil)
+	if err != nil {
+		log.Warn("open kline field query fail", zap.String("pair", exs.Symbol), zap.String("tf", tf), zap.Error(err))
+		return rows
+	}
+	defer conn.Release()
+	startMS, endMS := int64(0), int64(0)
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		if startMS == 0 || row.TimeMS < startMS {
+			startMS = row.TimeMS
+		}
+		if row.EndMS > endMS {
+			endMS = row.EndMS
+		}
+	}
+	if startMS == 0 || endMS <= startMS {
+		return rows
+	}
+	stored, err := sess.QuerySeriesFields(exs, tf, fields, startMS, endMS, 0, false)
+	if err != nil {
+		log.Warn("query kline fields fail", zap.String("pair", exs.Symbol), zap.String("tf", tf), zap.Error(err))
+		return rows
+	}
+	byTime := make(map[int64]*orm.DataSeries, len(stored))
+	for _, row := range stored {
+		if row != nil {
+			byTime[row.TimeMS] = row
+		}
+	}
+	return mergeKlineFieldRows(rows, byTime)
+}
+
+func mergeKlineFieldRows(rows []*orm.DataSeries, byTime map[int64]*orm.DataSeries) []*orm.DataSeries {
+	out := make([]*orm.DataSeries, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			out = append(out, row)
+			continue
+		}
+		full := byTime[row.TimeMS]
+		if full == nil {
+			out = append(out, row)
+			continue
+		}
+		cp := *row
+		cp.Values = make(map[string]any, len(row.Values)+len(full.Values))
+		for key, val := range row.Values {
+			cp.Values[key] = val
+		}
+		for key, val := range full.Values {
+			if !isDefaultKlineField(key) {
+				cp.Values[key] = val
+			}
+		}
+		out = append(out, &cp)
+	}
+	return out
+}
+
+func hasExtraKlineFields(fields []string) bool {
+	for _, field := range fields {
+		if !isDefaultKlineField(field) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDefaultKlineField(field string) bool {
+	switch field {
+	case "open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num":
+		return true
+	default:
+		return false
 	}
 }
 
