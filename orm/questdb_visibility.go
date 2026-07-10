@@ -144,6 +144,27 @@ func waitForQuestKlineWindowVisible(ctx context.Context, q *Queries, sid int32, 
 	return visible, nil
 }
 
+func waitForQuestKlineTimestampVisible(ctx context.Context, q *Queries, sid int32, timeframe string, timeMS int64) *errs.Error {
+	tblName := "kline_" + timeframe
+	sqlText := fmt.Sprintf(`SELECT count(*) > 0 FROM %s
+	WHERE sid = $1 AND ts = cast($2 as timestamp)`, tblName)
+	ok, err := waitForQuestCondition(ctx, questReadAfterWriteTimeout, questReadAfterWritePollInterval, func() (bool, error) {
+		var visible bool
+		if err := q.db.QueryRow(ctx, sqlText, sid, timeMS*1000).Scan(&visible); err != nil {
+			return false, err
+		}
+		return visible, nil
+	})
+	if err != nil {
+		return NewDbErr(core.ErrDbReadFail, err)
+	}
+	if !ok {
+		return errs.NewMsg(core.ErrDbReadFail,
+			"questdb kline row not visible before timeout: sid=%d timeframe=%s time=%d", sid, timeframe, timeMS)
+	}
+	return nil
+}
+
 func queryQuestKlineTimeRange(ctx context.Context, q *Queries, sid int32, timeframe string) (int64, int64, error) {
 	tblName := "kline_" + timeframe
 	sqlText := fmt.Sprintf("select min(cast(ts as long)/1000), max(cast(ts as long)/1000) from %s where sid=$1", tblName)
@@ -174,13 +195,46 @@ func waitForQuestKlineRangeVisible(ctx context.Context, q *Queries, sid int32, t
 	return start, end, nil
 }
 
-func verifyQuestRewriteCount(ctx context.Context, q *Queries, tableName string, expected int64) *errs.Error {
-	var count int64
-	if err := q.db.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", tableName)).Scan(&count); err != nil {
+func verifyQuestRewriteSnapshot(ctx context.Context, q *Queries, tableName string, expected map[int32]int64) *errs.Error {
+	var actual map[int32]int64
+	ok, err := waitForQuestCondition(ctx, questReadAfterWriteTimeout, questReadAfterWritePollInterval, func() (bool, error) {
+		rows, err := q.db.Query(ctx, fmt.Sprintf("SELECT sid, count(*) FROM %s GROUP BY sid ORDER BY sid", tableName))
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+		actual = make(map[int32]int64)
+		for rows.Next() {
+			var sid int32
+			var count int64
+			if err := rows.Scan(&sid, &count); err != nil {
+				return false, err
+			}
+			actual[sid] = count
+		}
+		if err := rows.Err(); err != nil {
+			return false, err
+		}
+		return equalQuestRewriteSnapshot(actual, expected), nil
+	})
+	if err != nil {
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
-	if count != expected {
-		return errs.NewMsg(core.ErrDbReadFail, "rewrite snapshot row count mismatch: table=%s got=%d want=%d", tableName, count, expected)
+	if !ok {
+		return errs.NewMsg(core.ErrDbReadFail,
+			"rewrite snapshot mismatch before timeout: table=%s got=%v want=%v", tableName, actual, expected)
 	}
 	return nil
+}
+
+func equalQuestRewriteSnapshot(actual, expected map[int32]int64) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for sid, count := range expected {
+		if actual[sid] != count {
+			return false
+		}
+	}
+	return true
 }

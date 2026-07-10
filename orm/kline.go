@@ -45,122 +45,8 @@ func init() {
 	}
 }
 
-func (q *Queries) QueryOHLCV(exs *ExSymbol, timeframe string, startMs, endMs int64, limit int, withUnFinish bool) ([]*banexg.Kline, *errs.Error) {
-	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
-	revRead := startMs == 0 && limit > 0
-	startMs, endMs = parseDownArgs(tfMSecs, startMs, endMs, limit, withUnFinish)
-	maxEndMs := endMs
-	finishEndMS := utils2.AlignTfMSecs(endMs, tfMSecs)
-	unFinishMS := int64(0)
-	if withUnFinish {
-		curMs := btime.UTCStamp()
-		unFinishMS = utils2.AlignTfMSecs(curMs, tfMSecs)
-		if finishEndMS > unFinishMS {
-			finishEndMS = unFinishMS
-		}
-	}
-
-	var klines []*banexg.Kline
-	if !IsQuestDB {
-		// TimescaleDB: time column is int8 ms.
-		var subTF string
-		var err_ error
-		if revRead {
-			klines, err_ = q.queryOHLCVPg(exs.ID, timeframe, 0, finishEndMS, limit, true)
-		} else {
-			if limit == 0 {
-				limit = int((finishEndMS-startMs)/tfMSecs) + 1
-			}
-			klines, err_ = q.queryOHLCVPg(exs.ID, timeframe, startMs, finishEndMS, limit, false)
-		}
-		tblName, subTF2, _ := resolveTablePg(timeframe)
-		_ = tblName
-		subTF = subTF2
-		if err_ != nil {
-			return nil, NewDbErr(core.ErrDbReadFail, err_)
-		}
-		if revRead {
-			utils.ReverseArr(klines)
-		}
-		if subTF != "" && len(klines) > 0 {
-			fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
-			var lastFinish bool
-			offMS := GetAlignOff(exs.ID, tfMSecs)
-			klines, lastFinish = utils.BuildOHLCV(klines, tfMSecs, 0, nil, fromTfMSecs, offMS)
-			if !lastFinish && len(klines) > 0 {
-				klines = klines[:len(klines)-1]
-			}
-		}
-		if len(klines) > limit && limit > 0 {
-			if revRead {
-				klines = klines[len(klines)-limit:]
-			} else {
-				klines = klines[:limit]
-			}
-		}
-		if len(klines) == 0 && maxEndMs-endMs > tfMSecs {
-			return q.QueryOHLCV(exs, timeframe, endMs, maxEndMs, limit, withUnFinish)
-		} else if withUnFinish && len(klines) > 0 && klines[len(klines)-1].Time+tfMSecs == unFinishMS {
-			unbar, _, _ := getUnFinish(q, exs.ID, timeframe, unFinishMS, unFinishMS+tfMSecs, "query")
-			if unbar != nil {
-				klines = append(klines, unbar)
-			}
-		}
-		return klines, nil
-	}
-
-	var dctSql string
-	if revRead {
-		// No start time provided, quantity limit provided, search in reverse chronological order
-		// 未提供开始时间，提供了数量限制，按时间倒序搜索
-		dctSql = fmt.Sprintf(`
-select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
-where sid=%d and ts < cast(%v as timestamp)
-order by ts desc`, exs.ID, finishEndMS*1000)
-	} else {
-		if limit == 0 {
-			limit = int((finishEndMS-startMs)/tfMSecs) + 1
-		}
-		dctSql = fmt.Sprintf(`
-select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num from $tbl
-where sid=%d and ts >= cast(%v as timestamp) and ts < cast(%v as timestamp)
-order by ts`, exs.ID, startMs*1000, finishEndMS*1000)
-	}
-	subTF, rows, err_ := queryHyper(q, timeframe, dctSql, limit)
-	klines, err_ = mapToKlines(rows, err_)
-	if err_ != nil {
-		return nil, NewDbErr(core.ErrDbReadFail, err_)
-	}
-	if revRead {
-		// If read in reverse order, reverse it again to make the time ascending
-		// 倒序读取的，再次逆序，使时间升序
-		utils.ReverseArr(klines)
-	}
-	if subTF != "" && len(klines) > 0 {
-		fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
-		var lastFinish bool
-		offMS := GetAlignOff(exs.ID, tfMSecs)
-		klines, lastFinish = utils.BuildOHLCV(klines, tfMSecs, 0, nil, fromTfMSecs, offMS)
-		if !lastFinish && len(klines) > 0 {
-			klines = klines[:len(klines)-1]
-		}
-	}
-	if len(klines) > limit {
-		if revRead {
-			klines = klines[len(klines)-limit:]
-		} else {
-			klines = klines[:limit]
-		}
-	}
-	if len(klines) == 0 && maxEndMs-endMs > tfMSecs {
-		return q.QueryOHLCV(exs, timeframe, endMs, maxEndMs, limit, withUnFinish)
-	} else if withUnFinish && len(klines) > 0 && klines[len(klines)-1].Time+tfMSecs == unFinishMS {
-		unbar, _, _ := getUnFinish(q, exs.ID, timeframe, unFinishMS, unFinishMS+tfMSecs, "query")
-		if unbar != nil {
-			klines = append(klines, unbar)
-		}
-	}
-	return klines, nil
+func (q *Queries) QueryOHLCV(exs *ExSymbol, timeframe string, startMs, endMs int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error) {
+	return q.QuerySeries(exs, timeframe, startMs, endMs, limit, withUnFinish)
 }
 
 type KlineSid struct {
@@ -168,85 +54,8 @@ type KlineSid struct {
 	Sid int32
 }
 
-func (q *Queries) QueryOHLCVBatch(exsMap map[int32]*ExSymbol, timeframe string, startMs, endMs int64, limit int, handle func(int32, []*banexg.Kline)) *errs.Error {
-	if len(exsMap) == 0 {
-		return nil
-	}
-	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
-	startMs, endMs = parseDownArgs(tfMSecs, startMs, endMs, limit, false)
-	finishEndMS := utils2.AlignTfMSecs(endMs, tfMSecs)
-	if core.LiveMode {
-		curMs := btime.TimeMS()
-		unFinishMS := utils2.AlignTfMSecs(curMs, tfMSecs)
-		if finishEndMS > unFinishMS {
-			finishEndMS = unFinishMS
-		}
-	}
-	if !IsQuestDB {
-		return q.queryOHLCVBatchPg(exsMap, timeframe, startMs, finishEndMS, tfMSecs, handle)
-	}
-	sidTA := make([]string, 0, len(exsMap))
-	for _, exs := range exsMap {
-		sidTA = append(sidTA, fmt.Sprintf("%v", exs.ID))
-	}
-	sidText := strings.Join(sidTA, ", ")
-	dctSql := fmt.Sprintf(`
-select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num,sid from $tbl
-where ts >= cast(%v as timestamp) and ts < cast(%v as timestamp) and sid in (%v)
-order by sid,ts`, startMs*1000, finishEndMS*1000, sidText)
-	subTF, rows, err_ := queryHyper(q, timeframe, dctSql, 0)
-	arrs, err_ := mapToItems(rows, err_, func() (*KlineSid, []any) {
-		var i KlineSid
-		return &i, []any{&i.Time, &i.Open, &i.High, &i.Low, &i.Close, &i.Volume, &i.Quote, &i.BuyVolume, &i.TradeNum, &i.Sid}
-	})
-	if err_ != nil {
-		return NewDbErr(core.ErrDbReadFail, err_)
-	}
-	initCap := max(len(arrs)/len(exsMap), 16)
-	var klineArr []*banexg.Kline
-	curSid := int32(0)
-	fromTfMSecs := int64(0)
-	if subTF != "" {
-		fromTfMSecs = int64(utils2.TFToSecs(subTF) * 1000)
-	}
-	noFired := make(map[int32]bool)
-	for _, exs := range exsMap {
-		noFired[exs.ID] = true
-	}
-	callBack := func() {
-		if fromTfMSecs > 0 {
-			var lastDone bool
-			offMS := GetAlignOff(curSid, tfMSecs)
-			klineArr, lastDone = utils.BuildOHLCV(klineArr, tfMSecs, 0, nil, fromTfMSecs, offMS)
-			if !lastDone && len(klineArr) > 0 {
-				klineArr = klineArr[:len(klineArr)-1]
-			}
-		}
-		if len(klineArr) > 0 {
-			delete(noFired, curSid)
-			handle(curSid, klineArr)
-		}
-	}
-	// callBack for kline pairs
-	for _, k := range arrs {
-		if k.Sid != curSid {
-			if curSid > 0 && len(klineArr) > 0 {
-				callBack()
-			}
-			curSid = k.Sid
-			klineArr = make([]*banexg.Kline, 0, initCap)
-		}
-		klineArr = append(klineArr, &banexg.Kline{Time: k.Time, Open: k.Open, High: k.High, Low: k.Low,
-			Close: k.Close, Volume: k.Volume, Quote: k.Quote, BuyVolume: k.BuyVolume, TradeNum: k.TradeNum})
-	}
-	if curSid > 0 && len(klineArr) > 0 {
-		callBack()
-	}
-	// callBack for no data sids
-	for sid := range noFired {
-		handle(sid, nil)
-	}
-	return nil
+func (q *Queries) QueryOHLCVBatch(exsMap map[int32]*ExSymbol, timeframe string, startMs, endMs int64, limit int, handle func(int32, []*DataSeries)) *errs.Error {
+	return q.QuerySeriesBatch(exsMap, timeframe, startMs, endMs, limit, handle)
 }
 
 func (q *Queries) getKLineTimes(sid int32, timeframe string, startMs, endMs int64) ([]int64, *errs.Error) {
@@ -824,20 +633,28 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 	if err != nil || insTs.IsZero() {
 		return 0, err
 	}
-	defer func() {
-		if insTs.IsZero() {
-			return
-		}
-		if err_ := q.DelInsKline(context.Background(), exs.ID, timeFrame, insTs); err_ != nil {
-			log.Warn("DelInsKline fail", zap.Int32("sid", exs.ID), zap.Error(err_))
-		}
-	}()
 	num, err := q.InsertKLines(timeFrame, exs.ID, arr)
 	if err != nil {
 		return num, err
 	}
-	err = q.UpdateKRange(exs, timeFrame, startMS, endMS, arr, aggBig)
-	return num, err
+	return num, q.finalizeKlineInsert(exs, timeFrame, startMS, endMS, arr[len(arr)-1].Time, insTs, aggBig)
+}
+
+func (q *Queries) finalizeKlineInsert(exs *ExSymbol, timeFrame string, startMS, endMS, lastMS int64,
+	insTs time.Time, aggBig bool) *errs.Error {
+	ctx := context.Background()
+	if IsQuestDB {
+		if err := waitForQuestKlineTimestampVisible(ctx, q, exs.ID, timeFrame, lastMS); err != nil {
+			return err
+		}
+	}
+	if err := q.UpdateKRange(exs, timeFrame, startMS, endMS, aggBig); err != nil {
+		return err
+	}
+	if err := q.DelInsKline(ctx, exs.ID, timeFrame, insTs); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	return nil
 }
 
 /*
@@ -849,7 +666,7 @@ UpdateKRange
 2. 搜索空洞，更新Khole
 3. 更新更大周期的连续聚合
 */
-func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS int64, klines []*banexg.Kline, aggBig bool, skipHoles ...bool) *errs.Error {
+func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS int64, aggBig bool, skipHoles ...bool) *errs.Error {
 	// Record data ranges in sranges (non-contiguous allowed).
 	if err := updateKLineRange(exs.ID, timeFrame, startMS, endMS); err != nil {
 		return err
@@ -1125,6 +942,7 @@ func (q *Queries) DelKLines(timeFrame string, delSids map[int32]bool) *errs.Erro
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
 	var validSids []string
+	keepSidCounts := make(map[int32]int64)
 	var totalCount, keepCount int64
 	for sidRows.Next() {
 		var sid int32
@@ -1136,6 +954,7 @@ func (q *Queries) DelKLines(timeFrame string, delSids map[int32]bool) *errs.Erro
 		totalCount += cnt
 		if !delSids[sid] {
 			validSids = append(validSids, strconv.Itoa(int(sid)))
+			keepSidCounts[sid] = cnt
 			keepCount += cnt
 		}
 	}
@@ -1160,7 +979,7 @@ from %s where 1=0
 		if _, err_ = q.db.Exec(ctx, createSQL); err_ != nil {
 			return NewDbErr(core.ErrDbExecFail, err_)
 		}
-		if verifyErr := verifyQuestRewriteCount(ctx, q, tmpTbl, 0); verifyErr != nil {
+		if verifyErr := verifyQuestRewriteSnapshot(ctx, q, tmpTbl, nil); verifyErr != nil {
 			_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
 			return verifyErr
 		}
@@ -1208,7 +1027,7 @@ from %s where sid in (%s)
 	if _, err_ = q.db.Exec(ctx, createSQL); err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
-	if verifyErr := verifyQuestRewriteCount(ctx, q, tmpTbl, keepCount); verifyErr != nil {
+	if verifyErr := verifyQuestRewriteSnapshot(ctx, q, tmpTbl, keepSidCounts); verifyErr != nil {
 		_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
 		return verifyErr
 	}
@@ -1534,7 +1353,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 			if start > 0 && end > 0 {
 				exs := GetSymbolByID(i.Sid)
 				if exs != nil {
-					if err := q.UpdateKRange(exs, i.Timeframe, start, end, nil, true); err != nil {
+					if err := q.UpdateKRange(exs, i.Timeframe, start, end, true); err != nil {
 						return err
 					}
 				}
@@ -1668,18 +1487,22 @@ func calcCnFutureFactors(sess *Queries, args *config.CmdArgs) *errs.Error {
 			lastCode = parts[0].Val
 			lastExs = exs
 		}
-		klines, err := sess.QueryOHLCV(exs, "1d", 0, 0, 0, false)
+		rows, err := sess.QueryOHLCV(exs, "1d", 0, 0, 0, false)
 		if err != nil {
 			return err
 		}
-		for _, k := range klines {
-			barTime := utils2.AlignTfMSecs(k.Time, dayMSecs)
+		bars, projectErr := SeriesToKLines(rows, exs)
+		if projectErr != nil {
+			return errs.New(core.ErrInvalidBars, projectErr)
+		}
+		for _, bar := range bars {
+			barTime := utils2.AlignTfMSecs(bar.Time, dayMSecs)
 			vols, _ := dateSidVols[barTime]
 			if vols == nil {
 				vols = make(map[int32]*banexg.Kline)
 				dateSidVols[barTime] = vols
 			}
-			vols[exs.ID] = k
+			vols[exs.ID] = bar
 		}
 	}
 	return saveAdjFactors(dateSidVols, lastCode, lastExs, args.OutPath)

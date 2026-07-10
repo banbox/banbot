@@ -352,16 +352,26 @@ func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *e
 			skips = append(skips, pair)
 			continue
 		}
-		_, klines, err := orm.GetOHLCV(exs, f.Timeframe, 0, timeMS, f.BackNum, false)
-		if err != nil || len(klines)*2 < f.BackNum {
+		_, rows, err := orm.GetOHLCV(exs, f.Timeframe, 0, timeMS, f.BackNum, false)
+		if err != nil || len(rows)*2 < f.BackNum {
 			skips = append(skips, pair)
 			continue
 		}
-		names = append(names, pair)
-		prices := make([]float64, 0, len(klines))
-		for _, b := range klines {
-			prices = append(prices, b.Close)
+		prices := make([]float64, 0, len(rows))
+		badRow := false
+		for _, row := range rows {
+			closeVal, err_ := row.CloseValue()
+			if err_ != nil {
+				skips = append(skips, pair)
+				badRow = true
+				break
+			}
+			prices = append(prices, closeVal)
 		}
+		if badRow {
+			continue
+		}
+		names = append(names, pair)
 		if len(prices) > f.BackNum {
 			prices = prices[:f.BackNum]
 		}

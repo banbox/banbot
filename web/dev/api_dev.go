@@ -1597,14 +1597,32 @@ func getSymbolData(c *fiber.Ctx) error {
 
 	// 转换为float64数组
 	result := make([][]float64, len(data))
-	for i, bar := range data {
+	for i, row := range data {
+		if row == nil {
+			return errs.NewMsg(core.ErrInvalidBars, "series row is nil")
+		}
+		open, err_ := row.OpenValue()
+		if err_ != nil {
+			return errs.New(core.ErrInvalidBars, err_)
+		}
+		high, err_ := row.HighValue()
+		if err_ != nil {
+			return errs.New(core.ErrInvalidBars, err_)
+		}
+		low, err_ := row.LowValue()
+		if err_ != nil {
+			return errs.New(core.ErrInvalidBars, err_)
+		}
+		closeVal, err_ := row.CloseValue()
+		if err_ != nil {
+			return errs.New(core.ErrInvalidBars, err_)
+		}
+		volume, err_ := row.VolumeValue()
+		if err_ != nil {
+			return errs.New(core.ErrInvalidBars, err_)
+		}
 		result[i] = []float64{
-			float64(bar.Time),
-			bar.Open,
-			bar.High,
-			bar.Low,
-			bar.Close,
-			bar.Volume,
+			float64(row.TimeMS), open, high, low, closeVal, volume,
 		}
 	}
 

@@ -1,10 +1,13 @@
 package orm
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/banbox/banexg"
 )
+
+var benchmarkProjectedKlines []*banexg.Kline
 
 func TestKlineToSeriesRoundTrip(t *testing.T) {
 	bar := &InfoKline{
@@ -59,6 +62,104 @@ func TestAsKlineRequiresOHLCV(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected AsKline to reject non-kline-shaped series")
 	}
+}
+
+func TestSeriesToKLinesMatchesOHLCVProjection(t *testing.T) {
+	exs := &ExSymbol{ID: 42, Symbol: "BTC/USDT"}
+	rows := []*DataSeries{
+		NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: 1_700_000_040_000, Open: 1, High: 2, Low: 0.5, Close: 1.5,
+			Volume: 10, Quote: 15, BuyVolume: 6, TradeNum: 8,
+		}, nil, false, true),
+		NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: 1_700_000_100_000, Open: 1.5, High: 2.5, Low: 1, Close: 2,
+			Volume: 11, Quote: 20, BuyVolume: 7, TradeNum: 9,
+		}, nil, false, true),
+	}
+
+	got, err := SeriesToKLines(rows, exs)
+	if err != nil {
+		t.Fatalf("SeriesToKLines returned error: %v", err)
+	}
+	if len(got) != len(rows) {
+		t.Fatalf("expected %d rows, got %d", len(rows), len(got))
+	}
+	for i, row := range rows {
+		view, err := row.OHLCV(exs)
+		if err != nil {
+			t.Fatalf("OHLCV returned error: %v", err)
+		}
+		if !reflect.DeepEqual(got[i], view.Bar()) {
+			t.Fatalf("row %d mismatch: got=%+v want=%+v", i, got[i], view.Bar())
+		}
+	}
+}
+
+func TestSeriesToKLinesRejectsInvalidRows(t *testing.T) {
+	exs := &ExSymbol{ID: 42, Symbol: "BTC/USDT"}
+	valid := NewDataSeriesFromKline(exs, "1m", &banexg.Kline{Time: 1_700_000_040_000}, nil, false, true)
+	missingField := &DataSeries{
+		Sid: 42, ExSymbol: exs, TimeMS: 1_700_000_100_000,
+		Values: map[string]any{"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5},
+	}
+	missingSymbol := NewDataSeriesFromKline(nil, "1m", &banexg.Kline{Time: 1_700_000_160_000}, nil, false, true)
+
+	tests := []struct {
+		name string
+		rows []*DataSeries
+		exs  *ExSymbol
+	}{
+		{name: "nil row", rows: []*DataSeries{valid, nil}, exs: exs},
+		{name: "missing field", rows: []*DataSeries{missingField}, exs: exs},
+		{name: "missing symbol", rows: []*DataSeries{missingSymbol}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := SeriesToKLines(test.rows, test.exs); err == nil {
+				t.Fatal("expected projection error")
+			}
+		})
+	}
+}
+
+func BenchmarkSeriesToKLines(b *testing.B) {
+	exs, rows := benchmarkSeriesRows(256)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var err error
+		benchmarkProjectedKlines, err = SeriesToKLines(rows, exs)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkOHLCVThenBar(b *testing.B) {
+	exs, rows := benchmarkSeriesRows(256)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		bars := make([]*banexg.Kline, 0, len(rows))
+		for _, row := range rows {
+			view, err := row.OHLCV(exs)
+			if err != nil {
+				b.Fatal(err)
+			}
+			bars = append(bars, view.Bar())
+		}
+		benchmarkProjectedKlines = bars
+	}
+}
+
+func benchmarkSeriesRows(size int) (*ExSymbol, []*DataSeries) {
+	exs := &ExSymbol{ID: 42, Symbol: "BTC/USDT"}
+	rows := make([]*DataSeries, 0, size)
+	for i := 0; i < size; i++ {
+		rows = append(rows, NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: int64(1_700_000_040_000 + i*60_000), Open: 1, High: 2, Low: 0.5, Close: 1.5,
+			Volume: 10, Quote: 15, BuyVolume: 6, TradeNum: 8,
+		}, nil, false, true))
+	}
+	return exs, rows
 }
 
 func TestResampleSeriesRecordsUsesAggRules(t *testing.T) {

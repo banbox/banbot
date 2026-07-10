@@ -434,16 +434,21 @@ func exportKlines(sess *Queries, ctx context.Context, task *ExportKlineJob, outD
 		default:
 		}
 
-		_, klines, err = sess.GetOHLCV(exs, task.TimeFrame, startMS, task.StopMS, batchSize, false)
+		_, rows, err := sess.GetOHLCV(exs, task.TimeFrame, startMS, task.StopMS, batchSize, false)
 		if err != nil {
 			return file, err
 		}
-		if len(klines) == 0 {
+		if len(rows) == 0 {
 			break
 		}
-		curEnd := klines[len(klines)-1].Time + tfMSecs
+		curEnd := rows[len(rows)-1].TimeMS + tfMSecs
 		pJob.Add(int((curEnd - startMS) / tfMSecs))
 		startMS = curEnd
+		projected, projectErr := SeriesToKLines(rows, exs)
+		if projectErr != nil {
+			return file, errs.New(core.ErrInvalidBars, projectErr)
+		}
+		klines = projected
 
 		for len(klines) > 0 {
 			klines = block.Append(klines, tfMSecs, hasInfo)

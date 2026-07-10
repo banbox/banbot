@@ -58,13 +58,17 @@ func getHist(c *fiber.Ctx) error {
 		return err2
 	}
 	startMS, stopMS, tf := data.FromMS, data.ToMS, data.TimeFrame
-	adjs, klines, err2 := orm.AutoFetchOHLCV(exchange, exs, tf, startMS, stopMS, 0, true, nil)
+	adjs, rows, err2 := orm.AutoFetchOHLCV(exchange, exs, tf, startMS, stopMS, 0, true, nil)
+	if err2 != nil {
+		return err2
+	}
+	dataRows, err2 := ArrSeriesRows(rows)
 	if err2 != nil {
 		return err2
 	}
 	return c.JSON(fiber.Map{
 		"adjs": adjs,
-		"data": ArrSeriesBars(klines),
+		"data": dataRows,
 	})
 }
 

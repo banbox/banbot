@@ -960,25 +960,31 @@ func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[stri
 		}
 		tfMSecs := int64(minTfSecs * 1000)
 		exs := orm.GetExSymbol2(core.ExgName, core.Market, pair)
-		_, bars, err := orm.GetOHLCV(exs, minTF, startMS, endMS, 1, false)
+		_, rows, err := orm.GetOHLCV(exs, minTF, startMS, endMS, 1, false)
 		if err != nil {
 			return nil, err
 		}
-		if len(bars) == 0 {
+		if len(rows) == 0 {
 			continue
 		}
-		priceOpen := bars[0].Open
-		openMS := bars[0].Time
-		_, bars, err = orm.GetOHLCV(exs, minTF, 0, endMS, 1, false)
+		priceOpen, err_ := rows[0].OpenValue()
+		if err_ != nil {
+			return nil, errs.New(core.ErrInvalidBars, err_)
+		}
+		openMS := rows[0].TimeMS
+		_, rows, err = orm.GetOHLCV(exs, minTF, 0, endMS, 1, false)
 		if err != nil {
 			return nil, err
 		}
-		if len(bars) == 0 {
+		if len(rows) == 0 {
 			return nil, errs.NewMsg(errs.CodeRunTime, "no kline before %v -%v", pair, endMS)
 		}
-		last := bars[len(bars)-1]
-		priceClose := last.Close
-		closeMS := last.Time + tfMSecs
+		last := rows[len(rows)-1]
+		priceClose, err_ := last.CloseValue()
+		if err_ != nil {
+			return nil, errs.New(core.ErrInvalidBars, err_)
+		}
+		closeMS := last.TimeMS + tfMSecs
 		for _, od := range items {
 			if _, ok := cloneIds[od.ID]; !ok {
 				continue

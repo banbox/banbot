@@ -663,12 +663,14 @@ func (m *Miner) watchKLines(pairs []string) {
 		}
 		// Send uohlcv subscription messages
 		// 发送uohlcv订阅消息
+		exs := orm.GetExSymbol2(m.ExgName, m.Market, pair)
+		rows := orm.KLinesToSeries(exs, "1m", arr, nil, false, false)
 		err_ := m.spider.Broadcast(&utils.IOMsg{
 			Action: unPrefix + pair,
 			Data: NotifySeries{
 				TFSecs:   tfSecs,
 				Interval: 1,
-				Rows:     orm.BarsToSeries(orm.GetExSymbol2(m.ExgName, m.Market, pair), "1m", arr, nil, false, false),
+				Rows:     rows,
 			},
 		})
 		curTS := btime.UTCStamp()
@@ -813,13 +815,14 @@ func (m *Miner) startLoopKLines() {
 					if len(bars) > 0 {
 						barNum += len(bars)
 						sta.ExpectMS = bars[len(bars)-1].Time + mntMSecs
+						exs := orm.GetSymbolByID(sta.Sid)
+						rows := orm.KLinesToSeries(exs, curTF, bars, nil, false, true)
 						// There are completed k-lines, written to the database, and only then the message is broadcast
 						// 有已完成的k线，写入到数据库，然后才广播消息
 						sidLock.Lock()
 						existingJob, exists := sidMap[sta.Sid]
 						if exists {
-							// Append to existing job's Arr
-							existingJob.Rows = append(existingJob.Rows, orm.BarsToSeries(orm.GetSymbolByID(sta.Sid), curTF, bars, nil, false, true)...)
+							existingJob.Rows = append(existingJob.Rows, rows...)
 							sidLock.Unlock()
 							log.Debug("kline appended to existing job", zap.Int32("sid", sta.Sid), zap.String("pair", p),
 								zap.Int("num", len(bars)), zap.Int("total", len(existingJob.Rows)))
@@ -828,7 +831,7 @@ func (m *Miner) startLoopKLines() {
 							newJob := &SaveSeries{
 								Sid:       sta.Sid,
 								TimeFrame: curTF,
-								Rows:      orm.BarsToSeries(orm.GetSymbolByID(sta.Sid), curTF, bars, nil, false, true),
+								Rows:      rows,
 								MsgAction: prefix + p,
 								ReceiveAt: btime.UTCStamp(),
 							}

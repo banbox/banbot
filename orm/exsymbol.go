@@ -745,17 +745,23 @@ func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int3
 			prgBar.Add(1)
 		}
 		startMS := core.MSMinStamp
-		var klines []*banexg.Kline
 		if hasFetch {
+			var klines []*banexg.Kline
 			klines, err = exchange.FetchOHLCV(exs.Symbol, "1m", startMS, 1, nil)
+			if len(klines) > 0 {
+				exs.ListMs = klines[0].Time
+			}
 		} else {
-			klines, err = sess.QueryOHLCV(exs, "1m", startMS, 0, 1, false)
+			var rows []*DataSeries
+			rows, err = sess.QueryOHLCV(exs, "1m", startMS, 0, 1, false)
+			if len(rows) > 0 {
+				exs.ListMs = rows[0].TimeMS
+			}
 		}
 		if err != nil {
 			return err
 		}
-		if len(klines) > 0 {
-			exs.ListMs = klines[0].Time
+		if exs.ListMs > 0 {
 			err_ := sess.SetListMS(context.Background(), SetListMSParams{
 				ID:       exs.ID,
 				ListMs:   exs.ListMs,

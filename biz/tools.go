@@ -228,23 +228,21 @@ func LoadZipSeries(inPath string, fid int, file *zip.File, arg interface{}) *err
 	endDt := btime.ToDateStr(endMS, "")
 	log.Info("insert", zap.String("symbol", exs.Symbol), zap.Int32("sid", exs.ID),
 		zap.Int("num", len(klines)), zap.String("start", startDt), zap.String("end", endDt))
-	// 这里不可使用数据库默认的归集策略，因有些bar成交量为0；应调用BuildOHLCVOff归集
-	// the database default aggregation strategy cannot be used here, because some bar volumes are 0; BuildOHLCVOff aggregation should be called
-	rowsToSave := orm.BarsToSeries(exs, timeFrame, klines, nil, false, true)
-	num, err := sess.InsertSeries(timeFrame, exs, rowsToSave, false)
+	// K-line aggregation must preserve the zero-volume and sparse-bucket rules.
+	seriesRows := orm.KLinesToSeries(exs, timeFrame, klines, nil, false, true)
+	num, err := sess.InsertSeries(timeFrame, exs, seriesRows, false)
 	if err == nil && num > 0 {
 		// insert data for big timeframes 插入更大周期
-		return aggBigKlines(sess, klines, tfMSecs, exs)
+		return aggBigSeries(sess, seriesRows, tfMSecs, exs)
 	}
 	return err
 }
 
-func aggBigKlines(sess *orm.Queries, klines []*banexg.Kline, tfMSecs int64, exs *orm.ExSymbol) *errs.Error {
-	if len(klines) == 0 {
+func aggBigSeries(sess *orm.Queries, rows []*orm.DataSeries, tfMSecs int64, exs *orm.ExSymbol) *errs.Error {
+	if len(rows) == 0 {
 		return nil
 	}
 	aggList := orm.GetKlineAggs()
-	klines1m := klines
 	var err *errs.Error
 	var num int64
 	for _, agg := range aggList[1:] {
@@ -252,11 +250,14 @@ func aggBigKlines(sess *orm.Queries, klines []*banexg.Kline, tfMSecs int64, exs 
 			continue
 		}
 		offMS := int64(exg.GetAlignOff(exs.Exchange, int(agg.MSecs/1000)) * 1000)
-		klines, _ = utils.BuildOHLCV(klines1m, agg.MSecs, 0, nil, tfMSecs, offMS)
-		if len(klines) == 0 {
+		aggRows, _, err_ := orm.ResampleDataSeries(exs, agg.TimeFrame, rows, nil, agg.MSecs, 0, tfMSecs, offMS, false)
+		if err_ != nil {
+			return errs.New(core.ErrInvalidBars, err_)
+		}
+		if len(aggRows) == 0 {
 			continue
 		}
-		num, err = sess.InsertSeries(agg.TimeFrame, exs, orm.BarsToSeries(exs, agg.TimeFrame, klines, nil, false, true), false)
+		num, err = sess.InsertSeries(agg.TimeFrame, exs, aggRows, false)
 		if err != nil {
 			return err
 		}
@@ -311,12 +312,12 @@ func AggBigKlines(args *config.CmdArgs) *errs.Error {
 		pBar.Add(1)
 		curStartMS, curEndMS := startMS, firstEndMS
 		for curStartMS < endMS {
-			bars, err := sess.QueryOHLCV(exs, minTF, curStartMS, curEndMS, 0, false)
+			rows, err := sess.QueryOHLCV(exs, minTF, curStartMS, curEndMS, 0, false)
 			if err != nil {
 				return err
 			}
-			if len(bars) > 0 {
-				err = aggBigKlines(sess, bars, minMSecs, exs)
+			if len(rows) > 0 {
+				err = aggBigSeries(sess, rows, minMSecs, exs)
 				if err != nil {
 					return err
 				}
@@ -460,14 +461,18 @@ func ExportKlines(args *config.CmdArgs, prg utils.PrgCB) *errs.Error {
 			continue
 		}
 		for _, tf := range args.TimeFrames {
-			adjs, klines, err := sess.GetOHLCV(exs, tf, start, stop, 0, false)
+			adjs, rows, err := sess.GetOHLCV(exs, tf, start, stop, 0, false)
 			if err != nil {
 				return err
 			}
+			klines, projectErr := orm.SeriesToKLines(rows, exs)
+			if projectErr != nil {
+				return errs.New(core.ErrInvalidBars, projectErr)
+			}
 			klines = orm.ApplyAdj(adjs, klines, adjVal, 0, 0)
-			rows := utils.KlineToStr(klines, btime.LocShow)
+			csvRows := utils.KlineToStr(klines, btime.LocShow)
 			path := filepath.Join(args.OutPath, fmt.Sprintf("%s_%s.csv", clean, tf))
-			err = utils.WriteCsvFile(path, rows, true)
+			err = utils.WriteCsvFile(path, csvRows, true)
 			if err != nil {
 				return err
 			}
@@ -687,15 +692,25 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 		dataArr := make([][]float64, 0, len(exsList))
 		var lacks []string
 		for i, exs := range exsList {
-			_, klines, err := orm.GetOHLCV(exs, tf, startMs, startMs+gapTFMSecs, klineNum, false)
+			_, rows, err := orm.GetOHLCV(exs, tf, startMs, startMs+gapTFMSecs, klineNum, false)
 			if err != nil {
 				log.Warn("get kline fail, skip", zap.String("code", exs.Symbol), zap.Error(err))
 				continue
 			}
-			if len(klines) >= klineNum {
-				prices := make([]float64, 0, len(klines))
-				for _, b := range klines {
-					prices = append(prices, b.Close)
+			if len(rows) >= klineNum {
+				prices := make([]float64, 0, len(rows))
+				badRow := false
+				for _, row := range rows {
+					closeVal, err_ := row.CloseValue()
+					if err_ != nil {
+						log.Warn("read close fail, skip", zap.String("code", exs.Symbol), zap.Error(err_))
+						badRow = true
+						break
+					}
+					prices = append(prices, closeVal)
+				}
+				if badRow {
+					continue
 				}
 				names = append(names, codes[i])
 				dataArr = append(dataArr, prices[:klineNum])
@@ -1197,50 +1212,54 @@ func TestKLineConsistency(args []string) error {
 			if err2 != nil {
 				return err2
 			}
-			_, kline, err2 := orm.AutoFetchOHLCV(exchange, exs, tf, startMS, endMS, 0, false, nil)
+			_, rows, err2 := orm.AutoFetchOHLCV(exchange, exs, tf, startMS, endMS, 0, false, nil)
 			if err2 != nil {
 				return err2
 			}
 			ida := 0
 			ka := arr[0]
-			for _, k := range kline {
-				if k.Time < ka.Time {
+			localBars, projectErr := orm.SeriesToKLines(rows, exs)
+			if projectErr != nil {
+				return errs.New(core.ErrInvalidBars, projectErr)
+			}
+			for _, view := range localBars {
+				if view.Time < ka.Time {
 					continue
 				}
-				for k.Time > ka.Time && ida+1 < len(arr) {
+				for view.Time > ka.Time && ida+1 < len(arr) {
 					// 本地有K线，实盘无K线；
 					ida += 1
 					ka = arr[ida]
 				}
-				if k.Time > ka.Time {
+				if view.Time > ka.Time {
 					// 没有更多实盘K线
 					break
 				}
 				// 时间相同，比较K线是否相同
-				openDiff := math.Abs(k.Open-ka.Open) / max(k.Open, ka.Open)
-				highDiff := math.Abs(k.High-ka.High) / max(k.High, ka.High)
-				lowDiff := math.Abs(k.Low-ka.Low) / max(k.Low, ka.Low)
-				closeDiff := math.Abs(k.Close-ka.Close) / max(k.Close, ka.Close)
-				volDiff := math.Abs(k.Volume-ka.Volume) / max(k.Volume, ka.Volume)
-				infoDiff := math.Abs(k.BuyVolume-ka.BuyVolume) / max(k.BuyVolume, ka.BuyVolume)
+				openDiff := math.Abs(view.Open-ka.Open) / max(view.Open, ka.Open)
+				highDiff := math.Abs(view.High-ka.High) / max(view.High, ka.High)
+				lowDiff := math.Abs(view.Low-ka.Low) / max(view.Low, ka.Low)
+				closeDiff := math.Abs(view.Close-ka.Close) / max(view.Close, ka.Close)
+				volDiff := math.Abs(view.Volume-ka.Volume) / max(view.Volume, ka.Volume)
+				infoDiff := math.Abs(view.BuyVolume-ka.BuyVolume) / max(view.BuyVolume, ka.BuyVolume)
 				var fields []string
 				if openDiff > 0.01 {
-					fields = append(fields, fmt.Sprintf("open: %f - %f", k.Open, ka.Open))
+					fields = append(fields, fmt.Sprintf("open: %f - %f", view.Open, ka.Open))
 				}
 				if highDiff > 0.01 {
-					fields = append(fields, fmt.Sprintf("high: %f - %f", k.High, ka.High))
+					fields = append(fields, fmt.Sprintf("high: %f - %f", view.High, ka.High))
 				}
 				if lowDiff > 0.01 {
-					fields = append(fields, fmt.Sprintf("low: %f - %f", k.Low, ka.Low))
+					fields = append(fields, fmt.Sprintf("low: %f - %f", view.Low, ka.Low))
 				}
 				if closeDiff > 0.01 {
-					fields = append(fields, fmt.Sprintf("close: %f - %f", k.Close, ka.Close))
+					fields = append(fields, fmt.Sprintf("close: %f - %f", view.Close, ka.Close))
 				}
 				if volDiff > 0.01 {
-					fields = append(fields, fmt.Sprintf("vol: %f - %f", k.Volume, ka.Volume))
+					fields = append(fields, fmt.Sprintf("vol: %f - %f", view.Volume, ka.Volume))
 				}
 				if infoDiff > 0.01 {
-					fields = append(fields, fmt.Sprintf("info: %f - %f", k.BuyVolume, ka.BuyVolume))
+					fields = append(fields, fmt.Sprintf("info: %f - %f", view.BuyVolume, ka.BuyVolume))
 				}
 				if len(fields) > 0 {
 					curDateStr := btime.ToDateStr(ka.Time, core.DefaultDateFmt)
@@ -1271,7 +1290,7 @@ func TestKLineConsistency(args []string) error {
 			endDateStr := btime.ToDateStr(endMS, core.DefaultDateFmt)
 			startDateStr := btime.ToDateStr(startMS, core.DefaultDateFmt)
 			liveLacks := checkLacks(arr)
-			localLacks := checkLacks(kline)
+			localLacks := checkLacks(localBars)
 			fmt.Printf("%s %s - %s, live: %v, local: %v\n",
 				key, startDateStr, endDateStr, liveLacks, localLacks)
 		}

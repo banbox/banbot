@@ -13,6 +13,7 @@ import (
 
 type visibilityDBStub struct {
 	exec     func(sql string, args ...interface{}) (pgconn.CommandTag, error)
+	query    func(sql string, args ...interface{}) (pgx.Rows, error)
 	queryRow func(sql string, args ...interface{}) pgx.Row
 }
 
@@ -23,8 +24,11 @@ func (s *visibilityDBStub) Exec(_ context.Context, sql string, args ...interface
 	return s.exec(sql, args...)
 }
 
-func (s *visibilityDBStub) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
-	panic("unexpected Query call")
+func (s *visibilityDBStub) Query(_ context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
+	if s.query == nil {
+		panic("unexpected Query call")
+	}
+	return s.query(sql, args...)
 }
 
 func (s *visibilityDBStub) QueryRow(_ context.Context, sql string, args ...interface{}) pgx.Row {
@@ -203,6 +207,62 @@ func TestWaitForQuestKlineWindowVisiblePolls(t *testing.T) {
 	}
 }
 
+func TestWaitForQuestKlineTimestampVisiblePolls(t *testing.T) {
+	oldTimeout := questReadAfterWriteTimeout
+	oldPoll := questReadAfterWritePollInterval
+	questReadAfterWriteTimeout = 20 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		questReadAfterWriteTimeout = oldTimeout
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	calls := 0
+	db := &visibilityDBStub{
+		queryRow: func(sql string, args ...interface{}) pgx.Row {
+			if !strings.Contains(sql, "ts = cast($2 as timestamp)") {
+				t.Fatalf("unexpected sql: %s", sql)
+			}
+			calls++
+			return visibilityRowStub{scan: func(dest ...interface{}) error {
+				*dest[0].(*bool) = calls >= 3
+				return nil
+			}}
+		},
+	}
+
+	if err := waitForQuestKlineTimestampVisible(context.Background(), New(db), 1, "1m", 60_000); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls < 3 {
+		t.Fatalf("expected polling, calls=%d", calls)
+	}
+}
+
+func TestWaitForQuestKlineTimestampVisibleTimesOut(t *testing.T) {
+	oldTimeout := questReadAfterWriteTimeout
+	oldPoll := questReadAfterWritePollInterval
+	questReadAfterWriteTimeout = 5 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		questReadAfterWriteTimeout = oldTimeout
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	db := &visibilityDBStub{
+		queryRow: func(string, ...interface{}) pgx.Row {
+			return visibilityRowStub{scan: func(dest ...interface{}) error {
+				*dest[0].(*bool) = false
+				return nil
+			}}
+		},
+	}
+
+	if err := waitForQuestKlineTimestampVisible(context.Background(), New(db), 1, "1m", 60_000); err == nil {
+		t.Fatal("expected visibility timeout error")
+	}
+}
+
 func TestWaitForQuestExsymbolTimestampVisibleNormalizesToMicroseconds(t *testing.T) {
 	oldTimeout := questReadAfterWriteTimeout
 	oldPoll := questReadAfterWritePollInterval
@@ -285,18 +345,87 @@ func TestWaitForQuestKlineRangeVisibleTimeoutKeepsPending(t *testing.T) {
 	}
 }
 
-func TestVerifyQuestRewriteCountMismatch(t *testing.T) {
+func TestVerifyQuestRewriteSnapshotPollsUntilExpected(t *testing.T) {
+	oldTimeout := questReadAfterWriteTimeout
+	oldPoll := questReadAfterWritePollInterval
+	questReadAfterWriteTimeout = 20 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		questReadAfterWriteTimeout = oldTimeout
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	calls := 0
 	db := &visibilityDBStub{
-		queryRow: func(sql string, args ...interface{}) pgx.Row {
-			return visibilityRowStub{scan: func(dest ...interface{}) error {
-				*dest[0].(*int64) = 3
-				return nil
-			}}
+		query: func(sql string, args ...interface{}) (pgx.Rows, error) {
+			calls++
+			if calls < 3 {
+				return newRewriteSnapshotRows(map[int32]int64{1: 2}), nil
+			}
+			return newRewriteSnapshotRows(map[int32]int64{1: 2, 2: 3}), nil
 		},
 	}
 
-	err := verifyQuestRewriteCount(context.Background(), New(db), "tmp_tbl", 4)
-	if err == nil {
-		t.Fatal("expected mismatch error")
+	if err := verifyQuestRewriteSnapshot(context.Background(), New(db), "tmp_tbl", map[int32]int64{1: 2, 2: 3}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
+	if calls < 3 {
+		t.Fatalf("expected polling, calls=%d", calls)
+	}
+}
+
+func TestVerifyQuestRewriteSnapshotRejectsSameTotalWrongDistribution(t *testing.T) {
+	oldTimeout := questReadAfterWriteTimeout
+	oldPoll := questReadAfterWritePollInterval
+	questReadAfterWriteTimeout = 5 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		questReadAfterWriteTimeout = oldTimeout
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	db := &visibilityDBStub{
+		query: func(string, ...interface{}) (pgx.Rows, error) {
+			return newRewriteSnapshotRows(map[int32]int64{1: 3, 2: 2}), nil
+		},
+	}
+
+	err := verifyQuestRewriteSnapshot(context.Background(), New(db), "tmp_tbl", map[int32]int64{1: 2, 2: 3})
+	if err == nil {
+		t.Fatal("expected snapshot distribution mismatch")
+	}
+}
+
+type rewriteSnapshotRows struct {
+	items [][2]int64
+	idx   int
+}
+
+func newRewriteSnapshotRows(counts map[int32]int64) *rewriteSnapshotRows {
+	items := make([][2]int64, 0, len(counts))
+	for sid, count := range counts {
+		items = append(items, [2]int64{int64(sid), count})
+	}
+	return &rewriteSnapshotRows{items: items, idx: -1}
+}
+
+func (r *rewriteSnapshotRows) Close()                                       {}
+func (r *rewriteSnapshotRows) Err() error                                   { return nil }
+func (r *rewriteSnapshotRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *rewriteSnapshotRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *rewriteSnapshotRows) RawValues() [][]byte                          { return nil }
+func (r *rewriteSnapshotRows) Conn() *pgx.Conn                              { return nil }
+func (r *rewriteSnapshotRows) Values() ([]any, error) {
+	item := r.items[r.idx]
+	return []any{int32(item[0]), item[1]}, nil
+}
+func (r *rewriteSnapshotRows) Next() bool {
+	r.idx++
+	return r.idx < len(r.items)
+}
+func (r *rewriteSnapshotRows) Scan(dest ...any) error {
+	item := r.items[r.idx]
+	*dest[0].(*int32) = int32(item[0])
+	*dest[1].(*int64) = item[1]
+	return nil
 }

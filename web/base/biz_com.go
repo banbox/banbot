@@ -50,12 +50,35 @@ func GetExg(name, market, ctType string, load bool) (banexg.BanExchange, *errs.E
 	return exchange, InitExg(exchange)
 }
 
-func ArrSeriesBars(bars []*banexg.Kline) [][]float64 {
-	res := make([][]float64, 0, len(bars))
-	for _, k := range bars {
-		res = append(res, []float64{float64(k.Time), k.Open, k.High, k.Low, k.Close, k.Volume, k.BuyVolume})
+func ArrSeriesRows(rows []*orm.DataSeries) ([][]float64, *errs.Error) {
+	res := make([][]float64, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			return nil, errs.NewMsg(core.ErrInvalidBars, "series row is nil")
+		}
+		open, err := row.OpenValue()
+		if err != nil {
+			return nil, errs.New(core.ErrInvalidBars, err)
+		}
+		high, err := row.HighValue()
+		if err != nil {
+			return nil, errs.New(core.ErrInvalidBars, err)
+		}
+		low, err := row.LowValue()
+		if err != nil {
+			return nil, errs.New(core.ErrInvalidBars, err)
+		}
+		closeVal, err := row.CloseValue()
+		if err != nil {
+			return nil, errs.New(core.ErrInvalidBars, err)
+		}
+		volume, err := row.VolumeValue()
+		if err != nil {
+			return nil, errs.New(core.ErrInvalidBars, err)
+		}
+		res = append(res, []float64{float64(row.TimeMS), open, high, low, closeVal, volume, row.BuyVolumeValue()})
 	}
-	return res
+	return res, nil
 }
 
 func SetSeriesSub(client *WsClient, isSub, lock bool, keys ...string) {

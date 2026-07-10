@@ -214,8 +214,9 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		}
 		return 0, err
 	}
+	clearInsJob := true
 	defer func() {
-		if insTs.IsZero() {
+		if !clearInsJob {
 			return
 		}
 		if err_ := sess.DelInsKline(context.Background(), exs.ID, timeFrame, insTs); err_ != nil {
@@ -338,8 +339,15 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	}
 
 	if saveNum > 0 {
-		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, nil, true, true)
+		if IsQuestDB {
+			if waitErr := waitForQuestKlineTimestampVisible(context.Background(), sess, exs.ID, timeFrame, realEnd); waitErr != nil {
+				clearInsJob = false
+				return saveNum, waitErr
+			}
+		}
+		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, true, true)
 		if updErr != nil {
+			clearInsJob = false
 			if outErr == nil {
 				outErr = updErr
 			} else {
@@ -360,30 +368,8 @@ AutoFetchOHLCV
 	先尝试从本地读取，不存在时从交易所下载，然后返回。
 */
 func AutoFetchOHLCV(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
-	limit int, withUnFinish bool, pBar *utils.PrgBar) ([]*AdjInfo, []*banexg.Kline, *errs.Error) {
-	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-	startMS, endMS = parseDownArgs(tfMSecs, startMS, endMS, limit, withUnFinish)
-	downTF, err := GetDownTF(timeFrame)
-	if err != nil {
-		if pBar != nil {
-			pBar.Add(core.StepTotal)
-		}
-		return nil, nil, err
-	}
-	sess, conn, err := Conn(nil)
-	if err != nil {
-		if pBar != nil {
-			pBar.Add(core.StepTotal)
-		}
-		return nil, nil, err
-	}
-	defer conn.Release()
-	_, err = sess.DownOHLCV2DB(exchange, exs, downTF, startMS, endMS, pBar)
-	if err != nil {
-		// DownOHLCV2DB 内部已处理stepCB，这里无需处理
-		return nil, nil, err
-	}
-	return sess.GetOHLCV(exs, timeFrame, startMS, endMS, limit, withUnFinish)
+	limit int, withUnFinish bool, pBar *utils.PrgBar) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return AutoFetchSeries(exchange, exs, timeFrame, startMS, endMS, limit, withUnFinish, pBar)
 }
 
 /*
@@ -391,24 +377,8 @@ GetOHLCV
 Get the variety K-line, if you need to rebalance, it will be automatically reweighted
 获取品种K线，如需复权自动前复权
 */
-func GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*banexg.Kline, *errs.Error) {
-	retry, maxRetry := 0, 3
-	for retry < maxRetry {
-		sess, conn, err := Conn(nil)
-		if err != nil {
-			return nil, nil, err
-		}
-		adjs, klines, err := sess.GetOHLCV(exs, timeFrame, startMS, endMS, limit, withUnFinish)
-		conn.Release()
-		if err != nil && err.Code == core.ErrDbConnFail && retry < maxRetry+1 {
-			// 连接被断开，等待一会，重试
-			retry += 1
-			core.Sleep(time.Millisecond * 1000 * time.Duration(retry))
-			continue
-		}
-		return adjs, klines, err
-	}
-	return nil, nil, errs.NewMsg(core.ErrDbReadFail, "max retry exceed")
+func GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return GetSeries(exs, timeFrame, startMS, endMS, limit, withUnFinish)
 }
 
 /*
@@ -416,27 +386,8 @@ GetOHLCV
 Obtain the variety K-line, return the unweighted K-line and the weighting factor, and the caller can call ApplyAdj to re-weight
 获取品种K线，返回未复权K线和复权因子，调用方可调用ApplyAdj进行复权
 */
-func (q *Queries) GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*banexg.Kline, *errs.Error) {
-	if exs.Exchange == "china" && exs.Market != banexg.MarketSpot {
-		// China's non stock market may include futures, options, funds
-		// 国内非股票，可能是：期货、期权、基金、、、
-		parts := utils2.SplitParts(exs.Symbol)
-		if len(parts) >= 2 {
-			p2val := parts[1].Val
-			if p2val == "888" {
-				// Futures 888 is the main continuous contract, while 000 is the index contract
-				// 期货888是主力连续合约，000是指数合约
-				adjs, err := GetAdjs(exs.ID)
-				if err != nil {
-					return nil, nil, err
-				}
-				klines, err := q.GetAdjOHLCV(adjs, timeFrame, startMS, endMS, limit, withUnFinish)
-				return adjs, klines, err
-			}
-		}
-	}
-	klines, err := q.QueryOHLCV(exs, timeFrame, startMS, endMS, limit, withUnFinish)
-	return nil, klines, err
+func (q *Queries) GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return q.GetSeries(exs, timeFrame, startMS, endMS, limit, withUnFinish)
 }
 
 func GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
@@ -510,9 +461,13 @@ func (q *Queries) GetAdjOHLCV(adjs []*AdjInfo, timeFrame string, startMS, endMS 
 			// 逆序读取，从后往前，开始置为0
 			start = 0
 		}
-		klines, err := q.QueryOHLCV(f.ExSymbol, timeFrame, start, stop, limit, withUnFinish)
+		rows, err := q.QuerySeries(f.ExSymbol, timeFrame, start, stop, limit, withUnFinish)
 		if err != nil {
 			return nil, err
+		}
+		klines, projectErr := SeriesToKLines(rows, f.ExSymbol)
+		if projectErr != nil {
+			return nil, errs.New(core.ErrInvalidBars, projectErr)
 		}
 		if revRead {
 			result = append(klines, result...)
@@ -737,9 +692,14 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 			}
 		}
 		if len(rawMap) > 0 {
-			bulkHandler := func(sid int32, klines []*banexg.Kline) {
+			bulkHandler := func(sid int32, rows []*DataSeries) {
 				exs, ok := exsMap[sid]
 				if !ok {
+					return
+				}
+				klines, projectErr := SeriesToKLines(rows, exs)
+				if projectErr != nil {
+					log.Warn("convert series to kline fail", zap.String("symbol", exs.Symbol), zap.Error(projectErr))
 					return
 				}
 				handler(exs.Symbol, timeFrame, klines, nil)
@@ -755,9 +715,13 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 	// 单个数量过多，逐个查询
 	for _, sid := range leftArr {
 		exs := exsMap[sid]
-		adjs, kline, err := sess.GetOHLCV(exs, timeFrame, startMS, endMS, limit, false)
+		adjs, rows, err := sess.GetOHLCV(exs, timeFrame, startMS, endMS, limit, false)
 		if err != nil {
 			return err
+		}
+		kline, projectErr := SeriesToKLines(rows, exs)
+		if projectErr != nil {
+			return errs.New(core.ErrInvalidBars, projectErr)
 		}
 		handler(exs.Symbol, timeFrame, kline, adjs)
 	}

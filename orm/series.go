@@ -253,31 +253,84 @@ func KlineToDataSeries(bar *InfoKline) *DataSeries {
 	return NewDataSeriesFromInfoKline(bar)
 }
 
-func (evt *DataSeries) OHLCV(extras ...*ExSymbol) (*SeriesOHLCV, error) {
+type seriesOHLCVFields struct {
+	open      float64
+	high      float64
+	low       float64
+	close     float64
+	volume    float64
+	quote     float64
+	buyVolume float64
+	tradeNum  int64
+}
+
+func (evt *DataSeries) readOHLCVFields() (seriesOHLCVFields, error) {
 	if evt == nil {
-		return nil, fmt.Errorf("series event is nil")
-	}
-	exs := ResolveSeriesExSymbol(evt, extras...)
-	if exs == nil {
-		return nil, fmt.Errorf("series event sid %d has no exsymbol", evt.Sid)
+		return seriesOHLCVFields{}, fmt.Errorf("series event is nil")
 	}
 	open, err := evt.OpenValue()
 	if err != nil {
-		return nil, err
+		return seriesOHLCVFields{}, err
 	}
 	high, err := evt.HighValue()
 	if err != nil {
-		return nil, err
+		return seriesOHLCVFields{}, err
 	}
 	low, err := evt.LowValue()
 	if err != nil {
-		return nil, err
+		return seriesOHLCVFields{}, err
 	}
 	closeVal, err := evt.CloseValue()
 	if err != nil {
-		return nil, err
+		return seriesOHLCVFields{}, err
 	}
 	volume, err := evt.VolumeValue()
+	if err != nil {
+		return seriesOHLCVFields{}, err
+	}
+	return seriesOHLCVFields{
+		open:      open,
+		high:      high,
+		low:       low,
+		close:     closeVal,
+		volume:    volume,
+		quote:     evt.QuoteValue(),
+		buyVolume: evt.BuyVolumeValue(),
+		tradeNum:  evt.TradeNumValue(),
+	}, nil
+}
+
+func (evt *DataSeries) resolveOHLCV(extras ...*ExSymbol) (*ExSymbol, seriesOHLCVFields, error) {
+	if evt == nil {
+		return nil, seriesOHLCVFields{}, fmt.Errorf("series event is nil")
+	}
+	exs := ResolveSeriesExSymbol(evt, extras...)
+	if exs == nil {
+		return nil, seriesOHLCVFields{}, fmt.Errorf("series event sid %d has no exsymbol", evt.Sid)
+	}
+	fields, err := evt.readOHLCVFields()
+	if err != nil {
+		return nil, seriesOHLCVFields{}, err
+	}
+	return exs, fields, nil
+}
+
+func (fields seriesOHLCVFields) kline(timeMS int64) *banexg.Kline {
+	return &banexg.Kline{
+		Time:      timeMS,
+		Open:      fields.open,
+		High:      fields.high,
+		Low:       fields.low,
+		Close:     fields.close,
+		Volume:    fields.volume,
+		Quote:     fields.quote,
+		BuyVolume: fields.buyVolume,
+		TradeNum:  fields.tradeNum,
+	}
+}
+
+func (evt *DataSeries) OHLCV(extras ...*ExSymbol) (*SeriesOHLCV, error) {
+	exs, fields, err := evt.resolveOHLCV(extras...)
 	if err != nil {
 		return nil, err
 	}
@@ -288,14 +341,14 @@ func (evt *DataSeries) OHLCV(extras ...*ExSymbol) (*SeriesOHLCV, error) {
 		Time:      evt.TimeMS,
 		EndMS:     evt.EndMS,
 		TimeFrame: evt.TimeFrame,
-		Open:      open,
-		High:      high,
-		Low:       low,
-		Close:     closeVal,
-		Volume:    volume,
-		Quote:     evt.QuoteValue(),
-		BuyVolume: evt.BuyVolumeValue(),
-		TradeNum:  evt.TradeNumValue(),
+		Open:      fields.open,
+		High:      fields.high,
+		Low:       fields.low,
+		Close:     fields.close,
+		Volume:    fields.volume,
+		Quote:     fields.quote,
+		BuyVolume: fields.buyVolume,
+		TradeNum:  fields.tradeNum,
 		Adj:       evt.Adj,
 		IsWarmUp:  evt.IsWarmUp,
 		Closed:    evt.Closed,
@@ -392,6 +445,9 @@ func ResampleDataSeries(exs *ExSymbol, tf string, rows, prev []*DataSeries, toTF
 		tf = utils2.SecsToTF(int(toTFMS / 1000))
 	}
 	source := NormalizeSeriesSource(rows[0].Source)
+	if source == SeriesSourceKline {
+		return resampleOHLCVSeries(exs, tf, rows, prev, toTFMS, preFire, fromTFMS, offMS, isWarmUp)
+	}
 	info := NewSeriesInfo(source, tf, inferSeriesFields(prev, rows))
 	records := make([]*DataRecord, 0, len(prev)+len(rows))
 	for _, row := range prev {
