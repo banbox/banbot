@@ -169,9 +169,21 @@ func newRollBtOpt(args *config.CmdArgs) (*rollBtOpt, *errs.Error) {
 	}, nil
 }
 
+func (t *rollBtOpt) setReviewRange() {
+	t.setTimeRange(t.curMs-t.reviewMSecs, t.curMs)
+}
+
+func (t *rollBtOpt) setRunRange() {
+	t.setTimeRange(t.curMs, min(t.curMs+t.runMSecs, t.allEndMs))
+}
+
+func (t *rollBtOpt) setTimeRange(startMS, endMS int64) {
+	t.dateRange = &config.TimeTuple{StartMS: startMS, EndMS: endMS}
+	config.TimeRange = t.dateRange
+}
+
 func (t *rollBtOpt) next(pairPicker string) (string, *errs.Error) {
-	t.dateRange.StartMS = t.curMs - t.reviewMSecs
-	t.dateRange.EndMS = t.curMs
+	t.setReviewRange()
 	fname := fmt.Sprintf("opt_%v.log", t.dateRange.StartMS/1000)
 	t.args.OutPath = filepath.Join(t.outDir, fname)
 	polStr, err := pickFromExists(t.args.OutPath, t.args.Picker, pairPicker)

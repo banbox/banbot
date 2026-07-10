@@ -44,6 +44,8 @@ func RunBTOverOpt(args *config.CmdArgs) *errs.Error {
 	if err != nil || t == nil {
 		return err
 	}
+	originalTimeRange := config.TimeRange
+	defer func() { config.TimeRange = originalTimeRange }()
 	var allHisOds []*ormo.InOutOrder
 	var lastWal map[string]float64
 	var lastRes *BTResult
@@ -73,8 +75,7 @@ func RunBTOverOpt(args *config.CmdArgs) *errs.Error {
 		lastPols = config.RunPolicy
 		wallets := biz.GetWallets(config.DefAcc)
 		core.BotRunning = true
-		t.dateRange.StartMS = t.curMs
-		t.dateRange.EndMS = t.curMs + t.runMSecs
+		t.setRunRange()
 		outDir := filepath.Join(t.outDir, args.Picker)
 		bt, err := NewBackTest(false, outDir)
 		if err != nil {
@@ -106,6 +107,8 @@ func RunRollBTPicker(args *config.CmdArgs) *errs.Error {
 	if err != nil || t == nil {
 		return err
 	}
+	originalTimeRange := config.TimeRange
+	defer func() { config.TimeRange = originalTimeRange }()
 	pbar := utils.NewPrgBar(int((t.allEndMs-t.curMs)/1000), "RollPicker")
 	defer pbar.Close()
 	pickers, err := getTestPickers(args.Picker)
@@ -148,8 +151,7 @@ func RunRollBTPicker(args *config.CmdArgs) *errs.Error {
 				return err
 			}
 			core.BotRunning = true
-			t.dateRange.StartMS = t.curMs
-			t.dateRange.EndMS = t.curMs + t.runMSecs
+			t.setRunRange()
 			bt, err := NewBackTest(true, "")
 			if err != nil {
 				return err
