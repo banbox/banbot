@@ -518,11 +518,13 @@ func (i *InOutOrder) saveToDb() *errs.Error {
 	if i.Status == InOutStatusDelete && i.ID == 0 {
 		return nil
 	}
+	dirtyInfo := i.DirtyInfo
 	var err *errs.Error
 	_, err = i.GetInfoText()
 	if err != nil {
 		return err
 	}
+	dirtyMain, dirtyEnter, dirtyExit := i.DirtyMain, i.DirtyEnter, i.DirtyExit
 	var sess *Queries
 	var conn *orm.TrackedDB
 	sess, conn, err = Conn(orm.DbTrades, true)
@@ -530,22 +532,58 @@ func (i *InOutOrder) saveToDb() *errs.Error {
 		return err
 	}
 	defer conn.Close()
+	tx, err_ := conn.BeginTx(context.Background(), nil)
+	if err_ != nil {
+		return errs.New(core.ErrDbExecFail, err_)
+	}
+	defer tx.Rollback()
+	sess = sess.WithTx(tx)
 	if i.Status == InOutStatusDelete {
-		return sess.DelOrder(i)
+		if err = sess.DelOrder(i); err != nil {
+			return err
+		}
+		if err_ = tx.Commit(); err_ != nil {
+			return errs.New(core.ErrDbExecFail, err_)
+		}
+		return nil
 	}
 	i.NanInfTo(0)
+	oldID := i.ID
+	oldEnterID, oldEnterInoutID := int64(0), int64(0)
+	if i.Enter != nil {
+		oldEnterID, oldEnterInoutID = i.Enter.ID, i.Enter.InoutID
+	}
+	oldExitID, oldExitInoutID := int64(0), int64(0)
+	if i.Exit != nil {
+		oldExitID, oldExitInoutID = i.Exit.ID, i.Exit.InoutID
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		i.ID = oldID
+		i.DirtyInfo = dirtyInfo
+		i.DirtyMain = dirtyMain
+		i.DirtyEnter = dirtyEnter
+		i.DirtyExit = dirtyExit
+		if i.Enter != nil {
+			i.Enter.ID, i.Enter.InoutID = oldEnterID, oldEnterInoutID
+		}
+		if i.Exit != nil {
+			i.Exit.ID, i.Exit.InoutID = oldExitID, oldExitInoutID
+		}
+	}()
 	if i.ID == 0 {
 		err = i.IOrder.saveAdd(sess)
 		if err != nil {
 			return err
 		}
-		i.DirtyMain = false
 		i.Enter.InoutID = i.ID
 		err = i.Enter.saveAdd(sess)
 		if err != nil {
 			return err
 		}
-		i.DirtyEnter = false
 		if i.Exit != nil && i.Exit.Symbol != "" {
 			i.Exit.InoutID = i.ID
 			err = i.Exit.saveAdd(sess)
@@ -553,21 +591,18 @@ func (i *InOutOrder) saveToDb() *errs.Error {
 				return err
 			}
 		}
-		i.DirtyExit = false
 	} else {
 		if i.DirtyMain {
 			err = i.IOrder.saveUpdate(sess)
 			if err != nil {
 				return err
 			}
-			i.DirtyMain = false
 		}
 		if i.DirtyEnter {
 			err = i.Enter.saveUpdate(sess)
 			if err != nil {
 				return err
 			}
-			i.DirtyEnter = false
 		}
 		if i.DirtyExit && i.Exit != nil && i.Exit.Symbol != "" {
 			if i.Exit.ID == 0 {
@@ -578,8 +613,16 @@ func (i *InOutOrder) saveToDb() *errs.Error {
 			if err != nil {
 				return err
 			}
-			i.DirtyExit = false
 		}
+	}
+	if err_ = tx.Commit(); err_ != nil {
+		return errs.New(core.ErrDbExecFail, err_)
+	}
+	committed = true
+	i.DirtyMain = false
+	i.DirtyEnter = false
+	if oldID == 0 || (dirtyExit && i.Exit != nil && i.Exit.Symbol != "") {
+		i.DirtyExit = false
 	}
 	return nil
 }
@@ -588,16 +631,19 @@ func (i *InOutOrder) GetInfoText() (string, *errs.Error) {
 	if !i.DirtyInfo {
 		return i.IOrder.Info, nil
 	}
-	i.DirtyInfo = false
 	if i.Info != nil && len(i.Info) > 0 {
 		infoText, err_ := utils2.MarshalString(i.Info)
 		if err_ != nil {
 			return "", errs.New(errs.CodeUnmarshalFail, err_)
 		}
 		i.IOrder.Info = infoText
+		i.DirtyInfo = false
 		i.DirtyMain = true
 		return infoText, nil
 	}
+	i.IOrder.Info = ""
+	i.DirtyInfo = false
+	i.DirtyMain = true
 	return "", nil
 }
 

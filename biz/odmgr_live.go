@@ -54,7 +54,9 @@ type OdQItem struct {
 }
 
 const (
-	AmtDust = 1e-8
+	AmtDust                 = 1e-8
+	odInfoLocalTrigger      = "LocalTrigger"
+	restoreAmbiguousExgData = "ambiguous_exchange_entries"
 )
 
 var (
@@ -307,6 +309,9 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		err = o.restoreInOutOrder(od, exgOdMap)
 		if err != nil {
 			log.Error("restoreInOutOrder fail", zap.String("acc", o.Account), zap.String("key", od.Key()), zap.Error(err))
+			if err.Data == restoreAmbiguousExgData {
+				return nil, nil, nil, err
+			}
 		}
 		if od.Status < ormo.InOutStatusFullExit {
 			lock.Lock()
@@ -483,9 +488,26 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 	}
 	var err *errs.Error
 	if tryOd.Enter && tryOd.OrderID == "" && tryOd.Status == ormo.OdStatusInit {
-		// The order has not been submitted to the exchange and is an entry order
-		// 订单未提交到交易所，且是入场订单
-		if isFarEnter(od) {
+		var clientMatches []*banexg.Order
+		for _, exOd := range exgOdMap {
+			if exOd.Symbol == od.Symbol && exOd.Side == od.Enter.Side && getClientOrderId(exOd.ClientOrderID) == od.ID {
+				clientMatches = append(clientMatches, exOd)
+			}
+		}
+		if len(clientMatches) > 1 {
+			err = errs.NewMsg(errs.CodeRunTime, "multiple exchange entries match local order %s", od.Key())
+			err.Data = restoreAmbiguousExgData
+			return err
+		}
+		if len(clientMatches) == 1 {
+			return o.applyAuthoritativeEnterOrder(od, clientMatches[0])
+		}
+		_, _, hasTarget := getEnterTriggerTarget(od)
+		isLegacyTrigger := hasTarget && od.GetInfoInt64(ormo.OdInfoStopAfter) > 0
+		if od.GetInfoInt64(odInfoLocalTrigger) > 0 || isLegacyTrigger {
+			// Market data is usually still cold during startup. Re-register persisted
+			// virtual entries and let VerifyTriggerOds evaluate them once data is ready.
+			od.SetInfo(odInfoLocalTrigger, int64(1))
 			ormo.AddTriggerOd(o.Account, od)
 		} else {
 			err = od.LocalExit(0, core.ExitTagForceExit, od.InitPrice, "Restart and cancel orders that haven't been filled", "")
@@ -508,7 +530,14 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 			}
 		}
 		if exOd != nil {
-			err = o.updateOdByExgRes(od, tryOd.Enter, exOd)
+			if tryOd.Enter {
+				if od.GetInfoInt64(odInfoLocalTrigger) > 0 && exOd.Status == banexg.OdStatusCanceled && exOd.Filled == 0 {
+					return o.rollbackCanceledEnterToLocalTrigger(od, exOd.ID, exOd.Timestamp, 0)
+				}
+				err = o.applyAuthoritativeEnterOrder(od, exOd)
+			} else {
+				err = o.updateOdByExgRes(od, false, exOd)
+			}
 			if err != nil {
 				return err
 			}
@@ -605,6 +634,9 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 			odAmt := iod.HoldAmount()
 			if odAmt == 0 {
 				if iod.Status == 0 && iod.Enter.OrderID == "" {
+					if iod.GetInfoInt64(odInfoLocalTrigger) > 0 {
+						continue
+					}
 					// Not submitted to the exchange yet, cancel directly
 					// 尚未提交到交易所，直接取消
 					msg := "Cancel unsubmitted orders"
@@ -778,6 +810,9 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 		}
 	}
 	if exOd != nil {
+		if exOd.Enter {
+			inOut.SetInfo(odInfoLocalTrigger, nil)
+		}
 		if amount > exOd.Filled*1.01 {
 			exOd.UpdateAt = odTime
 			exOd.Filled = amount
@@ -1092,6 +1127,12 @@ func (o *LiveOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.
 
 func (o *LiveOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
 	if isFarEnter(od) {
+		od.SetInfo(odInfoLocalTrigger, int64(1))
+		if err := od.Save(); err != nil {
+			log.Error("save local trigger order fail", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.Error(err))
+			return
+		}
 		ormo.AddTriggerOd(o.Account, od)
 	} else {
 		o.queue <- &OdQItem{
@@ -1107,6 +1148,10 @@ func makeAfterEnter(o *LiveOrderMgr) FuncHandleIOrder {
 		if isFarEnter(order) {
 			// Limit orders that are difficult to execute for a long time will not be submitted to the exchange to prevent funds from being occupied.
 			// 长时间难以成交的限价单，先不提交到交易所，防止资金占用
+			order.SetInfo(odInfoLocalTrigger, int64(1))
+			if err := order.Save(); err != nil {
+				return err
+			}
 			ormo.AddTriggerOd(o.Account, order)
 			log.Info("NEW Enter trigger", fields...)
 			return nil
@@ -1167,7 +1212,10 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 	err := com.EnsureLatestPrice(od.Symbol)
 	if err != nil {
 		log.Error("ensureLatestPrice fail", zap.String("od", od.Key()), zap.Error(err))
-		if action == ormo.OdActionEnter {
+		if action == ormo.OdActionEnter || action == ormo.OdActionLimitEnter {
+			if od.GetInfoInt64(odInfoLocalTrigger) > 0 {
+				ormo.AddTriggerOd(o.Account, od)
+			}
 			return
 		}
 	}
@@ -1191,6 +1239,11 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 	if err != nil {
 		log.Error("ConsumeOrderQueue error", zap.String("acc", o.Account),
 			zap.String("action", action), zap.Error(err))
+	}
+	if od.Enter != nil && od.Enter.OrderID != "" {
+		od.SetInfo(odInfoLocalTrigger, nil)
+	} else if od.Enter != nil && od.Status <= ormo.InOutStatusPartEnter && od.GetInfoInt64(odInfoLocalTrigger) > 0 {
+		ormo.AddTriggerOd(o.Account, od)
 	}
 	if od.IsDirty() {
 		err = od.Save()
@@ -1921,13 +1974,17 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 }
 
 func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *banexg.Order) *errs.Error {
+	if od == nil || res == nil {
+		return nil
+	}
 	subOd := od.Exit
 	if isEnter {
 		subOd = od.Enter
-		od.DirtyEnter = true
-	} else {
-		od.DirtyExit = true
 	}
+	if subOd == nil {
+		return errs.NewMsg(errs.CodeRunTime, "exchange order update has no local sub-order")
+	}
+	identityChanged := subOd.OrderID != res.ID
 	if subOd.OrderID != "" && subOd.OrderID != res.ID {
 		// If you modify the order price, order_id will change
 		// 如修改订单价格，order_id会变化
@@ -1936,11 +1993,38 @@ func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *
 		o.lockDoneKeys.Unlock()
 	}
 	subOd.OrderID = res.ID
+	if identityChanged {
+		if isEnter {
+			od.DirtyEnter = true
+		} else {
+			od.DirtyExit = true
+		}
+	}
 	idKey := od.Symbol + subOd.OrderID
 	o.lockExgIdMap.Lock()
 	o.exgIdMap[idKey] = od
 	o.lockExgIdMap.Unlock()
-	if o.hasNewTrades(res) && subOd.UpdateAt <= res.Timestamp {
+	if res.Filled < subOd.Filled-AmtDust || subOd.UpdateAt > res.Timestamp {
+		return o.consumeUnMatches(od, subOd)
+	}
+	fillAdvanced := res.Filled > subOd.Filled+AmtDust
+	terminalAdvanced := false
+	if banexg.IsOrderDone(res.Status) {
+		expectedStatus := int64(ormo.InOutStatusFullExit)
+		if isEnter == (res.Filled > 0) {
+			expectedStatus = int64(ormo.InOutStatusFullEnter)
+		}
+		terminalAdvanced = subOd.Status != ormo.OdStatusClosed || od.Status != expectedStatus
+	}
+	partialAdvanced := res.Filled > 0 && (subOd.Status == ormo.OdStatusInit ||
+		isEnter && od.Status < ormo.InOutStatusPartEnter)
+	newTrades := o.recordNewTrades(res)
+	if fillAdvanced || terminalAdvanced || partialAdvanced || newTrades {
+		if isEnter {
+			od.DirtyEnter = true
+		} else {
+			od.DirtyExit = true
+		}
 		subOd.UpdateAt = res.Timestamp
 		if subOd.Amount == 0 {
 			subOd.Amount = res.Amount
@@ -1967,6 +2051,10 @@ func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *
 				subOd.FeeType = res.Fee.Currency
 			}
 			subOd.Status = ormo.OdStatusPartOK
+			if isEnter && !banexg.IsOrderDone(res.Status) && od.Status < ormo.InOutStatusPartEnter {
+				od.Status = ormo.InOutStatusPartEnter
+				od.DirtyMain = true
+			}
 		}
 		if banexg.IsOrderDone(res.Status) {
 			subOd.Status = ormo.OdStatusClosed
@@ -2007,26 +2095,21 @@ func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *
 	return o.consumeUnMatches(od, subOd)
 }
 
-func (o *LiveOrderMgr) hasNewTrades(res *banexg.Order) bool {
-	if res == nil {
+func (o *LiveOrderMgr) recordNewTrades(res *banexg.Order) bool {
+	if res == nil || len(res.Trades) == 0 {
 		return false
 	}
-	if banexg.IsOrderDone(res.Status) || res.Filled > 0 {
-		return true
-	}
-	if len(res.Trades) == 0 {
-		return false
-	}
+	hasNew := false
+	o.lockDoneTrades.Lock()
+	defer o.lockDoneTrades.Unlock()
 	for _, trade := range res.Trades {
 		key := res.Symbol + trade.ID
-		if !o.checkTradeDone(key) {
-			o.lockDoneTrades.Lock()
+		if _, exists := o.doneTrades[key]; !exists {
 			o.doneTrades[key] = trade.Timestamp
-			o.lockDoneTrades.Unlock()
-			return true
+			hasNew = true
 		}
 	}
-	return false
+	return hasNew
 }
 
 /*
@@ -2178,7 +2261,7 @@ func getEnterTriggerTarget(od *ormo.InOutOrder) (string, float64, bool) {
 }
 
 func isFarEnter(od *ormo.InOutOrder) bool {
-	if od.Status > ormo.InOutStatusPartEnter {
+	if od == nil || od.Enter == nil || od.Enter.OrderID != "" || od.Status > ormo.InOutStatusPartEnter {
 		// 跳过已完全入场
 		return false
 	}
@@ -2314,7 +2397,9 @@ func verifyAccountTriggerOds(account string) {
 		if len(ods) > 0 {
 			if book == nil {
 				for _, od := range ods {
-					leftOds[od.ID] = od
+					if od.Status <= ormo.InOutStatusPartEnter {
+						leftOds[od.ID] = od
+					}
 				}
 			} else {
 				var viewKeys = make(map[string]bool)
@@ -2325,7 +2410,7 @@ func verifyAccountTriggerOds(account string) {
 						continue
 					}
 					viewKeys[odKey] = true
-					if od.Status >= ormo.InOutStatusFullExit {
+					if od.Status > ormo.InOutStatusPartEnter {
 						continue
 					}
 					subOd := od.Enter
@@ -2373,7 +2458,12 @@ func verifyAccountTriggerOds(account string) {
 			if waitSecs > config.PutLimitSecs*5 {
 				// Far from execution, rollback to local trigger to avoid fund occupation
 				// 距离成交过远，撤回到本地触发，避免资金占用
-				if cancelEnterToLocalTrigger(odMgr, od, waitSecs) {
+				changed, cancelErr := cancelEnterToLocalTrigger(odMgr, od, waitSecs)
+				if cancelErr != nil {
+					log.Error("rollback exchange enter to local trigger fail", zap.String("acc", account),
+						zap.String("key", od.Key()), zap.Error(cancelErr))
+				}
+				if changed {
 					saves = append(saves, od)
 				}
 			}
@@ -2388,6 +2478,16 @@ func verifyAccountTriggerOds(account string) {
 	for _, od := range resOds {
 		if od.Status >= ormo.InOutStatusFullExit {
 			continue
+		}
+		// A rollback can remain dirty after a database failure. Do not submit it
+		// again until the local-trigger ownership is durable.
+		if od.IsDirty() {
+			if err := od.Save(); err != nil {
+				log.Error("persist trigger before exchange submit fail", zap.String("acc", account),
+					zap.String("key", od.Key()), zap.Error(err))
+				ormo.AddTriggerOd(account, od)
+				continue
+			}
 		}
 		tag := ormo.OdActionEnter
 		if od.Exit != nil {
@@ -2436,32 +2536,59 @@ func saveIOrders(saveOds []*ormo.InOutOrder) {
 	}
 }
 
-func cancelEnterToLocalTrigger(odMgr *LiveOrderMgr, od *ormo.InOutOrder, waitSecs int) bool {
-	lock := od.Lock()
-	defer lock.Unlock()
-	if od.Enter == nil || od.Enter.OrderID == "" {
-		return false
+func (o *LiveOrderMgr) applyAuthoritativeEnterOrder(od *ormo.InOutOrder, res *banexg.Order) *errs.Error {
+	if od == nil || od.Enter == nil {
+		return errs.NewMsg(errs.CodeRunTime, "authoritative exchange entry has no local entry order")
 	}
-	if od.Enter.Filled > 0 || od.Status > ormo.InOutStatusPartEnter {
-		return false
+	if res == nil || res.ID == "" {
+		return errs.NewMsg(errs.CodeRunTime, "empty authoritative exchange entry order")
 	}
-	orderId := od.Enter.OrderID
-	res, err := exg.Default.CancelOrder(orderId, od.Symbol, map[string]interface{}{
-		banexg.ParamAccount: odMgr.Account,
+	if res.Filled < od.Enter.Filled-AmtDust {
+		return errs.NewMsg(errs.CodeRunTime, "stale authoritative entry order %s: filled %v < local %v",
+			res.ID, res.Filled, od.Enter.Filled)
+	}
+	if od.GetInfoInt64(odInfoLocalTrigger) > 0 {
+		od.SetInfo(odInfoLocalTrigger, nil)
+	}
+	wasFullEnter := od.Status == ormo.InOutStatusFullEnter && od.Enter.Status == ormo.OdStatusClosed
+
+	// Binance futures uses the order creation time as Timestamp. Use the latest
+	// known timestamp so an authoritative fetch is not rejected as older state.
+	normalized := *res
+	normalized.Timestamp = max(res.Timestamp, res.LastTradeTimestamp, res.LastUpdateTimestamp, od.Enter.UpdateAt)
+	err := o.updateOdByExgRes(od, true, &normalized)
+	if err != nil || !od.IsDirty() {
+		return err
+	}
+	if od.Status == ormo.InOutStatusFullEnter && !wasFullEnter {
+		o.setTrailingStop(od)
+		o.editTriggerOd(od, ormo.OdActionStopLoss)
+		o.editTriggerOd(od, ormo.OdActionTakeProfit)
+	}
+	return od.Save()
+}
+
+func (o *LiveOrderMgr) reconcileEnterAfterCancelRejected(od *ormo.InOutOrder, orderID string) *errs.Error {
+	res, err := exg.Default.FetchOrder(od.Symbol, orderID, map[string]interface{}{
+		banexg.ParamAccount: o.Account,
 	})
 	if err != nil {
-		log.Error("cancel enter order fail", zap.String("acc", odMgr.Account),
-			zap.String("key", od.Key()), zap.Error(err))
-		return false
+		return err
 	}
-	if res != nil {
-		odMgr.lockDoneKeys.Lock()
-		odMgr.doneKeys[od.Symbol+orderId] = res.Timestamp
-		odMgr.lockDoneKeys.Unlock()
+	if od.GetInfoInt64(odInfoLocalTrigger) > 0 && res != nil && res.Status == banexg.OdStatusCanceled && res.Filled == 0 {
+		return o.rollbackCanceledEnterToLocalTrigger(od, orderID, res.Timestamp, 0)
 	}
-	odMgr.lockExgIdMap.Lock()
-	delete(odMgr.exgIdMap, od.Symbol+orderId)
-	odMgr.lockExgIdMap.Unlock()
+	return o.applyAuthoritativeEnterOrder(od, res)
+}
+
+func (o *LiveOrderMgr) rollbackCanceledEnterToLocalTrigger(od *ormo.InOutOrder, orderID string, updateAt int64,
+	waitSecs int) *errs.Error {
+	o.lockDoneKeys.Lock()
+	o.doneKeys[od.Symbol+orderID] = updateAt
+	o.lockDoneKeys.Unlock()
+	o.lockExgIdMap.Lock()
+	delete(o.exgIdMap, od.Symbol+orderID)
+	o.lockExgIdMap.Unlock()
 	od.Enter.OrderID = ""
 	od.Enter.Status = ormo.OdStatusInit
 	od.Enter.UpdateAt = btime.UTCStamp()
@@ -2470,31 +2597,102 @@ func cancelEnterToLocalTrigger(odMgr *LiveOrderMgr, od *ormo.InOutOrder, waitSec
 		od.Status = ormo.InOutStatusInit
 		od.DirtyMain = true
 	}
-	ormo.AddTriggerOd(odMgr.Account, od)
-	log.Info("rollback enter to local trigger", zap.String("acc", odMgr.Account),
-		zap.String("key", od.Key()), zap.String("orderId", orderId), zap.Int("waitSecs", waitSecs))
-	return true
+	od.SetInfo(odInfoLocalTrigger, int64(1))
+	if err := od.Save(); err != nil {
+		// Keep runtime ownership after an already-confirmed external cancel. The
+		// trigger verifier will retry persistence before any resubmission.
+		ormo.AddTriggerOd(o.Account, od)
+		return err
+	}
+	ormo.AddTriggerOd(o.Account, od)
+	log.Info("rollback enter to local trigger", zap.String("acc", o.Account),
+		zap.String("key", od.Key()), zap.String("orderId", orderID), zap.Int("waitSecs", waitSecs))
+	return nil
+}
+
+func cancelEnterToLocalTrigger(odMgr *LiveOrderMgr, od *ormo.InOutOrder, waitSecs int) (bool, *errs.Error) {
+	lock := od.Lock()
+	defer lock.Unlock()
+	if od.Enter == nil || od.Enter.OrderID == "" {
+		return false, nil
+	}
+	if od.Enter.Filled > 0 || od.Status > ormo.InOutStatusPartEnter {
+		return false, nil
+	}
+	orderId := od.Enter.OrderID
+	// Persist the recovery intent before the external cancel. If the process
+	// exits after cancellation, startup reconciliation can finish the rollback.
+	od.SetInfo(odInfoLocalTrigger, int64(1))
+	if err := od.Save(); err != nil {
+		return false, err
+	}
+	res, err := exg.Default.CancelOrder(orderId, od.Symbol, map[string]interface{}{
+		banexg.ParamAccount: odMgr.Account,
+	})
+	if err != nil {
+		if err.BizCode == -2011 {
+			reconcileErr := odMgr.reconcileEnterAfterCancelRejected(od, orderId)
+			if reconcileErr != nil {
+				return false, reconcileErr
+			}
+			log.Warn("cancel enter order rejected; reconciled exchange state", zap.String("acc", odMgr.Account),
+				zap.String("key", od.Key()), zap.String("orderId", orderId), zap.Int("bizCode", err.BizCode))
+			return true, nil
+		}
+		return false, err
+	}
+	if res == nil {
+		return false, errs.NewMsg(errs.CodeRunTime, "cancel enter order %s returned empty response", orderId)
+	}
+	if res.Status != banexg.OdStatusCanceled || res.Filled != 0 {
+		if err = odMgr.applyAuthoritativeEnterOrder(od, res); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if err := odMgr.rollbackCanceledEnterToLocalTrigger(od, orderId, res.Timestamp, waitSecs); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func cancelTimeoutEnter(odMgr *LiveOrderMgr, od *ormo.InOutOrder) {
 	lock := od.Lock()
 	defer lock.Unlock()
+	if od.Enter == nil || od.Enter.Status == ormo.OdStatusClosed || od.Status > ormo.InOutStatusPartEnter {
+		return
+	}
 	if od.Enter.OrderID != "" {
-		res, err := exg.Default.CancelOrder(od.Enter.OrderID, od.Symbol, map[string]interface{}{
+		orderID := od.Enter.OrderID
+		res, err := exg.Default.CancelOrder(orderID, od.Symbol, map[string]interface{}{
 			banexg.ParamAccount: odMgr.Account,
 		})
 		if err != nil {
+			if err.BizCode == -2011 {
+				reconcileErr := odMgr.reconcileEnterAfterCancelRejected(od, orderID)
+				if reconcileErr != nil {
+					log.Error("reconcile timeout enter after cancel rejected fail", zap.String("acc", odMgr.Account),
+						zap.String("key", od.Key()), zap.String("orderId", orderID), zap.Error(reconcileErr))
+					return
+				}
+				log.Warn("cancel timeout enter rejected; reconciled exchange state", zap.String("acc", odMgr.Account),
+					zap.String("key", od.Key()), zap.String("orderId", orderID), zap.Int("bizCode", err.BizCode))
+				return
+			}
 			log.Error("cancel old limit enters fail", zap.String("key", od.Key()), zap.Error(err))
+			return
 		} else {
-			err = odMgr.updateOdByExgRes(od, true, res)
+			err = odMgr.applyAuthoritativeEnterOrder(od, res)
 			if err != nil {
 				log.Error("apply cancel res fail", zap.String("key", od.Key()), zap.Error(err))
 			}
+			return
 		}
 	}
 	if od.Enter.Filled == 0 {
 		// Not yet filled, exit directly
 		// 尚未入场，直接退出
+		od.SetInfo(odInfoLocalTrigger, nil)
 		err := od.LocalExit(0, core.ExitTagForceExit, od.InitPrice, "reach StopEnterBars", "")
 		strat.FireOdChange(odMgr.Account, od, strat.OdChgExitFill)
 		if err != nil {
@@ -2590,7 +2788,11 @@ func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 	if od.Short {
 		side = banexg.OdSideBuy
 	}
-	amt := od.Enter.Amount
+	amt := od.HoldAmount()
+	if amt <= AmtDust {
+		log.Warn("skip trailing trigger without position", zap.String("acc", o.Account), zap.String("key", od.Key()))
+		return
+	}
 	log.Debug("set trailing trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
 		zap.Float64("callbackRate", callRate), zap.Float64("qty", amt),
 		zap.Float64("activePrice", activePrice))
@@ -2673,16 +2875,21 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 	if od.Short {
 		side = banexg.OdSideBuy
 	}
-	amt := od.Enter.Amount
+	amt := od.HoldAmount()
 	if tg.Rate > 0 && tg.Rate < 1 {
 		amt *= tg.Rate
+	}
+	if amt <= AmtDust {
+		log.Warn("skip trigger without position", zap.String("acc", o.Account), zap.String("key", od.Key()),
+			zap.String("prefix", prefix))
+		return
 	}
 	retryNum := od.GetInfoInt64(ormo.OdInfoRetry)
 	if retryNum > 0 {
 		params[banexg.ParamRetry] = int(retryNum)
 	}
 	log.Debug("set trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
-		zap.Float64("amt", od.Enter.Amount), zap.Float64("qmt", amt),
+		zap.Float64("amt", od.HoldAmount()), zap.Float64("qmt", amt),
 		zap.Float64("price", od.Enter.Average))
 	res, err := exg.Default.CreateOrder(od.Symbol, odType, side, amt, price, params)
 	if err != nil {
