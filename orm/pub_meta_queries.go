@@ -26,6 +26,15 @@ func insKlineLockKey(sid int32, timeframe string) string {
 	return fmt.Sprintf("%d/%s", sid, timeframe)
 }
 
+func releaseKlineInsertOwnership(sid int32, timeframe string, ts time.Time) error {
+	err := releaseKlineInsertFileLock(klineInsertLockRoot(), sid, timeframe, ts)
+	key := insKlineLockKey(sid, timeframe)
+	insKlineLocksmu.Lock()
+	delete(insKlineLocks, key)
+	insKlineLocksmu.Unlock()
+	return err
+}
+
 type AddAdjFactorsParams struct {
 	Sid     int32   `json:"sid"`
 	SubID   int32   `json:"sub_id"`
@@ -230,16 +239,16 @@ WHERE coalesce(is_deleted, false) = false`)
 }
 
 func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, ts time.Time) error {
-	key := insKlineLockKey(sid, timeframe)
-	insKlineLocksmu.Lock()
-	delete(insKlineLocks, key)
-	insKlineLocksmu.Unlock()
-
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if !IsQuestDB {
-		return q.delInsKlinePg(ctx, sid, timeframe)
+		err := q.delInsKlinePg(ctx, sid, timeframe)
+		releaseErr := releaseKlineInsertOwnership(sid, timeframe, ts)
+		if err != nil {
+			return err
+		}
+		return releaseErr
 	}
 	write := func() error {
 		_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
@@ -259,15 +268,16 @@ func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, 
 	if err == nil {
 		MaybeCompact("ins_kline_q")
 	}
-	return err
+	releaseErr := releaseKlineInsertOwnership(sid, timeframe, ts)
+	if err != nil {
+		return err
+	}
+	return releaseErr
 }
 
 func (q *Queries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (time.Time, error) {
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	if !IsQuestDB {
-		return q.addInsKlinePg(ctx, arg)
 	}
 	key := insKlineLockKey(arg.Sid, arg.Timeframe)
 	insKlineLocksmu.Lock()
@@ -276,15 +286,33 @@ func (q *Queries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (time.
 		return time.Time{}, nil
 	}
 	ts := time.Now().UTC()
+	if IsQuestDB {
+		ts = normalizeQuestTimestamp(ts)
+	}
 	insKlineLocks[key] = ts
 	insKlineLocksmu.Unlock()
+	claimed, err := acquireKlineInsertFileLock(klineInsertLockRoot(), arg.Sid, arg.Timeframe, ts)
+	if err != nil || !claimed {
+		insKlineLocksmu.Lock()
+		delete(insKlineLocks, key)
+		insKlineLocksmu.Unlock()
+		return time.Time{}, err
+	}
+	if !IsQuestDB {
+		claimed, err = q.tryAddInsKlinePg(ctx, arg)
+		if err != nil || !claimed {
+			_ = releaseKlineInsertOwnership(arg.Sid, arg.Timeframe, ts)
+			return time.Time{}, err
+		}
+		return ts, nil
+	}
 
 	write := func() error {
 		_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
 VALUES ($1, $2, $3, $4, $5, false)`, arg.Sid, arg.Timeframe, ts, arg.StartMs, arg.StopMs)
 		return err
 	}
-	err := write()
+	err = write()
 	if err != nil {
 		repaired, repairErr := tryRepairQuestDBMissingPartition(ctx, q.db, err, "AddInsKline")
 		if repairErr != nil {
@@ -294,9 +322,7 @@ VALUES ($1, $2, $3, $4, $5, false)`, arg.Sid, arg.Timeframe, ts, arg.StartMs, ar
 		}
 	}
 	if err != nil {
-		insKlineLocksmu.Lock()
-		delete(insKlineLocks, key)
-		insKlineLocksmu.Unlock()
+		_ = releaseKlineInsertOwnership(arg.Sid, arg.Timeframe, ts)
 		return time.Time{}, err
 	}
 	return ts, nil

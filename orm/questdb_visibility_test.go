@@ -125,6 +125,40 @@ func TestAddSymbolsQuestVisibilityTimeoutKeepsCachedIdentity(t *testing.T) {
 	}
 }
 
+func TestWaitForQuestKlineCoverageVisibleBypassesCache(t *testing.T) {
+	oldGrace := klineInsertQuestVisibilityGrace
+	oldPoll := questReadAfterWritePollInterval
+	klineInsertQuestVisibilityGrace = 20 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		klineInsertQuestVisibilityGrace = oldGrace
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	const (
+		sid   = int32(777)
+		start = int64(100)
+		stop  = int64(200)
+	)
+	srangesCacheUpdate(sid, "kline_15m", "15m", []srangeSpan{{StartMs: start, StopMs: stop, HasData: true}})
+	defer srangesCacheDel(sid, "kline_15m", "15m")
+
+	queries := 0
+	db := &visibilityDBStub{query: func(_ string, _ ...interface{}) (pgx.Rows, error) {
+		queries++
+		if queries < 3 {
+			return &staleCoveredRows{idx: 0}, nil
+		}
+		return &staleCoveredRows{idx: -1, startMS: start, stopMS: stop}, nil
+	}}
+	if err := waitForQuestKlineCoverageVisible(context.Background(), New(db), sid, "15m", start, stop); err != nil {
+		t.Fatal(err)
+	}
+	if queries != 3 {
+		t.Fatalf("cache must not satisfy DB visibility wait: queries=%d", queries)
+	}
+}
+
 func TestWaitForQuestExsymbolVisiblePollsUntilRowVisible(t *testing.T) {
 	oldTimeout := questReadAfterWriteTimeout
 	oldPoll := questReadAfterWritePollInterval

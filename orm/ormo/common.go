@@ -71,6 +71,9 @@ func decodeTriggerState(data map[string]interface{}) *TriggerState {
 	if v, ok := data["order_id"].(string); ok {
 		ts.OrderId = v
 	}
+	if v, ok := data["client_id"].(string); ok {
+		ts.ClientId = v
+	}
 
 	// 处理嵌套的Old字段
 	if oldData, ok := data["old"].(map[string]interface{}); ok {

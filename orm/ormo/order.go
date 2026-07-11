@@ -1504,9 +1504,10 @@ func (s *TriggerState) Clone() *TriggerState {
 			Rate:  s.Rate,
 			Tag:   s.Tag,
 		},
-		Range:   s.Rate,
-		Hit:     s.Hit,
-		OrderId: s.OrderId,
+		Range:    s.Rate,
+		Hit:      s.Hit,
+		OrderId:  s.OrderId,
+		ClientId: s.ClientId,
 	}
 }
 

@@ -9,8 +9,9 @@ type ExitTrigger struct {
 
 type TriggerState struct {
 	*ExitTrigger
-	Range   float64      `json:"range,omitempty"` // The stop-profit and stop-loss range is the range from the entry price to the exit price. 止盈止损区间，入场价格到离场价格的区间
-	Hit     bool         `json:"hit,omitempty"`   // whether trigger price has been triggered? 是否已触发
-	OrderId string       `json:"order_id,omitempty"`
-	Old     *ExitTrigger `json:"old,omitempty"`
+	Range    float64      `json:"range,omitempty"` // The stop-profit and stop-loss range is the range from the entry price to the exit price. 止盈止损区间，入场价格到离场价格的区间
+	Hit      bool         `json:"hit,omitempty"`   // whether trigger price has been triggered? 是否已触发
+	OrderId  string       `json:"order_id,omitempty"`
+	ClientId string       `json:"client_id,omitempty"`
+	Old      *ExitTrigger `json:"old,omitempty"`
 }

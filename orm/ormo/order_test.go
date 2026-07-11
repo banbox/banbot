@@ -207,3 +207,18 @@ func TestSaveToDbRollsBackMainWhenEnterUpdateFails(t *testing.T) {
 		t.Fatalf("enter price changed despite rollback: got %v", price)
 	}
 }
+
+func TestTriggerStateClientIDSurvivesDecodeAndClone(t *testing.T) {
+	state := decodeTriggerState(map[string]interface{}{
+		"price":     float64(88),
+		"order_id":  "trigger-order",
+		"client_id": "ban_138_428_",
+	})
+	if state == nil || state.ClientId != "ban_138_428_" {
+		t.Fatalf("decoded trigger client ID mismatch: %+v", state)
+	}
+	clone := state.Clone()
+	if clone.ClientId != state.ClientId || clone.OrderId != state.OrderId {
+		t.Fatalf("cloned trigger identity mismatch: %+v", clone)
+	}
+}

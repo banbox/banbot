@@ -1351,23 +1351,24 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 			return
 		}
 	}
-	if strings.Contains(trade.Type, banexg.OdTypeStop) || strings.Contains(trade.Type, banexg.OdTypeTakeProfit) {
-		// Ignore stop loss / take profit trigger trades unless they are the tracked enter/exit order.
-		// 忽略止损/止盈触发单，但允许处理已追踪的入场/出场订单
+	lock := iod.Lock()
+	defer lock.Unlock()
+	if isTriggerTrade(trade) {
+		// A triggered Binance futures order may have a new order ID. In that case
+		// the client ID and trigger type must still identify this exact exit.
 		enterID := ""
 		exitID := ""
-		if iod != nil && iod.Enter != nil {
+		if iod.Enter != nil {
 			enterID = iod.Enter.OrderID
 		}
-		if iod != nil && iod.Exit != nil {
+		if iod.Exit != nil {
 			exitID = iod.Exit.OrderID
 		}
-		if trade.Order == "" || (trade.Order != enterID && trade.Order != exitID) {
+		_, matchedTrigger := matchTriggerExitTrade(iod, trade)
+		if trade.Order == "" || trade.Order != enterID && trade.Order != exitID && !matchedTrigger {
 			return
 		}
 	}
-	lock := iod.Lock()
-	defer lock.Unlock()
 	err := o.updateByMyTrade(iod, trade)
 	if err != nil {
 		log.Error("updateByMyTrade fail", zap.String("acc", o.Account), zap.String("key", iod.Key()),
@@ -1558,18 +1559,13 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 	o.lockDoneTrades.Lock()
 	o.doneTrades[trade.Symbol+trade.ID] = trade.Timestamp
 	o.lockDoneTrades.Unlock()
-	sl := od.GetStopLoss()
-	tp := od.GetTakeProfit()
 	isSell := trade.Side == banexg.OdSideSell
 	isEnter := od.Short == isSell
 	subOd := od.Exit
 	dirtTag := "enter"
-	var isStopLoss, isTakeProfit bool
-	if sl != nil && sl.OrderId == trade.Order {
-		isStopLoss = true
-	} else if tp != nil && tp.OrderId == trade.Order {
-		isTakeProfit = true
-	}
+	triggerTag, matchedTrigger := matchTriggerExitTrade(od, trade)
+	isStopLoss := matchedTrigger && triggerTag == core.ExitTagStopLoss
+	isTakeProfit := matchedTrigger && triggerTag == core.ExitTagTakeProfit
 	if isEnter {
 		subOd = od.Enter
 		dirtTag = "exit"
@@ -1580,17 +1576,20 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 			od.SetExit(0, core.ExitTagStopLoss, banexg.OdTypeMarket, 0)
 		} else if isTakeProfit {
 			od.SetExit(0, core.ExitTagTakeProfit, banexg.OdTypeTakeProfit, 0)
+		} else if matchedTrigger && triggerTag == core.ExitTagTrailingStop {
+			od.SetExit(0, core.ExitTagTrailingStop, banexg.OdTypeMarket, 0)
 		} else {
-			trialID := od.GetInfoString(ormo.OdInfoTrailingID)
-			if trialID == trade.Order {
-				od.SetExit(0, core.ExitTagTrailingStop, banexg.OdTypeMarket, 0)
-			} else {
-				// TODO: 检查是否是用户主动平仓，用户可能一次性平仓多个，需要更新相关订单状态
-				log.Error(fmt.Sprintf("%s %s subOd %s nil, trade state: %s", o.Account, od.Key(), dirtTag, trade.State))
-				return nil
-			}
+			log.Error(fmt.Sprintf("%s %s subOd %s nil, trade state: %s", o.Account, od.Key(), dirtTag, trade.State))
+			return nil
 		}
 		subOd = od.Exit
+		if trade.Order != "" {
+			subOd.OrderID = trade.Order
+			od.DirtyExit = true
+			o.lockExgIdMap.Lock()
+			o.exgIdMap[trade.Symbol+trade.Order] = od
+			o.lockExgIdMap.Unlock()
+		}
 		subOd.UpdateAt = trade.Timestamp
 	}
 	if trade.Timestamp < subOd.UpdateAt {
@@ -1656,10 +1655,14 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 		// May be triggered by stop loss or take profit, delete and set to completed
 		// 可能由止盈止损触发，删除置为已完成
 		if isStopLoss {
+			sl := od.GetStopLoss()
 			sl.OrderId = ""
+			sl.ClientId = ""
 			od.DirtyInfo = true
 		} else if isTakeProfit {
+			tp := od.GetTakeProfit()
 			tp.OrderId = ""
+			tp.ClientId = ""
 			od.DirtyInfo = true
 		}
 		err := o.finishOrder(od)
@@ -1674,6 +1677,48 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 		strat.FireOdChange(o.Account, od, strat.OdChgEnterFill)
 	}
 	return nil
+}
+
+func isTriggerTrade(trade *banexg.MyTrade) bool {
+	return trade != nil && (strings.Contains(trade.Type, banexg.OdTypeStop) ||
+		strings.Contains(trade.Type, banexg.OdTypeTakeProfit))
+}
+
+func matchTriggerExitTrade(od *ormo.InOutOrder, trade *banexg.MyTrade) (string, bool) {
+	if od == nil || trade == nil || od.Short == (trade.Side == banexg.OdSideSell) {
+		return "", false
+	}
+	sl := od.GetStopLoss()
+	tp := od.GetTakeProfit()
+	trailingID := od.GetInfoString(ormo.OdInfoTrailingID)
+	if sl != nil && sl.OrderId != "" && sl.OrderId == trade.Order {
+		return core.ExitTagStopLoss, true
+	}
+	if tp != nil && tp.OrderId != "" && tp.OrderId == trade.Order {
+		return core.ExitTagTakeProfit, true
+	}
+	if trailingID != "" && trailingID == trade.Order {
+		return core.ExitTagTrailingStop, true
+	}
+	if sl != nil && sl.ClientId != "" && sl.ClientId == trade.ClientID {
+		return core.ExitTagStopLoss, true
+	}
+	if tp != nil && tp.ClientId != "" && tp.ClientId == trade.ClientID {
+		return core.ExitTagTakeProfit, true
+	}
+	if getClientOrderId(trade.ClientID) != od.ID {
+		return "", false
+	}
+	if trade.Type == banexg.OdTypeTrailingStopMarket && trailingID != "" {
+		return core.ExitTagTrailingStop, true
+	}
+	if strings.Contains(trade.Type, banexg.OdTypeTakeProfit) && tp != nil && tp.OrderId != "" {
+		return core.ExitTagTakeProfit, true
+	}
+	if strings.Contains(trade.Type, banexg.OdTypeStop) && sl != nil && sl.OrderId != "" {
+		return core.ExitTagStopLoss, true
+	}
+	return "", false
 }
 
 func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
@@ -2838,13 +2883,15 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 				log.Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
 			tg.OrderId = ""
+			tg.ClientId = ""
 			_ = od.SetExitTrigger(prefix, nil, 0)
 		}
 		return
 	}
+	clientID := od.ClientId(true)
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
-		banexg.ParamClientOrderId: od.ClientId(true),
+		banexg.ParamClientOrderId: clientID,
 	}
 	if core.IsContract {
 		params[banexg.ParamPositionSide] = "LONG"
@@ -2920,6 +2967,10 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 	orderId := tg.OrderId
 	if res != nil {
 		tg.OrderId = res.ID
+		tg.ClientId = clientID
+		if res.ClientOrderID != "" {
+			tg.ClientId = res.ClientOrderID
+		}
 		od.DirtyInfo = true
 	}
 	if orderId != "" && (res == nil || res.Status == "open") {
@@ -2981,6 +3032,7 @@ func cancelTriggerOds(od *ormo.InOutOrder, account string) {
 			logFields = append(logFields, zap.String("sl", sl.OrderId))
 		}
 		sl.OrderId = ""
+		sl.ClientId = ""
 		od.DirtyInfo = true
 	}
 	if tp != nil && tp.OrderId != "" {
@@ -2991,6 +3043,7 @@ func cancelTriggerOds(od *ormo.InOutOrder, account string) {
 			logFields = append(logFields, zap.String("tp", tp.OrderId))
 		}
 		tp.OrderId = ""
+		tp.ClientId = ""
 		od.DirtyInfo = true
 	}
 	if len(logFields) > 0 {

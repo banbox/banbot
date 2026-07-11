@@ -121,7 +121,6 @@ stepCB 用于更新进度，总值固定1000，避免内部下载区间大于传
 */
 func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
 	retry int, pBar *utils.PrgBar) (int, *errs.Error) {
-	_ = retry
 	if startMS >= endMS || exs.Combined || exs.DelistMs > 0 || core.NetDisable {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
@@ -208,15 +207,61 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		StartMs:   curStart,
 		StopMs:    curEnd,
 	})
-	if err != nil || insTs.IsZero() {
+	if err != nil {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
 		}
 		return 0, err
 	}
+	if insTs.IsZero() {
+		waitCtx, cancel := context.WithTimeout(context.Background(), klineInsertWaitTimeout)
+		defer cancel()
+		grace := time.Duration(0)
+		if IsQuestDB {
+			grace = klineInsertQuestVisibilityGrace
+		}
+		complete, waitErr := waitForKlineInsertCompletion(waitCtx, klineInsertWaitPoll, grace,
+			func() (bool, error) {
+				covered, err := sess.getCoveredRanges(waitCtx, exs.ID, "kline_"+timeFrame, timeFrame, startMS, endMS)
+				if err != nil {
+					return false, err
+				}
+				return len(subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered)) == 0, nil
+			},
+			func() (bool, error) {
+				return klineInsertFileLockActive(klineInsertLockRoot(), exs.ID, timeFrame)
+			})
+		if waitErr != nil {
+			if waitErr == context.DeadlineExceeded {
+				return 0, errs.NewMsg(core.ErrTimeout, "wait for kline insert sid=%d tf=%s", exs.ID, timeFrame)
+			}
+			return 0, NewDbErr(core.ErrDbReadFail, waitErr)
+		}
+		if complete {
+			if pBar != nil {
+				pBar.Add(core.StepTotal)
+			}
+			return 0, nil
+		}
+		if !IsQuestDB {
+			item, itemErr := sess.GetInsKline(waitCtx, exs.ID, timeFrame)
+			if itemErr != nil {
+				return 0, NewDbErr(core.ErrDbReadFail, itemErr)
+			}
+			if item != nil {
+				return 0, errs.NewMsg(core.ErrRunTime,
+					"kline insert owner exited; pending recovery sid=%d tf=%s", exs.ID, timeFrame)
+			}
+		}
+		if retry >= klineInsertMaxRetry {
+			return 0, errs.NewMsg(core.ErrRunTime, "kline insert owner exited without covering sid=%d tf=%s", exs.ID, timeFrame)
+		}
+		return downOHLCV2DBRange(sess, exchange, exs, timeFrame, startMS, endMS, retry+1, pBar)
+	}
 	clearInsJob := true
 	defer func() {
 		if !clearInsJob {
+			_ = releaseKlineInsertOwnership(exs.ID, timeFrame, insTs)
 			return
 		}
 		if err_ := sess.DelInsKline(context.Background(), exs.ID, timeFrame, insTs); err_ != nil {
@@ -353,6 +398,12 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 			} else {
 				log.Warn("UpdateKRange fail", zap.Int32("sid", exs.ID), zap.String("tf", timeFrame),
 					zap.String("err", updErr.Short()))
+			}
+		}
+		if outErr == nil && IsQuestDB {
+			if waitErr := waitForQuestKlineCoverageVisible(context.Background(), sess, exs.ID, timeFrame, realStart, realEnd+tfMSecs); waitErr != nil {
+				clearInsJob = false
+				outErr = waitErr
 			}
 		}
 	}

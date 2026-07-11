@@ -104,6 +104,129 @@ func TestParseClient(t *testing.T) {
 	fmt.Println(res)
 }
 
+func TestHandleMyTradeClaimsTriggeredBinanceExitWithNewOrderID(t *testing.T) {
+	withIssue138Exchange(t, &issue138Exchange{})
+	oldName := config.Name
+	config.Name = "ban"
+	t.Cleanup(func() { config.Name = oldName })
+
+	tests := []struct {
+		name       string
+		tradeType  string
+		triggerKey string
+		triggerID  string
+		exitTag    string
+	}{
+		{
+			name:       "stop loss",
+			tradeType:  banexg.OdTypeMarket,
+			triggerKey: ormo.OdInfoStopLoss,
+			triggerID:  "2000000597523938",
+			exitTag:    core.ExitTagStopLoss,
+		},
+		{
+			name:       "take profit",
+			tradeType:  banexg.OdTypeMarket,
+			triggerKey: ormo.OdInfoTakeProfit,
+			triggerID:  "2000000597523939",
+			exitTag:    core.ExitTagTakeProfit,
+		},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			od := issue138Order("entry-order")
+			od.ID += int64(index)
+			od.Status = ormo.InOutStatusFullEnter
+			od.Enter.Status = ormo.OdStatusClosed
+			od.Enter.Filled = 0.35
+			od.Enter.Average = 90
+			od.SetInfo(test.triggerKey, &ormo.TriggerState{
+				ExitTrigger: &ormo.ExitTrigger{Price: 88.02},
+				OrderId:     test.triggerID,
+				ClientId:    fmt.Sprintf("ban_%d_428_", od.ID),
+			})
+
+			core.PairsMap[od.Symbol] = true
+			t.Cleanup(func() { delete(core.PairsMap, od.Symbol) })
+			openOds, openLock := ormo.GetOpenODs(config.DefAcc)
+			openLock.Lock()
+			openOds[od.ID] = od
+			openLock.Unlock()
+			t.Cleanup(func() {
+				openLock.Lock()
+				delete(openOds, od.ID)
+				openLock.Unlock()
+			})
+
+			mgr := newLiveOrderMgr("issue136-"+test.name, func(*ormo.InOutOrder, bool) {})
+			actualOrderID := fmt.Sprintf("108710997%d", index+1)
+			mgr.handleMyTrade(&banexg.MyTrade{
+				Trade: banexg.Trade{
+					ID:        fmt.Sprintf("4612254%d", index+4),
+					Symbol:    od.Symbol,
+					Side:      banexg.OdSideSell,
+					Type:      test.tradeType,
+					Amount:    0.35,
+					Order:     actualOrderID,
+					Timestamp: 1773196328529,
+				},
+				Filled:   0.35,
+				ClientID: fmt.Sprintf("ban_%d_428_", od.ID),
+				Average:  88.01,
+				State:    banexg.OdStatusFilled,
+				PosSide:  banexg.PosSideLong,
+			})
+
+			if od.Exit == nil {
+				t.Fatal("triggered trade did not create an exit sub-order")
+			}
+			if od.Exit.OrderID != actualOrderID || od.ExitTag != test.exitTag || od.Exit.Filled != 0.35 ||
+				od.Status != ormo.InOutStatusFullExit {
+				t.Fatalf("triggered exit mismatch: orderID=%q tag=%q filled=%v status=%d",
+					od.Exit.OrderID, od.ExitTag, od.Exit.Filled, od.Status)
+			}
+			if trigger := od.GetExitTrigger(test.triggerKey); trigger == nil || trigger.OrderId != "" || trigger.ClientId != "" {
+				t.Fatalf("completed trigger was not cleared: %+v", trigger)
+			}
+			mgr.lockExgIdMap.Lock()
+			mapped := mgr.exgIdMap[od.Symbol+actualOrderID]
+			mgr.lockExgIdMap.Unlock()
+			if mapped != od {
+				t.Fatal("actual exchange order ID was not mapped to the in/out order")
+			}
+		})
+	}
+}
+
+func TestMatchTriggerExitTradeRejectsUnrelatedTrade(t *testing.T) {
+	oldName := config.Name
+	config.Name = "ban"
+	t.Cleanup(func() { config.Name = oldName })
+	od := issue138Order("entry-order")
+	od.Status = ormo.InOutStatusFullEnter
+	od.SetInfo(ormo.OdInfoStopLoss, &ormo.TriggerState{
+		ExitTrigger: &ormo.ExitTrigger{Price: 88.02},
+		OrderId:     "trigger-order",
+		ClientId:    "ban_138_1_",
+	})
+
+	for _, trade := range []*banexg.MyTrade{
+		{
+			Trade:    banexg.Trade{Order: "actual-order", Side: banexg.OdSideSell, Type: banexg.OdTypeMarket},
+			ClientID: "ban_999_1_",
+		},
+		{
+			Trade:    banexg.Trade{Order: "actual-order", Side: banexg.OdSideBuy, Type: banexg.OdTypeMarket},
+			ClientID: "ban_138_1_",
+		},
+	} {
+		if tag, ok := matchTriggerExitTrade(od, trade); ok {
+			t.Fatalf("unrelated trigger trade matched as %q: %+v", tag, trade)
+		}
+	}
+}
+
 func TestRestoreInOutOrderKeepsVirtualTriggerWhenMarketDataIsCold(t *testing.T) {
 	exchange := &issue138Exchange{}
 	withIssue138Exchange(t, exchange)
@@ -463,6 +586,7 @@ func TestCancelEnterToLocalTriggerPreservesOrderOnEmptyCancelResponse(t *testing
 
 func TestCancelTimeoutEnterReconcilesFilledOrderAfterUnknownOrder(t *testing.T) {
 	createCalls := 0
+	createdClientID := ""
 	exchange := &issue138Exchange{
 		cancelOrder: func(string, string, map[string]interface{}) (*banexg.Order, *errs.Error) {
 			return nil, issue138Err(-2011)
@@ -475,7 +599,10 @@ func TestCancelTimeoutEnterReconcilesFilledOrderAfterUnknownOrder(t *testing.T) 
 		},
 		createOrder: func(symbol, odType, side string, amount, price float64, params map[string]interface{}) (*banexg.Order, *errs.Error) {
 			createCalls++
-			return &banexg.Order{ID: "stop-loss-order", Symbol: symbol, Status: banexg.OdStatusOpen}, nil
+			createdClientID, _ = params[banexg.ParamClientOrderId].(string)
+			return &banexg.Order{
+				ID: "stop-loss-order", ClientOrderID: createdClientID, Symbol: symbol, Status: banexg.OdStatusOpen,
+			}, nil
 		},
 	}
 	withIssue138Exchange(t, exchange)
@@ -502,6 +629,9 @@ func TestCancelTimeoutEnterReconcilesFilledOrderAfterUnknownOrder(t *testing.T) 
 	}
 	if createCalls != 1 || od.GetStopLoss().OrderId != "stop-loss-order" {
 		t.Fatalf("protective stop loss was not installed: calls=%d state=%+v", createCalls, od.GetStopLoss())
+	}
+	if createdClientID == "" || od.GetStopLoss().ClientId != createdClientID {
+		t.Fatalf("protective stop client ID was not persisted: created=%q state=%+v", createdClientID, od.GetStopLoss())
 	}
 	openOds, lock := ormo.GetOpenODs(config.DefAcc)
 	lock.Lock()

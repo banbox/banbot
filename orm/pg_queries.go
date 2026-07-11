@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -489,31 +488,18 @@ func delFactorsPg(ctx context.Context, sid int32, startMS, endMS int64) *errs.Er
 // ins_kline operations for TimescaleDB
 // ─────────────────────────────────────────────
 
-func (q *Queries) addInsKlinePg(ctx context.Context, arg AddInsKlineParams) (time.Time, error) {
+func (q *Queries) tryAddInsKlinePg(ctx context.Context, arg AddInsKlineParams) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	key := insKlineLockKey(arg.Sid, arg.Timeframe)
-	insKlineLocksmu.Lock()
-	if _, locked := insKlineLocks[key]; locked {
-		insKlineLocksmu.Unlock()
-		return time.Time{}, nil
-	}
-	ts := time.Now().UTC()
-	insKlineLocks[key] = ts
-	insKlineLocksmu.Unlock()
-
-	_, err := q.db.Exec(ctx, `INSERT INTO ins_kline (sid, timeframe, start_ms, stop_ms)
+	tag, err := q.db.Exec(ctx, `INSERT INTO ins_kline (sid, timeframe, start_ms, stop_ms)
 VALUES ($1, $2, $3, $4)
-ON CONFLICT (sid, timeframe) DO UPDATE SET start_ms = EXCLUDED.start_ms, stop_ms = EXCLUDED.stop_ms`,
+ON CONFLICT (sid, timeframe) DO NOTHING`,
 		arg.Sid, arg.Timeframe, arg.StartMs, arg.StopMs)
 	if err != nil {
-		insKlineLocksmu.Lock()
-		delete(insKlineLocks, key)
-		insKlineLocksmu.Unlock()
-		return time.Time{}, err
+		return false, err
 	}
-	return ts, nil
+	return tag.RowsAffected() > 0, nil
 }
 
 func (q *Queries) getAllInsKlinesPg(ctx context.Context) ([]*InsKline, error) {
@@ -552,11 +538,6 @@ func (q *Queries) getInsKlinePg(ctx context.Context, sid int32, timeframe string
 }
 
 func (q *Queries) delInsKlinePg(ctx context.Context, sid int32, timeframe string) error {
-	key := insKlineLockKey(sid, timeframe)
-	insKlineLocksmu.Lock()
-	delete(insKlineLocks, key)
-	insKlineLocksmu.Unlock()
-
 	if ctx == nil {
 		ctx = context.Background()
 	}

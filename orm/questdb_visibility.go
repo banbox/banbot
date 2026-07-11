@@ -144,6 +144,36 @@ func waitForQuestKlineWindowVisible(ctx context.Context, q *Queries, sid int32, 
 	return visible, nil
 }
 
+func questKlineCoverageVisible(ctx context.Context, q *Queries, sid int32, timeframe string, startMS, endMS int64) (bool, error) {
+	spans, err := q.loadSRangesSpansFromDB(ctx, sid, "kline_"+timeframe, timeframe, startMS, endMS)
+	if err != nil {
+		return false, err
+	}
+	covered := make([]MSRange, 0, len(spans))
+	for _, span := range spans {
+		if span.HasData && span.StopMs > span.StartMs {
+			covered = append(covered, MSRange{Start: span.StartMs, Stop: span.StopMs})
+		}
+	}
+	missing := subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, mergeMSRanges(covered))
+	return len(missing) == 0, nil
+}
+
+func waitForQuestKlineCoverageVisible(ctx context.Context, q *Queries, sid int32, timeframe string, startMS, endMS int64) *errs.Error {
+	ok, err := waitForQuestCondition(ctx, klineInsertQuestVisibilityGrace, questReadAfterWritePollInterval, func() (bool, error) {
+		return questKlineCoverageVisible(ctx, q, sid, timeframe, startMS, endMS)
+	})
+	if err != nil {
+		return NewDbErr(core.ErrDbReadFail, err)
+	}
+	if !ok {
+		return errs.NewMsg(core.ErrDbReadFail,
+			"questdb kline coverage not visible before timeout: sid=%d timeframe=%s start=%d end=%d",
+			sid, timeframe, startMS, endMS)
+	}
+	return nil
+}
+
 func waitForQuestKlineTimestampVisible(ctx context.Context, q *Queries, sid int32, timeframe string, timeMS int64) *errs.Error {
 	tblName := "kline_" + timeframe
 	sqlText := fmt.Sprintf(`SELECT count(*) > 0 FROM %s

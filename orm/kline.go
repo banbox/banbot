@@ -641,7 +641,12 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 }
 
 func (q *Queries) finalizeKlineInsert(exs *ExSymbol, timeFrame string, startMS, endMS, lastMS int64,
-	insTs time.Time, aggBig bool) *errs.Error {
+	insTs time.Time, aggBig bool) (outErr *errs.Error) {
+	defer func() {
+		if outErr != nil {
+			_ = releaseKlineInsertOwnership(exs.ID, timeFrame, insTs)
+		}
+	}()
 	ctx := context.Background()
 	if IsQuestDB {
 		if err := waitForQuestKlineTimestampVisible(ctx, q, exs.ID, timeFrame, lastMS); err != nil {
@@ -650,6 +655,11 @@ func (q *Queries) finalizeKlineInsert(exs *ExSymbol, timeFrame string, startMS, 
 	}
 	if err := q.UpdateKRange(exs, timeFrame, startMS, endMS, aggBig); err != nil {
 		return err
+	}
+	if IsQuestDB {
+		if err := waitForQuestKlineCoverageVisible(ctx, q, exs.ID, timeFrame, startMS, endMS); err != nil {
+			return err
+		}
 	}
 	if err := q.DelInsKline(ctx, exs.ID, timeFrame, insTs); err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
@@ -1341,6 +1351,17 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 	}
 	log.Info("Updating pending insert jobs", zap.Int("num", len(items)))
 	for _, i := range items {
+		active, lockErr := klineInsertFileLockActive(klineInsertLockRoot(), i.Sid, i.Timeframe)
+		if lockErr != nil {
+			log.Warn("check pending insert owner fail; keep job", zap.Int32("sid", i.Sid),
+				zap.String("tf", i.Timeframe), zap.Error(lockErr))
+			continue
+		}
+		if active {
+			log.Debug("pending insert still owned by active process", zap.Int32("sid", i.Sid),
+				zap.String("tf", i.Timeframe))
+			continue
+		}
 		if i.StartMs > 0 && i.StopMs > 0 {
 			start, end := q.GetKlineRange(i.Sid, i.Timeframe)
 			if IsQuestDB && (start == 0 || end == 0) {
@@ -1386,7 +1407,7 @@ func AddInsJob(add AddInsKlineParams) (time.Time, *errs.Error) {
 		return time.Time{}, NewDbErr(core.ErrDbExecFail, err_)
 	}
 	if ts.IsZero() {
-		log.Warn("insert candles for symbol locked, skip", zap.Int32("sid", add.Sid), zap.String("tf", add.Timeframe))
+		log.Debug("insert candles already claimed, skip", zap.Int32("sid", add.Sid), zap.String("tf", add.Timeframe))
 		return time.Time{}, nil
 	}
 	return ts, nil
