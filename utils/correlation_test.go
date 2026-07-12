@@ -1,8 +1,9 @@
 package utils
 
 import (
-	"fmt"
+	"bytes"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -18,20 +19,24 @@ func TestGenCorrImg(t *testing.T) {
 	names := []string{"btc", "eth", "fol", "etc", "eos"}
 	corrMat, _, err := CalcCorrMat(len(dataArr[0]), dataArr, false)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	data, err := GenCorrImg(corrMat, title, names, "", 0)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
-	file, err := os.OpenFile("example.png", os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Println("open file fail:", err)
-		return
+	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatal("generated correlation image is not a PNG")
 	}
-	defer file.Close()
-	_, err = file.Write(data)
+	path := filepath.Join(t.TempDir(), "correlation.png")
+	if err = os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
 	if err != nil {
-		fmt.Println("write png data fail:", err)
+		t.Fatal(err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("generated correlation image is empty")
 	}
 }

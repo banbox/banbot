@@ -217,6 +217,14 @@ func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {
 		if err != nil {
 			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Unmarshal %s Fail", path)
 		}
+		if _, ok := unpak["timerange"]; ok {
+			delete(merged, "time_start")
+			delete(merged, "time_end")
+		} else if _, hasStart := unpak["time_start"]; hasStart {
+			delete(merged, "timerange")
+		} else if _, hasEnd := unpak["time_end"]; hasEnd {
+			delete(merged, "timerange")
+		}
 		for key := range noExtends {
 			if _, ok := unpak[key]; ok {
 				delete(merged, key)
@@ -358,10 +366,13 @@ func MergeConfigPaths(paths []string, skips ...string) (string, error) {
 func (c *Config) Apply(args *CmdArgs) error {
 	if args.TimeRange != "" {
 		c.TimeRangeRaw = args.TimeRange
+		c.TimeStart = ""
+		c.TimeEnd = ""
 	}
 	if args.TimeStart != "" {
 		c.TimeStart = args.TimeStart
 		c.TimeEnd = args.TimeEnd
+		c.TimeRangeRaw = ""
 	}
 	if args.MaxPoolSize > 0 {
 		c.Database.MaxPoolSize = args.MaxPoolSize
