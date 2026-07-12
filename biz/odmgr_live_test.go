@@ -55,10 +55,8 @@ func (e *issue138Exchange) CalculateFee(string, string, string, float64, float64
 	return &banexg.Fee{}, nil
 }
 
-func issue138Err(bizCode int) *errs.Error {
-	err := errs.NewMsg(errs.CodeRunTime, "exchange error %d", bizCode)
-	err.BizCode = bizCode
-	return err
+func issue138Err(code int) *errs.Error {
+	return errs.NewMsg(code, "exchange error")
 }
 
 func issue138Order(id string) *ormo.InOutOrder {
@@ -431,7 +429,7 @@ func TestCancelEnterToLocalTriggerReconcilesFilledOrderAfterUnknownOrder(t *test
 	fetchCalls := 0
 	exchange := &issue138Exchange{
 		cancelOrder: func(string, string, map[string]interface{}) (*banexg.Order, *errs.Error) {
-			return nil, issue138Err(-2011)
+			return nil, issue138Err(errs.CodeOrderNotCancelable)
 		},
 		fetchOrder: func(symbol, id string, params map[string]interface{}) (*banexg.Order, *errs.Error) {
 			fetchCalls++
@@ -464,7 +462,7 @@ func TestCancelEnterToLocalTriggerReconcilesFilledOrderAfterUnknownOrder(t *test
 func TestCancelEnterToLocalTriggerRollsBackCanceledOrderAfterUnknownOrder(t *testing.T) {
 	exchange := &issue138Exchange{
 		cancelOrder: func(string, string, map[string]interface{}) (*banexg.Order, *errs.Error) {
-			return nil, issue138Err(-2011)
+			return nil, issue138Err(errs.CodeOrderNotCancelable)
 		},
 		fetchOrder: func(symbol, id string, params map[string]interface{}) (*banexg.Order, *errs.Error) {
 			return &banexg.Order{
@@ -589,7 +587,7 @@ func TestCancelTimeoutEnterReconcilesFilledOrderAfterUnknownOrder(t *testing.T) 
 	createdClientID := ""
 	exchange := &issue138Exchange{
 		cancelOrder: func(string, string, map[string]interface{}) (*banexg.Order, *errs.Error) {
-			return nil, issue138Err(-2011)
+			return nil, issue138Err(errs.CodeOrderNotCancelable)
 		},
 		fetchOrder: func(symbol, id string, params map[string]interface{}) (*banexg.Order, *errs.Error) {
 			return &banexg.Order{
@@ -719,7 +717,7 @@ func TestCancelTimeoutEnterAppliesSuccessfulZeroFillCancelOnce(t *testing.T) {
 func TestCancelTimeoutEnterDoesNotCloseLocallyWhenReconciliationFails(t *testing.T) {
 	exchange := &issue138Exchange{
 		cancelOrder: func(string, string, map[string]interface{}) (*banexg.Order, *errs.Error) {
-			return nil, issue138Err(-2011)
+			return nil, issue138Err(errs.CodeOrderNotCancelable)
 		},
 		fetchOrder: func(string, string, map[string]interface{}) (*banexg.Order, *errs.Error) {
 			return nil, issue138Err(-1000)
@@ -743,7 +741,7 @@ func TestCancelTimeoutEnterDoesNotCloseLocallyWhenReconciliationFails(t *testing
 func TestCancelTimeoutEnterRejectsStaleReconciliation(t *testing.T) {
 	exchange := &issue138Exchange{
 		cancelOrder: func(string, string, map[string]interface{}) (*banexg.Order, *errs.Error) {
-			return nil, issue138Err(-2011)
+			return nil, issue138Err(errs.CodeOrderNotCancelable)
 		},
 		fetchOrder: func(symbol, id string, params map[string]interface{}) (*banexg.Order, *errs.Error) {
 			return &banexg.Order{

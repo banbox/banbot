@@ -524,8 +524,8 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 			exOd, err = exg.Default.FetchOrder(od.Symbol, tryOd.OrderID, map[string]interface{}{
 				banexg.ParamAccount: o.Account,
 			})
-			if err != nil && err.BizCode != -2013 {
-				// 跳过错误 -2013 订单不存在
+			if err != nil && err.Code != errs.CodeOrderNotFound {
+				// An absent exchange order is handled by local reconciliation below.
 				return err
 			}
 		}
@@ -1984,7 +1984,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	}
 	res, err := exchange.CreateOrder(od.Symbol, subOd.OrderType, side, amount, price, params)
 	if err != nil {
-		if !isEnter && err.BizCode == -2022 {
+		if !isEnter && err.Code == errs.CodeReduceOnlyRejected {
 			msg := "ReduceOnly Order is rejected."
 			log.Error("close exg pos fail", zap.String("acc", o.Account), zap.String("key", od.Key()), zap.Error(err))
 			err = od.LocalExit(btime.UTCStamp(), core.ExitTagNoMatch, price, msg, banexg.OdTypeMarket)
@@ -2675,13 +2675,13 @@ func cancelEnterToLocalTrigger(odMgr *LiveOrderMgr, od *ormo.InOutOrder, waitSec
 		banexg.ParamAccount: odMgr.Account,
 	})
 	if err != nil {
-		if err.BizCode == -2011 {
+		if err.Code == errs.CodeOrderNotFound || err.Code == errs.CodeOrderNotCancelable {
 			reconcileErr := odMgr.reconcileEnterAfterCancelRejected(od, orderId)
 			if reconcileErr != nil {
 				return false, reconcileErr
 			}
 			log.Warn("cancel enter order rejected; reconciled exchange state", zap.String("acc", odMgr.Account),
-				zap.String("key", od.Key()), zap.String("orderId", orderId), zap.Int("bizCode", err.BizCode))
+				zap.String("key", od.Key()), zap.String("orderId", orderId), zap.Int("code", err.Code))
 			return true, nil
 		}
 		return false, err
@@ -2713,7 +2713,7 @@ func cancelTimeoutEnter(odMgr *LiveOrderMgr, od *ormo.InOutOrder) {
 			banexg.ParamAccount: odMgr.Account,
 		})
 		if err != nil {
-			if err.BizCode == -2011 {
+			if err.Code == errs.CodeOrderNotFound || err.Code == errs.CodeOrderNotCancelable {
 				reconcileErr := odMgr.reconcileEnterAfterCancelRejected(od, orderID)
 				if reconcileErr != nil {
 					log.Error("reconcile timeout enter after cancel rejected fail", zap.String("acc", odMgr.Account),
@@ -2721,7 +2721,7 @@ func cancelTimeoutEnter(odMgr *LiveOrderMgr, od *ormo.InOutOrder) {
 					return
 				}
 				log.Warn("cancel timeout enter rejected; reconciled exchange state", zap.String("acc", odMgr.Account),
-					zap.String("key", od.Key()), zap.String("orderId", orderID), zap.Int("bizCode", err.BizCode))
+					zap.String("key", od.Key()), zap.String("orderId", orderID), zap.Int("code", err.Code))
 				return
 			}
 			log.Error("cancel old limit enters fail", zap.String("key", od.Key()), zap.Error(err))
@@ -2940,7 +2940,7 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		zap.Float64("price", od.Enter.Average))
 	res, err := exg.Default.CreateOrder(od.Symbol, odType, side, amt, price, params)
 	if err != nil {
-		if err.BizCode == -2021 {
+		if err.Code == errs.CodeOrderWouldTrigger {
 			// Stop loss and stop profit are executed immediately, and the position is closed at the market price
 			// 止损止盈立刻成交，则市价平仓
 			log.Warn("Order would immediately trigger, exit", zap.String("key", od.Key()))

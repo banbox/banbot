@@ -212,7 +212,7 @@ func cancelPendingOrders(accMap map[string]bool, pairMap map[string]bool) *errs.
 					banexg.ParamAccount: account,
 				})
 				if err != nil {
-					if err.BizCode == -2011 {
+					if err.Code == errs.CodeOrderNotFound || err.Code == errs.CodeOrderNotCancelable {
 						log.Warn("cancel order skip, already cancelled on exchange", zap.String("acc", account),
 							zap.String("pair", order.Symbol), zap.String("orderId", order.ID))
 					} else {
