@@ -166,12 +166,13 @@ func (p *Provider[IDataFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPr
 
 type HistProvider struct {
 	Provider[IHistDataFeeder]
-	getEnd     FnGetInt64
-	maxTfSecs  int
-	pBar       *utils.StagedPrg
-	series     map[string]*HistSeriesFeeder
-	seriesCB   FnDataSeries
-	seriesRepo orm.SeriesRepo
+	getEnd        FnGetInt64
+	maxTfSecs     int
+	pBar          *utils.StagedPrg
+	allowDownload bool
+	series        map[string]*HistSeriesFeeder
+	seriesCB      FnDataSeries
+	seriesRepo    orm.SeriesRepo
 
 	wsLoader *WsDataLoader
 	trades   map[string]*TradeFeeder
@@ -197,14 +198,19 @@ func NewHistProvider(callBack FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64
 			dirtyVers: make(chan int, 5),
 			showLog:   showLog,
 		},
-		getEnd:   getEnd,
-		pBar:     pBar,
-		trades:   make(map[string]*TradeFeeder),
-		series:   make(map[string]*HistSeriesFeeder),
-		seriesCB: callBack,
+		getEnd:        getEnd,
+		pBar:          pBar,
+		allowDownload: true,
+		trades:        make(map[string]*TradeFeeder),
+		series:        make(map[string]*HistSeriesFeeder),
+		seriesCB:      callBack,
 	}
 
 	return p
+}
+
+func (p *HistProvider) SetAllowDownload(allow bool) {
+	p.allowDownload = allow
 }
 
 func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
@@ -287,6 +293,9 @@ func drainHistSeriesFeeder(feeder *HistSeriesFeeder) *errs.Error {
 }
 
 func (p *HistProvider) downIfNeed() *errs.Error {
+	if !p.allowDownload {
+		return nil
+	}
 	exchange := exg.Default
 	if !exchange.HasApi(banexg.ApiFetchOHLCV, core.Market) {
 		return nil

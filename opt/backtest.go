@@ -39,6 +39,8 @@ type BackTest struct {
 	*BackTestLite
 	lastDumpMs    int64 // The last time the backtest status was saved 上一次保存回测状态的时间
 	PBar          *utils.StagedPrg
+	dataPrep      bool
+	dataPrepErr   *errs.Error
 	nextRefresh   int64 // The time of the next refresh of the trading pair 下一次刷新交易对的时间
 	schedule      cron.Schedule
 	seriesRuntime *data.SeriesRuntime
@@ -63,6 +65,7 @@ func NewBackTestLite(isOpt bool, onBar data.FnDataSeries, getEnd data.FnGetInt64
 		}
 	}
 	b.dp = data.NewHistProvider(onBar, b.OnEnvEnd, getEnd, !isOpt, pBar)
+	b.dp.SetAllowDownload(!isOpt)
 	strat.SetPairUpdateHooks(strat.PairUpdateHooks{
 		SubWarmPairs: b.dp.SubWarmPairs,
 		ExitOrders: func(acc string, orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
@@ -321,9 +324,19 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 		dateStr := btime.ToDateStr(refreshMs, "")
 		if err != nil {
 			log.Error("RefreshPairJobs", zap.String("date", dateStr), zap.Error(err))
+			if b.dataPrep {
+				b.dataPrepErr = err
+				b.dp.Terminate()
+				return
+			}
 		} else {
 			if _, err := b.syncThirdPartySeriesRange(); err != nil {
 				log.Error("ensure third-party series after pair refresh", zap.String("date", dateStr), zap.Error(err))
+				if b.dataPrep {
+					b.dataPrepErr = err
+					b.dp.Terminate()
+					return
+				}
 			}
 			log.Info("refreshed pairs at", zap.String("date", dateStr))
 		}
@@ -331,16 +344,16 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 	}
 }
 
-func (b *BackTest) Run() {
+func (b *BackTest) Run() *errs.Error {
 	err := b.initRefreshCron()
 	if err != nil {
 		log.Error("init pair cron fail", zap.Error(err))
-		return
+		return err
 	}
 	err = b.Init()
 	if err != nil {
 		log.Error("backtest init fail", zap.Error(err))
-		return
+		return err
 	}
 	if !b.isOpt {
 		b.cronDumpBtStatus()
@@ -352,19 +365,25 @@ func (b *BackTest) Run() {
 		loopMainFn = b.dp.LoopMain
 	}
 	err = loopMainFn()
+	if err == nil && b.dataPrepErr != nil {
+		err = b.dataPrepErr
+	}
 	if !b.isOpt {
 		com.Cron().Stop()
 	}
 	if err != nil {
 		log.Error("backtest loop fail", zap.Error(err))
-		return
+		return err
 	}
 	btCost := btime.UTCTime() - btStart
 	err = biz.GetOdMgr(config.DefAcc).CleanUp()
 	strat.ExitStratJobs()
 	if err != nil {
 		log.Error("backtest clean orders fail", zap.Error(err))
-		return
+		return err
+	}
+	if b.dataPrep {
+		return nil
 	}
 	b.logPlot(biz.GetWallets(config.DefAcc), btime.TimeMS(), -1, -1)
 	b.Collect()
@@ -379,6 +398,7 @@ func (b *BackTest) Run() {
 		}
 		b.printBtResult(true)
 	}
+	return nil
 }
 
 func (b *BackTest) initTaskOut() *errs.Error {
