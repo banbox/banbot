@@ -1312,18 +1312,12 @@ func calcCumCurve(pairOrders map[string][]*ormo.InOutOrder, startMS, endMS int64
 }
 
 func getOHLCVNoLack(exs *orm.ExSymbol, tf string, startMS, endMS, tfMSecs int64) ([]*banexg.Kline, []float64, *errs.Error) {
-	_, rows, err := orm.GetOHLCV(exs, tf, startMS, endMS, 0, false)
+	_, bars, err := orm.GetOHLCV(exs, tf, startMS, endMS, 0, false)
 	if err != nil {
 		return nil, nil, err
 	}
-	var bars []*banexg.Kline
 	var closes []float64
-	if len(rows) > 0 {
-		projected, projectErr := orm.SeriesToKLines(rows, exs)
-		if projectErr != nil {
-			return nil, nil, errs.New(core.ErrInvalidBars, projectErr)
-		}
-		bars = projected
+	if len(bars) > 0 {
 		bars, _ = utils.FillOHLCVLacks(bars, startMS, endMS, tfMSecs)
 		closes = make([]float64, len(bars))
 		for i, b := range bars {

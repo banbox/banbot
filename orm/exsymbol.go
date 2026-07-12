@@ -753,7 +753,7 @@ func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int3
 			}
 		} else {
 			var rows []*DataSeries
-			rows, err = sess.QueryOHLCV(exs, "1m", startMS, 0, 1, false)
+			rows, err = sess.QuerySeries(exs, "1m", startMS, 0, 1, false)
 			if len(rows) > 0 {
 				exs.ListMs = rows[0].TimeMS
 			}

@@ -357,8 +357,8 @@ func (evt *DataSeries) resolveOHLCV(extras ...*ExSymbol) (*ExSymbol, seriesOHLCV
 	return exs, fields, nil
 }
 
-func (fields seriesOHLCVFields) kline(timeMS int64) *banexg.Kline {
-	return &banexg.Kline{
+func (fields seriesOHLCVFields) klineValue(timeMS int64) banexg.Kline {
+	return banexg.Kline{
 		Time:      timeMS,
 		Open:      fields.open,
 		High:      fields.high,
@@ -593,6 +593,9 @@ func seriesFloatValue(values map[string]any, key string) (float64, error) {
 	if !ok {
 		return 0, fmt.Errorf("series event missing field %q", key)
 	}
+	if num, ok := val.(float64); ok {
+		return num, nil
+	}
 	return seriesFloatAny(val)
 }
 
@@ -603,6 +606,9 @@ func seriesFloatValueDefault(values map[string]any, key string) (float64, bool) 
 	val, ok := values[key]
 	if !ok {
 		return 0, false
+	}
+	if num, ok := val.(float64); ok {
+		return num, true
 	}
 	num, err := seriesFloatAny(val)
 	if err != nil {
@@ -618,6 +624,9 @@ func seriesIntValueDefault(values map[string]any, key string) (int64, bool) {
 	val, ok := values[key]
 	if !ok {
 		return 0, false
+	}
+	if num, ok := val.(int64); ok {
+		return num, true
 	}
 	switch v := val.(type) {
 	case int:

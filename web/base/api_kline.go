@@ -58,7 +58,7 @@ func getHist(c *fiber.Ctx) error {
 		return err2
 	}
 	startMS, stopMS, tf := data.FromMS, data.ToMS, data.TimeFrame
-	adjs, rows, err2 := orm.AutoFetchOHLCV(exchange, exs, tf, startMS, stopMS, 0, true, nil)
+	adjs, rows, err2 := orm.AutoFetchSeries(exchange, exs, tf, startMS, stopMS, 0, true, nil)
 	if err2 != nil {
 		return err2
 	}

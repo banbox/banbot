@@ -1590,7 +1590,7 @@ func getSymbolData(c *fiber.Ctx) error {
 
 	// 查询K线数据
 	exs := orm.GetSymbolByID(args.ID)
-	data, err := sess.QueryOHLCV(exs, args.TimeFrame, args.StartMS, args.EndMS, args.Limit, false)
+	data, err := sess.QuerySeries(exs, args.TimeFrame, args.StartMS, args.EndMS, args.Limit, false)
 	if err != nil {
 		return err
 	}
