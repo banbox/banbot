@@ -107,6 +107,12 @@ func (s *compactState) getTableLock(table string) *sync.RWMutex {
 // MaybeCompact should be called after logical-delete writes.
 // It probabilistically triggers a compact check, guarded by per-table cooldown.
 func MaybeCompact(tableName string) {
+	// QuestDB compaction replaces a live WAL table via DROP/RENAME. Regular writers
+	// do not share the compaction lock, so that sequence can corrupt an active WAL.
+	// Keep logical deletes, but defer physical reclamation until it has a safe path.
+	if IsQuestDB {
+		return
+	}
 	if testing.Testing() {
 		return
 	}
