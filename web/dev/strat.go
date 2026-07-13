@@ -79,15 +79,12 @@ func makeNewStrat(folder, name string) error {
 import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/strat"
-	ta "github.com/banbox/banta"
 )
 
 func %s(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	return &strat.TradeStrat{
 		WarmupNum:   100,
 		OnBar: func(s *strat.StratJob) {
-			e := s.Env
-			
 		},
 	}
 }

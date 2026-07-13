@@ -49,6 +49,9 @@ func (s *KLineSeriesStore) Ensure(ctx context.Context) *errs.Error {
 	binding := resolveKLineSeriesBinding(s.info())
 	for _, field := range binding.Fields {
 		if _, err_ := q.db.Exec(ctx, buildKLineSeriesAddColumnSQL(binding.Table, field)); err_ != nil {
+			if shouldIgnoreKLineSeriesAddColumnError(err_) {
+				continue
+			}
 			return NewDbErr(core.ErrDbExecFail, err_)
 		}
 	}
@@ -346,6 +349,10 @@ func buildKLineSeriesAddColumnSQL(table string, field SeriesField) string {
 		quoteIdent(field.Name),
 		seriesSQLType(field.Type),
 	)
+}
+
+func shouldIgnoreKLineSeriesAddColumnError(err error) bool {
+	return IsQuestDB && isQuestDuplicateColumnErr(err)
 }
 
 func buildKLineSeriesUpdateSQL(binding SeriesBinding) string {

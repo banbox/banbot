@@ -7,14 +7,19 @@ import (
 
 // TestMailSender_SendMailWithAttachment 测试发送带附件的邮件
 func TestMailSender_SendMailWithAttachment(t *testing.T) {
-	// 创建 MailSender 实例
+	if os.Getenv("BANBOT_TEST_SMTP") != "1" {
+		t.Skip("set BANBOT_TEST_SMTP=1 to run the external SMTP integration test")
+	}
+
 	from := os.Getenv("SMTP_FROM")
 	password := os.Getenv("SMTP_PASSWORD")
 	host := os.Getenv("SMTP_HOST")
+	to := os.Getenv("SMTP_TO")
+	if from == "" || password == "" || host == "" || to == "" {
+		t.Fatal("SMTP_FROM, SMTP_PASSWORD, SMTP_HOST, and SMTP_TO are required")
+	}
 	sender := NewMailSender(host, 465, from, password)
 
-	// 准备测试数据
-	to := []string{"phiilo@163.com"}
 	subject := "Test Email with Attachment"
 	body := "This is a test email with attachment."
 
@@ -27,7 +32,7 @@ func TestMailSender_SendMailWithAttachment(t *testing.T) {
 		},
 	}
 
-	err := sender.SendMail(from, to, subject, body, attachments, false)
+	err := sender.SendMail(from, []string{to}, subject, body, attachments, false)
 	if err != nil {
 		t.Fatal(err)
 	}

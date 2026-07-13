@@ -93,6 +93,11 @@ func TestSeriesToKLinesMatchesOHLCVProjection(t *testing.T) {
 			t.Fatalf("row %d mismatch: got=%+v want=%+v", i, got[i], view.Bar())
 		}
 	}
+	originalSecondOpen := got[1].Open
+	got[0].Open = 99
+	if got[1].Open != originalSecondOpen {
+		t.Fatal("projected klines must have independent storage")
+	}
 }
 
 func TestSeriesToKLinesRejectsInvalidRows(t *testing.T) {
@@ -119,6 +124,29 @@ func TestSeriesToKLinesRejectsInvalidRows(t *testing.T) {
 				t.Fatal("expected projection error")
 			}
 		})
+	}
+}
+
+func TestSeriesToKLinesPreservesNumericConversions(t *testing.T) {
+	exs := &ExSymbol{ID: 42, Symbol: "BTC/USDT"}
+	rows := []*DataSeries{{
+		Sid: 42, ExSymbol: exs, TimeMS: 1_700_000_040_000,
+		Values: map[string]any{
+			"open": 1, "high": float32(2.5), "low": "0.5", "close": uint16(2),
+			"volume": int64(10), "quote": "15.5", "buy_volume": uint8(6), "trade_num": float64(8),
+		},
+	}}
+
+	got, err := SeriesToKLines(rows, exs)
+	if err != nil {
+		t.Fatalf("SeriesToKLines returned error: %v", err)
+	}
+	want := &banexg.Kline{
+		Time: 1_700_000_040_000, Open: 1, High: 2.5, Low: 0.5, Close: 2,
+		Volume: 10, Quote: 15.5, BuyVolume: 6, TradeNum: 8,
+	}
+	if !reflect.DeepEqual(got[0], want) {
+		t.Fatalf("unexpected numeric conversion: got=%+v want=%+v", got[0], want)
 	}
 }
 

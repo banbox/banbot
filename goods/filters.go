@@ -352,7 +352,7 @@ func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *e
 			skips = append(skips, pair)
 			continue
 		}
-		_, rows, err := orm.GetOHLCV(exs, f.Timeframe, 0, timeMS, f.BackNum, false)
+		_, rows, err := orm.GetSeries(exs, f.Timeframe, 0, timeMS, f.BackNum, false)
 		if err != nil || len(rows)*2 < f.BackNum {
 			skips = append(skips, pair)
 			continue

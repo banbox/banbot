@@ -1,10 +1,10 @@
 package data
 
 import (
+	"container/heap"
 	"fmt"
 	"maps"
 	"math"
-	"sort"
 
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/strat"
@@ -166,12 +166,13 @@ func (p *Provider[IDataFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPr
 
 type HistProvider struct {
 	Provider[IHistDataFeeder]
-	getEnd     FnGetInt64
-	maxTfSecs  int
-	pBar       *utils.StagedPrg
-	series     map[string]*HistSeriesFeeder
-	seriesCB   FnDataSeries
-	seriesRepo orm.SeriesRepo
+	getEnd        FnGetInt64
+	maxTfSecs     int
+	pBar          *utils.StagedPrg
+	allowDownload bool
+	series        map[string]*HistSeriesFeeder
+	seriesCB      FnDataSeries
+	seriesRepo    orm.SeriesRepo
 
 	wsLoader *WsDataLoader
 	trades   map[string]*TradeFeeder
@@ -197,14 +198,19 @@ func NewHistProvider(callBack FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64
 			dirtyVers: make(chan int, 5),
 			showLog:   showLog,
 		},
-		getEnd:   getEnd,
-		pBar:     pBar,
-		trades:   make(map[string]*TradeFeeder),
-		series:   make(map[string]*HistSeriesFeeder),
-		seriesCB: callBack,
+		getEnd:        getEnd,
+		pBar:          pBar,
+		allowDownload: true,
+		trades:        make(map[string]*TradeFeeder),
+		series:        make(map[string]*HistSeriesFeeder),
+		seriesCB:      callBack,
 	}
 
 	return p
+}
+
+func (p *HistProvider) SetAllowDownload(allow bool) {
+	p.allowDownload = allow
 }
 
 func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
@@ -287,6 +293,9 @@ func drainHistSeriesFeeder(feeder *HistSeriesFeeder) *errs.Error {
 }
 
 func (p *HistProvider) downIfNeed() *errs.Error {
+	if !p.allowDownload {
+		return nil
+	}
 	exchange := exg.Default
 	if !exchange.HasApi(banexg.ApiFetchOHLCV, core.Market) {
 		return nil
@@ -481,10 +490,10 @@ versions: When an integer greater than the previous value is received, makeFeede
 pBar: optional, used to display a progress bar
 */
 func RunHistFeeders(makeFeeders func() []IHistFeeder, versions chan int, pBar *utils.PrgBar) *errs.Error {
-	var hold IHistFeeder
 	var lastBarMs int64
 	var oldVer int
-	var holds []IHistFeeder
+	var holds histFeederHeap
+	var nextOrder uint64
 	var firstInit = true
 	for {
 		var ver = 0
@@ -497,20 +506,26 @@ func RunHistFeeders(makeFeeders func() []IHistFeeder, versions chan int, pBar *u
 			ver = 0
 		}
 		if ver > oldVer || firstInit {
-			holds = makeFeeders()
-			holds = SortFeeders(holds, nil, false)
+			feeders := makeFeeders()
+			holds = make(histFeederHeap, len(feeders))
+			for i, feeder := range feeders {
+				holds[i] = histFeederHeapItem{feeder: feeder, order: nextOrder}
+				nextOrder++
+			}
+			heap.Init(&holds)
 			oldVer = max(oldVer, ver)
 			firstInit = false
-		} else {
-			holds = SortFeeders(holds, hold, true)
 		}
-		hold = holds[0]
+		if holds.Len() == 0 {
+			break
+		}
+		item := heap.Pop(&holds).(histFeederHeapItem)
+		hold := item.feeder
 		batch := hold.GetBatch()
 		if batch == nil {
 			break
 		}
 		hold.CallNext()
-		holds = holds[1:]
 		batchTime := batch.TimeMS()
 		if batchTime > lastBarMs {
 			// 更新进度条
@@ -533,36 +548,54 @@ func RunHistFeeders(makeFeeders func() []IHistFeeder, versions chan int, pBar *u
 		if err != nil {
 			return err
 		}
+		item.order = nextOrder
+		nextOrder++
+		heap.Push(&holds, item)
 	}
 	return nil
 }
 
-func SortFeeders(holds []IHistFeeder, hold IHistFeeder, insert bool) []IHistFeeder {
-	if insert {
-		// 插入排序，说明holds已有序，二分查找位置，最快排序
-		vb := hold.getNextMS()
-		bSymbol := hold.getSymbol()
-		index := sort.Search(len(holds), func(i int) bool {
-			va := holds[i].getNextMS()
-			if va != vb || va == math.MaxInt64 || vb == math.MaxInt64 {
-				return va > vb
-			}
-			return holds[i].getSymbol() > bSymbol
-		})
-		holds = append(holds, hold)
-		copy(holds[index+1:], holds[index:])
-		holds[index] = hold
-		return holds
+type histFeederHeapItem struct {
+	feeder IHistFeeder
+	order  uint64
+}
+
+type histFeederHeap []histFeederHeapItem
+
+func (h histFeederHeap) Len() int {
+	return len(h)
+}
+
+func (h histFeederHeap) Less(i, j int) bool {
+	a, b := h[i], h[j]
+	aMS, bMS := a.feeder.getNextMS(), b.feeder.getNextMS()
+	if aMS != bMS {
+		return aMS < bMS
 	}
-	sort.Slice(holds, func(i, j int) bool {
-		a, b := holds[i], holds[j]
-		va, vb := a.getNextMS(), b.getNextMS()
-		if va != vb || va == math.MaxInt64 || vb == math.MaxInt64 {
-			return va < vb
+	if aMS != math.MaxInt64 {
+		aSymbol, bSymbol := a.feeder.getSymbol(), b.feeder.getSymbol()
+		if aSymbol != bSymbol {
+			return aSymbol < bSymbol
 		}
-		return a.getSymbol() < b.getSymbol()
-	})
-	return holds
+	}
+	return a.order < b.order
+}
+
+func (h histFeederHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *histFeederHeap) Push(value any) {
+	*h = append(*h, value.(histFeederHeapItem))
+}
+
+func (h *histFeederHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	item := old[last]
+	old[last] = histFeederHeapItem{}
+	*h = old[:last]
+	return item
 }
 
 type LiveProvider struct {

@@ -960,7 +960,7 @@ func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[stri
 		}
 		tfMSecs := int64(minTfSecs * 1000)
 		exs := orm.GetExSymbol2(core.ExgName, core.Market, pair)
-		_, rows, err := orm.GetOHLCV(exs, minTF, startMS, endMS, 1, false)
+		_, rows, err := orm.GetSeries(exs, minTF, startMS, endMS, 1, false)
 		if err != nil {
 			return nil, err
 		}
@@ -972,7 +972,7 @@ func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[stri
 			return nil, errs.New(core.ErrInvalidBars, err_)
 		}
 		openMS := rows[0].TimeMS
-		_, rows, err = orm.GetOHLCV(exs, minTF, 0, endMS, 1, false)
+		_, rows, err = orm.GetSeries(exs, minTF, 0, endMS, 1, false)
 		if err != nil {
 			return nil, err
 		}

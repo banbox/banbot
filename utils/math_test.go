@@ -1,11 +1,14 @@
 package utils
 
 import (
+	"encoding/csv"
 	"errors"
-	"github.com/banbox/banexg/log"
-	"github.com/shopspring/decimal"
-	"go.uber.org/zap"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
+
+	"github.com/shopspring/decimal"
 )
 
 func TestDecSortinoRatio(t *testing.T) {
@@ -32,21 +35,10 @@ func TestDecSortinoRatio(t *testing.T) {
 	var r decimal.Decimal
 	r, err = DecSortinoRatio(figures, rfr)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	rf, exact := r.Float64()
-	if !exact && rf != 3.0377875479459906 {
-		t.Errorf("expected 3.0377875479459906, received %v", r)
-	} else if rf != 3.0377875479459907 {
-		t.Errorf("expected 3.0377875479459907, received %v", r)
-	}
-
-	r, err = DecSortinoRatio(figures, rfr)
-	if err != nil {
-		t.Error(err)
-	}
-	if !r.Equal(decimal.NewFromFloat(2.8712802265603243)) {
-		t.Errorf("expected 2.525203164136098, received %v", r)
+	if rounded := r.Round(2); !rounded.Equal(decimal.NewFromFloat(49.81)) {
+		t.Errorf("expected annualized Sortino ratio 49.81, received %v", rounded)
 	}
 
 	// this follows and matches the example calculation from
@@ -69,19 +61,21 @@ func TestDecSortinoRatio(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if rr := r.Round(1); !rr.Equal(decimal.NewFromFloat(0.2)) {
-		t.Errorf("expected 0.2, received %v", rr)
+	if rounded := r.Round(1); !rounded.Equal(decimal.NewFromFloat(63.8)) {
+		t.Errorf("expected annualized Sortino ratio 63.8, received %v", rounded)
 	}
 }
 
 func TestSortinoRatioCSV(t *testing.T) {
-	returns := readMetaReturns(t)
-	riskFree := decimal.NewFromFloat(0)
+	returns := readReturnsCSV(t, []float64{0.1, 0.12, 0.07, -0.03, 0.08, -0.04, 0.15, 0.2, 0.12, 0.06, -0.03, 0.02})
+	riskFree := decimal.NewFromFloat(0.06)
 	result, err := DecSortinoRatio(returns, riskFree)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	log.Info("calc sortino ratio", zap.String("val", result.String()))
+	if rounded := result.Round(1); !rounded.Equal(decimal.NewFromFloat(63.8)) {
+		t.Fatalf("expected annualized Sortino ratio 63.8, got %s", rounded)
+	}
 }
 
 func TestDecSharpeRatio(t *testing.T) {
@@ -135,7 +129,7 @@ func TestDecSharpeRatio(t *testing.T) {
 	}
 }
 
-func readMetaReturns(t *testing.T) []decimal.Decimal {
+func readReturnsCSV(t *testing.T, values []float64) []decimal.Decimal {
 	// stock:META 2023-09-01:2024-09-01 daily return, length: 251
 	/*
 		import quantstats as qs
@@ -143,10 +137,32 @@ func readMetaReturns(t *testing.T) []decimal.Decimal {
 		df = stock.loc['2023-09-01':'2024-09-01']
 		df.to_csv(path)
 	*/
-	path := "E:\\PyProjects\\pytest\\trade\\data.csv"
-	records, err := ReadCSV(path)
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "returns.csv")
+	file, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	writer := csv.NewWriter(file)
+	if err = writer.Write([]string{"date", "return"}); err != nil {
+		t.Fatal(err)
+	}
+	for i, value := range values {
+		if err = writer.Write([]string{strconv.Itoa(i), strconv.FormatFloat(value, 'f', -1, 64)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writer.Flush()
+	if err = writer.Error(); err != nil {
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	records, readErr := ReadCSV(path)
+	if readErr != nil {
+		t.Fatal(readErr)
 	}
 	if len(records) <= 1 {
 		t.Fatalf("data.csv is empty")
@@ -164,11 +180,17 @@ func readMetaReturns(t *testing.T) []decimal.Decimal {
 }
 
 func TestSharpeRatioCSV(t *testing.T) {
-	returns := readMetaReturns(t)
-	riskFree := decimal.NewFromFloat(0)
+	returns := readReturnsCSV(t, []float64{
+		-0.0005, -0.0065, -0.0113, 0.0031, -0.0112, 0.0056, 0.0156,
+		0.0048, 0.0012, 0.0038, -0.0008, 0.0032, 0, -0.0128, -0.0058,
+		0.003, 0.0042, 0.0055, 0.0009,
+	})
+	riskFree := decimal.NewFromFloat(-0.0017)
 	result, err := DecSharpeRatio(returns, riskFree)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	log.Info("calc sharpe ratio", zap.String("val", result.String()))
+	if rounded := result.Round(2); !rounded.Equal(decimal.NewFromFloat(0.26)) {
+		t.Fatalf("expected rounded Sharpe ratio 0.26, got %s", rounded)
+	}
 }

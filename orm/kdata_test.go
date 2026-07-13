@@ -30,13 +30,9 @@ func TestAutoFetchOhlcv(t *testing.T) {
 	}
 	stop := btime.TimeMS()
 	start := int64(0)
-	_, rows, err := AutoFetchOHLCV(exchange, exs, "1m", start, stop, 1000, false, nil)
+	_, klines, err := AutoFetchOHLCV(exchange, exs, "1m", start, stop, 1000, false, nil)
 	if err != nil {
 		panic(err)
-	}
-	klines, projectErr := SeriesToKLines(rows, exs)
-	if projectErr != nil {
-		panic(projectErr)
 	}
 	for _, k := range klines {
 		fmt.Printf("%v %f %f %f %f %f\n", k.Time, k.Open, k.High, k.Low, k.Close, k.Volume)

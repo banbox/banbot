@@ -79,8 +79,14 @@ func runBackTest(outDir string, prgOut string) (string, *errs.Error) {
 			fmt.Printf("%s: %v\n", prgOut, rate)
 		})
 	}
-	b.Run()
-	return b.OutDir, nil
+	return executeBackTest(b.OutDir, b.Run)
+}
+
+func executeBackTest(outDir string, run func() *errs.Error) (string, *errs.Error) {
+	if err := run(); err != nil {
+		return "", err
+	}
+	return outDir, nil
 }
 
 func RunTrade(args *config.CmdArgs) *errs.Error {

@@ -295,6 +295,11 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 			return "", err
 		}
 	}
+	if os.Getenv(optDataPreparedEnv) != "1" {
+		if err = prepareOptimizeData(); err != nil {
+			return "", err
+		}
+	}
 	var logOuts []string
 	groups := config.RunPolicy
 	if len(groups) <= 1 || args.Concur <= 1 {
@@ -356,6 +361,7 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 				return errs.New(errs.CodeRunTime, err_)
 			}
 			cmd := exec.Command(excPath, curCmds...)
+			cmd.Env = append(os.Environ(), optDataPreparedEnv+"=1")
 			cmd.Stdout = &out
 			cmd.Stderr = &out
 			err_ = cmd.Run()
@@ -370,6 +376,20 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 		}
 	}
 	return collectOptLog(logOuts, minScore, args.Picker, args.PairPicker)
+}
+
+const optDataPreparedEnv = "BANBOT_OPT_DATA_PREPARED"
+
+func prepareOptimizeData() *errs.Error {
+	core.BotRunning = true
+	biz.ResetVars()
+	bt, err := NewBackTest(true, "")
+	if err != nil {
+		return err
+	}
+	bt.dp.SetAllowDownload(true)
+	bt.dataPrep = true
+	return bt.Run()
 }
 
 func sortOptLogs(path string) {

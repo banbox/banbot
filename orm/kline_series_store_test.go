@@ -2,6 +2,7 @@ package orm
 
 import (
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -10,6 +11,24 @@ func TestKLineSeriesStoreRejectsReservedColumns(t *testing.T) {
 	info := NewKLineSeriesInfo("custom_metric", "1h", []SeriesField{{Name: "open", Type: "float"}})
 	if err := validateKLineSeriesInfo(info); err == nil || !strings.Contains(err.Short(), "conflicts with an existing table column") {
 		t.Fatalf("expected reserved column error, got %v", err)
+	}
+}
+
+func TestKLineSeriesStoreIgnoresQuestDBDuplicateColumn(t *testing.T) {
+	oldQuest := IsQuestDB
+	t.Cleanup(func() { IsQuestDB = oldQuest })
+
+	duplicate := errors.New("duplicate column [name=open_interest]")
+	IsQuestDB = true
+	if !shouldIgnoreKLineSeriesAddColumnError(duplicate) {
+		t.Fatal("expected QuestDB duplicate column error to be ignored")
+	}
+	if shouldIgnoreKLineSeriesAddColumnError(errors.New("permission denied")) {
+		t.Fatal("expected unrelated QuestDB error to be returned")
+	}
+	IsQuestDB = false
+	if shouldIgnoreKLineSeriesAddColumnError(duplicate) {
+		t.Fatal("expected PostgreSQL duplicate column error to be returned")
 	}
 }
 

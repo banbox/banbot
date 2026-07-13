@@ -2,10 +2,9 @@ package utils
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
-
-	"github.com/banbox/banexg/log"
-	"go.uber.org/zap"
 )
 
 func TestGcdInts(t *testing.T) {
@@ -20,20 +19,44 @@ func TestGcdInts(t *testing.T) {
 	for _, c := range items {
 		res := GcdInts(c.Nums)
 		if res != c.Res {
-			t.Error(fmt.Sprintf("fail %v, exp: %d, res: %d", c.Nums, c.Res, res))
+			t.Errorf("fail %v, exp: %d, res: %d", c.Nums, c.Res, res)
 		}
 	}
 }
 
 func TestCopyDir(t *testing.T) {
-	name := "demo"
-	stagyDir := "E:\\trade\\go\\banstrat"
-	outDir := "E:\\trade\\go\\bandata\\backtest\\task_-1"
-	srcDir := fmt.Sprintf("%s/%s", stagyDir, name)
-	tgtDir := fmt.Sprintf("%s/strat_%s", outDir, name)
-	err_ := CopyDir(srcDir, tgtDir)
-	if err_ != nil {
-		log.Error("backup strat fail", zap.String("name", name), zap.Error(err_))
+	root := t.TempDir()
+	srcDir := filepath.Join(root, "source")
+	tgtDir := filepath.Join(root, "target")
+	nestedDir := filepath.Join(srcDir, "nested")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixtures := map[string]string{
+		filepath.Join(srcDir, "strategy.go"):   "package main\n",
+		filepath.Join(nestedDir, "config.yml"): "enabled: true\n",
+	}
+	for path, content := range fixtures {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := CopyDir(srcDir, tgtDir); err != nil {
+		t.Fatal(err)
+	}
+	for srcPath, want := range fixtures {
+		relPath, err := filepath.Rel(srcDir, srcPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(filepath.Join(tgtDir, relPath))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("copied %s = %q, want %q", relPath, got, want)
+		}
 	}
 }
 

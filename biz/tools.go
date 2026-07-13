@@ -312,7 +312,7 @@ func AggBigKlines(args *config.CmdArgs) *errs.Error {
 		pBar.Add(1)
 		curStartMS, curEndMS := startMS, firstEndMS
 		for curStartMS < endMS {
-			rows, err := sess.QueryOHLCV(exs, minTF, curStartMS, curEndMS, 0, false)
+			rows, err := sess.QuerySeries(exs, minTF, curStartMS, curEndMS, 0, false)
 			if err != nil {
 				return err
 			}
@@ -461,13 +461,9 @@ func ExportKlines(args *config.CmdArgs, prg utils.PrgCB) *errs.Error {
 			continue
 		}
 		for _, tf := range args.TimeFrames {
-			adjs, rows, err := sess.GetOHLCV(exs, tf, start, stop, 0, false)
+			adjs, klines, err := sess.GetOHLCV(exs, tf, start, stop, 0, false)
 			if err != nil {
 				return err
-			}
-			klines, projectErr := orm.SeriesToKLines(rows, exs)
-			if projectErr != nil {
-				return errs.New(core.ErrInvalidBars, projectErr)
 			}
 			klines = orm.ApplyAdj(adjs, klines, adjVal, 0, 0)
 			csvRows := utils.KlineToStr(klines, btime.LocShow)
@@ -692,7 +688,7 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 		dataArr := make([][]float64, 0, len(exsList))
 		var lacks []string
 		for i, exs := range exsList {
-			_, rows, err := orm.GetOHLCV(exs, tf, startMs, startMs+gapTFMSecs, klineNum, false)
+			_, rows, err := orm.GetSeries(exs, tf, startMs, startMs+gapTFMSecs, klineNum, false)
 			if err != nil {
 				log.Warn("get kline fail, skip", zap.String("code", exs.Symbol), zap.Error(err))
 				continue
@@ -1212,16 +1208,12 @@ func TestKLineConsistency(args []string) error {
 			if err2 != nil {
 				return err2
 			}
-			_, rows, err2 := orm.AutoFetchOHLCV(exchange, exs, tf, startMS, endMS, 0, false, nil)
+			_, localBars, err2 := orm.AutoFetchOHLCV(exchange, exs, tf, startMS, endMS, 0, false, nil)
 			if err2 != nil {
 				return err2
 			}
 			ida := 0
 			ka := arr[0]
-			localBars, projectErr := orm.SeriesToKLines(rows, exs)
-			if projectErr != nil {
-				return errs.New(core.ErrInvalidBars, projectErr)
-			}
 			for _, view := range localBars {
 				if view.Time < ka.Time {
 					continue

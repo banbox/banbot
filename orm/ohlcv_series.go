@@ -29,13 +29,15 @@ func KLinesToSeries(exs *ExSymbol, tf string, bars []*banexg.Kline, adj *AdjInfo
 // SeriesToKLines projects OHLCV-shaped series into the legacy Kline boundary.
 // It fails on the first invalid row and does not silently drop data.
 func SeriesToKLines(rows []*DataSeries, exs *ExSymbol) ([]*banexg.Kline, error) {
-	klines := make([]*banexg.Kline, 0, len(rows))
-	for _, row := range rows {
+	klines := make([]*banexg.Kline, len(rows))
+	values := make([]banexg.Kline, len(rows))
+	for i, row := range rows {
 		_, fields, err := row.resolveOHLCV(exs)
 		if err != nil {
 			return nil, err
 		}
-		klines = append(klines, fields.kline(row.TimeMS))
+		values[i] = fields.klineValue(row.TimeMS)
+		klines[i] = &values[i]
 	}
 	return klines, nil
 }

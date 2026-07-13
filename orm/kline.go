@@ -45,8 +45,19 @@ func init() {
 	}
 }
 
-func (q *Queries) QueryOHLCV(exs *ExSymbol, timeframe string, startMs, endMs int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error) {
-	return q.QuerySeries(exs, timeframe, startMs, endMs, limit, withUnFinish)
+// QueryOHLCV queries K-lines using the legacy banexg.Kline representation.
+//
+// Deprecated: use QuerySeries, which returns DataSeries values, instead.
+func (q *Queries) QueryOHLCV(exs *ExSymbol, timeframe string, startMs, endMs int64, limit int, withUnFinish bool) ([]*banexg.Kline, *errs.Error) {
+	rows, err := q.QuerySeries(exs, timeframe, startMs, endMs, limit, withUnFinish)
+	if err != nil {
+		return nil, err
+	}
+	klines, projectErr := SeriesToKLines(rows, exs)
+	if projectErr != nil {
+		return nil, errs.New(core.ErrInvalidBars, projectErr)
+	}
+	return klines, nil
 }
 
 type KlineSid struct {
@@ -54,8 +65,26 @@ type KlineSid struct {
 	Sid int32
 }
 
-func (q *Queries) QueryOHLCVBatch(exsMap map[int32]*ExSymbol, timeframe string, startMs, endMs int64, limit int, handle func(int32, []*DataSeries)) *errs.Error {
-	return q.QuerySeriesBatch(exsMap, timeframe, startMs, endMs, limit, handle)
+// QueryOHLCVBatch queries K-lines in batches using the legacy banexg.Kline representation.
+//
+// Deprecated: use QuerySeriesBatch, which returns DataSeries values, instead.
+func (q *Queries) QueryOHLCVBatch(exsMap map[int32]*ExSymbol, timeframe string, startMs, endMs int64, limit int, handle func(int32, []*banexg.Kline)) *errs.Error {
+	var projectErr *errs.Error
+	err := q.QuerySeriesBatch(exsMap, timeframe, startMs, endMs, limit, func(sid int32, rows []*DataSeries) {
+		if projectErr != nil {
+			return
+		}
+		klines, err := SeriesToKLines(rows, exsMap[sid])
+		if err != nil {
+			projectErr = errs.New(core.ErrInvalidBars, err)
+			return
+		}
+		handle(sid, klines)
+	})
+	if err != nil {
+		return err
+	}
+	return projectErr
 }
 
 func (q *Queries) getKLineTimes(sid int32, timeframe string, startMs, endMs int64) ([]int64, *errs.Error) {
@@ -1508,13 +1537,9 @@ func calcCnFutureFactors(sess *Queries, args *config.CmdArgs) *errs.Error {
 			lastCode = parts[0].Val
 			lastExs = exs
 		}
-		rows, err := sess.QueryOHLCV(exs, "1d", 0, 0, 0, false)
+		bars, err := sess.QueryOHLCV(exs, "1d", 0, 0, 0, false)
 		if err != nil {
 			return err
-		}
-		bars, projectErr := SeriesToKLines(rows, exs)
-		if projectErr != nil {
-			return errs.New(core.ErrInvalidBars, projectErr)
 		}
 		for _, bar := range bars {
 			barTime := utils2.AlignTfMSecs(bar.Time, dayMSecs)

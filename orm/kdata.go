@@ -439,28 +439,58 @@ AutoFetchOHLCV
 	Try to read from local first, download from the exchange if it doesn't exist, and then return.
 	获取给定交易对，给定时间维度，给定范围的K线数据。
 	先尝试从本地读取，不存在时从交易所下载，然后返回。
+
+Deprecated: use AutoFetchSeries, which returns DataSeries values, instead.
 */
 func AutoFetchOHLCV(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
-	limit int, withUnFinish bool, pBar *utils.PrgBar) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-	return AutoFetchSeries(exchange, exs, timeFrame, startMS, endMS, limit, withUnFinish, pBar)
+	limit int, withUnFinish bool, pBar *utils.PrgBar) ([]*AdjInfo, []*banexg.Kline, *errs.Error) {
+	adjs, rows, err := AutoFetchSeries(exchange, exs, timeFrame, startMS, endMS, limit, withUnFinish, pBar)
+	if err != nil {
+		return nil, nil, err
+	}
+	klines, projectErr := SeriesToKLines(rows, exs)
+	if projectErr != nil {
+		return nil, nil, errs.New(core.ErrInvalidBars, projectErr)
+	}
+	return adjs, klines, nil
 }
 
 /*
 GetOHLCV
 Get the variety K-line, if you need to rebalance, it will be automatically reweighted
 获取品种K线，如需复权自动前复权
+
+Deprecated: use GetSeries, which returns DataSeries values, instead.
 */
-func GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-	return GetSeries(exs, timeFrame, startMS, endMS, limit, withUnFinish)
+func GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*banexg.Kline, *errs.Error) {
+	adjs, rows, err := GetSeries(exs, timeFrame, startMS, endMS, limit, withUnFinish)
+	if err != nil {
+		return nil, nil, err
+	}
+	klines, projectErr := SeriesToKLines(rows, exs)
+	if projectErr != nil {
+		return nil, nil, errs.New(core.ErrInvalidBars, projectErr)
+	}
+	return adjs, klines, nil
 }
 
 /*
 GetOHLCV
 Obtain the variety K-line, return the unweighted K-line and the weighting factor, and the caller can call ApplyAdj to re-weight
 获取品种K线，返回未复权K线和复权因子，调用方可调用ApplyAdj进行复权
+
+Deprecated: use (*Queries).GetSeries, which returns DataSeries values, instead.
 */
-func (q *Queries) GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-	return q.GetSeries(exs, timeFrame, startMS, endMS, limit, withUnFinish)
+func (q *Queries) GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*banexg.Kline, *errs.Error) {
+	adjs, rows, err := q.GetSeries(exs, timeFrame, startMS, endMS, limit, withUnFinish)
+	if err != nil {
+		return nil, nil, err
+	}
+	klines, projectErr := SeriesToKLines(rows, exs)
+	if projectErr != nil {
+		return nil, nil, errs.New(core.ErrInvalidBars, projectErr)
+	}
+	return adjs, klines, nil
 }
 
 func GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
@@ -509,6 +539,8 @@ func GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
 GetAdjOHLCV
 Obtain K-line and weighted information (returns K-line that has not been weighted yet, needs to call ApplyAdj for weighted)
 获取K线和复权信息（返回的是尚未复权的K线，需调用ApplyAdj复权）
+
+Deprecated: use GetAdjSeries, which returns DataSeries values, instead.
 */
 func (q *Queries) GetAdjOHLCV(adjs []*AdjInfo, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*banexg.Kline, *errs.Error) {
 	if len(adjs) == 0 {
@@ -765,14 +797,9 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 			}
 		}
 		if len(rawMap) > 0 {
-			bulkHandler := func(sid int32, rows []*DataSeries) {
+			bulkHandler := func(sid int32, klines []*banexg.Kline) {
 				exs, ok := exsMap[sid]
 				if !ok {
-					return
-				}
-				klines, projectErr := SeriesToKLines(rows, exs)
-				if projectErr != nil {
-					log.Warn("convert series to kline fail", zap.String("symbol", exs.Symbol), zap.Error(projectErr))
 					return
 				}
 				handler(exs.Symbol, timeFrame, klines, nil)
@@ -788,15 +815,11 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 	// 单个数量过多，逐个查询
 	for _, sid := range leftArr {
 		exs := exsMap[sid]
-		adjs, rows, err := sess.GetOHLCV(exs, timeFrame, startMS, endMS, limit, false)
+		adjs, klines, err := sess.GetOHLCV(exs, timeFrame, startMS, endMS, limit, false)
 		if err != nil {
 			return err
 		}
-		kline, projectErr := SeriesToKLines(rows, exs)
-		if projectErr != nil {
-			return errs.New(core.ErrInvalidBars, projectErr)
-		}
-		handler(exs.Symbol, timeFrame, kline, adjs)
+		handler(exs.Symbol, timeFrame, klines, adjs)
 	}
 	return nil
 }

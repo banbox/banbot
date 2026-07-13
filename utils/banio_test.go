@@ -10,6 +10,7 @@ import (
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
 	"math/big"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 )
 
 func TestBanServer(t *testing.T) {
+	requireManualBanIOTest(t)
 	core.SetRunMode(core.RunModeLive)
 	server := NewBanServer("127.0.0.1:6789", "")
 	go func() {
@@ -40,6 +42,7 @@ func TestBanServer(t *testing.T) {
 }
 
 func TestBanClient(t *testing.T) {
+	requireManualBanIOTest(t)
 	core.SetRunMode(core.RunModeLive)
 	ctx, cancel := context.WithCancel(context.Background())
 	core.Ctx = ctx
@@ -83,6 +86,13 @@ func TestBanClient(t *testing.T) {
 		panic(err)
 	}
 	log.Info("lock val after del", zap.String("val", val))
+}
+
+func requireManualBanIOTest(t *testing.T) {
+	t.Helper()
+	if os.Getenv("BANBOT_RUN_MANUAL_BANIO_TESTS") != "1" {
+		t.Skip("set BANBOT_RUN_MANUAL_BANIO_TESTS=1 for the external server/client smoke test")
+	}
 }
 
 // 计算数据的MD5哈希值
@@ -291,8 +301,7 @@ func TestBanConnConcurrentLargeData(t *testing.T) {
 
 			log.Info("marked message as received", zap.String("msgID", msgID))
 		case <-time.After(30 * time.Second): // 增加超时时间
-			t.Errorf("timeout waiting for message %d", i+1)
-			break
+			t.Fatalf("timeout waiting for message %d", i+1)
 		}
 	}
 
@@ -311,8 +320,7 @@ func TestBanConnConcurrentLargeData(t *testing.T) {
 			ackSet[ackID] = true
 			log.Info("marked ack as received", zap.String("ackID", ackID))
 		case <-time.After(10 * time.Second):
-			t.Errorf("timeout waiting for ack %d", i+1)
-			break
+			t.Fatalf("timeout waiting for ack %d", i+1)
 		}
 	}
 
