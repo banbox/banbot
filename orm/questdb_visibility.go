@@ -159,12 +159,23 @@ func questKlineCoverageVisible(ctx context.Context, q *Queries, sid int32, timef
 	return len(missing) == 0, nil
 }
 
-func waitForQuestKlineCoverageVisible(ctx context.Context, q *Queries, sid int32, timeframe string, startMS, endMS int64) *errs.Error {
+// pollQuestKlineCoverageVisible distinguishes a normal WAL visibility timeout from
+// a database read failure. Callers that already have a durable pending insert marker
+// can defer the former to recovery without treating it as a failed write.
+func pollQuestKlineCoverageVisible(ctx context.Context, q *Queries, sid int32, timeframe string, startMS, endMS int64) (bool, *errs.Error) {
 	ok, err := waitForQuestCondition(ctx, klineInsertQuestVisibilityGrace, questReadAfterWritePollInterval, func() (bool, error) {
 		return questKlineCoverageVisible(ctx, q, sid, timeframe, startMS, endMS)
 	})
 	if err != nil {
-		return NewDbErr(core.ErrDbReadFail, err)
+		return false, NewDbErr(core.ErrDbReadFail, err)
+	}
+	return ok, nil
+}
+
+func waitForQuestKlineCoverageVisible(ctx context.Context, q *Queries, sid int32, timeframe string, startMS, endMS int64) *errs.Error {
+	ok, err := pollQuestKlineCoverageVisible(ctx, q, sid, timeframe, startMS, endMS)
+	if err != nil {
+		return err
 	}
 	if !ok {
 		return errs.NewMsg(core.ErrDbReadFail,
@@ -174,7 +185,10 @@ func waitForQuestKlineCoverageVisible(ctx context.Context, q *Queries, sid int32
 	return nil
 }
 
-func waitForQuestKlineTimestampVisible(ctx context.Context, q *Queries, sid int32, timeframe string, timeMS int64) *errs.Error {
+// pollQuestKlineTimestampVisible distinguishes a normal WAL visibility timeout
+// from a database read failure. A successful INSERT is durable even while QuestDB
+// has not made the row queryable yet.
+func pollQuestKlineTimestampVisible(ctx context.Context, q *Queries, sid int32, timeframe string, timeMS int64) (bool, *errs.Error) {
 	tblName := "kline_" + timeframe
 	sqlText := fmt.Sprintf(`SELECT count(*) > 0 FROM %s
 	WHERE sid = $1 AND ts = cast($2 as timestamp)`, tblName)
@@ -186,7 +200,15 @@ func waitForQuestKlineTimestampVisible(ctx context.Context, q *Queries, sid int3
 		return visible, nil
 	})
 	if err != nil {
-		return NewDbErr(core.ErrDbReadFail, err)
+		return false, NewDbErr(core.ErrDbReadFail, err)
+	}
+	return ok, nil
+}
+
+func waitForQuestKlineTimestampVisible(ctx context.Context, q *Queries, sid int32, timeframe string, timeMS int64) *errs.Error {
+	ok, err := pollQuestKlineTimestampVisible(ctx, q, sid, timeframe, timeMS)
+	if err != nil {
+		return err
 	}
 	if !ok {
 		return errs.NewMsg(core.ErrDbReadFail,

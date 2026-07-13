@@ -384,10 +384,24 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	}
 
 	if saveNum > 0 {
+		klineVisible := true
 		if IsQuestDB {
-			if waitErr := waitForQuestKlineTimestampVisible(context.Background(), sess, exs.ID, timeFrame, realEnd); waitErr != nil {
+			var waitErr *errs.Error
+			klineVisible, waitErr = pollQuestKlineTimestampVisible(context.Background(), sess, exs.ID, timeFrame, realEnd)
+			if waitErr != nil {
 				clearInsJob = false
 				return saveNum, waitErr
+			}
+			if !klineVisible {
+				// The INSERT was accepted, but the WAL row is not queryable yet. Continue
+				// writing range metadata, retain the pending job, and let startup recovery
+				// verify it later instead of aborting the live process.
+				clearInsJob = false
+				log.Warn("questdb kline row not visible; defer insert recovery",
+					zap.Int32("sid", exs.ID),
+					zap.String("tf", timeFrame),
+					zap.Int64("start", realStart),
+					zap.Int64("end", realEnd+tfMSecs))
 			}
 		}
 		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, true, true)
@@ -400,10 +414,18 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 					zap.String("err", updErr.Short()))
 			}
 		}
-		if outErr == nil && IsQuestDB {
-			if waitErr := waitForQuestKlineCoverageVisible(context.Background(), sess, exs.ID, timeFrame, realStart, realEnd+tfMSecs); waitErr != nil {
+		if outErr == nil && IsQuestDB && klineVisible {
+			covered, waitErr := pollQuestKlineCoverageVisible(context.Background(), sess, exs.ID, timeFrame, realStart, realEnd+tfMSecs)
+			if waitErr != nil {
 				clearInsJob = false
 				outErr = waitErr
+			} else if !covered {
+				clearInsJob = false
+				log.Warn("questdb kline coverage not visible; defer insert recovery",
+					zap.Int32("sid", exs.ID),
+					zap.String("tf", timeFrame),
+					zap.Int64("start", realStart),
+					zap.Int64("end", realEnd+tfMSecs))
 			}
 		}
 	}
