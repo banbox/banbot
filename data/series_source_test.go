@@ -513,8 +513,8 @@ func TestCollectRuntimeDataSubsFiltersKlinesAndDeduplicates(t *testing.T) {
 
 func TestMergeDataSubUnionsFieldsWithoutMutatingInput(t *testing.T) {
 	exs := &orm.ExSymbol{ID: 7}
-	first := &strat.DataSub{Source: "macro", ExSymbol: exs, TimeFrame: "1d", WarmupNum: 2, Fields: []string{"close", "signal_a"}}
-	second := &strat.DataSub{Source: "macro", ExSymbol: exs, TimeFrame: "1d", WarmupNum: 5, Fields: []string{"volume", "signal_b", "close"}}
+	first := &strat.DataSub{Source: "macro", ExSymbol: exs, TimeFrame: "1d", WarmupNum: 2, Fields: []string{"close", "signal_a"}, SeriesFields: []string{"signal_a"}}
+	second := &strat.DataSub{Source: "macro", ExSymbol: exs, TimeFrame: "1d", WarmupNum: 5, Fields: []string{"volume", "signal_b", "close"}, SeriesFields: []string{"signal_b"}}
 	seen := make(map[string]*strat.DataSub)
 	mergeDataSub(seen, first)
 	mergeDataSub(seen, second)
@@ -523,8 +523,14 @@ func TestMergeDataSubUnionsFieldsWithoutMutatingInput(t *testing.T) {
 	if got == first || got.WarmupNum != 5 || !reflect.DeepEqual(got.Fields, want) {
 		t.Fatalf("unexpected merged subscription: %+v", got)
 	}
+	if !reflect.DeepEqual(got.SeriesFields, []string{"signal_a", "signal_b"}) {
+		t.Fatalf("unexpected merged series fields: %+v", got.SeriesFields)
+	}
 	if !reflect.DeepEqual(first.Fields, []string{"close", "signal_a"}) {
 		t.Fatalf("merge mutated input: %v", first.Fields)
+	}
+	if !reflect.DeepEqual(first.SeriesFields, []string{"signal_a"}) {
+		t.Fatalf("merge mutated input series fields: %v", first.SeriesFields)
 	}
 }
 

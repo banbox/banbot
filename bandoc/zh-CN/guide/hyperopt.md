@@ -5,7 +5,7 @@ bot optimize -out PATH [-opt-rounds 30] [-sampler bayes]
 您在策略中使用`pol.Def`定义好超参数及其范围后，您可以对其进行超参数调优。
 
 启动时您需要指定一个输出文件，超参数搜索结果将写入到此文件中，一般形如`opt1.log`。
-您可通过`-opt-rounds`指定调优的执行次数，以及`-sampler`指定采样优化器。调优时将固定使用`-nodb`参数。
+您可通过`-opt-rounds`指定调优的执行次数，以及`-sampler`指定采样优化器。
 
 如果您有多组策略需要优化（即run_policy配置了多个策略），默认情况下banbot将逐个搜索每个策略；如果您希望提高并发，可编译为可执行文件后，传入`-concur`参数控制并发数量（仅对多个策略时启用并发）。
 
@@ -19,8 +19,14 @@ Usage of optimize:
         Concurrent Number (default 1)
   -config value
         config path to use, Multiple -config options may be used
+  -config-data string
+        yaml config string
+  -cpu-profile
+        enable cpu profile
   -datadir string
         Path to data dir.
+  -dlock
+        enable dead-lock detect
   -each-pairs
         run for each pairs
   -level string
@@ -29,12 +35,12 @@ Usage of optimize:
         Log to the file specified
   -max-pool-size int
         max pool size for db
-  -no-compress
-        disable compress for hyper table
+  -mem-profile
+        enable memory profile
+  -net-off
+        disable network request
   -no-default
         ignore default: config.yml, config.local.yml
-  -nodb
-        dont save orders to database
   -opt-rounds int
         rounds num for single optimize job (default 30)
   -out string
@@ -46,6 +52,7 @@ Usage of optimize:
 ```
 
 完成超参数优化后，您打开输出文件可看到日志：
+
 ```text
 # run hyper optimize: bayes, rounds: 20
 # date range: 2021-01-01 00:00:00 - 2021-12-27 00:00:00
@@ -72,6 +79,7 @@ loss:  -81.46 	bigRate: 2.69, lenSml: 21.28, midRate: 3.71 	odNum: 258, profit: 
 ```
 
 ## 过拟合陷阱
+
 超参数优化不是魔法，它本质上是在一段时间的数据上测试策略的不同参数，找出收益较好的参数。
 
 我们都知道基于机器学习和神经网络的交易策略非常容易过拟合，即在训练数据上表现优异，但在测试数据上收益很差。
@@ -83,19 +91,20 @@ loss:  -81.46 	bigRate: 2.69, lenSml: 21.28, midRate: 3.71 	odNum: 258, profit: 
 为了避免过拟合，我们需要某种方式从搜索记录中得到在未来一段时间表现最好的参数，banbot提供了`-picker`参数实现这一目的。
 
 banbot内置的`picker`有：
-* score: 选择分数最高的(loss最低的)
-* good3: 筛选盈利的组按分数降序，取从前往后位置在30%的一组参数。
-* good0t3: 筛选盈利的组按分数降序，对前30%的所有组，取平均值得到一组参数。
-* goodAvg: 队所有盈利的组取平均值得到一组参数。
-* good1t4: 筛选盈利的组按分数降序，对前10%~40%的所有组，取平均值得到一组参数。
-* good4: 筛选盈利的组按分数降序，取从前往后位置在40%的一组参数。
-* good2: 筛选盈利的组按分数降序，取从前往后位置在20%的一组参数。
-* good5: 筛选盈利的组按分数降序，取从前往后位置在50%的一组参数。
-* good7: 筛选盈利的组按分数降序，取从前往后位置在70%的一组参数。
-* good2t5: 筛选盈利的组按分数降序，对前20%~50%的所有组，取平均值得到一组参数。
-* good3t7: 筛选盈利的组按分数降序，对前30%~70%的所有组，取平均值得到一组参数。
-* good0t7: 筛选盈利的组按分数降序，对前70%的所有组，取平均值得到一组参数。
-* good3t10: 筛选盈利的组按分数降序，对前30%之后的所有组，取平均值得到一组参数。
+
+- score: 选择分数最高的(loss最低的)
+- good3: 筛选盈利的组按分数降序，取从前往后位置在30%的一组参数。
+- good0t3: 筛选盈利的组按分数降序，对前30%的所有组，取平均值得到一组参数。
+- goodAvg: 队所有盈利的组取平均值得到一组参数。
+- good1t4: 筛选盈利的组按分数降序，对前10%~40%的所有组，取平均值得到一组参数。
+- good4: 筛选盈利的组按分数降序，取从前往后位置在40%的一组参数。
+- good2: 筛选盈利的组按分数降序，取从前往后位置在20%的一组参数。
+- good5: 筛选盈利的组按分数降序，取从前往后位置在50%的一组参数。
+- good7: 筛选盈利的组按分数降序，取从前往后位置在70%的一组参数。
+- good2t5: 筛选盈利的组按分数降序，对前20%~50%的所有组，取平均值得到一组参数。
+- good3t7: 筛选盈利的组按分数降序，对前30%~70%的所有组，取平均值得到一组参数。
+- good0t7: 筛选盈利的组按分数降序，对前70%的所有组，取平均值得到一组参数。
+- good3t10: 筛选盈利的组按分数降序，对前30%之后的所有组，取平均值得到一组参数。
 
 您可以使用`bot tool test_pickers`测试所有picker在未来回测时的分数。  
 

@@ -467,10 +467,12 @@ func mergeDataSub(seen map[string]*strat.DataSub, sub *strat.DataSub) {
 			existing.WarmupNum = sub.WarmupNum
 		}
 		existing.Fields = orm.MergeSeriesFields(existing.Fields, sub.Fields)
+		existing.SeriesFields = orm.MergeSeriesFields(existing.SeriesFields, sub.SeriesFields)
 		return
 	}
 	cp := *sub
 	cp.Fields = append([]string(nil), sub.Fields...)
+	cp.SeriesFields = append([]string(nil), sub.SeriesFields...)
 	seen[key] = &cp
 }
 

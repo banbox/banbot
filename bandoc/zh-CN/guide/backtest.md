@@ -50,7 +50,7 @@ go build -o bot
 ./bot backtest
 ```
 
-回测完成后，你可以在`BanDataDir`中的 `backtests` 目录下找到详细的报告。
+回测完成后，未指定 `-out` 时可在 `BanDataDir/backtest/<配置哈希>` 中找到详细报告；也可通过 `-out` 指定输出目录。
 
 ## 回测注意事项
 
@@ -87,4 +87,3 @@ run_policy:
 ### 滚动回测
 
 滚动回测（Rolling Backtesting）是一种更严谨的回测方法，它将数据分为多个时间窗口，在每个窗口上进行“训练”（参数优化）和“测试”，以模拟策略在不同市场环境下的适应性。详情请参阅 [滚动回测](./roll_btopt.md) 文档。
-

@@ -23,10 +23,10 @@ func TestOHLCVSeriesTriggersOnDataAndOnBar(t *testing.T) {
 			OnBar: func(s *strat.StratJob) {
 				barCalls++
 			},
-			OnData: func(s *strat.StratJob, evt *orm.DataSeries) {
+			OnData: func(s *strat.StratJob, data *strat.DataFields) {
 				dataCalls++
-				if evt.Values["signal"] != 2.5 {
-					t.Fatalf("OnData did not receive the full event: %+v", evt.Values)
+				if data.Float64("signal") != 2.5 {
+					t.Fatalf("OnData did not receive the processed field: %+v", data.Raw("signal"))
 				}
 			},
 		},
@@ -50,7 +50,8 @@ func TestOHLCVSeriesTriggersOnDataAndOnBar(t *testing.T) {
 	evt.Values["signal"] = 2.5
 
 	trader := &Trader{}
-	if err := trader.onAccountDataSeriesJob(nil, job, evt, false); err != nil {
+	fields := job.SetData(evt)
+	if err := trader.onAccountDataSeriesJob(nil, job, evt, fields, false); err != nil {
 		t.Fatalf("onAccountDataSeriesJob returned error: %v", err)
 	}
 	if dataCalls != 1 || barCalls != 1 {
@@ -71,7 +72,7 @@ func TestNonKlineOHLCVShapeTriggersOnlyOnData(t *testing.T) {
 	dataCalls := 0
 	job := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(_ *strat.StratJob, evt *orm.DataSeries) { dataCalls++ },
+			OnData: func(_ *strat.StratJob, data *strat.DataFields) { dataCalls++ },
 			OnBar:  func(_ *strat.StratJob) { t.Fatal("custom source must not enter OnBar") },
 		},
 		DataHub: strat.NewDataHub(),
@@ -112,7 +113,7 @@ func TestPrimaryAndSideSubscriptionDoesNotDuplicateOnData(t *testing.T) {
 	barCalls := 0
 	job := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(_ *strat.StratJob, _ *orm.DataSeries) { dataCalls++ },
+			OnData: func(_ *strat.StratJob, _ *strat.DataFields) { dataCalls++ },
 			OnBar:  func(_ *strat.StratJob) { barCalls++ },
 		},
 		Env: env, DataHub: strat.NewDataHub(), Symbol: exs, TimeFrame: "1m", Account: config.DefAcc,

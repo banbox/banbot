@@ -10,7 +10,7 @@
 如果希望本地安装启动，您可按照下面步骤快速在本地配置并运行banbot：
 
 ## Step 1. 本地安装
-您需要安装Golang开发环境，建议使用最新版本。banbot使用QuestDB存储K线等公开数据，启动时会自动下载安装，无需您手动配置。
+您需要安装Golang开发环境，建议使用最新版本。banbot 支持 QuestDB 和 TimescaleDB 存储 K 线及其他时序数据：使用 QuestDB 时，首次连接失败会自动下载安装；使用 TimescaleDB 时请先自行部署。详细配置请参阅[数据库](./database.md)。
 
 您也可以查看B站的[安装教程视频](https://www.bilibili.com/video/BV1QuLozqEzg/)
 

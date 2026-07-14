@@ -8,7 +8,6 @@ orm 包提供了数据库访问和数据模型定义的功能。
 价格调整因子结构体，用于处理前复权、后复权等价格调整。
 
 字段：
-- `ID int32` - 调整因子ID
 - `Sid int32` - 交易对ID
 - `SubID int32` - 子交易对ID
 - `StartMs int64` - 开始时间戳（毫秒）
@@ -18,8 +17,7 @@ orm 包提供了数据库访问和数据模型定义的功能。
 交易日历结构体，用于记录交易时间段。
 
 字段：
-- `ID int32` - 日历ID
-- `Name string` - 日历名称
+- `Market string` - 市场或日历名称
 - `StartMs int64` - 开始时间戳（毫秒）
 - `StopMs int64` - 结束时间戳（毫秒）
 
@@ -35,36 +33,28 @@ orm 包提供了数据库访问和数据模型定义的功能。
 - `Combined bool` - 是否为组合交易对
 - `ListMs int64` - 上市时间戳（毫秒）
 - `DelistMs int64` - 退市时间戳（毫秒）
+- `AggRules string` - 自定义字段聚合规则 JSON
 
 ### InsKline
 K线插入任务结构体，用于管理K线数据的插入操作。
 
 字段：
-- `ID int32` - 任务ID
 - `Sid int32` - 交易对ID
 - `Timeframe string` - 时间周期
+- `Ts time.Time` - 任务创建时间
 - `StartMs int64` - 开始时间戳（毫秒）
 - `StopMs int64` - 结束时间戳（毫秒）
 
-### KHole
-K线数据空洞结构体，用于记录K线数据缺失的时间段。
-
-字段：
-- `ID int64` - 空洞记录ID
-- `Sid int32` - 交易对ID
-- `Timeframe string` - 时间周期
-- `Start int64` - 开始时间戳（毫秒）
-- `Stop int64` - 结束时间戳（毫秒）
-- `NoData bool` - 是否确认无数据
-
-### KInfo
-K线信息结构体，用于记录K线数据的基本信息。
+### SRange
+时序数据覆盖范围结构体，用于记录 K 线和自定义序列的已覆盖或确认无数据区间。
 
 字段：
 - `Sid int32` - 交易对ID
+- `Table string` - 物理时序表名
 - `Timeframe string` - 时间周期
-- `Start int64` - 开始时间戳（毫秒）
-- `Stop int64` - 结束时间戳（毫秒）
+- `StartMs int64` - 开始时间戳（毫秒）
+- `StopMs int64` - 结束时间戳（毫秒）
+- `HasData bool` - 此区间是否包含有效数据
 
 ### KlineUn
 未复权K线数据结构体，包含原始K线数据。
@@ -73,19 +63,23 @@ K线信息结构体，用于记录K线数据的基本信息。
 - `Sid int32` - 交易对ID
 - `StartMs int64` - 开始时间戳（毫秒）
 - `StopMs int64` - 结束时间戳（毫秒）
+- `ExpireMs int64` - 未完成 K 线过期时间戳（毫秒）
 - `Timeframe string` - 时间周期
 - `Open float64` - 开盘价
 - `High float64` - 最高价
 - `Low float64` - 最低价
 - `Close float64` - 收盘价
 - `Volume float64` - 成交量
-- `Info float64` - 附加信息
+- `Quote float64` - 成交额
+- `BuyVolume float64` - 主动买入成交量
+- `TradeNum int64` - 成交笔数
 
 ### InfoKline
 带有附加信息的K线数据结构体。
 
 字段：
 - `PairTFKline *banexg.PairTFKline` - 基础K线数据
+- `Sid int32` - 交易对ID
 - `Adj *AdjInfo` - 价格调整信息
 - `IsWarmUp bool` - 是否为预热数据
 
@@ -112,6 +106,14 @@ K线数据聚合配置结构体，用于管理不同时间周期的K线聚合。
 - `AggEvery string` - 聚合间隔
 - `CpsBefore string` - 补全截止时间
 - `Retention string` - 数据保留时间
+
+### SeriesInfo、DataRecord 与 DataSeries
+
+通用时序数据不再限定为 K 线。`SeriesInfo` 定义 source、周期、表绑定和字段；`DataRecord` 用于存储行；`DataSeries` 是回测和实盘的统一事件。`SeriesStore` 提供 `Write`、`WriteBatch`、`Read`、`Missing`、`Delete`、`Coverage` 等高层操作，并通过 `SeriesRepo` 适配 TimescaleDB 与 QuestDB。
+
+字段类型支持 `float`、`int`、`string`、`bool` 和 `json`。`NewSeriesInfo(name, timeframe, fields)` 会按默认规则创建表绑定；需要写入既有 K 线表的扩展列时使用 `NewKLineSeriesInfo` 与 `KLineSeriesStore`。
+
+请参阅[自定义时序数据](../guide/custom_data.md)了解注册、存储和策略消费的完整流程。
 
 ## 数据库连接相关
 
@@ -140,7 +142,7 @@ K线数据聚合配置结构体，用于管理不同时间周期的K线聚合。
 - `path string` - 数据库文件路径
 
 ### DbLite
-创建SQLite数据库连接。
+创建 banbot 本地 SQLite 辅助数据库连接。它只用于本地辅助状态；行情和通用时序数据通过 `Setup`/`Conn` 使用配置的 QuestDB 或 TimescaleDB。
 
 参数：
 - `src string` - 数据源名称

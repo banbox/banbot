@@ -7,6 +7,7 @@ config 包提供了系统配置相关的结构体和方法。
 ### CmdArgs
 命令行参数结构体,包含以下字段:
 - `Configs`: []string - 配置文件路径列表
+- `ConfigData`: string - 直接传入的 YAML 配置内容
 - `Logfile`: string - 日志文件路径
 - `DataDir`: string - 数据目录路径
 - `NoCompress`: bool - 是否不压缩
@@ -20,8 +21,16 @@ config 包提供了系统配置相关的结构体和方法。
 - `Force`: bool - 是否强制执行
 - `WithSpider`: bool - 是否使用爬虫
 - `MaxPoolSize`: int - 最大连接池大小
-- `CPUProfile`: bool - 是否开启CPU性能分析
-- `MemProfile`: bool - 是否开启内存性能分析
+- `RawTables` / `Tables`: string / []string - 数据表筛选条件
+- `Medium`: string - K 线数据介质：`db` 或 `file`
+- `InPath` / `InType`: string - 输入路径和输入类型
+- `OutPath` / `OutType`: string - 输出路径和输出类型
+- `AdjType`: string - K 线复权类型：`pre`、`post` 或 `none`
+- `ExgReal`: string - 实际交易所标识
+- `Picker` / `PairPicker`: string - 优化结果和品种选择器
+- `RunEveryTF`: string - 按指定周期运行
+- `BatchSize`: int - 任务批量大小
+- `DeadLock`: bool - 是否启用死锁检测
 - `TimeZone`: string - 时区
 - `OptRounds`: int - 超参数优化单任务执行轮次
 - `Concur`: int - 超参数优化多进程并发数量
@@ -48,13 +57,18 @@ config 包提供了系统配置相关的结构体和方法。
 - `PreFire`: float64 - 预发射
 - `MarginAddRate`: float64 - 追加保证金比率
 - `ChargeOnBomb`: bool - 是否在爆仓时收费
-- `TakeOverStgy`: string - 接管策略
+- `TakeOverStrat`: string - 接管策略
 - `StakeAmount`: float64 - 单笔开单金额
 - `StakePct`: float64 - 单笔开单金额百分比
 - `MaxStakeAmt`: float64 - 单笔最大开单金额
 - `OpenVolRate`: float64 - 开单数量倍率
 - `MinOpenRate`: float64 - 最小开单比率
 - `BTNetCost`: float64 - 回测网络延迟(秒)
+- `RelaySimUnFinish`: bool - 是否接力开始时间的未完成订单
+- `NTPLangCode`: string - NTP 时间同步区域代码
+- `ShowLangCode`: string - 界面显示语言代码
+- `BTInLive`: *BtInLiveConfig - 实盘定时回测对比配置
+- `OrderBarMax`: int - 查找未完成订单的最大回溯 bar 数
 - `MaxOpenOrders`: int - 最大开单数量
 - `MaxSimulOpen`: int - 最大同时开单数量
 - `WalletAmounts`: map[string]float64 - 钱包金额
@@ -76,6 +90,8 @@ config 包提供了系统配置相关的结构体和方法。
 - `APIServer`: *APIServerConfig - API服务器配置
 - `RPCChannels`: map[string]map[string]interface{} - RPC通道配置
 - `Webhook`: map[string]map[string]string - Webhook配置
+- `Mail`: *MailConfig - SMTP 邮件配置
+- `LLMModels`: map[string]*llm.LLMModelConfig - LLM 模型配置
 
 ### RunPolicyConfig
 运行策略配置,可以同时运行多个策略,包含以下字段:
@@ -105,7 +121,10 @@ config 包提供了系统配置相关的结构体和方法。
 - `Url`: string - 数据库连接URL
 - `Retention`: string - 数据保留时间
 - `MaxPoolSize`: int - 最大连接池大小
-- `AutoCreate`: bool - 是否自动创建数据库
+- `AutoCreate`: bool - 连接成功后是否初始化或升级 banbot schema
+- `DbType`: string - 数据库类型：`questdb` 或 `timescale`；留空时按连接端口自动识别
+- `QdbMemPct`: float64 - QuestDB 内存使用比例，范围 0~1，仅 QuestDB 生效
+- `QdbMaxMemMB`: int - QuestDB 最大内存使用量（MB），仅 QuestDB 生效
 
 ### APIServerConfig
 API服务器配置,包含以下字段:
@@ -121,18 +140,12 @@ API服务器配置,包含以下字段:
 用户配置,包含以下字段:
 - `Username`: string - 用户名
 - `Password`: string - 密码
+- `AllowIPs`: []string - 允许访问的 IP 列表
 - `AccRoles`: map[string]string - 账户角色权限
 - `ExpireHours`: float64 - Token过期时间(小时)
 
-### WeWorkChannel
-企业微信通道配置,包含以下字段:
-- `Enable`: bool - 是否启用
-- `Type`: string - 类型
-- `MsgTypes`: []string - 消息类型
-- `AgentId`: string - 应用ID
-- `CorpId`: string - 企业ID
-- `CorpSecret`: string - 应用密钥
-- `Keywords`: string - 关键词
+### RPCChannels
+通知渠道由 `RPCChannels map[string]map[string]interface{}` 配置。键是自定义渠道名称，值按 `type`（如 `mail`、`wework`、`telegram`）提供该渠道所需的字段；请参阅[配置指南](../guide/configuration.md)中的示例。
 
 ### PairMgrConfig
 交易对管理配置,包含以下字段:
@@ -140,6 +153,8 @@ API服务器配置,包含以下字段:
 - `Offset`: int - 偏移量
 - `Limit`: int - 限制数量
 - `ForceFilters`: bool - 是否强制过滤
+- `PosOnRotation`: string - 品种轮换时处理仓位：`hold` 或 `close`
+- `UseLatest`: bool - 回测未启用 cron 时是否按最新日期确定品种列表
 
 ### AccountConfig
 账户配置,包含以下字段:
@@ -157,7 +172,7 @@ API服务器配置,包含以下字段:
 获取数据目录路径。
 
 返回：
-- `string` - 数据目录的绝对路径。如果环境变量 `BanDataDir` 未设置,返回空字符串。
+- `string` - 数据目录的绝对路径。未提供 `BanDataDir` 或 `-datadir` 时会触发配置错误；需要可空结果时使用 `GetDataDirSafe`。
 
 ### GetStratDir 
 获取策略目录路径。

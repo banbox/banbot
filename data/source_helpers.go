@@ -44,9 +44,13 @@ func normalizeDataSubFields(info *orm.SeriesInfo, sub *strat.DataSub) error {
 	}
 	available := make(map[string]bool, len(info.Binding.Fields))
 	defaults := make([]string, 0, len(info.Binding.Fields))
+	defaultSeries := make([]string, 0, len(info.Binding.Fields))
 	for _, field := range info.Binding.Fields {
 		available[field.Name] = true
 		defaults = append(defaults, field.Name)
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(field.Type)), "float") {
+			defaultSeries = append(defaultSeries, field.Name)
+		}
 	}
 	fields := orm.NormalizeSeriesFields(info.Name, sub.Fields)
 	if len(fields) == 0 {
@@ -58,6 +62,17 @@ func normalizeDataSubFields(info *orm.SeriesInfo, sub *strat.DataSub) error {
 		}
 	}
 	sub.Fields = fields
+	seriesFields := orm.MergeSeriesFields(sub.SeriesFields)
+	if len(sub.SeriesFields) == 0 {
+		seriesFields = defaultSeries
+	}
+	for _, field := range seriesFields {
+		if !available[field] {
+			return fmt.Errorf("unsupported series field %q", field)
+		}
+	}
+	sub.SeriesFields = seriesFields
+	sub.Fields = orm.MergeSeriesFields(sub.Fields, seriesFields)
 	return nil
 }
 

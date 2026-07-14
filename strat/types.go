@@ -44,7 +44,7 @@ type TradeStrat struct {
 	OnSymbols           func(items []string) []string // return modified pairs
 	OnStartUp           func(s *StratJob)
 	OnBar               func(s *StratJob)
-	OnData              func(s *StratJob, evt *orm.DataSeries)
+	OnData              func(s *StratJob, data *DataFields)
 	OnInfoBar           func(s *StratJob, e *ta.BarEnv, pair, tf string)       // Other dependent bar data 其他依赖的bar数据
 	OnWsTrades          func(s *StratJob, pair string, trades []*banexg.Trade) // Transaction by transaction data 逐笔交易数据
 	OnWsDepth           func(s *StratJob, dep *banexg.OrderBook)               // Websocket order book websocket推送深度信息
@@ -93,17 +93,18 @@ type PairSub struct {
 }
 
 type DataSub struct {
-	Source    string
-	ExSymbol  *orm.ExSymbol
-	TimeFrame string
-	WarmupNum int
-	Fields    []string
+	Source       string
+	ExSymbol     *orm.ExSymbol
+	TimeFrame    string
+	WarmupNum    int
+	Fields       []string // fields fetched from the data source
+	SeriesFields []string // fields maintained as banta.Series; float fields by default
 }
 
 type StratJob struct {
 	Strat         *TradeStrat
 	Env           *ta.BarEnv
-	DataHub       DataHub
+	DataHub       *DataHub
 	Entrys        []*EnterReq
 	Exits         []*ExitReq
 	LongOrders    []*ormo.InOutOrder

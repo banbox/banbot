@@ -3,9 +3,9 @@ package orm
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
+	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	utils2 "github.com/banbox/banexg/utils"
 )
@@ -596,7 +596,7 @@ func seriesFloatValue(values map[string]any, key string) (float64, error) {
 	if num, ok := val.(float64); ok {
 		return num, nil
 	}
-	return seriesFloatAny(val)
+	return utils.ToFloat64(val)
 }
 
 func seriesFloatValueDefault(values map[string]any, key string) (float64, bool) {
@@ -610,7 +610,7 @@ func seriesFloatValueDefault(values map[string]any, key string) (float64, bool) 
 	if num, ok := val.(float64); ok {
 		return num, true
 	}
-	num, err := seriesFloatAny(val)
+	num, err := utils.ToFloat64(val)
 	if err != nil {
 		return 0, false
 	}
@@ -628,35 +628,9 @@ func seriesIntValueDefault(values map[string]any, key string) (int64, bool) {
 	if num, ok := val.(int64); ok {
 		return num, true
 	}
-	switch v := val.(type) {
-	case int:
-		return int64(v), true
-	case int8:
-		return int64(v), true
-	case int16:
-		return int64(v), true
-	case int32:
-		return int64(v), true
-	case int64:
-		return v, true
-	case uint:
-		return int64(v), true
-	case uint8:
-		return int64(v), true
-	case uint16:
-		return int64(v), true
-	case uint32:
-		return int64(v), true
-	case uint64:
-		return int64(v), true
-	case float32:
-		return int64(v), true
-	case float64:
-		return int64(v), true
-	case string:
-		num, err := strconv.ParseInt(v, 10, 64)
-		return num, err == nil
-	default:
+	num, err := utils.ToInt64(val)
+	if err != nil {
 		return 0, false
 	}
+	return num, true
 }

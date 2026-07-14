@@ -647,7 +647,7 @@ func aggFloatValue(row *DataRecord, field SeriesField) (float64, bool, error) {
 	if !ok {
 		return 0, false, nil
 	}
-	num, err := seriesFloatAny(val)
+	num, err := utils.ToFloat64(val)
 	if err != nil {
 		return 0, false, err
 	}

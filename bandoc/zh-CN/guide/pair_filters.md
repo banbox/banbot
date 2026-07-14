@@ -5,8 +5,14 @@
 ## 运行时机
 在机器人启动时，默认会运行一次品种过滤器，得到可交易品种列表。  
 您也可以指定cron表达式，定期执行并刷新可交易列表。  
-当某个品种需要被移除时，如果有未平仓订单，则暂时不会被移除。  
+当某个品种需要被移除时，`pairmgr.pos_on_rotation` 决定处理方式：`hold` 保留仓位但禁止继续开仓，`close` 会先退出仓位再移除。
 回测时也会执行corn表达式，定期刷新品种列表，以达到和实时交易类似的效果。
+
+```yaml
+pairmgr:
+  pos_on_rotation: hold  # hold 或 close
+  use_latest: false      # 回测未启用 cron 时，是否按最新日期确定品种列表
+```
 
 ## 所有支持的过滤器
 * VolumePairList

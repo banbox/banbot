@@ -11,7 +11,7 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `Name string` - 策略名称
 - `Version int` - 策略版本号
 - `WarmupNum int` - 预热所需的K线数量
-- `MinTfScore float64` - 最小时间周期质量，默认0.75
+- `MinTfScore float64` - 最小时间周期质量，默认0.8
 - `WsSubs map[string]string` - websocket订阅: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 - `DrawDownExit bool` - 是否启用回撤退出
 - `HedgeOff bool` -关闭合约双向持仓
@@ -22,9 +22,12 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `StopEnterBars int` - 限价入场单超时K线数
 - `EachMaxLong int` - 每个交易对最大做多订单数，-1表示禁用
 - `EachMaxShort int` - 每个交易对最大做空订单数，-1表示禁用
-- `AllowTFs []string` - 允许运行的时间周期，不提供时使用全局配置
+- `RunTimeFrames []string` - 允许运行的时间周期，不提供时使用全局配置
 - `Outputs []string` - 策略输出的文本文件内容，每个字符串是一行
 - `Policy *config.RunPolicyConfig` - 策略运行配置
+- `OnDataSubs`: 声明 K 线扩展列或自定义时序数据订阅
+- `OnData`: 接收已更新 Series/最新值的 `*strat.DataFields`
+- `OnWsData`: 接收 websocket 时序事件
 
 ### StratJob
 策略任务实例，负责执行具体的交易操作。
@@ -55,6 +58,20 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `ShortTPPrice float64` - 开仓时默认做空止盈价格
 - `IsWarmUp bool` - 当前是否处于预热状态
 - `More interface{}` - 策略自定义的额外信息
+- `DataHub`: 按 `(source, sid, timeframe)` 缓存最新事件和窗口数据
+
+### DataSub
+时序数据订阅信息。
+
+公开字段：
+- `Source string` - 数据源名称；空值等同 `kline`
+- `ExSymbol *orm.ExSymbol` - 绑定标的
+- `TimeFrame string` - 数据源基础周期
+- `WarmupNum int` - 初始化预热数量
+- `Fields []string` - 需要读取的字段
+
+### DataHub
+运行时数据缓存。`Get(tf, source, sid)` 返回处理后的 `DataFields`，`AllReady()` 判断当前事件时间上应闭合的全部订阅是否已经更新。自定义数据的订阅和消费示例请参阅[自定义时序数据](../guide/custom_data.md)。
 
 ### JobEnv
 在OnBatchInfos中表示某个额外品种数据的job

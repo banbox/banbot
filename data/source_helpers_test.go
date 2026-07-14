@@ -11,7 +11,10 @@ import (
 )
 
 func TestNormalizeDataSub(t *testing.T) {
-	info := orm.NewSeriesInfo("custom_metric", "1h", []orm.SeriesField{{Name: "value", Type: "float"}})
+	info := orm.NewSeriesInfo("custom_metric", "1h", []orm.SeriesField{
+		{Name: "value", Type: "float64"},
+		{Name: "count", Type: "int64"},
+	})
 	sub := &strat.DataSub{ExSymbol: &orm.ExSymbol{Symbol: "BTCUSDT"}}
 	got, err := NormalizeDataSub(info, sub)
 	if err != nil {
@@ -23,8 +26,31 @@ func TestNormalizeDataSub(t *testing.T) {
 	if got.Source != info.Name || got.TimeFrame != info.TimeFrame || got.ExSymbol != sub.ExSymbol {
 		t.Fatalf("unexpected normalized sub: %+v", got)
 	}
-	if !reflect.DeepEqual(got.Fields, []string{"value"}) {
+	if !reflect.DeepEqual(got.Fields, []string{"value", "count"}) {
 		t.Fatalf("expected source fields as default projection, got %v", got.Fields)
+	}
+	if !reflect.DeepEqual(got.SeriesFields, []string{"value"}) {
+		t.Fatalf("expected float fields as default series, got %v", got.SeriesFields)
+	}
+}
+
+func TestNormalizeDataSubValidatesAndProjectsSeriesFields(t *testing.T) {
+	info := orm.NewSeriesInfo("custom_metric", "1h", []orm.SeriesField{
+		{Name: "value", Type: "float"}, {Name: "count", Type: "int"},
+	})
+	sub := &strat.DataSub{
+		ExSymbol: &orm.ExSymbol{Symbol: "BTCUSDT"}, Fields: []string{"value"}, SeriesFields: []string{"count"},
+	}
+	got, err := NormalizeDataSub(info, sub)
+	if err != nil {
+		t.Fatalf("NormalizeDataSub failed: %v", err)
+	}
+	if !reflect.DeepEqual(got.Fields, []string{"value", "count"}) || !reflect.DeepEqual(got.SeriesFields, []string{"count"}) {
+		t.Fatalf("series fields should be included in the query projection: %+v", got)
+	}
+	sub.SeriesFields = []string{"missing"}
+	if _, err = NormalizeDataSub(info, sub); err == nil || !strings.Contains(err.Error(), `unsupported series field "missing"`) {
+		t.Fatalf("expected invalid series field error, got %v", err)
 	}
 }
 

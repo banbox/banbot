@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 )
 
@@ -200,11 +201,11 @@ func TestResampleSeriesRecordsUsesAggRules(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		firstVal, err := seriesFloatAny(first)
+		firstVal, err := utils.ToFloat64(first)
 		if err != nil {
 			return nil, err
 		}
-		lastVal, err := seriesFloatAny(last)
+		lastVal, err := utils.ToFloat64(last)
 		if err != nil {
 			return nil, err
 		}

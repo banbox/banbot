@@ -96,11 +96,11 @@ func TestCryptoTraderEmitRoutesThirdPartyRowsThroughOnData(t *testing.T) {
 		strat.AccInfoJobs = oldAccounts
 	})
 
-	var got []*orm.DataSeries
+	var got []*strat.DataFields
 	job := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(s *strat.StratJob, evt *orm.DataSeries) {
-				got = append(got, evt)
+			OnData: func(s *strat.StratJob, fields *strat.DataFields) {
+				got = append(got, fields)
 			},
 		},
 		DataHub: strat.NewDataHub(),
@@ -133,19 +133,19 @@ func TestCryptoTraderEmitRoutesThirdPartyRowsThroughOnData(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("expected OnData called twice, got %d", len(got))
 	}
-	if got[0].Source != "macro" || got[0].Sid != 77 || got[0].TimeFrame != "1d" {
+	if got[0].Source() != "macro" || got[0].Sid() != 77 || got[0].TimeFrame() != "1d" {
 		t.Fatalf("unexpected first OnData event: %+v", got[0])
 	}
 	if job.IsWarmUp {
 		t.Fatalf("expected emitted live rows to stay non-warmup")
 	}
-	latest := job.DataHub.Latest("macro", 77, "1d")
-	if latest == nil || latest.TimeMS != 200 {
+	latest := job.DataHub.Get("1d", "macro", 77)
+	if latest == nil || latest.TimeMS() != 200 {
 		t.Fatalf("expected latest macro row at 200, got %+v", latest)
 	}
-	window := job.DataHub.Window("macro", 77, "1d", 2)
-	if len(window) != 2 || window[0].TimeMS != 100 || window[1].TimeMS != 200 {
-		t.Fatalf("unexpected macro window after emit: %+v", window)
+	series := latest.Series("value")
+	if series == nil || series.Len() != 2 || series.Get(1) != 10 || series.Get(0) != 11 {
+		t.Fatalf("unexpected macro series after emit: %+v", series)
 	}
 	if notified != 1 {
 		t.Fatalf("expected provider callback once, got %d", notified)
@@ -199,7 +199,8 @@ func TestCryptoTraderRunEnsuresThirdPartyBeforeActivateAndLoop(t *testing.T) {
 	collected := []*strat.DataSub{{
 		Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 101, Symbol: "BTC/USDT"},
 		TimeFrame: alpha.info.TimeFrame, WarmupNum: 4,
-		Fields: []string{"open", "high", "low", "close", "volume"},
+		Fields:       []string{"open", "high", "low", "close", "volume"},
+		SeriesFields: []string{"open", "high", "low", "close", "volume"},
 	}}
 	trader := NewCryptoTrader()
 	steps := make([]string, 0, 4)

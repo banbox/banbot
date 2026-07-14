@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 
 	"gonum.org/v1/gonum/stat"
 )
@@ -17,31 +18,17 @@ Obtain the direction of numbers; 1, -1 or 0
 获取数字的方向；1，-1或0
 */
 func NumSign(obj interface{}) int {
-	if val, ok := obj.(int); ok {
-		if val > 0 {
+	switch obj.(type) {
+	case int, float32, float64:
+		value, _ := ToFloat64(obj)
+		if value > 0 {
 			return 1
-		} else if val < 0 {
-			return -1
-		} else {
-			return 0
 		}
-	} else if val, ok := obj.(float32); ok {
-		if val > 0 {
-			return 1
-		} else if val < 0 {
+		if value < 0 {
 			return -1
-		} else {
-			return 0
 		}
-	} else if val, ok := obj.(float64); ok {
-		if val > 0 {
-			return 1
-		} else if val < 0 {
-			return -1
-		} else {
-			return 0
-		}
-	} else {
+		return 0
+	default:
 		panic(fmt.Errorf("invalid type for NumSign: %t", obj))
 	}
 }
@@ -74,46 +61,90 @@ func NanInfTo(v, to float64) float64 {
 	return v
 }
 
-func ConvertFloat64(i interface{}) float64 {
-	switch v := i.(type) {
+func ToFloat64(value any) (float64, error) {
+	switch v := value.(type) {
 	case int:
-		return float64(v)
+		return float64(v), nil
 	case int8:
-		return float64(v)
+		return float64(v), nil
 	case int16:
-		return float64(v)
+		return float64(v), nil
 	case int32:
-		return float64(v)
+		return float64(v), nil
 	case int64:
-		return float64(v)
+		return float64(v), nil
+	case uint:
+		return float64(v), nil
+	case uint8:
+		return float64(v), nil
+	case uint16:
+		return float64(v), nil
+	case uint32:
+		return float64(v), nil
+	case uint64:
+		return float64(v), nil
 	case float32:
-		return float64(v)
+		return float64(v), nil
 	case float64:
-		return v
+		return v, nil
+	case string:
+		return strconv.ParseFloat(v, 64)
+	default:
+		return 0, fmt.Errorf("unsupported float type %T", value)
+	}
+}
+
+func ConvertFloat64(i interface{}) float64 {
+	switch i.(type) {
+	case int, int8, int16, int32, int64, float32, float64:
 	default:
 		return 0
+	}
+	value, _ := ToFloat64(i)
+	return value
+}
+
+func ToInt64(value any) (int64, error) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), nil
+	case int8:
+		return int64(v), nil
+	case int16:
+		return int64(v), nil
+	case int32:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case uint:
+		return int64(v), nil
+	case uint8:
+		return int64(v), nil
+	case uint16:
+		return int64(v), nil
+	case uint32:
+		return int64(v), nil
+	case uint64:
+		return int64(v), nil
+	case float32:
+		return int64(v), nil
+	case float64:
+		return int64(v), nil
+	case string:
+		return strconv.ParseInt(v, 10, 64)
+	default:
+		return 0, fmt.Errorf("unsupported int type %T", value)
 	}
 }
 
 func ConvertInt64(i interface{}) int64 {
-	switch v := i.(type) {
-	case int:
-		return int64(v)
-	case int8:
-		return int64(v)
-	case int16:
-		return int64(v)
-	case int32:
-		return int64(v)
-	case int64:
-		return v
-	case float32:
-		return int64(v)
-	case float64:
-		return int64(v)
+	switch i.(type) {
+	case int, int8, int16, int32, int64, float32, float64:
 	default:
 		return 0
 	}
+	value, _ := ToInt64(i)
+	return value
 }
 
 // Calculate the function of the greatest common divisor (GCD) of two numbers using the Euclidean algorithm

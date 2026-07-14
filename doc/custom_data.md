@@ -62,13 +62,13 @@ banbot 推荐两种接入方式：
 
 #### 2.2.2 策略中订阅
 
-策略订阅示例见 `../banstrats/fundingrate/strategy.go`：在 `OnDataSubs` 返回 `strat.DataSub`，在 `OnData` 中读取 `orm.DataSeries`，需要最新缓存时走 `job.DataHub.Latest(...)`。
+策略订阅示例见 `../banstrats/fundingrate/strategy.go`：在 `OnDataSubs` 返回 `strat.DataSub`，在 `OnData` 中读取处理后的 `strat.DataFields`，跨数据源读取使用 `job.DataHub.Get(...)`。
 
 回测和实盘启动时，banbot 会从 `OnDataSubs` 收集订阅，按 `(source, sid, timeframe)` 去重，取最大的 `WarmupNum` 并合并 `Fields` 字段并集，再调用已注册的 `DataSource.FetchHistory` 补齐缺口。
 
-`Fields` 为空时，kline 使用 `open, high, low, close, volume, quote, buy_volume, trade_num`，独立数据源使用其 `SeriesInfo.Binding.Fields`。多个策略订阅同一数据流的不同字段时，数据源只收到一个合并后的订阅，所有订阅策略的 `OnData` 都收到该字段并集。
+`Fields` 控制数据源读取投影；为空时，kline 使用 `open, high, low, close, volume, quote, buy_volume, trade_num`，独立数据源使用其 `SeriesInfo.Binding.Fields`。`SeriesFields` 控制哪些字段维护为 `banta.Series`；未配置时默认选择 schema 中的 `float*` 字段，运行时无 schema 的数据按 `float32/float64` 值识别。显式 `SeriesFields` 会自动并入 `Fields`。
 
-读取 kline 扩展列时仍使用同一个订阅入口，例如 `DataSub{Source: "kline", Fields: []string{"open_interest"}, ...}`。主 kline 的默认字段会和显式字段合并，因此 `OnData` 可读取 `evt.Values["open_interest"]`，`OnBar` 继续正常消费 OHLCV。
+读取 kline 扩展列时仍使用同一个订阅入口，例如 `DataSub{Source: "kline", SeriesFields: []string{"open_interest"}, ...}`。主 kline 的默认字段会和显式字段合并，因此 `OnData` 可通过 `data.Series("open_interest")` 或 `data.Float64("open_interest")` 读取，`OnBar` 继续正常消费 OHLCV。
 
 ### 2.3 WebUI / DashboardUI 管理与查看
 
@@ -98,7 +98,7 @@ banbot 内部主链路已经统一改为 `orm.DataSeries`：
 - `data.Feeder` / `data.Provider` 回调统一为 `FnDataSeries`
 - `biz.Trader` 主入口为 `FeedDataSeries` / `FeedSeries`
 - `live.CryptoTrader`、`opt.BackTestLite`、`opt.BackTest` 统一消费 `DataSeries`
-- `strat.DataHub` 统一缓存 `DataSeries`
+- `strat.DataHub` 将 `DataSeries` 处理为按订阅隔离的 `DataFields`
 
 ### 3.2 统一仓储名称：`SeriesRepo`
 
@@ -520,17 +520,27 @@ QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删
 
 ### 6.4 `DataHub` 作为统一运行时缓存
 
-`StratJob.DataHub` 统一缓存按 `(source, sid, timeframe)` 索引的运行时数据：
+`StratJob.DataHub` 统一缓存按 `(timeframe, source, sid)` 索引的处理后字段：
 
 ```go
-type DataHub interface {
-    Set(evt *orm.DataSeries)
-    Latest(source string, sid int32, tf string) *orm.DataSeries
-    Window(source string, sid int32, tf string, n int) []*orm.DataSeries
+type DataHub struct {
+    // 内部按 timeframe -> source -> sid 保存 *DataFields
 }
+
+func (d *DataHub) Get(tf, source string, sid int32) *DataFields
+func (d *DataHub) AllReady() bool
+
+type DataFields struct { /* 内部字段省略 */ }
+
+func (d *DataFields) Series(name string) *banta.Series
+func (d *DataFields) Float64(name string) float64
+func (d *DataFields) Int64(name string) int64
+func (d *DataFields) Raw(name string) any
+func (d *DataFields) TimeMS() int64
+func (d *DataFields) DoneMS() int64
 ```
 
-这使策略可以直接读取 side-input，而不再依赖 `pair_tf` 这种只适用于 kline 的单一视角。
+`AllReady()` 使用当前 Hub 已处理事件的最大 `EndMS` 作为事件时间，只检查在该时间点应当闭合的周期。例如 16:05 会要求 1m 和 5m 的全部订阅 `DoneMS() >= 16:05`，不会要求尚未闭合的 15m。订阅会在首个事件前预注册，因此尚未收到过的数据源不会被误判为已就绪。
 
 ---
 
@@ -558,16 +568,22 @@ func init() {
                     ExSymbol:  job.Symbol,
                     TimeFrame: "1d",
                     WarmupNum: 30,
-                    Fields:    []string{"value", "revision"},
+                    Fields:       []string{"value", "revision"},
+                    SeriesFields: []string{"value"},
                 },
             }
         },
-        OnData: func(job *strat.StratJob, evt *orm.DataSeries) {
-            if evt.Source != "macro_cpi" {
+        OnData: func(job *strat.StratJob, data *strat.DataFields) {
+            if data.Source() != "macro_cpi" {
                 return
             }
-            latest := job.DataHub.Latest("macro_cpi", evt.Sid, evt.TimeFrame)
-            _ = latest
+            value := data.Series("value")
+            revision := data.Int64("revision")
+            if !job.DataHub.AllReady() {
+                return
+            }
+            latest := job.DataHub.Get("1d", "macro_cpi", data.Sid())
+            _, _, _ = value, revision, latest
         },
     })
 }
@@ -586,7 +602,7 @@ func init() {
 
 - `OnPairInfos` 会在内部桥接为 `DataSub{Source: "kline", ...}`
 - `OnInfoBar` 仅在 side-input 能适配成 kline 且策略未实现 `OnData` 时触发
-- 主 kline 事件会分别尝试触发 `OnData` 和 `OnBar`：`OnData` 获得完整 `DataSeries.Values`，`OnBar` 使用可识别的 OHLCV 字段
+- 主 kline 事件会分别尝试触发 `OnData` 和 `OnBar`：`OnData` 获得处理后的 `DataFields`，`OnBar` 使用可识别的 OHLCV 字段
 
 ### 7.3 新代码不要再把 Kline 当作通用自定义数据契约
 
@@ -665,7 +681,8 @@ func init() {
 
 #### `strat`
 
-- `TestDataHubLatestAndWindow`
+- `TestDataHubBuildsConfiguredAndDefaultSeries`
+- `TestDataHubAllReadyOnlyChecksClosingTimeframes`
 - `TestCollectDataSubsBridgesLegacyPairInfos`
 - `TestUpdatePairs_RebuildsWarmsFromCurrentDataSubs`
 

@@ -14,8 +14,9 @@ entry.AddCmdJob(&entry.CmdJob{
     Help:    "show hello",
 })
 ```
+`Parent` 必须是已经注册的命令组；根命令使用空字符串。若需要添加子命令，请先通过 `entry.AddGroup` 注册父组。
 然后您可以通过`bot hello`触发执行`showHello`函数。此函数将接受一个`*config.CmdArgs`参数，存储解析后的命令行参数，如果您需要访问相关参数，请在`Options`中填写需要访问的字段名。
-所有可用的字段名可参考[entry/main](https://github.com/banbox/banbot/blob/main/entry/main.go)中的`bindSubFlags`函数。
+所有可用的字段名可参考[entry/main](https://github.com/banbox/banbot/blob/main/entry/main.go)中的`bindSubFlags`函数；公共参数的字段绑定在 `config.CmdArgs.BindToFlag` 中。
 
 ### 注册任意参数的函数
 固定的`Options`和`*config.CmdArgs`可能难以满足您的个性化需求。

@@ -46,11 +46,12 @@ func CollectDataSubs(job *StratJob) []*DataSub {
 				}
 			}
 			out = append(out, &DataSub{
-				Source:    orm.SeriesSourceKline,
-				ExSymbol:  exs,
-				TimeFrame: sub.TimeFrame,
-				WarmupNum: sub.WarmupNum,
-				Fields:    orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil),
+				Source:       orm.SeriesSourceKline,
+				ExSymbol:     exs,
+				TimeFrame:    sub.TimeFrame,
+				WarmupNum:    sub.WarmupNum,
+				Fields:       orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil),
+				SeriesFields: nil,
 			})
 		}
 	}
@@ -67,12 +68,18 @@ func CollectDataSubs(job *StratJob) []*DataSub {
 				continue
 			}
 			source := orm.NormalizeSeriesSource(sub.Source)
+			seriesFields := orm.MergeSeriesFields(sub.SeriesFields)
+			fields := orm.NormalizeSeriesFields(source, sub.Fields)
+			if len(sub.SeriesFields) > 0 {
+				fields = orm.MergeSeriesFields(fields, seriesFields)
+			}
 			out = append(out, &DataSub{
-				Source:    source,
-				ExSymbol:  exs,
-				TimeFrame: sub.TimeFrame,
-				WarmupNum: sub.WarmupNum,
-				Fields:    orm.NormalizeSeriesFields(source, sub.Fields),
+				Source:       source,
+				ExSymbol:     exs,
+				TimeFrame:    sub.TimeFrame,
+				WarmupNum:    sub.WarmupNum,
+				Fields:       fields,
+				SeriesFields: seriesFields,
 			})
 		}
 	}

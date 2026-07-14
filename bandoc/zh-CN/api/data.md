@@ -2,6 +2,20 @@
 
 data 包提供了数据处理和管理相关的功能。
 
+`data` 包的主链路已统一使用 `orm.DataSeries`。下文保留的 K 线 Feeder/Provider 类型用于内置 OHLCV 数据；自定义时序数据应使用本页的通用数据源接口。
+
+## 通用时序数据
+
+### DataSource
+
+自定义 source 实现 `Info`、`FetchHistory` 和可选的 `SubscribeLive`。历史函数返回 `[]*orm.DataRecord`，实时函数通过 `DataSink.Emit(sub, rows)` 发送数据。使用 `RegisterDataSource` 注册完整实现，或使用 `RegisterFuncDataSource` 快速注册函数式实现。source 名称不可重复。
+
+### SeriesRuntime
+
+`SeriesRuntime` 在回测和实盘启动时收集策略的 `DataSub`，按 `(source, sid, timeframe)` 合并字段和预热数量，补齐历史缺口后激活实时订阅。`HistSeriesFeeder` 会将独立序列按时间顺序与 K 线一起回放。
+
+策略在 `OnDataSubs` 中声明订阅，在 `OnData` 中接收处理后的 `*strat.DataFields`；详见[自定义时序数据](../guide/custom_data.md)。
+
 此package的重要概念如下：
 * Provider：K线数据提供者，可包含多个有相同起止时间的Feeder
 * Feeder：对应一个品种的数据源，可以包含多个周期的数据

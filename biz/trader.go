@@ -121,16 +121,13 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries) *errs.Error {
 
 func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSeries) {
 	for _, job := range jobMap {
-		if job.DataHub == nil {
-			job.DataHub = strat.NewDataHub()
-		}
-		job.DataHub.Set(evt)
+		fields := job.SetData(evt)
 		job.IsWarmUp = evt.IsWarmUp
 		if job.Strat.OnData == nil {
 			continue
 		}
 		num1, num2 := strat.GetJobInOutNum(job)
-		job.Strat.OnData(job, evt)
+		job.Strat.OnData(job, fields)
 		strat.CheckJobInOutNum(job, "OnData", num1, num2)
 	}
 }
@@ -265,27 +262,24 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 	handledJobs := make(map[*strat.StratJob]bool, len(jobs))
 	for _, job := range jobs {
 		handledJobs[job] = true
-		if job.DataHub == nil {
-			job.DataHub = strat.NewDataHub()
-		}
-		job.DataHub.Set(evt)
+		fields := job.SetData(evt)
 		job.IsWarmUp = isWarmup
 		job.InitBar(curOrders)
 		if !core.ParallelOnBar {
-			err = t.onAccountDataSeriesJob(odMgr, job, evt, barExpired)
+			err = t.onAccountDataSeriesJob(odMgr, job, evt, fields, barExpired)
 			if err != nil {
 				return err
 			}
 		} else {
 			wg.Add(1)
-			go func(j *strat.StratJob) {
+			go func(j *strat.StratJob, data *strat.DataFields) {
 				defer wg.Done()
-				if errCur := t.onAccountDataSeriesJob(odMgr, j, evt, barExpired); errCur != nil {
+				if errCur := t.onAccountDataSeriesJob(odMgr, j, evt, data, barExpired); errCur != nil {
 					if errCur != nil {
 						err = errCur
 					}
 				}
-			}(job)
+			}(job, fields)
 		}
 	}
 	if core.ParallelOnBar {
@@ -298,14 +292,11 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 		if handledJobs[job] {
 			continue
 		}
-		if job.DataHub == nil {
-			job.DataHub = strat.NewDataHub()
-		}
-		job.DataHub.Set(evt)
+		fields := job.SetData(evt)
 		job.IsWarmUp = isWarmup
 		num1, num2 := strat.GetJobInOutNum(job)
 		if job.Strat.OnData != nil {
-			job.Strat.OnData(job, evt)
+			job.Strat.OnData(job, fields)
 			strat.CheckJobInOutNum(job, "OnData", num1, num2)
 		} else if job.Strat.OnInfoBar != nil {
 			job.Strat.OnInfoBar(job, env, symbol, evt.TimeFrame)
@@ -339,10 +330,10 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 	return nil
 }
 
-func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, evt *orm.DataSeries, barExpired bool) *errs.Error {
+func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, evt *orm.DataSeries, fields *strat.DataFields, barExpired bool) *errs.Error {
 	account := job.Account
 	if job.Strat.OnData != nil {
-		job.Strat.OnData(job, evt)
+		job.Strat.OnData(job, fields)
 	}
 	if job.Strat.OnBar != nil {
 		job.Strat.OnBar(job)

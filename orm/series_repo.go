@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 	"github.com/jackc/pgx/v5"
 )
@@ -831,9 +832,9 @@ func seriesSQLType(fieldType string) string {
 func normalizeSeriesFieldValue(fieldType string, value any) (any, error) {
 	switch fieldType {
 	case "float":
-		return seriesFloatAny(value)
+		return utils.ToFloat64(value)
 	case "int":
-		return seriesIntAny(value)
+		return utils.ToInt64(value)
 	case "string":
 		return fmt.Sprint(value), nil
 	case "bool":
@@ -860,72 +861,6 @@ func normalizeSeriesFieldValue(fieldType string, value any) (any, error) {
 		}
 	default:
 		return nil, fmt.Errorf("unsupported field type %q", fieldType)
-	}
-}
-
-func seriesIntAny(value any) (int64, error) {
-	switch v := value.(type) {
-	case int:
-		return int64(v), nil
-	case int8:
-		return int64(v), nil
-	case int16:
-		return int64(v), nil
-	case int32:
-		return int64(v), nil
-	case int64:
-		return v, nil
-	case uint:
-		return int64(v), nil
-	case uint8:
-		return int64(v), nil
-	case uint16:
-		return int64(v), nil
-	case uint32:
-		return int64(v), nil
-	case uint64:
-		return int64(v), nil
-	case float32:
-		return int64(v), nil
-	case float64:
-		return int64(v), nil
-	case string:
-		return strconv.ParseInt(v, 10, 64)
-	default:
-		return 0, fmt.Errorf("unsupported int type %T", value)
-	}
-}
-
-func seriesFloatAny(value any) (float64, error) {
-	switch v := value.(type) {
-	case int:
-		return float64(v), nil
-	case int8:
-		return float64(v), nil
-	case int16:
-		return float64(v), nil
-	case int32:
-		return float64(v), nil
-	case int64:
-		return float64(v), nil
-	case uint:
-		return float64(v), nil
-	case uint8:
-		return float64(v), nil
-	case uint16:
-		return float64(v), nil
-	case uint32:
-		return float64(v), nil
-	case uint64:
-		return float64(v), nil
-	case float32:
-		return float64(v), nil
-	case float64:
-		return v, nil
-	case string:
-		return strconv.ParseFloat(v, 64)
-	default:
-		return 0, fmt.Errorf("unsupported float type %T", value)
 	}
 }
 

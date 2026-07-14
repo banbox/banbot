@@ -264,6 +264,8 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 					if source == "kline" {
 						if exs := orm.GetSymbolByID(sid); exs != nil {
 							pairTfs.Update(exs.Symbol, tf, 0)
+							envKeys[strings.Join([]string{exs.Symbol, tf}, "_")] = true
+							initBarEnv(exs, tf)
 						}
 					}
 				}
@@ -536,8 +538,10 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 				// 这里需要stratID+pair作为键，否则多个品种订阅同一个额外品种数据时，只记录了最后一个
 				items[strings.Join([]string{stgy.Name, exs.Symbol}, "_")] = job
 			}
-			if hasInfoSubs && stgy.OnData == nil && stgy.OnInfoBar == nil {
-				panic(fmt.Sprintf("%s: `OnData` or `OnInfoBar` is required for side-input subscriptions", stgy.Name))
+			hasSideInputHandler := stgy.OnData != nil || stgy.OnInfoBar != nil ||
+				stgy.BatchInfo && stgy.OnBatchInfos != nil
+			if hasInfoSubs && !hasSideInputHandler {
+				panic(fmt.Sprintf("%s: side-input subscriptions require `OnData`, `OnInfoBar`, or `BatchInfo` + `OnBatchInfos`", stgy.Name))
 			}
 		}
 	}

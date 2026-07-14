@@ -215,7 +215,7 @@ func TestUpdatePairs_RebuildsWarmsFromCurrentDataSubs(t *testing.T) {
 			Name:      "stg",
 			WarmupNum: 20,
 			Policy:    &config.RunPolicyConfig{RunTimeframes: []string{"1s"}},
-			OnData: func(s *StratJob, evt *orm.DataSeries) {
+			OnData: func(s *StratJob, data *DataFields) {
 			},
 			OnDataSubs: func(s *StratJob) []*DataSub {
 				return []*DataSub{
@@ -244,5 +244,36 @@ func TestUpdatePairs_RebuildsWarmsFromCurrentDataSubs(t *testing.T) {
 	}
 	if _, ok := lastWarmPairs["BTC/USDT"]["1d"]; ok {
 		t.Fatalf("non-kline side inputs should not be added to warm kline subscriptions: %+v", lastWarmPairs["BTC/USDT"])
+	}
+}
+
+func TestEnsureStratJobAllowsBatchInfoSideSubscription(t *testing.T) {
+	resetStratGlobals()
+	core.OrderMatchTfs = map[string]bool{}
+
+	exs := &orm.ExSymbol{ID: 1, Exchange: "binance", Market: "linear", Symbol: "BTC/USDT:USDT"}
+	env, err := ta.NewBarEnv(exs.Exchange, exs.Market, exs.Symbol, "15m")
+	if err != nil {
+		t.Fatalf("create bar env: %v", err)
+	}
+	stgy := &TradeStrat{
+		Name:      "batch-info",
+		BatchInfo: true,
+		Policy:    &config.RunPolicyConfig{},
+		OnPairInfos: func(s *StratJob) []*PairSub {
+			return []*PairSub{{Pair: "_cur_", TimeFrame: "1h", WarmupNum: 10}}
+		},
+		OnBatchInfos: func(string, map[string]*JobEnv) {},
+	}
+
+	ensureStratJob(stgy, "15m", exs, env, core.OdDirtBoth, func(string, string, int) {}, accStratLimits{})
+
+	job := AccJobs[config.DefAcc]["BTC/USDT:USDT_15m"][stgy.Name]
+	if job == nil {
+		t.Fatal("expected main job to be created")
+	}
+	key := DataSubKey(orm.SeriesSourceKline, exs.ID, "1h")
+	if AccInfoJobs[config.DefAcc][key][stgy.Name+"_"+exs.Symbol] != job {
+		t.Fatal("expected batch-info strategy to be registered for its side input")
 	}
 }

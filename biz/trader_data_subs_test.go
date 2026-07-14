@@ -25,13 +25,15 @@ func TestFeedSeriesRoutesNonKlineDataSubs(t *testing.T) {
 		strat.AccInfoJobs = oldInfoJobs
 	})
 
-	var got []*orm.DataSeries
+	var got []*strat.DataFields
+	var gotWarmups []bool
 	job := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(s *strat.StratJob, evt *orm.DataSeries) {
-				got = append(got, evt)
-				if evt.Source != "macro" {
-					t.Fatalf("unexpected source: %s", evt.Source)
+			OnData: func(s *strat.StratJob, data *strat.DataFields) {
+				got = append(got, data)
+				gotWarmups = append(gotWarmups, data.IsWarmUp())
+				if data.Source() != "macro" {
+					t.Fatalf("unexpected source: %s", data.Source())
 				}
 			},
 		},
@@ -90,19 +92,19 @@ func TestFeedSeriesRoutesNonKlineDataSubs(t *testing.T) {
 	if len(got) != len(events) {
 		t.Fatalf("expected OnData called %d times, got %d", len(events), len(got))
 	}
-	if !got[0].IsWarmUp {
+	if !gotWarmups[0] {
 		t.Fatalf("expected warmup event to reach OnData, got %+v", got[0])
 	}
 	if job.IsWarmUp {
 		t.Fatalf("expected latest non-warmup event to clear job warmup state")
 	}
-	latest := job.DataHub.Latest("macro", 11, "1d")
-	if latest == nil || latest.TimeMS != 300 || latest.IsWarmUp {
+	latest := job.DataHub.Get("1d", "macro", 11)
+	if latest == nil || latest.TimeMS() != 300 || latest.IsWarmUp() {
 		t.Fatalf("expected DataHub latest non-kline event at 300, got %+v", latest)
 	}
-	window := job.DataHub.Window("macro", 11, "1d", 3)
-	if len(window) != 3 || window[0].TimeMS != 100 || !window[0].IsWarmUp || window[2].TimeMS != 300 {
-		t.Fatalf("expected ordered non-kline window with warmup preserved, got %+v", window)
+	series := latest.Series("value")
+	if series == nil || series.Len() != 3 || series.Get(0) != 12 || series.Get(2) != 10 {
+		t.Fatalf("expected ordered non-kline value series, got %+v", series)
 	}
 }
 
@@ -197,10 +199,10 @@ func TestFeedSeriesCoexistsForThirdPartyAndLegacyInfoSubs(t *testing.T) {
 	macroEvents := 0
 	macroJob := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(s *strat.StratJob, evt *orm.DataSeries) {
+			OnData: func(s *strat.StratJob, data *strat.DataFields) {
 				macroEvents++
-				if evt.Source != "macro" || evt.Sid != 11 || evt.TimeFrame != "1d" {
-					t.Fatalf("unexpected macro routing identity: %+v", evt)
+				if data.Source() != "macro" || data.Sid() != 11 || data.TimeFrame() != "1d" {
+					t.Fatalf("unexpected macro routing identity: %+v", data)
 				}
 			},
 		},
@@ -272,18 +274,18 @@ func TestFeedSeriesCoexistsForThirdPartyAndLegacyInfoSubs(t *testing.T) {
 	if legacyCalls != 1 {
 		t.Fatalf("expected legacy OnInfoBar once, got %d", legacyCalls)
 	}
-	macroLatest := macroJob.DataHub.Latest("macro", 11, "1d")
-	if macroLatest == nil || macroLatest.TimeMS != 100 {
+	macroLatest := macroJob.DataHub.Get("1d", "macro", 11)
+	if macroLatest == nil || macroLatest.TimeMS() != 100 {
 		t.Fatalf("expected macro DataHub latest at 100, got %+v", macroLatest)
 	}
-	legacyLatest := legacyJob.DataHub.Latest("kline", exs.ID, "5m")
-	if legacyLatest == nil || legacyLatest.TimeMS != 200 {
+	legacyLatest := legacyJob.DataHub.Get("5m", "kline", exs.ID)
+	if legacyLatest == nil || legacyLatest.TimeMS() != 200 {
 		t.Fatalf("expected legacy DataHub latest at 200, got %+v", legacyLatest)
 	}
-	if macroJob.DataHub.Latest("kline", exs.ID, "5m") != nil {
+	if macroJob.DataHub.Get("5m", "kline", exs.ID) != nil {
 		t.Fatalf("expected macro job hub to stay isolated from legacy kline key")
 	}
-	if legacyJob.DataHub.Latest("macro", 11, "1d") != nil {
+	if legacyJob.DataHub.Get("1d", "macro", 11) != nil {
 		t.Fatalf("expected legacy job hub to stay isolated from macro key")
 	}
 }

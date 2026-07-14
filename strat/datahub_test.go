@@ -1,10 +1,12 @@
 package strat
 
 import (
+	"math"
 	"reflect"
 	"testing"
 
 	"github.com/banbox/banbot/orm"
+	ta "github.com/banbox/banta"
 )
 
 func TestCollectDataSubsNormalizesThirdPartySource(t *testing.T) {
@@ -33,7 +35,7 @@ func TestCollectDataSubsPreservesRequestedFields(t *testing.T) {
 	job := &StratJob{
 		Symbol: &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"},
 		Strat: &TradeStrat{OnDataSubs: func(s *StratJob) []*DataSub {
-			return []*DataSub{{Source: "kline", ExSymbol: s.Symbol, TimeFrame: "1h", Fields: []string{"close", "signal", "close"}}}
+			return []*DataSub{{Source: "kline", ExSymbol: s.Symbol, TimeFrame: "1h", Fields: []string{"close"}, SeriesFields: []string{"signal", "signal"}}}
 		}},
 	}
 	subs := CollectDataSubs(job)
@@ -41,61 +43,104 @@ func TestCollectDataSubsPreservesRequestedFields(t *testing.T) {
 	if len(subs) != 1 || !reflect.DeepEqual(subs[0].Fields, want) {
 		t.Fatalf("expected requested fields %v, got %+v", want, subs)
 	}
-}
-
-func TestDataHubLatestAndWindow(t *testing.T) {
-	hub := NewDataHub()
-	hub.Set(&orm.DataSeries{Source: "kline", Sid: 1, TimeMS: 100, EndMS: 200, TimeFrame: "1m", Values: map[string]any{"close": 1.0}})
-	hub.Set(&orm.DataSeries{Source: "kline", Sid: 1, TimeMS: 200, EndMS: 300, TimeFrame: "1m", Values: map[string]any{"close": 2.0}})
-	hub.Set(&orm.DataSeries{Source: "macro", Sid: 7, TimeMS: 300, EndMS: 400, TimeFrame: "1d", IsWarmUp: true, Values: map[string]any{"value": 10.0}})
-	hub.Set(&orm.DataSeries{Source: "macro", Sid: 7, TimeMS: 400, EndMS: 500, TimeFrame: "1d", Values: map[string]any{"value": 11.0}})
-	hub.Set(&orm.DataSeries{Source: "macro", Sid: 7, TimeMS: 500, EndMS: 600, TimeFrame: "1d", Values: map[string]any{"value": 12.0}})
-
-	latest := hub.Latest("kline", 1, "1m")
-	if latest == nil || latest.TimeMS != 200 {
-		t.Fatalf("unexpected kline latest event: %+v", latest)
-	}
-	window := hub.Window("kline", 1, "1m", 2)
-	if len(window) != 2 || window[0].TimeMS != 100 || window[1].TimeMS != 200 {
-		t.Fatalf("unexpected kline window: %+v", window)
-	}
-
-	macroLatest := hub.Latest("macro", 7, "1d")
-	if macroLatest == nil || macroLatest.TimeMS != 500 || macroLatest.IsWarmUp {
-		t.Fatalf("unexpected macro latest event: %+v", macroLatest)
-	}
-	macroWindow := hub.Window("macro", 7, "1d", 2)
-	if len(macroWindow) != 2 || macroWindow[0].TimeMS != 400 || macroWindow[1].TimeMS != 500 {
-		t.Fatalf("unexpected macro trailing window: %+v", macroWindow)
-	}
-	fullMacroWindow := hub.Window("macro", 7, "1d", 0)
-	if len(fullMacroWindow) != 3 || !fullMacroWindow[0].IsWarmUp || fullMacroWindow[2].TimeMS != 500 {
-		t.Fatalf("unexpected macro full window ordering: %+v", fullMacroWindow)
+	if !reflect.DeepEqual(subs[0].SeriesFields, []string{"signal"}) {
+		t.Fatalf("expected normalized series fields, got %+v", subs[0].SeriesFields)
 	}
 }
 
-func TestDataHubLatestAndWindowSeparatesThirdPartyAndLegacySeriesBySource(t *testing.T) {
-	hub := NewDataHub()
-	hub.Set(&orm.DataSeries{Source: "kline", Sid: 7, TimeMS: 100, EndMS: 200, TimeFrame: "1d", Values: map[string]any{"close": 1.0}})
-	hub.Set(&orm.DataSeries{Source: "macro", Sid: 7, TimeMS: 300, EndMS: 400, TimeFrame: "1d", IsWarmUp: true, Values: map[string]any{"value": 10.0}})
-	hub.Set(&orm.DataSeries{Source: "macro", Sid: 7, TimeMS: 400, EndMS: 500, TimeFrame: "1d", Values: map[string]any{"value": 11.0}})
-	hub.Set(&orm.DataSeries{Source: "kline", Sid: 7, TimeMS: 500, EndMS: 600, TimeFrame: "1d", Values: map[string]any{"close": 2.0}})
+func TestDataHubBuildsConfiguredAndDefaultSeries(t *testing.T) {
+	hub := NewDataHub(2)
+	exs := &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"}
+	hub.Configure([]*DataSub{{
+		Source: "kline", ExSymbol: exs, TimeFrame: "1m", SeriesFields: []string{"close", "trade_num"},
+	}})
+	avg := math.NaN()
+	for i := int64(1); i <= 3; i++ {
+		updated := hub.Set(&orm.DataSeries{
+			Source: "kline", Sid: 7, TimeMS: i * 100, EndMS: i*100 + 100, TimeFrame: "1m",
+			Values: map[string]any{"close": float64(i), "trade_num": i, "status": "ok"},
+		})
+		avg = ta.SMA(updated.Series("close"), 2).Get(0)
+	}
+	fields := hub.Get("1m", "kline", 7)
+	if fields == nil || fields.TimeMS() != 300 || fields.DoneMS() != 400 {
+		t.Fatalf("unexpected field timestamps: %+v", fields)
+	}
+	if fields.Series("close").Len() != 2 || fields.Float64("close") != 3 {
+		t.Fatalf("unexpected close series: %+v", fields.Series("close"))
+	}
+	if fields.Series("trade_num").Get(0) != 3 || fields.Int64("trade_num") != 3 {
+		t.Fatalf("explicit integer field was not converted to series")
+	}
+	if avg != 2.5 {
+		t.Fatalf("configured series should support banta indicators, got %v", avg)
+	}
+	if fields.Series("status") != nil || fields.String("status") != "ok" {
+		t.Fatalf("non-series value not retained: %v", fields.Raw("status"))
+	}
 
-	legacyLatest := hub.Latest("kline", 7, "1d")
-	if legacyLatest == nil || legacyLatest.TimeMS != 500 {
-		t.Fatalf("expected legacy latest at 500, got %+v", legacyLatest)
+	hub.Set(&orm.DataSeries{
+		Source: "macro", Sid: 7, TimeMS: 100, EndMS: 200, TimeFrame: "1m",
+		Values: map[string]any{"ratio": float32(1.5), "count": int64(4)},
+	})
+	macro := hub.Get("1m", "macro", 7)
+	if macro.Series("ratio") == nil || macro.Series("count") != nil || macro.Int64("count") != 4 {
+		t.Fatalf("default series selection should include only float values: %+v", macro)
 	}
-	thirdPartyLatest := hub.Latest("macro", 7, "1d")
-	if thirdPartyLatest == nil || thirdPartyLatest.TimeMS != 400 || thirdPartyLatest.IsWarmUp {
-		t.Fatalf("expected third-party latest at 400 without warmup, got %+v", thirdPartyLatest)
+	if hub.Get("1m", "kline", 7).Float64("close") != 3 {
+		t.Fatal("sources sharing sid/timeframe must remain isolated")
 	}
-	legacyWindow := hub.Window("kline", 7, "1d", 0)
-	if len(legacyWindow) != 2 || legacyWindow[0].TimeMS != 100 || legacyWindow[1].TimeMS != 500 {
-		t.Fatalf("expected legacy window to remain source-scoped, got %+v", legacyWindow)
+	hub.Set(&orm.DataSeries{Source: "kline", Sid: 7, TimeMS: 300, EndMS: 400, TimeFrame: "1m", Values: map[string]any{"close": 99.0}})
+	if fields.Series("close").Len() != 2 || fields.Float64("close") != 3 || math.IsNaN(fields.Float64("close")) {
+		t.Fatal("duplicate end timestamps must not append or replace series values")
 	}
-	thirdPartyWindow := hub.Window("macro", 7, "1d", 0)
-	if len(thirdPartyWindow) != 2 || !thirdPartyWindow[0].IsWarmUp || thirdPartyWindow[1].TimeMS != 400 {
-		t.Fatalf("expected third-party window to remain source-scoped, got %+v", thirdPartyWindow)
+
+	missingHub := NewDataHub()
+	missingHub.Configure([]*DataSub{{Source: "macro", ExSymbol: exs, TimeFrame: "1m", SeriesFields: []string{"a", "b"}}})
+	missingHub.Set(&orm.DataSeries{Source: "macro", Sid: 7, TimeMS: 100, EndMS: 200, TimeFrame: "1m", Values: map[string]any{"a": 1.0, "b": 2.0}})
+	missingHub.Set(&orm.DataSeries{Source: "macro", Sid: 7, TimeMS: 200, EndMS: 300, TimeFrame: "1m", Values: map[string]any{"a": 3.0}})
+	missingFields := missingHub.Get("1m", "macro", 7)
+	if missingFields.Series("a").Len() != missingFields.Series("b").Len() || !math.IsNaN(missingFields.Series("b").Get(0)) {
+		t.Fatal("missing configured fields must append NaN to keep series aligned")
+	}
+}
+
+func TestDataHubAllReadyOnlyChecksClosingTimeframes(t *testing.T) {
+	const minute = int64(60_000)
+	base := int64(1_700_000_000_000 / (15 * minute) * (15 * minute))
+	exs := &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"}
+	macro := &orm.ExSymbol{ID: 8, Symbol: "CPI_US"}
+	hub := NewDataHub()
+	hub.Configure([]*DataSub{
+		{Source: "kline", ExSymbol: exs, TimeFrame: "1m"},
+		{Source: "kline", ExSymbol: exs, TimeFrame: "5m"},
+		{Source: "kline", ExSymbol: exs, TimeFrame: "15m"},
+		{Source: "macro", ExSymbol: macro, TimeFrame: "5m"},
+	})
+	hub.Set(&orm.DataSeries{Source: "kline", Sid: 7, TimeFrame: "15m", TimeMS: base - 15*minute, EndMS: base, Values: map[string]any{"close": 1.0}})
+	hub.Set(&orm.DataSeries{Source: "kline", Sid: 7, TimeFrame: "5m", TimeMS: base, EndMS: base + 5*minute, Values: map[string]any{"close": 1.0}})
+	if hub.AllReady() {
+		t.Fatal("1m must block 16:05 readiness until its data arrives")
+	}
+	hub.Set(&orm.DataSeries{Source: "kline", Sid: 7, TimeFrame: "1m", TimeMS: base + 4*minute, EndMS: base + 5*minute, Values: map[string]any{"close": 1.0}})
+	if hub.AllReady() {
+		t.Fatal("all sources and sids closing at 16:05 must be ready")
+	}
+	hub.Set(&orm.DataSeries{Source: "macro", Sid: 8, TimeFrame: "5m", TimeMS: base, EndMS: base + 5*minute, Values: map[string]any{"value": 1.0}})
+	if !hub.AllReady() {
+		t.Fatal("1m and 5m should be ready at 16:05; 15m must not block")
+	}
+
+	end15 := base + 15*minute
+	hub.Set(&orm.DataSeries{Source: "kline", Sid: 7, TimeFrame: "1m", TimeMS: end15 - minute, EndMS: end15, Values: map[string]any{"close": 2.0}})
+	hub.Set(&orm.DataSeries{Source: "kline", Sid: 7, TimeFrame: "5m", TimeMS: end15 - 5*minute, EndMS: end15, Values: map[string]any{"close": 2.0}})
+	hub.Set(&orm.DataSeries{Source: "macro", Sid: 8, TimeFrame: "5m", TimeMS: end15 - 5*minute, EndMS: end15, Values: map[string]any{"value": 2.0}})
+	if hub.AllReady() {
+		t.Fatal("15m must block readiness at its closing boundary")
+	}
+	hub.Set(&orm.DataSeries{Source: "kline", Sid: 7, TimeFrame: "15m", TimeMS: base, EndMS: end15, Values: map[string]any{"close": 2.0}})
+	if !hub.AllReady() {
+		t.Fatal("all closing timeframes should be ready at 16:15")
 	}
 }
 

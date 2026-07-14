@@ -23,6 +23,8 @@ export default defineConfig({
                         { text: 'Banbot基础', link: '/zh-CN/guide/basic' },
                         { text: '命令行', link: '/zh-CN/guide/bot_usage' },
                         { text: '配置', link: '/zh-CN/guide/configuration' },
+                        { text: '数据库', link: '/zh-CN/guide/database' },
+                        { text: '自定义时序数据', link: '/zh-CN/guide/custom_data' },
                         { text: '自定义策略', link: '/zh-CN/guide/strat_custom' },
                         { text: '回测', link: '/zh-CN/guide/backtest' },
                         { text: '品种管理器', link: '/zh-CN/guide/pair_filters' },

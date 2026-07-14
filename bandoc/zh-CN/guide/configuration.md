@@ -175,13 +175,14 @@ exchange:  # 交易所配置
       linear:  # 键可以是：linear/inverse/main(spot or margin)
         taker: 0.0005
         maker: 0.0002
-database:  # 数据库配置(QuestDB，启动时自动下载安装)
+database:  # 数据库配置，支持 QuestDB 和 TimescaleDB
   retention: all
   max_pool_size: 50  # 连接池最大大小
-  auto_create: true  # 数据库不存在时，是否自动创建
+  auto_create: true  # 连接成功后是否初始化/升级 banbot schema
+  db_type: questdb  # questdb 或 timescale
   url: postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable
-  qdb_mem_pct: 0.3 # QuestDB内存使用占比，范围0~1
-  qdb_max_mem_mb: 16384 # 数据库最大内存使用量，单位MB
+  qdb_mem_pct: 0.3 # 仅 QuestDB：内存使用占比，范围0~1
+  qdb_max_mem_mb: 16384 # 仅 QuestDB：数据库最大内存使用量，单位MB
 spider_addr: 127.0.0.1:6789  # 爬虫监听的端口和地址
 rpc_channels:  # 支持的全部rpc渠道
   # 邮件通知渠道
