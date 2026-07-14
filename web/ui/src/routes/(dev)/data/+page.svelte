@@ -197,11 +197,12 @@
                         <th>Rows</th>
                         <th>Segments</th>
                         <th>Status</th>
+                        <th></th>
                     </tr>
                 </thead>
                 <tbody>
                     {#if seriesRanges.length === 0}
-                        <tr><td colspan="9" class="text-base-content/60">No series ranges found.</td></tr>
+                        <tr><td colspan="10" class="text-base-content/60">No series ranges found.</td></tr>
                     {:else}
                         {#each seriesRanges as row}
                             <tr class="hover:bg-base-300">
@@ -219,6 +220,9 @@
                                 <td>{rangeRows(row)}</td>
                                 <td>{row.segments}</td>
                                 <td><span class="badge badge-sm {row.has_data ? 'badge-success' : 'badge-warning'}">{row.has_data ? 'data' : 'hole'}</span></td>
+                                <td>
+                                    <a class="btn btn-xs btn-ghost" href={localizeHref(`/data/series?source=${encodeURIComponent(row.source)}&sid=${row.sid}&tf=${encodeURIComponent(row.timeframe)}`)}>View</a>
+                                </td>
                             </tr>
                         {/each}
                     {/if}
@@ -245,11 +249,12 @@
                         <th>Last Backfill</th>
                         <th>Subscription</th>
                         <th>Registered</th>
+                        <th></th>
                     </tr>
                 </thead>
                 <tbody>
                     {#if dataSources.length === 0}
-                        <tr><td colspan="8" class="text-base-content/60">No custom data sources registered.</td></tr>
+                        <tr><td colspan="9" class="text-base-content/60">No custom data sources registered.</td></tr>
                     {:else}
                         {#each dataSources as src}
                             <tr class="hover:bg-base-300">
@@ -275,6 +280,9 @@
                                 <td title={src.register_source}>
                                     <div>{fmtDateStr(src.registered_at_ms)}</div>
                                     <div class="text-xs text-base-content/60 truncate max-w-64">{src.register_source || '-'}</div>
+                                </td>
+                                <td>
+                                    <a class="btn btn-xs btn-ghost" href={localizeHref(`/data/series?source=${encodeURIComponent(src.name)}&tf=${encodeURIComponent(src.timeframe)}`)}>View</a>
                                 </td>
                             </tr>
                         {/each}

@@ -70,6 +70,23 @@ banbot 推荐两种接入方式：
 
 读取 kline 扩展列时仍使用同一个订阅入口，例如 `DataSub{Source: "kline", Fields: []string{"open_interest"}, ...}`。主 kline 的默认字段会和显式字段合并，因此 `OnData` 可读取 `evt.Values["open_interest"]`，`OnBar` 继续正常消费 OHLCV。
 
+### 2.3 WebUI / DashboardUI 管理与查看
+
+已注册的任意独立时序数据都可以在两个 UI 中查看：
+
+- 开发端：`数据`页面的 `Series Ranges` 和 `Data Sources` 表都提供 `View` 入口。
+- Dashboard：侧栏 `数据`入口提供相同的序列查看器，读取当前连接的 bot API。
+- 查看器按 `source + sid + timeframe` 查询，可限定起止时间、最大行数和字段子集；未填写时间时默认读取最近 30 天，最大单次返回 1000 行。
+- 返回值保留 `DataSeries` 的时间区间、闭合状态和 `Values`，所以 `float`、`int`、`string`、`bool`、`json` 字段均可直接检查。字段筛选只接受注册 `SeriesInfo.Binding.Fields` 中定义的列。
+
+底层接口为只读 `GET /api/kline/series`：
+
+```text
+source=<source>&sid=<sid>&timeframe=<tf>&start=<ms>&end=<ms>&limit=<n>&fields=a,b
+```
+
+其中 `source` 为已注册数据源名，`sid` 为 `ExSymbol.ID`。内置 `kline` 也可通过该接口读取默认 OHLCV 字段，或在 `fields` 中声明数值型扩展列。写入、补齐与删除仍应通过 `SeriesStore` / 数据源运行时完成；查看器不执行任何修改。
+
 ---
 
 ## 3. 当前实现结论
@@ -366,6 +383,7 @@ type DataSub struct {
     ExSymbol  *orm.ExSymbol
     TimeFrame string
     WarmupNum int
+    Fields    []string
 }
 ```
 
@@ -633,6 +651,11 @@ func init() {
 - `TestEnsureSeriesRangeQuestDB`
 - `TestHistSeriesFeederJoinsUnifiedTimeline`
 
+#### `web/base`
+
+- `TestResolveSeriesQueryInfoProjectsRegisteredFields`
+- `TestResolveSeriesQueryInfoBuildsKlineMetadata`
+
 #### `biz`
 
 - `TestOHLCVSeriesTriggersOnDataAndOnBar`
@@ -681,3 +704,4 @@ func init() {
 6. **内部通用数据链路一律使用 `DataSeries` / `DataRecord` / `SeriesInfo` / `SeriesBinding`。**
 7. **旧 Kline 接口只保留在 `TradeStrat` / `StratJob` 的兼容层，不再作为新功能设计基准。**
 8. **所有新接入的第三方时序数据都应先注册 source，再通过 `DataSub + ExSymbol.sid` 接入统一主链路。**
+9. **管理端和 Dashboard 的明细查看统一使用 `/api/kline/series`；该接口只读，不替代数据源的写入与补齐流程。**

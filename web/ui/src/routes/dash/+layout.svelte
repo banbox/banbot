@@ -29,6 +29,7 @@
     { path: localizeHref('/dash/board'), icon: 'home', text: m.home() },
     { path: localizeHref('/dash/strat_job'), icon: 'square-stack-3', text: m.strat_job() },
     { path: localizeHref('/dash/kline'), icon: 'chart-bar', text: m.kline() },
+    { path: localizeHref('/dash/series'), icon: 'chart-bar', text: m.data() },
     { path: localizeHref('/dash/perf'), icon: 'calender', text: m.perf() },
     { path: localizeHref('/dash/order'), icon: 'number-list', text: m.order() },
     { path: localizeHref('/dash/rebate'), icon: 'dollar', text: m.rebate() },
