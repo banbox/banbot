@@ -833,7 +833,7 @@ func (r *BTResult) dumpStrategy() {
 			continue
 		}
 		tgtDir := fmt.Sprintf("%s/strat_%s", r.OutDir, dname)
-		err_ = utils.CopyDir(curDir, tgtDir)
+		err_ = utils.CopyDirExcluding(curDir, tgtDir, r.OutDir)
 		if err_ != nil {
 			log.Warn("backup strat fail", zap.String("name", name), zap.Error(err_))
 		}

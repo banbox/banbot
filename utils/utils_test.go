@@ -60,6 +60,32 @@ func TestCopyDir(t *testing.T) {
 	}
 }
 
+func TestCopyDirExcluding(t *testing.T) {
+	root := t.TempDir()
+	srcDir := filepath.Join(root, "source")
+	tgtDir := filepath.Join(root, "target")
+	excludedDir := filepath.Join(srcDir, "backtest")
+	if err := os.MkdirAll(filepath.Join(excludedDir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "strategy.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(excludedDir, "nested", "report.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CopyDirExcluding(srcDir, tgtDir, excludedDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(tgtDir, "strategy.go")); err != nil {
+		t.Fatalf("expected non-excluded source file to be copied: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tgtDir, "backtest")); !os.IsNotExist(err) {
+		t.Fatalf("expected excluded subtree to be absent, got %v", err)
+	}
+}
+
 func TestHashToAlphaNum(t *testing.T) {
 	tests := []struct {
 		input  string

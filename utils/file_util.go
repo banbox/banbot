@@ -22,6 +22,38 @@ import (
 )
 
 func CopyDir(src, dst string) error {
+	return copyDir(src, dst, nil)
+}
+
+// CopyDirExcluding copies a directory tree while skipping every excluded path and its descendants.
+func CopyDirExcluding(src, dst string, excludes ...string) error {
+	cleanExcludes := make([]string, 0, len(excludes))
+	for _, path := range excludes {
+		if path == "" {
+			continue
+		}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		cleanExcludes = append(cleanExcludes, filepath.Clean(absPath))
+	}
+	return copyDir(src, dst, func(path string) bool {
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return false
+		}
+		for _, excluded := range cleanExcludes {
+			rel, err := filepath.Rel(excluded, absPath)
+			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func copyDir(src, dst string, skip func(string) bool) error {
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		return err
@@ -31,6 +63,9 @@ func CopyDir(src, dst string) error {
 	}
 	for _, entry := range entries {
 		sourcePath := filepath.Join(src, entry.Name())
+		if skip != nil && skip(sourcePath) {
+			continue
+		}
 		destPath := filepath.Join(dst, entry.Name())
 
 		fileInfo, err := os.Lstat(sourcePath)
@@ -43,7 +78,7 @@ func CopyDir(src, dst string) error {
 			if err = EnsureDir(destPath, 0755); err != nil {
 				return err
 			}
-			if err = CopyDir(sourcePath, destPath); err != nil {
+			if err = copyDir(sourcePath, destPath, skip); err != nil {
 				return err
 			}
 		case os.ModeSymlink:
