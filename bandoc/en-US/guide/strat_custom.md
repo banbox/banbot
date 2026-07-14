@@ -112,7 +112,7 @@ type TradeStrat struct {
 	StopEnterBars int     // If the limit order exceeds the given K line and still does not enter the market, it will be cancelled
 	EachMaxLong   int      // max number of long open orders for one pair
 	EachMaxShort  int      // max number of short open orders for one pair
-	AllowTFs      []string // Allow running time period, use global configuration when not provided
+	RunTimeFrames []string // Allow running time period, use global configuration when not provided
 	Outputs       []string // The content of the text file output by the strategy, where each string is one line
 	Policy        *config.RunPolicyConfig
 

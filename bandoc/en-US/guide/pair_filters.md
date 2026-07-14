@@ -7,9 +7,15 @@ When the robot starts, the instrument filter will be run once by default to get 
 
 You can also specify a cron expression to execute and refresh the tradable list regularly.
 
-When a certain instrument needs to be removed, if there is an open order, it will not be removed temporarily.
+When a certain instrument needs to be removed, `pairmgr.pos_on_rotation` controls the behavior: `hold` keeps the position but prevents new entries, while `close` exits the position before removing the symbol.
 
-The corn expression will also be executed during backtesting to refresh the instrument list regularly to achieve an effect similar to real-time trading.
+The cron expression will also be executed during backtesting to refresh the instrument list regularly to achieve an effect similar to real-time trading.
+
+```yaml
+pairmgr:
+  pos_on_rotation: hold  # hold or close
+  use_latest: false      # Whether backtesting without cron uses the latest date for the symbol list
+```
 
 ## All supported filters
 * VolumePairList

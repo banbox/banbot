@@ -14,8 +14,9 @@ entry.AddCmdJob(&entry.CmdJob{
     Help:    "show hello",
 })
 ```
+`Parent` must be an already registered command group; use an empty string for a root command. To add a subcommand, register its parent first with `entry.AddGroup`.
 You can then trigger the execution of the `showHello` function by typing `bot hello`. This function will accept a `*config.CmdArgs` parameter, which stores the parsed command-line arguments. If you need to access specific arguments, please fill in the required field names in the `Options` section.
-All available field names can be found in the `bindSubFlags` function in [entry/main](https://github.com/banbox/banbot/blob/main/entry/main.go).
+All available field names can be found in the `bindSubFlags` function in [entry/main](https://github.com/banbox/banbot/blob/main/entry/main.go); common argument fields are bound in `config.CmdArgs.BindToFlag`.
 
 ### Registering Functions with Arbitrary Arguments
 Fixed `Options` and `*config.CmdArgs` might not meet your personalized needs.

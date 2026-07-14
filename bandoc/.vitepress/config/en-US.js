@@ -21,6 +21,8 @@ export default defineConfig({
                         { text: 'Banbot Basics', link: '/en-US/guide/basic' },
                         { text: 'Commands', link: '/en-US/guide/bot_usage' },
                         { text: 'Configuration', link: '/en-US/guide/configuration' },
+                        { text: 'Database', link: '/en-US/guide/database' },
+                        { text: 'Custom Time-Series Data', link: '/en-US/guide/custom_data' },
                         { text: 'Custom Strategy', link: '/en-US/guide/strat_custom' },
                         { text: 'Backtesting', link: '/en-US/guide/backtest' },
                         { text: 'Symbol Manager', link: '/en-US/guide/pair_filters' },
@@ -31,7 +33,7 @@ export default defineConfig({
                     text: 'Advanced',
                     items: [
                         { text: 'Initialize new project', link: '/en-US/guide/init_project' },
-                        {text: 'Custom commands', link: '/zh-CN/advanced/custom_cmd'},
+                        {text: 'Custom commands', link: '/en-US/advanced/custom_cmd'},
                         {text: 'CandleStick Tools', link: '/en-US/advanced/kline_tools'},
                         { text: 'Hyperparameter optimization', link: '/en-US/guide/hyperopt' },
                         { text: 'Rolling optimization backtesting', link: '/en-US/guide/roll_btopt' },

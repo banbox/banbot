@@ -97,8 +97,8 @@ Options:
 ## Main Components
 The execution of backtesting and live trading involves various aspects. To ensure the project's structure remains flexible and clear, the main components involved in banbot include:
 
-* Spider Process: banbot uses a separate spider process to monitor public data from exchanges, write it into the database, and push it in real time via TCP to multiple listening bots. This allows banbot to support running a set of strategies across multiple accounts simultaneously.
-* DataProvider: Integrates all the symbols involved in backtesting/live trading (each symbol corresponds to a Feeder, and each Feeder supports multiple timeframes), and executes received candlesticks via callback functions.
+* Spider Process: banbot uses a separate spider process to monitor public exchange data such as K-lines, write it into the database, and push it in real time via TCP to multiple listening bots. This allows banbot to support running a set of strategies across multiple accounts simultaneously.
+* DataProvider: Integrates all the symbols involved in backtesting/live trading (each symbol corresponds to a Feeder, and each Feeder supports multiple timeframes), and executes received K-lines as unified time-series events. Third-party time-series data is backfilled and pushed to strategies in real time by registered data sources, without going through Spider.
 * Order Manager (OrderMgr): In backtesting, it matches the order request based on candlesticks; in live trading, it submits the order to the exchange and monitors the execution progress for real-time updates.
 * Wallets: During backtesting, it simulates the available balance, frozen amount, unrealized P&L, etc., based on order execution; in live trading, it monitors the exchange's account wallet status for real-time updates.
 * Exchange: Based on banexg, it supports Binance, OKX, and Bybit's REST/websocket, used for downloading candlesticks, querying market information, order processing, and listening to websocket streams.

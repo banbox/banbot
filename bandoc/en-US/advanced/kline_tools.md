@@ -1,18 +1,11 @@
 banbot supports rich candlestick processing tools including downloading, importing, exporting, deleting, and correcting.
 
-## candlestick Storage Core
-banbot uses QuestDB time-series database for storing candlestick and other data to provide better performance in reading and downloading. banbot will automatically download and install QuestDB on startup, no manual configuration is required.
+## Candlestick Storage Core
+banbot supports QuestDB and TimescaleDB for storing candlestick and other time-series data. When using QuestDB, banbot can download and install it locally; TimescaleDB must be deployed by the user. Both backends support the download, import, export, deletion, and correction tools on this page. See [Database](../guide/database.md) for configuration.
 
 To achieve a good balance between storage space and reading efficiency, only `1m,5m,15m,1h,1d` time periods are stored. However, you can use any time period like `3m` in your strategy. Unstored time periods will be automatically aggregated dynamically from smaller time period data.
 
-The database uses the `KInfo` table, which stores the candlestick start and end ranges for each symbol + time period: sid, timeframe, start, stop; This helps determine the range when reading or downloading candlesticks.
-
-The `KHole` table stores candlestick discontinuous gaps for each symbol + time period: sid, timeframe, start, stop, no_data;
-Where no_data being true indicates that the exchange has no candlestick data for this symbol during this time range (possibly due to trading suspension, etc.);
-no_data being false indicates that data download hasn't been attempted for this interval.
-
-The `KLineUn` table stores incomplete candlesticks for each symbol + time period: sid, timeframe, start_ms, stop_ms, open, high, low, close, volume;
-sid+timeframe should correspond to a unique record in this table. If the current time is 10:37, there should be a record on `1h` with start_ms corresponding to 10:00 and stop_ms corresponding to 10:37.
+banbot uses an internal coverage mechanism to record downloaded ranges and confirmed no-data ranges for each symbol and timeframe. The mechanism is consistent across both database backends; manage data through the commands on this page instead of relying on or modifying internal metadata tables directly.
 
 ## Downloading Candlesticks
 You don't need to implement candlestick data downloading, banbot will automatically download the required data during backtesting and live trading.
@@ -22,6 +15,14 @@ You can execute the following command to actively download candlestick data:
 `bot kline down -timeframes 1h,1d -timerange 20240101-20250101 -pairs BTC,ETH`
 
 Where `timeframes` is a required parameter, and the rest will be parsed from the yaml configuration file if not specified.
+
+## Aggregating Larger Timeframes
+
+When smaller-timeframe candlesticks already exist and you need to generate larger-timeframe data proactively, run:
+
+`bot kline agg -timeframes 1h,1d -pairs BTC,ETH`
+
+`-timeframes` and `-pairs` limit the aggregation scope. Normal backtests and live trading read, download, and aggregate data on demand; run this command manually only when data needs to be prepared in advance.
 
 ## Exporting Candlesticks (protobuf)
 When you need to synchronize candlestick data to another banbot's database, it's recommended to export in `protobuf` format, which is optimized for both storage space and execution speed.
@@ -93,10 +94,17 @@ Where `-timeframes` is a required parameter. When `-pairs` is not specified, it 
 Before starting deletion, summary information will be output, requiring you to input `y` to confirm deletion.
 
 ## Correcting Errors in Candlesticks
-While using banbot, sometimes misoperations may cause errors in `kInfo` or `KHole` that don't match the actual candlesticks. This will lead to runtime errors. You can run the following command to correct these errors:
+While using banbot, an unexpected interruption or a change to historical data may cause candlesticks to become inconsistent with the internal coverage ranges, affecting later downloads or reads. You can run the following command to correct the inconsistency:
 
 `bot kline correct -pairs BTC`
 
 Where `-pairs` is an optional parameter. If left empty, correction will be executed for all symbols, which may take an hour or two depending on the data size.
 
+## Verifying Candlesticks and Coverage
+
+`bot kline verify` checks whether candlestick data is consistent with the internal coverage metadata:
+
+`bot kline verify -pairs BTC,ETH -tables kline_1m,kline_1h -batch-size 1000`
+
+All parameters are optional. `-pairs` limits symbols, `-tables` limits data tables, and `-batch-size` controls the number of rows checked per batch. When an inconsistency is found, back up the data first, then use `bot kline correct` or download the data again.
 

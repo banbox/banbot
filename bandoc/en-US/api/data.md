@@ -2,6 +2,20 @@
 
 The data package provides functionality for data processing and management.
 
+The main data path in the `data` package now uses `orm.DataSeries`. The K-line Feeder/Provider types documented below remain for built-in OHLCV data; custom time-series data should use the generic data-source interfaces on this page.
+
+## Generic Time-Series Data
+
+### DataSource
+
+A custom source implements `Info`, `FetchHistory`, and the optional `SubscribeLive`. The history function returns `[]*orm.DataRecord`, while the live function sends data through `DataSink.Emit(sub, rows)`. Register a complete implementation with `RegisterDataSource`, or use `RegisterFuncDataSource` for a function-based implementation. Source names must be unique.
+
+### SeriesRuntime
+
+`SeriesRuntime` collects strategy `DataSub` subscriptions at backtest and live-trading startup, merging fields and warmup counts by `(source, sid, timeframe)`. It fills historical gaps before activating live subscriptions. `HistSeriesFeeder` replays independent series alongside K-lines in time order.
+
+Strategies declare subscriptions in `OnDataSubs` and receive processed `*strat.DataFields` in `OnData`; see [Custom Time-Series Data](../guide/custom_data.md).
+
 The important concepts of this package are as follows:
 * **Provider**: A candlestick data provider, which can contain multiple Feeders with the same start and end times.
 * **Feeder**: Corresponds to a data source for a specific instrument and can include data for multiple timeframes.
@@ -339,4 +353,4 @@ Parameters:
 - `args *config.CmdArgs` - Command line arguments
 
 Returns:
-- `*errs.Error` - Error information 
+- `*errs.Error` - Error information

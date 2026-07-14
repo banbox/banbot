@@ -8,7 +8,6 @@ The orm package provides database access and data model definition functionality
 Price adjustment factor structure, used for handling forward and backward price adjustments.
 
 Fields:
-- `ID int32` - Adjustment factor ID
 - `Sid int32` - Trading pair ID
 - `SubID int32` - Sub trading pair ID
 - `StartMs int64` - Start timestamp (milliseconds)
@@ -18,8 +17,7 @@ Fields:
 Trading calendar structure, used to record trading time periods.
 
 Fields:
-- `ID int32` - Calendar ID
-- `Name string` - Calendar name
+- `Market string` - Market or calendar name
 - `StartMs int64` - Start timestamp (milliseconds)
 - `StopMs int64` - End timestamp (milliseconds)
 
@@ -35,42 +33,35 @@ Fields:
 - `Combined bool` - Whether it's a combined trading pair
 - `ListMs int64` - Listing timestamp (milliseconds)
 - `DelistMs int64` - Delisting timestamp (milliseconds)
+- `AggRules string` - JSON aggregation rules for custom fields
 
 ### InsKline
 candlestick insertion task structure, used to manage candlestick data insertion operations.
 
 Fields:
-- `ID int32` - Task ID
 - `Sid int32` - Trading pair ID
 - `Timeframe string` - Time period
+- `Ts time.Time` - Task creation time
 - `StartMs int64` - Start timestamp (milliseconds)
 - `StopMs int64` - End timestamp (milliseconds)
 
-### KHole
-candlestick data gap structure, used to record missing periods in candlestick data.
-
-Fields:
-- `ID int64` - Gap record ID
-- `Sid int32` - Trading pair ID
-- `Timeframe string` - Time period
-- `Start int64` - Start timestamp (milliseconds)
-- `Stop int64` - End timestamp (milliseconds)
-- `NoData bool` - Whether confirmed no data exists
-
-### KInfo
-candlestick information structure, used to record basic information about candlestick data.
+### SRange
+Time-series coverage range structure, used to record covered or confirmed no-data ranges for K-lines and custom series.
 
 Fields:
 - `Sid int32` - Trading pair ID
+- `Table string` - Physical time-series table name
 - `Timeframe string` - Time period
-- `Start int64` - Start timestamp (milliseconds)
-- `Stop int64` - End timestamp (milliseconds)
+- `StartMs int64` - Start timestamp (milliseconds)
+- `StopMs int64` - End timestamp (milliseconds)
+- `HasData bool` - Whether this range contains valid data
 
 ### KlineUn
 Unadjusted candlestick data structure, containing raw candlestick data.
 
 Fields:
 - `Sid int32` - Trading pair ID
+- `ExpireMs int64` - Expiration timestamp for unfinished K-lines (milliseconds)
 - `StartMs int64` - Start timestamp (milliseconds)
 - `StopMs int64` - End timestamp (milliseconds)
 - `Timeframe string` - Time period
@@ -79,13 +70,16 @@ Fields:
 - `Low float64` - Lowest price
 - `Close float64` - Closing price
 - `Volume float64` - Trading volume
-- `Info float64` - Additional information
+- `Quote float64` - Quote volume
+- `BuyVolume float64` - Taker buy volume
+- `TradeNum int64` - Number of trades
 
 ### InfoKline
 candlestick data structure with additional information.
 
 Fields:
 - `PairTFKline *banexg.PairTFKline` - Base candlestick data
+- `Sid int32` - Trading pair ID
 - `Adj *AdjInfo` - Price adjustment information
 - `IsWarmUp bool` - Whether it's warm-up data
 
@@ -112,6 +106,14 @@ Fields:
 - `AggEvery string` - Aggregation interval
 - `CpsBefore string` - Completion deadline
 - `Retention string` - Data retention time
+
+### SeriesInfo, DataRecord, and DataSeries
+
+Generic time-series data is no longer limited to K-lines. `SeriesInfo` defines the source, timeframe, table binding, and fields; `DataRecord` stores rows; and `DataSeries` is the shared event model for backtesting and live trading. `SeriesStore` provides high-level `Write`, `WriteBatch`, `Read`, `Missing`, `Delete`, and `Coverage` operations, while `SeriesRepo` adapts them to TimescaleDB and QuestDB.
+
+Supported field types are `float`, `int`, `string`, `bool`, and `json`. `NewSeriesInfo(name, timeframe, fields)` creates a table binding using the default rules. To write extension columns to an existing K-line table, use `NewKLineSeriesInfo` and `KLineSeriesStore`.
+
+See [Custom Time-Series Data](../guide/custom_data.md) for the complete registration, storage, and strategy-consumption workflow.
 
 ## Database Connection Related
 
@@ -140,7 +142,7 @@ Parameters:
 - `path string` - Database file path
 
 ### DbLite
-Create SQLite database connection.
+Create a local banbot SQLite auxiliary database connection. It is only used for local auxiliary state; market and generic time-series data use the configured QuestDB or TimescaleDB through `Setup`/`Conn`.
 
 Parameters:
 - `src string` - Data source name
@@ -358,4 +360,4 @@ Parameters:
 - `exchange banexg.BanExchange` - Exchange interface
 - `exsList map[int32]*ExSymbol` - Trading pair list
 - `timeFrame string` - Time frame
-- `startMS int64` - Start time (milliseconds) 
+- `startMS int64` - Start time (milliseconds)

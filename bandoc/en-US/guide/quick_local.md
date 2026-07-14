@@ -11,7 +11,7 @@ If you are using runbanbot to start the service, you do not need to continue rea
 If you prefer to install and start it locally, you can follow the steps below to quickly configure and run banbot locally:
 
 ## Step 1. Local Installation
-You need to install the Golang development environment, the latest version is recommended. banbot uses QuestDB to store public data such as candlesticks, which is automatically downloaded and installed on startup, no manual configuration required.
+You need to install the Golang development environment, the latest version is recommended. banbot supports QuestDB and TimescaleDB for K-lines and other time-series data: QuestDB is automatically downloaded and installed when the first connection fails, while TimescaleDB must be deployed first. See [Database](./database.md) for detailed configuration.
 
 You may also refer to the installation tutorial video on Bilibili:  
 https://www.bilibili.com/video/BV1QuLozqEzg/

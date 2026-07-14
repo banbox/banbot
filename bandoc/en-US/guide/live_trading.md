@@ -75,7 +75,7 @@ Dry-run mode uses 1-minute K-line matching for local orders, so order status wil
 :::
 
 ## 3. Starting the Trading Bot
-You need to start both the spider process and the bot process. The spider process is used to subscribe to and update public data such as candlestick charts and order books, saving them to the database.
+You need to start both the spider process and the bot process. The spider process is used to subscribe to and update public exchange data such as K-lines and order books, saving them to the database. Registered custom time-series data sources automatically backfill historical data when the bot starts and may provide their own live subscriptions; they do not depend on Spider.
 The bot process subscribes to candlestick data and other information from the spider process and executes trading strategies. You can start multiple bot processes to run different strategies.
 
 Strategies and trading accounts consume minimal resources. On a 2-core, 2GB VPS, you can start multiple bot processes, and a single bot process can be configured with hundreds of strategies and hundreds of trading accounts.

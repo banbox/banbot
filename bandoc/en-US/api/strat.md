@@ -11,7 +11,7 @@ Public fields:
 - `Name string` - Strategy name
 - `Version int` - Strategy version number
 - `WarmupNum int` - Number of candlesticks needed for warmup
-- `MinTfScore float64` - Minimum time frame quality, default 0.75
+- `MinTfScore float64` - Minimum time frame quality, default 0.8
 - `WsSubs map[string]string` - WsSubs        map[string]string    // websocket subscription: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 - `DrawDownExit bool` - Whether to enable drawdown exit
 - `HedgeOff bool` - turn off future hedge mode
@@ -22,9 +22,12 @@ Public fields:
 - `StopEnterBars int` - Timeout candlestick number for limit entry orders
 - `EachMaxLong int` - Maximum number of long orders per trading pair, -1 to disable
 - `EachMaxShort int` - Maximum number of short orders per trading pair, -1 to disable
-- `AllowTFs []string` - Allowed running time periods, use global configuration when not provided
+- `RunTimeFrames []string` - Allowed running time periods, use global configuration when not provided
 - `Outputs []string` - Content of the text file output by the strategy, where each string is one line
 - `Policy *config.RunPolicyConfig` - Strategy running configuration
+- `OnDataSubs` - Declares K-line extension columns or custom time-series subscriptions
+- `OnData` - Receives updated Series/latest values as `*strat.DataFields`
+- `OnWsData` - Receives websocket time-series events
 
 ### StratJob
 Strategy task instance, responsible for executing specific trading operations.
@@ -55,6 +58,20 @@ Public fields:
 - `ShortTPPrice float64` - Default short take profit price when opening position
 - `IsWarmUp bool` - Whether currently in warmup state
 - `More interface{}` - Additional information for strategy customization
+- `DataHub` - Caches the latest events and window data by `(source, sid, timeframe)`
+
+### DataSub
+Time-series subscription information.
+
+Public fields:
+- `Source string` - Data source name; an empty value is equivalent to `kline`
+- `ExSymbol *orm.ExSymbol` - Bound trading symbol
+- `TimeFrame string` - Data source base timeframe
+- `WarmupNum int` - Initial warmup count
+- `Fields []string` - Fields to read
+
+### DataHub
+Runtime data cache. `Get(tf, source, sid)` returns processed `DataFields`, and `AllReady()` determines whether all subscriptions that should be closed at the current event time have been updated. See [Custom Time-Series Data](../guide/custom_data.md) for subscription and consumption examples.
 
 ### JobEnv
 Represents a job for additional product data in OnBatchInfos.
@@ -243,4 +260,4 @@ Returns:
 - `*errs.Error` - Error information
 
 ### ExitStratJobs
-Exit all strategy jobs. 
+Exit all strategy jobs.

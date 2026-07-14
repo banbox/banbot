@@ -36,19 +36,20 @@ Exchange object access management.
 
 #### [orm](orm.md)
 The orm package is referenced by its sub-packages ormo and ormu.
-- orm includes read/write access to time-series databases such as K-line data (kline), trading symbols (exsymbol), gaps (kHole), ranges (kInfo), trading calendars, and adjustment factors.
+- orm includes QuestDB/TimescaleDB time-series read/write access for OHLCV, arbitrary custom series, trading symbols, coverage ranges, trading calendars, and adjustment factors.
 - ormo includes order-related components: trading tasks (BotTask), position records (InOutOrder), and exchange orders (ExOrder).
 - ormu includes WebUI-related components: backtest task records.
 
 &emsp;exg config
 
 #### [data](data.md)
-For backtest and live K-line data reading, preheating, and subscription.
-- IProvider is a multi-asset K-line data provider for a particular exchange and market, while IKlineFeeder is a single-asset K-line data provider. An IProvider can contain multiple IKlineFeeders, and an IKlineFeeder can contain data for multiple timeframes.
+For backtest and live data reading, warmup, and subscription.
+- IProvider is a multi-asset OHLCV data provider for an exchange market, while IKlineFeeder is a single-asset K-line data provider. An IProvider can contain multiple IKlineFeeders, and an IKlineFeeder can contain data for multiple timeframes.
 - HistProvider corresponds to the backtest data provider, while LiveProvider corresponds to the live data provider (which subscribes to data from the spider process).
 - DBKlineFeeder corresponds to backtesting in IKlineFeeder, while KlineFeeder corresponds to live trading; TfKlineLoader can be used to load K-line data for a specific asset and timeframe in batches and then read it one by one. A KlineFeeder can contain multiple TfKlineLoaders.
 - Spider is a real-time data subscription spider process for public data. It can subscribe to price, order book, and K-line data for multiple exchanges, markets, and assets simultaneously. A Spider can be connected to and accessed by multiple live trading robot processes.
 - KLineWatcher is a client for receiving data from Spider and is used by LiveProvider.
+- DataSource, SeriesRuntime, and HistSeriesFeeder handle registration, historical backfill, live subscription, and replay for arbitrary custom time-series data.
 
 &emsp;orm exg config
 

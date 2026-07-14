@@ -10,21 +10,9 @@ Then you can use this executable file directly to start the UI, backtest, hyperp
 
 Directly executing `bot` will start the WebUI interface at `http://localhost:8000`, through which you can manage strategies, backtest, analyze transactions, etc.
 
-Running `bot -help` will display a list of subcommand help:
-```text
-banbot 0.1.5
-please run with a subcommand:
-    trade:      live trade
-    backtest:   backtest with strategies and data
-    spider:     start the spider
-    optimize:   run hyper parameters optimization
-    bt_opt:     backtest over optimize
-    kline:      run kline commands
-    tick:       run tick commands
-    tool:       run tools
-    web:        run web dashboard
-```
+Use `bot -help` to see the command groups for the current version. Common root commands include `trade`, `backtest`, `spider`, `optimize`, `bt_opt`, `web`, and `init`; data tools are grouped under `data`, `kline`, `tick`, `tool`, and `live`.
 ## Common command parameters
+
 **Data directory (-datadir)**
 
 When you start through the command line, unless the environment variable `BanDataDir` is set, you must pass in the parameter `-datadir` to specify the data directory each time you start.
@@ -39,6 +27,8 @@ If these two have already covered the parameters you need this time, you do not 
 
 You can display help information by adding `-help` or `-h` parameters after the command.
 
+All configuration-based commands support `-datadir`, repeated `-config`, `-no-default`, `-config-data`, `-logfile`, `-level`, and `-max-pool-size`. Use `-dlock` to enable deadlock detection; `-cpu-profile`, `-mem-profile`, and `-net-off` are runtime diagnostic options. Each subcommand accepts only the additional parameters it declares; use `bot <command> -help` as the source of truth.
+
 ## Start WebUI Research & Backtesting
 To facilitate your strategy research and backtesting, we provide WebUI visualization. You can edit strategies online, start backtesting, view profit and loss curves, analyze orders, etc. through WebUI.
 
@@ -46,29 +36,33 @@ This is a WebUI only for the strategy research stage. By default, only your loca
 
 If you need to access the Dashboard UI during real-time trading in banbot, please refer to [Real-time Trading](#start-real-time-trading-simulated-tradingreal-trading)。
 
+The Web UI uses separate development-server options; run `bot web -help` to see the current bind address, port, and resource path options.
+
 ```text
 Usage of web:
-  -host string
-        bind host ip (default "127.0.0.1")
-  -port int
-        port to listen (default 8000)
   -config value
         config path to use, Multiple -config options may be used
+  -config-data string
+        yaml config string
   -datadir string
         Path to data dir.
-  -db string
-        db file path (default "dev.db")
+  -host string
+        bind host ip (default "127.0.0.1")
   -level string
         log level (default "info")
   -logfile string
         log file path, default: system temp dir
+  -password string
+        password required to access WebUI
+  -port int
+        port to listen (default 8000)
   -tz string
-        timezone (default "utc")
+        timezone
 ```
 
 ## Start the crawler process
 ```shell
-bot spider [-datadir PATH] [-c PATH] [-c PATH]
+bot spider [-datadir PATH] [-config PATH]
 ```
 When you want to start real-time trading, you need to start the crawler process first. The crawler process listens to the `6789` port by default and only accepts local requests. You can change the yml configuration `spider_addr` to `0.0.0.0:6789` to accept external listening requests.
 
@@ -77,6 +71,10 @@ After the crawler process is started, it does not listen to any exchange, market
 Usage of spider:
   -config value
         config path to use, Multiple -config options may be used
+  -config-data string
+        yaml config string
+  -cpu-profile
+        enable cpu profile
   -datadir string
         Path to data dir.
   -level string
@@ -85,12 +83,12 @@ Usage of spider:
         Log to the file specified
   -max-pool-size int
         max pool size for db
-  -no-compress
-        disable compress for hyper table
+  -mem-profile
+        enable memory profile
+  -net-off
+        disable network request
   -no-default
         ignore default: config.yml, config.local.yml
-  -nodb
-        dont save orders to database
 ```
 ## Start real-time trading (simulated trading/real trading)
 ```shell
@@ -122,48 +120,8 @@ api_server:
 Usage of trade:
   -config value
         config path to use, Multiple -config options may be used
-  -datadir string
-        Path to data dir.
-  -level string
-        set logging level to debug (default "info")
-  -logfile string
-        Log to the file specified
-  -max-pool-size int
-        max pool size for db
-  -no-compress
-        disable compress for hyper table
-  -no-default
-        ignore default: config.yml, config.local.yml
-  -nodb
-        dont save orders to database
-  -pairs string
-        comma-separated pairs
-  -spider
-        start spider if not running
-  -stake-amount stake_amount
-        Override stake_amount in config
-  -stg-dir value
-        dir path for strategies
-  -task-hash string
-        hash code to use
-  -task-id int
-        task
-```
-## Backtesting
-```shell
-bot backtest [-nodb] [-separate] ...
-```
-This will start the backtest according to the `run_policy` in the yml configuration. Since the backtest may generate a large number of orders, it is recommended that you enable the `-nodb` option to not record the orders in the database, but only save them in a csv file.
-
-The default backtest is to run multiple strategy groups configured by `run_policy` at the same time to get a combined backtest report. If you want to test each strategy group in `run_policy` separately, please enable the `-separate` option.
-
-During the backtest, if the candle of the relevant symbol does not exist, it will be automatically downloaded and saved to the database.
-
-After the backtest is completed, the backtest results will be saved in `[data directory]/backtest/task_[TASKID]` by default. If you specify `-nodb`, `[TASKID]` is -1, that is, saved in the `task_-1` directory
-```text
-Usage of backtest:
-  -config value
-        config path to use, Multiple -config options may be used
+  -config-data string
+        yaml config string
   -cpu-profile
         enable cpu profile
   -datadir string
@@ -176,26 +134,70 @@ Usage of backtest:
         max pool size for db
   -mem-profile
         enable memory profile
-  -no-compress
-        disable compress for hyper table
+  -net-off
+        disable network request
   -no-default
         ignore default: config.yml, config.local.yml
-  -nodb
-        dont save orders to database
+  -out string
+        output file or directory
   -pairs string
         comma-separated pairs
+  -spider
+        start spider if not running
+  -stake-amount stake_amount
+        Override stake_amount in config
+```
+## Backtesting
+```shell
+bot backtest [-separate] ...
+```
+This will start the backtest according to the `run_policy` in the yml configuration. Use `-out` to specify the report directory.
+
+The default backtest is to run multiple strategy groups configured by `run_policy` at the same time to get a combined backtest report. If you want to test each strategy group in `run_policy` separately, please enable the `-separate` option.
+
+During the backtest, if the candle of the relevant symbol does not exist, it will be automatically downloaded and saved to the database.
+
+After the backtest is completed, when `-out` is not specified, the report is saved in `[data directory]/backtest/<config-hash>` by default.
+```text
+Usage of backtest:
+  -config value
+        config path to use, Multiple -config options may be used
+  -config-data string
+        yaml config string
+  -cpu-profile
+        enable cpu profile
+  -datadir string
+        Path to data dir.
+  -dlock
+        enable dead-lock detect
+  -level string
+        set logging level to debug (default "info")
+  -logfile string
+        Log to the file specified
+  -max-pool-size int
+        max pool size for db
+  -mem-profile
+        enable memory profile
+  -net-off
+        disable network request
+  -no-default
+        ignore default: config.yml, config.local.yml
+  -out string
+        output file or directory
+  -pairs string
+        comma-separated pairs
+  -prg string
+        prefix for progress in stdout
   -separate
         run policy separately for backtest
   -stake-amount stake_amount
         Override stake_amount in config
-  -stg-dir value
-        dir path for strategies
-  -timerange string
-        Specify what timerange of data to use
-  -timestart string
-        set start time, allow multiple formats
   -timeend string
         set end time, timestart is required
+  -timerange string
+        set timerange
+  -timestart string
+        set start time, allow multiple formats
 ```
 
 ## CandleStick related tools
@@ -207,6 +209,10 @@ Download candle from the exchange and save to the database
 **bot kline load**  
 Import candle from csv/zip file to database
 
+**bot kline agg**
+
+Aggregate larger-timeframe K-lines for the specified `-pairs` and `-timeframes`.
+
 **bot kline export**  
 Export candle from database to csv file
 
@@ -215,6 +221,10 @@ Purge candle from database.
 
 **bot kline correct**  
 Check if there is any error in database candle and correct it automatically.
+
+**bot kline verify**
+
+Verify that K-line data matches the coverage metadata; use `-pairs`, `-tables`, and `-batch-size` to narrow the check.
 
 **bot kline adj_calc**  
 Recalculate the adjust factor (for the Chinese futures market)
@@ -225,9 +235,11 @@ Export the adjust factor to a CSV file
 banbot kline:
     down:   download kline data from exchange
     load:   load kline data from zip/csv files
+    agg:    agg kline for big timeframes
     export: export kline to csv files from db
     purge:  purge/delete kline data with args
     correct: sync klines between timeframes
+    verify: verify kline data matches sranges metadata
     adj_calc: recalculate adjust factors
 ```
 ## Tick related tools
@@ -256,7 +268,8 @@ Close positions for the specified user's eligible orders.
 **bot tool collect_opt**  
 Collect hyperparameter tuning results and display them to the console in order.
 
-**bot tool bt_opt**  
+**bot bt_opt**
+
 Tuning hyperparameters in time rolling, and then backtesting. For example, for the data of the last three years. Each year's data is used for hyperparameter tuning, and then the tuned parameters are automatically backtested for the next three months; then the tuning is postponed for three months and repeated; this is repeated to simulate the backtest results in real scenarios.
 
 **bot tool load_cal**  

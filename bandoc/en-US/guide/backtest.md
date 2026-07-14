@@ -50,7 +50,7 @@ go build -o bot
 ./bot backtest
 ```
 
-After the backtest is complete, you can find the detailed report in the `backtests` directory within `BanDataDir`.
+After the backtest is complete, when `-out` is not specified, you can find the detailed report in `BanDataDir/backtest/<config-hash>`. You can also use `-out` to specify the output directory.
 
 ## Backtesting Notes
 

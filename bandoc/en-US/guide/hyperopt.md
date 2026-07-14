@@ -3,7 +3,7 @@ bot optimize -out PATH [-opt-rounds 30] [-sampler bayes]
 ```
 After defining hyperparameters and their ranges using `pol.Def` in your strategy, you can perform hyperparameter tuning.
 
-At startup, you need to specify an output file where the results of the hyperparameter search will be written, usually in the format of `opt1.log`. You can specify the number of tuning executions with `-opt-rounds` and the sampling optimizer with `-sampler`. During tuning, the `-nodb` parameter will be fixed.
+At startup, you need to specify an output file where the results of the hyperparameter search will be written, usually in the format of `opt1.log`. You can specify the number of tuning executions with `-opt-rounds` and the sampling optimizer with `-sampler`.
 
 If you have multiple strategies that need optimization (i.e., `run_policy` is configured with multiple strategies), by default, banbot will search each strategy one by one. If you wish to increase concurrency, you can compile it into an executable file and pass the `-concur` parameter to control the number of concurrent tasks (concurrency is only enabled when there are multiple strategies).
 
@@ -17,8 +17,14 @@ Usage of optimize:
         Concurrent Number (default 1)
   -config value
         config path to use, Multiple -config options may be used
+  -config-data string
+        yaml config string
+  -cpu-profile
+        enable cpu profile
   -datadir string
         Path to data dir.
+  -dlock
+        enable dead-lock detect
   -each-pairs
         run for each pairs
   -level string
@@ -27,12 +33,12 @@ Usage of optimize:
         Log to the file specified
   -max-pool-size int
         max pool size for db
-  -no-compress
-        disable compress for hyper table
+  -mem-profile
+        enable memory profile
+  -net-off
+        disable network request
   -no-default
         ignore default: config.yml, config.local.yml
-  -nodb
-        dont save orders to database
   -opt-rounds int
         rounds num for single optimize job (default 30)
   -out string
