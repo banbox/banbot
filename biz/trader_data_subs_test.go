@@ -29,8 +29,8 @@ func TestFeedSeriesRoutesNonKlineDataSubs(t *testing.T) {
 	var gotWarmups []bool
 	job := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(s *strat.StratJob, data *strat.DataFields) {
-				got = append(got, data)
+			OnData: func(s *strat.StratJob, data strat.DataEvent) {
+				got = append(got, data.DataFields)
 				gotWarmups = append(gotWarmups, data.IsWarmUp)
 				if data.Source != "macro" {
 					t.Fatalf("unexpected source: %s", data.Source)
@@ -199,7 +199,7 @@ func TestFeedSeriesCoexistsForThirdPartyAndLegacyInfoSubs(t *testing.T) {
 	macroEvents := 0
 	macroJob := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(s *strat.StratJob, data *strat.DataFields) {
+			OnData: func(s *strat.StratJob, data strat.DataEvent) {
 				macroEvents++
 				if data.Source != "macro" || data.Sid != 11 || data.TimeFrame != "1d" {
 					t.Fatalf("unexpected macro routing identity: %+v", data)
@@ -233,7 +233,30 @@ func TestFeedSeriesCoexistsForThirdPartyAndLegacyInfoSubs(t *testing.T) {
 		Symbol:  &orm.ExSymbol{ID: 99, Symbol: "BTC/USDT"},
 		Account: config.DefAcc,
 	}
-	strat.AccInfoJobs[config.DefAcc][strat.DataSubKey("kline", exs.ID, "5m")] = map[string]*strat.StratJob{"legacy": legacyJob}
+	infoCalls := 0
+	modernJob := &strat.StratJob{
+		Strat: &strat.TradeStrat{
+			OnData: func(_ *strat.StratJob, data strat.DataEvent) {
+				infoCalls++
+				if data.Role != strat.DataRoleInfo || !data.IsKline() || data.IsMain() {
+					t.Fatalf("unexpected info data role: %v", data.Role)
+				}
+				if data.Symbol == nil || data.Symbol.ID != exs.ID {
+					t.Fatalf("unexpected info data symbol: %+v", data.Symbol)
+				}
+			},
+			OnInfoBar: func(_ *strat.StratJob, _ *ta.BarEnv, _, _ string) {
+				t.Fatal("OnInfoBar must not run when OnData is set")
+			},
+		},
+		DataHub: strat.NewDataHub(),
+		Symbol:  &orm.ExSymbol{ID: 98, Symbol: "BTC/USDT"},
+		Account: config.DefAcc,
+	}
+	strat.AccInfoJobs[config.DefAcc][strat.DataSubKey("kline", exs.ID, "5m")] = map[string]*strat.StratJob{
+		"legacy": legacyJob,
+		"modern": modernJob,
+	}
 
 	trader := &Trader{}
 	macroEvt := &orm.DataSeries{
@@ -273,6 +296,9 @@ func TestFeedSeriesCoexistsForThirdPartyAndLegacyInfoSubs(t *testing.T) {
 	}
 	if legacyCalls != 1 {
 		t.Fatalf("expected legacy OnInfoBar once, got %d", legacyCalls)
+	}
+	if infoCalls != 1 {
+		t.Fatalf("expected modern info OnData once, got %d", infoCalls)
 	}
 	macroLatest := macroJob.DataHub.Get("1d", "macro", 11)
 	if macroLatest == nil || macroLatest.TimeMS != 100 {

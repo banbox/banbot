@@ -215,7 +215,7 @@ func TestUpdatePairs_RebuildsWarmsFromCurrentDataSubs(t *testing.T) {
 			Name:      "stg",
 			WarmupNum: 20,
 			Policy:    &config.RunPolicyConfig{RunTimeframes: []string{"1s"}},
-			OnData: func(s *StratJob, data *DataFields) {
+			OnData: func(s *StratJob, data DataEvent) {
 			},
 			OnDataSubs: func(s *StratJob) []*DataSub {
 				return []*DataSub{

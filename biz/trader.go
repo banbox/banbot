@@ -127,7 +127,11 @@ func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSerie
 			continue
 		}
 		num1, num2 := strat.GetJobInOutNum(job)
-		job.Strat.OnData(job, fields)
+		job.Strat.OnData(job, strat.DataEvent{
+			DataFields: fields,
+			Role:       strat.DataRoleCustom,
+			Symbol:     evt.EnsureExSymbol(),
+		})
 		strat.CheckJobInOutNum(job, "OnData", num1, num2)
 	}
 }
@@ -296,7 +300,11 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 		job.IsWarmUp = isWarmup
 		num1, num2 := strat.GetJobInOutNum(job)
 		if job.Strat.OnData != nil {
-			job.Strat.OnData(job, fields)
+			job.Strat.OnData(job, strat.DataEvent{
+				DataFields: fields,
+				Role:       strat.DataRoleInfo,
+				Symbol:     evt.EnsureExSymbol(),
+			})
 			strat.CheckJobInOutNum(job, "OnData", num1, num2)
 		} else if job.Strat.OnInfoBar != nil {
 			job.Strat.OnInfoBar(job, env, symbol, evt.TimeFrame)
@@ -333,9 +341,12 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, evt *orm.DataSeries, fields *strat.DataFields, barExpired bool) *errs.Error {
 	account := job.Account
 	if job.Strat.OnData != nil {
-		job.Strat.OnData(job, fields)
-	}
-	if job.Strat.OnBar != nil {
+		job.Strat.OnData(job, strat.DataEvent{
+			DataFields: fields,
+			Role:       strat.DataRoleMain,
+			Symbol:     job.Symbol,
+		})
+	} else if job.Strat.OnBar != nil {
 		job.Strat.OnBar(job)
 	}
 	isWarmup := job.IsWarmUp

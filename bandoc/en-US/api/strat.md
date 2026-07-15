@@ -26,8 +26,10 @@ Public fields:
 - `Outputs []string` - Content of the text file output by the strategy, where each string is one line
 - `Policy *config.RunPolicyConfig` - Strategy running configuration
 - `OnDataSubs` - Declares K-line extension columns or custom time-series subscriptions
-- `OnData` - Receives updated Series/latest values as `*strat.DataFields`
+- `OnData` - Receives a unified `strat.DataEvent`, which embeds updated Series/latest values from `*strat.DataFields` and identifies primary K-lines, auxiliary K-lines, or custom time-series
 - `OnWsData` - Receives websocket time-series events
+
+Assign `OnData` directly when there are no auxiliary or custom subscriptions. Use `KlineData`, `CustomData`, or `RouteData(DataHandlers{...})` when event filtering is required.
 
 ### StratJob
 Strategy task instance, responsible for executing specific trading operations.

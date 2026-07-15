@@ -14,7 +14,7 @@ A custom source implements `Info`, `FetchHistory`, and the optional `SubscribeLi
 
 `SeriesRuntime` collects strategy `DataSub` subscriptions at backtest and live-trading startup, merging fields and warmup counts by `(source, sid, timeframe)`. It fills historical gaps before activating live subscriptions. `HistSeriesFeeder` replays independent series alongside K-lines in time order.
 
-Strategies declare subscriptions in `OnDataSubs` and receive processed `*strat.DataFields` in `OnData`; see [Custom Time-Series Data](../guide/custom_data.md).
+Strategies declare subscriptions in `OnDataSubs` and receive a `strat.DataEvent` embedding the processed `*strat.DataFields` in `OnData`; see [Custom Time-Series Data](../guide/custom_data.md).
 
 The important concepts of this package are as follows:
 * **Provider**: A candlestick data provider, which can contain multiple Feeders with the same start and end times.

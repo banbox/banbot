@@ -62,13 +62,13 @@ banbot 推荐两种接入方式：
 
 #### 2.2.2 策略中订阅
 
-策略订阅示例见 `../banstrats/fundingrate/strategy.go`：在 `OnDataSubs` 返回 `strat.DataSub`，在 `OnData` 中读取处理后的 `strat.DataFields`，跨数据源读取使用 `job.DataHub.Get(...)`。
+策略订阅示例见 `../banstrats/fundingrate/strategy.go`：在 `OnDataSubs` 返回 `strat.DataSub`，在 `OnData` 中接收嵌入了 `strat.DataFields` 的 `strat.DataEvent`，跨数据源读取使用 `job.DataHub.Get(...)`。
 
 回测和实盘启动时，banbot 会从 `OnDataSubs` 收集订阅，按 `(source, sid, timeframe)` 去重，取最大的 `WarmupNum` 并合并 `Fields` 字段并集，再调用已注册的 `DataSource.FetchHistory` 补齐缺口。
 
 `Fields` 控制数据源读取投影；为空时，kline 使用 `open, high, low, close, volume, quote, buy_volume, trade_num`，独立数据源使用其 `SeriesInfo.Binding.Fields`。`SeriesFields` 控制哪些字段维护为 `banta.Series`；未配置时默认选择 schema 中的 `float*` 字段，运行时无 schema 的数据按 `float32/float64` 值识别。显式 `SeriesFields` 会自动并入 `Fields`。
 
-读取 kline 扩展列时仍使用同一个订阅入口，例如 `DataSub{Source: "kline", SeriesFields: []string{"open_interest"}, ...}`。主 kline 的默认字段会和显式字段合并，因此 `OnData` 可通过 `data.Series("open_interest")` 或 `data.Float64("open_interest")` 读取，`OnBar` 继续正常消费 OHLCV。
+读取 kline 扩展列时仍使用同一个订阅入口，例如 `DataSub{Source: "kline", SeriesFields: []string{"open_interest"}, ...}`。主 kline 的默认字段会和显式字段合并，因此 `OnData` 可通过 `data.Series("open_interest")` 或 `data.Float64("open_interest")` 读取；未实现 `OnData` 的旧策略仍可通过 `OnBar` 消费 OHLCV。
 
 ### 2.3 WebUI / DashboardUI 管理与查看
 
@@ -579,7 +579,7 @@ func init() {
                 },
             }
         },
-        OnData: func(job *strat.StratJob, data *strat.DataFields) {
+        OnData: strat.CustomData(func(job *strat.StratJob, data strat.DataEvent) {
             if data.Source != "macro_cpi" {
                 return
             }
@@ -590,9 +590,25 @@ func init() {
             }
             latest := job.DataHub.Get("1d", "macro_cpi", data.Sid)
             _, _, _ = value, revision, latest
-        },
+        }),
     })
 }
+```
+
+`DataEvent` 嵌入了 `*DataFields`，因此字段读取方式不变；同时提供 `Role`、`Symbol`、`IsMain()` 和 `IsKline()`。没有辅助或自定义订阅的策略可直接赋值 `OnData`，无需包装。需要过滤时，处理全部 K 线用 `strat.KlineData(...)`，只处理自定义时序用 `strat.CustomData(...)`；主周期、辅助 K 线和自定义数据需要不同逻辑时，使用：
+
+```go
+OnData: strat.RouteData(strat.DataHandlers{
+    Main: func(job *strat.StratJob, data strat.DataEvent) {
+        // 原 OnBar 逻辑
+    },
+    Info: func(job *strat.StratJob, data strat.DataEvent) {
+        // 原 OnInfoBar 逻辑
+    },
+    Custom: func(job *strat.StratJob, data strat.DataEvent) {
+        // 自定义时序逻辑
+    },
+})
 ```
 
 ### 7.2 旧策略兼容边界
@@ -608,7 +624,7 @@ func init() {
 
 - `OnPairInfos` 会在内部桥接为 `DataSub{Source: "kline", ...}`
 - `OnInfoBar` 仅在 side-input 能适配成 kline 且策略未实现 `OnData` 时触发
-- 主 kline 事件会分别尝试触发 `OnData` 和 `OnBar`：`OnData` 获得处理后的 `DataFields`，`OnBar` 使用可识别的 OHLCV 字段
+- `OnBar` 仅在主 kline 事件且策略未实现 `OnData` 时触发；同一事件不会同时调用两个回调
 
 ### 7.3 新代码不要再把 Kline 当作通用自定义数据契约
 
@@ -680,7 +696,7 @@ func init() {
 
 #### `biz`
 
-- `TestOHLCVSeriesTriggersOnDataAndOnBar`
+- `TestOHLCVSeriesUsesOnDataWithMainRole`
 - `TestNonKlineOHLCVShapeTriggersOnlyOnData`
 - `TestFeedSeriesRoutesNonKlineDataSubs`
 - `TestFeedSeriesFallsBackToOnInfoBarForLegacyKlineSubs`

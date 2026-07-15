@@ -83,7 +83,7 @@ strat.AddStrat(&strat.TradeStrat{
             SeriesFields: []string{"rate"},
         }}
     },
-    OnData: func(job *strat.StratJob, data *strat.DataFields) {
+    OnData: strat.CustomData(func(job *strat.StratJob, data strat.DataEvent) {
         if data.Source != "funding_rate" {
             return
         }
@@ -93,9 +93,11 @@ strat.AddStrat(&strat.TradeStrat{
         }
         latest := job.DataHub.Get(data.TimeFrame, data.Source, data.Sid)
         _, _ = rate, latest
-    },
+    }),
 })
 ```
+
+`DataEvent` 嵌入了 `*DataFields`，所以可直接使用 `Series`、`Float64` 等原有字段方法。没有辅助或自定义订阅时可直接赋值 `OnData`；需要过滤全部 K 线或自定义时序时，使用 `KlineData` 或 `CustomData`；不同数据类型需要不同逻辑时，使用 `RouteData(DataHandlers{Main: ..., Info: ..., Custom: ...})`。`OnData` 已定义时，同一主事件不会再重复触发旧 `OnBar`。
 
 `TimeFrame` 必须与数据源的 `SeriesInfo` 一致。启动时 banbot 会按 `(source, sid, timeframe)` 合并重复订阅，合并字段列表，并采用最大的 `WarmupNum`。回测会先回填再按时间顺序将数据与 K 线一起回放；实盘会先补齐历史，再激活实时订阅。未注册 source、周期不一致或声明订阅却未提供 `OnData`/兼容回调都会导致启动失败。
 

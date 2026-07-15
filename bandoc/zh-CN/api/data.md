@@ -14,7 +14,7 @@ data 包提供了数据处理和管理相关的功能。
 
 `SeriesRuntime` 在回测和实盘启动时收集策略的 `DataSub`，按 `(source, sid, timeframe)` 合并字段和预热数量，补齐历史缺口后激活实时订阅。`HistSeriesFeeder` 会将独立序列按时间顺序与 K 线一起回放。
 
-策略在 `OnDataSubs` 中声明订阅，在 `OnData` 中接收处理后的 `*strat.DataFields`；详见[自定义时序数据](../guide/custom_data.md)。
+策略在 `OnDataSubs` 中声明订阅，在 `OnData` 中接收嵌入了处理后 `*strat.DataFields` 的 `strat.DataEvent`；详见[自定义时序数据](../guide/custom_data.md)。
 
 此package的重要概念如下：
 * Provider：K线数据提供者，可包含多个有相同起止时间的Feeder

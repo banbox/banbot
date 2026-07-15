@@ -99,8 +99,8 @@ func TestCryptoTraderEmitRoutesThirdPartyRowsThroughOnData(t *testing.T) {
 	var got []*strat.DataFields
 	job := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(s *strat.StratJob, fields *strat.DataFields) {
-				got = append(got, fields)
+			OnData: func(s *strat.StratJob, fields strat.DataEvent) {
+				got = append(got, fields.DataFields)
 			},
 		},
 		DataHub: strat.NewDataHub(),

@@ -44,7 +44,7 @@ type TradeStrat struct {
 	OnSymbols           func(items []string) []string // return modified pairs
 	OnStartUp           func(s *StratJob)
 	OnBar               func(s *StratJob)
-	OnData              func(s *StratJob, data *DataFields)
+	OnData              FnOnData
 	OnInfoBar           func(s *StratJob, e *ta.BarEnv, pair, tf string)       // Other dependent bar data 其他依赖的bar数据
 	OnWsTrades          func(s *StratJob, pair string, trades []*banexg.Trade) // Transaction by transaction data 逐笔交易数据
 	OnWsDepth           func(s *StratJob, dep *banexg.OrderBook)               // Websocket order book websocket推送深度信息

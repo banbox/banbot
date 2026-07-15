@@ -11,20 +11,23 @@ import (
 	ta "github.com/banbox/banta"
 )
 
-func TestOHLCVSeriesTriggersOnDataAndOnBar(t *testing.T) {
+func TestOHLCVSeriesUsesOnDataWithMainRole(t *testing.T) {
 	env, err := ta.NewBarEnv("binance", "spot", "BTC/USDT", "1m")
 	if err != nil {
 		t.Fatalf("NewBarEnv failed: %v", err)
 	}
 	dataCalls := 0
-	barCalls := 0
 	job := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnBar: func(s *strat.StratJob) {
-				barCalls++
-			},
-			OnData: func(s *strat.StratJob, data *strat.DataFields) {
+			OnBar: func(s *strat.StratJob) { t.Fatal("OnBar must not run when OnData is set") },
+			OnData: func(s *strat.StratJob, data strat.DataEvent) {
 				dataCalls++
+				if !data.IsMain() || !data.IsKline() || data.Role != strat.DataRoleMain {
+					t.Fatalf("unexpected main data role: %v", data.Role)
+				}
+				if data.Symbol == nil || data.Symbol.ID != 11 {
+					t.Fatalf("unexpected main data symbol: %+v", data.Symbol)
+				}
 				if data.Float64("signal") != 2.5 {
 					t.Fatalf("OnData did not receive the processed field: %+v", data.Raw("signal"))
 				}
@@ -54,8 +57,8 @@ func TestOHLCVSeriesTriggersOnDataAndOnBar(t *testing.T) {
 	if err := trader.onAccountDataSeriesJob(nil, job, evt, fields, false); err != nil {
 		t.Fatalf("onAccountDataSeriesJob returned error: %v", err)
 	}
-	if dataCalls != 1 || barCalls != 1 {
-		t.Fatalf("expected OnData and OnBar once, got data=%d bar=%d", dataCalls, barCalls)
+	if dataCalls != 1 {
+		t.Fatalf("expected OnData once, got %d", dataCalls)
 	}
 }
 
@@ -72,8 +75,13 @@ func TestNonKlineOHLCVShapeTriggersOnlyOnData(t *testing.T) {
 	dataCalls := 0
 	job := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(_ *strat.StratJob, data *strat.DataFields) { dataCalls++ },
-			OnBar:  func(_ *strat.StratJob) { t.Fatal("custom source must not enter OnBar") },
+			OnData: func(_ *strat.StratJob, data strat.DataEvent) {
+				dataCalls++
+				if data.Role != strat.DataRoleCustom || data.IsKline() {
+					t.Fatalf("unexpected custom data role: %v", data.Role)
+				}
+			},
+			OnBar: func(_ *strat.StratJob) { t.Fatal("custom source must not enter OnBar") },
 		},
 		DataHub: strat.NewDataHub(),
 		Symbol:  &orm.ExSymbol{ID: 11, Symbol: "CPI_US"},
@@ -113,8 +121,13 @@ func TestPrimaryAndSideSubscriptionDoesNotDuplicateOnData(t *testing.T) {
 	barCalls := 0
 	job := &strat.StratJob{
 		Strat: &strat.TradeStrat{
-			OnData: func(_ *strat.StratJob, _ *strat.DataFields) { dataCalls++ },
-			OnBar:  func(_ *strat.StratJob) { barCalls++ },
+			OnData: func(_ *strat.StratJob, data strat.DataEvent) {
+				dataCalls++
+				if data.Role != strat.DataRoleMain {
+					t.Fatalf("unexpected duplicate subscription role: %v", data.Role)
+				}
+			},
+			OnBar: func(_ *strat.StratJob) { barCalls++ },
 		},
 		Env: env, DataHub: strat.NewDataHub(), Symbol: exs, TimeFrame: "1m", Account: config.DefAcc,
 	}
@@ -124,7 +137,7 @@ func TestPrimaryAndSideSubscriptionDoesNotDuplicateOnData(t *testing.T) {
 	if err := (&Trader{}).onAccountDataSeries(config.DefAcc, env, evt, nil, false); err != nil {
 		t.Fatalf("onAccountDataSeries returned error: %v", err)
 	}
-	if dataCalls != 1 || barCalls != 1 {
-		t.Fatalf("expected one primary dispatch, got data=%d bar=%d", dataCalls, barCalls)
+	if dataCalls != 1 || barCalls != 0 {
+		t.Fatalf("expected one OnData dispatch, got data=%d bar=%d", dataCalls, barCalls)
 	}
 }

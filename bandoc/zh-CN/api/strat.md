@@ -26,8 +26,10 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `Outputs []string` - 策略输出的文本文件内容，每个字符串是一行
 - `Policy *config.RunPolicyConfig` - 策略运行配置
 - `OnDataSubs`: 声明 K 线扩展列或自定义时序数据订阅
-- `OnData`: 接收已更新 Series/最新值的 `*strat.DataFields`
+- `OnData`: 接收统一的 `strat.DataEvent`；事件嵌入已更新 Series/最新值的 `*strat.DataFields`，并标识主周期、辅助 K 线或自定义时序
 - `OnWsData`: 接收 websocket 时序事件
+
+没有辅助或自定义订阅时直接赋值 `OnData`。需要过滤时可使用 `KlineData`、`CustomData`，或使用 `RouteData(DataHandlers{...})` 分别处理三类事件。
 
 ### StratJob
 策略任务实例，负责执行具体的交易操作。
