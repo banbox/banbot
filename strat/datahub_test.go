@@ -63,7 +63,7 @@ func TestDataHubBuildsConfiguredAndDefaultSeries(t *testing.T) {
 		avg = ta.SMA(updated.Series("close"), 2).Get(0)
 	}
 	fields := hub.Get("1m", "kline", 7)
-	if fields == nil || fields.TimeMS() != 300 || fields.DoneMS() != 400 {
+	if fields == nil || fields.TimeMS != 300 || fields.DoneMS != 400 {
 		t.Fatalf("unexpected field timestamps: %+v", fields)
 	}
 	if fields.Series("close").Len() != 2 || fields.Float64("close") != 3 {

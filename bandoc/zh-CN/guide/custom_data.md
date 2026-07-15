@@ -84,14 +84,14 @@ strat.AddStrat(&strat.TradeStrat{
         }}
     },
     OnData: func(job *strat.StratJob, data *strat.DataFields) {
-        if data.Source() != "funding_rate" {
+        if data.Source != "funding_rate" {
             return
         }
         rate := data.Float64("rate")
         if !job.DataHub.AllReady() {
             return
         }
-        latest := job.DataHub.Get(data.TimeFrame(), data.Source(), data.Sid())
+        latest := job.DataHub.Get(data.TimeFrame, data.Source, data.Sid)
         _, _ = rate, latest
     },
 })

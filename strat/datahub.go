@@ -23,13 +23,13 @@ type DataFields struct {
 	mu           sync.RWMutex
 	seriesMap    map[string]*ta.Series
 	valMap       map[string]any
-	doneMS       int64
-	timeMS       int64
-	source       string
-	sid          int32
-	timeFrame    string
-	closed       bool
-	isWarmUp     bool
+	DoneMS       int64
+	TimeMS       int64
+	Source       string
+	Sid          int32
+	TimeFrame    string
+	Closed       bool
+	IsWarmUp     bool
 	env          *ta.BarEnv
 	seriesFields map[string]bool
 	autoSeries   bool
@@ -118,7 +118,7 @@ func (d *DataHub) AllReady() bool {
 		}
 		for _, bySID := range bySource {
 			for _, fields := range bySID {
-				if fields == nil || fields.DoneMS() < d.curMS {
+				if fields == nil || fields.DoneMS < d.curMS {
 					return false
 				}
 			}
@@ -179,16 +179,16 @@ func (d *DataFields) configureDefault() {
 func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.doneMS > 0 && endMS <= d.doneMS {
+	if d.DoneMS > 0 && endMS <= d.DoneMS {
 		return
 	}
-	d.timeMS = evt.TimeMS
-	d.doneMS = endMS
-	d.source = orm.NormalizeSeriesSource(evt.Source)
-	d.sid = evt.Sid
-	d.timeFrame = evt.TimeFrame
-	d.closed = evt.Closed
-	d.isWarmUp = evt.IsWarmUp
+	d.TimeMS = evt.TimeMS
+	d.DoneMS = endMS
+	d.Source = orm.NormalizeSeriesSource(evt.Source)
+	d.Sid = evt.Sid
+	d.TimeFrame = evt.TimeFrame
+	d.Closed = evt.Closed
+	d.IsWarmUp = evt.IsWarmUp
 
 	selected := make(map[string]bool, len(d.seriesFields)+len(d.seriesMap))
 	for name := range d.seriesFields {
@@ -318,76 +318,6 @@ func (d *DataFields) Raw(name string) any {
 		return series.Get(0)
 	}
 	return d.valMap[name]
-}
-
-func (d *DataFields) DoneMS() int64 {
-	if d == nil {
-		return 0
-	}
-	d.mu.RLock()
-	value := d.doneMS
-	d.mu.RUnlock()
-	return value
-}
-
-func (d *DataFields) TimeMS() int64 {
-	if d == nil {
-		return 0
-	}
-	d.mu.RLock()
-	value := d.timeMS
-	d.mu.RUnlock()
-	return value
-}
-
-func (d *DataFields) Source() string {
-	if d == nil {
-		return ""
-	}
-	d.mu.RLock()
-	value := d.source
-	d.mu.RUnlock()
-	return value
-}
-
-func (d *DataFields) Sid() int32 {
-	if d == nil {
-		return 0
-	}
-	d.mu.RLock()
-	value := d.sid
-	d.mu.RUnlock()
-	return value
-}
-
-func (d *DataFields) TimeFrame() string {
-	if d == nil {
-		return ""
-	}
-	d.mu.RLock()
-	value := d.timeFrame
-	d.mu.RUnlock()
-	return value
-}
-
-func (d *DataFields) Closed() bool {
-	if d == nil {
-		return false
-	}
-	d.mu.RLock()
-	value := d.closed
-	d.mu.RUnlock()
-	return value
-}
-
-func (d *DataFields) IsWarmUp() bool {
-	if d == nil {
-		return false
-	}
-	d.mu.RLock()
-	value := d.isWarmUp
-	d.mu.RUnlock()
-	return value
 }
 
 func (s *StratJob) SetData(evt *orm.DataSeries) *DataFields {

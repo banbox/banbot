@@ -530,17 +530,23 @@ type DataHub struct {
 func (d *DataHub) Get(tf, source string, sid int32) *DataFields
 func (d *DataHub) AllReady() bool
 
-type DataFields struct { /* 内部字段省略 */ }
+type DataFields struct {
+    DoneMS    int64
+    TimeMS    int64
+    Source    string
+    Sid       int32
+    TimeFrame string
+    Closed    bool
+    IsWarmUp  bool
+}
 
 func (d *DataFields) Series(name string) *banta.Series
 func (d *DataFields) Float64(name string) float64
 func (d *DataFields) Int64(name string) int64
 func (d *DataFields) Raw(name string) any
-func (d *DataFields) TimeMS() int64
-func (d *DataFields) DoneMS() int64
 ```
 
-`AllReady()` 使用当前 Hub 已处理事件的最大 `EndMS` 作为事件时间，只检查在该时间点应当闭合的周期。例如 16:05 会要求 1m 和 5m 的全部订阅 `DoneMS() >= 16:05`，不会要求尚未闭合的 15m。订阅会在首个事件前预注册，因此尚未收到过的数据源不会被误判为已就绪。
+`AllReady()` 使用当前 Hub 已处理事件的最大 `EndMS` 作为事件时间，只检查在该时间点应当闭合的周期。例如 16:05 会要求 1m 和 5m 的全部订阅 `DoneMS >= 16:05`，不会要求尚未闭合的 15m。订阅会在首个事件前预注册，因此尚未收到过的数据源不会被误判为已就绪。
 
 ---
 
@@ -574,7 +580,7 @@ func init() {
             }
         },
         OnData: func(job *strat.StratJob, data *strat.DataFields) {
-            if data.Source() != "macro_cpi" {
+            if data.Source != "macro_cpi" {
                 return
             }
             value := data.Series("value")
@@ -582,7 +588,7 @@ func init() {
             if !job.DataHub.AllReady() {
                 return
             }
-            latest := job.DataHub.Get("1d", "macro_cpi", data.Sid())
+            latest := job.DataHub.Get("1d", "macro_cpi", data.Sid)
             _, _, _ = value, revision, latest
         },
     })

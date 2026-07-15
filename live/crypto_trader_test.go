@@ -133,14 +133,14 @@ func TestCryptoTraderEmitRoutesThirdPartyRowsThroughOnData(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("expected OnData called twice, got %d", len(got))
 	}
-	if got[0].Source() != "macro" || got[0].Sid() != 77 || got[0].TimeFrame() != "1d" {
+	if got[0].Source != "macro" || got[0].Sid != 77 || got[0].TimeFrame != "1d" {
 		t.Fatalf("unexpected first OnData event: %+v", got[0])
 	}
 	if job.IsWarmUp {
 		t.Fatalf("expected emitted live rows to stay non-warmup")
 	}
 	latest := job.DataHub.Get("1d", "macro", 77)
-	if latest == nil || latest.TimeMS() != 200 {
+	if latest == nil || latest.TimeMS != 200 {
 		t.Fatalf("expected latest macro row at 200, got %+v", latest)
 	}
 	series := latest.Series("value")

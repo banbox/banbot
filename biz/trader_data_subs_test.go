@@ -31,9 +31,9 @@ func TestFeedSeriesRoutesNonKlineDataSubs(t *testing.T) {
 		Strat: &strat.TradeStrat{
 			OnData: func(s *strat.StratJob, data *strat.DataFields) {
 				got = append(got, data)
-				gotWarmups = append(gotWarmups, data.IsWarmUp())
-				if data.Source() != "macro" {
-					t.Fatalf("unexpected source: %s", data.Source())
+				gotWarmups = append(gotWarmups, data.IsWarmUp)
+				if data.Source != "macro" {
+					t.Fatalf("unexpected source: %s", data.Source)
 				}
 			},
 		},
@@ -99,7 +99,7 @@ func TestFeedSeriesRoutesNonKlineDataSubs(t *testing.T) {
 		t.Fatalf("expected latest non-warmup event to clear job warmup state")
 	}
 	latest := job.DataHub.Get("1d", "macro", 11)
-	if latest == nil || latest.TimeMS() != 300 || latest.IsWarmUp() {
+	if latest == nil || latest.TimeMS != 300 || latest.IsWarmUp {
 		t.Fatalf("expected DataHub latest non-kline event at 300, got %+v", latest)
 	}
 	series := latest.Series("value")
@@ -201,7 +201,7 @@ func TestFeedSeriesCoexistsForThirdPartyAndLegacyInfoSubs(t *testing.T) {
 		Strat: &strat.TradeStrat{
 			OnData: func(s *strat.StratJob, data *strat.DataFields) {
 				macroEvents++
-				if data.Source() != "macro" || data.Sid() != 11 || data.TimeFrame() != "1d" {
+				if data.Source != "macro" || data.Sid != 11 || data.TimeFrame != "1d" {
 					t.Fatalf("unexpected macro routing identity: %+v", data)
 				}
 			},
@@ -275,11 +275,11 @@ func TestFeedSeriesCoexistsForThirdPartyAndLegacyInfoSubs(t *testing.T) {
 		t.Fatalf("expected legacy OnInfoBar once, got %d", legacyCalls)
 	}
 	macroLatest := macroJob.DataHub.Get("1d", "macro", 11)
-	if macroLatest == nil || macroLatest.TimeMS() != 100 {
+	if macroLatest == nil || macroLatest.TimeMS != 100 {
 		t.Fatalf("expected macro DataHub latest at 100, got %+v", macroLatest)
 	}
 	legacyLatest := legacyJob.DataHub.Get("5m", "kline", exs.ID)
-	if legacyLatest == nil || legacyLatest.TimeMS() != 200 {
+	if legacyLatest == nil || legacyLatest.TimeMS != 200 {
 		t.Fatalf("expected legacy DataHub latest at 200, got %+v", legacyLatest)
 	}
 	if macroJob.DataHub.Get("5m", "kline", exs.ID) != nil {
