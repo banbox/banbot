@@ -22,23 +22,18 @@ func TestRouteDataSelectsOneHandler(t *testing.T) {
 
 func TestDataRoleHelpers(t *testing.T) {
 	tests := []struct {
-		name  string
-		build func(FnOnData) FnOnData
-		want  int
+		role      DataRole
+		wantMain  bool
+		wantKline bool
 	}{
-		{"kline", KlineData, 2},
-		{"custom", CustomData, 1},
+		{DataRoleMain, true, true},
+		{DataRoleInfo, false, true},
+		{DataRoleCustom, false, false},
 	}
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			called := 0
-			handler := test.build(func(_ *StratJob, _ DataEvent) { called++ })
-			for _, role := range []DataRole{DataRoleMain, DataRoleInfo, DataRoleCustom} {
-				handler(nil, DataEvent{Role: role})
-			}
-			if called != test.want {
-				t.Fatalf("handler called %d times, want %d", called, test.want)
-			}
-		})
+		event := DataEvent{Role: test.role}
+		if event.IsMain() != test.wantMain || event.IsKline() != test.wantKline {
+			t.Fatalf("role %v: IsMain=%v IsKline=%v", test.role, event.IsMain(), event.IsKline())
+		}
 	}
 }

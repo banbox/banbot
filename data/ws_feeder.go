@@ -164,10 +164,15 @@ func (f *TradeFeeder) CallNext() {
 
 func (f *TradeFeeder) loadNextBatch() {
 	var err *errs.Error
+	done := f.waitNext
+	defer func() {
+		if done != nil {
+			done <- 1
+		}
+	}()
 	hourMS := int64(3600000)
 	f.offsetMS += hourMS
 	if f.offsetMS >= f.endMS {
-		f.nextMS = f.endMS
 		return
 	}
 	info := &WsSymbol{
@@ -185,11 +190,5 @@ func (f *TradeFeeder) loadNextBatch() {
 		} else {
 			log.Error("load ws trades fail", zap.String("item", info.String()), zap.Error(err))
 		}
-	}
-	if len(f.nextCache) == 0 {
-		f.nextMS = f.endMS
-	}
-	if f.waitNext != nil {
-		f.waitNext <- 1
 	}
 }
