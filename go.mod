@@ -2,21 +2,19 @@ module github.com/banbox/banbot
 
 go 1.24.0
 
-replace github.com/banbox/banexg => ../banexg
+// replace github.com/banbox/banexg => ../banexg
 
 // replace	github.com/banbox/banta => ../banta
 
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
-	github.com/banbox/banexg v0.2.54
+	github.com/banbox/banexg v0.2.56
 	github.com/banbox/banta v0.3.7
 	github.com/c-bata/goptuna v0.9.0
 	github.com/cloudwego/eino v0.6.0
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.1
 	github.com/dgraph-io/ristretto v0.2.0
 	github.com/jackc/pgx/v5 v5.7.6
-	github.com/muesli/clusters v0.0.0-20200529215643-2700303c1762
-	github.com/muesli/kmeans v0.3.1
 	github.com/olekukonko/tablewriter v1.1.0
 	// github.com/pkujhd/goloader v0.0.0-20240113094056-ff3a1e01ffcb
 	github.com/schollz/progressbar/v3 v3.18.0
@@ -46,6 +44,7 @@ require (
 	github.com/sasha-s/go-deadlock v0.3.6
 	github.com/shirou/gopsutil/v4 v4.25.9
 	golang.org/x/image v0.32.0
+	golang.org/x/sys v0.37.0
 	modernc.org/sqlite v1.39.1
 )
 
@@ -133,7 +132,6 @@ require (
 	golang.org/x/exp v0.0.0-20250718183923-645b1fa84792 // indirect
 	golang.org/x/net v0.46.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect
-	golang.org/x/sys v0.37.0 // indirect
 	golang.org/x/term v0.36.0 // indirect
 	golang.org/x/tools v0.37.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b // indirect
