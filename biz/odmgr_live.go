@@ -31,21 +31,23 @@ type FuncHandleMyOrder = func(trade *banexg.Order) bool
 
 type LiveOrderMgr struct {
 	OrderMgr
-	queue            chan *OdQItem
-	doneKeys         map[string]int64            // Completed Orders 已完成的订单：symbol+orderId
-	exgIdMap         map[string]*ormo.InOutOrder // symbol+orderId: InOutOrder
-	doneTrades       map[string]int64            // Processed trades 已处理的交易：symbol+tradeId
-	lockDoneKeys     deadlock.Mutex
-	lockExgIdMap     deadlock.Mutex
-	lockDoneTrades   deadlock.Mutex
-	isWatchMyTrade   int32                      // atomic flag: Is the account transaction flow being monitored? 是否正在监听账户交易流
-	isTrialUnMatches int32                      // atomic flag: Is monitoring unmatched transactions? 是否正在监听未匹配交易
-	isConsumeOrderQ  int32                      // atomic flag: Is it consuming from the order queue? 是否正在从订单队列消费
-	isWatchAccConfig int32                      // atomic flag: Is the leverage ratio being monitored? 是否正在监听杠杆倍数变化
-	unMatchTrades    map[string]*banexg.MyTrade // Transactions received from ws that have no matching orders 从ws收到的暂无匹配的订单的交易
-	lockUnMatches    deadlock.Mutex             // Prevent concurrent reading and writing of unMatchTrades 防止并发读写unMatchTrades
-	exitByMyOrder    FuncHandleMyOrder          // Try to use the transaction results of other end operations to update the current order status 尝试使用其他端操作的交易结果，更新当前订单状态
-	traceExgOrder    FuncHandleMyOrder
+	queue             chan *OdQItem
+	doneKeys          map[string]int64            // Completed Orders 已完成的订单：symbol+orderId
+	exgIdMap          map[string]*ormo.InOutOrder // symbol+orderId: InOutOrder
+	doneTrades        map[string]int64            // Processed trades 已处理的交易：symbol+tradeId
+	lockDoneKeys      deadlock.Mutex
+	lockExgIdMap      deadlock.Mutex
+	lockDoneTrades    deadlock.Mutex
+	isWatchMyTrade    int32 // atomic flag: Is the account transaction flow being monitored? 是否正在监听账户交易流
+	watchMyTradesFn   func(map[string]interface{}) (chan *banexg.MyTrade, *errs.Error)
+	myTradeWatchRetry time.Duration
+	isTrialUnMatches  int32                      // atomic flag: Is monitoring unmatched transactions? 是否正在监听未匹配交易
+	isConsumeOrderQ   int32                      // atomic flag: Is it consuming from the order queue? 是否正在从订单队列消费
+	isWatchAccConfig  int32                      // atomic flag: Is the leverage ratio being monitored? 是否正在监听杠杆倍数变化
+	unMatchTrades     map[string]*banexg.MyTrade // Transactions received from ws that have no matching orders 从ws收到的暂无匹配的订单的交易
+	lockUnMatches     deadlock.Mutex             // Prevent concurrent reading and writing of unMatchTrades 防止并发读写unMatchTrades
+	exitByMyOrder     FuncHandleMyOrder          // Try to use the transaction results of other end operations to update the current order status 尝试使用其他端操作的交易结果，更新当前订单状态
+	traceExgOrder     FuncHandleMyOrder
 }
 
 type OdQItem struct {
@@ -54,9 +56,11 @@ type OdQItem struct {
 }
 
 const (
-	AmtDust                 = 1e-8
-	odInfoLocalTrigger      = "LocalTrigger"
-	restoreAmbiguousExgData = "ambiguous_exchange_entries"
+	AmtDust                          = 1e-8
+	odInfoLocalTrigger               = "LocalTrigger"
+	restoreAmbiguousExgData          = "ambiguous_exchange_entries"
+	pendingMarketEntryReconcileAfter = 20 * time.Second
+	defaultMyTradeWatchRetry         = 5 * time.Second
 )
 
 var (
@@ -102,11 +106,12 @@ func newLiveOrderMgr(account string, callBack func(od *ormo.InOutOrder, isEnter 
 			callBack: callBack,
 			Account:  account,
 		},
-		queue:         make(chan *OdQItem, 1000),
-		doneKeys:      map[string]int64{},
-		exgIdMap:      map[string]*ormo.InOutOrder{},
-		doneTrades:    map[string]int64{},
-		unMatchTrades: map[string]*banexg.MyTrade{},
+		queue:             make(chan *OdQItem, 1000),
+		doneKeys:          map[string]int64{},
+		exgIdMap:          map[string]*ormo.InOutOrder{},
+		doneTrades:        map[string]int64{},
+		unMatchTrades:     map[string]*banexg.MyTrade{},
+		myTradeWatchRetry: defaultMyTradeWatchRetry,
 	}
 	res.afterEnter = makeAfterEnter(res)
 	res.afterExit = makeAfterExit(res)
@@ -146,8 +151,19 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 		posMap[pos.Symbol][isShort] = pos
 	}
 
-	// 按symbol分组本地订单
+	// Reconcile only stale submitted market entries. A private WebSocket outage may
+	// drop their execution events; the targeted REST check repairs that gap without
+	// changing pending limit-order behavior.
 	openOds, lock := ormo.GetOpenODs(o.Account)
+	lock.Lock()
+	pendingEntries := make([]*ormo.InOutOrder, 0, len(openOds))
+	for _, od := range openOds {
+		pendingEntries = append(pendingEntries, od)
+	}
+	lock.Unlock()
+	o.reconcilePendingMarketEntries(pendingEntries)
+
+	// 按symbol分组本地订单
 	lock.Lock()
 	// 过滤重复订单
 	var duplicateOdNum = 0
@@ -1272,30 +1288,101 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 }
 
 func (o *LiveOrderMgr) WatchMyTrades() {
-	out, err := exg.Default.WatchMyTrades(map[string]interface{}{
-		banexg.ParamAccount: o.Account,
-	})
-	if err != nil {
-		log.Error("WatchMyTrades fail", zap.String("acc", o.Account), zap.Error(err))
-		return
-	}
 	if !atomic.CompareAndSwapInt32(&o.isWatchMyTrade, 0, 1) {
 		return
 	}
+	watch := o.watchMyTradesFn
+	if watch == nil {
+		watch = exg.Default.WatchMyTrades
+	}
+	retryDelay := o.myTradeWatchRetry
+	if retryDelay <= 0 {
+		retryDelay = defaultMyTradeWatchRetry
+	}
 	go func() {
-		defer func() {
-			atomic.StoreInt32(&o.isWatchMyTrade, 0)
-		}()
-		for trade := range out {
-			orm.AddDumpRow(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
-			if trade.State == banexg.OdStatusOpen {
+		defer atomic.StoreInt32(&o.isWatchMyTrade, 0)
+		for {
+			out, err := watch(map[string]interface{}{
+				banexg.ParamAccount: o.Account,
+			})
+			if err != nil {
+				log.Error("WatchMyTrades fail, retrying", zap.String("acc", o.Account), zap.Error(err))
+				time.Sleep(retryDelay)
 				continue
 			}
-			o.handleMyTrade(trade)
+			for trade := range out {
+				orm.AddDumpRow(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
+				if trade.State == banexg.OdStatusOpen {
+					continue
+				}
+				o.handleMyTrade(trade)
+			}
+			log.Warn("WatchMyTrades stream closed, retrying", zap.String("acc", o.Account),
+				zap.Duration("after", retryDelay))
+			time.Sleep(retryDelay)
 		}
 	}()
 }
 
+// reconcilePendingMarketEntries restores a market entry only when the exchange
+// has an authoritative positive fill. It deliberately ignores limit
+// entries and fresh orders, preserving normal entry and trigger behavior.
+func (o *LiveOrderMgr) reconcilePendingMarketEntries(ods []*ormo.InOutOrder) {
+	cutoff := btime.UTCStamp() - pendingMarketEntryReconcileAfter.Milliseconds()
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		enter := od.Enter
+		if enter == nil || enter.OrderID == "" || enter.OrderType != banexg.OdTypeMarket ||
+			enter.Status == ormo.OdStatusClosed || enter.Filled > AmtDust || enter.UpdateAt > cutoff {
+			lock.Unlock()
+			continue
+		}
+		orderID, symbol := enter.OrderID, od.Symbol
+		lock.Unlock()
+
+		res, err := exg.Default.FetchOrder(symbol, orderID, map[string]interface{}{
+			banexg.ParamAccount: o.Account,
+		})
+		if err != nil {
+			log.Warn("reconcile pending market entry fetch fail", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if res == nil || res.ID == "" || res.ID != orderID {
+			log.Warn("reconcile pending market entry invalid response", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.String("orderId", orderID))
+			continue
+		}
+		if res.Filled <= AmtDust {
+			continue
+		}
+
+		lock = od.Lock()
+		enter = od.Enter
+		if enter == nil || enter.OrderID != orderID || enter.OrderType != banexg.OdTypeMarket ||
+			enter.Status == ormo.OdStatusClosed || enter.Filled > AmtDust {
+			lock.Unlock()
+			continue
+		}
+		beforeFilled, beforeStatus := enter.Filled, od.Status
+		err = o.applyAuthoritativeEnterOrder(od, res)
+		changed := enter.Filled > beforeFilled+AmtDust || od.Status != beforeStatus
+		lock.Unlock()
+		if err != nil {
+			log.Error("reconcile pending market entry apply fail", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if changed {
+			log.Info("reconciled pending market entry", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.String("orderId", orderID),
+				zap.Float64("filled", od.Enter.Filled), zap.Float64("average", od.Enter.Average))
+		}
+	}
+}
 func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 	if _, ok := core.PairsMap[trade.Symbol]; !ok {
 		// 忽略不处理的交易对
