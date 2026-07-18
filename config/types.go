@@ -161,8 +161,8 @@ type RunPolicyConfig struct {
 	PairParams    map[string]map[string]float64 `yaml:"pair_params,omitempty" mapstructure:"pair_params"`
 	More          map[string]interface{}        `yaml:",inline" mapstructure:",remain"`
 	defs          map[string]*core.Param
-	Score         float64
-	Index         int // index in run_policy array
+	Score         float64 `yaml:"-" mapstructure:"-"`
+	Index         int     `yaml:"-" mapstructure:"-"` // index in run_policy array
 }
 
 type BtInLiveConfig struct {

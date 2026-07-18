@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -24,11 +25,14 @@ type FuncMakeStrat = func(pol *config.RunPolicyConfig) *TradeStrat
 var (
 	StratMake   = make(map[string]FuncMakeStrat) // 已加载的策略缓存
 	cacheStrats = make(map[string]*TradeStrat)
+	cacheMu     sync.Mutex
 )
 
 func New(pol *config.RunPolicyConfig) *TradeStrat {
 	polID := pol.ID()
-	cacheKey := utils.MD5([]byte(pol.ToYaml()))
+	cacheKey := utils.MD5([]byte(polID + "\n" + pol.ToYaml()))
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
 	if obj, ok := cacheStrats[cacheKey]; ok {
 		return obj
 	}

@@ -218,7 +218,7 @@ func btOptHash(args *config.CmdArgs) string {
 	return res[:10]
 }
 
-func pickFromExists(path string, picker, pairPicker string) (string, *errs.Error) {
+func pickFromExists(path string, picker, pairPicker string, sources []*config.RunPolicyConfig) (string, *errs.Error) {
 	paths, err_ := utils.GetFilesWithPrefix(path)
 	if err_ != nil {
 		return "", errs.New(errs.CodeIOReadFail, err_)
@@ -226,7 +226,7 @@ func pickFromExists(path string, picker, pairPicker string) (string, *errs.Error
 	if len(paths) == 0 {
 		return "", nil
 	}
-	return collectOptLog(paths, 0, picker, pairPicker)
+	return collectOptLog(paths, 0, picker, pairPicker, sources)
 }
 
 /*
@@ -323,38 +323,41 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 		// Multi-process execution to improve speed.
 		// 多进程执行，提高速度。
 		log.Warn("running optimize", zap.Int("num", len(groups)), zap.Int("rounds", args.OptRounds))
-		var cmds = []string{"optimize", "-opt-rounds"}
-		cmds = append(cmds, strconv.Itoa(args.OptRounds), "-sampler", args.Sampler)
-		if args.EachPairs {
-			cmds = append(cmds, "-each-pairs")
+		cmds, cleanup, cmdErr := optimizeChildBaseArgs(args)
+		if cmdErr != nil {
+			return "", cmdErr
 		}
-		for _, p := range args.Configs {
-			cmds = append(cmds, "-config", p)
-		}
-		if args.Picker != "" {
-			cmds = append(cmds, "-picker", args.Picker)
-		}
+		defer cleanup()
 		startStr := strconv.FormatInt(config.TimeRange.StartMS/1000, 10)
 		endStr := strconv.FormatInt(config.TimeRange.EndMS/1000, 10)
+		logOuts = make([]string, len(groups))
+		for i := range groups {
+			logOuts[i] = args.OutPath + "." + strconv.Itoa(i+1)
+		}
 		err = utils.ParallelRun(groups, args.Concur, func(i int, pol *config.RunPolicyConfig) *errs.Error {
 			core.Sleep(time.Millisecond * time.Duration(1000*rand.Float64()+100*float64(i)))
 			iStr := strconv.Itoa(i + 1)
 			cfgFile, err_ := os.CreateTemp("", "ban_opt"+iStr)
 			if err_ != nil {
-				log.Warn("write temp config fail", zap.Error(err_))
-				return nil
+				return errs.New(errs.CodeIOWriteFail, err_)
 			}
 			defer os.Remove(cfgFile.Name())
-			cfgFile.WriteString(fmt.Sprintf("time_start: \"%s\"\n", startStr))
-			cfgFile.WriteString(fmt.Sprintf("time_end: \"%s\"\n", endStr))
-			cfgFile.WriteString("run_policy:\n")
-			cfgFile.WriteString(pol.ToYaml())
-			cfgFile.Close()
-			curCmds := append(cmds, "-config", cfgFile.Name())
-			outPath := args.OutPath + "." + iStr
+			cfgData, err_ := marshalOptimizeChildConfig(args, pol, startStr, endStr)
+			if err_ != nil {
+				cfgFile.Close()
+				return errs.New(errs.CodeMarshalFail, err_)
+			}
+			if _, err_ = cfgFile.Write(cfgData); err_ != nil {
+				cfgFile.Close()
+				return errs.New(errs.CodeIOWriteFail, err_)
+			}
+			if err_ = cfgFile.Close(); err_ != nil {
+				return errs.New(errs.CodeIOWriteFail, err_)
+			}
+			curCmds := append(slices.Clone(cmds), "-config", cfgFile.Name())
+			outPath := logOuts[i]
 			curCmds = append(curCmds, "-out", outPath)
-			logOuts = append(logOuts, outPath)
-			log.Warn("runing: " + strings.Join(curCmds, " "))
+			log.Warn("running: " + strings.Join(curCmds, " "))
 			var out bytes.Buffer
 			excPath, err_ := os.Executable()
 			if err_ != nil {
@@ -375,10 +378,88 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 			return "", err
 		}
 	}
-	return collectOptLog(logOuts, minScore, args.Picker, args.PairPicker)
+	return collectOptLog(logOuts, minScore, args.Picker, args.PairPicker, groups)
 }
 
 const optDataPreparedEnv = "BANBOT_OPT_DATA_PREPARED"
+
+type optimizeChildConfig struct {
+	TimeStart     string                    `yaml:"time_start"`
+	TimeEnd       string                    `yaml:"time_end"`
+	StakeAmount   *float64                  `yaml:"stake_amount,omitempty"`
+	StakePct      *float64                  `yaml:"stake_pct,omitempty"`
+	RunTimeframes []string                  `yaml:"run_timeframes,omitempty,flow"`
+	Pairs         []string                  `yaml:"pairs,omitempty,flow"`
+	Database      *optimizeChildDatabase    `yaml:"database,omitempty"`
+	RunPolicy     []*config.RunPolicyConfig `yaml:"run_policy"`
+}
+
+type optimizeChildDatabase struct {
+	MaxPoolSize int `yaml:"max_pool_size"`
+}
+
+func marshalOptimizeChildConfig(args *config.CmdArgs, pol *config.RunPolicyConfig, startStr, endStr string) ([]byte, error) {
+	cfg := &optimizeChildConfig{
+		TimeStart: startStr,
+		TimeEnd:   endStr,
+		RunPolicy: []*config.RunPolicyConfig{pol},
+	}
+	if args.StakeAmount > 0 {
+		cfg.StakeAmount = &args.StakeAmount
+	}
+	if args.StakePct > 0 {
+		cfg.StakePct = &args.StakePct
+	}
+	if len(args.TimeFrames) > 0 {
+		cfg.RunTimeframes = args.TimeFrames
+	}
+	if len(args.Pairs) > 0 {
+		cfg.Pairs = args.Pairs
+	}
+	if args.MaxPoolSize > 0 {
+		cfg.Database = &optimizeChildDatabase{MaxPoolSize: args.MaxPoolSize}
+	}
+	return core.MarshalYaml(cfg)
+}
+
+func optimizeChildBaseArgs(args *config.CmdArgs) ([]string, func(), *errs.Error) {
+	cmds := []string{"optimize", "-opt-rounds", strconv.Itoa(args.OptRounds), "-sampler", args.Sampler}
+	if args.EachPairs {
+		cmds = append(cmds, "-each-pairs")
+	}
+	if args.NoDefault {
+		cmds = append(cmds, "-no-default")
+	}
+	if args.DataDir != "" {
+		cmds = append(cmds, "-datadir", args.DataDir)
+	}
+	for _, path := range args.Configs {
+		cmds = append(cmds, "-config", path)
+	}
+	cleanup := func() {}
+	if args.ConfigData != "" {
+		file, err := os.CreateTemp("", "ban_opt_parent_config")
+		if err != nil {
+			return nil, cleanup, errs.New(errs.CodeIOWriteFail, err)
+		}
+		path := file.Name()
+		cleanup = func() { _ = os.Remove(path) }
+		if _, err = file.WriteString(args.ConfigData); err != nil {
+			file.Close()
+			cleanup()
+			return nil, func() {}, errs.New(errs.CodeIOWriteFail, err)
+		}
+		if err = file.Close(); err != nil {
+			cleanup()
+			return nil, func() {}, errs.New(errs.CodeIOWriteFail, err)
+		}
+		cmds = append(cmds, "-config", path)
+	}
+	if args.Picker != "" {
+		cmds = append(cmds, "-picker", args.Picker)
+	}
+	return cmds, cleanup, nil
+}
 
 func prepareOptimizeData() *errs.Error {
 	core.BotRunning = true
@@ -509,9 +590,9 @@ func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int,
 	var bestPols []*config.RunPolicyConfig
 	for _, p := range groups {
 		config.RunPolicy = []*config.RunPolicyConfig{p}
-		optForPol(p, method, picker, rounds, flog)
+		orderNum := optForPol(p, method, picker, rounds, flog)
 		if p.Score > bestScore {
-			bestOdNum = p.MaxOpen
+			bestOdNum = orderNum
 			bestScore = p.Score
 			bestPols = []*config.RunPolicyConfig{p}
 		}
@@ -573,7 +654,7 @@ Before calling this method, you need to set 'config. RunPolicy`
 对策略任务执行优化，支持bayes/tpe/cames等
 调用此方法前需要设置 `config.RunPolicy`
 */
-func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, flog *os.File) {
+func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, flog *os.File) int {
 	title := pol.Key()
 	// 重置PairParams，避免影响传入参数
 	pol.PairParams = make(map[string]map[string]float64)
@@ -582,13 +663,13 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 	params := pol.HyperParams()
 	if len(params) == 0 {
 		log.Warn("no hyper params, skip optimize", zap.String("strat", title))
-		return
+		return 0
 	}
 	detailDir := filepath.Join(filepath.Dir(flog.Name()), "detail")
 	err_ := utils.EnsureDir(detailDir, 0755)
 	if err_ != nil {
 		log.Warn("create detail dir fail", zap.String("path", detailDir), zap.Error(err_))
-		return
+		return 0
 	}
 	flog.WriteString(fmt.Sprintf("\n============== %s =============\n", title))
 	var resList = make([]*OptInfo, 0, rounds)
@@ -629,7 +710,7 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 	}
 	pol.Params = best.Params
 	pol.Score = best.Score
-	pol.MaxOpen = best.OrderNum
+	return best.OrderNum
 }
 
 func runBTOnce() (*BackTest, float64) {
@@ -770,7 +851,7 @@ func CollectOptLog(args *config.CmdArgs) *errs.Error {
 		}
 		return nil
 	})
-	res, err := collectOptLog(paths, 0, args.Picker, args.PairPicker)
+	res, err := collectOptLog(paths, 0, args.Picker, args.PairPicker, config.RunPolicy)
 	if err != nil {
 		return err
 	}
@@ -778,11 +859,12 @@ func CollectOptLog(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
-func collectOptLog(paths []string, minScore float64, picker, pairSel string) (string, *errs.Error) {
+func collectOptLog(paths []string, minScore float64, picker, pairSel string, sources []*config.RunPolicyConfig) (string, *errs.Error) {
 	res := make([]*OptGroup, 0)
 	detailDir := ""
 	for _, path := range paths {
 		var name, pair, dirt, tfStr string
+		var source *config.RunPolicyConfig
 		inUnion := false
 		var items []*OptInfo
 		var long, short, both, union, longMain, shortMain *OptInfo
@@ -851,14 +933,16 @@ func collectOptLog(paths []string, minScore float64, picker, pairSel string) (st
 				pols = []*OptInfo{oneSide}
 			}
 			res = append(res, &OptGroup{
-				Items: pols,
-				Score: bestScore,
-				Name:  name,
-				Pair:  pair,
-				TFStr: tfStr,
+				Items:  pols,
+				Source: source,
+				Score:  bestScore,
+				Name:   name,
+				Pair:   pair,
+				TFStr:  tfStr,
 			})
 			long, short, both, union, longMain, shortMain = nil, nil, nil, nil, nil, nil
 			name, pair, dirt, tfStr = "", "", "", ""
+			source = nil
 			inUnion = false
 			items = nil
 			pickerMap = make(map[string]*OptInfo)
@@ -892,46 +976,48 @@ func collectOptLog(paths []string, minScore float64, picker, pairSel string) (st
 						inUnion = false
 						if needRun {
 							config.RunPolicy = []*config.RunPolicyConfig{
-								long.ToPol(0, name, dirt, tfStr, pair),
-								short.ToPol(1, name, dirt, tfStr, pair),
+								long.ToPol(source, 0, name, dirt, tfStr, pair),
+								short.ToPol(source, 1, name, dirt, tfStr, pair),
 							}
 						}
 					} else if dirt == "long" {
+						best.Dirt = dirt
 						if long == nil {
 							long = best
 							if needRun {
 								config.RunPolicy = []*config.RunPolicyConfig{
-									long.ToPol(0, name, dirt, tfStr, pair),
+									long.ToPol(source, 0, name, dirt, tfStr, pair),
 								}
 							}
 						} else {
 							shortMain = best
 							if needRun {
 								config.RunPolicy = []*config.RunPolicyConfig{
-									short.ToPol(0, name, dirt, tfStr, pair),
-									shortMain.ToPol(1, name, dirt, tfStr, pair),
+									short.ToPol(source, 0, name, dirt, tfStr, pair),
+									shortMain.ToPol(source, 1, name, dirt, tfStr, pair),
 								}
 							}
 						}
 					} else if dirt == "short" {
+						best.Dirt = dirt
 						if short == nil {
 							short = best
 							if needRun {
 								config.RunPolicy = []*config.RunPolicyConfig{
-									short.ToPol(0, name, dirt, tfStr, pair)}
+									short.ToPol(source, 0, name, dirt, tfStr, pair)}
 							}
 						} else {
 							longMain = best
 							if needRun {
 								config.RunPolicy = []*config.RunPolicyConfig{
-									long.ToPol(0, name, dirt, tfStr, pair),
-									longMain.ToPol(1, name, dirt, tfStr, pair)}
+									long.ToPol(source, 0, name, dirt, tfStr, pair),
+									longMain.ToPol(source, 1, name, dirt, tfStr, pair)}
 							}
 						}
 					} else {
 						both = best
 						if needRun {
-							config.RunPolicy = []*config.RunPolicyConfig{both.ToPol(0, name, dirt, tfStr, pair)}
+							config.RunPolicy = []*config.RunPolicyConfig{both.ToPol(source, 0, name, dirt, tfStr, pair)}
 						}
 					}
 					var dumpPath string
@@ -968,11 +1054,16 @@ func collectOptLog(paths []string, minScore float64, picker, pairSel string) (st
 				continue
 			}
 			if strings.HasPrefix(line, "==============") && strings.HasSuffix(line, "=============") {
-				n, d, t, p := parseSectionTitle(strings.Split(line, " ")[1])
+				sectionTitle := strings.Split(line, " ")[1]
+				n, d, t, p := parseSectionTitle(sectionTitle)
 				if p != pair || n != name || t != tfStr {
 					saveGroup()
 				}
 				name, dirt, tfStr, pair = n, d, t, p
+				source = findSourcePolicy(sources, n, t, p)
+				if source == nil && len(sources) > 0 {
+					return "", errs.NewMsg(errs.CodeRunTime, "no source run policy matches optimize section %s", sectionTitle)
+				}
 				inUnion = false
 			} else if strings.HasPrefix(line, "========== union") {
 				inUnion = true
@@ -996,30 +1087,44 @@ func collectOptLog(paths []string, minScore float64, picker, pairSel string) (st
 			break
 		}
 		b.WriteString(fmt.Sprintf("\n  # score: %.2f\n", gp.Score))
-		for _, p := range gp.Items {
-			tfStr := strings.ReplaceAll(gp.TFStr, "|", ", ")
-			b.WriteString(fmt.Sprintf("  - name: %s\n    run_timeframes: [ %s ]\n", gp.Name, tfStr))
-			var pairStr string
+		for i, p := range gp.Items {
+			pairStr := gp.Pair
 			if pairSel != "" {
 				pairs := selectPairs(p.BTResult, pairSel)
 				if len(pairs) > 0 {
-					pairStr = strings.Join(pairs, ", ")
+					pairStr = strings.Join(pairs, "|")
 				}
 			}
-			if pairStr == "" && gp.Pair != "" {
-				pairStr = strings.ReplaceAll(gp.Pair, "|", ", ")
-			}
-			if pairStr != "" {
-				b.WriteString(fmt.Sprintf("    pairs: [%s]\n", pairStr))
-			}
-			if p.Dirt != "" {
-				b.WriteString(fmt.Sprintf("    dirt: %s\n", p.Dirt))
-			}
-			paramStr := utils.MapToStr(p.Params, true, 2)
-			b.WriteString(fmt.Sprintf("    params: {%s}\n", paramStr))
+			b.WriteString(p.ToPol(gp.Source, i, gp.Name, "", gp.TFStr, pairStr).ToYaml())
 		}
 	}
 	return b.String(), nil
+}
+
+func findSourcePolicy(sources []*config.RunPolicyConfig, name, tfStr, pairStr string) *config.RunPolicyConfig {
+	for _, pol := range sources {
+		if pol.Name != name || strings.Join(pol.RunTimeframes, "|") != tfStr {
+			continue
+		}
+		if len(pol.Pairs) == 0 || pairStr == "" || strings.Join(pol.Pairs, "|") == pairStr {
+			return pol
+		}
+		pairMap := make(map[string]bool, len(pol.Pairs))
+		for _, pair := range pol.Pairs {
+			pairMap[pair] = true
+		}
+		matched := true
+		for _, pair := range strings.Split(pairStr, "|") {
+			if !pairMap[pair] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return pol
+		}
+	}
+	return nil
 }
 
 /*
@@ -1027,7 +1132,7 @@ Parse the header and return: policy name, direction, tfStr, pairStr
 解析标题，返回：策略名，方向，tfStr，pairStr
 */
 func parseSectionTitle(title string) (string, string, string, string) {
-	arr := strings.Split(title, "/")
+	arr := strings.SplitN(title, "/", 3)
 	name, dirt := parsePolID(arr[0])
 	return name, dirt, arr[1], arr[2]
 }

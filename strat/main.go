@@ -328,7 +328,13 @@ func ExitStratJobs() {
 			}
 		}
 	}
+	cacheMu.Lock()
+	strats := make([]*TradeStrat, 0, len(cacheStrats))
 	for _, stg := range cacheStrats {
+		strats = append(strats, stg)
+	}
+	cacheMu.Unlock()
+	for _, stg := range strats {
 		if stg.OnStratExit != nil {
 			stg.OnStratExit()
 		}
