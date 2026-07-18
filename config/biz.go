@@ -940,34 +940,40 @@ api_server.users[*].pwd
 func (c *Config) Desensitize() *Config {
 	var res = c.Clone()
 
-	if res.Accounts != nil {
-		for _, acc := range res.Accounts {
-			acc.Exchanges = nil
-			acc.APIServer = nil
+	if c.Accounts != nil {
+		res.Accounts = make(map[string]*AccountConfig, len(c.Accounts))
+		for name, acc := range c.Accounts {
+			if acc == nil {
+				res.Accounts[name] = nil
+				continue
+			}
+			item := *acc
+			item.RPCChannels = make([]map[string]interface{}, len(acc.RPCChannels))
+			for i, channel := range acc.RPCChannels {
+				item.RPCChannels[i] = cloneStringMap(channel)
+			}
+			item.Exchanges = nil
+			item.APIServer = nil
+			res.Accounts[name] = &item
 		}
 	}
 
 	// 处理数据库配置
 	if c.Database != nil {
-		res.Database = &DatabaseConfig{
-			Url:         "",
-			Retention:   c.Database.Retention,
-			MaxPoolSize: c.Database.MaxPoolSize,
-			AutoCreate:  c.Database.AutoCreate,
-			QdbMemPct:   c.Database.QdbMemPct,
-			QdbMaxMemMB: c.Database.QdbMaxMemMB,
-		}
+		item := *c.Database
+		item.Url = ""
+		res.Database = &item
 	}
 
 	// 处理RPC通道配置
 	if c.RPCChannels != nil {
-		res.RPCChannels = make(map[string]map[string]interface{})
+		res.RPCChannels = make(map[string]map[string]interface{}, len(c.RPCChannels))
 		for channelName, channelConfig := range c.RPCChannels {
 			chlType := utils.GetMapVal(channelConfig, "type", "")
-			resChannel := make(map[string]interface{})
-			for k, v := range channelConfig {
-				if !strings.Contains(strings.ToLower(k), "secret") {
-					resChannel[k] = v
+			resChannel := cloneStringMap(channelConfig)
+			for key := range resChannel {
+				if strings.Contains(strings.ToLower(key), "secret") {
+					delete(resChannel, key)
 				}
 			}
 			if chlType == "wework" {
@@ -984,23 +990,22 @@ func (c *Config) Desensitize() *Config {
 
 	// 处理API服务器配置
 	if c.APIServer != nil {
-		res.APIServer = &APIServerConfig{
-			Enable:      c.APIServer.Enable,
-			BindIPAddr:  c.APIServer.BindIPAddr,
-			Port:        c.APIServer.Port,
-			Verbosity:   c.APIServer.Verbosity,
-			CORSOrigins: c.APIServer.CORSOrigins,
-		}
+		item := *c.APIServer
+		item.JWTSecretKey = ""
+		item.CORSOrigins = slices.Clone(c.APIServer.CORSOrigins)
 		if c.APIServer.Users != nil {
-			res.APIServer.Users = make([]*UserConfig, len(c.APIServer.Users))
+			item.Users = make([]*UserConfig, len(c.APIServer.Users))
 			for i, user := range c.APIServer.Users {
-				res.APIServer.Users[i] = &UserConfig{
-					Username:    user.Username,
-					AccRoles:    user.AccRoles,
-					ExpireHours: user.ExpireHours,
+				if user != nil {
+					userCopy := *user
+					userCopy.Password = ""
+					userCopy.AllowIPs = slices.Clone(user.AllowIPs)
+					userCopy.AccRoles = maps.Clone(user.AccRoles)
+					item.Users[i] = &userCopy
 				}
 			}
 		}
+		res.APIServer = &item
 	}
 
 	return res

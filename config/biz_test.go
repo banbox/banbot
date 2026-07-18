@@ -184,3 +184,109 @@ func TestRunPolicyToYamlRoundTrip(t *testing.T) {
 		t.Fatalf("policy YAML lost fields:\n got: %#v\nwant: %#v\nYAML:\n%s", got, want, text)
 	}
 }
+
+func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
+	oldData := Data
+	oldExchange := Exchange
+	t.Cleanup(func() {
+		Data = oldData
+		Exchange = oldExchange
+	})
+	Exchange = &ExchangeConfig{Name: "binance"}
+
+	Data = Config{
+		Accounts: map[string]*AccountConfig{
+			"primary": {
+				StakeRate: 1.5,
+				RPCChannels: []map[string]interface{}{{
+					"name":    "alerts",
+					"options": map[string]interface{}{"format": "compact"},
+				}},
+				APIServer: &AccPwdRole{Pwd: "account-password", Role: "admin"},
+				Exchanges: map[string]*ExgApiSecrets{
+					"binance": {
+						Prod: &ApiSecretConfig{APIKey: "prod-key", APISecret: "prod-secret", Password: "prod-password"},
+						Test: &ApiSecretConfig{APIKey: "test-key", APISecret: "test-secret", Password: "test-password"},
+					},
+				},
+			},
+		},
+		Database: &DatabaseConfig{
+			Url: "postgresql://db-user:db-password@localhost/banbot", Retention: "all", DbType: "questdb",
+		},
+		RPCChannels: map[string]map[string]interface{}{
+			"alerts": {
+				"type": "telegram", "token": "telegram-token", "chat_id": "telegram-chat",
+				"options": map[string]interface{}{"format": "compact"},
+			},
+		},
+		APIServer: &APIServerConfig{
+			Enable: true, JWTSecretKey: "jwt-secret", CORSOrigins: []string{"https://dashboard.example"},
+			Users: []*UserConfig{{
+				Username: "operator", Password: "operator-password", AllowIPs: []string{"127.0.0.1"},
+				AccRoles: map[string]string{"primary": "admin"}, ExpireHours: 24,
+			}},
+		},
+		Mail: &MailConfig{Username: "mailer", Password: "mail-password"},
+	}
+
+	first, err := DumpYaml(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := DumpYaml(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Fatal("repeated desensitized dumps differ")
+	}
+	for _, secret := range []string{
+		"prod-key", "prod-secret", "prod-password", "test-key", "test-secret", "test-password",
+		"account-password", "db-password", "telegram-token", "telegram-chat", "jwt-secret",
+		"operator-password", "mail-password",
+	} {
+		if strings.Contains(string(first), secret) {
+			t.Fatalf("desensitized YAML contains %q:\n%s", secret, first)
+		}
+	}
+
+	account := Data.Accounts["primary"]
+	if account.GetApiSecret().APIKey != "prod-key" || account.APIServer.Pwd != "account-password" {
+		t.Fatal("desensitizing mutated the live account credentials")
+	}
+
+	sanitized := Data.Desensitize()
+	sanitized.Accounts["secondary"] = &AccountConfig{}
+	sanitized.Accounts["primary"].StakeRate = 2
+	sanitized.Accounts["primary"].RPCChannels[0]["options"].(map[string]interface{})["format"] = "verbose"
+	sanitized.RPCChannels["alerts"]["options"].(map[string]interface{})["format"] = "verbose"
+	sanitized.APIServer.CORSOrigins[0] = "https://changed.example"
+	sanitized.APIServer.Users[0].AllowIPs[0] = "10.0.0.1"
+	sanitized.APIServer.Users[0].AccRoles["primary"] = "viewer"
+
+	if len(Data.Accounts) != 1 || account.StakeRate != 1.5 {
+		t.Fatal("desensitized account map or value shares mutable state")
+	}
+	if got := account.RPCChannels[0]["options"].(map[string]interface{})["format"]; got != "compact" {
+		t.Fatalf("desensitized account RPC config mutation reached source: %v", got)
+	}
+	if got := Data.RPCChannels["alerts"]["options"].(map[string]interface{})["format"]; got != "compact" {
+		t.Fatalf("desensitized global RPC config mutation reached source: %v", got)
+	}
+	if Data.APIServer.CORSOrigins[0] != "https://dashboard.example" ||
+		Data.APIServer.Users[0].AllowIPs[0] != "127.0.0.1" ||
+		Data.APIServer.Users[0].AccRoles["primary"] != "admin" {
+		t.Fatal("desensitized API server config shares mutable state")
+	}
+	if sanitized.Accounts["primary"].Exchanges != nil || sanitized.Accounts["primary"].APIServer != nil {
+		t.Fatal("desensitized account still contains credentials")
+	}
+	if sanitized.Database.Url != "" || sanitized.Database.DbType != "questdb" {
+		t.Fatal("database secret was retained or non-sensitive fields were dropped")
+	}
+	if sanitized.APIServer.JWTSecretKey != "" || sanitized.APIServer.Users[0].Password != "" ||
+		sanitized.APIServer.Users[0].AllowIPs[0] != "10.0.0.1" {
+		t.Fatal("API server secret was retained or non-sensitive fields were dropped")
+	}
+}
