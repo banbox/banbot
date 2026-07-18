@@ -54,9 +54,11 @@ type OdQItem struct {
 }
 
 const (
-	AmtDust                 = 1e-8
-	odInfoLocalTrigger      = "LocalTrigger"
-	restoreAmbiguousExgData = "ambiguous_exchange_entries"
+	AmtDust                          = 1e-8
+	odInfoLocalTrigger               = "LocalTrigger"
+	restoreAmbiguousExgData          = "ambiguous_exchange_entries"
+	pendingMarketEntryReconcileAfter = 20 * time.Second
+	defaultMyTradeWatchRetry         = 5 * time.Second
 )
 
 var (
@@ -146,8 +148,16 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 		posMap[pos.Symbol][isShort] = pos
 	}
 
-	// 按symbol分组本地订单
 	openOds, lock := ormo.GetOpenODs(o.Account)
+	lock.Lock()
+	pendingEntries := make([]*ormo.InOutOrder, 0, len(openOds))
+	for _, od := range openOds {
+		pendingEntries = append(pendingEntries, od)
+	}
+	lock.Unlock()
+	o.reconcilePendingMarketEntries(pendingEntries)
+
+	// 按symbol分组本地订单
 	lock.Lock()
 	// 过滤重复订单
 	var duplicateOdNum = 0
@@ -1272,28 +1282,114 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 }
 
 func (o *LiveOrderMgr) WatchMyTrades() {
-	out, err := exg.Default.WatchMyTrades(map[string]interface{}{
-		banexg.ParamAccount: o.Account,
-	})
-	if err != nil {
-		log.Error("WatchMyTrades fail", zap.String("acc", o.Account), zap.Error(err))
-		return
-	}
 	if !atomic.CompareAndSwapInt32(&o.isWatchMyTrade, 0, 1) {
 		return
 	}
 	go func() {
-		defer func() {
-			atomic.StoreInt32(&o.isWatchMyTrade, 0)
-		}()
-		for trade := range out {
-			orm.AddDumpRow(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
-			if trade.State == banexg.OdStatusOpen {
-				continue
-			}
-			o.handleMyTrade(trade)
-		}
+		defer atomic.StoreInt32(&o.isWatchMyTrade, 0)
+		o.watchMyTradesLoop(exg.Default.WatchMyTrades, defaultMyTradeWatchRetry)
 	}()
+}
+
+func (o *LiveOrderMgr) watchMyTradesLoop(
+	watch func(map[string]interface{}) (chan *banexg.MyTrade, *errs.Error), retryDelay time.Duration,
+) {
+	for {
+		select {
+		case <-core.Ctx.Done():
+			return
+		default:
+		}
+
+		out, err := watch(map[string]interface{}{
+			banexg.ParamAccount: o.Account,
+		})
+		if err != nil {
+			log.Error("WatchMyTrades fail, retrying", zap.String("acc", o.Account), zap.Error(err))
+		} else if out == nil {
+			log.Error("WatchMyTrades returned nil stream, retrying", zap.String("acc", o.Account))
+		} else {
+			streamOpen := true
+			for streamOpen {
+				select {
+				case <-core.Ctx.Done():
+					return
+				case trade, ok := <-out:
+					if !ok {
+						streamOpen = false
+						log.Warn("WatchMyTrades stream closed, retrying", zap.String("acc", o.Account),
+							zap.Duration("after", retryDelay))
+						continue
+					}
+					orm.AddDumpRow(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
+					if trade.State != banexg.OdStatusOpen {
+						o.handleMyTrade(trade)
+					}
+				}
+			}
+		}
+		if !core.Sleep(retryDelay) {
+			return
+		}
+	}
+}
+
+func (o *LiveOrderMgr) reconcilePendingMarketEntries(ods []*ormo.InOutOrder) {
+	cutoff := btime.UTCStamp() - pendingMarketEntryReconcileAfter.Milliseconds()
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		enter := od.Enter
+		if enter == nil || enter.OrderID == "" || enter.OrderType != banexg.OdTypeMarket ||
+			enter.Status == ormo.OdStatusClosed || enter.Filled > AmtDust || enter.UpdateAt > cutoff {
+			lock.Unlock()
+			continue
+		}
+		orderID, symbol, odKey := enter.OrderID, od.Symbol, od.Key()
+		lock.Unlock()
+
+		res, err := exg.Default.FetchOrder(symbol, orderID, map[string]interface{}{
+			banexg.ParamAccount: o.Account,
+		})
+		if err != nil {
+			log.Warn("reconcile pending market entry fetch fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if res == nil || res.ID != orderID {
+			log.Warn("reconcile pending market entry invalid response", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID))
+			continue
+		}
+		if res.Filled <= AmtDust {
+			continue
+		}
+
+		lock = od.Lock()
+		enter = od.Enter
+		if enter == nil || enter.OrderID != orderID || enter.OrderType != banexg.OdTypeMarket ||
+			enter.Status == ormo.OdStatusClosed || enter.Filled > AmtDust {
+			lock.Unlock()
+			continue
+		}
+		beforeFilled, beforeStatus := enter.Filled, od.Status
+		err = o.applyAuthoritativeEnterOrder(od, res)
+		changed := enter.Filled > beforeFilled+AmtDust || od.Status != beforeStatus
+		filled, average := enter.Filled, enter.Average
+		lock.Unlock()
+		if err != nil {
+			log.Error("reconcile pending market entry apply fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if changed {
+			log.Info("reconciled pending market entry", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID),
+				zap.Float64("filled", filled), zap.Float64("average", average))
+		}
+	}
 }
 
 func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {

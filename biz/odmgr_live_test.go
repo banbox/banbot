@@ -1,12 +1,14 @@
 package biz
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
@@ -422,6 +424,154 @@ func TestHandleOrderQueueRequeuesMarkedTriggerWhenPriceUnavailable(t *testing.T)
 	if requeued != od || od.GetInfoInt64(odInfoLocalTrigger) != 1 {
 		t.Fatalf("price failure lost local trigger ownership: requeued=%v marker=%d",
 			requeued == od, od.GetInfoInt64(odInfoLocalTrigger))
+	}
+}
+
+func TestWatchMyTradesRestartsAndStops(t *testing.T) {
+	tests := []struct {
+		name  string
+		first func() (chan *banexg.MyTrade, *errs.Error)
+	}{
+		{
+			name: "subscription error",
+			first: func() (chan *banexg.MyTrade, *errs.Error) {
+				return nil, issue138Err(errs.CodeWsReadFail)
+			},
+		},
+		{
+			name: "closed stream",
+			first: func() (chan *banexg.MyTrade, *errs.Error) {
+				out := make(chan *banexg.MyTrade)
+				close(out)
+				return out, nil
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			oldCtx := core.Ctx
+			ctx, cancel := context.WithCancel(context.Background())
+			core.Ctx = ctx
+			t.Cleanup(func() {
+				cancel()
+				core.Ctx = oldCtx
+			})
+
+			calls := 0
+			mgr := newLiveOrderMgr("watch-retry", func(*ormo.InOutOrder, bool) {})
+			done := make(chan struct{})
+			go func() {
+				mgr.watchMyTradesLoop(func(map[string]interface{}) (chan *banexg.MyTrade, *errs.Error) {
+					calls++
+					if calls == 1 {
+						return test.first()
+					}
+					cancel()
+					return make(chan *banexg.MyTrade), nil
+				}, time.Millisecond)
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("WatchMyTrades did not stop after context cancellation")
+			}
+			if calls != 2 {
+				t.Fatalf("WatchMyTrades calls = %d, want 2", calls)
+			}
+		})
+	}
+}
+
+func TestWatchMyTradesStopsDuringRetryDelay(t *testing.T) {
+	oldCtx := core.Ctx
+	ctx, cancel := context.WithCancel(context.Background())
+	core.Ctx = ctx
+	t.Cleanup(func() {
+		cancel()
+		core.Ctx = oldCtx
+	})
+
+	calls := 0
+	mgr := newLiveOrderMgr("watch-stop", func(*ormo.InOutOrder, bool) {})
+	done := make(chan struct{})
+	go func() {
+		mgr.watchMyTradesLoop(func(map[string]interface{}) (chan *banexg.MyTrade, *errs.Error) {
+			calls++
+			cancel()
+			return nil, issue138Err(errs.CodeWsReadFail)
+		}, time.Hour)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WatchMyTrades retry delay ignored context cancellation")
+	}
+	if calls != 1 {
+		t.Fatalf("WatchMyTrades calls = %d, want 1", calls)
+	}
+}
+
+func TestReconcilePendingMarketEntryFill(t *testing.T) {
+	fetchCalls := 0
+	exchange := &issue138Exchange{
+		fetchOrder: func(symbol, id string, params map[string]interface{}) (*banexg.Order, *errs.Error) {
+			fetchCalls++
+			return &banexg.Order{
+				ID: id, Symbol: symbol, Type: banexg.OdTypeMarket, Status: banexg.OdStatusFilled,
+				Amount: 2, Filled: 2, Average: 101, LastUpdateTimestamp: btime.UTCStamp(),
+			}, nil
+		},
+	}
+	withIssue138Exchange(t, exchange)
+	callbackCalls := 0
+	mgr := newLiveOrderMgr("market-entry-reconcile", func(*ormo.InOutOrder, bool) { callbackCalls++ })
+	od := issue138Order("filled-market-order")
+	od.Enter.OrderType = banexg.OdTypeMarket
+	od.Enter.UpdateAt = btime.UTCStamp() - pendingMarketEntryReconcileAfter.Milliseconds() - 1
+
+	mgr.reconcilePendingMarketEntries([]*ormo.InOutOrder{od})
+
+	if fetchCalls != 1 {
+		t.Fatalf("FetchOrder calls = %d, want 1", fetchCalls)
+	}
+	if od.Enter.Filled != 2 || od.Enter.Average != 101 || od.Enter.Status != ormo.OdStatusClosed ||
+		od.Status != ormo.InOutStatusFullEnter {
+		t.Fatalf("market entry was not reconciled: filled=%v average=%v enterStatus=%d status=%d",
+			od.Enter.Filled, od.Enter.Average, od.Enter.Status, od.Status)
+	}
+	if callbackCalls != 1 {
+		t.Fatalf("reconcile callbacks = %d, want 1", callbackCalls)
+	}
+}
+
+func TestReconcilePendingMarketEntriesSkipsUnrelatedOrders(t *testing.T) {
+	fetchCalls := 0
+	withIssue138Exchange(t, &issue138Exchange{
+		fetchOrder: func(string, string, map[string]interface{}) (*banexg.Order, *errs.Error) {
+			fetchCalls++
+			return nil, nil
+		},
+	})
+	mgr := newLiveOrderMgr("market-entry-scope", func(*ormo.InOutOrder, bool) {})
+	oldUpdate := btime.UTCStamp() - pendingMarketEntryReconcileAfter.Milliseconds() - 1
+	limitOrder := issue138Order("limit-order")
+	limitOrder.Enter.UpdateAt = oldUpdate
+	freshMarket := issue138Order("fresh-market")
+	freshMarket.Enter.OrderType = banexg.OdTypeMarket
+	freshMarket.Enter.UpdateAt = btime.UTCStamp()
+	partialMarket := issue138Order("partial-market")
+	partialMarket.Enter.OrderType = banexg.OdTypeMarket
+	partialMarket.Enter.UpdateAt = oldUpdate
+	partialMarket.Enter.Filled = 1
+
+	mgr.reconcilePendingMarketEntries([]*ormo.InOutOrder{limitOrder, freshMarket, partialMarket})
+
+	if fetchCalls != 0 {
+		t.Fatalf("FetchOrder calls = %d, want 0", fetchCalls)
 	}
 }
 
