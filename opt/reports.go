@@ -441,6 +441,14 @@ func (r *BTResult) groupByProfits(orders []*ormo.InOutOrder) {
 	res := utils.KMeansVals(rates, clsNum)
 	var grpTitles = make([]string, 0, len(res.Clusters))
 	for _, gp := range res.Clusters {
+		if len(gp.Items) == 0 {
+			// KMeansVals can emit empty clusters for degenerate (many-duplicate) inputs.
+			// No order maps to an empty cluster (res.RowGIds never references it), but a
+			// title slot must still exist so grpTitles stays index-aligned with the cluster
+			// ids used below via grpTitles[res.RowGIds[i]].
+			grpTitles = append(grpTitles, "")
+			continue
+		}
 		minPct := strconv.FormatFloat(slices.Min(gp.Items)*100, 'f', 2, 64)
 		maxPct := strconv.FormatFloat(slices.Max(gp.Items)*100, 'f', 2, 64)
 		grpTitles = append(grpTitles, fmt.Sprintf("%s ~ %s%%", minPct, maxPct))
