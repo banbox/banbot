@@ -2,7 +2,6 @@ package entry
 
 import (
 	_ "embed"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -289,38 +288,4 @@ func runDataImport(args *config.CmdArgs) *errs.Error {
 		return errs.NewMsg(errs.CodeParamRequired, "-in is required")
 	}
 	return orm.ImportData(args.InPath, args.Concur, nil)
-}
-
-func runMergeAssets(args []string) error {
-	fs := flag.NewFlagSet("", flag.ExitOnError)
-	var outPath string
-	var lines string
-	fs.StringVar(&outPath, "out", "merged_assets.html", "output html file path")
-	fs.StringVar(&lines, "lines", "Real,Available", "comma separated line names to extract")
-	err := fs.Parse(args)
-	if err != nil {
-		return err
-	}
-
-	files := fs.Args()
-	if len(files) < 2 {
-		return errs.NewMsg(errs.CodeParamRequired, "at least 2 files need to merge")
-	}
-	if outPath == "" {
-		return errs.NewMsg(errs.CodeParamRequired, "-out is required")
-	}
-	filesMap := make(map[string]string)
-	for _, file := range files {
-		path := config.ParsePath(file)
-		filesMap[path] = ""
-	}
-	outPath = config.ParsePath(outPath)
-
-	lineArr := utils.SplitSolid(lines, ",", true)
-	err2 := opt.MergeAssetsHtml(outPath, filesMap, lineArr, false)
-	if err2 != nil {
-		return err2
-	}
-	log.Info("assets merged", zap.String("to", outPath))
-	return nil
 }

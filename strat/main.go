@@ -1,7 +1,6 @@
 package strat
 
 import (
-	"flag"
 	"fmt"
 	"sort"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	ta "github.com/banbox/banta"
+	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
 
@@ -684,13 +684,27 @@ func getPolicyPairs(pol *config.RunPolicyConfig, pairs []string) ([]string, *err
 }
 
 func ListStrats(args []string) error {
+	command := NewListStratsCommand()
+	command.SetArgs(args)
+	return command.Execute()
+}
+
+func NewListStratsCommand() *cobra.Command {
 	var prefix string
-	var sub = flag.NewFlagSet("cmp", flag.ExitOnError)
-	sub.StringVar(&prefix, "prefix", "", "prefix to filter")
-	err_ := sub.Parse(args)
-	if err_ != nil {
-		return err_
+	command := &cobra.Command{
+		Use:     "list-strats",
+		Aliases: []string{"list_strats"},
+		Short:   "list registered strategies",
+		Args:    cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return listStrats(prefix)
+		},
 	}
+	command.Flags().StringVar(&prefix, "prefix", "", "strategy name prefix")
+	return command
+}
+
+func listStrats(prefix string) error {
 	arr := utils.KeysOfMap(StratMake)
 	if prefix != "" {
 		filtered := make([]string, 0, len(arr))

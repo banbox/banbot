@@ -1,11 +1,7 @@
 package entry
 
 import (
-	"errors"
-	"flag"
 	"fmt"
-	"github.com/banbox/banbot/utils"
-	"github.com/sasha-s/go-deadlock"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -16,31 +12,104 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/opt"
+	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banbot/web"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"github.com/sasha-s/go-deadlock"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"go.uber.org/zap"
 )
 
 func RunCmd() {
 	defer func() {
-		if r := recover(); r != nil {
-			if err, ok := r.(*errs.Error); ok {
+		if recovered := recover(); recovered != nil {
+			if err, ok := recovered.(*errs.Error); ok {
 				log.Error("banbot panic", zap.Any("error", err))
 			} else {
-				log.Error("banbot panic", zap.Any("error", r), zap.Stack("stack"))
+				log.Error("banbot panic", zap.Any("error", recovered), zap.Stack("stack"))
 			}
 			core.RunExitCalls()
 			os.Exit(1)
-		} else {
-			core.RunExitCalls()
 		}
+		core.RunExitCalls()
 	}()
 
+	installSignalHandler()
+	deadlock.Opts.Disable = true
+	if err := Execute(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		core.RunExitCalls()
+		os.Exit(1)
+	}
+}
+
+// Execute runs banbot with an explicit argument list. It is separated from
+// RunCmd so callers and tests can execute the Cobra command tree without exits.
+func Execute(args []string) error {
+	command := NewRootCommand()
+	if isImplicitWebInvocation(args) {
+		command = web.NewCommand()
+		command.SilenceErrors = true
+		command.SilenceUsage = true
+	}
+	command.SetArgs(normalizeLegacyFlags(command, args))
+	return command.Execute()
+}
+
+func isImplicitWebInvocation(args []string) bool {
+	if len(args) == 0 || !strings.HasPrefix(args[0], "-") {
+		return false
+	}
+	switch args[0] {
+	case "-h", "-help", "--help", "-v", "-version", "--version":
+		return false
+	default:
+		return true
+	}
+}
+
+// NewRootCommand builds the complete Cobra command tree.
+func NewRootCommand() *cobra.Command {
+	root := &cobra.Command{
+		Use:           "banbot",
+		Short:         "Banbot quantitative trading and data tools",
+		Version:       core.Version,
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return web.RunDev([]string{})
+		},
+	}
+	root.CompletionOptions.DisableDefaultCmd = true
+	root.SetVersionTemplate("banbot {{.Version}}\n")
+
+	groups := make(map[string]*cobra.Command, len(commandGroups)+len(extraGroups))
+	allGroups := append(append([]commandGroup{}, commandGroups...), extraGroups...)
+	for _, group := range allGroups {
+		command := &cobra.Command{
+			Use:   group.name,
+			Short: group.help,
+			Args:  cobra.NoArgs,
+			RunE: func(command *cobra.Command, _ []string) error {
+				return command.Help()
+			},
+		}
+		groups[group.name] = command
+		root.AddCommand(command)
+	}
+
+	registerBuiltInCommands(root, groups)
+	registerExtraCommands(root, groups)
+	return root
+}
+
+func installSignalHandler() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// 在goroutine中等待信号
 	go func() {
 		<-sigChan
 		if core.StopAll != nil {
@@ -49,233 +118,150 @@ func RunCmd() {
 		core.RunExitCalls()
 		os.Exit(0)
 	}()
-
-	// disable deadlock by default
-	deadlock.Opts.Disable = true
-
-	args := os.Args[1:]
-	if len(args) == 0 {
-		runWeb(args)
-		return
-	}
-
-	name := args[0]
-	if strings.HasPrefix(name, "-") {
-		if name == "-h" || name == "--help" {
-			printMainHelp()
-		} else {
-			runWeb(args)
-		}
-		return
-	}
-
-	// 检查是否是子命令组
-	if group := GetGroup(name); group != nil {
-		if len(args) < 2 {
-			printGroupHelp(name)
-			return
-		}
-		// 处理子命令
-		subName := args[1]
-		if job := GetCmdJob(subName, name); job != nil {
-			runJobCmd(args[1:], job, func(e error) {
-				if e != nil {
-					log.Error("parse command args fail", zap.String("cmd", args[1]), zap.Error(e))
-				} else {
-					log.Warn("unknown subcommand: " + args[1])
-					printGroupHelp(name)
-				}
-			})
-			return
-		}
-		printGroupHelp(name)
-		return
-	}
-
-	// 处理根命令
-	if job := GetCmdJob(name, ""); job != nil {
-		runJobCmd(args, job, func(e error) {
-			if e != nil {
-				log.Error("parse command args fail", zap.String("cmd", args[0]), zap.Error(e))
-			} else {
-				log.Warn("unknown command: " + args[0])
-				printMainHelp()
-			}
-		})
-		return
-	}
-
-	printMainHelp()
 }
 
-func printMainHelp() {
-	tpl := `
-args: %s
-banbot %v
-please run command:
-`
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf(tpl, strings.Join(os.Args, " "), core.Version))
-
-	if group := GetGroup(""); group != nil {
-		for name, job := range group.Jobs {
-			b.WriteString(fmt.Sprintf("    %-12s%s\n", name+":", job.Help))
-		}
+func newConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
+	args := &config.CmdArgs{}
+	command := &cobra.Command{
+		Use:   name,
+		Short: help,
+		Args:  cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runConfigCommand(args, run)
+		},
 	}
-
-	b.WriteString("\nor choose a subcommand:\n")
-	for key, gp := range groupMap {
-		if key == "" {
-			continue
-		}
-		b.WriteString(fmt.Sprintf("    %-12s%s\n", gp.Name+":", gp.Help))
+	bindCommonFlags(args, command.Flags(), allowDeadlock)
+	for _, bind := range binders {
+		bind(args, command.Flags())
 	}
-	log.Warn(b.String())
+	return command
 }
 
-func printGroupHelp(groupName string) {
-	group := GetGroup(groupName)
-	if group == nil {
-		return
+func bindCommonFlags(args *config.CmdArgs, flags *pflag.FlagSet, allowDeadlock bool) {
+	flags.StringVar(&args.DataDir, "datadir", "", "path to the data directory")
+	flags.StringArrayVar((*[]string)(&args.Configs), "config", nil, "config path; may be repeated")
+	flags.BoolVar(&args.NoDefault, "no-default", false, "ignore config.yml and config.local.yml")
+	flags.StringVar(&args.ConfigData, "config-data", "", "inline YAML config")
+	flags.StringVar(&args.Logfile, "logfile", "", "log file path")
+	flags.StringVar(&args.LogLevel, "level", "info", "logging level")
+	flags.IntVar(&args.MaxPoolSize, "max-pool-size", 0, "maximum database pool size")
+	if allowDeadlock {
+		flags.BoolVar(&args.DeadLock, "dlock", false, "enable deadlock detection")
 	}
-
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\nbanbot %s:\n", groupName))
-	for name, job := range group.Jobs {
-		b.WriteString(fmt.Sprintf("    %-12s%s\n", name+":", job.Help))
-	}
-	b.WriteString("please choose a valid action")
-	log.Warn(b.String())
+	flags.BoolVar(&core.CPUProfile, "cpu-profile", false, "enable CPU profiling")
+	flags.BoolVar(&core.MemProfile, "mem-profile", false, "enable memory profiling")
+	flags.BoolVar(&core.NetDisable, "net-off", false, "disable network requests")
 }
 
-func runWeb(args []string) {
-	err_ := web.RunDev(args)
-	if err_ != nil {
-		panic(err_)
-	}
-}
-
-func runJobCmd(sysArgs []string, job *CmdJob, fallback func(e error)) {
+func runConfigCommand(args *config.CmdArgs, run FuncEntry) error {
 	core.SetRunMode(core.RunModeOther)
-	if job.RunRaw != nil {
-		err_ := job.RunRaw(sysArgs[1:])
-		if err_ != nil {
-			panic(err_)
-		}
-		return
-	}
-	name, subArgs := sysArgs[0], sysArgs[1:]
-	var args config.CmdArgs
-	var sub = flag.NewFlagSet(name, flag.ExitOnError)
-	err_ := bindSubFlags(&args, sub, job.NoOptions, job.Options...)
-	if err_ == nil {
-		err_ = sub.Parse(subArgs)
-	}
-	if err_ != nil {
-		fallback(err_)
-		return
-	}
 	args.Init()
+	startProfiles()
+	if err := run(args); err != nil {
+		return err
+	}
+	return nil
+}
+
+func startProfiles() {
 	if core.MemProfile {
 		go func() {
-			log.Info("mem profile serve http at :6060 ...")
-			err_ = http.ListenAndServe(":6060", nil)
-			if err_ != nil {
-				log.Error("run mem profile http fail", zap.Error(err_))
+			log.Info("memory profile server listening", zap.String("address", ":6060"))
+			if err := http.ListenAndServe(":6060", nil); err != nil {
+				log.Error("memory profile server failed", zap.Error(err))
 			}
 		}()
 	}
-	if core.CPUProfile {
-		wd, err_ := os.Getwd()
-		if err_ != nil {
-			panic(err_)
-		}
-		outPath := filepath.Join(wd, "cpu.profile")
-		err := utils.StartCpuProfile(outPath, 6060)
-		if err != nil {
-			panic(err)
-		}
-		log.Info("start cpu profile", zap.String("to", outPath))
+	if !core.CPUProfile {
+		return
 	}
-	err := job.Run(&args)
+	wd, err := os.Getwd()
 	if err != nil {
 		panic(err)
 	}
+	outPath := filepath.Join(wd, "cpu.profile")
+	if err = utils.StartCpuProfile(outPath, 6060); err != nil {
+		panic(err)
+	}
+	log.Info("CPU profile started", zap.String("path", outPath))
 }
 
-func bindSubFlags(args *config.CmdArgs, cmd *flag.FlagSet, noOpts []string, opts ...string) error {
-	args.BindToFlag(cmd, noOpts)
-	cmd.BoolVar(&core.CPUProfile, "cpu-profile", false, "enable cpu profile")
-	cmd.BoolVar(&core.MemProfile, "mem-profile", false, "enable memory profile")
-	cmd.BoolVar(&core.NetDisable, "net-off", false, "disable network request")
+func newPositionalCommand(name, help, argName string, run func(args []string) error) *cobra.Command {
+	return &cobra.Command{
+		Use:   fmt.Sprintf("%s %s", name, argName),
+		Short: help,
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			core.SetRunMode(core.RunModeOther)
+			return run(args)
+		},
+	}
+}
 
-	for _, key := range opts {
-		switch key {
-		case "stake_amount":
-			cmd.Float64Var(&args.StakeAmount, "stake-amount", 0.0, "Override `stake_amount` in config")
-		case "stake_pct":
-			cmd.Float64Var(&args.StakePct, "stake-pct", 0.0, "Override `stake_pct` in config")
-		case "pairs":
-			cmd.StringVar(&args.RawPairs, "pairs", "", "comma-separated pairs")
-		case "with_spider":
-			cmd.BoolVar(&args.WithSpider, "spider", false, "start spider if not running")
-		case "timerange":
-			cmd.StringVar(&args.TimeRange, "timerange", "", "set timerange")
-		case "timestart":
-			cmd.StringVar(&args.TimeStart, "timestart", "", "set start time, allow multiple formats")
-		case "timeend":
-			cmd.StringVar(&args.TimeEnd, "timeend", "", "set end time, timestart is required")
-		case "timeframes":
-			cmd.StringVar(&args.RawTimeFrames, "timeframes", "", "comma-seperated timeframes to use")
-		case "medium":
-			cmd.StringVar(&args.Medium, "medium", "", "data medium:db,file")
-		case "tables":
-			cmd.StringVar(&args.RawTables, "tables", "", "db tables, comma-separated")
-		case "force":
-			cmd.BoolVar(&args.Force, "force", false, "skip confirm")
-		case "prg":
-			cmd.StringVar(&args.PrgOut, "prg", "", "prefix for progress in stdout")
-		case "in":
-			cmd.StringVar(&args.InPath, "in", "", "input file or directory")
-		case "in_type":
-			cmd.StringVar(&args.InType, "in-type", "", "input data type")
-		case "out":
-			cmd.StringVar(&args.OutPath, "out", "", "output file or directory")
-		case "adj":
-			cmd.StringVar(&args.AdjType, "adj", "", "pre/post/none for kline")
-		case "tz":
-			cmd.StringVar(&args.TimeZone, "tz", "", "timeZone, default: utc")
-		case "exg_real":
-			cmd.StringVar(&args.ExgReal, "exg-real", "", "real exchange")
-		case "opt_rounds":
-			cmd.IntVar(&args.OptRounds, "opt-rounds", 30, "rounds num for single optimize job")
-		case "sampler":
-			cmd.StringVar(&args.Sampler, "sampler", "bayes", "hyper optimize method, tpe/bayes/random/cmaes/ipop-cmaes/bipop-cmaes")
-		case "picker":
-			cmd.StringVar(&args.Picker, "picker", "good3", "Method for selecting targets from multiple hyperparameter optimization results")
-		case "alpha":
-			cmd.Float64Var(&args.Alpha, "alpha", 1, "ma alpha for calculating ema in hyperOpt")
-		case "pair_picker":
-			cmd.StringVar(&args.PairPicker, "pair-picker", "", "min sharpe val for pairs in bt_opt mode")
-		case "each_pairs":
-			cmd.BoolVar(&args.EachPairs, "each-pairs", false, "run for each pairs")
-		case "concur":
-			cmd.IntVar(&args.Concur, "concur", 1, "Concurrent Number")
-		case "review_period":
-			cmd.StringVar(&args.ReviewPeriod, "review-period", "3y", "review period, default: 3 years")
-		case "run_period":
-			cmd.StringVar(&args.RunPeriod, "run-period", "6M", "run period, default: 6 months")
-		case "batch_size":
-			cmd.IntVar(&args.BatchSize, "batch-size", 0, "batch size for task")
-		case "run_every":
-			cmd.StringVar(&args.RunEveryTF, "run-every", "", "run every ? timerange")
-		case "out_type":
-			cmd.StringVar(&args.OutType, "out-type", "", "output data type")
-		case "separate":
-			cmd.BoolVar(&args.Separate, "separate", false, "run policy separately for backtest")
-		default:
-			return errors.New(fmt.Sprintf("unknown argument: %s", key))
+func newMergeAssetsCommand() *cobra.Command {
+	var outPath string
+	var lines string
+	command := &cobra.Command{
+		Use:     "merge-assets FILE FILE [FILE...]",
+		Aliases: []string{"merge_assets"},
+		Short:   "merge multiple assets.html files",
+		Args:    cobra.MinimumNArgs(2),
+		RunE: func(_ *cobra.Command, files []string) error {
+			if outPath == "" {
+				return errs.NewMsg(errs.CodeParamRequired, "--out is required")
+			}
+			filesMap := make(map[string]string, len(files))
+			for _, file := range files {
+				filesMap[config.ParsePath(file)] = ""
+			}
+			outPath = config.ParsePath(outPath)
+			if err := opt.MergeAssetsHtml(outPath, filesMap, utils.SplitSolid(lines, ",", true), false); err != nil {
+				return err
+			}
+			log.Info("assets merged", zap.String("path", outPath))
+			return nil
+		},
+	}
+	command.Flags().StringVar(&outPath, "out", "merged_assets.html", "output HTML file")
+	command.Flags().StringVar(&lines, "lines", "Real,Available", "comma-separated line names to extract")
+	return command
+}
+
+func normalizeLegacyFlags(root *cobra.Command, args []string) []string {
+	longFlags := map[string]bool{"help": true, "version": true}
+	var collectFlags func(command *cobra.Command)
+	collectFlags = func(command *cobra.Command) {
+		command.Flags().VisitAll(func(flag *pflag.Flag) {
+			longFlags[flag.Name] = true
+		})
+		for _, child := range command.Commands() {
+			collectFlags(child)
 		}
 	}
-	return nil
+	collectFlags(root)
+
+	normalized := append([]string(nil), args...)
+	flagsEnded := false
+	for i, arg := range normalized {
+		if arg == "--" {
+			flagsEnded = true
+			continue
+		}
+		if flagsEnded {
+			continue
+		}
+		if len(arg) < 3 || !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") {
+			continue
+		}
+		first := arg[1]
+		if first >= '0' && first <= '9' || first == '.' {
+			continue
+		}
+		name := strings.SplitN(arg[1:], "=", 2)[0]
+		if !longFlags[name] {
+			continue
+		}
+		normalized[i] = "-" + arg
+	}
+	return normalized
 }

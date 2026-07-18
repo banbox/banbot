@@ -1,37 +1,26 @@
 In addition to using the built-in terminal commands of banbot, you can also register and execute your own terminal commands.
 
-### Registering Regular Functions
-You can register terminal command functions using the `entry.AddCmdJob` method:
-```go
-entry.AddCmdJob(&entry.CmdJob{
-    Name:    "hello",
-    Parent:  "",
-    Run: func(args *config.CmdArgs) *errs.Error {
-        fmt.Println("hello")
-        return nil
-    },
-    Options: []string{},
-    Help:    "show hello",
-})
-```
-`Parent` must be an already registered command group; use an empty string for a root command. To add a subcommand, register its parent first with `entry.AddGroup`.
-You can then trigger the execution of the `showHello` function by typing `bot hello`. This function will accept a `*config.CmdArgs` parameter, which stores the parsed command-line arguments. If you need to access specific arguments, please fill in the required field names in the `Options` section.
-All available field names can be found in the `bindSubFlags` function in [entry/main](https://github.com/banbox/banbot/blob/main/entry/main.go); common argument fields are bound in `config.CmdArgs.BindToFlag`.
+### Registering a Command
 
-### Registering Functions with Arbitrary Arguments
-Fixed `Options` and `*config.CmdArgs` might not meet your personalized needs.
-You can also use `RunRaw` to replace `Run` and parse the command-line arguments yourself:
+Banbot uses Cobra. Register a `*cobra.Command` with `entry.AddCommand` and keep command-specific options local to the command:
+
 ```go
-entry.AddCmdJob(&entry.CmdJob{
-    Name:   "hello",
-    Parent: "",
-    RunRaw: func(args []string) error {
-        fmt.Println(strings.Join(args, " "))
+var greeting string
+
+helloCmd := &cobra.Command{
+    Use:   "hello",
+    Short: "show a greeting",
+    Args:  cobra.NoArgs,
+    RunE: func(cmd *cobra.Command, args []string) error {
+        fmt.Println(greeting)
         return nil
     },
-    Help:    "show hello",
-})
+}
+helloCmd.Flags().StringVar(&greeting, "greeting", "hello", "greeting text")
+entry.AddCommand("", helloCmd)
 ```
+
+The first argument to `AddCommand` is the parent group; use an empty string for a root command. Register new groups first with `entry.AddGroup`. Cobra handles help, validation, flag parsing, and errors. Adding a command or flag does not require changing `config.CmdArgs` or a central option registry.
 
 ## Built-in Tool Commands
 
