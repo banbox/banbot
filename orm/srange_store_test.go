@@ -261,6 +261,29 @@ func TestGetCoveredRangesCacheTouchingBoundaryDoesNotMaskDB(t *testing.T) {
 	}
 }
 
+func TestGetCoveredRangesPartialCachePreservesDBCoverageOutsideWindow(t *testing.T) {
+	if !IsQuestDB {
+		t.Skip("QuestDB backend is not active, skipping QuestDB cache semantics test")
+	}
+	const (
+		sid = int32(90043)
+		tbl = "kline_1m"
+		tf  = "1m"
+	)
+	srangesCacheUpdate(sid, tbl, tf, []srangeSpan{{StartMs: 100, StopMs: 200, HasData: false}})
+	t.Cleanup(func() { srangesCacheDel(sid, tbl, tf) })
+
+	covSess := &Queries{db: staleCoveredRangeDB{}}
+	covered, err := covSess.getCoveredRanges(context.Background(), sid, tbl, tf, 100, 300)
+	if err != nil {
+		t.Fatalf("getCoveredRanges fail: %v", err)
+	}
+	want := []MSRange{{Start: 200, Stop: 300}}
+	if !reflect.DeepEqual(covered, want) {
+		t.Fatalf("partial false cache span must preserve DB coverage outside its window\nwant=%+v\ngot =%+v", want, covered)
+	}
+}
+
 func TestLoadSRangesSpansFromDBDoesNotRollbackCache(t *testing.T) {
 	if !IsQuestDB {
 		t.Skip("QuestDB backend is not active, skipping QuestDB cache semantics test")

@@ -931,6 +931,24 @@ func runEnsureSeriesRangeTest(t *testing.T, backend string) {
 	if src.fetchCount != 1 {
 		t.Fatalf("expected coverage metadata to skip duplicate fetch, got %d fetches", src.fetchCount)
 	}
+
+	t.Run("known empty range is not refetched", func(t *testing.T) {
+		emptySrc := &stubSeriesSource{info: info}
+		emptySub := &strat.DataSub{
+			Source:    info.Name,
+			ExSymbol:  &orm.ExSymbol{ID: sub.ExSymbol.ID + 1},
+			TimeFrame: info.TimeFrame,
+		}
+		if err := EnsureSeriesRange(ctx, emptySrc, emptySub, startMS, startMS+172_800_000); err != nil {
+			t.Fatalf("EnsureSeriesRange empty pass failed: %v", err)
+		}
+		if err := EnsureSeriesRange(ctx, emptySrc, emptySub, startMS, startMS+172_800_000); err != nil {
+			t.Fatalf("EnsureSeriesRange empty second pass failed: %v", err)
+		}
+		if emptySrc.fetchCount != 1 {
+			t.Fatalf("expected known-empty coverage to skip duplicate fetch, got %d fetches", emptySrc.fetchCount)
+		}
+	})
 }
 
 func initSeriesSourceTestApp(t *testing.T, cfgPath string) {

@@ -351,11 +351,22 @@ func (r *dbSeriesRepo) MissingSeriesRanges(ctx context.Context, info *SeriesInfo
 	}
 	defer conn.Release()
 	binding := normalizedSeriesBinding(info.Binding)
-	covered, err_ := q.getCoveredRanges(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS)
+	spans, err_ := q.ListSRanges(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}
-	return subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered), nil
+	return subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, answeredSeriesRanges(spans)), nil
+}
+
+func answeredSeriesRanges(spans []*SRange) []MSRange {
+	// Missing means unanswered, not data-free: known-empty spans are answers too.
+	answered := make([]MSRange, 0, len(spans))
+	for _, span := range spans {
+		if span != nil && span.StopMs > span.StartMs {
+			answered = append(answered, MSRange{Start: span.StartMs, Stop: span.StopMs})
+		}
+	}
+	return answered
 }
 
 func seriesRangeCovered(timeMS int64, covered []MSRange) bool {

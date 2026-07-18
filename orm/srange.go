@@ -182,12 +182,19 @@ func filterSRangesSpansWithOverlap(spans []srangeSpan, startMs, stopMs int64) ([
 }
 
 func (q *Queries) loadSRangesSpans(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]srangeSpan, error) {
-	if cached, ok := srangesCacheGetSpans(sid, table, timeframe); ok {
-		if filtered, hasOverlap := filterSRangesSpansWithOverlap(cached, startMs, stopMs); hasOverlap {
-			return normalizeSRangeSpans(filtered), nil
-		}
+	persisted, err := q.loadSRangesSpansFromDB(ctx, sid, table, timeframe, startMs, stopMs)
+	if err != nil {
+		return nil, err
 	}
-	return q.loadSRangesSpansFromDB(ctx, sid, table, timeframe, startMs, stopMs)
+	cached, ok := srangesCacheGetSpans(sid, table, timeframe)
+	if !ok {
+		return persisted, nil
+	}
+	filtered, hasOverlap := filterSRangesSpansWithOverlap(cached, startMs, stopMs)
+	if !hasOverlap {
+		return persisted, nil
+	}
+	return overlaySRangeSpans(persisted, normalizeSRangeSpans(filtered)), nil
 }
 
 func (q *Queries) loadSRangesSpansFromDB(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]srangeSpan, error) {
@@ -262,6 +269,25 @@ func normalizeSRangeSpans(spans []srangeSpan) []srangeSpan {
 	return out
 }
 
+func overlaySRangeSpans(base, overrides []srangeSpan) []srangeSpan {
+	// Cached windows are newer than QuestDB's asynchronously visible snapshot.
+	out := make([]srangeSpan, 0, len(base)+len(overrides))
+	for _, span := range base {
+		parts := []srangeSpan{span}
+		for _, override := range overrides {
+			next := make([]srangeSpan, 0, len(parts)+1)
+			for _, part := range parts {
+				next = append(next, keepSRangeSpanOutsideWindow(part, override.StartMs, override.StopMs)...)
+			}
+			parts = next
+		}
+		out = append(out, parts...)
+	}
+	out = append(out, overrides...)
+	sort.Slice(out, func(i, j int) bool { return out[i].StartMs < out[j].StartMs })
+	return mergeSRangeSpans(out)
+}
+
 func (q *Queries) ListSRanges(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]*SRange, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -313,31 +339,7 @@ func (q *Queries) getCoveredRanges(ctx context.Context, sid int32, table, timefr
 			covered = append(covered, MSRange{Start: r.StartMs, Stop: r.StopMs})
 		}
 	}
-	merged := mergeMSRanges(covered)
-
-	// WAL delay guard: in-process cache is synchronously updated by UpdateSRanges.
-	// Prefer it when present so same-process reads after QuestDB WAL writes do not
-	// see stale DB coverage, including freshly deleted holes.
-	if cachedSpans, ok := srangesCacheGetSpans(sid, table, timeframe); ok {
-		var inWindow []MSRange
-		hasOverlap := false
-		for _, r := range cachedSpans {
-			if r.StopMs <= startMs || r.StartMs >= stopMs {
-				continue
-			}
-			hasOverlap = true
-			if r.HasData {
-				inWindow = append(inWindow, MSRange{
-					Start: max(r.StartMs, startMs),
-					Stop:  min(r.StopMs, stopMs),
-				})
-			}
-		}
-		if hasOverlap {
-			return mergeMSRanges(inWindow), nil
-		}
-	}
-	return merged, nil
+	return mergeMSRanges(covered), nil
 }
 
 type srangeSpan struct {
