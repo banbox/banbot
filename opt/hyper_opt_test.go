@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/banbox/banbot/biz"
@@ -284,5 +285,89 @@ func TestOptimizeChildBaseArgsForwardsConfigSourcesWithoutInlineSecrets(t *testi
 	data, readErr := os.ReadFile(inlinePath)
 	if readErr != nil || string(data) != args.ConfigData {
 		t.Fatalf("forwarded inline config = %q, err=%v", data, readErr)
+	}
+}
+
+func TestOptimizeChildArgsAreIsolated(t *testing.T) {
+	base := make([]string, 1, 16)
+	base[0] = "optimize"
+	got := make([][]string, 3)
+	configPaths := []string{"config-a", "config-b", "config-c"}
+	outPaths := []string{"out-a", "out-b", "out-c"}
+	var wg sync.WaitGroup
+	for i := range got {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got[i] = optimizeChildArgs(base, configPaths[i], outPaths[i])
+		}(i)
+	}
+	wg.Wait()
+	for i, args := range got {
+		want := []string{"optimize", "-config", configPaths[i], "-out", outPaths[i]}
+		if !reflect.DeepEqual(args, want) {
+			t.Fatalf("child %d args = %v, want %v", i, args, want)
+		}
+	}
+	if len(base) != 1 || base[0] != "optimize" {
+		t.Fatalf("base command changed: %v", base)
+	}
+}
+
+func TestCollectOptLogIncludesAllIndexedGroupOutputs(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "detail"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sources := []*config.RunPolicyConfig{
+		{Name: "Alpha", RunTimeframes: []string{"1h"}},
+		{Name: "Beta", RunTimeframes: []string{"1h"}},
+		{Name: "Gamma", RunTimeframes: []string{"1h"}},
+	}
+	scores := []float64{1, 3, 2}
+	ids := []string{"group-a", "group-b", "group-c"}
+	paths := optimizeLogPaths(filepath.Join(dir, "opt.log"), len(sources))
+	for i, source := range sources {
+		info := &OptInfo{
+			ID:       ids[i],
+			Score:    scores[i],
+			Params:   map[string]float64{"group": float64(i)},
+			Ints:     map[string]bool{},
+			BTResult: &BTResult{OrderNum: i + 1, PairGrps: []*RowItem{{Title: source.Name}}},
+		}
+		info.dumpDetail(filepath.Join(dir, "detail", ids[i]+".json"))
+		line := info.ToLine()
+		logText := strings.Join([]string{
+			"# run hyper optimize: bayes, rounds: 1",
+			"# date range: test",
+			"",
+			"============== " + source.Name + "/1h/ =============",
+			line,
+			"[score] " + line,
+			"",
+		}, "\n")
+		if err := os.WriteFile(paths[i], []byte(logText), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	winnerYAML, collectErr := collectOptLog(paths, 0, "score", "", sources)
+	if collectErr != nil {
+		t.Fatal(collectErr)
+	}
+	var got struct {
+		RunPolicy []*config.RunPolicyConfig `yaml:"run_policy"`
+	}
+	if err := yaml.Unmarshal([]byte(winnerYAML), &got); err != nil {
+		t.Fatal(err)
+	}
+	wantOrder := []string{"Beta", "Gamma", "Alpha"}
+	if len(got.RunPolicy) != len(wantOrder) {
+		t.Fatalf("collected %d groups, want %d:\n%s", len(got.RunPolicy), len(wantOrder), winnerYAML)
+	}
+	for i, want := range wantOrder {
+		if got.RunPolicy[i].Name != want {
+			t.Fatalf("group %d = %s, want %s:\n%s", i, got.RunPolicy[i].Name, want, winnerYAML)
+		}
 	}
 }

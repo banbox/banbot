@@ -230,14 +230,20 @@ func DeepCopyMap(dst, src map[string]interface{}) {
 
 func ParallelRun[T any](items []T, concurNum int, handle func(int, T) *errs.Error) *errs.Error {
 	var retErr *errs.Error
+	retErrIndex := len(items)
+	var errLock sync.Mutex
 	guard := make(chan struct{}, concurNum)
 	var wg sync.WaitGroup
 	for i_, item_ := range items {
 		// If the concurrency limit is reached, it will block and wait here
 		// 如果达到并发限制，这里会阻塞等待
 		guard <- struct{}{}
-		if retErr != nil {
+		errLock.Lock()
+		stopped := retErr != nil
+		errLock.Unlock()
+		if stopped {
 			// 出错，终止返回
+			<-guard
 			break
 		}
 		wg.Add(1)
@@ -250,7 +256,12 @@ func ParallelRun[T any](items []T, concurNum int, handle func(int, T) *errs.Erro
 			}()
 			err := handle(i, item)
 			if err != nil {
-				retErr = err
+				errLock.Lock()
+				if i < retErrIndex {
+					retErr = err
+					retErrIndex = i
+				}
+				errLock.Unlock()
 			}
 		}(i_, item_)
 	}

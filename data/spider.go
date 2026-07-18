@@ -780,7 +780,9 @@ func (m *Miner) startLoopKLines() {
 						bars = bars[:len(bars)-1]
 					}
 					if len(bars) > 0 {
+						pairLock.Lock()
 						barNum += len(bars)
+						pairLock.Unlock()
 						sta.ExpectMS = bars[len(bars)-1].Time + mntMSecs
 						exs := orm.GetSymbolByID(sta.Sid)
 						rows := orm.KLinesToSeries(exs, curTF, bars, nil, false, true)

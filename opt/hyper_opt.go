@@ -330,10 +330,7 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 		defer cleanup()
 		startStr := strconv.FormatInt(config.TimeRange.StartMS/1000, 10)
 		endStr := strconv.FormatInt(config.TimeRange.EndMS/1000, 10)
-		logOuts = make([]string, len(groups))
-		for i := range groups {
-			logOuts[i] = args.OutPath + "." + strconv.Itoa(i+1)
-		}
+		logOuts = optimizeLogPaths(args.OutPath, len(groups))
 		err = utils.ParallelRun(groups, args.Concur, func(i int, pol *config.RunPolicyConfig) *errs.Error {
 			core.Sleep(time.Millisecond * time.Duration(1000*rand.Float64()+100*float64(i)))
 			iStr := strconv.Itoa(i + 1)
@@ -354,9 +351,8 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 			if err_ = cfgFile.Close(); err_ != nil {
 				return errs.New(errs.CodeIOWriteFail, err_)
 			}
-			curCmds := append(slices.Clone(cmds), "-config", cfgFile.Name())
 			outPath := logOuts[i]
-			curCmds = append(curCmds, "-out", outPath)
+			curCmds := optimizeChildArgs(cmds, cfgFile.Name(), outPath)
 			log.Warn("running: " + strings.Join(curCmds, " "))
 			var out bytes.Buffer
 			excPath, err_ := os.Executable()
@@ -396,6 +392,19 @@ type optimizeChildConfig struct {
 
 type optimizeChildDatabase struct {
 	MaxPoolSize int `yaml:"max_pool_size"`
+}
+
+func optimizeLogPaths(outPath string, count int) []string {
+	paths := make([]string, count)
+	for i := range paths {
+		paths[i] = outPath + "." + strconv.Itoa(i+1)
+	}
+	return paths
+}
+
+func optimizeChildArgs(base []string, configPath, outPath string) []string {
+	args := append(slices.Clone(base), "-config", configPath)
+	return append(args, "-out", outPath)
 }
 
 func marshalOptimizeChildConfig(args *config.CmdArgs, pol *config.RunPolicyConfig, startStr, endStr string) ([]byte, error) {
