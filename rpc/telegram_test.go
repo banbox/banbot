@@ -200,6 +200,9 @@ func TestTelegramOfficialBotRefreshSendsUpdatedOrders(t *testing.T) {
 		if msg.ChatID != int64(42) {
 			t.Fatalf("unexpected refresh chat: %v", msg.ChatID)
 		}
+		if msg.ParseMode != models.ParseModeHTML {
+			t.Fatalf("interactive response lost HTML formatting: %q", msg.ParseMode)
+		}
 		if !strings.Contains(msg.Text, "-3.50 (-1.25%)") {
 			t.Fatalf("refreshed orders do not contain calculated PnL: %s", msg.Text)
 		}
@@ -245,5 +248,47 @@ func TestTelegramOrdersKeepPlaceholderWhenPriceUnavailable(t *testing.T) {
 	text := newTelegramTestInstance(42).getOrdersList()
 	if !strings.Contains(text, "Calculating...") && !strings.Contains(text, "计算中...") {
 		t.Fatalf("missing unavailable PnL placeholder: %s", text)
+	}
+}
+
+func TestTelegramQueuedNotificationsSendArbitraryContentAsPlainText(t *testing.T) {
+	var gotText, gotParseMode string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotText = r.FormValue("text")
+		gotParseMode = r.FormValue("parse_mode")
+		w.Header().Set("Content-Type", "application/json")
+		if gotParseMode == string(models.ParseModeHTML) {
+			fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}`)
+			return
+		}
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1,"date":1,"chat":{"id":42,"type":"private"}}}`)
+	}))
+	defer server.Close()
+
+	client, err := bot.New("1:test", bot.WithServerURL(server.URL), bot.WithSkipGetMe())
+	if err != nil {
+		t.Fatalf("create telegram client: %v", err)
+	}
+	tg := newTelegramTestInstance(42)
+	tg.bot = client
+	tg.ctx = context.Background()
+	contents := []map[string]string{
+		{"content": `error: value is <nil> & price > stop`},
+		{"content": `<b>tag-like text</b> and "quotes"`},
+	}
+
+	if remaining := makeDoSendMsgTelegram(tg)(contents); remaining != nil {
+		t.Fatalf("queued notifications were rejected and retained for retry: %#v", remaining)
+	}
+	wantText := contents[0]["content"] + "\n\n---\n\n" + contents[1]["content"]
+	if gotText != wantText {
+		t.Fatalf("notification content changed:\n got: %q\nwant: %q", gotText, wantText)
+	}
+	if gotParseMode != "" {
+		t.Fatalf("arbitrary notification content must not use parse mode, got %q", gotParseMode)
 	}
 }
