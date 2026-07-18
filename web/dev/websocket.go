@@ -1,6 +1,9 @@
 package dev
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banexg/log"
@@ -21,9 +24,11 @@ var (
 )
 
 type WsClient struct {
-	Conn   *websocket.Conn
-	remote string
-	Tags   map[string]interface{}
+	Conn      *websocket.Conn
+	remote    string
+	Tags      map[string]interface{}
+	writeLock sync.Mutex
+	closed    atomic.Bool
 }
 
 func NewWsClient(c *websocket.Conn) *WsClient {
@@ -43,9 +48,6 @@ func NewWsClient(c *websocket.Conn) *WsClient {
 func (c *WsClient) HandleForever() {
 	log.Debug("dev ws client joined", zap.String("ip", c.remote))
 	for {
-		if c.Conn == nil {
-			break
-		}
 		mt, data, err := c.Conn.ReadMessage()
 		if err != nil {
 			log.Warn("ws read fail", zap.Error(err))
@@ -88,12 +90,14 @@ func (c *WsClient) HandleForever() {
 }
 
 func (c *WsClient) WriteMsg(msg map[string]interface{}) {
-	if c.Conn == nil {
-		return
-	}
 	data, err := utils.Marshal(msg)
 	if err != nil {
 		log.Warn("marshal ws msg fail", zap.Error(err))
+		return
+	}
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+	if c.closed.Load() {
 		return
 	}
 	err = c.Conn.WriteMessage(websocket.TextMessage, data)
@@ -103,29 +107,31 @@ func (c *WsClient) WriteMsg(msg map[string]interface{}) {
 }
 
 func (c *WsClient) Close() {
+	if !c.closed.CompareAndSwap(false, true) {
+		return
+	}
 	wsLock.Lock()
 	delete(clients, c)
 	wsLock.Unlock()
 
 	_ = c.Conn.Close()
-	c.Conn = nil
 	log.Debug("dev ws client removed", zap.String("addr", c.remote))
 }
 
 func BroadcastWS(tag string, msg map[string]interface{}) {
 	wsLock.RLock()
-	defer wsLock.RUnlock()
-
+	targets := make([]*WsClient, 0, len(clients))
 	for client := range clients {
 		if tag == "" {
-			// 无tag时广播给所有客户端
-			client.WriteMsg(msg)
-		} else {
-			// 有tag时只广播给包含此tag的客户端
-			if _, ok := client.Tags[tag]; ok {
-				client.WriteMsg(msg)
-			}
+			targets = append(targets, client)
+		} else if _, ok := client.Tags[tag]; ok {
+			targets = append(targets, client)
 		}
+	}
+	wsLock.RUnlock()
+
+	for _, client := range targets {
+		client.WriteMsg(msg)
 	}
 }
 
