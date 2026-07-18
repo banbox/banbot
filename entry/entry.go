@@ -197,7 +197,7 @@ func RunSpider(args *config.CmdArgs) *errs.Error {
 	return RunSpiderWith(args, nil)
 }
 
-func RunSpiderWith(args *config.CmdArgs, startup data.SpiderStartupHook) *errs.Error {
+func RunSpiderWith(args *config.CmdArgs, startup data.SpiderStartupFunc) *errs.Error {
 	core.SetRunMode(core.RunModeLive)
 	args.AutoCompact = true
 	if args.Logfile == "" {
@@ -207,7 +207,7 @@ func RunSpiderWith(args *config.CmdArgs, startup data.SpiderStartupHook) *errs.E
 	if err != nil {
 		return err
 	}
-	return data.RunSpider(config.SpiderAddr, data.WithSpiderStartupHook(startup))
+	return data.RunSpiderWith(config.SpiderAddr, startup)
 }
 
 func LoadKLinesToDB(args *config.CmdArgs) *errs.Error {
