@@ -1,7 +1,9 @@
 package opt
 
 import (
+	"math"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -61,6 +63,104 @@ func TestOptInfoToPolPreservesSourcePolicy(t *testing.T) {
 	got.Filters[0].Items["limit"] = 99
 	if source.Filters[0].Items["limit"] != 12 {
 		t.Fatal("winner mutation changed source policy")
+	}
+}
+
+func TestOptInfoLineRoundTripPreservesWinnerReplayParams(t *testing.T) {
+	want := map[string]float64{
+		"entry_threshold": 0.003938123456789,
+		"huge":            math.MaxFloat64,
+		"tiny":            math.SmallestNonzeroFloat64,
+		"z_threshold":     1.7934,
+	}
+	info := &OptInfo{
+		Score:    4.2,
+		Params:   want,
+		Ints:     map[string]bool{},
+		BTResult: &BTResult{OrderNum: 7},
+		ID:       "replay",
+	}
+
+	line := info.ToLine()
+	for i := 0; i < 10; i++ {
+		if got := info.ToLine(); got != line {
+			t.Fatalf("opt line is not deterministic:\nfirst: %s\nnext:  %s", line, got)
+		}
+	}
+	wantText := "entry_threshold: 0.003938123456789, huge: 1.7976931348623157e+308, tiny: 5e-324, z_threshold: 1.7934"
+	if !strings.Contains(line, wantText) {
+		t.Fatalf("opt params are not shortest round-trip values:\n%s", line)
+	}
+
+	parsed := parseOptLine(line)
+	if !reflect.DeepEqual(parsed.Params, want) {
+		t.Fatalf("opt.log changed replay params:\n got: %#v\nwant: %#v\nline: %s", parsed.Params, want, line)
+	}
+
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "detail"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info.PairGrps = []*RowItem{{}}
+	info.dumpDetail(filepath.Join(dir, "detail", info.ID+".json"))
+	logText := strings.Join([]string{
+		"# run hyper optimize: bayes, rounds: 1",
+		"# date range: test",
+		"",
+		"============== ReplayProbe/1h/BTC/USDT:USDT =============",
+		line,
+		"[score] " + line,
+		"",
+	}, "\n")
+	logPath := filepath.Join(dir, "opt.log")
+	if err := os.WriteFile(logPath, []byte(logText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	winnerYAML, collectErr := collectOptLog([]string{logPath}, 0, "score", "", []*config.RunPolicyConfig{{
+		Name:          "ReplayProbe",
+		RunTimeframes: []string{"1h"},
+		Pairs:         []string{"BTC/USDT:USDT"},
+	}})
+	if collectErr != nil {
+		t.Fatal(collectErr)
+	}
+	var wrapper struct {
+		RunPolicy []*config.RunPolicyConfig `yaml:"run_policy"`
+	}
+	if err := yaml.Unmarshal([]byte(winnerYAML), &wrapper); err != nil {
+		t.Fatal(err)
+	}
+	if len(wrapper.RunPolicy) != 1 || !reflect.DeepEqual(wrapper.RunPolicy[0].Params, want) {
+		t.Fatalf("collected winner YAML changed replay params:\n got: %#v\nwant: %#v\nYAML:\n%s", wrapper.RunPolicy, want, winnerYAML)
+	}
+}
+
+func TestParseOptLineAcceptsLegacyRoundedParams(t *testing.T) {
+	line := "loss:   -4.20 \tentry_threshold: 0.00, z_threshold: 1.79\t \todNum: 7, profit: 3.0%, drawDown: 1.0%, sharpe: 0.50, id: legacy"
+	got := parseOptLine(line)
+	want := map[string]float64{"entry_threshold": 0, "z_threshold": 1.79}
+	if !reflect.DeepEqual(got.Params, want) || got.Score != 4.2 || got.OrderNum != 7 || got.ID != "legacy" {
+		t.Fatalf("legacy opt line parsed incorrectly: %#v", got)
+	}
+}
+
+func TestOptInfoLineNonFinitePolicy(t *testing.T) {
+	info := &OptInfo{
+		Params: map[string]float64{
+			"nan":     math.NaN(),
+			"neg_inf": math.Inf(-1),
+			"pos_inf": math.Inf(1),
+		},
+		Ints:     map[string]bool{},
+		BTResult: &BTResult{},
+	}
+	line := info.ToLine()
+	if !strings.Contains(line, "nan: NaN, neg_inf: -Inf, pos_inf: +Inf") {
+		t.Fatalf("unexpected non-finite encoding: %s", line)
+	}
+	got := parseOptLine(line).Params
+	if !math.IsNaN(got["nan"]) || !math.IsInf(got["neg_inf"], -1) || !math.IsInf(got["pos_inf"], 1) {
+		t.Fatalf("non-finite values did not preserve their classification: %#v", got)
 	}
 }
 

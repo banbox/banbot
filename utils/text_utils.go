@@ -52,6 +52,11 @@ func PadCenter(s string, width int, padText string) string {
 
 func MapToStr[T any](m map[string]T, value bool, precFlt int) string {
 	var b strings.Builder
+	// Negative precision is the shortest representation that round-trips exactly.
+	fltFmt := byte('f')
+	if precFlt < 0 {
+		fltFmt = 'g'
+	}
 	arr := make([]*core.StrAny, 0, len(m))
 	for k, v := range m {
 		arr = append(arr, &core.StrAny{Str: k, Val: v})
@@ -66,9 +71,9 @@ func MapToStr[T any](m map[string]T, value bool, precFlt int) string {
 		if value {
 			var valStr string
 			if fltVal, ok := p.Val.(float64); ok {
-				valStr = strconv.FormatFloat(fltVal, 'f', precFlt, 64)
+				valStr = strconv.FormatFloat(fltVal, fltFmt, precFlt, 64)
 			} else if flt32Val, ok := p.Val.(float32); ok {
-				valStr = strconv.FormatFloat(float64(flt32Val), 'f', precFlt, 64)
+				valStr = strconv.FormatFloat(float64(flt32Val), fltFmt, precFlt, 32)
 			} else {
 				valStr = fmt.Sprintf("%v", p.Val)
 			}

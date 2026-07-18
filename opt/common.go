@@ -254,7 +254,7 @@ func (o *OptInfo) ToLine() string {
 			}
 			params[k] = v
 		}
-		text = utils.MapToStr(params, true, 2)
+		text = utils.MapToStr(params, true, -1)
 		text += "\t"
 	}
 	return fmt.Sprintf("loss: %7.2f \t%s \t%s, id: %v", -o.Score, text, o.BriefLine(), o.ID)
