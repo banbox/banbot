@@ -386,6 +386,140 @@ func TestApplyHisOrderReconcilesOfflineTriggerToItsOwnOrder(t *testing.T) {
 	}
 }
 
+func TestApplyHisOrderInstallsMissingFullEnterTriggers(t *testing.T) {
+	created := make([]string, 0, 2)
+	exchange := &issue138Exchange{
+		createOrder: func(symbol, odType, side string, amount, price float64, params map[string]interface{}) (*banexg.Order, *errs.Error) {
+			trigger := ""
+			if _, ok := params[banexg.ParamStopLossPrice]; ok {
+				trigger = ormo.OdInfoStopLoss
+			} else if _, ok := params[banexg.ParamTakeProfitPrice]; ok {
+				trigger = ormo.OdInfoTakeProfit
+			}
+			created = append(created, trigger)
+			return &banexg.Order{ID: trigger + "-order", Symbol: symbol, Status: banexg.OdStatusOpen}, nil
+		},
+	}
+	withIssue138Exchange(t, exchange)
+
+	od := issue138Order("offline-entry")
+	od.ID = 1631
+	od.Status = ormo.InOutStatusPartEnter
+	od.Enter.Filled = 1
+	od.SetInfo(ormo.OdInfoStopLoss, &ormo.TriggerState{ExitTrigger: &ormo.ExitTrigger{Price: 90}})
+	od.SetInfo(ormo.OdInfoTakeProfit, &ormo.TriggerState{ExitTrigger: &ormo.ExitTrigger{Price: 110}})
+	openOds := map[int64]*ormo.InOutOrder{od.ID: od}
+	knownOds, exIDs := indexHistoricalOrders(od.Symbol, nil, openOds)
+	mgr := newLiveOrderMgr("issue163-transition", func(*ormo.InOutOrder, bool) {})
+
+	err := mgr.applyHisOrder(openOds, knownOds, exIDs, &banexg.Order{
+		ID: od.Enter.OrderID, Symbol: od.Symbol, Side: banexg.OdSideBuy,
+		Status: banexg.OdStatusFilled, Amount: 2, Filled: 2, Average: 101, Timestamp: 200,
+	}, "")
+	if err != nil {
+		t.Fatalf("apply historical entry: %v", err)
+	}
+	if od.Status != ormo.InOutStatusFullEnter {
+		t.Fatalf("order status = %d, want FullEnter", od.Status)
+	}
+	if len(created) != 2 || od.GetStopLoss().OrderId != ormo.OdInfoStopLoss+"-order" ||
+		od.GetTakeProfit().OrderId != ormo.OdInfoTakeProfit+"-order" {
+		t.Fatalf("missing restart protections: created=%v sl=%+v tp=%+v", created, od.GetStopLoss(), od.GetTakeProfit())
+	}
+}
+
+func TestHealMissingFullEnterTriggersRetriesWithoutDuplicates(t *testing.T) {
+	createCalls := 0
+	clientIDs := make([]string, 0, 2)
+	exchange := &issue138Exchange{
+		createOrder: func(symbol, odType, side string, amount, price float64, params map[string]interface{}) (*banexg.Order, *errs.Error) {
+			createCalls++
+			clientID, _ := params[banexg.ParamClientOrderId].(string)
+			clientIDs = append(clientIDs, clientID)
+			if createCalls == 1 {
+				return nil, issue138Err(errs.CodeRunTime)
+			}
+			return &banexg.Order{ID: "healed-stop", ClientOrderID: clientID, Symbol: symbol, Status: banexg.OdStatusOpen}, nil
+		},
+	}
+	withIssue138Exchange(t, exchange)
+	account := "issue163-retry"
+	mgr := newLiveOrderMgr(account, func(*ormo.InOutOrder, bool) {})
+	oldEnvReal := core.EnvReal
+	core.EnvReal = true
+	oldMgr, hadMgr := accLiveOdMgrs[account]
+	accLiveOdMgrs[account] = mgr
+	od := issue138Order("filled-entry")
+	od.ID = 1632
+	od.Status = ormo.InOutStatusFullEnter
+	od.Enter.Filled = 2
+	od.Enter.Status = ormo.OdStatusClosed
+	od.SetInfo(ormo.OdInfoStopLoss, &ormo.TriggerState{ExitTrigger: &ormo.ExitTrigger{Price: 90}})
+	openOds, openLock := ormo.GetOpenODs(account)
+	openLock.Lock()
+	openOds[od.ID] = od
+	openLock.Unlock()
+	t.Cleanup(func() {
+		openLock.Lock()
+		delete(openOds, od.ID)
+		openLock.Unlock()
+		if hadMgr {
+			accLiveOdMgrs[account] = oldMgr
+		} else {
+			delete(accLiveOdMgrs, account)
+		}
+		core.EnvReal = oldEnvReal
+	})
+
+	verifyAccountTriggerOds(account)
+	if createCalls != 1 || od.GetStopLoss().OrderId != "" || od.GetStopLoss().ClientId == "" {
+		t.Fatalf("failed attempt was not retained for retry: calls=%d state=%+v", createCalls, od.GetStopLoss())
+	}
+	verifyAccountTriggerOds(account)
+	verifyAccountTriggerOds(account)
+	if createCalls != 2 || od.GetStopLoss().OrderId != "healed-stop" {
+		t.Fatalf("trigger retry was not idempotent: calls=%d state=%+v", createCalls, od.GetStopLoss())
+	}
+	if len(clientIDs) != 2 || clientIDs[0] == "" || clientIDs[0] != clientIDs[1] {
+		t.Fatalf("retry client IDs = %v, want one stable non-empty ID", clientIDs)
+	}
+}
+
+func TestHealMissingFullEnterTriggersSkipsIneligibleOrders(t *testing.T) {
+	createCalls := 0
+	withIssue138Exchange(t, &issue138Exchange{
+		createOrder: func(string, string, string, float64, float64, map[string]interface{}) (*banexg.Order, *errs.Error) {
+			createCalls++
+			return &banexg.Order{ID: "unexpected"}, nil
+		},
+	})
+	mgr := newLiveOrderMgr("issue163-skips", func(*ormo.InOutOrder, bool) {})
+	makeOrder := func(id int64, status int64, trigger *ormo.TriggerState) *ormo.InOutOrder {
+		od := issue138Order("filled-entry")
+		od.ID = id
+		od.Status = status
+		od.Enter.Filled = 2
+		od.Enter.Status = ormo.OdStatusClosed
+		od.SetInfo(ormo.OdInfoStopLoss, trigger)
+		return od
+	}
+	existing := makeOrder(1633, ormo.InOutStatusFullEnter, &ormo.TriggerState{
+		ExitTrigger: &ormo.ExitTrigger{Price: 90}, OrderId: "existing-stop",
+	})
+	trailing := makeOrder(1634, ormo.InOutStatusFullEnter, &ormo.TriggerState{
+		ExitTrigger: &ormo.ExitTrigger{Price: 90, Tag: core.ExitTagTrailingStop},
+	})
+	invalid := makeOrder(1635, ormo.InOutStatusFullEnter, &ormo.TriggerState{ExitTrigger: &ormo.ExitTrigger{}})
+	exiting := makeOrder(1636, ormo.InOutStatusFullEnter, &ormo.TriggerState{ExitTrigger: &ormo.ExitTrigger{Price: 90}})
+	exiting.Exit = &ormo.ExOrder{OrderID: "pending-exit"}
+	closed := makeOrder(1637, ormo.InOutStatusFullExit, &ormo.TriggerState{ExitTrigger: &ormo.ExitTrigger{Price: 90}})
+
+	mgr.healMissingFullEnterTriggers([]*ormo.InOutOrder{existing, trailing, invalid, exiting, closed})
+	if createCalls != 0 {
+		t.Fatalf("created %d triggers for ineligible orders", createCalls)
+	}
+}
+
 func TestParseClient(t *testing.T) {
 	config.Name = "big"
 	res := getClientOrderId("big_1176_747_")

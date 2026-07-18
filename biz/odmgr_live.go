@@ -887,6 +887,7 @@ func (o *LiveOrderMgr) applyHisOrder(openOds, knownOds map[int64]*ormo.InOutOrde
 	feeName, feeCost, feeQuote := getFeeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Filled, od.Average)
 	price, amount, odTime := od.Average, od.Filled, od.Timestamp
 	if exOd != nil {
+		wasFullEnter := inOut.Status == ormo.InOutStatusFullEnter
 		if exOd.Enter {
 			inOut.SetInfo(odInfoLocalTrigger, nil)
 		}
@@ -917,6 +918,9 @@ func (o *LiveOrderMgr) applyHisOrder(openOds, knownOds map[int64]*ormo.InOutOrde
 			err = inOut.Save()
 			if err != nil {
 				return err
+			}
+			if exOd.Enter && !wasFullEnter && inOut.Status == ormo.InOutStatusFullEnter {
+				o.healMissingFullEnterTriggers([]*ormo.InOutOrder{inOut})
 			}
 		}
 		return nil
@@ -2545,15 +2549,8 @@ func VerifyTriggerOds() {
 }
 
 func getSubmittedEnterOdsByPair(account string) map[string][]*ormo.InOutOrder {
-	openOds, lock := ormo.GetOpenODs(account)
-	lock.Lock()
-	list := make([]*ormo.InOutOrder, 0, len(openOds))
-	for _, od := range openOds {
-		list = append(list, od)
-	}
-	lock.Unlock()
 	submitOds := make(map[string][]*ormo.InOutOrder)
-	for _, od := range list {
+	for _, od := range getOpenOdsSnapshot(account) {
 		if od == nil || od.Exit != nil {
 			continue
 		}
@@ -2577,6 +2574,50 @@ func getSubmittedEnterOdsByPair(account string) map[string][]*ormo.InOutOrder {
 	return submitOds
 }
 
+func getOpenOdsSnapshot(account string) []*ormo.InOutOrder {
+	openOds, lock := ormo.GetOpenODs(account)
+	lock.Lock()
+	list := make([]*ormo.InOutOrder, 0, len(openOds))
+	for _, od := range openOds {
+		list = append(list, od)
+	}
+	lock.Unlock()
+	return list
+}
+
+func isMissingFullEnterTrigger(od *ormo.InOutOrder, key string) bool {
+	if od == nil || od.Status != ormo.InOutStatusFullEnter || od.Exit != nil || od.HoldAmount() <= AmtDust {
+		return false
+	}
+	tg := od.GetExitTrigger(key)
+	return tg != nil && tg.ExitTrigger != nil && tg.Price > 0 && tg.OrderId == "" &&
+		!(key == ormo.OdInfoStopLoss && tg.Tag == core.ExitTagTrailingStop)
+}
+
+func (o *LiveOrderMgr) healMissingFullEnterTriggers(ods []*ormo.InOutOrder) {
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		attempted := false
+		for _, key := range []string{ormo.OdInfoStopLoss, ormo.OdInfoTakeProfit} {
+			if !isMissingFullEnterTrigger(od, key) {
+				continue
+			}
+			o.editTriggerOd(od, key)
+			attempted = true
+		}
+		if attempted && od.IsDirty() {
+			if err := od.Save(); err != nil {
+				log.Error("save healed trigger fail", zap.String("acc", o.Account),
+					zap.String("key", od.Key()), zap.Error(err))
+			}
+		}
+		lock.Unlock()
+	}
+}
+
 func verifyAccountTriggerOds(account string) {
 	triggerOds, lock := ormo.GetTriggerODs(account)
 	var resOds []*ormo.InOutOrder
@@ -2589,6 +2630,10 @@ func verifyAccountTriggerOds(account string) {
 	var zeros []string
 	var fails []string
 	odMgr := GetLiveOdMgr(account)
+	if odMgr == nil {
+		return
+	}
+	odMgr.healMissingFullEnterTriggers(getOpenOdsSnapshot(account))
 	var saves []*ormo.InOutOrder
 	submitOds := getSubmittedEnterOdsByPair(account)
 	pairs := make(map[string]struct{})
@@ -3051,7 +3096,7 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		return
 	}
 	tg := od.GetExitTrigger(prefix)
-	if tg == nil || tg.Old != nil && tg.Old.Equal(tg.ExitTrigger) {
+	if tg == nil || tg.OrderId != "" && tg.Old != nil && tg.Old.Equal(tg.ExitTrigger) {
 		return
 	}
 	tg.SaveOld()
@@ -3072,7 +3117,12 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		}
 		return
 	}
-	clientID := od.ClientId(true)
+	clientID := tg.ClientId
+	if clientID == "" || tg.OrderId != "" {
+		clientID = od.ClientId(true)
+		tg.ClientId = clientID
+		od.DirtyInfo = true
+	}
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
 		banexg.ParamClientOrderId: clientID,
