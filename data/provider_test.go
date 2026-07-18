@@ -1,12 +1,61 @@
 package data
 
 import (
+	"fmt"
 	"math"
 	"reflect"
 	"testing"
 
+	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 )
+
+type stubDataFeeder struct {
+	symbol  string
+	warmLog *[]string
+}
+
+func (f *stubDataFeeder) getSymbol() string            { return f.symbol }
+func (f *stubDataFeeder) getWaitData() *orm.DataSeries { return nil }
+func (f *stubDataFeeder) setWaitData(*orm.DataSeries)  {}
+func (f *stubDataFeeder) getStates() []*PairTFCache    { return nil }
+func (f *stubDataFeeder) onNewData(int64, []*orm.DataSeries) (bool, *errs.Error) {
+	return false, nil
+}
+func (f *stubDataFeeder) SubTfs(tfs []string, _ bool) []string {
+	return tfs
+}
+func (f *stubDataFeeder) WarmTfs(_ int64, tfNums map[string]int, _ *utils.PrgBar) (int64, map[string][2]int, *errs.Error) {
+	*f.warmLog = append(*f.warmLog, fmt.Sprintf("%s:%d", f.symbol, tfNums["1h"]))
+	return 0, nil, nil
+}
+
+func TestSubWarmPairsUsesStablePairOrder(t *testing.T) {
+	var created, warmed []string
+	p := &Provider[IDataFeeder]{
+		holders: make(map[string]IDataFeeder),
+		newFeeder: func(pair string, _ []string) (IDataFeeder, *errs.Error) {
+			created = append(created, pair)
+			return &stubDataFeeder{symbol: pair, warmLog: &warmed}, nil
+		},
+	}
+	items := map[string]map[string]int{
+		"SOL/USDT": {"1h": 10},
+		"BTC/USDT": {"1h": 30},
+		"ETH/USDT": {"1h": 20},
+	}
+
+	_, _, _, err := p.SubWarmPairs(items, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCreated := []string{"BTC/USDT", "ETH/USDT", "SOL/USDT"}
+	wantWarmed := []string{"BTC/USDT:30", "ETH/USDT:20", "SOL/USDT:10"}
+	if !reflect.DeepEqual(created, wantCreated) || !reflect.DeepEqual(warmed, wantWarmed) {
+		t.Fatalf("unstable warmup order: created=%v warmed=%v", created, warmed)
+	}
+}
 
 type histFeederBatch struct {
 	symbol string

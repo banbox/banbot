@@ -8,9 +8,56 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"gopkg.in/yaml.v3"
 )
+
+func TestResetOptimizeTrialStakePctAmt(t *testing.T) {
+	oldAccounts := config.Accounts
+	oldStakePct := config.StakePct
+	t.Cleanup(func() {
+		config.Accounts = oldAccounts
+		config.StakePct = oldStakePct
+	})
+
+	config.StakePct = 10
+	config.Accounts = map[string]*config.AccountConfig{
+		config.DefAcc: {StakePctAmt: 100, StakeRate: 1.5},
+		"secondary":   {StakePctAmt: 250, MaxStakeAmt: 300},
+	}
+	resetOptimizeTrialVars()
+
+	for account, cfg := range config.Accounts {
+		if cfg.StakePctAmt != 0 {
+			t.Fatalf("account %s retained previous trial stake base: %v", account, cfg.StakePctAmt)
+		}
+	}
+	if config.Accounts[config.DefAcc].StakeRate != 1.5 || config.Accounts["secondary"].MaxStakeAmt != 300 {
+		t.Fatal("trial reset changed persistent account sizing settings")
+	}
+
+	wallets := &biz.BanWallets{
+		Account: config.DefAcc,
+		Items: map[string]*biz.ItemWallet{
+			"USDT": {Coin: "USDT", Available: 1100},
+		},
+	}
+	for trial := 1; trial <= 3; trial++ {
+		wallets.TryUpdateStakePctAmt()
+		if got := config.Accounts[config.DefAcc].StakePctAmt; got != 110 {
+			t.Fatalf("trial %d stake base = %v, want 110", trial, got)
+		}
+		config.Accounts[config.DefAcc].StakePctAmt = 100
+		resetOptimizeTrialVars()
+	}
+
+	config.Accounts[config.DefAcc].StakePctAmt = 135
+	biz.ResetVars()
+	if got := config.Accounts[config.DefAcc].StakePctAmt; got != 135 {
+		t.Fatalf("generic runtime reset discarded trial-local stake change: %v", got)
+	}
+}
 
 func TestSortOptLogs(t *testing.T) {
 	sortOptLogs("E:\\trade\\go\\bandata\\backtest\\opt_bearMacd.log")

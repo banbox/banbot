@@ -715,7 +715,7 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 
 func runBTOnce() (*BackTest, float64) {
 	core.BotRunning = true
-	biz.ResetVars()
+	resetOptimizeTrialVars()
 	bt, err := NewBackTest(true, "")
 	if err != nil {
 		panic(err)
@@ -723,6 +723,13 @@ func runBTOnce() (*BackTest, float64) {
 	bt.Run()
 	var loss = -bt.Score()
 	return bt, loss
+}
+
+func resetOptimizeTrialVars() {
+	biz.ResetVars()
+	for _, account := range config.Accounts {
+		account.StakePctAmt = 0
+	}
 }
 
 func runGOptuna(name string, rounds int, params []*core.Param, loop FuncOptTask) *errs.Error {
