@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 	_ "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type questExecer interface {
@@ -383,15 +384,13 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 }
 
 func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Error) {
-	// 添加 WAL 模式和其他性能优化参数
-	openFlag := "_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-64000)"
-	// 设置 mmap_size 为 300MB，利用内存映射 I/O 减少磁盘读写
-	openFlag += "&_pragma=mmap_size(300000000)"
-	// 确保 busy_timeout 始终设置，避免多进程锁冲突
 	if timeoutMs <= 0 {
 		timeoutMs = 5000 // 默认5秒超时
 	}
-	openFlag += fmt.Sprintf("&_pragma=busy_timeout(%d)", timeoutMs)
+	// Keep the lock timeout explicit before other per-connection pragmas.
+	openFlag := fmt.Sprintf("_pragma=busy_timeout(%d)", timeoutMs)
+	openFlag += "&_pragma=synchronous(NORMAL)&_pragma=cache_size(-64000)"
+	openFlag += "&_pragma=mmap_size(300000000)"
 	if write {
 		openFlag += "&cache=shared&mode=rwc"
 	} else {
@@ -419,6 +418,12 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 	// 多进程场景：缩短连接生命周期，让其他进程有机会获取锁
 	db.SetConnMaxLifetime(30 * time.Second)
 	db.SetConnMaxIdleTime(1 * time.Second)
+	if write {
+		if err_ = enableSQLiteWAL(db, time.Duration(timeoutMs)*time.Millisecond); err_ != nil {
+			_ = db.Close()
+			return nil, errs.New(core.ErrDbExecFail, err_)
+		}
+	}
 
 	// 初始化数据库结构（如果需要）
 	dbPathLock.Lock()
@@ -452,6 +457,41 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 		dbPathInit[path] = true
 	}
 	return db, nil
+}
+
+type sqliteErrorCoder interface {
+	Code() int
+}
+
+func isSQLiteBusy(err error) bool {
+	var sqliteErr sqliteErrorCoder
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
+}
+
+func enableSQLiteWAL(db *sql.DB, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return retrySQLiteBusy(ctx, 50*time.Millisecond, func() error {
+		_, err := db.Exec("PRAGMA journal_mode = WAL")
+		return err
+	})
+}
+
+func retrySQLiteBusy(ctx context.Context, delay time.Duration, fn func() error) error {
+	for {
+		err := fn()
+		if err == nil || !isSQLiteBusy(err) {
+			return err
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+	}
 }
 
 // monitorTimeout monitors a TrackedDB and logs an error if it exceeds the timeout
