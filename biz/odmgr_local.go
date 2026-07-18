@@ -137,7 +137,6 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 		}
 		lock.Unlock()
 		if len(newOds) > 0 {
-			sortOrdersForBacktest(newOds)
 			_, err = o.fillPendingOrders(newOds, evt)
 			if err != nil {
 				return orders, err
@@ -169,6 +168,7 @@ Fills orders waiting for exchange response. Cannot be used for real trading; can
 填充等待交易所响应的订单。不可用于实盘；可用于回测、模拟实盘等。
 */
 func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.DataSeries) (int, *errs.Error) {
+	sortOrdersForBacktest(orders)
 	core.SimOrderMatch = true
 	core.NewNumInSim = 0
 	defer func() {
