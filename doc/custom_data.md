@@ -409,6 +409,18 @@ type DataSub struct {
 `data.EnsureRuntimeSeriesRange(...)` / `data.EnsureSeriesSubsRange(...)` 是当前中性的运行时补齐入口；旧的
 `EnsureThirdPartySeriesRange(...)` / `EnsureThirdPartySeriesSubsRange(...)` 仍保留为兼容 alias。
 
+也可以在回测或参数优化前显式补齐已注册的数据源：
+
+```bash
+./bot series list
+./bot series down -pairs BTC/USDT,ETH/USDT -tables funding_rate \
+  -timestart 2025-01-01 -timeend 2026-01-01
+```
+
+`series list` 输出包含 source 名称、周期、物理表和字段定义的 JSON。`series down` 中的 `-tables`
+按 source 名称筛选；不传时补齐全部已注册 source。下载结束时间会按各 source 的周期截断到最后一个
+已闭合区间，QuestDB 下还会等待 `sranges_q` 覆盖范围可见后再退出。
+
 ### 5.4 `sranges` 仍然复用 `(sid, table, timeframe)`
 
 当前实现没有为 custom data 另建覆盖范围系统，而是继续复用现有 `sranges` 机制：

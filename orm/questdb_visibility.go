@@ -176,6 +176,49 @@ func waitForQuestKlineCoverageVisible(ctx context.Context, q *Queries, sid int32
 	return nil
 }
 
+// WaitForSeriesCoverageVisible waits until QuestDB's persisted sranges snapshot,
+// rather than the in-process cache, answers the complete requested interval.
+func WaitForSeriesCoverageVisible(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
+	if !IsQuestDB || startMS >= endMS {
+		return nil
+	}
+	if err := validateSeriesInfo(info); err != nil {
+		return err
+	}
+	q, conn, err := Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	return waitForQuestSeriesCoverageVisible(ctx, q, info, sid, startMS, endMS)
+}
+
+func waitForQuestSeriesCoverageVisible(ctx context.Context, q *Queries, info *SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
+	binding := normalizedSeriesBinding(info.Binding)
+	ok, err := waitForQuestCondition(ctx, klineInsertQuestVisibilityGrace, questReadAfterWritePollInterval, func() (bool, error) {
+		unlock := LockCompactTableRead("sranges_q")
+		defer unlock()
+		spans, err := q.loadSRangesSpansFromDB(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS)
+		if err != nil {
+			return false, err
+		}
+		answered := make([]MSRange, 0, len(spans))
+		for _, span := range spans {
+			answered = append(answered, MSRange{Start: span.StartMs, Stop: span.StopMs})
+		}
+		return len(subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, mergeMSRanges(answered))) == 0, nil
+	})
+	if err != nil {
+		return NewDbErr(core.ErrDbReadFail, err)
+	}
+	if !ok {
+		return errs.NewMsg(core.ErrDbReadFail,
+			"questdb series coverage not visible before timeout: table=%s sid=%d timeframe=%s start=%d end=%d",
+			binding.Table, sid, info.TimeFrame, startMS, endMS)
+	}
+	return nil
+}
+
 func waitForQuestKlineTimestampVisible(ctx context.Context, q *Queries, sid int32, timeframe string, timeMS int64) *errs.Error {
 	tblName := "kline_" + timeframe
 	sqlText := fmt.Sprintf(`SELECT count(*) > 0 FROM %s

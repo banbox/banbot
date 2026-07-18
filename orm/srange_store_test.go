@@ -334,9 +334,10 @@ type staleCoveredRow struct{}
 func (staleCoveredRow) Scan(...interface{}) error { return nil }
 
 type staleCoveredRows struct {
-	idx     int
-	startMS int64
-	stopMS  int64
+	idx        int
+	startMS    int64
+	stopMS     int64
+	knownEmpty bool
 }
 
 func (r *staleCoveredRows) Close()                                       {}
@@ -355,7 +356,7 @@ func (r *staleCoveredRows) Next() bool {
 func (r *staleCoveredRows) Scan(dest ...any) error {
 	*(dest[0].(*int64)) = r.startMS
 	*(dest[1].(*int64)) = r.stopMS
-	*(dest[2].(*bool)) = true
+	*(dest[2].(*bool)) = !r.knownEmpty
 	return nil
 }
 

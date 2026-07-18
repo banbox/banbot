@@ -32,6 +32,7 @@ var (
 	commandGroups = []commandGroup{
 		{name: "data", help: "export and import data"},
 		{name: "kline", help: "manage kline data"},
+		{name: "series", help: "manage custom series data"},
 		{name: "tick", help: "manage tick data"},
 		{name: "tool", help: "run maintenance and analysis tools"},
 		{name: "live", help: "manage live orders"},
@@ -121,6 +122,10 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 	add("kline", withAliases(newConfigCommand("adj-export", "export adjustment factors to CSV", biz.ExportAdjFactors, true,
 		bindOut, bindPairs, bindTimeZone), "adj_export"))
 
+	add("series", newConfigCommand("down", "download registered custom series", RunSeriesDown, true,
+		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindSeriesSources))
+	add("series", newSeriesListCommand())
+
 	add("tick", newConfigCommand("convert", "convert tick data formats", data.RunFormatTick, true, bindIn, bindOut))
 	add("tick", withAliases(newConfigCommand("to-kline", "build klines from tick data", data.Build1mWithTicks, true, bindIn, bindOut), "to_kline"))
 
@@ -196,6 +201,10 @@ func bindMedium(args *config.CmdArgs, flags *pflag.FlagSet) {
 
 func bindTables(args *config.CmdArgs, flags *pflag.FlagSet) {
 	flags.StringVar(&args.RawTables, "tables", "", "comma-separated database tables")
+}
+
+func bindSeriesSources(args *config.CmdArgs, flags *pflag.FlagSet) {
+	flags.StringVar(&args.RawTables, "tables", "", "comma-separated registered source names")
 }
 
 func bindProgress(args *config.CmdArgs, flags *pflag.FlagSet) {
