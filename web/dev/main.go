@@ -70,12 +70,13 @@ func Run(args []string) error {
 	// 初始化基础数据
 	core.SetRunMode(core.RunModeLive)
 	banArg := &config.CmdArgs{
-		DataDir:    ag.DataDir,
-		LogLevel:   ag.LogLevel,
-		TimeZone:   ag.TimeZone,
-		Configs:    ag.Configs,
-		ConfigData: ag.ConfigData,
-		Logfile:    ag.LogFile,
+		DataDir:     ag.DataDir,
+		LogLevel:    ag.LogLevel,
+		TimeZone:    ag.TimeZone,
+		Configs:     ag.Configs,
+		ConfigData:  ag.ConfigData,
+		Logfile:     ag.LogFile,
+		AutoCompact: true,
 	}
 	var err2 *errs.Error
 	if err2 = biz.SetupComsExg(banArg); err2 != nil {

@@ -617,14 +617,16 @@ func mapToSeriesFields(exs *ExSymbol, timeframe string, fields []string, pgRows 
 	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
 	var out []*DataSeries
+	var timeMS int64
+	values := make([]any, len(fields))
+	targets := make([]any, 1+len(fields))
+	targets[0] = &timeMS
+	for i := range values {
+		targets[i+1] = &values[i]
+	}
 	for pgRows.Next() {
-		var timeMS int64
-		values := make([]any, len(fields))
-		targets := make([]any, 1+len(fields))
-		targets[0] = &timeMS
-		for i := range values {
-			targets[i+1] = &values[i]
-		}
+		timeMS = 0
+		clear(values)
 		if err := pgRows.Scan(targets...); err != nil {
 			return nil, err
 		}

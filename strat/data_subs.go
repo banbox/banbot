@@ -1,7 +1,6 @@
 package strat
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -9,7 +8,17 @@ import (
 )
 
 func DataSubKey(source string, sid int32, tf string) string {
-	return fmt.Sprintf("%s:%d:%s", orm.NormalizeSeriesSource(source), sid, tf)
+	source = orm.NormalizeSeriesSource(source)
+	var sidBuf [12]byte
+	sidText := strconv.AppendInt(sidBuf[:0], int64(sid), 10)
+	var key strings.Builder
+	key.Grow(len(source) + len(sidText) + len(tf) + 2)
+	key.WriteString(source)
+	key.WriteByte(':')
+	key.Write(sidText)
+	key.WriteByte(':')
+	key.WriteString(tf)
+	return key.String()
 }
 
 func ParseDataSubKey(key string) (string, int32, string, bool) {
@@ -91,8 +100,19 @@ func CollectDataSubs(job *StratJob) []*DataSub {
 // path valid, while side-input subscriptions may extend the projection.
 func CollectKlineSubFields(sid int32, tf string) []string {
 	fields := orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil)
-	key := DataSubKey(orm.SeriesSourceKline, sid, tf)
 	lockInfoJobs.Lock()
+	hasInfoJobs := false
+	for _, accJobs := range AccInfoJobs {
+		if len(accJobs) > 0 {
+			hasInfoJobs = true
+			break
+		}
+	}
+	if !hasInfoJobs {
+		lockInfoJobs.Unlock()
+		return fields
+	}
+	key := DataSubKey(orm.SeriesSourceKline, sid, tf)
 	seenJobs := make(map[*StratJob]bool)
 	for _, accJobs := range AccInfoJobs {
 		for _, job := range accJobs[key] {

@@ -175,6 +175,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 		core.SimOrderMatch = false
 	}()
 	affectNum := 0
+	bar := seriesOHLCVCompat(evt)
 	for _, od := range orders {
 		matchTf, _ := config.GetStratRefineTF(od.Strategy, od.Timeframe)
 		if evt != nil && evt.TimeFrame != matchTf {
@@ -184,7 +185,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 		if exOrder == nil {
 			if od.ExitTag == "" && evt != nil {
 				// 已入场完成，尚未出现出场信号，检查是否触发止损The entry has been completed, but the exit signal has not yet appeared. Check whether the stop loss is triggered.
-				err := o.tryFillTriggers(od, seriesOHLCVCompat(evt), matchTf)
+				err := o.tryFillTriggers(od, bar, matchTf)
 				if err != nil {
 					return 0, err
 				}
@@ -219,7 +220,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 				price = exOrder.Price
 			}
 			minRate = float64((exOrder.CreateAt-barStartMS)/1000) / float64(odTFSecs)
-			minRate = simMarketRate(seriesOHLCVCompat(evt), trigPrice, odIsBuy, true, minRate)
+			minRate = simMarketRate(bar, trigPrice, odIsBuy, true, minRate)
 			fillBarRate = minRate
 			fillMS = evt.TimeMS + int64(float64(odTFSecs)*minRate)*1000
 			isStopEnter = true
@@ -254,19 +255,19 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			if minRate == 0 {
 				minRate = float64((exOrder.CreateAt-barStartMS)/1000) / float64(odTFSecs)
 			}
-			fillBarRate = simMarketRate(seriesOHLCVCompat(evt), exOrder.Price, odIsBuy, false, minRate)
+			fillBarRate = simMarketRate(bar, exOrder.Price, odIsBuy, false, minRate)
 			fillMS = evt.TimeMS + int64(float64(odTFSecs)*fillBarRate)*1000
 		} else if !isStopEnter {
 			// 按网络延迟，模拟成交价格，和开盘价接近According to the network delay, the simulated transaction price is close to the opening price
 			fillBarRate = float64((fillMS-barStartMS)/1000) / float64(odTFSecs)
-			price = simMarketPrice(seriesOHLCVCompat(evt), fillBarRate)
+			price = simMarketPrice(bar, fillBarRate)
 		}
 		var err *errs.Error
 		if exOrder.Enter {
 			err = o.fillPendingEnter(od, price, fillMS)
 			if err == nil && evt != nil {
 				// 入场后可能立刻触发止损/止盈
-				endBar := cutSeriesFromRate(seriesOHLCVCompat(evt), int64(odTFSecs*1000), fillBarRate)
+				endBar := cutSeriesFromRate(bar, int64(odTFSecs*1000), fillBarRate)
 				err = o.tryFillTriggers(od, endBar, matchTf)
 			}
 		} else {

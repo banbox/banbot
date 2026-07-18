@@ -31,6 +31,8 @@ type ListSeriesRangeSummariesArgs struct {
 }
 
 func (q *Queries) ListSeriesRangeSummaries(args ListSeriesRangeSummariesArgs) ([]*SeriesRangeSummary, int64, *errs.Error) {
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	ctx := context.Background()
 	where, params := buildSeriesRangeSummaryWhere(args)
 	fromSQL := fmt.Sprintf(`FROM sranges
@@ -121,6 +123,8 @@ func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Err
 	if args.Sid == 0 {
 		return nil, 0, errs.NewMsg(core.ErrDbReadFail, "sid is required")
 	}
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	ctx := context.Background()
 
 	var whereParts []string
@@ -190,6 +194,8 @@ ORDER BY start_ms DESC`, whereClause)
 }
 
 func (q *Queries) ListSRangesBySid(ctx context.Context, sid int32) ([]*SRange, error) {
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}

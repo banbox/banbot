@@ -90,7 +90,7 @@ func SetupComs(args *config.CmdArgs) *errs.Error {
 	if err != nil {
 		return err
 	}
-	err = orm.Setup()
+	err = orm.SetupWithAutoCompact(args.AutoCompact)
 	if err != nil {
 		return err
 	}
@@ -388,7 +388,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 				num4 += len(j.Job.Exits)
 			}
 			if num3 > num1 || num4 > num2 {
-				log.Warn("Open/Close order in OnBatchInfos not support, please call `biz.GetOdMgr(s.Account).ProcessOrders(nil, s)` manually")
+				log.Warn("Open/Close order in OnBatchInfos not support, please call `biz.GetOdMgr(s.Account).ProcessOrders(s)` manually")
 			}
 		}
 		if len(item.mainJobs) > 0 {

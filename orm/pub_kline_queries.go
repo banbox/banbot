@@ -8,14 +8,31 @@ import (
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
+	"github.com/banbox/banexg/log"
+	"go.uber.org/zap"
 )
 
 func (q *Queries) PurgeKlineUn() *errs.Error {
 	if !IsQuestDB {
 		return purgeKlineUnPg()
 	}
+	releaseProcessLock, acquired, err := tryAcquireCompactProcessExclusiveLock(compactProcessLockRootFn(), "kline_un_q")
+	if err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	if !acquired {
+		return errs.NewMsg(core.ErrRunTime, "kline_un_q is in use by another process")
+	}
+	defer func() {
+		if err := releaseProcessLock(); err != nil {
+			log.Warn("release kline_un_q process lock failed", zap.Error(err))
+		}
+	}()
+	tblLock := cptState.getTableLock("kline_un_q")
+	tblLock.Lock()
+	defer tblLock.Unlock()
 	ctx := context.Background()
-	_, err := q.db.Exec(ctx, `DROP TABLE IF EXISTS kline_un_q`)
+	_, err = q.db.Exec(ctx, `DROP TABLE IF EXISTS kline_un_q`)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
@@ -51,6 +68,8 @@ func (q *Queries) DelKInfo(sid int32, timeFrame string) *errs.Error {
 		}
 		return nil
 	}
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
 FROM sranges_q
 LATEST BY sid, tbl, timeframe, start_ms
@@ -92,7 +111,7 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND coalesce(is_deleted, false) =
 	}
 	// Invalidate in-process cache so subsequent reads reflect the deletion.
 	srangesCacheDel(sid, tbl, timeFrame)
-	MaybeCompact("sranges_q")
+	MarkTableForCompact("sranges_q", len(items))
 	return nil
 }
 
@@ -102,6 +121,8 @@ func (q *Queries) GetKlineRange(sid int32, timeFrame string) (int64, int64) {
 	if !IsQuestDB {
 		return getKlineRangePg(ctx, sid, tbl, timeFrame)
 	}
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	row := q.db.QueryRow(ctx, `SELECT min(start_ms), max(stop_ms)
 FROM (
   SELECT start_ms, stop_ms
@@ -126,6 +147,8 @@ func (q *Queries) GetKlineRanges(sidList []int32, timeFrame string) map[int32][2
 	if !IsQuestDB {
 		return getKlineRangesPg(ctx, sidList, tbl, timeFrame)
 	}
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 
 	var texts = make([]string, len(sidList))
 	for i, sid := range sidList {
@@ -163,6 +186,8 @@ func (q *Queries) DelFactors(sid int32, startMS, endMS int64) *errs.Error {
 	if !IsQuestDB {
 		return delFactorsPg(ctx, sid, startMS, endMS)
 	}
+	unlock := LockCompactTableRead("adj_factors_q")
+	defer unlock()
 	sqlText := `SELECT sid, sub_id, start_ms, factor
 FROM adj_factors_q
 LATEST BY sid, sub_id, start_ms
@@ -210,7 +235,7 @@ WHERE (sid = $1 OR sub_id = $1) AND coalesce(is_deleted, false) = false`
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
 	}
-	MaybeCompact("adj_factors_q")
+	MarkTableForCompact("adj_factors_q", len(items))
 	return nil
 }
 
@@ -219,6 +244,8 @@ func (q *Queries) DelKLineUn(sid int32, timeFrame string) *errs.Error {
 	if !IsQuestDB {
 		return delKLineUnPg(ctx, sid, timeFrame)
 	}
+	unlock := LockCompactTableRead("kline_un_q")
+	defer unlock()
 	ts := time.Now().UTC()
 	_, err := q.db.Exec(ctx, `INSERT INTO kline_un_q (sid, timeframe, ts, stop_ms, expire_ms,
 open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted)
@@ -226,6 +253,6 @@ VALUES ($1, $2, $3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, true)`, sid, timeFrame, ts)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
-	MaybeCompact("kline_un_q")
+	MarkTableForCompact("kline_un_q", 1)
 	return nil
 }

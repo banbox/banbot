@@ -637,6 +637,8 @@ func waitForQuestSeriesCoverageDeleted(ctx context.Context, info *SeriesInfo, si
 }
 
 func questSeriesCoveredRangesFromDB(ctx context.Context, q *Queries, table, timeframe string, sid int32, startMS, endMS int64) ([]MSRange, error) {
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	spans, err := q.loadSRangesSpansFromDB(ctx, sid, table, timeframe, startMS, endMS)
 	if err != nil {
 		return nil, err
@@ -651,6 +653,8 @@ func questSeriesCoveredRangesFromDB(ctx context.Context, q *Queries, table, time
 }
 
 func questSeriesDeleteMarkerVisible(ctx context.Context, q *Queries, table, timeframe string, sid int32, startMS, endMS int64) (bool, error) {
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
 FROM (
   SELECT start_ms, stop_ms, has_data, is_deleted

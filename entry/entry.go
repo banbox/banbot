@@ -200,6 +200,7 @@ func RunSpider(args *config.CmdArgs) *errs.Error {
 
 func RunSpiderWith(args *config.CmdArgs, startup data.SpiderStartupHook) *errs.Error {
 	core.SetRunMode(core.RunModeLive)
+	args.AutoCompact = true
 	if args.Logfile == "" {
 		args.Logfile = filepath.Join(config.GetLogsDir(), "spider.log")
 	}

@@ -291,6 +291,8 @@ func mergeIssues(issues []*VerifyIssue) []*VerifyIssue {
 }
 
 func listSRangeSids(tables []string) ([]int32, *errs.Error) {
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	ctx := context.Background()
 	var whereClause string
 	if len(tables) > 0 {

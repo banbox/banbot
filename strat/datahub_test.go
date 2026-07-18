@@ -105,6 +105,29 @@ func TestDataHubBuildsConfiguredAndDefaultSeries(t *testing.T) {
 	}
 }
 
+func TestDataHubDefaultSeriesTracksFieldsAddedLater(t *testing.T) {
+	hub := NewDataHub()
+	hub.Set(&orm.DataSeries{
+		Source: "macro", Sid: 7, TimeMS: 100, EndMS: 200, TimeFrame: "1m",
+		Values: map[string]any{"value": 1.0, "signal": "pending"},
+	})
+	fields := hub.Set(&orm.DataSeries{
+		Source: "macro", Sid: 7, TimeMS: 200, EndMS: 300, TimeFrame: "1m",
+		Values: map[string]any{"value": 2.0, "signal": float64(3)},
+	})
+	hub.Set(&orm.DataSeries{
+		Source: "macro", Sid: 7, TimeMS: 300, EndMS: 400, TimeFrame: "1m",
+		Values: map[string]any{"value": 4.0},
+	})
+
+	if got := fields.Series("signal"); got == nil || got.Len() != 2 || !math.IsNaN(got.Get(0)) || got.Get(1) != 3 {
+		t.Fatalf("late float field must become an aligned series, got %+v", got)
+	}
+	if _, ok := fields.valMap["signal"]; ok {
+		t.Fatal("series value must remove the earlier scalar value")
+	}
+}
+
 func TestDataHubAllReadyOnlyChecksClosingTimeframes(t *testing.T) {
 	const minute = int64(60_000)
 	base := int64(1_700_000_000_000 / (15 * minute) * (15 * minute))

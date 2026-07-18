@@ -10,7 +10,7 @@ import (
 )
 
 var (
-	questReadAfterWriteTimeout      = 500 * time.Millisecond
+	questReadAfterWriteTimeout      = 3 * time.Second
 	questReadAfterWritePollInterval = 50 * time.Millisecond
 )
 
@@ -145,6 +145,8 @@ func waitForQuestKlineWindowVisible(ctx context.Context, q *Queries, sid int32, 
 }
 
 func questKlineCoverageVisible(ctx context.Context, q *Queries, sid int32, timeframe string, startMS, endMS int64) (bool, error) {
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	spans, err := q.loadSRangesSpansFromDB(ctx, sid, "kline_"+timeframe, timeframe, startMS, endMS)
 	if err != nil {
 		return false, err

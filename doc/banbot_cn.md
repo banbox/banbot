@@ -83,8 +83,8 @@ func KDJBy(high *Series, low *Series, close *Series, period int, sm1 int, sm2 in
 // talib STOCHF 对应 KDJBy返回的[K,D,RSV]中的[RSV, K]
 func Stoch(high, low, close *Series, period int) *Series // 14, (close - LL)/(HH-LL) * 100; HH: HighestHigh, LL: LowestLow
 func Aroon(high *Series, low *Series, period int) (*Series, *Series, *Series) // return [AroonUp, Osc, AroonDn]
-func StdDev(obj *Series, period int) (*Series, *Series) // Standard deviation 20 return [stddev，sumVal]
-func StdDevBy(obj *Series, period int, ddof int) (*Series, *Series) // 20 return [stddev，sumVal]
+func StdDev(obj *Series, period int) *Series // Standard deviation，默认ddof=0
+func StdDevBy(obj *Series, period int, ddof int) (*Series, *Series) // 返回[stddev，sumVal]
 // Bollinger Bands 20 2 2  return [upper, mid, lower]
 func BBANDS(obj *Series, period int, stdUp, stdDn float64) (*Series, *Series, *Series)
 func TD(obj *Series) *Series // Tom DeMark Sequence
@@ -134,8 +134,8 @@ func MyExample(obj *Series, period int) *Series {
 ```
 ### 关键规则
 * 检查有效数据长度时，可使用`e.Close.Len()`
-* banta的所有代码都是每个K线执行一次，所有指标应该在用户的`OnBar`顶部无条件执行，指标计算完之后才可通过`if`等定义额外条件逻辑
-* 创建新序列使用`Series.To`：`BarEnv.NewSeries`会无条件创建新序列，在指标内或`OnBar`中使用会导致内存泄露。而`To`内部会优先返回已存在的Series，不存在时才调用`NewSeries`。
+* banta的所有代码都是每个K线执行一次，所有主周期指标应该在`OnData`的主数据处理器顶部无条件执行，指标计算完之后才可通过`if`等定义额外条件逻辑
+* 创建新序列使用`Series.To`：`BarEnv.NewSeries`会无条件创建新序列，在指标内或主数据处理器中使用会导致内存泄露。而`To`内部会优先返回已存在的Series，不存在时才调用`NewSeries`。
 * 当需要将收盘价Close与HighestHigh或LowesLow比较或进行Cross时，一般应先进行Back(1)，取前一个，否则收盘价永远低于HighestHigh或高于LowesLow不会触发信号
 
 ### github.com/banbox/banbot/core
@@ -158,8 +158,15 @@ func (e *Ema) Reset()
 func IsLimitOrder(t int) bool
 func MarshalYaml(v any) ([]byte, error)
 func Sleep(d time.Duration) bool
-func GetPrice/GetPriceSafe(symbol string) float64
 func SplitSymbol(pair string) (string, string, string, string) // Base,Quote,Settle,Identifier
+```
+
+### github.com/banbox/banbot/com
+```go
+func GetPrice(symbol, side string) float64
+func GetPriceSafe(symbol, side string) float64
+func GetPriceExp(symbol, side string, expMS int64) float64
+func GetPriceSafeExp(symbol, side string, expMS int64) float64
 ```
 
 ### github.com/banbox/banbot/config
@@ -171,6 +178,15 @@ type RunPolicyConfig struct {
 	PairParams map[string]map[string]float64
 	Score float64; Index int
 }
+type DatabaseConfig struct {
+	Url string
+	Retention string
+	MaxPoolSize int
+	AutoCreate bool
+	DbType string // "questdb" 或 "timescale"；留空时按连接信息自动识别
+	QdbMemPct float64
+	QdbMaxMemMB int
+}
 func (c *RunPolicyConfig) Def(k string, dv float64, p *core.Param) float64
 func (c *RunPolicyConfig) DefInt(k string, dv int, p *core.Param) int
 ```
@@ -179,14 +195,83 @@ func (c *RunPolicyConfig) DefInt(k string, dv int, p *core.Param) int
 type ExSymbol struct {
 	ID int32; Exchange, ExgReal, Market, Symbol string
 	Combined bool; ListMs, DelistMs int64
+	AggRules string // JSON字段聚合规则；未配置字段默认last
 }
+type SeriesField struct { Name, Type, Role string }
+type SeriesBinding struct {
+	Table, TimeColumn, EndColumn, SIDColumn string
+	Fields []SeriesField
+}
+type SeriesInfo struct {
+	Name, TimeFrame string
+	Binding SeriesBinding
+}
+type DataRecord struct {
+	Sid int32; TimeMS, EndMS int64; Closed bool
+	Values map[string]any
+}
+type DataSeries struct {
+	Source string; Sid int32; TimeMS, EndMS int64; TimeFrame string
+	Closed, IsWarmUp bool; Values map[string]any; ExSymbol *ExSymbol
+}
+type SeriesFetchFunc func(ctx context.Context, target *ExSymbol, startMS, endMS int64) ([]*DataRecord, error)
+
 func GetExSymbols/GetExSymbolMap(exgName, market string) map[int32/*string*/]*ExSymbol
 func GetSymbolByID(id int32) *ExSymbol
 func GetExSymbolCur(symbol string) (*ExSymbol, *errs.Error)
 func GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.Error)
 func GetExSymbol2(exgName, market, symbol string) *ExSymbol
 func GetAllExSymbols() map[int32]*ExSymbol
+func EnsureExSymbol(exchange, market, symbol string, exgReal ...string) (*ExSymbol, error)
+func NewSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
+func DefaultSeriesStore() *SeriesStore
+func (s *SeriesStore) Ensure(ctx context.Context, info *SeriesInfo) *errs.Error
+func (s *SeriesStore) Write(ctx context.Context, info *SeriesInfo, target *ExSymbol, row *DataRecord) *errs.Error
+func (s *SeriesStore) WriteBatch(ctx context.Context, info *SeriesInfo, target *ExSymbol, rows []*DataRecord) *errs.Error
+func (s *SeriesStore) WriteSeries(ctx context.Context, info *SeriesInfo, target *ExSymbol, evt *DataSeries) *errs.Error
+func (s *SeriesStore) WriteSeriesBatch(ctx context.Context, info *SeriesInfo, target *ExSymbol, rows []*DataSeries) *errs.Error
+func (s *SeriesStore) Read(ctx context.Context, info *SeriesInfo, target *ExSymbol, startMS, endMS int64, limit int) ([]*DataSeries, *errs.Error)
+func (s *SeriesStore) Delete(ctx context.Context, info *SeriesInfo, target *ExSymbol, startMS, endMS int64) *errs.Error
+func (s *SeriesStore) Missing(ctx context.Context, info *SeriesInfo, target *ExSymbol, startMS, endMS int64) ([]MSRange, *errs.Error)
+func (s *SeriesStore) FillMissing(ctx context.Context, info *SeriesInfo, target *ExSymbol, startMS, endMS int64, fetch SeriesFetchFunc) *errs.Error
+func (s *SeriesStore) Coverage(ctx context.Context, info *SeriesInfo, target *ExSymbol) (int64, int64, *errs.Error)
+func NewKLineSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
+func NewKLineSeriesStore(info *SeriesInfo) *KLineSeriesStore
+func (s *KLineSeriesStore) Ensure(ctx context.Context) *errs.Error
+func (s *KLineSeriesStore) Write(ctx context.Context, target *ExSymbol, rows []*DataRecord) *errs.Error
+func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, endMS int64, limit int) ([]*DataSeries, *errs.Error)
+type AggRuleFunc func(rows []*DataRecord, field SeriesField) (any, error)
+func (s *ExSymbol) SetAggRules(rules map[string]string) error
+func (s *ExSymbol) AggRule(col string) string
+func RegisterAggRule(name string, fn AggRuleFunc) bool
 ```
+
+### github.com/banbox/banbot/data
+```go
+type DataSink interface {
+	Emit(sub *strat.DataSub, rows []*orm.DataRecord) error
+}
+type DataSource interface {
+	Info() *orm.SeriesInfo
+	FetchHistory(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error)
+	SubscribeLive(ctx context.Context, subs []*strat.DataSub, sink DataSink) error
+}
+type FetchHistoryFunc func(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error)
+type SubscribeLiveFunc func(ctx context.Context, subs []*strat.DataSub, sink DataSink) error
+
+func RegisterDataSource(src DataSource) error
+func RegisterFuncDataSource(info *orm.SeriesInfo, fetch FetchHistoryFunc, subscribe SubscribeLiveFunc) error
+func GetDataSource(name string) DataSource
+func ListDataSources() []string
+```
+
+数据库和自定义时序数据规则：
+* banbot 同时支持 TimescaleDB 和 QuestDB。可用 `database.db_type: timescale|questdb` 显式指定；留空时自动识别。业务层应使用统一 ORM，不应在策略中拼接后端专用 SQL。
+* 与已有 K 线按时间戳一一对应的扩展字段，使用 `NewKLineSeriesInfo` 和 `KLineSeriesStore`；独立频率或独立结构的数据，使用 `NewSeriesInfo` 和 `SeriesStore`。
+* 需要由回测/实盘自动补齐和消费的独立数据，应实现 `DataSource`，或用 `RegisterFuncDataSource` 注册历史拉取和可选实时订阅函数。
+* `SeriesStore`、`KLineSeriesStore` 和数据源运行时会适配两种数据库的时间列、写入和可见性差异。K 线扩展写入只更新已存在的 `(sid, time)` 行，不会静默生成缺少 OHLCV 的行。
+* `DataRecord.Values` / `DataSeries.Values` 可保存 schema 声明的任意时序字段；策略通过 `OnData`、`DataFields` 和 `DataHub` 统一读取。
+* 时序聚合内置 `min`、`max`、`last`、`first`、`sum`、`avg`、`mid`。用 `ExSymbol.SetAggRules` 按字段配置；特殊语义可用 `RegisterAggRule` 注册自定义聚合函数。
 
 ### github.com/banbox/banbot/orm/ormo
 ```go
@@ -251,13 +336,16 @@ type TradeStrat struct {
 	Outputs []string // 策略输出的文本文件内容，每个字符串是一行
 	Policy *config.RunPolicyConfig
 	OnPairInfos func(s *StratJob) []*PairSub
+	OnDataSubs func(s *StratJob) []*DataSub
 	OnSymbols func(items []string) []string // return modified pairs
 	OnStartUp func(s *StratJob)
 	OnBar func(s *StratJob)
+	OnData FnOnData
 	OnInfoBar func(s *StratJob, e *ta.BarEnv, pair, tf string) // 其他依赖的bar数据
 	OnWsTrades func(s *StratJob, pair string, trades []*banexg.Trade) // 逐笔交易数据
 	OnWsDepth func(s *StratJob, dep *banexg.OrderBook) // Websocket推送深度信息
 	OnWsKline func(s *StratJob, pair string, k *banexg.Kline) // Websocket推送的实时K线
+	OnWsData func(s *StratJob, evt *orm.DataSeries)
 	OnBatchJobs func(jobs []*StratJob) // 当前时间所有标的job，用于批量开单/平仓
 	OnBatchInfos func(tf string, jobs map[string]*JobEnv) // 当前时间所有info标的job，用于批量处理
 	OnCheckExit func(s *StratJob, od *ormo.InOutOrder) *ExitReq // 自定义订单退出逻辑
@@ -273,9 +361,44 @@ const ( BatchTypeInOut = iota; BatchTypeInfo )
 
 type JobEnv struct { Job *StratJob; Env *ta.BarEnv; Symbol string }
 type PairSub struct { Pair, TimeFrame string; WarmupNum int }
+type DataSub struct {
+	Source string
+	ExSymbol *orm.ExSymbol // nil 表示当前任务品种
+	TimeFrame string
+	WarmupNum int
+	Fields []string       // 从数据源读取的字段
+	SeriesFields []string // 维护为 banta.Series 的字段；默认选择浮点字段
+}
+type DataRole uint8
+const (
+	DataRoleMain DataRole = iota + 1
+	DataRoleInfo
+	DataRoleCustom
+)
+type DataEvent struct {
+	*DataFields
+	Role DataRole
+	Symbol *orm.ExSymbol
+}
+func (e DataEvent) IsMain() bool
+func (e DataEvent) IsKline() bool
+type FnOnData func(s *StratJob, data DataEvent)
+type DataHandlers struct { Main, Info, Custom FnOnData }
+func RouteData(handlers DataHandlers) FnOnData
+type DataFields struct {
+	DoneMS, TimeMS int64
+	Source string; Sid int32; TimeFrame string
+	Closed, IsWarmUp bool
+}
+func (d *DataFields) Series(name string) *ta.Series
+func (d *DataFields) Float64(name string) float64
+func (d *DataFields) Int64(name string) int64
+func (d *DataFields) String(name string) string
+func (d *DataFields) Raw(name string) any
 type StratJob struct {
 	Strat *TradeStrat
 	Env *ta.BarEnv
+	DataHub *DataHub
 	Entrys []*EnterReq
 	Exits []*ExitReq
 	LongOrders []*ormo.InOutOrder
@@ -373,6 +496,8 @@ func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error
 func (s *StratJob) Position(dirt float64, enterTag string) float64
 func (s *StratJob) GetOrders/GetOrderNum(dirt float64) []*ormo.InOutOrder/int
 func (s *StratJob) SetAllStopLoss/SetAllTakeProfit(dirt float64, args *ormo.ExitTrigger)
+func (d *DataHub) Get(tf, source string, sid int32) *DataFields
+func (d *DataHub) AllReady() bool
 ```
 
 ### 策略示例
@@ -403,34 +528,37 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 			// goLong, atrBase是每个品种都不同的变量，会更新，需要记录到More中
 			s.More = &SmaOf2{goLong: false, atrBase: 1}
 		},
-		OnPairInfos: func(s *strat.StratJob) []*strat.PairSub {
-			// 仅当需要多个时间周期时，才传入OnPairInfos，比如当前主周期是15m，还需要1h作为参考
-			return []*strat.PairSub{{"_cur_", "1h", 50}}
+		OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			// 当前主周期之外，再订阅当前品种1h K线；ExSymbol为nil表示当前品种
+			return []*strat.DataSub{{Source: "kline", TimeFrame: "1h", WarmupNum: 50}}
 		},
-		OnBar: func(s *strat.StratJob) {
-			e := s.Env; m, _ := s.More.(*SmaOf2)
-			c := e.Close.Get(0)
-			atr := ta.ATR(e.High, e.Low, e.Close, lenAtr)
-			atrBase := ta.Lowest(ta.Highest(atr, lenAtr), baseAtrLen).Get(0)
-			m.atrBase = atrBase
-			ma5 := ta.SMA(e.Close, 5)
-			ma20 := ta.SMA(e.Close, 20)
-			maCross := ma5.Cross(ma20) // 1 上穿，-1 下穿，0 重合或未知，abs(maCross)-1表示交叉距离
-			// 不要重复定义 maCrossUnder = ma20.Cross(ma50)，应直接使用 maCross == -1
-			sma := ma20.Get(0)
-			if maCross == 1 && m.goLong && sma-c > atrBase*longRate && s.OrderNum == 0 {
-				s.OpenOrder(&strat.EnterReq{Tag: "long"})
-			} else if maCross == -1 && !m.goLong && c-sma > atrBase*shortRate {
-				s.CloseOrders(&strat.ExitReq{Tag: "short"})
-			}
-		},
-		OnInfoBar: func(s *strat.StratJob, e *ta.BarEnv, pair, tf string) {
-			// 处理大周期1h的数据，计算结果存储到`s.More`中以便`OnBar`中使用
-			m, _ := s.More.(*SmaOf2)
-			emaFast := ta.EMA(e.Close, 20).Get(0)
-			emaSlow := ta.EMA(e.Close, 25).Get(0)
-			m.goLong = emaFast > emaSlow
-		},
+		OnData: strat.RouteData(strat.DataHandlers{
+			Info: func(s *strat.StratJob, data strat.DataEvent) {
+				// 只处理辅助订阅，等价于原OnInfoBar逻辑
+				m, _ := s.More.(*SmaOf2)
+				closeSeries := data.Series("close")
+				emaFast := ta.EMA(closeSeries, 20).Get(0)
+				emaSlow := ta.EMA(closeSeries, 25).Get(0)
+				m.goLong = emaFast > emaSlow
+			},
+			Main: func(s *strat.StratJob, _ strat.DataEvent) {
+				// 只处理主订阅，等价于原OnBar逻辑
+				e := s.Env; m, _ := s.More.(*SmaOf2)
+				c := e.Close.Get(0)
+				atr := ta.ATR(e.High, e.Low, e.Close, lenAtr)
+				atrBase := ta.Lowest(ta.Highest(atr, lenAtr), baseAtrLen).Get(0)
+				m.atrBase = atrBase
+				ma5 := ta.SMA(e.Close, 5)
+				ma20 := ta.SMA(e.Close, 20)
+				maCross := ma5.Cross(ma20) // 1 上穿，-1 下穿，0 重合或未知，abs(maCross)-1表示交叉距离
+				sma := ma20.Get(0)
+				if maCross == 1 && m.goLong && sma-c > atrBase*longRate && s.OrderNum == 0 {
+					s.OpenOrder(&strat.EnterReq{Tag: "long"})
+				} else if maCross == -1 && !m.goLong && c-sma > atrBase*shortRate {
+					s.CloseOrders(&strat.ExitReq{Tag: "short"})
+				}
+			},
+		}),
 		OnCheckExit: func(s *strat.StratJob, od *ormo.InOutOrder) *strat.ExitReq {
 			m, _ := s.More.(*SmaOf2)
 			holdNum := int((s.Env.TimeStop - od.EnterAt) / s.Env.TFMSecs)
@@ -454,17 +582,20 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 ```
 
 ### 关键规则
- * 大部分策略只需`WarmupNum`和`OnBar`，如无必要不要添加额外的函数和逻辑
- * 在`OnBar`中可调用一次或多次`OpenOrder`和`CloseOrders`进行入场和出场，如果需要限制做多或做空的最大订单数量，可设置`TradeStrat`的`EachMaxLong`和`EachMaxShort`，设为1表示最多开1单，默认0不限制
+ * 新策略优先使用`OnData`。没有辅助或自定义订阅时可直接编写`OnData`；存在多类数据时使用`strat.RouteData(strat.DataHandlers{Main: ..., Info: ..., Custom: ...})`，保证每个事件至多进入一个处理器。
+ * 迁移旧策略时不能把`OnBar`直接改名为`OnData`。手写分流时，仅当`data.Role == strat.DataRoleInfo`才执行原`OnInfoBar`逻辑并返回；随后还要用`if !data.IsMain() { return }`排除自定义数据，最后才执行原`OnBar`逻辑。更推荐使用`RouteData`分别放入`Info`和`Main`。
+ * `data.IsMain()`只表示当前任务的主K线；`data.IsKline()`包含主K线和辅助K线。`DataRoleCustom`不能访问`s.Env`来假定它是OHLCV，应通过`DataFields`读取声明字段。
+ * 一旦策略定义了`OnData`，同一事件不会再回落触发旧`OnBar`或`OnInfoBar`。这两个接口仍保留用于兼容旧策略，但新代码不应继续依赖它们。
+ * 主数据处理器中可调用一次或多次`OpenOrder`和`CloseOrders`进行入场和出场。如果需要限制做多或做空的最大订单数量，可设置`TradeStrat`的`EachMaxLong`和`EachMaxShort`，设为1表示最多开1单，默认0不限制。
  * banbot会使用策略初始化函数 `func(pol \*config.RunPolicyConfig) \*strat.TradeStrat` 返回的策略对每一个品种创建一个策略任务`*strat.StratJob`；
- * 一些固定不变的信息一般可直接在策略初始化函数中直接定义好（如从pol解析的参数），然后在`OnBar/OnInfoBar`等函数中可直接使用这些固定的变量。对于每个品种不同的变量信息，则应记录到`*strat.StratJob.More`中。
+ * 一些固定不变的信息一般可直接在策略初始化函数中定义好（如从pol解析的参数），然后在`OnData`等回调中直接使用。对于每个品种不同的变量信息，则应记录到`*strat.StratJob.More`中。
  * 如果需要在订单盈利后，从最大盈利回撤到一定程度自动止损，可设置`DrawDownExit`为`true`，然后传入`GetDrawDownExitRate`函数：`func(s *StratJob, od *ormo.InOutOrder, maxChg float64) float64`，返回0表示不设置止损，返回0.5表示从最大盈利回撤50%止损。其中macChg参数是订单的最大盈利，如0.1表示做多订单价格增长10%或做空订单价格下跌10%
- * 策略的交易周期TimeFrame一般是设置在外部yaml中，代码中无需设置。如果除了当前策略正在使用的时间周期，还需要其他时间周期，可在`OnPairInfos`中返回需要的品种代码、时间周期，预热数量。`_cur_`表示当前品种。所有其他品种和其他时间周期，都需要在`OnInfoBar`中处理回调
+ * 策略的主周期一般设置在外部yaml中。其他品种、周期或自定义数据使用`OnDataSubs`返回`DataSub`；辅助K线在`RouteData.Info`处理，自定义时序在`RouteData.Custom`处理。旧`OnPairInfos`仅用于兼容，内部会桥接为`Source: "kline"`的订阅。
  * 注意通过`RunPolicyConfig`解析的超参数，是固定不变的，只读的，是此策略的所有`StratJob`可以直接共享使用的，所以不要把超参数保存到结构体，更不要保存到`StratJob.More`中。More应该只记录每个品种都不同的变量。
  * 如果需要对每个订单在每个bar单独处理退出逻辑，可传入`OnCheckExit`函数，返回一个非`nil`的`ExitReq`表示对此订单平仓；
- * `StratJob.More`仅用于存储每个品种都不同的、且需要更新的、且需要在多个回调函数间同步的信息（如`OnInfoBar`中其他周期的指标在`OnBar`中使用），这时应实现`OnStartUp`函数，并在其中对`More`进行初始化；如果是与品种无关的直接在return前定义然后任意位置使用即可（比如传入的超参数解析后变量）；如果是只读的直接在使用位置附近写死即可。
+ * `StratJob.More`仅用于存储每个品种都不同、会更新、且需要在多个处理器间同步的信息（如辅助周期指标供主周期使用）。这时应实现`OnStartUp`并初始化`More`；与品种无关的只读参数直接由闭包共享。
  * 如需计算订单已持仓的bar数量，可`holdNum := s.Env.BarCount(od.EnterAt)`
- * 注意，大多数情况下可在`OnBar`中直接实现统一的出场逻辑，无需通过`OnCheckExit`设置每个订单的出场逻辑。
+ * 注意，大多数情况下可在`OnData`主数据处理器中直接实现统一的出场逻辑，无需通过`OnCheckExit`设置每个订单的出场逻辑。
  * 如果需要在订单状态发生变化时得到通知，可传入`OnOrderChange`函数，其中chgType表示订单事件类型，可能的值: `strat.OdChgNew, strat.OdChgEnter, strat.OdChgEnterFill, strat.OdChgExit, strat.OdChgExitFill`
  * 订单的止损可在调用`OpenOrder`时传入，可以设置`StopLoss/TakeProfit`为某个止损止盈价格，但更推荐的是使用`StopLossVal/TakeProfitVal`，表示止盈止损的价格范围（注意不是倍率），它能根据`Short`是否是做多/做空，以及当前最新价格，自动计算出对应的止损止盈价格。如`{Short: true, StopLossVal:atr\*2}`表示打开做空订单，使用2倍atr止损。或`{StopLossVal:price\*0.01}`表示使用价格的1%止损。
  * 单笔订单的开单数量（法币金额）是在外部yaml中配置的，golang代码中一般不需要设置，如果需要对某个订单使用非默认开单金额，可设置`EnterReq`的`CostRate`，默认为1，传入0.5表示使用平时50%的金额开单。

@@ -83,6 +83,15 @@ var (
 )
 
 func Setup() *errs.Error {
+	return setup(false)
+}
+
+func SetupWithAutoCompact(autoCompact bool) *errs.Error {
+	return setup(autoCompact)
+}
+
+func setup(autoCompact bool) *errs.Error {
+	stopCompactWorker()
 	if pool != nil {
 		pool.Close()
 		pool = nil
@@ -131,7 +140,13 @@ func Setup() *errs.Error {
 			return err2
 		}
 	}
-	return sess.UpdatePendingIns()
+	if err2 = sess.UpdatePendingIns(); err2 != nil {
+		return err2
+	}
+	if autoCompact {
+		startCompactWorker()
+	}
+	return nil
 }
 
 func initSQLitePaths() {
@@ -773,6 +788,11 @@ func runQdbMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 			return nil
 		}
 	}
+	unlockCompactTables, lockErr := lockAllCompactTablesRead(ctx)
+	if lockErr != nil {
+		return NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlockCompactTables()
 
 	log.Warn("running database migrations (questdb) ...")
 	_, err := pool.Exec(ctx, `

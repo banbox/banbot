@@ -646,12 +646,6 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 		return err
 	}
 	// 创建数据库连接和导入管理器
-	sess, conn, err := Conn(nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-
 	if err = importAdjFactors(idMap, exInfo.AdjFactors); err != nil {
 		return err
 	}
@@ -768,6 +762,14 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 	}()
 
 	wg.Wait()
+
+	// Large imports can outlive a server-side connection. Acquire a fresh
+	// connection for range metadata after all worker writes have completed.
+	sess, conn, err := Conn(nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
 
 	itemNum := 0
 	for _, tfMap := range insRanges {
