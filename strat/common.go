@@ -40,8 +40,9 @@ func New(pol *config.RunPolicyConfig) *TradeStrat {
 		panic("strategy not found: " + pol.Name)
 		// stgy = loadNative(pol.Name)
 	}
-	cacheStrats[cacheKey] = stgy
 	stgy.Name = polID
+	validateDataCallbacks(stgy)
+	cacheStrats[cacheKey] = stgy
 	if stgy.MinTfScore == 0 {
 		stgy.MinTfScore = 0.75
 	}

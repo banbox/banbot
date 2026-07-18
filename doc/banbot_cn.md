@@ -585,7 +585,7 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
  * 新策略优先使用`OnData`。没有辅助或自定义订阅时可直接编写`OnData`；存在多类数据时使用`strat.RouteData(strat.DataHandlers{Main: ..., Info: ..., Custom: ...})`，保证每个事件至多进入一个处理器。
  * 迁移旧策略时不能把`OnBar`直接改名为`OnData`。手写分流时，仅当`data.Role == strat.DataRoleInfo`才执行原`OnInfoBar`逻辑并返回；随后还要用`if !data.IsMain() { return }`排除自定义数据，最后才执行原`OnBar`逻辑。更推荐使用`RouteData`分别放入`Info`和`Main`。
  * `data.IsMain()`只表示当前任务的主K线；`data.IsKline()`包含主K线和辅助K线。`DataRoleCustom`不能访问`s.Env`来假定它是OHLCV，应通过`DataFields`读取声明字段。
- * 一旦策略定义了`OnData`，同一事件不会再回落触发旧`OnBar`或`OnInfoBar`。这两个接口仍保留用于兼容旧策略，但新代码不应继续依赖它们。
+ * `OnData`不能与旧`OnBar`或`OnInfoBar`同时配置，策略构建会直接报错。请将主周期和辅助K线逻辑迁移到`RouteData`的`Main`和`Info`处理器；旧接口只用于未实现`OnData`的兼容策略。
  * 主数据处理器中可调用一次或多次`OpenOrder`和`CloseOrders`进行入场和出场。如果需要限制做多或做空的最大订单数量，可设置`TradeStrat`的`EachMaxLong`和`EachMaxShort`，设为1表示最多开1单，默认0不限制。
  * banbot会使用策略初始化函数 `func(pol \*config.RunPolicyConfig) \*strat.TradeStrat` 返回的策略对每一个品种创建一个策略任务`*strat.StratJob`；
  * 一些固定不变的信息一般可直接在策略初始化函数中定义好（如从pol解析的参数），然后在`OnData`等回调中直接使用。对于每个品种不同的变量信息，则应记录到`*strat.StratJob.More`中。

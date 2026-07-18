@@ -591,23 +591,25 @@ func init() {
                 },
             }
         },
-        OnData: strat.CustomData(func(job *strat.StratJob, data strat.DataEvent) {
-            if data.Source != "macro_cpi" {
-                return
-            }
-            value := data.Series("value")
-            revision := data.Int64("revision")
-            if !job.DataHub.AllReady() {
-                return
-            }
-            latest := job.DataHub.Get("1d", "macro_cpi", data.Sid)
-            _, _, _ = value, revision, latest
+        OnData: strat.RouteData(strat.DataHandlers{
+            Custom: func(job *strat.StratJob, data strat.DataEvent) {
+                if data.Source != "macro_cpi" {
+                    return
+                }
+                value := data.Series("value")
+                revision := data.Int64("revision")
+                if !job.DataHub.AllReady() {
+                    return
+                }
+                latest := job.DataHub.Get("1d", "macro_cpi", data.Sid)
+                _, _, _ = value, revision, latest
+            },
         }),
     })
 }
 ```
 
-`DataEvent` 嵌入了 `*DataFields`，因此字段读取方式不变；同时提供 `Role`、`Symbol`、`IsMain()` 和 `IsKline()`。没有辅助或自定义订阅的策略可直接赋值 `OnData`，无需包装。需要过滤时，处理全部 K 线用 `strat.KlineData(...)`，只处理自定义时序用 `strat.CustomData(...)`；主周期、辅助 K 线和自定义数据需要不同逻辑时，使用：
+`DataEvent` 嵌入了 `*DataFields`，因此字段读取方式不变；同时提供 `Role`、`Symbol`、`IsMain()` 和 `IsKline()`。没有辅助或自定义订阅的策略可直接赋值 `OnData`，无需包装。需要过滤或分别处理主周期、辅助 K 线和自定义数据时，使用：
 
 ```go
 OnData: strat.RouteData(strat.DataHandlers{
@@ -637,6 +639,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 - `OnPairInfos` 会在内部桥接为 `DataSub{Source: "kline", ...}`
 - `OnInfoBar` 仅在 side-input 能适配成 kline 且策略未实现 `OnData` 时触发
 - `OnBar` 仅在主 kline 事件且策略未实现 `OnData` 时触发；同一事件不会同时调用两个回调
+- `OnData` 不能与 `OnBar` 或 `OnInfoBar` 同时配置；策略构建会直接报错，请把旧回调逻辑迁移到 `RouteData` 的 `Main` / `Info` 处理器
 
 ### 7.3 新代码不要再把 Kline 当作通用自定义数据契约
 

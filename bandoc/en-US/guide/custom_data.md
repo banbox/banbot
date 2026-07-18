@@ -83,21 +83,23 @@ strat.AddStrat(&strat.TradeStrat{
             SeriesFields: []string{"rate"},
         }}
     },
-    OnData: strat.CustomData(func(job *strat.StratJob, data strat.DataEvent) {
-        if data.Source != "funding_rate" {
-            return
-        }
-        rate := data.Float64("rate")
-        if !job.DataHub.AllReady() {
-            return
-        }
-        latest := job.DataHub.Get(data.TimeFrame, data.Source, data.Sid)
-        _, _ = rate, latest
+    OnData: strat.RouteData(strat.DataHandlers{
+        Custom: func(job *strat.StratJob, data strat.DataEvent) {
+            if data.Source != "funding_rate" {
+                return
+            }
+            rate := data.Float64("rate")
+            if !job.DataHub.AllReady() {
+                return
+            }
+            latest := job.DataHub.Get(data.TimeFrame, data.Source, data.Sid)
+            _, _ = rate, latest
+        },
     }),
 })
 ```
 
-`DataEvent` embeds `*DataFields`, so existing field methods such as `Series` and `Float64` remain directly available. Assign `OnData` directly when the strategy has no auxiliary or custom subscriptions. Use `KlineData` or `CustomData` when those event classes need filtering, and `RouteData(DataHandlers{Main: ..., Info: ..., Custom: ...})` when each class needs different logic. Once `OnData` is defined, the same primary event does not also invoke legacy `OnBar`.
+`DataEvent` embeds `*DataFields`, so existing field methods such as `Series` and `Float64` remain directly available. Assign `OnData` directly when the strategy has no auxiliary or custom subscriptions. Use `RouteData(DataHandlers{Main: ..., Info: ..., Custom: ...})` to filter or handle each event class separately. `OnData` cannot be configured together with `OnBar` or `OnInfoBar`; strategy construction fails immediately so primary K-line logic cannot be silently skipped or executed twice.
 
 `TimeFrame` must match the data source's `SeriesInfo`. At startup, banbot merges duplicate subscriptions by `(source, sid, timeframe)`, merges their field lists, and uses the largest `WarmupNum`. During backtesting, it fills history first, then replays data together with K-lines in time order. During live trading, it fills history first and then activates live subscriptions. An unregistered source, a mismatched timeframe, or a declared subscription without `OnData` or a compatible callback causes startup to fail.
 
