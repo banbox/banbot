@@ -103,8 +103,8 @@ func TestFindSourcePolicyDistinguishesDirection(t *testing.T) {
 		}
 	}
 	any.Name = long.Name
-	if got, ambiguous := findSourcePolicy([]*config.RunPolicyConfig{any, long}, long.Name, "long", "1h", "BTC/USDT:USDT"); got != long || ambiguous {
-		t.Fatalf("exact long policy did not outrank any: %#v, ambiguous=%v", got, ambiguous)
+	if got, ambiguous := findSourcePolicy([]*config.RunPolicyConfig{any, long}, long.Name, "long", "1h", "BTC/USDT:USDT"); got != nil || !ambiguous {
+		t.Fatalf("identity-free any/long match = %#v, ambiguous=%v", got, ambiguous)
 	}
 	if got, ambiguous := findSourcePolicy([]*config.RunPolicyConfig{any, long}, long.Name, "short", "1h", "BTC/USDT:USDT"); got != any || ambiguous {
 		t.Fatalf("any policy did not cover missing short direction: %#v, ambiguous=%v", got, ambiguous)
@@ -139,11 +139,165 @@ func TestCollectOptLogRejectsAmbiguousSourcePolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	sources := []*config.RunPolicyConfig{
-		{Name: "AmbiguousProbe", Dirt: "long", RunTimeframes: []string{"1h"}, StopLoss: "2%"},
+		{Name: "AmbiguousProbe", Dirt: "any", RunTimeframes: []string{"1h"}, StopLoss: "2%"},
 		{Name: "AmbiguousProbe", Dirt: "long", RunTimeframes: []string{"1h"}, StopLoss: "6%"},
 	}
 	if _, err := collectOptLog([]string{path}, 0, "score", "", sources); err == nil || !strings.Contains(err.Error(), "multiple source run policies") {
 		t.Fatalf("ambiguous collect error = %v", err)
+	}
+}
+
+func TestCollectOptLogPreservesSourceIdentityAcrossCollapsedSections(t *testing.T) {
+	dir := t.TempDir()
+	detailDir := filepath.Join(dir, "detail")
+	if err := os.Mkdir(detailDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	any := &config.RunPolicyConfig{
+		Name:          "IdentityProbe",
+		Dirt:          "any",
+		RunTimeframes: []string{"1h"},
+		Pairs:         []string{"BTC/USDT:USDT"},
+		StopLoss:      "2%",
+		StakeRate:     1.25,
+		Filters:       []*config.CommonPairFilter{{Name: "VolumePairFilter", Items: map[string]interface{}{"limit": 1}}},
+	}
+	long := any.Clone()
+	long.Dirt = "long"
+	long.StopLoss = "6%"
+	long.StakeRate = 0.75
+	long.Filters[0].Items["limit"] = 2
+	sources := []*config.RunPolicyConfig{any, long}
+
+	path := filepath.Join(dir, "opt.log")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteString("# run hyper optimize: bayes, rounds: 1\n# date range: test\n"); err != nil {
+		t.Fatal(err)
+	}
+	writeIdentitySection(t, file, detailDir, any, "any-result", 2, 1, true)
+	writeIdentitySection(t, file, detailDir, long, "long-result", 1, 2, true)
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sortOptLogs(path)
+
+	winnerYAML, collectErr := collectOptLog([]string{path}, 0, "score", "", sources)
+	if collectErr != nil {
+		t.Fatal(collectErr)
+	}
+	assertIdentityWinners(t, winnerYAML)
+}
+
+func TestCollectOptLogUsesIndexedPathSourceIdentity(t *testing.T) {
+	dir := t.TempDir()
+	detailDir := filepath.Join(dir, "detail")
+	if err := os.Mkdir(detailDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	any := &config.RunPolicyConfig{
+		Name: "IndexedProbe", Dirt: "any", RunTimeframes: []string{"1h"}, Pairs: []string{"BTC/USDT:USDT"},
+		StopLoss: "2%", StakeRate: 1.25,
+	}
+	long := any.Clone()
+	long.Dirt, long.StopLoss, long.StakeRate = "long", "6%", 0.75
+	sources := []*config.RunPolicyConfig{any, long}
+	basePath := filepath.Join(dir, "opt.log")
+	paths := optimizeLogPaths(basePath, len(sources))
+	for i, source := range sources {
+		file, err := os.Create(paths[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = file.WriteString("# run hyper optimize: bayes, rounds: 1\n# date range: test\n"); err != nil {
+			t.Fatal(err)
+		}
+		writeIdentitySection(t, file, detailDir, source, []string{"any-indexed", "long-indexed"}[i], float64(2-i), float64(i+1), false)
+		if err = file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hints := indexedLogSourceHints(basePath, []string{paths[1], paths[0]}, sources)
+	winnerYAML, collectErr := collectOptLogWithHints([]string{paths[1], paths[0]}, 0, "score", "", sources, hints)
+	if collectErr != nil {
+		t.Fatal(collectErr)
+	}
+	var got struct {
+		RunPolicy []*config.RunPolicyConfig `yaml:"run_policy"`
+	}
+	if err := yaml.Unmarshal([]byte(winnerYAML), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.RunPolicy) != 2 {
+		t.Fatalf("indexed winner count = %d:\n%s", len(got.RunPolicy), winnerYAML)
+	}
+	for _, pol := range got.RunPolicy {
+		switch pol.Params["origin"] {
+		case 1:
+			if pol.StopLoss != "2%" || pol.StakeRate != 1.25 {
+				t.Fatalf("indexed any result used wrong source: %#v", pol)
+			}
+		case 2:
+			if pol.StopLoss != "6%" || pol.StakeRate != 0.75 {
+				t.Fatalf("indexed long result used wrong source: %#v", pol)
+			}
+		default:
+			t.Fatalf("unexpected indexed winner source: %#v", pol)
+		}
+	}
+}
+
+func writeIdentitySection(t *testing.T, file *os.File, detailDir string, source *config.RunPolicyConfig,
+	id string, score, origin float64, marker bool) {
+	t.Helper()
+	if marker {
+		if _, err := file.WriteString(optSourceLine(source) + "\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	info := &OptInfo{
+		ID:       id,
+		Score:    score,
+		Params:   map[string]float64{"origin": origin},
+		Ints:     map[string]bool{},
+		BTResult: &BTResult{OrderNum: 1, PairGrps: []*RowItem{{Title: id}}},
+	}
+	info.dumpDetail(filepath.Join(detailDir, id+".json"))
+	line := info.ToLine()
+	sectionPol := source.Clone()
+	sectionPol.Dirt = "long"
+	section := "============== " + sectionPol.Key() + " =============\n"
+	if _, err := file.WriteString(section + line + "\n[score] " + line + "\n\n"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertIdentityWinners(t *testing.T, winnerYAML string) {
+	t.Helper()
+	var got struct {
+		RunPolicy []*config.RunPolicyConfig `yaml:"run_policy"`
+	}
+	if err := yaml.Unmarshal([]byte(winnerYAML), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.RunPolicy) != 2 {
+		t.Fatalf("winner count = %d:\n%s", len(got.RunPolicy), winnerYAML)
+	}
+	for _, pol := range got.RunPolicy {
+		switch pol.Params["origin"] {
+		case 1:
+			if pol.StopLoss != "2%" || pol.StakeRate != 1.25 || pol.Filters[0].Items["limit"] != 1 {
+				t.Fatalf("any result used wrong source: %#v", pol)
+			}
+		case 2:
+			if pol.StopLoss != "6%" || pol.StakeRate != 0.75 || pol.Filters[0].Items["limit"] != 2 {
+				t.Fatalf("explicit long result used wrong source: %#v", pol)
+			}
+		default:
+			t.Fatalf("unexpected winner source: %#v", pol)
+		}
 	}
 }
 

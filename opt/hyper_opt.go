@@ -226,7 +226,7 @@ func pickFromExists(path string, picker, pairPicker string, sources []*config.Ru
 	if len(paths) == 0 {
 		return "", nil
 	}
-	return collectOptLog(paths, 0, picker, pairPicker, sources)
+	return collectOptLogWithHints(paths, 0, picker, pairPicker, sources, indexedLogSourceHints(path, paths, sources))
 }
 
 /*
@@ -301,6 +301,7 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 		}
 	}
 	var logOuts []string
+	var sourceHints map[string]*config.RunPolicyConfig
 	groups := config.RunPolicy
 	if len(groups) <= 1 || args.Concur <= 1 {
 		logOuts = append(logOuts, args.OutPath)
@@ -319,6 +320,9 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 		}
 		file.Close()
 		sortOptLogs(args.OutPath)
+		if len(groups) == 1 {
+			sourceHints = map[string]*config.RunPolicyConfig{args.OutPath: groups[0]}
+		}
 	} else {
 		// Multi-process execution to improve speed.
 		// 多进程执行，提高速度。
@@ -331,6 +335,7 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 		startStr := strconv.FormatInt(config.TimeRange.StartMS/1000, 10)
 		endStr := strconv.FormatInt(config.TimeRange.EndMS/1000, 10)
 		logOuts = optimizeLogPaths(args.OutPath, len(groups))
+		sourceHints = mapLogSources(logOuts, groups)
 		err = utils.ParallelRun(groups, args.Concur, func(i int, pol *config.RunPolicyConfig) *errs.Error {
 			core.Sleep(time.Millisecond * time.Duration(1000*rand.Float64()+100*float64(i)))
 			iStr := strconv.Itoa(i + 1)
@@ -374,7 +379,7 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 			return "", err
 		}
 	}
-	return collectOptLog(logOuts, minScore, args.Picker, args.PairPicker, groups)
+	return collectOptLogWithHints(logOuts, minScore, args.Picker, args.PairPicker, groups, sourceHints)
 }
 
 const optDataPreparedEnv = "BANBOT_OPT_DATA_PREPARED"
@@ -400,6 +405,37 @@ func optimizeLogPaths(outPath string, count int) []string {
 		paths[i] = outPath + "." + strconv.Itoa(i+1)
 	}
 	return paths
+}
+
+func mapLogSources(paths []string, sources []*config.RunPolicyConfig) map[string]*config.RunPolicyConfig {
+	if len(paths) != len(sources) {
+		return nil
+	}
+	res := make(map[string]*config.RunPolicyConfig, len(paths))
+	for i, path := range paths {
+		res[path] = sources[i]
+	}
+	return res
+}
+
+func indexedLogSourceHints(basePath string, paths []string, sources []*config.RunPolicyConfig) map[string]*config.RunPolicyConfig {
+	if len(paths) == 1 && len(sources) == 1 {
+		return mapLogSources(paths, sources)
+	}
+	if len(paths) != len(sources) {
+		return nil
+	}
+	pathSet := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		pathSet[path] = true
+	}
+	expected := optimizeLogPaths(basePath, len(sources))
+	for _, path := range expected {
+		if !pathSet[path] {
+			return nil
+		}
+	}
+	return mapLogSources(expected, sources)
 }
 
 func optimizeChildArgs(base []string, configPath, outPath string) []string {
@@ -540,6 +576,7 @@ func optAndPrint(pol *config.RunPolicyConfig, args *config.CmdArgs, allPairs []s
 	startDt := btime.ToDateStr(config.TimeRange.StartMS, "")
 	endDt := btime.ToDateStr(config.TimeRange.EndMS, "")
 	file.WriteString(fmt.Sprintf("# date range: %v - %v\n", startDt, endDt))
+	file.WriteString(optSourceLine(pol) + "\n")
 	var res []*GroupScore
 	if args.EachPairs {
 		pairs := pol.Pairs
@@ -573,6 +610,12 @@ func optAndPrint(pol *config.RunPolicyConfig, args *config.CmdArgs, allPairs []s
 		}
 	}
 	return nil
+}
+
+const optSourcePrefix = "# source_policy: "
+
+func optSourceLine(pol *config.RunPolicyConfig) string {
+	return optSourcePrefix + policySourceKey(pol)
 }
 
 /*
@@ -876,11 +919,17 @@ func CollectOptLog(args *config.CmdArgs) *errs.Error {
 }
 
 func collectOptLog(paths []string, minScore float64, picker, pairSel string, sources []*config.RunPolicyConfig) (string, *errs.Error) {
+	return collectOptLogWithHints(paths, minScore, picker, pairSel, sources, nil)
+}
+
+func collectOptLogWithHints(paths []string, minScore float64, picker, pairSel string, sources []*config.RunPolicyConfig,
+	sourceHints map[string]*config.RunPolicyConfig) (string, *errs.Error) {
 	res := make([]*OptGroup, 0)
 	detailDir := ""
 	for _, path := range paths {
 		var name, pair, dirt, tfStr string
 		var source *config.RunPolicyConfig
+		originSource := sourceHints[path]
 		inUnion := false
 		var items []*OptInfo
 		var long, short, both, union, longMain, shortMain *OptInfo
@@ -968,6 +1017,26 @@ func collectOptLog(paths []string, minScore float64, picker, pairSel string, sou
 		outs = append(outs, lines[:2]...)
 		for _, line := range lines[2:] {
 			outs = append(outs, line)
+			if strings.HasPrefix(line, optSourcePrefix) {
+				saveGroup()
+				key := strings.TrimSpace(strings.TrimPrefix(line, optSourcePrefix))
+				if hinted := sourceHints[path]; hinted != nil {
+					if policySourceKey(hinted) != key {
+						return "", errs.NewMsg(errs.CodeRunTime, "source run policy marker mismatch in %s", path)
+					}
+					originSource = hinted
+				} else {
+					var ambiguous bool
+					originSource, ambiguous = findSourcePolicyByKey(sources, key)
+					if ambiguous {
+						return "", errs.NewMsg(errs.CodeRunTime, "multiple source run policies match marker %s", key)
+					}
+					if originSource == nil && len(sources) > 0 {
+						return "", errs.NewMsg(errs.CodeRunTime, "no source run policy matches marker %s", key)
+					}
+				}
+				continue
+			}
 			if strings.HasPrefix(line, "loss:") {
 				opt := parseOptLine(line)
 				items = append(items, opt)
@@ -1076,13 +1145,20 @@ func collectOptLog(paths []string, minScore float64, picker, pairSel string, sou
 					saveGroup()
 				}
 				name, dirt, tfStr, pair = n, d, t, p
-				var ambiguous bool
-				source, ambiguous = findSourcePolicy(sources, n, d, t, p)
-				if ambiguous {
-					return "", errs.NewMsg(errs.CodeRunTime, "multiple source run policies match optimize section %s", sectionTitle)
-				}
-				if source == nil && len(sources) > 0 {
-					return "", errs.NewMsg(errs.CodeRunTime, "no source run policy matches optimize section %s", sectionTitle)
+				if originSource != nil {
+					if !sourcePolicyMatchesSection(originSource, n, d, t, p) {
+						return "", errs.NewMsg(errs.CodeRunTime, "source run policy does not match optimize section %s", sectionTitle)
+					}
+					source = originSource
+				} else {
+					var ambiguous bool
+					source, ambiguous = findSourcePolicy(sources, n, d, t, p)
+					if ambiguous {
+						return "", errs.NewMsg(errs.CodeRunTime, "multiple source run policies match optimize section %s", sectionTitle)
+					}
+					if source == nil && len(sources) > 0 {
+						return "", errs.NewMsg(errs.CodeRunTime, "no source run policy matches optimize section %s", sectionTitle)
+					}
 				}
 				inUnion = false
 			} else if strings.HasPrefix(line, "========== union") {
@@ -1122,47 +1198,57 @@ func collectOptLog(paths []string, minScore float64, picker, pairSel string, sou
 }
 
 func findSourcePolicy(sources []*config.RunPolicyConfig, name, dirt, tfStr, pairStr string) (*config.RunPolicyConfig, bool) {
-	var exact, wildcards []*config.RunPolicyConfig
+	var matches []*config.RunPolicyConfig
 	for _, pol := range sources {
-		polDirt := strings.TrimSpace(pol.Dirt)
-		if pol.Name != name || strings.Join(pol.RunTimeframes, "|") != tfStr || polDirt != "any" && polDirt != dirt {
-			continue
-		}
-		pairsMatch := true
-		if len(pol.Pairs) > 0 && pairStr != "" && strings.Join(pol.Pairs, "|") != pairStr {
-			pairMap := make(map[string]bool, len(pol.Pairs))
-			for _, pair := range pol.Pairs {
-				pairMap[pair] = true
-			}
-			for _, pair := range strings.Split(pairStr, "|") {
-				if !pairMap[pair] {
-					pairsMatch = false
-					break
-				}
-			}
-		}
-		if !pairsMatch {
-			continue
-		}
-		if polDirt == "any" {
-			wildcards = append(wildcards, pol)
-		} else {
-			exact = append(exact, pol)
+		if sourcePolicyMatchesSection(pol, name, dirt, tfStr, pairStr) {
+			matches = append(matches, pol)
 		}
 	}
-	if len(exact) > 1 {
+	if len(matches) > 1 {
 		return nil, true
 	}
-	if len(exact) == 1 {
-		return exact[0], false
-	}
-	if len(wildcards) > 1 {
-		return nil, true
-	}
-	if len(wildcards) == 1 {
-		return wildcards[0], false
+	if len(matches) == 1 {
+		return matches[0], false
 	}
 	return nil, false
+}
+
+func sourcePolicyMatchesSection(pol *config.RunPolicyConfig, name, dirt, tfStr, pairStr string) bool {
+	polDirt := strings.TrimSpace(pol.Dirt)
+	if pol.Name != name || strings.Join(pol.RunTimeframes, "|") != tfStr || polDirt != "any" && polDirt != dirt {
+		return false
+	}
+	if len(pol.Pairs) == 0 || pairStr == "" || strings.Join(pol.Pairs, "|") == pairStr {
+		return true
+	}
+	pairMap := make(map[string]bool, len(pol.Pairs))
+	for _, pair := range pol.Pairs {
+		pairMap[pair] = true
+	}
+	for _, pair := range strings.Split(pairStr, "|") {
+		if !pairMap[pair] {
+			return false
+		}
+	}
+	return true
+}
+
+func policySourceKey(pol *config.RunPolicyConfig) string {
+	return utils.MD5([]byte(pol.ToYaml()))
+}
+
+func findSourcePolicyByKey(sources []*config.RunPolicyConfig, key string) (*config.RunPolicyConfig, bool) {
+	var match *config.RunPolicyConfig
+	for _, pol := range sources {
+		if policySourceKey(pol) != key {
+			continue
+		}
+		if match != nil {
+			return nil, true
+		}
+		match = pol
+	}
+	return match, false
 }
 
 /*
