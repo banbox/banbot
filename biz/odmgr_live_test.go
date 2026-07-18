@@ -261,7 +261,6 @@ func TestSyncPairOrdersRecognizesRecentClosedOrder(t *testing.T) {
 }
 
 func TestLoadRecentClosedOrdersUsesExchangeHistoryWindow(t *testing.T) {
-	const taskID = int64(162_000)
 	now := int64(1_700_000_000_000)
 	monthMS := int64(30 * 24 * time.Hour / time.Millisecond)
 	since := exchangeOrderHistorySince(now, 0)
@@ -277,6 +276,11 @@ func TestLoadRecentClosedOrdersUsesExchangeHistoryWindow(t *testing.T) {
 		t.Fatalf("open trade repository: %v", err)
 	}
 	ctx := context.Background()
+	task, addErr := sess.AddTask(ctx, ormo.AddTaskParams{Mode: "test", Name: t.Name(), CreateAt: now})
+	if addErr != nil {
+		t.Fatalf("insert test task: %v", addErr)
+	}
+	taskID := task.ID
 	insertClosed := func(exitAt int64, exID string) int64 {
 		id, addErr := sess.AddIOrder(ctx, ormo.AddIOrderParams{
 			TaskID: taskID, Symbol: "ISSUE162/USDT:USDT", Timeframe: "1m",
