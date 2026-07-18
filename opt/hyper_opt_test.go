@@ -71,6 +71,82 @@ func TestParseSectionTitlePreservesSlashPairs(t *testing.T) {
 	}
 }
 
+func TestFindSourcePolicyDistinguishesDirection(t *testing.T) {
+	long := &config.RunPolicyConfig{
+		Name:          "DirectionProbe",
+		Dirt:          "long",
+		RunTimeframes: []string{"1h"},
+		Pairs:         []string{"BTC/USDT:USDT"},
+		StopLoss:      "2%",
+		StakeRate:     1.25,
+	}
+	short := &config.RunPolicyConfig{
+		Name:          "DirectionProbe",
+		Dirt:          "short",
+		RunTimeframes: []string{"1h"},
+		Pairs:         []string{"BTC/USDT:USDT"},
+		StopLoss:      "6%",
+		StakeRate:     0.75,
+	}
+	sources := []*config.RunPolicyConfig{long, short}
+
+	if got, ambiguous := findSourcePolicy(sources, "DirectionProbe", "short", "1h", "BTC/USDT:USDT"); got != short || ambiguous {
+		t.Fatalf("short section matched source %#v, want %#v", got, short)
+	}
+	if got, ambiguous := findSourcePolicy(sources, "DirectionProbe", "long", "1h", "BTC/USDT:USDT"); got != long || ambiguous {
+		t.Fatalf("long section matched source %#v, want %#v", got, long)
+	}
+	any := &config.RunPolicyConfig{Name: "AnyProbe", Dirt: "any", RunTimeframes: []string{"1h"}}
+	for _, dirt := range []string{"", "long", "short"} {
+		if got, ambiguous := findSourcePolicy([]*config.RunPolicyConfig{any}, "AnyProbe", dirt, "1h", ""); got != any || ambiguous {
+			t.Fatalf("any policy did not match %q section: %#v, ambiguous=%v", dirt, got, ambiguous)
+		}
+	}
+	any.Name = long.Name
+	if got, ambiguous := findSourcePolicy([]*config.RunPolicyConfig{any, long}, long.Name, "long", "1h", "BTC/USDT:USDT"); got != long || ambiguous {
+		t.Fatalf("exact long policy did not outrank any: %#v, ambiguous=%v", got, ambiguous)
+	}
+	if got, ambiguous := findSourcePolicy([]*config.RunPolicyConfig{any, long}, long.Name, "short", "1h", "BTC/USDT:USDT"); got != any || ambiguous {
+		t.Fatalf("any policy did not cover missing short direction: %#v, ambiguous=%v", got, ambiguous)
+	}
+}
+
+func TestFindSourcePolicyRejectsAmbiguousDirection(t *testing.T) {
+	sources := []*config.RunPolicyConfig{
+		{Name: "AmbiguousProbe", Dirt: "long", RunTimeframes: []string{"1h"}, StopLoss: "2%"},
+		{Name: "AmbiguousProbe", Dirt: "long", RunTimeframes: []string{"1h"}, StopLoss: "6%"},
+	}
+	if got, ambiguous := findSourcePolicy(sources, "AmbiguousProbe", "long", "1h", ""); got != nil || !ambiguous {
+		t.Fatalf("ambiguous section result = %#v, ambiguous=%v", got, ambiguous)
+	}
+	wildcards := []*config.RunPolicyConfig{
+		{Name: "WildcardProbe", Dirt: "any", RunTimeframes: []string{"1h"}, StopLoss: "2%"},
+		{Name: "WildcardProbe", Dirt: "any", RunTimeframes: []string{"1h"}, StopLoss: "6%"},
+	}
+	if got, ambiguous := findSourcePolicy(wildcards, "WildcardProbe", "short", "1h", ""); got != nil || !ambiguous {
+		t.Fatalf("ambiguous wildcard result = %#v, ambiguous=%v", got, ambiguous)
+	}
+}
+
+func TestCollectOptLogRejectsAmbiguousSourcePolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opt.log")
+	logText := strings.Join([]string{
+		"# run hyper optimize: bayes, rounds: 1",
+		"# date range: test",
+		"============== AmbiguousProbe:l/1h/ =============",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(logText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sources := []*config.RunPolicyConfig{
+		{Name: "AmbiguousProbe", Dirt: "long", RunTimeframes: []string{"1h"}, StopLoss: "2%"},
+		{Name: "AmbiguousProbe", Dirt: "long", RunTimeframes: []string{"1h"}, StopLoss: "6%"},
+	}
+	if _, err := collectOptLog([]string{path}, 0, "score", "", sources); err == nil || !strings.Contains(err.Error(), "multiple source run policies") {
+		t.Fatalf("ambiguous collect error = %v", err)
+	}
+}
+
 func TestOptInfoToPolPreservesSourcePolicy(t *testing.T) {
 	source := &config.RunPolicyConfig{
 		Name:          "Demo",

@@ -1076,7 +1076,11 @@ func collectOptLog(paths []string, minScore float64, picker, pairSel string, sou
 					saveGroup()
 				}
 				name, dirt, tfStr, pair = n, d, t, p
-				source = findSourcePolicy(sources, n, t, p)
+				var ambiguous bool
+				source, ambiguous = findSourcePolicy(sources, n, d, t, p)
+				if ambiguous {
+					return "", errs.NewMsg(errs.CodeRunTime, "multiple source run policies match optimize section %s", sectionTitle)
+				}
 				if source == nil && len(sources) > 0 {
 					return "", errs.NewMsg(errs.CodeRunTime, "no source run policy matches optimize section %s", sectionTitle)
 				}
@@ -1117,30 +1121,48 @@ func collectOptLog(paths []string, minScore float64, picker, pairSel string, sou
 	return b.String(), nil
 }
 
-func findSourcePolicy(sources []*config.RunPolicyConfig, name, tfStr, pairStr string) *config.RunPolicyConfig {
+func findSourcePolicy(sources []*config.RunPolicyConfig, name, dirt, tfStr, pairStr string) (*config.RunPolicyConfig, bool) {
+	var exact, wildcards []*config.RunPolicyConfig
 	for _, pol := range sources {
-		if pol.Name != name || strings.Join(pol.RunTimeframes, "|") != tfStr {
+		polDirt := strings.TrimSpace(pol.Dirt)
+		if pol.Name != name || strings.Join(pol.RunTimeframes, "|") != tfStr || polDirt != "any" && polDirt != dirt {
 			continue
 		}
-		if len(pol.Pairs) == 0 || pairStr == "" || strings.Join(pol.Pairs, "|") == pairStr {
-			return pol
-		}
-		pairMap := make(map[string]bool, len(pol.Pairs))
-		for _, pair := range pol.Pairs {
-			pairMap[pair] = true
-		}
-		matched := true
-		for _, pair := range strings.Split(pairStr, "|") {
-			if !pairMap[pair] {
-				matched = false
-				break
+		pairsMatch := true
+		if len(pol.Pairs) > 0 && pairStr != "" && strings.Join(pol.Pairs, "|") != pairStr {
+			pairMap := make(map[string]bool, len(pol.Pairs))
+			for _, pair := range pol.Pairs {
+				pairMap[pair] = true
+			}
+			for _, pair := range strings.Split(pairStr, "|") {
+				if !pairMap[pair] {
+					pairsMatch = false
+					break
+				}
 			}
 		}
-		if matched {
-			return pol
+		if !pairsMatch {
+			continue
+		}
+		if polDirt == "any" {
+			wildcards = append(wildcards, pol)
+		} else {
+			exact = append(exact, pol)
 		}
 	}
-	return nil
+	if len(exact) > 1 {
+		return nil, true
+	}
+	if len(exact) == 1 {
+		return exact[0], false
+	}
+	if len(wildcards) > 1 {
+		return nil, true
+	}
+	if len(wildcards) == 1 {
+		return wildcards[0], false
+	}
+	return nil, false
 }
 
 /*
