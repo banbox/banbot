@@ -341,6 +341,11 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		lock.Unlock()
 		return oldList, nil, nil, nil
 	}
+	historySince := exchangeOrderHistorySince(btime.UTCStamp(), lastOrderMS)
+	recentClosed, err := loadRecentClosedOrders(task.ID, historySince)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	// Get exchange positions
 	// 获取交易所仓位
 	posList, err := exchange.FetchAccountPositions(nil, map[string]interface{}{
@@ -379,7 +384,7 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 			}
 		}
 		prevTF, _ := pairLastTfs[pair]
-		err = o.syncPairOrders(pair, prevTF, longPos, shortPos, lastOrderMS, curOds)
+		err = o.syncPairOrders(pair, prevTF, longPos, shortPos, historySince, curOds, recentClosed)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -424,6 +429,24 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		log.Error("SaveDirtyODs fail", zap.String("acc", o.Account), zap.Error(err))
 	}
 	return oldList, newList, delList, nil
+}
+
+func exchangeOrderHistorySince(curMS, lastOrderMS int64) int64 {
+	monthMS := int64(utils2.TFToSecs("1M") * 1000)
+	return max(lastOrderMS, curMS-monthMS)
+}
+
+func loadRecentClosedOrders(taskID, sinceMS int64) ([]*ormo.InOutOrder, *errs.Error) {
+	sess, conn, err := ormo.Conn(orm.DbTrades, false)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return sess.GetOrders(ormo.GetOrdersArgs{
+		TaskID:     taskID,
+		Status:     2,
+		CloseAfter: sinceMS,
+	})
 }
 
 func loadOpenOrders(taskID int64, account string) ([]*ormo.InOutOrder, map[string]string, *errs.Error) {
@@ -591,16 +614,14 @@ For the specified currency, synchronize the exchange order status to the local m
 sinceMS是本地记录的已处理交易所最新订单时间戳，只获取此后的订单，同步状态到本地。
 */
 func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *banexg.Position, sinceMS int64,
-	openOds map[int64]*ormo.InOutOrder) *errs.Error {
+	openOds map[int64]*ormo.InOutOrder, recentClosed []*ormo.InOutOrder) *errs.Error {
 	var exOrders []*banexg.Order
 	var err *errs.Error
 	var curMS = btime.UTCStamp()
 	// Get exchange order history and try to restore the order status.
 	// 从交易所获取订单记录，尝试恢复订单状态。
 	// 这里必须指定sinceMS，避免获取过早的订单创建冗余本地记录
-	monMSecs := int64(utils2.TFToSecs("1M") * 1000)
-	minSince := curMS - monMSecs
-	exOrders, err = exg.Default.FetchOrders(pair, max(sinceMS, minSince), 300, map[string]interface{}{
+	exOrders, err = exg.Default.FetchOrders(pair, sinceMS, 300, map[string]interface{}{
 		banexg.ParamAccount:   o.Account,
 		banexg.ParamUntil:     curMS,
 		banexg.ParamLoopIntv:  int64(utils2.TFToSecs("7d") * 1000),
@@ -618,22 +639,14 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 		shortPosAmt = shortPos.Contracts
 	}
 	if len(openOds) > 0 {
-		exIdMap := make(map[string]*ormo.InOutOrder)
-		for _, iod := range openOds {
-			if iod.Enter != nil && iod.Enter.OrderID != "" {
-				exIdMap[iod.Enter.OrderID] = iod
-			}
-			if iod.Exit != nil && iod.Exit.OrderID != "" {
-				exIdMap[iod.Exit.OrderID] = iod
-			}
-		}
+		knownOds, exIdMap := indexHistoricalOrders(pair, recentClosed, openOds)
 		for _, exod := range exOrders {
 			if !banexg.IsOrderDone(exod.Status) {
 				// Skip uncompleted orders
 				// 跳过未完成订单
 				continue
 			}
-			err = o.applyHisOrder(openOds, exIdMap, exod, defTF)
+			err = o.applyHisOrder(openOds, knownOds, exIdMap, exod, defTF)
 			if err != nil {
 				return err
 			}
@@ -762,6 +775,58 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 	return nil
 }
 
+func indexHistoricalOrders(pair string, recentClosed []*ormo.InOutOrder,
+	openOds map[int64]*ormo.InOutOrder) (map[int64]*ormo.InOutOrder, map[string]*ormo.InOutOrder) {
+	knownOds := make(map[int64]*ormo.InOutOrder, len(recentClosed)+len(openOds))
+	// A present nil value blocks ambiguous IDs from reaching heuristic matching.
+	exIDMap := make(map[string]*ormo.InOutOrder)
+	for _, od := range recentClosed {
+		if od == nil || od.Symbol != pair {
+			continue
+		}
+		knownOds[od.ID] = od
+		indexHistoricalExchangeIDs(exIDMap, od)
+	}
+	openExIDs := make(map[string]*ormo.InOutOrder)
+	for _, od := range openOds {
+		if od == nil || od.Symbol != pair {
+			continue
+		}
+		knownOds[od.ID] = od
+		indexHistoricalExchangeIDs(openExIDs, od)
+	}
+	for id, od := range openExIDs {
+		exIDMap[id] = od
+	}
+	return knownOds, exIDMap
+}
+
+func indexHistoricalExchangeIDs(dst map[string]*ormo.InOutOrder, od *ormo.InOutOrder) {
+	ids := make([]string, 0, 5)
+	for _, sub := range []*ormo.ExOrder{od.Enter, od.Exit} {
+		if sub != nil {
+			ids = append(ids, sub.OrderID)
+		}
+	}
+	for _, trigger := range []*ormo.TriggerState{od.GetStopLoss(), od.GetTakeProfit()} {
+		if trigger != nil {
+			ids = append(ids, trigger.OrderId)
+		}
+	}
+	ids = append(ids, od.GetInfoString(ormo.OdInfoTrailingID))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		current, exists := dst[id]
+		if exists && current != od {
+			dst[id] = nil
+		} else if !exists {
+			dst[id] = od
+		}
+	}
+}
+
 func getFeeNameCost(fee *banexg.Fee, pair, odType, side string, amount, price float64) (string, float64, float64) {
 	isMaker := false
 	if fee != nil {
@@ -780,23 +845,23 @@ func getFeeNameCost(fee *banexg.Fee, pair, odType, side string, amount, price fl
 	return fee.Currency, fee.Cost, fee.QuoteCost
 }
 
-func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map[string]*ormo.InOutOrder, od *banexg.Order, defTF string) *errs.Error {
+func (o *LiveOrderMgr) applyHisOrder(openOds, knownOds map[int64]*ormo.InOutOrder,
+	exIdMap map[string]*ormo.InOutOrder, od *banexg.Order, defTF string) *errs.Error {
 	if od.Filled == 0 {
 		return nil
 	}
 	isShort := od.PositionSide == banexg.PosSideShort
 	isSell := od.Side == banexg.OdSideSell
-	exs, err := orm.GetExSymbolCur(od.Symbol)
-	if err != nil {
-		return err
-	}
-	feeName, feeCost, feeQuote := getFeeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Filled, od.Average)
-	price, amount, odTime := od.Average, od.Filled, od.Timestamp
-	defTF = config.GetTakeOverTF(od.Symbol, defTF)
 
 	var inOut *ormo.InOutOrder
 	var exOd *ormo.ExOrder
+	var err *errs.Error
 	if iod, ok := exIdMap[od.ID]; ok {
+		if iod == nil {
+			log.Warn("skip ambiguous historical exchange order", zap.String("acc", o.Account),
+				zap.String("pair", od.Symbol), zap.String("orderId", od.ID))
+			return nil
+		}
 		// 通过订单id直接匹配
 		if iod.Enter != nil && iod.Enter.OrderID == od.ID {
 			exOd = iod.Enter
@@ -809,7 +874,7 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 		// 通过ClientOrderID解析目标订单
 		iodID := getClientOrderId(od.ClientOrderID)
 		if iodID > 0 {
-			if iod, ok := ods[iodID]; ok {
+			if iod, ok := knownOds[iodID]; ok {
 				if isShort == isSell {
 					exOd = iod.Enter
 				} else {
@@ -819,6 +884,8 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 			}
 		}
 	}
+	feeName, feeCost, feeQuote := getFeeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Filled, od.Average)
+	price, amount, odTime := od.Average, od.Filled, od.Timestamp
 	if exOd != nil {
 		if exOd.Enter {
 			inOut.SetInfo(odInfoLocalTrigger, nil)
@@ -854,6 +921,27 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 		}
 		return nil
 	}
+	if inOut != nil {
+		if isShort == isSell {
+			log.Warn("skip historical entry with incomplete local identity", zap.String("acc", o.Account),
+				zap.String("pair", od.Symbol), zap.String("orderId", od.ID), zap.Int64("localId", inOut.ID))
+			return nil
+		}
+		return o.updateByMyTrade(inOut, &banexg.MyTrade{
+			Trade: banexg.Trade{
+				ID: od.ID, Symbol: od.Symbol, Side: od.Side, Type: od.Type, Amount: od.Amount,
+				Price: od.Average, Order: od.ID, Timestamp: od.Timestamp,
+				Fee: &banexg.Fee{Currency: feeName, Cost: feeCost, QuoteCost: feeQuote},
+			},
+			Filled: od.Filled, ClientID: od.ClientOrderID, Average: od.Average,
+			State: od.Status, PosSide: od.PositionSide, ReduceOnly: od.ReduceOnly,
+		})
+	}
+	exs, err := orm.GetExSymbolCur(od.Symbol)
+	if err != nil {
+		return err
+	}
+	defTF = config.GetTakeOverTF(od.Symbol, defTF)
 	if isShort == isSell {
 		// Open long or short 开多或开空
 		if defTF == "" {
@@ -873,12 +961,12 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 		if err != nil {
 			return err
 		}
-		ods[iod.ID] = iod
+		openOds[iod.ID] = iod
 	} else {
 		// Close long or short 平多或平空
 		var part *ormo.InOutOrder
 		var feeLeft float64
-		for _, iod := range ods {
+		for _, iod := range openOds {
 			if iod.Short != isShort || iod.RealEnterMS() > odTime {
 				continue
 			}
@@ -924,7 +1012,7 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 			if err != nil {
 				return err
 			}
-			ods[iod.ID] = iod
+			openOds[iod.ID] = iod
 		}
 	}
 	return nil
