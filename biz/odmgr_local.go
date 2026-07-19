@@ -589,6 +589,7 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noE
 }
 
 func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
+	sortOrdersForBacktest(orders)
 	for _, od := range orders {
 		_, err := o.exitOrder(od, req)
 		if err != nil {

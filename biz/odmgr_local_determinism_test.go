@@ -4,11 +4,13 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
@@ -81,6 +83,44 @@ func TestFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
 	}
 }
 
+func TestExitAndFillUsesStableBusinessOrder(t *testing.T) {
+	oldExchange := exg.Default
+	oldBackTest := core.BackTestMode
+	oldEnvReal := core.EnvReal
+	oldLiveMode := core.LiveMode
+	exg.Default = &issue155Exchange{}
+	core.BackTestMode = true
+	core.EnvReal = true
+	core.LiveMode = false
+	com.SetBarPrice("ISSUE155/USDT", 100)
+	t.Cleanup(func() {
+		exg.Default = oldExchange
+		core.BackTestMode = oldBackTest
+		core.EnvReal = oldEnvReal
+		core.LiveMode = oldLiveMode
+	})
+
+	permutations := [][]int64{{11, 12, 13}, {13, 12, 11}, {12, 13, 11}}
+	for _, permutation := range permutations {
+		var callbackIDs []int64
+		mgr := &LocalOrderMgr{OrderMgr: OrderMgr{Account: config.DefAcc}}
+		mgr.callBack = func(od *ormo.InOutOrder, _ bool) {
+			callbackIDs = append(callbackIDs, od.ID)
+		}
+		orders := make([]*ormo.InOutOrder, 0, len(permutation))
+		for _, id := range permutation {
+			orders = append(orders, issue155OpenOrder(id, "ISSUE155/USDT"))
+		}
+
+		if err := mgr.ExitAndFill(orders, &strat.ExitReq{Tag: "issue155", Force: true}); err != nil {
+			t.Fatalf("permutation %v: ExitAndFill() error: %v", permutation, err)
+		}
+		if !slices.Equal(callbackIDs, []int64{11, 12, 13}) {
+			t.Errorf("permutation %v: callback order = %v, want [11 12 13]", permutation, callbackIDs)
+		}
+	}
+}
+
 func issue155PendingExit(id int64, symbol string) *ormo.InOutOrder {
 	return &ormo.InOutOrder{
 		IOrder: &ormo.IOrder{
@@ -96,4 +136,11 @@ func issue155PendingExit(id int64, symbol string) *ormo.InOutOrder {
 			CreateAt: 1_699_999_940_000, Amount: 1, Status: ormo.OdStatusInit,
 		},
 	}
+}
+
+func issue155OpenOrder(id int64, symbol string) *ormo.InOutOrder {
+	od := issue155PendingExit(id, symbol)
+	od.ExitTag = ""
+	od.Exit = nil
+	return od
 }
