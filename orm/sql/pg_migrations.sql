@@ -71,3 +71,36 @@ ALTER TABLE exsymbol
 -- version 5
 ALTER TABLE exsymbol
     ADD COLUMN IF NOT EXISTS agg_rules text NOT NULL DEFAULT '';
+
+-- version 6
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'calendars'
+          AND column_name = 'name'
+    ) AND NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'calendars'
+          AND column_name = 'market'
+    ) THEN
+        ALTER TABLE public.calendars RENAME COLUMN name TO market;
+    END IF;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_calendars_market
+    ON public.calendars (market);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_calendars_market_start
+    ON public.calendars (market, start_ms);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_adj_factors_sid_sub_start
+    ON public.adj_factors (sid, sub_id, start_ms);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ins_kline_sid_tf_pkey
+    ON public.ins_kline (sid, timeframe);
