@@ -39,6 +39,7 @@ func RunCmd() {
 
 	installSignalHandler()
 	deadlock.Opts.Disable = true
+	cobra.MousetrapHelpText = ""
 	if err := Execute(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		core.RunExitCalls()
