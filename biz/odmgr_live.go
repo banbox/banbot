@@ -19,6 +19,7 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/bybit"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
@@ -57,6 +58,8 @@ const (
 	AmtDust                          = 1e-8
 	odInfoLocalTrigger               = "LocalTrigger"
 	restoreAmbiguousExgData          = "ambiguous_exchange_entries"
+	openOrderSnapshotLimit           = 1000
+	bybitOpenOrderPageLimit          = 50
 	pendingMarketEntryReconcileAfter = 20 * time.Second
 	defaultMyTradeWatchRetry         = 5 * time.Second
 )
@@ -282,17 +285,14 @@ For redundant positions, treat them as new orders opened by the user and create 
 */
 func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
 	EnsurePricesLoaded()
-	exchange := exg.Default
 	task := ormo.GetTask(o.Account)
 	// Get the exchange order
 	// 获取交易所挂单
-	exOdList, err := exchange.FetchOpenOrders("", task.CreateAt, 1000, map[string]interface{}{
-		banexg.ParamAccount:     o.Account,
-		banexg.ParamSettleCoins: config.StakeCurrency,
-	})
+	exOdList, err := fetchAccountOpenOrders(o.Account, task.CreateAt)
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	exchange := exg.Default
 	exgOdMap := make(map[string]*banexg.Order)
 	for _, od := range exOdList {
 		exgOdMap[od.ID] = od
@@ -301,6 +301,7 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	o.restoreExchangeTriggers(orders, exOdList)
 	openOds, lock := ormo.GetOpenODs(o.Account)
 	var lastOrderMS int64
 	var openPairs = map[string]struct{}{}
@@ -424,11 +425,199 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 	if len(newList) > 0 {
 		log.Info(fmt.Sprintf("%s: Started tracking %v users' orders", o.Account, len(newList)))
 	}
+	o.healMissingFullEnterTriggers(resOdList, exOdList)
 	err = ormo.SaveDirtyODs(orm.DbTrades, o.Account)
 	if err != nil {
 		log.Error("SaveDirtyODs fail", zap.String("acc", o.Account), zap.Error(err))
 	}
 	return oldList, newList, delList, nil
+}
+
+func fetchAccountOpenOrders(account string, since int64) ([]*banexg.Order, *errs.Error) {
+	if core.ExgName == "bybit" {
+		return fetchBybitAccountOpenOrders(account, since)
+	}
+	params := map[string]interface{}{
+		banexg.ParamAccount:     account,
+		banexg.ParamSettleCoins: config.StakeCurrency,
+	}
+	orders, err := exg.Default.FetchOpenOrders("", since, openOrderSnapshotLimit, params)
+	if err != nil {
+		return nil, err
+	}
+	if core.ExgName == "okx" && len(orders) >= 100 {
+		return nil, errs.NewMsg(errs.CodeRunTime, "open order snapshot reached OKX page limit")
+	}
+	if len(orders) >= openOrderSnapshotLimit {
+		return nil, errs.NewMsg(errs.CodeRunTime, "open order snapshot reached caller limit")
+	}
+	if !usesAlgoExitTriggers() {
+		return orders, nil
+	}
+	algoParams := map[string]interface{}{
+		banexg.ParamAccount:     account,
+		banexg.ParamAlgoOrder:   true,
+		banexg.ParamSettleCoins: config.StakeCurrency,
+	}
+	if core.ExgName == "okx" {
+		// OKX requires ordType. Query each type explicitly because the adapter's
+		// aggregate request is best-effort and can hide a failed subtype request.
+		algoOrders := make([]*banexg.Order, 0)
+		for _, ordType := range []string{"conditional", "oco", "trigger", "move_order_stop", "twap", "chase"} {
+			algoParams["ordType"] = ordType
+			orders, err := exg.Default.FetchOpenOrders("", since, openOrderSnapshotLimit, algoParams)
+			if err != nil {
+				return nil, err
+			}
+			if len(orders) >= 100 {
+				return nil, errs.NewMsg(errs.CodeRunTime,
+					"open OKX algo order snapshot reached page limit: type=%s", ordType)
+			}
+			algoOrders = append(algoOrders, orders...)
+		}
+		return append(orders, algoOrders...), nil
+	}
+	algoOrders, err := exg.Default.FetchOpenOrders("", since, openOrderSnapshotLimit, algoParams)
+	if err != nil {
+		return nil, err
+	}
+	if len(algoOrders) >= openOrderSnapshotLimit {
+		return nil, errs.NewMsg(errs.CodeRunTime, "open algo order snapshot reached caller limit")
+	}
+	return append(orders, algoOrders...), nil
+}
+
+func fetchBybitAccountOpenOrders(account string, since int64) ([]*banexg.Order, *errs.Error) {
+	category := core.Market
+	if category == banexg.MarketMargin {
+		category = banexg.MarketSpot
+	}
+	switch category {
+	case banexg.MarketSpot, banexg.MarketLinear, banexg.MarketInverse, banexg.MarketOption:
+	default:
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "unsupported Bybit market for open orders: %s", core.Market)
+	}
+	settleCoins := config.StakeCurrency
+	if category == banexg.MarketSpot {
+		settleCoins = []string{""}
+	} else if len(settleCoins) == 0 {
+		return nil, errs.NewMsg(errs.CodeParamRequired, "settle currency required for Bybit open orders")
+	}
+	result := make([]*banexg.Order, 0)
+	seen := make(map[string]bool)
+	for _, settleCoin := range settleCoins {
+		orders, err := fetchBybitOpenOrdersBySettle(account, category, settleCoin, since)
+		if err != nil {
+			return nil, err
+		}
+		for _, od := range orders {
+			key := od.ID
+			if key == "" {
+				key = od.Symbol + ":" + od.ClientOrderID
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			result = append(result, od)
+		}
+	}
+	return result, nil
+}
+
+func fetchBybitOpenOrdersBySettle(account, category, settleCoin string, since int64) ([]*banexg.Order, *errs.Error) {
+	result := make([]*banexg.Order, 0)
+	cursor := ""
+	seenCursors := map[string]bool{"": true}
+	for {
+		rawOrders, nextCursor, err := fetchBybitOpenOrderPage(account, category, settleCoin, cursor)
+		if err != nil {
+			return nil, err
+		}
+		params := map[string]interface{}{
+			banexg.ParamAccount: account,
+			banexg.ParamMarket:  category,
+		}
+		if settleCoin != "" {
+			params["settleCoin"] = settleCoin
+		}
+		if cursor != "" {
+			params[banexg.ParamAfter] = cursor
+		}
+		orders, err := exg.Default.FetchOpenOrders("", since, bybitOpenOrderPageLimit, params)
+		if err != nil {
+			return nil, err
+		}
+		if err = verifyBybitOpenOrderPage(rawOrders, orders); err != nil {
+			return nil, err
+		}
+		result = append(result, orders...)
+		if nextCursor == "" {
+			return result, nil
+		}
+		if seenCursors[nextCursor] {
+			return nil, errs.NewMsg(errs.CodeRunTime, "repeated Bybit open-order cursor: %s", nextCursor)
+		}
+		seenCursors[nextCursor] = true
+		cursor = nextCursor
+	}
+}
+
+func fetchBybitOpenOrderPage(account, category, settleCoin, cursor string) ([]map[string]interface{}, string, *errs.Error) {
+	params := map[string]interface{}{
+		banexg.ParamAccount: account,
+		"category":          category,
+		"limit":             bybitOpenOrderPageLimit,
+	}
+	if settleCoin != "" {
+		params["settleCoin"] = settleCoin
+	}
+	if cursor != "" {
+		params["cursor"] = cursor
+	}
+	rsp, err := exg.Default.Call(bybit.MethodPrivateGetV5OrderRealtime, params)
+	if err != nil {
+		return nil, "", err
+	}
+	var page bybit.V5Resp[bybit.V5ListResult]
+	if jsonErr := utils2.UnmarshalString(rsp.Content, &page, utils2.JsonNumDefault); jsonErr != nil {
+		return nil, "", errs.New(errs.CodeUnmarshalFail, jsonErr)
+	}
+	if page.RetCode != 0 {
+		return nil, "", errs.NewMsg(errs.CodeExchangeError, "Bybit open orders: %s", page.RetMsg)
+	}
+	return page.Result.List, page.Result.NextPageCursor, nil
+}
+
+func verifyBybitOpenOrderPage(rawOrders []map[string]interface{}, orders []*banexg.Order) *errs.Error {
+	rawIDs := make(map[string]bool, len(rawOrders))
+	for _, item := range rawOrders {
+		id := utils2.GetMapVal(item, "orderId", "")
+		if id == "" {
+			return errs.NewMsg(errs.CodeUnmarshalFail, "Bybit open order has no orderId")
+		}
+		rawIDs[id] = true
+	}
+	parsedIDs := make(map[string]bool, len(orders))
+	for _, od := range orders {
+		if od == nil || od.ID == "" {
+			return errs.NewMsg(errs.CodeUnmarshalFail, "parsed Bybit open order has no orderId")
+		}
+		parsedIDs[od.ID] = true
+	}
+	if len(rawIDs) != len(parsedIDs) {
+		return errs.NewMsg(errs.CodeRunTime, "Bybit open-order page changed during reconciliation")
+	}
+	for id := range rawIDs {
+		if !parsedIDs[id] {
+			return errs.NewMsg(errs.CodeRunTime, "Bybit open-order page changed during reconciliation")
+		}
+	}
+	return nil
+}
+
+func usesAlgoExitTriggers() bool {
+	return core.ExgName == "okx" || core.ExgName == "binance" && core.Market == banexg.MarketLinear
 }
 
 func exchangeOrderHistorySince(curMS, lastOrderMS int64) int64 {
@@ -887,7 +1076,6 @@ func (o *LiveOrderMgr) applyHisOrder(openOds, knownOds map[int64]*ormo.InOutOrde
 	feeName, feeCost, feeQuote := getFeeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Filled, od.Average)
 	price, amount, odTime := od.Average, od.Filled, od.Timestamp
 	if exOd != nil {
-		wasFullEnter := inOut.Status == ormo.InOutStatusFullEnter
 		if exOd.Enter {
 			inOut.SetInfo(odInfoLocalTrigger, nil)
 		}
@@ -918,9 +1106,6 @@ func (o *LiveOrderMgr) applyHisOrder(openOds, knownOds map[int64]*ormo.InOutOrde
 			err = inOut.Save()
 			if err != nil {
 				return err
-			}
-			if exOd.Enter && !wasFullEnter && inOut.Status == ormo.InOutStatusFullEnter {
-				o.healMissingFullEnterTriggers([]*ormo.InOutOrder{inOut})
 			}
 		}
 		return nil
@@ -2594,21 +2779,233 @@ func isMissingFullEnterTrigger(od *ormo.InOutOrder, key string) bool {
 		!(key == ormo.OdInfoStopLoss && tg.Tag == core.ExitTagTrailingStop)
 }
 
-func (o *LiveOrderMgr) healMissingFullEnterTriggers(ods []*ormo.InOutOrder) {
+func exchangeTriggerTypeKey(od *banexg.Order) string {
+	if od == nil {
+		return ""
+	}
+	hasTakeProfit := od.TakeProfitPrice > 0
+	hasStopLoss := od.StopLossPrice > 0
+	if hasTakeProfit && hasStopLoss {
+		return "?"
+	}
+	if hasTakeProfit {
+		return ormo.OdInfoTakeProfit
+	}
+	if hasStopLoss {
+		return ormo.OdInfoStopLoss
+	}
+	odType := strings.ToLower(od.Type)
+	if strings.Contains(odType, "trailing") {
+		return ""
+	}
+	if strings.Contains(odType, "take_profit") {
+		return ormo.OdInfoTakeProfit
+	}
+	if strings.Contains(odType, "stop_loss") {
+		return ormo.OdInfoStopLoss
+	}
+	return "?"
+}
+
+func triggerValueMatches(want, got float64) bool {
+	scale := max(math.Abs(want), math.Abs(got))
+	return math.Abs(want-got) <= max(AmtDust, scale*1e-8)
+}
+
+func exchangeTriggerPrice(od *banexg.Order, key string) (float64, bool) {
+	if key == ormo.OdInfoStopLoss {
+		if od.TakeProfitPrice > 0 {
+			return 0, false
+		}
+		if od.StopLossPrice > 0 {
+			return od.StopLossPrice, true
+		}
+	} else {
+		if od.StopLossPrice > 0 {
+			return 0, false
+		}
+		if od.TakeProfitPrice > 0 {
+			return od.TakeProfitPrice, true
+		}
+	}
+	price := od.TriggerPrice
+	if price <= 0 {
+		price = od.StopPrice
+	}
+	return price, price > 0
+}
+
+func legacyExchangeTriggerMatches(od *ormo.InOutOrder, key string, exOd *banexg.Order) bool {
+	tg := od.GetExitTrigger(key)
+	if tg == nil || tg.ExitTrigger == nil || tg.Price <= 0 {
+		return false
+	}
+	typeKey := exchangeTriggerTypeKey(exOd)
+	if typeKey == "" || typeKey != "?" && typeKey != key {
+		return false
+	}
+	price, ok := exchangeTriggerPrice(exOd, key)
+	if !ok || !triggerValueMatches(tg.Price, price) {
+		return false
+	}
+	if tg.Limit > 0 {
+		if exOd.Price <= 0 || !triggerValueMatches(tg.Limit, exOd.Price) {
+			return false
+		}
+	} else if exOd.Price > AmtDust {
+		return false
+	}
+	wantAmount := od.HoldAmount()
+	if tg.Rate > 0 && tg.Rate < 1 {
+		wantAmount *= tg.Rate
+	}
+	return exOd.Amount > AmtDust && triggerValueMatches(wantAmount, exOd.Amount)
+}
+
+func isExchangeTriggerFor(od *ormo.InOutOrder, exOd *banexg.Order) bool {
+	if od == nil || exOd == nil || exOd.ID == "" || exOd.ClientOrderID == "" || exOd.Symbol != od.Symbol ||
+		getClientOrderId(exOd.ClientOrderID) != od.ID || banexg.IsOrderDone(exOd.Status) {
+		return false
+	}
+	if od.Enter != nil && exOd.ID == od.Enter.OrderID || od.Exit != nil && exOd.ID == od.Exit.OrderID ||
+		exOd.ID == od.GetInfoString(ormo.OdInfoTrailingID) {
+		return false
+	}
+	wantSide := banexg.OdSideSell
+	wantPos := banexg.PosSideLong
+	if od.Short {
+		wantSide = banexg.OdSideBuy
+		wantPos = banexg.PosSideShort
+	}
+	return (exOd.Side == "" || exOd.Side == wantSide) &&
+		(exOd.PositionSide == "" || exOd.PositionSide == wantPos)
+}
+
+func (o *LiveOrderMgr) restoreExchangeTriggersLocked(od *ormo.InOutOrder, exOds []*banexg.Order) map[string]bool {
+	type candidate struct {
+		order *banexg.Order
+		key   string
+	}
+	candidates := make([]candidate, 0)
+	blocked := map[string]bool{}
+	for _, exOd := range exOds {
+		if !isExchangeTriggerFor(od, exOd) {
+			continue
+		}
+		key := exchangeTriggerTypeKey(exOd)
+		if key == "" {
+			continue
+		}
+		if key == "?" {
+			matchesStop := legacyExchangeTriggerMatches(od, ormo.OdInfoStopLoss, exOd)
+			matchesTake := legacyExchangeTriggerMatches(od, ormo.OdInfoTakeProfit, exOd)
+			if matchesStop != matchesTake {
+				if matchesStop {
+					key = ormo.OdInfoStopLoss
+				} else {
+					key = ormo.OdInfoTakeProfit
+				}
+			}
+		} else if !legacyExchangeTriggerMatches(od, key, exOd) {
+			key = "?"
+		}
+		candidates = append(candidates, candidate{order: exOd, key: key})
+	}
+	used := make(map[*banexg.Order]bool)
+	for _, key := range []string{ormo.OdInfoStopLoss, ormo.OdInfoTakeProfit} {
+		tg := od.GetExitTrigger(key)
+		if tg == nil || tg.OrderId != "" || tg.ClientId == "" {
+			continue
+		}
+		var exact []*banexg.Order
+		for _, item := range candidates {
+			if item.order.ClientOrderID == tg.ClientId {
+				exact = append(exact, item.order)
+			}
+		}
+		if len(exact) != 1 {
+			if len(exact) > 1 {
+				blocked[key] = true
+			}
+			continue
+		}
+		exOd := exact[0]
+		tg.OrderId = exOd.ID
+		tg.ClientId = exOd.ClientOrderID
+		tg.SaveOld()
+		od.DirtyInfo = true
+		used[exOd] = true
+	}
+	for _, key := range []string{ormo.OdInfoStopLoss, ormo.OdInfoTakeProfit} {
+		tg := od.GetExitTrigger(key)
+		if tg == nil || tg.OrderId != "" || blocked[key] {
+			continue
+		}
+		var matches []*banexg.Order
+		hasUnknown := false
+		for _, item := range candidates {
+			if used[item.order] {
+				continue
+			}
+			if item.key == "?" {
+				hasUnknown = true
+			} else if item.key == key {
+				matches = append(matches, item.order)
+			}
+		}
+		if tg.ClientId != "" {
+			if !hasUnknown && len(matches) == 0 {
+				continue
+			}
+			blocked[key] = true
+			log.Warn("exchange trigger client ID mismatch", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.String("trigger", key), zap.Int("num", len(matches)))
+			continue
+		}
+		if hasUnknown || len(matches) > 1 {
+			blocked[key] = true
+			log.Warn("ambiguous exchange triggers match local order", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.String("trigger", key), zap.Int("num", len(matches)))
+			continue
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		exOd := matches[0]
+		tg.OrderId = exOd.ID
+		tg.ClientId = exOd.ClientOrderID
+		tg.SaveOld()
+		od.DirtyInfo = true
+		used[exOd] = true
+	}
+	return blocked
+}
+
+func (o *LiveOrderMgr) restoreExchangeTriggers(ods []*ormo.InOutOrder, exOds []*banexg.Order) {
 	for _, od := range ods {
 		if od == nil {
 			continue
 		}
 		lock := od.Lock()
-		attempted := false
+		o.restoreExchangeTriggersLocked(od, exOds)
+		lock.Unlock()
+	}
+}
+
+func (o *LiveOrderMgr) healMissingFullEnterTriggers(ods []*ormo.InOutOrder, exOds []*banexg.Order) {
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		blocked := o.restoreExchangeTriggersLocked(od, exOds)
 		for _, key := range []string{ormo.OdInfoStopLoss, ormo.OdInfoTakeProfit} {
-			if !isMissingFullEnterTrigger(od, key) {
+			if blocked[key] || !isMissingFullEnterTrigger(od, key) {
 				continue
 			}
 			o.editTriggerOd(od, key)
-			attempted = true
 		}
-		if attempted && od.IsDirty() {
+		if od.IsDirty() {
 			if err := od.Save(); err != nil {
 				log.Error("save healed trigger fail", zap.String("acc", o.Account),
 					zap.String("key", od.Key()), zap.Error(err))
@@ -2633,7 +3030,12 @@ func verifyAccountTriggerOds(account string) {
 	if odMgr == nil {
 		return
 	}
-	odMgr.healMissingFullEnterTriggers(getOpenOdsSnapshot(account))
+	exOds, err := fetchAccountOpenOrders(account, 0)
+	if err != nil {
+		log.Error("fetch open orders for trigger verification fail", zap.String("acc", account), zap.Error(err))
+	} else {
+		odMgr.healMissingFullEnterTriggers(getOpenOdsSnapshot(account), exOds)
+	}
 	var saves []*ormo.InOutOrder
 	submitOds := getSubmittedEnterOdsByPair(account)
 	pairs := make(map[string]struct{})
@@ -3122,6 +3524,13 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		clientID = od.ClientId(true)
 		tg.ClientId = clientID
 		od.DirtyInfo = true
+		if tg.OrderId == "" && core.LiveMode {
+			if err := od.Save(); err != nil {
+				log.Error("save trigger client id before create fail", zap.String("acc", o.Account),
+					zap.String("key", od.Key()), zap.String("prefix", prefix), zap.Error(err))
+				return
+			}
+		}
 	}
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
@@ -3146,8 +3555,20 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 			return
 		}
 		params[banexg.ParamStopLossPrice] = tg.Price
+		if core.ExgName == "bybit" {
+			odType = banexg.OdTypeStopMarket
+			if tg.Limit > 0 {
+				odType = banexg.OdTypeStopLossLimit
+			}
+		}
 	} else if prefix == ormo.OdActionTakeProfit {
 		params[banexg.ParamTakeProfitPrice] = tg.Price
+		if core.ExgName == "bybit" {
+			odType = banexg.OdTypeTakeProfitMarket
+			if tg.Limit > 0 {
+				odType = banexg.OdTypeTakeProfitLimit
+			}
+		}
 	} else {
 		log.Error("invalid trigger ", zap.String("prefix", prefix))
 		return
@@ -3173,6 +3594,15 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		zap.Float64("amt", od.HoldAmount()), zap.Float64("qmt", amt),
 		zap.Float64("price", od.Enter.Average))
 	res, err := exg.Default.CreateOrder(od.Symbol, odType, side, amt, price, params)
+	if err != nil {
+		if err.Code == errs.CodeDuplicateRequest {
+			res, err = o.fetchTriggerByClientID(od.Symbol, clientID)
+			if err == nil && (res == nil || res.ID == "" || banexg.IsOrderDone(res.Status) ||
+				res.ClientOrderID != "" && res.ClientOrderID != clientID || res.Symbol != "" && res.Symbol != od.Symbol) {
+				err = errs.NewMsg(errs.CodeDataNotFound, "duplicate trigger lookup returned no open order")
+			}
+		}
+	}
 	if err != nil {
 		if err.Code == errs.CodeOrderWouldTrigger {
 			// Stop loss and stop profit are executed immediately, and the position is closed at the market price
@@ -3219,6 +3649,17 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 			o.lockDoneKeys.Unlock()
 		}
 	}
+}
+
+func (o *LiveOrderMgr) fetchTriggerByClientID(symbol, clientID string) (*banexg.Order, *errs.Error) {
+	params := map[string]interface{}{
+		banexg.ParamAccount:       o.Account,
+		banexg.ParamClientOrderId: clientID,
+	}
+	if usesAlgoExitTriggers() {
+		params[banexg.ParamAlgoOrder] = true
+	}
+	return exg.Default.FetchOrder(symbol, "", params)
 }
 
 func (o *LiveOrderMgr) checkTradeDone(k string) bool {
