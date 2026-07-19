@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/llm"
 	"gopkg.in/yaml.v3"
 )
 
@@ -185,6 +186,51 @@ func TestRunPolicyToYamlRoundTrip(t *testing.T) {
 	}
 }
 
+func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
+	temperature := 0.25
+	orig := &Config{
+		CloseOnStuck: 7,
+		NTPLangCode:  "en-US",
+		ShowLangCode: "zh-CN",
+		BTInLive: &BtInLiveConfig{
+			Cron: "0 3 * * *", Acount: "primary", MailTo: []string{"ops@example.com"},
+		},
+		TimeFrames: "1h,4h",
+		LLMModels: map[string]*llm.LLMModelConfig{
+			"primary": {
+				Name: "gpt-probe", APIType: "openai", APIKey: "llm-secret", BaseURL: "https://llm.example",
+				Temperature: &temperature,
+				Payload:     map[string]interface{}{"response_format": map[string]interface{}{"type": "json_object"}},
+			},
+		},
+	}
+
+	clone := orig.Clone()
+	if clone.CloseOnStuck != orig.CloseOnStuck || clone.NTPLangCode != orig.NTPLangCode ||
+		clone.ShowLangCode != orig.ShowLangCode || clone.TimeFrames != orig.TimeFrames ||
+		!reflect.DeepEqual(clone.BTInLive, orig.BTInLive) || !reflect.DeepEqual(clone.LLMModels, orig.LLMModels) {
+		t.Fatalf("config clone lost fields:\n got: %#v\nwant: %#v", clone, orig)
+	}
+	clone.BTInLive.MailTo[0] = "changed@example.com"
+	clone.LLMModels["primary"].BaseURL = "https://changed.example"
+	*clone.LLMModels["primary"].Temperature = 1
+	clone.LLMModels["primary"].Payload["response_format"].(map[string]interface{})["type"] = "text"
+	if orig.BTInLive.MailTo[0] != "ops@example.com" || orig.LLMModels["primary"].BaseURL != "https://llm.example" ||
+		*orig.LLMModels["primary"].Temperature != 0.25 ||
+		orig.LLMModels["primary"].Payload["response_format"].(map[string]interface{})["type"] != "json_object" {
+		t.Fatal("config clone shares omitted mutable fields")
+	}
+
+	sanitized := orig.Desensitize()
+	model := sanitized.LLMModels["primary"]
+	if model == nil || model.APIKey != "" || model.Name != "gpt-probe" || model.BaseURL != "https://llm.example" {
+		t.Fatalf("LLM model secret retained or non-sensitive fields lost: %#v", model)
+	}
+	if orig.LLMModels["primary"].APIKey != "llm-secret" {
+		t.Fatal("desensitizing LLM config mutated the source")
+	}
+}
+
 func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 	oldData := Data
 	oldExchange := Exchange
@@ -228,6 +274,9 @@ func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 			}},
 		},
 		Mail: &MailConfig{Username: "mailer", Password: "mail-password"},
+		LLMModels: map[string]*llm.LLMModelConfig{
+			"primary": {Name: "gpt-probe", APIKey: "llm-secret", BaseURL: "https://llm.example"},
+		},
 	}
 
 	first, err := DumpYaml(true)
@@ -244,7 +293,7 @@ func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 	for _, secret := range []string{
 		"prod-key", "prod-secret", "prod-password", "test-key", "test-secret", "test-password",
 		"account-password", "db-password", "telegram-token", "telegram-chat", "jwt-secret",
-		"operator-password", "mail-password",
+		"operator-password", "mail-password", "llm-secret",
 	} {
 		if strings.Contains(string(first), secret) {
 			t.Fatalf("desensitized YAML contains %q:\n%s", secret, first)
@@ -288,5 +337,8 @@ func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 	if sanitized.APIServer.JWTSecretKey != "" || sanitized.APIServer.Users[0].Password != "" ||
 		sanitized.APIServer.Users[0].AllowIPs[0] != "10.0.0.1" {
 		t.Fatal("API server secret was retained or non-sensitive fields were dropped")
+	}
+	if model := sanitized.LLMModels["primary"]; model == nil || model.APIKey != "" || model.BaseURL != "https://llm.example" {
+		t.Fatal("LLM secret was retained or non-sensitive fields were dropped")
 	}
 }

@@ -876,7 +876,7 @@ func (c *Config) ShowPairs() string {
 }
 
 func (c *Config) Clone() *Config {
-	return &Config{
+	res := &Config{
 		Name:             c.Name,
 		Env:              c.Env,
 		Leverage:         c.Leverage,
@@ -893,6 +893,7 @@ func (c *Config) Clone() *Config {
 		MarginAddRate:    c.MarginAddRate,
 		ChargeOnBomb:     c.ChargeOnBomb,
 		TakeOverStrat:    c.TakeOverStrat,
+		CloseOnStuck:     c.CloseOnStuck,
 		StakeAmount:      c.StakeAmount,
 		StakePct:         c.StakePct,
 		MaxStakeAmt:      c.MaxStakeAmt,
@@ -901,6 +902,8 @@ func (c *Config) Clone() *Config {
 		LowCostAction:    c.LowCostAction,
 		BTNetCost:        c.BTNetCost,
 		RelaySimUnFinish: c.RelaySimUnFinish,
+		NTPLangCode:      c.NTPLangCode,
+		ShowLangCode:     c.ShowLangCode,
 		OrderBarMax:      c.OrderBarMax,
 		MaxOpenOrders:    c.MaxOpenOrders,
 		MaxSimulOpen:     c.MaxSimulOpen,
@@ -913,6 +916,7 @@ func (c *Config) Clone() *Config {
 		TimeStart:        c.TimeStart,
 		TimeEnd:          c.TimeEnd,
 		TimeRange:        c.TimeRange,
+		TimeFrames:       c.TimeFrames,
 		RunTimeframes:    c.RunTimeframes,
 		KlineSource:      c.KlineSource,
 		WatchJobs:        c.WatchJobs,
@@ -926,6 +930,29 @@ func (c *Config) Clone() *Config {
 		Accounts:         c.Accounts,
 		Exchange:         c.Exchange,
 	}
+	if c.BTInLive != nil {
+		item := *c.BTInLive
+		item.MailTo = slices.Clone(c.BTInLive.MailTo)
+		res.BTInLive = &item
+	}
+	if c.LLMModels != nil {
+		res.LLMModels = make(map[string]*llm.LLMModelConfig, len(c.LLMModels))
+		for name, model := range c.LLMModels {
+			if model == nil {
+				res.LLMModels[name] = nil
+				continue
+			}
+			item := *model
+			item.Extend = cloneConfigValue(model.Extend)
+			item.Payload = cloneStringMap(model.Payload)
+			if model.Temperature != nil {
+				temperature := *model.Temperature
+				item.Temperature = &temperature
+			}
+			res.LLMModels[name] = &item
+		}
+	}
+	return res
 }
 
 /*
@@ -936,6 +963,7 @@ exchange.account_*.*.(api_key|api_secret)
 rpc_channels.*.*secret
 api_server.jwt_secret_key
 api_server.users[*].pwd
+llm_models.*.api_key
 */
 func (c *Config) Desensitize() *Config {
 	var res = c.Clone()
@@ -1006,6 +1034,11 @@ func (c *Config) Desensitize() *Config {
 			}
 		}
 		res.APIServer = &item
+	}
+	for _, model := range res.LLMModels {
+		if model != nil {
+			model.APIKey = ""
+		}
 	}
 
 	return res
