@@ -11,8 +11,25 @@ import (
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/banexg/errs"
 	"gopkg.in/yaml.v3"
 )
+
+func TestRunBayesReturnsFirstTrialError(t *testing.T) {
+	runErr := errs.NewMsg(core.ErrRunTime, "trial backtest failed")
+	calls := 0
+	err := runBayes(4, []*core.Param{{Name: "period", Min: 1, Max: 10}}, func(map[string]float64) (float64, *errs.Error) {
+		calls++
+		return 0, runErr
+	})
+	if err != runErr {
+		t.Fatalf("runBayes error = %v, want original trial error", err)
+	}
+	if calls != 1 {
+		t.Fatalf("trial callback calls = %d, want 1", calls)
+	}
+}
 
 func TestResetOptimizeTrialStakePctAmt(t *testing.T) {
 	oldAccounts := config.Accounts

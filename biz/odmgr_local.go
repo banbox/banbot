@@ -22,13 +22,18 @@ import (
 
 type LocalOrderMgr struct {
 	OrderMgr
-	showLog  bool
-	zeroAmts map[string]int
+	showLog      bool
+	zeroAmts     map[string]int
+	stopBacktest func()
 }
 
 type FnOdCb = func(od *ormo.InOutOrder, isEnter bool)
 
-func InitLocalOrderMgr(callBack FnOdCb, showLog bool) {
+func InitLocalOrderMgr(callBack FnOdCb, showLog bool, stops ...func()) {
+	stopBacktest := core.StopAll
+	if len(stops) > 0 {
+		stopBacktest = stops[0]
+	}
 	for account, cfg := range config.Accounts {
 		if cfg.NoTrade {
 			continue
@@ -40,8 +45,9 @@ func InitLocalOrderMgr(callBack FnOdCb, showLog bool) {
 					callBack: callBack,
 					Account:  account,
 				},
-				showLog:  showLog,
-				zeroAmts: make(map[string]int),
+				showLog:      showLog,
+				zeroAmts:     make(map[string]int),
+				stopBacktest: stopBacktest,
 			}
 			odMgr.afterEnter = makeLocalAfterEnter(odMgr)
 			accOdMgrs[account] = odMgr
@@ -542,7 +548,11 @@ func (o *LocalOrderMgr) onLowFunds() {
 	value := wallets.TotalLegal(nil, false)
 	if value < core.MinStakeAmount {
 		log.Warn("wallet low funds, no open orders, stop backTest..")
-		core.StopAll()
+		if o.stopBacktest != nil {
+			o.stopBacktest()
+		} else if core.StopAll != nil {
+			core.StopAll()
+		}
 		core.BotRunning = false
 	}
 }

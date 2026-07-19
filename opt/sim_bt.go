@@ -72,7 +72,9 @@ func RunSimBT(args *config.CmdArgs) *errs.Error {
 		if err != nil {
 			return err
 		}
-		bt.Run()
+		if err = bt.Run(); err != nil {
+			return err
+		}
 
 		// 收集订单
 		allOrders = append(allOrders, ormo.HistODs...)

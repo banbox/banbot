@@ -108,13 +108,17 @@ func calcBestBy(items []*OptInfo, name string) *OptInfo {
 	return res
 }
 
-func (o *OptInfo) runGetBtResult(pol *config.RunPolicyConfig) {
+func (o *OptInfo) runGetBtResult(pol *config.RunPolicyConfig) *errs.Error {
 	for k, v := range o.Params {
 		pol.Params[k] = v
 	}
-	bt, loss := runBTOnce()
+	bt, loss, err := runBTOnce()
+	if err != nil {
+		return err
+	}
 	o.Score = -loss
 	o.BTResult = bt.BTResult
+	return nil
 }
 
 func (o *OptInfo) ToPol(source *config.RunPolicyConfig, idx int, name, dirt, tfStr, pairStr string) *config.RunPolicyConfig {

@@ -88,7 +88,9 @@ func RunBTOverOpt(args *config.CmdArgs) *errs.Error {
 			bt.BTResult = lastRes
 		}
 		ormo.HistODs = allHisOds
-		bt.Run()
+		if err = bt.Run(); err != nil {
+			return err
+		}
 		lastRes = bt.BTResult
 		allHisOds = ormo.HistODs
 		lastWal = wallets.DumpAvas()
@@ -156,7 +158,9 @@ func RunRollBTPicker(args *config.CmdArgs) *errs.Error {
 			if err != nil {
 				return err
 			}
-			bt.Run()
+			if err = bt.Run(); err != nil {
+				return err
+			}
 			score := bt.Score()
 			scores = append(scores, score)
 			row = append(row, strconv.FormatFloat(score, 'f', 1, 64))
@@ -586,7 +590,10 @@ func optAndPrint(pol *config.RunPolicyConfig, args *config.CmdArgs, allPairs []s
 		res = make([]*GroupScore, 0, len(pairs))
 		for _, p := range pairs {
 			pol.Pairs = []string{p}
-			item := optForGroup(pol, args.Sampler, args.Picker, args.OptRounds, file)
+			item, err := optForGroup(pol, args.Sampler, args.Picker, args.OptRounds, file)
+			if err != nil {
+				return err
+			}
 			if item != nil {
 				res = append(res, item)
 			}
@@ -595,7 +602,10 @@ func optAndPrint(pol *config.RunPolicyConfig, args *config.CmdArgs, allPairs []s
 			return res[i].Score > res[j].Score
 		})
 	} else {
-		item := optForGroup(pol, args.Sampler, args.Picker, args.OptRounds, file)
+		item, err := optForGroup(pol, args.Sampler, args.Picker, args.OptRounds, file)
+		if err != nil {
+			return err
+		}
 		if item != nil {
 			res = append(res, item)
 		}
@@ -623,7 +633,7 @@ optForGroup
 Optimize the hyperparameters of a policy and automatically search for the best combination of long, short, and both.
 对某个策略超参数调优，自动搜索long/short/both的最佳组合。
 */
-func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int, flog *os.File) *GroupScore {
+func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int, flog *os.File) (*GroupScore, *errs.Error) {
 	groups := make([]*config.RunPolicyConfig, 0, 3)
 	var long, short, both *config.RunPolicyConfig
 	if pol.Dirt == "any" {
@@ -642,7 +652,10 @@ func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int,
 	var bestPols []*config.RunPolicyConfig
 	for _, p := range groups {
 		config.RunPolicy = []*config.RunPolicyConfig{p}
-		orderNum := optForPol(p, method, picker, rounds, flog)
+		orderNum, err := optForPol(p, method, picker, rounds, flog)
+		if err != nil {
+			return nil, err
+		}
 		if p.Score > bestScore {
 			bestOdNum = orderNum
 			bestScore = p.Score
@@ -650,7 +663,7 @@ func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int,
 		}
 	}
 	if len(groups) == 1 {
-		return &GroupScore{groups, bestScore}
+		return &GroupScore{groups, bestScore}, nil
 	}
 	// long,short,both分别评估
 	minScore := min(long.Score, short.Score)
@@ -658,8 +671,13 @@ func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int,
 	if minScore > 0 && maxScore > 0 {
 		// 检查组合的是否优于long/short/both
 		flog.WriteString("\n========== union long/short ============\n")
-		_ = config.SetRunPolicy(true, long, short)
-		bt, loss := runBTOnce()
+		if err := config.SetRunPolicy(true, long, short); err != nil {
+			return nil, err
+		}
+		bt, loss, err := runBTOnce()
+		if err != nil {
+			return nil, err
+		}
 		line := fmt.Sprintf("loss: %5.2f \t%v\n", loss, bt.BriefLine())
 		flog.WriteString(line)
 		log.Warn(line)
@@ -675,23 +693,29 @@ func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int,
 	if minScore < 0 || maxScore > minScore*5 {
 		// The long and short returns are seriously unbalanced, the parameters with high fixed returns remain unchanged, and the parameters with low returns are fine-tuned to find the best score of the combination
 		// 多空收益严重不均衡，固定收益高的参数不变，微调收益低的参数，寻找组合最佳分数
-		_ = config.SetRunPolicy(true, long, short)
+		if err := config.SetRunPolicy(true, long, short); err != nil {
+			return nil, err
+		}
 		var unionScore float64
 		if long.Score > short.Score {
-			optForPol(short, method, picker, rounds, flog)
+			if _, err := optForPol(short, method, picker, rounds, flog); err != nil {
+				return nil, err
+			}
 			unionScore = short.Score
 		} else {
-			optForPol(long, method, picker, rounds, flog)
+			if _, err := optForPol(long, method, picker, rounds, flog); err != nil {
+				return nil, err
+			}
 			unionScore = long.Score
 		}
 		if unionScore > bestScore {
-			return &GroupScore{[]*config.RunPolicyConfig{long, short}, unionScore}
+			return &GroupScore{[]*config.RunPolicyConfig{long, short}, unionScore}, nil
 		}
 	}
 	if len(bestPols) > 0 {
-		return &GroupScore{bestPols, bestScore}
+		return &GroupScore{bestPols, bestScore}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 type GroupScore struct {
@@ -706,7 +730,7 @@ Before calling this method, you need to set 'config. RunPolicy`
 对策略任务执行优化，支持bayes/tpe/cames等
 调用此方法前需要设置 `config.RunPolicy`
 */
-func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, flog *os.File) int {
+func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, flog *os.File) (int, *errs.Error) {
 	title := pol.Key()
 	// 重置PairParams，避免影响传入参数
 	pol.PairParams = make(map[string]map[string]float64)
@@ -715,13 +739,13 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 	params := pol.HyperParams()
 	if len(params) == 0 {
 		log.Warn("no hyper params, skip optimize", zap.String("strat", title))
-		return 0
+		return 0, nil
 	}
 	detailDir := filepath.Join(filepath.Dir(flog.Name()), "detail")
 	err_ := utils.EnsureDir(detailDir, 0755)
 	if err_ != nil {
 		log.Warn("create detail dir fail", zap.String("path", detailDir), zap.Error(err_))
-		return 0
+		return 0, errs.New(core.ErrIOWriteFail, err_)
 	}
 	flog.WriteString(fmt.Sprintf("\n============== %s =============\n", title))
 	var resList = make([]*OptInfo, 0, rounds)
@@ -732,7 +756,10 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 			pol.Params[k] = v
 			ints[k] = pol.IsInt(k)
 		}
-		bt, loss := runBTOnce()
+		bt, loss, err := runBTOnce()
+		if err != nil {
+			return 0, err
+		}
 		o := &OptInfo{Score: -loss, Params: data, Ints: ints, BTResult: bt.BTResult, ID: jobId}
 		line := o.ToLine()
 		flog.WriteString(line + "\n")
@@ -748,33 +775,37 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 	} else {
 		err = runGOptuna(method, rounds, params, runOptJob)
 	}
+	if err != nil {
+		return 0, err
+	}
 	best := calcBestBy(resList, picker)
 	if best.BTResult == nil {
 		best.ID = utils.RandomStr(6)
-		best.runGetBtResult(pol)
+		if err = best.runGetBtResult(pol); err != nil {
+			return 0, err
+		}
 		best.dumpDetail(filepath.Join(detailDir, best.ID+".json"))
 	}
 	line := fmt.Sprintf("[%s] %s", picker, best.ToLine())
 	flog.WriteString(line + "\n")
 	log.Warn(line)
-	if err != nil {
-		log.Error("optimize fail", zap.String("job", title), zap.Error(err))
-	}
 	pol.Params = best.Params
 	pol.Score = best.Score
-	return best.OrderNum
+	return best.OrderNum, nil
 }
 
-func runBTOnce() (*BackTest, float64) {
+func runBTOnce() (*BackTest, float64, *errs.Error) {
 	core.BotRunning = true
 	resetOptimizeTrialVars()
 	bt, err := NewBackTest(true, "")
 	if err != nil {
-		panic(err)
+		return nil, 0, err
 	}
-	bt.Run()
+	if err = bt.Run(); err != nil {
+		return nil, 0, err
+	}
 	var loss = -bt.Score()
-	return bt, loss
+	return bt, loss, nil
 }
 
 func resetOptimizeTrialVars() {
@@ -857,7 +888,11 @@ func runBayes(rounds int, params []*core.Param, loop FuncOptTask) *errs.Error {
 		bayesopt.WithRandomRounds(rounds / 2),
 	}
 	opt := bayesopt.New(bysParams, options...)
+	var runErr *errs.Error
 	_, _, err_ := opt.Optimize(func(m map[bayesopt.Param]float64) float64 {
+		if runErr != nil {
+			return 0
+		}
 		var data = make(map[string]float64)
 		for k, v := range m {
 			data[k.GetName()] = v
@@ -865,9 +900,18 @@ func runBayes(rounds int, params []*core.Param, loop FuncOptTask) *errs.Error {
 		for _, p := range params {
 			data[p.Name], _ = p.ToRegular(data[p.Name])
 		}
-		score, _ := loop(data)
+		score, err := loop(data)
+		if err != nil {
+			// bayesopt objectives cannot return errors, so stop and return it after Optimize unwinds.
+			runErr = err
+			opt.Stop()
+			return 0
+		}
 		return score
 	})
+	if runErr != nil {
+		return runErr
+	}
 	if err_ != nil {
 		return errs.New(errs.CodeRunTime, err_)
 	}
@@ -1120,7 +1164,9 @@ func collectOptLogWithHints(paths []string, minScore float64, picker, pairSel st
 						if best.BTResult == nil || len(best.PairGrps) == 0 {
 							best.ID = utils.RandomStr(6)
 							dumpPath = filepath.Join(detailDir, best.ID+".json")
-							best.runGetBtResult(config.RunPolicy[len(config.RunPolicy)-1])
+							if err := best.runGetBtResult(config.RunPolicy[len(config.RunPolicy)-1]); err != nil {
+								return "", err
+							}
 							best.dumpDetail(dumpPath)
 						}
 						l := fmt.Sprintf("[%s] %s", picker, best.ToLine())

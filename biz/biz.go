@@ -438,6 +438,11 @@ func ResetVars() {
 type VarsBackup struct {
 	Pairs         []string
 	PairMap       map[string]bool
+	TFSecs        map[string]int
+	StgPairTfs    map[string]map[string]string
+	OrderMatchTfs map[string]bool
+	BotRunning    bool
+	CheckWallets  bool
 	NoEnterUntil  map[string]int64
 	PairCopiedMs  map[string][2]int64
 	TfPairHits    map[string]map[string]int
@@ -457,15 +462,25 @@ type VarsBackup struct {
 	WsSubJobs     map[string]map[string]map[*strat.StratJob]bool
 	BatchTasks    map[string]*strat.BatchMap
 	ForbidJobs    map[string]map[string]bool
+	StratVersions map[string]int
+	PairHooks     strat.PairUpdateHooks
 	LastBatchMS   int64
 	OrmoBackup    *ormo.VarsBackup
 }
 
 // BackupVars 备份所有全局变量
 func BackupVars() *VarsBackup {
+	core.LockOdMatch.RLock()
+	orderMatchTfs := core.OrderMatchTfs
+	core.LockOdMatch.RUnlock()
 	return &VarsBackup{
 		Pairs:         slices.Clone(core.Pairs),
 		PairMap:       maps.Clone(core.PairsMap),
+		TFSecs:        core.TFSecs,
+		StgPairTfs:    core.StgPairTfs,
+		OrderMatchTfs: orderMatchTfs,
+		BotRunning:    core.BotRunning,
+		CheckWallets:  core.CheckWallets,
 		NoEnterUntil:  core.NoEnterUntil,
 		PairCopiedMs:  com.GetPairCopieds(),
 		TfPairHits:    core.TfPairHits,
@@ -485,6 +500,8 @@ func BackupVars() *VarsBackup {
 		WsSubJobs:     strat.WsSubJobs,
 		BatchTasks:    strat.BatchTasks,
 		ForbidJobs:    strat.ForbidJobs,
+		StratVersions: maps.Clone(strat.Versions),
+		PairHooks:     strat.SnapshotPairUpdateHooks(),
 		LastBatchMS:   strat.LastBatchMS,
 		OrmoBackup:    ormo.BackupVars(),
 	}
@@ -497,6 +514,13 @@ func RestoreVars(backup *VarsBackup) {
 	}
 	core.Pairs = backup.Pairs
 	core.PairsMap = backup.PairMap
+	core.TFSecs = backup.TFSecs
+	core.StgPairTfs = backup.StgPairTfs
+	core.LockOdMatch.Lock()
+	core.OrderMatchTfs = backup.OrderMatchTfs
+	core.LockOdMatch.Unlock()
+	core.BotRunning = backup.BotRunning
+	core.CheckWallets = backup.CheckWallets
 	core.NoEnterUntil = backup.NoEnterUntil
 	com.DelPairCopieds()
 	com.SetPairCopieds(backup.PairCopiedMs)
@@ -517,6 +541,8 @@ func RestoreVars(backup *VarsBackup) {
 	strat.WsSubJobs = backup.WsSubJobs
 	strat.BatchTasks = backup.BatchTasks
 	strat.ForbidJobs = backup.ForbidJobs
+	strat.Versions = backup.StratVersions
+	strat.SetPairUpdateHooks(backup.PairHooks)
 	strat.LastBatchMS = backup.LastBatchMS
 	ormo.RestoreVars(backup.OrmoBackup)
 }

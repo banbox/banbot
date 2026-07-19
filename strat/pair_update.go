@@ -53,6 +53,12 @@ func SetPairUpdateHooks(h PairUpdateHooks) {
 	pairUpdateMgr.mu.Unlock()
 }
 
+func SnapshotPairUpdateHooks() PairUpdateHooks {
+	pairUpdateMgr.mu.Lock()
+	defer pairUpdateMgr.mu.Unlock()
+	return pairUpdateMgr.hooks
+}
+
 func PairUpdateHooksReady() bool {
 	pairUpdateMgr.mu.Lock()
 	defer pairUpdateMgr.mu.Unlock()

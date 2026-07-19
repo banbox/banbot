@@ -31,8 +31,9 @@ const (
 type BackTestLite struct {
 	biz.Trader
 	*BTResult
-	dp    *data.HistProvider
-	isOpt bool // whether is hyper optimization
+	dp     *data.HistProvider
+	isOpt  bool // whether is hyper optimization
+	runErr *errs.Error
 }
 
 type BackTest struct {
@@ -72,7 +73,11 @@ func NewBackTestLite(isOpt bool, onBar data.FnDataSeries, getEnd data.FnGetInt64
 			return biz.GetOdMgr(acc).ExitAndFill(orders, req)
 		},
 	})
-	biz.InitLocalOrderMgr(b.orderCB, !isOpt)
+	stopBacktest := core.StopAll
+	if isOpt {
+		stopBacktest = b.dp.Terminate
+	}
+	biz.InitLocalOrderMgr(b.orderCB, !isOpt, stopBacktest)
 	return b
 }
 
@@ -81,6 +86,7 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 	if errView != nil {
 		if err := b.Trader.FeedDataSeries(evt); err != nil {
 			log.Error("FeedDataSeries fail", zap.Int32("sid", evt.Sid), zap.Error(err))
+			b.setRunError(err)
 			return false
 		}
 		return true
@@ -110,6 +116,7 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 			b.onLiquidation(view.Symbol())
 		} else {
 			log.Error("FeedDataSeries fail", zap.String("p", view.Symbol()), zap.Error(errRun))
+			b.setRunError(errRun)
 		}
 		return false
 	}
@@ -118,6 +125,23 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 		return false
 	}
 	return true
+}
+
+func (b *BackTestLite) setRunError(err *errs.Error) {
+	if err == nil || b.runErr != nil {
+		return
+	}
+	b.runErr = err
+	if b.dp != nil {
+		b.dp.Terminate()
+	}
+}
+
+func (b *BackTestLite) resolveLoopError(err *errs.Error) *errs.Error {
+	if err != nil {
+		return err
+	}
+	return b.runErr
 }
 
 func (b *BackTestLite) onLiquidation(symbol string) {
@@ -131,7 +155,9 @@ func (b *BackTestLite) onLiquidation(symbol string) {
 		log.Warn(fmt.Sprintf("wallet %s BOMB at %s, reset wallet and continue..", symbol, date))
 	} else {
 		log.Warn(fmt.Sprintf("wallet %s BOMB at %s, exit", symbol, date))
-		core.StopAll()
+		if !b.isOpt && core.StopAll != nil {
+			core.StopAll()
+		}
 		b.dp.Terminate()
 	}
 }
@@ -364,10 +390,7 @@ func (b *BackTest) Run() *errs.Error {
 	if loopMainFn == nil {
 		loopMainFn = b.dp.LoopMain
 	}
-	err = loopMainFn()
-	if err == nil && b.dataPrepErr != nil {
-		err = b.dataPrepErr
-	}
+	err = b.resolveLoopError(loopMainFn())
 	if !b.isOpt {
 		com.Cron().Stop()
 	}
@@ -397,6 +420,19 @@ func (b *BackTest) Run() *errs.Error {
 			log.Info("fail open tag nums:\n" + failOpens)
 		}
 		b.printBtResult(true)
+	}
+	return nil
+}
+
+func (b *BackTest) resolveLoopError(err *errs.Error) *errs.Error {
+	if err != nil {
+		return err
+	}
+	if b.dataPrepErr != nil {
+		return b.dataPrepErr
+	}
+	if b.BackTestLite != nil {
+		return b.BackTestLite.resolveLoopError(nil)
 	}
 	return nil
 }
@@ -509,92 +545,102 @@ func RefreshPairJobs(dp data.IProvider, showLog, isFirst bool, pBar *utils.Stage
 获取模拟回测的未完成订单，接力入场；
 应在RefreshJobs之后再调用，否则入场订单可能被视为旧的平仓掉
 */
+func withRelayBacktestState(run func() *errs.Error) *errs.Error {
+	backUp := biz.BackupVars()
+	timeRange := config.TimeRange.Clone()
+	backTime := btime.CurTimeMS
+	backPols := config.RunPolicy
+	backRunMode := core.RunMode
+	backRunEnv := core.RunEnv
+	bakAccs := config.MergeAccounts()
+	defer func() {
+		config.RunPolicy = backPols
+		config.ClearRefineMap()
+		config.TimeRange = timeRange
+		btime.CurTimeMS = backTime
+		biz.RestoreVars(backUp)
+		core.SetRunMode(backRunMode)
+		core.SetRunEnv(backRunEnv)
+		config.Accounts = bakAccs
+	}()
+	core.SetRunMode(core.RunModeBackTest)
+	core.SetRunEnv(backRunEnv)
+	return run()
+}
+
 func relayUnFinishOrders(pairTfScores map[string]map[string]float64, forbidJobs map[string]map[string]bool, isFirst bool) *errs.Error {
 	if !config.RelaySimUnFinish {
 		return nil
 	}
-	// Backup global state
-	// 备份全局状态
-	backUp := biz.BackupVars()
-	timeRange := config.TimeRange.Clone()
-	backTime := btime.CurTimeMS
-	simEndMs := backTime
+	simEndMs := btime.CurTimeMS
 	if core.LiveMode {
 		simEndMs = btime.TimeMS()
 	}
-	backPols := config.RunPolicy
-	backRunMode := core.RunMode
-	core.SetRunMode(core.RunModeBackTest)
-	core.SetRunEnv(core.RunEnv)
-	bakAccs := config.MergeAccounts()
-	// Divide into multiple groups based on the subscription period according to the strategy
-	// 按策略订阅周期划分为多个组
-	groups := strat.RelayPolicyGroups()
 	// pair_tf_stratID
-	var relayOpens = make(map[string]*ormo.InOutOrder)
-	var relayDones = make(map[string]*ormo.InOutOrder)
-	for _, gp := range groups {
-		// Reset global variables, backtest for time range, and search for open orders
-		// 重置全局变量，回测过去一段时间，查找未平仓订单
-		biz.ResetVars()
-		strat.ForbidJobs = forbidJobs
-		btime.CurTimeMS = gp.StartMS
-		config.TimeRange = &config.TimeTuple{
-			StartMS: gp.StartMS,
-			EndMS:   simEndMs,
-		}
-		err := ormo.InitTask(false, "")
-		if err != nil {
-			return err
-		}
-		lite := NewBackTestLite(true, nil, nil, nil)
-		// set policy to run
-		// 重新加载策略任务
-		err = config.SetRunPolicy(false, gp.Policies...)
-		if err != nil {
-			return err
-		}
-		warms, _, err := strat.LoadStratJobs(core.Pairs, pairTfScores)
-		if err != nil {
-			return err
-		}
-		if len(warms) == 0 {
-			// 没有需要预回测的任务
-			continue
-		}
-		err = lite.dp.SubWarmPairs(warms, true)
-		if err != nil {
-			return err
-		}
-		err = lite.dp.LoopMain()
-		if err != nil {
-			return err
-		}
-		// Record the last unfinished orders
-		// 记录最后的未完成订单
-		odMap, lock := ormo.GetOpenODs(config.DefAcc)
-		lock.Lock()
-		for _, od := range odMap {
-			if od.Status >= ormo.InOutStatusPartEnter && od.ExitTag == "" {
-				relayOpens[od.KeyAlign()] = od
-			} else if od.Status >= ormo.InOutStatusFullExit {
+	relayOpens := make(map[string]*ormo.InOutOrder)
+	relayDones := make(map[string]*ormo.InOutOrder)
+	err := withRelayBacktestState(func() *errs.Error {
+		// Divide into multiple groups based on the subscription period according to the strategy
+		// 按策略订阅周期划分为多个组
+		groups := strat.RelayPolicyGroups()
+		for _, gp := range groups {
+			// Reset global variables, backtest for time range, and search for open orders
+			// 重置全局变量，回测过去一段时间，查找未平仓订单
+			biz.ResetVars()
+			strat.ForbidJobs = forbidJobs
+			btime.CurTimeMS = gp.StartMS
+			config.TimeRange = &config.TimeTuple{
+				StartMS: gp.StartMS,
+				EndMS:   simEndMs,
+			}
+			err := ormo.InitTask(false, "")
+			if err != nil {
+				return err
+			}
+			lite := NewBackTestLite(true, nil, nil, nil)
+			// set policy to run
+			// 重新加载策略任务
+			err = config.SetRunPolicy(false, gp.Policies...)
+			if err != nil {
+				return err
+			}
+			warms, _, err := strat.LoadStratJobs(core.Pairs, pairTfScores)
+			if err != nil {
+				return err
+			}
+			if len(warms) == 0 {
+				// 没有需要预回测的任务
+				continue
+			}
+			err = lite.dp.SubWarmPairs(warms, true)
+			if err != nil {
+				return err
+			}
+			err = lite.resolveLoopError(lite.dp.LoopMain())
+			if err != nil {
+				return err
+			}
+			// Record the last unfinished orders
+			// 记录最后的未完成订单
+			odMap, lock := ormo.GetOpenODs(config.DefAcc)
+			lock.Lock()
+			for _, od := range odMap {
+				if od.Status >= ormo.InOutStatusPartEnter && od.ExitTag == "" {
+					relayOpens[od.KeyAlign()] = od
+				} else if od.Status >= ormo.InOutStatusFullExit {
+					relayDones[od.KeyAlign()] = od
+				}
+			}
+			lock.Unlock()
+			for _, od := range ormo.HistODs {
 				relayDones[od.KeyAlign()] = od
 			}
 		}
-		lock.Unlock()
-		for _, od := range ormo.HistODs {
-			relayDones[od.KeyAlign()] = od
-		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	config.RunPolicy = backPols
-	config.TimeRange = timeRange
-	btime.CurTimeMS = backTime
-	// Restore global variables and relay open orders for entry
-	// 恢复全局变量，接力入场未平仓订单
-	biz.RestoreVars(backUp)
-	core.SetRunMode(backRunMode)
-	core.SetRunEnv(core.RunEnv)
-	config.Accounts = bakAccs
 	return syncSimOrders(isFirst, relayOpens, relayDones)
 }
 
