@@ -294,19 +294,8 @@ func listSRangeSids(tables []string) ([]int32, *errs.Error) {
 	unlock := LockCompactTableRead("sranges_q")
 	defer unlock()
 	ctx := context.Background()
-	var whereClause string
-	if len(tables) > 0 {
-		pats := make([]string, 0, len(tables))
-		for _, t := range tables {
-			pats = append(pats, fmt.Sprintf("tbl ~ '%s_.*'", t))
-		}
-		whereClause = "AND (" + strings.Join(pats, " OR ") + ")"
-	}
-	sqlText := fmt.Sprintf(`SELECT DISTINCT sid FROM (
-  SELECT sid, tbl FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms
-  WHERE coalesce(is_deleted, false) = false %s
-) ORDER BY sid`, whereClause)
-	rows, err_ := pool.Query(ctx, sqlText)
+	sqlText, args := listSRangeSidsQuery(tables, IsQuestDB)
+	rows, err_ := pool.Query(ctx, sqlText, args...)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -320,6 +309,32 @@ func listSRangeSids(tables []string) ([]int32, *errs.Error) {
 		sids = append(sids, sid)
 	}
 	return sids, nil
+}
+
+func listSRangeSidsQuery(tables []string, questDB bool) (string, []any) {
+	var predicates []string
+	args := make([]any, 0, len(tables))
+	if len(tables) > 0 {
+		for _, t := range tables {
+			args = append(args, t+"_.*")
+			predicates = append(predicates, fmt.Sprintf("tbl ~ $%d", len(args)))
+		}
+	}
+	if questDB {
+		whereClause := ""
+		if len(predicates) > 0 {
+			whereClause = "AND (" + strings.Join(predicates, " OR ") + ")"
+		}
+		return fmt.Sprintf(`SELECT DISTINCT sid FROM (
+  SELECT sid, tbl FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms
+  WHERE coalesce(is_deleted, false) = false %s
+) ORDER BY sid`, whereClause), args
+	}
+	whereClause := ""
+	if len(predicates) > 0 {
+		whereClause = " WHERE " + strings.Join(predicates, " OR ")
+	}
+	return "SELECT DISTINCT sid FROM sranges" + whereClause + " ORDER BY sid", args
 }
 
 func PrintVerifyResults(results []*VerifyTFResult) {
