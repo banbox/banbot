@@ -67,3 +67,7 @@ ALTER TABLE exsymbol
 -- version 4
 ALTER TABLE exsymbol
     ADD COLUMN IF NOT EXISTS agg_rules text NOT NULL DEFAULT '';
+
+-- version 5
+ALTER TABLE exsymbol
+    ADD COLUMN IF NOT EXISTS agg_rules text NOT NULL DEFAULT '';
