@@ -104,3 +104,53 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_adj_factors_sid_sub_start
 
 CREATE UNIQUE INDEX IF NOT EXISTS ins_kline_sid_tf_pkey
     ON public.ins_kline (sid, timeframe);
+
+-- version 7
+DO $$
+DECLARE
+    target_table text;
+BEGIN
+    FOREACH target_table IN ARRAY ARRAY[
+        'kline_1m', 'kline_5m', 'kline_15m', 'kline_1h', 'kline_1d', 'kline_un'
+    ] LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM information_schema.columns c
+            WHERE c.table_schema = 'public'
+              AND c.table_name = target_table
+              AND c.column_name = 'info'
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM information_schema.columns c
+            WHERE c.table_schema = 'public'
+              AND c.table_name = target_table
+              AND c.column_name = 'buy_volume'
+        ) THEN
+            EXECUTE format(
+                'ALTER TABLE public.%I RENAME COLUMN info TO buy_volume',
+                target_table
+            );
+        END IF;
+
+        EXECUTE format(
+            'ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS quote float8 NOT NULL DEFAULT 0',
+            target_table
+        );
+        EXECUTE format(
+            'ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS buy_volume float8 NOT NULL DEFAULT 0',
+            target_table
+        );
+        EXECUTE format(
+            'ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS trade_num int8 NOT NULL DEFAULT 0',
+            target_table
+        );
+
+        IF target_table = 'kline_un' THEN
+            EXECUTE format(
+                'ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS expire_ms int8 NOT NULL DEFAULT 0',
+                target_table
+            );
+        END IF;
+    END LOOP;
+END
+$$;

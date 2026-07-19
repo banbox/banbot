@@ -27,6 +27,22 @@ func TestPgMigrationReconcilesLegacyMetadataSchema(t *testing.T) {
 	}
 }
 
+func TestPgMigrationReconcilesLegacyKlineSchema(t *testing.T) {
+	version7 := pgMigrationBody(7)
+	for _, want := range []string{
+		"'kline_1m', 'kline_5m', 'kline_15m', 'kline_1h', 'kline_1d', 'kline_un'",
+		"rename column info to buy_volume",
+		"add column if not exists quote",
+		"add column if not exists buy_volume",
+		"add column if not exists trade_num",
+		"add column if not exists expire_ms",
+	} {
+		if !strings.Contains(version7, want) {
+			t.Fatalf("version 7 migration is missing %q", want)
+		}
+	}
+}
+
 func pgMigrationBody(target int) string {
 	for _, migration := range strings.Split(ddlPgMigrations, "-- version") {
 		lines := strings.SplitN(strings.TrimSpace(migration), "\n", 2)
