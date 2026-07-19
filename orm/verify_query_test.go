@@ -33,3 +33,24 @@ func TestListSRangeSidsQueryKeepsQuestDBLatestRows(t *testing.T) {
 		t.Fatalf("unexpected query args: %#v", args)
 	}
 }
+
+func TestListSRangesBySidQueryUsesPostgresSchema(t *testing.T) {
+	sqlText := listSRangesBySidQuery(false)
+	for _, unexpected := range []string{"sranges_q", "LATEST BY", "is_deleted"} {
+		if strings.Contains(sqlText, unexpected) {
+			t.Fatalf("PostgreSQL query contains QuestDB syntax %q: %s", unexpected, sqlText)
+		}
+	}
+	if !strings.Contains(sqlText, "FROM sranges") || !strings.Contains(sqlText, "WHERE sid = $1") {
+		t.Fatalf("PostgreSQL query does not use the relational range table: %s", sqlText)
+	}
+}
+
+func TestListSRangesBySidQueryKeepsQuestDBLatestRows(t *testing.T) {
+	sqlText := listSRangesBySidQuery(true)
+	for _, want := range []string{"FROM sranges_q", "LATEST BY sid, tbl, timeframe, start_ms", "coalesce(is_deleted, false) = false"} {
+		if !strings.Contains(sqlText, want) {
+			t.Fatalf("QuestDB query is missing %q: %s", want, sqlText)
+		}
+	}
+}

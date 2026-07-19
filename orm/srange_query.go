@@ -199,15 +199,7 @@ func (q *Queries) ListSRangesBySid(ctx context.Context, sid int32) ([]*SRange, e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
-FROM (
-  SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted
-  FROM sranges_q
-  LATEST BY sid, tbl, timeframe, start_ms
-  WHERE sid = $1
-)
-WHERE coalesce(is_deleted, false) = false
-ORDER BY tbl, timeframe, start_ms`, sid)
+	rows, err := q.db.Query(ctx, listSRangesBySidQuery(IsQuestDB), sid)
 	if err != nil {
 		return nil, err
 	}
@@ -221,4 +213,22 @@ ORDER BY tbl, timeframe, start_ms`, sid)
 		out = append(out, &r)
 	}
 	return out, rows.Err()
+}
+
+func listSRangesBySidQuery(questDB bool) string {
+	if !questDB {
+		return `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
+FROM sranges
+WHERE sid = $1
+ORDER BY tbl, timeframe, start_ms`
+	}
+	return `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
+FROM (
+  SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted
+  FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms
+  WHERE sid = $1
+)
+WHERE coalesce(is_deleted, false) = false
+ORDER BY tbl, timeframe, start_ms`
 }
