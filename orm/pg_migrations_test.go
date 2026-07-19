@@ -43,6 +43,23 @@ func TestPgMigrationReconcilesLegacyKlineSchema(t *testing.T) {
 	}
 }
 
+func TestPgMigrationReconcilesLegacyKlineDefaults(t *testing.T) {
+	version8 := pgMigrationBody(8)
+	for _, want := range []string{
+		"'kline_1m', 'kline_5m', 'kline_15m', 'kline_1h', 'kline_1d', 'kline_un'",
+		"alter column buy_volume set default 0",
+	} {
+		if !strings.Contains(version8, want) {
+			t.Fatalf("version 8 migration is missing %q", want)
+		}
+	}
+	version7Pos := strings.Index(ddlPgMigrations, "-- version 7")
+	version8Pos := strings.Index(ddlPgMigrations, "-- version 8")
+	if version7Pos < 0 || version8Pos <= version7Pos {
+		t.Fatal("version 8 must run after the migration that creates buy_volume")
+	}
+}
+
 func pgMigrationBody(target int) string {
 	for _, migration := range strings.Split(ddlPgMigrations, "-- version") {
 		lines := strings.SplitN(strings.TrimSpace(migration), "\n", 2)

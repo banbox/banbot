@@ -154,3 +154,19 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- version 8
+DO $$
+DECLARE
+    target_table text;
+BEGIN
+    FOREACH target_table IN ARRAY ARRAY[
+        'kline_1m', 'kline_5m', 'kline_15m', 'kline_1h', 'kline_1d', 'kline_un'
+    ] LOOP
+        EXECUTE format(
+            'ALTER TABLE public.%I ALTER COLUMN buy_volume SET DEFAULT 0',
+            target_table
+        );
+    END LOOP;
+END
+$$;
