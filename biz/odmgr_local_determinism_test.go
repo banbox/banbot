@@ -140,6 +140,28 @@ func TestCompareExitOpenOrdersUsesFilledAmountAsSecondKey(t *testing.T) {
 	}
 }
 
+func TestCompareExitOpenOrdersIsTransitiveAtCentBoundary(t *testing.T) {
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{ID: 1, InitPrice: 1}, Enter: &ormo.ExOrder{Amount: 0, Filled: 0}},
+		{IOrder: &ormo.IOrder{ID: 2, InitPrice: 1}, Enter: &ormo.ExOrder{Amount: 0.004, Filled: 0}},
+		{IOrder: &ormo.IOrder{ID: 3, InitPrice: 1}, Enter: &ormo.ExOrder{Amount: 0.008, Filled: 0}},
+	}
+	want := []int64{3, 1, 2}
+	permutations := [][]*ormo.InOutOrder{
+		{orders[0], orders[1], orders[2]},
+		{orders[2], orders[1], orders[0]},
+		{orders[1], orders[0], orders[2]},
+	}
+	for _, permutation := range permutations {
+		slices.SortFunc(permutation, func(a, b *ormo.InOutOrder) int {
+			return compareExitOpenOrders(a, b, false)
+		})
+		if got := orderIDs(permutation); !slices.Equal(got, want) {
+			t.Fatalf("cent-boundary order = %v, want %v", got, want)
+		}
+	}
+}
+
 func issue155PendingExit(id int64, symbol string) *ormo.InOutOrder {
 	return &ormo.InOutOrder{
 		IOrder: &ormo.IOrder{

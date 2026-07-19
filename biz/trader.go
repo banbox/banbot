@@ -100,8 +100,8 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries) *errs.Error {
 	}
 	subKey := strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)
 	dispatched := false
-	// Deliberately do not sort accounts: this is a backtest hot path.
-	for account, cfg := range config.Accounts {
+	for _, account := range sortedAccountNames() {
+		cfg := config.Accounts[account]
 		if cfg.NoTrade {
 			continue
 		}
@@ -121,8 +121,7 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries) *errs.Error {
 }
 
 func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSeries) {
-	// Deliberately do not sort jobs: this is a backtest hot path.
-	for _, job := range jobMap {
+	for _, job := range sortedStratJobs(jobMap) {
 		fields := job.SetData(evt)
 		job.IsWarmUp = evt.IsWarmUp
 		if job.Strat.OnData == nil {
@@ -153,14 +152,14 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 	accOrders := make(map[string][]*ormo.InOutOrder)
 	com.SetBarPrice(symbol, closeVal)
 	if odMatch && !evt.IsWarmUp {
-		// Deliberately do not sort accounts: this is a backtest hot path.
-		for account, cfg := range config.Accounts {
+		for _, account := range sortedAccountNames() {
+			cfg := config.Accounts[account]
 			if cfg.NoTrade {
 				continue
 			}
 			openOds, lock := ormo.GetOpenODs(account)
 			lock.Lock()
-			allOrders := utils2.ValsOfMap(openOds)
+			allOrders := sortedOpenOrders(openOds)
 			lock.Unlock()
 			odMgr := GetOdMgr(account)
 			if len(allOrders) > 0 {
@@ -197,8 +196,8 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 	var wg sync.WaitGroup
 	var runErr *errs.Error
 	var accOdArr = make([]string, 0, len(config.Accounts))
-	// Deliberately do not sort accounts: this is a backtest hot path.
-	for account, cfg := range config.Accounts {
+	for _, account := range sortedAccountNames() {
+		cfg := config.Accounts[account]
 		if cfg.NoTrade {
 			continue
 		}
@@ -206,7 +205,7 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 		if !odMatch {
 			openOds, lock := ormo.GetOpenODs(account)
 			lock.Lock()
-			allOrders = utils2.ValsOfMap(openOds)
+			allOrders = sortedOpenOrders(openOds)
 			lock.Unlock()
 		}
 		var curOrders []*ormo.InOutOrder
@@ -274,8 +273,7 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 	if len(infoJobs) > 0 {
 		handledJobs = make(map[*strat.StratJob]bool, len(jobs))
 	}
-	// Deliberately do not sort jobs: this is a backtest hot path.
-	for _, job := range jobs {
+	for _, job := range sortedStratJobs(jobs) {
 		if handledJobs != nil {
 			handledJobs[job] = true
 		}
@@ -305,8 +303,7 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 			return err
 		}
 	}
-	// Deliberately do not sort jobs: this is a backtest hot path.
-	for _, job := range infoJobs {
+	for _, job := range sortedStratJobs(infoJobs) {
 		if handledJobs[job] {
 			continue
 		}

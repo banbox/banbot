@@ -643,7 +643,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 			// 回测无需持久化
 		}
 	}
-	openOdList := utils.ValsOfMap(openOds)
+	openOdList := sortedOpenOrders(openOds)
 	lock.Unlock()
 	if len(openOdList) > 0 {
 		exitOds := make([]*ormo.InOutOrder, 0, len(openOdList))

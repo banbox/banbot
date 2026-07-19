@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"testing"
 
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
@@ -54,6 +56,51 @@ func TestSubWarmPairsUsesStablePairOrder(t *testing.T) {
 	wantWarmed := []string{"BTC/USDT:30", "ETH/USDT:20", "SOL/USDT:10"}
 	if !reflect.DeepEqual(created, wantCreated) || !reflect.DeepEqual(warmed, wantWarmed) {
 		t.Fatalf("unstable warmup order: created=%v warmed=%v", created, warmed)
+	}
+}
+
+func TestSortedTimeframesUsesDurationThenName(t *testing.T) {
+	got := sortedTimeframes(map[string]int{"4h": 1, "15m": 1, "1h": 1, "60m": 1})
+	want := []string{"15m", "1h", "60m", "4h"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("timeframes = %v, want %v", got, want)
+	}
+}
+
+func TestComparePairTFCacheUsesTimeframeTieBreak(t *testing.T) {
+	states := []*PairTFCache{
+		{TimeFrame: "4h", TFSecs: 14400},
+		{TimeFrame: "60m", TFSecs: 3600},
+		{TimeFrame: "1h", TFSecs: 3600},
+		{TimeFrame: "15m", TFSecs: 900},
+	}
+	slices.SortFunc(states, comparePairTFCache)
+	got := make([]string, len(states))
+	for index, state := range states {
+		got[index] = state.TimeFrame
+	}
+	want := []string{"15m", "1h", "60m", "4h"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("timeframe states = %v, want %v", got, want)
+	}
+}
+
+func TestSubTfsReusesStableMinimumAlias(t *testing.T) {
+	oldExchange := config.Exchange
+	config.Exchange = &config.ExchangeConfig{Name: "binance", Items: map[string]map[string]interface{}{}}
+	t.Cleanup(func() { config.Exchange = oldExchange })
+	for run := 0; run < 100; run++ {
+		feeder := &Feeder{
+			ExSymbol: &orm.ExSymbol{Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"},
+			States: []*PairTFCache{
+				{TimeFrame: "900s", TFSecs: 900},
+				{TimeFrame: "15m", TFSecs: 900},
+			},
+		}
+		feeder.SubTfs([]string{"30m", "45m"}, true)
+		if len(feeder.States) != 3 || feeder.States[0].TimeFrame != "15m" {
+			t.Fatalf("run %d states start with %v", run, feeder.States)
+		}
 	}
 }
 

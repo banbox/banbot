@@ -245,7 +245,7 @@ func InitOdSubs() {
 					if evt == strat.OdChgExitFill {
 						openOds, lock := ormo.GetOpenODs(acc)
 						lock.Lock()
-						job.UpdateOrders(utils.ValsOfMap(openOds))
+						job.UpdateOrders(sortedOpenOrders(openOds))
 						lock.Unlock()
 					}
 					stgy.OnOrderChange(job, od, evt)
@@ -330,8 +330,8 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 	var readyItems []batchReadyItem
 	var waitNum = 0
 	lockBatch.Lock()
-	// Deliberately do not sort batch tasks: this is a backtest hot path.
-	for key, tasks := range strat.BatchTasks {
+	for _, key := range slices.Sorted(maps.Keys(strat.BatchTasks)) {
+		tasks := strat.BatchTasks[key]
 		if currMS < tasks.ExecMS {
 			if tasks.ExecMS-currMS < tasks.TFMSecs/2 {
 				// Batch processing time has not yet arrived
@@ -343,8 +343,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 		var mainJobs []*strat.StratJob
 		var infoJobs = make(map[string]*strat.JobEnv)
 		var stgy *strat.TradeStrat
-		// Deliberately do not sort batch tasks: this is a backtest hot path.
-		for _, task := range tasks.Map {
+		for _, task := range sortedJobEnvs(tasks.Map) {
 			stgy = task.Job.Strat
 			if task.Env == nil {
 				mainJobs = append(mainJobs, task.Job)
@@ -372,7 +371,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 	for _, item := range readyItems {
 		openOds, lock := ormo.GetOpenODs(item.account)
 		lock.Lock()
-		allOrders := utils.ValsOfMap(openOds)
+		allOrders := sortedOpenOrders(openOds)
 		lock.Unlock()
 		for _, job := range item.mainJobs {
 			job.InitBar(allOrders)

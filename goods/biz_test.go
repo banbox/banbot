@@ -94,3 +94,28 @@ func TestCompareSymbolVolUsesNumericTotalOrderAndSymbolTieBreak(t *testing.T) {
 		}
 	}
 }
+
+func TestBetterCorrelationCandidateUsesStableIDTieBreak(t *testing.T) {
+	for _, ascending := range []bool{true, false} {
+		if !betterCorrelationCandidate(0.5, 1, 0.5, 2, ascending) {
+			t.Fatalf("ascending=%v did not prefer lower ID on tie", ascending)
+		}
+		if betterCorrelationCandidate(0.5, 2, 0.5, 1, ascending) {
+			t.Fatalf("ascending=%v preferred higher ID on tie", ascending)
+		}
+	}
+}
+
+func TestBetterCorrelationCandidateTreatsNonFiniteValuesAsWorst(t *testing.T) {
+	for _, ascending := range []bool{true, false} {
+		if !betterCorrelationCandidate(0.5, 2, math.NaN(), 1, ascending) {
+			t.Fatalf("ascending=%v did not prefer finite correlation", ascending)
+		}
+		if betterCorrelationCandidate(math.Inf(1), 1, 0.5, 2, ascending) {
+			t.Fatalf("ascending=%v preferred non-finite correlation", ascending)
+		}
+		if !betterCorrelationCandidate(math.NaN(), 1, math.Inf(-1), 2, ascending) {
+			t.Fatalf("ascending=%v did not use ID tie-break for non-finite correlations", ascending)
+		}
+	}
+}
