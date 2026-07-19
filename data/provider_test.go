@@ -57,6 +57,30 @@ func TestSubWarmPairsUsesStablePairOrder(t *testing.T) {
 	}
 }
 
+func TestHistProviderMakeFeedersUsesStableCategoryAndKeyOrder(t *testing.T) {
+	symbol := &orm.ExSymbol{ID: 1, Symbol: "SAME/USDT"}
+	holderA := &DBSeriesFeeder{SeriesFeeder: SeriesFeeder{Feeder: Feeder{ExSymbol: symbol}}}
+	holderZ := &DBSeriesFeeder{SeriesFeeder: SeriesFeeder{Feeder: Feeder{ExSymbol: symbol}}}
+	tradeA := &TradeFeeder{ExSymbol: symbol}
+	tradeZ := &TradeFeeder{ExSymbol: symbol}
+	seriesA := &HistSeriesFeeder{info: &orm.SeriesInfo{Name: "macro", TimeFrame: "1m"}, target: symbol}
+	seriesZ := &HistSeriesFeeder{info: &orm.SeriesInfo{Name: "macro", TimeFrame: "1m"}, target: symbol}
+	provider := &HistProvider{
+		Provider: Provider[IHistDataFeeder]{holders: map[string]IHistDataFeeder{
+			"z": holderZ,
+			"a": holderA,
+		}},
+		trades: map[string]*TradeFeeder{"z": tradeZ, "a": tradeA},
+		series: map[string]*HistSeriesFeeder{"z": seriesZ, "a": seriesA},
+	}
+
+	got := provider.makeFeeders()
+	want := []IHistFeeder{holderA, holderZ, tradeA, tradeZ, seriesA, seriesZ}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unstable feeder order: got %v, want %v", got, want)
+	}
+}
+
 type histFeederBatch struct {
 	symbol string
 	timeMS int64

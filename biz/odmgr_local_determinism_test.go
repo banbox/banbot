@@ -121,6 +121,25 @@ func TestExitAndFillUsesStableBusinessOrder(t *testing.T) {
 	}
 }
 
+func TestCompareExitOpenOrdersUsesFilledAmountAsSecondKey(t *testing.T) {
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{ID: 1, InitPrice: 10}, Enter: &ormo.ExOrder{Amount: 10, Filled: 5}},
+		{IOrder: &ormo.IOrder{ID: 2, InitPrice: 10}, Enter: &ormo.ExOrder{Amount: 6, Filled: 1}},
+	}
+	permutations := [][]*ormo.InOutOrder{
+		{orders[0], orders[1]},
+		{orders[1], orders[0]},
+	}
+	for _, permutation := range permutations {
+		slices.SortFunc(permutation, func(a, b *ormo.InOutOrder) int {
+			return compareExitOpenOrders(a, b, false)
+		})
+		if permutation[0].ID != 2 || permutation[1].ID != 1 {
+			t.Fatalf("filled-amount order = [%d %d], want [2 1]", permutation[0].ID, permutation[1].ID)
+		}
+	}
+}
+
 func issue155PendingExit(id int64, symbol string) *ormo.InOutOrder {
 	return &ormo.InOutOrder{
 		IOrder: &ormo.IOrder{

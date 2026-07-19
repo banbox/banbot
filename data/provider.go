@@ -440,21 +440,6 @@ func (p *HistProvider) LoopMain() *errs.Error {
 	if len(p.holders) == 0 && len(p.series) == 0 && len(p.trades) == 0 {
 		return errs.NewMsg(core.ErrBadConfig, "no pairs to run")
 	}
-	makeFeeders := func() []IHistFeeder {
-		var feeders []IHistFeeder
-
-		for _, klineFeeder := range p.holders {
-			feeders = append(feeders, klineFeeder)
-		}
-		for _, tf := range p.trades {
-			feeders = append(feeders, tf)
-		}
-		for _, seriesFeeder := range p.series {
-			feeders = append(feeders, seriesFeeder)
-		}
-
-		return feeders
-	}
 	totalMS := (config.TimeRange.EndMS - config.TimeRange.StartMS) / 1000
 	var pBar = utils.NewPrgBar(int(totalMS), "RunHist")
 	if p.pBar != nil {
@@ -472,12 +457,26 @@ func (p *HistProvider) LoopMain() *errs.Error {
 		p.Terminate()
 		coreStop()
 	}
-	err := RunHistFeeders(makeFeeders, p.dirtyVers, pBar)
+	err := RunHistFeeders(p.makeFeeders, p.dirtyVers, pBar)
 	core.StopAll = coreStop
 	if p.pBar != nil {
 		p.pBar.SetProgress("runBT", 1)
 	}
 	return err
+}
+
+func (p *HistProvider) makeFeeders() []IHistFeeder {
+	feeders := make([]IHistFeeder, 0, len(p.holders)+len(p.trades)+len(p.series))
+	for _, key := range slices.Sorted(maps.Keys(p.holders)) {
+		feeders = append(feeders, p.holders[key])
+	}
+	for _, key := range slices.Sorted(maps.Keys(p.trades)) {
+		feeders = append(feeders, p.trades[key])
+	}
+	for _, key := range slices.Sorted(maps.Keys(p.series)) {
+		feeders = append(feeders, p.series[key])
+	}
+	return feeders
 }
 
 func (p *HistProvider) Terminate() {

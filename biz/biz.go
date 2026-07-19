@@ -330,6 +330,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 	var readyItems []batchReadyItem
 	var waitNum = 0
 	lockBatch.Lock()
+	// Deliberately do not sort batch tasks: this is a backtest hot path.
 	for key, tasks := range strat.BatchTasks {
 		if currMS < tasks.ExecMS {
 			if tasks.ExecMS-currMS < tasks.TFMSecs/2 {
@@ -342,6 +343,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 		var mainJobs []*strat.StratJob
 		var infoJobs = make(map[string]*strat.JobEnv)
 		var stgy *strat.TradeStrat
+		// Deliberately do not sort batch tasks: this is a backtest hot path.
 		for _, task := range tasks.Map {
 			stgy = task.Job.Strat
 			if task.Env == nil {

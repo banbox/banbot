@@ -5,6 +5,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/orm/ormo"
 )
 
@@ -109,4 +110,56 @@ func TestUpdateOdsUsesStableOrder(t *testing.T) {
 			t.Fatalf("permutation %d: UnrealizedPOL = %.17g, want %.17g", i, got, want)
 		}
 	}
+}
+
+func TestUpdateOdsStabilizesSharedMarginAllocation(t *testing.T) {
+	orders := []*ormo.InOutOrder{
+		marginOrder(1, "BTC/USDT:USDT", 60, 20),
+		marginOrder(2, "ETH/USDT:USDT", 50, 15),
+		marginOrder(3, "SAND/USDT:USDT", 40, 15),
+	}
+	permutations := [][]*ormo.InOutOrder{
+		{orders[0], orders[1], orders[2]},
+		{orders[2], orders[0], orders[1]},
+		{orders[1], orders[2], orders[0]},
+	}
+
+	for _, permutation := range permutations {
+		wallet := &ItemWallet{
+			Coin: "USDT", Available: 70, Pendings: map[string]float64{},
+			Frozens: map[string]float64{},
+		}
+		wallets := &BanWallets{Items: map[string]*ItemWallet{"USDT": wallet}}
+		if err := wallets.UpdateOds(permutation, "USDT"); err != nil {
+			t.Fatalf("permutation %v: UpdateOds() error: %v", orderIDs(permutation), err)
+		}
+
+		if wallet.Available != 10 || wallet.UsedUPol != 50 || wallet.Frozens[orders[0].Key()] != 10 ||
+			wallet.Frozens[orders[1].Key()] != 50 {
+			t.Fatalf("permutation %v: unstable margin state: available=%v usedUPol=%v frozens=%v",
+				orderIDs(permutation), wallet.Available, wallet.UsedUPol, wallet.Frozens)
+		}
+		if _, exists := wallet.Frozens[orders[2].Key()]; exists {
+			t.Fatalf("permutation %v: order 3 unexpectedly received margin", orderIDs(permutation))
+		}
+		if _, err := wallets.CostAva("next-entry", "USDT", 20, false, 0.9); err == nil {
+			t.Fatalf("permutation %v: downstream entry unexpectedly admitted", orderIDs(permutation))
+		}
+	}
+}
+
+func marginOrder(id int64, symbol string, margin, profit float64) *ormo.InOutOrder {
+	com.SetBarPrice(symbol, 1)
+	return &ormo.InOutOrder{
+		IOrder: &ormo.IOrder{ID: id, Symbol: symbol, EnterAt: id, Leverage: 1, Profit: profit},
+		Enter:  &ormo.ExOrder{Average: 0.5, Filled: margin},
+	}
+}
+
+func orderIDs(orders []*ormo.InOutOrder) []int64 {
+	ids := make([]int64, len(orders))
+	for index, order := range orders {
+		ids[index] = order.ID
+	}
+	return ids
 }

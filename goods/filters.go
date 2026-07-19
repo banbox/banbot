@@ -1,7 +1,9 @@
 package goods
 
 import (
+	"cmp"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand"
 	"slices"
@@ -93,9 +95,7 @@ func (f *VolumePairFilter) Filter(symbols []string, timeMS int64) ([]string, *er
 	if err != nil {
 		return nil, err
 	}
-	slices.SortFunc(symbolVols, func(a, b *SymbolVol) int {
-		return int((b.Vol - a.Vol) / 1000)
-	})
+	slices.SortFunc(symbolVols, compareSymbolVol)
 	if !f.AllowEmpty && f.MinValue == 0 {
 		f.MinValue = core.AmtDust
 	}
@@ -123,6 +123,13 @@ type SymbolVol struct {
 	Symbol string
 	Vol    float64
 	Price  float64
+}
+
+func compareSymbolVol(a, b *SymbolVol) int {
+	if result := cmp.Compare(b.Vol, a.Vol); result != 0 {
+		return result
+	}
+	return cmp.Compare(a.Symbol, b.Symbol)
 }
 
 func GetSymbolVols(symbols []string, tf string, num int, endMS int64, withEmpty bool) ([]*SymbolVol, *errs.Error) {
@@ -208,20 +215,22 @@ func filterByMinCost(symbols []*SymbolVol) ([]string, map[string]float64) {
 }
 
 func (f *VolumePairFilter) GenSymbols(timeMS int64) ([]string, *errs.Error) {
-	markets := exg.Default.GetCurMarkets()
-	symbols := utils.KeysOfMap(markets)
-	pairs := make([]string, 0, len(symbols))
-	for _, pair := range symbols {
+	symbols := volumeMarketSymbols(exg.Default.GetCurMarkets())
+	if len(symbols) == 0 {
+		return nil, errs.NewMsg(errs.CodeRunTime, "no symbols generate from VolumePairFilter")
+	}
+	return f.Filter(symbols, timeMS)
+}
+
+func volumeMarketSymbols(markets banexg.MarketMap) []string {
+	pairs := make([]string, 0, len(markets))
+	for _, pair := range slices.Sorted(maps.Keys(markets)) {
 		_, quote, _, _ := core.SplitSymbol(pair)
 		if _, ok := config.StakeCurrencyMap[quote]; ok {
 			pairs = append(pairs, pair)
 		}
 	}
-	symbols = pairs
-	if len(symbols) == 0 {
-		return nil, errs.NewMsg(errs.CodeRunTime, "no symbols generate from VolumePairFilter")
-	}
-	return f.Filter(symbols, timeMS)
+	return pairs
 }
 
 func (f *PriceFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
@@ -524,7 +533,7 @@ func (f *OffsetFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.E
 }
 
 func (f *ShuffleFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	rand.Shuffle(len(symbols), func(i, j int) {
+	rand.New(rand.NewSource(int64(f.Seed))).Shuffle(len(symbols), func(i, j int) {
 		symbols[i], symbols[j] = symbols[j], symbols[i]
 	})
 	return symbols, nil

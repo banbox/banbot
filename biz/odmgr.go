@@ -606,43 +606,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 		}
 	}
 	slices.SortFunc(matches, func(a, b *ormo.InOutOrder) int {
-		fillA := a.Enter.Filled * a.InitPrice
-		fillB := b.Enter.Filled * b.InitPrice
-		fillChg := int(math.Round((fillA - fillB) * 100))
-		// For profit taking or filled only, descending order by filled amount.
-		// 对于止盈或退出已入场的，优先按已入场金额降序
-		if (isTakeProfit || req.FilledOnly) && fillChg != 0 {
-			// 止盈单，优先按入场金额倒序
-			return -fillChg
-		}
-		costA := a.Enter.Amount * a.InitPrice
-		unfillA := costA - fillA
-		costB := b.Enter.Amount * b.InitPrice
-		unfillB := costB - fillB
-		// First, in descending order by unsold amount. 首先按未成交金额倒序
-		res := int(math.Round((unfillB - unfillA) * 100))
-		if res != 0 {
-			return res
-		}
-		// Secondly, in ascending order by deposit amount 其次按已入场金额升序
-		if fillChg != 0 {
-			return res
-		}
-		// Last entry time ascending, tie-break by ID for determinism
-		enterDiff := a.RealEnterMS() - b.RealEnterMS()
-		if enterDiff < 0 {
-			return -1
-		}
-		if enterDiff > 0 {
-			return 1
-		}
-		if a.ID < b.ID {
-			return -1
-		}
-		if a.ID > b.ID {
-			return 1
-		}
-		return 0
+		return compareExitOpenOrders(a, b, isTakeProfit || req.FilledOnly)
 	})
 	var result []*ormo.InOutOrder
 	var part *ormo.InOutOrder
@@ -705,6 +669,46 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 		}
 	}
 	return result, nil
+}
+
+func compareExitOpenOrders(a, b *ormo.InOutOrder, preferFilled bool) int {
+	fillA := a.Enter.Filled * a.InitPrice
+	fillB := b.Enter.Filled * b.InitPrice
+	fillChg := int(math.Round((fillA - fillB) * 100))
+	// For profit taking or filled only, descending order by filled amount.
+	// 对于止盈或退出已入场的，优先按已入场金额降序
+	if preferFilled && fillChg != 0 {
+		// 止盈单，优先按入场金额倒序
+		return -fillChg
+	}
+	costA := a.Enter.Amount * a.InitPrice
+	unfillA := costA - fillA
+	costB := b.Enter.Amount * b.InitPrice
+	unfillB := costB - fillB
+	// First, in descending order by unsold amount. 首先按未成交金额倒序
+	res := int(math.Round((unfillB - unfillA) * 100))
+	if res != 0 {
+		return res
+	}
+	// Secondly, in ascending order by deposit amount 其次按已入场金额升序
+	if fillChg != 0 {
+		return fillChg
+	}
+	// Last entry time ascending, tie-break by ID for determinism
+	enterDiff := a.RealEnterMS() - b.RealEnterMS()
+	if enterDiff < 0 {
+		return -1
+	}
+	if enterDiff > 0 {
+		return 1
+	}
+	if a.ID < b.ID {
+		return -1
+	}
+	if a.ID > b.ID {
+		return 1
+	}
+	return 0
 }
 
 func (o *OrderMgr) ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error) {
