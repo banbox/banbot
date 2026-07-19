@@ -571,9 +571,8 @@ func makeDoSendMsgTelegram(t *Telegram) func([]map[string]string) []map[string]s
 
 		text := strings.Join(msgArr, "\n\n---\n\n")
 		err := t.send(&bot.SendMessageParams{
-			ChatID:    t.chatId,
-			Text:      text,
-			ParseMode: models.ParseModeHTML,
+			ChatID: t.chatId,
+			Text:   text,
 		})
 		if err != nil {
 			log.Error("telegram send msg fail", zap.String("text", text),

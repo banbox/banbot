@@ -351,11 +351,22 @@ func (r *dbSeriesRepo) MissingSeriesRanges(ctx context.Context, info *SeriesInfo
 	}
 	defer conn.Release()
 	binding := normalizedSeriesBinding(info.Binding)
-	covered, err_ := q.getCoveredRanges(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS)
+	spans, err_ := q.ListSRanges(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}
-	return subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered), nil
+	return subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, answeredSeriesRanges(spans)), nil
+}
+
+func answeredSeriesRanges(spans []*SRange) []MSRange {
+	// Missing means unanswered, not data-free: known-empty spans are answers too.
+	answered := make([]MSRange, 0, len(spans))
+	for _, span := range spans {
+		if span != nil && span.StopMs > span.StartMs {
+			answered = append(answered, MSRange{Start: span.StartMs, Stop: span.StopMs})
+		}
+	}
+	return answered
 }
 
 func seriesRangeCovered(timeMS int64, covered []MSRange) bool {
@@ -637,6 +648,8 @@ func waitForQuestSeriesCoverageDeleted(ctx context.Context, info *SeriesInfo, si
 }
 
 func questSeriesCoveredRangesFromDB(ctx context.Context, q *Queries, table, timeframe string, sid int32, startMS, endMS int64) ([]MSRange, error) {
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	spans, err := q.loadSRangesSpansFromDB(ctx, sid, table, timeframe, startMS, endMS)
 	if err != nil {
 		return nil, err
@@ -651,6 +664,8 @@ func questSeriesCoveredRangesFromDB(ctx context.Context, q *Queries, table, time
 }
 
 func questSeriesDeleteMarkerVisible(ctx context.Context, q *Queries, table, timeframe string, sid int32, startMS, endMS int64) (bool, error) {
+	unlock := LockCompactTableRead("sranges_q")
+	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
 FROM (
   SELECT start_ms, stop_ms, has_data, is_deleted

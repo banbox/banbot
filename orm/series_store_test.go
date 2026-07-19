@@ -247,6 +247,17 @@ func TestSeriesStoreMissingRejectsRepoWithoutRangeSupport(t *testing.T) {
 	}
 }
 
+func TestAnsweredSeriesRangesIncludesKnownEmptySpans(t *testing.T) {
+	spans := []*SRange{
+		{StartMs: 100, StopMs: 200, HasData: false},
+		{StartMs: 200, StopMs: 300, HasData: true},
+	}
+	missing := subtractMSRanges(MSRange{Start: 100, Stop: 400}, answeredSeriesRanges(spans))
+	if len(missing) != 1 || missing[0] != (MSRange{Start: 300, Stop: 400}) {
+		t.Fatalf("known-empty and data-bearing spans must both answer missing queries, got %+v", missing)
+	}
+}
+
 func TestNormalizeDataRecordsRejectsSidMismatch(t *testing.T) {
 	_, err := NormalizeDataRecords(1, []*DataRecord{{Sid: 2, TimeMS: 0, EndMS: 1}})
 	if err == nil || !strings.Contains(err.Short(), "does not match") {

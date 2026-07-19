@@ -32,6 +32,7 @@ type CmdArgs struct {
 	Tables        []string
 	Force         bool
 	WithSpider    bool
+	AutoCompact   bool
 	Medium        string
 	MaxPoolSize   int
 	InPath        string

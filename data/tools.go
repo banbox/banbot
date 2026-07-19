@@ -398,7 +398,7 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 			fileInPath := filepath.Join(dirPath, name)
 			symbolDones := make(map[string]map[string]int)
 			dayKlines := make(map[string][]*banexg.Kline)
-			err = ReadZipCSVs(fileInPath, pBar, func(inPath string, fid int, file *zip.File, arg interface{}) *errs.Error {
+			runErr := ReadZipCSVs(fileInPath, pBar, func(inPath string, fid int, file *zip.File, arg interface{}) *errs.Error {
 				return build1mSymbolTick(inPath, fid, file, symbolDones, dayKlines, tickBar)
 			}, nil)
 			var b strings.Builder
@@ -445,7 +445,7 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 				symKLines[key] = append(oldData, dayKlines[key+"_"+suffix]...)
 			}
 			klineLock.Unlock()
-			return err
+			return runErr
 		})
 		pBar.Close()
 		log.Info("save 1m kline", zap.String("year", year))

@@ -409,6 +409,18 @@ type DataSub struct {
 `data.EnsureRuntimeSeriesRange(...)` / `data.EnsureSeriesSubsRange(...)` 是当前中性的运行时补齐入口；旧的
 `EnsureThirdPartySeriesRange(...)` / `EnsureThirdPartySeriesSubsRange(...)` 仍保留为兼容 alias。
 
+也可以在回测或参数优化前显式补齐已注册的数据源：
+
+```bash
+./bot series list
+./bot series down -pairs BTC/USDT,ETH/USDT -tables funding_rate \
+  -timestart 2025-01-01 -timeend 2026-01-01
+```
+
+`series list` 输出包含 source 名称、周期、物理表和字段定义的 JSON。`series down` 中的 `-tables`
+按 source 名称筛选；不传时补齐全部已注册 source。下载结束时间会按各 source 的周期截断到最后一个
+已闭合区间，QuestDB 下还会等待 `sranges_q` 覆盖范围可见后再退出。
+
 ### 5.4 `sranges` 仍然复用 `(sid, table, timeframe)`
 
 当前实现没有为 custom data 另建覆盖范围系统，而是继续复用现有 `sranges` 机制：
@@ -579,23 +591,25 @@ func init() {
                 },
             }
         },
-        OnData: strat.CustomData(func(job *strat.StratJob, data strat.DataEvent) {
-            if data.Source != "macro_cpi" {
-                return
-            }
-            value := data.Series("value")
-            revision := data.Int64("revision")
-            if !job.DataHub.AllReady() {
-                return
-            }
-            latest := job.DataHub.Get("1d", "macro_cpi", data.Sid)
-            _, _, _ = value, revision, latest
+        OnData: strat.RouteData(strat.DataHandlers{
+            Custom: func(job *strat.StratJob, data strat.DataEvent) {
+                if data.Source != "macro_cpi" {
+                    return
+                }
+                value := data.Series("value")
+                revision := data.Int64("revision")
+                if !job.DataHub.AllReady() {
+                    return
+                }
+                latest := job.DataHub.Get("1d", "macro_cpi", data.Sid)
+                _, _, _ = value, revision, latest
+            },
         }),
     })
 }
 ```
 
-`DataEvent` 嵌入了 `*DataFields`，因此字段读取方式不变；同时提供 `Role`、`Symbol`、`IsMain()` 和 `IsKline()`。没有辅助或自定义订阅的策略可直接赋值 `OnData`，无需包装。需要过滤时，处理全部 K 线用 `strat.KlineData(...)`，只处理自定义时序用 `strat.CustomData(...)`；主周期、辅助 K 线和自定义数据需要不同逻辑时，使用：
+`DataEvent` 嵌入了 `*DataFields`，因此字段读取方式不变；同时提供 `Role`、`Symbol`、`IsMain()` 和 `IsKline()`。没有辅助或自定义订阅的策略可直接赋值 `OnData`，无需包装。需要过滤或分别处理主周期、辅助 K 线和自定义数据时，使用：
 
 ```go
 OnData: strat.RouteData(strat.DataHandlers{
@@ -625,6 +639,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 - `OnPairInfos` 会在内部桥接为 `DataSub{Source: "kline", ...}`
 - `OnInfoBar` 仅在 side-input 能适配成 kline 且策略未实现 `OnData` 时触发
 - `OnBar` 仅在主 kline 事件且策略未实现 `OnData` 时触发；同一事件不会同时调用两个回调
+- `OnData` 不能与 `OnBar` 或 `OnInfoBar` 同时配置；策略构建会直接报错，请把旧回调逻辑迁移到 `RouteData` 的 `Main` / `Info` 处理器
 
 ### 7.3 新代码不要再把 Kline 当作通用自定义数据契约
 

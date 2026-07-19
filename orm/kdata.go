@@ -874,6 +874,8 @@ func (q *Queries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, 
 		}
 		return result, nil
 	}
+	unlock := LockCompactTableRead("calendars_q")
+	defer unlock()
 	sqlText := `SELECT start_ms, stop_ms
 FROM calendars_q
 LATEST BY market, start_ms
@@ -924,6 +926,8 @@ func (q *Queries) SetCalendars(name string, items [][2]int64) *errs.Error {
 		}
 		return nil
 	}
+	unlock := LockCompactTableRead("calendars_q")
+	defer unlock()
 
 	sqlText := `SELECT market, start_ms, stop_ms
 FROM calendars_q
@@ -969,7 +973,6 @@ WHERE market = $1 AND coalesce(is_deleted, false) = false`
 		if _, err := q.db.Exec(ctx, "INSERT INTO calendars_q (ts,market,start_ms,stop_ms,is_deleted) VALUES "+buildBatchValues(len(olds), cols, ",true"), delArgs...); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
-		MaybeCompact("calendars_q")
 	}
 
 	const cols = 4
@@ -989,6 +992,7 @@ WHERE market = $1 AND coalesce(is_deleted, false) = false`
 			return NewDbErr(core.ErrDbReadFail, err)
 		}
 	}
+	MarkTableForCompact("calendars_q", len(olds))
 	return nil
 }
 

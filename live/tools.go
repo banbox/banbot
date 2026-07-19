@@ -1,7 +1,6 @@
 package live
 
 import (
-	"flag"
 	"fmt"
 	"math/rand"
 	"time"
@@ -17,26 +16,47 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
 
+type tradeCloseOptions struct {
+	configs  config.ArrString
+	accounts string
+	pairs    string
+	strats   string
+	exchange bool
+}
+
 func RunTradeClose(args []string) error {
-	parser := flag.NewFlagSet("", flag.ExitOnError)
-	var accountStr, pairStr, stratStr string
-	var isExg bool
-	var configs config.ArrString
-	parser.Var(&configs, "config", "config path to use, Multiple -config options may be used")
-	parser.StringVar(&accountStr, "account", "", "accounts, comma separated, empty means all")
-	parser.StringVar(&pairStr, "pair", "", "pairs, comma separated, empty means all")
-	parser.StringVar(&stratStr, "strat", "", "strats, comma separated, empty means all")
-	parser.BoolVar(&isExg, "exg", false, "close exchange position directly")
-	err_ := parser.Parse(args)
-	if err_ != nil {
-		return err_
+	command := NewTradeCloseCommand()
+	command.SetArgs(args)
+	return command.Execute()
+}
+
+func NewTradeCloseCommand() *cobra.Command {
+	options := &tradeCloseOptions{}
+	command := &cobra.Command{
+		Use:     "close-order",
+		Aliases: []string{"close_order"},
+		Short:   "close orders by account, pair, or strategy",
+		Args:    cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runTradeClose(options)
+		},
 	}
+	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")
+	command.Flags().StringVar(&options.accounts, "account", "", "comma-separated accounts; empty means all")
+	command.Flags().StringVar(&options.pairs, "pair", "", "comma-separated pairs; empty means all")
+	command.Flags().StringVar(&options.strats, "strat", "", "comma-separated strategies; empty means all")
+	command.Flags().BoolVar(&options.exchange, "exg", false, "close exchange positions directly")
+	return command
+}
+
+func runTradeClose(options *tradeCloseOptions) error {
 	core.SetRunMode(core.RunModeLive)
 	err := config.LoadConfig(&config.CmdArgs{
-		Configs:  configs,
+		Configs:  options.configs,
 		LogLevel: "info",
 	})
 	if err != nil {
@@ -44,9 +64,9 @@ func RunTradeClose(args []string) error {
 	}
 
 	// 解析命令行参数
-	var accMap = utils.SplitToMap(accountStr, ",")
-	var pairMap = utils.SplitToMap(pairStr, ",")
-	var stratMap = utils.SplitToMap(stratStr, ",")
+	var accMap = utils.SplitToMap(options.accounts, ",")
+	var pairMap = utils.SplitToMap(options.pairs, ",")
+	var stratMap = utils.SplitToMap(options.strats, ",")
 
 	// 初始化订单管理器
 	err = biz.SetupComsExg(&config.CmdArgs{LogLevel: "info"})
@@ -59,7 +79,7 @@ func RunTradeClose(args []string) error {
 	if err != nil {
 		log.Error("cancelPendingOrders fail", zap.Error(err))
 	}
-	if isExg {
+	if options.exchange {
 		_, err = biz.RunRemoteCommand(biz.RemoteCommand{
 			Source:    biz.RemoteSourceCLI,
 			Actor:     "cli",

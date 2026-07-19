@@ -159,6 +159,66 @@ func TestWaitForQuestKlineCoverageVisibleBypassesCache(t *testing.T) {
 	}
 }
 
+func TestWaitForQuestSeriesCoverageVisiblePollsPersistedKnownEmptyCoverage(t *testing.T) {
+	oldGrace := klineInsertQuestVisibilityGrace
+	oldPoll := questReadAfterWritePollInterval
+	klineInsertQuestVisibilityGrace = 20 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		klineInsertQuestVisibilityGrace = oldGrace
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	const (
+		sid   = int32(778)
+		start = int64(100)
+		stop  = int64(200)
+	)
+	info := NewSeriesInfo("macro", "1h", []SeriesField{{Name: "value", Type: "float"}})
+	srangesCacheUpdate(sid, info.Binding.Table, info.TimeFrame, []srangeSpan{{StartMs: start, StopMs: stop, HasData: true}})
+	defer srangesCacheDel(sid, info.Binding.Table, info.TimeFrame)
+
+	queries := 0
+	db := &visibilityDBStub{query: func(_ string, _ ...interface{}) (pgx.Rows, error) {
+		queries++
+		if queries < 3 {
+			return &staleCoveredRows{idx: 0}, nil
+		}
+		return &staleCoveredRows{idx: -1, startMS: start, stopMS: stop, knownEmpty: true}, nil
+	}}
+	if err := waitForQuestSeriesCoverageVisible(context.Background(), New(db), info, sid, start, stop); err != nil {
+		t.Fatal(err)
+	}
+	if queries != 3 {
+		t.Fatalf("cache must not satisfy series coverage visibility wait: queries=%d", queries)
+	}
+}
+
+func TestWaitForQuestSeriesCoverageVisibleTimesOut(t *testing.T) {
+	oldGrace := klineInsertQuestVisibilityGrace
+	oldPoll := questReadAfterWritePollInterval
+	klineInsertQuestVisibilityGrace = 5 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		klineInsertQuestVisibilityGrace = oldGrace
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	queries := 0
+	db := &visibilityDBStub{query: func(_ string, _ ...interface{}) (pgx.Rows, error) {
+		queries++
+		return &staleCoveredRows{idx: 0}, nil
+	}}
+	info := NewSeriesInfo("macro", "1h", []SeriesField{{Name: "value", Type: "float"}})
+	err := waitForQuestSeriesCoverageVisible(context.Background(), New(db), info, 779, 100, 200)
+	if err == nil || !strings.Contains(err.Short(), "coverage not visible before timeout") {
+		t.Fatalf("expected series coverage timeout, got %v", err)
+	}
+	if queries < 2 {
+		t.Fatalf("expected polling before timeout, queries=%d", queries)
+	}
+}
+
 func TestWaitForQuestExsymbolVisiblePollsUntilRowVisible(t *testing.T) {
 	oldTimeout := questReadAfterWriteTimeout
 	oldPoll := questReadAfterWritePollInterval

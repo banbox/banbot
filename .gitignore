@@ -3,6 +3,8 @@
 .zed
 .claude
 .worktrees
+.gocache
+/biz/locks/
 *.db
 *.db-shm
 *.db-wal

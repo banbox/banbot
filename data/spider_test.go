@@ -197,26 +197,26 @@ func (s *stubSpiderConn) Release() {
 	s.releaseCount++
 }
 
-func newSpiderTestDeps(t *testing.T, recorder *runSpiderTestRecorder) spiderRuntimeDeps {
+func newSpiderTestRuntime(t *testing.T, recorder *runSpiderTestRecorder) spiderRuntime {
 	t.Helper()
-	return spiderRuntimeDeps{
+	return spiderRuntime{
 		newServer: func(addr, aesKey string) *utils.ServerIO {
 			recorder.addr = addr
 			return &utils.ServerIO{Addr: addr, Data: map[string]string{}, DataExp: map[string]int64{}}
 		},
-		startWriteQ: func(workNum int) {
-			recorder.writeQCalls++
-			recorder.writeQWorkers = append(recorder.writeQWorkers, workNum)
+		ensureDBCompression: func(ctx context.Context) *errs.Error {
+			recorder.ensureCompressionCalls++
+			recorder.ensureCompressionCtx = ctx
+			return recorder.ensureCompressionErr
 		},
 		ormConn: func(ctx context.Context) (spiderQueries, spiderConnRelease, *errs.Error) {
 			recorder.ormConnCalls++
 			recorder.ormCtx = ctx
 			return recorder.queries, recorder.conn, recorder.ormErr
 		},
-		runForever: func(spider *LiveSpider) *errs.Error {
-			recorder.runForeverCalls++
-			recorder.runForeverSpider = spider
-			return recorder.runErr
+		startWriteQ: func(workNum int) {
+			recorder.writeQCalls++
+			recorder.writeQWorkers = append(recorder.writeQWorkers, workNum)
 		},
 		startMonitor: func(spider *LiveSpider) {
 			recorder.monitorCalls++
@@ -224,23 +224,31 @@ func newSpiderTestDeps(t *testing.T, recorder *runSpiderTestRecorder) spiderRunt
 		startCron: func() {
 			recorder.cronCalls++
 		},
+		runForever: func(spider *LiveSpider) *errs.Error {
+			recorder.runForeverCalls++
+			recorder.runForeverSpider = spider
+			return recorder.runErr
+		},
 	}
 }
 
 type runSpiderTestRecorder struct {
-	addr             string
-	writeQCalls      int
-	writeQWorkers    []int
-	ormConnCalls     int
-	ormCtx           context.Context
-	runForeverCalls  int
-	monitorCalls     int
-	cronCalls        int
-	runForeverSpider *LiveSpider
-	queries          *stubSpiderQueries
-	conn             *stubSpiderConn
-	ormErr           *errs.Error
-	runErr           *errs.Error
+	addr                   string
+	writeQCalls            int
+	writeQWorkers          []int
+	ensureCompressionCalls int
+	ensureCompressionCtx   context.Context
+	ensureCompressionErr   *errs.Error
+	ormConnCalls           int
+	ormCtx                 context.Context
+	runForeverCalls        int
+	monitorCalls           int
+	cronCalls              int
+	runForeverSpider       *LiveSpider
+	queries                *stubSpiderQueries
+	conn                   *stubSpiderConn
+	ormErr                 *errs.Error
+	runErr                 *errs.Error
 }
 
 func TestRunSpiderSkipsStartupWhenCallbackNil(t *testing.T) {
@@ -253,12 +261,15 @@ func TestRunSpiderSkipsStartupWhenCallbackNil(t *testing.T) {
 		t.Fatalf("RegisterDataSource failed: %v", err)
 	}
 
-	err := runSpiderWithDeps("127.0.0.1:0", newSpiderTestDeps(t, recorder))
+	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", nil)
 	if err != nil {
-		t.Fatalf("runSpiderWithDeps failed: %v", err)
+		t.Fatalf("spiderRuntime.run failed: %v", err)
 	}
 	if src.subscribeCount != 0 {
 		t.Fatalf("expected no third-party activation without startup callback, got %d subscribe calls", src.subscribeCount)
+	}
+	if recorder.ensureCompressionCalls != 1 {
+		t.Fatalf("expected compression check once, got %d", recorder.ensureCompressionCalls)
 	}
 	if queries.purgeCount != 1 {
 		t.Fatalf("expected PurgeKlineUn once, got %d", queries.purgeCount)
@@ -292,7 +303,7 @@ func TestRunSpiderStartupActivatesSelectedSourcesOnce(t *testing.T) {
 	}
 
 	startupCalls := 0
-	err := runSpiderWithDeps("127.0.0.1:0", newSpiderTestDeps(t, recorder), WithSpiderStartupHook(func(ctx context.Context, spider *LiveSpider) error {
+	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", func(ctx context.Context, spider *LiveSpider) error {
 		startupCalls++
 		_, err := ActivateDataSources(ctx, []*strat.DataSub{
 			{Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 101}, TimeFrame: alpha.info.TimeFrame},
@@ -300,9 +311,9 @@ func TestRunSpiderStartupActivatesSelectedSourcesOnce(t *testing.T) {
 			{Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 303}, TimeFrame: alpha.info.TimeFrame},
 		}, stubDataSink{})
 		return err
-	}))
+	})
 	if err != nil {
-		t.Fatalf("runSpiderWithDeps failed: %v", err)
+		t.Fatalf("spiderRuntime.run failed: %v", err)
 	}
 	if startupCalls != 1 {
 		t.Fatalf("expected startup callback once, got %d", startupCalls)
@@ -334,18 +345,41 @@ func TestRunSpiderStartupUsesCoreContext(t *testing.T) {
 	})
 	var startupCtx context.Context
 
-	err := runSpiderWithDeps("127.0.0.1:0", newSpiderTestDeps(t, recorder), WithSpiderStartupHook(func(ctx context.Context, spider *LiveSpider) error {
+	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", func(ctx context.Context, spider *LiveSpider) error {
 		startupCtx = ctx
 		return nil
-	}))
+	})
 	if err != nil {
-		t.Fatalf("runSpiderWithDeps failed: %v", err)
+		t.Fatalf("spiderRuntime.run failed: %v", err)
 	}
 	if recorder.ormCtx != ctx {
 		t.Fatalf("expected orm connection to use core context")
 	}
+	if recorder.ensureCompressionCtx != ctx {
+		t.Fatalf("expected compression check to use core context")
+	}
 	if startupCtx != ctx {
 		t.Fatalf("expected startup hook to use core context")
+	}
+}
+
+func TestRunSpiderStopsWhenCompressionCheckFails(t *testing.T) {
+	recorder := &runSpiderTestRecorder{
+		queries:              &stubSpiderQueries{},
+		conn:                 &stubSpiderConn{},
+		ensureCompressionErr: errs.NewMsg(core.ErrDbExecFail, "compression check failed"),
+	}
+
+	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", nil)
+	if err == nil {
+		t.Fatal("expected compression check error")
+	}
+	if recorder.ensureCompressionCalls != 1 {
+		t.Fatalf("expected compression check once, got %d", recorder.ensureCompressionCalls)
+	}
+	if recorder.ormConnCalls != 0 || recorder.writeQCalls != 0 || recorder.runForeverCalls != 0 {
+		t.Fatalf("expected compression error to stop startup, got orm=%d writeQ=%d runForever=%d",
+			recorder.ormConnCalls, recorder.writeQCalls, recorder.runForeverCalls)
 	}
 }
 
@@ -355,14 +389,14 @@ func TestRunSpiderStartupReturnsUnknownSourceError(t *testing.T) {
 	recorder := &runSpiderTestRecorder{queries: queries, conn: conn}
 	resetDataSourcesForTest(t)
 
-	err := runSpiderWithDeps("127.0.0.1:0", newSpiderTestDeps(t, recorder), WithSpiderStartupHook(func(ctx context.Context, spider *LiveSpider) error {
+	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", func(ctx context.Context, spider *LiveSpider) error {
 		_, err := ActivateDataSources(ctx, []*strat.DataSub{{
 			Source:    "spider_missing_source",
 			ExSymbol:  &orm.ExSymbol{ID: 404},
 			TimeFrame: "1d",
 		}}, stubDataSink{})
 		return err
-	}))
+	})
 	if err == nil {
 		t.Fatalf("expected unknown source startup error")
 	}

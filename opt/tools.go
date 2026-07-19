@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/csv"
 	"errors"
-	"flag"
 	"fmt"
 	"maps"
 	"math"
@@ -31,8 +30,18 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
+	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
+
+type compareOrdersOptions struct {
+	configs    config.ArrString
+	backtest   string
+	botName    string
+	account    string
+	amountRate float64
+	skipUnhit  bool
+}
 
 /*
 CompareExgBTOrders
@@ -40,30 +49,41 @@ Compare the exchange export order records with the backtest order records.
 对比交易所导出订单记录和回测订单记录。
 */
 func CompareExgBTOrders(args []string) error {
-	var btPath, botName, account string
-	var amtRate float64
-	var skipUnHitBt bool
-	var configPaths config.ArrString
-	var sub = flag.NewFlagSet("cmp", flag.ExitOnError)
-	sub.Var(&configPaths, "config", "config path to use, Multiple -config options may be used")
-	sub.StringVar(&botName, "bot-name", "", "botName for live trade")
-	sub.StringVar(&account, "account", "", "account for api-key to fetch exchange orders")
-	sub.StringVar(&btPath, "bt-path", "", "backTest order file")
-	sub.Float64Var(&amtRate, "amt-rate", 0.1, "amt rate threshold, 0~1")
-	sub.BoolVar(&skipUnHitBt, "skip-unhit", true, "skip unhit pairs for backtest order")
-	err_ := sub.Parse(args)
-	if err_ != nil {
-		return err_
+	command := NewCompareExgBTOrdersCommand()
+	command.SetArgs(args)
+	return command.Execute()
+}
+
+func NewCompareExgBTOrdersCommand() *cobra.Command {
+	options := &compareOrdersOptions{}
+	command := &cobra.Command{
+		Use:     "cmp-orders",
+		Aliases: []string{"cmp_orders"},
+		Short:   "compare exchange orders with a backtest",
+		Args:    cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return compareExgBTOrders(options)
+		},
 	}
-	if account == "" || btPath == "" || botName == "" {
+	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")
+	command.Flags().StringVar(&options.botName, "bot-name", "", "bot name used for live trading")
+	command.Flags().StringVar(&options.account, "account", "", "account whose API key will fetch orders")
+	command.Flags().StringVar(&options.backtest, "bt-path", "", "backtest order file")
+	command.Flags().Float64Var(&options.amountRate, "amt-rate", 0.1, "amount difference threshold from 0 to 1")
+	command.Flags().BoolVar(&options.skipUnhit, "skip-unhit", true, "skip backtest pairs with no exchange orders")
+	return command
+}
+
+func compareExgBTOrders(options *compareOrdersOptions) error {
+	if options.account == "" || options.backtest == "" || options.botName == "" {
 		return errors.New("`exg-path/account` `bt-path` bot-name is required")
 	}
 	core.SetRunMode(core.RunModeLive)
-	err := biz.SetupComs(&config.CmdArgs{Configs: configPaths})
+	err := biz.SetupComs(&config.CmdArgs{Configs: options.configs})
 	if err != nil {
 		return err
 	}
-	btOrders, pairNums, startMS, endMS, err_ := readBackTestOrders(btPath)
+	btOrders, pairNums, startMS, endMS, err_ := readBackTestOrders(options.backtest)
 	if err_ != nil {
 		return err_
 	}
@@ -81,7 +101,7 @@ func CompareExgBTOrders(args []string) error {
 	}
 	outDir := filepath.Join(config.GetDataDir(), "exgOrders")
 	var exgOrders []*banexg.Order
-	exgOrders, err = loadExgOrders(account, exs.Exchange, exs.Market, startMS, endMS, pairNums)
+	exgOrders, err = loadExgOrders(options.account, exs.Exchange, exs.Market, startMS, endMS, pairNums)
 	if err != nil {
 		return err
 	}
@@ -89,7 +109,7 @@ func CompareExgBTOrders(args []string) error {
 		return errors.New("no exchange orders to compare")
 	}
 	log.Info("loaded exchange orders", zap.Int("num", len(exgOrders)))
-	pairExgOds := buildExgOrders(exgOrders, botName)
+	pairExgOds := buildExgOrders(exgOrders, options.botName)
 	exgOdList := make([]*ormo.InOutOrder, 0)
 	for _, odList := range pairExgOds {
 		exgOdList = append(exgOdList, odList...)
@@ -113,7 +133,7 @@ func CompareExgBTOrders(args []string) error {
 		tfMSecsFlt := float64(tfMSecs)
 		entFixMS := utils2.AlignTfMSecs(iod.RealEnterMS(), tfMSecs)
 		exgOds, _ := pairExgOds[iod.Symbol]
-		if skipUnHitBt && len(exgOds) == 0 {
+		if options.skipUnhit && len(exgOds) == 0 {
 			continue
 		}
 		dirt := "long"
@@ -126,7 +146,7 @@ func CompareExgBTOrders(args []string) error {
 		for _, exod := range exgOds {
 			if exod.Short == iod.Short && math.Abs(float64(exod.RealEnterMS()-entFixMS)) < tfMSecsFlt {
 				amtRate2 := exod.Enter.Filled / iod.Enter.Filled
-				if math.Abs(amtRate2-1) <= amtRate {
+				if math.Abs(amtRate2-1) <= options.amountRate {
 					matches = append(matches, exod)
 				}
 			}
@@ -736,34 +756,58 @@ var (
 BtFactors 从全品种回测订单，对给定的截面因子进行滚动回测，输出回测结果到控制台和目录
 */
 func BtFactors(args []string) error {
-	var configPaths config.ArrString
-	var factor, inPath, outDir, minBack, maxBack, runPeriod string
-	var downKline bool
-	var sub = flag.NewFlagSet("fac", flag.ExitOnError)
-	sub.Var(&configPaths, "config", "config path to use, Multiple -config options may be used")
-	sub.StringVar(&factor, "factor", "", "factor to test")
-	sub.StringVar(&inPath, "in", "", "path for all pairs orders e.g.: orders.gob")
-	sub.StringVar(&outDir, "out", "", "dump result to directory")
-	sub.StringVar(&minBack, "min-back", "1y", "min look back period")
-	sub.StringVar(&maxBack, "max-back", "2y", "max look back period")
-	sub.StringVar(&runPeriod, "interval", "4M", "interval time range between refreshes")
-	sub.BoolVar(&downKline, "down", false, "try download klines")
-	err_ := sub.Parse(args)
-	if err_ != nil {
-		return err_
+	command := NewBtFactorsCommand()
+	command.SetArgs(args)
+	return command.Execute()
+}
+
+type btFactorsOptions struct {
+	configs  config.ArrString
+	factor   string
+	input    string
+	output   string
+	minBack  string
+	maxBack  string
+	interval string
+	download bool
+}
+
+func NewBtFactorsCommand() *cobra.Command {
+	options := &btFactorsOptions{}
+	command := &cobra.Command{
+		Use:     "bt-factor",
+		Aliases: []string{"bt_factor"},
+		Short:   "backtest factors with orders",
+		Args:    cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return btFactors(options)
+		},
 	}
+	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")
+	command.Flags().StringVar(&options.factor, "factor", "", "factor to test")
+	command.Flags().StringVar(&options.input, "in", "", "orders file containing all pairs")
+	command.Flags().StringVar(&options.output, "out", "", "output directory")
+	command.Flags().StringVar(&options.minBack, "min-back", "1y", "minimum lookback period")
+	command.Flags().StringVar(&options.maxBack, "max-back", "2y", "maximum lookback period")
+	command.Flags().StringVar(&options.interval, "interval", "4M", "interval between refreshes")
+	command.Flags().BoolVar(&options.download, "down", false, "download missing klines")
+	return command
+}
+
+func btFactors(options *btFactorsOptions) error {
+	var err_ error
 	var logFile string
-	if outDir != "" {
-		outDir = config.ParsePath(outDir)
-		err_ = utils.EnsureDir(outDir, 0755)
+	if options.output != "" {
+		options.output = config.ParsePath(options.output)
+		err_ = utils.EnsureDir(options.output, 0755)
 		if err_ != nil {
 			return err_
 		}
-		logFile = filepath.Join(outDir, "out.log")
+		logFile = filepath.Join(options.output, "out.log")
 	}
 	core.SetRunMode(core.RunModeBackTest)
 	err := biz.SetupComsExg(&config.CmdArgs{
-		Configs: configPaths,
+		Configs: options.configs,
 		Logfile: logFile,
 	})
 	if err != nil {
@@ -776,16 +820,16 @@ func BtFactors(args []string) error {
 	}
 	var tfSecs int
 	var orders []*ormo.InOutOrder
-	if inPath == "" {
-		return errors.New("-in is required")
+	if options.input == "" {
+		return errors.New("--in is required")
 	} else {
-		inPath = config.ParsePath(inPath)
+		options.input = config.ParsePath(options.input)
 	}
-	facFunc, ok := FactorMap[factor]
+	facFunc, ok := FactorMap[options.factor]
 	if !ok || facFunc == nil {
-		return errors.New("-factor invalid")
+		return errors.New("--factor is invalid")
 	}
-	orders, err = ormo.LoadOrdersGob(inPath)
+	orders, err = ormo.LoadOrdersGob(options.input)
 	if err != nil {
 		return err
 	}
@@ -829,9 +873,9 @@ func BtFactors(args []string) error {
 	if tfSecs == 0 {
 		tfSecs = utils2.TFToSecs("1d")
 	}
-	minBackMSecs := int64(utils2.TFToSecs(minBack) * 1000)
-	maxBackMSecs := int64(utils2.TFToSecs(maxBack) * 1000)
-	intvMSecs := int64(utils2.TFToSecs(runPeriod) * 1000)
+	minBackMSecs := int64(utils2.TFToSecs(options.minBack) * 1000)
+	maxBackMSecs := int64(utils2.TFToSecs(options.maxBack) * 1000)
+	intvMSecs := int64(utils2.TFToSecs(options.interval) * 1000)
 	dayMSecs := int64(utils2.TFToSecs("1d") * 1000)
 	if intvMSecs < dayMSecs {
 		return errors.New("interval must >= 1d")
@@ -854,7 +898,7 @@ func BtFactors(args []string) error {
 	}
 	tf := utils2.SecsToTF(int(tfMSecs / 1000))
 	// 下载K线
-	if downKline {
+	if options.download {
 		prgTotal := 10000
 		pBar := utils.NewPrgBar(prgTotal, "BulkDown")
 		err = orm.BulkDownOHLCV(exg.Default, exsMap, tf, startMs, endMS, 0, func(done int, total int) {
@@ -890,11 +934,11 @@ func BtFactors(args []string) error {
 			TFMSecs:      tfMSecs,
 			StartMS:      rangeStart,
 			EndMS:        rangeEnd,
-			MinBack:      minBack,
+			MinBack:      options.minBack,
 			MinBackMS:    minBackMSecs,
-			MaxBack:      maxBack,
+			MaxBack:      options.maxBack,
 			MaxBackMS:    maxBackMSecs,
-			Interval:     runPeriod,
+			Interval:     options.interval,
 			IntervalMS:   intvMSecs,
 		})
 		if err_ != nil {
@@ -919,7 +963,7 @@ func BtFactors(args []string) error {
 			rangeStart = rangeEnd - maxBackMSecs
 		}
 	}
-	_, err = calcBtResult(testOrders, config.WalletAmounts, outDir)
+	_, err = calcBtResult(testOrders, config.WalletAmounts, options.output)
 	if err != nil {
 		return err
 	}

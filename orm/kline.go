@@ -389,6 +389,8 @@ func queryUnfinish(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline
 	if !IsQuestDB {
 		return queryUnfinishPg(sid, timeFrame, barStartMS)
 	}
+	unlock := LockCompactTableRead("kline_un_q")
+	defer unlock()
 	ctx := context.Background()
 	row := pool.QueryRow(ctx, `SELECT cast(ts as long)/1000, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
 FROM kline_un_q
@@ -566,6 +568,8 @@ func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kli
 	if !IsQuestDB {
 		return setUnfinishPg(sid, tf, endMS, bar)
 	}
+	unlock := LockCompactTableRead("kline_un_q")
+	defer unlock()
 	expireMS := utils2.AlignTfMSecs(btime.UTCStamp(), 60000) + 60000
 	ts := time.UnixMilli(bar.Time).UTC()
 	ctx := context.Background()
@@ -1107,6 +1111,17 @@ FixKInfoZeros
 */
 func (q *Queries) FixKInfoZeros() *errs.Error {
 	ctx := context.Background()
+	unlock := func() {}
+	locked := false
+	if IsQuestDB {
+		unlock = LockCompactTableRead("sranges_q")
+		locked = true
+		defer func() {
+			if locked {
+				unlock()
+			}
+		}()
+	}
 	var rows pgx.Rows
 	var err_ error
 	if IsQuestDB {
@@ -1141,6 +1156,10 @@ WHERE has_data = true AND (stop_ms = 0 OR start_ms = 0)`)
 	}
 	if err_ := rows.Err(); err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
+	}
+	if locked {
+		unlock()
+		locked = false
 	}
 	if len(tfGroups) == 0 {
 		return nil

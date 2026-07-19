@@ -1,6 +1,11 @@
 package strat
 
-import "github.com/banbox/banbot/orm"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/banbox/banbot/orm"
+)
 
 // DataRole identifies how an OnData event relates to the strategy job.
 type DataRole uint8
@@ -40,6 +45,22 @@ type DataHandlers struct {
 	Main   FnOnData
 	Info   FnOnData
 	Custom FnOnData
+}
+
+func validateDataCallbacks(stgy *TradeStrat) {
+	if stgy == nil || stgy.OnData == nil {
+		return
+	}
+	legacy := make([]string, 0, 2)
+	if stgy.OnBar != nil {
+		legacy = append(legacy, "OnBar")
+	}
+	if stgy.OnInfoBar != nil {
+		legacy = append(legacy, "OnInfoBar")
+	}
+	if len(legacy) > 0 {
+		panic(fmt.Sprintf("%s: OnData cannot be combined with %s; route main and info events inside OnData (for example with strat.RouteData)", stgy.Name, strings.Join(legacy, " and ")))
+	}
 }
 
 // RouteData builds an OnData callback that invokes at most one role handler.

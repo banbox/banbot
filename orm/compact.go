@@ -2,10 +2,10 @@ package orm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
-	"testing"
 	"time"
 
 	"github.com/banbox/banexg/log"
@@ -14,65 +14,92 @@ import (
 	"go.uber.org/zap"
 )
 
-// TableCompactMeta holds per-table configuration for the auto-compact mechanism.
-// Each QuestDB logical-deletion table registers its schema metadata here so that
-// MaybeCompact can build the correct CREATE TABLE ... AS (SELECT ... LATEST BY ...)
-// statement without hardcoding SQL per table.
+// TableCompactMeta describes one append-only metadata table maintained by the
+// background compact worker.
 type TableCompactMeta struct {
-	LatestByKeys string        // e.g. "sid, tbl, timeframe, start_ms"
-	SelectCols   string        // columns to copy (excluding is_deleted)
-	PartitionBy  string        // e.g. "MONTH"
-	DedupKeys    string        // e.g. "sid, tbl, timeframe, start_ms, ts"
-	Cooldown     time.Duration // per-table cooldown between checks
+	LatestByKeys     string
+	SelectCols       string
+	PartitionBy      string
+	DedupKeys        string
+	CheckInterval    time.Duration
+	FullScanInterval time.Duration
+	StartupDelay     time.Duration
+	MinPendingRows   int64
 }
 
 var compactTables = map[string]*TableCompactMeta{
-	"exsymbol_q": {
-		LatestByKeys: "sid",
-		SelectCols:   "sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules",
-		PartitionBy:  "YEAR",
-		DedupKeys:    "sid, ts",
-		Cooldown:     12 * time.Hour,
-	},
-	"calendars_q": {
-		LatestByKeys: "market, start_ms",
-		SelectCols:   "ts, market, start_ms, stop_ms",
-		PartitionBy:  "YEAR",
-		DedupKeys:    "market, start_ms, ts",
-		Cooldown:     8 * time.Hour,
-	},
-	"adj_factors_q": {
-		LatestByKeys: "sid, sub_id, start_ms",
-		SelectCols:   "ts, sid, sub_id, start_ms, factor",
-		PartitionBy:  "MONTH",
-		DedupKeys:    "sid, sub_id, start_ms, ts",
-		Cooldown:     12 * time.Hour,
-	},
 	"sranges_q": {
-		LatestByKeys: "sid, tbl, timeframe, start_ms",
-		SelectCols:   "sid, ts, tbl, timeframe, start_ms, stop_ms, has_data",
-		PartitionBy:  "MONTH",
-		DedupKeys:    "sid, tbl, timeframe, start_ms, ts",
-		Cooldown:     2 * time.Hour,
-	},
-	"ins_kline_q": {
-		LatestByKeys: "sid, timeframe",
-		SelectCols:   "sid, timeframe, ts, start_ms, stop_ms",
-		PartitionBy:  "DAY",
-		DedupKeys:    "sid, timeframe, ts",
-		Cooldown:     4 * time.Hour,
+		LatestByKeys:     "sid, tbl, timeframe, start_ms",
+		SelectCols:       "sid, ts, tbl, timeframe, start_ms, stop_ms, has_data",
+		PartitionBy:      "MONTH",
+		DedupKeys:        "sid, tbl, timeframe, start_ms, ts",
+		CheckInterval:    30 * time.Minute,
+		FullScanInterval: 2 * time.Hour,
+		StartupDelay:     30 * time.Second,
+		MinPendingRows:   256,
 	},
 	"kline_un_q": {
-		LatestByKeys: "sid, timeframe",
-		SelectCols:   "sid, timeframe, ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num",
-		PartitionBy:  "MONTH",
-		DedupKeys:    "sid, timeframe, ts",
-		Cooldown:     4 * time.Hour,
+		LatestByKeys:     "sid, timeframe",
+		SelectCols:       "sid, timeframe, ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num",
+		PartitionBy:      "MONTH",
+		DedupKeys:        "sid, timeframe, ts",
+		CheckInterval:    time.Hour,
+		FullScanInterval: 4 * time.Hour,
+		StartupDelay:     time.Minute,
+		MinPendingRows:   128,
+	},
+	"ins_kline_q": {
+		LatestByKeys:     "sid, timeframe",
+		SelectCols:       "sid, timeframe, ts, start_ms, stop_ms",
+		PartitionBy:      "DAY",
+		DedupKeys:        "sid, timeframe, ts",
+		CheckInterval:    2 * time.Hour,
+		FullScanInterval: 6 * time.Hour,
+		StartupDelay:     90 * time.Second,
+		MinPendingRows:   128,
+	},
+	"calendars_q": {
+		LatestByKeys:     "market, start_ms",
+		SelectCols:       "ts, market, start_ms, stop_ms",
+		PartitionBy:      "YEAR",
+		DedupKeys:        "market, start_ms, ts",
+		CheckInterval:    6 * time.Hour,
+		FullScanInterval: 24 * time.Hour,
+		StartupDelay:     2 * time.Minute,
+		MinPendingRows:   64,
+	},
+	"adj_factors_q": {
+		LatestByKeys:     "sid, sub_id, start_ms",
+		SelectCols:       "ts, sid, sub_id, start_ms, factor",
+		PartitionBy:      "MONTH",
+		DedupKeys:        "sid, sub_id, start_ms, ts",
+		CheckInterval:    12 * time.Hour,
+		FullScanInterval: 24 * time.Hour,
+		StartupDelay:     150 * time.Second,
+		MinPendingRows:   128,
+	},
+	"exsymbol_q": {
+		LatestByKeys:     "sid",
+		SelectCols:       "sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules",
+		PartitionBy:      "YEAR",
+		DedupKeys:        "sid, ts",
+		CheckInterval:    12 * time.Hour,
+		FullScanInterval: 24 * time.Hour,
+		StartupDelay:     3 * time.Minute,
+		MinPendingRows:   32,
 	},
 }
 
+var compactTableOrder = []string{
+	"sranges_q",
+	"kline_un_q",
+	"ins_kline_q",
+	"calendars_q",
+	"adj_factors_q",
+	"exsymbol_q",
+}
+
 const (
-	compactCheckProb   = 0.02
 	compactRatioThresh = 0.35
 	compactMinRows     = 500
 )
@@ -80,90 +107,246 @@ const (
 var (
 	compactVerifyTimeout      = 30 * time.Second
 	compactVerifyPollInterval = 100 * time.Millisecond
+	compactWorkerTick         = 15 * time.Second
 )
 
-type compactState struct {
-	mu          sync.Mutex
-	lastCheckAt map[string]time.Time
-	tableLocks  map[string]*sync.RWMutex
+type tableCompactState struct {
+	accessLock      sync.RWMutex
+	pendingRows     int64
+	lastScannedRows int64
+	hasScannedRows  bool
+	baselinePending bool
+	inFlight        bool
+	nextCheckAt     time.Time
+	lastCheckAt     time.Time
+	lastFullScanAt  time.Time
+	lastCompactAt   time.Time
 }
 
-var cptState = &compactState{
-	lastCheckAt: make(map[string]time.Time),
-	tableLocks:  make(map[string]*sync.RWMutex),
+type compactState struct {
+	mu     sync.Mutex
+	tables map[string]*tableCompactState
+}
+
+var cptState = &compactState{tables: make(map[string]*tableCompactState)}
+
+var (
+	compactWorkerMu     sync.Mutex
+	compactWorkerCancel context.CancelFunc
+	compactWorkerDone   chan struct{}
+)
+
+func (s *compactState) getTableState(table string) *tableCompactState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.tables[table]
+	if state == nil {
+		state = &tableCompactState{baselinePending: true}
+		s.tables[table] = state
+	}
+	return state
 }
 
 func (s *compactState) getTableLock(table string) *sync.RWMutex {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if l, ok := s.tableLocks[table]; ok {
-		return l
-	}
-	l := &sync.RWMutex{}
-	s.tableLocks[table] = l
-	return l
+	return &s.getTableState(table).accessLock
 }
 
-// MaybeCompact should be called after logical-delete writes.
-// It probabilistically triggers a compact check, guarded by per-table cooldown.
-func MaybeCompact(tableName string) {
-	if testing.Testing() {
+// LockCompactTableRead makes ordinary reads and writes wait while a table is
+// being replaced. Callers should hold the returned guard for the full logical
+// operation, not just one SQL statement.
+func LockCompactTableRead(table string) func() {
+	unlock, err := lockCompactTableRead(context.Background(), table)
+	if err != nil {
+		panic(fmt.Errorf("acquire shared compact lease for %s: %w", table, err))
+	}
+	return unlock
+}
+
+func lockCompactTableRead(ctx context.Context, table string) (func(), error) {
+	if !IsQuestDB {
+		return func() {}, nil
+	}
+	if _, ok := compactTables[table]; !ok {
+		return func() {}, nil
+	}
+	releaseProcessLock, err := acquireCompactProcessSharedLock(ctx, compactProcessLockRootFn(), table)
+	if err != nil {
+		return nil, err
+	}
+	lock := cptState.getTableLock(table)
+	lock.RLock()
+	return func() {
+		lock.RUnlock()
+		if err := releaseProcessLock(); err != nil {
+			log.Error("release shared compact process lock failed", zap.String("table", table), zap.Error(err))
+		}
+	}, nil
+}
+
+func lockAllCompactTablesRead(ctx context.Context) (func(), error) {
+	unlocks := make([]func(), 0, len(compactTableOrder))
+	for _, table := range compactTableOrder {
+		unlock, err := lockCompactTableRead(ctx, table)
+		if err != nil {
+			for i := len(unlocks) - 1; i >= 0; i-- {
+				unlocks[i]()
+			}
+			return nil, err
+		}
+		unlocks = append(unlocks, unlock)
+	}
+	return func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}, nil
+}
+
+// MarkTableForCompact records append-only versions created since the last
+// expensive check. It never queries QuestDB and is safe on hot write paths.
+func MarkTableForCompact(table string, rows int) {
+	if !IsQuestDB {
 		return
 	}
-	meta, ok := compactTables[tableName]
-	if !ok {
+	if _, ok := compactTables[table]; !ok {
+		return
+	}
+	if rows <= 0 {
 		return
 	}
 	cptState.mu.Lock()
-	last := cptState.lastCheckAt[tableName]
-	if time.Since(last) < meta.Cooldown {
-		cptState.mu.Unlock()
-		return
+	state := cptState.tables[table]
+	if state == nil {
+		state = &tableCompactState{baselinePending: true}
+		cptState.tables[table] = state
 	}
-	if rand.Float64() > compactCheckProb {
-		cptState.mu.Unlock()
-		return
-	}
-	cptState.lastCheckAt[tableName] = time.Now()
+	state.pendingRows += int64(rows)
 	cptState.mu.Unlock()
-
-	go doCompactCheck(tableName, meta)
 }
 
-func doCompactCheck(tableName string, meta *TableCompactMeta) {
-	ctx := context.Background()
-
-	var totalRows int64
-	if err := pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", tableName)).Scan(&totalRows); err != nil {
-		log.Warn("compact_check: count total fail", zap.String("table", tableName), zap.Error(err))
+func startCompactWorker() {
+	if !IsQuestDB || pool == nil {
 		return
 	}
-	if totalRows < compactMinRows {
+	stopCompactWorker()
+
+	now := time.Now()
+	cptState.mu.Lock()
+	for _, table := range compactTableOrder {
+		meta := compactTables[table]
+		state := cptState.tables[table]
+		if state == nil {
+			state = &tableCompactState{}
+			cptState.tables[table] = state
+		}
+		state.baselinePending = true
+		state.inFlight = false
+		state.nextCheckAt = now.Add(meta.StartupDelay)
+	}
+	cptState.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	compactWorkerMu.Lock()
+	compactWorkerCancel = cancel
+	compactWorkerDone = done
+	compactWorkerMu.Unlock()
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(compactWorkerTick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				runCompactMaintenance(ctx, pool, now)
+			}
+		}
+	}()
+}
+
+func stopCompactWorker() {
+	compactWorkerMu.Lock()
+	cancel := compactWorkerCancel
+	done := compactWorkerDone
+	compactWorkerCancel = nil
+	compactWorkerDone = nil
+	compactWorkerMu.Unlock()
+	if cancel == nil {
 		return
 	}
+	cancel()
+	if done != nil {
+		<-done
+	}
+}
 
-	validSQL := fmt.Sprintf(`SELECT count(*) FROM (
-  SELECT %s FROM %s LATEST BY %s WHERE coalesce(is_deleted, false) = false
-)`, meta.SelectCols, tableName, meta.LatestByKeys)
-	var validRows int64
-	if err := pool.QueryRow(ctx, validSQL).Scan(&validRows); err != nil {
-		log.Warn("compact_check: count valid fail", zap.String("table", tableName), zap.Error(err))
+type compactCheckClaim struct {
+	checkAt     time.Time
+	baseline    bool
+	pendingRows int64
+}
+
+func claimCompactCheck(table string, meta *TableCompactMeta, now time.Time) (compactCheckClaim, bool) {
+	cptState.mu.Lock()
+	defer cptState.mu.Unlock()
+	state := cptState.tables[table]
+	if state == nil {
+		state = &tableCompactState{baselinePending: true}
+		cptState.tables[table] = state
+	}
+	if state.inFlight || now.Before(state.nextCheckAt) {
+		return compactCheckClaim{}, false
+	}
+	state.inFlight = true
+	state.lastCheckAt = now
+	state.nextCheckAt = now.Add(meta.CheckInterval)
+	return compactCheckClaim{checkAt: now, baseline: state.baselinePending, pendingRows: state.pendingRows}, true
+}
+
+func finishCompactCheck(table string, claim compactCheckClaim, checked bool, scannedRows int64, compacted bool, retrySoon bool) {
+	now := time.Now()
+	cptState.mu.Lock()
+	defer cptState.mu.Unlock()
+	state := cptState.tables[table]
+	if state == nil {
 		return
 	}
-
-	ratio := float64(validRows) / float64(totalRows)
-	if ratio >= compactRatioThresh {
-		log.Info("compact_check", zap.String("table", tableName),
-			zap.Int64("total", totalRows), zap.Int64("valid", validRows),
-			zap.String("ratio", fmt.Sprintf("%.3f", ratio)), zap.String("action", "skip"))
+	state.inFlight = false
+	if retrySoon {
+		state.nextCheckAt = now.Add(max(compactWorkerTick, time.Second))
+	}
+	if !checked {
 		return
 	}
+	state.baselinePending = false
+	state.lastScannedRows = scannedRows
+	state.hasScannedRows = true
+	state.lastFullScanAt = now
+	state.pendingRows = max(int64(0), state.pendingRows-claim.pendingRows)
+	if compacted {
+		state.lastCompactAt = now
+	}
+}
 
-	log.Info("compact_check", zap.String("table", tableName),
-		zap.Int64("total", totalRows), zap.Int64("valid", validRows),
-		zap.String("ratio", fmt.Sprintf("%.3f", ratio)), zap.String("action", "compact"))
-
-	execCompact(ctx, tableName, meta, totalRows, validRows)
+func runCompactMaintenance(ctx context.Context, db compactDB, now time.Time) {
+	for _, table := range compactTableOrder {
+		if ctx.Err() != nil {
+			return
+		}
+		meta := compactTables[table]
+		claim, ok := claimCompactCheck(table, meta, now)
+		if !ok {
+			continue
+		}
+		checked, scannedRows, compacted, retrySoon, err := maintainCompactTable(ctx, db, table, meta, claim)
+		finishCompactCheck(table, claim, checked, scannedRows, compacted, retrySoon)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Warn("compact_check failed", zap.String("table", table), zap.Error(err))
+		}
+	}
 }
 
 type compactDB interface {
@@ -171,19 +354,200 @@ type compactDB interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-func queryCompactRowCount(ctx context.Context, db compactDB, tableName string) (int64, error) {
+type compactTableMetrics struct {
+	rowCount    *int64
+	pendingRows *int64
+	walTxn      *int64
+	tableTxn    *int64
+	suspended   bool
+}
+
+func queryCompactTableMetrics(ctx context.Context, db compactDB, table string) (compactTableMetrics, error) {
+	var metrics compactTableMetrics
+	err := db.QueryRow(ctx, `SELECT table_row_count, wal_pending_row_count, wal_txn, table_txn, table_suspended
+FROM tables() WHERE table_name = $1`, table).Scan(
+		&metrics.rowCount,
+		&metrics.pendingRows,
+		&metrics.walTxn,
+		&metrics.tableTxn,
+		&metrics.suspended,
+	)
+	return metrics, err
+}
+
+func (m compactTableMetrics) walApplied() bool {
+	if m.suspended {
+		return false
+	}
+	if m.pendingRows != nil && *m.pendingRows > 0 {
+		return false
+	}
+	return m.walTxn == nil || m.tableTxn == nil || *m.walTxn <= *m.tableTxn
+}
+
+func maintainCompactTable(ctx context.Context, db compactDB, table string, meta *TableCompactMeta, claim compactCheckClaim) (bool, int64, bool, bool, error) {
+	metrics, err := queryCompactTableMetrics(ctx, db, table)
+	if err != nil {
+		return false, 0, false, true, err
+	}
+	if !metrics.walApplied() {
+		return false, 0, false, true, nil
+	}
+
+	cptState.mu.Lock()
+	state := cptState.tables[table]
+	lastScannedRows := int64(0)
+	hasScannedRows := false
+	lastFullScanAt := time.Time{}
+	if state != nil {
+		lastScannedRows = state.lastScannedRows
+		hasScannedRows = state.hasScannedRows
+		lastFullScanAt = state.lastFullScanAt
+	}
+	cptState.mu.Unlock()
+
+	fullScanDue := claim.baseline || lastFullScanAt.IsZero() || !claim.checkAt.Before(lastFullScanAt.Add(meta.FullScanInterval))
+	if !fullScanDue && claim.pendingRows < meta.MinPendingRows && metrics.rowCount != nil && *metrics.rowCount < compactMinRows {
+		return false, lastScannedRows, false, false, nil
+	}
+	rowDeltaSmall := metrics.rowCount != nil && hasScannedRows && absInt64(*metrics.rowCount-lastScannedRows) < meta.MinPendingRows
+	if !fullScanDue && claim.pendingRows < meta.MinPendingRows && rowDeltaSmall {
+		return false, lastScannedRows, false, false, nil
+	}
+
+	totalRows, validRows, needed, err := queryCompactStats(ctx, db, table, meta)
+	if err != nil {
+		return false, 0, false, true, err
+	}
+	if !needed {
+		return true, totalRows, false, false, nil
+	}
+
+	releaseProcessLock, acquired, err := tryAcquireCompactProcessExclusiveLock(compactProcessLockRootFn(), table)
+	if err != nil {
+		return false, 0, false, true, err
+	}
+	if !acquired {
+		return false, 0, false, true, nil
+	}
+	defer func() {
+		if err := releaseProcessLock(); err != nil {
+			log.Warn("release compact process lock failed", zap.String("table", table), zap.Error(err))
+		}
+	}()
+
+	lock := cptState.getTableLock(table)
+	lock.Lock()
+	defer lock.Unlock()
+
+	sourceTxn, err := waitForCompactWalApplied(ctx, db, table)
+	if err != nil {
+		return false, 0, false, true, err
+	}
+	totalRows, validRows, needed, err = queryCompactStats(ctx, db, table, meta)
+	if err != nil {
+		return false, 0, false, true, err
+	}
+	if !needed {
+		return true, totalRows, false, false, nil
+	}
+	stableTxn, err := waitForCompactWalApplied(ctx, db, table)
+	if err != nil {
+		return false, 0, false, true, err
+	}
+	if stableTxn != sourceTxn {
+		return false, 0, false, true, fmt.Errorf("source table changed while compact snapshot was prepared: table=%s before_txn=%d after_txn=%d", table, sourceTxn, stableTxn)
+	}
+	if err := execCompactLocked(ctx, db, table, meta, totalRows, validRows, stableTxn); err != nil {
+		return false, 0, false, true, err
+	}
+	return true, validRows, true, false, nil
+}
+
+func absInt64(value int64) int64 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func queryCompactStats(ctx context.Context, db compactDB, table string, meta *TableCompactMeta) (int64, int64, bool, error) {
+	totalRows, err := queryCompactRowCount(ctx, db, table)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if totalRows < compactMinRows {
+		return totalRows, totalRows, false, nil
+	}
+	validSQL := fmt.Sprintf(`SELECT count(*) FROM (
+  SELECT %s FROM %s LATEST BY %s WHERE coalesce(is_deleted, false) = false
+)`, meta.SelectCols, table, meta.LatestByKeys)
+	var validRows int64
+	if err := db.QueryRow(ctx, validSQL).Scan(&validRows); err != nil {
+		return 0, 0, false, err
+	}
+	ratio := float64(validRows) / float64(totalRows)
+	return totalRows, validRows, ratio < compactRatioThresh, nil
+}
+
+func queryCompactWalFallback(ctx context.Context, db compactDB, table string) (int64, bool, bool, error) {
+	var sequencerTxn, writerTxn int64
+	var lagTxnCount int64
+	var suspended bool
+	err := db.QueryRow(ctx, `SELECT sequencerTxn, writerTxn, writerLagTxnCount, suspended
+FROM wal_tables() WHERE name = $1`, table).Scan(&sequencerTxn, &writerTxn, &lagTxnCount, &suspended)
+	if err != nil {
+		return 0, false, false, err
+	}
+	return sequencerTxn, writerTxn >= sequencerTxn && lagTxnCount == 0, suspended, nil
+}
+
+func compactWalApplied(ctx context.Context, db compactDB, table string) (int64, bool, bool, error) {
+	metrics, err := queryCompactTableMetrics(ctx, db, table)
+	if err != nil {
+		return 0, false, false, err
+	}
+	if metrics.walTxn == nil || metrics.tableTxn == nil {
+		return queryCompactWalFallback(ctx, db, table)
+	}
+	return *metrics.walTxn, metrics.walApplied(), metrics.suspended, nil
+}
+
+func waitForCompactWalApplied(ctx context.Context, db compactDB, table string) (int64, error) {
+	deadline := time.Now().Add(compactVerifyTimeout)
+	for {
+		walTxn, applied, suspended, err := compactWalApplied(ctx, db, table)
+		if err != nil {
+			return 0, err
+		}
+		if applied {
+			return walTxn, nil
+		}
+		if suspended {
+			return 0, fmt.Errorf("source WAL table is suspended: %s", table)
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("source WAL not fully applied before compact timeout: table=%s timeout=%s", table, compactVerifyTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(compactVerifyPollInterval):
+		}
+	}
+}
+
+func queryCompactRowCount(ctx context.Context, db compactDB, table string) (int64, error) {
 	var count int64
-	err := db.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", tableName)).Scan(&count)
+	err := db.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", table)).Scan(&count)
 	return count, err
 }
 
-func waitCompactVisibleCount(ctx context.Context, db compactDB, tableName string, expected int64) (int64, error) {
-	// QuestDB WAL tables acknowledge writes before rows are fully applied/visible.
-	// Poll until the compact snapshot reaches the expected visible row count.
+func waitCompactVisibleCount(ctx context.Context, db compactDB, table string, expected int64) (int64, error) {
 	deadline := time.Now().Add(compactVerifyTimeout)
 	var lastCount int64
 	for {
-		count, err := queryCompactRowCount(ctx, db, tableName)
+		count, err := queryCompactRowCount(ctx, db, table)
 		if err != nil {
 			return 0, err
 		}
@@ -205,15 +569,18 @@ func waitCompactVisibleCount(ctx context.Context, db compactDB, tableName string
 	}
 }
 
-func compactTempTableName(tableName string) string {
-	return fmt.Sprintf("%s_compact_%d_%06d", tableName, time.Now().UnixNano(), rand.Intn(1000000))
+func compactTempTableName(table string) string {
+	return fmt.Sprintf("%s_compact_%d_%06d", table, time.Now().UnixNano(), rand.Intn(1000000))
 }
 
-func execCompact(ctx context.Context, tableName string, meta *TableCompactMeta, beforeTotal, expectedRows int64) {
-	start := time.Now()
-	tmpTable := compactTempTableName(tableName)
-	db := compactDB(pool)
+func compactBackupTableName(table string) string {
+	return fmt.Sprintf("%s_backup_%d_%06d", table, time.Now().UnixNano(), rand.Intn(1000000))
+}
 
+func execCompactLocked(ctx context.Context, db compactDB, table string, meta *TableCompactMeta, beforeTotal, expectedRows, sourceTxn int64) error {
+	start := time.Now()
+	tmpTable := compactTempTableName(table)
+	backupTable := compactBackupTableName(table)
 	createSQL := fmt.Sprintf(`CREATE TABLE %s AS (
   SELECT %s,
          cast(false as boolean) as is_deleted
@@ -221,45 +588,44 @@ func execCompact(ctx context.Context, tableName string, meta *TableCompactMeta, 
   LATEST BY %s
   WHERE coalesce(is_deleted, false) = false
 ) TIMESTAMP(ts) PARTITION BY %s WAL
-DEDUP UPSERT KEYS(%s)`,
-		tmpTable, meta.SelectCols, tableName, meta.LatestByKeys, meta.PartitionBy, meta.DedupKeys)
+DEDUP UPSERT KEYS(%s)`, tmpTable, meta.SelectCols, table, meta.LatestByKeys, meta.PartitionBy, meta.DedupKeys)
 
 	if _, err := db.Exec(ctx, createSQL); err != nil {
-		log.Error("compact_error", zap.String("table", tableName),
-			zap.String("step", "create_new"), zap.Error(err))
-		return
+		return fmt.Errorf("create compact table: %w", err)
 	}
-
 	newCount, err := waitCompactVisibleCount(ctx, db, tmpTable, expectedRows)
 	if err != nil {
-		log.Error("compact_error", zap.String("table", tableName),
-			zap.String("step", "verify_count"),
-			zap.Int64("expected", expectedRows),
-			zap.Error(err))
 		_, _ = db.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tmpTable))
-		return
+		return fmt.Errorf("verify compact table: %w", err)
 	}
-
-	tblLock := cptState.getTableLock(tableName)
-	tblLock.Lock()
-	defer tblLock.Unlock()
-
-	if _, err := db.Exec(ctx, fmt.Sprintf("DROP TABLE %s", tableName)); err != nil {
-		log.Error("compact_error", zap.String("table", tableName),
-			zap.String("step", "drop_old"), zap.Error(err))
-		return
+	stableTxn, err := waitForCompactWalApplied(ctx, db, table)
+	if err != nil {
+		_, _ = db.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tmpTable))
+		return err
 	}
-	if _, err := db.Exec(ctx, fmt.Sprintf("RENAME TABLE %s TO %s", tmpTable, tableName)); err != nil {
-		log.Error("compact_error", zap.String("table", tableName),
-			zap.String("step", "rename"),
-			zap.Error(err),
-			zap.String("recovery", "old table dropped, new data in "+tmpTable))
-		return
+	if stableTxn != sourceTxn {
+		_, _ = db.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tmpTable))
+		return fmt.Errorf("source table changed during compact: table=%s before_txn=%d after_txn=%d", table, sourceTxn, stableTxn)
 	}
-
-	elapsed := time.Since(start)
-	log.Info("compact_done", zap.String("table", tableName),
-		zap.Int64("before", beforeTotal), zap.Int64("after", newCount),
+	if _, err := db.Exec(ctx, fmt.Sprintf("RENAME TABLE %s TO %s", table, backupTable)); err != nil {
+		_, _ = db.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tmpTable))
+		return fmt.Errorf("rename source to backup: %w", err)
+	}
+	if _, err := db.Exec(ctx, fmt.Sprintf("RENAME TABLE %s TO %s", tmpTable, table)); err != nil {
+		_, restoreErr := db.Exec(ctx, fmt.Sprintf("RENAME TABLE %s TO %s", backupTable, table))
+		if restoreErr != nil {
+			return fmt.Errorf("activate compact table: %w; restore source failed: %v; backup=%s temp=%s", err, restoreErr, backupTable, tmpTable)
+		}
+		return fmt.Errorf("activate compact table: %w; source restored; temp=%s", err, tmpTable)
+	}
+	if _, err := db.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", backupTable)); err != nil {
+		log.Warn("compact backup cleanup failed", zap.String("table", table), zap.String("backup", backupTable), zap.Error(err))
+	}
+	log.Info("compact_done",
+		zap.String("table", table),
+		zap.Int64("before", beforeTotal),
+		zap.Int64("after", newCount),
 		zap.String("ratio", fmt.Sprintf("%.3f", float64(newCount)/float64(max(beforeTotal, 1)))),
-		zap.Duration("elapsed", elapsed))
+		zap.Duration("elapsed", time.Since(start)))
+	return nil
 }

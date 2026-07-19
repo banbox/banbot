@@ -4,6 +4,7 @@ import (
 	"github.com/banbox/banbot/web/dev"
 	"github.com/banbox/banbot/web/live"
 	"github.com/banbox/banexg/errs"
+	"github.com/spf13/cobra"
 )
 
 /*
@@ -14,6 +15,10 @@ Run web UI robot panel
 */
 func RunDev(args []string) error {
 	return dev.Run(args)
+}
+
+func NewCommand() *cobra.Command {
+	return dev.NewCommand()
 }
 
 /*

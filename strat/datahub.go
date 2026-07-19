@@ -20,21 +20,23 @@ type DataHub struct {
 }
 
 type DataFields struct {
-	mu           sync.RWMutex
-	seriesMap    map[string]*ta.Series
-	valMap       map[string]any
-	DoneMS       int64
-	TimeMS       int64
-	Source       string
-	Sid          int32
-	TimeFrame    string
-	Closed       bool
-	IsWarmUp     bool
-	env          *ta.BarEnv
-	seriesFields map[string]bool
-	autoSeries   bool
-	configured   bool
-	limit        int
+	mu            sync.RWMutex
+	seriesMap     map[string]*ta.Series
+	valMap        map[string]any
+	DoneMS        int64
+	TimeMS        int64
+	Source        string
+	Sid           int32
+	TimeFrame     string
+	Closed        bool
+	IsWarmUp      bool
+	env           *ta.BarEnv
+	seriesFields  map[string]bool
+	seriesNames   []string
+	seriesNameSet map[string]struct{}
+	autoSeries    bool
+	configured    bool
+	limit         int
 }
 
 func NewDataHub(limit ...int) *DataHub {
@@ -160,10 +162,16 @@ func (d *DataFields) configure(names []string) {
 		d.autoSeries = true
 		return
 	}
+	changed := false
 	for _, name := range names {
-		if name != "" {
-			d.seriesFields[name] = true
+		if name == "" {
+			continue
 		}
+		d.seriesFields[name] = true
+		changed = d.addSeriesNameLocked(name) || changed
+	}
+	if changed {
+		sort.Strings(d.seriesNames)
 	}
 }
 
@@ -190,27 +198,21 @@ func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 	d.Closed = evt.Closed
 	d.IsWarmUp = evt.IsWarmUp
 
-	selected := make(map[string]bool, len(d.seriesFields)+len(d.seriesMap))
-	for name := range d.seriesFields {
-		selected[name] = true
-	}
-	for name := range d.seriesMap {
-		selected[name] = true
-	}
-	if d.autoSeries {
-		for name, value := range evt.Values {
-			if isFloatValue(value) {
-				selected[name] = true
-			}
-		}
-	}
-
+	changed := false
 	for name, value := range evt.Values {
-		if !selected[name] {
+		_, selected := d.seriesNameSet[name]
+		if !selected && d.autoSeries && isFloatValue(value) {
+			selected = true
+			changed = d.addSeriesNameLocked(name) || changed
+		}
+		if !selected {
 			d.valMap[name] = value
 		}
 	}
-	if len(selected) == 0 {
+	if changed {
+		sort.Strings(d.seriesNames)
+	}
+	if len(d.seriesNames) == 0 {
 		return
 	}
 	if d.env == nil {
@@ -223,12 +225,7 @@ func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 	d.env.TimeStart = evt.TimeMS
 	d.env.TimeStop = endMS
 	d.env.BarNum++
-	names := make([]string, 0, len(selected))
-	for name := range selected {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range d.seriesNames {
 		value := math.NaN()
 		if raw, ok := evt.Values[name]; ok {
 			if num, err := utils.ToFloat64(raw); err == nil {
@@ -248,6 +245,18 @@ func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 		}
 		delete(d.valMap, name)
 	}
+}
+
+func (d *DataFields) addSeriesNameLocked(name string) bool {
+	if _, exists := d.seriesNameSet[name]; exists {
+		return false
+	}
+	if d.seriesNameSet == nil {
+		d.seriesNameSet = make(map[string]struct{}, len(d.seriesFields)+len(d.seriesMap)+1)
+	}
+	d.seriesNameSet[name] = struct{}{}
+	d.seriesNames = append(d.seriesNames, name)
+	return true
 }
 
 func (d *DataFields) Series(name string) *ta.Series {

@@ -1,37 +1,26 @@
 除了使用banbot的[内置终端命令](../guide/bot_usage.md)，您也可以注册并执行自己的终端命令。
 
-### 注册常规函数
-您可通过`entry.AddCmdJob`方法注册终端命令函数：
-```go
-entry.AddCmdJob(&entry.CmdJob{
-    Name:    "hello",
-    Parent:  "",
-	Run: func(args *config.CmdArgs) *errs.Error {
-        fmt.Println("hello")
-        return nil
-    },
-    Options: []string{},
-    Help:    "show hello",
-})
-```
-`Parent` 必须是已经注册的命令组；根命令使用空字符串。若需要添加子命令，请先通过 `entry.AddGroup` 注册父组。
-然后您可以通过`bot hello`触发执行`showHello`函数。此函数将接受一个`*config.CmdArgs`参数，存储解析后的命令行参数，如果您需要访问相关参数，请在`Options`中填写需要访问的字段名。
-所有可用的字段名可参考[entry/main](https://github.com/banbox/banbot/blob/main/entry/main.go)中的`bindSubFlags`函数；公共参数的字段绑定在 `config.CmdArgs.BindToFlag` 中。
+### 注册命令
 
-### 注册任意参数的函数
-固定的`Options`和`*config.CmdArgs`可能难以满足您的个性化需求。
-您也可以使用RunRaw替换Run，然后自行解析命令行参数：
+Banbot 使用 Cobra。通过 `entry.AddCommand` 注册 `*cobra.Command`，命令专属参数直接保存在命令自己的局部变量中：
+
 ```go
-entry.AddCmdJob(&entry.CmdJob{
-    Name:   "hello",
-    Parent: "",
-    RunRaw: func(args []string) error {
-        fmt.Println(strings.Join(args, " "))
+var greeting string
+
+helloCmd := &cobra.Command{
+    Use:   "hello",
+    Short: "显示问候语",
+    Args:  cobra.NoArgs,
+    RunE: func(cmd *cobra.Command, args []string) error {
+        fmt.Println(greeting)
         return nil
     },
-    Help:    "show hello",
-})
+}
+helloCmd.Flags().StringVar(&greeting, "greeting", "hello", "问候语")
+entry.AddCommand("", helloCmd)
 ```
+
+`AddCommand` 的第一个参数是父命令组；根命令使用空字符串。需要新命令组时，先调用 `entry.AddGroup`。帮助、参数校验、flag 解析和错误输出由 Cobra 统一处理。新增命令或参数不再需要修改 `config.CmdArgs` 或中央参数注册表。
 
 ## 内置工具命令
 

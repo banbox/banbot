@@ -250,11 +250,14 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 
 func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.DataSeries, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
 	symbol := evt.Symbol()
-	envKey := strings.Join([]string{symbol, evt.TimeFrame}, "_")
-	infoKey := strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)
+	envKey := symbol + "_" + evt.TimeFrame
 	strat.LockJobsRead()
 	jobs, _ := strat.GetJobs(account)[envKey]
-	infoJobs, _ := strat.GetInfoJobs(account)[infoKey]
+	infoJobMap := strat.GetInfoJobs(account)
+	var infoJobs map[string]*strat.StratJob
+	if len(infoJobMap) > 0 {
+		infoJobs = infoJobMap[strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)]
+	}
 	strat.UnlockJobsRead()
 	if len(jobs) == 0 && len(infoJobs) == 0 {
 		return nil
@@ -263,9 +266,14 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 	var err *errs.Error
 	isWarmup := evt.IsWarmUp
 	var wg sync.WaitGroup
-	handledJobs := make(map[*strat.StratJob]bool, len(jobs))
+	var handledJobs map[*strat.StratJob]bool
+	if len(infoJobs) > 0 {
+		handledJobs = make(map[*strat.StratJob]bool, len(jobs))
+	}
 	for _, job := range jobs {
-		handledJobs[job] = true
+		if handledJobs != nil {
+			handledJobs[job] = true
+		}
 		fields := job.SetData(evt)
 		job.IsWarmUp = isWarmup
 		job.InitBar(curOrders)

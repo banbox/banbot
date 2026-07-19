@@ -29,7 +29,7 @@ Public fields:
 - `OnData` - Receives a unified `strat.DataEvent`, which embeds updated Series/latest values from `*strat.DataFields` and identifies primary K-lines, auxiliary K-lines, or custom time-series
 - `OnWsData` - Receives websocket time-series events
 
-Assign `OnData` directly when there are no auxiliary or custom subscriptions. Use `KlineData`, `CustomData`, or `RouteData(DataHandlers{...})` when event filtering is required.
+Assign `OnData` directly when there are no auxiliary or custom subscriptions. Use `RouteData(DataHandlers{...})` when event filtering is required. `OnData` cannot be configured together with `OnBar` or `OnInfoBar`.
 
 ### StratJob
 Strategy task instance, responsible for executing specific trading operations.

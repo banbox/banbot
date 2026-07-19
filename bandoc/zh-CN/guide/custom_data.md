@@ -83,21 +83,23 @@ strat.AddStrat(&strat.TradeStrat{
             SeriesFields: []string{"rate"},
         }}
     },
-    OnData: strat.CustomData(func(job *strat.StratJob, data strat.DataEvent) {
-        if data.Source != "funding_rate" {
-            return
-        }
-        rate := data.Float64("rate")
-        if !job.DataHub.AllReady() {
-            return
-        }
-        latest := job.DataHub.Get(data.TimeFrame, data.Source, data.Sid)
-        _, _ = rate, latest
+    OnData: strat.RouteData(strat.DataHandlers{
+        Custom: func(job *strat.StratJob, data strat.DataEvent) {
+            if data.Source != "funding_rate" {
+                return
+            }
+            rate := data.Float64("rate")
+            if !job.DataHub.AllReady() {
+                return
+            }
+            latest := job.DataHub.Get(data.TimeFrame, data.Source, data.Sid)
+            _, _ = rate, latest
+        },
     }),
 })
 ```
 
-`DataEvent` 嵌入了 `*DataFields`，所以可直接使用 `Series`、`Float64` 等原有字段方法。没有辅助或自定义订阅时可直接赋值 `OnData`；需要过滤全部 K 线或自定义时序时，使用 `KlineData` 或 `CustomData`；不同数据类型需要不同逻辑时，使用 `RouteData(DataHandlers{Main: ..., Info: ..., Custom: ...})`。`OnData` 已定义时，同一主事件不会再重复触发旧 `OnBar`。
+`DataEvent` 嵌入了 `*DataFields`，所以可直接使用 `Series`、`Float64` 等原有字段方法。没有辅助或自定义订阅时可直接赋值 `OnData`；需要过滤或分别处理主周期、辅助 K 线和自定义时序时，使用 `RouteData(DataHandlers{Main: ..., Info: ..., Custom: ...})`。`OnData` 不能与 `OnBar` 或 `OnInfoBar` 同时配置；策略构建会直接报错，避免主 K 线逻辑被静默跳过或重复执行。
 
 `TimeFrame` 必须与数据源的 `SeriesInfo` 一致。启动时 banbot 会按 `(source, sid, timeframe)` 合并重复订阅，合并字段列表，并采用最大的 `WarmupNum`。回测会先回填再按时间顺序将数据与 K 线一起回放；实盘会先补齐历史，再激活实时订阅。未注册 source、周期不一致或声明订阅却未提供 `OnData`/兼容回调都会导致启动失败。
 

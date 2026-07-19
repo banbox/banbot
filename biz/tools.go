@@ -6,7 +6,6 @@ import (
 	"encoding/csv"
 	"encoding/gob"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -31,6 +30,7 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
+	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
 
@@ -900,58 +900,80 @@ func RunHistSeries(args *RunHistSeriesArgs) *errs.Error {
 	return err
 }
 
+type downOrdersOptions struct {
+	configs  config.ArrString
+	exchange string
+	market   string
+	account  string
+	pairs    string
+	start    string
+	end      string
+	force    bool
+}
+
 func DownExgOrders(args []string) error {
-	var exchange, market, account, pairs string
-	var timeStart, timeEnd string
-	var force bool
-	var configPaths config.ArrString
-	var sub = flag.NewFlagSet("cmp", flag.ExitOnError)
-	sub.Var(&configPaths, "config", "config path to use, Multiple -config options may be used")
-	sub.StringVar(&account, "account", "", "account for api-key to fetch exchange orders")
-	sub.StringVar(&exchange, "exchange", "", "exchange id")
-	sub.StringVar(&market, "market", "", "spot/linear/inverse/option")
-	sub.StringVar(&timeStart, "timestart", "", "set start time, allow multiple formats")
-	sub.StringVar(&timeEnd, "timeend", "", "set start time, allow multiple formats")
-	sub.StringVar(&pairs, "pairs", "", "symbols, comma separated")
-	sub.BoolVar(&force, "force", false, "force check from order stamp")
-	err_ := sub.Parse(args)
-	if err_ != nil {
-		return err_
+	command := NewDownExgOrdersCommand()
+	command.SetArgs(args)
+	return command.Execute()
+}
+
+func NewDownExgOrdersCommand() *cobra.Command {
+	options := &downOrdersOptions{}
+	command := &cobra.Command{
+		Use:     "down-order",
+		Aliases: []string{"down_order"},
+		Short:   "download exchange orders for an account",
+		Args:    cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runDownExgOrders(options)
+		},
 	}
+	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")
+	command.Flags().StringVar(&options.account, "account", "", "account whose API key will fetch orders")
+	command.Flags().StringVar(&options.exchange, "exchange", "", "exchange identifier")
+	command.Flags().StringVar(&options.market, "market", "", "market: spot, linear, inverse, or option")
+	command.Flags().StringVar(&options.start, "timestart", "", "start time in a supported time format")
+	command.Flags().StringVar(&options.end, "timeend", "", "end time in a supported time format")
+	command.Flags().StringVar(&options.pairs, "pairs", "", "comma-separated symbols")
+	command.Flags().BoolVar(&options.force, "force", false, "force checking from the order timestamp")
+	return command
+}
+
+func runDownExgOrders(options *downOrdersOptions) error {
 	core.SetRunMode(core.RunModeLive)
-	err := SetupComs(&config.CmdArgs{Configs: configPaths})
+	err := SetupComs(&config.CmdArgs{Configs: options.configs})
 	if err != nil {
 		return err
 	}
-	if exchange == "" {
-		exchange = core.ExgName
+	if options.exchange == "" {
+		options.exchange = core.ExgName
 	}
-	if market == "" {
-		market = core.Market
+	if options.market == "" {
+		options.market = core.Market
 	}
-	if pairs == "" {
-		pairs = strings.Join(config.Pairs, ",")
+	if options.pairs == "" {
+		options.pairs = strings.Join(config.Pairs, ",")
 	}
-	if timeStart == "" || timeEnd == "" {
+	if options.start == "" || options.end == "" {
 		return errors.New("timestart or timeend is required")
 	}
-	if account == "" || pairs == "" {
+	if options.account == "" || options.pairs == "" {
 		return errors.New("`account` or `pairs` is required")
 	}
-	save, err := GetExgOrderSet(account, exchange, market)
+	save, err := GetExgOrderSet(options.account, options.exchange, options.market)
 	if err != nil {
 		return err
 	}
-	startMS, err_ := btime.ParseTimeMS(timeStart)
+	startMS, err_ := btime.ParseTimeMS(options.start)
 	if err_ != nil {
 		return err_
 	}
-	endMS, err_ := btime.ParseTimeMS(timeEnd)
+	endMS, err_ := btime.ParseTimeMS(options.end)
 	if err_ != nil {
 		return err_
 	}
-	pairArr := strings.Split(pairs, ",")
-	err = save.Download(startMS, endMS, pairArr, force)
+	pairArr := strings.Split(options.pairs, ",")
+	err = save.Download(startMS, endMS, pairArr, options.force)
 	if err != nil {
 		return err
 	}

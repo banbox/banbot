@@ -12,7 +12,7 @@ go build -o bot.exe
 
 您直接执行`bot`将启动WebUI界面，您可访问`http://localhost:8000`进行策略管理、回测、分析交易等。
 
-使用 `bot -help` 查看当前版本的命令组；常用根命令包括 `trade`、`backtest`、`spider`、`optimize`、`bt_opt`、`web` 和 `init`，数据工具位于 `data`、`kline`、`tick`、`tool`、`live` 命令组中。
+使用 `bot --help` 查看当前版本的命令组；常用根命令包括 `trade`、`backtest`、`spider`、`optimize`、`bt-opt`、`web` 和 `init`，数据工具位于 `data`、`kline`、`tick`、`tool`、`live` 命令组中。旧的下划线命令名仍作为别名可用。
 
 ## 通用命令参数
 
@@ -27,9 +27,9 @@ go build -o bot.exe
 
 **命令帮助信息**
 
-您可以通过在命令后面添加`-help`或`-h`参数，显示帮助信息。
+您可以通过在命令后面添加 `--help` 或 `-h` 参数显示帮助信息。
 
-所有配置型命令都支持 `-datadir`、重复的 `-config`、`-no-default`、`-config-data`、`-logfile`、`-level` 和 `-max-pool-size`。`-dlock` 用于启用死锁检测；`-cpu-profile`、`-mem-profile` 和 `-net-off` 为运行诊断选项。各子命令仅接受其声明的额外参数，请以 `bot <command> -help` 的输出为准。
+所有配置型命令都支持 `--datadir`、重复的 `--config`、`--no-default`、`--config-data`、`--logfile`、`--level` 和 `--max-pool-size`。`--dlock` 用于启用死锁检测；`--cpu-profile`、`--mem-profile` 和 `--net-off` 为运行诊断选项。各子命令仅接受其声明的额外参数，请以 `bot <command> --help` 的输出为准。旧的单横线长参数仍兼容。
 
 ## 启动WebUI研究&amp;回测
 
@@ -351,4 +351,3 @@ banbot tool:
     bt_factor:      backtest factors with orders
     bt_result:      build backtest result from orders.gob and config
 ```
-

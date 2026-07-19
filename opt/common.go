@@ -3,6 +3,7 @@ package opt
 import (
 	_ "embed"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -47,11 +48,12 @@ var (
 )
 
 type OptGroup struct {
-	Items []*OptInfo
-	Score float64
-	Name  string
-	Pair  string
-	TFStr string
+	Items  []*OptInfo
+	Source *config.RunPolicyConfig
+	Score  float64
+	Name   string
+	Pair   string
+	TFStr  string
 }
 
 type OptInfo struct {
@@ -115,17 +117,22 @@ func (o *OptInfo) runGetBtResult(pol *config.RunPolicyConfig) {
 	o.BTResult = bt.BTResult
 }
 
-func (o *OptInfo) ToPol(idx int, name, dirt, tfStr, pairStr string) *config.RunPolicyConfig {
-	if o.Dirt == "" {
-		o.Dirt = dirt
+func (o *OptInfo) ToPol(source *config.RunPolicyConfig, idx int, name, dirt, tfStr, pairStr string) *config.RunPolicyConfig {
+	var res *config.RunPolicyConfig
+	if source == nil {
+		res = &config.RunPolicyConfig{}
+	} else {
+		res = source.Clone()
 	}
-	res := &config.RunPolicyConfig{
-		Index:  idx,
-		Name:   name,
-		Dirt:   o.Dirt,
-		Params: o.Params,
-		Score:  o.Score,
+	res.Index = idx
+	res.Name = name
+	res.Dirt = o.Dirt
+	if res.Dirt == "" {
+		res.Dirt = dirt
 	}
+	res.Params = maps.Clone(o.Params)
+	res.PairParams = nil
+	res.Score = o.Score
 	if len(tfStr) > 0 {
 		res.RunTimeframes = strings.Split(tfStr, "|")
 	}
@@ -186,7 +193,7 @@ func (t *rollBtOpt) next(pairPicker string) (string, *errs.Error) {
 	t.setReviewRange()
 	fname := fmt.Sprintf("opt_%v.log", t.dateRange.StartMS/1000)
 	t.args.OutPath = filepath.Join(t.outDir, fname)
-	polStr, err := pickFromExists(t.args.OutPath, t.args.Picker, pairPicker)
+	polStr, err := pickFromExists(t.args.OutPath, t.args.Picker, pairPicker, t.initPols)
 	if err != nil {
 		return "", err
 	}
@@ -247,7 +254,7 @@ func (o *OptInfo) ToLine() string {
 			}
 			params[k] = v
 		}
-		text = utils.MapToStr(params, true, 2)
+		text = utils.MapToStr(params, true, -1)
 		text += "\t"
 	}
 	return fmt.Sprintf("loss: %7.2f \t%s \t%s, id: %v", -o.Score, text, o.BriefLine(), o.ID)

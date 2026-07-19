@@ -29,7 +29,7 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `OnData`: 接收统一的 `strat.DataEvent`；事件嵌入已更新 Series/最新值的 `*strat.DataFields`，并标识主周期、辅助 K 线或自定义时序
 - `OnWsData`: 接收 websocket 时序事件
 
-没有辅助或自定义订阅时直接赋值 `OnData`。需要过滤时可使用 `KlineData`、`CustomData`，或使用 `RouteData(DataHandlers{...})` 分别处理三类事件。
+没有辅助或自定义订阅时直接赋值 `OnData`。需要过滤时使用 `RouteData(DataHandlers{...})` 分别处理三类事件。`OnData` 不能与 `OnBar` 或 `OnInfoBar` 同时配置。
 
 ### StratJob
 策略任务实例，负责执行具体的交易操作。

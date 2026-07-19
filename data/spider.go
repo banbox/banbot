@@ -233,30 +233,16 @@ type LiveSpider struct {
 	miners map[string]*Miner
 }
 
-type SpiderStartupHook func(ctx context.Context, spider *LiveSpider) error
+type SpiderStartupFunc func(ctx context.Context, spider *LiveSpider) error
 
-type SpiderOption func(*spiderOptions)
-
-type spiderOptions struct {
-	ctx          context.Context
-	startupHooks []SpiderStartupHook
-}
-
-func WithSpiderStartupHook(hook SpiderStartupHook) SpiderOption {
-	return func(opts *spiderOptions) {
-		if hook != nil {
-			opts.startupHooks = append(opts.startupHooks, hook)
-		}
-	}
-}
-
-type spiderRuntimeDeps struct {
-	newServer    func(addr, aesKey string) *utils.ServerIO
-	startWriteQ  func(workNum int)
-	ormConn      func(ctx context.Context) (spiderQueries, spiderConnRelease, *errs.Error)
-	runForever   func(spider *LiveSpider) *errs.Error
-	startMonitor func(spider *LiveSpider)
-	startCron    func()
+type spiderRuntime struct {
+	newServer           func(addr, aesKey string) *utils.ServerIO
+	ensureDBCompression func(ctx context.Context) *errs.Error
+	ormConn             func(ctx context.Context) (spiderQueries, spiderConnRelease, *errs.Error)
+	startWriteQ         func(workNum int)
+	startMonitor        func(spider *LiveSpider)
+	startCron           func()
+	runForever          func(spider *LiveSpider) *errs.Error
 }
 
 type spiderQueries interface {
@@ -267,49 +253,30 @@ type spiderConnRelease interface {
 	Release()
 }
 
-var defaultSpiderRuntimeDeps = spiderRuntimeDeps{
-	newServer: utils.NewBanServer,
-	startWriteQ: func(workNum int) {
-		go consumeSeriesWriteQ(workNum)
-	},
-	ormConn: func(ctx context.Context) (spiderQueries, spiderConnRelease, *errs.Error) {
-		sess, conn, err := orm.Conn(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		return sess, conn, nil
-	},
-	runForever: func(spider *LiveSpider) *errs.Error {
-		return spider.RunForever(0, 0)
-	},
-	startMonitor: func(spider *LiveSpider) {
-		go spider.monitorSubscriptions()
-	},
-	startCron: func() {
-		com.Cron().Start()
-	},
-}
-
-func (d spiderRuntimeDeps) withDefaults() spiderRuntimeDeps {
-	if d.newServer == nil {
-		d.newServer = defaultSpiderRuntimeDeps.newServer
+func newSpiderRuntime() spiderRuntime {
+	return spiderRuntime{
+		newServer:           utils.NewBanServer,
+		ensureDBCompression: orm.EnsureTimescaleCompression,
+		ormConn: func(ctx context.Context) (spiderQueries, spiderConnRelease, *errs.Error) {
+			sess, conn, err := orm.Conn(ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			return sess, conn, nil
+		},
+		startWriteQ: func(workNum int) {
+			go consumeSeriesWriteQ(workNum)
+		},
+		startMonitor: func(spider *LiveSpider) {
+			go spider.monitorSubscriptions()
+		},
+		startCron: func() {
+			com.Cron().Start()
+		},
+		runForever: func(spider *LiveSpider) *errs.Error {
+			return spider.RunForever(0, 0)
+		},
 	}
-	if d.startWriteQ == nil {
-		d.startWriteQ = defaultSpiderRuntimeDeps.startWriteQ
-	}
-	if d.ormConn == nil {
-		d.ormConn = defaultSpiderRuntimeDeps.ormConn
-	}
-	if d.runForever == nil {
-		d.runForever = defaultSpiderRuntimeDeps.runForever
-	}
-	if d.startMonitor == nil {
-		d.startMonitor = defaultSpiderRuntimeDeps.startMonitor
-	}
-	if d.startCron == nil {
-		d.startCron = defaultSpiderRuntimeDeps.startCron
-	}
-	return d
 }
 
 // monitorSubscriptions periodically checks all miners for failed subscriptions and restarts them
@@ -813,7 +780,9 @@ func (m *Miner) startLoopKLines() {
 						bars = bars[:len(bars)-1]
 					}
 					if len(bars) > 0 {
+						pairLock.Lock()
 						barNum += len(bars)
+						pairLock.Unlock()
 						sta.ExpectMS = bars[len(bars)-1].Time + mntMSecs
 						exs := orm.GetSymbolByID(sta.Sid)
 						rows := orm.KLinesToSeries(exs, curTF, bars, nil, false, true)
@@ -865,41 +834,44 @@ func (m *Miner) startLoopKLines() {
 	})
 }
 
-func RunSpider(addr string, opts ...SpiderOption) *errs.Error {
-	return runSpiderWithDeps(addr, defaultSpiderRuntimeDeps, opts...)
+func RunSpider(addr string) *errs.Error {
+	return RunSpiderWith(addr, nil)
 }
 
-func runSpiderWithDeps(addr string, deps spiderRuntimeDeps, opts ...SpiderOption) *errs.Error {
-	cfg := newSpiderOptions(opts...)
-	ctx := cfg.ctx
-	if ctx == nil {
-		ctx = spiderContext()
-	}
-	deps = deps.withDefaults()
-	server := deps.newServer(addr, "")
+func RunSpiderWith(addr string, startup SpiderStartupFunc) *errs.Error {
+	return newSpiderRuntime().run(spiderContext(), addr, startup)
+}
+
+func (r spiderRuntime) run(ctx context.Context, addr string, startup SpiderStartupFunc) *errs.Error {
+	server := r.newServer(addr, "")
 	if server == nil {
 		return errs.NewMsg(core.ErrRunTime, "spider server is nil")
+	}
+	if err := r.ensureDBCompression(ctx); err != nil {
+		return err
 	}
 	Spider = &LiveSpider{
 		ServerIO: server,
 		miners:   map[string]*Miner{},
 	}
 	server.InitConn = makeInitConn(Spider)
-	if err := purgeSpiderKlineUn(ctx, deps); err != nil {
+	if err := r.purgeKlineUn(ctx); err != nil {
 		return err
 	}
-	if err := runSpiderStartupHooks(ctx, Spider, cfg.startupHooks); err != nil {
-		return err
+	if startup != nil {
+		if err := startup(ctx, Spider); err != nil {
+			return errs.New(core.ErrRunTime, fmt.Errorf("spider startup: %w", err))
+		}
 	}
 
-	deps.startWriteQ(5)
-	deps.startMonitor(Spider)
-	deps.startCron()
-	return deps.runForever(Spider)
+	r.startWriteQ(5)
+	r.startMonitor(Spider)
+	r.startCron()
+	return r.runForever(Spider)
 }
 
-func purgeSpiderKlineUn(ctx context.Context, deps spiderRuntimeDeps) *errs.Error {
-	sess, conn, err := deps.ormConn(ctx)
+func (r spiderRuntime) purgeKlineUn(ctx context.Context) *errs.Error {
+	sess, conn, err := r.ormConn(ctx)
 	if err != nil {
 		return err
 	}
@@ -912,33 +884,11 @@ func purgeSpiderKlineUn(ctx context.Context, deps spiderRuntimeDeps) *errs.Error
 	return sess.PurgeKlineUn()
 }
 
-func newSpiderOptions(opts ...SpiderOption) spiderOptions {
-	cfg := spiderOptions{}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&cfg)
-		}
-	}
-	return cfg
-}
-
 func spiderContext() context.Context {
 	if core.Ctx != nil {
 		return core.Ctx
 	}
 	return context.Background()
-}
-
-func runSpiderStartupHooks(ctx context.Context, spider *LiveSpider, hooks []SpiderStartupHook) *errs.Error {
-	for i, hook := range hooks {
-		if hook == nil {
-			continue
-		}
-		if err := hook(ctx, spider); err != nil {
-			return errs.New(core.ErrRunTime, fmt.Errorf("spider startup hook %d: %w", i+1, err))
-		}
-	}
-	return nil
 }
 
 func (s *LiveSpider) getMiner(exgName, market string) *Miner {

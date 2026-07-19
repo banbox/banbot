@@ -2,9 +2,11 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -938,34 +940,40 @@ api_server.users[*].pwd
 func (c *Config) Desensitize() *Config {
 	var res = c.Clone()
 
-	if res.Accounts != nil {
-		for _, acc := range res.Accounts {
-			acc.Exchanges = nil
-			acc.APIServer = nil
+	if c.Accounts != nil {
+		res.Accounts = make(map[string]*AccountConfig, len(c.Accounts))
+		for name, acc := range c.Accounts {
+			if acc == nil {
+				res.Accounts[name] = nil
+				continue
+			}
+			item := *acc
+			item.RPCChannels = make([]map[string]interface{}, len(acc.RPCChannels))
+			for i, channel := range acc.RPCChannels {
+				item.RPCChannels[i] = cloneStringMap(channel)
+			}
+			item.Exchanges = nil
+			item.APIServer = nil
+			res.Accounts[name] = &item
 		}
 	}
 
 	// 处理数据库配置
 	if c.Database != nil {
-		res.Database = &DatabaseConfig{
-			Url:         "",
-			Retention:   c.Database.Retention,
-			MaxPoolSize: c.Database.MaxPoolSize,
-			AutoCreate:  c.Database.AutoCreate,
-			QdbMemPct:   c.Database.QdbMemPct,
-			QdbMaxMemMB: c.Database.QdbMaxMemMB,
-		}
+		item := *c.Database
+		item.Url = ""
+		res.Database = &item
 	}
 
 	// 处理RPC通道配置
 	if c.RPCChannels != nil {
-		res.RPCChannels = make(map[string]map[string]interface{})
+		res.RPCChannels = make(map[string]map[string]interface{}, len(c.RPCChannels))
 		for channelName, channelConfig := range c.RPCChannels {
 			chlType := utils.GetMapVal(channelConfig, "type", "")
-			resChannel := make(map[string]interface{})
-			for k, v := range channelConfig {
-				if !strings.Contains(strings.ToLower(k), "secret") {
-					resChannel[k] = v
+			resChannel := cloneStringMap(channelConfig)
+			for key := range resChannel {
+				if strings.Contains(strings.ToLower(key), "secret") {
+					delete(resChannel, key)
 				}
 			}
 			if chlType == "wework" {
@@ -982,23 +990,22 @@ func (c *Config) Desensitize() *Config {
 
 	// 处理API服务器配置
 	if c.APIServer != nil {
-		res.APIServer = &APIServerConfig{
-			Enable:      c.APIServer.Enable,
-			BindIPAddr:  c.APIServer.BindIPAddr,
-			Port:        c.APIServer.Port,
-			Verbosity:   c.APIServer.Verbosity,
-			CORSOrigins: c.APIServer.CORSOrigins,
-		}
+		item := *c.APIServer
+		item.JWTSecretKey = ""
+		item.CORSOrigins = slices.Clone(c.APIServer.CORSOrigins)
 		if c.APIServer.Users != nil {
-			res.APIServer.Users = make([]*UserConfig, len(c.APIServer.Users))
+			item.Users = make([]*UserConfig, len(c.APIServer.Users))
 			for i, user := range c.APIServer.Users {
-				res.APIServer.Users[i] = &UserConfig{
-					Username:    user.Username,
-					AccRoles:    user.AccRoles,
-					ExpireHours: user.ExpireHours,
+				if user != nil {
+					userCopy := *user
+					userCopy.Password = ""
+					userCopy.AllowIPs = slices.Clone(user.AllowIPs)
+					userCopy.AccRoles = maps.Clone(user.AccRoles)
+					item.Users[i] = &userCopy
 				}
 			}
 		}
+		res.APIServer = &item
 	}
 
 	return res
@@ -1130,69 +1137,72 @@ func (c *RunPolicyConfig) KeepHyperOnly(keys ...string) {
 }
 
 func (c *RunPolicyConfig) ToYaml() string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("  - name: %s\n", c.Name))
-	if c.Dirt != "" {
-		b.WriteString(fmt.Sprintf("    dirt: %s\n", c.Dirt))
+	data, err := core.MarshalYaml([]*RunPolicyConfig{c})
+	if err != nil {
+		panic(fmt.Sprintf("marshal run policy fail: %v", err))
 	}
-	if len(c.RunTimeframes) > 0 {
-		b.WriteString(fmt.Sprintf("    run_timeframes: [ %s ]\n", strings.Join(c.RunTimeframes, ", ")))
-	}
-	if len(c.Pairs) > 0 {
-		b.WriteString(fmt.Sprintf("    pairs: [ %s ]\n", strings.Join(c.Pairs, ", ")))
-	}
-	argText := utils2.MapToStr(c.Params, true, 2)
-	if len(c.Pairs) == 1 {
-		b.WriteString("    pair_params:\n")
-		b.WriteString(fmt.Sprintf("      %s: {%s}\n", c.Pairs[0], argText))
-	} else {
-		b.WriteString(fmt.Sprintf("    params: {%s}\n", argText))
-	}
-	return b.String()
+	text := strings.TrimSuffix(string(data), "\n")
+	return "  " + strings.ReplaceAll(text, "\n", "\n  ") + "\n"
 }
 
 func (c *RunPolicyConfig) Clone() *RunPolicyConfig {
-	res := &RunPolicyConfig{
-		Index:         c.Index,
-		Name:          c.Name,
-		Filters:       c.Filters,
-		RunTimeframes: c.RunTimeframes,
-		MaxPair:       c.MaxPair,
-		MaxOpen:       c.MaxOpen,
-		MaxSimulOpen:  c.MaxSimulOpen,
-		Dirt:          c.Dirt,
-		StratPerf:     c.StratPerf,
-		Pairs:         c.Pairs,
-		Params:        make(map[string]float64),
-		PairParams:    make(map[string]map[string]float64),
-		More:          make(map[string]interface{}),
-		defs:          make(map[string]*core.Param),
+	res := *c
+	res.RunTimeframes = slices.Clone(c.RunTimeframes)
+	res.Pairs = slices.Clone(c.Pairs)
+	res.Params = maps.Clone(c.Params)
+	res.PairParams = make(map[string]map[string]float64, len(c.PairParams))
+	for pair, params := range c.PairParams {
+		res.PairParams[pair] = maps.Clone(params)
 	}
-	if len(c.Params) > 0 {
-		for k, v := range c.Params {
-			res.Params[k] = v
+	res.Filters = make([]*CommonPairFilter, len(c.Filters))
+	for i, filter := range c.Filters {
+		if filter != nil {
+			item := *filter
+			item.Items = cloneStringMap(filter.Items)
+			res.Filters[i] = &item
 		}
 	}
-	if len(c.PairParams) > 0 {
-		for k, mp := range c.PairParams {
-			pairPms := make(map[string]float64)
-			for k2, v := range mp {
-				pairPms[k2] = v
-			}
-			res.PairParams[k] = pairPms
+	if c.StratPerf != nil {
+		item := *c.StratPerf
+		res.StratPerf = &item
+	}
+	res.More = cloneStringMap(c.More)
+	res.defs = make(map[string]*core.Param, len(c.defs))
+	for name, def := range c.defs {
+		if def != nil {
+			item := *def
+			res.defs[name] = &item
 		}
 	}
-	if len(c.More) > 0 {
-		for k, v := range c.More {
-			res.More[k] = v
-		}
+	return &res
+}
+
+func cloneStringMap(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return nil
 	}
-	if len(c.defs) > 0 {
-		for k, v := range c.defs {
-			res.defs[k] = v
-		}
+	res := make(map[string]interface{}, len(src))
+	for key, val := range src {
+		res[key] = cloneConfigValue(val)
 	}
 	return res
+}
+
+func cloneConfigValue(val interface{}) interface{} {
+	switch item := val.(type) {
+	case map[string]interface{}:
+		return cloneStringMap(item)
+	case []interface{}:
+		res := make([]interface{}, len(item))
+		for i, val := range item {
+			res[i] = cloneConfigValue(val)
+		}
+		return res
+	case []string:
+		return slices.Clone(item)
+	default:
+		return item
+	}
 }
 
 func (c *RunPolicyConfig) PairDup(pair string) (*RunPolicyConfig, bool) {

@@ -1,7 +1,6 @@
 package dev
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,34 +22,48 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/gofiber/fiber/v2"
+	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
 
 func Run(args []string) error {
+	if args == nil {
+		args = os.Args[1:]
+	}
+	command := NewCommand()
+	command.SetArgs(args)
+	return command.Execute()
+}
+
+func NewCommand() *cobra.Command {
 	isDocker := utils.IsDocker()
-	var ag = &CmdArgs{}
-	var f = flag.NewFlagSet("web", flag.ExitOnError)
-	f.IntVar(&ag.Port, "port", 8000, "port to listen")
+	ag := &CmdArgs{}
 	defHost := "127.0.0.1"
 	if isDocker {
 		defHost = "0.0.0.0"
 	}
-	f.StringVar(&ag.Host, "host", defHost, "bind host ip")
-	f.StringVar(&ag.LogLevel, "level", "info", "log level")
-	f.StringVar(&ag.TimeZone, "tz", "", "timezone")
-	f.StringVar(&ag.DataDir, "datadir", "", "Path to data dir.")
-	f.StringVar(&ag.Password, "password", "", "password required to access WebUI")
-	f.StringVar(&ag.ConfigData, "config-data", "", "yaml config string")
-	f.Var(&ag.Configs, "config", "config path to use, Multiple -config options may be used")
-	f.StringVar(&ag.LogFile, "logfile", "", "log file path, default: system temp dir")
-	if args == nil {
-		args = os.Args[1:]
+	command := &cobra.Command{
+		Use:   "web",
+		Short: "run the Web UI",
+		Args:  cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runWeb(ag)
+		},
 	}
-	err_ := f.Parse(args)
-	if err_ != nil {
-		return err_
-	}
-	if err_ = validateWebAuth(ag.Host, ag.Password); err_ != nil {
+	command.Flags().IntVar(&ag.Port, "port", 8000, "port to listen on")
+	command.Flags().StringVar(&ag.Host, "host", defHost, "host IP to bind")
+	command.Flags().StringVar(&ag.LogLevel, "level", "info", "logging level")
+	command.Flags().StringVar(&ag.TimeZone, "tz", "", "timezone")
+	command.Flags().StringVar(&ag.DataDir, "datadir", "", "path to the data directory")
+	command.Flags().StringVar(&ag.Password, "password", "", "password required to access the Web UI")
+	command.Flags().StringVar(&ag.ConfigData, "config-data", "", "inline YAML config")
+	command.Flags().StringArrayVar((*[]string)(&ag.Configs), "config", nil, "config path; may be repeated")
+	command.Flags().StringVar(&ag.LogFile, "logfile", "", "log file path; defaults to the system temp directory")
+	return command
+}
+
+func runWeb(ag *CmdArgs) error {
+	if err_ := validateWebAuth(ag.Host, ag.Password); err_ != nil {
 		return err_
 	}
 
@@ -70,12 +83,13 @@ func Run(args []string) error {
 	// 初始化基础数据
 	core.SetRunMode(core.RunModeLive)
 	banArg := &config.CmdArgs{
-		DataDir:    ag.DataDir,
-		LogLevel:   ag.LogLevel,
-		TimeZone:   ag.TimeZone,
-		Configs:    ag.Configs,
-		ConfigData: ag.ConfigData,
-		Logfile:    ag.LogFile,
+		DataDir:     ag.DataDir,
+		LogLevel:    ag.LogLevel,
+		TimeZone:    ag.TimeZone,
+		Configs:     ag.Configs,
+		ConfigData:  ag.ConfigData,
+		Logfile:     ag.LogFile,
+		AutoCompact: true,
 	}
 	var err2 *errs.Error
 	if err2 = biz.SetupComsExg(banArg); err2 != nil {
@@ -88,7 +102,7 @@ func Run(args []string) error {
 			return err2
 		}
 	}
-	err_ = collectBtResults()
+	err_ := collectBtResults()
 	if err_ != nil {
 		return err_
 	}
@@ -136,7 +150,7 @@ func Run(args []string) error {
 	}
 
 	// 延迟500ms打开浏览器
-	if isDocker {
+	if utils.IsDocker() {
 		log.Info("please open browser to: " + openUrl)
 	} else {
 		utils.OpenBrowserDelay(openUrl, 500)

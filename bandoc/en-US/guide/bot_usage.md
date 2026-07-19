@@ -10,7 +10,7 @@ Then you can use this executable file directly to start the UI, backtest, hyperp
 
 Directly executing `bot` will start the WebUI interface at `http://localhost:8000`, through which you can manage strategies, backtest, analyze transactions, etc.
 
-Use `bot -help` to see the command groups for the current version. Common root commands include `trade`, `backtest`, `spider`, `optimize`, `bt_opt`, `web`, and `init`; data tools are grouped under `data`, `kline`, `tick`, `tool`, and `live`.
+Use `bot --help` to see the command groups for the current version. Common root commands include `trade`, `backtest`, `spider`, `optimize`, `bt-opt`, `web`, and `init`; data tools are grouped under `data`, `kline`, `tick`, `tool`, and `live`. Legacy underscore command names remain available as aliases.
 ## Common command parameters
 
 **Data directory (-datadir)**
@@ -25,9 +25,9 @@ If these two have already covered the parameters you need this time, you do not 
 
 **Command help information**
 
-You can display help information by adding `-help` or `-h` parameters after the command.
+You can display help information by adding `--help` or `-h` after the command.
 
-All configuration-based commands support `-datadir`, repeated `-config`, `-no-default`, `-config-data`, `-logfile`, `-level`, and `-max-pool-size`. Use `-dlock` to enable deadlock detection; `-cpu-profile`, `-mem-profile`, and `-net-off` are runtime diagnostic options. Each subcommand accepts only the additional parameters it declares; use `bot <command> -help` as the source of truth.
+All configuration-based commands support `--datadir`, repeated `--config`, `--no-default`, `--config-data`, `--logfile`, `--level`, and `--max-pool-size`. Use `--dlock` to enable deadlock detection; `--cpu-profile`, `--mem-profile`, and `--net-off` are runtime diagnostic options. Each subcommand accepts only the additional parameters it declares; use `bot <command> --help` as the source of truth. Legacy single-dash long options remain accepted for compatibility.
 
 ## Start WebUI Research & Backtesting
 To facilitate your strategy research and backtesting, we provide WebUI visualization. You can edit strategies online, start backtesting, view profit and loss curves, analyze orders, etc. through WebUI.
