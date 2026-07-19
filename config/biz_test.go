@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/banbox/banbot/core"
@@ -341,4 +342,50 @@ func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 	if model := sanitized.LLMModels["primary"]; model == nil || model.APIKey != "" || model.BaseURL != "https://llm.example" {
 		t.Fatal("LLM secret was retained or non-sensitive fields were dropped")
 	}
+}
+
+func TestRuntimeAccountUpdatesDoNotRaceWithConfigDump(t *testing.T) {
+	runtimeAccount := &AccountConfig{
+		RPCChannels: []map[string]interface{}{{"options": map[string]interface{}{"format": "compact"}}},
+		APIServer:   &AccPwdRole{Pwd: "password", Role: "admin"},
+		Exchanges: map[string]*ExgApiSecrets{
+			"binance": {Prod: &ApiSecretConfig{APIKey: "key", APISecret: "secret"}},
+		},
+	}
+	runtimeAccounts := map[string]*AccountConfig{"primary": runtimeAccount}
+	snapshot := &Config{Accounts: cloneAccountConfigs(runtimeAccounts)}
+
+	snapshotAccount := snapshot.Accounts["primary"]
+	if snapshotAccount == runtimeAccount || snapshotAccount.APIServer == runtimeAccount.APIServer ||
+		snapshotAccount.Exchanges["binance"] == runtimeAccount.Exchanges["binance"] ||
+		snapshotAccount.Exchanges["binance"].Prod == runtimeAccount.Exchanges["binance"].Prod {
+		t.Fatal("config snapshot shares account secrets with runtime state")
+	}
+	snapshotAccount.RPCChannels[0]["options"].(map[string]interface{})["format"] = "verbose"
+	if runtimeAccount.RPCChannels[0]["options"].(map[string]interface{})["format"] != "compact" {
+		t.Fatal("config snapshot shares nested account RPC state")
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				runtimeAccount.NoTrade = !runtimeAccount.NoTrade
+				runtimeAccount.StakePctAmt++
+			}
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		if _, err := snapshot.Desensitize().DumpYaml(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(done)
+	wg.Wait()
 }

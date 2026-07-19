@@ -426,7 +426,9 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 	Loaded = true
 	Name = c.Name
 	Args = args
+	runtimeAccounts := c.Accounts
 	Data = *c
+	Data.Accounts = cloneAccountConfigs(runtimeAccounts)
 	if args.DataDir != "" {
 		DataDir = args.DataDir
 	}
@@ -582,7 +584,7 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 			return setErr
 		}
 	}
-	err = initExgAccs(args, c.Accounts)
+	err = initExgAccs(args, runtimeAccounts)
 	if err != nil {
 		return err
 	}
@@ -968,21 +970,11 @@ llm_models.*.api_key
 func (c *Config) Desensitize() *Config {
 	var res = c.Clone()
 
-	if c.Accounts != nil {
-		res.Accounts = make(map[string]*AccountConfig, len(c.Accounts))
-		for name, acc := range c.Accounts {
-			if acc == nil {
-				res.Accounts[name] = nil
-				continue
-			}
-			item := *acc
-			item.RPCChannels = make([]map[string]interface{}, len(acc.RPCChannels))
-			for i, channel := range acc.RPCChannels {
-				item.RPCChannels[i] = cloneStringMap(channel)
-			}
-			item.Exchanges = nil
-			item.APIServer = nil
-			res.Accounts[name] = &item
+	res.Accounts = cloneAccountConfigs(c.Accounts)
+	for _, account := range res.Accounts {
+		if account != nil {
+			account.Exchanges = nil
+			account.APIServer = nil
 		}
 	}
 
@@ -1217,6 +1209,50 @@ func cloneStringMap(src map[string]interface{}) map[string]interface{} {
 	res := make(map[string]interface{}, len(src))
 	for key, val := range src {
 		res[key] = cloneConfigValue(val)
+	}
+	return res
+}
+
+func cloneAccountConfigs(src map[string]*AccountConfig) map[string]*AccountConfig {
+	if src == nil {
+		return nil
+	}
+	res := make(map[string]*AccountConfig, len(src))
+	for name, account := range src {
+		if account == nil {
+			res[name] = nil
+			continue
+		}
+		item := *account
+		item.StakePctAmt = 0
+		item.RPCChannels = make([]map[string]interface{}, len(account.RPCChannels))
+		for i, channel := range account.RPCChannels {
+			item.RPCChannels[i] = cloneStringMap(channel)
+		}
+		if account.APIServer != nil {
+			apiServer := *account.APIServer
+			item.APIServer = &apiServer
+		}
+		if account.Exchanges != nil {
+			item.Exchanges = make(map[string]*ExgApiSecrets, len(account.Exchanges))
+			for exchange, secrets := range account.Exchanges {
+				if secrets == nil {
+					item.Exchanges[exchange] = nil
+					continue
+				}
+				secretCopy := &ExgApiSecrets{}
+				if secrets.Prod != nil {
+					prod := *secrets.Prod
+					secretCopy.Prod = &prod
+				}
+				if secrets.Test != nil {
+					test := *secrets.Test
+					secretCopy.Test = &test
+				}
+				item.Exchanges[exchange] = secretCopy
+			}
+		}
+		res[name] = &item
 	}
 	return res
 }
