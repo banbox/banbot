@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"maps"
 	"math"
-	"slices"
 
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/strat"
@@ -76,8 +75,7 @@ func (p *Provider[IDataFeeder]) SubWarmPairs(items map[string]map[string]int, de
 	var warmJobs []*WarmJob
 	var oldSince = make(map[string]int64)
 	var err *errs.Error
-	for _, pair := range slices.Sorted(maps.Keys(items)) {
-		tfWarms := items[pair]
+	for pair, tfWarms := range items {
 		hold, ok := p.holders[pair]
 		if !ok {
 			hold, err = p.newFeeder(pair, utils.KeysOfMap(tfWarms))
