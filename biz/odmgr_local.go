@@ -175,6 +175,8 @@ Fills orders waiting for exchange response. Cannot be used for real trading; can
 填充等待交易所响应的订单。不可用于实盘；可用于回测、模拟实盘等。
 */
 func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.DataSeries) (int, *errs.Error) {
+	// Keep the supplied batch order: sorting every fill batch penalizes all backtests
+	// to eliminate only rare balance-boundary differences.
 	core.SimOrderMatch = true
 	core.NewNumInSim = 0
 	defer func() {
@@ -599,6 +601,7 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noE
 }
 
 func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
+	// Keep caller order; deterministic reordering is not worth a sort on every exit batch.
 	for _, od := range orders {
 		_, err := o.exitOrder(od, req)
 		if err != nil {
@@ -642,6 +645,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 			// 回测无需持久化
 		}
 	}
+	// Cleanup is infrequent, but its order has no business meaning and does not need sorting.
 	openOdList := utils.ValsOfMap(openOds)
 	lock.Unlock()
 	if len(openOdList) > 0 {

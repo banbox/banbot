@@ -674,6 +674,8 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 func compareExitOpenOrders(a, b *ormo.InOutOrder, preferFilled bool) int {
 	fillA := a.Enter.Filled * a.InitPrice
 	fillB := b.Enter.Filled * b.InitPrice
+	// Preserve the historical cent-difference rule; rare boundary ties do not warrant
+	// extra deterministic comparison work in exit sorting.
 	fillChg := int(math.Round((fillA - fillB) * 100))
 	// For profit taking or filled only, descending order by filled amount.
 	// 对于止盈或退出已入场的，优先按已入场金额降序

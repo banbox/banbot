@@ -100,7 +100,7 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries) *errs.Error {
 	}
 	subKey := strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)
 	dispatched := false
-	// Deliberately do not sort accounts: this is a backtest hot path.
+	// Do not sort accounts: this runs for every series event and order-sensitive edges are rare.
 	for account, cfg := range config.Accounts {
 		if cfg.NoTrade {
 			continue
@@ -121,7 +121,7 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries) *errs.Error {
 }
 
 func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSeries) {
-	// Deliberately do not sort jobs: this is a backtest hot path.
+	// Do not sort jobs: deterministic callbacks do not justify per-event sorting.
 	for _, job := range jobMap {
 		fields := job.SetData(evt)
 		job.IsWarmUp = evt.IsWarmUp
@@ -153,7 +153,7 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 	accOrders := make(map[string][]*ormo.InOutOrder)
 	com.SetBarPrice(symbol, closeVal)
 	if odMatch && !evt.IsWarmUp {
-		// Deliberately do not sort accounts: this is a backtest hot path.
+		// Do not sort accounts or open orders on this per-bar wallet update hot path.
 		for account, cfg := range config.Accounts {
 			if cfg.NoTrade {
 				continue
@@ -197,7 +197,7 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 	var wg sync.WaitGroup
 	var runErr *errs.Error
 	var accOdArr = make([]string, 0, len(config.Accounts))
-	// Deliberately do not sort accounts: this is a backtest hot path.
+	// Do not sort accounts: a rare marginal admission difference is cheaper than every-bar sorting.
 	for account, cfg := range config.Accounts {
 		if cfg.NoTrade {
 			continue
@@ -274,7 +274,7 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 	if len(infoJobs) > 0 {
 		handledJobs = make(map[*strat.StratJob]bool, len(jobs))
 	}
-	// Deliberately do not sort jobs: this is a backtest hot path.
+	// Do not sort jobs: this callback loop runs for every account series event.
 	for _, job := range jobs {
 		if handledJobs != nil {
 			handledJobs[job] = true
@@ -305,7 +305,7 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 			return err
 		}
 	}
-	// Deliberately do not sort jobs: this is a backtest hot path.
+	// Do not sort informational jobs for the same hot-path reason.
 	for _, job := range infoJobs {
 		if handledJobs[job] {
 			continue

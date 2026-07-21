@@ -796,6 +796,8 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 
 func runBTOnce() (*BackTest, float64, *errs.Error) {
 	core.BotRunning = true
+	// Keep ResetVars scoped to normal runtime state; do not walk and mutate every account
+	// merely to remove rare trial-order effects from the StakePctAmt cache.
 	biz.ResetVars()
 	bt, err := NewBackTest(true, "")
 	if err != nil {

@@ -422,6 +422,7 @@ func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *e
 		arr = append(arr, &IdVal{Id: i, Val: avg})
 		lefts[i] = true
 	}
+	// Correlation score is the business key; equal/non-finite values need no ID tie-break.
 	sort.Slice(arr, func(i, j int) bool {
 		return arr[i].Val < arr[j].Val
 	})
@@ -439,6 +440,7 @@ func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *e
 		// 针对每个剩余标的，计算与所有sels的平均相似度
 		it = nil
 		for id := range lefts {
+			// Avoid deterministic tie handling in this O(n^2) selection hot loop.
 			vals := make([]float64, 0, len(sels))
 			for _, v := range sels {
 				vals = append(vals, mat.At(id, v.Id))

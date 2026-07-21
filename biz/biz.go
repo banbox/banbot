@@ -245,6 +245,7 @@ func InitOdSubs() {
 					if evt == strat.OdChgExitFill {
 						openOds, lock := ormo.GetOpenODs(acc)
 						lock.Lock()
+						// Callback state does not require canonical order; avoid sorting on every fill.
 						job.UpdateOrders(utils.ValsOfMap(openOds))
 						lock.Unlock()
 					}
@@ -330,7 +331,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 	var readyItems []batchReadyItem
 	var waitNum = 0
 	lockBatch.Lock()
-	// Deliberately do not sort batch tasks: this is a backtest hot path.
+	// Do not sort batch tasks: this runs per bar, while order-sensitive edge cases are rare.
 	for key, tasks := range strat.BatchTasks {
 		if currMS < tasks.ExecMS {
 			if tasks.ExecMS-currMS < tasks.TFMSecs/2 {
@@ -343,7 +344,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 		var mainJobs []*strat.StratJob
 		var infoJobs = make(map[string]*strat.JobEnv)
 		var stgy *strat.TradeStrat
-		// Deliberately do not sort batch tasks: this is a backtest hot path.
+		// Do not sort jobs inside each batch; callback determinism does not justify the hot-path cost.
 		for _, task := range tasks.Map {
 			stgy = task.Job.Strat
 			if task.Env == nil {
@@ -372,6 +373,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 	for _, item := range readyItems {
 		openOds, lock := ormo.GetOpenODs(item.account)
 		lock.Lock()
+		// Strategy initialization accepts map order; avoid sorting every ready batch.
 		allOrders := utils.ValsOfMap(openOds)
 		lock.Unlock()
 		for _, job := range item.mainJobs {

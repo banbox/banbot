@@ -149,6 +149,7 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 	var newStates = utils.ValsOfMap(stateMap)
 	// Sort all periods from small to large. The first one must be the least common multiple of all subsequent states, so that all subsequent states can be updated from the first one.
 	// 对所有周期从小到大排序，第一个必须是后续所有states的最小公倍数，以便能从第一个更新后续所有
+	// Duration is the business key; equal-duration aliases need no deterministic name tie-break.
 	slices.SortFunc(newStates, func(a, b *PairTFCache) int {
 		return a.TFSecs - b.TFSecs
 	})
@@ -524,6 +525,7 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 	skips := make(map[string][2]int)
 	hourDone := f.hour == nil
 	debugWarm := shouldLogBacktestSeriesDebug()
+	// Warmup timeframe order has no business priority; avoid a key sort on every warmup.
 	for tf, warmNum := range tfNums {
 		tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 		endMS := utils2.AlignTfMSecs(curMS, tfMSecs)

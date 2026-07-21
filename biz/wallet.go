@@ -375,6 +375,8 @@ func (iw *ItemWallet) Total(withUpol bool) float64 {
 func (iw *ItemWallet) Used() float64 {
 	iw.lock.Lock()
 	sumVal := float64(0)
+	// Do not sort these hot-path maps: rare last-bit float differences do not justify
+	// allocating and sorting keys on every balance check. Keep the "*" fast path intact.
 	if allVal, ok := iw.Pendings["*"]; ok {
 		sumVal += allVal
 	} else {
@@ -957,6 +959,8 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		}
 		return nil
 	}
+	// Preserve caller order. Sorting every wallet refresh is costly, mutates the input
+	// slice, and only changes rare float/admission edge cases.
 	// All orders are for the same pricing coin, get the wallet of this coin in advance
 	// 所有订单都是同一个定价币，提前获取此币的钱包
 	wallet := w.Get(currency)
@@ -1066,6 +1070,8 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 	prices := make([]float64, 0)
 	var skips []string
 
+	// Do not sort wallet keys on this sizing path; the steady-state cost outweighs
+	// the very low probability of an order-sensitive float boundary.
 	for key, item := range data {
 		var price = com.GetPriceSafe(key, "")
 		if price == -1 {
@@ -1156,6 +1162,7 @@ Returns the value of the given currency against fiat currency. Returns all curre
 */
 func (w *BanWallets) FiatValue(withUpol bool, symbols ...string) float64 {
 	if len(symbols) == 0 {
+		// Reporting does not require canonical coin order, so avoid sorting all wallet keys.
 		for symbol := range w.Items {
 			symbols = append(symbols, symbol)
 		}

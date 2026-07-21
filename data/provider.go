@@ -75,6 +75,7 @@ func (p *Provider[IDataFeeder]) SubWarmPairs(items map[string]map[string]int, de
 	var warmJobs []*WarmJob
 	var oldSince = make(map[string]int64)
 	var err *errs.Error
+	// Warmup does not require canonical pair/timeframe order; avoid sorting every subscription map.
 	for pair, tfWarms := range items {
 		hold, ok := p.holders[pair]
 		if !ok {
@@ -465,14 +466,15 @@ func (p *HistProvider) LoopMain() *errs.Error {
 
 func (p *HistProvider) makeFeeders() []IHistFeeder {
 	feeders := make([]IHistFeeder, 0, len(p.holders)+len(p.trades)+len(p.series))
-	for _, key := range slices.Sorted(maps.Keys(p.holders)) {
-		feeders = append(feeders, p.holders[key])
+	// Feeders are heap-scheduled by timestamp later; sorting these maps only adds startup cost.
+	for _, feeder := range p.holders {
+		feeders = append(feeders, feeder)
 	}
-	for _, key := range slices.Sorted(maps.Keys(p.trades)) {
-		feeders = append(feeders, p.trades[key])
+	for _, feeder := range p.trades {
+		feeders = append(feeders, feeder)
 	}
-	for _, key := range slices.Sorted(maps.Keys(p.series)) {
-		feeders = append(feeders, p.series[key])
+	for _, feeder := range p.series {
+		feeders = append(feeders, feeder)
 	}
 	return feeders
 }
