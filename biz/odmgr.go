@@ -1,7 +1,6 @@
 package biz
 
 import (
-	"cmp"
 	"fmt"
 	"maps"
 	"math"
@@ -675,7 +674,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 func compareExitOpenOrders(a, b *ormo.InOutOrder, preferFilled bool) int {
 	fillA := a.Enter.Filled * a.InitPrice
 	fillB := b.Enter.Filled * b.InitPrice
-	fillChg := cmp.Compare(math.Round(fillA*100), math.Round(fillB*100))
+	fillChg := int(math.Round((fillA - fillB) * 100))
 	// For profit taking or filled only, descending order by filled amount.
 	// 对于止盈或退出已入场的，优先按已入场金额降序
 	if preferFilled && fillChg != 0 {
@@ -687,7 +686,7 @@ func compareExitOpenOrders(a, b *ormo.InOutOrder, preferFilled bool) int {
 	costB := b.Enter.Amount * b.InitPrice
 	unfillB := costB - fillB
 	// First, in descending order by unsold amount. 首先按未成交金额倒序
-	res := cmp.Compare(math.Round(unfillB*100), math.Round(unfillA*100))
+	res := int(math.Round((unfillB - unfillA) * 100))
 	if res != 0 {
 		return res
 	}

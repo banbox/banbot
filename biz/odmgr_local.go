@@ -599,7 +599,6 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noE
 }
 
 func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
-	sortOrdersForBacktest(orders)
 	for _, od := range orders {
 		_, err := o.exitOrder(od, req)
 		if err != nil {
@@ -643,7 +642,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 			// 回测无需持久化
 		}
 	}
-	openOdList := sortedOpenOrders(openOds)
+	openOdList := utils.ValsOfMap(openOds)
 	lock.Unlock()
 	if len(openOdList) > 0 {
 		exitOds := make([]*ormo.InOutOrder, 0, len(openOdList))
