@@ -1,7 +1,6 @@
 package biz
 
 import (
-	"cmp"
 	"fmt"
 	"maps"
 	"math"
@@ -379,23 +378,19 @@ func (iw *ItemWallet) Used() float64 {
 	if allVal, ok := iw.Pendings["*"]; ok {
 		sumVal += allVal
 	} else {
-		sumVal += sumMapStable(iw.Pendings)
+		for _, v := range iw.Pendings {
+			sumVal += v
+		}
 	}
 	if allVal, ok := iw.Frozens["*"]; ok {
 		sumVal += allVal
 	} else {
-		sumVal += sumMapStable(iw.Frozens)
+		for _, v := range iw.Frozens {
+			sumVal += v
+		}
 	}
 	iw.lock.Unlock()
 	return sumVal
-}
-
-func sumMapStable(values map[string]float64) float64 {
-	var total float64
-	for _, key := range slices.Sorted(maps.Keys(values)) {
-		total += values[key]
-	}
-	return total
 }
 
 /*
@@ -962,9 +957,6 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		}
 		return nil
 	}
-	slices.SortFunc(odList, func(a, b *ormo.InOutOrder) int {
-		return cmp.Compare(a.ID, b.ID)
-	})
 	// All orders are for the same pricing coin, get the wallet of this coin in advance
 	// 所有订单都是同一个定价币，提前获取此币的钱包
 	wallet := w.Get(currency)
@@ -1074,8 +1066,7 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 	prices := make([]float64, 0)
 	var skips []string
 
-	for _, key := range slices.Sorted(maps.Keys(data)) {
-		item := data[key]
+	for key, item := range data {
 		var price = com.GetPriceSafe(key, "")
 		if price == -1 {
 			skips = append(skips, key)
@@ -1165,7 +1156,9 @@ Returns the value of the given currency against fiat currency. Returns all curre
 */
 func (w *BanWallets) FiatValue(withUpol bool, symbols ...string) float64 {
 	if len(symbols) == 0 {
-		symbols = slices.Sorted(maps.Keys(w.Items))
+		for symbol := range w.Items {
+			symbols = append(symbols, symbol)
+		}
 	}
 
 	var totalVal float64
