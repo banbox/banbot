@@ -68,6 +68,20 @@ func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
 	return -1
 }
 
+// GetLastBarPrice returns the latest cached historical price without an expiry check.
+func GetLastBarPrice(symbol string) float64 {
+	if core.IsFiat(symbol) && !strings.Contains(symbol, "/") {
+		return 1
+	}
+	lockBarPrices.RLock()
+	item, ok := barPrices[symbol]
+	lockBarPrices.RUnlock()
+	if ok {
+		return item.Val
+	}
+	return -1
+}
+
 // GetPriceSafe return -1 if price expired or not found
 func GetPriceSafe(symbol string, side string) float64 {
 	return GetPriceSafeExp(symbol, side, PriceExpireMS)

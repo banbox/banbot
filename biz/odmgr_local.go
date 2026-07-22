@@ -2,6 +2,7 @@ package biz
 
 import (
 	"maps"
+	"math"
 	"sort"
 	"strings"
 
@@ -234,10 +235,13 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			isStopEnter = true
 		}
 		if evt == nil {
-			price = com.GetPriceSafeExp(od.Symbol, "", com.Day10MSecs)
+			if core.BackTestMode {
+				price = com.GetLastBarPrice(od.Symbol)
+			} else {
+				price = com.GetPriceSafeExp(od.Symbol, "", com.Day10MSecs)
+			}
 			if price < 0 {
-				// here return error would cause backtest interrupt
-				return 0, nil
+				continue
 			}
 		} else if strings.Contains(odType, "limit") && exOrder.Price > 0 {
 			lowVal, _ := evt.LowValue()
@@ -682,6 +686,26 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 		item.UnrealizedPOL = 0
 		item.UsedUPol = 0
 		item.lock.Unlock()
+	}
+	lock.Lock()
+	openNum := len(openOds)
+	lock.Unlock()
+	frozenNum := 0
+	frozenTotal := float64(0)
+	for _, item := range wallets.Items {
+		item.lock.Lock()
+		for _, amount := range item.Frozens {
+			if math.Abs(amount) > core.AmtDust {
+				frozenNum++
+				frozenTotal += math.Abs(amount)
+			}
+		}
+		item.lock.Unlock()
+	}
+	if openNum > 0 || frozenNum > 0 {
+		return errs.NewMsg(core.ErrRunTime,
+			"cleanup incomplete: %d open orders, %d frozen wallet entries (%.8f total)",
+			openNum, frozenNum, frozenTotal)
 	}
 	// Filter unfilled orders
 	// 过滤未入场订单
