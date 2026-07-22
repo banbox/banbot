@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,51 +90,47 @@ func mergeHistoricalMarketSnapshot(info *banexg.ExgInfo, markets banexg.MarketMa
 	if snapshot.Exchange != info.ID || snapshot.MarketType != info.MarketType {
 		return 0, fmt.Errorf("market snapshot identity mismatch")
 	}
-	count := 0
+	frozen := make(banexg.MarketMap, len(snapshot.Markets))
 	for symbol, historical := range snapshot.Markets {
-		if historical == nil || historical.Symbol != symbol || historical.Precision == nil {
-			continue
+		if historical == nil || historical.Symbol != symbol || historical.ID == "" || historical.Precision == nil {
+			return 0, fmt.Errorf("market snapshot has invalid market %s", symbol)
 		}
 		marketType := historicalMarketType(historical)
 		if marketType != info.MarketType {
-			continue
+			return 0, fmt.Errorf("market snapshot market %s has type %s, want %s", symbol, marketType, info.MarketType)
 		}
-		precision := *historical.Precision
-		if precision.ModeAmount == 0 {
-			precision.ModeAmount = banexg.PrecModeDecimalPlace
-		}
-		if precision.ModePrice == 0 {
-			precision.ModePrice = banexg.PrecModeDecimalPlace
-		}
-		if precision.ModeBase == 0 {
-			precision.ModeBase = banexg.PrecModeDecimalPlace
-		}
-		if precision.ModeQuote == 0 {
-			precision.ModeQuote = banexg.PrecModeDecimalPlace
-		}
-		current := markets[symbol]
-		if current == nil {
-			copy := *historical
-			copy.Type = marketType
-			copy.Active = false
-			copy.Precision = &precision
-			copy.Limits = cloneMarketLimits(historical.Limits)
-			current = &copy
-			markets[symbol] = current
-		} else {
-			current.Precision = &precision
-			current.Limits = cloneMarketLimits(historical.Limits)
-			if historical.ContractSize > 0 {
-				current.ContractSize = historical.ContractSize
-			}
-		}
-		count++
+		frozen[symbol] = cloneHistoricalMarket(historical, marketType)
 	}
-	if count == 0 {
-		return 0, fmt.Errorf("market snapshot has no %s markets", info.MarketType)
+	clear(markets)
+	for symbol, market := range frozen {
+		markets[symbol] = market
 	}
 	rebuildMarketIndexes(info, markets)
-	return count, nil
+	return len(frozen), nil
+}
+
+func cloneHistoricalMarket(historical *banexg.Market, marketType string) *banexg.Market {
+	copy := *historical
+	copy.Type = marketType
+	precision := *historical.Precision
+	if precision.ModeAmount == 0 {
+		precision.ModeAmount = banexg.PrecModeDecimalPlace
+	}
+	if precision.ModePrice == 0 {
+		precision.ModePrice = banexg.PrecModeDecimalPlace
+	}
+	if precision.ModeBase == 0 {
+		precision.ModeBase = banexg.PrecModeDecimalPlace
+	}
+	if precision.ModeQuote == 0 {
+		precision.ModeQuote = banexg.PrecModeDecimalPlace
+	}
+	copy.Precision = &precision
+	copy.Limits = cloneMarketLimits(historical.Limits)
+	copy.DayTimes = append([][2]int64(nil), historical.DayTimes...)
+	copy.NightTimes = append([][2]int64(nil), historical.NightTimes...)
+	copy.Info = maps.Clone(historical.Info)
+	return &copy
 }
 
 func historicalMarketType(market *banexg.Market) string {

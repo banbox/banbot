@@ -665,6 +665,13 @@ func (q *SubQueries) CopyFrom(ctx context.Context, tableName pgx.Identifier, col
 }
 
 func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *errs.Error) {
+	if hasConfiguredMarketSnapshot() {
+		markets := make(banexg.MarketMap)
+		if err := applyConfiguredMarketSnapshot(exchange, markets); err != nil {
+			return nil, err
+		}
+		return markets, nil
+	}
 	exInfo := exchange.Info()
 	args := make(map[string]interface{})
 	if exInfo.ID == "china" && exInfo.MarketType != banexg.MarketSpot {
@@ -680,9 +687,6 @@ func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *e
 	}
 	markets, err := exchange.LoadMarkets(reload, args)
 	if err != nil {
-		return nil, err
-	}
-	if err = applyConfiguredMarketSnapshot(exchange, markets); err != nil {
 		return nil, err
 	}
 	return markets, nil
