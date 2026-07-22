@@ -678,7 +678,14 @@ func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *e
 		}
 		args[banexg.ParamSymbols] = symbols
 	}
-	return exchange.LoadMarkets(reload, args)
+	markets, err := exchange.LoadMarkets(reload, args)
+	if err != nil {
+		return nil, err
+	}
+	if err = applyConfiguredMarketSnapshot(exchange, markets); err != nil {
+		return nil, err
+	}
+	return markets, nil
 }
 
 func InitExg(exchange banexg.BanExchange) *errs.Error {
