@@ -161,21 +161,6 @@ func withIssue163BybitRuntime(t *testing.T, exchange *bybit.Bybit) {
 	})
 }
 
-func writeIssue163BybitOrderPage(w http.ResponseWriter, orderID, clientID, nextCursor string) {
-	item := map[string]interface{}{
-		"orderId": orderID, "orderLinkId": clientID, "symbol": "BTCUSDT",
-		"side": "Sell", "orderType": "Market", "stopOrderType": "StopLoss",
-		"orderStatus": "New", "qty": "2", "leavesQty": "2", "cumExecQty": "0",
-		"triggerPrice": "90", "createdTime": "1700000000000", "updatedTime": "1700000001000",
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"retCode": 0, "retMsg": "OK", "result": map[string]interface{}{
-			"list": []map[string]interface{}{item}, "nextPageCursor": nextCursor,
-		}, "retExtInfo": map[string]interface{}{}, "time": 1700000000000,
-	})
-}
-
 func TestApplyHisOrderDoesNotMisattributeClosedExitToOpenSibling(t *testing.T) {
 	symbol := "ISSUE162/USDT:USDT"
 	withIssue138Exchange(t, &issue138Exchange{})
@@ -626,8 +611,8 @@ func TestHealMissingFullEnterTriggersRestoresExistingSide(t *testing.T) {
 	if od.GetStopLoss().OrderId != "existing-sl" || od.GetTakeProfit().OrderId != "new-tp" {
 		t.Fatalf("unexpected reconciled triggers: sl=%+v tp=%+v", od.GetStopLoss(), od.GetTakeProfit())
 	}
-	if len(created) != 1 {
-		t.Fatalf("created %d triggers, want only the missing take-profit", len(created))
+	if len(created) != 1 || created[0] != banexg.OdTypeTakeProfitMarket {
+		t.Fatalf("created triggers = %v, want one unified take-profit market order", created)
 	}
 }
 
@@ -638,9 +623,10 @@ func TestVerifyFullEnterTriggersSkipsUncertainSnapshot(t *testing.T) {
 	createCalls := 0
 	withIssue138Exchange(t, &issue138Exchange{
 		fetchOpenOrders: func(_ string, _ int64, _ int, params map[string]interface{}) ([]*banexg.Order, *errs.Error) {
-			if params[banexg.ParamAlgoOrder] == true {
+			if params[banexg.ParamFullSnapshot] == true {
 				return nil, issue138Err(errs.CodeRunTime)
 			}
+			t.Fatal("open orders requested without full snapshot")
 			return nil, nil
 		},
 		createOrder: func(string, string, string, float64, float64, map[string]interface{}) (*banexg.Order, *errs.Error) {
@@ -683,20 +669,13 @@ func TestVerifyFullEnterTriggersSkipsUncertainSnapshot(t *testing.T) {
 }
 
 func TestFetchAccountOpenOrdersScopesCompleteSnapshots(t *testing.T) {
-	oldExgName, oldMarket := core.ExgName, core.Market
-	core.ExgName, core.Market = "binance", banexg.MarketLinear
-	t.Cleanup(func() { core.ExgName, core.Market = oldExgName, oldMarket })
 	withIssue138Exchange(t, &issue138Exchange{
 		fetchOpenOrders: func(symbol string, since int64, limit int, params map[string]interface{}) ([]*banexg.Order, *errs.Error) {
 			account := params[banexg.ParamAccount].(string)
-			kind := "regular"
-			if params[banexg.ParamAlgoOrder] == true {
-				kind = "algo"
-				if account == "issue163-okx-full-page" {
-					return make([]*banexg.Order, 100), nil
-				}
+			if symbol != "" || since != 10 || limit != openOrderSnapshotLimit || params[banexg.ParamFullSnapshot] != true {
+				t.Fatalf("unexpected snapshot request: symbol=%q since=%d limit=%d params=%v", symbol, since, limit, params)
 			}
-			return []*banexg.Order{{ID: account + "-" + kind}}, nil
+			return []*banexg.Order{{ID: account + "-snapshot"}}, nil
 		},
 	})
 	for _, account := range []string{"issue163-account-a", "issue163-account-b"} {
@@ -704,67 +683,9 @@ func TestFetchAccountOpenOrdersScopesCompleteSnapshots(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fetch %s snapshot: %v", account, err)
 		}
-		if len(orders) != 2 || orders[0].ID != account+"-regular" || orders[1].ID != account+"-algo" {
+		if len(orders) != 1 || orders[0].ID != account+"-snapshot" {
 			t.Fatalf("cross-account or incomplete snapshot for %s: %+v", account, orders)
 		}
-	}
-	core.ExgName = "okx"
-	if _, err := fetchAccountOpenOrders("issue163-okx-full-page", 10); err == nil {
-		t.Fatal("full OKX page was treated as a complete open-order snapshot")
-	}
-}
-
-func TestFetchAccountOpenOrdersRejectsPartialOKXAlgoSnapshot(t *testing.T) {
-	oldExgName, oldMarket := core.ExgName, core.Market
-	core.ExgName, core.Market = "okx", banexg.MarketLinear
-	t.Cleanup(func() { core.ExgName, core.Market = oldExgName, oldMarket })
-	withIssue138Exchange(t, &issue138Exchange{
-		fetchOpenOrders: func(_ string, _ int64, _ int, params map[string]interface{}) ([]*banexg.Order, *errs.Error) {
-			if params[banexg.ParamAlgoOrder] == true && params["ordType"] == "trigger" {
-				return nil, issue138Err(errs.CodeRunTime)
-			}
-			return nil, nil
-		},
-	})
-
-	if _, err := fetchAccountOpenOrders("issue163-partial-okx", 0); err == nil {
-		t.Fatal("partial OKX algo snapshot was treated as complete")
-	}
-}
-
-func TestFetchAccountOpenOrdersFollowsShortBybitPageCursor(t *testing.T) {
-	exchange := newIssue163BybitAdapter(t, func(w http.ResponseWriter, r *http.Request) {
-		cursor := r.URL.Query().Get("cursor")
-		orderID, next := "bybit-page-1", "next-page"
-		if cursor == "next-page" {
-			orderID, next = "bybit-page-2", ""
-		}
-		writeIssue163BybitOrderPage(w, orderID, "ban_1646_7_", next)
-	})
-	withIssue163BybitRuntime(t, exchange)
-
-	orders, err := fetchAccountOpenOrders("issue163-bybit-create", 0)
-	if err != nil {
-		t.Fatalf("fetch complete Bybit snapshot: %v", err)
-	}
-	if len(orders) != 2 || orders[0].ID != "bybit-page-1" || orders[1].ID != "bybit-page-2" {
-		t.Fatalf("short Bybit page cursor was not followed: %+v", orders)
-	}
-}
-
-func TestFetchAccountOpenOrdersRejectsRepeatedBybitCursor(t *testing.T) {
-	exchange := newIssue163BybitAdapter(t, func(w http.ResponseWriter, r *http.Request) {
-		cursor := r.URL.Query().Get("cursor")
-		orderID := "bybit-repeat-1"
-		if cursor != "" {
-			orderID = "bybit-repeat-2"
-		}
-		writeIssue163BybitOrderPage(w, orderID, "ban_1647_7_", "repeat-cursor")
-	})
-	withIssue163BybitRuntime(t, exchange)
-
-	if _, err := fetchAccountOpenOrders("issue163-bybit-create", 0); err == nil {
-		t.Fatal("repeated Bybit cursor was accepted")
 	}
 }
 

@@ -19,7 +19,6 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
-	"github.com/banbox/banexg/bybit"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
@@ -59,7 +58,6 @@ const (
 	odInfoLocalTrigger               = "LocalTrigger"
 	restoreAmbiguousExgData          = "ambiguous_exchange_entries"
 	openOrderSnapshotLimit           = 1000
-	bybitOpenOrderPageLimit          = 50
 	pendingMarketEntryReconcileAfter = 20 * time.Second
 	defaultMyTradeWatchRetry         = 5 * time.Second
 )
@@ -434,190 +432,11 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 }
 
 func fetchAccountOpenOrders(account string, since int64) ([]*banexg.Order, *errs.Error) {
-	if core.ExgName == "bybit" {
-		return fetchBybitAccountOpenOrders(account, since)
-	}
-	params := map[string]interface{}{
-		banexg.ParamAccount:     account,
-		banexg.ParamSettleCoins: config.StakeCurrency,
-	}
-	orders, err := exg.Default.FetchOpenOrders("", since, openOrderSnapshotLimit, params)
-	if err != nil {
-		return nil, err
-	}
-	if core.ExgName == "okx" && len(orders) >= 100 {
-		return nil, errs.NewMsg(errs.CodeRunTime, "open order snapshot reached OKX page limit")
-	}
-	if len(orders) >= openOrderSnapshotLimit {
-		return nil, errs.NewMsg(errs.CodeRunTime, "open order snapshot reached caller limit")
-	}
-	if !usesAlgoExitTriggers() {
-		return orders, nil
-	}
-	algoParams := map[string]interface{}{
-		banexg.ParamAccount:     account,
-		banexg.ParamAlgoOrder:   true,
-		banexg.ParamSettleCoins: config.StakeCurrency,
-	}
-	if core.ExgName == "okx" {
-		// OKX requires ordType. Query each type explicitly because the adapter's
-		// aggregate request is best-effort and can hide a failed subtype request.
-		algoOrders := make([]*banexg.Order, 0)
-		for _, ordType := range []string{"conditional", "oco", "trigger", "move_order_stop", "twap", "chase"} {
-			algoParams["ordType"] = ordType
-			orders, err := exg.Default.FetchOpenOrders("", since, openOrderSnapshotLimit, algoParams)
-			if err != nil {
-				return nil, err
-			}
-			if len(orders) >= 100 {
-				return nil, errs.NewMsg(errs.CodeRunTime,
-					"open OKX algo order snapshot reached page limit: type=%s", ordType)
-			}
-			algoOrders = append(algoOrders, orders...)
-		}
-		return append(orders, algoOrders...), nil
-	}
-	algoOrders, err := exg.Default.FetchOpenOrders("", since, openOrderSnapshotLimit, algoParams)
-	if err != nil {
-		return nil, err
-	}
-	if len(algoOrders) >= openOrderSnapshotLimit {
-		return nil, errs.NewMsg(errs.CodeRunTime, "open algo order snapshot reached caller limit")
-	}
-	return append(orders, algoOrders...), nil
-}
-
-func fetchBybitAccountOpenOrders(account string, since int64) ([]*banexg.Order, *errs.Error) {
-	category := core.Market
-	if category == banexg.MarketMargin {
-		category = banexg.MarketSpot
-	}
-	switch category {
-	case banexg.MarketSpot, banexg.MarketLinear, banexg.MarketInverse, banexg.MarketOption:
-	default:
-		return nil, errs.NewMsg(errs.CodeParamInvalid, "unsupported Bybit market for open orders: %s", core.Market)
-	}
-	settleCoins := config.StakeCurrency
-	if category == banexg.MarketSpot {
-		settleCoins = []string{""}
-	} else if len(settleCoins) == 0 {
-		return nil, errs.NewMsg(errs.CodeParamRequired, "settle currency required for Bybit open orders")
-	}
-	result := make([]*banexg.Order, 0)
-	seen := make(map[string]bool)
-	for _, settleCoin := range settleCoins {
-		orders, err := fetchBybitOpenOrdersBySettle(account, category, settleCoin, since)
-		if err != nil {
-			return nil, err
-		}
-		for _, od := range orders {
-			key := od.ID
-			if key == "" {
-				key = od.Symbol + ":" + od.ClientOrderID
-			}
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			result = append(result, od)
-		}
-	}
-	return result, nil
-}
-
-func fetchBybitOpenOrdersBySettle(account, category, settleCoin string, since int64) ([]*banexg.Order, *errs.Error) {
-	result := make([]*banexg.Order, 0)
-	cursor := ""
-	seenCursors := map[string]bool{"": true}
-	for {
-		rawOrders, nextCursor, err := fetchBybitOpenOrderPage(account, category, settleCoin, cursor)
-		if err != nil {
-			return nil, err
-		}
-		params := map[string]interface{}{
-			banexg.ParamAccount: account,
-			banexg.ParamMarket:  category,
-		}
-		if settleCoin != "" {
-			params["settleCoin"] = settleCoin
-		}
-		if cursor != "" {
-			params[banexg.ParamAfter] = cursor
-		}
-		orders, err := exg.Default.FetchOpenOrders("", since, bybitOpenOrderPageLimit, params)
-		if err != nil {
-			return nil, err
-		}
-		if err = verifyBybitOpenOrderPage(rawOrders, orders); err != nil {
-			return nil, err
-		}
-		result = append(result, orders...)
-		if nextCursor == "" {
-			return result, nil
-		}
-		if seenCursors[nextCursor] {
-			return nil, errs.NewMsg(errs.CodeRunTime, "repeated Bybit open-order cursor: %s", nextCursor)
-		}
-		seenCursors[nextCursor] = true
-		cursor = nextCursor
-	}
-}
-
-func fetchBybitOpenOrderPage(account, category, settleCoin, cursor string) ([]map[string]interface{}, string, *errs.Error) {
-	params := map[string]interface{}{
-		banexg.ParamAccount: account,
-		"category":          category,
-		"limit":             bybitOpenOrderPageLimit,
-	}
-	if settleCoin != "" {
-		params["settleCoin"] = settleCoin
-	}
-	if cursor != "" {
-		params["cursor"] = cursor
-	}
-	rsp, err := exg.Default.Call(bybit.MethodPrivateGetV5OrderRealtime, params)
-	if err != nil {
-		return nil, "", err
-	}
-	var page bybit.V5Resp[bybit.V5ListResult]
-	if jsonErr := utils2.UnmarshalString(rsp.Content, &page, utils2.JsonNumDefault); jsonErr != nil {
-		return nil, "", errs.New(errs.CodeUnmarshalFail, jsonErr)
-	}
-	if page.RetCode != 0 {
-		return nil, "", errs.NewMsg(errs.CodeExchangeError, "Bybit open orders: %s", page.RetMsg)
-	}
-	return page.Result.List, page.Result.NextPageCursor, nil
-}
-
-func verifyBybitOpenOrderPage(rawOrders []map[string]interface{}, orders []*banexg.Order) *errs.Error {
-	rawIDs := make(map[string]bool, len(rawOrders))
-	for _, item := range rawOrders {
-		id := utils2.GetMapVal(item, "orderId", "")
-		if id == "" {
-			return errs.NewMsg(errs.CodeUnmarshalFail, "Bybit open order has no orderId")
-		}
-		rawIDs[id] = true
-	}
-	parsedIDs := make(map[string]bool, len(orders))
-	for _, od := range orders {
-		if od == nil || od.ID == "" {
-			return errs.NewMsg(errs.CodeUnmarshalFail, "parsed Bybit open order has no orderId")
-		}
-		parsedIDs[od.ID] = true
-	}
-	if len(rawIDs) != len(parsedIDs) {
-		return errs.NewMsg(errs.CodeRunTime, "Bybit open-order page changed during reconciliation")
-	}
-	for id := range rawIDs {
-		if !parsedIDs[id] {
-			return errs.NewMsg(errs.CodeRunTime, "Bybit open-order page changed during reconciliation")
-		}
-	}
-	return nil
-}
-
-func usesAlgoExitTriggers() bool {
-	return core.ExgName == "okx" || core.ExgName == "binance" && core.Market == banexg.MarketLinear
+	return exg.Default.FetchOpenOrders("", since, openOrderSnapshotLimit, map[string]interface{}{
+		banexg.ParamAccount:      account,
+		banexg.ParamSettleCoins:  config.StakeCurrency,
+		banexg.ParamFullSnapshot: true,
+	})
 }
 
 func exchangeOrderHistorySince(curMS, lastOrderMS int64) int64 {
@@ -3542,12 +3361,8 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 			params[banexg.ParamPositionSide] = "SHORT"
 		}
 	}
-	var odType = banexg.OdTypeMarket
-	var price = tg.Price
-	if tg.Limit > 0 {
-		odType = banexg.OdTypeLimit
-		price = tg.Limit
-	}
+	var odType string
+	var price float64
 	// 这里不应设置ClosePosition仓位止盈止损，否则多策略或多个订单止盈止损会互相覆盖
 	// 双向持仓无需设置ReduceOnly
 	if prefix == ormo.OdActionStopLoss {
@@ -3555,19 +3370,17 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 			return
 		}
 		params[banexg.ParamStopLossPrice] = tg.Price
-		if core.ExgName == "bybit" {
-			odType = banexg.OdTypeStopMarket
-			if tg.Limit > 0 {
-				odType = banexg.OdTypeStopLossLimit
-			}
+		odType = banexg.OdTypeStopLoss
+		if tg.Limit > 0 {
+			odType = banexg.OdTypeStopLossLimit
+			price = tg.Limit
 		}
 	} else if prefix == ormo.OdActionTakeProfit {
 		params[banexg.ParamTakeProfitPrice] = tg.Price
-		if core.ExgName == "bybit" {
-			odType = banexg.OdTypeTakeProfitMarket
-			if tg.Limit > 0 {
-				odType = banexg.OdTypeTakeProfitLimit
-			}
+		odType = banexg.OdTypeTakeProfitMarket
+		if tg.Limit > 0 {
+			odType = banexg.OdTypeTakeProfitLimit
+			price = tg.Limit
 		}
 	} else {
 		log.Error("invalid trigger ", zap.String("prefix", prefix))
@@ -3655,9 +3468,7 @@ func (o *LiveOrderMgr) fetchTriggerByClientID(symbol, clientID string) (*banexg.
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
 		banexg.ParamClientOrderId: clientID,
-	}
-	if usesAlgoExitTriggers() {
-		params[banexg.ParamAlgoOrder] = true
+		banexg.ParamAlgoOrder:     true,
 	}
 	return exg.Default.FetchOrder(symbol, "", params)
 }
