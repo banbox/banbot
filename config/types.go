@@ -33,6 +33,8 @@ var (
 	MinOpenRate      float64 // When the wallet balance is less than the single amount, orders are allowed to be issued when it reaches this ratio of the single amount. 钱包余额不足单笔金额时，达到单笔金额的此比例则允许开单
 	LowCostAction    string  // Actions taken when stake amount less than the minimum amount 花费不足最小金额时的动作：ignore, keep
 	BTNetCost        float64 // Order placement delay during backtesting, simulated slippage, unit seconds 回测时下单延迟，模拟滑点，单位秒
+	BTLegacyIntrabar bool    // Preserve the pre-v0.2.22 intrabar price path for historical comparisons
+	BTLegacyWallet   bool    // Use the last historical bar for legacy margin refreshes
 	RelaySimUnFinish bool    // 交易新品种时(回测/实盘)，是否从开始时间未平仓订单接力开始交易
 	NTPLangCode      string  // NTP真实时间同步所用langCode，默认none不启用
 	ShowLangCode     string
@@ -105,6 +107,8 @@ type Config struct {
 	MinOpenRate      float64                           `yaml:"min_open_rate,omitempty" mapstructure:"min_open_rate"`
 	LowCostAction    string                            `yaml:"low_cost_action,omitempty" mapstructure:"low_cost_action"`
 	BTNetCost        float64                           `yaml:"bt_net_cost,omitempty" mapstructure:"bt_net_cost"`
+	BTLegacyIntrabar bool                              `yaml:"bt_legacy_intrabar,omitempty" mapstructure:"bt_legacy_intrabar"`
+	BTLegacyWallet   bool                              `yaml:"bt_legacy_wallet_price,omitempty" mapstructure:"bt_legacy_wallet_price"`
 	RelaySimUnFinish bool                              `yaml:"relay_sim_unfinish,omitempty" mapstructure:"relay_sim_unfinish"`
 	NTPLangCode      string                            `yaml:"ntp_lang_code,omitempty" mapstructure:"ntp_lang_code"`
 	ShowLangCode     string                            `yaml:"show_lang_code,omitempty" mapstructure:"show_lang_code"`

@@ -707,19 +707,29 @@ func InitExg(exchange banexg.BanExchange) *errs.Error {
 	}
 	marketType := exchange.Info().MarketType
 	if marketType == banexg.MarketLinear || marketType == banexg.MarketInverse {
-		err = exchange.LoadLeverageBrackets(false, map[string]interface{}{
-			banexg.ParamAccount: validAcc,
-		})
-		if err != nil {
-			log.Error("LoadLeverageBrackets fail, skip, maint margin calculation may have large deviation",
-				zap.String("err", err.Short()))
-			err = exchange.InitLeverageBrackets()
-			if err != nil {
-				log.Warn("InitLeverageBrackets fail", zap.String("err", err.Short()))
-			}
-		}
+		initializeLeverageBrackets(exchange, validAcc)
 	}
 	return nil
+}
+
+func initializeLeverageBrackets(exchange banexg.BanExchange, account string) {
+	if hasConfiguredMarketSnapshot() {
+		if err := exchange.InitLeverageBrackets(); err != nil {
+			log.Warn("InitLeverageBrackets fail", zap.String("err", err.Short()))
+		}
+		return
+	}
+	err := exchange.LoadLeverageBrackets(false, map[string]interface{}{
+		banexg.ParamAccount: account,
+	})
+	if err == nil {
+		return
+	}
+	log.Error("LoadLeverageBrackets fail, skip, maint margin calculation may have large deviation",
+		zap.String("err", err.Short()))
+	if err = exchange.InitLeverageBrackets(); err != nil {
+		log.Warn("InitLeverageBrackets fail", zap.String("err", err.Short()))
+	}
 }
 
 func (a *AdjInfo) Apply(bars []*banexg.Kline, adj int) []*banexg.Kline {

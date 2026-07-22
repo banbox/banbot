@@ -3,8 +3,28 @@ package orm
 import (
 	"testing"
 
+	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 )
+
+type snapshotLeverageExchange struct {
+	banexg.BanExchange
+	loadCalls int
+	initCalls int
+	loadErr   *errs.Error
+}
+
+func (e *snapshotLeverageExchange) LoadLeverageBrackets(bool, map[string]interface{}) *errs.Error {
+	e.loadCalls++
+	return e.loadErr
+}
+
+func (e *snapshotLeverageExchange) InitLeverageBrackets() *errs.Error {
+	e.initCalls++
+	return nil
+}
 
 func TestMergeHistoricalMarketSnapshotRestoresExecutionRules(t *testing.T) {
 	current := &banexg.Market{
@@ -76,5 +96,49 @@ func TestRegistrationMarketsIncludesInactiveSnapshotMarket(t *testing.T) {
 	got := registrationMarkets(info, make(banexg.MarketMap), true)
 	if got[inactive.Symbol] != inactive {
 		t.Fatal("inactive snapshot market was not registered for backtest identity")
+	}
+}
+
+func TestMarketSnapshotUsesDeterministicLeverageBrackets(t *testing.T) {
+	originalBacktest := core.BackTestMode
+	originalExchange := config.Exchange
+	t.Cleanup(func() {
+		core.BackTestMode = originalBacktest
+		config.Exchange = originalExchange
+	})
+	core.BackTestMode = true
+	config.Exchange = &config.ExchangeConfig{
+		Name: "binance",
+		Items: map[string]map[string]interface{}{
+			"binance": {"market_snapshot": "@market-snapshots/frozen.json"},
+		},
+	}
+	exchange := &snapshotLeverageExchange{}
+	initializeLeverageBrackets(exchange, "default")
+	if exchange.loadCalls != 0 || exchange.initCalls != 1 {
+		t.Fatalf("load calls = %d, init calls = %d; want 0, 1", exchange.loadCalls, exchange.initCalls)
+	}
+}
+
+func TestLeverageBracketLoadingPreservesNormalFallback(t *testing.T) {
+	originalBacktest := core.BackTestMode
+	originalExchange := config.Exchange
+	t.Cleanup(func() {
+		core.BackTestMode = originalBacktest
+		config.Exchange = originalExchange
+	})
+	core.BackTestMode = false
+	config.Exchange = nil
+
+	success := &snapshotLeverageExchange{}
+	initializeLeverageBrackets(success, "default")
+	if success.loadCalls != 1 || success.initCalls != 0 {
+		t.Fatalf("successful load calls = %d, init calls = %d; want 1, 0", success.loadCalls, success.initCalls)
+	}
+
+	fallback := &snapshotLeverageExchange{loadErr: errs.NewMsg(errs.CodeRunTime, "load failed")}
+	initializeLeverageBrackets(fallback, "default")
+	if fallback.loadCalls != 1 || fallback.initCalls != 1 {
+		t.Fatalf("fallback load calls = %d, init calls = %d; want 1, 1", fallback.loadCalls, fallback.initCalls)
 	}
 }

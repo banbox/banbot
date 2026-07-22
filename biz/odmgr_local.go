@@ -194,7 +194,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 		if exOrder == nil {
 			if od.ExitTag == "" && evt != nil {
 				// 已入场完成，尚未出现出场信号，检查是否触发止损The entry has been completed, but the exit signal has not yet appeared. Check whether the stop loss is triggered.
-				err := o.tryFillTriggers(od, bar, matchTf)
+				err := o.tryFillTriggers(od, bar, matchTf, 0)
 				if err != nil {
 					return 0, err
 				}
@@ -279,8 +279,12 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			err = o.fillPendingEnter(od, price, fillMS)
 			if err == nil && evt != nil {
 				// 入场后可能立刻触发止损/止盈
-				endBar := cutSeriesFromRate(bar, int64(odTFSecs*1000), fillBarRate)
-				err = o.tryFillTriggers(od, endBar, matchTf)
+				if legacyIntrabarEnabled() {
+					err = o.tryFillTriggers(od, bar, matchTf, fillBarRate)
+				} else {
+					endBar := cutSeriesFromRate(bar, int64(odTFSecs*1000), fillBarRate)
+					err = o.tryFillTriggers(od, endBar, matchTf, 0)
+				}
 			}
 		} else {
 			err = o.fillPendingExit(od, price, fillMS)
@@ -428,7 +432,9 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 	return nil
 }
 
-func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLCV, tf string) *errs.Error {
+func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLCV, tf string,
+	afterRate float64,
+) *errs.Error {
 	if bar == nil {
 		return nil
 	}
@@ -466,7 +472,7 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 		// 触发止损，计算执行价格
 		trigPrice = sl.Price
 		amtRate = sl.Rate
-		fillPrice = getExcPrice(od, bar, sl.Price, sl.Limit, 0, tfSecs)
+		fillPrice = getExcPrice(od, bar, sl.Price, sl.Limit, afterRate, tfSecs)
 		if sl.Tag != "" {
 			exitTag = sl.Tag
 		} else {
@@ -481,7 +487,7 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 		// 触发止盈，计算执行价格
 		trigPrice = tp.Price
 		amtRate = tp.Rate
-		fillPrice = getExcPrice(od, bar, tp.Price, tp.Limit, 0, tfSecs)
+		fillPrice = getExcPrice(od, bar, tp.Price, tp.Limit, afterRate, tfSecs)
 		if fillPrice == 0 && tp.Limit > 0 {
 			// 设置了限价止盈，强制使用止盈价出场
 			fillPrice = tp.Limit
@@ -504,11 +510,11 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 	odType := banexg.OdTypeMarket
 	if fillPrice > 0 {
 		odType = banexg.OdTypeLimit
-		rate += simMarketRate(bar, fillPrice, od.Short, true, 0)
+		rate += simMarketRate(bar, fillPrice, od.Short, true, afterRate)
 	} else {
 		// Stop time + network delay
 		// 触发时间+网络延迟
-		rate += simMarketRate(bar, trigPrice, od.Short, true, 0)
+		rate += simMarketRate(bar, trigPrice, od.Short, true, afterRate)
 		// Stop loss at market price and sell immediately
 		// 市价止损，立刻卖出
 		fillPrice = simMarketPrice(bar, rate)
@@ -740,6 +746,10 @@ func simPriceByRate(bar *orm.SeriesOHLCV, rate float64) (float64, float64, float
 	highP := bar.High
 	lowP := bar.Low
 	closeP := bar.Close
+	preMoveFactor, closeLegFactor := 0.3, 1.3
+	if legacyIntrabarEnabled() {
+		preMoveFactor, closeLegFactor = 0, 1
+	}
 
 	if rate == 0 {
 		return openP, highP, lowP
@@ -752,10 +762,10 @@ func simPriceByRate(bar *orm.SeriesOHLCV, rate float64) (float64, float64, float
 	if openP <= closeP {
 		// close > open, generally first moves down to the lower shadow line, then rises to the highest point, and finally retreats slightly to form the upper shadow line.
 		// 阳线  一般是先下调走出下影线，然后上升到最高点，最后略微回撤，出现上影线
-		pa = (openP - lowP) * 0.3 // a向下前的小幅向上回调，模拟震荡
+		pa = (openP - lowP) * preMoveFactor // a向下前的小幅向上回调，模拟震荡
 		a = openP + pa - lowP
 		b = highP - lowP
-		c = (highP - closeP) * 1.3 // 多加些，模拟震荡
+		c = (highP - closeP) * closeLegFactor // 多加些，模拟震荡
 		totalLen = a + b + c + pa
 		if totalLen == 0 {
 			return closeP, highP, lowP
@@ -777,10 +787,10 @@ func simPriceByRate(bar *orm.SeriesOHLCV, rate float64) (float64, float64, float
 	} else {
 		// close < open. generally rises first and goes out of the upper shadow line, then drops to the lowest point, and finally pulls back slightly to form a lower shadow line.
 		// 阴线  一般是先上升走出上影线，然后下降到最低点，最后略微回调，出现下影线
-		pa = (highP - openP) * 0.3 // a向上前的小幅向下回调，模拟震荡
+		pa = (highP - openP) * preMoveFactor // a向上前的小幅向下回调，模拟震荡
 		a = highP - (openP - pa)
 		b = highP - lowP
-		c = (closeP - lowP) * 1.3 // 模拟震荡
+		c = (closeP - lowP) * closeLegFactor // 模拟震荡
 		totalLen = a + b + c + pa
 		if totalLen == 0 {
 			return closeP, highP, lowP
@@ -862,14 +872,19 @@ func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, m
 	highP := bar.High
 	lowP := bar.Low
 	closeP := bar.Close
+	legacyIntrabar := legacyIntrabarEnabled()
+	preMoveFactor, closeLegFactor := 0.3, 1.3
+	if legacyIntrabar {
+		preMoveFactor, closeLegFactor = 0, 1
+	}
 
 	if openP <= closeP {
 		// close > open. generally first moves down to the lower shadow line, then rises to the highest point, and finally retreats slightly to form the upper shadow line.
 		// 阳线  一般是先下调走出下影线，然后上升到最高点，最后略微回撤，出现上影线
-		pa = (openP - lowP) * 0.3  // a向下前的小幅向上回调，模拟震荡
-		a = openP + pa - lowP      // open~low. 开盘~最低
-		b = highP - lowP           // low~high. 最低~最高
-		c = (highP - closeP) * 1.3 // high~close. 最高~收盘，模拟震荡
+		pa = (openP - lowP) * preMoveFactor   // a向下前的小幅向上回调，模拟震荡
+		a = openP + pa - lowP                 // open~low. 开盘~最低
+		b = highP - lowP                      // low~high. 最低~最高
+		c = (highP - closeP) * closeLegFactor // high~close. 最高~收盘，模拟震荡
 		totalLen = a + b + c + pa
 		if totalLen == 0 {
 			return 0.5
@@ -877,7 +892,7 @@ func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, m
 		if isTrigger {
 			// Trigger price, no need to consider buying and selling direction, direct comparison
 			// 触发价格，无需考虑买卖方向，直接比较
-			if price >= openP && price <= openP+pa {
+			if !legacyIntrabar && price >= openP && price <= openP+pa {
 				// a向下前小幅向上回调时触发
 				rate := (price - openP) / totalLen
 				if rate >= minRate {
@@ -929,10 +944,10 @@ func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, m
 	} else {
 		// close < open. generally rises first and goes out of the upper shadow line, then drops to the lowest point, and finally pulls back slightly to form a lower shadow line.
 		// 阴线  一般是先上升走出上影线，然后下降到最低点，最后略微回调，出现下影线
-		pa = (highP - openP) * 0.3 // a向上前的小幅回调向下，模拟震荡
-		a = highP - (openP - pa)   // 开盘~最高
-		b = highP - lowP           // 最高~最低
-		c = (closeP - lowP) * 1.3  // 最低~收盘，模拟震荡
+		pa = (highP - openP) * preMoveFactor // a向上前的小幅回调向下，模拟震荡
+		a = highP - (openP - pa)             // 开盘~最高
+		b = highP - lowP                     // 最高~最低
+		c = (closeP - lowP) * closeLegFactor // 最低~收盘，模拟震荡
 		totalLen = a + b + c + pa
 		if totalLen == 0 {
 			return 0.5
@@ -1003,6 +1018,10 @@ func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, m
 			}
 		}
 	}
+}
+
+func legacyIntrabarEnabled() bool {
+	return core.BackTestMode && config.Data.BTLegacyIntrabar
 }
 
 /*

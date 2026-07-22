@@ -1,6 +1,7 @@
 package biz
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"math"
@@ -959,8 +960,7 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		}
 		return nil
 	}
-	// Preserve caller order. Sorting every wallet refresh is costly, mutates the input
-	// slice, and only changes rare float/admission edge cases.
+	odList = legacyWalletOrderView(odList)
 	// All orders are for the same pricing coin, get the wallet of this coin in advance
 	// 所有订单都是同一个定价币，提前获取此币的钱包
 	wallet := w.Get(currency)
@@ -990,7 +990,7 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		if od.Enter == nil || od.Enter.Filled == 0 {
 			continue
 		}
-		curPrice := com.GetPriceSafe(od.Symbol, "")
+		curPrice := walletMarkPrice(od.Symbol)
 		if curPrice == -1 {
 			continue
 		}
@@ -1037,6 +1037,24 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		}
 	}
 	return nil
+}
+
+func legacyWalletOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
+	if !core.BackTestMode || !config.Data.BTLegacyWallet || len(orders) < 2 {
+		return orders
+	}
+	result := slices.Clone(orders)
+	slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
+	return result
+}
+
+func walletMarkPrice(symbol string) float64 {
+	if core.BackTestMode && config.Data.BTLegacyWallet {
+		return com.GetLastBarPrice(symbol)
+	}
+	return com.GetPriceSafe(symbol, "")
 }
 
 func (w *BanWallets) GetAmountByLegal(symbol string, legalCost float64) float64 {
