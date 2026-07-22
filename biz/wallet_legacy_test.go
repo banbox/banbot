@@ -1,6 +1,8 @@
 package biz
 
 import (
+	"math"
+	"slices"
 	"testing"
 
 	"github.com/banbox/banbot/btime"
@@ -9,6 +11,72 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm/ormo"
 )
+
+func TestLegacyItemWalletUsedIsStableAcrossMapLayouts(t *testing.T) {
+	originalCompat := config.Data.BTLegacyWallet
+	originalBacktest := core.BackTestMode
+	t.Cleanup(func() {
+		config.Data.BTLegacyWallet = originalCompat
+		core.BackTestMode = originalBacktest
+	})
+	core.BackTestMode = true
+	config.Data.BTLegacyWallet = true
+
+	want := (float64(1) + 1) + 1e16
+	entries := []struct {
+		key string
+		val float64
+	}{{"a", 1}, {"b", 1}, {"c", 1e16}}
+	for _, target := range []string{"pendings", "frozens"} {
+		for shift := range entries {
+			values := make(map[string]float64, len(entries))
+			for offset := range entries {
+				entry := entries[(shift+offset)%len(entries)]
+				values[entry.key] = entry.val
+			}
+			wallet := &ItemWallet{Pendings: map[string]float64{}, Frozens: map[string]float64{}}
+			if target == "pendings" {
+				wallet.Pendings = values
+			} else {
+				wallet.Frozens = values
+			}
+			for range 32 {
+				if got := wallet.Used(); math.Float64bits(got) != math.Float64bits(want) {
+					t.Fatalf("%s layout %d: Used() = %.17g, want %.17g", target, shift, got, want)
+				}
+			}
+		}
+	}
+}
+
+func TestLegacyWalletLegalValuesUseStableCoinOrder(t *testing.T) {
+	originalCompat := config.Data.BTLegacyWallet
+	originalBacktest := core.BackTestMode
+	t.Cleanup(func() {
+		config.Data.BTLegacyWallet = originalCompat
+		core.BackTestMode = originalBacktest
+	})
+
+	core.BackTestMode = true
+	config.Data.BTLegacyWallet = true
+	wallets := &BanWallets{Items: map[string]*ItemWallet{
+		"DET_A": {Coin: "DET_A", Available: 1e16},
+		"DET_B": {Coin: "DET_B", Available: -1e16},
+		"DET_C": {Coin: "DET_C", Available: 1},
+	}}
+	for _, coin := range []string{"DET_A", "DET_B", "DET_C"} {
+		com.SetBarPrice(coin+"/USDT", 1)
+	}
+	for range 100 {
+		_, coins, _ := wallets.calcLegal(LegalValueAvailable, nil, false)
+		if !slices.Equal(coins, []string{"DET_A", "DET_B", "DET_C"}) {
+			t.Fatalf("legacy wallet coin order = %v", coins)
+		}
+		if got := wallets.AvaLegal(nil); got != 1 {
+			t.Fatalf("legacy wallet total = %v, want 1", got)
+		}
+	}
+}
 
 func TestLegacyWalletPriceUsesLastHistoricalBar(t *testing.T) {
 	originalCompat := config.Data.BTLegacyWallet

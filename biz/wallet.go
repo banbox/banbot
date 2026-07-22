@@ -376,24 +376,33 @@ func (iw *ItemWallet) Total(withUpol bool) float64 {
 func (iw *ItemWallet) Used() float64 {
 	iw.lock.Lock()
 	sumVal := float64(0)
-	// Do not sort these hot-path maps: rare last-bit float differences do not justify
-	// allocating and sorting keys on every balance check. Keep the "*" fast path intact.
+	// Keep the "*" fast path; historical compatibility sorts only keyed balances.
 	if allVal, ok := iw.Pendings["*"]; ok {
 		sumVal += allVal
 	} else {
-		for _, v := range iw.Pendings {
-			sumVal += v
-		}
+		sumVal += sumWalletMap(iw.Pendings)
 	}
 	if allVal, ok := iw.Frozens["*"]; ok {
 		sumVal += allVal
 	} else {
-		for _, v := range iw.Frozens {
-			sumVal += v
-		}
+		sumVal += sumWalletMap(iw.Frozens)
 	}
 	iw.lock.Unlock()
 	return sumVal
+}
+
+func sumWalletMap(values map[string]float64) float64 {
+	var total float64
+	if core.BackTestMode && config.Data.BTLegacyWallet {
+		for _, key := range slices.Sorted(maps.Keys(values)) {
+			total += values[key]
+		}
+		return total
+	}
+	for _, value := range values {
+		total += value
+	}
+	return total
 }
 
 /*
@@ -1088,9 +1097,12 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 	prices := make([]float64, 0)
 	var skips []string
 
-	// Do not sort wallet keys on this sizing path; the steady-state cost outweighs
-	// the very low probability of an order-sensitive float boundary.
-	for key, item := range data {
+	keys := maps.Keys(data)
+	if core.BackTestMode && config.Data.BTLegacyWallet {
+		keys = slices.Values(slices.Sorted(keys))
+	}
+	for key := range keys {
+		item := data[key]
 		var price = com.GetPriceSafe(key, "")
 		if price == -1 {
 			skips = append(skips, key)
