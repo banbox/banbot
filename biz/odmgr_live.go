@@ -278,6 +278,16 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 	return closedList, nil
 }
 
+// normalizeAuthoritativeOrder makes a FetchOrder snapshot safe for the generic
+// out-of-order guard. Some exchanges expose an order's creation time as Timestamp,
+// even after it has filled. A direct FetchOrder result is authoritative, so retain
+// the latest known local timestamp instead of rejecting a completed snapshot.
+func normalizeAuthoritativeOrder(res *banexg.Order, localUpdateAt int64) *banexg.Order {
+	normalized := *res
+	normalized.Timestamp = max(res.Timestamp, res.LastTradeTimestamp, res.LastUpdateTimestamp, localUpdateAt)
+	return &normalized
+}
+
 // reconcilePendingExitOrders refreshes submitted exits by their exchange order IDs.
 // It returns pending=true when an exit cannot yet be authoritatively resolved; callers
 // must then avoid attributing a position delta to another local order.
@@ -320,7 +330,7 @@ func (o *LiveOrderMgr) reconcilePendingExitOrders(ods []*ormo.InOutOrder) (chang
 			continue
 		}
 		beforeFilled, beforeStatus := exit.Filled, od.Status
-		err = o.updateOdByExgRes(od, false, res)
+		err = o.updateOdByExgRes(od, false, normalizeAuthoritativeOrder(res, exit.UpdateAt))
 		changed = changed || exit.Filled > beforeFilled+AmtDust || od.Status != beforeStatus
 		unresolved := od.Status < ormo.InOutStatusFullExit && exit.Status != ormo.OdStatusClosed
 		lock.Unlock()
@@ -3126,11 +3136,8 @@ func (o *LiveOrderMgr) applyAuthoritativeEnterOrder(od *ormo.InOutOrder, res *ba
 	}
 	wasFullEnter := od.Status == ormo.InOutStatusFullEnter && od.Enter.Status == ormo.OdStatusClosed
 
-	// Binance futures uses the order creation time as Timestamp. Use the latest
-	// known timestamp so an authoritative fetch is not rejected as older state.
-	normalized := *res
-	normalized.Timestamp = max(res.Timestamp, res.LastTradeTimestamp, res.LastUpdateTimestamp, od.Enter.UpdateAt)
-	err := o.updateOdByExgRes(od, true, &normalized)
+	err := o.updateOdByExgRes(od, true, normalizeAuthoritativeOrder(res, od.Enter.UpdateAt))
+
 	if err != nil || !od.IsDirty() {
 		return err
 	}
