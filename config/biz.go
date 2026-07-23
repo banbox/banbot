@@ -903,6 +903,8 @@ func (c *Config) Clone() *Config {
 		MinOpenRate:      c.MinOpenRate,
 		LowCostAction:    c.LowCostAction,
 		BTNetCost:        c.BTNetCost,
+		BTLegacyIntrabar: c.BTLegacyIntrabar,
+		BTLegacyWallet:   c.BTLegacyWallet,
 		RelaySimUnFinish: c.RelaySimUnFinish,
 		NTPLangCode:      c.NTPLangCode,
 		ShowLangCode:     c.ShowLangCode,

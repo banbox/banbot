@@ -202,16 +202,20 @@ func EnsureExgSymbols(exchange banexg.BanExchange) *errs.Error {
 	}
 	exInfo := exchange.Info()
 	exgId := exInfo.ID
-	marMap := exchange.GetCurMarkets()
+	marMap := registrationMarkets(exInfo, exchange.GetCurMarkets(), hasConfiguredMarketSnapshot())
 	exsList := make([]*ExSymbol, 0, len(marMap))
 	for symbol, market := range marMap {
+		delistMS := market.Expiry
+		if !market.Active && delistMS == 0 {
+			delistMS = btime.UTCStamp()
+		}
 		exsList = append(exsList, &ExSymbol{
 			Exchange: exgId,
 			Market:   market.Type,
 			Symbol:   symbol,
 			Combined: market.Combined,
 			ListMs:   market.Created,
-			DelistMs: market.Expiry,
+			DelistMs: delistMS,
 		})
 	}
 	err = EnsureSymbols(exsList, exgId)
@@ -253,6 +257,18 @@ func EnsureExgSymbols(exchange banexg.BanExchange) *errs.Error {
 		}
 	}
 	return err
+}
+
+func registrationMarkets(exInfo *banexg.ExgInfo, current banexg.MarketMap, includeSnapshot bool) banexg.MarketMap {
+	if !includeSnapshot {
+		return current
+	}
+	for symbol, market := range exInfo.Markets {
+		if market.Type == exInfo.MarketType {
+			current[symbol] = market
+		}
+	}
+	return current
 }
 
 func EnsureCurSymbols(symbols []string) *errs.Error {

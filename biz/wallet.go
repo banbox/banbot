@@ -376,24 +376,31 @@ func (iw *ItemWallet) Total(withUpol bool) float64 {
 func (iw *ItemWallet) Used() float64 {
 	iw.lock.Lock()
 	sumVal := float64(0)
+	// Keep the "*" fast path; historical compatibility sorts only keyed balances.
 	if allVal, ok := iw.Pendings["*"]; ok {
 		sumVal += allVal
 	} else {
-		sumVal += sumMapStable(iw.Pendings)
+		sumVal += sumWalletMap(iw.Pendings)
 	}
 	if allVal, ok := iw.Frozens["*"]; ok {
 		sumVal += allVal
 	} else {
-		sumVal += sumMapStable(iw.Frozens)
+		sumVal += sumWalletMap(iw.Frozens)
 	}
 	iw.lock.Unlock()
 	return sumVal
 }
 
-func sumMapStable(values map[string]float64) float64 {
+func sumWalletMap(values map[string]float64) float64 {
 	var total float64
-	for _, key := range slices.Sorted(maps.Keys(values)) {
-		total += values[key]
+	if core.BackTestMode && config.Data.BTLegacyWallet {
+		for _, key := range slices.Sorted(maps.Keys(values)) {
+			total += values[key]
+		}
+		return total
+	}
+	for _, value := range values {
+		total += value
 	}
 	return total
 }
@@ -962,9 +969,7 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		}
 		return nil
 	}
-	slices.SortFunc(odList, func(a, b *ormo.InOutOrder) int {
-		return cmp.Compare(a.ID, b.ID)
-	})
+	odList = legacyWalletOrderView(odList)
 	// All orders are for the same pricing coin, get the wallet of this coin in advance
 	// 所有订单都是同一个定价币，提前获取此币的钱包
 	wallet := w.Get(currency)
@@ -994,7 +999,7 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		if od.Enter == nil || od.Enter.Filled == 0 {
 			continue
 		}
-		curPrice := com.GetPriceSafe(od.Symbol, "")
+		curPrice := walletMarkPrice(od.Symbol)
 		if curPrice == -1 {
 			continue
 		}
@@ -1043,6 +1048,24 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 	return nil
 }
 
+func legacyWalletOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
+	if !core.BackTestMode || !config.Data.BTLegacyWallet || len(orders) < 2 {
+		return orders
+	}
+	result := slices.Clone(orders)
+	slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
+	return result
+}
+
+func walletMarkPrice(symbol string) float64 {
+	if core.BackTestMode && config.Data.BTLegacyWallet {
+		return com.GetLastBarPrice(symbol)
+	}
+	return com.GetPriceSafe(symbol, "")
+}
+
 func (w *BanWallets) GetAmountByLegal(symbol string, legalCost float64) float64 {
 	return legalCost / com.GetPrice(symbol, "")
 }
@@ -1074,7 +1097,11 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 	prices := make([]float64, 0)
 	var skips []string
 
-	for _, key := range slices.Sorted(maps.Keys(data)) {
+	keys := maps.Keys(data)
+	if core.BackTestMode && config.Data.BTLegacyWallet {
+		keys = slices.Values(slices.Sorted(keys))
+	}
+	for key := range keys {
 		item := data[key]
 		var price = com.GetPriceSafe(key, "")
 		if price == -1 {
@@ -1165,7 +1192,10 @@ Returns the value of the given currency against fiat currency. Returns all curre
 */
 func (w *BanWallets) FiatValue(withUpol bool, symbols ...string) float64 {
 	if len(symbols) == 0 {
-		symbols = slices.Sorted(maps.Keys(w.Items))
+		// Reporting does not require canonical coin order, so avoid sorting all wallet keys.
+		for symbol := range w.Items {
+			symbols = append(symbols, symbol)
+		}
 	}
 
 	var totalVal float64

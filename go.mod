@@ -8,7 +8,7 @@ go 1.24.0
 
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
-	github.com/banbox/banexg v0.2.57
+	github.com/banbox/banexg v0.2.58
 	github.com/banbox/banta v0.3.7
 	github.com/c-bata/goptuna v0.9.0
 	github.com/cloudwego/eino v0.6.0
@@ -41,6 +41,7 @@ require (
 	github.com/gofiber/fiber/v2 v2.52.9
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/sasha-s/go-deadlock v0.3.6
 	github.com/shirou/gopsutil/v4 v4.25.9
 	github.com/spf13/cobra v1.10.2
@@ -78,7 +79,6 @@ require (
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
 	github.com/google/pprof v0.0.0-20250317173921-a4b03ec1a45e // indirect
 	github.com/goph/emperror v0.17.2 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/invopop/yaml v0.1.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

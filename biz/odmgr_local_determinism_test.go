@@ -4,50 +4,48 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
-	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
 
-type issue155Exchange struct {
+type deterministicFillExchange struct {
 	banexg.BanExchange
 }
 
-func (e *issue155Exchange) CalculateFee(string, string, string, float64, float64, bool, map[string]interface{}) (*banexg.Fee, *errs.Error) {
+func (e *deterministicFillExchange) CalculateFee(string, string, string, float64, float64, bool,
+	map[string]interface{}) (*banexg.Fee, *errs.Error) {
 	return &banexg.Fee{}, nil
 }
 
-func TestFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
+func TestLegacyFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
 	oldExchange := exg.Default
 	oldBackTest := core.BackTestMode
 	oldEnvReal := core.EnvReal
 	oldLiveMode := core.LiveMode
-	exg.Default = &issue155Exchange{}
+	oldCompat := config.Data.BTLegacyWallet
+	exg.Default = &deterministicFillExchange{}
 	core.BackTestMode = true
 	core.EnvReal = true
 	core.LiveMode = false
+	config.Data.BTLegacyWallet = true
 	t.Cleanup(func() {
 		exg.Default = oldExchange
 		core.BackTestMode = oldBackTest
 		core.EnvReal = oldEnvReal
 		core.LiveMode = oldLiveMode
+		config.Data.BTLegacyWallet = oldCompat
 	})
 
-	exs := &orm.ExSymbol{ID: 155, Symbol: "ISSUE155/USDT"}
+	exs := &orm.ExSymbol{ID: 155, Symbol: "DETERMINISTIC/USDT"}
 	evt := orm.NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
 		Time: 1_700_000_000_000, Open: 100, High: 100, Low: 100, Close: 100,
 	}, nil, true, true)
-	permutations := [][]int64{
-		{1, 2, 3},
-		{3, 2, 1},
-		{2, 3, 1},
-	}
+	permutations := [][]int64{{1, 2, 3}, {3, 2, 1}, {2, 3, 1}}
 	costs := map[int64]float64{1: 60, 2: 50, 3: 40}
 
 	for _, permutation := range permutations {
@@ -65,7 +63,7 @@ func TestFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
 		}
 		orders := make([]*ormo.InOutOrder, 0, len(permutation))
 		for _, id := range permutation {
-			orders = append(orders, issue155PendingExit(id, exs.Symbol))
+			orders = append(orders, deterministicPendingExit(id, exs.Symbol))
 		}
 
 		if _, err := mgr.fillPendingOrders(orders, evt); err != nil {
@@ -83,90 +81,11 @@ func TestFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
 	}
 }
 
-func TestExitAndFillUsesStableBusinessOrder(t *testing.T) {
-	oldExchange := exg.Default
-	oldBackTest := core.BackTestMode
-	oldEnvReal := core.EnvReal
-	oldLiveMode := core.LiveMode
-	exg.Default = &issue155Exchange{}
-	core.BackTestMode = true
-	core.EnvReal = true
-	core.LiveMode = false
-	com.SetBarPrice("ISSUE155/USDT", 100)
-	t.Cleanup(func() {
-		exg.Default = oldExchange
-		core.BackTestMode = oldBackTest
-		core.EnvReal = oldEnvReal
-		core.LiveMode = oldLiveMode
-	})
-
-	permutations := [][]int64{{11, 12, 13}, {13, 12, 11}, {12, 13, 11}}
-	for _, permutation := range permutations {
-		var callbackIDs []int64
-		mgr := &LocalOrderMgr{OrderMgr: OrderMgr{Account: config.DefAcc}}
-		mgr.callBack = func(od *ormo.InOutOrder, _ bool) {
-			callbackIDs = append(callbackIDs, od.ID)
-		}
-		orders := make([]*ormo.InOutOrder, 0, len(permutation))
-		for _, id := range permutation {
-			orders = append(orders, issue155OpenOrder(id, "ISSUE155/USDT"))
-		}
-
-		if err := mgr.ExitAndFill(orders, &strat.ExitReq{Tag: "issue155", Force: true}); err != nil {
-			t.Fatalf("permutation %v: ExitAndFill() error: %v", permutation, err)
-		}
-		if !slices.Equal(callbackIDs, []int64{11, 12, 13}) {
-			t.Errorf("permutation %v: callback order = %v, want [11 12 13]", permutation, callbackIDs)
-		}
-	}
-}
-
-func TestCompareExitOpenOrdersUsesFilledAmountAsSecondKey(t *testing.T) {
-	orders := []*ormo.InOutOrder{
-		{IOrder: &ormo.IOrder{ID: 1, InitPrice: 10}, Enter: &ormo.ExOrder{Amount: 10, Filled: 5}},
-		{IOrder: &ormo.IOrder{ID: 2, InitPrice: 10}, Enter: &ormo.ExOrder{Amount: 6, Filled: 1}},
-	}
-	permutations := [][]*ormo.InOutOrder{
-		{orders[0], orders[1]},
-		{orders[1], orders[0]},
-	}
-	for _, permutation := range permutations {
-		slices.SortFunc(permutation, func(a, b *ormo.InOutOrder) int {
-			return compareExitOpenOrders(a, b, false)
-		})
-		if permutation[0].ID != 2 || permutation[1].ID != 1 {
-			t.Fatalf("filled-amount order = [%d %d], want [2 1]", permutation[0].ID, permutation[1].ID)
-		}
-	}
-}
-
-func TestCompareExitOpenOrdersIsTransitiveAtCentBoundary(t *testing.T) {
-	orders := []*ormo.InOutOrder{
-		{IOrder: &ormo.IOrder{ID: 1, InitPrice: 1}, Enter: &ormo.ExOrder{Amount: 0, Filled: 0}},
-		{IOrder: &ormo.IOrder{ID: 2, InitPrice: 1}, Enter: &ormo.ExOrder{Amount: 0.004, Filled: 0}},
-		{IOrder: &ormo.IOrder{ID: 3, InitPrice: 1}, Enter: &ormo.ExOrder{Amount: 0.008, Filled: 0}},
-	}
-	want := []int64{3, 1, 2}
-	permutations := [][]*ormo.InOutOrder{
-		{orders[0], orders[1], orders[2]},
-		{orders[2], orders[1], orders[0]},
-		{orders[1], orders[0], orders[2]},
-	}
-	for _, permutation := range permutations {
-		slices.SortFunc(permutation, func(a, b *ormo.InOutOrder) int {
-			return compareExitOpenOrders(a, b, false)
-		})
-		if got := orderIDs(permutation); !slices.Equal(got, want) {
-			t.Fatalf("cent-boundary order = %v, want %v", got, want)
-		}
-	}
-}
-
-func issue155PendingExit(id int64, symbol string) *ormo.InOutOrder {
+func deterministicPendingExit(id int64, symbol string) *ormo.InOutOrder {
 	return &ormo.InOutOrder{
 		IOrder: &ormo.IOrder{
 			ID: id, Symbol: symbol, Timeframe: "1m", Status: ormo.InOutStatusFullEnter,
-			ExitTag: "issue155", InitPrice: 100, EnterAt: 1_699_999_940_000 + id, Leverage: 1,
+			ExitTag: "deterministic", InitPrice: 100, EnterAt: 1_699_999_940_000 + id, Leverage: 1,
 		},
 		Enter: &ormo.ExOrder{
 			Enter: true, Side: banexg.OdSideBuy, Price: 100, Average: 100,
@@ -177,11 +96,4 @@ func issue155PendingExit(id int64, symbol string) *ormo.InOutOrder {
 			CreateAt: 1_699_999_940_000, Amount: 1, Status: ormo.OdStatusInit,
 		},
 	}
-}
-
-func issue155OpenOrder(id int64, symbol string) *ormo.InOutOrder {
-	od := issue155PendingExit(id, symbol)
-	od.ExitTag = ""
-	od.Exit = nil
-	return od
 }

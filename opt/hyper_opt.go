@@ -796,7 +796,9 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 
 func runBTOnce() (*BackTest, float64, *errs.Error) {
 	core.BotRunning = true
-	resetOptimizeTrialVars()
+	// Keep ResetVars scoped to normal runtime state; do not walk and mutate every account
+	// merely to remove rare trial-order effects from the StakePctAmt cache.
+	biz.ResetVars()
 	bt, err := NewBackTest(true, "")
 	if err != nil {
 		return nil, 0, err
@@ -806,13 +808,6 @@ func runBTOnce() (*BackTest, float64, *errs.Error) {
 	}
 	var loss = -bt.Score()
 	return bt, loss, nil
-}
-
-func resetOptimizeTrialVars() {
-	biz.ResetVars()
-	for _, account := range config.Accounts {
-		account.StakePctAmt = 0
-	}
 }
 
 func runGOptuna(name string, rounds int, params []*core.Param, loop FuncOptTask) *errs.Error {

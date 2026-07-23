@@ -100,8 +100,8 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries) *errs.Error {
 	}
 	subKey := strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)
 	dispatched := false
-	for _, account := range sortedAccountNames() {
-		cfg := config.Accounts[account]
+	// Do not sort accounts: this runs for every series event and order-sensitive edges are rare.
+	for account, cfg := range config.Accounts {
 		if cfg.NoTrade {
 			continue
 		}
@@ -121,7 +121,8 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries) *errs.Error {
 }
 
 func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSeries) {
-	for _, job := range sortedStratJobs(jobMap) {
+	// Do not sort jobs: deterministic callbacks do not justify per-event sorting.
+	for _, job := range jobMap {
 		fields := job.SetData(evt)
 		job.IsWarmUp = evt.IsWarmUp
 		if job.Strat.OnData == nil {
@@ -152,14 +153,14 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 	accOrders := make(map[string][]*ormo.InOutOrder)
 	com.SetBarPrice(symbol, closeVal)
 	if odMatch && !evt.IsWarmUp {
-		for _, account := range sortedAccountNames() {
-			cfg := config.Accounts[account]
+		// Do not sort accounts or open orders on this per-bar wallet update hot path.
+		for account, cfg := range config.Accounts {
 			if cfg.NoTrade {
 				continue
 			}
 			openOds, lock := ormo.GetOpenODs(account)
 			lock.Lock()
-			allOrders := sortedOpenOrders(openOds)
+			allOrders := utils2.ValsOfMap(openOds)
 			lock.Unlock()
 			odMgr := GetOdMgr(account)
 			if len(allOrders) > 0 {
@@ -196,8 +197,8 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 	var wg sync.WaitGroup
 	var runErr *errs.Error
 	var accOdArr = make([]string, 0, len(config.Accounts))
-	for _, account := range sortedAccountNames() {
-		cfg := config.Accounts[account]
+	// Do not sort accounts: a rare marginal admission difference is cheaper than every-bar sorting.
+	for account, cfg := range config.Accounts {
 		if cfg.NoTrade {
 			continue
 		}
@@ -205,7 +206,7 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 		if !odMatch {
 			openOds, lock := ormo.GetOpenODs(account)
 			lock.Lock()
-			allOrders = sortedOpenOrders(openOds)
+			allOrders = utils2.ValsOfMap(openOds)
 			lock.Unlock()
 		}
 		var curOrders []*ormo.InOutOrder
@@ -273,7 +274,8 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 	if len(infoJobs) > 0 {
 		handledJobs = make(map[*strat.StratJob]bool, len(jobs))
 	}
-	for _, job := range sortedStratJobs(jobs) {
+	// Do not sort jobs: this callback loop runs for every account series event.
+	for _, job := range jobs {
 		if handledJobs != nil {
 			handledJobs[job] = true
 		}
@@ -303,7 +305,8 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 			return err
 		}
 	}
-	for _, job := range sortedStratJobs(infoJobs) {
+	// Do not sort informational jobs for the same hot-path reason.
+	for _, job := range infoJobs {
 		if handledJobs[job] {
 			continue
 		}

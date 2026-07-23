@@ -1,12 +1,10 @@
 package data
 
 import (
-	"cmp"
 	"container/heap"
 	"fmt"
 	"maps"
 	"math"
-	"slices"
 
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/strat"
@@ -21,7 +19,6 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
-	utils2 "github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
 )
 
@@ -78,11 +75,11 @@ func (p *Provider[IDataFeeder]) SubWarmPairs(items map[string]map[string]int, de
 	var warmJobs []*WarmJob
 	var oldSince = make(map[string]int64)
 	var err *errs.Error
-	for _, pair := range slices.Sorted(maps.Keys(items)) {
-		tfWarms := items[pair]
+	// Warmup does not require canonical pair/timeframe order; avoid sorting every subscription map.
+	for pair, tfWarms := range items {
 		hold, ok := p.holders[pair]
 		if !ok {
-			hold, err = p.newFeeder(pair, sortedTimeframes(tfWarms))
+			hold, err = p.newFeeder(pair, utils.KeysOfMap(tfWarms))
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -91,7 +88,7 @@ func (p *Provider[IDataFeeder]) SubWarmPairs(items map[string]map[string]int, de
 			warmJobs = append(warmJobs, &WarmJob{hold: hold, tfWarms: tfWarms})
 		} else {
 			oldMinTf := hold.getStates()[0].TimeFrame
-			newTfs := hold.SubTfs(sortedTimeframes(tfWarms), delOther)
+			newTfs := hold.SubTfs(utils.KeysOfMap(tfWarms), delOther)
 			curMinTf := hold.getStates()[0].TimeFrame
 			if oldMinTf != curMinTf {
 				newHolds = append(newHolds, hold)
@@ -122,17 +119,6 @@ func (p *Provider[IDataFeeder]) SubWarmPairs(items map[string]map[string]int, de
 		sinceMap[key] = since
 	}
 	return newHolds, sinceMap, delPairs, err
-}
-
-func sortedTimeframes(items map[string]int) []string {
-	timeframes := slices.Sorted(maps.Keys(items))
-	slices.SortFunc(timeframes, func(a, b string) int {
-		if order := cmp.Compare(utils2.TFToSecs(a), utils2.TFToSecs(b)); order != 0 {
-			return order
-		}
-		return cmp.Compare(a, b)
-	})
-	return timeframes
 }
 
 func (p *Provider[IDataFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPrg) (map[string]int64, *errs.Error) {
@@ -480,14 +466,15 @@ func (p *HistProvider) LoopMain() *errs.Error {
 
 func (p *HistProvider) makeFeeders() []IHistFeeder {
 	feeders := make([]IHistFeeder, 0, len(p.holders)+len(p.trades)+len(p.series))
-	for _, key := range slices.Sorted(maps.Keys(p.holders)) {
-		feeders = append(feeders, p.holders[key])
+	// Feeders are heap-scheduled by timestamp later; sorting these maps only adds startup cost.
+	for _, feeder := range p.holders {
+		feeders = append(feeders, feeder)
 	}
-	for _, key := range slices.Sorted(maps.Keys(p.trades)) {
-		feeders = append(feeders, p.trades[key])
+	for _, feeder := range p.trades {
+		feeders = append(feeders, feeder)
 	}
-	for _, key := range slices.Sorted(maps.Keys(p.series)) {
-		feeders = append(feeders, p.series[key])
+	for _, feeder := range p.series {
+		feeders = append(feeders, feeder)
 	}
 	return feeders
 }
