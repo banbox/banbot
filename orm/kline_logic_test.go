@@ -44,6 +44,7 @@ func TestRefreshAggPgReturnsRepairedWindow(t *testing.T) {
 	})
 	db := &visibilityDBStub{exec: func(sql string, _ ...interface{}) (pgconn.CommandTag, error) {
 		if !strings.Contains(sql, "DELETE FROM kline_5m target") || !strings.Contains(sql, "INSERT INTO kline_5m") ||
+			!strings.Contains(sql, "SELECT $1::integer AS sid") ||
 			!strings.Contains(sql, "HAVING COUNT(*) = 5") ||
 			!strings.Contains(sql, "ON CONFLICT (sid, time) DO UPDATE") {
 			t.Fatalf("unexpected aggregation SQL: %s", sql)

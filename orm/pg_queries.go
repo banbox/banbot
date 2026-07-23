@@ -235,7 +235,7 @@ func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64,
 	groupExpr := buildAggGroupExpr(tfMSecs, offMS)
 
 	insertSQL := fmt.Sprintf(`WITH complete AS MATERIALIZED (
-SELECT $1 AS sid,
+SELECT $1::integer AS sid,
        %s AS bar_time,
        (array_agg(open ORDER BY time))[1] AS open,
        MAX(high) AS high,
