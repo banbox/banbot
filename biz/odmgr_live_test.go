@@ -1320,14 +1320,14 @@ func makeEnteredOrder(id int64, symbol, enterID string, amount float64) *ormo.In
 	return od
 }
 
-func TestSyncLocalOrdersReconcilesSubmittedExitBeforeNoMatch(t *testing.T) {
+func TestSyncLocalOrdersReconcilesSubmittedExitWithOlderCreatedTimestamp(t *testing.T) {
 	withIsolatedOrderState(t)
 	const account = "exit-reconcile"
 	const symbol = "EXITREC/USDT:USDT"
 	target := makeEnteredOrder(2101, symbol, "target-entry", 2)
 	target.Exit = &ormo.ExOrder{
 		OrderID: "target-exit", Symbol: symbol, Side: banexg.OdSideSell,
-		OrderType: banexg.OdTypeMarket, Amount: 2, Status: ormo.OdStatusInit,
+		OrderType: banexg.OdTypeMarket, Amount: 2, Status: ormo.OdStatusInit, UpdateAt: 200,
 	}
 	sibling := makeEnteredOrder(2102, symbol, "sibling-entry", 10)
 	fetchCalls := 0
@@ -1340,7 +1340,7 @@ func TestSyncLocalOrdersReconcilesSubmittedExitBeforeNoMatch(t *testing.T) {
 			return &banexg.Order{
 				ID: id, Symbol: symbol, Side: banexg.OdSideSell, Type: banexg.OdTypeMarket,
 				Status: banexg.OdStatusFilled, Amount: 2, Filled: 2, Average: 99,
-				LastUpdateTimestamp: btime.UTCStamp(),
+				Timestamp: 100, LastTradeTimestamp: 101, LastUpdateTimestamp: 102,
 			}, nil
 		},
 		fetchPositions: func([]string, map[string]interface{}) ([]*banexg.Position, *errs.Error) {
