@@ -204,6 +204,24 @@ func TestLoadMarketsUsesSnapshotWithoutLiveMarketRequest(t *testing.T) {
 	}
 }
 
+func TestMarketSnapshotModeIncludesDataCommandsButNotLive(t *testing.T) {
+	originalMode := core.RunMode
+	originalBacktest := core.BackTestMode
+	t.Cleanup(func() {
+		core.RunMode = originalMode
+		core.BackTestMode = originalBacktest
+	})
+	core.BackTestMode = false
+	core.RunMode = core.RunModeData
+	if !marketSnapshotMode() {
+		t.Fatal("data commands must allow frozen market snapshots")
+	}
+	core.RunMode = core.RunModeLive
+	if marketSnapshotMode() {
+		t.Fatal("live mode must not allow frozen market snapshots")
+	}
+}
+
 func TestMergeHistoricalMarketSnapshotRejectsWrongExchange(t *testing.T) {
 	info := &banexg.ExgInfo{ID: "binance", MarketType: banexg.MarketLinear}
 	_, err := mergeHistoricalMarketSnapshot(info, make(banexg.MarketMap), &historicalMarketSnapshot{

@@ -108,8 +108,16 @@ func (q *Queries) DownOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, timeF
 
 func (q *Queries) downOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
 	retry int, pBar *utils.PrgBar) (int, *errs.Error) {
-	startMS = exs.GetValidStart(startMS)
+	startMS, endMS = validKlineDownloadRange(exs, startMS, endMS)
 	return downOHLCV2DBRange(q, exchange, exs, timeFrame, startMS, endMS, retry, pBar)
+}
+
+func validKlineDownloadRange(exs *ExSymbol, startMS, endMS int64) (int64, int64) {
+	startMS = exs.GetValidStart(startMS)
+	if exs.DelistMs > 0 && (endMS == 0 || exs.DelistMs < endMS) {
+		endMS = exs.DelistMs
+	}
+	return startMS, endMS
 }
 
 /*
@@ -121,7 +129,8 @@ stepCB 用于更新进度，总值固定1000，避免内部下载区间大于传
 */
 func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
 	retry int, pBar *utils.PrgBar) (int, *errs.Error) {
-	if startMS >= endMS || exs.Combined || exs.DelistMs > 0 || core.NetDisable {
+	startMS, endMS = validKlineDownloadRange(exs, startMS, endMS)
+	if startMS >= endMS || exs.Combined || core.NetDisable {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
 		}
@@ -715,9 +724,6 @@ func BulkDownOHLCV(exchange banexg.BanExchange, exsList map[int32]*ExSymbol, tim
 	sidList := utils.KeysOfMap(exsList)
 	return utils.ParallelRun(sidList, core.ConcurNum, func(_ int, i int32) *errs.Error {
 		exs, _ := exsList[i]
-		if exs.DelistMs > 0 {
-			return nil
-		}
 		_, dlErr := downOHLCV2DBRange(nil, exchange, exs, downTF, startMS, endMS, 2, pBar)
 		return dlErr
 	})

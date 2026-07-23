@@ -113,6 +113,7 @@ func RunTradeWith(args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *e
 }
 
 func RunDownData(args *config.CmdArgs) *errs.Error {
+	core.SetRunMode(core.RunModeData)
 	err := biz.SetupComsExg(args)
 	if err != nil {
 		return err

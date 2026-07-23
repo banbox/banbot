@@ -208,53 +208,66 @@ func (q *Queries) getKLineNumPg(sid int32, timeFrame string, start, end int64) i
 // ─────────────────────────────────────────────
 
 // refreshAggPg uses an in-DB INSERT … SELECT … GROUP BY for efficient aggregation in TimescaleDB.
-func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64, aggFrom string) *errs.Error {
+func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64, aggFrom string) (int64, int64, *errs.Error) {
 	if aggFrom == "" {
 		aggFrom = item.AggFrom
 	}
 	if aggFrom == "" {
-		return nil
+		return 0, 0, nil
 	}
 	fromTbl := "kline_" + aggFrom
 	toTbl := item.Table
 	tfMSecs := item.MSecs
+	fromTfMSecs := int64(utils2.TFToSecs(aggFrom) * 1000)
+	if fromTfMSecs <= 0 || tfMSecs%fromTfMSecs != 0 {
+		return 0, 0, errs.NewMsg(core.ErrBadConfig, "invalid aggregate source %s for %s", aggFrom, item.TimeFrame)
+	}
 	// Align windows (accounting for exchange-specific offset).
 	offMS := GetAlignOff(sid, tfMSecs)
 	alignedStart := utils2.AlignTfMSecs(aggStart-offMS, tfMSecs) + offMS
 	alignedEnd := utils2.AlignTfMSecs(endMS-offMS, tfMSecs) + offMS
 	if alignedStart >= alignedEnd {
-		return nil
+		return 0, 0, nil
 	}
 
 	// Calculate bar group key in SQL: floor((time - offMS) / tfMSecs) * tfMSecs + offMS.
 	// For UTC-aligned exchanges offMS == 0 which simplifies to (time / tfMSecs) * tfMSecs.
 	groupExpr := buildAggGroupExpr(tfMSecs, offMS)
 
-	insertSQL := fmt.Sprintf(`INSERT INTO %s (sid, time, open, high, low, close, volume, quote, buy_volume, trade_num)
-SELECT $1,
+	insertSQL := fmt.Sprintf(`WITH complete AS MATERIALIZED (
+SELECT $1 AS sid,
        %s AS bar_time,
-       (array_agg(open ORDER BY time))[1],
-       MAX(high),
-       MIN(low),
-       (array_agg(close ORDER BY time DESC))[1],
-       SUM(volume),
-       SUM(quote),
-       SUM(buy_volume),
-       SUM(trade_num)
+       (array_agg(open ORDER BY time))[1] AS open,
+       MAX(high) AS high,
+       MIN(low) AS low,
+       (array_agg(close ORDER BY time DESC))[1] AS close,
+       SUM(volume) AS volume,
+       SUM(quote) AS quote,
+       SUM(buy_volume) AS buy_volume,
+       SUM(trade_num) AS trade_num
 FROM %s
 WHERE sid = $1 AND time >= $2 AND time < $3
 GROUP BY bar_time
-HAVING COUNT(*) > 0
+HAVING COUNT(*) = %d
+), deleted AS (
+  DELETE FROM %s target
+  WHERE target.sid = $1 AND target.time >= $2 AND target.time < $3
+    AND NOT EXISTS (SELECT 1 FROM complete WHERE complete.bar_time = target.time)
+  RETURNING target.time
+)
+INSERT INTO %s (sid, time, open, high, low, close, volume, quote, buy_volume, trade_num)
+SELECT sid, bar_time, open, high, low, close, volume, quote, buy_volume, trade_num
+FROM complete
 ON CONFLICT (sid, time) DO UPDATE SET
   open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
   volume = EXCLUDED.volume, quote = EXCLUDED.quote, buy_volume = EXCLUDED.buy_volume, trade_num = EXCLUDED.trade_num`,
-		toTbl, groupExpr, fromTbl)
+		groupExpr, fromTbl, tfMSecs/fromTfMSecs, toTbl, toTbl)
 
 	_, err := q.db.Exec(context.Background(), insertSQL, sid, alignedStart, alignedEnd)
 	if err != nil {
-		return NewDbErr(core.ErrDbExecFail, err)
+		return 0, 0, NewDbErr(core.ErrDbExecFail, err)
 	}
-	return nil
+	return alignedStart, alignedEnd, nil
 }
 
 // ─────────────────────────────────────────────

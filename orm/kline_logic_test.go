@@ -1,10 +1,76 @@
 package orm
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/banbox/banbot/core"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestValidKlineDownloadRange(t *testing.T) {
+	exs := &ExSymbol{ListMs: 200, DelistMs: 800}
+	start, end := validKlineDownloadRange(exs, 100, 900)
+	if start != 200 || end != 800 {
+		t.Fatalf("download range = %d/%d, want 200/800", start, end)
+	}
+	start, end = validKlineDownloadRange(&ExSymbol{}, 100, 900)
+	if start != 100 || end != 900 {
+		t.Fatalf("active download range = %d/%d, want 100/900", start, end)
+	}
+	start, end = validKlineDownloadRange(&ExSymbol{ListMs: 200, DelistMs: 800}, 100, 0)
+	if start != 200 || end != 800 {
+		t.Fatalf("unbounded delisted range = %d/%d, want 200/800", start, end)
+	}
+	start, end = validKlineDownloadRange(&ExSymbol{DelistMs: 800}, 900, 0)
+	if start != 900 || end != 800 {
+		t.Fatalf("post-delist range = %d/%d, want 900/800", start, end)
+	}
+}
+
+func TestRefreshAggPgReturnsRepairedWindow(t *testing.T) {
+	const (
+		base = int64(1_700_000_100_000)
+		sid  = int32(-101)
+	)
+	lockAlignOff.Lock()
+	alignOffs[sid] = map[int64]int64{300_000: 0}
+	lockAlignOff.Unlock()
+	t.Cleanup(func() {
+		lockAlignOff.Lock()
+		delete(alignOffs, sid)
+		lockAlignOff.Unlock()
+	})
+	db := &visibilityDBStub{exec: func(sql string, _ ...interface{}) (pgconn.CommandTag, error) {
+		if !strings.Contains(sql, "DELETE FROM kline_5m target") || !strings.Contains(sql, "INSERT INTO kline_5m") ||
+			!strings.Contains(sql, "HAVING COUNT(*) = 5") ||
+			!strings.Contains(sql, "ON CONFLICT (sid, time) DO UPDATE") {
+			t.Fatalf("unexpected aggregation SQL: %s", sql)
+		}
+		return pgconn.NewCommandTag("INSERT 0 2"), nil
+	}}
+	start, end, err := New(db).refreshAggPg(NewKlineAgg("5m", "kline_5m", "1m", "", "", "", "", ""), sid, base, base+900_000, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start != base || end != base+900_000 {
+		t.Fatalf("repair window = %d/%d, want %d/%d", start, end, base, base+900_000)
+	}
+}
+
+func TestExactKlineHolesPreservesInteriorAndTrailingGaps(t *testing.T) {
+	got := exactKlineHoles([]int64{100, 200, 400}, 100, 100, 600)
+	want := []MSRange{{Start: 300, Stop: 400}, {Start: 500, Stop: 600}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("holes = %+v, want %+v", got, want)
+	}
+	got = exactKlineHoles(nil, 100, 100, 600)
+	want = []MSRange{{Start: 100, Stop: 600}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("empty physical window holes = %+v, want %+v", got, want)
+	}
+}
 
 func TestParseDownArgsAlignStartAndInferEndByLimit(t *testing.T) {
 	tfMSecs := int64(60_000) // 1m

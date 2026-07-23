@@ -25,14 +25,14 @@ type historicalMarketSnapshot struct {
 }
 
 func hasConfiguredMarketSnapshot() bool {
-	if !core.BackTestMode || config.Exchange == nil {
+	if !marketSnapshotMode() || config.Exchange == nil {
 		return false
 	}
 	return config.Exchange.Items[config.Exchange.Name]["market_snapshot"] != nil
 }
 
 func applyConfiguredMarketSnapshot(exchange banexg.BanExchange, markets banexg.MarketMap) *errs.Error {
-	if !core.BackTestMode || config.Exchange == nil {
+	if !marketSnapshotMode() || config.Exchange == nil {
 		return nil
 	}
 	options := config.Exchange.Items[config.Exchange.Name]
@@ -79,6 +79,10 @@ func applyConfiguredMarketSnapshot(exchange banexg.BanExchange, markets banexg.M
 	log.Info("historical market snapshot applied", zap.String("path", rawPath),
 		zap.String("sha256", actualHash), zap.Int("markets", count))
 	return nil
+}
+
+func marketSnapshotMode() bool {
+	return core.BackTestMode || core.RunMode == core.RunModeData
 }
 
 func mergeHistoricalMarketSnapshot(info *banexg.ExgInfo, markets banexg.MarketMap,
