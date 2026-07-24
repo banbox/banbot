@@ -145,6 +145,27 @@ func RunDownData(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
+func RunRepairKlineRanges(args *config.CmdArgs) *errs.Error {
+	core.SetRunMode(core.RunModeData)
+	err := biz.SetupComsExg(args)
+	if err != nil {
+		return err
+	}
+	pairs, dynamic := config.GetStaticPairs()
+	if dynamic || len(pairs) == 0 {
+		return errs.NewMsg(errs.CodeParamInvalid, "kline repair-ranges requires explicit pairs")
+	}
+	exsMap := make(map[int32]*orm.ExSymbol, len(pairs))
+	for _, pair := range pairs {
+		exs, getErr := orm.GetExSymbolCur(pair)
+		if getErr != nil {
+			return getErr
+		}
+		exsMap[exs.ID] = exs
+	}
+	return orm.RepairKlineRanges(exsMap, args.TimeFrames, config.TimeRange.StartMS, config.TimeRange.EndMS)
+}
+
 func runExportData(args *config.CmdArgs) *errs.Error {
 	err := biz.SetupComsExg(args)
 	if err != nil {

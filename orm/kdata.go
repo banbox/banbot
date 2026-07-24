@@ -376,6 +376,10 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	}()
 
 	wg.Wait()
+	if outErr != nil {
+		clearInsJob = false
+		return saveNum, outErr
+	}
 
 	// Unfinished bar (best-effort).
 	curMS := btime.UTCStamp()
@@ -399,7 +403,7 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 				return saveNum, waitErr
 			}
 		}
-		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, true, true)
+		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, false, true)
 		if updErr != nil {
 			clearInsJob = false
 			if outErr == nil {
@@ -416,7 +420,27 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 			}
 		}
 	}
+	if outErr == nil {
+		outErr = reconcileDownloadedRanges(succDown, func(item MSRange) *errs.Error {
+			if holeErr := sess.repairKlineRangeFromPhysical(exs.ID, timeFrame, item.Start, item.Stop); holeErr != nil {
+				return holeErr
+			}
+			return sess.updateBigHyper(exs, timeFrame, item.Start, item.Stop)
+		})
+		if outErr != nil {
+			clearInsJob = false
+		}
+	}
 	return saveNum, outErr
+}
+
+func reconcileDownloadedRanges(ranges []MSRange, reconcile func(MSRange) *errs.Error) *errs.Error {
+	for _, item := range ranges {
+		if err := reconcile(item); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 /*
@@ -727,6 +751,29 @@ func BulkDownOHLCV(exchange banexg.BanExchange, exsList map[int32]*ExSymbol, tim
 		_, dlErr := downOHLCV2DBRange(nil, exchange, exs, downTF, startMS, endMS, 2, pBar)
 		return dlErr
 	})
+}
+
+func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS, endMS int64) *errs.Error {
+	sess, conn, err := Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	for _, timeFrame := range timeFrames {
+		if utils2.TFToSecs(timeFrame) <= 0 {
+			return errs.NewMsg(errs.CodeParamInvalid, "invalid timeframe: %s", timeFrame)
+		}
+		for _, exs := range exsList {
+			start, stop := validKlineDownloadRange(exs, startMS, endMS)
+			if start >= stop {
+				continue
+			}
+			if err = sess.repairKlineRangeFromPhysical(exs.ID, timeFrame, start, stop); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 /*

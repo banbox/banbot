@@ -107,6 +107,8 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 
 	add("kline", newConfigCommand("down", "download kline data from an exchange", RunDownData, true,
 		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindTimeFrames, bindMedium))
+	add("kline", newConfigCommand("repair-ranges", "rebuild kline range metadata from stored bars", RunRepairKlineRanges, true,
+		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindTimeFrames))
 	add("kline", newConfigCommand("load", "load kline data from zip or CSV files", LoadKLinesToDB, true, bindIn))
 	add("kline", newConfigCommand("agg", "aggregate kline data into larger timeframes", AggKlineBigs, true,
 		bindPairs, bindTimeFrames))
