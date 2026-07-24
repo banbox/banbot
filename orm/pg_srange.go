@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"slices"
 	"sort"
 )
 
@@ -72,13 +73,14 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <=
 	if err != nil {
 		return err
 	}
-	var overhangSegs []srangeSpan
+	var spans, overhangSegs []srangeSpan
 	for rows.Next() {
 		var s srangeSpan
 		if scanErr := rows.Scan(&s.StartMs, &s.StopMs, &s.HasData); scanErr != nil {
 			rows.Close()
 			return scanErr
 		}
+		spans = append(spans, s)
 		if s.StartMs < startMs {
 			overhangSegs = append(overhangSegs, srangeSpan{StartMs: s.StartMs, StopMs: startMs, HasData: s.HasData})
 		}
@@ -88,14 +90,6 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <=
 	}
 	rows.Close()
 	if err = rows.Err(); err != nil {
-		return err
-	}
-
-	// Delete all existing rows overlapping the window.
-	_, err = txq.db.Exec(ctx, `DELETE FROM sranges
-WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <= $5`,
-		sid, table, timeframe, startMs, stopMs)
-	if err != nil {
 		return err
 	}
 
@@ -119,6 +113,27 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <=
 		return allSegs[i].HasData && !allSegs[j].HasData
 	})
 	allSegs = mergeSRangeSpans(allSegs)
+	current := append([]srangeSpan(nil), spans...)
+	sort.Slice(current, func(i, j int) bool {
+		if current[i].StartMs != current[j].StartMs {
+			return current[i].StartMs < current[j].StartMs
+		}
+		if current[i].StopMs != current[j].StopMs {
+			return current[i].StopMs < current[j].StopMs
+		}
+		return current[i].HasData && !current[j].HasData
+	})
+	current = mergeSRangeSpans(current)
+	if slices.Equal(current, allSegs) {
+		return nil
+	}
+	// Delete all existing rows overlapping the window only when the logical spans changed.
+	_, err = txq.db.Exec(ctx, `DELETE FROM sranges
+WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <= $5`,
+		sid, table, timeframe, startMs, stopMs)
+	if err != nil {
+		return err
+	}
 	for _, s := range allSegs {
 		_, err = txq.db.Exec(ctx, `INSERT INTO sranges (sid, tbl, timeframe, start_ms, stop_ms, has_data)
 VALUES ($1, $2, $3, $4, $5, $6)
