@@ -69,6 +69,7 @@ type Feeder struct {
 	adjs     []*orm.AdjInfo // List of weighting factors 复权因子列表
 	adj      *orm.AdjInfo
 	isWarmUp bool // Is it currently in preheating state? 当前是否预热状态
+	coverage *config.HistoricalCoverageConfig
 }
 
 func (f *Feeder) getStates() []*PairTFCache {
@@ -204,6 +205,10 @@ bars original unweighted K-line
 bars 原始未复权的K线
 */
 func (f *Feeder) onStateOhlcvs(state *PairTFCache, rows []*orm.DataSeries, lastOk bool) []*orm.DataSeries {
+	if !lastOk && len(rows) > 0 && f.coverage != nil && !f.coverage.Allows(state.TimeFrame, rows[len(rows)-1].TimeMS) {
+		lastOk = true
+	}
+	rows = f.filterHistoricalCoverageRows(state.TimeFrame, rows)
 	if len(rows) == 0 {
 		return nil
 	}
@@ -264,6 +269,7 @@ func (f *Feeder) addTfKlines(tf string, rows []*orm.DataSeries) {
 func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.DataSeries, adj *orm.AdjInfo) {
 	isLive := core.LiveMode
 	pair := f.Symbol
+	rows = f.filterHistoricalCoverageRows(timeFrame, rows)
 	rows = enrichStoredKlineFields(f.ExSymbol, timeFrame, rows)
 	for _, row := range rows {
 		if !isLive || f.isWarmUp {
@@ -285,6 +291,25 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.Data
 			log.Warn(fmt.Sprintf("%s/%s bar too late, delay %v bars, %v", pair, timeFrame, barNum, lastTime))
 		}
 	}
+}
+
+func (f *Feeder) filterHistoricalCoverageRows(timeframe string, rows []*orm.DataSeries) []*orm.DataSeries {
+	if f.coverage == nil {
+		return rows
+	}
+	for index, row := range rows {
+		if f.coverage.Allows(timeframe, row.TimeMS) {
+			continue
+		}
+		filtered := append([]*orm.DataSeries(nil), rows[:index]...)
+		for _, remaining := range rows[index+1:] {
+			if f.coverage.Allows(timeframe, remaining.TimeMS) {
+				filtered = append(filtered, remaining)
+			}
+		}
+		return filtered
+	}
+	return rows
 }
 
 func applyAdjSeries(adj *orm.AdjInfo, rows []*orm.DataSeries) []*orm.DataSeries {
@@ -500,16 +525,25 @@ func NewSeriesFeeder(exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*S
 	if err != nil {
 		return nil, err
 	}
+	coverage := historicalCoverageForFeeder(exs.Symbol, core.BackTestMode)
 	return &SeriesFeeder{
 		Feeder: Feeder{
 			ExSymbol: exs,
 			CallBack: callBack,
 			tfBars:   make(map[string][]*orm.DataSeries),
 			adjs:     adjs,
+			coverage: coverage,
 		},
 		PreFire: config.PreFire,
 		showLog: showLog,
 	}, nil
+}
+
+func historicalCoverageForFeeder(symbol string, backtest bool) *config.HistoricalCoverageConfig {
+	if !backtest {
+		return nil
+	}
+	return config.HistoricalCoverageFor(symbol)
 }
 
 func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.PrgBar) (int64, map[string][2]int, *errs.Error) {
