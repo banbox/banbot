@@ -760,11 +760,12 @@ func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS
 	}
 	defer conn.Release()
 	for _, timeFrame := range timeFrames {
-		if utils2.TFToSecs(timeFrame) <= 0 {
+		tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
+		if tfMSecs <= 0 {
 			return errs.NewMsg(errs.CodeParamInvalid, "invalid timeframe: %s", timeFrame)
 		}
 		for _, exs := range exsList {
-			start, stop := validKlineDownloadRange(exs, startMS, endMS)
+			start, stop := repairKlineWindow(exs, startMS, endMS, tfMSecs)
 			if start >= stop {
 				continue
 			}
@@ -774,6 +775,13 @@ func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS
 		}
 	}
 	return nil
+}
+
+func repairKlineWindow(exs *ExSymbol, startMS, endMS, tfMSecs int64) (int64, int64) {
+	startMS = exs.GetValidStart(startMS)
+	startMS = ((startMS + tfMSecs - 1) / tfMSecs) * tfMSecs
+	endMS = (endMS / tfMSecs) * tfMSecs
+	return startMS, endMS
 }
 
 /*

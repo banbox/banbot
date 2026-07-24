@@ -29,6 +29,18 @@ func TestValidKlineDownloadRange(t *testing.T) {
 	}
 }
 
+func TestRepairKlineWindowAlignsAndDoesNotClampDelistedTail(t *testing.T) {
+	exs := &ExSymbol{ListMs: 200, DelistMs: 800}
+	start, end := repairKlineWindow(exs, 100, 950, 100)
+	if start != 200 || end != 900 {
+		t.Fatalf("repair range = %d/%d, want 200/900", start, end)
+	}
+	start, end = repairKlineWindow(&ExSymbol{ListMs: 201}, 100, 999, 100)
+	if start != 300 || end != 900 {
+		t.Fatalf("aligned repair range = %d/%d, want 300/900", start, end)
+	}
+}
+
 func TestRefreshAggPgReturnsRepairedWindow(t *testing.T) {
 	const (
 		base = int64(1_700_000_100_000)
