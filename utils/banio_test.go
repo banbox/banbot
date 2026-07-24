@@ -4,18 +4,91 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
+	"io"
 	"math/big"
+	"net"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestBanConnWriteIdleDeadlineDiscardsConnection(t *testing.T) {
+	oldTimeout := banConnWriteIdleTimeout
+	banConnWriteIdleTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { banConnWriteIdleTimeout = oldTimeout })
+	left, right := net.Pipe()
+	conn := &BanConn{Conn: left, Ready: true}
+	t.Cleanup(func() {
+		_ = left.Close()
+		_ = right.Close()
+	})
+
+	started := time.Now()
+	err := conn.WriteMsg(&IOMsg{Action: "blocked"})
+	if err == nil {
+		t.Fatal("blocked write unexpectedly succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("blocked write took %s", elapsed)
+	}
+	if conn.getConn() != nil || conn.Ready {
+		t.Fatal("failed frame connection remained reusable")
+	}
+}
+
+func TestBanConnWriteIdleDeadlineAllowsSlowProgress(t *testing.T) {
+	oldTimeout := banConnWriteIdleTimeout
+	banConnWriteIdleTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { banConnWriteIdleTimeout = oldTimeout })
+	left, right := net.Pipe()
+	conn := &BanConn{Conn: left, Ready: true}
+	t.Cleanup(func() {
+		_ = left.Close()
+		_ = right.Close()
+	})
+	payload := make([]byte, 256<<10)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(right, lenBuf); err != nil {
+			readDone <- err
+			return
+		}
+		remaining := int(binary.LittleEndian.Uint32(lenBuf))
+		buf := make([]byte, 32<<10)
+		for remaining > 0 {
+			size := min(len(buf), remaining)
+			if _, err := io.ReadFull(right, buf[:size]); err != nil {
+				readDone <- err
+				return
+			}
+			remaining -= size
+			time.Sleep(10 * time.Millisecond)
+		}
+		readDone <- nil
+	}()
+	started := time.Now()
+	if err := conn.WriteMsg(&IOMsg{Action: "slow", Data: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed <= banConnWriteIdleTimeout {
+		t.Fatalf("write completed too quickly to test idle deadline: %s", elapsed)
+	}
+}
 
 func TestBanServer(t *testing.T) {
 	requireManualBanIOTest(t)

@@ -86,9 +86,12 @@ type IOMsgRaw struct {
 }
 
 var (
-	tipRetryTimes     = make(map[string]int64)
-	tipRetryTimesLock deadlock.Mutex
+	tipRetryTimes           = make(map[string]int64)
+	tipRetryTimesLock       deadlock.Mutex
+	banConnWriteIdleTimeout = 30 * time.Second
 )
+
+const banConnWriteChunkSize = 64 << 10
 
 func (c *BanConn) GetRemote() string {
 	return c.Remote
@@ -123,9 +126,6 @@ func (c *BanConn) WriteMsg(msg *IOMsg) *errs.Error {
 	if msg == nil {
 		return nil
 	}
-	if c.Conn == nil {
-		return errs.NewMsg(errs.CodeIOWriteFail, "write fail as disconnected")
-	}
 	data, err := msg.Marshal(c.aesKey)
 	if err != nil {
 		return err
@@ -143,9 +143,6 @@ func (c *BanConn) Write(msg *IOMsgRaw) *errs.Error {
 }
 
 func (c *BanConn) write(data []byte, retryNum int) *errs.Error {
-	if c.Conn == nil {
-		return errs.NewMsg(errs.CodeIOWriteFail, "write fail as disconnected")
-	}
 	c.lockWrite.Lock()
 	locked := true
 	defer func() {
@@ -156,12 +153,14 @@ func (c *BanConn) write(data []byte, retryNum int) *errs.Error {
 	dataLen := uint32(len(data))
 	lenBt := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBt, dataLen)
-	if c.Conn != nil {
+	conn := c.getConn()
+	if conn != nil {
+		defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
 		// 先写长度头
-		if err_ := c.writeFully(lenBt); err_ != nil {
-			c.Ready = false
+		if err_ := writeFully(conn, lenBt); err_ != nil {
+			c.discardConn(conn)
 			errCode, errType := getErrType(err_)
-			if c.DoConnect != nil && errCode == core.ErrNetConnect && retryNum > 0 {
+			if c.DoConnect != nil && retryNum > 0 {
 				log.Warn("write fail, wait 3s and retry", zap.String("type", errType))
 				c.lockWrite.Unlock()
 				locked = false
@@ -172,16 +171,30 @@ func (c *BanConn) write(data []byte, retryNum int) *errs.Error {
 			return errs.New(errCode, err_)
 		}
 		// 再写数据内容
-		if c.Conn != nil {
-			if err_ := c.writeFully(data); err_ != nil {
-				c.Ready = false
-				errCode, _ := getErrType(err_)
-				return errs.New(errCode, err_)
-			}
-			return nil
+		if err_ := writeFully(conn, data); err_ != nil {
+			c.discardConn(conn)
+			errCode, _ := getErrType(err_)
+			return errs.New(errCode, err_)
 		}
+		return nil
 	}
 	return errs.NewMsg(errs.CodeIOWriteFail, "write fail as disconnected")
+}
+
+func (c *BanConn) getConn() net.Conn {
+	c.lockConnect.Lock()
+	defer c.lockConnect.Unlock()
+	return c.Conn
+}
+
+func (c *BanConn) discardConn(conn net.Conn) {
+	c.lockConnect.Lock()
+	if c.Conn == conn {
+		c.Conn = nil
+		c.Ready = false
+	}
+	c.lockConnect.Unlock()
+	_ = conn.Close()
 }
 
 func (c *BanConn) ReadMsg() (*IOMsgRaw, *errs.Error) {
@@ -221,10 +234,14 @@ func (c *BanConn) readFully(buf []byte) error {
 }
 
 // writeFully 确保完整写入指定长度的数据
-func (c *BanConn) writeFully(data []byte) error {
+func writeFully(conn net.Conn, data []byte) error {
 	totalWritten := 0
 	for totalWritten < len(data) {
-		n, err := c.Conn.Write(data[totalWritten:])
+		end := min(totalWritten+banConnWriteChunkSize, len(data))
+		if err := conn.SetWriteDeadline(time.Now().Add(banConnWriteIdleTimeout)); err != nil {
+			return err
+		}
+		n, err := conn.Write(data[totalWritten:end])
 		if err != nil {
 			return err
 		}
