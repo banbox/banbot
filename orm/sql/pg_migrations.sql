@@ -22,8 +22,8 @@ WHERE a.exchange = b.exchange
   AND a.symbol = b.symbol
   AND a.id > b.id;
 
-ALTER TABLE exsymbol
-    ADD CONSTRAINT ix_exsymbol_unique UNIQUE (exchange, market, symbol);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_exsymbol_unique
+    ON exsymbol (exchange, market, symbol);
 
 -- version 2
 DO $$
@@ -45,8 +45,8 @@ WHERE a.exchange = b.exchange
   AND a.symbol = b.symbol
   AND a.id > b.id;
 
-ALTER TABLE exsymbol
-    ADD CONSTRAINT ix_exsymbol_unique UNIQUE (exchange, market, symbol);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_exsymbol_unique
+    ON exsymbol (exchange, market, symbol);
 
 -- version 3
 DO $$
@@ -61,8 +61,8 @@ BEGIN
 END
 $$;
 
-ALTER TABLE exsymbol
-    ADD CONSTRAINT ix_exsymbol_unique UNIQUE (exchange, market, symbol);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_exsymbol_unique
+    ON exsymbol (exchange, market, symbol);
 
 -- version 4
 ALTER TABLE exsymbol

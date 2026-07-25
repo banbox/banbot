@@ -31,6 +31,15 @@ func TestPgMigrationsAreOrderedByVersion(t *testing.T) {
 	}
 }
 
+func TestPgMigrationsUseIdempotentExsymbolIndex(t *testing.T) {
+	for _, version := range []int{1, 2, 3} {
+		body := pgMigrationBody(version)
+		if !strings.Contains(body, "create unique index if not exists ix_exsymbol_unique") {
+			t.Fatalf("migration version %d does not preserve an idempotent exsymbol index", version)
+		}
+	}
+}
+
 func TestLegacyCalendarRenamePrecedesBaseSchema(t *testing.T) {
 	text := strings.ToLower(legacyPgCalendarRenameSQL)
 	for _, want := range []string{"table_name = 'calendars'", "column_name = 'name'", "rename column name to market"} {
