@@ -31,6 +31,15 @@ func TestPgMigrationsAreOrderedByVersion(t *testing.T) {
 	}
 }
 
+func TestLegacyCalendarRenamePrecedesBaseSchema(t *testing.T) {
+	text := strings.ToLower(legacyPgCalendarRenameSQL)
+	for _, want := range []string{"table_name = 'calendars'", "column_name = 'name'", "rename column name to market"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("legacy base-schema compatibility SQL is missing %q", want)
+		}
+	}
+}
+
 func TestPgMigrationReconcilesLegacyMetadataSchema(t *testing.T) {
 	version6 := pgMigrationBody(6)
 	for _, want := range []string{

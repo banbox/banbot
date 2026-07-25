@@ -77,6 +77,20 @@ var ddlPgSchema2 string
 //go:embed sql/pg_migrations.sql
 var ddlPgMigrations string
 
+const legacyPgCalendarRenameSQL = `DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'calendars' AND column_name = 'name'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'calendars' AND column_name = 'market'
+    ) THEN
+        ALTER TABLE public.calendars RENAME COLUMN name TO market;
+    END IF;
+END
+$$;`
+
 var (
 	DbTrades = "trades"
 	// DbPub stores mutable relational/meta data (calendars/adj_factors/sranges/ins_kline/kline_un + ui task).
@@ -979,6 +993,13 @@ func runPgMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
 	if tblCount == 0 {
+		// Some pre-migration installations have the legacy calendars.name
+		// column but no sranges table. The current base schema creates indexes
+		// on calendars.market, so reconcile that one prerequisite before the
+		// base DDL rather than attempting the later migration after it fails.
+		if _, err2 := pool.Exec(ctx, legacyPgCalendarRenameSQL); err2 != nil {
+			return NewDbErr(core.ErrDbExecFail, err2)
+		}
 		log.Info("initializing timescaledb base schema...")
 		if err2 := execMultiSQL(ctx, pool, ddlPgSchema); err2 != nil {
 			return NewDbErr(core.ErrDbExecFail, err2)
