@@ -161,6 +161,16 @@ func TestGetDownTFInvalid(t *testing.T) {
 	}
 }
 
+func TestRepairKlineStorageTimeframeUsesPhysicalStorage(t *testing.T) {
+	got, err := repairKlineStorageTimeframe("4h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "1h" {
+		t.Fatalf("repairKlineStorageTimeframe(4h) = %s, want 1h", got)
+	}
+}
+
 func TestUnfinishChain(t *testing.T) {
 	if got := unfinishChain("1m"); len(got) != 0 {
 		t.Fatalf("1m chain should be empty, got=%v", got)

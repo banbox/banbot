@@ -760,7 +760,11 @@ func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS
 	}
 	defer conn.Release()
 	for _, timeFrame := range timeFrames {
-		tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
+		storageTF, storageErr := repairKlineStorageTimeframe(timeFrame)
+		if storageErr != nil {
+			return storageErr
+		}
+		tfMSecs := int64(utils2.TFToSecs(storageTF) * 1000)
 		if tfMSecs <= 0 {
 			return errs.NewMsg(errs.CodeParamInvalid, "invalid timeframe: %s", timeFrame)
 		}
@@ -769,12 +773,24 @@ func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS
 			if start >= stop {
 				continue
 			}
-			if err = sess.repairKlineRangeFromPhysical(exs.ID, timeFrame, start, stop); err != nil {
+			if err = sess.repairKlineRangeFromPhysical(exs.ID, storageTF, start, stop); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// repairKlineStorageTimeframe maps a requested consumer timeframe to the
+// table that physically stores its bars.  Unconfigured periods such as 4h
+// are read by aggregating their download timeframe (1h), so their metadata
+// must be rebuilt against that table rather than a nonexistent kline_4h.
+// Explicit configured aggregates retain their own physical table.
+func repairKlineStorageTimeframe(timeFrame string) (string, *errs.Error) {
+	if _, configuredAggregate := aggMap[timeFrame]; configuredAggregate {
+		return timeFrame, nil
+	}
+	return GetDownTF(timeFrame)
 }
 
 func repairKlineWindow(exs *ExSymbol, startMS, endMS, tfMSecs int64) (int64, int64) {
