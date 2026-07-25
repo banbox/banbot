@@ -110,6 +110,7 @@ type Config struct {
 	BTNetCost          float64                           `yaml:"bt_net_cost,omitempty" mapstructure:"bt_net_cost"`
 	BTLegacyIntrabar   bool                              `yaml:"bt_legacy_intrabar,omitempty" mapstructure:"bt_legacy_intrabar"`
 	BTLegacyWallet     bool                              `yaml:"bt_legacy_wallet_price,omitempty" mapstructure:"bt_legacy_wallet_price"`
+	BTNoKlineDownload  bool                              `yaml:"bt_no_kline_download,omitempty" mapstructure:"bt_no_kline_download"`
 	HistoricalCoverage *HistoricalCoverageConfig         `yaml:"historical_coverage,omitempty" mapstructure:"historical_coverage"`
 	RelaySimUnFinish   bool                              `yaml:"relay_sim_unfinish,omitempty" mapstructure:"relay_sim_unfinish"`
 	NTPLangCode        string                            `yaml:"ntp_lang_code,omitempty" mapstructure:"ntp_lang_code"`

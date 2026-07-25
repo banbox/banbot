@@ -911,6 +911,7 @@ func (c *Config) Clone() *Config {
 		BTNetCost:          c.BTNetCost,
 		BTLegacyIntrabar:   c.BTLegacyIntrabar,
 		BTLegacyWallet:     c.BTLegacyWallet,
+		BTNoKlineDownload:  c.BTNoKlineDownload,
 		HistoricalCoverage: c.HistoricalCoverage.Clone(),
 		RelaySimUnFinish:   c.RelaySimUnFinish,
 		NTPLangCode:        c.NTPLangCode,

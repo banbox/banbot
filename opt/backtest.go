@@ -66,7 +66,7 @@ func NewBackTestLite(isOpt bool, onBar data.FnDataSeries, getEnd data.FnGetInt64
 		}
 	}
 	b.dp = data.NewHistProvider(onBar, b.OnEnvEnd, getEnd, !isOpt, pBar)
-	b.dp.SetAllowDownload(!isOpt)
+	b.dp.SetAllowDownload(allowBacktestKlineDownload(isOpt))
 	strat.SetPairUpdateHooks(strat.PairUpdateHooks{
 		SubWarmPairs: b.dp.SubWarmPairs,
 		ExitOrders: func(acc string, orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
@@ -79,6 +79,10 @@ func NewBackTestLite(isOpt bool, onBar data.FnDataSeries, getEnd data.FnGetInt64
 	}
 	biz.InitLocalOrderMgr(b.orderCB, !isOpt, stopBacktest)
 	return b
+}
+
+func allowBacktestKlineDownload(isOpt bool) bool {
+	return !isOpt && !config.Data.BTNoKlineDownload
 }
 
 func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
