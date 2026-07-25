@@ -13,6 +13,24 @@ func TestPgMigrationReconcilesAggRulesAfterVersion4(t *testing.T) {
 	}
 }
 
+func TestPgMigrationsAreOrderedByVersion(t *testing.T) {
+	previous := 0
+	for _, migration := range strings.Split(ddlPgMigrations, "-- version") {
+		lines := strings.SplitN(strings.TrimSpace(migration), "\n", 2)
+		if len(lines) != 2 {
+			continue
+		}
+		version, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+		if err != nil {
+			continue
+		}
+		if version <= previous {
+			t.Fatalf("migration version %d follows %d", version, previous)
+		}
+		previous = version
+	}
+}
+
 func TestPgMigrationReconcilesLegacyMetadataSchema(t *testing.T) {
 	version6 := pgMigrationBody(6)
 	for _, want := range []string{

@@ -25,7 +25,7 @@ WHERE a.exchange = b.exchange
 ALTER TABLE exsymbol
     ADD CONSTRAINT ix_exsymbol_unique UNIQUE (exchange, market, symbol);
 
--- version 3
+-- version 2
 DO $$
 BEGIN
     IF EXISTS (
@@ -48,7 +48,7 @@ WHERE a.exchange = b.exchange
 ALTER TABLE exsymbol
     ADD CONSTRAINT ix_exsymbol_unique UNIQUE (exchange, market, symbol);
 
--- version 2
+-- version 3
 DO $$
 BEGIN
     IF EXISTS (
