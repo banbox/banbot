@@ -203,7 +203,7 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	if dbCfg == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "database config is missing!")
 	}
-	poolCfg, err_ := pgxpool.ParseConfig(dbCfg.Url)
+	poolCfg, err_ := pgxpool.ParseConfig(normalizeDatabaseURL(dbCfg.Url))
 	if err_ != nil {
 		return nil, errs.New(core.ErrBadConfig, err_)
 	}
@@ -279,6 +279,13 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	}
 
 	return dbPool, nil
+}
+
+// normalizeDatabaseURL accepts legacy configs that bracket an IPv4 host. URL
+// brackets are valid for IPv6 only, but older worker configs used them around
+// 127.0.0.1; normalize that form before pgx parses the connection string.
+func normalizeDatabaseURL(raw string) string {
+	return strings.ReplaceAll(raw, "@[127.0.0.1]", "@127.0.0.1")
 }
 
 func Conn(ctx context.Context) (*Queries, *pgxpool.Conn, *errs.Error) {
