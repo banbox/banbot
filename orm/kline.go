@@ -861,6 +861,9 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	tfMSecs := item.MSecs
 	startMS := utils2.AlignTfMSecs(orgStartMS, tfMSecs)
 	endMS := utils2.AlignTfMSecs(orgEndMS, tfMSecs)
+	if exs := GetSymbolByID(sid); exs != nil {
+		endMS = aggregateEndForTerminalDelist(orgEndMS, endMS, exs.DelistMs, tfMSecs)
+	}
 	if startMS == endMS && endMS < orgStartMS {
 		// 没有出现新的完成的bar数据，无需更新
 		// 前2个相等，说明：插入的数据所属bar尚未完成。
@@ -943,6 +946,13 @@ order by ts`, fromTbl), sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endM
 		return err
 	}
 	return nil
+}
+
+func aggregateEndForTerminalDelist(orgEndMS, alignedEndMS, delistMS, timeframeMS int64) int64 {
+	if orgEndMS >= delistMS && allowPartialTerminalAggregate(delistMS, alignedEndMS, timeframeMS) {
+		return alignedEndMS + timeframeMS
+	}
+	return alignedEndMS
 }
 
 func NewKlineAgg(TimeFrame, Table, AggFrom, AggStart, AggEnd, AggEvery, CpsBefore, Retention string) *KlineAgg {

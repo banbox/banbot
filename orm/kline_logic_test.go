@@ -89,6 +89,20 @@ func TestAllowPartialTerminalAggregate(t *testing.T) {
 	}
 }
 
+func TestAggregateEndForTerminalDelist(t *testing.T) {
+	const day = int64(86_400_000)
+	const start = int64(1_700_000_000_000)
+	if got := aggregateEndForTerminalDelist(start+day/2, start, start+day/2, day); got != start+day {
+		t.Fatalf("terminal delisting aggregate end=%d, want %d", got, start+day)
+	}
+	if got := aggregateEndForTerminalDelist(start+day/3, start, start+day/2, day); got != start {
+		t.Fatalf("unreached delisting aggregate end=%d, want %d", got, start)
+	}
+	if got := aggregateEndForTerminalDelist(start+2*day, start+day, 0, day); got != start+day {
+		t.Fatalf("active market aggregate end=%d, want %d", got, start+day)
+	}
+}
+
 func TestExactKlineHolesPreservesInteriorAndTrailingGaps(t *testing.T) {
 	got := exactKlineHoles([]int64{100, 200, 400}, 100, 100, 600)
 	want := []MSRange{{Start: 300, Stop: 400}, {Start: 500, Stop: 600}}
