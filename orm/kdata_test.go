@@ -11,11 +11,11 @@ import (
 	"github.com/banbox/banexg/errs"
 )
 
-func TestContextualKlineFetchErrorMakesEmptyExchangeFailureAuditable(t *testing.T) {
-	err := contextualKlineFetchError("BTC/USDT:USDT", "15m", 1_785_024_000_000, 672,
+func TestContextualKlineOperationErrorMakesEmptyFailureAuditable(t *testing.T) {
+	err := contextualKlineOperationError("download", "BTC/USDT:USDT", "15m", 1_785_024_000_000, 1_785_628_800_000, 672,
 		errs.NewMsg(errs.CodeRunTime, ""))
 	if err == nil || !strings.Contains(err.Message(), "BTC/USDT:USDT") ||
-		!strings.Contains(err.Message(), "empty exchange error") {
+		!strings.Contains(err.Message(), "empty error code") {
 		t.Fatalf("fetch error = %#v", err)
 	}
 }

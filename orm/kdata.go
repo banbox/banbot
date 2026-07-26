@@ -65,7 +65,7 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 			banexg.ParamDebug: DebugDownKLine,
 		})
 		if err != nil {
-			return contextualKlineFetchError(pair, timeFrame, curSince, curSize, err)
+			return contextualKlineOperationError("fetch", pair, timeFrame, curSince, 0, curSize, err)
 		}
 		retSize := len(data)
 		log.Debug("fetch kline", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Int("curSize", curSize), zap.Int64("since", curSince),
@@ -82,12 +82,16 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 	return nil
 }
 
-func contextualKlineFetchError(pair, timeFrame string, sinceMS int64, limit int, fetchErr *errs.Error) *errs.Error {
-	context := fmt.Sprintf("fetch OHLCV pair=%s timeframe=%s since_ms=%d limit=%d", pair, timeFrame, sinceMS, limit)
-	if strings.TrimSpace(fetchErr.Message()) == "" {
-		return errs.NewMsg(core.ErrRunTime, "%s failed with an empty exchange error", context)
+func contextualKlineOperationError(operation, pair, timeFrame string, startMS, endMS int64, limit int, opErr *errs.Error) *errs.Error {
+	if opErr == nil {
+		return nil
 	}
-	return errs.NewFull(fetchErr.Code, fetchErr, "%s", context)
+	context := fmt.Sprintf("%s OHLCV pair=%s timeframe=%s start_ms=%d end_ms=%d limit=%d",
+		operation, pair, timeFrame, startMS, endMS, limit)
+	if strings.TrimSpace(opErr.Message()) == "" {
+		return errs.NewMsg(core.ErrRunTime, "%s failed with empty error code=%d", context, opErr.Code)
+	}
+	return errs.NewFull(opErr.Code, opErr, "%s", context)
 }
 
 func nextFetchSince(curSince int64, curSize int, tfMSecs int64, clean []*banexg.Kline) int64 {
@@ -754,11 +758,12 @@ func BulkDownOHLCV(exchange banexg.BanExchange, exsList map[int32]*ExSymbol, tim
 		}
 	}
 	sidList := utils.KeysOfMap(exsList)
-	return utils.ParallelRun(sidList, core.ConcurNum, func(_ int, i int32) *errs.Error {
+	err = utils.ParallelRun(sidList, core.ConcurNum, func(_ int, i int32) *errs.Error {
 		exs, _ := exsList[i]
 		_, dlErr := downOHLCV2DBRange(nil, exchange, exs, downTF, startMS, endMS, 2, pBar)
-		return dlErr
+		return contextualKlineOperationError("download", exs.Symbol, timeFrame, startMS, endMS, 0, dlErr)
 	})
+	return contextualKlineOperationError("bulk download", fmt.Sprintf("%d pairs", len(exsList)), timeFrame, startMS, endMS, 0, err)
 }
 
 func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS, endMS int64) *errs.Error {
@@ -782,7 +787,7 @@ func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS
 				continue
 			}
 			if err = sess.repairKlineRangeFromPhysical(exs.ID, storageTF, start, stop); err != nil {
-				return err
+				return contextualKlineOperationError("repair", exs.Symbol, storageTF, start, stop, 0, err)
 			}
 		}
 	}
