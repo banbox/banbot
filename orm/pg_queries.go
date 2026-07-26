@@ -229,6 +229,10 @@ func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64,
 	if alignedStart >= alignedEnd {
 		return 0, 0, nil
 	}
+	var delistMS int64
+	if exs := GetSymbolByID(sid); exs != nil {
+		delistMS = exs.DelistMs
+	}
 
 	// Calculate bar group key in SQL: floor((time - offMS) / tfMSecs) * tfMSecs + offMS.
 	// For UTC-aligned exchanges offMS == 0 which simplifies to (time / tfMSecs) * tfMSecs.
@@ -248,7 +252,7 @@ SELECT $1::integer AS sid,
 FROM %s
 WHERE sid = $1 AND time >= $2 AND time < $3
 GROUP BY bar_time
-HAVING COUNT(*) = %d
+HAVING COUNT(*) = %d OR ($4::bigint > %s AND $4::bigint < %s + %d)
 ), deleted AS (
   DELETE FROM %s target
   WHERE target.sid = $1 AND target.time >= $2 AND target.time < $3
@@ -261,13 +265,20 @@ FROM complete
 ON CONFLICT (sid, time) DO UPDATE SET
   open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
   volume = EXCLUDED.volume, quote = EXCLUDED.quote, buy_volume = EXCLUDED.buy_volume, trade_num = EXCLUDED.trade_num`,
-		groupExpr, fromTbl, tfMSecs/fromTfMSecs, toTbl, toTbl)
+		groupExpr, fromTbl, tfMSecs/fromTfMSecs, groupExpr, groupExpr, tfMSecs, toTbl, toTbl)
 
-	_, err := q.db.Exec(context.Background(), insertSQL, sid, alignedStart, alignedEnd)
+	_, err := q.db.Exec(context.Background(), insertSQL, sid, alignedStart, alignedEnd, delistMS)
 	if err != nil {
 		return 0, 0, NewDbErr(core.ErrDbExecFail, err)
 	}
 	return alignedStart, alignedEnd, nil
+}
+
+// allowPartialTerminalAggregate returns true only for a market that ended in
+// the middle of this aggregate candle. Its lower-timeframe bars are real
+// market data, while an active market's unfinished candle must remain absent.
+func allowPartialTerminalAggregate(delistMS, barStartMS, timeframeMS int64) bool {
+	return delistMS > barStartMS && delistMS < barStartMS+timeframeMS
 }
 
 // ─────────────────────────────────────────────

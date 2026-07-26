@@ -57,7 +57,7 @@ func TestRefreshAggPgReturnsRepairedWindow(t *testing.T) {
 	db := &visibilityDBStub{exec: func(sql string, _ ...interface{}) (pgconn.CommandTag, error) {
 		if !strings.Contains(sql, "DELETE FROM kline_5m target") || !strings.Contains(sql, "INSERT INTO kline_5m") ||
 			!strings.Contains(sql, "SELECT $1::integer AS sid") ||
-			!strings.Contains(sql, "HAVING COUNT(*) = 5") ||
+			!strings.Contains(sql, "HAVING COUNT(*) = 5 OR ($4::bigint >") ||
 			!strings.Contains(sql, "ON CONFLICT (sid, time) DO UPDATE") {
 			t.Fatalf("unexpected aggregation SQL: %s", sql)
 		}
@@ -69,6 +69,23 @@ func TestRefreshAggPgReturnsRepairedWindow(t *testing.T) {
 	}
 	if start != base || end != base+900_000 {
 		t.Fatalf("repair window = %d/%d, want %d/%d", start, end, base, base+900_000)
+	}
+}
+
+func TestAllowPartialTerminalAggregate(t *testing.T) {
+	const day = int64(86_400_000)
+	const start = int64(1_700_000_000_000)
+	if allowPartialTerminalAggregate(0, start, day) {
+		t.Fatal("active market must not produce a partial aggregate")
+	}
+	if allowPartialTerminalAggregate(start, start, day) {
+		t.Fatal("a delisting at candle open must not produce a partial aggregate")
+	}
+	if allowPartialTerminalAggregate(start+day, start, day) {
+		t.Fatal("a complete candle ending at delisting must use normal aggregation")
+	}
+	if !allowPartialTerminalAggregate(start+day/2, start, day) {
+		t.Fatal("a delisting inside the candle must preserve real terminal bars")
 	}
 }
 
