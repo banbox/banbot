@@ -1373,6 +1373,16 @@ func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.E
 }
 
 func (q *Queries) syncKlineSid(sid int32, calcs map[string]map[int32][2]int64) *errs.Error {
+	var delistMS int64
+	if !IsQuestDB {
+		var delistErr *errs.Error
+		delistMS, delistErr = q.getDelistMSPg(sid)
+		if delistErr != nil {
+			return delistErr
+		}
+	} else if exs := GetSymbolByID(sid); exs != nil {
+		delistMS = exs.DelistMs
+	}
 	tfRanges := make(map[string][2]int64)
 	for _, agg := range aggList {
 		rg, ok := calcs[agg.TimeFrame][sid]
@@ -1421,12 +1431,13 @@ func (q *Queries) syncKlineSid(sid int32, calcs map[string]map[int32][2]int64) *
 		tfMSecs := int64(utils2.TFToSecs(agg.TimeFrame) * 1000)
 		subAlignStart := utils2.AlignTfMSecs(subStart, tfMSecs)
 		subAlignEnd := utils2.AlignTfMSecs(subEnd, tfMSecs)
+		subAggregateEnd := aggregateEndForTerminalDelist(subEnd, subAlignEnd, delistMS, tfMSecs)
 		if subAlignStart < curStart {
 			if err := q.refreshAgg(agg, sid, subStart, min(subEnd, curStart), "", false); err != nil {
 				return err
 			}
 		}
-		if subAlignEnd > curEnd {
+		if subAggregateEnd > curEnd {
 			if err := q.refreshAgg(agg, sid, max(curEnd, subStart), subEnd, "", false); err != nil {
 				return err
 			}
