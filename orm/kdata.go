@@ -65,7 +65,7 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 			banexg.ParamDebug: DebugDownKLine,
 		})
 		if err != nil {
-			return err
+			return contextualKlineFetchError(pair, timeFrame, curSince, curSize, err)
 		}
 		retSize := len(data)
 		log.Debug("fetch kline", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Int("curSize", curSize), zap.Int64("since", curSince),
@@ -80,6 +80,14 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 		curSince = nextFetchSince(curSince, curSize, tfMSecs, data)
 	}
 	return nil
+}
+
+func contextualKlineFetchError(pair, timeFrame string, sinceMS int64, limit int, fetchErr *errs.Error) *errs.Error {
+	context := fmt.Sprintf("fetch OHLCV pair=%s timeframe=%s since_ms=%d limit=%d", pair, timeFrame, sinceMS, limit)
+	if strings.TrimSpace(fetchErr.Message()) == "" {
+		return errs.NewMsg(core.ErrRunTime, "%s failed with an empty exchange error", context)
+	}
+	return errs.NewFull(fetchErr.Code, fetchErr, "%s", context)
 }
 
 func nextFetchSince(curSince int64, curSize int, tfMSecs int64, clean []*banexg.Kline) int64 {
