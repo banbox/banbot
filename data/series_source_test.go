@@ -871,7 +871,7 @@ func mustFindSeriesSourceConfig(t *testing.T, name string) string {
 			return abs
 		}
 	}
-	t.Fatalf("series source test config %q not found in candidates: %v", name, candidates)
+	t.Skipf("series source integration config %q not found; checked %v", name, candidates)
 	return ""
 }
 
