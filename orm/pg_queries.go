@@ -208,7 +208,7 @@ func (q *Queries) getKLineNumPg(sid int32, timeFrame string, start, end int64) i
 // ─────────────────────────────────────────────
 
 // refreshAggPg uses an in-DB INSERT … SELECT … GROUP BY for efficient aggregation in TimescaleDB.
-func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64, aggFrom string) (int64, int64, *errs.Error) {
+func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64, aggFrom string, delistMS int64) (int64, int64, *errs.Error) {
 	if aggFrom == "" {
 		aggFrom = item.AggFrom
 	}
@@ -229,11 +229,6 @@ func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64,
 	if alignedStart >= alignedEnd {
 		return 0, 0, nil
 	}
-	var delistMS int64
-	if exs := GetSymbolByID(sid); exs != nil {
-		delistMS = exs.DelistMs
-	}
-
 	// Calculate bar group key in SQL: floor((time - offMS) / tfMSecs) * tfMSecs + offMS.
 	// For UTC-aligned exchanges offMS == 0 which simplifies to (time / tfMSecs) * tfMSecs.
 	groupExpr := buildAggGroupExpr(tfMSecs, offMS)
@@ -272,6 +267,17 @@ ON CONFLICT (sid, time) DO UPDATE SET
 		return 0, 0, NewDbErr(core.ErrDbExecFail, err)
 	}
 	return alignedStart, alignedEnd, nil
+}
+
+func (q *Queries) getDelistMSPg(sid int32) (int64, *errs.Error) {
+	var delistMS int64
+	err := q.db.QueryRow(context.Background(),
+		"SELECT COALESCE((SELECT delist_ms FROM exsymbol WHERE id = $1), 0)", sid,
+	).Scan(&delistMS)
+	if err != nil {
+		return 0, NewDbErr(core.ErrDbReadFail, err)
+	}
+	return delistMS, nil
 }
 
 // allowPartialTerminalAggregate returns true only for a market that ended in

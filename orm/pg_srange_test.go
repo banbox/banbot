@@ -104,7 +104,7 @@ VALUES ($1, $2, 1, 1, 1, 1, 1, 1, 1, 1)`, sid, base+index*60_000); execErr != ni
 		}
 	}
 	agg := NewKlineAgg("5m", "kline_5m", "1m", "", "", "", "", "")
-	if _, _, err = q.refreshAggPg(agg, sid, base, base+300_000, ""); err != nil {
+	if _, _, err = q.refreshAggPg(agg, sid, base, base+300_000, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	var count int
@@ -119,7 +119,7 @@ INSERT INTO kline_1m (sid, time, open, high, low, close, volume, quote, buy_volu
 VALUES ($1, $2, 1, 1, 1, 1, 1, 1, 1, 1)`, sid, base+240_000); execErr != nil {
 		t.Fatal(execErr)
 	}
-	if _, _, err = q.refreshAggPg(agg, sid, base, base+300_000, ""); err != nil {
+	if _, _, err = q.refreshAggPg(agg, sid, base, base+300_000, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if scanErr := q.db.QueryRow(ctx, `SELECT count(*) FROM kline_5m WHERE sid = $1 AND time = $2`, sid, base).Scan(&count); scanErr != nil {

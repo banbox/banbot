@@ -861,9 +861,17 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	tfMSecs := item.MSecs
 	startMS := utils2.AlignTfMSecs(orgStartMS, tfMSecs)
 	endMS := utils2.AlignTfMSecs(orgEndMS, tfMSecs)
-	if exs := GetSymbolByID(sid); exs != nil {
-		endMS = aggregateEndForTerminalDelist(orgEndMS, endMS, exs.DelistMs, tfMSecs)
+	var delistMS int64
+	if !IsQuestDB {
+		var delistErr *errs.Error
+		delistMS, delistErr = q.getDelistMSPg(sid)
+		if delistErr != nil {
+			return delistErr
+		}
+	} else if exs := GetSymbolByID(sid); exs != nil {
+		delistMS = exs.DelistMs
 	}
+	endMS = aggregateEndForTerminalDelist(orgEndMS, endMS, delistMS, tfMSecs)
 	if startMS == endMS && endMS < orgStartMS {
 		// 没有出现新的完成的bar数据，无需更新
 		// 前2个相等，说明：插入的数据所属bar尚未完成。
@@ -887,7 +895,7 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 		return nil
 	}
 	if !IsQuestDB {
-		saveStart, saveEnd, err := q.refreshAggPg(item, sid, aggStart, endMS, aggFrom)
+		saveStart, saveEnd, err := q.refreshAggPg(item, sid, aggStart, endMS, aggFrom, delistMS)
 		if err != nil || saveStart == 0 || saveEnd <= saveStart {
 			return err
 		}

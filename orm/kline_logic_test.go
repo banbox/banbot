@@ -63,7 +63,7 @@ func TestRefreshAggPgReturnsRepairedWindow(t *testing.T) {
 		}
 		return pgconn.NewCommandTag("INSERT 0 2"), nil
 	}}
-	start, end, err := New(db).refreshAggPg(NewKlineAgg("5m", "kline_5m", "1m", "", "", "", "", ""), sid, base, base+900_000, "")
+	start, end, err := New(db).refreshAggPg(NewKlineAgg("5m", "kline_5m", "1m", "", "", "", "", ""), sid, base, base+900_000, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
