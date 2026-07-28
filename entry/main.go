@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -26,6 +27,7 @@ import (
 func RunCmd() {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "banbot panic raw stack:\n%s", panicStack())
 			if err, ok := recovered.(*errs.Error); ok {
 				log.Error("banbot panic", zap.Any("error", err))
 			} else {
@@ -44,6 +46,10 @@ func RunCmd() {
 		core.RunExitCalls()
 		os.Exit(1)
 	}
+}
+
+func panicStack() []byte {
+	return debug.Stack()
 }
 
 // Execute runs banbot with an explicit argument list. It is separated from
