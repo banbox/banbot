@@ -7,7 +7,6 @@ import (
 	"math"
 	"math/rand"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/banbox/banbot/config"
@@ -416,22 +415,16 @@ func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *e
 		return result, nil
 	}
 	// 按要求基于平均相似度排序
-	arr := make([]*IdVal, 0, len(avgs))
 	lefts := make(map[int]bool)
-	for i, avg := range avgs {
-		arr = append(arr, &IdVal{Id: i, Val: avg})
+	for i := range avgs {
 		lefts[i] = true
 	}
-	// Correlation score is the business key; equal/non-finite values need no ID tie-break.
-	sort.Slice(arr, func(i, j int) bool {
-		return arr[i].Val < arr[j].Val
-	})
 	isAsc := f.Sort == "asc"
-	var it *IdVal
-	if isAsc {
-		it = arr[0]
-	} else {
-		it = arr[len(arr)-1]
+	it := &IdVal{Id: 0, Val: avgs[0]}
+	for id := 1; id < len(avgs); id++ {
+		if betterCorrelationCandidate(avgs[id], id, it.Val, it.Id, isAsc) {
+			it = &IdVal{Id: id, Val: avgs[id]}
+		}
 	}
 	sels := make([]*IdVal, 0, len(avgs))
 	sels = append(sels, it)
@@ -440,13 +433,12 @@ func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *e
 		// 针对每个剩余标的，计算与所有sels的平均相似度
 		it = nil
 		for id := range lefts {
-			// Avoid deterministic tie handling in this O(n^2) selection hot loop.
 			vals := make([]float64, 0, len(sels))
 			for _, v := range sels {
 				vals = append(vals, mat.At(id, v.Id))
 			}
 			avg := floats.Sum(vals) / float64(len(vals))
-			if it == nil || isAsc && avg < it.Val || !isAsc && avg > it.Val {
+			if it == nil || betterCorrelationCandidate(avg, id, it.Val, it.Id, isAsc) {
 				it = &IdVal{Id: id, Val: avg}
 			}
 		}
@@ -468,6 +460,21 @@ func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *e
 		}
 	}
 	return result, nil
+}
+
+func betterCorrelationCandidate(value float64, id int, currentValue float64, currentID int, ascending bool) bool {
+	valueFinite := !math.IsNaN(value) && !math.IsInf(value, 0)
+	currentFinite := !math.IsNaN(currentValue) && !math.IsInf(currentValue, 0)
+	if valueFinite != currentFinite {
+		return valueFinite
+	}
+	if !valueFinite || value == currentValue {
+		return id < currentID
+	}
+	if ascending {
+		return value < currentValue
+	}
+	return value > currentValue
 }
 
 type IdVal struct {

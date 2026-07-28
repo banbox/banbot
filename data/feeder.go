@@ -1,6 +1,7 @@
 package data
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
@@ -140,7 +141,7 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		// 删除此次为传入的时间周期
 		for tf := range oldTfs {
 			if sta, ok := stateMap[tf]; ok {
-				if sta.TFSecs == minTfSecs {
+				if sta.TFSecs == minTfSecs && (minDel == nil || comparePairTFCache(sta, minDel) < 0) {
 					minDel = sta
 				}
 				delete(stateMap, tf)
@@ -150,10 +151,7 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 	var newStates = utils.ValsOfMap(stateMap)
 	// Sort all periods from small to large. The first one must be the least common multiple of all subsequent states, so that all subsequent states can be updated from the first one.
 	// 对所有周期从小到大排序，第一个必须是后续所有states的最小公倍数，以便能从第一个更新后续所有
-	// Duration is the business key; equal-duration aliases need no deterministic name tie-break.
-	slices.SortFunc(newStates, func(a, b *PairTFCache) int {
-		return a.TFSecs - b.TFSecs
-	})
+	slices.SortFunc(newStates, comparePairTFCache)
 	hourSecs := 3600
 	maxTfSecs := newStates[len(newStates)-1].TFSecs
 	if maxTfSecs > hourSecs {
@@ -167,9 +165,7 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 			}
 			stateMap["1h"] = sta
 			newStates = utils.ValsOfMap(stateMap)
-			slices.SortFunc(newStates, func(a, b *PairTFCache) int {
-				return a.TFSecs - b.TFSecs
-			})
+			slices.SortFunc(newStates, comparePairTFCache)
 		}
 	}
 	secs := make([]int, len(newStates))
@@ -196,6 +192,13 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 	}
 	f.States = newStates
 	return adds
+}
+
+func comparePairTFCache(a, b *PairTFCache) int {
+	if order := cmp.Compare(a.TFSecs, b.TFSecs); order != 0 {
+		return order
+	}
+	return cmp.Compare(a.TimeFrame, b.TimeFrame)
 }
 
 /*
@@ -559,8 +562,8 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 	skips := make(map[string][2]int)
 	hourDone := f.hour == nil
 	debugWarm := shouldLogBacktestSeriesDebug()
-	// Warmup timeframe order has no business priority; avoid a key sort on every warmup.
-	for tf, warmNum := range tfNums {
+	for _, tf := range sortedTimeframes(tfNums) {
+		warmNum := tfNums[tf]
 		tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 		endMS := utils2.AlignTfMSecs(curMS, tfMSecs)
 		if tfMSecs < int64(60000) || warmNum <= 0 {

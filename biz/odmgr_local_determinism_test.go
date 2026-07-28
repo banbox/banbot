@@ -4,11 +4,13 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
@@ -23,22 +25,33 @@ func (e *deterministicFillExchange) CalculateFee(string, string, string, float64
 }
 
 func TestLegacyFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
+	testFillPendingOrdersUsesStableBusinessOrder(t, true, false)
+}
+
+func TestDeterministicFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
+	testFillPendingOrdersUsesStableBusinessOrder(t, false, true)
+}
+
+func testFillPendingOrdersUsesStableBusinessOrder(t *testing.T, legacy, deterministic bool) {
 	oldExchange := exg.Default
 	oldBackTest := core.BackTestMode
 	oldEnvReal := core.EnvReal
 	oldLiveMode := core.LiveMode
 	oldCompat := config.Data.BTLegacyWallet
+	oldDeterministic := config.Data.BTStrict
 	exg.Default = &deterministicFillExchange{}
 	core.BackTestMode = true
 	core.EnvReal = true
 	core.LiveMode = false
-	config.Data.BTLegacyWallet = true
+	config.Data.BTLegacyWallet = legacy
+	config.Data.BTStrict = deterministic
 	t.Cleanup(func() {
 		exg.Default = oldExchange
 		core.BackTestMode = oldBackTest
 		core.EnvReal = oldEnvReal
 		core.LiveMode = oldLiveMode
 		config.Data.BTLegacyWallet = oldCompat
+		config.Data.BTStrict = oldDeterministic
 	})
 
 	exs := &orm.ExSymbol{ID: 155, Symbol: "DETERMINISTIC/USDT"}
@@ -77,6 +90,62 @@ func TestLegacyFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
 		}
 		if got := wallets.Items["USDT"].Available; got != 0 {
 			t.Errorf("permutation %v: available = %v, want 0", permutation, got)
+		}
+	}
+}
+
+func TestDeterministicExitAndFillUsesStableBusinessOrder(t *testing.T) {
+	oldExchange, oldMode := exg.Default, core.BackTestMode
+	oldEnvReal, oldLiveMode := core.EnvReal, core.LiveMode
+	oldData := config.Data
+	exg.Default = &deterministicFillExchange{}
+	core.BackTestMode, core.EnvReal, core.LiveMode = true, true, false
+	config.Data.BTLegacyWallet, config.Data.BTStrict = false, true
+	com.SetBarPrice("DETERMINISTIC/USDT", 100)
+	t.Cleanup(func() {
+		exg.Default, core.BackTestMode = oldExchange, oldMode
+		core.EnvReal, core.LiveMode = oldEnvReal, oldLiveMode
+		config.Data = oldData
+	})
+
+	for _, permutation := range [][]int64{{11, 12, 13}, {13, 12, 11}, {12, 13, 11}} {
+		var callbackIDs []int64
+		mgr := &LocalOrderMgr{OrderMgr: OrderMgr{Account: config.DefAcc}}
+		mgr.callBack = func(order *ormo.InOutOrder, _ bool) {
+			callbackIDs = append(callbackIDs, order.ID)
+		}
+		orders := make([]*ormo.InOutOrder, 0, len(permutation))
+		for _, id := range permutation {
+			order := deterministicPendingExit(id, "DETERMINISTIC/USDT")
+			order.ExitTag, order.Exit = "", nil
+			orders = append(orders, order)
+		}
+		if err := mgr.ExitAndFill(orders, &strat.ExitReq{Tag: "deterministic", Force: true}); err != nil {
+			t.Fatalf("permutation %v: %v", permutation, err)
+		}
+		if !slices.Equal(callbackIDs, []int64{11, 12, 13}) {
+			t.Fatalf("permutation %v: callback order = %v", permutation, callbackIDs)
+		}
+	}
+}
+
+func TestCompareExitOpenOrdersIsTransitiveAtCentBoundary(t *testing.T) {
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{ID: 1, InitPrice: 1}, Enter: &ormo.ExOrder{Amount: 0, Filled: 0}},
+		{IOrder: &ormo.IOrder{ID: 2, InitPrice: 1}, Enter: &ormo.ExOrder{Amount: 0.004, Filled: 0}},
+		{IOrder: &ormo.IOrder{ID: 3, InitPrice: 1}, Enter: &ormo.ExOrder{Amount: 0.008, Filled: 0}},
+	}
+	want := []int64{3, 1, 2}
+	for _, permutation := range [][]*ormo.InOutOrder{
+		{orders[0], orders[1], orders[2]},
+		{orders[2], orders[1], orders[0]},
+		{orders[1], orders[0], orders[2]},
+	} {
+		slices.SortFunc(permutation, func(a, b *ormo.InOutOrder) int {
+			return compareExitOpenOrders(a, b, false)
+		})
+		if got := orderIDs(permutation); !slices.Equal(got, want) {
+			t.Fatalf("cent-boundary order = %v, want %v", got, want)
 		}
 	}
 }

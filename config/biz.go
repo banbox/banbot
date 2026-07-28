@@ -366,6 +366,9 @@ func MergeConfigPaths(paths []string, skips ...string) (string, error) {
 }
 
 func (c *Config) Apply(args *CmdArgs) error {
+	if args.BTStrictSet {
+		c.BTStrict = args.BTStrict
+	}
 	if args.TimeRange != "" {
 		c.TimeRangeRaw = args.TimeRange
 		c.TimeStart = ""
@@ -723,14 +726,18 @@ func initExgAccs(args *CmdArgs, accs map[string]*AccountConfig) *errs.Error {
 	BakAccounts = make(map[string]*AccountConfig)
 	if core.EnvReal {
 		DefAcc = ""
+	} else {
+		DefAcc = "default"
 	}
-	for name, val := range accs {
+	for _, name := range slices.Sorted(maps.Keys(accs)) {
+		val := accs[name]
 		if val.NoTrade {
 			BakAccounts[name] = val
 		} else if !core.EnvReal {
-			// Non-production environment, only enable one account
-			// 非生产环境，只启用一个账号
-			Accounts[DefAcc] = val
+			// Prefer an explicitly named default account, otherwise use the first name.
+			if _, exists := Accounts[DefAcc]; !exists || name == DefAcc {
+				Accounts[DefAcc] = val
+			}
 		} else {
 			Accounts[name] = val
 			if DefAcc == "" {
@@ -748,6 +755,10 @@ func initExgAccs(args *CmdArgs, accs map[string]*AccountConfig) *errs.Error {
 		Accounts[DefAcc] = &AccountConfig{}
 	}
 	return nil
+}
+
+func StrictBacktest() bool {
+	return core.BackTestMode && Data.BTStrict
 }
 
 func (p *StratPerfConfig) Validate() {
@@ -912,6 +923,7 @@ func (c *Config) Clone() *Config {
 		BTLegacyIntrabar:   c.BTLegacyIntrabar,
 		BTLegacyWallet:     c.BTLegacyWallet,
 		BTNoKlineDownload:  c.BTNoKlineDownload,
+		BTStrict:           c.BTStrict,
 		HistoricalCoverage: c.HistoricalCoverage.Clone(),
 		RelaySimUnFinish:   c.RelaySimUnFinish,
 		NTPLangCode:        c.NTPLangCode,

@@ -126,7 +126,8 @@ func newConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, bind
 		Use:   name,
 		Short: help,
 		Args:  cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
+		RunE: func(command *cobra.Command, _ []string) error {
+			args.BTStrictSet = command.Flags().Changed("bt-strict")
 			return runConfigCommand(args, run)
 		},
 	}

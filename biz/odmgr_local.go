@@ -35,7 +35,8 @@ func InitLocalOrderMgr(callBack FnOdCb, showLog bool, stops ...func()) {
 	if len(stops) > 0 {
 		stopBacktest = stops[0]
 	}
-	for account, cfg := range config.Accounts {
+	for account := range executionAccountNames() {
+		cfg := config.Accounts[account]
 		if cfg.NoTrade {
 			continue
 		}
@@ -610,7 +611,7 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noE
 }
 
 func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
-	// Keep caller order; deterministic reordering is not worth a sort on every exit batch.
+	orders = legacyWalletOrderView(orders)
 	for _, od := range orders {
 		_, err := o.exitOrder(od, req)
 		if err != nil {
@@ -654,8 +655,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 			// 回测无需持久化
 		}
 	}
-	// Cleanup is infrequent, but its order has no business meaning and does not need sorting.
-	openOdList := utils.ValsOfMap(openOds)
+	openOdList := executionOpenOrders(openOds)
 	lock.Unlock()
 	if len(openOdList) > 0 {
 		exitOds := make([]*ormo.InOutOrder, 0, len(openOdList))

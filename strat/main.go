@@ -1,7 +1,9 @@
 package strat
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -78,7 +80,8 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 		// 旧job允许开单的，先添加计数
 		oldAllowOpen := stgy.OrderOnRotation == "open"
 		oldAddPairs := make(map[string]bool)
-		for acc, accJobs := range AccJobs {
+		for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+			accJobs := AccJobs[acc]
 			codes := make([]string, 0, len(exsList)/2)
 			for _, jobs := range accJobs {
 				if job, ok := jobs[polID]; ok {
@@ -119,7 +122,8 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 				if jobType > 1 && !pairAdded {
 					// 任务禁止，但增加占位
 					holdNum += 1
-					for acc, cfg := range config.Accounts {
+					for acc := range utils.MapKeys(config.Accounts, config.StrictBacktest()) {
+						cfg := config.Accounts[acc]
 						if cfg.NoTrade {
 							continue
 						}
@@ -166,11 +170,14 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 	newPairs := make(map[string]bool)  // 继续监听的品种
 	pairTfs := make(Warms)
 	holdPosition := config.PairMgr.PosOnRotation != "close"
-	for acc, jobs := range AccJobs {
+	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+		jobs := AccJobs[acc]
 		exitOds := make([]*ormo.InOutOrder, 0, 4)
-		for envKey, envJobs := range jobs {
+		for envKey := range utils.MapKeys(jobs, config.StrictBacktest()) {
+			envJobs := jobs[envKey]
 			resJobs := make(map[string]*StratJob)
-			for name, job := range envJobs {
+			for name := range utils.MapKeys(envJobs, config.StrictBacktest()) {
+				job := envJobs[name]
 				if job.MaxOpenLong == -1 && job.MaxOpenShort == -1 {
 					// disable open order
 					if job.EnteredNum > 0 && holdPosition {
@@ -202,7 +209,8 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 				if _, ok := core.TFSecs[tf]; !ok {
 					core.TFSecs[tf] = utils2.TFToSecs(tf)
 				}
-				for _, j := range resJobs {
+				for name := range utils.MapKeys(resJobs, config.StrictBacktest()) {
+					j := resJobs[name]
 					subMap, ok := core.StgPairTfs[j.Strat.Name]
 					if !ok {
 						subMap = make(map[string]string)
@@ -243,11 +251,14 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 	}
 	// 从AccInfoJobs中移除已取消的项
 	lockInfoJobs.Lock()
-	for acc, jobMap := range AccInfoJobs {
+	for acc := range utils.MapKeys(AccInfoJobs, config.StrictBacktest()) {
+		jobMap := AccInfoJobs[acc]
 		newJobMap := make(map[string]map[string]*StratJob)
-		for subKey, stgMap := range jobMap {
+		for subKey := range utils.MapKeys(jobMap, config.StrictBacktest()) {
+			stgMap := jobMap[subKey]
 			newStgMap := make(map[string]*StratJob)
-			for name, job := range stgMap {
+			for name := range utils.MapKeys(stgMap, config.StrictBacktest()) {
+				job := stgMap[name]
 				if _, ok := exitJobs[job]; !ok {
 					newStgMap[name] = job
 					matchTf, _ := config.GetStratRefineTF(job.Strat.Name, job.TimeFrame)
@@ -318,9 +329,12 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 }
 
 func ExitStratJobs() {
-	for _, jobs := range AccJobs {
-		for _, items := range jobs {
-			for _, job := range items {
+	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+		jobs := AccJobs[acc]
+		for envKey := range utils.MapKeys(jobs, config.StrictBacktest()) {
+			items := jobs[envKey]
+			for name := range utils.MapKeys(items, config.StrictBacktest()) {
+				job := items[name]
 				if job.Strat.OnShutDown != nil {
 					job.Strat.OnShutDown(job)
 				}
@@ -436,7 +450,8 @@ func initBarEnv(exs *orm.ExSymbol, tf string) *ta.BarEnv {
 func markStratJob(tf, polID string, exs *orm.ExSymbol, dirt int, accLimits accStratLimits) (int, *errs.Error) {
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
 	newAdd := 0
-	for acc, jobs := range AccJobs {
+	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+		jobs := AccJobs[acc]
 		envJobs, ok := jobs[envKey]
 		if !ok {
 			// 对于多账户且品种数不一样时，忽略未配置的账户
@@ -481,7 +496,8 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 	core.OrderMatchTfs[matchTf] = true
 	core.LockOdMatch.Unlock()
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
-	for account, jobs := range AccJobs {
+	for account := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+		jobs := AccJobs[account]
 		envJobs, ok := jobs[envKey]
 		if !ok {
 			envJobs = make(map[string]*StratJob)
@@ -557,20 +573,20 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 将jobs的MaxOpenLong,MacOpenShort都置为-1，禁止开单，并更新附加订单
 */
 func resetJobs() {
-	for account, cfg := range config.Accounts {
+	for account := range utils.MapKeys(config.Accounts, config.StrictBacktest()) {
+		cfg := config.Accounts[account]
 		if cfg.NoTrade {
 			continue
 		}
 		openOds, lock := ormo.GetOpenODs(account)
 		lock.Lock()
-		odList := make([]*ormo.InOutOrder, 0, len(openOds))
-		for _, od := range openOds {
-			odList = append(odList, od)
-		}
+		odList := rotationOpenOrderView(openOds)
 		lock.Unlock()
 		accJobs := GetJobs(account)
-		for _, jobs := range accJobs {
-			for _, job := range jobs {
+		for envKey := range utils.MapKeys(accJobs, config.StrictBacktest()) {
+			jobs := accJobs[envKey]
+			for name := range utils.MapKeys(jobs, config.StrictBacktest()) {
+				job := jobs[name]
 				job.InitBar(odList)
 				if job.Strat.OrderOnRotation != "open" || job.OrderNum == 0 {
 					job.MaxOpenLong = -1
@@ -585,6 +601,19 @@ func resetJobs() {
 			}
 		}
 	}
+}
+
+func rotationOpenOrderView(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
+	result := utils2.ValsOfMap(orders)
+	if config.StrictBacktest() {
+		slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
+			if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {
+				return order
+			}
+			return cmp.Compare(a.ID, b.ID)
+		})
+	}
+	return result
 }
 
 func regWsJob(j *StratJob) *errs.Error {

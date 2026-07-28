@@ -172,7 +172,8 @@ func RefreshJobs(pairs []string, pairTfScores map[string]map[string]float64, sho
 		return nil, err
 	}
 	if len(accOds) > 0 {
-		for acc, odList := range accOds {
+		for acc := range executionMapKeys(accOds) {
+			odList := accOds[acc]
 			odMgr := GetOdMgr(acc)
 			err = odMgr.ExitAndFill(odList, &strat.ExitReq{Tag: core.ExitTagPairDel})
 			if err != nil {
@@ -209,7 +210,7 @@ func InitOdSubs() {
 		return
 	}
 	strat.LockJobsRead()
-	for acc := range strat.AccJobs {
+	for acc := range executionMapKeys(strat.AccJobs) {
 		strat.AddOdSub(acc, func(acc string, od *ormo.InOutOrder, evt int) {
 			stgy, ok := subStgys[od.Strategy]
 			if !ok {
@@ -245,8 +246,7 @@ func InitOdSubs() {
 					if evt == strat.OdChgExitFill {
 						openOds, lock := ormo.GetOpenODs(acc)
 						lock.Lock()
-						// Callback state does not require canonical order; avoid sorting on every fill.
-						job.UpdateOrders(utils.ValsOfMap(openOds))
+						job.UpdateOrders(executionOpenOrders(openOds))
 						lock.Unlock()
 					}
 					stgy.OnOrderChange(job, od, evt)
@@ -331,8 +331,8 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 	var readyItems []batchReadyItem
 	var waitNum = 0
 	lockBatch.Lock()
-	// Do not sort batch tasks: this runs per bar, while order-sensitive edge cases are rare.
-	for key, tasks := range strat.BatchTasks {
+	for key := range executionMapKeys(strat.BatchTasks) {
+		tasks := strat.BatchTasks[key]
 		if currMS < tasks.ExecMS {
 			if tasks.ExecMS-currMS < tasks.TFMSecs/2 {
 				// Batch processing time has not yet arrived
@@ -344,8 +344,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 		var mainJobs []*strat.StratJob
 		var infoJobs = make(map[string]*strat.JobEnv)
 		var stgy *strat.TradeStrat
-		// Do not sort jobs inside each batch; callback determinism does not justify the hot-path cost.
-		for _, task := range tasks.Map {
+		for task := range executionJobEnvs(tasks.Map) {
 			stgy = task.Job.Strat
 			if task.Env == nil {
 				mainJobs = append(mainJobs, task.Job)
@@ -373,8 +372,7 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 	for _, item := range readyItems {
 		openOds, lock := ormo.GetOpenODs(item.account)
 		lock.Lock()
-		// Strategy initialization accepts map order; avoid sorting every ready batch.
-		allOrders := utils.ValsOfMap(openOds)
+		allOrders := executionOpenOrders(openOds)
 		lock.Unlock()
 		for _, job := range item.mainJobs {
 			job.InitBar(allOrders)

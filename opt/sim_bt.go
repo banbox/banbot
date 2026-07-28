@@ -2,21 +2,22 @@ package opt
 
 import (
 	"bufio"
-	"github.com/banbox/banbot/biz"
-	"github.com/banbox/banbot/utils"
-	"github.com/banbox/banexg"
-	"go.uber.org/zap"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"go.uber.org/zap"
 )
 
 type BTSection struct {
@@ -63,7 +64,7 @@ func RunSimBT(args *config.CmdArgs) *errs.Error {
 		// 更新配置
 		config.TimeRange.StartMS = sec.StartMS
 		config.TimeRange.EndMS = sec.EndMS
-		config.Pairs = utils.KeysOfMap(sec.PairMap)
+		config.Pairs = sectionPairs(sec.PairMap)
 
 		// 执行回测
 		core.BotRunning = true
@@ -100,6 +101,10 @@ func RunSimBT(args *config.CmdArgs) *errs.Error {
 		zap.Int("total_sections", len(sections)),
 		zap.Int("total_orders", len(allOrders)))
 	return nil
+}
+
+func sectionPairs(pairMap map[string]bool) []string {
+	return slices.Collect(utils.MapKeys(pairMap, config.StrictBacktest()))
 }
 
 // parseLogFile 解析日志文件，提取每个回测区间的信息

@@ -2,6 +2,7 @@ package opt
 
 import (
 	"bytes"
+	"cmp"
 	_ "embed"
 	"encoding/csv"
 	"errors"
@@ -287,7 +288,10 @@ func (r *BTResult) textMetrics(orders []*ormo.InOutOrder) string {
 	avfProfit := strconv.FormatFloat(r.TotProfitPct*100/float64(len(orders)), 'f', 2, 64)
 	avgCost := r.TotCost / float64(len(orders))
 	slices.SortFunc(orders, func(a, b *ormo.InOutOrder) int {
-		return int((a.Profit - b.Profit) * 100)
+		if order := cmp.Compare(a.Profit, b.Profit); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.ID, b.ID)
 	})
 	drawDownRate := strconv.FormatFloat(r.ShowDrawDownPct, 'f', 2, 64) + "%"
 	realDrawDown := strconv.FormatFloat(r.MaxDrawDownPct, 'f', 2, 64) + "%"
@@ -752,7 +756,10 @@ func DumpOrdersCSV(orders []*ormo.InOutOrder, outPath string) error {
 		if a.EnterTag != b.EnterTag {
 			return a.EnterTag < b.EnterTag
 		}
-		return a.Enter.Amount < b.Enter.Amount
+		if a.Enter.Amount != b.Enter.Amount {
+			return a.Enter.Amount < b.Enter.Amount
+		}
+		return a.ID < b.ID
 	})
 	file, err_ := os.Create(outPath)
 	if err_ != nil {
@@ -1411,9 +1418,7 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 	if len(failMap) > 0 {
 		log.Warn("Sum(Returns) and Sum(Profits) differs too much", zap.Any("pair pcts", failMap))
 	}
-	sort.Slice(odList, func(i, j int) bool {
-		return odList[i].RealEnterMS() < odList[j].RealEnterMS()
-	})
+	odList = reportReplayOrder(odList)
 	core.Pairs = utils.KeysOfMap(pairOrders)
 	btRes.logPlot(wallets, startMS, 0, totalLegal)
 	btRes.MaxReal = totalLegal
@@ -1446,7 +1451,7 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 		com.SetPrices(prices, "")
 		// 更新当前持仓订单
 		lock.Lock()
-		openList := utils2.ValsOfMap(openOds)
+		openList := reportOpenOrderView(openOds)
 		lock.Unlock()
 		for _, od := range openList {
 			if od.RealExitMS() < curMS {
@@ -1488,7 +1493,8 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 		openNum := len(openOds)
 		btRes.MaxOpenOrders = max(btRes.MaxOpenOrders, openNum)
 		lock.Unlock()
-		for code, odArr := range settleMap {
+		for code := range utils.MapKeys(settleMap, config.StrictBacktest()) {
+			odArr := settleMap[code]
 			err = wallets.UpdateOds(odArr, code)
 			if err != nil {
 				return nil, err
@@ -1503,7 +1509,7 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 	}
 	// 退出终止时尚未退出的订单
 	lock.Lock()
-	openList := utils2.ValsOfMap(openOds)
+	openList := reportOpenOrderView(openOds)
 	lock.Unlock()
 	for _, od := range openList {
 		wallets.ExitOd(od, od.Exit.Filled)
@@ -1526,6 +1532,30 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github")
 	}
 	return btRes, nil
+}
+
+func reportOpenOrderView(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
+	result := utils2.ValsOfMap(orders)
+	if config.StrictBacktest() {
+		slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
+			if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {
+				return order
+			}
+			return cmp.Compare(a.ID, b.ID)
+		})
+	}
+	return result
+}
+
+func reportReplayOrder(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
+	result := slices.Clone(orders)
+	slices.SortStableFunc(result, func(a, b *ormo.InOutOrder) int {
+		if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.ID, b.ID)
+	})
+	return result
 }
 
 type PairStat struct {
@@ -1610,7 +1640,10 @@ func sortTfMap(intMap map[string]int) string {
 		})
 	}
 	sort.Slice(arr, func(i, j int) bool {
-		return arr[i].Int > arr[j].Int
+		if arr[i].Int != arr[j].Int {
+			return arr[i].Int > arr[j].Int
+		}
+		return arr[i].Str < arr[j].Str
 	})
 	tfArr := make([]string, len(arr))
 	for i, v := range arr {

@@ -24,6 +24,7 @@ min_open_rate: 0.5 # 最小开单比率，余额不足单笔金额时，余额/�
 low_cost_action: ignore # 开单金额不足最小金额时的动作：ignore/keepBig/keepAll
 max_simul_open: 0 # 在一个bar上最大同时打开订单数量
 bt_net_cost: 15 # 回测时下单延迟，可用于模拟滑点，单位：秒，默认15
+bt_strict: false # 是否启用严格回测模式；启用后固定关键执行顺序，确保回测结果可复现，可能降低回测速度
 relay_sim_unfinish: false  # 交易新品种时(回测/实盘)，是否从开始时间未平仓订单接力开始交易
 order_bar_max: 500  # 查找开始时间未平仓订单向前模拟最大bar数量
 ntp_lang_code: none  # ntp真实时间同步，默认none不启用，支持的代码：zh-CN, zh-HK, zh-TW, ja-JP, ko-KR, zh-SG, global(表示全球ntp服务器：google、apple、facebook...)
