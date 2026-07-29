@@ -720,6 +720,9 @@ func InitListDates() *errs.Error {
 }
 
 func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int32]*ExSymbol, exsList []*ExSymbol) *errs.Error {
+	if !allowImplicitKlineDownload() {
+		return klineDownloadDisabledError("EnsureListDates")
+	}
 	exInfo := exchange.Info()
 	if exInfo.MarketType != banexg.MarketSpot {
 		return nil

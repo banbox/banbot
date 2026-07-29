@@ -50,8 +50,8 @@ func TestHistoricalCoverageForFeeder(t *testing.T) {
 		t.Fatalf("backtest feeder lost known coverage: %#v", known)
 	}
 	missing := historicalCoverageForFeeder("BTC/USDT:USDT", true)
-	if missing == nil || missing.Allows("5m", 200) || !missing.Allows("5m", 500) {
-		t.Fatalf("missing symbol did not fail closed before baseline end: %#v", missing)
+	if missing == nil || missing.Allows("5m", 200) || missing.Allows("5m", 500) {
+		t.Fatalf("missing symbol did not fail closed across the extension tail: %#v", missing)
 	}
 }
 
@@ -64,7 +64,12 @@ func TestFeederHistoricalCoverageFiltersStateAndCache(t *testing.T) {
 		ExSymbol: &orm.ExSymbol{Symbol: "BTC/USDT:USDT"},
 		CallBack: func(evt *orm.DataSeries) { called = append(called, evt.TimeMS) },
 		tfBars:   make(map[string][]*orm.DataSeries),
-		coverage: &config.HistoricalCoverageConfig{BaselineEndMS: 500},
+		coverage: &config.HistoricalCoverageConfig{
+			BaselineEndMS: 500,
+			Bars: map[string]map[string][]config.HistoricalCoverageRange{
+				"BTC/USDT:USDT": {"8h": {{StartMS: 200, StopMS: 300}}},
+			},
+		},
 	}
 	if rows := feeder.onStateOhlcvs(state, []*orm.DataSeries{{TimeMS: 100}}, true); len(rows) != 0 {
 		t.Fatalf("excluded rows reached state: %v", rows)
@@ -101,5 +106,26 @@ func TestFeederHistoricalCoverageRecomputesLastCompletedRow(t *testing.T) {
 		len(feeder.tfBars["8h"]) != 1 {
 		t.Fatalf("completed covered row was delayed: rows=%v state=%#v cache=%v callbacks=%v",
 			rows, state, feeder.tfBars, called)
+	}
+}
+
+func TestSeriesFeederWarmupStateUsesLastAllowedRow(t *testing.T) {
+	called := make([]int64, 0, 1)
+	state := &PairTFCache{TimeFrame: "1h", TFSecs: 3600}
+	feeder := &SeriesFeeder{Feeder: Feeder{
+		ExSymbol: &orm.ExSymbol{Symbol: "BTC/USDT:USDT"},
+		CallBack: func(evt *orm.DataSeries) { called = append(called, evt.TimeMS) },
+		States:   []*PairTFCache{state},
+		coverage: &config.HistoricalCoverageConfig{
+			BaselineEndMS: 500,
+			Bars: map[string]map[string][]config.HistoricalCoverageRange{
+				"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 200}}},
+			},
+		},
+	}}
+	endMS := feeder.warmTf("1h", []*orm.DataSeries{{TimeMS: 100}, {TimeMS: 200}})
+	wantEnd := int64(100 + 3600*1000)
+	if endMS != wantEnd || state.SubNextMS != wantEnd || len(called) != 1 || called[0] != 100 {
+		t.Fatalf("end=%d state=%d callbacks=%v want=%d", endMS, state.SubNextMS, called, wantEnd)
 	}
 }

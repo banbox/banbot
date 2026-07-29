@@ -101,6 +101,10 @@ func (s *SeriesStore) Read(ctx context.Context, info *SeriesInfo, target *ExSymb
 	if err := validateSeriesInfo(info); err != nil {
 		return nil, err
 	}
+	if historicalCoverageForQuery(target.Symbol) != nil &&
+		isKLineSeriesBinding(info, normalizedSeriesBinding(info.Binding)) {
+		return NewKLineSeriesStore(info).Read(ctx, target, startMS, endMS, limit)
+	}
 	rows, err := s.repoOrDefault().QuerySeriesRange(ctx, info, target.ID, startMS, endMS, limit)
 	if err != nil {
 		return nil, err

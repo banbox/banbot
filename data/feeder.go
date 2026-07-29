@@ -574,6 +574,7 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 		if err != nil {
 			return 0, nil, err
 		}
+		bars = f.filterHistoricalCoverageRows(tf, bars)
 		if debugWarm {
 			var firstMS, lastMS int64
 			if len(bars) > 0 {
@@ -629,6 +630,7 @@ Returns the ending timestamp (i.e. the starting timestamp of the next bar)
 返回结束的时间戳（即下一个bar开始时间戳）
 */
 func (f *SeriesFeeder) warmTf(tf string, rows []*orm.DataSeries) int64 {
+	rows = f.filterHistoricalCoverageRows(tf, rows)
 	if len(rows) == 0 {
 		return 0
 	}

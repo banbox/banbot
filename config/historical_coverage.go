@@ -84,11 +84,23 @@ func HistoricalCoverageFor(symbol string) *HistoricalCoverageConfig {
 }
 
 func (c *HistoricalCoverageConfig) Allows(timeframe string, timeMS int64) bool {
-	if c == nil || timeMS >= c.BaselineEndMS {
+	if c == nil {
 		return true
 	}
+	if TimeRange != nil && TimeRange.EndMS > 0 && timeMS >= TimeRange.EndMS {
+		return false
+	}
 	for _, timeframes := range c.Bars {
-		ranges := timeframes[timeframe]
+		ranges, exists := timeframes[timeframe]
+		if !exists {
+			continue
+		}
+		// The archived bar plan is also the allow-list for the extension tail.
+		// A newly requested symbol/timeframe must never gain access merely because
+		// its timestamp is after the historical baseline.
+		if timeMS >= c.BaselineEndMS {
+			return true
+		}
 		index, found := slices.BinarySearchFunc(ranges, timeMS, func(item HistoricalCoverageRange, target int64) int {
 			if item.StopMS <= target {
 				return -1
@@ -98,7 +110,9 @@ func (c *HistoricalCoverageConfig) Allows(timeframe string, timeMS int64) bool {
 			}
 			return 0
 		})
-		return found && index < len(ranges)
+		if found && index < len(ranges) {
+			return true
+		}
 	}
 	return false
 }

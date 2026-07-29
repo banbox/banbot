@@ -10,6 +10,7 @@ import (
 	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
@@ -34,6 +35,9 @@ If you need to download from the end to the beginning, you should make startMS>e
 如果需要从后往前下载，应该使startMS>endMS
 */
 func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeFrame string, startMS, endMS int64, out chan []*banexg.Kline) *errs.Error {
+	if !allowImplicitKlineDownload() {
+		return klineDownloadDisabledError("FetchApiOHLCV")
+	}
 	if core.NetDisable {
 		return nil
 	}
@@ -115,6 +119,9 @@ Download K-line to database. This method should be called in a transaction, othe
 */
 func (q *Queries) DownOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
 	pBar *utils.PrgBar) (int, *errs.Error) {
+	if !allowImplicitKlineDownload() {
+		return 0, klineDownloadDisabledError("DownOHLCV2DB")
+	}
 	return q.downOHLCV2DB(exchange, exs, timeFrame, startMS, endMS, 2, pBar)
 }
 
@@ -739,6 +746,9 @@ Batch simultaneous download of K-line
 批量同时下载K线
 */
 func BulkDownOHLCV(exchange banexg.BanExchange, exsList map[int32]*ExSymbol, timeFrame string, startMS, endMS int64, limit int, prg utils.PrgCB) *errs.Error {
+	if !allowImplicitKlineDownload() {
+		return klineDownloadDisabledError("BulkDownOHLCV")
+	}
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	startMS, endMS = parseDownArgs(tfMSecs, startMS, endMS, limit, false)
 	downTF, err := GetDownTF(timeFrame)
@@ -825,6 +835,9 @@ For combination varieties, return the unweighted candlestick and the weighting f
 */
 func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame string,
 	startMS, endMS int64, limit int, handler func(string, string, []*banexg.Kline, []*AdjInfo)) *errs.Error {
+	if !allowImplicitKlineDownload() {
+		return klineDownloadDisabledError("FastBulkOHLCV")
+	}
 	var exsMap, err = MapExSymbols(exchange, symbols)
 	if len(exsMap) == 0 {
 		return err
@@ -842,6 +855,7 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 		return err
 	}
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
+	queryStartMS, queryEndMS := parseDownArgs(tfMSecs, startMS, endMS, limit, false)
 	exInfo := exchange.Info()
 	if exchange.HasApi(banexg.ApiFetchOHLCV, exInfo.MarketType) {
 		retErr := BulkDownOHLCV(exchange, exsMap, timeFrame, startMS, endMS, limit, nil)
@@ -852,8 +866,7 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 	if handler == nil {
 		return nil
 	}
-	sugStartMS, sugEndMS := parseDownArgs(tfMSecs, startMS, endMS, limit, false)
-	itemNum := (sugEndMS - sugStartMS) / tfMSecs
+	itemNum := (queryEndMS - queryStartMS) / tfMSecs
 	leftArr := make([]int32, 0, len(exsMap))
 	if itemNum < int64(core.KBatchSize) {
 		rawMap := make(map[int32]*ExSymbol)
@@ -870,9 +883,9 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 				if !ok {
 					return
 				}
-				handler(exs.Symbol, timeFrame, klines, nil)
+				deliverFastBulkOHLCV(handler, exs.Symbol, timeFrame, klines, nil)
 			}
-			err = sess.QueryOHLCVBatch(rawMap, timeFrame, startMS, endMS, limit, bulkHandler)
+			err = sess.QueryOHLCVBatch(rawMap, timeFrame, queryStartMS, queryEndMS, 0, bulkHandler)
 			if err != nil {
 				return err
 			}
@@ -883,13 +896,27 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 	// 单个数量过多，逐个查询
 	for _, sid := range leftArr {
 		exs := exsMap[sid]
-		adjs, klines, err := sess.GetOHLCV(exs, timeFrame, startMS, endMS, limit, false)
+		adjs, klines, err := sess.GetOHLCV(exs, timeFrame, queryStartMS, queryEndMS, 0, false)
 		if err != nil {
 			return err
 		}
-		handler(exs.Symbol, timeFrame, klines, adjs)
+		deliverFastBulkOHLCV(handler, exs.Symbol, timeFrame, klines, adjs)
 	}
 	return nil
+}
+
+func deliverFastBulkOHLCV(handler func(string, string, []*banexg.Kline, []*AdjInfo), symbol, timeframe string,
+	rows []*banexg.Kline, adjs []*AdjInfo,
+) {
+	handler(symbol, timeframe, filterHistoricalCoverageKlines(symbol, timeframe, rows), adjs)
+}
+
+func allowImplicitKlineDownload() bool {
+	return !core.BackTestMode || !config.Data.BTNoKlineDownload
+}
+
+func klineDownloadDisabledError(operation string) *errs.Error {
+	return errs.NewMsg(errs.CodeNotSupport, "%s: K-line download is disabled for strict backtests", operation)
 }
 
 func MapExSymbols(exchange banexg.BanExchange, symbols []string) (map[int32]*ExSymbol, *errs.Error) {

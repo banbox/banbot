@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
 )
 
@@ -128,6 +130,26 @@ func TestSeriesStoreReadConvertsRecordsToEvents(t *testing.T) {
 	}
 	if got[0].Source != info.Name || got[0].Sid != target.ID || got[0].ExSymbol != target {
 		t.Fatalf("unexpected event identity: %+v", got[0])
+	}
+}
+
+func TestSeriesStoreReadCannotBypassHistoricalKlineCoverage(t *testing.T) {
+	previousMode, previousCoverage := core.BackTestMode, config.HistoricalCoverage
+	core.BackTestMode = true
+	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
+		BaselineEndMS: 1000,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 1000}}},
+		},
+	}
+	t.Cleanup(func() { core.BackTestMode, config.HistoricalCoverage = previousMode, previousCoverage })
+	repo := &stubStoreRepo{queryRows: []*DataRecord{{Sid: 2, TimeMS: 100, EndMS: 200}}}
+	store := NewSeriesStore(repo)
+	info := NewSeriesInfo("signal", "1h", []SeriesField{{Name: "signal", Type: "float"}})
+	info.Binding.Table = SeriesTableName(SeriesSourceKline, info.TimeFrame)
+	rows, err := store.Read(context.Background(), info, &ExSymbol{ID: 2, Symbol: "ETH/USDT:USDT"}, 100, 900, 0)
+	if err == nil || len(rows) != 0 || repo.queryCalls != 0 {
+		t.Fatalf("generic K-line read rows=%v err=%v raw_calls=%d", rows, err, repo.queryCalls)
 	}
 }
 
