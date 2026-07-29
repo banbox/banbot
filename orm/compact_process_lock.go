@@ -25,6 +25,10 @@ var (
 )
 
 func compactProcessLockRoot() string {
+	return dbIdentLockRoot("compact", compactProcessLockRootDataDir)
+}
+
+func compactProcessLockRootDataDir() string {
 	dataDir := config.GetDataDirSafe()
 	if dataDir == "" {
 		return ""
