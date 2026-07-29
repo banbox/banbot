@@ -1,0 +1,233 @@
+package orm
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"hash"
+
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/banexg/errs"
+	utils2 "github.com/banbox/banexg/utils"
+)
+
+// PhysicalKlineGap describes a missing half-open interval in a physical K-line
+// table. The bounds use Unix milliseconds.
+type PhysicalKlineGap struct {
+	StartMS int64 `json:"start_ms"`
+	StopMS  int64 `json:"stop_ms"`
+}
+
+// PhysicalKlineManifest proves which physical rows back a requested consumer
+// timeframe. TimestampSHA256 hashes every physical bar timestamp in order.
+type PhysicalKlineManifest struct {
+	SID             int32              `json:"sid"`
+	Exchange        string             `json:"exchange"`
+	ExgReal         string             `json:"exg_real"`
+	Market          string             `json:"market"`
+	Symbol          string             `json:"symbol"`
+	Combined        bool               `json:"combined"`
+	RequestedTF     string             `json:"requested_timeframe"`
+	StorageTF       string             `json:"storage_timeframe"`
+	Table           string             `json:"table"`
+	RequestedStart  int64              `json:"requested_start_ms"`
+	RequestedEnd    int64              `json:"requested_end_ms"`
+	ConsumerStartMS int64              `json:"consumer_start_ms"`
+	ConsumerStopMS  int64              `json:"consumer_stop_ms"`
+	ConsumerAlignMS int64              `json:"consumer_align_ms"`
+	StartMS         int64              `json:"start_ms"`
+	StopMS          int64              `json:"stop_ms"`
+	StorageAlignMS  int64              `json:"storage_align_ms"`
+	ListMS          int64              `json:"list_ms"`
+	DelistMS        int64              `json:"delist_ms"`
+	FirstMS         int64              `json:"first_ms"`
+	LastMS          int64              `json:"last_ms"`
+	RowCount        int64              `json:"row_count"`
+	ExpectedRows    int64              `json:"expected_rows"`
+	Missing         []PhysicalKlineGap `json:"missing"`
+	TimestampSHA256 string             `json:"timestamp_sha256"`
+	Complete        bool               `json:"complete"`
+	NonApplicable   bool               `json:"non_applicable,omitempty"`
+	BoundaryReason  string             `json:"boundary_reason,omitempty"`
+}
+
+type physicalKlineCollector struct {
+	startMS  int64
+	stopMS   int64
+	stepMS   int64
+	nextMS   int64
+	firstMS  int64
+	lastMS   int64
+	rowCount int64
+	missing  []PhysicalKlineGap
+	hasher   hash.Hash
+}
+
+func newPhysicalKlineCollector(startMS, stopMS, stepMS int64) *physicalKlineCollector {
+	return &physicalKlineCollector{
+		startMS: startMS,
+		stopMS:  stopMS,
+		stepMS:  stepMS,
+		nextMS:  startMS,
+		hasher:  sha256.New(),
+	}
+}
+
+func (c *physicalKlineCollector) add(timestamp int64) error {
+	if timestamp < c.startMS || timestamp >= c.stopMS {
+		return fmt.Errorf("physical K-line timestamp %d is outside [%d,%d)", timestamp, c.startMS, c.stopMS)
+	}
+	if (timestamp-c.startMS)%c.stepMS != 0 {
+		return fmt.Errorf("physical K-line timestamp %d is not aligned to %d", timestamp, c.stepMS)
+	}
+	if timestamp < c.nextMS {
+		return fmt.Errorf("physical K-line timestamps are duplicated or out of order at %d", timestamp)
+	}
+	if timestamp > c.nextMS {
+		c.missing = append(c.missing, PhysicalKlineGap{StartMS: c.nextMS, StopMS: timestamp})
+	}
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(timestamp))
+	_, _ = c.hasher.Write(encoded[:])
+	if c.rowCount == 0 {
+		c.firstMS = timestamp
+	}
+	c.lastMS = timestamp
+	c.rowCount++
+	c.nextMS = timestamp + c.stepMS
+	return nil
+}
+
+func (c *physicalKlineCollector) finish() (firstMS, lastMS, rowCount int64, missing []PhysicalKlineGap, digest string) {
+	if c.nextMS < c.stopMS {
+		c.missing = append(c.missing, PhysicalKlineGap{StartMS: c.nextMS, StopMS: c.stopMS})
+	}
+	return c.firstMS, c.lastMS, c.rowCount, c.missing, hex.EncodeToString(c.hasher.Sum(nil))
+}
+
+func physicalKlineStorage(requestedTF string) (string, string, *errs.Error) {
+	if secs, err := utils2.TFToSecSafe(requestedTF); err != nil || secs <= 0 {
+		return "", "", errs.NewMsg(core.ErrInvalidTF, "invalid timeframe: %s", requestedTF)
+	}
+	table, storageTF, _ := resolveTablePg(requestedTF)
+	if storageTF == "" {
+		storageTF = requestedTF
+	}
+	switch table {
+	case "kline_1m", "kline_5m", "kline_15m", "kline_1h", "kline_1d":
+	default:
+		return "", "", errs.NewMsg(core.ErrInvalidTF, "timeframe %s has no physical K-line table", requestedTF)
+	}
+	if table != "kline_"+storageTF {
+		return "", "", errs.NewMsg(core.ErrInvalidTF, "timeframe %s resolved to inconsistent storage", requestedTF)
+	}
+	return storageTF, table, nil
+}
+
+func alignPhysicalKlineFloor(value, step, offset int64) int64 {
+	return (value-offset)/step*step + offset
+}
+
+func alignPhysicalKlineCeil(value, step, offset int64) int64 {
+	floor := alignPhysicalKlineFloor(value, step, offset)
+	if floor < value {
+		return floor + step
+	}
+	return floor
+}
+
+type physicalKlineBounds struct {
+	consumerStart int64
+	consumerStop  int64
+	storageStart  int64
+	storageStop   int64
+	reason        string
+}
+
+func physicalKlineCoverageBounds(startMS, stopMS, listMS, delistMS, consumerStepMS,
+	consumerOffsetMS, storageStepMS, storageOffsetMS int64,
+) physicalKlineBounds {
+	consumerStart := alignPhysicalKlineFloor(startMS, consumerStepMS, consumerOffsetMS)
+	if listMS > consumerStart {
+		consumerStart = alignPhysicalKlineCeil(listMS, consumerStepMS, consumerOffsetMS)
+	}
+	consumerStop := alignPhysicalKlineFloor(stopMS, consumerStepMS, consumerOffsetMS)
+	storageStart := alignPhysicalKlineFloor(consumerStart, storageStepMS, storageOffsetMS)
+	storageStop := alignPhysicalKlineFloor(consumerStop, storageStepMS, storageOffsetMS)
+	reason := ""
+	if delistMS > 0 && delistMS < stopMS {
+		consumerStop = alignPhysicalKlineCeil(delistMS, consumerStepMS, consumerOffsetMS)
+		storageStop = alignPhysicalKlineCeil(delistMS, storageStepMS, storageOffsetMS)
+		reason = "delisted_market"
+	}
+	return physicalKlineBounds{consumerStart, consumerStop, storageStart, storageStop, reason}
+}
+
+// InspectPhysicalKlineCoverage streams physical Timescale timestamps without
+// loading OHLCV rows into memory. It never downloads, repairs, or trusts
+// sranges metadata.
+func (q *Queries) InspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbol, requestedTF string,
+	startMS, stopMS int64,
+) (*PhysicalKlineManifest, *errs.Error) {
+	if q == nil || exs == nil || exs.ID <= 0 || startMS <= 0 || stopMS <= startMS {
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "physical K-line coverage input is incomplete")
+	}
+	if IsQuestDB {
+		return nil, errs.NewMsg(errs.CodeNotSupport, "physical K-line manifest currently requires TimescaleDB")
+	}
+	storageTF, table, err := physicalKlineStorage(requestedTF)
+	if err != nil {
+		return nil, err
+	}
+	consumerStepMS := int64(utils2.TFToSecs(requestedTF) * 1000)
+	storageStepMS := int64(utils2.TFToSecs(storageTF) * 1000)
+	consumerOffsetMS := GetAlignOff(exs.ID, consumerStepMS)
+	storageOffsetMS := GetAlignOff(exs.ID, storageStepMS)
+	requestedStart, requestedStop := startMS, stopMS
+	bounds := physicalKlineCoverageBounds(startMS, stopMS, exs.ListMs, exs.DelistMs,
+		consumerStepMS, consumerOffsetMS, storageStepMS, storageOffsetMS)
+	startMS, stopMS = bounds.storageStart, bounds.storageStop
+	base := PhysicalKlineManifest{
+		SID: exs.ID, Exchange: exs.Exchange, ExgReal: exs.ExgReal, Market: exs.Market,
+		Symbol: exs.Symbol, Combined: exs.Combined, RequestedTF: requestedTF, StorageTF: storageTF, Table: table,
+		RequestedStart: requestedStart, RequestedEnd: requestedStop,
+		ConsumerStartMS: bounds.consumerStart, ConsumerStopMS: bounds.consumerStop, ConsumerAlignMS: consumerOffsetMS,
+		StartMS: startMS, StopMS: stopMS, StorageAlignMS: storageOffsetMS,
+		ListMS: exs.ListMs, DelistMS: exs.DelistMs, BoundaryReason: bounds.reason,
+	}
+	if stopMS <= startMS {
+		base.NonApplicable = true
+		base.BoundaryReason = "no_tradable_range"
+		base.TimestampSHA256 = hex.EncodeToString(sha256.New().Sum(nil))
+		return &base, nil
+	}
+
+	rows, queryErr := q.db.Query(ctx, fmt.Sprintf(
+		"SELECT time FROM %s WHERE sid=$1 AND time >= $2 AND time < $3 ORDER BY time", table),
+		exs.ID, startMS, stopMS)
+	if queryErr != nil {
+		return nil, NewDbErr(core.ErrDbReadFail, queryErr)
+	}
+	defer rows.Close()
+	collector := newPhysicalKlineCollector(startMS, stopMS, storageStepMS)
+	for rows.Next() {
+		var timestamp int64
+		if scanErr := rows.Scan(&timestamp); scanErr != nil {
+			return nil, NewDbErr(core.ErrDbReadFail, scanErr)
+		}
+		if collectErr := collector.add(timestamp); collectErr != nil {
+			return nil, errs.New(core.ErrInvalidBars, collectErr)
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, NewDbErr(core.ErrDbReadFail, rowsErr)
+	}
+	firstMS, lastMS, rowCount, missing, digest := collector.finish()
+	expected := (stopMS - startMS) / storageStepMS
+	base.FirstMS, base.LastMS, base.RowCount, base.ExpectedRows = firstMS, lastMS, rowCount, expected
+	base.Missing, base.TimestampSHA256 = missing, digest
+	base.Complete = rowCount == expected && len(missing) == 0
+	return &base, nil
+}
