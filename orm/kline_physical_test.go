@@ -1,7 +1,9 @@
 package orm
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -23,6 +25,29 @@ func TestPhysicalKlineStorageUsesActualTable(t *testing.T) {
 		}
 		if storage != test.storage || table != test.table {
 			t.Fatalf("%s resolved to %s/%s, want %s/%s", test.requested, storage, table, test.storage, test.table)
+		}
+	}
+}
+
+func TestPhysicalKlineStorageTimeframeUsesCanonicalResolver(t *testing.T) {
+	storage, err := PhysicalKlineStorageTimeframe("4h")
+	if err != nil || storage != "1h" {
+		t.Fatalf("4h storage timeframe=%q err=%v", storage, err)
+	}
+	if _, err = PhysicalKlineStorageTimeframe("invalid"); err == nil {
+		t.Fatal("invalid timeframe resolved to physical storage")
+	}
+}
+
+func TestPhysicalKlineManifestOmitsUnusedAuditedStorageStart(t *testing.T) {
+	encoded, err := json.Marshal(PhysicalKlineManifest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := string(encoded)
+	for _, field := range []string{"audited_storage_start_ms", "start_boundary_reason"} {
+		if strings.Contains(value, field) {
+			t.Fatalf("zero-value manifest unexpectedly contains %q: %s", field, value)
 		}
 	}
 }
@@ -98,6 +123,47 @@ func TestPhysicalKlineAlignmentIncludesConsumerSourcePrefix(t *testing.T) {
 	}
 	if got := alignPhysicalKlineCeil(10*hour+1, 4*hour, 0); got != 12*hour {
 		t.Fatalf("4h ceil=%d, want %d", got, 12*hour)
+	}
+}
+
+func TestAuditedPhysicalKlineStorageStartAllowsOnlyFirstConsumerBucketPrefix(t *testing.T) {
+	const hour = int64(3_600_000)
+	base := physicalKlineCoverageBounds(16*hour, 32*hour, 0, 0, 4*hour, 0, hour, 0)
+	accepted, err := applyAuditedPhysicalKlineStorageStart(base, 17*hour, 4*hour, hour, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.consumerStart != 16*hour || accepted.storageStart != 17*hour ||
+		accepted.auditedStorageStart != 17*hour || accepted.startReason != "archived_storage_prefix" {
+		t.Fatalf("accepted bounds=%#v", accepted)
+	}
+
+	for _, test := range []struct {
+		name  string
+		start int64
+		stop  int64
+	}{
+		{name: "not later than default", start: 16 * hour, stop: 32 * hour},
+		{name: "unaligned", start: 17*hour + 1, stop: 32 * hour},
+		{name: "beyond first consumer bucket", start: 20 * hour, stop: 32 * hour},
+		{name: "not before stop", start: 17 * hour, stop: 17 * hour},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bounds := base
+			bounds.storageStop = test.stop
+			if _, err := applyAuditedPhysicalKlineStorageStart(bounds, test.start, 4*hour, hour, 0); err == nil {
+				t.Fatalf("audited storage start %d accepted for bounds %#v", test.start, bounds)
+			}
+		})
+	}
+
+	offsetDefault := base
+	offsetDefault.storageStart = 17 * hour
+	if _, err := applyAuditedPhysicalKlineStorageStart(offsetDefault, 17*hour, 4*hour, hour, 0); err == nil {
+		t.Fatal("storage start equal to the default offset storage boundary was accepted")
+	}
+	if _, err := applyAuditedPhysicalKlineStorageStart(base, 17*hour, hour, hour, 0); err == nil {
+		t.Fatal("audited storage start was accepted for a direct physical timeframe")
 	}
 }
 

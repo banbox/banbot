@@ -24,35 +24,37 @@ type PhysicalKlineGap struct {
 // PhysicalKlineManifest proves which physical rows back a requested consumer
 // timeframe. DataSHA256 hashes timestamps and every stored OHLCV field in order.
 type PhysicalKlineManifest struct {
-	SID             int32              `json:"sid"`
-	Exchange        string             `json:"exchange"`
-	ExgReal         string             `json:"exg_real"`
-	Market          string             `json:"market"`
-	Symbol          string             `json:"symbol"`
-	Combined        bool               `json:"combined"`
-	RequestedTF     string             `json:"requested_timeframe"`
-	StorageTF       string             `json:"storage_timeframe"`
-	Table           string             `json:"table"`
-	RequestedStart  int64              `json:"requested_start_ms"`
-	RequestedEnd    int64              `json:"requested_end_ms"`
-	ConsumerStartMS int64              `json:"consumer_start_ms"`
-	ConsumerStopMS  int64              `json:"consumer_stop_ms"`
-	ConsumerAlignMS int64              `json:"consumer_align_ms"`
-	StartMS         int64              `json:"start_ms"`
-	StopMS          int64              `json:"stop_ms"`
-	StorageAlignMS  int64              `json:"storage_align_ms"`
-	ListMS          int64              `json:"list_ms"`
-	DelistMS        int64              `json:"delist_ms"`
-	FirstMS         int64              `json:"first_ms"`
-	LastMS          int64              `json:"last_ms"`
-	RowCount        int64              `json:"row_count"`
-	ExpectedRows    int64              `json:"expected_rows"`
-	Missing         []PhysicalKlineGap `json:"missing"`
-	TimestampSHA256 string             `json:"timestamp_sha256"`
-	DataSHA256      string             `json:"data_sha256"`
-	Complete        bool               `json:"complete"`
-	NonApplicable   bool               `json:"non_applicable,omitempty"`
-	BoundaryReason  string             `json:"boundary_reason,omitempty"`
+	SID                   int32              `json:"sid"`
+	Exchange              string             `json:"exchange"`
+	ExgReal               string             `json:"exg_real"`
+	Market                string             `json:"market"`
+	Symbol                string             `json:"symbol"`
+	Combined              bool               `json:"combined"`
+	RequestedTF           string             `json:"requested_timeframe"`
+	StorageTF             string             `json:"storage_timeframe"`
+	Table                 string             `json:"table"`
+	RequestedStart        int64              `json:"requested_start_ms"`
+	RequestedEnd          int64              `json:"requested_end_ms"`
+	ConsumerStartMS       int64              `json:"consumer_start_ms"`
+	ConsumerStopMS        int64              `json:"consumer_stop_ms"`
+	ConsumerAlignMS       int64              `json:"consumer_align_ms"`
+	StartMS               int64              `json:"start_ms"`
+	StopMS                int64              `json:"stop_ms"`
+	StorageAlignMS        int64              `json:"storage_align_ms"`
+	AuditedStorageStartMS int64              `json:"audited_storage_start_ms,omitempty"`
+	StartBoundaryReason   string             `json:"start_boundary_reason,omitempty"`
+	ListMS                int64              `json:"list_ms"`
+	DelistMS              int64              `json:"delist_ms"`
+	FirstMS               int64              `json:"first_ms"`
+	LastMS                int64              `json:"last_ms"`
+	RowCount              int64              `json:"row_count"`
+	ExpectedRows          int64              `json:"expected_rows"`
+	Missing               []PhysicalKlineGap `json:"missing"`
+	TimestampSHA256       string             `json:"timestamp_sha256"`
+	DataSHA256            string             `json:"data_sha256"`
+	Complete              bool               `json:"complete"`
+	NonApplicable         bool               `json:"non_applicable,omitempty"`
+	BoundaryReason        string             `json:"boundary_reason,omitempty"`
 }
 
 type physicalKlineCollector struct {
@@ -162,6 +164,13 @@ func physicalKlineStorage(requestedTF string) (string, string, *errs.Error) {
 	return storageTF, table, nil
 }
 
+// PhysicalKlineStorageTimeframe returns the canonical physical timeframe used
+// to serve requestedTF in TimescaleDB.
+func PhysicalKlineStorageTimeframe(requestedTF string) (string, *errs.Error) {
+	storageTF, _, err := physicalKlineStorage(requestedTF)
+	return storageTF, err
+}
+
 func alignPhysicalKlineFloor(value, step, offset int64) int64 {
 	return (value-offset)/step*step + offset
 }
@@ -175,11 +184,13 @@ func alignPhysicalKlineCeil(value, step, offset int64) int64 {
 }
 
 type physicalKlineBounds struct {
-	consumerStart int64
-	consumerStop  int64
-	storageStart  int64
-	storageStop   int64
-	reason        string
+	consumerStart       int64
+	consumerStop        int64
+	storageStart        int64
+	storageStop         int64
+	auditedStorageStart int64
+	startReason         string
+	reason              string
 }
 
 func physicalKlineCoverageBounds(startMS, stopMS, listMS, delistMS, consumerStepMS,
@@ -198,7 +209,37 @@ func physicalKlineCoverageBounds(startMS, stopMS, listMS, delistMS, consumerStep
 		storageStop = alignPhysicalKlineCeil(delistMS, storageStepMS, storageOffsetMS)
 		reason = "delisted_market"
 	}
-	return physicalKlineBounds{consumerStart, consumerStop, storageStart, storageStop, reason}
+	return physicalKlineBounds{
+		consumerStart: consumerStart, consumerStop: consumerStop,
+		storageStart: storageStart, storageStop: storageStop, reason: reason,
+	}
+}
+
+func applyAuditedPhysicalKlineStorageStart(bounds physicalKlineBounds, storageStartMS,
+	consumerStepMS, storageStepMS, storageOffsetMS int64,
+) (physicalKlineBounds, error) {
+	if storageStepMS >= consumerStepMS {
+		return bounds, fmt.Errorf("audited physical K-line storage start requires a derived consumer timeframe")
+	}
+	if storageStartMS <= bounds.consumerStart {
+		return bounds, fmt.Errorf("audited physical K-line storage start must be later than the first consumer bucket start")
+	}
+	if storageStartMS <= bounds.storageStart {
+		return bounds, fmt.Errorf("audited physical K-line storage start must be later than the default storage start")
+	}
+	if storageStartMS >= bounds.consumerStart+consumerStepMS {
+		return bounds, fmt.Errorf("audited physical K-line storage start must remain within the first consumer bucket")
+	}
+	if storageStartMS >= bounds.storageStop {
+		return bounds, fmt.Errorf("audited physical K-line storage start must be before the storage stop")
+	}
+	if alignPhysicalKlineFloor(storageStartMS, storageStepMS, storageOffsetMS) != storageStartMS {
+		return bounds, fmt.Errorf("audited physical K-line storage start is not aligned to storage timeframe")
+	}
+	bounds.storageStart = storageStartMS
+	bounds.auditedStorageStart = storageStartMS
+	bounds.startReason = "archived_storage_prefix"
+	return bounds, nil
 }
 
 // InspectPhysicalKlineCoverage streams physical Timescale timestamps without
@@ -206,6 +247,24 @@ func physicalKlineCoverageBounds(startMS, stopMS, listMS, delistMS, consumerStep
 // sranges metadata.
 func (q *Queries) InspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbol, requestedTF string,
 	startMS, stopMS int64,
+) (*PhysicalKlineManifest, *errs.Error) {
+	return q.inspectPhysicalKlineCoverage(ctx, exs, requestedTF, startMS, stopMS, 0)
+}
+
+// InspectPhysicalKlineCoverageWithStorageStart permits an audited physical
+// storage prefix inside the first consumer bucket. It never changes ListMS or
+// the consumer coverage boundary.
+func (q *Queries) InspectPhysicalKlineCoverageWithStorageStart(ctx context.Context, exs *ExSymbol,
+	requestedTF string, startMS, stopMS, storageStartMS int64,
+) (*PhysicalKlineManifest, *errs.Error) {
+	if storageStartMS <= 0 {
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "audited physical K-line storage start is required")
+	}
+	return q.inspectPhysicalKlineCoverage(ctx, exs, requestedTF, startMS, stopMS, storageStartMS)
+}
+
+func (q *Queries) inspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbol, requestedTF string,
+	startMS, stopMS, auditedStorageStartMS int64,
 ) (*PhysicalKlineManifest, *errs.Error) {
 	if q == nil || exs == nil || exs.ID <= 0 || startMS <= 0 || stopMS <= startMS {
 		return nil, errs.NewMsg(errs.CodeParamInvalid, "physical K-line coverage input is incomplete")
@@ -224,6 +283,14 @@ func (q *Queries) InspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbo
 	requestedStart, requestedStop := startMS, stopMS
 	bounds := physicalKlineCoverageBounds(startMS, stopMS, exs.ListMs, exs.DelistMs,
 		consumerStepMS, consumerOffsetMS, storageStepMS, storageOffsetMS)
+	if auditedStorageStartMS > 0 {
+		var boundsErr error
+		bounds, boundsErr = applyAuditedPhysicalKlineStorageStart(bounds, auditedStorageStartMS,
+			consumerStepMS, storageStepMS, storageOffsetMS)
+		if boundsErr != nil {
+			return nil, errs.New(errs.CodeParamInvalid, boundsErr)
+		}
+	}
 	startMS, stopMS = bounds.storageStart, bounds.storageStop
 	base := PhysicalKlineManifest{
 		SID: exs.ID, Exchange: exs.Exchange, ExgReal: exs.ExgReal, Market: exs.Market,
@@ -231,6 +298,7 @@ func (q *Queries) InspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbo
 		RequestedStart: requestedStart, RequestedEnd: requestedStop,
 		ConsumerStartMS: bounds.consumerStart, ConsumerStopMS: bounds.consumerStop, ConsumerAlignMS: consumerOffsetMS,
 		StartMS: startMS, StopMS: stopMS, StorageAlignMS: storageOffsetMS,
+		AuditedStorageStartMS: bounds.auditedStorageStart, StartBoundaryReason: bounds.startReason,
 		ListMS: exs.ListMs, DelistMS: exs.DelistMs, BoundaryReason: bounds.reason,
 	}
 	if stopMS <= startMS {
