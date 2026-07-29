@@ -44,6 +44,26 @@ func TestBanConnWriteIdleDeadlineDiscardsConnection(t *testing.T) {
 	}
 }
 
+func TestBanConnReadRejectsOversizedFrameBeforeAllocation(t *testing.T) {
+	left, right := net.Pipe()
+	conn := &BanConn{Conn: left, Ready: true}
+	t.Cleanup(func() {
+		_ = left.Close()
+		_ = right.Close()
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var header [4]byte
+		binary.LittleEndian.PutUint32(header[:], banConnMaxFrameBytes+1)
+		_, _ = right.Write(header[:])
+	}()
+	if _, err := conn.Read(); err == nil || !strings.Contains(err.Error(), "frame exceeds") {
+		t.Fatalf("oversized frame error=%v", err)
+	}
+	<-done
+}
+
 func TestBanConnWriteIdleDeadlineAllowsSlowProgress(t *testing.T) {
 	oldTimeout := banConnWriteIdleTimeout
 	banConnWriteIdleTimeout = 50 * time.Millisecond

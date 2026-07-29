@@ -34,7 +34,7 @@ func TestPhysicalKlineCollectorFindsGapsAndHashesTimestamps(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	first, last, count, missing, digest := collector.finish()
+	first, last, count, missing, digest, _ := collector.finish()
 	if first != 100 || last != 500 || count != 4 {
 		t.Fatalf("summary=%d/%d/%d", first, last, count)
 	}
@@ -68,9 +68,25 @@ func TestPhysicalKlineCollectorReportsCompleteRange(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_, _, count, missing, _ := collector.finish()
+	_, _, count, missing, _, _ := collector.finish()
 	if count != 3 || len(missing) != 0 {
 		t.Fatalf("count=%d missing=%#v", count, missing)
+	}
+}
+
+func TestPhysicalKlineCollectorDataHashDetectsOHLCVChanges(t *testing.T) {
+	first := newPhysicalKlineCollector(100, 200, 100)
+	second := newPhysicalKlineCollector(100, 200, 100)
+	if err := first.addRow(100, 1, 2, 0.5, 1.5, 10, 15, 4, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.addRow(100, 1, 2, 0.5, 1.6, 10, 15, 4, 3); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, firstTimestamp, firstData := first.finish()
+	_, _, _, _, secondTimestamp, secondData := second.finish()
+	if firstTimestamp != secondTimestamp || firstData == secondData {
+		t.Fatalf("timestamps=%s/%s data=%s/%s", firstTimestamp, secondTimestamp, firstData, secondData)
 	}
 }
 

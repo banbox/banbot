@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash"
+	"math"
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
@@ -21,7 +22,7 @@ type PhysicalKlineGap struct {
 }
 
 // PhysicalKlineManifest proves which physical rows back a requested consumer
-// timeframe. TimestampSHA256 hashes every physical bar timestamp in order.
+// timeframe. DataSHA256 hashes timestamps and every stored OHLCV field in order.
 type PhysicalKlineManifest struct {
 	SID             int32              `json:"sid"`
 	Exchange        string             `json:"exchange"`
@@ -48,21 +49,23 @@ type PhysicalKlineManifest struct {
 	ExpectedRows    int64              `json:"expected_rows"`
 	Missing         []PhysicalKlineGap `json:"missing"`
 	TimestampSHA256 string             `json:"timestamp_sha256"`
+	DataSHA256      string             `json:"data_sha256"`
 	Complete        bool               `json:"complete"`
 	NonApplicable   bool               `json:"non_applicable,omitempty"`
 	BoundaryReason  string             `json:"boundary_reason,omitempty"`
 }
 
 type physicalKlineCollector struct {
-	startMS  int64
-	stopMS   int64
-	stepMS   int64
-	nextMS   int64
-	firstMS  int64
-	lastMS   int64
-	rowCount int64
-	missing  []PhysicalKlineGap
-	hasher   hash.Hash
+	startMS    int64
+	stopMS     int64
+	stepMS     int64
+	nextMS     int64
+	firstMS    int64
+	lastMS     int64
+	rowCount   int64
+	missing    []PhysicalKlineGap
+	hasher     hash.Hash
+	dataHasher hash.Hash
 }
 
 func newPhysicalKlineCollector(startMS, stopMS, stepMS int64) *physicalKlineCollector {
@@ -72,6 +75,11 @@ func newPhysicalKlineCollector(startMS, stopMS, stepMS int64) *physicalKlineColl
 		stepMS:  stepMS,
 		nextMS:  startMS,
 		hasher:  sha256.New(),
+		dataHasher: func() hash.Hash {
+			hasher := sha256.New()
+			_, _ = hasher.Write([]byte("banbot-physical-kline-data-v1\x00"))
+			return hasher
+		}(),
 	}
 }
 
@@ -100,11 +108,39 @@ func (c *physicalKlineCollector) add(timestamp int64) error {
 	return nil
 }
 
-func (c *physicalKlineCollector) finish() (firstMS, lastMS, rowCount int64, missing []PhysicalKlineGap, digest string) {
+func (c *physicalKlineCollector) addRow(timestamp int64, open, high, low, close, volume, quote,
+	buyVolume float64, tradeNum int64,
+) error {
+	if err := c.add(timestamp); err != nil {
+		return err
+	}
+	values := []float64{open, high, low, close, volume, quote, buyVolume}
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(timestamp))
+	_, _ = c.dataHasher.Write(encoded[:])
+	for _, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return fmt.Errorf("physical K-line contains non-finite value")
+		}
+		if value == 0 {
+			value = 0
+		}
+		binary.BigEndian.PutUint64(encoded[:], math.Float64bits(value))
+		_, _ = c.dataHasher.Write(encoded[:])
+	}
+	binary.BigEndian.PutUint64(encoded[:], uint64(tradeNum))
+	_, _ = c.dataHasher.Write(encoded[:])
+	return nil
+}
+
+func (c *physicalKlineCollector) finish() (firstMS, lastMS, rowCount int64, missing []PhysicalKlineGap,
+	timestampDigest, dataDigest string,
+) {
 	if c.nextMS < c.stopMS {
 		c.missing = append(c.missing, PhysicalKlineGap{StartMS: c.nextMS, StopMS: c.stopMS})
 	}
-	return c.firstMS, c.lastMS, c.rowCount, c.missing, hex.EncodeToString(c.hasher.Sum(nil))
+	return c.firstMS, c.lastMS, c.rowCount, c.missing,
+		hex.EncodeToString(c.hasher.Sum(nil)), hex.EncodeToString(c.dataHasher.Sum(nil))
 }
 
 func physicalKlineStorage(requestedTF string) (string, string, *errs.Error) {
@@ -201,11 +237,15 @@ func (q *Queries) InspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbo
 		base.NonApplicable = true
 		base.BoundaryReason = "no_tradable_range"
 		base.TimestampSHA256 = hex.EncodeToString(sha256.New().Sum(nil))
+		emptyData := sha256.New()
+		_, _ = emptyData.Write([]byte("banbot-physical-kline-data-v1\x00"))
+		base.DataSHA256 = hex.EncodeToString(emptyData.Sum(nil))
 		return &base, nil
 	}
 
 	rows, queryErr := q.db.Query(ctx, fmt.Sprintf(
-		"SELECT time FROM %s WHERE sid=$1 AND time >= $2 AND time < $3 ORDER BY time", table),
+		"SELECT time,open,high,low,close,volume,quote,buy_volume,trade_num FROM %s "+
+			"WHERE sid=$1 AND time >= $2 AND time < $3 ORDER BY time", table),
 		exs.ID, startMS, stopMS)
 	if queryErr != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, queryErr)
@@ -213,21 +253,24 @@ func (q *Queries) InspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbo
 	defer rows.Close()
 	collector := newPhysicalKlineCollector(startMS, stopMS, storageStepMS)
 	for rows.Next() {
-		var timestamp int64
-		if scanErr := rows.Scan(&timestamp); scanErr != nil {
+		var timestamp, tradeNum int64
+		var open, high, low, close, volume, quote, buyVolume float64
+		if scanErr := rows.Scan(&timestamp, &open, &high, &low, &close, &volume, &quote, &buyVolume,
+			&tradeNum); scanErr != nil {
 			return nil, NewDbErr(core.ErrDbReadFail, scanErr)
 		}
-		if collectErr := collector.add(timestamp); collectErr != nil {
+		if collectErr := collector.addRow(timestamp, open, high, low, close, volume, quote, buyVolume,
+			tradeNum); collectErr != nil {
 			return nil, errs.New(core.ErrInvalidBars, collectErr)
 		}
 	}
 	if rowsErr := rows.Err(); rowsErr != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, rowsErr)
 	}
-	firstMS, lastMS, rowCount, missing, digest := collector.finish()
+	firstMS, lastMS, rowCount, missing, timestampDigest, dataDigest := collector.finish()
 	expected := (stopMS - startMS) / storageStepMS
 	base.FirstMS, base.LastMS, base.RowCount, base.ExpectedRows = firstMS, lastMS, rowCount, expected
-	base.Missing, base.TimestampSHA256 = missing, digest
+	base.Missing, base.TimestampSHA256, base.DataSHA256 = missing, timestampDigest, dataDigest
 	base.Complete = rowCount == expected && len(missing) == 0
 	return &base, nil
 }
