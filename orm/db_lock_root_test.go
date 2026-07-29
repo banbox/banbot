@@ -1,6 +1,8 @@
 package orm
 
 import (
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -17,9 +19,10 @@ func swapLockConfig(t *testing.T, dataDir string, db *config.DatabaseConfig) {
 
 func TestDBIdentLockRootSameAcrossDataDirs(t *testing.T) {
 	url := "postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable"
-	swapLockConfig(t, t.TempDir(), &config.DatabaseConfig{Url: url})
+	dirA, dirB := t.TempDir(), t.TempDir()
+	swapLockConfig(t, dirA, &config.DatabaseConfig{Url: url})
 	compactA, klineA := compactProcessLockRoot(), klineInsertLockRoot()
-	config.DataDir = t.TempDir()
+	config.DataDir = dirB
 	compactB, klineB := compactProcessLockRoot(), klineInsertLockRoot()
 	if compactA == "" || compactA != compactB {
 		t.Fatalf("same URL must yield one shared compact root across data dirs: %q vs %q", compactA, compactB)
@@ -30,8 +33,10 @@ func TestDBIdentLockRootSameAcrossDataDirs(t *testing.T) {
 	if compactA == klineA {
 		t.Fatalf("compact and kline_insert must not share one lock dir: %q", compactA)
 	}
-	if strings.HasPrefix(compactA, config.DataDir) || strings.HasPrefix(klineA, config.DataDir) {
-		t.Fatalf("shared roots must live OUTSIDE the data dir: %q / %q", compactA, klineA)
+	for _, dir := range []string{dirA, dirB} {
+		if strings.HasPrefix(compactA, dir) || strings.HasPrefix(klineA, dir) {
+			t.Fatalf("shared roots must live OUTSIDE both data dirs (%q): %q / %q", dir, compactA, klineA)
+		}
 	}
 }
 
@@ -71,9 +76,15 @@ func TestDBIdentLockRootPathLeaksNoSecrets(t *testing.T) {
 	swapLockConfig(t, t.TempDir(),
 		&config.DatabaseConfig{Url: "postgresql://admin:hunter2@db-secret-host:8812/qdb"})
 	root := compactProcessLockRoot()
+	// Only the GENERATED portion is under this code's control — the cache-dir prefix
+	// is environment-owned and may legitimately contain e.g. a user named "admin".
+	base := filepath.Base(root)
+	if !regexp.MustCompile(`^compact-[0-9a-f]{12}$`).MatchString(base) {
+		t.Fatalf("generated lock dir %q must be exactly kind-<hash>", base)
+	}
 	for _, frag := range []string{"hunter2", "admin", "db-secret-host", "8812"} {
-		if strings.Contains(root, frag) {
-			t.Fatalf("lock root %q leaks %q from the database URL", root, frag)
+		if strings.Contains(base, frag) {
+			t.Fatalf("lock dir name %q leaks %q from the database URL", base, frag)
 		}
 	}
 }

@@ -49,6 +49,9 @@ func dbIdentLockRoot(kind string, fallback func() string) string {
 // runs with. Parsing goes through the same pgxpool config the real pool uses, so
 // the identity equals the actual connection target. The path carries only a hash —
 // the database URL holds credentials and must never leak into file system paths.
+// The root lives under the per-user cache dir; no world-writable location is ever
+// used — when os.UserCacheDir is unavailable (e.g. HOME unset) this returns ""
+// and the caller falls back to the legacy data-dir root.
 func sharedLockRootForDB(url, kind string) string {
 	cfg, err := pgxpool.ParseConfig(normalizeDatabaseURL(url))
 	if err != nil || cfg.ConnConfig == nil {
@@ -60,9 +63,7 @@ func sharedLockRootForDB(url, kind string) string {
 	tag := hex.EncodeToString(sum[:])[:12]
 	base, err := os.UserCacheDir()
 	if err != nil || base == "" {
-		base = filepath.Join(os.TempDir(), "banbot-locks")
-	} else {
-		base = filepath.Join(base, "banbot", "locks")
+		return ""
 	}
-	return filepath.Join(base, kind+"-"+tag)
+	return filepath.Join(base, "banbot", "locks", kind+"-"+tag)
 }
