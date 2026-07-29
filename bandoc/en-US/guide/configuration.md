@@ -48,7 +48,7 @@ min_open_rate: 0.5  # Minimum open order ratio, allows order if balance / per or
 low_cost_action: ignore # Action when stake amount < the minimum amount: ignore/keepBig/keepAll
 max_simul_open: 0 # Maximum number of simultaneously open orders on one candlestick
 bt_net_cost: 15  # Order delay in backtest, can be used to simulate slippage, in seconds, default is 15
-bt_strict: false  # Enable strict backtest mode; canonicalizes key execution order for reproducible results and may reduce speed
+bt_strict: false  # Enable strict backtest mode; canonicalizes key execution order for strictly reproducible results, adding 3%-5% execution time
 relay_sim_unfinish: false  # When trading a new symbol (backtesting/live trading), whether to trading from the open order relay at the beginning time
 order_bar_max: 500  # Find the maximum number of bars for forward simulation from the open orders at the start time.
 ntp_lang_code: none  # NTP (Network Time Protocol) real-time synchronization. The default is `none`(disabled). Supported codes: zh-CN, zh-HK, zh-TW, ja-JP, ko-KR, zh-SG, and global (indicating global NTP servers such as Google, Apple, Facebook, etc.).
