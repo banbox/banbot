@@ -43,6 +43,22 @@ func TestHistoricalCoverageRejectsInvalidRange(t *testing.T) {
 	}
 }
 
+func TestHistoricalCoverageAllowsBaselineAtBacktestEnd(t *testing.T) {
+	coverage := &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	if err := coverage.Normalize(&TimeTuple{StartMS: 50, EndMS: 500}); err != nil {
+		t.Fatalf("equal-end historical coverage was rejected: %v", err)
+	}
+	coverage.BaselineEndMS = 501
+	if err := coverage.Normalize(&TimeTuple{StartMS: 50, EndMS: 500}); err == nil {
+		t.Fatal("historical coverage beyond the backtest end was accepted")
+	}
+}
+
 func TestHistoricalCoverageCloneIsIndependent(t *testing.T) {
 	original := &HistoricalCoverageConfig{
 		BaselineEndMS: 500,

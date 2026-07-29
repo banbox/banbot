@@ -16,8 +16,8 @@ type HistoricalCoverageConfig struct {
 }
 
 func (c *HistoricalCoverageConfig) Normalize(runRange *TimeTuple) error {
-	if runRange == nil || c.BaselineEndMS <= runRange.StartMS || c.BaselineEndMS >= runRange.EndMS {
-		return fmt.Errorf("historical_coverage baseline_end_ms must be inside the backtest range")
+	if runRange == nil || c.BaselineEndMS <= runRange.StartMS || c.BaselineEndMS > runRange.EndMS {
+		return fmt.Errorf("historical_coverage baseline_end_ms must be after the start and at or before the end of the backtest range")
 	}
 	if len(c.Bars) == 0 {
 		return fmt.Errorf("historical_coverage bars are required")

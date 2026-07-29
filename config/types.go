@@ -75,10 +75,11 @@ const (
 
 var (
 	noExtends = map[string]bool{
-		"run_policy":     true,
-		"wallet_amounts": true,
-		"fatal_stop":     true,
-		"watch_jobs":     true,
+		"run_policy":          true,
+		"wallet_amounts":      true,
+		"fatal_stop":          true,
+		"watch_jobs":          true,
+		"historical_coverage": true,
 	}
 )
 
