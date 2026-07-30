@@ -125,6 +125,13 @@ func GetSymbolByID(id int32) *ExSymbol {
 }
 
 func GetExSymbolCur(symbol string) (*ExSymbol, *errs.Error) {
+	if exg.Default == nil {
+		item := findExSymbol(core.ExgName, core.Market, symbol)
+		if item == nil {
+			return nil, errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, len(keySymbolMap))
+		}
+		return item, nil
+	}
 	return GetExSymbol(exg.Default, symbol)
 }
 

@@ -34,6 +34,7 @@ func New(pol *config.RunPolicyConfig) *TradeStrat {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 	if obj, ok := cacheStrats[cacheKey]; ok {
+		obj.Policy = pol
 		return obj
 	}
 	makeFn, ok := StratMake[pol.Name]

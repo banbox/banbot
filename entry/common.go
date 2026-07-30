@@ -89,6 +89,7 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 
 	add("", newConfigCommand("trade", "live trade", RunTrade, false,
 		bindStakeAmount, bindPairs, bindSpider, bindOut))
+	add("", newInternalCommand())
 	add("", newConfigCommand("backtest", "backtest with strategies and data", RunBackTest, true,
 		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate, bindBTStrict))
 	add("", newConfigCommand("spider", "start the spider", RunSpider, false))
