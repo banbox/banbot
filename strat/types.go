@@ -129,6 +129,18 @@ type StratJob struct {
 	ShortTPPrice  float64           // Default short take profit price when opening a position 开仓时默认做空止盈价格
 	IsWarmUp      bool              // whether in a preheating state 当前是否处于预热状态
 	More          interface{}       // Additional information for policy customization 策略自定义的额外信息
+
+	inspectEffect func(string)
+}
+
+// NewInspectionJob creates the inert job state passed to startup-time
+// callbacks while keeping the effect hook outside strategy-facing fields.
+func NewInspectionJob(strategy *TradeStrat, env *ta.BarEnv, symbol *orm.ExSymbol, tf, account string, effect func(string)) *StratJob {
+	return &StratJob{
+		Strat: strategy, Env: env, DataHub: NewDataHub(), Symbol: symbol, TimeFrame: tf, Account: account,
+		TPMaxs: make(map[int64]float64), CloseLong: true, CloseShort: true,
+		ExgStopLoss: true, ExgTakeProfit: true, inspectEffect: effect,
+	}
 }
 
 /*

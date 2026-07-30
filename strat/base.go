@@ -117,6 +117,9 @@ func (s *StratJob) CanOpen(short bool) bool {
 }
 
 func (s *StratJob) OpenOrder(req *EnterReq) *errs.Error {
+	if s.recordInspectEffect("OpenOrder") {
+		return errs.NewMsg(core.ErrRunTime, "OpenOrder is forbidden during strategy inspection")
+	}
 	doLog := !s.IsWarmUp && req != nil && req.Log
 	var q *EnterReq
 	if doLog {
@@ -342,6 +345,9 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 }
 
 func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error {
+	if s.recordInspectEffect("CloseOrders") {
+		return errs.NewMsg(core.ErrRunTime, "CloseOrders is forbidden during strategy inspection")
+	}
 	doLog := !s.IsWarmUp && req != nil && req.Log
 	var q *ExitReq
 	if doLog {
@@ -787,9 +793,23 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 }
 
 func (s *StratJob) SetAllStopLoss(dirt float64, args *ormo.ExitTrigger) *errs.Error {
+	if s.recordInspectEffect("SetAllStopLoss") {
+		return errs.NewMsg(core.ErrRunTime, "SetAllStopLoss is forbidden during strategy inspection")
+	}
 	return s.setAllExitTrigger(dirt, ormo.OdInfoStopLoss, args)
 }
 
 func (s *StratJob) SetAllTakeProfit(dirt float64, args *ormo.ExitTrigger) *errs.Error {
+	if s.recordInspectEffect("SetAllTakeProfit") {
+		return errs.NewMsg(core.ErrRunTime, "SetAllTakeProfit is forbidden during strategy inspection")
+	}
 	return s.setAllExitTrigger(dirt, ormo.OdInfoTakeProfit, args)
+}
+
+func (s *StratJob) recordInspectEffect(name string) bool {
+	if s.inspectEffect == nil {
+		return false
+	}
+	s.inspectEffect(name)
+	return true
 }

@@ -348,6 +348,9 @@ func (q *ExitReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 }
 
 func (s *StratJob) UpdateOrders(curOrders []*ormo.InOutOrder) {
+	if s.recordInspectEffect("UpdateOrders") {
+		return
+	}
 	s.LongOrders = nil
 	s.ShortOrders = nil
 	enteredNum := 0
@@ -368,6 +371,9 @@ func (s *StratJob) UpdateOrders(curOrders []*ormo.InOutOrder) {
 }
 
 func (s *StratJob) InitBar(curOrders []*ormo.InOutOrder) {
+	if s.recordInspectEffect("InitBar") {
+		return
+	}
 	s.CheckMS = btime.TimeMS()
 	s.LastBarMS = s.Env.TimeStop
 	if s.IsWarmUp {

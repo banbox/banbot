@@ -241,7 +241,13 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 		base, panicText := makeStrategy(policy)
 		if panicText != "" {
 			plan.Unsupported = append(plan.Unsupported, unsupported("constructor_panic", policyID, "", "", panicText))
-			plan.Policies = append(plan.Policies, PolicyV1{PolicyID: policyID, SelectedSymbols: []string{}, AllowedRunTimeframes: []string{}})
+			plan.Policies = append(plan.Policies, PolicyV1{PolicyID: policyID, SelectedSymbols: []string{}, CoverageSymbols: []string{}, AllowedRunTimeframes: []string{}})
+			continue
+		}
+		baseAllowed := allowedTimeframes(base)
+		if len(policy.Filters) > 0 {
+			plan.Unsupported = append(plan.Unsupported, unsupported("policy_filters_require_runtime_data", policyID, "", "", "run_policy filters cannot be evaluated without runtime market data"))
+			plan.Policies = append(plan.Policies, PolicyV1{PolicyID: policyID, SelectedSymbols: []string{}, CoverageSymbols: []string{}, AllowedRunTimeframes: baseAllowed})
 			continue
 		}
 		selected := req.InitialSymbols
@@ -257,7 +263,7 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 				selected = nil
 			}
 		}
-		selected = canonicalizedStrings(selected)
+		selected = stableUniqueStrings(selected)
 		validSelected := selected[:0]
 		for _, symbol := range selected {
 			if symbol == "" || strings.TrimSpace(symbol) != symbol {
@@ -267,7 +273,27 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 			validSelected = append(validSelected, symbol)
 		}
 		selected = validSelected
+		maxPair, maxPairErr := effectivePolicyMaxPair(policy, cfg)
+		if maxPairErr != "" {
+			plan.Unsupported = append(plan.Unsupported, unsupported("invalid_max_pair", policyID, "", "", maxPairErr))
+			selected = selected[:0]
+		} else if maxPair > 0 && len(selected) > maxPair {
+			selected = selected[:maxPair]
+		}
+		coverage := canonicalizedStrings(selected)
+		if base.PickTimeFrame != nil {
+			plan.Unsupported = append(plan.Unsupported, unsupported("pick_timeframe_requires_scores", policyID, "", "", "PickTimeFrame requires runtime timeframe scores that are absent from request v1"))
+			plan.Policies = append(plan.Policies, PolicyV1{PolicyID: policyID, SelectedSymbols: selected, CoverageSymbols: coverage, AllowedRunTimeframes: baseAllowed})
+			continue
+		}
 		allowedSet := make(map[string]bool)
+		for _, tf := range baseAllowed {
+			if _, tfErr := utils2.TFToSecSafe(tf); tfErr != nil {
+				plan.Unsupported = append(plan.Unsupported, unsupported("invalid_timeframe", policyID, "", tf, tfErr.Error()))
+				continue
+			}
+			allowedSet[tf] = true
+		}
 		for _, symbol := range selected {
 			jobSymbol := universe[symbolKey(cfg.Exchange.Name, cfg.MarketType, symbol)]
 			if jobSymbol == nil {
@@ -280,6 +306,10 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 				jobStrategy, panicText = makeStrategy(jobPolicy)
 				if panicText != "" {
 					plan.Unsupported = append(plan.Unsupported, unsupported("constructor_panic", policyID, symbol, "", panicText))
+					continue
+				}
+				if jobStrategy.PickTimeFrame != nil {
+					plan.Unsupported = append(plan.Unsupported, unsupported("pick_timeframe_requires_scores", policyID, symbol, "", "pair-specific PickTimeFrame requires runtime timeframe scores that are absent from request v1"))
 					continue
 				}
 			}
@@ -301,7 +331,7 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 		if len(allowed) == 0 {
 			plan.Unsupported = append(plan.Unsupported, unsupported("invalid_timeframe", policyID, "", "", "strategy has no allowed run timeframe"))
 		}
-		plan.Policies = append(plan.Policies, PolicyV1{PolicyID: policyID, SelectedSymbols: selected, AllowedRunTimeframes: allowed})
+		plan.Policies = append(plan.Policies, PolicyV1{PolicyID: policyID, SelectedSymbols: selected, CoverageSymbols: coverage, AllowedRunTimeframes: allowed})
 	}
 	canonicalizePlan(&plan)
 	return plan
@@ -317,11 +347,11 @@ func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, policyI
 		plan.Unsupported = append(plan.Unsupported, unsupported("invalid_timeframe", policyID, symbol.Symbol, tf, err.Error()))
 		return
 	}
-	job := &strat.StratJob{
-		Strat: strategy, Env: env, DataHub: strat.NewDataHub(), Symbol: symbol, TimeFrame: tf,
-		Account: config.DefAcc, IsWarmUp: true, MaxOpenLong: -1, MaxOpenShort: -1,
-		TPMaxs: make(map[int64]float64), CloseLong: true, CloseShort: true,
-	}
+	var effects []string
+	job := strat.NewInspectionJob(strategy, env, symbol, tf, config.DefAcc,
+		func(name string) {
+			effects = append(effects, name)
+		})
 	addRequirement(plan, RequirementV1{
 		PolicyID: policyID, JobExchange: symbol.Exchange, JobMarket: symbol.Market, JobSymbol: symbol.Symbol, JobTimeframe: tf,
 		Source: orm.SeriesSourceKline, TargetExchange: symbol.Exchange, TargetMarket: symbol.Market, TargetSymbol: symbol.Symbol,
@@ -343,18 +373,22 @@ func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, policyI
 		})
 	}
 	if strategy.OnStartUp != nil {
-		if panicText := callJobCallback(strategy.OnStartUp, job); panicText != "" {
+		panicText := callJobCallback(strategy.OnStartUp, job)
+		if effect := inspectionOrderEffect(job, effects, "OnStartUp"); effect != "" {
+			plan.Unsupported = append(plan.Unsupported, unsupported("startup_order_effect", policyID, symbol.Symbol, tf, effect))
+			return
+		}
+		if panicText != "" {
 			plan.Unsupported = append(plan.Unsupported, unsupported("callback_panic", policyID, symbol.Symbol, tf, "OnStartUp: "+panicText))
 			return
 		}
 	}
-	if len(job.Entrys) > 0 || len(job.Exits) > 0 || job.OrderNum != 0 {
-		plan.Unsupported = append(plan.Unsupported, unsupported("startup_order_effect", policyID, symbol.Symbol, tf, "OnStartUp attempted an order lifecycle effect"))
-		return
-	}
 	if strategy.OnPairInfos != nil {
 		items, panicText := callPairInfos(strategy, job)
-		if panicText != "" {
+		if effect := inspectionOrderEffect(job, effects, "OnPairInfos"); effect != "" {
+			plan.Unsupported = append(plan.Unsupported, unsupported("startup_order_effect", policyID, symbol.Symbol, tf, effect))
+			return
+		} else if panicText != "" {
 			plan.Unsupported = append(plan.Unsupported, unsupported("callback_panic", policyID, symbol.Symbol, tf, "OnPairInfos: "+panicText))
 		} else {
 			for _, sub := range items {
@@ -373,7 +407,10 @@ func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, policyI
 	}
 	if strategy.OnDataSubs != nil {
 		items, panicText := callDataSubs(strategy, job)
-		if panicText != "" {
+		if effect := inspectionOrderEffect(job, effects, "OnDataSubs"); effect != "" {
+			plan.Unsupported = append(plan.Unsupported, unsupported("startup_order_effect", policyID, symbol.Symbol, tf, effect))
+			return
+		} else if panicText != "" {
 			plan.Unsupported = append(plan.Unsupported, unsupported("callback_panic", policyID, symbol.Symbol, tf, "OnDataSubs: "+panicText))
 		} else {
 			for _, sub := range items {
@@ -402,6 +439,16 @@ func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, policyI
 			}
 		}
 	}
+}
+
+func inspectionOrderEffect(job *strat.StratJob, effects []string, callback string) string {
+	if len(effects) > 0 {
+		return callback + " invoked forbidden order API: " + strings.Join(stableUniqueStrings(effects), ",")
+	}
+	if len(job.Entrys) > 0 || len(job.Exits) > 0 || len(job.LongOrders) > 0 || len(job.ShortOrders) > 0 || job.OrderNum != 0 || job.EnteredNum != 0 {
+		return callback + " directly changed order lifecycle state"
+	}
+	return ""
 }
 
 func collectSubscription(plan *SemanticPlanV1, policyID string, job *strat.StratJob, target *orm.ExSymbol,
@@ -514,7 +561,8 @@ func addRequirement(plan *SemanticPlanV1, item RequirementV1) {
 
 func canonicalizePlan(plan *SemanticPlanV1) {
 	for i := range plan.Policies {
-		plan.Policies[i].SelectedSymbols = canonicalizedStrings(plan.Policies[i].SelectedSymbols)
+		plan.Policies[i].SelectedSymbols = stableUniqueStrings(plan.Policies[i].SelectedSymbols)
+		plan.Policies[i].CoverageSymbols = canonicalizedStrings(plan.Policies[i].CoverageSymbols)
 		plan.Policies[i].AllowedRunTimeframes = canonicalizedStrings(plan.Policies[i].AllowedRunTimeframes)
 	}
 	slices.SortFunc(plan.Policies, func(a, b PolicyV1) int { return cmp.Compare(a.PolicyID, b.PolicyID) })
@@ -613,6 +661,51 @@ func canonicalizedStrings(items []string) []string {
 		return []string{}
 	}
 	return out
+}
+
+func stableUniqueStrings(items []string) []string {
+	seen := make(map[string]bool, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if !seen[item] {
+			seen[item] = true
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func effectivePolicyMaxPair(policy *config.RunPolicyConfig, cfg *config.Config) (int, string) {
+	if policy.MaxPair < 0 {
+		return 0, "run_policy max_pair must not be negative"
+	}
+	if policy.MaxPair != 0 {
+		return policy.MaxPair, ""
+	}
+	names := make([]string, 0, len(cfg.Accounts))
+	for name, account := range cfg.Accounts {
+		if account != nil && !account.NoTrade {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	if slices.Contains(names, config.DefAcc) {
+		return checkedAccountMaxPair(cfg.Accounts[config.DefAcc].MaxPair)
+	}
+	if len(names) > 0 {
+		return checkedAccountMaxPair(cfg.Accounts[names[0]].MaxPair)
+	}
+	return 999, ""
+}
+
+func checkedAccountMaxPair(limit int) (int, string) {
+	if limit < 0 {
+		return 0, "backtest account max_pair must not be negative"
+	}
+	if limit == 0 {
+		return 999, ""
+	}
+	return limit, ""
 }
 
 func symbolKey(exchange, market, symbol string) string {

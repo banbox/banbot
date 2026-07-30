@@ -57,6 +57,7 @@ type SemanticPlanV1 struct {
 type PolicyV1 struct {
 	PolicyID             string   `json:"policy_id"`
 	SelectedSymbols      []string `json:"selected_symbols"`
+	CoverageSymbols      []string `json:"coverage_symbols"`
 	AllowedRunTimeframes []string `json:"allowed_run_timeframes"`
 }
 
