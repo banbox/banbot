@@ -96,15 +96,146 @@ func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 	if !slices.Equal(policy.AllowedRunTimeframes, []string{"1h", "5m"}) {
 		t.Fatalf("allowed timeframes = %v", policy.AllowedRunTimeframes)
 	}
-	if len(first.Requirements) != 16 {
-		t.Fatalf("requirements = %d, want 16: %+v", len(first.Requirements), first.Requirements)
+	if len(first.Requirements) != 22 {
+		t.Fatalf("requirements = %d, want 22: %+v", len(first.Requirements), first.Requirements)
 	}
 	if len(first.Unsupported) != 0 || len(first.SemanticPlanSHA256) != 64 || len(first.RequestSHA256) != 64 {
 		t.Fatalf("unexpected hashes or unsupported output: %+v", first)
 	}
 	for _, requirement := range first.Requirements {
-		if requirement.Reason != "primary" && requirement.Reason != "pair_info" && requirement.Reason != "data_sub" {
+		if requirement.Reason != "primary" && requirement.Reason != "pair_info" && requirement.Reason != "data_sub" &&
+			requirement.Reason != "pair_list" && requirement.Reason != "pair_score" {
 			t.Fatalf("unexpected requirement reason: %s", requirement.Reason)
+		}
+	}
+}
+
+func TestInspectIncludesFrameworkPairListAndScoreKlines(t *testing.T) {
+	const strategyName = "runtime_plan_framework_fixture"
+	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"3d"}, WarmupNum: 300}
+	}
+	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	req := validRequest(t, strategyName)
+	req.ConfigYAML = strings.Replace(req.ConfigYAML, "exchange:\n", "run_timeframes: [15m]\nexchange:\n", 1)
+	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
+	output, err := Inspect(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"pair_list\x001h": 1, "pair_score\x0015m": 600, "pair_score\x003d": 600}
+	for _, requirement := range output.Requirements {
+		if requirement.PolicyID != "__framework__" || requirement.JobSymbol != "BTC/USDT:USDT" {
+			continue
+		}
+		key := requirement.Reason + "\x00" + requirement.Timeframe
+		if warmup, ok := want[key]; ok {
+			if requirement.WarmupBars != warmup {
+				t.Fatalf("%s warmup = %d, want %d", key, requirement.WarmupBars, warmup)
+			}
+			delete(want, key)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing framework requirements: %v", want)
+	}
+}
+
+func TestInspectAllowsForcedPairFiltersWithoutConfiguredFilters(t *testing.T) {
+	const strategyName = "runtime_plan_forced_filters_fixture"
+	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}}
+	}
+	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	req := validRequest(t, strategyName)
+	req.ConfigYAML = strings.Replace(req.ConfigYAML, "exchange:\n", "pairmgr:\n  force_filters: true\nexchange:\n", 1)
+	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
+	output, err := Inspect(req)
+	if err != nil || output == nil || len(output.Unsupported) != 0 {
+		t.Fatalf("empty forced pair filters were rejected: output=%+v err=%v", output, err)
+	}
+}
+
+func TestInspectRejectsConfiguredForcedPairFiltersWithoutRuntimeData(t *testing.T) {
+	const strategyName = "runtime_plan_configured_forced_filters_fixture"
+	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}}
+	}
+	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	req := validRequest(t, strategyName)
+	req.ConfigYAML = strings.Replace(req.ConfigYAML, "exchange:\n",
+		"pairmgr:\n  force_filters: true\npairlists:\n  - name: producer\n  - name: filter\nexchange:\n", 1)
+	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
+	output, err := Inspect(req)
+	if err == nil || output == nil || !hasUnsupportedCode(output.Unsupported, "forced_pair_filters_require_runtime_data") {
+		t.Fatalf("configured forced pair filters were not rejected: output=%+v err=%v", output, err)
+	}
+}
+
+func TestInspectFrameworkRequirementsCoverPolicyAndPreMaxPairSymbols(t *testing.T) {
+	const strategyName = "runtime_plan_framework_symbols_fixture"
+	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{
+			RunTimeFrames: []string{"1h"},
+			OnSymbols: func([]string) []string {
+				return []string{"SOL/USDT:USDT", "ETH/USDT:USDT", "BTC/USDT:USDT"}
+			},
+		}
+	}
+	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	req := validRequest(t, strategyName)
+	req.MarketUniverse = append(req.MarketUniverse, MarketSymbolV1{
+		SID: 3, Exchange: "binance", Market: "linear", Symbol: "SOL/USDT:USDT", ListMS: 1_600_000_000_000,
+	})
+	req.MarketUniverseSHA256 = mustMarketUniverseSHA256(t, req.MarketUniverse)
+	req.InitialSymbols = []string{"BTC/USDT:USDT"}
+	req.InputPairsSHA256 = mustInputPairsSHA256(t, req.InitialSymbols)
+	req.ConfigYAML = strings.Replace(req.ConfigYAML, "  - name: "+strategyName+"\n",
+		"  - name: "+strategyName+"\n    pairs: [ETH/USDT:USDT]\n    max_pair: 1\n", 1)
+	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
+	output, err := Inspect(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{
+		"pair_list\x00BTC/USDT:USDT\x001h":  1,
+		"pair_list\x00ETH/USDT:USDT\x001h":  1,
+		"pair_score\x00BTC/USDT:USDT\x001h": 600,
+		"pair_score\x00ETH/USDT:USDT\x001h": 600,
+		"pair_score\x00SOL/USDT:USDT\x001h": 600,
+	}
+	for _, requirement := range output.Requirements {
+		if requirement.PolicyID != "__framework__" {
+			continue
+		}
+		key := requirement.Reason + "\x00" + requirement.JobSymbol + "\x00" + requirement.Timeframe
+		warmup, ok := want[key]
+		if !ok || requirement.WarmupBars != warmup {
+			t.Fatalf("unexpected framework requirement: %+v", requirement)
+		}
+		delete(want, key)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing framework requirements: %v", want)
+	}
+	if !slices.Equal(output.Policies[0].SelectedSymbols, []string{"SOL/USDT:USDT"}) {
+		t.Fatalf("MaxPair did not remain limited to strategy jobs: %+v", output.Policies[0])
+	}
+}
+
+func TestInspectFrameworkPairScoresMirrorSubMinuteShortCircuit(t *testing.T) {
+	const strategyName = "runtime_plan_framework_subminute_fixture"
+	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"30s", "1h"}}
+	}
+	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	output, err := Inspect(validRequest(t, strategyName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, requirement := range output.Requirements {
+		if requirement.PolicyID == "__framework__" && requirement.Reason == "pair_score" {
+			t.Fatalf("sub-minute score path must not require K-lines: %+v", requirement)
 		}
 	}
 }
@@ -269,7 +400,7 @@ func TestInspectPreservesSelectionOrderAndAppliesMaxPairBeforeCoverage(t *testin
 		t.Fatalf("MaxPair/order not preserved: %+v", policy)
 	}
 	for _, requirement := range output.Requirements {
-		if requirement.JobSymbol != "ETH/USDT:USDT" {
+		if requirement.PolicyID != "__framework__" && requirement.JobSymbol != "ETH/USDT:USDT" {
 			t.Fatalf("requirement escaped MaxPair cutoff: %+v", requirement)
 		}
 	}

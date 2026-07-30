@@ -261,6 +261,12 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 			plan.Unsupported = append(plan.Unsupported, unsupported("symbol_outside_snapshot", "", symbol, "", "initial symbol is outside the configured frozen market"))
 		}
 	}
+	frameworkPairListSymbols := slices.Clone(req.InitialSymbols)
+	for _, policy := range config.RunPolicy {
+		frameworkPairListSymbols = append(frameworkPairListSymbols, policy.Pairs...)
+	}
+	frameworkPairListSymbols = stableUniqueStrings(frameworkPairListSymbols)
+	frameworkPairScoreSymbols := slices.Clone(frameworkPairListSymbols)
 
 	for _, policy := range config.RunPolicy {
 		policyID := policy.ID()
@@ -296,9 +302,14 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 				plan.Unsupported = append(plan.Unsupported, unsupported("invalid_symbol", policyID, symbol, "", "selected symbol must be a non-empty canonical string"))
 				continue
 			}
+			if universe[symbolKey(cfg.Exchange.Name, cfg.MarketType, symbol)] == nil {
+				plan.Unsupported = append(plan.Unsupported, unsupported("symbol_outside_snapshot", policyID, symbol, "", "selected symbol is outside the configured frozen market"))
+				continue
+			}
 			validSelected = append(validSelected, symbol)
 		}
 		selected = validSelected
+		frameworkPairScoreSymbols = append(frameworkPairScoreSymbols, selected...)
 		maxPair, maxPairErr := effectivePolicyMaxPair(policy, cfg)
 		if maxPairErr != "" {
 			plan.Unsupported = append(plan.Unsupported, unsupported("invalid_max_pair", policyID, "", "", maxPairErr))
@@ -359,8 +370,68 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 		}
 		plan.Policies = append(plan.Policies, PolicyV1{PolicyID: policyID, SelectedSymbols: selected, CoverageSymbols: coverage, AllowedRunTimeframes: allowed})
 	}
+	collectFrameworkRequirements(&plan, cfg, universe, frameworkPairListSymbols,
+		stableUniqueStrings(frameworkPairScoreSymbols))
 	canonicalizePlan(&plan)
 	return plan
+}
+
+func collectFrameworkRequirements(plan *SemanticPlanV1, cfg *config.Config, universe map[string]*orm.ExSymbol,
+	pairListSymbols, pairScoreSymbols []string,
+) {
+	const (
+		frameworkPolicyID = "__framework__"
+		staticPairTF      = "1h" // goods.RefreshPairList reads one bar for explicit pairs.
+		pairScoreBars     = 600  // strat.CalcPairTfScores scores every allowed timeframe.
+	)
+	if cfg.PairMgr != nil && cfg.PairMgr.ForceFilters && len(cfg.PairFilters) > 1 {
+		plan.Unsupported = append(plan.Unsupported, unsupported("forced_pair_filters_require_runtime_data",
+			frameworkPolicyID, "", "", "forced pair filters cannot be inspected without runtime market data"))
+		return
+	}
+	scoreTimeframes := slices.Clone(cfg.RunTimeframes)
+	for _, policy := range plan.Policies {
+		scoreTimeframes = append(scoreTimeframes, policy.AllowedRunTimeframes...)
+	}
+	scoreTimeframes = canonicalizedStrings(scoreTimeframes)
+	for _, symbol := range pairListSymbols {
+		target := universe[symbolKey(cfg.Exchange.Name, cfg.MarketType, symbol)]
+		if target == nil {
+			plan.Unsupported = append(plan.Unsupported, unsupported("symbol_outside_snapshot", frameworkPolicyID,
+				symbol, "", "framework pair-list symbol is outside the configured frozen market"))
+			continue
+		}
+		addRequirement(plan, RequirementV1{
+			PolicyID: frameworkPolicyID, JobExchange: target.Exchange, JobMarket: target.Market,
+			JobSymbol: symbol, JobTimeframe: staticPairTF, Source: orm.SeriesSourceKline,
+			TargetExchange: target.Exchange, TargetMarket: target.Market, TargetSymbol: symbol,
+			Timeframe: staticPairTF, WarmupBars: 1, Fields: orm.DefaultKlineFields(),
+			SeriesFields: []string{}, Reason: "pair_list",
+		})
+	}
+	for _, timeframe := range scoreTimeframes {
+		seconds, err := utils2.TFToSecSafe(timeframe)
+		if err == nil && seconds < 60 {
+			return
+		}
+	}
+	for _, symbol := range pairScoreSymbols {
+		target := universe[symbolKey(cfg.Exchange.Name, cfg.MarketType, symbol)]
+		if target == nil {
+			plan.Unsupported = append(plan.Unsupported, unsupported("symbol_outside_snapshot", frameworkPolicyID,
+				symbol, "", "framework pair-score symbol is outside the configured frozen market"))
+			continue
+		}
+		for _, timeframe := range scoreTimeframes {
+			addRequirement(plan, RequirementV1{
+				PolicyID: frameworkPolicyID, JobExchange: target.Exchange, JobMarket: target.Market,
+				JobSymbol: symbol, JobTimeframe: timeframe, Source: orm.SeriesSourceKline,
+				TargetExchange: target.Exchange, TargetMarket: target.Market, TargetSymbol: symbol,
+				Timeframe: timeframe, WarmupBars: pairScoreBars, Fields: orm.DefaultKlineFields(),
+				SeriesFields: []string{}, Reason: "pair_score",
+			})
+		}
+	}
 }
 
 func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, envs map[string]*ta.BarEnv,
