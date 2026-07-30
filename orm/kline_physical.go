@@ -196,7 +196,7 @@ type physicalKlineBounds struct {
 func physicalKlineCoverageBounds(startMS, stopMS, listMS, delistMS, consumerStepMS,
 	consumerOffsetMS, storageStepMS, storageOffsetMS int64,
 ) physicalKlineBounds {
-	consumerStart := alignPhysicalKlineFloor(startMS, consumerStepMS, consumerOffsetMS)
+	consumerStart := alignPhysicalKlineCeil(startMS, consumerStepMS, consumerOffsetMS)
 	if listMS > consumerStart {
 		consumerStart = alignPhysicalKlineCeil(listMS, consumerStepMS, consumerOffsetMS)
 	}
@@ -278,7 +278,8 @@ func (q *Queries) inspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbo
 	}
 	consumerStepMS := int64(utils2.TFToSecs(requestedTF) * 1000)
 	storageStepMS := int64(utils2.TFToSecs(storageTF) * 1000)
-	consumerOffsetMS := GetAlignOff(exs.ID, consumerStepMS)
+	_, consumerOffsetSecs := utils2.GetTfAlignOrigin(int(consumerStepMS / 1000))
+	consumerOffsetMS := int64(consumerOffsetSecs * 1000)
 	storageOffsetMS := GetAlignOff(exs.ID, storageStepMS)
 	requestedStart, requestedStop := startMS, stopMS
 	bounds := physicalKlineCoverageBounds(startMS, stopMS, exs.ListMs, exs.DelistMs,

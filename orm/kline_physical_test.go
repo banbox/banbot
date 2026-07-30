@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	utils2 "github.com/banbox/banexg/utils"
 )
 
 func TestPhysicalKlineStorageUsesActualTable(t *testing.T) {
@@ -115,14 +117,38 @@ func TestPhysicalKlineCollectorDataHashDetectsOHLCVChanges(t *testing.T) {
 	}
 }
 
-func TestPhysicalKlineAlignmentIncludesConsumerSourcePrefix(t *testing.T) {
+func TestPhysicalKlineAlignmentStartsAtFirstConsumableBucket(t *testing.T) {
 	const hour = int64(3_600_000)
 	bounds := physicalKlineCoverageBounds(hour, 12*hour, 0, 0, 4*hour, 0, hour, 0)
-	if bounds.consumerStart != 0 || bounds.storageStart != 0 {
-		t.Fatalf("4h bounds=%#v, want consumer/storage start 0", bounds)
+	if bounds.consumerStart != 4*hour || bounds.storageStart != 4*hour {
+		t.Fatalf("4h bounds=%#v, want consumer/storage start 4h", bounds)
 	}
 	if got := alignPhysicalKlineCeil(10*hour+1, 4*hour, 0); got != 12*hour {
 		t.Fatalf("4h ceil=%d, want %d", got, 12*hour)
+	}
+}
+
+func TestPhysicalKlineBoundsUseCanonicalLongTimeframeOrigin(t *testing.T) {
+	const (
+		day           = int64(24 * 60 * 60 * 1000)
+		consumerStart = int64(1662620400000)
+		storageStart  = int64(1662681600000)
+		stop          = int64(1753142400000)
+	)
+	month := int64(utils2.TFToSecs("1M") * 1000)
+	_, monthOffsetSecs := utils2.GetTfAlignOrigin(int(month / 1000))
+	bounds := physicalKlineCoverageBounds(consumerStart, stop, consumerStart, 0,
+		month, int64(monthOffsetSecs*1000), day, 0)
+	if bounds.consumerStart != 1664150400000 || bounds.consumerStart <= storageStart {
+		t.Fatalf("monthly bounds=%#v", bounds)
+	}
+
+	week := int64(utils2.TFToSecs("1w") * 1000)
+	_, weekOffsetSecs := utils2.GetTfAlignOrigin(int(week / 1000))
+	bounds = physicalKlineCoverageBounds(5*day, 20*day, 0, 0,
+		week, int64(weekOffsetSecs*1000), day, 0)
+	if bounds.consumerStart != 11*day {
+		t.Fatalf("weekly bounds=%#v, want Monday-aligned day 11", bounds)
 	}
 }
 
