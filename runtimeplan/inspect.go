@@ -226,6 +226,7 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 		Policies: make([]PolicyV1, 0, len(config.RunPolicy)), Requirements: []RequirementV1{}, Unsupported: []UnsupportedV1{},
 	}
 	universe := make(map[string]*orm.ExSymbol, len(req.MarketUniverse))
+	envs := make(map[string]*ta.BarEnv)
 	for _, item := range req.MarketUniverse {
 		exs := orm.GetSymbolByID(item.SID)
 		universe[symbolKey(item.Exchange, item.Market, item.Symbol)] = exs
@@ -320,7 +321,7 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 					continue
 				}
 				allowedSet[tf] = true
-				collectJob(&plan, universe, policyID, jobStrategy, jobSymbol, tf)
+				collectJob(&plan, universe, envs, policyID, jobStrategy, jobSymbol, tf)
 			}
 		}
 		allowed := make([]string, 0, len(allowedSet))
@@ -337,12 +338,14 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 	return plan
 }
 
-func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, policyID string, strategy *strat.TradeStrat, symbol *orm.ExSymbol, tf string) {
+func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, envs map[string]*ta.BarEnv,
+	policyID string, strategy *strat.TradeStrat, symbol *orm.ExSymbol, tf string,
+) {
 	if _, err := utils2.TFToSecSafe(tf); err != nil {
 		plan.Unsupported = append(plan.Unsupported, unsupported("invalid_timeframe", policyID, symbol.Symbol, tf, err.Error()))
 		return
 	}
-	env, err := ta.NewBarEnv(symbol.Exchange, symbol.Market, symbol.Symbol, tf)
+	env, err := inspectionBarEnv(envs, symbol, tf)
 	if err != nil {
 		plan.Unsupported = append(plan.Unsupported, unsupported("invalid_timeframe", policyID, symbol.Symbol, tf, err.Error()))
 		return
@@ -439,6 +442,21 @@ func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, policyI
 			}
 		}
 	}
+}
+
+func inspectionBarEnv(envs map[string]*ta.BarEnv, symbol *orm.ExSymbol, tf string) (*ta.BarEnv, error) {
+	key := strings.Join([]string{symbol.Symbol, tf}, "_")
+	if env := envs[key]; env != nil {
+		return env, nil
+	}
+	env, err := ta.NewBarEnv(core.ExgName, core.Market, symbol.Symbol, tf)
+	if err != nil {
+		return nil, err
+	}
+	env.MaxCache = core.NumTaCache
+	env.Data.Store("sid", int64(symbol.ID))
+	envs[key] = env
+	return env, nil
 }
 
 func inspectionOrderEffect(job *strat.StratJob, effects []string, callback string) string {

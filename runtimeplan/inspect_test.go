@@ -10,12 +10,21 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
+	ta "github.com/banbox/banta"
 )
 
 func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 	const strategyName = "runtime_plan_fixture"
 	startupCalls := 0
 	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		readSID := func(job *strat.StratJob) int64 {
+			value, ok := job.Env.Data.Load("sid")
+			sid, typed := value.(int64)
+			if !ok || !typed || sid <= 0 {
+				t.Fatalf("callback did not receive physical sid: value=%v ok=%v", value, ok)
+			}
+			return sid
+		}
 		return &strat.TradeStrat{
 			WarmupNum:     12,
 			RunTimeFrames: []string{"5m", "1h", "5m"},
@@ -28,19 +37,28 @@ func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 					t.Fatalf("inspection job did not match real OnStartUp initial state: %+v", job)
 				}
 				startupCalls++
-				job.TPMaxs[1] = 1
+				job.TPMaxs[readSID(job)] = 1
 			},
 			OnPairInfos: func(job *strat.StratJob) []*strat.PairSub {
-				if job.TPMaxs[1] != 1 {
+				sid := readSID(job)
+				if job.TPMaxs[sid] != 1 {
 					t.Fatalf("OnPairInfos ran before OnStartUp")
 				}
-				return []*strat.PairSub{{Pair: "ETH/USDT:USDT", TimeFrame: "15m", WarmupNum: 20}}
+				if sid == 1 {
+					return []*strat.PairSub{{Pair: "ETH/USDT:USDT", TimeFrame: "15m", WarmupNum: 20}}
+				}
+				return []*strat.PairSub{{Pair: "BTC/USDT:USDT", TimeFrame: "30m", WarmupNum: 21}}
 			},
 			OnDataSubs: func(job *strat.StratJob) []*strat.DataSub {
-				if job.TPMaxs[1] != 1 {
+				sid := readSID(job)
+				if job.TPMaxs[sid] != 1 {
 					t.Fatalf("OnDataSubs ran before OnStartUp")
 				}
-				return []*strat.DataSub{{Source: "", TimeFrame: "1d", WarmupNum: 3, Fields: []string{"close", "close"}, SeriesFields: []string{"close"}}}
+				tf := "1d"
+				if sid == 2 {
+					tf = "4h"
+				}
+				return []*strat.DataSub{{Source: "", TimeFrame: tf, WarmupNum: 3, Fields: []string{"close", "close"}, SeriesFields: []string{"close"}}}
 			},
 		}
 	}
@@ -89,6 +107,30 @@ func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 		if requirement.Reason != "primary" && requirement.Reason != "pair_info" && requirement.Reason != "data_sub" {
 			t.Fatalf("unexpected requirement reason: %s", requirement.Reason)
 		}
+	}
+}
+
+func TestInspectionBarEnvMatchesRuntimeSIDAndReuse(t *testing.T) {
+	envs := make(map[string]*ta.BarEnv)
+	symbol := &orm.ExSymbol{ID: 42, Exchange: "binance", Market: "linear", Symbol: "BTC/USDT:USDT"}
+	oldExchange, oldMarket := core.ExgName, core.Market
+	core.ExgName, core.Market = symbol.Exchange, symbol.Market
+	defer func() { core.ExgName, core.Market = oldExchange, oldMarket }()
+
+	first, err := inspectionBarEnv(envs, symbol, "1h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := inspectionBarEnv(envs, symbol, "1h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second || len(envs) != 1 {
+		t.Fatalf("symbol/timeframe environment was not reused: first=%p second=%p count=%d", first, second, len(envs))
+	}
+	value, ok := first.Data.Load("sid")
+	if !ok || value != int64(symbol.ID) || first.MaxCache != core.NumTaCache {
+		t.Fatalf("runtime environment metadata mismatch: sid=%v ok=%v max_cache=%d", value, ok, first.MaxCache)
 	}
 }
 
