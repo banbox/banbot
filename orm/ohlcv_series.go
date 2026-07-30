@@ -242,7 +242,19 @@ func (q *Queries) querySeriesFieldsRaw(exs *ExSymbol, timeframe string, fields [
 			finishEndMS = unFinishMS
 		}
 	}
-	rows, subTF, err := q.querySeriesRows(exs, timeframe, fields, startMs, finishEndMS, limit, revRead)
+	physicalStart, physicalStop, physicalBound, coverageErr := historicalPhysicalCoverageBounds(
+		historicalCoverageForQuery(exs.Symbol), exs.Symbol, timeframe, startMs, finishEndMS)
+	if coverageErr != nil {
+		return nil, coverageErr
+	}
+	if physicalBound {
+		if physicalStop <= physicalStart {
+			return nil, nil
+		}
+		startMs, finishEndMS = physicalStart, physicalStop
+	}
+	rows, subTF, err := q.querySeriesRows(exs, timeframe, fields, startMs, finishEndMS, limit,
+		revRead, physicalBound)
 	if err != nil {
 		return nil, err
 	}
@@ -525,9 +537,12 @@ func (q *Queries) getAdjSeriesFields(adjs []*AdjInfo, timeFrame string, fields [
 	return result, nil
 }
 
-func (q *Queries) querySeriesRows(exs *ExSymbol, timeframe string, fields []string, startMs, finishEndMS int64, limit int, revRead bool) ([]*DataSeries, string, *errs.Error) {
+func (q *Queries) querySeriesRows(exs *ExSymbol, timeframe string, fields []string, startMs, finishEndMS int64,
+	limit int, revRead, boundedReverse bool,
+) ([]*DataSeries, string, *errs.Error) {
 	if !IsQuestDB {
-		rows, subTF, err := q.querySeriesPg(exs, timeframe, fields, startMs, finishEndMS, limit, revRead)
+		rows, subTF, err := q.querySeriesPg(exs, timeframe, fields, startMs, finishEndMS, limit,
+			revRead, boundedReverse)
 		if err != nil {
 			return nil, "", NewDbErr(core.ErrDbReadFail, err)
 		}
@@ -536,10 +551,14 @@ func (q *Queries) querySeriesRows(exs *ExSymbol, timeframe string, fields []stri
 	projection := klineSelectProjection(fields, false)
 	var sql string
 	if revRead {
+		lowerBound := ""
+		if boundedReverse {
+			lowerBound = fmt.Sprintf(" and ts >= cast(%v as timestamp)", startMs*1000)
+		}
 		sql = fmt.Sprintf(`
 select cast(ts as long)/1000,%s from $tbl
-where sid=%d and ts < cast(%v as timestamp)
-order by ts desc`, projection, exs.ID, finishEndMS*1000)
+where sid=%d%s and ts < cast(%v as timestamp)
+order by ts desc`, projection, exs.ID, lowerBound, finishEndMS*1000)
 	} else {
 		if limit == 0 {
 			tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
@@ -558,7 +577,9 @@ order by ts`, projection, exs.ID, startMs*1000, finishEndMS*1000)
 	return rows, subTF, nil
 }
 
-func (q *Queries) querySeriesPg(exs *ExSymbol, timeframe string, fields []string, startMs, endMs int64, limit int, revRead bool) ([]*DataSeries, string, error) {
+func (q *Queries) querySeriesPg(exs *ExSymbol, timeframe string, fields []string, startMs, endMs int64,
+	limit int, revRead, boundedReverse bool,
+) ([]*DataSeries, string, error) {
 	tblName, subTF, rate := resolveTablePg(timeframe)
 	if limit > 0 && subTF != "" && rate > 1 {
 		limit = rate * (limit + 1)
@@ -566,9 +587,13 @@ func (q *Queries) querySeriesPg(exs *ExSymbol, timeframe string, fields []string
 	projection := klineSelectProjection(fields, false)
 	var sql string
 	if revRead {
+		timeFilter := fmt.Sprintf("time < %d", endMs)
+		if boundedReverse {
+			timeFilter = buildPgTimeFilter(startMs, endMs)
+		}
 		sql = fmt.Sprintf(`SELECT time,%s FROM %s
-	WHERE sid=%d AND time < %d
-	ORDER BY time DESC`, projection, tblName, exs.ID, endMs)
+	WHERE sid=%d AND %s
+	ORDER BY time DESC`, projection, tblName, exs.ID, timeFilter)
 	} else {
 		sql = fmt.Sprintf(`SELECT time,%s FROM %s
 	WHERE sid=%d AND %s

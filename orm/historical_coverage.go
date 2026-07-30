@@ -98,6 +98,31 @@ func historicalCoverageHasTimeframe(coverage *config.HistoricalCoverageConfig, s
 	return exists
 }
 
+func historicalPhysicalCoverageBounds(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
+	startMS, endMS int64,
+) (int64, int64, bool, *errs.Error) {
+	if coverage == nil {
+		return startMS, endMS, false, nil
+	}
+	storageTF, err := PhysicalKlineStorageTimeframe(timeframe)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if storageTF == timeframe {
+		return startMS, endMS, false, nil
+	}
+	intervals := historicalCoverageIntervals(coverage, symbol, storageTF, startMS, endMS)
+	if len(intervals) == 0 {
+		return 0, 0, true, nil
+	}
+	if len(intervals) != 1 {
+		return 0, 0, true, errs.NewMsg(core.ErrBadConfig,
+			"derived historical coverage requires one contiguous physical range for %s %s via %s",
+			symbol, timeframe, storageTF)
+	}
+	return intervals[0].StartMS, intervals[0].StopMS, true, nil
+}
+
 func readHistoricalCoverageSeries(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
 	startMS, endMS int64, limit int, withUnFinish bool, read seriesFieldsReader,
 ) ([]*AdjInfo, []*DataSeries, *errs.Error) {

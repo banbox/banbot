@@ -12,6 +12,62 @@ import (
 	"github.com/banbox/banexg/errs"
 )
 
+func TestDerivedHistoricalCoverageConsumesOnlyAuditedPhysicalPrefix(t *testing.T) {
+	const hour = int64(60 * 60 * 1000)
+	const bucketStart = int64(1_699_977_600_000)
+	symbol := "BTC/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: bucketStart + 8*hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"4h": {{StartMS: bucketStart, StopMS: bucketStart + 8*hour}},
+				"1h": {{StartMS: bucketStart + hour, StopMS: bucketStart + 8*hour}},
+			},
+		},
+	}
+	startMS, stopMS, constrained, err := historicalPhysicalCoverageBounds(
+		coverage, symbol, "4h", bucketStart, bucketStart+8*hour)
+	if err != nil || !constrained || startMS != bucketStart+hour || stopMS != bucketStart+8*hour {
+		t.Fatalf("physical bounds=%d:%d constrained=%v err=%v", startMS, stopMS, constrained, err)
+	}
+	exs := &ExSymbol{ID: 7, Symbol: symbol}
+	raw := make([]*DataSeries, 0, 8)
+	for index := int64(0); index < 8; index++ {
+		raw = append(raw, NewDataSeriesFromKline(exs, "1h", &banexg.Kline{
+			Time: bucketStart + index*hour, Open: float64(index + 16), High: float64(index + 16),
+			Low: float64(index + 16), Close: float64(index + 16), Volume: 1,
+		}, nil, false, true))
+	}
+	raw = slices.DeleteFunc(raw, func(row *DataSeries) bool {
+		return row.TimeMS < startMS || row.TimeMS >= stopMS
+	})
+	rows, done, resampleErr := ResampleDataSeries(exs, "4h", raw, nil, 4*hour, 0, hour, 0, false)
+	if resampleErr != nil || !done || len(rows) != 2 {
+		t.Fatalf("resample rows=%v done=%v err=%v", seriesTimes(rows), done, resampleErr)
+	}
+	first, valueErr := rows[0].OHLCV(exs)
+	if valueErr != nil || rows[0].TimeMS != bucketStart || first.Open != 17 || first.Volume != 3 {
+		t.Fatalf("partial first bucket time=%d values=%+v err=%v", rows[0].TimeMS, first, valueErr)
+	}
+}
+
+func TestDerivedHistoricalCoverageRejectsSegmentedPhysicalAuthority(t *testing.T) {
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 1000,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			"BTC/USDT:USDT": {
+				"4h": {{StartMS: 100, StopMS: 1000}},
+				"1h": {{StartMS: 100, StopMS: 400}, {StartMS: 500, StopMS: 1000}},
+			},
+		},
+	}
+	_, _, constrained, err := historicalPhysicalCoverageBounds(
+		coverage, "BTC/USDT:USDT", "4h", 100, 1000)
+	if !constrained || err == nil || !strings.Contains(err.Error(), "one contiguous physical range") {
+		t.Fatalf("constrained=%v err=%v", constrained, err)
+	}
+}
+
 func TestHistoricalCoverageReverseReadBackfillsAllowedRows(t *testing.T) {
 	coverage := &config.HistoricalCoverageConfig{
 		BaselineEndMS: 1000,
