@@ -81,15 +81,14 @@ func Inspect(req *RequestV1) (*OutputV1, error) {
 	config.DataDir = tmpDir
 
 	semantic := collectSemanticPlan(req, cfg)
-	semanticBytes, err := json.Marshal(semantic)
-	if err != nil {
-		return nil, fmt.Errorf("marshal semantic runtime data plan: %w", err)
-	}
 	output := &OutputV1{
 		Version: Version, RequestSHA256: requestHash, SelectionMode: semantic.SelectionMode,
 		InitialSymbols: semantic.InitialSymbols, Policies: semantic.Policies,
 		Requirements: semantic.Requirements, Unsupported: semantic.Unsupported,
-		SemanticPlanSHA256: domainHash(semanticHashDomain, semanticBytes),
+	}
+	output.SemanticPlanSHA256, err = SemanticPlanSHA256(semantic)
+	if err != nil {
+		return nil, err
 	}
 	if len(output.Unsupported) > 0 {
 		return output, fmt.Errorf("runtime data plan contains %d unsupported item(s)", len(output.Unsupported))
@@ -103,6 +102,26 @@ func MarshalOutput(output *OutputV1) ([]byte, error) {
 		return nil, fmt.Errorf("marshal runtime data plan output: %w", err)
 	}
 	return data, nil
+}
+
+// RequestSHA256 returns the canonical versioned digest of a runtime plan request.
+func RequestSHA256(request RequestV1) (string, error) {
+	return hashJSON(requestHashDomain, request)
+}
+
+// SemanticPlanSHA256 returns the canonical versioned digest of a semantic runtime plan.
+func SemanticPlanSHA256(plan SemanticPlanV1) (string, error) {
+	return hashJSON(semanticHashDomain, plan)
+}
+
+// MarketUniverseSHA256 returns the canonical versioned digest of a market universe.
+func MarketUniverseSHA256(markets []MarketSymbolV1) (string, error) {
+	return hashJSON(universeHashDomain, markets)
+}
+
+// InputPairsSHA256 returns the canonical versioned digest of the ordered input symbols.
+func InputPairsSHA256(symbols []string) (string, error) {
+	return hashJSON(pairsHashDomain, symbols)
 }
 
 func validateRequest(req *RequestV1) (string, *config.Config, error) {
@@ -145,15 +164,21 @@ func validateRequest(req *RequestV1) (string, *config.Config, error) {
 	if req.MarketUniverse == nil || !canonicalUniverse(req.MarketUniverse) {
 		return "", nil, fmt.Errorf("market_universe must be sorted, unique, and valid")
 	}
-	universeJSON, _ := json.Marshal(req.MarketUniverse)
-	if domainHash(universeHashDomain, universeJSON) != req.MarketUniverseSHA256 {
+	universeHash, err := MarketUniverseSHA256(req.MarketUniverse)
+	if err != nil {
+		return "", nil, fmt.Errorf("hash market_universe: %w", err)
+	}
+	if universeHash != req.MarketUniverseSHA256 {
 		return "", nil, fmt.Errorf("market_universe_sha256 mismatch")
 	}
-	if req.InitialSymbols == nil || !canonicalStrings(req.InitialSymbols) {
-		return "", nil, fmt.Errorf("initial_symbols must be sorted and unique")
+	if req.InitialSymbols == nil || !orderedUniqueStrings(req.InitialSymbols) {
+		return "", nil, fmt.Errorf("initial_symbols must be ordered, unique, and valid")
 	}
-	pairsJSON, _ := json.Marshal(req.InitialSymbols)
-	if domainHash(pairsHashDomain, pairsJSON) != req.InputPairsSHA256 {
+	pairsHash, err := InputPairsSHA256(req.InitialSymbols)
+	if err != nil {
+		return "", nil, fmt.Errorf("hash initial_symbols: %w", err)
+	}
+	if pairsHash != req.InputPairsSHA256 {
 		return "", nil, fmt.Errorf("input_pairs_sha256 mismatch")
 	}
 	var cfg config.Config
@@ -166,11 +191,11 @@ func validateRequest(req *RequestV1) (string, *config.Config, error) {
 	if len(cfg.RunPolicy) == 0 {
 		return "", nil, fmt.Errorf("config_yaml run_policy is required")
 	}
-	requestJSON, err := json.Marshal(req)
+	requestHash, err := RequestSHA256(*req)
 	if err != nil {
-		return "", nil, fmt.Errorf("marshal runtime data plan request: %w", err)
+		return "", nil, fmt.Errorf("hash runtime data plan request: %w", err)
 	}
-	return domainHash(requestHashDomain, requestJSON), &cfg, nil
+	return requestHash, &cfg, nil
 }
 
 func installRuntimeConfig(req *RequestV1, cfg *config.Config) (func(), error) {
@@ -662,11 +687,13 @@ func compareMarketSymbols(a, b MarketSymbolV1) int {
 	return cmp.Compare(a.SID, b.SID)
 }
 
-func canonicalStrings(items []string) bool {
-	for i, item := range items {
-		if item == "" || strings.TrimSpace(item) != item || i > 0 && items[i-1] >= item {
+func orderedUniqueStrings(items []string) bool {
+	seen := make(map[string]bool, len(items))
+	for _, item := range items {
+		if item == "" || strings.TrimSpace(item) != item || seen[item] {
 			return false
 		}
+		seen[item] = true
 	}
 	return true
 }
@@ -748,4 +775,12 @@ func domainHash(domain string, data []byte) string {
 	_, _ = hash.Write([]byte(domain))
 	_, _ = hash.Write(data)
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func hashJSON(domain string, value any) (string, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	return domainHash(domain, data), nil
 }

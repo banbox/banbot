@@ -1,7 +1,6 @@
 package runtimeplan
 
 import (
-	"encoding/json"
 	"slices"
 	"strings"
 	"testing"
@@ -292,6 +291,29 @@ func TestInspectPreservesSelectionOrderAndAppliesMaxPairBeforeCoverage(t *testin
 	}
 }
 
+func TestInspectPreservesInitialSymbolOrderBeforeMaxPair(t *testing.T) {
+	const strategyName = "runtime_plan_initial_order_fixture"
+	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}}
+	}
+	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	req := validRequest(t, strategyName)
+	req.InitialSymbols = []string{"ETH/USDT:USDT", "BTC/USDT:USDT"}
+	req.InputPairsSHA256, _ = InputPairsSHA256(req.InitialSymbols)
+	req.ConfigYAML = strings.Replace(req.ConfigYAML, "  - name: "+strategyName+"\n",
+		"  - name: "+strategyName+"\n    max_pair: 1\n", 1)
+	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
+
+	output, err := Inspect(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(output.InitialSymbols, req.InitialSymbols) ||
+		!slices.Equal(output.Policies[0].SelectedSymbols, []string{"ETH/USDT:USDT"}) {
+		t.Fatalf("initial order was not preserved before MaxPair: %+v", output)
+	}
+}
+
 func TestInspectRecordsOrderAPICallsWithRealStartupState(t *testing.T) {
 	const strategyName = "runtime_plan_order_effect_fixture"
 	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
@@ -351,9 +373,61 @@ func TestDecodeAndValidateRequestRejectAmbiguousInput(t *testing.T) {
 		t.Fatal("trailing JSON value was accepted")
 	}
 	req := validRequest(t, "missing_strategy_is_validated_after_hashes")
-	req.InitialSymbols = []string{"ETH/USDT:USDT", "BTC/USDT:USDT"}
+	req.InitialSymbols = []string{"BTC/USDT:USDT", "BTC/USDT:USDT"}
 	if _, _, err := validateRequest(req); err == nil || !strings.Contains(err.Error(), "initial_symbols") {
-		t.Fatalf("noncanonical initial_symbols error = %v", err)
+		t.Fatalf("duplicate initial_symbols error = %v", err)
+	}
+}
+
+func TestCanonicalHashAPICompatibility(t *testing.T) {
+	request := RequestV1{Version: Version, CompileKey: "fixture", InitialSymbols: []string{"ETH", "BTC"}}
+	semantic := SemanticPlanV1{Version: Version, SelectionMode: SelectionMode,
+		InitialSymbols: []string{"ETH", "BTC"}, Policies: []PolicyV1{}, Requirements: []RequirementV1{}, Unsupported: []UnsupportedV1{}}
+	markets := []MarketSymbolV1{{SID: 7, Exchange: "binance", Market: "linear", Symbol: "ETH/USDT:USDT", ListMS: 123}}
+
+	requestHash, err := RequestSHA256(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	semanticHash, err := SemanticPlanSHA256(semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	universeHash, err := MarketUniverseSHA256(markets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairsHash, err := InputPairsSHA256(request.InitialSymbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{
+		"request": requestHash, "semantic": semanticHash, "universe": universeHash, "pairs": pairsHash,
+	}
+	want := map[string]string{
+		"request":  "c9e19e2dedac2793b5a74b67afbcdb8590c9b4012b46f3f7d89d3fb490173a6b",
+		"semantic": "cdc42a1795298234ec06fa8c1dff06e2c2346f33c472b86fa493e4e14d72cc73",
+		"universe": "47b53877ce5f71bc9dd4cfbf0687567f2085546419aaa3c0e7639d949812f02c",
+		"pairs":    "594f0ab4dc2bd3f0ba61e386e73605da320b94c402a6c47651d22af2a8e1042b",
+	}
+	for name, hash := range got {
+		if hash != want[name] {
+			t.Errorf("%s hash = %s, want %s", name, hash, want[name])
+		}
+	}
+
+	reversed := request
+	reversed.InitialSymbols = []string{"BTC", "ETH"}
+	reversedRequestHash, err := RequestSHA256(reversed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reversedPairsHash, err := InputPairsSHA256(reversed.InitialSymbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reversedRequestHash == requestHash || reversedPairsHash == pairsHash {
+		t.Fatal("canonical hashes did not bind input pair order")
 	}
 }
 
@@ -368,8 +442,6 @@ func validRequest(t *testing.T, strategyName string) *RequestV1 {
 		{SID: 2, Exchange: "binance", Market: "linear", Symbol: "ETH/USDT:USDT", ListMS: 1_600_000_000_000},
 	}
 	initial := []string{"BTC/USDT:USDT", "ETH/USDT:USDT"}
-	universeJSON, _ := json.Marshal(universe)
-	initialJSON, _ := json.Marshal(initial)
 	hash := strings.Repeat("a", 64)
 	return &RequestV1{
 		Version: Version, CompileKey: hash, CompileBaseName: "fixture", CompileVersion: "v1",
@@ -377,8 +449,26 @@ func validRequest(t *testing.T, strategyName string) *RequestV1 {
 		CompiledBinarySHA256: hash, BanbotCommit: strings.Repeat("b", 40), BanbotSourceManifestSHA256: hash,
 		ConfigYAML: configYAML, ConfigSHA256: rawHash([]byte(configYAML)), ConfigSemanticSHA256: hash,
 		MarketSnapshotIdentity: "fixture-snapshot", MarketSnapshotSHA256: hash,
-		MarketUniverseSHA256: domainHash(universeHashDomain, universeJSON), MarketUniverse: universe,
-		InitialSymbols: initial, InputPairsSHA256: domainHash(pairsHashDomain, initialJSON),
+		MarketUniverseSHA256: mustMarketUniverseSHA256(t, universe), MarketUniverse: universe,
+		InitialSymbols: initial, InputPairsSHA256: mustInputPairsSHA256(t, initial),
 		TimeStartMS: 1_700_000_000_000, TimeEndMS: 1_710_000_000_000,
 	}
+}
+
+func mustMarketUniverseSHA256(t *testing.T, markets []MarketSymbolV1) string {
+	t.Helper()
+	hash, err := MarketUniverseSHA256(markets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash
+}
+
+func mustInputPairsSHA256(t *testing.T, symbols []string) string {
+	t.Helper()
+	hash, err := InputPairsSHA256(symbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash
 }
