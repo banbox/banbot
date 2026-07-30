@@ -220,17 +220,27 @@ func (q *Queries) QuerySeriesFields(exs *ExSymbol, timeframe string, fields []st
 		return q.querySeriesFieldsRaw(exs, timeframe, fields, startMs, endMs, limit, withUnFinish)
 	}
 	_, rows, err := readHistoricalCoverageSeries(coverage, exs.Symbol, timeframe, startMs, endMs, limit, withUnFinish,
-		func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-			rows, readErr := q.querySeriesFieldsRaw(exs, timeframe, fields, readStartMS, readEndMS, readLimit, readWithUnFinish)
+		func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish,
+			reverse bool,
+		) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+			rows, readErr := q.querySeriesFieldsRawMode(exs, timeframe, fields, readStartMS, readEndMS,
+				readLimit, readWithUnFinish, reverse)
 			return nil, rows, readErr
 		})
 	return rows, err
 }
 
 func (q *Queries) querySeriesFieldsRaw(exs *ExSymbol, timeframe string, fields []string, startMs, endMs int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error) {
+	return q.querySeriesFieldsRawMode(exs, timeframe, fields, startMs, endMs, limit, withUnFinish,
+		startMs == 0 && limit > 0)
+}
+
+func (q *Queries) querySeriesFieldsRawMode(exs *ExSymbol, timeframe string, fields []string,
+	startMs, endMs int64, limit int, withUnFinish, revRead bool,
+) ([]*DataSeries, *errs.Error) {
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
 	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
-	revRead := startMs == 0 && limit > 0
+	boundedReverse := revRead && startMs > 0
 	startMs, endMs = parseDownArgs(tfMSecs, startMs, endMs, limit, withUnFinish)
 	maxEndMs := endMs
 	finishEndMS := utils2.AlignTfMSecs(endMs, tfMSecs)
@@ -254,7 +264,7 @@ func (q *Queries) querySeriesFieldsRaw(exs *ExSymbol, timeframe string, fields [
 		startMs, finishEndMS = physicalStart, physicalStop
 	}
 	rows, subTF, err := q.querySeriesRows(exs, timeframe, fields, startMs, finishEndMS, limit,
-		revRead, physicalBound)
+		revRead, boundedReverse || physicalBound)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +292,8 @@ func (q *Queries) querySeriesFieldsRaw(exs *ExSymbol, timeframe string, fields [
 		}
 	}
 	if len(rows) == 0 && maxEndMs-endMs > tfMSecs {
-		return q.querySeriesFieldsRaw(exs, timeframe, fields, endMs, maxEndMs, limit, withUnFinish)
+		return q.querySeriesFieldsRawMode(exs, timeframe, fields, endMs, maxEndMs, limit,
+			withUnFinish, revRead)
 	} else if withUnFinish && len(rows) > 0 && rows[len(rows)-1].TimeMS+tfMSecs == unFinishMS {
 		unbar, _, _ := getUnFinish(q, exs.ID, timeframe, unFinishMS, unFinishMS+tfMSecs, "query")
 		if unbar != nil {
@@ -433,12 +444,19 @@ func (q *Queries) GetSeriesFields(exs *ExSymbol, timeFrame string, fields []stri
 		return q.getSeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
 	}
 	return readHistoricalCoverageSeries(coverage, exs.Symbol, timeFrame, startMS, endMS, limit, withUnFinish,
-		func(startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-			return q.getSeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
+		func(startMS, endMS int64, limit int, withUnFinish, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+			return q.getSeriesFieldsRawMode(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish, reverse)
 		})
 }
 
 func (q *Queries) getSeriesFieldsRaw(exs *ExSymbol, timeFrame string, fields []string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return q.getSeriesFieldsRawMode(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish,
+		startMS == 0 && limit > 0)
+}
+
+func (q *Queries) getSeriesFieldsRawMode(exs *ExSymbol, timeFrame string, fields []string,
+	startMS, endMS int64, limit int, withUnFinish, reverse bool,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 	if exs.Exchange == "china" && exs.Market != banexg.MarketSpot {
 		parts := utils2.SplitParts(exs.Symbol)
 		if len(parts) >= 2 && parts[1].Val == "888" {
@@ -446,15 +464,16 @@ func (q *Queries) getSeriesFieldsRaw(exs *ExSymbol, timeFrame string, fields []s
 			if err != nil {
 				return nil, nil, err
 			}
-			rows, err := q.getAdjSeriesFields(adjs, timeFrame, fields, startMS, endMS, limit, withUnFinish,
-				q.querySeriesFieldsRaw)
+			rows, err := q.getAdjSeriesFieldsMode(adjs, timeFrame, fields, startMS, endMS, limit,
+				withUnFinish, reverse, q.querySeriesFieldsRawMode)
 			if err != nil {
 				return nil, nil, err
 			}
 			return adjs, bindSeriesTarget(rows, exs), nil
 		}
 	}
-	rows, err := q.querySeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
+	rows, err := q.querySeriesFieldsRawMode(exs, timeFrame, fields, startMS, endMS, limit,
+		withUnFinish, reverse)
 	return nil, rows, err
 }
 
@@ -486,8 +505,27 @@ func (q *Queries) GetAdjSeriesFields(adjs []*AdjInfo, timeFrame string, fields [
 
 type querySeriesFieldsFunc func(*ExSymbol, string, []string, int64, int64, int, bool) ([]*DataSeries, *errs.Error)
 
+type querySeriesFieldsModeFunc func(*ExSymbol, string, []string, int64, int64, int, bool,
+	bool,
+) ([]*DataSeries, *errs.Error)
+
 func (q *Queries) getAdjSeriesFields(adjs []*AdjInfo, timeFrame string, fields []string, startMS, endMS int64,
 	limit int, withUnFinish bool, read querySeriesFieldsFunc,
+) ([]*DataSeries, *errs.Error) {
+	return q.getAdjSeriesFieldsMode(adjs, timeFrame, fields, startMS, endMS, limit, withUnFinish,
+		startMS == 0 && limit > 0,
+		func(exs *ExSymbol, timeframe string, fields []string, startMS, endMS int64, limit int,
+			withUnFinish, reverse bool,
+		) ([]*DataSeries, *errs.Error) {
+			if reverse {
+				startMS = 0
+			}
+			return read(exs, timeframe, fields, startMS, endMS, limit, withUnFinish)
+		})
+}
+
+func (q *Queries) getAdjSeriesFieldsMode(adjs []*AdjInfo, timeFrame string, fields []string,
+	startMS, endMS int64, limit int, withUnFinish, revRead bool, read querySeriesFieldsModeFunc,
 ) ([]*DataSeries, *errs.Error) {
 	if len(adjs) == 0 {
 		return nil, nil
@@ -495,7 +533,6 @@ func (q *Queries) getAdjSeriesFields(adjs []*AdjInfo, timeFrame string, fields [
 	if endMS == 0 {
 		endMS = btime.UTCStamp()
 	}
-	revRead := startMS == 0 && limit > 0
 	var result []*DataSeries
 	if revRead {
 		utils.ReverseArr(adjs)
@@ -507,10 +544,7 @@ func (q *Queries) getAdjSeriesFields(adjs []*AdjInfo, timeFrame string, fields [
 		}
 		start := max(f.StartMS, startMS)
 		stop := min(f.StopMS, endMS)
-		if revRead {
-			start = 0
-		}
-		rows, err := read(f.ExSymbol, timeFrame, fields, start, stop, limit, withUnFinish)
+		rows, err := read(f.ExSymbol, timeFrame, fields, start, stop, limit, withUnFinish, revRead)
 		if err != nil {
 			return nil, err
 		}

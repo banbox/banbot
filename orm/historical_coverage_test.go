@@ -52,7 +52,7 @@ func TestDerivedHistoricalCoverageConsumesOnlyAuditedPhysicalPrefix(t *testing.T
 	}
 }
 
-func TestDerivedHistoricalCoverageRejectsSegmentedPhysicalAuthority(t *testing.T) {
+func TestDerivedHistoricalCoverageSelectsExactlyOnePhysicalSegment(t *testing.T) {
 	coverage := &config.HistoricalCoverageConfig{
 		BaselineEndMS: 1000,
 		Bars: map[string]map[string][]config.HistoricalCoverageRange{
@@ -64,8 +64,70 @@ func TestDerivedHistoricalCoverageRejectsSegmentedPhysicalAuthority(t *testing.T
 	}
 	_, _, constrained, err := historicalPhysicalCoverageBounds(
 		coverage, "BTC/USDT:USDT", "4h", 100, 1000)
-	if !constrained || err == nil || !strings.Contains(err.Error(), "one contiguous physical range") {
+	if !constrained || err == nil || !strings.Contains(err.Error(), "exactly one matching continuous physical segment") {
 		t.Fatalf("constrained=%v err=%v", constrained, err)
+	}
+	start, stop, constrained, err := historicalPhysicalCoverageBounds(
+		coverage, "BTC/USDT:USDT", "4h", 100, 400)
+	if err != nil || !constrained || start != 100 || stop != 400 {
+		t.Fatalf("first physical segment=%d:%d constrained=%v err=%v", start, stop, constrained, err)
+	}
+	start, stop, constrained, err = historicalPhysicalCoverageBounds(
+		coverage, "BTC/USDT:USDT", "4h", 500, 1000)
+	if err != nil || !constrained || start != 500 || stop != 1000 {
+		t.Fatalf("second physical segment=%d:%d constrained=%v err=%v", start, stop, constrained, err)
+	}
+}
+
+func TestDerivedHistoricalCoverageReverseReadNeverCrossesSegmentLowerBound(t *testing.T) {
+	const hour = int64(3_600_000)
+	symbol := "BTC/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 48 * hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"4h": {
+					{StartMS: 16 * hour, StopMS: 28 * hour},
+					{StartMS: 32 * hour, StopMS: 48 * hour},
+				},
+				"1h": {
+					{StartMS: 17 * hour, StopMS: 28 * hour},
+					{StartMS: 32 * hour, StopMS: 48 * hour},
+				},
+			},
+		},
+	}
+	calls := 0
+	_, rows, err := readHistoricalCoverageSeries(coverage, symbol, "4h", 0, 48*hour, 5, false,
+		func(startMS, endMS int64, limit int, _ bool, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+			calls++
+			if !reverse {
+				t.Fatal("reverse historical request used a forward raw read")
+			}
+			physicalStart, physicalStop, constrained, boundsErr := historicalPhysicalCoverageBounds(
+				coverage, symbol, "4h", startMS, endMS)
+			wantConsumerStart := []int64{32 * hour, 16 * hour}[calls-1]
+			wantPhysicalStart := []int64{32 * hour, 17 * hour}[calls-1]
+			if boundsErr != nil || !constrained || startMS != wantConsumerStart ||
+				physicalStart != wantPhysicalStart || physicalStop != endMS {
+				t.Fatalf("call %d consumer=%d:%d physical=%d:%d constrained=%v err=%v",
+					calls, startMS, endMS, physicalStart, physicalStop, constrained, boundsErr)
+			}
+			available := []*DataSeries{}
+			for timestamp := startMS; timestamp < endMS; timestamp += 4 * hour {
+				available = append(available, &DataSeries{TimeMS: timestamp})
+			}
+			if len(available) > limit {
+				available = available[len(available)-limit:]
+			}
+			return nil, available, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int64{24 * hour, 32 * hour, 36 * hour, 40 * hour, 44 * hour}
+	if calls != 2 || !slices.Equal(seriesTimes(rows), want) {
+		t.Fatalf("calls=%d rows=%v want=%v", calls, seriesTimes(rows), want)
 	}
 }
 
@@ -80,11 +142,14 @@ func TestHistoricalCoverageReverseReadBackfillsAllowedRows(t *testing.T) {
 		{TimeMS: 500}, {TimeMS: 600}, {TimeMS: 700}, {TimeMS: 800}, {TimeMS: 900}}
 	reads := 0
 	_, rows, err := readHistoricalCoverageSeries(coverage, "BTC/USDT:USDT", "1h", 0, 1000, 5, false,
-		func(_ int64, endMS int64, limit int, _ bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+		func(startMS, endMS int64, limit int, _ bool, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			reads++
+			if !reverse || startMS != []int64{700, 100}[reads-1] {
+				t.Fatalf("reverse read %d bounds=%d:%d reverse=%v", reads, startMS, endMS, reverse)
+			}
 			eligible := make([]*DataSeries, 0)
 			for _, row := range physical {
-				if row.TimeMS < endMS {
+				if row.TimeMS >= startMS && row.TimeMS < endMS {
 					eligible = append(eligible, row)
 				}
 			}
@@ -118,8 +183,11 @@ func TestHistoricalCoverageForwardReadBackfillsAllowedRows(t *testing.T) {
 		{TimeMS: 500}, {TimeMS: 600}, {TimeMS: 700}, {TimeMS: 800}, {TimeMS: 900}}
 	reads := 0
 	_, rows, err := readHistoricalCoverageSeries(coverage, "BTC/USDT:USDT", "1h", 100, 1000, 5, false,
-		func(startMS, endMS int64, limit int, _ bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+		func(startMS, endMS int64, limit int, _ bool, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			reads++
+			if reverse {
+				t.Fatal("forward historical read requested reverse mode")
+			}
 			eligible := make([]*DataSeries, 0)
 			for _, row := range physical {
 				if row.TimeMS >= startMS && row.TimeMS < endMS {

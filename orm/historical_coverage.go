@@ -8,6 +8,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
+	utils2 "github.com/banbox/banexg/utils"
 )
 
 type historicalCoverageInterval struct {
@@ -16,6 +17,10 @@ type historicalCoverageInterval struct {
 }
 
 type seriesFieldsReader func(startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error)
+
+type historicalSeriesFieldsReader func(startMS, endMS int64, limit int, withUnFinish,
+	reverse bool,
+) ([]*AdjInfo, []*DataSeries, *errs.Error)
 
 func historicalCoverageForQuery(symbol string) *config.HistoricalCoverageConfig {
 	if !core.BackTestMode {
@@ -111,20 +116,29 @@ func historicalPhysicalCoverageBounds(coverage *config.HistoricalCoverageConfig,
 	if storageTF == timeframe {
 		return startMS, endMS, false, nil
 	}
-	intervals := historicalCoverageIntervals(coverage, symbol, storageTF, startMS, endMS)
-	if len(intervals) == 0 {
-		return 0, 0, true, nil
+	consumerSecs, tfErr := utils2.TFToSecSafe(timeframe)
+	if tfErr != nil || consumerSecs <= 0 {
+		return 0, 0, true, errs.NewMsg(core.ErrInvalidTF, "invalid timeframe: %s", timeframe)
 	}
-	if len(intervals) != 1 {
+	consumerStepMS := int64(consumerSecs * 1000)
+	intervals := historicalCoverageIntervals(coverage, symbol, storageTF, 0, endMS)
+	matches := intervals[:0]
+	for _, item := range intervals {
+		if item.StopMS <= startMS || item.StartMS >= endMS {
+			continue
+		}
+		matches = append(matches, item)
+	}
+	if len(matches) != 1 || matches[0].StopMS < endMS || matches[0].StartMS >= startMS+consumerStepMS {
 		return 0, 0, true, errs.NewMsg(core.ErrBadConfig,
-			"derived historical coverage requires one contiguous physical range for %s %s via %s",
-			symbol, timeframe, storageTF)
+			"derived historical coverage requires exactly one matching continuous physical segment for %s %s [%d,%d) via %s",
+			symbol, timeframe, startMS, endMS, storageTF)
 	}
-	return intervals[0].StartMS, intervals[0].StopMS, true, nil
+	return max(startMS, matches[0].StartMS), endMS, true, nil
 }
 
 func readHistoricalCoverageSeries(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
-	startMS, endMS int64, limit int, withUnFinish bool, read seriesFieldsReader,
+	startMS, endMS int64, limit int, withUnFinish bool, read historicalSeriesFieldsReader,
 ) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 	intervals := historicalCoverageIntervals(coverage, symbol, timeframe, startMS, endMS)
 	if len(intervals) == 0 {
@@ -135,7 +149,7 @@ func readHistoricalCoverageSeries(coverage *config.HistoricalCoverageConfig, sym
 		var result []*DataSeries
 		for index, item := range intervals {
 			partAdjs, rows, err := read(item.StartMS, item.StopMS, 0,
-				withUnFinish && index == len(intervals)-1)
+				withUnFinish && index == len(intervals)-1, false)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -151,7 +165,8 @@ func readHistoricalCoverageSeries(coverage *config.HistoricalCoverageConfig, sym
 	if startMS == 0 {
 		for index := len(intervals) - 1; index >= 0 && len(result) < limit; index-- {
 			item := intervals[index]
-			partAdjs, rows, err := read(0, item.StopMS, limit-len(result), withUnFinish && index == len(intervals)-1)
+			partAdjs, rows, err := read(item.StartMS, item.StopMS, limit-len(result),
+				withUnFinish && index == len(intervals)-1, true)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -168,7 +183,7 @@ func readHistoricalCoverageSeries(coverage *config.HistoricalCoverageConfig, sym
 	}
 	for index, item := range intervals {
 		partAdjs, rows, err := read(item.StartMS, item.StopMS, limit-len(result),
-			withUnFinish && index == len(intervals)-1)
+			withUnFinish && index == len(intervals)-1, false)
 		if err != nil {
 			return nil, nil, err
 		}
