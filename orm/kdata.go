@@ -835,7 +835,8 @@ For combination varieties, return the unweighted candlestick and the weighting f
 */
 func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame string,
 	startMS, endMS int64, limit int, handler func(string, string, []*banexg.Kline, []*AdjInfo)) *errs.Error {
-	if !allowImplicitKlineDownload() {
+	canDownload := allowImplicitKlineDownload()
+	if !canDownload && (!core.BackTestMode || config.HistoricalCoverage == nil) {
 		return klineDownloadDisabledError("FastBulkOHLCV")
 	}
 	var exsMap, err = MapExSymbols(exchange, symbols)
@@ -850,14 +851,15 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 		return err
 	}
 	defer conn.Release()
-	err = EnsureListDates(sess, exchange, exsMap, nil)
-	if err != nil {
-		return err
+	if canDownload {
+		err = EnsureListDates(sess, exchange, exsMap, nil)
+		if err != nil {
+			return err
+		}
 	}
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	queryStartMS, queryEndMS := parseDownArgs(tfMSecs, startMS, endMS, limit, false)
-	exInfo := exchange.Info()
-	if exchange.HasApi(banexg.ApiFetchOHLCV, exInfo.MarketType) {
+	if canDownload && exchange.HasApi(banexg.ApiFetchOHLCV, exchange.Info().MarketType) {
 		retErr := BulkDownOHLCV(exchange, exsMap, timeFrame, startMS, endMS, limit, nil)
 		if retErr != nil {
 			return retErr

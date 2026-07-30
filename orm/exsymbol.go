@@ -720,8 +720,25 @@ func InitListDates() *errs.Error {
 }
 
 func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int32]*ExSymbol, exsList []*ExSymbol) *errs.Error {
-	if !allowImplicitKlineDownload() {
-		return klineDownloadDisabledError("EnsureListDates")
+	canDownload := allowImplicitKlineDownload()
+	if exchange == nil {
+		if !canDownload {
+			return klineDownloadDisabledError("EnsureListDates")
+		}
+		return errs.NewMsg(core.ErrBadConfig, "EnsureListDates: exchange is required")
+	}
+	if !canDownload {
+		for _, exs := range exsMap {
+			if exs == nil || exs.ListMs == 0 {
+				return klineDownloadDisabledError("EnsureListDates")
+			}
+		}
+		for _, exs := range exsList {
+			if exs == nil || exs.ListMs == 0 {
+				return klineDownloadDisabledError("EnsureListDates")
+			}
+		}
+		return nil
 	}
 	exInfo := exchange.Info()
 	if exInfo.MarketType != banexg.MarketSpot {

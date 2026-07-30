@@ -8,6 +8,7 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
@@ -373,10 +374,13 @@ func TestFastBulkHistoricalCoverageAndNoDownloadGate(t *testing.T) {
 }
 
 func TestStrictBacktestRejectsEveryPublicKlineDownloadEntry(t *testing.T) {
-	previousMode, previousData := core.BackTestMode, config.Data
+	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
 	core.BackTestMode = true
 	config.Data = config.Config{BTNoKlineDownload: true}
-	t.Cleanup(func() { core.BackTestMode, config.Data = previousMode, previousData })
+	config.HistoricalCoverage = nil
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.HistoricalCoverage = previousMode, previousData, previousCoverage
+	})
 
 	tests := []struct {
 		name string
@@ -407,6 +411,61 @@ func TestStrictBacktestRejectsEveryPublicKlineDownloadEntry(t *testing.T) {
 				t.Fatalf("error=%v", err)
 			}
 		})
+	}
+}
+
+func TestStrictFastBulkAllowsAuditedDatabaseReadPath(t *testing.T) {
+	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
+	core.BackTestMode = true
+	config.Data = config.Config{BTNoKlineDownload: true}
+	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
+		BaselineEndMS: 1000,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.HistoricalCoverage = previousMode, previousData, previousCoverage
+	})
+
+	if err := FastBulkOHLCV(nil, nil, "1h", 100, 500, 0, nil); err != nil {
+		t.Fatalf("audited local FastBulk read was rejected: %v", err)
+	}
+}
+
+func TestStrictEnsureListDatesAllowsOnlyReadOnlyMetadataPaths(t *testing.T) {
+	previousMode, previousData, previousExchange := core.BackTestMode, config.Data, config.Exchange
+	core.BackTestMode = true
+	config.Data = config.Config{BTNoKlineDownload: true}
+	config.Exchange = &config.ExchangeConfig{Name: "binance", Items: map[string]map[string]interface{}{}}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.Exchange = previousMode, previousData, previousExchange
+	})
+
+	linear, err := exg.GetWith("binance", "linear", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := &ExSymbol{ID: 1, Symbol: "NEW/USDT:USDT"}
+	known := &ExSymbol{ID: 2, Symbol: "BTC/USDT", ListMs: 100}
+	if ensureErr := EnsureListDates(nil, linear, map[int32]*ExSymbol{known.ID: known}, nil); ensureErr != nil {
+		t.Fatalf("linear list-date no-op was rejected: %v", ensureErr)
+	}
+	if ensureErr := EnsureListDates(nil, linear, map[int32]*ExSymbol{unknown.ID: unknown}, nil); ensureErr == nil ||
+		!strings.Contains(strings.ToLower(ensureErr.Error()), "download is disabled") {
+		t.Fatalf("unknown linear list date error=%v", ensureErr)
+	}
+
+	spot, err := exg.GetWith("binance", "spot", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ensureErr := EnsureListDates(nil, spot, map[int32]*ExSymbol{known.ID: known}, nil); ensureErr != nil {
+		t.Fatalf("known spot list date was rejected: %v", ensureErr)
+	}
+	if ensureErr := EnsureListDates(nil, spot, map[int32]*ExSymbol{unknown.ID: unknown}, nil); ensureErr == nil ||
+		!strings.Contains(strings.ToLower(ensureErr.Error()), "download is disabled") {
+		t.Fatalf("unknown spot list date error=%v", ensureErr)
 	}
 }
 
