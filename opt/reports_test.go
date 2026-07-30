@@ -5,9 +5,73 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/biz"
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/utils"
 )
+
+func TestLogStateUsesMonotonicEventTimeForPlots(t *testing.T) {
+	const (
+		startMS  = int64(1700000000000)
+		firstMS  = int64(1700000003000)
+		secondMS = int64(1700000004000)
+	)
+	result := NewBTResult()
+	wallets := &biz.BanWallets{Items: map[string]*biz.ItemWallet{}}
+
+	result.logState(startMS, firstMS, 2)
+	result.TimeNum++
+	result.logState(startMS-1000, secondMS, 1)
+
+	if result.StartMS != startMS {
+		t.Fatalf("StartMS = %d, want %d", result.StartMS, startMS)
+	}
+	if result.EndMS != secondMS {
+		t.Fatalf("EndMS = %d, want %d", result.EndMS, secondMS)
+	}
+	wantLabels := []string{
+		btime.ToDateStr(firstMS, ""),
+		btime.ToDateStr(secondMS, ""),
+	}
+	if len(result.Plots.Labels) != len(wantLabels) {
+		t.Fatalf("labels = %v, want %v", result.Plots.Labels, wantLabels)
+	}
+	for i, want := range wantLabels {
+		if result.Plots.Labels[i] != want {
+			t.Fatalf("label[%d] = %q, want %q", i, result.Plots.Labels[i], want)
+		}
+	}
+	assertPlotLengths(t, result.Plots, 2)
+
+	result.logPlot(wallets, secondMS, 0, 10)
+	if len(result.Plots.Labels) != 2 {
+		t.Fatalf("equal terminal timestamp appended a label: %v", result.Plots.Labels)
+	}
+	if result.Plots.Real[1] != 10 || result.Plots.OdNum[1] != 0 {
+		t.Fatalf("terminal plot = real %v orders %v, want 10 and 0", result.Plots.Real[1], result.Plots.OdNum[1])
+	}
+	assertPlotLengths(t, result.Plots, 2)
+
+	result.logPlot(wallets, firstMS+500, 9, 99)
+	if result.Plots.Real[1] != 10 || result.Plots.OdNum[1] != 0 {
+		t.Fatalf("backwards plot changed terminal state: real %v orders %v", result.Plots.Real[1], result.Plots.OdNum[1])
+	}
+	assertPlotLengths(t, result.Plots, 2)
+}
+
+func assertPlotLengths(t *testing.T, plots *PlotData, want int) {
+	t.Helper()
+	lengths := map[string]int{
+		"labels": len(plots.Labels), "orders": len(plots.OdNum), "jobs": len(plots.JobNum),
+		"real": len(plots.Real), "available": len(plots.Available), "profit": len(plots.Profit),
+		"unrealized": len(plots.UnrealizedPOL), "withdraw": len(plots.WithDraw),
+	}
+	for name, got := range lengths {
+		if got != want {
+			t.Fatalf("%s length = %d, want %d", name, got, want)
+		}
+	}
+}
 
 func TestGroupByProfitsHandlesEmptyKMeansClusters(t *testing.T) {
 	const orderCount = 10

@@ -51,6 +51,7 @@ type BTResult struct {
 	TimeNum         int                    `json:"timeNum"`
 	OrderNum        int                    `json:"orderNum"`
 	lastTime        int64                  // 上次bar的时间戳
+	lastPlotMS      int64                  // 上次资金曲线采样时间
 	histOdOff       int                    // 计算已完成订单利润的偏移
 	donePftLegal    float64                // 已完成订单利润
 	Plots           *PlotData              `json:"plots"`
@@ -1031,11 +1032,15 @@ func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 		r.Plots = plots
 		return
 	}
-	// 这里应使用bar的开始时间，避免多个时间周期运行时，大部分CheckMS未更新
-	r.logPlot(wallets, startMS, odNum, totalLegal)
+	r.logPlot(wallets, timeMS, odNum, totalLegal)
 }
 
 func (r *BTResult) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, totalLegal float64) {
+	if timeMS < r.lastPlotMS {
+		log.Error("backtest plot time moved backwards",
+			zap.Int64("last_ms", r.lastPlotMS), zap.Int64("current_ms", timeMS))
+		return
+	}
 	if odNum < 0 {
 		odNum = ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)
 	}
@@ -1057,6 +1062,19 @@ func (r *BTResult) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, tot
 	curDate := btime.ToDateStr(timeMS, "")
 	r.donePftLegal += ormo.LegalDoneProfits(r.histOdOff)
 	r.histOdOff = len(ormo.HistODs)
+	if timeMS == r.lastPlotMS && len(r.Plots.Labels) > 0 {
+		last := len(r.Plots.Labels) - 1
+		r.Plots.Labels[last] = curDate
+		r.Plots.OdNum[last] = odNum
+		r.Plots.JobNum[last] = jobNum
+		r.Plots.Real[last] = totalLegal
+		r.Plots.Available[last] = avaLegal
+		r.Plots.Profit[last] = r.donePftLegal
+		r.Plots.UnrealizedPOL[last] = profitLegal
+		r.Plots.WithDraw[last] = drawLegal
+		return
+	}
+	r.lastPlotMS = timeMS
 	r.Plots.Labels = append(r.Plots.Labels, curDate)
 	r.Plots.OdNum = append(r.Plots.OdNum, odNum)
 	r.Plots.JobNum = append(r.Plots.JobNum, jobNum)
