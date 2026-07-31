@@ -219,7 +219,7 @@ func (q *Queries) QuerySeriesFields(exs *ExSymbol, timeframe string, fields []st
 	if coverage == nil {
 		return q.querySeriesFieldsRaw(exs, timeframe, fields, startMs, endMs, limit, withUnFinish)
 	}
-	_, rows, err := readHistoricalCoverageSeries(coverage, exs.Symbol, timeframe, startMs, endMs, limit, withUnFinish,
+	_, rows, err := readHistoricalCoverageSeries(coverage, exs, timeframe, startMs, endMs, limit, withUnFinish,
 		func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish,
 			reverse bool,
 		) ([]*AdjInfo, []*DataSeries, *errs.Error) {
@@ -252,8 +252,12 @@ func (q *Queries) querySeriesFieldsRawMode(exs *ExSymbol, timeframe string, fiel
 			finishEndMS = unFinishMS
 		}
 	}
+	coverage := historicalCoverageForQuery(exs.Symbol)
+	consumerIntervals := historicalCoverageIntervals(coverage, exs.Symbol, timeframe, startMs, finishEndMS)
+	listingPrefix, hasListingPrefix := legacyListingPrefixProof(
+		coverage, exs, timeframe, startMs, consumerIntervals)
 	physicalStart, physicalStop, physicalBound, coverageErr := historicalPhysicalCoverageBounds(
-		historicalCoverageForQuery(exs.Symbol), exs.Symbol, timeframe, startMs, finishEndMS)
+		coverage, exs.Symbol, timeframe, startMs, finishEndMS)
 	if coverageErr != nil {
 		return nil, coverageErr
 	}
@@ -270,6 +274,31 @@ func (q *Queries) querySeriesFieldsRawMode(exs *ExSymbol, timeframe string, fiel
 	}
 	if revRead {
 		utils.ReverseArr(rows)
+	}
+	if hasListingPrefix && listingPrefix.minuteStartMS < listingPrefix.storageStartMS &&
+		shouldRestoreHistoricalListingPrefix(timeframe, subTF, listingPrefix, rows) {
+		queryStorageTF := subTF
+		if queryStorageTF == "" {
+			queryStorageTF = timeframe
+		}
+		if queryStorageTF != listingPrefix.storageTF {
+			return nil, errs.NewMsg(core.ErrBadConfig,
+				"historical listing prefix storage mismatch for %s %s: query=%s proof=%s",
+				exs.Symbol, timeframe, queryStorageTF, listingPrefix.storageTF)
+		}
+		minuteRows, minuteSubTF, listingErr := q.querySeriesRows(exs, "1m", fields,
+			listingPrefix.minuteStartMS, listingPrefix.storageStartMS, 0, false, true)
+		if listingErr != nil {
+			return nil, listingErr
+		}
+		if minuteSubTF != "" {
+			return nil, errs.NewMsg(core.ErrBadConfig,
+				"historical listing prefix for %s resolved 1m through %s", exs.Symbol, minuteSubTF)
+		}
+		rows, listingErr = prependHistoricalListingPrefix(exs, listingPrefix, minuteRows, rows)
+		if listingErr != nil {
+			return nil, listingErr
+		}
 	}
 	if subTF != "" && len(rows) > 0 {
 		fromTFMS := int64(utils2.TFToSecs(subTF) * 1000)
@@ -303,6 +332,19 @@ func (q *Queries) querySeriesFieldsRawMode(exs *ExSymbol, timeframe string, fiel
 	return rows, nil
 }
 
+func shouldRestoreHistoricalListingPrefix(timeframe, subTF string, prefix historicalListingPrefix,
+	rows []*DataSeries,
+) bool {
+	if len(rows) == 0 || rows[0] == nil {
+		return false
+	}
+	if subTF == "" {
+		return timeframe == prefix.storageTF && rows[0].TimeMS == prefix.bucketStartMS
+	}
+	return subTF == prefix.storageTF &&
+		(rows[0].TimeMS == prefix.bucketStartMS || rows[0].TimeMS == prefix.storageStartMS)
+}
+
 func (q *Queries) QuerySeriesBatch(exsMap map[int32]*ExSymbol, timeframe string, startMs, endMs int64, limit int, handle func(int32, []*DataSeries)) *errs.Error {
 	return q.QuerySeriesBatchFields(exsMap, timeframe, nil, startMs, endMs, limit, handle)
 }
@@ -311,7 +353,7 @@ func (q *Queries) QuerySeriesBatchFields(exsMap map[int32]*ExSymbol, timeframe s
 	if len(exsMap) == 0 {
 		return nil
 	}
-	if core.BackTestMode && config.HistoricalCoverage != nil {
+	if config.StrictHistoricalReplay(config.HistoricalCoverage) {
 		sids := make([]int, 0, len(exsMap))
 		for sid := range exsMap {
 			sids = append(sids, int(sid))
@@ -443,7 +485,7 @@ func (q *Queries) GetSeriesFields(exs *ExSymbol, timeFrame string, fields []stri
 	if coverage == nil {
 		return q.getSeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
 	}
-	return readHistoricalCoverageSeries(coverage, exs.Symbol, timeFrame, startMS, endMS, limit, withUnFinish,
+	return readHistoricalCoverageSeries(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
 		func(startMS, endMS int64, limit int, withUnFinish, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			return q.getSeriesFieldsRawMode(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish, reverse)
 		})

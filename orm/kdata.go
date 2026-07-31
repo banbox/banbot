@@ -910,7 +910,7 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 func deliverFastBulkOHLCV(handler func(string, string, []*banexg.Kline, []*AdjInfo), symbol, timeframe string,
 	rows []*banexg.Kline, adjs []*AdjInfo,
 ) {
-	handler(symbol, timeframe, filterHistoricalCoverageKlines(symbol, timeframe, rows), adjs)
+	handler(symbol, timeframe, rows, adjs)
 }
 
 func allowImplicitKlineDownload() bool {

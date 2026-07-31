@@ -208,7 +208,8 @@ bars original unweighted K-line
 bars 原始未复权的K线
 */
 func (f *Feeder) onStateOhlcvs(state *PairTFCache, rows []*orm.DataSeries, lastOk bool) []*orm.DataSeries {
-	if !lastOk && len(rows) > 0 && f.coverage != nil && !f.coverage.Allows(state.TimeFrame, rows[len(rows)-1].TimeMS) {
+	if !lastOk && len(rows) > 0 && f.coverage != nil &&
+		!orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, state.TimeFrame, rows[len(rows)-1].TimeMS) {
 		lastOk = true
 	}
 	rows = f.filterHistoricalCoverageRows(state.TimeFrame, rows)
@@ -301,12 +302,12 @@ func (f *Feeder) filterHistoricalCoverageRows(timeframe string, rows []*orm.Data
 		return rows
 	}
 	for index, row := range rows {
-		if f.coverage.Allows(timeframe, row.TimeMS) {
+		if orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, timeframe, row.TimeMS) {
 			continue
 		}
 		filtered := append([]*orm.DataSeries(nil), rows[:index]...)
 		for _, remaining := range rows[index+1:] {
-			if f.coverage.Allows(timeframe, remaining.TimeMS) {
+			if orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, timeframe, remaining.TimeMS) {
 				filtered = append(filtered, remaining)
 			}
 		}

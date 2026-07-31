@@ -5,6 +5,7 @@ import (
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 )
 
@@ -106,6 +107,39 @@ func TestFeederHistoricalCoverageRecomputesLastCompletedRow(t *testing.T) {
 		len(feeder.tfBars["8h"]) != 1 {
 		t.Fatalf("completed covered row was delayed: rows=%v state=%#v cache=%v callbacks=%v",
 			rows, state, feeder.tfBars, called)
+	}
+}
+
+func TestFeederKeepsUnfinishedProvedListingBucketWaiting(t *testing.T) {
+	const hour = int64(60 * 60 * 1000)
+	previousMode, previousData := core.BackTestMode, config.Data
+	t.Cleanup(func() { core.BackTestMode, config.Data = previousMode, previousData })
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+
+	symbol := "WLD/USDT:USDT"
+	state := &PairTFCache{TimeFrame: "8h", TFSecs: 8 * 60 * 60}
+	called := make([]int64, 0, 1)
+	feeder := &Feeder{
+		ExSymbol: &orm.ExSymbol{ID: 7, Exchange: "binance", Symbol: symbol, ListMs: 4 * hour},
+		CallBack: func(evt *orm.DataSeries) { called = append(called, evt.TimeMS) },
+		tfBars:   make(map[string][]*orm.DataSeries),
+		coverage: &config.HistoricalCoverageConfig{
+			BaselineEndMS: 24 * hour,
+			Bars: map[string]map[string][]config.HistoricalCoverageRange{
+				symbol: {
+					"8h": {{StartMS: 4 * hour, StopMS: 24 * hour}},
+					"1h": {{StartMS: 4 * hour, StopMS: 24 * hour}},
+					"1m": {{StartMS: 4 * hour, StopMS: 24 * hour}},
+				},
+			},
+		},
+	}
+	row := &orm.DataSeries{TimeMS: 0}
+	if rows := feeder.onStateOhlcvs(state, []*orm.DataSeries{row}, false); len(rows) != 0 ||
+		state.WaitBar != row || len(called) != 0 {
+		t.Fatalf("unfinished listing bucket fired early: rows=%v wait=%v callbacks=%v", rows, state.WaitBar, called)
 	}
 }
 

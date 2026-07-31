@@ -13,6 +13,15 @@ import (
 	"github.com/banbox/banexg/errs"
 )
 
+func enableStrictHistoricalCoverageTest(t *testing.T) {
+	t.Helper()
+	previousMode, previousData := core.BackTestMode, config.Data
+	t.Cleanup(func() { core.BackTestMode, config.Data = previousMode, previousData })
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+}
+
 func TestDerivedHistoricalCoverageConsumesOnlyAuditedPhysicalPrefix(t *testing.T) {
 	const hour = int64(60 * 60 * 1000)
 	const bucketStart = int64(1_699_977_600_000)
@@ -49,6 +58,262 @@ func TestDerivedHistoricalCoverageConsumesOnlyAuditedPhysicalPrefix(t *testing.T
 	first, valueErr := rows[0].OHLCV(exs)
 	if valueErr != nil || rows[0].TimeMS != bucketStart || first.Open != 17 || first.Volume != 3 {
 		t.Fatalf("partial first bucket time=%d values=%+v err=%v", rows[0].TimeMS, first, valueErr)
+	}
+}
+
+func TestLegacyHistoricalCoverageRestoresPhysicallyProvedListingBucket(t *testing.T) {
+	const hour = int64(60 * 60 * 1000)
+	symbol := "WLD/USDT:USDT"
+	exs := &ExSymbol{ID: 7, Exchange: "binance", Symbol: symbol, ListMs: 4 * hour}
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 24 * hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"8h": {{StartMS: 4 * hour, StopMS: 24 * hour}},
+				"1h": {{StartMS: 4 * hour, StopMS: 24 * hour}},
+				"1m": {{StartMS: 4 * hour, StopMS: 24 * hour}},
+			},
+		},
+	}
+	enableStrictHistoricalCoverageTest(t)
+
+	base := historicalCoverageIntervals(coverage, symbol, "8h", 0, 24*hour)
+	got := extendLegacyListingCoverage(coverage, exs, "8h", 0, base)
+	if len(got) != 1 || got[0] != (historicalCoverageInterval{StartMS: 0, StopMS: 24 * hour}) {
+		t.Fatalf("legacy intervals=%v", got)
+	}
+	if !HistoricalCoverageAllows(coverage, exs, "8h", 0) {
+		t.Fatal("physically proved listing bucket was rejected by the runtime coverage filter")
+	}
+	physicalStart, physicalStop, constrained, err := historicalPhysicalCoverageBounds(
+		coverage, symbol, "8h", got[0].StartMS, got[0].StopMS)
+	if err != nil || !constrained || physicalStart != exs.ListMs || physicalStop != 24*hour {
+		t.Fatalf("physical bounds=%d:%d constrained=%v err=%v", physicalStart, physicalStop, constrained, err)
+	}
+	for _, test := range []struct {
+		name            string
+		archivedStartMS int64
+		wantStartMS     int64
+	}{
+		{name: "bucket label", archivedStartMS: 0, wantStartMS: 0},
+		{name: "pre-list label", archivedStartMS: 3 * hour, wantStartMS: 0},
+		{name: "exact list", archivedStartMS: 4 * hour, wantStartMS: 0},
+		{name: "post-list label", archivedStartMS: 5 * hour, wantStartMS: 0},
+		{name: "next full bucket", archivedStartMS: 8 * hour, wantStartMS: 0},
+		{name: "outside first bucket", archivedStartMS: 9 * hour, wantStartMS: 9 * hour},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			coverage.Bars[symbol]["8h"] = []config.HistoricalCoverageRange{{
+				StartMS: test.archivedStartMS, StopMS: 24 * hour,
+			}}
+			input := historicalCoverageIntervals(coverage, symbol, "8h", 0, 24*hour)
+			got := extendLegacyListingCoverage(coverage, exs, "8h", 0, input)
+			if len(got) != 1 || got[0].StartMS != test.wantStartMS {
+				t.Fatalf("intervals=%v want start=%d", got, test.wantStartMS)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		change func()
+	}{
+		{name: "non-backtest", change: func() { core.BackTestMode = false }},
+		{name: "non-strict replay", change: func() { config.Data.BTStrict = false }},
+		{name: "download-enabled replay", change: func() { config.Data.BTNoKlineDownload = false }},
+		{name: "explicit later query", change: func() {}},
+		{name: "missing runtime prefix", change: func() {
+			coverage.Bars[symbol]["1h"] = []config.HistoricalCoverageRange{{StartMS: 5 * hour, StopMS: 24 * hour}}
+		}},
+		{name: "missing minute proof", change: func() {
+			coverage.Bars[symbol]["1m"] = []config.HistoricalCoverageRange{{StartMS: 5 * hour, StopMS: 24 * hour}}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core.BackTestMode = true
+			config.Data.BTStrict = true
+			config.Data.BTNoKlineDownload = true
+			coverage.Bars[symbol]["8h"] = []config.HistoricalCoverageRange{{StartMS: 4 * hour, StopMS: 24 * hour}}
+			coverage.Bars[symbol]["1h"] = []config.HistoricalCoverageRange{{StartMS: 4 * hour, StopMS: 24 * hour}}
+			coverage.Bars[symbol]["1m"] = []config.HistoricalCoverageRange{{StartMS: 4 * hour, StopMS: 24 * hour}}
+			test.change()
+			requestedStart := int64(0)
+			requestedIntervals := base
+			if test.name == "explicit later query" {
+				requestedStart = 8 * hour
+				requestedIntervals = historicalCoverageIntervals(coverage, symbol, "8h", requestedStart, 24*hour)
+			}
+			got := extendLegacyListingCoverage(coverage, exs, "8h", requestedStart, requestedIntervals)
+			if !slices.Equal(got, requestedIntervals) {
+				t.Fatalf("intervals=%v want unchanged %v", got, requestedIntervals)
+			}
+			if test.name != "explicit later query" && HistoricalCoverageAllows(coverage, exs, "8h", 0) {
+				t.Fatal("unproved listing bucket was allowed by the runtime coverage filter")
+			}
+		})
+	}
+	if got := extendLegacyListingCoverage(nil, exs, "8h", 0, base); !slices.Equal(got, base) {
+		t.Fatalf("nil coverage changed intervals: %v", got)
+	}
+}
+
+func TestHistoricalListingPrefixRestoresExactDerivedOHLCV(t *testing.T) {
+	const (
+		minute = int64(60_000)
+		hour   = 60 * minute
+		base   = int64(1_699_977_600_000)
+	)
+	symbol := "WLD/USDT:USDT"
+	listMS := base + 4*hour + 17*minute
+	exs := &ExSymbol{ID: 7, Exchange: "binance", Symbol: symbol, ListMs: listMS}
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: base + 16*hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"8h": {{StartMS: listMS, StopMS: base + 16*hour}},
+				"1h": {{StartMS: base + 5*hour, StopMS: base + 16*hour}},
+				"1m": {{StartMS: listMS, StopMS: base + 16*hour}},
+			},
+		},
+	}
+	enableStrictHistoricalCoverageTest(t)
+
+	intervals := historicalCoverageIntervals(coverage, symbol, "8h", 0, base+16*hour)
+	prefix, ok := legacyListingPrefixProof(coverage, exs, "8h", 0, intervals)
+	if !ok {
+		t.Fatal("listing prefix proof was rejected")
+	}
+	minuteRows := make([]*DataSeries, 0, 43)
+	for timestamp := listMS; timestamp < base+5*hour; timestamp += minute {
+		value := float64(timestamp-listMS)/float64(minute) + 10
+		minuteRows = append(minuteRows, NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: timestamp, Open: value, High: value + 2, Low: value - 2, Close: value + 1,
+			Volume: 1, Quote: 2, BuyVolume: 0.5, TradeNum: 1,
+		}, nil, false, true))
+	}
+	physicalRows := []*DataSeries{
+		NewDataSeriesFromKline(exs, "1h", &banexg.Kline{
+			Time: base + 5*hour, Open: 100, High: 120, Low: 90, Close: 110,
+			Volume: 2, Quote: 20, BuyVolume: 2, TradeNum: 2,
+		}, nil, false, true),
+		NewDataSeriesFromKline(exs, "1h", &banexg.Kline{
+			Time: base + 6*hour, Open: 110, High: 130, Low: 80, Close: 120,
+			Volume: 3, Quote: 30, BuyVolume: 3, TradeNum: 3,
+		}, nil, false, true),
+		NewDataSeriesFromKline(exs, "1h", &banexg.Kline{
+			Time: base + 7*hour, Open: 120, High: 140, Low: 70, Close: 130,
+			Volume: 4, Quote: 40, BuyVolume: 4, TradeNum: 4,
+		}, nil, false, true),
+	}
+	storageRows, prefixErr := prependHistoricalListingPrefix(exs, prefix, minuteRows, physicalRows)
+	if prefixErr != nil {
+		t.Fatal(prefixErr)
+	}
+	rows, finished, resampleErr := ResampleDataSeries(exs, "8h", storageRows, nil, 8*hour, 0, hour, 0, false)
+	if resampleErr != nil || !finished || len(rows) != 1 {
+		t.Fatalf("derived rows=%v finished=%v err=%v", seriesTimes(rows), finished, resampleErr)
+	}
+	bar, valueErr := rows[0].OHLCV(exs)
+	if valueErr != nil || rows[0].TimeMS != base || bar.Open != 10 || bar.High != 140 || bar.Low != 8 ||
+		bar.Close != 130 || bar.Volume != 52 || bar.Quote != 176 || bar.BuyVolume != 30.5 || bar.TradeNum != 52 {
+		t.Fatalf("restored listing bar time=%d values=%+v err=%v", rows[0].TimeMS, bar, valueErr)
+	}
+}
+
+func TestHistoricalListingPrefixRestoresPhysicalListingBucket(t *testing.T) {
+	const (
+		minute = int64(60_000)
+		hour   = 60 * minute
+		base   = int64(1_710_576_000_000)
+	)
+	symbol := "BOME/USDT:USDT"
+	listMS := base + 4*hour + 30*minute
+	exs := &ExSymbol{ID: 1939, Exchange: "binance", Symbol: symbol, ListMs: listMS}
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: base + 16*hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"1h": {{StartMS: base + 5*hour, StopMS: base + 16*hour}},
+				"1m": {{StartMS: listMS, StopMS: base + 16*hour}},
+			},
+		},
+	}
+	enableStrictHistoricalCoverageTest(t)
+
+	intervals := historicalCoverageIntervals(coverage, symbol, "1h", 0, base+16*hour)
+	prefix, ok := legacyListingPrefixProof(coverage, exs, "1h", 0, intervals)
+	if !ok || prefix.bucketStartMS != base+4*hour || prefix.storageStartMS != base+5*hour {
+		t.Fatalf("physical listing prefix=%+v ok=%v", prefix, ok)
+	}
+	extended := extendLegacyListingCoverage(coverage, exs, "1h", 0, intervals)
+	if len(extended) != 1 || extended[0].StartMS != base+4*hour {
+		t.Fatalf("physical listing interval=%v", extended)
+	}
+
+	minuteRows := make([]*DataSeries, 0, 30)
+	for timestamp := listMS; timestamp < base+5*hour; timestamp += minute {
+		value := float64(timestamp-listMS)/float64(minute) + 10
+		minuteRows = append(minuteRows, NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: timestamp, Open: value, High: value + 2, Low: value - 2, Close: value + 1,
+			Volume: 1, Quote: 2, BuyVolume: 0.5, TradeNum: 1,
+		}, nil, false, true))
+	}
+	physicalRows := []*DataSeries{
+		NewDataSeriesFromKline(exs, "1h", &banexg.Kline{
+			Time: base + 4*hour, Open: 999, High: 999, Low: 999, Close: 999, Volume: 999,
+		}, nil, false, true),
+		NewDataSeriesFromKline(exs, "1h", &banexg.Kline{
+			Time: base + 5*hour, Open: 40, High: 42, Low: 38, Close: 41, Volume: 2,
+		}, nil, false, true),
+	}
+	rows, prefixErr := prependHistoricalListingPrefix(exs, prefix, minuteRows, physicalRows)
+	if prefixErr != nil || len(rows) != 2 || rows[0].TimeMS != base+4*hour || rows[1].TimeMS != base+5*hour {
+		t.Fatalf("physical listing rows=%v err=%v", seriesTimes(rows), prefixErr)
+	}
+	bar, valueErr := rows[0].OHLCV(exs)
+	if valueErr != nil || bar.Open != 10 || bar.High != 41 || bar.Low != 8 || bar.Close != 40 ||
+		bar.Volume != 30 || bar.Quote != 60 || bar.BuyVolume != 15 || bar.TradeNum != 30 {
+		t.Fatalf("physical listing bar=%+v err=%v", bar, valueErr)
+	}
+}
+
+func TestHistoricalListingPrefixRequiresArchivedPhysicalBucket(t *testing.T) {
+	prefix := historicalListingPrefix{
+		bucketStartMS:  100,
+		storageStartMS: 200,
+		storageTF:      "1h",
+	}
+	if !shouldRestoreHistoricalListingPrefix("1h", "", prefix, []*DataSeries{{TimeMS: 100}}) {
+		t.Fatal("archived physical listing bucket was not restored")
+	}
+	if shouldRestoreHistoricalListingPrefix("1h", "", prefix, []*DataSeries{{TimeMS: 200}}) {
+		t.Fatal("missing physical listing bucket was synthesized from minute coverage")
+	}
+	if !shouldRestoreHistoricalListingPrefix("8h", "1h", prefix, []*DataSeries{{TimeMS: 200}}) {
+		t.Fatal("derived listing bucket was not restored before its first complete storage row")
+	}
+}
+
+func TestHistoricalListingPrefixRejectsPhysicalMinuteGap(t *testing.T) {
+	const (
+		minute = int64(60_000)
+		hour   = 60 * minute
+		base   = int64(1_699_977_600_000)
+	)
+	exs := &ExSymbol{ID: 7, Exchange: "binance", Symbol: "WLD/USDT:USDT", ListMs: base + 4*hour + 58*minute}
+	prefix := historicalListingPrefix{
+		minuteStartMS:  exs.ListMs,
+		storageStartMS: base + 5*hour,
+		storageTF:      "1h",
+	}
+	minuteRows := []*DataSeries{
+		NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: exs.ListMs, Open: 1, High: 1, Low: 1, Close: 1, Volume: 1,
+		}, nil, false, true),
+	}
+	if _, err := prependHistoricalListingPrefix(exs, prefix, minuteRows, nil); err == nil ||
+		!strings.Contains(err.Error(), "continuous physical 1m") {
+		t.Fatalf("missing minute gap error=%v", err)
 	}
 }
 
@@ -98,7 +363,7 @@ func TestDerivedHistoricalCoverageReverseReadNeverCrossesSegmentLowerBound(t *te
 		},
 	}
 	calls := 0
-	_, rows, err := readHistoricalCoverageSeries(coverage, symbol, "4h", 0, 48*hour, 5, false,
+	_, rows, err := readHistoricalCoverageSeries(coverage, &ExSymbol{Symbol: symbol}, "4h", 0, 48*hour, 5, false,
 		func(startMS, endMS int64, limit int, _ bool, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			calls++
 			if !reverse {
@@ -141,7 +406,7 @@ func TestHistoricalCoverageReverseReadBackfillsAllowedRows(t *testing.T) {
 	physical := []*DataSeries{{TimeMS: 100}, {TimeMS: 200}, {TimeMS: 300}, {TimeMS: 400},
 		{TimeMS: 500}, {TimeMS: 600}, {TimeMS: 700}, {TimeMS: 800}, {TimeMS: 900}}
 	reads := 0
-	_, rows, err := readHistoricalCoverageSeries(coverage, "BTC/USDT:USDT", "1h", 0, 1000, 5, false,
+	_, rows, err := readHistoricalCoverageSeries(coverage, &ExSymbol{Symbol: "BTC/USDT:USDT"}, "1h", 0, 1000, 5, false,
 		func(startMS, endMS int64, limit int, _ bool, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			reads++
 			if !reverse || startMS != []int64{700, 100}[reads-1] {
@@ -182,7 +447,7 @@ func TestHistoricalCoverageForwardReadBackfillsAllowedRows(t *testing.T) {
 	physical := []*DataSeries{{TimeMS: 100}, {TimeMS: 200}, {TimeMS: 300}, {TimeMS: 400},
 		{TimeMS: 500}, {TimeMS: 600}, {TimeMS: 700}, {TimeMS: 800}, {TimeMS: 900}}
 	reads := 0
-	_, rows, err := readHistoricalCoverageSeries(coverage, "BTC/USDT:USDT", "1h", 100, 1000, 5, false,
+	_, rows, err := readHistoricalCoverageSeries(coverage, &ExSymbol{Symbol: "BTC/USDT:USDT"}, "1h", 100, 1000, 5, false,
 		func(startMS, endMS int64, limit int, _ bool, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			reads++
 			if reverse {
@@ -316,15 +581,19 @@ func TestHistoricalCoverageIntervalsCapExtensionAtBacktestEnd(t *testing.T) {
 }
 
 func TestExportedSeriesReadsFailClosedBeforeRawQuery(t *testing.T) {
-	previousMode, previousCoverage := core.BackTestMode, config.HistoricalCoverage
+	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
 	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
 	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
 		BaselineEndMS: 1000,
 		Bars: map[string]map[string][]config.HistoricalCoverageRange{
 			"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 500}}},
 		},
 	}
-	t.Cleanup(func() { core.BackTestMode, config.HistoricalCoverage = previousMode, previousCoverage })
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.HistoricalCoverage = previousMode, previousData, previousCoverage
+	})
 
 	q := &Queries{}
 	unknown := &ExSymbol{ID: 2, Symbol: "NEW/USDT:USDT"}
@@ -412,7 +681,7 @@ func TestHistoricalCoverageIsolatedBySymbol(t *testing.T) {
 func TestFastBulkHistoricalCoverageAndNoDownloadGate(t *testing.T) {
 	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
 	core.BackTestMode = true
-	config.Data = config.Config{BTNoKlineDownload: true}
+	config.Data = config.Config{BTStrict: true, BTNoKlineDownload: true}
 	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
 		BaselineEndMS: 1000,
 		Bars: map[string]map[string][]config.HistoricalCoverageRange{
@@ -429,15 +698,45 @@ func TestFastBulkHistoricalCoverageAndNoDownloadGate(t *testing.T) {
 		!strings.Contains(strings.ToLower(err.Error()), "download is disabled") {
 		t.Fatalf("low-level implicit download error=%v", err)
 	}
-	rows := filterHistoricalCoverageKlines("BTC/USDT:USDT", "1h", []*banexg.Kline{{Time: 200}, {Time: 700}})
-	if len(rows) != 1 || rows[0].Time != 200 {
-		t.Fatalf("filtered K-lines=%v", rows)
-	}
 	core.BackTestMode = false
-	if !allowImplicitKlineDownload() || historicalCoverageForQuery("BTC/USDT:USDT") != nil ||
-		len(filterHistoricalCoverageKlines("BTC/USDT:USDT", "1h",
-			[]*banexg.Kline{{Time: 200}, {Time: 700}})) != 2 {
+	if !allowImplicitKlineDownload() || historicalCoverageForQuery("BTC/USDT:USDT") != nil {
 		t.Fatal("live/raw K-line reads were constrained by historical coverage")
+	}
+}
+
+func TestHistoricalCoverageReadGateRequiresStrictHistoricalReplay(t *testing.T) {
+	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 1000,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.HistoricalCoverage = previousMode, previousData, previousCoverage
+	})
+
+	for _, test := range []struct {
+		name         string
+		backtest     bool
+		strict       bool
+		noDownload   bool
+		wantCoverage bool
+	}{
+		{name: "strict historical replay", backtest: true, strict: true, noDownload: true, wantCoverage: true},
+		{name: "non-strict backtest", backtest: true, noDownload: true},
+		{name: "download-enabled backtest", backtest: true, strict: true},
+		{name: "live", strict: true, noDownload: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core.BackTestMode = test.backtest
+			config.Data = config.Config{BTStrict: test.strict, BTNoKlineDownload: test.noDownload}
+			config.HistoricalCoverage = coverage
+			got := historicalCoverageForQuery("BTC/USDT:USDT")
+			if (got != nil) != test.wantCoverage {
+				t.Fatalf("coverage enabled = %v, want %v", got != nil, test.wantCoverage)
+			}
+		})
 	}
 }
 
@@ -550,7 +849,7 @@ func TestNonBacktestFetchRetainsNetDisableSemantics(t *testing.T) {
 	}
 }
 
-func TestFastBulkHistoricalCoverageUsesFixedWindow(t *testing.T) {
+func TestFastBulkDoesNotRefilterAuditedQueryRows(t *testing.T) {
 	previousMode, previousCoverage := core.BackTestMode, config.HistoricalCoverage
 	core.BackTestMode = true
 	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
@@ -571,8 +870,8 @@ func TestFastBulkHistoricalCoverageUsesFixedWindow(t *testing.T) {
 	}, "BTC/USDT:USDT", "1h", []*banexg.Kline{
 		{Time: 500}, {Time: 600}, {Time: 700}, {Time: 800}, {Time: 900},
 	}, []*AdjInfo{adj})
-	if times := klineTimes(got); !slices.Equal(times, []int64{700, 800, 900}) {
-		t.Fatalf("fixed-window rows=%v; FastBulk must not backfill from earlier coverage ranges", times)
+	if times := klineTimes(got); !slices.Equal(times, []int64{500, 600, 700, 800, 900}) {
+		t.Fatalf("FastBulk refiltered rows already audited by QuerySeries: %v", times)
 	}
 }
 
