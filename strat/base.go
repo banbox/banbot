@@ -201,20 +201,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 	}
 	if req.Stop > 0 {
-		if req.Short {
-			if req.Stop > curPrice {
-				// 做空，触发价应低于最新价
-				isLimit = true
-			}
-		} else if req.Stop < curPrice {
-			// 做多：触发价应高于最新价
-			isLimit = true
-		}
-		enterPrice = req.Stop
-		if isLimit {
-			req.Limit = req.Stop
-			req.Stop = 0
-		}
+		enterPrice = normalizeEntryStop(req, curPrice, isLimit)
 	}
 	if req.Amount == 0 && req.LegalCost == 0 {
 		if req.CostRate == 0 {
@@ -342,6 +329,25 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 	}
 	return nil
+}
+
+func normalizeEntryStop(req *EnterReq, curPrice float64, isLimit bool) float64 {
+	stopPrice := req.Stop
+	if config.StrictHistoricalReplay(config.HistoricalCoverage) && config.Data.BTLegacyIntrabar {
+		return curPrice
+	}
+	stopActsAsLimit := req.Stop < curPrice
+	if req.Short {
+		stopActsAsLimit = req.Stop > curPrice
+	}
+	if stopActsAsLimit {
+		isLimit = true
+	}
+	if isLimit {
+		req.Limit = req.Stop
+		req.Stop = 0
+	}
+	return stopPrice
 }
 
 func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error {

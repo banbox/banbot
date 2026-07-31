@@ -227,12 +227,13 @@ func TestRunPolicyToYamlRoundTrip(t *testing.T) {
 func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
 	temperature := 0.25
 	orig := &Config{
-		CloseOnStuck:      7,
-		BTLegacyIntrabar:  true,
-		BTLegacyWallet:    true,
-		BTNoKlineDownload: true,
-		NTPLangCode:       "en-US",
-		ShowLangCode:      "zh-CN",
+		CloseOnStuck:         7,
+		BTLegacyIntrabar:     true,
+		BTLegacyOrderMetrics: true,
+		BTLegacyWallet:       true,
+		BTNoKlineDownload:    true,
+		NTPLangCode:          "en-US",
+		ShowLangCode:         "zh-CN",
 		BTInLive: &BtInLiveConfig{
 			Cron: "0 3 * * *", Acount: "primary", MailTo: []string{"ops@example.com"},
 		},
@@ -247,7 +248,8 @@ func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
 	}
 
 	clone := orig.Clone()
-	if clone.CloseOnStuck != orig.CloseOnStuck || !clone.BTLegacyIntrabar || !clone.BTLegacyWallet || !clone.BTNoKlineDownload ||
+	if clone.CloseOnStuck != orig.CloseOnStuck || !clone.BTLegacyIntrabar || !clone.BTLegacyOrderMetrics ||
+		!clone.BTLegacyWallet || !clone.BTNoKlineDownload ||
 		clone.NTPLangCode != orig.NTPLangCode ||
 		clone.ShowLangCode != orig.ShowLangCode || clone.TimeFrames != orig.TimeFrames ||
 		!reflect.DeepEqual(clone.BTInLive, orig.BTInLive) || !reflect.DeepEqual(clone.LLMModels, orig.LLMModels) {

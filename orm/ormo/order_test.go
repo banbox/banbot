@@ -2,11 +2,13 @@ package ormo
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg/errs"
 )
@@ -51,6 +53,32 @@ func newTestOrder() *InOutOrder {
 		Info:       map[string]interface{}{"LocalTrigger": float64(1)},
 		DirtyMain:  true,
 		DirtyEnter: true,
+	}
+}
+
+func newFilledTestOrder() *InOutOrder {
+	order := newTestOrder()
+	order.Status = InOutStatusFullEnter
+	order.Enter.Average = 100
+	order.Enter.Filled = 1
+	return order
+}
+
+func enableStrictHistoricalOrderMetricsTest(t *testing.T) {
+	t.Helper()
+	originalMode, originalData, originalCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.HistoricalCoverage = originalMode, originalData, originalCoverage
+	})
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Data.BTLegacyOrderMetrics = true
+	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
+		BaselineEndMS: 2,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			"BTC/USDT:USDT": {"1h": {{StartMS: 0, StopMS: 2}}},
+		},
 	}
 }
 
@@ -220,5 +248,56 @@ func TestTriggerStateClientIDSurvivesDecodeAndClone(t *testing.T) {
 	clone := state.Clone()
 	if clone.ClientId != state.ClientId || clone.OrderId != state.OrderId {
 		t.Fatalf("cloned trigger identity mismatch: %+v", clone)
+	}
+}
+
+func TestUpdateProfitsPreservesLegacyDrawdownRate(t *testing.T) {
+	enableStrictHistoricalOrderMetricsTest(t)
+
+	legacy := newFilledTestOrder()
+	legacy.UpdateProfits(110)
+	legacy.UpdateProfits(95)
+	if math.Abs(legacy.MaxDrawDown-1.5) > 1e-12 {
+		t.Fatalf("legacy max drawdown = %v, want 1.5", legacy.MaxDrawDown)
+	}
+
+	continuousLoss := newFilledTestOrder()
+	continuousLoss.UpdateProfits(95)
+	if math.Abs(continuousLoss.MaxDrawDown-0.05) > 1e-12 {
+		t.Fatalf("legacy loss drawdown = %v, want 0.05", continuousLoss.MaxDrawDown)
+	}
+
+	config.Data.BTLegacyOrderMetrics = false
+	current := newFilledTestOrder()
+	current.UpdateProfits(110)
+	current.UpdateProfits(95)
+	if current.MaxDrawDown != -5 {
+		t.Fatalf("current max drawdown = %v, want -5", current.MaxDrawDown)
+	}
+}
+
+func TestUpdateProfitsRejectsLegacyMetricsOutsideStrictHistoricalReplay(t *testing.T) {
+	enableStrictHistoricalOrderMetricsTest(t)
+	strictCoverage := config.HistoricalCoverage
+	for _, test := range []struct {
+		name   string
+		change func()
+	}{
+		{name: "non-strict", change: func() { config.Data.BTStrict = false }},
+		{name: "download-enabled", change: func() { config.Data.BTNoKlineDownload = false }},
+		{name: "missing coverage", change: func() { config.HistoricalCoverage = nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core.BackTestMode = true
+			config.Data = config.Config{BTLegacyOrderMetrics: true, BTStrict: true, BTNoKlineDownload: true}
+			config.HistoricalCoverage = strictCoverage
+			test.change()
+			order := newFilledTestOrder()
+			order.UpdateProfits(110)
+			order.UpdateProfits(95)
+			if order.MaxDrawDown != -5 {
+				t.Fatalf("current max drawdown = %v, want -5", order.MaxDrawDown)
+			}
+		})
 	}
 }

@@ -405,12 +405,10 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 	if price < 0 {
 		return nil, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", exs.Symbol)
 	}
-	enterPrice := price
-	if !req.Short && req.Stop > price || req.Short && req.Stop < price && req.Stop > 0 {
-		enterPrice = req.Stop
-	} else if !req.Short && req.Limit > 0 && req.Limit < price || req.Short && req.Limit > price {
-		enterPrice = req.Limit
+	if legacyEntryStopAlreadyCrossed(req.Short, req.Stop, price) {
+		req.Stop = 0
 	}
+	enterPrice := entryInitPrice(req.Short, req.Stop, req.Limit, price)
 	curTimeMS := btime.TimeMS()
 	taskId := ormo.GetTaskID(o.Account)
 	od := &ormo.InOutOrder{
@@ -504,6 +502,34 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 		err = o.afterEnter(od)
 	}
 	return od, err
+}
+
+func legacyEntryStopAlreadyCrossed(short bool, stop, price float64) bool {
+	if !legacyIntrabarEnabled() || stop <= 0 {
+		return false
+	}
+	if short {
+		return price <= stop
+	}
+	return price > stop
+}
+
+func entryInitPrice(short bool, stop, limit, price float64) float64 {
+	if !legacyIntrabarEnabled() {
+		if short && stop > 0 && stop < price {
+			return stop
+		}
+		if !short && stop > price {
+			return stop
+		}
+	}
+	if short && limit > price {
+		return limit
+	}
+	if !short && limit > 0 && limit < price {
+		return limit
+	}
+	return price
 }
 
 func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error) {

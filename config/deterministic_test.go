@@ -62,6 +62,47 @@ func TestStrictBacktestRequiresModeAndFlag(t *testing.T) {
 	}
 }
 
+func TestStrictHistoricalReplayRequiresCompleteContext(t *testing.T) {
+	oldMode, oldData, oldCoverage := core.BackTestMode, Data, HistoricalCoverage
+	t.Cleanup(func() {
+		core.BackTestMode, Data, HistoricalCoverage = oldMode, oldData, oldCoverage
+	})
+
+	strictCoverage := &HistoricalCoverageConfig{
+		BaselineEndMS: 2,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BTC/USDT:USDT": {"1h": {{StartMS: 0, StopMS: 2}}},
+		},
+	}
+	resetContext := func() {
+		core.BackTestMode = true
+		Data = Config{BTStrict: true, BTNoKlineDownload: true}
+		HistoricalCoverage = strictCoverage
+	}
+	resetContext()
+	if !StrictHistoricalReplay(HistoricalCoverage) {
+		t.Fatal("complete strict historical replay context was rejected")
+	}
+
+	for _, test := range []struct {
+		name   string
+		change func()
+	}{
+		{name: "non-backtest", change: func() { core.BackTestMode = false }},
+		{name: "non-strict", change: func() { Data.BTStrict = false }},
+		{name: "download-enabled", change: func() { Data.BTNoKlineDownload = false }},
+		{name: "missing coverage", change: func() { HistoricalCoverage = nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetContext()
+			test.change()
+			if StrictHistoricalReplay(HistoricalCoverage) {
+				t.Fatal("incomplete historical replay context was accepted")
+			}
+		})
+	}
+}
+
 func TestInitExgAccsSelectsCanonicalBacktestAccount(t *testing.T) {
 	oldAccounts, oldBak := Accounts, BakAccounts
 	oldExchange, oldDefAcc := Exchange, DefAcc

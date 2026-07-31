@@ -218,8 +218,8 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			trigPrice := od.Stop
 			lowVal, _ := evt.LowValue()
 			highVal, _ := evt.HighValue()
-			if trigPrice < lowVal || trigPrice > highVal {
-				// 不处于bar的范围，无法触发
+			if !stopEntryTriggered(odIsBuy, trigPrice, lowVal, highVal) {
+				// The bar has not crossed the stop in the order direction.
 				continue
 			}
 			price = trigPrice
@@ -314,6 +314,16 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 		}
 	}
 	return affectNum, nil
+}
+
+func stopEntryTriggered(isBuy bool, trigger, low, high float64) bool {
+	if legacyIntrabarEnabled() {
+		if isBuy {
+			return trigger <= high
+		}
+		return trigger >= low
+	}
+	return trigger >= low && trigger <= high
 }
 
 func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fillMS int64) *errs.Error {
@@ -1020,7 +1030,7 @@ func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, m
 }
 
 func legacyIntrabarEnabled() bool {
-	return core.BackTestMode && config.Data.BTLegacyIntrabar
+	return config.StrictHistoricalReplay(config.HistoricalCoverage) && config.Data.BTLegacyIntrabar
 }
 
 /*
