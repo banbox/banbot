@@ -101,6 +101,21 @@ func Setup() *errs.Error {
 	return setup(false)
 }
 
+// SetupReadOnly initializes the Timescale connection and symbol cache without migrations or metadata writes.
+func SetupReadOnly() *errs.Error {
+	stopCompactWorker()
+	if pool != nil {
+		pool.Close()
+		pool = nil
+	}
+	var err *errs.Error
+	pool, err = pgConnPool()
+	if err != nil {
+		return err
+	}
+	return LoadAllExSymbols()
+}
+
 func SetupWithAutoCompact(autoCompact bool) *errs.Error {
 	return setup(autoCompact)
 }
