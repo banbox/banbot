@@ -69,8 +69,9 @@ func TestKLineSeriesStoreBuildsBackendSQL(t *testing.T) {
 }
 
 func TestKLineSeriesStoreReadRejectsUncoveredTargetBeforeDatabase(t *testing.T) {
-	previousMode, previousCoverage, previousRange := core.BackTestMode, config.HistoricalCoverage, config.TimeRange
+	previousMode, previousData, previousCoverage, previousRange := core.BackTestMode, config.Data, config.HistoricalCoverage, config.TimeRange
 	core.BackTestMode = true
+	config.Data = config.Config{BTStrict: true, BTNoKlineDownload: true}
 	config.TimeRange = &config.TimeTuple{StartMS: 100, EndMS: 2000}
 	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
 		BaselineEndMS: 1000,
@@ -79,7 +80,7 @@ func TestKLineSeriesStoreReadRejectsUncoveredTargetBeforeDatabase(t *testing.T) 
 		},
 	}
 	t.Cleanup(func() {
-		core.BackTestMode, config.HistoricalCoverage, config.TimeRange = previousMode, previousCoverage, previousRange
+		core.BackTestMode, config.Data, config.HistoricalCoverage, config.TimeRange = previousMode, previousData, previousCoverage, previousRange
 	})
 	store := NewKLineSeriesStore(NewKLineSeriesInfo("signal", "1h", []SeriesField{{Name: "signal", Type: "float"}}))
 	rows, err := store.Read(context.Background(), &ExSymbol{ID: 2, Symbol: "ETH/USDT:USDT"}, 100, 2000, 0)

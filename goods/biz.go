@@ -87,7 +87,11 @@ func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 			log.Info(fmt.Sprintf("gen symbols from %s, num: %d", pairProducer.GetName(), len(pairs)))
 		}
 	}
-	err = orm.EnsureCurSymbols(pairs)
+	if config.Args != nil && config.Args.ReadOnlyReplay {
+		err = orm.ValidateCurSymbolsReadOnly(pairs)
+	} else {
+		err = orm.EnsureCurSymbols(pairs)
+	}
 	if err != nil {
 		return nil, err
 	}

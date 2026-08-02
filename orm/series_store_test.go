@@ -134,15 +134,18 @@ func TestSeriesStoreReadConvertsRecordsToEvents(t *testing.T) {
 }
 
 func TestSeriesStoreReadCannotBypassHistoricalKlineCoverage(t *testing.T) {
-	previousMode, previousCoverage := core.BackTestMode, config.HistoricalCoverage
+	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
 	core.BackTestMode = true
+	config.Data = config.Config{BTStrict: true, BTNoKlineDownload: true}
 	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
 		BaselineEndMS: 1000,
 		Bars: map[string]map[string][]config.HistoricalCoverageRange{
 			"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 1000}}},
 		},
 	}
-	t.Cleanup(func() { core.BackTestMode, config.HistoricalCoverage = previousMode, previousCoverage })
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.HistoricalCoverage = previousMode, previousData, previousCoverage
+	})
 	repo := &stubStoreRepo{queryRows: []*DataRecord{{Sid: 2, TimeMS: 100, EndMS: 200}}}
 	store := NewSeriesStore(repo)
 	info := NewSeriesInfo("signal", "1h", []SeriesField{{Name: "signal", Type: "float"}})

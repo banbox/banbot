@@ -53,3 +53,18 @@ func TestStrictFlagPopulatesCommandArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestReadOnlyReplayFlagPopulatesCommandArgs(t *testing.T) {
+	var captured *config.CmdArgs
+	command := newConfigCommand("backtest-test", "", func(args *config.CmdArgs) *errs.Error {
+		captured = args
+		return nil
+	}, false, bindReadOnlyReplay)
+	command.SetArgs([]string{"--read-only-replay"})
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured == nil || !captured.ReadOnlyReplay {
+		t.Fatalf("read-only replay flag was not applied: %#v", captured)
+	}
+}

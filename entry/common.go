@@ -91,7 +91,8 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 		bindStakeAmount, bindPairs, bindSpider, bindOut))
 	add("", newInternalCommand())
 	add("", newConfigCommand("backtest", "backtest with strategies and data", RunBackTest, true,
-		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate, bindBTStrict))
+		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate,
+		bindBTStrict, bindReadOnlyReplay))
 	add("", newConfigCommand("spider", "start the spider", RunSpider, false))
 	add("", newConfigCommand("optimize", "run hyperparameter optimization", opt.RunOptimize, true,
 		bindOut, bindOptRounds, bindSampler, bindPicker, bindEachPairs, bindConcur, bindBTStrict))
@@ -294,4 +295,8 @@ func bindSeparate(args *config.CmdArgs, flags *pflag.FlagSet) {
 
 func bindBTStrict(args *config.CmdArgs, flags *pflag.FlagSet) {
 	flags.BoolVar(&args.BTStrict, "bt-strict", false, "enable strict backtest mode")
+}
+
+func bindReadOnlyReplay(args *config.CmdArgs, flags *pflag.FlagSet) {
+	flags.BoolVar(&args.ReadOnlyReplay, "read-only-replay", false, "disable all backtest database setup writes")
 }

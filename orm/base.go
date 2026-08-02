@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sasha-s/go-deadlock"
@@ -49,7 +51,8 @@ var (
 	sqlitePoolsLock = deadlock.Mutex{}
 
 	// IsQuestDB QuestDB (PGWire, port 8812). TimescaleDB (standard PostgreSQL, port 5432).
-	IsQuestDB = true
+	IsQuestDB                  = true
+	inheritedReplayDatabaseFDs bool
 )
 
 var (
@@ -103,6 +106,16 @@ func Setup() *errs.Error {
 
 // SetupReadOnly initializes the Timescale connection and symbol cache without migrations or metadata writes.
 func SetupReadOnly() *errs.Error {
+	inheritedReplayDatabaseFDs = false
+	return setupReadOnly()
+}
+
+func SetupReadOnlyReplay() *errs.Error {
+	inheritedReplayDatabaseFDs = true
+	return setupReadOnly()
+}
+
+func setupReadOnly() *errs.Error {
 	stopCompactWorker()
 	if pool != nil {
 		pool.Close()
@@ -121,6 +134,7 @@ func SetupWithAutoCompact(autoCompact bool) *errs.Error {
 }
 
 func setup(autoCompact bool) *errs.Error {
+	inheritedReplayDatabaseFDs = false
 	stopCompactWorker()
 	if pool != nil {
 		pool.Close()
@@ -236,6 +250,13 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	if err_ != nil {
 		return nil, errs.New(core.ErrBadConfig, err_)
 	}
+	if inheritedReplayDatabaseFDs {
+		dial, dialErr := inheritedReplayDatabaseDialer(os.Getenv("BANBOT_REPLAY_DB_FDS"))
+		if dialErr != nil {
+			return nil, errs.New(core.ErrBadConfig, dialErr)
+		}
+		poolCfg.ConnConfig.DialFunc = dial
+	}
 
 	// Detect DB type from explicit config or port heuristic.
 	dbType := strings.ToLower(strings.TrimSpace(dbCfg.DbType))
@@ -308,6 +329,36 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	}
 
 	return dbPool, nil
+}
+
+func inheritedReplayDatabaseDialer(raw string) (pgconn.DialFunc, error) {
+	parts := strings.Split(strings.TrimSpace(raw), "-")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("BANBOT_REPLAY_DB_FDS must be a descriptor range")
+	}
+	first, firstErr := strconv.Atoi(parts[0])
+	last, lastErr := strconv.Atoi(parts[1])
+	if firstErr != nil || lastErr != nil || first < 3 || last < first || last-first > 255 {
+		return nil, fmt.Errorf("BANBOT_REPLAY_DB_FDS range is invalid")
+	}
+	var lock sync.Mutex
+	next := first
+	return func(context.Context, string, string) (net.Conn, error) {
+		lock.Lock()
+		fd := next
+		next++
+		lock.Unlock()
+		if fd > last {
+			return nil, fmt.Errorf("historical replay database descriptor pool is exhausted")
+		}
+		file := os.NewFile(uintptr(fd), fmt.Sprintf("historical-replay-db-%d", fd))
+		if file == nil {
+			return nil, fmt.Errorf("historical replay database descriptor %d is unavailable", fd)
+		}
+		connection, err := net.FileConn(file)
+		_ = file.Close()
+		return connection, err
+	}, nil
 }
 
 // normalizeDatabaseURL accepts legacy configs that bracket an IPv4 host. URL
@@ -748,6 +799,19 @@ func InitExg(exchange banexg.BanExchange) *errs.Error {
 	marketType := exchange.Info().MarketType
 	if marketType == banexg.MarketLinear || marketType == banexg.MarketInverse {
 		initializeLeverageBrackets(exchange, validAcc)
+	}
+	return nil
+}
+
+func InitExgReadOnly(exchange banexg.BanExchange) *errs.Error {
+	if !hasConfiguredMarketSnapshot() {
+		return errs.NewMsg(core.ErrBadConfig, "read-only replay requires a frozen market snapshot")
+	}
+	if _, err := LoadMarkets(exchange, false); err != nil {
+		return err
+	}
+	if marketType := exchange.Info().MarketType; marketType == banexg.MarketLinear || marketType == banexg.MarketInverse {
+		return exchange.InitLeverageBrackets()
 	}
 	return nil
 }

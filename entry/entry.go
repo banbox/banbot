@@ -24,7 +24,11 @@ import (
 
 func RunBackTest(args *config.CmdArgs) *errs.Error {
 	core.SetRunMode(core.RunModeBackTest)
-	err := biz.SetupComsExg(args)
+	setup := biz.SetupComsExg
+	if args.ReadOnlyReplay {
+		setup = biz.SetupComsExgReadOnly
+	}
+	err := setup(args)
 	if err != nil {
 		return err
 	}
