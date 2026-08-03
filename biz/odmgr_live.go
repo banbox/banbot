@@ -211,6 +211,26 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 
 			// 如果本地订单量大于实际持仓量,需要关闭部分订单
 			if localAmt > posAmt*1.02 {
+				// A position snapshot can arrive before the private fill stream. Reconcile
+				// submitted exits by their own exchange IDs before using the aggregate
+				// no-match fallback, so a sibling order is never chosen for that fill.
+				changed, pending := o.reconcilePendingExitOrders(curOds)
+				if changed {
+					localAmt = 0
+					for _, od := range curOds {
+						localAmt += od.HoldAmount()
+					}
+				}
+				if localAmt <= posAmt*1.02 {
+					continue
+				}
+				if pending {
+					log.Warn("defer local position mismatch while exit order is pending",
+						zap.String("acc", o.Account), zap.String("pair", symbol), zap.Bool("short", isShort),
+						zap.Float64("localAmt", localAmt), zap.Float64("exgAmt", posAmt))
+					continue
+				}
+
 				// 按数量降序排序
 				sort.Slice(curOds, func(i, j int) bool {
 					amtI := curOds[i].HoldAmount()
@@ -256,6 +276,75 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 		}
 	}
 	return closedList, nil
+}
+
+// normalizeAuthoritativeOrder makes a FetchOrder snapshot safe for the generic
+// out-of-order guard. Some exchanges expose an order's creation time as Timestamp,
+// even after it has filled. A direct FetchOrder result is authoritative, so retain
+// the latest known local timestamp instead of rejecting a completed snapshot.
+func normalizeAuthoritativeOrder(res *banexg.Order, localUpdateAt int64) *banexg.Order {
+	normalized := *res
+	normalized.Timestamp = max(res.Timestamp, res.LastTradeTimestamp, res.LastUpdateTimestamp, localUpdateAt)
+	return &normalized
+}
+
+// reconcilePendingExitOrders refreshes submitted exits by their exchange order IDs.
+// It returns pending=true when an exit cannot yet be authoritatively resolved; callers
+// must then avoid attributing a position delta to another local order.
+func (o *LiveOrderMgr) reconcilePendingExitOrders(ods []*ormo.InOutOrder) (changed, pending bool) {
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		exit := od.Exit
+		if exit == nil || exit.OrderID == "" || exit.Status == ormo.OdStatusClosed ||
+			od.Status >= ormo.InOutStatusFullExit {
+			lock.Unlock()
+			continue
+		}
+		orderID, symbol, odKey := exit.OrderID, od.Symbol, od.Key()
+		lock.Unlock()
+
+		res, err := exg.Default.FetchOrder(symbol, orderID, map[string]interface{}{
+			banexg.ParamAccount: o.Account,
+		})
+		if err != nil {
+			pending = true
+			log.Warn("reconcile pending exit fetch fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if res == nil || res.ID != orderID {
+			pending = true
+			log.Warn("reconcile pending exit invalid response", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID))
+			continue
+		}
+
+		lock = od.Lock()
+		exit = od.Exit
+		if exit == nil || exit.OrderID != orderID || exit.Status == ormo.OdStatusClosed ||
+			od.Status >= ormo.InOutStatusFullExit {
+			lock.Unlock()
+			continue
+		}
+		beforeFilled, beforeStatus := exit.Filled, od.Status
+		err = o.updateOdByExgRes(od, false, normalizeAuthoritativeOrder(res, exit.UpdateAt))
+		changed = changed || exit.Filled > beforeFilled+AmtDust || od.Status != beforeStatus
+		unresolved := od.Status < ormo.InOutStatusFullExit && exit.Status != ormo.OdStatusClosed
+		lock.Unlock()
+		if err != nil {
+			pending = true
+			log.Error("reconcile pending exit apply fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if unresolved {
+			pending = true
+		}
+	}
+	return changed, pending
 }
 
 /*
@@ -3047,11 +3136,8 @@ func (o *LiveOrderMgr) applyAuthoritativeEnterOrder(od *ormo.InOutOrder, res *ba
 	}
 	wasFullEnter := od.Status == ormo.InOutStatusFullEnter && od.Enter.Status == ormo.OdStatusClosed
 
-	// Binance futures uses the order creation time as Timestamp. Use the latest
-	// known timestamp so an authoritative fetch is not rejected as older state.
-	normalized := *res
-	normalized.Timestamp = max(res.Timestamp, res.LastTradeTimestamp, res.LastUpdateTimestamp, od.Enter.UpdateAt)
-	err := o.updateOdByExgRes(od, true, &normalized)
+	err := o.updateOdByExgRes(od, true, normalizeAuthoritativeOrder(res, od.Enter.UpdateAt))
+
 	if err != nil || !od.IsDirty() {
 		return err
 	}
