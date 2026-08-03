@@ -32,6 +32,14 @@ func TestRootCommandExposesCobraHelp(t *testing.T) {
 	}
 }
 
+func TestPanicStackContainsCaller(t *testing.T) {
+	stack := string(panicStack())
+	if !strings.Contains(stack, "TestPanicStackContainsCaller") ||
+		!strings.Contains(stack, "runtime/debug.Stack") {
+		t.Fatalf("panic stack does not contain its caller: %s", stack)
+	}
+}
+
 func TestConfigCommandParsesRepeatedConfigAndLegacyFlags(t *testing.T) {
 	var captured *config.CmdArgs
 	command := newConfigCommand("capture", "capture args", func(args *config.CmdArgs) *errs.Error {

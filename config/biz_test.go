@@ -190,11 +190,12 @@ func TestRunPolicyToYamlRoundTrip(t *testing.T) {
 func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
 	temperature := 0.25
 	orig := &Config{
-		CloseOnStuck:     7,
-		BTLegacyIntrabar: true,
-		BTLegacyWallet:   true,
-		NTPLangCode:      "en-US",
-		ShowLangCode:     "zh-CN",
+		CloseOnStuck:      7,
+		BTLegacyIntrabar:  true,
+		BTLegacyWallet:    true,
+		BTNoKlineDownload: true,
+		NTPLangCode:       "en-US",
+		ShowLangCode:      "zh-CN",
 		BTInLive: &BtInLiveConfig{
 			Cron: "0 3 * * *", Acount: "primary", MailTo: []string{"ops@example.com"},
 		},
@@ -209,7 +210,7 @@ func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
 	}
 
 	clone := orig.Clone()
-	if clone.CloseOnStuck != orig.CloseOnStuck || !clone.BTLegacyIntrabar || !clone.BTLegacyWallet ||
+	if clone.CloseOnStuck != orig.CloseOnStuck || !clone.BTLegacyIntrabar || !clone.BTLegacyWallet || !clone.BTNoKlineDownload ||
 		clone.NTPLangCode != orig.NTPLangCode ||
 		clone.ShowLangCode != orig.ShowLangCode || clone.TimeFrames != orig.TimeFrames ||
 		!reflect.DeepEqual(clone.BTInLive, orig.BTInLive) || !reflect.DeepEqual(clone.LLMModels, orig.LLMModels) {
@@ -232,6 +233,16 @@ func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
 	}
 	if orig.LLMModels["primary"].APIKey != "llm-secret" {
 		t.Fatal("desensitizing LLM config mutated the source")
+	}
+}
+
+func TestParseYmlConfigBTNoKlineDownload(t *testing.T) {
+	cfg, err := ParseYmlConfig([]byte("bt_no_kline_download: true\n"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.BTNoKlineDownload {
+		t.Fatal("bt_no_kline_download was not parsed")
 	}
 }
 

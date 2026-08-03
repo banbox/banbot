@@ -1,6 +1,7 @@
 package strat
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"slices"
@@ -76,7 +77,10 @@ func (s *TradeStrat) pickTimeFrame(symbol string, tfScores map[string]float64) s
 		}
 	}
 	slices.SortFunc(curScores, func(a, b *core.TfScore) int {
-		return int((a.Score - b.Score) * 1000)
+		if order := cmp.Compare(a.Score, b.Score); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.TF, b.TF)
 	})
 	if s.PickTimeFrame != nil {
 		return s.PickTimeFrame(symbol, curScores)

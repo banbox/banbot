@@ -65,7 +65,7 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 			banexg.ParamDebug: DebugDownKLine,
 		})
 		if err != nil {
-			return err
+			return contextualKlineOperationError("fetch", pair, timeFrame, curSince, 0, curSize, err)
 		}
 		retSize := len(data)
 		log.Debug("fetch kline", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Int("curSize", curSize), zap.Int64("since", curSince),
@@ -80,6 +80,18 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 		curSince = nextFetchSince(curSince, curSize, tfMSecs, data)
 	}
 	return nil
+}
+
+func contextualKlineOperationError(operation, pair, timeFrame string, startMS, endMS int64, limit int, opErr *errs.Error) *errs.Error {
+	if opErr == nil {
+		return nil
+	}
+	context := fmt.Sprintf("%s OHLCV pair=%s timeframe=%s start_ms=%d end_ms=%d limit=%d",
+		operation, pair, timeFrame, startMS, endMS, limit)
+	if strings.TrimSpace(opErr.Message()) == "" {
+		return errs.NewMsg(core.ErrRunTime, "%s failed with empty error code=%d", context, opErr.Code)
+	}
+	return errs.NewFull(opErr.Code, opErr, "%s", context)
 }
 
 func nextFetchSince(curSince int64, curSize int, tfMSecs int64, clean []*banexg.Kline) int64 {
@@ -108,8 +120,16 @@ func (q *Queries) DownOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, timeF
 
 func (q *Queries) downOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
 	retry int, pBar *utils.PrgBar) (int, *errs.Error) {
-	startMS = exs.GetValidStart(startMS)
+	startMS, endMS = validKlineDownloadRange(exs, startMS, endMS)
 	return downOHLCV2DBRange(q, exchange, exs, timeFrame, startMS, endMS, retry, pBar)
+}
+
+func validKlineDownloadRange(exs *ExSymbol, startMS, endMS int64) (int64, int64) {
+	startMS = exs.GetValidStart(startMS)
+	if exs.DelistMs > 0 && (endMS == 0 || exs.DelistMs < endMS) {
+		endMS = exs.DelistMs
+	}
+	return startMS, endMS
 }
 
 /*
@@ -121,7 +141,8 @@ stepCB 用于更新进度，总值固定1000，避免内部下载区间大于传
 */
 func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
 	retry int, pBar *utils.PrgBar) (int, *errs.Error) {
-	if startMS >= endMS || exs.Combined || exs.DelistMs > 0 || core.NetDisable {
+	startMS, endMS = validKlineDownloadRange(exs, startMS, endMS)
+	if startMS >= endMS || exs.Combined || core.NetDisable {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
 		}
@@ -367,6 +388,10 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	}()
 
 	wg.Wait()
+	if outErr != nil {
+		clearInsJob = false
+		return saveNum, outErr
+	}
 
 	// Unfinished bar (best-effort).
 	curMS := btime.UTCStamp()
@@ -390,7 +415,7 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 				return saveNum, waitErr
 			}
 		}
-		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, true, true)
+		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, false, true)
 		if updErr != nil {
 			clearInsJob = false
 			if outErr == nil {
@@ -407,7 +432,27 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 			}
 		}
 	}
+	if outErr == nil {
+		outErr = reconcileDownloadedRanges(succDown, func(item MSRange) *errs.Error {
+			if holeErr := sess.repairKlineRangeFromPhysical(exs.ID, timeFrame, item.Start, item.Stop); holeErr != nil {
+				return holeErr
+			}
+			return sess.updateBigHyper(exs, timeFrame, item.Start, item.Stop)
+		})
+		if outErr != nil {
+			clearInsJob = false
+		}
+	}
 	return saveNum, outErr
+}
+
+func reconcileDownloadedRanges(ranges []MSRange, reconcile func(MSRange) *errs.Error) *errs.Error {
+	for _, item := range ranges {
+		if err := reconcile(item); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 /*
@@ -713,14 +758,59 @@ func BulkDownOHLCV(exchange banexg.BanExchange, exsList map[int32]*ExSymbol, tim
 		}
 	}
 	sidList := utils.KeysOfMap(exsList)
-	return utils.ParallelRun(sidList, core.ConcurNum, func(_ int, i int32) *errs.Error {
+	err = utils.ParallelRun(sidList, core.ConcurNum, func(_ int, i int32) *errs.Error {
 		exs, _ := exsList[i]
-		if exs.DelistMs > 0 {
-			return nil
-		}
 		_, dlErr := downOHLCV2DBRange(nil, exchange, exs, downTF, startMS, endMS, 2, pBar)
-		return dlErr
+		return contextualKlineOperationError("download", exs.Symbol, timeFrame, startMS, endMS, 0, dlErr)
 	})
+	return contextualKlineOperationError("bulk download", fmt.Sprintf("%d pairs", len(exsList)), timeFrame, startMS, endMS, 0, err)
+}
+
+func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS, endMS int64) *errs.Error {
+	sess, conn, err := Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	for _, timeFrame := range timeFrames {
+		storageTF, storageErr := repairKlineStorageTimeframe(timeFrame)
+		if storageErr != nil {
+			return storageErr
+		}
+		tfMSecs := int64(utils2.TFToSecs(storageTF) * 1000)
+		if tfMSecs <= 0 {
+			return errs.NewMsg(errs.CodeParamInvalid, "invalid timeframe: %s", timeFrame)
+		}
+		for _, exs := range exsList {
+			start, stop := repairKlineWindow(exs, startMS, endMS, tfMSecs)
+			if start >= stop {
+				continue
+			}
+			if err = sess.repairKlineRangeFromPhysical(exs.ID, storageTF, start, stop); err != nil {
+				return contextualKlineOperationError("repair", exs.Symbol, storageTF, start, stop, 0, err)
+			}
+		}
+	}
+	return nil
+}
+
+// repairKlineStorageTimeframe maps a requested consumer timeframe to the
+// table that physically stores its bars.  Unconfigured periods such as 4h
+// are read by aggregating their download timeframe (1h), so their metadata
+// must be rebuilt against that table rather than a nonexistent kline_4h.
+// Explicit configured aggregates retain their own physical table.
+func repairKlineStorageTimeframe(timeFrame string) (string, *errs.Error) {
+	if _, configuredAggregate := aggMap[timeFrame]; configuredAggregate {
+		return timeFrame, nil
+	}
+	return GetDownTF(timeFrame)
+}
+
+func repairKlineWindow(exs *ExSymbol, startMS, endMS, tfMSecs int64) (int64, int64) {
+	startMS = exs.GetValidStart(startMS)
+	startMS = ((startMS + tfMSecs - 1) / tfMSecs) * tfMSecs
+	endMS = (endMS / tfMSecs) * tfMSecs
+	return startMS, endMS
 }
 
 /*

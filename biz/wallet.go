@@ -393,7 +393,7 @@ func (iw *ItemWallet) Used() float64 {
 
 func sumWalletMap(values map[string]float64) float64 {
 	var total float64
-	if core.BackTestMode && config.Data.BTLegacyWallet {
+	if stableWalletBacktest() {
 		for _, key := range slices.Sorted(maps.Keys(values)) {
 			total += values[key]
 		}
@@ -1049,7 +1049,7 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 }
 
 func legacyWalletOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
-	if !core.BackTestMode || !config.Data.BTLegacyWallet || len(orders) < 2 {
+	if !stableWalletBacktest() || len(orders) < 2 {
 		return orders
 	}
 	result := slices.Clone(orders)
@@ -1064,6 +1064,10 @@ func walletMarkPrice(symbol string) float64 {
 		return com.GetLastBarPrice(symbol)
 	}
 	return com.GetPriceSafe(symbol, "")
+}
+
+func stableWalletBacktest() bool {
+	return core.BackTestMode && (config.Data.BTLegacyWallet || config.Data.BTStrict)
 }
 
 func (w *BanWallets) GetAmountByLegal(symbol string, legalCost float64) float64 {
@@ -1098,7 +1102,7 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 	var skips []string
 
 	keys := maps.Keys(data)
-	if core.BackTestMode && config.Data.BTLegacyWallet {
+	if stableWalletBacktest() {
 		keys = slices.Values(slices.Sorted(keys))
 	}
 	for key := range keys {
@@ -1192,9 +1196,12 @@ Returns the value of the given currency against fiat currency. Returns all curre
 */
 func (w *BanWallets) FiatValue(withUpol bool, symbols ...string) float64 {
 	if len(symbols) == 0 {
-		// Reporting does not require canonical coin order, so avoid sorting all wallet keys.
-		for symbol := range w.Items {
-			symbols = append(symbols, symbol)
+		if config.StrictBacktest() {
+			symbols = slices.Sorted(maps.Keys(w.Items))
+		} else {
+			for symbol := range w.Items {
+				symbols = append(symbols, symbol)
+			}
 		}
 	}
 

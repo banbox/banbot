@@ -15,6 +15,8 @@ package orm
 import (
 	"reflect"
 	"testing"
+
+	"github.com/banbox/banexg/errs"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +112,20 @@ func TestSubtractMSRangesNoCoverage(t *testing.T) {
 	want := []MSRange{{Start: 0, Stop: 100}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("want=%v got=%v", want, got)
+	}
+}
+
+func TestReconcileDownloadedRangesIncludesEmptyAndPartialResponses(t *testing.T) {
+	ranges := []MSRange{{Start: 100, Stop: 200}, {Start: 400, Stop: 900}}
+	var reconciled []MSRange
+	if err := reconcileDownloadedRanges(ranges, func(item MSRange) *errs.Error {
+		reconciled = append(reconciled, item)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reconciled, ranges) {
+		t.Fatalf("downloaded ranges were not all reconciled: got=%v want=%v", reconciled, ranges)
 	}
 }
 

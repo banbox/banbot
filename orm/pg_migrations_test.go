@@ -13,6 +13,42 @@ func TestPgMigrationReconcilesAggRulesAfterVersion4(t *testing.T) {
 	}
 }
 
+func TestPgMigrationsAreOrderedByVersion(t *testing.T) {
+	previous := 0
+	for _, migration := range strings.Split(ddlPgMigrations, "-- version") {
+		lines := strings.SplitN(strings.TrimSpace(migration), "\n", 2)
+		if len(lines) != 2 {
+			continue
+		}
+		version, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+		if err != nil {
+			continue
+		}
+		if version <= previous {
+			t.Fatalf("migration version %d follows %d", version, previous)
+		}
+		previous = version
+	}
+}
+
+func TestPgMigrationsUseIdempotentExsymbolIndex(t *testing.T) {
+	for _, version := range []int{1, 2, 3} {
+		body := pgMigrationBody(version)
+		if !strings.Contains(body, "create unique index if not exists ix_exsymbol_unique") {
+			t.Fatalf("migration version %d does not preserve an idempotent exsymbol index", version)
+		}
+	}
+}
+
+func TestLegacyCalendarRenamePrecedesBaseSchema(t *testing.T) {
+	text := strings.ToLower(legacyPgCalendarRenameSQL)
+	for _, want := range []string{"table_name = 'calendars'", "column_name = 'name'", "rename column name to market"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("legacy base-schema compatibility SQL is missing %q", want)
+		}
+	}
+}
+
 func TestPgMigrationReconcilesLegacyMetadataSchema(t *testing.T) {
 	version6 := pgMigrationBody(6)
 	for _, want := range []string{

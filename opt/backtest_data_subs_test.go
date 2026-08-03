@@ -67,6 +67,24 @@ func TestBackTestInitEnsuresThirdPartyBeforeLoop(t *testing.T) {
 	}
 }
 
+func TestAllowBacktestKlineDownload(t *testing.T) {
+	previous := config.Data.BTNoKlineDownload
+	defer func() { config.Data.BTNoKlineDownload = previous }()
+
+	config.Data.BTNoKlineDownload = false
+	if !allowBacktestKlineDownload(false) {
+		t.Fatal("normal backtests should download missing klines by default")
+	}
+	if allowBacktestKlineDownload(true) {
+		t.Fatal("optimization backtests should not download klines")
+	}
+
+	config.Data.BTNoKlineDownload = true
+	if allowBacktestKlineDownload(false) {
+		t.Fatal("bt_no_kline_download should disable implicit kline downloads")
+	}
+}
+
 func TestBackTestEnsureThirdPartyRangeUsesWarmupDepthAndRunWindow(t *testing.T) {
 	prevTimeRange := config.TimeRange
 	prevEnvReal := core.EnvReal

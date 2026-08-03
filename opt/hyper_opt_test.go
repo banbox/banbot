@@ -5,15 +5,47 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
 	"gopkg.in/yaml.v3"
 )
+
+func TestResetOptimizeTrialStakePctAmt(t *testing.T) {
+	oldAccounts, oldStakePct := config.Accounts, config.StakePct
+	t.Cleanup(func() {
+		config.Accounts, config.StakePct = oldAccounts, oldStakePct
+	})
+	config.StakePct = 10
+	config.Accounts = map[string]*config.AccountConfig{
+		config.DefAcc: {StakePctAmt: 100, StakeRate: 1.5},
+		"secondary":   {StakePctAmt: 250, MaxStakeAmt: 300},
+	}
+
+	resetOptimizeTrialVars()
+	for account, cfg := range config.Accounts {
+		if cfg.StakePctAmt != 0 {
+			t.Fatalf("account %s retained previous trial stake base: %v", account, cfg.StakePctAmt)
+		}
+	}
+	if config.Accounts[config.DefAcc].StakeRate != 1.5 || config.Accounts["secondary"].MaxStakeAmt != 300 {
+		t.Fatal("trial reset changed persistent account sizing settings")
+	}
+
+	wallets := &biz.BanWallets{Account: config.DefAcc, Items: map[string]*biz.ItemWallet{
+		"USDT": {Coin: "USDT", Available: 1100},
+	}}
+	wallets.TryUpdateStakePctAmt()
+	if got := config.Accounts[config.DefAcc].StakePctAmt; got != 110 {
+		t.Fatalf("fresh trial stake base = %v, want 110", got)
+	}
+}
 
 func TestRunBayesReturnsFirstTrialError(t *testing.T) {
 	runErr := errs.NewMsg(core.ErrRunTime, "trial backtest failed")
@@ -454,14 +486,16 @@ func TestMarshalOptimizeChildConfigPreservesPolicyAndOverrides(t *testing.T) {
 
 func TestOptimizeChildBaseArgsForwardsConfigSourcesWithoutInlineSecrets(t *testing.T) {
 	args := &config.CmdArgs{
-		OptRounds:  12,
-		Sampler:    "bayes",
-		EachPairs:  true,
-		NoDefault:  true,
-		DataDir:    t.TempDir(),
-		Configs:    config.ArrString{"one.yml", "two.yml"},
-		ConfigData: "stake_amount: 42\nsecret_probe: do-not-log-inline\n",
-		Picker:     "score",
+		OptRounds:   12,
+		Sampler:     "bayes",
+		EachPairs:   true,
+		NoDefault:   true,
+		DataDir:     t.TempDir(),
+		Configs:     config.ArrString{"one.yml", "two.yml"},
+		ConfigData:  "stake_amount: 42\nsecret_probe: do-not-log-inline\n",
+		Picker:      "score",
+		BTStrict:    true,
+		BTStrictSet: true,
 	}
 	cmds, cleanup, err := optimizeChildBaseArgs(args)
 	if err != nil {
@@ -471,6 +505,9 @@ func TestOptimizeChildBaseArgsForwardsConfigSourcesWithoutInlineSecrets(t *testi
 	joined := strings.Join(cmds, " ")
 	if !strings.Contains(joined, "-no-default") || !strings.Contains(joined, "-datadir "+args.DataDir) || !strings.Contains(joined, "-config one.yml -config two.yml") {
 		t.Fatalf("config source flags missing: %v", cmds)
+	}
+	if !strings.Contains(joined, "-bt-strict=true") {
+		t.Fatalf("strict backtest flag missing: %v", cmds)
 	}
 	if strings.Contains(joined, "do-not-log-inline") {
 		t.Fatalf("inline config leaked into child command: %v", cmds)
@@ -484,6 +521,32 @@ func TestOptimizeChildBaseArgsForwardsConfigSourcesWithoutInlineSecrets(t *testi
 	data, readErr := os.ReadFile(inlinePath)
 	if readErr != nil || string(data) != args.ConfigData {
 		t.Fatalf("forwarded inline config = %q, err=%v", data, readErr)
+	}
+}
+
+func TestOptimizeChildBaseArgsForwardsExplicitStrictFalse(t *testing.T) {
+	cmds, cleanup, err := optimizeChildBaseArgs(&config.CmdArgs{
+		OptRounds: 1, Sampler: "random", BTStrictSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if !slices.Contains(cmds, "-bt-strict=false") {
+		t.Fatalf("explicit false override missing: %v", cmds)
+	}
+}
+
+func TestOptimizeChildBaseArgsOmitsUnsetStrictFlag(t *testing.T) {
+	cmds, cleanup, err := optimizeChildBaseArgs(&config.CmdArgs{OptRounds: 1, Sampler: "random"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	for _, arg := range cmds {
+		if strings.HasPrefix(arg, "-bt-strict") {
+			t.Fatalf("unset strict backtest flag forwarded: %v", cmds)
+		}
 	}
 }
 

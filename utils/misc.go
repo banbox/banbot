@@ -3,6 +3,7 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
@@ -16,12 +17,15 @@ import (
 	"github.com/banbox/cron/v3"
 	"github.com/felixge/fgprof"
 	"io"
+	"iter"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +84,14 @@ func KeysOfMap[M ~map[K]V, K comparable, V any](m M) []K {
 		r = append(r, k)
 	}
 	return r
+}
+
+func MapKeys[M ~map[K]V, K cmp.Ordered, V any](m M, sorted bool) iter.Seq[K] {
+	keys := maps.Keys(m)
+	if sorted {
+		return slices.Values(slices.Sorted(keys))
+	}
+	return keys
 }
 
 func ValsOfMap[M ~map[K]V, K comparable, V any](m M) []V {

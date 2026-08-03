@@ -161,7 +161,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	var accLimits accStratLimits
 	if !req.ForceAdd {
 		accLimits, _ = newAccStratLimits()
-		for acc, jobsMap := range AccJobs {
+		for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+			jobsMap := AccJobs[acc]
 			for _, stgMap := range jobsMap {
 				if _, ok := stgMap[req.Strat.Name]; ok {
 					accLimits.tryAdd(acc, req.Strat.Name)
@@ -203,7 +204,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		ensureStratJob(req.Strat, tf, exs, env, dirt, logWarm, accLimits)
 		if len(req.Strat.WsSubs) > 0 {
 			envKey := pair + "_" + tf
-			for _, jobsMap := range AccJobs {
+			for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+				jobsMap := AccJobs[acc]
 				if stgMap, ok := jobsMap[envKey]; ok {
 					if job := stgMap[req.Strat.Name]; job != nil {
 						if err := regWsJob(job); err != nil {
@@ -225,7 +227,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			continue
 		}
 		envKey := pair + "_" + tf
-		for acc, accJobs := range AccJobs {
+		for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+			accJobs := AccJobs[acc]
 			if stgMap, ok := accJobs[envKey]; ok {
 				if job, ok := stgMap[req.Strat.Name]; ok {
 					if req.CloseOnRemove {
@@ -273,7 +276,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	lockJobs.Unlock()
 	locked = false
 	if req.CloseOnRemove && hooks.ExitOrders != nil {
-		for acc, orders := range res.ExitOrders {
+		for acc := range utils.MapKeys(res.ExitOrders, config.StrictBacktest()) {
+			orders := res.ExitOrders[acc]
 			_ = hooks.ExitOrders(acc, orders, &ExitReq{Tag: core.ExitTagPairDel})
 		}
 	}
@@ -285,7 +289,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 
 func collectAllWarmsLocked() Warms {
 	all := make(Warms)
-	for _, accJobs := range AccJobs {
+	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+		accJobs := AccJobs[acc]
 		for _, stgMap := range accJobs {
 			for _, job := range stgMap {
 				pair := job.Symbol.Symbol

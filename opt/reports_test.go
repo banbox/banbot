@@ -1,8 +1,10 @@
 package opt
 
 import (
+	"strconv"
 	"testing"
 
+	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/utils"
 )
@@ -36,5 +38,40 @@ func TestGroupByProfitsHandlesEmptyKMeansClusters(t *testing.T) {
 	result.groupByProfits(orders)
 	if len(result.ProfitGrps) != 1 {
 		t.Fatalf("profit groups = %d, want 1", len(result.ProfitGrps))
+	}
+}
+
+func TestReportReplayOrderMakesConstrainedAdmissionDeterministic(t *testing.T) {
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{ID: 1, EnterAt: 1000}},
+		{IOrder: &ormo.IOrder{ID: 2, EnterAt: 1000}},
+		{IOrder: &ormo.IOrder{ID: 3, EnterAt: 1000}},
+	}
+	costs := map[int64]float64{1: 60, 2: 50, 3: 40}
+	for _, input := range [][]*ormo.InOutOrder{
+		orders,
+		{orders[2], orders[1], orders[0]},
+		{orders[1], orders[2], orders[0]},
+	} {
+		wallets := &biz.BanWallets{Items: map[string]*biz.ItemWallet{
+			"USDT": {Available: 100, Pendings: map[string]float64{}, Frozens: map[string]float64{}},
+		}}
+		inputIDs := []int64{input[0].ID, input[1].ID, input[2].ID}
+		var admitted []int64
+		ordered := reportReplayOrder(input)
+		for _, od := range ordered {
+			if _, err := wallets.CostAva(strconv.FormatInt(od.ID, 10), "USDT", costs[od.ID], false, 0.9); err == nil {
+				admitted = append(admitted, od.ID)
+			}
+		}
+		if len(admitted) != 2 || admitted[0] != 1 || admitted[1] != 3 {
+			t.Fatalf("admitted orders = %v for input [%d,%d,%d]", admitted, input[0].ID, input[1].ID, input[2].ID)
+		}
+		if ordered[0].ID != 1 || ordered[1].ID != 2 || ordered[2].ID != 3 {
+			t.Fatalf("replay order = [%d,%d,%d]", ordered[0].ID, ordered[1].ID, ordered[2].ID)
+		}
+		if input[0].ID != inputIDs[0] || input[1].ID != inputIDs[1] || input[2].ID != inputIDs[2] {
+			t.Fatalf("reportReplayOrder modified input %v", inputIDs)
+		}
 	}
 }

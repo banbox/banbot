@@ -90,14 +90,14 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 	add("", newConfigCommand("trade", "live trade", RunTrade, false,
 		bindStakeAmount, bindPairs, bindSpider, bindOut))
 	add("", newConfigCommand("backtest", "backtest with strategies and data", RunBackTest, true,
-		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate))
+		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate, bindBTStrict))
 	add("", newConfigCommand("spider", "start the spider", RunSpider, false))
 	add("", newConfigCommand("optimize", "run hyperparameter optimization", opt.RunOptimize, true,
-		bindOut, bindOptRounds, bindSampler, bindPicker, bindEachPairs, bindConcur))
+		bindOut, bindOptRounds, bindSampler, bindPicker, bindEachPairs, bindConcur, bindBTStrict))
 	add("", newConfigCommand("init", "initialize config.yml/config.local.yml in the data directory", runInit, true))
 	add("", withAliases(newConfigCommand("bt-opt", "run rolling backtests with hyperparameter optimization", opt.RunBTOverOpt, true,
 		bindReviewPeriod, bindRunPeriod, bindOptRounds, bindSampler, bindPicker, bindEachPairs,
-		bindConcur, bindAlpha, bindPairPicker), "bt_opt"))
+		bindConcur, bindAlpha, bindPairPicker, bindBTStrict), "bt_opt"))
 	add("", web.NewCommand())
 
 	add("data", newConfigCommand("export", "export data from the database to protobuf files", runDataExport, true,
@@ -107,6 +107,8 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 
 	add("kline", newConfigCommand("down", "download kline data from an exchange", RunDownData, true,
 		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindTimeFrames, bindMedium))
+	add("kline", newConfigCommand("repair-ranges", "rebuild kline range metadata from stored bars", RunRepairKlineRanges, true,
+		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindTimeFrames))
 	add("kline", newConfigCommand("load", "load kline data from zip or CSV files", LoadKLinesToDB, true, bindIn))
 	add("kline", newConfigCommand("agg", "aggregate kline data into larger timeframes", AggKlineBigs, true,
 		bindPairs, bindTimeFrames))
@@ -131,9 +133,11 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 
 	add("tool", withAliases(newConfigCommand("collect-opt", "collect and rank optimization results", opt.CollectOptLog, true,
 		bindIn, bindPicker), "collect_opt"))
-	add("tool", withAliases(newConfigCommand("sim-bt", "run a backtest simulation from a report", opt.RunSimBT, true, bindIn), "sim_bt"))
+	add("tool", withAliases(newConfigCommand("sim-bt", "run a backtest simulation from a report", opt.RunSimBT, true,
+		bindIn, bindBTStrict), "sim_bt"))
 	add("tool", withAliases(newConfigCommand("test-pickers", "test pickers in rolling backtests", opt.RunRollBTPicker, true,
-		bindReviewPeriod, bindRunPeriod, bindOptRounds, bindSampler, bindEachPairs, bindConcur, bindPicker, bindPairPicker), "test_pickers"))
+		bindReviewPeriod, bindRunPeriod, bindOptRounds, bindSampler, bindEachPairs, bindConcur, bindPicker, bindPairPicker,
+		bindBTStrict), "test_pickers"))
 	add("tool", withAliases(newConfigCommand("load-cal", "load calendars", biz.LoadCalendars, true, bindIn), "load_cal"))
 	add("tool", withAliases(newConfigCommand("data-server", "serve a gRPC data feeder", biz.RunDataServer, true), "data_server"))
 	add("tool", withAliases(newConfigCommand("calc-perfs", "calculate Sharpe and Sortino ratios for input data", data.CalcFilePerfs, true,
@@ -145,7 +149,7 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 	add("tool", strat.NewListStratsCommand())
 	add("tool", opt.NewBtFactorsCommand())
 	add("tool", withAliases(newConfigCommand("bt-result", "build a backtest result from orders.gob and config", opt.BuildBtResult, true,
-		bindIn, bindOut), "bt_result"))
+		bindIn, bindOut, bindBTStrict), "bt_result"))
 	add("tool", withAliases(newPositionalCommand("test-live-bars", "compare live-trade klines with local data", "DUMP_FILE", biz.TestKLineConsistency), "test_live_bars"))
 
 	add("live", biz.NewDownExgOrdersCommand())
@@ -285,4 +289,8 @@ func bindRunEvery(args *config.CmdArgs, flags *pflag.FlagSet) {
 
 func bindSeparate(args *config.CmdArgs, flags *pflag.FlagSet) {
 	flags.BoolVar(&args.Separate, "separate", false, "backtest each policy separately")
+}
+
+func bindBTStrict(args *config.CmdArgs, flags *pflag.FlagSet) {
+	flags.BoolVar(&args.BTStrict, "bt-strict", false, "enable strict backtest mode")
 }

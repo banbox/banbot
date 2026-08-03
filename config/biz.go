@@ -366,6 +366,9 @@ func MergeConfigPaths(paths []string, skips ...string) (string, error) {
 }
 
 func (c *Config) Apply(args *CmdArgs) error {
+	if args.BTStrictSet {
+		c.BTStrict = args.BTStrict
+	}
 	if args.TimeRange != "" {
 		c.TimeRangeRaw = args.TimeRange
 		c.TimeStart = ""
@@ -403,6 +406,11 @@ func (c *Config) Apply(args *CmdArgs) error {
 		return fmt.Errorf("`time_start` in yml is required")
 	}
 	c.TimeRange = &TimeTuple{start, stop}
+	if c.HistoricalCoverage != nil {
+		if err = c.HistoricalCoverage.Normalize(c.TimeRange); err != nil {
+			return err
+		}
+	}
 	if args.StakeAmount > 0 {
 		c.StakeAmount = args.StakeAmount
 	}
@@ -496,6 +504,7 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 	}
 	LowCostAction = c.LowCostAction
 	BTNetCost = c.BTNetCost
+	HistoricalCoverage = c.HistoricalCoverage
 	if BTNetCost == 0 {
 		BTNetCost = 15
 	}
@@ -717,14 +726,18 @@ func initExgAccs(args *CmdArgs, accs map[string]*AccountConfig) *errs.Error {
 	BakAccounts = make(map[string]*AccountConfig)
 	if core.EnvReal {
 		DefAcc = ""
+	} else {
+		DefAcc = "default"
 	}
-	for name, val := range accs {
+	for _, name := range slices.Sorted(maps.Keys(accs)) {
+		val := accs[name]
 		if val.NoTrade {
 			BakAccounts[name] = val
 		} else if !core.EnvReal {
-			// Non-production environment, only enable one account
-			// 非生产环境，只启用一个账号
-			Accounts[DefAcc] = val
+			// Prefer an explicitly named default account, otherwise use the first name.
+			if _, exists := Accounts[DefAcc]; !exists || name == DefAcc {
+				Accounts[DefAcc] = val
+			}
 		} else {
 			Accounts[name] = val
 			if DefAcc == "" {
@@ -742,6 +755,10 @@ func initExgAccs(args *CmdArgs, accs map[string]*AccountConfig) *errs.Error {
 		Accounts[DefAcc] = &AccountConfig{}
 	}
 	return nil
+}
+
+func StrictBacktest() bool {
+	return core.BackTestMode && Data.BTStrict
 }
 
 func (p *StratPerfConfig) Validate() {
@@ -879,60 +896,63 @@ func (c *Config) ShowPairs() string {
 
 func (c *Config) Clone() *Config {
 	res := &Config{
-		Name:             c.Name,
-		Env:              c.Env,
-		Leverage:         c.Leverage,
-		LimitVolSecs:     c.LimitVolSecs,
-		PutLimitSecs:     c.PutLimitSecs,
-		AccountPullSecs:  c.AccountPullSecs,
-		MarketType:       c.MarketType,
-		ContractType:     c.ContractType,
-		OdBookTtl:        c.OdBookTtl,
-		StopEnterBars:    c.StopEnterBars,
-		ConcurNum:        c.ConcurNum,
-		OrderType:        c.OrderType,
-		PreFire:          c.PreFire,
-		MarginAddRate:    c.MarginAddRate,
-		ChargeOnBomb:     c.ChargeOnBomb,
-		TakeOverStrat:    c.TakeOverStrat,
-		CloseOnStuck:     c.CloseOnStuck,
-		StakeAmount:      c.StakeAmount,
-		StakePct:         c.StakePct,
-		MaxStakeAmt:      c.MaxStakeAmt,
-		OpenVolRate:      c.OpenVolRate,
-		MinOpenRate:      c.MinOpenRate,
-		LowCostAction:    c.LowCostAction,
-		BTNetCost:        c.BTNetCost,
-		BTLegacyIntrabar: c.BTLegacyIntrabar,
-		BTLegacyWallet:   c.BTLegacyWallet,
-		RelaySimUnFinish: c.RelaySimUnFinish,
-		NTPLangCode:      c.NTPLangCode,
-		ShowLangCode:     c.ShowLangCode,
-		OrderBarMax:      c.OrderBarMax,
-		MaxOpenOrders:    c.MaxOpenOrders,
-		MaxSimulOpen:     c.MaxSimulOpen,
-		WalletAmounts:    c.WalletAmounts,
-		DrawBalanceOver:  c.DrawBalanceOver,
-		StakeCurrency:    c.StakeCurrency,
-		FatalStop:        c.FatalStop,
-		FatalStopHours:   c.FatalStopHours,
-		TimeRangeRaw:     c.TimeRangeRaw,
-		TimeStart:        c.TimeStart,
-		TimeEnd:          c.TimeEnd,
-		TimeRange:        c.TimeRange,
-		TimeFrames:       c.TimeFrames,
-		RunTimeframes:    c.RunTimeframes,
-		KlineSource:      c.KlineSource,
-		WatchJobs:        c.WatchJobs,
-		RunPolicy:        c.RunPolicy,
-		StratPerf:        c.StratPerf,
-		Pairs:            c.Pairs,
-		PairMgr:          c.PairMgr,
-		PairFilters:      c.PairFilters,
-		SpiderAddr:       c.SpiderAddr,
-		Webhook:          c.Webhook,
-		Accounts:         c.Accounts,
-		Exchange:         c.Exchange,
+		Name:               c.Name,
+		Env:                c.Env,
+		Leverage:           c.Leverage,
+		LimitVolSecs:       c.LimitVolSecs,
+		PutLimitSecs:       c.PutLimitSecs,
+		AccountPullSecs:    c.AccountPullSecs,
+		MarketType:         c.MarketType,
+		ContractType:       c.ContractType,
+		OdBookTtl:          c.OdBookTtl,
+		StopEnterBars:      c.StopEnterBars,
+		ConcurNum:          c.ConcurNum,
+		OrderType:          c.OrderType,
+		PreFire:            c.PreFire,
+		MarginAddRate:      c.MarginAddRate,
+		ChargeOnBomb:       c.ChargeOnBomb,
+		TakeOverStrat:      c.TakeOverStrat,
+		CloseOnStuck:       c.CloseOnStuck,
+		StakeAmount:        c.StakeAmount,
+		StakePct:           c.StakePct,
+		MaxStakeAmt:        c.MaxStakeAmt,
+		OpenVolRate:        c.OpenVolRate,
+		MinOpenRate:        c.MinOpenRate,
+		LowCostAction:      c.LowCostAction,
+		BTNetCost:          c.BTNetCost,
+		BTLegacyIntrabar:   c.BTLegacyIntrabar,
+		BTLegacyWallet:     c.BTLegacyWallet,
+		BTNoKlineDownload:  c.BTNoKlineDownload,
+		BTStrict:           c.BTStrict,
+		HistoricalCoverage: c.HistoricalCoverage.Clone(),
+		RelaySimUnFinish:   c.RelaySimUnFinish,
+		NTPLangCode:        c.NTPLangCode,
+		ShowLangCode:       c.ShowLangCode,
+		OrderBarMax:        c.OrderBarMax,
+		MaxOpenOrders:      c.MaxOpenOrders,
+		MaxSimulOpen:       c.MaxSimulOpen,
+		WalletAmounts:      c.WalletAmounts,
+		DrawBalanceOver:    c.DrawBalanceOver,
+		StakeCurrency:      c.StakeCurrency,
+		FatalStop:          c.FatalStop,
+		FatalStopHours:     c.FatalStopHours,
+		TimeRangeRaw:       c.TimeRangeRaw,
+		TimeStart:          c.TimeStart,
+		TimeEnd:            c.TimeEnd,
+		TimeRange:          c.TimeRange,
+		TimeFrames:         c.TimeFrames,
+		RunTimeframes:      c.RunTimeframes,
+		KlineSource:        c.KlineSource,
+		WatchJobs:          c.WatchJobs,
+		RunPolicy:          c.RunPolicy,
+		StratPerf:          c.StratPerf,
+		Pairs:              c.Pairs,
+		PairMgr:            c.PairMgr,
+		PairFilters:        c.PairFilters,
+		SpiderAddr:         c.SpiderAddr,
+		Webhook:            c.Webhook,
+		Accounts:           c.Accounts,
+		Exchange:           c.Exchange,
 	}
 	if c.BTInLive != nil {
 		item := *c.BTInLive

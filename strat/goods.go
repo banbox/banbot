@@ -1,6 +1,7 @@
 package strat
 
 import (
+	"cmp"
 	"fmt"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -75,7 +76,10 @@ func RelayPolicyGroups() []*PolicyGroup {
 		})
 	}
 	slices.SortFunc(items, func(a, b *core.StrInt64) int {
-		return int(a.Int - b.Int)
+		if order := cmp.Compare(a.Int, b.Int); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.Str, b.Str)
 	})
 	// 当某个周期与组内最小周期倍率超过5倍，则归为新的组
 	curGpId := 0

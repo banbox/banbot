@@ -275,6 +275,43 @@ func rewriteHoleRangesInWindow(ctx context.Context, sid int32, timeFrame string,
 	return sess.UpdateSRangesWithHoles(ctx, sid, tbl, timeFrame, startMS, endMS, holes)
 }
 
+func exactKlineHoles(barTimes []int64, tfMSecs, startMS, endMS int64) []MSRange {
+	holes := make([]MSRange, 0)
+	cur := startMS
+	for _, barTime := range barTimes {
+		if barTime < cur {
+			continue
+		}
+		if barTime >= endMS {
+			break
+		}
+		if barTime > cur {
+			holes = append(holes, MSRange{Start: cur, Stop: barTime})
+		}
+		cur = barTime + tfMSecs
+	}
+	if cur < endMS {
+		holes = append(holes, MSRange{Start: cur, Stop: endMS})
+	}
+	return holes
+}
+
+func (q *Queries) repairKlineRangeFromPhysical(sid int32, timeframe string, startMS, endMS int64) *errs.Error {
+	if startMS <= 0 || endMS <= startMS {
+		return nil
+	}
+	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
+	barTimes, err := q.getKLineTimes(sid, timeframe, startMS, endMS)
+	if err != nil {
+		return err
+	}
+	if err := rewriteHoleRangesInWindow(context.Background(), sid, timeframe, startMS, endMS,
+		exactKlineHoles(barTimes, tfMSecs, startMS, endMS)); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	return nil
+}
+
 func queryHyper(sess *Queries, timeFrame, sql string, limit int, args ...interface{}) (string, pgx.Rows, error) {
 	agg, ok := aggMap[timeFrame]
 	var subTF, table string
@@ -824,6 +861,17 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	tfMSecs := item.MSecs
 	startMS := utils2.AlignTfMSecs(orgStartMS, tfMSecs)
 	endMS := utils2.AlignTfMSecs(orgEndMS, tfMSecs)
+	var delistMS int64
+	if !IsQuestDB {
+		var delistErr *errs.Error
+		delistMS, delistErr = q.getDelistMSPg(sid)
+		if delistErr != nil {
+			return delistErr
+		}
+	} else if exs := GetSymbolByID(sid); exs != nil {
+		delistMS = exs.DelistMs
+	}
+	endMS = aggregateEndForTerminalDelist(orgEndMS, endMS, delistMS, tfMSecs)
 	if startMS == endMS && endMS < orgStartMS {
 		// 没有出现新的完成的bar数据，无需更新
 		// 前2个相等，说明：插入的数据所属bar尚未完成。
@@ -847,7 +895,11 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 		return nil
 	}
 	if !IsQuestDB {
-		return q.refreshAggPg(item, sid, aggStart, endMS, aggFrom)
+		saveStart, saveEnd, err := q.refreshAggPg(item, sid, aggStart, endMS, aggFrom, delistMS)
+		if err != nil || saveStart == 0 || saveEnd <= saveStart {
+			return err
+		}
+		return q.repairKlineRangeFromPhysical(sid, item.TimeFrame, saveStart, saveEnd)
 	}
 	fromTbl := "kline_" + aggFrom
 	ctx := context.Background()
@@ -902,6 +954,13 @@ order by ts`, fromTbl), sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endM
 		return err
 	}
 	return nil
+}
+
+func aggregateEndForTerminalDelist(orgEndMS, alignedEndMS, delistMS, timeframeMS int64) int64 {
+	if orgEndMS >= delistMS && allowPartialTerminalAggregate(delistMS, alignedEndMS, timeframeMS) {
+		return alignedEndMS + timeframeMS
+	}
+	return alignedEndMS
 }
 
 func NewKlineAgg(TimeFrame, Table, AggFrom, AggStart, AggEnd, AggEvery, CpsBefore, Retention string) *KlineAgg {
@@ -1314,6 +1373,16 @@ func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.E
 }
 
 func (q *Queries) syncKlineSid(sid int32, calcs map[string]map[int32][2]int64) *errs.Error {
+	var delistMS int64
+	if !IsQuestDB {
+		var delistErr *errs.Error
+		delistMS, delistErr = q.getDelistMSPg(sid)
+		if delistErr != nil {
+			return delistErr
+		}
+	} else if exs := GetSymbolByID(sid); exs != nil {
+		delistMS = exs.DelistMs
+	}
 	tfRanges := make(map[string][2]int64)
 	for _, agg := range aggList {
 		rg, ok := calcs[agg.TimeFrame][sid]
@@ -1362,12 +1431,13 @@ func (q *Queries) syncKlineSid(sid int32, calcs map[string]map[int32][2]int64) *
 		tfMSecs := int64(utils2.TFToSecs(agg.TimeFrame) * 1000)
 		subAlignStart := utils2.AlignTfMSecs(subStart, tfMSecs)
 		subAlignEnd := utils2.AlignTfMSecs(subEnd, tfMSecs)
+		subAggregateEnd := aggregateEndForTerminalDelist(subEnd, subAlignEnd, delistMS, tfMSecs)
 		if subAlignStart < curStart {
 			if err := q.refreshAgg(agg, sid, subStart, min(subEnd, curStart), "", false); err != nil {
 				return err
 			}
 		}
-		if subAlignEnd > curEnd {
+		if subAggregateEnd > curEnd {
 			if err := q.refreshAgg(agg, sid, max(curEnd, subStart), subEnd, "", false); err != nil {
 				return err
 			}
@@ -1411,18 +1481,32 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 			continue
 		}
 		if i.StartMs > 0 && i.StopMs > 0 {
-			start, end := q.GetKlineRange(i.Sid, i.Timeframe)
-			if IsQuestDB && (start == 0 || end == 0) {
-				var waitErr *errs.Error
-				start, end, waitErr = waitForQuestKlineRangeVisible(ctx, q, i.Sid, i.Timeframe)
-				if waitErr != nil {
-					return waitErr
+			start, end := i.StartMs, i.StopMs
+			if IsQuestDB {
+				start, end = q.GetKlineRange(i.Sid, i.Timeframe)
+				if start == 0 || end == 0 {
+					var waitErr *errs.Error
+					start, end, waitErr = waitForQuestKlineRangeVisible(ctx, q, i.Sid, i.Timeframe)
+					if waitErr != nil {
+						return waitErr
+					}
 				}
 			}
-			if start > 0 && end > 0 {
+			if start > 0 && end > start {
 				exs := GetSymbolByID(i.Sid)
-				if exs != nil {
+				if exs == nil {
+					log.Warn("pending insert symbol is unavailable; keep job", zap.Int32("sid", i.Sid))
+					continue
+				}
+				if IsQuestDB {
 					if err := q.UpdateKRange(exs, i.Timeframe, start, end, true); err != nil {
+						return err
+					}
+				} else {
+					if err := q.repairKlineRangeFromPhysical(i.Sid, i.Timeframe, start, end); err != nil {
+						return err
+					}
+					if err := q.updateBigHyper(exs, i.Timeframe, start, end); err != nil {
 						return err
 					}
 				}

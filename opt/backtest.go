@@ -66,7 +66,7 @@ func NewBackTestLite(isOpt bool, onBar data.FnDataSeries, getEnd data.FnGetInt64
 		}
 	}
 	b.dp = data.NewHistProvider(onBar, b.OnEnvEnd, getEnd, !isOpt, pBar)
-	b.dp.SetAllowDownload(!isOpt)
+	b.dp.SetAllowDownload(allowBacktestKlineDownload(isOpt))
 	strat.SetPairUpdateHooks(strat.PairUpdateHooks{
 		SubWarmPairs: b.dp.SubWarmPairs,
 		ExitOrders: func(acc string, orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
@@ -79,6 +79,10 @@ func NewBackTestLite(isOpt bool, onBar data.FnDataSeries, getEnd data.FnGetInt64
 	}
 	biz.InitLocalOrderMgr(b.orderCB, !isOpt, stopBacktest)
 	return b
+}
+
+func allowBacktestKlineDownload(isOpt bool) bool {
+	return !isOpt && !config.Data.BTNoKlineDownload
 }
 
 func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
@@ -460,6 +464,9 @@ func (b *BackTest) initTaskOut() *errs.Error {
 }
 
 func (b *BackTest) cronDumpBtStatus() {
+	if config.StrictBacktest() {
+		return
+	}
 	b.lastDumpMs = btime.UTCStamp()
 	_, err_ := com.Cron().AddFunc("30 * * * * *", func() {
 		curTime := btime.UTCStamp()
@@ -650,7 +657,8 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 		// 主要针对实盘隔一段时间后重启有未平仓订单场景，需检查订单是否应在机器人停止期间平仓
 		var err *errs.Error
 		closeNums := make(map[string]int)
-		for acc, cfg := range config.Accounts {
+		for acc := range utils.MapKeys(config.Accounts, config.StrictBacktest()) {
+			cfg := config.Accounts[acc]
 			if cfg.NoTrade {
 				continue
 			}
@@ -681,7 +689,8 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 		return nil
 	}
 	var err *errs.Error
-	for acc, cfg := range config.Accounts {
+	for acc := range utils.MapKeys(config.Accounts, config.StrictBacktest()) {
+		cfg := config.Accounts[acc]
 		if cfg.NoTrade {
 			continue
 		}
@@ -695,7 +704,8 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 			curKeyMap[od.KeyAlign()] = od
 		}
 		lock.Unlock()
-		for keyAlign, od := range relayOpens {
+		for keyAlign := range utils.MapKeys(relayOpens, config.StrictBacktest()) {
+			od := relayOpens[keyAlign]
 			if _, ok := curKeyMap[keyAlign]; ok {
 				// 此订单已存在，跳过
 				continue
