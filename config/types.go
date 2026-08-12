@@ -12,61 +12,62 @@ var (
 	BakAccounts map[string]*AccountConfig // Exchange account, not tradable 交易所账户，不可交易
 	DefAcc      = "default"               // For non-real trading, the default key of the account (backtesting, simulated trading) 非实盘交易时，账户默认的key（回测、模拟交易）
 
-	Name               string
-	Loaded             bool
-	Leverage           float64
-	LimitVolSecs       int // How long the limit order is expected to wait for execution, in seconds 限价单预期等待多长时间成交，单位秒
-	PutLimitSecs       int // Only limit orders executed within this expected time will be submitted to the exchange. 在此预期时间内成交的限价单，才提交到交易所
-	AccountPullSecs    int
-	OdBookTtl          int64
-	StopEnterBars      int // The entry limit order will be canceled if it is not filled after the number of candles. 入场限价单超过多少个蜡烛未成交则取消
-	OrderType          string
-	PreFire            float64
-	MarginAddRate      float64 // When trading contracts, if a loss occurs and the loss reaches this value of the initial margin ratio, additional margin will be required to avoid forced liquidation. 交易合约时，如出现亏损，亏损达到初始保证金比率的此值时，进行追加保证金，避免强平
-	ChargeOnBomb       bool
-	TakeOverStrat      string
-	CloseOnStuck       int
-	StakeAmount        float64 // The amount of a single order, the priority is lower than StakePct 单笔开单金额，优先级低于StakePct
-	StakePct           float64 // Percentage of single bill amount 单笔开单金额百分比
-	MaxStakeAmt        float64 // Maximum bill amount for a single transaction 单笔最大开单金额
-	OpenVolRate        float64 // When opening an order without specifying a quantity, the multiple of the maximum allowed order quantity/average candle trading volume, defaults to 1 未指定数量开单时，最大允许开单数量/平均蜡烛成交量的倍数，默认1
-	MinOpenRate        float64 // When the wallet balance is less than the single amount, orders are allowed to be issued when it reaches this ratio of the single amount. 钱包余额不足单笔金额时，达到单笔金额的此比例则允许开单
-	LowCostAction      string  // Actions taken when stake amount less than the minimum amount 花费不足最小金额时的动作：ignore, keep
-	BTNetCost          float64 // Order placement delay during backtesting, simulated slippage, unit seconds 回测时下单延迟，模拟滑点，单位秒
-	BTLegacyIntrabar   bool    // Preserve the pre-v0.2.22 intrabar price path for historical comparisons
-	BTLegacyWallet     bool    // Use the last historical bar for legacy margin refreshes
-	HistoricalCoverage *HistoricalCoverageConfig
-	RelaySimUnFinish   bool   // 交易新品种时(回测/实盘)，是否从开始时间未平仓订单接力开始交易
-	NTPLangCode        string // NTP真实时间同步所用langCode，默认none不启用
-	ShowLangCode       string
-	BTInLive           *BtInLiveConfig
-	OrderBarMax        int // 查找开始时间未平仓订单向前模拟最大bar数量
-	MaxOpenOrders      int
-	MaxSimulOpen       int
-	WalletAmounts      map[string]float64
-	DrawBalanceOver    float64
-	StakeCurrency      []string
-	StakeCurrencyMap   map[string]bool
-	FatalStop          map[int]float64
-	FatalStopHours     int
-	TimeRange          *TimeTuple
-	RunTimeframes      []string
-	KlineSource        string
-	WatchJobs          map[string][]string
-	RunPolicy          []*RunPolicyConfig
-	StratPerf          *StratPerfConfig
-	Pairs              []string
-	PairMgr            *PairMgrConfig
-	PairFilters        []*CommonPairFilter
-	Exchange           *ExchangeConfig
-	DataDir            string
-	stratDir           string
-	Database           *DatabaseConfig
-	SpiderAddr         string
-	APIServer          *APIServerConfig
-	RPCChannels        map[string]map[string]interface{}
-	Mail               *MailConfig
-	Webhook            map[string]map[string]string
+	Name                 string
+	Loaded               bool
+	Leverage             float64
+	LimitVolSecs         int // How long the limit order is expected to wait for execution, in seconds 限价单预期等待多长时间成交，单位秒
+	PutLimitSecs         int // Only limit orders executed within this expected time will be submitted to the exchange. 在此预期时间内成交的限价单，才提交到交易所
+	AccountPullSecs      int
+	OdBookTtl            int64
+	StopEnterBars        int // The entry limit order will be canceled if it is not filled after the number of candles. 入场限价单超过多少个蜡烛未成交则取消
+	OrderType            string
+	PreFire              float64
+	MarginAddRate        float64 // When trading contracts, if a loss occurs and the loss reaches this value of the initial margin ratio, additional margin will be required to avoid forced liquidation. 交易合约时，如出现亏损，亏损达到初始保证金比率的此值时，进行追加保证金，避免强平
+	ChargeOnBomb         bool
+	TakeOverStrat        string
+	CloseOnStuck         int
+	StakeAmount          float64 // The amount of a single order, the priority is lower than StakePct 单笔开单金额，优先级低于StakePct
+	StakePct             float64 // Percentage of single bill amount 单笔开单金额百分比
+	MaxStakeAmt          float64 // Maximum bill amount for a single transaction 单笔最大开单金额
+	OpenVolRate          float64 // When opening an order without specifying a quantity, the multiple of the maximum allowed order quantity/average candle trading volume, defaults to 1 未指定数量开单时，最大允许开单数量/平均蜡烛成交量的倍数，默认1
+	MinOpenRate          float64 // When the wallet balance is less than the single amount, orders are allowed to be issued when it reaches this ratio of the single amount. 钱包余额不足单笔金额时，达到单笔金额的此比例则允许开单
+	LowCostAction        string  // Actions taken when stake amount less than the minimum amount 花费不足最小金额时的动作：ignore, keep
+	BTNetCost            float64 // Order placement delay during backtesting, simulated slippage, unit seconds 回测时下单延迟，模拟滑点，单位秒
+	BTLegacyIntrabar     bool    // Preserve the pre-v0.2.22 intrabar price path for historical comparisons
+	BTLegacyOrderMetrics bool    // Preserve historical per-order drawdown semantics
+	BTLegacyWallet       bool    // Use the last historical bar for legacy margin refreshes
+	HistoricalCoverage   *HistoricalCoverageConfig
+	RelaySimUnFinish     bool   // 交易新品种时(回测/实盘)，是否从开始时间未平仓订单接力开始交易
+	NTPLangCode          string // NTP真实时间同步所用langCode，默认none不启用
+	ShowLangCode         string
+	BTInLive             *BtInLiveConfig
+	OrderBarMax          int // 查找开始时间未平仓订单向前模拟最大bar数量
+	MaxOpenOrders        int
+	MaxSimulOpen         int
+	WalletAmounts        map[string]float64
+	DrawBalanceOver      float64
+	StakeCurrency        []string
+	StakeCurrencyMap     map[string]bool
+	FatalStop            map[int]float64
+	FatalStopHours       int
+	TimeRange            *TimeTuple
+	RunTimeframes        []string
+	KlineSource          string
+	WatchJobs            map[string][]string
+	RunPolicy            []*RunPolicyConfig
+	StratPerf            *StratPerfConfig
+	Pairs                []string
+	PairMgr              *PairMgrConfig
+	PairFilters          []*CommonPairFilter
+	Exchange             *ExchangeConfig
+	DataDir              string
+	stratDir             string
+	Database             *DatabaseConfig
+	SpiderAddr           string
+	APIServer            *APIServerConfig
+	RPCChannels          map[string]map[string]interface{}
+	Mail                 *MailConfig
+	Webhook              map[string]map[string]string
 )
 
 const (
@@ -75,78 +76,80 @@ const (
 
 var (
 	noExtends = map[string]bool{
-		"run_policy":     true,
-		"wallet_amounts": true,
-		"fatal_stop":     true,
-		"watch_jobs":     true,
+		"run_policy":          true,
+		"wallet_amounts":      true,
+		"fatal_stop":          true,
+		"watch_jobs":          true,
+		"historical_coverage": true,
 	}
 )
 
 // Config Is the root configuration structure 是根配置结构体
 type Config struct {
-	Name               string                            `yaml:"name,omitempty" mapstructure:"name"`
-	Env                string                            `yaml:"env,omitempty" mapstructure:"env"`
-	Leverage           float64                           `yaml:"leverage,omitempty" mapstructure:"leverage"`
-	LimitVolSecs       int                               `yaml:"limit_vol_secs,omitempty" mapstructure:"limit_vol_secs"`
-	PutLimitSecs       int                               `yaml:"put_limit_secs,omitempty" mapstructure:"put_limit_secs"`
-	AccountPullSecs    int                               `yaml:"account_pull_secs,omitempty" mapstructure:"account_pull_secs"`
-	MarketType         string                            `yaml:"market_type,omitempty" mapstructure:"market_type"`
-	ContractType       string                            `yaml:"contract_type,omitempty" mapstructure:"contract_type"`
-	OdBookTtl          int64                             `yaml:"odbook_ttl,omitempty" mapstructure:"odbook_ttl"`
-	StopEnterBars      int                               `yaml:"stop_enter_bars,omitempty" mapstructure:"stop_enter_bars"`
-	ConcurNum          int                               `yaml:"concur_num,omitempty" mapstructure:"concur_num"`
-	OrderType          string                            `yaml:"order_type,omitempty" mapstructure:"order_type"`
-	PreFire            float64                           `yaml:"prefire,omitempty" mapstructure:"prefire"`
-	MarginAddRate      float64                           `yaml:"margin_add_rate,omitempty" mapstructure:"margin_add_rate"`
-	ChargeOnBomb       bool                              `yaml:"charge_on_bomb,omitempty" mapstructure:"charge_on_bomb"`
-	TakeOverStrat      string                            `yaml:"take_over_strat,omitempty" mapstructure:"take_over_strat"`
-	CloseOnStuck       int                               `yaml:"close_on_stuck,omitempty" mapstructure:"close_on_stuck"`
-	StakeAmount        float64                           `yaml:"stake_amount,omitempty" mapstructure:"stake_amount"`
-	StakePct           float64                           `yaml:"stake_pct,omitempty" mapstructure:"stake_pct"`
-	MaxStakeAmt        float64                           `yaml:"max_stake_amt,omitempty" mapstructure:"max_stake_amt"`
-	OpenVolRate        float64                           `yaml:"open_vol_rate,omitempty" mapstructure:"open_vol_rate"`
-	MinOpenRate        float64                           `yaml:"min_open_rate,omitempty" mapstructure:"min_open_rate"`
-	LowCostAction      string                            `yaml:"low_cost_action,omitempty" mapstructure:"low_cost_action"`
-	BTNetCost          float64                           `yaml:"bt_net_cost,omitempty" mapstructure:"bt_net_cost"`
-	BTLegacyIntrabar   bool                              `yaml:"bt_legacy_intrabar,omitempty" mapstructure:"bt_legacy_intrabar"`
-	BTLegacyWallet     bool                              `yaml:"bt_legacy_wallet_price,omitempty" mapstructure:"bt_legacy_wallet_price"`
-	BTNoKlineDownload  bool                              `yaml:"bt_no_kline_download,omitempty" mapstructure:"bt_no_kline_download"`
-	BTStrict           bool                              `yaml:"bt_strict,omitempty" mapstructure:"bt_strict"`
-	HistoricalCoverage *HistoricalCoverageConfig         `yaml:"historical_coverage,omitempty" mapstructure:"historical_coverage"`
-	RelaySimUnFinish   bool                              `yaml:"relay_sim_unfinish,omitempty" mapstructure:"relay_sim_unfinish"`
-	NTPLangCode        string                            `yaml:"ntp_lang_code,omitempty" mapstructure:"ntp_lang_code"`
-	ShowLangCode       string                            `yaml:"show_lang_code,omitempty" mapstructure:"show_lang_code"`
-	BTInLive           *BtInLiveConfig                   `yaml:"bt_in_live,omitempty" mapstructure:"bt_in_live"`
-	OrderBarMax        int                               `yaml:"order_bar_max,omitempty" mapstructure:"order_bar_max"`
-	MaxOpenOrders      int                               `yaml:"max_open_orders,omitempty" mapstructure:"max_open_orders"`
-	MaxSimulOpen       int                               `yaml:"max_simul_open,omitempty" mapstructure:"max_simul_open"`
-	WalletAmounts      map[string]float64                `yaml:"wallet_amounts,omitempty" mapstructure:"wallet_amounts"`
-	DrawBalanceOver    float64                           `yaml:"draw_balance_over,omitempty" mapstructure:"draw_balance_over"`
-	StakeCurrency      []string                          `yaml:"stake_currency,omitempty,flow" mapstructure:"stake_currency"`
-	FatalStop          map[string]float64                `yaml:"fatal_stop,omitempty" mapstructure:"fatal_stop"`
-	FatalStopHours     int                               `yaml:"fatal_stop_hours,omitempty" mapstructure:"fatal_stop_hours"`
-	TimeRangeRaw       string                            `yaml:"timerange,omitempty" mapstructure:"timerange"`
-	TimeStart          string                            `yaml:"time_start,omitempty" mapstructure:"time_start"`
-	TimeEnd            string                            `yaml:"time_end,omitempty" mapstructure:"time_end"`
-	TimeRange          *TimeTuple                        `yaml:"-" json:"-" mapstructure:"-"`
-	TimeFrames         string                            `yaml:"timeframes" mapstructure:"timeframes"`
-	RunTimeframes      []string                          `yaml:"run_timeframes,omitempty,flow" mapstructure:"run_timeframes"`
-	KlineSource        string                            `yaml:"kline_source,omitempty" mapstructure:"kline_source"`
-	WatchJobs          map[string][]string               `yaml:"watch_jobs,omitempty" mapstructure:"watch_jobs"`
-	RunPolicy          []*RunPolicyConfig                `yaml:"run_policy,omitempty" mapstructure:"run_policy"`
-	StratPerf          *StratPerfConfig                  `yaml:"strat_perf,omitempty" mapstructure:"strat_perf"`
-	Pairs              []string                          `yaml:"pairs,omitempty,flow" mapstructure:"pairs"`
-	PairMgr            *PairMgrConfig                    `yaml:"pairmgr,omitempty" mapstructure:"pairmgr"`
-	PairFilters        []*CommonPairFilter               `yaml:"pairlists,omitempty" mapstructure:"pairlists"`
-	Accounts           map[string]*AccountConfig         `yaml:"accounts,omitempty" mapstructure:"accounts,omitempty"`
-	Exchange           *ExchangeConfig                   `yaml:"exchange,omitempty" mapstructure:"exchange"`
-	Database           *DatabaseConfig                   `yaml:"database,omitempty" mapstructure:"database"`
-	SpiderAddr         string                            `yaml:"spider_addr,omitempty" mapstructure:"spider_addr"`
-	APIServer          *APIServerConfig                  `yaml:"api_server,omitempty" mapstructure:"api_server"`
-	RPCChannels        map[string]map[string]interface{} `yaml:"rpc_channels,omitempty" mapstructure:"rpc_channels"`
-	Mail               *MailConfig                       `yaml:"mail,omitempty" mapstructure:"mail"`
-	Webhook            map[string]map[string]string      `yaml:"webhook,omitempty" mapstructure:"webhook"`
-	LLMModels          map[string]*llm.LLMModelConfig    `yaml:"llm_models" mapstructure:"llm_models"`
+	Name                 string                            `yaml:"name,omitempty" mapstructure:"name"`
+	Env                  string                            `yaml:"env,omitempty" mapstructure:"env"`
+	Leverage             float64                           `yaml:"leverage,omitempty" mapstructure:"leverage"`
+	LimitVolSecs         int                               `yaml:"limit_vol_secs,omitempty" mapstructure:"limit_vol_secs"`
+	PutLimitSecs         int                               `yaml:"put_limit_secs,omitempty" mapstructure:"put_limit_secs"`
+	AccountPullSecs      int                               `yaml:"account_pull_secs,omitempty" mapstructure:"account_pull_secs"`
+	MarketType           string                            `yaml:"market_type,omitempty" mapstructure:"market_type"`
+	ContractType         string                            `yaml:"contract_type,omitempty" mapstructure:"contract_type"`
+	OdBookTtl            int64                             `yaml:"odbook_ttl,omitempty" mapstructure:"odbook_ttl"`
+	StopEnterBars        int                               `yaml:"stop_enter_bars,omitempty" mapstructure:"stop_enter_bars"`
+	ConcurNum            int                               `yaml:"concur_num,omitempty" mapstructure:"concur_num"`
+	OrderType            string                            `yaml:"order_type,omitempty" mapstructure:"order_type"`
+	PreFire              float64                           `yaml:"prefire,omitempty" mapstructure:"prefire"`
+	MarginAddRate        float64                           `yaml:"margin_add_rate,omitempty" mapstructure:"margin_add_rate"`
+	ChargeOnBomb         bool                              `yaml:"charge_on_bomb,omitempty" mapstructure:"charge_on_bomb"`
+	TakeOverStrat        string                            `yaml:"take_over_strat,omitempty" mapstructure:"take_over_strat"`
+	CloseOnStuck         int                               `yaml:"close_on_stuck,omitempty" mapstructure:"close_on_stuck"`
+	StakeAmount          float64                           `yaml:"stake_amount,omitempty" mapstructure:"stake_amount"`
+	StakePct             float64                           `yaml:"stake_pct,omitempty" mapstructure:"stake_pct"`
+	MaxStakeAmt          float64                           `yaml:"max_stake_amt,omitempty" mapstructure:"max_stake_amt"`
+	OpenVolRate          float64                           `yaml:"open_vol_rate,omitempty" mapstructure:"open_vol_rate"`
+	MinOpenRate          float64                           `yaml:"min_open_rate,omitempty" mapstructure:"min_open_rate"`
+	LowCostAction        string                            `yaml:"low_cost_action,omitempty" mapstructure:"low_cost_action"`
+	BTNetCost            float64                           `yaml:"bt_net_cost,omitempty" mapstructure:"bt_net_cost"`
+	BTLegacyIntrabar     bool                              `yaml:"bt_legacy_intrabar,omitempty" mapstructure:"bt_legacy_intrabar"`
+	BTLegacyOrderMetrics bool                              `yaml:"bt_legacy_order_metrics,omitempty" mapstructure:"bt_legacy_order_metrics"`
+	BTLegacyWallet       bool                              `yaml:"bt_legacy_wallet_price,omitempty" mapstructure:"bt_legacy_wallet_price"`
+	BTNoKlineDownload    bool                              `yaml:"bt_no_kline_download,omitempty" mapstructure:"bt_no_kline_download"`
+	BTStrict             bool                              `yaml:"bt_strict,omitempty" mapstructure:"bt_strict"`
+	HistoricalCoverage   *HistoricalCoverageConfig         `yaml:"historical_coverage,omitempty" mapstructure:"historical_coverage"`
+	RelaySimUnFinish     bool                              `yaml:"relay_sim_unfinish,omitempty" mapstructure:"relay_sim_unfinish"`
+	NTPLangCode          string                            `yaml:"ntp_lang_code,omitempty" mapstructure:"ntp_lang_code"`
+	ShowLangCode         string                            `yaml:"show_lang_code,omitempty" mapstructure:"show_lang_code"`
+	BTInLive             *BtInLiveConfig                   `yaml:"bt_in_live,omitempty" mapstructure:"bt_in_live"`
+	OrderBarMax          int                               `yaml:"order_bar_max,omitempty" mapstructure:"order_bar_max"`
+	MaxOpenOrders        int                               `yaml:"max_open_orders,omitempty" mapstructure:"max_open_orders"`
+	MaxSimulOpen         int                               `yaml:"max_simul_open,omitempty" mapstructure:"max_simul_open"`
+	WalletAmounts        map[string]float64                `yaml:"wallet_amounts,omitempty" mapstructure:"wallet_amounts"`
+	DrawBalanceOver      float64                           `yaml:"draw_balance_over,omitempty" mapstructure:"draw_balance_over"`
+	StakeCurrency        []string                          `yaml:"stake_currency,omitempty,flow" mapstructure:"stake_currency"`
+	FatalStop            map[string]float64                `yaml:"fatal_stop,omitempty" mapstructure:"fatal_stop"`
+	FatalStopHours       int                               `yaml:"fatal_stop_hours,omitempty" mapstructure:"fatal_stop_hours"`
+	TimeRangeRaw         string                            `yaml:"timerange,omitempty" mapstructure:"timerange"`
+	TimeStart            string                            `yaml:"time_start,omitempty" mapstructure:"time_start"`
+	TimeEnd              string                            `yaml:"time_end,omitempty" mapstructure:"time_end"`
+	TimeRange            *TimeTuple                        `yaml:"-" json:"-" mapstructure:"-"`
+	TimeFrames           string                            `yaml:"timeframes" mapstructure:"timeframes"`
+	RunTimeframes        []string                          `yaml:"run_timeframes,omitempty,flow" mapstructure:"run_timeframes"`
+	KlineSource          string                            `yaml:"kline_source,omitempty" mapstructure:"kline_source"`
+	WatchJobs            map[string][]string               `yaml:"watch_jobs,omitempty" mapstructure:"watch_jobs"`
+	RunPolicy            []*RunPolicyConfig                `yaml:"run_policy,omitempty" mapstructure:"run_policy"`
+	StratPerf            *StratPerfConfig                  `yaml:"strat_perf,omitempty" mapstructure:"strat_perf"`
+	Pairs                []string                          `yaml:"pairs,omitempty,flow" mapstructure:"pairs"`
+	PairMgr              *PairMgrConfig                    `yaml:"pairmgr,omitempty" mapstructure:"pairmgr"`
+	PairFilters          []*CommonPairFilter               `yaml:"pairlists,omitempty" mapstructure:"pairlists"`
+	Accounts             map[string]*AccountConfig         `yaml:"accounts,omitempty" mapstructure:"accounts,omitempty"`
+	Exchange             *ExchangeConfig                   `yaml:"exchange,omitempty" mapstructure:"exchange"`
+	Database             *DatabaseConfig                   `yaml:"database,omitempty" mapstructure:"database"`
+	SpiderAddr           string                            `yaml:"spider_addr,omitempty" mapstructure:"spider_addr"`
+	APIServer            *APIServerConfig                  `yaml:"api_server,omitempty" mapstructure:"api_server"`
+	RPCChannels          map[string]map[string]interface{} `yaml:"rpc_channels,omitempty" mapstructure:"rpc_channels"`
+	Mail                 *MailConfig                       `yaml:"mail,omitempty" mapstructure:"mail"`
+	Webhook              map[string]map[string]string      `yaml:"webhook,omitempty" mapstructure:"webhook"`
+	LLMModels            map[string]*llm.LLMModelConfig    `yaml:"llm_models" mapstructure:"llm_models"`
 }
 
 // The strategy to run, multiple strategies can be run at the same time 运行的策略，可以多个策略同时运行

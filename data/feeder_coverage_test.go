@@ -5,6 +5,7 @@ import (
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 )
 
@@ -50,8 +51,8 @@ func TestHistoricalCoverageForFeeder(t *testing.T) {
 		t.Fatalf("backtest feeder lost known coverage: %#v", known)
 	}
 	missing := historicalCoverageForFeeder("BTC/USDT:USDT", true)
-	if missing == nil || missing.Allows("5m", 200) || !missing.Allows("5m", 500) {
-		t.Fatalf("missing symbol did not fail closed before baseline end: %#v", missing)
+	if missing == nil || missing.Allows("5m", 200) || missing.Allows("5m", 500) {
+		t.Fatalf("missing symbol did not fail closed across the extension tail: %#v", missing)
 	}
 }
 
@@ -64,7 +65,12 @@ func TestFeederHistoricalCoverageFiltersStateAndCache(t *testing.T) {
 		ExSymbol: &orm.ExSymbol{Symbol: "BTC/USDT:USDT"},
 		CallBack: func(evt *orm.DataSeries) { called = append(called, evt.TimeMS) },
 		tfBars:   make(map[string][]*orm.DataSeries),
-		coverage: &config.HistoricalCoverageConfig{BaselineEndMS: 500},
+		coverage: &config.HistoricalCoverageConfig{
+			BaselineEndMS: 500,
+			Bars: map[string]map[string][]config.HistoricalCoverageRange{
+				"BTC/USDT:USDT": {"8h": {{StartMS: 200, StopMS: 300}}},
+			},
+		},
 	}
 	if rows := feeder.onStateOhlcvs(state, []*orm.DataSeries{{TimeMS: 100}}, true); len(rows) != 0 {
 		t.Fatalf("excluded rows reached state: %v", rows)
@@ -101,5 +107,59 @@ func TestFeederHistoricalCoverageRecomputesLastCompletedRow(t *testing.T) {
 		len(feeder.tfBars["8h"]) != 1 {
 		t.Fatalf("completed covered row was delayed: rows=%v state=%#v cache=%v callbacks=%v",
 			rows, state, feeder.tfBars, called)
+	}
+}
+
+func TestFeederKeepsUnfinishedProvedListingBucketWaiting(t *testing.T) {
+	const hour = int64(60 * 60 * 1000)
+	previousMode, previousData := core.BackTestMode, config.Data
+	t.Cleanup(func() { core.BackTestMode, config.Data = previousMode, previousData })
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+
+	symbol := "WLD/USDT:USDT"
+	state := &PairTFCache{TimeFrame: "8h", TFSecs: 8 * 60 * 60}
+	called := make([]int64, 0, 1)
+	feeder := &Feeder{
+		ExSymbol: &orm.ExSymbol{ID: 7, Exchange: "binance", Symbol: symbol, ListMs: 4 * hour},
+		CallBack: func(evt *orm.DataSeries) { called = append(called, evt.TimeMS) },
+		tfBars:   make(map[string][]*orm.DataSeries),
+		coverage: &config.HistoricalCoverageConfig{
+			BaselineEndMS: 24 * hour,
+			Bars: map[string]map[string][]config.HistoricalCoverageRange{
+				symbol: {
+					"8h": {{StartMS: 4 * hour, StopMS: 24 * hour}},
+					"1h": {{StartMS: 4 * hour, StopMS: 24 * hour}},
+					"1m": {{StartMS: 4 * hour, StopMS: 24 * hour}},
+				},
+			},
+		},
+	}
+	row := &orm.DataSeries{TimeMS: 0}
+	if rows := feeder.onStateOhlcvs(state, []*orm.DataSeries{row}, false); len(rows) != 0 ||
+		state.WaitBar != row || len(called) != 0 {
+		t.Fatalf("unfinished listing bucket fired early: rows=%v wait=%v callbacks=%v", rows, state.WaitBar, called)
+	}
+}
+
+func TestSeriesFeederWarmupStateUsesLastAllowedRow(t *testing.T) {
+	called := make([]int64, 0, 1)
+	state := &PairTFCache{TimeFrame: "1h", TFSecs: 3600}
+	feeder := &SeriesFeeder{Feeder: Feeder{
+		ExSymbol: &orm.ExSymbol{Symbol: "BTC/USDT:USDT"},
+		CallBack: func(evt *orm.DataSeries) { called = append(called, evt.TimeMS) },
+		States:   []*PairTFCache{state},
+		coverage: &config.HistoricalCoverageConfig{
+			BaselineEndMS: 500,
+			Bars: map[string]map[string][]config.HistoricalCoverageRange{
+				"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 200}}},
+			},
+		},
+	}}
+	endMS := feeder.warmTf("1h", []*orm.DataSeries{{TimeMS: 100}, {TimeMS: 200}})
+	wantEnd := int64(100 + 3600*1000)
+	if endMS != wantEnd || state.SubNextMS != wantEnd || len(called) != 1 || called[0] != 100 {
+		t.Fatalf("end=%d state=%d callbacks=%v want=%d", endMS, state.SubNextMS, called, wantEnd)
 	}
 }

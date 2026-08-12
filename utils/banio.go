@@ -26,6 +26,11 @@ import (
 	"time"
 )
 
+const (
+	banConnMaxFrameBytes   = 96 << 20
+	banConnMaxMessageBytes = 128 << 20
+)
+
 type ConnCB = func(msg *IOMsgRaw)
 
 type IBanConn interface {
@@ -151,6 +156,9 @@ func (c *BanConn) write(data []byte, retryNum int) *errs.Error {
 			c.lockWrite.Unlock()
 		}
 	}()
+	if len(data) > banConnMaxFrameBytes {
+		return errs.NewMsg(errs.CodeParamInvalid, "ban connection frame exceeds %d bytes", banConnMaxFrameBytes)
+	}
 	dataLen := uint32(len(data))
 	lenBt := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBt, dataLen)
@@ -271,6 +279,9 @@ func (c *BanConn) Read() ([]byte, *errs.Error) {
 	dataLen := binary.LittleEndian.Uint32(lenBuf)
 	if dataLen == 0 {
 		return []byte{}, nil
+	}
+	if dataLen > banConnMaxFrameBytes {
+		return nil, errs.NewMsg(core.ErrNetReadFail, "ban connection frame exceeds %d bytes", banConnMaxFrameBytes)
 	}
 	// 读取完整的数据
 	buf := make([]byte, dataLen)
@@ -657,9 +668,12 @@ func deCompress(compressed []byte) ([]byte, *errs.Error) {
 
 	// Copy the decompressed data to the result
 	// 将解压后的数据复制到 result 中
-	_, err = io.Copy(&result, r)
+	_, err = io.Copy(&result, io.LimitReader(r, banConnMaxMessageBytes+1))
 	if err != nil {
 		return nil, errs.New(core.ErrDeCompressFail, err)
+	}
+	if result.Len() > banConnMaxMessageBytes {
+		return nil, errs.NewMsg(core.ErrDeCompressFail, "ban connection message exceeds %d bytes", banConnMaxMessageBytes)
 	}
 
 	return result.Bytes(), nil

@@ -29,6 +29,44 @@ func TestHistoricalCoverageNormalizeAndAllows(t *testing.T) {
 	if coverage.Allows("1h", 300) {
 		t.Fatal("missing timeframe was allowed before baseline end")
 	}
+	if coverage.Allows("1h", 700) {
+		t.Fatal("missing timeframe was allowed in the extension tail")
+	}
+}
+
+func TestHistoricalCoverageUnknownSymbolRejectsExtensionTail(t *testing.T) {
+	previous := HistoricalCoverage
+	HistoricalCoverage = &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	t.Cleanup(func() { HistoricalCoverage = previous })
+
+	unknown := HistoricalCoverageFor("NEW/USDT:USDT")
+	if unknown.Allows("5m", 200) || unknown.Allows("5m", 700) {
+		t.Fatal("unknown symbol was allowed by another symbol's archived bar plan")
+	}
+	known := HistoricalCoverageFor("BNB/USDT:USDT")
+	if !known.Allows("5m", 700) {
+		t.Fatal("known symbol/timeframe extension tail was rejected")
+	}
+}
+
+func TestHistoricalCoverageRejectsRowsAfterBacktestEnd(t *testing.T) {
+	previous := TimeRange
+	TimeRange = &TimeTuple{StartMS: 50, EndMS: 700}
+	t.Cleanup(func() { TimeRange = previous })
+	coverage := &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	if !coverage.Allows("5m", 699) || coverage.Allows("5m", 700) || coverage.Allows("5m", 900) {
+		t.Fatal("historical coverage was not capped at the frozen backtest end")
+	}
 }
 
 func TestHistoricalCoverageRejectsInvalidRange(t *testing.T) {
@@ -40,6 +78,22 @@ func TestHistoricalCoverageRejectsInvalidRange(t *testing.T) {
 	}
 	if err := coverage.Normalize(&TimeTuple{StartMS: 200, EndMS: 700}); err == nil {
 		t.Fatal("range extending past baseline end was accepted")
+	}
+}
+
+func TestHistoricalCoverageAllowsBaselineAtBacktestEnd(t *testing.T) {
+	coverage := &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	if err := coverage.Normalize(&TimeTuple{StartMS: 50, EndMS: 500}); err != nil {
+		t.Fatalf("equal-end historical coverage was rejected: %v", err)
+	}
+	coverage.BaselineEndMS = 501
+	if err := coverage.Normalize(&TimeTuple{StartMS: 50, EndMS: 500}); err == nil {
+		t.Fatal("historical coverage beyond the backtest end was accepted")
 	}
 }
 

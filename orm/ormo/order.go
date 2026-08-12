@@ -230,6 +230,12 @@ func (i *InOutOrder) UpdateProfits(price float64) {
 	i.ProfitRate = i.Profit / entQuoteVal
 	if i.ProfitRate > i.MaxPftRate {
 		i.MaxPftRate = i.ProfitRate
+	} else if config.StrictHistoricalReplay(config.HistoricalCoverage) && config.Data.BTLegacyOrderMetrics {
+		if i.MaxPftRate > 0 {
+			i.MaxDrawDown = (i.MaxPftRate - i.ProfitRate) / i.MaxPftRate
+		} else {
+			i.MaxDrawDown = -i.ProfitRate
+		}
 	} else {
 		i.MaxDrawDown = min(i.MaxDrawDown, i.Profit, 0)
 	}
