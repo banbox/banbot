@@ -65,12 +65,10 @@ func TestLegacyWalletLegalValuesUseStableCoinOrder(t *testing.T) {
 
 func TestLegacyWalletPriceUsesLastHistoricalBar(t *testing.T) {
 	originalData := config.Data
-	originalCoverage := config.HistoricalCoverage
 	originalBacktest := core.BackTestMode
 	originalTime := btime.CurTimeMS
 	t.Cleanup(func() {
 		config.Data = originalData
-		config.HistoricalCoverage = originalCoverage
 		core.BackTestMode = originalBacktest
 		btime.CurTimeMS = originalTime
 	})
@@ -84,12 +82,6 @@ func TestLegacyWalletPriceUsesLastHistoricalBar(t *testing.T) {
 		t.Fatalf("current stale price = %v, want -1", got)
 	}
 	config.Data.BTLegacyWallet = true
-	if got := walletMarkPrice(symbol); got != -1 {
-		t.Fatalf("legacy wallet escaped strict replay scope: %v", got)
-	}
-	config.Data.BTStrict = true
-	config.Data.BTNoKlineDownload = true
-	config.HistoricalCoverage = &config.HistoricalCoverageConfig{}
 	if got := walletMarkPrice(symbol); got != 123.45 {
 		t.Fatalf("legacy stale price = %v, want 123.45", got)
 	}
@@ -115,16 +107,11 @@ func TestLegacyWalletOrdersAreStableWithoutMutatingInput(t *testing.T) {
 func enableLegacyWalletReplay(t *testing.T) {
 	t.Helper()
 	originalData := config.Data
-	originalCoverage := config.HistoricalCoverage
 	originalBacktest := core.BackTestMode
 	t.Cleanup(func() {
 		config.Data = originalData
-		config.HistoricalCoverage = originalCoverage
 		core.BackTestMode = originalBacktest
 	})
 	core.BackTestMode = true
 	config.Data.BTLegacyWallet = true
-	config.Data.BTStrict = true
-	config.Data.BTNoKlineDownload = true
-	config.HistoricalCoverage = &config.HistoricalCoverageConfig{}
 }

@@ -1030,7 +1030,7 @@ func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, m
 }
 
 func legacyIntrabarEnabled() bool {
-	return config.StrictHistoricalReplay(config.HistoricalCoverage) && config.Data.BTLegacyIntrabar
+	return core.BackTestMode && config.Data.BTLegacyIntrabar
 }
 
 /*

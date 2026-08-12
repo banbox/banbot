@@ -208,8 +208,7 @@ bars original unweighted K-line
 bars 原始未复权的K线
 */
 func (f *Feeder) onStateOhlcvs(state *PairTFCache, rows []*orm.DataSeries, lastOk bool) []*orm.DataSeries {
-	if !lastOk && len(rows) > 0 && f.coverage != nil &&
-		!orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, state.TimeFrame, rows[len(rows)-1].TimeMS) {
+	if !lastOk && len(rows) > 0 && f.coverage != nil && !f.coverage.Allows(state.TimeFrame, rows[len(rows)-1].TimeMS) {
 		lastOk = true
 	}
 	rows = f.filterHistoricalCoverageRows(state.TimeFrame, rows)
@@ -302,12 +301,12 @@ func (f *Feeder) filterHistoricalCoverageRows(timeframe string, rows []*orm.Data
 		return rows
 	}
 	for index, row := range rows {
-		if orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, timeframe, row.TimeMS) {
+		if f.coverage.Allows(timeframe, row.TimeMS) {
 			continue
 		}
 		filtered := append([]*orm.DataSeries(nil), rows[:index]...)
 		for _, remaining := range rows[index+1:] {
-			if orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, timeframe, remaining.TimeMS) {
+			if f.coverage.Allows(timeframe, remaining.TimeMS) {
 				filtered = append(filtered, remaining)
 			}
 		}
@@ -575,7 +574,6 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 		if err != nil {
 			return 0, nil, err
 		}
-		bars = f.filterHistoricalCoverageRows(tf, bars)
 		if debugWarm {
 			var firstMS, lastMS int64
 			if len(bars) > 0 {
@@ -631,7 +629,6 @@ Returns the ending timestamp (i.e. the starting timestamp of the next bar)
 返回结束的时间戳（即下一个bar开始时间戳）
 */
 func (f *SeriesFeeder) warmTf(tf string, rows []*orm.DataSeries) int64 {
-	rows = f.filterHistoricalCoverageRows(tf, rows)
 	if len(rows) == 0 {
 		return 0
 	}

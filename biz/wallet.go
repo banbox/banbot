@@ -1060,14 +1060,14 @@ func legacyWalletOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
 }
 
 func walletMarkPrice(symbol string) float64 {
-	if config.StrictHistoricalReplay(config.HistoricalCoverage) && config.Data.BTLegacyWallet {
+	if core.BackTestMode && config.Data.BTLegacyWallet {
 		return com.GetLastBarPrice(symbol)
 	}
 	return com.GetPriceSafe(symbol, "")
 }
 
 func stableWalletBacktest() bool {
-	return config.StrictBacktest()
+	return core.BackTestMode && (config.Data.BTLegacyWallet || config.Data.BTStrict)
 }
 
 func (w *BanWallets) GetAmountByLegal(symbol string, legalCost float64) float64 {

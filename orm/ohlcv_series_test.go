@@ -1,8 +1,10 @@
 package orm
 
 import (
+	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/banbox/banexg"
 )
@@ -203,6 +205,58 @@ func TestUpdateSeriesValidatesRowsBeforeRangeUpdate(t *testing.T) {
 
 	if err := (&Queries{}).UpdateSeries(exs, "1m", 60_000, 120_000, []*DataSeries{invalid}, false); err == nil {
 		t.Fatal("expected invalid series error before database range update")
+	}
+}
+
+func TestInsertOHLCVSeriesAutoPostgresRollbackKeepsRecoveryJob(t *testing.T) {
+	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
+	if IsQuestDB {
+		t.Skip("postgres/timescale backend is not active")
+	}
+
+	ctx := context.Background()
+	q, conn, err := Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	sid := int32(time.Now().UnixNano()%1_000_000 + 5_000_000)
+	startMS := int64(1_700_000_040_000)
+	exs := &ExSymbol{ID: sid, Symbol: "ROLLBACK/USDT"}
+	row := NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+		Time: startMS, Open: 1, High: 2, Low: 0.5, Close: 1.5, Volume: 3,
+	}, nil, false, true)
+	defer func() {
+		_, _ = q.db.Exec(ctx, `DELETE FROM kline_1m WHERE sid = $1`, sid)
+		_, _ = q.db.Exec(ctx, `DELETE FROM sranges WHERE sid = $1 AND tbl = 'kline_1m' AND timeframe = '1m'`, sid)
+		_ = q.delInsKlinePg(ctx, sid, "1m")
+	}()
+
+	tx, write, txErr := q.begin(ctx)
+	if txErr != nil {
+		t.Fatal(txErr)
+	}
+	if _, err := write.InsertOHLCVSeriesAuto("1m", exs, []*DataSeries{row}, false); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var rowCount, rangeCount int
+	if err := q.db.QueryRow(ctx, `SELECT count(*) FROM kline_1m WHERE sid = $1`, sid).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.db.QueryRow(ctx, `SELECT count(*) FROM sranges WHERE sid = $1 AND tbl = 'kline_1m' AND timeframe = '1m'`, sid).Scan(&rangeCount); err != nil {
+		t.Fatal(err)
+	}
+	job, jobErr := q.getInsKlinePg(ctx, sid, "1m")
+	if jobErr != nil {
+		t.Fatal(jobErr)
+	}
+	if rowCount != 0 || rangeCount != 0 || job == nil {
+		t.Fatalf("rollback state rows=%d ranges=%d recovery_job=%+v", rowCount, rangeCount, job)
 	}
 }
 

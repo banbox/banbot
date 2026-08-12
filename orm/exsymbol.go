@@ -303,29 +303,6 @@ func EnsureCurSymbols(symbols []string) *errs.Error {
 	return EnsureSymbols(exsList, exgId)
 }
 
-// ValidateCurSymbolsReadOnly verifies that every frozen replay market already
-// has a database symbol. It never creates or updates symbol metadata.
-func ValidateCurSymbolsReadOnly(symbols []string) *errs.Error {
-	marMap, err := LoadMarkets(exg.Default, false)
-	if err != nil {
-		return err
-	}
-	return validateCurSymbolsReadOnly(symbols, marMap, config.Exchange.Name, core.Market)
-}
-
-func validateCurSymbolsReadOnly(symbols []string, marMap banexg.MarketMap, exchange, market string) *errs.Error {
-	for _, symbol := range symbols {
-		if _, ok := marMap[symbol]; !ok {
-			return errs.NewMsg(core.ErrInvalidSymbol, "symbol %s not found", symbol)
-		}
-		if findExSymbol(exchange, market, symbol) == nil {
-			return errs.NewMsg(core.ErrBadConfig,
-				"read-only replay symbol %s is absent from database authority", symbol)
-		}
-	}
-	return nil
-}
-
 func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 	var err *errs.Error
 	var exgNames = make(map[string]bool)
@@ -744,28 +721,6 @@ func InitListDates() *errs.Error {
 			if err_ != nil {
 				return NewDbErr(core.ErrDbExecFail, err_)
 			}
-		}
-	}
-	return nil
-}
-
-// ValidateListDatesReadOnly rejects market metadata that InitListDates would
-// otherwise repair. Historical replay must never mutate database authority.
-func ValidateListDatesReadOnly() *errs.Error {
-	exchange := exg.Default
-	exInfo := exchange.Info()
-	return validateListDatesReadOnly(GetExSymbols(exInfo.ID, exInfo.MarketType), exchange.GetCurMarkets())
-}
-
-func validateListDatesReadOnly(exsList map[int32]*ExSymbol, marketMap banexg.MarketMap) *errs.Error {
-	for _, exs := range exsList {
-		mar, ok := marketMap[exs.Symbol]
-		if !ok {
-			continue
-		}
-		if (exs.ListMs == 0 && mar.Created > 0) || (exs.DelistMs == 0 && mar.Expiry > 0) {
-			return errs.NewMsg(core.ErrBadConfig,
-				"read-only replay symbol %s has incomplete list-date authority", exs.Symbol)
 		}
 	}
 	return nil

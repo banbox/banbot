@@ -30,6 +30,10 @@ type SeriesRangeRepo interface {
 	MissingSeriesRanges(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64) ([]MSRange, *errs.Error)
 }
 
+type atomicSeriesWriter interface {
+	WriteSeriesBatch(ctx context.Context, info *SeriesInfo, sid int32, rows []*DataRecord) *errs.Error
+}
+
 var defaultSeriesRepo SeriesRepo = &dbSeriesRepo{}
 
 const seriesQuestRewriteDeleteRatio = 0.5
@@ -80,7 +84,10 @@ func (r *dbSeriesRepo) InsertSeriesBatch(ctx context.Context, info *SeriesInfo, 
 		return err
 	}
 	defer conn.Release()
+	return r.insertSeriesBatch(ctx, q, info, rows)
+}
 
+func (r *dbSeriesRepo) insertSeriesBatch(ctx context.Context, q *Queries, info *SeriesInfo, rows []*DataRecord) *errs.Error {
 	binding := normalizedSeriesBinding(info.Binding)
 	if IsQuestDB && !skipSeriesTableReadLock(ctx) {
 		tblLock := cptState.getTableLock(binding.Table)
@@ -169,6 +176,97 @@ func (r *dbSeriesRepo) InsertSeriesBatch(ctx context.Context, info *SeriesInfo, 
 		}
 	}
 	return nil
+}
+
+func (r *dbSeriesRepo) WriteSeriesBatch(ctx context.Context, info *SeriesInfo, sid int32, rows []*DataRecord) *errs.Error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateSeriesInfo(info); err != nil {
+		return err
+	}
+	if err := r.EnsureSeriesTable(ctx, info); err != nil {
+		return err
+	}
+	q, conn, err := Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	write := q
+	var tx pgx.Tx
+	if !IsQuestDB {
+		var txErr error
+		tx, write, txErr = q.begin(ctx)
+		if txErr != nil {
+			return NewDbErr(core.ErrDbExecFail, txErr)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+	}
+	oldEnds, oldErr := seriesRowEnds(ctx, write, info, sid, rows)
+	if oldErr != nil {
+		return oldErr
+	}
+	if err := r.insertSeriesBatch(ctx, write, info, rows); err != nil {
+		return err
+	}
+	binding := normalizedSeriesBinding(info.Binding)
+	for _, row := range rows {
+		if oldEnd := oldEnds[row.TimeMS]; oldEnd > row.EndMS {
+			if err := write.UpdateSRanges(ctx, sid, binding.Table, info.TimeFrame, row.EndMS, oldEnd, false); err != nil {
+				return NewDbErr(core.ErrDbExecFail, err)
+			}
+		}
+	}
+	if err := write.updateSeriesCoverage(ctx, info, sid, rows[0].TimeMS, rows[len(rows)-1].EndMS, rows); err != nil {
+		return err
+	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
+	}
+	return nil
+}
+
+func seriesRowEnds(ctx context.Context, q *Queries, info *SeriesInfo, sid int32, rows []*DataRecord) (map[int64]int64, *errs.Error) {
+	binding := normalizedSeriesBinding(info.Binding)
+	result := make(map[int64]int64)
+	wanted := make(map[int64]bool, len(rows))
+	for _, row := range rows {
+		wanted[row.TimeMS] = true
+	}
+	startVal, endVal := any(rows[0].TimeMS), any(rows[len(rows)-1].TimeMS)
+	timeProjection := quoteIdent(binding.TimeColumn)
+	if IsQuestDB {
+		startVal = time.UnixMilli(rows[0].TimeMS).UTC()
+		endVal = time.UnixMilli(rows[len(rows)-1].TimeMS).UTC()
+		timeProjection = fmt.Sprintf("cast(%s as long)/1000", quoteIdent(binding.TimeColumn))
+	}
+	query := fmt.Sprintf("SELECT %s, %s FROM %s WHERE %s = $1 AND %s >= $2 AND %s <= $3",
+		timeProjection, quoteIdent(binding.EndColumn), quoteIdent(binding.Table), quoteIdent(binding.SIDColumn),
+		quoteIdent(binding.TimeColumn), quoteIdent(binding.TimeColumn))
+	dbRows, err := q.db.Query(ctx, query, sid, startVal, endVal)
+	if err != nil {
+		return nil, NewDbErr(core.ErrDbReadFail, err)
+	}
+	defer dbRows.Close()
+	for dbRows.Next() {
+		var timeMS, endMS int64
+		if err := dbRows.Scan(&timeMS, &endMS); err != nil {
+			return nil, NewDbErr(core.ErrDbReadFail, err)
+		}
+		if wanted[timeMS] && endMS > result[timeMS] {
+			result[timeMS] = endMS
+		}
+	}
+	if err := dbRows.Err(); err != nil {
+		return nil, NewDbErr(core.ErrDbReadFail, err)
+	}
+	return result, nil
 }
 
 func withSeriesTableReadLockSkipped(ctx context.Context) context.Context {
@@ -304,16 +402,24 @@ func (r *dbSeriesRepo) DeleteSeriesRange(ctx context.Context, info *SeriesInfo, 
 
 	binding := normalizedSeriesBinding(info.Binding)
 	if !IsQuestDB {
+		tx, write, err_ := q.begin(ctx)
+		if err_ != nil {
+			return NewDbErr(core.ErrDbExecFail, err_)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
 		sqlText := fmt.Sprintf("DELETE FROM %s WHERE %s = $1 AND %s >= $2 AND %s < $3",
 			quoteIdent(binding.Table),
 			quoteIdent(binding.SIDColumn),
 			quoteIdent(binding.TimeColumn),
 			quoteIdent(binding.TimeColumn),
 		)
-		if _, err_ := q.db.Exec(ctx, sqlText, sid, startMS, endMS); err_ != nil {
+		if _, err_ := write.db.Exec(ctx, sqlText, sid, startMS, endMS); err_ != nil {
 			return NewDbErr(core.ErrDbExecFail, err_)
 		}
-		if err_ := q.UpdateSRanges(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS, false); err_ != nil {
+		if err_ := write.UpdateSRanges(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS, false); err_ != nil {
+			return NewDbErr(core.ErrDbExecFail, err_)
+		}
+		if err_ := tx.Commit(ctx); err_ != nil {
 			return NewDbErr(core.ErrDbExecFail, err_)
 		}
 		return nil
@@ -547,7 +653,24 @@ func (r *dbSeriesRepo) UpdateSeriesCoverage(ctx context.Context, info *SeriesInf
 		tblLock.RLock()
 		defer tblLock.RUnlock()
 	}
-	return UpdateSeriesCoverage(ctx, info, sid, startMS, endMS, rows)
+	q, conn, err := Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	return q.updateSeriesCoverage(ctx, info, sid, startMS, endMS, rows)
+}
+
+func (q *Queries) updateSeriesCoverage(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64, rows []*DataRecord) *errs.Error {
+	binding := normalizedSeriesBinding(info.Binding)
+	holes, err := seriesCoverageHoles(sid, startMS, endMS, rows)
+	if err != nil {
+		return err
+	}
+	if err := q.UpdateSRangesWithHoles(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS, holes); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	return nil
 }
 
 func (r *dbSeriesRepo) GetSeriesRange(ctx context.Context, info *SeriesInfo, sid int32) (int64, int64, *errs.Error) {
@@ -590,6 +713,18 @@ func seriesQuestPartitionBy(tf string) string {
 
 func waitForQuestSeriesVisible(ctx context.Context, q *Queries, info *SeriesInfo, sid int32, wantTimeMS int64) *errs.Error {
 	binding := normalizedSeriesBinding(info.Binding)
+	applied, err := waitForQuestCondition(ctx, 5*time.Second, questReadAfterWritePollInterval, func() (bool, error) {
+		var sequencerTxn, writerTxn int64
+		err := q.db.QueryRow(ctx, `SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = $1`,
+			binding.Table).Scan(&sequencerTxn, &writerTxn)
+		return writerTxn >= sequencerTxn, err
+	})
+	if err != nil {
+		return NewDbErr(core.ErrDbReadFail, err)
+	}
+	if !applied {
+		return errs.NewMsg(core.ErrDbReadFail, "questdb series WAL not applied in time: table=%s", binding.Table)
+	}
 	sqlText := fmt.Sprintf("SELECT max(cast(%s as long)/1000) FROM %s WHERE %s = $1",
 		quoteIdent(binding.TimeColumn),
 		quoteIdent(binding.Table),

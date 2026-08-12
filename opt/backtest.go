@@ -242,11 +242,7 @@ func (b *BackTest) Init() *errs.Error {
 		return err
 	}
 	b.PBar.SetProgress("init", 1)
-	if config.Args != nil && config.Args.ReadOnlyReplay {
-		err = orm.ValidateListDatesReadOnly()
-	} else {
-		err = orm.InitListDates()
-	}
+	err = orm.InitListDates()
 	if err != nil {
 		return err
 	}

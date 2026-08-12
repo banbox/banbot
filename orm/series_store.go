@@ -61,6 +61,9 @@ func (s *SeriesStore) WriteBatch(ctx context.Context, info *SeriesInfo, target *
 		return nil
 	}
 	repo := s.repoOrDefault()
+	if writer, ok := repo.(atomicSeriesWriter); ok {
+		return writer.WriteSeriesBatch(ctx, info, target.ID, items)
+	}
 	if err := repo.InsertSeriesBatch(ctx, info, items); err != nil {
 		return err
 	}
@@ -100,10 +103,6 @@ func (s *SeriesStore) Read(ctx context.Context, info *SeriesInfo, target *ExSymb
 	}
 	if err := validateSeriesInfo(info); err != nil {
 		return nil, err
-	}
-	if historicalCoverageForQuery(target.Symbol) != nil &&
-		isKLineSeriesBinding(info, normalizedSeriesBinding(info.Binding)) {
-		return NewKLineSeriesStore(info).Read(ctx, target, startMS, endMS, limit)
 	}
 	rows, err := s.repoOrDefault().QuerySeriesRange(ctx, info, target.ID, startMS, endMS, limit)
 	if err != nil {

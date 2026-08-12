@@ -257,22 +257,17 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 		holes = hs
 	}
 	ctx := context.Background()
-	if err := rewriteHoleRangesInWindow(ctx, sid, timeFrame, startMS, endMS, holes); err != nil {
+	if err := q.rewriteHoleRangesInWindow(ctx, sid, timeFrame, startMS, endMS, holes); err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
 }
 
-func rewriteHoleRangesInWindow(ctx context.Context, sid int32, timeFrame string, startMS, endMS int64, holes []MSRange) error {
-	sess, conn, err2 := Conn(ctx)
-	if err2 != nil {
-		return err2
-	}
-	defer conn.Release()
+func (q *Queries) rewriteHoleRangesInWindow(ctx context.Context, sid int32, timeFrame string, startMS, endMS int64, holes []MSRange) error {
 	tbl := "kline_" + timeFrame
 	// Use a single read+write cycle so QuestDB WAL commit lag between two consecutive
 	// UpdateSRanges calls cannot lose the has_data=true regions.
-	return sess.UpdateSRangesWithHoles(ctx, sid, tbl, timeFrame, startMS, endMS, holes)
+	return q.UpdateSRangesWithHoles(ctx, sid, tbl, timeFrame, startMS, endMS, holes)
 }
 
 func exactKlineHoles(barTimes []int64, tfMSecs, startMS, endMS int64) []MSRange {
@@ -305,7 +300,7 @@ func (q *Queries) repairKlineRangeFromPhysical(sid int32, timeframe string, star
 	if err != nil {
 		return err
 	}
-	if err := rewriteHoleRangesInWindow(context.Background(), sid, timeframe, startMS, endMS,
+	if err := q.rewriteHoleRangesInWindow(context.Background(), sid, timeframe, startMS, endMS,
 		exactKlineHoles(barTimes, tfMSecs, startMS, endMS)); err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
@@ -703,11 +698,29 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 	if err != nil || insTs.IsZero() {
 		return 0, err
 	}
-	num, err := q.InsertKLines(timeFrame, exs.ID, arr)
+	write := q
+	var tx pgx.Tx
+	if !IsQuestDB {
+		var txErr error
+		tx, write, txErr = q.begin(context.Background())
+		if txErr != nil {
+			return 0, NewDbErr(core.ErrDbExecFail, txErr)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+	}
+	num, err := write.InsertKLines(timeFrame, exs.ID, arr)
 	if err != nil {
 		return num, err
 	}
-	return num, q.finalizeKlineInsert(exs, timeFrame, startMS, endMS, arr[len(arr)-1].Time, insTs, aggBig)
+	if err = write.finalizeKlineInsert(exs, timeFrame, startMS, endMS, arr[len(arr)-1].Time, insTs, aggBig); err != nil {
+		return num, err
+	}
+	if tx != nil {
+		if err_ := tx.Commit(context.Background()); err_ != nil {
+			return num, NewDbErr(core.ErrDbExecFail, err_)
+		}
+	}
+	return num, nil
 }
 
 func (q *Queries) finalizeKlineInsert(exs *ExSymbol, timeFrame string, startMS, endMS, lastMS int64,
@@ -748,7 +761,7 @@ UpdateKRange
 */
 func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS int64, aggBig bool, skipHoles ...bool) *errs.Error {
 	// Record data ranges in sranges (non-contiguous allowed).
-	if err := updateKLineRange(exs.ID, timeFrame, startMS, endMS); err != nil {
+	if err := q.updateKLineRange(exs.ID, timeFrame, startMS, endMS); err != nil {
 		return err
 	}
 	// Search for holes and update sranges (has_data=false).
@@ -811,18 +824,13 @@ func (q *Queries) CalcKLineRanges(timeFrame string, sids map[int32]bool) (map[in
 	return res, nil
 }
 
-func updateKLineRange(sid int32, timeFrame string, startMS, endMS int64) *errs.Error {
+func (q *Queries) updateKLineRange(sid int32, timeFrame string, startMS, endMS int64) *errs.Error {
 	// QuestDB + sranges: record the data range (non-contiguous allowed).
 	if startMS <= 0 || endMS <= startMS {
 		return nil
 	}
 	ctx := context.Background()
-	sess, conn, err2 := Conn(ctx)
-	if err2 != nil {
-		return err2
-	}
-	defer conn.Release()
-	if err := sess.UpdateSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, startMS, endMS, true); err != nil {
+	if err := q.UpdateSRanges(ctx, sid, "kline_"+timeFrame, timeFrame, startMS, endMS, true); err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
@@ -949,7 +957,7 @@ order by ts`, fromTbl), sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endM
 	saveEnd := aggBars[len(aggBars)-1].Time + tfMSecs
 	// Update the effective range of intervals
 	// 更新有效区间范围
-	err = updateKLineRange(sid, item.TimeFrame, saveStart, saveEnd)
+	err = q.updateKLineRange(sid, item.TimeFrame, saveStart, saveEnd)
 	if err != nil {
 		return err
 	}
@@ -1239,7 +1247,7 @@ WHERE has_data = true AND (stop_ms = 0 OR start_ms = 0)`)
 			if err := q.DelKInfo(sid, tf); err != nil {
 				return err
 			}
-			if err := updateKLineRange(sid, tf, start, stop); err != nil {
+			if err := q.updateKLineRange(sid, tf, start, stop); err != nil {
 				return err
 			}
 			totalFixed++

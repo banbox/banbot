@@ -6,7 +6,6 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"math"
 	"os"
@@ -34,8 +33,6 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
-
-const maxBacktestZipBytes = 80 << 20
 
 type compareOrdersOptions struct {
 	configs    config.ArrString
@@ -1354,7 +1351,7 @@ func collectGoFiles(rootPath string) ([]string, error) {
 }
 
 // ZipBacktestResult 压缩回测结果为zip数据
-// maxFileSize: 最大允许的文件大小(字节)，超过此大小时返回错误，0表示不限制
+// maxFileSize: 最大允许的文件大小(字节)，超过此大小的文件不添加到zip中，0表示不限制
 func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFileSize int64) ([]byte, error) {
 	if !utils.Exists(resultPath) {
 		return nil, fmt.Errorf("backtest result not exist: %s", resultPath)
@@ -1363,9 +1360,6 @@ func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFi
 	names := []string{"detail.json", "config.yml", "out.log"}
 	if withOrders {
 		names = append(names, "orders.gob")
-		if !utils.Exists(filepath.Join(resultPath, "orders.gob")) {
-			return nil, fmt.Errorf("backtest result requires orders.gob")
-		}
 	}
 	var fileList []string
 	for _, name := range names {
@@ -1384,7 +1378,6 @@ func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFi
 	var buf bytes.Buffer
 	zipWriter := zip.NewWriter(&buf)
 	successCount := 0
-	var totalSize int64
 	for _, filePath := range fileList {
 		// 计算相对于resultPath的相对路径
 		fileName, err := filepath.Rel(resultPath, filePath)
@@ -1400,21 +1393,24 @@ func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFi
 		}
 
 		// 检查文件大小
-		fileInfo, err := os.Stat(filePath)
-		if err != nil {
-			return nil, fmt.Errorf("stat backtest artifact %s: %w", fileName, err)
-		}
-		if maxFileSize > 0 && fileInfo.Size() > maxFileSize {
-			return nil, fmt.Errorf("backtest artifact %s exceeds %d bytes", fileName, maxFileSize)
-		}
-		totalSize += fileInfo.Size()
-		if maxFileSize > 0 && totalSize > maxFileSize+(16<<20) {
-			return nil, fmt.Errorf("backtest result artifacts exceed %d bytes", maxFileSize+(16<<20))
+		if maxFileSize > 0 {
+			fileInfo, err := os.Stat(filePath)
+			if err != nil {
+				log.Warn("Failed to stat file", zap.String("file", fileName), zap.Error(err))
+				continue
+			}
+			if fileInfo.Size() > maxFileSize {
+				log.Warn("File too large, skipping", zap.String("file", fileName),
+					zap.Int64("size", fileInfo.Size()), zap.Int64("maxSize", maxFileSize))
+				continue
+			}
 		}
 
-		file, err := os.Open(filePath)
+		// 读取文件内容
+		fileData, err := os.ReadFile(filePath)
 		if err != nil {
-			return nil, fmt.Errorf("open backtest artifact %s: %w", fileName, err)
+			log.Warn("Failed to read file", zap.String("file", fileName), zap.Error(err))
+			continue
 		}
 
 		// 创建ZIP文件中的条目
@@ -1422,16 +1418,14 @@ func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFi
 
 		w, err := zipWriter.Create(zipPath)
 		if err != nil {
-			_ = file.Close()
-			return nil, fmt.Errorf("create backtest zip entry %s: %w", fileName, err)
+			log.Warn("Failed to create zip entry", zap.String("file", fileName), zap.Error(err))
+			continue
 		}
 
-		if _, err = io.Copy(w, file); err != nil {
-			_ = file.Close()
-			return nil, fmt.Errorf("write backtest zip entry %s: %w", fileName, err)
-		}
-		if err = file.Close(); err != nil {
-			return nil, fmt.Errorf("close backtest artifact %s: %w", fileName, err)
+		// 写入文件内容
+		if _, err = w.Write(fileData); err != nil {
+			log.Warn("Failed to write to zip", zap.String("file", fileName), zap.Error(err))
+			continue
 		}
 		successCount += 1
 	}
@@ -1443,9 +1437,6 @@ func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFi
 	// 关闭ZIP writer
 	if err = zipWriter.Close(); err != nil {
 		return nil, fmt.Errorf("failed to close zip writer: %w", err)
-	}
-	if buf.Len() > maxBacktestZipBytes {
-		return nil, fmt.Errorf("compressed backtest result exceeds %d bytes", maxBacktestZipBytes)
 	}
 
 	if cleanIfSuccess {

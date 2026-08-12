@@ -60,11 +60,11 @@ func (q *Queries) mergeSpansIntoPg(ctx context.Context, sid int32, table, timefr
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	tx, txq, err2 := q.NewTx(ctx)
-	if err2 != nil {
-		return err2
+	tx, txq, err := q.begin(ctx)
+	if err != nil {
+		return err
 	}
-	defer func() { _ = tx.Close(ctx, false) }()
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Read existing rows that overlap the window so we can recover any overhanging parts.
 	rows, err := txq.db.Query(ctx, `SELECT start_ms, stop_ms, has_data FROM sranges
@@ -144,10 +144,7 @@ ON CONFLICT (sid, tbl, timeframe, start_ms) DO UPDATE
 			return err
 		}
 	}
-	if closeErr := tx.Close(ctx, true); closeErr != nil {
-		return closeErr
-	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // UpdateSRangesPg is the TimescaleDB equivalent of UpdateSRanges.

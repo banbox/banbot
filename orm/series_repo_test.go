@@ -17,6 +17,130 @@ func TestSeriesRepoTimescaleRoundTrip(t *testing.T) {
 	runSeriesRepoRoundTrip(t, "timescale")
 }
 
+func TestSeriesRepoTimescaleRollbackKeepsRowsAndCoverageAtomic(t *testing.T) {
+	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
+	if IsQuestDB {
+		t.Skip("postgres/timescale backend is not active")
+	}
+
+	info, sid := newSeriesRepoTestInfo("series_repo_pg_rollback")
+	ctx := context.Background()
+	repo := &dbSeriesRepo{}
+	if err := repo.EnsureSeriesTable(ctx, info); err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupSeriesRepoTestTable(t, info)
+
+	q, conn, err := Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	tx, write, txErr := q.begin(ctx)
+	if txErr != nil {
+		t.Fatal(txErr)
+	}
+	row := &DataRecord{Sid: sid, TimeMS: 100, EndMS: 300, Values: map[string]any{"value": 1.0}}
+	if err := repo.insertSeriesBatch(ctx, write, info, []*DataRecord{row}); err != nil {
+		t.Fatal(err)
+	}
+	if err := write.updateSeriesCoverage(ctx, info, sid, row.TimeMS, row.EndMS, []*DataRecord{row}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var rowCount, rangeCount int
+	if err := q.db.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", quoteIdent(info.Binding.Table))).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.db.QueryRow(ctx, `SELECT count(*) FROM sranges WHERE sid = $1 AND tbl = $2 AND timeframe = $3`,
+		sid, info.Binding.Table, info.TimeFrame).Scan(&rangeCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 0 || rangeCount != 0 {
+		t.Fatalf("outer rollback leaked state: rows=%d ranges=%d", rowCount, rangeCount)
+	}
+}
+
+func TestSeriesRepoTimescaleWriteRollsBackWhenCoverageFails(t *testing.T) {
+	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
+	if IsQuestDB {
+		t.Skip("postgres/timescale backend is not active")
+	}
+
+	info, sid := newSeriesRepoTestInfo("series_repo_pg_coverage_fail")
+	ctx := context.Background()
+	repo := &dbSeriesRepo{}
+	if err := repo.EnsureSeriesTable(ctx, info); err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupSeriesRepoTestTable(t, info)
+
+	row := &DataRecord{Sid: sid + 1, TimeMS: 100, EndMS: 200, Values: map[string]any{"value": 1.0}}
+	if err := repo.WriteSeriesBatch(ctx, info, sid, []*DataRecord{row}); err == nil {
+		t.Fatal("expected coverage identity mismatch")
+	}
+	q, conn, err := Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	var count int
+	if err := q.db.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", quoteIdent(info.Binding.Table))).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("failed coverage update left %d physical rows", count)
+	}
+}
+
+func TestSeriesRepoTimescaleShorterUpsertClearsStaleCoverage(t *testing.T) {
+	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
+	if IsQuestDB {
+		t.Skip("postgres/timescale backend is not active")
+	}
+
+	info, sid := newSeriesRepoTestInfo("series_repo_pg_shrink")
+	ctx := context.Background()
+	repo := DefaultSeriesRepo()
+	store := NewSeriesStore(repo)
+	defer cleanupSeriesRepoTestTable(t, info)
+	target := &ExSymbol{ID: sid}
+	row := &DataRecord{Sid: sid, TimeMS: 100, EndMS: 300, Values: map[string]any{"value": 1.0}}
+	if err := store.WriteBatch(ctx, info, target, []*DataRecord{row}); err != nil {
+		t.Fatal(err)
+	}
+	shorter := *row
+	shorter.EndMS = 200
+	if err := store.WriteBatch(ctx, info, target, []*DataRecord{&shorter}); err != nil {
+		t.Fatal(err)
+	}
+	start, stop, err := repo.GetSeriesRange(ctx, info, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start != 100 || stop != 200 {
+		t.Fatalf("shorter upsert retained stale coverage: [%d,%d)", start, stop)
+	}
+}
+
+func newSeriesRepoTestInfo(prefix string) (*SeriesInfo, int32) {
+	suffix := time.Now().UnixNano()
+	return &SeriesInfo{
+		Name:      "macro_test",
+		TimeFrame: "1d",
+		Binding: SeriesBinding{
+			Table:      fmt.Sprintf("%s_%d", prefix, suffix),
+			TimeColumn: "ts",
+			EndColumn:  "end_ms",
+			SIDColumn:  "sid",
+			Fields:     []SeriesField{{Name: "value", Type: "float", Role: "value"}},
+		},
+	}, int32(suffix%1_000_000 + 3_000_000)
+}
+
 func TestSeriesRepoQuestDBRoundTrip(t *testing.T) {
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.yml"))
 	runSeriesRepoRoundTrip(t, "quest")
@@ -92,11 +216,10 @@ func runSeriesRepoRoundTrip(t *testing.T, backend string) {
 			},
 		},
 	}
-	if err := repo.InsertSeriesBatch(ctx, info, rows); err != nil {
-		t.Fatalf("InsertSeriesBatch failed: %v", err)
-	}
-	if err := repo.UpdateSeriesRange(ctx, info, sid, rows[0].TimeMS, rows[len(rows)-1].EndMS); err != nil {
-		t.Fatalf("UpdateSeriesRange failed: %v", err)
+	store := NewSeriesStore(repo)
+	target := &ExSymbol{ID: sid}
+	if err := store.WriteBatch(ctx, info, target, rows); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
 	}
 	got, err := repo.QuerySeriesRange(ctx, info, sid, rows[0].TimeMS, rows[len(rows)-1].EndMS, 10)
 	if err != nil {
@@ -110,6 +233,15 @@ func runSeriesRepoRoundTrip(t *testing.T, backend string) {
 	}
 	if got[1].Values["label"] != "wind" {
 		t.Fatalf("unexpected second row: %+v", got[1])
+	}
+	updated := *rows[1]
+	updated.Values = map[string]any{"value": 14.5, "label": "revised", "payload": `{"source":"update"}`}
+	if err := store.WriteBatch(ctx, info, target, []*DataRecord{&updated}); err != nil {
+		t.Fatalf("update WriteBatch failed: %v", err)
+	}
+	got, err = repo.QuerySeriesRange(ctx, info, sid, rows[0].TimeMS, rows[len(rows)-1].EndMS, 10)
+	if err != nil || len(got) != 2 || got[1].Values["label"] != "revised" {
+		t.Fatalf("updated series rows=%+v err=%v", got, err)
 	}
 	if start, stop, err := repo.GetSeriesRange(ctx, info, sid); err != nil {
 		t.Fatalf("GetSeriesRange failed: %v", err)
@@ -126,10 +258,29 @@ func runSeriesRepoRoundTrip(t *testing.T, backend string) {
 	if len(got) != 1 || got[0].TimeMS != rows[1].TimeMS {
 		t.Fatalf("expected only second row after delete, got %+v", got)
 	}
+	q, conn, connErr := Conn(ctx)
+	if connErr != nil {
+		t.Fatal(connErr)
+	}
+	spans, spanErr := q.ListSRanges(ctx, sid, info.Binding.Table, info.TimeFrame,
+		rows[0].TimeMS, rows[len(rows)-1].EndMS)
+	conn.Release()
+	if spanErr != nil || !hasSeriesGap(spans, rows[0].TimeMS, rows[0].EndMS) {
+		t.Fatalf("deleted gap spans=%+v err=%v", spans, spanErr)
+	}
 	if backend == "quest" {
 		assertQuestSeriesPhysicalRows(t, info, sid, 1)
 	}
 	cleanupSeriesRepoTestTable(t, info)
+}
+
+func hasSeriesGap(spans []*SRange, startMS, endMS int64) bool {
+	for _, span := range spans {
+		if !span.HasData && span.StartMs == startMS && span.StopMs == endMS {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSeriesRepoQuestDBDeleteHidesMiddleHole(t *testing.T) {
@@ -204,6 +355,9 @@ func initSeriesRepoTestApp(t *testing.T, cfgPath string) {
 	var args config.CmdArgs
 	args.NoDefault = true
 	args.Configs = []string{cfgPath}
+	if filepath.Base(cfgPath) == "config.local.yml" {
+		args.Configs = []string{filepath.Join(filepath.Dir(cfgPath), "config.yml"), cfgPath}
+	}
 	if err := config.LoadConfig(&args); err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}

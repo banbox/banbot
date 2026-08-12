@@ -136,11 +136,6 @@ func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, 
 	if err := validateKLineSeriesInfo(info); err != nil {
 		return nil, err
 	}
-	coverage := historicalCoverageForQuery(target.Symbol)
-	if coverage != nil {
-		return nil, errs.NewMsg(core.ErrBadConfig,
-			"historical coverage has no physical field proof for K-line series store reads")
-	}
 	return s.readRaw(ctx, target, startMS, endMS, limit)
 }
 

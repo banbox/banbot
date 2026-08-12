@@ -65,43 +65,6 @@ func TestParseConfigsStartEndOverrideEarlierTimerange(t *testing.T) {
 	}
 }
 
-func TestParseConfigsReplacesHistoricalCoverage(t *testing.T) {
-	cfg := parseLayeredTimeConfig(t,
-		`time_start: "1643673600000"
-time_end: "1785283200000"
-historical_coverage:
-  baseline_end_ms: 1754006400000
-  bars:
-    APT/USDT:USDT:
-      8h:
-        - start_ms: 1666137600000
-          stop_ms: 1754006400000
-`,
-		`historical_coverage:
-  baseline_end_ms: 1753142400000
-  bars:
-    APT/USDT:USDT:
-      4h:
-        - start_ms: 1666137600000
-          stop_ms: 1753142400000
-`,
-	)
-
-	coverage := cfg.HistoricalCoverage
-	if coverage == nil {
-		t.Fatal("historical coverage is missing")
-	}
-	apt := coverage.Bars["APT/USDT:USDT"]
-	if _, exists := apt["8h"]; exists {
-		t.Fatalf("earlier historical coverage leaked into the submitted layer: %#v", apt)
-	}
-	if ranges := apt["4h"]; len(ranges) != 1 || ranges[0] != (HistoricalCoverageRange{
-		StartMS: 1666137600000, StopMS: 1753142400000,
-	}) {
-		t.Fatalf("submitted historical coverage changed: %#v", ranges)
-	}
-}
-
 func parseLayeredTimeConfig(t *testing.T, layers ...string) *Config {
 	t.Helper()
 	dir := t.TempDir()
@@ -227,13 +190,12 @@ func TestRunPolicyToYamlRoundTrip(t *testing.T) {
 func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
 	temperature := 0.25
 	orig := &Config{
-		CloseOnStuck:         7,
-		BTLegacyIntrabar:     true,
-		BTLegacyOrderMetrics: true,
-		BTLegacyWallet:       true,
-		BTNoKlineDownload:    true,
-		NTPLangCode:          "en-US",
-		ShowLangCode:         "zh-CN",
+		CloseOnStuck:      7,
+		BTLegacyIntrabar:  true,
+		BTLegacyWallet:    true,
+		BTNoKlineDownload: true,
+		NTPLangCode:       "en-US",
+		ShowLangCode:      "zh-CN",
 		BTInLive: &BtInLiveConfig{
 			Cron: "0 3 * * *", Acount: "primary", MailTo: []string{"ops@example.com"},
 		},
@@ -248,7 +210,7 @@ func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
 	}
 
 	clone := orig.Clone()
-	if clone.CloseOnStuck != orig.CloseOnStuck || !clone.BTLegacyIntrabar || !clone.BTLegacyOrderMetrics ||
+	if clone.CloseOnStuck != orig.CloseOnStuck || !clone.BTLegacyIntrabar ||
 		!clone.BTLegacyWallet || !clone.BTNoKlineDownload ||
 		clone.NTPLangCode != orig.NTPLangCode ||
 		clone.ShowLangCode != orig.ShowLangCode || clone.TimeFrames != orig.TimeFrames ||

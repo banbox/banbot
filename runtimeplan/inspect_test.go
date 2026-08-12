@@ -1,6 +1,7 @@
 package runtimeplan
 
 import (
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -11,6 +12,37 @@ import (
 	"github.com/banbox/banbot/strat"
 	ta "github.com/banbox/banta"
 )
+
+func TestInspectUsesCallerDataDirWithoutChangingWorkingDirectory(t *testing.T) {
+	const strategyName = "runtime_plan_data_dir_fixture"
+	dataDir := t.TempDir()
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", "/nonexistent")
+	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{
+			RunTimeFrames: []string{"1h"},
+			OnStartUp: func(*strat.StratJob) {
+				if config.DataDir != dataDir {
+					t.Fatalf("config.DataDir = %q, want %q", config.DataDir, dataDir)
+				}
+			},
+		}
+	}
+	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+
+	if _, err = Inspect(validRequest(t, strategyName), dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if current, getErr := os.Getwd(); getErr != nil || current != workingDir {
+		t.Fatalf("working directory changed: got=%q want=%q err=%v", current, workingDir, getErr)
+	}
+	if _, err = Inspect(validRequest(t, strategyName), "relative"); err == nil {
+		t.Fatal("relative data directory was accepted")
+	}
+}
 
 func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 	const strategyName = "runtime_plan_fixture"
@@ -64,7 +96,7 @@ func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
 
 	req := validRequest(t, strategyName)
-	first, err := Inspect(req)
+	first, err := Inspect(req, t.TempDir())
 	if err != nil {
 		t.Fatalf("Inspect returned error: %v", err)
 	}
@@ -72,7 +104,7 @@ func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := Inspect(req)
+	second, err := Inspect(req, t.TempDir())
 	if err != nil {
 		t.Fatalf("second Inspect returned error: %v", err)
 	}
@@ -119,7 +151,7 @@ func TestInspectIncludesFrameworkPairListAndScoreKlines(t *testing.T) {
 	req := validRequest(t, strategyName)
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "exchange:\n", "run_timeframes: [15m]\nexchange:\n", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
-	output, err := Inspect(req)
+	output, err := Inspect(req, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +182,7 @@ func TestInspectAllowsForcedPairFiltersWithoutConfiguredFilters(t *testing.T) {
 	req := validRequest(t, strategyName)
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "exchange:\n", "pairmgr:\n  force_filters: true\nexchange:\n", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
-	output, err := Inspect(req)
+	output, err := Inspect(req, t.TempDir())
 	if err != nil || output == nil || len(output.Unsupported) != 0 {
 		t.Fatalf("empty forced pair filters were rejected: output=%+v err=%v", output, err)
 	}
@@ -166,7 +198,7 @@ func TestInspectRejectsConfiguredForcedPairFiltersWithoutRuntimeData(t *testing.
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "exchange:\n",
 		"pairmgr:\n  force_filters: true\npairlists:\n  - name: producer\n  - name: filter\nexchange:\n", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
-	output, err := Inspect(req)
+	output, err := Inspect(req, t.TempDir())
 	if err == nil || output == nil || !hasUnsupportedCode(output.Unsupported, "forced_pair_filters_require_runtime_data") {
 		t.Fatalf("configured forced pair filters were not rejected: output=%+v err=%v", output, err)
 	}
@@ -193,7 +225,7 @@ func TestInspectFrameworkRequirementsCoverPolicyAndPreMaxPairSymbols(t *testing.
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "  - name: "+strategyName+"\n",
 		"  - name: "+strategyName+"\n    pairs: [ETH/USDT:USDT]\n    max_pair: 1\n", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
-	output, err := Inspect(req)
+	output, err := Inspect(req, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +261,7 @@ func TestInspectFrameworkPairScoresMirrorSubMinuteShortCircuit(t *testing.T) {
 		return &strat.TradeStrat{RunTimeFrames: []string{"30s", "1h"}}
 	}
 	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
-	output, err := Inspect(validRequest(t, strategyName))
+	output, err := Inspect(validRequest(t, strategyName), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +316,7 @@ func TestInspectFailsClosedAndPersistsCanonicalUnsupportedItems(t *testing.T) {
 	}
 	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
 
-	output, err := Inspect(validRequest(t, strategyName))
+	output, err := Inspect(validRequest(t, strategyName), t.TempDir())
 	if err == nil || output == nil {
 		t.Fatalf("Inspect should fail with a persisted output, output=%+v err=%v", output, err)
 	}
@@ -319,7 +351,7 @@ func TestInspectCanonicalizesNondeterministicCallbackOrder(t *testing.T) {
 	req := validRequest(t, strategyName)
 	var expected string
 	for i := 0; i < 20; i++ {
-		output, err := Inspect(req)
+		output, err := Inspect(req, t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -368,7 +400,7 @@ func TestInspectFailsClosedWithoutTimeframeScoresOrPolicyFilterData(t *testing.T
 				req.ConfigYAML += test.configTail
 				req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
 			}
-			output, err := Inspect(req)
+			output, err := Inspect(req, t.TempDir())
 			if err == nil || output == nil || !hasUnsupportedCode(output.Unsupported, test.wantCode) {
 				t.Fatalf("output=%+v err=%v, want unsupported %s", output, err, test.wantCode)
 			}
@@ -391,7 +423,7 @@ func TestInspectPreservesSelectionOrderAndAppliesMaxPairBeforeCoverage(t *testin
 	req := validRequest(t, strategyName)
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "  - name: "+strategyName+"\n", "  - name: "+strategyName+"\n    max_pair: 1\n", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
-	output, err := Inspect(req)
+	output, err := Inspect(req, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,12 +438,12 @@ func TestInspectPreservesSelectionOrderAndAppliesMaxPairBeforeCoverage(t *testin
 	}
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "max_pair: 1", "max_pair: 2", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
-	ordered, err := Inspect(req)
+	ordered, err := Inspect(req, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	selectedOrder = []string{"BTC/USDT:USDT", "ETH/USDT:USDT", "BTC/USDT:USDT"}
-	reversed, err := Inspect(req)
+	reversed, err := Inspect(req, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +467,7 @@ func TestInspectPreservesInitialSymbolOrderBeforeMaxPair(t *testing.T) {
 		"  - name: "+strategyName+"\n    max_pair: 1\n", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
 
-	output, err := Inspect(req)
+	output, err := Inspect(req, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +491,7 @@ func TestInspectRecordsOrderAPICallsWithRealStartupState(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
-	output, err := Inspect(validRequest(t, strategyName))
+	output, err := Inspect(validRequest(t, strategyName), t.TempDir())
 	if err == nil || output == nil || !hasUnsupportedCode(output.Unsupported, "startup_order_effect") {
 		t.Fatalf("order API effect was not rejected: output=%+v err=%v", output, err)
 	}
@@ -507,6 +539,26 @@ func TestDecodeAndValidateRequestRejectAmbiguousInput(t *testing.T) {
 	req.InitialSymbols = []string{"BTC/USDT:USDT", "BTC/USDT:USDT"}
 	if _, _, err := validateRequest(req); err == nil || !strings.Contains(err.Error(), "initial_symbols") {
 		t.Fatalf("duplicate initial_symbols error = %v", err)
+	}
+}
+
+func TestValidateRequestAllowsUnboundMarketSnapshot(t *testing.T) {
+	req := validRequest(t, "snapshot_free_runtime_plan")
+	req.MarketSnapshotIdentity = ""
+	req.MarketSnapshotSHA256 = ""
+	if _, _, err := validateRequest(req); err != nil {
+		t.Fatalf("snapshot-free request was rejected: %v", err)
+	}
+
+	req.MarketSnapshotIdentity = "snapshot-only"
+	if _, _, err := validateRequest(req); err == nil || !strings.Contains(err.Error(), "provided together") {
+		t.Fatalf("incomplete snapshot binding error = %v", err)
+	}
+
+	req.MarketSnapshotIdentity = ""
+	req.MarketSnapshotSHA256 = strings.Repeat("a", 64)
+	if _, _, err := validateRequest(req); err == nil || !strings.Contains(err.Error(), "provided together") {
+		t.Fatalf("hash-only snapshot binding error = %v", err)
 	}
 }
 

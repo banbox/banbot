@@ -1,14 +1,10 @@
 package orm
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"strings"
 	"testing"
-
-	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/core"
 )
 
 func TestKLineSeriesStoreRejectsReservedColumns(t *testing.T) {
@@ -65,27 +61,6 @@ func TestKLineSeriesStoreBuildsBackendSQL(t *testing.T) {
 	updateSQL = buildKLineSeriesUpdateSQL(SeriesBinding{Table: "kline_1h", TimeColumn: "time", SIDColumn: "sid", Fields: []SeriesField{field}})
 	if updateSQL != `UPDATE "kline_1h" SET "metric_value" = $1 WHERE "sid" = $2 AND "time" = $3` {
 		t.Fatalf("unexpected TimescaleDB update SQL: %s", updateSQL)
-	}
-}
-
-func TestKLineSeriesStoreReadRejectsUncoveredTargetBeforeDatabase(t *testing.T) {
-	previousMode, previousData, previousCoverage, previousRange := core.BackTestMode, config.Data, config.HistoricalCoverage, config.TimeRange
-	core.BackTestMode = true
-	config.Data = config.Config{BTStrict: true, BTNoKlineDownload: true}
-	config.TimeRange = &config.TimeTuple{StartMS: 100, EndMS: 2000}
-	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
-		BaselineEndMS: 1000,
-		Bars: map[string]map[string][]config.HistoricalCoverageRange{
-			"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 1000}}},
-		},
-	}
-	t.Cleanup(func() {
-		core.BackTestMode, config.Data, config.HistoricalCoverage, config.TimeRange = previousMode, previousData, previousCoverage, previousRange
-	})
-	store := NewKLineSeriesStore(NewKLineSeriesInfo("signal", "1h", []SeriesField{{Name: "signal", Type: "float"}}))
-	rows, err := store.Read(context.Background(), &ExSymbol{ID: 2, Symbol: "ETH/USDT:USDT"}, 100, 2000, 0)
-	if err == nil || !strings.Contains(err.Error(), "physical field proof") || len(rows) != 0 {
-		t.Fatalf("uncovered store read rows=%v err=%v", rows, err)
 	}
 }
 

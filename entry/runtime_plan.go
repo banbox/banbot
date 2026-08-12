@@ -3,7 +3,6 @@ package entry
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/banbox/banbot/runtimeplan"
 	"github.com/spf13/cobra"
@@ -37,7 +36,11 @@ func newInspectDataPlanCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			output, inspectErr := runtimeplan.Inspect(request)
+			dataDir, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("get runtime data plan working directory: %w", err)
+			}
+			output, inspectErr := runtimeplan.Inspect(request, dataDir)
 			if output == nil {
 				return inspectErr
 			}
@@ -57,24 +60,16 @@ func newInspectDataPlanCommand() *cobra.Command {
 }
 
 func writeRuntimePlanOutput(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".runtime-plan-*")
+	output, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
 	if err != nil {
-		return fmt.Errorf("create runtime data plan output: %w", err)
+		return fmt.Errorf("open runtime data plan output: %w", err)
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err = tmp.Chmod(0o600); err == nil {
-		_, err = tmp.Write(data)
-	}
-	if closeErr := tmp.Close(); err == nil {
+	_, err = output.Write(data)
+	if closeErr := output.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		return fmt.Errorf("write runtime data plan output: %w", err)
-	}
-	if err = os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("publish runtime data plan output: %w", err)
 	}
 	return nil
 }

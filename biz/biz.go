@@ -48,14 +48,6 @@ var zhCNData embed.FS
 var enUSData embed.FS
 
 func SetupComs(args *config.CmdArgs) *errs.Error {
-	return setupComs(args, false)
-}
-
-func SetupComsReadOnly(args *config.CmdArgs) *errs.Error {
-	return setupComs(args, true)
-}
-
-func setupComs(args *config.CmdArgs, readOnly bool) *errs.Error {
 	args.Init()
 	if core.LiveMode {
 		// 实时模式下启用死锁检测
@@ -65,16 +57,7 @@ func setupComs(args *config.CmdArgs, readOnly bool) *errs.Error {
 	ctx, cancel := context.WithCancel(context.Background())
 	core.Ctx = ctx
 	core.StopAll = cancel
-	var err *errs.Error
-	if readOnly {
-		dataDir := config.GetDataDir()
-		info, statErr := os.Stat(dataDir)
-		if statErr != nil || !info.IsDir() {
-			return errs.NewMsg(core.ErrBadConfig, "read-only replay BanDataDir is unavailable: %v", statErr)
-		}
-	} else {
-		err = InitDataDir()
-	}
+	err := InitDataDir()
 	if err != nil {
 		return err
 	}
@@ -107,11 +90,7 @@ func setupComs(args *config.CmdArgs, readOnly bool) *errs.Error {
 	if err != nil {
 		return err
 	}
-	if readOnly {
-		err = orm.SetupReadOnlyReplay()
-	} else {
-		err = orm.SetupWithAutoCompact(args.AutoCompact)
-	}
+	err = orm.SetupWithAutoCompact(args.AutoCompact)
 	if err != nil {
 		return err
 	}
@@ -128,14 +107,6 @@ func SetupComsExg(args *config.CmdArgs) *errs.Error {
 		return err
 	}
 	return orm.InitExg(exg.Default)
-}
-
-func SetupComsExgReadOnly(args *config.CmdArgs) *errs.Error {
-	err := SetupComsReadOnly(args)
-	if err != nil {
-		return err
-	}
-	return orm.InitExgReadOnly(exg.Default)
 }
 
 var refreshPairsCache struct {

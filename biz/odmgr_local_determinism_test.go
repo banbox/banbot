@@ -38,7 +38,6 @@ func testFillPendingOrdersUsesStableBusinessOrder(t *testing.T, legacy, determin
 	oldEnvReal := core.EnvReal
 	oldLiveMode := core.LiveMode
 	oldData := config.Data
-	oldCoverage := config.HistoricalCoverage
 	exg.Default = &deterministicFillExchange{}
 	core.BackTestMode = true
 	core.EnvReal = true
@@ -46,9 +45,7 @@ func testFillPendingOrdersUsesStableBusinessOrder(t *testing.T, legacy, determin
 	config.Data.BTLegacyWallet = legacy
 	config.Data.BTStrict = deterministic
 	if legacy {
-		config.Data.BTStrict = true
-		config.Data.BTNoKlineDownload = true
-		config.HistoricalCoverage = &config.HistoricalCoverageConfig{}
+		config.Data.BTLegacyWallet = true
 	}
 	t.Cleanup(func() {
 		exg.Default = oldExchange
@@ -56,7 +53,6 @@ func testFillPendingOrdersUsesStableBusinessOrder(t *testing.T, legacy, determin
 		core.EnvReal = oldEnvReal
 		core.LiveMode = oldLiveMode
 		config.Data = oldData
-		config.HistoricalCoverage = oldCoverage
 	})
 
 	exs := &orm.ExSymbol{ID: 155, Symbol: "DETERMINISTIC/USDT"}

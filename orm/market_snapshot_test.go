@@ -25,7 +25,6 @@ type snapshotMarketExchange struct {
 	banexg.BanExchange
 	info      *banexg.ExgInfo
 	loadCalls int
-	initCalls int
 }
 
 func (e *snapshotMarketExchange) Info() *banexg.ExgInfo {
@@ -37,15 +36,6 @@ func (e *snapshotMarketExchange) LoadMarkets(bool, map[string]interface{}) (bane
 	return banexg.MarketMap{"LIVE/USDT:USDT": {
 		ID: "LIVEUSDT", Symbol: "LIVE/USDT:USDT", Linear: true, Precision: &banexg.Precision{Price: 1},
 	}}, nil
-}
-
-func (e *snapshotMarketExchange) GetCurMarkets() banexg.MarketMap {
-	return e.info.Markets
-}
-
-func (e *snapshotMarketExchange) InitLeverageBrackets() *errs.Error {
-	e.initCalls++
-	return nil
 }
 
 func (e *snapshotLeverageExchange) LoadLeverageBrackets(bool, map[string]interface{}) *errs.Error {
@@ -171,7 +161,7 @@ func TestMergeHistoricalMarketSnapshotSupportsSpot(t *testing.T) {
 	}
 }
 
-func TestInitExgReadOnlyUsesSnapshotWithoutLiveMarketRequest(t *testing.T) {
+func TestLoadMarketsUsesSnapshotWithoutLiveMarketRequest(t *testing.T) {
 	originalBacktest := core.BackTestMode
 	originalExchange := config.Exchange
 	originalDataDir := config.DataDir
@@ -205,31 +195,12 @@ func TestInitExgReadOnlyUsesSnapshotWithoutLiveMarketRequest(t *testing.T) {
 		},
 	}
 	exchange := &snapshotMarketExchange{info: &banexg.ExgInfo{ID: "binance", MarketType: banexg.MarketLinear}}
-	if initErr := InitExgReadOnly(exchange); initErr != nil {
-		t.Fatal(initErr)
+	markets, loadErr := LoadMarkets(exchange, false)
+	if loadErr != nil {
+		t.Fatal(loadErr)
 	}
-	markets := exchange.GetCurMarkets()
-	if exchange.loadCalls != 0 || exchange.initCalls != 1 || len(markets) != 1 ||
-		markets[symbol] == nil || markets["LIVE/USDT:USDT"] != nil {
-		t.Fatalf("load calls=%d init calls=%d markets=%#v", exchange.loadCalls, exchange.initCalls, markets)
-	}
-}
-
-func TestInitExgReadOnlyRejectsMissingSnapshotWithoutLiveMarketRequest(t *testing.T) {
-	originalBacktest := core.BackTestMode
-	originalExchange := config.Exchange
-	t.Cleanup(func() {
-		core.BackTestMode = originalBacktest
-		config.Exchange = originalExchange
-	})
-	core.BackTestMode = true
-	config.Exchange = &config.ExchangeConfig{Name: "binance", Items: map[string]map[string]interface{}{"binance": {}}}
-	exchange := &snapshotMarketExchange{info: &banexg.ExgInfo{ID: "binance", MarketType: banexg.MarketLinear}}
-	if err := InitExgReadOnly(exchange); err == nil {
-		t.Fatal("read-only exchange initialization accepted a missing snapshot")
-	}
-	if exchange.loadCalls != 0 || exchange.initCalls != 0 {
-		t.Fatalf("live exchange was touched: load calls=%d init calls=%d", exchange.loadCalls, exchange.initCalls)
+	if exchange.loadCalls != 0 || len(markets) != 1 || markets[symbol] == nil || markets["LIVE/USDT:USDT"] != nil {
+		t.Fatalf("load calls=%d markets=%#v", exchange.loadCalls, markets)
 	}
 }
 

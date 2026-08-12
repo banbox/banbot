@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -39,16 +39,20 @@ func DecodeRequest(data []byte) (*RequestV1, error) {
 	return &req, nil
 }
 
-func Inspect(req *RequestV1) (*OutputV1, error) {
+func Inspect(req *RequestV1, dataDir string) (*OutputV1, error) {
 	requestHash, cfg, err := validateRequest(req)
 	if err != nil {
 		return nil, err
+	}
+	if !filepath.IsAbs(dataDir) {
+		return nil, fmt.Errorf("runtime data plan data directory must be absolute")
 	}
 	restoreConfig, err := installRuntimeConfig(req, cfg)
 	if err != nil {
 		return nil, err
 	}
 	defer restoreConfig()
+	config.DataDir = dataDir
 
 	symbols := make([]*orm.ExSymbol, 0, len(req.MarketUniverse))
 	for _, item := range req.MarketUniverse {
@@ -62,23 +66,6 @@ func Inspect(req *RequestV1) (*OutputV1, error) {
 		return nil, fmt.Errorf("install frozen market universe: %w", err)
 	}
 	defer restoreSymbols()
-
-	// OnStartUp may initialize subscription state. The caller must execute this
-	// command in an OS sandbox with no network and a read-only host filesystem.
-	oldWD, err := os.Getwd()
-	if err != nil {
-		return nil, fmt.Errorf("get runtime data plan working directory: %w", err)
-	}
-	tmpDir, err := os.MkdirTemp("", "banbot-runtime-plan-")
-	if err != nil {
-		return nil, fmt.Errorf("create runtime data plan sandbox directory: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	if err = os.Chdir(tmpDir); err != nil {
-		return nil, fmt.Errorf("enter runtime data plan sandbox directory: %w", err)
-	}
-	defer os.Chdir(oldWD) //nolint:errcheck -- process exits if restoring the cwd fails
-	config.DataDir = tmpDir
 
 	semantic := collectSemanticPlan(req, cfg)
 	output := &OutputV1{
@@ -131,7 +118,6 @@ func validateRequest(req *RequestV1) (string, *config.Config, error) {
 	requiredText := map[string]string{
 		"compile_key": req.CompileKey, "compile_base_name": req.CompileBaseName,
 		"compile_version": req.CompileVersion, "banbot_commit": req.BanbotCommit,
-		"market_snapshot_identity": req.MarketSnapshotIdentity,
 	}
 	for name, value := range requiredText {
 		if strings.TrimSpace(value) == "" {
@@ -146,7 +132,6 @@ func validateRequest(req *RequestV1) (string, *config.Config, error) {
 		"banbot_source_manifest_sha256": req.BanbotSourceManifestSHA256,
 		"config_sha256":                 req.ConfigSHA256,
 		"config_semantic_sha256":        req.ConfigSemanticSHA256,
-		"market_snapshot_sha256":        req.MarketSnapshotSHA256,
 		"market_universe_sha256":        req.MarketUniverseSHA256,
 		"input_pairs_sha256":            req.InputPairsSHA256,
 	}
@@ -154,6 +139,13 @@ func validateRequest(req *RequestV1) (string, *config.Config, error) {
 		if !validSHA256(value) {
 			return "", nil, fmt.Errorf("%s must be a lowercase SHA-256", name)
 		}
+	}
+	if (strings.TrimSpace(req.MarketSnapshotIdentity) == "") !=
+		(strings.TrimSpace(req.MarketSnapshotSHA256) == "") {
+		return "", nil, fmt.Errorf("market snapshot identity and SHA-256 must be provided together")
+	}
+	if req.MarketSnapshotIdentity != "" && !validSHA256(req.MarketSnapshotSHA256) {
+		return "", nil, fmt.Errorf("market_snapshot_sha256 must be a lowercase SHA-256")
 	}
 	if req.ConfigYAML == "" || rawHash([]byte(req.ConfigYAML)) != req.ConfigSHA256 {
 		return "", nil, fmt.Errorf("config_sha256 does not match exact config_yaml bytes")

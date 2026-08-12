@@ -11,19 +11,11 @@ import (
 
 func enableStrictHistoricalIntrabarTest(t *testing.T) {
 	t.Helper()
-	oldMode, oldData, oldCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
+	oldMode, oldData := core.BackTestMode, config.Data
 	t.Cleanup(func() {
-		core.BackTestMode, config.Data, config.HistoricalCoverage = oldMode, oldData, oldCoverage
+		core.BackTestMode, config.Data = oldMode, oldData
 	})
 	core.BackTestMode = true
-	config.Data.BTStrict = true
-	config.Data.BTNoKlineDownload = true
-	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
-		BaselineEndMS: 2,
-		Bars: map[string]map[string][]config.HistoricalCoverageRange{
-			"BTC/USDT:USDT": {"1h": {{StartMS: 0, StopMS: 2}}},
-		},
-	}
 }
 
 func TestLegacyIntrabarRestoresHistoricalPricePath(t *testing.T) {
@@ -175,37 +167,5 @@ func TestEntryInitPricePreservesLegacyPendingStops(t *testing.T) {
 	}
 	if got := entryInitPrice(true, 90, 0, 100); got != 90 {
 		t.Fatalf("current short stop init price = %v, want 90", got)
-	}
-}
-
-func TestLegacyIntrabarRequiresStrictHistoricalReplay(t *testing.T) {
-	enableStrictHistoricalIntrabarTest(t)
-	config.Data.BTLegacyIntrabar = true
-	bar := &orm.SeriesOHLCV{Open: 100, High: 110, Low: 90, Close: 105}
-	config.Data.BTLegacyIntrabar = false
-	want := simMarketPrice(bar, 0.1)
-	config.Data.BTLegacyIntrabar = true
-	strictCoverage := config.HistoricalCoverage
-
-	for _, test := range []struct {
-		name   string
-		change func()
-	}{
-		{name: "non-strict", change: func() { config.Data.BTStrict = false }},
-		{name: "download-enabled", change: func() { config.Data.BTNoKlineDownload = false }},
-		{name: "missing coverage", change: func() { config.HistoricalCoverage = nil }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			config.Data.BTStrict = true
-			config.Data.BTNoKlineDownload = true
-			config.HistoricalCoverage = strictCoverage
-			test.change()
-			if legacyIntrabarEnabled() {
-				t.Fatal("legacy intrabar enabled outside strict historical replay")
-			}
-			if got := simMarketPrice(bar, 0.1); got != want {
-				t.Fatalf("intrabar price = %v, want current semantics %v", got, want)
-			}
-		})
 	}
 }
