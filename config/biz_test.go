@@ -190,12 +190,19 @@ func TestRunPolicyToYamlRoundTrip(t *testing.T) {
 func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
 	temperature := 0.25
 	orig := &Config{
-		CloseOnStuck:      7,
-		BTLegacyIntrabar:  true,
-		BTLegacyWallet:    true,
-		BTNoKlineDownload: true,
-		NTPLangCode:       "en-US",
-		ShowLangCode:      "zh-CN",
+		CloseOnStuck:         7,
+		BTLegacyIntrabar:     true,
+		BTLegacyOrderMetrics: true,
+		BTLegacyWallet:       true,
+		BTNoKlineDownload:    true,
+		HistoricalCoverage: &HistoricalCoverageConfig{
+			BaselineEndMS: 200,
+			Bars: map[string]map[string][]HistoricalCoverageRange{
+				"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 200}}},
+			},
+		},
+		NTPLangCode:  "en-US",
+		ShowLangCode: "zh-CN",
 		BTInLive: &BtInLiveConfig{
 			Cron: "0 3 * * *", Acount: "primary", MailTo: []string{"ops@example.com"},
 		},
@@ -210,18 +217,22 @@ func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
 	}
 
 	clone := orig.Clone()
-	if clone.CloseOnStuck != orig.CloseOnStuck || !clone.BTLegacyIntrabar ||
+	if clone.CloseOnStuck != orig.CloseOnStuck || !clone.BTLegacyIntrabar || !clone.BTLegacyOrderMetrics ||
 		!clone.BTLegacyWallet || !clone.BTNoKlineDownload ||
+		clone.HistoricalCoverage == nil ||
 		clone.NTPLangCode != orig.NTPLangCode ||
 		clone.ShowLangCode != orig.ShowLangCode || clone.TimeFrames != orig.TimeFrames ||
 		!reflect.DeepEqual(clone.BTInLive, orig.BTInLive) || !reflect.DeepEqual(clone.LLMModels, orig.LLMModels) {
 		t.Fatalf("config clone lost fields:\n got: %#v\nwant: %#v", clone, orig)
 	}
 	clone.BTInLive.MailTo[0] = "changed@example.com"
+	clone.HistoricalCoverage.Bars["BTC/USDT:USDT"]["1h"][0].StartMS = 150
 	clone.LLMModels["primary"].BaseURL = "https://changed.example"
 	*clone.LLMModels["primary"].Temperature = 1
 	clone.LLMModels["primary"].Payload["response_format"].(map[string]interface{})["type"] = "text"
-	if orig.BTInLive.MailTo[0] != "ops@example.com" || orig.LLMModels["primary"].BaseURL != "https://llm.example" ||
+	if orig.BTInLive.MailTo[0] != "ops@example.com" ||
+		orig.HistoricalCoverage.Bars["BTC/USDT:USDT"]["1h"][0].StartMS != 100 ||
+		orig.LLMModels["primary"].BaseURL != "https://llm.example" ||
 		*orig.LLMModels["primary"].Temperature != 0.25 ||
 		orig.LLMModels["primary"].Payload["response_format"].(map[string]interface{})["type"] != "json_object" {
 		t.Fatal("config clone shares omitted mutable fields")
