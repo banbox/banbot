@@ -117,7 +117,17 @@ func historicalPhysicalCoverageIntervals(coverage *config.HistoricalCoverageConf
 		return historicalCoverageIntervals(nil, symbol, timeframe, startMS, endMS)
 	}
 	if coverage.PhysicalBars == nil {
-		intervals := historicalCoverageIntervals(coverage, symbol, timeframe, startMS, endMS)
+		if endMS == 0 {
+			endMS = btime.TimeMS()
+		}
+		if config.TimeRange != nil && config.TimeRange.EndMS > 0 {
+			endMS = min(endMS, config.TimeRange.EndMS)
+		}
+		if endMS <= startMS {
+			return nil
+		}
+		intervals := historicalCoverageIntervals(coverage, symbol, timeframe, startMS,
+			min(endMS, coverage.BaselineEndMS))
 		// A direct request for the physical/storage timeframe must remain
 		// bounded by the archived baseline.  Only a derived consumer request
 		// may use its authorized consumer coverage to extend the physical tail.
@@ -133,6 +143,12 @@ func historicalPhysicalCoverageIntervals(coverage *config.HistoricalCoverageConf
 				}
 			}
 			return bounded
+		}
+		if endMS > coverage.BaselineEndMS && historicalCoverageHasTimeframe(coverage, symbol, consumerTimeframe) {
+			start := max(startMS, coverage.BaselineEndMS)
+			if endMS > start {
+				intervals = append(intervals, historicalCoverageInterval{StartMS: start, StopMS: endMS})
+			}
 		}
 		return intervals
 	}

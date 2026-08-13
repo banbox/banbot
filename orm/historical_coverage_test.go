@@ -391,6 +391,29 @@ func TestDerivedHistoricalCoverageExtendsConsumerTailAcrossBaseline(t *testing.T
 	}
 }
 
+func TestLegacyDerivedHistoricalCoverageExtendsConsumerTailAcrossBaseline(t *testing.T) {
+	const baseline = int64(100)
+	symbol := "TEST/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: baseline,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"10m": {{StartMS: 0, StopMS: baseline}},
+				"5m":  {{StartMS: 0, StopMS: baseline}},
+			},
+		},
+	}
+
+	intervals := historicalPhysicalCoverageIntervals(coverage, symbol, "5m", "10m", 0, 200)
+	if len(intervals) != 2 || intervals[0] != (historicalCoverageInterval{StartMS: 0, StopMS: baseline}) ||
+		intervals[1] != (historicalCoverageInterval{StartMS: baseline, StopMS: 200}) {
+		t.Fatalf("legacy derived coverage intervals=%v", intervals)
+	}
+	if direct := historicalPhysicalCoverageIntervals(coverage, symbol, "5m", "5m", 0, 200); len(direct) != 1 || direct[0] != (historicalCoverageInterval{StartMS: 0, StopMS: baseline}) {
+		t.Fatalf("direct storage coverage crossed the baseline: %v", direct)
+	}
+}
+
 func TestDirectStorageCoverageRejectsConsumerTailExtension(t *testing.T) {
 	const baseline = int64(100)
 	symbol := "TEST/USDT:USDT"
