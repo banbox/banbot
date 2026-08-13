@@ -353,12 +353,6 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 	}
 	curTime := btime.TimeMS()
 	ok := b.BackTestLite.FeedDataSeries(evt)
-	if ok && view.Time < b.baselineEndMS && btime.TimeMS() >= b.baselineEndMS && !b.baselineClosed {
-		if err := b.closeHistoricalBaseline(); err != nil {
-			b.setRunError(err)
-			return
-		}
-	}
 	if !view.IsWarmUp && core.CheckWallets {
 		core.CheckWallets = false
 		odNum := ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)

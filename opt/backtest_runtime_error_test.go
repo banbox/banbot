@@ -39,6 +39,16 @@ func TestBackTestPreservesFirstRuntimeError(t *testing.T) {
 	}
 }
 
+func TestHistoricalBaselineCloseWaitsForEventAtCutoff(t *testing.T) {
+	bt := &BackTest{baselineEndMS: 100, baselineClosed: false}
+	if bt.shouldCloseHistoricalBaseline(99) {
+		t.Fatal("historical baseline closed while processing a pre-cutoff event")
+	}
+	if !bt.shouldCloseHistoricalBaseline(100) {
+		t.Fatal("historical baseline did not close at the cutoff event")
+	}
+}
+
 func TestBackTestLiteOptimizationLiquidationDoesNotStopLiveRuntime(t *testing.T) {
 	originalChargeOnBomb := config.ChargeOnBomb
 	originalStopAll := core.StopAll
