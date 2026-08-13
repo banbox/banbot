@@ -63,7 +63,7 @@ func TestLegacyWalletLegalValuesUseStableCoinOrder(t *testing.T) {
 	}
 }
 
-func TestLegacyWalletPriceUsesLastHistoricalBar(t *testing.T) {
+func TestLegacyWalletPriceHonorsHistoricalBarExpiry(t *testing.T) {
 	originalData := config.Data
 	originalBacktest := core.BackTestMode
 	originalTime := btime.CurTimeMS
@@ -82,8 +82,55 @@ func TestLegacyWalletPriceUsesLastHistoricalBar(t *testing.T) {
 		t.Fatalf("current stale price = %v, want -1", got)
 	}
 	config.Data.BTLegacyWallet = true
-	if got := walletMarkPrice(symbol); got != 123.45 {
-		t.Fatalf("legacy stale price = %v, want 123.45", got)
+	if got := walletMarkPrice(symbol); got != -1 {
+		t.Fatalf("legacy stale price = %v, want -1", got)
+	}
+}
+
+func TestLegacyWalletRefreshSkipsStaleSymbols(t *testing.T) {
+	originalData := config.Data
+	originalBacktest := core.BackTestMode
+	originalTime := btime.CurTimeMS
+	t.Cleanup(func() {
+		config.Data = originalData
+		core.BackTestMode = originalBacktest
+		btime.CurTimeMS = originalTime
+	})
+
+	core.BackTestMode = true
+	config.Data.BTLegacyWallet = true
+	btime.CurTimeMS = 2_000_000
+	stale := "STALE-MARGIN/USDT:USDT"
+	fresh := "FRESH-MARGIN/USDT:USDT"
+	com.SetBarPrice(stale, 100)
+	btime.CurTimeMS += com.PriceExpireMS + 1
+	com.SetBarPrice(fresh, 200)
+
+	wallets := &BanWallets{Items: map[string]*ItemWallet{
+		"USDT": {Available: 500, Pendings: map[string]float64{}, Frozens: map[string]float64{}},
+	}}
+	orders := []*ormo.InOutOrder{
+		legacyMarginOrder(1, stale, 100),
+		legacyMarginOrder(2, fresh, 200),
+	}
+	if err := wallets.UpdateOds(orders, "USDT"); err != nil {
+		t.Fatalf("update legacy wallet margins: %v", err)
+	}
+	frozens := wallets.Items["USDT"].Frozens
+	if _, ok := frozens[orders[0].Key()]; ok {
+		t.Fatal("stale symbol received a refreshed margin")
+	}
+	if got := frozens[orders[1].Key()]; got != 100 {
+		t.Fatalf("fresh symbol margin = %v, want 100", got)
+	}
+}
+
+func legacyMarginOrder(id int64, symbol string, price float64) *ormo.InOutOrder {
+	return &ormo.InOutOrder{
+		IOrder: &ormo.IOrder{
+			ID: id, Symbol: symbol, Leverage: 2,
+		},
+		Enter: &ormo.ExOrder{Filled: 1, Average: price},
 	}
 }
 

@@ -1060,9 +1060,6 @@ func legacyWalletOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
 }
 
 func walletMarkPrice(symbol string) float64 {
-	if core.BackTestMode && config.Data.BTLegacyWallet {
-		return com.GetLastBarPrice(symbol)
-	}
 	return com.GetPriceSafe(symbol, "")
 }
 
