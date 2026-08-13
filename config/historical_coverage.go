@@ -13,6 +13,7 @@ type HistoricalCoverageRange struct {
 type HistoricalCoverageConfig struct {
 	BaselineEndMS   int64                                           `yaml:"baseline_end_ms" mapstructure:"baseline_end_ms"`
 	Bars            map[string]map[string][]HistoricalCoverageRange `yaml:"bars" mapstructure:"bars"`
+	PhysicalBars    map[string]map[string][]HistoricalCoverageRange `yaml:"physical_bars,omitempty" mapstructure:"physical_bars"`
 	ListingPrefixes map[string]map[string][]HistoricalCoverageRange `yaml:"listing_prefixes" mapstructure:"listing_prefixes"`
 }
 
@@ -24,6 +25,9 @@ func (c *HistoricalCoverageConfig) Normalize(runRange *TimeTuple) error {
 		return fmt.Errorf("historical_coverage bars are required")
 	}
 	if err := normalizeHistoricalCoverageRanges(c.Bars, c.BaselineEndMS); err != nil {
+		return err
+	}
+	if err := normalizeHistoricalCoverageRanges(c.PhysicalBars, c.BaselineEndMS); err != nil {
 		return err
 	}
 	return normalizeHistoricalCoverageRanges(c.ListingPrefixes, c.BaselineEndMS)
@@ -74,6 +78,7 @@ func (c *HistoricalCoverageConfig) Clone() *HistoricalCoverageConfig {
 	}
 	clone := &HistoricalCoverageConfig{BaselineEndMS: c.BaselineEndMS}
 	clone.Bars = cloneHistoricalCoverageRanges(c.Bars)
+	clone.PhysicalBars = cloneHistoricalCoverageRanges(c.PhysicalBars)
 	clone.ListingPrefixes = cloneHistoricalCoverageRanges(c.ListingPrefixes)
 	return clone
 }
@@ -102,6 +107,11 @@ func HistoricalCoverageFor(symbol string) *HistoricalCoverageConfig {
 	}
 	result := &HistoricalCoverageConfig{BaselineEndMS: HistoricalCoverage.BaselineEndMS,
 		Bars: map[string]map[string][]HistoricalCoverageRange{symbol: timeframes}}
+	if HistoricalCoverage.PhysicalBars != nil {
+		result.PhysicalBars = map[string]map[string][]HistoricalCoverageRange{
+			symbol: HistoricalCoverage.PhysicalBars[symbol],
+		}
+	}
 	if HistoricalCoverage.ListingPrefixes != nil {
 		result.ListingPrefixes = map[string]map[string][]HistoricalCoverageRange{
 			symbol: HistoricalCoverage.ListingPrefixes[symbol],

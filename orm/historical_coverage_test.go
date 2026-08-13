@@ -351,6 +351,27 @@ func TestListingPrefixEvidenceDoesNotAuthorizePhysicalExtensionTail(t *testing.T
 	}
 }
 
+func TestDerivedHistoricalCoverageExtendsAuditedPhysicalTail(t *testing.T) {
+	const baseline = int64(1_000)
+	symbol := "TEST/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: baseline,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"10m": {{StartMS: 100, StopMS: baseline}}},
+		},
+		PhysicalBars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"5m": {{StartMS: 100, StopMS: baseline}}},
+		},
+	}
+	start, stop, constrained, err := historicalPhysicalCoverageBounds(coverage, symbol, "10m", 900, 1_500)
+	if err != nil || !constrained || start != 900 || stop != 1_500 {
+		t.Fatalf("derived extension bounds=%d:%d constrained=%v err=%v", start, stop, constrained, err)
+	}
+	if len(historicalCoverageIntervals(coverage, symbol, "5m", 0, 1_500)) != 0 || coverage.Allows("5m", 1_200) {
+		t.Fatal("physical evidence authorized direct access to the derived storage timeframe")
+	}
+}
+
 func TestDerivedHistoricalCoverageRejectsMissingCompleteFirstBucket(t *testing.T) {
 	const hour = int64(3_600_000)
 	symbol := "TEST/USDT:USDT"

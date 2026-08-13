@@ -110,6 +110,38 @@ func historicalCoverageHasTimeframe(coverage *config.HistoricalCoverageConfig, s
 	return exists
 }
 
+func historicalPhysicalCoverageIntervals(coverage *config.HistoricalCoverageConfig, symbol, timeframe, consumerTimeframe string,
+	startMS, endMS int64,
+) []historicalCoverageInterval {
+	if coverage == nil || coverage.PhysicalBars == nil {
+		return historicalCoverageIntervals(coverage, symbol, timeframe, startMS, endMS)
+	}
+	if endMS == 0 {
+		endMS = btime.TimeMS()
+	}
+	if config.TimeRange != nil && config.TimeRange.EndMS > 0 {
+		endMS = min(endMS, config.TimeRange.EndMS)
+	}
+	if endMS <= startMS {
+		return nil
+	}
+	intervals := make([]historicalCoverageInterval, 0)
+	for _, item := range coverage.PhysicalBars[symbol][timeframe] {
+		start := max(startMS, item.StartMS)
+		stop := min(endMS, item.StopMS, coverage.BaselineEndMS)
+		if stop > start {
+			intervals = append(intervals, historicalCoverageInterval{StartMS: start, StopMS: stop})
+		}
+	}
+	if endMS > coverage.BaselineEndMS && historicalCoverageHasTimeframe(coverage, symbol, consumerTimeframe) {
+		start := max(startMS, coverage.BaselineEndMS)
+		if endMS > start {
+			intervals = append(intervals, historicalCoverageInterval{StartMS: start, StopMS: endMS})
+		}
+	}
+	return intervals
+}
+
 func historicalPhysicalCoverageBounds(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
 	startMS, endMS int64,
 ) (int64, int64, bool, *errs.Error) {
@@ -134,7 +166,7 @@ func historicalPhysicalCoverageBoundsWithListingPrefix(coverage *config.Historic
 		return 0, 0, true, errs.NewMsg(core.ErrInvalidTF, "invalid timeframe: %s", timeframe)
 	}
 	consumerStepMS := int64(consumerSecs * 1000)
-	intervals := historicalCoverageIntervals(coverage, symbol, storageTF, 0, endMS)
+	intervals := historicalPhysicalCoverageIntervals(coverage, symbol, storageTF, timeframe, 0, endMS)
 	intervals = append(intervals, historicalListingPrefixIntervals(coverage, symbol, storageTF, 0, endMS)...)
 	slices.SortFunc(intervals, func(left, right historicalCoverageInterval) int {
 		if left.StartMS < right.StartMS {

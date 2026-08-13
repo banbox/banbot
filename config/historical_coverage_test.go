@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -194,5 +195,28 @@ func TestHistoricalCoverageEmptyListingPrefixesSurviveYAMLRoundTrip(t *testing.T
 	}
 	if decoded.ListingPrefixes == nil {
 		t.Fatalf("empty listing-prefix evidence domain was omitted:\n%s", data)
+	}
+}
+
+func TestHistoricalCoverageLegacyPhysicalBarsRemainAbsentOnYAMLRoundTrip(t *testing.T) {
+	original := &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"10m": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	raw, err := yaml.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "physical_bars") {
+		t.Fatalf("legacy config unexpectedly emitted physical_bars: %s", raw)
+	}
+	var decoded HistoricalCoverageConfig
+	if err = yaml.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.PhysicalBars != nil {
+		t.Fatalf("legacy physical evidence became non-nil: %#v", decoded.PhysicalBars)
 	}
 }
