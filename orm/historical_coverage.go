@@ -113,6 +113,12 @@ func historicalCoverageHasTimeframe(coverage *config.HistoricalCoverageConfig, s
 func historicalPhysicalCoverageBounds(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
 	startMS, endMS int64,
 ) (int64, int64, bool, *errs.Error) {
+	return historicalPhysicalCoverageBoundsWithListingPrefix(coverage, symbol, timeframe, startMS, endMS, false)
+}
+
+func historicalPhysicalCoverageBoundsWithListingPrefix(coverage *config.HistoricalCoverageConfig,
+	symbol, timeframe string, startMS, endMS int64, hasListingPrefix bool,
+) (int64, int64, bool, *errs.Error) {
 	if coverage == nil {
 		return startMS, endMS, false, nil
 	}
@@ -129,6 +135,25 @@ func historicalPhysicalCoverageBounds(coverage *config.HistoricalCoverageConfig,
 	}
 	consumerStepMS := int64(consumerSecs * 1000)
 	intervals := historicalCoverageIntervals(coverage, symbol, storageTF, 0, endMS)
+	intervals = append(intervals, historicalListingPrefixIntervals(coverage, symbol, storageTF, 0, endMS)...)
+	slices.SortFunc(intervals, func(left, right historicalCoverageInterval) int {
+		if left.StartMS < right.StartMS {
+			return -1
+		}
+		if left.StartMS > right.StartMS {
+			return 1
+		}
+		return 0
+	})
+	merged := intervals[:0]
+	for _, item := range intervals {
+		if len(merged) == 0 || item.StartMS > merged[len(merged)-1].StopMS {
+			merged = append(merged, item)
+			continue
+		}
+		merged[len(merged)-1].StopMS = max(merged[len(merged)-1].StopMS, item.StopMS)
+	}
+	intervals = merged
 	matches := intervals[:0]
 	for _, item := range intervals {
 		if item.StopMS <= startMS || item.StartMS >= endMS {
@@ -136,7 +161,11 @@ func historicalPhysicalCoverageBounds(coverage *config.HistoricalCoverageConfig,
 		}
 		matches = append(matches, item)
 	}
-	if len(matches) != 1 || matches[0].StopMS < endMS || matches[0].StartMS >= startMS+consumerStepMS {
+	startsTooLate := len(matches) == 1 && matches[0].StartMS >= startMS+consumerStepMS
+	if hasListingPrefix && len(matches) == 1 {
+		startsTooLate = matches[0].StartMS > startMS+consumerStepMS
+	}
+	if len(matches) != 1 || matches[0].StopMS < endMS || startsTooLate {
 		return 0, 0, true, errs.NewMsg(core.ErrBadConfig,
 			"derived historical coverage requires exactly one matching continuous physical segment for %s %s [%d,%d) via %s",
 			symbol, timeframe, startMS, endMS, storageTF)
@@ -246,7 +275,7 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 	}
 	minuteStart := alignPhysicalKlineCeil(exs.ListMs, 60_000,
 		int64(exg.GetAlignOff(exs.Exchange, 60)*1000))
-	minutes := historicalCoverageIntervals(coverage, exs.Symbol, "1m", minuteStart, fullStart)
+	minutes := historicalListingPrefixIntervals(coverage, exs.Symbol, "1m", minuteStart, fullStart)
 	if len(minutes) != 1 || minutes[0].StartMS != minuteStart || minutes[0].StopMS < fullStart {
 		return historicalListingPrefix{}, false
 	}
@@ -257,8 +286,8 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 	storageStepMS := int64(storageSecs * 1000)
 	storageOffsetMS := int64(exg.GetAlignOff(exs.Exchange, storageSecs) * 1000)
 	storageStart := alignPhysicalKlineCeil(exs.ListMs, storageStepMS, storageOffsetMS)
-	if storageTF != timeframe {
-		physical := historicalCoverageIntervals(coverage, exs.Symbol, storageTF, storageStart, fullStart)
+	if storageTF != timeframe && storageStart < fullStart {
+		physical := historicalListingPrefixIntervals(coverage, exs.Symbol, storageTF, storageStart, fullStart)
 		if len(physical) != 1 || physical[0].StartMS != storageStart || physical[0].StopMS < fullStart {
 			return historicalListingPrefix{}, false
 		}
@@ -269,6 +298,36 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 		storageStartMS: storageStart,
 		storageTF:      storageTF,
 	}, true
+}
+
+func historicalListingPrefixIntervals(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
+	startMS, endMS int64,
+) []historicalCoverageInterval {
+	if coverage == nil {
+		return nil
+	}
+	prefixes := coverage.ListingPrefixes
+	if prefixes == nil {
+		prefixes = coverage.Bars
+	}
+	if endMS == 0 {
+		endMS = btime.TimeMS()
+	}
+	if config.TimeRange != nil && config.TimeRange.EndMS > 0 {
+		endMS = min(endMS, config.TimeRange.EndMS)
+	}
+	endMS = min(endMS, coverage.BaselineEndMS)
+	if endMS <= startMS {
+		return nil
+	}
+	intervals := make([]historicalCoverageInterval, 0, len(prefixes[symbol][timeframe]))
+	for _, item := range prefixes[symbol][timeframe] {
+		start, stop := max(startMS, item.StartMS), min(endMS, item.StopMS)
+		if stop > start {
+			intervals = append(intervals, historicalCoverageInterval{StartMS: start, StopMS: stop})
+		}
+	}
+	return intervals
 }
 
 func prependHistoricalListingPrefix(exs *ExSymbol, prefix historicalListingPrefix,

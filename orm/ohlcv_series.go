@@ -256,8 +256,8 @@ func (q *Queries) querySeriesFieldsRawMode(exs *ExSymbol, timeframe string, fiel
 	consumerIntervals := historicalCoverageIntervals(coverage, exs.Symbol, timeframe, startMs, finishEndMS)
 	listingPrefix, hasListingPrefix := legacyListingPrefixProof(
 		coverage, exs, timeframe, startMs, consumerIntervals)
-	physicalStart, physicalStop, physicalBound, coverageErr := historicalPhysicalCoverageBounds(
-		coverage, exs.Symbol, timeframe, startMs, finishEndMS)
+	physicalStart, physicalStop, physicalBound, coverageErr := historicalPhysicalCoverageBoundsWithListingPrefix(
+		coverage, exs.Symbol, timeframe, startMs, finishEndMS, hasListingPrefix)
 	if coverageErr != nil {
 		return nil, coverageErr
 	}

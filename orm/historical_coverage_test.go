@@ -277,6 +277,99 @@ func TestHistoricalListingPrefixRestoresPhysicalListingBucket(t *testing.T) {
 	}
 }
 
+func TestHistoricalListingPrefixDoesNotFallbackWhenEvidenceDomainIsPresent(t *testing.T) {
+	const hour = int64(3_600_000)
+	symbol := "CFX/USDT:USDT"
+	exs := &ExSymbol{Exchange: "binance", Symbol: symbol, ListMs: 4*hour + 30*60_000}
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 16 * hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"1h": {{StartMS: 5 * hour, StopMS: 16 * hour}},
+				"1m": {{StartMS: exs.ListMs, StopMS: 5 * hour}},
+			},
+		},
+		ListingPrefixes: map[string]map[string][]config.HistoricalCoverageRange{},
+	}
+	enableStrictHistoricalCoverageTest(t)
+
+	intervals := historicalCoverageIntervals(coverage, symbol, "1h", 0, 16*hour)
+	if _, ok := legacyListingPrefixProof(coverage, exs, "1h", 0, intervals); ok {
+		t.Fatal("new coverage format reused ordinary bars as missing listing-prefix evidence")
+	}
+	coverage.ListingPrefixes[symbol] = map[string][]config.HistoricalCoverageRange{
+		"1m": {{StartMS: exs.ListMs, StopMS: 5 * hour}},
+	}
+	if _, ok := legacyListingPrefixProof(coverage, exs, "1h", 0, intervals); !ok {
+		t.Fatal("explicit listing-prefix evidence was rejected")
+	}
+}
+
+func TestHistoricalCoverageForPreservesLegacyListingPrefixFallback(t *testing.T) {
+	const hour = int64(3_600_000)
+	symbol := "CFX/USDT:USDT"
+	previous := config.HistoricalCoverage
+	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
+		BaselineEndMS: 16 * hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"1h": {{StartMS: 5 * hour, StopMS: 16 * hour}},
+				"1m": {{StartMS: 4*hour + 30*60_000, StopMS: 5 * hour}},
+			},
+		},
+	}
+	t.Cleanup(func() { config.HistoricalCoverage = previous })
+	enableStrictHistoricalCoverageTest(t)
+
+	coverage := historicalCoverageForQuery(symbol)
+	if coverage.ListingPrefixes != nil {
+		t.Fatal("legacy listing-prefix fallback was converted to a non-nil evidence domain")
+	}
+	exs := &ExSymbol{Exchange: "binance", Symbol: symbol, ListMs: 4*hour + 30*60_000}
+	intervals := historicalCoverageIntervals(coverage, symbol, "1h", 0, 16*hour)
+	if _, ok := legacyListingPrefixProof(coverage, exs, "1h", 0, intervals); !ok {
+		t.Fatal("legacy runtime query lost listing-prefix fallback")
+	}
+}
+
+func TestListingPrefixEvidenceDoesNotAuthorizePhysicalExtensionTail(t *testing.T) {
+	const minute = int64(60_000)
+	symbol := "TEST/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 60 * minute,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"10m": {{StartMS: 0, StopMS: 60 * minute}}},
+		},
+		ListingPrefixes: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"5m": {{StartMS: 50 * minute, StopMS: 60 * minute}}},
+		},
+	}
+	_, _, constrained, err := historicalPhysicalCoverageBounds(
+		coverage, symbol, "10m", 60*minute, 70*minute)
+	if !constrained || err == nil {
+		t.Fatalf("prefix-only storage evidence authorized extension tail: constrained=%v err=%v", constrained, err)
+	}
+}
+
+func TestDerivedHistoricalCoverageRejectsMissingCompleteFirstBucket(t *testing.T) {
+	const hour = int64(3_600_000)
+	symbol := "TEST/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 8 * hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"4h": {{StartMS: 0, StopMS: 8 * hour}},
+				"1h": {{StartMS: 4 * hour, StopMS: 8 * hour}},
+			},
+		},
+		ListingPrefixes: map[string]map[string][]config.HistoricalCoverageRange{},
+	}
+	_, _, constrained, err := historicalPhysicalCoverageBounds(coverage, symbol, "4h", 0, 8*hour)
+	if !constrained || err == nil {
+		t.Fatalf("ordinary derived coverage accepted a missing first bucket: constrained=%v err=%v", constrained, err)
+	}
+}
+
 func TestHistoricalListingPrefixRequiresArchivedPhysicalBucket(t *testing.T) {
 	prefix := historicalListingPrefix{
 		bucketStartMS:  100,

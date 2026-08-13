@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
 
 func TestHistoricalCoverageNormalizeAndAllows(t *testing.T) {
 	coverage := &HistoricalCoverageConfig{
@@ -103,10 +107,92 @@ func TestHistoricalCoverageCloneIsIndependent(t *testing.T) {
 		Bars: map[string]map[string][]HistoricalCoverageRange{
 			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 400}}},
 		},
+		ListingPrefixes: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"1m": {{StartMS: 100, StopMS: 200}}},
+		},
 	}
 	clone := original.Clone()
 	clone.Bars["BNB/USDT:USDT"]["5m"][0].StopMS = 300
+	clone.ListingPrefixes["BNB/USDT:USDT"]["1m"][0].StopMS = 150
 	if original.Bars["BNB/USDT:USDT"]["5m"][0].StopMS != 400 {
 		t.Fatal("clone mutated original coverage")
+	}
+	if original.ListingPrefixes["BNB/USDT:USDT"]["1m"][0].StopMS != 200 ||
+		original.Allows("1m", 150) || original.Allows("1m", 600) {
+		t.Fatal("listing prefix mutated or expanded the runtime allow-list")
+	}
+}
+
+func TestHistoricalCoverageListingPrefixesAreEvidenceOnly(t *testing.T) {
+	coverage := &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+		ListingPrefixes: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"1m": {{StartMS: 100, StopMS: 200}}},
+		},
+	}
+	if err := coverage.Normalize(&TimeTuple{StartMS: 50, EndMS: 700}); err != nil {
+		t.Fatal(err)
+	}
+	if coverage.Allows("1m", 150) || coverage.Allows("1m", 600) {
+		t.Fatal("listing prefix expanded the runtime allow-list")
+	}
+}
+
+func TestHistoricalCoverageRejectsInvalidListingPrefix(t *testing.T) {
+	coverage := &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+		ListingPrefixes: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"1m": {{StartMS: 200, StopMS: 200}}},
+		},
+	}
+	if err := coverage.Normalize(&TimeTuple{StartMS: 50, EndMS: 700}); err == nil {
+		t.Fatal("invalid listing prefix was accepted")
+	}
+}
+
+func TestHistoricalCoverageForPreservesListingPrefixes(t *testing.T) {
+	previous := HistoricalCoverage
+	HistoricalCoverage = &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+		ListingPrefixes: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"1m": {{StartMS: 100, StopMS: 200}}},
+		},
+	}
+	t.Cleanup(func() { HistoricalCoverage = previous })
+
+	coverage := HistoricalCoverageFor("BNB/USDT:USDT")
+	ranges := coverage.ListingPrefixes["BNB/USDT:USDT"]["1m"]
+	if len(ranges) != 1 || ranges[0] != (HistoricalCoverageRange{StartMS: 100, StopMS: 200}) {
+		t.Fatalf("listing prefixes were not preserved: %#v", ranges)
+	}
+}
+
+func TestHistoricalCoverageEmptyListingPrefixesSurviveYAMLRoundTrip(t *testing.T) {
+	original := &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+		ListingPrefixes: map[string]map[string][]HistoricalCoverageRange{},
+	}
+	data, err := yaml.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded HistoricalCoverageConfig
+	if err = yaml.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ListingPrefixes == nil {
+		t.Fatalf("empty listing-prefix evidence domain was omitted:\n%s", data)
 	}
 }
