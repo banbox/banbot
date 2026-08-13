@@ -38,14 +38,16 @@ type BackTestLite struct {
 
 type BackTest struct {
 	*BackTestLite
-	lastDumpMs    int64 // The last time the backtest status was saved 上一次保存回测状态的时间
-	PBar          *utils.StagedPrg
-	dataPrep      bool
-	dataPrepErr   *errs.Error
-	nextRefresh   int64 // The time of the next refresh of the trading pair 下一次刷新交易对的时间
-	schedule      cron.Schedule
-	seriesRuntime *data.SeriesRuntime
-	loopMainFn    func() *errs.Error
+	lastDumpMs     int64 // The last time the backtest status was saved 上一次保存回测状态的时间
+	PBar           *utils.StagedPrg
+	dataPrep       bool
+	dataPrepErr    *errs.Error
+	nextRefresh    int64 // The time of the next refresh of the trading pair 下一次刷新交易对的时间
+	schedule       cron.Schedule
+	seriesRuntime  *data.SeriesRuntime
+	loopMainFn     func() *errs.Error
+	baselineEndMS  int64
+	baselineClosed bool
 }
 
 /*
@@ -212,6 +214,12 @@ func NewBackTest(isOpt bool, outDir string) (*BackTest, *errs.Error) {
 
 func (b *BackTest) Init() *errs.Error {
 	btime.CurTimeMS = config.TimeRange.StartMS
+	b.baselineEndMS = 0
+	b.baselineClosed = false
+	if config.HistoricalCoverage != nil && config.TimeRange.EndMS > config.HistoricalCoverage.BaselineEndMS &&
+		config.HistoricalCoverage.BaselineEndMS > config.TimeRange.StartMS {
+		b.baselineEndMS = config.HistoricalCoverage.BaselineEndMS
+	}
 	b.MinReal = math.MaxFloat64
 	log.Info("backtest config summary",
 		zap.Bool("questdb", orm.IsQuestDB),
@@ -337,8 +345,20 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 		_ = b.BackTestLite.FeedDataSeries(evt)
 		return
 	}
+	if b.shouldCloseHistoricalBaseline(view.Time) {
+		if err := b.closeHistoricalBaseline(); err != nil {
+			b.setRunError(err)
+			return
+		}
+	}
 	curTime := btime.TimeMS()
 	ok := b.BackTestLite.FeedDataSeries(evt)
+	if ok && view.Time < b.baselineEndMS && btime.TimeMS() >= b.baselineEndMS && !b.baselineClosed {
+		if err := b.closeHistoricalBaseline(); err != nil {
+			b.setRunError(err)
+			return
+		}
+	}
 	if !view.IsWarmUp && core.CheckWallets {
 		core.CheckWallets = false
 		odNum := ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)
@@ -374,6 +394,21 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 	}
 }
 
+func (b *BackTest) shouldCloseHistoricalBaseline(eventMS int64) bool {
+	return b.baselineEndMS > 0 && !b.baselineClosed && eventMS >= b.baselineEndMS
+}
+
+func (b *BackTest) closeHistoricalBaseline() *errs.Error {
+	if b.baselineEndMS <= 0 || b.baselineClosed {
+		return nil
+	}
+	if err := biz.CloseBacktestOrdersAt(config.DefAcc, b.baselineEndMS); err != nil {
+		return err
+	}
+	b.baselineClosed = true
+	return nil
+}
+
 func (b *BackTest) Run() *errs.Error {
 	err := b.initRefreshCron()
 	if err != nil {
@@ -400,6 +435,13 @@ func (b *BackTest) Run() *errs.Error {
 	}
 	if err != nil {
 		log.Error("backtest loop fail", zap.Error(err))
+		return err
+	}
+	// Some feeders finish without emitting a bar at or after the historical
+	// cutoff (for example when every series ends at the old baseline). Ensure
+	// those positions are closed before the final cleanup uses the new end.
+	if err := b.closeHistoricalBaseline(); err != nil {
+		log.Error("close historical baseline fail", zap.Error(err))
 		return err
 	}
 	btCost := btime.UTCTime() - btStart

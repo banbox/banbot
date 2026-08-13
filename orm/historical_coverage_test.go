@@ -372,6 +372,49 @@ func TestDerivedHistoricalCoverageExtendsAuditedPhysicalTail(t *testing.T) {
 	}
 }
 
+func TestDerivedHistoricalCoverageExtendsConsumerTailAcrossBaseline(t *testing.T) {
+	const baseline = int64(100)
+	symbol := "TEST/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: baseline,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"10m": {{StartMS: 0, StopMS: 200}}},
+		},
+		PhysicalBars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"5m": {{StartMS: 0, StopMS: baseline}}},
+		},
+	}
+	start, stop, constrained, err := historicalPhysicalCoverageBounds(
+		coverage, symbol, "10m", 0, 200)
+	if err != nil || !constrained || start != 0 || stop != 200 {
+		t.Fatalf("derived consumer tail bounds=%d:%d constrained=%v err=%v", start, stop, constrained, err)
+	}
+}
+
+func TestDirectStorageCoverageRejectsConsumerTailExtension(t *testing.T) {
+	const baseline = int64(100)
+	symbol := "TEST/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: baseline,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"10m": {{StartMS: 0, StopMS: 200}}},
+		},
+		PhysicalBars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"5m": {{StartMS: 0, StopMS: baseline}}},
+		},
+	}
+	intervals := historicalPhysicalCoverageIntervals(coverage, symbol, "5m", "5m", 0, 200)
+	if len(intervals) != 1 || intervals[0] != (historicalCoverageInterval{StartMS: 0, StopMS: baseline}) {
+		t.Fatalf("direct storage coverage crossed baseline: intervals=%v", intervals)
+	}
+}
+
+func TestHistoricalPhysicalCoverageNilIsSafe(t *testing.T) {
+	if got := historicalPhysicalCoverageIntervals(nil, "TEST/USDT:USDT", "1h", "1h", 0, 100); got != nil {
+		t.Fatalf("nil coverage intervals=%v, want nil", got)
+	}
+}
+
 func TestDerivedHistoricalCoverageRejectsMissingCompleteFirstBucket(t *testing.T) {
 	const hour = int64(3_600_000)
 	symbol := "TEST/USDT:USDT"

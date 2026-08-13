@@ -587,6 +587,36 @@ func (o *LocalOrderMgr) OnEnvEnd(evt *orm.DataSeries) *errs.Error {
 	return err
 }
 
+// cleanUpAt applies the same complete cleanup path used at the end of a
+// backtest, but at an explicit historical cutoff.
+func (o *LocalOrderMgr) cleanUpAt(atMS int64) *errs.Error {
+	if atMS <= 0 {
+		return errs.NewMsg(core.ErrBadConfig, "historical cleanup cutoff is invalid: %d", atMS)
+	}
+	oldMS := btime.CurTimeMS
+	oldNoEnter, hadNoEnter := core.NoEnterUntil[o.Account]
+	btime.CurTimeMS = atMS
+	defer func() {
+		btime.CurTimeMS = oldMS
+		if hadNoEnter {
+			core.NoEnterUntil[o.Account] = oldNoEnter
+		} else {
+			delete(core.NoEnterUntil, o.Account)
+		}
+	}()
+	return o.CleanUp()
+}
+
+// CloseBacktestOrdersAt closes positions that are still open at a historical
+// baseline before an extended backtest continues into its new tail.
+func CloseBacktestOrdersAt(account string, atMS int64) *errs.Error {
+	mgr, ok := GetOdMgr(account).(*LocalOrderMgr)
+	if !ok || mgr == nil {
+		return errs.NewMsg(core.ErrRunTime, "backtest order manager is not local")
+	}
+	return mgr.cleanUpAt(atMS)
+}
+
 func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noEnter bool) *errs.Error {
 	pairs := ""
 	if evt != nil {
@@ -659,6 +689,9 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 		delete(oldOpens, oid)
 	}
 	curMS := btime.UTCStamp()
+	if core.BackTestMode {
+		curMS = btime.TimeMS()
+	}
 	for _, od := range oldOpens {
 		if od.ExitTag != "" && od.ExitAt > curMS && od.ExitTag != core.ExitTagBotStop {
 			od.ExitTag = core.ExitTagBotStop
