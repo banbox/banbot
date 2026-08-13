@@ -39,13 +39,13 @@ func TestBackTestPreservesFirstRuntimeError(t *testing.T) {
 	}
 }
 
-func TestHistoricalBaselineCloseWaitsForEventAtCutoff(t *testing.T) {
+func TestHistoricalBaselineClosesBeforeTailEvent(t *testing.T) {
 	bt := &BackTest{baselineEndMS: 100, baselineClosed: false}
 	if bt.shouldCloseHistoricalBaseline(99) {
 		t.Fatal("historical baseline closed while processing a pre-cutoff event")
 	}
-	if bt.shouldCloseHistoricalBaseline(100) {
-		t.Fatal("historical baseline closed before all cutoff events were processed")
+	if !bt.shouldCloseHistoricalBaseline(100) {
+		t.Fatal("historical baseline did not close before the first tail event")
 	}
 	if !bt.shouldCloseHistoricalBaseline(101) {
 		t.Fatal("historical baseline did not close after the cutoff")

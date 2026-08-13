@@ -144,7 +144,9 @@ func historicalPhysicalCoverageIntervals(coverage *config.HistoricalCoverageConf
 			}
 			return bounded
 		}
-		if endMS > coverage.BaselineEndMS && historicalCoverageHasTimeframe(coverage, symbol, consumerTimeframe) {
+		if endMS > coverage.BaselineEndMS &&
+			historicalCoverageHasTimeframe(coverage, symbol, timeframe) &&
+			historicalCoverageHasTimeframe(coverage, symbol, consumerTimeframe) {
 			start := max(startMS, coverage.BaselineEndMS)
 			if endMS > start {
 				intervals = append(intervals, historicalCoverageInterval{StartMS: start, StopMS: endMS})

@@ -389,7 +389,9 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 }
 
 func (b *BackTest) shouldCloseHistoricalBaseline(eventMS int64) bool {
-	return b.baselineEndMS > 0 && !b.baselineClosed && eventMS > b.baselineEndMS
+	// Historical coverage is half-open: the first bar at baselineEndMS belongs
+	// to the appended tail and must not set the baseline liquidation price.
+	return b.baselineEndMS > 0 && !b.baselineClosed && eventMS >= b.baselineEndMS
 }
 
 func (b *BackTest) closeHistoricalBaseline() *errs.Error {
