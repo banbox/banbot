@@ -44,8 +44,11 @@ func TestHistoricalBaselineCloseWaitsForEventAtCutoff(t *testing.T) {
 	if bt.shouldCloseHistoricalBaseline(99) {
 		t.Fatal("historical baseline closed while processing a pre-cutoff event")
 	}
-	if !bt.shouldCloseHistoricalBaseline(100) {
-		t.Fatal("historical baseline did not close at the cutoff event")
+	if bt.shouldCloseHistoricalBaseline(100) {
+		t.Fatal("historical baseline closed before all cutoff events were processed")
+	}
+	if !bt.shouldCloseHistoricalBaseline(101) {
+		t.Fatal("historical baseline did not close after the cutoff")
 	}
 }
 

@@ -389,7 +389,7 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 }
 
 func (b *BackTest) shouldCloseHistoricalBaseline(eventMS int64) bool {
-	return b.baselineEndMS > 0 && !b.baselineClosed && eventMS >= b.baselineEndMS
+	return b.baselineEndMS > 0 && !b.baselineClosed && eventMS > b.baselineEndMS
 }
 
 func (b *BackTest) closeHistoricalBaseline() *errs.Error {
