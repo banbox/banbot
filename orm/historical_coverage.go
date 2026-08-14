@@ -345,6 +345,9 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 	}
 	minuteStart := alignPhysicalKlineCeil(exs.ListMs, 60_000,
 		int64(exg.GetAlignOff(exs.Exchange, 60)*1000))
+	if historicalListingPrefixStartsBefore(coverage, exs.Symbol, "1m", minuteStart, fullStart) {
+		return historicalListingPrefix{}, false
+	}
 	minutes := historicalListingPrefixIntervals(coverage, exs.Symbol, "1m", minuteStart, fullStart)
 	if len(minutes) != 1 || minutes[0].StartMS < minuteStart || minutes[0].StartMS >= fullStart ||
 		minutes[0].StopMS < fullStart {
@@ -359,6 +362,9 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 	storageOffsetMS := int64(exg.GetAlignOff(exs.Exchange, storageSecs) * 1000)
 	storageStart := alignPhysicalKlineCeil(exs.ListMs, storageStepMS, storageOffsetMS)
 	if storageTF != timeframe && storageStart < fullStart {
+		if historicalListingPrefixStartsBefore(coverage, exs.Symbol, storageTF, storageStart, fullStart) {
+			return historicalListingPrefix{}, false
+		}
 		physical := historicalListingPrefixIntervals(coverage, exs.Symbol, storageTF, storageStart, fullStart)
 		if len(physical) != 1 || physical[0].StartMS < storageStart || physical[0].StartMS >= fullStart ||
 			physical[0].StopMS < fullStart {
@@ -402,6 +408,24 @@ func historicalListingPrefixIntervals(coverage *config.HistoricalCoverageConfig,
 		}
 	}
 	return intervals
+}
+
+func historicalListingPrefixStartsBefore(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
+	startMS, endMS int64,
+) bool {
+	if coverage == nil || endMS <= startMS {
+		return false
+	}
+	prefixes := coverage.ListingPrefixes
+	if prefixes == nil {
+		prefixes = coverage.Bars
+	}
+	for _, item := range prefixes[symbol][timeframe] {
+		if item.StopMS > startMS && item.StartMS < endMS && item.StartMS < startMS {
+			return true
+		}
+	}
+	return false
 }
 
 func prependHistoricalListingPrefix(exs *ExSymbol, prefix historicalListingPrefix,
