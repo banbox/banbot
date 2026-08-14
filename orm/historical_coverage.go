@@ -346,9 +346,11 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 	minuteStart := alignPhysicalKlineCeil(exs.ListMs, 60_000,
 		int64(exg.GetAlignOff(exs.Exchange, 60)*1000))
 	minutes := historicalListingPrefixIntervals(coverage, exs.Symbol, "1m", minuteStart, fullStart)
-	if len(minutes) != 1 || minutes[0].StartMS != minuteStart || minutes[0].StopMS < fullStart {
+	if len(minutes) != 1 || minutes[0].StartMS < minuteStart || minutes[0].StartMS >= fullStart ||
+		minutes[0].StopMS < fullStart {
 		return historicalListingPrefix{}, false
 	}
+	minuteStart = minutes[0].StartMS
 	storageSecs, storageErr := utils2.TFToSecSafe(storageTF)
 	if storageErr != nil || storageSecs <= 0 {
 		return historicalListingPrefix{}, false
@@ -358,9 +360,11 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 	storageStart := alignPhysicalKlineCeil(exs.ListMs, storageStepMS, storageOffsetMS)
 	if storageTF != timeframe && storageStart < fullStart {
 		physical := historicalListingPrefixIntervals(coverage, exs.Symbol, storageTF, storageStart, fullStart)
-		if len(physical) != 1 || physical[0].StartMS != storageStart || physical[0].StopMS < fullStart {
+		if len(physical) != 1 || physical[0].StartMS < storageStart || physical[0].StartMS >= fullStart ||
+			physical[0].StopMS < fullStart {
 			return historicalListingPrefix{}, false
 		}
+		storageStart = physical[0].StartMS
 	}
 	return historicalListingPrefix{
 		bucketStartMS:  bucketStart,

@@ -220,6 +220,50 @@ func TestHistoricalListingPrefixRestoresExactDerivedOHLCV(t *testing.T) {
 	}
 }
 
+func TestHistoricalListingPrefixAcceptsExplicitNoTradeHead(t *testing.T) {
+	const (
+		minute = int64(60_000)
+		hour   = 60 * minute
+		base   = int64(1_699_977_600_000)
+	)
+	symbol := "NO-TRADE-HEAD/USDT:USDT"
+	listMS := base + 4*hour + 17*minute
+	firstMinuteMS := base + 4*hour + 45*minute
+	fullStart := base + 8*hour
+	exs := &ExSymbol{ID: 7, Exchange: "binance", Symbol: symbol, ListMs: listMS}
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: base + 16*hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"8h": {{StartMS: fullStart, StopMS: base + 16*hour}},
+			},
+		},
+		ListingPrefixes: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"1m": {{StartMS: firstMinuteMS, StopMS: fullStart}},
+				"1h": {{StartMS: base + 5*hour, StopMS: fullStart}},
+			},
+		},
+	}
+	enableStrictHistoricalCoverageTest(t)
+
+	intervals := historicalCoverageIntervals(coverage, symbol, "8h", 0, base+16*hour)
+	prefix, ok := legacyListingPrefixProof(coverage, exs, "8h", 0, intervals)
+	if !ok || prefix.minuteStartMS != firstMinuteMS || prefix.storageStartMS != base+5*hour {
+		t.Fatalf("no-trade-head prefix=%+v ok=%v", prefix, ok)
+	}
+	minuteRows := make([]*DataSeries, 0, 15)
+	for timestamp := firstMinuteMS; timestamp < base+5*hour; timestamp += minute {
+		minuteRows = append(minuteRows, NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: timestamp, Open: 10, High: 12, Low: 8, Close: 11, Volume: 1,
+		}, nil, false, true))
+	}
+	rows, err := prependHistoricalListingPrefix(exs, prefix, minuteRows, nil)
+	if err != nil || len(rows) != 1 || rows[0].TimeMS != base+4*hour {
+		t.Fatalf("no-trade-head rows=%v err=%v", seriesTimes(rows), err)
+	}
+}
+
 func TestHistoricalListingPrefixRestoresPhysicalListingBucket(t *testing.T) {
 	const (
 		minute = int64(60_000)
