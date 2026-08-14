@@ -604,6 +604,9 @@ func (q *SubQueries) Begin(ctx context.Context) (pgx.Tx, error) {
 	if tx, ok := q.db.(pgx.Tx); ok {
 		return tx.Begin(ctx)
 	}
+	if beginner, ok := q.db.(dbBeginner); ok {
+		return beginner.Begin(ctx)
+	}
 	return nil, fmt.Errorf("db is not pgx.Tx")
 }
 
