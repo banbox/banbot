@@ -834,6 +834,14 @@ func (i *InOutOrder) ClientId(random bool) string {
 	return fmt.Sprintf("%s_%v_%v", config.Name, i.ID, client)
 }
 
+// ExitClientId returns the dedicated Bybit client ID for a normal exit order.
+// The z marker occupies the random-number segment, so it cannot collide with
+// the numeric 0..999 segment used by entry orders and does not increase length.
+func (i *InOutOrder) ExitClientId() string {
+	client := i.GetInfoString(OdInfoClientID)
+	return fmt.Sprintf("%s_%v_z_%v", config.Name, i.ID, client)
+}
+
 func fireOdEdit(od *InOutOrder, action string) {
 	if OdEditListener != nil && core.EnvReal && od.Status > InOutStatusInit && od.ID > 0 {
 		OdEditListener(od, action)
