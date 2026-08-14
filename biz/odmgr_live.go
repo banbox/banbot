@@ -2131,9 +2131,13 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		}
 	}
 	side, amount, price := subOd.Side, subOd.Amount, subOd.Price
+	clientID := od.ClientId(true)
+	if !isEnter && core.ExgName == "bybit" {
+		clientID = od.ExitClientId()
+	}
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
-		banexg.ParamClientOrderId: od.ClientId(true),
+		banexg.ParamClientOrderId: clientID,
 	}
 	if core.IsContract {
 		params[banexg.ParamPositionSide] = "LONG"

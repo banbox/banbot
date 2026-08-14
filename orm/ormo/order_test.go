@@ -222,3 +222,16 @@ func TestTriggerStateClientIDSurvivesDecodeAndClone(t *testing.T) {
 		t.Fatalf("cloned trigger identity mismatch: %+v", clone)
 	}
 }
+
+func TestExitClientIdUsesDedicatedMarker(t *testing.T) {
+	oldName := config.Name
+	config.Name = "testbot"
+	t.Cleanup(func() { config.Name = oldName })
+
+	od := newTestOrder()
+	od.ID = 12345
+	od.SetInfo(OdInfoClientID, "user1")
+	if got, want := od.ExitClientId(), "testbot_12345_z_user1"; got != want {
+		t.Fatalf("exit client ID = %q, want %q", got, want)
+	}
+}
