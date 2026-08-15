@@ -282,7 +282,7 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.Data
 		evt := row.CloneWithExSymbol(f.ExSymbol)
 		evt.TimeFrame = timeFrame
 		evt.Adj = adj
-		evt.IsWarmUp = f.isWarmUp
+		evt.IsWarmUp = f.isWarmUp || core.BackTestMode && config.TimeRange != nil && row.TimeMS+tfMSecs <= config.TimeRange.StartMS
 		evt.Closed = true
 		f.CallBack(evt)
 	}

@@ -34,6 +34,34 @@ func TestFeederHistoricalCoverageFiltersCallbacks(t *testing.T) {
 	}
 }
 
+func TestFeederBacktestWarmupBoundaryUsesBarEnd(t *testing.T) {
+	const hourMS = int64(60 * 60 * 1000)
+	startMS := int64(10 * hourMS)
+	previousBackTest, previousLive, previousRange := core.BackTestMode, core.LiveMode, config.TimeRange
+	oldTime := btime.CurTimeMS
+	t.Cleanup(func() {
+		core.BackTestMode, core.LiveMode, config.TimeRange = previousBackTest, previousLive, previousRange
+		btime.CurTimeMS = oldTime
+	})
+	core.BackTestMode = true
+	core.LiveMode = false
+	config.TimeRange = &config.TimeTuple{StartMS: startMS}
+
+	var got []*orm.DataSeries
+	feeder := &Feeder{
+		ExSymbol: &orm.ExSymbol{Symbol: "BTC/USDT:USDT"},
+		CallBack: func(evt *orm.DataSeries) { got = append(got, evt) },
+	}
+	feeder.fireCallBacks("1h", hourMS, []*orm.DataSeries{
+		{TimeMS: startMS - hourMS},
+		{TimeMS: startMS},
+	}, nil)
+
+	if len(got) != 2 || !got[0].IsWarmUp || got[1].IsWarmUp {
+		t.Fatalf("warmup flags at boundary and next bar = %+v, want [true false]", got)
+	}
+}
+
 func TestHistoricalCoverageForFeeder(t *testing.T) {
 	previous := config.HistoricalCoverage
 	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
