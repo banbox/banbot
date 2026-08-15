@@ -7,8 +7,55 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
 )
+
+func TestUseFrozenStaticPairsRequiresUnfilteredStrictHistoricalReplay(t *testing.T) {
+	previousBackTest, previousData := core.BackTestMode, config.Data
+	previousCoverage, previousFilters, previousMgr := config.HistoricalCoverage, config.PairFilters, config.PairMgr
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data = previousBackTest, previousData
+		config.HistoricalCoverage, config.PairFilters, config.PairMgr = previousCoverage, previousFilters, previousMgr
+	})
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.HistoricalCoverage = &config.HistoricalCoverageConfig{}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+
+	if !useFrozenStaticPairs([]string{"BTC/USDT:USDT"}) {
+		t.Fatal("strict historical replay did not preserve frozen static pairs")
+	}
+
+	tests := []struct {
+		name   string
+		change func()
+	}{
+		{name: "no static pairs", change: func() {}},
+		{name: "pair filters", change: func() {
+			config.PairFilters = []*config.CommonPairFilter{{Name: "VolumePairFilter"}}
+		}},
+		{name: "forced filters", change: func() { config.PairMgr.ForceFilters = true }},
+		{name: "non-strict backtest", change: func() { config.Data.BTStrict = false }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config.PairFilters = nil
+			config.PairMgr.ForceFilters = false
+			config.Data.BTStrict = true
+			test.change()
+			pairs := []string{"BTC/USDT:USDT"}
+			if test.name == "no static pairs" {
+				pairs = nil
+			}
+			if useFrozenStaticPairs(pairs) {
+				t.Fatal("unexpected frozen static-pair shortcut")
+			}
+		})
+	}
+}
 
 func TestBlockFilter(t *testing.T) {
 	f := BlockFilter{
