@@ -142,6 +142,5 @@ func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 }
 
 func useFrozenStaticPairs(pairs []string) bool {
-	return len(pairs) > 0 && len(config.PairFilters) == 0 && !config.PairMgr.ForceFilters &&
-		config.StrictBacktest() && config.Data.BTNoKlineDownload
+	return config.IsFrozenStaticPairs(pairs)
 }

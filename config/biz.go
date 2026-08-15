@@ -761,6 +761,14 @@ func StrictBacktest() bool {
 	return core.BackTestMode && Data.BTStrict
 }
 
+// IsFrozenStaticPairs reports whether strict replay may use the submitted
+// static universe without discovering market data or applying pair filters.
+func IsFrozenStaticPairs(pairs []string) bool {
+	return len(pairs) > 0 && len(PairFilters) == 0 &&
+		(PairMgr == nil || !PairMgr.ForceFilters) &&
+		StrictBacktest() && Data.BTNoKlineDownload
+}
+
 func StrictHistoricalReplay(coverage *HistoricalCoverageConfig) bool {
 	return StrictBacktest() && Data.BTNoKlineDownload && coverage != nil
 }
