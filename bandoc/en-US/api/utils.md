@@ -444,14 +444,14 @@ Returns:
 ## Performance Metrics Calculation
 
 ### CalcExpectancy
-Calculate profit expectancy and risk-reward ratio.
+Calculate profit expectancy and expectancy ratio.
 
 Parameters:
 - `profits []float64` - Array of profits
 
 Returns:
 - `float64` - Expected profit
-- `float64` - Risk-reward ratio
+- `float64` - Expectancy ratio
 
 ### CalcMaxDrawDown
 Calculate maximum drawdown.

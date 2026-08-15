@@ -817,7 +817,7 @@
     "get_system_language": "Get system language settings",
     "calc_corr_mat": "Calculate correlation matrix",
     "calc_envs_corr": "Calculate correlation of multiple bar environments",
-    "calc_expectancy": "Calculate profit expectancy and risk-reward ratio",
+    "calc_expectancy": "Calculate profit expectancy and expectancy ratio",
     "calc_max_draw_down": "Calculate maximum drawdown",
     "auto_corr_penalty": "Calculate autocorrelation penalty factor",
     "kmeans_vals": "Perform K-means clustering on a value series",

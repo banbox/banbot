@@ -268,7 +268,7 @@ const banCompletions: PackageCompletions = {
       label: "CalcExpectancy",
       type: "function",
       detail: m.calc_expectancy(),
-      info: `Parameters:\n- \`profits []float64\` - profit array\nReturns:\n- \`float64\` - expected return\n- \`float64\` - risk-reward ratio`
+      info: `Parameters:\n- \`profits []float64\` - profit array\nReturns:\n- \`float64\` - expected return\n- \`float64\` - expectancy ratio`
     },
     {
       label: "CalcMaxDrawDown",
