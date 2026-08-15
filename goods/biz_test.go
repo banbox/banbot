@@ -21,12 +21,12 @@ func TestUseFrozenStaticPairsRequiresUnfilteredStrictHistoricalReplay(t *testing
 	core.BackTestMode = true
 	config.Data.BTStrict = true
 	config.Data.BTNoKlineDownload = true
-	config.HistoricalCoverage = &config.HistoricalCoverageConfig{}
+	config.HistoricalCoverage = nil
 	config.PairFilters = nil
 	config.PairMgr = &config.PairMgrConfig{}
 
 	if !useFrozenStaticPairs([]string{"BTC/USDT:USDT"}) {
-		t.Fatal("strict historical replay did not preserve frozen static pairs")
+		t.Fatal("strict no-download replay did not preserve frozen static pairs")
 	}
 
 	tests := []struct {
