@@ -575,6 +575,52 @@ func TestPhysicalLoaderConsumerCoverageExtendsOnlyAuthorizedTail(t *testing.T) {
 	}
 }
 
+func TestPhysicalLoaderConsumerCoverageRestoresListingPrefix(t *testing.T) {
+	const (
+		minute = int64(60_000)
+		hour   = 60 * minute
+		base   = int64(1_699_977_600_000)
+	)
+	symbol := "CFX/USDT:USDT"
+	listMS := base + 4*hour + 30*minute
+	exs := &ExSymbol{ID: 1742, Exchange: "binance", Symbol: symbol, ListMs: listMS}
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: base + 16*hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"4h": {{StartMS: base + 8*hour, StopMS: base + 16*hour}},
+				"1h": {{StartMS: base + 5*hour, StopMS: base + 16*hour}},
+			},
+		},
+		PhysicalBars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"1h": {{StartMS: base + 8*hour, StopMS: base + 16*hour}}},
+		},
+		ListingPrefixes: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {
+				"1m": {{StartMS: listMS, StopMS: base + 8*hour}},
+				"1h": {{StartMS: base + 5*hour, StopMS: base + 8*hour}},
+			},
+		},
+	}
+	enableStrictHistoricalCoverageTest(t)
+
+	physical := historicalPhysicalCoverageIntervals(coverage, symbol, "1h", "4h", 0, base+16*hour)
+	if len(physical) != 1 || physical[0].StartMS != base+8*hour {
+		t.Fatalf("physical intervals=%v", physical)
+	}
+	extended := extendLegacyListingCoverage(coverage, exs, "4h", 0, physical)
+	if len(extended) != 1 || extended[0].StartMS != base+4*hour {
+		t.Fatalf("consumer listing prefix was not restored: %v", extended)
+	}
+
+	// The prefix is only an authorization for the derived consumer. A direct
+	// 1h physical read must retain its audited storage start.
+	direct := extendLegacyListingCoverage(coverage, exs, "1h", 0, physical)
+	if len(direct) != 1 || direct[0].StartMS != base+8*hour {
+		t.Fatalf("direct physical interval expanded: %v", direct)
+	}
+}
+
 func TestHistoricalPhysicalCoverageNilIsSafe(t *testing.T) {
 	if got := historicalPhysicalCoverageIntervals(nil, "TEST/USDT:USDT", "1h", "1h", 0, 100); got != nil {
 		t.Fatalf("nil coverage intervals=%v, want nil", got)

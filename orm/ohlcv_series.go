@@ -508,6 +508,13 @@ func (q *Queries) GetPhysicalSeriesFieldsForConsumer(exs *ExSymbol, timeFrame st
 		return nil, nil, err
 	}
 	intervals := historicalPhysicalCoverageIntervals(coverage, exs.Symbol, timeFrame, consumerTimeframe, startMS, endMS)
+	// A derived consumer may legitimately begin with a partially listed bucket.
+	// Keep the physical loader aligned with the ordinary read path by restoring
+	// the separately proved listing prefix, but never apply it to a direct
+	// physical-timeframe read.
+	if consumerTimeframe != "" && consumerTimeframe != timeFrame {
+		intervals = extendLegacyListingCoverage(coverage, exs, consumerTimeframe, startMS, intervals)
+	}
 	return readHistoricalCoverageIntervals(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
 		intervals, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish, reverse bool) (
 			[]*AdjInfo, []*DataSeries, *errs.Error,
