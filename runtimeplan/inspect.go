@@ -253,7 +253,15 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 			plan.Unsupported = append(plan.Unsupported, unsupported("symbol_outside_snapshot", "", symbol, "", "initial symbol is outside the configured frozen market"))
 		}
 	}
+	frozenStaticPairs := len(req.InitialSymbols) > 0 && len(cfg.PairFilters) == 0 &&
+		(cfg.PairMgr == nil || !cfg.PairMgr.ForceFilters) && cfg.BTStrict && cfg.BTNoKlineDownload
 	frameworkPairListSymbols := slices.Clone(req.InitialSymbols)
+	if frozenStaticPairs {
+		// Strict replay already binds the static universe and forbids downloads.
+		// The live pair-list/score discovery path must not add requirements that
+		// the replay runtime will never read.
+		frameworkPairListSymbols = nil
+	}
 	for _, policy := range config.RunPolicy {
 		frameworkPairListSymbols = append(frameworkPairListSymbols, policy.Pairs...)
 	}
@@ -301,7 +309,9 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 			validSelected = append(validSelected, symbol)
 		}
 		selected = validSelected
-		frameworkPairScoreSymbols = append(frameworkPairScoreSymbols, selected...)
+		if !frozenStaticPairs {
+			frameworkPairScoreSymbols = append(frameworkPairScoreSymbols, selected...)
+		}
 		maxPair, maxPairErr := effectivePolicyMaxPair(policy, cfg)
 		if maxPairErr != "" {
 			plan.Unsupported = append(plan.Unsupported, unsupported("invalid_max_pair", policyID, "", "", maxPairErr))

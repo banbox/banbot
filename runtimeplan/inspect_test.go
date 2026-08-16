@@ -173,6 +173,30 @@ func TestInspectIncludesFrameworkPairListAndScoreKlines(t *testing.T) {
 	}
 }
 
+func TestInspectSkipsFrameworkKlinesForStrictFrozenPairs(t *testing.T) {
+	const strategyName = "runtime_plan_frozen_pairs_fixture"
+	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"8h"}, WarmupNum: 20}
+	}
+	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	req := validRequest(t, strategyName)
+	req.ConfigYAML = strings.Replace(req.ConfigYAML, "market_type: linear\n",
+		"market_type: linear\n"+
+			"pairs: [BTC/USDT:USDT, ETH/USDT:USDT]\n"+
+			"bt_no_kline_download: true\n"+
+			"bt_strict: true\n", 1)
+	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
+	output, err := Inspect(req, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, requirement := range output.Requirements {
+		if requirement.PolicyID == "__framework__" {
+			t.Fatalf("strict frozen pairs unexpectedly require framework K-lines: %+v", requirement)
+		}
+	}
+}
+
 func TestInspectAllowsForcedPairFiltersWithoutConfiguredFilters(t *testing.T) {
 	const strategyName = "runtime_plan_forced_filters_fixture"
 	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
