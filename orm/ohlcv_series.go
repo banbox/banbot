@@ -483,6 +483,15 @@ func (q *Queries) GetSeries(exs *ExSymbol, timeFrame string, startMS, endMS int6
 func (q *Queries) GetPhysicalSeriesFields(exs *ExSymbol, timeFrame string, fields []string,
 	startMS, endMS int64, limit int, withUnFinish bool,
 ) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return q.GetPhysicalSeriesFieldsForConsumer(exs, timeFrame, fields, timeFrame,
+		startMS, endMS, limit, withUnFinish)
+}
+
+// GetPhysicalSeriesFieldsForConsumer permits an internal physical loader to
+// use the extension tail only when its logical consumer is covered too.
+func (q *Queries) GetPhysicalSeriesFieldsForConsumer(exs *ExSymbol, timeFrame string, fields []string,
+	consumerTimeframe string, startMS, endMS int64, limit int, withUnFinish bool,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 	coverage := historicalCoverageForQuery(exs.Symbol)
 	if coverage == nil {
 		return q.getSeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
@@ -498,7 +507,7 @@ func (q *Queries) GetPhysicalSeriesFields(exs *ExSymbol, timeFrame string, field
 	if err = validateHistoricalCoverageFields(coverage, fields); err != nil {
 		return nil, nil, err
 	}
-	intervals := historicalPhysicalCoverageIntervals(coverage, exs.Symbol, timeFrame, timeFrame, startMS, endMS)
+	intervals := historicalPhysicalCoverageIntervals(coverage, exs.Symbol, timeFrame, consumerTimeframe, startMS, endMS)
 	return readHistoricalCoverageIntervals(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
 		intervals, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish, reverse bool) (
 			[]*AdjInfo, []*DataSeries, *errs.Error,

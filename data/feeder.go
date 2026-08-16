@@ -33,13 +33,14 @@ type FuncEnvEnd = func(evt *orm.DataSeries)
 type FnGetInt64 = func() int64
 
 type PairTFCache struct {
-	TimeFrame  string
-	TFSecs     int
-	SubNextMS  int64 // Record the start timestamp of the next bar expected to be received. If it is inconsistent, the bar is missing and needs to be queried and updated. 记录子周期K线下一个期待收到的bar起始时间戳，如果不一致，则出现了bar缺失，需查询更新。
-	NextMS     int64 // 当前周期下一个K线期望的时间戳
-	WaitBar    *orm.DataSeries
-	Latest     *orm.DataSeries
-	AlignOffMS int64
+	TimeFrame    string
+	TFSecs       int
+	physicalOnly bool
+	SubNextMS    int64 // Record the start timestamp of the next bar expected to be received. If it is inconsistent, the bar is missing and needs to be queried and updated. 记录子周期K线下一个期待收到的bar起始时间戳，如果不一致，则出现了bar缺失，需查询更新。
+	NextMS       int64 // 当前周期下一个K线期望的时间戳
+	WaitBar      *orm.DataSeries
+	Latest       *orm.DataSeries
+	AlignOffMS   int64
 }
 
 /*
@@ -117,7 +118,8 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 	exgID := exchange.Info().ID
 	adds := make([]string, 0, len(timeFrames))
 	for _, tf := range timeFrames {
-		if _, ok := oldTfs[tf]; ok {
+		if sta, ok := stateMap[tf]; ok {
+			sta.physicalOnly = false
 			delete(oldTfs, tf)
 			continue
 		}
@@ -159,9 +161,10 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		if _, ok := stateMap["1h"]; !ok {
 			// 当需要1h以上级别数据，但未订阅1h时，需插入1h，以便后续从1h归集
 			sta := &PairTFCache{
-				TimeFrame:  "1h",
-				TFSecs:     hourSecs,
-				AlignOffMS: int64(exg.GetAlignOff(exgID, hourSecs) * 1000),
+				TimeFrame:    "1h",
+				TFSecs:       hourSecs,
+				physicalOnly: true,
+				AlignOffMS:   int64(exg.GetAlignOff(exgID, hourSecs) * 1000),
 			}
 			stateMap["1h"] = sta
 			newStates = utils.ValsOfMap(stateMap)
@@ -182,17 +185,37 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		}
 	}
 	if maxTfSecs >= 3600 {
+		consumerTf := physicalConsumerTimeframe(newStates)
 		// 使用1h及以上周期数据，额外添加1h的loader
 		// 当使用DBSeriesFeeder时，如果最小周期是1h，应将f.hour置为nil
 		if f.hour == nil {
 			f.hour = NewTfSeriesLoader(f.ExSymbol, "1h")
-			f.hour.allowPhysicalRead = true
 		}
+		f.hour.allowPhysicalRead = consumerTf != ""
+		f.hour.physicalConsumerTimeframe = consumerTf
 	} else {
 		f.hour = nil
 	}
 	f.States = newStates
 	return adds
+}
+
+func physicalConsumerTimeframe(states []*PairTFCache) string {
+	const hourSecs = 3600
+	physical := false
+	var consumer *PairTFCache
+	for _, state := range states {
+		if state.TimeFrame == "1h" && state.physicalOnly {
+			physical = true
+		}
+		if state.TFSecs > hourSecs && (consumer == nil || state.TFSecs > consumer.TFSecs) {
+			consumer = state
+		}
+	}
+	if !physical || consumer == nil {
+		return ""
+	}
+	return consumer.TimeFrame
 }
 
 func comparePairTFCache(a, b *PairTFCache) int {
@@ -890,6 +913,9 @@ func (f *DBSeriesFeeder) SubTfs(timeFrames []string, delOther bool) []string {
 		f.hour = nil
 	}
 	f.SetTimeFrame(minTF)
+	consumerTf := physicalConsumerTimeframe(f.States)
+	f.allowPhysicalRead = consumerTf != ""
+	f.physicalConsumerTimeframe = consumerTf
 	return arr
 }
 
@@ -998,9 +1024,10 @@ TfSeriesLoader 用于分批加载某个品种的指定周期K线，然后逐个�
 */
 type TfSeriesLoader struct {
 	*orm.ExSymbol
-	Timeframe         string
-	TFMSecs           int64
-	allowPhysicalRead bool
+	Timeframe                 string
+	TFMSecs                   int64
+	allowPhysicalRead         bool
+	physicalConsumerTimeframe string
 
 	EndMS     int64
 	FirstRead bool
@@ -1174,7 +1201,8 @@ func (f *TfSeriesLoader) SetNext() {
 	fields := strat.CollectKlineSubFields(f.ExSymbol.ID, f.Timeframe)
 	var rows []*orm.DataSeries
 	if f.allowPhysicalRead {
-		_, rows, err = sess.GetPhysicalSeriesFields(f.ExSymbol, f.Timeframe, fields,
+		_, rows, err = sess.GetPhysicalSeriesFieldsForConsumer(f.ExSymbol, f.Timeframe, fields,
+			f.physicalConsumerTimeframe,
 			f.offsetMS, endMS, batchSize, true)
 	} else {
 		_, rows, err = sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields,

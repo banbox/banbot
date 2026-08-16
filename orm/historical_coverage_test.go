@@ -552,6 +552,29 @@ func TestPhysicalLoaderReadsProvedCanonicalStorageWithoutExpandingBars(t *testin
 	}
 }
 
+func TestPhysicalLoaderConsumerCoverageExtendsOnlyAuthorizedTail(t *testing.T) {
+	const hour = int64(3_600_000)
+	symbol := "BTC/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 8 * hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"4h": {{StartMS: 0, StopMS: 16 * hour}}},
+		},
+		PhysicalBars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"1h": {{StartMS: hour, StopMS: 8 * hour}}},
+		},
+	}
+	if got := historicalPhysicalCoverageIntervals(coverage, symbol, "1h", "4h", 0, 16*hour); len(got) != 2 ||
+		got[0] != (historicalCoverageInterval{StartMS: hour, StopMS: 8 * hour}) ||
+		got[1] != (historicalCoverageInterval{StartMS: 8 * hour, StopMS: 16 * hour}) {
+		t.Fatalf("authorized consumer intervals=%v", got)
+	}
+	if got := historicalPhysicalCoverageIntervals(coverage, symbol, "1h", "1h", 0, 16*hour); len(got) != 1 ||
+		got[0] != (historicalCoverageInterval{StartMS: hour, StopMS: 8 * hour}) {
+		t.Fatalf("direct storage intervals crossed baseline=%v", got)
+	}
+}
+
 func TestHistoricalPhysicalCoverageNilIsSafe(t *testing.T) {
 	if got := historicalPhysicalCoverageIntervals(nil, "TEST/USDT:USDT", "1h", "1h", 0, 100); got != nil {
 		t.Fatalf("nil coverage intervals=%v, want nil", got)
