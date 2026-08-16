@@ -664,6 +664,13 @@ func CalcMeasureByOrders(ods []*ormo.InOutOrder) (float64, float64, *errs.Error)
 	if err != nil {
 		return 0, 0, err
 	}
+	return calcMeasuresByCurve(cumRets, tfSecs)
+}
+
+func calcMeasuresByCurve(cumRets []float64, tfSecs int) (float64, float64, *errs.Error) {
+	if len(cumRets) == 0 {
+		return 0, 0, nil
+	}
 	lastRet := cumRets[0]
 	retRates := make([]float64, len(cumRets))
 	for i, ret := range cumRets {
