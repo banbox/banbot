@@ -451,6 +451,7 @@ func (b *BackTest) Run() *errs.Error {
 		return nil
 	}
 	b.logPlot(biz.GetWallets(config.DefAcc), btime.TimeMS(), -1, -1)
+	normalizeBacktestResultRange(b.BTResult)
 	b.Collect()
 	if AfterBacktest != nil {
 		AfterBacktest(b)
@@ -464,6 +465,18 @@ func (b *BackTest) Run() *errs.Error {
 		b.printBtResult(true)
 	}
 	return nil
+}
+
+// normalizeBacktestResultRange keeps the reported window tied to the
+// immutable backtest request. A run with no non-warmup events can otherwise
+// report its first appended-tail event as the start of the whole backtest.
+func normalizeBacktestResultRange(result *BTResult) {
+	if result == nil || config.TimeRange == nil || config.TimeRange.StartMS <= 0 ||
+		config.TimeRange.EndMS <= config.TimeRange.StartMS {
+		return
+	}
+	result.StartMS = config.TimeRange.StartMS
+	result.EndMS = config.TimeRange.EndMS
 }
 
 func (b *BackTest) resolveLoopError(err *errs.Error) *errs.Error {

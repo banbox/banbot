@@ -6,6 +6,7 @@ import (
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/utils"
 )
@@ -57,6 +58,20 @@ func TestLogStateUsesMonotonicEventTimeForPlots(t *testing.T) {
 		t.Fatalf("backwards plot changed terminal state: real %v orders %v", result.Plots.Real[1], result.Plots.OdNum[1])
 	}
 	assertPlotLengths(t, result.Plots, 2)
+}
+
+func TestNormalizeBacktestResultRangeUsesConfiguredWindow(t *testing.T) {
+	previous := config.TimeRange
+	t.Cleanup(func() { config.TimeRange = previous })
+	config.TimeRange = &config.TimeTuple{StartMS: 1_651_363_200_000, EndMS: 1_786_492_800_000}
+
+	result := &BTResult{StartMS: config.TimeRange.EndMS, EndMS: config.TimeRange.EndMS}
+	normalizeBacktestResultRange(result)
+
+	if result.StartMS != config.TimeRange.StartMS || result.EndMS != config.TimeRange.EndMS {
+		t.Fatalf("result range = %d-%d, want configured range %d-%d",
+			result.StartMS, result.EndMS, config.TimeRange.StartMS, config.TimeRange.EndMS)
+	}
 }
 
 func assertPlotLengths(t *testing.T, plots *PlotData, want int) {
