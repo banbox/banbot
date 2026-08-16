@@ -186,6 +186,7 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		// 当使用DBSeriesFeeder时，如果最小周期是1h，应将f.hour置为nil
 		if f.hour == nil {
 			f.hour = NewTfSeriesLoader(f.ExSymbol, "1h")
+			f.hour.allowPhysicalRead = true
 		}
 	} else {
 		f.hour = nil
@@ -997,8 +998,9 @@ TfSeriesLoader 用于分批加载某个品种的指定周期K线，然后逐个�
 */
 type TfSeriesLoader struct {
 	*orm.ExSymbol
-	Timeframe string
-	TFMSecs   int64
+	Timeframe         string
+	TFMSecs           int64
+	allowPhysicalRead bool
 
 	EndMS     int64
 	FirstRead bool
@@ -1170,7 +1172,14 @@ func (f *TfSeriesLoader) SetNext() {
 			zap.Int("batch_size", batchSize))
 	}
 	fields := strat.CollectKlineSubFields(f.ExSymbol.ID, f.Timeframe)
-	_, rows, err := sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields, f.offsetMS, endMS, batchSize, true)
+	var rows []*orm.DataSeries
+	if f.allowPhysicalRead {
+		_, rows, err = sess.GetPhysicalSeriesFields(f.ExSymbol, f.Timeframe, fields,
+			f.offsetMS, endMS, batchSize, true)
+	} else {
+		_, rows, err = sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields,
+			f.offsetMS, endMS, batchSize, true)
+	}
 	if err != nil || len(rows) == 0 {
 		f.rowIdx = -1
 		f.offsetMS = max(f.offsetMS, f.nextMS)

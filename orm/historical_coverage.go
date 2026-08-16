@@ -249,6 +249,17 @@ func readHistoricalCoverageSeries(coverage *config.HistoricalCoverageConfig, exs
 	symbol := exs.Symbol
 	intervals := historicalCoverageIntervals(coverage, symbol, timeframe, startMS, endMS)
 	intervals = extendLegacyListingCoverage(coverage, exs, timeframe, startMS, intervals)
+	return readHistoricalCoverageIntervals(coverage, exs, timeframe, startMS, endMS, limit,
+		withUnFinish, intervals, read)
+}
+
+func readHistoricalCoverageIntervals(_ *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
+	startMS, endMS int64, limit int, withUnFinish bool, intervals []historicalCoverageInterval,
+	read historicalSeriesFieldsReader,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	if exs == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "historical coverage read requires a symbol")
+	}
 	if len(intervals) == 0 {
 		return nil, nil, nil
 	}

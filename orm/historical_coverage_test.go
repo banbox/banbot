@@ -521,6 +521,37 @@ func TestDirectStorageCoverageRejectsConsumerTailExtension(t *testing.T) {
 	}
 }
 
+func TestPhysicalLoaderReadsProvedCanonicalStorageWithoutExpandingBars(t *testing.T) {
+	const hour = int64(3_600_000)
+	symbol := "BTC/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 8 * hour,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"4h": {{StartMS: 0, StopMS: 8 * hour}}},
+		},
+		PhysicalBars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"1h": {{StartMS: hour, StopMS: 8 * hour}}},
+		},
+	}
+	if got := historicalCoverageIntervals(coverage, symbol, "1h", 0, 8*hour); len(got) != 0 {
+		t.Fatalf("ordinary 1h read was expanded by physical evidence: %v", got)
+	}
+	intervals := historicalPhysicalCoverageIntervals(coverage, symbol, "1h", "1h", 0, 8*hour)
+	if len(intervals) != 1 || intervals[0] != (historicalCoverageInterval{StartMS: hour, StopMS: 8 * hour}) {
+		t.Fatalf("physical loader intervals=%v", intervals)
+	}
+	_, rows, err := readHistoricalCoverageIntervals(coverage, &ExSymbol{Symbol: symbol}, "1h", 0, 8*hour,
+		3, false, intervals, func(startMS, endMS int64, limit int, _ bool, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+			if startMS != hour || endMS != 8*hour || limit != 3 || !reverse {
+				t.Fatalf("physical loader read=%d:%d limit=%d reverse=%v", startMS, endMS, limit, reverse)
+			}
+			return nil, []*DataSeries{{TimeMS: 5 * hour}, {TimeMS: 6 * hour}, {TimeMS: 7 * hour}}, nil
+		})
+	if err != nil || !slices.Equal(seriesTimes(rows), []int64{5 * hour, 6 * hour, 7 * hour}) {
+		t.Fatalf("physical loader rows=%v err=%v", seriesTimes(rows), err)
+	}
+}
+
 func TestHistoricalPhysicalCoverageNilIsSafe(t *testing.T) {
 	if got := historicalPhysicalCoverageIntervals(nil, "TEST/USDT:USDT", "1h", "1h", 0, 100); got != nil {
 		t.Fatalf("nil coverage intervals=%v, want nil", got)

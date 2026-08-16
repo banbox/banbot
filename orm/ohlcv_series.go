@@ -477,6 +477,37 @@ func (q *Queries) GetSeries(exs *ExSymbol, timeFrame string, startMS, endMS int6
 	return q.GetSeriesFields(exs, timeFrame, nil, startMS, endMS, limit, withUnFinish)
 }
 
+// GetPhysicalSeriesFields is used by the feeder's internal canonical physical
+// timeframe loader. It accepts only the immutable PhysicalBars proof for the
+// requested storage timeframe; ordinary strategy reads remain Bars-gated.
+func (q *Queries) GetPhysicalSeriesFields(exs *ExSymbol, timeFrame string, fields []string,
+	startMS, endMS int64, limit int, withUnFinish bool,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	coverage := historicalCoverageForQuery(exs.Symbol)
+	if coverage == nil {
+		return q.getSeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
+	}
+	storageTF, err := PhysicalKlineStorageTimeframe(timeFrame)
+	if err != nil {
+		return nil, nil, err
+	}
+	if storageTF != timeFrame {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig,
+			"physical series read requires canonical storage timeframe: %s via %s", timeFrame, storageTF)
+	}
+	if err = validateHistoricalCoverageFields(coverage, fields); err != nil {
+		return nil, nil, err
+	}
+	intervals := historicalPhysicalCoverageIntervals(coverage, exs.Symbol, timeFrame, timeFrame, startMS, endMS)
+	return readHistoricalCoverageIntervals(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
+		intervals, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish, reverse bool) (
+			[]*AdjInfo, []*DataSeries, *errs.Error,
+		) {
+			return q.getSeriesFieldsRawMode(exs, timeFrame, fields, readStartMS, readEndMS,
+				readLimit, readWithUnFinish, reverse)
+		})
+}
+
 func (q *Queries) GetSeriesFields(exs *ExSymbol, timeFrame string, fields []string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 	coverage := historicalCoverageForQuery(exs.Symbol)
 	if err := validateHistoricalCoverageFields(coverage, fields); err != nil {
