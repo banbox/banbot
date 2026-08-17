@@ -42,7 +42,10 @@ func executionJobEnvs(jobs map[string]*strat.JobEnv) iter.Seq[*strat.JobEnv] {
 
 func executionOpenOrders(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
 	result := slices.Collect(maps.Values(orders))
-	if canonicalExecutionOrder() {
+	// A Go map has no business order. Strict replay must canonicalize every
+	// map-to-slice boundary, including frozen-pair replays; preserving an
+	// explicitly supplied slice order is handled separately by executionOrderView.
+	if config.StrictBacktest() {
 		slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
 			if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {
 				return order
@@ -54,7 +57,7 @@ func executionOpenOrders(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
 }
 
 func canonicalExecutionOrder() bool {
-	return config.StrictBacktest() && !preserveFrozenReplayExecutionOrder()
+	return config.StrictBacktest()
 }
 
 func preserveFrozenReplayExecutionOrder() bool {

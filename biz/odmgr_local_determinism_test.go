@@ -95,6 +95,31 @@ func TestFrozenReplayFillPendingOrdersPreservesSuppliedBusinessOrder(t *testing.
 	}
 }
 
+func TestFrozenReplayCallbackOrdersCanonicalizeMapRescan(t *testing.T) {
+	oldBackTest, oldData, oldPairs, oldFilters, oldMgr := core.BackTestMode, config.Data,
+		config.Pairs, config.PairFilters, config.PairMgr
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data = oldBackTest, oldData
+		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+	})
+
+	for _, permutation := range [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}} {
+		orders := make([]*ormo.InOutOrder, 0, len(permutation))
+		for _, id := range permutation {
+			orders = append(orders, &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: id}})
+		}
+		sortOrdersForBacktest(orders)
+		if got := orderIDs(orders); !slices.Equal(got, []int64{1, 2, 3}) {
+			t.Fatalf("permutation %v callback orders = %v, want [1 2 3]", permutation, got)
+		}
+	}
+}
+
 func testFillPendingOrdersUsesStableBusinessOrder(t *testing.T, legacy, deterministic bool) {
 	oldExchange := exg.Default
 	oldBackTest := core.BackTestMode
