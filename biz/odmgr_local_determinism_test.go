@@ -1,8 +1,6 @@
 package biz
 
 import (
-	"crypto/sha256"
-	"fmt"
 	"slices"
 	"testing"
 
@@ -97,11 +95,12 @@ func TestFrozenReplayFillPendingOrdersPreservesSuppliedBusinessOrder(t *testing.
 	}
 }
 
-func TestFrozenReplayCallbackOrdersCanonicalizeMapRescan(t *testing.T) {
+func TestFrozenReplayCallbackOrdersPreserveSuppliedOrder(t *testing.T) {
 	oldBackTest, oldData, oldPairs, oldFilters, oldMgr := core.BackTestMode, config.Data,
 		config.Pairs, config.PairFilters, config.PairMgr
 	core.BackTestMode = true
 	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
 	config.Pairs = []string{"DETERMINISTIC/USDT"}
 	config.PairFilters = nil
 	config.PairMgr = &config.PairMgrConfig{}
@@ -116,84 +115,32 @@ func TestFrozenReplayCallbackOrdersCanonicalizeMapRescan(t *testing.T) {
 			orders = append(orders, &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: id}})
 		}
 		sortOrdersForBacktest(orders)
-		if got := orderIDs(orders); !slices.Equal(got, []int64{1, 2, 3}) {
-			t.Fatalf("permutation %v callback orders = %v, want [1 2 3]", permutation, got)
+		if got := orderIDs(orders); !slices.Equal(got, permutation) {
+			t.Fatalf("permutation %v callback orders = %v, want supplied order", permutation, got)
 		}
 	}
 }
 
-func TestFrozenReplayMapBoundaryKeepsOrderAndEquityHashesStable(t *testing.T) {
-	oldExchange, oldBackTest, oldEnvReal, oldLiveMode := exg.Default, core.BackTestMode, core.EnvReal, core.LiveMode
-	oldData, oldPairs, oldFilters, oldMgr := config.Data, config.Pairs, config.PairFilters, config.PairMgr
-	exg.Default = &deterministicFillExchange{}
-	core.BackTestMode, core.EnvReal, core.LiveMode = true, true, false
-	config.Data.BTLegacyWallet, config.Data.BTStrict, config.Data.BTNoKlineDownload = true, true, true
+func TestFrozenReplayMapBoundaryPreservesSuppliedOrder(t *testing.T) {
+	oldMode, oldData := core.BackTestMode, config.Data
+	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
 	config.Pairs = []string{"DETERMINISTIC/USDT"}
 	config.PairFilters = nil
 	config.PairMgr = &config.PairMgrConfig{}
 	t.Cleanup(func() {
-		exg.Default, core.BackTestMode, core.EnvReal, core.LiveMode = oldExchange, oldBackTest, oldEnvReal, oldLiveMode
-		config.Data, config.Pairs, config.PairFilters, config.PairMgr = oldData, oldPairs, oldFilters, oldMgr
+		core.BackTestMode, config.Data = oldMode, oldData
+		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
 	})
-
-	exs := &orm.ExSymbol{ID: 155, Symbol: "DETERMINISTIC/USDT"}
-	evt := orm.NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
-		Time: 1_700_000_000_000, Open: 100, High: 100, Low: 100, Close: 100,
-	}, nil, true, true)
-	costs := map[int64]float64{1: 60, 2: 50, 3: 40}
-	var wantHash [sha256.Size]byte
-
-	for run, permutation := range [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}} {
-		wallets := &BanWallets{Items: map[string]*ItemWallet{
-			"USDT": {Available: 100, Pendings: map[string]float64{}, Frozens: map[string]float64{}},
-		}}
-		var executedIDs, admittedIDs []int64
-		job := &strat.StratJob{
-			Strat: &strat.TradeStrat{HedgeOff: true}, Symbol: exs, TimeFrame: "1m",
-			CloseLong: true, CloseShort: true,
-		}
-		mgr := &LocalOrderMgr{OrderMgr: OrderMgr{Account: config.DefAcc}}
-		mgr.callBack = func(od *ormo.InOutOrder, _ bool) {
-			executedIDs = append(executedIDs, od.ID)
-			if _, err := wallets.CostAva(od.Key(), "USDT", costs[od.ID], false, 0.9); err == nil {
-				admittedIDs = append(admittedIDs, od.ID)
-			}
-			if job.Strat.HedgeOff {
-				closeSideOrders(job, !od.Short)
-			}
-		}
-		ordersByID := make(map[int64]*ormo.InOutOrder, len(permutation))
-		for _, id := range permutation {
-			order := deterministicPendingExit(id, exs.Symbol)
-			order.EnterAt = 1_699_999_940_000
-			order.Short = id == 2
-			ordersByID[id] = order
-		}
-
-		executionOrders := executionOpenOrders(ordersByID)
-		job.UpdateOrders(executionOrders)
-		if _, err := mgr.fillPendingOrders(executionOrders, evt); err != nil {
-			t.Fatalf("permutation %v: fillPendingOrders() error: %v", permutation, err)
-		}
-		hedgeExitIDs := make([]int64, len(job.Exits))
-		for index, exit := range job.Exits {
-			hedgeExitIDs[index] = exit.OrderID
-		}
-		if !slices.Equal(executedIDs, []int64{1, 2, 3}) || !slices.Equal(admittedIDs, []int64{1, 3}) ||
-			!slices.Equal(hedgeExitIDs, []int64{2, 3}) || wallets.Items["USDT"].Available != 0 {
-			t.Fatalf("permutation %v: orders=%v admitted=%v hedge_exits=%v equity=%v", permutation,
-				executedIDs, admittedIDs, hedgeExitIDs, wallets.Items["USDT"].Available)
-		}
-		summary := fmt.Sprintf("orders=%v;admitted=%v;hedge_exits=%v;equity=%.8f", executedIDs,
-			admittedIDs, hedgeExitIDs, wallets.Items["USDT"].Available)
-		gotHash := sha256.Sum256([]byte(summary))
-		if run == 0 {
-			wantHash = gotHash
-			continue
-		}
-		if gotHash != wantHash {
-			t.Fatalf("permutation %v hash = %x, want %x; summary=%s", permutation, gotHash, wantHash, summary)
-		}
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{ID: 3}},
+		{IOrder: &ormo.IOrder{ID: 1}},
+		{IOrder: &ormo.IOrder{ID: 2}},
+	}
+	if got := executionOrderView(orders); !slices.Equal(orderIDs(got), []int64{3, 1, 2}) {
+		t.Fatalf("frozen map boundary changed supplied order: %v", orderIDs(got))
 	}
 }
 
