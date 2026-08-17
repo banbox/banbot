@@ -32,6 +32,69 @@ func TestDeterministicFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
 	testFillPendingOrdersUsesStableBusinessOrder(t, false, true)
 }
 
+func TestFrozenReplayFillPendingOrdersPreservesSuppliedBusinessOrder(t *testing.T) {
+	oldExchange := exg.Default
+	oldBackTest := core.BackTestMode
+	oldEnvReal := core.EnvReal
+	oldLiveMode := core.LiveMode
+	oldData := config.Data
+	oldPairs := config.Pairs
+	oldPairFilters := config.PairFilters
+	oldPairMgr := config.PairMgr
+	exg.Default = &deterministicFillExchange{}
+	core.BackTestMode = true
+	core.EnvReal = true
+	core.LiveMode = false
+	config.Data.BTLegacyWallet = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+	t.Cleanup(func() {
+		exg.Default = oldExchange
+		core.BackTestMode = oldBackTest
+		core.EnvReal = oldEnvReal
+		core.LiveMode = oldLiveMode
+		config.Data = oldData
+		config.Pairs = oldPairs
+		config.PairFilters = oldPairFilters
+		config.PairMgr = oldPairMgr
+	})
+
+	exs := &orm.ExSymbol{ID: 155, Symbol: "DETERMINISTIC/USDT"}
+	evt := orm.NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+		Time: 1_700_000_000_000, Open: 100, High: 100, Low: 100, Close: 100,
+	}, nil, true, true)
+	wallets := &BanWallets{Items: map[string]*ItemWallet{
+		"USDT": {Available: 100, Pendings: map[string]float64{}, Frozens: map[string]float64{}},
+	}}
+	var callbackIDs []int64
+	var admittedIDs []int64
+	mgr := &LocalOrderMgr{OrderMgr: OrderMgr{Account: config.DefAcc}}
+	mgr.callBack = func(od *ormo.InOutOrder, _ bool) {
+		callbackIDs = append(callbackIDs, od.ID)
+		if _, err := wallets.CostAva(od.Key(), "USDT", map[int64]float64{1: 60, 2: 50, 3: 40}[od.ID], false, 0.9); err == nil {
+			admittedIDs = append(admittedIDs, od.ID)
+		}
+	}
+	orders := []*ormo.InOutOrder{
+		deterministicPendingExit(3, exs.Symbol),
+		deterministicPendingExit(2, exs.Symbol),
+		deterministicPendingExit(1, exs.Symbol),
+	}
+
+	if _, err := mgr.fillPendingOrders(orders, evt); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(callbackIDs, []int64{3, 2, 1}) {
+		t.Fatalf("callback order = %v, want supplied order [3 2 1]", callbackIDs)
+	}
+	if !slices.Equal(admittedIDs, []int64{3, 2}) {
+		t.Fatalf("admitted orders = %v, want supplied-order result [3 2]", admittedIDs)
+	}
+}
+
 func testFillPendingOrdersUsesStableBusinessOrder(t *testing.T, legacy, deterministic bool) {
 	oldExchange := exg.Default
 	oldBackTest := core.BackTestMode

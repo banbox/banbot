@@ -163,7 +163,7 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 
 // sortOrdersForBacktest enforces deterministic order iteration only in backtests.
 func sortOrdersForBacktest(orders []*ormo.InOutOrder) {
-	if !core.BackTestMode || len(orders) < 2 {
+	if !core.BackTestMode || preserveFrozenReplayExecutionOrder() || len(orders) < 2 {
 		return
 	}
 	sort.Slice(orders, func(i, j int) bool {
@@ -177,7 +177,7 @@ Fills orders waiting for exchange response. Cannot be used for real trading; can
 填充等待交易所响应的订单。不可用于实盘；可用于回测、模拟实盘等。
 */
 func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.DataSeries) (int, *errs.Error) {
-	orders = legacyWalletOrderView(orders)
+	orders = executionOrderView(orders)
 	core.SimOrderMatch = true
 	core.NewNumInSim = 0
 	defer func() {
@@ -651,7 +651,7 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noE
 }
 
 func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
-	orders = legacyWalletOrderView(orders)
+	orders = executionOrderView(orders)
 	for _, od := range orders {
 		_, err := o.exitOrder(od, req)
 		if err != nil {

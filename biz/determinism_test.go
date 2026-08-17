@@ -58,6 +58,34 @@ func TestDeterministicExecutionViewsUseStableBusinessKeys(t *testing.T) {
 	}
 }
 
+func TestFrozenReplayDisablesCanonicalOrderExecution(t *testing.T) {
+	oldMode, oldData := core.BackTestMode, config.Data
+	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Pairs = []string{"BTC/USDT:USDT", "DOGE/USDT:USDT"}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data = oldMode, oldData
+		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+	})
+
+	if canonicalExecutionOrder() {
+		t.Fatal("frozen strict replay enabled canonical execution ordering")
+	}
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{ID: 3}},
+		{IOrder: &ormo.IOrder{ID: 1}},
+		{IOrder: &ormo.IOrder{ID: 2}},
+	}
+	got := executionOrderView(orders)
+	if !slices.Equal(orderIDs(got), []int64{3, 1, 2}) || &got[0] != &orders[0] {
+		t.Fatalf("execution order = %v, want supplied order [3 1 2]", orderIDs(got))
+	}
+}
+
 func TestTryFireBatchesUsesStableTaskOrderWhenDeterministic(t *testing.T) {
 	enableStrictBacktest(t)
 	oldTasks := strat.BatchTasks

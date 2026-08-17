@@ -42,7 +42,7 @@ func executionJobEnvs(jobs map[string]*strat.JobEnv) iter.Seq[*strat.JobEnv] {
 
 func executionOpenOrders(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
 	result := slices.Collect(maps.Values(orders))
-	if config.StrictBacktest() {
+	if canonicalExecutionOrder() {
 		slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
 			if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {
 				return order
@@ -51,4 +51,20 @@ func executionOpenOrders(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
 		})
 	}
 	return result
+}
+
+func canonicalExecutionOrder() bool {
+	return config.StrictBacktest() && !preserveFrozenReplayExecutionOrder()
+}
+
+func preserveFrozenReplayExecutionOrder() bool {
+	pairs, _ := config.GetStaticPairs()
+	return config.IsFrozenStaticPairs(pairs)
+}
+
+func executionOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
+	if preserveFrozenReplayExecutionOrder() {
+		return orders
+	}
+	return legacyWalletOrderView(orders)
 }
