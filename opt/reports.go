@@ -139,7 +139,10 @@ func (r *BTResult) printBtResult(reset bool) {
 	}
 	log.Info("Saved", zap.String("at", r.OutDir))
 	if r.CalcDiff > 0.01 {
-		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github")
+		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github",
+			zap.Float64("total_invest", r.TotalInvest), zap.Float64("total_profit", r.TotProfit),
+			zap.Float64("final_balance", r.FinBalance), zap.Float64("final_withdraw", r.FinWithdraw),
+			zap.Float64("calc_diff", r.CalcDiff))
 	}
 	r.dumpBtFiles(reset)
 }
@@ -1547,7 +1550,10 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 		log.Info("Saved", zap.String("at", outDir))
 	}
 	if btRes.CalcDiff > 0.01 {
-		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github")
+		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github",
+			zap.Float64("total_invest", btRes.TotalInvest), zap.Float64("total_profit", btRes.TotProfit),
+			zap.Float64("final_balance", btRes.FinBalance), zap.Float64("final_withdraw", btRes.FinWithdraw),
+			zap.Float64("calc_diff", btRes.CalcDiff))
 	}
 	return btRes, nil
 }
