@@ -989,7 +989,10 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		if marginRatio > 0.99 {
 			// The total loss exceeds the total assets and the position is liquidated.
 			// 总亏损超过总资产，爆仓
-			wallet.Reset()
+			// Backtests without recharge settle frozen margin during normal cleanup.
+			if !core.BackTestMode || config.ChargeOnBomb {
+				wallet.Reset()
+			}
 			return errs.NewMsg(core.ErrLiquidation, "Account Wallet Liquidation")
 		}
 	}
