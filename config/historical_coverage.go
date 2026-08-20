@@ -11,15 +11,20 @@ type HistoricalCoverageRange struct {
 }
 
 type HistoricalCoverageConfig struct {
-	BaselineEndMS   int64                                           `yaml:"baseline_end_ms" mapstructure:"baseline_end_ms"`
-	Bars            map[string]map[string][]HistoricalCoverageRange `yaml:"bars" mapstructure:"bars"`
-	PhysicalBars    map[string]map[string][]HistoricalCoverageRange `yaml:"physical_bars,omitempty" mapstructure:"physical_bars"`
-	ListingPrefixes map[string]map[string][]HistoricalCoverageRange `yaml:"listing_prefixes" mapstructure:"listing_prefixes"`
+	BaselineEndMS         int64                                           `yaml:"baseline_end_ms" mapstructure:"baseline_end_ms"`
+	HistoricalResultEndMS int64                                           `yaml:"historical_result_end_ms,omitempty" mapstructure:"historical_result_end_ms"`
+	Bars                  map[string]map[string][]HistoricalCoverageRange `yaml:"bars" mapstructure:"bars"`
+	PhysicalBars          map[string]map[string][]HistoricalCoverageRange `yaml:"physical_bars,omitempty" mapstructure:"physical_bars"`
+	ListingPrefixes       map[string]map[string][]HistoricalCoverageRange `yaml:"listing_prefixes" mapstructure:"listing_prefixes"`
 }
 
 func (c *HistoricalCoverageConfig) Normalize(runRange *TimeTuple) error {
 	if runRange == nil || c.BaselineEndMS <= runRange.StartMS || c.BaselineEndMS > runRange.EndMS {
 		return fmt.Errorf("historical_coverage baseline_end_ms must be after the start and at or before the end of the backtest range")
+	}
+	if c.HistoricalResultEndMS != 0 &&
+		(c.HistoricalResultEndMS < c.BaselineEndMS || c.HistoricalResultEndMS > runRange.EndMS) {
+		return fmt.Errorf("historical_coverage historical_result_end_ms must be at or after baseline_end_ms and at or before the backtest end")
 	}
 	if len(c.Bars) == 0 {
 		return fmt.Errorf("historical_coverage bars are required")
@@ -76,7 +81,9 @@ func (c *HistoricalCoverageConfig) Clone() *HistoricalCoverageConfig {
 	if c == nil {
 		return nil
 	}
-	clone := &HistoricalCoverageConfig{BaselineEndMS: c.BaselineEndMS}
+	clone := &HistoricalCoverageConfig{
+		BaselineEndMS: c.BaselineEndMS, HistoricalResultEndMS: c.HistoricalResultEndMS,
+	}
 	clone.Bars = cloneHistoricalCoverageRanges(c.Bars)
 	clone.PhysicalBars = cloneHistoricalCoverageRanges(c.PhysicalBars)
 	clone.ListingPrefixes = cloneHistoricalCoverageRanges(c.ListingPrefixes)
@@ -103,10 +110,12 @@ func HistoricalCoverageFor(symbol string) *HistoricalCoverageConfig {
 	}
 	timeframes := HistoricalCoverage.Bars[symbol]
 	if len(timeframes) == 0 {
-		return &HistoricalCoverageConfig{BaselineEndMS: HistoricalCoverage.BaselineEndMS}
+		return &HistoricalCoverageConfig{BaselineEndMS: HistoricalCoverage.BaselineEndMS,
+			HistoricalResultEndMS: HistoricalCoverage.HistoricalResultEndMS}
 	}
 	result := &HistoricalCoverageConfig{BaselineEndMS: HistoricalCoverage.BaselineEndMS,
-		Bars: map[string]map[string][]HistoricalCoverageRange{symbol: timeframes}}
+		HistoricalResultEndMS: HistoricalCoverage.HistoricalResultEndMS,
+		Bars:                  map[string]map[string][]HistoricalCoverageRange{symbol: timeframes}}
 	if HistoricalCoverage.PhysicalBars != nil {
 		result.PhysicalBars = map[string]map[string][]HistoricalCoverageRange{
 			symbol: HistoricalCoverage.PhysicalBars[symbol],

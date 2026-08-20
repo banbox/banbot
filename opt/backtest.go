@@ -38,16 +38,16 @@ type BackTestLite struct {
 
 type BackTest struct {
 	*BackTestLite
-	lastDumpMs     int64 // The last time the backtest status was saved 上一次保存回测状态的时间
-	PBar           *utils.StagedPrg
-	dataPrep       bool
-	dataPrepErr    *errs.Error
-	nextRefresh    int64 // The time of the next refresh of the trading pair 下一次刷新交易对的时间
-	schedule       cron.Schedule
-	seriesRuntime  *data.SeriesRuntime
-	loopMainFn     func() *errs.Error
-	baselineEndMS  int64
-	baselineClosed bool
+	lastDumpMs           int64 // The last time the backtest status was saved 上一次保存回测状态的时间
+	PBar                 *utils.StagedPrg
+	dataPrep             bool
+	dataPrepErr          *errs.Error
+	nextRefresh          int64 // The time of the next refresh of the trading pair 下一次刷新交易对的时间
+	schedule             cron.Schedule
+	seriesRuntime        *data.SeriesRuntime
+	loopMainFn           func() *errs.Error
+	historicalCloseMS    []int64
+	historicalCloseIndex int
 }
 
 /*
@@ -214,12 +214,8 @@ func NewBackTest(isOpt bool, outDir string) (*BackTest, *errs.Error) {
 
 func (b *BackTest) Init() *errs.Error {
 	btime.CurTimeMS = config.TimeRange.StartMS
-	b.baselineEndMS = 0
-	b.baselineClosed = false
-	if config.HistoricalCoverage != nil && config.TimeRange.EndMS > config.HistoricalCoverage.BaselineEndMS &&
-		config.HistoricalCoverage.BaselineEndMS > config.TimeRange.StartMS {
-		b.baselineEndMS = config.HistoricalCoverage.BaselineEndMS
-	}
+	b.historicalCloseMS = historicalCloseBoundaries(config.HistoricalCoverage, config.TimeRange)
+	b.historicalCloseIndex = 0
 	b.MinReal = math.MaxFloat64
 	log.Info("backtest config summary",
 		zap.Bool("questdb", orm.IsQuestDB),
@@ -345,8 +341,8 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 		_ = b.BackTestLite.FeedDataSeries(evt)
 		return
 	}
-	if b.shouldCloseHistoricalBaseline(view.Time) {
-		if err := b.closeHistoricalBaseline(); err != nil {
+	if b.shouldCloseHistoricalBoundary(view.Time) {
+		if err := b.closeHistoricalBoundaries(view.Time); err != nil {
 			b.setRunError(err)
 			return
 		}
@@ -388,20 +384,34 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 	}
 }
 
-func (b *BackTest) shouldCloseHistoricalBaseline(eventMS int64) bool {
-	// Historical coverage is half-open: the first bar at baselineEndMS belongs
-	// to the appended tail and must not set the baseline liquidation price.
-	return b.baselineEndMS > 0 && !b.baselineClosed && eventMS >= b.baselineEndMS
-}
-
-func (b *BackTest) closeHistoricalBaseline() *errs.Error {
-	if b.baselineEndMS <= 0 || b.baselineClosed {
+func historicalCloseBoundaries(coverage *config.HistoricalCoverageConfig, runRange *config.TimeTuple) []int64 {
+	if coverage == nil || runRange == nil {
 		return nil
 	}
-	if err := biz.CloseBacktestOrdersAt(config.DefAcc, b.baselineEndMS); err != nil {
-		return err
+	result := make([]int64, 0, 2)
+	if endMS := coverage.BaselineEndMS; endMS > runRange.StartMS && runRange.EndMS > endMS &&
+		(len(result) == 0 || result[len(result)-1] != endMS) {
+		result = append(result, endMS)
 	}
-	b.baselineClosed = true
+	if endMS := coverage.HistoricalResultEndMS; endMS > runRange.StartMS && runRange.EndMS > endMS &&
+		(len(result) == 0 || result[len(result)-1] != endMS) {
+		result = append(result, endMS)
+	}
+	return result
+}
+
+func (b *BackTest) shouldCloseHistoricalBoundary(eventMS int64) bool {
+	return b.historicalCloseIndex < len(b.historicalCloseMS) &&
+		eventMS >= b.historicalCloseMS[b.historicalCloseIndex]
+}
+
+func (b *BackTest) closeHistoricalBoundaries(eventMS int64) *errs.Error {
+	for b.shouldCloseHistoricalBoundary(eventMS) {
+		if err := biz.CloseBacktestOrdersAt(config.DefAcc, b.historicalCloseMS[b.historicalCloseIndex]); err != nil {
+			return err
+		}
+		b.historicalCloseIndex++
+	}
 	return nil
 }
 
@@ -433,11 +443,11 @@ func (b *BackTest) Run() *errs.Error {
 		log.Error("backtest loop fail", zap.Error(err))
 		return err
 	}
-	// Some feeders finish without emitting a bar at or after the historical
+	// Some feeders finish without emitting a bar at or after a historical
 	// cutoff (for example when every series ends at the old baseline). Ensure
 	// those positions are closed before the final cleanup uses the new end.
-	if err := b.closeHistoricalBaseline(); err != nil {
-		log.Error("close historical baseline fail", zap.Error(err))
+	if err := b.closeHistoricalBoundaries(math.MaxInt64); err != nil {
+		log.Error("close historical boundaries fail", zap.Error(err))
 		return err
 	}
 	btCost := btime.UTCTime() - btStart

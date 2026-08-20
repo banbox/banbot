@@ -102,9 +102,29 @@ func TestHistoricalCoverageAllowsBaselineAtBacktestEnd(t *testing.T) {
 	}
 }
 
+func TestHistoricalCoverageValidatesHistoricalResultEnd(t *testing.T) {
+	coverage := &HistoricalCoverageConfig{
+		BaselineEndMS: 500, HistoricalResultEndMS: 600,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	if err := coverage.Normalize(&TimeTuple{StartMS: 200, EndMS: 700}); err != nil {
+		t.Fatalf("valid historical result end was rejected: %v", err)
+	}
+	coverage.HistoricalResultEndMS = 499
+	if err := coverage.Normalize(&TimeTuple{StartMS: 200, EndMS: 700}); err == nil {
+		t.Fatal("historical result end before baseline was accepted")
+	}
+	coverage.HistoricalResultEndMS = 701
+	if err := coverage.Normalize(&TimeTuple{StartMS: 200, EndMS: 700}); err == nil {
+		t.Fatal("historical result end after the backtest end was accepted")
+	}
+}
+
 func TestHistoricalCoverageCloneIsIndependent(t *testing.T) {
 	original := &HistoricalCoverageConfig{
-		BaselineEndMS: 500,
+		BaselineEndMS: 500, HistoricalResultEndMS: 600,
 		Bars: map[string]map[string][]HistoricalCoverageRange{
 			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 400}}},
 		},
@@ -113,6 +133,9 @@ func TestHistoricalCoverageCloneIsIndependent(t *testing.T) {
 		},
 	}
 	clone := original.Clone()
+	if clone.HistoricalResultEndMS != original.HistoricalResultEndMS {
+		t.Fatal("clone dropped historical result end")
+	}
 	clone.Bars["BNB/USDT:USDT"]["5m"][0].StopMS = 300
 	clone.ListingPrefixes["BNB/USDT:USDT"]["1m"][0].StopMS = 150
 	if original.Bars["BNB/USDT:USDT"]["5m"][0].StopMS != 400 {
@@ -160,7 +183,7 @@ func TestHistoricalCoverageRejectsInvalidListingPrefix(t *testing.T) {
 func TestHistoricalCoverageForPreservesListingPrefixes(t *testing.T) {
 	previous := HistoricalCoverage
 	HistoricalCoverage = &HistoricalCoverageConfig{
-		BaselineEndMS: 500,
+		BaselineEndMS: 500, HistoricalResultEndMS: 600,
 		Bars: map[string]map[string][]HistoricalCoverageRange{
 			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
 		},
@@ -171,6 +194,9 @@ func TestHistoricalCoverageForPreservesListingPrefixes(t *testing.T) {
 	t.Cleanup(func() { HistoricalCoverage = previous })
 
 	coverage := HistoricalCoverageFor("BNB/USDT:USDT")
+	if coverage.HistoricalResultEndMS != 600 || HistoricalCoverageFor("NEW/USDT:USDT").HistoricalResultEndMS != 600 {
+		t.Fatal("per-symbol coverage dropped historical result end")
+	}
 	ranges := coverage.ListingPrefixes["BNB/USDT:USDT"]["1m"]
 	if len(ranges) != 1 || ranges[0] != (HistoricalCoverageRange{StartMS: 100, StopMS: 200}) {
 		t.Fatalf("listing prefixes were not preserved: %#v", ranges)
