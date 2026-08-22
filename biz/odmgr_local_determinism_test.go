@@ -95,12 +95,11 @@ func TestFrozenReplayFillPendingOrdersPreservesSuppliedBusinessOrder(t *testing.
 	}
 }
 
-func TestFrozenReplayCallbackOrdersPreserveSuppliedOrder(t *testing.T) {
+func TestFrozenReplayCallbackOrdersCanonicalizeMapRescan(t *testing.T) {
 	oldBackTest, oldData, oldPairs, oldFilters, oldMgr := core.BackTestMode, config.Data,
 		config.Pairs, config.PairFilters, config.PairMgr
 	core.BackTestMode = true
 	config.Data.BTStrict = true
-	config.Data.BTNoKlineDownload = true
 	config.Pairs = []string{"DETERMINISTIC/USDT"}
 	config.PairFilters = nil
 	config.PairMgr = &config.PairMgrConfig{}
@@ -115,8 +114,8 @@ func TestFrozenReplayCallbackOrdersPreserveSuppliedOrder(t *testing.T) {
 			orders = append(orders, &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: id}})
 		}
 		sortOrdersForBacktest(orders)
-		if got := orderIDs(orders); !slices.Equal(got, permutation) {
-			t.Fatalf("permutation %v callback orders = %v, want supplied order", permutation, got)
+		if got := orderIDs(orders); !slices.Equal(got, []int64{1, 2, 3}) {
+			t.Fatalf("permutation %v callback orders = %v, want [1 2 3]", permutation, got)
 		}
 	}
 }
