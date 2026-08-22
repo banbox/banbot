@@ -121,6 +121,32 @@ func TestFrozenReplayCallbackOrdersPreserveSuppliedOrder(t *testing.T) {
 	}
 }
 
+func TestFrozenReplayMapRescanCanonicalizesOrder(t *testing.T) {
+	oldMode, oldData := core.BackTestMode, config.Data
+	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data = oldMode, oldData
+		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+	})
+
+	for _, permutation := range [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}} {
+		orders := make([]*ormo.InOutOrder, 0, len(permutation))
+		for _, id := range permutation {
+			orders = append(orders, &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: id}})
+		}
+		sortMapOrdersForBacktest(orders)
+		if got := orderIDs(orders); !slices.Equal(got, []int64{1, 2, 3}) {
+			t.Fatalf("permutation %v map rescan order = %v, want [1 2 3]", permutation, got)
+		}
+	}
+}
+
 func TestFrozenReplayMapBoundaryPreservesSuppliedOrder(t *testing.T) {
 	oldMode, oldData := core.BackTestMode, config.Data
 	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr

@@ -145,7 +145,9 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 		}
 		lock.Unlock()
 		if len(newOds) > 0 {
-			sortOrdersForBacktest(newOds)
+			// openOds is a map, so its iteration order is not a historical
+			// order that frozen replay can preserve.
+			sortMapOrdersForBacktest(newOds)
 			_, err = o.fillPendingOrders(newOds, evt)
 			if err != nil {
 				return orders, err
@@ -166,6 +168,17 @@ func sortOrdersForBacktest(orders []*ormo.InOutOrder) {
 	if !core.BackTestMode || preserveFrozenReplayExecutionOrder() || len(orders) < 2 {
 		return
 	}
+	sortOrdersByID(orders)
+}
+
+func sortMapOrdersForBacktest(orders []*ormo.InOutOrder) {
+	if !core.BackTestMode || len(orders) < 2 {
+		return
+	}
+	sortOrdersByID(orders)
+}
+
+func sortOrdersByID(orders []*ormo.InOutOrder) {
 	sort.Slice(orders, func(i, j int) bool {
 		return orders[i].ID < orders[j].ID
 	})

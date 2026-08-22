@@ -58,7 +58,7 @@ func TestDeterministicExecutionViewsUseStableBusinessKeys(t *testing.T) {
 	}
 }
 
-func TestFrozenReplayPreservesSuppliedOrder(t *testing.T) {
+func TestFrozenReplayCanonicalizesMapOrderAndPreservesSuppliedSlice(t *testing.T) {
 	oldMode, oldData := core.BackTestMode, config.Data
 	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr
 	core.BackTestMode = true
@@ -72,8 +72,16 @@ func TestFrozenReplayPreservesSuppliedOrder(t *testing.T) {
 		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
 	})
 
-	if canonicalExecutionOrder() {
-		t.Fatal("frozen strict replay unexpectedly changed the historical execution order")
+	insertions := [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}}
+	enterAt := map[int64]int64{1: 20, 2: 20, 3: 10}
+	for run := 0; run < 100; run++ {
+		ordersByID := make(map[int64]*ormo.InOutOrder, 3)
+		for _, id := range insertions[run%len(insertions)] {
+			ordersByID[id] = &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: id, EnterAt: enterAt[id]}}
+		}
+		if got := orderIDs(executionOpenOrders(ordersByID)); !slices.Equal(got, []int64{3, 1, 2}) {
+			t.Fatalf("run %d frozen map execution order = %v, want [3 1 2]", run, got)
+		}
 	}
 	orders := []*ormo.InOutOrder{
 		{IOrder: &ormo.IOrder{ID: 3}},
