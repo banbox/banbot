@@ -163,7 +163,7 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 
 // sortOrdersForBacktest enforces deterministic order iteration only in backtests.
 func sortOrdersForBacktest(orders []*ormo.InOutOrder) {
-	if !core.BackTestMode || len(orders) < 2 {
+	if !core.BackTestMode || preserveFrozenReplayExecutionOrder() || len(orders) < 2 {
 		return
 	}
 	sort.Slice(orders, func(i, j int) bool {
