@@ -120,6 +120,16 @@ func TestGroupByProfitsHandlesEmptyKMeansClusters(t *testing.T) {
 	}
 }
 
+func TestCalcMeasuresByCurveEmpty(t *testing.T) {
+	sharpe, sortino, err := calcMeasuresByCurve(nil, 86400)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sharpe != 0 || sortino != 0 {
+		t.Fatalf("got sharpe=%v sortino=%v, want 0, 0", sharpe, sortino)
+	}
+}
+
 func TestReportReplayOrderMakesConstrainedAdmissionDeterministic(t *testing.T) {
 	orders := []*ormo.InOutOrder{
 		{IOrder: &ormo.IOrder{ID: 1, EnterAt: 1000}},
