@@ -105,8 +105,8 @@ type TradeStrat struct {
     WsSubs        map[string]string    // websocket订阅: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 	DrawDownExit  bool // 是否启用回撤止损（即跟踪止损）
     HedgeOff      bool    // 关闭合约双向持仓
-	BatchInOut    bool    // 是否批量执行入场/出场
-	BatchInfo     bool    // 是否对OnInfoBar后执行批量处理
+	BatchInOut    bool    // 是否在主周期OnData(RoleMain)/OnBar后批量执行入场/出场
+	BatchInfo     bool    // 是否在辅助周期OnData(RoleInfo)/OnInfoBar后执行批量处理
 	StakeRate     float64 // 相对基础金额开单倍率
     StopLoss      float64 // 此策略打开所有订单的默认止损比率（不带杠杆）
 	StopEnterBars int // 限价单如果超过给定K线仍未入场则取消
@@ -506,6 +506,7 @@ s.SetAllStopLoss(core.OdDirtLong, &ormo.ExitTrigger{
 ## 批量任务处理
 有时候您可能需要针对当前策略的所有品种一起进行某些计算（比如相关系数），得到一些中间状态保存，或者一起进行开单或平仓。
 这时候您可以使用`OnBatchJobs`或`OnBatchInfos`回调函数。
+其中，`OnBatchJobs`仅在主周期`OnData(RoleMain)`/`OnBar`后触发，`OnBatchInfos`仅在辅助周期`OnData(RoleInfo)`/`OnInfoBar`后触发；分别由`BatchInOut`和`BatchInfo`开启。
 > 注意OnBatchJobs的jobs参数是从map得到，不保证顺序
 ```go
 func calcCorrs(jobs []*strat.StratJob, isBig bool) {

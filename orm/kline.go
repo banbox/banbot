@@ -307,6 +307,25 @@ func (q *Queries) repairKlineRangeFromPhysical(sid int32, timeframe string, star
 	return nil
 }
 
+func (q *Queries) reconcileKlineRangeFromPhysical(sid int32, timeframe string, startMS, endMS int64) (bool, *errs.Error) {
+	if startMS <= 0 || endMS <= startMS {
+		return false, nil
+	}
+	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
+	barTimes, err := q.getKLineTimes(sid, timeframe, startMS, endMS)
+	if err != nil {
+		return false, err
+	}
+	if len(barTimes) == 0 {
+		return false, nil
+	}
+	if err := q.rewriteHoleRangesInWindow(context.Background(), sid, timeframe, startMS, endMS,
+		exactKlineHoles(barTimes, tfMSecs, startMS, endMS)); err != nil {
+		return false, NewDbErr(core.ErrDbExecFail, err)
+	}
+	return true, nil
+}
+
 func queryHyper(sess *Queries, timeFrame, sql string, limit int, args ...interface{}) (string, pgx.Rows, error) {
 	agg, ok := aggMap[timeFrame]
 	var subTF, table string

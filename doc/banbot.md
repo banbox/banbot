@@ -241,8 +241,8 @@ type TradeStrat struct {
 	WsSubs map[string]string // WebSocket subscription configuration
 	DrawDownExit bool // Whether to enable trailing stop-loss and take-profit, default false
 	HedgeOff bool // Disable contract bidirectional positions
-	BatchInOut bool // Whether to execute entry/exit in batches
-	BatchInfo bool // Whether to execute batch processing after OnInfoBar
+	BatchInOut bool // Whether to batch execute entry/exit after main OnData(RoleMain)/OnBar
+	BatchInfo bool // Whether to batch process after auxiliary OnData(RoleInfo)/OnInfoBar
 	StakeRate float64 // Position size multiplier relative to base amount
 	StopLoss float64 // Default stop loss ratio for this strategy, without leverage
 	StopEnterBars int

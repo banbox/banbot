@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -1153,7 +1154,8 @@ func (f *TfSeriesLoader) DownIfNeed(sess *orm.Queries, exchange banexg.BanExchan
 		}
 		defer conn.Release()
 	}
-	_, err = sess.DownOHLCV2DB(exchange, f.ExSymbol, downTf, btime.TimeMS(), f.EndMS, pBar)
+	_, err = sess.DownOHLCV2DBForRequestedTF(exchange, f.ExSymbol, downTf, f.Timeframe,
+		btime.TimeMS(), f.EndMS, pBar)
 	return err
 }
 
@@ -1174,15 +1176,6 @@ func (f *TfSeriesLoader) SetNext() {
 	}
 	// After the cache reading is completed, re-read the database
 	// 缓存读取完毕，重新读取数据库
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
-		f.rowIdx = -1
-		f.offsetMS = max(f.offsetMS, f.nextMS)
-		f.nextMS = math.MaxInt64
-		log.Error("get conn fail while loading kline", zap.Error(err))
-		return
-	}
-	defer conn.Release()
 	batchSize := 3000
 	if core.BackTestMode {
 		// QuestDB performs better with fewer, larger range queries than many small ones.
@@ -1200,13 +1193,32 @@ func (f *TfSeriesLoader) SetNext() {
 	}
 	fields := strat.CollectKlineSubFields(f.ExSymbol.ID, f.Timeframe)
 	var rows []*orm.DataSeries
-	if f.allowPhysicalRead {
-		_, rows, err = sess.GetPhysicalSeriesFieldsForConsumer(f.ExSymbol, f.Timeframe, fields,
-			f.physicalConsumerTimeframe,
-			f.offsetMS, endMS, batchSize, true)
-	} else {
-		_, rows, err = sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields,
-			f.offsetMS, endMS, batchSize, true)
+	var err *errs.Error
+	const maxSeriesLoadRetries = 3
+	for retry := 0; retry < maxSeriesLoadRetries; retry++ {
+		rows = nil
+		err = nil
+		sess, conn, connErr := orm.Conn(nil)
+		if connErr != nil {
+			err = connErr
+		} else {
+			if f.allowPhysicalRead {
+				_, rows, err = sess.GetPhysicalSeriesFieldsForConsumer(f.ExSymbol, f.Timeframe, fields,
+					f.physicalConsumerTimeframe,
+					f.offsetMS, endMS, batchSize, true)
+			} else {
+				_, rows, err = sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields,
+					f.offsetMS, endMS, batchSize, true)
+			}
+			conn.Release()
+		}
+		if err == nil || err.Code != core.ErrDbConnFail || retry == maxSeriesLoadRetries-1 {
+			break
+		}
+		log.Warn("retry loading kline after transient db connection failure",
+			zap.String("pair", f.Symbol), zap.String("tf", f.Timeframe),
+			zap.Int("attempt", retry+1), zap.Error(err))
+		core.Sleep(time.Second * time.Duration(retry+1))
 	}
 	if err != nil || len(rows) == 0 {
 		f.rowIdx = -1

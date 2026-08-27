@@ -424,7 +424,8 @@ func AutoFetchSeries(exchange banexg.BanExchange, exs *ExSymbol, timeFrame strin
 	defer conn.Release()
 	return autoFetchSeries(timeFrame, startMS, endMS, limit, withUnFinish, pBar,
 		func(downTF string, downStartMS, downEndMS int64) *errs.Error {
-			_, downErr := sess.DownOHLCV2DB(exchange, exs, downTF, downStartMS, downEndMS, pBar)
+			_, downErr := sess.DownOHLCV2DBForRequestedTF(exchange, exs, downTF, timeFrame,
+				downStartMS, downEndMS, pBar)
 			return downErr
 		}, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			return sess.GetSeries(exs, timeFrame, readStartMS, readEndMS, readLimit, readWithUnFinish)

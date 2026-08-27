@@ -105,8 +105,8 @@ type TradeStrat struct {
     WsSubs        map[string]string    // websocket subscription: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 	DrawDownExit  bool    // Whether to enable retracement stop loss (i.e. trailing stop loss)
     HedgeOff      bool    // turn off future hedge mode
-	BatchInOut    bool    // Whether to batch execute entry/exit
-	BatchInfo     bool    // whether to perform batch processing after OninfoBar
+	BatchInOut    bool    // Whether to batch execute entry/exit after main OnData(RoleMain)/OnBar
+	BatchInfo     bool    // Whether to batch process after auxiliary OnData(RoleInfo)/OnInfoBar
 	StakeRate     float64 // Relative basic amount billing rate
     StopLoss      float64 // Default stop loss rate for all orders opened by this strategy (without leverage).
 	StopEnterBars int     // If the limit order exceeds the given K line and still does not enter the market, it will be cancelled
@@ -505,6 +505,7 @@ For all open long orders, a stop loss of 50% of the position is set. When the pr
 ## Batch task processing
 Sometimes you may need to perform some calculations (such as correlation coefficients) for all symbols of the current strategy together, get some intermediate states to save, or open or close orders together.
 In this case, you can use the `OnBatchJobs` or `OnBatchInfos` callback function.
+`OnBatchJobs` is triggered only after main `OnData(RoleMain)`/`OnBar`; `OnBatchInfos` is triggered only after auxiliary `OnData(RoleInfo)`/`OnInfoBar`. They are enabled by `BatchInOut` and `BatchInfo`, respectively.
 > Note that the jobs parameter of OnBatchJobs is obtained from a map, so the order is not guaranteed.
 ```go
 func calcCorrs(jobs []*strat.StratJob, isBig bool) {

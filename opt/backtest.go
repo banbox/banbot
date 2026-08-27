@@ -366,17 +366,17 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 			log.Error("RefreshPairJobs", zap.String("date", dateStr), zap.Error(err))
 			if b.dataPrep {
 				b.dataPrepErr = err
-				b.dp.Terminate()
-				return
 			}
+			b.setRunError(err)
+			return
 		} else {
 			if _, err := b.syncThirdPartySeriesRange(); err != nil {
 				log.Error("ensure third-party series after pair refresh", zap.String("date", dateStr), zap.Error(err))
 				if b.dataPrep {
 					b.dataPrepErr = err
-					b.dp.Terminate()
-					return
 				}
+				b.setRunError(err)
+				return
 			}
 			log.Info("refreshed pairs at", zap.String("date", dateStr))
 		}

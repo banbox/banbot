@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/banbox/banbot/core"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -46,6 +47,13 @@ func TestParseQuestDBMissingPartitionRepair(t *testing.T) {
 	}
 	if repair.SQL() != "ALTER TABLE ins_kline_q FORCE DROP PARTITION LIST '2026-04-15'" {
 		t.Fatalf("sql mismatch: %s", repair.SQL())
+	}
+}
+
+func TestNewDbErrClassifiesBrokenPipeAsConnectionFailure(t *testing.T) {
+	err := NewDbErr(core.ErrDbReadFail, errors.New("write tcp 127.0.0.1:1234->127.0.0.1:8812: write: broken pipe"))
+	if err.Code != core.ErrDbConnFail {
+		t.Fatalf("expected connection failure code, got %d (%s)", err.Code, err.Short())
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/banbox/banbot/core"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -156,6 +157,25 @@ func TestWaitForQuestKlineCoverageVisibleBypassesCache(t *testing.T) {
 	}
 	if queries != 3 {
 		t.Fatalf("cache must not satisfy DB visibility wait: queries=%d", queries)
+	}
+}
+
+func TestWaitForQuestKlineCoverageVisibleTimeoutIsRetryable(t *testing.T) {
+	oldGrace := klineInsertQuestVisibilityGrace
+	oldPoll := questReadAfterWritePollInterval
+	klineInsertQuestVisibilityGrace = 5 * time.Millisecond
+	questReadAfterWritePollInterval = time.Millisecond
+	defer func() {
+		klineInsertQuestVisibilityGrace = oldGrace
+		questReadAfterWritePollInterval = oldPoll
+	}()
+
+	db := &visibilityDBStub{query: func(_ string, _ ...interface{}) (pgx.Rows, error) {
+		return &staleCoveredRows{idx: 0}, nil
+	}}
+	err := waitForQuestKlineCoverageVisible(context.Background(), New(db), 780, "1m", 100, 200)
+	if err == nil || err.Code != core.ErrTimeout || !strings.Contains(err.Short(), "coverage not visible before timeout") {
+		t.Fatalf("expected retryable coverage timeout, got %v", err)
 	}
 }
 

@@ -169,7 +169,7 @@ func waitForQuestKlineCoverageVisible(ctx context.Context, q *Queries, sid int32
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
 	if !ok {
-		return errs.NewMsg(core.ErrDbReadFail,
+		return errs.NewMsg(core.ErrTimeout,
 			"questdb kline coverage not visible before timeout: sid=%d timeframe=%s start=%d end=%d",
 			sid, timeframe, startMS, endMS)
 	}
@@ -212,7 +212,7 @@ func waitForQuestSeriesCoverageVisible(ctx context.Context, q *Queries, info *Se
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
 	if !ok {
-		return errs.NewMsg(core.ErrDbReadFail,
+		return errs.NewMsg(core.ErrTimeout,
 			"questdb series coverage not visible before timeout: table=%s sid=%d timeframe=%s start=%d end=%d",
 			binding.Table, sid, info.TimeFrame, startMS, endMS)
 	}

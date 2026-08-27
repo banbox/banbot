@@ -198,9 +198,9 @@ func (q *Queries) loadSRangesSpans(ctx context.Context, sid int32, table, timefr
 }
 
 func (q *Queries) loadSRangesSpansFromDB(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]srangeSpan, error) {
-	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
+	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data, ts
 FROM (
-  SELECT start_ms, stop_ms, has_data, is_deleted
+  SELECT start_ms, stop_ms, has_data, is_deleted, ts
   FROM sranges_q
   LATEST BY sid, tbl, timeframe, start_ms
   WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms > $4 AND start_ms < $5
@@ -216,7 +216,7 @@ ORDER BY start_ms, stop_ms`,
 	spans := make([]srangeSpan, 0, 16)
 	for rows.Next() {
 		var s srangeSpan
-		if err := rows.Scan(&s.StartMs, &s.StopMs, &s.HasData); err != nil {
+		if err := rows.Scan(&s.StartMs, &s.StopMs, &s.HasData, &s.Ts); err != nil {
 			return nil, err
 		}
 		if s.StopMs > s.StartMs {
@@ -251,7 +251,7 @@ func normalizeSRangeSpans(spans []srangeSpan) []srangeSpan {
 		for j := range spans {
 			s := &spans[j]
 			if s.StartMs <= a && s.StopMs >= b {
-				if chosen == nil || s.StartMs > chosen.StartMs {
+				if chosen == nil || newerSRangeSpan(*s, *chosen) {
 					chosen = s
 				}
 			}
@@ -346,6 +346,23 @@ type srangeSpan struct {
 	StartMs int64
 	StopMs  int64
 	HasData bool
+	Ts      time.Time
+}
+
+func newerSRangeSpan(candidate, current srangeSpan) bool {
+	if !candidate.Ts.IsZero() || !current.Ts.IsZero() {
+		if candidate.Ts.Equal(current.Ts) {
+			return candidate.StartMs > current.StartMs
+		}
+		if current.Ts.IsZero() {
+			return true
+		}
+		if candidate.Ts.IsZero() {
+			return false
+		}
+		return candidate.Ts.After(current.Ts)
+	}
+	return candidate.StartMs > current.StartMs
 }
 
 // UpdateSRangesWithHoles atomically marks [startMs, stopMs) as has_data=true while
