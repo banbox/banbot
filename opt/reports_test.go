@@ -66,11 +66,26 @@ func TestNormalizeBacktestResultRangeUsesConfiguredWindow(t *testing.T) {
 	config.TimeRange = &config.TimeTuple{StartMS: 1_651_363_200_000, EndMS: 1_786_492_800_000}
 
 	result := &BTResult{StartMS: config.TimeRange.EndMS, EndMS: config.TimeRange.EndMS}
-	normalizeBacktestResultRange(result)
+	normalizeBacktestResultRange(result, false)
 
 	if result.StartMS != config.TimeRange.StartMS || result.EndMS != config.TimeRange.EndMS {
 		t.Fatalf("result range = %d-%d, want configured range %d-%d",
 			result.StartMS, result.EndMS, config.TimeRange.StartMS, config.TimeRange.EndMS)
+	}
+}
+
+func TestNormalizeBacktestResultRangePreservesEarlyStop(t *testing.T) {
+	previous := config.TimeRange
+	t.Cleanup(func() { config.TimeRange = previous })
+	config.TimeRange = &config.TimeTuple{StartMS: 1_651_363_200_000, EndMS: 1_786_492_800_000}
+
+	actualEnd := config.TimeRange.StartMS + 7*24*60*60*1000
+	result := &BTResult{StartMS: config.TimeRange.StartMS, EndMS: actualEnd}
+	normalizeBacktestResultRange(result, true)
+
+	if result.StartMS != config.TimeRange.StartMS || result.EndMS != actualEnd {
+		t.Fatalf("early-stop result range = %d-%d, want %d-%d",
+			result.StartMS, result.EndMS, config.TimeRange.StartMS, actualEnd)
 	}
 }
 

@@ -31,9 +31,10 @@ const (
 type BackTestLite struct {
 	biz.Trader
 	*BTResult
-	dp     *data.HistProvider
-	isOpt  bool // whether is hyper optimization
-	runErr *errs.Error
+	dp           *data.HistProvider
+	isOpt        bool // whether is hyper optimization
+	runErr       *errs.Error
+	stoppedEarly bool
 }
 
 type BackTest struct {
@@ -126,6 +127,7 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 		return false
 	}
 	if !core.BotRunning {
+		b.stoppedEarly = true
 		b.dp.Terminate()
 		return false
 	}
@@ -459,7 +461,7 @@ func (b *BackTest) Run() *errs.Error {
 		return nil
 	}
 	b.logPlot(biz.GetWallets(config.DefAcc), btime.TimeMS(), -1, -1)
-	normalizeBacktestResultRange(b.BTResult)
+	normalizeBacktestResultRange(b.BTResult, b.stoppedEarly)
 	b.Collect()
 	if AfterBacktest != nil {
 		AfterBacktest(b)
@@ -478,7 +480,10 @@ func (b *BackTest) Run() *errs.Error {
 // normalizeBacktestResultRange keeps the reported window tied to the
 // immutable backtest request. A run with no non-warmup events can otherwise
 // report its first appended-tail event as the start of the whole backtest.
-func normalizeBacktestResultRange(result *BTResult) {
+func normalizeBacktestResultRange(result *BTResult, stoppedEarly bool) {
+	if stoppedEarly {
+		return
+	}
 	if result == nil || config.TimeRange == nil || config.TimeRange.StartMS <= 0 ||
 		config.TimeRange.EndMS <= config.TimeRange.StartMS {
 		return
