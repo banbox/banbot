@@ -130,7 +130,8 @@ type StratJob struct {
 	IsWarmUp      bool              // whether in a preheating state 当前是否处于预热状态
 	More          interface{}       // Additional information for policy customization 策略自定义的额外信息
 
-	inspectEffect func(string)
+	inspectEffect     func(string)
+	dataHubConfigured bool
 }
 
 // NewInspectionJob creates the inert job state passed to startup-time

@@ -187,8 +187,8 @@ func startProfiles() {
 		panic(err)
 	}
 	outPath := filepath.Join(wd, "cpu.profile")
-	if err = utils.StartCpuProfile(outPath, 6060); err != nil {
-		panic(err)
+	if profileErr := utils.StartCpuProfile(outPath, 6060); profileErr != nil {
+		panic(profileErr)
 	}
 	log.Info("CPU profile started", zap.String("path", outPath))
 }

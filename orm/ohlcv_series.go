@@ -139,8 +139,8 @@ func cloneOHLCVSeries(row *DataSeries, exs *ExSymbol, tf string, toTFMS int64, i
 	if row == nil {
 		return nil, fmt.Errorf("series event is nil")
 	}
-	if _, err := ohlcvSeriesValues(row, 0); err != nil {
-		return nil, err
+	if _, err := row.readOHLCVFields(); err != nil {
+		return nil, errs.New(core.ErrInvalidBars, err)
 	}
 	cp := *row
 	cp.Source = SeriesSourceKline
@@ -159,9 +159,12 @@ func cloneOHLCVSeries(row *DataSeries, exs *ExSymbol, tf string, toTFMS int64, i
 }
 
 func mergeOHLCVSeries(dst, src *DataSeries) error {
-	srcValues, err := ohlcvSeriesValues(src, 0)
+	if src == nil {
+		return errs.NewMsg(core.ErrInvalidBars, "series row is nil")
+	}
+	srcValues, err := src.readOHLCVFields()
 	if err != nil {
-		return err
+		return errs.New(core.ErrInvalidBars, err)
 	}
 	if srcValues.volume <= 0 {
 		return nil
@@ -771,17 +774,20 @@ func handleSeriesBatchFields(exsMap map[int32]*ExSymbol, timeframe string, field
 	}
 	defer pgRows.Close()
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
-	grouped := make(map[int32][]*DataSeries)
+	grouped := make(map[int32][]*DataSeries, len(exsMap))
+	var timeMS int64
+	var sid int32
+	values := make([]any, len(fields))
+	targets := make([]any, 2+len(fields))
+	targets[0] = &timeMS
+	for i := range values {
+		targets[i+1] = &values[i]
+	}
+	targets[len(targets)-1] = &sid
 	for pgRows.Next() {
-		var timeMS int64
-		var sid int32
-		values := make([]any, len(fields))
-		targets := make([]any, 2+len(fields))
-		targets[0] = &timeMS
-		for i := range values {
-			targets[i+1] = &values[i]
-		}
-		targets[len(targets)-1] = &sid
+		timeMS = 0
+		sid = 0
+		clear(values)
 		if err := pgRows.Scan(targets...); err != nil {
 			return NewDbErr(core.ErrDbReadFail, err)
 		}

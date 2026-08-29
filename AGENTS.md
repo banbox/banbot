@@ -1,6 +1,12 @@
 ## 开发规约
 - banexg负责不同交易所的对接和封装，对外提供一致的接口和参数。禁止在banbot中直接针对不同交易所写独有的处理逻辑。
 
+## 任意时序数据兼容性
+
+- 从 v0.3.8 升级到 v0.4.* 的核心目标是支持任意时序数据的读写。v0.3.8 只允许存储 K 线数据，且不允许给已有 K 线表增加列；
+- `orm.DataSeries` 是统一的运行时数据模型。`DataSeries.Values map[string]any` 是任意字段读写、跨数据源传递的核心兼容能力，不能因为性能优化而移除、收窄或退回固定 K 线字段模型。
+- 不引入 typed OHLCV 快速路径，默认 K 线和扩展列都统一通过 `DataSeries.Values map[string]any` 传递。聚合、复权、序列化、DataHub、feeder、回测和实盘回调必须继续保留自定义字段及其类型/NULL 语义。
+
 ## QuestDB WAL 规则
 
 - 将 QuestDB 的 `WAL` 表视为“写后读”异步模型。成功的 `INSERT` 或 `CREATE TABLE ... AS` 操作并不意味着后续读取能立即看到新增行。

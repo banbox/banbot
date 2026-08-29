@@ -41,6 +41,26 @@ func TestResampleDataSeriesPreservesOHLCVSemantics(t *testing.T) {
 	}
 }
 
+func TestResampleDataSeriesPreservesCustomFields(t *testing.T) {
+	exs := &ExSymbol{ID: 7, Symbol: "BTC/USDT"}
+	first := NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+		Time: 1_700_000_040_000, Open: 10, High: 13, Low: 9, Close: 12, Volume: 2,
+	}, nil, false, true)
+	second := NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+		Time: 1_700_000_100_000, Open: 12, High: 15, Low: 8, Close: 14, Volume: 5,
+	}, nil, false, true)
+	first.Values["signal"] = "buy"
+	second.Values["signal"] = "sell"
+
+	got, _, err := ResampleDataSeries(exs, "2m", []*DataSeries{first, second}, nil, 120_000, 0, 60_000, 0, false)
+	if err != nil {
+		t.Fatalf("ResampleDataSeries returned error: %v", err)
+	}
+	if len(got) != 1 || got[0].Values["signal"] != "sell" {
+		t.Fatalf("custom field was not preserved with last-row semantics: %+v", got)
+	}
+}
+
 func TestResampleDataSeriesIgnoresZeroVolumePrices(t *testing.T) {
 	exs := &ExSymbol{ID: 7, Symbol: "BTC/USDT"}
 	rows := []*DataSeries{

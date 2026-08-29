@@ -759,3 +759,4 @@ OnData: strat.RouteData(strat.DataHandlers{
 7. **旧 Kline 接口只保留在 `TradeStrat` / `StratJob` 的兼容层，不再作为新功能设计基准。**
 8. **所有新接入的第三方时序数据都应先注册 source，再通过 `DataSub + ExSymbol.sid` 接入统一主链路。**
 9. **管理端和 Dashboard 的明细查看统一使用 `/api/kline/series`；该接口只读，不替代数据源的写入与补齐流程。**
+10. **性能优化不得回退 v0.4.3 的任意时序数据和 K 线自定义列能力；`DataSeries.Values` 是必须保留的通用兼容边界。**

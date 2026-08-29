@@ -88,8 +88,7 @@ func allowBacktestKlineDownload(isOpt bool) bool {
 }
 
 func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
-	view, errView := evt.OHLCV(evt.ExSymbol)
-	if errView != nil {
+	if orm.NormalizeSeriesSource(evt.Source) != orm.SeriesSourceKline || !evt.HasOHLCV() {
 		if err := b.Trader.FeedDataSeries(evt); err != nil {
 			log.Error("FeedDataSeries fail", zap.Int32("sid", evt.Sid), zap.Error(err))
 			b.setRunError(err)
@@ -103,7 +102,7 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 		// Enter the next timeframe and trigger the batch entry callback
 		// 进入下一个时间帧，触发批量入场回调
 		btime.CurTimeMS = strat.LastBatchMS
-		waitNum := biz.TryFireBatches(curTime, view.IsWarmUp)
+		waitNum := biz.TryFireBatches(curTime, evt.IsWarmUp)
 		if waitNum > 0 {
 			log.Warn(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
 		}
@@ -113,15 +112,15 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 	if curTime > b.lastTime {
 		b.lastTime = curTime
 		b.TimeNum += 1
-		if !view.IsWarmUp {
+		if !evt.IsWarmUp {
 			core.CheckWallets = true
 		}
 	}
 	if errRun := b.Trader.FeedDataSeries(evt); errRun != nil {
 		if errRun.Code == core.ErrLiquidation {
-			b.onLiquidation(view.Symbol())
+			b.onLiquidation(evt.Symbol())
 		} else {
-			log.Error("FeedDataSeries fail", zap.String("p", view.Symbol()), zap.Error(errRun))
+			log.Error("FeedDataSeries fail", zap.String("p", evt.Symbol()), zap.Error(errRun))
 			b.setRunError(errRun)
 		}
 		return false
@@ -336,28 +335,27 @@ func backtestBootstrapPlan(jobs []*strat.StratJob, tr *config.TimeTuple) (*data.
 }
 
 func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
-	view, err := evt.OHLCV(evt.ExSymbol)
-	if err != nil {
+	if orm.NormalizeSeriesSource(evt.Source) != orm.SeriesSourceKline || !evt.HasOHLCV() {
 		_ = b.BackTestLite.FeedDataSeries(evt)
 		return
 	}
-	if b.shouldCloseHistoricalBoundary(view.Time) {
-		if err := b.closeHistoricalBoundaries(view.Time); err != nil {
+	if b.shouldCloseHistoricalBoundary(evt.TimeMS) {
+		if err := b.closeHistoricalBoundaries(evt.TimeMS); err != nil {
 			b.setRunError(err)
 			return
 		}
 	}
 	curTime := btime.TimeMS()
 	ok := b.BackTestLite.FeedDataSeries(evt)
-	if !view.IsWarmUp && core.CheckWallets {
+	if !evt.IsWarmUp && core.CheckWallets {
 		core.CheckWallets = false
 		odNum := ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)
-		b.logState(view.Time, curTime, odNum)
+		b.logState(evt.TimeMS, curTime, odNum)
 	}
-	if ok && b.nextRefresh > 0 && view.Time >= b.nextRefresh {
+	if ok && b.nextRefresh > 0 && evt.TimeMS >= b.nextRefresh {
 		// 刷新交易对
-		refreshMs := view.Time // 这里bar.Time 可能远大于b.nextRefresh，所以应当用bar.Time
-		b.nextRefresh = b.schedule.Next(time.UnixMilli(view.Time)).UnixMilli()
+		refreshMs := evt.TimeMS // 这里bar.Time 可能远大于b.nextRefresh，所以应当用bar.Time
+		b.nextRefresh = b.schedule.Next(time.UnixMilli(evt.TimeMS)).UnixMilli()
 		btime.CurTimeMS = refreshMs
 		err := RefreshPairJobs(b.dp, !b.isOpt, false, nil)
 		btime.CurTimeMS = curTime
