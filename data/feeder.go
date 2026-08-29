@@ -233,7 +233,7 @@ bars original unweighted K-line
 bars 原始未复权的K线
 */
 func (f *Feeder) onStateOhlcvs(state *PairTFCache, rows []*orm.DataSeries, lastOk bool) []*orm.DataSeries {
-	if !lastOk && len(rows) > 0 && f.coverage != nil &&
+	if !state.physicalOnly && !lastOk && len(rows) > 0 && f.coverage != nil &&
 		!orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, state.TimeFrame, rows[len(rows)-1].TimeMS) {
 		lastOk = true
 	}
@@ -325,6 +325,11 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.Data
 func (f *Feeder) filterHistoricalCoverageRows(timeframe string, rows []*orm.DataSeries) []*orm.DataSeries {
 	if f.coverage == nil {
 		return rows
+	}
+	for _, state := range f.States {
+		if state.TimeFrame == timeframe && state.physicalOnly {
+			return rows
+		}
 	}
 	for index, row := range rows {
 		if orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, timeframe, row.TimeMS) {

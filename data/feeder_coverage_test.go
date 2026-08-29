@@ -138,6 +138,81 @@ func TestFeederHistoricalCoverageRecomputesLastCompletedRow(t *testing.T) {
 	}
 }
 
+func TestFeederPhysicalCoverageOnlyAppliesToInternalPhysicalState(t *testing.T) {
+	const hourMS = int64(60 * 60 * 1000)
+	previousBackTest, previousLive := core.BackTestMode, core.LiveMode
+	previousStrict, previousNoDownload := config.Data.BTStrict, config.Data.BTNoKlineDownload
+	oldTime := btime.CurTimeMS
+	t.Cleanup(func() {
+		core.BackTestMode, core.LiveMode = previousBackTest, previousLive
+		config.Data.BTStrict, config.Data.BTNoKlineDownload = previousStrict, previousNoDownload
+		btime.CurTimeMS = oldTime
+	})
+	core.BackTestMode = true
+	core.LiveMode = false
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+
+	const symbol = "BTC/USDT:USDT"
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 10 * hourMS,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"8h": {{StartMS: 0, StopMS: 10 * hourMS}}},
+		},
+		PhysicalBars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {"1h": {{StartMS: 0, StopMS: 10 * hourMS}}},
+		},
+	}
+
+	t.Run("internal physical state accepts authorized row", func(t *testing.T) {
+		state := &PairTFCache{TimeFrame: "1h", TFSecs: 60 * 60, physicalOnly: true}
+		var called []*orm.DataSeries
+		feeder := &Feeder{
+			ExSymbol: &orm.ExSymbol{Symbol: symbol},
+			States:   []*PairTFCache{state},
+			CallBack: func(evt *orm.DataSeries) { called = append(called, evt) },
+			tfBars:   make(map[string][]*orm.DataSeries),
+			coverage: coverage,
+		}
+		row := &orm.DataSeries{TimeMS: hourMS}
+
+		if rows := feeder.onStateOhlcvs(state, []*orm.DataSeries{row}, true); len(rows) != 1 {
+			t.Fatalf("physical row was filtered: %v", rows)
+		}
+		if state.Latest != row || len(feeder.tfBars["1h"]) != 1 || len(called) != 1 ||
+			called[0].TimeMS != hourMS || called[0].TimeFrame != "1h" {
+			t.Fatalf("physical row did not reach state/cache/callback: state=%#v cache=%v callbacks=%v",
+				state, feeder.tfBars, called)
+		}
+		waiting := &orm.DataSeries{TimeMS: 2 * hourMS}
+		if rows := feeder.onStateOhlcvs(state, []*orm.DataSeries{waiting}, false); len(rows) != 0 ||
+			state.WaitBar != waiting || len(feeder.tfBars["1h"]) != 1 || len(called) != 1 {
+			t.Fatalf("unfinished physical row fired early: rows=%v state=%#v cache=%v callbacks=%v",
+				rows, state, feeder.tfBars, called)
+		}
+	})
+
+	t.Run("explicit state still requires logical coverage", func(t *testing.T) {
+		state := &PairTFCache{TimeFrame: "1h", TFSecs: 60 * 60}
+		var called []*orm.DataSeries
+		feeder := &Feeder{
+			ExSymbol: &orm.ExSymbol{Symbol: symbol},
+			States:   []*PairTFCache{state},
+			CallBack: func(evt *orm.DataSeries) { called = append(called, evt) },
+			tfBars:   make(map[string][]*orm.DataSeries),
+			coverage: coverage,
+		}
+
+		if rows := feeder.onStateOhlcvs(state, []*orm.DataSeries{{TimeMS: hourMS}}, true); len(rows) != 0 {
+			t.Fatalf("explicit row bypassed logical coverage: %v", rows)
+		}
+		if state.Latest != nil || len(feeder.tfBars["1h"]) != 0 || len(called) != 0 {
+			t.Fatalf("rejected row polluted state/cache/callback: state=%#v cache=%v callbacks=%v",
+				state, feeder.tfBars, called)
+		}
+	})
+}
+
 func TestFeederKeepsUnfinishedProvedListingBucketWaiting(t *testing.T) {
 	const hour = int64(60 * 60 * 1000)
 	previousMode, previousData := core.BackTestMode, config.Data
