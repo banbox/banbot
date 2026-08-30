@@ -848,6 +848,9 @@ func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 	if core.EnvReal {
 		return
 	}
+	if !(baseAmount > 0) {
+		return
+	}
 	exs := orm.GetSymbolByID(int32(od.Sid))
 	if exs == nil {
 		panic(fmt.Sprintf("EnterOd invalid sid of order: %v", od.Sid))
@@ -867,6 +870,10 @@ func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 		// For spot multiple orders, sell from the available value of the base, calculate the available value of the quote, and cancel it from the pending unfilled part of the quote.
 		// 现货多单，从base的available卖，计算到quote的available，从quote的pending未成交部分取消
 		wallet := w.Get(baseCode)
+		if wallet.Available <= 0 {
+			w.Cancel(od.Key(), quoteCode, 0, true)
+			return
+		}
 
 		if wallet.Available > 0 && wallet.Available < baseAmount || math.Abs(wallet.Available/baseAmount-1) <= 0.01 {
 			baseAmount = wallet.Available
