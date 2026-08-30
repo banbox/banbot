@@ -1153,7 +1153,7 @@ func TestStrictBacktestRejectsEveryPublicKlineDownloadEntry(t *testing.T) {
 func TestStrictFastBulkAllowsAuditedDatabaseReadPath(t *testing.T) {
 	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
 	core.BackTestMode = true
-	config.Data = config.Config{BTNoKlineDownload: true}
+	config.Data = config.Config{BTStrict: true, BTNoKlineDownload: true}
 	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
 		BaselineEndMS: 1000,
 		Bars: map[string]map[string][]config.HistoricalCoverageRange{
@@ -1166,6 +1166,21 @@ func TestStrictFastBulkAllowsAuditedDatabaseReadPath(t *testing.T) {
 
 	if err := FastBulkOHLCV(nil, nil, "1h", 100, 500, 0, nil); err != nil {
 		t.Fatalf("audited local FastBulk read was rejected: %v", err)
+	}
+}
+
+func TestFastBulkRejectsCoverageOutsideStrictHistoricalReplay(t *testing.T) {
+	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
+	core.BackTestMode = true
+	config.Data = config.Config{BTNoKlineDownload: true}
+	config.HistoricalCoverage = &config.HistoricalCoverageConfig{}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.HistoricalCoverage = previousMode, previousData, previousCoverage
+	})
+
+	err := FastBulkOHLCV(nil, nil, "1h", 100, 500, 0, nil)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "download is disabled") {
+		t.Fatalf("non-strict FastBulk coverage bypass error=%v", err)
 	}
 }
 

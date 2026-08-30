@@ -864,7 +864,7 @@ For combination varieties, return the unweighted candlestick and the weighting f
 func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame string,
 	startMS, endMS int64, limit int, handler func(string, string, []*banexg.Kline, []*AdjInfo)) *errs.Error {
 	canDownload := allowImplicitKlineDownload()
-	if !canDownload && (!core.BackTestMode || config.HistoricalCoverage == nil) {
+	if !canDownload && !config.StrictHistoricalReplay(config.HistoricalCoverage) {
 		return klineDownloadDisabledError("FastBulkOHLCV")
 	}
 	var exsMap, err = MapExSymbols(exchange, symbols)

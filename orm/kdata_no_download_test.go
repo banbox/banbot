@@ -53,13 +53,18 @@ func TestFastBulkOHLCVNoDownloadStillReadsLocalRows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oldBacktest := core.BackTestMode
-	oldNoDownload := config.Data.BTNoKlineDownload
+	oldBacktest, oldData, oldCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
 	core.BackTestMode = true
+	config.Data.BTStrict = true
 	config.Data.BTNoKlineDownload = true
+	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
+		BaselineEndMS: startMS + 60_000,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: {tf: {{StartMS: startMS, StopMS: startMS + 60_000}}},
+		},
+	}
 	defer func() {
-		core.BackTestMode = oldBacktest
-		config.Data.BTNoKlineDownload = oldNoDownload
+		core.BackTestMode, config.Data, config.HistoricalCoverage = oldBacktest, oldData, oldCoverage
 	}()
 	var got []*banexg.Kline
 	err = FastBulkOHLCV(exchange, []string{symbol}, tf, startMS, startMS+60_000, 0,

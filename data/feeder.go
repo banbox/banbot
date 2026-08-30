@@ -559,7 +559,7 @@ func NewSeriesFeeder(exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*S
 	if err != nil {
 		return nil, err
 	}
-	coverage := historicalCoverageForFeeder(exs.Symbol, core.BackTestMode)
+	coverage := historicalCoverageForFeeder(exs.Symbol)
 	return &SeriesFeeder{
 		Feeder: Feeder{
 			ExSymbol: exs,
@@ -573,8 +573,8 @@ func NewSeriesFeeder(exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*S
 	}, nil
 }
 
-func historicalCoverageForFeeder(symbol string, backtest bool) *config.HistoricalCoverageConfig {
-	if !backtest {
+func historicalCoverageForFeeder(symbol string) *config.HistoricalCoverageConfig {
+	if !config.StrictHistoricalReplay(config.HistoricalCoverage) {
 		return nil
 	}
 	return config.HistoricalCoverageFor(symbol)
