@@ -121,16 +121,6 @@ func CalcPairTfScores(exchange banexg.BanExchange, pairs []string) (map[string]m
 	if len(allowTfs) == 0 {
 		return pairTfScores, errs.NewMsg(core.ErrBadConfig, "run_timeframes is required in config")
 	}
-	if config.IsFrozenStaticPairs(pairs) {
-		for _, pair := range pairs {
-			tfScores := make(map[string]float64, len(allowTfs))
-			for _, tf := range allowTfs {
-				tfScores[tf] = 1
-			}
-			pairTfScores[pair] = tfScores
-		}
-		return pairTfScores, nil
-	}
 	wsModeTf := ""
 	for _, v := range allowTfs {
 		tfSecs := utils2.TFToSecs(v)

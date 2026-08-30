@@ -7,7 +7,7 @@ import (
 	"github.com/banbox/banbot/core"
 )
 
-func TestCalcPairTfScoresSkipsDiscoveryForFrozenStaticPairs(t *testing.T) {
+func TestCalcPairTfScoresDoesNotSkipDiscoveryForFrozenStaticPairs(t *testing.T) {
 	oldMode, oldData := core.BackTestMode, config.Data
 	oldTimeframes, oldPolicies := config.RunTimeframes, config.RunPolicy
 	oldFilters, oldPairMgr := config.PairFilters, config.PairMgr
@@ -25,16 +25,10 @@ func TestCalcPairTfScoresSkipsDiscoveryForFrozenStaticPairs(t *testing.T) {
 	config.PairFilters = nil
 	config.PairMgr = &config.PairMgrConfig{}
 
-	// A nil exchange proves the strict static-pair path does not call the
-	// K-line discovery callback.
-	scores, err := CalcPairTfScores(nil, []string{"BTC/USDT:USDT", "ETH/USDT:USDT"})
-	if err != nil {
-		t.Fatalf("CalcPairTfScores returned error: %v", err)
-	}
-	for _, pair := range []string{"BTC/USDT:USDT", "ETH/USDT:USDT"} {
-		if len(scores[pair]) != 2 || scores[pair]["15m"] != 1 || scores[pair]["1h"] != 1 {
-			t.Fatalf("scores[%q] = %#v", pair, scores[pair])
-		}
+	// A nil exchange proves strict static pairs still reach K-line discovery.
+	_, err := CalcPairTfScores(nil, []string{"BTC/USDT:USDT", "ETH/USDT:USDT"})
+	if err == nil {
+		t.Fatal("CalcPairTfScores unexpectedly skipped K-line discovery")
 	}
 }
 
