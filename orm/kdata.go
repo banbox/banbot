@@ -235,19 +235,6 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		return 0, NewDbErr(core.ErrDbReadFail, err_)
 	}
 	missing := subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered)
-	if len(missing) > 0 && IsQuestDB {
-		// sranges can retain stale hole markers after an interrupted run. Rebuild
-		// the requested window from physical bars before asking the exchange for data.
-		if present, repairErr := sess.reconcileKlineRangeFromPhysical(exs.ID, timeFrame, startMS, endMS); repairErr != nil {
-			return 0, repairErr
-		} else if present {
-			covered, err_ = sess.getCoveredRanges(context.Background(), exs.ID, "kline_"+timeFrame, timeFrame, startMS, endMS)
-			if err_ != nil {
-				return 0, NewDbErr(core.ErrDbReadFail, err_)
-			}
-			missing = subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered)
-		}
-	}
 	if len(missing) == 0 {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
@@ -477,26 +464,13 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		}
 		if outErr == nil && IsQuestDB {
 			if waitErr := waitForQuestKlineCoverageVisible(context.Background(), sess, exs.ID, timeFrame, realStart, realEnd+tfMSecs); waitErr != nil {
-				if waitErr.Code != core.ErrTimeout {
-					clearInsJob = false
-					outErr = waitErr
-				} else {
-					// The physical rows passed the timestamp visibility check above.
-					// Reconcile their actual coverage below instead of aborting when
-					// only sranges_q is still waiting on QuestDB WAL.
-					log.Warn("questdb kline coverage visibility delayed; reconcile from physical rows",
-						zap.Int32("sid", exs.ID), zap.String("tf", timeFrame),
-						zap.Int64("start", realStart), zap.Int64("end", realEnd+tfMSecs),
-						zap.Error(waitErr))
-				}
+				clearInsJob = false
+				outErr = waitErr
 			}
 		}
 	}
 	if outErr == nil {
-		outErr = reconcileDownloadedRanges(succDown, func(item MSRange) *errs.Error {
-			if holeErr := sess.repairKlineRangeFromPhysical(exs.ID, timeFrame, item.Start, item.Stop); holeErr != nil {
-				return holeErr
-			}
+		outErr = updateDownloadedRanges(succDown, func(item MSRange) *errs.Error {
 			return sess.updateBigHyper(exs, timeFrame, item.Start, item.Stop)
 		})
 		if outErr != nil {
@@ -506,9 +480,9 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	return saveNum, outErr
 }
 
-func reconcileDownloadedRanges(ranges []MSRange, reconcile func(MSRange) *errs.Error) *errs.Error {
+func updateDownloadedRanges(ranges []MSRange, update func(MSRange) *errs.Error) *errs.Error {
 	for _, item := range ranges {
-		if err := reconcile(item); err != nil {
+		if err := update(item); err != nil {
 			return err
 		}
 	}
