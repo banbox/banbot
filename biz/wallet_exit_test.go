@@ -1,6 +1,7 @@
 package biz
 
 import (
+	"math"
 	"testing"
 
 	"github.com/banbox/banbot/core"
@@ -72,5 +73,47 @@ func TestExitOdPreservesPositiveSpotPartialExit(t *testing.T) {
 	}
 	if got := base.Pendings[od.Key()]; got != 1 {
 		t.Fatalf("pending exit amount = %v, want 1", got)
+	}
+}
+
+func TestConfirmOdExitUsesNetSpotBaseAfterEntryFee(t *testing.T) {
+	oldEnvReal, oldIsContract := core.EnvReal, core.IsContract
+	core.EnvReal = false
+	core.IsContract = false
+	t.Cleanup(func() {
+		core.EnvReal = oldEnvReal
+		core.IsContract = oldIsContract
+	})
+
+	const symbol = "BASEFEE/USDT"
+	restoreSymbols, err := orm.InstallFrozenExSymbols([]*orm.ExSymbol{{
+		ID: 900003, Exchange: "binance", Market: banexg.MarketSpot, Symbol: symbol,
+	}})
+	if err != nil {
+		t.Fatalf("install test symbol: %v", err)
+	}
+	t.Cleanup(restoreSymbols)
+
+	od := &ormo.InOutOrder{
+		IOrder: &ormo.IOrder{ID: 3, Sid: 900003, Symbol: symbol, EnterAt: 1},
+		Enter:  &ormo.ExOrder{Enter: true, Amount: 100, Filled: 100, Average: 100, FeeQuote: 10, FeeType: "BASEFEE"},
+		Exit:   &ormo.ExOrder{Amount: 100, Filled: 100, Average: 110, FeeQuote: 11, FeeType: "USDT"},
+	}
+	quote := &ItemWallet{Coin: "USDT", Available: 10000, Pendings: map[string]float64{}, Frozens: map[string]float64{}}
+	base := &ItemWallet{Coin: "BASEFEE", Pendings: map[string]float64{}, Frozens: map[string]float64{}}
+	wallets := &BanWallets{Items: map[string]*ItemWallet{"BASEFEE": base, "USDT": quote}}
+
+	if _, err := wallets.CostAva(od.Key(), "USDT", 10000, false, 0); err != nil {
+		t.Fatalf("lock entry quote: %v", err)
+	}
+	wallets.ConfirmOdEnter(od, 100)
+	wallets.ExitOd(od, od.Exit.Filled)
+	wallets.ConfirmOdExit(od, 110)
+
+	if got := base.Available; math.Abs(got) > 1e-12 || len(base.Pendings) != 0 {
+		t.Fatalf("base balance after exit = %.12f, pending=%v; want zero", got, base.Pendings)
+	}
+	if got := quote.Available; math.Abs(got-10978) > 1e-9 {
+		t.Fatalf("quote balance after exit = %.12f, want 10978", got)
 	}
 }

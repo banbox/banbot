@@ -11,6 +11,7 @@ import (
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
@@ -101,6 +102,25 @@ func TestBacktestCleanupUsesLastHistoricalPrice(t *testing.T) {
 	}
 	if affected != 1 || od.Status != ormo.InOutStatusFullExit || od.Exit.Average != lastPrice {
 		t.Fatalf("stale historical price not used: affected=%d status=%d price=%v", affected, od.Status, od.Exit.Average)
+	}
+}
+
+func TestBacktestExitAndFillUsesLastHistoricalPrice(t *testing.T) {
+	mgr := setupLocalCleanupTest(t, true, true)
+	const symbol = "HIFI-ROTATION/USDT:USDT"
+	const lastPrice = 0.42
+	btime.CurTimeMS = 1_700_000_000_000
+	com.SetBarPrice(symbol, lastPrice)
+	btime.CurTimeMS += com.Day10MSecs + 1
+	od := cleanupPendingExit(1, symbol)
+	od.ExitTag = ""
+	od.Exit = nil
+
+	if err := mgr.ExitAndFill([]*ormo.InOutOrder{od}, &strat.ExitReq{Tag: core.ExitTagPairDel}); err != nil {
+		t.Fatalf("fill rotation order: %v", err)
+	}
+	if od.Status != ormo.InOutStatusFullExit || od.Exit.Average != lastPrice {
+		t.Fatalf("stale historical price not used: status=%d price=%v", od.Status, od.Exit.Average)
 	}
 }
 

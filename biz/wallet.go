@@ -928,8 +928,19 @@ func (w *BanWallets) ConfirmOdExit(od *ormo.InOutOrder, exitPrice float64) {
 	} else {
 		//For long orders, sell from the base's availability and exchange it for the quote's availability.
 		//多单，从base的avaiable卖，兑换为quote的available
-		quoteAmount := exitPrice*subOd.Amount - curFee
-		w.ConfirmPending(odKey, baseCode, subOd.Amount, quoteCode, quoteAmount, false)
+		baseAmount := subOd.Amount
+		// Entry fees may have been charged in base, so ExitOd can only lock the
+		// net amount actually received. Settle the pending amount instead of
+		// creating a negative base balance and crediting proceeds for unsold dust.
+		if baseWallet, ok := w.Items[baseCode]; ok {
+			baseWallet.lock.Lock()
+			if pendingAmount, exists := baseWallet.Pendings[odKey]; exists && pendingAmount > 0 {
+				baseAmount = pendingAmount
+			}
+			baseWallet.lock.Unlock()
+		}
+		quoteAmount := exitPrice*baseAmount - curFee
+		w.ConfirmPending(odKey, baseCode, baseAmount, quoteCode, quoteAmount, false)
 	}
 }
 func (w *BanWallets) CutPart(srcKey string, tgtKey string, symbol string, rate float64) {

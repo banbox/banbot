@@ -1,6 +1,10 @@
 package opt
 
 import (
+	"bytes"
+	"encoding/json"
+	"math"
+	"os"
 	"strconv"
 	"testing"
 
@@ -166,6 +170,112 @@ func TestReportReplayOrderMakesConstrainedAdmissionDeterministic(t *testing.T) {
 		}
 		if input[0].ID != inputIDs[0] || input[1].ID != inputIDs[1] || input[2].ID != inputIDs[2] {
 			t.Fatalf("reportReplayOrder modified input %v", inputIDs)
+		}
+	}
+}
+
+func TestCalcGroupEndProfitsUsesExitTimeAndFinalOrderProfit(t *testing.T) {
+	const startMS = int64(1700000000000)
+	orders := []*ormo.InOutOrder{
+		reportTestOrder(1, startMS, startMS+6000, "zone1", 10),
+		reportTestOrder(3, startMS+2000, startMS+8000, "zone1", 4),
+		reportTestOrder(2, startMS+1000, startMS+2000, "zone1", -3),
+		reportTestOrder(5, startMS+700, startMS+4000, "zone2", -2),
+		reportTestOrder(4, startMS+500, startMS+4000, "zone2", 5),
+	}
+
+	labels, datasets := CalcGroupEndProfits(orders, func(o *ormo.InOutOrder) string {
+		return o.EnterTag
+	}, 4)
+	if len(labels) != 5 {
+		t.Fatalf("labels = %d, want 5", len(labels))
+	}
+	if len(datasets) != 2 {
+		t.Fatalf("datasets = %d, want 2", len(datasets))
+	}
+	assertReportCurve(t, datasets[0], "zone1", []float64{0, -3, -3, 7, 11})
+	assertReportCurve(t, datasets[1], "zone2", []float64{0, 0, 3, 3, 3})
+
+	if orders[0].ID != 1 || orders[1].ID != 3 || orders[2].ID != 2 {
+		t.Fatalf("CalcGroupEndProfits modified input order sequence")
+	}
+}
+
+func TestCalcGroupEndProfitsIncludesAllProfitsAtFinalLabel(t *testing.T) {
+	const startMS = int64(1700000000000)
+	orders := []*ormo.InOutOrder{
+		reportTestOrder(2, startMS+1000, startMS+3000, "zone", -7),
+		reportTestOrder(1, startMS, startMS+9000, "zone", 12),
+	}
+
+	labels, datasets := CalcGroupEndProfits(orders, func(o *ormo.InOutOrder) string {
+		return o.EnterTag
+	}, 3)
+	if len(labels) != 4 {
+		t.Fatalf("labels = %d, want 4", len(labels))
+	}
+	assertReportCurve(t, datasets[0], "zone", []float64{0, -7, -7, 5})
+}
+
+func TestDumpEnterTagCumProfitsPreservesFourDigitValues(t *testing.T) {
+	const startMS = int64(1700000000000)
+	path := t.TempDir() + "/enters.html"
+	if err := DumpEnterTagCumProfits(path, []*ormo.InOutOrder{
+		reportTestOrder(1, startMS, startMS+6000, "zone3", -1028.988866),
+	}, 1); err != nil {
+		t.Fatalf("DumpEnterTagCumProfits failed: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated chart: %v", err)
+	}
+	const marker = "var chartData = "
+	start := bytes.Index(data, []byte(marker))
+	if start < 0 {
+		t.Fatal("generated chart does not contain chartData")
+	}
+	data = data[start+len(marker):]
+	end := bytes.IndexByte(data, '\n')
+	if end < 0 {
+		t.Fatal("generated chart chartData is not line terminated")
+	}
+	var chart Chart
+	if err := json.Unmarshal(data[:end], &chart); err != nil {
+		t.Fatalf("decode generated chart data: %v", err)
+	}
+	if len(chart.Datasets) != 1 || len(chart.Datasets[0].Data) != 2 {
+		t.Fatalf("generated datasets = %#v, want one two-point dataset", chart.Datasets)
+	}
+	if math.Abs(chart.Datasets[0].Data[1]+1029) > 1e-9 {
+		t.Fatalf("serialized final value = %v, want -1029 (not the old -100)", chart.Datasets[0].Data[1])
+	}
+}
+
+func reportTestOrder(id int64, enterMS, exitMS int64, tag string, profit float64) *ormo.InOutOrder {
+	return &ormo.InOutOrder{
+		IOrder: &ormo.IOrder{
+			ID:       id,
+			EnterAt:  enterMS,
+			ExitAt:   exitMS,
+			EnterTag: tag,
+			Profit:   profit,
+		},
+		Enter: &ormo.ExOrder{UpdateAt: enterMS},
+		Exit:  &ormo.ExOrder{UpdateAt: exitMS},
+	}
+}
+
+func assertReportCurve(t *testing.T, dataset *ChartDs, wantLabel string, want []float64) {
+	t.Helper()
+	if dataset.Label != wantLabel {
+		t.Fatalf("dataset label = %q, want %q", dataset.Label, wantLabel)
+	}
+	if len(dataset.Data) != len(want) {
+		t.Fatalf("%s data length = %d, want %d", dataset.Label, len(dataset.Data), len(want))
+	}
+	for i, wantVal := range want {
+		if math.Abs(dataset.Data[i]-wantVal) > 1e-9 {
+			t.Fatalf("%s data[%d] = %v, want %v", dataset.Label, i, dataset.Data[i], wantVal)
 		}
 	}
 }

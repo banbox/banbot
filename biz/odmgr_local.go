@@ -673,7 +673,15 @@ func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitRe
 	}
 	timeMS := btime.TimeMS()
 	for _, od := range orders {
-		price := com.GetPriceExp(od.Symbol, "", com.Day10MSecs)
+		var price float64
+		if core.BackTestMode {
+			price = com.GetLastBarPrice(od.Symbol)
+		} else {
+			price = com.GetPriceExp(od.Symbol, "", com.Day10MSecs)
+		}
+		if price < 0 {
+			return errs.NewMsg(core.ErrRunTime, "no historical price for %s", od.Symbol)
+		}
 		err := o.fillPendingExit(od, price, timeMS)
 		if err != nil {
 			return err
