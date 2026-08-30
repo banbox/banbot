@@ -1084,6 +1084,7 @@ func (i *ExOrder) saveUpdate(sess *Queries) *errs.Error {
 }
 
 func (i *ExOrder) CutPart(rate float64, fill bool) *ExOrder {
+	filled := i.Filled
 	part := &ExOrder{
 		TaskID:    i.TaskID,
 		Symbol:    i.Symbol,
@@ -1095,8 +1096,6 @@ func (i *ExOrder) CutPart(rate float64, fill bool) *ExOrder {
 		Price:     i.Price,
 		Average:   i.Average,
 		Amount:    i.Amount * rate,
-		Fee:       i.Fee,
-		FeeQuote:  i.FeeQuote,
 		FeeType:   i.FeeType,
 		UpdateAt:  i.UpdateAt,
 	}
@@ -1112,6 +1111,13 @@ func (i *ExOrder) CutPart(rate float64, fill bool) *ExOrder {
 	} else if i.Filled > i.Amount {
 		part.Filled = i.Filled - i.Amount
 		i.Filled = i.Amount
+	}
+	if filled > 0 {
+		feeRate := part.Filled / filled
+		part.Fee = i.Fee * feeRate
+		part.FeeQuote = i.FeeQuote * feeRate
+		i.Fee -= part.Fee
+		i.FeeQuote -= part.FeeQuote
 	}
 	if part.Filled >= part.Amount {
 		part.Status = OdStatusClosed
