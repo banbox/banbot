@@ -173,7 +173,7 @@ func TestInspectIncludesFrameworkPairListAndScoreKlines(t *testing.T) {
 	}
 }
 
-func TestInspectSkipsFrameworkKlinesForStrictFrozenPairs(t *testing.T) {
+func TestInspectIncludesFrameworkScoresForStrictFrozenPairs(t *testing.T) {
 	const strategyName = "runtime_plan_frozen_pairs_fixture"
 	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{RunTimeFrames: []string{"8h"}, WarmupNum: 20}
@@ -190,9 +190,23 @@ func TestInspectSkipsFrameworkKlinesForStrictFrozenPairs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	want := map[string]bool{
+		"BTC/USDT:USDT\x008h": false,
+		"ETH/USDT:USDT\x008h": false,
+	}
 	for _, requirement := range output.Requirements {
-		if requirement.PolicyID == "__framework__" {
-			t.Fatalf("strict frozen pairs unexpectedly require framework K-lines: %+v", requirement)
+		if requirement.PolicyID != "__framework__" || requirement.Reason != "pair_score" {
+			continue
+		}
+		key := requirement.JobSymbol + "\x00" + requirement.Timeframe
+		if _, ok := want[key]; !ok || requirement.WarmupBars != 600 {
+			t.Fatalf("unexpected strict frozen score requirement: %+v", requirement)
+		}
+		want[key] = true
+	}
+	for key, seen := range want {
+		if !seen {
+			t.Fatalf("missing strict frozen score requirement %s", key)
 		}
 	}
 }

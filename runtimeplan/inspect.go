@@ -258,15 +258,16 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 	frameworkPairListSymbols := slices.Clone(req.InitialSymbols)
 	if frozenStaticPairs {
 		// Strict replay already binds the static universe and forbids downloads.
-		// The live pair-list/score discovery path must not add requirements that
-		// the replay runtime will never read.
+		// The static pair-list path does not read its one-bar discovery input.
 		frameworkPairListSymbols = nil
 	}
 	for _, policy := range config.RunPolicy {
 		frameworkPairListSymbols = append(frameworkPairListSymbols, policy.Pairs...)
 	}
 	frameworkPairListSymbols = stableUniqueStrings(frameworkPairListSymbols)
-	frameworkPairScoreSymbols := slices.Clone(frameworkPairListSymbols)
+	// CalcPairTfScores still evaluates the frozen symbols in strict replay. Keep
+	// the 600-bar score requirements even when pair-list discovery is skipped.
+	frameworkPairScoreSymbols := slices.Clone(req.InitialSymbols)
 
 	for _, policy := range config.RunPolicy {
 		policyID := policy.ID()
@@ -309,9 +310,7 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 			validSelected = append(validSelected, symbol)
 		}
 		selected = validSelected
-		if !frozenStaticPairs {
-			frameworkPairScoreSymbols = append(frameworkPairScoreSymbols, selected...)
-		}
+		frameworkPairScoreSymbols = append(frameworkPairScoreSymbols, selected...)
 		maxPair, maxPairErr := effectivePolicyMaxPair(policy, cfg)
 		if maxPairErr != "" {
 			plan.Unsupported = append(plan.Unsupported, unsupported("invalid_max_pair", policyID, "", "", maxPairErr))
