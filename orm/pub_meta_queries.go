@@ -2,10 +2,13 @@ package orm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
@@ -429,67 +432,605 @@ ORDER BY sid`, exchange)
 }
 
 func (q *Queries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64, error) {
-	if len(arg) == 0 {
-		return 0, nil
+	return q.addSymbols(ctx, loadDefaultSymbolState(), true, arg)
+}
+
+func (q *SymbolQueries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64, error) {
+	if q == nil {
+		return 0, errs.NewMsg(core.ErrBadConfig, "symbol query is required")
+	}
+	return q.Queries.addSymbols(ctx, q.symbolState(), q.symbols == nil, arg)
+}
+
+func (q *Queries) addSymbols(ctx context.Context, state *SymbolState, legacy bool, arg []AddSymbolsParams) (int64, error) {
+	state = symbolStateOrDefault(state)
+	allocator := state.sidAllocator()
+	unlockEnsure := allocator.lockEnsure()
+	defer unlockEnsure()
+	return q.addSymbolsLocked(ctx, state, legacy, arg)
+}
+
+func (q *Queries) addSymbolsLocked(ctx context.Context, state *SymbolState, legacy bool, arg []AddSymbolsParams) (result int64, retErr error) {
+	allocator := state.sidAllocator()
+	if state.identitySet {
+		for i, item := range arg {
+			if !state.acceptsIdentity(item.Exchange, item.Market) {
+				return 0, fmt.Errorf("add symbol %d identity %s:%s does not match symbol state identity %s:%s",
+					i, item.Exchange, item.Market, state.identityExchange, state.identityMarket)
+			}
+		}
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if IsQuestDB {
+		registry, registryErr := allocator.configuredSIDRegistry()
+		if registryErr != nil {
+			return 0, registryErr
+		}
+		if registry != nil {
+			return q.addSymbolsQuestDBWithRegistry(ctx, state, legacy, arg, registry)
+		}
+	}
+	if len(arg) == 0 && !IsQuestDB {
+		return 0, nil
+	}
+	var err error
+	var recoveryRoot string
+	if IsQuestDB {
+		recoveryRoot, err = exSymbolRecoveryRoot(state, legacy)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if IsQuestDB {
+		releaseSIDLease, leaseErr := acquireLocalSIDReservationLease(ctx, allocator)
+		if leaseErr != nil {
+			return 0, leaseErr
+		}
+		defer func() {
+			if releaseErr := releaseSIDLease(); releaseErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("release exchange symbol SID lease: %w", releaseErr))
+			}
+		}()
+	}
 	if !IsQuestDB {
-		return q.addSymbolsPg(ctx, arg)
+		if err := state.reserveCanonicalSIDs(allocator); err != nil {
+			return 0, err
+		}
+		newArg, pendingRows, err := reuseReservedAddSymbols(state, allocator, arg)
+		if err != nil {
+			return 0, err
+		}
+		if len(pendingRows) > 0 {
+			return 0, fmt.Errorf("pending exchange symbol SID reservations require QuestDB visibility")
+		}
+		if len(newArg) == 0 {
+			return int64(len(arg)), nil
+		}
+		result, err := q.addSymbolsPg(ctx, state, newArg)
+		if err != nil {
+			return result, err
+		}
+		return int64(len(arg)), nil
 	}
-	unlock := LockCompactTableRead("exsymbol_q")
-	defer unlock()
-	if latest := queryMaxSidFromQDB(ctx, q.db); latest > maxSid {
-		maxSid = latest
+	unlock, lockErr := lockCompactTableReadExclusiveProcessAtRoot(ctx, "exsymbol_q", compactProcessLockRootForAllocator(allocator))
+	if lockErr != nil {
+		return 0, lockErr
 	}
+	defer func() {
+		if releaseErr := unlock(); releaseErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("release exsymbol table lease: %w", releaseErr))
+		}
+	}()
+	if err := reconcileSharedSIDReservations(ctx, q, state, allocator); err != nil {
+		return 0, err
+	}
+	for _, root := range recoveryRootsForAllocator(allocator, recoveryRoot) {
+		if err := reconcilePendingExSymbolMarkersLocked(ctx, q, state, root); err != nil {
+			return 0, err
+		}
+	}
+	if err := state.reserveCanonicalSIDs(allocator); err != nil {
+		return 0, err
+	}
+	newArg, pendingRows, err := reuseReservedAddSymbols(state, allocator, arg)
+	if err != nil {
+		return 0, err
+	}
+	if len(pendingRows) > 0 {
+		sharedMarkerPath, markerPath, markerErr := ensurePendingExSymbolMarkers(
+			allocator, recoveryRoot, pendingRows)
+		if markerErr != nil {
+			return 0, markerErr
+		}
+		visible, visibleErr := questExsymbolsVisible(ctx, q, pendingRows)
+		if visibleErr != nil {
+			return int64(len(arg)), visibleErr
+		}
+		if !visible {
+			ids := make([]int32, len(pendingRows))
+			for i, row := range pendingRows {
+				ids[i] = row.ID
+			}
+			log.Warn("questdb pending exsymbol rows still not visible after timeout; retain recovery marker",
+				zap.Int32s("sids", ids), zap.String("marker", markerPath), zap.String("shared_marker", sharedMarkerPath))
+			return int64(len(arg)), errs.NewMsg(core.ErrTimeout,
+				"questdb exsymbol rows not visible before timeout: sids=%v", ids)
+		}
+		if err := reconcileSharedSIDReservations(ctx, q, state, allocator); err != nil {
+			return int64(len(arg)), err
+		}
+		for _, root := range recoveryRootsForAllocator(allocator, recoveryRoot) {
+			if err := reconcilePendingExSymbolMarkersLocked(ctx, q, state, root); err != nil {
+				return int64(len(arg)), err
+			}
+		}
+		for _, row := range pendingRows {
+			key := exSymbolKey(row.Exchange, row.Market, row.Symbol)
+			if allocator.pendingSID(key) != 0 {
+				return int64(len(arg)), fmt.Errorf("visible exsymbol SID %d remained pending for logical symbol %s", row.ID, key)
+			}
+		}
+	}
+	newArg, err = reuseQuestDBCanonicalSymbols(ctx, q, state, newArg)
+	if err != nil {
+		return 0, err
+	}
+	if len(newArg) == 0 {
+		return int64(len(arg)), nil
+	}
+	dbMax, err := queryMaxSidFromQDB(ctx, q.db)
+	if err != nil {
+		return 0, err
+	}
+	prepareSymbolSIDAllocation(allocator, state, dbMax)
 	now := time.Now().UTC()
-	lastSID := maxSid
-	var lastSymbol AddSymbolsParams
-	for i, s := range arg {
-		maxSid++
-		sid := maxSid
-		lastSID = sid
-		lastSymbol = s
-		ts := now.Add(time.Duration(i) * time.Microsecond)
+	ids := make([]int32, len(newArg))
+	for i := range newArg {
+		key := exSymbolKey(newArg[i].Exchange, newArg[i].Market, newArg[i].Symbol)
+		if pendingID := allocator.pendingSID(key); pendingID > 0 {
+			ids[i] = pendingID
+		} else {
+			ids[i] = nextSymbolSID(allocator, state)
+		}
+	}
+	pendingRows = pendingExSymbolRows(newArg, ids)
+	for i := range pendingRows {
+		pendingRows[i].WriteTS = now.Add(time.Duration(i) * time.Microsecond)
+	}
+	sharedMarkerPath, markerPath, err := ensurePendingExSymbolMarkers(allocator, recoveryRoot, pendingRows)
+	if err != nil {
+		return 0, err
+	}
+	for i, s := range newArg {
+		sid := ids[i]
+		ts := pendingRows[i].WriteTS
 		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules, is_deleted)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`, sid, ts, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs, s.AggRules)
 		if err != nil {
 			return int64(i), err
 		}
-		cacheExSymbol(makeExSymbolFromAdd(sid, s))
+		if err := markPendingExSymbolRowInserted(markerPath, pendingRows[i]); err != nil {
+			return int64(i + 1), err
+		}
+		if err := markPendingExSymbolRowInserted(sharedMarkerPath, pendingRows[i]); err != nil {
+			return int64(i + 1), err
+		}
 	}
-	// QuestDB WAL commits are async. The caller already has canonical in-process
-	// state from cacheExSymbol, so visibility lag is informational rather than fatal.
-	visible, err := questExsymbolVisible(ctx, q, lastSID)
+	visible, err := questExsymbolsVisible(ctx, q, pendingRows)
 	if err != nil {
-		return int64(len(arg)), err
+		return int64(len(newArg)), err
 	}
 	if !visible {
-		log.Warn("questdb exsymbol row still not visible after timeout; continue with cached symbol state",
-			zap.Int32("sid", lastSID),
-			zap.String("exchange", lastSymbol.Exchange),
-			zap.String("market", lastSymbol.Market),
-			zap.String("symbol", lastSymbol.Symbol))
+		log.Warn("questdb exsymbol rows still not visible after timeout; retain recovery marker",
+			zap.Int32s("sids", ids), zap.String("marker", markerPath), zap.String("shared_marker", sharedMarkerPath))
+		return int64(len(arg)), errs.NewMsg(core.ErrTimeout,
+			"questdb exsymbol rows not visible before timeout: sids=%v", ids)
+	}
+	if err := cacheConfirmedQuestExSymbols(ctx, q, state, allocator, pendingRows); err != nil {
+		return int64(len(arg)), err
+	}
+	if err := removePendingExSymbolMarkerRows(markerPath, pendingRows); err != nil {
+		// Keep the marker when cleanup fails. A later recovery pass can safely
+		// re-check the rows and remove it.
+		return int64(len(arg)), err
+	}
+	if err := removeSharedSIDReservations(allocator, pendingRows); err != nil {
+		// The QuestDB row is confirmed, but retain the shared ledger when its
+		// durable cleanup fails so another writer can reconcile it safely.
+		return int64(len(arg)), err
 	}
 	return int64(len(arg)), nil
 }
 
-func queryMaxSidFromQDB(ctx context.Context, db DBTX) int32 {
+// addSymbolsQuestDBWithRegistry keeps QuestDB as the physical catalog while a
+// shared PostgreSQL registry owns logical identity. The registry operation is
+// atomic; the QuestDB write remains a recoverable second phase because WAL has
+// asynchronous visibility and no cross-database transaction exists.
+func (q *Queries) addSymbolsQuestDBWithRegistry(ctx context.Context, state *SymbolState, legacy bool,
+	arg []AddSymbolsParams, registry *SymbolSIDRegistry) (result int64, retErr error) {
+	recoveryRoot, err := exSymbolRecoveryRoot(state, legacy)
+	if err != nil {
+		return 0, err
+	}
+	allocator := state.sidAllocator()
+	unlock, err := lockCompactTableReadExclusiveProcessAtRoot(ctx, "exsymbol_q", compactProcessLockRootForAllocator(allocator))
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if releaseErr := unlock(); releaseErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("release exsymbol table lease: %w", releaseErr))
+		}
+	}()
+	if err := reconcileSharedSIDReservations(ctx, q, state, allocator); err != nil {
+		return 0, err
+	}
+	for _, root := range recoveryRootsForAllocator(allocator, recoveryRoot) {
+		if err := reconcilePendingExSymbolMarkersLocked(ctx, q, state, root); err != nil {
+			return 0, err
+		}
+	}
+	if err := state.reserveCanonicalSIDs(allocator); err != nil {
+		return 0, err
+	}
+	newArg, pendingRows, err := reuseReservedAddSymbols(state, allocator, arg)
+	if err != nil {
+		return 0, err
+	}
+	if len(pendingRows) > 0 {
+		if result, retErr = waitForPendingQuestSymbols(ctx, q, state, allocator, recoveryRoot, arg, pendingRows); retErr != nil {
+			return result, retErr
+		}
+	}
+
+	// Import pre-existing physical rows before allocating any new SID. This
+	// makes first deployment against an existing exsymbol_q catalog preserve
+	// every already published physical identity.
+	missing := make([]AddSymbolsParams, 0, len(newArg))
+	for _, requested := range newArg {
+		item, lookupErr := queryQuestDBCanonicalSymbol(ctx, q, requested)
+		if lookupErr != nil {
+			return 0, lookupErr
+		}
+		if item == nil {
+			missing = append(missing, requested)
+			continue
+		}
+		if err := state.validateReservedSymbol(item); err != nil {
+			return 0, err
+		}
+		if _, err := registry.Adopt(ctx, item); err != nil {
+			return 0, err
+		}
+		if err := state.cacheExSymbolChecked(item); err != nil {
+			return 0, err
+		}
+	}
+	if len(missing) == 0 {
+		return int64(len(arg)), nil
+	}
+	physicalMax, err := queryMaxSidFromQDB(ctx, q.db)
+	if err != nil {
+		return 0, err
+	}
+	if err := registry.EnsureSIDFloor(ctx, physicalMax); err != nil {
+		return 0, err
+	}
+	reservations, err := registry.Reserve(ctx, missing)
+	if err != nil {
+		return 0, err
+	}
+	if len(reservations) != len(missing) {
+		return 0, fmt.Errorf("SID registry returned %d rows for %d symbols", len(reservations), len(missing))
+	}
+	now := time.Now().UTC()
+	rows := make([]exSymbolRecoveryRow, len(reservations))
+	for i, reservation := range reservations {
+		item := &reservation.ExSymbol
+		if err := state.validateReservedSymbol(item); err != nil {
+			return 0, err
+		}
+		writeTS := reservation.WriteTS
+		if writeTS.IsZero() {
+			// Test doubles may omit the timestamp. Production registries always
+			// return the database-owned stable value.
+			writeTS = now.Add(time.Duration(i) * time.Microsecond)
+		}
+		rows[i] = exSymbolRecoveryRow{
+			ID: item.ID, Exchange: item.Exchange, ExgReal: item.ExgReal, Market: item.Market,
+			Symbol: item.Symbol, Combined: item.Combined, ListMs: item.ListMs,
+			DelistMs: item.DelistMs, AggRules: item.AggRules, WriteTS: writeTS,
+		}
+	}
+	sharedMarkerPath, markerPath, err := ensurePendingExSymbolMarkers(allocator, recoveryRoot, rows)
+	if err != nil {
+		return 0, err
+	}
+	for i, reservation := range reservations {
+		item := reservation.ExSymbol
+		if _, err := q.db.Exec(ctx, `INSERT INTO exsymbol_q
+	  (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules, is_deleted)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
+			item.ID, rows[i].WriteTS, item.Exchange, item.ExgReal, item.Market, item.Symbol,
+			item.Combined, item.ListMs, item.DelistMs, item.AggRules); err != nil {
+			return int64(i), err
+		}
+		if err := markPendingExSymbolRowInserted(markerPath, rows[i]); err != nil {
+			return int64(i + 1), err
+		}
+		if err := markPendingExSymbolRowInserted(sharedMarkerPath, rows[i]); err != nil {
+			return int64(i + 1), err
+		}
+	}
+	visible, err := questExsymbolsVisible(ctx, q, rows)
+	if err != nil {
+		return int64(len(arg)), err
+	}
+	if !visible {
+		ids := make([]int32, 0, len(rows))
+		for _, row := range rows {
+			ids = append(ids, row.ID)
+		}
+		log.Warn("questdb registry exsymbol rows still not visible after timeout; retain recovery marker",
+			zap.Int32s("sids", ids), zap.String("marker", markerPath), zap.String("shared_marker", sharedMarkerPath))
+		return int64(len(arg)), errs.NewMsg(core.ErrTimeout,
+			"questdb registry exsymbol rows not visible before timeout: sids=%v", ids)
+	}
+	if err := cacheConfirmedQuestExSymbols(ctx, q, state, allocator, rows); err != nil {
+		return int64(len(arg)), err
+	}
+	if err := removePendingExSymbolMarkerRows(markerPath, rows); err != nil {
+		return int64(len(arg)), err
+	}
+	if err := removeSharedSIDReservations(allocator, rows); err != nil {
+		return int64(len(arg)), err
+	}
+	return int64(len(arg)), nil
+}
+
+func waitForPendingQuestSymbols(ctx context.Context, q *Queries, state *SymbolState, allocator *SIDAllocator,
+	recoveryRoot string, arg []AddSymbolsParams, pendingRows []exSymbolRecoveryRow) (int64, error) {
+	sharedMarkerPath, markerPath, err := ensurePendingExSymbolMarkers(allocator, recoveryRoot, pendingRows)
+	if err != nil {
+		return 0, err
+	}
+	visible, err := questExsymbolsVisible(ctx, q, pendingRows)
+	if err != nil {
+		return int64(len(arg)), err
+	}
+	if !visible {
+		ids := make([]int32, 0, len(pendingRows))
+		for _, row := range pendingRows {
+			ids = append(ids, row.ID)
+		}
+		log.Warn("questdb registry pending exsymbol rows still not visible after timeout; retain recovery marker",
+			zap.Int32s("sids", ids), zap.String("marker", markerPath), zap.String("shared_marker", sharedMarkerPath))
+		return int64(len(arg)), errs.NewMsg(core.ErrTimeout,
+			"questdb registry pending exsymbol rows not visible before timeout: sids=%v", ids)
+	}
+	if err := cacheConfirmedQuestExSymbols(ctx, q, state, allocator, pendingRows); err != nil {
+		return int64(len(arg)), err
+	}
+	if err := removePendingExSymbolMarkerRows(markerPath, pendingRows); err != nil {
+		return int64(len(arg)), err
+	}
+	if err := removeSharedSIDReservations(allocator, pendingRows); err != nil {
+		return int64(len(arg)), err
+	}
+	return int64(len(arg)), nil
+}
+
+func reuseQuestDBCanonicalSymbols(ctx context.Context, q *Queries, state *SymbolState, arg []AddSymbolsParams) ([]AddSymbolsParams, error) {
+	remaining := make([]AddSymbolsParams, 0, len(arg))
+	for _, requested := range arg {
+		key := exSymbolKey(requested.Exchange, requested.Market, requested.Symbol)
+		item, err := queryQuestDBCanonicalSymbol(ctx, q, requested)
+		if err != nil {
+			return nil, fmt.Errorf("lookup exsymbol %s: %w", key, err)
+		}
+		if item == nil {
+			remaining = append(remaining, requested)
+			continue
+		}
+		if exSymbolKey(item.Exchange, item.Market, item.Symbol) != key {
+			remaining = append(remaining, requested)
+			continue
+		}
+		if err := state.cacheExSymbolChecked(item); err != nil {
+			return nil, fmt.Errorf("cache canonical exsymbol %s sid %d: %w", key, item.ID, err)
+		}
+	}
+	return remaining, nil
+}
+
+type questCanonicalExSymbolReader interface {
+	lookupQuestCanonicalExSymbol(context.Context, string, string, string) (*ExSymbol, error)
+}
+
+func queryQuestDBCanonicalSymbol(ctx context.Context, q *Queries, requested AddSymbolsParams) (*ExSymbol, error) {
+	if reader, ok := q.db.(questCanonicalExSymbolReader); ok {
+		return reader.lookupQuestCanonicalExSymbol(ctx, requested.Exchange, requested.Market, requested.Symbol)
+	}
+	row := q.db.QueryRow(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, coalesce(agg_rules, '')
+FROM exsymbol_q
+LATEST BY sid
+WHERE exchange = $1 AND market = $2 AND symbol = $3 AND coalesce(is_deleted, false) = false
+ORDER BY sid
+LIMIT 1`,
+		requested.Exchange, requested.Market, requested.Symbol)
+	var item ExSymbol
+	if err := row.Scan(&item.ID, &item.Exchange, &item.ExgReal, &item.Market, &item.Symbol,
+		&item.Combined, &item.ListMs, &item.DelistMs, &item.AggRules); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func cacheConfirmedQuestExSymbols(ctx context.Context, q *Queries, state *SymbolState, allocator *SIDAllocator, rows []exSymbolRecoveryRow) error {
+	for _, expected := range rows {
+		item, err := questExsymbolBySID(ctx, q, expected.ID)
+		if err != nil {
+			return fmt.Errorf("confirm exsymbol sid %d after visibility wait: %w", expected.ID, err)
+		}
+		if !expected.matches(item) {
+			return fmt.Errorf("confirm exsymbol sid %d metadata mismatch after visibility wait", expected.ID)
+		}
+		if err := state.validateReservedSymbol(item); err != nil {
+			return fmt.Errorf("cache confirmed exsymbol sid %d: %w", expected.ID, err)
+		}
+		if err := allocator.markSIDConfirmed(exSymbolKey(item.Exchange, item.Market, item.Symbol), item.ID); err != nil {
+			return fmt.Errorf("confirm exsymbol sid %d reservation: %w", expected.ID, err)
+		}
+		if err := state.cacheExSymbolChecked(item); err != nil {
+			return fmt.Errorf("cache confirmed exsymbol sid %d: %w", expected.ID, err)
+		}
+	}
+	return nil
+}
+
+func ensurePendingExSymbolMarkers(allocator *SIDAllocator, recoveryRoot string, rows []exSymbolRecoveryRow) (string, string, error) {
+	if len(rows) == 0 {
+		return "", "", nil
+	}
+	rows = append([]exSymbolRecoveryRow(nil), rows...)
+	now := time.Now().UTC()
+	for i := range rows {
+		if rows[i].WriteTS.IsZero() {
+			rows[i].WriteTS = now.Add(time.Duration(i) * time.Microsecond)
+		}
+		if rows[i].Inserted == nil {
+			inserted := false
+			rows[i].Inserted = &inserted
+		}
+	}
+	sharedMarkerPath, err := publishSharedSIDReservations(allocator, rows)
+	if err != nil {
+		return "", "", err
+	}
+	markerPath, err := findPendingExSymbolMarkerAcrossRoots(
+		recoveryRootsForAllocator(allocator, recoveryRoot), allocator.Namespace(), rows)
+	if err != nil {
+		return "", "", err
+	}
+	if markerPath == "" {
+		markerPath, err = writePendingExSymbolMarkerForNamespace(recoveryRoot, allocator.Namespace(), rows)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	reservations := make([]sidReservation, 0, len(rows))
+	for _, row := range rows {
+		reservations = append(reservations, sidReservation{
+			key: exSymbolKey(row.Exchange, row.Market, row.Symbol),
+			id:  row.ID,
+		})
+	}
+	if err := allocator.reservePendingSIDBatch(reservations); err != nil {
+		return "", "", fmt.Errorf("reserve pending exsymbol SIDs: %w", err)
+	}
+	return sharedMarkerPath, markerPath, nil
+}
+
+func reuseReservedAddSymbols(state *SymbolState, allocator *SIDAllocator, arg []AddSymbolsParams) ([]AddSymbolsParams, []exSymbolRecoveryRow, error) {
+	newArg := make([]AddSymbolsParams, 0, len(arg))
+	pendingRows := make([]exSymbolRecoveryRow, 0, len(arg))
+	seen := make(map[string]AddSymbolsParams, len(arg))
+	for _, item := range arg {
+		key := exSymbolKey(item.Exchange, item.Market, item.Symbol)
+		if previous, ok := seen[key]; ok {
+			if !sameAddSymbolsParams(previous, item) {
+				return nil, nil, fmt.Errorf("duplicate add symbol identity %s has conflicting metadata", key)
+			}
+			continue
+		}
+		seen[key] = item
+		// A pending QuestDB write already owns this logical symbol. Reuse its
+		// SID before allocating another one, even before WAL visibility catches
+		// up and promotes the reservation to confirmed.
+		if sid := allocator.reservationSID(key); sid > 0 {
+			if allocator.reservedSID(key) == sid {
+				requested := makeExSymbolFromAdd(sid, item)
+				if current := state.GetExSymbol2(item.Exchange, item.Market, item.Symbol); current != nil {
+					if !sameExSymbolSnapshot(current, requested) {
+						return nil, nil, fmt.Errorf("add symbol identity %s reservation sid %d conflicts with canonical metadata", key, sid)
+					}
+					continue
+				}
+				if err := state.validateReservedSymbol(requested); err != nil {
+					return nil, nil, fmt.Errorf("add symbol identity %s reservation sid %d conflicts with state: %w", key, sid, err)
+				}
+				if err := state.cacheExSymbolChecked(requested); err != nil {
+					return nil, nil, fmt.Errorf("cache reserved exsymbol %s sid %d: %w", key, sid, err)
+				}
+				continue
+			}
+			requested := makeExSymbolFromAdd(sid, item)
+			if current := state.GetExSymbol2(item.Exchange, item.Market, item.Symbol); current != nil {
+				if !sameExSymbolSnapshot(current, requested) {
+					return nil, nil, fmt.Errorf("add symbol identity %s pending sid %d conflicts with canonical metadata", key, sid)
+				}
+			}
+			if err := state.validateReservedSymbol(requested); err != nil {
+				return nil, nil, fmt.Errorf("add symbol identity %s pending sid %d conflicts with state: %w", key, sid, err)
+			}
+			pendingRows = append(pendingRows, pendingExSymbolRows([]AddSymbolsParams{item}, []int32{sid})[0])
+			continue
+		}
+		if current := state.GetExSymbol2(item.Exchange, item.Market, item.Symbol); current != nil {
+			requested := makeExSymbolFromAdd(current.ID, item)
+			if !sameExSymbolSnapshot(current, requested) {
+				return nil, nil, fmt.Errorf("add symbol identity %s conflicts with canonical metadata", key)
+			}
+			continue
+		}
+		newArg = append(newArg, item)
+	}
+	return newArg, pendingRows, nil
+}
+
+func sameAddSymbolsParams(a, b AddSymbolsParams) bool {
+	return a.Exchange == b.Exchange && a.ExgReal == b.ExgReal && a.Market == b.Market && a.Symbol == b.Symbol &&
+		a.Combined == b.Combined && a.ListMs == b.ListMs && a.DelistMs == b.DelistMs && a.AggRules == b.AggRules
+}
+
+func queryMaxSidFromQDB(ctx context.Context, db DBTX) (int32, error) {
 	var maxVal *int32
 	row := db.QueryRow(ctx, `SELECT max(sid) FROM exsymbol_q`)
-	if err := row.Scan(&maxVal); err != nil || maxVal == nil {
-		return 0
+	if err := row.Scan(&maxVal); err != nil {
+		return 0, err
 	}
-	return *maxVal
+	if maxVal == nil {
+		return 0, nil
+	}
+	return *maxVal, nil
 }
 
 func (q *Queries) SetListMS(ctx context.Context, arg SetListMSParams) error {
+	return q.setListMS(ctx, loadDefaultSymbolState(), arg, nil)
+}
+
+func (q *SymbolQueries) SetListMS(ctx context.Context, arg SetListMSParams) error {
+	if q == nil {
+		return errs.NewMsg(core.ErrBadConfig, "symbol query is required")
+	}
+	return q.Queries.setListMS(ctx, q.symbolState(), arg, nil)
+}
+
+func (q *Queries) setListMS(ctx context.Context, state *SymbolState, arg SetListMSParams, base *ExSymbol) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if !IsQuestDB {
-		return q.setListMSPg(ctx, arg)
+		err := q.setListMSPg(ctx, arg)
+		if err == nil {
+			symbolStateOrDefault(state).updateListMS(arg.ID, arg.ListMs, arg.DelistMs, base)
+		}
+		return err
 	}
 	unlock := LockCompactTableRead("exsymbol_q")
 	defer unlock()
@@ -502,6 +1043,7 @@ func (q *Queries) SetListMS(ctx context.Context, arg SetListMSParams) error {
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
 		item.ID, ts, item.Exchange, item.ExgReal, item.Market, item.Symbol, item.Combined, arg.ListMs, arg.DelistMs, item.AggRules)
 	if err == nil {
+		symbolStateOrDefault(state).updateListMS(item.ID, arg.ListMs, arg.DelistMs, item)
 		if err = waitForQuestExsymbolTimestampVisible(ctx, q, item.ID, ts); err != nil {
 			return err
 		}
@@ -511,11 +1053,26 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
 }
 
 func (q *Queries) SetAggRules(ctx context.Context, arg SetAggRulesParams) error {
+	return q.setAggRules(ctx, loadDefaultSymbolState(), arg)
+}
+
+func (q *SymbolQueries) SetAggRules(ctx context.Context, arg SetAggRulesParams) error {
+	if q == nil {
+		return errs.NewMsg(core.ErrBadConfig, "symbol query is required")
+	}
+	return q.Queries.setAggRules(ctx, q.symbolState(), arg)
+}
+
+func (q *Queries) setAggRules(ctx context.Context, state *SymbolState, arg SetAggRulesParams) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if !IsQuestDB {
-		return q.setAggRulesPg(ctx, arg)
+		err := q.setAggRulesPg(ctx, arg)
+		if err == nil {
+			symbolStateOrDefault(state).updateAggRules(arg.ID, arg.AggRules, nil)
+		}
+		return err
 	}
 	unlock := LockCompactTableRead("exsymbol_q")
 	defer unlock()
@@ -528,8 +1085,7 @@ func (q *Queries) SetAggRules(ctx context.Context, arg SetAggRulesParams) error 
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
 		item.ID, ts, item.Exchange, item.ExgReal, item.Market, item.Symbol, item.Combined, item.ListMs, item.DelistMs, arg.AggRules)
 	if err == nil {
-		item.AggRules = arg.AggRules
-		cacheExSymbol(item)
+		symbolStateOrDefault(state).updateAggRules(item.ID, arg.AggRules, item)
 		if err = waitForQuestExsymbolTimestampVisible(ctx, q, item.ID, ts); err != nil {
 			return err
 		}

@@ -3,7 +3,9 @@ package orm
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
 	utils2 "github.com/banbox/banexg/utils"
+	"github.com/jackc/pgx/v5"
 )
 
 type KLineSeriesStore struct {
@@ -47,6 +50,16 @@ func (s *KLineSeriesStore) Ensure(ctx context.Context) *errs.Error {
 	defer conn.Release()
 
 	binding := resolveKLineSeriesBinding(s.info())
+	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	if lockErr != nil {
+		return NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
+	return s.ensureLocked(ctx, q)
+}
+
+func (s *KLineSeriesStore) ensureLocked(ctx context.Context, q *Queries) *errs.Error {
+	binding := resolveKLineSeriesBinding(s.info())
 	for _, field := range binding.Fields {
 		if _, err_ := q.db.Exec(ctx, buildKLineSeriesAddColumnSQL(binding.Table, field)); err_ != nil {
 			if shouldIgnoreKLineSeriesAddColumnError(err_) {
@@ -71,12 +84,9 @@ func (s *KLineSeriesStore) Write(ctx context.Context, target *ExSymbol, rows []*
 	if err := validateKLineSeriesInfo(s.info()); err != nil {
 		return err
 	}
-	if err := s.Ensure(ctx); err != nil {
-		return err
-	}
 	info := s.info()
 	binding := resolveKLineSeriesBinding(info)
-	items, err := normalizeKLineSeriesRows(target.ID, binding.Fields, rows)
+	items, err := normalizeKLineSeriesRows(target.ID, rows)
 	if err != nil {
 		return err
 	}
@@ -88,15 +98,20 @@ func (s *KLineSeriesStore) Write(ctx context.Context, target *ExSymbol, rows []*
 		return err
 	}
 	defer conn.Release()
+	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	if lockErr != nil {
+		return NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
+	if err := s.ensureLocked(ctx, q); err != nil {
+		return err
+	}
 
 	sqlText := buildKLineSeriesUpdateSQL(binding)
 	for _, row := range items {
 		args := make([]any, 0, len(binding.Fields)+2)
 		for _, field := range binding.Fields {
-			val, ok := row.Values[field.Name]
-			if !ok {
-				return errs.NewMsg(core.ErrBadConfig, "kline series row missing field %q", field.Name)
-			}
+			val := row.Values[field.Name]
 			normVal, err_ := normalizeSeriesFieldValue(field.Type, val)
 			if err_ != nil {
 				return errs.NewMsg(core.ErrBadConfig, "kline series row field %q invalid: %v", field.Name, err_)
@@ -151,6 +166,11 @@ func (s *KLineSeriesStore) readRaw(ctx context.Context, target *ExSymbol, startM
 	defer conn.Release()
 
 	binding := resolveKLineSeriesBinding(info)
+	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	if lockErr != nil {
+		return nil, NewDbErr(core.ErrDbReadFail, lockErr)
+	}
+	defer unlock()
 	timeExpr := quoteIdent(binding.TimeColumn)
 	startArg, endArg := any(startMS), any(endMS)
 	var covered []MSRange
@@ -293,7 +313,7 @@ func validateKLineSeriesInfo(info *SeriesInfo) *errs.Error {
 	return nil
 }
 
-func normalizeKLineSeriesRows(sid int32, fields []SeriesField, rows []*DataRecord) ([]*DataRecord, *errs.Error) {
+func normalizeKLineSeriesRows(sid int32, rows []*DataRecord) ([]*DataRecord, *errs.Error) {
 	if sid <= 0 {
 		return nil, errs.NewMsg(core.ErrBadConfig, "kline series target sid is required")
 	}
@@ -308,11 +328,6 @@ func normalizeKLineSeriesRows(sid int32, fields []SeriesField, rows []*DataRecor
 		}
 		if cp.Sid != sid {
 			return nil, errs.NewMsg(core.ErrBadConfig, "kline series row sid %d does not match target sid %d", cp.Sid, sid)
-		}
-		for _, field := range fields {
-			if _, ok := cp.Values[field.Name]; !ok {
-				return nil, errs.NewMsg(core.ErrBadConfig, "kline series row missing field %q", field.Name)
-			}
 		}
 		items = append(items, &cp)
 	}
@@ -386,6 +401,7 @@ func scanKLineSeriesRecord(rows rowScanner, fields []SeriesField) (*DataRecord, 
 	targets = append(targets, &rec.Sid, &rec.TimeMS)
 	fieldTargets := make([]any, len(fields))
 	for i, field := range fields {
+		rec.Values[field.Name] = nil
 		switch field.Type {
 		case "float":
 			var val sql.NullFloat64
@@ -430,10 +446,6 @@ func scanKLineSeriesRecord(rows rowScanner, fields []SeriesField) (*DataRecord, 
 	return rec, nil
 }
 
-type rowScanner interface {
-	Scan(dest ...any) error
-}
-
 func waitForQuestKLineSeriesVisible(ctx context.Context, q *Queries, info *SeriesInfo, row *DataRecord) *errs.Error {
 	if info == nil || row == nil {
 		return nil
@@ -442,28 +454,33 @@ func waitForQuestKLineSeriesVisible(ctx context.Context, q *Queries, info *Serie
 	if len(binding.Fields) == 0 {
 		return nil
 	}
-	field := binding.Fields[0]
-	want, ok := row.Values[field.Name]
-	if !ok {
-		return nil
-	}
-	normWant, err := normalizeSeriesFieldValue(field.Type, want)
-	if err != nil {
-		return errs.NewMsg(core.ErrBadConfig, "kline series row field %q invalid: %v", field.Name, err)
-	}
-	visible, err := waitForQuestCondition(ctx, 5*time.Second, questReadAfterWritePollInterval, func() (bool, error) {
-		var got any
-		sqlText := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1 AND %s = $2",
-			quoteIdent(field.Name),
-			quoteIdent(binding.Table),
-			quoteIdent(binding.SIDColumn),
-			quoteIdent(binding.TimeColumn),
-		)
-		err_ := q.db.QueryRow(ctx, sqlText, row.Sid, time.UnixMilli(row.TimeMS).UTC()).Scan(&got)
-		if err_ != nil {
-			return false, nil
+	want := make(map[string]any, len(binding.Fields))
+	for _, field := range binding.Fields {
+		normVal, err := normalizeSeriesFieldValue(field.Type, row.Values[field.Name])
+		if err != nil {
+			return errs.NewMsg(core.ErrBadConfig, "kline series row field %q invalid: %v", field.Name, err)
 		}
-		return fmt.Sprint(got) == fmt.Sprint(normWant), nil
+		want[field.Name] = normVal
+	}
+	selectCols := []string{quoteIdent(binding.SIDColumn), fmt.Sprintf("cast(%s as long)/1000", quoteIdent(binding.TimeColumn))}
+	for _, field := range binding.Fields {
+		selectCols = append(selectCols, quoteIdent(field.Name))
+	}
+	sqlText := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1 AND %s = $2",
+		strings.Join(selectCols, ", "),
+		quoteIdent(binding.Table),
+		quoteIdent(binding.SIDColumn),
+		quoteIdent(binding.TimeColumn),
+	)
+	visible, err := waitForQuestCondition(ctx, 5*time.Second, questReadAfterWritePollInterval, func() (bool, error) {
+		got, err_ := scanKLineSeriesRecord(q.db.QueryRow(ctx, sqlText, row.Sid, time.UnixMilli(row.TimeMS).UTC()), binding.Fields)
+		if err_ != nil {
+			if errors.Is(err_, pgx.ErrNoRows) {
+				return false, nil
+			}
+			return false, err_
+		}
+		return got.Sid == row.Sid && got.TimeMS == row.TimeMS && reflect.DeepEqual(got.Values, want), nil
 	})
 	if err != nil {
 		return NewDbErr(core.ErrDbReadFail, err)
@@ -471,6 +488,6 @@ func waitForQuestKLineSeriesVisible(ctx context.Context, q *Queries, info *Serie
 	if visible {
 		return nil
 	}
-	return errs.NewMsg(core.ErrDbReadFail, "questdb kline series row not visible in time: table=%s sid=%d time_ms=%d field=%s",
-		binding.Table, row.Sid, row.TimeMS, field.Name)
+	return errs.NewMsg(core.ErrDbReadFail, "questdb kline series row not visible in time: table=%s sid=%d time_ms=%d",
+		binding.Table, row.Sid, row.TimeMS)
 }

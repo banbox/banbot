@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +45,43 @@ type issue138Exchange struct {
 	createOrder     func(symbol, odType, side string, amount, price float64, params map[string]interface{}) (*banexg.Order, *errs.Error)
 	fetchOpenOrders func(symbol string, since int64, limit int, params map[string]interface{}) ([]*banexg.Order, *errs.Error)
 	fetchTickers    func(symbols []string, params map[string]interface{}) ([]*banexg.Ticker, *errs.Error)
+}
+
+func (*issue138Exchange) ParseClientOrderID(botName, clientID string) int64 {
+	prefix := botName + "_"
+	if botName == "" || !strings.HasPrefix(clientID, prefix) {
+		return 0
+	}
+	value := clientID[len(prefix):]
+	if index := strings.IndexByte(value, '_'); index >= 0 {
+		value = value[:index]
+	}
+	orderID, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || orderID <= 0 {
+		return 0
+	}
+	return orderID
+}
+
+func (*issue138Exchange) GetOrderEventOrderID(trade *banexg.MyTrade) string {
+	if trade == nil || trade.AlgoId == "" {
+		return ""
+	}
+	return "algo:" + strings.TrimPrefix(trade.AlgoId, "algo:")
+}
+
+func (*issue138Exchange) NormalizeOrderTimestamp(order *banexg.Order, fallback int64) int64 {
+	if order == nil {
+		return fallback
+	}
+	return max(fallback, order.Timestamp, order.LastTradeTimestamp, order.LastUpdateTimestamp)
+}
+
+func (*issue138Exchange) BuildClientOrderID(namespace string, orderID int64, clientID string, randomize bool) string {
+	if randomize {
+		return fmt.Sprintf("%s_%d_%d_%s", namespace, orderID, rand.Intn(1000), clientID)
+	}
+	return fmt.Sprintf("%s_%d_%s", namespace, orderID, clientID)
 }
 
 func (e *issue138Exchange) CancelOrder(id, symbol string, params map[string]interface{}) (*banexg.Order, *errs.Error) {
@@ -872,12 +912,6 @@ func TestHealMissingFullEnterTriggersConcurrentRetryIsSingleCreate(t *testing.T)
 	if createCalls != 1 || od.GetStopLoss().OrderId != "single-trigger" {
 		t.Fatalf("concurrent heal duplicated trigger: calls=%d state=%+v", createCalls, od.GetStopLoss())
 	}
-}
-
-func TestParseClient(t *testing.T) {
-	config.Name = "big"
-	res := getClientOrderId("big_1176_747_")
-	fmt.Println(res)
 }
 
 func TestHandleMyTradeClaimsTriggeredBinanceExitWithNewOrderID(t *testing.T) {

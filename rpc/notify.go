@@ -15,11 +15,99 @@ import (
 )
 
 var (
-	channels = make([]IWebHook, 0, 2)
-	initOnce sync.Once
+	channels      = make([]IWebHook, 0, 2)
+	channelsMu    sync.RWMutex
+	rpcClosed     bool
+	rpcReady      bool
+	rpcGeneration uint64
+	rpcInitMu     sync.Mutex
+	rpcStopDone   = closedRPCSignal()
+	rpcJoined     bool
 )
 
+func closedRPCSignal() chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+
+type rpcStopper interface {
+	Stop()
+}
+
+type rpcJoiner interface {
+	Join()
+}
+
+func stopChannel(channel IWebHook) {
+	if channel == nil {
+		return
+	}
+	if stopper, ok := channel.(rpcStopper); ok {
+		stopper.Stop()
+		return
+	}
+	channel.SetDisable(true)
+}
+
+func joinChannel(channel IWebHook) {
+	if channel == nil {
+		return
+	}
+	if joiner, ok := channel.(rpcJoiner); ok {
+		joiner.Join()
+		return
+	}
+	channel.CleanUp()
+}
+
+func stopAndJoinChannels(channels []IWebHook) {
+	for _, channel := range channels {
+		stopChannel(channel)
+	}
+	for _, channel := range channels {
+		joinChannel(channel)
+	}
+}
+
+// InitRPC initializes the current RPC session. It is idempotent while the
+// session is open and starts a new generation after Stop or CleanUp.
+func InitRPC() *errs.Error {
+	rpcInitMu.Lock()
+	defer rpcInitMu.Unlock()
+
+	channelsMu.RLock()
+	ready, closed := rpcReady, rpcClosed
+	channelsMu.RUnlock()
+	if ready && !closed {
+		return nil
+	}
+	if ready && closed {
+		joinRPCSession()
+	}
+
+	channelsMu.Lock()
+	if rpcReady && !rpcClosed {
+		channelsMu.Unlock()
+		return nil
+	}
+	rpcGeneration++
+	generation := rpcGeneration
+	rpcReady = true
+	rpcClosed = false
+	channels = make([]IWebHook, 0, 2)
+	rpcStopDone = closedRPCSignal()
+	rpcJoined = false
+	channelsMu.Unlock()
+
+	return initWebHooksForGeneration(generation)
+}
+
 func initWebHooks() *errs.Error {
+	return InitRPC()
+}
+
+func initWebHooksForGeneration(generation uint64) *errs.Error {
 	if len(config.RPCChannels) == 0 {
 		log.Info("no channels, skip send rpc msg")
 		return nil
@@ -30,7 +118,8 @@ func initWebHooks() *errs.Error {
 		if acc.NoTrade {
 			continue
 		}
-		for i, chl := range acc.RPCChannels {
+		for i, rawChl := range acc.RPCChannels {
+			chl := maps.Clone(rawChl)
 			chlName := utils.GetMapVal(chl, "name", "")
 			if chlName == "" {
 				return errs.NewMsg(core.ErrBadConfig, "`name` is required in accounts.%s.rpc_channels[%d]", accName, i)
@@ -54,6 +143,7 @@ func initWebHooks() *errs.Error {
 		maps.Copy(chlCfg, chl)
 		items[fmt.Sprintf("%s_%s", chlName, acc)] = chlCfg
 	}
+	newChannels := make([]IWebHook, 0, len(items))
 	for name, item := range items {
 		chlType := utils.GetMapVal(item, "type", "")
 		var channel IWebHook
@@ -65,28 +155,53 @@ func initWebHooks() *errs.Error {
 		case "telegram":
 			channel = NewTelegram(name, item)
 		default:
-			return errs.NewMsg(core.ErrBadConfig, "RPCChannel not support: %v", chlType)
+			err := errs.NewMsg(core.ErrBadConfig, "RPCChannel not support: %v", chlType)
+			stopAndJoinChannels(newChannels)
+			return err
 		}
 		if channel.IsDisable() {
 			continue
 		}
-		go channel.ConsumeForever()
-		channels = append(channels, channel)
+		newChannels = append(newChannels, channel)
 	}
-	if len(channels) == 0 {
+	channelsMu.Lock()
+	valid := rpcReady && !rpcClosed && rpcGeneration == generation
+	if valid {
+		channels = append(channels, newChannels...)
+	}
+	channelCount := len(channels)
+	channelsMu.Unlock()
+	if !valid {
+		stopAndJoinChannels(newChannels)
+		return nil
+	}
+	for _, channel := range newChannels {
+		go channel.ConsumeForever()
+	}
+	if channelCount == 0 {
 		log.Info("no channels, skip send rpc msg")
 	}
 	return nil
 }
 
 func SendMsg(msg map[string]interface{}) {
-	initOnce.Do(func() {
-		err := initWebHooks()
+	channelsMu.RLock()
+	ready := rpcReady && !rpcClosed
+	channelsMu.RUnlock()
+	if !ready {
+		err := InitRPC()
 		if err != nil {
 			log.Error("init rpc fail", zap.Error(err))
 		}
-	})
-	if len(channels) == 0 {
+	}
+	channelsMu.RLock()
+	if !rpcReady || rpcClosed {
+		channelsMu.RUnlock()
+		return
+	}
+	chls := append([]IWebHook(nil), channels...)
+	channelsMu.RUnlock()
+	if len(chls) == 0 {
 		return
 	}
 	account := utils.GetMapVal(msg, "account", "")
@@ -105,17 +220,68 @@ func SendMsg(msg map[string]interface{}) {
 	for key, val := range item {
 		payload[key] = utils2.FormatWithMap(val, msg)
 	}
-	for _, chl := range channels {
+	for _, chl := range chls {
 		chl.SendMsg(msgType, account, payload)
 	}
 }
 
+// Stop closes RPC admission and signals every channel without waiting for
+// callbacks already running in those channels.
+func Stop() {
+	channelsMu.Lock()
+	if rpcClosed {
+		channelsMu.Unlock()
+		return
+	}
+	rpcClosed = true
+	stopDone := make(chan struct{})
+	rpcStopDone = stopDone
+	chls := append([]IWebHook(nil), channels...)
+	channelsMu.Unlock()
+	for _, chl := range chls {
+		stopChannel(chl)
+	}
+	close(stopDone)
+}
+
+func joinRPCSession() {
+	channelsMu.RLock()
+	if !rpcClosed {
+		channelsMu.RUnlock()
+		return
+	}
+	generation := rpcGeneration
+	chls := append([]IWebHook(nil), channels...)
+	stopDone := rpcStopDone
+	channelsMu.RUnlock()
+	if stopDone != nil {
+		<-stopDone
+	}
+	if rpcJoined {
+		return
+	}
+	for _, chl := range chls {
+		joinChannel(chl)
+	}
+	rpcJoined = true
+	channelsMu.Lock()
+	if rpcGeneration == generation && rpcClosed {
+		channels = make([]IWebHook, 0, 2)
+	}
+	channelsMu.Unlock()
+}
+
+// Join waits for every RPC channel stopped by Stop. It is a no-op while RPC
+// remains open; callers that need shutdown completion should call CleanUp.
+func Join() {
+	rpcInitMu.Lock()
+	defer rpcInitMu.Unlock()
+	joinRPCSession()
+}
+
 func CleanUp() {
-	for _, chl := range channels {
-		chl.SetDisable(true)
-	}
-	for _, chl := range channels {
-		chl.CleanUp()
-	}
-	channels = make([]IWebHook, 0, 2)
+	rpcInitMu.Lock()
+	defer rpcInitMu.Unlock()
+	Stop()
+	joinRPCSession()
 }

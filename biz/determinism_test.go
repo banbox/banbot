@@ -72,6 +72,19 @@ func TestSingleDefaultAccountExecutionView(t *testing.T) {
 	}
 }
 
+func TestRuntimeExecutionAccountViewUsesOwnedConfig(t *testing.T) {
+	oldAccounts := config.Accounts
+	config.Accounts = map[string]*config.AccountConfig{"legacy-only": {}}
+	t.Cleanup(func() { config.Accounts = oldAccounts })
+
+	deps := &RuntimeDeps{Config: config.NewSnapshot(&config.Config{
+		Accounts: map[string]*config.AccountConfig{"runtime-only": {}},
+	})}
+	if got := slices.Collect(executionAccountNames(deps)); !slices.Equal(got, []string{"runtime-only"}) {
+		t.Fatalf("runtime accounts = %v, want [runtime-only]", got)
+	}
+}
+
 func TestFrozenReplayCanonicalizesMapOrderAndPreservesSuppliedSlice(t *testing.T) {
 	oldMode, oldData := core.BackTestMode, config.Data
 	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr
@@ -110,10 +123,9 @@ func TestFrozenReplayCanonicalizesMapOrderAndPreservesSuppliedSlice(t *testing.T
 
 func TestTryFireBatchesUsesStableTaskOrderWhenDeterministic(t *testing.T) {
 	enableStrictBacktest(t)
-	oldTasks := strat.BatchTasks
-	t.Cleanup(func() { strat.BatchTasks = oldTasks })
 
 	for shift := 0; shift < 3; shift++ {
+		state := strat.NewBatchState()
 		var got []string
 		strategy := &strat.TradeStrat{Name: "demo", OnBatchJobs: func(jobs []*strat.StratJob) {
 			for _, job := range jobs {
@@ -122,14 +134,12 @@ func TestTryFireBatchesUsesStableTaskOrderWhenDeterministic(t *testing.T) {
 		}}
 		keys := []string{"z_main", "a_main", "m_main"}
 		symbols := map[string]string{"z_main": "z", "a_main": "a", "m_main": "m"}
-		tasks := &strat.BatchMap{Map: make(map[string]*strat.JobEnv), TFMSecs: 3_600_000}
 		for offset := range keys {
 			key := keys[(shift+offset)%len(keys)]
 			job := &strat.StratJob{Strat: strategy, Env: &ta.BarEnv{}, Symbol: &orm.ExSymbol{Symbol: symbols[key]}}
-			tasks.Map[key] = &strat.JobEnv{Job: job, Symbol: symbols[key]}
+			AddBatchJobWithState(state, "default", "1h", job, nil)
 		}
-		strat.BatchTasks = map[string]*strat.BatchMap{"1h_default_demo": tasks}
-		TryFireBatches(1, true)
+		TryFireBatchesWithState(state, int64(^uint64(0)>>1), true)
 		if !slices.Equal(got, []string{"a", "m", "z"}) {
 			t.Fatalf("layout %d batch jobs = %v", shift, got)
 		}
@@ -137,28 +147,22 @@ func TestTryFireBatchesUsesStableTaskOrderWhenDeterministic(t *testing.T) {
 }
 
 func TestAddBatchJobReusesPendingPairTask(t *testing.T) {
-	oldTasks := strat.BatchTasks
-	strat.BatchTasks = make(map[string]*strat.BatchMap)
-	t.Cleanup(func() { strat.BatchTasks = oldTasks })
-
-	strategy := &strat.TradeStrat{Name: "demo"}
-	job := &strat.StratJob{
+	state := strat.NewBatchState()
+	var got []*strat.StratJob
+	strategy := &strat.TradeStrat{Name: "demo", OnBatchJobs: func(jobs []*strat.StratJob) {
+		got = append(got, jobs...)
+	}}
+	first := &strat.StratJob{
 		Strat:  strategy,
+		Env:    &ta.BarEnv{},
 		Symbol: &orm.ExSymbol{Symbol: "BTC/USDT"},
 	}
-	AddBatchJob("default", "15m", job, nil)
-	tasks := strat.BatchTasks["15m_default_demo"]
-	if tasks == nil {
-		t.Fatal("batch task was not registered")
-	}
-	first := tasks.Map["BTC/USDT_main"]
-	if first == nil {
-		t.Fatal("pair task was not registered")
-	}
-
-	AddBatchJob("default", "15m", job, nil)
-	if got := tasks.Map["BTC/USDT_main"]; got != first {
-		t.Fatal("re-registering a pending pair allocated a new task")
+	latest := &strat.StratJob{Strat: strategy, Env: &ta.BarEnv{}, Symbol: first.Symbol}
+	AddBatchJobWithState(state, "default", "15m", first, nil)
+	AddBatchJobWithState(state, "default", "15m", latest, nil)
+	TryFireBatchesWithState(state, int64(^uint64(0)>>1), true)
+	if len(got) != 1 || got[0] != latest {
+		t.Fatalf("batch jobs = %v, want only latest job", got)
 	}
 }
 

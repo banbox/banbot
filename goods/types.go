@@ -2,6 +2,8 @@ package goods
 
 import (
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/go-viper/mapstructure/v2"
 )
@@ -12,9 +14,22 @@ type IFilter interface {
 	Filter(pairs []string, timeMS int64) ([]string, *errs.Error)
 }
 
+// SymbolStateFilter is an optional extension for filters that need symbol or
+// historical data. Existing custom filters can keep implementing IFilter and
+// are called through their legacy method by state-aware callers.
+type SymbolStateFilter interface {
+	FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, pairs []string, timeMS int64) ([]string, *errs.Error)
+}
+
 type IProducer interface {
 	IFilter
 	GenSymbols(timeMS int64) ([]string, *errs.Error)
+}
+
+// SymbolStateProducer is the optional state-aware form of IProducer.
+type SymbolStateProducer interface {
+	IProducer
+	GenSymbolsWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, timeMS int64) ([]string, *errs.Error)
 }
 
 type BaseFilter struct {

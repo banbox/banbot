@@ -374,16 +374,16 @@ func (s *StratJob) InitBar(curOrders []*ormo.InOutOrder) {
 	if s.recordInspectEffect("InitBar") {
 		return
 	}
-	s.CheckMS = btime.TimeMS()
+	s.CheckMS = s.runtimeTimeMS()
 	s.LastBarMS = s.Env.TimeStop
 	if s.IsWarmUp {
 		s.LongOrders = nil
 		s.ShortOrders = nil
-	} else if s.OrderNum > 0 || core.LiveMode {
+	} else if s.OrderNum > 0 || s.runtimeLive() {
 		// 针对实盘，重启后OrderNum状态重置，本地未平仓订单无法更新到StratJob中，这里每次都检查
 		s.UpdateOrders(curOrders)
 	}
-	if core.LiveMode && !s.IsWarmUp {
+	if s.runtimeLive() && !s.IsWarmUp {
 		// print warning before clear
 		for i, q := range s.Entrys {
 			fields := q.GetZapFields(s)
@@ -436,26 +436,14 @@ func GetJobs(account string) map[string]map[string]*StratJob {
 	if !core.EnvReal {
 		account = config.DefAcc
 	}
-	jobs, ok := AccJobs[account]
-	if !ok {
-		jobs = map[string]map[string]*StratJob{}
-		AccJobs[account] = jobs
-	}
-	return jobs
+	return LegacyState().Jobs(account)
 }
 
 func GetInfoJobs(account string) map[string]map[string]*StratJob {
 	if !core.EnvReal {
 		account = config.DefAcc
 	}
-	lockInfoJobs.Lock()
-	jobs, ok := AccInfoJobs[account]
-	if !ok {
-		jobs = map[string]map[string]*StratJob{}
-		AccInfoJobs[account] = jobs
-	}
-	lockInfoJobs.Unlock()
-	return jobs
+	return LegacyState().InfoJobs(account)
 }
 
 func GetHistOrders(args ormo.GetHistOrdersArgs) ([]*ormo.InOutOrder, *errs.Error) {
@@ -756,7 +744,25 @@ func FireOdChange(acc string, od *ormo.InOutOrder, evt int) {
 	subs, _ := accOdSubs[acc]
 	subs2, _ := accOdSubs["*"]
 	lockOdSub.Unlock()
-	subs = append(subs, subs2...)
+	fireOdChange(subs, subs2, acc, od, evt)
+}
+
+// FireOdChangeWithState dispatches an order event through one runtime's
+// strategy callbacks. A nil state keeps the legacy global behavior.
+func FireOdChangeWithState(state *State, acc string, od *ormo.InOutOrder, evt int) {
+	if state == nil {
+		FireOdChange(acc, od, evt)
+		return
+	}
+	state.orderSubLock.Lock()
+	subs := append([]FnOdChange(nil), state.AccOdSubs[acc]...)
+	subs2 := append([]FnOdChange(nil), state.AccOdSubs["*"]...)
+	state.orderSubLock.Unlock()
+	fireOdChange(subs, subs2, acc, od, evt)
+}
+
+func fireOdChange(subs, wildcard []FnOdChange, acc string, od *ormo.InOutOrder, evt int) {
+	subs = append(subs, wildcard...)
 	// 将模拟时间置为事件触发时间，并备份当前时间
 	evtTime := int64(0)
 	if evt == OdChgEnter {
@@ -804,7 +810,14 @@ func (w Warms) Update(pair, tf string, num int) {
 JobForbidType 0 allow; 1 forbid; 2 forbid & occupy a slot
 */
 func JobForbidType(pair, tf, stratID string) int {
-	if jobs, ok := ForbidJobs[fmt.Sprintf("%s_%s", pair, tf)]; ok {
+	return jobForbidType(LegacyState(), pair, tf, stratID)
+}
+
+func jobForbidType(state *State, pair, tf, stratID string) int {
+	if state == nil {
+		state = LegacyState()
+	}
+	if jobs, ok := state.ForbidJobs[fmt.Sprintf("%s_%s", pair, tf)]; ok {
 		hold, ok2 := jobs[stratID]
 		if ok2 {
 			if hold {
@@ -948,6 +961,55 @@ func PrintStratGroups() {
 		if len(disables) > 0 {
 			text := core.GroupByPairQuotes(disables, true)
 			log.Info("group disable jobs by strat_tf", zap.String("acc", acc), zap.String("res", "\n"+text))
+		}
+	}
+}
+
+// PrintStratGroupsWithState is the typed logging view used by Runtime
+// runners. It intentionally performs the same low-frequency formatting as
+// PrintStratGroups while reading only the supplied strategy/core registries.
+func PrintStratGroupsWithState(strategyState *State, coreState *core.State) {
+	if strategyState == nil {
+		PrintStratGroups()
+		return
+	}
+	strategyState.ensureMaps()
+	pairs := []string(nil)
+	if coreState != nil {
+		pairs = coreState.Pairs
+	} else {
+		pairs = core.Pairs
+	}
+	log.Info("global pairs", zap.String("res", "\n"+core.GroupByPairQuotes(map[string][]string{"Pairs": pairs}, false)))
+	for acc, jobMap := range strategyState.AccJobs {
+		allows := make(map[string][]string)
+		disables := make(map[string][]string)
+		for pairTF, stratMap := range jobMap {
+			arrP := strings.Split(pairTF, "_")
+			if len(arrP) != 2 {
+				continue
+			}
+			pair, tf := arrP[0], arrP[1]
+			for stratID := range stratMap {
+				key := fmt.Sprintf("%s_%s", stratID, tf)
+				enabled := false
+				if coreState != nil {
+					enabled = coreState.PairEnabled(pair)
+				} else {
+					enabled = core.PairsMap[pair]
+				}
+				if enabled {
+					allows[key] = append(allows[key], pair)
+				} else {
+					disables[key] = append(disables[key], pair)
+				}
+			}
+		}
+		if len(allows) > 0 {
+			log.Info("group jobs by strat_tf", zap.String("acc", acc), zap.String("res", "\n"+core.GroupByPairQuotes(allows, true)))
+		}
+		if len(disables) > 0 {
+			log.Info("group disable jobs by strat_tf", zap.String("acc", acc), zap.String("res", "\n"+core.GroupByPairQuotes(disables, true)))
 		}
 	}
 }

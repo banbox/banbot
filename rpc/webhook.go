@@ -3,7 +3,6 @@ package rpc
 import (
 	"bytes"
 	"fmt"
-	"github.com/banbox/banbot/btime"
 	"io"
 	"net/http"
 	"net/url"
@@ -11,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	utils2 "github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
@@ -24,7 +24,10 @@ type WebHook struct {
 	webHookItem
 	name       string
 	wg         sync.WaitGroup
+	stateMu    sync.RWMutex
+	owner      *rpcOwner
 	msgArr     []map[string]string // 待发送列表
+	retryNum   int                 // msgArr中已经尝试发送、无需再次计数的消息数
 	retryCnt   int                 // 重试次数，发送成功时重置
 	lastSentAt int64               // 上次发送时间戳
 	doSendMsgs func([]map[string]string) []map[string]string
@@ -32,6 +35,117 @@ type WebHook struct {
 	MsgTypes   map[string]bool
 	Accounts   map[string]bool
 	Queue      chan map[string]string
+}
+
+// rpcOwner closes admission before closing the queue and tracks every
+// goroutine owned by one RPC channel instance.
+type rpcOwner struct {
+	mu          sync.Mutex
+	closed      bool
+	stop        chan struct{}
+	closeOnce   sync.Once
+	enqueueWait sync.WaitGroup
+	taskDone    chan struct{}
+	taskCount   int
+}
+
+func newRPCOwner() *rpcOwner {
+	done := make(chan struct{})
+	close(done)
+	return &rpcOwner{
+		stop:     make(chan struct{}),
+		taskDone: done,
+	}
+}
+
+func admitRPC[T any](o *rpcOwner, queue chan T, payload T, beforeSend func()) bool {
+	if o == nil || queue == nil {
+		return false
+	}
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return false
+	}
+	if beforeSend != nil {
+		beforeSend()
+	}
+	o.enqueueWait.Add(1)
+	o.mu.Unlock()
+	defer o.enqueueWait.Done()
+
+	select {
+	case queue <- payload:
+		return true
+	case <-o.stop:
+		return false
+	}
+}
+
+func (o *rpcOwner) startTask() bool {
+	if o == nil {
+		return true
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return false
+	}
+	if o.taskCount == 0 {
+		o.taskDone = make(chan struct{})
+	}
+	o.taskCount++
+	return true
+}
+
+func (o *rpcOwner) doneTask() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	if o.taskCount > 0 {
+		o.taskCount--
+		if o.taskCount == 0 {
+			close(o.taskDone)
+		}
+	}
+	o.mu.Unlock()
+}
+
+func (o *rpcOwner) isClosed() bool {
+	if o == nil {
+		return false
+	}
+	o.mu.Lock()
+	closed := o.closed
+	o.mu.Unlock()
+	return closed
+}
+
+func (o *rpcOwner) stopQueue(queue chan map[string]string) {
+	if o == nil {
+		return
+	}
+	o.closeOnce.Do(func() {
+		o.mu.Lock()
+		o.closed = true
+		close(o.stop)
+		o.mu.Unlock()
+		o.enqueueWait.Wait()
+		if queue != nil {
+			close(queue)
+		}
+	})
+}
+
+func (o *rpcOwner) join() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	done := o.taskDone
+	o.mu.Unlock()
+	<-done
 }
 
 // 这是rpc_channels中的通用参数
@@ -83,6 +197,7 @@ func NewWebHook(name string, item map[string]interface{}) *WebHook {
 	res := &WebHook{
 		webHookItem: cfg,
 		name:        name,
+		owner:       newRPCOwner(),
 		Config:      item,
 		MsgTypes:    make(map[string]bool),
 		Accounts:    make(map[string]bool),
@@ -106,15 +221,20 @@ func (h *WebHook) GetName() string {
 }
 
 func (h *WebHook) IsDisable() bool {
-	return h.Disable
+	h.stateMu.RLock()
+	disabled := h.Disable
+	h.stateMu.RUnlock()
+	return disabled
 }
 
 func (h *WebHook) SetDisable(val bool) {
+	h.stateMu.Lock()
 	h.Disable = val
+	h.stateMu.Unlock()
 }
 
 func (h *WebHook) SendMsg(msgType string, account string, payload map[string]string) bool {
-	if h.Disable {
+	if h.IsDisable() {
 		return false
 	}
 	if len(h.MsgTypes) > 0 {
@@ -139,21 +259,75 @@ func (h *WebHook) SendMsg(msgType string, account string, payload map[string]str
 			return false
 		}
 	}
-	h.Queue <- payload
-	h.wg.Add(1)
-	return true
+	added := false
+	ok := admitRPC(h.lifecycleOwner(), h.Queue, payload, func() {
+		h.wg.Add(1)
+		added = true
+	})
+	if !ok && added {
+		h.wg.Done()
+	}
+	return ok
 }
 
 func (h *WebHook) CleanUp() {
-	h.Disable = true
-	h.wg.Wait()
-	close(h.Queue)
+	h.Stop()
+	h.Join()
+}
+
+func (h *WebHook) Close() {
+	h.Stop()
+	h.Join()
+}
+
+// Stop closes message admission and signals all owned workers without waiting
+// for callbacks that are already running.
+func (h *WebHook) Stop() {
+	if h == nil {
+		return
+	}
+	h.SetDisable(true)
+	owner := h.lifecycleOwner()
+	owner.stopQueue(h.Queue)
+}
+
+// Join waits for all workers admitted before Stop and discards any messages
+// that were queued but could not be sent after shutdown.
+func (h *WebHook) Join() {
+	if h == nil {
+		return
+	}
+	h.Stop()
+	owner := h.lifecycleOwner()
+	owner.join()
+	h.discardPending()
+}
+
+func (h *WebHook) lifecycleOwner() *rpcOwner {
+	if h == nil {
+		return nil
+	}
+	h.stateMu.Lock()
+	if h.owner == nil {
+		h.owner = newRPCOwner()
+	}
+	owner := h.owner
+	h.stateMu.Unlock()
+	return owner
 }
 
 func (h *WebHook) ConsumeForever() {
-	if h.Disable {
+	if h.IsDisable() {
 		return
 	}
+	owner := h.lifecycleOwner()
+	if owner != nil {
+		if !owner.startTask() {
+			return
+		}
+		defer owner.doneTask()
+	}
+	defer h.discardPending()
 	name := h.GetName()
 	log.Debug("start consume rpc for", zap.String("name", name))
 	for {
@@ -187,18 +361,79 @@ func (h *WebHook) doSend() {
 	}
 	sleepMSecs := int64(minGapSecs)*1000 - (btime.UTCStamp() - h.lastSentAt)
 	if sleepMSecs > 0 {
-		time.Sleep(time.Duration(sleepMSecs) * time.Millisecond)
+		timer := time.NewTimer(time.Duration(sleepMSecs) * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-h.stopChan():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			h.discardPending()
+			return
+		}
+	}
+	if owner := h.lifecycleOwner(); owner != nil && owner.isClosed() {
+		h.discardPending()
+		return
 	}
 	h.readCache()
 	beforeNum := len(h.msgArr)
+	trackedNum := beforeNum - h.retryNum
+	if trackedNum < 0 {
+		trackedNum = 0
+	}
+	defer h.doneMessages(trackedNum)
+	if h.doSendMsgs == nil {
+		h.msgArr = nil
+		h.retryNum = 0
+		return
+	}
 	h.msgArr = h.doSendMsgs(h.msgArr)
+	h.retryNum = len(h.msgArr)
 	okNum := beforeNum - len(h.msgArr)
 	if okNum > 0 {
 		h.retryCnt = 0
 		h.lastSentAt = btime.UTCStamp()
-		h.wg.Add(0 - okNum)
 	} else {
 		h.retryCnt += 1
+	}
+}
+
+func (h *WebHook) stopChan() <-chan struct{} {
+	owner := h.lifecycleOwner()
+	if owner == nil {
+		return nil
+	}
+	return owner.stop
+}
+
+func (h *WebHook) doneMessages(num int) {
+	for i := 0; i < num; i++ {
+		h.wg.Done()
+	}
+}
+
+func (h *WebHook) discardPending() {
+	trackedNum := len(h.msgArr) - h.retryNum
+	if trackedNum < 0 {
+		trackedNum = 0
+	}
+	h.msgArr = nil
+	h.retryNum = 0
+	h.doneMessages(trackedNum)
+	for h.Queue != nil {
+		select {
+		case _, ok := <-h.Queue:
+			if !ok {
+				return
+			}
+			h.doneMessages(1)
+		default:
+			return
+		}
 	}
 }
 

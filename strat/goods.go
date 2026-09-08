@@ -6,6 +6,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
@@ -30,6 +31,10 @@ RelayPolicyGroups 获取需要接力开单的策略分组
 用于对不同起止时间且不同周期的策略，划分不同组，提高整体效率
 */
 func RelayPolicyGroups() []*PolicyGroup {
+	return RelayPolicyGroupsWithSymbolState(nil)
+}
+
+func RelayPolicyGroupsWithSymbolState(symbols *orm.SymbolState) []*PolicyGroup {
 	tfScores := make(map[string]float64)
 	allowTfs := allAllowTFs()
 	for _, tf := range allowTfs {
@@ -53,6 +58,7 @@ func RelayPolicyGroups() []*PolicyGroup {
 				Strat:     stgy,
 				DataHub:   NewDataHub(),
 				TimeFrame: tf,
+				symbols:   symbols,
 			}
 			infos := CollectDataSubs(job)
 			for _, it := range infos {
@@ -116,6 +122,15 @@ func RelayPolicyGroups() []*PolicyGroup {
 // CalcPairTfScores Calculate the K-line quality score of each dimension of the trading pair
 // 计算交易对各维度K线质量分数
 func CalcPairTfScores(exchange banexg.BanExchange, pairs []string) (map[string]map[string]float64, *errs.Error) {
+	return CalcPairTfScoresWithSymbolState(nil, exchange, pairs)
+}
+
+// CalcPairTfScoresWithSymbolState keeps symbol lookup and K-line loading on
+// the supplied runtime state. Scoring itself remains the existing hot loop.
+func CalcPairTfScoresWithSymbolState(symbols *orm.SymbolState, exchange banexg.BanExchange, pairs []string) (map[string]map[string]float64, *errs.Error) {
+	if exchange == nil && symbols == nil {
+		exchange = exg.Default
+	}
 	pairTfScores := make(map[string]map[string]float64)
 	allowTfs := allAllowTFs()
 	if len(allowTfs) == 0 {
@@ -134,6 +149,10 @@ func CalcPairTfScores(exchange banexg.BanExchange, pairs []string) (map[string]m
 			pairTfScores[pair] = map[string]float64{wsModeTf: 1.0}
 		}
 		return pairTfScores, nil
+	}
+	if exchange == nil {
+		return pairTfScores, errs.NewMsg(core.ErrExgNotInit,
+			"runtime exchange is required to score strategy pairs")
 	}
 	handle := func(pair, timeFrame string, arr []*banexg.Kline, adjs []*orm.AdjInfo) {
 		tfScores, ok := pairTfScores[pair]
@@ -158,7 +177,7 @@ func CalcPairTfScores(exchange banexg.BanExchange, pairs []string) (map[string]m
 	}
 	backNum := 600
 	for _, tf := range allowTfs {
-		err := orm.FastBulkOHLCV(exchange, pairs, tf, 0, 0, backNum, handle)
+		err := orm.FastBulkOHLCVWithSymbolState(symbols, exchange, pairs, tf, 0, 0, backNum, handle)
 		if err != nil {
 			return pairTfScores, err
 		}

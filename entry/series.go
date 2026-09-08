@@ -59,6 +59,10 @@ func writeSeriesDefinitions(out io.Writer, sources []data.DataSource) error {
 }
 
 func RunSeriesDown(args *config.CmdArgs) *errs.Error {
+	return runLegacyEntrySession(func() *errs.Error { return runSeriesDown(args) })
+}
+
+func runSeriesDown(args *config.CmdArgs) *errs.Error {
 	sources, err := resolveSeriesSources(args.Tables)
 	if err != nil {
 		return err

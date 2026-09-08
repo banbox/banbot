@@ -10,11 +10,11 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/goods"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
@@ -40,23 +40,78 @@ strat.AccInfoJobs
 	return：pair:timeframe:warmNum, acc:exit orders, error
 */
 func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[string]map[string]int, map[string][]*ormo.InOutOrder, *errs.Error) {
+	return loadStratJobsWithExchange(nil, nil, nil, nil, pairs, tfScores)
+}
+
+// LoadStratJobsWithSymbolState loads strategy jobs using the supplied symbol state.
+func LoadStratJobsWithSymbolState(symbols *orm.SymbolState, pairs []string, tfScores map[string]map[string]float64) (map[string]map[string]int, map[string][]*ormo.InOutOrder, *errs.Error) {
+	hooks := SnapshotPairUpdateHooks()
+	exchange, _ := resolveStratExchange(nil, nil, symbols, hooks)
+	return loadStratJobsWithExchange(nil, nil, symbols, exchange, pairs, tfScores)
+}
+
+// LoadStratJobsWithState loads strategy registries into explicit runtime
+// state. Typed runners use this path instead of installing package globals.
+func LoadStratJobsWithState(strategyState *State, runtimeState *core.State, symbols *orm.SymbolState,
+	pairs []string, tfScores map[string]map[string]float64, orderStates ...*ormo.OrderState) (map[string]map[string]int, map[string][]*ormo.InOutOrder, *errs.Error) {
+	hooks := SnapshotPairUpdateHooks()
+	if strategyState != nil {
+		if stateHooks := strategyState.PairUpdateHooks(); stateHooks.SubWarmPairs != nil {
+			hooks = stateHooks
+		}
+	}
+	exchange, _ := resolveStratExchange(nil, runtimeState, symbols, hooks)
+	return loadStratJobsWithExchange(strategyState, runtimeState, symbols, exchange, pairs, tfScores, orderStates...)
+}
+
+// LoadStratJobsWithRuntimeState keeps pair admission on the supplied runtime
+// state while retaining the legacy strategy registries and job lifecycle.
+func LoadStratJobsWithRuntimeState(state *core.State, symbols *orm.SymbolState, pairs []string, tfScores map[string]map[string]float64) (map[string]map[string]int, map[string][]*ormo.InOutOrder, *errs.Error) {
+	hooks := SnapshotPairUpdateHooks()
+	exchange, _ := resolveStratExchange(nil, state, symbols, hooks)
+	return loadStratJobsWithExchange(nil, state, symbols, exchange, pairs, tfScores)
+}
+
+func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols *orm.SymbolState, exchange banexg.BanExchange,
+	pairs []string, tfScores map[string]map[string]float64, orderStates ...*ormo.OrderState) (map[string]map[string]int, map[string][]*ormo.InOutOrder, *errs.Error) {
 	if len(pairs) == 0 || len(tfScores) == 0 {
 		return nil, nil, errs.NewMsg(errs.CodeParamRequired, "`pairs` and `tfScores` are required for LoadStratJobs")
 	}
-	// Set the global variables involved to null, as will be updated below
-	// 将涉及的全局变量置为空，下面会更新
-	core.TFSecs = make(map[string]int)
-	core.StgPairTfs = make(map[string]map[string]string)
-	core.LockOdMatch.Lock()
-	core.OrderMatchTfs = make(map[string]bool)
-	core.LockOdMatch.Unlock()
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
+	if state != nil {
+		state.EnsureRuntimeMaps()
+	}
+	// Explicit runtimes own these maps. The package globals are reset only for
+	// the compatibility facade, so loading a second runtime cannot overwrite
+	// the first runtime's admission and timeframe state.
+	var tfSecs map[string]int
+	var stgPairTfs map[string]map[string]string
+	if state != nil {
+		tfSecs = state.TFSecs
+		stgPairTfs = state.StgPairTfs
+		state.LockOdMatch.Lock()
+		state.OrderMatchTfs = make(map[string]bool)
+		state.LockOdMatch.Unlock()
+	} else {
+		core.TFSecs = make(map[string]int)
+		core.StgPairTfs = make(map[string]map[string]string)
+		core.LockOdMatch.Lock()
+		core.OrderMatchTfs = make(map[string]bool)
+		core.LockOdMatch.Unlock()
+		tfSecs = core.TFSecs
+		stgPairTfs = core.StgPairTfs
+	}
 	config.ClearRefineMap()
-	resetJobs()
+	Versions := strategyState.Versions
+	resetJobsWithState(strategyState, state, orderStates...)
 	pairTfWarms := make(Warms)
 	// 记录每个账户下，每个策略的任务数量，防止超过账户要求数量
 	accLimits, maxJobNum := newAccStratLimits()
 	for _, pol := range config.RunPolicy {
-		stgy := New(pol)
+		stgy := newStrategyWithState(strategyState, pol)
 		polID := pol.ID()
 		if stgy == nil {
 			return nil, nil, errs.NewMsg(core.ErrRunTime, "strategy %s load fail", polID)
@@ -68,11 +123,11 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 		}
 		holdNum := 0
 		failTfScores := make(map[string]map[string]float64)
-		var curPairs, err = getPolicyPairs(pol, pairs)
+		var curPairs, err = getPolicyPairsWithRuntimeState(state, symbols, exchange, pol, pairs)
 		if err != nil {
 			return nil, nil, err
 		}
-		exsList, err := CallStratSymbols(stgy, curPairs, tfScores)
+		exsList, err := callStratSymbolsWithExchange(state, symbols, exchange, stgy, curPairs, tfScores)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -80,8 +135,8 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 		// 旧job允许开单的，先添加计数
 		oldAllowOpen := stgy.OrderOnRotation == "open"
 		oldAddPairs := make(map[string]bool)
-		for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
-			accJobs := AccJobs[acc]
+		for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+			accJobs := strategyState.AccJobs[acc]
 			codes := make([]string, 0, len(exsList)/2)
 			for _, jobs := range accJobs {
 				if job, ok := jobs[polID]; ok {
@@ -117,7 +172,7 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 				}
 				continue
 			}
-			jobType := JobForbidType(exs.Symbol, tf, polID)
+			jobType := jobForbidType(strategyState, exs.Symbol, tf, polID)
 			if jobType > 0 {
 				if jobType > 1 && !pairAdded {
 					// 任务禁止，但增加占位
@@ -132,15 +187,15 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 				}
 				continue
 			}
-			items, ok := PairStrats[exs.Symbol]
+			items, ok := strategyState.PairStrats[exs.Symbol]
 			if !ok {
 				items = make(map[string]*TradeStrat)
-				PairStrats[exs.Symbol] = items
+				strategyState.PairStrats[exs.Symbol] = items
 			}
 			if _, ok = items[polID]; ok {
 				// 当前pair+stratID已有任务，跳过
 				newAdd := 0
-				newAdd, err = markStratJob(tf, polID, exs, dirt, accLimits)
+				newAdd, err = markStratJobWithState(strategyState, tf, polID, exs, dirt, accLimits)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -152,13 +207,13 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 			// Check for proprietary parameters of the current target and reinitialize the strategy
 			// 检查有当前标的专有参数，重新初始化策略
 			if curPol, isDiff := pol.PairDup(exs.Symbol); isDiff {
-				curStgy = New(curPol)
+				curStgy = newStrategyWithState(strategyState, curPol)
 			}
 			items[polID] = curStgy
 			holdNum += 1
 			// 初始化BarEnv
-			env := initBarEnv(exs, tf)
-			ensureStratJob(curStgy, tf, exs, env, dirt, pairTfWarms.Update, accLimits)
+			env := initBarEnvWithState(strategyState, state, exs, tf)
+			ensureStratJobWithRuntimeState(strategyState, state, curStgy, tf, exs, env, dirt, pairTfWarms.Update, accLimits, symbols)
 		}
 		printFailTfScores(polID, failTfScores)
 	}
@@ -170,8 +225,8 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 	newPairs := make(map[string]bool)  // 继续监听的品种
 	pairTfs := make(Warms)
 	holdPosition := config.PairMgr.PosOnRotation != "close"
-	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
-		jobs := AccJobs[acc]
+	for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+		jobs := strategyState.AccJobs[acc]
 		exitOds := make([]*ormo.InOutOrder, 0, 4)
 		for envKey := range utils.MapKeys(jobs, config.StrictBacktest()) {
 			envJobs := jobs[envKey]
@@ -188,10 +243,12 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 						if job.Strat.OnShutDown != nil {
 							job.Strat.OnShutDown(job)
 						}
-						unRegWsJob(job)
+						unRegWsJobWithState(strategyState, job)
 						exitJobs[job] = true
 						exitPairs[job.Symbol.Symbol] = true
-						if job.EnteredNum > 0 {
+						if jobHasOutstandingOrders(job) || len(job.LongOrders) > 0 || len(job.ShortOrders) > 0 {
+							job.pairRemovalPending = true
+							resJobs[name] = job
 							exitOds = append(exitOds, job.LongOrders...)
 							exitOds = append(exitOds, job.ShortOrders...)
 						}
@@ -204,21 +261,26 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 			}
 			if len(resJobs) > 0 {
 				jobs[envKey] = resJobs
+				hasLiveJob := false
 				arr := strings.Split(envKey, "_")
 				pair, tf := arr[0], arr[1]
-				if _, ok := core.TFSecs[tf]; !ok {
-					core.TFSecs[tf] = utils2.TFToSecs(tf)
+				if _, ok := tfSecs[tf]; !ok {
+					tfSecs[tf] = utils2.TFToSecs(tf)
 				}
 				for name := range utils.MapKeys(resJobs, config.StrictBacktest()) {
 					j := resJobs[name]
-					subMap, ok := core.StgPairTfs[j.Strat.Name]
+					if j.pairRemovalPending {
+						continue
+					}
+					hasLiveJob = true
+					subMap, ok := stgPairTfs[j.Strat.Name]
 					if !ok {
 						subMap = make(map[string]string)
-						core.StgPairTfs[j.Strat.Name] = subMap
+						stgPairTfs[j.Strat.Name] = subMap
 					}
 					subMap[pair] = tf
 					if len(j.Strat.WsSubs) > 0 {
-						err := regWsJob(j)
+						err := regWsJobWithState(strategyState, j)
 						if err != nil {
 							return nil, nil, err
 						}
@@ -226,8 +288,10 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 					matchTf, _ := config.GetStratRefineTF(j.Strat.Name, tf)
 					pairTfs.Update(pair, matchTf, 0)
 				}
-				envKeys[envKey] = true
-				pairTfs.Update(pair, tf, 0)
+				if hasLiveJob {
+					envKeys[envKey] = true
+					pairTfs.Update(pair, tf, 0)
+				}
 			} else {
 				delete(jobs, envKey)
 			}
@@ -245,14 +309,11 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 		keys := utils2.KeysOfMap(exitPairs)
 		log.Info("exit pairs", zap.Int("num", len(keys)), zap.Strings("arr", keys))
 	}
-	for k := range core.PairsMap {
-		_, ok := newPairs[k]
-		core.PairsMap[k] = ok
-	}
+	setAdmissionSnapshot(state, newPairs)
 	// 从AccInfoJobs中移除已取消的项
 	lockInfoJobs.Lock()
-	for acc := range utils.MapKeys(AccInfoJobs, config.StrictBacktest()) {
-		jobMap := AccInfoJobs[acc]
+	for acc := range utils.MapKeys(strategyState.AccInfoJobs, config.StrictBacktest()) {
+		jobMap := strategyState.AccInfoJobs[acc]
 		newJobMap := make(map[string]map[string]*StratJob)
 		for subKey := range utils.MapKeys(jobMap, config.StrictBacktest()) {
 			stgMap := jobMap[subKey]
@@ -269,34 +330,40 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 				newJobMap[subKey] = newStgMap
 				source, sid, tf, ok := ParseDataSubKey(subKey)
 				if ok {
-					if _, ok = core.TFSecs[tf]; !ok {
-						core.TFSecs[tf] = utils2.TFToSecs(tf)
+					if _, ok = tfSecs[tf]; !ok {
+						tfSecs[tf] = utils2.TFToSecs(tf)
 					}
 					if source == "kline" {
-						if exs := orm.GetSymbolByID(sid); exs != nil {
+						var exs *orm.ExSymbol
+						if symbols == nil {
+							exs = orm.GetSymbolByID(sid)
+						} else {
+							exs = symbols.GetSymbolByID(sid)
+						}
+						if exs != nil {
 							pairTfs.Update(exs.Symbol, tf, 0)
 							envKeys[strings.Join([]string{exs.Symbol, tf}, "_")] = true
-							initBarEnv(exs, tf)
+							initBarEnvWithState(strategyState, state, exs, tf)
 						}
 					}
 				}
 			}
 		}
-		AccInfoJobs[acc] = newJobMap
+		strategyState.AccInfoJobs[acc] = newJobMap
 	}
 	lockInfoJobs.Unlock()
 	// Ensure that all pairs and TFs are recorded in the returned data to prevent them from being removed by the data subscriber
 	// 确保所有pair、tf都在返回的中有记录，防止被数据订阅端移除
-	for _, pairMap := range core.StgPairTfs {
+	for _, pairMap := range stgPairTfs {
 		for pair, tf := range pairMap {
 			pairTfs.Update(pair, tf, 0)
 		}
 	}
 	// Remove useless items from PairStrats
 	// 从PairStrats中删除无用的项
-	for pair, stgMap := range PairStrats {
+	for pair, stgMap := range strategyState.PairStrats {
 		for name := range stgMap {
-			if pairMap, ok := core.StgPairTfs[name]; ok {
+			if pairMap, ok := stgPairTfs[name]; ok {
 				if _, ok = pairMap[pair]; ok {
 					continue
 				}
@@ -306,10 +373,10 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 	}
 	// Remove useless items from Envs
 	// 从Envs中删除无用的项
-	for envKey := range Envs {
+	for envKey := range strategyState.Envs {
 		if _, ok := envKeys[envKey]; !ok {
-			delete(Envs, envKey)
-			delete(TmpEnvs, envKey)
+			delete(strategyState.Envs, envKey)
+			delete(strategyState.TmpEnvs, envKey)
 		}
 	}
 	// 从pairTfs中确认哪些要恢复
@@ -329,8 +396,18 @@ func LoadStratJobs(pairs []string, tfScores map[string]map[string]float64) (map[
 }
 
 func ExitStratJobs() {
-	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
-		jobs := AccJobs[acc]
+	ExitStratJobsWithState(nil)
+}
+
+// ExitStratJobsWithState shuts down strategy callbacks owned by one runtime.
+// A nil state preserves the legacy package facade; explicit runners never need
+// to consult the process-global strategy registries during cleanup.
+func ExitStratJobsWithState(strategyState *State) {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+		jobs := strategyState.AccJobs[acc]
 		for envKey := range utils.MapKeys(jobs, config.StrictBacktest()) {
 			items := jobs[envKey]
 			for name := range utils.MapKeys(items, config.StrictBacktest()) {
@@ -338,16 +415,26 @@ func ExitStratJobs() {
 				if job.Strat.OnShutDown != nil {
 					job.Strat.OnShutDown(job)
 				}
-				unRegWsJob(job)
+				unRegWsJobWithState(strategyState, job)
 			}
 		}
 	}
-	cacheMu.Lock()
-	strats := make([]*TradeStrat, 0, len(cacheStrats))
-	for _, stg := range cacheStrats {
-		strats = append(strats, stg)
+	var strats []*TradeStrat
+	if strategyState == legacyState {
+		cacheMu.Lock()
+		strats = make([]*TradeStrat, 0, len(cacheStrats))
+		for _, stg := range cacheStrats {
+			strats = append(strats, stg)
+		}
+		cacheMu.Unlock()
+	} else {
+		strategyState.cacheMu.Lock()
+		strats = make([]*TradeStrat, 0, len(strategyState.cacheStrats))
+		for _, stg := range strategyState.cacheStrats {
+			strats = append(strats, stg)
+		}
+		strategyState.cacheMu.Unlock()
 	}
-	cacheMu.Unlock()
 	for _, stg := range strats {
 		if stg.OnStratExit != nil {
 			stg.OnStratExit()
@@ -356,9 +443,35 @@ func ExitStratJobs() {
 }
 
 func CallStratSymbols(stgy *TradeStrat, curPairs []string, tfScores map[string]map[string]float64) ([]*orm.ExSymbol, *errs.Error) {
+	return callStratSymbolsWithExchange(nil, nil, nil, stgy, curPairs, tfScores)
+}
+
+// CallStratSymbolsWithSymbolState resolves strategy symbols from the supplied state.
+func CallStratSymbolsWithSymbolState(symbols *orm.SymbolState, stgy *TradeStrat, curPairs []string, tfScores map[string]map[string]float64) ([]*orm.ExSymbol, *errs.Error) {
+	hooks := SnapshotPairUpdateHooks()
+	exchange, _ := resolveStratExchange(nil, nil, symbols, hooks)
+	return callStratSymbolsWithExchange(nil, symbols, exchange, stgy, curPairs, tfScores)
+}
+
+// CallStratSymbolsWithRuntimeState keeps dynamic pair admission on the
+// supplied runtime state while preserving legacy behavior for a nil state.
+func CallStratSymbolsWithRuntimeState(state *core.State, symbols *orm.SymbolState, stgy *TradeStrat, curPairs []string, tfScores map[string]map[string]float64) ([]*orm.ExSymbol, *errs.Error) {
+	hooks := SnapshotPairUpdateHooks()
+	exchange, _ := resolveStratExchange(nil, state, symbols, hooks)
+	return callStratSymbolsWithExchange(state, symbols, exchange, stgy, curPairs, tfScores)
+}
+
+func callStratSymbolsWithExchange(state *core.State, symbols *orm.SymbolState, exchange banexg.BanExchange,
+	stgy *TradeStrat, curPairs []string, tfScores map[string]map[string]float64) ([]*orm.ExSymbol, *errs.Error) {
 	var exsMap = make(map[string]*orm.ExSymbol)
 	for _, pair := range curPairs {
-		exs, err := orm.GetExSymbolCur(pair)
+		var exs *orm.ExSymbol
+		var err *errs.Error
+		if symbols == nil {
+			exs, err = orm.GetExSymbolCur(pair)
+		} else {
+			exs, err = symbols.GetExSymbolCur(pair)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -376,23 +489,30 @@ func CallStratSymbols(stgy *TradeStrat, curPairs []string, tfScores map[string]m
 			newPairs := make([]string, 0, len(adds))
 			for _, pair := range adds {
 				if _, ok := exsMap[pair]; !ok {
-					exs, err := orm.GetExSymbolCur(pair)
+					var exs *orm.ExSymbol
+					var err *errs.Error
+					if symbols == nil {
+						exs, err = orm.GetExSymbolCur(pair)
+					} else {
+						exs, err = symbols.GetExSymbolCur(pair)
+					}
 					if err != nil {
 						return nil, err
 					}
 					exsMap[pair] = exs
 					if _, ok = tfScores[pair]; !ok {
 						newPairs = append(newPairs, pair)
-						if _, ok = core.PairsMap[pair]; !ok {
-							core.PairsMap[pair] = true
-							core.Pairs = append(core.Pairs, pair)
-						}
+						enableAdmissionPair(state, pair)
 					}
 				}
 			}
 			if len(newPairs) > 0 {
-				pairTfScores, err := CalcPairTfScores(exg.Default, newPairs)
+				explicit := state != nil || symbols != nil || exchange != nil
+				pairTfScores, err := calcPairTfScoresForRuntime(symbols, exchange, explicit, newPairs)
 				if err != nil {
+					if explicit {
+						return nil, err
+					}
 					log.Error("CalcPairTfScores fail", zap.Error(err))
 				} else {
 					for pair, scores := range pairTfScores {
@@ -432,26 +552,60 @@ func printFailTfScores(stratName string, pairTfScores map[string]map[string]floa
 }
 
 func initBarEnv(exs *orm.ExSymbol, tf string) *ta.BarEnv {
+	return initBarEnvWithState(nil, nil, exs, tf)
+}
+
+func initBarEnvWithState(strategyState *State, state *core.State, exs *orm.ExSymbol, tf string) *ta.BarEnv {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
-	env, ok := Envs[envKey]
+	env, ok := strategyState.Envs[envKey]
 	if !ok {
 		var err error
-		env, err = ta.NewBarEnv(core.ExgName, core.Market, exs.Symbol, tf)
+		exgName, market := exs.Exchange, exs.Market
+		if exgName == "" {
+			if state != nil {
+				exgName = state.ExgName
+			} else {
+				exgName = core.ExgName
+			}
+		}
+		if market == "" {
+			if state != nil {
+				market = state.Market
+			} else {
+				market = core.Market
+			}
+		}
+		env, err = ta.NewBarEnv(exgName, market, exs.Symbol, tf)
 		if err != nil {
 			panic(err)
 		}
 		env.MaxCache = core.NumTaCache
+		if state != nil && state.NumTaCache > 0 {
+			env.MaxCache = state.NumTaCache
+		}
 		env.Data.Store("sid", int64(exs.ID))
-		Envs[envKey] = env
+		strategyState.Envs[envKey] = env
 	}
 	return env
 }
 
 func markStratJob(tf, polID string, exs *orm.ExSymbol, dirt int, accLimits accStratLimits) (int, *errs.Error) {
+	return markStratJobWithState(LegacyState(), tf, polID, exs, dirt, accLimits)
+}
+
+func markStratJobWithState(strategyState *State, tf, polID string, exs *orm.ExSymbol, dirt int, accLimits accStratLimits) (int, *errs.Error) {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
 	newAdd := 0
-	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
-		jobs := AccJobs[acc]
+	for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+		jobs := strategyState.AccJobs[acc]
 		envJobs, ok := jobs[envKey]
 		if !ok {
 			// 对于多账户且品种数不一样时，忽略未配置的账户
@@ -484,6 +638,20 @@ func markStratJob(tf, polID string, exs *orm.ExSymbol, dirt int, accLimits accSt
 
 func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarEnv, dirt int,
 	logWarm func(pair, tf string, num int), accLimits accStratLimits) {
+	ensureStratJobWithRuntimeState(LegacyState(), nil, stgy, tf, exs, env, dirt, logWarm, accLimits, nil)
+}
+
+func ensureStratJobWithSymbolState(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarEnv, dirt int,
+	logWarm func(pair, tf string, num int), accLimits accStratLimits, symbols *orm.SymbolState) {
+	ensureStratJobWithRuntimeState(LegacyState(), nil, stgy, tf, exs, env, dirt, logWarm, accLimits, symbols)
+}
+
+func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarEnv, dirt int,
+	logWarm func(pair, tf string, num int), accLimits accStratLimits, symbols *orm.SymbolState) {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
 	logWarm(exs.Symbol, tf, stgy.WarmupNum)
 	if stgy.Policy.RefineTF == nil && stgy.RefineTF != nil {
 		stgy.Policy.RefineTF = stgy.RefineTF
@@ -492,12 +660,18 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 	if matchTf != tf {
 		logWarm(exs.Symbol, matchTf, 0)
 	}
-	core.LockOdMatch.Lock()
-	core.OrderMatchTfs[matchTf] = true
-	core.LockOdMatch.Unlock()
+	if state != nil {
+		state.LockOdMatch.Lock()
+		state.OrderMatchTfs[matchTf] = true
+		state.LockOdMatch.Unlock()
+	} else {
+		core.LockOdMatch.Lock()
+		core.OrderMatchTfs[matchTf] = true
+		core.LockOdMatch.Unlock()
+	}
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
-	for account := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
-		jobs := AccJobs[account]
+	for account := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+		jobs := strategyState.AccJobs[account]
 		envJobs, ok := jobs[envKey]
 		if !ok {
 			envJobs = make(map[string]*StratJob)
@@ -521,11 +695,18 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 				CloseShort:    true,
 				ExgStopLoss:   true,
 				ExgTakeProfit: true,
+				symbols:       symbols,
+				strategyState: strategyState,
+				runtimeCore:   state,
 			}
 			if stgy.OnStartUp != nil {
 				stgy.OnStartUp(job)
 			}
 			envJobs[stgy.Name] = job
+		} else {
+			job.symbols = symbols
+			job.strategyState = strategyState
+			job.runtimeCore = state
 		}
 		if allowOpen {
 			job.MaxOpenShort = stgy.EachMaxShort
@@ -539,7 +720,7 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 		// Load subscription information for other targets
 		// 加载订阅其他标的信息
 		if stgy.OnPairInfos != nil || stgy.OnDataSubs != nil {
-			infoJobs := GetInfoJobs(account)
+			infoJobs := strategyState.InfoJobs(account)
 			hasInfoSubs := false
 			for _, s := range CollectDataSubs(job) {
 				if s == nil || s.ExSymbol == nil {
@@ -548,7 +729,7 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 				hasInfoSubs = true
 				if orm.NormalizeSeriesSource(s.Source) == orm.SeriesSourceKline {
 					pair := s.ExSymbol.Symbol
-					initBarEnv(s.ExSymbol, s.TimeFrame)
+					initBarEnvWithState(strategyState, state, s.ExSymbol, s.TimeFrame)
 					logWarm(pair, s.TimeFrame, s.WarmupNum)
 				}
 				jobKey := DataSubKey(s.Source, s.ExSymbol.ID, s.TimeFrame)
@@ -573,16 +754,28 @@ func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarE
 将jobs的MaxOpenLong,MacOpenShort都置为-1，禁止开单，并更新附加订单
 */
 func resetJobs() {
+	resetJobsWithState(LegacyState(), nil)
+}
+
+func resetJobsWithState(strategyState *State, state *core.State, orderStates ...*ormo.OrderState) {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
+	orderState := ormo.LegacyState()
+	if len(orderStates) > 0 && orderStates[0] != nil {
+		orderState = orderStates[0]
+	}
 	for account := range utils.MapKeys(config.Accounts, config.StrictBacktest()) {
 		cfg := config.Accounts[account]
 		if cfg.NoTrade {
 			continue
 		}
-		openOds, lock := ormo.GetOpenODs(account)
+		openOds, lock := orderState.GetOpenODs(account)
 		lock.Lock()
 		odList := rotationOpenOrderView(openOds)
 		lock.Unlock()
-		accJobs := GetJobs(account)
+		accJobs := strategyState.Jobs(account)
 		for envKey := range utils.MapKeys(accJobs, config.StrictBacktest()) {
 			jobs := accJobs[envKey]
 			for name := range utils.MapKeys(jobs, config.StrictBacktest()) {
@@ -593,14 +786,136 @@ func resetJobs() {
 					job.MaxOpenShort = -1
 				} else {
 					pair := job.Symbol.Symbol
-					if _, ok := core.PairsMap[pair]; !ok {
-						core.PairsMap[pair] = true
-						core.Pairs = append(core.Pairs, pair)
-					}
+					enableAdmissionPair(state, pair)
 				}
 			}
 		}
 	}
+}
+
+func jobHasOutstandingOrders(job *StratJob) bool {
+	if job == nil {
+		return false
+	}
+	if job.EnteredNum > 0 {
+		return true
+	}
+	seen := make(map[*ormo.InOutOrder]struct{}, len(job.LongOrders)+len(job.ShortOrders))
+	for _, orders := range [][]*ormo.InOutOrder{job.LongOrders, job.ShortOrders} {
+		for _, od := range orders {
+			if od == nil {
+				continue
+			}
+			if _, ok := seen[od]; ok {
+				continue
+			}
+			seen[od] = struct{}{}
+			if od.Status < ormo.InOutStatusFullExit {
+				return true
+			}
+			if od.Enter != nil && od.Exit != nil &&
+				od.Enter.Filled-od.Exit.Filled > core.AmtDust {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// FinalizePairRotation removes disabled jobs after their requested exits have
+// reached a terminal state. Until then they remain in AccJobs so order events
+// can still be routed to the owning strategy instance.
+func FinalizePairRotation(strategyState *State, coreStates ...*core.State) {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
+	var coreState *core.State
+	if len(coreStates) > 0 {
+		coreState = coreStates[0]
+	}
+	pairTfs := core.StgPairTfs
+	if coreState != nil {
+		coreState.EnsureRuntimeMaps()
+		pairTfs = coreState.StgPairTfs
+	}
+	finalizedPairs := make(map[string]struct{})
+	lockJobs.Lock()
+	defer lockJobs.Unlock()
+	for account, jobs := range strategyState.AccJobs {
+		for envKey, envJobs := range jobs {
+			for name, job := range envJobs {
+				if job == nil || !job.pairRemovalPending || jobHasOutstandingOrders(job) {
+					continue
+				}
+				delete(envJobs, name)
+				if job.Symbol != nil {
+					if items := strategyState.PairStrats[job.Symbol.Symbol]; items != nil && items[name] == job.Strat {
+						delete(items, name)
+						if len(items) == 0 {
+							delete(strategyState.PairStrats, job.Symbol.Symbol)
+						}
+					}
+					if pairMap := pairTfs[name]; pairMap != nil {
+						delete(pairMap, job.Symbol.Symbol)
+						if len(pairMap) == 0 {
+							delete(pairTfs, name)
+						}
+					}
+					finalizedPairs[job.Symbol.Symbol] = struct{}{}
+				}
+			}
+			if len(envJobs) == 0 {
+				delete(jobs, envKey)
+			}
+		}
+		if len(jobs) == 0 {
+			delete(strategyState.AccJobs, account)
+		}
+	}
+	for pair := range finalizedPairs {
+		used := false
+		for _, pairs := range pairTfs {
+			if _, ok := pairs[pair]; ok {
+				used = true
+				break
+			}
+		}
+		if !used {
+			setAdmissionPair(coreState, pair, false)
+		}
+	}
+}
+
+func admissionPairs(state *core.State) []string {
+	if state != nil {
+		return state.AdmissionPairs()
+	}
+	return core.LegacyAdmissionPairs()
+}
+
+func enableAdmissionPair(state *core.State, pair string) {
+	if state != nil {
+		state.SetAdmissionPair(pair, true)
+		return
+	}
+	core.SetLegacyAdmissionPair(pair, true)
+}
+
+func setAdmissionPair(state *core.State, pair string, enabled bool) {
+	if state != nil {
+		state.SetAdmissionPair(pair, enabled)
+		return
+	}
+	core.SetLegacyAdmissionPair(pair, enabled)
+}
+
+func setAdmissionSnapshot(state *core.State, active map[string]bool) {
+	if state != nil {
+		state.SetAdmissionSnapshot(active)
+		return
+	}
+	core.SetLegacyAdmissionSnapshot(active)
 }
 
 func rotationOpenOrderView(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
@@ -617,6 +932,31 @@ func rotationOpenOrderView(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder
 }
 
 func regWsJob(j *StratJob) *errs.Error {
+	return regWsJobWithState(LegacyState(), j)
+}
+
+func regWsJobWithState(strategyState *State, j *StratJob) *errs.Error {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
+	lockJobs.Lock()
+	defer lockJobs.Unlock()
+	return regWsJobLockedWithState(strategyState, j)
+}
+
+// regWsJobLocked mutates the legacy websocket registry while lockJobs is held.
+// Pair updates already hold that lock across the related job maps, so those
+// callers use this helper to avoid recursive locking.
+func regWsJobLocked(j *StratJob) *errs.Error {
+	return regWsJobLockedWithState(LegacyState(), j)
+}
+
+func regWsJobLockedWithState(strategyState *State, j *StratJob) *errs.Error {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
 	for msgType, subPairs := range j.Strat.WsSubs {
 		if _, ok := core.WsSubMap[msgType]; !ok {
 			return errs.NewMsg(errs.CodeRunTime, "WsSubs.%s for %s is invalid", msgType, j.Strat.Name)
@@ -630,10 +970,10 @@ func regWsJob(j *StratJob) *errs.Error {
 		if msgType == core.WsSubKLine && j.Strat.OnWsKline == nil {
 			continue
 		}
-		pairMap, ok := WsSubJobs[msgType]
+		pairMap, ok := strategyState.WsSubJobs[msgType]
 		if !ok {
 			pairMap = make(map[string]map[*StratJob]bool)
-			WsSubJobs[msgType] = pairMap
+			strategyState.WsSubJobs[msgType] = pairMap
 		}
 		pairArr := strings.Split(subPairs, ",")
 		for _, pairs := range pairArr {
@@ -655,9 +995,35 @@ func regWsJob(j *StratJob) *errs.Error {
 }
 
 func unRegWsJob(j *StratJob) {
+	unRegWsJobWithState(LegacyState(), j)
+}
+
+func unRegWsJobWithState(strategyState *State, j *StratJob) {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
+	lockJobs.Lock()
+	defer lockJobs.Unlock()
+	unRegWsJobLockedWithState(strategyState, j)
+}
+
+// unRegWsJobLocked mutates the legacy websocket registry while lockJobs is
+// held. The compatibility unwatch callback intentionally remains outside the
+// immutable callback snapshot and is invoked before the lock is released by
+// callers that already own the write lock.
+func unRegWsJobLocked(j *StratJob) {
+	unRegWsJobLockedWithState(LegacyState(), j)
+}
+
+func unRegWsJobLockedWithState(strategyState *State, j *StratJob) {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
 	unwatches := make(map[string][]string)
 	for msgType, subPairs := range j.Strat.WsSubs {
-		pairMap, ok := WsSubJobs[msgType]
+		pairMap, ok := strategyState.WsSubJobs[msgType]
 		if !ok {
 			continue
 		}
@@ -678,14 +1044,25 @@ func unRegWsJob(j *StratJob) {
 			unwatches[msgType] = removes
 		}
 	}
-	if len(unwatches) > 0 && WsSubUnWatch != nil {
-		WsSubUnWatch(unwatches)
+	if len(unwatches) > 0 && strategyState.WsSubUnWatch != nil {
+		strategyState.WsSubUnWatch(unwatches)
 	}
 }
 
 var polFilters = make(map[string][]goods.IFilter)
 
 func getPolicyPairs(pol *config.RunPolicyConfig, pairs []string) ([]string, *errs.Error) {
+	return getPolicyPairsWithRuntimeState(nil, nil, nil, pol, pairs)
+}
+
+func getPolicyPairsWithSymbolState(symbols *orm.SymbolState, pol *config.RunPolicyConfig, pairs []string) ([]string, *errs.Error) {
+	hooks := SnapshotPairUpdateHooks()
+	exchange, _ := resolveStratExchange(nil, nil, symbols, hooks)
+	return getPolicyPairsWithRuntimeState(nil, symbols, exchange, pol, pairs)
+}
+
+func getPolicyPairsWithRuntimeState(state *core.State, symbols *orm.SymbolState, exchange banexg.BanExchange,
+	pol *config.RunPolicyConfig, pairs []string) ([]string, *errs.Error) {
 	// According to pol.Pairs determine the tradable symbols
 	// 根据pol.Pairs确定交易的标的
 	if len(pol.Pairs) > 0 {
@@ -709,7 +1086,14 @@ func getPolicyPairs(pol *config.RunPolicyConfig, pairs []string) ([]string, *err
 		}
 		curMS := btime.TimeMS()
 		for _, flt := range filters {
-			pairs, err = flt.Filter(pairs, curMS)
+			if stateFilter, ok := flt.(goods.SymbolStateFilter); ok && (state != nil || symbols != nil || exchange != nil) {
+				if exchange == nil {
+					return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required to filter strategy pairs")
+				}
+				pairs, err = stateFilter.FilterWithSymbolState(symbols, exchange, pairs, curMS)
+			} else {
+				pairs, err = flt.Filter(pairs, curMS)
+			}
 			if err != nil {
 				return nil, err
 			}

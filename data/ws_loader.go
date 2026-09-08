@@ -3,6 +3,7 @@ package data
 import (
 	"archive/zip"
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"github.com/banbox/banbot/btime"
@@ -39,6 +40,12 @@ func (b TradeBatch) TimeMS() int64 {
 
 type WsDataLoader struct {
 	cacheDir   string
+	deps       *RuntimeDeps
+	ctx        context.Context
+	cancel     context.CancelFunc
+	stopOnce   sync.Once
+	workerWait sync.WaitGroup
+	stopped    bool
 	mu         sync.RWMutex
 	httpClient *http.Client
 
@@ -58,14 +65,36 @@ type WsSymbol struct {
 	Date      string
 	Hour      int
 	dataType  string
+	// ArchiveURL overrides the exchange-specific archive endpoint when set.
+	ArchiveURL string
 }
 
 func (info *WsSymbol) FillDefaults() *errs.Error {
+	return info.fillDefaults(nil)
+}
+
+func (info *WsSymbol) fillDefaults(deps *RuntimeDeps) *errs.Error {
 	if info.ExgId == "" {
-		info.ExgId = config.Exchange.Name
+		if deps == nil {
+			info.ExgId = config.Exchange.Name
+		} else {
+			info.ExgId, _ = deps.identity()
+			if info.ExgId == "" && deps.exchange() != nil {
+				info.ExgId = deps.exchange().Info().ID
+			}
+		}
 	}
 	if info.RawSymbol == "" || info.Market == "" {
-		exchange, err := exg.GetWith(info.ExgId, info.Market, "")
+		var exchange banexg.BanExchange
+		var err *errs.Error
+		if deps == nil {
+			exchange, err = exg.GetWith(info.ExgId, info.Market, "")
+		} else {
+			exchange = deps.exchange()
+			if exchange == nil {
+				return errs.NewMsg(core.ErrBadConfig, "runtime exchange is required")
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -101,28 +130,63 @@ func (info *WsSymbol) MidPath() string {
 }
 
 func (info *WsSymbol) DownUrl() string {
-	if info.ExgId == "binance" {
-		// https://data.binance.vision/data/spot/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2025-08-03.zip
-		prefix := "https://data.binance.vision/data"
-		market := banexg.MarketSpot
-		if info.Market == banexg.MarketLinear {
-			market = "futures/um"
-		} else if info.Market == banexg.MarketInverse {
-			market = "futures/cm"
-		} else if info.Market == banexg.MarketOption {
-			market = banexg.MarketOption
-		}
-		name := fmt.Sprintf("%s-%s-%s.zip", info.RawSymbol, info.dataType, info.Date)
-		return fmt.Sprintf("%s/%s/daily/%s/%s/%s", prefix, market, info.dataType, info.RawSymbol, name)
+	url, _ := info.archiveURL()
+	return url
+}
+
+func (info *WsSymbol) archiveURL() (string, *errs.Error) {
+	return info.archiveURLForDeps(nil)
+}
+
+func (info *WsSymbol) archiveURLForDeps(deps *RuntimeDeps) (string, *errs.Error) {
+	if info == nil {
+		return "", errs.NewMsg(errs.CodeParamInvalid, "ws symbol is nil")
 	}
-	panic("exchange not support: " + info.ExgId)
+	if info.ArchiveURL != "" {
+		return info.ArchiveURL, nil
+	}
+	if deps != nil {
+		return exg.BuildArchiveURLForExchange(deps.exchange(), info.Market, info.dataType, info.RawSymbol, info.Date)
+	}
+	return exg.BuildArchiveURL(info.ExgId, info.Market, info.dataType, info.RawSymbol, info.Date)
 }
 
 func NewWsDataLoader() (*WsDataLoader, *errs.Error) {
+	return newWsDataLoader(nil)
+}
+
+// NewWsDataLoaderWithRuntimeDeps binds cache resolution, worker lifetime, and
+// HTTP requests to one runtime. A nil dependency set preserves the legacy
+// package facade.
+func NewWsDataLoaderWithRuntimeDeps(deps *RuntimeDeps) (*WsDataLoader, *errs.Error) {
+	if deps == nil {
+		return NewWsDataLoader()
+	}
+	return newWsDataLoader(deps)
+}
+
+func newWsDataLoader(deps *RuntimeDeps) (*WsDataLoader, *errs.Error) {
 	client := banexg.NewHttpClient()
 	client.Timeout = 120 * time.Second
+	parent := core.Ctx
+	if deps != nil {
+		parent = deps.context()
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	var dataDir string
+	if deps == nil {
+		dataDir = config.GetDataDir()
+	} else {
+		dataDir = deps.dataDir()
+	}
 	loader := &WsDataLoader{
-		cacheDir:   filepath.Join(config.GetDataDir(), "wscache"),
+		cacheDir:   filepath.Join(dataDir, "wscache"),
+		deps:       deps,
+		ctx:        ctx,
+		cancel:     cancel,
 		httpClient: client,
 		tasks:      make(map[*WsSymbol]chan *errs.Error),
 		chanDown:   make(chan *WsSymbol, 100),
@@ -136,7 +200,11 @@ func NewWsDataLoader() (*WsDataLoader, *errs.Error) {
 		logicCpu = 8
 	}
 	for range logicCpu {
-		go loader.downloadWorker()
+		loader.workerWait.Add(1)
+		go func() {
+			defer loader.workerWait.Done()
+			loader.downloadWorker()
+		}()
 	}
 	physicalCounts, err_ := cpu.Counts(false)
 	if err_ != nil {
@@ -146,7 +214,11 @@ func NewWsDataLoader() (*WsDataLoader, *errs.Error) {
 		physicalCounts = 8
 	}
 	for range physicalCounts {
-		go loader.splitWorker()
+		loader.workerWait.Add(1)
+		go func() {
+			defer loader.workerWait.Done()
+			loader.splitWorker()
+		}()
 	}
 	log.Info("start hft data loader workers", zap.Int("download", logicCpu), zap.Int("split", physicalCounts))
 
@@ -155,7 +227,7 @@ func NewWsDataLoader() (*WsDataLoader, *errs.Error) {
 
 // GetCachePath returns the cache path for a specific symbol, date and hour
 func (l *WsDataLoader) GetCachePath(info *WsSymbol, tryRoot bool) (string, bool) {
-	err := info.FillDefaults()
+	err := info.fillDefaults(l.deps)
 	if err != nil {
 		log.Error("fill defaults for ws symbol fail", zap.Error(err))
 	}
@@ -181,16 +253,21 @@ func (l *WsDataLoader) LoadTrades(info *WsSymbol) ([]*banexg.Trade, *errs.Error)
 	cachePath, isCached := l.GetCachePath(info, true)
 	if !isCached {
 		wait := l.submitTask(info)
-		err := <-wait
-		if err != nil {
-			return nil, err
+		select {
+		case err := <-wait:
+			if err != nil {
+				return nil, err
+			}
+		case <-l.context().Done():
+			l.cancelTask(info, wait)
+			return nil, l.canceledError()
 		}
 		cachePath, _ = l.GetCachePath(info, true)
 	}
 	if strings.HasSuffix(cachePath, ".zip") {
 		return l.loadTradeZip(cachePath, info)
 	} else if strings.HasSuffix(cachePath, ".bin") {
-		timeStart := btime.UTCStamp()
+		timeStart := l.nowMS()
 		trades, err_ := loadBinaryTrades(cachePath)
 		if err_ != nil {
 			return nil, errs.New(errs.CodeIOReadFail, err_)
@@ -198,7 +275,7 @@ func (l *WsDataLoader) LoadTrades(info *WsSymbol) ([]*banexg.Trade, *errs.Error)
 		for _, t := range trades {
 			t.Symbol = info.Symbol
 		}
-		cost := btime.UTCStamp() - timeStart
+		cost := l.nowMS() - timeStart
 		log.Debug("load bin ws trades ok", zap.Int("num", len(trades)), zap.Int64("cost", cost),
 			zap.String("path", cachePath))
 		return trades, nil
@@ -208,7 +285,7 @@ func (l *WsDataLoader) LoadTrades(info *WsSymbol) ([]*banexg.Trade, *errs.Error)
 }
 
 func (l *WsDataLoader) loadTradeZip(path string, info *WsSymbol) ([]*banexg.Trade, *errs.Error) {
-	timeStart := btime.UTCStamp()
+	timeStart := l.nowMS()
 	trades := make([]*banexg.Trade, 0, 1000)
 	err := ReadZipCSVs(path, nil, func(inPath string, fid int, fileRaw *zip.File, arg interface{}) *errs.Error {
 		// Pre-allocate trades slice with estimated capacity
@@ -243,7 +320,7 @@ func (l *WsDataLoader) loadTradeZip(path string, info *WsSymbol) ([]*banexg.Trad
 	if err != nil {
 		return nil, err
 	}
-	cost := btime.UTCStamp() - timeStart
+	cost := l.nowMS() - timeStart
 	log.Debug("load csv ws trades cost", zap.Int("num", len(trades)), zap.Int64("cost", cost))
 	return trades, nil
 }
@@ -327,31 +404,160 @@ func (l *WsDataLoader) SplitBigZip(zipPath string, info *WsSymbol) *errs.Error {
 }
 
 func (l *WsDataLoader) submitTask(info *WsSymbol) chan *errs.Error {
+	taskChan := make(chan *errs.Error, 1)
+	if l == nil {
+		completeTask(taskChan, errs.NewMsg(errs.CodeCancel, "ws data loader is nil"))
+		return taskChan
+	}
+	ctx := l.context()
 	l.lockTasks.Lock()
-	taskChan := make(chan *errs.Error)
+	if l.stopped {
+		l.lockTasks.Unlock()
+		completeTask(taskChan, l.canceledError())
+		return taskChan
+	}
+	if l.tasks == nil {
+		l.tasks = make(map[*WsSymbol]chan *errs.Error)
+	}
 	l.tasks[info] = taskChan
-	l.chanDown <- info
 	l.lockTasks.Unlock()
+	if l.chanDown == nil {
+		l.cancelTask(info, taskChan)
+		return taskChan
+	}
+	select {
+	case l.chanDown <- info:
+	case <-ctx.Done():
+		l.cancelTask(info, taskChan)
+	}
 	return taskChan
+}
+
+func (l *WsDataLoader) context() context.Context {
+	if l == nil {
+		return context.Background()
+	}
+	if l.ctx != nil {
+		return l.ctx
+	}
+	if l.deps != nil {
+		if ctx := l.deps.context(); ctx != nil {
+			return ctx
+		}
+	}
+	if core.Ctx != nil {
+		return core.Ctx
+	}
+	return context.Background()
+}
+
+func (l *WsDataLoader) nowMS() int64 {
+	if l.deps != nil {
+		return l.deps.utcStamp()
+	}
+	return btime.UTCStamp()
 }
 
 func (l *WsDataLoader) markTaskDone(info *WsSymbol, err *errs.Error) {
 	l.lockTasks.Lock()
-	taskChan := l.tasks[info]
-	taskChan <- err
-	delete(l.tasks, info)
+	var taskChan chan *errs.Error
+	if l.tasks != nil {
+		taskChan = l.tasks[info]
+		delete(l.tasks, info)
+	}
 	l.lockTasks.Unlock()
+	completeTask(taskChan, err)
+}
+
+func completeTask(taskChan chan *errs.Error, err *errs.Error) {
+	if taskChan == nil {
+		return
+	}
+	select {
+	case taskChan <- err:
+	default:
+	}
+}
+
+func (l *WsDataLoader) cancelTask(info *WsSymbol, taskChan chan *errs.Error) {
+	if l == nil {
+		return
+	}
+	l.lockTasks.Lock()
+	if l.tasks != nil && l.tasks[info] == taskChan {
+		delete(l.tasks, info)
+	}
+	l.lockTasks.Unlock()
+	completeTask(taskChan, l.canceledError())
+}
+
+func (l *WsDataLoader) canceledError() *errs.Error {
+	if err := l.context().Err(); err != nil {
+		return errs.New(errs.CodeCancel, err)
+	}
+	return errs.NewMsg(errs.CodeCancel, "ws data loader stopped")
+}
+
+// Stop closes task admission and cancels queued or active work without waiting
+// for workers. Call Join when the lifecycle owner needs completion.
+func (l *WsDataLoader) Stop() *errs.Error {
+	if l == nil {
+		return nil
+	}
+	l.stopOnce.Do(func() {
+		l.lockTasks.Lock()
+		l.stopped = true
+		pending := make([]chan *errs.Error, 0, len(l.tasks))
+		for info, taskChan := range l.tasks {
+			delete(l.tasks, info)
+			pending = append(pending, taskChan)
+		}
+		l.lockTasks.Unlock()
+		if l.cancel != nil {
+			l.cancel()
+		}
+		cancelErr := l.canceledError()
+		for _, taskChan := range pending {
+			completeTask(taskChan, cancelErr)
+		}
+	})
+	return nil
+}
+
+// Join stops admission and waits for every loader worker to exit.
+func (l *WsDataLoader) Join() {
+	if l == nil {
+		return
+	}
+	l.Stop()
+	l.workerWait.Wait()
 }
 
 func (l *WsDataLoader) downloadWorker() {
+	ctx := l.context()
 	for {
 		select {
-		case <-core.Ctx.Done():
+		case <-ctx.Done():
 			return
-		case info := <-l.chanDown:
+		case info, ok := <-l.chanDown:
+			if !ok {
+				return
+			}
+			if ctx.Err() != nil {
+				l.markTaskDone(info, l.canceledError())
+				continue
+			}
 			tmpPath, err := l.downloadJob(info)
+			if ctx.Err() != nil {
+				l.markTaskDone(info, l.canceledError())
+				continue
+			}
 			if tmpPath != "" {
-				l.chanSplit <- info
+				select {
+				case l.chanSplit <- info:
+				case <-ctx.Done():
+					l.markTaskDone(info, l.canceledError())
+				}
 			} else {
 				l.markTaskDone(info, err)
 			}
@@ -360,14 +566,25 @@ func (l *WsDataLoader) downloadWorker() {
 }
 
 func (l *WsDataLoader) splitWorker() {
+	ctx := l.context()
 	for {
 		select {
-		case <-core.Ctx.Done():
+		case <-ctx.Done():
 			return
-		case info := <-l.chanSplit:
+		case info, ok := <-l.chanSplit:
+			if !ok {
+				return
+			}
+			if ctx.Err() != nil {
+				l.markTaskDone(info, l.canceledError())
+				continue
+			}
 			filePath, _ := l.GetCachePath(info, true)
 			tmpFile := filePath + ".tmp"
 			err := l.SplitBigZip(tmpFile, info)
+			if ctx.Err() != nil {
+				err = l.canceledError()
+			}
 			err_ := os.Remove(tmpFile)
 			if err_ != nil {
 				log.Error("remove zip tmp fail", zap.Error(err_))
@@ -385,10 +602,20 @@ func (l *WsDataLoader) downloadJob(info *WsSymbol) (string, *errs.Error) {
 	}
 
 	tmpFile := filePath + ".tmp"
-	downUrl := info.DownUrl()
+	downUrl, downErr := info.archiveURLForDeps(l.deps)
+	if downErr != nil {
+		return "", downErr
+	}
 	log.Debug("download", zap.String("ws", info.String()))
-	resp, err := l.httpClient.Get(downUrl)
+	request, err := http.NewRequestWithContext(l.context(), http.MethodGet, downUrl, nil)
 	if err != nil {
+		return "", errs.New(errs.CodeNetFail, err)
+	}
+	resp, err := l.httpClient.Do(request)
+	if err != nil {
+		if ctxErr := l.context().Err(); ctxErr != nil {
+			return "", errs.New(errs.CodeCancel, ctxErr)
+		}
 		return "", errs.New(errs.CodeNetFail, err)
 	}
 	defer resp.Body.Close()
@@ -415,6 +642,9 @@ func (l *WsDataLoader) downloadJob(info *WsSymbol) (string, *errs.Error) {
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
 		os.Remove(tmpFile)
+		if ctxErr := l.context().Err(); ctxErr != nil {
+			return "", errs.New(errs.CodeCancel, ctxErr)
+		}
 		return "", errs.New(errs.CodeIOWriteFail, err)
 	}
 

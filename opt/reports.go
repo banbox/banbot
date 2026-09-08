@@ -83,6 +83,7 @@ type BTResult struct {
 	CalcDiff        float64                `json:"calcDiff"`
 	Stability       float64                `json:"stability"`
 	HitSlTp         int                    `json:"hitSlTp"`
+	runtimeDeps     *biz.RuntimeDeps
 }
 
 type PlotData struct {
@@ -128,11 +129,84 @@ func NewBTResult() *BTResult {
 	return res
 }
 
+func (r *BTResult) orderState() *ormo.OrderState {
+	if r != nil && r.runtimeDeps != nil {
+		return r.runtimeDeps.Orders
+	}
+	return nil
+}
+
+func (r *BTResult) historyOrders() []*ormo.InOutOrder {
+	if state := r.orderState(); state != nil {
+		return state.HistoricalOrders()
+	}
+	return ormo.HistODs
+}
+
+func (r *BTResult) reportAccount() string {
+	if r != nil && r.runtimeDeps != nil && r.runtimeDeps.DefaultAccount != "" {
+		return r.runtimeDeps.DefaultAccount
+	}
+	return config.DefAcc
+}
+
+func (r *BTResult) reportWallet() *biz.BanWallets {
+	account := r.reportAccount()
+	if r != nil && r.runtimeDeps != nil && r.runtimeDeps.Trading != nil {
+		return r.runtimeDeps.Trading.Wallet(account)
+	}
+	return biz.GetWallets(account)
+}
+
+func (r *BTResult) strategyJobs(account string) map[string]map[string]*strat.StratJob {
+	if r != nil && r.runtimeDeps != nil && r.runtimeDeps.Strategies != nil {
+		return r.runtimeDeps.Strategies.Jobs(account)
+	}
+	return strat.GetJobs(account)
+}
+
+func (r *BTResult) orderMatchTfs() map[string]bool {
+	if r != nil && r.runtimeDeps != nil && r.runtimeDeps.Core != nil {
+		return r.runtimeDeps.Core.OrderMatchTfs
+	}
+	return core.OrderMatchTfs
+}
+
+func (r *BTResult) doneProfits(off int) float64 {
+	if r == nil || r.runtimeDeps == nil {
+		return ormo.LegalDoneProfits(off)
+	}
+	orders := r.historyOrders()
+	if off < 0 {
+		off = 0
+	}
+	if off >= len(orders) {
+		return 0
+	}
+	var total float64
+	for _, order := range orders[off:] {
+		_, quote, _, _ := core.SplitSymbol(order.Symbol)
+		price := 1.0
+		if r.runtimeDeps.Market != nil && r.runtimeDeps.Market.Prices != nil {
+			nowMS := int64(0)
+			if r.runtimeDeps.Clock != nil {
+				nowMS = r.runtimeDeps.Clock.TimeMS()
+			}
+			price = r.runtimeDeps.Market.Prices.GetPriceSafeExpAt(nowMS, quote, "", com.PriceExpireMS)
+		}
+		if price >= 0 {
+			total += price * order.Profit
+		}
+	}
+	return total
+}
+
 func (r *BTResult) printBtResult(reset bool) {
 	if config.StratPerf != nil && config.StratPerf.Enable {
 		core.DumpPerfs(r.OutDir)
 	}
-	log.Info("BackTest Reports:\n" + r.cmdReports(ormo.HistODs))
+	orders := r.historyOrders()
+	log.Info("BackTest Reports:\n" + r.cmdReports(orders))
 	if r.HitSlTp > 0 {
 		log.Warn("Stop-loss & take-profit triggered in one K-line — set proper `run_policy[i].refine_tf`",
 			zap.Int("bad", r.HitSlTp), zap.Int("total", r.OrderNum))
@@ -182,12 +256,13 @@ func (r *BTResult) cmdReports(orders []*ormo.InOutOrder) string {
 
 func (r *BTResult) dumpBtFiles(reset bool) {
 	csvPath := fmt.Sprintf("%s/orders.csv", r.OutDir)
-	err_ := DumpOrdersCSV(ormo.HistODs, csvPath)
+	orders := r.historyOrders()
+	err_ := DumpOrdersCSV(orders, csvPath)
 	if err_ != nil {
 		log.Error("dump orders.csv fail", zap.Error(err_))
 	}
 
-	err := ormo.DumpOrdersGob(filepath.Join(r.OutDir, "orders.gob"))
+	err := ormo.DumpOrdersGobItems(filepath.Join(r.OutDir, "orders.gob"), orders)
 	if err != nil {
 		log.Warn("dump orders.gob fail", zap.Error(err))
 	}
@@ -206,7 +281,7 @@ func (r *BTResult) dumpBtFiles(reset bool) {
 }
 
 func (r *BTResult) Collect() {
-	orders := ormo.HistODs
+	orders := r.historyOrders()
 	r.OrderNum = len(orders)
 	sumProfit := float64(0)
 	sumFee := float64(0)
@@ -230,7 +305,7 @@ func (r *BTResult) Collect() {
 			hitSlTp += 1
 		}
 	}
-	for tf := range core.OrderMatchTfs {
+	for tf := range r.orderMatchTfs() {
 		if _, ok := tfHits[tf]; !ok {
 			tfHits[tf] = 0
 		}
@@ -268,7 +343,7 @@ func (r *BTResult) Collect() {
 		r.EntLabels = labels
 		r.EntDatasets = dsList
 	}
-	wallets := biz.GetWallets(config.DefAcc)
+	wallets := r.reportWallet()
 	r.FinWithdraw = wallets.GetWithdrawLegal(nil)
 	r.FinBalance = wallets.AvaLegal(nil) + r.FinWithdraw
 	rangeSecs := (r.EndMS - r.StartMS) / 1000
@@ -969,7 +1044,7 @@ func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 		r.StartMS = startMS
 	}
 	r.EndMS = timeMS
-	wallets := biz.GetWallets(config.DefAcc)
+	wallets := r.reportWallet()
 	totalLegal := wallets.TotalLegal(nil, true)
 	r.MinReal = min(r.MinReal, totalLegal)
 	if totalLegal > r.MaxReal {
@@ -1044,7 +1119,7 @@ func (r *BTResult) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, tot
 		odNum = ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)
 	}
 	jobNum := 0
-	jobMap := strat.GetJobs(wallets.Account)
+	jobMap := r.strategyJobs(wallets.Account)
 	for _, jobs := range jobMap {
 		for _, j := range jobs {
 			if j.CheckMS+j.Env.TFMSecs >= timeMS {
@@ -1059,8 +1134,8 @@ func (r *BTResult) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, tot
 	profitLegal := wallets.UnrealizedPOLLegal(nil)
 	drawLegal := wallets.GetWithdrawLegal(nil)
 	curDate := btime.ToDateStr(timeMS, "")
-	r.donePftLegal += ormo.LegalDoneProfits(r.histOdOff)
-	r.histOdOff = len(ormo.HistODs)
+	r.donePftLegal += r.doneProfits(r.histOdOff)
+	r.histOdOff = len(r.historyOrders())
 	if timeMS == r.lastPlotMS && len(r.Plots.Labels) > 0 {
 		last := len(r.Plots.Labels) - 1
 		r.Plots.Labels[last] = curDate

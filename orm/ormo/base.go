@@ -52,26 +52,37 @@ func GetTaskAcc(id int64) string {
 }
 
 func GetOpenODs(account string) (map[int64]*InOutOrder, *deadlock.Mutex) {
+	openOrders, lock, _ := GetOpenODsStatus(account)
+	return openOrders, lock
+}
+
+// GetOpenODsStatus is the order snapshot API for callers that must fail closed
+// when a live database reload was not successful. The legacy GetOpenODs API
+// intentionally keeps its two-return-value contract for the rest of Banbot.
+func GetOpenODsStatus(account string) (map[int64]*InOutOrder, *deadlock.Mutex, bool) {
 	if !core.EnvReal {
 		account = config.DefAcc
 	} else if account == "" {
 		log.Warn("get open ods fail, unknown account")
-		return make(map[int64]*InOutOrder), &deadlock.Mutex{}
+		return make(map[int64]*InOutOrder), &deadlock.Mutex{}, false
 	}
 	isReload := false
+	authoritative := true
 	mOpenLock.Lock()
 	if core.LiveMode {
 		cfg, ok := config.Accounts[account]
 		if ok && cfg.NoTrade {
 			mOpenLock.Unlock()
-			return make(map[int64]*InOutOrder), &deadlock.Mutex{}
+			return make(map[int64]*InOutOrder), &deadlock.Mutex{}, true
 		}
 		curMS := btime.UTCStamp()
 		stamp, _ := accSyncStamps[account]
+		authoritative = stamp > 0
 		if curMS-stamp > odSyncIntvMS {
 			// 超过同步间隔，强制同步一次
 			accSyncStamps[account] = curMS
 			isReload = true
+			authoritative = false
 		}
 	}
 	val, ok := accOpenODs[account]
@@ -90,9 +101,17 @@ func GetOpenODs(account string) (map[int64]*InOutOrder, *deadlock.Mutex) {
 		err := loadOpenODs(account, val)
 		if err != nil {
 			log.Error("loadOpenODs fail", zap.String("acc", account), zap.Error(err))
+			// Keep retrying and keep the snapshot explicitly non-authoritative
+			// until a later reload succeeds.
+			mOpenLock.Lock()
+			accSyncStamps[account] = -max(btime.UTCStamp(), int64(1))
+			mOpenLock.Unlock()
+			authoritative = false
+		} else {
+			authoritative = true
 		}
 	}
-	return val, lock
+	return val, lock, authoritative
 }
 
 func loadOpenODs(account string, odMap map[int64]*InOutOrder) *errs.Error {

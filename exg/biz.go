@@ -32,7 +32,13 @@ func Setup() *errs.Error {
 }
 
 func create(name, market, contractType string) (banexg.BanExchange, *errs.Error) {
-	var exgOpts, _ = config.Exchange.Items[config.Exchange.Name]
+	var exgOpts map[string]interface{}
+	if config.Exchange != nil {
+		exgOpts = config.Exchange.Items[name]
+		if exgOpts == nil && config.Exchange.Name == name {
+			exgOpts = config.Exchange.Items[config.Exchange.Name]
+		}
+	}
 	var options = map[string]interface{}{}
 	for key, val := range exgOpts {
 		key = utils.SnakeToCamel(key)
@@ -198,19 +204,4 @@ func GetTickers24Hr() (map[string]*banexg.Ticker, *errs.Error) {
 	expires := time.Second * 3600
 	core.Cache.SetWithTTL("tickers", tickersMap, 1, expires)
 	return tickersMap, nil
-}
-
-/*
-GetAlignOff Obtain the time offset of the aggregation for the specified period, in seconds 获取指定周期聚合的时间偏移，单位：秒
-*/
-func GetAlignOff(exgName string, tfSecs int) int {
-	if tfSecs < 86400 {
-		return 0
-	}
-	if exgName == "china" {
-		// 中国市场，期货夜盘属于次日日线数据，夜盘一般21点开始，当日收盘一般15点，取中间18，即推迟6个小时
-		// 又考虑时差8小时，累计推迟14小时
-		return 50400
-	}
-	return 0
 }

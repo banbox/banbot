@@ -20,6 +20,7 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
+	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 )
 
@@ -51,14 +52,670 @@ type IOrderMgrLive interface {
 
 type FuncHandleIOrder = func(order *ormo.InOutOrder) *errs.Error
 
+// runtimeOrderConfig is the immutable, hot-path view of configuration needed
+// by one order manager. It is copied when the manager is bound so Runtime
+// order processing never consults the process-wide config facade.
+type runtimeOrderConfig struct {
+	stakeCurrency        []string
+	takeOverStrategy     string
+	orderType            string
+	limitVolSecs         int
+	putLimitSecs         int
+	orderBookTTL         int64
+	stopEnterBars        int
+	maxOpenOrders        int
+	maxSimulOpen         int
+	backtestNetCost      float64
+	legacyIntrabar       bool
+	accountLeverage      float64
+	accountMaxOpenOrders int
+}
+
 type OrderMgr struct {
 	callBack    func(order *ormo.InOutOrder, isEnter bool)
 	afterEnter  FuncHandleIOrder
 	afterExit   FuncHandleIOrder
+	prices      *com.PriceState
+	clock       *btime.ClockState
+	exchange    banexg.BanExchange
+	runtimeCore *core.State
+	symbols     *orm.SymbolState
+	wallet      *BanWallets
+	runtimeDeps bool
+	walletDeps  RuntimeDeps
+	runtimeCfg  runtimeOrderConfig
 	Account     string
 	BarMS       int64
 	simulOpen   int // Simultaneously open number in the current bar
 	simulOpenSt map[string]int
+}
+
+func accountMaxOpenOrders(accounts map[string]*config.AccountConfig, account string) int {
+	if acc := accounts[account]; acc != nil && acc.MaxOpenOrders > 0 {
+		return acc.MaxOpenOrders
+	}
+	return 0
+}
+
+func (o *OrderMgr) stakeCurrency() []string {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.stakeCurrency
+	}
+	return config.StakeCurrency
+}
+
+func (o *OrderMgr) takeOverStrategy() string {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.takeOverStrategy
+	}
+	return config.TakeOverStrat
+}
+
+func (o *OrderMgr) orderType() string {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.orderType
+	}
+	return config.OrderType
+}
+
+func (o *OrderMgr) limitVolSecs() int {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.limitVolSecs
+	}
+	return config.LimitVolSecs
+}
+
+func (o *OrderMgr) putLimitSecs() int {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.putLimitSecs
+	}
+	return config.PutLimitSecs
+}
+
+func (o *OrderMgr) orderBookTTL() int64 {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.orderBookTTL
+	}
+	return config.OdBookTtl
+}
+
+func (o *OrderMgr) stopEnterBars() int {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.stopEnterBars
+	}
+	return config.StopEnterBars
+}
+
+func (o *OrderMgr) maxOpenOrders() int {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCfg.accountMaxOpenOrders > 0 {
+			return o.runtimeCfg.accountMaxOpenOrders
+		}
+		return o.runtimeCfg.maxOpenOrders
+	}
+	return config.MaxOpenOrders
+}
+
+func (o *OrderMgr) maxSimulOpen() int {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.maxSimulOpen
+	}
+	return config.MaxSimulOpen
+}
+
+func (o *OrderMgr) backtestNetCost() float64 {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.backtestNetCost
+	}
+	return config.BTNetCost
+}
+
+func (o *OrderMgr) accountLeverage() float64 {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCfg.accountLeverage
+	}
+	return config.GetAccLeverage(o.Account)
+}
+
+func (o *OrderMgr) takeOverTF(pair, defTF string) string {
+	if o == nil || !o.runtimeDeps {
+		return config.GetTakeOverTF(pair, defTF)
+	}
+	if o.runtimeCore != nil {
+		if pairMap := o.runtimeCore.StgPairTfs[o.takeOverStrategy()]; pairMap != nil {
+			if tf := pairMap[pair]; tf != "" {
+				return tf
+			}
+		}
+	}
+	return defTF
+}
+
+func (o *OrderMgr) priceNow() int64 {
+	if o != nil && o.clock != nil {
+		return o.clock.TimeMS()
+	}
+	if o != nil && o.runtimeDeps {
+		return 0
+	}
+	return btime.TimeMS()
+}
+
+func (o *OrderMgr) priceSafeExp(symbol, side string, expMS int64) float64 {
+	if o != nil && o.prices != nil {
+		return o.prices.GetPriceSafeExpAt(o.priceNow(), symbol, side, expMS)
+	}
+	if o != nil && o.runtimeDeps {
+		return -1
+	}
+	return com.GetPriceSafeExp(symbol, side, expMS)
+}
+
+func (o *OrderMgr) priceExp(symbol, side string, expMS int64) float64 {
+	price := o.priceSafeExp(symbol, side, expMS)
+	if price < 0 {
+		panic(fmt.Errorf("invalid symbol for price: %s", symbol))
+	}
+	return price
+}
+
+func (o *OrderMgr) lastBarPrice(symbol string) float64 {
+	if o != nil && o.prices != nil {
+		return o.prices.GetLastBarPriceAt(symbol)
+	}
+	if o != nil && o.runtimeDeps {
+		return -1
+	}
+	return com.GetLastBarPrice(symbol)
+}
+
+func (o *OrderMgr) exchangeClient() banexg.BanExchange {
+	if o != nil && o.runtimeDeps {
+		return o.exchange
+	}
+	return exg.Default
+}
+
+func (o *OrderMgr) marketType() string {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			return o.runtimeCore.Market
+		}
+		if o.exchange != nil {
+			if info := o.exchange.Info(); info != nil {
+				return info.MarketType
+			}
+		}
+		return ""
+	}
+	return core.Market
+}
+
+func (o *OrderMgr) exchangeName() string {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil && o.runtimeCore.ExgName != "" {
+			return o.runtimeCore.ExgName
+		}
+		if o.exchange != nil {
+			if info := o.exchange.Info(); info != nil {
+				return info.ID
+			}
+		}
+		return ""
+	}
+	return core.ExgName
+}
+
+func (o *OrderMgr) isContract() bool {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			return o.runtimeCore.IsContract || banexg.IsContract(o.runtimeCore.Market)
+		}
+		return banexg.IsContract(o.marketType())
+	}
+	return core.IsContract
+}
+
+func (o *OrderMgr) isLive() bool {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCore != nil && o.runtimeCore.LiveMode
+	}
+	return core.LiveMode
+}
+
+func (o *OrderMgr) isEnvReal() bool {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCore != nil && o.runtimeCore.EnvReal
+	}
+	return core.EnvReal
+}
+
+func (o *OrderMgr) isBacktest() bool {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCore != nil && o.runtimeCore.BackTestMode
+	}
+	return core.BackTestMode
+}
+
+func (o *OrderMgr) runMode() string {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			return o.runtimeCore.RunMode
+		}
+		return ""
+	}
+	return core.RunMode
+}
+
+func (o *OrderMgr) runEnv() string {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			return o.runtimeCore.RunEnv
+		}
+		return ""
+	}
+	return core.RunEnv
+}
+
+func (o *OrderMgr) banPairsUntil() map[string]int64 {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore == nil {
+			return nil
+		}
+		if o.runtimeCore.BanPairsUntil == nil {
+			o.runtimeCore.BanPairsUntil = make(map[string]int64)
+		}
+		return o.runtimeCore.BanPairsUntil
+	}
+	return core.BanPairsUntil
+}
+
+func (o *OrderMgr) noEnterUntil() map[string]int64 {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore == nil {
+			return nil
+		}
+		if o.runtimeCore.NoEnterUntil == nil {
+			o.runtimeCore.NoEnterUntil = make(map[string]int64)
+		}
+		return o.runtimeCore.NoEnterUntil
+	}
+	return core.NoEnterUntil
+}
+
+func (o *OrderMgr) checkWallets() bool {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCore != nil && o.runtimeCore.CheckWallets
+	}
+	return core.CheckWallets
+}
+
+func (o *OrderMgr) stopAll() func() {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			return o.runtimeCore.StopAll
+		}
+		return nil
+	}
+	return core.StopAll
+}
+
+func (o *OrderMgr) setBotRunning(running bool) {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			o.runtimeCore.BotRunning = running
+		}
+		return
+	}
+	core.BotRunning = running
+}
+
+func (o *OrderMgr) setExit(od *ormo.InOutOrder, exitAt int64, tag, orderType string, limit float64) {
+	if o == nil || !o.runtimeDeps {
+		od.SetExit(exitAt, tag, orderType, limit)
+		return
+	}
+	if exitAt == 0 {
+		exitAt = o.priceNow()
+	}
+	if od.ExitAt == 0 {
+		if tag == "" {
+			tag = core.ExitTagUnknown
+		}
+		od.ExitTag = tag
+		od.ExitAt = exitAt
+		od.DirtyMain = true
+	}
+	if od.Exit == nil {
+		odSide := banexg.OdSideSell
+		if od.Short {
+			odSide = banexg.OdSideBuy
+		}
+		if o.runtimeCore != nil {
+			o.runtimeCore.NewNumInSim += 1
+		}
+		od.Exit = &ormo.ExOrder{
+			TaskID:    od.TaskID,
+			InoutID:   od.ID,
+			Symbol:    od.Symbol,
+			Enter:     false,
+			OrderType: orderType,
+			Side:      odSide,
+			CreateAt:  exitAt,
+			UpdateAt:  exitAt,
+			Price:     limit,
+			Amount:    od.Enter.Filled,
+			Status:    ormo.OdStatusInit,
+		}
+		od.DirtyExit = true
+		return
+	}
+	if orderType != "" {
+		od.Exit.OrderType = orderType
+		od.DirtyExit = true
+	}
+	if limit > 0 {
+		od.Exit.Price = limit
+		od.DirtyExit = true
+	}
+}
+
+func (o *OrderMgr) canClose(od *ormo.InOutOrder) bool {
+	if o == nil || !o.runtimeDeps {
+		return od.CanClose()
+	}
+	if od.ExitTag != "" {
+		return false
+	}
+	if od.Timeframe == "ws" {
+		return true
+	}
+	tfMSecs := int64(utils.TFToSecs(od.Timeframe) * 1000)
+	return float64(o.priceNow()-od.RealEnterMS()) > float64(tfMSecs)*0.9
+}
+
+func (o *OrderMgr) updateOrderFee(od *ormo.InOutOrder, price float64, forEnter bool) *errs.Error {
+	if o == nil || !o.runtimeDeps {
+		return od.UpdateFee(price, forEnter)
+	}
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "exchange is required to calculate fee for %s", od.Symbol)
+	}
+	exOrder := od.Enter
+	if !forEnter {
+		exOrder = od.Exit
+	}
+	if exOrder == nil {
+		return errs.NewMsg(errs.CodeRunTime, "fee order is nil for %s", od.Symbol)
+	}
+	// Keep the legacy order-type normalization while calculating through the
+	// manager-bound exchange for explicit Runtime managers.
+	maker := strings.Contains(exOrder.OrderType, "limit")
+	if exOrder.OrderType == banexg.OdTypeLimit {
+		if maker {
+			exOrder.OrderType = banexg.OdTypeLimitMaker
+		} else {
+			exOrder.OrderType = "limit_taker"
+		}
+	}
+	fee, err := exchange.CalculateFee(exOrder.Symbol, exOrder.OrderType, exOrder.Side,
+		exOrder.Filled, price, maker, nil)
+	if err != nil {
+		return err
+	}
+	if fee == nil {
+		return errs.NewMsg(errs.CodeRunTime, "exchange returned nil fee for %s", od.Symbol)
+	}
+	exOrder.Fee = fee.Cost
+	exOrder.FeeQuote = fee.QuoteCost
+	exOrder.FeeType = fee.Currency
+	if forEnter {
+		od.DirtyEnter = true
+	} else {
+		od.DirtyExit = true
+	}
+	return nil
+}
+
+func (o *OrderMgr) localExit(od *ormo.InOutOrder, exitAt int64, tag string, price float64, msg, odType string) *errs.Error {
+	if o == nil || !o.runtimeDeps {
+		return od.LocalExit(exitAt, tag, price, msg, odType)
+	}
+	if price == 0 {
+		price = o.priceSafeExp(od.Symbol, "", com.Day10MSecs)
+		if price <= 0 {
+			if od.Enter.Average > 0 {
+				price = od.Enter.Average
+			} else if od.Enter.Price > 0 {
+				price = od.Enter.Price
+			} else {
+				price = od.InitPrice
+			}
+		}
+	}
+	if exitAt == 0 {
+		exitAt = o.priceNow()
+	}
+	if od.Enter.Status < ormo.OdStatusClosed {
+		od.Enter.Status = ormo.OdStatusClosed
+		if err := o.updateOrderFee(od, price, true); err != nil {
+			return err
+		}
+		od.DirtyEnter = true
+	}
+	if odType == "" {
+		odType = banexg.OdTypeMarket
+	}
+	o.setExit(od, exitAt, tag, odType, price)
+	od.Exit.Status = ormo.OdStatusClosed
+	od.Exit.Filled = od.Enter.Filled
+	od.Exit.Average = od.Exit.Price
+	od.Status = ormo.InOutStatusFullExit
+	if err := o.updateOrderFee(od, price, false); err != nil {
+		return err
+	}
+	od.UpdateProfits(price)
+	od.DirtyMain = true
+	od.DirtyExit = true
+	if msg != "" {
+		od.SetInfo(ormo.KeyStatusMsg, msg)
+	}
+	return od.Save()
+}
+
+func (o *OrderMgr) bindRuntimeDeps(deps RuntimeDeps) {
+	o.runtimeDeps = true
+	o.runtimeCore = deps.Core
+	if o.runtimeCore == nil {
+		o.runtimeCore, _ = core.NewState(nil)
+	}
+	o.clock = deps.Clock
+	o.exchange = deps.Exchange
+	o.symbols = deps.Symbols
+	if deps.Market != nil {
+		o.prices = deps.Market.Prices
+	}
+	if o.clock == nil {
+		backtest := o.runtimeCore.BackTestMode
+		o.clock = btime.NewClockState(backtest, nil)
+	}
+	if o.prices == nil {
+		exgName := o.runtimeCore.ExgName
+		o.prices = com.NewPriceStateWithExchange(exgName, deps.Exchange)
+	}
+	deps.Core = o.runtimeCore
+	deps.Clock = o.clock
+	if deps.Orders != nil {
+		deps.Orders.SetLive(o.runtimeCore.LiveMode)
+	}
+	if deps.Market == nil {
+		deps.Market = &com.MarketState{Prices: o.prices}
+	} else if deps.Market.Prices == nil {
+		deps.Market.Prices = o.prices
+	}
+	o.walletDeps = deps
+	o.runtimeCfg = makeRuntimeOrderConfig(deps, o.Account)
+	if deps.Trading != nil {
+		o.wallet = deps.Trading.Wallet(o.Account)
+	} else {
+		o.wallet = getRuntimeWallets(o.Account)
+	}
+	o.wallet.bindRuntimeDeps(deps)
+}
+
+func makeRuntimeOrderConfig(deps RuntimeDeps, account string) runtimeOrderConfig {
+	result := runtimeOrderConfig{}
+	if deps.Config == nil {
+		return result
+	}
+	cfg := deps.Config.View()
+	if cfg == nil {
+		return result
+	}
+	result.stakeCurrency = cfg.StakeCurrency
+	result.takeOverStrategy = cfg.TakeOverStrat
+	result.orderType = cfg.OrderType
+	result.limitVolSecs = cfg.LimitVolSecs
+	if result.limitVolSecs == 0 {
+		result.limitVolSecs = 10
+	}
+	result.putLimitSecs = cfg.PutLimitSecs
+	if result.putLimitSecs == 0 {
+		result.putLimitSecs = 180
+	}
+	result.orderBookTTL = cfg.OdBookTtl
+	if result.orderBookTTL == 0 {
+		result.orderBookTTL = 500
+	}
+	result.stopEnterBars = cfg.StopEnterBars
+	result.maxOpenOrders = cfg.MaxOpenOrders
+	result.maxSimulOpen = cfg.MaxSimulOpen
+	result.backtestNetCost = cfg.BTNetCost
+	if result.backtestNetCost == 0 {
+		result.backtestNetCost = 15
+	}
+	result.legacyIntrabar = cfg.BTLegacyIntrabar
+	result.accountLeverage = cfg.Leverage
+	if acc := cfg.Accounts[account]; acc != nil {
+		if acc.Leverage > 0 {
+			result.accountLeverage = acc.Leverage
+		}
+		if acc.MaxOpenOrders > 0 {
+			result.accountMaxOpenOrders = acc.MaxOpenOrders
+		}
+	}
+	return result
+}
+
+func (o *OrderMgr) orderState() *ormo.OrderState {
+	if o != nil && o.runtimeDeps {
+		return o.walletDeps.Orders
+	}
+	return nil
+}
+
+func (o *OrderMgr) openOrders() (map[int64]*ormo.InOutOrder, *deadlock.Mutex) {
+	if state := o.orderState(); state != nil {
+		return state.GetOpenODs(o.Account)
+	}
+	return ormo.GetOpenODs(o.Account)
+}
+
+func (o *OrderMgr) taskID() int64 {
+	if state := o.orderState(); state != nil {
+		return state.GetTaskID(o.Account)
+	}
+	return ormo.GetTaskID(o.Account)
+}
+
+func (o *OrderMgr) taskAccount(taskID int64) string {
+	if state := o.orderState(); state != nil {
+		return state.GetTaskAcc(taskID)
+	}
+	return ormo.GetTaskAcc(taskID)
+}
+
+// exSymbolCur resolves through the manager-owned symbol catalog for typed
+// runtimes. Legacy managers retain the package facade for compatibility.
+func (o *OrderMgr) exSymbolCur(symbol string) (*orm.ExSymbol, *errs.Error) {
+	if o != nil && o.runtimeDeps {
+		if o.symbols == nil {
+			return nil, errs.NewMsg(core.ErrInvalidSymbol, "runtime symbol state is required")
+		}
+		return o.symbols.GetExSymbolCur(symbol)
+	}
+	return orm.GetExSymbolCur(symbol)
+}
+
+// exSymbolMap resolves through the manager-owned symbol catalog for typed
+// runtimes. A nil map is intentional when the required runtime state is
+// absent: callers then return their normal unknown-symbol error.
+func (o *OrderMgr) exSymbolMap() map[string]*orm.ExSymbol {
+	if o != nil && o.runtimeDeps {
+		if o.symbols == nil {
+			return nil
+		}
+		return o.symbols.GetExSymbolMap(o.exchangeName(), o.marketType())
+	}
+	return orm.GetExSymbolMap(o.exchangeName(), o.marketType())
+}
+
+func (o *OrderMgr) priceSymbolParts(symbol string) ([4]string, *errs.Error) {
+	if o != nil && o.runtimeDeps {
+		return exg.ResolveRuntimePriceSymbol(o.exchangeClient(), symbol)
+	}
+	return exg.ResolvePriceSymbol(exg.Default, symbol)
+}
+
+func (o *OrderMgr) walletsForOrder() *BanWallets {
+	if o != nil && o.runtimeDeps {
+		if o.wallet == nil {
+			if o.walletDeps.Trading != nil {
+				o.wallet = o.walletDeps.Trading.Wallet(o.Account)
+			} else {
+				o.wallet = getRuntimeWallets(o.Account)
+			}
+			o.wallet.bindRuntimeDeps(o.walletDeps)
+		}
+		return o.wallet
+	}
+	return GetWallets(o.Account)
+}
+
+func (o *OrderMgr) ensureLatestPrice(symbol string) *errs.Error {
+	if o == nil || !o.runtimeDeps {
+		return com.EnsureLatestPrice(symbol)
+	}
+	if o.priceSafeExp(symbol, "", com.PriceExpireMS) > 0 {
+		return nil
+	}
+	if o.exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required to load price for %s", symbol)
+	}
+	tickers, err := o.exchange.FetchTickers(nil, map[string]interface{}{
+		banexg.ParamMethod: "bookTicker",
+	})
+	if err != nil {
+		return err
+	}
+	nowMS := o.priceNow()
+	for _, ticker := range tickers {
+		if ticker != nil {
+			o.prices.SetPriceAt(nowMS, ticker.Symbol, ticker.Ask, ticker.Bid)
+		}
+	}
+	if o.priceSafeExp(symbol, "", com.PriceExpireMS) <= 0 {
+		return errs.NewMsg(errs.CodeRunTime, "no valid price for %s", symbol)
+	}
+	return nil
+}
+
+func (o *OrderMgr) legacyIntrabarEnabled() bool {
+	if o != nil && o.runtimeDeps {
+		return o.isBacktest() && o.runtimeCfg.legacyIntrabar
+	}
+	return legacyIntrabarEnabled()
 }
 
 func GetOdMgr(account string) IOrderMgr {
@@ -67,6 +724,26 @@ func GetOdMgr(account string) IOrderMgr {
 	}
 	val, _ := accOdMgrs[account]
 	return val
+}
+
+// GetOdMgrWithState resolves an account manager from an explicit runtime
+// registry. It is the typed counterpart to the legacy package facade.
+func GetOdMgrWithState(state *TradingState, account string) IOrderMgr {
+	if state == nil {
+		return nil
+	}
+	return state.OrderManager(account)
+}
+
+func GetAllOdMgrWithState(state *TradingState) map[string]IOrderMgr {
+	if state == nil {
+		return nil
+	}
+	result := make(map[string]IOrderMgr, len(state.OrderManagers))
+	for account, manager := range state.OrderManagers {
+		result[account] = manager
+	}
+	return result
 }
 
 func GetAllOdMgr() map[string]IOrderMgr {
@@ -89,6 +766,14 @@ func GetLiveOdMgr(account string) *LiveOrderMgr {
 	}
 	val, _ := accLiveOdMgrs[account]
 	return val
+}
+
+// GetLiveOdMgrWithState resolves a live manager from an explicit runtime.
+func GetLiveOdMgrWithState(state *TradingState, account string) *LiveOrderMgr {
+	if state == nil {
+		return nil
+	}
+	return state.LiveManager(account)
 }
 
 func CleanUpOdMgr() *errs.Error {
@@ -115,28 +800,54 @@ func CleanUpOdMgr() *errs.Error {
 	return err
 }
 
+// CleanUpOdMgrWithState closes only managers owned by an explicit runtime.
+// The legacy function above remains the serialized compatibility path.
+func CleanUpOdMgrWithState(state *TradingState) *errs.Error {
+	if state == nil {
+		return nil
+	}
+	state.ensure()
+	accounts := slices.Sorted(maps.Keys(state.OrderManagers))
+	var firstErr *errs.Error
+	for _, account := range accounts {
+		manager := state.OrderManagers[account]
+		if manager == nil {
+			continue
+		}
+		if currentErr := manager.CleanUp(); currentErr != nil {
+			if firstErr == nil {
+				firstErr = currentErr
+			} else {
+				log.Error("clean runtime odMgr fail", zap.String("acc", account), zap.Error(currentErr))
+			}
+		}
+	}
+	return firstErr
+}
+
 func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat.EnterReq) ([]*strat.EnterReq, map[string]int) {
-	curMS := btime.TimeMS()
+	curMS := o.priceNow()
 	rawNum := len(enters)
-	if banUntil, ok := core.BanPairsUntil[exs.Symbol]; ok {
+	banPairsUntil := o.banPairsUntil()
+	if banUntil, ok := banPairsUntil[exs.Symbol]; ok {
 		if curMS < banUntil {
 			return nil, map[string]int{"BanPair": rawNum}
 		} else {
-			delete(core.BanPairsUntil, exs.Symbol)
+			delete(banPairsUntil, exs.Symbol)
 		}
 	}
-	if core.RunMode == core.RunModeOther {
+	if o.runMode() == core.RunModeOther {
 		// Does not involve order mode, prohibit opening orders
 		// 不涉及订单模式，禁止开单
 		return nil, map[string]int{"NoOrderMode": rawNum}
 	}
 	pairZapField := zap.String("pair", exs.Symbol)
-	stopUntil, _ := core.NoEnterUntil[o.Account]
+	stopUntil, _ := o.noEnterUntil()[o.Account]
 	if curMS < stopUntil {
-		if core.LiveMode {
+		if o.isLive() {
 			log.Warn("any enter forbid", pairZapField)
 		}
-		strat.AddAccFailOpens(o.Account, strat.FailOpenNoEntry, len(enters))
+		o.addAccFailOpens(strat.FailOpenNoEntry, len(enters))
 		return nil, map[string]int{"AccNoEntry": rawNum}
 	}
 	tfMSecs := int64(utils.TFToSecs(tf) * 1000)
@@ -146,18 +857,14 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 		o.simulOpen = 0
 		o.simulOpenSt = make(map[string]int)
 	}
-	maxOpenNum := config.MaxOpenOrders
-	acc, _ := config.Accounts[o.Account]
-	if acc != nil && acc.MaxOpenOrders > 0 {
-		maxOpenNum = acc.MaxOpenOrders
-	}
+	maxOpenNum := o.maxOpenOrders()
 	orgNum := len(enters)
-	enters = checkOrderNum(enters, orgNum, maxOpenNum, "max_open_orders")
-	if len(enters) > 0 && config.MaxSimulOpen > 0 {
-		enters = checkOrderNum(enters, o.simulOpen, config.MaxSimulOpen, "max_simul_open")
+	enters = o.checkOrderNum(enters, orgNum, maxOpenNum, "max_open_orders")
+	if maxSimulOpen := o.maxSimulOpen(); len(enters) > 0 && maxSimulOpen > 0 {
+		enters = o.checkOrderNum(enters, o.simulOpen, maxSimulOpen, "max_simul_open")
 	}
 	if orgNum > len(enters) {
-		strat.AddAccFailOpens(o.Account, strat.FailOpenNumLimit, orgNum-len(enters))
+		o.addAccFailOpens(strat.FailOpenNumLimit, orgNum-len(enters))
 	}
 	if len(enters) == 0 {
 		return nil, map[string]int{"OpenTooMuch": rawNum}
@@ -169,7 +876,7 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 	}
 	// Check whether the maximum number of orders opened by the strategy is exceeded
 	// 检查是否超出策略最大开单数量
-	openOds, lock := ormo.GetOpenODs(o.Account)
+	openOds, lock := o.openOrders()
 	lock.Lock()
 	stratOdNum := make(map[string]int)
 	for _, od := range openOds {
@@ -182,7 +889,20 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 	for _, req := range enters {
 		num, _ := stratOdNum[req.StratName]
 		simulNum, _ := o.simulOpenSt[req.StratName]
-		pol := strat.Get(exs.Symbol, req.StratName).Policy
+		// Runtime-owned strategy registries do not necessarily populate the
+		// legacy global PairStrats map. Missing metadata must not turn an
+		// otherwise valid request into a nil-pointer panic; common account and
+		// strategy-name limits above still apply.
+		var pol *config.RunPolicyConfig
+		var stgy *strat.TradeStrat
+		if o.runtimeDeps && o.walletDeps.Strategies != nil {
+			stgy = o.walletDeps.Strategies.Get(exs.Symbol, req.StratName)
+		} else {
+			stgy = strat.Get(exs.Symbol, req.StratName)
+		}
+		if stgy != nil {
+			pol = stgy.Policy
+		}
 		if pol != nil {
 			if pol.MaxOpen > 0 && num >= pol.MaxOpen {
 				skipNum += 1
@@ -199,7 +919,7 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 		res = append(res, req)
 	}
 	if skipNum > 0 {
-		strat.AddAccFailOpens(o.Account, strat.FailOpenNumLimitPol, skipNum)
+		o.addAccFailOpens(strat.FailOpenNumLimitPol, skipNum)
 	}
 	numCut = rawNum - len(enters)
 	if numCut > 0 {
@@ -208,18 +928,37 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 	return res, tagMap
 }
 
+func (o *OrderMgr) addAccFailOpens(tag string, num int) {
+	if num <= 0 {
+		return
+	}
+	if o != nil && o.runtimeDeps && o.walletDeps.Strategies != nil {
+		o.walletDeps.Strategies.AddAccFailOpens(o.Account, tag, num)
+		return
+	}
+	strat.AddAccFailOpens(o.Account, tag, num)
+}
+
+func (o *OrderMgr) checkOrderNum(enters []*strat.EnterReq, oldNum, maxNum int, tag string) []*strat.EnterReq {
+	return checkOrderNumWithLive(enters, oldNum, maxNum, tag, o.isLive())
+}
+
 func checkOrderNum(enters []*strat.EnterReq, oldNum, maxNum int, tag string) []*strat.EnterReq {
+	return checkOrderNumWithLive(enters, oldNum, maxNum, tag, core.LiveMode)
+}
+
+func checkOrderNumWithLive(enters []*strat.EnterReq, oldNum, maxNum int, tag string, live bool) []*strat.EnterReq {
 	cutNum := oldNum + len(enters) - maxNum
 	if maxNum > 0 && cutNum > 0 {
 		if maxNum > oldNum {
 			enters = enters[:maxNum-oldNum]
-			if core.LiveMode {
+			if live {
 				log.Warn("cut enters by", zap.String("tag", tag),
 					zap.Int("left", len(enters)), zap.Int("cut", cutNum))
 			}
 		} else {
 			enters = nil
-			if core.LiveMode {
+			if live {
 				log.Warn("skip enters by", zap.String("tag", tag), zap.Int("cut", cutNum))
 			}
 		}
@@ -251,7 +990,7 @@ func (o *OrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*or
 		rawNum := len(enters)
 		var reasons map[string]int
 		enters, reasons = o.allowOrderEnter(exs, job.TimeFrame, enters)
-		if core.LiveMode && len(enters) < rawNum {
+		if o.isLive() && len(enters) < rawNum {
 			log.Info("skip enters by allowOrderEnter", zap.Any("tags", reasons))
 		}
 		for _, ent := range enters {
@@ -295,15 +1034,15 @@ func (o *LocalOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
 }
 
 func (o *OrderMgr) RelayOrders(orders []*ormo.InOutOrder) *errs.Error {
-	symbolMap := orm.GetExSymbolMap(core.ExgName, core.Market)
-	taskId := ormo.GetTaskID(o.Account)
+	symbolMap := o.exSymbolMap()
+	taskId := o.taskID()
 	for _, odr := range orders {
 		exs, ok := symbolMap[odr.Symbol]
 		if !ok {
 			return errs.NewMsg(errs.CodeNoMarketForPair, "%s not found", odr.Symbol)
 		}
-		price := com.GetPriceExp(odr.Symbol, odr.Enter.Side, com.Day10MSecs)
-		curTime := btime.TimeMS()
+		price := o.priceExp(odr.Symbol, odr.Enter.Side, com.Day10MSecs)
+		curTime := o.priceNow()
 		od := &ormo.InOutOrder{
 			IOrder: &ormo.IOrder{
 				TaskID:    taskId,
@@ -342,6 +1081,9 @@ func (o *OrderMgr) RelayOrders(orders []*ormo.InOutOrder) *errs.Error {
 			DirtyMain:  true,
 			DirtyEnter: true,
 		}
+		if state := o.orderState(); state != nil {
+			od.BindState(state)
+		}
 		if odr.Exit != nil && odr.Exit.Filled > 0 {
 			od.Enter.Amount -= odr.Exit.Filled
 			od.QuoteCost = od.Enter.Price * od.Enter.Amount
@@ -367,7 +1109,7 @@ func (o *OrderMgr) EnterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq)
 }
 
 func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq, doCheck bool) (*ormo.InOutOrder, *errs.Error) {
-	isSpot := core.Market == banexg.MarketSpot
+	isSpot := o.marketType() == banexg.MarketSpot
 	if req.Short && isSpot {
 		return nil, errs.NewMsg(core.ErrRunTime, "short oder is invalid for spot")
 	}
@@ -381,36 +1123,44 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 	if req.Leverage == 0 {
 		req.Leverage = 1
 		if !isSpot {
-			exchange := exg.Default
-			exInfo := exchange.Info()
-			if exInfo.FixedLvg {
-				req.Leverage, _ = exchange.GetLeverage(exs.Symbol, 0, o.Account)
-			} else {
-				req.Leverage = config.GetAccLeverage(o.Account)
+			exchange := o.exchangeClient()
+			if exchange != nil {
+				exInfo := exchange.Info()
+				if exInfo != nil && exInfo.FixedLvg {
+					req.Leverage, _ = exchange.GetLeverage(exs.Symbol, 0, o.Account)
+				} else {
+					req.Leverage = o.accountLeverage()
+				}
 			}
 		}
 	}
-	stgVer, _ := strat.Versions[req.StratName]
+	stgVer := 0
+	if o.runtimeDeps && o.walletDeps.Strategies != nil {
+		stgVer, _ = o.walletDeps.Strategies.Version(req.StratName)
+	} else {
+		stgVer, _ = strat.Versions[req.StratName]
+	}
 	odSide := banexg.OdSideBuy
 	if req.Short {
 		odSide = banexg.OdSideSell
 	}
-	if core.LiveMode {
-		err := com.EnsureLatestPrice(exs.Symbol)
+	if o.isLive() {
+		err := o.ensureLatestPrice(exs.Symbol)
 		if err != nil {
 			return nil, err
 		}
 	}
-	price := com.GetPriceSafe(exs.Symbol, odSide)
+	price := o.priceSafeExp(exs.Symbol, odSide, com.PriceExpireMS)
 	if price < 0 {
 		return nil, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", exs.Symbol)
 	}
-	if legacyEntryStopAlreadyCrossed(req.Short, req.Stop, price) {
+	legacyIntrabar := o.legacyIntrabarEnabled()
+	if legacyEntryStopAlreadyCrossedWith(req.Short, req.Stop, price, legacyIntrabar) {
 		req.Stop = 0
 	}
-	enterPrice := entryInitPrice(req.Short, req.Stop, req.Limit, price)
-	curTimeMS := btime.TimeMS()
-	taskId := ormo.GetTaskID(o.Account)
+	enterPrice := entryInitPriceWith(req.Short, req.Stop, req.Limit, price, legacyIntrabar)
+	curTimeMS := o.priceNow()
+	taskId := o.taskID()
 	od := &ormo.InOutOrder{
 		IOrder: &ormo.IOrder{
 			TaskID:    taskId,
@@ -443,16 +1193,19 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 		DirtyMain:  true,
 		DirtyEnter: true,
 	}
+	if state := o.orderState(); state != nil {
+		od.BindState(state)
+	}
 	if od.Enter.OrderType == "" {
-		od.Enter.OrderType = config.OrderType
+		od.Enter.OrderType = o.orderType()
 	}
 	if req.Limit > 0 {
 		od.InitPrice = req.Limit
 		if req.StopBars == 0 {
-			req.StopBars = config.StopEnterBars
+			req.StopBars = o.stopEnterBars()
 		}
 		if req.StopBars > 0 {
-			stopAfter := btime.TimeMS() + int64(req.StopBars*utils.TFToSecs(od.Timeframe))*1000
+			stopAfter := o.priceNow() + int64(req.StopBars*utils.TFToSecs(od.Timeframe))*1000
 			od.SetInfo(ormo.OdInfoStopAfter, stopAfter)
 			od.SetInfo(ormo.OdInfoStopBars, req.StopBars)
 		}
@@ -505,7 +1258,11 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 }
 
 func legacyEntryStopAlreadyCrossed(short bool, stop, price float64) bool {
-	if !legacyIntrabarEnabled() || stop <= 0 {
+	return legacyEntryStopAlreadyCrossedWith(short, stop, price, legacyIntrabarEnabled())
+}
+
+func legacyEntryStopAlreadyCrossedWith(short bool, stop, price float64, legacyIntrabar bool) bool {
+	if !legacyIntrabar || stop <= 0 {
 		return false
 	}
 	if short {
@@ -515,7 +1272,11 @@ func legacyEntryStopAlreadyCrossed(short bool, stop, price float64) bool {
 }
 
 func entryInitPrice(short bool, stop, limit, price float64) float64 {
-	if !legacyIntrabarEnabled() {
+	return entryInitPriceWith(short, stop, limit, price, legacyIntrabarEnabled())
+}
+
+func entryInitPriceWith(short bool, stop, limit, price float64, legacyIntrabar bool) float64 {
+	if !legacyIntrabar {
 		if short && stop > 0 && stop < price {
 			return stop
 		}
@@ -535,7 +1296,7 @@ func entryInitPrice(short bool, stop, limit, price float64) float64 {
 func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error) {
 	// Filter matching orders 筛选匹配的订单
 	var matches []*ormo.InOutOrder
-	openOds, lock := ormo.GetOpenODs(o.Account)
+	openOds, lock := o.openOrders()
 	if req.OrderID > 0 {
 		// Specify the exact order ID to exit 精确指定退出的订单ID
 		lock.Lock()
@@ -588,7 +1349,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 		lock.Unlock()
 	}
 	if len(matches) == 0 {
-		if core.LiveMode {
+		if o.isLive() {
 			fields := req.GetZapFields(nil, zap.String("acc", o.Account), zap.String("pair", pairs),
 				zap.Int("all", len(openOds)))
 			log.Warn("no match orders to exit", fields...)
@@ -627,7 +1388,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 		} else if req.Dirt == core.OdDirtShort {
 			odSide = banexg.OdSideBuy
 		}
-		price := com.GetPriceExp(symbol, odSide, com.Day10MSecs)
+		price := o.priceExp(symbol, odSide, com.Day10MSecs)
 		if price > 0 && (req.Limit-price)*float64(req.Dirt) > 0 {
 			isTakeProfit = true
 		}
@@ -639,7 +1400,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 	var part *ormo.InOutOrder
 	var err *errs.Error
 	for i, od := range matches {
-		if !req.Force && !od.CanClose() {
+		if !req.Force && !o.canClose(od) {
 			continue
 		}
 		dust := od.Enter.Amount * 0.01
@@ -753,7 +1514,7 @@ func (o *OrderMgr) ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InO
 		} else if req.Dirt == core.OdDirtShort {
 			odSide = banexg.OdSideBuy
 		}
-		price := com.GetPriceExp(od.Symbol, odSide, com.Day10MSecs)
+		price := o.priceExp(od.Symbol, odSide, com.Day10MSecs)
 		if price > 0 && (req.Limit-price)*float64(req.Dirt) > 0 {
 			// It is a valid limit order, set to take profit
 			// 是有效的限价出场单，设置到止盈中
@@ -773,7 +1534,7 @@ func (o *OrderMgr) exitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InO
 	// 外部已确认不是限价止盈
 	odType := core.OrderTypeEnums[req.OrderType]
 	if odType == "" {
-		odType = config.OrderType
+		odType = o.orderType()
 	}
 	if req.ExitRate < 0.99 && req.ExitRate > 0 {
 		// The portion to be exited is less than 99%, so a small order is split out for exit.
@@ -786,7 +1547,7 @@ func (o *OrderMgr) exitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InO
 		}
 		return o.exitOrder(part, req)
 	}
-	od.SetExit(0, req.Tag, odType, req.Limit)
+	o.setExit(od, 0, req.Tag, odType, req.Limit)
 	return o.postOrderExit(od)
 }
 
@@ -861,8 +1622,13 @@ func (o *OrderMgr) CutOrder(od *ormo.InOutOrder, enterRate, exitRate float64) *o
 	// Here the key of part is the same as the original one, so part is used as src_key
 	// 这里part的key和原始的一样，所以part作为src_key
 	tgtKey, srcKey := od.Key(), part.Key()
-	base, quote, _, _ := core.SplitSymbol(od.Symbol)
-	wallets := GetWallets(o.Account)
+	parts, parseErr := o.priceSymbolParts(od.Symbol)
+	if parseErr != nil {
+		log.Error("resolve order symbol parts fail", zap.String("symbol", od.Symbol), zap.Error(parseErr))
+		parts = [4]string{}
+	}
+	base, quote := parts[0], parts[1]
+	wallets := o.walletsForOrder()
 	wallets.CutPart(srcKey, tgtKey, base, 1-enterRate)
 	wallets.CutPart(srcKey, tgtKey, quote, 1-enterRate)
 	return part

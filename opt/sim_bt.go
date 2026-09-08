@@ -32,7 +32,22 @@ Perform rolling simulation backtest, extract trading symbols for each time range
 
 执行滚动模拟回测，从日志文件中提取每个区间的交易品种，并进行回测；导出订单记录和enters2.html
 */
+// RunSimBT is the public compatibility entrypoint and owns the legacy state
+// gate for direct embedding callers.
 func RunSimBT(args *config.CmdArgs) *errs.Error {
+	return WithLegacySession(func(session LegacySession) *errs.Error {
+		return RunSimBTWithSession(args, session)
+	})
+}
+
+// RunSimBTWithSession runs simulation under an existing legacy session owned
+// by the command composition root.
+func RunSimBTWithSession(args *config.CmdArgs, session LegacySession) *errs.Error {
+	session.require()
+	return runSimBT(args)
+}
+
+func runSimBT(args *config.CmdArgs) *errs.Error {
 	if args.InPath == "" {
 		log.Warn("-in is required")
 		return nil

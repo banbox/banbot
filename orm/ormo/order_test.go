@@ -2,14 +2,18 @@ package ormo
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	botexg "github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
 
@@ -62,6 +66,50 @@ func newFilledTestOrder() *InOutOrder {
 	order.Enter.Average = 100
 	order.Enter.Filled = 1
 	return order
+}
+
+type clientIDExchangeStub struct {
+	banexg.BanExchange
+	id string
+}
+
+func (s *clientIDExchangeStub) Info() *banexg.ExgInfo {
+	return &banexg.ExgInfo{ID: s.id}
+}
+
+func (s *clientIDExchangeStub) BuildClientOrderID(namespace string, orderID int64, clientID string, _ bool) string {
+	if s.id == "okx" {
+		return fmt.Sprintf("abcdef%012d0000", orderID)
+	}
+	return fmt.Sprintf("%s_%d_%s", namespace, orderID, clientID)
+}
+
+func TestClientIDDelegatesFormatToExchangeBoundary(t *testing.T) {
+	oldName, oldExgName, oldDefault := config.Name, core.ExgName, botexg.Default
+	t.Cleanup(func() {
+		config.Name, core.ExgName, botexg.Default = oldName, oldExgName, oldDefault
+	})
+	config.Name = "bot"
+	order := newTestOrder()
+	order.ID = 42
+
+	botexg.Default = &clientIDExchangeStub{id: "binance"}
+	if got := order.ClientId(false); got != "bot_42_" {
+		t.Fatalf("standard client ID = %q, want bot_42_", got)
+	}
+
+	botexg.Default = &clientIDExchangeStub{id: "okx"}
+	got := order.ClientId(false)
+	if len(got) != 22 || strings.Contains(got, "_") {
+		t.Fatalf("compact client ID = %q, want 22 alphanumeric characters", got)
+	}
+
+	botexg.Default = nil
+	core.ExgName = "okx"
+	got = order.ClientId(false)
+	if len(got) != 22 || strings.Contains(got, "_") {
+		t.Fatalf("legacy compact client ID = %q, want 22 alphanumeric characters", got)
+	}
 }
 
 func enableStrictHistoricalOrderMetricsTest(t *testing.T) {

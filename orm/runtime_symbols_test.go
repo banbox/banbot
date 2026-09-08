@@ -1,6 +1,8 @@
 package orm
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/banbox/banbot/core"
@@ -32,4 +34,42 @@ func TestInstallFrozenExSymbolsIsMemoryOnlyAndRestorable(t *testing.T) {
 	if GetSymbolByID(91) == nil || GetSymbolByID(7) != nil {
 		t.Fatal("original symbol cache was not restored")
 	}
+}
+
+func TestInstallFrozenExSymbolsConcurrentLegacyReads(t *testing.T) {
+	base := NewSymbolState()
+	previous := swapDefaultSymbolState(base)
+	t.Cleanup(func() { swapDefaultSymbolState(previous) })
+	legacyQueries := New(nil)
+
+	const iterations = 100
+	var readers sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			<-start
+			for j := 0; j < iterations; j++ {
+				_ = GetExSymbol2("test", "spot", "PAIR")
+				_ = GetExSymbols("", "")
+				_ = GetAllExSymbols()
+				_ = legacyQueries.WithSymbolState(nil).symbolState().SymbolCount()
+			}
+		}()
+	}
+	close(start)
+	for i := 1; i <= iterations; i++ {
+		restore, err := InstallFrozenExSymbols([]*ExSymbol{{
+			ID:       int32(i),
+			Exchange: "test",
+			Market:   "spot",
+			Symbol:   fmt.Sprintf("PAIR-%d", i),
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		restore()
+	}
+	readers.Wait()
 }

@@ -35,11 +35,49 @@ func (s *TradeStrat) GetStakeAmount(j *StratJob) float64 {
 	}
 	// 乘以此任务的开单倍率
 	key := core.KeyStratPairTf(j.Strat.Name, j.Symbol.Symbol, j.TimeFrame)
-	pref, _ := core.JobPerfs[key]
+	perfs := core.JobPerfs
+	if j != nil && j.runtimeCore != nil {
+		perfs = j.runtimeCore.JobPerfs
+	}
+	pref, _ := perfs[key]
 	if pref != nil {
 		amount = pref.GetAmount(amount)
 	}
 	return amount
+}
+
+func (s *StratJob) runtimeLive() bool {
+	if s != nil && s.runtimeCore != nil {
+		return s.runtimeCore.LiveMode
+	}
+	return core.LiveMode
+}
+
+func (s *StratJob) runtimeBacktest() bool {
+	if s != nil && s.runtimeCore != nil {
+		return s.runtimeCore.BackTestMode
+	}
+	return core.BackTestMode
+}
+
+func (s *StratJob) runtimeTimeMS() int64 {
+	if s != nil && s.runtimeClock != nil {
+		return s.runtimeClock.TimeMS()
+	}
+	return btime.TimeMS()
+}
+
+func (s *StratJob) currentPrice(side string) float64 {
+	if s != nil && s.runtimePrices != nil {
+		price := s.runtimePrices.GetPriceSafeExpAt(s.runtimeTimeMS(), s.Symbol.Symbol, side, com.PriceExpireMS)
+		if price >= 0 {
+			return price
+		}
+	}
+	if s != nil && s.Env != nil {
+		return s.Env.Close.Get(0)
+	}
+	return -1
 }
 
 func (s *TradeStrat) WriteOutput(line string, date bool) {
@@ -107,13 +145,32 @@ func (s *StratJob) CanOpen(short bool) bool {
 	disable := false
 	if short {
 		disable = s.MaxOpenShort < 0 || s.MaxOpenShort > 0 && len(s.ShortOrders) >= s.MaxOpenShort
-		if core.Market == banexg.MarketSpot {
+		if s.runtimeMarket() == banexg.MarketSpot {
 			disable = true
 		}
 	} else {
 		disable = s.MaxOpenLong < 0 || s.MaxOpenLong > 0 && len(s.LongOrders) >= s.MaxOpenLong
 	}
 	return !disable
+}
+
+// runtimeMarket keeps explicit jobs independent from the process-wide market.
+// Symbol identity wins over the shared BarEnv because a legacy env cache may
+// be reused while a job still owns its runtime-local ExSymbol.
+func (s *StratJob) runtimeMarket() string {
+	if s == nil {
+		return core.Market
+	}
+	if s.Symbol != nil && s.Symbol.Market != "" {
+		return s.Symbol.Market
+	}
+	if s.Env != nil && s.Env.MarketType != "" {
+		return s.Env.MarketType
+	}
+	if s.symbols != nil {
+		return ""
+	}
+	return core.Market
 }
 
 func (s *StratJob) OpenOrder(req *EnterReq) *errs.Error {
@@ -141,7 +198,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		return errs.NewMsg(errs.CodeParamRequired, "tag is Required")
 	}
 	req.StratName = s.Strat.Name
-	isLiveMode := core.LiveMode
+	isLiveMode := s.runtimeLive()
 	symbol := s.Symbol.Symbol
 	var dirType = core.OdDirtLong
 	if req.Short {
@@ -181,10 +238,14 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	if s.IsWarmUp {
 		curPrice = s.Env.Close.Get(0)
 	} else {
-		_ = com.EnsureLatestPrice(symbol)
-		curPrice = com.GetPriceSafe(symbol, odSide)
-		if curPrice < 0 {
-			curPrice = s.Env.Close.Get(0)
+		if s.runtimeCore != nil {
+			curPrice = s.currentPrice(odSide)
+		} else {
+			_ = com.EnsureLatestPrice(symbol)
+			curPrice = com.GetPriceSafe(symbol, odSide)
+			if curPrice < 0 {
+				curPrice = s.Env.Close.Get(0)
+			}
 		}
 	}
 	enterPrice := curPrice
@@ -201,7 +262,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 	}
 	if req.Stop > 0 {
-		enterPrice = normalizeEntryStop(req, curPrice, isLimit)
+		enterPrice = normalizeEntryStop(req, curPrice, isLimit, s.runtimeBacktest())
 	}
 	if req.Amount == 0 && req.LegalCost == 0 {
 		if req.CostRate == 0 {
@@ -212,7 +273,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		reqAmt := req.LegalCost / enterPrice
 		if avgVol > 0 && reqAmt/avgVol > config.OpenVolRate {
 			req.LegalCost = avgVol * config.OpenVolRate * enterPrice
-			if core.LiveMode {
+			if isLiveMode {
 				log.Info(fmt.Sprintf("%v open amt rate: %.1f > open_vol_rate(%.1f), cut to cost: %.1f",
 					symbol, reqAmt/avgVol, config.OpenVolRate, req.LegalCost))
 			}
@@ -324,16 +385,16 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	if !s.IsWarmUp {
 		s.Entrys = append(s.Entrys, req)
 		s.OrderNum += 1
-		if core.LiveMode {
+		if isLiveMode {
 			log.Info("OpenOrder", req.GetZapFields(s)...)
 		}
 	}
 	return nil
 }
 
-func normalizeEntryStop(req *EnterReq, curPrice float64, isLimit bool) float64 {
+func normalizeEntryStop(req *EnterReq, curPrice float64, isLimit, backtest bool) float64 {
 	stopPrice := req.Stop
-	if core.BackTestMode && config.Data.BTLegacyIntrabar {
+	if backtest && config.Data.BTLegacyIntrabar {
 		return curPrice
 	}
 	stopActsAsLimit := req.Stop < curPrice
@@ -420,10 +481,14 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 			if s.IsWarmUp {
 				curPrice = s.Env.Close.Get(0)
 			} else {
-				_ = com.EnsureLatestPrice(s.Symbol.Symbol)
-				curPrice = com.GetPriceSafe(s.Symbol.Symbol, odSide)
-				if curPrice < 0 {
-					curPrice = s.Env.Close.Get(0)
+				if s.runtimeCore != nil {
+					curPrice = s.currentPrice(odSide)
+				} else {
+					_ = com.EnsureLatestPrice(s.Symbol.Symbol)
+					curPrice = com.GetPriceSafe(s.Symbol.Symbol, odSide)
+					if curPrice < 0 {
+						curPrice = s.Env.Close.Get(0)
+					}
 				}
 			}
 			sl := &ormo.ExitTrigger{
@@ -456,7 +521,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 	}
 	if !s.IsWarmUp {
 		s.Exits = append(s.Exits, req)
-		if core.LiveMode {
+		if s.runtimeLive() {
 			log.Info("CloseOrders", req.GetZapFields(s)...)
 		}
 	}

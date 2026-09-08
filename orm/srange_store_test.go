@@ -32,9 +32,9 @@ func cleanSRanges(t *testing.T, sid int32, tbl, tf string) {
 	srangesCacheDel(sid, tbl, tf)
 	ctx := context.Background()
 	rows, err := pool.Query(ctx, `SELECT start_ms, stop_ms, has_data
-FROM (
-  SELECT start_ms, stop_ms, has_data, is_deleted
-  FROM sranges_q
+	FROM (
+	  SELECT start_ms, stop_ms, has_data, is_deleted
+	  FROM sranges_q
   LATEST BY sid, tbl, timeframe, start_ms
   WHERE sid = $1 AND tbl = $2 AND timeframe = $3
 )
@@ -62,8 +62,91 @@ WHERE coalesce(is_deleted, false) = false`, sid, tbl, tf)
 		_, _ = pool.Exec(ctx, `INSERT INTO sranges_q (sid, ts, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted)
 VALUES ($1, $2, $3, $4, $5, $6, $7, true)`, sid, ts, tbl, tf, it.startMs, it.stopMs, it.hasData)
 	}
-	time.Sleep(200 * time.Millisecond)
+	if len(items) > 0 {
+		waitSRangesEmpty(t, sid, tbl, tf)
+	}
+	// Keep the cleanup stable across test runs. A row from an earlier process
+	// can become visible after the first query while QuestDB drains its WAL.
+	waitSRangesEmptyStable(t, sid, tbl, tf, 3)
 	srangesCacheDel(sid, tbl, tf)
+}
+
+func waitSRangesEmpty(t *testing.T, sid int32, tbl, tf string) {
+	t.Helper()
+	ok, err := waitForQuestCondition(context.Background(), 5*time.Second, questReadAfterWritePollInterval, func() (bool, error) {
+		rows, err := pool.Query(context.Background(), `SELECT start_ms
+FROM (
+  SELECT start_ms, is_deleted
+  FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms
+  WHERE sid = $1 AND tbl = $2 AND timeframe = $3
+)
+WHERE coalesce(is_deleted, false) = false`, sid, tbl, tf)
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var startMs int64
+			if err := rows.Scan(&startMs); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		return rows.Err() == nil, rows.Err()
+	})
+	if err != nil {
+		t.Fatalf("wait for sranges cleanup: %v", err)
+	}
+	if !ok {
+		t.Fatalf("sranges cleanup did not become visible: sid=%d table=%s timeframe=%s", sid, tbl, tf)
+	}
+}
+
+func waitSRangesEmptyStable(t *testing.T, sid int32, tbl, tf string, checks int) {
+	t.Helper()
+	if checks <= 1 {
+		waitSRangesEmpty(t, sid, tbl, tf)
+		return
+	}
+	consecutive := 0
+	ok, err := waitForQuestCondition(context.Background(), 5*time.Second, questReadAfterWritePollInterval, func() (bool, error) {
+		rows, err := pool.Query(context.Background(), `SELECT start_ms
+FROM (
+  SELECT start_ms, is_deleted
+  FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms
+  WHERE sid = $1 AND tbl = $2 AND timeframe = $3
+)
+WHERE coalesce(is_deleted, false) = false`, sid, tbl, tf)
+		if err != nil {
+			return false, err
+		}
+		hasRows := rows.Next()
+		if hasRows {
+			var startMs int64
+			if err := rows.Scan(&startMs); err != nil {
+				rows.Close()
+				return false, err
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return false, err
+		}
+		if hasRows {
+			consecutive = 0
+			return false, nil
+		}
+		consecutive++
+		return consecutive >= checks, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for stable sranges cleanup: %v", err)
+	}
+	if !ok {
+		t.Fatalf("sranges cleanup did not stay empty: sid=%d table=%s timeframe=%s", sid, tbl, tf)
+	}
 }
 
 func mustUpdateRange(t *testing.T, sid int32, tbl, tf string, startMs, stopMs int64, hasData bool) {

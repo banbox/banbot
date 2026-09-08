@@ -10,6 +10,7 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
@@ -41,8 +42,13 @@ func NewTradeCloseCommand() *cobra.Command {
 		Aliases: []string{"close_order"},
 		Short:   "close orders by account, pair, or strategy",
 		Args:    cobra.NoArgs,
+		Annotations: map[string]string{
+			legacygate.Annotation: "1",
+		},
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return runTradeClose(options)
+			return legacygate.With(func() error {
+				return runTradeClose(options)
+			})
 		},
 	}
 	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")

@@ -15,6 +15,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	utils2 "github.com/banbox/banexg/utils"
@@ -40,6 +41,12 @@ func DecodeRequest(data []byte) (*RequestV1, error) {
 }
 
 func Inspect(req *RequestV1, dataDir string) (*OutputV1, error) {
+	unlock := legacygate.Lock()
+	defer unlock()
+	return inspect(req, dataDir)
+}
+
+func inspect(req *RequestV1, dataDir string) (*OutputV1, error) {
 	requestHash, cfg, err := validateRequest(req)
 	if err != nil {
 		return nil, err
@@ -61,13 +68,12 @@ func Inspect(req *RequestV1, dataDir string) (*OutputV1, error) {
 			Symbol: item.Symbol, Combined: item.Combined, ListMs: item.ListMS, DelistMs: item.DelistMS,
 		})
 	}
-	restoreSymbols, err := orm.InstallFrozenExSymbols(symbols)
-	if err != nil {
+	symbolState := orm.NewSymbolStateWithIdentity(cfg.Exchange.Name, cfg.MarketType)
+	if err := symbolState.SetExSymbols(symbols); err != nil {
 		return nil, fmt.Errorf("install frozen market universe: %w", err)
 	}
-	defer restoreSymbols()
 
-	semantic := collectSemanticPlan(req, cfg)
+	semantic := collectSemanticPlan(req, cfg, symbolState)
 	output := &OutputV1{
 		Version: Version, RequestSHA256: requestHash, SelectionMode: semantic.SelectionMode,
 		InitialSymbols: semantic.InitialSymbols, Policies: semantic.Policies,
@@ -237,7 +243,7 @@ func installRuntimeConfig(req *RequestV1, cfg *config.Config) (func(), error) {
 	return restore, nil
 }
 
-func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
+func collectSemanticPlan(req *RequestV1, cfg *config.Config, symbolState *orm.SymbolState) SemanticPlanV1 {
 	plan := SemanticPlanV1{
 		Version: Version, SelectionMode: SelectionMode, InitialSymbols: slices.Clone(req.InitialSymbols),
 		Policies: make([]PolicyV1, 0, len(config.RunPolicy)), Requirements: []RequirementV1{}, Unsupported: []UnsupportedV1{},
@@ -245,7 +251,7 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config) SemanticPlanV1 {
 	universe := make(map[string]*orm.ExSymbol, len(req.MarketUniverse))
 	envs := make(map[string]*ta.BarEnv)
 	for _, item := range req.MarketUniverse {
-		exs := orm.GetSymbolByID(item.SID)
+		exs := symbolState.GetSymbolByID(item.SID)
 		universe[symbolKey(item.Exchange, item.Market, item.Symbol)] = exs
 	}
 	for _, symbol := range req.InitialSymbols {

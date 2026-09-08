@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/banbox/banbot/btime"
@@ -65,6 +66,48 @@ func InitTask(showLog bool, outDir string) *errs.Error {
 		log.Info("init task ok", zap.String("id", strings.Join(idList, ", ")))
 	}
 	return nil
+}
+
+// InitTasksWithState installs in-memory task identities into an explicit
+// runtime order state. Negative IDs are intentionally local-only: they keep
+// simulated task identity independent from the process-wide legacy registry
+// while remaining distinct for every account in one runtime.
+func InitTasksWithState(state *OrderState, accounts []string, mode string, startAt, stopAt int64, showLog bool) *errs.Error {
+	if state == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "order state is required")
+	}
+	if len(accounts) == 0 {
+		accounts = []string{config.DefAcc}
+	}
+	accounts = append([]string(nil), accounts...)
+	sort.Strings(accounts)
+	nextID := int64(-1)
+	ids := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		if account == "" || state.GetTask(account) != nil {
+			continue
+		}
+		for state.GetTaskAcc(nextID) != "" {
+			nextID--
+		}
+		task := &BotTask{ID: nextID, Mode: mode, CreateAt: btime.UTCStamp(), StartAt: startAt, StopAt: stopAt}
+		state.SetTask(account, task)
+		ids = append(ids, fmt.Sprintf("%s:%v", account, task.ID))
+		nextID--
+	}
+	if showLog && len(ids) > 0 {
+		log.Info("init runtime tasks ok", zap.String("ids", strings.Join(ids, ", ")))
+	}
+	return nil
+}
+
+// InitTaskWithState is the single-account compatibility wrapper around
+// InitTasksWithState.
+func InitTaskWithState(state *OrderState, account, mode string, startAt, stopAt int64, showLog bool) *errs.Error {
+	if account == "" {
+		account = config.DefAcc
+	}
+	return InitTasksWithState(state, []string{account}, mode, startAt, stopAt, showLog)
 }
 
 func (q *Queries) GetAccTask(account string) (*BotTask, *errs.Error) {

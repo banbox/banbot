@@ -233,12 +233,14 @@ func LoadZipSeries(inPath string, fid int, file *zip.File, arg interface{}) *err
 	num, err := sess.InsertSeries(timeFrame, exs, seriesRows, false)
 	if err == nil && num > 0 {
 		// insert data for big timeframes 插入更大周期
-		return aggBigSeries(sess, seriesRows, tfMSecs, exs)
+		return aggBigSeries(sess, seriesRows, tfMSecs, exs, exchange)
 	}
 	return err
 }
 
-func aggBigSeries(sess *orm.Queries, rows []*orm.DataSeries, tfMSecs int64, exs *orm.ExSymbol) *errs.Error {
+func aggBigSeries(sess *orm.Queries, rows []*orm.DataSeries, tfMSecs int64, exs *orm.ExSymbol,
+	exchange banexg.BanExchange,
+) *errs.Error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -249,7 +251,7 @@ func aggBigSeries(sess *orm.Queries, rows []*orm.DataSeries, tfMSecs int64, exs 
 		if agg.MSecs <= tfMSecs {
 			continue
 		}
-		offMS := int64(exg.GetAlignOff(exs.Exchange, int(agg.MSecs/1000)) * 1000)
+		offMS := int64(exg.GetAlignOffForExchange(exchange, exs.Symbol, int(agg.MSecs/1000)) * 1000)
 		aggRows, _, err_ := orm.ResampleDataSeries(exs, agg.TimeFrame, rows, nil, agg.MSecs, 0, tfMSecs, offMS, false)
 		if err_ != nil {
 			return errs.New(core.ErrInvalidBars, err_)
@@ -302,6 +304,10 @@ func AggBigKlines(args *config.CmdArgs) *errs.Error {
 		return err
 	}
 	defer conn.Release()
+	exchange, err := exg.GetWith(core.ExgName, core.Market, core.ContractType)
+	if err != nil {
+		return err
+	}
 	minMSecs := int64(utils2.TFToSecs(minTF) * 1000)
 	yearMSecs := int64(utils2.TFToSecs("1y") * 1000)
 	startMS, endMS := config.TimeRange.StartMS, config.TimeRange.EndMS
@@ -317,7 +323,7 @@ func AggBigKlines(args *config.CmdArgs) *errs.Error {
 				return err
 			}
 			if len(rows) > 0 {
-				err = aggBigSeries(sess, rows, minMSecs, exs)
+				err = aggBigSeries(sess, rows, minMSecs, exs, exchange)
 				if err != nil {
 					return err
 				}

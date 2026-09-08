@@ -22,6 +22,7 @@ type DataHub struct {
 type DataFields struct {
 	mu            sync.RWMutex
 	seriesMap     map[string]*ta.Series
+	rawMap        map[string]any // values from the latest event; map presence preserves explicit NULL
 	valMap        map[string]any
 	DoneMS        int64
 	TimeMS        int64
@@ -145,6 +146,7 @@ func (d *DataHub) ensureLocked(tf, source string, sid int32) *DataFields {
 	if fields == nil {
 		fields = &DataFields{
 			seriesMap:    make(map[string]*ta.Series),
+			rawMap:       make(map[string]any),
 			valMap:       make(map[string]any),
 			seriesFields: make(map[string]bool),
 			limit:        d.limit,
@@ -197,6 +199,15 @@ func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 	d.TimeFrame = evt.TimeFrame
 	d.Closed = evt.Closed
 	d.IsWarmUp = evt.IsWarmUp
+	clear(d.rawMap)
+	for name, value := range evt.Values {
+		d.rawMap[name] = value
+	}
+	for name := range d.valMap {
+		if _, present := evt.Values[name]; !present {
+			delete(d.valMap, name)
+		}
+	}
 
 	changed := false
 	for name, value := range evt.Values {
@@ -207,6 +218,8 @@ func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 		}
 		if !selected {
 			d.valMap[name] = value
+		} else {
+			delete(d.valMap, name)
 		}
 	}
 	if changed {
@@ -318,15 +331,28 @@ func (d *DataFields) String(name string) string {
 }
 
 func (d *DataFields) Raw(name string) any {
+	value, _ := d.RawValue(name)
+	return value
+}
+
+// RawValue returns the value from the latest event and whether that field was
+// present in the event. The boolean distinguishes an explicit nil from a
+// missing field; series(name) remains the derived numeric history.
+func (d *DataFields) RawValue(name string) (any, bool) {
 	if d == nil {
-		return nil
+		return nil, false
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	if series := d.seriesMap[name]; series != nil {
-		return series.Get(0)
-	}
-	return d.valMap[name]
+	value, ok := d.rawMap[name]
+	return value, ok
+}
+
+// Has reports whether the latest event contained name, including when its
+// value was explicitly nil.
+func (d *DataFields) Has(name string) bool {
+	_, ok := d.RawValue(name)
+	return ok
 }
 
 func (s *StratJob) SetData(evt *orm.DataSeries) *DataFields {

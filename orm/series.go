@@ -116,6 +116,17 @@ type DataSeries struct {
 }
 
 func ResolveSeriesExSymbol(evt *DataSeries, extras ...*ExSymbol) *ExSymbol {
+	return resolveSeriesExSymbol(nil, evt, extras...)
+}
+
+// ResolveSeriesExSymbolWithSymbolState resolves SID-only series against the
+// supplied runtime catalog. A non-nil state never consults the legacy catalog;
+// the nil-state wrapper above preserves the old facade for legacy callers.
+func ResolveSeriesExSymbolWithSymbolState(state *SymbolState, evt *DataSeries, extras ...*ExSymbol) *ExSymbol {
+	return resolveSeriesExSymbol(state, evt, extras...)
+}
+
+func resolveSeriesExSymbol(state *SymbolState, evt *DataSeries, extras ...*ExSymbol) *ExSymbol {
 	if evt == nil {
 		return nil
 	}
@@ -128,6 +139,9 @@ func ResolveSeriesExSymbol(evt *DataSeries, extras ...*ExSymbol) *ExSymbol {
 		}
 	}
 	if evt.Sid > 0 {
+		if state != nil {
+			return state.GetSymbolByID(evt.Sid)
+		}
 		return GetSymbolByID(evt.Sid)
 	}
 	return nil
@@ -480,6 +494,14 @@ func ResampleSeriesRecords(info *SeriesInfo, exs *ExSymbol, rows []*DataRecord, 
 }
 
 func ResampleDataSeries(exs *ExSymbol, tf string, rows, prev []*DataSeries, toTFMS int64, preFire float64, fromTFMS, offMS int64, isWarmUp bool) ([]*DataSeries, bool, error) {
+	return ResampleDataSeriesWithSymbolState(nil, exs, tf, rows, prev, toTFMS, preFire, fromTFMS, offMS, isWarmUp)
+}
+
+// ResampleDataSeriesWithSymbolState keeps SID-only rows on the supplied
+// runtime symbol catalog while retaining the legacy wrapper above.
+func ResampleDataSeriesWithSymbolState(state *SymbolState, exs *ExSymbol, tf string,
+	rows, prev []*DataSeries, toTFMS int64, preFire float64, fromTFMS, offMS int64, isWarmUp bool,
+) ([]*DataSeries, bool, error) {
 	if len(rows) == 0 {
 		return nil, false, nil
 	}
@@ -488,7 +510,7 @@ func ResampleDataSeries(exs *ExSymbol, tf string, rows, prev []*DataSeries, toTF
 	}
 	source := NormalizeSeriesSource(rows[0].Source)
 	if source == SeriesSourceKline {
-		return resampleOHLCVSeries(exs, tf, rows, prev, toTFMS, preFire, fromTFMS, offMS, isWarmUp)
+		return resampleOHLCVSeries(state, exs, tf, rows, prev, toTFMS, preFire, fromTFMS, offMS, isWarmUp)
 	}
 	info := NewSeriesInfo(source, tf, inferSeriesFields(prev, rows))
 	records := make([]*DataRecord, 0, len(prev)+len(rows))
@@ -529,7 +551,8 @@ func inferSeriesFields(groups ...[]*DataSeries) []SeriesField {
 				continue
 			}
 			for key, val := range row.Values {
-				if _, ok := seen[key]; !ok {
+				existing, ok := seen[key]
+				if !ok || (existing == nil && val != nil) {
 					seen[key] = val
 				}
 			}

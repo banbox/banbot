@@ -1,6 +1,7 @@
 package biz
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/banbox/banbot/config"
@@ -8,8 +9,33 @@ import (
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 	ta "github.com/banbox/banta"
 )
+
+func TestParallelErrorSelectionIsDeterministic(t *testing.T) {
+	results := []parallelError{
+		{key: "z-job", err: errs.NewMsg(errs.CodeRunTime, "z")},
+		{key: "a-job", err: errs.NewMsg(errs.CodeRunTime, "a")},
+		{key: "m-job", err: errs.NewMsg(errs.CodeRunTime, "m")},
+	}
+	for run := 0; run < 20; run++ {
+		errCh := make(chan parallelError, len(results))
+		var wg sync.WaitGroup
+		for _, result := range results {
+			wg.Add(1)
+			go func(result parallelError) {
+				defer wg.Done()
+				errCh <- result
+			}(result)
+		}
+		wg.Wait()
+		close(errCh)
+		if err := selectParallelError(errCh); err == nil || err.Message() != "a" {
+			t.Fatalf("run %d selected error = %v, want a", run, err)
+		}
+	}
+}
 
 func TestOHLCVSeriesUsesOnDataWithMainRole(t *testing.T) {
 	env, err := ta.NewBarEnv("binance", "spot", "BTC/USDT", "1m")
@@ -139,5 +165,129 @@ func TestPrimaryAndSideSubscriptionDoesNotDuplicateOnData(t *testing.T) {
 	}
 	if dataCalls != 1 || barCalls != 0 {
 		t.Fatalf("expected one OnData dispatch, got data=%d bar=%d", dataCalls, barCalls)
+	}
+}
+
+func TestTraderRuntimeUsesOwnedSymbolStateForSIDOnlySeries(t *testing.T) {
+	oldAccounts, oldInfoJobs := config.Accounts, strat.AccInfoJobs
+	config.Accounts = map[string]*config.AccountConfig{config.DefAcc: {}}
+	strat.AccInfoJobs = map[string]map[string]map[string]*strat.StratJob{config.DefAcc: {}}
+	t.Cleanup(func() {
+		config.Accounts = oldAccounts
+		strat.AccInfoJobs = oldInfoJobs
+	})
+
+	restoreLegacy, err := orm.InstallFrozenExSymbols([]*orm.ExSymbol{{
+		ID: 7, Exchange: "legacy", Market: "spot", Symbol: "LEGACY/USDT",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(restoreLegacy)
+
+	runtimeSymbols := orm.NewSymbolStateWithIdentity("runtime", "spot")
+	if err := runtimeSymbols.SetExSymbols([]*orm.ExSymbol{{
+		ID: 7, Exchange: "runtime", Market: "spot", Symbol: "RUNTIME/USDT",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	newJob := func() *strat.StratJob {
+		return &strat.StratJob{
+			Strat: &strat.TradeStrat{OnData: func(_ *strat.StratJob, data strat.DataEvent) {
+				if data.Symbol == nil {
+					t.Fatal("OnData received no resolved symbol")
+				}
+				got = append(got, data.Symbol.Symbol)
+			}},
+			DataHub: strat.NewDataHub(),
+		}
+	}
+	subKey := strat.DataSubKey("macro", 7, "1d")
+	strat.AccInfoJobs[config.DefAcc][subKey] = map[string]*strat.StratJob{"legacy": newJob()}
+	runtimeStrategies := strat.NewState()
+	runtimeStrategies.InfoJobs(config.DefAcc)[subKey] = map[string]*strat.StratJob{"runtime": newJob()}
+
+	legacy := NewTrader(nil)
+	if err := legacy.FeedDataSeries(&orm.DataSeries{
+		Source: "macro", Sid: 7, TimeFrame: "1d", Values: map[string]any{"signal": 1.0},
+	}); err != nil {
+		t.Fatalf("legacy FeedDataSeries returned error: %v", err)
+	}
+	runtimeTrader := NewTraderWithRuntimeDeps(RuntimeDeps{Symbols: runtimeSymbols, Strategies: runtimeStrategies})
+	if err := runtimeTrader.FeedDataSeries(&orm.DataSeries{
+		Source: "macro", Sid: 7, TimeFrame: "1d", Values: map[string]any{"signal": 2.0},
+	}); err != nil {
+		t.Fatalf("typed FeedDataSeries returned error: %v", err)
+	}
+
+	if len(got) != 2 || got[0] != "LEGACY/USDT" || got[1] != "RUNTIME/USDT" {
+		t.Fatalf("resolved symbols = %v, want [LEGACY/USDT RUNTIME/USDT]", got)
+	}
+}
+
+func TestTraderRuntimeAccountDispatchUsesOwnedConfig(t *testing.T) {
+	oldAccounts := config.Accounts
+	config.Accounts = map[string]*config.AccountConfig{"legacy-only": {}}
+	t.Cleanup(func() { config.Accounts = oldAccounts })
+
+	const account = "runtime-only"
+	const subKey = "macro:1:1d"
+	strategies := strat.NewState()
+	calls := 0
+	strategies.InfoJobs(account)[subKey] = map[string]*strat.StratJob{
+		"job": {
+			Strat:   &strat.TradeStrat{OnData: func(*strat.StratJob, strat.DataEvent) { calls++ }},
+			DataHub: strat.NewDataHub(),
+		},
+	}
+	trader := NewTraderWithRuntimeDeps(RuntimeDeps{
+		Core:       &core.State{EnvReal: true},
+		Strategies: strategies,
+		Config: config.NewSnapshot(&config.Config{
+			Accounts: map[string]*config.AccountConfig{account: {}},
+		}),
+	})
+
+	evt := &orm.DataSeries{
+		Source: "macro", Sid: 1, TimeFrame: "1d",
+		Values: map[string]any{"value": 1.0},
+	}
+	if err := trader.feedDataOnlySeries(evt, &orm.ExSymbol{ID: 1, Symbol: "RUNTIME/USDT"}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("runtime callback calls = %d, want 1", calls)
+	}
+}
+
+func TestTraderTypedSeriesRejectsForeignAndMissingSymbols(t *testing.T) {
+	restoreLegacy, err := orm.InstallFrozenExSymbols([]*orm.ExSymbol{
+		{ID: 7, Exchange: "legacy", Market: "spot", Symbol: "LEGACY/USDT"},
+		{ID: 8, Exchange: "legacy", Market: "spot", Symbol: "LEGACY-ONLY/USDT"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(restoreLegacy)
+
+	runtimeSymbols := orm.NewSymbolStateWithIdentity("runtime", "spot")
+	if err := runtimeSymbols.SetExSymbols([]*orm.ExSymbol{{
+		ID: 7, Exchange: "runtime", Market: "spot", Symbol: "RUNTIME/USDT",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	trader := NewTraderWithRuntimeDeps(RuntimeDeps{Symbols: runtimeSymbols})
+
+	foreign := &orm.DataSeries{
+		Source: "macro", Sid: 7, TimeFrame: "1d",
+		ExSymbol: &orm.ExSymbol{ID: 7, Exchange: "legacy", Market: "spot", Symbol: "LEGACY/USDT"},
+	}
+	if err := trader.FeedDataSeries(foreign); err == nil {
+		t.Fatal("typed Trader accepted a foreign symbol")
+	}
+	if err := trader.FeedDataSeries(&orm.DataSeries{Source: "macro", Sid: 8, TimeFrame: "1d"}); err == nil {
+		t.Fatal("typed Trader fell back to the legacy symbol for a missing runtime SID")
 	}
 }

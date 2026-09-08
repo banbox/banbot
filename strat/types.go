@@ -1,6 +1,8 @@
 package strat
 
 import (
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
@@ -130,8 +132,25 @@ type StratJob struct {
 	IsWarmUp      bool              // whether in a preheating state 当前是否处于预热状态
 	More          interface{}       // Additional information for policy customization 策略自定义的额外信息
 
-	inspectEffect     func(string)
-	dataHubConfigured bool
+	symbols            *orm.SymbolState
+	strategyState      *State
+	runtimeCore        *core.State
+	runtimePrices      *com.PriceState
+	runtimeClock       *btime.ClockState
+	inspectEffect      func(string)
+	dataHubConfigured  bool
+	pairRemovalPending bool
+}
+
+// BindRuntimeMarket attaches the explicit market clock to a job. Strategy
+// callbacks keep using direct receiver fields, while typed runtimes avoid the
+// legacy package price/time facades.
+func (s *StratJob) BindRuntimeMarket(prices *com.PriceState, clock *btime.ClockState) {
+	if s == nil {
+		return
+	}
+	s.runtimePrices = prices
+	s.runtimeClock = clock
 }
 
 // NewInspectionJob creates the inert job state passed to startup-time

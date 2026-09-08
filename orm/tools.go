@@ -31,6 +31,7 @@ type ExportKlineJob struct {
 	TimeFrame string
 	StartMS   int64
 	StopMS    int64
+	HasInfo   bool
 }
 
 type ExportTask struct {
@@ -240,6 +241,7 @@ func genExportKlines(items []*config.MarketTFSymbolsRange, adjs []*AdjFactorBloc
 
 		exchanges, markets := parseExgMarkets(kCfg.Exchange, kCfg.Market)
 		for _, exchange := range exchanges {
+			hasInfo := config.ExchangeUsesOpaqueSymbols(exchange)
 			for _, market := range markets {
 				exsList, err := parseExSymbols(exchange, kCfg.ExgReal, market, kCfg.Symbols)
 				if err != nil {
@@ -259,6 +261,7 @@ func genExportKlines(items []*config.MarketTFSymbolsRange, adjs []*AdjFactorBloc
 							TimeFrame: tf,
 							StartMS:   startMS,
 							StopMS:    stopMS,
+							HasInfo:   hasInfo,
 						})
 					}
 				}
@@ -419,7 +422,7 @@ func exportKlines(sess *Queries, ctx context.Context, task *ExportKlineJob, outD
 	const batchSize, maxKlineSize = 5000, 655360
 	startMS := task.StartMS
 	block := newKlineBlock(exs.ID, task.TimeFrame, min(batchSize, totalKLineNum))
-	hasInfo := task.Exchange == "china"
+	hasInfo := task.HasInfo
 	if file == nil {
 		file, err_ = utils2.CreateNumFile(outDir, "kline", "dat")
 		if err_ != nil {

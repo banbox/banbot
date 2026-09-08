@@ -15,23 +15,14 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
-	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 )
 
 var (
-	keySymbolMap  = make(map[string]*ExSymbol)
-	idSymbolMap   = make(map[int32]*ExSymbol)
-	marketMap     = make(map[string]int)
-	pairsMap      = make(map[string]*ExSymbol) // 获取1m的品种
-	hourPairsMap  = make(map[string]*ExSymbol) // 只获取1h及以上的品种
-	symbolLock    deadlock.Mutex
-	tryListIds    = make(map[int32]bool)
-	tryListLock   deadlock.Mutex
-	hourPairsLock deadlock.Mutex
-	maxSid        int32 // in-memory sid counter, protected by symbolLock
-	aggRulesMu    sync.RWMutex
-	aggRules      = map[string]AggRuleFunc{
+	defaultSymbolState   = NewSymbolState()
+	defaultSymbolStateMu sync.RWMutex
+	aggRulesMu           sync.RWMutex
+	aggRules             = map[string]AggRuleFunc{
 		"min":   aggMin,
 		"max":   aggMax,
 		"last":  aggLast,
@@ -45,22 +36,7 @@ var (
 type AggRuleFunc func(rows []*DataRecord, field SeriesField) (any, error)
 
 func cacheExSymbol(exs *ExSymbol) {
-	if exs == nil {
-		return
-	}
-	if exs.ID > maxSid {
-		maxSid = exs.ID
-	}
-	idSymbolMap[exs.ID] = exs
-	key := exSymbolKey(exs.Exchange, exs.Market, exs.Symbol, exs.ExgReal)
-	if cur, ok := keySymbolMap[key]; ok {
-		if cur.ExgReal == "" || exs.ExgReal != "" {
-			return
-		}
-	}
-	keySymbolMap[key] = exs
-	market := fmt.Sprintf("%s:%s", exs.Exchange, exs.Market)
-	marketMap[market] = marketMap[market] + 1
+	loadDefaultSymbolState().CacheExSymbol(exs)
 }
 
 func exSymbolKey(exchange, market, symbol string, _ ...string) string {
@@ -68,67 +44,63 @@ func exSymbolKey(exchange, market, symbol string, _ ...string) string {
 }
 
 func findExSymbol(exchange, market, symbol string) *ExSymbol {
-	if item, ok := keySymbolMap[exSymbolKey(exchange, market, symbol)]; ok {
-		return item
-	}
-	return nil
+	return loadDefaultSymbolState().GetExSymbol2(exchange, market, symbol)
 }
 
 func (q *Queries) LoadExgSymbols(exgName string) *errs.Error {
+	return q.loadExgSymbols(loadDefaultSymbolState(), exgName)
+}
+
+func (q *SymbolQueries) LoadExgSymbols(exgName string) *errs.Error {
+	if q == nil {
+		return errs.NewMsg(core.ErrBadConfig, "symbol query is required")
+	}
+	return q.Queries.loadExgSymbols(q.symbolState(), exgName)
+}
+
+func (q *Queries) loadExgSymbols(state *SymbolState, exgName string) *errs.Error {
+	state = symbolStateOrDefault(state)
+	unlockEnsure := state.sidAllocator().lockEnsure()
+	defer unlockEnsure()
+	return q.loadExgSymbolsLocked(state, exgName)
+}
+
+// loadExgSymbolsLocked is used by catalog operations that already own the
+// allocator ensure lock. Keeping the database read and cache publication in a
+// separate call shape avoids recursive locking in EnsureSymbols.
+func (q *Queries) loadExgSymbolsLocked(state *SymbolState, exgName string) *errs.Error {
 	ctx := context.Background()
 	exsList, err := q.ListSymbols(ctx, exgName)
 	if err != nil {
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
+	state = symbolStateOrDefault(state)
 	for _, exs := range exsList {
-		cacheExSymbol(exs)
+		if err := state.cacheExSymbolChecked(exs); err != nil {
+			return errs.New(core.ErrBadConfig, fmt.Errorf("cache exchange symbol: %w", err))
+		}
 	}
 	return nil
 }
 
 func GetExSymbols(exgName, market string) map[int32]*ExSymbol {
-	var res = make(map[int32]*ExSymbol)
-	for _, exs := range keySymbolMap {
-		if exgName != "" && exs.Exchange != exgName {
-			continue
-		}
-		if market != "" && exs.Market != market {
-			continue
-		}
-		res[exs.ID] = exs
-	}
-	return res
+	return loadDefaultSymbolState().GetExSymbols(exgName, market)
 }
 
 func GetExSymbolMap(exgName, market string) map[string]*ExSymbol {
-	var res = make(map[string]*ExSymbol)
-	for _, exs := range keySymbolMap {
-		if exgName != "" && exs.Exchange != exgName {
-			continue
-		}
-		if market != "" && exs.Market != market {
-			continue
-		}
-		if cur, ok := res[exs.Symbol]; !ok || cur.ExgReal != "" && exs.ExgReal == "" {
-			res[exs.Symbol] = exs
-		}
-	}
-	return res
+	return loadDefaultSymbolState().GetExSymbolMap(exgName, market)
 }
 
 func GetSymbolByID(id int32) *ExSymbol {
-	item, ok := idSymbolMap[id]
-	if !ok {
-		return nil
-	}
-	return item
+	return loadDefaultSymbolState().GetSymbolByID(id)
 }
 
 func GetExSymbolCur(symbol string) (*ExSymbol, *errs.Error) {
 	if exg.Default == nil {
-		item := findExSymbol(core.ExgName, core.Market, symbol)
+		state := loadDefaultSymbolState()
+		item := state.GetExSymbol2(core.ExgName, core.Market, symbol)
 		if item == nil {
-			return nil, errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, len(keySymbolMap))
+			return nil, errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, state.SymbolCount())
 		}
 		return item, nil
 	}
@@ -136,6 +108,9 @@ func GetExSymbolCur(symbol string) (*ExSymbol, *errs.Error) {
 }
 
 func GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.Error) {
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
 	market, err := exchange.GetMarket(symbol)
 	// It is not immediately exited here, it may be delisted, and it is returned empty, but there is historical data, you can try to get it from the cache below
 	// 这里不立即退出，可能退市了这里返回空，但有历史数据，可尝试从下面缓存获取
@@ -144,10 +119,65 @@ func GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.E
 	if market != nil {
 		marketType = market.Type
 	}
-	item := findExSymbol(exgInfo.ID, marketType, symbol)
+	state := loadDefaultSymbolState()
+	item := state.GetExSymbol2(exgInfo.ID, marketType, symbol)
 	if item == nil {
 		if err == nil {
-			err = errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, len(keySymbolMap))
+			err = errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, state.SymbolCount())
+		}
+		return nil, err
+	}
+	return item, nil
+}
+
+// GetExSymbolCur resolves a symbol from this state without consulting the
+// package-level legacy cache. It is intentionally a low-frequency lookup used
+// while constructing feeders; event processing keeps the resolved pointer.
+func (s *SymbolState) GetExSymbolCur(symbol string) (*ExSymbol, *errs.Error) {
+	if s == nil {
+		return GetExSymbolCur(symbol)
+	}
+	if s.identitySet {
+		item := s.GetExSymbol2(s.identityExchange, s.identityMarket, symbol)
+		if item == nil {
+			return nil, errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, s.SymbolCount())
+		}
+		return item, nil
+	}
+	if exg.Default == nil {
+		item := s.GetExSymbol2(core.ExgName, core.Market, symbol)
+		if item == nil {
+			return nil, errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, s.SymbolCount())
+		}
+		return item, nil
+	}
+	return s.GetExSymbol(exg.Default, symbol)
+}
+
+// GetExSymbol resolves a symbol from this state using the exchange's market
+// classification. Database loading remains an explicit composition concern;
+// callers should populate the state before entering a running data path.
+func (s *SymbolState) GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.Error) {
+	if s == nil {
+		return GetExSymbol(exchange, symbol)
+	}
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	market, err := exchange.GetMarket(symbol)
+	exgInfo := exchange.Info()
+	marketType := exgInfo.MarketType
+	if market != nil {
+		marketType = market.Type
+	}
+	if !s.acceptsIdentity(exgInfo.ID, marketType) {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange %s market %s does not match symbol state identity %s:%s",
+			exgInfo.ID, marketType, s.identityExchange, s.identityMarket)
+	}
+	item := s.GetExSymbol2(exgInfo.ID, marketType, symbol)
+	if item == nil {
+		if err == nil {
+			err = errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, s.SymbolCount())
 		}
 		return nil, err
 	}
@@ -155,7 +185,7 @@ func GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.E
 }
 
 func GetExSymbol2(exgName, market, symbol string, exgReal ...string) *ExSymbol {
-	return findExSymbol(exgName, market, symbol)
+	return loadDefaultSymbolState().GetExSymbol2(exgName, market, symbol, exgReal...)
 }
 
 func EnsureExSymbol(exchange, market, symbol string, exgReal ...string) (*ExSymbol, error) {
@@ -236,13 +266,14 @@ func EnsureExgSymbols(exchange banexg.BanExchange) *errs.Error {
 	} else {
 		// Mark the coins that are not returned by the exchange as delisted
 		var editList []*ExSymbol
-		for _, exs := range idSymbolMap {
+		for _, exs := range loadDefaultSymbolState().GetExSymbolsByID(exInfo.ID, exInfo.MarketType) {
 			if exs.Exchange != exInfo.ID || exs.Market != exInfo.MarketType || exs.DelistMs > 0 {
 				continue
 			}
 			if _, ok := exInfo.Markets[exs.Symbol]; !ok {
-				exs.DelistMs = btime.UTCStamp()
-				editList = append(editList, exs)
+				item := *exs
+				item.DelistMs = btime.UTCStamp()
+				editList = append(editList, &item)
 			}
 		}
 		if len(editList) > 0 {
@@ -279,10 +310,36 @@ func registrationMarkets(exInfo *banexg.ExgInfo, current banexg.MarketMap, inclu
 }
 
 func EnsureCurSymbols(symbols []string) *errs.Error {
+	return ensureCurSymbols(loadDefaultSymbolState(), exg.Default, config.Exchange.Name, core.Market, symbols)
+}
+
+// EnsureCurSymbolsWithSymbolState registers the current exchange markets in
+// an explicit symbol state. Market/exchange sessions remain an external
+// capability; the resulting catalog and ID updates stay in state.
+func EnsureCurSymbolsWithSymbolState(state *SymbolState, exchange banexg.BanExchange, symbols []string) *errs.Error {
+	if state == nil {
+		return EnsureCurSymbols(symbols)
+	}
+	if exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	exInfo := exchange.Info()
+	if !state.acceptsIdentity(exInfo.ID, exInfo.MarketType) {
+		return errs.NewMsg(core.ErrBadConfig, "exchange %s market %s does not match symbol state identity %s:%s",
+			exInfo.ID, exInfo.MarketType, state.identityExchange, state.identityMarket)
+	}
+	return ensureCurSymbols(state, exchange, exInfo.ID, exInfo.MarketType, symbols)
+}
+
+func ensureCurSymbols(state *SymbolState, exchange banexg.BanExchange, exchangeName, marketType string, symbols []string) *errs.Error {
+	if state == nil {
+		state = loadDefaultSymbolState()
+	}
+	if exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
 	exsList := make([]*ExSymbol, 0, len(symbols))
-	exgId := config.Exchange.Name
-	marketType := core.Market
-	marMap, err := LoadMarkets(exg.Default, false)
+	marMap, err := LoadMarkets(exchange, false)
 	if err != nil {
 		return err
 	}
@@ -292,7 +349,7 @@ func EnsureCurSymbols(symbols []string) *errs.Error {
 			return errs.NewMsg(core.ErrInvalidSymbol, "symbol %s not found", symbol)
 		}
 		exsList = append(exsList, &ExSymbol{
-			Exchange: exgId,
+			Exchange: exchangeName,
 			Market:   marketType,
 			Symbol:   symbol,
 			Combined: mar.Combined,
@@ -300,13 +357,34 @@ func EnsureCurSymbols(symbols []string) *errs.Error {
 			DelistMs: mar.Expiry,
 		})
 	}
-	return EnsureSymbols(exsList, exgId)
+	return state.EnsureSymbols(exsList, exchangeName)
 }
 
 func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
+	return loadDefaultSymbolState().EnsureSymbols(symbols, exchanges...)
+}
+
+// EnsureSymbols resolves and persists symbols using this runtime's symbol
+// indexes. The database handle is bound to the same state for every cache
+// update made by this operation.
+func (s *SymbolState) EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
+	if s == nil {
+		return errs.NewMsg(core.ErrBadConfig, "symbol state is required")
+	}
+	allocator := s.sidAllocator()
+	unlockEnsure := allocator.lockEnsure()
+	defer unlockEnsure()
+
 	var err *errs.Error
 	var exgNames = make(map[string]bool)
 	for _, exs := range symbols {
+		if exs == nil {
+			return errs.NewMsg(core.ErrBadConfig, "symbol is required")
+		}
+		if !s.acceptsIdentity(exs.Exchange, exs.Market) {
+			return errs.NewMsg(core.ErrBadConfig, "symbol %s:%s:%s does not match symbol state identity %s:%s",
+				exs.Exchange, exs.Market, exs.Symbol, s.identityExchange, s.identityMarket)
+		}
 		exgNames[exs.Exchange] = true
 	}
 	for _, name := range exchanges {
@@ -317,55 +395,62 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 		return err2
 	}
 	defer conn2.Release()
-	if len(keySymbolMap) == 0 {
+	spq := newEnsureSymbolQueries(pq, s)
+	if s.SymbolCount() == 0 {
 		// Not yet loaded, load the information of all the underlying assets of the specified exchange
 		// 尚未加载，加载指定交易所所有标的信息
 		for exgId := range exgNames {
-			err = pq.LoadExgSymbols(exgId)
+			err = spq.Queries.loadExgSymbolsLocked(s, exgId)
 			if err != nil {
 				return err
 			}
 		}
+	}
+	if err := reserveStateSymbols(allocator, s, exgNames); err != nil {
+		return errs.New(core.ErrBadConfig, err)
 	}
 	// Check symbols that need to be inserted
 	// 检查需要插入的标的
 	adds := map[string]*ExSymbol{}
 	for _, exs := range symbols {
 		key := exSymbolKey(exs.Exchange, exs.Market, exs.Symbol)
-		if item, ok := keySymbolMap[key]; !ok {
+		item, resolveErr := resolveEnsuredSymbolLocked(allocator, s, exs)
+		if resolveErr != nil {
+			return errs.New(core.ErrBadConfig, resolveErr)
+		}
+		if item == nil {
 			adds[key] = exs
-		} else {
-			exs.ID = item.ID
-			exs.ListMs = item.ListMs
-			exs.DelistMs = item.DelistMs
-			exs.Combined = item.Combined
-			exs.AggRules = item.AggRules
 		}
 	}
 	if len(adds) == 0 {
 		return nil
 	}
-	// Lock, reload, and add the data that needs to be added
-	// 加锁，重新加载，然后添加需要添加的数据
-	symbolLock.Lock()
-	defer symbolLock.Unlock()
+	// Reload and add under the allocator-owned ensure reservation. Runtimes
+	// created by one Process share this boundary; independent legacy states do
+	// not, and cross-process uniqueness still depends on storage constraints.
 	for exgId := range exgNames {
-		err = pq.LoadExgSymbols(exgId)
+		err = spq.Queries.loadExgSymbolsLocked(s, exgId)
 		if err != nil {
 			return err
 		}
 	}
+	if err := reserveStateSymbols(allocator, s, exgNames); err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
 	argList := make([]AddSymbolsParams, 0, len(adds))
 	for _, item := range adds {
-		key := exSymbolKey(item.Exchange, item.Market, item.Symbol)
-		if _, ok := keySymbolMap[key]; ok {
+		resolved, resolveErr := resolveEnsuredSymbolLocked(allocator, s, item)
+		if resolveErr != nil {
+			return errs.New(core.ErrBadConfig, resolveErr)
+		}
+		if resolved != nil {
 			continue
 		}
 		argList = append(argList, AddSymbolsParams{Exchange: item.Exchange, ExgReal: item.ExgReal,
 			Market: item.Market, Symbol: item.Symbol, Combined: item.Combined, ListMs: item.ListMs, DelistMs: item.DelistMs,
 			AggRules: item.AggRules})
 	}
-	_, err_ := pq.AddSymbols(context.Background(), argList)
+	_, err_ := spq.Queries.addSymbolsLocked(context.Background(), s, spq.symbols == nil, argList)
 	if err_ != nil {
 		errMsg := err_.Error()
 		if strings.Contains(errMsg, "SQLSTATE 22001") {
@@ -373,25 +458,95 @@ func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {
 		}
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
+	// QuestDB may not expose the inserted WAL rows to the reload below before
+	// timeout. Keep the allocator reservation until a later visibility pass.
+	if err := reserveStateSymbols(allocator, s, exgNames); err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
 	for exgId := range exgNames {
-		err = pq.LoadExgSymbols(exgId)
+		err = spq.Queries.loadExgSymbolsLocked(s, exgId)
 		if err != nil {
 			return err
 		}
 	}
+	if err := reserveStateSymbols(allocator, s, exgNames); err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
 	// 刷新Sid
 	for _, exs := range symbols {
-		item := findExSymbol(exs.Exchange, exs.Market, exs.Symbol)
-		if item == nil {
-			continue
+		if _, err := resolveEnsuredSymbolLocked(allocator, s, exs); err != nil {
+			return errs.New(core.ErrBadConfig, err)
 		}
-		exs.ID = item.ID
-		exs.ListMs = item.ListMs
-		exs.DelistMs = item.DelistMs
-		exs.Combined = item.Combined
-		exs.AggRules = item.AggRules
 	}
 	return nil
+}
+
+func newEnsureSymbolQueries(q *Queries, state *SymbolState) *SymbolQueries {
+	if state == loadDefaultSymbolState() {
+		state = nil
+	}
+	return NewSymbolQueries(q, state)
+}
+
+func reserveStateSymbols(allocator *SIDAllocator, state *SymbolState, exchanges map[string]bool) error {
+	if allocator == nil || state == nil {
+		return nil
+	}
+	reservations := make([]sidReservation, 0)
+	for _, item := range state.GetExSymbols("", "") {
+		if item == nil || item.ID <= 0 || len(exchanges) != 0 && !exchanges[item.Exchange] {
+			continue
+		}
+		reservations = append(reservations, sidReservation{
+			key: exSymbolKey(item.Exchange, item.Market, item.Symbol),
+			id:  item.ID,
+		})
+	}
+	if err := allocator.reserveSIDBatch(reservations); err != nil {
+		return fmt.Errorf("reserve cached exchange symbol SIDs: %w", err)
+	}
+	return nil
+}
+
+func resolveEnsuredSymbol(allocator *SIDAllocator, state *SymbolState, target *ExSymbol) (*ExSymbol, error) {
+	if allocator == nil && state != nil {
+		allocator = state.sidAllocator()
+	}
+	unlockEnsure := allocator.lockEnsure()
+	defer unlockEnsure()
+	return resolveEnsuredSymbolLocked(allocator, state, target)
+}
+
+// resolveEnsuredSymbolLocked resolves a symbol while the caller owns the
+// allocator's ensure lock. Keeping this form separate avoids recursive lock
+// acquisition in EnsureSymbols while preserving a safe wrapper for callers
+// that do not already hold the lock.
+func resolveEnsuredSymbolLocked(allocator *SIDAllocator, state *SymbolState, target *ExSymbol) (*ExSymbol, error) {
+	if target == nil {
+		return nil, nil
+	}
+	if state == nil {
+		return nil, fmt.Errorf("resolve exchange symbol: symbol state is nil")
+	}
+	key := exSymbolKey(target.Exchange, target.Market, target.Symbol)
+	item := state.GetExSymbol2(target.Exchange, target.Market, target.Symbol)
+	if id := allocator.reservedSID(key); id > 0 {
+		if item != nil && item.ID != id {
+			return nil, fmt.Errorf("logical symbol %s is cached as sid %d, reserved as sid %d", key, item.ID, id)
+		}
+		if item == nil {
+			reserved := *target
+			reserved.ID = id
+			if err := state.cacheExSymbolChecked(&reserved); err != nil {
+				return nil, err
+			}
+			item = state.GetExSymbol2(target.Exchange, target.Market, target.Symbol)
+		}
+	}
+	if item != nil {
+		*target = *cloneExSymbol(item)
+	}
+	return item, nil
 }
 
 func LoadAllExSymbols() *errs.Error {
@@ -420,7 +575,7 @@ Gets all the objects that have been loaded into the cache
 获取已加载到缓存的所有标的
 */
 func GetAllExSymbols() map[int32]*ExSymbol {
-	return idSymbolMap
+	return loadDefaultSymbolState().GetExSymbolsByID("", "")
 }
 
 func (s *ExSymbol) GetValidStart(startMS int64) int64 {
@@ -557,12 +712,18 @@ func aggEdge(rows []*DataRecord, field SeriesField, first bool) (any, error) {
 }
 
 func aggMin(rows []*DataRecord, field SeriesField) (any, error) {
-	val, ok, err := aggFloatSeed(rows, field)
-	if err != nil || !ok {
-		return val, err
+	val, ok, hasNull, err := aggFloatSeed(rows, field)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		if hasNull {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("series field %q has no values", field.Name)
 	}
 	for _, row := range rows {
-		cur, ok, err := aggFloatValue(row, field)
+		cur, _, ok, err := aggFloatValue(row, field)
 		if err != nil {
 			return nil, err
 		}
@@ -574,12 +735,18 @@ func aggMin(rows []*DataRecord, field SeriesField) (any, error) {
 }
 
 func aggMax(rows []*DataRecord, field SeriesField) (any, error) {
-	val, ok, err := aggFloatSeed(rows, field)
-	if err != nil || !ok {
-		return val, err
+	val, ok, hasNull, err := aggFloatSeed(rows, field)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		if hasNull {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("series field %q has no values", field.Name)
 	}
 	for _, row := range rows {
-		cur, ok, err := aggFloatValue(row, field)
+		cur, _, ok, err := aggFloatValue(row, field)
 		if err != nil {
 			return nil, err
 		}
@@ -593,10 +760,15 @@ func aggMax(rows []*DataRecord, field SeriesField) (any, error) {
 func aggSum(rows []*DataRecord, field SeriesField) (any, error) {
 	total := 0.0
 	seen := false
+	hasNull := false
 	for _, row := range rows {
-		val, ok, err := aggFloatValue(row, field)
+		val, present, ok, err := aggFloatValue(row, field)
 		if err != nil {
 			return nil, err
+		}
+		if present && !ok {
+			hasNull = true
+			continue
 		}
 		if ok {
 			total += val
@@ -604,6 +776,9 @@ func aggSum(rows []*DataRecord, field SeriesField) (any, error) {
 		}
 	}
 	if !seen {
+		if hasNull {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("series field %q has no values", field.Name)
 	}
 	return aggNumericResult(field, total), nil
@@ -612,10 +787,15 @@ func aggSum(rows []*DataRecord, field SeriesField) (any, error) {
 func aggAvg(rows []*DataRecord, field SeriesField) (any, error) {
 	total := 0.0
 	count := 0
+	hasNull := false
 	for _, row := range rows {
-		val, ok, err := aggFloatValue(row, field)
+		val, present, ok, err := aggFloatValue(row, field)
 		if err != nil {
 			return nil, err
+		}
+		if present && !ok {
+			hasNull = true
+			continue
 		}
 		if ok {
 			total += val
@@ -623,19 +803,28 @@ func aggAvg(rows []*DataRecord, field SeriesField) (any, error) {
 		}
 	}
 	if count == 0 {
+		if hasNull {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("series field %q has no values", field.Name)
 	}
-	return total / float64(count), nil
+	return aggNumericResult(field, total/float64(count)), nil
 }
 
 func aggMid(rows []*DataRecord, field SeriesField) (any, error) {
-	minVal, ok, err := aggFloatSeed(rows, field)
-	if err != nil || !ok {
-		return minVal, err
+	minVal, ok, hasNull, err := aggFloatSeed(rows, field)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		if hasNull {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("series field %q has no values", field.Name)
 	}
 	maxVal := minVal
 	for _, row := range rows {
-		val, ok, err := aggFloatValue(row, field)
+		val, _, ok, err := aggFloatValue(row, field)
 		if err != nil {
 			return nil, err
 		}
@@ -649,32 +838,43 @@ func aggMid(rows []*DataRecord, field SeriesField) (any, error) {
 			maxVal = val
 		}
 	}
-	return (minVal + maxVal) / 2, nil
+	return aggNumericResult(field, (minVal+maxVal)/2), nil
 }
 
-func aggFloatSeed(rows []*DataRecord, field SeriesField) (float64, bool, error) {
+func aggFloatSeed(rows []*DataRecord, field SeriesField) (float64, bool, bool, error) {
+	hasNull := false
 	for _, row := range rows {
-		val, ok, err := aggFloatValue(row, field)
-		if err != nil || ok {
-			return val, ok, err
+		val, present, ok, err := aggFloatValue(row, field)
+		if err != nil {
+			return 0, false, hasNull, err
+		}
+		if present && !ok {
+			hasNull = true
+			continue
+		}
+		if ok {
+			return val, true, hasNull, nil
 		}
 	}
-	return 0, false, fmt.Errorf("series field %q has no values", field.Name)
+	return 0, false, hasNull, nil
 }
 
-func aggFloatValue(row *DataRecord, field SeriesField) (float64, bool, error) {
+func aggFloatValue(row *DataRecord, field SeriesField) (float64, bool, bool, error) {
 	if row == nil || row.Values == nil {
-		return 0, false, nil
+		return 0, false, false, nil
 	}
 	val, ok := row.Values[field.Name]
 	if !ok {
-		return 0, false, nil
+		return 0, false, false, nil
+	}
+	if val == nil {
+		return 0, true, false, nil
 	}
 	num, err := utils.ToFloat64(val)
 	if err != nil {
-		return 0, false, err
+		return 0, true, false, err
 	}
-	return num, true, nil
+	return num, true, true, nil
 }
 
 func aggNumericResult(field SeriesField, val float64) any {
@@ -685,14 +885,32 @@ func aggNumericResult(field SeriesField, val float64) any {
 }
 
 func InitListDates() *errs.Error {
+	return InitListDatesWithExchange(nil, exg.Default)
+}
+
+// InitListDatesWithState initializes listing metadata in the supplied symbol
+// state. A nil state preserves the legacy package-level behavior.
+func InitListDatesWithState(state *SymbolState) *errs.Error {
+	return InitListDatesWithExchange(state, exg.Default)
+}
+
+// InitListDatesWithExchange initializes listing metadata using an explicit
+// exchange, avoiding process-global exchange lookup for runtime-owned states.
+func InitListDatesWithExchange(state *SymbolState, exchange banexg.BanExchange) *errs.Error {
+	if exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	if state == nil {
+		state = loadDefaultSymbolState()
+	}
 	pq, conn2, err2 := Conn(nil)
 	if err2 != nil {
 		return err2
 	}
 	defer conn2.Release()
-	exchange := exg.Default
+	spq := NewSymbolQueries(pq, state)
 	exInfo := exchange.Info()
-	exsList := GetExSymbols(exInfo.ID, exInfo.MarketType)
+	exsList := state.GetExSymbols(exInfo.ID, exInfo.MarketType)
 	marketMap := exchange.GetCurMarkets()
 	for _, exs := range exsList {
 		if exs.ListMs > 0 && exs.DelistMs > 0 {
@@ -702,21 +920,22 @@ func InitListDates() *errs.Error {
 		if !ok {
 			continue
 		}
+		listMS, delistMS := exs.ListMs, exs.DelistMs
 		changed := false
-		if exs.DelistMs == 0 && mar.Expiry > 0 {
-			exs.DelistMs = mar.Expiry
+		if delistMS == 0 && mar.Expiry > 0 {
+			delistMS = mar.Expiry
 			changed = true
 		}
-		if exs.ListMs == 0 && mar.Created > 0 {
+		if listMS == 0 && mar.Created > 0 {
 			// 只有合约有Created字段，现货需从k线计算
-			exs.ListMs = mar.Created
+			listMS = mar.Created
 			changed = true
 		}
 		if changed {
-			err_ := pq.SetListMS(context.Background(), SetListMSParams{
+			err_ := spq.SetListMS(context.Background(), SetListMSParams{
 				ID:       exs.ID,
-				ListMs:   exs.ListMs,
-				DelistMs: exs.DelistMs,
+				ListMs:   listMS,
+				DelistMs: delistMS,
 			})
 			if err_ != nil {
 				return NewDbErr(core.ErrDbExecFail, err_)
@@ -727,6 +946,13 @@ func InitListDates() *errs.Error {
 }
 
 func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int32]*ExSymbol, exsList []*ExSymbol) *errs.Error {
+	return EnsureListDatesWithState(sess, nil, exchange, exsMap, exsList)
+}
+
+// EnsureListDatesWithState keeps listing-date discovery on an explicit symbol
+// state while retaining the old helper as a legacy facade.
+func EnsureListDatesWithState(sess *Queries, state *SymbolState, exchange banexg.BanExchange,
+	exsMap map[int32]*ExSymbol, exsList []*ExSymbol) *errs.Error {
 	canDownload := allowImplicitKlineDownload()
 	if exchange == nil {
 		if !canDownload {
@@ -751,29 +977,36 @@ func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int3
 	if exInfo.MarketType != banexg.MarketSpot {
 		return nil
 	}
-	tryListLock.Lock()
-	defer tryListLock.Unlock()
-	var emptys = make([]*ExSymbol, 0, (len(exsMap)+len(exsList))/4)
-	for _, v := range exsMap {
-		if v.ListMs == 0 {
-			if _, ok := tryListIds[v.ID]; !ok {
-				emptys = append(emptys, v)
-			}
+	state = symbolStateOrDefault(state)
+	generation := state.catalogGeneration()
+	state.tryListMu.Lock()
+	if state.tryListIDs == nil {
+		state.tryListIDs = make(map[int32]bool)
+	}
+	candidates := make([]*ExSymbol, 0, (len(exsMap)+len(exsList))/4)
+	addCandidate := func(v *ExSymbol) {
+		if v == nil || v.ListMs != 0 {
+			return
 		}
+		if state.tryListIDs[v.ID] {
+			return
+		}
+		state.tryListIDs[v.ID] = true
+		candidates = append(candidates, cloneExSymbol(v))
+	}
+	for _, v := range exsMap {
+		addCandidate(v)
 	}
 	for _, v := range exsList {
-		if v.ListMs == 0 {
-			if _, ok := tryListIds[v.ID]; !ok {
-				emptys = append(emptys, v)
-			}
-		}
+		addCandidate(v)
 	}
-	if len(emptys) == 0 {
+	state.tryListMu.Unlock()
+	if len(candidates) == 0 {
 		return nil
 	}
 	hasFetch := !core.NetDisable && exchange.HasApi(banexg.ApiFetchOHLCV, exInfo.MarketType)
 	var prgBar *utils.PrgBar
-	cacheNum := len(emptys)
+	cacheNum := len(candidates)
 	if cacheNum > 10 && hasFetch {
 		costSecs := float64(cacheNum) / 6
 		log.Info("calculating listDates for new symbols", zap.Int("num", cacheNum),
@@ -782,36 +1015,63 @@ func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int3
 		defer prgBar.Close()
 	}
 	var err *errs.Error
-	for _, exs := range emptys {
-		tryListIds[exs.ID] = true
+	for i, exs := range candidates {
+		if !state.hasCatalogGeneration(generation) {
+			return nil
+		}
 		if prgBar != nil {
 			prgBar.Add(1)
 		}
 		startMS := core.MSMinStamp
+		var listMS int64
 		if hasFetch {
 			var klines []*banexg.Kline
 			klines, err = exchange.FetchOHLCV(exs.Symbol, "1m", startMS, 1, nil)
 			if len(klines) > 0 {
-				exs.ListMs = klines[0].Time
+				listMS = klines[0].Time
 			}
 		} else {
 			var rows []*DataSeries
 			rows, err = sess.QuerySeries(exs, "1m", startMS, 0, 1, false)
 			if len(rows) > 0 {
-				exs.ListMs = rows[0].TimeMS
+				listMS = rows[0].TimeMS
 			}
 		}
 		if err != nil {
 			return err
 		}
-		if exs.ListMs > 0 {
-			err_ := sess.SetListMS(context.Background(), SetListMSParams{
+		if listMS > 0 {
+			unlockCatalog, current := state.lockCatalogGeneration(generation)
+			if !current {
+				return nil
+			}
+			err_ := sess.setListMS(context.Background(), state, SetListMSParams{
 				ID:       exs.ID,
-				ListMs:   exs.ListMs,
+				ListMs:   listMS,
 				DelistMs: exs.DelistMs,
-			})
+			}, exs)
+			unlockCatalog()
 			if err_ != nil {
 				return NewDbErr(core.ErrDbExecFail, err_)
+			}
+			if latest := state.GetSymbolByID(exs.ID); latest != nil {
+				exs = latest
+				candidates[i] = latest
+			}
+		}
+	}
+	// Metadata updates use copy-on-write snapshots. Refresh caller-owned
+	// containers so filters and setup code observe the new snapshot without
+	// mutating an object that may already be read by another goroutine.
+	for id := range exsMap {
+		if item := state.GetSymbolByID(id); item != nil {
+			exsMap[id] = item
+		}
+	}
+	for i, item := range exsList {
+		if item != nil {
+			if latest := state.GetSymbolByID(item.ID); latest != nil {
+				exsList[i] = latest
 			}
 		}
 	}
@@ -819,6 +1079,7 @@ func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int3
 }
 
 func ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
+	state := loadDefaultSymbolState()
 	slashArr := strings.Split(short, "/")
 	var symbol string
 	var market = banexg.MarketSpot
@@ -852,25 +1113,25 @@ func ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
 	} else {
 		symbol = short
 	}
-	item := findExSymbol(exgName, market, symbol)
+	item := state.GetExSymbol2(exgName, market, symbol)
 	if item == nil {
 		exgMarket := fmt.Sprintf("%s:%s", exgName, market)
-		pairNum, _ := marketMap[exgMarket]
+		pairNum := state.MarketCount(exgName, market)
 		if pairNum == 0 {
 			pq2, conn2, err2 := Conn(nil)
 			if err2 != nil {
 				return nil, err2
 			}
-			err := pq2.LoadExgSymbols(exgName)
+			err := pq2.WithSymbolState(state).LoadExgSymbols(exgName)
 			conn2.Release()
 			if err != nil {
 				return nil, err
 			}
-			item = findExSymbol(exgName, market, symbol)
+			item = state.GetExSymbol2(exgName, market, symbol)
 			if item != nil {
 				return item, nil
 			}
-			pairNum, _ = marketMap[exgMarket]
+			pairNum = state.MarketCount(exgName, market)
 		}
 		err := errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache for %s", symbol, pairNum, exgMarket)
 		return nil, err
@@ -879,32 +1140,17 @@ func ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
 }
 
 func AddHourSymbol(exs *ExSymbol) {
-	hourPairsLock.Lock()
-	hourPairsMap[exs.Symbol] = exs
-	hourPairsLock.Unlock()
+	loadDefaultSymbolState().AddHourSymbol(exs)
 }
 
 func Sub1mSymbol(pair string) {
-	hourPairsLock.Lock()
-	pairsMap[pair] = nil
-	hourPairsLock.Unlock()
+	loadDefaultSymbolState().Sub1mSymbol(pair)
 }
 
 func ResetSubSymbol() {
-	hourPairsLock.Lock()
-	hourPairsMap = make(map[string]*ExSymbol)
-	pairsMap = make(map[string]*ExSymbol)
-	hourPairsLock.Unlock()
+	loadDefaultSymbolState().ResetSubSymbol()
 }
 
 func GetHourOnlySymbols() map[int32]*ExSymbol {
-	hourPairsLock.Lock()
-	res := make(map[int32]*ExSymbol)
-	for _, exs := range hourPairsMap {
-		if _, ok := pairsMap[exs.Symbol]; !ok {
-			res[exs.ID] = exs
-		}
-	}
-	hourPairsLock.Unlock()
-	return res
+	return loadDefaultSymbolState().GetHourOnlySymbols()
 }

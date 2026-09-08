@@ -43,6 +43,7 @@ var (
 	telegramInstances = make(map[string]*Telegram)
 	telegramMutex     sync.RWMutex
 	dashBot           *utils2.ClientIO // 通过官方机器人管理
+	dashBotOwner      *Telegram
 	// 订单管理接口，由外部注入实现，避免循环依赖
 	orderManager OrderManagerInterface
 	// 钱包信息提供者，由外部注入，避免循环依赖
@@ -102,6 +103,7 @@ type Telegram struct {
 	chatId        int64
 	secret        string
 	bot           *bot.Bot
+	dashboard     *utils2.ClientIO
 	ctx           context.Context
 	cancel        context.CancelFunc
 	chanSend      chan *bot.SendMessageParams
@@ -157,7 +159,7 @@ func NewTelegram(name string, item map[string]interface{}) *Telegram {
 		chanSend:      make(chan *bot.SendMessageParams, 10),
 		activeAccount: config.DefAcc, // 初始化为默认账户
 	}
-	if hook.Disable {
+	if hook.IsDisable() {
 		return res
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -182,8 +184,11 @@ func NewTelegram(name string, item map[string]interface{}) *Telegram {
 }
 
 func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.Error {
-	if dashBot != nil {
-		if secretV, ok := dashBot.GetData("secret"); ok {
+	telegramMutex.RLock()
+	currentBot := dashBot
+	telegramMutex.RUnlock()
+	if currentBot != nil {
+		if secretV, ok := currentBot.GetData("secret"); ok {
 			res.secret = secretV.(string)
 		}
 		return nil
@@ -197,7 +202,11 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 	if err2 != nil {
 		return err2
 	}
+	telegramMutex.Lock()
 	dashBot = ioClient
+	dashBotOwner = res
+	res.dashboard = ioClient
+	telegramMutex.Unlock()
 	if res.secret != "" {
 		if !reUUID4.MatchString(res.secret) {
 			log.Warn("rpc_channels." + name + ".secret must be uuid v4 format, reset to random")
@@ -207,15 +216,15 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 	if res.secret == "" {
 		res.secret = uuid.New().String()
 	}
-	dashBot.SetData(res.secret, "secret")
-	dashBot.ReInitConn = func() {
+	ioClient.SetData(res.secret, "secret")
+	ioClient.ReInitConn = func() {
 		sessionSecret, err2 = getSessionSecret(res.Proxy)
 		if err2 != nil {
 			log.Error("re-initDashBot fail, get sess secret fail", zap.Error(err2))
 			return
 		}
 		ioClient.SetAesKey(sessionSecret)
-		err2 = dashBot.WriteMsg(&utils2.IOMsg{
+		err2 = ioClient.WriteMsg(&utils2.IOMsg{
 			Action:    "init",
 			Data:      config.Name,
 			NoEncrypt: true,
@@ -224,7 +233,7 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 			log.Error("re-initDashBot fail", zap.Error(err2))
 		}
 	}
-	dashBot.Listens["getSecret"] = func(msg *utils2.IOMsgRaw) {
+	ioClient.Listens["getSecret"] = func(msg *utils2.IOMsgRaw) {
 		info := BotSecret{
 			Secret: res.secret,
 			Pid:    os.Getpid(),
@@ -242,7 +251,7 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 			log.Info("Manage Your Bot On https://t.me/trade_banbot?start=" + res.secret)
 		}
 	}
-	dashBot.Listens["telegram_cmd"] = func(msg *utils2.IOMsgRaw) {
+	ioClient.Listens["telegram_cmd"] = func(msg *utils2.IOMsgRaw) {
 		log.Warn("telegram_cmd", zap.String("str", string(msg.Data)))
 		var update models.Update
 		err := utils.Unmarshal(msg.Data, &update, utils.JsonNumDefault)
@@ -264,17 +273,21 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 				res.chatId = update.CallbackQuery.From.ID
 			}
 		}
-		res.routeUpdate(res.ctx, nil, &update)
+		res.routeUpdate(res.telegramContext(), nil, &update)
 	}
 
-	go func() {
-		err := dashBot.RunForever()
-		if err != nil {
-			log.Warn("read client fail", zap.String("remote", dashBot.GetRemote()),
-				zap.String("err", err.Message()))
-		}
-	}()
-	return dashBot.WriteMsg(&utils2.IOMsg{
+	owner := res.lifecycleOwner()
+	if owner != nil && owner.startTask() {
+		go func() {
+			defer owner.doneTask()
+			err := ioClient.RunForever()
+			if err != nil {
+				log.Warn("read client fail", zap.String("remote", ioClient.GetRemote()),
+					zap.String("err", err.Message()))
+			}
+		}()
+	}
+	return ioClient.WriteMsg(&utils2.IOMsg{
 		Action:    "init",
 		Data:      config.Name,
 		NoEncrypt: true,
@@ -370,21 +383,72 @@ func initCustomTgBot(res *Telegram, name string, item map[string]interface{}) *e
 	return nil
 }
 
-// Close 关闭Telegram客户端
-func (t *Telegram) Close() {
+// Stop closes Telegram admission and signals its sender, bot listener, and
+// owned dashboard connection without waiting for callbacks.
+func (t *Telegram) Stop() {
+	if t == nil {
+		return
+	}
 	if t.cancel != nil {
 		t.cancel()
 	}
 
-	// 从全局实例管理器中移除
 	telegramMutex.Lock()
+	ownedDashBot := dashBotOwner == t
+	ownedBot := t.dashboard
+	if ownedDashBot && ownedBot == nil {
+		ownedBot = dashBot
+	}
+	if ownedDashBot {
+		dashBot = nil
+		dashBotOwner = nil
+	}
+	// 从全局实例管理器中移除
 	for name, instance := range telegramInstances {
 		if instance == t {
 			delete(telegramInstances, name)
-			break
 		}
 	}
 	telegramMutex.Unlock()
+	if t.WebHook != nil {
+		t.WebHook.Stop()
+	}
+	if ownedDashBot && ownedBot != nil {
+		if err := ownedBot.Stop(); err != nil {
+			log.Warn("stop telegram dashboard client fail", zap.Error(err))
+		}
+	}
+}
+
+// Join waits for all Telegram workers and the dashboard connection owned by
+// this instance. The stop phase is idempotently requested first so Join is
+// safe for callers that only need completion.
+func (t *Telegram) Join() {
+	if t == nil {
+		return
+	}
+	t.Stop()
+	telegramMutex.RLock()
+	dashboard := t.dashboard
+	telegramMutex.RUnlock()
+	if dashboard != nil {
+		dashboard.Join()
+	}
+	if t.WebHook != nil {
+		t.WebHook.Join()
+	}
+}
+
+// Close 关闭Telegram客户端
+func (t *Telegram) Close() {
+	t.Stop()
+	t.Join()
+}
+
+// CleanUp lets the generic RPC owner close Telegram's sender and listener too.
+func (t *Telegram) CleanUp() {
+	t.Stop()
+	t.Join()
 }
 
 // registerHandler 注册消息处理器
@@ -508,14 +572,37 @@ func (t *Telegram) setupUpdateHandlers() {
 }
 
 func (t *Telegram) loopSend() {
+	var owner *rpcOwner
+	if t.WebHook != nil {
+		owner = t.lifecycleOwner()
+	}
+	if owner != nil {
+		if !owner.startTask() {
+			return
+		}
+		defer owner.doneTask()
+	}
 	defer func() {
 		log.Info("loopSend for telegram exit")
 	}()
+	ctx := t.telegramContext()
+	var stop <-chan struct{}
+	if owner != nil {
+		stop = owner.stop
+	}
 	for {
 		select {
-		case <-t.ctx.Done():
+		case <-ctx.Done():
 			return
-		case msg := <-t.chanSend:
+		case <-stop:
+			return
+		case msg, ok := <-t.chanSend:
+			if !ok {
+				return
+			}
+			if msg == nil {
+				continue
+			}
 			err := t.send(msg)
 			if err != nil {
 				log.Error("send telegram msg fail", zap.Error(err))
@@ -524,7 +611,35 @@ func (t *Telegram) loopSend() {
 	}
 }
 
+func currentDashBot() *utils2.ClientIO {
+	telegramMutex.RLock()
+	bot := dashBot
+	telegramMutex.RUnlock()
+	return bot
+}
+
+func (t *Telegram) telegramContext() context.Context {
+	if t != nil && t.ctx != nil {
+		return t.ctx
+	}
+	return context.Background()
+}
+
+func (t *Telegram) enqueueSend(msg *bot.SendMessageParams) bool {
+	if t == nil || msg == nil || t.chanSend == nil {
+		return false
+	}
+	if t.WebHook == nil {
+		t.chanSend <- msg
+		return true
+	}
+	return admitRPC(t.lifecycleOwner(), t.chanSend, msg, nil)
+}
+
 func (t *Telegram) send(msg *bot.SendMessageParams) error {
+	if msg == nil {
+		return nil
+	}
 	// Telegram消息长度限制
 	if len(msg.Text) > maxTelegramMsgLen {
 		msg.Text = msg.Text[:maxTelegramMsgLen-3] + "..."
@@ -533,7 +648,11 @@ func (t *Telegram) send(msg *bot.SendMessageParams) error {
 	var err error
 	if t.bot == nil {
 		// 通过官方机器人发送
-		err2 := dashBot.WriteMsg(&utils2.IOMsg{
+		telegramBot := currentDashBot()
+		if telegramBot == nil {
+			return fmt.Errorf("telegram dashboard client is unavailable")
+		}
+		err2 := telegramBot.WriteMsg(&utils2.IOMsg{
 			Action: "telegram",
 			Data:   msg,
 		})
@@ -542,7 +661,7 @@ func (t *Telegram) send(msg *bot.SendMessageParams) error {
 		}
 	} else {
 		// 使用go-telegram/bot库发送消息
-		_, err = t.bot.SendMessage(t.ctx, msg)
+		_, err = t.bot.SendMessage(t.telegramContext(), msg)
 	}
 	return err
 }
@@ -550,7 +669,7 @@ func (t *Telegram) send(msg *bot.SendMessageParams) error {
 // makeDoSendMsgTelegram 返回批量Telegram消息发送函数，符合 WebHook.doSendMsgs 的签名要求
 func makeDoSendMsgTelegram(t *Telegram) func([]map[string]string) []map[string]string {
 	return func(msgList []map[string]string) []map[string]string {
-		if t.bot == nil && dashBot == nil {
+		if t.bot == nil && currentDashBot() == nil {
 			log.Debug("skip send telegram msg, no valid channel")
 			return nil
 		}
@@ -590,6 +709,9 @@ func makeDoSendMsgTelegram(t *Telegram) func([]map[string]string) []map[string]s
 
 // setupCommandHandlers 设置Telegram Bot命令处理器
 func (t *Telegram) setupCommandHandlers() {
+	if t.bot == nil {
+		return
+	}
 	t.bot.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypePrefix, func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		t.routeUpdate(ctx, b, update)
 	})
@@ -597,14 +719,24 @@ func (t *Telegram) setupCommandHandlers() {
 		t.routeUpdate(ctx, b, update)
 	})
 	// 启动Bot更新监听
+	owner := (*rpcOwner)(nil)
+	if t.WebHook != nil {
+		owner = t.lifecycleOwner()
+		if !owner.startTask() {
+			return
+		}
+	}
 	go func() {
+		if owner != nil {
+			defer owner.doneTask()
+		}
 		log.Info("Starting Telegram bot command listener", zap.Int64("chat_id", t.chatId))
 		defer func() {
 			if r := recover(); r != nil {
 				log.Error("Telegram bot panic", zap.Any("panic", r))
 			}
 		}()
-		t.bot.Start(t.ctx)
+		t.bot.Start(t.telegramContext())
 		log.Info("Telegram bot stopped")
 	}()
 }
@@ -633,12 +765,12 @@ func (t *Telegram) handleOrdersCommand(ctx context.Context, b *bot.Bot, update *
 	response := t.getOrdersList()
 	kb := t.buildOrdersInlineKeyboard()
 
-	t.chanSend <- &bot.SendMessageParams{
+	t.enqueueSend(&bot.SendMessageParams{
 		ChatID:      update.Message.Chat.ID,
 		Text:        response,
 		ParseMode:   models.ParseModeHTML,
 		ReplyMarkup: kb,
-	}
+	})
 }
 
 // handleCloseCommand 处理 /close 命令 - 强制平仓订单
@@ -765,12 +897,12 @@ func (t *Telegram) handleMenuCommand(ctx context.Context, b *bot.Bot, update *mo
 	}
 
 	menuText := `🎛️ <b>BanBot Menu</b>`
-	t.chanSend <- &bot.SendMessageParams{
+	t.enqueueSend(&bot.SendMessageParams{
 		ChatID:      update.Message.Chat.ID,
 		Text:        menuText,
 		ParseMode:   models.ParseModeHTML,
 		ReplyMarkup: kb,
-	}
+	})
 }
 
 // handleCallbackQuery 处理内联键盘回调
@@ -822,11 +954,11 @@ func (t *Telegram) handleCallbackQuery(ctx context.Context, b *bot.Bot, update *
 			account := strings.TrimPrefix(data, "switch:")
 			t.switchAccount(account)
 			response := config.GetLangMsg("account_switched", "✅ 已切换到账户: <code>%s</code>")
-			t.chanSend <- &bot.SendMessageParams{
+			t.enqueueSend(&bot.SendMessageParams{
 				ChatID:    update.Message.Chat.ID,
 				Text:      fmt.Sprintf(response, account),
 				ParseMode: models.ParseModeHTML,
-			}
+			})
 		}
 	}
 }
@@ -856,12 +988,12 @@ func (t *Telegram) handleOrdersCallback(ctx context.Context, b *bot.Bot, update 
 		log.Warn("refresh telegram orders fail: callback has no chat")
 		return
 	}
-	t.chanSend <- &bot.SendMessageParams{
+	t.enqueueSend(&bot.SendMessageParams{
 		ChatID:      chatID,
 		Text:        response,
 		ParseMode:   models.ParseModeHTML,
 		ReplyMarkup: kb,
-	}
+	})
 }
 
 func isTelegramMessageNotModified(err error) bool {
@@ -925,11 +1057,11 @@ func (t *Telegram) isAuthorized(update *models.Update) bool {
 
 // sendResponse 发送响应消息
 func (t *Telegram) sendResponse(update *models.Update, response string) {
-	t.chanSend <- &bot.SendMessageParams{
+	t.enqueueSend(&bot.SendMessageParams{
 		ChatID:    update.Message.Chat.ID,
 		Text:      response,
 		ParseMode: models.ParseModeHTML,
-	}
+	})
 }
 
 // getOrdersList 获取订单列表
@@ -1261,12 +1393,12 @@ func (t *Telegram) handleAccountCommand(ctx context.Context, b *bot.Bot, update 
 	response := t.getAccountList()
 	kb := t.buildAccountInlineKeyboard()
 
-	t.chanSend <- &bot.SendMessageParams{
+	t.enqueueSend(&bot.SendMessageParams{
 		ChatID:      update.Message.Chat.ID,
 		Text:        response,
 		ParseMode:   models.ParseModeHTML,
 		ReplyMarkup: kb,
-	}
+	})
 }
 
 // handleSwitchCommand 处理 /switch <account> 命令 - 切换账户

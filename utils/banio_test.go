@@ -121,6 +121,123 @@ func TestBanConnWriteIdleDeadlineAllowsSlowProgress(t *testing.T) {
 	}
 }
 
+func TestBanConnCoreStopFromHandlerDoesNotDeadlock(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	state, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &BanConn{
+		Conn:    clientConn,
+		Data:    map[string]interface{}{},
+		Listens: map[string]ConnCB{},
+		Ready:   true,
+	}
+	state.OnExit(func() { _ = conn.Stop() })
+	callbackDone := make(chan struct{})
+	conn.Listens["stop"] = func(*IOMsgRaw) {
+		state.Stop()
+		close(callbackDone)
+	}
+	loopDone := make(chan struct{})
+	go func() {
+		_ = conn.RunForever()
+		close(loopDone)
+	}()
+
+	server := &BanConn{Conn: serverConn, Ready: true}
+	if err := server.Write(&IOMsgRaw{Action: "stop"}); err != nil {
+		t.Fatalf("write stop message: %v", err)
+	}
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("Core.Stop from BanConn handler deadlocked")
+	}
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("BanConn loop did not exit after Core.Stop")
+	}
+}
+
+func TestBanConnStopJoinWaitsForAdmittedHandler(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	conn := &BanConn{
+		Conn: clientConn,
+		Data: map[string]interface{}{},
+		Listens: map[string]ConnCB{"block": func(*IOMsgRaw) {
+			close(entered)
+			<-release
+		}},
+		Ready: true,
+	}
+	loopDone := make(chan struct{})
+	go func() {
+		_ = conn.RunForever()
+		close(loopDone)
+	}()
+
+	server := &BanConn{Conn: serverConn, Ready: true}
+	if err := server.Write(&IOMsgRaw{Action: "block"}); err != nil {
+		t.Fatalf("write blocking message: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("socket handler did not start")
+	}
+
+	joined := make(chan struct{})
+	go func() {
+		if err := conn.Stop(); err != nil {
+			t.Errorf("stop connection: %v", err)
+		}
+		conn.Join()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+		t.Fatal("Stop+Join returned before handler completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if conn.beginHandler() {
+		conn.handlerWait.Done()
+		t.Fatal("handler admitted after Stop")
+	}
+	close(release)
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("Join did not wait for handler")
+	}
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("connection loop did not exit after Stop")
+	}
+}
+
 func TestBanServer(t *testing.T) {
 	requireManualBanIOTest(t)
 	core.SetRunMode(core.RunModeLive)

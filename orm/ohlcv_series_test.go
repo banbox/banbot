@@ -3,10 +3,12 @@ package orm
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/banbox/banexg"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestResampleDataSeriesPreservesOHLCVSemantics(t *testing.T) {
@@ -58,6 +60,142 @@ func TestResampleDataSeriesPreservesCustomFields(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Values["signal"] != "sell" {
 		t.Fatalf("custom field was not preserved with last-row semantics: %+v", got)
+	}
+}
+
+func TestResampleDataSeriesUsesAggRulesForKlineExtensionsAndPreservesBuiltins(t *testing.T) {
+	const captureRule = "ohlcv_series_capture"
+	var capturedType string
+	var capturedRows int
+	var sawExplicitNull bool
+	if !RegisterAggRule(captureRule, func(rows []*DataRecord, field SeriesField) (any, error) {
+		capturedType = field.Type
+		capturedRows = len(rows)
+		if len(rows) > 0 && rows[0] != nil && rows[0].Values != nil {
+			value, ok := rows[0].Values[field.Name]
+			sawExplicitNull = ok && value == nil
+		}
+		return aggLast(rows, field)
+	}) {
+		t.Fatal("expected custom agg rule registration to succeed")
+	}
+
+	exs := &ExSymbol{
+		ID: 7, Symbol: "BTC/USDT",
+		AggRules: `{"open":"last","high":"min","low":"max","close":"first","volume":"last","quote":"last","buy_volume":"last","trade_num":"last","signal":"first","count":"sum","nullable":"first","captured":"ohlcv_series_capture","average":"avg"}`,
+	}
+	base := int64(1_700_000_100_000)
+	rows := []*DataSeries{
+		NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: base, Open: 10, High: 13, Low: 9, Close: 12, Volume: 2, Quote: 21, BuyVolume: 1, TradeNum: 3,
+		}, nil, false, true),
+		NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: base + 60_000, Open: 12, High: 15, Low: 8, Close: 14, Volume: 5, Quote: 65, BuyVolume: 4, TradeNum: 6,
+		}, nil, false, true),
+		NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: base + 120_000, Open: 14, High: 17, Low: 7, Close: 16, Volume: 3, Quote: 30, BuyVolume: 2, TradeNum: 4,
+		}, nil, false, true),
+	}
+	rows[0].Values["signal"] = "first"
+	rows[1].Values["signal"] = "middle"
+	rows[2].Values["signal"] = "last"
+	rows[0].Values["count"] = int64(2)
+	rows[1].Values["count"] = int64(5)
+	rows[2].Values["count"] = int64(7)
+	rows[0].Values["nullable"] = nil
+	rows[1].Values["nullable"] = "later"
+	rows[2].Values["nullable"] = "latest"
+	rows[0].Values["captured"] = nil
+	rows[1].Values["captured"] = int64(4)
+	rows[2].Values["captured"] = int64(8)
+	rows[0].Values["average"] = 1.0
+	rows[1].Values["average"] = 3.0
+	rows[2].Values["average"] = 9.0
+
+	got, done, err := ResampleDataSeries(exs, "3m", rows, nil, 180_000, 0, 60_000, 0, false)
+	if err != nil {
+		t.Fatalf("ResampleDataSeries returned error: %v", err)
+	}
+	if !done || len(got) != 1 {
+		t.Fatalf("expected one finished row, done=%v len=%d", done, len(got))
+	}
+	view, err := got[0].OHLCV(exs)
+	if err != nil {
+		t.Fatalf("OHLCV projection returned error: %v", err)
+	}
+	if view.Open != 10 || view.High != 17 || view.Low != 7 || view.Close != 16 ||
+		view.Volume != 10 || view.Quote != 116 || view.BuyVolume != 7 || view.TradeNum != 13 {
+		t.Fatalf("AggRules must not replace built-in OHLCV rules: %+v", view)
+	}
+	if got[0].Values["signal"] != "first" {
+		t.Fatalf("extension first rule was not applied: %#v", got[0].Values["signal"])
+	}
+	if value, ok := got[0].Values["count"].(int64); !ok || value != 14 {
+		t.Fatalf("extension sum/type mismatch: value=%#v type=%T", got[0].Values["count"], got[0].Values["count"])
+	}
+	if value, ok := got[0].Values["nullable"]; !ok || value != nil {
+		t.Fatalf("extension first rule must preserve explicit NULL: %#v present=%v", value, ok)
+	}
+	if value, ok := got[0].Values["captured"].(int64); !ok || value != 8 {
+		t.Fatalf("registered extension rule result mismatch: value=%#v type=%T", got[0].Values["captured"], got[0].Values["captured"])
+	}
+	if capturedType != "int" || capturedRows != 3 || !sawExplicitNull {
+		t.Fatalf("registered rule did not receive field type/NULL-preserving rows: type=%q rows=%d null=%v", capturedType, capturedRows, sawExplicitNull)
+	}
+	if value, ok := got[0].Values["average"].(float64); !ok || value != 13.0/3.0 {
+		t.Fatalf("extension avg was not evaluated over the whole bucket: value=%#v type=%T", got[0].Values["average"], got[0].Values["average"])
+	}
+}
+
+func TestResampleDataSeriesUsesAggRulesForKlineExtensions(t *testing.T) {
+	const ruleName = "ohlcv_series_test_bucket_size"
+	var fieldType string
+	if !RegisterAggRule(ruleName, func(rows []*DataRecord, field SeriesField) (any, error) {
+		fieldType = field.Type
+		return int64(len(rows)), nil
+	}) {
+		t.Fatal("expected custom agg rule registration to succeed")
+	}
+
+	exs := &ExSymbol{ID: 7, Symbol: "BTC/USDT", AggRules: `{"bucket_size":"` + ruleName + `"}`}
+	row := NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+		Time: 1_700_000_040_000, Open: 10, High: 13, Low: 9, Close: 12, Volume: 2,
+	}, nil, false, true)
+	row.Values["bucket_size"] = 30.0
+
+	got, _, err := ResampleDataSeries(exs, "2m", []*DataSeries{row}, nil, 120_000, 0, 60_000, 0, false)
+	if err != nil {
+		t.Fatalf("ResampleDataSeries returned error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one aggregate row, got %d", len(got))
+	}
+	if fieldType != "float" {
+		t.Fatalf("registered rule received field type %q, want float", fieldType)
+	}
+	if got[0].Values["bucket_size"] != int64(1) {
+		t.Fatalf("registered rule was not applied to a single-row bucket: %#v", got[0].Values["bucket_size"])
+	}
+}
+
+func TestResampleDataSeriesPreservesNullCustomField(t *testing.T) {
+	exs := &ExSymbol{ID: 7, Symbol: "BTC/USDT"}
+	first := NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+		Time: 1_700_000_040_000, Open: 10, High: 13, Low: 9, Close: 12, Volume: 2,
+	}, nil, false, true)
+	second := NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+		Time: 1_700_000_100_000, Open: 12, High: 15, Low: 8, Close: 14, Volume: 5,
+	}, nil, false, true)
+	first.Values["optional_note"] = "present"
+	second.Values["optional_note"] = nil
+
+	got, _, err := ResampleDataSeries(exs, "2m", []*DataSeries{first, second}, nil, 120_000, 0, 60_000, 0, false)
+	if err != nil {
+		t.Fatalf("ResampleDataSeries returned error: %v", err)
+	}
+	value, ok := got[0].Values["optional_note"]
+	if !ok || value != nil {
+		t.Fatalf("aggregate must preserve explicit NULL extension key: %#v, present=%v", value, ok)
 	}
 }
 
@@ -140,12 +278,12 @@ func TestOHLCVSeriesValuesPreserveFieldsAndUseTargetSID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ohlcvSeriesValues returned error: %v", err)
 	}
-	if got.sid != 99 || got.timeMS != 123_000 {
+	if got.Sid != 99 || got.TimeMS != 123_000 {
 		t.Fatalf("unexpected identity: %+v", got)
 	}
-	if got.open != 1 || got.high != 2 || got.low != 0.5 || got.close != 1.5 ||
-		got.volume != 10 || got.quote != 15 || got.buyVolume != 6 || got.tradeNum != 8 {
-		t.Fatalf("unexpected values: %+v", got)
+	if got.Values["open"] != 1.0 || got.Values["high"] != 2.0 || got.Values["low"] != 0.5 || got.Values["close"] != 1.5 ||
+		got.Values["volume"] != 10.0 || got.Values["quote"] != 15.0 || got.Values["buy_volume"] != 6.0 || got.Values["trade_num"] != int64(8) {
+		t.Fatalf("unexpected values: %+v", got.Values)
 	}
 }
 
@@ -153,18 +291,22 @@ func TestOHLCVSeriesValuesPreserveExtraFieldsForWrite(t *testing.T) {
 	row := NewDataSeriesFromKline(&ExSymbol{ID: 11}, "1m", &banexg.Kline{Time: 123_000}, nil, false, true)
 	row.Values["signal_b"] = "sell"
 	row.Values["signal_a"] = 1.25
+	row.Values["signal_nil"] = nil
 	got, err := normalizeOHLCVSeries([]*DataSeries{row}, 11)
 	if err != nil {
 		t.Fatalf("normalizeOHLCVSeries returned error: %v", err)
 	}
-	wantFields := []string{"signal_a", "signal_b"}
+	wantFields := []string{"signal_a", "signal_b", "signal_nil"}
 	if len(got) != 1 || !reflect.DeepEqual(klineExtraFields(got), wantFields) {
 		t.Fatalf("unexpected extra fields: %+v", got)
 	}
-	if got[0].extras["signal_a"] != 1.25 || got[0].extras["signal_b"] != "sell" {
-		t.Fatalf("extra values were dropped: %+v", got[0].extras)
+	if got[0].Values["signal_a"] != 1.25 || got[0].Values["signal_b"] != "sell" {
+		t.Fatalf("extra values were dropped: %+v", got[0].Values)
 	}
-	wantCols := []string{"sid", "ts", "open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num", "signal_a", "signal_b"}
+	if value, ok := got[0].Values["signal_nil"]; !ok || value != nil {
+		t.Fatalf("explicit nil extra value was dropped: %#v, present=%v", value, ok)
+	}
+	wantCols := []string{"sid", "ts", "open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num", "signal_a", "signal_b", "signal_nil"}
 	if cols := klineInsertColumns("ts", wantFields); !reflect.DeepEqual(cols, wantCols) {
 		t.Fatalf("unexpected insert columns: %v", cols)
 	}
@@ -178,6 +320,99 @@ func TestKlineSelectProjectionUsesDefaultsOrRequestedFields(t *testing.T) {
 	wantRequested := `"close","signal","sid"`
 	if got := klineSelectProjection([]string{"close", "signal", "close"}, true); got != wantRequested {
 		t.Fatalf("unexpected requested projection: %s", got)
+	}
+}
+
+func TestBuildQuestKlineAggregateQueryIncludesDynamicColumns(t *testing.T) {
+	columns := []questTableColumn{
+		{Name: "sid", Type: "INT", UpsertKey: true},
+		{Name: "ts", Type: "TIMESTAMP", Designated: true, UpsertKey: true},
+		{Name: "open", Type: "DOUBLE"},
+		{Name: "high", Type: "DOUBLE"},
+		{Name: "low", Type: "DOUBLE"},
+		{Name: "close", Type: "DOUBLE"},
+		{Name: "volume", Type: "DOUBLE"},
+		{Name: "quote", Type: "DOUBLE"},
+		{Name: "buy_volume", Type: "DOUBLE"},
+		{Name: "trade_num", Type: "LONG"},
+		{Name: "optional_note", Type: "STRING"},
+	}
+	query, fields, err := buildQuestKlineAggregateQuery("kline_1m", columns)
+	if err != nil {
+		t.Fatalf("buildQuestKlineAggregateQuery returned error: %v", err)
+	}
+	if !reflect.DeepEqual(fields, []string{"open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num", "optional_note"}) {
+		t.Fatalf("unexpected aggregate fields: %v", fields)
+	}
+	for _, want := range []string{`cast("ts" as long)/1000`, `"open"`, `"optional_note"`, `FROM "kline_1m"`} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("aggregate query %q missing %q", query, want)
+		}
+	}
+	if _, err := buildQuestKlineAddColumnSQL("kline_2m", questTableColumn{Name: "optional_note", Type: "STRING"}); err != nil {
+		t.Fatalf("dynamic extension column must have valid DDL: %v", err)
+	}
+}
+
+func TestMapToSeriesFieldsPreservesNullKeysAndValueTypes(t *testing.T) {
+	fields := []string{"open", "quote", "signal"}
+	rows := newInterfaceRows([][]any{{
+		int64(123_000), float64(1.25), nil, "buy",
+	}})
+
+	got, err := mapToSeriesFields(&ExSymbol{ID: 7}, "1m", fields, rows, nil)
+	if err != nil {
+		t.Fatalf("mapToSeriesFields returned error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one row, got %d", len(got))
+	}
+	valueMap := got[0].Values
+	if value, ok := valueMap["quote"]; !ok || value != nil {
+		t.Fatalf("SQL NULL must remain an explicit nil value: %#v, present=%v", value, ok)
+	}
+	if value, ok := valueMap["signal"]; !ok || value != "buy" {
+		t.Fatalf("non-NULL extension field was not preserved: %#v, present=%v", value, ok)
+	}
+	if _, ok := valueMap["open"].(float64); !ok {
+		t.Fatalf("OHLCV value type changed: %T", valueMap["open"])
+	}
+}
+
+func TestHandleSeriesBatchFieldsPreservesNullKeysAndValueTypes(t *testing.T) {
+	fields := []string{"open", "quote", "signal"}
+	exsMap := map[int32]*ExSymbol{7: {ID: 7}, 8: {ID: 8}}
+	rows := newInterfaceRows([][]any{
+		{int64(123_000), float64(1.25), nil, "buy", int32(7)},
+		{int64(183_000), nil, float32(2.5), int64(42), int32(8)},
+	})
+	got := make(map[int32][]*DataSeries)
+
+	if err := handleSeriesBatchFields(exsMap, "1m", fields, 60_000, "", rows, nil,
+		func(sid int32, series []*DataSeries) { got[sid] = series }); err != nil {
+		t.Fatalf("handleSeriesBatchFields returned error: %v", err)
+	}
+	if len(got[7]) != 1 || len(got[8]) != 1 {
+		t.Fatalf("expected one row per SID, got: %+v", got)
+	}
+	if value, ok := got[7][0].Values["quote"]; !ok || value != nil {
+		t.Fatalf("batch SQL NULL must remain an explicit nil value: %#v, present=%v", value, ok)
+	}
+	if value, ok := got[7][0].Values["signal"]; !ok || value != "buy" {
+		t.Fatalf("batch extension field was not preserved: %#v, present=%v", value, ok)
+	}
+	if value, ok := got[8][0].Values["open"]; !ok || value != nil {
+		t.Fatalf("batch NULL OHLCV field must remain an explicit nil value: %#v, present=%v", value, ok)
+	}
+	if value, ok := got[8][0].Values["quote"]; !ok {
+		t.Fatalf("batch non-NULL field key was dropped")
+	} else if _, ok := value.(float32); !ok {
+		t.Fatalf("batch extension value type changed: %T", value)
+	}
+	if value, ok := got[8][0].Values["signal"]; !ok {
+		t.Fatalf("batch extension field key was dropped")
+	} else if _, ok := value.(int64); !ok {
+		t.Fatalf("batch extension type changed: %T", value)
 	}
 }
 
@@ -298,5 +533,73 @@ func TestBindSeriesTargetPreservesAdjustmentAndUsesRequestedIdentity(t *testing.
 	}
 	if row.Sid != underlying.ID || row.ExSymbol != underlying {
 		t.Fatalf("source row was mutated: %+v", row)
+	}
+}
+
+func TestSeriesAdjustmentRoutingUsesMarketBoundaryMetadata(t *testing.T) {
+	const sid = int32(910001)
+	const startMS = int64(1_700_000_000_000)
+	underlying := &ExSymbol{ID: 12, Symbol: "AU2406"}
+	cached := []*AdjInfo{{ExSymbol: underlying, StartMS: startMS, StopMS: startMS + 60_000}}
+	amLock.Lock()
+	previous, hadPrevious := adjMap[sid]
+	adjMap[sid] = cached
+	amLock.Unlock()
+	t.Cleanup(func() {
+		amLock.Lock()
+		if hadPrevious {
+			adjMap[sid] = previous
+		} else {
+			delete(adjMap, sid)
+		}
+		amLock.Unlock()
+	})
+
+	oldQuestDB := IsQuestDB
+	IsQuestDB = true
+	t.Cleanup(func() { IsQuestDB = oldQuestDB })
+	q := New(&visibilityDBStub{query: func(_ string, _ ...interface{}) (pgx.Rows, error) {
+		return newInterfaceRows(nil), nil
+	}})
+
+	tests := []struct {
+		name         string
+		exchange     string
+		market       *banexg.Market
+		wantAdjusted bool
+	}{
+		{
+			name:     "non China suffix is not enough",
+			exchange: "binance",
+			market:   &banexg.Market{Symbol: "AU888", Type: banexg.MarketLinear, Combined: false},
+		},
+		{
+			name:         "China special market uses combined metadata",
+			exchange:     "china",
+			market:       &banexg.Market{Symbol: "AU888", Type: banexg.MarketLinear, Combined: true},
+			wantAdjusted: true,
+		},
+		{
+			name:         "non China combined market uses combined metadata",
+			exchange:     "binance",
+			market:       &banexg.Market{Symbol: "MAIN", Type: banexg.MarketLinear, Combined: true},
+			wantAdjusted: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			exs := &ExSymbol{
+				ID: sid, Exchange: test.exchange, Market: test.market.Type,
+				Symbol: test.market.Symbol, Combined: test.market.Combined,
+			}
+			adjs, _, err := q.getSeriesFieldsRawMode(exs, "1m", nil, startMS, startMS+60_000, 0, false, false)
+			if err != nil {
+				t.Fatalf("getSeriesFieldsRawMode returned error: %v", err)
+			}
+			gotAdjusted := len(adjs) > 0
+			if gotAdjusted != test.wantAdjusted {
+				t.Fatalf("adjustment routing = %v, want %v for market=%+v", gotAdjusted, test.wantAdjusted, test.market)
+			}
+		})
 	}
 }

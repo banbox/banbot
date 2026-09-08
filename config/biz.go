@@ -6,11 +6,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
@@ -717,8 +717,8 @@ func initExgAccs(args *CmdArgs, accs map[string]*AccountConfig) *errs.Error {
 	}
 	if loc != nil {
 		btime.LocShow = loc
-	} else if Exchange.Name == "china" {
-		btime.LocShow, _ = time.LoadLocation("Asia/Shanghai")
+	} else if location := ExchangeDefaultLocation(Exchange.Name); location != nil {
+		btime.LocShow = location
 	} else {
 		btime.LocShow = btime.UTCLocale
 	}
@@ -971,6 +971,10 @@ func (c *Config) Clone() *Config {
 		item := *c.BTInLive
 		item.MailTo = slices.Clone(c.BTInLive.MailTo)
 		res.BTInLive = &item
+	}
+	if c.Database != nil {
+		item := *c.Database
+		res.Database = &item
 	}
 	if c.LLMModels != nil {
 		res.LLMModels = make(map[string]*llm.LLMModelConfig, len(c.LLMModels))
@@ -1293,19 +1297,70 @@ func cloneAccountConfigs(src map[string]*AccountConfig) map[string]*AccountConfi
 }
 
 func cloneConfigValue(val interface{}) interface{} {
-	switch item := val.(type) {
-	case map[string]interface{}:
-		return cloneStringMap(item)
-	case []interface{}:
-		res := make([]interface{}, len(item))
-		for i, val := range item {
-			res[i] = cloneConfigValue(val)
+	cloned := cloneConfigReflect(reflect.ValueOf(val))
+	if !cloned.IsValid() {
+		return nil
+	}
+	return cloned.Interface()
+}
+
+func cloneConfigReflect(val reflect.Value) reflect.Value {
+	if !val.IsValid() || !val.CanInterface() {
+		return val
+	}
+	switch val.Kind() {
+	case reflect.Interface:
+		if val.IsNil() {
+			return reflect.Zero(val.Type())
+		}
+		res := reflect.New(val.Type()).Elem()
+		res.Set(cloneConfigReflect(val.Elem()))
+		return res
+	case reflect.Map:
+		if val.IsNil() {
+			return reflect.Zero(val.Type())
+		}
+		res := reflect.MakeMapWithSize(val.Type(), val.Len())
+		iter := val.MapRange()
+		for iter.Next() {
+			res.SetMapIndex(cloneConfigReflect(iter.Key()), cloneConfigReflect(iter.Value()))
 		}
 		return res
-	case []string:
-		return slices.Clone(item)
+	case reflect.Slice:
+		if val.IsNil() {
+			return reflect.Zero(val.Type())
+		}
+		res := reflect.MakeSlice(val.Type(), val.Len(), val.Len())
+		for i := 0; i < val.Len(); i++ {
+			res.Index(i).Set(cloneConfigReflect(val.Index(i)))
+		}
+		return res
+	case reflect.Array:
+		res := reflect.New(val.Type()).Elem()
+		for i := 0; i < val.Len(); i++ {
+			res.Index(i).Set(cloneConfigReflect(val.Index(i)))
+		}
+		return res
+	case reflect.Ptr:
+		if val.IsNil() {
+			return reflect.Zero(val.Type())
+		}
+		res := reflect.New(val.Type().Elem())
+		res.Elem().Set(cloneConfigReflect(val.Elem()))
+		return res
+	case reflect.Struct:
+		res := reflect.New(val.Type()).Elem()
+		res.Set(val)
+		for i := 0; i < val.NumField(); i++ {
+			src, dst := val.Field(i), res.Field(i)
+			if !src.CanInterface() || !dst.CanSet() {
+				continue
+			}
+			dst.Set(cloneConfigReflect(src))
+		}
+		return res
 	default:
-		return item
+		return val
 	}
 }
 
@@ -1593,8 +1648,12 @@ func SplitTimeFrames(timeframes string) []string {
 
 // ParsePairs parse short pairs to standard pair format
 func ParsePairs(pairs ...string) ([]string, *errs.Error) {
-	if core.ExgName == "china" {
-		return pairs, nil
+	exchangeName := core.ExgName
+	if Exchange != nil && Exchange.Name != "" {
+		exchangeName = Exchange.Name
+	}
+	if ExchangeUsesOpaqueSymbols(exchangeName) {
+		return slices.Clone(pairs), nil
 	}
 	quote := ""
 	if len(StakeCurrency) > 0 {

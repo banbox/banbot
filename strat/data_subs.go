@@ -34,6 +34,25 @@ func ParseDataSubKey(key string) (string, int32, string, bool) {
 }
 
 func CollectDataSubs(job *StratJob) []*DataSub {
+	if job != nil && job.symbols != nil {
+		return CollectDataSubsWithSymbolState(job.symbols, job)
+	}
+	return CollectDataSubsWithSymbolState(nil, job)
+}
+
+func canonicalDataSubSymbol(symbols *orm.SymbolState, exs *orm.ExSymbol) *orm.ExSymbol {
+	if symbols == nil || exs == nil {
+		return exs
+	}
+	canonical := symbols.GetExSymbol2(exs.Exchange, exs.Market, exs.Symbol)
+	if canonical == nil || canonical.ID != exs.ID {
+		return nil
+	}
+	return canonical
+}
+
+// CollectDataSubsWithSymbolState resolves pair-info symbols from the supplied state.
+func CollectDataSubsWithSymbolState(symbols *orm.SymbolState, job *StratJob) []*DataSub {
 	if job == nil || job.Strat == nil {
 		return nil
 	}
@@ -43,16 +62,27 @@ func CollectDataSubs(job *StratJob) []*DataSub {
 			if sub == nil {
 				continue
 			}
-			exs := job.Symbol
+			exs := canonicalDataSubSymbol(symbols, job.Symbol)
 			if sub.Pair != "" && sub.Pair != "_cur_" {
 				if job.Symbol != nil {
-					exs = orm.GetExSymbol2(job.Symbol.Exchange, job.Symbol.Market, sub.Pair)
+					if symbols == nil {
+						exs = orm.GetExSymbol2(job.Symbol.Exchange, job.Symbol.Market, sub.Pair)
+					} else {
+						exs = symbols.GetExSymbol2(job.Symbol.Exchange, job.Symbol.Market, sub.Pair)
+					}
 				} else {
-					exs, _ = orm.GetExSymbolCur(sub.Pair)
+					if symbols == nil {
+						exs, _ = orm.GetExSymbolCur(sub.Pair)
+					} else {
+						exs, _ = symbols.GetExSymbolCur(sub.Pair)
+					}
 				}
 				if exs == nil {
 					continue
 				}
+			}
+			if symbols != nil && exs == nil {
+				continue
 			}
 			out = append(out, &DataSub{
 				Source:       orm.SeriesSourceKline,
@@ -73,6 +103,7 @@ func CollectDataSubs(job *StratJob) []*DataSub {
 			if exs == nil {
 				exs = job.Symbol
 			}
+			exs = canonicalDataSubSymbol(symbols, exs)
 			if exs == nil {
 				continue
 			}
@@ -99,6 +130,11 @@ func CollectDataSubs(job *StratJob) []*DataSub {
 // consumes the same K-line stream. The default fields keep the primary OnBar
 // path valid, while side-input subscriptions may extend the projection.
 func CollectKlineSubFields(sid int32, tf string) []string {
+	return CollectKlineSubFieldsWithSymbolState(nil, sid, tf)
+}
+
+// CollectKlineSubFieldsWithSymbolState collects fields using the supplied symbol state.
+func CollectKlineSubFieldsWithSymbolState(symbols *orm.SymbolState, sid int32, tf string) []string {
 	fields := orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil)
 	lockInfoJobs.Lock()
 	hasInfoJobs := false
@@ -121,7 +157,7 @@ func CollectKlineSubFields(sid int32, tf string) []string {
 	}
 	lockInfoJobs.Unlock()
 	for job := range seenJobs {
-		for _, sub := range CollectDataSubs(job) {
+		for _, sub := range CollectDataSubsWithSymbolState(symbols, job) {
 			if sub == nil || sub.ExSymbol == nil || sub.ExSymbol.ID != sid || sub.TimeFrame != tf ||
 				orm.NormalizeSeriesSource(sub.Source) != orm.SeriesSourceKline {
 				continue

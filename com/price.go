@@ -2,92 +2,107 @@ package com
 
 import (
 	"fmt"
-	"math"
-	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banexg"
-	"gonum.org/v1/gonum/floats"
 )
+
+type legacyPriceBinding struct {
+	exchange string
+	state    *PriceState
+}
 
 var (
-	barPrices     = make(map[string]*core.Int64Flt) // Latest price of each coin from bar, only for backtesting etc. The key can be a trading pair or a coin code 来自bar的每个币的最新价格，仅用于回测等。键可以是交易对，也可以是币的code
-	bidPrices     = make(map[string]*core.Int64Flt) // The latest order book price of the trading pair is only used for real-time simulation or real trading. The key can be a trading pair or a coin code 交易对的最新订单簿价格，仅用于实时模拟或实盘。键可以是交易对，也可以是币的code
-	askPrices     = make(map[string]*core.Int64Flt)
-	lockPrices    sync.RWMutex // 确认正确，无需deadlock
-	lockBarPrices sync.RWMutex // 确认正确，无需deadlock
-	PriceExpireMS = int64(60000)
+	legacyPrices           = NewPriceState("")
+	legacyPriceStates      = map[string]*PriceState{"": legacyPrices}
+	legacyPriceCurrent     atomic.Pointer[legacyPriceBinding]
+	legacyPriceExchangeMux sync.Mutex
+	PriceExpireMS          = int64(60000)
 )
 
-const (
-	Day10MSecs = int64(864000000)
-)
-
-func getPriceBySide(ask, bid map[string]*core.Int64Flt, lock *sync.RWMutex, symbol string, side string, expMS int64) (float64, bool) {
-	lock.RLock()
-	curMS := btime.TimeMS()
-	priceArr := make([]float64, 0, 1)
-	expMSFlt := float64(expMS)
-	if side == banexg.OdSideBuy || side == "" {
-		if item, ok := bid[symbol]; ok && math.Abs(float64(curMS-item.Int)) <= expMSFlt {
-			priceArr = append(priceArr, item.Val)
-		}
-	}
-	if side == banexg.OdSideSell || side == "" {
-		if item, ok := ask[symbol]; ok && math.Abs(float64(curMS-item.Int)) <= expMSFlt {
-			priceArr = append(priceArr, item.Val)
-		}
-	}
-	lock.RUnlock()
-	if len(priceArr) > 0 {
-		if len(priceArr) == 1 {
-			return priceArr[0], true
-		}
-		return floats.Sum(priceArr) / float64(len(priceArr)), true
-	}
-	return 0, false
+func init() {
+	legacyPriceCurrent.Store(&legacyPriceBinding{state: legacyPrices})
 }
+
+// syncLegacyPriceParser keeps the old facade tied to the current process
+// exchange while leaving unchanged-exchange calls lock-free. Each exchange
+// keeps its own parser and price maps so switching back restores old data.
+func syncLegacyPriceParser() *PriceState {
+	exgName := core.ExgName
+	current := legacyPriceCurrent.Load()
+	if current != nil && current.exchange == exgName {
+		return current.state
+	}
+	legacyPriceExchangeMux.Lock()
+	current = legacyPriceCurrent.Load()
+	if current == nil || current.exchange != exgName {
+		state := legacyPriceStates[exgName]
+		if state == nil {
+			// Keep configured legacy calls on the current adapter. Exchange
+			// semantics, including non-standard contract symbols, belong to
+			// banexg's MapMarket implementation.
+			state = NewPriceStateWithStrategy(exgName, newLegacyPriceSymbolParser(exgName, legacyExchange(exgName)))
+			legacyPriceStates[exgName] = state
+		}
+		current = &legacyPriceBinding{exchange: exgName, state: state}
+		legacyPriceCurrent.Store(current)
+	}
+	legacyPriceExchangeMux.Unlock()
+	return current.state
+}
+
+func newLegacyPriceSymbolParser(exgName string, exchange banexg.BanExchange) core.SymbolParserStrategy {
+	fallback := exg.NewLegacyPriceSymbolParser(exgName)
+	if exchange == nil {
+		return fallback
+	}
+	checked := exg.NewPriceSymbolParserWithError(exgName, exchange)
+	return func(pair string) [4]string {
+		parts, err := checked(pair)
+		if err != nil || parts == [4]string{} {
+			// The old facade accepted arbitrary synthetic symbols. Preserve that
+			// compatibility without weakening explicit Runtime parser validation.
+			return fallback(pair)
+		}
+		return parts
+	}
+}
+
+func legacyExchange(exgName string) banexg.BanExchange {
+	exchange := exg.Default
+	if exchange == nil {
+		return nil
+	}
+	defer func() {
+		if recover() != nil {
+			exchange = nil
+		}
+	}()
+	info := exchange.Info()
+	if info == nil || info.ID != exgName {
+		return nil
+	}
+	return exchange
+}
+
+const Day10MSecs = int64(864000000)
 
 func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
-	if core.IsFiat(symbol) && !strings.Contains(symbol, "/") {
-		return 1
-	}
-	price, ok := getPriceBySide(askPrices, bidPrices, &lockPrices, symbol, side, expMS)
-	if ok {
-		return price
-	}
-	lockBarPrices.RLock()
-	item, ok := barPrices[symbol]
-	lockBarPrices.RUnlock()
-	curMS := btime.TimeMS()
-	if ok && math.Abs(float64(curMS-item.Int)) <= float64(expMS) {
-		return item.Val
-	}
-	return -1
+	return syncLegacyPriceParser().GetPriceSafeExpAt(btime.TimeMS(), symbol, side, expMS)
 }
 
-// GetLastBarPrice returns the latest cached historical price without an expiry check.
 func GetLastBarPrice(symbol string) float64 {
-	if core.IsFiat(symbol) && !strings.Contains(symbol, "/") {
-		return 1
-	}
-	lockBarPrices.RLock()
-	item, ok := barPrices[symbol]
-	lockBarPrices.RUnlock()
-	if ok {
-		return item.Val
-	}
-	return -1
+	return syncLegacyPriceParser().GetLastBarPriceAt(symbol)
 }
 
-// GetPriceSafe return -1 if price expired or not found
 func GetPriceSafe(symbol string, side string) float64 {
 	return GetPriceSafeExp(symbol, side, PriceExpireMS)
 }
 
-// GetPriceExp panic if price expired before expMS or not found
 func GetPriceExp(symbol string, side string, expMS int64) float64 {
 	price := GetPriceSafeExp(symbol, side, expMS)
 	if price == -1 {
@@ -96,102 +111,28 @@ func GetPriceExp(symbol string, side string, expMS int64) float64 {
 	return price
 }
 
-// GetPrice panic if price expired or not found
 func GetPrice(symbol string, side string) float64 {
 	return GetPriceExp(symbol, side, 10000)
 }
 
-func setDataPrice(data map[string]*core.Int64Flt, pair string, price float64) {
-	item := &core.Int64Flt{
-		Int: btime.TimeMS(),
-		Val: price,
-	}
-	data[pair] = item
-	base, quote, settle, _ := core.SplitSymbol(pair)
-	if core.IsFiat(quote) && (settle == "" || settle == quote) {
-		data[base] = item
-	}
-}
-
 func SetBarPrice(pair string, price float64) {
-	lockBarPrices.Lock()
-	setDataPrice(barPrices, pair, price)
-	lockBarPrices.Unlock()
+	syncLegacyPriceParser().SetBarPriceAt(btime.TimeMS(), pair, price)
 }
 
 func IsPriceEmpty() bool {
-	lockPrices.RLock()
-	lockBarPrices.RLock()
-	empty := len(bidPrices) == 0 && len(barPrices) == 0
-	lockBarPrices.RUnlock()
-	lockPrices.RUnlock()
-	return empty
+	return syncLegacyPriceParser().IsPriceEmpty()
 }
 
 func SetPrice(pair string, ask, bid float64) {
-	lockPrices.Lock()
-	curMS := btime.TimeMS()
-	var askItem, bidItem *core.Int64Flt
-	if ask > 0 {
-		askItem = &core.Int64Flt{
-			Int: curMS,
-			Val: ask,
-		}
-		askPrices[pair] = askItem
-	}
-	if bid > 0 {
-		bidItem = &core.Int64Flt{
-			Int: curMS,
-			Val: bid,
-		}
-		bidPrices[pair] = bidItem
-	}
-	base, quote, settle, _ := core.SplitSymbol(pair)
-	if core.IsFiat(quote) && (settle == "" || settle == quote) {
-		if askItem != nil {
-			askPrices[base] = askItem
-		}
-		if bidItem != nil {
-			bidPrices[base] = bidItem
-		}
-	}
-	lockPrices.Unlock()
+	syncLegacyPriceParser().SetPriceAt(btime.TimeMS(), pair, ask, bid)
 }
 
 func SetPrices(data map[string]float64, side string) {
-	updateAsk := side == banexg.OdSideSell || side == ""
-	updateBid := side == banexg.OdSideBuy || side == ""
-	if !updateBid && !updateAsk {
-		panic(fmt.Sprintf("invalid side: %v, use `banexg.OdSideBuy/OdSideSell` or ''", side))
-	}
-	lockPrices.Lock()
-	curMS := btime.TimeMS()
-	for pair, price := range data {
-		item := &core.Int64Flt{
-			Int: curMS,
-			Val: price,
-		}
-		if updateAsk {
-			askPrices[pair] = item
-		}
-		if updateBid {
-			bidPrices[pair] = item
-		}
-		base, quote, settle, _ := core.SplitSymbol(pair)
-		if core.IsFiat(quote) && (settle == "" || settle == quote) {
-			if updateAsk {
-				askPrices[base] = item
-			}
-			if updateBid {
-				bidPrices[base] = item
-			}
-		}
-	}
-	lockPrices.Unlock()
+	syncLegacyPriceParser().SetPricesAt(btime.TimeMS(), data, side)
 }
 
 func IsMaker(pair, side string, price float64) bool {
-	curPrice := GetPrice(pair, side)
+	curPrice := GetPriceExp(pair, side, 10000)
 	isBuy := side == banexg.OdSideBuy
 	isLow := price < curPrice
 	return isBuy == isLow

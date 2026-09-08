@@ -3,8 +3,11 @@ package runtimeplan
 import (
 	"os"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -42,6 +45,119 @@ func TestInspectUsesCallerDataDirWithoutChangingWorkingDirectory(t *testing.T) {
 	if _, err = Inspect(validRequest(t, strategyName), "relative"); err == nil {
 		t.Fatal("relative data directory was accepted")
 	}
+}
+
+func TestInspectSerializesLegacyGlobalState(t *testing.T) {
+	fixtureID := strconv.FormatInt(time.Now().UnixNano(), 10)
+	firstStrategyName := "runtime_plan_serial_first_fixture_" + fixtureID
+	secondStrategyName := "runtime_plan_serial_second_fixture_" + fixtureID
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondEntered := make(chan struct{})
+	var firstOnce, secondOnce sync.Once
+
+	strat.StratMake[firstStrategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{
+			RunTimeFrames: []string{"1h"},
+			OnStartUp: func(*strat.StratJob) {
+				firstOnce.Do(func() { close(firstEntered) })
+				<-releaseFirst
+			},
+		}
+	}
+	strat.StratMake[secondStrategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{
+			RunTimeFrames: []string{"1h"},
+			OnStartUp: func(*strat.StratJob) {
+				secondOnce.Do(func() { close(secondEntered) })
+			},
+		}
+	}
+	t.Cleanup(func() {
+		delete(strat.StratMake, firstStrategyName)
+		delete(strat.StratMake, secondStrategyName)
+	})
+
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	firstReq := validRequest(t, firstStrategyName)
+	secondReq := validRequest(t, secondStrategyName)
+	firstDataDir := t.TempDir()
+	secondDataDir := t.TempDir()
+	go func() {
+		_, err := Inspect(firstReq, firstDataDir)
+		firstDone <- err
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(5 * time.Second):
+		close(releaseFirst)
+		select {
+		case err := <-firstDone:
+			t.Fatalf("first Inspect did not reach its startup callback: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("first Inspect did not reach its startup callback")
+		}
+	}
+
+	go func() {
+		_, err := Inspect(secondReq, secondDataDir)
+		secondDone <- err
+	}()
+	serial := true
+	select {
+	case <-secondEntered:
+		serial = false
+	case <-time.After(time.Second):
+	}
+	close(releaseFirst)
+
+	waitInspect := func(name string, done <-chan error) {
+		t.Helper()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("%s Inspect returned error: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s Inspect did not finish", name)
+		}
+	}
+	waitInspect("first", firstDone)
+	waitInspect("second", secondDone)
+	if !serial {
+		t.Fatal("second Inspect entered before first Inspect restored legacy globals")
+	}
+}
+
+func TestInspectDoesNotPolluteLegacySymbolFacade(t *testing.T) {
+	const strategyName = "runtime_plan_symbol_state_fixture"
+	legacy := &orm.ExSymbol{ID: 99, Exchange: "legacy", Market: "spot", Symbol: "LEGACY/USDT"}
+	restoreSymbols, err := orm.InstallFrozenExSymbols([]*orm.ExSymbol{legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(restoreSymbols)
+	assertLegacyState := func() {
+		t.Helper()
+		if got := orm.GetSymbolByID(legacy.ID); got == nil || got.Symbol != legacy.Symbol {
+			t.Fatalf("legacy symbol facade changed: got=%+v want=%+v", got, legacy)
+		}
+		if got := orm.GetSymbolByID(1); got != nil {
+			t.Fatalf("runtime plan symbol leaked into legacy facade: %+v", got)
+		}
+	}
+	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}, OnStartUp: func(*strat.StratJob) {
+			assertLegacyState()
+		}}
+	}
+	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+
+	if _, err := Inspect(validRequest(t, strategyName), t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	assertLegacyState()
 }
 
 func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {

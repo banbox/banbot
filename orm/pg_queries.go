@@ -5,6 +5,7 @@ package orm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
@@ -341,35 +343,102 @@ func (q *Queries) listExchangesPg(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-func (q *Queries) addSymbolsPg(ctx context.Context, arg []AddSymbolsParams) (int64, error) {
-	if len(arg) == 0 || ctx == nil {
+func (q *Queries) addSymbolsPg(ctx context.Context, state *SymbolState, arg []AddSymbolsParams) (result int64, retErr error) {
+	if len(arg) == 0 {
 		return 0, nil
 	}
-	// Sync maxSid from DB before assigning new IDs.
-	if latest := queryMaxSidFromPg(ctx, q.db); latest > maxSid {
-		maxSid = latest
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	state = symbolStateOrDefault(state)
+	if !isProductionDBHandle(q.db) {
+		return q.addSymbolsPgCompatibility(ctx, state, arg)
 	}
 	for i, s := range arg {
-		maxSid++
-		sid := maxSid
-		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol (id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	ON CONFLICT (exchange, market, symbol) DO NOTHING`,
-			sid, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs, s.AggRules)
-		if err != nil {
+		row := q.db.QueryRow(ctx, `INSERT INTO public.exsymbol AS e
+  (exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (exchange, market, symbol)
+DO UPDATE SET exchange = e.exchange
+RETURNING id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules`,
+			s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs, s.AggRules)
+		var stored ExSymbol
+		if err := row.Scan(&stored.ID, &stored.Exchange, &stored.ExgReal, &stored.Market, &stored.Symbol,
+			&stored.Combined, &stored.ListMs, &stored.DelistMs, &stored.AggRules); err != nil {
 			return int64(i), err
+		}
+		key := exSymbolKey(stored.Exchange, stored.Market, stored.Symbol)
+		if err := state.sidAllocator().reserveSIDBatch([]sidReservation{{key: key, id: stored.ID}}); err != nil {
+			return int64(i), fmt.Errorf("reserve persisted exchange symbol %s sid %d: %w", key, stored.ID, err)
+		}
+		if err := state.cacheExSymbolChecked(&stored); err != nil {
+			return int64(i), fmt.Errorf("cache persisted exchange symbol %s sid %d: %w", key, stored.ID, err)
 		}
 	}
 	return int64(len(arg)), nil
 }
 
-func queryMaxSidFromPg(ctx context.Context, db DBTX) int32 {
+// addSymbolsPgCompatibility keeps in-memory DB doubles and old package-local
+// callers useful. Real database handles always use the sequence-backed path
+// above; this fallback is never a source of production persistence guarantees.
+func (q *Queries) addSymbolsPgCompatibility(ctx context.Context, state *SymbolState, arg []AddSymbolsParams) (result int64, retErr error) {
+	allocator := state.sidAllocator()
+	release, err := acquireLocalSIDReservationLease(ctx, allocator)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if releaseErr := release(); releaseErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("release exchange symbol SID lease: %w", releaseErr))
+		}
+	}()
+	dbMax, err := queryMaxSidFromPg(ctx, q.db)
+	if err != nil {
+		return 0, err
+	}
+	prepareSymbolSIDAllocation(allocator, state, dbMax)
+	for i, s := range arg {
+		sid := nextSymbolSID(allocator, state)
+		row := q.db.QueryRow(ctx, `INSERT INTO exsymbol (id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	ON CONFLICT (exchange, market, symbol) DO UPDATE SET exchange = exsymbol.exchange
+	RETURNING id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules`,
+			sid, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs, s.AggRules)
+		var stored ExSymbol
+		if err := row.Scan(&stored.ID, &stored.Exchange, &stored.ExgReal, &stored.Market, &stored.Symbol,
+			&stored.Combined, &stored.ListMs, &stored.DelistMs, &stored.AggRules); err != nil {
+			return int64(i), err
+		}
+		key := exSymbolKey(stored.Exchange, stored.Market, stored.Symbol)
+		if err := allocator.reserveSIDBatch([]sidReservation{{key: key, id: stored.ID}}); err != nil {
+			return int64(i), fmt.Errorf("reserve persisted exchange symbol %s sid %d: %w", key, stored.ID, err)
+		}
+		if err := state.cacheExSymbolChecked(&stored); err != nil {
+			return int64(i), fmt.Errorf("cache persisted exchange symbol %s sid %d: %w", key, stored.ID, err)
+		}
+	}
+	return int64(len(arg)), nil
+}
+
+func isProductionDBHandle(db DBTX) bool {
+	switch db.(type) {
+	case *SubQueries, *pgxpool.Pool, *pgxpool.Conn, *pgx.Conn, pgx.Tx:
+		return true
+	default:
+		return false
+	}
+}
+
+func queryMaxSidFromPg(ctx context.Context, db DBTX) (int32, error) {
 	var maxVal *int32
 	row := db.QueryRow(ctx, `SELECT max(id) FROM exsymbol`)
-	if err := row.Scan(&maxVal); err != nil || maxVal == nil {
-		return 0
+	if err := row.Scan(&maxVal); err != nil {
+		return 0, err
 	}
-	return *maxVal
+	if maxVal == nil {
+		return 0, nil
+	}
+	return *maxVal, nil
 }
 
 func (q *Queries) setListMSPg(ctx context.Context, arg SetListMSParams) error {
@@ -386,11 +455,6 @@ func (q *Queries) setAggRulesPg(ctx context.Context, arg SetAggRulesParams) erro
 		ctx = context.Background()
 	}
 	_, err := q.db.Exec(ctx, `UPDATE exsymbol SET agg_rules = $1 WHERE id = $2`, arg.AggRules, arg.ID)
-	if err == nil {
-		if exs := GetSymbolByID(arg.ID); exs != nil {
-			exs.AggRules = arg.AggRules
-		}
-	}
 	return err
 }
 

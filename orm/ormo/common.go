@@ -10,11 +10,18 @@ import (
 )
 
 func DumpOrdersGob(path string) *errs.Error {
-	for _, od := range HistODs {
+	return DumpOrdersGobItems(path, HistODs)
+}
+
+// DumpOrdersGobItems serializes an explicit order snapshot. Runtime-owned
+// backtests use this entry point so report output does not copy orders into
+// the legacy process-wide history registry.
+func DumpOrdersGobItems(path string, orders []*InOutOrder) *errs.Error {
+	for _, od := range orders {
 		_, _ = od.GetInfoText()
 		od.Info = nil
 	}
-	return utils.EncodeGob(path, HistODs)
+	return utils.EncodeGob(path, orders)
 }
 
 func LoadOrdersGob(path string) ([]*InOutOrder, *errs.Error) {

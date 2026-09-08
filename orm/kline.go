@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -610,7 +609,7 @@ func GetAlignOff(sid int32, toTfMSecs int64) int64 {
 		alignOffs[sid] = data
 	}
 	exs := GetSymbolByID(sid)
-	offMS := int64(exg.GetAlignOff(exs.Exchange, int(toTfMSecs/1000)) * 1000)
+	offMS := int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, int(toTfMSecs/1000)) * 1000)
 	data[toTfMSecs] = offMS
 	return offMS
 }
@@ -642,6 +641,25 @@ Only batch insert K-lines. To update associated information simultaneously, plea
 只批量插入K线，如需同时更新关联信息，请使用InsertKLinesAuto
 */
 func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline) (int64, *errs.Error) {
+	arrLen := len(arr)
+	if arrLen == 0 {
+		return 0, nil
+	}
+	if !IsQuestDB {
+		return insertKLinesPg(q, timeFrame, sid, arr)
+	}
+	tblName := "kline_" + timeFrame
+	ctx := context.Background()
+	unlock, lockErr := acquireQuestTableReadLock(ctx, tblName)
+	if lockErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
+	return q.insertKLinesLocked(timeFrame, sid, arr)
+}
+
+// insertKLinesLocked writes rows while the caller holds the target table read lock.
+func (q *Queries) insertKLinesLocked(timeFrame string, sid int32, arr []*banexg.Kline) (int64, *errs.Error) {
 	arrLen := len(arr)
 	if arrLen == 0 {
 		return 0, nil
@@ -705,6 +723,12 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 	if len(arr) == 0 {
 		return 0, nil
 	}
+	tblName := "kline_" + timeFrame
+	unlock, lockErr := acquireQuestTableReadLock(context.Background(), tblName)
+	if lockErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
 	startMS := arr[0].Time
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	endMS := arr[len(arr)-1].Time + tfMSecs
@@ -727,7 +751,7 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 		}
 		defer func() { _ = tx.Rollback(context.Background()) }()
 	}
-	num, err := write.InsertKLines(timeFrame, exs.ID, arr)
+	num, err := write.insertKLinesLocked(timeFrame, exs.ID, arr)
 	if err != nil {
 		return num, err
 	}
@@ -889,13 +913,14 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	startMS := utils2.AlignTfMSecs(orgStartMS, tfMSecs)
 	endMS := utils2.AlignTfMSecs(orgEndMS, tfMSecs)
 	var delistMS int64
+	var exs *ExSymbol
 	if !IsQuestDB {
 		var delistErr *errs.Error
 		delistMS, delistErr = q.getDelistMSPg(sid)
 		if delistErr != nil {
 			return delistErr
 		}
-	} else if exs := GetSymbolByID(sid); exs != nil {
+	} else if exs = GetSymbolByID(sid); exs != nil {
 		delistMS = exs.DelistMs
 	}
 	endMS = aggregateEndForTerminalDelist(orgEndMS, endMS, delistMS, tfMSecs)
@@ -930,12 +955,28 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	}
 	fromTbl := "kline_" + aggFrom
 	ctx := context.Background()
-	rows, err_ := q.db.Query(ctx, fmt.Sprintf(`
-select cast(ts as long)/1000,open,high,low,close,volume,quote,buy_volume,trade_num
-from %s
-where sid=$1 and ts >= $2 and ts < $3
-order by ts`, fromTbl), sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endMS).UTC())
-	src, err_ := mapToKlines(rows, err_)
+	var sourceColumns []questTableColumn
+	var src []*DataSeries
+	readErr := func() error {
+		unlock, lockErr := acquireQuestTableReadLock(ctx, fromTbl)
+		if lockErr != nil {
+			return lockErr
+		}
+		defer unlock()
+		var err error
+		sourceColumns, err = queryQuestTableColumns(ctx, q, fromTbl)
+		if err != nil {
+			return err
+		}
+		queryText, fields, err := buildQuestKlineAggregateQuery(fromTbl, sourceColumns)
+		if err != nil {
+			return err
+		}
+		rows, err := q.db.Query(ctx, queryText, sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endMS).UTC())
+		src, err = mapToSeriesFields(exs, aggFrom, fields, rows, err)
+		return err
+	}()
+	err_ := readErr
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -943,8 +984,11 @@ order by ts`, fromTbl), sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endM
 		return nil
 	}
 	fromTfMSecs := int64(utils2.TFToSecs(aggFrom) * 1000)
-	offMS := GetAlignOff(sid, tfMSecs)
-	aggBars, lastFinish := utils.BuildOHLCV(src, tfMSecs, 0, nil, fromTfMSecs, offMS)
+	offMS := seriesAlignOff(exs, tfMSecs)
+	aggBars, lastFinish, err := ResampleDataSeries(exs, item.TimeFrame, src, nil, tfMSecs, 0, fromTfMSecs, offMS, false)
+	if err != nil {
+		return errs.New(core.ErrInvalidBars, err)
+	}
 	if !lastFinish && len(aggBars) > 0 {
 		aggBars = aggBars[:len(aggBars)-1]
 	}
@@ -954,10 +998,10 @@ order by ts`, fromTbl), sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endM
 	// Keep only complete bars within [aggStart, endMS).
 	cut := aggBars[:0]
 	for _, b := range aggBars {
-		if b.Time < aggStart {
+		if b.TimeMS < aggStart {
 			continue
 		}
-		if b.Time+tfMSecs > endMS {
+		if b.TimeMS+tfMSecs > endMS {
 			break
 		}
 		cut = append(cut, b)
@@ -966,18 +1010,35 @@ order by ts`, fromTbl), sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endM
 	if len(aggBars) == 0 {
 		return nil
 	}
-	_, err := q.InsertKLines(item.TimeFrame, sid, aggBars)
-	if err != nil {
-		return err
+	values, normalizeErr := normalizeOHLCVSeries(aggBars, sid)
+	if normalizeErr != nil {
+		return normalizeErr
+	}
+	targetTbl := "kline_" + item.TimeFrame
+	unlock, lockErr := acquireQuestTableReadLock(ctx, targetTbl)
+	if lockErr != nil {
+		return NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
+	if err := ensureQuestKlineExtraColumns(ctx, q, targetTbl, sourceColumns); err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	if _, insertErr := q.insertOHLCVRowsLocked(item.TimeFrame, values); insertErr != nil {
+		return insertErr
 	}
 	// Use actual inserted bar range for srange update
 	// 使用实际插入的bar范围更新srange
-	saveStart := aggBars[0].Time
-	saveEnd := aggBars[len(aggBars)-1].Time + tfMSecs
+	saveStart := aggBars[0].TimeMS
+	saveEnd := aggBars[len(aggBars)-1].TimeMS + tfMSecs
+	if err := waitForQuestKlineTimestampVisible(ctx, q, sid, item.TimeFrame, aggBars[len(aggBars)-1].TimeMS); err != nil {
+		return err
+	}
 	// Update the effective range of intervals
 	// 更新有效区间范围
-	err = q.updateKLineRange(sid, item.TimeFrame, saveStart, saveEnd)
-	if err != nil {
+	if rangeErr := q.updateKLineRange(sid, item.TimeFrame, saveStart, saveEnd); rangeErr != nil {
+		return rangeErr
+	}
+	if err := waitForQuestKlineCoverageVisible(ctx, q, sid, item.TimeFrame, saveStart, saveEnd); err != nil {
 		return err
 	}
 	return nil
@@ -1063,10 +1124,22 @@ func (q *Queries) DelKLines(timeFrame string, delSids map[int32]bool) *errs.Erro
 	if !ok {
 		return errs.NewMsg(core.ErrInvalidTF, "unsupported tf for rewrite: %s", timeFrame)
 	}
+	unlock, acquired, lockErr := acquireQuestTableWriteLock(ctx, tblName)
+	if lockErr != nil {
+		return NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	if !acquired {
+		return errs.NewMsg(core.ErrRunTime, "kline table %s is in use by another process", tblName)
+	}
+	defer unlock()
+	sourceTxn, err_ := waitForCompactWalApplied(ctx, q.db, tblName)
+	if err_ != nil {
+		return NewDbErr(core.ErrDbReadFail, err_)
+	}
 
 	// 1. 一次扫描同时获取所有 sid 及其行数，避免两次全表扫描。
 	//    不依赖 sranges，避免 WAL 延迟导致刚删除的 sid 仍被查到。
-	sidRows, err_ := q.db.Query(ctx, fmt.Sprintf("SELECT sid, count(*) FROM %s GROUP BY sid", tblName))
+	sidRows, err_ := q.db.Query(ctx, fmt.Sprintf("SELECT %s, count(*) FROM %s GROUP BY %s", quoteIdent("sid"), quoteIdent(tblName), quoteIdent("sid")))
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -1091,6 +1164,9 @@ func (q *Queries) DelKLines(timeFrame string, delSids map[int32]bool) *errs.Erro
 	if err_ = sidRows.Err(); err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
+	if err_ = verifyQuestRewriteSourceStable(ctx, q, tblName, sourceTxn); err_ != nil {
+		return NewDbErr(core.ErrDbReadFail, err_)
+	}
 
 	if totalCount == 0 {
 		return nil
@@ -1100,24 +1176,31 @@ func (q *Queries) DelKLines(timeFrame string, delSids map[int32]bool) *errs.Erro
 	if len(validSids) == 0 {
 		log.Info("DelKLines: no valid sids, truncating table",
 			zap.String("tf", timeFrame), zap.Int64("total", totalCount))
-		tmpTbl := tblName + "_new"
-		createSQL := fmt.Sprintf(`create table %s as (
-select sid,ts,open,high,low,close,volume,quote,buy_volume,trade_num
-from %s where 1=0
-) timestamp(ts) partition by %s dedup upsert keys(sid, ts)`, tmpTbl, tblName, partBy)
+		tmpTbl := compactTempTableName(tblName)
+		backupTbl := compactBackupTableName(tblName)
+		expected, snapshotErr := captureQuestRewriteTableSnapshot(ctx, q, tblName, "sid", "1=0")
+		if snapshotErr != nil {
+			return NewDbErr(core.ErrDbReadFail, snapshotErr)
+		}
+		if err_ := verifyQuestRewriteSourceStable(ctx, q, tblName, sourceTxn); err_ != nil {
+			return NewDbErr(core.ErrDbReadFail, err_)
+		}
+		createSQL, buildErr := buildQuestKlineRewriteSQLChecked(tmpTbl, tblName, "1=0", partBy, expected.Columns)
+		if buildErr != nil {
+			return NewDbErr(core.ErrDbReadFail, buildErr)
+		}
 		if _, err_ = q.db.Exec(ctx, createSQL); err_ != nil {
-			return NewDbErr(core.ErrDbExecFail, err_)
+			return NewDbErr(core.ErrDbExecFail, cleanupQuestRewriteFailure(ctx, q.db, tmpTbl, fmt.Errorf("create kline rewrite table: %w", err_)))
 		}
-		if verifyErr := verifyQuestRewriteSnapshot(ctx, q, tmpTbl, nil); verifyErr != nil {
-			_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
-			return verifyErr
+		if _, err_ = waitCompactVisibleCount(ctx, q.db, tmpTbl, questRewriteSnapshotRowCount(expected.Counts)); err_ != nil {
+			return NewDbErr(core.ErrDbReadFail, cleanupQuestRewriteFailure(ctx, q.db, tmpTbl, err_))
 		}
-		if _, err_ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tblName)); err_ != nil {
-			_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
-			return NewDbErr(core.ErrDbExecFail, err_)
+		if verifyErr := verifyQuestRewriteTableSnapshot(ctx, q, tmpTbl, "sid", "", expected); verifyErr != nil {
+			cause := fmt.Errorf("verify kline rewrite table: %s", verifyErr.Short())
+			return NewDbErr(core.ErrDbReadFail, cleanupQuestRewriteFailure(ctx, q.db, tmpTbl, cause))
 		}
-		if _, err_ = q.db.Exec(ctx, fmt.Sprintf("rename table %s to %s", tmpTbl, tblName)); err_ != nil {
-			return NewDbErr(core.ErrDbExecFail, err_)
+		if replaceErr := replaceVerifiedQuestTable(ctx, q, tblName, tmpTbl, backupTbl, "sid", "1=0", expected); replaceErr != nil {
+			return replaceErr
 		}
 		log.Info("DelKLines: table truncated", zap.String("tf", timeFrame))
 		return nil
@@ -1146,30 +1229,45 @@ from %s where 1=0
 		zap.String("deleteRatio", fmt.Sprintf("%.1f%%", deleteRatio*100)),
 		zap.Int("est_secs", int(estSecs)))
 
-	// 5. 重写表：创建新表 -> 复制保留数据 -> 删除旧表 -> 重命名
+	// 5. 重写表：创建并验证新表 -> 备份旧表 -> 激活并复验新表 -> 删除备份
 	sidIn := strings.Join(validSids, ",")
-	tmpTbl := tblName + "_new"
-	createSQL := fmt.Sprintf(`create table %s as (
-select sid,ts,open,high,low,close,volume,quote,buy_volume,trade_num
-from %s where sid in (%s)
-) timestamp(ts) partition by %s dedup upsert keys(sid, ts)`, tmpTbl, tblName, sidIn, partBy)
+	tmpTbl := compactTempTableName(tblName)
+	backupTbl := compactBackupTableName(tblName)
+	predicate := fmt.Sprintf("%s IN (%s)", quoteIdent("sid"), sidIn)
+	expected, snapshotErr := captureQuestRewriteTableSnapshot(ctx, q, tblName, "sid", predicate)
+	if snapshotErr != nil {
+		return NewDbErr(core.ErrDbReadFail, snapshotErr)
+	}
+	if !equalQuestRewriteSnapshot(expected.Counts, keepSidCounts) {
+		return errs.NewMsg(core.ErrDbReadFail, "kline rewrite source changed before CTAS: table=%s got=%v want=%v", tblName, expected.Counts, keepSidCounts)
+	}
+	if err_ := verifyQuestRewriteSourceStable(ctx, q, tblName, sourceTxn); err_ != nil {
+		return NewDbErr(core.ErrDbReadFail, err_)
+	}
+	createSQL, buildErr := buildQuestKlineRewriteSQLChecked(tmpTbl, tblName, predicate, partBy, expected.Columns)
+	if buildErr != nil {
+		return NewDbErr(core.ErrDbReadFail, buildErr)
+	}
 	if _, err_ = q.db.Exec(ctx, createSQL); err_ != nil {
-		return NewDbErr(core.ErrDbExecFail, err_)
+		return NewDbErr(core.ErrDbExecFail, cleanupQuestRewriteFailure(ctx, q.db, tmpTbl, fmt.Errorf("create kline rewrite table: %w", err_)))
 	}
-	if verifyErr := verifyQuestRewriteSnapshot(ctx, q, tmpTbl, keepSidCounts); verifyErr != nil {
-		_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
-		return verifyErr
+	if _, err_ = waitCompactVisibleCount(ctx, q.db, tmpTbl, questRewriteSnapshotRowCount(expected.Counts)); err_ != nil {
+		return NewDbErr(core.ErrDbReadFail, cleanupQuestRewriteFailure(ctx, q.db, tmpTbl, err_))
 	}
-	if _, err_ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tblName)); err_ != nil {
-		_, _ = q.db.Exec(ctx, fmt.Sprintf("drop table %s", tmpTbl))
-		return NewDbErr(core.ErrDbExecFail, err_)
+	if verifyErr := verifyQuestRewriteTableSnapshot(ctx, q, tmpTbl, "sid", "", expected); verifyErr != nil {
+		cause := fmt.Errorf("verify kline rewrite table: %s", verifyErr.Short())
+		return NewDbErr(core.ErrDbReadFail, cleanupQuestRewriteFailure(ctx, q.db, tmpTbl, cause))
 	}
-	if _, err_ = q.db.Exec(ctx, fmt.Sprintf("rename table %s to %s", tmpTbl, tblName)); err_ != nil {
-		return NewDbErr(core.ErrDbExecFail, err_)
+	if replaceErr := replaceVerifiedQuestTable(ctx, q, tblName, tmpTbl, backupTbl, "sid", predicate, expected); replaceErr != nil {
+		return replaceErr
 	}
 	log.Info("DelKLines: table rewrite done",
 		zap.String("tf", timeFrame), zap.Int64("kept", keepCount))
 	return nil
+}
+
+func buildQuestKlineRewriteSQLChecked(tmpTable, sourceTable, predicate, partitionBy string, columns []questTableColumn) (string, error) {
+	return buildQuestRewriteSQLChecked(tmpTable, sourceTable, predicate, partitionBy, "ts", columns)
 }
 
 func mapToItems[T any](rows pgx.Rows, err_ error, assign func() (T, []any)) ([]T, error) {
@@ -1510,13 +1608,20 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 		if i.StartMs > 0 && i.StopMs > 0 {
 			start, end := i.StartMs, i.StopMs
 			if IsQuestDB {
-				start, end = q.GetKlineRange(i.Sid, i.Timeframe)
-				if start == 0 || end == 0 {
-					var waitErr *errs.Error
-					start, end, waitErr = waitForQuestKlineRangeVisible(ctx, q, i.Sid, i.Timeframe)
-					if waitErr != nil {
+				var waitErr *errs.Error
+				start, end, waitErr = waitForQuestKlineRangeVisible(ctx, q, i.Sid, i.Timeframe, start, end)
+				if waitErr != nil {
+					if waitErr.Code != core.ErrTimeout {
 						return waitErr
 					}
+					// QuestDB WAL visibility can lag without indicating a
+					// database failure. Keep the pending marker and let the
+					// next recovery pass retry it.
+					log.Warn("pending insert rows still not visible; keep job for next recovery",
+						zap.Int32("sid", i.Sid), zap.String("tf", i.Timeframe),
+						zap.Int64("job_start", i.StartMs), zap.Int64("job_stop", i.StopMs),
+						zap.Error(waitErr))
+					continue
 				}
 			}
 			if start > 0 && end > start {
@@ -1577,283 +1682,48 @@ func GetKlineAggs() []*KlineAgg {
 }
 
 /*
-CalcAdjFactors
-Calculate and update all weighting factors
-计算更新所有复权因子
+CalcAdjFactors calculates adjustment factors through an adapter-owned
+capability. The released banexg version has no such capability, so callers
+must provide the calculation explicitly until their adapter supplies it.
 */
-func CalcAdjFactors(args *config.CmdArgs) *errs.Error {
+type AdjFactorCalculator func(*config.CmdArgs) *errs.Error
+
+type adjFactorCapability interface {
+	CalcAdjFactors(*config.CmdArgs) *errs.Error
+}
+
+func CalcAdjFactors(args *config.CmdArgs, calculators ...AdjFactorCalculator) *errs.Error {
+	if args == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "command args are required")
+	}
 	if args.OutPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--out is required")
 	}
-	exInfo := exg.Default.Info()
-	if exInfo.ID == "china" {
-		return calcChinaAdjFactors(args)
-	} else {
-		return errs.NewMsg(errs.CodeParamInvalid, "exchange %s dont support adjust factors", exInfo.ID)
+	if len(calculators) > 1 {
+		return errs.NewMsg(errs.CodeParamInvalid, "only one adjustment-factor calculator is allowed")
 	}
-}
-
-func calcChinaAdjFactors(args *config.CmdArgs) *errs.Error {
-	exchange := exg.Default
-	_, err := LoadMarkets(exchange, false)
-	if err != nil {
-		return err
-	}
-	err = InitListDates()
-	if err != nil {
-		return err
-	}
-	sess, conn, err := Conn(nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-	err = calcCnFutureFactors(sess, args)
-	if err != nil {
-		return err
-	}
-	// 对于股票计算复权因子?
-	log.Info("calc china adj_factors complete")
-	return nil
-}
-
-func calcCnFutureFactors(sess *Queries, args *config.CmdArgs) *errs.Error {
-	err_ := utils.EnsureDir(args.OutPath, 0755)
-	if err_ != nil {
-		return errs.New(errs.CodeIOWriteFail, err_)
-	}
-	items := GetExSymbols("china", banexg.MarketLinear)
-	exsList := utils.ValsOfMap(items)
-	sort.Slice(exsList, func(i, j int) bool {
-		return exsList[i].Symbol < exsList[j].Symbol
-	})
-	var allows = make(map[string]bool)
-	for _, key := range args.Pairs {
-		parts := utils2.SplitParts(key)
-		allows[parts[0].Val] = true
-	}
-	var err *errs.Error
-	// Save the daily trading volume of each contract for the current variety, used to find the main contract
-	// 保存当前品种日线各个合约的成交量，用于寻找主力合约
-	dateSidVols := make(map[int64]map[int32]*banexg.Kline)
-	lastCode := ""
-	var lastExs *ExSymbol
-	// For all futures targets, obtain daily K in order and record it by time
-	// 对所有期货标的，按顺序获取日K，并按时间记录
-	var pBar = utils.NewPrgBar(len(exsList), "future")
-	defer pBar.Close()
-	dayMSecs := int64(utils2.TFToSecs("1d") * 1000)
-	for _, exs := range exsList {
-		pBar.Add(1)
-		parts := utils2.SplitParts(exs.Symbol)
-		if len(parts) > 1 && parts[1].Type == utils2.StrInt {
-			p1Str := parts[1].Val
-			p1num, _ := strconv.Atoi(p1Str[len(p1Str)-2:])
-			if p1num == 0 || p1num > 12 {
-				// 跳过000, 888, 999这些特殊后缀
-				continue
-			}
+	if len(calculators) == 1 {
+		if calculators[0] == nil {
+			return errs.NewMsg(errs.CodeParamInvalid, "adjustment-factor calculator is nil")
 		}
-		if _, ok := allows[parts[0].Val]; len(allows) > 0 && !ok {
-			// 跳过未选中的
-			continue
-		}
-		if lastCode != parts[0].Val {
-			err = saveAdjFactors(dateSidVols, lastCode, lastExs, args.OutPath)
-			if err != nil {
-				return err
-			}
-			dateSidVols = make(map[int64]map[int32]*banexg.Kline)
-			lastCode = parts[0].Val
-			lastExs = exs
-		}
-		bars, err := sess.QueryOHLCV(exs, "1d", 0, 0, 0, false)
-		if err != nil {
-			return err
-		}
-		for _, bar := range bars {
-			barTime := utils2.AlignTfMSecs(bar.Time, dayMSecs)
-			vols, _ := dateSidVols[barTime]
-			if vols == nil {
-				vols = make(map[int32]*banexg.Kline)
-				dateSidVols[barTime] = vols
-			}
-			vols[exs.ID] = bar
+		return calculators[0](args)
+	}
+	if exg.Default == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "exchange is required")
+	}
+	if capability, ok := exg.Default.(adjFactorCapability); ok && capability != nil {
+		return capability.CalcAdjFactors(args)
+	}
+	if wrapper, ok := exg.Default.(*exg.BotExchange); ok && wrapper != nil && wrapper.BanExchange != nil {
+		if capability, ok := wrapper.BanExchange.(adjFactorCapability); ok && capability != nil {
+			return capability.CalcAdjFactors(args)
 		}
 	}
-	return saveAdjFactors(dateSidVols, lastCode, lastExs, args.OutPath)
-}
-
-func saveAdjFactors(data map[int64]map[int32]*banexg.Kline, pCode string, pExs *ExSymbol, outDir string) *errs.Error {
-	if pCode == "" {
-		return nil
+	exchangeID := "unknown"
+	if info := exg.Default.Info(); info != nil && info.ID != "" {
+		exchangeID = info.ID
 	}
-	exs := &ExSymbol{
-		Exchange: pExs.Exchange,
-		Market:   pExs.Market,
-		ExgReal:  pExs.ExgReal,
-		Symbol:   pCode + "888", // 期货888结尾表示主力连续合约
-		Combined: true,
-	}
-	err := EnsureSymbols([]*ExSymbol{exs})
-	if err != nil {
-		return err
-	}
-	// Delete the old main continuous contract compounding factor
-	// 删除旧的主力连续合约复权因子
-	ctx := context.Background()
-	sess, conn, err2 := Conn(ctx)
-	if err2 != nil {
-		return err2
-	}
-	defer conn.Release()
-	err_ := sess.DelAdjFactors(ctx, exs.ID)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbExecFail, err_)
-	}
-	dates := utils.KeysOfMap(data)
-	sort.Slice(dates, func(i, j int) bool {
-		return dates[i] < dates[j]
-	})
-	// Daily search for the contract ID with the highest trading volume and calculate the compounding factor
-	// 逐日寻找成交量最大的合约ID，并计算复权因子
-	var adds []AddAdjFactorsParams
-	var row *AddAdjFactorsParams
-	// Choose the one with the largest position on the first day of listing
-	// 上市首日选持仓量最大的
-	vols, _ := data[dates[0]]
-	vol, hold := findMaxVols(vols)
-	adds = append(adds, AddAdjFactorsParams{
-		Sid:     exs.ID,
-		StartMs: dates[0],
-		SubID:   hold.Sid,
-		Factor:  1,
-	})
-	lastSid := hold.Sid
-	var lines []string
-	dateFmt := "2006-01-02"
-	lines = writeAdjChg(lastSid, lastSid, 0, 5, data, dates, lines)
-	for i, dateMS := range dates[1:] {
-		if row != nil {
-			row.StartMs = dateMS
-			adds = append(adds, *row)
-			row = nil
-		}
-		vols, _ = data[dateMS]
-		vol, hold = findMaxVols(vols)
-		// When the trading volume and position of the main force are not at their maximum, it is necessary to give up the main force
-		// 当主力的成交量和持仓量都不为最大，需让出主力
-		if vol.Sid != lastSid && hold.Sid != lastSid && len(vols) > 1 {
-			tgt := hold
-			if exs.ExgReal == "CFFEX" {
-				tgt = vol
-			}
-			lines = writeAdjChg(lastSid, tgt.Sid, i+1, 5, data, dates, lines)
-			lastK, _ := vols[lastSid]
-			var factor float64
-			if lastK != nil {
-				factor = tgt.Price / lastK.Close
-			} else {
-				date := btime.ToDateStr(dateMS, dateFmt)
-				it := GetSymbolByID(lastSid)
-				log.Warn("last interrupted", zap.String("code", it.Symbol),
-					zap.Int32("sid", lastSid), zap.String("date", date))
-				factor = findPrevFactor(data, dates[1:], i, tgt.Sid, lastSid)
-			}
-			row = &AddAdjFactorsParams{
-				Sid:    exs.ID,
-				SubID:  tgt.Sid,
-				Factor: factor,
-			}
-			lastSid = tgt.Sid
-		}
-	}
-	outPath := filepath.Join(outDir, exs.Symbol+"_adjs.txt")
-	_ = utils2.WriteFile(outPath, []byte(strings.Join(lines, "\n")))
-	_, err_ = sess.AddAdjFactors(ctx, adds)
-	if err_ != nil {
-		return NewDbErr(core.ErrDbExecFail, err_)
-	}
-	return nil
-}
-
-func writeAdjChg(sid1, sid2 int32, hit, width int, data map[int64]map[int32]*banexg.Kline, dates []int64, lines []string) []string {
-	symbol1 := GetSymbolByID(sid1).Symbol
-	symbol2 := GetSymbolByID(sid2).Symbol
-	dateFmt := "2006-01-02"
-	lines = append(lines, symbol1+"  "+symbol2)
-	start := max(hit-width, 0)
-	stop := min(hit+width, len(dates))
-	for start < stop {
-		dateMs := dates[start]
-		dateStr := btime.ToDateStr(dateMs, dateFmt)
-		k1 := data[dateMs][sid1]
-		k2 := data[dateMs][sid2]
-		if k1 != nil || k2 != nil {
-			var p1, v1, i1, p2, v2, i2 float64
-			if k1 != nil {
-				p1, v1, i1 = k1.Close, k1.Volume, k1.BuyVolume
-			}
-			if k2 != nil {
-				p2, v2, i2 = k2.Close, k2.Volume, k2.BuyVolume
-			}
-			text := fmt.Sprintf("%v/%v\t%v/%v\t%v/%v", p1, p2, v1, v2, i1, i2)
-			line := dateStr + "   " + text
-			if start == hit {
-				line += " *"
-			}
-			lines = append(lines, line)
-		}
-		start += 1
-	}
-	lines = append(lines, "")
-	return lines
-}
-
-type PriceVol struct {
-	Sid   int32
-	Price float64
-	Vol   float64
-}
-
-/*
-Find the item with the highest trading volume and position
-查找成交量和持仓量最大的项
-*/
-func findMaxVols(vols map[int32]*banexg.Kline) (*PriceVol, *PriceVol) {
-	var vol, hold PriceVol
-	for sid, k := range vols {
-		if vol.Sid == 0 {
-			vol.Sid = sid
-			vol.Price = k.Close
-			vol.Vol = k.Volume
-			hold.Sid = sid
-			hold.Price = k.Close
-			hold.Vol = k.BuyVolume
-		} else if k.Volume > vol.Vol {
-			vol.Sid = sid
-			vol.Price = k.Close
-			vol.Vol = k.Volume
-		}
-		if k.BuyVolume > hold.Vol {
-			hold.Sid = sid
-			hold.Price = k.Close
-			hold.Vol = k.BuyVolume
-		}
-	}
-	return &vol, &hold
-}
-
-func findPrevFactor(data map[int64]map[int32]*banexg.Kline, dates []int64, i int, tgt, old int32) float64 {
-	for i > 0 {
-		i--
-		vols := data[dates[i]]
-		tgtK, _ := vols[tgt]
-		oldK, _ := vols[old]
-		if tgtK == nil || oldK == nil {
-			continue
-		}
-		return tgtK.Close / oldK.Close
-	}
-	return 1
+	return errs.NewMsg(errs.CodeNotImplement,
+		"exchange %s does not provide adjustment-factor calculation; pass an explicit calculator or use an adapter with CalcAdjFactors capability",
+		exchangeID)
 }

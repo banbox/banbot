@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/banbox/banbot/biz"
@@ -16,6 +17,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/goods"
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
@@ -23,24 +25,242 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
 )
 
-var (
-	lastNotifyDelay = int64(0)
-	lastRefreshMS   = int64(0)
-)
+func legacyScheduler(scheduler com.Scheduler) com.Scheduler {
+	if scheduler == nil {
+		return com.Cron()
+	}
+	return scheduler
+}
 
 func CronRefreshPairs(dp data.IProvider, afterRefresh ...func() error) {
+	CronRefreshPairsWithSymbolState(dp, nil, afterRefresh...)
+}
+
+// CronRefreshPairsWithSymbolState schedules pair refreshes against the
+// supplied runtime symbol state. A nil state keeps the legacy facade.
+func CronRefreshPairsWithSymbolState(dp data.IProvider, symbols *orm.SymbolState, afterRefresh ...func() error) {
+	cronRefreshPairs(legacyScheduler(nil), dp, symbols, afterRefresh...)
+}
+
+// cronRefreshPairsWithTrader keeps the runtime-owned pair refresh on the
+// trader's core, clock, exchange, and symbol state. The public wrappers above
+// intentionally retain their legacy behavior.
+func cronRefreshPairsWithTrader(scheduler com.Scheduler, trader *CryptoTrader, dp data.IProvider, afterRefresh ...func() error) {
+	if scheduler == nil || trader == nil || dp == nil {
+		return
+	}
+	lastRefreshMS := trader.currentTimeMS()
+	if config.PairMgr.Cron == "" {
+		return
+	}
+	_, err := scheduler.AddFunc(config.PairMgr.Cron, func() {
+		if !trader.runtimeActive() {
+			return
+		}
+		curMS := trader.currentTimeMS()
+		if curMS-lastRefreshMS < config.MinPairCronGapMS {
+			return
+		}
+		lastRefreshMS = curMS
+		if err := trader.refreshPairJobs(false); err != nil {
+			log.Error("RefreshPairJobs fail", zap.Error(err))
+			return
+		}
+		if len(afterRefresh) > 0 && afterRefresh[0] != nil {
+			if err := afterRefresh[0](); err != nil {
+				log.Error("RefreshPairJobs post-refresh fail", zap.Error(err))
+			}
+		}
+	})
+	if err != nil {
+		log.Error("add RefreshPairList fail", zap.Error(err))
+	}
+}
+
+// refreshPairJobsWithRuntime performs the parts of pair rotation that can be
+// composed from explicit dependencies. Strategy/order registries are still
+// compatibility globals, so callers must keep the legacy session gate around
+// this operation (the official live entry already does so).
+func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, deps *biz.RuntimeDeps,
+	clock *btime.ClockState, exchange banexg.BanExchange, showLog, isFirst bool) *errs.Error {
+	cfg := &config.Data
+	if deps != nil {
+		if deps.Config == nil || deps.Config.View() == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime config is required")
+		}
+		cfg = deps.Config.View()
+	}
+	pairMgr := cfg.PairMgr
+	if pairMgr == nil {
+		pairMgr = &config.PairMgrConfig{}
+	}
+	var state *core.State
+	if deps != nil {
+		state = deps.Core
+	}
+	if dp == nil {
+		return errs.NewMsg(core.ErrRunTime, "live provider is required")
+	}
+	if state != nil && clock == nil {
+		return errs.NewMsg(core.ErrRunTime, "runtime clock is required")
+	}
+	if state != nil && exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime exchange is required")
+	}
+	if exchange == nil {
+		exchange = exg.Default
+	}
+	curTime := btime.TimeMS()
+	envReal := core.EnvReal
+	if clock != nil {
+		curTime = clock.TimeMS()
+	}
+	if state != nil {
+		envReal = state.EnvReal
+	}
+	if isFirst {
+		if pairMgr.Cron != "" {
+			schedule, err := utils.NewCronScheduler(pairMgr.Cron)
+			if err != nil {
+				return errs.New(errs.CodeRunTime, err)
+			}
+			curTime = utils.CronAlign(schedule, btime.ToTime(curTime)).UnixMilli()
+		} else if !envReal && !stateIsLive(state) && pairMgr.UseLatest && cfg.TimeRange != nil {
+			curTime = min(curTime, cfg.TimeRange.EndMS)
+		}
+	}
+
+	// goods.RefreshPairListWithSymbolState still updates the compatibility
+	// pair facade. Keep that mutation inside the legacy operation and restore it
+	// before any runtime-owned admission check can observe it.
+	oldPairs, oldPairsMap, oldShowLog := core.Pairs, core.PairsMap, goods.ShowLog
+	defer func() {
+		core.Pairs, core.PairsMap, goods.ShowLog = oldPairs, oldPairsMap, oldShowLog
+	}()
+	goods.ShowLog = showLog
+	pairs, err := goods.RefreshPairListWithSymbolState(symbols, exchange, curTime)
+	if err != nil {
+		return err
+	}
+	allPairs := make([]string, 0, len(pairs))
+	allPairs = append(allPairs, pairs...)
+	for _, policy := range cfg.RunPolicy {
+		allPairs = append(allPairs, policy.Pairs...)
+	}
+	allPairs, _ = utils.UniqueItems(allPairs)
+	pairTfScores, err := strat.CalcPairTfScoresWithSymbolState(symbols, exchange, allPairs)
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		setRuntimePairs(state, pairs)
+	}
+	var warms strat.Warms
+	var exitOrders map[string][]*ormo.InOutOrder
+	if deps != nil {
+		var loadErr *errs.Error
+		warms, exitOrders, loadErr = strat.LoadStratJobsWithState(deps.Strategies, state, symbols, pairs, pairTfScores, deps.Orders)
+		if loadErr != nil {
+			return loadErr
+		}
+	} else {
+		warms, exitOrders, err = strat.LoadStratJobsWithRuntimeState(state, symbols, pairs, pairTfScores)
+	}
+	if err != nil {
+		return err
+	}
+	for acc, orders := range exitOrders {
+		if len(orders) == 0 {
+			continue
+		}
+		mgr := biz.GetOdMgr(acc)
+		if deps != nil {
+			mgr = biz.GetOdMgrWithState(deps.Trading, acc)
+		}
+		if mgr == nil {
+			return errs.NewMsg(core.ErrRunTime, "order manager is required for pair rotation: %s", acc)
+		}
+		if err := mgr.ExitAndFill(orders, &strat.ExitReq{Tag: core.ExitTagPairDel}); err != nil {
+			return err
+		}
+		if deps != nil {
+			strat.FinalizePairRotation(deps.Strategies)
+		} else {
+			strat.FinalizePairRotation(nil)
+		}
+		log.Info("exit old orders as pair rotation", zap.Int("num", len(orders)))
+	}
+	if showLog {
+		if deps != nil {
+			strat.PrintStratGroupsWithState(deps.Strategies, state)
+		} else {
+			strat.PrintStratGroups()
+		}
+	}
+	if isFirst {
+		biz.InitOdSubsWithRuntimeDeps(deps)
+	}
+	if symbols == nil {
+		orm.ResetSubSymbol()
+	} else {
+		symbols.ResetSubSymbol()
+	}
+	if err := dp.SubWarmPairs(warms, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func stateIsLive(state *core.State) bool {
+	if state != nil {
+		return state.LiveMode
+	}
+	return core.LiveMode
+}
+
+func setRuntimePairs(state *core.State, pairs []string) {
+	if state == nil {
+		return
+	}
+	additional := make([]string, 0)
+	for _, policy := range config.RunPolicy {
+		additional = append(additional, policy.Pairs...)
+	}
+	state.SetPairs(pairs, additional)
+}
+
+func syncRuntimeOrderMatchState(state *core.State) {
+	if state == nil {
+		return
+	}
+	core.LockOdMatch.RLock()
+	state.LockOdMatch.Lock()
+	state.OrderMatchTfs = make(map[string]bool, len(core.OrderMatchTfs))
+	for tf, enabled := range core.OrderMatchTfs {
+		state.OrderMatchTfs[tf] = enabled
+	}
+	state.LockOdMatch.Unlock()
+	core.LockOdMatch.RUnlock()
+}
+
+func cronRefreshPairs(scheduler com.Scheduler, dp data.IProvider, symbols *orm.SymbolState, afterRefresh ...func() error) {
+	if scheduler == nil {
+		return
+	}
 	if config.PairMgr.Cron != "" {
-		_, err_ := com.Cron().AddFunc(config.PairMgr.Cron, func() {
+		lastRefreshMS := btime.TimeMS()
+		_, err_ := scheduler.AddFunc(config.PairMgr.Cron, func() {
 			curMS := btime.TimeMS()
 			if curMS-lastRefreshMS < config.MinPairCronGapMS {
 				return
 			}
 			lastRefreshMS = curMS
-			err := opt.RefreshPairJobs(dp, true, false, nil)
+			err := opt.RefreshPairJobsWithSymbolState(dp, symbols, true, false, nil)
 			if err != nil {
 				log.Error("RefreshPairJobs fail", zap.Error(err))
 				return
@@ -58,9 +278,27 @@ func CronRefreshPairs(dp data.IProvider, afterRefresh ...func() error) {
 }
 
 func FetchHourKlines(dp *data.LiveProvider) {
+	FetchHourKlinesWithSymbolState(dp, nil)
+}
+
+// FetchHourKlinesWithSymbolState keeps the periodic higher-timeframe fetch
+// on the same symbol subscription state as the live provider.
+func FetchHourKlinesWithSymbolState(dp *data.LiveProvider, symbols *orm.SymbolState) {
+	fetchHourKlines(legacyScheduler(nil), dp, symbols)
+}
+
+func fetchHourKlines(scheduler com.Scheduler, dp *data.LiveProvider, symbols *orm.SymbolState) {
+	if scheduler == nil {
+		return
+	}
 	endMap := make(map[int32]int64)
-	_, err := com.Cron().AddFunc("0 0 * * * *", func() {
-		exsList := orm.GetHourOnlySymbols()
+	_, err := scheduler.AddFunc("0 0 * * * *", func() {
+		exsList := make(map[int32]*orm.ExSymbol)
+		if symbols == nil {
+			exsList = orm.GetHourOnlySymbols()
+		} else {
+			exsList = symbols.GetHourOnlySymbols()
+		}
 		if len(exsList) == 0 {
 			return
 		}
@@ -75,7 +313,7 @@ func FetchHourKlines(dp *data.LiveProvider) {
 				delete(endMap, sid)
 			}
 		}
-		data.DownEmitHourKlines(dp, endMap)
+		data.DownEmitHourKlinesWithSymbolState(dp, symbols, endMap)
 	})
 	if err != nil {
 		log.Error("add FetchHourKlines fail", zap.Error(err))
@@ -83,8 +321,15 @@ func FetchHourKlines(dp *data.LiveProvider) {
 }
 
 func CronLoadMarkets() {
+	cronLoadMarkets(legacyScheduler(nil))
+}
+
+func cronLoadMarkets(scheduler com.Scheduler) {
+	if scheduler == nil {
+		return
+	}
 	// 2小时更新一次市场行情
-	_, err := com.Cron().AddFunc("30 3 */2 * * *", func() {
+	_, err := scheduler.AddFunc("30 3 */2 * * *", func() {
 		_, _ = orm.LoadMarkets(exg.Default, true)
 	})
 	if err != nil {
@@ -93,6 +338,13 @@ func CronLoadMarkets() {
 }
 
 func CronFatalLossCheck() {
+	cronFatalLossCheck(legacyScheduler(nil))
+}
+
+func cronFatalLossCheck(scheduler com.Scheduler) {
+	if scheduler == nil {
+		return
+	}
 	checkIntvs := utils.KeysOfMap(config.FatalStop)
 	if len(checkIntvs) == 0 {
 		return
@@ -104,15 +356,28 @@ func CronFatalLossCheck() {
 	}
 	cronStr := fmt.Sprintf("35 */%v * * * *", min(5, minIntv))
 	maxIntv := slices.Max(checkIntvs)
-	_, err := com.Cron().AddFunc(cronStr, biz.MakeCheckFatalStop(maxIntv))
+	_, err := scheduler.AddFunc(cronStr, biz.MakeCheckFatalStop(maxIntv))
 	if err != nil {
 		log.Error("add CronFatalLossCheck fail", zap.Error(err))
 	}
 }
 
 func CronKlineDelays(dp *data.LiveProvider) {
+	cronKlineDelays(legacyScheduler(nil), dp, com.LegacyPairCopiedState(), btime.TimeMS)
+}
+
+// cronKlineDelays is the runtime-owned implementation. The state and clock
+// are explicit so a live Runtime never observes another Runtime's progress.
+func cronKlineDelays(scheduler com.Scheduler, dp *data.LiveProvider, copied *com.PairCopiedState, clock func() int64) {
+	if scheduler == nil || dp == nil || copied == nil {
+		return
+	}
+	if clock == nil {
+		clock = btime.TimeMS
+	}
+	lastNotifyDelay := int64(0)
 	logDelay := func(msgText string) {
-		curMS := btime.TimeMS()
+		curMS := clock()
 		log.Warn(msgText)
 		if curMS-lastNotifyDelay > 600000 {
 			// Delay reminders are sent every 10 minutes
@@ -125,13 +390,13 @@ func CronKlineDelays(dp *data.LiveProvider) {
 		}
 	}
 	stuckCount := 0
-	_, err_ := com.Cron().AddFunc("30 * * * * *", func() {
+	_, err_ := scheduler.AddFunc("30 * * * * *", func() {
 		jobs := dp.GetJobs("ohlcv")
 		if len(jobs) == 0 {
 			return
 		}
-		curMS := btime.TimeMS()
-		delaySecs := int((curMS - core.LastCopiedMs) / 1000)
+		curMS := clock()
+		delaySecs := int((curMS - copied.LastCopiedMs()) / 1000)
 		if delaySecs > 120 {
 			// It should be received every minute, alert if haven't been received for more than 2 minutes
 			// 应该每分钟都能收到，超过2分钟未收到爬虫推送报警
@@ -168,8 +433,8 @@ func CronKlineDelays(dp *data.LiveProvider) {
 		}
 		stuckCount = 0
 		var fails = make(map[string][]string)
-		copied := com.GetPairCopieds()
-		for pair, wait := range copied {
+		pairWaits := copied.GetPairCopieds()
+		for pair, wait := range pairWaits {
 			if wait[0]+wait[1]*2 > curMS {
 				continue
 			}
@@ -188,7 +453,14 @@ func CronKlineDelays(dp *data.LiveProvider) {
 }
 
 func CronKlineSummary() {
-	_, err_ := com.Cron().AddFunc("30 1-59/10 * * * *", func() {
+	cronKlineSummary(legacyScheduler(nil))
+}
+
+func cronKlineSummary(scheduler com.Scheduler) {
+	if scheduler == nil {
+		return
+	}
+	_, err_ := scheduler.AddFunc("30 1-59/10 * * * *", func() {
 		core.TfPairHitsLock.Lock()
 		var pairGroups = make(map[string][]string)
 		for tf, tfMap := range core.TfPairHits {
@@ -215,7 +487,14 @@ func CronKlineSummary() {
 }
 
 func CronDumpStratOutputs() {
-	_, err_ := com.Cron().AddFunc("31 * * * * *", func() {
+	cronDumpStratOutputs(legacyScheduler(nil))
+}
+
+func cronDumpStratOutputs(scheduler com.Scheduler) {
+	if scheduler == nil {
+		return
+	}
+	_, err_ := scheduler.AddFunc("31 * * * * *", func() {
 		groups := make(map[string][]string)
 		for _, items := range strat.PairStrats {
 			for _, stgy := range items {
@@ -253,20 +532,52 @@ func CronDumpStratOutputs() {
 }
 
 func CronCheckTriggerOds() {
+	cronCheckTriggerOds(legacyScheduler(nil))
+}
+
+func cronCheckTriggerOds(scheduler com.Scheduler) {
+	if scheduler == nil {
+		return
+	}
 	// Check every minute 15 seconds to see if the limit order submission is triggered
 	// 在每分钟的15s检查是否触发限价单提交
-	_, err_ := com.Cron().AddFunc("15,45 * * * * *", biz.VerifyTriggerOds)
+	_, err_ := scheduler.AddFunc("15,45 * * * * *", biz.VerifyTriggerOds)
 	if err_ != nil {
 		log.Error("add VerifyTriggerOds fail", zap.Error(err_))
 	}
 }
 
 func CronBacktestInLive() {
+	cronBacktestInLive(legacyScheduler(nil))
+}
+
+var backtestToCompareWithRuntime = opt.BacktestToCompareWithRuntime
+
+func cronBacktestInLive(scheduler com.Scheduler) {
+	if scheduler == nil {
+		return
+	}
 	if config.BTInLive != nil && config.BTInLive.Cron != "" {
-		_, err := com.Cron().AddFunc(config.BTInLive.Cron, opt.BacktestToCompare)
+		_, err := scheduler.AddFunc(config.BTInLive.Cron, opt.BacktestToCompare)
 		if err != nil {
 			log.Error("add CronBacktestInLive fail", zap.Error(err))
 		}
+	}
+}
+
+func cronBacktestInLiveWithRuntime(scheduler com.Scheduler, deps biz.RuntimeDeps) {
+	if scheduler == nil || deps.Config == nil {
+		return
+	}
+	cfg := deps.Config.View()
+	if cfg == nil || cfg.BTInLive == nil || cfg.BTInLive.Cron == "" {
+		return
+	}
+	_, err := scheduler.AddFunc(cfg.BTInLive.Cron, func() {
+		backtestToCompareWithRuntime(deps)
+	})
+	if err != nil {
+		log.Error("add runtime CronBacktestInLive fail", zap.Error(err))
 	}
 }
 
@@ -289,9 +600,134 @@ func StartLoopBalancePositions() {
 	}()
 }
 
+// StartLoopBalancePositionsWithRuntime ties the polling worker to an
+// explicit runtime. The zero-argument wrapper above retains legacy globals.
+type balanceRuntimeDeps struct {
+	exchange banexg.BanExchange
+	core     *core.State
+	config   *config.Config
+	accounts map[string]*config.AccountConfig
+	orders   *ormo.OrderState
+	trading  *biz.TradingState
+	interval time.Duration
+}
+
+func bindBalanceRuntimeDeps(deps biz.RuntimeDeps) *balanceRuntimeDeps {
+	bound := &balanceRuntimeDeps{
+		exchange: deps.Exchange,
+		core:     deps.Core,
+		orders:   deps.Orders,
+		trading:  deps.Trading,
+		interval: time.Minute,
+	}
+	if bound.orders == nil {
+		bound.orders = ormo.NewOrderState()
+	}
+	if bound.trading == nil {
+		bound.trading = biz.NewTradingState()
+	}
+	if deps.Config != nil {
+		bound.config = deps.Config.View()
+	}
+	if bound.config != nil {
+		bound.accounts = bound.config.Accounts
+		if bound.config.AccountPullSecs > 0 {
+			bound.interval = time.Duration(bound.config.AccountPullSecs) * time.Second
+		}
+	}
+	return bound
+}
+
+func StartLoopBalancePositionsWithRuntime(lifecycle RuntimeLifecycle, runtimeDeps ...biz.RuntimeDeps) {
+	if lifecycle == nil {
+		StartLoopBalancePositions()
+		return
+	}
+	if len(runtimeDeps) == 0 {
+		log.Error("runtime balance worker requires explicit dependencies")
+		return
+	}
+	deps := bindBalanceRuntimeDeps(runtimeDeps[0])
+	ctx := lifecycle.Context()
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+	for account, cfg := range deps.accounts {
+		if cfg == nil || cfg.NoTrade {
+			continue
+		}
+		updateAccBalanceWithRuntime(deps, account)
+	}
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
+	stop := make(chan struct{})
+	ticker := time.NewTicker(deps.interval)
+	var wait sync.WaitGroup
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				updateBalancePosWithRuntime(deps)
+			case <-done:
+				return
+			case <-stop:
+				return
+			}
+		}
+	}()
+	var stopOnce sync.Once
+	lifecycle.OnClose(func() {
+		ticker.Stop()
+		stopOnce.Do(func() { close(stop) })
+	})
+	lifecycle.OnCloseWait(wait.Wait)
+}
+
+func updateBalancePosWithRuntime(deps *balanceRuntimeDeps) {
+	if deps == nil {
+		return
+	}
+	for account, cfg := range deps.accounts {
+		if cfg == nil || cfg.NoTrade {
+			continue
+		}
+		if deps.orders == nil || deps.trading == nil {
+			continue
+		}
+		odList, lock := deps.orders.GetOpenODs(account)
+		lock.Lock()
+		odNum := len(odList)
+		lock.Unlock()
+		if odNum == 0 {
+			continue
+		}
+		if deps.core != nil && (deps.core.Market == banexg.MarketLinear || deps.core.Market == banexg.MarketInverse) {
+			// 定期同步仓位检查不匹配订单，现货不支持
+			odMgr := biz.GetLiveOdMgrWithState(deps.trading, account)
+			if odMgr == nil {
+				continue
+			}
+			_, err := odMgr.SyncLocalOrders()
+			if err != nil {
+				log.Error("SyncLocalOrders fail", zap.String("acc", account), zap.Error(err))
+			}
+		}
+		updateAccBalanceWithRuntime(deps, account)
+	}
+}
+
 func updateBalancePos() {
 	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
+		if cfg == nil || cfg.NoTrade {
 			continue
 		}
 		odList, lock := ormo.GetOpenODs(account)
@@ -302,7 +738,6 @@ func updateBalancePos() {
 			continue
 		}
 		if core.Market == banexg.MarketLinear || core.Market == banexg.MarketInverse {
-			// 定期同步仓位检查不匹配订单，现货不支持
 			odMgr := biz.GetLiveOdMgr(account)
 			_, err := odMgr.SyncLocalOrders()
 			if err != nil {
@@ -314,18 +749,34 @@ func updateBalancePos() {
 }
 
 func updateAccBalance(account string) {
-	wallet := biz.GetWallets(account)
-	rsp, err := exg.Default.FetchBalance(map[string]interface{}{
+	updateAccBalanceWithRuntime(&balanceRuntimeDeps{exchange: exg.Default}, account)
+}
+
+func updateAccBalanceWithRuntime(deps *balanceRuntimeDeps, account string) {
+	if deps == nil || deps.exchange == nil {
+		log.Error("UpdateBalance requires a runtime exchange", zap.String("acc", account))
+		return
+	}
+	if deps.trading == nil {
+		log.Error("UpdateBalance requires runtime trading state", zap.String("acc", account))
+		return
+	}
+	wallet := deps.trading.Wallet(account)
+	rsp, err := deps.exchange.FetchBalance(map[string]interface{}{
 		banexg.ParamAccount: account,
 	})
 	if err != nil {
 		log.Error("UpdateBalance fail", zap.String("acc", account), zap.Error(err))
 	} else {
-		biz.UpdateWalletByBalances(wallet, rsp)
+		biz.UpdateWalletByBalancesWithRuntime(wallet, rsp)
 	}
 }
 
 func sendOrderMsg(od *ormo.InOutOrder, isEnter bool) {
+	sendOrderMsgWithOrderState(od, isEnter, nil)
+}
+
+func sendOrderMsgWithOrderState(od *ormo.InOutOrder, isEnter bool, orderState *ormo.OrderState) {
 	msgType := rpc.MsgTypeExit
 	subOd := od.Exit
 	action := "Close Long"
@@ -345,6 +796,9 @@ func sendOrderMsg(od *ormo.InOutOrder, isEnter bool) {
 	}
 	filled, price := subOd.Filled, subOd.Average
 	account := ormo.GetTaskAcc(od.TaskID)
+	if orderState != nil {
+		account = orderState.GetTaskAcc(od.TaskID)
+	}
 	if account == "" {
 		log.Info("skip send rpc msg, unknown account", zap.Int64("task_id", od.TaskID), zap.String("key", od.Key()),
 			zap.Int64("status", subOd.Status), zap.Float64("filled", filled))

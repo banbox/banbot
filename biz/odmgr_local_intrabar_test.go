@@ -70,6 +70,49 @@ func TestLegacyIntrabarFlagDoesNotAffectNonBacktestSimulation(t *testing.T) {
 	}
 }
 
+func TestLocalOrderMgrIntrabarHelpersUseRuntimeMode(t *testing.T) {
+	bar := &orm.SeriesOHLCV{Time: 1000, Open: 100, High: 110, Low: 90, Close: 105, Volume: 10}
+
+	for _, test := range []struct {
+		name             string
+		backtest, legacy bool
+		wantLegacy       bool
+	}{
+		{name: "runtime legacy", backtest: true, legacy: true, wantLegacy: true},
+		{name: "runtime current", backtest: true, legacy: false},
+		{name: "runtime live", backtest: false, legacy: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &core.State{BackTestMode: test.backtest}
+			runtimeConfig := config.NewSnapshot(&config.Config{
+				BTLegacyIntrabar: test.legacy,
+				Accounts:         map[string]*config.AccountConfig{config.DefAcc: {}},
+			})
+			mgr := &LocalOrderMgr{OrderMgr: OrderMgr{runtimeDeps: true, runtimeCore: state}}
+			mgr.runtimeCfg = makeRuntimeOrderConfig(RuntimeDeps{
+				Core:   state,
+				Config: runtimeConfig,
+			}, config.DefAcc)
+
+			wantPrice := simMarketPriceWithLegacy(bar, 0.1, test.wantLegacy)
+			if got := mgr.simMarketPrice(bar, 0.1); got != wantPrice {
+				t.Fatalf("simMarketPrice = %.12f, want %.12f", got, wantPrice)
+			}
+			wantRate := simMarketRateWithLegacy(bar, 95, true, true, 0, test.wantLegacy)
+			if got := mgr.simMarketRate(bar, 95, true, true, 0); got != wantRate {
+				t.Fatalf("simMarketRate = %.12f, want %.12f", got, wantRate)
+			}
+
+			gotBar := mgr.cutSeriesFromRate(bar, 60_000, 0.1)
+			wantBar := cutSeriesFromRateWithLegacy(bar, 60_000, 0.1, test.wantLegacy)
+			if gotBar.Open != wantBar.Open || gotBar.High != wantBar.High || gotBar.Low != wantBar.Low ||
+				gotBar.Time != wantBar.Time || gotBar.Volume != wantBar.Volume {
+				t.Fatalf("cutSeriesFromRate = %#v, want %#v", gotBar, wantBar)
+			}
+		})
+	}
+}
+
 func TestStopEntryTriggerPreservesModeSemantics(t *testing.T) {
 	enableStrictHistoricalIntrabarTest(t)
 

@@ -17,6 +17,7 @@ import (
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/web/base"
 	"github.com/banbox/banexg/errs"
@@ -27,6 +28,12 @@ import (
 )
 
 func Run(args []string) error {
+	return legacygate.With(func() error {
+		return run(args)
+	})
+}
+
+func run(args []string) error {
 	if args == nil {
 		args = os.Args[1:]
 	}

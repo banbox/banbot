@@ -2,27 +2,22 @@ package orm
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
 func TestGetExSymbol2UsesThreeFieldIdentity(t *testing.T) {
-	oldKey := keySymbolMap
-	oldID := idSymbolMap
-	keySymbolMap = map[string]*ExSymbol{}
-	idSymbolMap = map[int32]*ExSymbol{}
-	t.Cleanup(func() {
-		keySymbolMap = oldKey
-		idSymbolMap = oldID
-	})
+	oldState := swapDefaultSymbolState(NewSymbolState())
+	t.Cleanup(func() { swapDefaultSymbolState(oldState) })
 
 	item := &ExSymbol{ID: 101, Exchange: "macro", Market: "macro", Symbol: "CPI_US", ExgReal: "fred"}
 	cacheExSymbol(item)
 
-	if got := GetExSymbol2("macro", "macro", "CPI_US"); got != item {
+	if got := GetExSymbol2("macro", "macro", "CPI_US"); got == nil || got == item || got.ID != item.ID {
 		t.Fatalf("expected 3-field lookup to return cached symbol, got %+v", got)
 	}
-	if got := GetExSymbol2("macro", "macro", "CPI_US", "wind"); got != item {
+	if got := GetExSymbol2("macro", "macro", "CPI_US", "wind"); got == nil || got == item || got.ID != item.ID {
 		t.Fatalf("expected exg_real to be ignored for identity lookup, got %+v", got)
 	}
 }
@@ -78,5 +73,20 @@ func TestEnsureExSymbolMatchesEnsureSymbolsIdentity(t *testing.T) {
 	cached := GetExSymbol2(exchange, "macro", "PMI_CN", "ignored")
 	if cached == nil || cached.ID != ensured.ID {
 		t.Fatalf("expected canonical cache lookup to return the shared sid, got %+v", cached)
+	}
+}
+
+func TestCanonicalDatabaseIdentityNormalizesLoopbackHosts(t *testing.T) {
+	dataDir := t.TempDir()
+	urls := []string{
+		"postgresql://user:pass@localhost:8812/qdb",
+		"postgresql://user:pass@127.0.0.1:8812/qdb",
+		"postgresql://user:pass@[::1]:8812/qdb",
+	}
+	want := "database:<loopback>:8812/qdb|qdbdata:" + absoluteStoragePath(filepath.Join(dataDir, "qdbdata"))
+	for _, rawURL := range urls {
+		if got := CanonicalDatabaseIdentity(rawURL, dataDir); got != want {
+			t.Fatalf("CanonicalDatabaseIdentity(%q) = %q, want %q", rawURL, got, want)
+		}
 	}
 }

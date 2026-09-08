@@ -2,8 +2,11 @@ package orm
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/banbox/banexg/errs"
 )
@@ -236,6 +239,47 @@ type seriesRepoOnly struct {
 	SeriesRepo
 }
 
+type contextRecordingSeriesRepo struct {
+	*stubStoreRepo
+	contexts []context.Context
+}
+
+func (r *contextRecordingSeriesRepo) InsertSeriesBatch(ctx context.Context, info *SeriesInfo, rows []*DataRecord) *errs.Error {
+	r.contexts = append(r.contexts, ctx)
+	return r.stubStoreRepo.InsertSeriesBatch(ctx, info, rows)
+}
+
+func (r *contextRecordingSeriesRepo) UpdateSeriesCoverage(ctx context.Context, info *SeriesInfo, sid int32, startMS, endMS int64, rows []*DataRecord) *errs.Error {
+	r.contexts = append(r.contexts, ctx)
+	return r.stubStoreRepo.UpdateSeriesCoverage(ctx, info, sid, startMS, endMS, rows)
+}
+
+func TestSeriesStorePassesContextThroughUnchanged(t *testing.T) {
+	oldQuest := IsQuestDB
+	IsQuestDB = true
+	t.Cleanup(func() { IsQuestDB = oldQuest })
+
+	repo := &contextRecordingSeriesRepo{stubStoreRepo: &stubStoreRepo{}}
+	store := NewSeriesStore(repo)
+	info := testSeriesInfo("context_passthrough")
+	target := &ExSymbol{ID: 3, Exchange: "custom", Market: "metric", Symbol: "latency"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := store.WriteBatch(ctx, info, target, []*DataRecord{{TimeMS: 10, EndMS: 20, Values: map[string]any{"value": nil}}})
+	if err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+	if len(repo.contexts) != 2 {
+		t.Fatalf("repository context calls = %d, want 2", len(repo.contexts))
+	}
+	for i, got := range repo.contexts {
+		if got != ctx {
+			t.Fatalf("repository context %d was wrapped or replaced", i)
+		}
+	}
+}
+
 func TestSeriesStoreMissingRejectsRepoWithoutRangeSupport(t *testing.T) {
 	store := NewSeriesStore(seriesRepoOnly{SeriesRepo: &stubStoreRepo{}})
 	info := testSeriesInfo("macro")
@@ -262,6 +306,72 @@ func TestNormalizeDataRecordsRejectsSidMismatch(t *testing.T) {
 	_, err := NormalizeDataRecords(1, []*DataRecord{{Sid: 2, TimeMS: 0, EndMS: 1}})
 	if err == nil || !strings.Contains(err.Short(), "does not match") {
 		t.Fatalf("expected sid mismatch error, got %v", err)
+	}
+}
+
+func TestSeriesDynamicFieldsAreNullable(t *testing.T) {
+	oldQuest := IsQuestDB
+	IsQuestDB = false
+	t.Cleanup(func() { IsQuestDB = oldQuest })
+
+	fields := []SeriesField{
+		{Name: "float_value", Type: "float"},
+		{Name: "int_value", Type: "int"},
+		{Name: "text_value", Type: "string"},
+		{Name: "bool_value", Type: "bool"},
+		{Name: "json_value", Type: "json"},
+	}
+	info := NewSeriesInfo("nullable", "1m", fields)
+	ddl := buildSeriesTableDDL(info)
+	for _, field := range fields {
+		if strings.Contains(ddl, quoteIdent(field.Name)+" "+seriesSQLType(field.Type)+" NOT NULL") {
+			t.Fatalf("dynamic field must be nullable: %s", ddl)
+		}
+	}
+
+	var args []any
+	db := &visibilityDBStub{exec: func(_ string, got ...interface{}) (pgconn.CommandTag, error) {
+		args = append([]any(nil), got...)
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	}}
+	row := &DataRecord{Sid: 7, TimeMS: 100, EndMS: 200, Values: map[string]any{"float_value": nil}}
+	if err := (&dbSeriesRepo{}).insertSeriesBatch(context.Background(), New(db), info, []*DataRecord{row}); err != nil {
+		t.Fatalf("insert nullable series row: %v", err)
+	}
+	for i, got := range args[3:] {
+		if got != nil {
+			t.Fatalf("dynamic arg %d = %#v, want SQL NULL", i, got)
+		}
+	}
+}
+
+func TestScanSeriesRecordPreservesNullFieldsAndTypes(t *testing.T) {
+	fields := []SeriesField{
+		{Name: "float_value", Type: "float"},
+		{Name: "int_value", Type: "int"},
+		{Name: "text_value", Type: "string"},
+		{Name: "bool_value", Type: "bool"},
+		{Name: "json_value", Type: "json"},
+	}
+	rec, err := scanSeriesRecord(rowScannerFunc(func(dest ...any) error {
+		*dest[0].(*int32) = 7
+		*dest[1].(*int64) = 100
+		*dest[2].(*int64) = 200
+		*dest[3].(*sql.NullFloat64) = sql.NullFloat64{Float64: 1.25, Valid: true}
+		*dest[4].(*sql.NullInt64) = sql.NullInt64{Int64: 4, Valid: true}
+		*dest[5].(*sql.NullString) = sql.NullString{}
+		*dest[6].(*sql.NullBool) = sql.NullBool{Bool: true, Valid: true}
+		*dest[7].(*sql.NullString) = sql.NullString{String: `{"ok":true}`, Valid: true}
+		return nil
+	}), fields)
+	if err != nil {
+		t.Fatalf("scan nullable series row: %v", err)
+	}
+	if rec.Values["float_value"] != 1.25 || rec.Values["int_value"] != int64(4) || rec.Values["bool_value"] != true || rec.Values["json_value"] != `{"ok":true}` {
+		t.Fatalf("scanned field types changed: %+v", rec.Values)
+	}
+	if got, ok := rec.Values["text_value"]; !ok || got != nil {
+		t.Fatalf("SQL NULL mapping = (%#v, %v), want present nil", got, ok)
 	}
 }
 

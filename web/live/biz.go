@@ -2,7 +2,6 @@ package live
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -14,8 +13,6 @@ import (
 
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/opt"
-	"github.com/banbox/banexg/binance"
-
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
@@ -1011,22 +1008,8 @@ func postStartDownTrade(c *fiber.Ctx) error {
 	if err_ != nil {
 		return err_
 	}
-	if exg.Default.Info().ID != "binance" {
-		return errors.New("exchange not support")
-	}
-	method := binance.MethodFapiPrivateGetOrderAsyn
-	if data.Source == "income" {
-		method = binance.MethodFapiPrivateGetIncomeAsyn
-	} else if data.Source == "trade" {
-		method = binance.MethodFapiPrivateGetTradeAsyn
-	}
 	return wrapAccount(c, func(acc string) error {
-		rsp, err := exg.Default.Call(method, map[string]interface{}{
-			banexg.ParamAccount: acc,
-			"startTime":         startMS,
-			"endTime":           endMS,
-			"timestamp":         btime.UTCStamp(),
-		})
+		rsp, err := exg.StartAccountDownload(exg.Default, data.Source, acc, startMS, endMS, btime.UTCStamp())
 		if err != nil {
 			return err
 		}
@@ -1043,21 +1026,8 @@ func getDownTrade(c *fiber.Ctx) error {
 	if err_ := base.VerifyArg(c, data, base.ArgQuery); err_ != nil {
 		return err_
 	}
-	if exg.Default.Info().ID != "binance" {
-		return errors.New("exchange not support")
-	}
-	method := binance.MethodFapiPrivateGetOrderAsynId
-	if data.Source == "income" {
-		method = binance.MethodFapiPrivateGetIncomeAsynId
-	} else if data.Source == "trade" {
-		method = binance.MethodFapiPrivateGetTradeAsynId
-	}
 	return wrapAccount(c, func(acc string) error {
-		rsp, err := exg.Default.Call(method, map[string]interface{}{
-			banexg.ParamAccount: acc,
-			"downloadId":        data.ID,
-			"timestamp":         btime.UTCStamp(),
-		})
+		rsp, err := exg.GetAccountDownload(exg.Default, data.Source, acc, data.ID, btime.UTCStamp())
 		if err != nil {
 			return err
 		}

@@ -1,9 +1,23 @@
 package strat
 
 import (
+	"sync/atomic"
+
+	"github.com/banbox/banbot/orm"
 	ta "github.com/banbox/banta"
 	"github.com/sasha-s/go-deadlock"
 )
+
+type wsSubJobSnapshot map[string]map[string][]*StratJob
+
+// WsSubJobRegistry is an instance-owned, immutable websocket subscription
+// view. Refresh copies the compatible global registry; callbacks only load the
+// published snapshot and never lock or copy maps.
+type WsSubJobRegistry struct {
+	state    *State
+	symbols  *orm.SymbolState
+	snapshot atomic.Pointer[wsSubJobSnapshot]
+}
 
 /*
 下面变量中所有的stratName都是RunPolicy.ID()，不是原始策略名。后面添加了":l"或":s"后缀表示仅开多或仅开空
@@ -19,9 +33,6 @@ var (
 	ForbidJobs  = make(map[string]map[string]bool)                 // pair_tf: [stratID] occupy
 	WsSubJobs   = make(map[string]map[string]map[*StratJob]bool)   // msgType: pair: job
 
-	BatchTasks  = map[string]*BatchMap{} // tf_account_strat: pair: task 每个bar周期更新（只适用于单交易所单市场）
-	LastBatchMS = int64(0)               // timeMS The timestamp of the last batch execution is only used for backtesting 上次批量执行的时间戳，仅用于回测
-
 	lockJobs     deadlock.RWMutex
 	lockInfoJobs deadlock.Mutex
 	lockTmpEnv   deadlock.Mutex
@@ -34,6 +45,137 @@ var (
 
 	WsSubUnWatch func(map[string][]string)
 )
+
+var legacyWsSubJobRegistry WsSubJobRegistry
+
+// NewWsSubJobRegistry creates a websocket subscription view for one runtime.
+// A nil symbol state keeps the legacy unfiltered registry behavior.
+func NewWsSubJobRegistry(symbols *orm.SymbolState) *WsSubJobRegistry {
+	return NewWsSubJobRegistryWithState(nil, symbols)
+}
+
+// NewWsSubJobRegistryWithState creates a websocket subscription view backed by
+// one strategy state. The state pointer is captured once at construction, so
+// event dispatch remains a typed atomic snapshot load with no dynamic lookup.
+func NewWsSubJobRegistryWithState(state *State, symbols *orm.SymbolState) *WsSubJobRegistry {
+	registry := &WsSubJobRegistry{state: state, symbols: symbols}
+	registry.Refresh()
+	return registry
+}
+
+// LegacyWsSubJobRegistry returns the package-compatible subscription view for
+// callers that do not bind an explicit symbol state.
+func LegacyWsSubJobRegistry() *WsSubJobRegistry {
+	return &legacyWsSubJobRegistry
+}
+
+// Refresh publishes the current compatible global websocket subscriptions.
+func (r *WsSubJobRegistry) Refresh() {
+	if r == nil {
+		return
+	}
+	jobs := WsSubJobs
+	if r.state != nil {
+		r.state.ensureMaps()
+		jobs = r.state.WsSubJobs
+	}
+	lockJobs.RLock()
+	snapshot := make(wsSubJobSnapshot, len(jobs))
+	for msgType, pairMap := range jobs {
+		pairs := make(map[string][]*StratJob, len(pairMap))
+		for pair, jobMap := range pairMap {
+			jobs := make([]*StratJob, 0, len(jobMap))
+			for job := range jobMap {
+				if job == nil || r.symbols != nil && job.symbols != r.symbols {
+					continue
+				}
+				jobs = append(jobs, job)
+			}
+			if len(jobs) > 0 {
+				pairs[pair] = jobs
+			}
+		}
+		if len(pairs) > 0 {
+			snapshot[msgType] = pairs
+		}
+	}
+	lockJobs.RUnlock()
+	r.snapshot.Store(&snapshot)
+}
+
+func init() {
+	legacyWsSubJobRegistry.Refresh()
+}
+
+// ForEach runs fn against the immutable websocket subscription view.
+func (r *WsSubJobRegistry) ForEach(msgType, pair string, fn func(*StratJob)) {
+	if fn == nil {
+		return
+	}
+	if r == nil {
+		return
+	}
+	snapshot := r.snapshot.Load()
+	if snapshot == nil {
+		return
+	}
+	for _, job := range (*snapshot)[msgType][pair] {
+		fn(job)
+	}
+}
+
+// Pairs returns the currently subscribed pairs for one websocket message type.
+func (r *WsSubJobRegistry) Pairs(msgType string) []string {
+	if r == nil {
+		return nil
+	}
+	snapshot := r.snapshot.Load()
+	if snapshot == nil {
+		return nil
+	}
+	pairMap := (*snapshot)[msgType]
+	pairs := make([]string, 0, len(pairMap))
+	for pair := range pairMap {
+		pairs = append(pairs, pair)
+	}
+	return pairs
+}
+
+// Types returns the websocket message types with registered pairs.
+func (r *WsSubJobRegistry) Types() []string {
+	if r == nil {
+		return nil
+	}
+	snapshot := r.snapshot.Load()
+	if snapshot == nil {
+		return nil
+	}
+	types := make([]string, 0, len(*snapshot))
+	for msgType := range *snapshot {
+		types = append(types, msgType)
+	}
+	return types
+}
+
+// RefreshWsSubJobsSnapshot publishes the legacy unfiltered websocket view.
+func RefreshWsSubJobsSnapshot() {
+	legacyWsSubJobRegistry.Refresh()
+}
+
+// ForEachWsSubJob runs fn against the legacy immutable websocket view.
+func ForEachWsSubJob(msgType, pair string, fn func(*StratJob)) {
+	legacyWsSubJobRegistry.ForEach(msgType, pair, fn)
+}
+
+// WsSubJobPairs returns pairs from the legacy immutable websocket view.
+func WsSubJobPairs(msgType string) []string {
+	return legacyWsSubJobRegistry.Pairs(msgType)
+}
+
+// WsSubJobTypes returns message types from the legacy immutable websocket view.
+func WsSubJobTypes() []string {
+	return legacyWsSubJobRegistry.Types()
+}
 
 var (
 	FailOpenCostTooLess    = "CostTooLess"

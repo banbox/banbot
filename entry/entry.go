@@ -16,13 +16,35 @@ import (
 	"github.com/banbox/banbot/live"
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
 )
 
+func runLegacyRunnerSession(run func(*runtime.Process) *errs.Error) *errs.Error {
+	process := runtime.NewProcess()
+	// These entrypoints still install process-wide facades. Serialize their full
+	// lifecycle; explicit runtimes inside the session do not make it concurrent.
+	return runLegacyEntrySession(func() *errs.Error { return run(process) })
+}
+
+func runBackTestEntry(args *config.CmdArgs, session opt.LegacySession) *errs.Error {
+	return runBackTestSession(runtime.NewProcess(), args, session)
+}
+
+func runLegacyEntrySession(run func() *errs.Error) *errs.Error {
+	return opt.WithLegacySession(func(opt.LegacySession) *errs.Error { return run() })
+}
+
 func RunBackTest(args *config.CmdArgs) *errs.Error {
+	return opt.WithLegacySession(func(session opt.LegacySession) *errs.Error {
+		return runBackTestSession(runtime.NewProcess(), args, session)
+	})
+}
+
+func runBackTestSession(process *runtime.Process, args *config.CmdArgs, session opt.LegacySession) *errs.Error {
 	core.SetRunMode(core.RunModeBackTest)
 	err := biz.SetupComsExg(args)
 	if err != nil {
@@ -44,7 +66,7 @@ func RunBackTest(args *config.CmdArgs) *errs.Error {
 			if err != nil {
 				return err
 			}
-			outDir, err := runBackTest(fmt.Sprintf("%s%d", args.OutPath, i+1), "")
+			outDir, err := runBackTest(process, fmt.Sprintf("%s%d", args.OutPath, i+1), "", session)
 			if err != nil {
 				return err
 			}
@@ -54,16 +76,28 @@ func RunBackTest(args *config.CmdArgs) *errs.Error {
 			}
 		}
 	} else {
-		_, err = runBackTest(args.OutPath, args.PrgOut)
+		_, err = runBackTest(process, args.OutPath, args.PrgOut, session)
 		return err
 	}
 	return nil
 }
 
-func runBackTest(outDir string, prgOut string) (string, *errs.Error) {
+func runBackTest(process *runtime.Process, outDir string, prgOut string, session opt.LegacySession) (string, *errs.Error) {
 	core.BotRunning = true
 	biz.ResetVars()
-	b, err := opt.NewBackTest(false, outDir)
+	startAt := int64(0)
+	if config.TimeRange != nil {
+		startAt = config.TimeRange.StartMS
+	}
+	rt, err := newEntryRuntime(process, core.RunModeBackTest, startAt)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		rt.Close()
+		rt.Join()
+	}()
+	b, err := opt.NewBackTestWithRuntimeDataDeps(session, runtimeRunnerDeps(rt), rt.Symbols, false, outDir, runtimeRunnerDataDeps(rt))
 	if err != nil {
 		return "", err
 	}
@@ -93,6 +127,16 @@ func RunTrade(args *config.CmdArgs) *errs.Error {
 }
 
 func RunTradeWith(args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *errs.Error {
+	return runLegacyRunnerSession(func(process *runtime.Process) *errs.Error {
+		return runTradeSession(process, args, startup)
+	})
+}
+
+func runTradeEntry(args *config.CmdArgs) *errs.Error {
+	return runTradeSession(runtime.NewProcess(), args, nil)
+}
+
+func runTradeSession(process *runtime.Process, args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *errs.Error {
 	core.SetRunMode(core.RunModeLive)
 	err := biz.SetupComsExg(args)
 	if err != nil {
@@ -108,11 +152,86 @@ func RunTradeWith(args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *e
 	}
 	core.BotRunning = true
 	core.StartAt = btime.UTCStamp()
-	t := live.NewCryptoTraderWith(startup)
+	rt, err := newEntryRuntime(process, core.RunModeLive, core.StartAt)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		rt.Close()
+		rt.Join()
+	}()
+	t := live.NewCryptoTraderWithRuntimeDataDeps(rt, runtimeRunnerDeps(rt), rt.Symbols, startup, runtimeRunnerDataDeps(rt))
 	return t.Run()
 }
 
+func runtimeRunnerDeps(rt *runtime.Runtime) biz.RuntimeDeps {
+	return biz.RuntimeDeps{
+		Core:           rt.Core,
+		Clock:          rt.Clock,
+		Market:         rt.Market,
+		Batch:          rt.Batch,
+		Strategies:     rt.Strategies,
+		Orders:         rt.Orders,
+		Trading:        rt.Trading,
+		Config:         rt.Config,
+		Symbols:        rt.Symbols,
+		Exchange:       rt.Exchange,
+		Scheduler:      rt.Scheduler(),
+		DefaultAccount: config.DefAcc,
+	}
+}
+
+func runtimeRunnerDataDeps(rt *runtime.Runtime) *data.RuntimeDeps {
+	return &data.RuntimeDeps{
+		Core:         rt.Core,
+		Clock:        rt.Clock,
+		Config:       rt.Config,
+		Market:       rt.Market,
+		Symbols:      rt.Symbols,
+		Strategies:   rt.Strategies,
+		Callbacks:    rt,
+		Exchange:     rt.Exchange,
+		ExchangeName: rt.Core.ExgName,
+		MarketType:   rt.Core.Market,
+	}
+}
+
+func newEntryRuntime(process *runtime.Process, mode string, startAt int64) (*runtime.Runtime, *errs.Error) {
+	rt, err := process.NewRuntime(runtime.Options{
+		Context:      core.Ctx,
+		Config:       &config.Data,
+		DataDir:      config.GetDataDirSafe(),
+		StrategyDir:  config.GetStratDir(),
+		Mode:         mode,
+		Env:          core.RunEnv,
+		StartAt:      startAt,
+		Exchange:     exg.Default,
+		ExchangeName: core.ExgName,
+		Market:       core.Market,
+		ContractType: core.ContractType,
+		Pairs:        config.Pairs,
+	})
+	if err != nil {
+		return nil, errs.New(errs.CodeRunTime, err)
+	}
+	// SetupComsExg initializes the legacy catalog before the runtime is built.
+	// Seed only the current exchange/market; subsequent provider lookups stay on
+	// the runtime state and do not expose other identities to event processing.
+	for _, item := range orm.GetExSymbols(core.ExgName, core.Market) {
+		if cacheErr := rt.Symbols.CacheExSymbolChecked(item); cacheErr != nil {
+			rt.Close()
+			rt.Join()
+			return nil, errs.New(errs.CodeRunTime, cacheErr)
+		}
+	}
+	return rt, nil
+}
+
 func RunDownData(args *config.CmdArgs) *errs.Error {
+	return runLegacyEntrySession(func() *errs.Error { return runDownData(args) })
+}
+
+func runDownData(args *config.CmdArgs) *errs.Error {
 	core.SetRunMode(core.RunModeData)
 	err := biz.SetupComsExg(args)
 	if err != nil {
@@ -146,6 +265,10 @@ func RunDownData(args *config.CmdArgs) *errs.Error {
 }
 
 func RunRepairKlineRanges(args *config.CmdArgs) *errs.Error {
+	return runLegacyEntrySession(func() *errs.Error { return runRepairKlineRanges(args) })
+}
+
+func runRepairKlineRanges(args *config.CmdArgs) *errs.Error {
 	core.SetRunMode(core.RunModeData)
 	err := biz.SetupComsExg(args)
 	if err != nil {
@@ -183,6 +306,10 @@ func runPurgeData(args *config.CmdArgs) *errs.Error {
 }
 
 func RunKlineCorrect(args *config.CmdArgs) *errs.Error {
+	return runLegacyEntrySession(func() *errs.Error { return runKlineCorrect(args) })
+}
+
+func runKlineCorrect(args *config.CmdArgs) *errs.Error {
 	err := biz.SetupComs(args)
 	if err != nil {
 		return err
@@ -191,6 +318,10 @@ func RunKlineCorrect(args *config.CmdArgs) *errs.Error {
 }
 
 func RunKlineAdjFactors(args *config.CmdArgs) *errs.Error {
+	return runLegacyEntrySession(func() *errs.Error { return runKlineAdjFactors(args) })
+}
+
+func runKlineAdjFactors(args *config.CmdArgs) *errs.Error {
 	err := biz.SetupComs(args)
 	if err != nil {
 		return err
@@ -199,6 +330,10 @@ func RunKlineAdjFactors(args *config.CmdArgs) *errs.Error {
 }
 
 func RunVerifyData(args *config.CmdArgs) *errs.Error {
+	return runLegacyEntrySession(func() *errs.Error { return runVerifyData(args) })
+}
+
+func runVerifyData(args *config.CmdArgs) *errs.Error {
 	err := biz.SetupComs(args)
 	if err != nil {
 		return err
@@ -219,7 +354,15 @@ func RunSpider(args *config.CmdArgs) *errs.Error {
 	return RunSpiderWith(args, nil)
 }
 
+func runSpider(args *config.CmdArgs) *errs.Error {
+	return runSpiderWith(args, nil)
+}
+
 func RunSpiderWith(args *config.CmdArgs, startup data.SpiderStartupFunc) *errs.Error {
+	return runLegacyEntrySession(func() *errs.Error { return runSpiderWith(args, startup) })
+}
+
+func runSpiderWith(args *config.CmdArgs, startup data.SpiderStartupFunc) *errs.Error {
 	core.SetRunMode(core.RunModeLive)
 	args.AutoCompact = true
 	if args.Logfile == "" {
@@ -229,10 +372,14 @@ func RunSpiderWith(args *config.CmdArgs, startup data.SpiderStartupFunc) *errs.E
 	if err != nil {
 		return err
 	}
-	return data.RunSpiderWith(config.SpiderAddr, startup)
+	return data.RunSpiderWithSession(config.SpiderAddr, startup)
 }
 
 func LoadKLinesToDB(args *config.CmdArgs) *errs.Error {
+	return runLegacyEntrySession(func() *errs.Error { return loadKLinesToDB(args) })
+}
+
+func loadKLinesToDB(args *config.CmdArgs) *errs.Error {
 	err := biz.SetupComsExg(args)
 	if err != nil {
 		return err
@@ -261,6 +408,10 @@ func LoadKLinesToDB(args *config.CmdArgs) *errs.Error {
 }
 
 func AggKlineBigs(args *config.CmdArgs) *errs.Error {
+	return runLegacyEntrySession(func() *errs.Error { return aggKlineBigs(args) })
+}
+
+func aggKlineBigs(args *config.CmdArgs) *errs.Error {
 	err := biz.SetupComsExg(args)
 	if err != nil {
 		return err
@@ -269,6 +420,7 @@ func AggKlineBigs(args *config.CmdArgs) *errs.Error {
 }
 
 func runInit(args *config.CmdArgs) *errs.Error {
+	args.Init()
 	errs.PrintErr = utils.PrintErr
 	dataDir := config.GetDataDir()
 	fmt.Printf("BanDataDir=%s\n", dataDir)

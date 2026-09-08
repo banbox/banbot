@@ -5,12 +5,12 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
@@ -26,43 +26,91 @@ type LocalOrderMgr struct {
 	showLog      bool
 	zeroAmts     map[string]int
 	stopBacktest func()
+	simMu        sync.Mutex
 }
 
 type FnOdCb = func(od *ormo.InOutOrder, isEnter bool)
 
 func InitLocalOrderMgr(callBack FnOdCb, showLog bool, stops ...func()) {
+	InitLocalOrderMgrWithPriceState(callBack, showLog, nil, nil, stops...)
+}
+
+// InitLocalOrderMgrWithPriceState binds order matching to a Runtime-owned
+// price and clock state. A nil price state keeps the legacy facade behavior.
+func InitLocalOrderMgrWithPriceState(callBack FnOdCb, showLog bool, prices *com.PriceState, clock *btime.ClockState, stops ...func()) {
+	initLocalOrderMgr(nil, callBack, showLog, prices, clock, stops...)
+}
+
+// InitLocalOrderMgrWithRuntimeDeps binds order matching and wallet symbol
+// accounting to one explicit Runtime. The legacy initializer remains the
+// compatibility path for callers that still use package state.
+func InitLocalOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack FnOdCb, showLog bool, stops ...func()) {
+	initLocalOrderMgr(&deps, callBack, showLog, nil, nil, stops...)
+}
+
+func initLocalOrderMgr(deps *RuntimeDeps, callBack FnOdCb, showLog bool, prices *com.PriceState, clock *btime.ClockState, stops ...func()) {
 	stopBacktest := core.StopAll
+	if deps != nil && deps.Trading == nil {
+		// Keep direct explicit-runtime construction isolated even when the
+		// caller did not pre-allocate the account registry.
+		deps.Trading = NewTradingState()
+	}
+	if deps != nil && deps.Core != nil {
+		stopBacktest = deps.Core.StopAll
+	}
 	if len(stops) > 0 {
 		stopBacktest = stops[0]
 	}
-	for account := range executionAccountNames() {
-		cfg := config.Accounts[account]
-		if cfg.NoTrade {
+	managers := accOdMgrs
+	if deps != nil && deps.Trading != nil {
+		managers = deps.Trading.OrderManagers
+	}
+	accounts := executionAccountConfigs(deps)
+	for account, cfg := range accounts {
+		if cfg == nil || cfg.NoTrade {
 			continue
 		}
-		_, ok := accOdMgrs[account]
+		_, ok := managers[account]
 		if !ok {
 			odMgr := &LocalOrderMgr{
 				OrderMgr: OrderMgr{
 					callBack: callBack,
+					prices:   prices,
+					clock:    clock,
 					Account:  account,
 				},
 				showLog:      showLog,
 				zeroAmts:     make(map[string]int),
 				stopBacktest: stopBacktest,
 			}
+			if deps != nil {
+				odMgr.bindRuntimeDeps(*deps)
+			}
 			odMgr.afterEnter = makeLocalAfterEnter(odMgr)
-			accOdMgrs[account] = odMgr
+			managers[account] = odMgr
+		} else if odMgr, ok := managers[account].(*LocalOrderMgr); ok {
+			if deps != nil {
+				odMgr.bindRuntimeDeps(*deps)
+			} else {
+				odMgr.prices = prices
+				odMgr.clock = clock
+			}
+			odMgr.callBack = callBack
+			odMgr.stopBacktest = stopBacktest
 		}
 	}
 }
 
 func (o *LocalOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
+	if o.isBacktest() {
+		o.simMu.Lock()
+		defer o.simMu.Unlock()
+	}
 	return o.OrderMgr.ProcessOrders(job)
 }
 
 func (o *LocalOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
-	if len(allOpens) == 0 || core.EnvReal || core.LiveMode {
+	if len(allOpens) == 0 || o.isEnvReal() || o.isLive() {
 		return nil
 	}
 	if evt == nil {
@@ -82,7 +130,7 @@ func (o *LocalOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm
 			}
 		}
 	}
-	if len(curOrders) == 0 && !core.CheckWallets {
+	if len(curOrders) == 0 && !o.checkWallets() {
 		return nil
 	}
 	curOrders, err := o.fillPendingOrdersAll(curOrders, curMap, evt)
@@ -99,18 +147,26 @@ func (o *LocalOrderMgr) updateProfitAndWallets(allOpens, curOrders []*ormo.InOut
 	if err != nil {
 		return err
 	}
-	if core.IsContract && core.CheckWallets {
+	if o.isContract() && o.checkWallets() {
 		// Update all order margins and wallet status of this pricing currency for the contract
 		// 为合约更新此定价币的所有订单保证金和钱包情况
-		_, _, code, _ := core.SplitSymbol(evt.Symbol())
+		parts, parseErr := o.priceSymbolParts(evt.Symbol())
+		if parseErr != nil {
+			return parseErr
+		}
+		code := parts[2]
 		var orders []*ormo.InOutOrder
 		for _, od := range allOpens {
-			_, _, odSettle, _ := core.SplitSymbol(od.Symbol)
+			odParts, parseErr := o.priceSymbolParts(od.Symbol)
+			if parseErr != nil {
+				return parseErr
+			}
+			odSettle := odParts[2]
 			if odSettle == code && od.Status < ormo.InOutStatusFullExit {
 				orders = append(orders, od)
 			}
 		}
-		wallets := GetWallets(o.Account)
+		wallets := o.walletsForOrder()
 		err = wallets.UpdateOds(orders, code)
 	}
 	return err
@@ -123,8 +179,8 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 	}
 	// 在订单事件回调中可能触发新订单入场
 	checkCount := 0
-	for core.NewNumInSim > 0 {
-		openOds, lock := ormo.GetOpenODs(o.Account)
+	for o.newOrdersInSim() > 0 {
+		openOds, lock := o.openOrders()
 		var newOds []*ormo.InOutOrder
 		lock.Lock()
 		for _, od := range openOds {
@@ -147,7 +203,7 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 		if len(newOds) > 0 {
 			// openOds is a map, so its iteration order is not a historical
 			// order that frozen replay can preserve.
-			sortMapOrdersForBacktest(newOds)
+			o.sortMapOrdersForBacktest(newOds)
 			_, err = o.fillPendingOrders(newOds, evt)
 			if err != nil {
 				return orders, err
@@ -161,6 +217,43 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 		}
 	}
 	return orders, nil
+}
+
+func (o *LocalOrderMgr) newOrdersInSim() int {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			return o.runtimeCore.NewNumInSim
+		}
+		return 0
+	}
+	return core.NewNumInSim
+}
+
+func (o *LocalOrderMgr) setSimOrderMatch(enabled bool) {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			o.runtimeCore.SimOrderMatch = enabled
+		}
+		return
+	}
+	core.SimOrderMatch = enabled
+}
+
+func (o *LocalOrderMgr) resetSimOrderCount() {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			o.runtimeCore.NewNumInSim = 0
+		}
+		return
+	}
+	core.NewNumInSim = 0
+}
+
+func (o *LocalOrderMgr) sortMapOrdersForBacktest(orders []*ormo.InOutOrder) {
+	if !o.isBacktest() || len(orders) < 2 {
+		return
+	}
+	sortOrdersByID(orders)
 }
 
 // sortOrdersForBacktest enforces deterministic order iteration only in backtests.
@@ -191,10 +284,10 @@ Fills orders waiting for exchange response. Cannot be used for real trading; can
 */
 func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.DataSeries) (int, *errs.Error) {
 	orders = executionOrderView(orders)
-	core.SimOrderMatch = true
-	core.NewNumInSim = 0
+	o.setSimOrderMatch(true)
+	o.resetSimOrderCount()
 	defer func() {
-		core.SimOrderMatch = false
+		o.setSimOrderMatch(false)
 	}()
 	affectNum := 0
 	bar := seriesOHLCVCompat(evt)
@@ -214,13 +307,13 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			}
 			continue
 		}
-		odType := config.OrderType
+		odType := o.orderType()
 		if exOrder.OrderType != "" {
 			odType = exOrder.OrderType
 		}
 		price := exOrder.Price
 		odTFSecs := utils.TFToSecs(matchTf)
-		fillMS := exOrder.CreateAt + int64(config.BTNetCost*1000)
+		fillMS := exOrder.CreateAt + int64(o.backtestNetCost()*1000)
 		barStartMS := utils.AlignTfMSecs(fillMS, int64(odTFSecs*1000))
 		odIsBuy := exOrder.Side == banexg.OdSideBuy
 		var minRate float64
@@ -231,7 +324,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			trigPrice := od.Stop
 			lowVal, _ := evt.LowValue()
 			highVal, _ := evt.HighValue()
-			if !stopEntryTriggered(odIsBuy, trigPrice, lowVal, highVal) {
+			if !stopEntryTriggeredWith(odIsBuy, trigPrice, lowVal, highVal, o.legacyIntrabarEnabled()) {
 				// The bar has not crossed the stop in the order direction.
 				continue
 			}
@@ -242,16 +335,16 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 				price = exOrder.Price
 			}
 			minRate = float64((exOrder.CreateAt-barStartMS)/1000) / float64(odTFSecs)
-			minRate = simMarketRate(bar, trigPrice, odIsBuy, true, minRate)
+			minRate = o.simMarketRate(bar, trigPrice, odIsBuy, true, minRate)
 			fillBarRate = minRate
 			fillMS = evt.TimeMS + int64(float64(odTFSecs)*minRate)*1000
 			isStopEnter = true
 		}
 		if evt == nil {
-			if core.BackTestMode {
-				price = com.GetLastBarPrice(od.Symbol)
+			if o.isBacktest() {
+				price = o.lastBarPrice(od.Symbol)
 			} else {
-				price = com.GetPriceSafeExp(od.Symbol, "", com.Day10MSecs)
+				price = o.priceSafeExp(od.Symbol, "", com.Day10MSecs)
 			}
 			if price < 0 {
 				continue
@@ -280,22 +373,22 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			if minRate == 0 {
 				minRate = float64((exOrder.CreateAt-barStartMS)/1000) / float64(odTFSecs)
 			}
-			fillBarRate = simMarketRate(bar, exOrder.Price, odIsBuy, false, minRate)
+			fillBarRate = o.simMarketRate(bar, exOrder.Price, odIsBuy, false, minRate)
 			fillMS = evt.TimeMS + int64(float64(odTFSecs)*fillBarRate)*1000
 		} else if !isStopEnter {
 			// 按网络延迟，模拟成交价格，和开盘价接近According to the network delay, the simulated transaction price is close to the opening price
 			fillBarRate = float64((fillMS-barStartMS)/1000) / float64(odTFSecs)
-			price = simMarketPrice(bar, fillBarRate)
+			price = o.simMarketPrice(bar, fillBarRate)
 		}
 		var err *errs.Error
 		if exOrder.Enter {
 			err = o.fillPendingEnter(od, price, fillMS)
 			if err == nil && evt != nil {
 				// 入场后可能立刻触发止损/止盈
-				if legacyIntrabarEnabled() {
+				if o.legacyIntrabarEnabled() {
 					err = o.tryFillTriggers(od, bar, matchTf, fillBarRate)
 				} else {
-					endBar := cutSeriesFromRate(bar, int64(odTFSecs*1000), fillBarRate)
+					endBar := o.cutSeriesFromRate(bar, int64(odTFSecs*1000), fillBarRate)
 					err = o.tryFillTriggers(od, endBar, matchTf, 0)
 				}
 			}
@@ -309,7 +402,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 	}
 	// Forced liquidation of limit entry orders that have not been executed within a timeout period
 	// 强制平仓超时未成交的限价入场单
-	curMS := btime.TimeMS()
+	curMS := o.priceNow()
 	for _, od := range orders {
 		if od.Status > ormo.InOutStatusInit || od.Enter.Price == 0 ||
 			!strings.Contains(od.Enter.OrderType, banexg.OdTypeLimit) {
@@ -319,7 +412,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 		}
 		stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
 		if stopAfter > 0 && stopAfter <= curMS {
-			err := od.LocalExit(stopAfter, core.ExitTagEntExp, od.InitPrice, "reach StopEnterBars", "")
+			err := o.localExit(od, stopAfter, core.ExitTagEntExp, od.InitPrice, "reach StopEnterBars", "")
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 			if err != nil {
 				log.Error("local exit for StopEnterBars fail", zap.String("key", od.Key()), zap.Error(err))
@@ -330,7 +423,11 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 }
 
 func stopEntryTriggered(isBuy bool, trigger, low, high float64) bool {
-	if legacyIntrabarEnabled() {
+	return stopEntryTriggeredWith(isBuy, trigger, low, high, legacyIntrabarEnabled())
+}
+
+func stopEntryTriggeredWith(isBuy bool, trigger, low, high float64, legacyIntrabar bool) bool {
+	if legacyIntrabar {
 		if isBuy {
 			return trigger <= high
 		}
@@ -339,19 +436,34 @@ func stopEntryTriggered(isBuy bool, trigger, low, high float64) bool {
 	return trigger >= low && trigger <= high
 }
 
+func (o *LocalOrderMgr) simMarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {
+	return simMarketPriceWithLegacy(bar, rate, o.legacyIntrabarEnabled())
+}
+
+func (o *LocalOrderMgr) simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, minRate float64) float64 {
+	return simMarketRateWithLegacy(bar, price, isBuy, isTrigger, minRate, o.legacyIntrabarEnabled())
+}
+
+func (o *LocalOrderMgr) cutSeriesFromRate(bar *orm.SeriesOHLCV, tfMSecs int64, rate float64) *orm.SeriesOHLCV {
+	return cutSeriesFromRateWithLegacy(bar, tfMSecs, rate, o.legacyIntrabarEnabled())
+}
+
 func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fillMS int64) *errs.Error {
-	wallets := GetWallets(o.Account)
+	wallets := o.walletsForOrder()
 	_, err := wallets.EnterOd(od)
 	if err != nil {
 		if err.Code == core.ErrLowFunds {
-			err = od.LocalExit(fillMS, core.ExitTagForceExit, od.InitPrice, err.Error(), "")
+			err = o.localExit(od, fillMS, core.ExitTagForceExit, od.InitPrice, err.Error(), "")
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 			o.onLowFunds()
 			return err
 		}
 		return err
 	}
-	exchange := exg.Default
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "exchange is required to fill %s", od.Symbol)
+	}
 	market, err := exchange.GetMarket(od.Symbol)
 	if err != nil {
 		return err
@@ -362,7 +474,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	}
 	exOrder := od.Enter
 	if exOrder.Amount == 0 {
-		if od.Short && !core.IsContract {
+		if od.Short && !o.isContract() {
 			// Spot short order, quantity must be given
 			// 现货空单，必须给定数量
 			return errs.NewMsg(core.ErrInvalidCost, "EnterAmount is required")
@@ -379,7 +491,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 				num, _ := o.zeroAmts[od.Symbol]
 				o.zeroAmts[od.Symbol] = num + 1
 			}
-			err = od.LocalExit(fillMS, core.ExitTagFatalErr, od.InitPrice, err.Error(), "")
+			err = o.localExit(od, fillMS, core.ExitTagFatalErr, od.InitPrice, err.Error(), "")
 			_, quote, _, _ := core.SplitSymbol(od.Symbol)
 			wallets.Cancel(od.Key(), quote, 0, true)
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
@@ -397,7 +509,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	exOrder.Filled = exOrder.Amount
 	exOrder.Average = entPrice
 	exOrder.Status = ormo.OdStatusClosed
-	err = od.UpdateFee(entPrice, true)
+	err = o.updateOrderFee(od, entPrice, true)
 	if err != nil {
 		return err
 	}
@@ -409,7 +521,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	if err != nil {
 		return err
 	}
-	if core.LiveMode {
+	if o.isLive() {
 		err = od.Save()
 		if err != nil {
 			log.Error("save order fail", zap.String("acc", o.Account),
@@ -422,7 +534,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 }
 
 func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fillMS int64) *errs.Error {
-	wallets := GetWallets(o.Account)
+	wallets := o.walletsForOrder()
 	exOrder := od.Exit
 	wallets.ExitOd(od, exOrder.Amount)
 	if exOrder.Filled == 0 {
@@ -434,7 +546,7 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 	exOrder.Price = price
 	exOrder.Filled = exOrder.Amount
 	exOrder.Average = price
-	err := od.UpdateFee(price, false)
+	err := o.updateOrderFee(od, price, false)
 	if err != nil {
 		return err
 	}
@@ -443,7 +555,7 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 	od.DirtyExit = true
 	_ = o.finishOrder(od)
 	wallets.ConfirmOdExit(od, price)
-	if core.LiveMode {
+	if o.isLive() {
 		err = od.Save()
 		if err != nil {
 			log.Error("save order fail", zap.String("acc", o.Account),
@@ -526,21 +638,21 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 	if fillPrice < 0 {
 		return nil
 	}
-	curMS := btime.TimeMS()
+	curMS := o.priceNow()
 	// The time when the simulation is triggered
 	// 模拟触发时的时间
 	var rate = float64(0) // 限价单触发不考虑网络延迟
 	odType := banexg.OdTypeMarket
 	if fillPrice > 0 {
 		odType = banexg.OdTypeLimit
-		rate += simMarketRate(bar, fillPrice, od.Short, true, afterRate)
+		rate += o.simMarketRate(bar, fillPrice, od.Short, true, afterRate)
 	} else {
 		// Stop time + network delay
 		// 触发时间+网络延迟
-		rate += simMarketRate(bar, trigPrice, od.Short, true, afterRate)
+		rate += o.simMarketRate(bar, trigPrice, od.Short, true, afterRate)
 		// Stop loss at market price and sell immediately
 		// 市价止损，立刻卖出
-		fillPrice = simMarketPrice(bar, rate)
+		fillPrice = o.simMarketPrice(bar, rate)
 	}
 	if amtRate > 0 && amtRate <= 0.99 {
 		// Partial withdrawal
@@ -562,8 +674,8 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 	}
 	cutSecs := tfSecs * (1 - rate)
 	exitAt := curMS - int64(cutSecs*1000)
-	err := od.LocalExit(exitAt, exitTag, fillPrice, "", odType)
-	wallets := GetWallets(o.Account)
+	err := o.localExit(od, exitAt, exitTag, fillPrice, "", odType)
+	wallets := o.walletsForOrder()
 	wallets.ExitOd(od, od.Exit.Amount)
 	_ = o.finishOrder(od)
 	wallets.ConfirmOdExit(od, od.Exit.Price)
@@ -579,16 +691,16 @@ func (o *LocalOrderMgr) onLowFunds() {
 	if openNum > 0 {
 		return
 	}
-	wallets := GetWallets(o.Account)
+	wallets := o.walletsForOrder()
 	value := wallets.TotalLegal(nil, false)
 	if value < core.MinStakeAmount {
 		log.Warn("wallet low funds, no open orders, stop backTest..")
 		if o.stopBacktest != nil {
 			o.stopBacktest()
-		} else if core.StopAll != nil {
-			core.StopAll()
+		} else if stopAll := o.stopAll(); stopAll != nil {
+			stopAll()
 		}
-		core.BotRunning = false
+		o.setBotRunning(false)
 	}
 }
 
@@ -606,15 +718,24 @@ func (o *LocalOrderMgr) cleanUpAt(atMS int64) *errs.Error {
 	if atMS <= 0 {
 		return errs.NewMsg(core.ErrBadConfig, "historical cleanup cutoff is invalid: %d", atMS)
 	}
-	oldMS := btime.CurTimeMS
-	oldNoEnter, hadNoEnter := core.NoEnterUntil[o.Account]
-	btime.CurTimeMS = atMS
+	oldMS := o.priceNow()
+	noEnterUntil := o.noEnterUntil()
+	oldNoEnter, hadNoEnter := noEnterUntil[o.Account]
+	if o.clock != nil {
+		o.clock.SetTimeMS(atMS)
+	} else {
+		btime.SetTimeMS(atMS)
+	}
 	defer func() {
-		btime.CurTimeMS = oldMS
-		if hadNoEnter {
-			core.NoEnterUntil[o.Account] = oldNoEnter
+		if o.clock != nil {
+			o.clock.SetTimeMS(oldMS)
 		} else {
-			delete(core.NoEnterUntil, o.Account)
+			btime.SetTimeMS(oldMS)
+		}
+		if hadNoEnter {
+			noEnterUntil[o.Account] = oldNoEnter
+		} else {
+			delete(noEnterUntil, o.Account)
 		}
 	}()
 	return o.CleanUp()
@@ -623,7 +744,17 @@ func (o *LocalOrderMgr) cleanUpAt(atMS int64) *errs.Error {
 // CloseBacktestOrdersAt closes positions that are still open at a historical
 // baseline before an extended backtest continues into its new tail.
 func CloseBacktestOrdersAt(account string, atMS int64) *errs.Error {
-	mgr, ok := GetOdMgr(account).(*LocalOrderMgr)
+	return closeBacktestOrdersAt(nil, account, atMS)
+}
+
+// CloseBacktestOrdersAtWithState closes typed-runtime positions at a
+// historical boundary without consulting the legacy order-manager registry.
+func CloseBacktestOrdersAtWithState(state *TradingState, account string, atMS int64) *errs.Error {
+	return closeBacktestOrdersAt(state, account, atMS)
+}
+
+func closeBacktestOrdersAt(state *TradingState, account string, atMS int64) *errs.Error {
+	mgr, ok := getBatchOrderManager(state, account).(*LocalOrderMgr)
 	if !ok || mgr == nil {
 		return errs.NewMsg(core.ErrRunTime, "backtest order manager is not local")
 	}
@@ -649,12 +780,13 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noE
 		}
 		backUntil := int64(0)
 		if noEnter {
-			backUntil, _ = core.NoEnterUntil[o.Account]
-			core.NoEnterUntil[o.Account] = btime.TimeMS() + 72*3600*1000
+			noEnterUntil := o.noEnterUntil()
+			backUntil, _ = noEnterUntil[o.Account]
+			noEnterUntil[o.Account] = o.priceNow() + 72*3600*1000
 		}
 		_, err = o.fillPendingOrdersAll(orders, odMap, evt)
 		if noEnter {
-			core.NoEnterUntil[o.Account] = backUntil
+			o.noEnterUntil()[o.Account] = backUntil
 		}
 		if err != nil {
 			return err
@@ -671,13 +803,13 @@ func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitRe
 			return err
 		}
 	}
-	timeMS := btime.TimeMS()
+	timeMS := o.priceNow()
 	for _, od := range orders {
 		var price float64
-		if core.BackTestMode {
-			price = com.GetLastBarPrice(od.Symbol)
+		if o.isBacktest() {
+			price = o.lastBarPrice(od.Symbol)
 		} else {
-			price = com.GetPriceExp(od.Symbol, "", com.Day10MSecs)
+			price = o.priceExp(od.Symbol, "", com.Day10MSecs)
 		}
 		if price < 0 {
 			return errs.NewMsg(core.ErrRunTime, "no historical price for %s", od.Symbol)
@@ -696,7 +828,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 		Dirt:  core.OdDirtBoth,
 		Force: true,
 	}
-	openOds, lock := ormo.GetOpenODs(o.Account)
+	openOds, lock := o.openOrders()
 	lock.Lock()
 	oldOpens := maps.Clone(openOds)
 	lock.Unlock()
@@ -709,10 +841,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 	for oid := range openOds {
 		delete(oldOpens, oid)
 	}
-	curMS := btime.UTCStamp()
-	if core.BackTestMode {
-		curMS = btime.TimeMS()
-	}
+	curMS := o.priceNow()
 	for _, od := range oldOpens {
 		if od.ExitTag != "" && od.ExitAt > curMS && od.ExitTag != core.ExitTagBotStop {
 			od.ExitTag = core.ExitTagBotStop
@@ -737,7 +866,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 			}
 		}
 		if err == nil {
-			core.NoEnterUntil[o.Account] = btime.TimeMS() + 72*3600*1000
+			o.noEnterUntil()[o.Account] = o.priceNow() + 72*3600*1000
 			_, err = o.fillPendingOrdersAll(exitOds, odMap, nil)
 		}
 	}
@@ -749,7 +878,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 	}
 	// Reset Unrealized P&L
 	// 重置未实现盈亏
-	wallets := GetWallets(o.Account)
+	wallets := o.walletsForOrder()
 	for _, item := range wallets.Items {
 		item.lock.Lock()
 		item.UnrealizedPOL = 0
@@ -799,6 +928,10 @@ func getPendingSub(od *ormo.InOutOrder) *ormo.ExOrder {
 }
 
 func simPriceByRate(bar *orm.SeriesOHLCV, rate float64) (float64, float64, float64) {
+	return simPriceByRateWithLegacy(bar, rate, legacyIntrabarEnabled())
+}
+
+func simPriceByRateWithLegacy(bar *orm.SeriesOHLCV, rate float64, legacyIntrabar bool) (float64, float64, float64) {
 	var (
 		a, b, c, pa, totalLen float64
 		aEndRate, bEndRate    float64
@@ -810,7 +943,7 @@ func simPriceByRate(bar *orm.SeriesOHLCV, rate float64) (float64, float64, float
 	lowP := bar.Low
 	closeP := bar.Close
 	preMoveFactor, closeLegFactor := 0.3, 1.3
-	if legacyIntrabarEnabled() {
+	if legacyIntrabar {
 		preMoveFactor, closeLegFactor = 0, 1
 	}
 
@@ -881,12 +1014,20 @@ func simPriceByRate(bar *orm.SeriesOHLCV, rate float64) (float64, float64, float
 }
 
 func simMarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {
-	start, _, _ := simPriceByRate(bar, rate)
+	return simMarketPriceWithLegacy(bar, rate, legacyIntrabarEnabled())
+}
+
+func simMarketPriceWithLegacy(bar *orm.SeriesOHLCV, rate float64, legacyIntrabar bool) float64 {
+	start, _, _ := simPriceByRateWithLegacy(bar, rate, legacyIntrabar)
 	return start
 }
 
 func cutSeriesFromRate(bar *orm.SeriesOHLCV, tfMSecs int64, rate float64) *orm.SeriesOHLCV {
-	start, high, low := simPriceByRate(bar, rate)
+	return cutSeriesFromRateWithLegacy(bar, tfMSecs, rate, legacyIntrabarEnabled())
+}
+
+func cutSeriesFromRateWithLegacy(bar *orm.SeriesOHLCV, tfMSecs int64, rate float64, legacyIntrabar bool) *orm.SeriesOHLCV {
+	start, high, low := simPriceByRateWithLegacy(bar, rate, legacyIntrabar)
 	return &orm.SeriesOHLCV{
 		Sid:       bar.Sid,
 		ExSymbol:  bar.ExSymbol,
@@ -909,6 +1050,10 @@ func cutSeriesFromRate(bar *orm.SeriesOHLCV, tfMSecs int64, rate float64) *orm.S
 }
 
 func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, minRate float64) float64 {
+	return simMarketRateWithLegacy(bar, price, isBuy, isTrigger, minRate, legacyIntrabarEnabled())
+}
+
+func simMarketRateWithLegacy(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, minRate float64, legacyIntrabar bool) float64 {
 	if bar == nil {
 		return minRate
 	}
@@ -935,7 +1080,6 @@ func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, m
 	highP := bar.High
 	lowP := bar.Low
 	closeP := bar.Close
-	legacyIntrabar := legacyIntrabarEnabled()
 	preMoveFactor, closeLegFactor := 0.3, 1.3
 	if legacyIntrabar {
 		preMoveFactor, closeLegFactor = 0, 1
@@ -1120,7 +1264,14 @@ func getExcPrice(od *ormo.InOutOrder, bar *orm.SeriesOHLCV, trigPrice, limit, af
 func makeLocalAfterEnter(o *LocalOrderMgr) FuncHandleIOrder {
 	return func(order *ormo.InOutOrder) *errs.Error {
 		// 伪时间增加1，避免同时多个订单下单key相同导致钱包扣除错误
-		btime.CurTimeMS += 1
+		if !o.isBacktest() {
+			return nil
+		}
+		if o.clock != nil {
+			o.clock.AdvanceMS(1)
+		} else {
+			btime.AdvanceTimeMS(1)
+		}
 		return nil
 	}
 }

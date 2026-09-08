@@ -39,7 +39,24 @@ RunBTOverOpt
 Backtesting mode based on continuous parameter tuning. Approach the real situation and avoid using future information to adjust parameters for backtesting.
 基于持续调参的回测模式。接近实盘情况，避免使用未来信息调参回测。
 */
+// RunBTOverOpt is the public compatibility entrypoint. The implementation
+// receives an active session so CLI callers and embedding callers share the
+// same legacy-state ownership rule without nested mutex acquisition.
 func RunBTOverOpt(args *config.CmdArgs) *errs.Error {
+	return WithLegacySession(func(session LegacySession) *errs.Error {
+		return RunBTOverOptWithSession(args, session)
+	})
+}
+
+// RunBTOverOptWithSession runs rolling optimization under an existing legacy
+// session. It is intended for command composition roots that already own the
+// compatibility gate.
+func RunBTOverOptWithSession(args *config.CmdArgs, session LegacySession) *errs.Error {
+	session.require()
+	return runBTOverOpt(args)
+}
+
+func runBTOverOpt(args *config.CmdArgs) *errs.Error {
 	t, err := newRollBtOpt(args)
 	if err != nil || t == nil {
 		return err
@@ -105,6 +122,19 @@ func RunBTOverOpt(args *config.CmdArgs) *errs.Error {
 }
 
 func RunRollBTPicker(args *config.CmdArgs) *errs.Error {
+	return WithLegacySession(func(session LegacySession) *errs.Error {
+		return RunRollBTPickerWithSession(args, session)
+	})
+}
+
+// RunRollBTPickerWithSession runs picker evaluation under an existing legacy
+// session owned by the command composition root.
+func RunRollBTPickerWithSession(args *config.CmdArgs, session LegacySession) *errs.Error {
+	session.require()
+	return runRollBTPicker(args)
+}
+
+func runRollBTPicker(args *config.CmdArgs) *errs.Error {
 	t, err := newRollBtOpt(args)
 	if err != nil || t == nil {
 		return err
@@ -269,6 +299,15 @@ func applyOptPolicies(olds, pols []*config.RunPolicyConfig, alpha float64) {
 }
 
 func RunOptimize(args *config.CmdArgs) *errs.Error {
+	return WithLegacySession(func(session LegacySession) *errs.Error {
+		return RunOptimizeWithSession(args, session)
+	})
+}
+
+// RunOptimizeWithSession runs optimization while the composition root owns
+// the legacy compatibility lease.
+func RunOptimizeWithSession(args *config.CmdArgs, session LegacySession) *errs.Error {
+	session.require()
 	if args.OutPath == "" {
 		log.Warn("-out is required")
 		return nil
@@ -933,6 +972,19 @@ Sorts all policy tasks in reverse score order of output.
 将所有策略任务按分数倒序排列输出。
 */
 func CollectOptLog(args *config.CmdArgs) *errs.Error {
+	return WithLegacySession(func(session LegacySession) *errs.Error {
+		return CollectOptLogWithSession(args, session)
+	})
+}
+
+// CollectOptLogWithSession runs report collection under an existing legacy
+// session owned by the command composition root.
+func CollectOptLogWithSession(args *config.CmdArgs, session LegacySession) *errs.Error {
+	session.require()
+	return collectOptLogEntry(args)
+}
+
+func collectOptLogEntry(args *config.CmdArgs) *errs.Error {
 	if args.InPath == "" {
 		log.Warn("-in is required")
 		return nil

@@ -29,7 +29,16 @@ func TestMakeNewStratGeneratesCompilableProject(t *testing.T) {
 		t.Fatal("resolve test source path")
 	}
 	banbotRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
-	goMod := "module example.com/teststrats\n\ngo 1.24.0\n\nreplace github.com/banbox/banbot => " + strconv.Quote(banbotRoot) + "\n\nrequire github.com/banbox/banbot v0.0.0\n"
+	banexgRootCmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/banbox/banexg")
+	banexgRootCmd.Dir = banbotRoot
+	banexgRootBytes, err := banexgRootCmd.Output()
+	if err != nil {
+		t.Fatalf("resolve banexg module: %v", err)
+	}
+	banexgRoot := strings.TrimSpace(string(banexgRootBytes))
+	goMod := "module example.com/teststrats\n\ngo 1.24.0\n\nreplace github.com/banbox/banbot => " + strconv.Quote(banbotRoot) +
+		"\nreplace github.com/banbox/banexg => " + strconv.Quote(banexgRoot) +
+		"\n\nrequire github.com/banbox/banbot v0.0.0\n"
 	mainGo := "package main\n\nfunc main() {}\n"
 
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte(goMod), 0o644); err != nil {

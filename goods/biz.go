@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 )
@@ -67,12 +69,22 @@ RefreshPairList
 更新core.Pairs和core.PairsMap
 */
 func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
+	return RefreshPairListWithSymbolState(nil, exg.Default, timeMS)
+}
+
+// RefreshPairListWithSymbolState keeps symbol catalog and historical lookup
+// on the supplied state. Custom filters without the optional state-aware
+// interface continue through their existing IFilter method.
+func RefreshPairListWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, timeMS int64) ([]string, *errs.Error) {
+	if exchange == nil {
+		exchange = exg.Default
+	}
 	var allowFilter = false
 	var err *errs.Error
 	pairs, _ := config.GetStaticPairs()
 	if len(pairs) > 0 {
 		if !useFrozenStaticPairs(pairs) {
-			pairVols, err := GetSymbolVols(pairs, "1h", 1, timeMS, true)
+			pairVols, err := GetSymbolVolsWithSymbolState(state, exchange, pairs, "1h", 1, timeMS, true)
 			if err != nil {
 				return nil, err
 			}
@@ -81,7 +93,11 @@ func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 		allowFilter = config.PairMgr.ForceFilters
 	} else {
 		allowFilter = true
-		pairs, err = pairProducer.GenSymbols(timeMS)
+		if producer, ok := pairProducer.(SymbolStateProducer); ok {
+			pairs, err = producer.GenSymbolsWithSymbolState(state, exchange, timeMS)
+		} else {
+			pairs, err = pairProducer.GenSymbols(timeMS)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -89,7 +105,11 @@ func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 			log.Info(fmt.Sprintf("gen symbols from %s, num: %d", pairProducer.GetName(), len(pairs)))
 		}
 	}
-	err = orm.EnsureCurSymbols(pairs)
+	if state == nil {
+		err = orm.EnsureCurSymbols(pairs)
+	} else {
+		err = orm.EnsureCurSymbolsWithSymbolState(state, exchange, pairs)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +119,11 @@ func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 				continue
 			}
 			oldNum := len(pairs)
-			pairs, err = flt.Filter(pairs, timeMS)
+			if stateFilter, ok := flt.(SymbolStateFilter); ok {
+				pairs, err = stateFilter.FilterWithSymbolState(state, exchange, pairs, timeMS)
+			} else {
+				pairs, err = flt.Filter(pairs, timeMS)
+			}
 			if err != nil {
 				return nil, err
 			}

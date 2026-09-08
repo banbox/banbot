@@ -170,3 +170,21 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- version 9
+-- Persistent exchange-symbol IDs are allocated by PostgreSQL. Sequence gaps
+-- are acceptable; logical-key uniqueness and the returned row are the
+-- correctness boundary for concurrent writers.
+CREATE SEQUENCE IF NOT EXISTS public.exsymbol_sid_seq AS integer;
+
+SELECT setval(
+    'public.exsymbol_sid_seq'::regclass,
+    COALESCE((SELECT max(id)::bigint FROM public.exsymbol), 1),
+    (SELECT count(*) > 0 FROM public.exsymbol)
+);
+
+ALTER TABLE public.exsymbol
+    ALTER COLUMN id SET DEFAULT nextval('public.exsymbol_sid_seq'::regclass);
+
+ALTER SEQUENCE public.exsymbol_sid_seq
+    OWNED BY public.exsymbol.id;

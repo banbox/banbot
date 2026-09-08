@@ -263,6 +263,27 @@ func TestResampleDataSeriesUsesAggRulesForGenericSeries(t *testing.T) {
 	}
 }
 
+func TestInferSeriesFieldsUsesFirstNonNullValue(t *testing.T) {
+	got := inferSeriesFields([]*DataSeries{
+		{Values: map[string]any{"count": nil, "all_null": nil}},
+		{Values: map[string]any{"count": int64(7)}},
+	})
+
+	if len(got) != 2 {
+		t.Fatalf("inferred fields = %+v, want count and all_null", got)
+	}
+	byName := make(map[string]string, len(got))
+	for _, field := range got {
+		byName[field.Name] = field.Type
+	}
+	if byName["count"] != "int" {
+		t.Fatalf("NULL-first field type = %q, want int", byName["count"])
+	}
+	if byName["all_null"] != "json" {
+		t.Fatalf("all-NULL field type = %q, want json fallback", byName["all_null"])
+	}
+}
+
 func testPairTFKline(symbol, tf string, ts int64) *banexg.PairTFKline {
 	return &banexg.PairTFKline{
 		Kline:     banexg.Kline{Time: ts},

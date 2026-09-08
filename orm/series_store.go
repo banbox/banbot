@@ -46,13 +46,6 @@ func (s *SeriesStore) WriteBatch(ctx context.Context, info *SeriesInfo, target *
 	if err := validateSeriesInfo(info); err != nil {
 		return err
 	}
-	if IsQuestDB {
-		binding := normalizedSeriesBinding(info.Binding)
-		tblLock := cptState.getTableLock(binding.Table)
-		tblLock.RLock()
-		defer tblLock.RUnlock()
-		ctx = withSeriesTableReadLockSkipped(ctx)
-	}
 	items, err := NormalizeDataRecords(target.ID, rows)
 	if err != nil {
 		return err
@@ -165,13 +158,6 @@ func (s *SeriesStore) UpdateCoverage(ctx context.Context, info *SeriesInfo, targ
 	}
 	if err := validateSeriesInfo(info); err != nil {
 		return err
-	}
-	if IsQuestDB {
-		binding := normalizedSeriesBinding(info.Binding)
-		tblLock := cptState.getTableLock(binding.Table)
-		tblLock.RLock()
-		defer tblLock.RUnlock()
-		ctx = withSeriesTableReadLockSkipped(ctx)
 	}
 	return s.repoOrDefault().UpdateSeriesCoverage(ctx, info, target.ID, startMS, endMS, rows)
 }

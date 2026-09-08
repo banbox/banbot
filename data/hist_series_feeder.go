@@ -16,6 +16,7 @@ type HistSeriesFeeder struct {
 	target    *orm.ExSymbol
 	callback  FnDataSeries
 	store     *orm.SeriesStore
+	deps      *RuntimeDeps
 	warmEndMS int64
 	endMS     int64
 	offsetMS  int64
@@ -32,6 +33,21 @@ type seriesLoadErrorBatch struct {
 func (b *seriesLoadErrorBatch) TimeMS() int64 { return 0 }
 
 func NewHistSeriesFeeder(repo orm.SeriesRepo, info *orm.SeriesInfo, sub *strat.DataSub, callback FnDataSeries, warmEndMS int64) (*HistSeriesFeeder, error) {
+	return newHistSeriesFeeder(nil, repo, info, sub, callback, warmEndMS)
+}
+
+// NewHistSeriesFeederWithRuntimeDeps binds reads and callback time to one
+// runtime. A nil dependency set preserves the legacy package facade.
+func NewHistSeriesFeederWithRuntimeDeps(deps *RuntimeDeps, repo orm.SeriesRepo, info *orm.SeriesInfo,
+	sub *strat.DataSub, callback FnDataSeries, warmEndMS int64) (*HistSeriesFeeder, error) {
+	if deps == nil {
+		return NewHistSeriesFeeder(repo, info, sub, callback, warmEndMS)
+	}
+	return newHistSeriesFeeder(deps, repo, info, sub, callback, warmEndMS)
+}
+
+func newHistSeriesFeeder(deps *RuntimeDeps, repo orm.SeriesRepo, info *orm.SeriesInfo, sub *strat.DataSub,
+	callback FnDataSeries, warmEndMS int64) (*HistSeriesFeeder, error) {
 	if info == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "series info is required")
 	}
@@ -44,7 +60,7 @@ func NewHistSeriesFeeder(repo orm.SeriesRepo, info *orm.SeriesInfo, sub *strat.D
 	}
 	return &HistSeriesFeeder{
 		info: projected, target: sub.ExSymbol, callback: callback,
-		store: orm.NewSeriesStore(repo), warmEndMS: warmEndMS,
+		store: orm.NewSeriesStore(repo), deps: deps, warmEndMS: warmEndMS,
 	}, nil
 }
 
@@ -107,7 +123,11 @@ func (f *HistSeriesFeeder) RunBatch(batch Batch) *errs.Error {
 	}
 	evt := item.DataSeries
 	evt.IsWarmUp = evt.EndMS <= f.warmEndMS
-	btime.CurTimeMS = evt.EndMS
+	if f.deps == nil {
+		btime.CurTimeMS = evt.EndMS
+	} else {
+		f.deps.setTimeMS(evt.EndMS)
+	}
 	if f.callback != nil {
 		f.callback(evt)
 	}
@@ -132,7 +152,11 @@ func (f *HistSeriesFeeder) CallNext() {
 	if endMS <= 0 {
 		endMS = math.MaxInt64
 	}
-	rows, err := f.store.Read(context.Background(), f.info, f.target, f.offsetMS, endMS, 20_000)
+	ctx := context.Background()
+	if f.deps != nil {
+		ctx = f.deps.context()
+	}
+	rows, err := f.store.Read(ctx, f.info, f.target, f.offsetMS, endMS, 20_000)
 	if err != nil {
 		f.loadErr = err
 		f.rowIdx = -1

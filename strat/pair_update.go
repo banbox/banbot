@@ -3,10 +3,10 @@ package strat
 import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/sasha-s/go-deadlock"
@@ -14,6 +14,9 @@ import (
 
 type PairUpdateReq struct {
 	Strat         *TradeStrat
+	StrategyState *State
+	Core          *core.State
+	Exchange      banexg.BanExchange
 	Add           []string
 	Remove        []string
 	CloseOnRemove bool
@@ -30,9 +33,24 @@ type PairUpdateResult struct {
 }
 
 type PairUpdateHooks struct {
-	SubWarmPairs func(items map[string]map[string]int, delOther bool) *errs.Error
-	ExitOrders   func(acc string, orders []*ormo.InOutOrder, req *ExitReq) *errs.Error
-	LookupSymbol func(pair string) (*orm.ExSymbol, *errs.Error)
+	SubWarmPairs  func(items map[string]map[string]int, delOther bool) *errs.Error
+	ExitOrders    func(acc string, orders []*ormo.InOutOrder, req *ExitReq) *errs.Error
+	LookupSymbol  func(pair string) (*orm.ExSymbol, *errs.Error)
+	Core          *core.State
+	StrategyState *State
+	SymbolState   *orm.SymbolState
+	Exchange      banexg.BanExchange
+}
+
+// pairRemoval keeps a disabled job routable while its outstanding orders are
+// being closed. Order callbacks can be synchronous with ExitOrders, so deleting
+// the job before that hook runs would orphan the strategy's lifecycle state.
+type pairRemoval struct {
+	account string
+	envKey  string
+	name    string
+	pair    string
+	job     *StratJob
 }
 
 type PairUpdateManager struct {
@@ -47,7 +65,11 @@ var pairUpdateMgr = &PairUpdateManager{
 func SetPairUpdateHooks(h PairUpdateHooks) {
 	pairUpdateMgr.mu.Lock()
 	if h.LookupSymbol == nil {
-		h.LookupSymbol = orm.GetExSymbolCur
+		if h.SymbolState != nil {
+			h.LookupSymbol = h.SymbolState.GetExSymbolCur
+		} else {
+			h.LookupSymbol = orm.GetExSymbolCur
+		}
 	}
 	pairUpdateMgr.hooks = h
 	pairUpdateMgr.mu.Unlock()
@@ -75,10 +97,33 @@ func (s *TradeStrat) UpdatePairs(req PairUpdateReq) (*PairUpdateResult, *errs.Er
 	return pairUpdateMgr.Apply(req)
 }
 
+func resolveStratExchange(exchange banexg.BanExchange, state *core.State, symbols *orm.SymbolState, hooks PairUpdateHooks) (banexg.BanExchange, bool) {
+	if exchange == nil {
+		exchange = hooks.Exchange
+	}
+	explicit := exchange != nil || state != nil || symbols != nil || hooks.Core != nil || hooks.SymbolState != nil
+	return exchange, explicit
+}
+
+func calcPairTfScoresForRuntime(symbols *orm.SymbolState, exchange banexg.BanExchange, explicit bool, pairs []string) (map[string]map[string]float64, *errs.Error) {
+	if !explicit {
+		return CalcPairTfScores(nil, pairs)
+	}
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required to score strategy pairs")
+	}
+	return CalcPairTfScoresWithSymbolState(symbols, exchange, pairs)
+}
+
 func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.Error) {
 	m.mu.Lock()
 	hooks := m.hooks
 	m.mu.Unlock()
+	if req.StrategyState != nil {
+		if stateHooks := req.StrategyState.PairUpdateHooks(); stateHooks.SubWarmPairs != nil {
+			hooks = stateHooks
+		}
+	}
 	if hooks.SubWarmPairs == nil {
 		return nil, errs.NewMsg(core.ErrRunTime, "PairUpdateHooks.SubWarmPairs not set")
 	}
@@ -87,6 +132,26 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	}
 	if hooks.LookupSymbol == nil {
 		hooks.LookupSymbol = orm.GetExSymbolCur
+	}
+	admissionState := req.Core
+	if admissionState == nil {
+		admissionState = hooks.Core
+	}
+	strategyState := req.StrategyState
+	if strategyState == nil {
+		strategyState = hooks.StrategyState
+	}
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
+	exchange, runtimeExplicit := resolveStratExchange(req.Exchange, admissionState, hooks.SymbolState, hooks)
+	var stgPairTfs map[string]map[string]string
+	if admissionState != nil {
+		admissionState.EnsureRuntimeMaps()
+		stgPairTfs = admissionState.StgPairTfs
+	} else {
+		stgPairTfs = core.StgPairTfs
 	}
 	res := &PairUpdateResult{ExitOrders: map[string][]*ormo.InOutOrder{}}
 	adds, err := config.ParsePairs(req.Add...)
@@ -104,16 +169,17 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			lockJobs.Unlock()
 		}
 	}()
-	curMap, ok := core.StgPairTfs[req.Strat.Name]
+	curMap, ok := stgPairTfs[req.Strat.Name]
 	if !ok {
 		curMap = map[string]string{}
-		core.StgPairTfs[req.Strat.Name] = curMap
+		stgPairTfs[req.Strat.Name] = curMap
 	}
 	allowedSet := map[string]bool{}
 	if !req.ForceAdd {
-		candidates := make([]string, 0, len(core.Pairs)+len(adds))
+		basePairs := admissionPairs(admissionState)
+		candidates := make([]string, 0, len(basePairs)+len(adds))
 		seen := map[string]bool{}
-		for _, pair := range core.Pairs {
+		for _, pair := range basePairs {
 			if !seen[pair] {
 				seen[pair] = true
 				candidates = append(candidates, pair)
@@ -127,7 +193,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		}
 		pol := *req.Strat.Policy
 		pol.Pairs = nil
-		allowedPairs, err := getPolicyPairs(&pol, candidates)
+		allowedPairs, err := getPolicyPairsWithRuntimeState(admissionState, hooks.SymbolState, exchange, &pol, candidates)
 		if err != nil {
 			return nil, err
 		}
@@ -135,6 +201,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			allowedSet[p] = true
 		}
 	}
+	removals := make([]pairRemoval, 0, len(removes))
 	pendingScores := map[string]bool{}
 	for _, pair := range adds {
 		if _, exists := curMap[pair]; exists {
@@ -152,7 +219,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	pairTfScores := map[string]map[string]float64{}
 	if len(pendingScores) > 0 {
 		pairs := utils.KeysOfMap(pendingScores)
-		scores, err := CalcPairTfScores(exg.Default, pairs)
+		scores, err := calcPairTfScoresForRuntime(hooks.SymbolState, exchange, runtimeExplicit, pairs)
 		if err != nil {
 			return nil, err
 		}
@@ -161,8 +228,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	var accLimits accStratLimits
 	if !req.ForceAdd {
 		accLimits, _ = newAccStratLimits()
-		for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
-			jobsMap := AccJobs[acc]
+		for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+			jobsMap := strategyState.AccJobs[acc]
 			for _, stgMap := range jobsMap {
 				if _, ok := stgMap[req.Strat.Name]; ok {
 					accLimits.tryAdd(acc, req.Strat.Name)
@@ -189,34 +256,37 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			continue
 		}
 		exs, _ := hooks.LookupSymbol(pair)
-		items, ok := PairStrats[pair]
+		items, ok := strategyState.PairStrats[pair]
 		if !ok {
 			items = map[string]*TradeStrat{}
-			PairStrats[pair] = items
+			strategyState.PairStrats[pair] = items
 		}
 		items[req.Strat.Name] = req.Strat
 		curMap[pair] = tf
-		if _, ok := core.PairsMap[pair]; !ok {
-			core.PairsMap[pair] = true
-			core.Pairs = append(core.Pairs, pair)
-		}
-		env := initBarEnv(exs, tf)
-		ensureStratJob(req.Strat, tf, exs, env, dirt, logWarm, accLimits)
+		enableAdmissionPair(admissionState, pair)
+		env := initBarEnvWithState(strategyState, admissionState, exs, tf)
+		ensureStratJobWithRuntimeState(strategyState, admissionState, req.Strat, tf, exs, env, dirt, logWarm, accLimits, hooks.SymbolState)
 		if len(req.Strat.WsSubs) > 0 {
 			envKey := pair + "_" + tf
-			for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
-				jobsMap := AccJobs[acc]
+			for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+				jobsMap := strategyState.AccJobs[acc]
 				if stgMap, ok := jobsMap[envKey]; ok {
 					if job := stgMap[req.Strat.Name]; job != nil {
-						if err := regWsJob(job); err != nil {
+						if err := regWsJobLockedWithState(strategyState, job); err != nil {
 							return nil, err
 						}
 					}
 				}
 			}
 		}
-		if _, ok := core.TFSecs[tf]; !ok {
-			core.TFSecs[tf] = utils2.TFToSecs(tf)
+		var tfSecs map[string]int
+		if admissionState != nil {
+			tfSecs = admissionState.TFSecs
+		} else {
+			tfSecs = core.TFSecs
+		}
+		if _, ok := tfSecs[tf]; !ok {
+			tfSecs[tf] = utils2.TFToSecs(tf)
 		}
 		res.Added = append(res.Added, pair)
 	}
@@ -227,59 +297,99 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			continue
 		}
 		envKey := pair + "_" + tf
-		for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
-			accJobs := AccJobs[acc]
+		for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+			accJobs := strategyState.AccJobs[acc]
 			if stgMap, ok := accJobs[envKey]; ok {
 				if job, ok := stgMap[req.Strat.Name]; ok {
 					if req.CloseOnRemove {
+						job.MaxOpenLong = -1
+						job.MaxOpenShort = -1
+						// Keep a disabled job routable until every outstanding order
+						// reaches a terminal state. Live order events can arrive after
+						// this method returns.
+						job.pairRemovalPending = true
 						if job.Strat.OnShutDown != nil {
 							job.Strat.OnShutDown(job)
 						}
-						unRegWsJob(job)
-						if job.EnteredNum > 0 {
+						unRegWsJobLockedWithState(strategyState, job)
+						removals = append(removals, pairRemoval{
+							account: acc,
+							envKey:  envKey,
+							name:    req.Strat.Name,
+							pair:    pair,
+							job:     job,
+						})
+						if job.EnteredNum > 0 || len(job.LongOrders) > 0 || len(job.ShortOrders) > 0 {
 							res.ExitOrders[acc] = append(res.ExitOrders[acc], job.LongOrders...)
 							res.ExitOrders[acc] = append(res.ExitOrders[acc], job.ShortOrders...)
 						}
-						delete(stgMap, req.Strat.Name)
 					} else {
 						job.MaxOpenLong = -1
 						job.MaxOpenShort = -1
 					}
-					if len(stgMap) == 0 {
-						delete(accJobs, envKey)
-					}
 				}
 			}
 		}
-		if req.CloseOnRemove {
-			delete(curMap, pair)
-			if items, ok := PairStrats[pair]; ok {
-				delete(items, req.Strat.Name)
+		if !req.CloseOnRemove {
+			res.Removed = append(res.Removed, pair)
+		}
+	}
+	lockJobs.Unlock()
+	locked = false
+	if req.CloseOnRemove {
+		if hooks.ExitOrders == nil && len(res.ExitOrders) > 0 {
+			return nil, errs.NewMsg(core.ErrRunTime, "ExitOrders hook is required to close removed pair orders")
+		}
+		for acc := range utils.MapKeys(res.ExitOrders, config.StrictBacktest()) {
+			orders := res.ExitOrders[acc]
+			if len(orders) == 0 {
+				continue
+			}
+			if err := hooks.ExitOrders(acc, orders, &ExitReq{Tag: core.ExitTagPairDel}); err != nil {
+				return nil, err
+			}
+		}
+		lockJobs.Lock()
+		locked = true
+		for _, removal := range removals {
+			accJobs := strategyState.AccJobs[removal.account]
+			if stgMap := accJobs[removal.envKey]; stgMap != nil && stgMap[removal.name] == removal.job {
+				if jobHasOutstandingOrders(removal.job) {
+					// The job remains in AccJobs as the callback route for the
+					// pending exit. FinalizePairRotation removes it after the
+					// terminal order event.
+					res.Removed = append(res.Removed, removal.pair)
+					continue
+				}
+				delete(stgMap, removal.name)
+				if len(stgMap) == 0 {
+					delete(accJobs, removal.envKey)
+				}
+			}
+			delete(curMap, removal.pair)
+			if items := strategyState.PairStrats[removal.pair]; items != nil && items[removal.name] == req.Strat {
+				delete(items, removal.name)
 				if len(items) == 0 {
-					delete(PairStrats, pair)
+					delete(strategyState.PairStrats, removal.pair)
 				}
 			}
 			used := false
-			for _, stgMap := range core.StgPairTfs {
-				if _, ok := stgMap[pair]; ok {
+			for _, stgMap := range stgPairTfs {
+				if _, ok := stgMap[removal.pair]; ok {
 					used = true
 					break
 				}
 			}
 			if !used {
-				core.PairsMap[pair] = false
+				setAdmissionPair(admissionState, removal.pair, false)
 			}
+			res.Removed = append(res.Removed, removal.pair)
 		}
-		res.Removed = append(res.Removed, pair)
 	}
-	allWarms := collectAllWarmsLocked()
-	lockJobs.Unlock()
-	locked = false
-	if req.CloseOnRemove && hooks.ExitOrders != nil {
-		for acc := range utils.MapKeys(res.ExitOrders, config.StrictBacktest()) {
-			orders := res.ExitOrders[acc]
-			_ = hooks.ExitOrders(acc, orders, &ExitReq{Tag: core.ExitTagPairDel})
-		}
+	allWarms := collectAllWarmsLockedWithState(strategyState)
+	if locked {
+		lockJobs.Unlock()
+		locked = false
 	}
 	if err := hooks.SubWarmPairs(allWarms, true); err != nil {
 		return nil, err
@@ -288,9 +398,17 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 }
 
 func collectAllWarmsLocked() Warms {
+	return collectAllWarmsLockedWithState(LegacyState())
+}
+
+func collectAllWarmsLockedWithState(strategyState *State) Warms {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
 	all := make(Warms)
-	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
-		accJobs := AccJobs[acc]
+	for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+		accJobs := strategyState.AccJobs[acc]
 		for _, stgMap := range accJobs {
 			for _, job := range stgMap {
 				pair := job.Symbol.Symbol

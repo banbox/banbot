@@ -16,6 +16,8 @@ import (
 // TradeFeeder feeds trade data from files for backtesting
 type TradeFeeder struct {
 	*orm.ExSymbol
+	deps   *RuntimeDeps
+	wsSubs *strat.WsSubJobRegistry
 
 	cache     []*banexg.Trade
 	index     int
@@ -36,12 +38,49 @@ type TradeFeeder struct {
 
 // NewTradeFeeder creates a new trade data feeder
 func NewTradeFeeder(exs *orm.ExSymbol, l *WsDataLoader) *TradeFeeder {
+	return newTradeFeeder(nil, strat.LegacyWsSubJobRegistry(), exs, l)
+}
+
+// NewTradeFeederWithRuntimeDeps binds trade replay timing and loading to one
+// runtime. A nil dependency set preserves the legacy package facade.
+func NewTradeFeederWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol, l *WsDataLoader) *TradeFeeder {
+	if deps == nil {
+		return NewTradeFeeder(exs, l)
+	}
+	return newTradeFeeder(deps, strat.NewWsSubJobRegistryWithState(deps.Strategies, deps.Symbols), exs, l)
+}
+
+func newTradeFeeder(deps *RuntimeDeps, wsSubs *strat.WsSubJobRegistry, exs *orm.ExSymbol, l *WsDataLoader) *TradeFeeder {
+	endMS := int64(0)
+	if deps == nil {
+		if config.TimeRange != nil {
+			endMS = config.TimeRange.EndMS
+		}
+	} else if timeRange := deps.timeRange(); timeRange != nil {
+		endMS = timeRange.EndMS
+	}
 	return &TradeFeeder{
 		ExSymbol: exs,
+		deps:     deps,
+		wsSubs:   wsSubs,
 		cache:    make([]*banexg.Trade, 0),
 		loader:   l,
-		endMS:    config.TimeRange.EndMS,
+		endMS:    endMS,
 	}
+}
+
+func (f *TradeFeeder) wsRegistry() *strat.WsSubJobRegistry {
+	if f != nil && f.wsSubs != nil {
+		return f.wsSubs
+	}
+	return strat.LegacyWsSubJobRegistry()
+}
+
+func (f *TradeFeeder) nowMS() int64 {
+	if f.deps != nil {
+		return f.deps.timeMS()
+	}
+	return btime.UTCStamp()
 }
 
 func (f *TradeFeeder) getSymbol() string {
@@ -103,15 +142,13 @@ func (f *TradeFeeder) RunBatch(batch Batch) *errs.Error {
 		if len(trades) == 0 {
 			return nil
 		}
-		pairMap, _ := strat.WsSubJobs[core.WsSubTrade]
-		if len(pairMap) == 0 || len(trades) == 0 {
+		if len(trades) == 0 {
 			return nil
 		}
 		pair := trades[0].Symbol
-		jobMap, _ := pairMap[pair]
-		for job := range jobMap {
+		f.wsRegistry().ForEach(core.WsSubTrade, pair, func(job *strat.StratJob) {
 			job.Strat.OnWsTrades(job, pair, trades)
-		}
+		})
 	} else {
 		return errs.NewMsg(errs.CodeRunTime, "type error: %T", batch)
 	}
@@ -133,15 +170,15 @@ func (f *TradeFeeder) CallNext() {
 	}
 	// 缓存读取完毕，加载下一批
 	if f.timeStart > 0 {
-		cost := btime.UTCStamp() - f.timeStart
+		cost := f.nowMS() - f.timeStart
 		runNum := len(f.cache)
 		log.Debug("run trade done", zap.Int64("costMS", cost), zap.Int("num", runNum), zap.Int("batch", f.num))
 	}
-	f.timeStart = btime.UTCStamp()
+	f.timeStart = f.nowMS()
 	if f.waitNext != nil {
 		// 等待nextCache加载完成
 		<-f.waitNext
-		cost := btime.UTCStamp() - f.timeStart
+		cost := f.nowMS() - f.timeStart
 		log.Debug("wait next ws batch", zap.Int64("cost", cost))
 		f.waitNext = nil
 	}
@@ -158,7 +195,7 @@ func (f *TradeFeeder) CallNext() {
 	} else {
 		f.nextMS = f.cache[0].Timestamp
 	}
-	f.waitNext = make(chan int)
+	f.waitNext = make(chan int, 1)
 	go f.loadNextBatch()
 }
 

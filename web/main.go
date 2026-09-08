@@ -30,3 +30,19 @@ start web monitoring panel for live trade
 func StartApi() *errs.Error {
 	return live.StartApi()
 }
+
+func StartApiWithLifecycle(lifecycle live.ServerLifecycle) (*live.ApiServer, *errs.Error) {
+	return live.StartApiWithLifecycle(lifecycle)
+}
+
+// StartApiWithLifecycleInLegacySession is used by a legacy runner that
+// already owns the process-wide compatibility gate.
+func StartApiWithLifecycleInLegacySession(lifecycle live.ServerLifecycle) (*live.ApiServer, *errs.Error) {
+	return live.StartApiWithLifecycleInLegacySession(lifecycle)
+}
+
+// StartApiInLegacySession is used by a legacy runner that already owns the
+// process-wide compatibility gate.
+func StartApiInLegacySession() *errs.Error {
+	return live.StartApiInLegacySession()
+}

@@ -889,11 +889,18 @@ For combination varieties, return the unweighted candlestick and the weighting f
 */
 func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame string,
 	startMS, endMS int64, limit int, handler func(string, string, []*banexg.Kline, []*AdjInfo)) *errs.Error {
+	return FastBulkOHLCVWithSymbolState(nil, exchange, symbols, timeFrame, startMS, endMS, limit, handler)
+}
+
+// FastBulkOHLCVWithSymbolState keeps low-frequency symbol resolution and
+// listing-date updates on the supplied state. Row delivery is unchanged.
+func FastBulkOHLCVWithSymbolState(state *SymbolState, exchange banexg.BanExchange, symbols []string, timeFrame string,
+	startMS, endMS int64, limit int, handler func(string, string, []*banexg.Kline, []*AdjInfo)) *errs.Error {
 	canDownload := allowImplicitKlineDownload()
 	if !canDownload && (!core.BackTestMode || config.HistoricalCoverage == nil) {
 		return klineDownloadDisabledError("FastBulkOHLCV")
 	}
-	var exsMap, err = MapExSymbols(exchange, symbols)
+	var exsMap, err = MapExSymbolsWithSymbolState(state, exchange, symbols)
 	if len(exsMap) == 0 {
 		return err
 	}
@@ -905,7 +912,7 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 		if connErr != nil {
 			return connErr
 		}
-		err = EnsureListDates(sess, exchange, exsMap, nil)
+		err = EnsureListDatesWithState(sess, state, exchange, exsMap, nil)
 		conn.Release()
 		if err != nil {
 			return err
@@ -1006,10 +1013,22 @@ func klineDownloadDisabledError(operation string) *errs.Error {
 }
 
 func MapExSymbols(exchange banexg.BanExchange, symbols []string) (map[int32]*ExSymbol, *errs.Error) {
+	return MapExSymbolsWithSymbolState(nil, exchange, symbols)
+}
+
+// MapExSymbolsWithSymbolState resolves symbols without consulting the
+// package-level catalog when state is supplied.
+func MapExSymbolsWithSymbolState(state *SymbolState, exchange banexg.BanExchange, symbols []string) (map[int32]*ExSymbol, *errs.Error) {
 	var exsMap = make(map[int32]*ExSymbol)
 	var fails = make(map[string]*errs.Error)
 	for _, pair := range symbols {
-		exs, err := GetExSymbol(exchange, pair)
+		var exs *ExSymbol
+		var err *errs.Error
+		if state == nil {
+			exs, err = GetExSymbol(exchange, pair)
+		} else {
+			exs, err = state.GetExSymbol(exchange, pair)
+		}
 		if err != nil {
 			fails[pair] = err
 		} else {
@@ -1207,6 +1226,12 @@ For the 365 * 24 coin circle, it will not stop and return empty
 对于币圈365*24不休，返回空
 */
 func GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start, stop int64, full bool) ([][2]int64, *errs.Error) {
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	if exs == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange symbol is required")
+	}
 	exInfo := exchange.Info()
 	if exInfo.FullDay && exInfo.NoHoliday {
 		// 365天全年无休，且24小时可交易，不存在休息时间段

@@ -2,8 +2,12 @@ package orm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,12 +28,56 @@ var (
 	compactProcessLockRootFn = compactProcessLockRoot
 )
 
+// compactProcessLockRoot retains the legacy-config root for existing callers.
+// Identity-aware callers should use CompactProcessLockRootForIdentity.
 func compactProcessLockRoot() string {
 	dataDir := config.GetDataDirSafe()
-	if dataDir == "" {
+	identity := CanonicalStorageIdentityForType("", databaseURL(), dataDir, databaseType())
+	if identity == "" {
+		if dataDir == "" {
+			return ""
+		}
+		identity = "data-dir:" + absoluteStoragePath(dataDir)
+	}
+	return compactProcessLockRootForIdentity(identity)
+}
+
+func compactProcessLockRootForIdentity(identity string) string {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
 		return ""
 	}
-	return filepath.Join(dataDir, "locks", "compact")
+	digest := sha256.Sum256([]byte(identity))
+	return filepath.Join(os.TempDir(), "banbot", "compact", hex.EncodeToString(digest[:]))
+}
+
+// CompactProcessLockRootForIdentity maps an explicit storage identity to the
+// process-lock root used by QuestDB compact and rewrite leases. Callers that
+// already own an explicit Runtime identity should use this instead of the
+// legacy-config-derived root.
+func CompactProcessLockRootForIdentity(identity string) string {
+	return compactProcessLockRootForIdentity(identity)
+}
+
+func compactProcessLockRootForAllocator(allocator *SIDAllocator) string {
+	if allocator != nil && !allocator.legacyConfig {
+		return allocator.sharedReservationRoot()
+	}
+	return compactProcessLockRootFn()
+}
+
+func databaseURL() string {
+	if config.Database == nil {
+		return ""
+	}
+	return config.Database.Url
+}
+
+func databaseType() string {
+	if config.Database == nil {
+		return ""
+	}
+	return config.Database.DbType
 }
 
 func ensureCompactProcessLockRoot(root string) error {
@@ -59,14 +107,14 @@ func tryAcquireCompactProcessLock(root, table string, mode compactProcessLockMod
 	}
 	locked, err := tryCompactProcessOSLock(file, mode == compactProcessLockExclusive)
 	if err != nil || !locked {
-		_ = file.Close()
-		return nil, false, err
+		closeErr := file.Close()
+		return nil, false, errors.Join(err, closeErr)
 	}
 	release := func() error {
 		unlockErr := unlockCompactProcessOSLock(file)
 		closeErr := file.Close()
 		if unlockErr != nil {
-			return unlockErr
+			return errors.Join(unlockErr, closeErr)
 		}
 		return closeErr
 	}
@@ -74,8 +122,19 @@ func tryAcquireCompactProcessLock(root, table string, mode compactProcessLockMod
 }
 
 func acquireCompactProcessSharedLock(ctx context.Context, root, table string) (func() error, error) {
+	return acquireCompactProcessLock(ctx, root, table, compactProcessLockShared)
+}
+
+func acquireCompactProcessExclusiveLock(ctx context.Context, root, table string) (func() error, error) {
+	return acquireCompactProcessLock(ctx, root, table, compactProcessLockExclusive)
+}
+
+func acquireCompactProcessLock(ctx context.Context, root, table string, mode compactProcessLockMode) (func() error, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for {
-		release, acquired, err := tryAcquireCompactProcessLock(root, table, compactProcessLockShared)
+		release, acquired, err := tryAcquireCompactProcessLock(root, table, mode)
 		if err != nil {
 			return nil, err
 		}

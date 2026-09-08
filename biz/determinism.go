@@ -15,19 +15,31 @@ func executionMapKeys[M ~map[K]V, K cmp.Ordered, V any](items M) iter.Seq[K] {
 	return utils.MapKeys(items, config.StrictBacktest())
 }
 
-func executionAccountNames() iter.Seq[string] {
-	if len(config.Accounts) == 1 {
-		for account := range config.Accounts {
+func executionAccountConfigs(deps *RuntimeDeps) map[string]*config.AccountConfig {
+	if deps != nil {
+		return deps.AccountConfigs()
+	}
+	return config.Accounts
+}
+
+func executionAccountNames(deps ...*RuntimeDeps) iter.Seq[string] {
+	var runtimeDeps *RuntimeDeps
+	if len(deps) > 0 {
+		runtimeDeps = deps[0]
+	}
+	accounts := executionAccountConfigs(runtimeDeps)
+	if len(accounts) == 1 {
+		for account := range accounts {
 			return func(yield func(string) bool) {
 				yield(account)
 			}
 		}
 	}
 	if config.StrictBacktest() {
-		return utils.MapKeys(config.Accounts, true)
+		return utils.MapKeys(accounts, true)
 	}
 	return func(yield func(string) bool) {
-		for account := range config.Accounts {
+		for account := range accounts {
 			if !yield(account) {
 				return
 			}

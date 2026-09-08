@@ -16,9 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var (
-	Cache *ristretto.Cache
-)
+var Cache *ristretto.Cache
 
 func Setup() *errs.Error {
 	var err_ error

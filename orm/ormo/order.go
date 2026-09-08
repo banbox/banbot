@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,6 +42,22 @@ type InOutOrder struct {
 	DirtyExit  bool                   `json:"-"` // Exit has unsaved temporary changes 有未保存的临时修改
 	DirtyInfo  bool                   `json:"-"` // Info has unsaved temporary changes 有未保存的临时修改
 	idKey      string                 // Key to distinguish orders 区分订单的key
+	state      *OrderState            `json:"-"`
+}
+
+// BindState associates an order with the runtime-owned order registries. It
+// is intentionally explicit; no implicit current-runtime lookup is used.
+func (i *InOutOrder) BindState(state *OrderState) {
+	if i != nil {
+		i.state = state
+	}
+}
+
+func (i *InOutOrder) orderState() *OrderState {
+	if i != nil && i.state != nil {
+		return i.state
+	}
+	return nil
 }
 
 type InOutEdit struct {
@@ -414,6 +429,7 @@ func (i *InOutOrder) CutPart(enterAmt, exitAmt float64) *InOutOrder {
 		DirtyEnter: true,
 		DirtyInfo:  true,
 		idKey:      i.idKey,
+		state:      i.state,
 	}
 	for key, val := range i.Info {
 		part.Info[key] = val
@@ -458,22 +474,45 @@ func (i *InOutOrder) IsDirty() bool {
 }
 
 func (i *InOutOrder) Save() *errs.Error {
-	if i.ID == 0 && core.SimOrderMatch {
-		core.NewNumInSim += 1
+	if i.ID == 0 {
+		if state := i.orderState(); state != nil {
+			state.addSimOrder()
+		} else if core.SimOrderMatch {
+			core.NewNumInSim++
+		}
 	}
 	if i.Status == InOutStatusFullExit && (i.Enter == nil || i.Enter.Filled == 0) && (i.Exit == nil || i.Exit.Filled == 0) {
 		i.Status = InOutStatusDelete
 	}
-	if core.LiveMode {
-		openOds, lock := GetOpenODs(GetTaskAcc(i.TaskID))
+	live := core.LiveMode
+	state := i.orderState()
+	if state != nil {
+		live = state.Live()
+	}
+	if live {
+		account := GetTaskAcc(i.TaskID)
+		if state != nil {
+			account = state.GetTaskAcc(i.TaskID)
+		}
+		var openOds map[int64]*InOutOrder
+		var lock *deadlock.Mutex
+		if state != nil {
+			openOds, lock = state.GetOpenODs(account)
+		} else {
+			openOds, lock = GetOpenODs(account)
+		}
 		lock.Lock()
 		if i.Status < InOutStatusFullExit {
 			openOds[i.ID] = i
 		} else {
 			delete(openOds, i.ID)
-			mLockOds.Lock()
-			delete(lockOds, i.Key())
-			mLockOds.Unlock()
+			if state != nil {
+				state.DeleteOrderLock(i.Key())
+			} else {
+				mLockOds.Lock()
+				delete(lockOds, i.Key())
+				mLockOds.Unlock()
+			}
 		}
 		lock.Unlock()
 		oldId := i.ID
@@ -498,10 +537,25 @@ func (i *InOutOrder) saveToMem() {
 		if i.Status == InOutStatusDelete {
 			return
 		}
-		i.ID = FakeOdId
-		FakeOdId += 1
+		if state := i.orderState(); state != nil {
+			i.ID = state.NextFakeID()
+		} else {
+			i.ID = FakeOdId
+			FakeOdId += 1
+		}
 	}
-	openOds, lock := GetOpenODs(GetTaskAcc(i.TaskID))
+	state := i.orderState()
+	account := GetTaskAcc(i.TaskID)
+	if state != nil {
+		account = state.GetTaskAcc(i.TaskID)
+	}
+	var openOds map[int64]*InOutOrder
+	var lock *deadlock.Mutex
+	if state != nil {
+		openOds, lock = state.GetOpenODs(account)
+	} else {
+		openOds, lock = GetOpenODs(account)
+	}
 	lock.Lock()
 	if i.Status < InOutStatusFullExit {
 		openOds[i.ID] = i
@@ -510,9 +564,10 @@ func (i *InOutOrder) saveToMem() {
 			delete(openOds, i.ID)
 		}
 		if i.Status == InOutStatusFullExit && i.Enter != nil && i.Enter.Filled > core.AmtDust {
-			if _, ok := doneODs[i.ID]; !ok {
+			if state != nil {
+				state.AddHistoricalOrder(i)
+			} else if _, ok := doneODs[i.ID]; !ok {
 				doneODs[i.ID] = true
-				// 切分的订单不会出现在openOds中
 				HistODs = append(HistODs, i)
 			}
 		}
@@ -816,33 +871,24 @@ func (i *InOutOrder) UpdateTrailing(price float64) *errs.Error {
 
 /*
 ClientId
-Generate the exchange's ClientOrderId
+Generate the adapter's ClientOrderId
 生成交易所的ClientOrderId
-For OKX: only alphanumeric, max 32 chars, use fixed-length format: {nameHash6}{orderId12}{rand4}
-For others: use underscore separator format: {name}_{orderId}_{rand}_{clientId}
+The exchange boundary selects the format required by the adapter.
 */
 func (i *InOutOrder) ClientId(random bool) string {
-	if core.ExgName == "okx" {
-		// OKX: alphanumeric only, max 32 chars
-		// Format: {nameHash6}{orderId12}{rand4} = 22 chars
-		nameHash := utils.HashToAlphaNum(config.Name, 6)
-		randNum := 0
-		if random {
-			randNum = rand.Intn(10000)
-		}
-		return fmt.Sprintf("%s%012d%04d", nameHash, i.ID, randNum)
-	}
-	// Binance and others: use underscore separator
 	client := i.GetInfoString(OdInfoClientID)
-	if random {
-		return fmt.Sprintf("%s_%v_%v_%v", config.Name, i.ID, rand.Intn(1000), client)
-	}
-	return fmt.Sprintf("%s_%v_%v", config.Name, i.ID, client)
+	return exg.BuildClientOrderID(exg.Default, core.ExgName, config.Name, i.ID, client, random)
 }
 
 func fireOdEdit(od *InOutOrder, action string) {
-	if OdEditListener != nil && core.EnvReal && od.Status > InOutStatusInit && od.ID > 0 {
-		OdEditListener(od, action)
+	listener := OdEditListener
+	envReal := core.EnvReal
+	if od != nil && od.state != nil {
+		listener = od.state.GetEditListener()
+		envReal = od.state.Live()
+	}
+	if listener != nil && envReal && od.Status > InOutStatusInit && od.ID > 0 {
+		listener(od, action)
 	}
 }
 
@@ -852,15 +898,26 @@ Return to modify the lock of the current order. A successful return indicates th
 */
 func (i *InOutOrder) Lock() *deadlock.Mutex {
 	odKey := i.Key()
-	mLockOds.Lock()
-	lock, ok := lockOds[odKey]
-	if !ok {
-		lock = &deadlock.Mutex{}
-		lockOds[odKey] = lock
+	state := i.orderState()
+	var lock *deadlock.Mutex
+	if state != nil {
+		lock = state.GetOrderLock(odKey)
+	} else {
+		mLockOds.Lock()
+		var ok bool
+		lock, ok = lockOds[odKey]
+		if !ok {
+			lock = &deadlock.Mutex{}
+			lockOds[odKey] = lock
+		}
+		mLockOds.Unlock()
 	}
-	mLockOds.Unlock()
 	var got = int32(0)
-	if core.LiveMode {
+	live := core.LiveMode
+	if state != nil {
+		live = state.Live()
+	}
+	if live {
 		// Real time mode with added deadlock detection
 		// 实时模式，增加死锁检测
 		stack := errs.CallStack(3, 20)
@@ -921,6 +978,7 @@ func (i *InOutOrder) Clone() *InOutOrder {
 		DirtyExit:  i.DirtyExit,
 		DirtyInfo:  i.DirtyInfo,
 		idKey:      i.idKey,
+		state:      i.state,
 	}
 	if i.Info != nil {
 		for k, v := range i.Info {

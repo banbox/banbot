@@ -39,6 +39,58 @@ func TestBackTestPreservesFirstRuntimeError(t *testing.T) {
 	}
 }
 
+func TestNewBackTestLiteOwnsBatchState(t *testing.T) {
+	originalBiz := biz.BackupVars()
+	t.Cleanup(func() { biz.RestoreVars(originalBiz) })
+	first := NewBackTestLite(true, nil, nil, nil)
+	second := NewBackTestLite(true, nil, nil, nil)
+	first.dp.Terminate()
+	second.dp.Terminate()
+	firstState := first.Trader.BatchState()
+	secondState := second.Trader.BatchState()
+	if firstState == nil || secondState == nil || firstState == secondState {
+		t.Fatal("backtests must own distinct batch states")
+	}
+	zero := &BackTestLite{}
+	zeroState := zero.batchStateForRun()
+	if zeroState == nil || zeroState != zero.Trader.BatchState() {
+		t.Fatal("zero-value backtest did not lazily create a private batch state")
+	}
+}
+
+func TestBackTestLiteCanUseCompositionRootBatchState(t *testing.T) {
+	state := strat.NewBatchState()
+	WithLegacySession(func(session LegacySession) struct{} {
+		bt := NewBackTestLiteWithBatchState(session, state, true, nil, nil, nil)
+		bt.dp.Terminate()
+		if bt.Trader.BatchState() != state {
+			t.Fatal("backtest did not use the supplied batch state")
+		}
+		return struct{}{}
+	})
+}
+
+func TestNewBackTestWithBatchStateUsesSuppliedState(t *testing.T) {
+	originalBiz := biz.BackupVars()
+	t.Cleanup(func() { biz.RestoreVars(originalBiz) })
+	originalDataDir := config.DataDir
+	config.DataDir = t.TempDir()
+	t.Cleanup(func() { config.DataDir = originalDataDir })
+
+	state := strat.NewBatchState()
+	WithLegacySession(func(session LegacySession) struct{} {
+		bt, runErr := NewBackTestWithBatchState(session, state, true, "")
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		t.Cleanup(func() { bt.dp.Terminate() })
+		if bt.Trader.BatchState() != state {
+			t.Fatal("backtest did not use the supplied batch state")
+		}
+		return struct{}{}
+	})
+}
+
 func TestHistoricalCloseBoundariesPreserveLegacyAndSequenceInTime(t *testing.T) {
 	runRange := &config.TimeTuple{StartMS: 10, EndMS: 200}
 	legacy := historicalCloseBoundaries(&config.HistoricalCoverageConfig{BaselineEndMS: 100}, runRange)

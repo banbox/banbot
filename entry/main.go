@@ -13,6 +13,7 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banbot/web"
@@ -57,7 +58,7 @@ func panicStack() []byte {
 func Execute(args []string) error {
 	command := NewRootCommand()
 	if isImplicitWebInvocation(args) {
-		command = web.NewCommand()
+		command = withLegacyCommand(web.NewCommand())
 		command.SilenceErrors = true
 		command.SilenceUsage = true
 	}
@@ -86,6 +87,7 @@ func NewRootCommand() *cobra.Command {
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
+		Annotations:   map[string]string{legacyGateAnnotation: "1"},
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return web.RunDev([]string{})
 		},
@@ -128,23 +130,94 @@ func installSignalHandler() {
 
 func newConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
 	args := &config.CmdArgs{}
+	legacy := &legacyCommandFlags{}
 	command := &cobra.Command{
-		Use:   name,
-		Short: help,
-		Args:  cobra.NoArgs,
+		Use:         name,
+		Short:       help,
+		Args:        cobra.NoArgs,
+		Annotations: map[string]string{legacyGateAnnotation: "1"},
 		RunE: func(command *cobra.Command, _ []string) error {
 			args.BTStrictSet = command.Flags().Changed("bt-strict")
-			return runConfigCommand(args, run)
+			return runConfigCommand(args, legacy, run)
 		},
 	}
-	bindCommonFlags(args, command.Flags(), allowDeadlock)
+	bindCommonFlags(args, legacy, command.Flags(), allowDeadlock)
 	for _, bind := range binders {
 		bind(args, command.Flags())
 	}
 	return command
 }
 
-func bindCommonFlags(args *config.CmdArgs, flags *pflag.FlagSet, allowDeadlock bool) {
+func newLegacySessionConfigCommand(name, help string, run func(*config.CmdArgs, opt.LegacySession) *errs.Error, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
+	args := &config.CmdArgs{}
+	legacy := &legacyCommandFlags{}
+	command := &cobra.Command{
+		Use:         name,
+		Short:       help,
+		Args:        cobra.NoArgs,
+		Annotations: map[string]string{legacyGateAnnotation: "1"},
+		RunE: func(command *cobra.Command, _ []string) error {
+			args.BTStrictSet = command.Flags().Changed("bt-strict")
+			return runConfigCommandWithLegacySession(args, legacy, run)
+		},
+	}
+	bindCommonFlags(args, legacy, command.Flags(), allowDeadlock)
+	for _, bind := range binders {
+		bind(args, command.Flags())
+	}
+	return command
+}
+
+const legacyGateAnnotation = legacygate.Annotation
+
+func hasLegacyGate(command *cobra.Command) bool {
+	return command != nil && command.Annotations != nil && command.Annotations[legacyGateAnnotation] == "1"
+}
+
+func markLegacyGate(command *cobra.Command) {
+	if command == nil {
+		return
+	}
+	if command.Annotations == nil {
+		command.Annotations = make(map[string]string)
+	}
+	command.Annotations[legacyGateAnnotation] = "1"
+}
+
+// withLegacyCommand serializes every runnable command in a Cobra tree that
+// still reaches package-level compatibility state.
+func withLegacyCommand(command *cobra.Command) *cobra.Command {
+	if command == nil {
+		return nil
+	}
+	if !hasLegacyGate(command) {
+		if run := command.RunE; run != nil {
+			command.RunE = func(cmd *cobra.Command, args []string) error {
+				return opt.WithCommandLegacySession(func(opt.LegacySession) error { return run(cmd, args) })
+			}
+		} else if run := command.Run; run != nil {
+			command.Run = func(cmd *cobra.Command, args []string) {
+				opt.WithCommandLegacySession(func(opt.LegacySession) struct{} {
+					run(cmd, args)
+					return struct{}{}
+				})
+			}
+		}
+		markLegacyGate(command)
+	}
+	for _, child := range command.Commands() {
+		withLegacyCommand(child)
+	}
+	return command
+}
+
+type legacyCommandFlags struct {
+	cpuProfile bool
+	memProfile bool
+	netDisable bool
+}
+
+func bindCommonFlags(args *config.CmdArgs, legacy *legacyCommandFlags, flags *pflag.FlagSet, allowDeadlock bool) {
 	flags.StringVar(&args.DataDir, "datadir", "", "path to the data directory")
 	flags.StringArrayVar((*[]string)(&args.Configs), "config", nil, "config path; may be repeated")
 	flags.BoolVar(&args.NoDefault, "no-default", false, "ignore config.yml and config.local.yml")
@@ -155,19 +228,35 @@ func bindCommonFlags(args *config.CmdArgs, flags *pflag.FlagSet, allowDeadlock b
 	if allowDeadlock {
 		flags.BoolVar(&args.DeadLock, "dlock", false, "enable deadlock detection")
 	}
-	flags.BoolVar(&core.CPUProfile, "cpu-profile", false, "enable CPU profiling")
-	flags.BoolVar(&core.MemProfile, "mem-profile", false, "enable memory profiling")
-	flags.BoolVar(&core.NetDisable, "net-off", false, "disable network requests")
+	flags.BoolVar(&legacy.cpuProfile, "cpu-profile", false, "enable CPU profiling")
+	flags.BoolVar(&legacy.memProfile, "mem-profile", false, "enable memory profiling")
+	flags.BoolVar(&legacy.netDisable, "net-off", false, "disable network requests")
 }
 
-func runConfigCommand(args *config.CmdArgs, run FuncEntry) error {
-	core.SetRunMode(core.RunModeOther)
-	args.Init()
-	startProfiles()
-	if err := run(args); err != nil {
-		return err
-	}
-	return nil
+func runConfigCommand(args *config.CmdArgs, legacy *legacyCommandFlags, run FuncEntry) error {
+	return opt.WithLegacySession(func(opt.LegacySession) error {
+		core.CPUProfile, core.MemProfile, core.NetDisable = legacy.cpuProfile, legacy.memProfile, legacy.netDisable
+		core.SetRunMode(core.RunModeOther)
+		args.Init()
+		startProfiles()
+		if err := run(args); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func runConfigCommandWithLegacySession(args *config.CmdArgs, legacy *legacyCommandFlags, run func(*config.CmdArgs, opt.LegacySession) *errs.Error) error {
+	return opt.WithLegacySession(func(session opt.LegacySession) error {
+		core.CPUProfile, core.MemProfile, core.NetDisable = legacy.cpuProfile, legacy.memProfile, legacy.netDisable
+		core.SetRunMode(core.RunModeOther)
+		args.Init()
+		startProfiles()
+		if err := run(args, session); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func startProfiles() {
@@ -195,12 +284,15 @@ func startProfiles() {
 
 func newPositionalCommand(name, help, argName string, run func(args []string) error) *cobra.Command {
 	return &cobra.Command{
-		Use:   fmt.Sprintf("%s %s", name, argName),
-		Short: help,
-		Args:  cobra.ExactArgs(1),
+		Use:         fmt.Sprintf("%s %s", name, argName),
+		Short:       help,
+		Args:        cobra.ExactArgs(1),
+		Annotations: map[string]string{legacyGateAnnotation: "1"},
 		RunE: func(_ *cobra.Command, args []string) error {
-			core.SetRunMode(core.RunModeOther)
-			return run(args)
+			return opt.WithLegacySession(func(opt.LegacySession) error {
+				core.SetRunMode(core.RunModeOther)
+				return run(args)
+			})
 		},
 	}
 }

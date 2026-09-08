@@ -13,6 +13,7 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/web/base"
 	"github.com/banbox/banexg"
@@ -78,6 +79,12 @@ func (m *DataToolsManager) EndTask() {
 
 // RunDataTools 执行数据工具任务
 func RunDataTools(args *DataToolsArgs) *errs.Error {
+	return legacygate.With(func() *errs.Error {
+		return runDataTools(args)
+	})
+}
+
+func runDataTools(args *DataToolsArgs) *errs.Error {
 	switch args.Action {
 	case "download":
 		return runDataTask(runDownloadData, args, []string{"downKline"}, []float64{1})
@@ -291,6 +298,20 @@ func handleDataTools(c *fiber.Ctx) error {
 		})
 	}
 
+	if err := dataToolsMgr.StartTask(); err != nil {
+		return c.Status(400).JSON(fiber.Map{
+			"msg": err.Error(),
+		})
+	}
+	// Keep the admission claim until the asynchronous task is handed off.
+	// Every synchronous failure path below must release it.
+	claimed := true
+	defer func() {
+		if claimed {
+			dataToolsMgr.EndTask()
+		}
+	}()
+
 	if mustMarket {
 		exchange, err2 := exg.GetWith(args.Exchange, args.Market, banexg.MarketSwap)
 		if err2 != nil {
@@ -334,12 +355,6 @@ func handleDataTools(c *fiber.Ctx) error {
 	}
 
 	// 尝试启动任务
-	if err := dataToolsMgr.StartTask(); err != nil {
-		return c.Status(400).JSON(fiber.Map{
-			"msg": err.Error(),
-		})
-	}
-
 	if args.Action == "export" {
 		args.Folder = config.ParsePath(args.Folder)
 	}
@@ -347,13 +362,14 @@ func handleDataTools(c *fiber.Ctx) error {
 	// 在goroutine中执行任务
 	go func() {
 		defer dataToolsMgr.EndTask()
-		err := RunDataTools(args)
+		err := runDataTools(args)
 		if err != nil {
 			log.Error("data tools task failed",
 				zap.String("action", args.Action),
 				zap.Error(err))
 		}
 	}()
+	claimed = false
 
 	return c.JSON(fiber.Map{
 		"code": 200,

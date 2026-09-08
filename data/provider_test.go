@@ -3,32 +3,792 @@ package data
 import (
 	"fmt"
 	"math"
+	"net"
 	"reflect"
+	"runtime"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
 
-type stubDataFeeder struct {
-	symbol  string
-	warmLog *[]string
+type providerBlockingConn struct {
+	net.Conn
+	readStarted chan struct{}
+	once        sync.Once
 }
 
-func (f *stubDataFeeder) getSymbol() string            { return f.symbol }
-func (f *stubDataFeeder) getWaitData() *orm.DataSeries { return nil }
-func (f *stubDataFeeder) setWaitData(*orm.DataSeries)  {}
-func (f *stubDataFeeder) getStates() []*PairTFCache    { return nil }
+func (c *providerBlockingConn) Read(buf []byte) (int, error) {
+	c.once.Do(func() { close(c.readStarted) })
+	return c.Conn.Read(buf)
+}
+
+func TestLiveProviderCloseConcurrentWithRunForever(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() { _ = serverConn.Close() })
+	conn := &providerBlockingConn{Conn: clientConn, readStarted: make(chan struct{})}
+	client := &utils.ClientIO{BanConn: utils.BanConn{
+		Conn:      conn,
+		Data:      map[string]interface{}{},
+		Listens:   map[string]utils.ConnCB{},
+		Ready:     true,
+		DoConnect: func(*utils.BanConn) {},
+	}}
+	provider := &LiveProvider{SeriesWatcher: &SeriesWatcher{ClientIO: client}}
+	loopDone := make(chan struct{})
+	go func() {
+		_ = provider.LoopMain()
+		close(loopDone)
+	}()
+
+	select {
+	case <-conn.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("live provider loop did not start reading")
+	}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := provider.Close(); err != nil {
+				t.Errorf("close live provider: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Close did not terminate live provider loop")
+	}
+	if !client.IsClosed() {
+		t.Fatal("client connection remained open after Close")
+	}
+}
+
+func TestLiveProviderCloseWaitsForSocketHandler(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
+
+	serverConn, clientConn := net.Pipe()
+	server := &utils.BanConn{Conn: serverConn, Ready: true}
+	t.Cleanup(func() { _ = server.Close() })
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	client := &utils.ClientIO{BanConn: utils.BanConn{
+		Conn: clientConn,
+		Data: map[string]interface{}{},
+		Listens: map[string]utils.ConnCB{"block": func(*utils.IOMsgRaw) {
+			close(entered)
+			<-release
+		}},
+		Ready: true,
+	}}
+	provider := &LiveProvider{SeriesWatcher: &SeriesWatcher{ClientIO: client}}
+	loopDone := make(chan struct{})
+	go func() {
+		_ = provider.LoopMain()
+		close(loopDone)
+	}()
+	if err := server.Write(&utils.IOMsgRaw{Action: "block"}); err != nil {
+		t.Fatalf("write blocking message: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("socket handler did not start")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		_ = provider.Close()
+		provider.Join()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned before socket handler completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not join socket handler")
+	}
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not terminate socket loop")
+	}
+}
+
+type stubDataFeeder struct {
+	symbol       string
+	states       []*PairTFCache
+	warmLog      *[]string
+	onNewDataFn  func()
+	onNewDataErr *errs.Error
+	waitStarted  chan struct{}
+	waitRelease  <-chan struct{}
+	waitOnce     sync.Once
+}
+
+type providerCallbackTracker struct {
+	entered atomic.Int32
+	left    atomic.Int32
+}
+
+func (t *providerCallbackTracker) EnterCallback() bool {
+	t.entered.Add(1)
+	return true
+}
+
+func (t *providerCallbackTracker) LeaveCallback() {
+	t.left.Add(1)
+}
+
+func (f *stubDataFeeder) getSymbol() string { return f.symbol }
+func (f *stubDataFeeder) getWaitData() *orm.DataSeries {
+	if f.waitStarted != nil {
+		f.waitOnce.Do(func() { close(f.waitStarted) })
+		<-f.waitRelease
+	}
+	return nil
+}
+func (f *stubDataFeeder) setWaitData(*orm.DataSeries) {}
+func (f *stubDataFeeder) getStates() []*PairTFCache   { return f.states }
 func (f *stubDataFeeder) onNewData(int64, []*orm.DataSeries) (bool, *errs.Error) {
-	return false, nil
+	if f.onNewDataFn != nil {
+		f.onNewDataFn()
+	}
+	return false, f.onNewDataErr
 }
 func (f *stubDataFeeder) SubTfs(tfs []string, _ bool) []string { return tfs }
 func (f *stubDataFeeder) WarmTfs(_ int64, tfNums map[string]int, _ *utils.PrgBar) (int64, map[string][2]int, *errs.Error) {
-	*f.warmLog = append(*f.warmLog, fmt.Sprintf("%s:%d", f.symbol, tfNums["1h"]))
+	if f.warmLog != nil {
+		*f.warmLog = append(*f.warmLog, fmt.Sprintf("%s:%d", f.symbol, tfNums["1h"]))
+	}
 	return 0, nil, nil
+}
+
+func TestLiveProviderHandlerStopsAfterFeederError(t *testing.T) {
+	called := 0
+	provider := &LiveProvider{
+		OnDataSeries: func(*SeriesMsg, []*orm.DataSeries) *errs.Error {
+			called++
+			return nil
+		},
+	}
+	hold := &stubDataFeeder{onNewDataErr: errs.NewMsg(core.ErrDbReadFail, "enrichment failed")}
+	provider.handlerWait.Add(1)
+	provider.runHandler(hold, 60_000, &SeriesMsg{Pair: "BTC/USDT"}, []*orm.DataSeries{{TimeMS: 100}})
+	if called != 0 {
+		t.Fatalf("OnDataSeries called after feeder error: %d", called)
+	}
+}
+
+func TestLiveProviderConcurrentCloseWaitsForSeriesHandlerAndStopsAdmission(t *testing.T) {
+	oldExgName, oldMarket := core.ExgName, core.Market
+	core.ExgName, core.Market = "test", "spot"
+	t.Cleanup(func() { core.ExgName, core.Market = oldExgName, oldMarket })
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	feeder := &stubDataFeeder{symbol: "BTC/USDT", onNewDataFn: func() {
+		if calls.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+	}}
+	provider := &LiveProvider{
+		Provider: Provider[IDataFeeder]{holders: map[string]IDataFeeder{"BTC/USDT": feeder}},
+		SeriesWatcher: &SeriesWatcher{ClientIO: &utils.ClientIO{BanConn: utils.BanConn{
+			Data:    map[string]interface{}{},
+			Listens: map[string]utils.ConnCB{},
+		}}},
+	}
+	handle := makeOnSeriesMsg(provider)
+	msg := &SeriesMsg{
+		ExgName: "test", Market: "spot", Pair: "BTC/USDT",
+		NotifySeries: NotifySeries{TFSecs: 60, Interval: 60, Rows: []*orm.DataSeries{{TimeMS: 1}}},
+	}
+	handle(msg)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("series handler did not start")
+	}
+
+	const closeCount = 8
+	closeDone := make(chan struct{}, closeCount)
+	for range closeCount {
+		go func() {
+			_ = provider.Close()
+			provider.Join()
+			closeDone <- struct{}{}
+		}()
+	}
+	select {
+	case <-closeDone:
+		t.Fatal("concurrent Close returned before series handler completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	handle(msg)
+	close(release)
+	for range closeCount {
+		select {
+		case <-closeDone:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent Close did not join series handler")
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("series handlers admitted after Close: calls=%d, want 1", got)
+	}
+}
+
+func TestLiveProviderCallbackLeaseCoversHandlerLifetime(t *testing.T) {
+	oldExgName, oldMarket := core.ExgName, core.Market
+	core.ExgName, core.Market = "test", "spot"
+	t.Cleanup(func() { core.ExgName, core.Market = oldExgName, oldMarket })
+
+	tracker := &providerCallbackTracker{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	provider := &LiveProvider{
+		Provider: Provider[IDataFeeder]{holders: map[string]IDataFeeder{
+			"BTC/USDT": &stubDataFeeder{symbol: "BTC/USDT"},
+		}},
+		deps: &RuntimeDeps{
+			Callbacks:    tracker,
+			ExchangeName: "test",
+			MarketType:   "spot",
+		},
+		SeriesWatcher: &SeriesWatcher{ClientIO: &utils.ClientIO{BanConn: utils.BanConn{
+			Data:    map[string]interface{}{},
+			Listens: map[string]utils.ConnCB{},
+		}}},
+	}
+	provider.OnDataSeries = func(*SeriesMsg, []*orm.DataSeries) *errs.Error {
+		close(started)
+		<-release
+		return nil
+	}
+
+	msg := &SeriesMsg{
+		ExgName: "test", Market: "spot", Pair: "BTC/USDT",
+		NotifySeries: NotifySeries{TFSecs: 60, Interval: 60, Rows: []*orm.DataSeries{{TimeMS: 1}}},
+	}
+	makeOnSeriesMsg(provider)(msg)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider callback did not start")
+	}
+
+	joined := make(chan struct{})
+	go func() {
+		_ = provider.Stop()
+		provider.Join()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+		t.Fatal("provider joined before callback release")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := tracker.entered.Load(); got != 1 {
+		t.Fatalf("callback lease enters = %d, want 1", got)
+	}
+	if got := tracker.left.Load(); got != 0 {
+		t.Fatalf("callback lease left while handler was blocked: %d", got)
+	}
+
+	close(release)
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not join callback after release")
+	}
+	if got := tracker.left.Load(); got != 1 {
+		t.Fatalf("callback lease leaves = %d, want 1", got)
+	}
+}
+
+func TestLiveProviderCloseFromSeriesHandlerDoesNotDeadlock(t *testing.T) {
+	for _, stop := range []struct {
+		name string
+		call func(*LiveProvider) *errs.Error
+	}{
+		{name: "Close", call: func(provider *LiveProvider) *errs.Error { return provider.Close() }},
+		{name: "Stop", call: func(provider *LiveProvider) *errs.Error { return provider.Stop() }},
+	} {
+		t.Run(stop.name, func(t *testing.T) {
+			oldExgName, oldMarket := core.ExgName, core.Market
+			core.ExgName, core.Market = "test", "spot"
+			t.Cleanup(func() { core.ExgName, core.Market = oldExgName, oldMarket })
+
+			closed := make(chan struct{})
+			feeder := &stubDataFeeder{symbol: "BTC/USDT"}
+			provider := &LiveProvider{
+				Provider: Provider[IDataFeeder]{holders: map[string]IDataFeeder{"BTC/USDT": feeder}},
+				SeriesWatcher: &SeriesWatcher{ClientIO: &utils.ClientIO{BanConn: utils.BanConn{
+					Data:    map[string]interface{}{},
+					Listens: map[string]utils.ConnCB{},
+				}}},
+			}
+			provider.OnDataSeries = func(*SeriesMsg, []*orm.DataSeries) *errs.Error {
+				_ = stop.call(provider)
+				close(closed)
+				return nil
+			}
+			msg := &SeriesMsg{
+				ExgName: "test", Market: "spot", Pair: "BTC/USDT",
+				NotifySeries: NotifySeries{TFSecs: 60, Interval: 60, Rows: []*orm.DataSeries{{TimeMS: 1}}},
+			}
+			makeOnSeriesMsg(provider)(msg)
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatalf("LiveProvider.%s from series handler deadlocked", stop.name)
+			}
+			provider.Join()
+		})
+	}
+}
+
+func TestLiveProviderSeriesAdmissionCarriesIntoAsyncHandler(t *testing.T) {
+	oldExgName, oldMarket := core.ExgName, core.Market
+	core.ExgName, core.Market = "test", "spot"
+	t.Cleanup(func() { core.ExgName, core.Market = oldExgName, oldMarket })
+
+	waitStarted := make(chan struct{})
+	releaseWait := make(chan struct{})
+	var calls atomic.Int32
+	feeder := &stubDataFeeder{
+		symbol:      "BTC/USDT",
+		waitStarted: waitStarted,
+		waitRelease: releaseWait,
+		onNewDataFn: func() { calls.Add(1) },
+	}
+	provider := &LiveProvider{
+		Provider: Provider[IDataFeeder]{holders: map[string]IDataFeeder{"BTC/USDT": feeder}},
+		SeriesWatcher: &SeriesWatcher{ClientIO: &utils.ClientIO{BanConn: utils.BanConn{
+			Data:    map[string]interface{}{},
+			Listens: map[string]utils.ConnCB{},
+		}}},
+	}
+	msg := &SeriesMsg{
+		ExgName: "test", Market: "spot", Pair: "BTC/USDT",
+		NotifySeries: NotifySeries{
+			TFSecs: 60, Interval: 10,
+			Rows: []*orm.DataSeries{{TimeMS: 1, EndMS: 2, Values: map[string]any{
+				"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0,
+			}}},
+		},
+	}
+	handlerDone := make(chan struct{})
+	go func() {
+		makeOnSeriesMsg(provider)(msg)
+		close(handlerDone)
+	}()
+	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("series handler did not reach the admission boundary")
+	}
+
+	joinDone := make(chan struct{})
+	go func() {
+		if err := provider.Stop(); err != nil {
+			t.Errorf("stop live provider: %v", err)
+		}
+		provider.Join()
+		close(joinDone)
+	}()
+	select {
+	case <-joinDone:
+		t.Fatal("Stop/Join returned while admitted series handler was blocked")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseWait)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("series handler did not finish after release")
+	}
+	select {
+	case <-joinDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop/Join did not wait for admitted async series handler")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("admitted series handler calls = %d, want 1", got)
+	}
+}
+
+func TestLiveProviderStopJoinSealsCallbackBeforeStateReset(t *testing.T) {
+	oldExgName, oldMarket := core.ExgName, core.Market
+	core.ExgName, core.Market = "test", "spot"
+	t.Cleanup(func() { core.ExgName, core.Market = oldExgName, oldMarket })
+
+	batch := strat.NewBatchState()
+	batch.SetLastBatchMS(123)
+	entered := make(chan struct{})
+	var calls atomic.Int32
+	var resetTouches atomic.Int32
+	provider := &LiveProvider{
+		Provider: Provider[IDataFeeder]{holders: map[string]IDataFeeder{
+			"BTC/USDT": &stubDataFeeder{symbol: "BTC/USDT"},
+		}},
+		OnDataSeries: func(*SeriesMsg, []*orm.DataSeries) *errs.Error {
+			if batch.LastBatchMS() != 123 {
+				resetTouches.Add(1)
+			}
+			if calls.Add(1) == 1 {
+				close(entered)
+			}
+			return nil
+		},
+	}
+	msg := &SeriesMsg{
+		ExgName: "test", Market: "spot", Pair: "BTC/USDT",
+		NotifySeries: NotifySeries{TFSecs: 60, Interval: 60, Rows: []*orm.DataSeries{{TimeMS: 1}}},
+	}
+
+	makeOnSeriesMsg(provider)(msg)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("series callback did not start")
+	}
+	if err := provider.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	provider.Join()
+
+	batch.Reset()
+	makeOnSeriesMsg(provider)(msg)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("callbacks after Stop/Join = %d, want 1", got)
+	}
+	if got := resetTouches.Load(); got != 0 {
+		t.Fatalf("callback touched reset state %d times", got)
+	}
+}
+
+func TestLiveProviderCloseJoinsWsCallbacksAndStopsAdmission(t *testing.T) {
+	oldJobs := strat.WsSubJobs
+	t.Cleanup(func() {
+		strat.LockJobsWrite()
+		strat.WsSubJobs = oldJobs
+		strat.UnlockJobsWrite()
+		strat.RefreshWsSubJobsSnapshot()
+	})
+
+	for _, msgType := range []string{core.WsSubTrade, core.WsSubDepth} {
+		for _, stop := range []struct {
+			name string
+			call func(*LiveProvider) *errs.Error
+		}{
+			{name: "Close", call: func(provider *LiveProvider) *errs.Error { return provider.Close() }},
+			{name: "Stop", call: func(provider *LiveProvider) *errs.Error { return provider.Stop() }},
+		} {
+			t.Run(msgType+"/"+stop.name, func(t *testing.T) {
+				entered := make(chan struct{})
+				release := make(chan struct{})
+				var calls atomic.Int32
+				strategy := &strat.TradeStrat{}
+				if msgType == core.WsSubTrade {
+					strategy.OnWsTrades = func(*strat.StratJob, string, []*banexg.Trade) {
+						calls.Add(1)
+						close(entered)
+						<-release
+					}
+				} else {
+					strategy.OnWsDepth = func(*strat.StratJob, *banexg.OrderBook) {
+						calls.Add(1)
+						close(entered)
+						<-release
+					}
+				}
+				job := &strat.StratJob{Strat: strategy}
+				strat.LockJobsWrite()
+				strat.WsSubJobs = map[string]map[string]map[*strat.StratJob]bool{
+					msgType: {"BTC/USDT": {job: true}},
+				}
+				strat.UnlockJobsWrite()
+				strat.RefreshWsSubJobsSnapshot()
+				provider := &LiveProvider{}
+				invoke := func() {
+					if msgType == core.WsSubTrade {
+						makeOnTrade(provider)("test", "spot", "BTC/USDT", []*banexg.Trade{{Symbol: "BTC/USDT"}})
+					} else {
+						makeOnDepth(provider)(&banexg.OrderBook{Symbol: "BTC/USDT"})
+					}
+				}
+				go invoke()
+				select {
+				case <-entered:
+				case <-time.After(time.Second):
+					t.Fatal("websocket callback did not start")
+				}
+
+				joined := make(chan struct{})
+				go func() {
+					if err := stop.call(provider); err != nil {
+						t.Errorf("stop live provider: %v", err)
+					}
+					provider.Join()
+					close(joined)
+				}()
+				select {
+				case <-joined:
+					t.Fatal("Join returned before websocket callback completed")
+				case <-time.After(50 * time.Millisecond):
+				}
+				invoke()
+				close(release)
+				select {
+				case <-joined:
+				case <-time.After(time.Second):
+					t.Fatal("Join did not wait for websocket callback")
+				}
+				if got := calls.Load(); got != 1 {
+					t.Fatalf("websocket callbacks admitted after %s: calls=%d, want 1", stop.name, got)
+				}
+			})
+		}
+	}
+}
+
+func TestProviderHoldersConcurrentWithSeriesRotation(t *testing.T) {
+	oldExgName, oldMarket := core.ExgName, core.Market
+	core.ExgName, core.Market = "test", "spot"
+	t.Cleanup(func() { core.ExgName, core.Market = oldExgName, oldMarket })
+
+	const iterations = 1000
+	newFeeder := func(pair string, _ []string) (IDataFeeder, *errs.Error) {
+		return &stubDataFeeder{
+			symbol: pair,
+			states: []*PairTFCache{{TimeFrame: "1m", TFSecs: 60, SubNextMS: 1}},
+		}, nil
+	}
+	provider := &LiveProvider{
+		Provider: Provider[IDataFeeder]{
+			holders: map[string]IDataFeeder{"BTC/USDT": &stubDataFeeder{
+				symbol: "BTC/USDT",
+				states: []*PairTFCache{{TimeFrame: "1m", TFSecs: 60, SubNextMS: 1}},
+			}},
+			newFeeder: newFeeder,
+		},
+	}
+	var callbackCalls atomic.Int32
+	holderObserved := make(chan struct{})
+	var holderObservedOnce sync.Once
+	provider.OnDataSeries = func(*SeriesMsg, []*orm.DataSeries) *errs.Error {
+		callbackCalls.Add(1)
+		holderObservedOnce.Do(func() { close(holderObserved) })
+		return nil
+	}
+	msg := &SeriesMsg{
+		ExgName: "test", Market: "spot", Pair: "BTC/USDT",
+		NotifySeries: NotifySeries{
+			TFSecs:   60,
+			Interval: 60,
+			Rows:     []*orm.DataSeries{{TimeMS: 1}},
+		},
+	}
+	handle := makeOnSeriesMsg(provider)
+	// Establish the initial holder-observed state before rotation starts. Without
+	// this handshake, a valid schedule can remove the only holder before the
+	// series goroutine reaches getHolder.
+	handle(msg)
+	select {
+	case <-holderObserved:
+	case <-time.After(time.Second):
+		t.Fatal("series callback did not observe the initial holder")
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errsCh := make(chan *errs.Error, 1)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iterations {
+			handle(msg)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		items := map[string]map[string]int{"BTC/USDT": {"1m": 1}}
+		for i := 0; i < iterations; i++ {
+			if i%2 == 0 {
+				provider.Provider.UnSubPairs("BTC/USDT")
+			} else {
+				_, _, _, err := provider.Provider.SubWarmPairs(items, false, nil)
+				if err != nil {
+					select {
+					case errsCh <- err:
+					default:
+					}
+				}
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+	if err := provider.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	provider.Join()
+	select {
+	case err := <-errsCh:
+		t.Fatal(err)
+	default:
+	}
+	if callbackCalls.Load() == 0 {
+		t.Fatal("series callback never observed a holder")
+	}
+}
+
+func TestWsCallbacksConcurrentWithSubscriptionRotation(t *testing.T) {
+	oldJobs := strat.WsSubJobs
+	t.Cleanup(func() {
+		strat.LockJobsWrite()
+		strat.WsSubJobs = oldJobs
+		strat.UnlockJobsWrite()
+	})
+	var callbacks atomic.Int32
+	job := &strat.StratJob{Strat: &strat.TradeStrat{
+		OnWsTrades: func(*strat.StratJob, string, []*banexg.Trade) {
+			callbacks.Add(1)
+			runtime.Gosched()
+		},
+		OnWsDepth: func(*strat.StratJob, *banexg.OrderBook) {
+			callbacks.Add(1)
+			runtime.Gosched()
+		},
+	}}
+	setJobs := func(pair string) {
+		strat.LockJobsWrite()
+		strat.WsSubJobs = map[string]map[string]map[*strat.StratJob]bool{
+			core.WsSubTrade: {pair: {job: true}},
+			core.WsSubDepth: {pair: {job: true}},
+		}
+		strat.UnlockJobsWrite()
+		strat.RefreshWsSubJobsSnapshot()
+	}
+	setJobs("BTC/USDT")
+	provider := &LiveProvider{}
+	onTrade := makeOnTrade(provider)
+	onDepth := makeOnDepth(provider)
+
+	const iterations = 1000
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iterations {
+			onTrade("test", "spot", "BTC/USDT", []*banexg.Trade{{Symbol: "BTC/USDT"}})
+			onDepth(&banexg.OrderBook{Symbol: "BTC/USDT"})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			if i%2 == 0 {
+				setJobs("BTC/USDT")
+			} else {
+				setJobs("ETH/USDT")
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+	if callbacks.Load() == 0 {
+		t.Fatal("websocket callbacks never observed a subscription")
+	}
+}
+
+func TestLiveProviderCallbacksUseInstanceWsRegistries(t *testing.T) {
+	oldJobs := strat.WsSubJobs
+	t.Cleanup(func() {
+		strat.LockJobsWrite()
+		strat.WsSubJobs = oldJobs
+		strat.UnlockJobsWrite()
+		strat.RefreshWsSubJobsSnapshot()
+	})
+
+	var callsA, callsB atomic.Int32
+	jobA := &strat.StratJob{Strat: &strat.TradeStrat{
+		OnWsTrades: func(*strat.StratJob, string, []*banexg.Trade) { callsA.Add(1) },
+	}}
+	jobB := &strat.StratJob{Strat: &strat.TradeStrat{
+		OnWsTrades: func(*strat.StratJob, string, []*banexg.Trade) { callsB.Add(1) },
+	}}
+	setJobs := func(job *strat.StratJob) {
+		strat.LockJobsWrite()
+		strat.WsSubJobs = map[string]map[string]map[*strat.StratJob]bool{
+			core.WsSubTrade: {"BTC/USDT": {job: true}},
+		}
+		strat.UnlockJobsWrite()
+	}
+	setJobs(jobA)
+	registryA := strat.NewWsSubJobRegistry(nil)
+	setJobs(jobB)
+	registryB := strat.NewWsSubJobRegistry(nil)
+
+	providerA := &LiveProvider{Provider: Provider[IDataFeeder]{wsSubs: registryA}}
+	providerB := &LiveProvider{Provider: Provider[IDataFeeder]{wsSubs: registryB}}
+	makeOnTrade(providerA)("test", "spot", "BTC/USDT", []*banexg.Trade{{Symbol: "BTC/USDT"}})
+	makeOnTrade(providerB)("test", "spot", "BTC/USDT", []*banexg.Trade{{Symbol: "BTC/USDT"}})
+	if err := (&TradeFeeder{wsSubs: registryA}).RunBatch(TradeBatch{{Symbol: "BTC/USDT"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&TradeFeeder{wsSubs: registryB}).RunBatch(TradeBatch{{Symbol: "BTC/USDT"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := callsA.Load(); got != 2 {
+		t.Fatalf("runtime A callbacks = %d, want 2", got)
+	}
+	if got := callsB.Load(); got != 2 {
+		t.Fatalf("runtime B callbacks = %d, want 2", got)
+	}
+	if err := providerA.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := providerB.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	providerA.Join()
+	providerB.Join()
 }
 
 func TestSubWarmPairsUsesStablePairOrder(t *testing.T) {

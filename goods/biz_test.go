@@ -127,8 +127,9 @@ func TestVolumeMarketSymbolsUsesStableMarketOrder(t *testing.T) {
 		"BTC/USDT": {},
 		"ETH/USDT": {},
 		"AAA/BTC":  {},
+		"RAW-USDT": {Quote: "USDT"},
 	}
-	want := []string{"BTC/USDT", "ETH/USDT", "SOL/USDT"}
+	want := []string{"BTC/USDT", "ETH/USDT", "RAW-USDT", "SOL/USDT"}
 	for run := 0; run < 20; run++ {
 		if got := volumeMarketSymbols(markets); !slices.Equal(got, want) {
 			t.Fatalf("run %d market symbols = %v, want %v", run, got, want)

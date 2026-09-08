@@ -11,6 +11,7 @@ import (
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
@@ -105,7 +106,10 @@ func consumeSeriesWriteQ(workNum int) {
 			sidLock.Lock()
 			delete(sidMap, job.Sid)
 			sidLock.Unlock()
-			trySaveSeries(job, tfSecs, mntSta, hourSta)
+			if err := trySaveSeries(job, tfSecs, mntSta, hourSta); err != nil {
+				log.Error("save series fail", zap.Int32("sid", job.Sid), zap.Error(err))
+				return
+			}
 			saveCost = time.Since(start)
 			// After the series is written to the database, notify robots to avoid repeated insertion.
 			// 写入时序数据到数据库后，才发消息通知机器人，避免重复插入。
@@ -839,6 +843,15 @@ func RunSpider(addr string) *errs.Error {
 }
 
 func RunSpiderWith(addr string, startup SpiderStartupFunc) *errs.Error {
+	return legacygate.With(func() *errs.Error {
+		return RunSpiderWithSession(addr, startup)
+	})
+}
+
+// RunSpiderWithSession runs the spider while the caller owns the legacy gate.
+// It is the non-reentrant form for composition roots that already hold an
+// opt.WithLegacySession or legacygate session.
+func RunSpiderWithSession(addr string, startup SpiderStartupFunc) *errs.Error {
 	return newSpiderRuntime().run(spiderContext(), addr, startup)
 }
 

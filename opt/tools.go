@@ -24,6 +24,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
@@ -49,18 +50,31 @@ Compare the exchange export order records with the backtest order records.
 对比交易所导出订单记录和回测订单记录。
 */
 func CompareExgBTOrders(args []string) error {
-	command := NewCompareExgBTOrdersCommand()
-	command.SetArgs(args)
-	return command.Execute()
+	return WithLegacySession(func(LegacySession) error {
+		command, _ := newCompareExgBTOrdersCommand()
+		command.SetArgs(args)
+		return command.Execute()
+	})
 }
 
 func NewCompareExgBTOrdersCommand() *cobra.Command {
+	command, options := newCompareExgBTOrdersCommand()
+	command.RunE = func(_ *cobra.Command, _ []string) error {
+		return WithLegacySession(func(LegacySession) error {
+			return compareExgBTOrders(options)
+		})
+	}
+	return command
+}
+
+func newCompareExgBTOrdersCommand() (*cobra.Command, *compareOrdersOptions) {
 	options := &compareOrdersOptions{}
 	command := &cobra.Command{
-		Use:     "cmp-orders",
-		Aliases: []string{"cmp_orders"},
-		Short:   "compare exchange orders with a backtest",
-		Args:    cobra.NoArgs,
+		Use:         "cmp-orders",
+		Aliases:     []string{"cmp_orders"},
+		Short:       "compare exchange orders with a backtest",
+		Args:        cobra.NoArgs,
+		Annotations: map[string]string{legacygate.Annotation: "1"},
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return compareExgBTOrders(options)
 		},
@@ -71,7 +85,7 @@ func NewCompareExgBTOrdersCommand() *cobra.Command {
 	command.Flags().StringVar(&options.backtest, "bt-path", "", "backtest order file")
 	command.Flags().Float64Var(&options.amountRate, "amt-rate", 0.1, "amount difference threshold from 0 to 1")
 	command.Flags().BoolVar(&options.skipUnhit, "skip-unhit", true, "skip backtest pairs with no exchange orders")
-	return command
+	return command, options
 }
 
 func compareExgBTOrders(options *compareOrdersOptions) error {
@@ -756,9 +770,11 @@ var (
 BtFactors 从全品种回测订单，对给定的截面因子进行滚动回测，输出回测结果到控制台和目录
 */
 func BtFactors(args []string) error {
-	command := NewBtFactorsCommand()
-	command.SetArgs(args)
-	return command.Execute()
+	return WithLegacySession(func(LegacySession) error {
+		command, _ := newBtFactorsCommand()
+		command.SetArgs(args)
+		return command.Execute()
+	})
 }
 
 type btFactorsOptions struct {
@@ -773,12 +789,23 @@ type btFactorsOptions struct {
 }
 
 func NewBtFactorsCommand() *cobra.Command {
+	command, options := newBtFactorsCommand()
+	command.RunE = func(_ *cobra.Command, _ []string) error {
+		return WithLegacySession(func(LegacySession) error {
+			return btFactors(options)
+		})
+	}
+	return command
+}
+
+func newBtFactorsCommand() (*cobra.Command, *btFactorsOptions) {
 	options := &btFactorsOptions{}
 	command := &cobra.Command{
-		Use:     "bt-factor",
-		Aliases: []string{"bt_factor"},
-		Short:   "backtest factors with orders",
-		Args:    cobra.NoArgs,
+		Use:         "bt-factor",
+		Aliases:     []string{"bt_factor"},
+		Short:       "backtest factors with orders",
+		Args:        cobra.NoArgs,
+		Annotations: map[string]string{legacygate.Annotation: "1"},
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return btFactors(options)
 		},
@@ -791,7 +818,7 @@ func NewBtFactorsCommand() *cobra.Command {
 	command.Flags().StringVar(&options.maxBack, "max-back", "2y", "maximum lookback period")
 	command.Flags().StringVar(&options.interval, "interval", "4M", "interval between refreshes")
 	command.Flags().BoolVar(&options.download, "down", false, "download missing klines")
-	return command
+	return command, options
 }
 
 func btFactors(options *btFactorsOptions) error {
@@ -1067,6 +1094,17 @@ func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[stri
 }
 
 func BuildBtResult(args *config.CmdArgs) *errs.Error {
+	return WithLegacySession(func(session LegacySession) *errs.Error {
+		return BuildBtResultWithSession(args, session)
+	})
+}
+
+func BuildBtResultWithSession(args *config.CmdArgs, session LegacySession) *errs.Error {
+	session.require()
+	return buildBtResult(args)
+}
+
+func buildBtResult(args *config.CmdArgs) *errs.Error {
 	core.SetRunMode(core.RunModeBackTest)
 	if args.InPath == "" {
 		return errs.NewMsg(errs.CodeRunTime, "-in for orders.gob is required")
@@ -1095,13 +1133,111 @@ func BuildBtResult(args *config.CmdArgs) *errs.Error {
 var odNextMS = make(map[string]int64)
 var odNextLock sync.Mutex
 
+type backtestCompareRuntime struct {
+	cfg            *config.Config
+	dataDir        func() string
+	name           string
+	lang           string
+	market         string
+	startAt        int64
+	exchange       banexg.BanExchange
+	nowMS          func() int64
+	nextMS         map[string]int64
+	nextLock       *sync.Mutex
+	defaultAccount string
+}
+
+func legacyBacktestCompareRuntime() *backtestCompareRuntime {
+	return &backtestCompareRuntime{
+		cfg:            &config.Data,
+		dataDir:        config.GetDataDir,
+		name:           config.Name,
+		lang:           config.ShowLangCode,
+		market:         core.Market,
+		startAt:        core.StartAt,
+		exchange:       exg.Default,
+		nowMS:          btime.UTCStamp,
+		nextMS:         odNextMS,
+		nextLock:       &odNextLock,
+		defaultAccount: config.DefAcc,
+	}
+}
+
+func runtimeBacktestCompareRuntime(deps biz.RuntimeDeps) (*backtestCompareRuntime, bool) {
+	if deps.Config == nil || deps.Core == nil || deps.Clock == nil || deps.Exchange == nil {
+		log.Error("runtime backtest comparison requires config, core, clock, and exchange")
+		return nil, false
+	}
+	cfg := deps.Config.View()
+	if cfg == nil || cfg.BTInLive == nil {
+		return nil, false
+	}
+	if deps.Config.DataDir == "" {
+		log.Error("runtime backtest comparison requires a data directory")
+		return nil, false
+	}
+	lang := cfg.ShowLangCode
+	if lang == "" {
+		lang = "en-US"
+	}
+	return &backtestCompareRuntime{
+		cfg:            cfg,
+		dataDir:        func() string { return deps.Config.DataDir },
+		name:           cfg.Name,
+		lang:           lang,
+		market:         deps.Core.Market,
+		startAt:        deps.Core.StartAt,
+		exchange:       deps.Exchange,
+		nowMS:          deps.Clock.TimeMS,
+		nextMS:         make(map[string]int64),
+		nextLock:       &sync.Mutex{},
+		defaultAccount: firstRuntimeAccount(cfg.Accounts),
+	}, true
+}
+
+func firstRuntimeAccount(accounts map[string]*config.AccountConfig) string {
+	names := make([]string, 0, len(accounts))
+	for account, cfg := range accounts {
+		if cfg != nil {
+			names = append(names, account)
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
 // BacktestToCompare 实盘时定期回测对比持仓
 func BacktestToCompare() {
+	backtestToCompare(legacyBacktestCompareRuntime())
+}
+
+// BacktestToCompareWithRuntime runs the live comparison using one explicit
+// runtime. The child backtest process enters its own legacy session through
+// the normal CLI entry; the parent only reads the supplied runtime state.
+func BacktestToCompareWithRuntime(deps biz.RuntimeDeps) {
+	runtime, ok := runtimeBacktestCompareRuntime(deps)
+	if !ok {
+		return
+	}
+	backtestToCompare(runtime)
+}
+
+func backtestToCompare(runtime *backtestCompareRuntime) {
+	if runtime == nil || runtime.cfg == nil || runtime.exchange == nil || runtime.nowMS == nil ||
+		runtime.nextMS == nil || runtime.nextLock == nil {
+		return
+	}
+	cfg := runtime.cfg.Clone()
+	if cfg == nil || cfg.BTInLive == nil {
+		return
+	}
 	runArgs := make([]string, 0, 4)
 	runArgs = append(runArgs, "backtest")
-	btCfg := config.BTInLive
-	cfg := config.Data
-	account := config.DefAcc
+	btCfg := cfg.BTInLive
+	account := runtime.defaultAccount
 	if btCfg.Acount != "" && len(cfg.Accounts) > 0 {
 		accCfg, _ := cfg.Accounts[btCfg.Acount]
 		cfg.Accounts = make(map[string]*config.AccountConfig)
@@ -1110,20 +1246,20 @@ func BacktestToCompare() {
 			account = btCfg.Acount
 		}
 	}
-	if !banexg.IsContract(core.Market) {
+	if !banexg.IsContract(runtime.market) {
 		return
 	}
-	posList, err2 := exg.Default.FetchAccountPositions(nil, map[string]interface{}{
+	posList, err2 := runtime.exchange.FetchAccountPositions(nil, map[string]interface{}{
 		banexg.ParamAccount:     account,
-		banexg.ParamSettleCoins: config.StakeCurrency,
+		banexg.ParamSettleCoins: cfg.StakeCurrency,
 	})
 	if err2 != nil {
 		log.Error("FetchAccountPositions fail", zap.Error(err2))
 		return
 	}
-	odNextLock.Lock()
-	defer odNextLock.Unlock()
-	curMS := btime.UTCStamp()
+	runtime.nextLock.Lock()
+	defer runtime.nextLock.Unlock()
+	curMS := runtime.nowMS()
 	liveOpens, lock := ormo.GetOpenODs(account)
 	minStartMS := curMS
 	liveOpenQtys := make(map[int64]*ormo.InOutOrder)
@@ -1147,7 +1283,12 @@ func BacktestToCompare() {
 		return
 	}
 	// 固定回测保存在某个目录
-	outPath := filepath.Join(config.GetDataDir(), "backtest", "bt_in_live_"+config.Name)
+	dataDir := runtime.dataDir()
+	if dataDir == "" {
+		log.Error("runtime backtest comparison requires a data directory")
+		return
+	}
+	outPath := filepath.Join(dataDir, "backtest", "bt_in_live_"+runtime.name)
 	err := os.RemoveAll(outPath)
 	if err != nil {
 		log.Error("BacktestToCompare clear fail", zap.Error(err))
@@ -1169,7 +1310,7 @@ func BacktestToCompare() {
 		log.Error("get Executable fail", zap.Error(err))
 		return
 	}
-	startMS := min(minStartMS, max(core.StartAt, curMS-86400000*30))
+	startMS := min(minStartMS, max(runtime.startAt, curMS-86400000*30))
 	startStr := strconv.FormatInt(startMS, 10)
 	endStr := strconv.FormatInt(curMS, 10)
 	runArgs = append(runArgs, "-timeend", endStr, "-timestart", startStr)
@@ -1209,13 +1350,13 @@ func BacktestToCompare() {
 	btMore := make(map[string]int64)
 	liveMore := make(map[string]int64)
 	liveAmts := make(map[string]float64)
-	dupNexts := maps.Clone(odNextMS)
+	dupNexts := maps.Clone(runtime.nextMS)
 	for _, od := range liveOpenQtys {
 		holdQty := od.HoldAmount()
 		odKey := od.KeyAlign()
 		tfMSecs := int64(utils2.TFToSecs(od.Timeframe) * 1000)
-		odNext, _ := odNextMS[odKey]
-		odNextMS[odKey] = utils2.AlignTfMSecs(curMS, tfMSecs) + tfMSecs
+		odNext, _ := runtime.nextMS[odKey]
+		runtime.nextMS[odKey] = utils2.AlignTfMSecs(curMS, tfMSecs) + tfMSecs
 		btOd, _ := btOpens[odKey]
 		delete(dupNexts, odKey)
 		if btOd != nil || curMS < odNext || curMS-od.RealEnterMS() < tfMSecs {
@@ -1239,7 +1380,7 @@ func BacktestToCompare() {
 	}
 	// 清理已完成订单的key
 	for key := range dupNexts {
-		delete(odNextMS, key)
+		delete(runtime.nextMS, key)
 	}
 	for _, od := range btOpens {
 		btMore[od.KeyAlign()] = od.RealEnterMS()
@@ -1247,7 +1388,7 @@ func BacktestToCompare() {
 	// 和交易所仓位对比
 	exgMatch, exgDiff := compareLocalWithExg(posList, localAmts, liveAmts)
 	// 发送对比邮件报告
-	sendPosCompareReport(matchOpens, btMore, liveMore, exgMatch, exgDiff, outPath)
+	sendPosCompareReport(runtime, matchOpens, btMore, liveMore, exgMatch, exgDiff, outPath)
 }
 
 func compareLocalWithExg(posList []*banexg.Position, localAmts, liveAmts map[string]float64) (map[string]float64, map[string][3]float64) {
@@ -1267,16 +1408,19 @@ func compareLocalWithExg(posList []*banexg.Position, localAmts, liveAmts map[str
 	return matchSizes, diffSizes
 }
 
-func sendPosCompareReport(matchOpens []string, btMore, liveMore map[string]int64, exgMatch map[string]float64, exgDiff map[string][3]float64, btDir string) {
-	title := config.Name + " " + config.GetLangMsg("backtest_regular", "定期回测")
-	liveBadOpen := config.GetLangMsg("live_bad_open", "实盘误开")
-	liveNoOpen := config.GetLangMsg("live_no_open", "实盘未开")
-	liveBadPos := config.GetLangMsg("live_bad_pos", "仓位不符")
+func sendPosCompareReport(runtime *backtestCompareRuntime, matchOpens []string, btMore, liveMore map[string]int64, exgMatch map[string]float64, exgDiff map[string][3]float64, btDir string) {
+	langMsg := func(code, defaultValue string) string {
+		return config.GetLangMsgBy(runtime.lang, code, defaultValue)
+	}
+	title := runtime.name + " " + langMsg("backtest_regular", "定期回测")
+	liveBadOpen := langMsg("live_bad_open", "实盘误开")
+	liveNoOpen := langMsg("live_no_open", "实盘未开")
+	liveBadPos := langMsg("live_bad_pos", "仓位不符")
 	allMatch := true
 	var attFileData []byte
 	var mail = &utils.EmailTask{}
 	if len(btMore) == 0 && len(liveMore) == 0 && len(exgDiff) == 0 {
-		title += config.GetLangMsg("normal", "正常")
+		title += langMsg("normal", "正常")
 	} else {
 		const maxFileSize = 30 * 1024 * 1024 // 30MB
 		var err error
@@ -1287,7 +1431,7 @@ func sendPosCompareReport(matchOpens []string, btMore, liveMore map[string]int64
 			mail.AttachFileBy("result.zip", attFileData, "")
 		}
 		allMatch = false
-		title += config.GetLangMsg("abnormal", "异常")
+		title += langMsg("abnormal", "异常")
 		title += fmt.Sprintf(", %s: %d %s: %d",
 			liveBadOpen, len(liveMore), liveNoOpen, len(btMore),
 		)
@@ -1304,7 +1448,7 @@ func sendPosCompareReport(matchOpens []string, btMore, liveMore map[string]int64
 	for key, stamp := range btMore {
 		b.WriteString(fmt.Sprintf("\t%s should open at %s\n", key, btime.ToDateStr(stamp, core.DefaultDateFmt)))
 	}
-	liveOpenMatch := config.GetLangMsg("live_open_match", "开仓匹配")
+	liveOpenMatch := langMsg("live_open_match", "开仓匹配")
 	b.WriteString("\n" + liveOpenMatch + ":\n")
 	for _, key := range matchOpens {
 		b.WriteString(fmt.Sprintf("\t%s\n", key))
@@ -1314,15 +1458,15 @@ func sendPosCompareReport(matchOpens []string, btMore, liveMore map[string]int64
 		b.WriteString(fmt.Sprintf("\t%s in exg: %.6f but in local: %.6f, and in live: %.6f\n",
 			key, amts[0], amts[1], amts[2]))
 	}
-	livePosMatch := config.GetLangMsg("live_pos_match", "交易所持仓匹配")
+	livePosMatch := langMsg("live_pos_match", "交易所持仓匹配")
 	b.WriteString("\n" + livePosMatch + ":\n")
 	for key, amt := range exgMatch {
 		b.WriteString(fmt.Sprintf("\t%s with amt: %.6f\n", key, amt))
 	}
-	if len(config.BTInLive.MailTo) > 0 {
+	if runtime.cfg != nil && runtime.cfg.BTInLive != nil && len(runtime.cfg.BTInLive.MailTo) > 0 {
 		mail.Subject = title
 		mail.Body = b.String()
-		mail.To = config.BTInLive.MailTo
+		mail.To = runtime.cfg.BTInLive.MailTo
 		err := utils.SendEmail(mail)
 		if err != nil {
 			log.Error("send mail fail", zap.Strings("to", mail.To), zap.Error(err))

@@ -355,7 +355,7 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 		return historicalListingPrefix{}, false
 	}
 	minuteStart := alignPhysicalKlineCeil(exs.ListMs, 60_000,
-		int64(exg.GetAlignOff(exs.Exchange, 60)*1000))
+		int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, 60)*1000))
 	if historicalListingPrefixStartsBefore(coverage, exs.Symbol, "1m", minuteStart, fullStart) {
 		return historicalListingPrefix{}, false
 	}
@@ -370,7 +370,7 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 		return historicalListingPrefix{}, false
 	}
 	storageStepMS := int64(storageSecs * 1000)
-	storageOffsetMS := int64(exg.GetAlignOff(exs.Exchange, storageSecs) * 1000)
+	storageOffsetMS := int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, storageSecs) * 1000)
 	storageStart := alignPhysicalKlineCeil(exs.ListMs, storageStepMS, storageOffsetMS)
 	if storageTF != timeframe && storageStart < fullStart {
 		if historicalListingPrefixStartsBefore(coverage, exs.Symbol, storageTF, storageStart, fullStart) {
@@ -465,7 +465,7 @@ func prependHistoricalListingPrefix(exs *ExSymbol, prefix historicalListingPrefi
 		return nil, errs.NewMsg(core.ErrInvalidTF, "invalid historical storage timeframe: %s", prefix.storageTF)
 	}
 	storageMS := int64(storageSecs * 1000)
-	offsetMS := int64(exg.GetAlignOff(exs.Exchange, storageSecs) * 1000)
+	offsetMS := int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, storageSecs) * 1000)
 	aggregated, finished, aggErr := ResampleDataSeries(exs, prefix.storageTF, minuteRows, nil,
 		storageMS, 0, minuteMS, offsetMS, false)
 	wantTimeMS := alignPhysicalKlineFloor(prefix.minuteStartMS, storageMS, offsetMS)

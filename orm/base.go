@@ -690,6 +690,9 @@ func (q *SubQueries) CopyFrom(ctx context.Context, tableName pgx.Identifier, col
 }
 
 func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *errs.Error) {
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
 	if hasConfiguredMarketSnapshot() {
 		markets := make(banexg.MarketMap)
 		if err := applyConfiguredMarketSnapshot(exchange, markets); err != nil {
@@ -698,23 +701,46 @@ func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *e
 		return markets, nil
 	}
 	exInfo := exchange.Info()
-	args := make(map[string]interface{})
-	if exInfo.ID == "china" && exInfo.MarketType != banexg.MarketSpot {
-		items := GetExSymbols(exInfo.ID, exInfo.MarketType)
-		symbols := make([]string, 0, len(items))
-		for _, it := range items {
-			if it.Symbol == "" {
-				return nil, errs.NewMsg(errs.CodeRunTime, "symbol empty for sid: %v", it.ID)
-			}
-			symbols = append(symbols, it.Symbol)
+	if exInfo == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange info is required")
+	}
+	markets, err := exchange.LoadMarkets(reload, nil)
+	if err != nil || len(markets) > 0 || !exchange.IsContract(exInfo.MarketType) {
+		return markets, err
+	}
+	items := GetExSymbols(exInfo.ID, exInfo.MarketType)
+	if len(items) == 0 {
+		return markets, nil
+	}
+	loader := symbolScopedMarketLoader(exchange)
+	if loader == nil {
+		// A symbol-scoped reload is an adapter capability, not a generic
+		// contract-market assumption. Keep the adapter's result unchanged when
+		// it does not opt into that operation.
+		return markets, nil
+	}
+	symbols := make([]string, 0, len(items))
+	for _, it := range items {
+		if it == nil || it.Symbol == "" {
+			return nil, errs.NewMsg(errs.CodeRunTime, "symbol empty for cached market")
 		}
-		args[banexg.ParamSymbols] = symbols
+		symbols = append(symbols, it.Symbol)
 	}
-	markets, err := exchange.LoadMarkets(reload, args)
-	if err != nil {
-		return nil, err
+	return loader.LoadMarketsForSymbols(true, symbols)
+}
+
+func symbolScopedMarketLoader(exchange banexg.BanExchange) banexg.SymbolScopedMarketLoader {
+	if exchange == nil {
+		return nil
 	}
-	return markets, nil
+	if loader, ok := exchange.(banexg.SymbolScopedMarketLoader); ok {
+		return loader
+	}
+	if wrapper, ok := exchange.(*exg.BotExchange); ok && wrapper != nil {
+		loader, _ := wrapper.BanExchange.(banexg.SymbolScopedMarketLoader)
+		return loader
+	}
+	return nil
 }
 
 func InitExg(exchange banexg.BanExchange) *errs.Error {
@@ -890,7 +916,8 @@ func tryRepairQuestDBMissingPartition(ctx context.Context, db DBTX, err error, r
 	return true, nil
 }
 
-// runQdbMigrations executes QuestDB schema migrations (best-effort, non-transactional).
+// runQdbMigrations executes QuestDB schema migrations as ordered, non-transactional
+// steps. Every database, visibility, and migration error is returned to the caller.
 func runQdbMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 	if ctx == nil {
 		ctx = context.Background()

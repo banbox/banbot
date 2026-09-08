@@ -125,6 +125,113 @@ func TestSeriesWatcherOnSpiderSeriesKeepsDataSeriesRows(t *testing.T) {
 	}
 }
 
+type noFetchExchange struct {
+	banexg.BanExchange
+}
+
+func (noFetchExchange) HasApi(string, string) bool { return false }
+
+type fetchExchange struct {
+	banexg.BanExchange
+}
+
+func (fetchExchange) HasApi(string, string) bool { return true }
+
+type legacyFacadePanicExchange struct {
+	banexg.BanExchange
+}
+
+func (legacyFacadePanicExchange) GetMarket(string) (*banexg.Market, *errs.Error) {
+	panic("gap recovery accessed legacy symbol facade")
+}
+
+func TestGapRecoverySymbolUsesExplicitStateWithoutLegacyFacade(t *testing.T) {
+	oldDefault := exg.Default
+	exg.Default = legacyFacadePanicExchange{}
+	t.Cleanup(func() { exg.Default = oldDefault })
+
+	const pair = "RATE_US"
+	symbols := orm.NewSymbolStateWithIdentity("china", "spot")
+	if err := symbols.SetExSymbols([]*orm.ExSymbol{{
+		ID: 2, Exchange: "china", Market: "spot", Symbol: pair,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := gapRecoverySymbol(symbols, &orm.ExSymbol{
+		ID: 1, Exchange: "china", Market: "spot", Symbol: pair,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != 2 {
+		t.Fatalf("gap recovery symbol ID = %d, want explicit-state ID 2", got.ID)
+	}
+}
+
+func TestAutoFetchOhlcvUsesSymbolExchange(t *testing.T) {
+	oldConfig, oldDefault := config.Exchange, exg.Default
+	config.Exchange = &config.ExchangeConfig{Name: "china", Items: map[string]map[string]interface{}{}}
+	exg.Default = fetchExchange{}
+	t.Cleanup(func() { config.Exchange, exg.Default = oldConfig, oldDefault })
+
+	_, rows, err := autoFetchOhlcv(&orm.ExSymbol{Exchange: "china", Market: "spot", Symbol: "RATE_US"}, "1m", 1_700_000_000_000, 1_700_000_060_000)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("autoFetchOhlcv used the wrong exchange: rows=%v err=%v", rows, err)
+	}
+}
+
+func TestSeriesWatcherGapRecoveryUsesExplicitSymbolState(t *testing.T) {
+	const pair = "RATE_US"
+	const startMS = int64(1_700_000_040_000)
+	oldConfig := config.Exchange
+	config.Exchange = &config.ExchangeConfig{Name: "china", Items: map[string]map[string]interface{}{}}
+	t.Cleanup(func() { config.Exchange = oldConfig })
+	legacyRestore, err := orm.InstallFrozenExSymbols([]*orm.ExSymbol{{
+		ID: 1, Exchange: "china", Market: "spot", Symbol: pair, AggRules: `{"rate":"sum"}`,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(legacyRestore)
+	oldDefault := exg.Default
+	exg.Default = noFetchExchange{}
+	t.Cleanup(func() { exg.Default = oldDefault })
+
+	symbols := orm.NewSymbolStateWithIdentity("china", "spot")
+	if err := symbols.SetExSymbols([]*orm.ExSymbol{{
+		ID: 2, Exchange: "china", Market: "spot", Symbol: pair, AggRules: `{"rate":"avg"}`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	exs := symbols.GetExSymbol2("china", "spot", pair)
+	w := &SeriesWatcher{
+		symbols: symbols,
+		jobs: map[string]map[string]*PairTFCache{
+			"ohlcv": {pair: {TimeFrame: "2m", TFSecs: 120, exSymbol: exs, SubNextMS: startMS - 60_000}},
+		},
+	}
+	var got *SeriesMsg
+	w.OnDataMsg = func(msg *SeriesMsg) { got = msg }
+	rows := []*orm.DataSeries{
+		{Source: "rates", Sid: exs.ID, TimeMS: startMS, EndMS: startMS + 60_000, Values: map[string]any{"rate": 1.0}},
+		{Source: "rates", Sid: exs.ID, TimeMS: startMS + 60_000, EndMS: startMS + 120_000, Values: map[string]any{"rate": 3.0}},
+	}
+	raw, marshalErr := utils2.Marshal(NotifySeries{TFSecs: 60, Interval: 60, Rows: rows})
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+
+	w.onSpiderSeries(&utils.IOMsgRaw{Action: "ohlcv_china_spot_" + pair, Data: raw})
+
+	if got == nil || len(got.Rows) != 1 {
+		t.Fatalf("expected one recovered aggregate, got %+v", got)
+	}
+	if got.Rows[0].Sid != exs.ID || got.Rows[0].Values["rate"] != 2.0 {
+		t.Fatalf("aggregate used wrong symbol catalog: %+v", got.Rows[0])
+	}
+}
+
 func TestSaveKlines(t *testing.T) {
 	t.Skip("integration test (requires writable kline tables and backend-specific SQL support)")
 	err := initApp()

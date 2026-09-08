@@ -1,10 +1,13 @@
 package orm
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestKLineSeriesStoreRejectsReservedColumns(t *testing.T) {
@@ -65,7 +68,7 @@ func TestKLineSeriesStoreBuildsBackendSQL(t *testing.T) {
 }
 
 func TestNormalizeKLineSeriesRowsFillsSidAndSorts(t *testing.T) {
-	rows, err := normalizeKLineSeriesRows(7, []SeriesField{{Name: "metric_value", Type: "float"}}, []*DataRecord{
+	rows, err := normalizeKLineSeriesRows(7, []*DataRecord{
 		{TimeMS: 200, Values: map[string]any{"metric_value": 2.0}},
 		{TimeMS: 100, Values: map[string]any{"metric_value": 1.0}},
 	})
@@ -77,7 +80,7 @@ func TestNormalizeKLineSeriesRowsFillsSidAndSorts(t *testing.T) {
 	}
 }
 
-func TestScanKLineSeriesRecordOmitsNullFields(t *testing.T) {
+func TestScanKLineSeriesRecordPreservesNullFields(t *testing.T) {
 	rec, err := scanKLineSeriesRecord(rowScannerFunc(func(dest ...any) error {
 		*(dest[0].(*int32)) = 7
 		*(dest[1].(*int64)) = 100
@@ -91,11 +94,49 @@ func TestScanKLineSeriesRecordOmitsNullFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scanKLineSeriesRecord failed: %v", err)
 	}
-	if _, ok := rec.Values["metric_a"]; ok {
-		t.Fatalf("expected null field to be omitted, got %+v", rec.Values)
+	if got, ok := rec.Values["metric_a"]; !ok || got != nil {
+		t.Fatalf("expected null field key with nil value, got %+v", rec.Values)
 	}
 	if got := rec.Values["metric_b"]; got != 2.5 {
 		t.Fatalf("expected valid field to be scanned, got %+v", rec.Values)
+	}
+}
+
+func TestNormalizeKLineSeriesRowsAllowsMissingAndExplicitNullFields(t *testing.T) {
+	rows, err := normalizeKLineSeriesRows(7, []*DataRecord{
+		{TimeMS: 100, Values: nil},
+		{TimeMS: 200, Values: map[string]any{"metric_value": nil}},
+	})
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("nullable kline series rows = (%+v, %v), want two rows", rows, err)
+	}
+}
+
+func TestKLineSeriesStoreEnsureLockedRunsUnderHeldTableReadLock(t *testing.T) {
+	withFreshCompactState(t)
+	oldQuest := IsQuestDB
+	IsQuestDB = true
+	t.Cleanup(func() { IsQuestDB = oldQuest })
+
+	info := NewKLineSeriesInfo("custom_metric", "1m", []SeriesField{
+		{Name: "metric_value", Type: "float"},
+		{Name: "note", Type: "string"},
+	})
+	var statements []string
+	db := &visibilityDBStub{exec: func(sql string, _ ...interface{}) (pgconn.CommandTag, error) {
+		statements = append(statements, sql)
+		return pgconn.CommandTag{}, nil
+	}}
+
+	tableLock := cptState.getTableLock(info.Binding.Table)
+	tableLock.RLock()
+	err := (&KLineSeriesStore{Info: info}).ensureLocked(context.Background(), New(db))
+	tableLock.RUnlock()
+	if err != nil {
+		t.Fatalf("ensure under held table read lock failed: %v", err)
+	}
+	if len(statements) != len(info.Binding.Fields) {
+		t.Fatalf("expected one DDL statement per field, got %d", len(statements))
 	}
 }
 

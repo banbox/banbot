@@ -7,6 +7,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -189,6 +190,14 @@ func isRawContract(name string) bool {
 }
 
 func RunFormatTick(args *config.CmdArgs) *errs.Error {
+	return legacygate.With(func() *errs.Error {
+		return RunFormatTickWithSession(args)
+	})
+}
+
+// RunFormatTickWithSession runs the formatter while the caller owns the
+// legacy gate.
+func RunFormatTickWithSession(args *config.CmdArgs) *errs.Error {
 	if args.InPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
 	}
@@ -265,6 +274,14 @@ func RunFormatTick(args *config.CmdArgs) *errs.Error {
 }
 
 func Build1mWithTicks(args *config.CmdArgs) *errs.Error {
+	return legacygate.With(func() *errs.Error {
+		return Build1mWithTicksWithSession(args)
+	})
+}
+
+// Build1mWithTicksWithSession runs the tick builder while the caller owns the
+// legacy gate.
+func Build1mWithTicksWithSession(args *config.CmdArgs) *errs.Error {
 	return build1mWithTicks(args)
 }
 

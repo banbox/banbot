@@ -52,9 +52,21 @@ func AddGroup(name, help string) {
 	extraGroups = append(extraGroups, commandGroup{name: name, help: help})
 }
 
-// AddCommand registers a Cobra command. Command-specific flags should be local
-// variables captured by RunE, so extending the CLI does not require CmdArgs changes.
+// AddCommand registers a Cobra command under the process-wide legacy gate.
+// Command-specific flags should be local variables captured by RunE, so
+// extending the CLI does not require CmdArgs changes.
 func AddCommand(parent string, command *cobra.Command) {
+	registerCommand(parent, withLegacyCommand(command))
+}
+
+// AddRuntimeCommand registers a command whose callback owns explicit Runtime
+// state. It deliberately bypasses the legacy gate so independent runtimes can
+// execute concurrently.
+func AddRuntimeCommand(parent string, command *cobra.Command) {
+	registerCommand(parent, command)
+}
+
+func registerCommand(parent string, command *cobra.Command) {
 	if command == nil {
 		panic("command must not be nil")
 	}
@@ -87,56 +99,60 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 		groups[parent].AddCommand(command)
 	}
 
-	add("", newConfigCommand("trade", "live trade", RunTrade, false,
+	add("", newConfigCommand("trade", "live trade", runTradeEntry, false,
 		bindStakeAmount, bindPairs, bindSpider, bindOut))
 	add("", newInternalCommand())
-	add("", newConfigCommand("backtest", "backtest with strategies and data", RunBackTest, true,
+	add("", newLegacySessionConfigCommand("backtest", "backtest with strategies and data", runBackTestEntry, true,
 		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate, bindBTStrict))
-	add("", newConfigCommand("spider", "start the spider", RunSpider, false))
-	add("", newConfigCommand("optimize", "run hyperparameter optimization", opt.RunOptimize, true,
+	add("", newConfigCommand("spider", "start the spider", runSpider, false))
+	add("", newLegacySessionConfigCommand("optimize", "run hyperparameter optimization", opt.RunOptimizeWithSession, true,
 		bindOut, bindOptRounds, bindSampler, bindPicker, bindEachPairs, bindConcur, bindBTStrict))
 	add("", newConfigCommand("init", "initialize config.yml/config.local.yml in the data directory", runInit, true))
-	add("", withAliases(newConfigCommand("bt-opt", "run rolling backtests with hyperparameter optimization", opt.RunBTOverOpt, true,
+	add("", withAliases(newLegacySessionConfigCommand("bt-opt", "run rolling backtests with hyperparameter optimization", opt.RunBTOverOptWithSession, true,
 		bindReviewPeriod, bindRunPeriod, bindOptRounds, bindSampler, bindPicker, bindEachPairs,
 		bindConcur, bindAlpha, bindPairPicker, bindBTStrict), "bt_opt"))
-	add("", web.NewCommand())
+	add("", withLegacyCommand(web.NewCommand()))
 
 	add("data", newConfigCommand("export", "export data from the database to protobuf files", runDataExport, true,
 		bindOut, bindConcur))
 	add("data", newConfigCommand("import", "import protobuf files into the database", runDataImport, true,
 		bindIn, bindConcur))
 
-	add("kline", newConfigCommand("down", "download kline data from an exchange", RunDownData, true,
+	add("kline", newConfigCommand("down", "download kline data from an exchange", runDownData, true,
 		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindTimeFrames, bindMedium))
-	add("kline", newConfigCommand("repair-ranges", "rebuild kline range metadata from stored bars", RunRepairKlineRanges, true,
+	add("kline", newConfigCommand("repair-ranges", "rebuild kline range metadata from stored bars", runRepairKlineRanges, true,
 		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindTimeFrames))
-	add("kline", newConfigCommand("load", "load kline data from zip or CSV files", LoadKLinesToDB, true, bindIn))
-	add("kline", newConfigCommand("agg", "aggregate kline data into larger timeframes", AggKlineBigs, true,
+	add("kline", newConfigCommand("load", "load kline data from zip or CSV files", loadKLinesToDB, true, bindIn))
+	add("kline", newConfigCommand("agg", "aggregate kline data into larger timeframes", aggKlineBigs, true,
 		bindPairs, bindTimeFrames))
 	add("kline", newConfigCommand("export", "export kline data from the database to CSV files", runExportData, true,
 		bindOut, bindPairs, bindTimeFrames, bindAdjustment, bindTimeZone))
 	add("kline", newConfigCommand("purge", "delete matching kline data", runPurgeData, true,
 		bindRealExchange, bindPairs, bindTimeFrames))
-	add("kline", newConfigCommand("correct", "synchronize klines between timeframes", RunKlineCorrect, true, bindPairs))
-	add("kline", newConfigCommand("verify", "verify kline data against series-range metadata", RunVerifyData, true,
+	add("kline", newConfigCommand("correct", "synchronize klines between timeframes", runKlineCorrect, true, bindPairs))
+	add("kline", newConfigCommand("verify", "verify kline data against series-range metadata", runVerifyData, true,
 		bindPairs, bindTables, bindBatchSize))
-	add("kline", withAliases(newConfigCommand("adj-calc", "recalculate adjustment factors", RunKlineAdjFactors, true,
+	add("kline", withAliases(newConfigCommand("adj-calc", "recalculate adjustment factors", runKlineAdjFactors, true,
 		bindOut, bindPairs), "adj_calc"))
 	add("kline", withAliases(newConfigCommand("adj-export", "export adjustment factors to CSV", biz.ExportAdjFactors, true,
 		bindOut, bindPairs, bindTimeZone), "adj_export"))
 
-	add("series", newConfigCommand("down", "download registered custom series", RunSeriesDown, true,
+	add("series", newConfigCommand("down", "download registered custom series", runSeriesDown, true,
 		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindSeriesSources))
 	add("series", newSeriesListCommand())
 
-	add("tick", newConfigCommand("convert", "convert tick data formats", data.RunFormatTick, true, bindIn, bindOut))
-	add("tick", withAliases(newConfigCommand("to-kline", "build klines from tick data", data.Build1mWithTicks, true, bindIn, bindOut), "to_kline"))
+	add("tick", newLegacySessionConfigCommand("convert", "convert tick data formats", func(args *config.CmdArgs, _ opt.LegacySession) *errs.Error {
+		return data.RunFormatTickWithSession(args)
+	}, true, bindIn, bindOut))
+	add("tick", withAliases(newLegacySessionConfigCommand("to-kline", "build klines from tick data", func(args *config.CmdArgs, _ opt.LegacySession) *errs.Error {
+		return data.Build1mWithTicksWithSession(args)
+	}, true, bindIn, bindOut), "to_kline"))
 
-	add("tool", withAliases(newConfigCommand("collect-opt", "collect and rank optimization results", opt.CollectOptLog, true,
+	add("tool", withAliases(newLegacySessionConfigCommand("collect-opt", "collect and rank optimization results", opt.CollectOptLogWithSession, true,
 		bindIn, bindPicker), "collect_opt"))
-	add("tool", withAliases(newConfigCommand("sim-bt", "run a backtest simulation from a report", opt.RunSimBT, true,
+	add("tool", withAliases(newLegacySessionConfigCommand("sim-bt", "run a backtest simulation from a report", opt.RunSimBTWithSession, true,
 		bindIn, bindBTStrict), "sim_bt"))
-	add("tool", withAliases(newConfigCommand("test-pickers", "test pickers in rolling backtests", opt.RunRollBTPicker, true,
+	add("tool", withAliases(newLegacySessionConfigCommand("test-pickers", "test pickers in rolling backtests", opt.RunRollBTPickerWithSession, true,
 		bindReviewPeriod, bindRunPeriod, bindOptRounds, bindSampler, bindEachPairs, bindConcur, bindPicker, bindPairPicker,
 		bindBTStrict), "test_pickers"))
 	add("tool", withAliases(newConfigCommand("load-cal", "load calendars", biz.LoadCalendars, true, bindIn), "load_cal"))
@@ -145,16 +161,16 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 		bindIn, bindInType, bindOut), "calc_perfs"))
 	add("tool", newConfigCommand("corr", "calculate a symbol correlation matrix", biz.CalcCorrelation, true,
 		bindOut, bindOutType, bindTimeFrames, bindBatchSize, bindRunEvery))
-	add("tool", newMergeAssetsCommand())
-	add("tool", opt.NewCompareExgBTOrdersCommand())
-	add("tool", strat.NewListStratsCommand())
-	add("tool", opt.NewBtFactorsCommand())
-	add("tool", withAliases(newConfigCommand("bt-result", "build a backtest result from orders.gob and config", opt.BuildBtResult, true,
+	add("tool", withLegacyCommand(newMergeAssetsCommand()))
+	add("tool", withLegacyCommand(opt.NewCompareExgBTOrdersCommand()))
+	add("tool", withLegacyCommand(strat.NewListStratsCommand()))
+	add("tool", withLegacyCommand(opt.NewBtFactorsCommand()))
+	add("tool", withAliases(newLegacySessionConfigCommand("bt-result", "build a backtest result from orders.gob and config", opt.BuildBtResultWithSession, true,
 		bindIn, bindOut, bindBTStrict), "bt_result"))
 	add("tool", withAliases(newPositionalCommand("test-live-bars", "compare live-trade klines with local data", "DUMP_FILE", biz.TestKLineConsistency), "test_live_bars"))
 
-	add("live", biz.NewDownExgOrdersCommand())
-	add("live", live.NewTradeCloseCommand())
+	add("live", withLegacyCommand(biz.NewDownExgOrdersCommand()))
+	add("live", withLegacyCommand(live.NewTradeCloseCommand()))
 }
 
 func withAliases(command *cobra.Command, aliases ...string) *cobra.Command {

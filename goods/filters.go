@@ -31,12 +31,25 @@ func (f *BaseFilter) GetName() string {
 }
 
 func (f *AgeFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+}
+
+func (f *AgeFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
 	if f.Min == 0 && f.Max == 0 {
 		return symbols, nil
 	}
+	if exchange == nil {
+		exchange = exg.Default
+	}
 	dayMs := int64(utils2.TFToSecs("1d") * 1000)
 	result := make([]string, 0, len(symbols))
-	exsMap := orm.GetExSymbols(core.ExgName, core.Market)
+	exInfo := exchange.Info()
+	var exsMap map[int32]*orm.ExSymbol
+	if state == nil {
+		exsMap = orm.GetExSymbols(core.ExgName, core.Market)
+	} else {
+		exsMap = state.GetExSymbols(exInfo.ID, exInfo.MarketType)
+	}
 	sess, conn, err := orm.Conn(nil)
 	if err != nil {
 		return nil, err
@@ -54,7 +67,7 @@ func (f *AgeFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Erro
 			return nil, errs.NewMsg(errs.CodeNoMarketForPair, "unknown %v", p)
 		}
 	}
-	err = orm.EnsureListDates(sess, exg.Default, careMap, nil)
+	err = orm.EnsureListDatesWithState(sess, state, exchange, careMap, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -87,10 +100,14 @@ func (f *AgeFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Erro
 }
 
 func (f *VolumePairFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+}
+
+func (f *VolumePairFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
 	var symbolVols []*SymbolVol
 	backTf, backNum := utils.SecsToTfNum(utils2.TFToSecs(f.BackPeriod))
 	var err *errs.Error
-	symbolVols, err = GetSymbolVols(symbols, backTf, backNum, timeMS, true)
+	symbolVols, err = GetSymbolVolsWithSymbolState(state, exchange, symbols, backTf, backNum, timeMS, true)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +124,7 @@ func (f *VolumePairFilter) Filter(symbols []string, timeMS int64) ([]string, *er
 			break
 		}
 	}
-	resPairs, _ := filterByMinCost(symbolVols)
+	resPairs, _ := filterByMinCostWithExchange(exchange, symbolVols)
 	if f.LimitRate > 0 && f.LimitRate < 1 {
 		num := int(math.Round(f.LimitRate * float64(len(resPairs))))
 		resPairs = resPairs[:num]
@@ -132,6 +149,10 @@ func compareSymbolVol(a, b *SymbolVol) int {
 }
 
 func GetSymbolVols(symbols []string, tf string, num int, endMS int64, withEmpty bool) ([]*SymbolVol, *errs.Error) {
+	return GetSymbolVolsWithSymbolState(nil, exg.Default, symbols, tf, num, endMS, withEmpty)
+}
+
+func GetSymbolVolsWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, tf string, num int, endMS int64, withEmpty bool) ([]*SymbolVol, *errs.Error) {
 	var symbolVols = make([]*SymbolVol, 0)
 	callBack := func(symbol string, _ string, klines []*banexg.Kline, adjs []*orm.AdjInfo) {
 		if len(klines) == 0 || len(klines) < num {
@@ -155,8 +176,10 @@ func GetSymbolVols(symbols []string, tf string, num int, endMS int64, withEmpty 
 			}
 		}
 	}
-	exchange := exg.Default
-	err := orm.FastBulkOHLCV(exchange, symbols, tf, 0, endMS, num, callBack)
+	if exchange == nil {
+		exchange = exg.Default
+	}
+	err := orm.FastBulkOHLCVWithSymbolState(state, exchange, symbols, tf, 0, endMS, num, callBack)
 	if err != nil {
 		return nil, err
 	}
@@ -167,9 +190,15 @@ func GetSymbolVols(symbols []string, tf string, num int, endMS int64, withEmpty 
 }
 
 func filterByMinCost(symbols []*SymbolVol) ([]string, map[string]float64) {
+	return filterByMinCostWithExchange(exg.Default, symbols)
+}
+
+func filterByMinCostWithExchange(exchange banexg.BanExchange, symbols []*SymbolVol) ([]string, map[string]float64) {
 	res := make([]string, 0, len(symbols))
 	skip := make(map[string]float64)
-	exchange := exg.Default
+	if exchange == nil {
+		exchange = exg.Default
+	}
 	accCost := float64(0)
 	for name, cfg := range config.Accounts {
 		if cfg.NoTrade {
@@ -214,17 +243,30 @@ func filterByMinCost(symbols []*SymbolVol) ([]string, map[string]float64) {
 }
 
 func (f *VolumePairFilter) GenSymbols(timeMS int64) ([]string, *errs.Error) {
-	symbols := volumeMarketSymbols(exg.Default.GetCurMarkets())
+	return f.GenSymbolsWithSymbolState(nil, exg.Default, timeMS)
+}
+
+func (f *VolumePairFilter) GenSymbolsWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, timeMS int64) ([]string, *errs.Error) {
+	if exchange == nil {
+		exchange = exg.Default
+	}
+	symbols := volumeMarketSymbols(exchange.GetCurMarkets())
 	if len(symbols) == 0 {
 		return nil, errs.NewMsg(errs.CodeRunTime, "no symbols generate from VolumePairFilter")
 	}
-	return f.Filter(symbols, timeMS)
+	return f.FilterWithSymbolState(state, exchange, symbols, timeMS)
 }
 
 func volumeMarketSymbols(markets banexg.MarketMap) []string {
 	pairs := make([]string, 0, len(markets))
 	for _, pair := range slices.Sorted(maps.Keys(markets)) {
-		_, quote, _, _ := core.SplitSymbol(pair)
+		quote := ""
+		if market := markets[pair]; market != nil {
+			quote = market.Quote
+		}
+		if quote == "" {
+			_, quote, _, _ = core.SplitSymbol(pair)
+		}
 		if _, ok := config.StakeCurrencyMap[quote]; ok {
 			pairs = append(pairs, pair)
 		}
@@ -233,16 +275,26 @@ func volumeMarketSymbols(markets banexg.MarketMap) []string {
 }
 
 func (f *PriceFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	return filterByOHLCV(symbols, "1h", timeMS, 1, core.AdjFront, func(s string, klines []*banexg.Kline) bool {
+	return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+}
+
+func (f *PriceFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return filterByOHLCVWithSymbolState(state, exchange, symbols, "1h", timeMS, 1, core.AdjFront, func(s string, klines []*banexg.Kline) bool {
 		if len(klines) == 0 {
 			return f.AllowEmpty
 		}
-		return f.validatePrice(s, klines[len(klines)-1].Close)
+		return f.validatePriceWithExchange(s, klines[len(klines)-1].Close, exchange)
 	})
 }
 
 func (f *PriceFilter) validatePrice(symbol string, price float64) bool {
-	exchange := exg.Default
+	return f.validatePriceWithExchange(symbol, price, exg.Default)
+}
+
+func (f *PriceFilter) validatePriceWithExchange(symbol string, price float64, exchange banexg.BanExchange) bool {
+	if exchange == nil {
+		exchange = exg.Default
+	}
 	if f.Precision > 0 {
 		pip, err := exchange.PriceOnePip(symbol)
 		if err != nil {
@@ -289,7 +341,11 @@ func (f *PriceFilter) validatePrice(symbol string, price float64) bool {
 }
 
 func (f *RateOfChangeFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	return filterByOHLCV(symbols, "1d", timeMS, f.BackDays, core.AdjFront, f.validate)
+	return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+}
+
+func (f *RateOfChangeFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return filterByOHLCVWithSymbolState(state, exchange, symbols, "1d", timeMS, f.BackDays, core.AdjFront, f.validate)
 }
 
 func (f *RateOfChangeFilter) validate(pair string, arr []*banexg.Kline) bool {
@@ -318,6 +374,13 @@ func (f *RateOfChangeFilter) validate(pair string, arr []*banexg.Kline) bool {
 }
 
 func filterByOHLCV(symbols []string, timeFrame string, endMS int64, limit int, adj int, cb func(string, []*banexg.Kline) bool) ([]string, *errs.Error) {
+	return filterByOHLCVWithSymbolState(nil, exg.Default, symbols, timeFrame, endMS, limit, adj, cb)
+}
+
+func filterByOHLCVWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeFrame string, endMS int64, limit int, adj int, cb func(string, []*banexg.Kline) bool) ([]string, *errs.Error) {
+	if exchange == nil {
+		exchange = exg.Default
+	}
 	var has = make(map[string]struct{})
 	handle := func(pair string, _ string, arr []*banexg.Kline, adjs []*orm.AdjInfo) {
 		arr = orm.ApplyAdj(adjs, arr, adj, endMS, 0)
@@ -325,7 +388,7 @@ func filterByOHLCV(symbols []string, timeFrame string, endMS int64, limit int, a
 			has[pair] = struct{}{}
 		}
 	}
-	err := orm.FastBulkOHLCV(exg.Default, symbols, timeFrame, 0, endMS, limit, handle)
+	err := orm.FastBulkOHLCVWithSymbolState(state, exchange, symbols, timeFrame, 0, endMS, limit, handle)
 	if err != nil {
 		return nil, err
 	}
@@ -339,6 +402,10 @@ func filterByOHLCV(symbols []string, timeFrame string, endMS int64, limit int, a
 }
 
 func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+}
+
+func (f *CorrelationFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
 	if f.Timeframe == "" || f.BackNum == 0 || f.Max == 0 && f.TopN == 0 && f.TopRate == 0 {
 		return symbols, nil
 	}
@@ -355,7 +422,13 @@ func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *e
 	var names = make([]string, 0, len(symbols))
 	var dataArr = make([][]float64, 0, len(symbols))
 	for _, pair := range symbols {
-		exs, err := orm.GetExSymbolCur(pair)
+		var exs *orm.ExSymbol
+		var err *errs.Error
+		if state == nil {
+			exs, err = orm.GetExSymbolCur(pair)
+		} else {
+			exs, err = state.GetExSymbolCur(pair)
+		}
 		if err != nil {
 			skips = append(skips, pair)
 			continue
@@ -483,7 +556,11 @@ type IdVal struct {
 }
 
 func (f *VolatilityFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	return filterByOHLCV(symbols, "1d", timeMS, f.BackDays, core.AdjFront, func(s string, klines []*banexg.Kline) bool {
+	return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+}
+
+func (f *VolatilityFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return filterByOHLCVWithSymbolState(state, exchange, symbols, "1d", timeMS, f.BackDays, core.AdjFront, func(s string, klines []*banexg.Kline) bool {
 		if len(klines) == 0 {
 			return f.AllowEmpty
 		}

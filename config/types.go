@@ -192,13 +192,14 @@ type StratPerfConfig struct {
 }
 
 type DatabaseConfig struct {
-	Url         string  `yaml:"url,omitempty" mapstructure:"url"`
-	Retention   string  `yaml:"retention,omitempty" mapstructure:"retention"`
-	MaxPoolSize int     `yaml:"max_pool_size,omitempty" mapstructure:"max_pool_size"`
-	AutoCreate  bool    `yaml:"auto_create" mapstructure:"auto_create"`
-	DbType      string  `yaml:"db_type,omitempty" mapstructure:"db_type"`               // "questdb" or "timescale"; auto-detected when empty
-	QdbMemPct   float64 `yaml:"qdb_mem_pct,omitempty" mapstructure:"qdb_mem_pct"`       // QuestDB memory usage ratio (0~1), default 0.3
-	QdbMaxMemMB int     `yaml:"qdb_max_mem_mb,omitempty" mapstructure:"qdb_max_mem_mb"` // QuestDB max memory in MB, default 16384
+	Url            string  `yaml:"url,omitempty" mapstructure:"url"`
+	Retention      string  `yaml:"retention,omitempty" mapstructure:"retention"`
+	MaxPoolSize    int     `yaml:"max_pool_size,omitempty" mapstructure:"max_pool_size"`
+	AutoCreate     bool    `yaml:"auto_create" mapstructure:"auto_create"`
+	DbType         string  `yaml:"db_type,omitempty" mapstructure:"db_type"`                   // "questdb" or "timescale"; auto-detected when empty
+	SIDRegistryURL string  `yaml:"sid_registry_url,omitempty" mapstructure:"sid_registry_url"` // PostgreSQL registry for QuestDB multi-writer SID allocation
+	QdbMemPct      float64 `yaml:"qdb_mem_pct,omitempty" mapstructure:"qdb_mem_pct"`           // QuestDB memory usage ratio (0~1), default 0.3
+	QdbMaxMemMB    int     `yaml:"qdb_max_mem_mb,omitempty" mapstructure:"qdb_max_mem_mb"`     // QuestDB max memory in MB, default 16384
 }
 
 type APIServerConfig struct {
