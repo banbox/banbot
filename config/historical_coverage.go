@@ -130,10 +130,18 @@ func HistoricalCoverageFor(symbol string) *HistoricalCoverageConfig {
 }
 
 func (c *HistoricalCoverageConfig) Allows(timeframe string, timeMS int64) bool {
+	var endMS int64
+	if TimeRange != nil {
+		endMS = TimeRange.EndMS
+	}
+	return c.AllowsWithEnd(timeframe, timeMS, endMS)
+}
+
+func (c *HistoricalCoverageConfig) AllowsWithEnd(timeframe string, timeMS, endMS int64) bool {
 	if c == nil {
 		return true
 	}
-	if TimeRange != nil && TimeRange.EndMS > 0 && timeMS >= TimeRange.EndMS {
+	if endMS > 0 && timeMS >= endMS {
 		return false
 	}
 	for _, timeframes := range c.Bars {

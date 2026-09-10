@@ -39,6 +39,34 @@ func TestBackTestPreservesFirstRuntimeError(t *testing.T) {
 	}
 }
 
+func TestBackTestAfterCallbackIsRuntimeOwned(t *testing.T) {
+	previous := AfterBacktest
+	t.Cleanup(func() { AfterBacktest = previous })
+	globalCalls := 0
+	AfterBacktest = func(*BackTest) { globalCalls++ }
+
+	state, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	runtimeBacktest := &BackTest{BackTestLite: &BackTestLite{
+		Trader: biz.NewTraderWithRuntimeDeps(biz.RuntimeDeps{Core: state}),
+	}}
+	ownedCalls := 0
+	runtimeBacktest.SetAfterBacktest(func(*BackTest) { ownedCalls++ })
+	runtimeBacktest.runAfterBacktestCallback()
+	if ownedCalls != 1 || globalCalls != 0 {
+		t.Fatalf("runtime callback calls = %d, global calls = %d; want runtime=1 global=0", ownedCalls, globalCalls)
+	}
+
+	legacyBacktest := &BackTest{}
+	legacyBacktest.runAfterBacktestCallback()
+	if globalCalls != 1 {
+		t.Fatalf("legacy global callback calls = %d, want 1", globalCalls)
+	}
+}
+
 func TestNewBackTestLiteOwnsBatchState(t *testing.T) {
 	originalBiz := biz.BackupVars()
 	t.Cleanup(func() { biz.RestoreVars(originalBiz) })

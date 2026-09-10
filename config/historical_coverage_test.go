@@ -74,6 +74,27 @@ func TestHistoricalCoverageRejectsRowsAfterBacktestEnd(t *testing.T) {
 	}
 }
 
+func TestHistoricalCoverageAllowsWithEndUsesExplicitRange(t *testing.T) {
+	previous := TimeRange
+	TimeRange = &TimeTuple{StartMS: 50, EndMS: 300}
+	t.Cleanup(func() { TimeRange = previous })
+	coverage := &HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]HistoricalCoverageRange{
+			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	if coverage.Allows("5m", 400) {
+		t.Fatal("legacy coverage unexpectedly ignored the global range")
+	}
+	if !coverage.AllowsWithEnd("5m", 400, 700) {
+		t.Fatal("explicit coverage range was overridden by the global range")
+	}
+	if coverage.AllowsWithEnd("5m", 700, 700) {
+		t.Fatal("explicit coverage range did not cap the result")
+	}
+}
+
 func TestHistoricalCoverageRejectsInvalidRange(t *testing.T) {
 	coverage := &HistoricalCoverageConfig{
 		BaselineEndMS: 500,

@@ -2,6 +2,7 @@ package goods
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"maps"
 	"math"
@@ -18,6 +19,7 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 	"gonum.org/v1/gonum/floats"
 )
@@ -31,14 +33,42 @@ func (f *BaseFilter) GetName() string {
 }
 
 func (f *AgeFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+	return f.filterWithRuntimeDeps(nil, symbols, timeMS)
 }
 
 func (f *AgeFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	if state == nil {
+		return f.filterWithRuntimeDeps(nil, symbols, timeMS)
+	}
+	return f.filterWithRuntimeDeps(&RuntimeDeps{Symbols: state, Exchange: exchange}, symbols, timeMS)
+}
+
+func (f *AgeFilter) FilterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return f.filterWithRuntimeDeps(deps, symbols, timeMS)
+}
+
+func (f *AgeFilter) filterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, timeMS int64) ([]string, *errs.Error) {
 	if f.Min == 0 && f.Max == 0 {
 		return symbols, nil
 	}
+	var state *orm.SymbolState
+	var exchange banexg.BanExchange
+	var coreState *core.State
+	if deps != nil {
+		state = deps.Symbols
+		exchange = deps.Exchange
+		coreState = deps.Core
+		if state == nil {
+			return nil, errs.NewMsg(core.ErrRunTime, "runtime symbol state is required for age filter")
+		}
+		if f.AllowEmpty && coreState == nil {
+			return nil, errs.NewMsg(core.ErrRunTime, "runtime core state is required for age filter with allow_empty")
+		}
+	}
 	if exchange == nil {
+		if deps != nil {
+			return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required for age filter")
+		}
 		exchange = exg.Default
 	}
 	dayMs := int64(utils2.TFToSecs("1d") * 1000)
@@ -50,7 +80,16 @@ func (f *AgeFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banex
 	} else {
 		exsMap = state.GetExSymbols(exInfo.ID, exInfo.MarketType)
 	}
-	sess, conn, err := orm.Conn(nil)
+	var sess *orm.Queries
+	var conn *pgxpool.Conn
+	var err *errs.Error
+	if deps != nil && deps.Storage != nil {
+		sess, conn, err = deps.Storage.Conn(context.Background())
+	} else if state != nil {
+		sess, conn, err = state.Conn(context.Background())
+	} else {
+		sess, conn, err = orm.Conn(nil)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +119,11 @@ func (f *AgeFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banex
 				continue
 			} else if f.Min > 0 && days < f.Min {
 				if f.AllowEmpty {
-					core.BanPairsUntil[exs.Symbol] = minStartMS
+					if coreState != nil {
+						coreState.BanPairsUntil[exs.Symbol] = minStartMS
+					} else {
+						core.BanPairsUntil[exs.Symbol] = minStartMS
+					}
 				} else {
 					continue
 				}
@@ -100,31 +143,70 @@ func (f *AgeFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banex
 }
 
 func (f *VolumePairFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+	return f.filterWithRuntimeDeps(nil, symbols, timeMS)
 }
 
 func (f *VolumePairFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	if state == nil {
+		return f.filterWithRuntimeDeps(nil, symbols, timeMS)
+	}
+	return f.filterWithRuntimeDeps(&RuntimeDeps{Symbols: state, Exchange: exchange}, symbols, timeMS)
+}
+
+func (f *VolumePairFilter) FilterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return f.filterWithRuntimeDeps(deps, symbols, timeMS)
+}
+
+func (f *VolumePairFilter) filterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	var state *orm.SymbolState
+	var exchange banexg.BanExchange
+	var cfg *config.Config
+	if deps != nil {
+		state = deps.Symbols
+		exchange = deps.Exchange
+		cfg = deps.Config
+		if state == nil {
+			return nil, errs.NewMsg(core.ErrRunTime, "runtime symbol state is required for volume filter")
+		}
+		if exchange == nil {
+			return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required for volume filter")
+		}
+		if cfg == nil {
+			return nil, errs.NewMsg(core.ErrBadConfig, "runtime config is required for volume filter")
+		}
+	}
+	var klineOptions orm.KlineRuntimeOptions
+	if deps == nil {
+		klineOptions = orm.LegacyKlineRuntimeOptions()
+	} else {
+		klineOptions = orm.NewKlineRuntimeOptions(deps.Core, cfg, runtimeFilterNow(deps, timeMS), deps.Storage)
+	}
 	var symbolVols []*SymbolVol
 	backTf, backNum := utils.SecsToTfNum(utils2.TFToSecs(f.BackPeriod))
 	var err *errs.Error
-	symbolVols, err = GetSymbolVolsWithSymbolState(state, exchange, symbols, backTf, backNum, timeMS, true)
+	symbolVols, err = getSymbolVolsWithOptions(state, exchange, symbols, backTf, backNum, timeMS, true, klineOptions)
 	if err != nil {
 		return nil, err
 	}
 	slices.SortFunc(symbolVols, compareSymbolVol)
-	if !f.AllowEmpty && f.MinValue == 0 {
-		f.MinValue = core.AmtDust
+	minValue := f.MinValue
+	if !f.AllowEmpty && minValue == 0 {
+		minValue = core.AmtDust
 	}
-	if f.MinValue > 0 {
+	if minValue > 0 {
 		for i, v := range symbolVols {
-			if v.Vol >= f.MinValue {
+			if v.Vol >= minValue {
 				continue
 			}
 			symbolVols = symbolVols[:i]
 			break
 		}
 	}
-	resPairs, _ := filterByMinCostWithExchange(exchange, symbolVols)
+	showLog := ShowLog
+	if deps != nil {
+		showLog = deps.ShowLog
+	}
+	resPairs, _ := filterByMinCostWithRuntime(exchange, symbolVols, cfg, showLog)
 	if f.LimitRate > 0 && f.LimitRate < 1 {
 		num := int(math.Round(f.LimitRate * float64(len(resPairs))))
 		resPairs = resPairs[:num]
@@ -133,6 +215,64 @@ func (f *VolumePairFilter) FilterWithSymbolState(state *orm.SymbolState, exchang
 		resPairs = resPairs[:f.Limit]
 	}
 	return resPairs, nil
+}
+
+func (f *VolumePairFilter) GenSymbolsWithRuntimeDeps(deps *RuntimeDeps, timeMS int64) ([]string, *errs.Error) {
+	var state *orm.SymbolState
+	var exchange banexg.BanExchange
+	var cfg *config.Config
+	if deps != nil {
+		state = deps.Symbols
+		exchange = deps.Exchange
+		cfg = deps.Config
+	}
+	if exchange == nil {
+		if deps != nil {
+			return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required for volume pair producer")
+		}
+		exchange = exg.Default
+	}
+	marketMap := exchange.GetCurMarkets()
+	pairs := volumeMarketSymbolsWithConfig(marketMap, cfg)
+	if deps == nil {
+		return f.filterWithRuntimeDeps(nil, pairs, timeMS)
+	}
+	copyDeps := *deps
+	copyDeps.Symbols = state
+	copyDeps.Exchange = exchange
+	copyDeps.Config = cfg
+	return f.filterWithRuntimeDeps(&copyDeps, pairs, timeMS)
+}
+
+func depsCore(deps *RuntimeDeps) *core.State {
+	if deps == nil {
+		return nil
+	}
+	return deps.Core
+}
+
+func (d *RuntimeDeps) querySeries(exs *orm.ExSymbol, timeframe string, startMS, endMS int64, limit int) ([]*orm.AdjInfo, []*orm.DataSeries, *errs.Error) {
+	if d == nil {
+		return orm.GetSeries(exs, timeframe, startMS, endMS, limit, false)
+	}
+	if d.Symbols == nil {
+		return nil, nil, errs.NewMsg(core.ErrRunTime, "runtime symbol state is required for historical filter")
+	}
+	var sess *orm.Queries
+	var conn *pgxpool.Conn
+	var err *errs.Error
+	if d.Storage != nil {
+		sess, conn, err = d.Storage.Conn(context.Background())
+	} else {
+		sess, conn, err = d.Symbols.Conn(context.Background())
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Release()
+	sess = sess.WithSeriesSymbolState(d.Symbols).WithKlineRuntimeOptions(
+		orm.NewKlineRuntimeOptions(d.Core, d.Config, runtimeFilterNow(d, endMS), d.Storage))
+	return sess.GetSeries(exs, timeframe, startMS, endMS, limit, false)
 }
 
 type SymbolVol struct {
@@ -153,6 +293,37 @@ func GetSymbolVols(symbols []string, tf string, num int, endMS int64, withEmpty 
 }
 
 func GetSymbolVolsWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, tf string, num int, endMS int64, withEmpty bool) ([]*SymbolVol, *errs.Error) {
+	return getSymbolVolsWithOptions(state, exchange, symbols, tf, num, endMS, withEmpty,
+		orm.LegacyKlineRuntimeOptions())
+}
+
+// GetSymbolVolsWithRuntimeDeps loads historical volume using the supplied
+// runtime policy. The explicit path never snapshots package-level backtest,
+// download, clock, or storage settings.
+func GetSymbolVolsWithRuntimeDeps(deps *RuntimeDeps, symbols []string, tf string, num int, endMS int64, withEmpty bool) ([]*SymbolVol, *errs.Error) {
+	if deps == nil {
+		return GetSymbolVolsWithSymbolState(nil, exg.Default, symbols, tf, num, endMS, withEmpty)
+	}
+	if deps.Symbols == nil {
+		return nil, errs.NewMsg(core.ErrRunTime, "runtime symbol state is required for volume data")
+	}
+	if deps.Exchange == nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required for volume data")
+	}
+	storage := deps.Storage
+	if storage == nil {
+		storage = deps.Symbols.Storage()
+	}
+	options := orm.NewKlineRuntimeOptions(deps.Core, deps.Config, runtimeFilterNow(deps, endMS), storage)
+	return getSymbolVolsWithOptions(deps.Symbols, deps.Exchange, symbols, tf, num, endMS, withEmpty, options)
+}
+
+func getSymbolVolsWithOptions(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, tf string, num int,
+	endMS int64, withEmpty bool, options orm.KlineRuntimeOptions,
+) ([]*SymbolVol, *errs.Error) {
+	if exchange == nil && options.Storage != nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "exchange is required for volume data")
+	}
 	var symbolVols = make([]*SymbolVol, 0)
 	callBack := func(symbol string, _ string, klines []*banexg.Kline, adjs []*orm.AdjInfo) {
 		if len(klines) == 0 || len(klines) < num {
@@ -179,7 +350,7 @@ func GetSymbolVolsWithSymbolState(state *orm.SymbolState, exchange banexg.BanExc
 	if exchange == nil {
 		exchange = exg.Default
 	}
-	err := orm.FastBulkOHLCVWithSymbolState(state, exchange, symbols, tf, 0, endMS, num, callBack)
+	err := orm.FastBulkOHLCVWithSymbolStateAndOptions(state, exchange, symbols, tf, 0, endMS, num, callBack, options)
 	if err != nil {
 		return nil, err
 	}
@@ -189,22 +360,37 @@ func GetSymbolVolsWithSymbolState(state *orm.SymbolState, exchange banexg.BanExc
 	return symbolVols, nil
 }
 
+func runtimeFilterNow(deps *RuntimeDeps, fallback int64) int64 {
+	if deps != nil && deps.Clock != nil {
+		return deps.Clock.TimeMS()
+	}
+	return fallback
+}
+
 func filterByMinCost(symbols []*SymbolVol) ([]string, map[string]float64) {
 	return filterByMinCostWithExchange(exg.Default, symbols)
 }
 
 func filterByMinCostWithExchange(exchange banexg.BanExchange, symbols []*SymbolVol) ([]string, map[string]float64) {
+	return filterByMinCostWithRuntime(exchange, symbols, nil, ShowLog)
+}
+
+func filterByMinCostWithRuntime(exchange banexg.BanExchange, symbols []*SymbolVol, cfg *config.Config, showLog bool) ([]string, map[string]float64) {
 	res := make([]string, 0, len(symbols))
 	skip := make(map[string]float64)
 	if exchange == nil {
 		exchange = exg.Default
 	}
 	accCost := float64(0)
-	for name, cfg := range config.Accounts {
-		if cfg.NoTrade {
+	accounts := config.Accounts
+	if cfg != nil {
+		accounts = cfg.Accounts
+	}
+	for name, account := range accounts {
+		if account.NoTrade {
 			continue
 		}
-		curCost := config.GetStakeAmount(name)
+		curCost := stakeAmount(cfg, name, account)
 		if curCost > accCost {
 			accCost = curCost
 		}
@@ -212,7 +398,7 @@ func filterByMinCostWithExchange(exchange banexg.BanExchange, symbols []*SymbolV
 	for _, item := range symbols {
 		mar, err := exchange.GetMarket(item.Symbol)
 		if err != nil {
-			if ShowLog {
+			if showLog {
 				log.Warn("no market found", zap.String("symbol", item.Symbol))
 			}
 			skip[item.Symbol] = 0
@@ -235,11 +421,30 @@ func filterByMinCostWithExchange(exchange banexg.BanExchange, symbols []*SymbolV
 		for key, amt := range skip {
 			b.WriteString(fmt.Sprintf("%s: %v  ", key, amt))
 		}
-		if ShowLog {
+		if showLog {
 			log.Warn("skip symbols as cost too big", zap.Int("num", len(skip)), zap.String("more", b.String()))
 		}
 	}
 	return res, skip
+}
+
+func stakeAmount(cfg *config.Config, name string, account *config.AccountConfig) float64 {
+	if cfg == nil {
+		return config.GetStakeAmount(name)
+	}
+	amount := cfg.StakeAmount
+	if account != nil && account.StakePctAmt > 0 {
+		amount = account.StakePctAmt
+	}
+	if account != nil && account.StakeRate > 0 {
+		amount *= account.StakeRate
+	}
+	if account != nil && account.MaxStakeAmt > 0 && account.MaxStakeAmt < amount {
+		amount = account.MaxStakeAmt
+	} else if cfg.MaxStakeAmt > 0 && cfg.MaxStakeAmt < amount {
+		amount = cfg.MaxStakeAmt
+	}
+	return amount
 }
 
 func (f *VolumePairFilter) GenSymbols(timeMS int64) ([]string, *errs.Error) {
@@ -258,7 +463,18 @@ func (f *VolumePairFilter) GenSymbolsWithSymbolState(state *orm.SymbolState, exc
 }
 
 func volumeMarketSymbols(markets banexg.MarketMap) []string {
+	return volumeMarketSymbolsWithConfig(markets, nil)
+}
+
+func volumeMarketSymbolsWithConfig(markets banexg.MarketMap, cfg *config.Config) []string {
 	pairs := make([]string, 0, len(markets))
+	stakeCurrencies := config.StakeCurrencyMap
+	if cfg != nil {
+		stakeCurrencies = make(map[string]bool, len(cfg.StakeCurrency))
+		for _, currency := range cfg.StakeCurrency {
+			stakeCurrencies[currency] = true
+		}
+	}
 	for _, pair := range slices.Sorted(maps.Keys(markets)) {
 		quote := ""
 		if market := markets[pair]; market != nil {
@@ -267,7 +483,7 @@ func volumeMarketSymbols(markets banexg.MarketMap) []string {
 		if quote == "" {
 			_, quote, _, _ = core.SplitSymbol(pair)
 		}
-		if _, ok := config.StakeCurrencyMap[quote]; ok {
+		if _, ok := stakeCurrencies[quote]; ok {
 			pairs = append(pairs, pair)
 		}
 	}
@@ -285,6 +501,19 @@ func (f *PriceFilter) FilterWithSymbolState(state *orm.SymbolState, exchange ban
 		}
 		return f.validatePriceWithExchange(s, klines[len(klines)-1].Close, exchange)
 	})
+}
+
+func (f *PriceFilter) FilterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	if deps == nil {
+		return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+	}
+	return filterByOHLCVWithRuntimeDeps(deps, symbols, "1h", timeMS, 1, core.AdjFront,
+		func(s string, klines []*banexg.Kline) bool {
+			if len(klines) == 0 {
+				return f.AllowEmpty
+			}
+			return f.validatePriceWithExchange(s, klines[len(klines)-1].Close, deps.Exchange)
+		})
 }
 
 func (f *PriceFilter) validatePrice(symbol string, price float64) bool {
@@ -348,6 +577,10 @@ func (f *RateOfChangeFilter) FilterWithSymbolState(state *orm.SymbolState, excha
 	return filterByOHLCVWithSymbolState(state, exchange, symbols, "1d", timeMS, f.BackDays, core.AdjFront, f.validate)
 }
 
+func (f *RateOfChangeFilter) FilterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return filterByOHLCVWithRuntimeDeps(deps, symbols, "1d", timeMS, f.BackDays, core.AdjFront, f.validate)
+}
+
 func (f *RateOfChangeFilter) validate(pair string, arr []*banexg.Kline) bool {
 	if len(arr) == 0 {
 		return f.AllowEmpty
@@ -401,11 +634,64 @@ func filterByOHLCVWithSymbolState(state *orm.SymbolState, exchange banexg.BanExc
 	return res, nil
 }
 
+func filterByOHLCVWithRuntimeDeps(deps *RuntimeDeps, symbols []string, timeFrame string, endMS int64, limit int,
+	adj int, cb func(string, []*banexg.Kline) bool,
+) ([]string, *errs.Error) {
+	if deps == nil {
+		return filterByOHLCVWithSymbolState(nil, exg.Default, symbols, timeFrame, endMS, limit, adj, cb)
+	}
+	if deps.Exchange == nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required for historical filter")
+	}
+	if deps.Symbols == nil {
+		return nil, errs.NewMsg(core.ErrRunTime, "runtime symbol state is required for historical filter")
+	}
+	options := orm.NewKlineRuntimeOptions(deps.Core, deps.Config, runtimeFilterNow(deps, endMS), deps.Storage)
+	var has = make(map[string]struct{})
+	handle := func(pair string, _ string, arr []*banexg.Kline, adjs []*orm.AdjInfo) {
+		arr = orm.ApplyAdj(adjs, arr, adj, endMS, 0)
+		if cb(pair, arr) {
+			has[pair] = struct{}{}
+		}
+	}
+	if err := orm.FastBulkOHLCVWithSymbolStateAndOptions(deps.Symbols, deps.Exchange, symbols, timeFrame,
+		0, endMS, limit, handle, options); err != nil {
+		return nil, err
+	}
+	result := make([]string, 0, len(has))
+	for _, pair := range symbols {
+		if _, ok := has[pair]; ok {
+			result = append(result, pair)
+		}
+	}
+	return result, nil
+}
+
 func (f *CorrelationFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
 	return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
 }
 
 func (f *CorrelationFilter) FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return f.filterWithRuntimeDeps(nil, state, exchange, symbols, timeMS)
+}
+
+func (f *CorrelationFilter) FilterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	if deps == nil {
+		return f.FilterWithSymbolState(nil, exg.Default, symbols, timeMS)
+	}
+	return f.filterWithRuntimeDeps(deps, deps.Symbols, deps.Exchange, symbols, timeMS)
+}
+
+func (f *CorrelationFilter) filterWithRuntimeDeps(deps *RuntimeDeps, state *orm.SymbolState,
+	exchange banexg.BanExchange, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	if deps != nil {
+		if exchange == nil {
+			return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required for correlation filter")
+		}
+		if state == nil {
+			return nil, errs.NewMsg(core.ErrRunTime, "runtime symbol state is required for correlation filter")
+		}
+	}
 	if f.Timeframe == "" || f.BackNum == 0 || f.Max == 0 && f.TopN == 0 && f.TopRate == 0 {
 		return symbols, nil
 	}
@@ -433,7 +719,12 @@ func (f *CorrelationFilter) FilterWithSymbolState(state *orm.SymbolState, exchan
 			skips = append(skips, pair)
 			continue
 		}
-		_, rows, err := orm.GetSeries(exs, f.Timeframe, 0, timeMS, f.BackNum, false)
+		var rows []*orm.DataSeries
+		if deps == nil {
+			_, rows, err = orm.GetSeries(exs, f.Timeframe, 0, timeMS, f.BackNum, false)
+		} else {
+			_, rows, err = deps.querySeries(exs, f.Timeframe, 0, timeMS, f.BackNum)
+		}
 		if err != nil || len(rows)*2 < f.BackNum {
 			skips = append(skips, pair)
 			continue
@@ -575,6 +866,25 @@ func (f *VolatilityFilter) FilterWithSymbolState(state *orm.SymbolState, exchang
 		}
 		return true
 	})
+}
+
+func (f *VolatilityFilter) FilterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, timeMS int64) ([]string, *errs.Error) {
+	return filterByOHLCVWithRuntimeDeps(deps, symbols, "1d", timeMS, f.BackDays, core.AdjFront,
+		func(s string, klines []*banexg.Kline) bool {
+			if len(klines) == 0 {
+				return f.AllowEmpty
+			}
+			data := make([]float64, 0, len(klines))
+			for i, value := range klines[1:] {
+				data = append(data, value.Close/klines[i].Close)
+			}
+			result := utils.StdDevVolatility(data, 1)
+			if result < f.Min || f.Max > 0 && result > f.Max {
+				log.Info("VolatilityFilter drop", zap.String("pair", s), zap.Float64("v", result))
+				return false
+			}
+			return true
+		})
 }
 
 func (f *SpreadFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {

@@ -15,9 +15,11 @@ import (
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banbot/rpc"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 )
@@ -43,6 +45,7 @@ type Process struct {
 	runtimes            []*Runtime
 	runtimeConstructing int
 	runtimeCond         *sync.Cond
+	registered          bool
 	closed              bool
 	closeDone           chan struct{}
 
@@ -50,6 +53,47 @@ type Process struct {
 	symbolAllocators  map[string]*orm.SIDAllocator
 	sidRegistryMu     sync.Mutex
 	sidRegistries     map[string]*orm.SymbolSIDRegistry
+}
+
+// activeProcesses is a low-frequency lifecycle registry used by process
+// signal handling. It contains only Process owners with at least one active
+// Runtime; runtime data and dependencies remain owned by the Process itself.
+var activeProcesses = struct {
+	sync.Mutex
+	items map[*Process]struct{}
+}{items: make(map[*Process]struct{})}
+
+func registerActiveProcess(process *Process) {
+	if process == nil {
+		return
+	}
+	activeProcesses.Lock()
+	activeProcesses.items[process] = struct{}{}
+	activeProcesses.Unlock()
+}
+
+func unregisterActiveProcess(process *Process) {
+	if process == nil {
+		return
+	}
+	activeProcesses.Lock()
+	delete(activeProcesses.items, process)
+	activeProcesses.Unlock()
+}
+
+// StopProcesses publishes cancellation to every active Process. The snapshot
+// keeps registry locking out of Runtime stop hooks and preserves isolation
+// between Runtime instances.
+func StopProcesses() {
+	activeProcesses.Lock()
+	processes := make([]*Process, 0, len(activeProcesses.items))
+	for process := range activeProcesses.items {
+		processes = append(processes, process)
+	}
+	activeProcesses.Unlock()
+	for _, process := range processes {
+		process.Stop()
+	}
 }
 
 func NewProcess() *Process {
@@ -83,6 +127,32 @@ func (p *Process) finishRuntimeConstruction() {
 	p.runtimeConstructing--
 	if p.runtimeConstructing == 0 {
 		p.runtimeConditionLocked().Broadcast()
+	}
+	p.runtimeMu.Unlock()
+}
+
+func (p *Process) unregisterRuntime(target *Runtime) {
+	if p == nil || target == nil {
+		return
+	}
+	unregister := false
+	p.runtimeMu.Lock()
+	for index, runtime := range p.runtimes {
+		if runtime != target {
+			continue
+		}
+		copy(p.runtimes[index:], p.runtimes[index+1:])
+		p.runtimes[len(p.runtimes)-1] = nil
+		p.runtimes = p.runtimes[:len(p.runtimes)-1]
+		if len(p.runtimes) == 0 && p.runtimeConstructing == 0 && p.registered {
+			p.registered = false
+			unregister = true
+		}
+		p.runtimeMu.Unlock()
+		if unregister {
+			unregisterActiveProcess(p)
+		}
+		return
 	}
 	p.runtimeMu.Unlock()
 }
@@ -178,7 +248,30 @@ func (p *Process) Close() {
 	for _, registry := range registries {
 		registry.Close()
 	}
+	p.runtimeMu.Lock()
+	if p.registered {
+		p.registered = false
+		unregisterActiveProcess(p)
+	}
+	p.runtimeMu.Unlock()
 	close(done)
+}
+
+// Stop publishes cancellation for every Runtime currently owned by this
+// Process. It is intentionally non-owning: callers still use Close/Join to
+// wait for component cleanup and release process-scoped resources.
+func (p *Process) Stop() {
+	if p == nil {
+		return
+	}
+	p.runtimeMu.Lock()
+	runtimes := slices.Clone(p.runtimes)
+	p.runtimeMu.Unlock()
+	for _, runtime := range runtimes {
+		if runtime != nil {
+			runtime.Stop()
+		}
+	}
 }
 
 type Options struct {
@@ -194,38 +287,46 @@ type Options struct {
 	// allocator ownership is derived from canonical database identity; DataDir
 	// remains a recovery root and must not split allocators for the same DB.
 	StorageNamespace string
+	Storage          *orm.Storage
 	Exchange         banexg.BanExchange
 	ExchangeName     string
 	Market           string
 	ContractType     string
 	DisplayLocation  *time.Location
+	SchedulerLang    string
 	NumTaCache       int
 	ConcurNum        int
 	Pairs            []string
 	NetDisable       bool
 	ParallelOnBar    bool
 	Scheduler        com.Scheduler
+	Catalog          *data.DataSourceCatalog
+	Dump             *orm.DumpSink
 }
 
 // Runtime is the typed composition root for the first migration slice. The
 // remaining domain managers will be added here as they leave their legacy
 // facades; no domain package imports runtime.
 type Runtime struct {
-	Process    *Process
-	ID         string
-	Core       *core.State
-	Config     *config.Snapshot
-	Clock      *btime.ClockState
-	Market     *com.MarketState
-	Symbols    *orm.SymbolState
-	Batch      *strat.BatchState
-	Strategies *strat.State
-	Orders     *ormo.OrderState
-	Trading    *biz.TradingState
-	Cron       com.Scheduler
+	Process       *Process
+	ID            string
+	Core          *core.State
+	Config        *config.Snapshot
+	Clock         *btime.ClockState
+	Market        *com.MarketState
+	Symbols       *orm.SymbolState
+	Storage       *orm.Storage
+	Batch         *strat.BatchState
+	Strategies    *strat.State
+	Orders        *ormo.OrderState
+	Trading       *biz.TradingState
+	Cron          com.Scheduler
+	Notifications *rpc.Session
+	Catalog       *data.DataSourceCatalog
 	// Exchange is a runtime dependency, not an ownership claim. The entry
 	// layer decides when the adapter session is closed.
 	Exchange banexg.BanExchange
+	Dump     *orm.DumpSink
 
 	closeMu           sync.Mutex
 	closeDone         chan struct{}
@@ -287,15 +388,55 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	if opts.ContractType == "" && banexg.IsContract(opts.Market) {
 		opts.ContractType = banexg.MarketSwap
 	}
+	catalog := opts.Catalog
+	if catalog == nil {
+		catalog = data.NewDataSourceCatalog()
+	}
+	if snapshotConfig != nil && snapshotConfig.Database != nil {
+		dbCfg := snapshotConfig.Database
+		if strings.TrimSpace(dbCfg.Url) != "" {
+			if opts.Storage == nil {
+				return nil, fmt.Errorf("runtime: storage is required when database configuration is provided")
+			}
+			if err := opts.Storage.ValidateConfig(dbCfg, snapshot.DataDir); err != nil {
+				return nil, fmt.Errorf("runtime: storage/database mismatch: %w", err)
+			}
+		}
+	}
+	schedulerLocation := opts.DisplayLocation
+	schedulerLang := opts.SchedulerLang
+	if snapshot != nil {
+		if schedulerLocation == nil {
+			schedulerLocation = snapshot.Location()
+		}
+		if schedulerLang == "" && snapshotConfig != nil {
+			schedulerLang = snapshotConfig.NTPLangCode
+		}
+	}
 	scheduler := opts.Scheduler
 	if scheduler == nil {
-		scheduler = com.NewScheduler()
+		scheduler = com.NewSchedulerWithConfig(schedulerLocation, schedulerLang)
 	}
 	id := opts.ID
 	if id == "" {
 		id = fmt.Sprintf("runtime-%d", runtimeOrdinal)
 	}
 	storageNamespace := runtimeStorageNamespace(opts, snapshot)
+	if opts.Storage != nil {
+		if opts.Storage.Identity() == "" {
+			return nil, fmt.Errorf("runtime: storage identity is required")
+		}
+		if requested := strings.TrimSpace(opts.StorageNamespace); requested != "" {
+			// Explicit namespaces are stored with an internal prefix so they do
+			// not collide with canonical database identities. Accept either the
+			// caller's fully-qualified identity or its short option spelling.
+			storageIdentity := opts.Storage.Identity()
+			if storageIdentity != requested && storageIdentity != "explicit:"+requested {
+				return nil, fmt.Errorf("runtime: allocator namespace does not match supplied storage")
+			}
+		}
+		storageNamespace = opts.Storage.Identity()
+	}
 	if storageNamespace == "" {
 		// No storage identity means this runtime has no safe sharing boundary.
 		// Keep its allocator private instead of merging it into a literal default.
@@ -308,10 +449,6 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		if registryErr != nil {
 			return nil, fmt.Errorf("runtime: initialize SID registry: %w", registryErr)
 		}
-	}
-	coreState, err := core.NewState(opts.Context)
-	if err != nil {
-		return nil, err
 	}
 	activePairs := opts.Pairs
 	if activePairs == nil && snapshotConfig != nil {
@@ -327,6 +464,10 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 				return nil, fmt.Errorf("runtime: validate configured symbols: %w", err)
 			}
 		}
+	}
+	coreState, err := core.NewState(opts.Context)
+	if err != nil {
+		return nil, err
 	}
 	if opts.Mode == "" {
 		opts.Mode = core.RunModeOther
@@ -350,7 +491,7 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		coreState.ConcurNum = opts.ConcurNum
 	}
 	coreState.SetPairs(activePairs, nil)
-	clock := btime.NewClockState(coreState.BackTestMode, opts.DisplayLocation)
+	clock := btime.NewClockState(coreState.BackTestMode, schedulerLocation)
 	if opts.StartAt != 0 {
 		clock.SetTimeMS(opts.StartAt)
 	}
@@ -360,6 +501,10 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		return nil, allocatorErr
 	}
 	symbols := orm.NewSymbolStateWithAllocatorAndIdentity(allocator, symbolExchange, symbolMarket)
+	if err := symbols.BindStorage(opts.Storage); err != nil {
+		coreState.Close()
+		return nil, fmt.Errorf("runtime: bind storage: %w", err)
+	}
 	if opts.DataDir != "" {
 		if err := orm.BindExSymbolRecoveryDir(symbols, opts.DataDir); err != nil {
 			coreState.Close()
@@ -374,15 +519,39 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		Clock:      clock,
 		Market:     com.NewMarketStateWithExchange(opts.ExchangeName, opts.Exchange),
 		Symbols:    symbols,
+		Storage:    opts.Storage,
 		Batch:      strat.NewBatchState(),
 		Strategies: strat.NewState(),
 		Orders:     ormo.NewOrderState(),
 		Trading:    biz.NewTradingState(),
 		Cron:       scheduler,
 		Exchange:   opts.Exchange,
+		Catalog:    catalog,
+		Dump:       opts.Dump,
 		closeDone:  make(chan struct{}),
 	}
 	runtime.Orders.BindCore(coreState)
+	runtime.Orders.BindRuntime(clock, runtime.Market.Prices, opts.Exchange, snapshotConfig)
+	runtime.Orders.SetLive(coreState.LiveMode)
+	if snapshotConfig != nil {
+		runtime.Orders.BindExecutionOptions(ormo.ExecutionOptions{
+			StrictBacktest: coreState.BackTestMode && snapshotConfig.BTStrict,
+			LegacyOrderMetrics: coreState.BackTestMode && snapshotConfig.BTStrict &&
+				snapshotConfig.BTNoKlineDownload && snapshotConfig.HistoricalCoverage != nil &&
+				snapshotConfig.BTLegacyOrderMetrics,
+		})
+	}
+	if snapshotConfig != nil && snapshot.DataDir != "" {
+		runtime.Orders.BindTradesPath(filepath.Join(snapshot.DataDir, fmt.Sprintf("orders_%s.db", snapshotConfig.Name)))
+	}
+	runtime.Strategies.BindRuntime(coreState, clock, snapshotConfig, symbols, opts.Exchange)
+	runtime.Notifications = biz.NewRuntimeNotifications(biz.RuntimeDeps{
+		Core: coreState, Clock: clock, Config: snapshot, Orders: runtime.Orders,
+		Trading: runtime.Trading, Market: runtime.Market, Dump: runtime.Dump,
+		DefaultAccount: snapshot.DefaultAccount(),
+	})
+	runtime.OnClose(runtime.Notifications.Stop)
+	runtime.OnCloseWait(runtime.Notifications.Join)
 
 	p.runtimeMu.Lock()
 	if p.closed {
@@ -390,6 +559,10 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		runtime.Close()
 		runtime.Join()
 		return nil, fmt.Errorf("runtime: process is closed")
+	}
+	if !p.registered {
+		p.registered = true
+		registerActiveProcess(p)
 	}
 	p.runtimes = append(p.runtimes, runtime)
 	p.runtimeMu.Unlock()
@@ -720,6 +893,9 @@ func (r *Runtime) closeOwned() {
 	// barrier here so every callback source obeys the same reset-before-return
 	// invariant.
 	r.callbackWait.Wait()
+	if r.Dump != nil {
+		_ = r.Dump.Close()
+	}
 	if r.Market != nil {
 		r.Market.Reset()
 	}
@@ -738,6 +914,7 @@ func (r *Runtime) closeOwned() {
 	if r.Trading != nil {
 		r.Trading.Reset()
 	}
+	r.Catalog = nil
 	if r.Core != nil {
 		r.Core.Close()
 	}
@@ -777,6 +954,7 @@ func (r *Runtime) stopScheduler() {
 }
 
 func (r *Runtime) finishClose() {
+	process := r.Process
 	r.closeMu.Lock()
 	if r.closePhase != closeClosed {
 		if r.closeDone == nil {
@@ -785,6 +963,9 @@ func (r *Runtime) finishClose() {
 		r.closeRequested = false
 		r.closePhase = closeClosed
 		close(r.closeDone)
+		r.closeMu.Unlock()
+		process.unregisterRuntime(r)
+		return
 	}
 	r.closeMu.Unlock()
 }

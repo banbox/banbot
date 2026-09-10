@@ -3,6 +3,7 @@ package config
 import (
 	"maps"
 	"slices"
+	"time"
 )
 
 // Snapshot is an owned, typed configuration copy for one Runtime. It is
@@ -11,6 +12,7 @@ type Snapshot struct {
 	value       *Config
 	DataDir     string
 	StrategyDir string
+	location    *time.Location
 }
 
 func NewSnapshot(cfg *Config) *Snapshot {
@@ -42,7 +44,9 @@ func (s *Snapshot) Clone() *Snapshot {
 	if s == nil {
 		return &Snapshot{}
 	}
-	return NewSnapshotWithDirs(s.value, s.DataDir, s.StrategyDir)
+	result := NewSnapshotWithDirs(s.value, s.DataDir, s.StrategyDir)
+	result.location = s.location
+	return result
 }
 
 func cloneSnapshotConfig(c *Config) *Config {

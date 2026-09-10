@@ -1,6 +1,7 @@
 package opt
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -122,6 +123,29 @@ func TestBackTestRuntimeDataDepsUseConfigSnapshot(t *testing.T) {
 		}
 		return struct{}{}
 	})
+}
+
+func TestBacktestSeriesContextUsesRuntimeCore(t *testing.T) {
+	oldContext := core.Ctx
+	legacyContext, cancelLegacy := context.WithCancel(context.Background())
+	cancelLegacy()
+	core.Ctx = legacyContext
+	t.Cleanup(func() { core.Ctx = oldContext })
+
+	runtimeContext := context.Background()
+	state, err := core.NewState(runtimeContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	trader := biz.NewTraderWithRuntimeDeps(biz.RuntimeDeps{Core: state})
+	backtest := &BackTest{BackTestLite: &BackTestLite{Trader: trader}}
+	got := backtest.backtestSeriesContext()
+	select {
+	case <-got.Done():
+		t.Fatal("backtest series context inherited canceled legacy context")
+	default:
+	}
 }
 
 func TestRuntimeBacktestConstructorsRejectExpiredLegacySession(t *testing.T) {

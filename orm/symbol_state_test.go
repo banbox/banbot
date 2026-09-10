@@ -5,11 +5,29 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
+
+func TestExplicitSymbolStateAllocatorDoesNotReadLegacyConfig(t *testing.T) {
+	previousDataDir, previousDatabase := config.DataDir, config.Database
+	config.DataDir = t.TempDir()
+	config.Database = &config.DatabaseConfig{Url: "postgres://legacy.example/legacy", DbType: "postgres"}
+	t.Cleanup(func() { config.DataDir, config.Database = previousDataDir, previousDatabase })
+
+	state := NewSymbolStateWithIdentity("runtime", "spot")
+	allocator := state.sidAllocator()
+	if allocator.legacyConfig {
+		t.Fatal("explicit symbol state created a legacy-configured SID allocator")
+	}
+	if allocator.Namespace() != "" || allocator.sharedReservationRoot() != "" {
+		t.Fatalf("explicit symbol state inherited global storage identity: namespace=%q root=%q",
+			allocator.Namespace(), allocator.sharedReservationRoot())
+	}
+}
 
 type symbolStateIdentityExchange struct {
 	banexg.BanExchange

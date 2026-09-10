@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sasha-s/go-deadlock"
@@ -40,6 +41,8 @@ type questExecer interface {
 
 var (
 	pool           *pgxpool.Pool
+	defaultStorage *Storage
+	storageMu      sync.RWMutex
 	dbPathMap      = make(map[string]string)
 	dbPathInit     = make(map[string]bool)
 	dbPathLock     = deadlock.Mutex{}
@@ -108,6 +111,13 @@ func SetupWithAutoCompact(autoCompact bool) *errs.Error {
 
 func setup(autoCompact bool) *errs.Error {
 	stopCompactWorker()
+	storageMu.Lock()
+	oldStorage := defaultStorage
+	defaultStorage = nil
+	storageMu.Unlock()
+	if oldStorage != nil {
+		oldStorage.closeFn = nil
+	}
 	if pool != nil {
 		pool.Close()
 		pool = nil
@@ -117,6 +127,11 @@ func setup(autoCompact bool) *errs.Error {
 	if err2 != nil {
 		return err2
 	}
+	storageMu.Lock()
+	defaultStorage = NewStorage(pool, IsQuestDB,
+		CanonicalStorageIdentityForType("", databaseURL(), config.GetDataDirSafe(), databaseType()))
+	defaultStorage.legacy = true
+	storageMu.Unlock()
 	initSQLitePaths()
 	{
 		// Ensure banpub.db exists and schema is initialized (task table only).
@@ -214,32 +229,33 @@ func execMultiSQLTx(ctx context.Context, tx pgx.Tx, sqlText string) error {
 }
 
 func pgConnPool() (*pgxpool.Pool, *errs.Error) {
-	dbCfg := config.Database
+	dbPool, questDB, err := pgConnPoolForConfig(context.Background(), config.Database)
+	if err == nil {
+		IsQuestDB = questDB
+	}
+	return dbPool, err
+}
+
+func pgConnPoolForConfig(ctx context.Context, dbCfg *config.DatabaseConfig) (*pgxpool.Pool, bool, *errs.Error) {
 	if dbCfg == nil {
-		return nil, errs.NewMsg(core.ErrBadConfig, "database config is missing!")
+		return nil, false, errs.NewMsg(core.ErrBadConfig, "database config is missing!")
 	}
 	poolCfg, err_ := pgxpool.ParseConfig(normalizeDatabaseURL(dbCfg.Url))
 	if err_ != nil {
-		return nil, errs.New(core.ErrBadConfig, err_)
+		return nil, false, errs.New(core.ErrBadConfig, err_)
 	}
 
 	// Detect DB type from explicit config or port heuristic.
-	dbType := strings.ToLower(strings.TrimSpace(dbCfg.DbType))
+	questDB, backendKnown, backendErr := databaseBackendForPoolConfig(dbCfg, poolCfg)
+	if backendErr != nil {
+		return nil, false, errs.New(core.ErrBadConfig, backendErr)
+	}
 	port := uint16(0)
 	if poolCfg.ConnConfig != nil {
 		port = poolCfg.ConnConfig.Port
 	}
-	switch dbType {
-	case "questdb":
-		IsQuestDB = true
-	case "timescale", "timescaledb", "postgres", "postgresql":
-		IsQuestDB = false
-	default:
-		// Auto-detect by port: 8812 = QuestDB default, 5432 = PostgreSQL default.
-		IsQuestDB = port != 5432
-	}
 
-	if IsQuestDB {
+	if questDB {
 		// QuestDB uses the PostgreSQL wire protocol, but (unlike Postgres/TimescaleDB) it doesn't benefit from
 		// pgx's statement cache when our SQL strings are dynamic. Disable the statement/describe cache and run
 		// in non-caching exec mode to reduce per-query overhead (especially under concurrency).
@@ -259,41 +275,81 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	defer connCancel()
 	dbPool, err_ := pgxpool.NewWithConfig(connCtx, poolCfg)
 	if err_ != nil {
-		return nil, errs.New(core.ErrDbConnFail, err_)
+		return nil, false, errs.New(core.ErrDbConnFail, err_)
 	}
 	// Ping to verify connectivity; if QuestDB is not reachable, try to auto-start it.
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer pingCancel()
 	if err_ = dbPool.Ping(pingCtx); err_ != nil {
 		dbPool.Close()
-		if IsQuestDB {
+		if questDB {
 			if ensureErr := ensureQuestDB(port); ensureErr != nil {
-				return nil, ensureErr
+				return nil, false, ensureErr
 			}
 		} else {
-			return nil, errs.New(core.ErrDbConnFail, err_)
+			return nil, false, errs.New(core.ErrDbConnFail, err_)
 		}
 		// Retry after QuestDB is started.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer retryCancel()
 		dbPool, err_ = pgxpool.NewWithConfig(retryCtx, poolCfg)
 		if err_ != nil {
-			return nil, errs.New(core.ErrDbConnFail, err_)
+			return nil, false, errs.New(core.ErrDbConnFail, err_)
 		}
 	}
 
 	// When auto-detect is still ambiguous (non-5432, non-8812), probe QuestDB-specific syntax.
-	if dbType == "" && port != 5432 && port != 8812 {
+	if !backendKnown {
 		var n int64
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer probeCancel()
 		if probeErr := dbPool.QueryRow(probeCtx, `select count() from tables()`).Scan(&n); probeErr != nil {
 			// QuestDB probe failed – treat as TimescaleDB/PostgreSQL.
-			IsQuestDB = false
+			questDB = false
 		}
 	}
 
-	return dbPool, nil
+	return dbPool, questDB, nil
+}
+
+// databaseBackendForConfig returns the backend selected without connecting.
+// The result is marked unknown for non-standard ports because those require
+// the same QuestDB probe used by the actual pool setup.
+func databaseBackendForConfig(dbCfg *config.DatabaseConfig) (bool, bool, error) {
+	if dbCfg == nil {
+		return false, false, fmt.Errorf("database config is missing")
+	}
+	poolCfg, err := pgxpool.ParseConfig(normalizeDatabaseURL(dbCfg.Url))
+	if err != nil {
+		return false, false, err
+	}
+	return databaseBackendForPoolConfig(dbCfg, poolCfg)
+}
+
+func databaseBackendForPoolConfig(dbCfg *config.DatabaseConfig, poolCfg *pgxpool.Config) (bool, bool, error) {
+	if dbCfg == nil || poolCfg == nil || poolCfg.ConnConfig == nil {
+		return false, false, fmt.Errorf("database connection config is missing")
+	}
+	dbType := strings.ToLower(strings.TrimSpace(dbCfg.DbType))
+	port := poolCfg.ConnConfig.Port
+	switch dbType {
+	case "questdb", "quest":
+		return true, true, nil
+	case "timescale", "timescaledb", "postgres", "postgresql", "postgresql+timescale":
+		return false, true, nil
+	case "":
+		// Auto-detect by port: 8812 = QuestDB default, 5432 = PostgreSQL default.
+		if port == 8812 {
+			return true, true, nil
+		}
+		if port == 5432 {
+			return false, true, nil
+		}
+		// Keep the historical optimistic QuestDB choice until the probe runs.
+		return true, false, nil
+	default:
+		return false, false, fmt.Errorf("unsupported database type %q", dbCfg.DbType)
+	}
 }
 
 // normalizeDatabaseURL accepts legacy configs that bracket an IPv4 host. URL
@@ -304,14 +360,26 @@ func normalizeDatabaseURL(raw string) string {
 }
 
 func Conn(ctx context.Context) (*Queries, *pgxpool.Conn, *errs.Error) {
-	if ctx == nil {
-		ctx = context.Background()
+	storageMu.RLock()
+	current := defaultStorage
+	storageMu.RUnlock()
+	if current != nil {
+		return current.Conn(ctx)
 	}
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return nil, nil, errs.New(core.ErrDbConnFail, err)
+	if pool == nil {
+		return nil, nil, errs.NewMsg(core.ErrDbConnFail, "database pool is not configured")
 	}
-	return New(&SubQueries{db: conn}), conn, nil
+	current = NewStorage(pool, IsQuestDB,
+		CanonicalStorageIdentityForType("", databaseURL(), config.GetDataDirSafe(), databaseType()))
+	current.legacy = true
+	storageMu.Lock()
+	if defaultStorage == nil {
+		defaultStorage = current
+	} else {
+		current = defaultStorage
+	}
+	storageMu.Unlock()
+	return current.Conn(ctx)
 }
 
 func SetDbPath(key, path string) {
@@ -576,15 +644,29 @@ func (q *Queries) NewTx(ctx context.Context) (*Tx, *Queries, *errs.Error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	tx, err := pool.Begin(ctx)
+	var tx pgx.Tx
+	var err error
+	if q != nil && q.storage != nil {
+		if q.storage.pool == nil {
+			err = fmt.Errorf("storage pool is not configured")
+		} else {
+			tx, err = q.storage.pool.Begin(ctx)
+		}
+	} else if pool != nil {
+		tx, err = pool.Begin(ctx)
+	} else {
+		err = fmt.Errorf("database pool is not configured")
+	}
 	if err != nil {
 		return nil, nil, errs.New(core.ErrDbConnFail, err)
 	}
 	allowShow := false
-	if it, ok := q.db.(*SubQueries); ok {
-		allowShow = it.ShowLog
+	if q != nil {
+		if it, ok := q.db.(*SubQueries); ok {
+			allowShow = it.ShowLog
+		}
 	}
-	nq := q.WithTx(&SubQueries{db: tx, ShowLog: allowShow})
+	nq := q.WithTx(&SubQueries{db: tx, ShowLog: allowShow, storage: q.storage})
 	return &Tx{tx: tx}, nq, nil
 }
 
@@ -599,6 +681,7 @@ func (q *Queries) Exec(sql string, args ...interface{}) *errs.Error {
 type SubQueries struct {
 	db      DBTX
 	ShowLog bool
+	storage *Storage
 }
 
 func (q *SubQueries) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -690,12 +773,51 @@ func (q *SubQueries) CopyFrom(ctx context.Context, tableName pgx.Identifier, col
 }
 
 func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *errs.Error) {
+	return LoadMarketsWithSymbolState(nil, exchange, reload)
+}
+
+// LoadMarketsWithSymbolState loads exchange markets without consulting the
+// process-wide symbol catalog. Runtime-owned callers pass their SymbolState so
+// contract-market capability reloads stay on the same task identity.
+func LoadMarketsWithSymbolState(state *SymbolState, exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *errs.Error) {
+	return loadMarketsWithRuntimeConfig(state, exchange, reload, &config.Data, config.GetDataDir(), nil, false)
+}
+
+// LoadMarketsWithRuntime loads markets using the runtime-owned configuration
+// and core mode. The legacy LoadMarkets/LoadMarketsWithSymbolState facades
+// pass nil and retain their process-wide behavior.
+func LoadMarketsWithRuntime(state *SymbolState, exchange banexg.BanExchange, reload bool,
+	snapshot *config.Snapshot, runtimeCore *core.State,
+) (banexg.MarketMap, *errs.Error) {
+	if snapshot == nil {
+		return loadMarketsWithRuntimeConfig(state, exchange, reload, &config.Data, config.GetDataDir(), nil, false)
+	}
+	return loadMarketsWithRuntimeConfig(state, exchange, reload, snapshot.View(), snapshot.DataDir, runtimeCore, true)
+}
+
+// LoadMarketsWithRuntimeConfig is the config-level counterpart used by
+// domain helpers that already carry a cloned Config but not its Snapshot.
+// dataDir is the only filesystem root consulted for a configured snapshot.
+func LoadMarketsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, reload bool,
+	cfg *config.Config, dataDir string, runtimeCore *core.State,
+) (banexg.MarketMap, *errs.Error) {
+	return loadMarketsWithRuntimeConfig(state, exchange, reload, cfg, dataDir, runtimeCore, true)
+}
+
+func loadMarketsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, reload bool,
+	cfg *config.Config, dataDir string, runtimeCore *core.State, explicit bool,
+) (banexg.MarketMap, *errs.Error) {
 	if exchange == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
 	}
-	if hasConfiguredMarketSnapshot() {
+	if !explicit {
+		legacyConfig := config.Data
+		legacyConfig.Exchange = config.Exchange
+		cfg = &legacyConfig
+	}
+	if hasConfiguredMarketSnapshotForConfig(cfg, runtimeCore, explicit) {
 		markets := make(banexg.MarketMap)
-		if err := applyConfiguredMarketSnapshot(exchange, markets); err != nil {
+		if err := applyConfiguredMarketSnapshotForConfig(cfg, dataDir, runtimeCore, explicit, exchange, markets); err != nil {
 			return nil, err
 		}
 		return markets, nil
@@ -708,7 +830,12 @@ func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *e
 	if err != nil || len(markets) > 0 || !exchange.IsContract(exInfo.MarketType) {
 		return markets, err
 	}
-	items := GetExSymbols(exInfo.ID, exInfo.MarketType)
+	var items map[int32]*ExSymbol
+	if state != nil {
+		items = state.GetExSymbols(exInfo.ID, exInfo.MarketType)
+	} else {
+		items = GetExSymbols(exInfo.ID, exInfo.MarketType)
+	}
 	if len(items) == 0 {
 		return markets, nil
 	}

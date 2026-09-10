@@ -40,7 +40,7 @@ func NewSIDAllocator() *SIDAllocator {
 // owned by one storage namespace. Its process lease and pending ledger are
 // derived from that namespace, not from the current runtime DataDir.
 func NewSIDAllocatorForNamespace(namespace string) *SIDAllocator {
-	return newSIDAllocator(namespace, config.GetDataDirSafe())
+	return newSIDAllocator(namespace, "")
 }
 
 // NewSIDAllocatorForStorage binds an allocator to the Runtime's immutable
@@ -217,8 +217,10 @@ func (a *SIDAllocator) recoveryRootSnapshot() []string {
 // API delegates to defaultSymbolState for legacy callers; new runtimes use
 // their own instance directly.
 type SymbolState struct {
-	mu          sync.RWMutex
-	lifecycleMu sync.RWMutex
+	mu              sync.RWMutex
+	lifecycleMu     sync.RWMutex
+	storage         *Storage
+	allowLegacyConn bool
 
 	identitySet      bool
 	identityExchange string
@@ -242,7 +244,7 @@ type SymbolState struct {
 }
 
 func NewSymbolState() *SymbolState {
-	return NewSymbolStateWithAllocator(nil)
+	return newSymbolState(nil, "", "", true)
 }
 
 // NewSymbolStateWithAllocator creates a symbol state with an optional shared
@@ -250,23 +252,31 @@ func NewSymbolState() *SymbolState {
 // Runtime composition roots should pass their Process-owned allocator when
 // several runtimes can write to the same symbol database.
 func NewSymbolStateWithAllocator(allocator *SIDAllocator) *SymbolState {
-	return NewSymbolStateWithAllocatorAndIdentity(allocator, "", "")
+	return newSymbolState(allocator, "", "", false)
 }
 
 // NewSymbolStateWithIdentity creates a symbol state bound to one immutable
-// exchange and market. An empty exchange or market keeps the state unbound,
-// preserving the legacy global fallback used by NewSymbolState.
+// exchange and market.
 func NewSymbolStateWithIdentity(exchange, market string) *SymbolState {
-	return NewSymbolStateWithAllocatorAndIdentity(nil, exchange, market)
+	return newSymbolState(nil, exchange, market, false)
 }
 
 // NewSymbolStateWithAllocatorAndIdentity combines a process-owned SID
 // allocator with an immutable exchange/market identity.
 func NewSymbolStateWithAllocatorAndIdentity(allocator *SIDAllocator, exchange, market string) *SymbolState {
+	return newSymbolState(allocator, exchange, market, false)
+}
+
+func newSymbolState(allocator *SIDAllocator, exchange, market string, allowLegacyConn bool) *SymbolState {
 	if allocator == nil {
-		allocator = NewSIDAllocator()
+		if allowLegacyConn {
+			allocator = NewSIDAllocator()
+		} else {
+			allocator = newSIDAllocator("", "")
+		}
 	}
 	return &SymbolState{
+		allowLegacyConn:  allowLegacyConn,
 		identitySet:      exchange != "" && market != "",
 		identityExchange: exchange,
 		identityMarket:   market,
@@ -278,6 +288,56 @@ func NewSymbolStateWithAllocatorAndIdentity(allocator *SIDAllocator, exchange, m
 		hourPairs:        make(map[string]*ExSymbol),
 		allocator:        allocator,
 	}
+}
+
+// NewSymbolStateWithStorage creates a symbol catalog whose persistence path
+// is owned by the supplied Storage. The allocator should normally be shared
+// by the Process that owns the Storage so sibling runtimes coordinate SIDs.
+func NewSymbolStateWithStorage(storage *Storage, allocator *SIDAllocator, exchange, market string) *SymbolState {
+	if allocator == nil && storage != nil {
+		allocator = NewSIDAllocatorForStorage(storage.Identity(), "")
+	}
+	state := NewSymbolStateWithAllocatorAndIdentity(allocator, exchange, market)
+	if err := state.BindStorage(storage); err != nil {
+		panic(err)
+	}
+	return state
+}
+
+// BindStorage attaches the immutable persistence owner to this symbol state.
+// A state cannot switch storage after it has been used, because doing so would
+// make its in-memory SID catalog ambiguous. Legacy states may remain unbound
+// and continue to use the package compatibility facade.
+func (s *SymbolState) BindStorage(storage *Storage) error {
+	if s == nil || storage == nil {
+		return nil
+	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.storage != nil && s.storage != storage {
+		if s.storage.Identity() != storage.Identity() || s.storage.IsQuestDB() != storage.IsQuestDB() {
+			return fmt.Errorf("symbol state is already bound to %s", s.storage)
+		}
+	}
+	if allocator := s.allocator; allocator != nil {
+		namespace := strings.TrimSpace(allocator.Namespace())
+		identity := strings.TrimSpace(storage.Identity())
+		if namespace != "" && identity != "" && namespace != identity {
+			return fmt.Errorf("symbol state allocator identity %q does not match storage identity %q", namespace, identity)
+		}
+	}
+	s.storage = storage
+	return nil
+}
+
+func (s *SymbolState) Storage() *Storage {
+	if s == nil {
+		return nil
+	}
+	s.lifecycleMu.RLock()
+	storage := s.storage
+	s.lifecycleMu.RUnlock()
+	return storage
 }
 
 func (s *SymbolState) acceptsIdentity(exchange, market string) bool {
@@ -607,7 +667,11 @@ func (s *SymbolState) sidAllocator() *SIDAllocator {
 	}
 	s.mu.Lock()
 	if s.allocator == nil {
-		s.allocator = NewSIDAllocator()
+		if s.allowLegacyConn {
+			s.allocator = NewSIDAllocator()
+		} else {
+			s.allocator = newSIDAllocator("", "")
+		}
 	}
 	allocator := s.allocator
 	s.mu.Unlock()

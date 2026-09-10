@@ -28,13 +28,25 @@ import (
  */
 
 func (s *TradeStrat) GetStakeAmount(j *StratJob) float64 {
-	amount := config.GetStakeAmount(j.Account)
+	var amount float64
+	account := ""
+	if j != nil {
+		account = j.Account
+	}
+	if cfg := s.runtimeConfigFor(j); cfg != nil {
+		amount = runtimeStakeAmount(cfg, account)
+	} else {
+		amount = config.GetStakeAmount(account)
+	}
 	// 乘以策略倍率
 	if s.StakeRate > 0 {
 		amount *= s.StakeRate
 	}
 	// 乘以此任务的开单倍率
-	key := core.KeyStratPairTf(j.Strat.Name, j.Symbol.Symbol, j.TimeFrame)
+	key := ""
+	if j != nil && j.Strat != nil && j.Symbol != nil {
+		key = core.KeyStratPairTf(j.Strat.Name, j.Symbol.Symbol, j.TimeFrame)
+	}
 	perfs := core.JobPerfs
 	if j != nil && j.runtimeCore != nil {
 		perfs = j.runtimeCore.JobPerfs
@@ -42,6 +54,37 @@ func (s *TradeStrat) GetStakeAmount(j *StratJob) float64 {
 	pref, _ := perfs[key]
 	if pref != nil {
 		amount = pref.GetAmount(amount)
+	}
+	return amount
+}
+
+func (s *TradeStrat) runtimeConfigFor(j *StratJob) *config.Config {
+	if j != nil && j.strategyState != nil && j.strategyState != legacyState && j.strategyState.Config != nil {
+		return j.strategyState.Config
+	}
+	if s != nil && s.runtimeConfig != nil {
+		return s.runtimeConfig
+	}
+	return nil
+}
+
+func runtimeStakeAmount(cfg *config.Config, account string) float64 {
+	if cfg == nil {
+		return 0
+	}
+	amount := cfg.StakeAmount
+	if acc, ok := cfg.Accounts[account]; ok && acc != nil {
+		if acc.StakePctAmt > 0 {
+			amount = acc.StakePctAmt
+		}
+		if acc.StakeRate > 0 {
+			amount *= acc.StakeRate
+		}
+		if acc.MaxStakeAmt > 0 && acc.MaxStakeAmt < amount {
+			amount = acc.MaxStakeAmt
+		}
+	} else if cfg.MaxStakeAmt > 0 && cfg.MaxStakeAmt < amount {
+		amount = cfg.MaxStakeAmt
 	}
 	return amount
 }
@@ -67,6 +110,14 @@ func (s *StratJob) runtimeTimeMS() int64 {
 	return btime.TimeMS()
 }
 
+func (s *StratJob) addFailOpen(tag string) {
+	if s != nil && s.strategyState != nil && s.strategyState != legacyState {
+		s.strategyState.AddAccFailOpen(s.Account, tag)
+		return
+	}
+	AddAccFailOpen(s.Account, tag)
+}
+
 func (s *StratJob) currentPrice(side string) float64 {
 	if s != nil && s.runtimePrices != nil {
 		price := s.runtimePrices.GetPriceSafeExpAt(s.runtimeTimeMS(), s.Symbol.Symbol, side, com.PriceExpireMS)
@@ -82,7 +133,11 @@ func (s *StratJob) currentPrice(side string) float64 {
 
 func (s *TradeStrat) WriteOutput(line string, date bool) {
 	if date {
-		prefix := btime.ToDateStr(btime.TimeMS(), core.DefaultDateFmt)
+		nowMS := btime.TimeMS()
+		if s != nil && s.runtimeClock != nil {
+			nowMS = s.runtimeClock.TimeMS()
+		}
+		prefix := btime.ToDateStr(nowMS, core.DefaultDateFmt)
 		line = prefix + " " + line
 	}
 	s.Outputs = append(s.Outputs, line)
@@ -103,7 +158,11 @@ func (s *TradeStrat) pickTimeFrame(symbol string, tfScores map[string]float64) s
 		tfList = s.Policy.RunTimeframes
 	}
 	if len(tfList) == 0 {
-		tfList = config.RunTimeframes
+		if s.runtimeConfig != nil {
+			tfList = s.runtimeConfig.RunTimeframes
+		} else if !s.runtimeExplicit {
+			tfList = config.RunTimeframes
+		}
 	}
 	for _, tf := range tfList {
 		useTfs[tf] = true
@@ -134,6 +193,12 @@ func (s *TradeStrat) pickTimeFrame(symbol string, tfScores map[string]float64) s
 func (s *TradeStrat) orderBarMax() int {
 	if s.OdBarMax > 0 {
 		return s.OdBarMax
+	}
+	if s.runtimeConfig != nil && s.runtimeConfig.OrderBarMax > 0 {
+		return s.runtimeConfig.OrderBarMax
+	}
+	if s.runtimeExplicit {
+		return 500
 	}
 	return config.OrderBarMax
 }
@@ -212,14 +277,14 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 				zap.String("tag", req.Tag),
 				zap.Int("dir", dirType))
 		}
-		AddAccFailOpen(s.Account, FailOpenBadDirtOrLimit)
+		s.addFailOpen(FailOpenBadDirtOrLimit)
 		return errs.NewMsg(errs.CodeParamInvalid, "open order disabled")
 	}
 
 	if math.IsNaN(req.Limit+req.Amount+req.Leverage+req.CostRate+req.LegalCost) ||
 		math.IsNaN(req.StopLoss+req.StopLossVal+req.StopLossLimit+req.StopLossRate) ||
 		math.IsNaN(req.TakeProfit+req.TakeProfitVal+req.TakeProfitLimit+req.TakeProfitRate) {
-		AddAccFailOpen(s.Account, FailOpenNanNum)
+		s.addFailOpen(FailOpenNanNum)
 		return errs.NewMsg(errs.CodeParamInvalid, "nan in EnterReq")
 	}
 	if req.CallbackPct > 0 && (req.CallbackPct < 0.1 || req.CallbackPct > 10) {
@@ -262,7 +327,14 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 	}
 	if req.Stop > 0 {
-		enterPrice = normalizeEntryStop(req, curPrice, isLimit, s.runtimeBacktest())
+		legacyIntrabar := false
+		if !s.Strat.runtimeExplicit {
+			legacyIntrabar = config.Data.BTLegacyIntrabar
+		}
+		if s.Strat.runtimeConfig != nil {
+			legacyIntrabar = s.Strat.runtimeConfig.BTLegacyIntrabar
+		}
+		enterPrice = normalizeEntryStop(req, curPrice, isLimit, s.runtimeBacktest(), legacyIntrabar)
 	}
 	if req.Amount == 0 && req.LegalCost == 0 {
 		if req.CostRate == 0 {
@@ -271,20 +343,33 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		req.LegalCost = s.Strat.GetStakeAmount(s) * req.CostRate
 		avgVol := s.avgVolume(5) // 最近5个蜡烛成交量
 		reqAmt := req.LegalCost / enterPrice
-		if avgVol > 0 && reqAmt/avgVol > config.OpenVolRate {
-			req.LegalCost = avgVol * config.OpenVolRate * enterPrice
+		openVolRate := 1.0
+		lowCostAction := ""
+		if !s.Strat.runtimeExplicit {
+			openVolRate = config.OpenVolRate
+			lowCostAction = config.LowCostAction
+		}
+		if s.Strat.runtimeConfig != nil {
+			openVolRate = s.Strat.runtimeConfig.OpenVolRate
+			if openVolRate == 0 {
+				openVolRate = 1
+			}
+			lowCostAction = s.Strat.runtimeConfig.LowCostAction
+		}
+		if avgVol > 0 && reqAmt/avgVol > openVolRate {
+			req.LegalCost = avgVol * openVolRate * enterPrice
 			if isLiveMode {
 				log.Info(fmt.Sprintf("%v open amt rate: %.1f > open_vol_rate(%.1f), cut to cost: %.1f",
-					symbol, reqAmt/avgVol, config.OpenVolRate, req.LegalCost))
+					symbol, reqAmt/avgVol, openVolRate, req.LegalCost))
 			}
 		}
 		minCost := core.MinStakeAmount
 		if req.LegalCost < minCost {
 			rate := req.LegalCost / minCost
-			if config.LowCostAction == core.LowCostKeepBig && rate > 0.4 || config.LowCostAction == core.LowCostKeepAll {
+			if lowCostAction == core.LowCostKeepBig && rate > 0.4 || lowCostAction == core.LowCostKeepAll {
 				req.LegalCost = minCost * 1.1
 			} else {
-				AddAccFailOpen(s.Account, FailOpenCostTooLess)
+				s.addFailOpen(FailOpenCostTooLess)
 				return errs.NewMsg(errs.CodeParamInvalid, "legal cost must >= %.2f", minCost)
 			}
 		}
@@ -317,7 +402,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 				if req.Short {
 					rel = ">"
 				}
-				AddAccFailOpen(s.Account, FailOpenBadStopLoss)
+				s.addFailOpen(FailOpenBadStopLoss)
 				return errs.NewMsg(errs.CodeParamInvalid, "%s stopLoss %f must %s %f for %v order",
 					symbol, curSLPrice, rel, enterPrice, dirType)
 			}
@@ -353,7 +438,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 				if req.Short {
 					rel = "<"
 				}
-				AddAccFailOpen(s.Account, FailOpenBadTakeProfit)
+				s.addFailOpen(FailOpenBadTakeProfit)
 				return errs.NewMsg(errs.CodeParamInvalid, "%s takeProfit %f must %s %f for %v order",
 					symbol, curTPPrice, rel, enterPrice, dirType)
 			}
@@ -392,9 +477,9 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	return nil
 }
 
-func normalizeEntryStop(req *EnterReq, curPrice float64, isLimit, backtest bool) float64 {
+func normalizeEntryStop(req *EnterReq, curPrice float64, isLimit, backtest, legacyIntrabar bool) float64 {
 	stopPrice := req.Stop
-	if backtest && config.Data.BTLegacyIntrabar {
+	if backtest && legacyIntrabar {
 		return curPrice
 	}
 	stopActsAsLimit := req.Stop < curPrice
@@ -756,22 +841,44 @@ func (s *StratJob) GetAvgCostPrice(odList ...*ormo.InOutOrder) float64 {
 
 func (s *StratJob) GetTmpEnv(stamp int64, o, h, l, c, v, quote, buyVolume float64, tradeNum int64) *ta.BarEnv {
 	envKey := strings.Join([]string{s.Symbol.Symbol, s.TimeFrame}, "_")
-	lockTmpEnv.Lock()
-	e, ok := TmpEnvs[envKey]
-	if !ok {
-		e = s.Env.Clone()
-		TmpEnvs[envKey] = e
+	var e *ta.BarEnv
+	tmpEnvs := TmpEnvs
+	if s.strategyState != nil && s.strategyState != legacyState {
+		state := s.strategyState
+		state.ensureMaps()
+		state.tmpEnvLock.Lock()
+		tmpEnvs = state.TmpEnvs
+		e, ok := tmpEnvs[envKey]
+		if !ok {
+			e = s.Env.Clone()
+			tmpEnvs[envKey] = e
+		}
+		state.tmpEnvLock.Unlock()
+	} else {
+		lockTmpEnv.Lock()
+		e, ok := tmpEnvs[envKey]
+		if !ok {
+			e = s.Env.Clone()
+			tmpEnvs[envKey] = e
+		}
+		lockTmpEnv.Unlock()
 	}
-	lockTmpEnv.Unlock()
 	if e.TimeStop < stamp {
 		// update on new data
 		barMs := utils2.AlignTfMSecs(stamp, e.TFMSecs)
 		if barMs > e.TimeStart && barMs == s.Env.TimeStop {
 			// enter new kline
 			e = s.Env.Clone()
-			lockTmpEnv.Lock()
-			TmpEnvs[envKey] = e
-			lockTmpEnv.Unlock()
+			if s.strategyState != nil && s.strategyState != legacyState {
+				state := s.strategyState
+				state.tmpEnvLock.Lock()
+				state.TmpEnvs[envKey] = e
+				state.tmpEnvLock.Unlock()
+			} else {
+				lockTmpEnv.Lock()
+				TmpEnvs[envKey] = e
+				lockTmpEnv.Unlock()
+			}
 			e.OnBar2(barMs, stamp, o, o, o, o, 0, 0, 0, 0)
 		} else {
 			e.ResetTo(s.Env)

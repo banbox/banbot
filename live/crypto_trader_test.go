@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/banbox/banbot/biz"
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
@@ -212,6 +213,62 @@ func TestCryptoTraderRuntimeWebAPIDoesNotReacquireLegacyGate(t *testing.T) {
 	unlock()
 }
 
+func TestCryptoTraderExplicitRuntimeSkipsLegacyWebAPI(t *testing.T) {
+	oldStartAPIWithLifecycle := webStartAPIWithLifecycle
+	t.Cleanup(func() { webStartAPIWithLifecycle = oldStartAPIWithLifecycle })
+
+	state, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	trader := NewCryptoTraderWithRuntimeDeps(nil, biz.RuntimeDeps{Core: state}, nil, nil)
+	called := false
+	webStartAPIWithLifecycle = func(RuntimeLifecycle) *errs.Error {
+		called = true
+		return nil
+	}
+
+	if err := trader.startWebAPI(); err != nil {
+		t.Fatalf("explicit runtime web API start failed: %v", err)
+	}
+	if called {
+		t.Fatal("explicit runtime started the legacy Web API")
+	}
+}
+
+func TestCryptoTraderExplicitRuntimeRequiresLifecycle(t *testing.T) {
+	state, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	trader := NewCryptoTraderWithRuntimeDeps(nil, biz.RuntimeDeps{Core: state}, nil, nil)
+	if err := trader.Init(); err == nil || !strings.Contains(err.Error(), "lifecycle") {
+		t.Fatalf("explicit runtime Init error = %v, want lifecycle requirement", err)
+	}
+	if err := trader.runWithDeps(); err == nil || !strings.Contains(err.Error(), "lifecycle") {
+		t.Fatalf("explicit runtime run error = %v, want lifecycle requirement", err)
+	}
+}
+
+func TestExplicitRuntimeStartJobsDoesNotUseLegacyPathWithoutLifecycle(t *testing.T) {
+	oldEnvReal := core.EnvReal
+	core.EnvReal = false
+	t.Cleanup(func() { core.EnvReal = oldEnvReal })
+
+	state := &core.State{EnvReal: true}
+	trader := NewCryptoTraderWithRuntimeDeps(nil, biz.RuntimeDeps{Core: state}, nil, nil)
+	trader.dp = &data.LiveProvider{}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("explicit runtime startJobs panicked through legacy path: %v", recovered)
+		}
+	}()
+	trader.startJobs()
+}
+
 func TestCryptoTraderRuntimeDepsRetainOneSymbolState(t *testing.T) {
 	symbols := orm.NewSymbolState()
 	trader := NewCryptoTraderWithRuntimeDeps(nil, biz.RuntimeDeps{Symbols: symbols}, nil, nil)
@@ -243,6 +300,29 @@ func TestCryptoTraderExplicitRuntimeUsesBoundExchange(t *testing.T) {
 	trader := NewCryptoTraderWithRuntimeDeps(nil, biz.RuntimeDeps{Exchange: exchange}, nil, nil)
 	if got := trader.exchangeForRun(); got != exchange {
 		t.Fatalf("explicit runtime exchange = %p, want %p", got, exchange)
+	}
+}
+
+func TestExplicitPairRefreshRequiresOwnedOrderState(t *testing.T) {
+	coreState, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(coreState.Close)
+	coreState.SetRunMode(core.RunModeLive)
+	exchange := &banexg.Exchange{}
+	deps := &biz.RuntimeDeps{
+		Core:       coreState,
+		Clock:      btime.NewClockState(false, nil),
+		Strategies: strat.NewStateWithRuntime(coreState, nil, &config.Config{}, nil, exchange),
+		Trading:    biz.NewTradingState(),
+		Symbols:    orm.NewSymbolState(),
+		Exchange:   exchange,
+		Config:     config.NewSnapshot(&config.Config{}),
+	}
+	err = refreshPairJobsWithRuntime(nil, deps.Symbols, deps, deps.Clock, exchange, false, false)
+	if err == nil || !strings.Contains(err.Error(), "order state") {
+		t.Fatalf("missing runtime order state error = %v", err)
 	}
 }
 

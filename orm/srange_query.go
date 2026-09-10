@@ -31,13 +31,13 @@ type ListSeriesRangeSummariesArgs struct {
 }
 
 func (q *Queries) ListSeriesRangeSummaries(args ListSeriesRangeSummariesArgs) ([]*SeriesRangeSummary, int64, *errs.Error) {
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	ctx := context.Background()
 	where, params := buildSeriesRangeSummaryWhere(args)
 	fromSQL := fmt.Sprintf(`FROM sranges
   WHERE %s`, where)
-	if IsQuestDB {
+	if q.isQuestDB() {
 		fromSQL = fmt.Sprintf(`FROM (
     SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted
     FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms
@@ -78,7 +78,7 @@ OFFSET $%d LIMIT $%d`, fromSQL, len(params)-1, len(params))
 		if err := rows.Scan(&r.Sid, &r.Table, &r.Source, &r.Timeframe, &r.StartMs, &r.StopMs, &r.HasData, &r.Segments); err != nil {
 			return nil, 0, NewDbErr(core.ErrDbReadFail, err)
 		}
-		r.Symbol = GetSymbolByID(r.Sid)
+		r.Symbol = q.symbolByID(r.Sid)
 		out = append(out, &r)
 	}
 	if err := rows.Err(); err != nil {
@@ -123,7 +123,7 @@ func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Err
 	if args.Sid == 0 {
 		return nil, 0, errs.NewMsg(core.ErrDbReadFail, "sid is required")
 	}
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	ctx := context.Background()
 
@@ -194,12 +194,12 @@ ORDER BY start_ms DESC`, whereClause)
 }
 
 func (q *Queries) ListSRangesBySid(ctx context.Context, sid int32) ([]*SRange, error) {
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	rows, err := q.db.Query(ctx, listSRangesBySidQuery(IsQuestDB), sid)
+	rows, err := q.db.Query(ctx, listSRangesBySidQuery(q.isQuestDB()), sid)
 	if err != nil {
 		return nil, err
 	}

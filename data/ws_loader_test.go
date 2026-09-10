@@ -86,6 +86,31 @@ func TestWsDataLoaderStopCancelsPendingLoad(t *testing.T) {
 	loader.Join()
 }
 
+func TestWsDataLoaderRuntimeContextIgnoresLegacyContext(t *testing.T) {
+	oldContext := core.Ctx
+	legacyContext, cancelLegacy := context.WithCancel(context.Background())
+	cancelLegacy()
+	core.Ctx = legacyContext
+	t.Cleanup(func() { core.Ctx = oldContext })
+
+	runtimeState, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(runtimeState.Close)
+	loader, loaderErr := NewWsDataLoaderWithRuntimeDeps(&RuntimeDeps{Core: runtimeState})
+	if loaderErr != nil {
+		t.Fatal(loaderErr)
+	}
+	select {
+	case <-loader.ctx.Done():
+		t.Fatal("runtime websocket loader inherited canceled legacy context")
+	default:
+	}
+	loader.Stop()
+	loader.Join()
+}
+
 func TestWsSymbolArchiveURLUsesAdapterCapabilityAndSupportsOverrides(t *testing.T) {
 	info := testWsLoaderSymbol()
 	want := "https://archive.example.test/trades.zip"

@@ -89,6 +89,13 @@ var questRewriteIntentStoreFn = func() questRewriteIntentStore {
 	return &fileQuestRewriteIntentStore{root: compactProcessLockRootFn()}
 }
 
+func questRewriteIntentStoreForRoot(root string) questRewriteIntentStore {
+	if root == "" || root == compactProcessLockRootFn() {
+		return questRewriteIntentStoreFn()
+	}
+	return &fileQuestRewriteIntentStore{root: root}
+}
+
 func (s *fileQuestRewriteIntentStore) path(table string) (string, error) {
 	if s.root == "" {
 		return "", errors.New("QuestDB rewrite intent storage identity is empty")
@@ -347,7 +354,7 @@ func waitForQuestCalendarTimestampVisible(ctx context.Context, q *Queries, marke
 }
 
 func questKlineWindowVisible(ctx context.Context, q *Queries, sid int32, timeframe string, startMS, endMS int64) (bool, error) {
-	return questKlineWindowVisibleWithExSymbol(ctx, q, sid, GetSymbolByID(sid), timeframe, startMS, endMS)
+	return questKlineWindowVisibleWithExSymbol(ctx, q, sid, q.symbolByID(sid), timeframe, startMS, endMS)
 }
 
 // questKlineWindowVisibleWithSymbolState keeps explicit runtime catalogs
@@ -476,7 +483,7 @@ func waitForQuestKlineWindowVisible(ctx context.Context, q *Queries, sid int32, 
 }
 
 func questKlineCoverageVisible(ctx context.Context, q *Queries, sid int32, timeframe string, startMS, endMS int64) (bool, error) {
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	spans, err := q.loadSRangesSpansFromDB(ctx, sid, "kline_"+timeframe, timeframe, startMS, endMS)
 	if err != nil {
@@ -534,7 +541,7 @@ func WaitForSeriesCoverageVisible(ctx context.Context, info *SeriesInfo, sid int
 func waitForQuestSeriesCoverageVisible(ctx context.Context, q *Queries, info *SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
 	binding := normalizedSeriesBinding(info.Binding)
 	ok, err := questWaitForCondition(ctx, klineInsertQuestVisibilityGrace, questReadAfterWritePollInterval, func() (bool, error) {
-		unlock := LockCompactTableRead("sranges_q")
+		unlock := q.LockCompactTableRead("sranges_q")
 		defer unlock()
 		spans, err := q.loadSRangesSpansFromDB(ctx, sid, binding.Table, info.TimeFrame, startMS, endMS)
 		if err != nil {
@@ -1707,7 +1714,11 @@ func renameQuestRewriteTable(ctx context.Context, db questRewriteExecDB, from, t
 }
 
 func reconcileQuestRewriteSwap(ctx context.Context, db questRewriteSwapDB, table string) error {
-	store := questRewriteIntentStoreFn()
+	return reconcileQuestRewriteSwapAtRoot(ctx, db, table, compactProcessLockRootFn())
+}
+
+func reconcileQuestRewriteSwapAtRoot(ctx context.Context, db questRewriteSwapDB, table, root string) error {
+	store := questRewriteIntentStoreForRoot(root)
 	intent, err := store.Load(table)
 	if err != nil || intent == nil {
 		return err
@@ -1827,19 +1838,42 @@ func reconcileQuestRewriteSwap(ctx context.Context, db questRewriteSwapDB, table
 }
 
 func saveQuestRewriteSwapIntent(intent *questRewriteSwapIntent) error {
+	return saveQuestRewriteSwapIntentAtRoot(intent, compactProcessLockRootFn())
+}
+
+func saveQuestRewriteSwapIntentAtRoot(intent *questRewriteSwapIntent, root string) error {
 	intent.Version = questRewriteSwapIntentVersion
-	if err := questRewriteIntentStoreFn().Save(intent); err != nil {
+	if err := questRewriteIntentStoreForRoot(root).Save(intent); err != nil {
 		return fmt.Errorf("persist QuestDB rewrite swap intent: %w", err)
 	}
 	return nil
 }
 
 func clearQuestRewriteSwapIntent(table string) error {
-	return questRewriteIntentStoreFn().Remove(table)
+	return clearQuestRewriteSwapIntentAtRoot(table, compactProcessLockRootFn())
+}
+
+func clearQuestRewriteSwapIntentAtRoot(table, root string) error {
+	return questRewriteIntentStoreForRoot(root).Remove(table)
+}
+
+func abortQuestRewriteSwap(ctx context.Context, db questRewriteExecDB, source, temporary string, cause error) error {
+	return abortQuestRewriteSwapAtRoot(ctx, db, source, temporary, cause, compactProcessLockRootFn())
+}
+
+func abortQuestRewriteSwapAtRoot(ctx context.Context, db questRewriteExecDB, source, temporary string, cause error, root string) error {
+	if err := dropQuestRewriteTable(ctx, db, temporary); err != nil {
+		return fmt.Errorf("%w; temporary cleanup failed: %v; recovery intent retained for %s", cause, err, source)
+	}
+	if err := clearQuestRewriteSwapIntentAtRoot(source, root); err != nil {
+		return fmt.Errorf("%w; clear swap intent: %v", cause, err)
+	}
+	return cause
 }
 
 func replaceVerifiedQuestTable(ctx context.Context, q *Queries, tableName, tmpTable, backupTable, sidColumn, sourcePredicate string, expected *questRewriteTableSnapshot) *errs.Error {
-	if err := reconcileQuestRewriteSwap(ctx, q.db, tableName); err != nil {
+	root := q.processLockRoot()
+	if err := reconcileQuestRewriteSwapAtRoot(ctx, q.db, tableName, root); err != nil {
 		return NewDbErr(core.ErrDbExecFail, fmt.Errorf("reconcile interrupted rewrite: %w", err))
 	}
 	if sourceErr := verifyQuestRewriteTableSnapshot(ctx, q, tableName, sidColumn, sourcePredicate, expected); sourceErr != nil {
@@ -1850,15 +1884,12 @@ func replaceVerifiedQuestTable(ctx context.Context, q *Queries, tableName, tmpTa
 		Kind: "table", Source: tableName, Temp: tmpTable, Backup: backupTable,
 		SIDColumn: sidColumn, SourcePredicate: sourcePredicate, TableSnapshot: expected,
 	}
-	if err := saveQuestRewriteSwapIntent(intent); err != nil {
+	if err := saveQuestRewriteSwapIntentAtRoot(intent, root); err != nil {
 		return NewDbErr(core.ErrDbExecFail, cleanupQuestRewriteFailure(ctx, q.db, tmpTable, err))
 	}
 	if _, err := q.db.Exec(ctx, fmt.Sprintf("RENAME TABLE %s TO %s", quoteIdent(tableName), quoteIdent(backupTable))); err != nil {
 		cause := fmt.Errorf("rename source to backup: %w", err)
-		cause = cleanupQuestRewriteFailure(ctx, q.db, tmpTable, cause)
-		if clearErr := clearQuestRewriteSwapIntent(tableName); clearErr != nil {
-			cause = fmt.Errorf("%w; clear swap intent: %v", cause, clearErr)
-		}
+		cause = abortQuestRewriteSwapAtRoot(ctx, q.db, tableName, tmpTable, cause, root)
 		return NewDbErr(core.ErrDbExecFail, cause)
 	}
 	if _, err := q.db.Exec(ctx, fmt.Sprintf("RENAME TABLE %s TO %s", quoteIdent(tmpTable), quoteIdent(tableName))); err != nil {
@@ -1871,7 +1902,7 @@ func replaceVerifiedQuestTable(ctx context.Context, q *Queries, tableName, tmpTa
 		if cleanupErr := dropQuestRewriteTable(ctx, q.db, tmpTable); cleanupErr != nil {
 			return NewDbErr(core.ErrDbExecFail, fmt.Errorf("activate rewritten table: %w; source restored; temporary cleanup failed: %v; temporary=%s", err, cleanupErr, tmpTable))
 		}
-		if clearErr := clearQuestRewriteSwapIntent(tableName); clearErr != nil {
+		if clearErr := clearQuestRewriteSwapIntentAtRoot(tableName, root); clearErr != nil {
 			return NewDbErr(core.ErrDbExecFail, fmt.Errorf("activate rewritten table: %w; source restored; clear swap intent: %v", err, clearErr))
 		}
 		return NewDbErr(core.ErrDbExecFail, fmt.Errorf("activate rewritten table: %w; source restored; temporary=%s", err, tmpTable))
@@ -1887,7 +1918,7 @@ func replaceVerifiedQuestTable(ctx context.Context, q *Queries, tableName, tmpTa
 		if cleanupErr := dropQuestRewriteTable(ctx, q.db, tmpTable); cleanupErr != nil {
 			return NewDbErr(core.ErrDbExecFail, fmt.Errorf("verify activated rewritten table: %v; source restored; temporary cleanup failed: %v; temporary=%s", verifyErr, cleanupErr, tmpTable))
 		}
-		if clearErr := clearQuestRewriteSwapIntent(tableName); clearErr != nil {
+		if clearErr := clearQuestRewriteSwapIntentAtRoot(tableName, root); clearErr != nil {
 			return NewDbErr(core.ErrDbExecFail, fmt.Errorf("verify activated rewritten table: %v; source restored; clear swap intent: %v", verifyErr, clearErr))
 		}
 		return errs.NewMsg(core.ErrDbReadFail, "verify activated rewritten table: %v; source restored; temporary=%s", verifyErr, tmpTable)
@@ -1898,7 +1929,7 @@ func replaceVerifiedQuestTable(ctx context.Context, q *Queries, tableName, tmpTa
 	if cleanupErr != nil {
 		return NewDbErr(core.ErrDbExecFail, fmt.Errorf("drop verified rewrite backup %s: %w", backupTable, cleanupErr))
 	}
-	if err := clearQuestRewriteSwapIntent(tableName); err != nil {
+	if err := clearQuestRewriteSwapIntentAtRoot(tableName, root); err != nil {
 		return NewDbErr(core.ErrDbExecFail, fmt.Errorf("clear completed rewrite swap intent: %w", err))
 	}
 	return nil

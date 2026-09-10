@@ -33,11 +33,15 @@ func NewFuncDataSource(info *orm.SeriesInfo, fetch FetchHistoryFunc, subscribe S
 }
 
 func RegisterFuncDataSource(info *orm.SeriesInfo, fetch FetchHistoryFunc, subscribe SubscribeLiveFunc) error {
+	return legacyDataSourceCatalog.RegisterFuncDataSource(info, fetch, subscribe)
+}
+
+func (c *DataSourceCatalog) RegisterFuncDataSource(info *orm.SeriesInfo, fetch FetchHistoryFunc, subscribe SubscribeLiveFunc) error {
 	src, err := NewFuncDataSource(info, fetch, subscribe)
 	if err != nil {
 		return err
 	}
-	return RegisterDataSource(src)
+	return c.RegisterDataSource(src)
 }
 
 func (s *FuncDataSource) Info() *orm.SeriesInfo {

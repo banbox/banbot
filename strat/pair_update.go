@@ -1,6 +1,10 @@
 package strat
 
 import (
+	"fmt"
+	"slices"
+	"strings"
+
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
@@ -105,33 +109,74 @@ func resolveStratExchange(exchange banexg.BanExchange, state *core.State, symbol
 	return exchange, explicit
 }
 
-func calcPairTfScoresForRuntime(symbols *orm.SymbolState, exchange banexg.BanExchange, explicit bool, pairs []string) (map[string]map[string]float64, *errs.Error) {
+func calcPairTfScoresForRuntime(strategyState *State, symbols *orm.SymbolState, exchange banexg.BanExchange, explicit bool, pairs []string) (map[string]map[string]float64, *errs.Error) {
 	if !explicit {
 		return CalcPairTfScores(nil, pairs)
 	}
 	if exchange == nil {
 		return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required to score strategy pairs")
 	}
+	if strategyState != nil && strategyState != legacyState {
+		return CalcPairTfScoresWithState(strategyState, symbols, exchange, pairs)
+	}
 	return CalcPairTfScoresWithSymbolState(symbols, exchange, pairs)
 }
 
-func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.Error) {
-	m.mu.Lock()
-	hooks := m.hooks
-	m.mu.Unlock()
-	if req.StrategyState != nil {
-		if stateHooks := req.StrategyState.PairUpdateHooks(); stateHooks.SubWarmPairs != nil {
-			hooks = stateHooks
+func parsePairsForState(state *State, pairs ...string) ([]string, *errs.Error) {
+	if state == nil || state == legacyState {
+		return config.ParsePairs(pairs...)
+	}
+	cfg := state.Config
+	exchangeName, market, quote := "", "", ""
+	if cfg != nil {
+		if cfg.Exchange != nil {
+			exchangeName = cfg.Exchange.Name
 		}
+		market = cfg.MarketType
+		if len(cfg.StakeCurrency) > 0 {
+			quote = cfg.StakeCurrency[0]
+		}
+	}
+	if config.ExchangeUsesOpaqueSymbols(exchangeName) {
+		return slices.Clone(pairs), nil
+	}
+	result := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		if strings.Contains(pair, "/") {
+			result = append(result, pair)
+			continue
+		}
+		if quote == "" {
+			return nil, errs.NewMsg(core.ErrBadConfig, "`stake_currency` is required")
+		}
+		switch market {
+		case banexg.MarketSpot:
+			result = append(result, fmt.Sprintf("%s/%s", pair, quote))
+		case banexg.MarketLinear:
+			result = append(result, fmt.Sprintf("%s/%s:%s", pair, quote, quote))
+		case banexg.MarketInverse:
+			result = append(result, fmt.Sprintf("%s/%s:%s", pair, quote, pair))
+		default:
+			return nil, errs.NewMsg(core.ErrBadConfig, "option market don't support short pair")
+		}
+	}
+	return result, nil
+}
+
+func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.Error) {
+	var hooks PairUpdateHooks
+	if req.StrategyState != nil && req.StrategyState != legacyState {
+		hooks = req.StrategyState.PairUpdateHooks()
+	} else {
+		m.mu.Lock()
+		hooks = m.hooks
+		m.mu.Unlock()
 	}
 	if hooks.SubWarmPairs == nil {
 		return nil, errs.NewMsg(core.ErrRunTime, "PairUpdateHooks.SubWarmPairs not set")
 	}
 	if req.Strat == nil || req.Strat.Policy == nil {
 		return nil, errs.NewMsg(errs.CodeParamRequired, "Strat and Strat.Policy are required")
-	}
-	if hooks.LookupSymbol == nil {
-		hooks.LookupSymbol = orm.GetExSymbolCur
 	}
 	admissionState := req.Core
 	if admissionState == nil {
@@ -144,6 +189,26 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	if strategyState == nil {
 		strategyState = LegacyState()
 	}
+	explicitStrategyState := strategyState != legacyState
+	if hooks.SymbolState == nil && explicitStrategyState {
+		hooks.SymbolState = strategyState.Symbols
+	}
+	if hooks.LookupSymbol == nil {
+		if hooks.SymbolState != nil {
+			hooks.LookupSymbol = hooks.SymbolState.GetExSymbolCur
+		} else if !explicitStrategyState {
+			hooks.LookupSymbol = orm.GetExSymbolCur
+		}
+	}
+	if explicitStrategyState && hooks.SubWarmPairs == nil {
+		return nil, errs.NewMsg(core.ErrRunTime, "explicit strategy state requires PairUpdateHooks.SubWarmPairs")
+	}
+	if explicitStrategyState && hooks.LookupSymbol == nil {
+		return nil, errs.NewMsg(core.ErrRunTime, "explicit strategy state requires PairUpdateHooks.LookupSymbol or SymbolState")
+	}
+	if explicitStrategyState && hooks.Exchange == nil {
+		hooks.Exchange = strategyState.Exchange
+	}
 	strategyState.ensureMaps()
 	exchange, runtimeExplicit := resolveStratExchange(req.Exchange, admissionState, hooks.SymbolState, hooks)
 	var stgPairTfs map[string]map[string]string
@@ -154,19 +219,19 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		stgPairTfs = core.StgPairTfs
 	}
 	res := &PairUpdateResult{ExitOrders: map[string][]*ormo.InOutOrder{}}
-	adds, err := config.ParsePairs(req.Add...)
+	adds, err := parsePairsForState(strategyState, req.Add...)
 	if err != nil {
 		return nil, err
 	}
-	removes, err := config.ParsePairs(req.Remove...)
+	removes, err := parsePairsForState(strategyState, req.Remove...)
 	if err != nil {
 		return nil, err
 	}
-	lockJobs.Lock()
+	lockJobsWriteForState(strategyState)
 	locked := true
 	defer func() {
 		if locked {
-			lockJobs.Unlock()
+			unlockJobsWriteForState(strategyState)
 		}
 	}()
 	curMap, ok := stgPairTfs[req.Strat.Name]
@@ -193,7 +258,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		}
 		pol := *req.Strat.Policy
 		pol.Pairs = nil
-		allowedPairs, err := getPolicyPairsWithRuntimeState(admissionState, hooks.SymbolState, exchange, &pol, candidates)
+		allowedPairs, err := getPolicyPairsWithStrategyState(strategyState, admissionState, hooks.SymbolState, exchange, &pol, candidates)
 		if err != nil {
 			return nil, err
 		}
@@ -219,7 +284,22 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	pairTfScores := map[string]map[string]float64{}
 	if len(pendingScores) > 0 {
 		pairs := utils.KeysOfMap(pendingScores)
-		scores, err := calcPairTfScoresForRuntime(hooks.SymbolState, exchange, runtimeExplicit, pairs)
+		var scores map[string]map[string]float64
+		var err *errs.Error
+		// A dynamically supplied strategy may be updated before it is inserted
+		// into the runtime registry. Use its own policy projection for scoring
+		// rather than consulting the process-wide config.
+		if runtimeExplicit && strategyState != nil && strategyState.Config == nil && req.Strat.Policy != nil && len(req.Strat.Policy.RunTimeframes) > 0 {
+			if exchange == nil {
+				return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required to score strategy pairs")
+			}
+			cfg := &config.Config{
+				RunTimeframes: req.Strat.Policy.RunTimeframes,
+			}
+			scores, err = calcPairTfScoresWithConfig(strategyState, cfg, hooks.SymbolState, exchange, runtimeTimeMSFor(strategyState), pairs)
+		} else {
+			scores, err = calcPairTfScoresForRuntime(strategyState, hooks.SymbolState, exchange, runtimeExplicit, pairs)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -227,8 +307,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	}
 	var accLimits accStratLimits
 	if !req.ForceAdd {
-		accLimits, _ = newAccStratLimits()
-		for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+		accLimits, _ = newAccStratLimitsForState(strategyState)
+		for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, admissionState)) {
 			jobsMap := strategyState.AccJobs[acc]
 			for _, stgMap := range jobsMap {
 				if _, ok := stgMap[req.Strat.Name]; ok {
@@ -268,7 +348,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		ensureStratJobWithRuntimeState(strategyState, admissionState, req.Strat, tf, exs, env, dirt, logWarm, accLimits, hooks.SymbolState)
 		if len(req.Strat.WsSubs) > 0 {
 			envKey := pair + "_" + tf
-			for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+			for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, admissionState)) {
 				jobsMap := strategyState.AccJobs[acc]
 				if stgMap, ok := jobsMap[envKey]; ok {
 					if job := stgMap[req.Strat.Name]; job != nil {
@@ -297,7 +377,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			continue
 		}
 		envKey := pair + "_" + tf
-		for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+		for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, admissionState)) {
 			accJobs := strategyState.AccJobs[acc]
 			if stgMap, ok := accJobs[envKey]; ok {
 				if job, ok := stgMap[req.Strat.Name]; ok {
@@ -334,13 +414,13 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			res.Removed = append(res.Removed, pair)
 		}
 	}
-	lockJobs.Unlock()
+	unlockJobsWriteForState(strategyState)
 	locked = false
 	if req.CloseOnRemove {
 		if hooks.ExitOrders == nil && len(res.ExitOrders) > 0 {
 			return nil, errs.NewMsg(core.ErrRunTime, "ExitOrders hook is required to close removed pair orders")
 		}
-		for acc := range utils.MapKeys(res.ExitOrders, config.StrictBacktest()) {
+		for acc := range utils.MapKeys(res.ExitOrders, strictBacktestFor(strategyState, admissionState)) {
 			orders := res.ExitOrders[acc]
 			if len(orders) == 0 {
 				continue
@@ -349,7 +429,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 				return nil, err
 			}
 		}
-		lockJobs.Lock()
+		lockJobsWriteForState(strategyState)
 		locked = true
 		for _, removal := range removals {
 			accJobs := strategyState.AccJobs[removal.account]
@@ -388,7 +468,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	}
 	allWarms := collectAllWarmsLockedWithState(strategyState)
 	if locked {
-		lockJobs.Unlock()
+		unlockJobsWriteForState(strategyState)
 		locked = false
 	}
 	if err := hooks.SubWarmPairs(allWarms, true); err != nil {
@@ -407,14 +487,14 @@ func collectAllWarmsLockedWithState(strategyState *State) Warms {
 	}
 	strategyState.ensureMaps()
 	all := make(Warms)
-	for acc := range utils.MapKeys(strategyState.AccJobs, config.StrictBacktest()) {
+	for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, nil)) {
 		accJobs := strategyState.AccJobs[acc]
 		for _, stgMap := range accJobs {
 			for _, job := range stgMap {
 				pair := job.Symbol.Symbol
 				tf := job.TimeFrame
 				all.Update(pair, tf, job.Strat.WarmupNum)
-				matchTf, _ := config.GetStratRefineTF(job.Strat.Name, tf)
+				matchTf := strategyState.refineTimeFrame(job.Strat.Name, tf)
 				all.Update(pair, matchTf, 0)
 				for _, sub := range CollectDataSubs(job) {
 					if sub == nil || orm.NormalizeSeriesSource(sub.Source) != orm.SeriesSourceKline || sub.ExSymbol == nil {

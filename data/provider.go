@@ -23,6 +23,7 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
@@ -96,6 +97,9 @@ func (p *Provider[T]) wsRegistry() *strat.WsSubJobRegistry {
 	if p != nil && p.wsSubs != nil {
 		return p.wsSubs
 	}
+	if p != nil && p.deps != nil {
+		return nil
+	}
 	return strat.LegacyWsSubJobRegistry()
 }
 
@@ -165,7 +169,11 @@ Return the trading pairs with the smallest period change (new/old pairs new peri
 	返回最小周期变化的交易对(新增/旧对新周期)、预热任务
 */
 func (p *Provider[IDataFeeder]) SubWarmPairs(items map[string]map[string]int, delOther bool, pBar *utils.StagedPrg) ([]IDataFeeder, map[string]int64, []string, *errs.Error) {
-	p.wsRegistry().Refresh()
+	registry := p.wsRegistry()
+	if registry == nil && p != nil && p.deps != nil {
+		return nil, nil, nil, errs.NewMsg(core.ErrBadConfig, "explicit data provider websocket registry is required")
+	}
+	registry.Refresh()
 	var newHolds []IDataFeeder
 	var warmJobs []*WarmJob
 	var oldSince = make(map[string]int64)
@@ -279,6 +287,7 @@ func (p *Provider[IDataFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPr
 type HistProvider struct {
 	Provider[IHistDataFeeder]
 	deps          *RuntimeDeps
+	catalog       *DataSourceCatalog
 	symbols       *orm.SymbolState
 	getEnd        FnGetInt64
 	maxTfSecs     int
@@ -292,8 +301,19 @@ type HistProvider struct {
 	trades   map[string]*TradeFeeder
 }
 
+func (p *HistProvider) DataSourceCatalog() *DataSourceCatalog {
+	if p == nil {
+		return nil
+	}
+	return p.catalog
+}
+
 func NewHistProvider(callBack FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) *HistProvider {
 	return newHistProvider(nil, nil, callBack, envEnd, getEnd, showLog, pBar)
+}
+
+func NewHistProviderWithCatalog(catalog *DataSourceCatalog, symbols *orm.SymbolState, callBack FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) *HistProvider {
+	return newHistProviderWithCatalog(nil, symbols, catalog, callBack, envEnd, getEnd, showLog, pBar)
 }
 
 // NewHistProviderWithSymbolState binds symbol resolution and subscription
@@ -309,19 +329,38 @@ func NewHistProviderWithRuntimeDeps(deps *RuntimeDeps, callBack FnDataSeries, en
 	if deps == nil {
 		return NewHistProvider(callBack, envEnd, getEnd, showLog, pBar)
 	}
-	return newHistProvider(deps, deps.Symbols, callBack, envEnd, getEnd, showLog, pBar)
+	return newHistProviderWithCatalog(deps, deps.Symbols, deps.Catalog, callBack, envEnd, getEnd, showLog, pBar)
 }
 
 func newHistProvider(deps *RuntimeDeps, symbols *orm.SymbolState, callBack FnDataSeries, envEnd FuncEnvEnd,
 	getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) *HistProvider {
+	catalog := legacyDataSourceCatalog
+	if deps != nil {
+		catalog = deps.Catalog
+	}
+	return newHistProviderWithCatalog(deps, symbols, catalog, callBack, envEnd, getEnd, showLog, pBar)
+}
+
+func newHistProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, catalog *DataSourceCatalog, callBack FnDataSeries, envEnd FuncEnvEnd,
+	getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) *HistProvider {
 	var wsSubs *strat.WsSubJobRegistry
 	if deps != nil {
-		wsSubs = strat.NewWsSubJobRegistryWithState(deps.Strategies, symbols)
+		strategyState := deps.Strategies
+		if strategyState == nil {
+			strategyState = strat.NewState()
+		}
+		wsSubs = strat.NewWsSubJobRegistryWithState(strategyState, symbols)
 	} else {
 		wsSubs = strat.NewWsSubJobRegistry(symbols)
 	}
 	if deps == nil && symbols == nil {
 		wsSubs = strat.LegacyWsSubJobRegistry()
+	}
+	var seriesRepo orm.SeriesRepo
+	if deps != nil {
+		seriesRepo = orm.NewSeriesRepo(deps.storage())
+	} else {
+		seriesRepo = orm.DefaultSeriesRepo()
 	}
 	p := &HistProvider{
 		Provider: Provider[IHistDataFeeder]{
@@ -350,6 +389,7 @@ func newHistProvider(deps *RuntimeDeps, symbols *orm.SymbolState, callBack FnDat
 			wsSubs:    wsSubs,
 		},
 		deps:          deps,
+		catalog:       catalog,
 		getEnd:        getEnd,
 		symbols:       symbols,
 		pBar:          pBar,
@@ -357,6 +397,7 @@ func newHistProvider(deps *RuntimeDeps, symbols *orm.SymbolState, callBack FnDat
 		trades:        make(map[string]*TradeFeeder),
 		series:        make(map[string]*HistSeriesFeeder),
 		seriesCB:      callBack,
+		seriesRepo:    seriesRepo,
 	}
 
 	return p
@@ -386,7 +427,7 @@ func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
 		if sub == nil || sub.ExSymbol == nil || orm.NormalizeSeriesSource(sub.Source) == orm.SeriesSourceKline {
 			continue
 		}
-		src := GetDataSource(sub.Source)
+		src := p.catalog.GetDataSource(sub.Source)
 		if src == nil {
 			return errs.NewMsg(core.ErrBadConfig, "data source %q is not registered", sub.Source)
 		}
@@ -486,7 +527,13 @@ func (p *HistProvider) downIfNeed() *errs.Error {
 		return nil
 	}
 	var err *errs.Error
-	sess, conn, err := orm.Conn(nil)
+	var sess *orm.Queries
+	var conn *pgxpool.Conn
+	if p.deps == nil {
+		sess, conn, err = orm.Conn(nil)
+	} else {
+		sess, conn, err = p.deps.conn()
+	}
 	if err != nil {
 		return err
 	}
@@ -517,6 +564,7 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 	if err != nil {
 		return err
 	}
+	registry := p.wsRegistry()
 	maxSince := int64(0)
 	holders := make(map[string]IHistDataFeeder)
 	var defSince int64
@@ -559,7 +607,7 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 		needSeek[pair] = sta.SubNextMS
 	}
 	// 初始化高频数据订阅
-	pairJobs := p.wsRegistry().Pairs(core.WsSubTrade)
+	pairJobs := registry.Pairs(core.WsSubTrade)
 	if len(pairJobs) > 0 {
 		if p.wsLoader == nil {
 			if p.deps == nil {
@@ -588,7 +636,7 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 				return err
 			}
 			var feed *TradeFeeder
-			feed = newTradeFeeder(p.deps, p.wsRegistry(), exs, p.wsLoader)
+			feed = newTradeFeeder(p.deps, registry, exs, p.wsLoader)
 			feed.SetSeek(curMS)
 			p.trades[pair] = feed
 		}
@@ -836,6 +884,7 @@ func (h *histFeederHeap) Pop() any {
 type LiveProvider struct {
 	Provider[IDataFeeder]
 	deps    *RuntimeDeps
+	catalog *DataSourceCatalog
 	symbols *orm.SymbolState
 	*SeriesWatcher
 	OnDataSeries func(msg *SeriesMsg, rows []*orm.DataSeries) *errs.Error
@@ -844,8 +893,19 @@ type LiveProvider struct {
 	handlerStop  bool
 }
 
+func (p *LiveProvider) DataSourceCatalog() *DataSourceCatalog {
+	if p == nil {
+		return nil
+	}
+	return p.catalog
+}
+
 func NewLiveProvider(callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error) {
 	return newLiveProvider(nil, nil, callBack, envEnd)
+}
+
+func NewLiveProviderWithCatalog(catalog *DataSourceCatalog, symbols *orm.SymbolState, callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error) {
+	return newLiveProviderWithCatalog(nil, symbols, catalog, callBack, envEnd)
 }
 
 // NewLiveProviderWithSymbolState binds symbol resolution and subscription
@@ -860,13 +920,25 @@ func NewLiveProviderWithRuntimeDeps(deps *RuntimeDeps, callBack FnDataSeries, en
 	if deps == nil {
 		return NewLiveProvider(callBack, envEnd)
 	}
-	return newLiveProvider(deps, deps.Symbols, callBack, envEnd)
+	return newLiveProviderWithCatalog(deps, deps.Symbols, deps.Catalog, callBack, envEnd)
 }
 
 func newLiveProvider(deps *RuntimeDeps, symbols *orm.SymbolState, callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error) {
+	catalog := legacyDataSourceCatalog
+	if deps != nil {
+		catalog = deps.Catalog
+	}
+	return newLiveProviderWithCatalog(deps, symbols, catalog, callBack, envEnd)
+}
+
+func newLiveProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, catalog *DataSourceCatalog, callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error) {
 	var wsSubs *strat.WsSubJobRegistry
 	if deps != nil {
-		wsSubs = strat.NewWsSubJobRegistryWithState(deps.Strategies, symbols)
+		strategyState := deps.Strategies
+		if strategyState == nil {
+			strategyState = strat.NewState()
+		}
+		wsSubs = strat.NewWsSubJobRegistryWithState(strategyState, symbols)
 	} else {
 		wsSubs = strat.NewWsSubJobRegistry(symbols)
 	}
@@ -924,6 +996,7 @@ func newLiveProvider(deps *RuntimeDeps, symbols *orm.SymbolState, callBack FnDat
 			wsSubs:    wsSubs,
 		},
 		deps:          deps,
+		catalog:       catalog,
 		symbols:       symbols,
 		SeriesWatcher: watcher,
 	}
@@ -1246,20 +1319,55 @@ func enrichStoredKlineFieldsWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol
 func enrichStoredKlineFieldsWithRuntimeDepsAndReader(deps *RuntimeDeps, exs *orm.ExSymbol, tf string,
 	rows []*orm.DataSeries, reader klineFieldReader,
 ) ([]*orm.DataSeries, *errs.Error) {
+	if deps == nil {
+		return enrichStoredKlineFieldsWithReader(nil, exs, tf, rows, reader)
+	}
 	var symbols *orm.SymbolState
+	var strategies *strat.State
 	if deps != nil {
 		symbols = deps.Symbols
+		strategies = deps.Strategies
 	}
-	return enrichStoredKlineFieldsWithReader(symbols, exs, tf, rows, reader)
+	if strategies != nil && symbols == nil {
+		symbols = strategies.Symbols
+	}
+	if reader == nil && deps != nil {
+		reader = func(exs *orm.ExSymbol, tf string, fields []string, startMS, endMS int64) ([]*orm.DataSeries, *errs.Error) {
+			sess, conn, connErr := deps.conn()
+			if connErr != nil {
+				return nil, connErr
+			}
+			defer conn.Release()
+			if symbols != nil {
+				sess = sess.WithSeriesSymbolState(symbols)
+			}
+			return sess.QuerySeriesFields(exs, tf, fields, startMS, endMS, 0, false)
+		}
+	}
+	return enrichStoredKlineFieldsWithState(strategies, symbols, exs, tf, rows, reader)
 }
 
 func enrichStoredKlineFieldsWithReader(symbols *orm.SymbolState, exs *orm.ExSymbol, tf string,
 	rows []*orm.DataSeries, reader klineFieldReader,
 ) ([]*orm.DataSeries, *errs.Error) {
+	fields := strat.CollectKlineSubFieldsWithSymbolState(symbols, exs.ID, tf)
+	return enrichKlineFieldRows(exs, tf, fields, rows, reader)
+}
+
+func enrichStoredKlineFieldsWithState(strategies *strat.State, symbols *orm.SymbolState, exs *orm.ExSymbol, tf string,
+	rows []*orm.DataSeries, reader klineFieldReader,
+) ([]*orm.DataSeries, *errs.Error) {
 	if exs == nil || len(rows) == 0 {
 		return rows, nil
 	}
-	fields := strat.CollectKlineSubFieldsWithSymbolState(symbols, exs.ID, tf)
+	var fields []string
+	if strategies != nil {
+		fields = strategies.CollectKlineSubFields(symbols, exs.ID, tf)
+	} else {
+		// Explicit providers do not fall back to the process-wide strategy
+		// registry when no strategy state was supplied.
+		fields = orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil)
+	}
 	return enrichKlineFieldRows(exs, tf, fields, rows, reader)
 }
 

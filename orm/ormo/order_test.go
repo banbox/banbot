@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	botexg "github.com/banbox/banbot/exg"
@@ -73,6 +75,16 @@ type clientIDExchangeStub struct {
 	id string
 }
 
+type runtimeOrderExchangeStub struct {
+	clientIDExchangeStub
+	feeCalls int
+}
+
+func (s *runtimeOrderExchangeStub) CalculateFee(string, string, string, float64, float64, bool, map[string]interface{}) (*banexg.Fee, *errs.Error) {
+	s.feeCalls++
+	return &banexg.Fee{Currency: "USDT", Cost: 1, QuoteCost: 1}, nil
+}
+
 func (s *clientIDExchangeStub) Info() *banexg.ExgInfo {
 	return &banexg.ExgInfo{ID: s.id}
 }
@@ -109,6 +121,65 @@ func TestClientIDDelegatesFormatToExchangeBoundary(t *testing.T) {
 	got = order.ClientId(false)
 	if len(got) != 22 || strings.Contains(got, "_") {
 		t.Fatalf("legacy compact client ID = %q, want 22 alphanumeric characters", got)
+	}
+}
+
+func TestExplicitOrderUsesBoundRuntimeDependencies(t *testing.T) {
+	oldDefault, oldName, oldExgName, oldSimCount := botexg.Default, config.Name, core.ExgName, core.NewNumInSim
+	t.Cleanup(func() {
+		botexg.Default, config.Name, core.ExgName, core.NewNumInSim = oldDefault, oldName, oldExgName, oldSimCount
+	})
+	botexg.Default = nil
+	config.Name, core.ExgName, core.NewNumInSim = "legacy", "legacy-exchange", 73
+
+	coreState, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coreState.Close()
+	coreState.SetRunMode(core.RunModeBackTest)
+	coreState.SimOrderMatch = true
+	clock := btime.NewClockState(true, nil)
+	clock.SetTimeMS(100_000)
+	prices := com.NewPriceState("runtime-exchange")
+	prices.SetPriceAt(clock.TimeMS(), "BTC/USDT", 111, 109)
+	exchange := &runtimeOrderExchangeStub{clientIDExchangeStub: clientIDExchangeStub{id: "runtime-exchange"}}
+	state := NewOrderState()
+	state.BindCore(coreState)
+	state.BindRuntime(clock, prices, exchange, &config.Config{
+		Name:     "runtime-name",
+		Exchange: &config.ExchangeConfig{Name: "runtime-exchange"},
+	})
+	order := newFilledTestOrder()
+	order.EnterAt = 0
+	order.BindState(state)
+
+	if err := order.UpdateFee(100, true); err != nil {
+		t.Fatal(err)
+	}
+	if exchange.feeCalls != 1 {
+		t.Fatalf("runtime exchange fee calls = %d, want 1", exchange.feeCalls)
+	}
+	if got := order.ClientId(false); got != "runtime-name_0_" {
+		t.Fatalf("runtime client ID = %q, want runtime-name_0_", got)
+	}
+	if !order.CanClose() {
+		t.Fatal("runtime clock was not used by CanClose")
+	}
+	order.SetExit(0, "runtime-exit", banexg.OdTypeMarket, 0)
+	if got := coreState.NewNumInSim; got != 1 {
+		t.Fatalf("runtime simulation counter = %d, want 1", got)
+	}
+	if core.NewNumInSim != 73 {
+		t.Fatalf("legacy simulation counter changed to %d", core.NewNumInSim)
+	}
+
+	clock.SetTimeMS(100_001)
+	if err := order.LocalExit(0, "runtime-local-exit", 0, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := order.Exit.Price; got != 110 {
+		t.Fatalf("runtime price = %v, want 110", got)
 	}
 }
 

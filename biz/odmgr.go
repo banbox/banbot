@@ -78,6 +78,7 @@ type OrderMgr struct {
 	prices      *com.PriceState
 	clock       *btime.ClockState
 	exchange    banexg.BanExchange
+	dump        *orm.DumpSink
 	runtimeCore *core.State
 	symbols     *orm.SymbolState
 	wallet      *BanWallets
@@ -532,6 +533,7 @@ func (o *OrderMgr) bindRuntimeDeps(deps RuntimeDeps) {
 	}
 	o.clock = deps.Clock
 	o.exchange = deps.Exchange
+	o.dump = deps.Dump
 	o.symbols = deps.Symbols
 	if deps.Market != nil {
 		o.prices = deps.Market.Prices
@@ -615,6 +617,14 @@ func (o *OrderMgr) orderState() *ormo.OrderState {
 	return nil
 }
 
+func (o *OrderMgr) fireOdChange(od *ormo.InOutOrder, evt int) {
+	if o != nil && o.runtimeDeps {
+		strat.FireOdChangeWithState(o.walletDeps.Strategies, o.Account, od, evt)
+		return
+	}
+	strat.FireOdChange(o.Account, od, evt)
+}
+
 func (o *OrderMgr) openOrders() (map[int64]*ormo.InOutOrder, *deadlock.Mutex) {
 	if state := o.orderState(); state != nil {
 		return state.GetOpenODs(o.Account)
@@ -683,6 +693,24 @@ func (o *OrderMgr) walletsForOrder() *BanWallets {
 	return GetWallets(o.Account)
 }
 
+func (o *OrderMgr) executionDeps() *RuntimeDeps {
+	if o.runtimeDeps {
+		return &o.walletDeps
+	}
+	return nil
+}
+
+func (o *OrderMgr) refineTimeFrame(strategy, timeframe string) string {
+	if o.runtimeDeps {
+		if o.walletDeps.Strategies != nil {
+			return o.walletDeps.Strategies.RefineTimeFrame(strategy, timeframe)
+		}
+		return timeframe
+	}
+	refined, _ := config.GetStratRefineTF(strategy, timeframe)
+	return refined
+}
+
 func (o *OrderMgr) ensureLatestPrice(symbol string) *errs.Error {
 	if o == nil || !o.runtimeDeps {
 		return com.EnsureLatestPrice(symbol)
@@ -690,25 +718,7 @@ func (o *OrderMgr) ensureLatestPrice(symbol string) *errs.Error {
 	if o.priceSafeExp(symbol, "", com.PriceExpireMS) > 0 {
 		return nil
 	}
-	if o.exchange == nil {
-		return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required to load price for %s", symbol)
-	}
-	tickers, err := o.exchange.FetchTickers(nil, map[string]interface{}{
-		banexg.ParamMethod: "bookTicker",
-	})
-	if err != nil {
-		return err
-	}
-	nowMS := o.priceNow()
-	for _, ticker := range tickers {
-		if ticker != nil {
-			o.prices.SetPriceAt(nowMS, ticker.Symbol, ticker.Ask, ticker.Bid)
-		}
-	}
-	if o.priceSafeExp(symbol, "", com.PriceExpireMS) <= 0 {
-		return errs.NewMsg(errs.CodeRunTime, "no valid price for %s", symbol)
-	}
-	return nil
+	return o.prices.RefreshLatestPriceAt(o.priceNow(), o.exchange, symbol)
 }
 
 func (o *OrderMgr) legacyIntrabarEnabled() bool {
@@ -1585,7 +1595,7 @@ func (o *OrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.Data
 		if od.Symbol != symbol || od.Status >= ormo.InOutStatusFullExit {
 			continue
 		}
-		matchTf, _ := config.GetStratRefineTF(od.Strategy, od.Timeframe)
+		matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
 		if tf != matchTf {
 			continue
 		}
@@ -1643,12 +1653,30 @@ It will be saved internally to the database during the actual trading.
 func (o *OrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 	od.UpdateProfits(0)
 	err := od.Save()
-	cfg := strat.GetStratPerf(od.Symbol, od.Strategy)
-	if cfg != nil && cfg.Enable && o.Account == config.DefAcc {
-		err2 := strat.CalcJobScores(od.Symbol, od.Timeframe, od.Strategy)
-		if err2 != nil {
-			log.Error("calc job performance fail", zap.Error(err2),
-				zap.Strings("job", []string{od.Symbol, od.Timeframe, od.Strategy}))
+	if o != nil && o.runtimeDeps {
+		account := o.walletDeps.DefaultAccount
+		if account == "" && o.runtimeCore != nil && !o.runtimeCore.EnvReal {
+			account = o.Account
+		}
+		if account == "" {
+			account = o.Account
+		}
+		if o.walletDeps.Strategies != nil && o.runtimeCore != nil && o.orderState() != nil && o.Account == account {
+			if cfg := o.walletDeps.Strategies.GetStratPerf(od.Symbol, od.Strategy); cfg != nil && cfg.Enable {
+				if err2 := strat.CalcJobScoresWithState(o.walletDeps.Strategies, o.runtimeCore, o.orderState(), account,
+					od.Symbol, od.Timeframe, od.Strategy); err2 != nil {
+					log.Error("calc job performance fail", zap.Error(err2),
+						zap.Strings("job", []string{od.Symbol, od.Timeframe, od.Strategy}))
+				}
+			}
+		}
+	} else {
+		cfg := strat.GetStratPerf(od.Symbol, od.Strategy)
+		if cfg != nil && cfg.Enable && o.Account == config.DefAcc {
+			if err2 := strat.CalcJobScores(od.Symbol, od.Timeframe, od.Strategy); err2 != nil {
+				log.Error("calc job performance fail", zap.Error(err2),
+					zap.Strings("job", []string{od.Symbol, od.Timeframe, od.Strategy}))
+			}
 		}
 	}
 	return err

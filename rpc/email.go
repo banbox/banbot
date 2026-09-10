@@ -28,6 +28,7 @@ import (
 type Email struct {
 	*WebHook
 	toUser string
+	send   func(string, string, string) error
 }
 
 // NewEmail 构造函数，基于通用 WebHook 创建 Email 发送实例
@@ -36,6 +37,7 @@ func NewEmail(name string, item map[string]interface{}) *Email {
 	res := &Email{
 		WebHook: hook,
 		toUser:  utils.GetMapVal(item, "touser", ""),
+		send:    func(subject, body, recipient string) error { return utils2.SendEmailTo(subject, body, recipient) },
 	}
 	if res.toUser == "" {
 		panic(name + ": `touser` is required")
@@ -59,7 +61,7 @@ func makeDoSendMsgEmail(e *Email) func([]map[string]string) []map[string]string 
 		}
 		body := b.String()
 		subject := fmt.Sprintf("[%d]%s", len(msgList), body[:min(len(body), 50)])
-		if err := utils2.SendEmailTo(subject, body, e.toUser); err != nil {
+		if err := e.send(subject, body, e.toUser); err != nil {
 			log.Error("email send fail", zap.String("to", e.toUser), zap.Error(err))
 			return msgList
 		}

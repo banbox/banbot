@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
@@ -187,6 +188,83 @@ func TestBackTestBootstrapRangeSkipsWhenNoThirdPartySubs(t *testing.T) {
 	}
 	if plan.HasSubs() || plan.StartMS != config.TimeRange.StartMS || plan.EndMS != config.TimeRange.EndMS {
 		t.Fatalf("expected no bootstrap subs with range preserved, got %+v", plan)
+	}
+}
+
+func TestBacktestBootstrapPlanWithCatalogUsesExplicitCatalog(t *testing.T) {
+	const sourceName = "opt_runtime_catalog_plan_test"
+	catalog := data.NewDataSourceCatalog()
+	source, err := data.NewFuncDataSource(
+		orm.NewSeriesInfo(sourceName, "1d", []orm.SeriesField{{Name: "runtime_field", Type: "float", Role: "value"}}),
+		func(context.Context, *strat.DataSub, int64, int64) ([]*orm.DataRecord, error) {
+			return nil, nil
+		}, nil,
+	)
+	if err != nil {
+		t.Fatalf("new data source: %v", err)
+	}
+	if err := catalog.RegisterDataSource(source); err != nil {
+		t.Fatalf("register data source: %v", err)
+	}
+
+	job := &strat.StratJob{
+		Symbol: &orm.ExSymbol{ID: 101, Symbol: "BTC/USDT"},
+		Strat: &strat.TradeStrat{OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			return []*strat.DataSub{{Source: sourceName, ExSymbol: s.Symbol, TimeFrame: "1d"}}
+		}},
+	}
+	plan, err := backtestBootstrapPlanWithCatalog(catalog, []*strat.StratJob{job}, &config.TimeTuple{StartMS: 100, EndMS: 200})
+	if err != nil {
+		t.Fatalf("backtestBootstrapPlanWithCatalog returned error: %v", err)
+	}
+	if len(plan.Subs) != 1 || plan.Subs[0].Source != sourceName ||
+		!reflect.DeepEqual(plan.Subs[0].Fields, []string{"runtime_field"}) {
+		t.Fatalf("explicit catalog was not used, got %+v", plan.Subs)
+	}
+}
+
+func TestBacktestBootstrapPlanWithCatalogRejectsMissingCatalog(t *testing.T) {
+	for _, catalog := range []*data.DataSourceCatalog{nil, data.LegacyDataSourceCatalog()} {
+		_, err := backtestBootstrapPlanWithCatalog(catalog, nil, &config.TimeTuple{StartMS: 100, EndMS: 200})
+		if err == nil || !strings.Contains(err.Error(), "explicit data source catalog") {
+			t.Fatalf("expected explicit catalog error for catalog=%p, got %v", catalog, err)
+		}
+	}
+}
+
+func TestExplicitBacktestSeriesSyncDoesNotUseLegacyCatalog(t *testing.T) {
+	state, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	state.SetRunMode(core.RunModeBackTest)
+	snapshot := config.NewSnapshot(&config.Config{TimeRange: &config.TimeTuple{StartMS: 100, EndMS: 200}})
+	trader := biz.NewTraderWithRuntimeDeps(biz.RuntimeDeps{
+		Core: state, Config: snapshot, Strategies: strat.NewState(),
+	})
+	deps := trader.RuntimeDependencies()
+	job := &strat.StratJob{
+		Symbol: &orm.ExSymbol{ID: 102, Symbol: "BTC/USDT"},
+		Strat: &strat.TradeStrat{OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			return []*strat.DataSub{{Source: "opt_runtime_missing_catalog_test", ExSymbol: s.Symbol, TimeFrame: "1d"}}
+		}},
+	}
+	deps.Strategies.Jobs(deps.DefaultAccount)["BTC/USDT_1h"] = map[string]*strat.StratJob{"test": job}
+	backtest := &BackTest{BackTestLite: &BackTestLite{Trader: trader}}
+	backtest.seriesRuntime = data.NewSeriesRuntime(nil)
+	ensureCalls := 0
+	backtest.seriesRuntime.EnsureFunc = func(context.Context, *data.ThirdPartySeriesBootstrap) *errs.Error {
+		ensureCalls++
+		return nil
+	}
+
+	_, gotErr := backtest.syncThirdPartySeriesRange()
+	if gotErr == nil || !strings.Contains(gotErr.Error(), "explicit data source catalog") {
+		t.Fatalf("expected explicit catalog error, got %v", gotErr)
+	}
+	if ensureCalls != 0 {
+		t.Fatalf("ensure callback ran after catalog validation failure: %d", ensureCalls)
 	}
 }
 

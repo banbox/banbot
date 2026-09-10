@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
@@ -85,8 +86,81 @@ func CheckLiveAccounts() {
 	}
 }
 
+// CheckLiveAccountsWithRuntimeDeps validates the accounts owned by one live
+// runtime. The explicit path never consults the package-level exchange,
+// account map, wallet expectations, or notification session.
+func CheckLiveAccountsWithRuntimeDeps(deps biz.RuntimeDeps) {
+	state := deps.Core
+	exchange := deps.Exchange
+	if state == nil || !state.EnvReal || exchange == nil {
+		return
+	}
+	cfg := deps.ConfigView()
+	accounts := deps.AccountConfigs()
+	var expected map[string]float64
+	var settleCoins []string
+	if cfg != nil {
+		expected = cfg.WalletAmounts
+		settleCoins = cfg.StakeCurrency
+	}
+	for account, accountCfg := range accounts {
+		if accountCfg == nil || accountCfg.NoTrade {
+			continue
+		}
+		res := &accCheckResult{balanceSummary: balanceUnknownSummary()}
+		balances := fetchAccountBalanceWithExchange(exchange, account, res)
+		if balances != nil {
+			balances.Init()
+			res.balanceSummary, res.errors = buildBalanceSummary(balances, expected)
+		}
+		access, err := exchange.FetchAccountAccess(map[string]interface{}{
+			banexg.ParamAccount: account,
+			banexg.ParamBalance: balances,
+		})
+		if err != nil {
+			res.errors = append(res.errors, fmt.Sprintf(accMsg("account_access_fetch_failed", "Account access check failed: %v"), err))
+		}
+		applyAccountAccess(res, access)
+		if res.marginMode == "" && (state.IsContract || state.Market == banexg.MarketMargin) {
+			res.marginMode = fetchMarginModeFromPositionsWithExchange(exchange, account, settleCoins)
+		}
+		if res.tradeKnown && !res.tradeAllowed {
+			res.errors = append(res.errors, accMsg("no_trade_permission", "No trading permission"))
+		}
+		if res.withdrawKnown && res.withdrawAllowed {
+			res.warns = append(res.warns, accMsg("withdraw_permission_enabled", "Withdrawals enabled"))
+		}
+		if res.ipKnown && res.ipAny {
+			res.warns = append(res.warns, accMsg("ip_any_warning", "IP restriction: any"))
+		}
+		summary := buildAccSummary(account, res)
+		log.Info("live account check", zap.String("acc", account), zap.String("summary", summary))
+		if len(res.warns) > 0 {
+			log.Warn("live account check", zap.String("acc", account), zap.String("warn", "WARN: "+strings.Join(res.warns, "; ")))
+		}
+		if len(res.errors) > 0 {
+			errMsg := "ERROR: " + strings.Join(res.errors, "; ")
+			log.Error("account disabled", zap.String("acc", account), zap.String("error", errMsg))
+			sendRuntimeMessage(&deps, map[string]interface{}{
+				"type":    rpc.MsgTypeException,
+				"account": account,
+				"status":  errMsg,
+			})
+			accountCfg.NoTrade = true
+		}
+	}
+}
+
 func fetchAccountBalance(account string, res *accCheckResult) *banexg.Balances {
-	balances, err := exg.Default.FetchBalance(map[string]interface{}{
+	return fetchAccountBalanceWithExchange(exg.Default, account, res)
+}
+
+func fetchAccountBalanceWithExchange(exchange banexg.BanExchange, account string, res *accCheckResult) *banexg.Balances {
+	if exchange == nil {
+		res.errors = append(res.errors, "exchange is not configured")
+		return nil
+	}
+	balances, err := exchange.FetchBalance(map[string]interface{}{
 		banexg.ParamAccount: account,
 	})
 	if err != nil {
@@ -244,9 +318,16 @@ func boolSummary(val bool, known bool, yes string, no string) string {
 }
 
 func fetchMarginModeFromPositions(account string) string {
-	posList, err := exg.Default.FetchAccountPositions(nil, map[string]interface{}{
+	return fetchMarginModeFromPositionsWithExchange(exg.Default, account, config.StakeCurrency)
+}
+
+func fetchMarginModeFromPositionsWithExchange(exchange banexg.BanExchange, account string, settleCoins []string) string {
+	if exchange == nil {
+		return ""
+	}
+	posList, err := exchange.FetchAccountPositions(nil, map[string]interface{}{
 		banexg.ParamAccount:     account,
-		banexg.ParamSettleCoins: config.StakeCurrency,
+		banexg.ParamSettleCoins: settleCoins,
 	})
 	if err != nil {
 		return ""

@@ -328,10 +328,42 @@ func EnsureCurSymbolsWithSymbolState(state *SymbolState, exchange banexg.BanExch
 		return errs.NewMsg(core.ErrBadConfig, "exchange %s market %s does not match symbol state identity %s:%s",
 			exInfo.ID, exInfo.MarketType, state.identityExchange, state.identityMarket)
 	}
-	return ensureCurSymbols(state, exchange, exInfo.ID, exInfo.MarketType, symbols)
+	return ensureCurSymbolsWithRuntimeConfig(state, exchange, exInfo.ID, exInfo.MarketType, symbols,
+		&config.Data, config.GetDataDir(), nil, false)
+}
+
+// EnsureCurSymbolsWithRuntimeConfig registers current markets using the
+// caller's immutable Config and Core state. Explicit pair refresh must use this
+// entrypoint when market snapshots or contract reloads are configured per run.
+func EnsureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, symbols []string,
+	cfg *config.Config, dataDir string, runtimeCore *core.State,
+) *errs.Error {
+	if state == nil {
+		return errs.NewMsg(core.ErrRunTime, "runtime symbol state is required")
+	}
+	if exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	exInfo := exchange.Info()
+	if exInfo == nil {
+		return errs.NewMsg(core.ErrBadConfig, "exchange info is required")
+	}
+	if !state.acceptsIdentity(exInfo.ID, exInfo.MarketType) {
+		return errs.NewMsg(core.ErrBadConfig, "exchange %s market %s does not match symbol state identity %s:%s",
+			exInfo.ID, exInfo.MarketType, state.identityExchange, state.identityMarket)
+	}
+	return ensureCurSymbolsWithRuntimeConfig(state, exchange, exInfo.ID, exInfo.MarketType, symbols,
+		cfg, dataDir, runtimeCore, true)
 }
 
 func ensureCurSymbols(state *SymbolState, exchange banexg.BanExchange, exchangeName, marketType string, symbols []string) *errs.Error {
+	return ensureCurSymbolsWithRuntimeConfig(state, exchange, exchangeName, marketType, symbols,
+		&config.Data, config.GetDataDir(), nil, false)
+}
+
+func ensureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, exchangeName, marketType string,
+	symbols []string, cfg *config.Config, dataDir string, runtimeCore *core.State, explicit bool,
+) *errs.Error {
 	if state == nil {
 		state = loadDefaultSymbolState()
 	}
@@ -339,7 +371,7 @@ func ensureCurSymbols(state *SymbolState, exchange banexg.BanExchange, exchangeN
 		return errs.NewMsg(core.ErrBadConfig, "exchange is required")
 	}
 	exsList := make([]*ExSymbol, 0, len(symbols))
-	marMap, err := LoadMarkets(exchange, false)
+	marMap, err := loadMarketsWithRuntimeConfig(state, exchange, false, cfg, dataDir, runtimeCore, explicit)
 	if err != nil {
 		return err
 	}
@@ -390,12 +422,12 @@ func (s *SymbolState) EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *e
 	for _, name := range exchanges {
 		exgNames[name] = true
 	}
-	pq, conn2, err2 := Conn(nil)
+	pq, conn2, err2 := s.Conn(nil)
 	if err2 != nil {
 		return err2
 	}
 	defer conn2.Release()
-	spq := newEnsureSymbolQueries(pq, s)
+	spq := newEnsureSymbolQueries(pq.WithSeriesSymbolState(s), s)
 	if s.SymbolCount() == 0 {
 		// Not yet loaded, load the information of all the underlying assets of the specified exchange
 		// 尚未加载，加载指定交易所所有标的信息
@@ -903,7 +935,7 @@ func InitListDatesWithExchange(state *SymbolState, exchange banexg.BanExchange) 
 	if state == nil {
 		state = loadDefaultSymbolState()
 	}
-	pq, conn2, err2 := Conn(nil)
+	pq, conn2, err2 := state.Conn(nil)
 	if err2 != nil {
 		return err2
 	}
@@ -946,14 +978,22 @@ func InitListDatesWithExchange(state *SymbolState, exchange banexg.BanExchange) 
 }
 
 func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int32]*ExSymbol, exsList []*ExSymbol) *errs.Error {
-	return EnsureListDatesWithState(sess, nil, exchange, exsMap, exsList)
+	return EnsureListDatesWithStateAndOptions(sess, nil, exchange, exsMap, exsList, LegacyKlineRuntimeOptions())
 }
 
 // EnsureListDatesWithState keeps listing-date discovery on an explicit symbol
 // state while retaining the old helper as a legacy facade.
 func EnsureListDatesWithState(sess *Queries, state *SymbolState, exchange banexg.BanExchange,
 	exsMap map[int32]*ExSymbol, exsList []*ExSymbol) *errs.Error {
-	canDownload := allowImplicitKlineDownload()
+	return EnsureListDatesWithStateAndOptions(sess, state, exchange, exsMap, exsList, LegacyKlineRuntimeOptions())
+}
+
+// EnsureListDatesWithStateAndOptions performs low-frequency listing-date
+// discovery with an explicit download/network policy. The supplied query and
+// symbol state remain the only mutable owners touched by this operation.
+func EnsureListDatesWithStateAndOptions(sess *Queries, state *SymbolState, exchange banexg.BanExchange,
+	exsMap map[int32]*ExSymbol, exsList []*ExSymbol, options KlineRuntimeOptions) *errs.Error {
+	canDownload := options.allowDownload()
 	if exchange == nil {
 		if !canDownload {
 			return klineDownloadDisabledError("EnsureListDates")
@@ -1004,7 +1044,7 @@ func EnsureListDatesWithState(sess *Queries, state *SymbolState, exchange banexg
 	if len(candidates) == 0 {
 		return nil
 	}
-	hasFetch := !core.NetDisable && exchange.HasApi(banexg.ApiFetchOHLCV, exInfo.MarketType)
+	hasFetch := !options.NetDisable && exchange.HasApi(banexg.ApiFetchOHLCV, exInfo.MarketType)
 	var prgBar *utils.PrgBar
 	cacheNum := len(candidates)
 	if cacheNum > 10 && hasFetch {
@@ -1118,7 +1158,7 @@ func ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
 		exgMarket := fmt.Sprintf("%s:%s", exgName, market)
 		pairNum := state.MarketCount(exgName, market)
 		if pairNum == 0 {
-			pq2, conn2, err2 := Conn(nil)
+			pq2, conn2, err2 := state.Conn(nil)
 			if err2 != nil {
 				return nil, err2
 			}

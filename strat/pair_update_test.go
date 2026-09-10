@@ -234,6 +234,11 @@ func TestUpdatePairsExplicitStrategyStateWinsOverHookState(t *testing.T) {
 	hooks.StrategyState = second
 	hooks.Core = secondCore
 	SetPairUpdateHooks(hooks)
+	first.SetPairUpdateHooks(PairUpdateHooks{
+		SubWarmPairs: hooks.SubWarmPairs,
+		ExitOrders:   hooks.ExitOrders,
+		LookupSymbol: hooks.LookupSymbol,
+	})
 
 	stg := &TradeStrat{
 		Name:       "explicit-state-pair-update",
@@ -262,6 +267,29 @@ func TestUpdatePairsExplicitStrategyStateWinsOverHookState(t *testing.T) {
 	}
 	if _, ok := secondCore.StgPairTfs[stg.Name]; ok {
 		t.Fatalf("global hook core state was mutated: %+v", secondCore.StgPairTfs)
+	}
+}
+
+func TestUpdatePairsExplicitStrategyStateDoesNotUseLegacyHooks(t *testing.T) {
+	resetStratGlobals()
+	oldHooks := SnapshotPairUpdateHooks()
+	t.Cleanup(func() { SetPairUpdateHooks(oldHooks) })
+	setTestHooks()
+
+	state := NewState()
+	stg := &TradeStrat{
+		Name:   "explicit-hooks-required",
+		Policy: &config.RunPolicyConfig{RunTimeframes: []string{"1s"}},
+	}
+	_, updateErr := stg.UpdatePairs(PairUpdateReq{
+		Strat:         stg,
+		StrategyState: state,
+		Exchange:      &pairUpdateTestExchange{},
+		ForceAdd:      true,
+		Add:           []string{"BTC/USDT"},
+	})
+	if updateErr == nil || updateErr.Code != core.ErrRunTime {
+		t.Fatalf("explicit state without hooks error = %v, want ErrRunTime", updateErr)
 	}
 }
 
@@ -603,5 +631,127 @@ func TestEnsureStratJobAllowsBatchInfoSideSubscription(t *testing.T) {
 	key := DataSubKey(orm.SeriesSourceKline, exs.ID, "1h")
 	if AccInfoJobs[config.DefAcc][key][stgy.Name+"_"+exs.Symbol] != job {
 		t.Fatal("expected batch-info strategy to be registered for its side input")
+	}
+}
+
+func TestEnsureStratJobWithRuntimeStateUsesBoundCore(t *testing.T) {
+	resetStratGlobals()
+	core.OrderMatchTfs = map[string]bool{"legacy": true}
+
+	runtimeCore, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeCore.Close()
+	strategyState := NewStateWithRuntime(runtimeCore, nil, nil, nil, nil)
+	strategyState.AccJobs[config.DefAcc] = map[string]map[string]*StratJob{}
+
+	exs := &orm.ExSymbol{ID: 1, Exchange: "binance", Market: banexg.MarketSpot, Symbol: "BTC/USDT"}
+	env, envErr := ta.NewBarEnv(exs.Exchange, exs.Market, exs.Symbol, "15m")
+	if envErr != nil {
+		t.Fatal(envErr)
+	}
+	stgy := &TradeStrat{Name: "runtime-match", Policy: &config.RunPolicyConfig{}}
+	ensureStratJobWithRuntimeState(strategyState, nil, stgy, "15m", exs, env, core.OdDirtBoth,
+		func(string, string, int) {}, accStratLimits{}, nil)
+
+	if !runtimeCore.OrderMatchTfs["15m"] {
+		t.Fatalf("bound runtime core was not updated: %v", runtimeCore.OrderMatchTfs)
+	}
+	if runtimeCore.OrderMatchTfs["legacy"] || core.OrderMatchTfs["15m"] {
+		t.Fatalf("order-match state leaked to the wrong owner: runtime=%v legacy=%v",
+			runtimeCore.OrderMatchTfs, core.OrderMatchTfs)
+	}
+}
+
+func TestEnsureStratJobWithRuntimeStateWithoutCoreDoesNotUseLegacy(t *testing.T) {
+	resetStratGlobals()
+	core.OrderMatchTfs = map[string]bool{"legacy": true}
+
+	strategyState := NewState()
+	strategyState.AccJobs[config.DefAcc] = map[string]map[string]*StratJob{}
+	exs := &orm.ExSymbol{ID: 1, Exchange: "binance", Market: banexg.MarketSpot, Symbol: "BTC/USDT"}
+	env, err := ta.NewBarEnv(exs.Exchange, exs.Market, exs.Symbol, "15m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stgy := &TradeStrat{Name: "runtime-without-core", Policy: &config.RunPolicyConfig{}}
+	ensureStratJobWithRuntimeState(strategyState, nil, stgy, "15m", exs, env, core.OdDirtBoth,
+		func(string, string, int) {}, accStratLimits{}, nil)
+
+	if len(core.OrderMatchTfs) != 1 || !core.OrderMatchTfs["legacy"] {
+		t.Fatalf("unbound explicit state changed legacy order-match state: %v", core.OrderMatchTfs)
+	}
+}
+
+func TestFinalizePairRotationUsesBoundCoreAndDoesNotTouchLegacy(t *testing.T) {
+	resetStratGlobals()
+	core.StgPairTfs = map[string]map[string]string{
+		"legacy": {"LEGACY/USDT": "1s"},
+	}
+	core.SetLegacyAdmissionPair("LEGACY/USDT", true)
+
+	runtimeCore, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeCore.Close()
+	runtimeCore.SetPairs([]string{"BTC/USDT"}, nil)
+	runtimeCore.StgPairTfs["runtime"] = map[string]string{"BTC/USDT": "1s"}
+	strategyState := NewStateWithRuntime(runtimeCore, nil, nil, nil, nil)
+	stgy := &TradeStrat{Name: "runtime", Policy: &config.RunPolicyConfig{}}
+	job := &StratJob{
+		Strat:              stgy,
+		Symbol:             &orm.ExSymbol{ID: 1, Symbol: "BTC/USDT"},
+		TimeFrame:          "1s",
+		Account:            config.DefAcc,
+		TPMaxs:             map[int64]float64{},
+		pairRemovalPending: true,
+	}
+	strategyState.AccJobs[config.DefAcc] = map[string]map[string]*StratJob{
+		"BTC/USDT_1s": {stgy.Name: job},
+	}
+	strategyState.PairStrats["BTC/USDT"] = map[string]*TradeStrat{stgy.Name: stgy}
+
+	FinalizePairRotation(strategyState)
+
+	if _, ok := runtimeCore.StgPairTfs[stgy.Name]["BTC/USDT"]; ok {
+		t.Fatalf("bound runtime mapping was not finalized: %v", runtimeCore.StgPairTfs)
+	}
+	if runtimeCore.PairEnabled("BTC/USDT") {
+		t.Fatal("finalized runtime pair remains admitted")
+	}
+	if _, ok := core.StgPairTfs["legacy"]["LEGACY/USDT"]; !ok || !core.LegacyPairEnabled("LEGACY/USDT") {
+		t.Fatalf("legacy state was changed while finalizing runtime pair: stg=%v pairs=%v",
+			core.StgPairTfs, core.LegacyAdmissionPairs())
+	}
+}
+
+func TestFinalizePairRotationWithoutCoreDoesNotUseLegacy(t *testing.T) {
+	resetStratGlobals()
+	core.StgPairTfs = map[string]map[string]string{
+		"runtime": {"BTC/USDT": "1s"},
+	}
+	core.SetLegacyAdmissionPair("BTC/USDT", true)
+	strategyState := NewState()
+	stgy := &TradeStrat{Name: "runtime", Policy: &config.RunPolicyConfig{}}
+	job := &StratJob{
+		Strat:              stgy,
+		Symbol:             &orm.ExSymbol{ID: 1, Symbol: "BTC/USDT"},
+		TimeFrame:          "1s",
+		Account:            config.DefAcc,
+		TPMaxs:             map[int64]float64{},
+		pairRemovalPending: true,
+	}
+	strategyState.AccJobs[config.DefAcc] = map[string]map[string]*StratJob{
+		"BTC/USDT_1s": {stgy.Name: job},
+	}
+	strategyState.PairStrats["BTC/USDT"] = map[string]*TradeStrat{stgy.Name: stgy}
+
+	FinalizePairRotation(strategyState)
+
+	if _, ok := core.StgPairTfs[stgy.Name]["BTC/USDT"]; !ok || !core.LegacyPairEnabled("BTC/USDT") {
+		t.Fatalf("unbound explicit state changed legacy state: stg=%v pairs=%v",
+			core.StgPairTfs, core.LegacyAdmissionPairs())
 	}
 }

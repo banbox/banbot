@@ -9,6 +9,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 )
 
 type PriceSymbolParser = core.SymbolParserStrategy
@@ -21,6 +22,32 @@ type PriceState struct {
 	lockPrices sync.RWMutex
 	lockBars   sync.RWMutex
 	parser     *core.SymbolParser
+	loadMu     sync.Mutex
+	lastLoadMS int64
+}
+
+func (p *PriceState) RefreshLatestPriceAt(nowMS int64, exchange banexg.BanExchange, symbol string) *errs.Error {
+	if p == nil || exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "runtime prices and exchange are required")
+	}
+	p.loadMu.Lock()
+	defer p.loadMu.Unlock()
+	if p.lastLoadMS == 0 || nowMS-p.lastLoadMS >= 3000 {
+		tickers, err := exchange.FetchTickers(nil, map[string]interface{}{banexg.ParamMethod: "bookTicker"})
+		p.lastLoadMS = nowMS
+		if err != nil {
+			return err
+		}
+		for _, ticker := range tickers {
+			if ticker != nil {
+				p.SetPriceAt(nowMS, ticker.Symbol, ticker.Ask, ticker.Bid)
+			}
+		}
+	}
+	if p.GetPriceSafeExpAt(nowMS, symbol, "", PriceExpireMS) <= 0 {
+		return errs.NewMsg(errs.CodeRunTime, "no valid price for %s", symbol)
+	}
+	return nil
 }
 
 func NewPriceState(exgName string) *PriceState {
@@ -204,6 +231,9 @@ func (p *PriceState) Reset() {
 	if p == nil {
 		return
 	}
+	p.loadMu.Lock()
+	defer p.loadMu.Unlock()
+	p.lastLoadMS = 0
 	p.lockPrices.Lock()
 	p.bidPrices = make(map[string]*core.Int64Flt)
 	p.askPrices = make(map[string]*core.Int64Flt)

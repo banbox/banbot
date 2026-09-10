@@ -31,6 +31,14 @@ func InitLocalLiveOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack FnOdCb, sho
 }
 
 func initLocalLiveOrderMgr(deps *RuntimeDeps, callBack FnOdCb, showLog bool) {
+	if deps != nil {
+		if deps.Orders == nil {
+			deps.Orders = ormo.NewOrderState()
+		}
+		if deps.Trading == nil {
+			deps.Trading = NewTradingState()
+		}
+	}
 	managers := accOdMgrs
 	if deps != nil && deps.Trading != nil {
 		deps.Trading.ensure()

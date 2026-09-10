@@ -101,6 +101,16 @@ func (l *runtimeShutdownLifecycle) Exchange() banexg.BanExchange {
 	return l.owner.exchangeBinding()
 }
 
+func (l *runtimeShutdownLifecycle) WalletRuntimeDeps() biz.RuntimeDeps {
+	if l == nil || l.owner == nil {
+		return biz.RuntimeDeps{}
+	}
+	if deps := l.owner.RuntimeDependencies(); deps != nil {
+		return *deps
+	}
+	return biz.RuntimeDeps{}
+}
+
 func (l *runtimeShutdownLifecycle) OnClose(call func()) {
 	if l == nil || l.owner == nil || l.owner.runtime == nil || call == nil {
 		return
@@ -167,7 +177,7 @@ func NewCryptoTraderWithRuntimeState(lifecycle RuntimeLifecycle, batchState *str
 }
 
 // NewCryptoTraderWithRuntimeDeps binds lifecycle, typed mutable state, and
-// symbol indexes. Strategy jobs, orders, and wallets remain legacy globals.
+// symbol indexes to an isolated live trader.
 func NewCryptoTraderWithRuntimeDeps(lifecycle RuntimeLifecycle, deps biz.RuntimeDeps, symbols *orm.SymbolState, startup CryptoTraderStartupFunc) *CryptoTrader {
 	if symbols == nil {
 		symbols = deps.Symbols
@@ -206,7 +216,9 @@ func makeDataRuntimeDeps(deps *biz.RuntimeDeps, supplied *data.RuntimeDeps, symb
 		Config:     deps.Config,
 		Market:     deps.Market,
 		Symbols:    symbols,
+		Storage:    deps.Storage,
 		Strategies: deps.Strategies,
+		Dump:       deps.Dump,
 		Exchange:   deps.Exchange,
 	}
 	if supplied != nil {
@@ -220,11 +232,20 @@ func makeDataRuntimeDeps(deps *biz.RuntimeDeps, supplied *data.RuntimeDeps, symb
 		if copyDeps.Config != nil {
 			result.Config = copyDeps.Config
 		}
+		if copyDeps.Storage != nil {
+			result.Storage = copyDeps.Storage
+		}
 		if copyDeps.Market != nil {
 			result.Market = copyDeps.Market
 		}
 		if copyDeps.Strategies != nil {
 			result.Strategies = copyDeps.Strategies
+		}
+		if copyDeps.Catalog != nil {
+			result.Catalog = copyDeps.Catalog
+		}
+		if copyDeps.Dump != nil {
+			result.Dump = copyDeps.Dump
 		}
 		if copyDeps.Callbacks != nil {
 			result.Callbacks = copyDeps.Callbacks
@@ -294,7 +315,23 @@ func NewCryptoTraderWithBatchAndSymbolState(batchState *strat.BatchState, symbol
 }
 
 func (t *CryptoTrader) Init() *errs.Error {
-	config.LoadPerfs(config.GetDataDir())
+	if deps := t.RuntimeDependencies(); deps != nil && t.runtime == nil {
+		return errs.NewMsg(core.ErrRunTime, "explicit live runtime requires a lifecycle")
+	}
+	if deps := t.RuntimeDependencies(); deps != nil {
+		if t.symbols == nil {
+			t.symbols = deps.Symbols
+		}
+		if deps.Symbols == nil {
+			deps.Symbols = t.symbols
+		}
+		if err := validateCryptoTraderRuntimeDeps(deps, t.symbols); err != nil {
+			return err
+		}
+	}
+	if t.RuntimeDependencies() == nil {
+		config.LoadPerfs(config.GetDataDir())
+	}
 	if t.envReal() {
 		if _, err := exg.RequireOrderEventCapability(t.exchangeForRun(), true); err != nil {
 			return err
@@ -327,15 +364,20 @@ func (t *CryptoTrader) Init() *errs.Error {
 			return nil
 		}(),
 		LookupSymbol: func(pair string) (*orm.ExSymbol, *errs.Error) {
+			if t.RuntimeDependencies() != nil && t.symbols == nil {
+				return nil, errs.NewMsg(core.ErrRunTime, "runtime symbol state is required to resolve %s", pair)
+			}
 			if t.symbols == nil {
 				return orm.GetExSymbolCur(pair)
 			}
 			return t.symbols.GetExSymbolCur(pair)
 		},
 		ExitOrders: func(acc string, orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
-			mgr := biz.GetOdMgr(acc)
+			var mgr biz.IOrderMgr
 			if deps := t.RuntimeDependencies(); deps != nil {
 				mgr = biz.GetOdMgrWithState(deps.Trading, acc)
+			} else {
+				mgr = biz.GetOdMgr(acc)
 			}
 			if mgr == nil {
 				return errs.NewMsg(core.ErrRunTime, "order manager is required for pair update: %s", acc)
@@ -343,7 +385,10 @@ func (t *CryptoTrader) Init() *errs.Error {
 			return mgr.ExitAndFill(orders, req)
 		},
 	}
-	if deps := t.RuntimeDependencies(); deps != nil && deps.Strategies != nil {
+	if deps := t.RuntimeDependencies(); deps != nil {
+		if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
+			return errs.NewMsg(core.ErrRunTime, "explicit live runtime requires a private strategy state")
+		}
 		deps.Strategies.SetPairUpdateHooks(pairHooks)
 	} else {
 		strat.SetPairUpdateHooks(pairHooks)
@@ -356,7 +401,11 @@ func (t *CryptoTrader) Init() *errs.Error {
 		if len(accounts) == 0 {
 			accounts = []string{deps.DefaultAccount}
 		}
-		err = ormo.InitTasksWithState(deps.Orders, accounts, core.RunModeLive, 0, 0, true)
+		cfg := deps.ConfigView()
+		if cfg == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime config is required")
+		}
+		err = ormo.InitLiveTasksWithState(deps.Orders, accounts, cfg.Name, deps.Core.EnvReal)
 	} else {
 		err = ormo.InitTask(true, config.GetDataDir())
 	}
@@ -370,13 +419,19 @@ func (t *CryptoTrader) Init() *errs.Error {
 		return err
 	}
 	// 初始化 Telegram 订单管理器
-	biz.InitTelegramOrderManager()
+	if t.RuntimeDependencies() == nil {
+		biz.InitTelegramOrderManager()
+	}
 	err = t.startWebAPI()
 	if err != nil {
 		return err
 	}
 	if t.envReal() {
-		CheckLiveAccounts()
+		if deps := t.RuntimeDependencies(); deps != nil {
+			CheckLiveAccountsWithRuntimeDeps(*deps)
+		} else {
+			CheckLiveAccounts()
+		}
 	}
 	// Order Manager initialization
 	// 订单管理器初始化
@@ -389,7 +444,7 @@ func (t *CryptoTrader) Init() *errs.Error {
 		return err
 	}
 	// add exit callback
-	if t.runtime == nil {
+	if t.RuntimeDependencies() == nil && t.runtime == nil {
 		core.ExitCalls = append(core.ExitCalls, t.finishRunCleanup)
 	}
 	unwatch := func(m map[string][]string) {
@@ -401,10 +456,48 @@ func (t *CryptoTrader) Init() *errs.Error {
 			}
 		}
 	}
-	if deps := t.RuntimeDependencies(); deps != nil && deps.Strategies != nil {
+	if deps := t.RuntimeDependencies(); deps != nil {
+		if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
+			return errs.NewMsg(core.ErrRunTime, "explicit live runtime requires a private strategy state")
+		}
 		deps.Strategies.WsSubUnWatch = unwatch
 	} else {
 		strat.WsSubUnWatch = unwatch
+	}
+	return nil
+}
+
+func validateCryptoTraderRuntimeDeps(deps *biz.RuntimeDeps, symbols *orm.SymbolState) *errs.Error {
+	if deps == nil {
+		return nil
+	}
+	missing := make([]string, 0, 8)
+	if deps.Core == nil {
+		missing = append(missing, "core")
+	}
+	if deps.Clock == nil {
+		missing = append(missing, "clock")
+	}
+	if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
+		missing = append(missing, "strategy state")
+	}
+	if deps.Orders == nil {
+		missing = append(missing, "order state")
+	}
+	if deps.Trading == nil {
+		missing = append(missing, "trading state")
+	}
+	if symbols == nil {
+		missing = append(missing, "symbol state")
+	}
+	if deps.Exchange == nil {
+		missing = append(missing, "exchange")
+	}
+	if deps.Config == nil || deps.Config.View() == nil {
+		missing = append(missing, "config")
+	}
+	if len(missing) > 0 {
+		return errs.NewMsg(core.ErrRunTime, "explicit live runtime requires %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -444,6 +537,13 @@ func (t *CryptoTrader) refreshPairJobs(isFirst bool) *errs.Error {
 }
 
 func (t *CryptoTrader) startWebAPI() *errs.Error {
+	// The current Web API handlers are legacy process-global handlers. Starting
+	// them from an explicit Runtime would expose another runtime's config,
+	// strategy registry, orders, and storage, so the explicit runner leaves the
+	// legacy API disabled until the handlers receive typed dependencies.
+	if t.RuntimeDependencies() != nil {
+		return nil
+	}
 	if t.runtime != nil {
 		return webStartAPIWithLifecycle(&runtimeShutdownLifecycle{owner: t})
 	}
@@ -482,9 +582,11 @@ func (t *CryptoTrader) initOdMgr() *errs.Error {
 		biz.InitLiveOrderMgr(t.orderCB)
 	}
 	t.bindProviderRuntimeCallbacks(dp)
-	accounts := config.Accounts
+	var accounts map[string]*config.AccountConfig
 	if deps != nil {
 		accounts = deps.AccountConfigs()
+	} else {
+		accounts = config.Accounts
 	}
 	for account, cfg := range accounts {
 		if cfg == nil || cfg.NoTrade {
@@ -503,14 +605,17 @@ func (t *CryptoTrader) initOdMgr() *errs.Error {
 		if err != nil {
 			return err
 		}
-		openOds, lock := ormo.GetOpenODs(account)
-		if deps != nil && deps.Orders != nil {
-			openOds, lock = deps.Orders.GetOpenODs(account)
+		var orders *ormo.OrderState
+		if deps != nil {
+			orders = deps.Orders
+		} else {
+			orders = ormo.LegacyState()
 		}
+		openOds, lock := orders.GetOpenODs(account)
 		lock.Lock()
 		msg := fmt.Sprintf("orders: %d restored, %d deleted, %d added, %d opened", len(oldList), len(delList), len(newList), len(openOds))
 		lock.Unlock()
-		rpc.SendMsg(map[string]interface{}{
+		sendRuntimeMessage(deps, map[string]interface{}{
 			"type":    rpc.MsgTypeStatus,
 			"account": account,
 			"status":  msg,
@@ -531,6 +636,15 @@ func (t *CryptoTrader) bootstrapThirdPartySources(ctx context.Context) error {
 func (t *CryptoTrader) runtimeJobs() []*strat.StratJob {
 	if t.collectJobsFn != nil {
 		return t.collectJobsFn()
+	}
+	if deps := t.RuntimeDependencies(); deps != nil {
+		if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
+			return nil
+		}
+		return deps.Strategies.CollectJobs()
+	}
+	if state := t.strategyStateForRun(); state != nil {
+		return state.CollectJobs()
 	}
 	seen := make(map[*strat.StratJob]bool)
 	var jobs []*strat.StratJob
@@ -657,7 +771,14 @@ func (t *CryptoTrader) runContext() context.Context {
 
 func (t *CryptoTrader) thirdPartyRuntime() *data.SeriesRuntime {
 	if t.seriesRuntime == nil {
-		t.seriesRuntime = data.NewSeriesRuntime(t)
+		if t.dataDeps != nil {
+			t.seriesRuntime = data.NewSeriesRuntimeWithRuntimeDeps(t.dataDeps, t)
+		} else {
+			t.seriesRuntime = data.NewSeriesRuntime(t)
+		}
+		if deps := t.RuntimeDependencies(); deps != nil {
+			t.seriesRuntime.Repo = orm.NewSeriesRepo(deps.Storage)
+		}
 	}
 	if t.seriesRuntime.Sink == nil {
 		t.seriesRuntime.Sink = t
@@ -668,6 +789,9 @@ func (t *CryptoTrader) thirdPartyRuntime() *data.SeriesRuntime {
 func (t *CryptoTrader) runWithDeps() (runErr *errs.Error) {
 	t.runLock.Lock()
 	defer t.runLock.Unlock()
+	if t.RuntimeDependencies() != nil && t.runtime == nil {
+		return errs.NewMsg(core.ErrRunTime, "explicit live runtime requires a lifecycle")
+	}
 	if !t.resetRuntimeState() {
 		return errs.NewMsg(core.ErrRunTime, "runtime is stopped")
 	}
@@ -874,11 +998,19 @@ func (t *CryptoTrader) handleWarmupSeries(view *orm.SeriesOHLCV) {
 	tfMSecs := int64(utils.TFToSecs(view.TimeFrame) * 1000)
 	barEndMS := view.Time + tfMSecs
 	batchState := t.batchStateForRun()
+	if batchState == nil {
+		return
+	}
 	if barEndMS > batchState.LastBatchMS() {
 		// Enter the next timeframe and trigger the batch entry callback
 		// 进入下一个时间帧，触发批量入场回调
 		execMS := barEndMS + core.DelayBatchMS + 1
-		waitNum := biz.TryFireBatchesWithState(batchState, execMS, view.IsWarmUp)
+		var waitNum int
+		if deps := t.RuntimeDependencies(); deps != nil {
+			waitNum = biz.TryFireBatchesWithRuntimeDeps(deps, batchState, execMS, view.IsWarmUp)
+		} else {
+			waitNum = biz.TryFireBatchesWithState(batchState, execMS, view.IsWarmUp)
+		}
 		if waitNum > 0 {
 			log.Warn(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
 		}
@@ -893,7 +1025,13 @@ func (t *CryptoTrader) handleLiveSeries(view *orm.SeriesOHLCV) {
 	t.delayExecBatch()
 	envKey := strings.Join([]string{view.Symbol(), view.TimeFrame}, "_")
 	if bar := view.Bar(); bar != nil {
-		orm.AddDumpRow(orm.DumpKline, envKey, *bar)
+		if deps := t.RuntimeDependencies(); deps != nil {
+			if deps.Dump != nil {
+				deps.Dump.Add(orm.DumpKline, envKey, *bar)
+			}
+		} else {
+			orm.AddDumpRow(orm.DumpKline, envKey, *bar)
+		}
 	}
 }
 
@@ -954,13 +1092,31 @@ func (t *CryptoTrader) delayExecBatchAfter(delay time.Duration) {
 }
 
 func (t *CryptoTrader) runDelayedBatch() {
-	waitNum := biz.TryFireBatchesWithState(t.batchStateForRun(), t.currentTimeMS(), false)
+	batchState := t.batchStateForRun()
+	if batchState == nil {
+		return
+	}
+	nowMS := t.currentTimeMS()
+	var waitNum int
+	if deps := t.RuntimeDependencies(); deps != nil {
+		waitNum = biz.TryFireBatchesWithRuntimeDeps(deps, batchState, nowMS, false)
+	} else {
+		waitNum = biz.TryFireBatchesWithState(batchState, nowMS, false)
+	}
 	if waitNum > 0 {
 		// There are TF cycles that have not yet been completed, and they are postponed for a few seconds to trigger again
 		// 有尚未完成的tf周期，推迟几秒再次触发
 		t.delayExecBatch()
 	} else {
-		orm.FlushDumps()
+		if deps := t.RuntimeDependencies(); deps != nil {
+			if deps.Dump != nil {
+				if err := deps.Dump.Flush(); err != nil {
+					log.Error("flush runtime dump fail", zap.Error(err))
+				}
+			}
+		} else {
+			orm.FlushDumps()
+		}
 	}
 }
 
@@ -1497,10 +1653,12 @@ func (t *CryptoTrader) batchStateForRun() *strat.BatchState {
 
 func (t *CryptoTrader) orderCB(od *ormo.InOutOrder, isEnter bool) {
 	var orders *ormo.OrderState
+	var notifications *rpc.Session
 	if deps := t.RuntimeDependencies(); deps != nil {
 		orders = deps.Orders
+		notifications = deps.Notifications
 	}
-	sendOrderMsgWithOrderState(od, isEnter, orders)
+	sendOrderMsgWithRuntime(od, isEnter, orders, notifications)
 }
 
 func (t *CryptoTrader) startJobs() {
@@ -1508,20 +1666,24 @@ func (t *CryptoTrader) startJobs() {
 	if dp == nil {
 		return
 	}
+	deps := t.RuntimeDependencies()
+	if deps != nil && t.runtime == nil {
+		log.Error("explicit live runtime jobs require a lifecycle")
+		return
+	}
 	if t.envReal() {
 		// Listen to account order flow, process user orders, and consume order queues
 		// 监听账户订单流、处理用户下单、消费订单队列
-		if t.runtime != nil {
+		if deps != nil {
 			lifecycle := &runtimeShutdownLifecycle{owner: t}
-			if deps := t.RuntimeDependencies(); deps != nil {
-				lifecycle.OnClose(func() { biz.StopLiveOdMgrWithRuntimeDeps(*deps) })
-				biz.StartLiveOdMgrWithRuntimeDeps(*deps, t.runContext())
-				lifecycle.OnCloseWait(func() { biz.JoinLiveOdMgrWithRuntimeDeps(*deps) })
-			} else {
-				lifecycle.OnClose(biz.StopLiveOdMgr)
-				biz.StartLiveOdMgrWithContext(t.runContext())
-				lifecycle.OnCloseWait(biz.JoinLiveOdMgr)
-			}
+			lifecycle.OnClose(func() { biz.StopLiveOdMgrWithRuntimeDeps(*deps) })
+			biz.StartLiveOdMgrWithRuntimeDeps(*deps, t.runContext())
+			lifecycle.OnCloseWait(func() { biz.JoinLiveOdMgrWithRuntimeDeps(*deps) })
+		} else if t.runtime != nil {
+			lifecycle := &runtimeShutdownLifecycle{owner: t}
+			lifecycle.OnClose(biz.StopLiveOdMgr)
+			biz.StartLiveOdMgrWithContext(t.runContext())
+			lifecycle.OnCloseWait(biz.JoinLiveOdMgr)
 		} else {
 			biz.StartLiveOdMgr()
 		}
@@ -1533,11 +1695,10 @@ func (t *CryptoTrader) startJobs() {
 	cronRefresh := func() error {
 		return t.bootstrapThirdPartySources(t.runContext())
 	}
-	deps := t.RuntimeDependencies()
-	if t.runtime != nil && deps != nil && t.coreStateForRun() != nil {
+	if deps != nil && t.coreStateForRun() != nil {
 		cronRefreshPairsWithRuntime(scheduler, t, dp, deps, cronRefresh)
 		fetchHourKlinesWithRuntime(scheduler, dp, deps)
-		cronLoadMarketsWithRuntime(scheduler, deps.Exchange)
+		cronLoadMarketsWithRuntime(scheduler, deps.Exchange, deps.Symbols, deps.Config, deps.Core)
 		cronFatalLossCheckWithRuntime(scheduler, *deps, t.currentTimeMS)
 		cronKlineDelaysWithRuntime(scheduler, dp, t.pairCopiedStateForRun(), t.currentTimeMS, *deps)
 		cronKlineSummaryWithRuntime(scheduler, deps.Core)
@@ -1564,10 +1725,8 @@ func (t *CryptoTrader) startJobs() {
 		cronDumpStratOutputs(scheduler)
 	}
 	// 实盘中定期回测对比
-	if t.runtime != nil {
-		if deps := t.RuntimeDependencies(); deps != nil {
-			cronBacktestInLiveWithRuntime(scheduler, *deps)
-		}
+	if deps != nil {
+		cronBacktestInLiveWithRuntime(scheduler, *deps)
 	} else {
 		cronBacktestInLive(scheduler)
 	}
@@ -1581,22 +1740,18 @@ func (t *CryptoTrader) startJobs() {
 		}
 		// Regularly update balance and synchronize exchange positions with local orders
 		// 定期更新余额，同步交易所持仓到本地订单
-		if t.runtime != nil {
-			if deps := t.RuntimeDependencies(); deps != nil {
-				lifecycle := &runtimeShutdownLifecycle{owner: t}
-				StartLoopBalancePositionsWithRuntime(lifecycle, *deps)
-			}
-		} else {
+		if deps != nil {
+			lifecycle := &runtimeShutdownLifecycle{owner: t}
+			StartLoopBalancePositionsWithRuntime(lifecycle, *deps)
+		} else if deps == nil {
 			StartLoopBalancePositions()
 		}
 		// 定期保存实盘钱包快照
-		if t.runtime != nil {
-			if deps := t.RuntimeDependencies(); deps != nil {
-				biz.StartLiveWalletSnapshotsWithRuntimeDeps(*deps, &runtimeShutdownLifecycle{owner: t})
-			} else {
-				biz.StartLiveWalletSnapshots(&runtimeShutdownLifecycle{owner: t})
-			}
-		} else {
+		if deps != nil {
+			biz.StartLiveWalletSnapshotsWithRuntimeDeps(*deps, &runtimeShutdownLifecycle{owner: t})
+		} else if deps == nil && t.runtime != nil {
+			biz.StartLiveWalletSnapshots(&runtimeShutdownLifecycle{owner: t})
+		} else if deps == nil {
 			biz.StartLiveWalletSnapshots()
 		}
 	}
@@ -1606,6 +1761,20 @@ func (t *CryptoTrader) startJobs() {
 }
 
 func (t *CryptoTrader) markUnWarm() {
+	if deps := t.RuntimeDependencies(); deps != nil {
+		state := deps.Strategies
+		if state == nil || strat.IsLegacyState(state) {
+			return
+		}
+		for _, accMap := range state.AccJobs {
+			for _, jobMap := range accMap {
+				for _, job := range jobMap {
+					job.IsWarmUp = false
+				}
+			}
+		}
+		return
+	}
 	if state := t.strategyStateForRun(); state != nil {
 		for _, accMap := range state.AccJobs {
 			for _, jobMap := range accMap {
@@ -1641,8 +1810,10 @@ func exitCleanUpWithRuntime(scheduler com.Scheduler, exchange banexg.BanExchange
 			<-stop.Done()
 		}
 	}
-	orm.FlushDumps()
-	orm.CloseDump()
+	if deps == nil {
+		orm.FlushDumps()
+		orm.CloseDump()
+	}
 	var err *errs.Error
 	if deps != nil {
 		err = biz.CleanUpOdMgrWithState(deps.Trading)
@@ -1652,36 +1823,60 @@ func exitCleanUpWithRuntime(scheduler com.Scheduler, exchange banexg.BanExchange
 	if err != nil {
 		log.Error("clean odMgr fail", zap.Error(err))
 	}
-	strat.ExitStratJobsWithState(strategyState)
-	if exchange != nil {
+	if deps != nil && deps.Dump != nil {
+		if dumpErr := deps.Dump.Flush(); dumpErr != nil {
+			log.Error("flush runtime dump fail", zap.Error(dumpErr))
+		}
+	}
+	if deps == nil {
+		strat.ExitStratJobsWithState(strategyState)
+	} else if strategyState != nil && !strat.IsLegacyState(strategyState) {
+		strat.ExitStratJobsWithState(strategyState)
+	}
+	if deps == nil && exchange != nil {
 		err = exchange.Close()
 	}
 	if err != nil {
 		log.Error("close exg fail", zap.Error(err))
 	}
-	accounts := config.Accounts
+	var accounts map[string]*config.AccountConfig
 	var orders *ormo.OrderState
 	if deps != nil {
 		accounts = deps.AccountConfigs()
 		orders = deps.Orders
+	} else {
+		accounts = config.Accounts
+		orders = ormo.LegacyState()
 	}
 	for account, cfg := range accounts {
 		if cfg == nil || cfg.NoTrade {
 			continue
 		}
-		openOds, lock := ormo.GetOpenODs(account)
-		if orders != nil {
-			openOds, lock = orders.GetOpenODs(account)
+		if orders == nil {
+			continue
 		}
+		openOds, lock := orders.GetOpenODs(account)
 		lock.Lock()
 		openNum := len(openOds)
 		lock.Unlock()
 		msg := fmt.Sprintf("bot stop, %d orders opened", openNum)
-		rpc.SendMsg(map[string]interface{}{
+		sendRuntimeMessage(deps, map[string]interface{}{
 			"type":    rpc.MsgTypeStatus,
 			"account": account,
 			"status":  msg,
 		})
 	}
-	rpc.CleanUp()
+	if deps == nil {
+		rpc.CleanUp()
+	} else if deps.Notifications != nil {
+		deps.Notifications.Close()
+	}
+}
+
+func sendRuntimeMessage(deps *biz.RuntimeDeps, message map[string]interface{}) {
+	if deps == nil {
+		rpc.SendMsg(message)
+	} else if deps.Notifications != nil {
+		deps.Notifications.SendMsg(message)
+	}
 }

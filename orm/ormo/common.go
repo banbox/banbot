@@ -13,6 +13,12 @@ func DumpOrdersGob(path string) *errs.Error {
 	return DumpOrdersGobItems(path, HistODs)
 }
 
+// FilterUnfilledHistoricalOrders keeps the legacy facade behavior while
+// routing the mutation through its registry owner.
+func FilterUnfilledHistoricalOrders() {
+	LegacyState().FilterUnfilledHistoricalOrders()
+}
+
 // DumpOrdersGobItems serializes an explicit order snapshot. Runtime-owned
 // backtests use this entry point so report output does not copy orders into
 // the legacy process-wide history registry.

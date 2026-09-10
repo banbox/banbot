@@ -60,6 +60,69 @@ func (i *InOutOrder) orderState() *OrderState {
 	return nil
 }
 
+func (i *InOutOrder) runtimeTimeMS() int64 {
+	if state := i.orderState(); state != nil {
+		if state.runtimeClock != nil {
+			return state.runtimeClock.TimeMS()
+		}
+		if state != legacyOrderState {
+			return time.Now().UnixMilli()
+		}
+	}
+	return btime.TimeMS()
+}
+
+func (i *InOutOrder) runtimePrice(symbol, side string, expMS int64) float64 {
+	if state := i.orderState(); state != nil {
+		if state.runtimePrices != nil {
+			return state.runtimePrices.GetPriceSafeExpAt(i.runtimeTimeMS(), symbol, side, expMS)
+		}
+		if state != legacyOrderState {
+			return -1
+		}
+	}
+	return com.GetPriceExp(symbol, side, expMS)
+}
+
+func (i *InOutOrder) runtimeExchange() banexg.BanExchange {
+	if state := i.orderState(); state != nil {
+		if state != legacyOrderState {
+			return state.runtimeExchange
+		}
+	}
+	return exg.Default
+}
+
+func (i *InOutOrder) runtimeExchangeName() string {
+	if state := i.orderState(); state != nil && state != legacyOrderState {
+		if state.runtimeCore != nil && state.runtimeCore.ExgName != "" {
+			return state.runtimeCore.ExgName
+		}
+		if state.runtimeConfig != nil && state.runtimeConfig.Exchange != nil {
+			return state.runtimeConfig.Exchange.Name
+		}
+		if state.runtimeExchange != nil {
+			if info := state.runtimeExchange.Info(); info != nil {
+				return info.ID
+			}
+		}
+		return ""
+	}
+	return core.ExgName
+}
+
+func (i *InOutOrder) runtimeNamespace() string {
+	if state := i.orderState(); state != nil {
+		if state != legacyOrderState {
+			if state.runtimeConfig != nil {
+				return state.runtimeConfig.Name
+			}
+			return ""
+		}
+	}
+	return config.Name
+}
+
 type InOutEdit struct {
 	Order  *InOutOrder
 	Action string
@@ -180,7 +243,7 @@ func (i *InOutOrder) SetEnterLimit(price float64) *errs.Error {
 		i.DirtyEnter = true
 		stopBars := i.GetInfoInt64(OdInfoStopBars)
 		if stopBars > 0 {
-			stopAfter := btime.TimeMS() + stopBars*int64(utils2.TFToSecs(i.Timeframe))*1000
+			stopAfter := i.runtimeTimeMS() + stopBars*int64(utils2.TFToSecs(i.Timeframe))*1000
 			i.SetInfo(OdInfoStopAfter, stopAfter)
 		}
 		fireOdEdit(i, OdActionLimitEnter)
@@ -245,7 +308,7 @@ func (i *InOutOrder) UpdateProfits(price float64) {
 	i.ProfitRate = i.Profit / entQuoteVal
 	if i.ProfitRate > i.MaxPftRate {
 		i.MaxPftRate = i.ProfitRate
-	} else if config.StrictHistoricalReplay(config.HistoricalCoverage) && config.Data.BTLegacyOrderMetrics {
+	} else if legacyOrderMetricsEnabled(i) {
 		if i.MaxPftRate > 0 {
 			i.MaxDrawDown = (i.MaxPftRate - i.ProfitRate) / i.MaxPftRate
 		} else {
@@ -257,13 +320,25 @@ func (i *InOutOrder) UpdateProfits(price float64) {
 	i.DirtyMain = true
 }
 
+func legacyOrderMetricsEnabled(order *InOutOrder) bool {
+	if order != nil {
+		if state := order.orderState(); state != nil {
+			return state.LegacyOrderMetrics()
+		}
+	}
+	return config.StrictHistoricalReplay(config.HistoricalCoverage) && config.Data.BTLegacyOrderMetrics
+}
+
 /*
 UpdateFee
 Calculates commission for entry/exit orders. Must be called after Filled is assigned a value, otherwise the calculation is empty
 为入场/出场订单计算手续费，必须在Filled赋值后调用，否则计算为空
 */
 func (i *InOutOrder) UpdateFee(price float64, forEnter bool) *errs.Error {
-	exchange := exg.Default
+	exchange := i.runtimeExchange()
+	if exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "exchange is required to calculate fee for %s", i.Symbol)
+	}
 	exOrder := i.Enter
 	if !forEnter {
 		exOrder = i.Exit
@@ -300,12 +375,12 @@ func (i *InOutOrder) CanClose() bool {
 		return true
 	}
 	tfMSecs := int64(utils2.TFToSecs(i.Timeframe) * 1000)
-	return float64(btime.TimeMS()-i.RealEnterMS()) > float64(tfMSecs)*0.9
+	return float64(i.runtimeTimeMS()-i.RealEnterMS()) > float64(tfMSecs)*0.9
 }
 
 func (i *InOutOrder) SetExit(exitAt int64, tag, orderType string, limit float64) {
 	if exitAt == 0 {
-		exitAt = btime.TimeMS()
+		exitAt = i.runtimeTimeMS()
 	}
 	if i.ExitAt == 0 {
 		if tag == "" {
@@ -320,7 +395,11 @@ func (i *InOutOrder) SetExit(exitAt int64, tag, orderType string, limit float64)
 		if i.Short {
 			odSide = banexg.OdSideBuy
 		}
-		core.NewNumInSim += 1
+		if state := i.orderState(); state != nil {
+			state.addSimOrder()
+		} else {
+			core.NewNumInSim++
+		}
 		i.Exit = &ExOrder{
 			TaskID:    i.TaskID,
 			InoutID:   i.ID,
@@ -356,7 +435,7 @@ When calling this function on a real drive, it will be saved to the database
 */
 func (i *InOutOrder) LocalExit(exitAt int64, tag string, price float64, msg, odType string) *errs.Error {
 	if price == 0 {
-		newPrice := com.GetPriceExp(i.Symbol, "", com.Day10MSecs)
+		newPrice := i.runtimePrice(i.Symbol, "", com.Day10MSecs)
 		if newPrice > 0 {
 			price = newPrice
 		} else if i.Enter.Average > 0 {
@@ -484,15 +563,19 @@ func (i *InOutOrder) Save() *errs.Error {
 	if i.Status == InOutStatusFullExit && (i.Enter == nil || i.Enter.Filled == 0) && (i.Exit == nil || i.Exit.Filled == 0) {
 		i.Status = InOutStatusDelete
 	}
-	live := core.LiveMode
 	state := i.orderState()
+	var live bool
 	if state != nil {
 		live = state.Live()
+	} else {
+		live = core.LiveMode
 	}
 	if live {
-		account := GetTaskAcc(i.TaskID)
+		var account string
 		if state != nil {
 			account = state.GetTaskAcc(i.TaskID)
+		} else {
+			account = GetTaskAcc(i.TaskID)
 		}
 		var openOds map[int64]*InOutOrder
 		var lock *deadlock.Mutex
@@ -545,9 +628,11 @@ func (i *InOutOrder) saveToMem() {
 		}
 	}
 	state := i.orderState()
-	account := GetTaskAcc(i.TaskID)
+	account := ""
 	if state != nil {
 		account = state.GetTaskAcc(i.TaskID)
+	} else {
+		account = GetTaskAcc(i.TaskID)
 	}
 	var openOds map[int64]*InOutOrder
 	var lock *deadlock.Mutex
@@ -588,7 +673,7 @@ func (i *InOutOrder) saveToDb() *errs.Error {
 	dirtyMain, dirtyEnter, dirtyExit := i.DirtyMain, i.DirtyEnter, i.DirtyExit
 	var sess *Queries
 	var conn *orm.TrackedDB
-	sess, conn, err = Conn(orm.DbTrades, true)
+	sess, conn, err = i.orderState().Conn(true)
 	if err != nil {
 		return err
 	}
@@ -736,7 +821,7 @@ func (i *InOutOrder) SetExitTrigger(key string, args *ExitTrigger, price float64
 		if i.Status == InOutStatusInit && i.Enter != nil && strings.Contains(i.Enter.OrderType, "limit") {
 			price = i.Enter.Price
 		} else {
-			price = com.GetPriceExp(i.Symbol, side, com.Day10MSecs)
+			price = i.runtimePrice(i.Symbol, side, com.Day10MSecs)
 		}
 	}
 	if isStopLoss == (side == banexg.OdSideSell) {
@@ -877,15 +962,18 @@ The exchange boundary selects the format required by the adapter.
 */
 func (i *InOutOrder) ClientId(random bool) string {
 	client := i.GetInfoString(OdInfoClientID)
-	return exg.BuildClientOrderID(exg.Default, core.ExgName, config.Name, i.ID, client, random)
+	return exg.BuildClientOrderID(i.runtimeExchange(), i.runtimeExchangeName(), i.runtimeNamespace(), i.ID, client, random)
 }
 
 func fireOdEdit(od *InOutOrder, action string) {
-	listener := OdEditListener
-	envReal := core.EnvReal
+	var listener func(*InOutOrder, string)
+	var envReal bool
 	if od != nil && od.state != nil {
 		listener = od.state.GetEditListener()
-		envReal = od.state.Live()
+		envReal = od.state.runtimeCore != nil && od.state.runtimeCore.EnvReal
+	} else {
+		listener = OdEditListener
+		envReal = core.EnvReal
 	}
 	if listener != nil && envReal && od.Status > InOutStatusInit && od.ID > 0 {
 		listener(od, action)
@@ -913,9 +1001,11 @@ func (i *InOutOrder) Lock() *deadlock.Mutex {
 		mLockOds.Unlock()
 	}
 	var got = int32(0)
-	live := core.LiveMode
+	var live bool
 	if state != nil {
 		live = state.Live()
+	} else {
+		live = core.LiveMode
 	}
 	if live {
 		// Real time mode with added deadlock detection
@@ -1501,7 +1591,14 @@ func (q *Queries) DelOrder(od *InOutOrder) *errs.Error {
 	if od == nil || od.ID == 0 {
 		return nil
 	}
-	openOds, lock := GetOpenODs(GetTaskAcc(od.TaskID))
+	state := od.orderState()
+	var openOds map[int64]*InOutOrder
+	var lock *deadlock.Mutex
+	if state != nil {
+		openOds, lock = state.GetOpenODs(state.GetTaskAcc(od.TaskID))
+	} else {
+		openOds, lock = GetOpenODs(GetTaskAcc(od.TaskID))
+	}
 	lock.Lock()
 	delete(openOds, od.ID)
 	lock.Unlock()

@@ -99,10 +99,10 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 		groups[parent].AddCommand(command)
 	}
 
-	add("", newConfigCommand("trade", "live trade", runTradeEntry, false,
+	add("", newRuntimeConfigCommand("trade", "live trade", runTradeEntry, false,
 		bindStakeAmount, bindPairs, bindSpider, bindOut))
 	add("", newInternalCommand())
-	add("", newLegacySessionConfigCommand("backtest", "backtest with strategies and data", runBackTestEntry, true,
+	add("", newRuntimeConfigCommand("backtest", "backtest with strategies and data", runBackTestEntry, true,
 		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate, bindBTStrict))
 	add("", newConfigCommand("spider", "start the spider", runSpider, false))
 	add("", newLegacySessionConfigCommand("optimize", "run hyperparameter optimization", opt.RunOptimizeWithSession, true,

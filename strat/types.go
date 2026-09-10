@@ -41,6 +41,14 @@ type TradeStrat struct {
 	Outputs         []string    // The content of the text file output by the strategy, where each string is one line 策略输出的文本文件内容，每个字符串是一行
 	Policy          *config.RunPolicyConfig
 
+	// Explicit runtimes bind these concrete dependencies once while loading a
+	// strategy. Legacy strategies leave them nil and keep the compatibility
+	// facade behavior.
+	runtimeConfig   *config.Config
+	runtimeCore     *core.State
+	runtimeClock    *btime.ClockState
+	runtimeExplicit bool
+
 	OnPairInfos         func(s *StratJob) []*PairSub
 	OnDataSubs          func(s *StratJob) []*DataSub
 	OnSymbols           func(items []string) []string // return modified pairs

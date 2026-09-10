@@ -1,6 +1,6 @@
 # BanBot Runtime 上下文架构
 
-本文记录当前工作树已经实现的性能优先 `Process -> Runtime` 架构。它描述现状，不把 typed state、legacy gate 或局部双实例测试解释为完整的多 Runtime 业务并发隔离。
+本文记录当前工作树已经实现的性能优先 `Process -> Runtime` 架构。它描述现状：High/Medium 的主要修复已落地，但不把 typed state、legacy gate 或局部双实例测试解释为完整的多 Runtime 业务并发隔离。
 
 ## 1. 核心结论
 
@@ -31,9 +31,16 @@ registry 首次接管已有 `exsymbol_q` catalog 时，新增逻辑 symbol 会�
 | `Clock` | `btime.ClockState`：实时或模拟时间 |
 | `Market` | `com.MarketState`：价格和复制进度 |
 | `Symbols` | `orm.SymbolState`：symbol 索引、identity、订阅和 recovery root |
+| `Storage` | `orm.Storage`：显式连接池、数据库后端和存储协调身份 |
 | `Batch` | `strat.BatchState`：batch 队列和 `LastBatchMS` |
+| `Strategies` | `strat.State`：策略实例、jobs、订阅字段、性能状态与 pair hooks |
+| `Orders` | `ormo.OrderState`：任务、活动订单、历史订单与执行选项 |
+| `Trading` | `biz.TradingState`：订单管理器、钱包、快照调度状态 |
+| `Cron` | 实例 scheduler，构造时绑定语言和时区 |
+| `Notifications` | `rpc.Session`：实例通知通道和远程命令依赖 |
+| `Exchange` | 显式交易所 session；关闭责任由构造入口承担 |
 
-领域类型仍由原包定义，`runtime` 只负责构造、组合和关闭。`Runtime.Close` 依次发出 stop，再 reset `Market`、`Symbols`、`Batch` 和 `Core`；它尚未拥有策略图、订单、钱包、交易所 session、通知、Web task 或 ORM pool。
+领域类型仍由原包定义，`runtime` 负责构造、组合和关闭。`Runtime.Close` 先停止调度、通知及注册的后台任务，等待 callback/join，再清空 `Market`、`Symbols`、`Batch`、`Strategies`、`Orders`、`Trading` 并关闭 `Core`。`Storage` 和 `Exchange` 是显式依赖，不能因为一个 Runtime 关闭就误关另一个 Runtime 共享的连接；创建资源的入口负责关闭，`Process.Close` 释放其持有的 SID registry。
 
 ## 3. Legacy gate
 
@@ -41,11 +48,11 @@ registry 首次接管已有 `exsymbol_q` catalog 时，新增逻辑 symbol 会�
 
 当前覆盖范围：
 
-- entry runner：backtest、trade；
+- legacy entry runner/API：backtest、trade；显式 Cobra `backtest`/`trade` 走独立 Runtime session，不获取该 gate；
 - entry 数据路径：data download、repair/verify/correct/adjust、series download、spider、load、aggregate、init、import、export，以及同类通过 `runConfigCommand` 执行的配置型命令；
 - [`runtimeplan.Inspect`](../runtimeplan/inspect.go)，因为它仍临时安装并恢复 `config`、`core` 和 `btime` 状态。
 
-Cobra 的配置型命令在 `runConfigCommand` 外层取得 gate，内部调用不加锁的 helper，避免同一 goroutine 重入互斥量；直接导出的 legacy entry API 则由各自 wrapper 取得同一 gate。一次 backtest/trade session 内创建一个 `Process`，该 session 内的 Runtime 共享 SID allocator；不同 session 仍被 gate 串行化。
+Cobra 的 legacy 配置型命令在 `runConfigCommand` 外层取得 gate，内部调用不加锁的 helper，避免同一 goroutine 重入互斥量；直接导出的 legacy entry API 则由各自 wrapper 取得同一 gate。显式 Cobra runner 通过 `openExplicitEntrySession` 创建自己的 Process、Storage、Exchange、Config 和 Runtime，不要求 `LegacySession`。一次显式 backtest/trade session 内创建一个 `Process`，该 session 内的 Runtime 共享 SID allocator；仍使用 legacy facade 的 session 继续串行化。
 
 以下 pure paths 不需要 gate：命令树构造、参数/legacy flag 规范化、help/version、`series list` 对已注册定义的只读 JSON 输出，以及 `runtimeplan.DecodeRequest` 的纯解码。它们不安装运行期全局状态。gate 不进入 bar、tick、价格或策略 callback 热路径。
 
@@ -63,7 +70,7 @@ live runner 当前建立了三层停机边界：
 
 [`core.SplitSymbol`](../core/utils.go) 不再读取 `core.ExgName`，也没有 China 特判；默认 parser 只处理通用分隔符语法。Runtime-owned `Market.Prices` 内持有 [`core.SymbolParser`](../core/symbol_parser.go)，可在构造边界注入 typed `SymbolParserStrategy`。
 
-China 价格语义位于 [`com.PriceState`](../com/price_state.go) 的调用方适配层：优先使用 banexg `MapMarket` 提供的 market/base，再补齐当前 banexg 版本未提供的 CNY quote/settle 和合约月份。旧 `com` facade 按 exchange 保存独立 `PriceState`，保持 China 基础品种别名和切换交易所后恢复旧价格的兼容行为。
+交易所价格语义由 `banexg v0.2.64` 的 capability 和 `MapMarket` 提供。banbot 在构造边界绑定 adapter parser，不按交易所名称补写专属 quote/settle 或合约月份逻辑。旧 `com` facade 按 exchange 保存独立 `PriceState`，保留基础品种别名和切换交易所后恢复旧价格的兼容行为。
 
 parser 使用并发缓存和 hot/warm 原子指针；exchange adapter 只在 cache miss 调用。价格和 runner 热路径继续使用具体 receiver、字段和局部变量，不通过 Context 查找服务。
 
@@ -81,7 +88,7 @@ exsymbol pending marker 在原子 rename 发布后同步 recovery 目录。后�
 
 ## 7. Runtime runner 已消费与剩余边界
 
-entry 将 `rt.Core`、`rt.Clock`、`rt.Market`、`rt.Batch` 组成 `biz.RuntimeDeps`，并把 `rt.Symbols` 单独传给 backtest/live runner。当前直接消费如下：
+entry 将 `rt.Core`、`rt.Clock`、`rt.Market`、`rt.Batch` 组成 `biz.RuntimeDeps`，并把 `rt.Symbols` 单独传给显式 backtest/live runner。当前直接消费如下：
 
 | typed dependency | runner 当前使用 |
 | --- | --- |
@@ -93,7 +100,7 @@ entry 将 `rt.Core`、`rt.Clock`、`rt.Market`、`rt.Batch` 组成 `biz.RuntimeD
 
 `Runtime.Config` 已有实例所有权，但 runner 大量业务代码仍直接读取 legacy `config` globals。以下仍是 gate 下的串行边界：策略 `Envs`、`AccJobs`、`PairStrats`、hooks 和可变策略实例；jobs refresh/cache；订单管理器、open orders、钱包和 relay snapshot；交易所默认 session；ORM `pool`、`IsQuestDB`、范围/compact/dump 状态；以及仍使用 package facade 的 rpc、web、data、goods、opt/live 工具。
 
-因此当前测试只能证明已绑定 typed state 的局部隔离，不能证明两个完整 backtest/live runner 可在同一进程并发运行。
+显式 runner 已绕过 legacy gate，但仍有上述未迁移 facade；当前测试已验证 typed runner 的局部并发、取消和串行基线隔离，真实数据库/生产服务参与的两个完整 backtest/live runner 并发 E2E 仍待环境验收。
 
 ## 8. Context 约束
 
@@ -104,12 +111,13 @@ ORM series table 的重入锁标记已从 `context.WithValue`/`Context.Value` �
 ## 9. 决策与验证证据
 
 - `Key[T]`：删除，无 alias、wrapper 或兼容层。
+- `banexg`：固定 `github.com/banbox/banexg v0.2.64`，`go.mod` 无本机绝对路径 replace，模块可从 Go proxy 下载。
 - 性能：typed hot paths 保持具体 receiver；现有 symbol parser、price state 等代表性 benchmark 报告零分配。该证据不是全链路 benchmark，也没有证明所有路径均低于 5% 回归阈值。
 - 历史账本基线：旧策略工作树快照的配置 SHA-256 记录为 `87bed31c92dd4769bf17ae218181c958f984fd3b5d63983c3141e4a4b9484a7b`；当时的 `Total Orders/BarNum = 733/1568085`、`Final Balance = 693.79`。
 - 2026-09-06 复验：在 `/data/quant/strat1` 运行 `./bot backtest -config @adv.yml`，退出码为 0；`Total Orders/BarNum = 0/1626569`、`Final Balance = 3000.00`、`Total Profit = 0.0%`、`Total Fee = 0.00`；elapsed `2:25.27`、user `53.70s`、最大 RSS `1064760 KB`，输出目录为 `/data/ban/data/backtest/18fbb39e60`。
 - 可比性：本次复验使用的 `/data/quant/strat1` 策略工作树状态不同于历史账本对应的旧快照，因此两次结果不能直接比较，也不得表述为当前指标与历史基线一致。
-- 变更后验证：`go vet ./...` 和 `go build ./...` 均通过；`go test ./... -count=1` 已运行但未完全通过，仅 `orm/TestBulkDownOHLCV` 因外部 `/data/ban/banexg` 缺少 Binance linear `EOS/USDT:USDT` market fixture 而失败，其余 package 均成功完成；文中其他位置列出的针对性 package 测试和 race 测试均通过；代表性 benchmark 已运行，typed hot paths 的代表性 benchmark 为零分配。
-- 测试：已有回归覆盖 legacy gate 互斥、runner typed deps、双 Runtime 局部状态隔离、live provider/socket admission-stop-join、Context.Value 移除、QuestDB WAL 轮询/硬错误、CTAS 删除前验证、series NULL、recovery marker 和 SID reservation。
+- 变更后验证：`go vet ./...` 和 `go build ./...` 均通过；定向 package 测试和 race 测试均通过。`go test ./orm -count=1` 仍受外部 QuestDB WAL 可见性和 Binance linear `MATIC/USDT:USDT` market fixture 缺失影响，`TestBulkDownOHLCV` 未能完成；这属于外部环境限制，不改变已通过的编译、静态检查和 Runtime 回归证据。代表性 benchmark 已运行，typed hot paths 的代表性 benchmark 为零分配。
+- 测试：已有回归覆盖 legacy gate 互斥、runner typed deps、双 Runtime 局部状态隔离、第三方 source/字段投影隔离（相同 SID/timeframe、全局第三组 job、显式 NULL）、live provider/socket admission-stop-join、Context.Value 移除、QuestDB WAL 轮询/硬错误、CTAS 删除前验证、series NULL、recovery marker 和 SID reservation。
 
 这些证据支持当前迁移切片，不支持“完整多 Runtime 并发隔离已经完成”的结论。
 
@@ -119,4 +127,4 @@ ORM series table 的重入锁标记已从 `context.WithValue`/`Context.Value` �
 - live cron、订单/钱包循环、Web/RPC 与第三方组件尚未全部纳入 Runtime-owned stop/join；当前 reset 顺序只对已接线 runner 路径成立。
 - 未配置 registry 时，Process 内 allocator 和本地 lease 只协调同一主机的 single-writer；配置 registry 后 PostgreSQL 的 sequence/unique key 才是跨进程 SID 协调边界。
 - QuestDB snapshot 通过 schema、每 SID 行数和样本验证，不是逐单元格全表校验；WAL timeout、rename 中断和 backup 恢复仍需运维可见性。
-- 完整承诺前仍需迁移剩余 globals、删除临时全局安装，完成两个完整 runner 的并发/race 验证，并持续运行全量测试、vet 和稳定 benchmark 对比。
+- 最终多 Runtime 并发承诺仍需迁移剩余 globals、删除临时全局安装，完成两个完整 runner 的确定性并发/取消/结果一致性验证，并持续运行全量测试和稳定 benchmark 对比。

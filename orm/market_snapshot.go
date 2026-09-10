@@ -25,17 +25,53 @@ type historicalMarketSnapshot struct {
 }
 
 func hasConfiguredMarketSnapshot() bool {
-	if !marketSnapshotMode() || config.Exchange == nil {
-		return false
-	}
-	return config.Exchange.Items[config.Exchange.Name]["market_snapshot"] != nil
+	return hasConfiguredMarketSnapshotWithRuntime(nil, nil)
 }
 
 func applyConfiguredMarketSnapshot(exchange banexg.BanExchange, markets banexg.MarketMap) *errs.Error {
-	if !marketSnapshotMode() || config.Exchange == nil {
+	return applyConfiguredMarketSnapshotWithRuntime(nil, nil, exchange, markets)
+}
+
+// hasConfiguredMarketSnapshotWithRuntime reports whether an explicit runtime
+// configured a historical market snapshot. A nil snapshot/core pair is the
+// legacy facade and intentionally reads the process configuration.
+func hasConfiguredMarketSnapshotWithRuntime(snapshot *config.Snapshot, runtimeCore *core.State) bool {
+	if snapshot == nil {
+		legacyConfig := config.Data
+		legacyConfig.Exchange = config.Exchange
+		return hasConfiguredMarketSnapshotForConfig(&legacyConfig, nil, false)
+	}
+	return hasConfiguredMarketSnapshotForConfig(snapshot.View(), runtimeCore, true)
+}
+
+func hasConfiguredMarketSnapshotForConfig(cfg *config.Config, runtimeCore *core.State, explicit bool) bool {
+	if !marketSnapshotModeFor(runtimeCore, explicit) || cfg == nil || cfg.Exchange == nil {
+		return false
+	}
+	return cfg.Exchange.Items[cfg.Exchange.Name]["market_snapshot"] != nil
+}
+
+// applyConfiguredMarketSnapshotWithRuntime applies the snapshot owned by an
+// explicit runtime. It keeps path resolution and validation tied to the same
+// configuration snapshot as the market request; legacy callers use nil args.
+func applyConfiguredMarketSnapshotWithRuntime(snapshot *config.Snapshot, runtimeCore *core.State,
+	exchange banexg.BanExchange, markets banexg.MarketMap,
+) *errs.Error {
+	if snapshot == nil {
+		legacyConfig := config.Data
+		legacyConfig.Exchange = config.Exchange
+		return applyConfiguredMarketSnapshotForConfig(&legacyConfig, config.GetDataDir(), nil, false, exchange, markets)
+	}
+	return applyConfiguredMarketSnapshotForConfig(snapshot.View(), snapshot.DataDir, runtimeCore, true, exchange, markets)
+}
+
+func applyConfiguredMarketSnapshotForConfig(cfg *config.Config, dataDir string, runtimeCore *core.State,
+	explicit bool, exchange banexg.BanExchange, markets banexg.MarketMap,
+) *errs.Error {
+	if !marketSnapshotModeFor(runtimeCore, explicit) || cfg == nil || cfg.Exchange == nil {
 		return nil
 	}
-	options := config.Exchange.Items[config.Exchange.Name]
+	options := cfg.Exchange.Items[cfg.Exchange.Name]
 	rawPath, _ := options["market_snapshot"].(string)
 	if rawPath == "" {
 		return nil
@@ -47,8 +83,13 @@ func applyConfiguredMarketSnapshot(exchange banexg.BanExchange, markets banexg.M
 	if !strings.HasPrefix(rawPath, "@") {
 		return errs.NewMsg(core.ErrBadConfig, "market_snapshot must use a BanDataDir-relative @ path")
 	}
-	path := config.ParsePath(rawPath)
-	root, err := filepath.EvalSymlinks(filepath.Clean(config.GetDataDir()))
+	path := rawPath
+	if explicit {
+		path = filepath.Join(dataDir, strings.TrimLeft(rawPath, "$@\\/"))
+	} else {
+		path = config.ParsePath(rawPath)
+	}
+	root, err := filepath.EvalSymlinks(filepath.Clean(dataDir))
 	if err != nil {
 		return errs.New(core.ErrIOReadFail, err)
 	}
@@ -82,6 +123,13 @@ func applyConfiguredMarketSnapshot(exchange banexg.BanExchange, markets banexg.M
 }
 
 func marketSnapshotMode() bool {
+	return marketSnapshotModeFor(nil, false)
+}
+
+func marketSnapshotModeFor(runtimeCore *core.State, explicit bool) bool {
+	if explicit {
+		return runtimeCore != nil && (runtimeCore.BackTestMode || runtimeCore.RunMode == core.RunModeData)
+	}
 	return core.BackTestMode || core.RunMode == core.RunModeData
 }
 

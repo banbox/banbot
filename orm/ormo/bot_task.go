@@ -2,6 +2,8 @@ package ormo
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -77,7 +79,7 @@ func InitTasksWithState(state *OrderState, accounts []string, mode string, start
 		return errs.NewMsg(errs.CodeParamRequired, "order state is required")
 	}
 	if len(accounts) == 0 {
-		accounts = []string{config.DefAcc}
+		accounts = []string{"default"}
 	}
 	accounts = append([]string(nil), accounts...)
 	sort.Strings(accounts)
@@ -90,7 +92,7 @@ func InitTasksWithState(state *OrderState, accounts []string, mode string, start
 		for state.GetTaskAcc(nextID) != "" {
 			nextID--
 		}
-		task := &BotTask{ID: nextID, Mode: mode, CreateAt: btime.UTCStamp(), StartAt: startAt, StopAt: stopAt}
+		task := &BotTask{ID: nextID, Mode: mode, CreateAt: state.TimeMS(), StartAt: startAt, StopAt: stopAt}
 		state.SetTask(account, task)
 		ids = append(ids, fmt.Sprintf("%s:%v", account, task.ID))
 		nextID--
@@ -105,9 +107,36 @@ func InitTasksWithState(state *OrderState, accounts []string, mode string, start
 // InitTasksWithState.
 func InitTaskWithState(state *OrderState, account, mode string, startAt, stopAt int64, showLog bool) *errs.Error {
 	if account == "" {
-		account = config.DefAcc
+		account = "default"
 	}
 	return InitTasksWithState(state, []string{account}, mode, startAt, stopAt, showLog)
+}
+
+func InitLiveTasksWithState(state *OrderState, accounts []string, name string, real bool) *errs.Error {
+	sess, conn, err := state.Conn(true)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	ctx := context.Background()
+	for _, account := range accounts {
+		taskName := name
+		if real {
+			taskName += "/" + account
+		}
+		task, queryErr := sess.FindTask(ctx, FindTaskParams{Mode: core.RunModeLive, Name: taskName})
+		if errors.Is(queryErr, sql.ErrNoRows) {
+			nowMS := state.TimeMS()
+			task, queryErr = sess.AddTask(ctx, AddTaskParams{
+				Mode: core.RunModeLive, Name: taskName, CreateAt: nowMS, StartAt: nowMS,
+			})
+		}
+		if queryErr != nil {
+			return errs.New(core.ErrDbExecFail, queryErr)
+		}
+		state.SetTask(account, task)
+	}
+	return nil
 }
 
 func (q *Queries) GetAccTask(account string) (*BotTask, *errs.Error) {

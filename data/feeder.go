@@ -271,7 +271,8 @@ func (f *Feeder) onStateOhlcvsWithErr(state *PairTFCache, rows []*orm.DataSeries
 		}
 	}
 	if !state.physicalOnly && !lastOk && len(rows) > 0 && f.coverage != nil &&
-		!orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, state.TimeFrame, rows[len(rows)-1].TimeMS) {
+		!orm.HistoricalCoverageAllowsWithOptions(f.coverage, f.ExSymbol, state.TimeFrame,
+			rows[len(rows)-1].TimeMS, f.klineOptions()) {
 		lastOk = true
 	}
 	rows = f.filterHistoricalCoverageRows(state.TimeFrame, rows)
@@ -326,13 +327,28 @@ func (f *Feeder) getTfKlines(tf string, endMS int64, limit int, pBar *utils.PrgB
 	if err != nil {
 		return nil, err
 	}
-	adjs, rows, err := orm.AutoFetchSeries(exchange, f.ExSymbol, tf, 0, endMS, limit, false, pBar)
+	var adjs []*orm.AdjInfo
+	var fetchedRows []*orm.DataSeries
+	if f.deps != nil {
+		sess, conn, connErr := f.deps.conn()
+		if connErr != nil {
+			return nil, connErr
+		}
+		defer conn.Release()
+		if f.symbols != nil {
+			sess = sess.WithSeriesSymbolState(f.symbols)
+		}
+		adjs, fetchedRows, err = sess.AutoFetchSeriesWithOptions(exchange, f.ExSymbol, tf, 0, endMS, limit, false, pBar,
+			f.deps.KlineOptions())
+	} else {
+		adjs, fetchedRows, err = orm.AutoFetchSeries(exchange, f.ExSymbol, tf, 0, endMS, limit, false, pBar)
+	}
 	if err != nil {
 		return nil, err
 	}
-	f.tfBars[tf] = rows
-	rows = applyAdjSeriesList(f.ExSymbol, adjs, rows, core.AdjFront, 0, 0)
-	return rows, nil
+	f.tfBars[tf] = fetchedRows
+	fetchedRows = applyAdjSeriesList(f.ExSymbol, adjs, fetchedRows, core.AdjFront, 0, 0)
+	return fetchedRows, nil
 }
 
 func (f *Feeder) addTfKlines(tf string, rows []*orm.DataSeries) {
@@ -425,18 +441,25 @@ func (f *Feeder) filterHistoricalCoverageRows(timeframe string, rows []*orm.Data
 		}
 	}
 	for index, row := range rows {
-		if orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, timeframe, row.TimeMS) {
+		if orm.HistoricalCoverageAllowsWithOptions(f.coverage, f.ExSymbol, timeframe, row.TimeMS, f.klineOptions()) {
 			continue
 		}
 		filtered := append([]*orm.DataSeries(nil), rows[:index]...)
 		for _, remaining := range rows[index+1:] {
-			if orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, timeframe, remaining.TimeMS) {
+			if orm.HistoricalCoverageAllowsWithOptions(f.coverage, f.ExSymbol, timeframe, remaining.TimeMS, f.klineOptions()) {
 				filtered = append(filtered, remaining)
 			}
 		}
 		return filtered
 	}
 	return rows
+}
+
+func (f *Feeder) klineOptions() orm.KlineRuntimeOptions {
+	if f != nil && f.deps != nil {
+		return f.deps.KlineOptions()
+	}
+	return orm.LegacyKlineRuntimeOptions()
 }
 
 func applyAdjSeries(adj *orm.AdjInfo, rows []*orm.DataSeries) []*orm.DataSeries {
@@ -683,7 +706,21 @@ func NewSeriesFeederWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol, callBa
 }
 
 func newSeriesFeeder(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error) {
-	adjs, err := orm.GetAdjs(exs.ID)
+	var adjs []*orm.AdjInfo
+	var err *errs.Error
+	if deps != nil {
+		sess, conn, connErr := deps.conn()
+		if connErr != nil {
+			return nil, connErr
+		}
+		defer conn.Release()
+		if symbols != nil {
+			sess = sess.WithSeriesSymbolState(symbols)
+		}
+		adjs, err = sess.GetAdjs(exs.ID)
+	} else {
+		adjs, err = orm.GetAdjs(exs.ID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -761,8 +798,12 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 				firstMS = bars[0].TimeMS
 				lastMS = bars[len(bars)-1].TimeMS
 			}
+			questDB := orm.IsQuestDB
+			if f.deps != nil {
+				questDB = f.deps.isQuestDB()
+			}
 			log.Debug("warm tf fetch",
-				zap.Bool("questdb", orm.IsQuestDB),
+				zap.Bool("questdb", questDB),
 				zap.String("pair", f.Symbol),
 				zap.String("tf", tf),
 				zap.Int("warm_num", warmNum),
@@ -843,8 +884,14 @@ func (f *SeriesFeeder) warmTfWithErr(tf string, rows []*orm.DataSeries) (int64, 
 	tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 	lastMS := rows[len(rows)-1].TimeMS + tfMSecs
 	envKey := strings.Join([]string{f.Symbol, tf}, "_")
-	if env, ok := strat.Envs[envKey]; ok {
-		env.Reset()
+	if f.deps == nil {
+		if env, ok := strat.Envs[envKey]; ok {
+			env.Reset()
+		}
+	} else if f.deps.Strategies != nil {
+		if env, ok := f.deps.Strategies.Envs[envKey]; ok {
+			env.Reset()
+		}
 	}
 	if len(f.adjs) > 0 {
 		// 按复权信息分批调用
@@ -1309,6 +1356,13 @@ func (f *TfSeriesLoader) context() context.Context {
 	return context.Background()
 }
 
+func (f *TfSeriesLoader) questDB() bool {
+	if f != nil && f.deps != nil {
+		return f.deps.isQuestDB()
+	}
+	return orm.IsQuestDB
+}
+
 func NewTfSeriesLoader(exs *orm.ExSymbol, tf string) *TfSeriesLoader {
 	return NewTfSeriesLoaderWithSymbolState(nil, exs, tf)
 }
@@ -1447,9 +1501,12 @@ func (f *TfSeriesLoader) DownIfNeed(sess *orm.Queries, exchange banexg.BanExchan
 		return err
 	}
 	if sess == nil {
-		ctx := f.context()
 		var conn *pgxpool.Conn
-		sess, conn, err = orm.Conn(ctx)
+		if f.deps == nil {
+			sess, conn, err = orm.Conn(f.context())
+		} else {
+			sess, conn, err = f.deps.conn()
+		}
 		if err != nil {
 			if pBar != nil {
 				pBar.Add(core.StepTotal)
@@ -1464,8 +1521,13 @@ func (f *TfSeriesLoader) DownIfNeed(sess *orm.Queries, exchange banexg.BanExchan
 	} else {
 		curMS = f.deps.timeMS()
 	}
-	_, err = sess.DownOHLCV2DBForRequestedTF(exchange, f.ExSymbol, downTf, f.Timeframe,
-		curMS, f.EndMS, pBar)
+	if f.deps == nil {
+		_, err = sess.DownOHLCV2DBForRequestedTF(exchange, f.ExSymbol, downTf, f.Timeframe,
+			curMS, f.EndMS, pBar)
+	} else {
+		_, err = sess.DownOHLCV2DBForRequestedTFWithOptions(exchange, f.ExSymbol, downTf, f.Timeframe,
+			curMS, f.EndMS, pBar, f.deps.KlineOptions())
+	}
 	return err
 }
 
@@ -1500,7 +1562,7 @@ func (f *TfSeriesLoader) SetNext() {
 	debugLoad := shouldLogBacktestSeriesDebugWithRuntime(f.deps)
 	if debugLoad {
 		log.Debug("load tf bars request",
-			zap.Bool("questdb", orm.IsQuestDB),
+			zap.Bool("questdb", f.questDB()),
 			zap.String("pair", f.Symbol),
 			zap.String("tf", f.Timeframe),
 			zap.Int64("offset_ms", f.offsetMS),
@@ -1508,9 +1570,13 @@ func (f *TfSeriesLoader) SetNext() {
 			zap.Int("batch_size", batchSize))
 	}
 	var fields []string
-	if f.deps == nil || f.symbols != nil {
+	if f.deps != nil && f.deps.Strategies != nil {
+		fields = f.deps.Strategies.CollectKlineSubFields(f.symbols, f.ExSymbol.ID, f.Timeframe)
+	} else if f.deps == nil {
 		fields = strat.CollectKlineSubFieldsWithSymbolState(f.symbols, f.ExSymbol.ID, f.Timeframe)
 	} else {
+		// An explicit data dependency set without a strategy registry is still
+		// isolated; use the base projection instead of consulting legacy jobs.
 		fields = orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil)
 	}
 	var rows []*orm.DataSeries
@@ -1519,10 +1585,23 @@ func (f *TfSeriesLoader) SetNext() {
 	for retry := 0; retry < maxSeriesLoadRetries; retry++ {
 		rows = nil
 		err = nil
-		sess, conn, connErr := orm.Conn(f.context())
+		var sess *orm.Queries
+		var conn *pgxpool.Conn
+		var connErr *errs.Error
+		if f.deps == nil {
+			sess, conn, connErr = orm.Conn(f.context())
+		} else {
+			sess, conn, connErr = f.deps.conn()
+		}
 		if connErr != nil {
 			err = connErr
 		} else {
+			if f.symbols != nil {
+				sess = sess.WithSeriesSymbolState(f.symbols)
+			}
+			if f.deps != nil {
+				sess = sess.WithKlineRuntimeOptions(f.deps.KlineOptions())
+			}
 			if f.allowPhysicalRead {
 				_, rows, err = sess.GetPhysicalSeriesFieldsForConsumer(f.ExSymbol, f.Timeframe, fields,
 					f.physicalConsumerTimeframe,
@@ -1551,7 +1630,7 @@ func (f *TfSeriesLoader) SetNext() {
 		f.nextMS = math.MaxInt64
 		if debugLoad {
 			log.Debug("load tf bars result",
-				zap.Bool("questdb", orm.IsQuestDB),
+				zap.Bool("questdb", f.questDB()),
 				zap.String("pair", f.Symbol),
 				zap.String("tf", f.Timeframe),
 				zap.Int("got", len(rows)),
@@ -1564,7 +1643,7 @@ func (f *TfSeriesLoader) SetNext() {
 	}
 	if debugLoad {
 		log.Debug("load tf bars result",
-			zap.Bool("questdb", orm.IsQuestDB),
+			zap.Bool("questdb", f.questDB()),
 			zap.String("pair", f.Symbol),
 			zap.String("tf", f.Timeframe),
 			zap.Int("got", len(rows)),

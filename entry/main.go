@@ -15,6 +15,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/opt"
+	runtimectx "github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banbot/web"
 	"github.com/banbox/banexg/errs"
@@ -120,6 +121,7 @@ func installSignalHandler() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
+		runtimectx.StopProcesses()
 		if core.StopAll != nil {
 			core.StopAll()
 		}
@@ -129,17 +131,38 @@ func installSignalHandler() {
 }
 
 func newConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
+	return newConfigCommandWithGate(name, help, run, allowDeadlock, true, binders...)
+}
+
+func newRuntimeConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
+	command := newConfigCommandWithGate(name, help, run, allowDeadlock, false, binders...)
+	// Keep the historical marker for command-tree compatibility. Unlike a
+	// legacy command, this callback does not acquire the gate.
+	command.Annotations = map[string]string{legacyGateAnnotation: "1"}
+	return command
+}
+
+func newConfigCommandWithGate(name, help string, run FuncEntry, allowDeadlock, legacyGate bool, binders ...flagBinder) *cobra.Command {
 	args := &config.CmdArgs{}
 	legacy := &legacyCommandFlags{}
 	command := &cobra.Command{
-		Use:         name,
-		Short:       help,
-		Args:        cobra.NoArgs,
-		Annotations: map[string]string{legacyGateAnnotation: "1"},
+		Use:   name,
+		Short: help,
+		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			args.BTStrictSet = command.Flags().Changed("bt-strict")
+			if !legacyGate {
+				args.NetDisable = legacy.netDisable
+				if err := run(args); err != nil {
+					return err
+				}
+				return nil
+			}
 			return runConfigCommand(args, legacy, run)
 		},
+	}
+	if legacyGate {
+		command.Annotations = map[string]string{legacyGateAnnotation: "1"}
 	}
 	bindCommonFlags(args, legacy, command.Flags(), allowDeadlock)
 	for _, bind := range binders {

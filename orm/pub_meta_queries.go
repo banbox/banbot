@@ -30,8 +30,20 @@ func insKlineLockKey(sid int32, timeframe string) string {
 }
 
 func releaseKlineInsertOwnership(sid int32, timeframe string, ts time.Time) error {
-	err := releaseKlineInsertFileLock(klineInsertLockRoot(), sid, timeframe, ts)
+	return (&Queries{}).releaseInsertOwnership(sid, timeframe, ts)
+}
+
+func (q *Queries) insertLockKey(sid int32, timeframe string) string {
 	key := insKlineLockKey(sid, timeframe)
+	if q.storage != nil {
+		key = q.storage.Identity() + "\x00" + key
+	}
+	return key
+}
+
+func (q *Queries) releaseInsertOwnership(sid int32, timeframe string, ts time.Time) error {
+	err := releaseKlineInsertFileLock(q.insertLockRoot(), sid, timeframe, ts)
+	key := q.insertLockKey(sid, timeframe)
 	insKlineLocksmu.Lock()
 	delete(insKlineLocks, key)
 	insKlineLocksmu.Unlock()
@@ -65,10 +77,10 @@ func (q *Queries) AddCalendars(ctx context.Context, arg []AddCalendarsParams) (i
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.addCalendarsPg(ctx, arg)
 	}
-	unlock := LockCompactTableRead("calendars_q")
+	unlock := q.LockCompactTableRead("calendars_q")
 	defer unlock()
 	now := time.Now().UTC()
 	const cols = 4
@@ -90,10 +102,10 @@ func (q *Queries) AddAdjFactors(ctx context.Context, arg []AddAdjFactorsParams) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.addAdjFactorsPg(ctx, arg)
 	}
-	unlock := LockCompactTableRead("adj_factors_q")
+	unlock := q.LockCompactTableRead("adj_factors_q")
 	defer unlock()
 	now := time.Now().UTC()
 	const cols = 5
@@ -112,10 +124,10 @@ func (q *Queries) GetAdjFactors(ctx context.Context, sid int32) ([]*AdjFactor, e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.getAdjFactorsPg(ctx, sid)
 	}
-	unlock := LockCompactTableRead("adj_factors_q")
+	unlock := q.LockCompactTableRead("adj_factors_q")
 	defer unlock()
 	return q.getAdjFactorsQuest(ctx, sid)
 }
@@ -145,10 +157,10 @@ func (q *Queries) DelAdjFactors(ctx context.Context, sid int32) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.delAdjFactorsPg(ctx, sid)
 	}
-	unlock := LockCompactTableRead("adj_factors_q")
+	unlock := q.LockCompactTableRead("adj_factors_q")
 	defer unlock()
 	factors, err := q.getAdjFactorsQuest(ctx, sid)
 	if err != nil {
@@ -161,7 +173,7 @@ func (q *Queries) DelAdjFactors(ctx context.Context, sid int32) error {
 	if err = batchInsertAdjFactorsDeleted(ctx, q, factors, now); err != nil {
 		return err
 	}
-	MarkTableForCompact("adj_factors_q", len(factors))
+	q.MarkTableForCompact("adj_factors_q", len(factors))
 	return nil
 }
 
@@ -181,10 +193,10 @@ func (q *Queries) GetInsKline(ctx context.Context, sid int32, timeframe string) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.getInsKlinePg(ctx, sid, timeframe)
 	}
-	unlock := LockCompactTableRead("ins_kline_q")
+	unlock := q.LockCompactTableRead("ins_kline_q")
 	defer unlock()
 	load := func() (*InsKline, error) {
 		row := q.db.QueryRow(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
@@ -217,10 +229,10 @@ func (q *Queries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.getAllInsKlinesPg(ctx)
 	}
-	unlock := LockCompactTableRead("ins_kline_q")
+	unlock := q.LockCompactTableRead("ins_kline_q")
 	defer unlock()
 	load := func() ([]*InsKline, error) {
 		rows, err := q.db.Query(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
@@ -261,15 +273,15 @@ func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		err := q.delInsKlinePg(ctx, sid, timeframe)
-		releaseErr := releaseKlineInsertOwnership(sid, timeframe, ts)
+		releaseErr := q.releaseInsertOwnership(sid, timeframe, ts)
 		if err != nil {
 			return err
 		}
 		return releaseErr
 	}
-	unlock := LockCompactTableRead("ins_kline_q")
+	unlock := q.LockCompactTableRead("ins_kline_q")
 	defer unlock()
 	write := func() error {
 		_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
@@ -288,11 +300,11 @@ func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, 
 	}
 	// Keep the table access guard through ownership release so a compact cannot
 	// replace the lease table in the middle of this logical operation.
-	releaseErr := releaseKlineInsertOwnership(sid, timeframe, ts)
+	releaseErr := q.releaseInsertOwnership(sid, timeframe, ts)
 	if err != nil {
 		return err
 	}
-	MarkTableForCompact("ins_kline_q", 1)
+	q.MarkTableForCompact("ins_kline_q", 1)
 	return releaseErr
 }
 
@@ -300,34 +312,34 @@ func (q *Queries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (time.
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	key := insKlineLockKey(arg.Sid, arg.Timeframe)
+	key := q.insertLockKey(arg.Sid, arg.Timeframe)
 	insKlineLocksmu.Lock()
 	if _, locked := insKlineLocks[key]; locked {
 		insKlineLocksmu.Unlock()
 		return time.Time{}, nil
 	}
 	ts := time.Now().UTC()
-	if IsQuestDB {
+	if q.isQuestDB() {
 		ts = normalizeQuestTimestamp(ts)
 	}
 	insKlineLocks[key] = ts
 	insKlineLocksmu.Unlock()
-	claimed, err := acquireKlineInsertFileLock(klineInsertLockRoot(), arg.Sid, arg.Timeframe, ts)
+	claimed, err := acquireKlineInsertFileLock(q.insertLockRoot(), arg.Sid, arg.Timeframe, ts)
 	if err != nil || !claimed {
 		insKlineLocksmu.Lock()
 		delete(insKlineLocks, key)
 		insKlineLocksmu.Unlock()
 		return time.Time{}, err
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		claimed, err = q.tryAddInsKlinePg(ctx, arg)
 		if err != nil || !claimed {
-			_ = releaseKlineInsertOwnership(arg.Sid, arg.Timeframe, ts)
+			_ = q.releaseInsertOwnership(arg.Sid, arg.Timeframe, ts)
 			return time.Time{}, err
 		}
 		return ts, nil
 	}
-	unlock := LockCompactTableRead("ins_kline_q")
+	unlock := q.LockCompactTableRead("ins_kline_q")
 	defer unlock()
 
 	write := func() error {
@@ -345,7 +357,7 @@ VALUES ($1, $2, $3, $4, $5, false)`, arg.Sid, arg.Timeframe, ts, arg.StartMs, ar
 		}
 	}
 	if err != nil {
-		_ = releaseKlineInsertOwnership(arg.Sid, arg.Timeframe, ts)
+		_ = q.releaseInsertOwnership(arg.Sid, arg.Timeframe, ts)
 		return time.Time{}, err
 	}
 	return ts, nil
@@ -377,10 +389,10 @@ func (q *Queries) ListExchanges(ctx context.Context) ([]string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.listExchangesPg(ctx)
 	}
-	unlock := LockCompactTableRead("exsymbol_q")
+	unlock := q.LockCompactTableRead("exsymbol_q")
 	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT DISTINCT exchange
 FROM exsymbol_q
@@ -406,10 +418,10 @@ func (q *Queries) ListSymbols(ctx context.Context, exchange string) ([]*ExSymbol
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.listSymbolsPg(ctx, exchange)
 	}
-	unlock := LockCompactTableRead("exsymbol_q")
+	unlock := q.LockCompactTableRead("exsymbol_q")
 	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, coalesce(agg_rules, '')
 FROM exsymbol_q
@@ -463,7 +475,7 @@ func (q *Queries) addSymbolsLocked(ctx context.Context, state *SymbolState, lega
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if IsQuestDB {
+	if q.isQuestDB() {
 		registry, registryErr := allocator.configuredSIDRegistry()
 		if registryErr != nil {
 			return 0, registryErr
@@ -472,18 +484,18 @@ func (q *Queries) addSymbolsLocked(ctx context.Context, state *SymbolState, lega
 			return q.addSymbolsQuestDBWithRegistry(ctx, state, legacy, arg, registry)
 		}
 	}
-	if len(arg) == 0 && !IsQuestDB {
+	if len(arg) == 0 && !q.isQuestDB() {
 		return 0, nil
 	}
 	var err error
 	var recoveryRoot string
-	if IsQuestDB {
+	if q.isQuestDB() {
 		recoveryRoot, err = exSymbolRecoveryRoot(state, legacy)
 		if err != nil {
 			return 0, err
 		}
 	}
-	if IsQuestDB {
+	if q.isQuestDB() {
 		releaseSIDLease, leaseErr := acquireLocalSIDReservationLease(ctx, allocator)
 		if leaseErr != nil {
 			return 0, leaseErr
@@ -494,7 +506,7 @@ func (q *Queries) addSymbolsLocked(ctx context.Context, state *SymbolState, lega
 			}
 		}()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		if err := state.reserveCanonicalSIDs(allocator); err != nil {
 			return 0, err
 		}
@@ -1025,14 +1037,14 @@ func (q *Queries) setListMS(ctx context.Context, state *SymbolState, arg SetList
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		err := q.setListMSPg(ctx, arg)
 		if err == nil {
 			symbolStateOrDefault(state).updateListMS(arg.ID, arg.ListMs, arg.DelistMs, base)
 		}
 		return err
 	}
-	unlock := LockCompactTableRead("exsymbol_q")
+	unlock := q.LockCompactTableRead("exsymbol_q")
 	defer unlock()
 	item, err := waitForQuestExsymbolVisible(ctx, q, arg.ID)
 	if err != nil || item == nil {
@@ -1047,7 +1059,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
 		if err = waitForQuestExsymbolTimestampVisible(ctx, q, item.ID, ts); err != nil {
 			return err
 		}
-		MarkTableForCompact("exsymbol_q", 1)
+		q.MarkTableForCompact("exsymbol_q", 1)
 	}
 	return err
 }
@@ -1067,14 +1079,14 @@ func (q *Queries) setAggRules(ctx context.Context, state *SymbolState, arg SetAg
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		err := q.setAggRulesPg(ctx, arg)
 		if err == nil {
 			symbolStateOrDefault(state).updateAggRules(arg.ID, arg.AggRules, nil)
 		}
 		return err
 	}
-	unlock := LockCompactTableRead("exsymbol_q")
+	unlock := q.LockCompactTableRead("exsymbol_q")
 	defer unlock()
 	item, err := waitForQuestExsymbolVisible(ctx, q, arg.ID)
 	if err != nil || item == nil {
@@ -1089,7 +1101,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
 		if err = waitForQuestExsymbolTimestampVisible(ctx, q, item.ID, ts); err != nil {
 			return err
 		}
-		MarkTableForCompact("exsymbol_q", 1)
+		q.MarkTableForCompact("exsymbol_q", 1)
 	}
 	return err
 }

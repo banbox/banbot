@@ -47,6 +47,13 @@ func klineInsertLockRoot() string {
 	return filepath.Join(dataDir, "locks", "kline_insert")
 }
 
+func (q *Queries) insertLockRoot() string {
+	if q.storage != nil {
+		return filepath.Join(q.storage.ProcessLockRoot(), "kline_insert")
+	}
+	return klineInsertLockRoot()
+}
+
 func klineInsertLockPath(root string, sid int32, timeframe string) string {
 	tfKey := base64.RawURLEncoding.EncodeToString([]byte(timeframe))
 	return filepath.Join(root, strconv.FormatInt(int64(sid), 10)+"_"+tfKey+".lock")

@@ -7,6 +7,22 @@ import (
 	"github.com/banbox/banbot/orm"
 )
 
+func lockInfoJobsWrite(state *State) {
+	if state == nil || state == legacyState {
+		lockInfoJobs.Lock()
+		return
+	}
+	state.infoJobsMu.Lock()
+}
+
+func unlockInfoJobsWrite(state *State) {
+	if state == nil || state == legacyState {
+		lockInfoJobs.Unlock()
+		return
+	}
+	state.infoJobsMu.Unlock()
+}
+
 func DataSubKey(source string, sid int32, tf string) string {
 	source = orm.NormalizeSeriesSource(source)
 	var sidBuf [12]byte
@@ -135,27 +151,56 @@ func CollectKlineSubFields(sid int32, tf string) []string {
 
 // CollectKlineSubFieldsWithSymbolState collects fields using the supplied symbol state.
 func CollectKlineSubFieldsWithSymbolState(symbols *orm.SymbolState, sid int32, tf string) []string {
+	return LegacyState().CollectKlineSubFields(symbols, sid, tf)
+}
+
+// CollectKlineSubFields collects the projection required by jobs owned by
+// this state. Explicit runtimes never inspect the package-level AccInfoJobs
+// registry, so two runtimes can subscribe to different extension columns for
+// the same symbol and timeframe.
+func (s *State) CollectKlineSubFields(symbols *orm.SymbolState, sid int32, tf string) []string {
 	fields := orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil)
-	lockInfoJobs.Lock()
+	if s == nil {
+		return fields
+	}
+	if s != legacyState && symbols == nil {
+		symbols = s.Symbols
+	}
+	var jobsByAccount map[string]map[string]map[string]*StratJob
+	if s == legacyState {
+		lockInfoJobs.Lock()
+		jobsByAccount = s.AccInfoJobs
+	} else {
+		s.infoJobsMu.RLock()
+		jobsByAccount = s.AccInfoJobs
+	}
 	hasInfoJobs := false
-	for _, accJobs := range AccInfoJobs {
+	for _, accJobs := range jobsByAccount {
 		if len(accJobs) > 0 {
 			hasInfoJobs = true
 			break
 		}
 	}
 	if !hasInfoJobs {
-		lockInfoJobs.Unlock()
+		if s == legacyState {
+			lockInfoJobs.Unlock()
+		} else {
+			s.infoJobsMu.RUnlock()
+		}
 		return fields
 	}
 	key := DataSubKey(orm.SeriesSourceKline, sid, tf)
 	seenJobs := make(map[*StratJob]bool)
-	for _, accJobs := range AccInfoJobs {
+	for _, accJobs := range jobsByAccount {
 		for _, job := range accJobs[key] {
 			seenJobs[job] = true
 		}
 	}
-	lockInfoJobs.Unlock()
+	if s == legacyState {
+		lockInfoJobs.Unlock()
+	} else {
+		s.infoJobsMu.RUnlock()
+	}
 	for job := range seenJobs {
 		for _, sub := range CollectDataSubsWithSymbolState(symbols, job) {
 			if sub == nil || sub.ExSymbol == nil || sub.ExSymbol.ID != sid || sub.TimeFrame != tf ||

@@ -8,6 +8,7 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg"
 )
 
@@ -73,6 +74,74 @@ func TestBlockFilter(t *testing.T) {
 		t.Errorf("FAIL BlockFilter, get: %v, expect: %v", out, []string{"ETH/USDT:USDT"})
 	}
 }
+
+func TestGetPairFiltersWithConfigParsesBlockPairsFromRuntimeConfig(t *testing.T) {
+	oldExchange, oldMarket, oldStake := config.Exchange, core.Market, config.StakeCurrency
+	t.Cleanup(func() {
+		config.Exchange, core.Market, config.StakeCurrency = oldExchange, oldMarket, oldStake
+	})
+	config.Exchange = &config.ExchangeConfig{Name: "legacy"}
+	core.Market = banexg.MarketLinear
+	config.StakeCurrency = []string{"BTC"}
+
+	runtimeConfig := &config.Config{
+		Exchange:      &config.ExchangeConfig{Name: "runtime"},
+		MarketType:    banexg.MarketSpot,
+		StakeCurrency: []string{"USDT"},
+		PairMgr:       &config.PairMgrConfig{},
+	}
+	filters, err := GetPairFiltersWithConfig([]*config.CommonPairFilter{{
+		Name:  "BlockFilter",
+		Items: map[string]interface{}{"pairs": []string{"ETH"}},
+	}}, false, runtimeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, ok := filters[0].(*BlockFilter)
+	if !ok || len(block.Pairs) != 1 || block.Pairs[0] != "ETH/USDT" {
+		t.Fatalf("runtime block pairs = %#v, want ETH/USDT", filters)
+	}
+}
+
+func TestRefreshPairListWithRuntimeDepsRequiresSymbolState(t *testing.T) {
+	_, err := RefreshPairListWithRuntimeDeps(&RuntimeDeps{
+		Exchange: &runtimeDepsExchange{},
+	}, 100)
+	if err == nil || err.Code != core.ErrRunTime {
+		t.Fatalf("missing runtime symbol state error = %v, want ErrRunTime", err)
+	}
+}
+
+func TestExplicitAgeFilterDoesNotFallBackToGlobalCoreState(t *testing.T) {
+	previous := core.BanPairsUntil
+	core.BanPairsUntil = map[string]int64{"legacy": 1}
+	t.Cleanup(func() { core.BanPairsUntil = previous })
+
+	filter := &AgeFilter{BaseFilter: BaseFilter{AllowEmpty: true}, Min: 1}
+	_, err := filter.FilterWithRuntimeDeps(&RuntimeDeps{
+		Symbols:  orm.NewSymbolState(),
+		Exchange: &runtimeDepsExchange{},
+	}, []string{"BTC/USDT"}, 100)
+	if err == nil || err.Code != core.ErrRunTime {
+		t.Fatalf("missing runtime core error = %v, want ErrRunTime", err)
+	}
+	if len(core.BanPairsUntil) != 1 || core.BanPairsUntil["legacy"] != 1 {
+		t.Fatalf("global ban state changed on explicit filter failure: %#v", core.BanPairsUntil)
+	}
+}
+
+func TestExplicitVolumeFilterDoesNotFallBackToGlobalConfig(t *testing.T) {
+	filter := &VolumePairFilter{}
+	_, err := filter.FilterWithRuntimeDeps(&RuntimeDeps{
+		Symbols:  orm.NewSymbolState(),
+		Exchange: &runtimeDepsExchange{},
+	}, nil, 100)
+	if err == nil || err.Code != core.ErrBadConfig {
+		t.Fatalf("missing runtime config error = %v, want ErrBadConfig", err)
+	}
+}
+
+type runtimeDepsExchange struct{ banexg.BanExchange }
 
 func TestShuffleFilterUsesSeedDeterministically(t *testing.T) {
 	input := []string{"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX"}

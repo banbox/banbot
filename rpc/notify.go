@@ -107,14 +107,14 @@ func initWebHooks() *errs.Error {
 	return InitRPC()
 }
 
-func initWebHooksForGeneration(generation uint64) *errs.Error {
-	if len(config.RPCChannels) == 0 {
+func buildChannels(cfg *config.Config, accounts map[string]*config.AccountConfig, newTelegram func(string, map[string]interface{}) *Telegram) ([]IWebHook, *errs.Error) {
+	if len(cfg.RPCChannels) == 0 {
 		log.Info("no channels, skip send rpc msg")
-		return nil
+		return nil, nil
 	}
 	// 解析accounts中的rpc配置
 	accChls := make([]map[string]interface{}, 0)
-	for accName, acc := range config.Accounts {
+	for accName, acc := range accounts {
 		if acc.NoTrade {
 			continue
 		}
@@ -122,7 +122,7 @@ func initWebHooksForGeneration(generation uint64) *errs.Error {
 			chl := maps.Clone(rawChl)
 			chlName := utils.GetMapVal(chl, "name", "")
 			if chlName == "" {
-				return errs.NewMsg(core.ErrBadConfig, "`name` is required in accounts.%s.rpc_channels[%d]", accName, i)
+				return nil, errs.NewMsg(core.ErrBadConfig, "`name` is required in accounts.%s.rpc_channels[%d]", accName, i)
 			}
 			chl["_acc"] = accName
 			if _, ok := chl["accounts"]; !ok {
@@ -131,13 +131,13 @@ func initWebHooksForGeneration(generation uint64) *errs.Error {
 			accChls = append(accChls, chl)
 		}
 	}
-	items := maps.Clone(config.RPCChannels)
+	items := maps.Clone(cfg.RPCChannels)
 	for _, chl := range accChls {
 		chlName := utils.PopMapVal(chl, "name", "")
 		acc := utils.PopMapVal(chl, "_acc", "")
 		base, _ := items[chlName]
 		if base == nil {
-			return errs.NewMsg(core.ErrBadConfig, "channel `%s.%s` not exists", acc, chlName)
+			return nil, errs.NewMsg(core.ErrBadConfig, "channel `%s.%s` not exists", acc, chlName)
 		}
 		chlCfg := maps.Clone(base)
 		maps.Copy(chlCfg, chl)
@@ -153,16 +153,26 @@ func initWebHooksForGeneration(generation uint64) *errs.Error {
 		case "mail", "email":
 			channel = NewEmail(name, item)
 		case "telegram":
-			channel = NewTelegram(name, item)
+			channel = newTelegram(name, item)
 		default:
 			err := errs.NewMsg(core.ErrBadConfig, "RPCChannel not support: %v", chlType)
 			stopAndJoinChannels(newChannels)
-			return err
+			return nil, err
 		}
 		if channel.IsDisable() {
 			continue
 		}
 		newChannels = append(newChannels, channel)
+	}
+	return newChannels, nil
+}
+
+func initWebHooksForGeneration(generation uint64) *errs.Error {
+	cfg := config.Data
+	cfg.RPCChannels = config.RPCChannels
+	newChannels, err := buildChannels(&cfg, config.Accounts, NewTelegram)
+	if err != nil {
+		return err
 	}
 	channelsMu.Lock()
 	valid := rpcReady && !rpcClosed && rpcGeneration == generation

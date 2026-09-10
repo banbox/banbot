@@ -36,6 +36,10 @@ type LiveOrderMgr struct {
 	coreState        *core.State
 	orderNamespace   string
 	orderEvents      exg.OrderEventCapability
+	pairVolMap       map[string]*PairValItem
+	volPrices        map[string]*VolPrice
+	lockPairVolMap   deadlock.Mutex
+	lockVolPrices    deadlock.Mutex
 	queue            chan *OdQItem
 	doneKeys         map[string]int64            // Completed Orders 已完成的订单：symbol+orderId
 	exgIdMap         map[string]*ormo.InOutOrder // symbol+orderId: InOutOrder
@@ -158,6 +162,8 @@ func newLiveOrderMgrWithRuntimeDeps(account string, callBack func(od *ormo.InOut
 			callBack: callBack,
 			Account:  account,
 		},
+		pairVolMap:    make(map[string]*PairValItem),
+		volPrices:     make(map[string]*VolPrice),
 		queue:         make(chan *OdQItem, 1000),
 		doneKeys:      map[string]int64{},
 		exgIdMap:      map[string]*ormo.InOutOrder{},
@@ -183,7 +189,11 @@ func newLiveOrderMgrWithRuntimeDeps(account string, callBack func(od *ormo.InOut
 	res.afterExit = makeAfterExit(res)
 	res.exitByMyOrder = exitByMyOrder(res)
 	res.traceExgOrder = traceExgOrder(res)
-	if exg.AfterCreateOrder == nil {
+	if deps != nil {
+		// The explicit runtime owns its callback. The optional exchange capability
+		// keeps the legacy package hook untouched even when another runtime exists.
+		exg.SetOrderCallback(deps.Exchange, logPutOrderWithDump(deps.Dump))
+	} else if exg.AfterCreateOrder == nil {
 		exg.AfterCreateOrder = logPutOrder
 	}
 	return res
@@ -532,7 +542,7 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 	for _, od := range exOdList {
 		exgOdMap[od.ID] = od
 	}
-	orders, pairLastTfs, err := loadOpenOrders(task.ID, o.Account, o.takeOverStrategy())
+	orders, pairLastTfs, err := loadOpenOrders(task.ID, o.Account, o.takeOverStrategy(), o.orderState())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -575,7 +585,7 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		saveOds = append(saveOds, od)
 	}
 	if len(delOds) > 0 || len(saveOds) > 0 {
-		delSaveOrders(o.Account, delOds, saveOds)
+		delSaveOrders(o.Account, delOds, saveOds, o.orderState())
 	}
 	if !o.isContract() {
 		// 非合约市场，无法获取仓位，直接返回
@@ -585,7 +595,7 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		return oldList, nil, nil, nil
 	}
 	historySince := exchangeOrderHistorySince(o.priceNow(), lastOrderMS)
-	recentClosed, err := loadRecentClosedOrders(task.ID, historySince)
+	recentClosed, err := loadRecentClosedOrders(task.ID, historySince, o.orderState())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -700,8 +710,8 @@ func exchangeOrderHistorySince(curMS, lastOrderMS int64) int64 {
 	return max(lastOrderMS, curMS-monthMS)
 }
 
-func loadRecentClosedOrders(taskID, sinceMS int64) ([]*ormo.InOutOrder, *errs.Error) {
-	sess, conn, err := ormo.Conn(orm.DbTrades, false)
+func loadRecentClosedOrders(taskID, sinceMS int64, states ...*ormo.OrderState) ([]*ormo.InOutOrder, *errs.Error) {
+	sess, conn, err := orderStorageState(states).Conn(false)
 	if err != nil {
 		return nil, err
 	}
@@ -713,8 +723,8 @@ func loadRecentClosedOrders(taskID, sinceMS int64) ([]*ormo.InOutOrder, *errs.Er
 	})
 }
 
-func loadOpenOrders(taskID int64, account, takeOverStrategy string) ([]*ormo.InOutOrder, map[string]string, *errs.Error) {
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
+func loadOpenOrders(taskID int64, account, takeOverStrategy string, states ...*ormo.OrderState) ([]*ormo.InOutOrder, map[string]string, *errs.Error) {
+	sess, conn, err := orderStorageState(states).Conn(true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -745,8 +755,15 @@ func loadOpenOrders(taskID int64, account, takeOverStrategy string) ([]*ormo.InO
 	return orders, pairLastTfs, nil
 }
 
-func delSaveOrders(account string, delOds, saves []*ormo.InOutOrder) {
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
+func orderStorageState(states []*ormo.OrderState) *ormo.OrderState {
+	if len(states) > 0 {
+		return states[0]
+	}
+	return nil
+}
+
+func delSaveOrders(account string, delOds, saves []*ormo.InOutOrder, states ...*ormo.OrderState) {
+	sess, conn, err := orderStorageState(states).Conn(true)
 	if err != nil {
 		log.Warn("get conn fail", zap.Error(err))
 		return
@@ -1741,7 +1758,11 @@ func (o *LiveOrderMgr) watchMyTradesLoopDone(done <-chan struct{},
 							zap.Duration("after", retryDelay))
 						continue
 					}
-					orm.AddDumpRow(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
+					if o.runtimeDeps {
+						o.dump.Add(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
+					} else {
+						orm.AddDumpRow(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
+					}
 					if trade.State != banexg.OdStatusOpen {
 						o.handleMyTrade(trade)
 					}
@@ -2370,7 +2391,7 @@ func (o *LiveOrderMgr) forceDelOd(od *ormo.InOutOrder, err *errs.Error) {
 	if err != nil {
 		log.Error("del order", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
 	}
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
+	sess, conn, err := o.orderState().Conn(true)
 	if err != nil {
 		log.Error("get db sess fail", zap.String("acc", o.Account), zap.Error(err))
 		return
@@ -2867,6 +2888,16 @@ func (o *LiveOrderMgr) getLimitPrice(pair string, waitSecs int) (float64, float6
 }
 
 func (o *LiveOrderMgr) getRuntimeLimitPrice(pair string, waitSecs int) (float64, float64) {
+	key := fmt.Sprintf("%s_%s", pair, strconv.Itoa(waitSecs))
+	nowMS := o.priceNow()
+	if o.volPrices != nil {
+		o.lockVolPrices.Lock()
+		cache, ok := o.volPrices[key]
+		o.lockVolPrices.Unlock()
+		if ok && cache.ExpireMS > nowMS {
+			return cache.BuyPrice, cache.SellPrice
+		}
+	}
 	avgVol, lastVol, err := o.getPairMinsVol(pair, 5)
 	if err != nil {
 		log.Error("getPairMinsVol fail for getLimitPrice", zap.String("acc", o.Account),
@@ -2881,6 +2912,16 @@ func (o *LiveOrderMgr) getRuntimeLimitPrice(pair string, waitSecs int) (float64,
 	}
 	buyPrice, _, _ := book.AvgPrice(banexg.OdSideBuy, depth)
 	sellPrice, _, _ := book.AvgPrice(banexg.OdSideSell, depth)
+	if o.volPrices != nil {
+		expMS := min(3000, int64(waitSecs)*100)
+		o.lockVolPrices.Lock()
+		o.volPrices[key] = &VolPrice{
+			BuyPrice:  buyPrice,
+			SellPrice: sellPrice,
+			ExpireMS:  o.priceNow() + expMS,
+		}
+		o.lockVolPrices.Unlock()
+	}
 	return buyPrice, sellPrice
 }
 
@@ -2930,6 +2971,16 @@ func (o *LiveOrderMgr) getPairMinsVol(pair string, num int) (float64, float64, *
 	if o == nil || !o.runtimeDeps {
 		return getPairMinsVol(pair, num)
 	}
+	cacheKey := fmt.Sprintf("%s_%v", pair, num)
+	curMs := o.priceNow()
+	if o.pairVolMap != nil {
+		o.lockPairVolMap.Lock()
+		cache, ok := o.pairVolMap[cacheKey]
+		o.lockPairVolMap.Unlock()
+		if ok && cache.ExpireMS > curMs {
+			return cache.AvgVol, cache.LastVol, nil
+		}
+	}
 	exchange := o.exchangeClient()
 	if exchange == nil {
 		return 0, 0, errs.NewMsg(core.ErrExgNotInit, "exchange is required to load volume for %s", pair)
@@ -2938,11 +2989,44 @@ func (o *LiveOrderMgr) getPairMinsVol(pair string, num int) (float64, float64, *
 	if err != nil {
 		return 0, 0, err
 	}
-	_, rows, err := orm.AutoFetchSeries(exchange, exs, "1m", 0, 0, num, false, nil)
+	storage := o.walletDeps.Storage
+	if storage == nil && o.symbols != nil {
+		storage = o.symbols.Storage()
+	}
+	if storage == nil {
+		return 0, 0, errs.NewMsg(core.ErrDbConnFail, "runtime storage is required to load volume for %s", pair)
+	}
+	ctx := context.Background()
+	if o.runtimeCore != nil && o.runtimeCore.Context() != nil {
+		ctx = o.runtimeCore.Context()
+	}
+	sess, conn, connErr := storage.Conn(ctx)
+	if connErr != nil {
+		return 0, 0, connErr
+	}
+	defer conn.Release()
+	var cfg *config.Config
+	if o.walletDeps.Config != nil {
+		cfg = o.walletDeps.Config.View()
+	}
+	options := orm.NewKlineRuntimeOptions(o.runtimeCore, cfg, curMs, storage)
+	_, rows, err := sess.AutoFetchSeriesWithOptions(exchange, exs, "1m", 0, 0, num, false, nil, options)
 	if err != nil {
+		if o.pairVolMap != nil {
+			expireMS := utils2.AlignTfMSecs(curMs+60000, 60000)
+			o.lockPairVolMap.Lock()
+			o.pairVolMap[cacheKey] = &PairValItem{ExpireMS: expireMS}
+			o.lockPairVolMap.Unlock()
+		}
 		return 0, 0, err
 	}
 	if len(rows) == 0 {
+		if o.pairVolMap != nil {
+			expireMS := utils2.AlignTfMSecs(curMs+60000, 60000)
+			o.lockPairVolMap.Lock()
+			o.pairVolMap[cacheKey] = &PairValItem{ExpireMS: expireMS}
+			o.lockPairVolMap.Unlock()
+		}
 		return 0, 0, nil
 	}
 	var sumVol float64
@@ -2951,6 +3035,12 @@ func (o *LiveOrderMgr) getPairMinsVol(pair string, num int) (float64, float64, *
 		sumVol += vol
 	}
 	lastVol, _ := rows[len(rows)-1].VolumeValue()
+	if o.pairVolMap != nil {
+		expireMS := utils2.AlignTfMSecs(curMs+60000, 60000)
+		o.lockPairVolMap.Lock()
+		o.pairVolMap[cacheKey] = &PairValItem{AvgVol: sumVol / float64(len(rows)), LastVol: lastVol, ExpireMS: expireMS}
+		o.lockPairVolMap.Unlock()
+	}
 	return sumVol / float64(len(rows)), lastVol, nil
 }
 
@@ -3389,7 +3479,10 @@ func (odMgr *LiveOrderMgr) verifyAccountTriggerOds() {
 	var copyTriggers = make(map[string]map[int64]*ormo.InOutOrder)
 	lock.Lock()
 	for key, val := range triggerOds {
-		copyTriggers[key] = val
+		copyTriggers[key] = make(map[int64]*ormo.InOutOrder, len(val))
+		for orderID, order := range val {
+			copyTriggers[key][orderID] = order
+		}
 	}
 	lock.Unlock()
 	var zeros []string
@@ -4421,9 +4514,29 @@ func joinLiveOdMgr(deps *RuntimeDeps) {
 }
 
 func logPutOrder(arg *exg.PutOrderRes) *errs.Error {
+	if arg == nil {
+		return nil
+	}
 	if arg.Err != nil {
 		return arg.Err
 	}
-	orm.AddDumpRow(orm.DumpApiOrder, arg.Symbol+arg.Order.ID, arg)
+	if arg.Order != nil {
+		orm.AddDumpRow(orm.DumpApiOrder, arg.Symbol+arg.Order.ID, arg)
+	}
 	return nil
+}
+
+func logPutOrderWithDump(sink *orm.DumpSink) func(*exg.PutOrderRes) *errs.Error {
+	return func(arg *exg.PutOrderRes) *errs.Error {
+		if arg == nil {
+			return nil
+		}
+		if arg.Err != nil {
+			return arg.Err
+		}
+		if sink != nil && arg.Order != nil {
+			sink.Add(orm.DumpApiOrder, arg.Symbol+arg.Order.ID, arg)
+		}
+		return nil
+	}
 }

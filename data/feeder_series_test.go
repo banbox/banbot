@@ -1,6 +1,7 @@
 package data
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -178,6 +179,56 @@ func TestMergeKlineFieldRowsPreservesExplicitNull(t *testing.T) {
 	if len(got) != 1 || got[0] == row || !ok || value != nil {
 		t.Fatalf("merge overwrote explicit NULL: %v", got)
 	}
+}
+
+func TestRuntimeKlineProjectionUsesOwnedStrategyState(t *testing.T) {
+	const sid int32 = 88
+	const tf = "1m"
+	makeState := func(field string) *strat.State {
+		state := strat.NewState()
+		job := &strat.StratJob{
+			Symbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"},
+			Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+				return []*strat.DataSub{{Source: orm.SeriesSourceKline, ExSymbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"}, TimeFrame: tf, Fields: []string{field}}}
+			}},
+		}
+		state.InfoJobs("default")[strat.DataSubKey(orm.SeriesSourceKline, sid, tf)] = map[string]*strat.StratJob{"job": job}
+		return state
+	}
+
+	first := makeState("open_interest_a")
+	second := makeState("open_interest_b")
+	oldInfo := strat.AccInfoJobs
+	strat.AccInfoJobs = map[string]map[string]map[string]*strat.StratJob{
+		"global": {
+			strat.DataSubKey(orm.SeriesSourceKline, sid, tf): {
+				"global": {Symbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"}, Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+					return []*strat.DataSub{{Source: orm.SeriesSourceKline, ExSymbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"}, TimeFrame: tf, Fields: []string{"global_field"}}}
+				}}},
+			},
+		},
+	}
+	t.Cleanup(func() { strat.AccInfoJobs = oldInfo })
+
+	check := func(name string, state *strat.State, field string, value any) {
+		t.Helper()
+		var requested []string
+		got, err := enrichStoredKlineFieldsWithRuntimeDepsAndReader(&RuntimeDeps{Strategies: state},
+			&orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"}, tf,
+			[]*orm.DataSeries{{TimeMS: 100, EndMS: 60_100, Values: map[string]any{"close": 3.0}}},
+			func(_ *orm.ExSymbol, _ string, fields []string, _, _ int64) ([]*orm.DataSeries, *errs.Error) {
+				requested = append([]string(nil), fields...)
+				return []*orm.DataSeries{{TimeMS: 100, Values: map[string]any{field: value}}}, nil
+			})
+		if err != nil || len(got) != 1 || got[0].Values[field] != value {
+			t.Fatalf("%s projection result=(%v,%v), want %v", name, got, err, value)
+		}
+		if !slices.Contains(requested, field) || slices.Contains(requested, "global_field") {
+			t.Fatalf("%s reader fields=%v, want owned %q without global field", name, requested, field)
+		}
+	}
+	check("first", first, "open_interest_a", int64(7))
+	check("second", second, "open_interest_b", nil)
 }
 
 func TestEnrichKlineFieldRowsMergesCompleteStoredRow(t *testing.T) {

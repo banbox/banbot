@@ -38,8 +38,8 @@ type WalletRuntimeLifecycle interface {
 	OnCloseWait(func())
 }
 
-type walletExchangeLifecycle interface {
-	Exchange() banexg.BanExchange
+type walletRuntimeDepsLifecycle interface {
+	WalletRuntimeDeps() RuntimeDeps
 }
 
 type ItemWallet struct {
@@ -63,6 +63,7 @@ type BanWallets struct {
 	runtimeClock    *btime.ClockState
 	runtimePrices   *com.PriceState
 	runtimeConfig   *config.Snapshot
+	runtimeAccounts map[string]*config.AccountConfig
 	runtimeBacktest bool
 	runtimeBTLegacy bool
 	runtimeBTStrict bool
@@ -173,17 +174,15 @@ func InitFakeWalletsWithRuntimeDeps(deps RuntimeDeps, symbols ...string) *BanWal
 	}
 	account := deps.DefaultAccount
 	if account == "" {
-		account = config.DefAcc
+		account = "default"
 	}
 	wallet := deps.Trading.Wallet(account)
+	wallet.bindRuntimeDeps(deps)
 	var amounts map[string]float64
 	if deps.Config != nil {
 		if cfg := deps.Config.View(); cfg != nil {
 			amounts = cfg.WalletAmounts
 		}
-	}
-	if amounts == nil {
-		amounts = config.WalletAmounts
 	}
 	updates := make(map[string]float64)
 	if len(symbols) == 0 {
@@ -251,6 +250,7 @@ func (w *BanWallets) bindRuntimeDeps(deps RuntimeDeps) {
 		w.runtimePrices = deps.Market.Prices
 	}
 	w.runtimeConfig = deps.Config
+	w.runtimeAccounts = deps.AccountConfigs()
 	w.runtimeBacktest = deps.Core != nil && deps.Core.BackTestMode
 	w.runtimeBTLegacy = false
 	w.runtimeBTStrict = false
@@ -279,11 +279,33 @@ func (w *BanWallets) symbolByID(id int32) *orm.ExSymbol {
 	return orm.GetSymbolByID(id)
 }
 
+func (w *BanWallets) envReal() bool {
+	if w.runtimeBound {
+		return w.runtimeCore != nil && w.runtimeCore.EnvReal
+	}
+	return core.EnvReal
+}
+
+func (w *BanWallets) stableBacktest() bool {
+	if w.runtimeBound {
+		return w.runtimeBacktest && (w.runtimeBTLegacy || w.runtimeBTStrict)
+	}
+	return stableWalletBacktest()
+}
+
 func (w *BanWallets) priceSymbolParts(symbol string) ([4]string, *errs.Error) {
 	if w != nil && w.runtimeBound {
 		return exg.ResolveRuntimePriceSymbol(w.runtimeExg, symbol)
 	}
 	return exg.ResolvePriceSymbol(exg.Default, symbol)
+}
+
+func (w *BanWallets) settlementSymbolParts(symbol string) ([4]string, *errs.Error) {
+	if w.runtimeBound {
+		return w.priceSymbolParts(symbol)
+	}
+	base, quote, settle, expiry := core.SplitSymbol(symbol)
+	return [4]string{base, quote, settle, expiry}, nil
 }
 
 func (w *BanWallets) snapshotItems() []*ormo.WalletSnapshotItem {
@@ -400,10 +422,7 @@ func saveWalletSnapshotWithRuntimeDeps(deps *RuntimeDeps, account string, timeMS
 		return errs.NewMsg(core.ErrRunTime, "task not found for account %s", account)
 	}
 	if timeMS == 0 {
-		timeMS = btime.TimeMS()
-		if deps.Clock != nil {
-			timeMS = deps.Clock.TimeMS()
-		}
+		timeMS = deps.Clock.TimeMS()
 	}
 	cfg := deps.Trading.snapshotConfig()
 	cfg.lastSnapshotLock.Lock()
@@ -426,11 +445,11 @@ func saveWalletSnapshotWithRuntimeDeps(deps *RuntimeDeps, account string, timeMS
 		}
 	}
 	summary := buildWalletSnapshotSummaryWithCurrency(wallets, stakeCurrency)
-	if err := ormo.SaveWalletSnapshot(task.ID, account, timeMS, items, summary); err != nil {
+	if err := ormo.SaveWalletSnapshot(task.ID, account, timeMS, items, summary, deps.Orders); err != nil {
 		return err
 	}
 	if cfg.compactCfg != nil {
-		maybeCompactWalletSnapshots(task.ID, account, timeMS, cfg.compactCfg)
+		maybeCompactWalletSnapshots(task.ID, account, timeMS, cfg.compactCfg, deps.Orders)
 	}
 	return nil
 }
@@ -442,7 +461,7 @@ func SaveDryRunWalletSnapshot(account string, timeMS int64, force bool) *errs.Er
 	return saveWalletSnapshot(account, timeMS, force, &dryRunSnapshotCfg)
 }
 
-func maybeCompactWalletSnapshots(taskID int64, account string, nowMS int64, cfg *walletSnapshotCompactCfg) {
+func maybeCompactWalletSnapshots(taskID int64, account string, nowMS int64, cfg *walletSnapshotCompactCfg, states ...*ormo.OrderState) {
 	if nowMS == 0 {
 		nowMS = btime.TimeMS()
 	}
@@ -463,20 +482,20 @@ func maybeCompactWalletSnapshots(taskID int64, account string, nowMS int64, cfg 
 	if endMS <= 0 {
 		return
 	}
-	compactedUntilMS, err := ormo.LoadWalletSnapshotCompactUntil(taskID, account)
+	compactedUntilMS, err := ormo.LoadWalletSnapshotCompactUntil(taskID, account, states...)
 	if err != nil {
 		log.Warn("load wallet snapshot compact time fail", zap.Error(err), zap.String("account", account))
 		return
 	}
 	startMS := compactedUntilMS
 	if startMS == 0 {
-		earliestMS, err := ormo.FindEarliestWalletSnapshotTime(taskID, account, endMS)
+		earliestMS, err := ormo.FindEarliestWalletSnapshotTime(taskID, account, endMS, states...)
 		if err != nil {
 			log.Warn("load wallet snapshot earliest time fail", zap.Error(err), zap.String("account", account))
 			return
 		}
 		if earliestMS == 0 {
-			if err := ormo.SaveWalletSnapshotCompactUntil(taskID, account, endMS); err != nil {
+			if err := ormo.SaveWalletSnapshotCompactUntil(taskID, account, endMS, states...); err != nil {
 				log.Warn("save wallet snapshot compact time fail", zap.Error(err), zap.String("account", account))
 			}
 			return
@@ -486,11 +505,11 @@ func maybeCompactWalletSnapshots(taskID int64, account string, nowMS int64, cfg 
 	if startMS >= endMS {
 		return
 	}
-	if _, err := ormo.CompactWalletSnapshotsByHour(taskID, account, startMS, endMS); err != nil {
+	if _, err := ormo.CompactWalletSnapshotsByHour(taskID, account, startMS, endMS, states...); err != nil {
 		log.Warn("compact wallet snapshots fail", zap.Error(err), zap.String("account", account))
 		return
 	}
-	if err := ormo.SaveWalletSnapshotCompactUntil(taskID, account, endMS); err != nil {
+	if err := ormo.SaveWalletSnapshotCompactUntil(taskID, account, endMS, states...); err != nil {
 		log.Warn("save wallet snapshot compact time fail", zap.Error(err), zap.String("account", account))
 	}
 }
@@ -527,7 +546,7 @@ func RestoreDryRunWalletSnapshotWithRuntimeDeps(deps RuntimeDeps) bool {
 	if task == nil {
 		return false
 	}
-	items, _, err := ormo.LoadLatestWalletSnapshot(task.ID, deps.DefaultAccount)
+	items, _, err := ormo.LoadLatestWalletSnapshot(task.ID, deps.DefaultAccount, deps.Orders)
 	if err != nil || len(items) == 0 {
 		if err != nil {
 			log.Warn("load runtime dry_run wallet snapshot fail, fallback to config wallet", zap.Error(err))
@@ -596,6 +615,12 @@ func StartLiveWalletSnapshotsWithRuntimeDeps(deps RuntimeDeps, lifecycle WalletR
 }
 
 func startLiveWalletSnapshotsForDeps(deps *RuntimeDeps, lifecycle WalletRuntimeLifecycle) {
+	if lifecycle == nil {
+		if deps != nil {
+			log.Error("runtime wallet snapshots require a lifecycle")
+		}
+		return
+	}
 	if deps != nil && deps.Trading == nil {
 		log.Error("runtime wallet snapshots require trading state")
 		return
@@ -612,13 +637,16 @@ func startLiveWalletSnapshotsForDeps(deps *RuntimeDeps, lifecycle WalletRuntimeL
 	}
 	// The runtime's Core.EnvReal is authoritative for this explicit path; the
 	// legacy SaveLiveWalletSnapshots guard intentionally remains unchanged.
-	accounts := config.Accounts
+	var accounts map[string]*config.AccountConfig
+	var timeMS, interval int64
 	if deps != nil {
 		accounts = deps.AccountConfigs()
-	}
-	timeMS := btime.TimeMS()
-	if deps != nil && deps.Clock != nil {
 		timeMS = deps.Clock.TimeMS()
+		interval = deps.Trading.snapshotConfig().intervalMS
+	} else {
+		accounts = config.Accounts
+		timeMS = btime.TimeMS()
+		interval = liveSnapshotCfg.intervalMS
 	}
 	for account, cfg := range accounts {
 		if cfg == nil || cfg.NoTrade {
@@ -632,10 +660,6 @@ func startLiveWalletSnapshotsForDeps(deps *RuntimeDeps, lifecycle WalletRuntimeL
 			saveWalletSnapshot(account, timeMS, true, &liveSnapshotCfg)
 		}
 	}
-	interval := liveSnapshotCfg.intervalMS
-	if deps != nil {
-		interval = deps.Trading.snapshotConfig().intervalMS
-	}
 	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
 	stop := make(chan struct{})
 	var wait sync.WaitGroup
@@ -646,9 +670,11 @@ func startLiveWalletSnapshotsForDeps(deps *RuntimeDeps, lifecycle WalletRuntimeL
 		for {
 			select {
 			case <-ticker.C:
-				timeMS := btime.TimeMS()
-				if deps != nil && deps.Clock != nil {
+				var timeMS int64
+				if deps != nil {
 					timeMS = deps.Clock.TimeMS()
+				} else {
+					timeMS = btime.TimeMS()
 				}
 				for account, cfg := range accounts {
 					if cfg == nil || cfg.NoTrade {
@@ -709,14 +735,8 @@ func (iw *ItemWallet) Used() float64 {
 
 func sumWalletMap(values map[string]float64) float64 {
 	var total float64
-	if stableWalletBacktest() {
-		for _, key := range slices.Sorted(maps.Keys(values)) {
-			total += values[key]
-		}
-		return total
-	}
-	for _, value := range values {
-		total += value
+	for _, key := range slices.Sorted(maps.Keys(values)) {
+		total += values[key]
 	}
 	return total
 }
@@ -898,7 +918,14 @@ func (w *BanWallets) CostAva(odKey string, symbol string, amount float64, negati
 	wallet.lock.Lock()
 	srcAmount := wallet.Available
 	if minRate == 0 {
-		minRate = config.MinOpenRate
+		if w.runtimeBound {
+			minRate = 0.5
+			if w.runtimeConfig != nil && w.runtimeConfig.View().MinOpenRate != 0 {
+				minRate = w.runtimeConfig.View().MinOpenRate
+			}
+		} else {
+			minRate = config.MinOpenRate
+		}
 	}
 	var realCost float64
 	if srcAmount >= amount || negative {
@@ -1062,13 +1089,31 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 	if od.Enter.Amount != 0 {
 		price := od.Enter.Average
 		if price == 0 {
-			if core.LiveMode {
-				err := com.EnsureLatestPrice(od.Symbol)
+			var liveMode bool
+			if w.runtimeBound {
+				liveMode = w.runtimeCore != nil && w.runtimeCore.LiveMode
+			} else {
+				liveMode = core.LiveMode
+			}
+			if liveMode {
+				var err *errs.Error
+				if w.runtimeBound {
+					if w.markPrice(od.Symbol) <= 0 {
+						err = w.runtimePrices.RefreshLatestPriceAt(w.runtimeClock.TimeMS(), w.runtimeExg, od.Symbol)
+					}
+				} else {
+					err = com.EnsureLatestPrice(od.Symbol)
+				}
 				if err != nil {
 					return 0, err
 				}
 			}
-			curPrice := com.GetPriceSafe(od.Symbol, od.Enter.Side)
+			var curPrice float64
+			if w.runtimeBound {
+				curPrice = w.runtimePrices.GetPriceSafeExpAt(w.runtimeClock.TimeMS(), od.Symbol, od.Enter.Side, com.PriceExpireMS)
+			} else {
+				curPrice = com.GetPriceSafe(od.Symbol, od.Enter.Side)
+			}
 			if curPrice < 0 {
 				return 0, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", od.Symbol)
 			}
@@ -1115,7 +1160,7 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 			quoteMargin *= od.Leverage
 		}
 
-		od.QuoteCost, err = exg.PrecCost(nil, od.Symbol, quoteMargin)
+		od.QuoteCost, err = exg.PrecCost(w.runtimeExg, od.Symbol, quoteMargin)
 		if err != nil {
 			return 0, err
 		}
@@ -1134,7 +1179,7 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 }
 
 func (w *BanWallets) ConfirmOdEnter(od *ormo.InOutOrder, enterPrice float64) {
-	if core.EnvReal {
+	if w.envReal() {
 		return
 	}
 	exs := w.symbolByID(int32(od.Sid))
@@ -1145,8 +1190,13 @@ func (w *BanWallets) ConfirmOdEnter(od *ormo.InOutOrder, enterPrice float64) {
 	quoteAmount := enterPrice * subOd.Amount
 	curFee := subOd.FeeQuote
 
-	baseCode, quoteCode, _, _ := core.SplitSymbol(exs.Symbol)
-	if core.IsContract {
+	parts, err := w.settlementSymbolParts(exs.Symbol)
+	if err != nil {
+		log.Error("resolve wallet symbol", zap.Error(err))
+		return
+	}
+	baseCode, quoteCode := parts[0], parts[1]
+	if banexg.IsContract(exs.Market) {
 		// Futures contracts only lock the fixed currency and do not involve the increase of base currency.
 		// 期货合约，只锁定定价币，不涉及base币的增加
 		quoteAmount /= od.Leverage
@@ -1165,7 +1215,7 @@ func (w *BanWallets) ConfirmOdEnter(od *ormo.InOutOrder, enterPrice float64) {
 	}
 }
 func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
-	if core.EnvReal {
+	if w.envReal() {
 		return
 	}
 	if !(baseAmount > 0) {
@@ -1179,7 +1229,12 @@ func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 		// 期货合约，不涉及base币的变化。退出订单时，对锁定的定价币平仓释放
 		return
 	}
-	baseCode, quoteCode, _, _ := core.SplitSymbol(exs.Symbol)
+	parts, err := w.settlementSymbolParts(exs.Symbol)
+	if err != nil {
+		log.Error("resolve wallet symbol", zap.Error(err))
+		return
+	}
+	baseCode, quoteCode := parts[0], parts[1]
 	if od.Short {
 		// Spot short orders are sold from the frozen part of the quote, calculated to the available part of the quote, and canceled from the pending unfilled part of the base.
 		// 现货空单，从quote的frozen卖，计算到quote的available，从base的pending未成交部分取消
@@ -1212,7 +1267,7 @@ func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 }
 
 func (w *BanWallets) ConfirmOdExit(od *ormo.InOutOrder, exitPrice float64) {
-	if core.EnvReal {
+	if w.envReal() {
 		return
 	}
 	exs := w.symbolByID(int32(od.Sid))
@@ -1221,7 +1276,12 @@ func (w *BanWallets) ConfirmOdExit(od *ormo.InOutOrder, exitPrice float64) {
 	}
 	subOd := od.Exit
 	curFee := subOd.FeeQuote
-	baseCode, quoteCode, _, _ := core.SplitSymbol(exs.Symbol)
+	parts, err := w.settlementSymbolParts(exs.Symbol)
+	if err != nil {
+		log.Error("resolve wallet symbol", zap.Error(err))
+		return
+	}
+	baseCode, quoteCode := parts[0], parts[1]
 	odKey := od.Key()
 	if banexg.IsContract(exs.Market) {
 		//Futures contracts do not involve changes in base currency. When exiting the order, the locked pricing currency will be closed and released.
@@ -1328,11 +1388,13 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 			// The total loss exceeds the total assets and the position is liquidated.
 			// 总亏损超过总资产，爆仓
 			// Backtests without recharge settle frozen margin during normal cleanup.
-			backtest := core.BackTestMode
-			chargeOnBomb := config.ChargeOnBomb
+			var backtest, chargeOnBomb bool
 			if w.runtimeBound {
 				backtest = w.runtimeBacktest
 				chargeOnBomb = w.runtimeCharge
+			} else {
+				backtest = core.BackTestMode
+				chargeOnBomb = config.ChargeOnBomb
 			}
 			if !backtest || chargeOnBomb {
 				wallet.Reset()
@@ -1342,12 +1404,13 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 	}
 
 	var exchange banexg.BanExchange
-	marginAddRate := config.MarginAddRate
+	var marginAddRate float64
 	if w.runtimeBound {
 		exchange = w.runtimeExg
 		marginAddRate = w.runtimeMargin
 	} else {
 		exchange = exg.Default
+		marginAddRate = config.MarginAddRate
 	}
 	for _, od := range odList {
 		if od.Enter == nil || od.Enter.Filled == 0 {
@@ -1439,10 +1502,7 @@ func (w *BanWallets) markPrice(symbol string) float64 {
 		if w.runtimePrices == nil {
 			return -1
 		}
-		nowMS := btime.TimeMS()
-		if w.runtimeClock != nil {
-			nowMS = w.runtimeClock.TimeMS()
-		}
+		nowMS := w.runtimeClock.TimeMS()
 		return w.runtimePrices.GetPriceSafeExpAt(nowMS, symbol, "", com.PriceExpireMS)
 	}
 	return walletMarkPrice(symbol)
@@ -1453,6 +1513,9 @@ func stableWalletBacktest() bool {
 }
 
 func (w *BanWallets) GetAmountByLegal(symbol string, legalCost float64) float64 {
+	if w.runtimeBound {
+		return legalCost / w.markPrice(symbol)
+	}
 	return legalCost / com.GetPrice(symbol, "")
 }
 
@@ -1484,12 +1547,12 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 	var skips []string
 
 	keys := maps.Keys(data)
-	if stableWalletBacktest() {
+	if w.stableBacktest() {
 		keys = slices.Values(slices.Sorted(keys))
 	}
 	for key := range keys {
 		item := data[key]
-		var price = com.GetPriceSafe(key, "")
+		price := w.markPrice(key)
 		if price == -1 {
 			skips = append(skips, key)
 			continue
@@ -1578,7 +1641,7 @@ Returns the value of the given currency against fiat currency. Returns all curre
 */
 func (w *BanWallets) FiatValue(withUpol bool, symbols ...string) float64 {
 	if len(symbols) == 0 {
-		if config.StrictBacktest() {
+		if w.stableBacktest() {
 			symbols = slices.Sorted(maps.Keys(w.Items))
 		} else {
 			for symbol := range w.Items {
@@ -1593,7 +1656,11 @@ func (w *BanWallets) FiatValue(withUpol bool, symbols ...string) float64 {
 		if !exists {
 			continue
 		}
-		totalVal += item.FiatValue(withUpol)
+		if w.runtimeBound {
+			totalVal += item.Total(withUpol) * w.runtimePrices.GetPriceSafeExpAt(w.runtimeClock.TimeMS(), symbol, "", com.Day10MSecs)
+		} else {
+			totalVal += item.FiatValue(withUpol)
+		}
 	}
 
 	return totalVal
@@ -1615,7 +1682,7 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 		if cfg == nil || cfg.StakePct <= 0 {
 			return
 		}
-		acc := cfg.Accounts[w.Account]
+		acc := w.runtimeAccounts[w.Account]
 		if acc == nil {
 			return
 		}
@@ -1631,10 +1698,7 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 				zap.Float64("amount", pctAmt))
 			acc.StakePctAmt = pctAmt
 		} else if math.Abs(pctAmt/acc.StakePctAmt-1) >= 0.2 {
-			dateMS := btime.TimeMS()
-			if w.runtimeClock != nil {
-				dateMS = w.runtimeClock.TimeMS()
-			}
+			dateMS := w.runtimeClock.TimeMS()
 			date := btime.ToDateStr(dateMS, core.DefaultDateFmt)
 			log.Debug("runtime stake amount changed by stake_pct", zap.String("d", date),
 				zap.Float64("old", acc.StakePctAmt), zap.Float64("new", pctAmt))
@@ -1707,9 +1771,11 @@ func UpdateWalletByBalances(wallets *BanWallets, item *banexg.Balances) {
 			wallets.Items[coin] = record
 		}
 		record.lock.Lock()
-		isContract := core.IsContract
+		var isContract bool
 		if wallets.runtimeBound {
 			isContract = wallets.runtimeCore != nil && banexg.IsContract(wallets.runtimeCore.Market)
+		} else {
+			isContract = core.IsContract
 		}
 		if isContract {
 			record.Pendings["*"] = it.Used
@@ -1797,29 +1863,32 @@ func WatchLiveBalances(lifecycles ...WalletRuntimeLifecycle) {
 }
 
 func watchLiveBalancesWithRuntime(lifecycle WalletRuntimeLifecycle) {
+	provider, ok := lifecycle.(walletRuntimeDepsLifecycle)
+	if !ok {
+		log.Error("watch balance requires runtime dependencies")
+		return
+	}
+	deps := provider.WalletRuntimeDeps()
+	if deps.Trading == nil || deps.Exchange == nil {
+		log.Error("watch balance requires runtime trading state and exchange")
+		return
+	}
 	ctx := lifecycle.Context()
 	var done <-chan struct{}
 	if ctx != nil {
 		done = ctx.Done()
 	}
-	var exchange banexg.BanExchange
-	if provider, ok := lifecycle.(walletExchangeLifecycle); ok {
-		exchange = provider.Exchange()
-	}
-	if exchange == nil {
-		log.Error("watch balance requires a runtime exchange")
-		return
-	}
 	var wait sync.WaitGroup
-	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
+	for account, cfg := range deps.AccountConfigs() {
+		if cfg == nil || cfg.NoTrade {
 			continue
 		}
-		wallets := getRuntimeWallets(account)
+		wallets := deps.Trading.Wallet(account)
+		wallets.bindRuntimeDeps(deps)
 		if wallets.IsWatch {
 			continue
 		}
-		out, err := exchange.WatchBalance(map[string]interface{}{
+		out, err := deps.Exchange.WatchBalance(map[string]interface{}{
 			banexg.ParamAccount: account,
 		})
 		if err != nil {

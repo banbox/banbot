@@ -998,6 +998,21 @@ func btFactors(options *btFactorsOptions) error {
 }
 
 func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[string][]*ormo.InOutOrder, *errs.Error) {
+	return cutOrdersInRange(orders, startMS, endMS, nil)
+}
+
+// CutOrdersInRangeWithRuntimeDeps performs the same replay-window clipping
+// with an explicit symbol catalog and storage owner.
+func CutOrdersInRangeWithRuntimeDeps(orders []*ormo.InOutOrder, startMS, endMS int64, deps biz.RuntimeDeps) (map[string][]*ormo.InOutOrder, *errs.Error) {
+	return cutOrdersInRange(orders, startMS, endMS, NewReportDeps(deps))
+}
+
+func cutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64, deps *ReportDeps) (map[string][]*ormo.InOutOrder, *errs.Error) {
+	if deps != nil {
+		if err := deps.validateSeries(); err != nil {
+			return nil, err
+		}
+	}
 	pairOrders := make(map[string][]*ormo.InOutOrder)
 	cloneIds := make(map[int64]bool)
 	for _, od := range orders {
@@ -1030,8 +1045,27 @@ func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[stri
 			}
 		}
 		tfMSecs := int64(minTfSecs * 1000)
-		exs := orm.GetExSymbol2(core.ExgName, core.Market, pair)
-		_, rows, err := orm.GetSeries(exs, minTF, startMS, endMS, 1, false)
+		var exs *orm.ExSymbol
+		var err *errs.Error
+		if deps == nil {
+			exs = orm.GetExSymbol2(core.ExgName, core.Market, pair)
+		} else {
+			exs, err = deps.symbol(pair)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var rows []*orm.DataSeries
+		if deps == nil {
+			_, rows, err = orm.GetSeries(exs, minTF, startMS, endMS, 1, false)
+		} else {
+			queries, release, queryErr := deps.queries()
+			if queryErr != nil {
+				return nil, queryErr
+			}
+			_, rows, err = queries.GetSeries(exs, minTF, startMS, endMS, 1, false)
+			release()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1043,7 +1077,16 @@ func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[stri
 			return nil, errs.New(core.ErrInvalidBars, err_)
 		}
 		openMS := rows[0].TimeMS
-		_, rows, err = orm.GetSeries(exs, minTF, 0, endMS, 1, false)
+		if deps == nil {
+			_, rows, err = orm.GetSeries(exs, minTF, 0, endMS, 1, false)
+		} else {
+			queries, release, queryErr := deps.queries()
+			if queryErr != nil {
+				return nil, queryErr
+			}
+			_, rows, err = queries.GetSeries(exs, minTF, 0, endMS, 1, false)
+			release()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1104,6 +1147,37 @@ func BuildBtResultWithSession(args *config.CmdArgs, session LegacySession) *errs
 	return buildBtResult(args)
 }
 
+// BuildBtResultWithRuntimeDeps builds a report from an explicit runtime. The
+// legacy command above remains the compatibility facade; this path does not
+// install or restore process-wide config, wallet, order, price, or core state.
+func BuildBtResultWithRuntimeDeps(args *config.CmdArgs, deps biz.RuntimeDeps) *errs.Error {
+	if args == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "build backtest result args are required")
+	}
+	reportDeps := NewReportDeps(deps)
+	if err := reportDeps.validateResult(); err != nil {
+		return err
+	}
+	cfg := reportDeps.configView()
+	parsePath := reportDeps.Config.ParsePath
+	if args.InPath == "" {
+		return errs.NewMsg(errs.CodeRunTime, "-in for orders.gob is required")
+	}
+	outDir := parsePath(args.OutPath)
+	if outDir != "" {
+		if err := utils.EnsureDir(outDir, 0755); err != nil {
+			return errs.New(errs.CodeIOWriteFail, err)
+		}
+		args.Logfile = filepath.Join(outDir, "out.log")
+	}
+	orders, err := ormo.LoadOrdersGob(parsePath(args.InPath))
+	if err != nil {
+		return err
+	}
+	_, err = calcBtResultWithDeps(orders, cfg.WalletAmounts, outDir, reportDeps)
+	return err
+}
+
 func buildBtResult(args *config.CmdArgs) *errs.Error {
 	core.SetRunMode(core.RunModeBackTest)
 	if args.InPath == "" {
@@ -1145,6 +1219,9 @@ type backtestCompareRuntime struct {
 	nextMS         map[string]int64
 	nextLock       *sync.Mutex
 	defaultAccount string
+	orders         *ormo.OrderState
+	explicit       bool
+	dateStr        func(int64, string) string
 }
 
 func legacyBacktestCompareRuntime() *backtestCompareRuntime {
@@ -1160,6 +1237,8 @@ func legacyBacktestCompareRuntime() *backtestCompareRuntime {
 		nextMS:         odNextMS,
 		nextLock:       &odNextLock,
 		defaultAccount: config.DefAcc,
+		explicit:       false,
+		dateStr:        btime.ToDateStr,
 	}
 }
 
@@ -1180,6 +1259,7 @@ func runtimeBacktestCompareRuntime(deps biz.RuntimeDeps) (*backtestCompareRuntim
 	if lang == "" {
 		lang = "en-US"
 	}
+	reportDeps := NewReportDeps(deps)
 	return &backtestCompareRuntime{
 		cfg:            cfg,
 		dataDir:        func() string { return deps.Config.DataDir },
@@ -1192,6 +1272,9 @@ func runtimeBacktestCompareRuntime(deps biz.RuntimeDeps) (*backtestCompareRuntim
 		nextMS:         make(map[string]int64),
 		nextLock:       &sync.Mutex{},
 		defaultAccount: firstRuntimeAccount(cfg.Accounts),
+		orders:         deps.Orders,
+		explicit:       true,
+		dateStr:        reportDeps.dateStr,
 	}, true
 }
 
@@ -1227,7 +1310,7 @@ func BacktestToCompareWithRuntime(deps biz.RuntimeDeps) {
 
 func backtestToCompare(runtime *backtestCompareRuntime) {
 	if runtime == nil || runtime.cfg == nil || runtime.exchange == nil || runtime.nowMS == nil ||
-		runtime.nextMS == nil || runtime.nextLock == nil {
+		runtime.nextMS == nil || runtime.nextLock == nil || runtime.dateStr == nil {
 		return
 	}
 	cfg := runtime.cfg.Clone()
@@ -1260,7 +1343,20 @@ func backtestToCompare(runtime *backtestCompareRuntime) {
 	runtime.nextLock.Lock()
 	defer runtime.nextLock.Unlock()
 	curMS := runtime.nowMS()
-	liveOpens, lock := ormo.GetOpenODs(account)
+	var liveOpens map[int64]*ormo.InOutOrder
+	var lock interface {
+		Lock()
+		Unlock()
+	}
+	if runtime.explicit {
+		if runtime.orders == nil {
+			log.Error("runtime backtest comparison requires order state")
+			return
+		}
+		liveOpens, lock = runtime.orders.GetOpenODs(account)
+	} else {
+		liveOpens, lock = ormo.GetOpenODs(account)
+	}
 	minStartMS := curMS
 	liveOpenQtys := make(map[int64]*ormo.InOutOrder)
 	lock.Lock()
@@ -1442,11 +1538,11 @@ func sendPosCompareReport(runtime *backtestCompareRuntime, matchOpens []string, 
 	var b strings.Builder
 	b.WriteString(liveBadOpen + ":\n")
 	for key, stamp := range liveMore {
-		b.WriteString(fmt.Sprintf("\t%s should close at %s\n", key, btime.ToDateStr(stamp, core.DefaultDateFmt)))
+		b.WriteString(fmt.Sprintf("\t%s should close at %s\n", key, runtime.dateStr(stamp, core.DefaultDateFmt)))
 	}
 	b.WriteString("\n" + liveNoOpen + ":\n")
 	for key, stamp := range btMore {
-		b.WriteString(fmt.Sprintf("\t%s should open at %s\n", key, btime.ToDateStr(stamp, core.DefaultDateFmt)))
+		b.WriteString(fmt.Sprintf("\t%s should open at %s\n", key, runtime.dateStr(stamp, core.DefaultDateFmt)))
 	}
 	liveOpenMatch := langMsg("live_open_match", "开仓匹配")
 	b.WriteString("\n" + liveOpenMatch + ":\n")

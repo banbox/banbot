@@ -535,8 +535,18 @@ func StartCpuProfile(path string, port int) *errs.Error {
 }
 
 func NewCronScheduler(exp string) (cron.Schedule, error) {
+	return NewCronSchedulerWithLocation(exp, btime.LocShow)
+}
+
+// NewCronSchedulerWithLocation parses a cron expression against an explicit
+// location. Runtime-owned callers should use this form so schedule alignment
+// does not depend on process-wide display settings.
+func NewCronSchedulerWithLocation(exp string, location *time.Location) (cron.Schedule, error) {
+	if location == nil {
+		location = time.UTC
+	}
 	parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
-	return parser.Parse(exp, btime.LocShow)
+	return parser.Parse(exp, location)
 }
 
 func CronAlign(scd cron.Schedule, stamp time.Time) time.Time {

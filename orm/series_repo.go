@@ -18,6 +18,7 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
@@ -47,7 +48,57 @@ func DefaultSeriesRepo() SeriesRepo {
 	return defaultSeriesRepo
 }
 
-type dbSeriesRepo struct{}
+// NewSeriesRepo creates a repository bound to an explicit Storage owner. A
+// nil Storage is retained as an invalid explicit dependency; legacy callers
+// must use DefaultSeriesRepo so they cannot accidentally cross runtime owners.
+func NewSeriesRepo(storage *Storage) SeriesRepo {
+	return &dbSeriesRepo{storage: storage, explicit: true}
+}
+
+type dbSeriesRepo struct {
+	storage  *Storage
+	explicit bool
+}
+
+func (r *dbSeriesRepo) conn(ctx context.Context) (*Queries, *pgxpool.Conn, *errs.Error) {
+	if r != nil && r.explicit && r.storage == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "series repository storage is required")
+	}
+	if r != nil && r.storage != nil {
+		return r.storage.Conn(ctx)
+	}
+	return Conn(ctx)
+}
+
+func (r *dbSeriesRepo) isQuestDB() bool {
+	if r != nil && r.explicit && r.storage == nil {
+		return false
+	}
+	if r != nil && r.storage != nil {
+		return r.storage.IsQuestDB()
+	}
+	return IsQuestDB
+}
+
+func (r *dbSeriesRepo) readLock(ctx context.Context, table string) (func(), error) {
+	if r != nil && r.explicit && r.storage == nil {
+		return func() {}, nil
+	}
+	if r != nil && r.storage != nil {
+		return acquireQuestTableReadLockForStorage(ctx, table, r.storage)
+	}
+	return acquireQuestTableReadLock(ctx, table)
+}
+
+func (r *dbSeriesRepo) writeLock(ctx context.Context, table string) (func(), bool, error) {
+	if r != nil && r.explicit && r.storage == nil {
+		return func() {}, false, nil
+	}
+	if r != nil && r.storage != nil {
+		return acquireQuestTableWriteLockForStorage(ctx, table, r.storage)
+	}
+	return acquireQuestTableWriteLock(ctx, table)
+}
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -57,17 +108,28 @@ type rowScanner interface {
 // table with table replacement. The process lease is acquired first so the
 // in-process lock cannot be held while waiting for another process.
 func acquireQuestTableReadLock(ctx context.Context, table string) (func(), error) {
+	return acquireQuestTableReadLockAtRoot(ctx, table, IsQuestDB, compactProcessLockRootFn())
+}
+
+func acquireQuestTableReadLockForStorage(ctx context.Context, table string, storage *Storage) (func(), error) {
+	if storage == nil {
+		return acquireQuestTableReadLock(ctx, table)
+	}
+	return acquireQuestTableReadLockAtRoot(ctx, table, storage.IsQuestDB(), storage.ProcessLockRoot())
+}
+
+func acquireQuestTableReadLockAtRoot(ctx context.Context, table string, questDB bool, root string) (func(), error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !questDB {
 		return func() {}, nil
 	}
-	releaseProcess, err := acquireCompactProcessSharedLock(ctx, compactProcessLockRootFn(), table)
+	releaseProcess, err := acquireCompactProcessSharedLock(ctx, root, table)
 	if err != nil {
 		return nil, err
 	}
-	tableLock := cptState.getTableLock(table)
+	tableLock := compactStateForRoot(root).getTableLock(table)
 	tableLock.RLock()
 	return func() {
 		tableLock.RUnlock()
@@ -78,17 +140,28 @@ func acquireQuestTableReadLock(ctx context.Context, table string) (func(), error
 }
 
 func acquireQuestTableWriteLock(ctx context.Context, table string) (func(), bool, error) {
+	return acquireQuestTableWriteLockAtRoot(ctx, table, IsQuestDB, compactProcessLockRootFn())
+}
+
+func acquireQuestTableWriteLockForStorage(ctx context.Context, table string, storage *Storage) (func(), bool, error) {
+	if storage == nil {
+		return acquireQuestTableWriteLock(ctx, table)
+	}
+	return acquireQuestTableWriteLockAtRoot(ctx, table, storage.IsQuestDB(), storage.ProcessLockRoot())
+}
+
+func acquireQuestTableWriteLockAtRoot(ctx context.Context, table string, questDB bool, root string) (func(), bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !questDB {
 		return func() {}, true, nil
 	}
-	releaseProcess, acquired, err := tryAcquireCompactProcessExclusiveLock(compactProcessLockRootFn(), table)
+	releaseProcess, acquired, err := tryAcquireCompactProcessExclusiveLock(root, table)
 	if err != nil || !acquired {
 		return nil, acquired, err
 	}
-	tableLock := cptState.getTableLock(table)
+	tableLock := compactStateForRoot(root).getTableLock(table)
 	tableLock.Lock()
 	return func() {
 		tableLock.Unlock()
@@ -105,13 +178,13 @@ func (r *dbSeriesRepo) EnsureSeriesTable(ctx context.Context, info *SeriesInfo) 
 	if err := validateSeriesInfo(info); err != nil {
 		return err
 	}
-	q, conn, err := Conn(ctx)
+	q, conn, err := r.conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
 	binding := normalizedSeriesBinding(info.Binding)
-	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	unlock, lockErr := r.readLock(ctx, binding.Table)
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -120,7 +193,7 @@ func (r *dbSeriesRepo) EnsureSeriesTable(ctx context.Context, info *SeriesInfo) 
 }
 
 func (r *dbSeriesRepo) ensureSeriesTableLocked(ctx context.Context, q *Queries, info *SeriesInfo) *errs.Error {
-	sqlText := buildSeriesTableDDL(info)
+	sqlText := buildSeriesTableDDLForBackend(info, q.isQuestDB())
 	if _, err_ := q.db.Exec(ctx, sqlText); err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
@@ -137,13 +210,13 @@ func (r *dbSeriesRepo) InsertSeriesBatch(ctx context.Context, info *SeriesInfo, 
 	if err := validateSeriesInfo(info); err != nil {
 		return err
 	}
-	q, conn, err := Conn(ctx)
+	q, conn, err := r.conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
 	binding := normalizedSeriesBinding(info.Binding)
-	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	unlock, lockErr := r.readLock(ctx, binding.Table)
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -156,7 +229,7 @@ func (r *dbSeriesRepo) InsertSeriesBatch(ctx context.Context, info *SeriesInfo, 
 
 func (r *dbSeriesRepo) insertSeriesBatch(ctx context.Context, q *Queries, info *SeriesInfo, rows []*DataRecord) *errs.Error {
 	binding := normalizedSeriesBinding(info.Binding)
-	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	unlock, lockErr := acquireQuestTableReadLockAtRoot(ctx, binding.Table, q.isQuestDB(), q.processLockRoot())
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -172,7 +245,7 @@ func (r *dbSeriesRepo) insertSeriesBatchLocked(ctx context.Context, q *Queries, 
 		quoteIdent(binding.EndColumn),
 	}
 	var questVisible map[int32]map[int64]*DataRecord
-	if IsQuestDB {
+	if q.isQuestDB() {
 		questVisible = make(map[int32]map[int64]*DataRecord)
 	}
 	for _, field := range binding.Fields {
@@ -196,7 +269,7 @@ func (r *dbSeriesRepo) insertSeriesBatchLocked(ctx context.Context, q *Queries, 
 			if row.EndMS <= row.TimeMS {
 				return errs.NewMsg(core.ErrBadConfig, "series row end_ms must be greater than time_ms")
 			}
-			if IsQuestDB {
+			if q.isQuestDB() {
 				rowsByTime := questVisible[row.Sid]
 				if rowsByTime == nil {
 					rowsByTime = make(map[int64]*DataRecord)
@@ -217,7 +290,7 @@ func (r *dbSeriesRepo) insertSeriesBatchLocked(ctx context.Context, q *Queries, 
 			sb.WriteByte(')')
 
 			args = append(args, row.Sid)
-			if IsQuestDB {
+			if q.isQuestDB() {
 				args = append(args, time.UnixMilli(row.TimeMS).UTC())
 			} else {
 				args = append(args, row.TimeMS)
@@ -232,7 +305,7 @@ func (r *dbSeriesRepo) insertSeriesBatchLocked(ctx context.Context, q *Queries, 
 				args = append(args, normVal)
 			}
 		}
-		if !IsQuestDB {
+		if !q.isQuestDB() {
 			assigns := buildSeriesConflictAssignments(binding)
 			fmt.Fprintf(&sb, " ON CONFLICT (%s, %s) DO UPDATE SET %s",
 				quoteIdent(binding.SIDColumn), quoteIdent(binding.TimeColumn), strings.Join(assigns, ", "))
@@ -241,7 +314,7 @@ func (r *dbSeriesRepo) insertSeriesBatchLocked(ctx context.Context, q *Queries, 
 			return NewDbErr(core.ErrDbExecFail, err_)
 		}
 	}
-	if IsQuestDB {
+	if q.isQuestDB() {
 		for sid, rowsByTime := range questVisible {
 			pending := make([]*DataRecord, 0, len(rowsByTime))
 			var wantTimeMS int64
@@ -300,13 +373,13 @@ func (r *dbSeriesRepo) WriteSeriesBatch(ctx context.Context, info *SeriesInfo, s
 	if err := validateSeriesInfo(info); err != nil {
 		return err
 	}
-	q, conn, err := Conn(ctx)
+	q, conn, err := r.conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
 	binding := normalizedSeriesBinding(info.Binding)
-	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	unlock, lockErr := r.readLock(ctx, binding.Table)
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -316,7 +389,7 @@ func (r *dbSeriesRepo) WriteSeriesBatch(ctx context.Context, info *SeriesInfo, s
 	}
 	write := q
 	var tx pgx.Tx
-	if !IsQuestDB {
+	if !r.isQuestDB() {
 		var txErr error
 		tx, write, txErr = q.begin(ctx)
 		if txErr != nil {
@@ -358,7 +431,7 @@ func seriesRowEnds(ctx context.Context, q *Queries, info *SeriesInfo, sid int32,
 	}
 	startVal, endVal := any(rows[0].TimeMS), any(rows[len(rows)-1].TimeMS)
 	timeProjection := quoteIdent(binding.TimeColumn)
-	if IsQuestDB {
+	if q.isQuestDB() {
 		startVal = time.UnixMilli(rows[0].TimeMS).UTC()
 		endVal = time.UnixMilli(rows[len(rows)-1].TimeMS).UTC()
 		timeProjection = fmt.Sprintf("cast(%s as long)/1000", quoteIdent(binding.TimeColumn))
@@ -393,14 +466,14 @@ func (r *dbSeriesRepo) QuerySeriesRange(ctx context.Context, info *SeriesInfo, s
 	if err := validateSeriesInfo(info); err != nil {
 		return nil, err
 	}
-	q, conn, err := Conn(ctx)
+	q, conn, err := r.conn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Release()
 
 	binding := normalizedSeriesBinding(info.Binding)
-	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	unlock, lockErr := r.readLock(ctx, binding.Table)
 	if lockErr != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, lockErr)
 	}
@@ -408,7 +481,7 @@ func (r *dbSeriesRepo) QuerySeriesRange(ctx context.Context, info *SeriesInfo, s
 	var covered []MSRange
 	timeExpr := quoteIdent(binding.TimeColumn)
 	startArg, endArg := any(startMS), any(endMS)
-	if IsQuestDB {
+	if q.isQuestDB() {
 		timeExpr = fmt.Sprintf("cast(%s as long)/1000", quoteIdent(binding.TimeColumn))
 		startArg = startMS * 1000
 		endArg = endMS * 1000
@@ -428,13 +501,13 @@ func (r *dbSeriesRepo) QuerySeriesRange(ctx context.Context, info *SeriesInfo, s
 	}
 	for _, field := range binding.Fields {
 		colExpr := quoteIdent(field.Name)
-		if !IsQuestDB && field.Type == "json" {
+		if !q.isQuestDB() && field.Type == "json" {
 			colExpr = fmt.Sprintf("%s::text", colExpr)
 		}
 		selectCols = append(selectCols, colExpr)
 	}
 	timeFilter := fmt.Sprintf("%s >= $2 AND %s < $3", quoteIdent(binding.TimeColumn), quoteIdent(binding.TimeColumn))
-	if IsQuestDB {
+	if q.isQuestDB() {
 		timeFilter = fmt.Sprintf("cast(%s as long) >= $2 AND cast(%s as long) < $3",
 			quoteIdent(binding.TimeColumn), quoteIdent(binding.TimeColumn))
 	}
@@ -446,7 +519,7 @@ func (r *dbSeriesRepo) QuerySeriesRange(ctx context.Context, info *SeriesInfo, s
 		quoteIdent(binding.TimeColumn),
 	)
 	args := []any{sid, startArg, endArg}
-	if limit > 0 && !IsQuestDB {
+	if limit > 0 && !q.isQuestDB() {
 		sqlText += " LIMIT $4"
 		args = append(args, limit)
 	}
@@ -462,11 +535,11 @@ func (r *dbSeriesRepo) QuerySeriesRange(ctx context.Context, info *SeriesInfo, s
 		if err_ != nil {
 			return nil, NewDbErr(core.ErrDbReadFail, err_)
 		}
-		if IsQuestDB && !seriesRangeCovered(rec.TimeMS, covered) {
+		if q.isQuestDB() && !seriesRangeCovered(rec.TimeMS, covered) {
 			continue
 		}
 		out = append(out, rec)
-		if IsQuestDB && limit > 0 && len(out) >= limit {
+		if q.isQuestDB() && limit > 0 && len(out) >= limit {
 			break
 		}
 	}
@@ -486,14 +559,14 @@ func (r *dbSeriesRepo) DeleteSeriesRange(ctx context.Context, info *SeriesInfo, 
 	if err := validateSeriesInfo(info); err != nil {
 		return err
 	}
-	q, conn, err := Conn(ctx)
+	q, conn, err := r.conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
 
 	binding := normalizedSeriesBinding(info.Binding)
-	if !IsQuestDB {
+	if !r.isQuestDB() {
 		tx, write, err_ := q.begin(ctx)
 		if err_ != nil {
 			return NewDbErr(core.ErrDbExecFail, err_)
@@ -516,7 +589,7 @@ func (r *dbSeriesRepo) DeleteSeriesRange(ctx context.Context, info *SeriesInfo, 
 		}
 		return nil
 	}
-	unlock, acquired, lockErr := acquireQuestTableWriteLock(ctx, binding.Table)
+	unlock, acquired, lockErr := r.writeLock(ctx, binding.Table)
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -547,13 +620,13 @@ func (r *dbSeriesRepo) MissingSeriesRanges(ctx context.Context, info *SeriesInfo
 	if err := validateSeriesInfo(info); err != nil {
 		return nil, err
 	}
-	q, conn, err := Conn(ctx)
+	q, conn, err := r.conn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Release()
 	binding := normalizedSeriesBinding(info.Binding)
-	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	unlock, lockErr := r.readLock(ctx, binding.Table)
 	if lockErr != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, lockErr)
 	}
@@ -638,7 +711,7 @@ func questRewriteSnapshotRowCount(counts map[int32]int64) int64 {
 }
 
 func verifyQuestRewriteSourceStable(ctx context.Context, q *Queries, table string, sourceTxn int64) error {
-	stableTxn, err := waitForCompactWalApplied(ctx, q.db, table)
+	stableTxn, err := waitForCompactWalAppliedAtRoot(ctx, q.db, table, q.processLockRoot())
 	if err != nil {
 		return err
 	}
@@ -653,7 +726,7 @@ func rewriteQuestSeriesTableLocked(ctx context.Context, q *Queries, info *Series
 	tmpTable := fmt.Sprintf("%s_rewrite_%d_%06d", binding.Table, time.Now().UnixNano(), rand.Intn(1000000))
 	backupTable := fmt.Sprintf("%s_backup_%d_%06d", binding.Table, time.Now().UnixNano(), rand.Intn(1000000))
 	predicate := questSeriesRewritePredicate(binding, sid, covered)
-	sourceTxn, err := waitForCompactWalApplied(ctx, q.db, binding.Table)
+	sourceTxn, err := waitForCompactWalAppliedAtRoot(ctx, q.db, binding.Table, q.processLockRoot())
 	if err != nil {
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
@@ -706,13 +779,13 @@ func (r *dbSeriesRepo) UpdateSeriesRange(ctx context.Context, info *SeriesInfo, 
 	if err := validateSeriesInfo(info); err != nil {
 		return err
 	}
-	q, conn, err := Conn(ctx)
+	q, conn, err := r.conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
 	binding := normalizedSeriesBinding(info.Binding)
-	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	unlock, lockErr := r.readLock(ctx, binding.Table)
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -730,13 +803,13 @@ func (r *dbSeriesRepo) UpdateSeriesCoverage(ctx context.Context, info *SeriesInf
 	if err := validateSeriesInfo(info); err != nil {
 		return err
 	}
-	q, conn, err := Conn(ctx)
+	q, conn, err := r.conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
 	binding := normalizedSeriesBinding(info.Binding)
-	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	unlock, lockErr := r.readLock(ctx, binding.Table)
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -763,17 +836,26 @@ func (r *dbSeriesRepo) GetSeriesRange(ctx context.Context, info *SeriesInfo, sid
 	if err := validateSeriesInfo(info); err != nil {
 		return 0, 0, err
 	}
-	q, conn, err := Conn(ctx)
+	q, conn, err := r.conn(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer conn.Release()
 	binding := normalizedSeriesBinding(info.Binding)
-	if !IsQuestDB {
-		start, stop := getKlineRangePg(ctx, sid, binding.Table, info.TimeFrame)
-		return start, stop, nil
+	if !q.isQuestDB() {
+		row := q.db.QueryRow(ctx, `SELECT min(start_ms), max(stop_ms)
+FROM sranges
+WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND has_data = true`, sid, binding.Table, info.TimeFrame)
+		var start, stop *int64
+		if err := row.Scan(&start, &stop); err != nil {
+			return 0, 0, NewDbErr(core.ErrDbReadFail, err)
+		}
+		if start == nil || stop == nil {
+			return 0, 0, nil
+		}
+		return *start, *stop, nil
 	}
-	unlock, lockErr := acquireQuestTableReadLock(ctx, binding.Table)
+	unlock, lockErr := r.readLock(ctx, binding.Table)
 	if lockErr != nil {
 		return 0, 0, NewDbErr(core.ErrDbReadFail, lockErr)
 	}
@@ -1006,7 +1088,7 @@ func waitForQuestSeriesCoverageDeletedWithQueries(ctx context.Context, q *Querie
 }
 
 func questSeriesCoveredRangesFromDB(ctx context.Context, q *Queries, table, timeframe string, sid int32, startMS, endMS int64) ([]MSRange, error) {
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	spans, err := q.loadSRangesSpansFromDB(ctx, sid, table, timeframe, startMS, endMS)
 	if err != nil {
@@ -1022,7 +1104,7 @@ func questSeriesCoveredRangesFromDB(ctx context.Context, q *Queries, table, time
 }
 
 func questSeriesDeleteMarkerVisible(ctx context.Context, q *Queries, table, timeframe string, sid int32, startMS, endMS int64) (bool, error) {
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
 FROM (
@@ -1056,16 +1138,20 @@ WHERE coalesce(is_deleted, false) = false`,
 }
 
 func buildSeriesTableDDL(info *SeriesInfo) string {
+	return buildSeriesTableDDLForBackend(info, IsQuestDB)
+}
+
+func buildSeriesTableDDLForBackend(info *SeriesInfo, questDB bool) string {
 	binding := normalizedSeriesBinding(info.Binding)
 	colDefs := []string{
 		fmt.Sprintf("%s INT NOT NULL", quoteIdent(binding.SIDColumn)),
-		fmt.Sprintf("%s %s NOT NULL", quoteIdent(binding.TimeColumn), seriesTimeSQLType()),
-		fmt.Sprintf("%s %s NOT NULL", quoteIdent(binding.EndColumn), seriesSQLType("int")),
+		fmt.Sprintf("%s %s NOT NULL", quoteIdent(binding.TimeColumn), seriesTimeSQLTypeForBackend(questDB)),
+		fmt.Sprintf("%s %s NOT NULL", quoteIdent(binding.EndColumn), seriesSQLTypeForBackend("int", questDB)),
 	}
 	for _, field := range binding.Fields {
-		colDefs = append(colDefs, fmt.Sprintf("%s %s", quoteIdent(field.Name), seriesSQLType(field.Type)))
+		colDefs = append(colDefs, fmt.Sprintf("%s %s", quoteIdent(field.Name), seriesSQLTypeForBackend(field.Type, questDB)))
 	}
-	if IsQuestDB {
+	if questDB {
 		return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) timestamp(%s) PARTITION BY %s WAL DEDUP UPSERT KEYS(%s, %s)",
 			quoteIdent(binding.Table),
 			strings.Join(colDefs, ", "),
@@ -1176,14 +1262,22 @@ func normalizedSeriesBinding(binding SeriesBinding) SeriesBinding {
 }
 
 func seriesTimeSQLType() string {
-	if IsQuestDB {
+	return seriesTimeSQLTypeForBackend(IsQuestDB)
+}
+
+func seriesTimeSQLTypeForBackend(questDB bool) string {
+	if questDB {
 		return "TIMESTAMP"
 	}
 	return "BIGINT"
 }
 
 func seriesSQLType(fieldType string) string {
-	if IsQuestDB {
+	return seriesSQLTypeForBackend(fieldType, IsQuestDB)
+}
+
+func seriesSQLTypeForBackend(fieldType string, questDB bool) string {
+	if questDB {
 		switch fieldType {
 		case "float":
 			return "DOUBLE"

@@ -6,11 +6,13 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/utils"
 )
@@ -62,6 +64,26 @@ func TestLogStateUsesMonotonicEventTimeForPlots(t *testing.T) {
 		t.Fatalf("backwards plot changed terminal state: real %v orders %v", result.Plots.Real[1], result.Plots.OdNum[1])
 	}
 	assertPlotLengths(t, result.Plots, 2)
+}
+
+func TestExplicitReportDepsDoNotUseLegacyStorageOrOrders(t *testing.T) {
+	previous := ormo.HistODs
+	legacyOrder := &ormo.InOutOrder{}
+	ormo.HistODs = []*ormo.InOutOrder{legacyOrder}
+	t.Cleanup(func() { ormo.HistODs = previous })
+
+	result := &BTResult{reportDeps: &ReportDeps{}}
+	if got := result.historyOrders(); got != nil {
+		t.Fatalf("explicit report history orders = %v, want nil without OrderState", got)
+	}
+
+	deps := &ReportDeps{Symbols: orm.NewSymbolStateWithAllocator(
+		orm.NewSIDAllocatorForStorage("explicit:"+t.Name(), t.TempDir()),
+	)}
+	_, _, err := deps.queries()
+	if err == nil || !strings.Contains(err.Error(), "report storage is required") {
+		t.Fatalf("explicit report query error = %v, want fail-closed storage error", err)
+	}
 }
 
 func TestNormalizeBacktestResultRangeUsesConfiguredWindow(t *testing.T) {

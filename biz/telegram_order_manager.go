@@ -10,15 +10,33 @@ import (
 )
 
 // TelegramOrderManager 实现 rpc.OrderManagerInterface 接口
-type TelegramOrderManager struct{}
+type TelegramOrderManager struct {
+	deps     *RuntimeDeps
+	commands *RemoteCommandService
+}
 
 // NewTelegramOrderManager 创建 Telegram 订单管理器
 func NewTelegramOrderManager() *TelegramOrderManager {
-	return &TelegramOrderManager{}
+	return &TelegramOrderManager{commands: defaultRemoteCommandService}
+}
+
+func NewTelegramOrderManagerWithRuntimeDeps(deps RuntimeDeps) *TelegramOrderManager {
+	return &TelegramOrderManager{deps: &deps, commands: NewRemoteCommandServiceWithRuntimeDeps(deps)}
 }
 
 // GetActiveOrders 获取活跃订单列表
 func (m *TelegramOrderManager) GetActiveOrders(account string) ([]*rpc.OrderInfo, error) {
+	if m.deps != nil {
+		openOrders, lock := m.deps.Orders.GetOpenODs(account)
+		lock.Lock()
+		defer lock.Unlock()
+		result := make([]*rpc.OrderInfo, 0, len(openOrders))
+		for _, order := range openOrders {
+			price := m.deps.Market.Prices.GetPriceSafeExpAt(m.deps.Clock.TimeMS(), order.Symbol, "", com.Day10MSecs)
+			result = append(result, buildTelegramOrderInfo(order, account, price))
+		}
+		return result, nil
+	}
 	sess, conn, err := ormo.Conn(orm.DbTrades, false)
 	if err != nil {
 		return nil, err
@@ -78,7 +96,7 @@ func buildTelegramOrderInfo(order *ormo.InOutOrder, account string, currentPrice
 
 // CloseOrder 平仓指定订单
 func (m *TelegramOrderManager) CloseOrder(account string, orderID int64) error {
-	_, err := CloseBotOrdersRemote(RemoteCommand{
+	_, err := m.commands.CloseOrders(RemoteCommand{
 		Source:    RemoteSourceTelegram,
 		Actor:     "telegram",
 		Account:   account,
@@ -91,7 +109,7 @@ func (m *TelegramOrderManager) CloseOrder(account string, orderID int64) error {
 
 // CloseAllOrders 平仓所有订单
 func (m *TelegramOrderManager) CloseAllOrders(account string) (int, int, error) {
-	res, err := CloseBotOrdersRemote(RemoteCommand{
+	res, err := m.commands.CloseOrders(RemoteCommand{
 		Source:    RemoteSourceTelegram,
 		Actor:     "telegram",
 		Account:   account,
@@ -106,7 +124,7 @@ func (m *TelegramOrderManager) CloseAllOrders(account string) (int, int, error) 
 }
 
 func (m *TelegramOrderManager) DisableTrading(account string, hours int) (int64, error) {
-	res, err := RunRemoteCommand(RemoteCommand{
+	res, err := m.commands.Run(RemoteCommand{
 		Source:       RemoteSourceTelegram,
 		Actor:        "telegram",
 		Account:      account,
@@ -120,7 +138,7 @@ func (m *TelegramOrderManager) DisableTrading(account string, hours int) (int64,
 }
 
 func (m *TelegramOrderManager) EnableTrading(account string) error {
-	_, err := RunRemoteCommand(RemoteCommand{
+	_, err := m.commands.Run(RemoteCommand{
 		Source:  RemoteSourceTelegram,
 		Actor:   "telegram",
 		Account: account,
@@ -132,6 +150,17 @@ func (m *TelegramOrderManager) EnableTrading(account string) error {
 
 // GetOrderStats 获取订单统计信息
 func (m *TelegramOrderManager) GetOrderStats(account string) (longCount, shortCount int, err error) {
+	if m.deps != nil {
+		orders, err := m.GetActiveOrders(account)
+		for _, order := range orders {
+			if order.Short {
+				shortCount++
+			} else {
+				longCount++
+			}
+		}
+		return longCount, shortCount, err
+	}
 	sess, conn, connErr := ormo.Conn(orm.DbTrades, false)
 	if connErr != nil {
 		return 0, 0, connErr
@@ -176,4 +205,23 @@ type walletInfoProvider struct{}
 func (walletInfoProvider) GetSummary(account string) (totalLegal float64, availableLegal float64, unrealizedPOLLegal float64) {
 	w := GetWallets(account)
 	return w.TotalLegal(nil, true), w.AvaLegal(nil), w.UnrealizedPOLLegal(nil)
+}
+
+type runtimeWalletInfoProvider struct{ state *TradingState }
+
+func (provider runtimeWalletInfoProvider) GetSummary(account string) (float64, float64, float64) {
+	wallet := provider.state.Wallet(account)
+	if wallet == nil {
+		return 0, 0, 0
+	}
+	return wallet.TotalLegal(nil, true), wallet.AvaLegal(nil), wallet.UnrealizedPOLLegal(nil)
+}
+
+func NewRuntimeNotifications(deps RuntimeDeps) *rpc.Session {
+	deps.Accounts = normalizeRuntimeAccounts(deps)
+	session := rpc.NewSession(deps.Config, deps.Accounts)
+	session.Core, session.Clock = deps.Core, deps.Clock
+	session.Orders = NewTelegramOrderManagerWithRuntimeDeps(deps)
+	session.Wallets = runtimeWalletInfoProvider{state: deps.Trading}
+	return session
 }

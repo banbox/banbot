@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
@@ -49,17 +51,10 @@ func newStubRegistrySource(name string) *stubSeriesSource {
 
 func resetDataSourcesForTest(t *testing.T) {
 	t.Helper()
-	dataSourcesMu.Lock()
-	old := dataSources
-	oldSta := dataSourceSta
-	dataSources = make(map[string]DataSource)
-	dataSourceSta = make(map[string]*DataSourceStatus)
-	dataSourcesMu.Unlock()
+	old := legacyDataSourceCatalog
+	legacyDataSourceCatalog = NewDataSourceCatalog()
 	t.Cleanup(func() {
-		dataSourcesMu.Lock()
-		dataSources = old
-		dataSourceSta = oldSta
-		dataSourcesMu.Unlock()
+		legacyDataSourceCatalog = old
 	})
 }
 
@@ -197,6 +192,13 @@ func TestRegisterDataSourceRejectsNil(t *testing.T) {
 	resetDataSourcesForTest(t)
 	if err := RegisterDataSource(nil); err == nil {
 		t.Fatalf("expected nil data source registration to fail")
+	}
+}
+
+func TestDataSourceCatalogRejectsNilReceiver(t *testing.T) {
+	var catalog *DataSourceCatalog
+	if err := catalog.RegisterDataSource(nil); err == nil || !strings.Contains(err.Error(), "catalog") {
+		t.Fatalf("nil catalog error = %v, want an explicit catalog error", err)
 	}
 }
 
@@ -384,6 +386,106 @@ func TestActivateDataSourcesRequiresSink(t *testing.T) {
 	}
 }
 
+func TestDataSourceCatalogIsolatesRuntimeLookupActivationAndHistory(t *testing.T) {
+	resetDataSourcesForTest(t)
+	const sourceName = "macro_catalog_isolation_test"
+	const sid int32 = 707
+	newSource := func(field string) *stubSeriesSource {
+		src := newStubRegistrySource(sourceName)
+		src.info.Binding.Fields = []orm.SeriesField{{Name: field, Type: "float", Role: "value"}}
+		return src
+	}
+	catalogA := NewDataSourceCatalog()
+	catalogB := NewDataSourceCatalog()
+	sourceA := newSource("runtime_a")
+	sourceB := newSource("runtime_b")
+	if err := catalogA.RegisterDataSource(sourceA); err != nil {
+		t.Fatalf("register catalog A source: %v", err)
+	}
+	if err := catalogB.RegisterDataSource(sourceB); err != nil {
+		t.Fatalf("register catalog B source: %v", err)
+	}
+	global := newSource("legacy_global")
+	if err := RegisterDataSource(global); err != nil {
+		t.Fatalf("register legacy source: %v", err)
+	}
+
+	job := func(field string) *strat.StratJob {
+		exs := &orm.ExSymbol{ID: sid, Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"}
+		return &strat.StratJob{
+			Symbol: exs,
+			Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+				return []*strat.DataSub{{Source: sourceName, ExSymbol: exs, TimeFrame: "1d", Fields: []string{field}}}
+			}},
+		}
+	}
+
+	runtimeA := NewSeriesRuntimeWithCatalog(catalogA, stubDataSink{})
+	runtimeB := NewSeriesRuntimeWithCatalog(catalogB, stubDataSink{})
+	runtimeA.Repo = &stubSeriesRepo{}
+	runtimeB.Repo = &stubSeriesRepo{}
+	planA, err := runtimeA.Plan([]*strat.StratJob{job("runtime_a")}, 100, 200)
+	if err != nil {
+		t.Fatalf("plan catalog A: %v", err)
+	}
+	planB, err := runtimeB.Plan([]*strat.StratJob{job("runtime_b")}, 100, 200)
+	if err != nil {
+		t.Fatalf("plan catalog B: %v", err)
+	}
+	if len(planA.Subs) != 1 || !slices.Contains(planA.Subs[0].Fields, "runtime_a") || slices.Contains(planA.Subs[0].Fields, "runtime_b") {
+		t.Fatalf("catalog A planned fields leaked: %+v", planA.Subs)
+	}
+	if len(planB.Subs) != 1 || !slices.Contains(planB.Subs[0].Fields, "runtime_b") || slices.Contains(planB.Subs[0].Fields, "runtime_a") {
+		t.Fatalf("catalog B planned fields leaked: %+v", planB.Subs)
+	}
+	if err := runtimeA.Ensure(context.Background(), planA); err != nil {
+		t.Fatalf("ensure catalog A: %v", err)
+	}
+	if err := runtimeB.Ensure(context.Background(), planB); err != nil {
+		t.Fatalf("ensure catalog B: %v", err)
+	}
+	if sourceA.fetchCount != 1 || sourceB.fetchCount != 1 || global.fetchCount != 0 {
+		t.Fatalf("history lookup crossed catalogs: fetch A=%d B=%d global=%d", sourceA.fetchCount, sourceB.fetchCount, global.fetchCount)
+	}
+	if err := runtimeA.ActivateNew(context.Background(), planA.Subs); err != nil {
+		t.Fatalf("activate catalog A: %v", err)
+	}
+	if err := runtimeB.ActivateNew(context.Background(), planB.Subs); err != nil {
+		t.Fatalf("activate catalog B: %v", err)
+	}
+	if sourceA.subscribeCount != 1 || sourceB.subscribeCount != 1 || global.subscribeCount != 0 {
+		t.Fatalf("activation crossed catalogs: subscribe A=%d B=%d global=%d", sourceA.subscribeCount, sourceB.subscribeCount, global.subscribeCount)
+	}
+
+	clockA := btime.NewClockState(true, nil)
+	clockA.SetTimeMS(100)
+	configSnapshot := config.NewSnapshot(&config.Config{TimeRange: &config.TimeTuple{StartMS: 100, EndMS: 200}})
+	providerA := NewHistProviderWithRuntimeDeps(&RuntimeDeps{Catalog: catalogA, Clock: clockA, Config: configSnapshot}, nil, nil, nil, false, nil)
+	providerA.seriesRepo = &stubSeriesRepo{}
+	if err := providerA.SetSeriesSubs(planA.Subs); err != nil {
+		t.Fatalf("historical provider catalog A: %v", err)
+	}
+	feeder := providerA.series[strat.DataSubKey(sourceName, sid, "1d")]
+	if feeder == nil {
+		t.Fatalf("provider A did not create a series feeder")
+	}
+	projectedFields := make([]string, 0, len(feeder.info.Binding.Fields))
+	for _, field := range feeder.info.Binding.Fields {
+		projectedFields = append(projectedFields, field.Name)
+	}
+	if !slices.Contains(projectedFields, "runtime_a") || slices.Contains(projectedFields, "runtime_b") {
+		t.Fatalf("provider A projected fields=%v", projectedFields)
+	}
+
+	noCatalogRuntime := NewSeriesRuntimeWithCatalog(nil, stubDataSink{})
+	if err := noCatalogRuntime.ActivateNew(context.Background(), planA.Subs); err == nil {
+		t.Fatalf("explicit runtime without catalog unexpectedly used legacy source")
+	}
+	if global.subscribeCount != 0 {
+		t.Fatalf("explicit runtime without catalog subscribed through legacy catalog: %d", global.subscribeCount)
+	}
+}
+
 func TestSeriesRuntimeSyncLiveEnsuresThenActivatesNewSubs(t *testing.T) {
 	job := &strat.StratJob{
 		Symbol: &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"},
@@ -551,6 +653,128 @@ func TestCollectRuntimeDataSubsRejectsMalformedSubs(t *testing.T) {
 	if !strings.Contains(err.Error(), "bootstrap collect") || !strings.Contains(err.Error(), "exsymbol") {
 		t.Fatalf("expected collect-phase exsymbol error, got %v", err)
 	}
+}
+
+func TestRuntimeSeriesSourcesAndKlineFieldsStayOwned(t *testing.T) {
+	resetDataSourcesForTest(t)
+
+	const sid int32 = 91
+	const tf = "1m"
+	exs := &orm.ExSymbol{ID: sid, Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"}
+
+	newSource := func(name, field string) *stubSeriesSource {
+		src := newStubRegistrySource(name)
+		src.info.Binding.Fields = []orm.SeriesField{{Name: field, Type: "float", Role: "value"}}
+		if err := RegisterDataSource(src); err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+		return src
+	}
+	sourceA := newSource("macro_runtime_a", "runtime_source_a")
+	sourceB := newSource("macro_runtime_b", "runtime_source_b")
+	sourceGlobal := newSource("macro_runtime_global", "runtime_source_global")
+
+	makeState := func(sourceName, sourceField, klineField string) *strat.State {
+		state := strat.NewState()
+		seriesJob := &strat.StratJob{
+			Symbol: exs,
+			Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+				return []*strat.DataSub{{Source: sourceName, ExSymbol: exs, TimeFrame: "1d", Fields: []string{sourceField}}}
+			}},
+		}
+		state.Jobs("default")["primary"] = map[string]*strat.StratJob{"series": seriesJob}
+
+		klineJob := &strat.StratJob{
+			Symbol: exs,
+			Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+				return []*strat.DataSub{{Source: orm.SeriesSourceKline, ExSymbol: exs, TimeFrame: tf, Fields: []string{klineField}}}
+			}},
+		}
+		state.InfoJobs("default")[strat.DataSubKey(orm.SeriesSourceKline, sid, tf)] = map[string]*strat.StratJob{"kline": klineJob}
+		return state
+	}
+
+	first := makeState(sourceA.info.Name, "runtime_source_a", "runtime_field_a")
+	second := makeState(sourceB.info.Name, "runtime_source_b", "runtime_field_b")
+
+	oldJobs, oldInfoJobs := strat.AccJobs, strat.AccInfoJobs
+	strat.AccJobs = map[string]map[string]map[string]*strat.StratJob{
+		"legacy": {
+			"primary": {
+				"global": {
+					Symbol: exs,
+					Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+						return []*strat.DataSub{{Source: sourceGlobal.info.Name, ExSymbol: exs, TimeFrame: "1d", Fields: []string{"runtime_source_global"}}}
+					}},
+				},
+			},
+		},
+	}
+	strat.AccInfoJobs = map[string]map[string]map[string]*strat.StratJob{
+		"legacy": {
+			strat.DataSubKey(orm.SeriesSourceKline, sid, tf): {
+				"global": {
+					Symbol: exs,
+					Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+						return []*strat.DataSub{{Source: orm.SeriesSourceKline, ExSymbol: exs, TimeFrame: tf, Fields: []string{"global_field"}}}
+					}},
+				},
+			},
+		},
+	}
+	t.Cleanup(func() {
+		strat.AccJobs = oldJobs
+		strat.AccInfoJobs = oldInfoJobs
+	})
+
+	activate := func(name string, state *strat.State, wantSource *stubSeriesSource) {
+		t.Helper()
+		subs, err := CollectRuntimeDataSubs(state.CollectJobs())
+		if err != nil {
+			t.Fatalf("%s collect: %v", name, err)
+		}
+		if len(subs) != 1 || subs[0].Source != wantSource.info.Name || !slices.Contains(subs[0].Fields, wantSource.info.Binding.Fields[0].Name) {
+			t.Fatalf("%s collected subscriptions=%+v, want only %s", name, subs, wantSource.info.Name)
+		}
+		activated, err := ActivateDataSources(context.Background(), subs, stubDataSink{})
+		if err != nil {
+			t.Fatalf("%s activate: %v", name, err)
+		}
+		if len(activated) != 1 || wantSource.subscribeCount != 1 || len(wantSource.subscribedSubs) != 1 {
+			t.Fatalf("%s activated=%+v subscribe_count=%d groups=%d", name, activated, wantSource.subscribeCount, len(wantSource.subscribedSubs))
+		}
+		if got := activated[0].Fields; !slices.Contains(got, wantSource.info.Binding.Fields[0].Name) {
+			t.Fatalf("%s activated fields=%v, want %s", name, got, wantSource.info.Binding.Fields[0].Name)
+		}
+	}
+	activate("first", first, sourceA)
+	activate("second", second, sourceB)
+	if sourceGlobal.subscribeCount != 0 {
+		t.Fatalf("legacy source leaked into explicit runtimes: subscribe_count=%d", sourceGlobal.subscribeCount)
+	}
+
+	project := func(name string, state *strat.State, field string, value any) {
+		t.Helper()
+		var requested []string
+		got, err := enrichStoredKlineFieldsWithRuntimeDepsAndReader(&RuntimeDeps{Strategies: state}, exs, tf,
+			[]*orm.DataSeries{{TimeMS: 100, EndMS: 60_100, Values: map[string]any{"close": 3.0}}},
+			func(_ *orm.ExSymbol, _ string, fields []string, _, _ int64) ([]*orm.DataSeries, *errs.Error) {
+				requested = append([]string(nil), fields...)
+				return []*orm.DataSeries{{TimeMS: 100, Values: map[string]any{field: value}}}, nil
+			})
+		if err != nil || len(got) != 1 {
+			t.Fatalf("%s projection=(%v,%v)", name, got, err)
+		}
+		gotValue, ok := got[0].Values[field]
+		if !ok || gotValue != value {
+			t.Fatalf("%s projected value=%v present=%v, want %v", name, gotValue, ok, value)
+		}
+		if !slices.Contains(requested, field) || slices.Contains(requested, "global_field") {
+			t.Fatalf("%s reader fields=%v, want owned %q without global field", name, requested, field)
+		}
+	}
+	project("first", first, "runtime_field_a", int64(7))
+	project("second", second, "runtime_field_b", nil)
 }
 
 func TestNewThirdPartySeriesBootstrapPlansWarmupOnce(t *testing.T) {

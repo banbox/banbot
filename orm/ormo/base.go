@@ -26,6 +26,20 @@ func Conn(path string, write bool) (*Queries, *orm.TrackedDB, *errs.Error) {
 	return New(db), db, nil
 }
 
+func (s *OrderState) BindTradesPath(path string) {
+	s.tradesPath = path
+}
+
+func (s *OrderState) Conn(write bool) (*Queries, *orm.TrackedDB, *errs.Error) {
+	if s == nil || s == legacyOrderState {
+		return Conn(orm.DbTrades, write)
+	}
+	if s.tradesPath == "" {
+		return nil, nil, errs.NewMsg(core.ErrDbConnFail, "runtime trades database path is required")
+	}
+	return Conn(s.tradesPath, write)
+}
+
 func GetTaskID(account string) int64 {
 	task := GetTask(account)
 	if task != nil {

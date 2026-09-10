@@ -23,6 +23,30 @@ type walletRuntimeExchangeStub struct {
 	watchOut     chan *banexg.Balances
 }
 
+func TestRuntimeWalletValuationUsesOwnPrices(t *testing.T) {
+	clock := btime.NewClockState(true, nil)
+	clock.SetTimeMS(10_000)
+	makeWallet := func(price float64) *BanWallets {
+		prices := com.NewPriceState("binance")
+		prices.SetBarPriceAt(10_000, "BTC/USDT", price)
+		wallet := &BanWallets{Items: map[string]*ItemWallet{
+			"BTC": {Coin: "BTC", Available: 2, Pendings: map[string]float64{"entry": 1}},
+		}}
+		wallet.bindRuntimeDeps(RuntimeDeps{Clock: clock, Market: &com.MarketState{Prices: prices}})
+		return wallet
+	}
+	first, second := makeWallet(100), makeWallet(200)
+	if first.TotalLegal(nil, false) != 300 || second.TotalLegal(nil, false) != 600 {
+		t.Fatal("wallet totals do not use runtime prices")
+	}
+	if first.FiatValue(false) != 300 || second.FiatValue(false) != 600 {
+		t.Fatal("fiat valuation does not use runtime prices")
+	}
+	if first.GetAmountByLegal("BTC", 200) != 2 || second.GetAmountByLegal("BTC", 200) != 1 {
+		t.Fatal("wallet conversion does not use runtime prices")
+	}
+}
+
 func (s *walletRuntimeExchangeStub) CalcMaintMargin(_ string, cost float64) (float64, *errs.Error) {
 	s.calls++
 	s.cost = cost
@@ -61,6 +85,15 @@ func (s *walletRuntimeLifecycleStub) closeAndWait() {
 	for _, call := range s.wait {
 		call()
 	}
+}
+
+type walletRuntimeDepsLifecycleStub struct {
+	*walletRuntimeLifecycleStub
+	deps RuntimeDeps
+}
+
+func (s *walletRuntimeDepsLifecycleStub) WalletRuntimeDeps() RuntimeDeps {
+	return s.deps
 }
 
 func TestRuntimeWalletUpdateOdsUsesBoundPriceAndExchange(t *testing.T) {
@@ -166,6 +199,41 @@ func TestRuntimeWatchLiveBalancesDoesNotFallBackToGlobalExchange(t *testing.T) {
 	lifecycle.closeAndWait()
 	if legacyExchange.watchCalls != 0 {
 		t.Fatalf("legacy exchange was used %d times, want 0", legacyExchange.watchCalls)
+	}
+}
+
+func TestRuntimeWatchLiveBalancesUsesOwnedDependencies(t *testing.T) {
+	oldDefault, oldAccounts := exg.Default, config.Accounts
+	legacyExchange := &walletRuntimeExchangeStub{watchOut: make(chan *banexg.Balances)}
+	runtimeExchange := &walletRuntimeExchangeStub{watchOut: make(chan *banexg.Balances)}
+	exg.Default = legacyExchange
+	const account = "runtime-owned-watch-account"
+	config.Accounts = map[string]*config.AccountConfig{"legacy-watch-account": {}}
+	t.Cleanup(func() {
+		exg.Default = oldDefault
+		config.Accounts = oldAccounts
+	})
+
+	trading := NewTradingState()
+	lifecycle := &walletRuntimeDepsLifecycleStub{
+		walletRuntimeLifecycleStub: newWalletRuntimeLifecycleStub(),
+		deps: RuntimeDeps{
+			Trading:  trading,
+			Config:   config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{account: {}}}),
+			Exchange: runtimeExchange,
+		},
+	}
+	watchLiveBalancesWithRuntime(lifecycle)
+	lifecycle.closeAndWait()
+
+	if runtimeExchange.watchCalls != 1 || runtimeExchange.watchAccount != account {
+		t.Fatalf("runtime watch calls/account = %d/%q, want 1/%q", runtimeExchange.watchCalls, runtimeExchange.watchAccount, account)
+	}
+	if legacyExchange.watchCalls != 0 {
+		t.Fatalf("legacy exchange was used %d times, want 0", legacyExchange.watchCalls)
+	}
+	if wallet := trading.Wallet(account); !wallet.runtimeBound {
+		t.Fatal("runtime watch wallet was not bound to explicit dependencies")
 	}
 }
 

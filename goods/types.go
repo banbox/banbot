@@ -1,7 +1,9 @@
 package goods
 
 import (
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -21,6 +23,27 @@ type SymbolStateFilter interface {
 	FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, pairs []string, timeMS int64) ([]string, *errs.Error)
 }
 
+// RuntimeDeps binds pair filters to one runtime's typed state. Filters use
+// these concrete fields directly, keeping the selection path independent of
+// package globals while preserving the existing IFilter API for legacy users.
+type RuntimeDeps struct {
+	Core     *core.State
+	Clock    *btime.ClockState
+	Config   *config.Config
+	DataDir  string
+	Symbols  *orm.SymbolState
+	Storage  *orm.Storage
+	Exchange banexg.BanExchange
+	ShowLog  bool
+}
+
+// RuntimeFilter is implemented by built-in filters that need runtime-owned
+// configuration or mutable state. Custom filters can continue implementing
+// SymbolStateFilter or IFilter.
+type RuntimeFilter interface {
+	FilterWithRuntimeDeps(deps *RuntimeDeps, pairs []string, timeMS int64) ([]string, *errs.Error)
+}
+
 type IProducer interface {
 	IFilter
 	GenSymbols(timeMS int64) ([]string, *errs.Error)
@@ -30,6 +53,11 @@ type IProducer interface {
 type SymbolStateProducer interface {
 	IProducer
 	GenSymbolsWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, timeMS int64) ([]string, *errs.Error)
+}
+
+// RuntimeProducer is the runtime-aware form of a pair producer.
+type RuntimeProducer interface {
+	GenSymbolsWithRuntimeDeps(deps *RuntimeDeps, timeMS int64) ([]string, *errs.Error)
 }
 
 type BaseFilter struct {

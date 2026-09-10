@@ -949,6 +949,27 @@ func TestHistoricalCoverageIntervalsCapExtensionAtBacktestEnd(t *testing.T) {
 	}
 }
 
+func TestHistoricalCoverageAllowsWithOptionsUsesRuntimeRange(t *testing.T) {
+	previous := config.TimeRange
+	config.TimeRange = &config.TimeTuple{StartMS: 100, EndMS: 300}
+	t.Cleanup(func() { config.TimeRange = previous })
+	coverage := &config.HistoricalCoverageConfig{
+		BaselineEndMS: 500,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 500}}},
+		},
+	}
+	exs := &ExSymbol{Symbol: "BTC/USDT:USDT"}
+	options := KlineRuntimeOptions{StrictReplay: true, TimeRangeEndMS: 700}
+	if !HistoricalCoverageAllowsWithOptions(coverage, exs, "1h", 600, options) {
+		t.Fatal("explicit runtime coverage range was overridden by config.TimeRange")
+	}
+	options.TimeRangeEndMS = 600
+	if HistoricalCoverageAllowsWithOptions(coverage, exs, "1h", 600, options) {
+		t.Fatal("explicit runtime coverage range did not cap the result")
+	}
+}
+
 func TestExportedSeriesReadsFailClosedBeforeRawQuery(t *testing.T) {
 	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
 	core.BackTestMode = true

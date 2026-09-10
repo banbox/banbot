@@ -219,3 +219,63 @@ func TestCleanupFailsWithFrozenWalletFunds(t *testing.T) {
 		t.Fatalf("cleanup error = %v, want frozen-wallet residue", err)
 	}
 }
+
+func TestRuntimeCleanupFiltersOnlyOwnedHistory(t *testing.T) {
+	manager := setupLocalCleanupTest(t, true, false)
+	first, second := ormo.NewOrderState(), ormo.NewOrderState()
+	unfilled := cleanupPendingExit(1001, "USDT")
+	unfilled.Enter.Filled = 0
+	filled := cleanupPendingExit(1002, "USDT")
+	legacyFilled := cleanupPendingExit(2001, "USDT")
+	legacyUnfilled := cleanupPendingExit(2002, "USDT")
+	legacyUnfilled.Enter.Filled = 0
+	legacy := ormo.LegacyState()
+	legacy.AddHistoricalOrder(legacyFilled)
+	legacy.AddHistoricalOrder(legacyUnfilled)
+	first.AddHistoricalOrder(unfilled)
+	first.AddHistoricalOrder(filled)
+	secondUnfilled := cleanupPendingExit(1003, "USDT")
+	secondUnfilled.Enter.Filled = 0
+	second.AddHistoricalOrder(secondUnfilled)
+	legacyBefore := legacy.HistoricalOrders()
+	manager.bindRuntimeDeps(RuntimeDeps{
+		Core:           &core.State{BackTestMode: true},
+		Config:         config.NewSnapshot(&config.Config{}),
+		Orders:         first,
+		Trading:        NewTradingState(),
+		DefaultAccount: manager.Account,
+	})
+	if err := manager.CleanUp(); err != nil {
+		t.Fatal(err)
+	}
+	if history := first.HistoricalOrders(); len(history) != 1 || history[0] != filled {
+		t.Fatalf("unexpected cleaned history: %v", history)
+	}
+	if history := second.HistoricalOrders(); len(history) != 1 || history[0] != secondUnfilled {
+		t.Fatal("cleanup changed sibling runtime history")
+	}
+	if history := legacy.HistoricalOrders(); len(history) != len(legacyBefore) || history[0] != legacyFilled || history[1] != legacyUnfilled {
+		t.Fatal("cleanup changed legacy history contents")
+	}
+	if !first.AddHistoricalOrder(unfilled) {
+		t.Fatal("removed history ID remains reserved")
+	}
+}
+
+func TestLegacyCleanupFiltersLegacyHistory(t *testing.T) {
+	manager := setupLocalCleanupTest(t, true, false)
+	legacy := ormo.LegacyState()
+	filled := cleanupPendingExit(3001, "USDT")
+	unfilled := cleanupPendingExit(3002, "USDT")
+	unfilled.Enter.Filled = 0
+	legacy.AddHistoricalOrder(filled)
+	legacy.AddHistoricalOrder(unfilled)
+
+	if err := manager.CleanUp(); err != nil {
+		t.Fatal(err)
+	}
+	history := legacy.HistoricalOrders()
+	if len(history) != 1 || history[0] != filled {
+		t.Fatalf("legacy cleanup history = %v, want only filled order", history)
+	}
+}

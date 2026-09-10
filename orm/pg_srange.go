@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sort"
 )
@@ -292,6 +293,18 @@ func delKInfoPg(ctx context.Context, sid int32, tbl, timeFrame string) error {
 	return err
 }
 
+func (q *Queries) delKInfoPg(ctx context.Context, sid int32, tbl, timeFrame string) error {
+	if q == nil || q.db == nil {
+		return fmt.Errorf("database query is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, err := q.db.Exec(ctx, `DELETE FROM sranges WHERE sid = $1 AND tbl = $2 AND timeframe = $3`,
+		sid, tbl, timeFrame)
+	return err
+}
+
 // GetKlineRangePg returns (minStartMs, maxStopMs) for has_data=true segments in TimescaleDB.
 func getKlineRangePg(ctx context.Context, sid int32, tbl, timeFrame string) (int64, int64) {
 	if ctx == nil {
@@ -300,6 +313,25 @@ func getKlineRangePg(ctx context.Context, sid int32, tbl, timeFrame string) (int
 	row := pool.QueryRow(ctx, `SELECT min(start_ms), max(stop_ms)
 FROM sranges
 WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND has_data = true`,
+		sid, tbl, timeFrame)
+	var start, stop *int64
+	_ = row.Scan(&start, &stop)
+	if start == nil || stop == nil {
+		return 0, 0
+	}
+	return *start, *stop
+}
+
+func (q *Queries) getKlineRangePg(ctx context.Context, sid int32, tbl, timeFrame string) (int64, int64) {
+	if q == nil || q.db == nil {
+		return 0, 0
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	row := q.db.QueryRow(ctx, `SELECT min(start_ms), max(stop_ms)
+	FROM sranges
+	WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND has_data = true`,
 		sid, tbl, timeFrame)
 	var start, stop *int64
 	_ = row.Scan(&start, &stop)
@@ -321,6 +353,35 @@ FROM sranges
 WHERE tbl = $1 AND timeframe = $2 AND has_data = true AND sid IN (` + sidIn + `)
 GROUP BY sid`
 	rows, err := pool.Query(ctx, sql, tbl, timeFrame)
+	if err != nil {
+		return res
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sid int32
+		var start, stop int64
+		if err := rows.Scan(&sid, &start, &stop); err != nil {
+			continue
+		}
+		res[sid] = [2]int64{start, stop}
+	}
+	return res
+}
+
+func (q *Queries) getKlineRangesPg(ctx context.Context, sidList []int32, tbl, timeFrame string) map[int32][2]int64 {
+	res := make(map[int32][2]int64)
+	if q == nil || q.db == nil || len(sidList) == 0 {
+		return res
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sidIn := buildIntList(sidList)
+	sql := `SELECT sid, min(start_ms), max(stop_ms)
+	FROM sranges
+	WHERE tbl = $1 AND timeframe = $2 AND has_data = true AND sid IN (` + sidIn + `)
+	GROUP BY sid`
+	rows, err := q.db.Query(ctx, sql, tbl, timeFrame)
 	if err != nil {
 		return res
 	}

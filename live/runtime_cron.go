@@ -22,6 +22,8 @@ import (
 	"go.uber.org/zap"
 )
 
+const runtimeMinPairCronGapMS int64 = 30 * 60 * 1000
+
 func runtimeConfig(deps *biz.RuntimeDeps) *config.Config {
 	if deps == nil || deps.Config == nil {
 		return nil
@@ -36,7 +38,7 @@ func runtimeDataDeps(deps *biz.RuntimeDeps) *data.RuntimeDeps {
 	return &data.RuntimeDeps{
 		Core: deps.Core, Clock: deps.Clock, Config: deps.Config,
 		Market: deps.Market, Symbols: deps.Symbols, Strategies: deps.Strategies,
-		Exchange: deps.Exchange, Callbacks: nil,
+		Storage: deps.Storage, Exchange: deps.Exchange, Callbacks: nil,
 	}
 }
 
@@ -52,7 +54,7 @@ func cronRefreshPairsWithRuntime(scheduler com.Scheduler, trader *CryptoTrader, 
 			return
 		}
 		curMS := trader.currentTimeMS()
-		if curMS-lastRefreshMS < config.MinPairCronGapMS {
+		if curMS-lastRefreshMS < runtimeMinPairCronGapMS {
 			return
 		}
 		lastRefreshMS = curMS
@@ -98,12 +100,14 @@ func fetchHourKlinesWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, 
 	}
 }
 
-func cronLoadMarketsWithRuntime(scheduler com.Scheduler, exchange banexg.BanExchange) {
+func cronLoadMarketsWithRuntime(scheduler com.Scheduler, exchange banexg.BanExchange, symbols *orm.SymbolState,
+	snapshot *config.Snapshot, runtimeCore *core.State,
+) {
 	if scheduler == nil || exchange == nil {
 		return
 	}
 	_, err := scheduler.AddFunc("30 3 */2 * * *", func() {
-		if _, loadErr := orm.LoadMarkets(exchange, true); loadErr != nil {
+		if _, loadErr := orm.LoadMarketsWithRuntime(symbols, exchange, true, snapshot, runtimeCore); loadErr != nil {
 			log.Error("runtime LoadMarkets fail", zap.Error(loadErr))
 		}
 	})
@@ -172,7 +176,7 @@ func cronKlineDelaysWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, 
 		log.Warn(message)
 		if now-lastNotifyDelay > 600000 {
 			lastNotifyDelay = now
-			rpc.SendMsg(map[string]interface{}{"type": rpc.MsgTypeException, "status": message})
+			sendRuntimeMessage(&deps, map[string]interface{}{"type": rpc.MsgTypeException, "status": message})
 		}
 	}
 	_, err := scheduler.AddFunc("30 * * * * *", func() {

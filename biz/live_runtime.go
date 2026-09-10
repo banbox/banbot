@@ -6,7 +6,6 @@ import (
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/errs"
@@ -110,7 +109,7 @@ func checkRuntimeFatalStop(deps RuntimeDeps, account string, fatal map[int]float
 	if taskID < 0 {
 		return
 	}
-	sess, conn, err := ormo.Conn(orm.DbTrades, false)
+	sess, conn, err := deps.Orders.Conn(false)
 	if err != nil {
 		log.Error("get runtime db session fail", zap.Error(err))
 		return

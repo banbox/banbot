@@ -49,11 +49,19 @@ func InitLocalOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack FnOdCb, showLog
 }
 
 func initLocalOrderMgr(deps *RuntimeDeps, callBack FnOdCb, showLog bool, prices *com.PriceState, clock *btime.ClockState, stops ...func()) {
-	stopBacktest := core.StopAll
-	if deps != nil && deps.Trading == nil {
-		// Keep direct explicit-runtime construction isolated even when the
-		// caller did not pre-allocate the account registry.
-		deps.Trading = NewTradingState()
+	var stopBacktest func()
+	if deps == nil {
+		stopBacktest = core.StopAll
+	}
+	if deps != nil {
+		// Complete the explicit dependency set before creating any manager. A
+		// runtime manager must never fall back to the process-wide order state.
+		if deps.Orders == nil {
+			deps.Orders = ormo.NewOrderState()
+		}
+		if deps.Trading == nil {
+			deps.Trading = NewTradingState()
+		}
 	}
 	if deps != nil && deps.Core != nil {
 		stopBacktest = deps.Core.StopAll
@@ -61,9 +69,11 @@ func initLocalOrderMgr(deps *RuntimeDeps, callBack FnOdCb, showLog bool, prices 
 	if len(stops) > 0 {
 		stopBacktest = stops[0]
 	}
-	managers := accOdMgrs
-	if deps != nil && deps.Trading != nil {
+	var managers map[string]IOrderMgr
+	if deps != nil {
 		managers = deps.Trading.OrderManagers
+	} else {
+		managers = accOdMgrs
 	}
 	accounts := executionAccountConfigs(deps)
 	for account, cfg := range accounts {
@@ -283,7 +293,7 @@ Fills orders waiting for exchange response. Cannot be used for real trading; can
 填充等待交易所响应的订单。不可用于实盘；可用于回测、模拟实盘等。
 */
 func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.DataSeries) (int, *errs.Error) {
-	orders = executionOrderView(orders)
+	orders = executionOrderView(orders, o.executionDeps())
 	o.setSimOrderMatch(true)
 	o.resetSimOrderCount()
 	defer func() {
@@ -292,7 +302,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 	affectNum := 0
 	bar := seriesOHLCVCompat(evt)
 	for _, od := range orders {
-		matchTf, _ := config.GetStratRefineTF(od.Strategy, od.Timeframe)
+		matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
 		if evt != nil && evt.TimeFrame != matchTf {
 			continue
 		}
@@ -413,7 +423,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 		stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
 		if stopAfter > 0 && stopAfter <= curMS {
 			err := o.localExit(od, stopAfter, core.ExitTagEntExp, od.InitPrice, "reach StopEnterBars", "")
-			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+			o.fireOdChange(od, strat.OdChgExitFill)
 			if err != nil {
 				log.Error("local exit for StopEnterBars fail", zap.String("key", od.Key()), zap.Error(err))
 			}
@@ -454,7 +464,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	if err != nil {
 		if err.Code == core.ErrLowFunds {
 			err = o.localExit(od, fillMS, core.ExitTagForceExit, od.InitPrice, err.Error(), "")
-			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+			o.fireOdChange(od, strat.OdChgExitFill)
 			o.onLowFunds()
 			return err
 		}
@@ -494,7 +504,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 			err = o.localExit(od, fillMS, core.ExitTagFatalErr, od.InitPrice, err.Error(), "")
 			_, quote, _, _ := core.SplitSymbol(od.Symbol)
 			wallets.Cancel(od.Key(), quote, 0, true)
-			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+			o.fireOdChange(od, strat.OdChgExitFill)
 			return err
 		}
 	}
@@ -529,7 +539,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 		}
 	}
 	o.callBack(od, true)
-	strat.FireOdChange(o.Account, od, strat.OdChgEnterFill)
+	o.fireOdChange(od, strat.OdChgEnterFill)
 	return nil
 }
 
@@ -563,7 +573,7 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 		}
 	}
 	o.callBack(od, false)
-	strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+	o.fireOdChange(od, strat.OdChgExitFill)
 	return nil
 }
 
@@ -680,14 +690,19 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 	_ = o.finishOrder(od)
 	wallets.ConfirmOdExit(od, od.Exit.Price)
 	o.callBack(od, false)
-	strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+	o.fireOdChange(od, strat.OdChgExitFill)
 	return err
 }
 
 func (o *LocalOrderMgr) onLowFunds() {
 	// If the balance is insufficient and there are no orders entered, the backtest will be terminated early.
 	// 如果余额不足，且没有入场的订单，则提前终止回测
-	openNum := ormo.OpenNum(o.Account, ormo.InOutStatusPartEnter)
+	var openNum int
+	if o.runtimeDeps {
+		openNum = o.orderState().OpenNum(o.Account, ormo.InOutStatusPartEnter)
+	} else {
+		openNum = ormo.OpenNum(o.Account, ormo.InOutStatusPartEnter)
+	}
 	if openNum > 0 {
 		return
 	}
@@ -796,7 +811,7 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noE
 }
 
 func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
-	orders = executionOrderView(orders)
+	orders = executionOrderView(orders, o.executionDeps())
 	for _, od := range orders {
 		_, err := o.exitOrder(od, req)
 		if err != nil {
@@ -848,7 +863,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 			// 回测无需持久化
 		}
 	}
-	openOdList := executionOpenOrders(openOds)
+	openOdList := executionOpenOrders(openOds, o.executionDeps())
 	lock.Unlock()
 	if len(openOdList) > 0 {
 		exitOds := make([]*ormo.InOutOrder, 0, len(openOdList))
@@ -907,14 +922,15 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 	}
 	// Filter unfilled orders
 	// 过滤未入场订单
-	var validOds = make([]*ormo.InOutOrder, 0, len(ormo.HistODs))
-	for _, od := range ormo.HistODs {
-		if od.Enter == nil || od.Enter.Filled == 0 {
-			continue
+	state := o.orderState()
+	if o.runtimeDeps {
+		if state == nil {
+			return errs.NewMsg(core.ErrRunTime, "runtime order state is required for cleanup")
 		}
-		validOds = append(validOds, od)
+	} else {
+		state = ormo.LegacyState()
 	}
-	ormo.HistODs = validOds
+	state.FilterUnfilledHistoricalOrders()
 	return nil
 }
 

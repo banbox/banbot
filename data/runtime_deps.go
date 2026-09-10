@@ -11,6 +11,8 @@ import (
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // CallbackTracker lets a composition root account for provider callbacks
@@ -29,12 +31,61 @@ type RuntimeDeps struct {
 	Config     *config.Snapshot
 	Market     *com.MarketState
 	Symbols    *orm.SymbolState
+	Storage    *orm.Storage
 	Strategies *strat.State
+	Catalog    *DataSourceCatalog
+	Dump       *orm.DumpSink
 	Callbacks  CallbackTracker
 	Exchange   banexg.BanExchange
 
 	ExchangeName string
 	MarketType   string
+}
+
+func (d *RuntimeDeps) dataSourceCatalog() *DataSourceCatalog {
+	if d == nil {
+		return legacyDataSourceCatalog
+	}
+	return d.Catalog
+}
+
+func (d *RuntimeDeps) storage() *orm.Storage {
+	if d == nil {
+		return nil
+	}
+	if d.Storage != nil {
+		return d.Storage
+	}
+	if d.Symbols != nil {
+		return d.Symbols.Storage()
+	}
+	return nil
+}
+
+func (d *RuntimeDeps) conn() (*orm.Queries, *pgxpool.Conn, *errs.Error) {
+	if d == nil {
+		return orm.Conn(nil)
+	}
+	storage := d.storage()
+	if storage == nil {
+		return nil, nil, errs.NewMsg(core.ErrDbConnFail, "explicit data storage is required")
+	}
+	sess, conn, err := storage.Conn(d.context())
+	if err == nil && d.Symbols != nil {
+		sess = sess.WithSeriesSymbolState(d.Symbols)
+	}
+	if err == nil {
+		sess = sess.WithKlineRuntimeOptions(d.KlineOptions())
+	}
+	return sess, conn, err
+}
+
+func (d *RuntimeDeps) isQuestDB() bool {
+	if d == nil {
+		return orm.IsQuestDB
+	}
+	storage := d.storage()
+	return storage != nil && storage.IsQuestDB()
 }
 
 func (d *RuntimeDeps) configView() *config.Config {
@@ -129,6 +180,16 @@ func (d *RuntimeDeps) sleep(delay time.Duration) bool {
 	}
 	time.Sleep(delay)
 	return true
+}
+
+// KlineOptions snapshots the low-frequency K-line policy for ORM download
+// helpers. The returned value is concrete and can be passed through hot
+// callback setup without a dynamic lookup or context.Value access.
+func (d *RuntimeDeps) KlineOptions() orm.KlineRuntimeOptions {
+	if d == nil {
+		return orm.LegacyKlineRuntimeOptions()
+	}
+	return orm.NewKlineRuntimeOptions(d.Core, d.configView(), d.timeMS(), d.storage())
 }
 
 func (d *RuntimeDeps) context() context.Context {

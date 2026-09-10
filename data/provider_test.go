@@ -791,6 +791,51 @@ func TestLiveProviderCallbacksUseInstanceWsRegistries(t *testing.T) {
 	providerB.Join()
 }
 
+func TestExplicitProviderWsRegistryDoesNotUseLegacyJobs(t *testing.T) {
+	oldJobs := strat.WsSubJobs
+	t.Cleanup(func() {
+		strat.LockJobsWrite()
+		strat.WsSubJobs = oldJobs
+		strat.UnlockJobsWrite()
+		strat.RefreshWsSubJobsSnapshot()
+	})
+	job := &strat.StratJob{}
+	strat.LockJobsWrite()
+	strat.WsSubJobs = map[string]map[string]map[*strat.StratJob]bool{
+		core.WsSubTrade: {"BTC/USDT": {job: true}},
+	}
+	strat.UnlockJobsWrite()
+	strat.RefreshWsSubJobsSnapshot()
+
+	provider := &Provider[IDataFeeder]{deps: &RuntimeDeps{}}
+	if got := provider.wsRegistry().Pairs(core.WsSubTrade); len(got) != 0 {
+		t.Fatalf("explicit provider inherited legacy websocket pairs: %v", got)
+	}
+}
+
+func TestProviderConstructorsIsolateNilStrategyState(t *testing.T) {
+	oldJobs := strat.WsSubJobs
+	t.Cleanup(func() {
+		strat.LockJobsWrite()
+		strat.WsSubJobs = oldJobs
+		strat.UnlockJobsWrite()
+		strat.RefreshWsSubJobsSnapshot()
+	})
+	job := &strat.StratJob{}
+	strat.LockJobsWrite()
+	strat.WsSubJobs = map[string]map[string]map[*strat.StratJob]bool{
+		core.WsSubTrade: {"BTC/USDT": {job: true}},
+	}
+	strat.UnlockJobsWrite()
+	strat.RefreshWsSubJobsSnapshot()
+
+	deps := &RuntimeDeps{}
+	provider := newHistProviderWithCatalog(deps, nil, nil, nil, nil, nil, false, nil)
+	if got := provider.wsRegistry().Pairs(core.WsSubTrade); len(got) != 0 {
+		t.Fatalf("explicit provider constructor inherited legacy websocket pairs: %v", got)
+	}
+}
+
 func TestSubWarmPairsUsesStablePairOrder(t *testing.T) {
 	var created, warmed []string
 	p := &Provider[IDataFeeder]{

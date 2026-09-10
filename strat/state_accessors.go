@@ -1,6 +1,56 @@
 package strat
 
+import "slices"
+
 import ta "github.com/banbox/banta"
+
+// CollectJobs returns a low-frequency snapshot of all jobs owned by this
+// strategy state. Callers use the returned slice for lifecycle dispatch; the
+// job objects remain state-owned and are not copied.
+func (s *State) CollectJobs() []*StratJob {
+	if s == nil {
+		return nil
+	}
+	lockJobsReadForState(s)
+	defer unlockJobsReadForState(s)
+	accounts := sortedMapKeys(s.AccJobs)
+	jobs := make([]*StratJob, 0)
+	seen := make(map[*StratJob]struct{})
+	for _, account := range accounts {
+		accountJobs := s.AccJobs[account]
+		envKeys := sortedMapKeys(accountJobs)
+		for _, envKey := range envKeys {
+			envJobs := accountJobs[envKey]
+			jobKeys := sortedMapKeys(envJobs)
+			for _, jobKey := range jobKeys {
+				job := envJobs[jobKey]
+				if job == nil {
+					continue
+				}
+				if _, ok := seen[job]; ok {
+					continue
+				}
+				seen[job] = struct{}{}
+				jobs = append(jobs, job)
+			}
+		}
+	}
+	return jobs
+}
+
+func mapKeys[V any](items map[string]V) []string {
+	keys := make([]string, 0, len(items))
+	for key := range items {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func sortedMapKeys[V any](items map[string]V) []string {
+	keys := mapKeys(items)
+	slices.Sort(keys)
+	return keys
+}
 
 // Jobs returns the strategy jobs owned by this state. The returned map is the
 // state-owned map, so callers on the hot path can index it directly without a

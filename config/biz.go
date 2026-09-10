@@ -1546,7 +1546,10 @@ func MergeAccounts() map[string]*AccountConfig {
 }
 
 func ReadLangFile(lang, name string) (string, error) {
-	resDir := GetDataDir()
+	return ReadLangFileFrom(GetDataDir(), lang, name)
+}
+
+func ReadLangFileFrom(resDir, lang, name string) (string, error) {
 	path := filepath.Join(resDir, lang, name)
 	if !utils2.Exists(path) {
 		path2 := filepath.Join(resDir, "en-US", name)
@@ -1652,12 +1655,16 @@ func ParsePairs(pairs ...string) ([]string, *errs.Error) {
 	if Exchange != nil && Exchange.Name != "" {
 		exchangeName = Exchange.Name
 	}
+	return parsePairs(exchangeName, core.Market, StakeCurrency, pairs...)
+}
+
+func parsePairs(exchangeName, market string, stakeCurrency []string, pairs ...string) ([]string, *errs.Error) {
 	if ExchangeUsesOpaqueSymbols(exchangeName) {
 		return slices.Clone(pairs), nil
 	}
 	quote := ""
-	if len(StakeCurrency) > 0 {
-		quote = StakeCurrency[0]
+	if len(stakeCurrency) > 0 {
+		quote = stakeCurrency[0]
 	}
 	var result = make([]string, 0, len(pairs))
 	for _, p := range pairs {
@@ -1667,11 +1674,11 @@ func ParsePairs(pairs ...string) ([]string, *errs.Error) {
 		} else if quote == "" {
 			return nil, errs.NewMsg(core.ErrBadConfig, "`stake_currency` is required")
 		}
-		if core.Market == banexg.MarketSpot {
+		if market == banexg.MarketSpot {
 			result = append(result, fmt.Sprintf("%s/%s", p, quote))
-		} else if core.Market == banexg.MarketLinear {
+		} else if market == banexg.MarketLinear {
 			result = append(result, fmt.Sprintf("%s/%s:%s", p, quote, quote))
-		} else if core.Market == banexg.MarketInverse {
+		} else if market == banexg.MarketInverse {
 			result = append(result, fmt.Sprintf("%s/%s:%s", p, quote, p))
 		} else {
 			return nil, errs.NewMsg(core.ErrBadConfig, "option market don't support short pair")

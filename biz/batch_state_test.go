@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
@@ -46,6 +48,28 @@ func TestBatchStatesAreIsolated(t *testing.T) {
 	second.SetLastBatchMS(200)
 	if first.LastBatchMS() != 100 || second.LastBatchMS() != 200 {
 		t.Fatalf("timestamps leaked: first=%d second=%d", first.LastBatchMS(), second.LastBatchMS())
+	}
+}
+
+func TestRuntimeBatchAdmissionUsesOwnedClock(t *testing.T) {
+	oldTime := btime.CurTimeMS
+	btime.SetTimeMS(1)
+	t.Cleanup(func() { btime.SetTimeMS(oldTime) })
+
+	clock := btime.NewClockState(true, nil)
+	clock.SetTimeMS(100_000)
+	state := strat.NewBatchState()
+	strategy := &strat.TradeStrat{Name: "runtime-clock"}
+	AddBatchJobWithRuntimeDeps(&RuntimeDeps{Clock: clock}, state, "default", "1m",
+		batchTestJob(strategy, "BTC/USDT"), nil)
+
+	ready, _ := state.TakeReady(btime.CurTimeMS+core.DelayBatchMS+1, false)
+	if len(ready) != 0 {
+		t.Fatalf("runtime batch became ready at legacy time: %d", len(ready))
+	}
+	ready, _ = state.TakeReady(clock.TimeMS()+core.DelayBatchMS+1, false)
+	if len(ready) != 1 {
+		t.Fatalf("runtime batch ready count = %d, want 1", len(ready))
 	}
 }
 

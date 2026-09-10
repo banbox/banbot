@@ -8,8 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/banbox/banbot/btime"
-	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/utils"
@@ -280,21 +278,22 @@ func (q *Queries) QuerySeries(exs *ExSymbol, timeframe string, startMs, endMs in
 }
 
 func (q *Queries) QuerySeriesFields(exs *ExSymbol, timeframe string, fields []string, startMs, endMs int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error) {
-	coverage := historicalCoverageForQuery(exs.Symbol)
+	options := q.klineRuntimeOptions()
+	coverage := historicalCoverageForQueryWithOptions(exs.Symbol, options)
 	if err := validateHistoricalCoverageFields(coverage, fields); err != nil {
 		return nil, err
 	}
 	if coverage == nil {
 		return q.querySeriesFieldsRaw(exs, timeframe, fields, startMs, endMs, limit, withUnFinish)
 	}
-	_, rows, err := readHistoricalCoverageSeries(coverage, exs, timeframe, startMs, endMs, limit, withUnFinish,
+	_, rows, err := readHistoricalCoverageSeriesWithOptions(coverage, exs, timeframe, startMs, endMs, limit, withUnFinish,
 		func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish,
 			reverse bool,
 		) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			rows, readErr := q.querySeriesFieldsRawMode(exs, timeframe, fields, readStartMS, readEndMS,
 				readLimit, readWithUnFinish, reverse)
 			return nil, rows, readErr
-		})
+		}, coverageQueryOptionsFromKline(options))
 	return rows, err
 }
 
@@ -309,23 +308,25 @@ func (q *Queries) querySeriesFieldsRawMode(exs *ExSymbol, timeframe string, fiel
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
 	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
 	boundedReverse := revRead && startMs > 0
-	startMs, endMs = parseDownArgs(tfMSecs, startMs, endMs, limit, withUnFinish)
+	options := q.klineRuntimeOptions()
+	startMs, endMs = parseDownArgsAt(tfMSecs, startMs, endMs, limit, withUnFinish, options.nowMS())
 	maxEndMs := endMs
 	finishEndMS := utils2.AlignTfMSecs(endMs, tfMSecs)
 	unFinishMS := int64(0)
 	if withUnFinish {
-		curMs := btime.UTCStamp()
+		curMs := options.nowMS()
 		unFinishMS = utils2.AlignTfMSecs(curMs, tfMSecs)
 		if finishEndMS > unFinishMS {
 			finishEndMS = unFinishMS
 		}
 	}
-	coverage := historicalCoverageForQuery(exs.Symbol)
-	consumerIntervals := historicalCoverageIntervals(coverage, exs.Symbol, timeframe, startMs, finishEndMS)
-	listingPrefix, hasListingPrefix := legacyListingPrefixProof(
-		coverage, exs, timeframe, startMs, consumerIntervals)
-	physicalStart, physicalStop, physicalBound, coverageErr := historicalPhysicalCoverageBoundsWithListingPrefix(
-		coverage, exs.Symbol, timeframe, startMs, finishEndMS, hasListingPrefix)
+	coverage := historicalCoverageForQueryWithOptions(exs.Symbol, options)
+	coverageOptions := coverageQueryOptionsFromKline(options)
+	consumerIntervals := historicalCoverageIntervalsWithOptions(coverage, exs.Symbol, timeframe, startMs, finishEndMS, coverageOptions)
+	listingPrefix, hasListingPrefix := legacyListingPrefixProofWithOptions(
+		coverage, exs, timeframe, startMs, consumerIntervals, coverageOptions)
+	physicalStart, physicalStop, physicalBound, coverageErr := historicalPhysicalCoverageBoundsWithListingPrefixWithOptions(
+		coverage, exs.Symbol, timeframe, startMs, finishEndMS, hasListingPrefix, coverageOptions)
 	if coverageErr != nil {
 		return nil, coverageErr
 	}
@@ -421,7 +422,8 @@ func (q *Queries) QuerySeriesBatchFields(exsMap map[int32]*ExSymbol, timeframe s
 	if len(exsMap) == 0 {
 		return nil
 	}
-	if config.StrictHistoricalReplay(config.HistoricalCoverage) {
+	options := q.klineRuntimeOptions()
+	if options.strictHistoricalReplay() {
 		sids := make([]int, 0, len(exsMap))
 		for sid := range exsMap {
 			sids = append(sids, int(sid))
@@ -444,16 +446,17 @@ func (q *Queries) QuerySeriesBatchFields(exsMap map[int32]*ExSymbol, timeframe s
 func (q *Queries) querySeriesBatchFieldsRaw(exsMap map[int32]*ExSymbol, timeframe string, fields []string, startMs, endMs int64, limit int, handle func(int32, []*DataSeries)) *errs.Error {
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
 	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
-	startMs, endMs = parseDownArgs(tfMSecs, startMs, endMs, limit, false)
+	options := q.klineRuntimeOptions()
+	startMs, endMs = parseDownArgsAt(tfMSecs, startMs, endMs, limit, false, options.nowMS())
 	finishEndMS := utils2.AlignTfMSecs(endMs, tfMSecs)
-	if core.LiveMode {
-		curMs := btime.TimeMS()
+	if options.Live {
+		curMs := options.nowMS()
 		unFinishMS := utils2.AlignTfMSecs(curMs, tfMSecs)
 		if finishEndMS > unFinishMS {
 			finishEndMS = unFinishMS
 		}
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.querySeriesBatchPg(exsMap, timeframe, fields, startMs, finishEndMS, tfMSecs, handle)
 	}
 	sidTA := make([]string, 0, len(exsMap))
@@ -490,20 +493,57 @@ func AutoFetchSeries(exchange banexg.BanExchange, exs *ExSymbol, timeFrame strin
 		return nil, nil, err
 	}
 	defer conn.Release()
-	return autoFetchSeries(timeFrame, startMS, endMS, limit, withUnFinish, pBar,
+	return autoFetchSeriesWithOptions(timeFrame, startMS, endMS, limit, withUnFinish, pBar,
 		func(downTF string, downStartMS, downEndMS int64) *errs.Error {
 			_, downErr := sess.DownOHLCV2DBForRequestedTF(exchange, exs, downTF, timeFrame,
 				downStartMS, downEndMS, pBar)
 			return downErr
 		}, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			return sess.GetSeries(exs, timeFrame, readStartMS, readEndMS, readLimit, readWithUnFinish)
-		})
+		}, LegacyKlineRuntimeOptions())
+}
+
+// AutoFetchSeries runs the same read/download policy on an explicit query
+// owner. Callers must keep q valid for the duration of the operation.
+func (q *Queries) AutoFetchSeries(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string,
+	startMS, endMS int64, limit int, withUnFinish bool, pBar *utils.PrgBar,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return q.AutoFetchSeriesWithOptions(exchange, exs, timeFrame, startMS, endMS, limit, withUnFinish, pBar,
+		LegacyKlineRuntimeOptions())
+}
+
+// AutoFetchSeriesWithOptions is the explicit-runtime counterpart to
+// AutoFetchSeries. Download gating and implicit range alignment use options;
+// reads remain on this query owner and therefore retain the DataSeries.Values
+// contract.
+func (q *Queries) AutoFetchSeriesWithOptions(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string,
+	startMS, endMS int64, limit int, withUnFinish bool, pBar *utils.PrgBar, options KlineRuntimeOptions,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	if q == nil || q.db == nil {
+		return nil, nil, errs.NewMsg(core.ErrDbConnFail, "database query is not configured")
+	}
+	query := q.WithKlineRuntimeOptions(options)
+	return autoFetchSeriesWithOptions(timeFrame, startMS, endMS, limit, withUnFinish, pBar,
+		func(downTF string, downStartMS, downEndMS int64) *errs.Error {
+			_, downErr := query.DownOHLCV2DBForRequestedTFWithOptions(exchange, exs, downTF, timeFrame,
+				downStartMS, downEndMS, pBar, options)
+			return downErr
+		}, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+			return query.GetSeries(exs, timeFrame, readStartMS, readEndMS, readLimit, readWithUnFinish)
+		}, options)
 }
 
 func autoFetchSeries(timeFrame string, startMS, endMS int64, limit int, withUnFinish bool, pBar *utils.PrgBar,
 	download func(string, int64, int64) *errs.Error, read seriesFieldsReader,
 ) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-	if allowImplicitKlineDownload() {
+	return autoFetchSeriesWithOptions(timeFrame, startMS, endMS, limit, withUnFinish, pBar, download, read,
+		LegacyKlineRuntimeOptions())
+}
+
+func autoFetchSeriesWithOptions(timeFrame string, startMS, endMS int64, limit int, withUnFinish bool, pBar *utils.PrgBar,
+	download func(string, int64, int64) *errs.Error, read seriesFieldsReader, options KlineRuntimeOptions,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	if options.allowDownload() {
 		downTF, err := GetDownTF(timeFrame)
 		if err != nil {
 			if pBar != nil {
@@ -512,7 +552,7 @@ func autoFetchSeries(timeFrame string, startMS, endMS int64, limit int, withUnFi
 			return nil, nil, err
 		}
 		tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-		downStartMS, downEndMS := parseDownArgs(tfMSecs, startMS, endMS, limit, withUnFinish)
+		downStartMS, downEndMS := parseDownArgsAt(tfMSecs, startMS, endMS, limit, withUnFinish, options.nowMS())
 		if err = download(downTF, downStartMS, downEndMS); err != nil {
 			return nil, nil, err
 		}
@@ -561,7 +601,8 @@ func (q *Queries) GetPhysicalSeriesFields(exs *ExSymbol, timeFrame string, field
 func (q *Queries) GetPhysicalSeriesFieldsForConsumer(exs *ExSymbol, timeFrame string, fields []string,
 	consumerTimeframe string, startMS, endMS int64, limit int, withUnFinish bool,
 ) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-	coverage := historicalCoverageForQuery(exs.Symbol)
+	options := q.klineRuntimeOptions()
+	coverage := historicalCoverageForQueryWithOptions(exs.Symbol, options)
 	if coverage == nil {
 		return q.getSeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
 	}
@@ -576,13 +617,14 @@ func (q *Queries) GetPhysicalSeriesFieldsForConsumer(exs *ExSymbol, timeFrame st
 	if err = validateHistoricalCoverageFields(coverage, fields); err != nil {
 		return nil, nil, err
 	}
-	intervals := historicalPhysicalCoverageIntervals(coverage, exs.Symbol, timeFrame, consumerTimeframe, startMS, endMS)
+	coverageOptions := coverageQueryOptionsFromKline(options)
+	intervals := historicalPhysicalCoverageIntervalsWithOptions(coverage, exs.Symbol, timeFrame, consumerTimeframe, startMS, endMS, coverageOptions)
 	// A derived consumer may legitimately begin with a partially listed bucket.
 	// Keep the physical loader aligned with the ordinary read path by restoring
 	// the separately proved listing prefix, but never apply it to a direct
 	// physical-timeframe read.
 	if consumerTimeframe != "" && consumerTimeframe != timeFrame {
-		intervals = extendLegacyListingCoverage(coverage, exs, consumerTimeframe, startMS, intervals)
+		intervals = extendLegacyListingCoverageWithOptions(coverage, exs, consumerTimeframe, startMS, intervals, coverageOptions)
 	}
 	return readHistoricalCoverageIntervals(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
 		intervals, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish, reverse bool) (
@@ -594,17 +636,18 @@ func (q *Queries) GetPhysicalSeriesFieldsForConsumer(exs *ExSymbol, timeFrame st
 }
 
 func (q *Queries) GetSeriesFields(exs *ExSymbol, timeFrame string, fields []string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-	coverage := historicalCoverageForQuery(exs.Symbol)
+	options := q.klineRuntimeOptions()
+	coverage := historicalCoverageForQueryWithOptions(exs.Symbol, options)
 	if err := validateHistoricalCoverageFields(coverage, fields); err != nil {
 		return nil, nil, err
 	}
 	if coverage == nil {
 		return q.getSeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
 	}
-	return readHistoricalCoverageSeries(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
+	return readHistoricalCoverageSeriesWithOptions(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
 		func(startMS, endMS int64, limit int, withUnFinish, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 			return q.getSeriesFieldsRawMode(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish, reverse)
-		})
+		}, coverageQueryOptionsFromKline(options))
 }
 
 func (q *Queries) getSeriesFieldsRaw(exs *ExSymbol, timeFrame string, fields []string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
@@ -617,7 +660,7 @@ func (q *Queries) getSeriesFieldsRawMode(exs *ExSymbol, timeFrame string, fields
 ) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 	// Combined is populated from banexg.Market.Combined at the symbol boundary.
 	if exs.Combined {
-		adjs, err := GetAdjs(exs.ID)
+		adjs, err := q.getAdjs(exs.ID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -687,7 +730,7 @@ func (q *Queries) getAdjSeriesFieldsMode(adjs []*AdjInfo, timeFrame string, fiel
 		return nil, nil
 	}
 	if endMS == 0 {
-		endMS = btime.UTCStamp()
+		endMS = q.klineRuntimeOptions().nowMS()
 	}
 	var result []*DataSeries
 	if revRead {
@@ -730,7 +773,7 @@ func (q *Queries) getAdjSeriesFieldsMode(adjs []*AdjInfo, timeFrame string, fiel
 func (q *Queries) querySeriesRows(exs *ExSymbol, timeframe string, fields []string, startMs, finishEndMS int64,
 	limit int, revRead, boundedReverse bool,
 ) ([]*DataSeries, string, *errs.Error) {
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		rows, subTF, err := q.querySeriesPg(exs, timeframe, fields, startMs, finishEndMS, limit,
 			revRead, boundedReverse)
 		if err != nil {
@@ -946,7 +989,7 @@ func (q *Queries) InsertOHLCVSeriesAuto(timeFrame string, exs *ExSymbol, rows []
 		return 0, err
 	}
 	tblName := "kline_" + timeFrame
-	unlock, lockErr := acquireQuestTableReadLock(context.Background(), tblName)
+	unlock, lockErr := q.tableReadLock(context.Background(), tblName)
 	if lockErr != nil {
 		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -955,18 +998,21 @@ func (q *Queries) InsertOHLCVSeriesAuto(timeFrame string, exs *ExSymbol, rows []
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	lastMS := values[len(values)-1].TimeMS
 	endMS := lastMS + tfMSecs
-	insTs, err := AddInsJob(AddInsKlineParams{
+	insTs, addErr := q.AddInsKline(context.Background(), AddInsKlineParams{
 		Sid:       exs.ID,
 		Timeframe: timeFrame,
 		StartMs:   startMS,
 		StopMs:    endMS,
 	})
-	if err != nil || insTs.IsZero() {
-		return 0, err
+	if addErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, addErr)
+	}
+	if insTs.IsZero() {
+		return 0, nil
 	}
 	write := q
 	var tx pgx.Tx
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		var txErr error
 		tx, write, txErr = q.begin(context.Background())
 		if txErr != nil {
@@ -995,7 +1041,7 @@ func (q *Queries) InsertOHLCVSeries(timeFrame string, sid int32, rows []*DataSer
 		return 0, err
 	}
 	tblName := "kline_" + timeFrame
-	unlock, lockErr := acquireQuestTableReadLock(context.Background(), tblName)
+	unlock, lockErr := q.tableReadLock(context.Background(), tblName)
 	if lockErr != nil {
 		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -1004,11 +1050,11 @@ func (q *Queries) InsertOHLCVSeries(timeFrame string, sid int32, rows []*DataSer
 }
 
 func (q *Queries) insertOHLCVRows(timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.insertOHLCVRowsLocked(timeFrame, rows)
 	}
 	tblName := "kline_" + timeFrame
-	unlock, lockErr := acquireQuestTableReadLock(context.Background(), tblName)
+	unlock, lockErr := q.tableReadLock(context.Background(), tblName)
 	if lockErr != nil {
 		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -1018,7 +1064,7 @@ func (q *Queries) insertOHLCVRows(timeFrame string, rows []*DataSeries) (int64, 
 
 // insertOHLCVRowsLocked writes rows while the caller holds the target table read lock.
 func (q *Queries) insertOHLCVRowsLocked(timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.insertOHLCVSeriesPg(timeFrame, rows)
 	}
 	tblName := "kline_" + timeFrame

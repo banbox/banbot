@@ -23,8 +23,67 @@ func New(db DBTX) *Queries {
 	return &Queries{db: db}
 }
 
+// NewWithStorage binds a low-level database handle to an explicit Storage
+// owner. The generated query methods remain allocation-free; the owner is
+// consulted only for backend selection and coordination-sensitive helpers.
+func NewWithStorage(db DBTX, storage *Storage) *Queries {
+	return &Queries{db: db, storage: storage}
+}
+
 type Queries struct {
-	db DBTX
+	db      DBTX
+	storage *Storage
+	symbols *SymbolState
+	options *KlineRuntimeOptions
+}
+
+func (q *Queries) Storage() *Storage {
+	if q == nil {
+		return nil
+	}
+	return q.storage
+}
+
+func (q *Queries) isQuestDB() bool {
+	if q != nil && q.storage != nil {
+		return q.storage.IsQuestDB()
+	}
+	return IsQuestDB
+}
+
+func (q *Queries) processLockRoot() string {
+	if q != nil && q.storage != nil {
+		return q.storage.ProcessLockRoot()
+	}
+	return compactProcessLockRootFn()
+}
+
+func (q *Queries) symbolByID(id int32) *ExSymbol {
+	if q != nil {
+		if q.symbols != nil {
+			return q.symbols.GetSymbolByID(id)
+		}
+		if q.storage != nil {
+			if q.storage.legacy {
+				return GetSymbolByID(id)
+			}
+			return nil
+		}
+	}
+	return GetSymbolByID(id)
+}
+
+// usesLegacySymbolCatalog reports whether this query handle is still using
+// the package-level symbol registry. Explicit Storage and SymbolState owners
+// must never fall back to that registry when a SID is absent.
+func (q *Queries) usesLegacySymbolCatalog() bool {
+	if q == nil {
+		return true
+	}
+	if q.symbols != nil {
+		return false
+	}
+	return q.storage == nil || q.storage.legacy
 }
 
 type dbBeginner interface {
@@ -45,6 +104,39 @@ func (q *Queries) begin(ctx context.Context) (pgx.Tx, *Queries, error) {
 
 func (q *Queries) WithTx(tx pgx.Tx) *Queries {
 	return &Queries{
-		db: tx,
+		db:      tx,
+		storage: q.storage,
+		symbols: q.symbols,
+		options: q.options,
 	}
+}
+
+// WithSeriesSymbolState returns a query handle that resolves adjustment
+// constituent SIDs from the supplied runtime catalog.
+func (q *Queries) WithSeriesSymbolState(symbols *SymbolState) *Queries {
+	if q == nil {
+		return &Queries{symbols: symbols}
+	}
+	copy := *q
+	copy.symbols = symbols
+	return &copy
+}
+
+// WithKlineRuntimeOptions binds the low-frequency replay and clock policy to
+// this query handle. The value is copied so callers can reuse their options
+// without sharing mutable query state.
+func (q *Queries) WithKlineRuntimeOptions(options KlineRuntimeOptions) *Queries {
+	if q == nil {
+		return &Queries{options: &options}
+	}
+	copy := *q
+	copy.options = &options
+	return &copy
+}
+
+func (q *Queries) klineRuntimeOptions() KlineRuntimeOptions {
+	if q != nil && q.options != nil {
+		return *q.options
+	}
+	return LegacyKlineRuntimeOptions()
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 )
@@ -117,7 +118,14 @@ func trySaveSeriesWithDeps(deps *RuntimeDeps, symbols *orm.SymbolState, job *Sav
 	if deps != nil {
 		ctx = deps.context()
 	}
-	sess, conn, err := orm.Conn(ctx)
+	var sess *orm.Queries
+	var conn *pgxpool.Conn
+	var err *errs.Error
+	if deps != nil {
+		sess, conn, err = deps.conn()
+	} else {
+		sess, conn, err = orm.Conn(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -373,7 +381,14 @@ func downEmitHourKlines(deps *RuntimeDeps, symbols *orm.SymbolState, dp *LivePro
 			return
 		}
 	}
-	sess, conn, err := orm.Conn(ctx)
+	var sess *orm.Queries
+	var conn *pgxpool.Conn
+	var err *errs.Error
+	if deps != nil {
+		sess, conn, err = deps.conn()
+	} else {
+		sess, conn, err = orm.Conn(ctx)
+	}
 	if err != nil {
 		log.Error("get kline Conn fail", zap.Error(err))
 		return
@@ -487,7 +502,7 @@ func (j *PairTFCache) fillLacksWithDeps(deps *RuntimeDeps, symbols *orm.SymbolSt
 	if deps == nil {
 		_, preRows, err = autoFetchOhlcv(exs, fetchTF, bigStartMS, startMS)
 	} else {
-		_, preRows, err = autoFetchOhlcvWithExchange(deps.exchange(), exs, fetchTF, bigStartMS, startMS)
+		_, preRows, err = autoFetchOhlcvWithRuntimeDeps(deps, exs, fetchTF, bigStartMS, startMS)
 	}
 	if err != nil {
 		return nil, err
@@ -537,4 +552,26 @@ func autoFetchOhlcvWithExchange(exchange banexg.BanExchange, exs *orm.ExSymbol, 
 		return nil, nil, nil
 	}
 	return orm.AutoFetchSeries(exchange, exs, tf, startMS, endMS, 0, false, nil)
+}
+
+func autoFetchOhlcvWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol, tf string, startMS, endMS int64) ([]*orm.AdjInfo, []*orm.DataSeries, *errs.Error) {
+	if deps == nil {
+		return autoFetchOhlcv(exs, tf, startMS, endMS)
+	}
+	exchange := deps.exchange()
+	if exs == nil {
+		return nil, nil, errs.NewMsg(core.ErrInvalidSymbol, "symbol is required for OHLCV recovery")
+	}
+	if exchange == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "runtime exchange is required")
+	}
+	if !exchange.HasApi(banexg.ApiFetchOHLCV, exs.Market) {
+		return nil, nil, nil
+	}
+	sess, conn, err := deps.conn()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Release()
+	return sess.AutoFetchSeriesWithOptions(exchange, exs, tf, startMS, endMS, 0, false, nil, deps.KlineOptions())
 }

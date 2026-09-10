@@ -47,53 +47,20 @@ func CronRefreshPairsWithSymbolState(dp data.IProvider, symbols *orm.SymbolState
 	cronRefreshPairs(legacyScheduler(nil), dp, symbols, afterRefresh...)
 }
 
-// cronRefreshPairsWithTrader keeps the runtime-owned pair refresh on the
-// trader's core, clock, exchange, and symbol state. The public wrappers above
-// intentionally retain their legacy behavior.
-func cronRefreshPairsWithTrader(scheduler com.Scheduler, trader *CryptoTrader, dp data.IProvider, afterRefresh ...func() error) {
-	if scheduler == nil || trader == nil || dp == nil {
-		return
-	}
-	lastRefreshMS := trader.currentTimeMS()
-	if config.PairMgr.Cron == "" {
-		return
-	}
-	_, err := scheduler.AddFunc(config.PairMgr.Cron, func() {
-		if !trader.runtimeActive() {
-			return
-		}
-		curMS := trader.currentTimeMS()
-		if curMS-lastRefreshMS < config.MinPairCronGapMS {
-			return
-		}
-		lastRefreshMS = curMS
-		if err := trader.refreshPairJobs(false); err != nil {
-			log.Error("RefreshPairJobs fail", zap.Error(err))
-			return
-		}
-		if len(afterRefresh) > 0 && afterRefresh[0] != nil {
-			if err := afterRefresh[0](); err != nil {
-				log.Error("RefreshPairJobs post-refresh fail", zap.Error(err))
-			}
-		}
-	})
-	if err != nil {
-		log.Error("add RefreshPairList fail", zap.Error(err))
-	}
-}
-
 // refreshPairJobsWithRuntime performs the parts of pair rotation that can be
 // composed from explicit dependencies. Strategy/order registries are still
 // compatibility globals, so callers must keep the legacy session gate around
 // this operation (the official live entry already does so).
 func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, deps *biz.RuntimeDeps,
 	clock *btime.ClockState, exchange banexg.BanExchange, showLog, isFirst bool) *errs.Error {
-	cfg := &config.Data
+	var cfg *config.Config
 	if deps != nil {
 		if deps.Config == nil || deps.Config.View() == nil {
 			return errs.NewMsg(core.ErrBadConfig, "runtime config is required")
 		}
 		cfg = deps.Config.View()
+	} else {
+		cfg = &config.Data
 	}
 	pairMgr := cfg.PairMgr
 	if pairMgr == nil {
@@ -103,29 +70,49 @@ func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, dep
 	if deps != nil {
 		state = deps.Core
 	}
+	if deps != nil {
+		if symbols == nil {
+			symbols = deps.Symbols
+		}
+		if deps.Symbols == nil {
+			deps.Symbols = symbols
+		}
+		if clock == nil {
+			clock = deps.Clock
+		}
+		if err := validateCryptoTraderRuntimeDeps(deps, symbols); err != nil {
+			return err
+		}
+	}
 	if dp == nil {
 		return errs.NewMsg(core.ErrRunTime, "live provider is required")
 	}
-	if state != nil && clock == nil {
-		return errs.NewMsg(core.ErrRunTime, "runtime clock is required")
-	}
-	if state != nil && exchange == nil {
+	if deps != nil && exchange == nil {
 		return errs.NewMsg(core.ErrBadConfig, "runtime exchange is required")
 	}
 	if exchange == nil {
 		exchange = exg.Default
 	}
-	curTime := btime.TimeMS()
-	envReal := core.EnvReal
+	var curTime int64
+	var envReal bool
 	if clock != nil {
 		curTime = clock.TimeMS()
+	} else {
+		curTime = btime.TimeMS()
 	}
 	if state != nil {
 		envReal = state.EnvReal
+	} else {
+		envReal = core.EnvReal
 	}
+	var err *errs.Error
 	if isFirst {
 		if pairMgr.Cron != "" {
-			schedule, err := utils.NewCronScheduler(pairMgr.Cron)
+			location := (*time.Location)(nil)
+			if deps != nil && deps.Config != nil {
+				location = deps.Config.Location()
+			}
+			schedule, err := utils.NewCronSchedulerWithLocation(pairMgr.Cron, location)
 			if err != nil {
 				return errs.New(errs.CodeRunTime, err)
 			}
@@ -135,15 +122,26 @@ func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, dep
 		}
 	}
 
-	// goods.RefreshPairListWithSymbolState still updates the compatibility
-	// pair facade. Keep that mutation inside the legacy operation and restore it
-	// before any runtime-owned admission check can observe it.
-	oldPairs, oldPairsMap, oldShowLog := core.Pairs, core.PairsMap, goods.ShowLog
-	defer func() {
-		core.Pairs, core.PairsMap, goods.ShowLog = oldPairs, oldPairsMap, oldShowLog
-	}()
-	goods.ShowLog = showLog
-	pairs, err := goods.RefreshPairListWithSymbolState(symbols, exchange, curTime)
+	var pairs []string
+	if deps != nil {
+		dataDir := ""
+		if deps.Config != nil {
+			dataDir = deps.Config.DataDir
+		}
+		pairs, err = goods.RefreshPairListWithRuntimeDeps(&goods.RuntimeDeps{
+			Core: deps.Core, Clock: deps.Clock, Config: cfg, DataDir: dataDir, Storage: deps.Storage,
+			Symbols: symbols, Exchange: exchange, ShowLog: showLog,
+		}, curTime)
+	} else {
+		// The legacy implementation still updates package-level pair state. Keep
+		// that compatibility mutation scoped to the legacy operation only.
+		oldPairs, oldPairsMap, oldShowLog := core.Pairs, core.PairsMap, goods.ShowLog
+		defer func() {
+			core.Pairs, core.PairsMap, goods.ShowLog = oldPairs, oldPairsMap, oldShowLog
+		}()
+		goods.ShowLog = showLog
+		pairs, err = goods.RefreshPairListWithSymbolState(symbols, exchange, curTime)
+	}
 	if err != nil {
 		return err
 	}
@@ -153,12 +151,16 @@ func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, dep
 		allPairs = append(allPairs, policy.Pairs...)
 	}
 	allPairs, _ = utils.UniqueItems(allPairs)
-	pairTfScores, err := strat.CalcPairTfScoresWithSymbolState(symbols, exchange, allPairs)
+	var scoreState *strat.State
+	if deps != nil {
+		scoreState = deps.Strategies
+	}
+	pairTfScores, err := strat.CalcPairTfScoresWithState(scoreState, symbols, exchange, allPairs)
 	if err != nil {
 		return err
 	}
 	if state != nil {
-		setRuntimePairs(state, pairs)
+		state.SetPairs(pairs, policyPairs(cfg.RunPolicy))
 	}
 	var warms strat.Warms
 	var exitOrders map[string][]*ormo.InOutOrder
@@ -178,9 +180,11 @@ func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, dep
 		if len(orders) == 0 {
 			continue
 		}
-		mgr := biz.GetOdMgr(acc)
+		var mgr biz.IOrderMgr
 		if deps != nil {
 			mgr = biz.GetOdMgrWithState(deps.Trading, acc)
+		} else {
+			mgr = biz.GetOdMgr(acc)
 		}
 		if mgr == nil {
 			return errs.NewMsg(core.ErrRunTime, "order manager is required for pair rotation: %s", acc)
@@ -189,7 +193,7 @@ func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, dep
 			return err
 		}
 		if deps != nil {
-			strat.FinalizePairRotation(deps.Strategies)
+			strat.FinalizePairRotation(deps.Strategies, deps.Core)
 		} else {
 			strat.FinalizePairRotation(nil)
 		}
@@ -216,22 +220,25 @@ func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, dep
 	return nil
 }
 
+func policyPairs(policies []*config.RunPolicyConfig) []string {
+	if len(policies) == 0 {
+		return nil
+	}
+	pairs := make([]string, 0)
+	for _, policy := range policies {
+		if policy != nil {
+			pairs = append(pairs, policy.Pairs...)
+		}
+	}
+	pairs, _ = utils.UniqueItems(pairs)
+	return pairs
+}
+
 func stateIsLive(state *core.State) bool {
 	if state != nil {
 		return state.LiveMode
 	}
 	return core.LiveMode
-}
-
-func setRuntimePairs(state *core.State, pairs []string) {
-	if state == nil {
-		return
-	}
-	additional := make([]string, 0)
-	for _, policy := range config.RunPolicy {
-		additional = append(additional, policy.Pairs...)
-	}
-	state.SetPairs(pairs, additional)
 }
 
 func syncRuntimeOrderMatchState(state *core.State) {
@@ -640,7 +647,7 @@ func bindBalanceRuntimeDeps(deps biz.RuntimeDeps) *balanceRuntimeDeps {
 
 func StartLoopBalancePositionsWithRuntime(lifecycle RuntimeLifecycle, runtimeDeps ...biz.RuntimeDeps) {
 	if lifecycle == nil {
-		StartLoopBalancePositions()
+		log.Error("runtime balance worker requires a lifecycle")
 		return
 	}
 	if len(runtimeDeps) == 0 {
@@ -777,6 +784,10 @@ func sendOrderMsg(od *ormo.InOutOrder, isEnter bool) {
 }
 
 func sendOrderMsgWithOrderState(od *ormo.InOutOrder, isEnter bool, orderState *ormo.OrderState) {
+	sendOrderMsgWithRuntime(od, isEnter, orderState, nil)
+}
+
+func sendOrderMsgWithRuntime(od *ormo.InOutOrder, isEnter bool, orderState *ormo.OrderState, notifications *rpc.Session) {
 	msgType := rpc.MsgTypeExit
 	subOd := od.Exit
 	action := "Close Long"
@@ -795,9 +806,11 @@ func sendOrderMsgWithOrderState(od *ormo.InOutOrder, isEnter bool, orderState *o
 		return
 	}
 	filled, price := subOd.Filled, subOd.Average
-	account := ormo.GetTaskAcc(od.TaskID)
+	var account string
 	if orderState != nil {
 		account = orderState.GetTaskAcc(od.TaskID)
+	} else {
+		account = ormo.GetTaskAcc(od.TaskID)
 	}
 	if account == "" {
 		log.Info("skip send rpc msg, unknown account", zap.Int64("task_id", od.TaskID), zap.String("key", od.Key()),
@@ -809,7 +822,7 @@ func sendOrderMsgWithOrderState(od *ormo.InOutOrder, isEnter bool, orderState *o
 			zap.Int64("status", subOd.Status), zap.Float64("filled", filled))
 		return
 	}
-	rpc.SendMsg(map[string]interface{}{
+	message := map[string]interface{}{
 		"type":          msgType,
 		"account":       account,
 		"action":        action,
@@ -829,5 +842,10 @@ func sendOrderMsgWithOrderState(od *ormo.InOutOrder, isEnter bool, orderState *o
 		"profit_rate":   od.ProfitRate,
 		"max_pft_rate":  od.MaxPftRate,
 		"max_draw_down": od.MaxDrawDown,
-	})
+	}
+	if notifications != nil {
+		notifications.SendMsg(message)
+	} else {
+		rpc.SendMsg(message)
+	}
 }

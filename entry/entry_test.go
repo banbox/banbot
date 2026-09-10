@@ -184,6 +184,75 @@ func TestLegacyRunnerSessionCreatesOneProcess(t *testing.T) {
 	}
 }
 
+func TestLegacyRunnerClosesProcessBeforeReleasingGate(t *testing.T) {
+	callbackReady := make(chan struct{})
+	callbackReturned := make(chan struct{})
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	firstDone := make(chan *errs.Error, 1)
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(releaseClose)
+		}
+	})
+
+	go func() {
+		firstDone <- runLegacyRunnerSession(func(process *runtime.Process) *errs.Error {
+			rt, err := process.NewRuntime(runtime.Options{})
+			if err != nil {
+				return errs.New(core.ErrRunTime, err)
+			}
+			rt.OnClose(func() {
+				close(closeStarted)
+				<-releaseClose
+			})
+			close(callbackReady)
+			close(callbackReturned)
+			return nil
+		})
+	}()
+
+	<-callbackReady
+	<-callbackReturned
+	secondEntered := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		_ = runLegacyEntrySession(func() *errs.Error {
+			close(secondEntered)
+			return nil
+		})
+		close(secondDone)
+	}()
+
+	select {
+	case <-secondEntered:
+		t.Fatal("legacy gate released before Process.Close completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseClose)
+	released = true
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first legacy runner failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first legacy runner did not close its process")
+	}
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("process close hook did not run")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("legacy gate was not released after Process.Close")
+	}
+}
+
 func TestLegacyEntrySessionReleasesAfterError(t *testing.T) {
 	want := errs.NewMsg(core.ErrRunTime, "legacy entry failed")
 	if got := runLegacyEntrySession(func() *errs.Error { return want }); got != want {
@@ -426,9 +495,6 @@ func TestPublicLegacyEntryAPIsShareProcessGate(t *testing.T) {
 		name string
 		run  func(*config.CmdArgs) *errs.Error
 	}{
-		{name: "backtest", run: RunBackTest},
-		{name: "trade", run: RunTrade},
-		{name: "trade-with", run: func(args *config.CmdArgs) *errs.Error { return RunTradeWith(args, nil) }},
 		{name: "down", run: RunDownData},
 		{name: "repair-ranges", run: RunRepairKlineRanges},
 		{name: "correct", run: RunKlineCorrect},
@@ -481,6 +547,42 @@ func TestPublicLegacyEntryAPIsShareProcessGate(t *testing.T) {
 				}
 			case <-time.After(time.Second):
 				t.Fatalf("%s did not finish after gate release", test.name)
+			}
+		})
+	}
+}
+
+func TestPublicRuntimeEntryAPIsBypassLegacyGate(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*config.CmdArgs) *errs.Error
+	}{
+		{name: "backtest", run: RunBackTest},
+		{name: "trade", run: func(args *config.CmdArgs) *errs.Error { return RunTradeWith(args, nil) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			args := &config.CmdArgs{
+				DataDir:    dataDir,
+				NoDefault:  true,
+				ConfigData: "invalid: [",
+				Logfile:    filepath.Join(dataDir, "runner.log"),
+			}
+			unlock := runtime.LockLegacy()
+			defer unlock()
+			done := make(chan struct{})
+			var got *errs.Error
+			go func() {
+				defer close(done)
+				got = test.run(args)
+			}()
+			select {
+			case <-done:
+				if got == nil {
+					t.Fatal("runtime entry unexpectedly succeeded with invalid config")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("runtime entry waited for the legacy gate")
 			}
 		})
 	}

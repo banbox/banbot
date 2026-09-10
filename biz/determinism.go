@@ -11,8 +11,15 @@ import (
 	"github.com/banbox/banbot/utils"
 )
 
-func executionMapKeys[M ~map[K]V, K cmp.Ordered, V any](items M) iter.Seq[K] {
-	return utils.MapKeys(items, config.StrictBacktest())
+func executionMapKeys[M ~map[K]V, K cmp.Ordered, V any](items M, deps ...*RuntimeDeps) iter.Seq[K] {
+	return utils.MapKeys(items, strictBacktestFor(deps...))
+}
+
+func strictBacktestFor(deps ...*RuntimeDeps) bool {
+	if len(deps) > 0 {
+		return deps[0].StrictBacktest()
+	}
+	return config.StrictBacktest()
 }
 
 func executionAccountConfigs(deps *RuntimeDeps) map[string]*config.AccountConfig {
@@ -35,7 +42,7 @@ func executionAccountNames(deps ...*RuntimeDeps) iter.Seq[string] {
 			}
 		}
 	}
-	if config.StrictBacktest() {
+	if strictBacktestFor(runtimeDeps) {
 		return utils.MapKeys(accounts, true)
 	}
 	return func(yield func(string) bool) {
@@ -47,10 +54,10 @@ func executionAccountNames(deps ...*RuntimeDeps) iter.Seq[string] {
 	}
 }
 
-func executionStratJobs(jobs map[string]*strat.StratJob) iter.Seq[*strat.StratJob] {
+func executionStratJobs(jobs map[string]*strat.StratJob, deps ...*RuntimeDeps) iter.Seq[*strat.StratJob] {
 	return func(yield func(*strat.StratJob) bool) {
-		if config.StrictBacktest() {
-			for key := range executionMapKeys(jobs) {
+		if strictBacktestFor(deps...) {
+			for key := range executionMapKeys(jobs, deps...) {
 				if !yield(jobs[key]) {
 					return
 				}
@@ -65,10 +72,10 @@ func executionStratJobs(jobs map[string]*strat.StratJob) iter.Seq[*strat.StratJo
 	}
 }
 
-func executionJobEnvs(jobs map[string]*strat.JobEnv) iter.Seq[*strat.JobEnv] {
+func executionJobEnvs(jobs map[string]*strat.JobEnv, deps ...*RuntimeDeps) iter.Seq[*strat.JobEnv] {
 	return func(yield func(*strat.JobEnv) bool) {
-		if config.StrictBacktest() {
-			for key := range executionMapKeys(jobs) {
+		if strictBacktestFor(deps...) {
+			for key := range executionMapKeys(jobs, deps...) {
 				if !yield(jobs[key]) {
 					return
 				}
@@ -83,10 +90,10 @@ func executionJobEnvs(jobs map[string]*strat.JobEnv) iter.Seq[*strat.JobEnv] {
 	}
 }
 
-func executionOpenOrders(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
+func executionOpenOrders(orders map[int64]*ormo.InOutOrder, deps ...*RuntimeDeps) []*ormo.InOutOrder {
 	result := utils.ValsOfMap(orders)
 	// Maps have no supplied order to preserve, including during frozen replays.
-	if config.StrictBacktest() {
+	if strictBacktestFor(deps...) {
 		slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
 			if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {
 				return order
@@ -97,17 +104,35 @@ func executionOpenOrders(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
 	return result
 }
 
-func preserveFrozenReplayExecutionOrder() bool {
+func preserveFrozenReplayExecutionOrder(deps ...*RuntimeDeps) bool {
+	if len(deps) > 0 && deps[0] != nil {
+		cfg := deps[0].ConfigView()
+		if cfg == nil {
+			return false
+		}
+		return isFrozenRuntimePairs(cfg, deps[0].StrictBacktest())
+	}
 	pairs, _ := config.GetStaticPairs()
 	return config.IsFrozenStaticPairs(pairs)
 }
 
-func executionOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
-	if !config.StrictBacktest() {
+func executionOrderView(orders []*ormo.InOutOrder, deps ...*RuntimeDeps) []*ormo.InOutOrder {
+	if !strictBacktestFor(deps...) {
+		if len(deps) > 0 && deps[0] != nil {
+			return orders
+		}
 		return legacyWalletOrderView(orders)
 	}
-	if preserveFrozenReplayExecutionOrder() {
+	if preserveFrozenReplayExecutionOrder(deps...) {
+		return orders
+	}
+	if len(deps) > 0 && deps[0] != nil {
 		return orders
 	}
 	return legacyWalletOrderView(orders)
+}
+
+func isFrozenRuntimePairs(cfg *config.Config, strict bool) bool {
+	return cfg != nil && len(cfg.Pairs) > 0 && len(cfg.PairFilters) == 0 &&
+		(cfg.PairMgr == nil || !cfg.PairMgr.ForceFilters) && strict && cfg.BTNoKlineDownload
 }

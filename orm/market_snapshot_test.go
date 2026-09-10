@@ -204,6 +204,50 @@ func TestLoadMarketsUsesSnapshotWithoutLiveMarketRequest(t *testing.T) {
 	}
 }
 
+func TestLoadMarketsWithRuntimeUsesOwnedSnapshot(t *testing.T) {
+	dataDir := t.TempDir()
+	const symbol = "RUNTIME/USDT:USDT"
+	snapshot := historicalMarketSnapshot{
+		Exchange: "binance", MarketType: banexg.MarketLinear,
+		Markets: banexg.MarketMap{symbol: {
+			ID: "RUNTIMEUSDT", Symbol: symbol, Linear: true, Contract: true,
+			Precision: &banexg.Precision{Price: 3, Amount: 4},
+		}},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "runtime.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(data))
+	cfg := &config.Config{
+		Exchange: &config.ExchangeConfig{
+			Name: "binance", Items: map[string]map[string]interface{}{
+				"binance": {"market_snapshot": "@runtime.json", "market_snapshot_sha256": hash},
+			},
+		},
+		MarketType: banexg.MarketLinear,
+	}
+	runtimeSnapshot := config.NewSnapshotWithDirs(cfg, dataDir, "")
+	runtimeCore, stateErr := core.NewState(nil)
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	defer runtimeCore.Close()
+	runtimeCore.SetRunMode(core.RunModeBackTest)
+	exchange := &snapshotMarketExchange{info: &banexg.ExgInfo{ID: "binance", MarketType: banexg.MarketLinear}}
+	markets, loadErr := LoadMarketsWithRuntime(NewSymbolStateWithIdentity("binance", banexg.MarketLinear), exchange,
+		false, runtimeSnapshot, runtimeCore)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if exchange.loadCalls != 0 || len(markets) != 1 || markets[symbol] == nil || markets["LIVE/USDT:USDT"] != nil {
+		t.Fatalf("load calls=%d markets=%#v", exchange.loadCalls, markets)
+	}
+}
+
 func TestMarketSnapshotModeIncludesDataCommandsButNotLive(t *testing.T) {
 	originalMode := core.RunMode
 	originalBacktest := core.BackTestMode

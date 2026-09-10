@@ -140,6 +140,14 @@ func TestKLineSeriesStoreEnsureLockedRunsUnderHeldTableReadLock(t *testing.T) {
 	}
 }
 
+func TestKLineSeriesStoreWithNilStorageDoesNotFallBackToLegacyConnection(t *testing.T) {
+	store := NewKLineSeriesStoreWithStorage(&SeriesInfo{Name: "series", TimeFrame: "1m"}, nil)
+	_, release, err := store.session(context.Background())
+	if err == nil || release != nil || !strings.Contains(err.Error(), "storage is required") {
+		t.Fatalf("nil explicit storage session = release present %t, error %v", release != nil, err)
+	}
+}
+
 type rowScannerFunc func(dest ...any) error
 
 func (f rowScannerFunc) Scan(dest ...any) error {

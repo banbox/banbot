@@ -225,7 +225,11 @@ func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64,
 		return 0, 0, errs.NewMsg(core.ErrBadConfig, "invalid aggregate source %s for %s", aggFrom, item.TimeFrame)
 	}
 	// Align windows (accounting for exchange-specific offset).
-	offMS := GetAlignOff(sid, tfMSecs)
+	exs := q.symbolByID(sid)
+	offMS := seriesAlignOff(exs, tfMSecs)
+	if offMS == 0 && exs == nil && q.usesLegacySymbolCatalog() {
+		offMS = GetAlignOff(sid, tfMSecs)
+	}
 	alignedStart := utils2.AlignTfMSecs(aggStart-offMS, tfMSecs) + offMS
 	alignedEnd := utils2.AlignTfMSecs(endMS-offMS, tfMSecs) + offMS
 	if alignedStart >= alignedEnd {
@@ -555,7 +559,7 @@ func (q *Queries) delAdjFactorsPg(ctx context.Context, sid int32) error {
 	return err
 }
 
-func delFactorsPg(ctx context.Context, sid int32, startMS, endMS int64) *errs.Error {
+func (q *Queries) delFactorsPg(ctx context.Context, sid int32, startMS, endMS int64) *errs.Error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -571,7 +575,7 @@ func delFactorsPg(ctx context.Context, sid int32, startMS, endMS int64) *errs.Er
 		sqlText += fmt.Sprintf(" AND start_ms < $%d", argIdx)
 		args = append(args, endMS)
 	}
-	_, err := pool.Exec(ctx, sqlText, args...)
+	_, err := q.db.Exec(ctx, sqlText, args...)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
@@ -643,9 +647,9 @@ func (q *Queries) delInsKlinePg(ctx context.Context, sid int32, timeframe string
 // kline_un (unfinished bar) operations for TimescaleDB
 // ─────────────────────────────────────────────
 
-func queryUnfinishPg(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline, int64, *int64, error) {
+func (q *Queries) queryUnfinishPg(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline, int64, *int64, error) {
 	ctx := context.Background()
-	row := pool.QueryRow(ctx, `SELECT start_ms, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
+	row := q.db.QueryRow(ctx, `SELECT start_ms, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
 FROM kline_un
 WHERE sid = $1 AND timeframe = $2 AND start_ms >= $3`,
 		sid, timeFrame, barStartMS,
@@ -668,10 +672,10 @@ WHERE sid = $1 AND timeframe = $2 AND start_ms >= $3`,
 	return bar, stopMs, &expireMsVal, nil
 }
 
-func setUnfinishPg(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
+func (q *Queries) setUnfinishPg(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
 	expireMS := utils2.AlignTfMSecs(btime.UTCStamp(), 60000) + 60000
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO kline_un (sid, timeframe, start_ms, stop_ms, expire_ms,
+	_, err := q.db.Exec(ctx, `INSERT INTO kline_un (sid, timeframe, start_ms, stop_ms, expire_ms,
 open, high, low, close, volume, quote, buy_volume, trade_num)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 ON CONFLICT (sid, timeframe) DO UPDATE SET
@@ -687,20 +691,20 @@ ON CONFLICT (sid, timeframe) DO UPDATE SET
 	return nil
 }
 
-func delKLineUnPg(ctx context.Context, sid int32, timeFrame string) *errs.Error {
+func (q *Queries) delKLineUnPg(ctx context.Context, sid int32, timeFrame string) *errs.Error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	_, err := pool.Exec(ctx, `DELETE FROM kline_un WHERE sid = $1 AND timeframe = $2`, sid, timeFrame)
+	_, err := q.db.Exec(ctx, `DELETE FROM kline_un WHERE sid = $1 AND timeframe = $2`, sid, timeFrame)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
 }
 
-func purgeKlineUnPg() *errs.Error {
+func (q *Queries) purgeKlineUnPg() *errs.Error {
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `TRUNCATE TABLE kline_un`)
+	_, err := q.db.Exec(ctx, `TRUNCATE TABLE kline_un`)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
@@ -726,7 +730,7 @@ func (q *Queries) delKLinesPgBySid(timeFrame string, delSids map[int32]bool) *er
 		delList = append(delList, itoa(int64(sid)))
 	}
 	sidIn := strings.Join(delList, ",")
-	_, err_ := pool.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE sid IN (%s)", tblName, sidIn))
+	_, err_ := q.db.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE sid IN (%s)", tblName, sidIn))
 	if err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
@@ -824,7 +828,11 @@ ORDER BY sid, time`, tblName, buildPgTimeFilter(startMs, finishEndMS), sidText)
 	callBack := func() {
 		if fromTfMSecs > 0 {
 			var lastDone bool
-			offMS := GetAlignOff(curSid, tfMSecs)
+			exs := exsMap[curSid]
+			offMS := seriesAlignOff(exs, tfMSecs)
+			if offMS == 0 && exs == nil && q.usesLegacySymbolCatalog() {
+				offMS = GetAlignOff(curSid, tfMSecs)
+			}
 			klineArr, lastDone = utils.BuildOHLCV(klineArr, tfMSecs, 0, nil, fromTfMSecs, offMS)
 			if !lastDone && len(klineArr) > 0 {
 				klineArr = klineArr[:len(klineArr)-1]

@@ -3,6 +3,7 @@ package biz
 import (
 	"fmt"
 	"math"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banbot/rpc"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -35,8 +37,8 @@ type Trader struct {
 }
 
 // RuntimeDeps is the mutable runtime state consumed directly by Trader.
-// Strategy jobs, order managers, and wallets remain package-scoped and entry
-// serializes runners that use them until those owners gain typed state.
+// Each explicit trader owns its strategy, order, trading, market, and clock
+// state; legacy package facades are used only by traders without RuntimeDeps.
 type RuntimeDeps struct {
 	Core       *core.State
 	Clock      *btime.ClockState
@@ -51,9 +53,42 @@ type RuntimeDeps struct {
 	// the historical single-account semantics without a hot-path global read.
 	Accounts       map[string]*config.AccountConfig
 	Symbols        *orm.SymbolState
+	Storage        *orm.Storage
 	Exchange       banexg.BanExchange
 	Scheduler      com.Scheduler
+	Notifications  *rpc.Session
+	Dump           *orm.DumpSink
 	DefaultAccount string
+}
+
+// ConfigView returns the immutable configuration owned by this runtime. A
+// nil result is intentional for an explicitly constructed runtime without a
+// configuration; callers must not substitute the process-wide config there.
+func (d *RuntimeDeps) ConfigView() *config.Config {
+	if d == nil || d.Config == nil {
+		return nil
+	}
+	return d.Config.View()
+}
+
+// StrictBacktest reports the execution policy bound to this runtime. The
+// legacy facade remains available only when no runtime dependencies exist.
+func (d *RuntimeDeps) StrictBacktest() bool {
+	if d == nil {
+		return config.StrictBacktest()
+	}
+	cfg := d.ConfigView()
+	return d.Core != nil && d.Core.BackTestMode && cfg != nil && cfg.BTStrict
+}
+
+// StrictHistoricalReplay reports the legacy order-metric compatibility mode
+// using only this runtime's configuration snapshot.
+func (d *RuntimeDeps) StrictHistoricalReplay() bool {
+	if d == nil {
+		return config.StrictHistoricalReplay(config.HistoricalCoverage)
+	}
+	cfg := d.ConfigView()
+	return d.StrictBacktest() && cfg != nil && cfg.BTNoKlineDownload && cfg.HistoricalCoverage != nil
 }
 
 // AccountConfigs returns the immutable account configuration owned by this
@@ -112,24 +147,43 @@ func NewTraderWithRuntimeDeps(deps RuntimeDeps) Trader {
 		deps.Clock = btime.NewClockState(deps.Core.BackTestMode, nil)
 	}
 	if deps.Market == nil {
-		deps.Market = com.NewMarketState(deps.Core.ExgName)
+		deps.Market = com.NewMarketStateWithExchange(deps.Core.ExgName, deps.Exchange)
+	} else if deps.Market.Prices == nil {
+		deps.Market.Prices = com.NewPriceStateWithExchange(deps.Core.ExgName, deps.Exchange)
+	}
+	if deps.Market.PairCopied == nil {
+		deps.Market.PairCopied = com.NewPairCopiedState()
 	}
 	if deps.Batch == nil {
 		deps.Batch = strat.NewBatchState()
 	}
-	if deps.Strategies == nil {
+	if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
 		deps.Strategies = strat.NewState()
 	}
-	if deps.Orders == nil {
+	if deps.Orders == nil || deps.Orders == ormo.LegacyState() {
 		deps.Orders = ormo.NewOrderState()
 	}
 	deps.Orders.BindCore(deps.Core)
+	deps.Orders.BindRuntime(deps.Clock, deps.Market.Prices, deps.Exchange, deps.ConfigView())
+	if cfg := deps.ConfigView(); cfg != nil {
+		if deps.Config.DataDir != "" {
+			deps.Orders.BindTradesPath(filepath.Join(deps.Config.DataDir, fmt.Sprintf("orders_%s.db", cfg.Name)))
+		}
+		deps.Orders.BindExecutionOptions(ormo.ExecutionOptions{
+			StrictBacktest:     deps.StrictBacktest(),
+			LegacyOrderMetrics: deps.StrictHistoricalReplay() && cfg.BTLegacyOrderMetrics,
+		})
+	}
 	if deps.Trading == nil {
 		deps.Trading = NewTradingState()
 	} else {
 		deps.Trading.ensure()
 	}
+	if deps.DefaultAccount == "" && !deps.Core.EnvReal {
+		deps.DefaultAccount = "default"
+	}
 	deps.Accounts = normalizeRuntimeAccounts(deps)
+	deps.Strategies.BindRuntime(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange)
 	for account := range deps.Accounts {
 		// Explicit strategy states start empty. Seed their account registries at
 		// construction time so the loader can populate them without consulting
@@ -189,10 +243,13 @@ func (t *Trader) RuntimeDependencies() *RuntimeDeps {
 }
 
 func (t *Trader) strategyState() *strat.State {
-	if t != nil && t.runtime != nil && t.runtime.Strategies != nil {
-		return t.runtime.Strategies
+	if t == nil || t.runtime == nil {
+		return strat.LegacyState()
 	}
-	return strat.LegacyState()
+	if t.runtime.Strategies == nil {
+		return nil
+	}
+	return t.runtime.Strategies
 }
 
 func (t *Trader) accountName(account string) string {
@@ -410,7 +467,11 @@ func (t *Trader) OnEnvSeries(evt *orm.DataSeries) (*ta.BarEnv, *errs.Error) {
 	}
 	symbol := exs.Symbol
 	envKey := strings.Join([]string{symbol, evt.TimeFrame}, "_")
-	env, ok := t.strategyState().Env(envKey)
+	strategyState := t.strategyState()
+	if strategyState == nil {
+		return nil, errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
+	}
+	env, ok := strategyState.Env(envKey)
 	if !ok {
 		// 额外订阅1h没有对应的env，无需处理
 		return nil, nil
@@ -487,6 +548,10 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries, resolved ...*orm.ExSymb
 	if evt == nil {
 		return nil
 	}
+	strategyState := t.strategyState()
+	if strategyState == nil {
+		return errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
+	}
 	var exs *orm.ExSymbol
 	if len(resolved) > 0 {
 		exs = resolved[0]
@@ -509,31 +574,31 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries, resolved ...*orm.ExSymb
 		}
 		dispatched = true
 		var jobMap map[string]*strat.StratJob
-		if t.runtime != nil && t.runtime.Strategies != nil {
-			jobMap = t.runtime.Strategies.InfoJobs(t.accountName(account))[subKey]
+		if t.runtime != nil {
+			jobMap = strategyState.InfoJobs(t.accountName(account))[subKey]
 		} else {
 			strat.LockJobsRead()
 			jobMap, _ = strat.GetInfoJobs(account)[subKey]
 			strat.UnlockJobsRead()
 		}
-		deliverDataOnlySeries(jobMap, evt, exs)
+		deliverDataOnlySeries(jobMap, evt, exs, t.runtime)
 	}
 	if !dispatched {
 		var jobMap map[string]*strat.StratJob
-		if t.runtime != nil && t.runtime.Strategies != nil {
-			jobMap = t.runtime.Strategies.InfoJobs(t.accountName(config.DefAcc))[subKey]
+		if t.runtime != nil {
+			jobMap = strategyState.InfoJobs(t.runtime.DefaultAccount)[subKey]
 		} else {
 			strat.LockJobsRead()
 			jobMap, _ = strat.GetInfoJobs(config.DefAcc)[subKey]
 			strat.UnlockJobsRead()
 		}
-		deliverDataOnlySeries(jobMap, evt, exs)
+		deliverDataOnlySeries(jobMap, evt, exs, t.runtime)
 	}
 	return nil
 }
 
-func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSeries, exs *orm.ExSymbol) {
-	for job := range executionStratJobs(jobMap) {
+func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSeries, exs *orm.ExSymbol, deps *RuntimeDeps) {
+	for job := range executionStratJobs(jobMap, deps) {
 		if job.Strat.OnData == nil {
 			continue
 		}
@@ -583,7 +648,9 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 	}
 	var accOrders map[string][]*ormo.InOutOrder
 	if market := t.marketState(); market != nil {
-		market.Prices.SetBarPriceAt(t.TimeMS(), symbol, closeVal)
+		if market.Prices != nil {
+			market.Prices.SetBarPriceAt(t.TimeMS(), symbol, closeVal)
+		}
 	} else {
 		com.SetBarPrice(symbol, closeVal)
 	}
@@ -597,7 +664,7 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 			}
 			openOds, lock := t.openOrders(account)
 			lock.Lock()
-			allOrders := executionOpenOrders(openOds)
+			allOrders := executionOpenOrders(openOds, t.runtime)
 			lock.Unlock()
 			odMgr := t.orderManager(account)
 			if len(allOrders) > 0 {
@@ -631,7 +698,7 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 			barExpired = false
 		}
 	}
-	if t.parallelOnBar() && !config.StrictBacktest() {
+	if t.parallelOnBar() && !strictBacktestFor(t.runtime) {
 		return t.feedClosedSeriesParallel(evt, env, symbol, odMatch, accOrders, barExpired)
 	}
 	return t.feedClosedSeriesSerial(evt, env, symbol, odMatch, accOrders, barExpired)
@@ -654,7 +721,7 @@ func (t *Trader) feedClosedSeriesSerial(evt *orm.DataSeries, env *ta.BarEnv, sym
 		if !odMatch {
 			openOds, lock := t.openOrders(account)
 			lock.Lock()
-			allOrders = executionOpenOrders(openOds)
+			allOrders = executionOpenOrders(openOds, t.runtime)
 			lock.Unlock()
 		}
 		var curOrders []*ormo.InOutOrder
@@ -699,7 +766,7 @@ func (t *Trader) feedClosedSeriesParallel(evt *orm.DataSeries, env *ta.BarEnv, s
 		if !odMatch {
 			openOds, lock := t.openOrders(account)
 			lock.Lock()
-			allOrders = executionOpenOrders(openOds)
+			allOrders = executionOpenOrders(openOds, t.runtime)
 			lock.Unlock()
 		}
 		var curOrders []*ormo.InOutOrder
@@ -732,7 +799,7 @@ func (t *Trader) feedClosedSeriesParallel(evt *orm.DataSeries, env *ta.BarEnv, s
 }
 
 func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.DataSeries, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
-	if t.parallelOnBar() && !config.StrictBacktest() {
+	if t.parallelOnBar() && !strictBacktestFor(t.runtime) {
 		return t.onAccountDataSeriesParallel(account, env, evt, curOrders, barExpired)
 	}
 	return t.onAccountDataSeriesSerial(account, env, evt, curOrders, barExpired)
@@ -744,10 +811,13 @@ func (t *Trader) onAccountDataSeriesSerial(account string, env *ta.BarEnv, evt *
 	envKey := symbol + "_" + evt.TimeFrame
 	var jobs map[string]*strat.StratJob
 	var infoJobMap map[string]map[string]*strat.StratJob
-	if t.runtime != nil && t.runtime.Strategies != nil {
-		state := t.runtime.Strategies
-		jobs = state.Jobs(t.accountName(account))[envKey]
-		infoJobMap = state.InfoJobs(t.accountName(account))
+	strategyState := t.strategyState()
+	if strategyState == nil {
+		return errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
+	}
+	if t.runtime != nil {
+		jobs = strategyState.Jobs(t.accountName(account))[envKey]
+		infoJobMap = strategyState.InfoJobs(t.accountName(account))
 	} else {
 		strat.LockJobsRead()
 		jobs, _ = strat.GetJobs(account)[envKey]
@@ -757,7 +827,7 @@ func (t *Trader) onAccountDataSeriesSerial(account string, env *ta.BarEnv, evt *
 	if len(infoJobMap) > 0 {
 		infoJobs = infoJobMap[strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)]
 	}
-	if t.runtime == nil || t.runtime.Strategies == nil {
+	if t.runtime == nil {
 		strat.UnlockJobsRead()
 	}
 	if len(jobs) == 0 && len(infoJobs) == 0 {
@@ -769,7 +839,7 @@ func (t *Trader) onAccountDataSeriesSerial(account string, env *ta.BarEnv, evt *
 	if len(infoJobs) > 0 {
 		handledJobs = make(map[*strat.StratJob]bool, len(jobs))
 	}
-	for job := range executionStratJobs(jobs) {
+	for job := range executionStratJobs(jobs, t.runtime) {
 		if handledJobs != nil {
 			handledJobs[job] = true
 		}
@@ -790,7 +860,7 @@ func (t *Trader) onAccountInfoSeries(account string, env *ta.BarEnv, evt *orm.Da
 	infoJobs map[string]*strat.StratJob, handledJobs map[*strat.StratJob]bool) *errs.Error {
 	symbol := t.seriesSymbol(evt)
 	isWarmup := evt.IsWarmUp
-	for job := range executionStratJobs(infoJobs) {
+	for job := range executionStratJobs(infoJobs, t.runtime) {
 		t.bindJobRuntime(job)
 		if handledJobs[job] {
 			continue
@@ -810,7 +880,7 @@ func (t *Trader) onAccountInfoSeries(account string, env *ta.BarEnv, evt *orm.Da
 			strat.CheckJobInOutNum(job, "OnInfoBar", num1, num2)
 		}
 		if job.Strat.BatchInfo && job.Strat.OnBatchInfos != nil {
-			AddBatchJobWithState(t.BatchState(), account, evt.TimeFrame, job, env)
+			AddBatchJobWithRuntimeDeps(t.runtime, t.BatchState(), account, evt.TimeFrame, job, env)
 		}
 	}
 	if env.VNum > 1000 && !isWarmup {
@@ -842,10 +912,13 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 	envKey := symbol + "_" + evt.TimeFrame
 	var jobs map[string]*strat.StratJob
 	var infoJobMap map[string]map[string]*strat.StratJob
-	if t.runtime != nil && t.runtime.Strategies != nil {
-		state := t.runtime.Strategies
-		jobs = state.Jobs(t.accountName(account))[envKey]
-		infoJobMap = state.InfoJobs(t.accountName(account))
+	strategyState := t.strategyState()
+	if strategyState == nil {
+		return errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
+	}
+	if t.runtime != nil {
+		jobs = strategyState.Jobs(t.accountName(account))[envKey]
+		infoJobMap = strategyState.InfoJobs(t.accountName(account))
 	} else {
 		strat.LockJobsRead()
 		jobs, _ = strat.GetJobs(account)[envKey]
@@ -855,7 +928,7 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 	if len(infoJobMap) > 0 {
 		infoJobs = infoJobMap[strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)]
 	}
-	if t.runtime == nil || t.runtime.Strategies == nil {
+	if t.runtime == nil {
 		strat.UnlockJobsRead()
 	}
 	if len(jobs) == 0 && len(infoJobs) == 0 {
@@ -864,12 +937,12 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 	odMgr := t.orderManager(account)
 	isWarmup := evt.IsWarmUp
 	var wg sync.WaitGroup
-	parallelOnBar := t.parallelOnBar() && !config.StrictBacktest()
+	parallelOnBar := t.parallelOnBar() && !strictBacktestFor(t.runtime)
 	jobKeys := make([]string, 0, len(jobs))
 	for key := range jobs {
 		jobKeys = append(jobKeys, key)
 	}
-	if config.StrictBacktest() {
+	if strictBacktestFor(t.runtime) {
 		sort.Strings(jobKeys)
 	}
 	var errCh chan parallelError
@@ -912,7 +985,7 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 			return err
 		}
 	}
-	for job := range executionStratJobs(infoJobs) {
+	for job := range executionStratJobs(infoJobs, t.runtime) {
 		if handledJobs[job] {
 			continue
 		}
@@ -931,7 +1004,7 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 			strat.CheckJobInOutNum(job, "OnInfoBar", num1, num2)
 		}
 		if job.Strat.BatchInfo && job.Strat.OnBatchInfos != nil {
-			AddBatchJobWithState(t.BatchState(), account, evt.TimeFrame, job, env)
+			AddBatchJobWithRuntimeDeps(t.runtime, t.BatchState(), account, evt.TimeFrame, job, env)
 		}
 	}
 	if env.VNum > 1000 && !isWarmup {
@@ -974,7 +1047,7 @@ func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, ev
 	isBatch := job.Strat.BatchInOut && job.Strat.OnBatchJobs != nil
 	if !barExpired {
 		if isBatch {
-			AddBatchJobWithState(t.BatchState(), account, evt.TimeFrame, job, nil)
+			AddBatchJobWithRuntimeDeps(t.runtime, t.BatchState(), account, evt.TimeFrame, job, nil)
 		}
 	} else {
 		entryNum := len(job.Entrys)
@@ -982,7 +1055,13 @@ func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, ev
 			log.Info("skip open orders by bar expired", zap.String("acc", account),
 				zap.String("pair", t.seriesSymbol(evt)), zap.String("tf", evt.TimeFrame),
 				zap.Int("num", entryNum))
-			strat.AddAccFailOpens(account, strat.FailOpenBarTooLate, entryNum)
+			if t.runtime != nil {
+				if strategyState := t.strategyState(); strategyState != nil {
+					strategyState.AddAccFailOpens(account, strat.FailOpenBarTooLate, entryNum)
+				}
+			} else {
+				strat.AddAccFailOpens(account, strat.FailOpenBarTooLate, entryNum)
+			}
 			job.Entrys = nil
 		}
 	}
@@ -1025,7 +1104,11 @@ func (t *Trader) OnEnvEnd(evt *orm.DataSeries) {
 		return
 	}
 	envKey := strings.Join([]string{symbol, evt.TimeFrame}, "_")
-	env, ok := t.strategyState().Env(envKey)
+	strategyState := t.strategyState()
+	if strategyState == nil {
+		return
+	}
+	env, ok := strategyState.Env(envKey)
 	if ok {
 		env.Reset()
 	}

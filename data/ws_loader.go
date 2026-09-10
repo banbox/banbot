@@ -168,8 +168,10 @@ func NewWsDataLoaderWithRuntimeDeps(deps *RuntimeDeps) (*WsDataLoader, *errs.Err
 func newWsDataLoader(deps *RuntimeDeps) (*WsDataLoader, *errs.Error) {
 	client := banexg.NewHttpClient()
 	client.Timeout = 120 * time.Second
-	parent := core.Ctx
-	if deps != nil {
+	var parent context.Context
+	if deps == nil {
+		parent = core.Ctx
+	} else {
 		parent = deps.context()
 	}
 	if parent == nil {

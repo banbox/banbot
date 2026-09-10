@@ -73,6 +73,9 @@ func (f *TradeFeeder) wsRegistry() *strat.WsSubJobRegistry {
 	if f != nil && f.wsSubs != nil {
 		return f.wsSubs
 	}
+	if f != nil && f.deps != nil {
+		return nil
+	}
 	return strat.LegacyWsSubJobRegistry()
 }
 

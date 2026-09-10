@@ -97,8 +97,22 @@ func (p *PerfSta) Log2(profit float64) float64 {
 }
 
 func DumpPerfs(outDir string) {
+	dumpPerfs(outDir, JobPerfs, StratPerfSta)
+}
+
+func (s *State) DumpPerfs(outDir string) {
+	if s == nil {
+		return
+	}
+	dumpPerfs(outDir, s.JobPerfs, s.StratPerfSta)
+}
+
+func dumpPerfs(outDir string, jobPerfs map[string]*JobPerf, stratPerfSta map[string]*PerfSta) {
 	perfs := make(map[string]map[string]string)
-	for key, pf := range JobPerfs {
+	for key, pf := range jobPerfs {
+		if pf == nil {
+			continue
+		}
 		parts := strings.Split(key, "_")
 		data, ok := perfs[parts[0]]
 		if !ok {
@@ -109,7 +123,10 @@ func DumpPerfs(outDir string) {
 		data[cacheKey] = fmt.Sprintf("%v|%.5f|%.5f", pf.Num, pf.TotProfit, pf.Score)
 	}
 	res := make(map[string]interface{})
-	for name, sta := range StratPerfSta {
+	for name, sta := range stratPerfSta {
+		if sta == nil {
+			continue
+		}
 		perf, _ := perfs[name]
 		res[name] = map[string]interface{}{
 			"od_num":     sta.OdNum,

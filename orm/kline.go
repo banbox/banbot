@@ -23,6 +23,7 @@ import (
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
@@ -87,7 +88,7 @@ func (q *Queries) QueryOHLCVBatch(exsMap map[int32]*ExSymbol, timeframe string, 
 }
 
 func (q *Queries) getKLineTimes(sid int32, timeframe string, startMs, endMs int64) ([]int64, *errs.Error) {
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.getKLineTimesPg(sid, timeframe, startMs, endMs)
 	}
 	tblName := "kline_" + timeframe
@@ -111,7 +112,7 @@ order by ts`, tblName, sid, startMs*1000, endMs*1000)
 }
 
 func (q *Queries) getKLineTimeRange(sid int32, timeframe string) (int64, int64, *errs.Error) {
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.getKLineTimeRangePg(sid, timeframe)
 	}
 	tblName := "kline_" + timeframe
@@ -142,9 +143,9 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 		// **QuestDB WAL 延迟防护**：防止 WAL 延迟导致读取结果为空。
 		// 若 `srangesCache` 已覆盖该区间，此处空值即为「假阴性」。
 		// 严禁写入 `has_data=false`，否则其新时间戳会使 `LATEST BY` 永久覆盖旧的正确记录，导致回测时重复下载。
-		if IsQuestDB {
+		if q.isQuestDB() {
 			tbl := "kline_" + timeFrame
-			cachedTrue := srangesCacheGet(sid, tbl, timeFrame)
+			cachedTrue := q.cachedSRanges(sid, tbl, timeFrame)
 			if len(cachedTrue) > 0 {
 				uncovered := subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, cachedTrue)
 				if len(uncovered) == 0 {
@@ -178,19 +179,14 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 		// No holes found – mark the entire window as has_data=true in one atomic call.
 		ctx := context.Background()
 		tbl := "kline_" + timeFrame
-		sess, conn, err2 := Conn(ctx)
-		if err2 != nil {
-			return NewDbErr(core.ErrDbExecFail, err2)
-		}
-		defer conn.Release()
-		if err := sess.UpdateSRangesWithHoles(ctx, sid, tbl, timeFrame, startMS, endMS, nil); err != nil {
+		if err := q.UpdateSRangesWithHoles(ctx, sid, tbl, timeFrame, startMS, endMS, nil); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
 		return nil
 	}
 
 	// Filter out non-trading time ranges.
-	exs := GetSymbolByID(sid)
+	exs := q.symbolByID(sid)
 	if exs == nil {
 		log.Warn("no ExSymbol found", zap.Int32("sid", sid))
 		return nil
@@ -401,7 +397,7 @@ func getUnFinish(sess *Queries, sid int32, timeFrame string, startMS, endMS int6
 	}
 
 	// 1) Read cached unfinish (kline_un) first. Only recompute when expired.
-	cached, cachedStop, cachedExpire, err := queryUnfinish(sid, timeFrame, startMS)
+	cached, cachedStop, cachedExpire, err := sess.queryUnfinish(sid, timeFrame, startMS)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, 0, err
 	}
@@ -436,13 +432,22 @@ func getUnFinish(sess *Queries, sid int32, timeFrame string, startMS, endMS int6
 }
 
 func queryUnfinish(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline, int64, *int64, error) {
-	if !IsQuestDB {
-		return queryUnfinishPg(sid, timeFrame, barStartMS)
+	queries, conn, err := Conn(nil)
+	if err != nil {
+		return nil, 0, nil, err
 	}
-	unlock := LockCompactTableRead("kline_un_q")
+	defer conn.Release()
+	return queries.queryUnfinish(sid, timeFrame, barStartMS)
+}
+
+func (q *Queries) queryUnfinish(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline, int64, *int64, error) {
+	if !q.isQuestDB() {
+		return q.queryUnfinishPg(sid, timeFrame, barStartMS)
+	}
+	unlock := q.LockCompactTableRead("kline_un_q")
 	defer unlock()
 	ctx := context.Background()
-	row := pool.QueryRow(ctx, `SELECT cast(ts as long)/1000, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
+	row := q.db.QueryRow(ctx, `SELECT cast(ts as long)/1000, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
 FROM kline_un_q
 LATEST BY sid, timeframe
 WHERE sid = $1 AND timeframe = $2 AND coalesce(is_deleted, false) = false
@@ -497,7 +502,7 @@ func queryKlinesRange(sess *Queries, sid int32, timeFrame string, startMS, endMS
 	if startMS <= 0 || endMS <= startMS {
 		return nil, nil
 	}
-	if !IsQuestDB {
+	if !sess.isQuestDB() {
 		return sess.queryOHLCVPg(sid, timeFrame, startMS, endMS, 0, false)
 	}
 	sql := fmt.Sprintf(`
@@ -515,7 +520,11 @@ order by ts`, sid, startMS*1000, endMS*1000)
 	// Safety: if queryHyper fell back to a smaller table, aggregate to requested timeframe.
 	toTfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
-	offMS := GetAlignOff(sid, toTfMSecs)
+	exs := sess.symbolByID(sid)
+	offMS := seriesAlignOff(exs, toTfMSecs)
+	if offMS == 0 && exs == nil && sess.usesLegacySymbolCatalog() {
+		offMS = GetAlignOff(sid, toTfMSecs)
+	}
 	var lastFinish bool
 	klines, lastFinish = utils.BuildOHLCV(klines, toTfMSecs, 0, nil, fromTfMSecs, offMS)
 	if !lastFinish && len(klines) > 0 {
@@ -559,7 +568,7 @@ func calcUnfinishFromSubs(sess *Queries, sid int32, timeFrame string, startMS, e
 	smallMSecs := int64(utils2.TFToSecs(smallTF) * 1000)
 	unStart := utils2.AlignTfMSecs(nowMS, smallMSecs)
 	if unStart >= curStart && unStart < endMS {
-		unbar, unTo, _, err := queryUnfinish(sid, smallTF, unStart)
+		unbar, unTo, _, err := sess.queryUnfinish(sid, smallTF, unStart)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return nil, 0, err
 		}
@@ -615,15 +624,15 @@ func GetAlignOff(sid int32, toTfMSecs int64) int64 {
 }
 
 func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
-	if !IsQuestDB {
-		return setUnfinishPg(sid, tf, endMS, bar)
+	if !q.isQuestDB() {
+		return q.setUnfinishPg(sid, tf, endMS, bar)
 	}
-	unlock := LockCompactTableRead("kline_un_q")
+	unlock := q.LockCompactTableRead("kline_un_q")
 	defer unlock()
 	expireMS := utils2.AlignTfMSecs(btime.UTCStamp(), 60000) + 60000
 	ts := time.UnixMilli(bar.Time).UTC()
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO kline_un_q
+	_, err := q.db.Exec(ctx, `INSERT INTO kline_un_q
 (sid, timeframe, ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false)`,
 		sid, tf, ts, endMS, expireMS,
@@ -645,12 +654,12 @@ func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline)
 	if arrLen == 0 {
 		return 0, nil
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return insertKLinesPg(q, timeFrame, sid, arr)
 	}
 	tblName := "kline_" + timeFrame
 	ctx := context.Background()
-	unlock, lockErr := acquireQuestTableReadLock(ctx, tblName)
+	unlock, lockErr := q.tableReadLock(ctx, tblName)
 	if lockErr != nil {
 		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -664,7 +673,7 @@ func (q *Queries) insertKLinesLocked(timeFrame string, sid int32, arr []*banexg.
 	if arrLen == 0 {
 		return 0, nil
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return insertKLinesPg(q, timeFrame, sid, arr)
 	}
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
@@ -724,7 +733,7 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 		return 0, nil
 	}
 	tblName := "kline_" + timeFrame
-	unlock, lockErr := acquireQuestTableReadLock(context.Background(), tblName)
+	unlock, lockErr := q.tableReadLock(context.Background(), tblName)
 	if lockErr != nil {
 		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -732,18 +741,21 @@ func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banex
 	startMS := arr[0].Time
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	endMS := arr[len(arr)-1].Time + tfMSecs
-	insTs, err := AddInsJob(AddInsKlineParams{
+	insTs, addErr := q.AddInsKline(context.Background(), AddInsKlineParams{
 		Sid:       exs.ID,
 		Timeframe: timeFrame,
 		StartMs:   startMS,
 		StopMs:    endMS,
 	})
-	if err != nil || insTs.IsZero() {
-		return 0, err
+	if addErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, addErr)
+	}
+	if insTs.IsZero() {
+		return 0, nil
 	}
 	write := q
 	var tx pgx.Tx
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		var txErr error
 		tx, write, txErr = q.begin(context.Background())
 		if txErr != nil {
@@ -770,11 +782,11 @@ func (q *Queries) finalizeKlineInsert(exs *ExSymbol, timeFrame string, startMS, 
 	insTs time.Time, aggBig bool) (outErr *errs.Error) {
 	defer func() {
 		if outErr != nil {
-			_ = releaseKlineInsertOwnership(exs.ID, timeFrame, insTs)
+			_ = q.releaseInsertOwnership(exs.ID, timeFrame, insTs)
 		}
 	}()
 	ctx := context.Background()
-	if IsQuestDB {
+	if q.isQuestDB() {
 		if err := waitForQuestKlineTimestampVisible(ctx, q, exs.ID, timeFrame, lastMS); err != nil {
 			return err
 		}
@@ -782,7 +794,7 @@ func (q *Queries) finalizeKlineInsert(exs *ExSymbol, timeFrame string, startMS, 
 	if err := q.UpdateKRange(exs, timeFrame, startMS, endMS, aggBig); err != nil {
 		return err
 	}
-	if IsQuestDB {
+	if q.isQuestDB() {
 		if err := waitForQuestKlineCoverageVisible(ctx, q, exs.ID, timeFrame, startMS, endMS); err != nil {
 			return err
 		}
@@ -824,7 +836,7 @@ func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS i
 }
 
 func (q *Queries) CalcKLineRanges(timeFrame string, sids map[int32]bool) (map[int32][2]int64, *errs.Error) {
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.calcKLineRangesPg(timeFrame, sids)
 	}
 	tblName := "kline_" + timeFrame
@@ -914,13 +926,13 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	endMS := utils2.AlignTfMSecs(orgEndMS, tfMSecs)
 	var delistMS int64
 	var exs *ExSymbol
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		var delistErr *errs.Error
 		delistMS, delistErr = q.getDelistMSPg(sid)
 		if delistErr != nil {
 			return delistErr
 		}
-	} else if exs = GetSymbolByID(sid); exs != nil {
+	} else if exs = q.symbolByID(sid); exs != nil {
 		delistMS = exs.DelistMs
 	}
 	endMS = aggregateEndForTerminalDelist(orgEndMS, endMS, delistMS, tfMSecs)
@@ -946,7 +958,7 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	if aggFrom == "" {
 		return nil
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		saveStart, saveEnd, err := q.refreshAggPg(item, sid, aggStart, endMS, aggFrom, delistMS)
 		if err != nil || saveStart == 0 || saveEnd <= saveStart {
 			return err
@@ -958,7 +970,7 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 	var sourceColumns []questTableColumn
 	var src []*DataSeries
 	readErr := func() error {
-		unlock, lockErr := acquireQuestTableReadLock(ctx, fromTbl)
+		unlock, lockErr := q.tableReadLock(ctx, fromTbl)
 		if lockErr != nil {
 			return lockErr
 		}
@@ -1015,7 +1027,7 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 		return normalizeErr
 	}
 	targetTbl := "kline_" + item.TimeFrame
-	unlock, lockErr := acquireQuestTableReadLock(ctx, targetTbl)
+	unlock, lockErr := q.tableReadLock(ctx, targetTbl)
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -1057,7 +1069,7 @@ func NewKlineAgg(TimeFrame, Table, AggFrom, AggStart, AggEnd, AggEvery, CpsBefor
 }
 
 func (q *Queries) GetKlineNum(sid int32, timeFrame string, start, end int64) int {
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.getKLineNumPg(sid, timeFrame, start, end)
 	}
 	sql := fmt.Sprintf("select count(0) from kline_%s where sid=%v and ts>=cast(%v as timestamp) and ts<cast(%v as timestamp)",
@@ -1111,7 +1123,7 @@ delSids为本次需要删除的sid集合；validSids = 表中已有sids - delSid
 - 若删除比例 >= 50%（删除量较多），执行重写以回收磁盘空间。
 */
 func (q *Queries) DelKLines(timeFrame string, delSids map[int32]bool) *errs.Error {
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.delKLinesPgBySid(timeFrame, delSids)
 	}
 	tblName := "kline_" + timeFrame
@@ -1124,7 +1136,7 @@ func (q *Queries) DelKLines(timeFrame string, delSids map[int32]bool) *errs.Erro
 	if !ok {
 		return errs.NewMsg(core.ErrInvalidTF, "unsupported tf for rewrite: %s", timeFrame)
 	}
-	unlock, acquired, lockErr := acquireQuestTableWriteLock(ctx, tblName)
+	unlock, acquired, lockErr := q.tableWriteLock(ctx, tblName)
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
@@ -1132,7 +1144,7 @@ func (q *Queries) DelKLines(timeFrame string, delSids map[int32]bool) *errs.Erro
 		return errs.NewMsg(core.ErrRunTime, "kline table %s is in use by another process", tblName)
 	}
 	defer unlock()
-	sourceTxn, err_ := waitForCompactWalApplied(ctx, q.db, tblName)
+	sourceTxn, err_ := waitForCompactWalAppliedAtRoot(ctx, q.db, tblName, q.processLockRoot())
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -1297,8 +1309,8 @@ func (q *Queries) FixKInfoZeros() *errs.Error {
 	ctx := context.Background()
 	unlock := func() {}
 	locked := false
-	if IsQuestDB {
-		unlock = LockCompactTableRead("sranges_q")
+	if q.isQuestDB() {
+		unlock = q.LockCompactTableRead("sranges_q")
 		locked = true
 		defer func() {
 			if locked {
@@ -1308,13 +1320,13 @@ func (q *Queries) FixKInfoZeros() *errs.Error {
 	}
 	var rows pgx.Rows
 	var err_ error
-	if IsQuestDB {
-		rows, err_ = pool.Query(ctx, `SELECT sid, tbl, timeframe
+	if q.isQuestDB() {
+		rows, err_ = q.db.Query(ctx, `SELECT sid, tbl, timeframe
 FROM sranges_q
 LATEST BY sid, tbl, timeframe, start_ms
 WHERE has_data = true AND coalesce(is_deleted, false) = false AND (stop_ms = 0 OR start_ms = 0)`)
 	} else {
-		rows, err_ = pool.Query(ctx, `SELECT sid, tbl, timeframe
+		rows, err_ = q.db.Query(ctx, `SELECT sid, tbl, timeframe
 FROM sranges
 WHERE has_data = true AND (stop_ms = 0 OR start_ms = 0)`)
 	}
@@ -1469,7 +1481,7 @@ func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.E
 				}
 				seen[sid] = true
 				// Skip sids not in exsymbol to avoid reviving soft-deleted data
-				if GetSymbolByID(sid) == nil {
+				if sess.symbolByID(sid) == nil {
 					continue
 				}
 				sidList = append(sidList, sid)
@@ -1486,11 +1498,21 @@ func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.E
 	defer pBar.Close()
 
 	return utils.ParallelRun(sidList, 20, func(_ int, sid int32) *errs.Error {
-		sess2, conn, err := Conn(nil)
+		var sess2 *Queries
+		var conn *pgxpool.Conn
+		var err *errs.Error
+		if sess.storage != nil {
+			sess2, conn, err = sess.storage.Conn(nil)
+		} else {
+			sess2, conn, err = Conn(nil)
+		}
 		if err != nil {
 			return err
 		}
 		defer conn.Release()
+		if sess.symbols != nil {
+			sess2 = sess2.WithSeriesSymbolState(sess.symbols)
+		}
 		err = sess2.syncKlineSid(sid, calcs)
 		pBar.Add(len(aggList))
 		return err
@@ -1499,13 +1521,13 @@ func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.E
 
 func (q *Queries) syncKlineSid(sid int32, calcs map[string]map[int32][2]int64) *errs.Error {
 	var delistMS int64
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		var delistErr *errs.Error
 		delistMS, delistErr = q.getDelistMSPg(sid)
 		if delistErr != nil {
 			return delistErr
 		}
-	} else if exs := GetSymbolByID(sid); exs != nil {
+	} else if exs := q.symbolByID(sid); exs != nil {
 		delistMS = exs.DelistMs
 	}
 	tfRanges := make(map[string][2]int64)
@@ -1594,7 +1616,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 	}
 	log.Info("Updating pending insert jobs", zap.Int("num", len(items)))
 	for _, i := range items {
-		active, lockErr := klineInsertFileLockActive(klineInsertLockRoot(), i.Sid, i.Timeframe)
+		active, lockErr := klineInsertFileLockActive(q.insertLockRoot(), i.Sid, i.Timeframe)
 		if lockErr != nil {
 			log.Warn("check pending insert owner fail; keep job", zap.Int32("sid", i.Sid),
 				zap.String("tf", i.Timeframe), zap.Error(lockErr))
@@ -1607,7 +1629,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 		}
 		if i.StartMs > 0 && i.StopMs > 0 {
 			start, end := i.StartMs, i.StopMs
-			if IsQuestDB {
+			if q.isQuestDB() {
 				var waitErr *errs.Error
 				start, end, waitErr = waitForQuestKlineRangeVisible(ctx, q, i.Sid, i.Timeframe, start, end)
 				if waitErr != nil {
@@ -1625,12 +1647,12 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 				}
 			}
 			if start > 0 && end > start {
-				exs := GetSymbolByID(i.Sid)
+				exs := q.symbolByID(i.Sid)
 				if exs == nil {
 					log.Warn("pending insert symbol is unavailable; keep job", zap.Int32("sid", i.Sid))
 					continue
 				}
-				if IsQuestDB {
+				if q.isQuestDB() {
 					if err := q.UpdateKRange(exs, i.Timeframe, start, end, true); err != nil {
 						return err
 					}
@@ -1642,7 +1664,7 @@ func (q *Queries) UpdatePendingIns() *errs.Error {
 						return err
 					}
 				}
-			} else if IsQuestDB {
+			} else if q.isQuestDB() {
 				log.Warn("pending insert rows still not visible; keep job for next recovery",
 					zap.Int32("sid", i.Sid),
 					zap.String("tf", i.Timeframe),

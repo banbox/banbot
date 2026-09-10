@@ -58,6 +58,7 @@ type CmdArgs struct {
 
 	BTStrict    bool
 	BTStrictSet bool
+	NetDisable  bool
 
 	Inited   bool
 	DeadLock bool

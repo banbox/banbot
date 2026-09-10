@@ -3,7 +3,6 @@ package orm
 import (
 	"slices"
 
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
@@ -29,11 +28,56 @@ type historicalSeriesFieldsReader func(startMS, endMS int64, limit int, withUnFi
 	reverse bool,
 ) ([]*AdjInfo, []*DataSeries, *errs.Error)
 
+type coverageQueryOptions struct {
+	nowMS          int64
+	timeRangeEndMS int64
+	strict         bool
+}
+
+func legacyCoverageQueryOptions() coverageQueryOptions {
+	options := LegacyKlineRuntimeOptions()
+	return coverageQueryOptions{
+		nowMS:          options.nowMS(),
+		timeRangeEndMS: options.TimeRangeEndMS,
+		strict:         options.StrictReplay,
+	}
+}
+
+func coverageQueryOptionsFromKline(options KlineRuntimeOptions) coverageQueryOptions {
+	return coverageQueryOptions{
+		nowMS:          options.nowMS(),
+		timeRangeEndMS: options.TimeRangeEndMS,
+		strict:         options.StrictReplay,
+	}
+}
+
 func historicalCoverageForQuery(symbol string) *config.HistoricalCoverageConfig {
-	if !config.StrictHistoricalReplay(config.HistoricalCoverage) {
+	return historicalCoverageForQueryWithOptions(symbol, LegacyKlineRuntimeOptions())
+}
+
+func historicalCoverageForQueryWithOptions(symbol string, options KlineRuntimeOptions) *config.HistoricalCoverageConfig {
+	if !options.strictHistoricalReplay() || options.HistoricalCoverage == nil {
 		return nil
 	}
-	return config.HistoricalCoverageFor(symbol)
+	coverage := options.HistoricalCoverage
+	result := &config.HistoricalCoverageConfig{
+		BaselineEndMS:         coverage.BaselineEndMS,
+		HistoricalResultEndMS: coverage.HistoricalResultEndMS,
+	}
+	if timeframes := coverage.Bars[symbol]; len(timeframes) > 0 {
+		result.Bars = map[string]map[string][]config.HistoricalCoverageRange{symbol: timeframes}
+	}
+	if coverage.PhysicalBars != nil {
+		result.PhysicalBars = map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: coverage.PhysicalBars[symbol],
+		}
+	}
+	if coverage.ListingPrefixes != nil {
+		result.ListingPrefixes = map[string]map[string][]config.HistoricalCoverageRange{
+			symbol: coverage.ListingPrefixes[symbol],
+		}
+	}
+	return result
 }
 
 func validateHistoricalCoverageFields(coverage *config.HistoricalCoverageConfig, fields []string) *errs.Error {
@@ -53,14 +97,21 @@ func validateHistoricalCoverageFields(coverage *config.HistoricalCoverageConfig,
 func historicalCoverageIntervals(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
 	startMS, endMS int64,
 ) []historicalCoverageInterval {
+	return historicalCoverageIntervalsWithOptions(coverage, symbol, timeframe, startMS, endMS,
+		legacyCoverageQueryOptions())
+}
+
+func historicalCoverageIntervalsWithOptions(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
+	startMS, endMS int64, options coverageQueryOptions,
+) []historicalCoverageInterval {
 	if coverage == nil {
 		return nil
 	}
 	if endMS == 0 {
-		endMS = btime.TimeMS()
+		endMS = options.nowMS
 	}
-	if config.TimeRange != nil && config.TimeRange.EndMS > 0 {
-		endMS = min(endMS, config.TimeRange.EndMS)
+	if options.timeRangeEndMS > 0 {
+		endMS = min(endMS, options.timeRangeEndMS)
 	}
 	if endMS <= startMS {
 		return nil
@@ -113,21 +164,28 @@ func historicalCoverageHasTimeframe(coverage *config.HistoricalCoverageConfig, s
 func historicalPhysicalCoverageIntervals(coverage *config.HistoricalCoverageConfig, symbol, timeframe, consumerTimeframe string,
 	startMS, endMS int64,
 ) []historicalCoverageInterval {
+	return historicalPhysicalCoverageIntervalsWithOptions(coverage, symbol, timeframe, consumerTimeframe,
+		startMS, endMS, legacyCoverageQueryOptions())
+}
+
+func historicalPhysicalCoverageIntervalsWithOptions(coverage *config.HistoricalCoverageConfig, symbol, timeframe, consumerTimeframe string,
+	startMS, endMS int64, options coverageQueryOptions,
+) []historicalCoverageInterval {
 	if coverage == nil {
-		return historicalCoverageIntervals(nil, symbol, timeframe, startMS, endMS)
+		return historicalCoverageIntervalsWithOptions(nil, symbol, timeframe, startMS, endMS, options)
 	}
 	if coverage.PhysicalBars == nil {
 		if endMS == 0 {
-			endMS = btime.TimeMS()
+			endMS = options.nowMS
 		}
-		if config.TimeRange != nil && config.TimeRange.EndMS > 0 {
-			endMS = min(endMS, config.TimeRange.EndMS)
+		if options.timeRangeEndMS > 0 {
+			endMS = min(endMS, options.timeRangeEndMS)
 		}
 		if endMS <= startMS {
 			return nil
 		}
-		intervals := historicalCoverageIntervals(coverage, symbol, timeframe, startMS,
-			min(endMS, coverage.BaselineEndMS))
+		intervals := historicalCoverageIntervalsWithOptions(coverage, symbol, timeframe, startMS,
+			min(endMS, coverage.BaselineEndMS), options)
 		// A direct request for the physical/storage timeframe must remain
 		// bounded by the archived baseline.  Only a derived consumer request
 		// may use its authorized consumer coverage to extend the physical tail.
@@ -155,10 +213,10 @@ func historicalPhysicalCoverageIntervals(coverage *config.HistoricalCoverageConf
 		return intervals
 	}
 	if endMS == 0 {
-		endMS = btime.TimeMS()
+		endMS = options.nowMS
 	}
-	if config.TimeRange != nil && config.TimeRange.EndMS > 0 {
-		endMS = min(endMS, config.TimeRange.EndMS)
+	if options.timeRangeEndMS > 0 {
+		endMS = min(endMS, options.timeRangeEndMS)
 	}
 	if endMS <= startMS {
 		return nil
@@ -183,11 +241,19 @@ func historicalPhysicalCoverageIntervals(coverage *config.HistoricalCoverageConf
 func historicalPhysicalCoverageBounds(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
 	startMS, endMS int64,
 ) (int64, int64, bool, *errs.Error) {
-	return historicalPhysicalCoverageBoundsWithListingPrefix(coverage, symbol, timeframe, startMS, endMS, false)
+	return historicalPhysicalCoverageBoundsWithListingPrefixWithOptions(coverage, symbol, timeframe, startMS, endMS, false,
+		legacyCoverageQueryOptions())
 }
 
 func historicalPhysicalCoverageBoundsWithListingPrefix(coverage *config.HistoricalCoverageConfig,
 	symbol, timeframe string, startMS, endMS int64, hasListingPrefix bool,
+) (int64, int64, bool, *errs.Error) {
+	return historicalPhysicalCoverageBoundsWithListingPrefixWithOptions(coverage, symbol, timeframe, startMS, endMS,
+		hasListingPrefix, legacyCoverageQueryOptions())
+}
+
+func historicalPhysicalCoverageBoundsWithListingPrefixWithOptions(coverage *config.HistoricalCoverageConfig,
+	symbol, timeframe string, startMS, endMS int64, hasListingPrefix bool, options coverageQueryOptions,
 ) (int64, int64, bool, *errs.Error) {
 	if coverage == nil {
 		return startMS, endMS, false, nil
@@ -204,8 +270,8 @@ func historicalPhysicalCoverageBoundsWithListingPrefix(coverage *config.Historic
 		return 0, 0, true, errs.NewMsg(core.ErrInvalidTF, "invalid timeframe: %s", timeframe)
 	}
 	consumerStepMS := int64(consumerSecs * 1000)
-	intervals := historicalPhysicalCoverageIntervals(coverage, symbol, storageTF, timeframe, 0, endMS)
-	intervals = append(intervals, historicalListingPrefixIntervals(coverage, symbol, storageTF, 0, endMS)...)
+	intervals := historicalPhysicalCoverageIntervalsWithOptions(coverage, symbol, storageTF, timeframe, 0, endMS, options)
+	intervals = append(intervals, historicalListingPrefixIntervalsWithOptions(coverage, symbol, storageTF, 0, endMS, options)...)
 	slices.SortFunc(intervals, func(left, right historicalCoverageInterval) int {
 		if left.StartMS < right.StartMS {
 			return -1
@@ -246,9 +312,17 @@ func historicalPhysicalCoverageBoundsWithListingPrefix(coverage *config.Historic
 func readHistoricalCoverageSeries(coverage *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
 	startMS, endMS int64, limit int, withUnFinish bool, read historicalSeriesFieldsReader,
 ) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return readHistoricalCoverageSeriesWithOptions(coverage, exs, timeframe, startMS, endMS, limit,
+		withUnFinish, read, legacyCoverageQueryOptions())
+}
+
+func readHistoricalCoverageSeriesWithOptions(coverage *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
+	startMS, endMS int64, limit int, withUnFinish bool, read historicalSeriesFieldsReader,
+	options coverageQueryOptions,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 	symbol := exs.Symbol
-	intervals := historicalCoverageIntervals(coverage, symbol, timeframe, startMS, endMS)
-	intervals = extendLegacyListingCoverage(coverage, exs, timeframe, startMS, intervals)
+	intervals := historicalCoverageIntervalsWithOptions(coverage, symbol, timeframe, startMS, endMS, options)
+	intervals = extendLegacyListingCoverageWithOptions(coverage, exs, timeframe, startMS, intervals, options)
 	return readHistoricalCoverageIntervals(coverage, exs, timeframe, startMS, endMS, limit,
 		withUnFinish, intervals, read)
 }
@@ -320,7 +394,14 @@ func readHistoricalCoverageIntervals(_ *config.HistoricalCoverageConfig, exs *Ex
 func extendLegacyListingCoverage(coverage *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
 	requestedStartMS int64, intervals []historicalCoverageInterval,
 ) []historicalCoverageInterval {
-	prefix, ok := legacyListingPrefixProof(coverage, exs, timeframe, requestedStartMS, intervals)
+	return extendLegacyListingCoverageWithOptions(coverage, exs, timeframe, requestedStartMS, intervals,
+		legacyCoverageQueryOptions())
+}
+
+func extendLegacyListingCoverageWithOptions(coverage *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
+	requestedStartMS int64, intervals []historicalCoverageInterval, options coverageQueryOptions,
+) []historicalCoverageInterval {
+	prefix, ok := legacyListingPrefixProofWithOptions(coverage, exs, timeframe, requestedStartMS, intervals, options)
 	if !ok {
 		return intervals
 	}
@@ -332,7 +413,14 @@ func extendLegacyListingCoverage(coverage *config.HistoricalCoverageConfig, exs 
 func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
 	requestedStartMS int64, intervals []historicalCoverageInterval,
 ) (historicalListingPrefix, bool) {
-	if !config.StrictHistoricalReplay(coverage) || exs == nil || exs.ListMs <= 0 || len(intervals) == 0 {
+	return legacyListingPrefixProofWithOptions(coverage, exs, timeframe, requestedStartMS, intervals,
+		legacyCoverageQueryOptions())
+}
+
+func legacyListingPrefixProofWithOptions(coverage *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
+	requestedStartMS int64, intervals []historicalCoverageInterval, options coverageQueryOptions,
+) (historicalListingPrefix, bool) {
+	if !options.strict || coverage == nil || exs == nil || exs.ListMs <= 0 || len(intervals) == 0 {
 		return historicalListingPrefix{}, false
 	}
 	storageTF, err := PhysicalKlineStorageTimeframe(timeframe)
@@ -356,10 +444,10 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 	}
 	minuteStart := alignPhysicalKlineCeil(exs.ListMs, 60_000,
 		int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, 60)*1000))
-	if historicalListingPrefixStartsBefore(coverage, exs.Symbol, "1m", minuteStart, fullStart) {
+	if historicalListingPrefixStartsBeforeWithOptions(coverage, exs.Symbol, "1m", minuteStart, fullStart, options) {
 		return historicalListingPrefix{}, false
 	}
-	minutes := historicalListingPrefixIntervals(coverage, exs.Symbol, "1m", minuteStart, fullStart)
+	minutes := historicalListingPrefixIntervalsWithOptions(coverage, exs.Symbol, "1m", minuteStart, fullStart, options)
 	if len(minutes) != 1 || minutes[0].StartMS < minuteStart || minutes[0].StartMS >= fullStart ||
 		minutes[0].StopMS < fullStart {
 		return historicalListingPrefix{}, false
@@ -373,10 +461,10 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 	storageOffsetMS := int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, storageSecs) * 1000)
 	storageStart := alignPhysicalKlineCeil(exs.ListMs, storageStepMS, storageOffsetMS)
 	if storageTF != timeframe && storageStart < fullStart {
-		if historicalListingPrefixStartsBefore(coverage, exs.Symbol, storageTF, storageStart, fullStart) {
+		if historicalListingPrefixStartsBeforeWithOptions(coverage, exs.Symbol, storageTF, storageStart, fullStart, options) {
 			return historicalListingPrefix{}, false
 		}
-		physical := historicalListingPrefixIntervals(coverage, exs.Symbol, storageTF, storageStart, fullStart)
+		physical := historicalListingPrefixIntervalsWithOptions(coverage, exs.Symbol, storageTF, storageStart, fullStart, options)
 		if len(physical) != 1 || physical[0].StartMS < storageStart || physical[0].StartMS >= fullStart ||
 			physical[0].StopMS < fullStart {
 			return historicalListingPrefix{}, false
@@ -394,6 +482,13 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 func historicalListingPrefixIntervals(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
 	startMS, endMS int64,
 ) []historicalCoverageInterval {
+	return historicalListingPrefixIntervalsWithOptions(coverage, symbol, timeframe, startMS, endMS,
+		legacyCoverageQueryOptions())
+}
+
+func historicalListingPrefixIntervalsWithOptions(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
+	startMS, endMS int64, options coverageQueryOptions,
+) []historicalCoverageInterval {
 	if coverage == nil {
 		return nil
 	}
@@ -402,10 +497,10 @@ func historicalListingPrefixIntervals(coverage *config.HistoricalCoverageConfig,
 		prefixes = coverage.Bars
 	}
 	if endMS == 0 {
-		endMS = btime.TimeMS()
+		endMS = options.nowMS
 	}
-	if config.TimeRange != nil && config.TimeRange.EndMS > 0 {
-		endMS = min(endMS, config.TimeRange.EndMS)
+	if options.timeRangeEndMS > 0 {
+		endMS = min(endMS, options.timeRangeEndMS)
 	}
 	endMS = min(endMS, coverage.BaselineEndMS)
 	if endMS <= startMS {
@@ -423,6 +518,13 @@ func historicalListingPrefixIntervals(coverage *config.HistoricalCoverageConfig,
 
 func historicalListingPrefixStartsBefore(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
 	startMS, endMS int64,
+) bool {
+	return historicalListingPrefixStartsBeforeWithOptions(coverage, symbol, timeframe, startMS, endMS,
+		legacyCoverageQueryOptions())
+}
+
+func historicalListingPrefixStartsBeforeWithOptions(coverage *config.HistoricalCoverageConfig, symbol, timeframe string,
+	startMS, endMS int64, _ coverageQueryOptions,
 ) bool {
 	if coverage == nil || endMS <= startMS {
 		return false
@@ -488,14 +590,26 @@ func prependHistoricalListingPrefix(exs *ExSymbol, prefix historicalListingPrefi
 func HistoricalCoverageAllows(coverage *config.HistoricalCoverageConfig, exs *ExSymbol,
 	timeframe string, timeMS int64,
 ) bool {
-	if coverage == nil || coverage.Allows(timeframe, timeMS) {
+	return HistoricalCoverageAllowsWithOptions(coverage, exs, timeframe, timeMS, LegacyKlineRuntimeOptions())
+}
+
+// HistoricalCoverageAllowsWithOptions evaluates one runtime's coverage proof
+// without consulting package-level mode, clock, or time-range state.
+func HistoricalCoverageAllowsWithOptions(coverage *config.HistoricalCoverageConfig, exs *ExSymbol,
+	timeframe string, timeMS int64, options KlineRuntimeOptions,
+) bool {
+	if coverage == nil || coverage.AllowsWithEnd(timeframe, timeMS, options.TimeRangeEndMS) {
 		return true
 	}
 	if exs == nil {
 		return false
 	}
-	intervals := historicalCoverageIntervals(coverage, exs.Symbol, timeframe, 0, coverage.BaselineEndMS)
-	intervals = extendLegacyListingCoverage(coverage, exs, timeframe, 0, intervals)
+	queryOptions := coverageQueryOptionsFromKline(options)
+	if !queryOptions.strict {
+		return false
+	}
+	intervals := historicalCoverageIntervalsWithOptions(coverage, exs.Symbol, timeframe, 0, coverage.BaselineEndMS, queryOptions)
+	intervals = extendLegacyListingCoverageWithOptions(coverage, exs, timeframe, 0, intervals, queryOptions)
 	return len(intervals) > 0 && timeMS >= intervals[0].StartMS && timeMS < intervals[0].StopMS
 }
 

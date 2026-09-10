@@ -1,7 +1,13 @@
 package ormo
 
 import (
+	"time"
+
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/sasha-s/go-deadlock"
 )
@@ -30,9 +36,23 @@ type OrderState struct {
 	editListener     *func(*InOutOrder, string)
 	liveMode         bool
 	runtimeCore      *core.State
+	runtimeClock     *btime.ClockState
+	runtimePrices    *com.PriceState
+	runtimeExchange  banexg.BanExchange
+	runtimeConfig    *config.Config
+	tradesPath       string
+	executionOptions ExecutionOptions
 
 	tasks          *map[string]*BotTask
 	taskIDAccounts *map[int64]string
+}
+
+// ExecutionOptions is the small execution policy bound to one runtime's
+// order registry. Keeping it here prevents hot paths from reading global
+// backtest flags.
+type ExecutionOptions struct {
+	StrictBacktest     bool
+	LegacyOrderMetrics bool
 }
 
 // NewOrderState creates isolated order and task registries for one runtime.
@@ -299,6 +319,29 @@ func (s *OrderState) HistoricalOrders() []*InOutOrder {
 	return orders
 }
 
+// FilterUnfilledHistoricalOrders removes simulated orders that never filled
+// from this runtime's history. The registry owner performs the filtering so
+// cleaning one runtime cannot rewrite another runtime's order history.
+func (s *OrderState) FilterUnfilledHistoricalOrders() {
+	if s == nil || s.historicalOrders == nil || s.doneOrderIDs == nil || s.stateGuard == nil {
+		return
+	}
+	s.stateGuard.Lock()
+	valid := (*s.historicalOrders)[:0]
+	done := make(map[int64]bool, len(valid))
+	for _, order := range *s.historicalOrders {
+		if order == nil || order.Enter == nil || order.Enter.Filled == 0 {
+			continue
+		}
+		valid = append(valid, order)
+		done[order.ID] = true
+	}
+	clear((*s.historicalOrders)[len(valid):])
+	*s.historicalOrders = valid
+	*s.doneOrderIDs = done
+	s.stateGuard.Unlock()
+}
+
 // AddHistoricalOrder appends an order once, keyed by its ID.
 func (s *OrderState) AddHistoricalOrder(order *InOutOrder) bool {
 	if s == nil || order == nil || s.historicalOrders == nil || s.doneOrderIDs == nil || s.stateGuard == nil {
@@ -416,6 +459,53 @@ func (s *OrderState) BindCore(state *core.State) {
 		return
 	}
 	s.runtimeCore = state
+}
+
+// BindRuntime associates the order registry with the runtime-owned services
+// used by order methods. The pointers are fixed at composition time so hot
+// paths do not consult process-wide clocks, prices, exchanges, or config.
+func (s *OrderState) BindRuntime(clock *btime.ClockState, prices *com.PriceState,
+	exchange banexg.BanExchange, cfg *config.Config) {
+	if s == nil {
+		return
+	}
+	s.runtimeClock = clock
+	s.runtimePrices = prices
+	s.runtimeExchange = exchange
+	s.runtimeConfig = cfg
+}
+
+// TimeMS returns the timestamp owned by this order state. Explicit runtimes
+// use their bound clock; an unbound state uses wall time without consulting the
+// package compatibility clock.
+func (s *OrderState) TimeMS() int64 {
+	if s == nil {
+		return time.Now().UnixMilli()
+	}
+	if s.runtimeClock != nil {
+		return s.runtimeClock.TimeMS()
+	}
+	if s == legacyOrderState {
+		return btime.UTCStamp()
+	}
+	return time.Now().UnixMilli()
+}
+
+// BindExecutionOptions associates deterministic order behavior with this
+// runtime's order registry during composition.
+func (s *OrderState) BindExecutionOptions(options ExecutionOptions) {
+	if s == nil {
+		return
+	}
+	s.executionOptions = options
+}
+
+func (s *OrderState) StrictBacktest() bool {
+	return s != nil && s.executionOptions.StrictBacktest
+}
+
+func (s *OrderState) LegacyOrderMetrics() bool {
+	return s != nil && s.executionOptions.LegacyOrderMetrics
 }
 
 func (s *OrderState) addSimOrder() {

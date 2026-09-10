@@ -50,6 +50,7 @@ type RemoteCommandResult struct {
 }
 
 type RemoteCommandService struct {
+	deps    *RuntimeDeps
 	mu      sync.Mutex
 	seen    map[string]*RemoteCommandResult
 	lastHit map[string]time.Time
@@ -64,6 +65,12 @@ func NewRemoteCommandService() *RemoteCommandService {
 	}
 }
 
+func NewRemoteCommandServiceWithRuntimeDeps(deps RuntimeDeps) *RemoteCommandService {
+	service := NewRemoteCommandService()
+	service.deps = &deps
+	return service
+}
+
 var defaultRemoteCommandService = NewRemoteCommandService()
 
 func RunRemoteCommand(cmd RemoteCommand) (*RemoteCommandResult, *errs.Error) {
@@ -74,7 +81,11 @@ func (s *RemoteCommandService) Run(cmd RemoteCommand) (*RemoteCommandResult, *er
 	if cmd.Source == "" || cmd.Action == "" || cmd.Account == "" {
 		return nil, errs.NewMsg(errs.CodeParamRequired, "source/action/account required")
 	}
-	if cfg, ok := config.Accounts[cmd.Account]; !ok {
+	accounts := config.Accounts
+	if s.deps != nil {
+		accounts = s.deps.AccountConfigs()
+	}
+	if cfg, ok := accounts[cmd.Account]; !ok || cfg == nil {
 		return nil, errs.NewMsg(errs.CodeParamInvalid, "account invalid: %s", cmd.Account)
 	} else if cfg.NoTrade {
 		return nil, errs.NewMsg(errs.CodeParamInvalid, "account no trade permission: %s", cmd.Account)
@@ -147,14 +158,23 @@ func (s *RemoteCommandService) runTradingSwitch(cmd RemoteCommand) (*RemoteComma
 		return nil, errs.NewMsg(errs.CodeParamInvalid, "set exactly one trading switch action")
 	}
 	var untilMS int64
+	noEnterUntil := core.NoEnterUntil
+	nowMS := btime.TimeMS
+	if s.deps != nil {
+		if s.deps.Core == nil || s.deps.Clock == nil {
+			return nil, errs.NewMsg(core.ErrBadConfig, "runtime core and clock are required")
+		}
+		noEnterUntil = s.deps.Core.NoEnterUntil
+		nowMS = s.deps.Clock.TimeMS
+	}
 	if cmd.Enable {
-		delete(core.NoEnterUntil, cmd.Account)
+		delete(noEnterUntil, cmd.Account)
 	} else {
 		untilMS = cmd.UntilMS
 		if untilMS == 0 {
-			untilMS = btime.TimeMS() + int64(cmd.DisableHours)*3600*1000
+			untilMS = nowMS() + int64(cmd.DisableHours)*3600*1000
 		}
-		core.NoEnterUntil[cmd.Account] = untilMS
+		noEnterUntil[cmd.Account] = untilMS
 	}
 	return &RemoteCommandResult{UntilMS: untilMS}, nil
 }
@@ -204,18 +224,40 @@ func (cmd RemoteCommand) defaultKey() string {
 }
 
 func CloseBotOrdersRemote(cmd RemoteCommand) (*RemoteCommandResult, *errs.Error) {
+	return defaultRemoteCommandService.CloseOrders(cmd)
+}
+
+func (s *RemoteCommandService) CloseOrders(cmd RemoteCommand) (*RemoteCommandResult, *errs.Error) {
 	if cmd.ExitTag == "" {
 		cmd.ExitTag = core.ExitTagUserExit
 	}
 	cmd.Action = RemoteActionCloseOrder
 	cmd.ExecClose = func() (int, int, *errs.Error) {
+		if s.deps != nil {
+			if s.deps.Orders == nil {
+				return 0, 0, errs.NewMsg(core.ErrBadConfig, "runtime orders are required")
+			}
+			openOrders, lock := s.deps.Orders.GetOpenODs(cmd.Account)
+			lock.Lock()
+			orders := make([]*ormo.InOutOrder, 0, len(openOrders))
+			for _, order := range openOrders {
+				if cmd.OrderID <= 0 || order.ID == cmd.OrderID {
+					orders = append(orders, order)
+				}
+			}
+			lock.Unlock()
+			if cmd.OrderID > 0 && len(orders) == 0 {
+				return 0, 0, errs.NewMsg(errs.CodeParamInvalid, "order not found: %d", cmd.OrderID)
+			}
+			return CloseAccOrdersWithState(s.deps.Trading, cmd.Account, orders, &strat.ExitReq{Tag: cmd.ExitTag, Force: true})
+		}
 		orders, err := FindOpenOrders(cmd.Account, cmd.OrderID)
 		if err != nil {
 			return 0, 0, err
 		}
 		return CloseAccOrders(cmd.Account, orders, &strat.ExitReq{Tag: cmd.ExitTag, Force: true})
 	}
-	return RunRemoteCommand(cmd)
+	return s.Run(cmd)
 }
 
 func FindOpenOrders(account string, orderID int64) ([]*ormo.InOutOrder, *errs.Error) {

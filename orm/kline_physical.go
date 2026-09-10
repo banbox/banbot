@@ -269,7 +269,7 @@ func (q *Queries) inspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbo
 	if q == nil || exs == nil || exs.ID <= 0 || startMS <= 0 || stopMS <= startMS {
 		return nil, errs.NewMsg(errs.CodeParamInvalid, "physical K-line coverage input is incomplete")
 	}
-	if IsQuestDB {
+	if q.isQuestDB() {
 		return nil, errs.NewMsg(errs.CodeNotSupport, "physical K-line manifest currently requires TimescaleDB")
 	}
 	storageTF, table, err := physicalKlineStorage(requestedTF)
@@ -280,7 +280,10 @@ func (q *Queries) inspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbo
 	storageStepMS := int64(utils2.TFToSecs(storageTF) * 1000)
 	_, consumerOffsetSecs := utils2.GetTfAlignOrigin(int(consumerStepMS / 1000))
 	consumerOffsetMS := int64(consumerOffsetSecs * 1000)
-	storageOffsetMS := GetAlignOff(exs.ID, storageStepMS)
+	storageOffsetMS := seriesAlignOff(exs, storageStepMS)
+	if storageOffsetMS == 0 && q.symbolByID(exs.ID) == nil && q.usesLegacySymbolCatalog() {
+		storageOffsetMS = GetAlignOff(exs.ID, storageStepMS)
+	}
 	requestedStart, requestedStop := startMS, stopMS
 	bounds := physicalKlineCoverageBounds(startMS, stopMS, exs.ListMs, exs.DelistMs,
 		consumerStepMS, consumerOffsetMS, storageStepMS, storageOffsetMS)

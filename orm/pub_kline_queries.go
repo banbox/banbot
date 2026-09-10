@@ -13,10 +13,10 @@ import (
 )
 
 func (q *Queries) PurgeKlineUn() *errs.Error {
-	if !IsQuestDB {
-		return purgeKlineUnPg()
+	if !q.isQuestDB() {
+		return q.purgeKlineUnPg()
 	}
-	releaseProcessLock, acquired, err := tryAcquireCompactProcessExclusiveLock(compactProcessLockRootFn(), "kline_un_q")
+	releaseProcessLock, acquired, err := tryAcquireCompactProcessExclusiveLock(q.processLockRoot(), "kline_un_q")
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
@@ -28,7 +28,7 @@ func (q *Queries) PurgeKlineUn() *errs.Error {
 			log.Warn("release kline_un_q process lock failed", zap.Error(err))
 		}
 	}()
-	tblLock := cptState.getTableLock("kline_un_q")
+	tblLock := compactStateForRoot(q.processLockRoot()).getTableLock("kline_un_q")
 	tblLock.Lock()
 	defer tblLock.Unlock()
 	ctx := context.Background()
@@ -62,13 +62,13 @@ DEDUP UPSERT KEYS(sid, timeframe, ts)`)
 func (q *Queries) DelKInfo(sid int32, timeFrame string) *errs.Error {
 	ctx := context.Background()
 	tbl := "kline_" + timeFrame
-	if !IsQuestDB {
-		if err := delKInfoPg(ctx, sid, tbl, timeFrame); err != nil {
+	if !q.isQuestDB() {
+		if err := q.delKInfoPg(ctx, sid, tbl, timeFrame); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
 		return nil
 	}
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
 FROM sranges_q
@@ -110,18 +110,18 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND coalesce(is_deleted, false) =
 		}
 	}
 	// Invalidate in-process cache so subsequent reads reflect the deletion.
-	srangesCacheDel(sid, tbl, timeFrame)
-	MarkTableForCompact("sranges_q", len(items))
+	q.deleteCachedSRanges(sid, tbl, timeFrame)
+	q.MarkTableForCompact("sranges_q", len(items))
 	return nil
 }
 
 func (q *Queries) GetKlineRange(sid int32, timeFrame string) (int64, int64) {
 	ctx := context.Background()
 	tbl := "kline_" + timeFrame
-	if !IsQuestDB {
-		return getKlineRangePg(ctx, sid, tbl, timeFrame)
+	if !q.isQuestDB() {
+		return q.getKlineRangePg(ctx, sid, tbl, timeFrame)
 	}
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	row := q.db.QueryRow(ctx, `SELECT min(start_ms), max(stop_ms)
 FROM (
@@ -144,10 +144,10 @@ func (q *Queries) GetKlineRanges(sidList []int32, timeFrame string) map[int32][2
 	}
 	ctx := context.Background()
 	tbl := "kline_" + timeFrame
-	if !IsQuestDB {
-		return getKlineRangesPg(ctx, sidList, tbl, timeFrame)
+	if !q.isQuestDB() {
+		return q.getKlineRangesPg(ctx, sidList, tbl, timeFrame)
 	}
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 
 	var texts = make([]string, len(sidList))
@@ -183,10 +183,10 @@ GROUP BY sid`, sidText)
 
 func (q *Queries) DelFactors(sid int32, startMS, endMS int64) *errs.Error {
 	ctx := context.Background()
-	if !IsQuestDB {
-		return delFactorsPg(ctx, sid, startMS, endMS)
+	if !q.isQuestDB() {
+		return q.delFactorsPg(ctx, sid, startMS, endMS)
 	}
-	unlock := LockCompactTableRead("adj_factors_q")
+	unlock := q.LockCompactTableRead("adj_factors_q")
 	defer unlock()
 	sqlText := `SELECT sid, sub_id, start_ms, factor
 FROM adj_factors_q
@@ -235,16 +235,16 @@ WHERE (sid = $1 OR sub_id = $1) AND coalesce(is_deleted, false) = false`
 			return NewDbErr(core.ErrDbExecFail, err)
 		}
 	}
-	MarkTableForCompact("adj_factors_q", len(items))
+	q.MarkTableForCompact("adj_factors_q", len(items))
 	return nil
 }
 
 func (q *Queries) DelKLineUn(sid int32, timeFrame string) *errs.Error {
 	ctx := context.Background()
-	if !IsQuestDB {
-		return delKLineUnPg(ctx, sid, timeFrame)
+	if !q.isQuestDB() {
+		return q.delKLineUnPg(ctx, sid, timeFrame)
 	}
-	unlock := LockCompactTableRead("kline_un_q")
+	unlock := q.LockCompactTableRead("kline_un_q")
 	defer unlock()
 	ts := time.Now().UTC()
 	_, err := q.db.Exec(ctx, `INSERT INTO kline_un_q (sid, timeframe, ts, stop_ms, expire_ms,
@@ -253,6 +253,6 @@ VALUES ($1, $2, $3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, true)`, sid, timeFrame, ts)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
-	MarkTableForCompact("kline_un_q", 1)
+	q.MarkTableForCompact("kline_un_q", 1)
 	return nil
 }

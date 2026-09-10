@@ -27,11 +27,14 @@ func runLegacyRunnerSession(run func(*runtime.Process) *errs.Error) *errs.Error 
 	process := runtime.NewProcess()
 	// These entrypoints still install process-wide facades. Serialize their full
 	// lifecycle; explicit runtimes inside the session do not make it concurrent.
-	return runLegacyEntrySession(func() *errs.Error { return run(process) })
+	return runLegacyEntrySession(func() *errs.Error {
+		defer process.Close()
+		return run(process)
+	})
 }
 
-func runBackTestEntry(args *config.CmdArgs, session opt.LegacySession) *errs.Error {
-	return runBackTestSession(runtime.NewProcess(), args, session)
+func runBackTestEntry(args *config.CmdArgs) *errs.Error {
+	return runExplicitBackTest(args)
 }
 
 func runLegacyEntrySession(run func() *errs.Error) *errs.Error {
@@ -39,9 +42,7 @@ func runLegacyEntrySession(run func() *errs.Error) *errs.Error {
 }
 
 func RunBackTest(args *config.CmdArgs) *errs.Error {
-	return opt.WithLegacySession(func(session opt.LegacySession) *errs.Error {
-		return runBackTestSession(runtime.NewProcess(), args, session)
-	})
+	return runExplicitBackTest(args)
 }
 
 func runBackTestSession(process *runtime.Process, args *config.CmdArgs, session opt.LegacySession) *errs.Error {
@@ -127,13 +128,11 @@ func RunTrade(args *config.CmdArgs) *errs.Error {
 }
 
 func RunTradeWith(args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *errs.Error {
-	return runLegacyRunnerSession(func(process *runtime.Process) *errs.Error {
-		return runTradeSession(process, args, startup)
-	})
+	return runExplicitTrade(args, startup)
 }
 
 func runTradeEntry(args *config.CmdArgs) *errs.Error {
-	return runTradeSession(runtime.NewProcess(), args, nil)
+	return runExplicitTrade(args, nil)
 }
 
 func runTradeSession(process *runtime.Process, args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *errs.Error {
@@ -175,9 +174,12 @@ func runtimeRunnerDeps(rt *runtime.Runtime) biz.RuntimeDeps {
 		Trading:        rt.Trading,
 		Config:         rt.Config,
 		Symbols:        rt.Symbols,
+		Storage:        rt.Storage,
 		Exchange:       rt.Exchange,
+		Dump:           rt.Dump,
 		Scheduler:      rt.Scheduler(),
-		DefaultAccount: config.DefAcc,
+		Notifications:  rt.Notifications,
+		DefaultAccount: rt.Config.DefaultAccount(),
 	}
 }
 
@@ -188,9 +190,12 @@ func runtimeRunnerDataDeps(rt *runtime.Runtime) *data.RuntimeDeps {
 		Config:       rt.Config,
 		Market:       rt.Market,
 		Symbols:      rt.Symbols,
+		Storage:      rt.Storage,
 		Strategies:   rt.Strategies,
+		Catalog:      rt.Catalog,
 		Callbacks:    rt,
 		Exchange:     rt.Exchange,
+		Dump:         rt.Dump,
 		ExchangeName: rt.Core.ExgName,
 		MarketType:   rt.Core.Market,
 	}
@@ -206,6 +211,7 @@ func newEntryRuntime(process *runtime.Process, mode string, startAt int64) (*run
 		Env:          core.RunEnv,
 		StartAt:      startAt,
 		Exchange:     exg.Default,
+		Storage:      orm.CurrentStorage(),
 		ExchangeName: core.ExgName,
 		Market:       core.Market,
 		ContractType: core.ContractType,

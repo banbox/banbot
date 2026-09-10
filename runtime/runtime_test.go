@@ -11,6 +11,7 @@ import (
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
@@ -21,6 +22,59 @@ import (
 
 type processTrackingScheduler struct {
 	stopCalls atomic.Int32
+}
+
+func TestRuntimeOwnsIndependentDataSourceCatalogs(t *testing.T) {
+	process := NewProcess()
+	defer process.Close()
+	catalogA := data.NewDataSourceCatalog()
+	catalogB := data.NewDataSourceCatalog()
+	first, err := process.NewRuntime(Options{Catalog: catalogA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := process.NewRuntime(Options{Catalog: catalogB})
+	if err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	if first.Catalog != catalogA || second.Catalog != catalogB || first.Catalog == second.Catalog {
+		t.Fatalf("runtime catalogs are not independent: %p/%p", first.Catalog, second.Catalog)
+	}
+	first.Close()
+	if second.Catalog != catalogB {
+		t.Fatal("closing one runtime cleared another runtime's data source catalog")
+	}
+}
+
+func TestRuntimeCloseUnregistersFromProcess(t *testing.T) {
+	process := NewProcess()
+	defer process.Close()
+	first, err := process.NewRuntime(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := process.NewRuntime(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first.Close()
+	process.runtimeMu.Lock()
+	tracked := len(process.runtimes)
+	remaining := tracked == 1 && process.runtimes[0] == second
+	process.runtimeMu.Unlock()
+	if !remaining {
+		t.Fatalf("tracked runtimes after first close = %d, want only second runtime", tracked)
+	}
+
+	second.Close()
+	process.runtimeMu.Lock()
+	tracked = len(process.runtimes)
+	process.runtimeMu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("tracked runtimes after all closes = %d, want 0", tracked)
+	}
 }
 
 func (s *processTrackingScheduler) AddFunc(string, func()) (cron.EntryID, error) {
@@ -134,6 +188,42 @@ func TestRuntimeStatesAreIndependent(t *testing.T) {
 	}
 }
 
+func TestProcessStopOnlyStopsItsRuntimes(t *testing.T) {
+	firstProcess := NewProcess()
+	secondProcess := NewProcess()
+	firstA, err := firstProcess.NewRuntime(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstB, err := firstProcess.NewRuntime(Options{})
+	if err != nil {
+		firstProcess.Close()
+		t.Fatal(err)
+	}
+	second, err := secondProcess.NewRuntime(Options{})
+	if err != nil {
+		firstProcess.Close()
+		secondProcess.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(firstProcess.Close)
+	t.Cleanup(secondProcess.Close)
+
+	firstProcess.Stop()
+	for name, runtime := range map[string]*Runtime{"first-a": firstA, "first-b": firstB} {
+		select {
+		case <-runtime.Done():
+		default:
+			t.Fatalf("Process.Stop did not stop %s", name)
+		}
+	}
+	select {
+	case <-second.Done():
+		t.Fatal("stopping one Process stopped a Runtime owned by another Process")
+	default:
+	}
+}
+
 func TestRuntimeCloseResetsAllOwnedState(t *testing.T) {
 	rt, err := NewProcess().NewRuntime(Options{})
 	if err != nil {
@@ -231,16 +321,17 @@ func TestRuntimeAllocatorUsesCanonicalDatabaseIdentityNotRecoveryRoot(t *testing
 	cfg := &config.Config{
 		Database: &config.DatabaseConfig{Url: "postgresql://user:pass@quest.example/banbot"},
 	}
+	storage := orm.NewStorage(nil, false, "database:quest.example:5432/banbot")
 	firstDir := t.TempDir()
 	secondDir := t.TempDir()
 	first, err := process.NewRuntime(Options{
-		Config: cfg, DataDir: firstDir, ExchangeName: "binance", Market: banexg.MarketSpot,
+		Config: cfg, DataDir: firstDir, Storage: storage, ExchangeName: "binance", Market: banexg.MarketSpot,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := process.NewRuntime(Options{
-		Config: cfg, DataDir: secondDir, ExchangeName: "binance", Market: banexg.MarketSpot,
+		Config: cfg, DataDir: secondDir, Storage: storage, ExchangeName: "binance", Market: banexg.MarketSpot,
 	})
 	if err != nil {
 		first.Close()
@@ -266,10 +357,11 @@ func TestRuntimeAllocatorUsesCanonicalDatabaseIdentityNotRecoveryRoot(t *testing
 
 func TestRuntimeAllocatorCanonicalizesEquivalentDatabaseURLs(t *testing.T) {
 	process := NewProcess()
+	storage := orm.NewStorage(nil, false, "database:quest.example:5432/banbot")
 	first, err := process.NewRuntime(Options{
 		Config: &config.Config{Database: &config.DatabaseConfig{
 			Url: "postgresql://user:password@QUEST.EXAMPLE/banbot",
-		}},
+		}}, Storage: storage,
 		DataDir: t.TempDir(), ExchangeName: "binance", Market: banexg.MarketSpot,
 	})
 	if err != nil {
@@ -278,7 +370,7 @@ func TestRuntimeAllocatorCanonicalizesEquivalentDatabaseURLs(t *testing.T) {
 	second, err := process.NewRuntime(Options{
 		Config: &config.Config{Database: &config.DatabaseConfig{
 			Url: "postgres://another:credential@quest.example:5432/banbot",
-		}},
+		}}, Storage: storage,
 		DataDir: t.TempDir(), ExchangeName: "binance", Market: banexg.MarketSpot,
 	})
 	if err != nil {

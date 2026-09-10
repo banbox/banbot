@@ -5,6 +5,9 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banbot/strat"
 )
 
 func TestRuntimeDepsNormalizeNonRealAccountsForOrderDispatch(t *testing.T) {
@@ -42,5 +45,55 @@ func TestRuntimeDepsNormalizeNonRealAccountsForOrderDispatch(t *testing.T) {
 	}
 	if bound.Trading.OrderManager("user1") != nil {
 		t.Fatal("order manager was initialized under the raw account key")
+	}
+}
+
+func TestNewTraderWithRuntimeDepsRejectsLegacyStatePointers(t *testing.T) {
+	legacyStrategies := strat.LegacyState()
+	legacyOrders := ormo.LegacyState()
+	trader := NewTraderWithRuntimeDeps(RuntimeDeps{
+		Core:       &core.State{},
+		Strategies: legacyStrategies,
+		Orders:     legacyOrders,
+	})
+	deps := trader.RuntimeDependencies()
+	if deps == nil {
+		t.Fatal("runtime dependencies were not bound")
+	}
+	if deps.Strategies == nil || deps.Strategies == legacyStrategies {
+		t.Fatal("explicit trader retained legacy strategy state")
+	}
+	if deps.Orders == nil || deps.Orders == legacyOrders {
+		t.Fatal("explicit trader retained legacy order state")
+	}
+}
+
+func TestTraderExplicitRuntimeDoesNotReadLegacyStrategyJobs(t *testing.T) {
+	oldAccounts, oldInfoJobs := config.Accounts, strat.AccInfoJobs
+	config.Accounts = map[string]*config.AccountConfig{config.DefAcc: {}}
+	called := 0
+	strat.AccInfoJobs = map[string]map[string]map[string]*strat.StratJob{
+		config.DefAcc: {
+			strat.DataSubKey("macro", 1, "1d"): {
+				"legacy": {
+					Strat: &strat.TradeStrat{OnData: func(*strat.StratJob, strat.DataEvent) { called++ }},
+				},
+			},
+		},
+	}
+	t.Cleanup(func() {
+		config.Accounts, strat.AccInfoJobs = oldAccounts, oldInfoJobs
+	})
+
+	trader := Trader{runtime: &RuntimeDeps{Strategies: nil}}
+	err := trader.feedDataOnlySeries(
+		&orm.DataSeries{Source: "macro", Sid: 1, TimeFrame: "1d"},
+		&orm.ExSymbol{ID: 1, Symbol: "BTC/USDT"},
+	)
+	if err == nil {
+		t.Fatal("explicit trader with missing strategy state was not rejected")
+	}
+	if called != 0 {
+		t.Fatalf("explicit trader dispatched %d legacy callbacks", called)
 	}
 }

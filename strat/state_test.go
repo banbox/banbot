@@ -1,13 +1,127 @@
 package strat
 
 import (
+	"slices"
 	"testing"
 
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg"
 )
+
+func TestExplicitStrategyStateUsesOwnSelectionClockAndStrictMode(t *testing.T) {
+	oldMode, oldStrict := core.BackTestMode, config.Data.BTStrict
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data.BTStrict = oldMode, oldStrict
+	})
+	core.BackTestMode = false
+	config.Data.BTStrict = false
+
+	firstCore, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCore.BackTestMode = true
+	firstClock := btime.NewClockState(true, nil)
+	firstClock.SetTimeMS(111)
+	first := NewStateWithRuntime(firstCore, firstClock, &config.Config{BTStrict: true}, nil, nil)
+
+	secondCore, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCore.BackTestMode = true
+	secondClock := btime.NewClockState(true, nil)
+	secondClock.SetTimeMS(222)
+	second := NewStateWithRuntime(secondCore, secondClock, &config.Config{BTStrict: false}, nil, nil)
+
+	if !strictBacktestFor(first, firstCore) || strictBacktestFor(second, secondCore) {
+		t.Fatalf("strict mode leaked between runtimes: first=%v second=%v",
+			strictBacktestFor(first, firstCore), strictBacktestFor(second, secondCore))
+	}
+	if got := runtimeTimeMSFor(first); got != 111 {
+		t.Fatalf("first runtime time=%d, want 111", got)
+	}
+	if got := runtimeTimeMSFor(second); got != 222 {
+		t.Fatalf("second runtime time=%d, want 222", got)
+	}
+}
+
+func TestExplicitStrategyStateNormalizesNonRealAccounts(t *testing.T) {
+	runtimeCore, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeCore.Close()
+	runtimeCore.EnvReal = false
+	cfg := &config.Config{Accounts: map[string]*config.AccountConfig{
+		"z-account": {},
+		"a-account": {},
+	}}
+	state := NewStateWithRuntime(runtimeCore, nil, cfg, nil, nil)
+	accounts := runtimeAccountsFor(state)
+	if len(accounts) != 1 {
+		t.Fatalf("normalized account count = %d, want 1: %v", len(accounts), accounts)
+	}
+	selected, ok := accounts["default"]
+	if !ok || selected != cfg.Accounts["a-account"] {
+		t.Fatalf("normalized accounts = %v, want default mapped to first sorted account", accounts)
+	}
+	if got := runtimeDefaultAccountFor(state); got != "default" {
+		t.Fatalf("default account = %q, want default", got)
+	}
+
+	runtimeCore.EnvReal = true
+	accounts = runtimeAccountsFor(state)
+	if len(accounts) != 2 || accounts["a-account"] == nil || accounts["z-account"] == nil {
+		t.Fatalf("real account map = %v, want original accounts", accounts)
+	}
+	if got := runtimeDefaultAccountFor(state); got != "a-account" {
+		t.Fatalf("real default account = %q, want a-account", got)
+	}
+}
+
+func TestExplicitStrategyStateProjectsOnlyItsKlineFields(t *testing.T) {
+	const sid int32 = 77
+	const tf = "1m"
+	makeState := func(field string) *State {
+		state := NewState()
+		job := &StratJob{
+			Symbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"},
+			Strat: &TradeStrat{OnDataSubs: func(*StratJob) []*DataSub {
+				return []*DataSub{{Source: orm.SeriesSourceKline, ExSymbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"}, TimeFrame: tf, Fields: []string{field}}}
+			}},
+		}
+		state.InfoJobs("default")[DataSubKey(orm.SeriesSourceKline, sid, tf)] = map[string]*StratJob{"job": job}
+		return state
+	}
+
+	first := makeState("open_interest_a")
+	second := makeState("open_interest_b")
+	oldInfo := AccInfoJobs
+	AccInfoJobs = map[string]map[string]map[string]*StratJob{
+		"global": {
+			DataSubKey(orm.SeriesSourceKline, sid, tf): {
+				"global": {Symbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"}, Strat: &TradeStrat{OnDataSubs: func(*StratJob) []*DataSub {
+					return []*DataSub{{Source: orm.SeriesSourceKline, ExSymbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"}, TimeFrame: tf, Fields: []string{"global_field"}}}
+				}}},
+			},
+		},
+	}
+	t.Cleanup(func() { AccInfoJobs = oldInfo })
+
+	firstFields := first.CollectKlineSubFields(nil, sid, tf)
+	secondFields := second.CollectKlineSubFields(nil, sid, tf)
+	if slices.Contains(firstFields, "open_interest_b") || slices.Contains(firstFields, "global_field") ||
+		slices.Contains(secondFields, "open_interest_a") || slices.Contains(secondFields, "global_field") {
+		t.Fatalf("runtime field projections crossed state boundaries: first=%v second=%v", firstFields, secondFields)
+	}
+	if !slices.Contains(firstFields, "open_interest_a") || !slices.Contains(secondFields, "open_interest_b") {
+		t.Fatalf("runtime field projections omitted owned fields: first=%v second=%v", firstFields, secondFields)
+	}
+}
 
 func TestStateRegistriesAreIndependent(t *testing.T) {
 	first := NewState()

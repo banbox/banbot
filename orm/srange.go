@@ -11,6 +11,7 @@ import (
 
 // srangesCacheKey uniquely identifies a (sid, tbl, timeframe) combination.
 type srangesCacheKey struct {
+	storage   string
 	sid       int32
 	tbl       string
 	timeframe string
@@ -29,8 +30,12 @@ var (
 // srangesCacheGet returns the cached covered (has_data=true) MSRanges for a key.
 // Returns nil if no cache entry exists.
 func srangesCacheGet(sid int32, tbl, tf string) []MSRange {
+	return (&Queries{}).cachedSRanges(sid, tbl, tf)
+}
+
+func (q *Queries) cachedSRanges(sid int32, tbl, tf string) []MSRange {
 	srangesCacheLock.RLock()
-	entry, ok := srangesCache[srangesCacheKey{sid: sid, tbl: tbl, timeframe: tf}]
+	entry, ok := srangesCache[q.srangesKey(sid, tbl, tf)]
 	srangesCacheLock.RUnlock()
 	if !ok {
 		return nil
@@ -45,8 +50,12 @@ func srangesCacheGet(sid int32, tbl, tf string) []MSRange {
 }
 
 func srangesCacheGetSpans(sid int32, tbl, tf string) ([]srangeSpan, bool) {
+	return (&Queries{}).cachedSRangeSpans(sid, tbl, tf)
+}
+
+func (q *Queries) cachedSRangeSpans(sid int32, tbl, tf string) ([]srangeSpan, bool) {
 	srangesCacheLock.RLock()
-	entry, ok := srangesCache[srangesCacheKey{sid: sid, tbl: tbl, timeframe: tf}]
+	entry, ok := srangesCache[q.srangesKey(sid, tbl, tf)]
 	srangesCacheLock.RUnlock()
 	if !ok || entry == nil {
 		return nil, false
@@ -86,7 +95,19 @@ func keepSRangeSpanOutsideWindow(s srangeSpan, startMs, stopMs int64) []srangeSp
 
 // srangesCacheDel removes the cache entry for a key (used when sranges are deleted).
 func srangesCacheDel(sid int32, tbl, tf string) {
-	key := srangesCacheKey{sid: sid, tbl: tbl, timeframe: tf}
+	(&Queries{}).deleteCachedSRanges(sid, tbl, tf)
+}
+
+func (q *Queries) srangesKey(sid int32, table, timeframe string) srangesCacheKey {
+	identity := ""
+	if q.storage != nil {
+		identity = q.storage.Identity()
+	}
+	return srangesCacheKey{storage: identity, sid: sid, tbl: table, timeframe: timeframe}
+}
+
+func (q *Queries) deleteCachedSRanges(sid int32, tbl, tf string) {
+	key := q.srangesKey(sid, tbl, tf)
 	srangesCacheLock.Lock()
 	delete(srangesCache, key)
 	srangesCacheLock.Unlock()
@@ -186,7 +207,7 @@ func (q *Queries) loadSRangesSpans(ctx context.Context, sid int32, table, timefr
 	if err != nil {
 		return nil, err
 	}
-	cached, ok := srangesCacheGetSpans(sid, table, timeframe)
+	cached, ok := q.cachedSRangeSpans(sid, table, timeframe)
 	if !ok {
 		return persisted, nil
 	}
@@ -292,10 +313,10 @@ func (q *Queries) ListSRanges(ctx context.Context, sid int32, table, timeframe s
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.listSRangesPg(ctx, sid, table, timeframe, startMs, stopMs)
 	}
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	spans, err := q.loadSRangesSpans(ctx, sid, table, timeframe, startMs, stopMs)
 	if err != nil {
@@ -326,7 +347,7 @@ func (q *Queries) ListSRanges(ctx context.Context, sid int32, table, timeframe s
 }
 
 func (q *Queries) getCoveredRanges(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]MSRange, error) {
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.getCoveredRangesPg(ctx, sid, table, timeframe, startMs, stopMs)
 	}
 	rows, err := q.ListSRanges(ctx, sid, table, timeframe, startMs, stopMs)
@@ -379,10 +400,10 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.UpdateSRangesWithHolesPg(ctx, sid, table, timeframe, startMs, stopMs, holes)
 	}
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 
 	// Sort holes ascending by Start so the cur-pointer sweep below is correct.
@@ -466,7 +487,7 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 	newSpansFromWant = mergeSRangeSpans(newSpansFromWant)
 	if len(newSpansFromWant) == 0 {
 		// Nothing to insert; update cache to remove the window interior only.
-		key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
+		key := q.srangesKey(sid, table, timeframe)
 		srangesCacheLock.Lock()
 		entry := srangesCache[key]
 		if entry != nil {
@@ -481,17 +502,17 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 			}
 		}
 		srangesCacheLock.Unlock()
-		MarkTableForCompact("sranges_q", len(spans))
+		q.MarkTableForCompact("sranges_q", len(spans))
 		return nil
 	}
 
 	if err = batchInsertSranges(ctx, q, sid, table, timeframe, newSpansFromWant, now, &microOff); err != nil {
 		return fmt.Errorf("insert srange seg: %w", err)
 	}
-	MarkTableForCompact("sranges_q", len(spans))
+	q.MarkTableForCompact("sranges_q", len(spans))
 
 	// Update in-process cache: replace the window interior while keeping spans outside.
-	key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
+	key := q.srangesKey(sid, table, timeframe)
 	srangesCacheLock.Lock()
 	entry := srangesCache[key]
 	var newSpans []srangeSpan
@@ -534,10 +555,10 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.UpdateSRangesPg(ctx, sid, table, timeframe, startMs, stopMs, hasData)
 	}
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 
 	spans, err := q.loadSRangesSpans(ctx, sid, table, timeframe, startMs, stopMs)
@@ -608,7 +629,7 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 	}
 
 	if len(segs) == 0 {
-		key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
+		key := q.srangesKey(sid, table, timeframe)
 		srangesCacheLock.Lock()
 		entry := srangesCache[key]
 		if entry != nil {
@@ -623,7 +644,7 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 			}
 		}
 		srangesCacheLock.Unlock()
-		MarkTableForCompact("sranges_q", len(spans))
+		q.MarkTableForCompact("sranges_q", len(spans))
 		return nil
 	}
 
@@ -634,12 +655,12 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 	if err = batchInsertSranges(ctx, q, sid, table, timeframe, segSpans, now, &microOff); err != nil {
 		return fmt.Errorf("insert srange seg: %w", err)
 	}
-	MarkTableForCompact("sranges_q", len(spans))
+	q.MarkTableForCompact("sranges_q", len(spans))
 
 	// Synchronously update in-process cache so subsequent reads in the same
 	// process are not affected by QuestDB WAL commit lag (<100 ms).
 	// Keep existing spans outside [startMs, stopMs), replace interior with newly computed segs.
-	key := srangesCacheKey{sid: sid, tbl: table, timeframe: timeframe}
+	key := q.srangesKey(sid, table, timeframe)
 	srangesCacheLock.Lock()
 	entry := srangesCache[key]
 	var newSpans []srangeSpan

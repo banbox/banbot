@@ -54,6 +54,9 @@ func newHistSeriesFeeder(deps *RuntimeDeps, repo orm.SeriesRepo, info *orm.Serie
 	if sub == nil || sub.ExSymbol == nil || sub.ExSymbol.ID <= 0 {
 		return nil, errs.NewMsg(core.ErrBadConfig, "data sub exsymbol is required")
 	}
+	if deps != nil && repo == nil {
+		repo = orm.NewSeriesRepo(deps.Storage)
+	}
 	projected, err := projectSeriesInfo(info, sub.Fields)
 	if err != nil {
 		return nil, err

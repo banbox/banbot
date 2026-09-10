@@ -48,6 +48,38 @@ var (
 
 var legacyWsSubJobRegistry WsSubJobRegistry
 
+func lockJobsReadForState(state *State) {
+	if state == nil || state == legacyState {
+		lockJobs.RLock()
+		return
+	}
+	state.jobsMu.RLock()
+}
+
+func unlockJobsReadForState(state *State) {
+	if state == nil || state == legacyState {
+		lockJobs.RUnlock()
+		return
+	}
+	state.jobsMu.RUnlock()
+}
+
+func lockJobsWriteForState(state *State) {
+	if state == nil || state == legacyState {
+		lockJobs.Lock()
+		return
+	}
+	state.jobsMu.Lock()
+}
+
+func unlockJobsWriteForState(state *State) {
+	if state == nil || state == legacyState {
+		lockJobs.Unlock()
+		return
+	}
+	state.jobsMu.Unlock()
+}
+
 // NewWsSubJobRegistry creates a websocket subscription view for one runtime.
 // A nil symbol state keeps the legacy unfiltered registry behavior.
 func NewWsSubJobRegistry(symbols *orm.SymbolState) *WsSubJobRegistry {
@@ -74,12 +106,15 @@ func (r *WsSubJobRegistry) Refresh() {
 	if r == nil {
 		return
 	}
-	jobs := WsSubJobs
+	lockJobsReadForState(r.state)
+	defer unlockJobsReadForState(r.state)
+	var jobs map[string]map[string]map[*StratJob]bool
 	if r.state != nil {
 		r.state.ensureMaps()
 		jobs = r.state.WsSubJobs
+	} else {
+		jobs = WsSubJobs
 	}
-	lockJobs.RLock()
 	snapshot := make(wsSubJobSnapshot, len(jobs))
 	for msgType, pairMap := range jobs {
 		pairs := make(map[string][]*StratJob, len(pairMap))
@@ -99,7 +134,6 @@ func (r *WsSubJobRegistry) Refresh() {
 			snapshot[msgType] = pairs
 		}
 	}
-	lockJobs.RUnlock()
 	r.snapshot.Store(&snapshot)
 }
 
