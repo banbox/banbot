@@ -333,12 +333,12 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 
 func normalizeEntryStop(req *EnterReq, curPrice float64, isLimit bool) float64 {
 	stopPrice := req.Stop
-	if core.BackTestMode && config.Data.BTLegacyIntrabar {
-		return curPrice
-	}
 	stopActsAsLimit := req.Stop < curPrice
 	if req.Short {
 		stopActsAsLimit = req.Stop > curPrice
+	}
+	if core.BackTestMode && config.Data.BTLegacyIntrabar && !stopActsAsLimit {
+		return curPrice
 	}
 	if stopActsAsLimit {
 		isLimit = true
