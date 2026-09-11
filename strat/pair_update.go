@@ -267,6 +267,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		}
 	}
 	removals := make([]pairRemoval, 0, len(removes))
+	pendingUnwatches := make(map[string][]string)
+	shutdownJobs := make([]*StratJob, 0, len(removes))
 	pendingScores := map[string]bool{}
 	for _, pair := range adds {
 		if _, exists := curMap[pair]; exists {
@@ -382,16 +384,15 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			if stgMap, ok := accJobs[envKey]; ok {
 				if job, ok := stgMap[req.Strat.Name]; ok {
 					if req.CloseOnRemove {
-						job.MaxOpenLong = -1
-						job.MaxOpenShort = -1
+						job.SetOpenLimits(-1, -1)
 						// Keep a disabled job routable until every outstanding order
 						// reaches a terminal state. Live order events can arrive after
 						// this method returns.
-						job.pairRemovalPending = true
-						if job.Strat.OnShutDown != nil {
-							job.Strat.OnShutDown(job)
+						job.SetPairRemovalPending(true)
+						shutdownJobs = append(shutdownJobs, job)
+						for msgType, pairs := range unRegWsJobLockedWithState(strategyState, job) {
+							pendingUnwatches[msgType] = append(pendingUnwatches[msgType], pairs...)
 						}
-						unRegWsJobLockedWithState(strategyState, job)
 						removals = append(removals, pairRemoval{
 							account: acc,
 							envKey:  envKey,
@@ -399,13 +400,13 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 							pair:    pair,
 							job:     job,
 						})
-						if job.EnteredNum > 0 || len(job.LongOrders) > 0 || len(job.ShortOrders) > 0 {
-							res.ExitOrders[acc] = append(res.ExitOrders[acc], job.LongOrders...)
-							res.ExitOrders[acc] = append(res.ExitOrders[acc], job.ShortOrders...)
+						snapshot := job.ExecutionSnapshot()
+						if snapshot.EnteredNum > 0 || len(snapshot.LongOrders) > 0 || len(snapshot.ShortOrders) > 0 {
+							res.ExitOrders[acc] = append(res.ExitOrders[acc], snapshot.LongOrders...)
+							res.ExitOrders[acc] = append(res.ExitOrders[acc], snapshot.ShortOrders...)
 						}
 					} else {
-						job.MaxOpenLong = -1
-						job.MaxOpenShort = -1
+						job.SetOpenLimits(-1, -1)
 					}
 				}
 			}
@@ -416,6 +417,14 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	}
 	unlockJobsWriteForState(strategyState)
 	locked = false
+	for _, job := range shutdownJobs {
+		if job != nil && job.Strat != nil && job.Strat.OnShutDown != nil {
+			job.Strat.OnShutDown(job)
+		}
+	}
+	if callback := strategyState.WsSubUnWatchFunc(); callback != nil && len(pendingUnwatches) > 0 {
+		callback(pendingUnwatches)
+	}
 	if req.CloseOnRemove {
 		if hooks.ExitOrders == nil && len(res.ExitOrders) > 0 {
 			return nil, errs.NewMsg(core.ErrRunTime, "ExitOrders hook is required to close removed pair orders")

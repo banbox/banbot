@@ -1378,22 +1378,28 @@ func backtestToCompare(runtime *backtestCompareRuntime) {
 		log.Error("dump config fail in BacktestToCompare", zap.Error(err2))
 		return
 	}
-	// 固定回测保存在某个目录
+	// Reserve a fresh directory for every comparison run. A live runtime may
+	// trigger another comparison before the previous child process has fully
+	// finished, and two runtimes can legitimately share the same name. The
+	// allocator uses an atomic mkdir so neither case can overwrite another
+	// run's reports.
 	dataDir := runtime.dataDir()
 	if dataDir == "" {
 		log.Error("runtime backtest comparison requires a data directory")
 		return
 	}
-	outPath := filepath.Join(dataDir, "backtest", "bt_in_live_"+runtime.name)
-	err := os.RemoveAll(outPath)
-	if err != nil {
-		log.Error("BacktestToCompare clear fail", zap.Error(err))
-	}
-	err = utils.EnsureDir(outPath, 0755)
+	basePath := filepath.Join(dataDir, "backtest", "bt_in_live_"+runtime.name)
+	outPath, err := config.AllocateOutputDir(basePath)
 	if err != nil {
 		log.Error("create backtest dir fail", zap.Error(err))
 		return
 	}
+	keepOutput := false
+	defer func() {
+		if !keepOutput {
+			_ = os.RemoveAll(outPath)
+		}
+	}()
 	cfgPath := filepath.Join(outPath, "config.yml")
 	err = utils2.WriteFile(cfgPath, cfgData)
 	if err != nil {
@@ -1485,6 +1491,7 @@ func backtestToCompare(runtime *backtestCompareRuntime) {
 	exgMatch, exgDiff := compareLocalWithExg(posList, localAmts, liveAmts)
 	// 发送对比邮件报告
 	sendPosCompareReport(runtime, matchOpens, btMore, liveMore, exgMatch, exgDiff, outPath)
+	keepOutput = true
 }
 
 func compareLocalWithExg(posList []*banexg.Position, localAmts, liveAmts map[string]float64) (map[string]float64, map[string][3]float64) {

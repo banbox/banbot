@@ -501,37 +501,57 @@ func normalizeLanguageCode(code string) string {
 }
 
 func StartCpuProfile(path string, port int) *errs.Error {
+	cleanup, err := StartCpuProfileScoped(path, port)
+	if err != nil {
+		return err
+	}
+	core.AddExitCall(cleanup)
+	return nil
+}
+
+var fgprofRouteOnce sync.Once
+
+// StartCpuProfileScoped starts CPU profiling and returns an idempotent cleanup
+// callback. StartCpuProfile preserves the legacy process-wide registration by
+// adding that callback to core.AddExitCall.
+func StartCpuProfileScoped(path string, port int) (func(), *errs.Error) {
 	if _, err_ := os.Stat(path); err_ == nil {
 		err_ = os.Remove(path)
 		if err_ != nil {
-			return errs.New(errs.CodeIOWriteFail, err_)
+			return nil, errs.New(errs.CodeIOWriteFail, err_)
 		}
 	}
 	f, err_ := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
 	if err_ != nil {
-		return errs.New(errs.CodeIOWriteFail, err_)
-	} else {
-		err_ = pprof.StartCPUProfile(f)
-		if err_ != nil {
-			return errs.New(errs.CodeRunTime, err_)
-		}
+		return nil, errs.New(errs.CodeIOWriteFail, err_)
+	}
+	if err_ = pprof.StartCPUProfile(f); err_ != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return nil, errs.New(errs.CodeRunTime, err_)
+	}
+	fgprofRouteOnce.Do(func() {
 		http.DefaultServeMux.Handle("/debug/fgprof", fgprof.Handler())
-		go func() {
-			log.Info("cpu profile http started", zap.Int("port", port))
-			err_ = http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
-			if err_ != nil {
-				log.Warn("serve fgprof fail", zap.Int("port", port), zap.Error(err_))
-			}
-		}()
-		core.ExitCalls = append(core.ExitCalls, func() {
+	})
+	server := &http.Server{Addr: fmt.Sprintf(":%d", port)}
+	go func() {
+		log.Info("cpu profile http started", zap.Int("port", port))
+		serveErr := server.ListenAndServe()
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			log.Warn("serve fgprof fail", zap.Int("port", port), zap.Error(serveErr))
+		}
+	}()
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
 			pprof.StopCPUProfile()
-			err_ = f.Close()
-			if err_ != nil {
-				log.Error("save cpu.profile fail", zap.Error(err_))
+			_ = server.Close()
+			if closeErr := f.Close(); closeErr != nil {
+				log.Error("save cpu.profile fail", zap.Error(closeErr))
 			}
 		})
 	}
-	return nil
+	return cleanup, nil
 }
 
 func NewCronScheduler(exp string) (cron.Schedule, error) {

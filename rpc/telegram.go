@@ -1300,7 +1300,7 @@ func (t *Telegram) getTradingStatus() string {
 	shortOrderLabel := t.langMsg("short_order_label", "空单:")
 
 	// 检查当前激活账户是否被禁用
-	if untilMS, exists := t.noEnterUntil()[t.activeAccount]; exists && nowMS < untilMS {
+	if untilMS, exists := t.noEnterUntilFor(t.activeAccount); exists && nowMS < untilMS {
 		remainingMS := untilMS - nowMS
 		remaining := time.Duration(remainingMS) * time.Millisecond
 		response.WriteString(fmt.Sprintf("🚫 <b>%s</b> %s\n", statusLabel, tradingDisabledStatus))
@@ -1367,7 +1367,7 @@ func (t *Telegram) enableTrading() string {
 
 // IsTradingDisabled 检查指定账户是否被禁用交易（供外部调用）
 func (t *Telegram) IsTradingDisabled(account string) bool {
-	if untilMS, exists := t.noEnterUntil()[account]; exists {
+	if untilMS, exists := t.noEnterUntilFor(account); exists {
 		return t.nowMS() < untilMS
 	}
 	return false

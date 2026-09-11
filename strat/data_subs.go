@@ -13,6 +13,7 @@ func lockInfoJobsWrite(state *State) {
 		return
 	}
 	state.infoJobsMu.Lock()
+	state.infoSnapshotDirty.Store(true)
 }
 
 func unlockInfoJobsWrite(state *State) {
@@ -21,6 +22,22 @@ func unlockInfoJobsWrite(state *State) {
 		return
 	}
 	state.infoJobsMu.Unlock()
+}
+
+func lockInfoJobsReadForState(state *State) {
+	if state == nil || state == legacyState {
+		lockInfoJobs.Lock()
+		return
+	}
+	state.infoJobsMu.RLock()
+}
+
+func unlockInfoJobsReadForState(state *State) {
+	if state == nil || state == legacyState {
+		lockInfoJobs.Unlock()
+		return
+	}
+	state.infoJobsMu.RUnlock()
 }
 
 func DataSubKey(source string, sid int32, tf string) string {

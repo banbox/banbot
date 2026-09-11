@@ -31,14 +31,18 @@ func runtimeConfig(deps *biz.RuntimeDeps) *config.Config {
 	return deps.Config.View()
 }
 
-func runtimeDataDeps(deps *biz.RuntimeDeps) *data.RuntimeDeps {
+func runtimeDataDeps(deps *biz.RuntimeDeps, catalog ...*data.DataSourceCatalog) *data.RuntimeDeps {
 	if deps == nil {
 		return nil
+	}
+	var dataCatalog *data.DataSourceCatalog
+	if len(catalog) > 0 {
+		dataCatalog = catalog[0]
 	}
 	return &data.RuntimeDeps{
 		Core: deps.Core, Clock: deps.Clock, Config: deps.Config,
 		Market: deps.Market, Symbols: deps.Symbols, Strategies: deps.Strategies,
-		Storage: deps.Storage, Exchange: deps.Exchange, Callbacks: nil,
+		Storage: deps.Storage, Catalog: dataCatalog, Exchange: deps.Exchange, Callbacks: nil,
 	}
 }
 
@@ -73,7 +77,8 @@ func cronRefreshPairsWithRuntime(scheduler com.Scheduler, trader *CryptoTrader, 
 	}
 }
 
-func fetchHourKlinesWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, deps *biz.RuntimeDeps) {
+func fetchHourKlinesWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, deps *biz.RuntimeDeps,
+	catalog ...*data.DataSourceCatalog) {
 	if scheduler == nil || dp == nil || deps == nil || deps.Symbols == nil {
 		return
 	}
@@ -93,7 +98,7 @@ func fetchHourKlinesWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, 
 				delete(endMap, sid)
 			}
 		}
-		data.DownEmitHourKlinesWithRuntimeDeps(runtimeDataDeps(deps), dp, endMap)
+		data.DownEmitHourKlinesWithRuntimeDeps(runtimeDataDeps(deps, catalog...), dp, endMap)
 	})
 	if err != nil {
 		log.Error("add runtime FetchHourKlines fail", zap.Error(err))
@@ -267,13 +272,14 @@ func cronDumpStratOutputsWithRuntime(scheduler com.Scheduler, state *strat.State
 	logDir := filepath.Join(dataDir, "logs")
 	_, err := scheduler.AddFunc("31 * * * * *", func() {
 		groups := make(map[string][]string)
-		for _, items := range state.PairStrats {
+		for _, items := range state.PairStrategiesView() {
 			for _, strategy := range items {
-				if strategy == nil || len(strategy.Outputs) == 0 {
+				if strategy == nil {
 					continue
 				}
-				groups[strategy.Name] = append(groups[strategy.Name], strategy.Outputs...)
-				strategy.Outputs = nil
+				if rows := strategy.DrainOutputs(); len(rows) > 0 {
+					groups[strategy.Name] = append(groups[strategy.Name], rows...)
+				}
 			}
 		}
 		for name, lines := range groups {

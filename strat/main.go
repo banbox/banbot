@@ -94,6 +94,30 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		strategyState = LegacyState()
 	}
 	strategyState.ensureMaps()
+	// Explicit runtimes publish their job registry through immutable snapshots.
+	// Keep the mutable construction phase under the same write lock used by
+	// snapshot readers and pair rotation. Readers that already hold the prior
+	// snapshot can continue without blocking; readers that observe the dirty
+	// bit wait until this complete registry update has finished and then clone
+	// a consistent view. The legacy facade keeps its historical locking and
+	// callback behavior for source compatibility.
+	var pendingUnwatches map[string][]string
+	var pendingShutdown []*StratJob
+	if strategyState != legacyState {
+		pendingUnwatches = make(map[string][]string)
+		lockJobsWriteForState(strategyState)
+		defer func() {
+			unlockJobsWriteForState(strategyState)
+			for _, job := range pendingShutdown {
+				if job != nil && job.Strat != nil && job.Strat.OnShutDown != nil {
+					job.Strat.OnShutDown(job)
+				}
+			}
+			if callback := strategyState.WsSubUnWatchFunc(); callback != nil && len(pendingUnwatches) > 0 {
+				callback(pendingUnwatches)
+			}
+		}()
+	}
 	strict := strictBacktestFor(strategyState, state)
 	accounts := runtimeAccountsFor(strategyState)
 	if strategyState != legacyState && runtimeConfigFor(strategyState) == nil {
@@ -130,7 +154,11 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		config.ClearRefineMap()
 	}
 	Versions := strategyState.Versions
-	resetJobsWithState(strategyState, state, orderStates...)
+	if strategyState == legacyState {
+		resetJobsWithState(strategyState, state, orderStates...)
+	} else {
+		resetJobsWithStateLocked(strategyState, state, orderStates...)
+	}
 	pairTfWarms := make(Warms)
 	// 记录每个账户下，每个策略的任务数量，防止超过账户要求数量
 	accLimits, maxJobNum := newAccStratLimitsForState(strategyState)
@@ -172,7 +200,8 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 			codes := make([]string, 0, len(exsList)/2)
 			for _, jobs := range accJobs {
 				if job, ok := jobs[polID]; ok {
-					if job.MaxOpenLong >= 0 || job.MaxOpenShort >= 0 {
+					snapshot := job.ExecutionSnapshot()
+					if snapshot.MaxOpenLong >= 0 || snapshot.MaxOpenShort >= 0 {
 						holdNum += 1
 						oldAddPairs[job.Symbol.Symbol] = true
 						if !accLimits.tryAdd(acc, polID) {
@@ -268,24 +297,32 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 			resJobs := make(map[string]*StratJob)
 			for name := range utils.MapKeys(envJobs, strict) {
 				job := envJobs[name]
-				if job.MaxOpenLong == -1 && job.MaxOpenShort == -1 {
+				snapshot := job.ExecutionSnapshot()
+				if snapshot.MaxOpenLong == -1 && snapshot.MaxOpenShort == -1 {
 					// disable open order
-					if job.EnteredNum > 0 && holdPosition {
+					if snapshot.EnteredNum > 0 && holdPosition {
 						// 有未平仓订单，继续跟踪
 						resJobs[name] = job
 					} else {
 						// 立刻平仓
-						if job.Strat.OnShutDown != nil {
-							job.Strat.OnShutDown(job)
+						if strategyState == legacyState {
+							if job.Strat.OnShutDown != nil {
+								job.Strat.OnShutDown(job)
+							}
+							unRegWsJobWithState(strategyState, job)
+						} else {
+							pendingShutdown = append(pendingShutdown, job)
+							for msgType, pairs := range unRegWsJobLockedWithState(strategyState, job) {
+								pendingUnwatches[msgType] = append(pendingUnwatches[msgType], pairs...)
+							}
 						}
-						unRegWsJobWithState(strategyState, job)
 						exitJobs[job] = true
 						exitPairs[job.Symbol.Symbol] = true
-						if jobHasOutstandingOrders(job) || len(job.LongOrders) > 0 || len(job.ShortOrders) > 0 {
-							job.pairRemovalPending = true
+						if jobHasOutstandingOrders(job) || len(snapshot.LongOrders) > 0 || len(snapshot.ShortOrders) > 0 {
+							job.SetPairRemovalPending(true)
 							resJobs[name] = job
-							exitOds = append(exitOds, job.LongOrders...)
-							exitOds = append(exitOds, job.ShortOrders...)
+							exitOds = append(exitOds, snapshot.LongOrders...)
+							exitOds = append(exitOds, snapshot.ShortOrders...)
 						}
 					}
 				} else {
@@ -304,7 +341,7 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 				}
 				for name := range utils.MapKeys(resJobs, strict) {
 					j := resJobs[name]
-					if j.pairRemovalPending {
+					if j.PairRemovalPending() {
 						continue
 					}
 					hasLiveJob = true
@@ -315,7 +352,12 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 					}
 					subMap[pair] = tf
 					if len(j.Strat.WsSubs) > 0 {
-						err := regWsJobWithState(strategyState, j)
+						var err *errs.Error
+						if strategyState == legacyState {
+							err = regWsJobWithState(strategyState, j)
+						} else {
+							err = regWsJobLockedWithState(strategyState, j)
+						}
 						if err != nil {
 							return nil, nil, err
 						}
@@ -408,10 +450,12 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 	}
 	// Remove useless items from Envs
 	// 从Envs中删除无用的项
-	for envKey := range strategyState.Envs {
+	for _, envKey := range strategyState.EnvKeys() {
 		if _, ok := envKeys[envKey]; !ok {
-			delete(strategyState.Envs, envKey)
+			strategyState.DeleteEnv(envKey)
+			strategyState.tmpEnvLock.Lock()
 			delete(strategyState.TmpEnvs, envKey)
+			strategyState.tmpEnvLock.Unlock()
 		}
 	}
 	// 从pairTfs中确认哪些要恢复
@@ -441,19 +485,14 @@ func ExitStratJobsWithState(strategyState *State) {
 	if strategyState == nil {
 		strategyState = LegacyState()
 	}
-	strict := strictBacktestFor(strategyState, nil)
-	for acc := range utils.MapKeys(strategyState.AccJobs, strict) {
-		jobs := strategyState.AccJobs[acc]
-		for envKey := range utils.MapKeys(jobs, strict) {
-			items := jobs[envKey]
-			for name := range utils.MapKeys(items, strict) {
-				job := items[name]
-				if job.Strat.OnShutDown != nil {
-					job.Strat.OnShutDown(job)
-				}
-				unRegWsJobWithState(strategyState, job)
-			}
+	for _, job := range strategyState.CollectJobs() {
+		if job == nil || job.Strat == nil {
+			continue
 		}
+		if job.Strat.OnShutDown != nil {
+			job.Strat.OnShutDown(job)
+		}
+		unRegWsJobWithState(strategyState, job)
 	}
 	var strats []*TradeStrat
 	if strategyState == legacyState {
@@ -597,7 +636,7 @@ func initBarEnvWithState(strategyState *State, state *core.State, exs *orm.ExSym
 	}
 	strategyState.ensureMaps()
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
-	env, ok := strategyState.Envs[envKey]
+	env, ok := strategyState.Env(envKey)
 	if !ok {
 		var err error
 		exgName, market := exs.Exchange, exs.Market
@@ -628,7 +667,7 @@ func initBarEnvWithState(strategyState *State, state *core.State, exs *orm.ExSym
 			env.MaxCache = core.NumTaCache
 		}
 		env.Data.Store("sid", int64(exs.ID))
-		strategyState.Envs[envKey] = env
+		strategyState.SetEnv(envKey, env)
 	}
 	return env
 }
@@ -658,19 +697,20 @@ func markStratJobWithState(strategyState *State, tf, polID string, exs *orm.ExSy
 				zap.String("strat", polID))
 			continue
 		}
-		if job.MaxOpenShort >= 0 || job.MaxOpenLong >= 0 {
+		snapshot := job.ExecutionSnapshot()
+		if snapshot.MaxOpenShort >= 0 || snapshot.MaxOpenLong >= 0 {
 			// 已事先允许，跳过避免重复计数
 			continue
 		}
 		if accLimits.tryAdd(acc, polID) {
 			newAdd += 1
-			job.MaxOpenShort = job.Strat.EachMaxShort
-			job.MaxOpenLong = job.Strat.EachMaxLong
+			maxLong, maxShort := job.Strat.EachMaxLong, job.Strat.EachMaxShort
 			if dirt == core.OdDirtShort {
-				job.MaxOpenLong = -1
+				maxLong = -1
 			} else if dirt == core.OdDirtLong {
-				job.MaxOpenShort = -1
+				maxShort = -1
 			}
+			job.SetOpenLimits(maxLong, maxShort)
 		}
 	}
 	return newAdd, nil
@@ -757,20 +797,33 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 			job.runtimeClock = runtimeClock
 		}
 		if allowOpen {
-			job.MaxOpenShort = stgy.EachMaxShort
-			job.MaxOpenLong = stgy.EachMaxLong
+			maxLong, maxShort := stgy.EachMaxLong, stgy.EachMaxShort
 			if dirt == core.OdDirtShort {
-				job.MaxOpenLong = -1
+				maxLong = -1
 			} else if dirt == core.OdDirtLong {
-				job.MaxOpenShort = -1
+				maxShort = -1
 			}
+			job.SetOpenLimits(maxLong, maxShort)
 		}
 		// Load subscription information for other targets
 		// 加载订阅其他标的信息
 		if stgy.OnPairInfos != nil || stgy.OnDataSubs != nil {
-			infoJobs := strategyState.InfoJobs(account)
+			subs := CollectDataSubs(job)
 			hasInfoSubs := false
-			for _, s := range CollectDataSubs(job) {
+			for _, sub := range subs {
+				if sub != nil && sub.ExSymbol != nil {
+					hasInfoSubs = true
+					break
+				}
+			}
+			hasSideInputHandler := stgy.OnData != nil || stgy.OnInfoBar != nil ||
+				stgy.BatchInfo && stgy.OnBatchInfos != nil
+			if hasInfoSubs && !hasSideInputHandler {
+				panic(fmt.Sprintf("%s: side-input subscriptions require `OnData`, `OnInfoBar`, or `BatchInfo` + `OnBatchInfos`", stgy.Name))
+			}
+			lockInfoJobsWrite(strategyState)
+			infoJobs := strategyState.InfoJobs(account)
+			for _, s := range subs {
 				if s == nil || s.ExSymbol == nil {
 					continue
 				}
@@ -789,11 +842,7 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 				// 这里需要stratID+pair作为键，否则多个品种订阅同一个额外品种数据时，只记录了最后一个
 				items[strings.Join([]string{stgy.Name, exs.Symbol}, "_")] = job
 			}
-			hasSideInputHandler := stgy.OnData != nil || stgy.OnInfoBar != nil ||
-				stgy.BatchInfo && stgy.OnBatchInfos != nil
-			if hasInfoSubs && !hasSideInputHandler {
-				panic(fmt.Sprintf("%s: side-input subscriptions require `OnData`, `OnInfoBar`, or `BatchInfo` + `OnBatchInfos`", stgy.Name))
-			}
+			unlockInfoJobsWrite(strategyState)
 		}
 	}
 }
@@ -806,6 +855,19 @@ func resetJobs() {
 }
 
 func resetJobsWithState(strategyState *State, state *core.State, orderStates ...*ormo.OrderState) {
+	if strategyState == nil {
+		strategyState = LegacyState()
+	}
+	strategyState.ensureMaps()
+	lockJobsWriteForState(strategyState)
+	defer unlockJobsWriteForState(strategyState)
+	resetJobsWithStateLocked(strategyState, state, orderStates...)
+}
+
+// resetJobsWithStateLocked is the construction-phase variant used by an
+// explicit registry reload that already owns jobsMu. Keeping the locking
+// wrapper above preserves the public/legacy helper without recursive locking.
+func resetJobsWithStateLocked(strategyState *State, state *core.State, orderStates ...*ormo.OrderState) {
 	if strategyState == nil {
 		strategyState = LegacyState()
 	}
@@ -831,9 +893,9 @@ func resetJobsWithState(strategyState *State, state *core.State, orderStates ...
 			for name := range utils.MapKeys(jobs, strict) {
 				job := jobs[name]
 				job.InitBar(odList)
-				if job.Strat.OrderOnRotation != "open" || job.OrderNum == 0 {
-					job.MaxOpenLong = -1
-					job.MaxOpenShort = -1
+				snapshot := job.ExecutionSnapshot()
+				if job.Strat.OrderOnRotation != "open" || snapshot.OrderNum == 0 {
+					job.SetOpenLimits(-1, -1)
 				} else {
 					pair := job.Symbol.Symbol
 					enableAdmissionPair(state, pair)
@@ -847,11 +909,12 @@ func jobHasOutstandingOrders(job *StratJob) bool {
 	if job == nil {
 		return false
 	}
-	if job.EnteredNum > 0 {
+	snapshot := job.ExecutionSnapshot()
+	if snapshot.EnteredNum > 0 {
 		return true
 	}
-	seen := make(map[*ormo.InOutOrder]struct{}, len(job.LongOrders)+len(job.ShortOrders))
-	for _, orders := range [][]*ormo.InOutOrder{job.LongOrders, job.ShortOrders} {
+	seen := make(map[*ormo.InOutOrder]struct{}, len(snapshot.LongOrders)+len(snapshot.ShortOrders))
+	for _, orders := range [][]*ormo.InOutOrder{snapshot.LongOrders, snapshot.ShortOrders} {
 		for _, od := range orders {
 			if od == nil {
 				continue
@@ -900,7 +963,7 @@ func FinalizePairRotation(strategyState *State, coreStates ...*core.State) {
 	for account, jobs := range strategyState.AccJobs {
 		for envKey, envJobs := range jobs {
 			for name, job := range envJobs {
-				if job == nil || !job.pairRemovalPending || jobHasOutstandingOrders(job) {
+				if job == nil || !job.PairRemovalPending() || jobHasOutstandingOrders(job) {
 					continue
 				}
 				delete(envJobs, name)
@@ -1063,19 +1126,22 @@ func unRegWsJobWithState(strategyState *State, j *StratJob) {
 	}
 	strategyState.ensureMaps()
 	lockJobsWriteForState(strategyState)
-	defer unlockJobsWriteForState(strategyState)
-	unRegWsJobLockedWithState(strategyState, j)
+	unwatches := unRegWsJobLockedWithState(strategyState, j)
+	callback := strategyState.WsSubUnWatchFunc()
+	unlockJobsWriteForState(strategyState)
+	if callback != nil && len(unwatches) > 0 {
+		callback(unwatches)
+	}
 }
 
 // unRegWsJobLocked mutates the legacy websocket registry while lockJobs is
-// held. The compatibility unwatch callback intentionally remains outside the
-// immutable callback snapshot and is invoked before the lock is released by
-// callers that already own the write lock.
+// held. It returns the pairs that should be passed to the compatibility
+// unwatch callback after the lock is released.
 func unRegWsJobLocked(j *StratJob) {
 	unRegWsJobLockedWithState(LegacyState(), j)
 }
 
-func unRegWsJobLockedWithState(strategyState *State, j *StratJob) {
+func unRegWsJobLockedWithState(strategyState *State, j *StratJob) map[string][]string {
 	if strategyState == nil {
 		strategyState = LegacyState()
 	}
@@ -1103,9 +1169,7 @@ func unRegWsJobLockedWithState(strategyState *State, j *StratJob) {
 			unwatches[msgType] = removes
 		}
 	}
-	if len(unwatches) > 0 && strategyState.WsSubUnWatch != nil {
-		strategyState.WsSubUnWatch(unwatches)
-	}
+	return unwatches
 }
 
 var polFilters = make(map[string][]goods.IFilter)

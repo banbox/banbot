@@ -48,14 +48,22 @@ func findExSymbol(exchange, market, symbol string) *ExSymbol {
 }
 
 func (q *Queries) LoadExgSymbols(exgName string) *errs.Error {
-	return q.loadExgSymbols(loadDefaultSymbolState(), exgName)
+	state, err := q.requireSymbolState()
+	if err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
+	return q.loadExgSymbols(state, exgName)
 }
 
 func (q *SymbolQueries) LoadExgSymbols(exgName string) *errs.Error {
 	if q == nil {
 		return errs.NewMsg(core.ErrBadConfig, "symbol query is required")
 	}
-	return q.Queries.loadExgSymbols(q.symbolState(), exgName)
+	state := q.symbolState()
+	if state == nil {
+		return errs.NewMsg(core.ErrBadConfig, "explicit storage requires an explicit symbol state")
+	}
+	return q.Queries.loadExgSymbols(state, exgName)
 }
 
 func (q *Queries) loadExgSymbols(state *SymbolState, exgName string) *errs.Error {
@@ -1017,7 +1025,11 @@ func EnsureListDatesWithStateAndOptions(sess *Queries, state *SymbolState, excha
 	if exInfo.MarketType != banexg.MarketSpot {
 		return nil
 	}
-	state = symbolStateOrDefault(state)
+	var stateErr error
+	state, stateErr = resolveQuerySymbolState(sess, state)
+	if stateErr != nil {
+		return errs.New(core.ErrBadConfig, stateErr)
+	}
 	generation := state.catalogGeneration()
 	state.tryListMu.Lock()
 	if state.tryListIDs == nil {

@@ -258,6 +258,45 @@ func TestStateAdmissionConcurrentSnapshotReads(t *testing.T) {
 	}
 }
 
+func TestStateAdmissionOverridesAreSynchronized(t *testing.T) {
+	state, err := NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	state.SetPairs([]string{"BTC/USDT"}, nil)
+
+	const iterations = 1000
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			state.SetPairBanUntil("BTC/USDT", int64(i+1))
+			_ = state.IsPairBanned("BTC/USDT", int64(i))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			state.SetNoEnterUntil("account", int64(i+1))
+			_, _ = state.NoEnterUntilFor("account")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			state.SetPairs([]string{"BTC/USDT", fmt.Sprintf("PAIR-%d/USDT", i%8)}, nil)
+			for _, pair := range state.BannedPairs() {
+				if !state.PairEnabled(pair) {
+					state.SetPairBanUntil(pair, 0)
+				}
+			}
+		}
+	}()
+	wg.Wait()
+}
+
 func BenchmarkSymbolParserColdMiss(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {

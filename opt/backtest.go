@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -56,6 +57,7 @@ type BackTest struct {
 	loopMainFn           func() *errs.Error
 	historicalCloseMS    []int64
 	historicalCloseIndex int
+	outputOwned          bool
 }
 
 func (b *BackTest) SetAfterBacktest(callback func(*BackTest)) {
@@ -226,8 +228,30 @@ func NewBackTestLiteWithRuntimeDataDeps(session LegacySession, deps biz.RuntimeD
 // NewBackTestLiteWithRuntimeDataDepsOwned constructs a backtest over explicit
 // runtime state. It does not require or touch the legacy session gate.
 func NewBackTestLiteWithRuntimeDataDepsOwned(deps biz.RuntimeDeps, symbols *orm.SymbolState, isOpt bool, onBar data.FnDataSeries, getEnd data.FnGetInt64, pBar *utils.StagedPrg, dataDeps *data.RuntimeDeps) *BackTestLite {
+	resolvedSymbols, symbolsErr := resolveBacktestSymbols(deps.Symbols, symbols, dataDepsSymbolState(dataDeps))
+	if symbolsErr == nil {
+		symbols = resolvedSymbols
+		if deps.Symbols == nil {
+			deps.Symbols = symbols
+		}
+	} else if symbols == nil {
+		// Keep the constructed runner usable enough to report the identity
+		// error through its normal run-error path without selecting a foreign
+		// catalog. The caller still receives a deterministic failure from the
+		// first loop operation.
+		if deps.Symbols != nil {
+			symbols = deps.Symbols
+		} else {
+			symbols = dataDepsSymbolState(dataDeps)
+		}
+		deps.Symbols = symbols
+	}
 	trader := biz.NewTraderWithRuntimeDeps(deps)
-	return newBackTestLite(trader, symbols, isOpt, onBar, getEnd, pBar, dataDeps)
+	lite := newBackTestLite(trader, symbols, isOpt, onBar, getEnd, pBar, dataDeps)
+	if symbolsErr != nil {
+		lite.setRunError(symbolsErr)
+	}
+	return lite
 }
 
 func legacyDataRuntimeDeps(deps *biz.RuntimeDeps, symbols *orm.SymbolState) *data.RuntimeDeps {
@@ -301,11 +325,19 @@ func bindDataRuntimeDeps(traderDeps *biz.RuntimeDeps, symbols *orm.SymbolState, 
 }
 
 func newBackTestLite(trader biz.Trader, symbols *orm.SymbolState, isOpt bool, onBar data.FnDataSeries, getEnd data.FnGetInt64, pBar *utils.StagedPrg, dataDeps *data.RuntimeDeps) *BackTestLite {
+	var runtimeDepsErr *errs.Error
 	if deps := trader.RuntimeDependencies(); deps != nil {
+		traderSymbols := deps.Symbols
+		if _, symbolsErr := resolveBacktestSymbols(traderSymbols, symbols, dataDepsSymbolState(dataDeps)); symbolsErr != nil {
+			runtimeDepsErr = symbolsErr
+		}
 		dataDeps = bindDataRuntimeDeps(deps, symbols, dataDeps)
 		symbols = dataDeps.Symbols
 		if deps.Symbols == nil {
 			deps.Symbols = symbols
+		}
+		if runtimeDepsErr == nil {
+			runtimeDepsErr = validateDataRuntimeDeps(deps, symbols, dataDeps)
 		}
 	}
 	b := &BackTestLite{
@@ -316,6 +348,9 @@ func newBackTestLite(trader biz.Trader, symbols *orm.SymbolState, isOpt bool, on
 	}
 	b.BTResult.runtimeDeps = b.RuntimeDependencies()
 	b.BTResult.reportDeps = reportDepsFromRuntime(b.RuntimeDependencies())
+	if runtimeDepsErr != nil {
+		b.runErr = runtimeDepsErr
+	}
 	var wallets *biz.BanWallets
 	if deps := b.RuntimeDependencies(); deps != nil {
 		wallets = biz.InitFakeWalletsWithRuntimeDeps(*deps)
@@ -669,9 +704,11 @@ func NewBackTestWithRuntimeDataDeps(session LegacySession, deps biz.RuntimeDeps,
 // NewBackTestWithRuntimeDataDepsOwned constructs a backtest over explicit
 // runtime state. The returned runner does not depend on a legacy session.
 func NewBackTestWithRuntimeDataDepsOwned(deps biz.RuntimeDeps, symbols *orm.SymbolState, isOpt bool, outDir string, dataDeps *data.RuntimeDeps) (*BackTest, *errs.Error) {
-	if symbols == nil {
-		symbols = deps.Symbols
+	resolvedSymbols, symbolsErr := resolveBacktestSymbols(deps.Symbols, symbols, dataDepsSymbolState(dataDeps))
+	if symbolsErr != nil {
+		return nil, symbolsErr
 	}
+	symbols = resolvedSymbols
 	if deps.Symbols == nil {
 		deps.Symbols = symbols
 	}
@@ -684,8 +721,90 @@ func NewBackTestWithRuntimeDataDepsOwned(deps biz.RuntimeDeps, symbols *orm.Symb
 
 func newBackTestWithRuntimeDataDepsCompat(deps biz.RuntimeDeps, symbols *orm.SymbolState, isOpt bool,
 	outDir string, dataDeps *data.RuntimeDeps) (*BackTest, *errs.Error) {
+	resolvedSymbols, symbolsErr := resolveBacktestSymbols(deps.Symbols, symbols, dataDepsSymbolState(dataDeps))
+	if symbolsErr != nil {
+		return nil, symbolsErr
+	}
+	symbols = resolvedSymbols
+	if deps.Symbols == nil {
+		deps.Symbols = symbols
+	}
 	trader := biz.NewTraderWithRuntimeDeps(deps)
+	if err := validateDataRuntimeDeps(trader.RuntimeDependencies(), symbols, dataDeps); err != nil {
+		return nil, err
+	}
 	return newBackTest(trader, symbols, isOpt, outDir, dataDeps)
+}
+
+func dataDepsSymbolState(dataDeps *data.RuntimeDeps) *orm.SymbolState {
+	if dataDeps == nil {
+		return nil
+	}
+	return dataDeps.Symbols
+}
+
+// resolveBacktestSymbols keeps the symbol catalog identity consistent across
+// the constructor's three possible owners. A later dependency set must not
+// silently replace a catalog that was already supplied by the caller.
+func resolveBacktestSymbols(depsSymbols, explicitSymbols, suppliedSymbols *orm.SymbolState) (*orm.SymbolState, *errs.Error) {
+	resolved := explicitSymbols
+	if depsSymbols != nil {
+		if resolved != nil && resolved != depsSymbols {
+			return nil, errs.NewMsg(core.ErrRunTime, "backtest runtime symbols do not match dependencies")
+		}
+		resolved = depsSymbols
+	}
+	if suppliedSymbols != nil {
+		if resolved != nil && resolved != suppliedSymbols {
+			return nil, errs.NewMsg(core.ErrRunTime, "data runtime symbols do not match backtest runtime")
+		}
+		resolved = suppliedSymbols
+	}
+	return resolved, nil
+}
+
+// validateDataRuntimeDeps rejects a supplied data dependency set that points
+// at a different runtime than the trader. Provider-only extensions such as a
+// data source catalog and callback tracker may vary; mutable state identities
+// must remain shared with the composition root.
+func validateDataRuntimeDeps(deps *biz.RuntimeDeps, symbols *orm.SymbolState, supplied *data.RuntimeDeps) *errs.Error {
+	if deps == nil || supplied == nil {
+		return nil
+	}
+	if supplied.Core != nil && supplied.Core != deps.Core {
+		return errs.NewMsg(core.ErrRunTime, "data runtime core does not match trader runtime")
+	}
+	if supplied.Clock != nil && supplied.Clock != deps.Clock {
+		return errs.NewMsg(core.ErrRunTime, "data runtime clock does not match trader runtime")
+	}
+	if supplied.Config != nil && supplied.Config != deps.Config {
+		return errs.NewMsg(core.ErrRunTime, "data runtime config does not match trader runtime")
+	}
+	if supplied.Market != nil && supplied.Market != deps.Market {
+		return errs.NewMsg(core.ErrRunTime, "data runtime market does not match trader runtime")
+	}
+	if supplied.Symbols != nil && supplied.Symbols != symbols {
+		return errs.NewMsg(core.ErrRunTime, "data runtime symbols do not match trader runtime")
+	}
+	if supplied.Storage != nil && supplied.Storage != deps.Storage {
+		return errs.NewMsg(core.ErrRunTime, "data runtime storage does not match trader runtime")
+	}
+	if supplied.Strategies != nil && supplied.Strategies != deps.Strategies {
+		return errs.NewMsg(core.ErrRunTime, "data runtime strategies do not match trader runtime")
+	}
+	if supplied.Exchange != nil && supplied.Exchange != deps.Exchange {
+		return errs.NewMsg(core.ErrRunTime, "data runtime exchange does not match trader runtime")
+	}
+	if supplied.Dump != nil && supplied.Dump != deps.Dump {
+		return errs.NewMsg(core.ErrRunTime, "data runtime dump does not match trader runtime")
+	}
+	if supplied.ExchangeName != "" && deps.Core != nil && supplied.ExchangeName != deps.Core.ExgName {
+		return errs.NewMsg(core.ErrRunTime, "data runtime exchange name does not match trader runtime")
+	}
+	if supplied.MarketType != "" && deps.Core != nil && supplied.MarketType != deps.Core.Market {
+		return errs.NewMsg(core.ErrRunTime, "data runtime market type does not match trader runtime")
+	}
+	return nil
 }
 
 func newBackTest(trader biz.Trader, symbols *orm.SymbolState, isOpt bool, outDir string, dataDeps *data.RuntimeDeps) (*BackTest, *errs.Error) {
@@ -720,7 +839,13 @@ func newBackTest(trader biz.Trader, symbols *orm.SymbolState, isOpt bool, outDir
 		} else {
 			dataDir = config.GetDataDir()
 		}
-		outDir = fmt.Sprintf("%s/backtest/%s", dataDir, hash)
+		baseDir := filepath.Join(dataDir, "backtest", hash)
+		allocatedDir, outputErr := config.AllocateOutputDir(baseDir)
+		if outputErr != nil {
+			return nil, errs.New(core.ErrIOWriteFail, outputErr)
+		}
+		outDir = allocatedDir
+		b.outputOwned = true
 	}
 	if snapshot := b.runSnapshot(); snapshot != nil {
 		b.OutDir = snapshot.ParsePath(outDir)
@@ -905,7 +1030,7 @@ func collectBacktestJobsForBacktest(b *BackTest) ([]*strat.StratJob, *errs.Error
 			if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
 				return nil, errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for backtest series")
 			}
-			return collectBacktestJobsFromMap(deps.Strategies.Jobs(deps.DefaultAccount)), nil
+			return collectBacktestJobsFromMap(deps.Strategies.JobMaps(deps.DefaultAccount)), nil
 		}
 	}
 	return collectBacktestJobs(), nil
@@ -1052,6 +1177,12 @@ func (b *BackTest) closeHistoricalBoundaries(eventMS int64) *errs.Error {
 }
 
 func (b *BackTest) Run() *errs.Error {
+	completed := false
+	defer func() {
+		if !completed && b != nil && b.outputOwned && b.OutDir != "" {
+			_ = os.RemoveAll(b.OutDir)
+		}
+	}()
 	err := b.initRefreshCron()
 	if err != nil {
 		log.Error("init pair cron fail", zap.Error(err))
@@ -1116,6 +1247,7 @@ func (b *BackTest) Run() *errs.Error {
 		return err
 	}
 	if b.dataPrep {
+		completed = true
 		return nil
 	}
 	if wallets == nil {
@@ -1138,6 +1270,7 @@ func (b *BackTest) Run() *errs.Error {
 		}
 		b.printBtResult(true)
 	}
+	completed = true
 	return nil
 }
 
@@ -1686,7 +1819,7 @@ func syncSimOrdersWithDeps(deps *biz.RuntimeDeps, isFirst bool, relayOpens, rela
 		if manager == nil {
 			continue
 		}
-		jobs := deps.Strategies.Jobs(account)
+		jobs := deps.Strategies.JobMaps(account)
 		openOrders, lock := deps.Orders.GetOpenODs(account)
 		current := make(map[string]*ormo.InOutOrder, len(openOrders))
 		lock.Lock()
@@ -1702,7 +1835,7 @@ func syncSimOrdersWithDeps(deps *biz.RuntimeDeps, isFirst bool, relayOpens, rela
 			}
 			if strategyJobs := jobs[fmt.Sprintf("%s_%s", order.Symbol, order.Timeframe)]; strategyJobs != nil {
 				if job := strategyJobs[order.Strategy]; job != nil {
-					job.OrderNum++
+					job.AddOrderCount(1)
 					allowed = append(allowed, order)
 				}
 			}
@@ -1865,7 +1998,7 @@ func syncSimOrders(isFirst bool, relayOpens, relayDones map[string]*ormo.InOutOr
 			stgMap, ok := jobs[fmt.Sprintf("%s_%s", od.Symbol, od.Timeframe)]
 			if ok {
 				if job, ok := stgMap[od.Strategy]; ok {
-					job.OrderNum += 1
+					job.AddOrderCount(1)
 					allowOds = append(allowOds, od)
 					continue
 				}

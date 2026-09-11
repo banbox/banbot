@@ -100,7 +100,7 @@ func MakeCheckFatalStopWithRuntime(deps RuntimeDeps, fatal map[int]float64, fata
 
 func checkRuntimeFatalStop(deps RuntimeDeps, account string, fatal map[int]float64, fatalHours int,
 	intervals []int, nowMS func() int64) {
-	stopUntil := deps.Core.NoEnterUntil[account]
+	stopUntil, _ := deps.Core.NoEnterUntilFor(account)
 	now := nowMS()
 	if stopUntil >= now {
 		return
@@ -126,7 +126,7 @@ func checkRuntimeFatalStop(deps RuntimeDeps, account string, fatal map[int]float
 		if lossRate < fatal[interval] {
 			continue
 		}
-		deps.Core.NoEnterUntil[account] = now + int64(fatalHours)*int64(60*60*1000)
+		deps.Core.SetNoEnterUntil(account, now+int64(fatalHours)*int64(60*60*1000))
 		log.Error("runtime fatal stop activated", zap.String("account", account), zap.Int("minutes", interval), zap.Float64("loss_rate", lossRate))
 		return
 	}

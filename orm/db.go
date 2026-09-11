@@ -86,6 +86,22 @@ func (q *Queries) usesLegacySymbolCatalog() bool {
 	return q.storage == nil || q.storage.legacy
 }
 
+// requireSymbolState makes explicit database handles fail closed when a
+// symbol operation was not given the matching runtime catalog. Only the
+// package-level legacy handles are allowed to use the default catalog.
+func (q *Queries) requireSymbolState() (*SymbolState, error) {
+	if q == nil {
+		return nil, fmt.Errorf("symbol query is required")
+	}
+	if q.symbols != nil {
+		return q.symbols, nil
+	}
+	if q.storage != nil && !q.storage.legacy {
+		return nil, fmt.Errorf("explicit storage requires an explicit symbol state")
+	}
+	return loadDefaultSymbolState(), nil
+}
+
 type dbBeginner interface {
 	Begin(context.Context) (pgx.Tx, error)
 }

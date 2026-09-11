@@ -427,8 +427,10 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 	}
 	dbPathLock.Unlock()
 
-	// 构建缓存键：路径+读写模式
-	cacheKey := path
+	// Include the schema source in the key. Trade and publication databases
+	// may intentionally point at the same file during tests or migrations, but
+	// they must not share a pool or a one-time schema initialization marker.
+	cacheKey := src + "\x00" + path
 	if write {
 		cacheKey += ":write"
 	} else {
@@ -518,7 +520,8 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 	// 初始化数据库结构（如果需要）
 	dbPathLock.Lock()
 	defer dbPathLock.Unlock()
-	if _, ok := dbPathInit[path]; !ok {
+	initKey := src + "\x00" + path
+	if _, ok := dbPathInit[initKey]; !ok {
 		ddl, tbl := ddlTrade, "bottask"
 		if src == DbPub {
 			ddl, tbl = ddlBanpub, "task"
@@ -544,7 +547,7 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 				return nil, errs.New(core.ErrDbExecFail, err_)
 			}
 		}
-		dbPathInit[path] = true
+		dbPathInit[initKey] = true
 	}
 	return db, nil
 }

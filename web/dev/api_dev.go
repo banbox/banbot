@@ -237,6 +237,130 @@ func parsePath(curPath string) (string, error) {
 	return curPath, nil
 }
 
+// prepareBacktestConfigFiles snapshots all configuration inputs for one Web
+// request into a private temporary directory. The editor commonly sends
+// @config.yml, which normally resolves to the shared data directory; writing
+// there before parsing lets concurrent requests overwrite one another. The
+// returned paths are absolute and can be passed directly to config.GetConfig.
+func prepareBacktestConfigFiles(configs map[string]string, paths []string) (string, []string, error) {
+	tempDir, err := os.MkdirTemp("", "banbot-web-config-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(tempDir)
+	}
+
+	pathTargets := make(map[string]string, len(configs)+len(paths))
+	targetOwners := make(map[string]string, len(configs)+len(paths))
+	targetOwnerKeys := make(map[string]string, len(configs)+len(paths))
+	for rawPath, text := range configs {
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		relPath, pathErr := backtestConfigTempPath(rawPath)
+		if pathErr != nil {
+			cleanup()
+			return "", nil, pathErr
+		}
+		key := backtestConfigKey(rawPath)
+		if owner := targetOwners[relPath]; owner != "" &&
+			(owner != rawPath || targetOwnerKeys[relPath] != key) {
+			cleanup()
+			return "", nil, fmt.Errorf("configuration paths %q and %q resolve to the same temporary file", owner, rawPath)
+		}
+		targetOwners[relPath] = rawPath
+		targetOwnerKeys[relPath] = key
+		target := filepath.Join(tempDir, relPath)
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		if err := os.WriteFile(target, []byte(text), 0644); err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		pathTargets[key] = target
+	}
+
+	resolved := make([]string, 0, len(paths))
+	for _, rawPath := range paths {
+		if target := pathTargets[backtestConfigKey(rawPath)]; target != "" {
+			resolved = append(resolved, target)
+			continue
+		}
+		source, pathErr := parsePath(rawPath)
+		if pathErr != nil {
+			cleanup()
+			return "", nil, pathErr
+		}
+		data, readErr := os.ReadFile(source)
+		if readErr != nil {
+			cleanup()
+			return "", nil, readErr
+		}
+		relPath, relErr := backtestConfigTempPath(rawPath)
+		if relErr != nil {
+			cleanup()
+			return "", nil, relErr
+		}
+		key := backtestConfigKey(rawPath)
+		if owner := targetOwners[relPath]; owner != "" &&
+			(owner != rawPath || targetOwnerKeys[relPath] != key) {
+			cleanup()
+			return "", nil, fmt.Errorf("configuration paths %q and %q resolve to the same temporary file", owner, rawPath)
+		}
+		targetOwners[relPath] = rawPath
+		targetOwnerKeys[relPath] = key
+		target := filepath.Join(tempDir, relPath)
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		if _, statErr := os.Stat(target); os.IsNotExist(statErr) {
+			if err := os.WriteFile(target, data, 0644); err != nil {
+				cleanup()
+				return "", nil, err
+			}
+		} else if statErr != nil {
+			cleanup()
+			return "", nil, statErr
+		}
+		pathTargets[key] = target
+		resolved = append(resolved, target)
+	}
+	return tempDir, resolved, nil
+}
+
+func backtestConfigTempPath(rawPath string) (string, error) {
+	path := strings.TrimSpace(rawPath)
+	if path == "" {
+		return "", fmt.Errorf("configuration path is empty")
+	}
+	if path[0] == '$' || path[0] == '@' {
+		path = strings.TrimLeft(path[1:], "\\/")
+	}
+	path = filepath.Clean(filepath.FromSlash(path))
+	if path == "." || path == ".." || strings.HasPrefix(path, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("configuration path escapes temporary directory: %q", rawPath)
+	}
+	if filepath.IsAbs(path) {
+		path = filepath.Base(path)
+	}
+	if path == "" || path == "." {
+		return "", fmt.Errorf("configuration path is invalid: %q", rawPath)
+	}
+	return path, nil
+}
+
+func backtestConfigKey(rawPath string) string {
+	path := strings.TrimSpace(rawPath)
+	if path != "" && (path[0] == '$' || path[0] == '@') {
+		path = strings.TrimLeft(path[1:], "\\/")
+	}
+	return filepath.Clean(filepath.FromSlash(path))
+}
+
 func getText(c *fiber.Ctx) error {
 	type TextArgs struct {
 		Path string `query:"path" validate:"required"`
@@ -548,7 +672,12 @@ func appendTaskAssets(task *ormu.Task, taskMap map[string]interface{}) {
 	if task == nil || task.Path == "" || task.Status < int64(ormu.BtStatusDone) {
 		return
 	}
-	assetPath := filepath.Join(config.GetDataDir(), "backtest", task.Path, "assets.html")
+	reportDirs, err := taskReportDirs(task)
+	if err != nil {
+		return
+	}
+	reportDir := firstReportDir(reportDirs, "assets.html")
+	assetPath := filepath.Join(reportDir, "assets.html")
 	if !utils.Exists(assetPath) {
 		return
 	}
@@ -738,30 +867,14 @@ func handleRunBacktest(c *fiber.Ctx) error {
 		return err
 	}
 
-	// 写入配置内容
-	var realPath string
-	var err error
-	for path, text := range args.Configs {
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
-		realPath, err = parsePath(path)
-		if err != nil {
-			return err
-		}
-		err2 := utils.WriteFile(realPath, []byte(text))
-		if err2 != nil {
-			return err2
-		}
+	// Snapshot request-owned editor contents before parsing. In particular,
+	// @config.yml must never be written to the shared data directory because a
+	// concurrent request could otherwise change the file between hash and load.
+	configTempDir, paths, err := prepareBacktestConfigFiles(args.Configs, args.Paths)
+	if err != nil {
+		return err
 	}
-	var paths []string
-	for _, path := range args.Paths {
-		realPath, err = parsePath(path)
-		if err != nil {
-			return err
-		}
-		paths = append(paths, realPath)
-	}
+	defer os.RemoveAll(configTempDir)
 
 	// 加载并验证配置
 	cfg, err2 := config.GetConfig(&config.CmdArgs{Configs: paths, NoDefault: true}, false)
@@ -798,13 +911,33 @@ func handleRunBacktest(c *fiber.Ctx) error {
 		return err2
 	}
 	hashVal := utils.MD5(cfgData)[:10]
-	btPath := fmt.Sprintf("$backtest/%s", hashVal)
-	absPath := config.ParsePath(btPath)
-
-	// 创建目标目录
-	if err = os.MkdirAll(absPath, 0755); err != nil {
+	backtestRoot := config.ParsePath("$backtest")
+	basePath := filepath.Join(backtestRoot, hashVal)
+	// Reserve the output before writing the config. Mkdir is the allocation
+	// operation, so concurrent submissions of the same configuration receive
+	// hash, hash_1, hash_2, ... without sharing report files.
+	absPath, err := config.AllocateOutputDir(basePath)
+	if err != nil {
 		return err
 	}
+	keepOutput := false
+	backupAbs := ""
+	backupOwned := false
+	defer func() {
+		if !keepOutput {
+			_ = os.RemoveAll(absPath)
+		}
+		if backupAbs != "" && !backupOwned {
+			_ = os.RemoveAll(backupAbs)
+		}
+	}()
+	relPath, err := filepath.Rel(backtestRoot, absPath)
+	if err != nil {
+		_ = os.RemoveAll(absPath)
+		return err
+	}
+	taskPath := filepath.ToSlash(relPath)
+	btPath := fmt.Sprintf("$backtest/%s", taskPath)
 
 	// 添加回测任务
 	qu, conn, err2 := ormu.Conn()
@@ -813,9 +946,13 @@ func handleRunBacktest(c *fiber.Ctx) error {
 	}
 	defer conn.Close()
 
-	// 移动配置文件
+	// Keep the old UI "backup" action useful: archive the original hash
+	// directory under a unique path before adding the newly allocated task.
+	// The new run always writes to its reserved directory, so backup/overwrite
+	// can never truncate another task's reports.
 	cfgPath := filepath.Join(absPath, "config.yml")
-	if utils.Exists(cfgPath) {
+	baseConfigPath := filepath.Join(basePath, "config.yml")
+	if utils.Exists(baseConfigPath) && args.DupMode == "backup" {
 		oldTasks, err2 := qu.FindTasks(context.Background(), ormu.FindTasksParams{
 			Mode: "backtest",
 			Path: hashVal,
@@ -827,19 +964,27 @@ func handleRunBacktest(c *fiber.Ctx) error {
 		if len(oldTasks) > 0 {
 			old = oldTasks[0]
 		}
-		backupPath := ""
-		if args.DupMode == "" {
-			return fmt.Errorf("already_exist")
-		} else if args.DupMode == "backup" {
-			backupPath = hashVal + "_bak"
-			if old != nil {
-				backupPath = hashVal + "_" + strconv.FormatInt(old.ID, 10)
-			}
-			realPath = config.ParsePath(fmt.Sprintf("$backtest/%s", backupPath))
-			err = utils.CopyDir(absPath, realPath)
-			if err != nil {
-				return err
-			}
+		backupBase := hashVal + "_bak"
+		if old != nil {
+			backupBase = hashVal + "_" + strconv.FormatInt(old.ID, 10)
+		}
+		var allocErr error
+		backupAbs, allocErr = config.AllocateOutputDir(filepath.Join(backtestRoot, backupBase))
+		if allocErr != nil {
+			_ = os.RemoveAll(absPath)
+			return allocErr
+		}
+		backupPathRel, relErr := filepath.Rel(backtestRoot, backupAbs)
+		if relErr != nil {
+			_ = os.RemoveAll(absPath)
+			_ = os.RemoveAll(backupAbs)
+			return relErr
+		}
+		backupPath := filepath.ToSlash(backupPathRel)
+		if err = utils.CopyDir(basePath, backupAbs); err != nil {
+			_ = os.RemoveAll(absPath)
+			_ = os.RemoveAll(backupAbs)
+			return err
 		}
 		if old != nil {
 			err = qu.SetTaskPath(context.Background(), ormu.SetTaskPathParams{
@@ -849,6 +994,10 @@ func handleRunBacktest(c *fiber.Ctx) error {
 			if err != nil {
 				return err
 			}
+			// Once the old row points at the copied directory, that row owns the
+			// backup even if registering the new task fails below. Keep it in that
+			// case; otherwise the old task would reference a deleted report.
+			backupOwned = true
 		}
 	}
 	if err = os.WriteFile(cfgPath, cfgData, 0644); err != nil {
@@ -863,7 +1012,7 @@ func handleRunBacktest(c *fiber.Ctx) error {
 
 	task, err := qu.AddTask(context.Background(), ormu.AddTaskParams{
 		Mode:     "backtest",
-		Path:     hashVal,
+		Path:     taskPath,
 		Args:     btArgs,
 		Config:   string(cfgData),
 		Strats:   strings.Join(cfg.Strats(), ","),
@@ -878,14 +1027,21 @@ func handleRunBacktest(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	log.Info("add backtest", zap.Int64("id", task.ID), zap.String("hash", hashVal))
+	log.Info("add backtest", zap.Int64("id", task.ID), zap.String("path", taskPath))
 
 	// 通知任务调度器有新任务
+	// If there was no old database row, the backup has no owner until this new
+	// task is accepted. Preserve it only after AddTask succeeds; failures before
+	// that point are cleaned by the defer above.
+	if backupAbs != "" && !backupOwned {
+		backupOwned = true
+	}
+	keepOutput = true
 	taskNotifyChan <- task
 
 	return c.JSON(fiber.Map{
 		"code": 200,
-		"data": hashVal,
+		"data": taskPath,
 	})
 }
 
@@ -900,7 +1056,24 @@ func getBtPath(taskID int64) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("query task failed: %v", err)
 	}
-	return filepath.Join(config.GetDataDir(), "backtest", task.Path), nil
+	return taskBaseDir(task)
+}
+
+func getBtReportPath(taskID int64, marker string) (string, error) {
+	qu, conn, connErr := ormu.Conn()
+	if connErr != nil {
+		return "", connErr
+	}
+	defer conn.Close()
+	task, queryErr := qu.GetTask(context.Background(), taskID)
+	if queryErr != nil {
+		return "", fmt.Errorf("query task failed: %v", queryErr)
+	}
+	dirs, pathErr := taskReportDirs(task)
+	if pathErr != nil {
+		return "", pathErr
+	}
+	return firstReportDir(dirs, marker), nil
 }
 
 // parseBtResult 解析回测结果
@@ -936,9 +1109,20 @@ func getBtDetail(c *fiber.Ctx) error {
 	if err != nil {
 		return fmt.Errorf("query task failed: %v", err)
 	}
-	btPath := filepath.Join(config.GetDataDir(), "backtest", task.Path)
+	basePath, pathErr := taskBaseDir(task)
+	if pathErr != nil {
+		return pathErr
+	}
+	reportDirs, pathErr := taskReportDirs(task)
+	if pathErr != nil {
+		return pathErr
+	}
+	btPath := firstReportDir(reportDirs, "detail.json")
 
-	configPath := filepath.Join(btPath, "config.yml")
+	configPath := filepath.Join(basePath, "config.yml")
+	if !utils.Exists(configPath) {
+		configPath = filepath.Join(btPath, "config.yml")
+	}
 	var cfg *config.Config
 	if utils.Exists(configPath) {
 		cfg, err2 = config.ParseConfig(configPath)
@@ -1013,13 +1197,27 @@ func getBtOrders(c *fiber.Ctx) error {
 		return fmt.Errorf("query task failed: %v", err)
 	}
 
-	dbPath := filepath.Join(config.GetDataDir(), "backtest", task.Path, "orders.gob")
-	allOrders, lock, err2 := getGobOrders(dbPath)
-	if err2 != nil {
-		return err2
+	reportDirs, pathErr := taskReportDirs(task)
+	if pathErr != nil {
+		return pathErr
 	}
-	lock.Lock()
-	defer lock.Unlock()
+	allOrders := make([]*ormo.InOutOrder, 0)
+	for _, reportDir := range reportDirs {
+		dbPath := filepath.Join(reportDir, "orders.gob")
+		if _, statErr := os.Stat(dbPath); statErr != nil {
+			if os.IsNotExist(statErr) && len(reportDirs) > 1 {
+				continue
+			}
+			return statErr
+		}
+		cached, lock, loadErr := getGobOrders(dbPath)
+		if loadErr != nil {
+			return loadErr
+		}
+		lock.Lock()
+		allOrders = append(allOrders, cached...)
+		lock.Unlock()
+	}
 
 	var orders = make([]*ormo.InOutOrder, 0, len(allOrders)/10)
 	for _, od := range allOrders {
@@ -1186,6 +1384,13 @@ func getBtConfig(c *fiber.Ctx) error {
 
 	// 读取config.yml
 	configPath := filepath.Join(btPath, "config.yml")
+	if !utils.Exists(configPath) {
+		btPath, err = getBtReportPath(args.TaskID, "config.yml")
+		if err != nil {
+			return fmt.Errorf("get backtest path failed: %v", err)
+		}
+		configPath = filepath.Join(btPath, "config.yml")
+	}
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("read config file failed: %v", err)
@@ -1208,7 +1413,7 @@ func getBtLogs(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	btPath, err := getBtReportPath(args.TaskID, "out.log")
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1244,7 +1449,11 @@ func getBtHtml(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	marker := "assets.html"
+	if args.Type == "enters" {
+		marker = "enters.html"
+	}
+	btPath, err := getBtReportPath(args.TaskID, marker)
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1277,7 +1486,7 @@ func getBtStratTree(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	btPath, err := getBtReportPath(args.TaskID, "detail.json")
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1343,12 +1552,16 @@ func getBtStratText(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	btPath, err := getBtReportPath(args.TaskID, "detail.json")
 	if err != nil {
 		return err
 	}
 
-	content, err2 := utils.ReadTextFile(filepath.Join(btPath, args.Path))
+	filePath, pathErr := reportFilePath(btPath, args.Path)
+	if pathErr != nil {
+		return pathErr
+	}
+	content, err2 := utils.ReadTextFile(filePath)
 	if err2 != nil {
 		return err2
 	}
@@ -1754,7 +1967,12 @@ func getCompareAssets(c *fiber.Ctx) error {
 		if task.Path == "" {
 			continue
 		}
-		path := filepath.Join(config.GetDataDir(), "backtest", task.Path, "assets.html")
+		reportDirs, pathErr := taskReportDirs(task)
+		if pathErr != nil {
+			return pathErr
+		}
+		reportDir := firstReportDir(reportDirs, "assets.html")
+		path := filepath.Join(reportDir, "assets.html")
 		if !utils.Exists(path) {
 			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("assets.html not found for id %s, path: %s", id, path))
 		}
@@ -1804,6 +2022,7 @@ func delBacktestReports(c *fiber.Ctx) error {
 	// 构建files参数
 	files := make(map[string]bool)
 	tasks := make([]int64, 0, len(args.IDs))
+	taskIDs := make(map[int64]struct{}, len(args.IDs))
 	failNum := 0
 	for _, id := range args.IDs {
 		task, err := qu.GetTask(context.Background(), id)
@@ -1812,14 +2031,25 @@ func delBacktestReports(c *fiber.Ctx) error {
 			log.Error("query task fail", zap.Int64("id", id), zap.Error(err))
 			continue
 		}
-		tasks = append(tasks, id)
+		if _, seen := taskIDs[id]; !seen {
+			tasks = append(tasks, id)
+			taskIDs[id] = struct{}{}
+		}
 		if task.Path != "" {
-			path := filepath.Join(config.GetDataDir(), "backtest", task.Path)
+			path, pathErr := taskBaseDir(task)
+			if pathErr != nil {
+				failNum++
+				log.Error("invalid backtest task path", zap.Int64("id", id), zap.String("path", task.Path), zap.Error(pathErr))
+				continue
+			}
 			files[path] = utils.Exists(path)
 		}
 	}
 	for _, hash := range args.Hashes {
-		path := filepath.Join(config.GetDataDir(), "backtest", hash)
+		path, pathErr := taskBaseDir(&ormu.Task{Path: hash})
+		if pathErr != nil {
+			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("invalid backtest path: %v", pathErr))
+		}
 		files[path] = utils.Exists(path)
 		rows, err := qu.FindTasks(context.Background(), ormu.FindTasksParams{
 			Path: hash,
@@ -1829,7 +2059,10 @@ func delBacktestReports(c *fiber.Ctx) error {
 			continue
 		}
 		for _, r := range rows {
-			tasks = append(tasks, r.ID)
+			if _, seen := taskIDs[r.ID]; !seen {
+				tasks = append(tasks, r.ID)
+				taskIDs[r.ID] = struct{}{}
+			}
 		}
 	}
 	for path, exist := range files {

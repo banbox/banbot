@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -55,12 +56,22 @@ type State struct {
 	failOpenLock  sync.Mutex
 	cacheMu       sync.Mutex
 	tmpEnvLock    sync.Mutex
+	envMu         sync.RWMutex
+	wsUnwatchMu   sync.RWMutex
 	jobsMu        deadlock.RWMutex
 	infoJobsMu    sync.RWMutex
 	policyMu      sync.Mutex
 	policyFilters map[string][]goods.IFilter
 	refineMu      sync.RWMutex
 	refineTF      map[string]map[string]string
+	// Registry snapshots are rebuilt only after a registry write. Readers on
+	// the bar path borrow these immutable maps instead of cloning them for
+	// every event. The underlying StratJob pointers remain state-owned; only
+	// registry membership is snapshotted here.
+	jobsSnapshot      *jobRegistrySnapshot
+	jobsSnapshotDirty atomic.Bool
+	infoSnapshot      *infoJobRegistrySnapshot
+	infoSnapshotDirty atomic.Bool
 }
 
 // NewState creates an isolated strategy state with every registry ready for
@@ -402,14 +413,26 @@ func (s *State) Reset() {
 	if s == nil {
 		return
 	}
+	lockJobsWriteForState(s)
 	s.Versions = make(map[string]int)
-	s.Envs = make(map[string]*ta.BarEnv)
-	s.TmpEnvs = make(map[string]*ta.BarEnv)
 	s.AccJobs = make(map[string]map[string]map[string]*StratJob)
-	s.AccInfoJobs = make(map[string]map[string]map[string]*StratJob)
 	s.PairStrats = make(map[string]map[string]*TradeStrat)
 	s.ForbidJobs = make(map[string]map[string]bool)
 	s.WsSubJobs = make(map[string]map[string]map[*StratJob]bool)
+	unlockJobsWriteForState(s)
+	s.envMu.Lock()
+	s.Envs = make(map[string]*ta.BarEnv)
+	s.envMu.Unlock()
+	s.tmpEnvLock.Lock()
+	s.TmpEnvs = make(map[string]*ta.BarEnv)
+	s.tmpEnvLock.Unlock()
+
+	lockInfoJobsWrite(s)
+	s.AccInfoJobs = make(map[string]map[string]map[string]*StratJob)
+	if s != legacyState {
+		s.infoSnapshotDirty.Store(true)
+	}
+	unlockInfoJobsWrite(s)
 
 	s.orderSubLock.Lock()
 	s.AccOdSubs = make(map[string][]FnOdChange)
@@ -428,7 +451,7 @@ func (s *State) Reset() {
 	s.refineTF = make(map[string]map[string]string)
 	s.refineMu.Unlock()
 	s.infoJobsMu.Unlock()
-	s.WsSubUnWatch = nil
+	s.SetWsSubUnWatch(nil)
 	s.pairHooksMu.Lock()
 	s.pairHooks = PairUpdateHooks{}
 	s.pairHooksMu.Unlock()
@@ -449,6 +472,29 @@ func (s *State) Reset() {
 		cacheStrats = s.cacheStrats
 		cacheMu.Unlock()
 	}
+}
+
+// SetWsSubUnWatch binds the callback used to release runtime websocket
+// subscriptions. Explicit callers use this accessor so pair rotation cannot
+// race a trader shutdown while replacing the callback.
+func (s *State) SetWsSubUnWatch(callback func(map[string][]string)) {
+	if s == nil {
+		return
+	}
+	s.wsUnwatchMu.Lock()
+	s.WsSubUnWatch = callback
+	s.wsUnwatchMu.Unlock()
+}
+
+// WsSubUnWatchFunc returns the currently published unwatch callback.
+func (s *State) WsSubUnWatchFunc() func(map[string][]string) {
+	if s == nil {
+		return nil
+	}
+	s.wsUnwatchMu.RLock()
+	callback := s.WsSubUnWatch
+	s.wsUnwatchMu.RUnlock()
+	return callback
 }
 
 // SetPairUpdateHooks binds pair rotation callbacks to this strategy state.
@@ -494,13 +540,20 @@ func (s *State) PairUpdateHooks() PairUpdateHooks {
 	return h
 }
 
-// Get returns a strategy registered for pair and strategy ID without
-// allocating or locking.
+// Get returns a strategy registered for pair and strategy ID. Explicit
+// runtimes read the immutable registry snapshot; the legacy facade keeps its
+// compatibility lock around the package map.
 func (s *State) Get(pair, stratID string) *TradeStrat {
 	if s == nil {
 		return nil
 	}
-	return s.PairStrats[pair][stratID]
+	if s == legacyState {
+		lockJobsReadForState(s)
+		defer unlockJobsReadForState(s)
+		return s.PairStrats[pair][stratID]
+	}
+	strategies := s.PairStrategiesView()[pair]
+	return strategies[stratID]
 }
 
 // GetStratPerf resolves performance configuration from this runtime's
@@ -690,6 +743,7 @@ func cloneTradeStrat(stgy *TradeStrat, pol *config.RunPolicyConfig) *TradeStrat 
 	copy.Policy = pol
 	copy.WsSubs = maps.Clone(stgy.WsSubs)
 	copy.RunTimeFrames = append([]string(nil), stgy.RunTimeFrames...)
-	copy.Outputs = append([]string(nil), stgy.Outputs...)
+	copy.Outputs = stgy.SnapshotOutputs(false)
+	copy.outputState = &tradeStratOutputState{}
 	return &copy
 }

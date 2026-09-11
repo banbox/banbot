@@ -41,11 +41,31 @@ func GetCacheVal[T any](key interface{}, defVal T) T {
 	return defVal
 }
 
-func RunExitCalls() {
-	for _, method := range ExitCalls {
-		method()
+// AddExitCall registers a process-wide cleanup callback for the legacy
+// facade. Runtime-owned code should use State.OnExit instead; this helper is
+// retained for compatibility with process-level profiling and legacy loops.
+func AddExitCall(method func()) {
+	if method == nil {
+		return
 	}
+	exitCallsLock.Lock()
+	ExitCalls = append(ExitCalls, method)
+	exitCallsLock.Unlock()
+}
+
+// RunExitCalls drains the legacy cleanup list exactly once per registration.
+// Taking a snapshot before running callbacks avoids holding the lock across
+// arbitrary cleanup and makes concurrent signal/defer drains idempotent.
+func RunExitCalls() {
+	exitCallsLock.Lock()
+	calls := ExitCalls
 	ExitCalls = nil
+	exitCallsLock.Unlock()
+	for _, method := range calls {
+		if method != nil {
+			method()
+		}
+	}
 }
 
 func KeyStratPairTf(stagy, pair, tf string) string {

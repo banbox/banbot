@@ -96,6 +96,23 @@ func StopProcesses() {
 	}
 }
 
+// StopAndWaitProcesses publishes cancellation and waits for every active
+// process owner to finish its Runtime cleanup. Callers use this at process
+// shutdown; ordinary cancellation should continue to use StopProcesses when
+// the caller owns the subsequent Close/Join boundary.
+func StopAndWaitProcesses() {
+	activeProcesses.Lock()
+	processes := make([]*Process, 0, len(activeProcesses.items))
+	for process := range activeProcesses.items {
+		processes = append(processes, process)
+	}
+	activeProcesses.Unlock()
+	for _, process := range processes {
+		process.Stop()
+		process.Close()
+	}
+}
+
 func NewProcess() *Process {
 	process := &Process{
 		symbolAllocators: make(map[string]*orm.SIDAllocator),
@@ -135,7 +152,6 @@ func (p *Process) unregisterRuntime(target *Runtime) {
 	if p == nil || target == nil {
 		return
 	}
-	unregister := false
 	p.runtimeMu.Lock()
 	for index, runtime := range p.runtimes {
 		if runtime != target {
@@ -146,12 +162,13 @@ func (p *Process) unregisterRuntime(target *Runtime) {
 		p.runtimes = p.runtimes[:len(p.runtimes)-1]
 		if len(p.runtimes) == 0 && p.runtimeConstructing == 0 && p.registered {
 			p.registered = false
-			unregister = true
-		}
-		p.runtimeMu.Unlock()
-		if unregister {
+			// Keep the process registry transition in the same critical
+			// section as the owner state transition. NewRuntime uses this
+			// lock order too; moving this call after Unlock loses a newly
+			// registered runtime in a close/new interleaving.
 			unregisterActiveProcess(p)
 		}
+		p.runtimeMu.Unlock()
 		return
 	}
 	p.runtimeMu.Unlock()

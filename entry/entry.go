@@ -3,7 +3,6 @@ package entry
 import (
 	_ "embed"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/banbox/banbot/biz"
@@ -23,16 +22,6 @@ import (
 	"go.uber.org/zap"
 )
 
-func runLegacyRunnerSession(run func(*runtime.Process) *errs.Error) *errs.Error {
-	process := runtime.NewProcess()
-	// These entrypoints still install process-wide facades. Serialize their full
-	// lifecycle; explicit runtimes inside the session do not make it concurrent.
-	return runLegacyEntrySession(func() *errs.Error {
-		defer process.Close()
-		return run(process)
-	})
-}
-
 func runBackTestEntry(args *config.CmdArgs) *errs.Error {
 	return runExplicitBackTest(args)
 }
@@ -43,77 +32,6 @@ func runLegacyEntrySession(run func() *errs.Error) *errs.Error {
 
 func RunBackTest(args *config.CmdArgs) *errs.Error {
 	return runExplicitBackTest(args)
-}
-
-func runBackTestSession(process *runtime.Process, args *config.CmdArgs, session opt.LegacySession) *errs.Error {
-	core.SetRunMode(core.RunModeBackTest)
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
-	}
-	if args.OutPath == "" {
-		hash, err := config.Data.HashCode()
-		if err != nil {
-			panic(err)
-		}
-		args.OutPath = fmt.Sprintf("$backtest/%s", hash)
-	}
-	if args.Separate && len(config.RunPolicy) > 1 {
-		log.Info("run backtest separately for policies", zap.Int("num", len(config.RunPolicy)))
-		policyList := config.RunPolicy
-		for i, item := range policyList {
-			log.Info("start backtest", zap.Int("id", i+1), zap.String("name", item.Name))
-			err = config.SetRunPolicy(true, item)
-			if err != nil {
-				return err
-			}
-			outDir, err := runBackTest(process, fmt.Sprintf("%s%d", args.OutPath, i+1), "", session)
-			if err != nil {
-				return err
-			}
-			err_ := utils.CopyDir(outDir, fmt.Sprintf("%s_%d", outDir, i+1))
-			if err_ != nil {
-				return errs.New(errs.CodeIOWriteFail, err_)
-			}
-		}
-	} else {
-		_, err = runBackTest(process, args.OutPath, args.PrgOut, session)
-		return err
-	}
-	return nil
-}
-
-func runBackTest(process *runtime.Process, outDir string, prgOut string, session opt.LegacySession) (string, *errs.Error) {
-	core.BotRunning = true
-	biz.ResetVars()
-	startAt := int64(0)
-	if config.TimeRange != nil {
-		startAt = config.TimeRange.StartMS
-	}
-	rt, err := newEntryRuntime(process, core.RunModeBackTest, startAt)
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		rt.Close()
-		rt.Join()
-	}()
-	b, err := opt.NewBackTestWithRuntimeDataDeps(session, runtimeRunnerDeps(rt), rt.Symbols, false, outDir, runtimeRunnerDataDeps(rt))
-	if err != nil {
-		return "", err
-	}
-	if prgOut != "" {
-		lastSave := btime.UTCStamp()
-		b.PBar.AddTrigger("", func(task string, rate float64) {
-			curTime := btime.UTCStamp()
-			if curTime-lastSave < 200 && rate < 1 {
-				return
-			}
-			lastSave = curTime
-			fmt.Printf("%s: %v\n", prgOut, rate)
-		})
-	}
-	return executeBackTest(b.OutDir, b.Run)
 }
 
 func executeBackTest(outDir string, run func() *errs.Error) (string, *errs.Error) {
@@ -133,34 +51,6 @@ func RunTradeWith(args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *e
 
 func runTradeEntry(args *config.CmdArgs) *errs.Error {
 	return runExplicitTrade(args, nil)
-}
-
-func runTradeSession(process *runtime.Process, args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *errs.Error {
-	core.SetRunMode(core.RunModeLive)
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
-	}
-	if args.OutPath != "" {
-		file, err_ := os.OpenFile(args.OutPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err_ != nil {
-			log.Error("open live dump file fail", zap.Error(err_))
-		} else {
-			orm.SetDump(file)
-		}
-	}
-	core.BotRunning = true
-	core.StartAt = btime.UTCStamp()
-	rt, err := newEntryRuntime(process, core.RunModeLive, core.StartAt)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		rt.Close()
-		rt.Join()
-	}()
-	t := live.NewCryptoTraderWithRuntimeDataDeps(rt, runtimeRunnerDeps(rt), rt.Symbols, startup, runtimeRunnerDataDeps(rt))
-	return t.Run()
 }
 
 func runtimeRunnerDeps(rt *runtime.Runtime) biz.RuntimeDeps {
@@ -199,38 +89,6 @@ func runtimeRunnerDataDeps(rt *runtime.Runtime) *data.RuntimeDeps {
 		ExchangeName: rt.Core.ExgName,
 		MarketType:   rt.Core.Market,
 	}
-}
-
-func newEntryRuntime(process *runtime.Process, mode string, startAt int64) (*runtime.Runtime, *errs.Error) {
-	rt, err := process.NewRuntime(runtime.Options{
-		Context:      core.Ctx,
-		Config:       &config.Data,
-		DataDir:      config.GetDataDirSafe(),
-		StrategyDir:  config.GetStratDir(),
-		Mode:         mode,
-		Env:          core.RunEnv,
-		StartAt:      startAt,
-		Exchange:     exg.Default,
-		Storage:      orm.CurrentStorage(),
-		ExchangeName: core.ExgName,
-		Market:       core.Market,
-		ContractType: core.ContractType,
-		Pairs:        config.Pairs,
-	})
-	if err != nil {
-		return nil, errs.New(errs.CodeRunTime, err)
-	}
-	// SetupComsExg initializes the legacy catalog before the runtime is built.
-	// Seed only the current exchange/market; subsequent provider lookups stay on
-	// the runtime state and do not expose other identities to event processing.
-	for _, item := range orm.GetExSymbols(core.ExgName, core.Market) {
-		if cacheErr := rt.Symbols.CacheExSymbolChecked(item); cacheErr != nil {
-			rt.Close()
-			rt.Join()
-			return nil, errs.New(errs.CodeRunTime, cacheErr)
-		}
-	}
-	return rt, nil
 }
 
 func RunDownData(args *config.CmdArgs) *errs.Error {

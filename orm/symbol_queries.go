@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
@@ -35,10 +36,38 @@ func (q *Queries) WithSymbolState(symbols *SymbolState) *SymbolQueries {
 }
 
 func (q *SymbolQueries) symbolState() *SymbolState {
-	if q == nil || q.symbols == nil {
+	if q == nil {
+		return loadDefaultSymbolState()
+	}
+	if q.symbols == nil {
+		if q.Queries != nil && q.Queries.storage != nil && !q.Queries.storage.legacy {
+			return nil
+		}
 		return loadDefaultSymbolState()
 	}
 	return q.symbols
+}
+
+// resolveQuerySymbolState resolves the catalog for an operation that accepts
+// both a query handle and an optional state. A state explicitly supplied by a
+// caller wins; otherwise a state already bound to the query is used. Only a
+// query on the package-level legacy facade may fall back to the default
+// catalog. Explicit Storage handles must fail closed when neither owner is
+// present, otherwise a SID can be resolved against a different database's
+// catalog.
+func resolveQuerySymbolState(q *Queries, state *SymbolState) (*SymbolState, error) {
+	if state != nil {
+		return state, nil
+	}
+	if q != nil {
+		if q.symbols != nil {
+			return q.symbols, nil
+		}
+		if q.storage != nil && !q.storage.legacy {
+			return nil, fmt.Errorf("explicit storage requires an explicit symbol state")
+		}
+	}
+	return loadDefaultSymbolState(), nil
 }
 
 // EnsureListDates keeps listing-date discovery on the state bound to this
@@ -48,7 +77,11 @@ func (q *SymbolQueries) EnsureListDates(exchange banexg.BanExchange, exsMap map[
 	if q == nil {
 		return errs.NewMsg(core.ErrBadConfig, "symbol query is required")
 	}
-	return EnsureListDatesWithState(q.Queries, q.symbolState(), exchange, exsMap, exsList)
+	state := q.symbolState()
+	if state == nil {
+		return errs.NewMsg(core.ErrBadConfig, "explicit storage requires an explicit symbol state")
+	}
+	return EnsureListDatesWithState(q.Queries, state, exchange, exsMap, exsList)
 }
 
 // WithTx preserves the explicit symbol state across a transaction handle.

@@ -575,7 +575,7 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries, resolved ...*orm.ExSymb
 		dispatched = true
 		var jobMap map[string]*strat.StratJob
 		if t.runtime != nil {
-			jobMap = strategyState.InfoJobs(t.accountName(account))[subKey]
+			jobMap = strategyState.InfoJobMapView(t.accountName(account))[subKey]
 		} else {
 			strat.LockJobsRead()
 			jobMap, _ = strat.GetInfoJobs(account)[subKey]
@@ -586,7 +586,7 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries, resolved ...*orm.ExSymb
 	if !dispatched {
 		var jobMap map[string]*strat.StratJob
 		if t.runtime != nil {
-			jobMap = strategyState.InfoJobs(t.runtime.DefaultAccount)[subKey]
+			jobMap = strategyState.InfoJobMapView(t.runtime.DefaultAccount)[subKey]
 		} else {
 			strat.LockJobsRead()
 			jobMap, _ = strat.GetInfoJobs(config.DefAcc)[subKey]
@@ -603,7 +603,7 @@ func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSerie
 			continue
 		}
 		fields := job.SetData(evt)
-		job.IsWarmUp = evt.IsWarmUp
+		job.SetWarmUp(evt.IsWarmUp)
 		num1, num2 := strat.GetJobInOutNum(job)
 		job.Strat.OnData(job, strat.DataEvent{
 			DataFields: fields,
@@ -816,8 +816,9 @@ func (t *Trader) onAccountDataSeriesSerial(account string, env *ta.BarEnv, evt *
 		return errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
 	}
 	if t.runtime != nil {
-		jobs = strategyState.Jobs(t.accountName(account))[envKey]
-		infoJobMap = strategyState.InfoJobs(t.accountName(account))
+		accountName := t.accountName(account)
+		jobs = strategyState.JobMapView(accountName, envKey)
+		infoJobMap = strategyState.InfoJobMapView(accountName)
 	} else {
 		strat.LockJobsRead()
 		jobs, _ = strat.GetJobs(account)[envKey]
@@ -847,7 +848,7 @@ func (t *Trader) onAccountDataSeriesSerial(account string, env *ta.BarEnv, evt *
 		if job.Strat.OnData != nil {
 			fields = job.SetData(evt)
 		}
-		job.IsWarmUp = isWarmup
+		job.SetWarmUp(isWarmup)
 		job.InitBar(curOrders)
 		if err := t.onAccountDataSeriesJob(odMgr, job, evt, fields, barExpired); err != nil {
 			return err
@@ -866,7 +867,7 @@ func (t *Trader) onAccountInfoSeries(account string, env *ta.BarEnv, evt *orm.Da
 			continue
 		}
 		fields := job.SetData(evt)
-		job.IsWarmUp = isWarmup
+		job.SetWarmUp(isWarmup)
 		num1, num2 := strat.GetJobInOutNum(job)
 		if job.Strat.OnData != nil {
 			job.Strat.OnData(job, strat.DataEvent{
@@ -917,8 +918,9 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 		return errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
 	}
 	if t.runtime != nil {
-		jobs = strategyState.Jobs(t.accountName(account))[envKey]
-		infoJobMap = strategyState.InfoJobs(t.accountName(account))
+		accountName := t.accountName(account)
+		jobs = strategyState.JobMapView(accountName, envKey)
+		infoJobMap = strategyState.InfoJobMapView(accountName)
 	} else {
 		strat.LockJobsRead()
 		jobs, _ = strat.GetJobs(account)[envKey]
@@ -962,7 +964,7 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 		if job.Strat.OnData != nil {
 			fields = job.SetData(evt)
 		}
-		job.IsWarmUp = isWarmup
+		job.SetWarmUp(isWarmup)
 		job.InitBar(curOrders)
 		if !parallelOnBar {
 			if err := t.onAccountDataSeriesJob(odMgr, job, evt, fields, barExpired); err != nil {
@@ -990,7 +992,7 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 			continue
 		}
 		fields := job.SetData(evt)
-		job.IsWarmUp = isWarmup
+		job.SetWarmUp(isWarmup)
 		num1, num2 := strat.GetJobInOutNum(job)
 		if job.Strat.OnData != nil {
 			job.Strat.OnData(job, strat.DataEvent{
@@ -1043,14 +1045,14 @@ func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, ev
 	} else if job.Strat.OnBar != nil {
 		job.Strat.OnBar(job)
 	}
-	isWarmup := job.IsWarmUp
+	isWarmup := job.IsWarmUpState()
 	isBatch := job.Strat.BatchInOut && job.Strat.OnBatchJobs != nil
 	if !barExpired {
 		if isBatch {
 			AddBatchJobWithRuntimeDeps(t.runtime, t.BatchState(), account, evt.TimeFrame, job, nil)
 		}
 	} else {
-		entryNum := len(job.Entrys)
+		entryNum := job.PendingEntryCount()
 		if t.liveMode() && !isWarmup && entryNum > 0 {
 			log.Info("skip open orders by bar expired", zap.String("acc", account),
 				zap.String("pair", t.seriesSymbol(evt)), zap.String("tf", evt.TimeFrame),
@@ -1062,7 +1064,7 @@ func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, ev
 			} else {
 				strat.AddAccFailOpens(account, strat.FailOpenBarTooLate, entryNum)
 			}
-			job.Entrys = nil
+			_ = job.DropEntryRequests()
 		}
 	}
 	if !isWarmup {

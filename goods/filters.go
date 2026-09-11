@@ -120,7 +120,7 @@ func (f *AgeFilter) filterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, t
 			} else if f.Min > 0 && days < f.Min {
 				if f.AllowEmpty {
 					if coreState != nil {
-						coreState.BanPairsUntil[exs.Symbol] = minStartMS
+						coreState.SetPairBanUntil(exs.Symbol, minStartMS)
 					} else {
 						core.BanPairsUntil[exs.Symbol] = minStartMS
 					}

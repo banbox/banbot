@@ -140,7 +140,11 @@ func (s *TradeStrat) WriteOutput(line string, date bool) {
 		prefix := btime.ToDateStr(nowMS, core.DefaultDateFmt)
 		line = prefix + " " + line
 	}
-	s.Outputs = append(s.Outputs, line)
+	if state := s.outputStateOwner(); state != nil {
+		state.mu.Lock()
+		s.Outputs = append(s.Outputs, line)
+		state.mu.Unlock()
+	}
 }
 
 /*
@@ -208,6 +212,8 @@ func (s *TradeStrat) orderBarMax() int {
  */
 func (s *StratJob) CanOpen(short bool) bool {
 	disable := false
+	state := s.executionState()
+	state.mu.Lock()
 	if short {
 		disable = s.MaxOpenShort < 0 || s.MaxOpenShort > 0 && len(s.ShortOrders) >= s.MaxOpenShort
 		if s.runtimeMarket() == banexg.MarketSpot {
@@ -216,6 +222,7 @@ func (s *StratJob) CanOpen(short bool) bool {
 	} else {
 		disable = s.MaxOpenLong < 0 || s.MaxOpenLong > 0 && len(s.LongOrders) >= s.MaxOpenLong
 	}
+	state.mu.Unlock()
 	return !disable
 }
 
@@ -242,7 +249,7 @@ func (s *StratJob) OpenOrder(req *EnterReq) *errs.Error {
 	if s.recordInspectEffect("OpenOrder") {
 		return errs.NewMsg(core.ErrRunTime, "OpenOrder is forbidden during strategy inspection")
 	}
-	doLog := !s.IsWarmUp && req != nil && req.Log
+	doLog := !s.IsWarmUpState() && req != nil && req.Log
 	var q *EnterReq
 	if doLog {
 		q = req.Clone()
@@ -300,7 +307,8 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		odSide = banexg.OdSideSell
 	}
 	var curPrice float64
-	if s.IsWarmUp {
+	isWarmUp := s.IsWarmUpState()
+	if isWarmUp {
 		curPrice = s.Env.Close.Get(0)
 	} else {
 		if s.runtimeCore != nil {
@@ -467,9 +475,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 			}
 		}
 	}
-	if !s.IsWarmUp {
-		s.Entrys = append(s.Entrys, req)
-		s.OrderNum += 1
+	if s.enqueueEntry(req) {
 		if isLiveMode {
 			log.Info("OpenOrder", req.GetZapFields(s)...)
 		}
@@ -500,7 +506,7 @@ func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error {
 	if s.recordInspectEffect("CloseOrders") {
 		return errs.NewMsg(core.ErrRunTime, "CloseOrders is forbidden during strategy inspection")
 	}
-	doLog := !s.IsWarmUp && req != nil && req.Log
+	doLog := !s.IsWarmUpState() && req != nil && req.Log
 	var q *ExitReq
 	if doLog {
 		q = req.Clone()
@@ -544,8 +550,9 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 		if !core.IsLimitOrder(req.OrderType) {
 			return errs.NewMsg(errs.CodeParamInvalid, "`ExitReq.Limit` is invalid for Market order")
 		}
-		hasLong := len(s.LongOrders) > 0
-		hasShort := len(s.ShortOrders) > 0
+		snapshot := s.ExecutionSnapshot()
+		hasLong := len(snapshot.LongOrders) > 0
+		hasShort := len(snapshot.ShortOrders) > 0
 		if req.Dirt == core.OdDirtBoth {
 			if hasLong && hasShort {
 				return errs.NewMsg(errs.CodeParamInvalid, "`ExitReq.Dirt` is required with long & short positions")
@@ -563,7 +570,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 				odSide = banexg.OdSideBuy
 			}
 			var curPrice float64
-			if s.IsWarmUp {
+			if snapshot.IsWarmUp {
 				curPrice = s.Env.Close.Get(0)
 			} else {
 				if s.runtimeCore != nil {
@@ -584,7 +591,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 			if req.Dirt == core.OdDirtShort {
 				if req.Limit > curPrice {
 					// 平空买入，价格更高，立刻成交，maker改为限价止损
-					for _, od := range s.ShortOrders {
+					for _, od := range snapshot.ShortOrders {
 						err := od.SetStopLoss(sl)
 						if err != nil {
 							return err
@@ -594,7 +601,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 				}
 			} else if req.Limit < curPrice {
 				// 平多卖出，价格更低，立刻成交，maker改为限价止损
-				for _, od := range s.LongOrders {
+				for _, od := range snapshot.LongOrders {
 					err := od.SetStopLoss(sl)
 					if err != nil {
 						return err
@@ -604,8 +611,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 			}
 		}
 	}
-	if !s.IsWarmUp {
-		s.Exits = append(s.Exits, req)
+	if s.enqueueExit(req) {
 		if s.runtimeLive() {
 			log.Info("CloseOrders", req.GetZapFields(s)...)
 		}
@@ -801,25 +807,27 @@ func (s *StratJob) PositionAvgPrice(dirt float64, enterTag string) float64 {
 }
 
 func (s *StratJob) GetOrders(dirt float64) []*ormo.InOutOrder {
+	snapshot := s.ExecutionSnapshot()
 	if dirt < 0 {
-		return s.ShortOrders
+		return snapshot.ShortOrders
 	} else if dirt > 0 {
-		return s.LongOrders
+		return snapshot.LongOrders
 	} else {
-		res := make([]*ormo.InOutOrder, 0, len(s.ShortOrders)+len(s.LongOrders))
-		res = append(res, s.ShortOrders...)
-		res = append(res, s.LongOrders...)
+		res := make([]*ormo.InOutOrder, 0, len(snapshot.ShortOrders)+len(snapshot.LongOrders))
+		res = append(res, snapshot.ShortOrders...)
+		res = append(res, snapshot.LongOrders...)
 		return res
 	}
 }
 
 func (s *StratJob) GetOrderNum(dirt float64) int {
+	snapshot := s.ExecutionSnapshot()
 	if dirt > 0 {
-		return len(s.LongOrders)
+		return len(snapshot.LongOrders)
 	} else if dirt < 0 {
-		return len(s.ShortOrders)
+		return len(snapshot.ShortOrders)
 	} else {
-		return len(s.LongOrders) + len(s.ShortOrders)
+		return len(snapshot.LongOrders) + len(snapshot.ShortOrders)
 	}
 }
 
@@ -904,7 +912,8 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 	if s.GetOrderNum(dirt) == 0 {
 		return nil
 	}
-	if dirt == 0 && len(s.LongOrders) > 0 && len(s.ShortOrders) > 0 {
+	snapshot := s.ExecutionSnapshot()
+	if dirt == 0 && len(snapshot.LongOrders) > 0 && len(snapshot.ShortOrders) > 0 {
 		panic(fmt.Sprintf("%v SetAll%s.dirt should be 1/-1 when both long/short orders exists!", s.Strat.Name, key))
 	}
 	odList := s.GetOrders(dirt)

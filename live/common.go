@@ -505,12 +505,11 @@ func cronDumpStratOutputs(scheduler com.Scheduler) {
 		groups := make(map[string][]string)
 		for _, items := range strat.PairStrats {
 			for _, stgy := range items {
-				if len(stgy.Outputs) == 0 {
+				rows := stgy.DrainOutputs()
+				if len(rows) == 0 {
 					continue
 				}
-				rows, _ := groups[stgy.Name]
-				groups[stgy.Name] = append(rows, stgy.Outputs...)
-				stgy.Outputs = nil
+				groups[stgy.Name] = append(groups[stgy.Name], rows...)
 			}
 		}
 		for name, lines := range groups {
@@ -597,7 +596,7 @@ func StartLoopBalancePositions() {
 	}
 	go func() {
 		ticker := time.NewTicker(time.Duration(config.AccountPullSecs) * time.Second)
-		core.ExitCalls = append(core.ExitCalls, ticker.Stop)
+		core.AddExitCall(ticker.Stop)
 		for {
 			select {
 			case <-ticker.C:

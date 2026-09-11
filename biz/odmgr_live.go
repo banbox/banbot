@@ -1347,7 +1347,7 @@ func (o *LiveOrderMgr) createInOutOd(exs *orm.ExSymbol, short bool, average, fil
 	if o.runtimeDeps && o.walletDeps.Strategies != nil {
 		stgVer, _ = o.walletDeps.Strategies.Version(o.takeOverStrategy())
 	} else {
-		stgVer, _ = strat.Versions[o.takeOverStrategy()]
+		stgVer, _ = strat.LegacyState().Version(o.takeOverStrategy())
 	}
 	entSide := banexg.OdSideBuy
 	if short {
@@ -1512,11 +1512,14 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 }
 
 func (o *LiveOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
-	if len(job.Entrys) == 0 && len(job.Exits) == 0 {
+	if job == nil {
 		return nil, nil, nil
 	}
-	log.Info("ProcessOrders", zap.String("acc", o.Account), zap.String("pair", job.Symbol.Symbol),
-		zap.Any("enters", job.Entrys), zap.Any("exits", job.Exits))
+	snapshot := job.ExecutionSnapshot()
+	if len(snapshot.Entrys) > 0 || len(snapshot.Exits) > 0 {
+		log.Info("ProcessOrders", zap.String("acc", o.Account), zap.String("pair", job.Symbol.Symbol),
+			zap.Any("enters", snapshot.Entrys), zap.Any("exits", snapshot.Exits))
+	}
 	return o.OrderMgr.ProcessOrders(job)
 }
 

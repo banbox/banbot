@@ -885,11 +885,11 @@ func (f *SeriesFeeder) warmTfWithErr(tf string, rows []*orm.DataSeries) (int64, 
 	lastMS := rows[len(rows)-1].TimeMS + tfMSecs
 	envKey := strings.Join([]string{f.Symbol, tf}, "_")
 	if f.deps == nil {
-		if env, ok := strat.Envs[envKey]; ok {
+		if env, ok := strat.LegacyState().Env(envKey); ok {
 			env.Reset()
 		}
 	} else if f.deps.Strategies != nil {
-		if env, ok := f.deps.Strategies.Envs[envKey]; ok {
+		if env, ok := f.deps.Strategies.Env(envKey); ok {
 			env.Reset()
 		}
 	}

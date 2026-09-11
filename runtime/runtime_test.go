@@ -77,6 +77,33 @@ func TestRuntimeCloseUnregistersFromProcess(t *testing.T) {
 	}
 }
 
+func TestStopAndWaitProcessesJoinsRuntimeOwners(t *testing.T) {
+	process := NewProcess()
+	rt, err := process.NewRuntime(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := make(chan struct{})
+	rt.OnCloseWait(func() { close(joined) })
+
+	StopAndWaitProcesses()
+
+	select {
+	case <-joined:
+	default:
+		t.Fatal("StopAndWaitProcesses returned before runtime owner joined")
+	}
+	process.runtimeMu.Lock()
+	remaining := len(process.runtimes)
+	process.runtimeMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("runtimes after StopAndWaitProcesses = %d, want 0", remaining)
+	}
+	// StopAndWaitProcesses owns this process' close; the call is intentionally
+	// idempotent so test cleanup and signal handling can safely repeat it.
+	process.Close()
+}
+
 func (s *processTrackingScheduler) AddFunc(string, func()) (cron.EntryID, error) {
 	return 0, nil
 }

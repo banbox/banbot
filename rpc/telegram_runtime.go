@@ -73,6 +73,17 @@ func (t *Telegram) noEnterUntil() map[string]int64 {
 	return core.NoEnterUntil
 }
 
+func (t *Telegram) noEnterUntilFor(account string) (int64, bool) {
+	if t.session != nil {
+		if t.session.Core != nil {
+			return t.session.Core.NoEnterUntilFor(account)
+		}
+		return 0, false
+	}
+	until, ok := core.NoEnterUntil[account]
+	return until, ok
+}
+
 func (t *Telegram) currentDashboard() *utils2.ClientIO {
 	if t.session != nil {
 		return t.dashboard

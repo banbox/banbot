@@ -8,6 +8,7 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/live"
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm"
@@ -15,6 +16,46 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/sasha-s/go-deadlock"
 )
+
+// newEntryRuntime is a test-only adapter for exercising the legacy facade's
+// runtime construction. Production entrypoints use explicitEntrySession and
+// never need to rebuild a Runtime from package globals.
+func newEntryRuntime(process *runtime.Process, mode string, startAt int64) (*runtime.Runtime, *errs.Error) {
+	rt, err := process.NewRuntime(runtime.Options{
+		Context:      core.Ctx,
+		Config:       &config.Data,
+		DataDir:      config.GetDataDirSafe(),
+		StrategyDir:  config.GetStratDir(),
+		Mode:         mode,
+		Env:          core.RunEnv,
+		StartAt:      startAt,
+		Exchange:     exg.Default,
+		Storage:      orm.CurrentStorage(),
+		ExchangeName: core.ExgName,
+		Market:       core.Market,
+		ContractType: core.ContractType,
+		Pairs:        config.Pairs,
+	})
+	if err != nil {
+		return nil, errs.New(errs.CodeRunTime, err)
+	}
+	for _, item := range orm.GetExSymbols(core.ExgName, core.Market) {
+		if cacheErr := rt.Symbols.CacheExSymbolChecked(item); cacheErr != nil {
+			rt.Close()
+			rt.Join()
+			return nil, errs.New(errs.CodeRunTime, cacheErr)
+		}
+	}
+	return rt, nil
+}
+
+func runLegacyRunnerSession(run func(*runtime.Process) *errs.Error) *errs.Error {
+	process := runtime.NewProcess()
+	return runLegacyEntrySession(func() *errs.Error {
+		defer process.Close()
+		return run(process)
+	})
+}
 
 func TestExecuteBackTestPropagatesRunFailure(t *testing.T) {
 	want := errs.New(core.ErrRunTime, errors.New("prediction loop failed"))

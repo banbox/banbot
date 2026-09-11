@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/banbox/banexg"
 )
 
 func TestStorageCloseConcurrent(t *testing.T) {
@@ -81,6 +83,61 @@ func TestStorageBoundQueriesDoNotFallBackToLegacySymbols(t *testing.T) {
 	}
 	if got := q.WithSeriesSymbolState(explicit).symbolByID(7); got == nil || got.ID != bound.ID || got.Symbol != bound.Symbol {
 		t.Fatalf("explicit symbol state was not used: got=%+v", got)
+	}
+}
+
+func TestExplicitStorageSymbolMutationsRequireState(t *testing.T) {
+	q := NewWithStorage(nil, NewStorage(nil, true, "storage:requires-symbol-state"))
+	if _, err := q.AddSymbols(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "explicit symbol state") {
+		t.Fatalf("AddSymbols error = %v, want explicit symbol state error", err)
+	}
+	if err := q.SetListMS(context.Background(), SetListMSParams{ID: 1}); err == nil || !strings.Contains(err.Error(), "explicit symbol state") {
+		t.Fatalf("SetListMS error = %v, want explicit symbol state error", err)
+	}
+	if err := q.SetAggRules(context.Background(), SetAggRulesParams{ID: 1}); err == nil || !strings.Contains(err.Error(), "explicit symbol state") {
+		t.Fatalf("SetAggRules error = %v, want explicit symbol state error", err)
+	}
+	if err := q.LoadExgSymbols("binance"); err == nil || !strings.Contains(err.Error(), "explicit symbol state") {
+		t.Fatalf("LoadExgSymbols error = %v, want explicit symbol state error", err)
+	}
+	if _, err := q.GetAdjs(7); err == nil || !strings.Contains(err.Error(), "explicit symbol state") {
+		t.Fatalf("GetAdjs error = %v, want explicit symbol state error", err)
+	}
+}
+
+func TestGetAdjsUsesBoundStorageConnection(t *testing.T) {
+	previous := swapDefaultSymbolState(NewSymbolState())
+	t.Cleanup(func() { swapDefaultSymbolState(previous) })
+	if err := loadDefaultSymbolState().CacheExSymbolChecked(&ExSymbol{
+		ID: 7, Exchange: "legacy", Market: "spot", Symbol: "LEGACY/USDT",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	state := NewSymbolStateWithIdentity("runtime", banexg.MarketSpot)
+	if err := state.CacheExSymbolChecked(&ExSymbol{
+		ID: 7, Exchange: "runtime", Market: banexg.MarketSpot, Symbol: "BOUND/USDT",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	storage := NewStorage(nil, true, "storage:get-adjs")
+	q := NewWithStorage(nil, storage).WithSeriesSymbolState(state)
+	if _, err := q.GetAdjs(7); err == nil || !strings.Contains(err.Error(), "storage pool is not configured") {
+		t.Fatalf("GetAdjs error = %v, want bound storage pool error", err)
+	}
+}
+
+func TestExplicitQueryStateIsUsedByEnsureListDates(t *testing.T) {
+	q := NewWithStorage(nil, NewStorage(nil, false, "storage:ensure-list-dates"))
+	exchange := &listDateExchange{info: &banexg.ExgInfo{ID: "test", MarketType: banexg.MarketSpot}}
+	if err := EnsureListDatesWithState(q, nil, exchange, nil, nil); err == nil || !strings.Contains(err.Error(), "explicit symbol state") {
+		t.Fatalf("EnsureListDates error = %v, want explicit symbol state error", err)
+	}
+
+	state := NewSymbolStateWithIdentity("test", banexg.MarketSpot)
+	q = q.WithSeriesSymbolState(state)
+	if got, err := resolveQuerySymbolState(q, nil); err != nil || got != state {
+		t.Fatalf("query-bound state = %p, err=%v; want %p", got, err, state)
 	}
 }
 

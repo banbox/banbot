@@ -318,30 +318,46 @@ func (o *OrderMgr) runEnv() string {
 	return core.RunEnv
 }
 
-func (o *OrderMgr) banPairsUntil() map[string]int64 {
+func (o *OrderMgr) pairIsBanned(pair string, nowMS int64) bool {
 	if o != nil && o.runtimeDeps {
 		if o.runtimeCore == nil {
-			return nil
+			return false
 		}
-		if o.runtimeCore.BanPairsUntil == nil {
-			o.runtimeCore.BanPairsUntil = make(map[string]int64)
-		}
-		return o.runtimeCore.BanPairsUntil
+		return o.runtimeCore.IsPairBanned(pair, nowMS)
 	}
-	return core.BanPairsUntil
+	banPairsUntil := core.BanPairsUntil
+	if until, ok := banPairsUntil[pair]; ok {
+		if nowMS < until {
+			return true
+		}
+		delete(banPairsUntil, pair)
+	}
+	return false
 }
 
-func (o *OrderMgr) noEnterUntil() map[string]int64 {
+func (o *OrderMgr) noEnterUntilFor(account string) (int64, bool) {
 	if o != nil && o.runtimeDeps {
 		if o.runtimeCore == nil {
-			return nil
+			return 0, false
 		}
-		if o.runtimeCore.NoEnterUntil == nil {
-			o.runtimeCore.NoEnterUntil = make(map[string]int64)
-		}
-		return o.runtimeCore.NoEnterUntil
+		return o.runtimeCore.NoEnterUntilFor(account)
 	}
-	return core.NoEnterUntil
+	until, ok := core.NoEnterUntil[account]
+	return until, ok
+}
+
+func (o *OrderMgr) setNoEnterUntil(account string, untilMS int64) {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			o.runtimeCore.SetNoEnterUntil(account, untilMS)
+		}
+		return
+	}
+	if untilMS <= 0 {
+		delete(core.NoEnterUntil, account)
+	} else {
+		core.NoEnterUntil[account] = untilMS
+	}
 }
 
 func (o *OrderMgr) checkWallets() bool {
@@ -838,13 +854,8 @@ func CleanUpOdMgrWithState(state *TradingState) *errs.Error {
 func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat.EnterReq) ([]*strat.EnterReq, map[string]int) {
 	curMS := o.priceNow()
 	rawNum := len(enters)
-	banPairsUntil := o.banPairsUntil()
-	if banUntil, ok := banPairsUntil[exs.Symbol]; ok {
-		if curMS < banUntil {
-			return nil, map[string]int{"BanPair": rawNum}
-		} else {
-			delete(banPairsUntil, exs.Symbol)
-		}
+	if o.pairIsBanned(exs.Symbol, curMS) {
+		return nil, map[string]int{"BanPair": rawNum}
 	}
 	if o.runMode() == core.RunModeOther {
 		// Does not involve order mode, prohibit opening orders
@@ -852,7 +863,7 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 		return nil, map[string]int{"NoOrderMode": rawNum}
 	}
 	pairZapField := zap.String("pair", exs.Symbol)
-	stopUntil, _ := o.noEnterUntil()[o.Account]
+	stopUntil, _ := o.noEnterUntilFor(o.Account)
 	if curMS < stopUntil {
 		if o.isLive() {
 			log.Warn("any enter forbid", pairZapField)
@@ -988,52 +999,63 @@ Live trading: monitor the exchange to return the order status to update the entr
 实盘：监听交易所返回订单状态更新入场出场
 */
 func (o *OrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
-	enters, exits := job.Entrys, job.Exits
-	if len(enters) == 0 && len(exits) == 0 {
+	if job == nil || !job.BeginOrderProcessing() {
 		return nil, nil, nil
 	}
-	job.Entrys = nil
-	job.Exits = nil
-	exs := job.Symbol
+	finished := false
+	defer func() {
+		if !finished {
+			// Error paths leave the active drain so a later caller can retry. The
+			// normal empty-queue path uses finishOrderProcessing below, which
+			// atomically closes the producer hand-off race.
+			job.EndOrderProcessing()
+		}
+	}()
 	var entOrders, extOrders []*ormo.InOutOrder
-	if len(enters) > 0 {
-		rawNum := len(enters)
-		var reasons map[string]int
-		enters, reasons = o.allowOrderEnter(exs, job.TimeFrame, enters)
-		if o.isLive() && len(enters) < rawNum {
-			log.Info("skip enters by allowOrderEnter", zap.Any("tags", reasons))
-		}
-		for _, ent := range enters {
-			iorder, err := o.enterOrder(exs, job.TimeFrame, ent, false)
-			if err != nil {
-				return entOrders, extOrders, err
+	exs := job.Symbol
+	for {
+		enters, exits := job.DrainOrderRequests()
+		if len(enters) == 0 && len(exits) == 0 {
+			if job.FinishOrderProcessing() {
+				finished = true
+				break
 			}
-			entOrders = append(entOrders, iorder)
+			continue
 		}
-	}
-	if len(exits) > 0 {
-		for _, exit := range exits {
-			iorders, err := o.ExitOpenOrders(exs.Symbol, exit)
-			if err != nil {
-				return entOrders, extOrders, err
+		var batchEntOrders, batchExtOrders []*ormo.InOutOrder
+		if len(enters) > 0 {
+			rawNum := len(enters)
+			var reasons map[string]int
+			enters, reasons = o.allowOrderEnter(exs, job.TimeFrame, enters)
+			if o.isLive() && len(enters) < rawNum {
+				log.Info("skip enters by allowOrderEnter", zap.Any("tags", reasons))
 			}
-			extOrders = append(extOrders, iorders...)
-		}
-	}
-	if job.Strat.OnOrderChange != nil && (len(entOrders) > 0 || len(extOrders) > 0) {
-		for _, od := range entOrders {
-			job.Strat.OnOrderChange(job, od, strat.OdChgEnter)
-		}
-		for _, od := range extOrders {
-			job.Strat.OnOrderChange(job, od, strat.OdChgExit)
-		}
-		if len(job.Entrys) > 0 || len(job.Exits) > 0 {
-			ents, exts, err := o.ProcessOrders(job)
-			if err != nil {
-				return entOrders, extOrders, err
+			for _, ent := range enters {
+				iorder, err := o.enterOrder(exs, job.TimeFrame, ent, false)
+				if err != nil {
+					return entOrders, extOrders, err
+				}
+				batchEntOrders = append(batchEntOrders, iorder)
+				entOrders = append(entOrders, iorder)
 			}
-			entOrders = append(entOrders, ents...)
-			extOrders = append(extOrders, exts...)
+		}
+		if len(exits) > 0 {
+			for _, exit := range exits {
+				iorders, err := o.ExitOpenOrders(exs.Symbol, exit)
+				if err != nil {
+					return entOrders, extOrders, err
+				}
+				batchExtOrders = append(batchExtOrders, iorders...)
+				extOrders = append(extOrders, iorders...)
+			}
+		}
+		if job.Strat.OnOrderChange != nil && (len(batchEntOrders) > 0 || len(batchExtOrders) > 0) {
+			for _, od := range batchEntOrders {
+				job.Strat.OnOrderChange(job, od, strat.OdChgEnter)
+			}
+			for _, od := range batchExtOrders {
+				job.Strat.OnOrderChange(job, od, strat.OdChgExit)
+			}
 		}
 	}
 	return entOrders, extOrders, nil
@@ -1148,7 +1170,7 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 	if o.runtimeDeps && o.walletDeps.Strategies != nil {
 		stgVer, _ = o.walletDeps.Strategies.Version(req.StratName)
 	} else {
-		stgVer, _ = strat.Versions[req.StratName]
+		stgVer, _ = strat.LegacyState().Version(req.StratName)
 	}
 	odSide := banexg.OdSideBuy
 	if req.Short {

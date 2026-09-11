@@ -354,6 +354,9 @@ func (s *StratJob) UpdateOrders(curOrders []*ormo.InOutOrder) {
 	if s.recordInspectEffect("UpdateOrders") {
 		return
 	}
+	state := s.executionState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	s.LongOrders = nil
 	s.ShortOrders = nil
 	enteredNum := 0
@@ -377,30 +380,40 @@ func (s *StratJob) InitBar(curOrders []*ormo.InOutOrder) {
 	if s.recordInspectEffect("InitBar") {
 		return
 	}
-	s.CheckMS = s.runtimeTimeMS()
-	s.LastBarMS = s.Env.TimeStop
-	if s.IsWarmUp {
+	checkMS := s.runtimeTimeMS()
+	lastBarMS := s.Env.TimeStop
+	state := s.executionState()
+	state.mu.Lock()
+	s.CheckMS = checkMS
+	s.LastBarMS = lastBarMS
+	isWarmUp := s.IsWarmUp
+	orderNum := s.OrderNum
+	state.mu.Unlock()
+	if isWarmUp {
+		state.mu.Lock()
 		s.LongOrders = nil
 		s.ShortOrders = nil
-	} else if s.OrderNum > 0 || s.runtimeLive() {
+		state.mu.Unlock()
+	} else if orderNum > 0 || s.runtimeLive() {
 		// 针对实盘，重启后OrderNum状态重置，本地未平仓订单无法更新到StratJob中，这里每次都检查
 		s.UpdateOrders(curOrders)
 	}
-	if s.runtimeLive() && !s.IsWarmUp {
+	if s.runtimeLive() && !isWarmUp {
 		// print warning before clear
-		for i, q := range s.Entrys {
+		enters, exits := s.DrainOrderRequests()
+		for i, q := range enters {
 			fields := q.GetZapFields(s)
 			fields = append(fields, zap.Int("i", i))
 			log.Warn("ignore unhandle Entry", fields...)
 		}
-		for i, q := range s.Exits {
+		for i, q := range exits {
 			fields := q.GetZapFields(s)
 			fields = append(fields, zap.Int("i", i))
 			log.Warn("ignore unhandle Exit", fields...)
 		}
+	} else {
+		_, _ = s.DrainOrderRequests()
 	}
-	s.Entrys = nil
-	s.Exits = nil
 }
 
 func CheckCustomExits(job *StratJob) *errs.Error {
@@ -1157,6 +1170,9 @@ func PrintStratGroupsWithState(strategyState *State, coreState *core.State) {
 		return
 	}
 	strategyState.ensureMaps()
+	if coreState == nil && strategyState != legacyState {
+		coreState = strategyState.Core
+	}
 	pairs := []string(nil)
 	if coreState != nil {
 		pairs = coreState.Pairs
@@ -1164,7 +1180,8 @@ func PrintStratGroupsWithState(strategyState *State, coreState *core.State) {
 		pairs = core.Pairs
 	}
 	log.Info("global pairs", zap.String("res", "\n"+core.GroupByPairQuotes(map[string][]string{"Pairs": pairs}, false)))
-	for acc, jobMap := range strategyState.AccJobs {
+	for _, acc := range strategyState.Accounts() {
+		jobMap := strategyState.JobMapsView(acc)
 		allows := make(map[string][]string)
 		disables := make(map[string][]string)
 		for pairTF, stratMap := range jobMap {
@@ -1198,15 +1215,17 @@ func PrintStratGroupsWithState(strategyState *State, coreState *core.State) {
 }
 
 func GetJobInOutNum(job *StratJob) (int, int) {
-	return len(job.Entrys), len(job.Exits)
+	snapshot := job.ExecutionSnapshot()
+	return len(snapshot.Entrys), len(snapshot.Exits)
 }
 
 func CheckJobInOutNum(job *StratJob, tag string, inNum, outNum int) {
 	msg := "not support, please call `biz.GetOdMgr(s.Account).ProcessOrders(nil, s)` manually"
-	if len(job.Entrys) > inNum {
+	snapshot := job.ExecutionSnapshot()
+	if len(snapshot.Entrys) > inNum {
 		log.Warn("OpenOrder "+msg, zap.String("method", tag))
 	}
-	if len(job.Exits) > outNum {
+	if len(snapshot.Exits) > outNum {
 		log.Warn("CloseOrder "+msg, zap.String("method", tag))
 	}
 }

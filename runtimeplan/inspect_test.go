@@ -16,6 +16,37 @@ import (
 	ta "github.com/banbox/banta"
 )
 
+func TestInspectRestoresRefineTimeframeCache(t *testing.T) {
+	oldPolicies := config.RunPolicy
+	t.Cleanup(func() {
+		config.RunPolicy = oldPolicies
+		config.ClearRefineMap()
+	})
+	config.RunPolicy = []*config.RunPolicyConfig{{Name: "review_refine", RefineTF: "15m"}}
+	config.ClearRefineMap()
+	if got := config.EnsureStratRefineTF("review_refine", "1h"); got != "15m" {
+		t.Fatalf("initial refine timeframe = %q", got)
+	}
+	cfg := &config.Config{
+		Exchange:      &config.ExchangeConfig{Name: "binance"},
+		MarketType:    "spot",
+		StakeCurrency: []string{"USDT"},
+		RunPolicy:     []*config.RunPolicyConfig{{Name: "review_refine", RefineTF: "5m"}},
+	}
+	restore, err := installRuntimeConfig(&RequestV1{TimeStartMS: 1_000_000_000_000, TimeEndMS: 1_000_003_600_000}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := config.EnsureStratRefineTF("review_refine", "1h"); got != "5m" {
+		restore()
+		t.Fatalf("temporary refine timeframe = %q", got)
+	}
+	restore()
+	if got := config.EnsureStratRefineTF("review_refine", "1h"); got != "15m" {
+		t.Fatalf("restored refine timeframe = %q, want 15m", got)
+	}
+}
+
 func TestInspectUsesCallerDataDirWithoutChangingWorkingDirectory(t *testing.T) {
 	const strategyName = "runtime_plan_data_dir_fixture"
 	dataDir := t.TempDir()

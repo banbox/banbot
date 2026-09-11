@@ -204,6 +204,12 @@ func installRuntimeConfig(req *RequestV1, cfg *config.Config) (func(), error) {
 	oldBacktest, oldLive, oldNet := core.BackTestMode, core.LiveMode, core.NetDisable
 	oldTime := btime.CurTimeMS
 	restore := func() {
+		// RefineTF lookups are cached independently from RunPolicy. The
+		// inspection pass installs temporary policies below, so retaining that
+		// cache after restoring the old policy would return the temporary period
+		// for a same-named strategy. Clear it before the next caller observes
+		// the restored configuration; the first lookup repopulates it.
+		config.ClearRefineMap()
 		config.Data, config.Exchange, config.PairMgr = oldData, oldExchange, oldPairMgr
 		config.RunPolicy, config.RunTimeframes, config.StakeCurrency = oldPolicies, oldTFs, oldStake
 		config.Pairs, config.TimeRange, config.DataDir = oldPairs, oldRange, oldDataDir
@@ -566,7 +572,8 @@ func inspectionOrderEffect(job *strat.StratJob, effects []string, callback strin
 	if len(effects) > 0 {
 		return callback + " invoked forbidden order API: " + strings.Join(stableUniqueStrings(effects), ",")
 	}
-	if len(job.Entrys) > 0 || len(job.Exits) > 0 || len(job.LongOrders) > 0 || len(job.ShortOrders) > 0 || job.OrderNum != 0 || job.EnteredNum != 0 {
+	snapshot := job.ExecutionSnapshot()
+	if len(snapshot.Entrys) > 0 || len(snapshot.Exits) > 0 || len(snapshot.LongOrders) > 0 || len(snapshot.ShortOrders) > 0 || snapshot.OrderNum != 0 || snapshot.EnteredNum != 0 {
 		return callback + " directly changed order lifecycle state"
 	}
 	return ""

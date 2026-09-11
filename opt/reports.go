@@ -467,7 +467,7 @@ func (r *BTResult) strategyJobs(account string) map[string]map[string]*strat.Str
 		if deps.Strategies == nil {
 			return nil
 		}
-		return deps.Strategies.Jobs(account)
+		return deps.Strategies.JobMaps(account)
 	}
 	return strat.GetJobs(account)
 }
@@ -1308,20 +1308,17 @@ func (r *BTResult) dumpStratOutputs(reset bool) {
 	groups := make(map[string][]string)
 	pairStrats := map[string]map[string]*strat.TradeStrat(nil)
 	if state := r.strategyState(); state != nil {
-		pairStrats = state.PairStrats
+		pairStrats = state.PairStrategiesView()
 	} else if r.reportRuntimeDeps() == nil {
 		pairStrats = strat.PairStrats
 	}
 	for _, items := range pairStrats {
 		for _, stgy := range items {
-			if len(stgy.Outputs) == 0 {
+			rows := stgy.SnapshotOutputs(reset)
+			if len(rows) == 0 {
 				continue
 			}
-			rows, _ := groups[stgy.Name]
-			groups[stgy.Name] = append(rows, stgy.Outputs...)
-			if reset {
-				stgy.Outputs = nil
-			}
+			groups[stgy.Name] = append(groups[stgy.Name], rows...)
 		}
 	}
 	for name, rows := range groups {

@@ -664,10 +664,19 @@ func (q *Queries) GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
 }
 
 func (q *Queries) getAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
+	symbols, symbolErr := resolveQuerySymbolState(q, nil)
+	if symbolErr != nil {
+		return nil, errs.New(core.ErrBadConfig, symbolErr)
+	}
+	// Keep the cache limited to the legacy facade. Explicit Storage queries
+	// must retain both their database owner and symbol catalog for the whole
+	// operation, including the connection-acquisition path below.
+	explicitStorage := q != nil && q.storage != nil && !q.storage.legacy
+	explicitQuery := q != nil && (q.storage != nil || q.symbols != nil)
 	amLock.Lock()
 	cache, hasOld := adjMap[sid]
 	amLock.Unlock()
-	if hasOld && (q == nil || q.storage == nil && q.symbols == nil) {
+	if hasOld && !explicitQuery {
 		return cache, nil
 	}
 	ctx := context.Background()
@@ -675,9 +684,16 @@ func (q *Queries) getAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
 	if q == nil || q.db == nil {
 		var err2 *errs.Error
 		var conn *pgxpool.Conn
-		q, conn, err2 = Conn(ctx)
+		if explicitStorage {
+			q, conn, err2 = q.storage.Conn(ctx)
+		} else {
+			q, conn, err2 = Conn(ctx)
+		}
 		if err2 != nil {
 			return nil, err2
+		}
+		if q != nil && symbols != nil {
+			q = q.WithSeriesSymbolState(symbols)
 		}
 		release = conn.Release
 	}
@@ -708,7 +724,7 @@ func (q *Queries) getAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
 		curEnd = f.StartMs
 	}
 	utils.ReverseArr(adjs)
-	if q == nil || q.storage == nil && q.symbols == nil {
+	if !explicitQuery {
 		amLock.Lock()
 		adjMap[sid] = adjs
 		amLock.Unlock()

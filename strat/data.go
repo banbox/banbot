@@ -70,6 +70,7 @@ func lockJobsWriteForState(state *State) {
 		return
 	}
 	state.jobsMu.Lock()
+	state.jobsSnapshotDirty.Store(true)
 }
 
 func unlockJobsWriteForState(state *State) {

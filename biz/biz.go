@@ -355,7 +355,7 @@ func InitOdSubs() {
 			job, _ := its[od.Strategy]
 			strat.UnlockJobsRead()
 			if job != nil {
-				if core.LiveMode && !job.IsWarmUp {
+				if core.LiveMode && !job.IsWarmUpState() {
 					if err := com.RefreshLatestPrice(job.Symbol.Symbol); err != nil {
 						log.Warn("refresh latest price fail", zap.String("pair", job.Symbol.Symbol), zap.Error(err))
 					}
@@ -373,7 +373,8 @@ func InitOdSubs() {
 					}
 					stgy.OnOrderChange(job, od, evt)
 				}
-				if len(job.Entrys) > 0 || len(job.Exits) > 0 {
+				requests := job.ExecutionSnapshot()
+				if len(requests.Entrys) > 0 || len(requests.Exits) > 0 {
 					_, _, err := GetOdMgr(acc).ProcessOrders(job)
 					if err != nil {
 						log.Error("process orders fail", zap.Error(err))
@@ -404,7 +405,7 @@ func InitOdSubsWithRuntimeDeps(deps *RuntimeDeps) {
 	if deps.Market != nil {
 		prices = deps.Market.Prices
 	}
-	stateMap := state.PairStrats
+	stateMap := state.PairStrategies()
 	subStgys := make(map[string]*strat.TradeStrat)
 	for _, items := range stateMap {
 		for stgName, stgy := range items {
@@ -416,20 +417,19 @@ func InitOdSubsWithRuntimeDeps(deps *RuntimeDeps) {
 	if len(subStgys) == 0 {
 		return
 	}
-	for acc := range executionMapKeys(state.AccJobs, deps) {
+	for _, acc := range state.Accounts() {
 		account := acc
 		state.AddOdSub(account, func(_ string, od *ormo.InOutOrder, evt int) {
 			stgy := subStgys[od.Strategy]
 			if stgy == nil {
 				return
 			}
-			items := state.AccJobs[account]
 			pairTF := strings.Join([]string{od.Symbol, od.Timeframe}, "_")
-			job := items[pairTF][od.Strategy]
+			job := state.LookupJob(account, pairTF, od.Strategy)
 			if job == nil {
 				return
 			}
-			if deps.Core != nil && deps.Core.LiveMode && !job.IsWarmUp && prices != nil && deps.Clock != nil && deps.Exchange != nil {
+			if deps.Core != nil && deps.Core.LiveMode && !job.IsWarmUpState() && prices != nil && deps.Clock != nil && deps.Exchange != nil {
 				if err := prices.RefreshLatestPriceAt(deps.Clock.TimeMS(), deps.Exchange, job.Symbol.Symbol); err != nil {
 					log.Warn("refresh latest price fail", zap.String("pair", job.Symbol.Symbol), zap.Error(err))
 				}
@@ -450,7 +450,8 @@ func InitOdSubsWithRuntimeDeps(deps *RuntimeDeps) {
 				}
 				stgy.OnOrderChange(job, od, evt)
 			}
-			if len(job.Entrys) > 0 || len(job.Exits) > 0 {
+			requests := job.ExecutionSnapshot()
+			if len(requests.Entrys) > 0 || len(requests.Exits) > 0 {
 				mgr := GetOdMgrWithState(deps.Trading, account)
 				if mgr != nil {
 					if _, _, err := mgr.ProcessOrders(job); err != nil {
@@ -466,9 +467,10 @@ func InitOdSubsWithRuntimeDeps(deps *RuntimeDeps) {
 }
 
 func closeSideOrders(s *strat.StratJob, isShort bool) {
-	var closeList = s.LongOrders
+	snapshot := s.ExecutionSnapshot()
+	var closeList = snapshot.LongOrders
 	if isShort {
-		closeList = s.ShortOrders
+		closeList = snapshot.ShortOrders
 	}
 	if len(closeList) > 0 {
 		for _, o := range closeList {
@@ -580,14 +582,16 @@ func tryFireBatches(state *strat.BatchState, currMS int64, isWarmUp bool,
 			num1, num2 := 0, 0
 			for _, j := range item.InfoJobs {
 				bindBatchJobRuntime(j.Job, deps)
-				num1 += len(j.Job.Entrys)
-				num2 += len(j.Job.Exits)
+				inNum, outNum := strat.GetJobInOutNum(j.Job)
+				num1 += inNum
+				num2 += outNum
 			}
 			item.Strategy.OnBatchInfos(item.TimeFrame, item.InfoJobs)
 			num3, num4 := 0, 0
 			for _, j := range item.InfoJobs {
-				num3 += len(j.Job.Entrys)
-				num4 += len(j.Job.Exits)
+				inNum, outNum := strat.GetJobInOutNum(j.Job)
+				num3 += inNum
+				num4 += outNum
 			}
 			if num3 > num1 || num4 > num2 {
 				log.Warn("Open/Close order in OnBatchInfos not support, please call `biz.GetOdMgr(s.Account).ProcessOrders(s)` manually")

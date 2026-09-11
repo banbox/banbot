@@ -140,18 +140,11 @@ func TestCryptoTraderCanUseRuntimeBatchState(t *testing.T) {
 }
 
 func TestCryptoTraderRuntimeWebAPIUsesShutdownLifecycle(t *testing.T) {
-	oldStartAPI, oldStartAPIWithLifecycle := webStartAPI, webStartAPIWithLifecycle
-	t.Cleanup(func() {
-		webStartAPI, webStartAPIWithLifecycle = oldStartAPI, oldStartAPIWithLifecycle
-	})
+	oldStartAPIWithLifecycle := webStartAPIWithLifecycle
+	t.Cleanup(func() { webStartAPIWithLifecycle = oldStartAPIWithLifecycle })
 
 	lifecycle := newTestRuntimeLifecycle()
 	trader := NewCryptoTraderWithRuntime(lifecycle, strat.NewBatchState(), nil)
-	legacyCalled := false
-	webStartAPI = func() *errs.Error {
-		legacyCalled = true
-		return nil
-	}
 	var webLifecycle RuntimeLifecycle
 	webStartAPIWithLifecycle = func(got RuntimeLifecycle) *errs.Error {
 		webLifecycle = got
@@ -160,9 +153,6 @@ func TestCryptoTraderRuntimeWebAPIUsesShutdownLifecycle(t *testing.T) {
 
 	if err := trader.startWebAPI(); err != nil {
 		t.Fatalf("startWebAPI failed: %v", err)
-	}
-	if legacyCalled {
-		t.Fatal("runtime web API used the legacy start entry")
 	}
 	got, ok := webLifecycle.(*runtimeShutdownLifecycle)
 	if !ok || got.owner != trader {
@@ -237,6 +227,24 @@ func TestCryptoTraderExplicitRuntimeSkipsLegacyWebAPI(t *testing.T) {
 	}
 }
 
+func TestCryptoTraderExplicitRuntimeRejectsEnabledWebAPI(t *testing.T) {
+	state, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	cfg := &config.Config{
+		Exchange:      &config.ExchangeConfig{Name: "binance"},
+		StakeCurrency: []string{"USDT"},
+		APIServer:     &config.APIServerConfig{Enable: true},
+	}
+	snapshot := config.NewSnapshotWithDirs(cfg, t.TempDir(), "")
+	trader := NewCryptoTraderWithRuntimeDeps(nil, biz.RuntimeDeps{Core: state, Config: snapshot}, nil, nil)
+	if err := trader.startWebAPI(); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("startWebAPI error = %v, want explicit unsupported-api error", err)
+	}
+}
+
 func TestCryptoTraderExplicitRuntimeRequiresLifecycle(t *testing.T) {
 	state, err := core.NewState(context.Background())
 	if err != nil {
@@ -280,6 +288,22 @@ func TestCryptoTraderRuntimeDepsRetainOneSymbolState(t *testing.T) {
 	if dataTrader.symbols != symbols || dataTrader.dataDeps.Symbols != symbols ||
 		dataTrader.RuntimeDependencies() == nil || dataTrader.RuntimeDependencies().Symbols != symbols {
 		t.Fatal("runtime data dependencies did not share the supplied symbol state")
+	}
+}
+
+func TestCryptoTraderRuntimeDepsRejectConflictingSymbolStates(t *testing.T) {
+	depsSymbols := orm.NewSymbolState()
+	explicitSymbols := orm.NewSymbolState()
+	trader := NewCryptoTraderWithRuntimeDeps(nil, biz.RuntimeDeps{Symbols: depsSymbols}, explicitSymbols, nil)
+	if trader.runtimeDepsErr == nil || !strings.Contains(trader.runtimeDepsErr.Error(), "symbols") {
+		t.Fatalf("conflicting trader symbol states were accepted: %v", trader.runtimeDepsErr)
+	}
+
+	dataSymbols := orm.NewSymbolState()
+	trader = NewCryptoTraderWithRuntimeDataDeps(nil, biz.RuntimeDeps{Symbols: depsSymbols}, explicitSymbols, nil,
+		&data.RuntimeDeps{Symbols: dataSymbols})
+	if trader.runtimeDepsErr == nil || !strings.Contains(trader.runtimeDepsErr.Error(), "symbols") {
+		t.Fatalf("conflicting data symbol states were accepted: %v", trader.runtimeDepsErr)
 	}
 }
 

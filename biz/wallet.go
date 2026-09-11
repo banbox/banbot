@@ -593,7 +593,7 @@ func StartLiveWalletSnapshots(lifecycles ...WalletRuntimeLifecycle) {
 	SaveLiveWalletSnapshots(true)
 	go func() {
 		ticker := time.NewTicker(time.Duration(liveSnapshotCfg.intervalMS) * time.Millisecond)
-		core.ExitCalls = append(core.ExitCalls, ticker.Stop)
+		core.AddExitCall(ticker.Stop)
 		for {
 			select {
 			case <-ticker.C:

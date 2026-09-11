@@ -734,8 +734,7 @@ func (o *LocalOrderMgr) cleanUpAt(atMS int64) *errs.Error {
 		return errs.NewMsg(core.ErrBadConfig, "historical cleanup cutoff is invalid: %d", atMS)
 	}
 	oldMS := o.priceNow()
-	noEnterUntil := o.noEnterUntil()
-	oldNoEnter, hadNoEnter := noEnterUntil[o.Account]
+	oldNoEnter, hadNoEnter := o.noEnterUntilFor(o.Account)
 	if o.clock != nil {
 		o.clock.SetTimeMS(atMS)
 	} else {
@@ -748,9 +747,9 @@ func (o *LocalOrderMgr) cleanUpAt(atMS int64) *errs.Error {
 			btime.SetTimeMS(oldMS)
 		}
 		if hadNoEnter {
-			noEnterUntil[o.Account] = oldNoEnter
+			o.setNoEnterUntil(o.Account, oldNoEnter)
 		} else {
-			delete(noEnterUntil, o.Account)
+			o.setNoEnterUntil(o.Account, 0)
 		}
 	}()
 	return o.CleanUp()
@@ -795,13 +794,12 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noE
 		}
 		backUntil := int64(0)
 		if noEnter {
-			noEnterUntil := o.noEnterUntil()
-			backUntil, _ = noEnterUntil[o.Account]
-			noEnterUntil[o.Account] = o.priceNow() + 72*3600*1000
+			backUntil, _ = o.noEnterUntilFor(o.Account)
+			o.setNoEnterUntil(o.Account, o.priceNow()+72*3600*1000)
 		}
 		_, err = o.fillPendingOrdersAll(orders, odMap, evt)
 		if noEnter {
-			o.noEnterUntil()[o.Account] = backUntil
+			o.setNoEnterUntil(o.Account, backUntil)
 		}
 		if err != nil {
 			return err
@@ -881,7 +879,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 			}
 		}
 		if err == nil {
-			o.noEnterUntil()[o.Account] = o.priceNow() + 72*3600*1000
+			o.setNoEnterUntil(o.Account, o.priceNow()+72*3600*1000)
 			_, err = o.fillPendingOrdersAll(exitOds, odMap, nil)
 		}
 	}

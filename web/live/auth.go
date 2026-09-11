@@ -99,7 +99,7 @@ func postStratCall(c *fiber.Ctx) error {
 			seen := make(map[string]bool)
 			for _, jobMap := range jobs {
 				for _, job := range jobMap {
-					if job == nil || job.IsWarmUp {
+					if job == nil || job.IsWarmUpState() {
 						continue
 					}
 					symbol := job.Symbol.Symbol

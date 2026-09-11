@@ -76,6 +76,10 @@ type State struct {
 
 	admissionMu sync.RWMutex
 	admission   atomic.Pointer[admissionSnapshot]
+	// flagsMu protects the frequently-read admission override maps. The maps
+	// remain concrete compatibility fields; explicit runtime code uses the
+	// typed accessors below instead of racing on direct map access.
+	flagsMu sync.RWMutex
 }
 
 // NewState creates a self-contained core state and derives a private
@@ -213,11 +217,13 @@ func (s *State) SetPairs(pairs, additionalAllowed []string) {
 	s.admissionMu.Lock()
 	s.Pairs = slices.Clone(pairs)
 	s.publishAdmissionLocked(enabled)
+	s.flagsMu.Lock()
 	for pair := range s.BanPairsUntil {
 		if !enabled[pair] {
 			delete(s.BanPairsUntil, pair)
 		}
 	}
+	s.flagsMu.Unlock()
 	s.admissionMu.Unlock()
 }
 
@@ -288,6 +294,84 @@ func (s *State) AdmissionPairs() []string {
 	pairs := slices.Clone(s.Pairs)
 	s.admissionMu.RUnlock()
 	return pairs
+}
+
+// IsPairBanned reports and lazily clears a runtime pair ban. The map field is
+// retained for source compatibility, but explicit hot paths should use this
+// method so readers and pair refresh writers are synchronized.
+func (s *State) IsPairBanned(pair string, nowMS int64) bool {
+	if s == nil {
+		return false
+	}
+	s.flagsMu.Lock()
+	until, ok := s.BanPairsUntil[pair]
+	if ok && nowMS >= until {
+		delete(s.BanPairsUntil, pair)
+		ok = false
+	}
+	s.flagsMu.Unlock()
+	return ok
+}
+
+// SetPairBanUntil updates one runtime pair ban. A non-positive value clears
+// the current ban.
+func (s *State) SetPairBanUntil(pair string, untilMS int64) {
+	if s == nil {
+		return
+	}
+	s.flagsMu.Lock()
+	if s.BanPairsUntil == nil {
+		s.BanPairsUntil = make(map[string]int64)
+	}
+	if untilMS <= 0 {
+		delete(s.BanPairsUntil, pair)
+	} else {
+		s.BanPairsUntil[pair] = untilMS
+	}
+	s.flagsMu.Unlock()
+}
+
+// BannedPairs returns a stable list for low-frequency refresh and cleanup.
+func (s *State) BannedPairs() []string {
+	if s == nil {
+		return nil
+	}
+	s.flagsMu.RLock()
+	pairs := make([]string, 0, len(s.BanPairsUntil))
+	for pair := range s.BanPairsUntil {
+		pairs = append(pairs, pair)
+	}
+	s.flagsMu.RUnlock()
+	return pairs
+}
+
+// NoEnterUntilFor reads the account trading switch owned by this runtime.
+func (s *State) NoEnterUntilFor(account string) (int64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	s.flagsMu.RLock()
+	until, ok := s.NoEnterUntil[account]
+	s.flagsMu.RUnlock()
+	return until, ok
+}
+
+// SetNoEnterUntil updates the account trading switch owned by this runtime.
+// A non-positive value clears the switch.
+func (s *State) SetNoEnterUntil(account string, untilMS int64) {
+	if s == nil {
+		return
+	}
+	s.flagsMu.Lock()
+	if s.NoEnterUntil == nil {
+		s.NoEnterUntil = make(map[string]int64)
+	}
+	if untilMS <= 0 {
+		delete(s.NoEnterUntil, account)
+	} else {
+		s.NoEnterUntil[account] = untilMS
+	}
+	s.flagsMu.Unlock()
 }
 
 func (s *State) admissionSnapshotLocked() *admissionSnapshot {

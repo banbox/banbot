@@ -1,6 +1,8 @@
 package strat
 
 import (
+	"sync/atomic"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
@@ -48,6 +50,7 @@ type TradeStrat struct {
 	runtimeCore     *core.State
 	runtimeClock    *btime.ClockState
 	runtimeExplicit bool
+	outputState     *tradeStratOutputState
 
 	OnPairInfos         func(s *StratJob) []*PairSub
 	OnDataSubs          func(s *StratJob) []*DataSub
@@ -148,6 +151,7 @@ type StratJob struct {
 	inspectEffect      func(string)
 	dataHubConfigured  bool
 	pairRemovalPending bool
+	executionStateMu   atomic.Pointer[executionStateMu]
 }
 
 // BindRuntimeMarket attaches the explicit market clock to a job. Strategy

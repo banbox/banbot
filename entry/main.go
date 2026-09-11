@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/banbox/banbot/config"
@@ -121,12 +122,15 @@ func installSignalHandler() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		runtimectx.StopProcesses()
+		// Stop is only cancellation. Wait for each explicit Runtime owner to
+		// join callbacks and flush state before the command returns; os.Exit
+		// would bypass the entry/session defers that close storage and exchange
+		// resources.
+		runtimectx.StopAndWaitProcesses()
 		if core.StopAll != nil {
 			core.StopAll()
 		}
 		core.RunExitCalls()
-		os.Exit(0)
 	}()
 }
 
@@ -153,6 +157,8 @@ func newConfigCommandWithGate(name, help string, run FuncEntry, allowDeadlock, l
 			args.BTStrictSet = command.Flags().Changed("bt-strict")
 			if !legacyGate {
 				args.NetDisable = legacy.netDisable
+				args.CPUProfile = legacy.cpuProfile
+				args.MemProfile = legacy.memProfile
 				if err := run(args); err != nil {
 					return err
 				}
@@ -282,27 +288,60 @@ func runConfigCommandWithLegacySession(args *config.CmdArgs, legacy *legacyComma
 	})
 }
 
-func startProfiles() {
-	if core.MemProfile {
-		go func() {
-			log.Info("memory profile server listening", zap.String("address", ":6060"))
-			if err := http.ListenAndServe(":6060", nil); err != nil {
-				log.Error("memory profile server failed", zap.Error(err))
-			}
-		}()
-	}
-	if !core.CPUProfile {
-		return
-	}
-	wd, err := os.Getwd()
+func startProfiles() func() {
+	cleanup, err := startProfilesFor(core.CPUProfile, core.MemProfile)
 	if err != nil {
 		panic(err)
 	}
-	outPath := filepath.Join(wd, "cpu.profile")
-	if profileErr := utils.StartCpuProfile(outPath, 6060); profileErr != nil {
-		panic(profileErr)
+	if cleanup != nil {
+		core.AddExitCall(cleanup)
 	}
-	log.Info("CPU profile started", zap.String("path", outPath))
+	return cleanup
+}
+
+func startProfilesFor(cpuProfile, memProfile bool) (func(), *errs.Error) {
+	var cleanups []func()
+	if memProfile && !cpuProfile {
+		server := &http.Server{Addr: ":6060"}
+		go func() {
+			log.Info("memory profile server listening", zap.String("address", ":6060"))
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("memory profile server failed", zap.Error(err))
+			}
+		}()
+		cleanups = append(cleanups, func() { _ = server.Close() })
+	}
+	if cpuProfile {
+		wd, err := os.Getwd()
+		if err != nil {
+			for i := len(cleanups) - 1; i >= 0; i-- {
+				cleanups[i]()
+			}
+			return nil, errs.New(errs.CodeRunTime, err)
+		}
+		outPath := filepath.Join(wd, "cpu.profile")
+		cleanup, profileErr := utils.StartCpuProfileScoped(outPath, 6060)
+		if profileErr != nil {
+			for i := len(cleanups) - 1; i >= 0; i-- {
+				cleanups[i]()
+			}
+			return nil, profileErr
+		}
+		cleanups = append(cleanups, cleanup)
+		log.Info("CPU profile started", zap.String("path", outPath))
+	}
+	if len(cleanups) == 0 {
+		return nil, nil
+	}
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			for i := len(cleanups) - 1; i >= 0; i-- {
+				cleanups[i]()
+			}
+		})
+	}
+	return cleanup, nil
 }
 
 func newPositionalCommand(name, help, argName string, run func(args []string) error) *cobra.Command {

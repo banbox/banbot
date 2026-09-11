@@ -315,9 +315,9 @@ func RefreshPairListWithRuntimeDeps(deps *RuntimeDeps, timeMS int64) ([]string, 
 	}
 	if deps.Core != nil {
 		deps.Core.SetPairs(pairs, additional)
-		for pair := range deps.Core.BanPairsUntil {
+		for _, pair := range deps.Core.BannedPairs() {
 			if !deps.Core.PairEnabled(pair) {
-				delete(deps.Core.BanPairsUntil, pair)
+				deps.Core.SetPairBanUntil(pair, 0)
 			}
 		}
 	}

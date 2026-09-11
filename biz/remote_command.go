@@ -158,23 +158,29 @@ func (s *RemoteCommandService) runTradingSwitch(cmd RemoteCommand) (*RemoteComma
 		return nil, errs.NewMsg(errs.CodeParamInvalid, "set exactly one trading switch action")
 	}
 	var untilMS int64
-	noEnterUntil := core.NoEnterUntil
 	nowMS := btime.TimeMS
 	if s.deps != nil {
 		if s.deps.Core == nil || s.deps.Clock == nil {
 			return nil, errs.NewMsg(core.ErrBadConfig, "runtime core and clock are required")
 		}
-		noEnterUntil = s.deps.Core.NoEnterUntil
 		nowMS = s.deps.Clock.TimeMS
 	}
 	if cmd.Enable {
-		delete(noEnterUntil, cmd.Account)
+		if s.deps != nil {
+			s.deps.Core.SetNoEnterUntil(cmd.Account, 0)
+		} else {
+			delete(core.NoEnterUntil, cmd.Account)
+		}
 	} else {
 		untilMS = cmd.UntilMS
 		if untilMS == 0 {
 			untilMS = nowMS() + int64(cmd.DisableHours)*3600*1000
 		}
-		noEnterUntil[cmd.Account] = untilMS
+		if s.deps != nil {
+			s.deps.Core.SetNoEnterUntil(cmd.Account, untilMS)
+		} else {
+			core.NoEnterUntil[cmd.Account] = untilMS
+		}
 	}
 	return &RemoteCommandResult{UntilMS: untilMS}, nil
 }

@@ -444,14 +444,22 @@ ORDER BY sid`, exchange)
 }
 
 func (q *Queries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64, error) {
-	return q.addSymbols(ctx, loadDefaultSymbolState(), true, arg)
+	state, err := q.requireSymbolState()
+	if err != nil {
+		return 0, err
+	}
+	return q.addSymbols(ctx, state, q.usesLegacySymbolCatalog(), arg)
 }
 
 func (q *SymbolQueries) AddSymbols(ctx context.Context, arg []AddSymbolsParams) (int64, error) {
 	if q == nil {
 		return 0, errs.NewMsg(core.ErrBadConfig, "symbol query is required")
 	}
-	return q.Queries.addSymbols(ctx, q.symbolState(), q.symbols == nil, arg)
+	state := q.symbolState()
+	if state == nil {
+		return 0, fmt.Errorf("explicit storage requires an explicit symbol state")
+	}
+	return q.Queries.addSymbols(ctx, state, q.symbols == nil, arg)
 }
 
 func (q *Queries) addSymbols(ctx context.Context, state *SymbolState, legacy bool, arg []AddSymbolsParams) (int64, error) {
@@ -1023,14 +1031,22 @@ func queryMaxSidFromQDB(ctx context.Context, db DBTX) (int32, error) {
 }
 
 func (q *Queries) SetListMS(ctx context.Context, arg SetListMSParams) error {
-	return q.setListMS(ctx, loadDefaultSymbolState(), arg, nil)
+	state, err := q.requireSymbolState()
+	if err != nil {
+		return err
+	}
+	return q.setListMS(ctx, state, arg, nil)
 }
 
 func (q *SymbolQueries) SetListMS(ctx context.Context, arg SetListMSParams) error {
 	if q == nil {
 		return errs.NewMsg(core.ErrBadConfig, "symbol query is required")
 	}
-	return q.Queries.setListMS(ctx, q.symbolState(), arg, nil)
+	state := q.symbolState()
+	if state == nil {
+		return fmt.Errorf("explicit storage requires an explicit symbol state")
+	}
+	return q.Queries.setListMS(ctx, state, arg, nil)
 }
 
 func (q *Queries) setListMS(ctx context.Context, state *SymbolState, arg SetListMSParams, base *ExSymbol) error {
@@ -1065,14 +1081,22 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
 }
 
 func (q *Queries) SetAggRules(ctx context.Context, arg SetAggRulesParams) error {
-	return q.setAggRules(ctx, loadDefaultSymbolState(), arg)
+	state, err := q.requireSymbolState()
+	if err != nil {
+		return err
+	}
+	return q.setAggRules(ctx, state, arg)
 }
 
 func (q *SymbolQueries) SetAggRules(ctx context.Context, arg SetAggRulesParams) error {
 	if q == nil {
 		return errs.NewMsg(core.ErrBadConfig, "symbol query is required")
 	}
-	return q.Queries.setAggRules(ctx, q.symbolState(), arg)
+	state := q.symbolState()
+	if state == nil {
+		return fmt.Errorf("explicit storage requires an explicit symbol state")
+	}
+	return q.Queries.setAggRules(ctx, state, arg)
 }
 
 func (q *Queries) setAggRules(ctx context.Context, state *SymbolState, arg SetAggRulesParams) error {
