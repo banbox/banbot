@@ -11,8 +11,10 @@ import (
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg/errs"
 )
 
 func TestLogStateUsesMonotonicEventTimeForPlots(t *testing.T) {
@@ -136,6 +138,39 @@ func TestGroupByProfitsHandlesEmptyKMeansClusters(t *testing.T) {
 	result.groupByProfits(orders)
 	if len(result.ProfitGrps) != 1 {
 		t.Fatalf("profit groups = %d, want 1", len(result.ProfitGrps))
+	}
+}
+
+func TestBTResultCollectPropagatesGroupMeasureError(t *testing.T) {
+	previousMeasure := calcMeasureByOrdersFn
+	previousOrders := ormo.HistODs
+	t.Cleanup(func() {
+		calcMeasureByOrdersFn = previousMeasure
+		ormo.HistODs = previousOrders
+	})
+
+	want := errs.NewMsg(core.ErrRunTime, "historical coverage missing")
+	calcMeasureByOrdersFn = func([]*ormo.InOutOrder) (float64, float64, *errs.Error) {
+		return 0, 0, want
+	}
+	ormo.HistODs = []*ormo.InOutOrder{{
+		IOrder: &ormo.IOrder{
+			ID:        1,
+			Symbol:    "BTC/USDT",
+			Timeframe: "1h",
+			EnterAt:   1_700_000_000_000,
+			ExitAt:    1_700_003_600_000,
+			Leverage:  1,
+			Profit:    1,
+		},
+		Enter: &ormo.ExOrder{Filled: 1, Average: 1, FeeQuote: 0},
+		Exit:  &ormo.ExOrder{Filled: 1, Average: 2, FeeQuote: 0},
+	}}
+
+	result := NewBTResult()
+	result.TotalInvest = 1
+	if got := result.Collect(); got != want {
+		t.Fatalf("Collect error = %v, want %v", got, want)
 	}
 }
 
