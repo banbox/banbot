@@ -2,6 +2,7 @@ package data
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/banbox/banbot/btime"
@@ -22,6 +23,14 @@ type CallbackTracker interface {
 	LeaveCallback()
 }
 
+// LifecycleRegistrar is the optional owner-side lifecycle surface used when a
+// provider is constructed directly from a Runtime. It is deliberately narrow
+// so the data package does not depend on runtime or a dynamic service bag.
+type LifecycleRegistrar interface {
+	OnClose(func())
+	OnCloseWait(func())
+}
+
 // RuntimeDeps is the narrow, typed dependency set needed by data providers.
 // It is stored on a provider/feeder instance, never discovered dynamically.
 // A nil dependency set means that the caller is using the legacy package facade.
@@ -37,6 +46,10 @@ type RuntimeDeps struct {
 	Dump       *orm.DumpSink
 	Callbacks  CallbackTracker
 	Exchange   banexg.BanExchange
+	// IdentityErr records a fail-closed adapter metadata error discovered while
+	// binding this dependency set. Keeping it on the typed view preserves the
+	// original failure instead of silently treating a panic as empty identity.
+	IdentityErr error
 
 	ExchangeName string
 	MarketType   string
@@ -70,7 +83,13 @@ func (d *RuntimeDeps) conn() (*orm.Queries, *pgxpool.Conn, *errs.Error) {
 	if storage == nil {
 		return nil, nil, errs.NewMsg(core.ErrDbConnFail, "explicit data storage is required")
 	}
+	if d.Clock == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "explicit data runtime clock is required")
+	}
 	sess, conn, err := storage.Conn(d.context())
+	if err == nil && d.Exchange != nil {
+		sess = sess.WithExchange(d.Exchange)
+	}
 	if err == nil && d.Symbols != nil {
 		sess = sess.WithSeriesSymbolState(d.Symbols)
 	}
@@ -109,7 +128,10 @@ func (d *RuntimeDeps) timeMS() int64 {
 	if d.Clock != nil {
 		return d.Clock.TimeMS()
 	}
-	return time.Now().UnixMilli()
+	// Explicit dependencies must carry their own clock. Returning zero keeps
+	// callers deterministic and lets validation/scheduling paths fail closed;
+	// it must never silently switch a simulated run to wall-clock time.
+	return 0
 }
 
 func (d *RuntimeDeps) utcStamp() int64 {
@@ -120,21 +142,76 @@ func (d *RuntimeDeps) utcStamp() int64 {
 }
 
 func (d *RuntimeDeps) identity() (string, string) {
-	if d != nil {
-		if d.ExchangeName != "" || d.MarketType != "" {
-			return d.ExchangeName, d.MarketType
-		}
-		if d.Core != nil {
-			return d.Core.ExgName, d.Core.Market
-		}
-		if d.Exchange != nil {
-			if info := d.Exchange.Info(); info != nil {
-				return info.ID, info.MarketType
-			}
-		}
+	name, market, err := d.ResolveIdentity()
+	if err != nil {
 		return "", ""
 	}
-	return core.ExgName, core.Market
+	return name, market
+}
+
+// ResolveIdentity returns the complete exchange/market identity proven by the
+// explicit adapter and dependency fields. Callers at construction boundaries
+// should use the error result; hot-path compatibility callers can continue to
+// use identity(), which maps an invalid identity to an empty pair.
+func (d *RuntimeDeps) ResolveIdentity() (string, string, error) {
+	if d == nil {
+		return core.ExgName, core.Market, nil
+	}
+	if d.IdentityErr != nil {
+		return "", "", d.IdentityErr
+	}
+	name, market := "", ""
+	if d.ExchangeName != "" || d.MarketType != "" {
+		if d.ExchangeName == "" || d.MarketType == "" {
+			return "", "", fmt.Errorf("runtime data identity requires both exchange name and market")
+		}
+		name, market = d.ExchangeName, d.MarketType
+	} else if d.Core != nil {
+		name, market = d.Core.ExgName, d.Core.Market
+		if (name == "") != (market == "") {
+			return "", "", fmt.Errorf("runtime core identity is incomplete")
+		}
+	}
+	if d.Exchange != nil {
+		info, err := runtimeExchangeInfo(d.Exchange)
+		if err != nil {
+			return "", "", err
+		}
+		if info == nil || info.ID == "" || info.MarketType == "" {
+			return "", "", fmt.Errorf("runtime adapter identity metadata is incomplete")
+		}
+		if (name != "" && name != info.ID) || (market != "" && market != info.MarketType) {
+			return "", "", fmt.Errorf("runtime identity %q/%q does not match adapter %q/%q",
+				name, market, info.ID, info.MarketType)
+		}
+		if name == "" {
+			name = info.ID
+		}
+		if market == "" {
+			market = info.MarketType
+		}
+	}
+	if name == "" || market == "" {
+		return "", "", fmt.Errorf("runtime data identity is incomplete")
+	}
+	return name, market, nil
+}
+
+func runtimeExchangeInfo(exchange banexg.BanExchange) (info *banexg.ExgInfo, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			info = nil
+			err = fmt.Errorf("adapter Info panicked: %v", recovered)
+		}
+	}()
+	if exchange == nil {
+		return nil, fmt.Errorf("adapter is nil")
+	}
+	info = exchange.Info()
+	if info == nil {
+		return nil, fmt.Errorf("adapter Info returned nil")
+	}
+	return info, nil
 }
 
 func (d *RuntimeDeps) exchange() banexg.BanExchange {

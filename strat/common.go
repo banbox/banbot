@@ -679,35 +679,36 @@ func CalcJobScoresWithState(strategyState *State, coreState *core.State, orderSt
 	if err != nil {
 		return err
 	}
-	coreState.EnsureRuntimeMaps()
-	sta := coreState.StratPerfSta[stgy]
-	if sta == nil {
-		sta = &core.PerfSta{}
-		coreState.StratPerfSta[stgy] = sta
-	}
-	sta.OdNum++
-	if len(orders) < cfg.MinOdNum {
-		return nil
-	}
 	totalPft := 0.0
 	for _, od := range orders {
 		totalPft += od.ProfitRate
 	}
 	prefKey := core.KeyStratPairTf(stgy, pair, tf)
-	perf := coreState.JobPerfs[prefKey]
-	if perf == nil {
-		perf = &core.JobPerf{Num: len(orders), TotProfit: totalPft, Score: 1}
-		coreState.JobPerfs[prefKey] = perf
-	} else {
-		perf.Num = len(orders)
-	}
-	prefs := make([]*core.JobPerf, 0)
-	for key, item := range coreState.JobPerfs {
-		if strings.HasPrefix(key, stgy) {
-			prefs = append(prefs, item)
+	coreState.WithPerformance(func(jobPerfs map[string]*core.JobPerf, stratPerfSta map[string]*core.PerfSta) {
+		sta := stratPerfSta[stgy]
+		if sta == nil {
+			sta = &core.PerfSta{}
+			stratPerfSta[stgy] = sta
 		}
-	}
-	perf.Score = defaultCalcJobScore(cfg, sta, perf, prefs)
+		sta.OdNum++
+		if len(orders) < cfg.MinOdNum {
+			return
+		}
+		perf := jobPerfs[prefKey]
+		if perf == nil {
+			perf = &core.JobPerf{Num: len(orders), TotProfit: totalPft, Score: 1}
+			jobPerfs[prefKey] = perf
+		} else {
+			perf.Num = len(orders)
+		}
+		prefs := make([]*core.JobPerf, 0)
+		for key, item := range jobPerfs {
+			if strings.HasPrefix(key, stgy) {
+				prefs = append(prefs, item)
+			}
+		}
+		perf.Score = defaultCalcJobScore(cfg, sta, perf, prefs)
+	})
 	return nil
 }
 
@@ -723,37 +724,47 @@ func CalcJobScores(pair, tf, stgy string) *errs.Error {
 	if err != nil {
 		return err
 	}
-	sta := core.GetPerfSta(stgy)
-	sta.OdNum += 1
-	if len(orders) < cfg.MinOdNum {
-		return nil
-	}
+	var updated bool
 	totalPft := 0.0
-	for _, od := range orders {
-		totalPft += od.ProfitRate
+	if len(orders) >= cfg.MinOdNum {
+		for _, od := range orders {
+			totalPft += od.ProfitRate
+		}
 	}
 	var prefKey = core.KeyStratPairTf(stgy, pair, tf)
-	perf, _ := core.JobPerfs[prefKey]
-	if perf == nil {
-		perf = &core.JobPerf{
-			Num:       len(orders),
-			TotProfit: totalPft,
-			Score:     1,
+	core.WithLegacyPerformance(func(jobPerfs map[string]*core.JobPerf, stratPerfSta map[string]*core.PerfSta) {
+		sta := stratPerfSta[stgy]
+		if sta == nil {
+			sta = &core.PerfSta{}
+			stratPerfSta[stgy] = sta
 		}
-		core.JobPerfs[prefKey] = perf
-	} else {
-		perf.Num = len(orders)
-	}
-	// collect all trade jobs for this strategy & calculate stake rate
-	// 收集此策略所有任务，计算开单倍率
-	var prefs []*core.JobPerf
-	for key, p := range core.JobPerfs {
-		if strings.HasPrefix(key, stgy) {
-			prefs = append(prefs, p)
+		sta.OdNum++
+		if len(orders) < cfg.MinOdNum {
+			return
 		}
-	}
-	perf.Score = defaultCalcJobScore(cfg, sta, perf, prefs)
-	if core.LiveMode {
+		perf := jobPerfs[prefKey]
+		if perf == nil {
+			perf = &core.JobPerf{
+				Num:       len(orders),
+				TotProfit: totalPft,
+				Score:     1,
+			}
+			jobPerfs[prefKey] = perf
+		} else {
+			perf.Num = len(orders)
+		}
+		// Collect all trade jobs for this strategy while the compatibility
+		// performance lock is held; score calculation mutates these values.
+		var prefs []*core.JobPerf
+		for key, p := range jobPerfs {
+			if strings.HasPrefix(key, stgy) {
+				prefs = append(prefs, p)
+			}
+		}
+		perf.Score = defaultCalcJobScore(cfg, sta, perf, prefs)
+		updated = true
+	})
+	if updated && core.LiveMode {
 		// Real disk mode, immediately save to data directory
 		// 实盘模式，立刻保存到数据目录
 		core.DumpPerfs(config.GetDataDir())
@@ -1131,7 +1142,7 @@ print strategy+timeframe from `core.StgPairTfs`
 从core.StgPairTfs输出策略+时间周期的币种信息到控制台
 */
 func PrintStratGroups() {
-	text := core.GroupByPairQuotes(map[string][]string{"Pairs": core.Pairs}, false)
+	text := core.GroupByPairQuotes(map[string][]string{"Pairs": core.LegacyAdmissionPairs()}, false)
 	log.Info("global pairs", zap.String("res", "\n"+text))
 	for acc, jobMap := range AccJobs {
 		allows := make(map[string][]string)
@@ -1141,7 +1152,7 @@ func PrintStratGroups() {
 			pair, tf := arrP[0], arrP[1]
 			for stratID := range stratMap {
 				key := fmt.Sprintf("%s_%s", stratID, tf)
-				if ok, _ := core.PairsMap[pair]; ok {
+				if core.LegacyPairEnabled(pair) {
 					arr, _ := allows[key]
 					allows[key] = append(arr, pair)
 				} else {
@@ -1175,9 +1186,9 @@ func PrintStratGroupsWithState(strategyState *State, coreState *core.State) {
 	}
 	pairs := []string(nil)
 	if coreState != nil {
-		pairs = coreState.Pairs
+		pairs = coreState.AdmissionPairs()
 	} else {
-		pairs = core.Pairs
+		pairs = core.LegacyAdmissionPairs()
 	}
 	log.Info("global pairs", zap.String("res", "\n"+core.GroupByPairQuotes(map[string][]string{"Pairs": pairs}, false)))
 	for _, acc := range strategyState.Accounts() {
@@ -1196,7 +1207,7 @@ func PrintStratGroupsWithState(strategyState *State, coreState *core.State) {
 				if coreState != nil {
 					enabled = coreState.PairEnabled(pair)
 				} else {
-					enabled = core.PairsMap[pair]
+					enabled = core.LegacyPairEnabled(pair)
 				}
 				if enabled {
 					allows[key] = append(allows[key], pair)

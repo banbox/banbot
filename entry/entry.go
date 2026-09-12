@@ -54,41 +54,11 @@ func runTradeEntry(args *config.CmdArgs) *errs.Error {
 }
 
 func runtimeRunnerDeps(rt *runtime.Runtime) biz.RuntimeDeps {
-	return biz.RuntimeDeps{
-		Core:           rt.Core,
-		Clock:          rt.Clock,
-		Market:         rt.Market,
-		Batch:          rt.Batch,
-		Strategies:     rt.Strategies,
-		Orders:         rt.Orders,
-		Trading:        rt.Trading,
-		Config:         rt.Config,
-		Symbols:        rt.Symbols,
-		Storage:        rt.Storage,
-		Exchange:       rt.Exchange,
-		Dump:           rt.Dump,
-		Scheduler:      rt.Scheduler(),
-		Notifications:  rt.Notifications,
-		DefaultAccount: rt.Config.DefaultAccount(),
-	}
+	return rt.BizDeps()
 }
 
 func runtimeRunnerDataDeps(rt *runtime.Runtime) *data.RuntimeDeps {
-	return &data.RuntimeDeps{
-		Core:         rt.Core,
-		Clock:        rt.Clock,
-		Config:       rt.Config,
-		Market:       rt.Market,
-		Symbols:      rt.Symbols,
-		Storage:      rt.Storage,
-		Strategies:   rt.Strategies,
-		Catalog:      rt.Catalog,
-		Callbacks:    rt,
-		Exchange:     rt.Exchange,
-		Dump:         rt.Dump,
-		ExchangeName: rt.Core.ExgName,
-		MarketType:   rt.Core.Market,
-	}
+	return rt.DataDeps()
 }
 
 func RunDownData(args *config.CmdArgs) *errs.Error {

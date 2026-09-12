@@ -8,6 +8,9 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -31,10 +34,11 @@ func NewWithStorage(db DBTX, storage *Storage) *Queries {
 }
 
 type Queries struct {
-	db      DBTX
-	storage *Storage
-	symbols *SymbolState
-	options *KlineRuntimeOptions
+	db       DBTX
+	storage  *Storage
+	symbols  *SymbolState
+	options  *KlineRuntimeOptions
+	exchange banexg.BanExchange
 }
 
 func (q *Queries) Storage() *Storage {
@@ -120,10 +124,11 @@ func (q *Queries) begin(ctx context.Context) (pgx.Tx, *Queries, error) {
 
 func (q *Queries) WithTx(tx pgx.Tx) *Queries {
 	return &Queries{
-		db:      tx,
-		storage: q.storage,
-		symbols: q.symbols,
-		options: q.options,
+		db:       tx,
+		storage:  q.storage,
+		symbols:  q.symbols,
+		options:  q.options,
+		exchange: q.exchange,
 	}
 }
 
@@ -148,6 +153,59 @@ func (q *Queries) WithKlineRuntimeOptions(options KlineRuntimeOptions) *Queries 
 	copy := *q
 	copy.options = &options
 	return &copy
+}
+
+// WithExchange binds the runtime-owned exchange session used by explicit
+// aggregate and market-metadata helpers. Legacy callers can leave it unset.
+func (q *Queries) WithExchange(exchange banexg.BanExchange) *Queries {
+	if q == nil {
+		return &Queries{exchange: exchange}
+	}
+	copy := *q
+	copy.exchange = exchange
+	return &copy
+}
+
+func (q *Queries) hasExplicitKlineRuntime() bool {
+	return q != nil && (q.symbols != nil || (q.storage != nil && !q.storage.legacy))
+}
+
+func (q *Queries) usesExplicitExchange() bool {
+	return q != nil && (q.exchange != nil || q.hasExplicitKlineRuntime())
+}
+
+// requireKlineRuntimeOptions rejects an incomplete explicit query instead of
+// silently borrowing the process-wide replay policy. The package-level query
+// facade remains compatible with its legacy defaults.
+func (q *Queries) requireKlineRuntimeOptions() (KlineRuntimeOptions, *errs.Error) {
+	if q != nil && q.options != nil {
+		options := *q.options
+		if err := validateKlineRuntimeOptions(options); err != nil {
+			return KlineRuntimeOptions{}, err
+		}
+		return options, nil
+	}
+	if q.hasExplicitKlineRuntime() {
+		return KlineRuntimeOptions{}, errs.NewMsg(core.ErrBadConfig,
+			"explicit query requires K-line runtime options")
+	}
+	return LegacyKlineRuntimeOptions(), nil
+}
+
+// requireExplicitKlineRuntime validates the complete dependency set needed by
+// explicit series reads. An explicit storage/catalog without its exchange
+// session would otherwise reach alignment helpers with a nil adapter and
+// silently fall back to a process-wide exchange cache (or return offset 0).
+func (q *Queries) requireExplicitKlineRuntime() (KlineRuntimeOptions, *errs.Error) {
+	options, err := q.requireKlineRuntimeOptions()
+	if err != nil {
+		return KlineRuntimeOptions{}, err
+	}
+	if q != nil && q.usesExplicitExchange() && q.exchange == nil {
+		return KlineRuntimeOptions{}, errs.NewMsg(core.ErrExgNotInit,
+			"explicit query requires an exchange adapter")
+	}
+	return options, nil
 }
 
 func (q *Queries) klineRuntimeOptions() KlineRuntimeOptions {

@@ -10,6 +10,65 @@ import (
 	"github.com/banbox/banbot/strat"
 )
 
+func TestNewTraderWithRuntimeDepsCopiesAccounts(t *testing.T) {
+	source := map[string]*config.AccountConfig{
+		"runtime": {
+			StakeRate:   1.5,
+			StakePctAmt: 73,
+			RPCChannels: []map[string]interface{}{{
+				"options": map[string]interface{}{"format": "compact"},
+			}},
+			APIServer: &config.AccPwdRole{Pwd: "password", Role: "admin"},
+			Exchanges: map[string]*config.ExgApiSecrets{
+				"runtime-exchange": {Prod: &config.ApiSecretConfig{APIKey: "key"}},
+			},
+		},
+	}
+	trader := NewTraderWithRuntimeDeps(RuntimeDeps{
+		Core:     &core.State{EnvReal: true},
+		Accounts: source,
+	})
+	owned := trader.RuntimeDependencies().AccountConfigs()
+	if owned == nil || owned["runtime"] == nil {
+		t.Fatalf("owned runtime accounts = %#v", owned)
+	}
+	if owned["runtime"] == source["runtime"] {
+		t.Fatal("trader retained caller-owned account config")
+	}
+	if owned["runtime"].StakePctAmt != source["runtime"].StakePctAmt {
+		t.Fatalf("runtime StakePctAmt = %v, want %v", owned["runtime"].StakePctAmt, source["runtime"].StakePctAmt)
+	}
+	owned["owned-only"] = &config.AccountConfig{}
+	if _, ok := source["owned-only"]; ok {
+		t.Fatal("trader retained caller-owned account map")
+	}
+	delete(owned, "owned-only")
+	owned["runtime"].RPCChannels[0]["options"].(map[string]interface{})["format"] = "verbose"
+	owned["runtime"].APIServer.Pwd = "changed"
+	owned["runtime"].Exchanges["runtime-exchange"].Prod.APIKey = "changed"
+	if source["runtime"].RPCChannels[0]["options"].(map[string]interface{})["format"] != "compact" ||
+		source["runtime"].APIServer.Pwd != "password" ||
+		source["runtime"].Exchanges["runtime-exchange"].Prod.APIKey != "key" {
+		t.Fatal("mutating trader accounts changed caller-owned configuration")
+	}
+}
+
+func TestRefreshPairsWithSymbolStateRejectsLegacyFallback(t *testing.T) {
+	symbols := orm.NewSymbolStateWithIdentity("runtime", "spot")
+	oldPairs, oldPairsMap := core.LegacyPairStateSnapshot()
+	t.Cleanup(func() { core.ReplaceLegacyPairState(oldPairs, oldPairsMap) })
+	core.SetLegacyPairs([]string{"legacy"}, nil)
+
+	_, _, err := RefreshPairsWithSymbolState(symbols, false, 100, nil)
+	if err == nil || err.Code != core.ErrBadConfig {
+		t.Fatalf("symbol-only pair refresh error = %v, want ErrBadConfig", err)
+	}
+	pairs, pairsMap := core.LegacyPairStateSnapshot()
+	if len(pairs) != 1 || pairs[0] != "legacy" || !pairsMap["legacy"] {
+		t.Fatalf("legacy pair state changed on rejected refresh: %v/%v", pairs, pairsMap)
+	}
+}
+
 func TestRuntimeDepsNormalizeNonRealAccountsForOrderDispatch(t *testing.T) {
 	deps := RuntimeDeps{
 		Core: &core.State{EnvReal: false},

@@ -48,10 +48,18 @@ type RuntimeDeps struct {
 	Orders     *ormo.OrderState
 	Trading    *TradingState
 	Config     *config.Snapshot
-	// Accounts is the immutable, execution-facing account map. For non-real
-	// runs it is normalized to DefaultAccount once at construction, matching
-	// the historical single-account semantics without a hot-path global read.
-	Accounts       map[string]*config.AccountConfig
+	// Accounts is the execution-facing account map. Runtime composition roots may
+	// mark it owned so wallet and strategy state observe the same mutable
+	// StakePctAmt values; ordinary callers receive a defensive clone.
+	Accounts map[string]*config.AccountConfig
+	// AccountsOwned marks a map already owned by the composition root. The
+	// Runtime uses this to let Trader, Wallet, and Strategy share one mutable
+	// execution view while ordinary callers still get a defensive clone.
+	AccountsOwned bool
+	// AccountsMu protects mutable execution fields (currently StakePctAmt) in
+	// Accounts. The composition root owns the lock and passes the same pointer
+	// to Trader, Wallet, and Strategy; nil keeps legacy/immutable callers cheap.
+	AccountsMu     *sync.RWMutex
 	Symbols        *orm.SymbolState
 	Storage        *orm.Storage
 	Exchange       banexg.BanExchange
@@ -183,6 +191,7 @@ func NewTraderWithRuntimeDeps(deps RuntimeDeps) Trader {
 		deps.DefaultAccount = "default"
 	}
 	deps.Accounts = normalizeRuntimeAccounts(deps)
+	deps.Strategies.BindRuntimeAccountsLock(deps.AccountsMu)
 	deps.Strategies.BindRuntime(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange)
 	for account := range deps.Accounts {
 		// Explicit strategy states start empty. Seed their account registries at
@@ -194,9 +203,19 @@ func NewTraderWithRuntimeDeps(deps RuntimeDeps) Trader {
 	return Trader{batchState: unsafe.Pointer(deps.Batch), runtime: &deps}
 }
 
+// NormalizeRuntimeAccounts applies the same deterministic account selection
+// used by NewTraderWithRuntimeDeps. Composition roots can call it once and
+// pass the owned result to multiple domain states.
+func NormalizeRuntimeAccounts(deps RuntimeDeps) map[string]*config.AccountConfig {
+	return normalizeRuntimeAccounts(deps)
+}
+
 func normalizeRuntimeAccounts(deps RuntimeDeps) map[string]*config.AccountConfig {
 	if deps.Accounts != nil {
-		return deps.Accounts
+		if deps.AccountsOwned {
+			return deps.Accounts
+		}
+		return cloneRuntimeAccounts(deps.Accounts)
 	}
 	accounts := map[string]*config.AccountConfig(nil)
 	if deps.Config != nil {
@@ -205,7 +224,7 @@ func normalizeRuntimeAccounts(deps RuntimeDeps) map[string]*config.AccountConfig
 		}
 	}
 	if deps.Core == nil || deps.Core.EnvReal {
-		return accounts
+		return cloneRuntimeAccounts(accounts)
 	}
 	account := deps.DefaultAccount
 	if account == "" {
@@ -215,7 +234,7 @@ func normalizeRuntimeAccounts(deps RuntimeDeps) map[string]*config.AccountConfig
 		return map[string]*config.AccountConfig{account: {}}
 	}
 	if selected, ok := accounts[account]; ok {
-		return map[string]*config.AccountConfig{account: selected}
+		return cloneRuntimeAccounts(map[string]*config.AccountConfig{account: selected})
 	}
 	// Config files may name credentials for a live account while backtests use
 	// the historical default key. Pick the same deterministic first account
@@ -230,7 +249,15 @@ func normalizeRuntimeAccounts(deps RuntimeDeps) map[string]*config.AccountConfig
 	if len(names) == 0 {
 		return map[string]*config.AccountConfig{account: {}}
 	}
-	return map[string]*config.AccountConfig{account: accounts[names[0]]}
+	return cloneRuntimeAccounts(map[string]*config.AccountConfig{account: accounts[names[0]]})
+}
+
+// cloneRuntimeAccounts takes ownership of account configuration at the
+// Trader boundary. Config snapshots are already copied, but callers may also
+// supply Accounts directly; copying both the map and nested credential/RPC
+// fields prevents later refreshes from racing with account iteration.
+func cloneRuntimeAccounts(accounts map[string]*config.AccountConfig) map[string]*config.AccountConfig {
+	return config.CloneAccountConfigsForRuntime(accounts)
 }
 
 // RuntimeDependencies reports the explicit dependencies, or nil for legacy
@@ -277,11 +304,7 @@ func (t *Trader) openOrders(account string) (map[int64]*ormo.InOutOrder, *deadlo
 
 func (t *Trader) allOrderManagers() map[string]IOrderMgr {
 	if t != nil && t.runtime != nil && t.runtime.Trading != nil {
-		result := make(map[string]IOrderMgr, len(t.runtime.Trading.OrderManagers))
-		for account, manager := range t.runtime.Trading.OrderManagers {
-			result[account] = manager
-		}
-		return result
+		return t.runtime.Trading.OrderManagersSnapshot()
 	}
 	return GetAllOdMgr()
 }
@@ -363,7 +386,7 @@ func (t *Trader) parallelOnBar() bool {
 
 func (t *Trader) setBotRunning(running bool) {
 	if state := t.coreState(); state != nil {
-		state.BotRunning = running
+		state.SetBotRunning(running)
 		return
 	}
 	core.BotRunning = running
@@ -638,13 +661,9 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 	state := t.coreState()
 	var odMatch bool
 	if state == nil {
-		core.LockOdMatch.RLock()
-		_, odMatch = core.OrderMatchTfs[evt.TimeFrame]
-		core.LockOdMatch.RUnlock()
+		odMatch = core.LegacyOrderMatchEnabled(evt.TimeFrame)
 	} else {
-		state.LockOdMatch.RLock()
-		_, odMatch = state.OrderMatchTfs[evt.TimeFrame]
-		state.LockOdMatch.RUnlock()
+		odMatch = state.OrderMatchEnabled(evt.TimeFrame)
 	}
 	var accOrders map[string][]*ormo.InOutOrder
 	if market := t.marketState(); market != nil {

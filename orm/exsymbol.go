@@ -1001,6 +1001,9 @@ func EnsureListDatesWithState(sess *Queries, state *SymbolState, exchange banexg
 // symbol state remain the only mutable owners touched by this operation.
 func EnsureListDatesWithStateAndOptions(sess *Queries, state *SymbolState, exchange banexg.BanExchange,
 	exsMap map[int32]*ExSymbol, exsList []*ExSymbol, options KlineRuntimeOptions) *errs.Error {
+	if err := validateKlineRuntimeOptions(options); err != nil {
+		return err
+	}
 	canDownload := options.allowDownload()
 	if exchange == nil {
 		if !canDownload {

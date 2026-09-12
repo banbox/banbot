@@ -370,8 +370,31 @@ func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 	}
 }
 
+func TestGetApiSecretForUsesExplicitExchangeAndEnvironment(t *testing.T) {
+	oldExchange, oldEnv := Exchange, core.RunEnv
+	t.Cleanup(func() {
+		Exchange, core.RunEnv = oldExchange, oldEnv
+	})
+	Exchange = &ExchangeConfig{Name: "legacy"}
+	core.RunEnv = core.RunEnvProd
+	account := &AccountConfig{Exchanges: map[string]*ExgApiSecrets{
+		"legacy":  {Prod: &ApiSecretConfig{APIKey: "legacy-prod"}},
+		"runtime": {Prod: &ApiSecretConfig{APIKey: "runtime-prod"}, Test: &ApiSecretConfig{APIKey: "runtime-test"}},
+	}}
+	if got := account.GetApiSecretFor("runtime", core.RunEnvTest).APIKey; got != "runtime-test" {
+		t.Fatalf("explicit test credentials = %q, want runtime-test", got)
+	}
+	if got := account.GetApiSecretFor("runtime", core.RunEnvProd).APIKey; got != "runtime-prod" {
+		t.Fatalf("explicit prod credentials = %q, want runtime-prod", got)
+	}
+	if got := account.GetApiSecret().APIKey; got != "legacy-prod" {
+		t.Fatalf("legacy credentials = %q, want legacy-prod", got)
+	}
+}
+
 func TestRuntimeAccountUpdatesDoNotRaceWithConfigDump(t *testing.T) {
 	runtimeAccount := &AccountConfig{
+		StakePctAmt: 42,
 		RPCChannels: []map[string]interface{}{{"options": map[string]interface{}{"format": "compact"}}},
 		APIServer:   &AccPwdRole{Pwd: "password", Role: "admin"},
 		Exchanges: map[string]*ExgApiSecrets{
@@ -386,6 +409,9 @@ func TestRuntimeAccountUpdatesDoNotRaceWithConfigDump(t *testing.T) {
 		snapshotAccount.Exchanges["binance"] == runtimeAccount.Exchanges["binance"] ||
 		snapshotAccount.Exchanges["binance"].Prod == runtimeAccount.Exchanges["binance"].Prod {
 		t.Fatal("config snapshot shares account secrets with runtime state")
+	}
+	if snapshotAccount.StakePctAmt != 0 {
+		t.Fatalf("legacy config snapshot retained runtime StakePctAmt: %v", snapshotAccount.StakePctAmt)
 	}
 	snapshotAccount.RPCChannels[0]["options"].(map[string]interface{})["format"] = "verbose"
 	if runtimeAccount.RPCChannels[0]["options"].(map[string]interface{})["format"] != "compact" {

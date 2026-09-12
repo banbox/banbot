@@ -16,9 +16,9 @@ type PriceSymbolParser = core.SymbolParserStrategy
 
 // PriceState owns bar and order-book prices for one Runtime.
 type PriceState struct {
-	barPrices  map[string]*core.Int64Flt
-	bidPrices  map[string]*core.Int64Flt
-	askPrices  map[string]*core.Int64Flt
+	barPrices  map[string]core.Int64Flt
+	bidPrices  map[string]core.Int64Flt
+	askPrices  map[string]core.Int64Flt
 	lockPrices sync.RWMutex
 	lockBars   sync.RWMutex
 	parser     *core.SymbolParser
@@ -56,18 +56,18 @@ func NewPriceState(exgName string) *PriceState {
 
 func NewPriceStateWithStrategy(exgName string, parse PriceSymbolParser) *PriceState {
 	return &PriceState{
-		barPrices: make(map[string]*core.Int64Flt),
-		bidPrices: make(map[string]*core.Int64Flt),
-		askPrices: make(map[string]*core.Int64Flt),
+		barPrices: make(map[string]core.Int64Flt),
+		bidPrices: make(map[string]core.Int64Flt),
+		askPrices: make(map[string]core.Int64Flt),
 		parser:    core.NewSymbolParserWithStrategy(exgName, parse),
 	}
 }
 
 func NewPriceStateWithErrorStrategy(exgName string, parse core.SymbolParserStrategyWithError) *PriceState {
 	return &PriceState{
-		barPrices: make(map[string]*core.Int64Flt),
-		bidPrices: make(map[string]*core.Int64Flt),
-		askPrices: make(map[string]*core.Int64Flt),
+		barPrices: make(map[string]core.Int64Flt),
+		bidPrices: make(map[string]core.Int64Flt),
+		askPrices: make(map[string]core.Int64Flt),
 		parser:    core.NewSymbolParserWithErrorStrategy(exgName, parse),
 	}
 }
@@ -163,21 +163,24 @@ func (p *PriceState) SetPriceAt(nowMS int64, pair string, ask, bid float64) {
 		return
 	}
 	p.lockPrices.Lock()
-	var askItem, bidItem *core.Int64Flt
+	var askItem, bidItem core.Int64Flt
+	var hasAsk, hasBid bool
 	if ask > 0 {
-		askItem = &core.Int64Flt{Int: nowMS, Val: ask}
+		askItem = core.Int64Flt{Int: nowMS, Val: ask}
 		p.askPrices[pair] = askItem
+		hasAsk = true
 	}
 	if bid > 0 {
-		bidItem = &core.Int64Flt{Int: nowMS, Val: bid}
+		bidItem = core.Int64Flt{Int: nowMS, Val: bid}
 		p.bidPrices[pair] = bidItem
+		hasBid = true
 	}
 	base, quote, settle, _ := p.parser.Split(pair)
 	if core.IsFiat(quote) && (settle == "" || settle == quote) {
-		if askItem != nil {
+		if hasAsk {
 			p.askPrices[base] = askItem
 		}
-		if bidItem != nil {
+		if hasBid {
 			p.bidPrices[base] = bidItem
 		}
 	}
@@ -195,7 +198,7 @@ func (p *PriceState) SetPricesAt(nowMS int64, data map[string]float64, side stri
 	}
 	p.lockPrices.Lock()
 	for pair, price := range data {
-		item := &core.Int64Flt{Int: nowMS, Val: price}
+		item := core.Int64Flt{Int: nowMS, Val: price}
 		if updateAsk {
 			p.askPrices[pair] = item
 		}
@@ -235,16 +238,16 @@ func (p *PriceState) Reset() {
 	defer p.loadMu.Unlock()
 	p.lastLoadMS = 0
 	p.lockPrices.Lock()
-	p.bidPrices = make(map[string]*core.Int64Flt)
-	p.askPrices = make(map[string]*core.Int64Flt)
+	p.bidPrices = make(map[string]core.Int64Flt)
+	p.askPrices = make(map[string]core.Int64Flt)
 	p.lockPrices.Unlock()
 	p.lockBars.Lock()
-	p.barPrices = make(map[string]*core.Int64Flt)
+	p.barPrices = make(map[string]core.Int64Flt)
 	p.lockBars.Unlock()
 }
 
-func (p *PriceState) setDataPrice(dst map[string]*core.Int64Flt, nowMS int64, pair string, price float64) {
-	item := &core.Int64Flt{Int: nowMS, Val: price}
+func (p *PriceState) setDataPrice(dst map[string]core.Int64Flt, nowMS int64, pair string, price float64) {
+	item := core.Int64Flt{Int: nowMS, Val: price}
 	dst[pair] = item
 	base, quote, settle, _ := p.parser.Split(pair)
 	if core.IsFiat(quote) && (settle == "" || settle == quote) {

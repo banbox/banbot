@@ -7,7 +7,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 )
 
 func TestStorageCloseConcurrent(t *testing.T) {
@@ -41,6 +43,12 @@ func TestStorageQueryBackendAndCoordination(t *testing.T) {
 	}
 	if quest.NewQueries(nil).WithTx(nil).Storage() != quest {
 		t.Fatal("transaction loses storage binding")
+	}
+	exchange := &listDateExchange{}
+	q := quest.NewQueries(nil).WithExchange(exchange).WithKlineRuntimeOptions(KlineRuntimeOptions{NowMS: 42, ClockValid: true})
+	tx := q.WithTx(nil)
+	if tx.exchange != exchange || tx.klineRuntimeOptions().NowMS != 42 {
+		t.Fatal("transaction loses explicit query dependencies")
 	}
 }
 
@@ -100,7 +108,7 @@ func TestExplicitStorageSymbolMutationsRequireState(t *testing.T) {
 	if err := q.LoadExgSymbols("binance"); err == nil || !strings.Contains(err.Error(), "explicit symbol state") {
 		t.Fatalf("LoadExgSymbols error = %v, want explicit symbol state error", err)
 	}
-	if _, err := q.GetAdjs(7); err == nil || !strings.Contains(err.Error(), "explicit symbol state") {
+	if _, err := q.WithKlineRuntimeOptions(KlineRuntimeOptions{NowMS: 1, ClockValid: true}).GetAdjs(7); err == nil || !strings.Contains(err.Error(), "explicit symbol state") {
 		t.Fatalf("GetAdjs error = %v, want explicit symbol state error", err)
 	}
 }
@@ -121,9 +129,86 @@ func TestGetAdjsUsesBoundStorageConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	storage := NewStorage(nil, true, "storage:get-adjs")
-	q := NewWithStorage(nil, storage).WithSeriesSymbolState(state)
+	q := NewWithStorage(nil, storage).WithSeriesSymbolState(state).WithKlineRuntimeOptions(KlineRuntimeOptions{
+		NowMS: 123, ClockValid: true,
+	})
 	if _, err := q.GetAdjs(7); err == nil || !strings.Contains(err.Error(), "storage pool is not configured") {
 		t.Fatalf("GetAdjs error = %v, want bound storage pool error", err)
+	}
+}
+
+func TestExplicitGetAdjsRequiresKlineRuntimeOptions(t *testing.T) {
+	state := NewSymbolStateWithIdentity("runtime", banexg.MarketSpot)
+	if err := state.CacheExSymbolChecked(&ExSymbol{
+		ID: 7, Exchange: "runtime", Market: banexg.MarketSpot, Symbol: "BOUND/USDT",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q := NewWithStorage(nil, NewStorage(nil, true, "storage:get-adjs-options")).WithSeriesSymbolState(state)
+	if _, err := q.GetAdjs(7); err == nil || !strings.Contains(err.Error(), "K-line runtime options") {
+		t.Fatalf("GetAdjs error = %v, want missing K-line runtime options error", err)
+	}
+}
+
+func TestExplicitSeriesQueryRequiresKlineRuntimeOptions(t *testing.T) {
+	state := NewSymbolStateWithIdentity("runtime", banexg.MarketSpot)
+	exs := &ExSymbol{ID: 7, Exchange: "runtime", Market: banexg.MarketSpot, Symbol: "BOUND/USDT"}
+	if err := state.CacheExSymbolChecked(exs); err != nil {
+		t.Fatal(err)
+	}
+	q := NewWithStorage(nil, NewStorage(nil, true, "storage:series-options")).WithSeriesSymbolState(state)
+	if _, err := q.QuerySeriesFields(exs, "1m", nil, 1, 2, 0, false); err == nil || !strings.Contains(err.Error(), "K-line runtime options") {
+		t.Fatalf("QuerySeriesFields error = %v, want missing K-line runtime options error", err)
+	}
+}
+
+func TestExplicitKlineRuntimeRequiresClockForQueryAndWrite(t *testing.T) {
+	state := NewSymbolStateWithIdentity("runtime", banexg.MarketSpot)
+	exs := &ExSymbol{ID: 7, Exchange: "runtime", Market: banexg.MarketSpot, Symbol: "BOUND/USDT"}
+	if err := state.CacheExSymbolChecked(exs); err != nil {
+		t.Fatal(err)
+	}
+	exchange := &listDateExchange{info: &banexg.ExgInfo{ID: "runtime", MarketType: banexg.MarketSpot}}
+	q := NewWithStorage(nil, NewStorage(nil, true, "storage:missing-clock")).
+		WithSeriesSymbolState(state).
+		WithExchange(exchange).
+		WithKlineRuntimeOptions(KlineRuntimeOptions{})
+	if _, err := q.QuerySeriesFields(exs, "1m", nil, 1, 2, 0, false); err == nil ||
+		err.Code != core.ErrBadConfig || !strings.Contains(err.Error(), "runtime clock") {
+		t.Fatalf("QuerySeriesFields error = %v, want missing runtime clock error", err)
+	}
+	if err := q.SetUnfinish(exs.ID, "1m", 2, nil); err == nil ||
+		err.Code != core.ErrBadConfig || !strings.Contains(err.Error(), "runtime clock") {
+		t.Fatalf("SetUnfinish error = %v, want missing runtime clock error", err)
+	}
+	wantClockErr := func(name string, err *errs.Error) {
+		t.Helper()
+		if err == nil || err.Code != core.ErrBadConfig || !strings.Contains(err.Error(), "runtime clock") {
+			t.Fatalf("%s error = %v, want missing runtime clock error", name, err)
+		}
+	}
+	_, insertErr := q.InsertKLines("1m", exs.ID, []*banexg.Kline{{Time: 1}})
+	wantClockErr("InsertKLines", insertErr)
+	_, insertAutoErr := q.InsertKLinesAuto("1m", exs, []*banexg.Kline{{Time: 1}}, false)
+	wantClockErr("InsertKLinesAuto", insertAutoErr)
+	_, seriesErr := q.InsertOHLCVSeries("1m", exs.ID, []*DataSeries{{Sid: exs.ID, TimeMS: 1}})
+	wantClockErr("InsertOHLCVSeries", seriesErr)
+	_, seriesAutoErr := q.InsertOHLCVSeriesAuto("1m", exs, []*DataSeries{{Sid: exs.ID, TimeMS: 1}}, false)
+	wantClockErr("InsertOHLCVSeriesAuto", seriesAutoErr)
+	wantClockErr("UpdateKRange", q.UpdateKRange(exs, "1m", 1, 2, false))
+}
+
+func TestExplicitSeriesQueryRequiresExchangeAdapter(t *testing.T) {
+	state := NewSymbolStateWithIdentity("runtime", banexg.MarketSpot)
+	exs := &ExSymbol{ID: 7, Exchange: "runtime", Market: banexg.MarketSpot, Symbol: "BOUND/USDT"}
+	if err := state.CacheExSymbolChecked(exs); err != nil {
+		t.Fatal(err)
+	}
+	q := NewWithStorage(nil, NewStorage(nil, true, "storage:series-exchange")).
+		WithSeriesSymbolState(state).
+		WithKlineRuntimeOptions(KlineRuntimeOptions{NowMS: 123, ClockValid: true})
+	if _, err := q.QuerySeriesFields(exs, "1m", nil, 1, 2, 0, false); err == nil || !strings.Contains(err.Error(), "exchange adapter") {
+		t.Fatalf("QuerySeriesFields error = %v, want missing exchange adapter error", err)
 	}
 }
 

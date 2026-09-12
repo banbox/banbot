@@ -129,6 +129,14 @@ func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 // on the supplied state. Custom filters without the optional state-aware
 // interface continue through their existing IFilter method.
 func RefreshPairListWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, timeMS int64) ([]string, *errs.Error) {
+	if state != nil {
+		// SymbolState does not carry the runtime configuration, filter registry,
+		// or core admission state. Do not silently fill those from package
+		// globals; callers with an explicit Runtime must use the complete typed
+		// dependency path below.
+		return nil, errs.NewMsg(core.ErrBadConfig,
+			"explicit pair refresh requires complete runtime dependencies")
+	}
 	if exchange == nil {
 		exchange = exg.Default
 	}
@@ -198,23 +206,13 @@ func RefreshPairListWithSymbolState(state *orm.SymbolState, exchange banexg.BanE
 		pairs = pairs[:mgrCfg.Limit]
 	}
 
-	core.Pairs = nil
-	core.PairsMap = make(map[string]bool)
-	for _, p := range pairs {
-		core.Pairs = append(core.Pairs, p)
-		core.PairsMap[p] = true
-	}
+	additional := make([]string, 0)
 	for _, p := range config.RunPolicy {
 		for _, pair := range p.Pairs {
-			core.PairsMap[pair] = true
+			additional = append(additional, pair)
 		}
 	}
-
-	for pair := range core.BanPairsUntil {
-		if _, ok := core.PairsMap[pair]; !ok {
-			delete(core.BanPairsUntil, pair)
-		}
-	}
+	core.SetLegacyPairs(pairs, additional)
 	return pairs, nil
 }
 

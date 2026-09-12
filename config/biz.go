@@ -693,10 +693,8 @@ func GetStaticPairs() ([]string, bool) {
 }
 
 func GetTakeOverTF(pair, defTF string) string {
-	if pairMap, ok := core.StgPairTfs[TakeOverStrat]; ok {
-		if tf, ok := pairMap[pair]; ok {
-			return tf
-		}
+	if tf, ok := core.LegacyStrategyTimeFrame(TakeOverStrat, pair); ok {
+		return tf
 	}
 	return defTF
 }
@@ -1253,6 +1251,18 @@ func cloneStringMap(src map[string]interface{}) map[string]interface{} {
 }
 
 func cloneAccountConfigs(src map[string]*AccountConfig) map[string]*AccountConfig {
+	return cloneAccountConfigsWithStake(src, false)
+}
+
+// CloneAccountConfigsForRuntime copies account configuration for a Runtime
+// owner while preserving the execution-owned stake amount. The ordinary
+// configuration snapshot intentionally clears StakePctAmt because that field
+// is mutable runtime state in the legacy/hyper-opt lifecycle.
+func CloneAccountConfigsForRuntime(src map[string]*AccountConfig) map[string]*AccountConfig {
+	return cloneAccountConfigsWithStake(src, true)
+}
+
+func cloneAccountConfigsWithStake(src map[string]*AccountConfig, preserveStakePctAmt bool) map[string]*AccountConfig {
 	if src == nil {
 		return nil
 	}
@@ -1263,7 +1273,9 @@ func cloneAccountConfigs(src map[string]*AccountConfig) map[string]*AccountConfi
 			continue
 		}
 		item := *account
-		item.StakePctAmt = 0
+		if !preserveStakePctAmt {
+			item.StakePctAmt = 0
+		}
 		item.RPCChannels = make([]map[string]interface{}, len(account.RPCChannels))
 		for i, channel := range account.RPCChannels {
 			item.RPCChannels[i] = cloneStringMap(channel)
@@ -1376,23 +1388,44 @@ func (c *RunPolicyConfig) PairDup(pair string) (*RunPolicyConfig, bool) {
 	return res, isDiff
 }
 
-func (a *AccountConfig) GetApiSecret() *ApiSecretConfig {
+// GetApiSecretFor selects credentials using the supplied exchange and
+// environment. Explicit Runtime construction must use this method so it does
+// not depend on the process-wide config.Exchange or core.RunEnv values.
+func (a *AccountConfig) GetApiSecretFor(exchangeName, env string) *ApiSecretConfig {
 	if a == nil || len(a.Exchanges) == 0 {
 		return &ApiSecretConfig{}
 	}
-	cfg, _ := a.Exchanges[Exchange.Name]
+	cfg, _ := a.Exchanges[exchangeName]
 	if cfg != nil {
-		if core.RunEnv != core.RunEnvTest && cfg.Prod != nil {
+		if env != core.RunEnvTest && cfg.Prod != nil {
 			return cfg.Prod
-		} else if core.RunEnv == core.RunEnvTest && cfg.Test != nil {
+		} else if env == core.RunEnvTest && cfg.Test != nil {
 			return cfg.Test
 		}
 	}
 	return &ApiSecretConfig{}
 }
 
+// GetApiSecret is the legacy facade. New Runtime code should pass its own
+// exchange and environment to GetApiSecretFor instead.
+func (a *AccountConfig) GetApiSecret() *ApiSecretConfig {
+	exchangeName := ""
+	if Exchange != nil {
+		exchangeName = Exchange.Name
+	}
+	return a.GetApiSecretFor(exchangeName, core.RunEnv)
+}
+
 func LoadPerfs(inDir string) {
-	if StratPerf == nil || !StratPerf.Enable {
+	LoadPerfsWithCoreState(inDir, nil, StratPerf)
+}
+
+// LoadPerfsWithCoreState loads persisted strategy performance into the
+// supplied runtime state. Passing a non-nil state and configuration keeps an
+// explicit run independent from the process-wide performance facade; nil
+// state retains the legacy behavior.
+func LoadPerfsWithCoreState(inDir string, state *core.State, perfCfg *StratPerfConfig) {
+	if perfCfg == nil || !perfCfg.Enable {
 		return
 	}
 	inPath := fmt.Sprintf("%s/strat_perfs.yml", inDir)
@@ -1411,14 +1444,16 @@ func LoadPerfs(inDir string) {
 		log.Error("unmarshal strat_perfs fail", zap.Error(err_))
 		return
 	}
+	loadedSta := make(map[string]*core.PerfSta, len(unpak))
+	loadedPerfs := make(map[string]*core.JobPerf)
 	for strat, cfg := range unpak {
 		sta := &core.PerfSta{}
-		err_ = mapstructure.Decode(cfg, &sta)
+		err_ = mapstructure.Decode(cfg, sta)
 		if err_ != nil {
 			log.Error(fmt.Sprintf("decode %s fail", strat), zap.Error(err_))
 			continue
 		}
-		core.StratPerfSta[strat] = sta
+		loadedSta[strat] = sta
 		perfVal, ok := cfg["perf"]
 		if ok && perfVal != nil {
 			var perf = map[string]string{}
@@ -1429,16 +1464,39 @@ func LoadPerfs(inDir string) {
 			}
 			for pairTf, arrStr := range perf {
 				arr := strings.Split(arrStr, "|")
+				if len(arr) < 3 {
+					log.Error(fmt.Sprintf("decode %s.%s fail: invalid performance value", strat, pairTf))
+					continue
+				}
 				num, _ := strconv.Atoi(arr[0])
 				profit, _ := strconv.ParseFloat(arr[1], 64)
 				score, _ := strconv.ParseFloat(arr[2], 64)
-				core.JobPerfs[fmt.Sprintf("%s_%s", strat, pairTf)] = &core.JobPerf{
+				loadedPerfs[fmt.Sprintf("%s_%s", strat, pairTf)] = &core.JobPerf{
 					Num:       num,
 					TotProfit: profit,
 					Score:     score,
 				}
 			}
 		}
+	}
+	if state != nil {
+		state.WithPerformance(func(jobPerfs map[string]*core.JobPerf, stratPerfSta map[string]*core.PerfSta) {
+			for key, sta := range loadedSta {
+				stratPerfSta[key] = sta
+			}
+			for key, perf := range loadedPerfs {
+				jobPerfs[key] = perf
+			}
+		})
+	} else {
+		core.WithLegacyPerformance(func(jobPerfs map[string]*core.JobPerf, stratPerfSta map[string]*core.PerfSta) {
+			for key, sta := range loadedSta {
+				stratPerfSta[key] = sta
+			}
+			for key, perf := range loadedPerfs {
+				jobPerfs[key] = perf
+			}
+		})
 	}
 	log.Info("load strat_perfs ok", zap.String("path", inPath))
 }

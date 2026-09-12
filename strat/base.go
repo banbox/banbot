@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/banbox/banbot/com"
 
@@ -34,7 +35,8 @@ func (s *TradeStrat) GetStakeAmount(j *StratJob) float64 {
 		account = j.Account
 	}
 	if cfg := s.runtimeConfigFor(j); cfg != nil {
-		amount = runtimeStakeAmount(cfg, account)
+		accounts, accountsMu := s.runtimeAccountsFor(j)
+		amount = runtimeStakeAmount(cfg, accounts, accountsMu, account)
 	} else {
 		amount = config.GetStakeAmount(account)
 	}
@@ -47,12 +49,14 @@ func (s *TradeStrat) GetStakeAmount(j *StratJob) float64 {
 	if j != nil && j.Strat != nil && j.Symbol != nil {
 		key = core.KeyStratPairTf(j.Strat.Name, j.Symbol.Symbol, j.TimeFrame)
 	}
-	perfs := core.JobPerfs
+	var pref core.JobPerf
+	var hasPref bool
 	if j != nil && j.runtimeCore != nil {
-		perfs = j.runtimeCore.JobPerfs
+		pref, hasPref = j.runtimeCore.JobPerfValue(key)
+	} else {
+		pref, hasPref = core.LegacyJobPerfValue(key)
 	}
-	pref, _ := perfs[key]
-	if pref != nil {
+	if hasPref {
 		amount = pref.GetAmount(amount)
 	}
 	return amount
@@ -68,12 +72,31 @@ func (s *TradeStrat) runtimeConfigFor(j *StratJob) *config.Config {
 	return nil
 }
 
-func runtimeStakeAmount(cfg *config.Config, account string) float64 {
+func (s *TradeStrat) runtimeAccountsFor(j *StratJob) (map[string]*config.AccountConfig, *sync.RWMutex) {
+	if j != nil && j.strategyState != nil && j.strategyState != legacyState {
+		if j.strategyState.runtimeAccounts != nil {
+			return j.strategyState.runtimeAccounts, j.strategyState.runtimeAccountsMu
+		}
+	}
+	if s != nil {
+		return s.runtimeAccounts, s.runtimeAccountsMu
+	}
+	return nil, nil
+}
+
+func runtimeStakeAmount(cfg *config.Config, accounts map[string]*config.AccountConfig, accountsMu *sync.RWMutex, account string) float64 {
 	if cfg == nil {
 		return 0
 	}
+	if accountsMu != nil {
+		accountsMu.RLock()
+		defer accountsMu.RUnlock()
+	}
 	amount := cfg.StakeAmount
-	if acc, ok := cfg.Accounts[account]; ok && acc != nil {
+	if accounts == nil {
+		accounts = cfg.Accounts
+	}
+	if acc, ok := accounts[account]; ok && acc != nil {
 		if acc.StakePctAmt > 0 {
 			amount = acc.StakePctAmt
 		}

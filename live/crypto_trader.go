@@ -400,7 +400,11 @@ func (t *CryptoTrader) Init() *errs.Error {
 			return err
 		}
 	}
-	if t.RuntimeDependencies() == nil {
+	if deps := t.RuntimeDependencies(); deps != nil {
+		if cfg := deps.ConfigView(); cfg != nil {
+			config.LoadPerfsWithCoreState(deps.Config.DataDir, deps.Core, cfg.StratPerf)
+		}
+	} else {
 		config.LoadPerfs(config.GetDataDir())
 	}
 	if t.envReal() {
@@ -592,6 +596,10 @@ func (t *CryptoTrader) refreshPairJobs(isFirst bool) *errs.Error {
 	}
 	state := t.coreStateForRun()
 	if state == nil {
+		if t.symbols != nil || t.dataDeps != nil {
+			return errs.NewMsg(core.ErrBadConfig,
+				"explicit live pair refresh requires complete runtime dependencies")
+		}
 		// Preserve the public legacy path for callers that have no Runtime.
 		return opt.RefreshPairJobsWithSymbolState(t.provider(), t.symbols, true, isFirst, nil)
 	}

@@ -74,15 +74,25 @@ func (info *WsSymbol) FillDefaults() *errs.Error {
 }
 
 func (info *WsSymbol) fillDefaults(deps *RuntimeDeps) *errs.Error {
-	if info.ExgId == "" {
-		if deps == nil {
-			info.ExgId = config.Exchange.Name
-		} else {
-			info.ExgId, _ = deps.identity()
-			if info.ExgId == "" && deps.exchange() != nil {
-				info.ExgId = deps.exchange().Info().ID
-			}
+	if info == nil {
+		return errs.NewMsg(errs.CodeParamInvalid, "ws symbol is nil")
+	}
+	runtimeExg, runtimeMarket := "", ""
+	if deps != nil {
+		runtimeExg, runtimeMarket = deps.identity()
+		if runtimeExg == "" || runtimeMarket == "" {
+			return errs.NewMsg(core.ErrBadConfig, "complete runtime exchange and market identity is required")
 		}
+		if info.ExgId != "" && info.ExgId != runtimeExg {
+			return errs.NewMsg(core.ErrBadConfig, "ws symbol exchange %q does not match runtime %q", info.ExgId, runtimeExg)
+		}
+		if info.Market != "" && info.Market != runtimeMarket {
+			return errs.NewMsg(core.ErrBadConfig, "ws symbol market %q does not match runtime %q", info.Market, runtimeMarket)
+		}
+		info.ExgId = runtimeExg
+	}
+	if deps == nil && info.ExgId == "" {
+		info.ExgId = config.Exchange.Name
 	}
 	if info.RawSymbol == "" || info.Market == "" {
 		var exchange banexg.BanExchange
@@ -101,6 +111,12 @@ func (info *WsSymbol) fillDefaults(deps *RuntimeDeps) *errs.Error {
 		mkt, err := exchange.GetMarket(info.Symbol)
 		if err != nil {
 			return err
+		}
+		if mkt == nil {
+			return errs.NewMsg(core.ErrInvalidSymbol, "market %q was not resolved", info.Symbol)
+		}
+		if deps != nil && mkt.Type != runtimeMarket {
+			return errs.NewMsg(core.ErrBadConfig, "resolved market %q does not match runtime %q", mkt.Type, runtimeMarket)
 		}
 		info.Market = mkt.Type
 		info.RawSymbol = mkt.ID

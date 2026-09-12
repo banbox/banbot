@@ -13,7 +13,6 @@ import (
 
 	"github.com/sasha-s/go-deadlock"
 
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
@@ -133,6 +132,10 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 	if startMS <= 0 || endMS <= startMS {
 		return nil
 	}
+	options, optionsErr := q.requireKlineRuntimeOptions()
+	if optionsErr != nil {
+		return optionsErr
+	}
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	barTimes, err := q.getKLineTimes(sid, timeFrame, startMS, endMS)
 	if err != nil {
@@ -170,7 +173,7 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 			}
 			prevTime = t
 		}
-		maxEnd := utils2.AlignTfMSecs(btime.UTCStamp(), tfMSecs) - tfMSecs
+		maxEnd := utils2.AlignTfMSecs(options.nowMS(), tfMSecs) - tfMSecs
 		if maxEnd-prevTime > tfMSecs*5 && endMS-prevTime > tfMSecs {
 			holes = append(holes, MSRange{Start: prevTime + tfMSecs, Stop: min(endMS, maxEnd)})
 		}
@@ -191,9 +194,16 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 		log.Warn("no ExSymbol found", zap.Int32("sid", sid))
 		return nil
 	}
-	exchange, err := exg.GetWith(exs.Exchange, exs.Market, "")
-	if err != nil {
-		return err
+	exchange := q.exchange
+	if exchange == nil {
+		if q.usesExplicitExchange() {
+			return errs.NewMsg(core.ErrExgNotInit, "explicit query requires an exchange adapter")
+		}
+		var err *errs.Error
+		exchange, err = exg.GetWith(exs.Exchange, exs.Market, "")
+		if err != nil {
+			return err
+		}
 	}
 	susp, err := GetExSHoles(exchange, exs, startMS, endMS, true)
 	if err != nil {
@@ -391,7 +401,7 @@ func getUnFinish(sess *Queries, sid int32, timeFrame string, startMS, endMS int6
 		barEndMS = startMS + tfMSecs
 	}
 
-	nowMS := btime.UTCStamp()
+	nowMS := sess.klineRuntimeOptions().nowMS()
 	if barEndMS > 0 {
 		nowMS = min(nowMS, barEndMS)
 	}
@@ -521,7 +531,7 @@ order by ts`, sid, startMS*1000, endMS*1000)
 	toTfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 	fromTfMSecs := int64(utils2.TFToSecs(subTF) * 1000)
 	exs := sess.symbolByID(sid)
-	offMS := seriesAlignOff(exs, toTfMSecs)
+	offMS := sess.alignOff(exs, toTfMSecs)
 	if offMS == 0 && exs == nil && sess.usesLegacySymbolCatalog() {
 		offMS = GetAlignOff(sid, toTfMSecs)
 	}
@@ -624,12 +634,16 @@ func GetAlignOff(sid int32, toTfMSecs int64) int64 {
 }
 
 func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
+	options, optionsErr := q.requireKlineRuntimeOptions()
+	if optionsErr != nil {
+		return optionsErr
+	}
 	if !q.isQuestDB() {
-		return q.setUnfinishPg(sid, tf, endMS, bar)
+		return q.setUnfinishPg(sid, tf, endMS, bar, options)
 	}
 	unlock := q.LockCompactTableRead("kline_un_q")
 	defer unlock()
-	expireMS := utils2.AlignTfMSecs(btime.UTCStamp(), 60000) + 60000
+	expireMS := utils2.AlignTfMSecs(options.nowMS(), 60000) + 60000
 	ts := time.UnixMilli(bar.Time).UTC()
 	ctx := context.Background()
 	_, err := q.db.Exec(ctx, `INSERT INTO kline_un_q
@@ -653,6 +667,9 @@ func (q *Queries) InsertKLines(timeFrame string, sid int32, arr []*banexg.Kline)
 	arrLen := len(arr)
 	if arrLen == 0 {
 		return 0, nil
+	}
+	if _, err := q.requireKlineRuntimeOptions(); err != nil {
+		return 0, err
 	}
 	if !q.isQuestDB() {
 		return insertKLinesPg(q, timeFrame, sid, arr)
@@ -731,6 +748,9 @@ Before calling this method, it is necessary to determine whether it already exis
 func (q *Queries) InsertKLinesAuto(timeFrame string, exs *ExSymbol, arr []*banexg.Kline, aggBig bool) (int64, *errs.Error) {
 	if len(arr) == 0 {
 		return 0, nil
+	}
+	if _, err := q.requireKlineRuntimeOptions(); err != nil {
+		return 0, err
 	}
 	tblName := "kline_" + timeFrame
 	unlock, lockErr := q.tableReadLock(context.Background(), tblName)
@@ -815,6 +835,9 @@ UpdateKRange
 3. 更新更大周期的连续聚合
 */
 func (q *Queries) UpdateKRange(exs *ExSymbol, timeFrame string, startMS, endMS int64, aggBig bool, skipHoles ...bool) *errs.Error {
+	if _, err := q.requireKlineRuntimeOptions(); err != nil {
+		return err
+	}
 	// Record data ranges in sranges (non-contiguous allowed).
 	if err := q.updateKLineRange(exs.ID, timeFrame, startMS, endMS); err != nil {
 		return err
@@ -996,7 +1019,7 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 		return nil
 	}
 	fromTfMSecs := int64(utils2.TFToSecs(aggFrom) * 1000)
-	offMS := seriesAlignOff(exs, tfMSecs)
+	offMS := q.alignOff(exs, tfMSecs)
 	aggBars, lastFinish, err := ResampleDataSeries(exs, item.TimeFrame, src, nil, tfMSecs, 0, fromTfMSecs, offMS, false)
 	if err != nil {
 		return errs.New(core.ErrInvalidBars, err)
@@ -1510,8 +1533,14 @@ func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.E
 			return err
 		}
 		defer conn.Release()
+		if sess.exchange != nil {
+			sess2 = sess2.WithExchange(sess.exchange)
+		}
 		if sess.symbols != nil {
 			sess2 = sess2.WithSeriesSymbolState(sess.symbols)
+		}
+		if sess.options != nil {
+			sess2 = sess2.WithKlineRuntimeOptions(*sess.options)
 		}
 		err = sess2.syncKlineSid(sid, calcs)
 		pBar.Add(len(aggList))

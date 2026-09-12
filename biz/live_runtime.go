@@ -4,7 +4,6 @@ import (
 	"math"
 	"sort"
 
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
@@ -74,9 +73,7 @@ func MakeCheckFatalStopWithRuntime(deps RuntimeDeps, fatal map[int]float64, fata
 	if fatalHours <= 0 {
 		fatalHours = 8
 	}
-	if nowMS == nil {
-		nowMS = btime.TimeMS
-	}
+	nowMS = runtimeFatalStopClock(deps, nowMS)
 	intervals := make([]int, 0, len(fatal))
 	for interval := range fatal {
 		if interval > 0 {
@@ -85,7 +82,7 @@ func MakeCheckFatalStopWithRuntime(deps RuntimeDeps, fatal map[int]float64, fata
 	}
 	sort.Ints(intervals)
 	return func() {
-		if deps.Core == nil || deps.Orders == nil || deps.Trading == nil || len(intervals) == 0 {
+		if deps.Core == nil || deps.Orders == nil || deps.Trading == nil || nowMS == nil || len(intervals) == 0 {
 			return
 		}
 		accounts := deps.AccountConfigs()
@@ -96,6 +93,16 @@ func MakeCheckFatalStopWithRuntime(deps RuntimeDeps, fatal map[int]float64, fata
 			checkRuntimeFatalStop(deps, account, fatal, fatalHours, intervals, nowMS)
 		}
 	}
+}
+
+func runtimeFatalStopClock(deps RuntimeDeps, nowMS func() int64) func() int64 {
+	if nowMS != nil {
+		return nowMS
+	}
+	if deps.Clock != nil {
+		return deps.Clock.TimeMS
+	}
+	return nil
 }
 
 func checkRuntimeFatalStop(deps RuntimeDeps, account string, fatal map[int]float64, fatalHours int,

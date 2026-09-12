@@ -54,22 +54,23 @@ type ItemWallet struct {
 }
 
 type BanWallets struct {
-	Items           map[string]*ItemWallet
-	Account         string
-	IsWatch         bool
-	runtimeSymbols  *orm.SymbolState
-	runtimeExg      banexg.BanExchange
-	runtimeCore     *core.State
-	runtimeClock    *btime.ClockState
-	runtimePrices   *com.PriceState
-	runtimeConfig   *config.Snapshot
-	runtimeAccounts map[string]*config.AccountConfig
-	runtimeBacktest bool
-	runtimeBTLegacy bool
-	runtimeBTStrict bool
-	runtimeCharge   bool
-	runtimeMargin   float64
-	runtimeBound    bool
+	Items             map[string]*ItemWallet
+	Account           string
+	IsWatch           bool
+	runtimeSymbols    *orm.SymbolState
+	runtimeExg        banexg.BanExchange
+	runtimeCore       *core.State
+	runtimeClock      *btime.ClockState
+	runtimePrices     *com.PriceState
+	runtimeConfig     *config.Snapshot
+	runtimeAccounts   map[string]*config.AccountConfig
+	runtimeAccountsMu *sync.RWMutex
+	runtimeBacktest   bool
+	runtimeBTLegacy   bool
+	runtimeBTStrict   bool
+	runtimeCharge     bool
+	runtimeMargin     float64
+	runtimeBound      bool
 }
 
 type walletSnapshotCompactCfg struct {
@@ -251,6 +252,7 @@ func (w *BanWallets) bindRuntimeDeps(deps RuntimeDeps) {
 	}
 	w.runtimeConfig = deps.Config
 	w.runtimeAccounts = deps.AccountConfigs()
+	w.runtimeAccountsMu = deps.AccountsMu
 	w.runtimeBacktest = deps.Core != nil && deps.Core.BackTestMode
 	w.runtimeBTLegacy = false
 	w.runtimeBTStrict = false
@@ -623,6 +625,10 @@ func startLiveWalletSnapshotsForDeps(deps *RuntimeDeps, lifecycle WalletRuntimeL
 	}
 	if deps != nil && deps.Trading == nil {
 		log.Error("runtime wallet snapshots require trading state")
+		return
+	}
+	if deps != nil && deps.Clock == nil {
+		log.Error("runtime wallet snapshots require clock")
 		return
 	}
 	ctx := lifecycle.Context()
@@ -1682,10 +1688,6 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 		if cfg == nil || cfg.StakePct <= 0 {
 			return
 		}
-		acc := w.runtimeAccounts[w.Account]
-		if acc == nil {
-			return
-		}
 		rawLegal := w.TotalLegal(nil, true)
 		legalValue := rawLegal
 		isContract := w.runtimeCore != nil && banexg.IsContract(w.runtimeCore.Market)
@@ -1693,6 +1695,14 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 			legalValue *= cfg.Leverage
 		}
 		pctAmt := math.Round(legalValue*cfg.StakePct/1000) * 10
+		if w.runtimeAccountsMu != nil {
+			w.runtimeAccountsMu.Lock()
+			defer w.runtimeAccountsMu.Unlock()
+		}
+		acc := w.runtimeAccounts[w.Account]
+		if acc == nil {
+			return
+		}
 		if acc.StakePctAmt == 0 {
 			log.Debug("set runtime StakePctAmt by stake_pct", zap.Float64("totalLegal", rawLegal),
 				zap.Float64("amount", pctAmt))

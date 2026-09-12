@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/banbox/banbot/biz"
@@ -58,6 +59,9 @@ type BackTest struct {
 	historicalCloseMS    []int64
 	historicalCloseIndex int
 	outputOwned          bool
+	schedulerMu          sync.Mutex
+	runScheduler         com.Scheduler
+	runSchedulerOwned    bool
 }
 
 func (b *BackTest) SetAfterBacktest(callback func(*BackTest)) {
@@ -311,13 +315,16 @@ func bindDataRuntimeDeps(traderDeps *biz.RuntimeDeps, symbols *orm.SymbolState, 
 	if bound.MarketType == "" && bound.Core != nil {
 		bound.MarketType = bound.Core.Market
 	}
-	if bound.Exchange != nil && (bound.ExchangeName == "" || bound.MarketType == "") {
-		if info := bound.Exchange.Info(); info != nil {
+	if bound.IdentityErr == nil && bound.Exchange != nil {
+		name, market, err := bound.ResolveIdentity()
+		if err != nil {
+			bound.IdentityErr = err
+		} else {
 			if bound.ExchangeName == "" {
-				bound.ExchangeName = info.ID
+				bound.ExchangeName = name
 			}
 			if bound.MarketType == "" {
-				bound.MarketType = info.MarketType
+				bound.MarketType = market
 			}
 		}
 	}
@@ -539,7 +546,7 @@ func (b *BackTestLite) runtimeCore() *core.State {
 
 func (b *BackTestLite) setCheckWallets(check bool) {
 	if state := b.runtimeCore(); state != nil {
-		state.CheckWallets = check
+		state.SetCheckWallets(check)
 		return
 	}
 	core.CheckWallets = check
@@ -547,14 +554,14 @@ func (b *BackTestLite) setCheckWallets(check bool) {
 
 func (b *BackTestLite) checkWallets() bool {
 	if state := b.runtimeCore(); state != nil {
-		return state.CheckWallets
+		return state.ShouldCheckWallets()
 	}
 	return core.CheckWallets
 }
 
 func (b *BackTestLite) botRunning() bool {
 	if state := b.runtimeCore(); state != nil {
-		return state.BotRunning
+		return state.IsBotRunning()
 	}
 	return core.BotRunning
 }
@@ -771,6 +778,9 @@ func validateDataRuntimeDeps(deps *biz.RuntimeDeps, symbols *orm.SymbolState, su
 	if deps == nil || supplied == nil {
 		return nil
 	}
+	if supplied.IdentityErr != nil {
+		return errs.New(core.ErrRunTime, supplied.IdentityErr)
+	}
 	if supplied.Core != nil && supplied.Core != deps.Core {
 		return errs.NewMsg(core.ErrRunTime, "data runtime core does not match trader runtime")
 	}
@@ -849,6 +859,9 @@ func newBackTest(trader biz.Trader, symbols *orm.SymbolState, isOpt bool, outDir
 	}
 	if snapshot := b.runSnapshot(); snapshot != nil {
 		b.OutDir = snapshot.ParsePath(outDir)
+		if cfg := b.runConfig(); cfg != nil {
+			config.LoadPerfsWithCoreState(snapshot.DataDir, b.runtimeCore(), cfg.StratPerf)
+		}
 	} else {
 		b.OutDir = config.ParsePath(outDir)
 		config.LoadPerfs(config.GetDataDir())
@@ -857,6 +870,12 @@ func newBackTest(trader biz.Trader, symbols *orm.SymbolState, isOpt bool, outDir
 }
 
 func (b *BackTest) Init() *errs.Error {
+	if b != nil && b.BackTestLite != nil && b.BackTestLite.runErr != nil {
+		// Runtime dependency binding errors are recorded by the lite runner so
+		// its constructor remains source-compatible. Surface them before any
+		// listing, provider, or adapter operation can run.
+		return b.BackTestLite.runErr
+	}
 	cfg := b.runConfig()
 	runRange := b.runTimeRange()
 	if cfg == nil || runRange == nil {
@@ -1204,7 +1223,7 @@ func (b *BackTest) Run() *errs.Error {
 	}
 	err = b.resolveLoopError(loopMainFn())
 	if !b.isOpt {
-		b.schedulerForRun().Stop()
+		b.stopRunScheduler()
 	}
 	if err != nil {
 		log.Error("backtest loop fail", zap.Error(err))
@@ -1364,23 +1383,66 @@ func (b *BackTest) cronDumpBtStatus() {
 }
 
 func (b *BackTest) schedulerForRun() com.Scheduler {
-	if b != nil {
-		if deps := b.RuntimeDependencies(); deps != nil && deps.Scheduler != nil {
-			return deps.Scheduler
+	if b == nil {
+		return com.Cron()
+	}
+	b.schedulerMu.Lock()
+	defer b.schedulerMu.Unlock()
+	if b.runScheduler != nil {
+		return b.runScheduler
+	}
+	if deps := b.RuntimeDependencies(); deps != nil {
+		if deps.Scheduler != nil {
+			b.runScheduler = deps.Scheduler
+			// A scheduler supplied through RuntimeDeps belongs to its caller
+			// (normally Runtime). BackTest may add jobs and start it, but must
+			// leave shutdown to the scheduler owner so another runner sharing
+			// the Runtime cannot be stopped early.
+			b.runSchedulerOwned = false
+			return b.runScheduler
 		}
-		if deps := b.RuntimeDependencies(); deps != nil {
-			location := time.UTC
-			lang := ""
-			if deps.Config != nil {
-				location = deps.Config.Location()
-				if cfg := deps.Config.View(); cfg != nil {
-					lang = cfg.NTPLangCode
-				}
+		location := time.UTC
+		lang := ""
+		if deps.Config != nil {
+			location = deps.Config.Location()
+			if cfg := deps.Config.View(); cfg != nil {
+				lang = cfg.NTPLangCode
 			}
-			return com.NewSchedulerWithConfig(location, lang)
+		}
+		// Keep the fallback private to this BackTest. Run, status-dump, and
+		// cleanup must all address the same scheduler instance.
+		b.runScheduler = com.NewSchedulerWithConfig(location, lang)
+		b.runSchedulerOwned = true
+		return b.runScheduler
+	}
+	// Preserve the legacy facade's existing lifecycle: a backtest started
+	// without explicit Runtime dependencies is the owner of the process-wide
+	// scheduler it starts. Explicit Runtime schedulers take the external-owner
+	// path above instead.
+	b.runScheduler = com.Cron()
+	b.runSchedulerOwned = true
+	return b.runScheduler
+}
+
+func (b *BackTest) ownsRunScheduler() bool {
+	if b == nil {
+		return false
+	}
+	b.schedulerMu.Lock()
+	defer b.schedulerMu.Unlock()
+	return b.runSchedulerOwned
+}
+
+func (b *BackTest) stopRunScheduler() {
+	if b == nil || !b.ownsRunScheduler() {
+		return
+	}
+	if scheduler := b.schedulerForRun(); scheduler != nil {
+		stop := scheduler.Stop()
+		if stop != nil && stop.Done() != nil {
+			<-stop.Done()
 		}
 	}
-	return com.Cron()
 }
 
 func (b *BackTest) initRefreshCron() *errs.Error {
@@ -1422,6 +1484,10 @@ func RefreshPairJobs(dp data.IProvider, showLog, isFirst bool, pBar *utils.Stage
 // RefreshPairJobsWithSymbolState keeps the pair refresh's symbol subscription
 // set aligned with the provider's runtime-owned symbol state.
 func RefreshPairJobsWithSymbolState(dp data.IProvider, symbols *orm.SymbolState, showLog, isFirst bool, pBar *utils.StagedPrg) *errs.Error {
+	if symbols != nil {
+		return errs.NewMsg(core.ErrBadConfig,
+			"explicit pair refresh requires complete runtime dependencies")
+	}
 	return refreshPairJobsWithRuntimeDeps(dp, symbols, nil, showLog, isFirst, pBar)
 }
 
@@ -1583,14 +1649,7 @@ func syncRuntimeOrderMatchState(state *core.State) {
 	if state == nil {
 		return
 	}
-	core.LockOdMatch.RLock()
-	state.LockOdMatch.Lock()
-	state.OrderMatchTfs = make(map[string]bool, len(core.OrderMatchTfs))
-	for tf, enabled := range core.OrderMatchTfs {
-		state.OrderMatchTfs[tf] = enabled
-	}
-	state.LockOdMatch.Unlock()
-	core.LockOdMatch.RUnlock()
+	state.ReplaceOrderMatchTfs(core.LegacyOrderMatchTfsSnapshot())
 }
 
 /*
@@ -1648,7 +1707,7 @@ func relayUnFinishOrdersWithDeps(pairTfScores map[string]map[string]float64, for
 			return err
 		}
 		warms, _, loadErr := strat.LoadStratJobsWithState(tempDeps.Strategies, tempDeps.Core, symbols,
-			tempDeps.Core.Pairs, pairTfScores, tempDeps.Orders)
+			tempDeps.Core.AdmissionPairs(), pairTfScores, tempDeps.Orders)
 		if loadErr != nil {
 			cleanup()
 			return loadErr
@@ -1685,7 +1744,7 @@ func newRelayRuntime(parent biz.RuntimeDeps, symbols *orm.SymbolState, group *st
 	state.SimOrderMatch = parent.Core.SimOrderMatch
 	state.ParallelOnBar = parent.Core.ParallelOnBar
 	state.NumTaCache, state.ConcurNum = parent.Core.NumTaCache, parent.Core.ConcurNum
-	state.SetPairs(parent.Core.Pairs, nil)
+	state.SetPairs(parent.Core.AdmissionPairs(), nil)
 	clock := btime.NewClockState(true, parent.Config.Location())
 	clock.SetTimeMS(group.StartMS)
 	market := com.NewMarketStateWithExchange(state.ExgName, parent.Exchange)
@@ -1896,7 +1955,7 @@ func relayUnFinishOrdersLegacy(pairTfScores map[string]map[string]float64, forbi
 			if err != nil {
 				return err
 			}
-			warms, _, err := strat.LoadStratJobsWithSymbolState(symbols, core.Pairs, pairTfScores)
+			warms, _, err := strat.LoadStratJobsWithSymbolState(symbols, core.LegacyAdmissionPairs(), pairTfScores)
 			if err != nil {
 				return err
 			}

@@ -340,6 +340,19 @@ func (s *SymbolState) Storage() *Storage {
 	return storage
 }
 
+// SIDAllocator returns the process-owned allocator bound to this symbol state.
+// It is a typed, read-only identity accessor used by lifecycle owners when
+// deciding whether a failed construction may release shared allocator state.
+func (s *SymbolState) SIDAllocator() *SIDAllocator {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	allocator := s.allocator
+	s.mu.RUnlock()
+	return allocator
+}
+
 func (s *SymbolState) acceptsIdentity(exchange, market string) bool {
 	return s == nil || !s.identitySet || exchange == s.identityExchange && market == s.identityMarket
 }

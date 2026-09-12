@@ -169,7 +169,7 @@ func (s *RemoteCommandService) runTradingSwitch(cmd RemoteCommand) (*RemoteComma
 		if s.deps != nil {
 			s.deps.Core.SetNoEnterUntil(cmd.Account, 0)
 		} else {
-			delete(core.NoEnterUntil, cmd.Account)
+			core.SetLegacyNoEnterUntil(cmd.Account, 0)
 		}
 	} else {
 		untilMS = cmd.UntilMS
@@ -179,7 +179,7 @@ func (s *RemoteCommandService) runTradingSwitch(cmd RemoteCommand) (*RemoteComma
 		if s.deps != nil {
 			s.deps.Core.SetNoEnterUntil(cmd.Account, untilMS)
 		} else {
-			core.NoEnterUntil[cmd.Account] = untilMS
+			core.SetLegacyNoEnterUntil(cmd.Account, untilMS)
 		}
 	}
 	return &RemoteCommandResult{UntilMS: untilMS}, nil

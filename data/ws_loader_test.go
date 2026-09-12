@@ -21,6 +21,21 @@ func (s *wsArchiveExchangeStub) BuildArchiveURL(string, string, string, string) 
 	return s.url, nil
 }
 
+type wsIdentityExchangeStub struct {
+	banexg.BanExchange
+	info          *banexg.ExgInfo
+	getMarketCall int
+}
+
+func (s *wsIdentityExchangeStub) Info() *banexg.ExgInfo {
+	return s.info
+}
+
+func (s *wsIdentityExchangeStub) GetMarket(string) (*banexg.Market, *errs.Error) {
+	s.getMarketCall++
+	return &banexg.Market{Type: banexg.MarketSpot}, nil
+}
+
 func testWsLoaderSymbol() *WsSymbol {
 	return &WsSymbol{
 		ExgId:     "binance",
@@ -140,6 +155,47 @@ func TestWsDataLoaderUnsupportedArchiveReturnsStructuredError(t *testing.T) {
 	info.ExgId = "okx"
 	if _, err := loader.downloadJob(info); err == nil || err.Code != errs.CodeNotSupport {
 		t.Fatalf("download error = %v, want CodeNotSupport", err)
+	}
+}
+
+func TestWsSymbolFillDefaultsRejectsMismatchedRuntimeIdentityBeforeMarketLookup(t *testing.T) {
+	exchange := &wsIdentityExchangeStub{info: &banexg.ExgInfo{ID: "adapter", MarketType: banexg.MarketSpot}}
+	info := &WsSymbol{Symbol: "BTC/USDT"}
+	err := info.fillDefaults(&RuntimeDeps{
+		ExchangeName: "runtime",
+		MarketType:   banexg.MarketSpot,
+		Exchange:     exchange,
+	})
+	if err == nil || err.Code != core.ErrBadConfig {
+		t.Fatalf("fillDefaults error = %v, want bad config", err)
+	}
+	if exchange.getMarketCall != 0 {
+		t.Fatalf("fillDefaults called GetMarket %d times after identity mismatch", exchange.getMarketCall)
+	}
+	if info.ExgId != "" || info.Market != "" {
+		t.Fatalf("fillDefaults mutated mismatched symbol identity to %q/%q", info.ExgId, info.Market)
+	}
+}
+
+func TestWsSymbolFillDefaultsRejectsSymbolIdentityMismatch(t *testing.T) {
+	for name, info := range map[string]*WsSymbol{
+		"exchange": {ExgId: "other", Market: banexg.MarketSpot, RawSymbol: "BTCUSDT", Symbol: "BTC/USDT"},
+		"market":   {ExgId: "runtime", Market: banexg.MarketLinear, RawSymbol: "BTCUSDT", Symbol: "BTC/USDT"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			exchange := &wsIdentityExchangeStub{info: &banexg.ExgInfo{ID: "runtime", MarketType: banexg.MarketSpot}}
+			err := info.fillDefaults(&RuntimeDeps{
+				ExchangeName: "runtime",
+				MarketType:   banexg.MarketSpot,
+				Exchange:     exchange,
+			})
+			if err == nil || err.Code != core.ErrBadConfig {
+				t.Fatalf("fillDefaults error = %v, want bad config", err)
+			}
+			if exchange.getMarketCall != 0 {
+				t.Fatalf("fillDefaults called GetMarket %d times after symbol identity mismatch", exchange.getMarketCall)
+			}
+		})
 	}
 }
 

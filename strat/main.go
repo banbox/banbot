@@ -136,19 +136,16 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 	var tfSecs map[string]int
 	var stgPairTfs map[string]map[string]string
 	if state != nil {
-		tfSecs = state.TFSecs
-		stgPairTfs = state.StgPairTfs
-		state.LockOdMatch.Lock()
-		state.OrderMatchTfs = make(map[string]bool)
-		state.LockOdMatch.Unlock()
+		// Build refresh indexes off to the side, then publish one immutable
+		// replacement. Readers never observe a partially populated nested map.
+		tfSecs = state.TimeFrameSecondsSnapshot()
+		stgPairTfs = state.StrategyTimeFramesSnapshot()
+		defer state.ReplaceTimeFrameState(tfSecs, stgPairTfs)
+		state.ReplaceOrderMatchTfs(nil)
 	} else {
-		core.TFSecs = make(map[string]int)
-		core.StgPairTfs = make(map[string]map[string]string)
-		core.LockOdMatch.Lock()
-		core.OrderMatchTfs = make(map[string]bool)
-		core.LockOdMatch.Unlock()
-		tfSecs = core.TFSecs
-		stgPairTfs = core.StgPairTfs
+		tfSecs, stgPairTfs = core.LegacyTimeFrameStateSnapshot()
+		defer core.ReplaceLegacyTimeFrameState(tfSecs, stgPairTfs)
+		core.ReplaceLegacyOrderMatchTfs(nil)
 	}
 	if strategyState == legacyState {
 		config.ClearRefineMap()
@@ -747,13 +744,9 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 	}
 	if runtimeCore != nil {
 		runtimeCore.EnsureRuntimeMaps()
-		runtimeCore.LockOdMatch.Lock()
-		runtimeCore.OrderMatchTfs[matchTf] = true
-		runtimeCore.LockOdMatch.Unlock()
+		runtimeCore.SetOrderMatchEnabled(matchTf, true)
 	} else if strategyState == legacyState {
-		core.LockOdMatch.Lock()
-		core.OrderMatchTfs[matchTf] = true
-		core.LockOdMatch.Unlock()
+		core.SetLegacyOrderMatchEnabled(matchTf, true)
 	}
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
 	for account := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, state)) {
@@ -953,9 +946,12 @@ func FinalizePairRotation(strategyState *State, coreStates ...*core.State) {
 	var pairTfs map[string]map[string]string
 	if coreState != nil {
 		coreState.EnsureRuntimeMaps()
-		pairTfs = coreState.StgPairTfs
+		pairTfs = coreState.StrategyTimeFramesSnapshot()
+		defer coreState.ReplaceTimeFrameState(coreState.TimeFrameSecondsSnapshot(), pairTfs)
 	} else if strategyState == legacyState {
-		pairTfs = core.StgPairTfs
+		var tfSecs map[string]int
+		tfSecs, pairTfs = core.LegacyTimeFrameStateSnapshot()
+		defer core.ReplaceLegacyTimeFrameState(tfSecs, pairTfs)
 	}
 	finalizedPairs := make(map[string]struct{})
 	lockJobsWriteForState(strategyState)

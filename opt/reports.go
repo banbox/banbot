@@ -292,9 +292,10 @@ func (d *ReportDeps) queries() (*orm.Queries, func(), *errs.Error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		if d.Symbols != nil {
-			queries = queries.WithSeriesSymbolState(d.Symbols)
-		}
+		options := orm.NewKlineRuntimeOptions(d.Core, d.configView(), d.reportNowMS(), d.Storage)
+		queries = queries.WithSeriesSymbolState(d.Symbols).
+			WithExchange(d.Exchange).
+			WithKlineRuntimeOptions(options)
 		return queries, func() {
 			if conn != nil {
 				conn.Release()
@@ -302,6 +303,13 @@ func (d *ReportDeps) queries() (*orm.Queries, func(), *errs.Error) {
 		}, nil
 	}
 	return nil, nil, errs.NewMsg(core.ErrBadConfig, "runtime report storage is required")
+}
+
+func (d *ReportDeps) reportNowMS() int64 {
+	if d != nil && d.Clock != nil {
+		return d.Clock.TimeMS()
+	}
+	return 0
 }
 
 func (d *ReportDeps) bizRuntimeDeps() biz.RuntimeDeps {
@@ -477,9 +485,9 @@ func (r *BTResult) orderMatchTfs() map[string]bool {
 		if deps.Core == nil {
 			return nil
 		}
-		return deps.Core.OrderMatchTfs
+		return deps.Core.OrderMatchTfsSnapshot()
 	}
-	return core.OrderMatchTfs
+	return core.LegacyOrderMatchTfsSnapshot()
 }
 
 func (r *BTResult) doneProfits(off int) float64 {
@@ -1285,9 +1293,9 @@ func (r *BTResult) dumpStrategy() {
 	}
 	pairTfs := map[string]map[string]string(nil)
 	if state := r.runtimeCore(); state != nil {
-		pairTfs = state.StgPairTfs
+		pairTfs = state.StrategyTimeFramesSnapshot()
 	} else if r.reportRuntimeDeps() == nil {
-		pairTfs = core.StgPairTfs
+		pairTfs = core.LegacyStrategyTimeFramesSnapshot()
 	}
 	for name := range pairTfs {
 		dname := strings.Split(name, ":")[0]
@@ -1447,9 +1455,9 @@ func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 		r.MaxFundOccup = max(r.MaxFundOccup, maxOccupy)
 		pairNum := 0
 		if state := r.runtimeCore(); state != nil {
-			pairNum = len(state.Pairs)
+			pairNum = len(state.AdmissionPairs())
 		} else if r.reportRuntimeDeps() == nil {
-			pairNum = len(core.Pairs)
+			pairNum = len(core.LegacyAdmissionPairs())
 		}
 		if pairNum > 0 {
 			r.MaxOccupForPair = max(r.MaxOccupForPair, maxOccupy/float64(pairNum))
@@ -2033,7 +2041,7 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 	}
 	odList = reportReplayOrder(odList)
 	if deps == nil {
-		core.Pairs = utils.KeysOfMap(pairOrders)
+		core.SetLegacyPairs(utils.KeysOfMap(pairOrders), nil)
 	} else if deps.Core != nil {
 		deps.Core.SetPairs(utils.KeysOfMap(pairOrders), nil)
 	}

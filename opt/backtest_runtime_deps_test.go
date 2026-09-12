@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/biz"
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
@@ -21,12 +22,52 @@ type backtestRuntimeExchangeStub struct {
 	info *banexg.ExgInfo
 }
 
+type panicBacktestRuntimeExchange struct{ banexg.BanExchange }
+
+func (*panicBacktestRuntimeExchange) Info() *banexg.ExgInfo {
+	panic("metadata unavailable")
+}
+
 func (e *backtestRuntimeExchangeStub) Info() *banexg.ExgInfo {
 	return e.info
 }
 
 func newBacktestRuntimeExchangeStub(id, market string) *backtestRuntimeExchangeStub {
 	return &backtestRuntimeExchangeStub{info: &banexg.ExgInfo{ID: id, MarketType: market}}
+}
+
+func TestBacktestRuntimeAdapterInfoPanicFailsClosed(t *testing.T) {
+	state, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	state.SetRunMode(core.RunModeBackTest)
+	state.ExgName = "runtime-exchange"
+	state.Market = "spot"
+	clock := btime.NewClockState(true, nil)
+	clock.SetTimeMS(100)
+	configSnapshot := config.NewSnapshotWithDirs(&config.Config{
+		TimeRange: &config.TimeTuple{StartMS: 100, EndMS: 200},
+		Accounts:  map[string]*config.AccountConfig{config.DefAcc: {}},
+	}, t.TempDir(), "")
+	symbols := orm.NewSymbolStateWithIdentity(state.ExgName, state.Market)
+	lite := NewBackTestLiteWithRuntimeDataDepsOwned(biz.RuntimeDeps{
+		Core: state, Clock: clock, Config: configSnapshot, Symbols: symbols,
+		Exchange: &panicBacktestRuntimeExchange{},
+	}, symbols, true, nil, nil, nil, nil)
+	if lite == nil || lite.runErr == nil {
+		t.Fatalf("adapter metadata panic was not captured: %#v", lite)
+	}
+	if !strings.Contains(lite.runErr.Error(), "adapter Info panicked") {
+		t.Fatalf("adapter metadata error = %v, want panic detail", lite.runErr)
+	}
+	if err := (&BackTest{BackTestLite: lite}).Init(); err == nil {
+		t.Fatal("BackTest.Init accepted an invalid adapter identity")
+	}
+	if lite.dp != nil {
+		t.Cleanup(lite.dp.Terminate)
+	}
 }
 
 func TestLegacyDataRuntimeDepsUsesExplicitRuntimeValues(t *testing.T) {

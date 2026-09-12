@@ -183,10 +183,8 @@ func (o *OrderMgr) takeOverTF(pair, defTF string) string {
 		return config.GetTakeOverTF(pair, defTF)
 	}
 	if o.runtimeCore != nil {
-		if pairMap := o.runtimeCore.StgPairTfs[o.takeOverStrategy()]; pairMap != nil {
-			if tf := pairMap[pair]; tf != "" {
-				return tf
-			}
+		if tf, ok := o.runtimeCore.StrategyTimeFrame(o.takeOverStrategy(), pair); ok && tf != "" {
+			return tf
 		}
 	}
 	return defTF
@@ -325,14 +323,7 @@ func (o *OrderMgr) pairIsBanned(pair string, nowMS int64) bool {
 		}
 		return o.runtimeCore.IsPairBanned(pair, nowMS)
 	}
-	banPairsUntil := core.BanPairsUntil
-	if until, ok := banPairsUntil[pair]; ok {
-		if nowMS < until {
-			return true
-		}
-		delete(banPairsUntil, pair)
-	}
-	return false
+	return core.LegacyPairIsBanned(pair, nowMS)
 }
 
 func (o *OrderMgr) noEnterUntilFor(account string) (int64, bool) {
@@ -342,8 +333,7 @@ func (o *OrderMgr) noEnterUntilFor(account string) (int64, bool) {
 		}
 		return o.runtimeCore.NoEnterUntilFor(account)
 	}
-	until, ok := core.NoEnterUntil[account]
-	return until, ok
+	return core.LegacyNoEnterUntilFor(account)
 }
 
 func (o *OrderMgr) setNoEnterUntil(account string, untilMS int64) {
@@ -353,16 +343,12 @@ func (o *OrderMgr) setNoEnterUntil(account string, untilMS int64) {
 		}
 		return
 	}
-	if untilMS <= 0 {
-		delete(core.NoEnterUntil, account)
-	} else {
-		core.NoEnterUntil[account] = untilMS
-	}
+	core.SetLegacyNoEnterUntil(account, untilMS)
 }
 
 func (o *OrderMgr) checkWallets() bool {
 	if o != nil && o.runtimeDeps {
-		return o.runtimeCore != nil && o.runtimeCore.CheckWallets
+		return o.runtimeCore != nil && o.runtimeCore.ShouldCheckWallets()
 	}
 	return core.CheckWallets
 }
@@ -380,7 +366,7 @@ func (o *OrderMgr) stopAll() func() {
 func (o *OrderMgr) setBotRunning(running bool) {
 	if o != nil && o.runtimeDeps {
 		if o.runtimeCore != nil {
-			o.runtimeCore.BotRunning = running
+			o.runtimeCore.SetBotRunning(running)
 		}
 		return
 	}
@@ -765,11 +751,7 @@ func GetAllOdMgrWithState(state *TradingState) map[string]IOrderMgr {
 	if state == nil {
 		return nil
 	}
-	result := make(map[string]IOrderMgr, len(state.OrderManagers))
-	for account, manager := range state.OrderManagers {
-		result[account] = manager
-	}
-	return result
+	return state.OrderManagersSnapshot()
 }
 
 func GetAllOdMgr() map[string]IOrderMgr {
@@ -832,11 +814,11 @@ func CleanUpOdMgrWithState(state *TradingState) *errs.Error {
 	if state == nil {
 		return nil
 	}
-	state.ensure()
-	accounts := slices.Sorted(maps.Keys(state.OrderManagers))
+	managers := state.OrderManagersSnapshot()
+	accounts := slices.Sorted(maps.Keys(managers))
 	var firstErr *errs.Error
 	for _, account := range accounts {
-		manager := state.OrderManagers[account]
+		manager := managers[account]
 		if manager == nil {
 			continue
 		}

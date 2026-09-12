@@ -158,6 +158,42 @@ type providerCallbackTracker struct {
 	left    atomic.Int32
 }
 
+type providerLifecycleRecorder struct {
+	close func()
+	wait  func()
+}
+
+func (r *providerLifecycleRecorder) EnterCallback() bool { return true }
+
+func (r *providerLifecycleRecorder) LeaveCallback() {}
+
+func (r *providerLifecycleRecorder) OnClose(call func()) {
+	r.close = call
+}
+
+func (r *providerLifecycleRecorder) OnCloseWait(call func()) {
+	r.wait = call
+}
+
+func TestLiveProviderRegistersDirectRuntimeLifecycle(t *testing.T) {
+	recorder := &providerLifecycleRecorder{}
+	provider := &LiveProvider{deps: &RuntimeDeps{Callbacks: recorder}}
+	provider.registerLifecycle()
+	provider.registerLifecycle()
+	if recorder.close == nil || recorder.wait == nil {
+		t.Fatal("provider did not register both lifecycle phases")
+	}
+	recorder.close()
+	if !provider.handlerStop {
+		t.Fatal("provider stop hook did not close handler admission")
+	}
+	recorder.wait()
+	// The once guard must not replace the callbacks on a repeated registration.
+	if recorder.close == nil || recorder.wait == nil {
+		t.Fatal("provider lifecycle registration was not stable")
+	}
+}
+
 func (t *providerCallbackTracker) EnterCallback() bool {
 	t.entered.Add(1)
 	return true

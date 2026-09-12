@@ -113,6 +113,10 @@ type DataSeries struct {
 	Values    map[string]any
 	ExSymbol  *ExSymbol
 	Adj       *AdjInfo
+	// aggRows is the original input for an unfinished aggregate bucket. It is
+	// deliberately private: it is runtime bookkeeping, not a user field, and
+	// must never be serialized through Values.
+	aggRows []*DataSeries
 }
 
 func ResolveSeriesExSymbol(evt *DataSeries, extras ...*ExSymbol) *ExSymbol {
@@ -505,6 +509,9 @@ func ResampleDataSeriesWithSymbolState(state *SymbolState, exs *ExSymbol, tf str
 	if len(rows) == 0 {
 		return nil, false, nil
 	}
+	if rows[0] == nil {
+		return nil, false, fmt.Errorf("series event is nil")
+	}
 	if tf == "" {
 		tf = utils2.SecsToTF(int(toTFMS / 1000))
 	}
@@ -513,34 +520,137 @@ func ResampleDataSeriesWithSymbolState(state *SymbolState, exs *ExSymbol, tf str
 		return resampleOHLCVSeries(state, exs, tf, rows, prev, toTFMS, preFire, fromTFMS, offMS, isWarmUp)
 	}
 	info := NewSeriesInfo(source, tf, inferSeriesFields(prev, rows))
-	records := make([]*DataRecord, 0, len(prev)+len(rows))
-	for _, row := range prev {
-		if rec := SeriesToRecord(row); rec != nil {
-			records = append(records, rec)
+	result := make([]*DataSeries, 0, len(prev)+len(rows))
+	// Completed previous buckets are already aggregated. Re-running arbitrary
+	// user functions over their output is both incorrect and unnecessarily
+	// expensive, so carry them through unchanged (apart from warm-up state).
+	if len(prev) > 1 {
+		for _, row := range prev[:len(prev)-1] {
+			if row == nil {
+				continue
+			}
+			cp := *row
+			cp.IsWarmUp = isWarmUp
+			cp.aggRows = nil
+			result = append(result, &cp)
 		}
 	}
-	for _, row := range rows {
-		if rec := SeriesToRecord(row); rec != nil {
-			records = append(records, rec)
-		}
+	var active []*DataSeries
+	if len(prev) > 0 && prev[len(prev)-1] != nil {
+		active = aggregationRows(prev[len(prev)-1])
 	}
+	active = append(active, rows...)
 	offsetMS := int64(float64(toTFMS)*preFire) + offMS
-	aggRecords, err := ResampleSeriesRecords(info, exs, records, toTFMS, offsetMS)
+	aggRecords, sources, err := resampleSeriesWithSources(info, exs, active, toTFMS, offsetMS)
 	if err != nil {
 		return nil, false, err
 	}
-	out := RecordsToSeries(info, exs, aggRecords)
-	for _, row := range out {
+	for i, record := range aggRecords {
+		row := RecordToSeries(info, exs, record)
+		if row == nil {
+			continue
+		}
 		row.IsWarmUp = isWarmUp
+		if i < len(sources) {
+			row.aggRows = append([]*DataSeries(nil), sources[i]...)
+		}
+		result = append(result, row)
 	}
 	lastFinished := false
-	if fromTFMS > 0 && len(out) > 0 {
+	if fromTFMS > 0 && len(result) > 0 {
 		_, offset := utils2.GetTfAlignOrigin(int(toTFMS / 1000))
 		alignOffMS := int64(offset * 1000)
 		finishMS := utils2.AlignTfMSecsOffset(rows[len(rows)-1].TimeMS+fromTFMS+offsetMS, toTFMS, alignOffMS)
-		lastFinished = finishMS > out[len(out)-1].TimeMS
+		lastFinished = finishMS > result[len(result)-1].TimeMS
 	}
-	return out, lastFinished, nil
+	for i, row := range result {
+		if i < len(result)-1 || lastFinished {
+			row.aggRows = nil
+		}
+	}
+	return result, lastFinished, nil
+}
+
+// aggregationRows returns the original rows represented by an aggregate
+// output. A raw input has no sidecar and therefore represents itself.
+func aggregationRows(row *DataSeries) []*DataSeries {
+	if row == nil {
+		return nil
+	}
+	if len(row.aggRows) == 0 {
+		return []*DataSeries{row}
+	}
+	return append([]*DataSeries(nil), row.aggRows...)
+}
+
+// resampleSeriesWithSources performs one aggregation pass and retains the
+// source rows for each output bucket so an unfinished bucket can be resumed
+// without treating its prior aggregate as a raw input.
+func resampleSeriesWithSources(info *SeriesInfo, exs *ExSymbol, rows []*DataSeries,
+	toTFMS, offMS int64) ([]*DataRecord, [][]*DataSeries, error) {
+	if len(rows) == 0 {
+		return nil, nil, nil
+	}
+	_, offset := utils2.GetTfAlignOrigin(int(toTFMS / 1000))
+	alignOffMS := int64(offset * 1000)
+	fields := normalizedSeriesBinding(info.Binding).Fields
+	var records []*DataRecord
+	var sources [][]*DataSeries
+	var bucket []*DataRecord
+	var bucketSources []*DataSeries
+	var bucketTime int64
+	flush := func() error {
+		if len(bucket) == 0 {
+			return nil
+		}
+		values := make(map[string]any, len(fields))
+		for _, field := range fields {
+			fn, ok := GetAggRuleFunc(seriesAggRule(info, exs, field.Name))
+			if !ok {
+				fn, _ = GetAggRuleFunc("last")
+			}
+			value, err := fn(bucket, field)
+			if err != nil {
+				return err
+			}
+			values[field.Name] = value
+		}
+		records = append(records, &DataRecord{
+			Sid:    bucket[0].Sid,
+			TimeMS: bucketTime,
+			EndMS:  bucketTime + toTFMS,
+			Closed: bucket[len(bucket)-1].Closed,
+			Values: values,
+		})
+		sources = append(sources, append([]*DataSeries(nil), bucketSources...))
+		bucket = nil
+		bucketSources = nil
+		return nil
+	}
+	for _, row := range rows {
+		if row == nil {
+			return nil, nil, fmt.Errorf("series event is nil")
+		}
+		record := SeriesToRecord(row)
+		if record == nil {
+			continue
+		}
+		timeAlign := utils2.AlignTfMSecsOffset(row.TimeMS+offMS, toTFMS, alignOffMS)
+		if len(bucket) > 0 && timeAlign != bucketTime {
+			if err := flush(); err != nil {
+				return nil, nil, err
+			}
+		}
+		if len(bucket) == 0 {
+			bucketTime = timeAlign
+		}
+		bucket = append(bucket, record)
+		bucketSources = append(bucketSources, row)
+	}
+	if err := flush(); err != nil {
+		return nil, nil, err
+	}
+	return records, sources, nil
 }
 
 func inferSeriesFields(groups ...[]*DataSeries) []SeriesField {

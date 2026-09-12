@@ -220,14 +220,7 @@ func (w *SeriesWatcher) addTfPairHits(timeFrame, pair string, count int) {
 		}
 		return
 	}
-	core.TfPairHitsLock.Lock()
-	hits, ok := core.TfPairHits[timeFrame]
-	if !ok {
-		hits = make(map[string]int)
-		core.TfPairHits[timeFrame] = hits
-	}
-	hits[pair] += count
-	core.TfPairHitsLock.Unlock()
+	core.AddLegacyTfPairHits(timeFrame, pair, count)
 }
 
 func (w *SeriesWatcher) beginCallback() bool {

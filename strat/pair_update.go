@@ -212,11 +212,17 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	strategyState.ensureMaps()
 	exchange, runtimeExplicit := resolveStratExchange(req.Exchange, admissionState, hooks.SymbolState, hooks)
 	var stgPairTfs map[string]map[string]string
+	var tfSecs map[string]int
 	if admissionState != nil {
 		admissionState.EnsureRuntimeMaps()
-		stgPairTfs = admissionState.StgPairTfs
+		// Pair updates can race readers such as order managers. Build the
+		// nested indexes privately and publish one replacement at the end.
+		stgPairTfs = admissionState.StrategyTimeFramesSnapshot()
+		tfSecs = admissionState.TimeFrameSecondsSnapshot()
+		defer admissionState.ReplaceTimeFrameState(tfSecs, stgPairTfs)
 	} else {
-		stgPairTfs = core.StgPairTfs
+		tfSecs, stgPairTfs = core.LegacyTimeFrameStateSnapshot()
+		defer core.ReplaceLegacyTimeFrameState(tfSecs, stgPairTfs)
 	}
 	res := &PairUpdateResult{ExitOrders: map[string][]*ormo.InOutOrder{}}
 	adds, err := parsePairsForState(strategyState, req.Add...)
@@ -360,12 +366,6 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 					}
 				}
 			}
-		}
-		var tfSecs map[string]int
-		if admissionState != nil {
-			tfSecs = admissionState.TFSecs
-		} else {
-			tfSecs = core.TFSecs
 		}
 		if _, ok := tfSecs[tf]; !ok {
 			tfSecs[tf] = utils2.TFToSecs(tf)

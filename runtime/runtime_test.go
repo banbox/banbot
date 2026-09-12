@@ -77,6 +77,38 @@ func TestRuntimeCloseUnregistersFromProcess(t *testing.T) {
 	}
 }
 
+func TestRuntimeSharesOwnedAccountExecutionStateWithTrader(t *testing.T) {
+	process := NewProcess()
+	defer process.Close()
+	source := &config.Config{
+		Env: core.RunEnvProd,
+		Accounts: map[string]*config.AccountConfig{
+			"live": {StakePctAmt: 73},
+		},
+	}
+	rt, err := process.NewRuntime(Options{Config: source, Env: core.RunEnvProd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	if rt.Accounts["live"] == nil || rt.Accounts["live"].StakePctAmt != 73 {
+		t.Fatalf("runtime account state = %#v, want preserved StakePctAmt", rt.Accounts)
+	}
+	deps := rt.BizDeps()
+	if !deps.AccountsOwned || deps.Accounts["live"] != rt.Accounts["live"] {
+		t.Fatal("Runtime.BizDeps did not expose its owned account execution state")
+	}
+	trader := biz.NewTraderWithRuntimeDeps(deps)
+	traderDeps := trader.RuntimeDependencies()
+	if traderDeps == nil || traderDeps.Accounts["live"] != rt.Accounts["live"] {
+		t.Fatal("Trader did not retain the Runtime-owned account execution state")
+	}
+	rt.Accounts["live"].StakePctAmt = 11
+	if got := traderDeps.Accounts["live"].StakePctAmt; got != 11 {
+		t.Fatalf("Trader account state = %v, want shared value 11", got)
+	}
+}
+
 func TestStopAndWaitProcessesJoinsRuntimeOwners(t *testing.T) {
 	process := NewProcess()
 	rt, err := process.NewRuntime(Options{})
@@ -122,6 +154,10 @@ type processBlockingExchange struct {
 	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+func (*processBlockingExchange) Info() *banexg.ExgInfo {
+	return &banexg.ExgInfo{ID: "test", MarketType: banexg.MarketSpot}
 }
 
 func (e *processBlockingExchange) PriceSymbolParts(string) ([4]string, *errs.Error) {
@@ -212,6 +248,24 @@ func TestRuntimeStatesAreIndependent(t *testing.T) {
 	case <-b.Done():
 		t.Fatal("runtime B was stopped with A")
 	default:
+	}
+}
+
+func TestRuntimeRejectsExchangeIdentityMismatch(t *testing.T) {
+	process := NewProcess()
+	defer process.Close()
+	adapter := &banexg.Exchange{ExgInfo: &banexg.ExgInfo{ID: "adapter", MarketType: banexg.MarketSpot}}
+
+	if _, err := process.NewRuntime(Options{
+		Exchange: adapter, ExchangeName: "runtime", Market: banexg.MarketSpot,
+	}); err == nil || !strings.Contains(err.Error(), "exchange identity") {
+		t.Fatalf("exchange mismatch error = %v, want identity error", err)
+	}
+	process.runtimeMu.Lock()
+	tracked := len(process.runtimes)
+	process.runtimeMu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("mismatched runtime was registered: %d", tracked)
 	}
 }
 

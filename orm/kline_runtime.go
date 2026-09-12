@@ -6,6 +6,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banexg/errs"
 )
 
 // KlineRuntimeOptions contains the low-frequency policy needed by K-line
@@ -21,8 +22,12 @@ type KlineRuntimeOptions struct {
 	TimeRangeEndMS     int64
 	ConcurNum          int
 	NowMS              int64
-	Storage            *Storage
-	Sleep              func(time.Duration) bool
+	// ClockValid distinguishes an instance clock from a caller-supplied
+	// timestamp. Explicit ORM operations must not treat a zero/missing clock as
+	// Unix epoch data or silently borrow the process clock.
+	ClockValid bool
+	Storage    *Storage
+	Sleep      func(time.Duration) bool
 }
 
 // LegacyKlineRuntimeOptions snapshots the package facade for compatibility
@@ -38,6 +43,7 @@ func LegacyKlineRuntimeOptions() KlineRuntimeOptions {
 		TimeRangeEndMS:     timeRangeEnd(config.TimeRange),
 		ConcurNum:          core.ConcurNum,
 		NowMS:              btime.TimeMS(),
+		ClockValid:         true,
 		Sleep:              core.Sleep,
 	}
 }
@@ -45,9 +51,10 @@ func LegacyKlineRuntimeOptions() KlineRuntimeOptions {
 // NewKlineRuntimeOptions binds K-line policy from explicit runtime fields.
 func NewKlineRuntimeOptions(runtimeCore *core.State, cfg *config.Config, nowMS int64, storage *Storage) KlineRuntimeOptions {
 	options := KlineRuntimeOptions{
-		Storage:   storage,
-		NowMS:     nowMS,
-		ConcurNum: 2,
+		Storage:    storage,
+		NowMS:      nowMS,
+		ClockValid: nowMS > 0,
+		ConcurNum:  2,
 	}
 	if runtimeCore != nil {
 		options.Backtest = runtimeCore.BackTestMode
@@ -82,11 +89,15 @@ func (o KlineRuntimeOptions) allowDownload() bool {
 	return !o.Backtest || !o.NoDownload
 }
 
-func (o KlineRuntimeOptions) nowMS() int64 {
-	if o.NowMS != 0 {
-		return o.NowMS
+func validateKlineRuntimeOptions(options KlineRuntimeOptions) *errs.Error {
+	if !options.ClockValid || options.NowMS <= 0 {
+		return errs.NewMsg(core.ErrBadConfig, "explicit K-line runtime requires a runtime clock")
 	}
-	return btime.TimeMS()
+	return nil
+}
+
+func (o KlineRuntimeOptions) nowMS() int64 {
+	return o.NowMS
 }
 
 func (o KlineRuntimeOptions) strictHistoricalReplay() bool {

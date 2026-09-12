@@ -112,6 +112,22 @@ func TestRefreshPairListWithRuntimeDepsRequiresSymbolState(t *testing.T) {
 	}
 }
 
+func TestRefreshPairListWithSymbolStateRejectsLegacyFallback(t *testing.T) {
+	state := orm.NewSymbolStateWithIdentity("runtime", banexg.MarketSpot)
+	oldPairs, oldPairsMap := core.LegacyPairStateSnapshot()
+	t.Cleanup(func() { core.ReplaceLegacyPairState(oldPairs, oldPairsMap) })
+	core.SetLegacyPairs([]string{"legacy"}, []string{"legacy-additional"})
+
+	_, err := RefreshPairListWithSymbolState(state, &runtimeDepsExchange{}, 100)
+	if err == nil || err.Code != core.ErrBadConfig {
+		t.Fatalf("symbol-only refresh error = %v, want ErrBadConfig", err)
+	}
+	pairs, pairsMap := core.LegacyPairStateSnapshot()
+	if len(pairs) != 1 || pairs[0] != "legacy" || !pairsMap["legacy"] {
+		t.Fatalf("legacy pair state changed on rejected refresh: %v/%v", pairs, pairsMap)
+	}
+}
+
 func TestExplicitAgeFilterDoesNotFallBackToGlobalCoreState(t *testing.T) {
 	previous := core.BanPairsUntil
 	core.BanPairsUntil = map[string]int64{"legacy": 1}

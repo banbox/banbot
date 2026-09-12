@@ -1068,7 +1068,7 @@ func getBotInfo(c *fiber.Ctx) error {
 		return err
 	}
 	return wrapAccount(c, func(acc string) error {
-		stopUntil, _ := core.NoEnterUntil[acc]
+		stopUntil, _ := core.LegacyNoEnterUntilFor(acc)
 		return c.JSON(fiber.Map{
 			"cpuPct":       percent[0],
 			"ramPct":       v.UsedPercent,

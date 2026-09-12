@@ -69,12 +69,38 @@ func initLocalOrderMgr(deps *RuntimeDeps, callBack FnOdCb, showLog bool, prices 
 	if len(stops) > 0 {
 		stopBacktest = stops[0]
 	}
-	var managers map[string]IOrderMgr
 	if deps != nil {
-		managers = deps.Trading.OrderManagers
-	} else {
-		managers = accOdMgrs
+		for account, cfg := range executionAccountConfigs(deps) {
+			if cfg == nil || cfg.NoTrade {
+				continue
+			}
+			manager := deps.Trading.OrderManager(account)
+			if manager == nil {
+				odMgr := &LocalOrderMgr{
+					OrderMgr: OrderMgr{
+						callBack: callBack,
+						prices:   prices,
+						clock:    clock,
+						Account:  account,
+					},
+					showLog:      showLog,
+					zeroAmts:     make(map[string]int),
+					stopBacktest: stopBacktest,
+				}
+				odMgr.bindRuntimeDeps(*deps)
+				odMgr.afterEnter = makeLocalAfterEnter(odMgr)
+				deps.Trading.SetOrderManager(account, odMgr)
+				continue
+			}
+			if odMgr, ok := manager.(*LocalOrderMgr); ok {
+				odMgr.bindRuntimeDeps(*deps)
+				odMgr.callBack = callBack
+				odMgr.stopBacktest = stopBacktest
+			}
+		}
+		return
 	}
+	managers := accOdMgrs
 	accounts := executionAccountConfigs(deps)
 	for account, cfg := range accounts {
 		if cfg == nil || cfg.NoTrade {

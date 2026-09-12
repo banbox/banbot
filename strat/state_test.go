@@ -2,6 +2,7 @@ package strat
 
 import (
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/banbox/banbot/btime"
@@ -47,6 +48,60 @@ func TestExplicitStrategyStateUsesOwnSelectionClockAndStrictMode(t *testing.T) {
 	if got := runtimeTimeMSFor(second); got != 222 {
 		t.Fatalf("second runtime time=%d, want 222", got)
 	}
+}
+
+func TestExplicitStrategyReadsRuntimeStakeAmount(t *testing.T) {
+	coreState, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coreState.Close()
+	coreState.EnvReal = true
+	cfg := &config.Config{
+		StakeAmount: 100,
+		Accounts: map[string]*config.AccountConfig{
+			"live": {StakePctAmt: 42},
+		},
+	}
+	state := NewStateWithRuntime(coreState, nil, cfg, nil, nil)
+	accounts := map[string]*config.AccountConfig{"live": {StakePctAmt: 42}}
+	state.BindRuntimeAccounts(accounts)
+	var accountsMu sync.RWMutex
+	state.BindRuntimeAccountsLock(&accountsMu)
+	job := &StratJob{
+		Strat:         &TradeStrat{runtimeConfig: cfg},
+		Account:       "live",
+		strategyState: state,
+	}
+	if got := job.Strat.GetStakeAmount(job); got != 42 {
+		t.Fatalf("initial runtime stake amount = %v, want 42", got)
+	}
+	accountsMu.Lock()
+	accounts["live"].StakePctAmt = 17
+	accountsMu.Unlock()
+	if got := job.Strat.GetStakeAmount(job); got != 17 {
+		t.Fatalf("updated runtime stake amount = %v, want 17", got)
+	}
+	var group sync.WaitGroup
+	group.Add(2)
+	go func() {
+		defer group.Done()
+		for i := 0; i < 1000; i++ {
+			accountsMu.Lock()
+			accounts["live"].StakePctAmt = float64(i + 1)
+			accountsMu.Unlock()
+		}
+	}()
+	go func() {
+		defer group.Done()
+		for i := 0; i < 1000; i++ {
+			if got := job.Strat.GetStakeAmount(job); got <= 0 {
+				t.Errorf("concurrent runtime stake amount = %v, want positive", got)
+				return
+			}
+		}
+	}()
+	group.Wait()
 }
 
 func TestExplicitStrategyStateNormalizesNonRealAccounts(t *testing.T) {

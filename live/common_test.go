@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -131,6 +132,48 @@ func TestRuntimeBalanceWorkerUsesBoundDependencies(t *testing.T) {
 		t.Fatalf("legacy default balance calls = %d, want 0", legacyExchange.balanceCalls)
 	}
 	lifecycle.closeAndWait()
+}
+
+func TestBindBalanceRuntimeDepsSnapshotsAccounts(t *testing.T) {
+	const account = "runtime"
+	runtimeConfig := config.NewSnapshot(&config.Config{
+		Accounts: map[string]*config.AccountConfig{account: {}},
+	})
+	bound := bindBalanceRuntimeDeps(biz.RuntimeDeps{Config: runtimeConfig})
+	source := runtimeConfig.View().Accounts
+
+	source[account].NoTrade = true
+	delete(source, account)
+	if cfg := bound.accounts[account]; cfg == nil || cfg.NoTrade {
+		t.Fatalf("balance worker retained mutable account state: %#v", bound.accounts)
+	}
+}
+
+func TestBalanceRuntimeDepsAccountSnapshotIsRaceFree(t *testing.T) {
+	const accountCount = 256
+	accounts := make(map[string]*config.AccountConfig, accountCount)
+	for i := 0; i < accountCount; i++ {
+		accounts[fmt.Sprintf("account-%d", i)] = &config.AccountConfig{NoTrade: true}
+	}
+	runtimeConfig := config.NewSnapshot(&config.Config{Accounts: accounts})
+	bound := bindBalanceRuntimeDeps(biz.RuntimeDeps{Config: runtimeConfig})
+	source := runtimeConfig.View().Accounts
+
+	var calls sync.WaitGroup
+	calls.Add(2)
+	go func() {
+		defer calls.Done()
+		for i := 0; i < 1000; i++ {
+			source["account-0"] = &config.AccountConfig{NoTrade: true}
+		}
+	}()
+	go func() {
+		defer calls.Done()
+		for i := 0; i < 1000; i++ {
+			updateBalancePosWithRuntime(bound)
+		}
+	}()
+	calls.Wait()
 }
 
 func TestRuntimeBacktestCronBindsRuntimeDependencies(t *testing.T) {

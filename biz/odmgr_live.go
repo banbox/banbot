@@ -109,15 +109,38 @@ func NewLiveOrderMgrWithRuntimeDeps(deps RuntimeDeps, account string, callBack f
 
 func initLiveOrderMgr(deps *RuntimeDeps, callBack func(od *ormo.InOutOrder, isEnter bool)) {
 	ensureLiveRuntimeDeps(deps)
+	if deps != nil && deps.Trading != nil {
+		accounts := deps.AccountConfigs()
+		for account, cfg := range accounts {
+			if cfg == nil || cfg.NoTrade {
+				continue
+			}
+			mgr := deps.Trading.LiveManager(account)
+			if mgr == nil {
+				odMgr := newLiveOrderMgrWithRuntimeDeps(account, callBack, deps)
+				deps.Trading.SetLiveManager(account, odMgr)
+				deps.Trading.SetOrderManager(account, odMgr)
+			} else {
+				mgr.callBack = callBack
+			}
+		}
+		if deps.Orders != nil {
+			state := deps.Orders
+			state.SetEditListener(func(od *ormo.InOutOrder, action string) {
+				if od == nil {
+					return
+				}
+				account := state.GetTaskAcc(od.TaskID)
+				if mgr := GetOdMgrWithState(deps.Trading, account); mgr != nil {
+					mgr.EditOrder(od, action)
+				}
+			})
+		}
+		return
+	}
 	managers := accLiveOdMgrs
 	orderManagers := accOdMgrs
 	accounts := config.Accounts
-	if deps != nil && deps.Trading != nil {
-		deps.Trading.ensure()
-		managers = deps.Trading.LiveManagers
-		orderManagers = deps.Trading.OrderManagers
-		accounts = deps.AccountConfigs()
-	}
 	for account, cfg := range accounts {
 		if cfg == nil || cfg.NoTrade {
 			continue
@@ -131,18 +154,7 @@ func initLiveOrderMgr(deps *RuntimeDeps, callBack func(od *ormo.InOutOrder, isEn
 			mgr.callBack = callBack
 		}
 	}
-	if deps != nil && deps.Orders != nil {
-		state := deps.Orders
-		state.SetEditListener(func(od *ormo.InOutOrder, action string) {
-			if od == nil {
-				return
-			}
-			account := state.GetTaskAcc(od.TaskID)
-			if mgr := GetOdMgrWithState(deps.Trading, account); mgr != nil {
-				mgr.EditOrder(od, action)
-			}
-		})
-	} else if ormo.OdEditListener == nil {
+	if ormo.OdEditListener == nil {
 		ormo.OdEditListener = func(od *ormo.InOutOrder, action string) {
 			odMgr := GetOdMgr(ormo.GetTaskAcc(od.TaskID))
 			if odMgr != nil {
@@ -4341,7 +4353,7 @@ func MakeCheckFatalStop(maxIntv int) func() {
 }
 
 func checkAccFatalStop(account string, maxIntv int) {
-	stopUntil, _ := core.NoEnterUntil[account]
+	stopUntil, _ := core.LegacyNoEnterUntilFor(account)
 	if stopUntil >= btime.TimeMS() {
 		return
 	}
@@ -4367,7 +4379,7 @@ func checkAccFatalStop(account string, maxIntv int) {
 		lossRate := calcFatalLoss(wallets, orders, backMins)
 		if lossRate >= rate {
 			lossPct := int(lossRate * 100)
-			core.NoEnterUntil[account] = btime.TimeMS() + int64(config.FatalStopHours)*3600*1000
+			core.SetLegacyNoEnterUntil(account, btime.TimeMS()+int64(config.FatalStopHours)*3600*1000)
 			log.Error(fmt.Sprintf("%v: Loss of %v%% in %v minutes, prohibition of placing orders for %v hours!", account,
 				lossPct, backMins, config.FatalStopHours))
 			break
@@ -4446,16 +4458,32 @@ func StartLiveOdMgrWithRuntimeDeps(deps RuntimeDeps, ctx context.Context) {
 }
 
 func startLiveOdMgr(ctx context.Context, deps *RuntimeDeps) {
-	managers := accLiveOdMgrs
-	accounts := config.Accounts
 	if deps != nil {
 		if deps.Trading == nil {
 			return
 		}
-		deps.Trading.ensure()
-		managers = deps.Trading.LiveManagers
-		accounts = deps.AccountConfigs()
+		managers := deps.Trading.LiveManagersSnapshot()
+		for account, cfg := range deps.AccountConfigs() {
+			if cfg == nil || cfg.NoTrade {
+				continue
+			}
+			odMgr := managers[account]
+			if odMgr == nil || !odMgr.setWorkerContext(ctx) {
+				continue
+			}
+			// Monitor account order flow 监听账户订单流
+			odMgr.WatchMyTrades()
+			// Track user orders 跟踪用户下单
+			odMgr.TrialUnMatchesForever()
+			// Consumption order queue 消费订单队列
+			odMgr.ConsumeOrderQueue()
+			// Monitor leverage changes 监听杠杆倍数变化
+			odMgr.WatchLeverages()
+		}
+		return
 	}
+	managers := accLiveOdMgrs
+	accounts := config.Accounts
 	for account, cfg := range accounts {
 		if cfg == nil || cfg.NoTrade {
 			continue
@@ -4487,10 +4515,16 @@ func StopLiveOdMgrWithRuntimeDeps(deps RuntimeDeps) {
 }
 
 func stopLiveOdMgr(deps *RuntimeDeps) {
-	managers := accLiveOdMgrs
-	if deps != nil && deps.Trading != nil {
-		managers = deps.Trading.LiveManagers
+	if deps != nil {
+		if deps.Trading == nil {
+			return
+		}
+		for _, odMgr := range deps.Trading.LiveManagersSnapshot() {
+			odMgr.Stop()
+		}
+		return
 	}
+	managers := accLiveOdMgrs
 	for _, odMgr := range managers {
 		odMgr.Stop()
 	}
@@ -4507,10 +4541,16 @@ func JoinLiveOdMgrWithRuntimeDeps(deps RuntimeDeps) {
 }
 
 func joinLiveOdMgr(deps *RuntimeDeps) {
-	managers := accLiveOdMgrs
-	if deps != nil && deps.Trading != nil {
-		managers = deps.Trading.LiveManagers
+	if deps != nil {
+		if deps.Trading == nil {
+			return
+		}
+		for _, odMgr := range deps.Trading.LiveManagersSnapshot() {
+			odMgr.Join()
+		}
+		return
 	}
+	managers := accLiveOdMgrs
 	for _, odMgr := range managers {
 		odMgr.Join()
 	}

@@ -39,11 +39,39 @@ func initLocalLiveOrderMgr(deps *RuntimeDeps, callBack FnOdCb, showLog bool) {
 			deps.Trading = NewTradingState()
 		}
 	}
-	managers := accOdMgrs
 	if deps != nil && deps.Trading != nil {
-		deps.Trading.ensure()
-		managers = deps.Trading.OrderManagers
+		for account, cfg := range executionAccountConfigs(deps) {
+			if cfg == nil || cfg.NoTrade {
+				continue
+			}
+			manager := deps.Trading.OrderManager(account)
+			if manager != nil && deps != nil {
+				// Explicit construction refreshes the manager's callback and runtime
+				// bindings, while the registry itself remains lock-protected.
+				if existing, ok := manager.(*LocalLiveOrderMgr); ok {
+					existing.callBack = callBack
+					existing.bindRuntimeDeps(*deps)
+					continue
+				}
+			}
+			odMgr := &LocalLiveOrderMgr{
+				LocalOrderMgr: LocalOrderMgr{
+					OrderMgr: OrderMgr{
+						callBack: callBack,
+						Account:  account,
+					},
+					showLog:  showLog,
+					zeroAmts: make(map[string]int),
+				},
+			}
+			odMgr.bindRuntimeDeps(*deps)
+			odMgr.afterEnter = makeAfterEnterLocalLive(odMgr)
+			odMgr.afterExit = makeAfterExitLocalLive(odMgr)
+			deps.Trading.SetOrderManager(account, odMgr)
+		}
+		return
 	}
+	managers := accOdMgrs
 	accounts := executionAccountConfigs(deps)
 	for account, cfg := range accounts {
 		if cfg == nil || cfg.NoTrade {
@@ -175,8 +203,7 @@ func callLocalLiveOdMgrsData(deps *RuntimeDeps, msg *data.SeriesMsg, rows []*orm
 	managers := accOdMgrs
 	var orderState *ormo.OrderState
 	if deps != nil && deps.Trading != nil {
-		deps.Trading.ensure()
-		managers = deps.Trading.OrderManagers
+		managers = deps.Trading.OrderManagersSnapshot()
 		orderState = deps.Orders
 	}
 	for account, mgr := range managers {

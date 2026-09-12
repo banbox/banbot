@@ -237,6 +237,17 @@ func TestRuntimeWatchLiveBalancesUsesOwnedDependencies(t *testing.T) {
 	}
 }
 
+func TestRuntimeWalletSnapshotsRequireRuntimeClock(t *testing.T) {
+	lifecycle := newWalletRuntimeLifecycleStub()
+	StartLiveWalletSnapshotsWithRuntimeDeps(RuntimeDeps{
+		Trading: NewTradingState(),
+		Config:  config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{"runtime": {}}}),
+	}, lifecycle)
+	if len(lifecycle.wait) != 0 {
+		t.Fatalf("wallet snapshot worker registered without runtime clock")
+	}
+}
+
 func TestRuntimeOrderMgrKeepsExplicitWalletAccount(t *testing.T) {
 	oldEnvReal, oldDefAcc := core.EnvReal, config.DefAcc
 	const account = "runtime-wallet-account"

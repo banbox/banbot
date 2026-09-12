@@ -887,10 +887,11 @@ type LiveProvider struct {
 	catalog *DataSourceCatalog
 	symbols *orm.SymbolState
 	*SeriesWatcher
-	OnDataSeries func(msg *SeriesMsg, rows []*orm.DataSeries) *errs.Error
-	handlerLock  sync.Mutex
-	handlerWait  sync.WaitGroup
-	handlerStop  bool
+	OnDataSeries  func(msg *SeriesMsg, rows []*orm.DataSeries) *errs.Error
+	handlerLock   sync.Mutex
+	handlerWait   sync.WaitGroup
+	handlerStop   bool
+	lifecycleOnce sync.Once
 }
 
 func (p *LiveProvider) DataSourceCatalog() *DataSourceCatalog {
@@ -1003,6 +1004,7 @@ func newLiveProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, cat
 	watcher.OnDataMsg = makeOnSeriesMsg(provider)
 	watcher.OnTrades = makeOnTrade(provider)
 	watcher.OnDepth = makeOnDepth(provider)
+	provider.registerLifecycle()
 	// 立刻订阅实时价格
 	//err = watcher.SendMsg("subscribe", []string{
 	//	fmt.Sprintf("price_%s_%s", core.ExgName, core.Market),
@@ -1011,6 +1013,26 @@ func newLiveProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, cat
 	//	return nil, err
 	//}
 	return provider, nil
+}
+
+// registerLifecycle gives a directly-created provider the same stop -> join
+// ownership as the composition-root trader. Existing trader lifecycle wiring
+// may also register these callbacks; Stop and Join are intentionally
+// idempotent, and the once guard prevents duplicate registration on retries.
+func (p *LiveProvider) registerLifecycle() {
+	if p == nil || p.deps == nil || p.deps.Callbacks == nil {
+		return
+	}
+	lifecycle, ok := p.deps.Callbacks.(LifecycleRegistrar)
+	if !ok {
+		return
+	}
+	p.lifecycleOnce.Do(func() {
+		lifecycle.OnClose(func() {
+			_ = p.Stop()
+		})
+		lifecycle.OnCloseWait(p.Join)
+	})
 }
 
 func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bool) *errs.Error {

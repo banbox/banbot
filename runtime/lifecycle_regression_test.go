@@ -69,6 +69,46 @@ func TestRuntimeCloseStopsSchedulerOnceWhenStopReturnsNil(t *testing.T) {
 	}
 }
 
+func TestRuntimeRejectsSharedOwnedScheduler(t *testing.T) {
+	process := NewProcess()
+	defer process.Close()
+	scheduler := newLifecycleScheduler(true)
+	first, err := process.NewRuntime(Options{Scheduler: scheduler})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := process.NewRuntime(Options{Scheduler: scheduler}); err == nil {
+		t.Fatal("Process allowed two owner Runtimes to share one scheduler")
+	}
+	if got := scheduler.stopCalls.Load(); got != 0 {
+		t.Fatalf("scheduler stopped while duplicate construction was rejected: %d", got)
+	}
+}
+
+func TestRuntimeBorrowedSchedulerIsNeverStopped(t *testing.T) {
+	process := NewProcess()
+	defer process.Close()
+	scheduler := newLifecycleScheduler(true)
+	first, err := process.NewRuntime(Options{Scheduler: scheduler, SchedulerBorrowed: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := process.NewRuntime(Options{Scheduler: scheduler, SchedulerBorrowed: true})
+	if err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	first.Close()
+	if got := scheduler.stopCalls.Load(); got != 0 {
+		t.Fatalf("borrowed scheduler stopped with one Runtime still active: %d", got)
+	}
+	second.Close()
+	if got := scheduler.stopCalls.Load(); got != 0 {
+		t.Fatalf("borrowed scheduler was stopped by Runtime.Close: %d", got)
+	}
+}
+
 func TestRuntimeSchedulerStopAllowsOnCloseWaitRegistration(t *testing.T) {
 	scheduler := newLifecycleScheduler(true)
 	var rt *Runtime

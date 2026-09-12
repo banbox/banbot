@@ -122,7 +122,7 @@ func (f *AgeFilter) filterWithRuntimeDeps(deps *RuntimeDeps, symbols []string, t
 					if coreState != nil {
 						coreState.SetPairBanUntil(exs.Symbol, minStartMS)
 					} else {
-						core.BanPairsUntil[exs.Symbol] = minStartMS
+						core.SetLegacyPairBanUntil(exs.Symbol, minStartMS)
 					}
 				} else {
 					continue
@@ -270,7 +270,7 @@ func (d *RuntimeDeps) querySeries(exs *orm.ExSymbol, timeframe string, startMS, 
 		return nil, nil, err
 	}
 	defer conn.Release()
-	sess = sess.WithSeriesSymbolState(d.Symbols).WithKlineRuntimeOptions(
+	sess = sess.WithSeriesSymbolState(d.Symbols).WithExchange(d.Exchange).WithKlineRuntimeOptions(
 		orm.NewKlineRuntimeOptions(d.Core, d.Config, runtimeFilterNow(d, endMS), d.Storage))
 	return sess.GetSeries(exs, timeframe, startMS, endMS, limit, false)
 }
@@ -361,8 +361,11 @@ func getSymbolVolsWithOptions(state *orm.SymbolState, exchange banexg.BanExchang
 }
 
 func runtimeFilterNow(deps *RuntimeDeps, fallback int64) int64 {
-	if deps != nil && deps.Clock != nil {
-		return deps.Clock.TimeMS()
+	if deps != nil {
+		if deps.Clock != nil {
+			return deps.Clock.TimeMS()
+		}
+		return 0
 	}
 	return fallback
 }

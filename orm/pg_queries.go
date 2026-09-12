@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
@@ -226,7 +225,7 @@ func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64,
 	}
 	// Align windows (accounting for exchange-specific offset).
 	exs := q.symbolByID(sid)
-	offMS := seriesAlignOff(exs, tfMSecs)
+	offMS := q.alignOff(exs, tfMSecs)
 	if offMS == 0 && exs == nil && q.usesLegacySymbolCatalog() {
 		offMS = GetAlignOff(sid, tfMSecs)
 	}
@@ -672,8 +671,8 @@ WHERE sid = $1 AND timeframe = $2 AND start_ms >= $3`,
 	return bar, stopMs, &expireMsVal, nil
 }
 
-func (q *Queries) setUnfinishPg(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
-	expireMS := utils2.AlignTfMSecs(btime.UTCStamp(), 60000) + 60000
+func (q *Queries) setUnfinishPg(sid int32, tf string, endMS int64, bar *banexg.Kline, options KlineRuntimeOptions) *errs.Error {
+	expireMS := utils2.AlignTfMSecs(options.nowMS(), 60000) + 60000
 	ctx := context.Background()
 	_, err := q.db.Exec(ctx, `INSERT INTO kline_un (sid, timeframe, start_ms, stop_ms, expire_ms,
 open, high, low, close, volume, quote, buy_volume, trade_num)
@@ -829,7 +828,7 @@ ORDER BY sid, time`, tblName, buildPgTimeFilter(startMs, finishEndMS), sidText)
 		if fromTfMSecs > 0 {
 			var lastDone bool
 			exs := exsMap[curSid]
-			offMS := seriesAlignOff(exs, tfMSecs)
+			offMS := q.alignOff(exs, tfMSecs)
 			if offMS == 0 && exs == nil && q.usesLegacySymbolCatalog() {
 				offMS = GetAlignOff(curSid, tfMSecs)
 			}

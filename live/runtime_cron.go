@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/com"
@@ -151,6 +150,12 @@ func cronFatalLossCheckWithRuntime(scheduler com.Scheduler, deps biz.RuntimeDeps
 	if scheduler == nil || len(fatal) == 0 || maxInterval <= 0 {
 		return
 	}
+	if nowMS == nil {
+		if deps.Clock == nil {
+			return
+		}
+		nowMS = deps.Clock.TimeMS
+	}
 	interval := maxInterval
 	if interval > 5 {
 		interval = 5
@@ -167,7 +172,10 @@ func cronKlineDelaysWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, 
 		return
 	}
 	if clock == nil {
-		clock = func() int64 { return time.Now().UnixMilli() }
+		if deps.Clock == nil {
+			return
+		}
+		clock = deps.Clock.TimeMS
 	}
 	cfg := runtimeConfig(&deps)
 	closeOnStuck := 20
@@ -243,9 +251,8 @@ func cronKlineSummaryWithRuntime(scheduler com.Scheduler, state *core.State) {
 		return
 	}
 	_, err := scheduler.AddFunc("30 1-59/10 * * * *", func() {
-		state.TfPairHitsLock.Lock()
 		groups := make(map[string][]string)
-		for tf, pairs := range state.TfPairHits {
+		for tf, pairs := range state.DrainTfPairHits() {
 			byHits := make(map[int][]string)
 			for pair, hits := range pairs {
 				byHits[hits] = append(byHits[hits], pair)
@@ -254,8 +261,6 @@ func cronKlineSummaryWithRuntime(scheduler com.Scheduler, state *core.State) {
 				groups[fmt.Sprintf("%s_%d: %d", tf, hits, len(items))] = items
 			}
 		}
-		state.TfPairHits = make(map[string]map[string]int)
-		state.TfPairHitsLock.Unlock()
 		if len(groups) > 0 {
 			log.Info(fmt.Sprintf("receive bars in 10 mins:\n%s", core.GroupByPairQuotes(groups, true)))
 		}

@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"strings"
@@ -88,6 +89,11 @@ func (p *JobPerf) GetAmount(amount float64) float64 {
 }
 
 func GetPerfSta(stagy string) *PerfSta {
+	legacyFlagsMu.Lock()
+	defer legacyFlagsMu.Unlock()
+	if StratPerfSta == nil {
+		StratPerfSta = make(map[string]*PerfSta)
+	}
 	p, ok := StratPerfSta[stagy]
 	if !ok || p == nil {
 		p = &PerfSta{}
@@ -117,14 +123,16 @@ func (p *PerfSta) Log2(profit float64) float64 {
 }
 
 func DumpPerfs(outDir string) {
-	dumpPerfs(outDir, JobPerfs, StratPerfSta)
+	jobPerfs, stratPerfSta := LegacyPerformanceSnapshot()
+	dumpPerfs(outDir, jobPerfs, stratPerfSta)
 }
 
 func (s *State) DumpPerfs(outDir string) {
 	if s == nil {
 		return
 	}
-	dumpPerfs(outDir, s.JobPerfs, s.StratPerfSta)
+	jobPerfs, stratPerfSta := s.PerformanceSnapshot()
+	dumpPerfs(outDir, jobPerfs, stratPerfSta)
 }
 
 func dumpPerfs(outDir string, jobPerfs map[string]*JobPerf, stratPerfSta map[string]*PerfSta) {
@@ -342,7 +350,28 @@ func GetOdBook(pair string) (*banexg.OrderBook, bool) {
 
 func SetOdBook(pair string, book *banexg.OrderBook) {
 	lockOdBook.Lock()
+	if OdBooks == nil {
+		OdBooks = make(map[string]*banexg.OrderBook)
+	}
 	OdBooks[pair] = book
+	lockOdBook.Unlock()
+}
+
+// LegacyOdBooksSnapshot returns a stable compatibility order-book index.
+func LegacyOdBooksSnapshot() map[string]*banexg.OrderBook {
+	lockOdBook.Lock()
+	result := maps.Clone(OdBooks)
+	lockOdBook.Unlock()
+	return result
+}
+
+// ReplaceLegacyOdBooks restores the compatibility order-book index.
+func ReplaceLegacyOdBooks(books map[string]*banexg.OrderBook) {
+	lockOdBook.Lock()
+	OdBooks = maps.Clone(books)
+	if OdBooks == nil {
+		OdBooks = make(map[string]*banexg.OrderBook)
+	}
 	lockOdBook.Unlock()
 }
 

@@ -280,7 +280,7 @@ func (q *Queries) inspectPhysicalKlineCoverage(ctx context.Context, exs *ExSymbo
 	storageStepMS := int64(utils2.TFToSecs(storageTF) * 1000)
 	_, consumerOffsetSecs := utils2.GetTfAlignOrigin(int(consumerStepMS / 1000))
 	consumerOffsetMS := int64(consumerOffsetSecs * 1000)
-	storageOffsetMS := seriesAlignOff(exs, storageStepMS)
+	storageOffsetMS := q.alignOff(exs, storageStepMS)
 	if storageOffsetMS == 0 && q.symbolByID(exs.ID) == nil && q.usesLegacySymbolCatalog() {
 		storageOffsetMS = GetAlignOff(exs.ID, storageStepMS)
 	}

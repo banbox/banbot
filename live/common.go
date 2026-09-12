@@ -53,6 +53,13 @@ func CronRefreshPairsWithSymbolState(dp data.IProvider, symbols *orm.SymbolState
 // this operation (the official live entry already does so).
 func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, deps *biz.RuntimeDeps,
 	clock *btime.ClockState, exchange banexg.BanExchange, showLog, isFirst bool) *errs.Error {
+	// A symbol catalog by itself does not identify the strategy, order, clock,
+	// or exchange session that owns a live run. Refuse this ambiguous path so a
+	// caller cannot accidentally combine one Runtime's symbols with globals.
+	if deps == nil && symbols != nil {
+		return errs.NewMsg(core.ErrBadConfig,
+			"explicit live pair refresh requires complete runtime dependencies")
+	}
 	var cfg *config.Config
 	if deps != nil {
 		if deps.Config == nil || deps.Config.View() == nil {
@@ -135,9 +142,11 @@ func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, dep
 	} else {
 		// The legacy implementation still updates package-level pair state. Keep
 		// that compatibility mutation scoped to the legacy operation only.
-		oldPairs, oldPairsMap, oldShowLog := core.Pairs, core.PairsMap, goods.ShowLog
+		oldPairs, oldPairsMap := core.LegacyPairStateSnapshot()
+		oldShowLog := goods.ShowLog
 		defer func() {
-			core.Pairs, core.PairsMap, goods.ShowLog = oldPairs, oldPairsMap, oldShowLog
+			core.ReplaceLegacyPairState(oldPairs, oldPairsMap)
+			goods.ShowLog = oldShowLog
 		}()
 		goods.ShowLog = showLog
 		pairs, err = goods.RefreshPairListWithSymbolState(symbols, exchange, curTime)
@@ -245,18 +254,15 @@ func syncRuntimeOrderMatchState(state *core.State) {
 	if state == nil {
 		return
 	}
-	core.LockOdMatch.RLock()
-	state.LockOdMatch.Lock()
-	state.OrderMatchTfs = make(map[string]bool, len(core.OrderMatchTfs))
-	for tf, enabled := range core.OrderMatchTfs {
-		state.OrderMatchTfs[tf] = enabled
-	}
-	state.LockOdMatch.Unlock()
-	core.LockOdMatch.RUnlock()
+	state.ReplaceOrderMatchTfs(core.LegacyOrderMatchTfsSnapshot())
 }
 
 func cronRefreshPairs(scheduler com.Scheduler, dp data.IProvider, symbols *orm.SymbolState, afterRefresh ...func() error) {
 	if scheduler == nil {
+		return
+	}
+	if symbols != nil {
+		log.Error("symbol-only live pair refresh is unsupported; bind complete runtime dependencies")
 		return
 	}
 	if config.PairMgr.Cron != "" {
@@ -267,7 +273,7 @@ func cronRefreshPairs(scheduler com.Scheduler, dp data.IProvider, symbols *orm.S
 				return
 			}
 			lastRefreshMS = curMS
-			err := opt.RefreshPairJobsWithSymbolState(dp, symbols, true, false, nil)
+			err := opt.RefreshPairJobsWithSymbolState(dp, nil, true, false, nil)
 			if err != nil {
 				log.Error("RefreshPairJobs fail", zap.Error(err))
 				return
@@ -468,9 +474,8 @@ func cronKlineSummary(scheduler com.Scheduler) {
 		return
 	}
 	_, err_ := scheduler.AddFunc("30 1-59/10 * * * *", func() {
-		core.TfPairHitsLock.Lock()
 		var pairGroups = make(map[string][]string)
-		for tf, tfMap := range core.TfPairHits {
+		for tf, tfMap := range core.DrainLegacyTfPairHits() {
 			hitMap := make(map[int][]string)
 			for pair, num := range tfMap {
 				arr, _ := hitMap[num]
@@ -480,9 +485,7 @@ func cronKlineSummary(scheduler com.Scheduler) {
 				arrLen := len(arr)
 				pairGroups[fmt.Sprintf("%s_%v: %v", tf, num, arrLen)] = arr
 			}
-			core.TfPairHits[tf] = make(map[string]int)
 		}
-		core.TfPairHitsLock.Unlock()
 		if len(pairGroups) > 0 {
 			staText := core.GroupByPairQuotes(pairGroups, true)
 			log.Info(fmt.Sprintf("receive bars in 10 mins:\n%s", staText))
@@ -618,6 +621,21 @@ type balanceRuntimeDeps struct {
 	interval time.Duration
 }
 
+// snapshotBalanceAccounts copies the low-frequency account configuration at
+// the worker boundary. The worker may outlive a config refresh, so retaining
+// either the source map or its AccountConfig pointers would reintroduce a
+// concurrent map/pointer mutation race.
+func snapshotBalanceAccounts(accounts map[string]*config.AccountConfig) map[string]*config.AccountConfig {
+	if accounts == nil {
+		return nil
+	}
+	snapshot := config.NewSnapshotWithDirs(&config.Config{Accounts: accounts}, "", "")
+	if snapshot == nil || snapshot.View() == nil {
+		return nil
+	}
+	return snapshot.View().Accounts
+}
+
 func bindBalanceRuntimeDeps(deps biz.RuntimeDeps) *balanceRuntimeDeps {
 	bound := &balanceRuntimeDeps{
 		exchange: deps.Exchange,
@@ -636,11 +654,11 @@ func bindBalanceRuntimeDeps(deps biz.RuntimeDeps) *balanceRuntimeDeps {
 		bound.config = deps.Config.View()
 	}
 	if bound.config != nil {
-		bound.accounts = bound.config.Accounts
 		if bound.config.AccountPullSecs > 0 {
 			bound.interval = time.Duration(bound.config.AccountPullSecs) * time.Second
 		}
 	}
+	bound.accounts = snapshotBalanceAccounts(deps.AccountConfigs())
 	return bound
 }
 

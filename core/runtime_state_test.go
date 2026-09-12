@@ -30,6 +30,29 @@ func TestStateExitCallbacksAreScopedAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestRuntimeFlagsUseTypedAccessorsConcurrently(t *testing.T) {
+	state, err := NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for n := 0; n < 1000; n++ {
+				state.SetBotRunning((n+worker)%2 == 0)
+				_ = state.IsBotRunning()
+				state.SetCheckWallets((n+worker)%2 == 0)
+				_ = state.ShouldCheckWallets()
+			}
+		}(worker)
+	}
+	wg.Wait()
+}
+
 func TestSymbolParserConcurrentCacheMisses(t *testing.T) {
 	parser := NewSymbolParser("binance")
 	const workers = 8

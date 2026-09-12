@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -53,6 +54,18 @@ type Process struct {
 	symbolAllocators  map[string]*orm.SIDAllocator
 	sidRegistryMu     sync.Mutex
 	sidRegistries     map[string]*orm.SymbolSIDRegistry
+	schedulerMu       sync.Mutex
+	schedulerClaims   []*schedulerClaim
+}
+
+// schedulerClaim records one Process binding to an externally supplied
+// scheduler. A scheduler can be shared only when every binding explicitly
+// marks it borrowed; otherwise Runtime.Close would have no safe way to stop
+// only its own jobs.
+type schedulerClaim struct {
+	scheduler com.Scheduler
+	borrowed  bool
+	refs      int
 }
 
 // activeProcesses is a low-frequency lifecycle registry used by process
@@ -175,8 +188,17 @@ func (p *Process) unregisterRuntime(target *Runtime) {
 }
 
 func (p *Process) initSIDRegistry(url string, autoCreate bool) (*orm.SymbolSIDRegistry, error) {
+	registry, _, err := p.initSIDRegistryOwned(url, autoCreate)
+	return registry, err
+}
+
+// initSIDRegistryOwned is the construction-boundary variant of
+// initSIDRegistry. The created flag lets NewRuntime roll back a registry that
+// was allocated for a failed construction, while keeping shared registries
+// alive for sibling runtimes.
+func (p *Process) initSIDRegistryOwned(url string, autoCreate bool) (*orm.SymbolSIDRegistry, bool, error) {
 	if p == nil || strings.TrimSpace(url) == "" {
-		return nil, nil
+		return nil, false, nil
 	}
 	url = strings.TrimSpace(url)
 	p.sidRegistryMu.Lock()
@@ -186,16 +208,16 @@ func (p *Process) initSIDRegistry(url string, autoCreate bool) (*orm.SymbolSIDRe
 	}
 	if registry := p.sidRegistries[url]; registry != nil {
 		if registry.AutoCreate() != autoCreate {
-			return nil, fmt.Errorf("runtime: SID registry %q already uses auto-create=%t, requested %t", url, registry.AutoCreate(), autoCreate)
+			return nil, false, fmt.Errorf("runtime: SID registry %q already uses auto-create=%t, requested %t", url, registry.AutoCreate(), autoCreate)
 		}
-		return registry, nil
+		return registry, false, nil
 	}
 	registry, err := orm.NewSymbolSIDRegistry(url, autoCreate)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	p.sidRegistries[url] = registry
-	return registry, nil
+	return registry, true, nil
 }
 
 func (p *Process) initSymbolAllocator(namespace, dataDir string, registry *orm.SymbolSIDRegistry) (*orm.SIDAllocator, error) {
@@ -215,6 +237,126 @@ func (p *Process) initSymbolAllocator(namespace, dataDir string, registry *orm.S
 		return nil, err
 	}
 	return allocator, nil
+}
+
+func sameScheduler(left, right com.Scheduler) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftType, rightType := reflect.TypeOf(left), reflect.TypeOf(right)
+	if leftType != rightType {
+		return false
+	}
+	if leftType.Comparable() {
+		return left == right
+	}
+	leftValue, rightValue := reflect.ValueOf(left), reflect.ValueOf(right)
+	if leftValue.Kind() == reflect.Pointer {
+		return leftValue.Pointer() == rightValue.Pointer()
+	}
+	return false
+}
+
+func (p *Process) claimScheduler(scheduler com.Scheduler, borrowed bool) (*schedulerClaim, error) {
+	if p == nil || scheduler == nil {
+		return nil, nil
+	}
+	p.schedulerMu.Lock()
+	defer p.schedulerMu.Unlock()
+	for _, claim := range p.schedulerClaims {
+		if claim == nil || !sameScheduler(claim.scheduler, scheduler) {
+			continue
+		}
+		if !borrowed || !claim.borrowed {
+			return nil, fmt.Errorf("runtime: scheduler is already bound; shared schedulers must be explicitly borrowed by every runtime")
+		}
+		claim.refs++
+		return claim, nil
+	}
+	claim := &schedulerClaim{scheduler: scheduler, borrowed: borrowed, refs: 1}
+	p.schedulerClaims = append(p.schedulerClaims, claim)
+	return claim, nil
+}
+
+func (p *Process) releaseSchedulerClaim(claim *schedulerClaim) {
+	if p == nil || claim == nil {
+		return
+	}
+	p.schedulerMu.Lock()
+	if claim.refs > 0 {
+		claim.refs--
+	}
+	if claim.refs == 0 {
+		for index, current := range p.schedulerClaims {
+			if current != claim {
+				continue
+			}
+			copy(p.schedulerClaims[index:], p.schedulerClaims[index+1:])
+			p.schedulerClaims[len(p.schedulerClaims)-1] = nil
+			p.schedulerClaims = p.schedulerClaims[:len(p.schedulerClaims)-1]
+			break
+		}
+	}
+	p.schedulerMu.Unlock()
+}
+
+func (p *Process) waitForRuntimeConstructions() {
+	if p == nil {
+		return
+	}
+	p.runtimeMu.Lock()
+	condition := p.runtimeConditionLocked()
+	for p.runtimeConstructing > 0 {
+		condition.Wait()
+	}
+	p.runtimeMu.Unlock()
+}
+
+// releaseFailedRuntimeDependencies removes process-scoped state created by a
+// failed construction after all sibling constructors have quiesced. A shared
+// allocator or registry remains alive when a successfully registered Runtime
+// still references it.
+func (p *Process) releaseFailedRuntimeDependencies(namespace string, allocator *orm.SIDAllocator,
+	registryURL string, registry *orm.SymbolSIDRegistry) {
+	if p == nil {
+		return
+	}
+	p.runtimeMu.Lock()
+	if p.runtimeConstructing != 0 {
+		p.runtimeMu.Unlock()
+		return
+	}
+	allocatorUsed := false
+	for _, runtime := range p.runtimes {
+		if runtime != nil && runtime.Symbols != nil && runtime.Symbols.SIDAllocator() == allocator {
+			allocatorUsed = true
+			break
+		}
+	}
+	p.symbolAllocatorMu.Lock()
+	if allocator != nil && !allocatorUsed && strings.TrimSpace(namespace) != "" &&
+		p.symbolAllocators[namespace] == allocator {
+		delete(p.symbolAllocators, namespace)
+	}
+	registryUsed := false
+	if registry != nil {
+		for _, current := range p.symbolAllocators {
+			if current != nil && current.SIDRegistry() == registry {
+				registryUsed = true
+				break
+			}
+		}
+	}
+	p.symbolAllocatorMu.Unlock()
+	if registry != nil && !registryUsed {
+		p.sidRegistryMu.Lock()
+		if strings.TrimSpace(registryURL) != "" && p.sidRegistries[registryURL] == registry {
+			delete(p.sidRegistries, registryURL)
+			registry.Close()
+		}
+		p.sidRegistryMu.Unlock()
+	}
+	p.runtimeMu.Unlock()
 }
 
 // Close releases process-owned low-frequency dependencies after all runtimes
@@ -317,24 +459,32 @@ type Options struct {
 	NetDisable       bool
 	ParallelOnBar    bool
 	Scheduler        com.Scheduler
-	Catalog          *data.DataSourceCatalog
-	Dump             *orm.DumpSink
+	// SchedulerBorrowed must be true for every Runtime that shares an external
+	// scheduler. Borrowed schedulers are never stopped by Runtime.Close; their
+	// owner is responsible for stopping them after all runtimes have joined.
+	SchedulerBorrowed bool
+	Catalog           *data.DataSourceCatalog
+	Dump              *orm.DumpSink
 }
 
 // Runtime is the typed composition root for the first migration slice. The
 // remaining domain managers will be added here as they leave their legacy
 // facades; no domain package imports runtime.
 type Runtime struct {
-	Process       *Process
-	ID            string
-	Core          *core.State
-	Config        *config.Snapshot
-	Clock         *btime.ClockState
-	Market        *com.MarketState
-	Symbols       *orm.SymbolState
-	Storage       *orm.Storage
-	Batch         *strat.BatchState
-	Strategies    *strat.State
+	Process    *Process
+	ID         string
+	Core       *core.State
+	Config     *config.Snapshot
+	Clock      *btime.ClockState
+	Market     *com.MarketState
+	Symbols    *orm.SymbolState
+	Storage    *orm.Storage
+	Batch      *strat.BatchState
+	Strategies *strat.State
+	// Accounts is the mutable execution account state shared by Trader, Wallet,
+	// and Strategy for this Runtime. Config remains an immutable snapshot.
+	Accounts      map[string]*config.AccountConfig
+	accountsMu    sync.RWMutex
 	Orders        *ormo.OrderState
 	Trading       *biz.TradingState
 	Cron          com.Scheduler
@@ -342,8 +492,10 @@ type Runtime struct {
 	Catalog       *data.DataSourceCatalog
 	// Exchange is a runtime dependency, not an ownership claim. The entry
 	// layer decides when the adapter session is closed.
-	Exchange banexg.BanExchange
-	Dump     *orm.DumpSink
+	Exchange          banexg.BanExchange
+	Dump              *orm.DumpSink
+	schedulerClaim    *schedulerClaim
+	schedulerBorrowed bool
 
 	closeMu           sync.Mutex
 	closeDone         chan struct{}
@@ -367,7 +519,26 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	if err := p.beginRuntimeConstruction(); err != nil {
 		return nil, err
 	}
-	defer p.finishRuntimeConstruction()
+	var sidRegistryURL string
+	var sidRegistry *orm.SymbolSIDRegistry
+	var allocator *orm.SIDAllocator
+	var allocatorNamespace string
+	var schedulerClaim *schedulerClaim
+	schedulerClaimReleased := false
+	constructed := false
+	defer func() {
+		p.finishRuntimeConstruction()
+		if !constructed {
+			// Wait for sibling constructors before deciding whether shared state is
+			// still referenced. This also lets the final failed constructor clean
+			// up resources created by an earlier failed sibling.
+			p.waitForRuntimeConstructions()
+			p.releaseFailedRuntimeDependencies(allocatorNamespace, allocator, sidRegistryURL, sidRegistry)
+			if schedulerClaim != nil && !schedulerClaimReleased {
+				p.releaseSchedulerClaim(schedulerClaim)
+			}
+		}
+	}()
 
 	runtimeOrdinal := p.nextID.Add(1)
 	contractTypeExplicit := opts.ContractType != ""
@@ -392,6 +563,9 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	}
 	if (opts.ExchangeName == "") != (opts.Market == "") {
 		return nil, fmt.Errorf("runtime: exchange and market must be provided together")
+	}
+	if err := validateRuntimeExchangeIdentity(opts.Exchange, opts.ExchangeName, opts.Market); err != nil {
+		return nil, err
 	}
 	symbolExchange, symbolMarket := opts.ExchangeName, opts.Market
 	if symbolExchange == "" {
@@ -431,9 +605,6 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		}
 	}
 	scheduler := opts.Scheduler
-	if scheduler == nil {
-		scheduler = com.NewSchedulerWithConfig(schedulerLocation, schedulerLang)
-	}
 	id := opts.ID
 	if id == "" {
 		id = fmt.Sprintf("runtime-%d", runtimeOrdinal)
@@ -459,10 +630,11 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		// Keep its allocator private instead of merging it into a literal default.
 		storageNamespace = fmt.Sprintf("runtime:%d", runtimeOrdinal)
 	}
-	var sidRegistry *orm.SymbolSIDRegistry
+	allocatorNamespace = storageNamespace
 	if snapshotConfig != nil && snapshotConfig.Database != nil {
 		var registryErr error
-		sidRegistry, registryErr = p.initSIDRegistry(snapshotConfig.Database.SIDRegistryURL, snapshotConfig.Database.AutoCreate)
+		sidRegistryURL = strings.TrimSpace(snapshotConfig.Database.SIDRegistryURL)
+		sidRegistry, _, registryErr = p.initSIDRegistryOwned(sidRegistryURL, snapshotConfig.Database.AutoCreate)
 		if registryErr != nil {
 			return nil, fmt.Errorf("runtime: initialize SID registry: %w", registryErr)
 		}
@@ -512,7 +684,8 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	if opts.StartAt != 0 {
 		clock.SetTimeMS(opts.StartAt)
 	}
-	allocator, allocatorErr := p.initSymbolAllocator(storageNamespace, opts.DataDir, sidRegistry)
+	var allocatorErr error
+	allocator, allocatorErr = p.initSymbolAllocator(storageNamespace, opts.DataDir, sidRegistry)
 	if allocatorErr != nil {
 		coreState.Close()
 		return nil, allocatorErr
@@ -528,25 +701,49 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 			return nil, fmt.Errorf("runtime: bind symbol recovery directory: %w", err)
 		}
 	}
-	runtime := &Runtime{
-		Process:    p,
-		ID:         id,
-		Core:       coreState,
-		Config:     snapshot,
-		Clock:      clock,
-		Market:     com.NewMarketStateWithExchange(opts.ExchangeName, opts.Exchange),
-		Symbols:    symbols,
-		Storage:    opts.Storage,
-		Batch:      strat.NewBatchState(),
-		Strategies: strat.NewState(),
-		Orders:     ormo.NewOrderState(),
-		Trading:    biz.NewTradingState(),
-		Cron:       scheduler,
-		Exchange:   opts.Exchange,
-		Catalog:    catalog,
-		Dump:       opts.Dump,
-		closeDone:  make(chan struct{}),
+	if scheduler == nil {
+		scheduler = com.NewSchedulerWithConfig(schedulerLocation, schedulerLang)
 	}
+	schedulerClaim, allocatorErr = p.claimScheduler(scheduler, opts.SchedulerBorrowed)
+	if allocatorErr != nil {
+		coreState.Close()
+		return nil, allocatorErr
+	}
+	runtimeAccounts := biz.NormalizeRuntimeAccounts(biz.RuntimeDeps{
+		Core: coreState, Config: snapshot, Accounts: func() map[string]*config.AccountConfig {
+			if opts.Config != nil {
+				return opts.Config.Accounts
+			}
+			if snapshotConfig != nil {
+				return snapshotConfig.Accounts
+			}
+			return nil
+		}(), DefaultAccount: snapshot.DefaultAccount(),
+	})
+	runtime := &Runtime{
+		Process:           p,
+		ID:                id,
+		Core:              coreState,
+		Config:            snapshot,
+		Clock:             clock,
+		Market:            com.NewMarketStateWithExchange(opts.ExchangeName, opts.Exchange),
+		Symbols:           symbols,
+		Storage:           opts.Storage,
+		Batch:             strat.NewBatchState(),
+		Strategies:        strat.NewState(),
+		Accounts:          runtimeAccounts,
+		Orders:            ormo.NewOrderState(),
+		Trading:           biz.NewTradingState(),
+		Cron:              scheduler,
+		Exchange:          opts.Exchange,
+		Catalog:           catalog,
+		Dump:              opts.Dump,
+		schedulerClaim:    schedulerClaim,
+		schedulerBorrowed: opts.SchedulerBorrowed,
+		closeDone:         make(chan struct{}),
+	}
+	runtime.Strategies.BindRuntimeAccounts(runtimeAccounts)
+	runtime.Strategies.BindRuntimeAccountsLock(&runtime.accountsMu)
 	runtime.Orders.BindCore(coreState)
 	runtime.Orders.BindRuntime(clock, runtime.Market.Prices, opts.Exchange, snapshotConfig)
 	runtime.Orders.SetLive(coreState.LiveMode)
@@ -575,6 +772,7 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		p.runtimeMu.Unlock()
 		runtime.Close()
 		runtime.Join()
+		schedulerClaimReleased = true
 		return nil, fmt.Errorf("runtime: process is closed")
 	}
 	if !p.registered {
@@ -583,7 +781,54 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	}
 	p.runtimes = append(p.runtimes, runtime)
 	p.runtimeMu.Unlock()
+	constructed = true
 	return runtime, nil
+}
+
+// validateRuntimeExchangeIdentity prevents a Runtime from pairing an adapter
+// for one exchange/market with symbol and routing metadata for another. An
+// explicit identity is only accepted when the adapter can prove both halves
+// of that identity.
+func validateRuntimeExchangeIdentity(exchange banexg.BanExchange, name, market string) error {
+	if exchange == nil {
+		return nil
+	}
+	// Identity-free runtimes are useful for non-symbol capabilities. Their
+	// adapter metadata is still checked by data identity before symbol access.
+	if name == "" && market == "" {
+		return nil
+	}
+	info, err := runtimeExchangeInfo(exchange)
+	if err != nil {
+		return fmt.Errorf("runtime: adapter identity is unavailable: %w", err)
+	}
+	if info == nil || info.ID == "" || info.MarketType == "" {
+		return fmt.Errorf("runtime: adapter identity metadata is incomplete")
+	}
+	if info.ID != "" && name != "" && info.ID != name {
+		return fmt.Errorf("runtime: exchange identity %q does not match adapter %q", name, info.ID)
+	}
+	if info.MarketType != "" && market != "" && info.MarketType != market {
+		return fmt.Errorf("runtime: market identity %q does not match adapter %q", market, info.MarketType)
+	}
+	return nil
+}
+
+func runtimeExchangeInfo(exchange banexg.BanExchange) (info *banexg.ExgInfo, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			info = nil
+			err = fmt.Errorf("adapter Info panicked: %v", recovered)
+		}
+	}()
+	if exchange == nil {
+		return nil, fmt.Errorf("adapter is nil")
+	}
+	info = exchange.Info()
+	if info == nil {
+		return nil, fmt.Errorf("adapter Info returned nil")
+	}
+	return info, nil
 }
 
 func runtimeStorageNamespace(opts Options, snapshot *config.Snapshot) string {
@@ -619,6 +864,66 @@ func (r *Runtime) Context() context.Context {
 		return nil
 	}
 	return r.Core.Context()
+}
+
+// BizDeps returns the narrow, typed dependency view consumed by biz and live
+// components. Keeping this conversion at the composition root prevents each
+// caller from silently dropping a newly-added runtime dependency.
+func (r *Runtime) BizDeps() biz.RuntimeDeps {
+	if r == nil {
+		return biz.RuntimeDeps{}
+	}
+	defaultAccount := ""
+	if r.Config != nil {
+		defaultAccount = r.Config.DefaultAccount()
+	}
+	return biz.RuntimeDeps{
+		Core:           r.Core,
+		Clock:          r.Clock,
+		Market:         r.Market,
+		Batch:          r.Batch,
+		Strategies:     r.Strategies,
+		Orders:         r.Orders,
+		Trading:        r.Trading,
+		Config:         r.Config,
+		Accounts:       r.Accounts,
+		AccountsOwned:  true,
+		AccountsMu:     &r.accountsMu,
+		Symbols:        r.Symbols,
+		Storage:        r.Storage,
+		Exchange:       r.Exchange,
+		Dump:           r.Dump,
+		Scheduler:      r.Scheduler(),
+		Notifications:  r.Notifications,
+		DefaultAccount: defaultAccount,
+	}
+}
+
+// DataDeps returns the narrow, typed dependency view consumed by data
+// providers. The Runtime itself is the callback admission barrier.
+func (r *Runtime) DataDeps() *data.RuntimeDeps {
+	if r == nil {
+		return nil
+	}
+	exchangeName, marketType := "", ""
+	if r.Core != nil {
+		exchangeName, marketType = r.Core.ExgName, r.Core.Market
+	}
+	return &data.RuntimeDeps{
+		Core:         r.Core,
+		Clock:        r.Clock,
+		Config:       r.Config,
+		Market:       r.Market,
+		Symbols:      r.Symbols,
+		Storage:      r.Storage,
+		Strategies:   r.Strategies,
+		Catalog:      r.Catalog,
+		Callbacks:    r,
+		Exchange:     r.Exchange,
+		Dump:         r.Dump,
+		ExchangeName: exchangeName,
+		MarketType:   marketType,
+	}
 }
 
 // EnterCallback admits a callback that may call Runtime.Close. Close changes
@@ -951,7 +1256,7 @@ func (r *Runtime) waitStop() {
 }
 
 func (r *Runtime) stopScheduler() {
-	if r == nil || r.Cron == nil {
+	if r == nil || r.Cron == nil || r.schedulerBorrowed {
 		return
 	}
 	r.closeMu.Lock()
@@ -981,7 +1286,11 @@ func (r *Runtime) finishClose() {
 		r.closePhase = closeClosed
 		close(r.closeDone)
 		r.closeMu.Unlock()
-		process.unregisterRuntime(r)
+		if process != nil {
+			process.unregisterRuntime(r)
+			process.releaseSchedulerClaim(r.schedulerClaim)
+		}
+		r.schedulerClaim = nil
 		return
 	}
 	r.closeMu.Unlock()

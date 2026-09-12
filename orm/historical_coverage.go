@@ -5,7 +5,7 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	utils2 "github.com/banbox/banexg/utils"
 )
@@ -318,11 +318,11 @@ func readHistoricalCoverageSeries(coverage *config.HistoricalCoverageConfig, exs
 
 func readHistoricalCoverageSeriesWithOptions(coverage *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
 	startMS, endMS int64, limit int, withUnFinish bool, read historicalSeriesFieldsReader,
-	options coverageQueryOptions,
+	options coverageQueryOptions, exchange ...banexg.BanExchange,
 ) ([]*AdjInfo, []*DataSeries, *errs.Error) {
 	symbol := exs.Symbol
 	intervals := historicalCoverageIntervalsWithOptions(coverage, symbol, timeframe, startMS, endMS, options)
-	intervals = extendLegacyListingCoverageWithOptions(coverage, exs, timeframe, startMS, intervals, options)
+	intervals = extendLegacyListingCoverageWithOptions(coverage, exs, timeframe, startMS, intervals, options, exchange...)
 	return readHistoricalCoverageIntervals(coverage, exs, timeframe, startMS, endMS, limit,
 		withUnFinish, intervals, read)
 }
@@ -400,8 +400,9 @@ func extendLegacyListingCoverage(coverage *config.HistoricalCoverageConfig, exs 
 
 func extendLegacyListingCoverageWithOptions(coverage *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
 	requestedStartMS int64, intervals []historicalCoverageInterval, options coverageQueryOptions,
+	exchange ...banexg.BanExchange,
 ) []historicalCoverageInterval {
-	prefix, ok := legacyListingPrefixProofWithOptions(coverage, exs, timeframe, requestedStartMS, intervals, options)
+	prefix, ok := legacyListingPrefixProofWithOptions(coverage, exs, timeframe, requestedStartMS, intervals, options, exchange...)
 	if !ok {
 		return intervals
 	}
@@ -419,6 +420,7 @@ func legacyListingPrefixProof(coverage *config.HistoricalCoverageConfig, exs *Ex
 
 func legacyListingPrefixProofWithOptions(coverage *config.HistoricalCoverageConfig, exs *ExSymbol, timeframe string,
 	requestedStartMS int64, intervals []historicalCoverageInterval, options coverageQueryOptions,
+	exchange ...banexg.BanExchange,
 ) (historicalListingPrefix, bool) {
 	if !options.strict || coverage == nil || exs == nil || exs.ListMs <= 0 || len(intervals) == 0 {
 		return historicalListingPrefix{}, false
@@ -443,7 +445,7 @@ func legacyListingPrefixProofWithOptions(coverage *config.HistoricalCoverageConf
 		return historicalListingPrefix{}, false
 	}
 	minuteStart := alignPhysicalKlineCeil(exs.ListMs, 60_000,
-		int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, 60)*1000))
+		seriesAlignOff(exs, 60_000, exchange...))
 	if historicalListingPrefixStartsBeforeWithOptions(coverage, exs.Symbol, "1m", minuteStart, fullStart, options) {
 		return historicalListingPrefix{}, false
 	}
@@ -458,7 +460,7 @@ func legacyListingPrefixProofWithOptions(coverage *config.HistoricalCoverageConf
 		return historicalListingPrefix{}, false
 	}
 	storageStepMS := int64(storageSecs * 1000)
-	storageOffsetMS := int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, storageSecs) * 1000)
+	storageOffsetMS := seriesAlignOff(exs, storageStepMS, exchange...)
 	storageStart := alignPhysicalKlineCeil(exs.ListMs, storageStepMS, storageOffsetMS)
 	if storageTF != timeframe && storageStart < fullStart {
 		if historicalListingPrefixStartsBeforeWithOptions(coverage, exs.Symbol, storageTF, storageStart, fullStart, options) {
@@ -542,7 +544,7 @@ func historicalListingPrefixStartsBeforeWithOptions(coverage *config.HistoricalC
 }
 
 func prependHistoricalListingPrefix(exs *ExSymbol, prefix historicalListingPrefix,
-	minuteRows, storageRows []*DataSeries,
+	minuteRows, storageRows []*DataSeries, exchange ...banexg.BanExchange,
 ) ([]*DataSeries, *errs.Error) {
 	if prefix.minuteStartMS >= prefix.storageStartMS {
 		return storageRows, nil
@@ -567,7 +569,7 @@ func prependHistoricalListingPrefix(exs *ExSymbol, prefix historicalListingPrefi
 		return nil, errs.NewMsg(core.ErrInvalidTF, "invalid historical storage timeframe: %s", prefix.storageTF)
 	}
 	storageMS := int64(storageSecs * 1000)
-	offsetMS := int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, storageSecs) * 1000)
+	offsetMS := seriesAlignOff(exs, storageMS, exchange...)
 	aggregated, finished, aggErr := ResampleDataSeries(exs, prefix.storageTF, minuteRows, nil,
 		storageMS, 0, minuteMS, offsetMS, false)
 	wantTimeMS := alignPhysicalKlineFloor(prefix.minuteStartMS, storageMS, offsetMS)

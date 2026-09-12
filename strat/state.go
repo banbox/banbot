@@ -30,12 +30,16 @@ type State struct {
 	// Runtime-owned dependencies are bound once at construction. They are
 	// concrete pointers so strategy/data hot paths do not perform dynamic
 	// lookups or use process-wide configuration.
-	Core      *core.State
-	Clock     *btime.ClockState
-	Config    *config.Config
-	Symbols   *orm.SymbolState
-	Exchange  banexg.BanExchange
-	factories map[string]FuncMakeStrat
+	Core   *core.State
+	Clock  *btime.ClockState
+	Config *config.Config
+	// runtimeAccounts is the mutable execution account state owned by a Runtime.
+	// It is separate from Config because StakePctAmt changes while a run is live.
+	runtimeAccounts   map[string]*config.AccountConfig
+	runtimeAccountsMu *sync.RWMutex
+	Symbols           *orm.SymbolState
+	Exchange          banexg.BanExchange
+	factories         map[string]FuncMakeStrat
 
 	Versions    map[string]int
 	Envs        map[string]*ta.BarEnv
@@ -110,6 +114,27 @@ func (s *State) BindRuntime(coreState *core.State, clock *btime.ClockState, cfg 
 	s.Exchange = exchange
 }
 
+// BindRuntimeAccounts attaches the Runtime-owned account execution state.
+// Keeping this as a separate binding preserves the narrow legacy constructor
+// while allowing wallets and strategies to observe the same StakePctAmt values.
+func (s *State) BindRuntimeAccounts(accounts map[string]*config.AccountConfig) {
+	if s == nil {
+		return
+	}
+	s.runtimeAccounts = accounts
+}
+
+// BindRuntimeAccountsLock binds the composition root's account lock. It is a
+// separate method to keep the existing map-only API source-compatible while
+// allowing wallet and strategy stake updates to synchronize on one instance
+// lock.
+func (s *State) BindRuntimeAccountsLock(lock *sync.RWMutex) {
+	if s == nil {
+		return
+	}
+	s.runtimeAccountsMu = lock
+}
+
 func runtimeConfigFor(state *State) *config.Config {
 	if state != nil && state != legacyState {
 		return state.Config
@@ -141,6 +166,9 @@ func strictBacktestFor(state *State, coreState *core.State) bool {
 
 func runtimeAccountsFor(state *State) map[string]*config.AccountConfig {
 	if state != nil && state != legacyState {
+		if state.runtimeAccounts != nil {
+			return state.runtimeAccounts
+		}
 		if state.Config == nil {
 			return nil
 		}
@@ -685,6 +713,8 @@ func newStrategyWithState(state *State, pol *config.RunPolicyConfig) *TradeStrat
 	stgy.Policy = localPol
 	runtimeCfg := runtimeConfigFor(state)
 	stgy.runtimeConfig = runtimeCfg
+	stgy.runtimeAccounts = state.runtimeAccounts
+	stgy.runtimeAccountsMu = state.runtimeAccountsMu
 	stgy.runtimeCore = state.Core
 	stgy.runtimeClock = state.Clock
 	stgy.runtimeExplicit = true

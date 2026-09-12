@@ -90,7 +90,7 @@ func createConfigured(name, market, contractType string, exchangeConfig *config.
 	var defAcc string
 	for _, key := range slices.Sorted(maps.Keys(backups)) {
 		acc := backups[key]
-		sec := acc.GetApiSecret()
+		sec := acc.GetApiSecretFor(name, env)
 		accs[key] = map[string]interface{}{
 			banexg.OptApiKey:    sec.APIKey,
 			banexg.OptApiSecret: sec.APISecret,
@@ -104,7 +104,7 @@ func createConfigured(name, market, contractType string, exchangeConfig *config.
 		if acc.NoTrade {
 			continue
 		}
-		sec := acc.GetApiSecret()
+		sec := acc.GetApiSecretFor(name, env)
 		accs[key] = map[string]interface{}{
 			banexg.OptApiKey:    sec.APIKey,
 			banexg.OptApiSecret: sec.APISecret,

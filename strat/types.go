@@ -1,6 +1,7 @@
 package strat
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/banbox/banbot/btime"
@@ -46,11 +47,13 @@ type TradeStrat struct {
 	// Explicit runtimes bind these concrete dependencies once while loading a
 	// strategy. Legacy strategies leave them nil and keep the compatibility
 	// facade behavior.
-	runtimeConfig   *config.Config
-	runtimeCore     *core.State
-	runtimeClock    *btime.ClockState
-	runtimeExplicit bool
-	outputState     *tradeStratOutputState
+	runtimeConfig     *config.Config
+	runtimeAccounts   map[string]*config.AccountConfig
+	runtimeAccountsMu *sync.RWMutex
+	runtimeCore       *core.State
+	runtimeClock      *btime.ClockState
+	runtimeExplicit   bool
+	outputState       *tradeStratOutputState
 
 	OnPairInfos         func(s *StratJob) []*PairSub
 	OnDataSubs          func(s *StratJob) []*DataSub

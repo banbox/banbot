@@ -66,11 +66,11 @@ func (t *Telegram) nowMS() int64 {
 func (t *Telegram) noEnterUntil() map[string]int64 {
 	if t.session != nil {
 		if t.session.Core != nil {
-			return t.session.Core.NoEnterUntil
+			return t.session.Core.NoEnterUntilSnapshot()
 		}
 		return nil
 	}
-	return core.NoEnterUntil
+	return core.LegacyNoEnterUntilSnapshot()
 }
 
 func (t *Telegram) noEnterUntilFor(account string) (int64, bool) {
@@ -80,8 +80,7 @@ func (t *Telegram) noEnterUntilFor(account string) (int64, bool) {
 		}
 		return 0, false
 	}
-	until, ok := core.NoEnterUntil[account]
-	return until, ok
+	return core.LegacyNoEnterUntilFor(account)
 }
 
 func (t *Telegram) currentDashboard() *utils2.ClientIO {

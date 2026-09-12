@@ -3,14 +3,14 @@ package biz
 import "sync"
 
 // TradingState owns the account-scoped managers and wallets for one Runtime.
-// The maps are deliberately concrete: construction happens at the lifecycle
-// boundary, while order processing reads a direct map entry on the hot path.
-// The legacy package maps remain available only through the compatibility
-// constructors and Get* facade functions.
+// The maps are deliberately concrete: lifecycle code can bind them directly,
+// while lookup and lazy writes use the per-runtime registry lock. The legacy
+// package maps remain available only through compatibility facades.
 type TradingState struct {
 	OrderManagers map[string]IOrderMgr
 	LiveManagers  map[string]*LiveOrderMgr
 	Wallets       map[string]*BanWallets
+	registryMu    sync.RWMutex
 	triggerMu     sync.Mutex
 
 	snapshotMu  sync.Mutex
@@ -29,6 +29,12 @@ func (s *TradingState) ensure() {
 	if s == nil {
 		return
 	}
+	s.registryMu.Lock()
+	s.ensureLocked()
+	s.registryMu.Unlock()
+}
+
+func (s *TradingState) ensureLocked() {
 	if s.OrderManagers == nil {
 		s.OrderManagers = make(map[string]IOrderMgr)
 	}
@@ -44,27 +50,97 @@ func (s *TradingState) OrderManager(account string) IOrderMgr {
 	if s == nil {
 		return nil
 	}
-	return s.OrderManagers[account]
+	s.registryMu.RLock()
+	manager := s.OrderManagers[account]
+	s.registryMu.RUnlock()
+	return manager
 }
 
 func (s *TradingState) LiveManager(account string) *LiveOrderMgr {
 	if s == nil {
 		return nil
 	}
-	return s.LiveManagers[account]
+	s.registryMu.RLock()
+	manager := s.LiveManagers[account]
+	s.registryMu.RUnlock()
+	return manager
 }
 
 func (s *TradingState) Wallet(account string) *BanWallets {
 	if s == nil {
 		return nil
 	}
-	s.ensure()
+	s.registryMu.Lock()
+	s.ensureLocked()
 	wallet := s.Wallets[account]
 	if wallet == nil {
 		wallet = &BanWallets{Items: make(map[string]*ItemWallet), Account: account}
 		s.Wallets[account] = wallet
 	}
+	s.registryMu.Unlock()
 	return wallet
+}
+
+// SetOrderManager binds one account manager while preserving the concrete
+// registry used by the hot path. A nil manager removes the account entry.
+func (s *TradingState) SetOrderManager(account string, manager IOrderMgr) {
+	if s == nil {
+		return
+	}
+	s.registryMu.Lock()
+	s.ensureLocked()
+	if manager == nil {
+		delete(s.OrderManagers, account)
+	} else {
+		s.OrderManagers[account] = manager
+	}
+	s.registryMu.Unlock()
+}
+
+// SetLiveManager binds one account's live manager. A nil manager removes the
+// account entry.
+func (s *TradingState) SetLiveManager(account string, manager *LiveOrderMgr) {
+	if s == nil {
+		return
+	}
+	s.registryMu.Lock()
+	s.ensureLocked()
+	if manager == nil {
+		delete(s.LiveManagers, account)
+	} else {
+		s.LiveManagers[account] = manager
+	}
+	s.registryMu.Unlock()
+}
+
+// OrderManagersSnapshot returns a typed copy for lifecycle operations that
+// need to iterate the registry without holding the state lock while running a
+// manager callback.
+func (s *TradingState) OrderManagersSnapshot() map[string]IOrderMgr {
+	if s == nil {
+		return nil
+	}
+	s.registryMu.RLock()
+	result := make(map[string]IOrderMgr, len(s.OrderManagers))
+	for account, manager := range s.OrderManagers {
+		result[account] = manager
+	}
+	s.registryMu.RUnlock()
+	return result
+}
+
+// LiveManagersSnapshot returns a typed copy of the live manager registry.
+func (s *TradingState) LiveManagersSnapshot() map[string]*LiveOrderMgr {
+	if s == nil {
+		return nil
+	}
+	s.registryMu.RLock()
+	result := make(map[string]*LiveOrderMgr, len(s.LiveManagers))
+	for account, manager := range s.LiveManagers {
+		result[account] = manager
+	}
+	s.registryMu.RUnlock()
+	return result
 }
 
 func (s *TradingState) snapshotConfig() *walletSnapshotCfg {
@@ -85,9 +161,11 @@ func (s *TradingState) Reset() {
 	if s == nil {
 		return
 	}
+	s.registryMu.Lock()
 	s.OrderManagers = make(map[string]IOrderMgr)
 	s.LiveManagers = make(map[string]*LiveOrderMgr)
 	s.Wallets = make(map[string]*BanWallets)
+	s.registryMu.Unlock()
 	s.snapshotMu.Lock()
 	s.snapshotCfg = nil
 	s.snapshotMu.Unlock()

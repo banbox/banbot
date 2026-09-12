@@ -11,6 +11,31 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+func TestExplicitQueryAlignmentUsesBoundExchange(t *testing.T) {
+	const hourMS = int64(60 * 60 * 1000)
+	const dayMS = 24 * hourMS
+	const wantOffsetMS = 6 * hourMS
+	exs := &ExSymbol{ID: 7, Exchange: "legacy", Market: banexg.MarketSpot, Symbol: "RUNTIME/USDT"}
+	exchange := &localReadExchange{
+		info: &banexg.ExgInfo{ID: "runtime", MarketType: banexg.MarketSpot},
+		market: &banexg.Market{
+			Symbol:     exs.Symbol,
+			DayTimes:   [][2]int64{{9 * hourMS, 15 * hourMS}},
+			NightTimes: [][2]int64{{21 * hourMS, 23 * hourMS}},
+		},
+	}
+	state := NewSymbolStateWithIdentity(exs.Exchange, exs.Market)
+	q := NewWithStorage(nil, NewStorage(nil, true, "storage:alignment"))
+	q = q.WithSeriesSymbolState(state).WithExchange(exchange)
+
+	if got := q.alignOff(exs, dayMS); got != wantOffsetMS {
+		t.Fatalf("explicit alignment offset = %d, want %d", got, wantOffsetMS)
+	}
+	if got := q.alignOff(exs, hourMS); got != 0 {
+		t.Fatalf("short timeframe alignment offset = %d, want 0", got)
+	}
+}
+
 func TestResampleDataSeriesPreservesOHLCVSemantics(t *testing.T) {
 	exs := &ExSymbol{ID: 7, Symbol: "BTC/USDT"}
 	rows := []*DataSeries{
@@ -144,6 +169,85 @@ func TestResampleDataSeriesUsesAggRulesForKlineExtensionsAndPreservesBuiltins(t 
 	}
 	if value, ok := got[0].Values["average"].(float64); !ok || value != 13.0/3.0 {
 		t.Fatalf("extension avg was not evaluated over the whole bucket: value=%#v type=%T", got[0].Values["average"], got[0].Values["average"])
+	}
+}
+
+func TestResampleDataSeriesPreservesRawInputsAcrossBatches(t *testing.T) {
+	exs := &ExSymbol{
+		ID: 7, Symbol: "BTC/USDT",
+		AggRules: `{"average":"avg"}`,
+	}
+	base := int64(1_700_000_100_000)
+	rows := make([]*DataSeries, 0, 3)
+	for i, value := range []float64{1, 3, 9} {
+		row := NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+			Time: base + int64(i)*60_000, Open: 10, High: 10, Low: 10, Close: 10, Volume: 1,
+		}, nil, false, true)
+		row.Values["average"] = value
+		rows = append(rows, row)
+	}
+
+	first, done, err := ResampleDataSeries(exs, "3m", rows[:2], nil, 180_000, 0, 60_000, 0, false)
+	if err != nil {
+		t.Fatalf("first batch returned error: %v", err)
+	}
+	if done || len(first) != 1 {
+		t.Fatalf("first batch should leave one unfinished bucket, done=%v len=%d", done, len(first))
+	}
+	second, done, err := ResampleDataSeries(exs, "3m", rows[2:], first, 180_000, 0, 60_000, 0, false)
+	if err != nil {
+		t.Fatalf("second batch returned error: %v", err)
+	}
+	if !done || len(second) != 1 {
+		t.Fatalf("second batch should finish one bucket, done=%v len=%d", done, len(second))
+	}
+	if got, ok := second[0].Values["average"].(float64); !ok || got != 13.0/3.0 {
+		t.Fatalf("cross-batch average = %#v (%T), want %v", second[0].Values["average"], second[0].Values["average"], 13.0/3.0)
+	}
+}
+
+func TestResampleGenericSeriesPreservesRawInputsAcrossBatches(t *testing.T) {
+	const source = "macro"
+	const averageRule = "generic_batch_average"
+	if !RegisterAggRule(averageRule, func(rows []*DataRecord, field SeriesField) (any, error) {
+		var sum float64
+		var count int
+		for _, row := range rows {
+			if row == nil {
+				continue
+			}
+			value, ok := row.Values[field.Name].(float64)
+			if ok {
+				sum += value
+				count++
+			}
+		}
+		if count == 0 {
+			return nil, nil
+		}
+		return sum / float64(count), nil
+	}) {
+		t.Fatal("expected custom generic aggregation rule registration to succeed")
+	}
+	exs := &ExSymbol{ID: 8, Symbol: "CPI", AggRules: `{"value":"generic_batch_average"}`}
+	base := int64(1_700_000_100_000)
+	rows := make([]*DataSeries, 0, 3)
+	for i, value := range []float64{1, 3, 9} {
+		rows = append(rows, &DataSeries{
+			Source: source, Sid: exs.ID, TimeMS: base + int64(i)*60_000, TimeFrame: "1m",
+			Values: map[string]any{"value": value}, ExSymbol: exs,
+		})
+	}
+	first, done, err := ResampleDataSeries(exs, "3m", rows[:2], nil, 180_000, 0, 60_000, 0, false)
+	if err != nil || done || len(first) != 1 {
+		t.Fatalf("first generic batch = len:%d done:%v err:%v", len(first), done, err)
+	}
+	second, done, err := ResampleDataSeries(exs, "3m", rows[2:], first, 180_000, 0, 60_000, 0, false)
+	if err != nil || !done || len(second) != 1 {
+		t.Fatalf("second generic batch = len:%d done:%v err:%v", len(second), done, err)
+	}
+	if got := second[0].Values["value"]; got != 13.0/3.0 {
+		t.Fatalf("cross-batch generic average = %#v, want %v", got, 13.0/3.0)
 	}
 }
 

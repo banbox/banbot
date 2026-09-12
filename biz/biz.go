@@ -8,7 +8,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/banbox/banbot/com"
@@ -127,42 +126,18 @@ func RefreshPairsWithSymbolState(symbols *orm.SymbolState, showLog bool, timeMS 
 	if symbols == nil {
 		return refreshPairsLegacy(showLog, timeMS, pBar)
 	}
-	goods.ShowLog = showLog
-	pairs, err := goods.RefreshPairListWithSymbolState(symbols, exg.Default, timeMS)
-	if err != nil {
-		return nil, nil, err
-	}
-	if pBar != nil {
-		pBar.SetProgress("loadPairs", 1)
-	}
-	allPairs := make([]string, 0, len(pairs))
-	allPairs = append(allPairs, pairs...)
-	for _, r := range config.RunPolicy {
-		if len(r.Pairs) > 0 {
-			allPairs = append(allPairs, r.Pairs...)
-		}
-	}
-	allPairs, _ = utils.UniqueItems(allPairs)
-	pairTfScores, err := strat.CalcPairTfScoresWithSymbolState(symbols, exg.Default, allPairs)
-	if err != nil {
-		return nil, nil, err
-	}
-	if pBar != nil {
-		pBar.SetProgress("tfScores", 1)
-	}
-	return pairs, pairTfScores, nil
+	// A symbol catalog alone does not identify the exchange, configuration,
+	// strategy registry, or pair admission state that owns a refresh. Refuse
+	// this ambiguous compatibility path instead of combining one Runtime's
+	// symbols with process-global dependencies.
+	return nil, nil, errs.NewMsg(core.ErrBadConfig,
+		"explicit pair refresh requires complete runtime dependencies")
 }
 
 func refreshPairsLegacy(showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]string, map[string]map[string]float64, *errs.Error) {
 	c := &refreshPairsCache
 	if core.BackTestMode && c.timeMS == timeMS && c.pairTfScores != nil {
-		core.Pairs = slices.Clone(c.corePairs)
-		core.PairsMap = maps.Clone(c.pairsMap)
-		for pair := range core.BanPairsUntil {
-			if _, ok := core.PairsMap[pair]; !ok {
-				delete(core.BanPairsUntil, pair)
-			}
-		}
+		core.ReplaceLegacyPairState(c.corePairs, c.pairsMap)
 		if pBar != nil {
 			pBar.SetProgress("loadPairs", 1)
 			pBar.SetProgress("tfScores", 1)
@@ -196,8 +171,7 @@ func refreshPairsLegacy(showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]st
 		c.timeMS = timeMS
 		c.pairs = pairs
 		c.pairTfScores = pairTfScores
-		c.corePairs = slices.Clone(core.Pairs)
-		c.pairsMap = maps.Clone(core.PairsMap)
+		c.corePairs, c.pairsMap = core.LegacyPairStateSnapshot()
 	}
 	return pairs, pairTfScores, nil
 }
@@ -652,16 +626,15 @@ func getBatchOrderManager(state *TradingState, account string) IOrderMgr {
 }
 
 func ResetVars() {
-	core.NoEnterUntil = make(map[string]int64)
+	core.ResetLegacyNoEnterUntil()
 	com.DelPairCopieds()
-	core.TfPairHits = make(map[string]map[string]int)
-	core.JobPerfs = make(map[string]*core.JobPerf)
-	core.StratPerfSta = make(map[string]*core.PerfSta)
+	core.ReplaceLegacyTfPairHits(nil)
+	core.ResetLegacyPerformance()
 	accLiveOdMgrs = make(map[string]*LiveOrderMgr)
 	accOdMgrs = make(map[string]IOrderMgr)
 	accWallets = make(map[string]*BanWallets)
 	core.LastBarMs = 0
-	core.OdBooks = make(map[string]*banexg.OrderBook)
+	core.ReplaceLegacyOdBooks(nil)
 	ormo.HistODs = make([]*ormo.InOutOrder, 0)
 	ormo.ResetVars()
 	strat.Envs = make(map[string]*ta.BarEnv)
@@ -709,28 +682,31 @@ type VarsBackup struct {
 
 // BackupVars 备份所有全局变量
 func BackupVars() *VarsBackup {
-	core.LockOdMatch.RLock()
-	orderMatchTfs := core.OrderMatchTfs
-	core.LockOdMatch.RUnlock()
+	pairs, pairMap := core.LegacyPairStateSnapshot()
+	tfSecs, stgPairTfs := core.LegacyTimeFrameStateSnapshot()
+	orderMatchTfs := core.LegacyOrderMatchTfsSnapshot()
+	noEnterUntil := core.LegacyNoEnterUntilSnapshot()
+	tfPairHits := core.LegacyTfPairHitsSnapshot()
+	jobPerfs, stratPerfSta := core.LegacyPerformanceSnapshot()
 	batchTasks, lastBatchMS := strat.BackupLegacyBatchState()
 	return &VarsBackup{
-		Pairs:         slices.Clone(core.Pairs),
-		PairMap:       maps.Clone(core.PairsMap),
-		TFSecs:        core.TFSecs,
-		StgPairTfs:    core.StgPairTfs,
+		Pairs:         pairs,
+		PairMap:       pairMap,
+		TFSecs:        tfSecs,
+		StgPairTfs:    stgPairTfs,
 		OrderMatchTfs: orderMatchTfs,
 		BotRunning:    core.BotRunning,
 		CheckWallets:  core.CheckWallets,
-		NoEnterUntil:  core.NoEnterUntil,
+		NoEnterUntil:  noEnterUntil,
 		PairCopiedMs:  com.GetPairCopieds(),
-		TfPairHits:    core.TfPairHits,
-		JobPerfs:      core.JobPerfs,
-		StratPerfSta:  core.StratPerfSta,
+		TfPairHits:    tfPairHits,
+		JobPerfs:      jobPerfs,
+		StratPerfSta:  stratPerfSta,
 		AccLiveOdMgrs: accLiveOdMgrs,
 		AccOdMgrs:     accOdMgrs,
 		AccWallets:    accWallets,
 		LastBarMs:     core.LastBarMs,
-		OdBooks:       core.OdBooks,
+		OdBooks:       core.LegacyOdBooksSnapshot(),
 		HistODs:       ormo.HistODs,
 		Envs:          strat.Envs,
 		TmpEnvs:       strat.TmpEnvs,
@@ -752,26 +728,21 @@ func RestoreVars(backup *VarsBackup) {
 	if backup == nil {
 		return
 	}
-	core.Pairs = backup.Pairs
-	core.PairsMap = backup.PairMap
-	core.TFSecs = backup.TFSecs
-	core.StgPairTfs = backup.StgPairTfs
-	core.LockOdMatch.Lock()
-	core.OrderMatchTfs = backup.OrderMatchTfs
-	core.LockOdMatch.Unlock()
+	core.ReplaceLegacyPairState(backup.Pairs, backup.PairMap)
+	core.ReplaceLegacyTimeFrameState(backup.TFSecs, backup.StgPairTfs)
+	core.ReplaceLegacyOrderMatchTfs(backup.OrderMatchTfs)
 	core.BotRunning = backup.BotRunning
 	core.CheckWallets = backup.CheckWallets
-	core.NoEnterUntil = backup.NoEnterUntil
+	core.ReplaceLegacyNoEnterUntil(backup.NoEnterUntil)
 	com.DelPairCopieds()
 	com.SetPairCopieds(backup.PairCopiedMs)
-	core.TfPairHits = backup.TfPairHits
-	core.JobPerfs = backup.JobPerfs
-	core.StratPerfSta = backup.StratPerfSta
+	core.ReplaceLegacyTfPairHits(backup.TfPairHits)
+	core.ReplaceLegacyPerformance(backup.JobPerfs, backup.StratPerfSta)
 	accLiveOdMgrs = backup.AccLiveOdMgrs
 	accOdMgrs = backup.AccOdMgrs
 	accWallets = backup.AccWallets
 	core.LastBarMs = backup.LastBarMs
-	core.OdBooks = backup.OdBooks
+	core.ReplaceLegacyOdBooks(backup.OdBooks)
 	ormo.HistODs = backup.HistODs
 	strat.Envs = backup.Envs
 	strat.TmpEnvs = backup.TmpEnvs
