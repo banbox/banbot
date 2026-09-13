@@ -31,21 +31,24 @@ const (
 type BackTestLite struct {
 	biz.Trader
 	*BTResult
-	dp     *data.HistProvider
-	isOpt  bool // whether is hyper optimization
-	runErr *errs.Error
+	dp           *data.HistProvider
+	isOpt        bool // whether is hyper optimization
+	runErr       *errs.Error
+	stoppedEarly bool
 }
 
 type BackTest struct {
 	*BackTestLite
-	lastDumpMs    int64 // The last time the backtest status was saved 上一次保存回测状态的时间
-	PBar          *utils.StagedPrg
-	dataPrep      bool
-	dataPrepErr   *errs.Error
-	nextRefresh   int64 // The time of the next refresh of the trading pair 下一次刷新交易对的时间
-	schedule      cron.Schedule
-	seriesRuntime *data.SeriesRuntime
-	loopMainFn    func() *errs.Error
+	lastDumpMs           int64 // The last time the backtest status was saved 上一次保存回测状态的时间
+	PBar                 *utils.StagedPrg
+	dataPrep             bool
+	dataPrepErr          *errs.Error
+	nextRefresh          int64 // The time of the next refresh of the trading pair 下一次刷新交易对的时间
+	schedule             cron.Schedule
+	seriesRuntime        *data.SeriesRuntime
+	loopMainFn           func() *errs.Error
+	historicalCloseMS    []int64
+	historicalCloseIndex int
 }
 
 /*
@@ -86,8 +89,7 @@ func allowBacktestKlineDownload(isOpt bool) bool {
 }
 
 func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
-	view, errView := evt.OHLCV(evt.ExSymbol)
-	if errView != nil {
+	if orm.NormalizeSeriesSource(evt.Source) != orm.SeriesSourceKline || !evt.HasOHLCV() {
 		if err := b.Trader.FeedDataSeries(evt); err != nil {
 			log.Error("FeedDataSeries fail", zap.Int32("sid", evt.Sid), zap.Error(err))
 			b.setRunError(err)
@@ -101,7 +103,7 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 		// Enter the next timeframe and trigger the batch entry callback
 		// 进入下一个时间帧，触发批量入场回调
 		btime.CurTimeMS = strat.LastBatchMS
-		waitNum := biz.TryFireBatches(curTime, view.IsWarmUp)
+		waitNum := biz.TryFireBatches(curTime, evt.IsWarmUp)
 		if waitNum > 0 {
 			log.Warn(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
 		}
@@ -111,20 +113,21 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 	if curTime > b.lastTime {
 		b.lastTime = curTime
 		b.TimeNum += 1
-		if !view.IsWarmUp {
+		if !evt.IsWarmUp {
 			core.CheckWallets = true
 		}
 	}
 	if errRun := b.Trader.FeedDataSeries(evt); errRun != nil {
 		if errRun.Code == core.ErrLiquidation {
-			b.onLiquidation(view.Symbol())
+			b.onLiquidation(evt.Symbol())
 		} else {
-			log.Error("FeedDataSeries fail", zap.String("p", view.Symbol()), zap.Error(errRun))
+			log.Error("FeedDataSeries fail", zap.String("p", evt.Symbol()), zap.Error(errRun))
 			b.setRunError(errRun)
 		}
 		return false
 	}
 	if !core.BotRunning {
+		b.stoppedEarly = true
 		b.dp.Terminate()
 		return false
 	}
@@ -212,6 +215,8 @@ func NewBackTest(isOpt bool, outDir string) (*BackTest, *errs.Error) {
 
 func (b *BackTest) Init() *errs.Error {
 	btime.CurTimeMS = config.TimeRange.StartMS
+	b.historicalCloseMS = historicalCloseBoundaries(config.HistoricalCoverage, config.TimeRange)
+	b.historicalCloseIndex = 0
 	b.MinReal = math.MaxFloat64
 	log.Info("backtest config summary",
 		zap.Bool("questdb", orm.IsQuestDB),
@@ -332,22 +337,27 @@ func backtestBootstrapPlan(jobs []*strat.StratJob, tr *config.TimeTuple) (*data.
 }
 
 func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
-	view, err := evt.OHLCV(evt.ExSymbol)
-	if err != nil {
+	if orm.NormalizeSeriesSource(evt.Source) != orm.SeriesSourceKline || !evt.HasOHLCV() {
 		_ = b.BackTestLite.FeedDataSeries(evt)
 		return
 	}
+	if b.shouldCloseHistoricalBoundary(evt.TimeMS) {
+		if err := b.closeHistoricalBoundaries(evt.TimeMS); err != nil {
+			b.setRunError(err)
+			return
+		}
+	}
 	curTime := btime.TimeMS()
 	ok := b.BackTestLite.FeedDataSeries(evt)
-	if !view.IsWarmUp && core.CheckWallets {
+	if !evt.IsWarmUp && core.CheckWallets {
 		core.CheckWallets = false
 		odNum := ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)
-		b.logState(view.Time, curTime, odNum)
+		b.logState(evt.TimeMS, curTime, odNum)
 	}
-	if ok && b.nextRefresh > 0 && view.Time >= b.nextRefresh {
+	if ok && b.nextRefresh > 0 && evt.TimeMS >= b.nextRefresh {
 		// 刷新交易对
-		refreshMs := view.Time // 这里bar.Time 可能远大于b.nextRefresh，所以应当用bar.Time
-		b.nextRefresh = b.schedule.Next(time.UnixMilli(view.Time)).UnixMilli()
+		refreshMs := evt.TimeMS // 这里bar.Time 可能远大于b.nextRefresh，所以应当用bar.Time
+		b.nextRefresh = b.schedule.Next(time.UnixMilli(evt.TimeMS)).UnixMilli()
 		btime.CurTimeMS = refreshMs
 		err := RefreshPairJobs(b.dp, !b.isOpt, false, nil)
 		btime.CurTimeMS = curTime
@@ -356,22 +366,53 @@ func (b *BackTest) FeedDataSeries(evt *orm.DataSeries) {
 			log.Error("RefreshPairJobs", zap.String("date", dateStr), zap.Error(err))
 			if b.dataPrep {
 				b.dataPrepErr = err
-				b.dp.Terminate()
-				return
 			}
+			b.setRunError(err)
+			return
 		} else {
 			if _, err := b.syncThirdPartySeriesRange(); err != nil {
 				log.Error("ensure third-party series after pair refresh", zap.String("date", dateStr), zap.Error(err))
 				if b.dataPrep {
 					b.dataPrepErr = err
-					b.dp.Terminate()
-					return
 				}
+				b.setRunError(err)
+				return
 			}
 			log.Info("refreshed pairs at", zap.String("date", dateStr))
 		}
 		b.dp.SetDirty()
 	}
+}
+
+func historicalCloseBoundaries(coverage *config.HistoricalCoverageConfig, runRange *config.TimeTuple) []int64 {
+	if coverage == nil || runRange == nil {
+		return nil
+	}
+	result := make([]int64, 0, 2)
+	if endMS := coverage.BaselineEndMS; endMS > runRange.StartMS && runRange.EndMS > endMS &&
+		(len(result) == 0 || result[len(result)-1] != endMS) {
+		result = append(result, endMS)
+	}
+	if endMS := coverage.HistoricalResultEndMS; endMS > runRange.StartMS && runRange.EndMS > endMS &&
+		(len(result) == 0 || result[len(result)-1] != endMS) {
+		result = append(result, endMS)
+	}
+	return result
+}
+
+func (b *BackTest) shouldCloseHistoricalBoundary(eventMS int64) bool {
+	return b.historicalCloseIndex < len(b.historicalCloseMS) &&
+		eventMS >= b.historicalCloseMS[b.historicalCloseIndex]
+}
+
+func (b *BackTest) closeHistoricalBoundaries(eventMS int64) *errs.Error {
+	for b.shouldCloseHistoricalBoundary(eventMS) {
+		if err := biz.CloseBacktestOrdersAt(config.DefAcc, b.historicalCloseMS[b.historicalCloseIndex]); err != nil {
+			return err
+		}
+		b.historicalCloseIndex++
+	}
+	return nil
 }
 
 func (b *BackTest) Run() *errs.Error {
@@ -402,6 +443,13 @@ func (b *BackTest) Run() *errs.Error {
 		log.Error("backtest loop fail", zap.Error(err))
 		return err
 	}
+	// Some feeders finish without emitting a bar at or after a historical
+	// cutoff (for example when every series ends at the old baseline). Ensure
+	// those positions are closed before the final cleanup uses the new end.
+	if err := b.closeHistoricalBoundaries(math.MaxInt64); err != nil {
+		log.Error("close historical boundaries fail", zap.Error(err))
+		return err
+	}
 	btCost := btime.UTCTime() - btStart
 	err = biz.GetOdMgr(config.DefAcc).CleanUp()
 	strat.ExitStratJobs()
@@ -413,6 +461,7 @@ func (b *BackTest) Run() *errs.Error {
 		return nil
 	}
 	b.logPlot(biz.GetWallets(config.DefAcc), btime.TimeMS(), -1, -1)
+	normalizeBacktestResultRange(b.BTResult, b.stoppedEarly)
 	b.Collect()
 	if AfterBacktest != nil {
 		AfterBacktest(b)
@@ -426,6 +475,21 @@ func (b *BackTest) Run() *errs.Error {
 		b.printBtResult(true)
 	}
 	return nil
+}
+
+// normalizeBacktestResultRange keeps the reported window tied to the
+// immutable backtest request. A run with no non-warmup events can otherwise
+// report its first appended-tail event as the start of the whole backtest.
+func normalizeBacktestResultRange(result *BTResult, stoppedEarly bool) {
+	if stoppedEarly {
+		return
+	}
+	if result == nil || config.TimeRange == nil || config.TimeRange.StartMS <= 0 ||
+		config.TimeRange.EndMS <= config.TimeRange.StartMS {
+		return
+	}
+	result.StartMS = config.TimeRange.StartMS
+	result.EndMS = config.TimeRange.EndMS
 }
 
 func (b *BackTest) resolveLoopError(err *errs.Error) *errs.Error {

@@ -39,6 +39,34 @@ func TestBackTestPreservesFirstRuntimeError(t *testing.T) {
 	}
 }
 
+func TestHistoricalCloseBoundariesPreserveLegacyAndSequenceInTime(t *testing.T) {
+	runRange := &config.TimeTuple{StartMS: 10, EndMS: 200}
+	legacy := historicalCloseBoundaries(&config.HistoricalCoverageConfig{BaselineEndMS: 100}, runRange)
+	if len(legacy) != 1 || legacy[0] != 100 {
+		t.Fatalf("legacy close boundaries = %v, want [100]", legacy)
+	}
+	boundaries := historicalCloseBoundaries(&config.HistoricalCoverageConfig{
+		BaselineEndMS: 100, HistoricalResultEndMS: 160,
+	}, runRange)
+	if len(boundaries) != 2 || boundaries[0] != 100 || boundaries[1] != 160 {
+		t.Fatalf("historical close boundaries = %v, want [100 160]", boundaries)
+	}
+	equal := historicalCloseBoundaries(&config.HistoricalCoverageConfig{
+		BaselineEndMS: 100, HistoricalResultEndMS: 100,
+	}, runRange)
+	if len(equal) != 1 || equal[0] != 100 {
+		t.Fatalf("equal close boundaries = %v, want [100]", equal)
+	}
+	bt := &BackTest{historicalCloseMS: boundaries}
+	if bt.shouldCloseHistoricalBoundary(99) || !bt.shouldCloseHistoricalBoundary(100) {
+		t.Fatal("historical baseline boundary predicate is incorrect")
+	}
+	bt.historicalCloseIndex++
+	if bt.shouldCloseHistoricalBoundary(159) || !bt.shouldCloseHistoricalBoundary(160) {
+		t.Fatal("historical result boundary predicate is incorrect")
+	}
+}
+
 func TestBackTestLiteOptimizationLiquidationDoesNotStopLiveRuntime(t *testing.T) {
 	originalChargeOnBomb := config.ChargeOnBomb
 	originalStopAll := core.StopAll

@@ -13,14 +13,7 @@ import (
 )
 
 func TestLegacyItemWalletUsedIsStableAcrossMapLayouts(t *testing.T) {
-	originalCompat := config.Data.BTLegacyWallet
-	originalBacktest := core.BackTestMode
-	t.Cleanup(func() {
-		config.Data.BTLegacyWallet = originalCompat
-		core.BackTestMode = originalBacktest
-	})
-	core.BackTestMode = true
-	config.Data.BTLegacyWallet = true
+	enableLegacyWalletReplay(t)
 
 	want := (float64(1) + 1) + 1e16
 	entries := []struct {
@@ -50,15 +43,7 @@ func TestLegacyItemWalletUsedIsStableAcrossMapLayouts(t *testing.T) {
 }
 
 func TestLegacyWalletLegalValuesUseStableCoinOrder(t *testing.T) {
-	originalCompat := config.Data.BTLegacyWallet
-	originalBacktest := core.BackTestMode
-	t.Cleanup(func() {
-		config.Data.BTLegacyWallet = originalCompat
-		core.BackTestMode = originalBacktest
-	})
-
-	core.BackTestMode = true
-	config.Data.BTLegacyWallet = true
+	enableLegacyWalletReplay(t)
 	wallets := &BanWallets{Items: map[string]*ItemWallet{
 		"DET_A": {Coin: "DET_A", Available: 1e16},
 		"DET_B": {Coin: "DET_B", Available: -1e16},
@@ -78,12 +63,12 @@ func TestLegacyWalletLegalValuesUseStableCoinOrder(t *testing.T) {
 	}
 }
 
-func TestLegacyWalletPriceUsesLastHistoricalBar(t *testing.T) {
-	originalCompat := config.Data.BTLegacyWallet
+func TestLegacyWalletPriceHonorsHistoricalBarExpiry(t *testing.T) {
+	originalData := config.Data
 	originalBacktest := core.BackTestMode
 	originalTime := btime.CurTimeMS
 	t.Cleanup(func() {
-		config.Data.BTLegacyWallet = originalCompat
+		config.Data = originalData
 		core.BackTestMode = originalBacktest
 		btime.CurTimeMS = originalTime
 	})
@@ -97,26 +82,66 @@ func TestLegacyWalletPriceUsesLastHistoricalBar(t *testing.T) {
 		t.Fatalf("current stale price = %v, want -1", got)
 	}
 	config.Data.BTLegacyWallet = true
-	if got := walletMarkPrice(symbol); got != 123.45 {
-		t.Fatalf("legacy stale price = %v, want 123.45", got)
+	if got := walletMarkPrice(symbol); got != -1 {
+		t.Fatalf("legacy stale price = %v, want -1", got)
+	}
+}
+
+func TestLegacyWalletRefreshSkipsStaleSymbols(t *testing.T) {
+	originalData := config.Data
+	originalBacktest := core.BackTestMode
+	originalTime := btime.CurTimeMS
+	t.Cleanup(func() {
+		config.Data = originalData
+		core.BackTestMode = originalBacktest
+		btime.CurTimeMS = originalTime
+	})
+
+	core.BackTestMode = true
+	config.Data.BTLegacyWallet = true
+	btime.CurTimeMS = 2_000_000
+	stale := "STALE-MARGIN/USDT:USDT"
+	fresh := "FRESH-MARGIN/USDT:USDT"
+	com.SetBarPrice(stale, 100)
+	btime.CurTimeMS += com.PriceExpireMS + 1
+	com.SetBarPrice(fresh, 200)
+
+	wallets := &BanWallets{Items: map[string]*ItemWallet{
+		"USDT": {Available: 500, Pendings: map[string]float64{}, Frozens: map[string]float64{}},
+	}}
+	orders := []*ormo.InOutOrder{
+		legacyMarginOrder(1, stale, 100),
+		legacyMarginOrder(2, fresh, 200),
+	}
+	if err := wallets.UpdateOds(orders, "USDT"); err != nil {
+		t.Fatalf("update legacy wallet margins: %v", err)
+	}
+	frozens := wallets.Items["USDT"].Frozens
+	if _, ok := frozens[orders[0].Key()]; ok {
+		t.Fatal("stale symbol received a refreshed margin")
+	}
+	if got := frozens[orders[1].Key()]; got != 100 {
+		t.Fatalf("fresh symbol margin = %v, want 100", got)
+	}
+}
+
+func legacyMarginOrder(id int64, symbol string, price float64) *ormo.InOutOrder {
+	return &ormo.InOutOrder{
+		IOrder: &ormo.IOrder{
+			ID: id, Symbol: symbol, Leverage: 2,
+		},
+		Enter: &ormo.ExOrder{Filled: 1, Average: price},
 	}
 }
 
 func TestLegacyWalletOrdersAreStableWithoutMutatingInput(t *testing.T) {
-	originalCompat := config.Data.BTLegacyWallet
-	originalBacktest := core.BackTestMode
-	t.Cleanup(func() {
-		config.Data.BTLegacyWallet = originalCompat
-		core.BackTestMode = originalBacktest
-	})
+	enableLegacyWalletReplay(t)
 
 	orders := []*ormo.InOutOrder{
 		{IOrder: &ormo.IOrder{ID: 3}},
 		{IOrder: &ormo.IOrder{ID: 1}},
 		{IOrder: &ormo.IOrder{ID: 2}},
 	}
-	core.BackTestMode = true
-	config.Data.BTLegacyWallet = true
 	got := legacyWalletOrderView(orders)
 	if got[0].ID != 1 || got[1].ID != 2 || got[2].ID != 3 {
 		t.Fatalf("legacy wallet order = [%d %d %d], want [1 2 3]", got[0].ID, got[1].ID, got[2].ID)
@@ -124,4 +149,16 @@ func TestLegacyWalletOrdersAreStableWithoutMutatingInput(t *testing.T) {
 	if orders[0].ID != 3 || orders[1].ID != 1 || orders[2].ID != 2 {
 		t.Fatalf("input order mutated: [%d %d %d]", orders[0].ID, orders[1].ID, orders[2].ID)
 	}
+}
+
+func enableLegacyWalletReplay(t *testing.T) {
+	t.Helper()
+	originalData := config.Data
+	originalBacktest := core.BackTestMode
+	t.Cleanup(func() {
+		config.Data = originalData
+		core.BackTestMode = originalBacktest
+	})
+	core.BackTestMode = true
+	config.Data.BTLegacyWallet = true
 }

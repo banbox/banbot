@@ -325,8 +325,8 @@ type TradeStrat struct {
 	WsSubs map[string]string // WebSocket订阅配置
 	DrawDownExit bool // 是否启用回撤止盈，默认false
 	HedgeOff bool // 关闭合约双向持仓
-	BatchInOut bool // 是否批量执行入场/出场
-	BatchInfo bool // 是否对OnInfoBar后执行批量处理
+	BatchInOut bool // 是否在主周期OnData(RoleMain)/OnBar后批量执行入场/出场
+	BatchInfo bool // 是否在辅助周期OnData(RoleInfo)/OnInfoBar后执行批量处理
 	StakeRate float64 // 相对基础金额开单倍率
 	StopLoss float64 // 此策略默认止损比率，不带杠杆
 	StopEnterBars int

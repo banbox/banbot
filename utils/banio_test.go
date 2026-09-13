@@ -44,6 +44,37 @@ func TestBanConnWriteIdleDeadlineDiscardsConnection(t *testing.T) {
 	}
 }
 
+func TestBanConnReadRejectsOversizedFrameBeforeAllocation(t *testing.T) {
+	left, right := net.Pipe()
+	conn := &BanConn{Conn: left, Ready: true}
+	t.Cleanup(func() {
+		_ = left.Close()
+		_ = right.Close()
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var header [4]byte
+		binary.LittleEndian.PutUint32(header[:], banConnMaxFrameBytes+1)
+		_, _ = right.Write(header[:])
+	}()
+	if _, err := conn.Read(); err == nil || !strings.Contains(err.Error(), "frame exceeds") {
+		t.Fatalf("oversized frame error=%v", err)
+	}
+	<-done
+}
+
+func TestDeCompressRejectsOversizedMessage(t *testing.T) {
+	payload := make([]byte, banConnMaxMessageBytes+1)
+	compressed, err := compress(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = deCompress(compressed); err == nil || !strings.Contains(err.Error(), "message exceeds") {
+		t.Fatalf("oversized message error=%v", err)
+	}
+}
+
 func TestBanConnWriteIdleDeadlineAllowsSlowProgress(t *testing.T) {
 	oldTimeout := banConnWriteIdleTimeout
 	banConnWriteIdleTimeout = 50 * time.Millisecond
@@ -97,7 +128,7 @@ func TestBanServer(t *testing.T) {
 	go func() {
 		for {
 			time.Sleep(time.Millisecond * 300)
-			for _, conn := range server.Conns {
+			for _, conn := range server.ConnectionsSnapshot() {
 				if conn.IsClosed() {
 					continue
 				}
@@ -111,6 +142,40 @@ func TestBanServer(t *testing.T) {
 	err := server.RunForever(0, 0)
 	if err != nil {
 		panic(err)
+	}
+}
+
+func TestServerIOConnectionsConcurrentSnapshot(t *testing.T) {
+	server := NewBanServer("", "")
+	const count = 100
+	conns := make([]IBanConn, count)
+	for i := range conns {
+		left, right := net.Pipe()
+		conns[i] = server.WrapConn(left)
+		t.Cleanup(func() {
+			_ = left.Close()
+			_ = right.Close()
+		})
+	}
+
+	var wg sync.WaitGroup
+	for _, conn := range conns {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			server.AddConnection(conn)
+			server.RemoveConnection(conn)
+		}()
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				_ = server.ConnectionsSnapshot()
+			}
+		}()
+	}
+	wg.Wait()
+	if got := len(server.ConnectionsSnapshot()); got != 0 {
+		t.Fatalf("connections after removal = %d", got)
 	}
 }
 

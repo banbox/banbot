@@ -1,6 +1,8 @@
 package exg
 
 import (
+	"context"
+
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
@@ -42,4 +44,13 @@ func (e *BotExchange) CreateOrder(symbol, odType, side string, amount, price flo
 		}
 	}
 	return order, err
+}
+
+func (e *BotExchange) FetchOHLCVArchive(ctx context.Context, symbol, timeframe string, startMS, endMS int64) (
+	[]*banexg.Kline, bool, *errs.Error) {
+	fetcher, ok := e.BanExchange.(banexg.OHLCVArchiveFetcher)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchOHLCVArchive(ctx, symbol, timeframe, startMS, endMS)
 }

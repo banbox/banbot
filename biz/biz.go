@@ -4,7 +4,6 @@ import (
 	"context"
 	"embed"
 	_ "embed"
-	"fmt"
 	"maps"
 	"os"
 	"path"
@@ -295,7 +294,7 @@ Even if the job has no entry tasks, this method should be called to postpone the
 func AddBatchJob(account, tf string, job *strat.StratJob, infoEnv *ta.BarEnv) {
 	lockBatch.Lock()
 	defer lockBatch.Unlock()
-	key := fmt.Sprintf("%s_%s_%s", tf, account, job.Strat.Name)
+	key := tf + "_" + account + "_" + job.Strat.Name
 	tasks, ok := strat.BatchTasks[key]
 	if !ok {
 		tasks = &strat.BatchMap{
@@ -313,7 +312,13 @@ func AddBatchJob(account, tf string, job *strat.StratJob, infoEnv *ta.BarEnv) {
 		pair = infoEnv.Symbol
 		pairKey = pair + "_info"
 	}
-	tasks.Map[pairKey] = &strat.JobEnv{Job: job, Env: infoEnv, Symbol: pair}
+	if task, ok := tasks.Map[pairKey]; ok {
+		task.Job = job
+		task.Env = infoEnv
+		task.Symbol = pair
+	} else {
+		tasks.Map[pairKey] = &strat.JobEnv{Job: job, Env: infoEnv, Symbol: pair}
+	}
 }
 
 type batchReadyItem struct {

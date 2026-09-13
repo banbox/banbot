@@ -58,6 +58,56 @@ func TestDeterministicExecutionViewsUseStableBusinessKeys(t *testing.T) {
 	}
 }
 
+func TestSingleDefaultAccountExecutionView(t *testing.T) {
+	oldMode, oldData, oldAccounts := core.BackTestMode, config.Data, config.Accounts
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Accounts = map[string]*config.AccountConfig{config.DefAcc: {}}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.Accounts = oldMode, oldData, oldAccounts
+	})
+
+	if got := slices.Collect(executionAccountNames()); !slices.Equal(got, []string{config.DefAcc}) {
+		t.Fatalf("accounts = %v, want [%s]", got, config.DefAcc)
+	}
+}
+
+func TestFrozenReplayCanonicalizesMapOrderAndPreservesSuppliedSlice(t *testing.T) {
+	oldMode, oldData := core.BackTestMode, config.Data
+	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Pairs = []string{"BTC/USDT:USDT", "DOGE/USDT:USDT"}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data = oldMode, oldData
+		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+	})
+
+	insertions := [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}}
+	enterAt := map[int64]int64{1: 20, 2: 20, 3: 10}
+	for run := 0; run < 100; run++ {
+		ordersByID := make(map[int64]*ormo.InOutOrder, 3)
+		for _, id := range insertions[run%len(insertions)] {
+			ordersByID[id] = &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: id, EnterAt: enterAt[id]}}
+		}
+		if got := orderIDs(executionOpenOrders(ordersByID)); !slices.Equal(got, []int64{3, 1, 2}) {
+			t.Fatalf("run %d frozen map execution order = %v, want [3 1 2]", run, got)
+		}
+	}
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{ID: 3}},
+		{IOrder: &ormo.IOrder{ID: 1}},
+		{IOrder: &ormo.IOrder{ID: 2}},
+	}
+	got := executionOrderView(orders)
+	if !slices.Equal(orderIDs(got), []int64{3, 1, 2}) || &got[0] != &orders[0] {
+		t.Fatalf("execution order = %v, want supplied order [3 1 2]", orderIDs(got))
+	}
+}
+
 func TestTryFireBatchesUsesStableTaskOrderWhenDeterministic(t *testing.T) {
 	enableStrictBacktest(t)
 	oldTasks := strat.BatchTasks
@@ -83,6 +133,32 @@ func TestTryFireBatchesUsesStableTaskOrderWhenDeterministic(t *testing.T) {
 		if !slices.Equal(got, []string{"a", "m", "z"}) {
 			t.Fatalf("layout %d batch jobs = %v", shift, got)
 		}
+	}
+}
+
+func TestAddBatchJobReusesPendingPairTask(t *testing.T) {
+	oldTasks := strat.BatchTasks
+	strat.BatchTasks = make(map[string]*strat.BatchMap)
+	t.Cleanup(func() { strat.BatchTasks = oldTasks })
+
+	strategy := &strat.TradeStrat{Name: "demo"}
+	job := &strat.StratJob{
+		Strat:  strategy,
+		Symbol: &orm.ExSymbol{Symbol: "BTC/USDT"},
+	}
+	AddBatchJob("default", "15m", job, nil)
+	tasks := strat.BatchTasks["15m_default_demo"]
+	if tasks == nil {
+		t.Fatal("batch task was not registered")
+	}
+	first := tasks.Map["BTC/USDT_main"]
+	if first == nil {
+		t.Fatal("pair task was not registered")
+	}
+
+	AddBatchJob("default", "15m", job, nil)
+	if got := tasks.Map["BTC/USDT_main"]; got != first {
+		t.Fatal("re-registering a pending pair allocated a new task")
 	}
 }
 

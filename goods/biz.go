@@ -71,11 +71,13 @@ func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 	var err *errs.Error
 	pairs, _ := config.GetStaticPairs()
 	if len(pairs) > 0 {
-		pairVols, err := GetSymbolVols(pairs, "1h", 1, timeMS, true)
-		if err != nil {
-			return nil, err
+		if !useFrozenStaticPairs(pairs) {
+			pairVols, err := GetSymbolVols(pairs, "1h", 1, timeMS, true)
+			if err != nil {
+				return nil, err
+			}
+			pairs, _ = filterByMinCost(pairVols)
 		}
-		pairs, _ = filterByMinCost(pairVols)
 		allowFilter = config.PairMgr.ForceFilters
 	} else {
 		allowFilter = true
@@ -137,4 +139,8 @@ func RefreshPairList(timeMS int64) ([]string, *errs.Error) {
 		}
 	}
 	return pairs, nil
+}
+
+func useFrozenStaticPairs(pairs []string) bool {
+	return config.IsFrozenStaticPairs(pairs)
 }

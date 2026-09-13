@@ -136,6 +136,14 @@ func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, 
 	if err := validateKLineSeriesInfo(info); err != nil {
 		return nil, err
 	}
+	return s.readRaw(ctx, target, startMS, endMS, limit)
+}
+
+func (s *KLineSeriesStore) readRaw(ctx context.Context, target *ExSymbol, startMS, endMS int64, limit int) ([]*DataSeries, *errs.Error) {
+	info := s.info()
+	if err := validateKLineSeriesInfo(info); err != nil {
+		return nil, err
+	}
 	q, conn, err := Conn(ctx)
 	if err != nil {
 		return nil, err

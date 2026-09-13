@@ -99,6 +99,32 @@ func TestSubTfsReusesStableMinimumAlias(t *testing.T) {
 	}
 }
 
+func TestDBSeriesFeederPhysicalConsumerAuthorization(t *testing.T) {
+	oldExchange := config.Exchange
+	oldTimeRange := config.TimeRange
+	config.Exchange = &config.ExchangeConfig{Name: "binance", Items: map[string]map[string]interface{}{}}
+	config.TimeRange = &config.TimeTuple{EndMS: 24 * 60 * 60 * 1000}
+	t.Cleanup(func() { config.Exchange, config.TimeRange = oldExchange, oldTimeRange })
+	symbol := &orm.ExSymbol{Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"}
+	feeder := &DBSeriesFeeder{
+		SeriesFeeder:   SeriesFeeder{Feeder: Feeder{ExSymbol: symbol}},
+		TfSeriesLoader: &TfSeriesLoader{EndMS: 1_700_000_000_000},
+	}
+
+	feeder.SubTfs([]string{"4h"}, false)
+	if feeder.Timeframe != "1h" || feeder.hour != nil || !feeder.allowPhysicalRead ||
+		feeder.physicalConsumerTimeframe != "4h" || len(feeder.States) != 2 || !feeder.States[0].physicalOnly {
+		t.Fatalf("4h physical loader state=%#v timeframe=%q hour=%v physical=%v consumer=%q",
+			feeder.States, feeder.Timeframe, feeder.hour, feeder.allowPhysicalRead, feeder.physicalConsumerTimeframe)
+	}
+
+	feeder.SubTfs([]string{"1h"}, true)
+	if feeder.allowPhysicalRead || feeder.physicalConsumerTimeframe != "" || feeder.States[0].physicalOnly {
+		t.Fatalf("explicit 1h retained physical authorization: physical=%v consumer=%q state=%#v",
+			feeder.allowPhysicalRead, feeder.physicalConsumerTimeframe, feeder.States[0])
+	}
+}
+
 func TestHistProviderMakeFeedersUsesStableCategoryAndKeyOrder(t *testing.T) {
 	symbol := &orm.ExSymbol{ID: 1, Symbol: "SAME/USDT"}
 	holderA := &DBSeriesFeeder{SeriesFeeder: SeriesFeeder{Feeder: Feeder{ExSymbol: symbol}}}

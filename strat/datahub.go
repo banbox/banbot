@@ -336,13 +336,16 @@ func (s *StratJob) SetData(evt *orm.DataSeries) *DataFields {
 	if s.DataHub == nil {
 		s.DataHub = NewDataHub()
 	}
-	subs := CollectDataSubs(s)
-	if s.Symbol != nil && s.TimeFrame != "" {
-		subs = append(subs, &DataSub{
-			Source: orm.SeriesSourceKline, ExSymbol: s.Symbol, TimeFrame: s.TimeFrame,
-		})
+	if !s.dataHubConfigured {
+		subs := CollectDataSubs(s)
+		if s.Symbol != nil && s.TimeFrame != "" {
+			subs = append(subs, &DataSub{
+				Source: orm.SeriesSourceKline, ExSymbol: s.Symbol, TimeFrame: s.TimeFrame,
+			})
+		}
+		s.DataHub.Configure(subs)
+		s.dataHubConfigured = true
 	}
-	s.DataHub.Configure(subs)
 	return s.DataHub.Set(evt)
 }
 

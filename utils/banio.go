@@ -21,8 +21,14 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+)
+
+const (
+	banConnMaxFrameBytes   = 96 << 20
+	banConnMaxMessageBytes = 128 << 20
 )
 
 type ConnCB = func(msg *IOMsgRaw)
@@ -150,6 +156,9 @@ func (c *BanConn) write(data []byte, retryNum int) *errs.Error {
 			c.lockWrite.Unlock()
 		}
 	}()
+	if len(data) > banConnMaxFrameBytes {
+		return errs.NewMsg(errs.CodeParamInvalid, "ban connection frame exceeds %d bytes", banConnMaxFrameBytes)
+	}
 	dataLen := uint32(len(data))
 	lenBt := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBt, dataLen)
@@ -270,6 +279,9 @@ func (c *BanConn) Read() ([]byte, *errs.Error) {
 	dataLen := binary.LittleEndian.Uint32(lenBuf)
 	if dataLen == 0 {
 		return []byte{}, nil
+	}
+	if dataLen > banConnMaxFrameBytes {
+		return nil, errs.NewMsg(core.ErrNetReadFail, "ban connection frame exceeds %d bytes", banConnMaxFrameBytes)
 	}
 	// 读取完整的数据
 	buf := make([]byte, dataLen)
@@ -656,9 +668,12 @@ func deCompress(compressed []byte) ([]byte, *errs.Error) {
 
 	// Copy the decompressed data to the result
 	// 将解压后的数据复制到 result 中
-	_, err = io.Copy(&result, r)
+	_, err = io.Copy(&result, io.LimitReader(r, banConnMaxMessageBytes+1))
 	if err != nil {
 		return nil, errs.New(core.ErrDeCompressFail, err)
+	}
+	if result.Len() > banConnMaxMessageBytes {
+		return nil, errs.NewMsg(core.ErrDeCompressFail, "ban connection message exceeds %d bytes", banConnMaxMessageBytes)
 	}
 
 	return result.Bytes(), nil
@@ -703,13 +718,18 @@ func getErrType(err error) (int, string) {
 }
 
 type ServerIO struct {
-	Addr       string
-	aesKey     string
-	Conns      []IBanConn
-	Data       map[string]string // Cache data available for remote access 缓存的数据，可供远程端访问
-	DataExp    map[string]int64  // Cache data expiration timestamp, 13 bits 缓存数据的过期时间戳，13位
-	InitConn   func(*BanConn)
-	OnConnExit func(*BanConn, *errs.Error)
+	Addr        string
+	aesKey      string
+	connections *serverConnections
+	Data        map[string]string // Cache data available for remote access 缓存的数据，可供远程端访问
+	DataExp     map[string]int64  // Cache data expiration timestamp, 13 bits 缓存数据的过期时间戳，13位
+	InitConn    func(*BanConn)
+	OnConnExit  func(*BanConn, *errs.Error)
+}
+
+type serverConnections struct {
+	sync.RWMutex
+	items []IBanConn
 }
 
 var (
@@ -720,10 +740,44 @@ func NewBanServer(addr, aesKey string) *ServerIO {
 	var server ServerIO
 	server.Addr = addr
 	server.aesKey = aesKey
+	server.connections = &serverConnections{}
 	server.Data = map[string]string{}
 	banServer = &server
 	gob.Register(IOMsgRaw{})
 	return &server
+}
+
+func (s *ServerIO) AddConnection(conn IBanConn) {
+	if s.connections == nil {
+		s.connections = &serverConnections{}
+	}
+	s.connections.Lock()
+	s.connections.items = append(s.connections.items, conn)
+	s.connections.Unlock()
+}
+
+func (s *ServerIO) RemoveConnection(target IBanConn) {
+	if s.connections == nil {
+		return
+	}
+	s.connections.Lock()
+	for i, conn := range s.connections.items {
+		if conn == target {
+			s.connections.items = append(s.connections.items[:i], s.connections.items[i+1:]...)
+			break
+		}
+	}
+	s.connections.Unlock()
+}
+
+func (s *ServerIO) ConnectionsSnapshot() []IBanConn {
+	if s.connections == nil {
+		return nil
+	}
+	s.connections.RLock()
+	result := append([]IBanConn(nil), s.connections.items...)
+	s.connections.RUnlock()
+	return result
 }
 
 func (s *ServerIO) RunForever(intvSecs, timeoutSecs int) *errs.Error {
@@ -743,13 +797,14 @@ func (s *ServerIO) RunForever(intvSecs, timeoutSecs int) *errs.Error {
 		}
 		conn := s.WrapConn(conn_)
 		log.Info("receive client", zap.String("remote", conn.GetRemote()))
-		s.Conns = append(s.Conns, conn)
+		s.AddConnection(conn)
 		go func() {
 			err := conn.RunForever()
 			if err != nil {
 				log.Warn("read client fail", zap.String("remote", conn.GetRemote()),
 					zap.String("err", err.Message()))
 			}
+			s.RemoveConnection(conn)
 			if s.OnConnExit != nil {
 				s.OnConnExit(conn, err)
 			}
@@ -796,18 +851,17 @@ func (s *ServerIO) GetVal(key string) string {
 }
 
 func (s *ServerIO) Broadcast(msg *IOMsg) *errs.Error {
-	allConns := make([]IBanConn, 0, len(s.Conns))
+	conns := s.ConnectionsSnapshot()
 	curConns := make([]IBanConn, 0)
-	for _, conn := range s.Conns {
+	for _, conn := range conns {
 		if conn.IsClosed() {
+			s.RemoveConnection(conn)
 			continue
 		}
-		allConns = append(allConns, conn)
 		if _, ok := conn.GetData(msg.Action); ok {
 			curConns = append(curConns, conn)
 		}
 	}
-	s.Conns = allConns
 	if len(curConns) == 0 {
 		return nil
 	}
@@ -845,14 +899,13 @@ func (s *ServerIO) loopCheckTimeout(intvSecs, timeoutSecs int) {
 		nowMS := btime.UTCStamp()
 		timeoutMS := int64(timeoutSecs * 1000)
 
-		aliveConns := make([]IBanConn, 0, len(s.Conns))
-		for _, conn := range s.Conns {
+		for _, conn := range s.ConnectionsSnapshot() {
 			if conn.IsClosed() {
+				s.RemoveConnection(conn)
 				continue
 			}
 			banConn, ok := conn.(*BanConn)
 			if !ok {
-				aliveConns = append(aliveConns, conn)
 				continue
 			}
 			// Check if heartbeat timeout
@@ -862,11 +915,10 @@ func (s *ServerIO) loopCheckTimeout(intvSecs, timeoutSecs int) {
 					zap.Int64("lastHeartbeat", banConn.heartBeatMs),
 					zap.Int64("timeoutMs", timeoutMS))
 				_ = banConn.Close()
+				s.RemoveConnection(conn)
 				continue
 			}
-			aliveConns = append(aliveConns, conn)
 		}
-		s.Conns = aliveConns
 	}
 }
 

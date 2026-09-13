@@ -848,6 +848,9 @@ func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 	if core.EnvReal {
 		return
 	}
+	if !(baseAmount > 0) {
+		return
+	}
 	exs := orm.GetSymbolByID(int32(od.Sid))
 	if exs == nil {
 		panic(fmt.Sprintf("EnterOd invalid sid of order: %v", od.Sid))
@@ -867,6 +870,10 @@ func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 		// For spot multiple orders, sell from the available value of the base, calculate the available value of the quote, and cancel it from the pending unfilled part of the quote.
 		// 现货多单，从base的available卖，计算到quote的available，从quote的pending未成交部分取消
 		wallet := w.Get(baseCode)
+		if wallet.Available <= 0 {
+			w.Cancel(od.Key(), quoteCode, 0, true)
+			return
+		}
 
 		if wallet.Available > 0 && wallet.Available < baseAmount || math.Abs(wallet.Available/baseAmount-1) <= 0.01 {
 			baseAmount = wallet.Available
@@ -921,8 +928,19 @@ func (w *BanWallets) ConfirmOdExit(od *ormo.InOutOrder, exitPrice float64) {
 	} else {
 		//For long orders, sell from the base's availability and exchange it for the quote's availability.
 		//多单，从base的avaiable卖，兑换为quote的available
-		quoteAmount := exitPrice*subOd.Amount - curFee
-		w.ConfirmPending(odKey, baseCode, subOd.Amount, quoteCode, quoteAmount, false)
+		baseAmount := subOd.Amount
+		// Entry fees may have been charged in base, so ExitOd can only lock the
+		// net amount actually received. Settle the pending amount instead of
+		// creating a negative base balance and crediting proceeds for unsold dust.
+		if baseWallet, ok := w.Items[baseCode]; ok {
+			baseWallet.lock.Lock()
+			if pendingAmount, exists := baseWallet.Pendings[odKey]; exists && pendingAmount > 0 {
+				baseAmount = pendingAmount
+			}
+			baseWallet.lock.Unlock()
+		}
+		quoteAmount := exitPrice*baseAmount - curFee
+		w.ConfirmPending(odKey, baseCode, baseAmount, quoteCode, quoteAmount, false)
 	}
 }
 func (w *BanWallets) CutPart(srcKey string, tgtKey string, symbol string, rate float64) {
@@ -989,7 +1007,10 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		if marginRatio > 0.99 {
 			// The total loss exceeds the total assets and the position is liquidated.
 			// 总亏损超过总资产，爆仓
-			wallet.Reset()
+			// Backtests without recharge settle frozen margin during normal cleanup.
+			if !core.BackTestMode || config.ChargeOnBomb {
+				wallet.Reset()
+			}
 			return errs.NewMsg(core.ErrLiquidation, "Account Wallet Liquidation")
 		}
 	}
@@ -1060,9 +1081,6 @@ func legacyWalletOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
 }
 
 func walletMarkPrice(symbol string) float64 {
-	if core.BackTestMode && config.Data.BTLegacyWallet {
-		return com.GetLastBarPrice(symbol)
-	}
 	return com.GetPriceSafe(symbol, "")
 }
 

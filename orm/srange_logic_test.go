@@ -15,9 +15,25 @@ package orm
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/banbox/banexg/errs"
 )
+
+func TestNormalizeSRangeSpansPrefersLatestRowVersion(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0).UTC()
+	got := normalizeSRangeSpans([]srangeSpan{
+		{StartMs: 0, StopMs: 100, HasData: true, Ts: base},
+		{StartMs: 50, StopMs: 150, HasData: false, Ts: base.Add(time.Second)},
+	})
+	want := []srangeSpan{
+		{StartMs: 0, StopMs: 50, HasData: true},
+		{StartMs: 50, StopMs: 150, HasData: false},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized spans = %+v, want %+v", got, want)
+	}
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. mergeMSRanges comprehensive edge cases

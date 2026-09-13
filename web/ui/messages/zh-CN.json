@@ -829,7 +829,7 @@
   "get_system_language": "获取系统语言设置",
   "calc_corr_mat": "计算相关性矩阵",
   "calc_envs_corr": "计算多个K线环境的相关性",
-  "calc_expectancy": "计算收益期望和风险回报比",
+  "calc_expectancy": "计算收益期望和收益期望比率",
   "calc_max_draw_down": "计算最大回撤",
   "auto_corr_penalty": "计算自相关惩罚因子",
   "kmeans_vals": "对数值序列进行K均值聚类",

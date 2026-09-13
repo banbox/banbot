@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"regexp"
@@ -604,6 +605,9 @@ func (q *SubQueries) Begin(ctx context.Context) (pgx.Tx, error) {
 	if tx, ok := q.db.(pgx.Tx); ok {
 		return tx.Begin(ctx)
 	}
+	if beginner, ok := q.db.(dbBeginner); ok {
+		return beginner.Begin(ctx)
+	}
 	return nil, fmt.Errorf("db is not pgx.Tx")
 }
 
@@ -783,7 +787,37 @@ func (a *AdjInfo) Apply(bars []*banexg.Kline, adj int) []*banexg.Kline {
 	return result
 }
 
+func isTransientDBConnError(err_ error) bool {
+	if err_ == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err_, &opErr) {
+		return true
+	}
+	if errors.Is(err_, io.EOF) {
+		return true
+	}
+	msg := strings.ToLower(err_.Error())
+	for _, marker := range []string{
+		"broken pipe",
+		"unexpected eof",
+		"connection reset",
+		"connection refused",
+		"connection closed",
+		"use of closed network connection",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func NewDbErr(code int, err_ error) *errs.Error {
+	if isTransientDBConnError(err_) {
+		return errs.New(core.ErrDbConnFail, err_)
+	}
 	var opErr *net.OpError
 	var pgErr *pgconn.ConnectError
 	if errors.As(err_, &opErr) {

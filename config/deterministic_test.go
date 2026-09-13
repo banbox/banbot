@@ -62,6 +62,34 @@ func TestStrictBacktestRequiresModeAndFlag(t *testing.T) {
 	}
 }
 
+func TestStrictHistoricalReplayRequiresEveryGate(t *testing.T) {
+	oldMode, oldData := core.BackTestMode, Data
+	t.Cleanup(func() {
+		core.BackTestMode, Data = oldMode, oldData
+	})
+	coverage := &HistoricalCoverageConfig{}
+	core.BackTestMode = true
+	Data.BTStrict = true
+	Data.BTNoKlineDownload = true
+	if !StrictHistoricalReplay(coverage) {
+		t.Fatal("strict historical replay disabled with every gate")
+	}
+	for _, disable := range []func(){
+		func() { core.BackTestMode = false },
+		func() { Data.BTStrict = false },
+		func() { Data.BTNoKlineDownload = false },
+	} {
+		core.BackTestMode, Data.BTStrict, Data.BTNoKlineDownload = true, true, true
+		disable()
+		if StrictHistoricalReplay(coverage) {
+			t.Fatal("strict historical replay ignored a required gate")
+		}
+	}
+	if StrictHistoricalReplay(nil) {
+		t.Fatal("strict historical replay accepted nil coverage")
+	}
+}
+
 func TestInitExgAccsSelectsCanonicalBacktestAccount(t *testing.T) {
 	oldAccounts, oldBak := Accounts, BakAccounts
 	oldExchange, oldDefAcc := Exchange, DefAcc

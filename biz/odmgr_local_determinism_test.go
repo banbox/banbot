@@ -32,26 +32,165 @@ func TestDeterministicFillPendingOrdersUsesStableBusinessOrder(t *testing.T) {
 	testFillPendingOrdersUsesStableBusinessOrder(t, false, true)
 }
 
+func TestFrozenReplayFillPendingOrdersPreservesSuppliedBusinessOrder(t *testing.T) {
+	oldExchange := exg.Default
+	oldBackTest := core.BackTestMode
+	oldEnvReal := core.EnvReal
+	oldLiveMode := core.LiveMode
+	oldData := config.Data
+	oldPairs := config.Pairs
+	oldPairFilters := config.PairFilters
+	oldPairMgr := config.PairMgr
+	exg.Default = &deterministicFillExchange{}
+	core.BackTestMode = true
+	core.EnvReal = true
+	core.LiveMode = false
+	config.Data.BTLegacyWallet = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+	t.Cleanup(func() {
+		exg.Default = oldExchange
+		core.BackTestMode = oldBackTest
+		core.EnvReal = oldEnvReal
+		core.LiveMode = oldLiveMode
+		config.Data = oldData
+		config.Pairs = oldPairs
+		config.PairFilters = oldPairFilters
+		config.PairMgr = oldPairMgr
+	})
+
+	exs := &orm.ExSymbol{ID: 155, Symbol: "DETERMINISTIC/USDT"}
+	evt := orm.NewDataSeriesFromKline(exs, "1m", &banexg.Kline{
+		Time: 1_700_000_000_000, Open: 100, High: 100, Low: 100, Close: 100,
+	}, nil, true, true)
+	wallets := &BanWallets{Items: map[string]*ItemWallet{
+		"USDT": {Available: 100, Pendings: map[string]float64{}, Frozens: map[string]float64{}},
+	}}
+	var callbackIDs []int64
+	var admittedIDs []int64
+	mgr := &LocalOrderMgr{OrderMgr: OrderMgr{Account: config.DefAcc}}
+	mgr.callBack = func(od *ormo.InOutOrder, _ bool) {
+		callbackIDs = append(callbackIDs, od.ID)
+		if _, err := wallets.CostAva(od.Key(), "USDT", map[int64]float64{1: 60, 2: 50, 3: 40}[od.ID], false, 0.9); err == nil {
+			admittedIDs = append(admittedIDs, od.ID)
+		}
+	}
+	orders := []*ormo.InOutOrder{
+		deterministicPendingExit(3, exs.Symbol),
+		deterministicPendingExit(2, exs.Symbol),
+		deterministicPendingExit(1, exs.Symbol),
+	}
+
+	if _, err := mgr.fillPendingOrders(orders, evt); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(callbackIDs, []int64{3, 2, 1}) {
+		t.Fatalf("callback order = %v, want supplied order [3 2 1]", callbackIDs)
+	}
+	if !slices.Equal(admittedIDs, []int64{3, 2}) {
+		t.Fatalf("admitted orders = %v, want supplied-order result [3 2]", admittedIDs)
+	}
+}
+
+func TestFrozenReplayCallbackOrdersPreserveSuppliedOrder(t *testing.T) {
+	oldBackTest, oldData, oldPairs, oldFilters, oldMgr := core.BackTestMode, config.Data,
+		config.Pairs, config.PairFilters, config.PairMgr
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data = oldBackTest, oldData
+		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+	})
+
+	for _, permutation := range [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}} {
+		orders := make([]*ormo.InOutOrder, 0, len(permutation))
+		for _, id := range permutation {
+			orders = append(orders, &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: id}})
+		}
+		sortOrdersForBacktest(orders)
+		if got := orderIDs(orders); !slices.Equal(got, permutation) {
+			t.Fatalf("permutation %v callback orders = %v, want supplied order", permutation, got)
+		}
+	}
+}
+
+func TestFrozenReplayMapRescanCanonicalizesOrder(t *testing.T) {
+	oldMode, oldData := core.BackTestMode, config.Data
+	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data = oldMode, oldData
+		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+	})
+
+	for _, permutation := range [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}} {
+		orders := make([]*ormo.InOutOrder, 0, len(permutation))
+		for _, id := range permutation {
+			orders = append(orders, &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: id}})
+		}
+		sortMapOrdersForBacktest(orders)
+		if got := orderIDs(orders); !slices.Equal(got, []int64{1, 2, 3}) {
+			t.Fatalf("permutation %v map rescan order = %v, want [1 2 3]", permutation, got)
+		}
+	}
+}
+
+func TestFrozenReplayMapBoundaryPreservesSuppliedOrder(t *testing.T) {
+	oldMode, oldData := core.BackTestMode, config.Data
+	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.PairFilters = nil
+	config.PairMgr = &config.PairMgrConfig{}
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data = oldMode, oldData
+		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+	})
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{ID: 3}},
+		{IOrder: &ormo.IOrder{ID: 1}},
+		{IOrder: &ormo.IOrder{ID: 2}},
+	}
+	if got := executionOrderView(orders); !slices.Equal(orderIDs(got), []int64{3, 1, 2}) {
+		t.Fatalf("frozen map boundary changed supplied order: %v", orderIDs(got))
+	}
+}
+
 func testFillPendingOrdersUsesStableBusinessOrder(t *testing.T, legacy, deterministic bool) {
 	oldExchange := exg.Default
 	oldBackTest := core.BackTestMode
 	oldEnvReal := core.EnvReal
 	oldLiveMode := core.LiveMode
-	oldCompat := config.Data.BTLegacyWallet
-	oldDeterministic := config.Data.BTStrict
+	oldData := config.Data
 	exg.Default = &deterministicFillExchange{}
 	core.BackTestMode = true
 	core.EnvReal = true
 	core.LiveMode = false
 	config.Data.BTLegacyWallet = legacy
 	config.Data.BTStrict = deterministic
+	if legacy {
+		config.Data.BTLegacyWallet = true
+	}
 	t.Cleanup(func() {
 		exg.Default = oldExchange
 		core.BackTestMode = oldBackTest
 		core.EnvReal = oldEnvReal
 		core.LiveMode = oldLiveMode
-		config.Data.BTLegacyWallet = oldCompat
-		config.Data.BTStrict = oldDeterministic
+		config.Data = oldData
 	})
 
 	exs := &orm.ExSymbol{ID: 155, Symbol: "DETERMINISTIC/USDT"}

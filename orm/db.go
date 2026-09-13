@@ -6,6 +6,7 @@ package orm
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -24,6 +25,22 @@ func New(db DBTX) *Queries {
 
 type Queries struct {
 	db DBTX
+}
+
+type dbBeginner interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+func (q *Queries) begin(ctx context.Context) (pgx.Tx, *Queries, error) {
+	beginner, ok := q.db.(dbBeginner)
+	if !ok {
+		return nil, nil, fmt.Errorf("database connection does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tx, q.WithTx(tx), nil
 }
 
 func (q *Queries) WithTx(tx pgx.Tx) *Queries {

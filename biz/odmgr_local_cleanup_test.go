@@ -9,7 +9,9 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
@@ -100,6 +102,58 @@ func TestBacktestCleanupUsesLastHistoricalPrice(t *testing.T) {
 	}
 	if affected != 1 || od.Status != ormo.InOutStatusFullExit || od.Exit.Average != lastPrice {
 		t.Fatalf("stale historical price not used: affected=%d status=%d price=%v", affected, od.Status, od.Exit.Average)
+	}
+}
+
+func TestBacktestExitAndFillUsesLastHistoricalPrice(t *testing.T) {
+	mgr := setupLocalCleanupTest(t, true, true)
+	const symbol = "HIFI-ROTATION/USDT:USDT"
+	const lastPrice = 0.42
+	btime.CurTimeMS = 1_700_000_000_000
+	com.SetBarPrice(symbol, lastPrice)
+	btime.CurTimeMS += com.Day10MSecs + 1
+	od := cleanupPendingExit(1, symbol)
+	od.ExitTag = ""
+	od.Exit = nil
+
+	if err := mgr.ExitAndFill([]*ormo.InOutOrder{od}, &strat.ExitReq{Tag: core.ExitTagPairDel}); err != nil {
+		t.Fatalf("fill rotation order: %v", err)
+	}
+	if od.Status != ormo.InOutStatusFullExit || od.Exit.Average != lastPrice {
+		t.Fatalf("stale historical price not used: status=%d price=%v", od.Status, od.Exit.Average)
+	}
+}
+
+func TestBacktestBaselineCleanupUsesExplicitCutoff(t *testing.T) {
+	mgr := setupLocalCleanupTest(t, true, false)
+	oldNetCost := config.BTNetCost
+	config.BTNetCost = 15
+	t.Cleanup(func() { config.BTNetCost = oldNetCost })
+	const cutoff = int64(1_700_000_000_000)
+	const symbol = "BASELINE-CLEANUP/USDT:USDT"
+	restoreSymbols, err := orm.InstallFrozenExSymbols([]*orm.ExSymbol{{
+		ID: 1, Exchange: "binance", Market: banexg.MarketLinear, Symbol: symbol,
+	}})
+	if err != nil {
+		t.Fatalf("install test symbol: %v", err)
+	}
+	t.Cleanup(restoreSymbols)
+	btime.CurTimeMS = cutoff + com.Day10MSecs
+	com.SetBarPrice(symbol, 12)
+	od := cleanupPendingExit(1, symbol)
+	od.Sid = 1
+	od.ExitTag = ""
+	od.Exit = nil
+	od.Save()
+	if err := mgr.cleanUpAt(cutoff); err != nil {
+		t.Fatalf("close baseline orders: %v", err)
+	}
+	if od.Status != ormo.InOutStatusFullExit || od.ExitTag != core.ExitTagBotStop ||
+		od.ExitAt != cutoff+15_000 {
+		t.Fatalf("baseline cleanup order=%+v, want bot_stop at %d", od, cutoff+15_000)
+	}
+	if btime.CurTimeMS != cutoff+com.Day10MSecs {
+		t.Fatalf("cleanup changed simulated clock: %d", btime.CurTimeMS)
 	}
 }
 

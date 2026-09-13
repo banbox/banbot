@@ -122,11 +122,11 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries) *errs.Error {
 
 func deliverDataOnlySeries(jobMap map[string]*strat.StratJob, evt *orm.DataSeries) {
 	for job := range executionStratJobs(jobMap) {
-		fields := job.SetData(evt)
-		job.IsWarmUp = evt.IsWarmUp
 		if job.Strat.OnData == nil {
 			continue
 		}
+		fields := job.SetData(evt)
+		job.IsWarmUp = evt.IsWarmUp
 		num1, num2 := strat.GetJobInOutNum(job)
 		job.Strat.OnData(job, strat.DataEvent{
 			DataFields: fields,
@@ -149,9 +149,10 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 	core.LockOdMatch.RLock()
 	_, odMatch := core.OrderMatchTfs[evt.TimeFrame]
 	core.LockOdMatch.RUnlock()
-	accOrders := make(map[string][]*ormo.InOutOrder)
+	var accOrders map[string][]*ormo.InOutOrder
 	com.SetBarPrice(symbol, closeVal)
 	if odMatch && !evt.IsWarmUp {
+		accOrders = make(map[string][]*ormo.InOutOrder)
 		for account := range executionAccountNames() {
 			cfg := config.Accounts[account]
 			if cfg.NoTrade {
@@ -193,10 +194,19 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 			barExpired = false
 		}
 	}
-	var wg sync.WaitGroup
+	if core.ParallelOnBar && !config.StrictBacktest() {
+		return t.feedClosedSeriesParallel(evt, env, symbol, odMatch, accOrders, barExpired)
+	}
+	return t.feedClosedSeriesSerial(evt, env, symbol, odMatch, accOrders, barExpired)
+}
+
+func (t *Trader) feedClosedSeriesSerial(evt *orm.DataSeries, env *ta.BarEnv, symbol string,
+	odMatch bool, accOrders map[string][]*ormo.InOutOrder, barExpired bool) *errs.Error {
 	var runErr *errs.Error
-	var accOdArr = make([]string, 0, len(config.Accounts))
-	parallelOnBar := core.ParallelOnBar && !config.StrictBacktest()
+	var accOdArr []string
+	if core.LiveMode {
+		accOdArr = make([]string, 0, len(config.Accounts))
+	}
 	for account := range executionAccountNames() {
 		cfg := config.Accounts[account]
 		if cfg.NoTrade {
@@ -216,34 +226,15 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 			}
 		}
 		if core.LiveMode && !evt.IsWarmUp {
-			numStr := fmt.Sprintf("%s: %d/%d", account, len(curOrders), len(allOrders))
-			accOdArr = append(accOdArr, numStr)
+			accOdArr = append(accOdArr, fmt.Sprintf("%s: %d/%d", account, len(curOrders), len(allOrders)))
 		}
-		if !parallelOnBar {
-			curErr := t.onAccountDataSeries(account, env, evt, allOrders, barExpired)
-			if curErr != nil {
-				if runErr != nil {
-					log.Error("onAccountDataSeries fail", zap.String("account", account), zap.Error(curErr))
-				} else {
-					runErr = curErr
-				}
+		if curErr := t.onAccountDataSeries(account, env, evt, allOrders, barExpired); curErr != nil {
+			if runErr != nil {
+				log.Error("onAccountDataSeries fail", zap.String("account", account), zap.Error(curErr))
+			} else {
+				runErr = curErr
 			}
-		} else {
-			wg.Add(1)
-			go func(acc string, ods []*ormo.InOutOrder) {
-				defer wg.Done()
-				if curErr := t.onAccountDataSeries(acc, env, evt, ods, barExpired); curErr != nil {
-					if runErr != nil {
-						log.Error("onAccountDataSeries fail", zap.String("account", acc), zap.Error(curErr))
-					} else {
-						runErr = curErr
-					}
-				}
-			}(account, allOrders)
 		}
-	}
-	if parallelOnBar {
-		wg.Wait()
 	}
 	if core.LiveMode && len(accOdArr) > 0 {
 		log.Info("OnSeries", zap.String("pair", symbol), zap.String("tf", evt.TimeFrame),
@@ -252,7 +243,152 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 	return runErr
 }
 
+func (t *Trader) feedClosedSeriesParallel(evt *orm.DataSeries, env *ta.BarEnv, symbol string,
+	odMatch bool, accOrders map[string][]*ormo.InOutOrder, barExpired bool) *errs.Error {
+	var accOdArr []string
+	if core.LiveMode {
+		accOdArr = make([]string, 0, len(config.Accounts))
+	}
+	errCh := make(chan *errs.Error, len(config.Accounts))
+	var wg sync.WaitGroup
+	for account := range executionAccountNames() {
+		cfg := config.Accounts[account]
+		if cfg.NoTrade {
+			continue
+		}
+		allOrders, _ := accOrders[account]
+		if !odMatch {
+			openOds, lock := ormo.GetOpenODs(account)
+			lock.Lock()
+			allOrders = executionOpenOrders(openOds)
+			lock.Unlock()
+		}
+		var curOrders []*ormo.InOutOrder
+		for _, od := range allOrders {
+			if od.Status < ormo.InOutStatusFullExit && od.Symbol == symbol && od.Timeframe == evt.TimeFrame {
+				curOrders = append(curOrders, od)
+			}
+		}
+		if core.LiveMode && !evt.IsWarmUp {
+			accOdArr = append(accOdArr, fmt.Sprintf("%s: %d/%d", account, len(curOrders), len(allOrders)))
+		}
+		wg.Add(1)
+		go func(acc string, ods []*ormo.InOutOrder) {
+			defer wg.Done()
+			if err := t.onAccountDataSeries(acc, env, evt, ods, barExpired); err != nil {
+				errCh <- err
+			}
+		}(account, allOrders)
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+	if core.LiveMode && len(accOdArr) > 0 {
+		log.Info("OnSeries", zap.String("pair", symbol), zap.String("tf", evt.TimeFrame),
+			zap.Strings("accOdNums", accOdArr))
+	}
+	return nil
+}
+
 func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.DataSeries, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
+	if core.ParallelOnBar && !config.StrictBacktest() {
+		return t.onAccountDataSeriesParallel(account, env, evt, curOrders, barExpired)
+	}
+	return t.onAccountDataSeriesSerial(account, env, evt, curOrders, barExpired)
+}
+
+func (t *Trader) onAccountDataSeriesSerial(account string, env *ta.BarEnv, evt *orm.DataSeries,
+	curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
+	symbol := evt.Symbol()
+	envKey := symbol + "_" + evt.TimeFrame
+	strat.LockJobsRead()
+	jobs, _ := strat.GetJobs(account)[envKey]
+	infoJobMap := strat.GetInfoJobs(account)
+	var infoJobs map[string]*strat.StratJob
+	if len(infoJobMap) > 0 {
+		infoJobs = infoJobMap[strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)]
+	}
+	strat.UnlockJobsRead()
+	if len(jobs) == 0 && len(infoJobs) == 0 {
+		return nil
+	}
+	odMgr := GetOdMgr(account)
+	isWarmup := evt.IsWarmUp
+	var handledJobs map[*strat.StratJob]bool
+	if len(infoJobs) > 0 {
+		handledJobs = make(map[*strat.StratJob]bool, len(jobs))
+	}
+	for job := range executionStratJobs(jobs) {
+		if handledJobs != nil {
+			handledJobs[job] = true
+		}
+		var fields *strat.DataFields
+		if job.Strat.OnData != nil {
+			fields = job.SetData(evt)
+		}
+		job.IsWarmUp = isWarmup
+		job.InitBar(curOrders)
+		if err := t.onAccountDataSeriesJob(odMgr, job, evt, fields, barExpired); err != nil {
+			return err
+		}
+	}
+	return t.onAccountInfoSeries(account, env, evt, infoJobs, handledJobs)
+}
+
+func (t *Trader) onAccountInfoSeries(account string, env *ta.BarEnv, evt *orm.DataSeries,
+	infoJobs map[string]*strat.StratJob, handledJobs map[*strat.StratJob]bool) *errs.Error {
+	symbol := evt.Symbol()
+	isWarmup := evt.IsWarmUp
+	for job := range executionStratJobs(infoJobs) {
+		if handledJobs[job] {
+			continue
+		}
+		fields := job.SetData(evt)
+		job.IsWarmUp = isWarmup
+		num1, num2 := strat.GetJobInOutNum(job)
+		if job.Strat.OnData != nil {
+			job.Strat.OnData(job, strat.DataEvent{
+				DataFields: fields,
+				Role:       strat.DataRoleInfo,
+				Symbol:     evt.EnsureExSymbol(),
+			})
+			strat.CheckJobInOutNum(job, "OnData", num1, num2)
+		} else if job.Strat.OnInfoBar != nil {
+			job.Strat.OnInfoBar(job, env, symbol, evt.TimeFrame)
+			strat.CheckJobInOutNum(job, "OnInfoBar", num1, num2)
+		}
+		if job.Strat.BatchInfo && job.Strat.OnBatchInfos != nil {
+			AddBatchJob(account, evt.TimeFrame, job, env)
+		}
+	}
+	if env.VNum > 1000 && !isWarmup {
+		keyAt := "first_hit_at"
+		keyNum := "first_hit_vnum"
+		if cacheVal, ok := env.Data.Load(keyAt); ok {
+			firstAt, _ := cacheVal.(int)
+			firstNumVal, _ := env.Data.Load(keyNum)
+			firstNum, _ := firstNumVal.(int)
+			if env.BarNum-firstAt > 10 {
+				if env.VNum-firstNum > 0 {
+					addNum := env.VNum - firstNum
+					addFor := env.BarNum - firstAt
+					errMsg := "series too many (total %v), new add %v in %v bars, try replace `NewSeries` with `Series.To`"
+					core.BotRunning = false
+					return errs.NewMsg(errs.CodeRunTime, errMsg, env.VNum, addNum, addFor)
+				}
+			}
+		} else {
+			env.Data.Store(keyAt, env.BarNum)
+			env.Data.Store(keyNum, env.VNum)
+		}
+	}
+	return nil
+}
+
+func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt *orm.DataSeries, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
 	symbol := evt.Symbol()
 	envKey := symbol + "_" + evt.TimeFrame
 	strat.LockJobsRead()
@@ -279,7 +415,10 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 		if handledJobs != nil {
 			handledJobs[job] = true
 		}
-		fields := job.SetData(evt)
+		var fields *strat.DataFields
+		if job.Strat.OnData != nil {
+			fields = job.SetData(evt)
+		}
 		job.IsWarmUp = isWarmup
 		job.InitBar(curOrders)
 		if !parallelOnBar {

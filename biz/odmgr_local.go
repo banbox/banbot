@@ -145,7 +145,9 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 		}
 		lock.Unlock()
 		if len(newOds) > 0 {
-			sortOrdersForBacktest(newOds)
+			// openOds is a map, so its iteration order is not a historical
+			// order that frozen replay can preserve.
+			sortMapOrdersForBacktest(newOds)
 			_, err = o.fillPendingOrders(newOds, evt)
 			if err != nil {
 				return orders, err
@@ -163,9 +165,20 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 
 // sortOrdersForBacktest enforces deterministic order iteration only in backtests.
 func sortOrdersForBacktest(orders []*ormo.InOutOrder) {
+	if !core.BackTestMode || preserveFrozenReplayExecutionOrder() || len(orders) < 2 {
+		return
+	}
+	sortOrdersByID(orders)
+}
+
+func sortMapOrdersForBacktest(orders []*ormo.InOutOrder) {
 	if !core.BackTestMode || len(orders) < 2 {
 		return
 	}
+	sortOrdersByID(orders)
+}
+
+func sortOrdersByID(orders []*ormo.InOutOrder) {
 	sort.Slice(orders, func(i, j int) bool {
 		return orders[i].ID < orders[j].ID
 	})
@@ -177,7 +190,7 @@ Fills orders waiting for exchange response. Cannot be used for real trading; can
 填充等待交易所响应的订单。不可用于实盘；可用于回测、模拟实盘等。
 */
 func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.DataSeries) (int, *errs.Error) {
-	orders = legacyWalletOrderView(orders)
+	orders = executionOrderView(orders)
 	core.SimOrderMatch = true
 	core.NewNumInSim = 0
 	defer func() {
@@ -218,8 +231,8 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			trigPrice := od.Stop
 			lowVal, _ := evt.LowValue()
 			highVal, _ := evt.HighValue()
-			if trigPrice < lowVal || trigPrice > highVal {
-				// 不处于bar的范围，无法触发
+			if !stopEntryTriggered(odIsBuy, trigPrice, lowVal, highVal) {
+				// The bar has not crossed the stop in the order direction.
 				continue
 			}
 			price = trigPrice
@@ -314,6 +327,16 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 		}
 	}
 	return affectNum, nil
+}
+
+func stopEntryTriggered(isBuy bool, trigger, low, high float64) bool {
+	if legacyIntrabarEnabled() {
+		if isBuy {
+			return trigger <= high
+		}
+		return trigger >= low
+	}
+	return trigger >= low && trigger <= high
 }
 
 func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fillMS int64) *errs.Error {
@@ -577,6 +600,36 @@ func (o *LocalOrderMgr) OnEnvEnd(evt *orm.DataSeries) *errs.Error {
 	return err
 }
 
+// cleanUpAt applies the same complete cleanup path used at the end of a
+// backtest, but at an explicit historical cutoff.
+func (o *LocalOrderMgr) cleanUpAt(atMS int64) *errs.Error {
+	if atMS <= 0 {
+		return errs.NewMsg(core.ErrBadConfig, "historical cleanup cutoff is invalid: %d", atMS)
+	}
+	oldMS := btime.CurTimeMS
+	oldNoEnter, hadNoEnter := core.NoEnterUntil[o.Account]
+	btime.CurTimeMS = atMS
+	defer func() {
+		btime.CurTimeMS = oldMS
+		if hadNoEnter {
+			core.NoEnterUntil[o.Account] = oldNoEnter
+		} else {
+			delete(core.NoEnterUntil, o.Account)
+		}
+	}()
+	return o.CleanUp()
+}
+
+// CloseBacktestOrdersAt closes positions that are still open at a historical
+// baseline before an extended backtest continues into its new tail.
+func CloseBacktestOrdersAt(account string, atMS int64) *errs.Error {
+	mgr, ok := GetOdMgr(account).(*LocalOrderMgr)
+	if !ok || mgr == nil {
+		return errs.NewMsg(core.ErrRunTime, "backtest order manager is not local")
+	}
+	return mgr.cleanUpAt(atMS)
+}
+
 func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noEnter bool) *errs.Error {
 	pairs := ""
 	if evt != nil {
@@ -611,7 +664,7 @@ func (o *LocalOrderMgr) exitAndFill(req *strat.ExitReq, evt *orm.DataSeries, noE
 }
 
 func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error {
-	orders = legacyWalletOrderView(orders)
+	orders = executionOrderView(orders)
 	for _, od := range orders {
 		_, err := o.exitOrder(od, req)
 		if err != nil {
@@ -620,7 +673,15 @@ func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitRe
 	}
 	timeMS := btime.TimeMS()
 	for _, od := range orders {
-		price := com.GetPriceExp(od.Symbol, "", com.Day10MSecs)
+		var price float64
+		if core.BackTestMode {
+			price = com.GetLastBarPrice(od.Symbol)
+		} else {
+			price = com.GetPriceExp(od.Symbol, "", com.Day10MSecs)
+		}
+		if price < 0 {
+			return errs.NewMsg(core.ErrRunTime, "no historical price for %s", od.Symbol)
+		}
 		err := o.fillPendingExit(od, price, timeMS)
 		if err != nil {
 			return err
@@ -649,6 +710,9 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 		delete(oldOpens, oid)
 	}
 	curMS := btime.UTCStamp()
+	if core.BackTestMode {
+		curMS = btime.TimeMS()
+	}
 	for _, od := range oldOpens {
 		if od.ExitTag != "" && od.ExitAt > curMS && od.ExitTag != core.ExitTagBotStop {
 			od.ExitTag = core.ExitTagBotStop

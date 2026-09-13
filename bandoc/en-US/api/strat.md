@@ -15,8 +15,8 @@ Public fields:
 - `WsSubs map[string]string` - WsSubs        map[string]string    // websocket subscription: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 - `DrawDownExit bool` - Whether to enable drawdown exit
 - `HedgeOff bool` - turn off future hedge mode
-- `BatchInOut bool` - Whether to batch execute entry/exit
-- `BatchInfo bool` - Whether to perform batch processing after OnInfoBar
+- `BatchInOut bool` - Whether to batch execute entry/exit after main `OnData(RoleMain)`/`OnBar`
+- `BatchInfo bool` - Whether to batch process after auxiliary `OnData(RoleInfo)`/`OnInfoBar`
 - `StakeRate float64` - Relative basic amount billing rate
 - `StopLoss float64` - Stop loss rate for all orders opened by this strategy (without leverage)
 - `StopEnterBars int` - Timeout candlestick number for limit entry orders
@@ -74,6 +74,8 @@ Public fields:
 
 ### DataHub
 Runtime data cache. `Get(tf, source, sid)` returns processed `DataFields`, and `AllReady()` determines whether all subscriptions that should be closed at the current event time have been updated. See [Custom Time-Series Data](../guide/custom_data.md) for subscription and consumption examples.
+
+`OnBatchJobs` receives main-timeframe jobs only and is enabled by `BatchInOut`; auxiliary-timeframe jobs go to `OnBatchInfos`, enabled by `BatchInfo`.
 
 ### JobEnv
 Represents a job for additional product data in OnBatchInfos.

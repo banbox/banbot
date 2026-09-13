@@ -444,14 +444,14 @@ Quote: Base1 Base2 ...
 ## 性能指标计算
 
 ### CalcExpectancy
-计算收益期望和风险回报比。
+计算收益期望和收益期望比率。
 
 参数:
 - `profits []float64` - 收益数组
 
 返回:
 - `float64` - 期望收益
-- `float64` - 风险回报比
+- `float64` - 收益期望比率
 
 ### CalcMaxDrawDown
 计算最大回撤。

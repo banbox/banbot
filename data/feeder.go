@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -33,13 +34,14 @@ type FuncEnvEnd = func(evt *orm.DataSeries)
 type FnGetInt64 = func() int64
 
 type PairTFCache struct {
-	TimeFrame  string
-	TFSecs     int
-	SubNextMS  int64 // Record the start timestamp of the next bar expected to be received. If it is inconsistent, the bar is missing and needs to be queried and updated. 记录子周期K线下一个期待收到的bar起始时间戳，如果不一致，则出现了bar缺失，需查询更新。
-	NextMS     int64 // 当前周期下一个K线期望的时间戳
-	WaitBar    *orm.DataSeries
-	Latest     *orm.DataSeries
-	AlignOffMS int64
+	TimeFrame    string
+	TFSecs       int
+	physicalOnly bool
+	SubNextMS    int64 // Record the start timestamp of the next bar expected to be received. If it is inconsistent, the bar is missing and needs to be queried and updated. 记录子周期K线下一个期待收到的bar起始时间戳，如果不一致，则出现了bar缺失，需查询更新。
+	NextMS       int64 // 当前周期下一个K线期望的时间戳
+	WaitBar      *orm.DataSeries
+	Latest       *orm.DataSeries
+	AlignOffMS   int64
 }
 
 /*
@@ -117,7 +119,8 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 	exgID := exchange.Info().ID
 	adds := make([]string, 0, len(timeFrames))
 	for _, tf := range timeFrames {
-		if _, ok := oldTfs[tf]; ok {
+		if sta, ok := stateMap[tf]; ok {
+			sta.physicalOnly = false
 			delete(oldTfs, tf)
 			continue
 		}
@@ -159,9 +162,10 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		if _, ok := stateMap["1h"]; !ok {
 			// 当需要1h以上级别数据，但未订阅1h时，需插入1h，以便后续从1h归集
 			sta := &PairTFCache{
-				TimeFrame:  "1h",
-				TFSecs:     hourSecs,
-				AlignOffMS: int64(exg.GetAlignOff(exgID, hourSecs) * 1000),
+				TimeFrame:    "1h",
+				TFSecs:       hourSecs,
+				physicalOnly: true,
+				AlignOffMS:   int64(exg.GetAlignOff(exgID, hourSecs) * 1000),
 			}
 			stateMap["1h"] = sta
 			newStates = utils.ValsOfMap(stateMap)
@@ -182,16 +186,37 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		}
 	}
 	if maxTfSecs >= 3600 {
+		consumerTf := physicalConsumerTimeframe(newStates)
 		// 使用1h及以上周期数据，额外添加1h的loader
 		// 当使用DBSeriesFeeder时，如果最小周期是1h，应将f.hour置为nil
 		if f.hour == nil {
 			f.hour = NewTfSeriesLoader(f.ExSymbol, "1h")
 		}
+		f.hour.allowPhysicalRead = consumerTf != ""
+		f.hour.physicalConsumerTimeframe = consumerTf
 	} else {
 		f.hour = nil
 	}
 	f.States = newStates
 	return adds
+}
+
+func physicalConsumerTimeframe(states []*PairTFCache) string {
+	const hourSecs = 3600
+	physical := false
+	var consumer *PairTFCache
+	for _, state := range states {
+		if state.TimeFrame == "1h" && state.physicalOnly {
+			physical = true
+		}
+		if state.TFSecs > hourSecs && (consumer == nil || state.TFSecs > consumer.TFSecs) {
+			consumer = state
+		}
+	}
+	if !physical || consumer == nil {
+		return ""
+	}
+	return consumer.TimeFrame
 }
 
 func comparePairTFCache(a, b *PairTFCache) int {
@@ -208,7 +233,8 @@ bars original unweighted K-line
 bars 原始未复权的K线
 */
 func (f *Feeder) onStateOhlcvs(state *PairTFCache, rows []*orm.DataSeries, lastOk bool) []*orm.DataSeries {
-	if !lastOk && len(rows) > 0 && f.coverage != nil && !f.coverage.Allows(state.TimeFrame, rows[len(rows)-1].TimeMS) {
+	if !state.physicalOnly && !lastOk && len(rows) > 0 && f.coverage != nil &&
+		!orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, state.TimeFrame, rows[len(rows)-1].TimeMS) {
 		lastOk = true
 	}
 	rows = f.filterHistoricalCoverageRows(state.TimeFrame, rows)
@@ -281,7 +307,7 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.Data
 		evt := row.CloneWithExSymbol(f.ExSymbol)
 		evt.TimeFrame = timeFrame
 		evt.Adj = adj
-		evt.IsWarmUp = f.isWarmUp
+		evt.IsWarmUp = f.isWarmUp || core.BackTestMode && config.TimeRange != nil && row.TimeMS+tfMSecs <= config.TimeRange.StartMS
 		evt.Closed = true
 		f.CallBack(evt)
 	}
@@ -300,13 +326,18 @@ func (f *Feeder) filterHistoricalCoverageRows(timeframe string, rows []*orm.Data
 	if f.coverage == nil {
 		return rows
 	}
+	for _, state := range f.States {
+		if state.TimeFrame == timeframe && state.physicalOnly {
+			return rows
+		}
+	}
 	for index, row := range rows {
-		if f.coverage.Allows(timeframe, row.TimeMS) {
+		if orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, timeframe, row.TimeMS) {
 			continue
 		}
 		filtered := append([]*orm.DataSeries(nil), rows[:index]...)
 		for _, remaining := range rows[index+1:] {
-			if f.coverage.Allows(timeframe, remaining.TimeMS) {
+			if orm.HistoricalCoverageAllows(f.coverage, f.ExSymbol, timeframe, remaining.TimeMS) {
 				filtered = append(filtered, remaining)
 			}
 		}
@@ -574,6 +605,7 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 		if err != nil {
 			return 0, nil, err
 		}
+		bars = f.filterHistoricalCoverageRows(tf, bars)
 		if debugWarm {
 			var firstMS, lastMS int64
 			if len(bars) > 0 {
@@ -629,6 +661,7 @@ Returns the ending timestamp (i.e. the starting timestamp of the next bar)
 返回结束的时间戳（即下一个bar开始时间戳）
 */
 func (f *SeriesFeeder) warmTf(tf string, rows []*orm.DataSeries) int64 {
+	rows = f.filterHistoricalCoverageRows(tf, rows)
 	if len(rows) == 0 {
 		return 0
 	}
@@ -886,6 +919,9 @@ func (f *DBSeriesFeeder) SubTfs(timeFrames []string, delOther bool) []string {
 		f.hour = nil
 	}
 	f.SetTimeFrame(minTF)
+	consumerTf := physicalConsumerTimeframe(f.States)
+	f.allowPhysicalRead = consumerTf != ""
+	f.physicalConsumerTimeframe = consumerTf
 	return arr
 }
 
@@ -994,8 +1030,10 @@ TfSeriesLoader 用于分批加载某个品种的指定周期K线，然后逐个�
 */
 type TfSeriesLoader struct {
 	*orm.ExSymbol
-	Timeframe string
-	TFMSecs   int64
+	Timeframe                 string
+	TFMSecs                   int64
+	allowPhysicalRead         bool
+	physicalConsumerTimeframe string
 
 	EndMS     int64
 	FirstRead bool
@@ -1121,7 +1159,8 @@ func (f *TfSeriesLoader) DownIfNeed(sess *orm.Queries, exchange banexg.BanExchan
 		}
 		defer conn.Release()
 	}
-	_, err = sess.DownOHLCV2DB(exchange, f.ExSymbol, downTf, btime.TimeMS(), f.EndMS, pBar)
+	_, err = sess.DownOHLCV2DBForRequestedTF(exchange, f.ExSymbol, downTf, f.Timeframe,
+		btime.TimeMS(), f.EndMS, pBar)
 	return err
 }
 
@@ -1142,15 +1181,6 @@ func (f *TfSeriesLoader) SetNext() {
 	}
 	// After the cache reading is completed, re-read the database
 	// 缓存读取完毕，重新读取数据库
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
-		f.rowIdx = -1
-		f.offsetMS = max(f.offsetMS, f.nextMS)
-		f.nextMS = math.MaxInt64
-		log.Error("get conn fail while loading kline", zap.Error(err))
-		return
-	}
-	defer conn.Release()
 	batchSize := 3000
 	if core.BackTestMode {
 		// QuestDB performs better with fewer, larger range queries than many small ones.
@@ -1167,7 +1197,34 @@ func (f *TfSeriesLoader) SetNext() {
 			zap.Int("batch_size", batchSize))
 	}
 	fields := strat.CollectKlineSubFields(f.ExSymbol.ID, f.Timeframe)
-	_, rows, err := sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields, f.offsetMS, endMS, batchSize, true)
+	var rows []*orm.DataSeries
+	var err *errs.Error
+	const maxSeriesLoadRetries = 3
+	for retry := 0; retry < maxSeriesLoadRetries; retry++ {
+		rows = nil
+		err = nil
+		sess, conn, connErr := orm.Conn(nil)
+		if connErr != nil {
+			err = connErr
+		} else {
+			if f.allowPhysicalRead {
+				_, rows, err = sess.GetPhysicalSeriesFieldsForConsumer(f.ExSymbol, f.Timeframe, fields,
+					f.physicalConsumerTimeframe,
+					f.offsetMS, endMS, batchSize, true)
+			} else {
+				_, rows, err = sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields,
+					f.offsetMS, endMS, batchSize, true)
+			}
+			conn.Release()
+		}
+		if err == nil || err.Code != core.ErrDbConnFail || retry == maxSeriesLoadRetries-1 {
+			break
+		}
+		log.Warn("retry loading kline after transient db connection failure",
+			zap.String("pair", f.Symbol), zap.String("tf", f.Timeframe),
+			zap.Int("attempt", retry+1), zap.Error(err))
+		core.Sleep(time.Second * time.Duration(retry+1))
+	}
 	if err != nil || len(rows) == 0 {
 		f.rowIdx = -1
 		f.offsetMS = max(f.offsetMS, f.nextMS)

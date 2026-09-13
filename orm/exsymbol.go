@@ -125,6 +125,13 @@ func GetSymbolByID(id int32) *ExSymbol {
 }
 
 func GetExSymbolCur(symbol string) (*ExSymbol, *errs.Error) {
+	if exg.Default == nil {
+		item := findExSymbol(core.ExgName, core.Market, symbol)
+		if item == nil {
+			return nil, errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, len(keySymbolMap))
+		}
+		return item, nil
+	}
 	return GetExSymbol(exg.Default, symbol)
 }
 
@@ -720,6 +727,26 @@ func InitListDates() *errs.Error {
 }
 
 func EnsureListDates(sess *Queries, exchange banexg.BanExchange, exsMap map[int32]*ExSymbol, exsList []*ExSymbol) *errs.Error {
+	canDownload := allowImplicitKlineDownload()
+	if exchange == nil {
+		if !canDownload {
+			return klineDownloadDisabledError("EnsureListDates")
+		}
+		return errs.NewMsg(core.ErrBadConfig, "EnsureListDates: exchange is required")
+	}
+	if !canDownload {
+		for _, exs := range exsMap {
+			if exs == nil || exs.ListMs == 0 {
+				return klineDownloadDisabledError("EnsureListDates")
+			}
+		}
+		for _, exs := range exsList {
+			if exs == nil || exs.ListMs == 0 {
+				return klineDownloadDisabledError("EnsureListDates")
+			}
+		}
+		return nil
+	}
 	exInfo := exchange.Info()
 	if exInfo.MarketType != banexg.MarketSpot {
 		return nil

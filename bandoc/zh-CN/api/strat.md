@@ -15,8 +15,8 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `WsSubs map[string]string` - websocket订阅: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 - `DrawDownExit bool` - 是否启用回撤退出
 - `HedgeOff bool` -关闭合约双向持仓
-- `BatchInOut bool` - 是否批量执行入场/出场
-- `BatchInfo bool` - 是否对OnInfoBar后执行批量处理
+- `BatchInOut bool` - 是否在主周期 `OnData(RoleMain)`/`OnBar` 后批量执行入场/出场
+- `BatchInfo bool` - 是否在辅助周期 `OnData(RoleInfo)`/`OnInfoBar` 后执行批量处理
 - `StakeRate float64` - 相对基础金额开单倍率
 - `StopLoss float64` - 此策略打开所有订单的默认止损比率（不带杠杆）
 - `StopEnterBars int` - 限价入场单超时K线数
@@ -74,6 +74,8 @@ strat 包提供了交易策略相关的功能定义和实现。
 
 ### DataHub
 运行时数据缓存。`Get(tf, source, sid)` 返回处理后的 `DataFields`，`AllReady()` 判断当前事件时间上应闭合的全部订阅是否已经更新。自定义数据的订阅和消费示例请参阅[自定义时序数据](../guide/custom_data.md)。
+
+`OnBatchJobs` 仅接收主周期任务，并由 `BatchInOut` 开启；辅助周期任务进入 `OnBatchInfos`，由 `BatchInfo` 开启。
 
 ### JobEnv
 在OnBatchInfos中表示某个额外品种数据的job

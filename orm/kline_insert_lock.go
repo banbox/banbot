@@ -19,7 +19,10 @@ const (
 	klineInsertMaxRetry    = 10
 )
 
-var klineInsertQuestVisibilityGrace = 3 * time.Second
+// QuestDB may take longer to publish sranges_q while many historical K-line
+// batches are being written concurrently. Keep the owner/recovery grace long
+// enough to absorb that WAL backlog; callers still validate the physical rows.
+var klineInsertQuestVisibilityGrace = 30 * time.Second
 
 type klineInsertLockOwner struct {
 	PID   int    `json:"pid"`

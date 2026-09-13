@@ -25,8 +25,8 @@ type TradeStrat struct {
 	WsSubs          map[string]string
 	DrawDownExit    bool
 	HedgeOff        bool    // turn off future hedge mode 关闭合约双向持仓
-	BatchInOut      bool    // Whether to batch execute entry/exit 是否批量执行入场/出场
-	BatchInfo       bool    // whether to perform batch processing after OninfoBar 是否对OnInfoBar后执行批量处理
+	BatchInOut      bool    // Whether to batch execute entry/exit after the main OnData/OnBar 是否在主周期OnData/OnBar后批量执行入场/出场
+	BatchInfo       bool    // Whether to batch process after auxiliary OnData/OnInfoBar 是否在辅助周期OnData/OnInfoBar后执行批量处理
 	StakeRate       float64 // Relative basic amount billing rate 相对基础金额开单倍率
 	StopLoss        float64 // Default stoploss without leverage 此策略默认止损比率，不带杠杆
 	StopEnterBars   int
@@ -50,8 +50,8 @@ type TradeStrat struct {
 	OnWsDepth           func(s *StratJob, dep *banexg.OrderBook)               // Websocket order book websocket推送深度信息
 	OnWsKline           func(s *StratJob, pair string, k *banexg.Kline)        // websocket real-time kline(may unfinish) Websocket推送的实时K线
 	OnWsData            func(s *StratJob, evt *orm.DataSeries)
-	OnBatchJobs         func(jobs []*StratJob)                              // All target jobs at the current time, used for bulk opening/closing of orders 当前时间所有标的job，用于批量开单/平仓
-	OnBatchInfos        func(tf string, jobs map[string]*JobEnv)            // All info marked jobs at the current time, used for batch processing 当前时间所有info标的job，用于批量处理
+	OnBatchJobs         func(jobs []*StratJob)                              // Main-timeframe jobs after OnData(RoleMain)/OnBar, used for bulk opening/closing 主周期OnData(RoleMain)/OnBar后的job，用于批量开单/平仓
+	OnBatchInfos        func(tf string, jobs map[string]*JobEnv)            // Auxiliary-timeframe jobs after OnData(RoleInfo)/OnInfoBar 辅助周期OnData(RoleInfo)/OnInfoBar后的job，用于批量处理
 	OnCheckExit         func(s *StratJob, od *ormo.InOutOrder) *ExitReq     // Custom order exit logic 自定义订单退出逻辑
 	OnOrderChange       func(s *StratJob, od *ormo.InOutOrder, chgType int) // Order update callback 订单更新回调
 	GetDrawDownExitRate CalcDDExitRate                                      // Calculate the ratio of tracking profit taking, drawdown, and exit 计算跟踪止盈回撤退出的比率
@@ -129,6 +129,19 @@ type StratJob struct {
 	ShortTPPrice  float64           // Default short take profit price when opening a position 开仓时默认做空止盈价格
 	IsWarmUp      bool              // whether in a preheating state 当前是否处于预热状态
 	More          interface{}       // Additional information for policy customization 策略自定义的额外信息
+
+	inspectEffect     func(string)
+	dataHubConfigured bool
+}
+
+// NewInspectionJob creates the inert job state passed to startup-time
+// callbacks while keeping the effect hook outside strategy-facing fields.
+func NewInspectionJob(strategy *TradeStrat, env *ta.BarEnv, symbol *orm.ExSymbol, tf, account string, effect func(string)) *StratJob {
+	return &StratJob{
+		Strat: strategy, Env: env, DataHub: NewDataHub(), Symbol: symbol, TimeFrame: tf, Account: account,
+		TPMaxs: make(map[int64]float64), CloseLong: true, CloseShort: true,
+		ExgStopLoss: true, ExgTakeProfit: true, inspectEffect: effect,
+	}
 }
 
 /*

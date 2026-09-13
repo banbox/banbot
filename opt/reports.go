@@ -51,6 +51,7 @@ type BTResult struct {
 	TimeNum         int                    `json:"timeNum"`
 	OrderNum        int                    `json:"orderNum"`
 	lastTime        int64                  // 上次bar的时间戳
+	lastPlotMS      int64                  // 上次资金曲线采样时间
 	histOdOff       int                    // 计算已完成订单利润的偏移
 	donePftLegal    float64                // 已完成订单利润
 	Plots           *PlotData              `json:"plots"`
@@ -138,7 +139,10 @@ func (r *BTResult) printBtResult(reset bool) {
 	}
 	log.Info("Saved", zap.String("at", r.OutDir))
 	if r.CalcDiff > 0.01 {
-		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github")
+		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github",
+			zap.Float64("total_invest", r.TotalInvest), zap.Float64("total_profit", r.TotProfit),
+			zap.Float64("final_balance", r.FinBalance), zap.Float64("final_withdraw", r.FinWithdraw),
+			zap.Float64("calc_diff", r.CalcDiff))
 	}
 	r.dumpBtFiles(reset)
 }
@@ -258,15 +262,11 @@ func (r *BTResult) Collect() {
 		r.groupByProfits(orders)
 		r.groupByEnters(orders)
 		r.groupByExits(orders)
-		labels, dsList, err := CalcGroupCumProfits(orders, func(o *ormo.InOutOrder) string {
+		labels, dsList := CalcGroupEndProfits(orders, func(o *ormo.InOutOrder) string {
 			return fmt.Sprintf("%v:%v", o.Strategy, o.EnterTag)
 		}, ShowNum)
-		if err != nil {
-			log.Warn("calc cum profit for enter tags fail", zap.Error(err))
-		} else {
-			r.EntLabels = labels
-			r.EntDatasets = dsList
-		}
+		r.EntLabels = labels
+		r.EntDatasets = dsList
 	}
 	wallets := biz.GetWallets(config.DefAcc)
 	r.FinWithdraw = wallets.GetWithdrawLegal(nil)
@@ -922,7 +922,7 @@ func (r *BTResult) DumpCharts() {
 	if len(r.EntLabels) > 0 {
 		outPath = fmt.Sprintf("%s/enters.html", r.OutDir)
 		title = "Strategy Enter Tag Cum Profits"
-		err = DumpChart(outPath, title, r.EntLabels, 3, nil, r.EntDatasets)
+		err = DumpChart(outPath, title, r.EntLabels, 5, nil, r.EntDatasets)
 		if err != nil {
 			log.Error("Dump EnterTag CumProfits fail", zap.Error(err))
 		}
@@ -1031,11 +1031,15 @@ func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 		r.Plots = plots
 		return
 	}
-	// 这里应使用bar的开始时间，避免多个时间周期运行时，大部分CheckMS未更新
-	r.logPlot(wallets, startMS, odNum, totalLegal)
+	r.logPlot(wallets, timeMS, odNum, totalLegal)
 }
 
 func (r *BTResult) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, totalLegal float64) {
+	if timeMS < r.lastPlotMS {
+		log.Error("backtest plot time moved backwards",
+			zap.Int64("last_ms", r.lastPlotMS), zap.Int64("current_ms", timeMS))
+		return
+	}
 	if odNum < 0 {
 		odNum = ormo.OpenNum(config.DefAcc, ormo.InOutStatusPartEnter)
 	}
@@ -1057,6 +1061,19 @@ func (r *BTResult) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, tot
 	curDate := btime.ToDateStr(timeMS, "")
 	r.donePftLegal += ormo.LegalDoneProfits(r.histOdOff)
 	r.histOdOff = len(ormo.HistODs)
+	if timeMS == r.lastPlotMS && len(r.Plots.Labels) > 0 {
+		last := len(r.Plots.Labels) - 1
+		r.Plots.Labels[last] = curDate
+		r.Plots.OdNum[last] = odNum
+		r.Plots.JobNum[last] = jobNum
+		r.Plots.Real[last] = totalLegal
+		r.Plots.Available[last] = avaLegal
+		r.Plots.Profit[last] = r.donePftLegal
+		r.Plots.UnrealizedPOL[last] = profitLegal
+		r.Plots.WithDraw[last] = drawLegal
+		return
+	}
+	r.lastPlotMS = timeMS
 	r.Plots.Labels = append(r.Plots.Labels, curDate)
 	r.Plots.OdNum = append(r.Plots.OdNum, odNum)
 	r.Plots.JobNum = append(r.Plots.JobNum, jobNum)
@@ -1159,14 +1176,14 @@ export line chart of cumulative profit based on entry tag statistics
 按入场信号统计累计利润导出折线图
 */
 func DumpEnterTagCumProfits(path string, odList []*ormo.InOutOrder, xNum int) *errs.Error {
-	labels, dsList, err := CalcGroupCumProfits(odList, func(o *ormo.InOutOrder) string {
+	labels, dsList := CalcGroupEndProfits(odList, func(o *ormo.InOutOrder) string {
 		return fmt.Sprintf("%v:%v", o.Strategy, o.EnterTag)
 	}, xNum)
-	if err != nil || len(dsList) == 0 {
-		return err
+	if len(dsList) == 0 {
+		return nil
 	}
 	title := "Strategy Enter Tag Cum Profits"
-	err = DumpChart(path, title, labels, 3, nil, dsList)
+	err := DumpChart(path, title, labels, 5, nil, dsList)
 	return err
 }
 
@@ -1181,51 +1198,70 @@ func CalcGroupEndProfits(odList []*ormo.InOutOrder, genKey func(o *ormo.InOutOrd
 	if len(odList) == 0 {
 		return nil, nil
 	}
-	startMs := odList[0].RealEnterMS()
+	if xNum <= 0 {
+		xNum = 1
+	}
+	orders := slices.Clone(odList)
+	sort.SliceStable(orders, func(i, j int) bool {
+		a, b := orders[i], orders[j]
+		if ta, tb := a.RealExitMS(), b.RealExitMS(); ta != tb {
+			return ta < tb
+		}
+		if ta, tb := a.RealEnterMS(), b.RealEnterMS(); ta != tb {
+			return ta < tb
+		}
+		return a.ID < b.ID
+	})
+	startMs := int64(math.MaxInt64)
+	endMs := int64(0)
 	tagMap := make(map[string][]*TimeVal)
-	for _, od := range odList {
+	groupOrder := make([]string, 0, 8)
+	for _, od := range orders {
+		startMs = min(startMs, od.RealEnterMS())
+		endMs = max(endMs, od.RealExitMS())
 		key := genKey(od)
-		items, _ := tagMap[key]
+		items, exists := tagMap[key]
+		if !exists {
+			groupOrder = append(groupOrder, key)
+		}
 		curVal := float64(0)
 		if len(items) > 0 {
 			curVal = items[len(items)-1].Value
 		}
 		tagMap[key] = append(items, &TimeVal{Time: od.RealExitMS(), Value: curVal + od.Profit})
 	}
-	endMs := odList[len(odList)-1].RealExitMS()
-	gapMs := (endMs - startMs) / int64(xNum)
+	if endMs < startMs {
+		endMs = startMs
+	}
+	spanMs := endMs - startMs
+	sampleTime := func(i int) int64 {
+		if i == xNum {
+			return endMs
+		}
+		return startMs + spanMs*int64(i)/int64(xNum)
+	}
+	labels := make([]string, xNum+1)
+	for i := range labels {
+		labels[i] = btime.ToDateStr(sampleTime(i), "")
+	}
 	var res []*ChartDs
-	for tag, items := range tagMap {
-		arr := make([]float64, 0, xNum+5)
-		arr = append(arr, 0)
-		curMs := startMs
+	for _, tag := range groupOrder {
+		items := tagMap[tag]
+		arr := make([]float64, xNum+1)
 		i := 0
 		curVal := float64(0)
-		next := items[i]
-		for curMs+gapMs < endMs {
-			curMs += gapMs
-			for curMs > next.Time {
-				curVal = next.Value
-				if i+1 < len(items) {
-					i += 1
-					next = items[i]
-				} else {
-					next = &TimeVal{Time: math.MaxInt64}
-				}
+		for j := range arr {
+			curMs := sampleTime(j)
+			for i < len(items) && items[i].Time <= curMs {
+				curVal = items[i].Value
+				i += 1
 			}
-			arr = append(arr, curVal)
+			arr[j] = curVal
 		}
 		res = append(res, &ChartDs{
 			Label: tag,
 			Data:  arr,
 		})
-	}
-	curMs := startMs
-	labels := make([]string, 0, len(res[0].Data))
-	labels = append(labels, btime.ToDateStr(curMs, ""))
-	for curMs+gapMs < endMs {
-		curMs += gapMs
-		labels = append(labels, btime.ToDateStr(curMs, ""))
 	}
 	return labels, res
 }
@@ -1529,7 +1565,10 @@ func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir st
 		log.Info("Saved", zap.String("at", outDir))
 	}
 	if btRes.CalcDiff > 0.01 {
-		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github")
+		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github",
+			zap.Float64("total_invest", btRes.TotalInvest), zap.Float64("total_profit", btRes.TotProfit),
+			zap.Float64("final_balance", btRes.FinBalance), zap.Float64("final_withdraw", btRes.FinWithdraw),
+			zap.Float64("calc_diff", btRes.CalcDiff))
 	}
 	return btRes, nil
 }

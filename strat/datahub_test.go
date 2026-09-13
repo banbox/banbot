@@ -48,6 +48,30 @@ func TestCollectDataSubsPreservesRequestedFields(t *testing.T) {
 	}
 }
 
+func TestStratJobSetDataConfiguresSubscriptionsOnce(t *testing.T) {
+	calls := 0
+	job := &StratJob{
+		Strat: &TradeStrat{
+			OnDataSubs: func(s *StratJob) []*DataSub {
+				calls++
+				return []*DataSub{{Source: "macro", ExSymbol: s.Symbol, TimeFrame: "1d"}}
+			},
+		},
+		Symbol:    &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"},
+		TimeFrame: "1m",
+	}
+	evt := &orm.DataSeries{
+		Source: "macro", Sid: 7, TimeMS: 100, EndMS: 200, TimeFrame: "1d",
+		Values: map[string]any{"value": 1.0},
+	}
+	job.SetData(evt)
+	evt.TimeMS, evt.EndMS = 200, 300
+	job.SetData(evt)
+	if calls != 1 {
+		t.Fatalf("OnDataSubs called %d times, want once", calls)
+	}
+}
+
 func TestDataHubBuildsConfiguredAndDefaultSeries(t *testing.T) {
 	hub := NewDataHub(2)
 	exs := &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"}

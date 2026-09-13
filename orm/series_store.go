@@ -61,6 +61,9 @@ func (s *SeriesStore) WriteBatch(ctx context.Context, info *SeriesInfo, target *
 		return nil
 	}
 	repo := s.repoOrDefault()
+	if writer, ok := repo.(atomicSeriesWriter); ok {
+		return writer.WriteSeriesBatch(ctx, info, target.ID, items)
+	}
 	if err := repo.InsertSeriesBatch(ctx, info, items); err != nil {
 		return err
 	}

@@ -117,6 +117,9 @@ func (s *StratJob) CanOpen(short bool) bool {
 }
 
 func (s *StratJob) OpenOrder(req *EnterReq) *errs.Error {
+	if s.recordInspectEffect("OpenOrder") {
+		return errs.NewMsg(core.ErrRunTime, "OpenOrder is forbidden during strategy inspection")
+	}
 	doLog := !s.IsWarmUp && req != nil && req.Log
 	var q *EnterReq
 	if doLog {
@@ -198,20 +201,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 	}
 	if req.Stop > 0 {
-		if req.Short {
-			if req.Stop > curPrice {
-				// 做空，触发价应低于最新价
-				isLimit = true
-			}
-		} else if req.Stop < curPrice {
-			// 做多：触发价应高于最新价
-			isLimit = true
-		}
-		enterPrice = req.Stop
-		if isLimit {
-			req.Limit = req.Stop
-			req.Stop = 0
-		}
+		enterPrice = normalizeEntryStop(req, curPrice, isLimit)
 	}
 	if req.Amount == 0 && req.LegalCost == 0 {
 		if req.CostRate == 0 {
@@ -341,7 +331,29 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	return nil
 }
 
+func normalizeEntryStop(req *EnterReq, curPrice float64, isLimit bool) float64 {
+	stopPrice := req.Stop
+	if core.BackTestMode && config.Data.BTLegacyIntrabar {
+		return curPrice
+	}
+	stopActsAsLimit := req.Stop < curPrice
+	if req.Short {
+		stopActsAsLimit = req.Stop > curPrice
+	}
+	if stopActsAsLimit {
+		isLimit = true
+	}
+	if isLimit {
+		req.Limit = req.Stop
+		req.Stop = 0
+	}
+	return stopPrice
+}
+
 func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error {
+	if s.recordInspectEffect("CloseOrders") {
+		return errs.NewMsg(core.ErrRunTime, "CloseOrders is forbidden during strategy inspection")
+	}
 	doLog := !s.IsWarmUp && req != nil && req.Log
 	var q *ExitReq
 	if doLog {
@@ -787,9 +799,23 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 }
 
 func (s *StratJob) SetAllStopLoss(dirt float64, args *ormo.ExitTrigger) *errs.Error {
+	if s.recordInspectEffect("SetAllStopLoss") {
+		return errs.NewMsg(core.ErrRunTime, "SetAllStopLoss is forbidden during strategy inspection")
+	}
 	return s.setAllExitTrigger(dirt, ormo.OdInfoStopLoss, args)
 }
 
 func (s *StratJob) SetAllTakeProfit(dirt float64, args *ormo.ExitTrigger) *errs.Error {
+	if s.recordInspectEffect("SetAllTakeProfit") {
+		return errs.NewMsg(core.ErrRunTime, "SetAllTakeProfit is forbidden during strategy inspection")
+	}
 	return s.setAllExitTrigger(dirt, ormo.OdInfoTakeProfit, args)
+}
+
+func (s *StratJob) recordInspectEffect(name string) bool {
+	if s.inspectEffect == nil {
+		return false
+	}
+	s.inspectEffect(name)
+	return true
 }
