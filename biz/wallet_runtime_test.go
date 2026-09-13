@@ -220,6 +220,7 @@ func TestRuntimeWatchLiveBalancesUsesOwnedDependencies(t *testing.T) {
 		deps: RuntimeDeps{
 			Trading:  trading,
 			Config:   config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{account: {}}}),
+			Accounts: map[string]*config.AccountConfig{account: {}},
 			Exchange: runtimeExchange,
 		},
 	}

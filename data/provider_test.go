@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,6 +26,15 @@ type providerBlockingConn struct {
 	net.Conn
 	readStarted chan struct{}
 	once        sync.Once
+}
+
+func TestRuntimeProvidersRequireExplicitStrategyState(t *testing.T) {
+	if provider, err := NewHistProviderWithRuntimeDeps(&RuntimeDeps{}, nil, nil, nil, false, nil); err == nil || provider != nil {
+		t.Fatalf("historical provider = %#v, error = %v", provider, err)
+	}
+	if provider, err := NewLiveProviderWithRuntimeDeps(&RuntimeDeps{}, nil, nil); err == nil || provider != nil {
+		t.Fatalf("live provider = %#v, error = %v", provider, err)
+	}
 }
 
 func (c *providerBlockingConn) Read(buf []byte) (int, error) {
@@ -849,29 +859,6 @@ func TestExplicitProviderWsRegistryDoesNotUseLegacyJobs(t *testing.T) {
 	}
 }
 
-func TestProviderConstructorsIsolateNilStrategyState(t *testing.T) {
-	oldJobs := strat.WsSubJobs
-	t.Cleanup(func() {
-		strat.LockJobsWrite()
-		strat.WsSubJobs = oldJobs
-		strat.UnlockJobsWrite()
-		strat.RefreshWsSubJobsSnapshot()
-	})
-	job := &strat.StratJob{}
-	strat.LockJobsWrite()
-	strat.WsSubJobs = map[string]map[string]map[*strat.StratJob]bool{
-		core.WsSubTrade: {"BTC/USDT": {job: true}},
-	}
-	strat.UnlockJobsWrite()
-	strat.RefreshWsSubJobsSnapshot()
-
-	deps := &RuntimeDeps{}
-	provider := newHistProviderWithCatalog(deps, nil, nil, nil, nil, nil, false, nil)
-	if got := provider.wsRegistry().Pairs(core.WsSubTrade); len(got) != 0 {
-		t.Fatalf("explicit provider constructor inherited legacy websocket pairs: %v", got)
-	}
-}
-
 func TestSubWarmPairsUsesStablePairOrder(t *testing.T) {
 	var created, warmed []string
 	p := &Provider[IDataFeeder]{
@@ -1127,5 +1114,12 @@ func TestRunHistFeedersHandlesEmptyFeeders(t *testing.T) {
 	err := RunHistFeeders(func() []IHistFeeder { return nil }, make(chan int, 1), nil)
 	if err != nil {
 		t.Fatalf("RunHistFeeders returned error: %v", err)
+	}
+}
+
+func TestRunHistFeedersWithRuntimeDepsRejectsNilDeps(t *testing.T) {
+	err := RunHistFeedersWithRuntimeDeps(nil, func() []IHistFeeder { return nil }, make(chan int, 1), nil)
+	if err == nil || !strings.Contains(err.Error(), "runtime dependencies") {
+		t.Fatalf("nil runtime dependencies error = %v, want explicit dependency error", err)
 	}
 }

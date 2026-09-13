@@ -36,26 +36,17 @@ func TestPickTimeFrameUsesExactScoreAndNameTieBreak(t *testing.T) {
 }
 
 func TestResetJobsUsesCanonicalOpenOrderView(t *testing.T) {
-	oldData, oldAccounts := config.Data, config.Accounts
-	oldJobs := AccJobs
-	oldMode, oldLive, oldReal := core.BackTestMode, core.LiveMode, core.EnvReal
-	oldPairs, oldPairsMap := core.Pairs, core.PairsMap
-	ormVars := ormo.BackupVars()
-	t.Cleanup(func() {
-		config.Data, config.Accounts = oldData, oldAccounts
-		AccJobs = oldJobs
-		core.BackTestMode, core.LiveMode, core.EnvReal = oldMode, oldLive, oldReal
-		core.Pairs, core.PairsMap = oldPairs, oldPairsMap
-		ormo.ResetVars()
-		ormo.RestoreVars(ormVars)
-	})
-
-	core.BackTestMode, core.LiveMode, core.EnvReal = true, false, false
-	config.Data.BTStrict = true
-	config.Accounts = map[string]*config.AccountConfig{config.DefAcc: {}}
-	core.Pairs, core.PairsMap = nil, map[string]bool{}
-	ormo.ResetVars()
-	openOrders, lock := ormo.GetOpenODs(config.DefAcc)
+	cfg := &config.Config{BTStrict: true, Accounts: map[string]*config.AccountConfig{"default": {}}}
+	state, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	state.SetRunMode(core.RunModeBackTest)
+	strategies := NewStateWithRuntime(state, nil, cfg, nil, nil)
+	strategies.BindRuntimeAccounts(cfg.Accounts)
+	orders := ormo.NewOrderState()
+	openOrders, lock := orders.GetOpenODs("default")
 	lock.Lock()
 	for id := int64(6); id >= 1; id-- {
 		openOrders[id] = &ormo.InOutOrder{IOrder: &ormo.IOrder{
@@ -69,10 +60,8 @@ func TestResetJobsUsesCanonicalOpenOrderView(t *testing.T) {
 		Strat: &TradeStrat{Name: "rotation", OrderOnRotation: "open"},
 		Env:   &ta.BarEnv{}, Symbol: &orm.ExSymbol{Symbol: "BTC/USDT"}, TimeFrame: "1m", OrderNum: 6,
 	}
-	AccJobs = map[string]map[string]map[string]*StratJob{
-		config.DefAcc: {"BTC/USDT_1m": {"rotation": job}},
-	}
-	resetJobs()
+	strategies.SetJobMap("default", "BTC/USDT_1m", map[string]*StratJob{"rotation": job})
+	resetJobsWithState(strategies, state, orders)
 
 	longIDs := make([]int64, len(job.LongOrders))
 	for i, od := range job.LongOrders {

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -59,39 +58,61 @@ func writeSeriesDefinitions(out io.Writer, sources []data.DataSource) error {
 }
 
 func RunSeriesDown(args *config.CmdArgs) *errs.Error {
-	return runLegacyEntrySession(func() *errs.Error { return runSeriesDown(args) })
+	return runExplicitSeriesDown(args)
 }
 
-func runSeriesDown(args *config.CmdArgs) *errs.Error {
-	sources, err := resolveSeriesSources(args.Tables)
+func runExplicitSeriesDown(args *config.CmdArgs) *errs.Error {
+	session, snapshot, err := openExplicitEntrySession(args)
+	if err != nil {
+		return err
+	}
+	defer session.close()
+	rt, err := session.newRuntime(snapshot, core.RunModeData, btime.UTCStamp())
+	if err != nil {
+		return err
+	}
+	defer func() { rt.Close(); rt.Join() }()
+	cfg := snapshot.View()
+	sources, err := resolveSeriesSourcesWithCatalog(rt.Catalog, args.Tables)
 	if err != nil {
 		return err
 	}
 	if len(sources) == 0 {
 		return errs.NewMsg(core.ErrBadConfig, "no custom series sources are registered")
 	}
-	if err := biz.SetupComsExg(args); err != nil {
-		return err
-	}
-	pairs, err := goods.RefreshPairList(btime.TimeMS())
+	pairs, err := goods.RefreshPairListWithRuntimeDeps(&goods.RuntimeDeps{
+		Core: rt.Core, Clock: rt.Clock, Config: cfg, DataDir: snapshot.DataDir,
+		Symbols: rt.Symbols, Storage: rt.Storage, Exchange: rt.Exchange,
+	}, rt.Clock.TimeMS())
 	if err != nil {
 		return err
 	}
 	targets := make([]*orm.ExSymbol, 0, len(pairs))
 	for _, pair := range pairs {
-		target, targetErr := orm.GetExSymbolCur(pair)
+		target, targetErr := rt.Symbols.GetExSymbolCur(pair)
 		if targetErr != nil {
 			return targetErr
 		}
 		targets = append(targets, target)
 	}
-	return ensureSeriesRanges(core.Ctx, orm.DefaultSeriesRepo(), sources, targets,
-		config.TimeRange.StartMS, config.TimeRange.EndMS, btime.UTCStamp())
+	var startMS, endMS int64
+	if cfg.TimeRange != nil {
+		startMS, endMS = cfg.TimeRange.StartMS, cfg.TimeRange.EndMS
+	}
+	return ensureSeriesRanges(rt.Context(), orm.NewSeriesRepo(rt.Storage), sources, targets,
+		startMS, endMS, rt.Clock.TimeMS())
 }
 
 func resolveSeriesSources(names []string) ([]data.DataSource, *errs.Error) {
+	return resolveSeriesSourcesWithCatalog(data.LegacyDataSourceCatalog(), names)
+}
+
+func resolveSeriesSourcesWithCatalog(catalog *data.DataSourceCatalog, names []string) ([]data.DataSource, *errs.Error) {
+	if catalog == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "custom series catalog is not configured")
+	}
 	if len(names) == 0 {
-		return registeredSeriesSources(), nil
+		return registeredSeriesSourcesWithCatalog(catalog), nil
 	}
 	sources := make([]data.DataSource, 0, len(names))
 	seen := make(map[string]bool, len(names))
@@ -99,7 +120,7 @@ func resolveSeriesSources(names []string) ([]data.DataSource, *errs.Error) {
 		if seen[name] {
 			continue
 		}
-		source := data.GetDataSource(name)
+		source := catalog.GetDataSource(name)
 		if source == nil {
 			return nil, errs.NewMsg(core.ErrBadConfig, "custom series source %q is not registered", name)
 		}
@@ -110,10 +131,17 @@ func resolveSeriesSources(names []string) ([]data.DataSource, *errs.Error) {
 }
 
 func registeredSeriesSources() []data.DataSource {
-	names := data.ListDataSources()
+	return registeredSeriesSourcesWithCatalog(data.LegacyDataSourceCatalog())
+}
+
+func registeredSeriesSourcesWithCatalog(catalog *data.DataSourceCatalog) []data.DataSource {
+	if catalog == nil {
+		return nil
+	}
+	names := catalog.ListDataSources()
 	sources := make([]data.DataSource, 0, len(names))
 	for _, name := range names {
-		if source := data.GetDataSource(name); source != nil {
+		if source := catalog.GetDataSource(name); source != nil {
 			sources = append(sources, source)
 		}
 	}

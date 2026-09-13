@@ -7,7 +7,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
 	"io"
@@ -296,6 +298,69 @@ func TestServerIOConnectionsConcurrentSnapshot(t *testing.T) {
 	}
 }
 
+func TestNewServerIOKeepsLegacyServerStateUntouched(t *testing.T) {
+	oldServer, oldClient := banServer, banClient
+	banServer, banClient = nil, nil
+	t.Cleanup(func() { banServer, banClient = oldServer, oldClient })
+
+	legacy := NewBanServer("", "")
+	owned := NewServerIO("", "")
+	if banServer != legacy {
+		t.Fatal("NewServerIO replaced the legacy server")
+	}
+	if !HasBanConn() {
+		t.Fatal("legacy server was not visible to legacy connection helpers")
+	}
+	lock, err := GetNetLock("owned_constructor", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.GetVal("lock_owned_constructor") == "" {
+		t.Fatal("legacy net lock was not stored on the legacy server")
+	}
+	if owned.GetVal("lock_owned_constructor") != "" {
+		t.Fatal("legacy net lock was stored on the owned server")
+	}
+	if err := DelNetLock("owned_constructor", lock); err != nil {
+		t.Fatal(err)
+	}
+
+	banServer = nil
+	if HasBanConn() {
+		t.Fatal("owned server affected legacy connection detection")
+	}
+}
+
+func TestServerIOValuesConcurrentAndExpired(t *testing.T) {
+	server := NewServerIO("", "")
+	if server.DataExp == nil {
+		t.Fatal("owned server did not initialize expiration state")
+	}
+	const workers = 16
+	const iterations = 100
+	var wg sync.WaitGroup
+	for worker := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range iterations {
+				key := fmt.Sprintf("key-%d", i%4)
+				server.SetVal(&KeyValExpire{Key: key, Val: fmt.Sprintf("%d-%d", worker, i)})
+				_ = server.GetVal(key)
+			}
+		}()
+	}
+	wg.Wait()
+
+	server.SetVal(&KeyValExpire{Key: "expired", Val: "value"})
+	server.dataMu.Lock()
+	server.DataExp["expired"] = btime.TimeMS() - 1
+	server.dataMu.Unlock()
+	if got := server.GetVal("expired"); got != "" {
+		t.Fatalf("expired value = %q, want empty", got)
+	}
+}
+
 func TestBanClient(t *testing.T) {
 	requireManualBanIOTest(t)
 	core.SetRunMode(core.RunModeLive)
@@ -345,6 +410,7 @@ func TestBanClient(t *testing.T) {
 
 func requireManualBanIOTest(t *testing.T) {
 	t.Helper()
+	testutil.RequireIntegration(t)
 	if os.Getenv("BANBOT_RUN_MANUAL_BANIO_TESTS") != "1" {
 		t.Skip("set BANBOT_RUN_MANUAL_BANIO_TESTS=1 for the external server/client smoke test")
 	}

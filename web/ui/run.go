@@ -20,7 +20,14 @@ import (
 const downUrlTpl = "https://github.com/banbox/banbot/releases/download/{tag}/dist.zip"
 
 func ServeStatic(app *fiber.App) error {
-	uiDistDir := filepath.Join(config.GetDataDir(), "uidist")
+	return ServeStaticAt(app, config.GetDataDir(), core.SysLang)
+}
+
+// ServeStaticAt serves UI assets from a runtime-owned data directory. Callers
+// that run multiple runtimes must pass their own directory instead of using
+// the legacy configuration facade.
+func ServeStaticAt(app *fiber.App, dataDir, sysLang string) error {
+	uiDistDir := filepath.Join(dataDir, "uidist")
 	indexPath := filepath.Join(uiDistDir, "index.html")
 	verPath := filepath.Join(uiDistDir, "version.txt")
 	oldVer, err2 := utils.ReadTextFile(verPath)
@@ -34,7 +41,7 @@ func ServeStatic(app *fiber.App) error {
 		errMsg = "uidist is too old"
 	}
 	if reDown > 0 {
-		err := downNewUI(errMsg, uiDistDir, verPath)
+		err := downNewUI(errMsg, uiDistDir, verPath, dataDir, sysLang)
 		if err != nil {
 			if utils.Exists(indexPath) {
 				// 有旧的UI，继续使用不中断
@@ -48,16 +55,16 @@ func ServeStatic(app *fiber.App) error {
 	return nil
 }
 
-func downNewUI(errMsg, uiDistDir, verPath string) error {
+func downNewUI(errMsg, uiDistDir, verPath, dataDir, sysLang string) error {
 	downUrl := strings.Replace(downUrlTpl, "{tag}", core.UIVersion, 1)
-	if core.SysLang == "zh-CN" {
+	if sysLang == "zh-CN" {
 		// 对简体中文的环境，使用gitee下载，避免访问外网可能失败
 		downUrl = strings.Replace(downUrl, "github", "gitee", 1)
 	}
 	log.Info(errMsg+", downloading", zap.String("url", downUrl))
 
 	// 创建临时目录
-	tmpDir := filepath.Join(config.GetDataDir(), "tmp")
+	tmpDir := filepath.Join(dataDir, "tmp")
 	if err := utils.EnsureDir(tmpDir, 0755); err != nil {
 		return err
 	}

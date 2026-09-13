@@ -84,8 +84,9 @@ func TestTelegramSessionStateIsolation(t *testing.T) {
 	second := NewSession(config.NewSnapshot(&config.Config{Name: "second"}), nil)
 	defer first.Close()
 	defer second.Close()
-	first.Core = &core.State{NoEnterUntil: map[string]int64{"account": 200}}
-	second.Core = &core.State{NoEnterUntil: map[string]int64{}}
+	first.Core = &core.State{}
+	first.Core.SetNoEnterUntil("account", 200)
+	second.Core = &core.State{}
 	first.Clock = btime.NewClockState(true, nil)
 	first.Clock.SetTimeMS(100)
 	second.Clock = btime.NewClockState(true, nil)

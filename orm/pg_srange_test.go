@@ -5,9 +5,12 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/banbox/banbot/internal/testutil"
 )
 
 func TestUpdateSRangesPgMergesOverhangsWithWindow(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
 	if IsQuestDB {
 		t.Skip("postgres/timescale backend is not active")
@@ -67,6 +70,7 @@ func TestUpdateSRangesPgMergesOverhangsWithWindow(t *testing.T) {
 }
 
 func TestRefreshAggPgRemovesIncompleteStaleBucket(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
 	if IsQuestDB {
 		t.Skip("postgres/timescale backend is not active")

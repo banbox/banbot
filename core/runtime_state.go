@@ -12,6 +12,7 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/sasha-s/go-deadlock"
+	"go.uber.org/zap"
 )
 
 type admissionSnapshot struct {
@@ -32,6 +33,8 @@ var legacyFlagsMu sync.RWMutex
 // such as Cache are not owned by State. It is intentionally a concrete type so
 // hot paths can use direct field access.
 type State struct {
+	// Logger is bound before execution and never installed globally.
+	Logger       *zap.Logger
 	RunMode      string
 	RunEnv       string
 	StartAt      int64
@@ -39,25 +42,22 @@ type State struct {
 	LiveMode     bool
 	BackTestMode bool
 
-	TFSecs       map[string]int
-	ExgName      string
-	Market       string
-	IsContract   bool
-	CheckWallets bool
-	ContractType string
-	StgPairTfs   map[string]map[string]string
-	Pairs        []string
-	// PairsMap is a legacy compatibility view. Runtime code must use
-	// PairEnabled and the SetAdmission* methods instead of mutating it.
-	PairsMap      map[string]bool
-	BanPairsUntil map[string]int64
-	NoEnterUntil  map[string]int64
-	TfPairHits    map[string]map[string]int
-	JobPerfs      map[string]*JobPerf
-	StratPerfSta  map[string]*PerfSta
-	OdBooks       map[string]*banexg.OrderBook
+	tFSecs        map[string]int
+	ExgName       string
+	Market        string
+	IsContract    bool
+	CheckWallets  bool
+	ContractType  string
+	stgPairTfs    map[string]map[string]string
+	Pairs         []string
+	banPairsUntil map[string]int64
+	noEnterUntil  map[string]int64
+	tfPairHits    map[string]map[string]int
+	jobPerfs      map[string]*JobPerf
+	stratPerfSta  map[string]*PerfSta
+	odBooks       map[string]*banexg.OrderBook
 	NumTaCache    int
-	OrderMatchTfs map[string]bool
+	orderMatchTfs map[string]bool
 
 	CPUProfile    bool
 	MemProfile    bool
@@ -68,8 +68,8 @@ type State struct {
 	ConcurNum     int
 	SysLang       string
 
-	TfPairHitsLock deadlock.RWMutex
-	LockOdMatch    sync.RWMutex
+	tfPairHitsLock deadlock.RWMutex
+	lockOdMatch    sync.RWMutex
 	StopAll        func()
 	BotRunning     bool
 
@@ -99,16 +99,15 @@ func NewState(parent context.Context) (*State, *errs.Error) {
 	state := &State{
 		RunMode:       RunModeOther,
 		RunEnv:        RunEnvDryRun,
-		TFSecs:        make(map[string]int),
-		StgPairTfs:    make(map[string]map[string]string),
-		PairsMap:      make(map[string]bool),
-		BanPairsUntil: make(map[string]int64),
-		NoEnterUntil:  make(map[string]int64),
-		TfPairHits:    make(map[string]map[string]int),
-		JobPerfs:      make(map[string]*JobPerf),
-		StratPerfSta:  make(map[string]*PerfSta),
-		OdBooks:       make(map[string]*banexg.OrderBook),
-		OrderMatchTfs: make(map[string]bool),
+		tFSecs:        make(map[string]int),
+		stgPairTfs:    make(map[string]map[string]string),
+		banPairsUntil: make(map[string]int64),
+		noEnterUntil:  make(map[string]int64),
+		tfPairHits:    make(map[string]map[string]int),
+		jobPerfs:      make(map[string]*JobPerf),
+		stratPerfSta:  make(map[string]*PerfSta),
+		odBooks:       make(map[string]*banexg.OrderBook),
+		orderMatchTfs: make(map[string]bool),
 		NumTaCache:    1500,
 		ConcurNum:     2,
 		ctx:           ctx,
@@ -129,44 +128,39 @@ func (s *State) EnsureRuntimeMaps() {
 	// Zero-value States can be initialized after construction. Keep each map
 	// under the same lock used by its accessors so a late initialization cannot
 	// race a refresh or callback that is already using the State.
-	s.admissionMu.Lock()
-	if s.PairsMap == nil {
-		s.PairsMap = make(map[string]bool)
-	}
-	s.admissionMu.Unlock()
 	s.flagsMu.Lock()
-	if s.TFSecs == nil {
-		s.TFSecs = make(map[string]int)
+	if s.tFSecs == nil {
+		s.tFSecs = make(map[string]int)
 	}
-	if s.StgPairTfs == nil {
-		s.StgPairTfs = make(map[string]map[string]string)
+	if s.stgPairTfs == nil {
+		s.stgPairTfs = make(map[string]map[string]string)
 	}
-	if s.BanPairsUntil == nil {
-		s.BanPairsUntil = make(map[string]int64)
+	if s.banPairsUntil == nil {
+		s.banPairsUntil = make(map[string]int64)
 	}
-	if s.NoEnterUntil == nil {
-		s.NoEnterUntil = make(map[string]int64)
+	if s.noEnterUntil == nil {
+		s.noEnterUntil = make(map[string]int64)
 	}
-	if s.JobPerfs == nil {
-		s.JobPerfs = make(map[string]*JobPerf)
+	if s.jobPerfs == nil {
+		s.jobPerfs = make(map[string]*JobPerf)
 	}
-	if s.StratPerfSta == nil {
-		s.StratPerfSta = make(map[string]*PerfSta)
+	if s.stratPerfSta == nil {
+		s.stratPerfSta = make(map[string]*PerfSta)
 	}
 	s.flagsMu.Unlock()
-	s.TfPairHitsLock.Lock()
-	if s.TfPairHits == nil {
-		s.TfPairHits = make(map[string]map[string]int)
+	s.tfPairHitsLock.Lock()
+	if s.tfPairHits == nil {
+		s.tfPairHits = make(map[string]map[string]int)
 	}
-	s.TfPairHitsLock.Unlock()
-	s.LockOdMatch.Lock()
-	if s.OdBooks == nil {
-		s.OdBooks = make(map[string]*banexg.OrderBook)
+	s.tfPairHitsLock.Unlock()
+	s.lockOdMatch.Lock()
+	if s.odBooks == nil {
+		s.odBooks = make(map[string]*banexg.OrderBook)
 	}
-	if s.OrderMatchTfs == nil {
-		s.OrderMatchTfs = make(map[string]bool)
+	if s.orderMatchTfs == nil {
+		s.orderMatchTfs = make(map[string]bool)
 	}
-	s.LockOdMatch.Unlock()
+	s.lockOdMatch.Unlock()
 }
 
 // IsBotRunning returns the execution flag owned by this Runtime. The public
@@ -280,9 +274,9 @@ func (s *State) SetPairs(pairs, additionalAllowed []string) {
 	s.Pairs = slices.Clone(pairs)
 	s.publishAdmissionLocked(enabled)
 	s.flagsMu.Lock()
-	for pair := range s.BanPairsUntil {
+	for pair := range s.banPairsUntil {
 		if !enabled[pair] {
-			delete(s.BanPairsUntil, pair)
+			delete(s.banPairsUntil, pair)
 		}
 	}
 	s.flagsMu.Unlock()
@@ -366,9 +360,9 @@ func (s *State) IsPairBanned(pair string, nowMS int64) bool {
 		return false
 	}
 	s.flagsMu.Lock()
-	until, ok := s.BanPairsUntil[pair]
+	until, ok := s.banPairsUntil[pair]
 	if ok && nowMS >= until {
-		delete(s.BanPairsUntil, pair)
+		delete(s.banPairsUntil, pair)
 		ok = false
 	}
 	s.flagsMu.Unlock()
@@ -382,13 +376,13 @@ func (s *State) SetPairBanUntil(pair string, untilMS int64) {
 		return
 	}
 	s.flagsMu.Lock()
-	if s.BanPairsUntil == nil {
-		s.BanPairsUntil = make(map[string]int64)
+	if s.banPairsUntil == nil {
+		s.banPairsUntil = make(map[string]int64)
 	}
 	if untilMS <= 0 {
-		delete(s.BanPairsUntil, pair)
+		delete(s.banPairsUntil, pair)
 	} else {
-		s.BanPairsUntil[pair] = untilMS
+		s.banPairsUntil[pair] = untilMS
 	}
 	s.flagsMu.Unlock()
 }
@@ -399,8 +393,8 @@ func (s *State) BannedPairs() []string {
 		return nil
 	}
 	s.flagsMu.RLock()
-	pairs := make([]string, 0, len(s.BanPairsUntil))
-	for pair := range s.BanPairsUntil {
+	pairs := make([]string, 0, len(s.banPairsUntil))
+	for pair := range s.banPairsUntil {
 		pairs = append(pairs, pair)
 	}
 	s.flagsMu.RUnlock()
@@ -413,7 +407,7 @@ func (s *State) NoEnterUntilFor(account string) (int64, bool) {
 		return 0, false
 	}
 	s.flagsMu.RLock()
-	until, ok := s.NoEnterUntil[account]
+	until, ok := s.noEnterUntil[account]
 	s.flagsMu.RUnlock()
 	return until, ok
 }
@@ -424,7 +418,7 @@ func (s *State) NoEnterUntilSnapshot() map[string]int64 {
 		return nil
 	}
 	s.flagsMu.RLock()
-	result := maps.Clone(s.NoEnterUntil)
+	result := maps.Clone(s.noEnterUntil)
 	s.flagsMu.RUnlock()
 	return result
 }
@@ -436,13 +430,13 @@ func (s *State) SetNoEnterUntil(account string, untilMS int64) {
 		return
 	}
 	s.flagsMu.Lock()
-	if s.NoEnterUntil == nil {
-		s.NoEnterUntil = make(map[string]int64)
+	if s.noEnterUntil == nil {
+		s.noEnterUntil = make(map[string]int64)
 	}
 	if untilMS <= 0 {
-		delete(s.NoEnterUntil, account)
+		delete(s.noEnterUntil, account)
 	} else {
-		s.NoEnterUntil[account] = untilMS
+		s.noEnterUntil[account] = untilMS
 	}
 	s.flagsMu.Unlock()
 }
@@ -455,7 +449,7 @@ func (s *State) StrategyTimeFrame(strategy, pair string) (string, bool) {
 		return "", false
 	}
 	s.flagsMu.RLock()
-	pairs := s.StgPairTfs[strategy]
+	pairs := s.stgPairTfs[strategy]
 	tf, ok := pairs[pair]
 	s.flagsMu.RUnlock()
 	return tf, ok
@@ -468,8 +462,8 @@ func (s *State) StrategyTimeFramesSnapshot() map[string]map[string]string {
 		return nil
 	}
 	s.flagsMu.RLock()
-	result := make(map[string]map[string]string, len(s.StgPairTfs))
-	for strategy, pairs := range s.StgPairTfs {
+	result := make(map[string]map[string]string, len(s.stgPairTfs))
+	for strategy, pairs := range s.stgPairTfs {
 		result[strategy] = maps.Clone(pairs)
 	}
 	s.flagsMu.RUnlock()
@@ -483,13 +477,13 @@ func (s *State) SetStrategyTimeFrame(strategy, pair, timeframe string) {
 		return
 	}
 	s.flagsMu.Lock()
-	if s.StgPairTfs == nil {
-		s.StgPairTfs = make(map[string]map[string]string)
+	if s.stgPairTfs == nil {
+		s.stgPairTfs = make(map[string]map[string]string)
 	}
-	pairs := s.StgPairTfs[strategy]
+	pairs := s.stgPairTfs[strategy]
 	if pairs == nil {
 		pairs = make(map[string]string)
-		s.StgPairTfs[strategy] = pairs
+		s.stgPairTfs[strategy] = pairs
 	}
 	if timeframe == "" {
 		delete(pairs, pair)
@@ -505,13 +499,13 @@ func (s *State) SetTimeFrameSeconds(timeframe string, seconds int) {
 		return
 	}
 	s.flagsMu.Lock()
-	if s.TFSecs == nil {
-		s.TFSecs = make(map[string]int)
+	if s.tFSecs == nil {
+		s.tFSecs = make(map[string]int)
 	}
 	if seconds <= 0 {
-		delete(s.TFSecs, timeframe)
+		delete(s.tFSecs, timeframe)
 	} else {
-		s.TFSecs[timeframe] = seconds
+		s.tFSecs[timeframe] = seconds
 	}
 	s.flagsMu.Unlock()
 }
@@ -522,7 +516,7 @@ func (s *State) TimeFrameSeconds(timeframe string) (int, bool) {
 		return 0, false
 	}
 	s.flagsMu.RLock()
-	seconds, ok := s.TFSecs[timeframe]
+	seconds, ok := s.tFSecs[timeframe]
 	s.flagsMu.RUnlock()
 	return seconds, ok
 }
@@ -533,7 +527,7 @@ func (s *State) TimeFrameSecondsSnapshot() map[string]int {
 		return nil
 	}
 	s.flagsMu.RLock()
-	result := maps.Clone(s.TFSecs)
+	result := maps.Clone(s.tFSecs)
 	s.flagsMu.RUnlock()
 	return result
 }
@@ -552,10 +546,10 @@ func (s *State) ReplaceTimeFrameState(timeframes map[string]int, strategyPairs m
 	if strategyPairs == nil {
 		strategyPairs = make(map[string]map[string]string)
 	}
-	s.TFSecs = maps.Clone(timeframes)
-	s.StgPairTfs = make(map[string]map[string]string, len(strategyPairs))
+	s.tFSecs = maps.Clone(timeframes)
+	s.stgPairTfs = make(map[string]map[string]string, len(strategyPairs))
 	for strategy, pairs := range strategyPairs {
-		s.StgPairTfs[strategy] = maps.Clone(pairs)
+		s.stgPairTfs[strategy] = maps.Clone(pairs)
 	}
 	s.flagsMu.Unlock()
 }
@@ -588,7 +582,7 @@ func (s *State) JobPerf(key string) *JobPerf {
 		return nil
 	}
 	s.flagsMu.RLock()
-	result := cloneJobPerf(s.JobPerfs[key])
+	result := cloneJobPerf(s.jobPerfs[key])
 	s.flagsMu.RUnlock()
 	return result
 }
@@ -601,7 +595,7 @@ func (s *State) JobPerfValue(key string) (JobPerf, bool) {
 		return JobPerf{}, false
 	}
 	s.flagsMu.RLock()
-	perf := s.JobPerfs[key]
+	perf := s.jobPerfs[key]
 	if perf == nil {
 		s.flagsMu.RUnlock()
 		return JobPerf{}, false
@@ -617,13 +611,13 @@ func (s *State) SetJobPerf(key string, perf *JobPerf) {
 		return
 	}
 	s.flagsMu.Lock()
-	if s.JobPerfs == nil {
-		s.JobPerfs = make(map[string]*JobPerf)
+	if s.jobPerfs == nil {
+		s.jobPerfs = make(map[string]*JobPerf)
 	}
 	if perf == nil {
-		delete(s.JobPerfs, key)
+		delete(s.jobPerfs, key)
 	} else {
-		s.JobPerfs[key] = cloneJobPerf(perf)
+		s.jobPerfs[key] = cloneJobPerf(perf)
 	}
 	s.flagsMu.Unlock()
 }
@@ -634,7 +628,7 @@ func (s *State) PerfSta(strategy string) *PerfSta {
 		return nil
 	}
 	s.flagsMu.RLock()
-	result := clonePerfSta(s.StratPerfSta[strategy])
+	result := clonePerfSta(s.stratPerfSta[strategy])
 	s.flagsMu.RUnlock()
 	return result
 }
@@ -645,13 +639,13 @@ func (s *State) SetPerfSta(strategy string, sta *PerfSta) {
 		return
 	}
 	s.flagsMu.Lock()
-	if s.StratPerfSta == nil {
-		s.StratPerfSta = make(map[string]*PerfSta)
+	if s.stratPerfSta == nil {
+		s.stratPerfSta = make(map[string]*PerfSta)
 	}
 	if sta == nil {
-		delete(s.StratPerfSta, strategy)
+		delete(s.stratPerfSta, strategy)
 	} else {
-		s.StratPerfSta[strategy] = clonePerfSta(sta)
+		s.stratPerfSta[strategy] = clonePerfSta(sta)
 	}
 	s.flagsMu.Unlock()
 }
@@ -664,8 +658,8 @@ func (s *State) JobPerfSnapshot(prefix string) []*JobPerf {
 		return nil
 	}
 	s.flagsMu.RLock()
-	result := make([]*JobPerf, 0, len(s.JobPerfs))
-	for key, perf := range s.JobPerfs {
+	result := make([]*JobPerf, 0, len(s.jobPerfs))
+	for key, perf := range s.jobPerfs {
 		if strings.HasPrefix(key, prefix) {
 			result = append(result, cloneJobPerf(perf))
 		}
@@ -682,12 +676,12 @@ func (s *State) PerformanceSnapshot() (map[string]*JobPerf, map[string]*PerfSta)
 		return nil, nil
 	}
 	s.flagsMu.RLock()
-	jobPerfs := make(map[string]*JobPerf, len(s.JobPerfs))
-	for key, perf := range s.JobPerfs {
+	jobPerfs := make(map[string]*JobPerf, len(s.jobPerfs))
+	for key, perf := range s.jobPerfs {
 		jobPerfs[key] = cloneJobPerf(perf)
 	}
-	stratPerfSta := make(map[string]*PerfSta, len(s.StratPerfSta))
-	for key, sta := range s.StratPerfSta {
+	stratPerfSta := make(map[string]*PerfSta, len(s.stratPerfSta))
+	for key, sta := range s.stratPerfSta {
 		stratPerfSta[key] = clonePerfSta(sta)
 	}
 	s.flagsMu.RUnlock()
@@ -702,13 +696,13 @@ func (s *State) WithPerformance(fn func(map[string]*JobPerf, map[string]*PerfSta
 		return
 	}
 	s.flagsMu.Lock()
-	if s.JobPerfs == nil {
-		s.JobPerfs = make(map[string]*JobPerf)
+	if s.jobPerfs == nil {
+		s.jobPerfs = make(map[string]*JobPerf)
 	}
-	if s.StratPerfSta == nil {
-		s.StratPerfSta = make(map[string]*PerfSta)
+	if s.stratPerfSta == nil {
+		s.stratPerfSta = make(map[string]*PerfSta)
 	}
-	fn(s.JobPerfs, s.StratPerfSta)
+	fn(s.jobPerfs, s.stratPerfSta)
 	s.flagsMu.Unlock()
 }
 
@@ -796,27 +790,19 @@ func (s *State) admissionSnapshotLocked() *admissionSnapshot {
 }
 
 func (s *State) initAdmissionSnapshotLocked() *admissionSnapshot {
-	enabled := make(map[string]bool, len(s.Pairs)+len(s.PairsMap))
+	enabled := make(map[string]bool, len(s.Pairs))
 	for _, pair := range s.Pairs {
 		enabled[pair] = true
 	}
-	for pair, allowed := range s.PairsMap {
-		enabled[pair] = allowed
-	}
-	compat := maps.Clone(enabled)
-	s.PairsMap = compat
 	snapshot := &admissionSnapshot{enabled: enabled}
 	s.admission.Store(snapshot)
 	return snapshot
 }
 
+// publishAdmissionLocked takes ownership of a newly built map. Callers never
+// mutate it after publication; admission reads remain a single atomic load.
 func (s *State) publishAdmissionLocked(enabled map[string]bool) {
-	snapshotEnabled := maps.Clone(enabled)
-	if snapshotEnabled == nil {
-		snapshotEnabled = make(map[string]bool)
-	}
-	s.PairsMap = maps.Clone(snapshotEnabled)
-	s.admission.Store(&admissionSnapshot{enabled: snapshotEnabled})
+	s.admission.Store(&admissionSnapshot{enabled: enabled})
 }
 
 // LegacyPairEnabled is the compatibility facade for callers that have not
@@ -1073,9 +1059,9 @@ func (s *State) GetOdBook(pair string) (*banexg.OrderBook, bool) {
 	if s == nil {
 		return nil, false
 	}
-	s.LockOdMatch.RLock()
-	book, ok := s.OdBooks[pair]
-	s.LockOdMatch.RUnlock()
+	s.lockOdMatch.RLock()
+	book, ok := s.odBooks[pair]
+	s.lockOdMatch.RUnlock()
 	return book, ok
 }
 
@@ -1084,12 +1070,12 @@ func (s *State) SetOdBook(pair string, book *banexg.OrderBook) {
 	if s == nil {
 		return
 	}
-	s.LockOdMatch.Lock()
-	if s.OdBooks == nil {
-		s.OdBooks = make(map[string]*banexg.OrderBook)
+	s.lockOdMatch.Lock()
+	if s.odBooks == nil {
+		s.odBooks = make(map[string]*banexg.OrderBook)
 	}
-	s.OdBooks[pair] = book
-	s.LockOdMatch.Unlock()
+	s.odBooks[pair] = book
+	s.lockOdMatch.Unlock()
 }
 
 // OrderMatchEnabled reports whether this Runtime should match orders for a
@@ -1099,9 +1085,9 @@ func (s *State) OrderMatchEnabled(timeFrame string) bool {
 	if s == nil {
 		return false
 	}
-	s.LockOdMatch.RLock()
-	enabled := s.OrderMatchTfs[timeFrame]
-	s.LockOdMatch.RUnlock()
+	s.lockOdMatch.RLock()
+	enabled := s.orderMatchTfs[timeFrame]
+	s.lockOdMatch.RUnlock()
 	return enabled
 }
 
@@ -1112,9 +1098,9 @@ func (s *State) OrderMatchTfsSnapshot() map[string]bool {
 	if s == nil {
 		return nil
 	}
-	s.LockOdMatch.RLock()
-	result := maps.Clone(s.OrderMatchTfs)
-	s.LockOdMatch.RUnlock()
+	s.lockOdMatch.RLock()
+	result := maps.Clone(s.orderMatchTfs)
+	s.lockOdMatch.RUnlock()
 	return result
 }
 
@@ -1123,12 +1109,12 @@ func (s *State) SetOrderMatchEnabled(timeFrame string, enabled bool) {
 	if s == nil {
 		return
 	}
-	s.LockOdMatch.Lock()
-	if s.OrderMatchTfs == nil {
-		s.OrderMatchTfs = make(map[string]bool)
+	s.lockOdMatch.Lock()
+	if s.orderMatchTfs == nil {
+		s.orderMatchTfs = make(map[string]bool)
 	}
-	s.OrderMatchTfs[timeFrame] = enabled
-	s.LockOdMatch.Unlock()
+	s.orderMatchTfs[timeFrame] = enabled
+	s.lockOdMatch.Unlock()
 }
 
 // ReplaceOrderMatchTfs publishes a complete order-match policy while keeping
@@ -1137,12 +1123,12 @@ func (s *State) ReplaceOrderMatchTfs(flags map[string]bool) {
 	if s == nil {
 		return
 	}
-	s.LockOdMatch.Lock()
-	s.OrderMatchTfs = maps.Clone(flags)
-	if s.OrderMatchTfs == nil {
-		s.OrderMatchTfs = make(map[string]bool)
+	s.lockOdMatch.Lock()
+	s.orderMatchTfs = maps.Clone(flags)
+	if s.orderMatchTfs == nil {
+		s.orderMatchTfs = make(map[string]bool)
 	}
-	s.LockOdMatch.Unlock()
+	s.lockOdMatch.Unlock()
 }
 
 // LegacyOrderMatchEnabled reads one process-wide order-match flag.
@@ -1241,17 +1227,17 @@ func (s *State) AddTfPairHits(timeFrame, pair string, count int) {
 	if s == nil || count == 0 {
 		return
 	}
-	s.TfPairHitsLock.Lock()
-	if s.TfPairHits == nil {
-		s.TfPairHits = make(map[string]map[string]int)
+	s.tfPairHitsLock.Lock()
+	if s.tfPairHits == nil {
+		s.tfPairHits = make(map[string]map[string]int)
 	}
-	hits := s.TfPairHits[timeFrame]
+	hits := s.tfPairHits[timeFrame]
 	if hits == nil {
 		hits = make(map[string]int)
-		s.TfPairHits[timeFrame] = hits
+		s.tfPairHits[timeFrame] = hits
 	}
 	hits[pair] += count
-	s.TfPairHitsLock.Unlock()
+	s.tfPairHitsLock.Unlock()
 }
 
 // DrainTfPairHits atomically takes the current hit counters and starts a new
@@ -1260,13 +1246,13 @@ func (s *State) DrainTfPairHits() map[string]map[string]int {
 	if s == nil {
 		return nil
 	}
-	s.TfPairHitsLock.Lock()
-	result := make(map[string]map[string]int, len(s.TfPairHits))
-	for timeframe, pairs := range s.TfPairHits {
+	s.tfPairHitsLock.Lock()
+	result := make(map[string]map[string]int, len(s.tfPairHits))
+	for timeframe, pairs := range s.tfPairHits {
 		result[timeframe] = maps.Clone(pairs)
 	}
-	s.TfPairHits = make(map[string]map[string]int)
-	s.TfPairHitsLock.Unlock()
+	s.tfPairHits = make(map[string]map[string]int)
+	s.tfPairHitsLock.Unlock()
 	return result
 }
 

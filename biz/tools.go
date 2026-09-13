@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sasha-s/go-deadlock"
 
@@ -30,18 +32,34 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
-	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
 
-func LoadZipSeries(inPath string, fid int, file *zip.File, arg interface{}) *errs.Error {
-	cleanName := strings.Split(filepath.Base(file.Name), ".")[0]
-	exArgs := arg.([]string)
-	exgName, market := exArgs[0], exArgs[1]
-	exchange, err := exg.GetWith(exgName, market, exArgs[2])
-	if err != nil {
-		return err
+// KlineLoadRuntimeDeps owns the concrete dependencies used while importing a
+// zip member. The query handle, symbols, and exchange all come from one
+// Runtime so the import never reaches package-level ORM or exchange facades.
+type KlineLoadRuntimeDeps struct {
+	Context      context.Context
+	Queries      *orm.Queries
+	Symbols      *orm.SymbolState
+	Exchange     banexg.BanExchange
+	ExchangeName string
+	Market       string
+}
+
+func LoadZipSeriesWithRuntimeDeps(deps *KlineLoadRuntimeDeps) data.FuncReadZipItem {
+	return func(inPath string, fid int, file *zip.File, _ interface{}) *errs.Error {
+		return loadZipSeriesWithRuntimeDeps(inPath, fid, file, deps)
 	}
+}
+
+func loadZipSeriesWithRuntimeDeps(inPath string, _ int, file *zip.File, deps *KlineLoadRuntimeDeps) *errs.Error {
+	if deps == nil || deps.Queries == nil || deps.Symbols == nil || deps.Exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "kline import runtime dependencies are required")
+	}
+	cleanName := strings.Split(filepath.Base(file.Name), ".")[0]
+	exgName, market := deps.ExchangeName, deps.Market
+	exchange := deps.Exchange
 	yearStr := strings.Split(filepath.Base(inPath), ".")[0]
 	year, _ := strconv.Atoi(yearStr)
 	mar, err := exchange.MapMarket(cleanName, year)
@@ -50,16 +68,11 @@ func LoadZipSeries(inPath string, fid int, file *zip.File, arg interface{}) *err
 		return nil
 	}
 	exs := &orm.ExSymbol{Symbol: mar.Symbol, Exchange: exgName, ExgReal: mar.ExgReal, Market: market}
-	err = orm.EnsureSymbols([]*orm.ExSymbol{exs})
+	err = deps.Symbols.EnsureSymbols([]*orm.ExSymbol{exs})
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	sess, conn, err := orm.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
+	sess := deps.Queries
 	fReader, err_ := file.Open()
 	if err_ != nil {
 		return errs.New(errs.CodeIOReadFail, err_)
@@ -233,12 +246,12 @@ func LoadZipSeries(inPath string, fid int, file *zip.File, arg interface{}) *err
 	num, err := sess.InsertSeries(timeFrame, exs, seriesRows, false)
 	if err == nil && num > 0 {
 		// insert data for big timeframes 插入更大周期
-		return aggBigSeries(sess, seriesRows, tfMSecs, exs, exchange)
+		return aggBigSeriesWithSymbolState(deps.Symbols, sess, seriesRows, tfMSecs, exs, exchange)
 	}
 	return err
 }
 
-func aggBigSeries(sess *orm.Queries, rows []*orm.DataSeries, tfMSecs int64, exs *orm.ExSymbol,
+func aggBigSeriesWithSymbolState(symbols *orm.SymbolState, sess *orm.Queries, rows []*orm.DataSeries, tfMSecs int64, exs *orm.ExSymbol,
 	exchange banexg.BanExchange,
 ) *errs.Error {
 	if len(rows) == 0 {
@@ -252,7 +265,7 @@ func aggBigSeries(sess *orm.Queries, rows []*orm.DataSeries, tfMSecs int64, exs 
 			continue
 		}
 		offMS := int64(exg.GetAlignOffForExchange(exchange, exs.Symbol, int(agg.MSecs/1000)) * 1000)
-		aggRows, _, err_ := orm.ResampleDataSeries(exs, agg.TimeFrame, rows, nil, agg.MSecs, 0, tfMSecs, offMS, false)
+		aggRows, _, err_ := orm.ResampleDataSeriesWithSymbolState(symbols, exs, agg.TimeFrame, rows, nil, agg.MSecs, 0, tfMSecs, offMS, false)
 		if err_ != nil {
 			return errs.New(core.ErrInvalidBars, err_)
 		}
@@ -270,19 +283,37 @@ func aggBigSeries(sess *orm.Queries, rows []*orm.DataSeries, tfMSecs int64, exs 
 	return nil
 }
 
-func AggBigKlines(args *config.CmdArgs) *errs.Error {
+// KlineAggRuntimeDeps defines the runtime-owned aggregate inputs. Confirm is
+// kept injectable so the command retains its destructive-operation prompt.
+type KlineAggRuntimeDeps struct {
+	Context      context.Context
+	Queries      *orm.Queries
+	Symbols      *orm.SymbolState
+	Exchange     banexg.BanExchange
+	ExchangeName string
+	Market       string
+	StartMS      int64
+	EndMS        int64
+	Confirm      func([]string, string, string, bool) bool
+}
+
+func AggBigKlinesWithRuntimeDeps(args *config.CmdArgs, deps *KlineAggRuntimeDeps) *errs.Error {
+	if args == nil || deps == nil || deps.Queries == nil || deps.Symbols == nil || deps.Exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "kline aggregate runtime dependencies are required")
+	}
 	minTF := "1m"
 	if len(args.TimeFrames) > 0 {
 		minTF = args.TimeFrames[0]
 	}
 	log.Info("try agg timeFrames above " + minTF)
 	pairs := args.Pairs
-	if len(pairs) == 0 && len(config.Pairs) > 0 {
-		pairs = config.Pairs
-	}
-	exsMap := orm.GetExSymbolMap(core.ExgName, core.Market)
+	exsMap := deps.Symbols.GetExSymbolMap(deps.ExchangeName, deps.Market)
 	if len(pairs) == 0 {
-		if !utils.ReadConfirm([]string{
+		confirm := deps.Confirm
+		if confirm == nil {
+			confirm = utils.ReadConfirm
+		}
+		if !confirm([]string{
 			fmt.Sprintf("agg for %v symbols, input `y` to continue", len(exsMap)),
 		}, "y", "n", true) {
 			return nil
@@ -298,19 +329,11 @@ func AggBigKlines(args *config.CmdArgs) *errs.Error {
 		}
 		exsMap = keeps
 	}
-	ctx := context.Background()
-	sess, conn, err := orm.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-	exchange, err := exg.GetWith(core.ExgName, core.Market, core.ContractType)
-	if err != nil {
-		return err
-	}
+	sess := deps.Queries
+	exchange := deps.Exchange
 	minMSecs := int64(utils2.TFToSecs(minTF) * 1000)
 	yearMSecs := int64(utils2.TFToSecs("1y") * 1000)
-	startMS, endMS := config.TimeRange.StartMS, config.TimeRange.EndMS
+	startMS, endMS := deps.StartMS, deps.EndMS
 	firstEndMS := utils2.AlignTfMSecs(startMS+yearMSecs, yearMSecs)
 	pBar := utils.NewPrgBar(len(exsMap), "aggTf")
 	defer pBar.Close()
@@ -323,7 +346,7 @@ func AggBigKlines(args *config.CmdArgs) *errs.Error {
 				return err
 			}
 			if len(rows) > 0 {
-				err = aggBigSeries(sess, rows, minMSecs, exs, exchange)
+				err = aggBigSeriesWithSymbolState(deps.Symbols, sess, rows, minMSecs, exs, exchange)
 				if err != nil {
 					return err
 				}
@@ -335,58 +358,72 @@ func AggBigKlines(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
-func LoadCalendars(args *config.CmdArgs) *errs.Error {
-	err := SetupComs(args)
-	if err != nil {
+type CalendarWriter interface {
+	SetCalendars(string, [][2]int64) *errs.Error
+}
+
+// LoadCalendarRows validates and persists calendar records using the caller's
+// storage owner. It deliberately returns write failures so a command cannot
+// report a successful import after only part of the input was stored.
+func LoadCalendarRows(rows [][]string, store CalendarWriter, logger *zap.Logger) *errs.Error {
+	if store == nil {
+		return errs.NewMsg(core.ErrBadConfig, "calendar storage is required")
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	lastExg := ""
+	dateList := make([][2]int64, 0)
+	dtLay := "2006-01-02"
+	flush := func() *errs.Error {
+		if len(dateList) == 0 {
+			return nil
+		}
+		if err := store.SetCalendars(lastExg, dateList); err != nil {
+			return err
+		}
+		dateList = make([][2]int64, 0)
+		return nil
+	}
+	for index, row := range rows {
+		if len(row) < 3 || strings.TrimSpace(row[0]) == "" {
+			return errs.NewMsg(errs.CodeParamInvalid, "calendar row %d must contain exchange, start date, and stop date", index+1)
+		}
+		startMS, err := btime.ParseTimeMSBy(dtLay, row[1])
+		if err != nil {
+			return errs.New(errs.CodeRunTime, err)
+		}
+		stopMS, err := btime.ParseTimeMSBy(dtLay, row[2])
+		if err != nil {
+			return errs.New(errs.CodeRunTime, err)
+		}
+		if lastExg == "" {
+			lastExg = row[0]
+		}
+		if lastExg != row[0] {
+			if err := flush(); err != nil {
+				return err
+			}
+			lastExg = row[0]
+		}
+		dateList = append(dateList, [2]int64{startMS, stopMS})
+	}
+	if err := flush(); err != nil {
 		return err
 	}
-	if args.InPath == "" {
+	logger.Info("load calendars success", zap.Int("num", len(rows)))
+	return nil
+}
+
+func LoadCalendarsWithDeps(args *config.CmdArgs, store CalendarWriter, logger *zap.Logger) *errs.Error {
+	if args == nil || args.InPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
 	}
 	rows, err := utils.ReadCSV(args.InPath)
 	if err != nil {
 		return err
 	}
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-	lastExg := ""
-	dateList := make([][2]int64, 0)
-	dtLay := "2006-01-02"
-	for _, row := range rows {
-		startMS, err_ := btime.ParseTimeMSBy(dtLay, row[1])
-		if err_ != nil {
-			return errs.New(errs.CodeRunTime, err_)
-		}
-		stopMS, err_ := btime.ParseTimeMSBy(dtLay, row[2])
-		if err_ != nil {
-			return errs.New(errs.CodeRunTime, err_)
-		}
-		if lastExg == "" {
-			lastExg = row[0]
-		}
-		if lastExg != row[0] {
-			if len(dateList) > 0 {
-				err = sess.SetCalendars(lastExg, dateList)
-				if err != nil {
-					log.Error("save calendars fail", zap.String("exg", lastExg), zap.Error(err))
-				}
-				dateList = make([][2]int64, 0)
-			}
-			lastExg = row[0]
-		}
-		dateList = append(dateList, [2]int64{startMS, stopMS})
-	}
-	if len(dateList) > 0 {
-		err = sess.SetCalendars(lastExg, dateList)
-		if err != nil {
-			log.Error("save calendars fail", zap.String("exg", lastExg), zap.Error(err))
-		}
-	}
-	log.Info("load calendars success", zap.Int("num", len(rows)))
-	return nil
+	return LoadCalendarRows(rows, store, logger)
 }
 
 var adjMap = map[string]int{
@@ -396,16 +433,29 @@ var adjMap = map[string]int{
 	"":     0,
 }
 
-func ExportKlines(args *config.CmdArgs, prg utils.PrgCB) *errs.Error {
+type KlineMaintenanceDeps struct {
+	Context  context.Context
+	Queries  *orm.Queries
+	Symbols  *orm.SymbolState
+	Config   *config.Config
+	Exchange banexg.BanExchange
+	Logger   *zap.Logger
+	Location *time.Location
+	Confirm  func([]string, string, string, bool) bool
+}
+
+func ExportKlinesWithRuntimeDeps(args *config.CmdArgs, deps *KlineMaintenanceDeps, prg utils.PrgCB) *errs.Error {
+	if args == nil || deps == nil || deps.Queries == nil || deps.Symbols == nil || deps.Config == nil || deps.Exchange == nil || deps.Logger == nil || deps.Location == nil {
+		return errs.NewMsg(core.ErrBadConfig, "kline export runtime dependencies are required")
+	}
 	if args.OutPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--out is required")
 	}
 	if len(args.Pairs) == 0 {
 		// No target is provided, export all current market
 		// 未提供标的，导出当前市场所有
-		exsList := orm.GetAllExSymbols()
-		for _, exs := range exsList {
-			if exs.Exchange != core.ExgName || exs.Market != core.Market {
+		for _, exs := range deps.Symbols.GetExSymbolsByID("", "") {
+			if deps.Config.Exchange == nil || exs.Exchange != deps.Config.Exchange.Name || exs.Market != deps.Config.MarketType {
 				continue
 			}
 			args.Pairs = append(args.Pairs, exs.Symbol)
@@ -422,20 +472,18 @@ func ExportKlines(args *config.CmdArgs, prg utils.PrgCB) *errs.Error {
 	if !adjValid {
 		return errs.NewMsg(errs.CodeParamRequired, "--adj should be pre/post/none")
 	}
-	ctx := context.Background()
-	sess, conn, err := orm.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
+	sess := deps.Queries
 	err_ := utils.EnsureDir(args.OutPath, 0755)
 	if err_ != nil {
 		return errs.New(errs.CodeIOWriteFail, err_)
 	}
-	start, stop := config.TimeRange.StartMS, config.TimeRange.EndMS
-	startStr := btime.ToDateStrLoc(start, core.DefaultDateFmt)
-	endStr := btime.ToDateStrLoc(stop, core.DefaultDateFmt)
-	log.Info("export kline", zap.Strings("tf", args.TimeFrames), zap.String("dt", startStr+" - "+endStr),
+	var start, stop int64
+	if deps.Config.TimeRange != nil {
+		start, stop = deps.Config.TimeRange.StartMS, deps.Config.TimeRange.EndMS
+	}
+	startStr := time.UnixMilli(start).In(deps.Location).Format(core.DefaultDateFmt)
+	endStr := time.UnixMilli(stop).In(deps.Location).Format(core.DefaultDateFmt)
+	deps.Logger.Info("export kline", zap.Strings("tf", args.TimeFrames), zap.String("dt", startStr+" - "+endStr),
 		zap.String("adj", args.AdjType), zap.Int("num", len(args.Pairs)))
 	names, err := data.FindPathNames(args.OutPath, ".zip")
 	if err != nil {
@@ -456,14 +504,14 @@ func ExportKlines(args *config.CmdArgs, prg utils.PrgCB) *errs.Error {
 		clean := strings.ReplaceAll(strings.ReplaceAll(symbol, "/", "_"), ":", "_")
 		if _, ok := handles[clean]; ok {
 			pBar.Add(tfNum)
-			log.Info("skip exist", zap.String("symbol", symbol))
+			deps.Logger.Info("skip exist", zap.String("symbol", symbol))
 			continue
 		}
-		log.Info("handle", zap.String("symbol", symbol))
-		exs, err := orm.GetExSymbolCur(symbol)
+		deps.Logger.Info("handle", zap.String("symbol", symbol))
+		exs, err := deps.Symbols.GetExSymbol(deps.Exchange, symbol)
 		if err != nil {
 			pBar.Add(tfNum)
-			log.Warn("export fail", zap.String("symbol", symbol), zap.Error(err))
+			deps.Logger.Warn("export fail", zap.String("symbol", symbol), zap.Error(err))
 			continue
 		}
 		for _, tf := range args.TimeFrames {
@@ -472,7 +520,7 @@ func ExportKlines(args *config.CmdArgs, prg utils.PrgCB) *errs.Error {
 				return err
 			}
 			klines = orm.ApplyAdj(adjs, klines, adjVal, 0, 0)
-			csvRows := utils.KlineToStr(klines, btime.LocShow)
+			csvRows := utils.KlineToStr(klines, deps.Location)
 			path := filepath.Join(args.OutPath, fmt.Sprintf("%s_%s.csv", clean, tf))
 			err = utils.WriteCsvFile(path, csvRows, true)
 			if err != nil {
@@ -481,23 +529,21 @@ func ExportKlines(args *config.CmdArgs, prg utils.PrgCB) *errs.Error {
 			pBar.Add(1)
 		}
 	}
-	log.Info("export kline complete")
+	deps.Logger.Info("export kline complete")
 	return nil
 }
 
-func PurgeKlines(args *config.CmdArgs) *errs.Error {
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
-		return err
+func PurgeKlinesWithRuntimeDeps(args *config.CmdArgs, deps *KlineMaintenanceDeps) *errs.Error {
+	if args == nil || deps == nil || deps.Queries == nil || deps.Symbols == nil || deps.Config == nil || deps.Config.Exchange == nil || deps.Exchange == nil || deps.Logger == nil {
+		return errs.NewMsg(core.ErrBadConfig, "kline purge runtime dependencies are required")
 	}
-	defer conn.Release()
-	exchange := exg.Default
+	sess, exchange := deps.Queries, deps.Exchange
 	// 搜索需要删除的标的
 	// Search for the target to be deleted
 	exsList := make([]*orm.ExSymbol, 0)
-	if len(config.Pairs) > 0 {
-		for _, symbol := range config.Pairs {
-			exs, err := orm.GetExSymbol(exchange, symbol)
+	if len(args.Pairs) > 0 {
+		for _, symbol := range args.Pairs {
+			exs, err := deps.Symbols.GetExSymbol(exchange, symbol)
 			if err != nil {
 				return err
 			}
@@ -505,7 +551,7 @@ func PurgeKlines(args *config.CmdArgs) *errs.Error {
 		}
 	} else {
 		exInfo := exchange.Info()
-		exMap := orm.GetExSymbols(exInfo.ID, exInfo.MarketType)
+		exMap := deps.Symbols.GetExSymbols(exInfo.ID, exInfo.MarketType)
 		for _, exs := range exMap {
 			exsList = append(exsList, exs)
 		}
@@ -535,8 +581,12 @@ func PurgeKlines(args *config.CmdArgs) *errs.Error {
 			tfList = append(tfList, a.TimeFrame)
 		}
 	}
-	isOk := utils.ReadConfirm([]string{
-		fmt.Sprintf("exchange: %s, exg_real: %s", config.Exchange.Name, args.ExgReal),
+	confirm := deps.Confirm
+	if confirm == nil {
+		confirm = utils.ReadConfirm
+	}
+	isOk := confirm([]string{
+		fmt.Sprintf("exchange: %s, exg_real: %s", deps.Config.Exchange.Name, args.ExgReal),
 		fmt.Sprintf("date range: all"),
 		fmt.Sprintf("timeFrames: %s", strings.Join(tfList, ", ")),
 		fmt.Sprintf("symbols(%v): %s", len(exsList), strings.Join(pairs, ", ")),
@@ -547,18 +597,17 @@ func PurgeKlines(args *config.CmdArgs) *errs.Error {
 	}
 	// 删除符合要求的数据
 	// Delete the data that meets the requirements
-	err = sess.DelKData(exsList, tfList, 0, 0)
+	err := sess.DelKData(exsList, tfList, 0, 0)
 	if err != nil {
 		return err
 	}
-	log.Info("all purge complete")
+	deps.Logger.Info("all purge complete")
 	return nil
 }
 
-func ExportAdjFactors(args *config.CmdArgs) *errs.Error {
-	err := SetupComsExg(args)
-	if err != nil {
-		return err
+func ExportAdjFactorsWithRuntimeDeps(args *config.CmdArgs, deps *KlineMaintenanceDeps) *errs.Error {
+	if args == nil || deps == nil || deps.Context == nil || deps.Queries == nil || deps.Symbols == nil || deps.Exchange == nil || deps.Logger == nil || deps.Location == nil {
+		return errs.NewMsg(core.ErrBadConfig, "adjustment export runtime dependencies are required")
 	}
 	if args.OutPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--out is required")
@@ -566,23 +615,18 @@ func ExportAdjFactors(args *config.CmdArgs) *errs.Error {
 	if len(args.Pairs) == 0 {
 		return errs.NewMsg(errs.CodeParamRequired, "--pairs is required")
 	}
-	ctx := context.Background()
 	err_ := utils.EnsureDir(args.OutPath, 0755)
 	if err_ != nil {
 		return errs.New(errs.CodeIOWriteFail, err_)
 	}
-	sess, conn, err := orm.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
+	sess := deps.Queries
 	for _, symbol := range args.Pairs {
-		log.Info("handle", zap.String("symbol", symbol))
-		exs, err := orm.GetExSymbolCur(symbol)
+		deps.Logger.Info("handle", zap.String("symbol", symbol))
+		exs, err := deps.Symbols.GetExSymbol(deps.Exchange, symbol)
 		if err != nil {
 			return err
 		}
-		facs, err_ := sess.GetAdjFactors(ctx, exs.ID)
+		facs, err_ := sess.GetAdjFactors(deps.Context, exs.ID)
 		if err_ != nil {
 			return orm.NewDbErr(core.ErrDbReadFail, err_)
 		}
@@ -591,10 +635,10 @@ func ExportAdjFactors(args *config.CmdArgs) *errs.Error {
 		})
 		rows := make([][]string, 0, len(facs))
 		for _, f := range facs {
-			dateStr := btime.ToDateStrLoc(f.StartMs, core.DefaultDateFmt)
+			dateStr := time.UnixMilli(f.StartMs).In(deps.Location).Format(core.DefaultDateFmt)
 			subCode := ""
 			if f.SubID > 0 {
-				it := orm.GetSymbolByID(f.SubID)
+				it := deps.Symbols.GetSymbolByID(f.SubID)
 				if it != nil {
 					subCode = it.Symbol
 				}
@@ -618,10 +662,26 @@ func ExportAdjFactors(args *config.CmdArgs) *errs.Error {
 /*
 CalcCorrelation calculate correlation for pairs; generate csv or images
 */
-func CalcCorrelation(args *config.CmdArgs) *errs.Error {
-	err := SetupComsExg(args)
-	if err != nil {
-		return err
+type CorrelationRuntimeDeps struct {
+	Queries *orm.Queries
+	Runtime *RuntimeDeps
+	Logger  *zap.Logger
+}
+
+func CalcCorrelationWithRuntimeDeps(args *config.CmdArgs, deps *CorrelationRuntimeDeps) *errs.Error {
+	if deps == nil || deps.Queries == nil || deps.Runtime == nil || deps.Runtime.ConfigView() == nil ||
+		deps.Runtime.Symbols == nil || deps.Runtime.Clock == nil {
+		return errs.NewMsg(core.ErrBadConfig, "correlation runtime dependencies are required")
+	}
+	if deps.Logger == nil {
+		deps.Logger = zap.NewNop()
+	}
+	return calcCorrelation(args, deps)
+}
+
+func calcCorrelation(args *config.CmdArgs, deps *CorrelationRuntimeDeps) *errs.Error {
+	if args == nil {
+		return errs.NewMsg(core.ErrBadConfig, "correlation arguments are required")
 	}
 	if len(args.TimeFrames) == 0 {
 		return errs.NewMsg(errs.CodeParamRequired, "--timeframes is required")
@@ -635,16 +695,23 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 	if args.OutPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--out is required")
 	}
-	pairs, err := goods.RefreshPairList(btime.TimeMS())
+	var pairs []string
+	var err *errs.Error
+	pairs, err = goods.RefreshPairListWithRuntimeDeps(&goods.RuntimeDeps{
+		Core: deps.Runtime.Core, Clock: deps.Runtime.Clock, Config: deps.Runtime.ConfigView(),
+		DataDir: deps.Runtime.Config.DataDir, Storage: deps.Runtime.Storage, Symbols: deps.Runtime.Symbols,
+		Exchange: deps.Runtime.Exchange,
+	}, deps.Runtime.Clock.TimeMS())
 	if err != nil {
 		return err
 	}
 	slices.Sort(pairs)
 	exsList := make([]*orm.ExSymbol, 0, len(pairs))
 	for _, pair := range pairs {
-		exs, err := orm.GetExSymbolCur(pair)
+		var exs *orm.ExSymbol
+		exs, err = deps.Runtime.Symbols.GetExSymbolCur(pair)
 		if err != nil {
-			log.Warn("get exs fail, skip", zap.String("code", pair), zap.Error(err))
+			deps.Logger.Warn("get exs fail, skip", zap.String("code", pair), zap.Error(err))
 			continue
 		}
 		exsList = append(exsList, exs)
@@ -656,9 +723,14 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 		log.Error("run-every is too small for current batch-size and timeframe")
 		return nil
 	}
-	startMs := config.TimeRange.StartMS
+	var startMs, endMS int64
+	if timeRange := deps.Runtime.ConfigView().TimeRange; timeRange != nil {
+		startMs, endMS = timeRange.StartMS, timeRange.EndMS
+	} else {
+		return errs.NewMsg(core.ErrBadConfig, "correlation time range is required")
+	}
 	klineNum := args.BatchSize + 1
-	pBar := utils.NewPrgBar(int((config.TimeRange.EndMS-startMs)/gapTFMSecs)+1, "Corr")
+	pBar := utils.NewPrgBar(int((endMS-startMs)/gapTFMSecs)+1, "Corr")
 	defer pBar.Close()
 	var csvRows [][]string
 	codes := make([]string, 0, len(pairs))
@@ -685,7 +757,7 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 	}
 	csvRows = append(csvRows, head)
 	for {
-		if startMs >= config.TimeRange.EndMS {
+		if startMs >= endMS {
 			break
 		}
 		pBar.Add(1)
@@ -694,9 +766,10 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 		dataArr := make([][]float64, 0, len(exsList))
 		var lacks []string
 		for i, exs := range exsList {
-			_, rows, err := orm.GetSeries(exs, tf, startMs, startMs+gapTFMSecs, klineNum, false)
+			var rows []*orm.DataSeries
+			_, rows, err = deps.Queries.GetSeries(exs, tf, startMs, startMs+gapTFMSecs, klineNum, false)
 			if err != nil {
-				log.Warn("get kline fail, skip", zap.String("code", exs.Symbol), zap.Error(err))
+				deps.Logger.Warn("get kline fail, skip", zap.String("code", exs.Symbol), zap.Error(err))
 				continue
 			}
 			if len(rows) >= klineNum {
@@ -705,7 +778,7 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 				for _, row := range rows {
 					closeVal, err_ := row.CloseValue()
 					if err_ != nil {
-						log.Warn("read close fail, skip", zap.String("code", exs.Symbol), zap.Error(err_))
+						deps.Logger.Warn("read close fail, skip", zap.String("code", exs.Symbol), zap.Error(err_))
 						badRow = true
 						break
 					}
@@ -722,7 +795,7 @@ func CalcCorrelation(args *config.CmdArgs) *errs.Error {
 		}
 		dateStr := btime.ToDateStr(startMs, "20060102")
 		if len(lacks) > 0 {
-			log.Warn("skip no enough kline", zap.String("dt", dateStr), zap.Strings("codes", lacks))
+			deps.Logger.Warn("skip no enough kline", zap.String("dt", dateStr), zap.Strings("codes", lacks))
 		}
 		startMs += gapTFMSecs
 		if len(names) == 0 {
@@ -793,6 +866,57 @@ Replay OHLCV-shaped DataSeries within a specified time range for multiple symbol
 对多个品种回放指定时间范围的 DataSeries，支持多周期，支持返回未来 n 个最小周期事件。
 */
 func RunHistSeries(args *RunHistSeriesArgs) *errs.Error {
+	return runHistSeries(args, nil)
+}
+
+// RunHistSeriesWithRuntimeDeps replays series using runtime-owned storage,
+// exchange, clock, symbols, strategy state, and cancellation. RunHistSeries is
+// retained as the compatibility tool entrypoint for existing integrations.
+func RunHistSeriesWithRuntimeDeps(args *RunHistSeriesArgs, deps RuntimeDeps) *errs.Error {
+	missing := make([]string, 0, 8)
+	if deps.Core == nil {
+		missing = append(missing, "core")
+	}
+	if deps.Clock == nil {
+		missing = append(missing, "clock")
+	}
+	if deps.Config == nil || deps.Config.View() == nil {
+		missing = append(missing, "config")
+	}
+	if deps.Market == nil {
+		missing = append(missing, "market")
+	}
+	if deps.Symbols == nil {
+		missing = append(missing, "symbols")
+	}
+	if deps.Storage == nil {
+		missing = append(missing, "storage")
+	}
+	if deps.Strategies == nil {
+		missing = append(missing, "strategies")
+	}
+	if deps.Exchange == nil {
+		missing = append(missing, "exchange")
+	}
+	if len(missing) > 0 {
+		return errs.NewMsg(core.ErrBadConfig, "historical series runtime requires %s", strings.Join(missing, ", "))
+	}
+	return runHistSeries(args, &deps)
+}
+
+func runHistSeries(args *RunHistSeriesArgs, runtimeDeps *RuntimeDeps) *errs.Error {
+	if args == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "historical series arguments are required")
+	}
+	if args.OnData == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "historical series callback is required")
+	}
+	var dataDeps *data.RuntimeDeps
+	logger := log.L()
+	if runtimeDeps != nil {
+		dataDeps = runtimeDeps.DataDeps()
+		logger = runtimeDeps.Logger()
+	}
 	if args.VerCh == nil {
 		args.VerCh = make(chan int, 5)
 	}
@@ -857,7 +981,13 @@ func RunHistSeries(args *RunHistSeriesArgs) *errs.Error {
 			})
 		}
 		futures[exs.Symbol] = tfList
-		feeder, err := data.NewDBSeriesFeeder(exs, onItemBar, true)
+		var feeder *data.DBSeriesFeeder
+		var err *errs.Error
+		if dataDeps == nil {
+			feeder, err = data.NewDBSeriesFeeder(exs, onItemBar, true)
+		} else {
+			feeder, err = data.NewDBSeriesFeederWithRuntimeDeps(dataDeps, exs, onItemBar, true)
+		}
 		if err != nil {
 			return err
 		}
@@ -869,13 +999,21 @@ func RunHistSeries(args *RunHistSeriesArgs) *errs.Error {
 			}
 		}
 		feeder.SubTfs(utils.KeysOfMap(args.TfWarms), true)
-		exchange, err := exg.GetWith(exs.Exchange, exs.Market, "")
-		if err != nil {
-			return err
+		var exchange banexg.BanExchange
+		if runtimeDeps == nil {
+			exchange, err = exg.GetWith(exs.Exchange, exs.Market, "")
+			if err != nil {
+				return err
+			}
+		} else {
+			exchange = runtimeDeps.Exchange
+			if exchange == nil {
+				return errs.NewMsg(core.ErrBadConfig, "historical series runtime exchange is required")
+			}
 		}
 		err = feeder.DownIfNeed(nil, exchange, nil)
 		if err != nil {
-			log.Error("down kline fail", zap.String("code", exs.Symbol), zap.Error(err))
+			logger.Error("down kline fail", zap.String("code", exs.Symbol), zap.Error(err))
 		}
 		_, skips, err = feeder.WarmTfs(args.Start, args.TfWarms, nil)
 		if err != nil {
@@ -886,11 +1024,11 @@ func RunHistSeries(args *RunHistSeriesArgs) *errs.Error {
 		}
 		feeder.SetSeek(args.Start)
 		if i%10 == 0 {
-			log.Info("warm done", zap.Int("total", len(args.ExsList)), zap.Int("cur", i+1))
+			logger.Info("warm done", zap.Int("total", len(args.ExsList)), zap.Int("cur", i+1))
 		}
 	}
 	if len(skipWarms) > 0 {
-		log.Warn("warm lacks", zap.String("items", data.StrWarmLacks(skipWarms)))
+		logger.Warn("warm lacks", zap.String("items", data.StrWarmLacks(skipWarms)))
 	}
 	makeFeeders := func() []data.IHistFeeder {
 		var feeders []data.IHistFeeder
@@ -899,91 +1037,16 @@ func RunHistSeries(args *RunHistSeriesArgs) *errs.Error {
 		}
 		return feeders
 	}
-	err := data.RunHistFeeders(makeFeeders, args.VerCh, nil)
+	var err *errs.Error
+	if dataDeps == nil {
+		err = data.RunHistFeeders(makeFeeders, args.VerCh, nil)
+	} else {
+		err = data.RunHistFeedersWithRuntimeDeps(dataDeps, makeFeeders, args.VerCh, nil)
+	}
 	if args.OnEnvEnd != nil {
 		args.OnEnvEnd(nil)
 	}
 	return err
-}
-
-type downOrdersOptions struct {
-	configs  config.ArrString
-	exchange string
-	market   string
-	account  string
-	pairs    string
-	start    string
-	end      string
-	force    bool
-}
-
-func DownExgOrders(args []string) error {
-	command := NewDownExgOrdersCommand()
-	command.SetArgs(args)
-	return command.Execute()
-}
-
-func NewDownExgOrdersCommand() *cobra.Command {
-	options := &downOrdersOptions{}
-	command := &cobra.Command{
-		Use:     "down-order",
-		Aliases: []string{"down_order"},
-		Short:   "download exchange orders for an account",
-		Args:    cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return runDownExgOrders(options)
-		},
-	}
-	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")
-	command.Flags().StringVar(&options.account, "account", "", "account whose API key will fetch orders")
-	command.Flags().StringVar(&options.exchange, "exchange", "", "exchange identifier")
-	command.Flags().StringVar(&options.market, "market", "", "market: spot, linear, inverse, or option")
-	command.Flags().StringVar(&options.start, "timestart", "", "start time in a supported time format")
-	command.Flags().StringVar(&options.end, "timeend", "", "end time in a supported time format")
-	command.Flags().StringVar(&options.pairs, "pairs", "", "comma-separated symbols")
-	command.Flags().BoolVar(&options.force, "force", false, "force checking from the order timestamp")
-	return command
-}
-
-func runDownExgOrders(options *downOrdersOptions) error {
-	core.SetRunMode(core.RunModeLive)
-	err := SetupComs(&config.CmdArgs{Configs: options.configs})
-	if err != nil {
-		return err
-	}
-	if options.exchange == "" {
-		options.exchange = core.ExgName
-	}
-	if options.market == "" {
-		options.market = core.Market
-	}
-	if options.pairs == "" {
-		options.pairs = strings.Join(config.Pairs, ",")
-	}
-	if options.start == "" || options.end == "" {
-		return errors.New("timestart or timeend is required")
-	}
-	if options.account == "" || options.pairs == "" {
-		return errors.New("`account` or `pairs` is required")
-	}
-	save, err := GetExgOrderSet(options.account, options.exchange, options.market)
-	if err != nil {
-		return err
-	}
-	startMS, err_ := btime.ParseTimeMS(options.start)
-	if err_ != nil {
-		return err_
-	}
-	endMS, err_ := btime.ParseTimeMS(options.end)
-	if err_ != nil {
-		return err_
-	}
-	pairArr := strings.Split(options.pairs, ",")
-	err = save.Download(startMS, endMS, pairArr, options.force)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 type PairOrders struct {
@@ -1000,32 +1063,142 @@ type ExgOrderSet struct {
 	Data     map[string]*PairOrders
 	path     string
 	exchange banexg.BanExchange
+	logger   *zap.Logger
 }
 
+// GetExgOrderSet preserves the public serial tool facade. Isolated callers
+// should use NewExgOrderSetWithRuntimeDeps.
 func GetExgOrderSet(account, exgName, market string) (*ExgOrderSet, *errs.Error) {
-	acc := config.Accounts[account]
-	accHash := acc.GetApiSecret().APIKey[:5]
-	fname := fmt.Sprintf("%s_%s_%s_%s.gob", exgName, market, account, accHash)
-	orderDir := filepath.Join(config.GetDataDir(), "exgOrders")
-	err := utils.EnsureDir(orderDir, 0755)
+	if err := validateOrderCacheIdentity(account, exgName, market); err != nil {
+		return nil, err
+	}
+	accountCfg := config.Accounts[account]
+	if accountCfg == nil {
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "account invalid: %s", account)
+	}
+	apiKey := accountCfg.GetApiSecretFor(exgName, core.RunEnv).APIKey
+	if len(apiKey) > 5 {
+		apiKey = apiKey[:5]
+	}
+	if apiKey == "" {
+		return nil, errs.NewMsg(errs.CodeParamRequired, "account API key is required: %s", account)
+	}
+	if err := validateOrderCacheSegment("API key prefix", apiKey); err != nil {
+		return nil, err
+	}
+	exchange, err := exg.GetWith(exgName, market, "")
 	if err != nil {
+		return nil, err
+	}
+	orderDir := filepath.Join(config.GetDataDir(), "exgOrders")
+	if err := utils.EnsureDir(orderDir, 0755); err != nil {
 		return nil, errs.New(errs.CodeIOWriteFail, err)
 	}
-	path := filepath.Join(orderDir, fname)
-	var save = ExgOrderSet{
-		Account: account,
-		Name:    exgName,
-		Market:  market,
-		Data:    make(map[string]*PairOrders),
-		path:    path,
+	path := filepath.Join(orderDir, fmt.Sprintf("%s_%s_%s_%s.gob", exgName, market, account, apiKey))
+	result := &ExgOrderSet{Account: account, Name: exgName, Market: market, Data: make(map[string]*PairOrders), path: path, logger: log.L()}
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := utils.DecodeGobFile(path, result); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(statErr) {
+		return nil, errs.New(errs.CodeIOReadFail, statErr)
 	}
-	_ = utils.DecodeGobFile(path, &save)
-	exchange, err2 := exg.GetWith(exgName, market, "")
-	if err2 != nil {
-		return nil, err2
+	result.Account, result.Name, result.Market, result.path, result.exchange, result.logger = account, exgName, market, path, exchange, log.L()
+	if result.Data == nil {
+		result.Data = make(map[string]*PairOrders)
 	}
-	save.exchange = exchange
-	return &save, nil
+	return result, nil
+}
+
+// NewExgOrderSetWithRuntimeDeps opens the persisted order cache owned by one
+// runtime. It uses the runtime exchange directly and never resolves a global
+// exchange or account configuration.
+func NewExgOrderSetWithRuntimeDeps(deps RuntimeDeps, account, exgName, market string) (*ExgOrderSet, *errs.Error) {
+	if deps.Config == nil || deps.Config.DataDir == "" || deps.Exchange == nil || deps.Core == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "runtime config, exchange, and core are required")
+	}
+	if exgName == "" {
+		exgName = deps.Core.ExgName
+	}
+	if market == "" {
+		market = deps.Core.Market
+	}
+	if err := validateOrderCacheIdentity(account, exgName, market); err != nil {
+		return nil, err
+	}
+	info := deps.Exchange.Info()
+	if info == nil || info.ID != exgName || info.MarketType != market {
+		return nil, errs.NewMsg(core.ErrBadConfig, "runtime exchange identity %q/%q does not match order cache %q/%q", infoID(info), infoMarket(info), exgName, market)
+	}
+	accountCfg := deps.AccountConfigs()[account]
+	if accountCfg == nil {
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "account invalid: %s", account)
+	}
+	apiKey := accountCfg.GetApiSecretFor(exgName, deps.Core.RunEnv).APIKey
+	if len(apiKey) > 5 {
+		apiKey = apiKey[:5]
+	}
+	if apiKey == "" {
+		return nil, errs.NewMsg(errs.CodeParamRequired, "account API key is required: %s", account)
+	}
+	if err := validateOrderCacheSegment("API key prefix", apiKey); err != nil {
+		return nil, err
+	}
+	orderDir := filepath.Join(deps.Config.DataDir, "exgOrders")
+	if err := utils.EnsureDir(orderDir, 0755); err != nil {
+		return nil, errs.New(errs.CodeIOWriteFail, err)
+	}
+	path := filepath.Join(orderDir, fmt.Sprintf("%s_%s_%s_%s.gob", exgName, market, account, apiKey))
+	result := &ExgOrderSet{Account: account, Name: exgName, Market: market, Data: make(map[string]*PairOrders), path: path, exchange: deps.Exchange, logger: deps.Core.Log()}
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := utils.DecodeGobFile(path, result); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(statErr) {
+		return nil, errs.New(errs.CodeIOReadFail, statErr)
+	}
+	if result.Account != account || result.Name != exgName || result.Market != market {
+		return nil, errs.NewMsg(core.ErrBadConfig, "order cache identity does not match requested account or exchange")
+	}
+	// Gob contains historical fields, but never gets authority to replace the
+	// runtime-bound exchange or the cache path selected from current secrets.
+	result.Account, result.Name, result.Market, result.path, result.exchange, result.logger = account, exgName, market, path, deps.Exchange, deps.Core.Log()
+	if result.Data == nil {
+		result.Data = make(map[string]*PairOrders)
+	}
+	return result, nil
+}
+
+func validateOrderCacheIdentity(account, exgName, market string) *errs.Error {
+	for _, item := range []struct{ label, value string }{
+		{"account", account}, {"exchange", exgName}, {"market", market},
+	} {
+		if err := validateOrderCacheSegment(item.label, item.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateOrderCacheSegment(label, value string) *errs.Error {
+	if value == "" || value == "." || value == ".." || filepath.Base(value) != value || strings.ContainsAny(value, `/\\`) {
+		return errs.NewMsg(errs.CodeParamInvalid, "invalid order-cache %s: %q", label, value)
+	}
+	return nil
+}
+
+func infoID(info *banexg.ExgInfo) string {
+	if info == nil {
+		return ""
+	}
+	return info.ID
+}
+
+func infoMarket(info *banexg.ExgInfo) string {
+	if info == nil {
+		return ""
+	}
+	return info.MarketType
 }
 
 // Download 下载指定时间范围内的订单记录
@@ -1098,11 +1271,12 @@ func (s *ExgOrderSet) Download(startMS, endMS int64, pairs []string, force bool)
 
 				startStr := btime.ToDateStr(start, "")
 				endStr := btime.ToDateStr(end, "")
-				log.Info("download orders",
-					zap.String("pair", pair),
-					zap.Bool("algo", isAlgo),
-					zap.String("range", fmt.Sprintf("%s - %s", startStr, endStr)),
-					zap.Int("num", len(newOrders)))
+				fields := []zap.Field{zap.String("pair", pair), zap.Bool("algo", isAlgo), zap.String("range", fmt.Sprintf("%s - %s", startStr, endStr)), zap.Int("num", len(newOrders))}
+				if s.logger != nil {
+					s.logger.Info("download orders", fields...)
+				} else {
+					log.Info("download orders", fields...)
+				}
 				if len(newOrders) < limit {
 					break
 				}
@@ -1199,44 +1373,60 @@ func (s *ExgOrderSet) Get(startMS, endMS int64, pairs []string, botName string) 
 // 1. Each K-line's time is within 2 minutes of its row time
 // 2. The interval between consecutive K-lines matches the timeframe
 // 3. Reports any missing K-lines
-func TestKLineConsistency(args []string) error {
-	if len(args) == 0 {
-		return errors.New("out path is required")
+type KlineConsistencyDeps struct {
+	Queries *orm.Queries
+	Symbols *orm.SymbolState
+	Logger  *zap.Logger
+}
+
+var registerConsistencyGobTypes sync.Once
+
+// TestKLineConsistencyWithRuntimeDeps compares a dump against local stored
+// bars. It never downloads missing data: the dump check must not mutate the
+// database or reach an exchange while inspecting a prior live run.
+func TestKLineConsistencyWithRuntimeDeps(path string, deps KlineConsistencyDeps) error {
+	if path == "" {
+		return errors.New("dump path is required")
 	}
-	file, err := os.Open(args[0])
+	if deps.Queries == nil || deps.Symbols == nil {
+		return errs.NewMsg(core.ErrBadConfig, "kline consistency queries and symbols are required")
+	}
+	if deps.Logger == nil {
+		deps.Logger = zap.NewNop()
+	}
+	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	gob.Register(banexg.Kline{})
-	gob.Register([]*orm.DumpRow{})
-	gob.Register(banexg.MyTrade{})
-	gob.Register(exg.PutOrderRes{})
+	registerConsistencyGobTypes.Do(func() {
+		gob.Register(banexg.Kline{})
+		gob.Register([]*orm.DumpRow{})
+		gob.Register(banexg.MyTrade{})
+		gob.Register(exg.PutOrderRes{})
+	})
 	dec := gob.NewDecoder(file)
-
-	core.SetRunMode(core.RunModeLive)
-	err2 := SetupComs(&config.CmdArgs{})
-	if err2 != nil {
-		return err2
-	}
-
-	exgName, market := "binance", "linear"
 	gpKlines := make(map[string][]*banexg.Kline) // map[pair_tf]klines
 	endMS := int64(0)
 	totalNum := 0
 	printStat := func() error {
 		for key, arr := range gpKlines {
 			envKeyArr := strings.Split(key, "_")
+			if len(envKeyArr) != 2 || len(arr) == 0 || endMS == 0 {
+				continue
+			}
 			symbol, tf := envKeyArr[0], envKeyArr[1]
 			tfMSecs := int64(utils2.TFToSecs(tf)) * 1000
-			exs := orm.GetExSymbol2(exgName, market, symbol)
-			startMS := arr[0].Time
-			exchange, err2 := exg.GetWith(exs.Exchange, exs.Market, "")
-			if err2 != nil {
-				return err2
+			if tfMSecs <= 0 {
+				return fmt.Errorf("invalid timeframe %q", tf)
 			}
-			_, localBars, err2 := orm.AutoFetchOHLCV(exchange, exs, tf, startMS, endMS, 0, false, nil)
+			exs, symbolErr := deps.Symbols.GetExSymbolCur(symbol)
+			if symbolErr != nil {
+				return symbolErr
+			}
+			startMS := arr[0].Time
+			_, localBars, err2 := deps.Queries.GetOHLCV(exs, tf, startMS, endMS, 0, false)
 			if err2 != nil {
 				return err2
 			}
@@ -1297,7 +1487,9 @@ func TestKLineConsistency(args []string) error {
 				var flags = make([]int, num)
 				for _, b := range bars {
 					idx := int((b.Time - startMS) / tfMSecs)
-					flags[idx] = 1
+					if idx >= 0 && idx < len(flags) {
+						flags[idx] = 1
+					}
 				}
 				var res = make([]int, 0, num)
 				for i, f := range flags {
@@ -1324,7 +1516,7 @@ func TestKLineConsistency(args []string) error {
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			fmt.Printf("Failed to decode dump file: %v\n", err)
+			return fmt.Errorf("decode dump file: %w", err)
 		}
 		for _, row := range rows {
 			if row == nil {
@@ -1336,7 +1528,7 @@ func TestKLineConsistency(args []string) error {
 					return err
 				}
 				dateStr := btime.ToDateStr(row.Time, core.DefaultDateFmt)
-				log.Info("bot start up", zap.String("date", dateStr))
+				deps.Logger.Info("bot start up", zap.String("date", dateStr))
 				gpKlines = make(map[string][]*banexg.Kline)
 				endMS = int64(0)
 				totalNum = 0
@@ -1368,6 +1560,10 @@ func TestKLineConsistency(args []string) error {
 			endMS = row.Time
 
 			envKeyArr := strings.Split(row.Key, "_")
+			if len(envKeyArr) != 2 {
+				fmt.Printf("Invalid K-line key %q\n", row.Key)
+				continue
+			}
 			symbol, tf := envKeyArr[0], envKeyArr[1]
 
 			tfMSecs := int64(utils2.TFToSecs(tf)) * 1000

@@ -118,13 +118,13 @@ func checkRuntimeFatalStop(deps RuntimeDeps, account string, fatal map[int]float
 	}
 	sess, conn, err := deps.Orders.Conn(false)
 	if err != nil {
-		log.Error("get runtime db session fail", zap.Error(err))
+		deps.Logger().Error("get runtime db session fail", zap.Error(err))
 		return
 	}
 	defer conn.Close()
 	orders, err := sess.GetOrders(ormo.GetOrdersArgs{TaskID: taskID, Status: 2, CloseAfter: now - int64(intervals[len(intervals)-1])*60000})
 	if err != nil {
-		log.Error("get runtime closed orders fail", zap.Error(err))
+		deps.Logger().Error("get runtime closed orders fail", zap.Error(err))
 		return
 	}
 	wallet := deps.Trading.Wallet(account)
@@ -134,14 +134,14 @@ func checkRuntimeFatalStop(deps RuntimeDeps, account string, fatal map[int]float
 			continue
 		}
 		deps.Core.SetNoEnterUntil(account, now+int64(fatalHours)*int64(60*60*1000))
-		log.Error("runtime fatal stop activated", zap.String("account", account), zap.Int("minutes", interval), zap.Float64("loss_rate", lossRate))
+		deps.Logger().Error("runtime fatal stop activated", zap.String("account", account), zap.Int("minutes", interval), zap.Float64("loss_rate", lossRate))
 		return
 	}
 }
 
 func calcRuntimeFatalLoss(wallet *BanWallets, orders []*ormo.InOutOrder, interval int, nowMS, startMS int64) float64 {
 	minMS := nowMS - int64(interval)*60000
-	if startMS > 0 && minMS > startMS {
+	if startMS > 0 && minMS < startMS {
 		minMS = startMS
 	}
 	profit := 0.0

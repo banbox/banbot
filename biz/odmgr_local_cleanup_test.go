@@ -8,7 +8,6 @@ import (
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
@@ -26,33 +25,18 @@ func (*cleanupTestExchange) CalculateFee(string, string, string, float64, float6
 
 func setupLocalCleanupTest(t *testing.T, backtest, envReal bool) *LocalOrderMgr {
 	t.Helper()
-	originalBiz := BackupVars()
-	originalExchange := exg.Default
-	originalBacktest := core.BackTestMode
-	originalLive := core.LiveMode
-	originalEnvReal := core.EnvReal
-	originalTime := btime.CurTimeMS
-	t.Cleanup(func() {
-		RestoreVars(originalBiz)
-		exg.Default = originalExchange
-		core.BackTestMode = originalBacktest
-		core.LiveMode = originalLive
-		core.EnvReal = originalEnvReal
-		btime.CurTimeMS = originalTime
-	})
-
-	ResetVars()
-	exg.Default = &cleanupTestExchange{}
-	core.BackTestMode = backtest
-	core.LiveMode = false
-	core.EnvReal = envReal
-	return &LocalOrderMgr{
-		OrderMgr: OrderMgr{
-			Account:  "cleanup-test",
-			callBack: func(*ormo.InOutOrder, bool) {},
-		},
-		zeroAmts: make(map[string]int),
+	state, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
 	}
+	t.Cleanup(state.Close)
+	state.BackTestMode, state.EnvReal = backtest, envReal
+	state.Market = banexg.MarketLinear
+	cfg := config.NewSnapshotWithDirs(&config.Config{Accounts: map[string]*config.AccountConfig{"cleanup-test": {}}, BTNetCost: 15}, t.TempDir(), "")
+	trader := newCompleteTraderForTest(t, RuntimeDeps{Core: state, Clock: btime.NewClockState(backtest, nil), Config: cfg, Symbols: orm.NewSymbolState(), Exchange: &cleanupTestExchange{}, DefaultAccount: "cleanup-test"})
+	mgr := &LocalOrderMgr{OrderMgr: OrderMgr{Account: "cleanup-test", callBack: func(*ormo.InOutOrder, bool) {}}, zeroAmts: make(map[string]int)}
+	mgr.bindRuntimeDeps(*trader.RuntimeDependencies())
+	return mgr
 }
 
 func cleanupPendingExit(id int64, symbol string) *ormo.InOutOrder {
@@ -91,9 +75,9 @@ func TestBacktestCleanupUsesLastHistoricalPrice(t *testing.T) {
 	mgr := setupLocalCleanupTest(t, true, true)
 	const symbol = "HIFI-CLEANUP/USDT:USDT"
 	const lastPrice = 0.42
-	btime.CurTimeMS = 1_700_000_000_000
-	com.SetBarPrice(symbol, lastPrice)
-	btime.CurTimeMS += com.Day10MSecs + 1
+	mgr.clock.SetTimeMS(1_700_000_000_000)
+	mgr.prices.SetBarPriceAt(mgr.clock.TimeMS(), symbol, lastPrice)
+	mgr.clock.SetTimeMS(mgr.clock.TimeMS() + com.Day10MSecs + 1)
 	od := cleanupPendingExit(1, symbol)
 
 	affected, err := mgr.fillPendingOrders([]*ormo.InOutOrder{od}, nil)
@@ -109,9 +93,9 @@ func TestBacktestExitAndFillUsesLastHistoricalPrice(t *testing.T) {
 	mgr := setupLocalCleanupTest(t, true, true)
 	const symbol = "HIFI-ROTATION/USDT:USDT"
 	const lastPrice = 0.42
-	btime.CurTimeMS = 1_700_000_000_000
-	com.SetBarPrice(symbol, lastPrice)
-	btime.CurTimeMS += com.Day10MSecs + 1
+	mgr.clock.SetTimeMS(1_700_000_000_000)
+	mgr.prices.SetBarPriceAt(mgr.clock.TimeMS(), symbol, lastPrice)
+	mgr.clock.SetTimeMS(mgr.clock.TimeMS() + com.Day10MSecs + 1)
 	od := cleanupPendingExit(1, symbol)
 	od.ExitTag = ""
 	od.Exit = nil
@@ -126,25 +110,27 @@ func TestBacktestExitAndFillUsesLastHistoricalPrice(t *testing.T) {
 
 func TestBacktestBaselineCleanupUsesExplicitCutoff(t *testing.T) {
 	mgr := setupLocalCleanupTest(t, true, false)
-	oldNetCost := config.BTNetCost
-	config.BTNetCost = 15
-	t.Cleanup(func() { config.BTNetCost = oldNetCost })
 	const cutoff = int64(1_700_000_000_000)
 	const symbol = "BASELINE-CLEANUP/USDT:USDT"
-	restoreSymbols, err := orm.InstallFrozenExSymbols([]*orm.ExSymbol{{
+	err := mgr.symbols.SetExSymbols([]*orm.ExSymbol{{
 		ID: 1, Exchange: "binance", Market: banexg.MarketLinear, Symbol: symbol,
 	}})
 	if err != nil {
 		t.Fatalf("install test symbol: %v", err)
 	}
-	t.Cleanup(restoreSymbols)
-	btime.CurTimeMS = cutoff + com.Day10MSecs
-	com.SetBarPrice(symbol, 12)
+	mgr.clock.SetTimeMS(cutoff + com.Day10MSecs)
+	mgr.prices.SetBarPriceAt(mgr.clock.TimeMS(), symbol, 12)
 	od := cleanupPendingExit(1, symbol)
 	od.Sid = 1
 	od.ExitTag = ""
 	od.Exit = nil
-	od.Save()
+	orders := mgr.orderState()
+	orders.SetTask(mgr.Account, &ormo.BotTask{ID: 1})
+	od.TaskID = 1
+	od.BindState(orders)
+	if err := od.Save(); err != nil {
+		t.Fatalf("save baseline order: %v", err)
+	}
 	if err := mgr.cleanUpAt(cutoff); err != nil {
 		t.Fatalf("close baseline orders: %v", err)
 	}
@@ -152,8 +138,8 @@ func TestBacktestBaselineCleanupUsesExplicitCutoff(t *testing.T) {
 		od.ExitAt != cutoff+15_000 {
 		t.Fatalf("baseline cleanup order=%+v, want bot_stop at %d", od, cutoff+15_000)
 	}
-	if btime.CurTimeMS != cutoff+com.Day10MSecs {
-		t.Fatalf("cleanup changed simulated clock: %d", btime.CurTimeMS)
+	if mgr.clock.TimeMS() != cutoff+com.Day10MSecs {
+		t.Fatalf("cleanup changed simulated clock: %d", mgr.clock.TimeMS())
 	}
 }
 
@@ -177,10 +163,10 @@ func TestCleanupMissingPriceDoesNotSkipFollowingOrder(t *testing.T) {
 func TestNonBacktestCleanupStillRejectsStalePrice(t *testing.T) {
 	mgr := setupLocalCleanupTest(t, true, true)
 	const symbol = "LIVE-CLEANUP/USDT:USDT"
-	btime.CurTimeMS = 1_700_000_000_000
-	com.SetBarPrice(symbol, 12)
-	btime.CurTimeMS += com.Day10MSecs + 1
-	core.BackTestMode = false
+	mgr.clock.SetTimeMS(1_700_000_000_000)
+	mgr.prices.SetBarPriceAt(mgr.clock.TimeMS(), symbol, 12)
+	mgr.clock.SetTimeMS(mgr.clock.TimeMS() + com.Day10MSecs + 1)
+	mgr.runtimeCore.BackTestMode = false
 	od := cleanupPendingExit(1, symbol)
 
 	affected, err := mgr.fillPendingOrders([]*ormo.InOutOrder{od}, nil)
@@ -194,7 +180,7 @@ func TestNonBacktestCleanupStillRejectsStalePrice(t *testing.T) {
 
 func TestCleanupFailsWithOpenOrders(t *testing.T) {
 	mgr := setupLocalCleanupTest(t, true, false)
-	openOds, lock := ormo.GetOpenODs(config.DefAcc)
+	openOds, lock := mgr.orderState().GetOpenODs(mgr.Account)
 	lock.Lock()
 	openOds[1] = cleanupPendingExit(1, "NO-CLEANUP-PRICE-LEFT/USDT:USDT")
 	lock.Unlock()
@@ -207,7 +193,7 @@ func TestCleanupFailsWithOpenOrders(t *testing.T) {
 
 func TestCleanupFailsWithFrozenWalletFunds(t *testing.T) {
 	mgr := setupLocalCleanupTest(t, true, false)
-	wallets := GetWallets(config.DefAcc)
+	wallets := mgr.walletsForOrder()
 	wallets.Items["USDT"] = &ItemWallet{
 		Coin:     "USDT",
 		Pendings: make(map[string]float64),
@@ -226,18 +212,11 @@ func TestRuntimeCleanupFiltersOnlyOwnedHistory(t *testing.T) {
 	unfilled := cleanupPendingExit(1001, "USDT")
 	unfilled.Enter.Filled = 0
 	filled := cleanupPendingExit(1002, "USDT")
-	legacyFilled := cleanupPendingExit(2001, "USDT")
-	legacyUnfilled := cleanupPendingExit(2002, "USDT")
-	legacyUnfilled.Enter.Filled = 0
-	legacy := ormo.LegacyState()
-	legacy.AddHistoricalOrder(legacyFilled)
-	legacy.AddHistoricalOrder(legacyUnfilled)
 	first.AddHistoricalOrder(unfilled)
 	first.AddHistoricalOrder(filled)
 	secondUnfilled := cleanupPendingExit(1003, "USDT")
 	secondUnfilled.Enter.Filled = 0
 	second.AddHistoricalOrder(secondUnfilled)
-	legacyBefore := legacy.HistoricalOrders()
 	manager.bindRuntimeDeps(RuntimeDeps{
 		Core:           &core.State{BackTestMode: true},
 		Config:         config.NewSnapshot(&config.Config{}),
@@ -254,28 +233,8 @@ func TestRuntimeCleanupFiltersOnlyOwnedHistory(t *testing.T) {
 	if history := second.HistoricalOrders(); len(history) != 1 || history[0] != secondUnfilled {
 		t.Fatal("cleanup changed sibling runtime history")
 	}
-	if history := legacy.HistoricalOrders(); len(history) != len(legacyBefore) || history[0] != legacyFilled || history[1] != legacyUnfilled {
-		t.Fatal("cleanup changed legacy history contents")
-	}
+
 	if !first.AddHistoricalOrder(unfilled) {
 		t.Fatal("removed history ID remains reserved")
-	}
-}
-
-func TestLegacyCleanupFiltersLegacyHistory(t *testing.T) {
-	manager := setupLocalCleanupTest(t, true, false)
-	legacy := ormo.LegacyState()
-	filled := cleanupPendingExit(3001, "USDT")
-	unfilled := cleanupPendingExit(3002, "USDT")
-	unfilled.Enter.Filled = 0
-	legacy.AddHistoricalOrder(filled)
-	legacy.AddHistoricalOrder(unfilled)
-
-	if err := manager.CleanUp(); err != nil {
-		t.Fatal(err)
-	}
-	history := legacy.HistoricalOrders()
-	if len(history) != 1 || history[0] != filled {
-		t.Fatalf("legacy cleanup history = %v, want only filled order", history)
 	}
 }

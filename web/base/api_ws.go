@@ -10,5 +10,9 @@ func RegApiWebsocket(api fiber.Router) {
 }
 
 func wsOHLCV(c *websocket.Conn) {
-	NewWsClient(c).HandleForever()
+	legacyWsHub.serve(c)
+}
+
+func RegApiWebsocketWithHub(api fiber.Router, hub *WsHub) {
+	api.Get("/ohlcv", websocket.New(hub.serve))
 }

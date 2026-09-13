@@ -21,33 +21,50 @@ type csvRow struct {
 }
 
 func RegApiCsv(api fiber.Router) {
-	api.Post("/csv/upload", postCsvUpload)
-	api.Get("/csv/list", getCsvList)
-	api.Post("/csv/data", postCsvData)
+	RegApiCsvAt(api, config.GetDataDir())
 }
 
-func getCsvDir() string {
-	return filepath.Join(config.GetDataDir(), "csv")
+// RegApiCsvAt registers CSV endpoints against one explicit runtime data root.
+func RegApiCsvAt(api fiber.Router, dataDir string) {
+	h := csvHandlers{dataDir: dataDir}
+	api.Post("/csv/upload", h.postCsvUpload)
+	api.Get("/csv/list", h.getCsvList)
+	api.Post("/csv/data", h.postCsvData)
+}
+
+type csvHandlers struct{ dataDir string }
+
+func (h csvHandlers) csvDir() string {
+	return filepath.Join(h.dataDir, "csv")
+}
+
+func csvFilePath(dir, name string) (string, error) {
+	if !filepath.IsLocal(name) || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
+		return "", &fiber.Error{Code: fiber.StatusBadRequest, Message: "invalid csv file name"}
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".csv") {
+		return "", &fiber.Error{Code: fiber.StatusBadRequest, Message: "only .csv files are allowed"}
+	}
+	return filepath.Join(dir, name), nil
 }
 
 /*
 postCsvUpload 上传CSV文件到BanDataDir/csv/
 */
-func postCsvUpload(c *fiber.Ctx) error {
+func (h csvHandlers) postCsvUpload(c *fiber.Ctx) error {
 	file, err := c.FormFile("file")
 	if err != nil {
 		return &fiber.Error{Code: fiber.StatusBadRequest, Message: "file is required"}
 	}
-	if !strings.HasSuffix(strings.ToLower(file.Filename), ".csv") {
-		return &fiber.Error{Code: fiber.StatusBadRequest, Message: "only .csv files are allowed"}
+	csvDir := h.csvDir()
+	dstPath, err := csvFilePath(csvDir, file.Filename)
+	if err != nil {
+		return err
 	}
-
-	csvDir := getCsvDir()
 	if err := utils.EnsureDir(csvDir, 0755); err != nil {
 		return err
 	}
 
-	dstPath := filepath.Join(csvDir, file.Filename)
 	if err := c.SaveFile(file, dstPath); err != nil {
 		return err
 	}
@@ -63,8 +80,8 @@ func postCsvUpload(c *fiber.Ctx) error {
 getCsvList 获取CSV云端指标列表
 扫描BanDataDir/csv/目录下的所有csv文件
 */
-func getCsvList(c *fiber.Ctx) error {
-	csvDir := getCsvDir()
+func (h csvHandlers) getCsvList(c *fiber.Ctx) error {
+	csvDir := h.csvDir()
 	if err := utils.EnsureDir(csvDir, 0755); err != nil {
 		return err
 	}
@@ -109,13 +126,16 @@ type CsvDataArgs struct {
 /*
 postCsvData 获取CSV数据，按kline时间范围和周期进行标准化
 */
-func postCsvData(c *fiber.Ctx) error {
+func (h csvHandlers) postCsvData(c *fiber.Ctx) error {
 	var args CsvDataArgs
 	if err := VerifyArg(c, &args, ArgBody); err != nil {
 		return err
 	}
 
-	csvPath := filepath.Join(getCsvDir(), args.Name)
+	csvPath, err := csvFilePath(h.csvDir(), args.Name)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(csvPath); os.IsNotExist(err) {
 		return &fiber.Error{Code: fiber.StatusNotFound, Message: "csv file not found: " + args.Name}
 	}

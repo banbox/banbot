@@ -1,12 +1,16 @@
 package data
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/strat"
+	"github.com/banbox/banexg"
+	ta "github.com/banbox/banta"
 )
 
 func TestFeederHistoricalCoverageFiltersCallbacks(t *testing.T) {
@@ -264,5 +268,123 @@ func TestSeriesFeederWarmupStateUsesLastAllowedRow(t *testing.T) {
 	wantEnd := int64(100 + 3600*1000)
 	if endMS != wantEnd || state.SubNextMS != wantEnd || len(called) != 1 || called[0] != 100 {
 		t.Fatalf("end=%d state=%d callbacks=%v want=%d", endMS, state.SubNextMS, called, wantEnd)
+	}
+}
+
+func TestExplicitSeriesFeederRequiresRuntimeState(t *testing.T) {
+	exs := &orm.ExSymbol{ID: 1, Symbol: "BTC/USDT:USDT"}
+	if feeder, err := NewSeriesFeederWithRuntimeDeps(nil, exs, nil, false); err == nil || feeder != nil {
+		t.Fatalf("nil runtime dependencies returned feeder=%v err=%v", feeder, err)
+	}
+	if feeder, err := NewSeriesFeederWithRuntimeDeps(&RuntimeDeps{}, exs, nil, false); err == nil || feeder != nil {
+		t.Fatalf("missing strategy state returned feeder=%v err=%v", feeder, err)
+	}
+	if feeder, err := NewDBSeriesFeederWithRuntimeDeps(nil, exs, nil, false); err == nil || feeder != nil {
+		t.Fatalf("nil historical runtime dependencies returned feeder=%v err=%v", feeder, err)
+	}
+	if feeder, err := NewDBSeriesFeederWithRuntimeDeps(&RuntimeDeps{}, exs, nil, false); err == nil || feeder != nil {
+		t.Fatalf("missing historical strategy state returned feeder=%v err=%v", feeder, err)
+	}
+}
+
+func TestExplicitSeriesFeedersRejectForeignRuntimeIdentityBeforeIO(t *testing.T) {
+	deps := &RuntimeDeps{
+		Strategies:   strat.NewState(),
+		Exchange:     &banexg.Exchange{ExgInfo: &banexg.ExgInfo{ID: "owner", MarketType: banexg.MarketSpot}},
+		ExchangeName: "owner",
+		MarketType:   banexg.MarketSpot,
+	}
+	exs := &orm.ExSymbol{Exchange: "foreign", Market: banexg.MarketSpot, Symbol: "BTC/USDT"}
+	if feeder, err := NewSeriesFeederWithRuntimeDeps(deps, exs, nil, false); err == nil || feeder != nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("series feeder = %#v, error = %v, want identity mismatch", feeder, err)
+	}
+	if feeder, err := NewDBSeriesFeederWithRuntimeDeps(deps, exs, nil, false); err == nil || feeder != nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("DB feeder = %#v, error = %v, want identity mismatch", feeder, err)
+	}
+}
+
+func TestSeriesFeederWarmupUsesOnlyExplicitRuntimeState(t *testing.T) {
+	const (
+		symbol = "BTC/USDT:USDT"
+		tf     = "1h"
+	)
+	previousBacktest := core.BackTestMode
+	previousTime := btime.CurTimeMS
+	t.Cleanup(func() {
+		core.BackTestMode = previousBacktest
+		btime.CurTimeMS = previousTime
+	})
+	core.BackTestMode = false
+	btime.CurTimeMS = 987654321
+
+	runtimeStrategies := strat.NewState()
+	runtimeEnv := &ta.BarEnv{BarNum: 12}
+	runtimeStrategies.SetEnv(symbol+"_"+tf, runtimeEnv)
+	otherRuntimeStrategies := strat.NewState()
+	otherRuntimeEnv := &ta.BarEnv{BarNum: 34}
+	otherRuntimeStrategies.SetEnv(symbol+"_"+tf, otherRuntimeEnv)
+	legacyEnv := &ta.BarEnv{BarNum: 77}
+	legacyKey := symbol + "_" + tf
+	previousLegacyEnv, hadPreviousLegacyEnv := strat.Envs[legacyKey]
+	strat.Envs[legacyKey] = legacyEnv
+	t.Cleanup(func() {
+		if hadPreviousLegacyEnv {
+			strat.Envs[legacyKey] = previousLegacyEnv
+		} else {
+			delete(strat.Envs, legacyKey)
+		}
+	})
+
+	clock := btime.NewClockState(true, nil)
+	seenWarmup := false
+	feeder := &SeriesFeeder{Feeder: Feeder{
+		ExSymbol: &orm.ExSymbol{Symbol: symbol},
+		deps: &RuntimeDeps{
+			Core:       &core.State{BackTestMode: true},
+			Clock:      clock,
+			Strategies: runtimeStrategies,
+		},
+		CallBack: func(evt *orm.DataSeries) { seenWarmup = evt.IsWarmUp },
+		tfBars:   make(map[string][]*orm.DataSeries),
+	}}
+
+	endMS, err := feeder.warmTfWithErr(tf, []*orm.DataSeries{{TimeMS: 100}})
+	if err != nil {
+		t.Fatalf("warm explicit runtime: %v", err)
+	}
+	if want := int64(100 + 60*60*1000); endMS != want || clock.TimeMS() != want {
+		t.Fatalf("end=%d clock=%d want=%d", endMS, clock.TimeMS(), want)
+	}
+	if !seenWarmup {
+		t.Fatal("explicit warmup callback was not marked warm")
+	}
+	if runtimeEnv.BarNum != 0 {
+		t.Fatalf("runtime env was not reset: BarNum=%d", runtimeEnv.BarNum)
+	}
+	if otherRuntimeEnv.BarNum != 34 {
+		t.Fatalf("other runtime env was mutated: BarNum=%d", otherRuntimeEnv.BarNum)
+	}
+	if legacyEnv.BarNum != 77 {
+		t.Fatalf("legacy env was mutated: BarNum=%d", legacyEnv.BarNum)
+	}
+	if core.BackTestMode || btime.CurTimeMS != 987654321 {
+		t.Fatalf("legacy globals changed: backtest=%v time=%d", core.BackTestMode, btime.CurTimeMS)
+	}
+}
+
+func TestLegacyFeederSubTfsHandlesExchangeFailure(t *testing.T) {
+	feeder := &Feeder{ExSymbol: &orm.ExSymbol{Exchange: "not-a-real-exchange", Market: banexg.MarketSpot, Symbol: "BTC/USDT"}}
+	if added := feeder.SubTfs([]string{"1m"}, false); added != nil {
+		t.Fatalf("added timeframes = %v, want nil", added)
+	}
+}
+
+func TestFeederSubTfsHandlesEmptyState(t *testing.T) {
+	feeder := &Feeder{deps: &RuntimeDeps{Exchange: &banexg.Exchange{ExgInfo: &banexg.ExgInfo{ID: "test", MarketType: banexg.MarketSpot}}}}
+	if added := feeder.SubTfs(nil, true); len(added) != 0 {
+		t.Fatalf("added timeframes = %v, want empty", added)
+	}
+	if len(feeder.States) != 0 || feeder.hour != nil {
+		t.Fatalf("empty subscription retained state: states=%v hour=%v", feeder.States, feeder.hour)
 	}
 }

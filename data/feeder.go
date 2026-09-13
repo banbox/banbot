@@ -19,7 +19,6 @@ import (
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -129,12 +128,16 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 	} else {
 		exchange = f.deps.exchange()
 		if exchange == nil {
-			log.Warn("runtime exchange is required", zap.String("ex", f.Exchange))
+			f.deps.logger().Warn("runtime exchange is required", zap.String("ex", f.Exchange))
 			return nil
 		}
 	}
 	if err != nil {
-		log.Warn("get exchange fail", zap.String("ex", f.Exchange), zap.Error(err))
+		logger := zap.NewNop()
+		if f.deps != nil {
+			logger = f.deps.logger()
+		}
+		logger.Warn("get exchange fail", zap.String("ex", f.Exchange), zap.Error(err))
 		return nil
 	}
 	adds := make([]string, 0, len(timeFrames))
@@ -172,6 +175,11 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		}
 	}
 	var newStates = utils.ValsOfMap(stateMap)
+	if len(newStates) == 0 {
+		f.States = nil
+		f.hour = nil
+		return adds
+	}
 	// Sort all periods from small to large. The first one must be the least common multiple of all subsequent states, so that all subsequent states can be updated from the first one.
 	// 对所有周期从小到大排序，第一个必须是后续所有states的最小公倍数，以便能从第一个更新后续所有
 	slices.SortFunc(newStates, comparePairTFCache)
@@ -210,11 +218,7 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		// 使用1h及以上周期数据，额外添加1h的loader
 		// 当使用DBSeriesFeeder时，如果最小周期是1h，应将f.hour置为nil
 		if f.hour == nil {
-			if f.deps == nil {
-				f.hour = NewTfSeriesLoaderWithSymbolState(f.symbols, f.ExSymbol, "1h")
-			} else {
-				f.hour = NewTfSeriesLoaderWithRuntimeDeps(f.deps, f.ExSymbol, "1h")
-			}
+			f.hour = newTfSeriesLoader(f.deps, f.symbols, f.ExSymbol, "1h")
 		}
 		f.hour.allowPhysicalRead = consumerTf != ""
 		f.hour.physicalConsumerTimeframe = consumerTf
@@ -259,7 +263,7 @@ bars 原始未复权的K线
 func (f *Feeder) onStateOhlcvs(state *PairTFCache, rows []*orm.DataSeries, lastOk bool) []*orm.DataSeries {
 	finishRows, err := f.onStateOhlcvsWithErr(state, rows, lastOk)
 	if err != nil {
-		log.Error("fire kline callback fail", zap.String("pair", f.Symbol), zap.Error(err))
+		f.deps.logger().Error("fire kline callback fail", zap.String("pair", f.Symbol), zap.Error(err))
 	}
 	return finishRows
 }
@@ -382,7 +386,7 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.Data
 	var err *errs.Error
 	rows, err = enrichStoredKlineFieldsWithRuntimeDepsAndReader(f.deps, f.ExSymbol, timeFrame, rows, f.readKlineFields)
 	if err != nil {
-		log.Error("enrich stored kline fields fail", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Error(err))
+		f.deps.logger().Error("enrich stored kline fields fail", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Error(err))
 		return err
 	}
 	for _, row := range rows {
@@ -425,7 +429,7 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.Data
 		delay := nowMS - (lastTime + tfMSecs)
 		if delay > tfMSecs && tfMSecs >= 60000 {
 			barNum := delay / tfMSecs
-			log.Warn(fmt.Sprintf("%s/%s bar too late, delay %v bars, %v", pair, timeFrame, barNum, lastTime))
+			f.deps.logger().Warn(fmt.Sprintf("%s/%s bar too late, delay %v bars, %v", pair, timeFrame, barNum, lastTime))
 		}
 	}
 	return nil
@@ -697,12 +701,32 @@ func NewSeriesFeederWithSymbolState(symbols *orm.SymbolState, exs *orm.ExSymbol,
 }
 
 // NewSeriesFeederWithRuntimeDeps binds all runtime-owned data dependencies to
-// the feeder. A nil deps pointer keeps the legacy package facade.
+// the feeder. Legacy callers must use NewSeriesFeeder explicitly.
 func NewSeriesFeederWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error) {
 	if deps == nil {
-		return NewSeriesFeeder(exs, callBack, showLog)
+		return nil, errs.NewMsg(core.ErrBadConfig, "series feeder requires explicit runtime dependencies")
+	}
+	if deps.Strategies == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "series feeder requires explicit strategy state")
+	}
+	if err := validateFeederRuntimeIdentity(deps, exs); err != nil {
+		return nil, err
 	}
 	return newSeriesFeeder(deps, deps.Symbols, exs, callBack, showLog)
+}
+
+func validateFeederRuntimeIdentity(deps *RuntimeDeps, exs *orm.ExSymbol) *errs.Error {
+	if exs == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "feeder symbol is required")
+	}
+	exchange, market, err := deps.ResolveIdentity()
+	if err != nil {
+		return errs.New(core.ErrRunTime, err)
+	}
+	if exs.Exchange != exchange || exs.Market != market {
+		return errs.NewMsg(core.ErrBadConfig, "feeder symbol identity %q/%q does not match runtime %q/%q", exs.Exchange, exs.Market, exchange, market)
+	}
+	return nil
 }
 
 func newSeriesFeeder(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error) {
@@ -802,7 +826,7 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 			if f.deps != nil {
 				questDB = f.deps.isQuestDB()
 			}
-			log.Debug("warm tf fetch",
+			f.deps.logger().Debug("warm tf fetch",
 				zap.Bool("questdb", questDB),
 				zap.String("pair", f.Symbol),
 				zap.String("tf", tf),
@@ -856,7 +880,7 @@ Returns the ending timestamp (i.e. the starting timestamp of the next bar)
 func (f *SeriesFeeder) warmTf(tf string, rows []*orm.DataSeries) int64 {
 	lastMS, err := f.warmTfWithErr(tf, rows)
 	if err != nil {
-		log.Error("warm kline callback fail", zap.String("pair", f.Symbol), zap.String("tf", tf), zap.Error(err))
+		f.deps.logger().Error("warm kline callback fail", zap.String("pair", f.Symbol), zap.String("tf", tf), zap.Error(err))
 		return 0
 	}
 	return lastMS
@@ -885,7 +909,7 @@ func (f *SeriesFeeder) warmTfWithErr(tf string, rows []*orm.DataSeries) (int64, 
 	lastMS := rows[len(rows)-1].TimeMS + tfMSecs
 	envKey := strings.Join([]string{f.Symbol, tf}, "_")
 	if f.deps == nil {
-		if env, ok := strat.LegacyState().Env(envKey); ok {
+		if env, ok := strat.GetEnv(envKey); ok {
 			env.Reset()
 		}
 	} else if f.deps.Strategies != nil {
@@ -1226,9 +1250,9 @@ func (f *DBSeriesFeeder) CallNext() {
 			// 重新复权预热
 			_, skips, err := f.WarmTfs(curMS, nil, nil)
 			if err != nil {
-				log.Error("next warm tf fail", zap.Error(err))
+				f.Feeder.deps.logger().Error("next warm tf fail", zap.Error(err))
 			} else if len(skips) > 0 {
-				log.Warn("warm lacks", zap.String("items", StrWarmLacks(skips)))
+				f.Feeder.deps.logger().Warn("warm lacks", zap.String("items", StrWarmLacks(skips)))
 			}
 			f.setAdjIdx()
 		}
@@ -1284,7 +1308,13 @@ func NewDBSeriesFeederWithSymbolState(symbols *orm.SymbolState, exs *orm.ExSymbo
 // runtime's exchange, clock, configuration, and symbol state.
 func NewDBSeriesFeederWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*DBSeriesFeeder, *errs.Error) {
 	if deps == nil {
-		return NewDBSeriesFeeder(exs, callBack, showLog)
+		return nil, errs.NewMsg(core.ErrBadConfig, "historical feeder requires explicit runtime dependencies")
+	}
+	if deps.Strategies == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "historical feeder requires explicit strategy state")
+	}
+	if err := validateFeederRuntimeIdentity(deps, exs); err != nil {
+		return nil, err
 	}
 	return newDBSeriesFeeder(deps, deps.Symbols, exs, callBack, showLog)
 }
@@ -1315,7 +1345,7 @@ func newDBSeriesFeeder(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExS
 	if deps == nil {
 		feeder, err = NewSeriesFeederWithSymbolState(symbols, exs, callBack, showLog)
 	} else {
-		feeder, err = NewSeriesFeederWithRuntimeDeps(deps, exs, callBack, showLog)
+		feeder, err = newSeriesFeeder(deps, symbols, exs, callBack, showLog)
 	}
 	if err != nil {
 		return nil, err
@@ -1369,15 +1399,6 @@ func NewTfSeriesLoader(exs *orm.ExSymbol, tf string) *TfSeriesLoader {
 
 func NewTfSeriesLoaderWithSymbolState(symbols *orm.SymbolState, exs *orm.ExSymbol, tf string) *TfSeriesLoader {
 	return newTfSeriesLoader(nil, symbols, exs, tf)
-}
-
-// NewTfSeriesLoaderWithRuntimeDeps binds the loader to one runtime's clock,
-// mode, and symbol state.
-func NewTfSeriesLoaderWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol, tf string) *TfSeriesLoader {
-	if deps == nil {
-		return NewTfSeriesLoader(exs, tf)
-	}
-	return newTfSeriesLoader(deps, deps.Symbols, exs, tf)
 }
 
 func newTfSeriesLoader(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExSymbol, tf string) *TfSeriesLoader {
@@ -1559,9 +1580,10 @@ func (f *TfSeriesLoader) SetNext() {
 		// QuestDB performs better with fewer, larger range queries than many small ones.
 		batchSize = 20000
 	}
+	withUnFinish := !backtest
 	debugLoad := shouldLogBacktestSeriesDebugWithRuntime(f.deps)
 	if debugLoad {
-		log.Debug("load tf bars request",
+		f.deps.logger().Debug("load tf bars request",
 			zap.Bool("questdb", f.questDB()),
 			zap.String("pair", f.Symbol),
 			zap.String("tf", f.Timeframe),
@@ -1605,17 +1627,17 @@ func (f *TfSeriesLoader) SetNext() {
 			if f.allowPhysicalRead {
 				_, rows, err = sess.GetPhysicalSeriesFieldsForConsumer(f.ExSymbol, f.Timeframe, fields,
 					f.physicalConsumerTimeframe,
-					f.offsetMS, endMS, batchSize, true)
+					f.offsetMS, endMS, batchSize, withUnFinish)
 			} else {
 				_, rows, err = sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields,
-					f.offsetMS, endMS, batchSize, true)
+					f.offsetMS, endMS, batchSize, withUnFinish)
 			}
 			conn.Release()
 		}
 		if err == nil || err.Code != core.ErrDbConnFail || retry == maxSeriesLoadRetries-1 {
 			break
 		}
-		log.Warn("retry loading kline after transient db connection failure",
+		f.deps.logger().Warn("retry loading kline after transient db connection failure",
 			zap.String("pair", f.Symbol), zap.String("tf", f.Timeframe),
 			zap.Int("attempt", retry+1), zap.Error(err))
 		if f.deps == nil {
@@ -1629,7 +1651,7 @@ func (f *TfSeriesLoader) SetNext() {
 		f.offsetMS = max(f.offsetMS, f.nextMS)
 		f.nextMS = math.MaxInt64
 		if debugLoad {
-			log.Debug("load tf bars result",
+			f.deps.logger().Debug("load tf bars result",
 				zap.Bool("questdb", f.questDB()),
 				zap.String("pair", f.Symbol),
 				zap.String("tf", f.Timeframe),
@@ -1637,12 +1659,12 @@ func (f *TfSeriesLoader) SetNext() {
 				zap.Error(err))
 		}
 		if err != nil {
-			log.Error("load series fail", zap.Error(err))
+			f.deps.logger().Error("load series fail", zap.Error(err))
 		}
 		return
 	}
 	if debugLoad {
-		log.Debug("load tf bars result",
+		f.deps.logger().Debug("load tf bars result",
 			zap.Bool("questdb", f.questDB()),
 			zap.String("pair", f.Symbol),
 			zap.String("tf", f.Timeframe),

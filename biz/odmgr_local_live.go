@@ -27,17 +27,13 @@ func InitLocalLiveOrderMgr(callBack FnOdCb, showLog bool) {
 // InitLocalLiveOrderMgrWithRuntimeDeps binds dry-run fills to one Runtime's
 // prices, clock, and exchange. The legacy initializer remains package-scoped.
 func InitLocalLiveOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack FnOdCb, showLog bool) {
+	requireRuntimeDeps(deps)
 	initLocalLiveOrderMgr(&deps, callBack, showLog)
 }
 
 func initLocalLiveOrderMgr(deps *RuntimeDeps, callBack FnOdCb, showLog bool) {
 	if deps != nil {
-		if deps.Orders == nil {
-			deps.Orders = ormo.NewOrderState()
-		}
-		if deps.Trading == nil {
-			deps.Trading = NewTradingState()
-		}
+		requireRuntimeDeps(*deps)
 	}
 	if deps != nil && deps.Trading != nil {
 		for account, cfg := range executionAccountConfigs(deps) {

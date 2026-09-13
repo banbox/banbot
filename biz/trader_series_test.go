@@ -207,15 +207,15 @@ func TestTraderRuntimeUsesOwnedSymbolStateForSIDOnlySeries(t *testing.T) {
 	subKey := strat.DataSubKey("macro", 7, "1d")
 	strat.AccInfoJobs[config.DefAcc][subKey] = map[string]*strat.StratJob{"legacy": newJob()}
 	runtimeStrategies := strat.NewState()
-	runtimeStrategies.InfoJobs(config.DefAcc)[subKey] = map[string]*strat.StratJob{"runtime": newJob()}
+	runtimeStrategies.SetInfoJobMap(config.DefAcc, subKey, map[string]*strat.StratJob{"runtime": newJob()})
 
-	legacy := NewTrader(nil)
+	legacy := Trader{}
 	if err := legacy.FeedDataSeries(&orm.DataSeries{
 		Source: "macro", Sid: 7, TimeFrame: "1d", Values: map[string]any{"signal": 1.0},
 	}); err != nil {
 		t.Fatalf("legacy FeedDataSeries returned error: %v", err)
 	}
-	runtimeTrader := NewTraderWithRuntimeDeps(RuntimeDeps{Symbols: runtimeSymbols, Strategies: runtimeStrategies})
+	runtimeTrader := newCompleteTraderForTest(t, RuntimeDeps{Symbols: runtimeSymbols, Strategies: runtimeStrategies})
 	if err := runtimeTrader.FeedDataSeries(&orm.DataSeries{
 		Source: "macro", Sid: 7, TimeFrame: "1d", Values: map[string]any{"signal": 2.0},
 	}); err != nil {
@@ -236,13 +236,13 @@ func TestTraderRuntimeAccountDispatchUsesOwnedConfig(t *testing.T) {
 	const subKey = "macro:1:1d"
 	strategies := strat.NewState()
 	calls := 0
-	strategies.InfoJobs(account)[subKey] = map[string]*strat.StratJob{
+	strategies.SetInfoJobMap(account, subKey, map[string]*strat.StratJob{
 		"job": {
 			Strat:   &strat.TradeStrat{OnData: func(*strat.StratJob, strat.DataEvent) { calls++ }},
 			DataHub: strat.NewDataHub(),
 		},
-	}
-	trader := NewTraderWithRuntimeDeps(RuntimeDeps{
+	})
+	trader := newCompleteTraderForTest(t, RuntimeDeps{
 		Core:       &core.State{EnvReal: true},
 		Strategies: strategies,
 		Config: config.NewSnapshot(&config.Config{
@@ -278,7 +278,7 @@ func TestTraderTypedSeriesRejectsForeignAndMissingSymbols(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	trader := NewTraderWithRuntimeDeps(RuntimeDeps{Symbols: runtimeSymbols})
+	trader := newCompleteTraderForTest(t, RuntimeDeps{Symbols: runtimeSymbols})
 
 	foreign := &orm.DataSeries{
 		Source: "macro", Sid: 7, TimeFrame: "1d",

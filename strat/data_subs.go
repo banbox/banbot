@@ -168,7 +168,7 @@ func CollectKlineSubFields(sid int32, tf string) []string {
 
 // CollectKlineSubFieldsWithSymbolState collects fields using the supplied symbol state.
 func CollectKlineSubFieldsWithSymbolState(symbols *orm.SymbolState, sid int32, tf string) []string {
-	return LegacyState().CollectKlineSubFields(symbols, sid, tf)
+	return legacyStateView().CollectKlineSubFields(symbols, sid, tf)
 }
 
 // CollectKlineSubFields collects the projection required by jobs owned by
@@ -186,10 +186,10 @@ func (s *State) CollectKlineSubFields(symbols *orm.SymbolState, sid int32, tf st
 	var jobsByAccount map[string]map[string]map[string]*StratJob
 	if s == legacyState {
 		lockInfoJobs.Lock()
-		jobsByAccount = s.AccInfoJobs
+		jobsByAccount = s.accInfoJobs
 	} else {
 		s.infoJobsMu.RLock()
-		jobsByAccount = s.AccInfoJobs
+		jobsByAccount = s.accInfoJobs
 	}
 	hasInfoJobs := false
 	for _, accJobs := range jobsByAccount {

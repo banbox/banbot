@@ -1,6 +1,8 @@
 package orm
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -8,12 +10,98 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 )
+
+type klineSyncTestDB struct {
+	queries int
+}
+
+func (db *klineSyncTestDB) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+
+func (db *klineSyncTestDB) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
+	db.queries++
+	return nil, errors.New("query rejected")
+}
+
+func (*klineSyncTestDB) QueryRow(context.Context, string, ...interface{}) pgx.Row { return nil }
+
+func (*klineSyncTestDB) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
+	return 0, nil
+}
+
+type klineSyncFactoryExchange struct {
+	banexg.BanExchange
+}
+
+func TestSyncKlineTFsWithDepsDeclinedDoesNotQuery(t *testing.T) {
+	called := false
+	err := SyncKlineTFsWithDeps(&config.CmdArgs{}, KlineSyncDeps{
+		ConfirmAll: func(context.Context) (bool, error) {
+			called = true
+			return false, nil
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("declined sync error = %v", err)
+	}
+	if !called {
+		t.Fatal("all-symbol confirmation was not requested")
+	}
+}
+
+func TestSyncKlineTFsWithDepsUnknownPairsDoesNotQueryOrExpandToAll(t *testing.T) {
+	db := &klineSyncTestDB{}
+	factoryCalled := false
+	err := SyncKlineTFsWithDeps(&config.CmdArgs{Pairs: []string{"MISSING/USDT"}}, KlineSyncDeps{
+		Queries: New(db),
+		Symbols: []*ExSymbol{{ID: 1, Exchange: "first", Market: "spot", Symbol: "BTC/USDT"}},
+		ExchangeFactory: func(context.Context, string, string) (banexg.BanExchange, *errs.Error) {
+			factoryCalled = true
+			return &klineSyncFactoryExchange{}, nil
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("unknown pair sync error = %v", err)
+	}
+	if factoryCalled || db.queries != 0 {
+		t.Fatalf("unknown pair sync accessed factory=%t queries=%d", factoryCalled, db.queries)
+	}
+}
+
+func TestSyncKlineTFsWithDepsEnumeratesEveryStoredIdentity(t *testing.T) {
+	db := &klineSyncTestDB{}
+	var calls []string
+	err := SyncKlineTFsWithDeps(&config.CmdArgs{Force: true}, KlineSyncDeps{
+		Queries: New(db),
+		Symbols: []*ExSymbol{
+			{ID: 1, Exchange: "first", Market: "spot", Symbol: "BTC/USDT"},
+			{ID: 2, Exchange: "second", Market: "linear", Symbol: "BTC/USDT:USDT"},
+			{ID: 3, Exchange: "first", Market: "spot", Symbol: "ETH/USDT"},
+		},
+		ExchangeFactory: func(_ context.Context, exchange, market string) (banexg.BanExchange, *errs.Error) {
+			calls = append(calls, exchange+":"+market)
+			return &klineSyncFactoryExchange{}, nil
+		},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "query rejected") {
+		t.Fatalf("sync error = %v, want rejected query after factory enumeration", err)
+	}
+	if !reflect.DeepEqual(calls, []string{"first:spot", "second:linear"}) {
+		t.Fatalf("factory identities = %v, want all stored exchange markets", calls)
+	}
+	if db.queries != 1 {
+		t.Fatalf("database queries = %d, want one FixKInfoZeros query", db.queries)
+	}
+}
 
 func initApp() *errs.Error {
 	var args config.CmdArgs
@@ -30,7 +118,7 @@ func initApp() *errs.Error {
 }
 
 func TestGetKrange(t *testing.T) {
-	t.Skip("integration test (requires database)")
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)

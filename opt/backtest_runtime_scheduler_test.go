@@ -36,7 +36,7 @@ func TestBackTestExplicitRuntimeUsesOneSchedulerWhenMissingDependency(t *testing
 	}
 	defer state.Close()
 
-	trader := biz.NewTraderWithRuntimeDeps(biz.RuntimeDeps{
+	trader := newBacktestTraderForTest(t, biz.RuntimeDeps{
 		Core:   state,
 		Config: config.NewSnapshot(&config.Config{}),
 	})
@@ -66,7 +66,7 @@ func TestBackTestDoesNotOwnSuppliedRuntimeScheduler(t *testing.T) {
 	defer state.Close()
 
 	scheduler := &backtestSchedulerProbe{}
-	trader := biz.NewTraderWithRuntimeDeps(biz.RuntimeDeps{
+	trader := newBacktestTraderForTest(t, biz.RuntimeDeps{
 		Core:      state,
 		Config:    config.NewSnapshot(&config.Config{}),
 		Scheduler: scheduler,

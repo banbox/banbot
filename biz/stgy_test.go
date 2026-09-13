@@ -6,13 +6,13 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	utils2 "github.com/banbox/banexg/utils"
 	ta "github.com/banbox/banta"
-	"os"
 	"strings"
 	"testing"
 )
@@ -33,9 +33,7 @@ func initApp() *errs.Error {
 }
 
 func TestStratRun(t *testing.T) {
-	if os.Getenv("BANBOT_TEST_STRAT_RUN") == "" {
-		t.Skip("set BANBOT_TEST_STRAT_RUN=1 to run integration strategy registry test")
-	}
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)

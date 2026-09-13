@@ -105,9 +105,8 @@ func TestTraderZeroValueBatchStateInitializesOnceConcurrently(t *testing.T) {
 }
 
 func TestTypedBatchAPIsDoNotFallbackToLegacyState(t *testing.T) {
-	tasks, lastMS := strat.BackupLegacyBatchState()
 	strat.LegacyBatchState().Reset()
-	t.Cleanup(func() { strat.RestoreLegacyBatchState(tasks, lastMS) })
+	t.Cleanup(strat.LegacyBatchState().Reset)
 	strategy := &strat.TradeStrat{Name: "typed-nil"}
 	job := batchTestJob(strategy, "BTC/USDT")
 
@@ -128,7 +127,7 @@ func TestRuntimeBatchPathUsesTypedOrderManager(t *testing.T) {
 	state := strat.NewBatchState()
 	manager := &batchRuntimeOrderMgr{}
 	trading := NewTradingState()
-	trading.OrderManagers["typed-account"] = manager
+	trading.SetOrderManager("typed-account", manager)
 	deps := &RuntimeDeps{
 		Orders:         ormo.NewOrderState(),
 		Trading:        trading,
@@ -220,32 +219,13 @@ func TestBatchCallbackCanReenterSameState(t *testing.T) {
 }
 
 func TestLegacyBatchFacadeStillWorks(t *testing.T) {
-	tasks, lastMS := strat.BackupLegacyBatchState()
 	strat.LegacyBatchState().Reset()
-	t.Cleanup(func() { strat.RestoreLegacyBatchState(tasks, lastMS) })
+	t.Cleanup(strat.LegacyBatchState().Reset)
 	var calls int
 	strategy := &strat.TradeStrat{Name: "legacy", OnBatchJobs: func([]*strat.StratJob) { calls++ }}
 	AddBatchJob("default", "1m", batchTestJob(strategy, "BTC/USDT"), nil)
 	TryFireBatches(fireAllBatchMS, true)
 	if calls != 1 || strat.LegacyBatchState().PendingCount() != 0 {
 		t.Fatalf("legacy facade calls=%d pending=%d", calls, strat.LegacyBatchState().PendingCount())
-	}
-}
-
-func TestBackupRestoreVarsPreservesLegacyBatchState(t *testing.T) {
-	original := BackupVars()
-	t.Cleanup(func() { RestoreVars(original) })
-	ResetVars()
-	strategy := &strat.TradeStrat{Name: "backup", OnBatchJobs: func([]*strat.StratJob) {}}
-	AddBatchJob("default", "1m", batchTestJob(strategy, "BTC/USDT"), nil)
-	strat.LegacyBatchState().SetLastBatchMS(42)
-	backup := BackupVars()
-	ResetVars()
-	if strat.LegacyBatchState().PendingCount() != 0 || strat.LegacyBatchState().LastBatchMS() != 0 {
-		t.Fatal("ResetVars did not reset legacy batch state")
-	}
-	RestoreVars(backup)
-	if strat.LegacyBatchState().PendingCount() != 1 || strat.LegacyBatchState().LastBatchMS() != 42 {
-		t.Fatalf("restored legacy batch pending=%d last=%d", strat.LegacyBatchState().PendingCount(), strat.LegacyBatchState().LastBatchMS())
 	}
 }

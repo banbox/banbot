@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -19,6 +20,7 @@ import (
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	ta "github.com/banbox/banta"
+	"github.com/sasha-s/go-deadlock"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
@@ -32,10 +34,10 @@ core.TFSecs
 core.StgPairTfs
 core.BookPairs
 strat.Versions
-strat.Envs
-strat.PairStrats
-strat.AccJobs
-strat.AccInfoJobs
+strat.envs
+strat.pairStrats
+strat.accJobs
+strat.accInfoJobs
 
 	return：pair:timeframe:warmNum, acc:exit orders, error
 */
@@ -91,7 +93,7 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		return nil, nil, errs.NewMsg(errs.CodeParamRequired, "`pairs` and `tfScores` are required for LoadStratJobs")
 	}
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	// Explicit runtimes publish their job registry through immutable snapshots.
@@ -124,8 +126,8 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		return nil, nil, errs.NewMsg(core.ErrBadConfig, "explicit strategy state requires runtime config")
 	}
 	for account := range accounts {
-		strategyState.Jobs(account)
-		strategyState.InfoJobs(account)
+		strategyState.jobsLocked(account)
+		strategyState.infoJobsLocked(account)
 	}
 	if state != nil {
 		state.EnsureRuntimeMaps()
@@ -150,12 +152,12 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 	if strategyState == legacyState {
 		config.ClearRefineMap()
 	}
-	Versions := strategyState.Versions
 	if strategyState == legacyState {
 		resetJobsWithState(strategyState, state, orderStates...)
 	} else {
 		resetJobsWithStateLocked(strategyState, state, orderStates...)
 	}
+	versions := strategyState.versions
 	pairTfWarms := make(Warms)
 	// 记录每个账户下，每个策略的任务数量，防止超过账户要求数量
 	accLimits, maxJobNum := newAccStratLimitsForState(strategyState)
@@ -168,12 +170,12 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		policies = cfg.RunPolicy
 	}
 	for _, pol := range policies {
-		stgy := newStrategyWithState(strategyState, pol)
+		stgy := strategyState.NewStrategy(pol)
 		polID := pol.ID()
 		if stgy == nil {
 			return nil, nil, errs.NewMsg(core.ErrRunTime, "strategy %s load fail", polID)
 		}
-		Versions[stgy.Name] = stgy.Version
+		versions[stgy.Name] = stgy.Version
 		stgyMaxNum := pol.MaxPair
 		if stgyMaxNum == 0 {
 			stgyMaxNum = maxJobNum
@@ -192,8 +194,8 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		// 旧job允许开单的，先添加计数
 		oldAllowOpen := stgy.OrderOnRotation == "open"
 		oldAddPairs := make(map[string]bool)
-		for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, state)) {
-			accJobs := strategyState.AccJobs[acc]
+		for acc := range utils.MapKeys(strategyState.accJobs, strictBacktestFor(strategyState, state)) {
+			accJobs := strategyState.accJobs[acc]
 			codes := make([]string, 0, len(exsList)/2)
 			for _, jobs := range accJobs {
 				if job, ok := jobs[polID]; ok {
@@ -245,10 +247,10 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 				}
 				continue
 			}
-			items, ok := strategyState.PairStrats[exs.Symbol]
+			items, ok := strategyState.pairStrats[exs.Symbol]
 			if !ok {
 				items = make(map[string]*TradeStrat)
-				strategyState.PairStrats[exs.Symbol] = items
+				strategyState.pairStrats[exs.Symbol] = items
 			}
 			if _, ok = items[polID]; ok {
 				// 当前pair+stratID已有任务，跳过
@@ -265,7 +267,7 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 			// Check for proprietary parameters of the current target and reinitialize the strategy
 			// 检查有当前标的专有参数，重新初始化策略
 			if curPol, isDiff := pol.PairDup(exs.Symbol); isDiff {
-				curStgy = newStrategyWithState(strategyState, curPol)
+				curStgy = strategyState.NewStrategy(curPol)
 			}
 			items[polID] = curStgy
 			holdNum += 1
@@ -286,8 +288,8 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 	if cfg := runtimeConfigFor(strategyState); cfg != nil && cfg.PairMgr != nil {
 		holdPosition = cfg.PairMgr.PosOnRotation != "close"
 	}
-	for acc := range utils.MapKeys(strategyState.AccJobs, strict) {
-		jobs := strategyState.AccJobs[acc]
+	for acc := range utils.MapKeys(strategyState.accJobs, strict) {
+		jobs := strategyState.accJobs[acc]
 		exitOds := make([]*ormo.InOutOrder, 0, 4)
 		for envKey := range utils.MapKeys(jobs, strict) {
 			envJobs := jobs[envKey]
@@ -386,8 +388,8 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 	setAdmissionSnapshot(state, newPairs)
 	// 从AccInfoJobs中移除已取消的项
 	lockInfoJobsWrite(strategyState)
-	for acc := range utils.MapKeys(strategyState.AccInfoJobs, strict) {
-		jobMap := strategyState.AccInfoJobs[acc]
+	for acc := range utils.MapKeys(strategyState.accInfoJobs, strict) {
+		jobMap := strategyState.accInfoJobs[acc]
 		newJobMap := make(map[string]map[string]*StratJob)
 		for subKey := range utils.MapKeys(jobMap, strict) {
 			stgMap := jobMap[subKey]
@@ -423,7 +425,7 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 				}
 			}
 		}
-		strategyState.AccInfoJobs[acc] = newJobMap
+		strategyState.accInfoJobs[acc] = newJobMap
 	}
 	unlockInfoJobsWrite(strategyState)
 	// Ensure that all pairs and TFs are recorded in the returned data to prevent them from being removed by the data subscriber
@@ -435,7 +437,7 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 	}
 	// Remove useless items from PairStrats
 	// 从PairStrats中删除无用的项
-	for pair, stgMap := range strategyState.PairStrats {
+	for pair, stgMap := range strategyState.pairStrats {
 		for name := range stgMap {
 			if pairMap, ok := stgPairTfs[name]; ok {
 				if _, ok = pairMap[pair]; ok {
@@ -451,7 +453,7 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		if _, ok := envKeys[envKey]; !ok {
 			strategyState.DeleteEnv(envKey)
 			strategyState.tmpEnvLock.Lock()
-			delete(strategyState.TmpEnvs, envKey)
+			delete(strategyState.tmpEnvs, envKey)
 			strategyState.tmpEnvLock.Unlock()
 		}
 	}
@@ -480,7 +482,7 @@ func ExitStratJobs() {
 // to consult the process-global strategy registries during cleanup.
 func ExitStratJobsWithState(strategyState *State) {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	for _, job := range strategyState.CollectJobs() {
 		if job == nil || job.Strat == nil {
@@ -629,7 +631,7 @@ func initBarEnv(exs *orm.ExSymbol, tf string) *ta.BarEnv {
 
 func initBarEnvWithState(strategyState *State, state *core.State, exs *orm.ExSymbol, tf string) *ta.BarEnv {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
@@ -670,18 +672,18 @@ func initBarEnvWithState(strategyState *State, state *core.State, exs *orm.ExSym
 }
 
 func markStratJob(tf, polID string, exs *orm.ExSymbol, dirt int, accLimits accStratLimits) (int, *errs.Error) {
-	return markStratJobWithState(LegacyState(), tf, polID, exs, dirt, accLimits)
+	return markStratJobWithState(legacyStateView(), tf, polID, exs, dirt, accLimits)
 }
 
 func markStratJobWithState(strategyState *State, tf, polID string, exs *orm.ExSymbol, dirt int, accLimits accStratLimits) (int, *errs.Error) {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
 	newAdd := 0
-	for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, nil)) {
-		jobs := strategyState.AccJobs[acc]
+	for acc := range utils.MapKeys(strategyState.accJobs, strictBacktestFor(strategyState, nil)) {
+		jobs := strategyState.accJobs[acc]
 		envJobs, ok := jobs[envKey]
 		if !ok {
 			// 对于多账户且品种数不一样时，忽略未配置的账户
@@ -715,18 +717,18 @@ func markStratJobWithState(strategyState *State, tf, polID string, exs *orm.ExSy
 
 func ensureStratJob(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarEnv, dirt int,
 	logWarm func(pair, tf string, num int), accLimits accStratLimits) {
-	ensureStratJobWithRuntimeState(LegacyState(), nil, stgy, tf, exs, env, dirt, logWarm, accLimits, nil)
+	ensureStratJobWithRuntimeState(legacyStateView(), nil, stgy, tf, exs, env, dirt, logWarm, accLimits, nil)
 }
 
 func ensureStratJobWithSymbolState(stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarEnv, dirt int,
 	logWarm func(pair, tf string, num int), accLimits accStratLimits, symbols *orm.SymbolState) {
-	ensureStratJobWithRuntimeState(LegacyState(), nil, stgy, tf, exs, env, dirt, logWarm, accLimits, symbols)
+	ensureStratJobWithRuntimeState(legacyStateView(), nil, stgy, tf, exs, env, dirt, logWarm, accLimits, symbols)
 }
 
 func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarEnv, dirt int,
 	logWarm func(pair, tf string, num int), accLimits accStratLimits, symbols *orm.SymbolState) {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	runtimeCore := runtimeCoreFor(strategyState, state)
 	runtimeClock := (*btime.ClockState)(nil)
@@ -749,8 +751,8 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 		core.SetLegacyOrderMatchEnabled(matchTf, true)
 	}
 	envKey := strings.Join([]string{exs.Symbol, tf}, "_")
-	for account := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, state)) {
-		jobs := strategyState.AccJobs[account]
+	for account := range utils.MapKeys(strategyState.accJobs, strictBacktestFor(strategyState, state)) {
+		jobs := strategyState.accJobs[account]
 		envJobs, ok := jobs[envKey]
 		if !ok {
 			envJobs = make(map[string]*StratJob)
@@ -815,7 +817,7 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 				panic(fmt.Sprintf("%s: side-input subscriptions require `OnData`, `OnInfoBar`, or `BatchInfo` + `OnBatchInfos`", stgy.Name))
 			}
 			lockInfoJobsWrite(strategyState)
-			infoJobs := strategyState.InfoJobs(account)
+			infoJobs := strategyState.infoJobsLocked(account)
 			for _, s := range subs {
 				if s == nil || s.ExSymbol == nil {
 					continue
@@ -844,12 +846,12 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 将jobs的MaxOpenLong,MacOpenShort都置为-1，禁止开单，并更新附加订单
 */
 func resetJobs() {
-	resetJobsWithState(LegacyState(), nil)
+	resetJobsWithState(legacyStateView(), nil)
 }
 
 func resetJobsWithState(strategyState *State, state *core.State, orderStates ...*ormo.OrderState) {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	lockJobsWriteForState(strategyState)
@@ -862,11 +864,11 @@ func resetJobsWithState(strategyState *State, state *core.State, orderStates ...
 // wrapper above preserves the public/legacy helper without recursive locking.
 func resetJobsWithStateLocked(strategyState *State, state *core.State, orderStates ...*ormo.OrderState) {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
-	orderState := ormo.LegacyState()
-	if len(orderStates) > 0 && orderStates[0] != nil {
+	var orderState *ormo.OrderState
+	if len(orderStates) > 0 {
 		orderState = orderStates[0]
 	}
 	accounts := runtimeAccountsFor(strategyState)
@@ -876,11 +878,17 @@ func resetJobsWithStateLocked(strategyState *State, state *core.State, orderStat
 		if cfg.NoTrade {
 			continue
 		}
-		openOds, lock := orderState.GetOpenODs(account)
+		var openOds map[int64]*ormo.InOutOrder
+		var lock *deadlock.Mutex
+		if orderState != nil {
+			openOds, lock = orderState.GetOpenODs(account)
+		} else {
+			openOds, lock = ormo.GetOpenODs(account)
+		}
 		lock.Lock()
 		odList := rotationOpenOrderViewWithStrict(openOds, strict)
 		lock.Unlock()
-		accJobs := strategyState.Jobs(account)
+		accJobs := strategyState.jobsLocked(account)
 		for envKey := range utils.MapKeys(accJobs, strict) {
 			jobs := accJobs[envKey]
 			for name := range utils.MapKeys(jobs, strict) {
@@ -933,7 +941,7 @@ func jobHasOutstandingOrders(job *StratJob) bool {
 // can still be routed to the owning strategy instance.
 func FinalizePairRotation(strategyState *State, coreStates ...*core.State) {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	var coreState *core.State
@@ -956,7 +964,7 @@ func FinalizePairRotation(strategyState *State, coreStates ...*core.State) {
 	finalizedPairs := make(map[string]struct{})
 	lockJobsWriteForState(strategyState)
 	defer unlockJobsWriteForState(strategyState)
-	for account, jobs := range strategyState.AccJobs {
+	for account, jobs := range strategyState.accJobs {
 		for envKey, envJobs := range jobs {
 			for name, job := range envJobs {
 				if job == nil || !job.PairRemovalPending() || jobHasOutstandingOrders(job) {
@@ -964,10 +972,10 @@ func FinalizePairRotation(strategyState *State, coreStates ...*core.State) {
 				}
 				delete(envJobs, name)
 				if job.Symbol != nil {
-					if items := strategyState.PairStrats[job.Symbol.Symbol]; items != nil && items[name] == job.Strat {
+					if items := strategyState.pairStrats[job.Symbol.Symbol]; items != nil && items[name] == job.Strat {
 						delete(items, name)
 						if len(items) == 0 {
-							delete(strategyState.PairStrats, job.Symbol.Symbol)
+							delete(strategyState.pairStrats, job.Symbol.Symbol)
 						}
 					}
 					if pairMap := pairTfs[name]; pairMap != nil {
@@ -984,7 +992,7 @@ func FinalizePairRotation(strategyState *State, coreStates ...*core.State) {
 			}
 		}
 		if len(jobs) == 0 {
-			delete(strategyState.AccJobs, account)
+			delete(strategyState.accJobs, account)
 		}
 	}
 	for pair := range finalizedPairs {
@@ -1050,12 +1058,19 @@ func rotationOpenOrderViewWithStrict(orders map[int64]*ormo.InOutOrder, strict b
 }
 
 func regWsJob(j *StratJob) *errs.Error {
-	return regWsJobWithState(LegacyState(), j)
+	return regWsJobWithState(legacyStateView(), j)
+}
+
+// RegisterWsJob adds one job's websocket subscriptions to an explicit state.
+// It is the public registration boundary for runtime-owned fixtures and
+// integrations that already have a fully constructed StratJob.
+func RegisterWsJob(strategyState *State, job *StratJob) *errs.Error {
+	return regWsJobWithState(strategyState, job)
 }
 
 func regWsJobWithState(strategyState *State, j *StratJob) *errs.Error {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	lockJobsWriteForState(strategyState)
@@ -1067,12 +1082,12 @@ func regWsJobWithState(strategyState *State, j *StratJob) *errs.Error {
 // Pair updates already hold that lock across the related job maps, so those
 // callers use this helper to avoid recursive locking.
 func regWsJobLocked(j *StratJob) *errs.Error {
-	return regWsJobLockedWithState(LegacyState(), j)
+	return regWsJobLockedWithState(legacyStateView(), j)
 }
 
 func regWsJobLockedWithState(strategyState *State, j *StratJob) *errs.Error {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	for msgType, subPairs := range j.Strat.WsSubs {
@@ -1088,10 +1103,10 @@ func regWsJobLockedWithState(strategyState *State, j *StratJob) *errs.Error {
 		if msgType == core.WsSubKLine && j.Strat.OnWsKline == nil {
 			continue
 		}
-		pairMap, ok := strategyState.WsSubJobs[msgType]
+		pairMap, ok := strategyState.wsSubJobs[msgType]
 		if !ok {
 			pairMap = make(map[string]map[*StratJob]bool)
-			strategyState.WsSubJobs[msgType] = pairMap
+			strategyState.wsSubJobs[msgType] = pairMap
 		}
 		pairArr := strings.Split(subPairs, ",")
 		for _, pairs := range pairArr {
@@ -1113,12 +1128,12 @@ func regWsJobLockedWithState(strategyState *State, j *StratJob) *errs.Error {
 }
 
 func unRegWsJob(j *StratJob) {
-	unRegWsJobWithState(LegacyState(), j)
+	unRegWsJobWithState(legacyStateView(), j)
 }
 
 func unRegWsJobWithState(strategyState *State, j *StratJob) {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	lockJobsWriteForState(strategyState)
@@ -1134,17 +1149,17 @@ func unRegWsJobWithState(strategyState *State, j *StratJob) {
 // held. It returns the pairs that should be passed to the compatibility
 // unwatch callback after the lock is released.
 func unRegWsJobLocked(j *StratJob) {
-	unRegWsJobLockedWithState(LegacyState(), j)
+	unRegWsJobLockedWithState(legacyStateView(), j)
 }
 
 func unRegWsJobLockedWithState(strategyState *State, j *StratJob) map[string][]string {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	unwatches := make(map[string][]string)
 	for msgType, subPairs := range j.Strat.WsSubs {
-		pairMap, ok := strategyState.WsSubJobs[msgType]
+		pairMap, ok := strategyState.wsSubJobs[msgType]
 		if !ok {
 			continue
 		}
@@ -1169,6 +1184,7 @@ func unRegWsJobLockedWithState(strategyState *State, j *StratJob) map[string][]s
 }
 
 var polFilters = make(map[string][]goods.IFilter)
+var polFiltersMu sync.Mutex
 
 func strategyStorage(symbols *orm.SymbolState) *orm.Storage {
 	if symbols == nil {
@@ -1271,15 +1287,18 @@ func getPolicyPairsWithRuntimeState(state *core.State, symbols *orm.SymbolState,
 		// Filter based on filters
 		// 根据filters过滤筛选
 		polID := pol.ID()
+		polFiltersMu.Lock()
 		filters, ok := polFilters[polID]
 		var err *errs.Error
 		if !ok {
 			filters, err = goods.GetPairFilters(pol.Filters, false)
 			if err != nil {
+				polFiltersMu.Unlock()
 				return nil, err
 			}
 			polFilters[polID] = filters
 		}
+		polFiltersMu.Unlock()
 		curMS := btime.TimeMS()
 		for _, flt := range filters {
 			if stateFilter, ok := flt.(goods.SymbolStateFilter); ok && (state != nil || symbols != nil || exchange != nil) {
@@ -1320,7 +1339,7 @@ func NewListStratsCommand() *cobra.Command {
 }
 
 func listStrats(prefix string) error {
-	arr := utils.KeysOfMap(StratMake)
+	arr := utils.KeysOfMap(snapshotStratFactories())
 	if prefix != "" {
 		filtered := make([]string, 0, len(arr))
 		for _, code := range arr {

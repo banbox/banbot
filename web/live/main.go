@@ -7,7 +7,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/banbox/banbot/legacygate"
+	"github.com/banbox/banbot/biz"
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/data"
 	"github.com/banbox/banexg/utils"
 
 	"github.com/banbox/banbot/config"
@@ -27,12 +29,11 @@ type ServerLifecycle interface {
 
 type apiServer struct {
 	app            *fiber.App
+	hub            *base.WsHub
 	done           chan struct{}
 	shutdownDone   chan struct{}
 	stopOnce       sync.Once
 	shutdownFinish sync.Once
-	gateRelease    sync.Once
-	releaseGate    func()
 	stateMu        sync.Mutex
 	listenFinished bool
 	shutdownStart  bool
@@ -45,8 +46,10 @@ func (s *apiServer) Stop() {
 	if s == nil {
 		return
 	}
-	s.releaseLegacyGate()
 	s.stopOnce.Do(func() {
+		if s.hub != nil {
+			s.hub.Close()
+		}
 		s.stateMu.Lock()
 		if s.listenFinished {
 			s.stateMu.Unlock()
@@ -66,23 +69,25 @@ func (s *apiServer) Stop() {
 
 func (s *apiServer) Join() {
 	if s != nil {
-		defer s.releaseLegacyGate()
 		<-s.done
 		<-s.shutdownDone
+		if s.hub != nil {
+			s.hub.Join()
+		}
 	}
 }
 
-func newAPIServer(app *fiber.App, listen func() error, releaseGate ...func()) *apiServer {
+func newAPIServer(app *fiber.App, listen func() error) *apiServer {
+	return newAPIServerWithHub(app, listen, nil)
+}
+func newAPIServerWithHub(app *fiber.App, listen func() error, hub *base.WsHub) *apiServer {
 	server := &apiServer{
 		app:          app,
+		hub:          hub,
 		done:         make(chan struct{}),
 		shutdownDone: make(chan struct{}),
 	}
-	if len(releaseGate) > 0 {
-		server.releaseGate = releaseGate[0]
-	}
 	go func() {
-		defer server.releaseLegacyGate()
 		defer close(server.done)
 		if err := listen(); err != nil && !isShutdownError(err) {
 			log.Error("run api fail", zap.Error(err))
@@ -92,6 +97,9 @@ func newAPIServer(app *fiber.App, listen func() error, releaseGate ...func()) *a
 		shutdownStarted := server.shutdownStart
 		server.stateMu.Unlock()
 		if !shutdownStarted {
+			if server.hub != nil {
+				server.hub.Close()
+			}
 			server.finishShutdown()
 		}
 	}()
@@ -105,41 +113,46 @@ func (s *apiServer) finishShutdown() {
 	s.shutdownFinish.Do(func() { close(s.shutdownDone) })
 }
 
-func (s *apiServer) releaseLegacyGate() {
-	if s == nil {
-		return
-	}
-	s.gateRelease.Do(func() {
-		if s.releaseGate != nil {
-			s.releaseGate()
-		}
-	})
-}
-
 func isShutdownError(err error) bool {
 	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection")
 }
 
-func StartApiWithLifecycle(lifecycle ServerLifecycle) (*apiServer, *errs.Error) {
-	unlock := legacygate.Lock()
-	server, err := startApiWithLifecycle(lifecycle, unlock)
-	if err != nil || server == nil {
-		unlock()
-	}
-	return server, err
+// StartApiWithRuntimeDeps starts an API server whose routes use one explicit
+// runtime.
+func StartApiWithRuntimeDeps(lifecycle ServerLifecycle, deps biz.RuntimeDeps) (*apiServer, *errs.Error) {
+	return startApiWithDeps(lifecycle, &deps)
 }
 
-// StartApiWithLifecycleInLegacySession starts the API while the caller already
-// owns legacygate. The caller keeps that session alive for the server lifetime.
-func StartApiWithLifecycleInLegacySession(lifecycle ServerLifecycle) (*apiServer, *errs.Error) {
-	return startApiWithLifecycle(lifecycle)
-}
-
-func startApiWithLifecycle(lifecycle ServerLifecycle, releaseGate ...func()) (*apiServer, *errs.Error) {
+func startApiWithLifecycle(lifecycle ServerLifecycle) (*apiServer, *errs.Error) {
 	cfg := config.APIServer
 	if cfg == nil || !cfg.Enable {
 		return nil, nil
 	}
+	return startAPIServer(lifecycle, cfg, nil)
+}
+
+func startApiWithDeps(lifecycle ServerLifecycle, deps *biz.RuntimeDeps) (*apiServer, *errs.Error) {
+	if deps == nil || deps.ConfigView() == nil {
+		return nil, errs.NewMsg(errs.CodeParamRequired, "runtime configuration is required")
+	}
+	cfg := deps.ConfigView().APIServer
+	if cfg == nil || !cfg.Enable {
+		return nil, nil
+	}
+	if err := validateAPIRuntimeDeps(deps); err != nil {
+		return nil, err
+	}
+	return startAPIServer(lifecycle, cfg, deps)
+}
+
+func validateAPIRuntimeDeps(deps *biz.RuntimeDeps) *errs.Error {
+	if deps == nil || deps.Core == nil || deps.Clock == nil || deps.Symbols == nil || deps.Storage == nil || deps.Catalog == nil || deps.Exchange == nil || deps.Strategies == nil || deps.Orders == nil || deps.Trading == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime api requires core, clock, symbols, storage, catalog, exchange, strategies, orders, and trading state")
+	}
+	return nil
+}
+
+func startAPIServer(lifecycle ServerLifecycle, cfg *config.APIServerConfig, deps *biz.RuntimeDeps) (*apiServer, *errs.Error) {
 	app := fiber.New(fiber.Config{
 		AppName:      "banbot",
 		ErrorHandler: base.ErrHandler,
@@ -155,21 +168,52 @@ func startApiWithLifecycle(lifecycle ServerLifecycle, releaseGate ...func()) (*a
 	}))
 
 	// register routes 注册路由
-	base.RegApiKline(app.Group("/api/kline"))
-	base.RegApiCsv(app.Group("/api/kline"))
-	base.RegApiWebsocket(app.Group("/api/ws"))
-	regApiBiz(app.Group("/api/bot", AuthMiddleware(cfg.JWTSecretKey)))
-	regApiPub(app.Group("/api"))
+	if deps == nil {
+		base.RegApiKline(app.Group("/api/kline"))
+		base.RegApiCsv(app.Group("/api/kline"))
+	} else {
+		base.RegApiKlineWithRuntimeDeps(app.Group("/api/kline"), *deps.DataDeps())
+		dataDir := deps.Config.DataDir
+		base.RegApiCsvAt(app.Group("/api/kline"), dataDir)
+	}
+	var hub *base.WsHub
+	if deps == nil {
+		base.RegApiWebsocket(app.Group("/api/ws"))
+	} else {
+		hub = base.NewWsHub(deps.DataDeps())
+		base.RegApiWebsocketWithHub(app.Group("/api/ws"), hub)
+	}
+	if deps == nil {
+		regApiBiz(app.Group("/api/bot", AuthMiddleware(cfg.JWTSecretKey)))
+		regApiPub(app.Group("/api"))
+	} else {
+		handlers := newAPIHandlers(deps)
+		handlers.regApiBiz(app.Group("/api/bot", handlers.authMiddleware(cfg.JWTSecretKey)))
+		handlers.regApiPub(app.Group("/api"))
+	}
 
 	// 添加静态文件服务
-	err_ := ui.ServeStatic(app)
+	var err_ error
+	if deps == nil {
+		err_ = ui.ServeStatic(app)
+	} else {
+		sysLang := ""
+		if deps.Core != nil {
+			sysLang = deps.Core.SysLang
+		}
+		err_ = ui.ServeStaticAt(app, deps.Config.DataDir, sysLang)
+	}
 	if err_ != nil {
+		if hub != nil {
+			hub.Close()
+			hub.Join()
+		}
 		return nil, errs.New(errs.CodeRunTime, err_)
 	}
 
 	addr := fmt.Sprintf("%s:%v", cfg.BindIPAddr, cfg.Port)
 	log.Info("serve bot api at", zap.String("addr", addr))
-	server := newAPIServer(app, func() error { return app.Listen(addr) })
+	server := newAPIServerWithHub(app, func() error { return app.Listen(addr) }, hub)
 	if lifecycle != nil {
 		lifecycle.OnClose(server.Stop)
 		lifecycle.OnCloseWait(server.Join)
@@ -177,23 +221,19 @@ func startApiWithLifecycle(lifecycle ServerLifecycle, releaseGate ...func()) (*a
 	return server, nil
 }
 
-// StartApiInLegacySession starts the legacy API while the caller already owns
-// legacygate. Legacy entrypoints use this form because legacygate is not
-// re-entrant; the caller keeps the session alive for the server lifetime.
-func StartApiInLegacySession() *errs.Error {
-	_, err := startApiWithLifecycle(nil)
-	return err
-}
-
 func StartApi() *errs.Error {
-	unlock := legacygate.Lock()
-	server, err := startApiWithLifecycle(nil, unlock)
+	server, err := startApiWithLifecycle(nil)
 	if err != nil || server == nil {
-		unlock()
 		return err
 	}
 	go func() {
 		server.Join()
 	}()
 	return nil
+}
+
+func (s *apiServer) PublishSeries(msg *data.SeriesMsg) {
+	if s != nil && s.hub != nil {
+		s.hub.Publish(msg)
+	}
 }

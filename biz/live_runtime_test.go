@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/orm/ormo"
 )
 
 func TestRuntimeFatalStopUsesRuntimeClockWhenNowIsNil(t *testing.T) {
@@ -34,5 +35,25 @@ func TestRuntimeFatalStopUsesRuntimeClockWhenNowIsNil(t *testing.T) {
 	explicit := func() int64 { return 303 }
 	if got := runtimeFatalStopClock(RuntimeDeps{Clock: firstClock}, explicit)(); got != 303 {
 		t.Fatalf("explicit now function = %d, want 303", got)
+	}
+}
+
+func TestCalcRuntimeFatalLossUsesWindowBoundedByRuntimeStart(t *testing.T) {
+	wallet := &BanWallets{Items: map[string]*ItemWallet{
+		"USDT": {Coin: "USDT", Available: 100},
+	}}
+	const nowMS int64 = 3_600_000
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{EnterAt: nowMS - 30*60_000, Profit: -100}},
+		{IOrder: &ormo.IOrder{EnterAt: nowMS - 2*60_000, Profit: -10}},
+	}
+	if got := calcRuntimeFatalLoss(wallet, orders, 5, nowMS, 0); got <= 0 || got >= 0.1 {
+		t.Fatalf("five-minute loss rate = %v, want only recent loss", got)
+	}
+	if got := calcRuntimeFatalLoss(wallet, orders, 60, nowMS, 0); got <= 0.5 {
+		t.Fatalf("sixty-minute loss rate = %v, want both losses", got)
+	}
+	if got := calcRuntimeFatalLoss(wallet, orders, 60, nowMS, nowMS-10*60_000); got <= 0 || got >= 0.1 {
+		t.Fatalf("runtime-start bounded loss rate = %v, want only post-start loss", got)
 	}
 }

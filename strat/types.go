@@ -168,6 +168,24 @@ func (s *StratJob) BindRuntimeMarket(prices *com.PriceState, clock *btime.ClockS
 	s.runtimeClock = clock
 }
 
+// BindRuntimeState attaches the explicit state used by strategy callbacks.
+func (s *StratJob) BindRuntimeState(state *State, coreState *core.State, clock *btime.ClockState) {
+	if s == nil {
+		return
+	}
+	s.strategyState = state
+	s.runtimeCore = coreState
+	s.runtimeClock = clock
+}
+
+// OpenOrdersSnapshot returns this job account's runtime-owned order view.
+func (s *StratJob) OpenOrdersSnapshot() ([]*ormo.InOutOrder, bool) {
+	if s == nil || s.strategyState == nil {
+		return nil, false
+	}
+	return s.strategyState.OpenOrdersSnapshot(s.Account)
+}
+
 // NewInspectionJob creates the inert job state passed to startup-time
 // callbacks while keeping the effect hook outside strategy-facing fields.
 func NewInspectionJob(strategy *TradeStrat, env *ta.BarEnv, symbol *orm.ExSymbol, tf, account string, effect func(string)) *StratJob {

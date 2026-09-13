@@ -3,6 +3,7 @@ package strat
 import (
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,11 +15,10 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/goods"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
-	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	ta "github.com/banbox/banta"
-	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 )
 
@@ -27,6 +27,7 @@ import (
 // layer or an allocation. Callers own lifecycle synchronization for those
 // registries; callback and cache helpers protect their own mutations.
 type State struct {
+	runtimeBindMu sync.Mutex
 	// Runtime-owned dependencies are bound once at construction. They are
 	// concrete pointers so strategy/data hot paths do not perform dynamic
 	// lookups or use process-wide configuration.
@@ -37,18 +38,19 @@ type State struct {
 	// It is separate from Config because StakePctAmt changes while a run is live.
 	runtimeAccounts   map[string]*config.AccountConfig
 	runtimeAccountsMu *sync.RWMutex
+	runtimeOrders     *ormo.OrderState
 	Symbols           *orm.SymbolState
 	Exchange          banexg.BanExchange
 	factories         map[string]FuncMakeStrat
 
-	Versions    map[string]int
-	Envs        map[string]*ta.BarEnv
-	TmpEnvs     map[string]*ta.BarEnv
-	AccJobs     map[string]map[string]map[string]*StratJob
-	AccInfoJobs map[string]map[string]map[string]*StratJob
-	PairStrats  map[string]map[string]*TradeStrat
-	ForbidJobs  map[string]map[string]bool
-	WsSubJobs   map[string]map[string]map[*StratJob]bool
+	versions    map[string]int
+	envs        map[string]*ta.BarEnv
+	tmpEnvs     map[string]*ta.BarEnv
+	accJobs     map[string]map[string]map[string]*StratJob
+	accInfoJobs map[string]map[string]map[string]*StratJob
+	pairStrats  map[string]map[string]*TradeStrat
+	forbidJobs  map[string]map[string]bool
+	wsSubJobs   map[string]map[string]map[*StratJob]bool
 
 	AccOdSubs     map[string][]FnOdChange
 	AccFailOpens  map[string]map[string]int
@@ -62,7 +64,7 @@ type State struct {
 	tmpEnvLock    sync.Mutex
 	envMu         sync.RWMutex
 	wsUnwatchMu   sync.RWMutex
-	jobsMu        deadlock.RWMutex
+	jobsMu        sync.RWMutex
 	infoJobsMu    sync.RWMutex
 	policyMu      sync.Mutex
 	policyFilters map[string][]goods.IFilter
@@ -83,14 +85,14 @@ type State struct {
 func NewState() *State {
 	return &State{
 		factories:     snapshotStratFactories(),
-		Versions:      make(map[string]int),
-		Envs:          make(map[string]*ta.BarEnv),
-		TmpEnvs:       make(map[string]*ta.BarEnv),
-		AccJobs:       make(map[string]map[string]map[string]*StratJob),
-		AccInfoJobs:   make(map[string]map[string]map[string]*StratJob),
-		PairStrats:    make(map[string]map[string]*TradeStrat),
-		ForbidJobs:    make(map[string]map[string]bool),
-		WsSubJobs:     make(map[string]map[string]map[*StratJob]bool),
+		versions:      make(map[string]int),
+		envs:          make(map[string]*ta.BarEnv),
+		tmpEnvs:       make(map[string]*ta.BarEnv),
+		accJobs:       make(map[string]map[string]map[string]*StratJob),
+		accInfoJobs:   make(map[string]map[string]map[string]*StratJob),
+		pairStrats:    make(map[string]map[string]*TradeStrat),
+		forbidJobs:    make(map[string]map[string]bool),
+		wsSubJobs:     make(map[string]map[string]map[*StratJob]bool),
 		AccOdSubs:     make(map[string][]FnOdChange),
 		AccFailOpens:  make(map[string]map[string]int),
 		cacheStrats:   make(map[string]*TradeStrat),
@@ -133,6 +135,130 @@ func (s *State) BindRuntimeAccountsLock(lock *sync.RWMutex) {
 		return
 	}
 	s.runtimeAccountsMu = lock
+}
+
+// BindRuntimeOrders attaches the order state owned by this strategy runtime.
+func (s *State) BindRuntimeOrders(orders *ormo.OrderState) {
+	if s != nil {
+		s.runtimeOrders = orders
+	}
+}
+
+// CanBindRuntime reports whether this state is unbound or already belongs to
+// the supplied runtime. It is used only during construction to prevent a
+// state from being silently rebound across concurrent runtimes.
+func (s *State) CanBindRuntime(coreState *core.State, clock *btime.ClockState, cfg *config.Config,
+	symbols *orm.SymbolState, exchange banexg.BanExchange, accountsMu *sync.RWMutex, orders *ormo.OrderState) bool {
+	if s == nil {
+		return false
+	}
+	s.runtimeBindMu.Lock()
+	defer s.runtimeBindMu.Unlock()
+	return (s.Core == nil || s.Core == coreState) &&
+		(s.Clock == nil || s.Clock == clock) &&
+		(s.Config == nil || s.Config == cfg) &&
+		(s.Symbols == nil || s.Symbols == symbols) &&
+		(s.Exchange == nil || sameRuntimeExchange(s.Exchange, exchange)) &&
+		(s.runtimeAccountsMu == nil || s.runtimeAccountsMu == accountsMu) &&
+		(s.runtimeOrders == nil || s.runtimeOrders == orders)
+}
+
+// RuntimeBindingsMatch reports whether this state has already been bound by
+// the composition root to exactly these runtime services. It intentionally
+// does not mutate state: consumers such as biz.Trader must not race the root
+// by attempting a second bind.
+func (s *State) RuntimeBindingsMatch(coreState *core.State, clock *btime.ClockState, cfg *config.Config,
+	symbols *orm.SymbolState, exchange banexg.BanExchange, accountsMu *sync.RWMutex, orders *ormo.OrderState) bool {
+	if s == nil {
+		return false
+	}
+	s.runtimeBindMu.Lock()
+	defer s.runtimeBindMu.Unlock()
+	return s.Core == coreState && s.Clock == clock && s.Config == cfg &&
+		s.Symbols == symbols && sameRuntimeExchange(s.Exchange, exchange) &&
+		s.runtimeAccountsMu == accountsMu && s.runtimeOrders == orders
+}
+
+// BindRuntimeOnce claims an unbound strategy state for one runtime. The
+// composition root calls it before publishing the state; another root cannot
+// overwrite the claim during that construction window.
+func (s *State) BindRuntimeOnce(coreState *core.State, clock *btime.ClockState, cfg *config.Config,
+	symbols *orm.SymbolState, exchange banexg.BanExchange, accounts map[string]*config.AccountConfig,
+	accountsMu *sync.RWMutex, orders *ormo.OrderState) bool {
+	if s == nil {
+		return false
+	}
+	s.runtimeBindMu.Lock()
+	defer s.runtimeBindMu.Unlock()
+	if s.Core != nil || s.Clock != nil || s.Config != nil || s.Symbols != nil || s.Exchange != nil ||
+		s.runtimeAccounts != nil || s.runtimeAccountsMu != nil || s.runtimeOrders != nil {
+		return s.Core == coreState && s.Clock == clock && s.Config == cfg && s.Symbols == symbols &&
+			sameRuntimeExchange(s.Exchange, exchange) && sameRuntimeAccounts(s.runtimeAccounts, accounts) &&
+			s.runtimeAccountsMu == accountsMu && s.runtimeOrders == orders
+	}
+	s.Core = coreState
+	s.Clock = clock
+	s.Config = cfg
+	s.Symbols = symbols
+	s.Exchange = exchange
+	s.runtimeAccounts = accounts
+	s.runtimeAccountsMu = accountsMu
+	s.runtimeOrders = orders
+	return true
+}
+
+func sameRuntimeAccounts(left, right map[string]*config.AccountConfig) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return reflect.ValueOf(left).Pointer() == reflect.ValueOf(right).Pointer()
+}
+
+// OpenOrdersSnapshot returns a cloned account-scoped order view when the
+// runtime can establish that the view is authoritative. Backtests own their
+// in-memory state; live runtimes require a successful account sync marker.
+func (s *State) OpenOrdersSnapshot(account string) ([]*ormo.InOutOrder, bool) {
+	if s == nil || s == legacyState || s.runtimeOrders == nil || s.Core == nil || account == "" {
+		return nil, false
+	}
+	if !s.Core.BackTestMode && s.runtimeOrders.GetSyncStamp(account) <= 0 {
+		return nil, false
+	}
+	orders, lock := s.runtimeOrders.GetOpenODs(account)
+	lock.Lock()
+	defer lock.Unlock()
+	result := make([]*ormo.InOutOrder, 0, len(orders))
+	for _, order := range orders {
+		if order != nil {
+			result = append(result, order.Clone())
+		}
+	}
+	return result, true
+}
+
+func sameRuntimeExchange(left, right banexg.BanExchange) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftType := reflect.TypeOf(left)
+	if leftType != reflect.TypeOf(right) || !leftType.Comparable() {
+		return false
+	}
+	return left == right
+}
+
+// SetForbidJobs replaces the runtime's strategy admission rules. The caller
+// owns the supplied map for the lifetime of this state.
+func (s *State) SetForbidJobs(forbidJobs map[string]map[string]bool) {
+	if s == nil {
+		return
+	}
+	lockJobsWriteForState(s)
+	s.forbidJobs = forbidJobs
+	if s.forbidJobs == nil {
+		s.forbidJobs = make(map[string]map[string]bool)
+	}
+	unlockJobsWriteForState(s)
 }
 
 func runtimeConfigFor(state *State) *config.Config {
@@ -347,29 +473,29 @@ func (s *State) ensureMaps() {
 	if s == nil {
 		return
 	}
-	if s.Versions == nil {
-		s.Versions = make(map[string]int)
+	if s.versions == nil {
+		s.versions = make(map[string]int)
 	}
-	if s.Envs == nil {
-		s.Envs = make(map[string]*ta.BarEnv)
+	if s.envs == nil {
+		s.envs = make(map[string]*ta.BarEnv)
 	}
-	if s.TmpEnvs == nil {
-		s.TmpEnvs = make(map[string]*ta.BarEnv)
+	if s.tmpEnvs == nil {
+		s.tmpEnvs = make(map[string]*ta.BarEnv)
 	}
-	if s.AccJobs == nil {
-		s.AccJobs = make(map[string]map[string]map[string]*StratJob)
+	if s.accJobs == nil {
+		s.accJobs = make(map[string]map[string]map[string]*StratJob)
 	}
-	if s.AccInfoJobs == nil {
-		s.AccInfoJobs = make(map[string]map[string]map[string]*StratJob)
+	if s.accInfoJobs == nil {
+		s.accInfoJobs = make(map[string]map[string]map[string]*StratJob)
 	}
-	if s.PairStrats == nil {
-		s.PairStrats = make(map[string]map[string]*TradeStrat)
+	if s.pairStrats == nil {
+		s.pairStrats = make(map[string]map[string]*TradeStrat)
 	}
-	if s.ForbidJobs == nil {
-		s.ForbidJobs = make(map[string]map[string]bool)
+	if s.forbidJobs == nil {
+		s.forbidJobs = make(map[string]map[string]bool)
 	}
-	if s.WsSubJobs == nil {
-		s.WsSubJobs = make(map[string]map[string]map[*StratJob]bool)
+	if s.wsSubJobs == nil {
+		s.wsSubJobs = make(map[string]map[string]map[*StratJob]bool)
 	}
 	if s.AccOdSubs == nil {
 		s.AccOdSubs = make(map[string][]FnOdChange)
@@ -394,14 +520,14 @@ func (s *State) ensureMaps() {
 // legacyState is a typed view over the package globals. The globals remain
 // the compatibility facade used by existing callers.
 var legacyState = &State{
-	Versions:     Versions,
-	Envs:         Envs,
-	TmpEnvs:      TmpEnvs,
-	AccJobs:      AccJobs,
-	AccInfoJobs:  AccInfoJobs,
-	PairStrats:   PairStrats,
-	ForbidJobs:   ForbidJobs,
-	WsSubJobs:    WsSubJobs,
+	versions:     Versions,
+	envs:         Envs,
+	tmpEnvs:      TmpEnvs,
+	accJobs:      AccJobs,
+	accInfoJobs:  AccInfoJobs,
+	pairStrats:   PairStrats,
+	forbidJobs:   ForbidJobs,
+	wsSubJobs:    WsSubJobs,
 	AccOdSubs:    accOdSubs,
 	AccFailOpens: accFailOpens,
 	WsSubUnWatch: WsSubUnWatch,
@@ -409,24 +535,24 @@ var legacyState = &State{
 }
 
 // IsLegacyState reports whether state is the package compatibility view.
-// Unlike LegacyState, this predicate has no side effects and is safe to use
+// The predicate has no side effects and is safe to use
 // from explicit runtimes that may run concurrently with legacy callers.
 func IsLegacyState(state *State) bool {
 	return state == legacyState
 }
 
-// LegacyState returns the typed view of the current package-level state.
+// legacyStateView returns the typed view of the current package-level state.
 // Refreshing the fields preserves compatibility with callers that rebind the
 // legacy maps during a serial run or test.
-func LegacyState() *State {
-	legacyState.Versions = Versions
-	legacyState.Envs = Envs
-	legacyState.TmpEnvs = TmpEnvs
-	legacyState.AccJobs = AccJobs
-	legacyState.AccInfoJobs = AccInfoJobs
-	legacyState.PairStrats = PairStrats
-	legacyState.ForbidJobs = ForbidJobs
-	legacyState.WsSubJobs = WsSubJobs
+func legacyStateView() *State {
+	legacyState.versions = Versions
+	legacyState.envs = Envs
+	legacyState.tmpEnvs = TmpEnvs
+	legacyState.accJobs = AccJobs
+	legacyState.accInfoJobs = AccInfoJobs
+	legacyState.pairStrats = PairStrats
+	legacyState.forbidJobs = ForbidJobs
+	legacyState.wsSubJobs = WsSubJobs
 	legacyState.AccOdSubs = accOdSubs
 	legacyState.AccFailOpens = accFailOpens
 	legacyState.WsSubUnWatch = WsSubUnWatch
@@ -442,21 +568,21 @@ func (s *State) Reset() {
 		return
 	}
 	lockJobsWriteForState(s)
-	s.Versions = make(map[string]int)
-	s.AccJobs = make(map[string]map[string]map[string]*StratJob)
-	s.PairStrats = make(map[string]map[string]*TradeStrat)
-	s.ForbidJobs = make(map[string]map[string]bool)
-	s.WsSubJobs = make(map[string]map[string]map[*StratJob]bool)
+	s.versions = make(map[string]int)
+	s.accJobs = make(map[string]map[string]map[string]*StratJob)
+	s.pairStrats = make(map[string]map[string]*TradeStrat)
+	s.forbidJobs = make(map[string]map[string]bool)
+	s.wsSubJobs = make(map[string]map[string]map[*StratJob]bool)
 	unlockJobsWriteForState(s)
 	s.envMu.Lock()
-	s.Envs = make(map[string]*ta.BarEnv)
+	s.envs = make(map[string]*ta.BarEnv)
 	s.envMu.Unlock()
 	s.tmpEnvLock.Lock()
-	s.TmpEnvs = make(map[string]*ta.BarEnv)
+	s.tmpEnvs = make(map[string]*ta.BarEnv)
 	s.tmpEnvLock.Unlock()
 
 	lockInfoJobsWrite(s)
-	s.AccInfoJobs = make(map[string]map[string]map[string]*StratJob)
+	s.accInfoJobs = make(map[string]map[string]map[string]*StratJob)
 	if s != legacyState {
 		s.infoSnapshotDirty.Store(true)
 	}
@@ -485,14 +611,14 @@ func (s *State) Reset() {
 	s.pairHooksMu.Unlock()
 
 	if s == legacyState {
-		Versions = s.Versions
-		Envs = s.Envs
-		TmpEnvs = s.TmpEnvs
-		AccJobs = s.AccJobs
-		AccInfoJobs = s.AccInfoJobs
-		PairStrats = s.PairStrats
-		ForbidJobs = s.ForbidJobs
-		WsSubJobs = s.WsSubJobs
+		Versions = s.versions
+		Envs = s.envs
+		TmpEnvs = s.tmpEnvs
+		AccJobs = s.accJobs
+		AccInfoJobs = s.accInfoJobs
+		PairStrats = s.pairStrats
+		ForbidJobs = s.forbidJobs
+		WsSubJobs = s.wsSubJobs
 		accOdSubs = s.AccOdSubs
 		accFailOpens = s.AccFailOpens
 		WsSubUnWatch = s.WsSubUnWatch
@@ -578,7 +704,7 @@ func (s *State) Get(pair, stratID string) *TradeStrat {
 	if s == legacyState {
 		lockJobsReadForState(s)
 		defer unlockJobsReadForState(s)
-		return s.PairStrats[pair][stratID]
+		return s.pairStrats[pair][stratID]
 	}
 	strategies := s.PairStrategiesView()[pair]
 	return strategies[stratID]
@@ -686,10 +812,10 @@ func (s *State) SetCachedStrategy(key string, stgy *TradeStrat) {
 	s.cacheMu.Unlock()
 }
 
-// newStrategyWithState keeps explicit runtimes out of the package-level
-// strategy cache. The legacy facade continues to use New, while each typed
-// state owns its strategy object and its mutable policy/slice fields.
-func newStrategyWithState(state *State, pol *config.RunPolicyConfig) *TradeStrat {
+// NewStrategy keeps explicit runtimes out of the package-level strategy cache.
+// The legacy facade continues to use New, while each typed state owns its
+// strategy object and its mutable policy/slice fields.
+func (state *State) NewStrategy(pol *config.RunPolicyConfig) *TradeStrat {
 	if state == nil || state == legacyState {
 		return New(pol)
 	}
@@ -737,7 +863,7 @@ func newStrategyWithState(state *State, pol *config.RunPolicyConfig) *TradeStrat
 			if slRate > 0 {
 				stgy.StopLoss = slRate
 			} else if slRate < 0 {
-				log.Error("stop_loss should > 0", zap.String("policy", localPol.Name))
+				state.Core.Log().Error("stop_loss should > 0", zap.String("policy", localPol.Name))
 			}
 		} else if slStr, ok := localPol.StopLoss.(string); ok {
 			if strings.TrimSpace(slStr) != "" {
@@ -750,17 +876,17 @@ func newStrategyWithState(state *State, pol *config.RunPolicyConfig) *TradeStrat
 					slRate, err = strconv.ParseFloat(slStr, 64)
 				}
 				if err != nil {
-					log.Error("invalid stop_loss", zap.String("policy", localPol.Name), zap.Error(err))
+					state.Core.Log().Error("invalid stop_loss", zap.String("policy", localPol.Name), zap.Error(err))
 				} else if slRate > 0 {
 					stgy.StopLoss = slRate
 				}
 			}
 		} else if slInt, ok := localPol.StopLoss.(int); ok {
 			if slInt != 0 {
-				log.Error("stop_loss format error, expect to be 5% or 0.05", zap.String("policy", localPol.Name))
+				state.Core.Log().Error("stop_loss format error, expect to be 5% or 0.05", zap.String("policy", localPol.Name))
 			}
 		} else {
-			log.Error("invalid stop_loss type, expect e.g.: 5% or 0.05", zap.String("policy", localPol.Name),
+			state.Core.Log().Error("invalid stop_loss type, expect e.g.: 5% or 0.05", zap.String("policy", localPol.Name),
 				zap.String("type", fmt.Sprintf("%T", localPol.StopLoss)))
 		}
 	}

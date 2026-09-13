@@ -82,10 +82,28 @@ func (q *Queries) loadExgSymbolsLocked(state *SymbolState, exgName string) *errs
 	if err != nil {
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
+	if err := cacheExgSymbolsForState(state, exsList); err != nil {
+		return errs.New(core.ErrBadConfig, fmt.Errorf("cache exchange symbol: %w", err))
+	}
+	return nil
+}
+
+// cacheExgSymbolsForState publishes only symbols owned by state. ListSymbols
+// is exchange-scoped, while explicit SymbolState instances are market-scoped.
+// All rows still advance the shared SID allocator so a filtered market cannot
+// cause a later symbol allocation to reuse a physical database SID.
+func cacheExgSymbolsForState(state *SymbolState, exsList []*ExSymbol) error {
 	state = symbolStateOrDefault(state)
 	for _, exs := range exsList {
+		if exs == nil {
+			continue
+		}
+		state.ObserveSID(exs.ID)
+		if !state.acceptsIdentity(exs.Exchange, exs.Market) {
+			continue
+		}
 		if err := state.cacheExSymbolChecked(exs); err != nil {
-			return errs.New(core.ErrBadConfig, fmt.Errorf("cache exchange symbol: %w", err))
+			return err
 		}
 	}
 	return nil
@@ -1134,7 +1152,14 @@ func EnsureListDatesWithStateAndOptions(sess *Queries, state *SymbolState, excha
 }
 
 func ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
-	state := loadDefaultSymbolState()
+	return loadDefaultSymbolState().ParseShort(exgName, short)
+}
+
+// ParseShort resolves a display symbol using only this symbol catalog.
+func (state *SymbolState) ParseShort(exgName, short string) (*ExSymbol, *errs.Error) {
+	if state == nil {
+		return nil, errs.NewMsg(core.ErrInvalidSymbol, "symbol state is required")
+	}
 	slashArr := strings.Split(short, "/")
 	var symbol string
 	var market = banexg.MarketSpot

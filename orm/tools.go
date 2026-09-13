@@ -11,14 +11,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/banbox/banexg/log"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 
 	"github.com/banbox/banbot/core"
 
 	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/exg"
 	utils2 "github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -39,14 +37,61 @@ type ExportTask struct {
 	exInfo *EXInfo
 }
 
+// KDataTransferDeps owns the runtime resources used by protobuf kline
+// import/export. Symbols must contain the complete stored catalog referenced
+// by the transfer configuration, not merely the configured trading pairs.
+type KDataTransferDeps struct {
+	Context      context.Context
+	Storage      *Storage
+	Symbols      *SymbolState
+	Logger       *zap.Logger
+	KlineOptions *KlineRuntimeOptions
+}
+
+func (d KDataTransferDeps) context() context.Context {
+	if d.Context != nil {
+		return d.Context
+	}
+	return context.Background()
+}
+
+func (d KDataTransferDeps) logger() *zap.Logger {
+	if d.Logger != nil {
+		return d.Logger
+	}
+	return zap.NewNop()
+}
+
+func (d KDataTransferDeps) conn() (*Queries, func(), *errs.Error) {
+	if d.Storage == nil {
+		return nil, nil, errs.NewMsg(core.ErrDbConnFail, "data transfer storage is required")
+	}
+	if d.Symbols == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "data transfer symbol state is required")
+	}
+	q, conn, err := d.Storage.Conn(d.context())
+	if err != nil {
+		return nil, nil, err
+	}
+	q = q.WithSeriesSymbolState(d.Symbols)
+	if d.KlineOptions != nil {
+		q = q.WithKlineRuntimeOptions(*d.KlineOptions)
+	}
+	return q, conn.Release, nil
+}
+
 const maxOutFSize = 1024 * 1024 * 1024
 
 func ExportKData(configFile string, outputDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Error {
+	return ExportKDataWithDeps(configFile, outputDir, numWorkers, KDataTransferDeps{Storage: CurrentStorage(), Symbols: loadDefaultSymbolState()}, pb)
+}
+
+func ExportKDataWithDeps(configFile string, outputDir string, numWorkers int, deps KDataTransferDeps, pb *utils2.StagedPrg) *errs.Error {
 	cfg, err := config.GetExportConfig(configFile)
 	if err != nil {
 		return err
 	}
-	task, err := genExportTask(cfg, pb)
+	task, err := genExportTaskWithDeps(deps, cfg, pb)
 	if err != nil {
 		return err
 	}
@@ -65,19 +110,19 @@ func ExportKData(configFile string, outputDir string, numWorkers int, pb *utils2
 	if err != nil {
 		return err
 	}
-	log.Info("export basic info ok")
+	deps.logger().Info("export basic info ok")
 
-	return runExportKlines(task.jobs, outputDir, numWorkers, pb)
+	return runExportKlinesWithDeps(deps, task.jobs, outputDir, numWorkers, pb)
 }
 
-func genExpAdjFactors(items []*config.MarketSymbolsRange) ([]*AdjFactorBlock, *errs.Error) {
+func genExpAdjFactors(deps KDataTransferDeps, items []*config.MarketSymbolsRange) ([]*AdjFactorBlock, *errs.Error) {
 	var adjFactors []*AdjFactorBlock
-	ctx := context.Background()
-	sess, conn, err2 := Conn(ctx)
+	ctx := deps.context()
+	sess, release, err2 := deps.conn()
 	if err2 != nil {
 		return nil, err2
 	}
-	defer conn.Release()
+	defer release()
 
 	for _, adjCfg := range items {
 		startMS, stopMS, err_ := config.ParseTimeRange(adjCfg.TimeRange)
@@ -85,10 +130,10 @@ func genExpAdjFactors(items []*config.MarketSymbolsRange) ([]*AdjFactorBlock, *e
 			return nil, errs.New(errs.CodeRunTime, err_)
 		}
 
-		exchanges, markets := parseExgMarkets(adjCfg.Exchange, adjCfg.Market)
+		exchanges, markets := parseExgMarkets(deps.Symbols, adjCfg.Exchange, adjCfg.Market)
 		for _, exchange := range exchanges {
 			for _, market := range markets {
-				exsList, err := parseExSymbols(exchange, adjCfg.ExgReal, market, adjCfg.Symbols)
+				exsList, err := parseExSymbols(deps.Symbols, exchange, adjCfg.ExgReal, market, adjCfg.Symbols)
 				if err != nil {
 					return nil, err
 				}
@@ -114,13 +159,13 @@ func genExpAdjFactors(items []*config.MarketSymbolsRange) ([]*AdjFactorBlock, *e
 	return adjFactors, nil
 }
 
-func genExpCalendars(items []*config.MarketRange) ([]*CalendarBlock, *errs.Error) {
+func genExpCalendars(deps KDataTransferDeps, items []*config.MarketRange) ([]*CalendarBlock, *errs.Error) {
 	var calendars []*CalendarBlock
-	calSess, calConn, err2 := Conn(nil)
+	calSess, release, err2 := deps.conn()
 	if err2 != nil {
 		return nil, err2
 	}
-	defer calConn.Release()
+	defer release()
 
 	for _, calCfg := range items {
 		startMS, stopMS, err := config.ParseTimeRange(calCfg.TimeRange)
@@ -128,8 +173,8 @@ func genExpCalendars(items []*config.MarketRange) ([]*CalendarBlock, *errs.Error
 			return nil, errs.New(errs.CodeRunTime, err)
 		}
 
-		exchanges, markets := parseExgMarkets(calCfg.Exchange, calCfg.Market)
-		allExList := GetAllExSymbols()
+		exchanges, markets := parseExgMarkets(deps.Symbols, calCfg.Exchange, calCfg.Market)
+		allExList := deps.Symbols.GetExSymbolsByID("", "")
 		allowExgs := make(map[string]bool)
 		allowMarket := make(map[string]bool)
 		for _, exchange := range exchanges {
@@ -176,18 +221,18 @@ func genExpCalendars(items []*config.MarketRange) ([]*CalendarBlock, *errs.Error
 	return calendars, nil
 }
 
-func genExportTask(cfg *config.ExportConfig, pb *utils2.StagedPrg) (*ExportTask, *errs.Error) {
-	adjFactors, err := genExpAdjFactors(cfg.AdjFactors)
+func genExportTaskWithDeps(deps KDataTransferDeps, cfg *config.ExportConfig, pb *utils2.StagedPrg) (*ExportTask, *errs.Error) {
+	adjFactors, err := genExpAdjFactors(deps, cfg.AdjFactors)
 	if err != nil {
 		return nil, err
 	}
 
-	calendars, err := genExpCalendars(cfg.Calendars)
+	calendars, err := genExpCalendars(deps, cfg.Calendars)
 	if err != nil {
 		return nil, err
 	}
 
-	jobs, exsBlockMap, err := genExportKlines(cfg.Klines, adjFactors)
+	jobs, exsBlockMap, err := genExportKlines(deps.Symbols, cfg.Klines, adjFactors)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +251,7 @@ func genExportTask(cfg *config.ExportConfig, pb *utils2.StagedPrg) (*ExportTask,
 	}
 
 	// Generate kHoles for each ExSymbol+TimeFrame combination
-	kHoles, err := genExpKHoles(jobs, pb)
+	kHoles, err := genExpKHoles(deps, jobs, pb)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +267,7 @@ func genExportTask(cfg *config.ExportConfig, pb *utils2.StagedPrg) (*ExportTask,
 	}, nil
 }
 
-func genExportKlines(items []*config.MarketTFSymbolsRange, adjs []*AdjFactorBlock) ([]*ExportKlineJob, map[int32]*ExSymbol, *errs.Error) {
+func genExportKlines(symbols *SymbolState, items []*config.MarketTFSymbolsRange, adjs []*AdjFactorBlock) ([]*ExportKlineJob, map[int32]*ExSymbol, *errs.Error) {
 	var tasks []*ExportKlineJob
 	var exsResMap = make(map[int32]*ExSymbol)
 
@@ -239,11 +284,11 @@ func genExportKlines(items []*config.MarketTFSymbolsRange, adjs []*AdjFactorBloc
 			return nil, nil, errs.New(errs.CodeRunTime, err_)
 		}
 
-		exchanges, markets := parseExgMarkets(kCfg.Exchange, kCfg.Market)
+		exchanges, markets := parseExgMarkets(symbols, kCfg.Exchange, kCfg.Market)
 		for _, exchange := range exchanges {
 			hasInfo := config.ExchangeUsesOpaqueSymbols(exchange)
 			for _, market := range markets {
-				exsList, err := parseExSymbols(exchange, kCfg.ExgReal, market, kCfg.Symbols)
+				exsList, err := parseExSymbols(symbols, exchange, kCfg.ExgReal, market, kCfg.Symbols)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -270,7 +315,7 @@ func genExportKlines(items []*config.MarketTFSymbolsRange, adjs []*AdjFactorBloc
 	}
 
 	if len(adjs) > 0 {
-		allExSymbols := GetAllExSymbols()
+		allExSymbols := symbols.GetExSymbolsByID("", "")
 		for _, a := range adjs {
 			exsResMap[a.Sid] = allExSymbols[a.Sid]
 			exsResMap[a.SubId] = allExSymbols[a.SubId]
@@ -301,14 +346,14 @@ func genExportKlines(items []*config.MarketTFSymbolsRange, adjs []*AdjFactorBloc
 	return tasks, exsResMap, nil
 }
 
-func genExpKHoles(jobs []*ExportKlineJob, pb *utils2.StagedPrg) ([]*KHoleBlock, *errs.Error) {
+func genExpKHoles(deps KDataTransferDeps, jobs []*ExportKlineJob, pb *utils2.StagedPrg) ([]*KHoleBlock, *errs.Error) {
 	rangeMap := make(map[string]*config.TimeTuple)
 	var kHoles []*KHoleBlock
-	holeSess, holeConn, err2 := Conn(nil)
+	holeSess, release, err2 := deps.conn()
 	if err2 != nil {
 		return nil, err2
 	}
-	defer holeConn.Release()
+	defer release()
 
 	// Find min startMS and max stopMS for each ExSymbol+TimeFrame
 	for _, task := range jobs {
@@ -339,7 +384,7 @@ func genExpKHoles(jobs []*ExportKlineJob, pb *utils2.StagedPrg) ([]*KHoleBlock, 
 		pBar.Add(1)
 		key := fmt.Sprintf("%d_%s", task.ID, task.TimeFrame)
 		r := rangeMap[key]
-		ranges, err := holeSess.ListSRanges(context.Background(), task.ID, "kline_"+task.TimeFrame, task.TimeFrame, r.StartMS, r.EndMS)
+		ranges, err := holeSess.ListSRanges(deps.context(), task.ID, "kline_"+task.TimeFrame, task.TimeFrame, r.StartMS, r.EndMS)
 		if err != nil {
 			return nil, errs.New(core.ErrDbReadFail, err)
 		}
@@ -364,15 +409,21 @@ func genExpKHoles(jobs []*ExportKlineJob, pb *utils2.StagedPrg) ([]*KHoleBlock, 
 	return kHoles, nil
 }
 
-func parseExgMarkets(exgName, market string) ([]string, []string) {
-	exchanges := expandWildcard(exgName, utils2.KeysOfMap(exg.AllowExgIds))
-	markets := expandWildcard(market, []string{banexg.MarketSpot, banexg.MarketLinear, banexg.MarketInverse})
+func parseExgMarkets(symbols *SymbolState, exgName, market string) ([]string, []string) {
+	all := symbols.GetExSymbolsByID("", "")
+	exgSet, marketSet := make(map[string]bool), make(map[string]bool)
+	for _, item := range all {
+		exgSet[item.Exchange] = true
+		marketSet[item.Market] = true
+	}
+	exchanges := expandWildcard(exgName, utils2.KeysOfMap(exgSet))
+	markets := expandWildcard(market, utils2.KeysOfMap(marketSet))
 	return exchanges, markets
 }
 
-func parseExSymbols(exgName, exgReal, market string, symbols []string) ([]*ExSymbol, *errs.Error) {
+func parseExSymbols(state *SymbolState, exgName, exgReal, market string, symbols []string) ([]*ExSymbol, *errs.Error) {
 	var exsList []*ExSymbol
-	exsMap := GetExSymbolMap(exgName, market)
+	exsMap := state.GetExSymbolMap(exgName, market)
 	if len(symbols) == 0 {
 		exsList = make([]*ExSymbol, 0, len(exsMap))
 		for _, exs := range exsMap {
@@ -560,8 +611,8 @@ func dumpProto(b proto.Message, file *os.File) *errs.Error {
 	return err2
 }
 
-func runExportKlines(jobs []*ExportKlineJob, outputDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Error {
-	ctx, cancel := context.WithCancel(context.Background())
+func runExportKlinesWithDeps(deps KDataTransferDeps, jobs []*ExportKlineJob, outputDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Error {
+	ctx, cancel := context.WithCancel(deps.context())
 	defer cancel()
 	numWorkers = min(len(jobs), max(1, numWorkers))
 
@@ -581,7 +632,7 @@ func runExportKlines(jobs []*ExportKlineJob, outputDir string, numWorkers int, p
 		wg.Add(1)
 		go func() {
 			var file *os.File
-			sess, conn, err := Conn(nil)
+			sess, release, err := deps.conn()
 			if err != nil {
 				errCh <- fmt.Errorf("error get db session: %v", err.Short())
 				cancel()
@@ -589,7 +640,7 @@ func runExportKlines(jobs []*ExportKlineJob, outputDir string, numWorkers int, p
 			}
 			defer func() {
 				wg.Done()
-				conn.Release()
+				release()
 				if file != nil {
 					_ = file.Close()
 				}
@@ -619,7 +670,7 @@ func runExportKlines(jobs []*ExportKlineJob, outputDir string, numWorkers int, p
 	}()
 
 	wg.Wait()
-	log.Info("export kline done")
+	deps.logger().Info("export kline done")
 
 	// Check for errors
 	select {
@@ -631,6 +682,14 @@ func runExportKlines(jobs []*ExportKlineJob, outputDir string, numWorkers int, p
 }
 
 func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Error {
+	options := LegacyKlineRuntimeOptions()
+	return ImportDataWithDeps(dataDir, numWorkers, KDataTransferDeps{Storage: CurrentStorage(), Symbols: loadDefaultSymbolState(), KlineOptions: &options}, pb)
+}
+
+func ImportDataWithDeps(dataDir string, numWorkers int, deps KDataTransferDeps, pb *utils2.StagedPrg) *errs.Error {
+	if deps.KlineOptions == nil {
+		return errs.NewMsg(core.ErrBadConfig, "data import kline runtime options are required")
+	}
 	// 首先读取并处理exInfo文件
 	exInfoPath := filepath.Join(dataDir, "exInfo1.dat")
 	exInfoFile, err_ := os.Open(exInfoPath)
@@ -644,15 +703,15 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 		return err
 	}
 
-	idMap, err := importSymbols(exInfo.Symbols)
+	idMap, err := importSymbolsWithDeps(deps, exInfo.Symbols)
 	if err != nil {
 		return err
 	}
 	// 创建数据库连接和导入管理器
-	if err = importAdjFactors(idMap, exInfo.AdjFactors); err != nil {
+	if err = importAdjFactorsWithDeps(deps, idMap, exInfo.AdjFactors); err != nil {
 		return err
 	}
-	if err = importCalendars(exInfo.Calendars); err != nil {
+	if err = importCalendarsWithDeps(deps, exInfo.Calendars); err != nil {
 		return err
 	}
 
@@ -672,7 +731,7 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 	errCh := make(chan error, numWorkers+2)
 	insRanges := make(map[int32]map[string][]MSRange)
 	insLock := deadlock.Mutex{}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(deps.context())
 	defer cancel()
 	pBar := utils2.NewPrgBar(len(files)*core.StepTotal, "kLine")
 	if pb != nil {
@@ -706,13 +765,13 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 			return
 		}
 		defer file.Close()
-		sess2, conn2, err := Conn(nil)
+		sess2, release, err := deps.conn()
 		if err != nil {
 			errCh <- fmt.Errorf("error get db session: %v", err)
 			cancel()
 			return
 		}
-		defer conn2.Release()
+		defer release()
 
 		for {
 			block := KlineBlock{}
@@ -768,11 +827,11 @@ func ImportData(dataDir string, numWorkers int, pb *utils2.StagedPrg) *errs.Erro
 
 	// Large imports can outlive a server-side connection. Acquire a fresh
 	// connection for range metadata after all worker writes have completed.
-	sess, conn, err := Conn(nil)
+	sess, release, err := deps.conn()
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
+	defer release()
 
 	itemNum := 0
 	for _, tfMap := range insRanges {
@@ -903,8 +962,8 @@ func importKlines(sess *Queries, ctx context.Context, sid int32, block *KlineBlo
 	return nil
 }
 
-func importSymbols(items []*ExSymbolBlock) (map[int32]int32, *errs.Error) {
-	olds := GetAllExSymbols()
+func importSymbolsWithDeps(deps KDataTransferDeps, items []*ExSymbolBlock) (map[int32]int32, *errs.Error) {
+	olds := deps.Symbols.GetExSymbolsByID("", "")
 	idMap := make(map[int32]int32)
 	var addItems []*ExSymbolBlock
 	var addExs []*ExSymbol
@@ -930,30 +989,39 @@ func importSymbols(items []*ExSymbolBlock) (map[int32]int32, *errs.Error) {
 		}
 	}
 	if len(addExs) > 0 {
-		err := EnsureSymbols(addExs)
+		q, release, err := deps.conn()
 		if err != nil {
 			return nil, err
 		}
-		log.Info("symbols import ok", zap.Int("num", len(addExs)))
+		defer release()
+		adds := make([]AddSymbolsParams, 0, len(addExs))
+		for _, item := range addExs {
+			adds = append(adds, AddSymbolsParams{Exchange: item.Exchange, ExgReal: item.ExgReal, Market: item.Market, Symbol: item.Symbol, ListMs: item.ListMs, DelistMs: item.DelistMs})
+		}
+		if _, err := q.AddSymbols(deps.context(), adds); err != nil {
+			return nil, errs.New(core.ErrDbExecFail, err)
+		}
+		deps.logger().Info("symbols import ok", zap.Int("num", len(addExs)))
 		for i, exs := range addExs {
-			if exs.ID == 0 {
+			stored := deps.Symbols.GetExSymbol2(exs.Exchange, exs.Market, exs.Symbol)
+			if stored == nil || stored.ID == 0 {
 				return nil, errs.NewMsg(errs.CodeRunTime, "add ExSymbol fail: %v", exs.Symbol)
 			}
-			idMap[addItems[i].Id] = exs.ID
+			idMap[addItems[i].Id] = stored.ID
 		}
 	}
 	return idMap, nil
 }
 
-func importAdjFactors(idMap map[int32]int32, items []*AdjFactorBlock) *errs.Error {
+func importAdjFactorsWithDeps(deps KDataTransferDeps, idMap map[int32]int32, items []*AdjFactorBlock) *errs.Error {
 	if len(items) == 0 {
 		return nil
 	}
-	adjSess, adjConn, err2 := Conn(nil)
+	adjSess, release, err2 := deps.conn()
 	if err2 != nil {
 		return err2
 	}
-	defer adjConn.Release()
+	defer release()
 	idArr := make(map[int32][]*AdjFactor)
 	for _, it := range items {
 		oldId, ok := idMap[it.Sid]
@@ -973,23 +1041,22 @@ func importAdjFactors(idMap map[int32]int32, items []*AdjFactorBlock) *errs.Erro
 		})
 	}
 	addNum := 0
-	defer log.Info("adjFactors import ok", zap.Int("num", addNum))
+	defer func() { deps.logger().Info("adjFactors import ok", zap.Int("num", addNum)) }()
 	for sid, arr := range idArr {
-		olds, err := GetAdjs(sid)
+		olds, err := adjSess.GetAdjFactors(deps.context(), sid)
 		if err != nil {
-			return err
+			return errs.New(core.ErrDbReadFail, err)
 		}
 		var valids = make([]*AdjFactor, 0, len(arr))
-		if len(olds) == 0 {
-			start := olds[0].StartMS
-			end := olds[len(olds)-1].StopMS
-			for _, v := range arr {
-				if v.StartMs < start || v.StartMs >= end {
-					valids = append(valids, v)
-				}
+		known := make(map[string]bool, len(olds))
+		for _, old := range olds {
+			known[fmt.Sprintf("%d:%d:%d:%g", old.Sid, old.SubID, old.StartMs, old.Factor)] = true
+		}
+		for _, item := range arr {
+			key := fmt.Sprintf("%d:%d:%d:%g", item.Sid, item.SubID, item.StartMs, item.Factor)
+			if !known[key] {
+				valids = append(valids, item)
 			}
-		} else {
-			valids = arr
 		}
 		var adds = make([]AddAdjFactorsParams, 0, len(valids))
 		for _, v := range valids {
@@ -1001,7 +1068,7 @@ func importAdjFactors(idMap map[int32]int32, items []*AdjFactorBlock) *errs.Erro
 			})
 		}
 		if len(adds) > 0 {
-			_, err_ := adjSess.AddAdjFactors(context.Background(), adds)
+			_, err_ := adjSess.AddAdjFactors(deps.context(), adds)
 			if err_ != nil {
 				return errs.New(core.ErrDbExecFail, err_)
 			}
@@ -1011,20 +1078,20 @@ func importAdjFactors(idMap map[int32]int32, items []*AdjFactorBlock) *errs.Erro
 	return nil
 }
 
-func importCalendars(cals []*CalendarBlock) *errs.Error {
+func importCalendarsWithDeps(deps KDataTransferDeps, cals []*CalendarBlock) *errs.Error {
 	if len(cals) == 0 {
 		return nil
 	}
-	calSess, calConn, err2 := Conn(nil)
+	calSess, release, err2 := deps.conn()
 	if err2 != nil {
 		return err2
 	}
-	defer calConn.Release()
+	defer release()
 	for _, cal := range cals {
 		if len(cal.Times) == 0 {
 			continue
 		}
-		items, err := calSess.GetCalendars(cal.Name, cal.Times[0], cal.Times[len(cal.Times)-1])
+		items, err := calSess.GetCalendarsWithContext(deps.context(), cal.Name, cal.Times[0], cal.Times[len(cal.Times)-1])
 		if err != nil {
 			return err
 		}
@@ -1053,11 +1120,11 @@ func importCalendars(cals []*CalendarBlock) *errs.Error {
 
 		// 添加新的日历数据
 		if len(newCalendars) > 0 {
-			_, err_ := calSess.AddCalendars(context.Background(), newCalendars)
+			_, err_ := calSess.AddCalendars(deps.context(), newCalendars)
 			if err_ != nil {
 				return errs.New(core.ErrDbExecFail, err_)
 			}
-			log.Info("import calendars", zap.String("exg", cal.Name), zap.Int("num", len(newCalendars)))
+			deps.logger().Info("import calendars", zap.String("exg", cal.Name), zap.Int("num", len(newCalendars)))
 		}
 	}
 	return nil

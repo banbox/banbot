@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/banbox/banbot/com"
@@ -29,6 +30,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
@@ -36,7 +38,6 @@ import (
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/olekukonko/tablewriter"
-	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 )
 
@@ -104,7 +105,10 @@ type ReportDeps struct {
 	Orders         *ormo.OrderState
 	Trading        *biz.TradingState
 	Exchange       banexg.BanExchange
+	Accounts       map[string]*config.AccountConfig
+	AccountsMu     *sync.RWMutex
 	DefaultAccount string
+	legacy         bool
 }
 
 func NewReportDeps(deps biz.RuntimeDeps) *ReportDeps {
@@ -119,6 +123,8 @@ func NewReportDeps(deps biz.RuntimeDeps) *ReportDeps {
 		Orders:         deps.Orders,
 		Trading:        deps.Trading,
 		Exchange:       deps.Exchange,
+		Accounts:       deps.Accounts,
+		AccountsMu:     deps.AccountsMu,
 		DefaultAccount: deps.DefaultAccount,
 	}
 }
@@ -130,9 +136,58 @@ func reportDepsFromRuntime(deps *biz.RuntimeDeps) *ReportDeps {
 	return NewReportDeps(*deps)
 }
 
+// legacyReportDeps is the sole compatibility boundary for the pre-Runtime
+// report API. New report entrypoints must pass their own ReportDeps instead.
+func legacyReportDeps() *ReportDeps {
+	return &ReportDeps{Config: config.NewSnapshot(&config.Data), legacy: true}
+}
+
+// legacyReplayReportDeps borrows legacy inputs while keeping temporary replay
+// wallets, orders, prices, and clock private to one report invocation.
+func legacyReplayReportDeps() *ReportDeps {
+	snapshot := config.NewSnapshot(&config.Data)
+	accounts := config.CloneAccountConfigsForRuntime(config.Accounts)
+	defaultAccount := config.DefAcc
+	if defaultAccount == "" {
+		defaultAccount = "default"
+	}
+	if accounts == nil {
+		accounts = make(map[string]*config.AccountConfig, 1)
+	}
+	if accounts[defaultAccount] == nil {
+		accounts[defaultAccount] = &config.AccountConfig{}
+	}
+	symbols := orm.NewSymbolState()
+	legacySymbols := orm.GetAllExSymbols()
+	items := make([]*orm.ExSymbol, 0, len(legacySymbols))
+	for _, symbol := range legacySymbols {
+		items = append(items, symbol)
+	}
+	_ = symbols.SetExSymbols(items)
+	coreState := &core.State{Logger: log.L(), BackTestMode: true}
+	coreState.ReplaceOrderMatchTfs(core.LegacyOrderMatchTfsSnapshot())
+	return &ReportDeps{
+		Config:         snapshot,
+		Core:           coreState,
+		Clock:          btime.NewClockState(true, snapshot.Location()),
+		Market:         com.NewMarketStateWithExchange(core.ExgName, exg.Default),
+		Symbols:        symbols,
+		Orders:         ormo.NewOrderState(),
+		Trading:        biz.NewTradingState(),
+		Exchange:       exg.Default,
+		Accounts:       accounts,
+		AccountsMu:     &sync.RWMutex{},
+		DefaultAccount: defaultAccount,
+		legacy:         true,
+	}
+}
+
 func (d *ReportDeps) validateSeries() *errs.Error {
 	if d == nil {
 		return errs.NewMsg(core.ErrBadConfig, "report dependencies are required")
+	}
+	if d.legacy {
+		return nil
 	}
 	missing := make([]string, 0, 2)
 	if d.Symbols == nil {
@@ -158,7 +213,7 @@ func (d *ReportDeps) validateResult() *errs.Error {
 	if d == nil {
 		return errs.NewMsg(core.ErrBadConfig, "report dependencies are required")
 	}
-	missing := make([]string, 0, 6)
+	missing := make([]string, 0, 9)
 	if d.Config == nil || d.Config.View() == nil {
 		missing = append(missing, "config")
 	}
@@ -174,20 +229,32 @@ func (d *ReportDeps) validateResult() *errs.Error {
 	if d.Symbols == nil {
 		missing = append(missing, "symbols")
 	}
-	if d.Storage == nil {
+	if d.Storage == nil && !d.legacy {
 		missing = append(missing, "storage")
+	}
+	if d.Accounts == nil {
+		missing = append(missing, "accounts")
+	}
+	if d.AccountsMu == nil {
+		missing = append(missing, "accounts lock")
+	}
+	if d.DefaultAccount == "" && !d.legacy {
+		missing = append(missing, "default account")
 	}
 	if len(missing) > 0 {
 		return errs.NewMsg(core.ErrBadConfig, "runtime report requires %s state", strings.Join(missing, ", "))
 	}
-	if d.Symbols.Storage() != d.Storage {
+	if !d.legacy && d.Accounts[d.DefaultAccount] == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime report default account %q is not configured", d.DefaultAccount)
+	}
+	if !d.legacy && d.Symbols.Storage() != d.Storage {
 		return errs.NewMsg(core.ErrBadConfig, "runtime report symbols and storage must share an owner")
 	}
 	return nil
 }
 
 func (d *ReportDeps) dateStr(timestamp int64, format string) string {
-	if d == nil {
+	if d.legacy {
 		return btime.ToDateStr(timestamp, format)
 	}
 	if format == "" {
@@ -201,7 +268,7 @@ func (d *ReportDeps) dateStr(timestamp int64, format string) string {
 }
 
 func (d *ReportDeps) dateStrLoc(timestamp int64, format string) string {
-	if d == nil {
+	if d.legacy {
 		return btime.ToDateStrLoc(timestamp, format)
 	}
 	return d.dateStr(timestamp, format)
@@ -215,11 +282,11 @@ func (d *ReportDeps) configView() *config.Config {
 }
 
 func (d *ReportDeps) account() string {
-	if d == nil {
-		return ""
-	}
 	if d.DefaultAccount != "" {
 		return d.DefaultAccount
+	}
+	if d.legacy {
+		return config.DefAcc
 	}
 	if d.Config != nil {
 		if account := d.Config.DefaultAccount(); account != "" {
@@ -238,14 +305,17 @@ func (d *ReportDeps) strictBacktest() bool {
 }
 
 func (d *ReportDeps) wallet() *biz.BanWallets {
-	if d == nil || d.Trading == nil {
-		return nil
+	if d.Trading != nil {
+		return d.Trading.Wallet(d.account())
 	}
-	return d.Trading.Wallet(d.account())
+	if d.legacy {
+		return biz.GetWallets(d.account())
+	}
+	return nil
 }
 
 func (d *ReportDeps) context() context.Context {
-	if d != nil && d.Core != nil {
+	if d.Core != nil {
 		if ctx := d.Core.Context(); ctx != nil {
 			return ctx
 		}
@@ -253,9 +323,16 @@ func (d *ReportDeps) context() context.Context {
 	return context.Background()
 }
 
+func (d *ReportDeps) logger() *zap.Logger {
+	if d.legacy || d.Core == nil {
+		return log.L()
+	}
+	return d.Core.Log()
+}
+
 func (d *ReportDeps) exchangeMarket() (string, string) {
-	if d == nil {
-		return "", ""
+	if d.legacy {
+		return core.ExgName, core.Market
 	}
 	if d.Core != nil && d.Core.ExgName != "" && d.Core.Market != "" {
 		return d.Core.ExgName, d.Core.Market
@@ -269,7 +346,10 @@ func (d *ReportDeps) exchangeMarket() (string, string) {
 }
 
 func (d *ReportDeps) symbol(pair string) (*orm.ExSymbol, *errs.Error) {
-	if d == nil || d.Symbols == nil {
+	if d.legacy {
+		return orm.GetExSymbol2(core.ExgName, core.Market, pair), nil
+	}
+	if d.Symbols == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "report symbol state is required")
 	}
 	exchange, market := d.exchangeMarket()
@@ -284,8 +364,16 @@ func (d *ReportDeps) symbol(pair string) (*orm.ExSymbol, *errs.Error) {
 }
 
 func (d *ReportDeps) queries() (*orm.Queries, func(), *errs.Error) {
-	if d == nil {
-		return nil, nil, errs.NewMsg(core.ErrBadConfig, "report dependencies are required")
+	if d != nil && d.legacy {
+		queries, conn, err := orm.Conn(context.Background())
+		if err != nil {
+			return nil, nil, err
+		}
+		return queries, func() {
+			if conn != nil {
+				conn.Release()
+			}
+		}, nil
 	}
 	if d.Storage != nil {
 		queries, conn, err := d.Storage.Conn(d.context())
@@ -327,6 +415,8 @@ func (d *ReportDeps) bizRuntimeDeps() biz.RuntimeDeps {
 		Orders:         d.Orders,
 		Trading:        d.Trading,
 		Exchange:       d.Exchange,
+		Accounts:       d.Accounts,
+		AccountsMu:     d.AccountsMu,
 		DefaultAccount: d.DefaultAccount,
 	}
 }
@@ -361,9 +451,49 @@ type RowItem struct {
 	RowPart
 }
 
+type PairPicker func(r *BTResult) []string
+
 var (
+	pairPickerRegistry   = make(map[string]PairPicker)
+	pairPickerRegistryMu sync.RWMutex
+
+	// PairPickers preserves the main-era direct registration surface. Direct
+	// map mutation is serial compatibility only; concurrent callers must use
+	// RegisterPairPicker and GetPairPicker.
 	PairPickers = make(map[string]func(r *BTResult) []string)
 )
+
+func RegisterPairPicker(name string, picker PairPicker) {
+	if name == "" || picker == nil {
+		panic("pair picker name and function are required")
+	}
+	pairPickerRegistryMu.Lock()
+	pairPickerRegistry[name] = picker
+	pairPickerRegistryMu.Unlock()
+}
+
+func GetPairPicker(name string) (PairPicker, bool) {
+	pairPickerRegistryMu.RLock()
+	picker, ok := pairPickerRegistry[name]
+	pairPickerRegistryMu.RUnlock()
+	return picker, ok
+}
+
+func UnregisterPairPicker(name string) {
+	pairPickerRegistryMu.Lock()
+	delete(pairPickerRegistry, name)
+	pairPickerRegistryMu.Unlock()
+}
+
+func SnapshotPairPickers() map[string]PairPicker {
+	pairPickerRegistryMu.RLock()
+	result := make(map[string]PairPicker, len(pairPickerRegistry))
+	for name, picker := range pairPickerRegistry {
+		result[name] = picker
+	}
+	pairPickerRegistryMu.RUnlock()
+	return result
+}
 
 func NewBTResult() *BTResult {
 	res := &BTResult{
@@ -381,118 +511,97 @@ func (r *BTResult) reportRuntimeDeps() *ReportDeps {
 	if r.reportDeps != nil {
 		return r.reportDeps
 	}
-	return reportDepsFromRuntime(r.runtimeDeps)
+	if deps := reportDepsFromRuntime(r.runtimeDeps); deps != nil {
+		return deps
+	}
+	return legacyReportDeps()
+}
+
+func (r *BTResult) logger() *zap.Logger {
+	if r == nil {
+		return log.L()
+	}
+	return r.reportRuntimeDeps().logger()
 }
 
 func (r *BTResult) dateStr(timestamp int64, format string) string {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		return deps.dateStr(timestamp, format)
-	}
-	return btime.ToDateStr(timestamp, format)
+	return r.reportRuntimeDeps().dateStr(timestamp, format)
 }
 
 func (r *BTResult) dateStrLoc(timestamp int64, format string) string {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		return deps.dateStrLoc(timestamp, format)
-	}
-	return btime.ToDateStrLoc(timestamp, format)
+	return r.reportRuntimeDeps().dateStrLoc(timestamp, format)
 }
 
 func (r *BTResult) runtimeConfig() *config.Config {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		return deps.configView()
-	}
-	return &config.Data
+	return r.reportRuntimeDeps().configView()
 }
 
 func (r *BTResult) runtimeCore() *core.State {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		return deps.Core
-	}
-	return nil
+	return r.reportRuntimeDeps().Core
 }
 
 func (r *BTResult) dataDir() string {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		if deps.Config != nil {
-			return deps.Config.DataDir
-		}
-		return ""
+	if deps := r.reportRuntimeDeps(); deps.Config != nil {
+		return deps.Config.DataDir
 	}
-	return config.GetDataDir()
+	return ""
 }
 
 func (r *BTResult) strategyDir() string {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		if deps.Config != nil {
-			return deps.Config.StrategyDir
-		}
-		return ""
+	if deps := r.reportRuntimeDeps(); deps.Config != nil {
+		return deps.Config.StrategyDir
 	}
-	return config.GetStratDir()
+	return ""
 }
 
 func (r *BTResult) strategyState() *strat.State {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		return deps.Strategies
-	}
-	return nil
-}
-
-func (r *BTResult) orderState() *ormo.OrderState {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		return deps.Orders
-	}
-	return nil
+	return r.reportRuntimeDeps().Strategies
 }
 
 func (r *BTResult) historyOrders() []*ormo.InOutOrder {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		if deps.Orders == nil {
-			return nil
-		}
+	deps := r.reportRuntimeDeps()
+	if deps.Orders != nil {
 		return deps.Orders.HistoricalOrders()
 	}
-	return ormo.HistODs
+	if deps.legacy {
+		return ormo.HistoricalOrdersSnapshot()
+	}
+	return nil
 }
 
 func (r *BTResult) reportAccount() string {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		return deps.account()
-	}
-	return config.DefAcc
+	return r.reportRuntimeDeps().account()
 }
 
 func (r *BTResult) reportWallet() *biz.BanWallets {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		return deps.wallet()
-	}
-	return biz.GetWallets(r.reportAccount())
+	return r.reportRuntimeDeps().wallet()
 }
 
 func (r *BTResult) strategyJobs(account string) map[string]map[string]*strat.StratJob {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		if deps.Strategies == nil {
-			return nil
-		}
-		return deps.Strategies.JobMaps(account)
+	deps := r.reportRuntimeDeps()
+	if deps.legacy {
+		return strat.GetJobs(account)
 	}
-	return strat.GetJobs(account)
+	if deps.Strategies == nil {
+		return nil
+	}
+	return deps.Strategies.JobMaps(account)
 }
 
 func (r *BTResult) orderMatchTfs() map[string]bool {
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		if deps.Core == nil {
-			return nil
-		}
+	deps := r.reportRuntimeDeps()
+	if deps.Core != nil {
 		return deps.Core.OrderMatchTfsSnapshot()
 	}
-	return core.LegacyOrderMatchTfsSnapshot()
+	if deps.legacy {
+		return core.LegacyOrderMatchTfsSnapshot()
+	}
+	return nil
 }
 
 func (r *BTResult) doneProfits(off int) float64 {
 	deps := r.reportRuntimeDeps()
-	if deps == nil {
+	if deps.legacy && deps.Orders == nil {
 		return ormo.LegalDoneProfits(off)
 	}
 	if deps.Market == nil || deps.Market.Prices == nil {
@@ -522,21 +631,21 @@ func (r *BTResult) doneProfits(off int) float64 {
 
 func (r *BTResult) printBtResult(reset bool) {
 	if cfg := r.runtimeConfig(); cfg != nil && cfg.StratPerf != nil && cfg.StratPerf.Enable {
-		if state := r.runtimeCore(); state != nil {
-			state.DumpPerfs(r.OutDir)
-		} else if r.reportRuntimeDeps() == nil {
+		if r.reportRuntimeDeps().legacy {
 			core.DumpPerfs(r.OutDir)
+		} else if state := r.runtimeCore(); state != nil {
+			state.DumpPerfs(r.OutDir)
 		}
 	}
 	orders := r.historyOrders()
-	log.Info("BackTest Reports:\n" + r.cmdReports(orders))
+	r.logger().Info("BackTest Reports:\n" + r.cmdReports(orders))
 	if r.HitSlTp > 0 {
-		log.Warn("Stop-loss & take-profit triggered in one K-line — set proper `run_policy[i].refine_tf`",
+		r.logger().Warn("Stop-loss & take-profit triggered in one K-line — set proper `run_policy[i].refine_tf`",
 			zap.Int("bad", r.HitSlTp), zap.Int("total", r.OrderNum))
 	}
-	log.Info("Saved", zap.String("at", r.OutDir))
+	r.logger().Info("Saved", zap.String("at", r.OutDir))
 	if r.CalcDiff > 0.01 {
-		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github",
+		r.logger().Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github",
 			zap.Float64("total_invest", r.TotalInvest), zap.Float64("total_profit", r.TotProfit),
 			zap.Float64("final_balance", r.FinBalance), zap.Float64("final_withdraw", r.FinWithdraw),
 			zap.Float64("calc_diff", r.CalcDiff))
@@ -580,19 +689,14 @@ func (r *BTResult) cmdReports(orders []*ormo.InOutOrder) string {
 func (r *BTResult) dumpBtFiles(reset bool) {
 	csvPath := fmt.Sprintf("%s/orders.csv", r.OutDir)
 	orders := r.historyOrders()
-	var err_ error
-	if deps := r.reportRuntimeDeps(); deps != nil {
-		err_ = dumpOrdersCSV(orders, csvPath, deps)
-	} else {
-		err_ = DumpOrdersCSV(orders, csvPath)
-	}
+	err_ := dumpOrdersCSV(orders, csvPath, r.reportRuntimeDeps())
 	if err_ != nil {
-		log.Error("dump orders.csv fail", zap.Error(err_))
+		r.logger().Error("dump orders.csv fail", zap.Error(err_))
 	}
 
 	err := ormo.DumpOrdersGobItems(filepath.Join(r.OutDir, "orders.gob"), orders)
 	if err != nil {
-		log.Warn("dump orders.gob fail", zap.Error(err))
+		r.logger().Warn("dump orders.gob fail", zap.Error(err))
 	}
 
 	r.dumpConfig()
@@ -679,7 +783,7 @@ func (r *BTResult) Collect() {
 	rangeSecs := (r.EndMS - r.StartMS) / 1000
 	sharpe, sortino, err := CalcMeasuresByReal(r.Plots.Real, rangeSecs, "", 0, 0)
 	if err != nil {
-		log.Warn("calc sharpe/sortino fail", zap.Error(err))
+		r.logger().Warn("calc sharpe/sortino fail", zap.Error(err))
 	} else {
 		r.SharpeRatio, r.SortinoRatio = sharpe, sortino
 	}
@@ -768,9 +872,9 @@ func renderTable(heads []string, rows [][]string, align tw.Align) string {
 }
 
 func (r *BTResult) groupByPairs(orders []*ormo.InOutOrder) {
-	groups := groupItems(orders, true, func(od *ormo.InOutOrder, i int) string {
+	groups := groupItemsWithDeps(orders, true, func(od *ormo.InOutOrder, i int) string {
 		return od.Symbol
-	})
+	}, r.reportRuntimeDeps())
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Sharpe > groups[j].Sharpe
 	})
@@ -782,9 +886,9 @@ func textGroupPairs(r *BTResult) string {
 }
 
 func (r *BTResult) groupByEnters(orders []*ormo.InOutOrder) {
-	groups := groupItems(orders, true, func(od *ormo.InOutOrder, i int) string {
+	groups := groupItemsWithDeps(orders, true, func(od *ormo.InOutOrder, i int) string {
 		return fmt.Sprintf("%s:%s", od.Strategy, od.EnterTag)
-	})
+	}, r.reportRuntimeDeps())
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Title < groups[j].Title
 	})
@@ -796,9 +900,9 @@ func textGroupEntTags(r *BTResult) string {
 }
 
 func (r *BTResult) groupByExits(orders []*ormo.InOutOrder) {
-	groups := groupItems(orders, true, func(od *ormo.InOutOrder, i int) string {
+	groups := groupItemsWithDeps(orders, true, func(od *ormo.InOutOrder, i int) string {
 		return fmt.Sprintf("%s:%s", od.Strategy, od.ExitTag)
-	})
+	}, r.reportRuntimeDeps())
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Title < groups[j].Title
 	})
@@ -862,9 +966,9 @@ func (r *BTResult) groupByProfits(orders []*ormo.InOutOrder) {
 		maxPct := strconv.FormatFloat(slices.Max(gp.Items)*100, 'f', 2, 64)
 		grpTitles = append(grpTitles, fmt.Sprintf("%s ~ %s%%", minPct, maxPct))
 	}
-	groups := groupItems(orders, false, func(od *ormo.InOutOrder, i int) string {
+	groups := groupItemsWithDeps(orders, false, func(od *ormo.InOutOrder, i int) string {
 		return grpTitles[res.RowGIds[i]]
-	})
+	}, r.reportRuntimeDeps())
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Orders[0].ProfitRate < groups[j].Orders[0].ProfitRate
 	})
@@ -901,7 +1005,7 @@ func (r *BTResult) groupByDates(orders []*ormo.InOutOrder) {
 		bestTFSecs = utils2.TFToSecs(bestTF)
 	}
 	tfUnit := bestTF[1]
-	groups := groupItems(orders, false, func(od *ormo.InOutOrder, i int) string {
+	groups := groupItemsWithDeps(orders, false, func(od *ormo.InOutOrder, i int) string {
 		entMS := od.RealEnterMS()
 		if tfUnit == 'Y' {
 			return r.dateStrLoc(entMS, "2006")
@@ -916,7 +1020,7 @@ func (r *BTResult) groupByDates(orders []*ormo.InOutOrder) {
 		} else {
 			return r.dateStrLoc(entMS, "2006-01-02 15")
 		}
-	})
+	}, r.reportRuntimeDeps())
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Title < groups[j].Title
 	})
@@ -956,7 +1060,8 @@ func makeEnterExits(orders []*ormo.InOutOrder) []string {
 	}
 }
 
-func groupItems(orders []*ormo.InOutOrder, measure bool, getTag func(od *ormo.InOutOrder, i int) string) []*RowItem {
+// groupItemsWithDeps calculates report groups from one report dependency owner.
+func groupItemsWithDeps(orders []*ormo.InOutOrder, measure bool, getTag func(od *ormo.InOutOrder, i int) string, deps *ReportDeps) []*RowItem {
 	if len(orders) == 0 {
 		return nil
 	}
@@ -996,11 +1101,12 @@ func groupItems(orders []*ormo.InOutOrder, measure bool, getTag func(od *ormo.In
 		}
 	}
 	if measure {
+		logger := deps.logger()
 		// 分30份采样计算指标，太大的话会导致指标偏小
 		for _, gp := range groups {
-			sharpe, sortino, err := CalcMeasureByOrders(gp.Orders)
+			sharpe, sortino, err := calcMeasureByOrders(gp.Orders, deps)
 			if err != nil {
-				log.Warn("calc measure fail", zap.Error(err))
+				logger.Warn("calc measure fail", zap.Error(err))
 			} else {
 				if !math.IsNaN(sharpe) && !math.IsInf(sharpe, 0) {
 					gp.Sharpe = sharpe
@@ -1047,7 +1153,7 @@ func printGroups(groups []*RowItem, title string, measure bool, extHeads []strin
 }
 
 func CalcMeasureByOrders(ods []*ormo.InOutOrder) (float64, float64, *errs.Error) {
-	return calcMeasureByOrders(ods, nil)
+	return calcMeasureByOrders(ods, legacyReportDeps())
 }
 
 // CalcMeasureByOrdersWithRuntimeDeps calculates order metrics using only the
@@ -1061,7 +1167,7 @@ func calcMeasureByOrders(ods []*ormo.InOutOrder, deps *ReportDeps) (float64, flo
 		return 0, 0, nil
 	}
 	initStake := float64(0)
-	if deps == nil {
+	if deps.legacy {
 		for key, val := range config.WalletAmounts {
 			initStake += val * com.GetPriceSafe(key, "")
 		}
@@ -1177,7 +1283,7 @@ func kMeansDurations(durations []int, num int) string {
 }
 
 func DumpOrdersCSV(orders []*ormo.InOutOrder, outPath string) error {
-	return dumpOrdersCSV(orders, outPath, nil)
+	return dumpOrdersCSV(orders, outPath, legacyReportDeps())
 }
 
 func dumpOrdersCSV(orders []*ormo.InOutOrder, outPath string, deps *ReportDeps) error {
@@ -1201,12 +1307,7 @@ func dumpOrdersCSV(orders []*ormo.InOutOrder, outPath string, deps *ReportDeps) 
 		}
 		return a.ID < b.ID
 	})
-	dateStr := func(timestamp int64) string {
-		if deps != nil {
-			return deps.dateStrLoc(timestamp, "")
-		}
-		return btime.ToDateStrLoc(timestamp, "")
-	}
+	dateStr := func(timestamp int64) string { return deps.dateStrLoc(timestamp, "") }
 	file, err_ := os.Create(outPath)
 	if err_ != nil {
 		return err_
@@ -1269,45 +1370,45 @@ func calcExOrder(od *ormo.ExOrder) (string, string, string, string) {
 func (r *BTResult) dumpConfig() {
 	cfg := r.runtimeConfig()
 	if cfg == nil {
-		log.Error("runtime config is unavailable while dumping backtest config")
+		r.logger().Error("runtime config is unavailable while dumping backtest config")
 		return
 	}
 	data, err := cfg.Desensitize().DumpYaml()
 	if err != nil {
-		log.Error("marshal config as yaml fail", zap.Error(err))
+		r.logger().Error("marshal config as yaml fail", zap.Error(err))
 		return
 	}
 	outName := fmt.Sprintf("%s/config.yml", r.OutDir)
 	// 这里不检查是否存在，直接覆盖，因webUI创建的带有敏感信息
 	err_ := os.WriteFile(outName, data, 0644)
 	if err_ != nil {
-		log.Error("save yaml to file fail", zap.Error(err_))
+		r.logger().Error("save yaml to file fail", zap.Error(err_))
 	}
 }
 
 func (r *BTResult) dumpStrategy() {
 	stratDir := r.strategyDir()
 	if stratDir == "" {
-		log.Info("env `BanStratDir` not configured, skip backup strategy")
+		r.logger().Info("env `BanStratDir` not configured, skip backup strategy")
 		return
 	}
 	pairTfs := map[string]map[string]string(nil)
-	if state := r.runtimeCore(); state != nil {
-		pairTfs = state.StrategyTimeFramesSnapshot()
-	} else if r.reportRuntimeDeps() == nil {
+	if r.reportRuntimeDeps().legacy {
 		pairTfs = core.LegacyStrategyTimeFramesSnapshot()
+	} else if state := r.runtimeCore(); state != nil {
+		pairTfs = state.StrategyTimeFramesSnapshot()
 	}
 	for name := range pairTfs {
 		dname := strings.Split(name, ":")[0]
 		curDir, err_ := utils.FindSubPath(stratDir, dname, 3)
 		if err_ != nil {
-			log.Warn("skip backup strat", zap.String("name", name), zap.Error(err_))
+			r.logger().Warn("skip backup strat", zap.String("name", name), zap.Error(err_))
 			continue
 		}
 		tgtDir := fmt.Sprintf("%s/strat_%s", r.OutDir, dname)
 		err_ = utils.CopyDirExcluding(curDir, tgtDir, r.OutDir)
 		if err_ != nil {
-			log.Warn("backup strat fail", zap.String("name", name), zap.Error(err_))
+			r.logger().Warn("backup strat fail", zap.String("name", name), zap.Error(err_))
 		}
 	}
 }
@@ -1317,7 +1418,7 @@ func (r *BTResult) dumpStratOutputs(reset bool) {
 	pairStrats := map[string]map[string]*strat.TradeStrat(nil)
 	if state := r.strategyState(); state != nil {
 		pairStrats = state.PairStrategiesView()
-	} else if r.reportRuntimeDeps() == nil {
+	} else if r.reportRuntimeDeps().legacy {
 		pairStrats = strat.PairStrats
 	}
 	for _, items := range pairStrats {
@@ -1334,16 +1435,16 @@ func (r *BTResult) dumpStratOutputs(reset bool) {
 		outPath := fmt.Sprintf("%s/%s.log", r.OutDir, name)
 		file, err := os.Create(outPath)
 		if err != nil {
-			log.Error("create strategy output file fail", zap.String("name", name), zap.Error(err))
+			r.logger().Error("create strategy output file fail", zap.String("name", name), zap.Error(err))
 			continue
 		}
 		_, err = file.WriteString(strings.Join(rows, "\n"))
 		if err != nil {
-			log.Error("write strategy output fail", zap.String("name", name), zap.Error(err))
+			r.logger().Error("write strategy output fail", zap.String("name", name), zap.Error(err))
 		}
 		err = file.Close()
 		if err != nil {
-			log.Error("close strategy output fail", zap.String("name", name), zap.Error(err))
+			r.logger().Error("close strategy output fail", zap.String("name", name), zap.Error(err))
 		}
 	}
 }
@@ -1375,7 +1476,7 @@ func (r *BTResult) DumpCharts() {
 	}
 	err := DumpChart(outPath, title, r.Plots.Labels, 5, tplData, dataList)
 	if err != nil {
-		log.Error("save assets.html fail", zap.Error(err))
+		r.logger().Error("save assets.html fail", zap.Error(err))
 	}
 	// Draw cumulative profit curves for each entry tag separately
 	// 为入场标签分别绘制累计利润曲线
@@ -1384,7 +1485,7 @@ func (r *BTResult) DumpCharts() {
 		title = "Strategy Enter Tag Cum Profits"
 		err = DumpChart(outPath, title, r.EntLabels, 5, nil, r.EntDatasets)
 		if err != nil {
-			log.Error("Dump EnterTag CumProfits fail", zap.Error(err))
+			r.logger().Error("Dump EnterTag CumProfits fail", zap.Error(err))
 		}
 	}
 }
@@ -1402,12 +1503,12 @@ func (r *BTResult) dumpDetail(outPath string) {
 	}
 	data, err_ := utils2.Marshal(r)
 	if err_ != nil {
-		log.Error("marshal backtest detail fail", zap.Error(err_))
+		r.logger().Error("marshal backtest detail fail", zap.Error(err_))
 		return
 	}
 	err_ = os.WriteFile(outPath, data, 0644)
 	if err_ != nil {
-		log.Error("write backtest detail fail", zap.Error(err_))
+		r.logger().Error("write backtest detail fail", zap.Error(err_))
 	}
 }
 
@@ -1456,7 +1557,7 @@ func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 		pairNum := 0
 		if state := r.runtimeCore(); state != nil {
 			pairNum = len(state.AdmissionPairs())
-		} else if r.reportRuntimeDeps() == nil {
+		} else if r.reportRuntimeDeps().legacy {
 			pairNum = len(core.LegacyAdmissionPairs())
 		}
 		if pairNum > 0 {
@@ -1510,16 +1611,17 @@ func (r *BTResult) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, tot
 		return
 	}
 	if timeMS < r.lastPlotMS {
-		log.Error("backtest plot time moved backwards",
+		r.logger().Error("backtest plot time moved backwards",
 			zap.Int64("last_ms", r.lastPlotMS), zap.Int64("current_ms", timeMS))
 		return
 	}
 	if odNum < 0 {
 		odNum = 0
 		account := r.reportAccount()
-		if state := r.orderState(); state != nil {
-			odNum = state.OpenNum(account, ormo.InOutStatusPartEnter)
-		} else if r.reportRuntimeDeps() == nil {
+		deps := r.reportRuntimeDeps()
+		if deps.Orders != nil {
+			odNum = deps.Orders.OpenNum(account, ormo.InOutStatusPartEnter)
+		} else if deps.legacy {
 			odNum = ormo.OpenNum(account, ormo.InOutStatusPartEnter)
 		}
 	}
@@ -1616,9 +1718,13 @@ func CalcMeasuresByReal(real []float64, rangeSecs int64, tf string, factor int, 
 }
 
 func selectPairs(r *BTResult, name string) []string {
-	fn, ok := PairPickers[name]
+	fn, ok := GetPairPicker(name)
+	if !ok && r.reportRuntimeDeps().legacy {
+		legacy, found := PairPickers[name]
+		fn, ok = PairPicker(legacy), found
+	}
 	if !ok {
-		log.Warn("PairPickers not found", zap.String("name", name))
+		r.logger().Warn("PairPickers not found", zap.String("name", name))
 		return nil
 	}
 	return fn(r)
@@ -1656,9 +1762,19 @@ export line chart of cumulative profit based on entry tag statistics
 按入场信号统计累计利润导出折线图
 */
 func DumpEnterTagCumProfits(path string, odList []*ormo.InOutOrder, xNum int) *errs.Error {
-	labels, dsList := CalcGroupEndProfits(odList, func(o *ormo.InOutOrder) string {
+	return dumpEnterTagCumProfitsWithDeps(path, odList, xNum, legacyReportDeps())
+}
+
+// DumpEnterTagCumProfitsWithRuntimeDeps exports an entry-tag cumulative-profit
+// chart with the supplied runtime's display configuration.
+func DumpEnterTagCumProfitsWithRuntimeDeps(path string, odList []*ormo.InOutOrder, xNum int, deps biz.RuntimeDeps) *errs.Error {
+	return dumpEnterTagCumProfitsWithDeps(path, odList, xNum, NewReportDeps(deps))
+}
+
+func dumpEnterTagCumProfitsWithDeps(path string, odList []*ormo.InOutOrder, xNum int, deps *ReportDeps) *errs.Error {
+	labels, dsList := calcGroupEndProfitsWithDeps(odList, func(o *ormo.InOutOrder) string {
 		return fmt.Sprintf("%v:%v", o.Strategy, o.EnterTag)
-	}, xNum)
+	}, xNum, deps)
 	if len(dsList) == 0 {
 		return nil
 	}
@@ -1675,7 +1791,13 @@ calculate cumulative profit curve data for orders (directly using profit accumul
 生成订单累计利润曲线数据（直接使用平仓时利润累加）
 */
 func CalcGroupEndProfits(odList []*ormo.InOutOrder, genKey func(o *ormo.InOutOrder) string, xNum int) ([]string, []*ChartDs) {
-	return calcGroupEndProfitsWithDeps(odList, genKey, xNum, nil)
+	return calcGroupEndProfitsWithDeps(odList, genKey, xNum, legacyReportDeps())
+}
+
+// CalcGroupEndProfitsWithRuntimeDeps calculates closed-order profit curves
+// with the supplied runtime's display configuration.
+func CalcGroupEndProfitsWithRuntimeDeps(odList []*ormo.InOutOrder, genKey func(o *ormo.InOutOrder) string, xNum int, deps biz.RuntimeDeps) ([]string, []*ChartDs) {
+	return calcGroupEndProfitsWithDeps(odList, genKey, xNum, NewReportDeps(deps))
 }
 
 func calcGroupEndProfitsWithDeps(odList []*ormo.InOutOrder, genKey func(o *ormo.InOutOrder) string, xNum int, deps *ReportDeps) ([]string, []*ChartDs) {
@@ -1726,11 +1848,7 @@ func calcGroupEndProfitsWithDeps(odList []*ormo.InOutOrder, genKey func(o *ormo.
 	}
 	labels := make([]string, xNum+1)
 	for i := range labels {
-		if deps == nil {
-			labels[i] = btime.ToDateStr(sampleTime(i), "")
-		} else {
-			labels[i] = deps.dateStr(sampleTime(i), "")
-		}
+		labels[i] = deps.dateStr(sampleTime(i), "")
 	}
 	var res []*ChartDs
 	for _, tag := range groupOrder {
@@ -1762,7 +1880,7 @@ calculate cumulative profit curve data for orders (obtain K-line and calculate r
 生成订单累计利润曲线数据（获取K线，计算实时持仓累计利润）
 */
 func CalcGroupCumProfits(odList []*ormo.InOutOrder, genKey func(o *ormo.InOutOrder) string, xNum int) ([]string, []*ChartDs, *errs.Error) {
-	return calcGroupCumProfitsWithDeps(odList, genKey, xNum, nil)
+	return calcGroupCumProfitsWithDeps(odList, genKey, xNum, legacyReportDeps())
 }
 
 // CalcGroupCumProfitsWithRuntimeDeps calculates cumulative profit curves from
@@ -1775,7 +1893,7 @@ func calcGroupCumProfitsWithDeps(odList []*ormo.InOutOrder, genKey func(o *ormo.
 	if len(odList) == 0 {
 		return nil, nil, nil
 	}
-	if deps != nil {
+	if !deps.legacy {
 		if err := deps.validateSeries(); err != nil {
 			return nil, nil, err
 		}
@@ -1805,13 +1923,7 @@ func calcGroupCumProfitsWithDeps(odList []*ormo.InOutOrder, genKey func(o *ormo.
 	maxXNum := 0
 	for _, key := range groupOrder {
 		pairMap := groups[key]
-		var cumRets []float64
-		var err *errs.Error
-		if deps == nil {
-			cumRets, err = calcCumCurve(pairMap, startMS, endMS, tf, 0)
-		} else {
-			cumRets, err = calcCumCurveWithDeps(pairMap, startMS, endMS, tf, 0, deps)
-		}
+		cumRets, err := calcCumCurveWithDeps(pairMap, startMS, endMS, tf, 0, deps)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1828,25 +1940,14 @@ func calcGroupCumProfitsWithDeps(odList []*ormo.InOutOrder, genKey func(o *ormo.
 		lay = "2006-01-02"
 	}
 	for i := 0; i < maxXNum; i++ {
-		var dateStr string
-		if deps == nil {
-			dateStr = btime.ToDateStr(curMS, lay)
-		} else {
-			dateStr = deps.dateStr(curMS, lay)
-		}
-		labels = append(labels, dateStr)
+		labels = append(labels, deps.dateStr(curMS, lay))
 		curMS += tfMSecs
 	}
 	return labels, result, nil
 }
 
-// 计算给定订单的累计收益曲线
-func calcCumCurve(pairOrders map[string][]*ormo.InOutOrder, startMS, endMS int64, tf string, baseVal float64) ([]float64, *errs.Error) {
-	return calcCumCurveWithDeps(pairOrders, startMS, endMS, tf, baseVal, nil)
-}
-
 func calcCumCurveWithDeps(pairOrders map[string][]*ormo.InOutOrder, startMS, endMS int64, tf string, baseVal float64, deps *ReportDeps) ([]float64, *errs.Error) {
-	if deps != nil {
+	if !deps.legacy {
 		if err := deps.validateSeries(); err != nil {
 			return nil, err
 		}
@@ -1862,20 +1963,12 @@ func calcCumCurveWithDeps(pairOrders map[string][]*ormo.InOutOrder, startMS, end
 		orders := pairOrders[pair]
 		var exs *orm.ExSymbol
 		var err *errs.Error
-		if deps == nil {
-			exs = orm.GetExSymbol2(core.ExgName, core.Market, pair)
-		} else {
-			exs, err = deps.symbol(pair)
-			if err != nil {
-				return nil, err
-			}
+		exs, err = deps.symbol(pair)
+		if err != nil {
+			return nil, err
 		}
 		var closes []float64
-		if deps == nil {
-			_, closes, err = getOHLCVNoLack(exs, tf, startMS, endMS, tfMSecs)
-		} else {
-			_, closes, err = getOHLCVNoLackWithDeps(deps, exs, tf, startMS, endMS, tfMSecs)
-		}
+		_, closes, err = getOHLCVNoLackWithDeps(deps, exs, tf, startMS, endMS, tfMSecs)
 		if err != nil {
 			return nil, err
 		}
@@ -1899,14 +1992,10 @@ func calcCumCurveWithDeps(pairOrders map[string][]*ormo.InOutOrder, startMS, end
 	return cumRets, nil
 }
 
-func getOHLCVNoLack(exs *orm.ExSymbol, tf string, startMS, endMS, tfMSecs int64) ([]*banexg.Kline, []float64, *errs.Error) {
-	_, bars, err := orm.GetOHLCV(exs, tf, startMS, endMS, 0, false)
-	return fillReportOHLCVLacks(bars, err, startMS, endMS, tfMSecs)
-}
-
 func getOHLCVNoLackWithDeps(deps *ReportDeps, exs *orm.ExSymbol, tf string, startMS, endMS, tfMSecs int64) ([]*banexg.Kline, []float64, *errs.Error) {
-	if deps == nil {
-		return getOHLCVNoLack(exs, tf, startMS, endMS, tfMSecs)
+	if deps.legacy {
+		_, bars, err := orm.GetOHLCV(exs, tf, startMS, endMS, 0, false)
+		return fillReportOHLCVLacks(bars, err, startMS, endMS, tfMSecs)
 	}
 	if exs == nil {
 		return nil, nil, errs.NewMsg(core.ErrInvalidSymbol, "report symbol is required")
@@ -1935,37 +2024,17 @@ func fillReportOHLCVLacks(bars []*banexg.Kline, err *errs.Error, startMS, endMS,
 	return bars, closes, nil
 }
 
-func calcBtResult(odList []*ormo.InOutOrder, funds map[string]float64, outDir string) (*BTResult, *errs.Error) {
-	backUp := biz.BackupVars()
-	biz.ResetVars()
-	defer func() {
-		biz.RestoreVars(backUp)
-	}()
-	return calcBtResultWithDeps(odList, funds, outDir, nil)
-}
-
-func calcBtResultWithRuntimeDeps(odList []*ormo.InOutOrder, funds map[string]float64, outDir string, deps biz.RuntimeDeps) (*BTResult, *errs.Error) {
-	return calcBtResultWithDeps(odList, funds, outDir, NewReportDeps(deps))
-}
-
 func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, outDir string, deps *ReportDeps) (*BTResult, *errs.Error) {
 	btRes := NewBTResult()
 	btRes.reportDeps = deps
-	if deps != nil {
-		if err := deps.validateResult(); err != nil {
-			return nil, err
-		}
+	if err := deps.validateResult(); err != nil {
+		return nil, err
 	}
 	if len(odList) == 0 {
 		return btRes, nil
 	}
 	var err *errs.Error
-	var wallets *biz.BanWallets
-	if deps == nil {
-		wallets = biz.GetWallets(config.DefAcc)
-	} else {
-		wallets = biz.InitFakeWalletsWithRuntimeDeps(deps.bizRuntimeDeps())
-	}
+	wallets := biz.InitFakeWalletsWithRuntimeDeps(deps.bizRuntimeDeps())
 	if wallets == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "report wallet is required")
 	}
@@ -2004,12 +2073,7 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 	btRes.OrderNum = len(odList)
 	tf := utils2.SecsToTF(tfSecs)
 	// 获取各个品种信息
-	var pairStats []*PairStat
-	if deps == nil {
-		pairStats, err = CalcPairStats(pairOrders, startMS, endMS, tf)
-	} else {
-		pairStats, err = calcPairStats(pairOrders, startMS, endMS, tf, deps)
-	}
+	pairStats, err := calcPairStats(pairOrders, startMS, endMS, tf, deps)
 	if err != nil {
 		return nil, err
 	}
@@ -2037,12 +2101,10 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 		return nil, errs.NewMsg(errs.CodeRunTime, "pairStats len not same: %v", numMap)
 	}
 	if len(failMap) > 0 {
-		log.Warn("Sum(Returns) and Sum(Profits) differs too much", zap.Any("pair pcts", failMap))
+		btRes.logger().Warn("Sum(Returns) and Sum(Profits) differs too much", zap.Any("pair pcts", failMap))
 	}
 	odList = reportReplayOrder(odList)
-	if deps == nil {
-		core.SetLegacyPairs(utils.KeysOfMap(pairOrders), nil)
-	} else if deps.Core != nil {
+	if deps.Core != nil {
 		deps.Core.SetPairs(utils.KeysOfMap(pairOrders), nil)
 	}
 	btRes.logPlot(wallets, startMS, 0, totalLegal)
@@ -2051,13 +2113,7 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 	btRes.TotalInvest = totalLegal
 	offsetMS := min(tfMSecs/2, 120000) // 定位到K线后120s，避免整点时订单尚未成交
 	curAlignMS := startMS
-	var openOds map[int64]*ormo.InOutOrder
-	var lock *deadlock.Mutex
-	if deps != nil {
-		openOds, lock = deps.Orders.GetOpenODs(deps.account())
-	} else {
-		openOds, lock = ormo.GetOpenODs(config.DefAcc)
-	}
+	openOds, lock := deps.Orders.GetOpenODs(deps.account())
 	nextOd, failEnter := 0, 0
 	for curAlignMS < endMS {
 		barStartMs := curAlignMS
@@ -2079,14 +2135,10 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 				break
 			}
 		}
-		if deps == nil {
-			com.SetPrices(prices, "")
-		} else {
-			if deps.Clock != nil {
-				deps.Clock.SetTimeMS(curMS)
-			}
-			deps.Market.Prices.SetPricesAt(curMS, prices, "")
+		if deps.Clock != nil {
+			deps.Clock.SetTimeMS(curMS)
 		}
+		deps.Market.Prices.SetPricesAt(curMS, prices, "")
 		// 更新当前持仓订单
 		lock.Lock()
 		openList := reportOpenOrderViewWithDeps(openOds, deps)
@@ -2095,11 +2147,7 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 			if od.RealExitMS() < curMS {
 				wallets.ExitOd(od, od.Exit.Filled)
 				wallets.ConfirmOdExit(od, od.Exit.Average)
-				if deps == nil {
-					ormo.HistODs = append(ormo.HistODs, od)
-				} else {
-					deps.Orders.AddHistoricalOrder(od)
-				}
+				deps.Orders.AddHistoricalOrder(od)
 				lock.Lock()
 				delete(openOds, od.ID)
 				lock.Unlock()
@@ -2135,12 +2183,7 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 		openNum := len(openOds)
 		btRes.MaxOpenOrders = max(btRes.MaxOpenOrders, openNum)
 		lock.Unlock()
-		strict := false
-		if deps == nil {
-			strict = config.StrictBacktest()
-		} else {
-			strict = deps.strictBacktest()
-		}
+		strict := deps.strictBacktest()
 		for code := range utils.MapKeys(settleMap, strict) {
 			odArr := settleMap[code]
 			err = wallets.UpdateOds(odArr, code)
@@ -2153,7 +2196,7 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 		btRes.logState(barStartMs, curAlignMS, openNum)
 	}
 	if failEnter > 0 {
-		log.Warn("skip enter failed orders", zap.Int("num", failEnter))
+		btRes.logger().Warn("skip enter failed orders", zap.Int("num", failEnter))
 	}
 	// 退出终止时尚未退出的订单
 	lock.Lock()
@@ -2168,22 +2211,18 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 	}
 	btRes.logState(curAlignMS, curAlignMS, 0)
 	// 统计结果并输出
-	if deps == nil {
-		ormo.HistODs = odList
-	} else {
-		for _, od := range odList {
-			deps.Orders.AddHistoricalOrder(od)
-		}
+	for _, od := range odList {
+		deps.Orders.AddHistoricalOrder(od)
 	}
 	btRes.Collect()
-	log.Info("BackTest Reports:\n" + btRes.cmdReports(odList))
+	btRes.logger().Info("BackTest Reports:\n" + btRes.cmdReports(odList))
 	if outDir != "" {
 		btRes.OutDir = outDir
 		btRes.dumpBtFiles(true)
-		log.Info("Saved", zap.String("at", outDir))
+		btRes.logger().Info("Saved", zap.String("at", outDir))
 	}
 	if btRes.CalcDiff > 0.01 {
-		log.Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github",
+		btRes.logger().Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github",
 			zap.Float64("total_invest", btRes.TotalInvest), zap.Float64("total_profit", btRes.TotProfit),
 			zap.Float64("final_balance", btRes.FinBalance), zap.Float64("final_withdraw", btRes.FinWithdraw),
 			zap.Float64("calc_diff", btRes.CalcDiff))
@@ -2191,18 +2230,9 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 	return btRes, nil
 }
 
-func reportOpenOrderView(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
-	return reportOpenOrderViewWithDeps(orders, nil)
-}
-
 func reportOpenOrderViewWithDeps(orders map[int64]*ormo.InOutOrder, deps *ReportDeps) []*ormo.InOutOrder {
 	result := utils2.ValsOfMap(orders)
-	strict := false
-	if deps == nil {
-		strict = config.StrictBacktest()
-	} else {
-		strict = deps.strictBacktest()
-	}
+	strict := deps.strictBacktest()
 	if strict {
 		slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
 			if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {
@@ -2233,8 +2263,10 @@ type PairStat struct {
 	Idx     int
 }
 
+// CalcPairStats preserves the package-level report API for existing callers.
+// New callers should use CalcPairStatsWithRuntimeDeps.
 func CalcPairStats(pairOrders map[string][]*ormo.InOutOrder, startMS, endMS int64, tf string) ([]*PairStat, *errs.Error) {
-	return calcPairStats(pairOrders, startMS, endMS, tf, nil)
+	return calcPairStats(pairOrders, startMS, endMS, tf, legacyReportDeps())
 }
 
 // CalcPairStatsWithRuntimeDeps resolves symbols and series through one
@@ -2244,7 +2276,7 @@ func CalcPairStatsWithRuntimeDeps(pairOrders map[string][]*ormo.InOutOrder, star
 }
 
 func calcPairStats(pairOrders map[string][]*ormo.InOutOrder, startMS, endMS int64, tf string, deps *ReportDeps) ([]*PairStat, *errs.Error) {
-	if deps != nil {
+	if !deps.legacy {
 		if err := deps.validateSeries(); err != nil {
 			return nil, err
 		}
@@ -2260,21 +2292,13 @@ func calcPairStats(pairOrders map[string][]*ormo.InOutOrder, startMS, endMS int6
 		orders := pairOrders[pair]
 		var exs *orm.ExSymbol
 		var err *errs.Error
-		if deps == nil {
-			exs = orm.GetExSymbol2(core.ExgName, core.Market, pair)
-		} else {
-			exs, err = deps.symbol(pair)
-			if err != nil {
-				return nil, err
-			}
+		exs, err = deps.symbol(pair)
+		if err != nil {
+			return nil, err
 		}
 		var bars []*banexg.Kline
 		var closes []float64
-		if deps == nil {
-			bars, closes, err = getOHLCVNoLack(exs, tf, startMS, endMS, tfMSecs)
-		} else {
-			bars, closes, err = getOHLCVNoLackWithDeps(deps, exs, tf, startMS, endMS, tfMSecs)
-		}
+		bars, closes, err = getOHLCVNoLackWithDeps(deps, exs, tf, startMS, endMS, tfMSecs)
 		if err != nil {
 			return nil, err
 		}

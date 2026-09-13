@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/banbox/banbot/internal/testutil"
 )
 
 func TestGetExSymbol2UsesThreeFieldIdentity(t *testing.T) {
@@ -23,6 +25,7 @@ func TestGetExSymbol2UsesThreeFieldIdentity(t *testing.T) {
 }
 
 func TestEnsureSymbolsReusesIdentityAcrossExgReal(t *testing.T) {
+	testutil.RequireIntegration(t)
 	if err := initApp(); err != nil {
 		t.Fatalf("initApp failed: %v", err)
 	}
@@ -46,6 +49,7 @@ func TestEnsureSymbolsReusesIdentityAcrossExgReal(t *testing.T) {
 }
 
 func TestEnsureExSymbolMatchesEnsureSymbolsIdentity(t *testing.T) {
+	testutil.RequireIntegration(t)
 	if err := initApp(); err != nil {
 		t.Fatalf("initApp failed: %v", err)
 	}

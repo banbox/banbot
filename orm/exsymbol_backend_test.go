@@ -1,8 +1,13 @@
 package orm
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/banbox/banbot/internal/testutil"
+)
 
 func TestEnsureSymbolsIgnoresExgRealForIdentity(t *testing.T) {
+	testutil.RequireIntegration(t)
 	if err := initApp(); err != nil {
 		t.Fatalf("initApp failed: %v", err)
 	}

@@ -62,17 +62,17 @@ func cronRefreshPairsWithRuntime(scheduler com.Scheduler, trader *CryptoTrader, 
 		}
 		lastRefreshMS = curMS
 		if err := trader.refreshPairJobs(false); err != nil {
-			log.Error("RefreshPairJobs fail", zap.Error(err))
+			deps.Logger().Error("RefreshPairJobs fail", zap.Error(err))
 			return
 		}
 		if afterRefresh != nil {
 			if err := afterRefresh(); err != nil {
-				log.Error("RefreshPairJobs post-refresh fail", zap.Error(err))
+				deps.Logger().Error("RefreshPairJobs post-refresh fail", zap.Error(err))
 			}
 		}
 	})
 	if err != nil {
-		log.Error("add runtime RefreshPairList fail", zap.Error(err))
+		deps.Logger().Error("add runtime RefreshPairList fail", zap.Error(err))
 	}
 }
 
@@ -100,7 +100,7 @@ func fetchHourKlinesWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, 
 		data.DownEmitHourKlinesWithRuntimeDeps(runtimeDataDeps(deps, catalog...), dp, endMap)
 	})
 	if err != nil {
-		log.Error("add runtime FetchHourKlines fail", zap.Error(err))
+		deps.Logger().Error("add runtime FetchHourKlines fail", zap.Error(err))
 	}
 }
 
@@ -112,11 +112,11 @@ func cronLoadMarketsWithRuntime(scheduler com.Scheduler, exchange banexg.BanExch
 	}
 	_, err := scheduler.AddFunc("30 3 */2 * * *", func() {
 		if _, loadErr := orm.LoadMarketsWithRuntime(symbols, exchange, true, snapshot, runtimeCore); loadErr != nil {
-			log.Error("runtime LoadMarkets fail", zap.Error(loadErr))
+			runtimeCore.Log().Error("runtime LoadMarkets fail", zap.Error(loadErr))
 		}
 	})
 	if err != nil {
-		log.Error("add runtime CronLoadMarkets fail", zap.Error(err))
+		runtimeCore.Log().Error("add runtime CronLoadMarkets fail", zap.Error(err))
 	}
 }
 
@@ -162,7 +162,7 @@ func cronFatalLossCheckWithRuntime(scheduler com.Scheduler, deps biz.RuntimeDeps
 	}
 	_, err := scheduler.AddFunc(fmt.Sprintf("35 */%d * * * *", interval), biz.MakeCheckFatalStopWithRuntime(deps, fatal, hours, nowMS))
 	if err != nil {
-		log.Error("add runtime CronFatalLossCheck fail", zap.Error(err))
+		deps.Logger().Error("add runtime CronFatalLossCheck fail", zap.Error(err))
 	}
 }
 
@@ -186,7 +186,7 @@ func cronKlineDelaysWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, 
 	stuckCount := 0
 	logDelay := func(message string) {
 		now := clock()
-		log.Warn(message)
+		deps.Logger().Warn(message)
 		if now-lastNotifyDelay > 600000 {
 			lastNotifyDelay = now
 			sendRuntimeMessage(&deps, map[string]interface{}{"type": rpc.MsgTypeException, "status": message})
@@ -221,7 +221,7 @@ func cronKlineDelaysWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, 
 					}
 					closed, failed, closeErr := biz.CloseAccOrdersWithState(deps.Trading, account, list, &strat.ExitReq{Tag: core.ExitTagDataStuck, Force: true})
 					if closeErr != nil {
-						log.Error("close runtime orders on stuck fail", zap.String("account", account), zap.Int("success", closed), zap.Int("fail", failed), zap.Error(closeErr))
+						deps.Logger().Error("close runtime orders on stuck fail", zap.String("account", account), zap.Int("success", closed), zap.Int("fail", failed), zap.Error(closeErr))
 					}
 				}
 				stuckCount = 0
@@ -242,7 +242,7 @@ func cronKlineDelaysWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, 
 		}
 	})
 	if err != nil {
-		log.Error("add runtime Monitor Klines fail", zap.Error(err))
+		deps.Logger().Error("add runtime Monitor Klines fail", zap.Error(err))
 	}
 }
 
@@ -262,11 +262,11 @@ func cronKlineSummaryWithRuntime(scheduler com.Scheduler, state *core.State) {
 			}
 		}
 		if len(groups) > 0 {
-			log.Info(fmt.Sprintf("receive bars in 10 mins:\n%s", core.GroupByPairQuotes(groups, true)))
+			state.Log().Info(fmt.Sprintf("receive bars in 10 mins:\n%s", core.GroupByPairQuotes(groups, true)))
 		}
 	})
 	if err != nil {
-		log.Error("add runtime Receive Klines Summary fail", zap.Error(err))
+		state.Log().Error("add runtime Receive Klines Summary fail", zap.Error(err))
 	}
 }
 
@@ -319,6 +319,6 @@ func cronCheckTriggerOdsWithRuntime(scheduler com.Scheduler, deps biz.RuntimeDep
 	}
 	_, err := scheduler.AddFunc("15,45 * * * * *", func() { biz.VerifyTriggerOdsWithRuntimeDeps(deps) })
 	if err != nil {
-		log.Error("add runtime VerifyTriggerOds fail", zap.Error(err))
+		deps.Logger().Error("add runtime VerifyTriggerOds fail", zap.Error(err))
 	}
 }

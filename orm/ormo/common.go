@@ -16,7 +16,13 @@ func DumpOrdersGob(path string) *errs.Error {
 // FilterUnfilledHistoricalOrders keeps the legacy facade behavior while
 // routing the mutation through its registry owner.
 func FilterUnfilledHistoricalOrders() {
-	LegacyState().FilterUnfilledHistoricalOrders()
+	legacyStateView().FilterUnfilledHistoricalOrders()
+}
+
+// HistoricalOrdersSnapshot returns a stable snapshot of the package-level
+// compatibility registry. Explicit runtimes should use OrderState directly.
+func HistoricalOrdersSnapshot() []*InOutOrder {
+	return legacyStateView().HistoricalOrders()
 }
 
 // DumpOrdersGobItems serializes an explicit order snapshot. Runtime-owned

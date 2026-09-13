@@ -9,8 +9,8 @@ import (
 )
 
 func TestRemoteCommandRuntimeIsolation(t *testing.T) {
-	first := &core.State{NoEnterUntil: make(map[string]int64)}
-	second := &core.State{NoEnterUntil: make(map[string]int64)}
+	first := &core.State{}
+	second := &core.State{}
 	clock := btime.NewClockState(true, nil)
 	clock.SetTimeMS(123000)
 	makeService := func(state *core.State) *RemoteCommandService {
@@ -24,7 +24,7 @@ func TestRemoteCommandRuntimeIsolation(t *testing.T) {
 	if err != nil || result.UntilMS != 3723000 {
 		t.Fatalf("runtime command failed: %+v %v", result, err)
 	}
-	if first.NoEnterUntil["owned"] != result.UntilMS || len(second.NoEnterUntil) != 0 {
+	if first.NoEnterUntilSnapshot()["owned"] != result.UntilMS || len(second.NoEnterUntilSnapshot()) != 0 {
 		t.Fatal("trading switch escaped its runtime")
 	}
 	if _, err := makeService(second).Run(command); err != nil {

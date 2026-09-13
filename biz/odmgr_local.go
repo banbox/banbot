@@ -16,7 +16,6 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
 )
@@ -45,6 +44,7 @@ func InitLocalOrderMgrWithPriceState(callBack FnOdCb, showLog bool, prices *com.
 // accounting to one explicit Runtime. The legacy initializer remains the
 // compatibility path for callers that still use package state.
 func InitLocalOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack FnOdCb, showLog bool, stops ...func()) {
+	requireRuntimeDeps(deps)
 	initLocalOrderMgr(&deps, callBack, showLog, nil, nil, stops...)
 }
 
@@ -54,14 +54,7 @@ func initLocalOrderMgr(deps *RuntimeDeps, callBack FnOdCb, showLog bool, prices 
 		stopBacktest = core.StopAll
 	}
 	if deps != nil {
-		// Complete the explicit dependency set before creating any manager. A
-		// runtime manager must never fall back to the process-wide order state.
-		if deps.Orders == nil {
-			deps.Orders = ormo.NewOrderState()
-		}
-		if deps.Trading == nil {
-			deps.Trading = NewTradingState()
-		}
+		requireRuntimeDeps(*deps)
 	}
 	if deps != nil && deps.Core != nil {
 		stopBacktest = deps.Core.StopAll
@@ -451,7 +444,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			err := o.localExit(od, stopAfter, core.ExitTagEntExp, od.InitPrice, "reach StopEnterBars", "")
 			o.fireOdChange(od, strat.OdChgExitFill)
 			if err != nil {
-				log.Error("local exit for StopEnterBars fail", zap.String("key", od.Key()), zap.Error(err))
+				o.Logger().Error("local exit for StopEnterBars fail", zap.String("key", od.Key()), zap.Error(err))
 			}
 		}
 	}
@@ -520,7 +513,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 		if err != nil || exOrder.Amount == 0 {
 			if err != nil {
 				if o.showLog {
-					log.Warn("prec enter amount fail", zap.String("symbol", od.Symbol),
+					o.Logger().Warn("prec enter amount fail", zap.String("symbol", od.Symbol),
 						zap.Float64("amt", entAmount), zap.Error(err))
 				}
 			} else {
@@ -560,7 +553,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	if o.isLive() {
 		err = od.Save()
 		if err != nil {
-			log.Error("save order fail", zap.String("acc", o.Account),
+			o.Logger().Error("save order fail", zap.String("acc", o.Account),
 				zap.String("key", od.Key()), zap.Error(err))
 		}
 	}
@@ -594,7 +587,7 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 	if o.isLive() {
 		err = od.Save()
 		if err != nil {
-			log.Error("save order fail", zap.String("acc", o.Account),
+			o.Logger().Error("save order fail", zap.String("acc", o.Account),
 				zap.String("key", od.Key()), zap.Error(err))
 		}
 	}
@@ -701,7 +694,7 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 		}
 		err := od.Save()
 		if err != nil {
-			log.Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
+			o.Logger().Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
 		}
 		od = part
 	}
@@ -735,7 +728,7 @@ func (o *LocalOrderMgr) onLowFunds() {
 	wallets := o.walletsForOrder()
 	value := wallets.TotalLegal(nil, false)
 	if value < core.MinStakeAmount {
-		log.Warn("wallet low funds, no open orders, stop backTest..")
+		o.Logger().Warn("wallet low funds, no open orders, stop backTest..")
 		if o.stopBacktest != nil {
 			o.stopBacktest()
 		} else if stopAll := o.stopAll(); stopAll != nil {
@@ -913,7 +906,7 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 		return err
 	}
 	if len(o.zeroAmts) > 0 {
-		log.Warn("prec amount to zero", zap.Any("times", o.zeroAmts))
+		o.Logger().Warn("prec amount to zero", zap.Any("times", o.zeroAmts))
 	}
 	// Reset Unrealized P&L
 	// 重置未实现盈亏
@@ -946,15 +939,15 @@ func (o *LocalOrderMgr) CleanUp() *errs.Error {
 	}
 	// Filter unfilled orders
 	// 过滤未入场订单
-	state := o.orderState()
 	if o.runtimeDeps {
+		state := o.orderState()
 		if state == nil {
 			return errs.NewMsg(core.ErrRunTime, "runtime order state is required for cleanup")
 		}
+		state.FilterUnfilledHistoricalOrders()
 	} else {
-		state = ormo.LegacyState()
+		ormo.FilterUnfilledHistoricalOrders()
 	}
-	state.FilterUnfilledHistoricalOrders()
 	return nil
 }
 

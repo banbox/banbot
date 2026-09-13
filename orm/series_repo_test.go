@@ -14,6 +14,7 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -428,11 +429,13 @@ func TestWaitForQuestSeriesVisiblePropagatesHardQueryErrors(t *testing.T) {
 }
 
 func TestSeriesRepoTimescaleRoundTrip(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
 	runSeriesRepoRoundTrip(t, "timescale")
 }
 
 func TestSeriesRepoTimescaleRollbackKeepsRowsAndCoverageAtomic(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
 	if IsQuestDB {
 		t.Skip("postgres/timescale backend is not active")
@@ -480,6 +483,7 @@ func TestSeriesRepoTimescaleRollbackKeepsRowsAndCoverageAtomic(t *testing.T) {
 }
 
 func TestSeriesRepoTimescaleWriteRollsBackWhenCoverageFails(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
 	if IsQuestDB {
 		t.Skip("postgres/timescale backend is not active")
@@ -512,6 +516,7 @@ func TestSeriesRepoTimescaleWriteRollsBackWhenCoverageFails(t *testing.T) {
 }
 
 func TestSeriesRepoTimescaleShorterUpsertClearsStaleCoverage(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
 	if IsQuestDB {
 		t.Skip("postgres/timescale backend is not active")
@@ -557,6 +562,7 @@ func newSeriesRepoTestInfo(prefix string) (*SeriesInfo, int32) {
 }
 
 func TestSeriesRepoQuestDBRoundTrip(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.yml"))
 	runSeriesRepoRoundTrip(t, "quest")
 }
@@ -699,6 +705,7 @@ func hasSeriesGap(spans []*SRange, startMS, endMS int64) bool {
 }
 
 func TestSeriesRepoQuestDBDeleteHidesMiddleHole(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.yml"))
 	repo := DefaultSeriesRepo()
 	tableName := fmt.Sprintf("series_repo_quest_hole_%d", time.Now().UnixNano())

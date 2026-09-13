@@ -7,6 +7,7 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
@@ -26,6 +27,7 @@ func (e *localReadExchange) GetMarket(string) (*banexg.Market, *errs.Error) {
 func (e *localReadExchange) HasApi(string, string) bool { return false }
 
 func TestFastBulkOHLCVNoDownloadStillReadsLocalRows(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
 	if IsQuestDB {
 		t.Skip("postgres/timescale backend is not active")

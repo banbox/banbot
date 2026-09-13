@@ -16,16 +16,24 @@ import (
 	"github.com/banbox/banexg/errs"
 )
 
-func TestBackTestInitEnsuresThirdPartyBeforeLoop(t *testing.T) {
-	prevTimeRange := config.TimeRange
-	prevEnvReal := core.EnvReal
-	config.TimeRange = &config.TimeTuple{StartMS: 100_000, EndMS: 200_000}
-	core.EnvReal = false
-	defer func() {
-		config.TimeRange = prevTimeRange
-		core.EnvReal = prevEnvReal
-	}()
+func backtestTestCatalog(t *testing.T, sources ...string) *data.DataSourceCatalog {
+	t.Helper()
+	catalog := data.NewDataSourceCatalog()
+	for _, name := range sources {
+		source, err := data.NewFuncDataSource(
+			orm.NewSeriesInfo(name, "1d", []orm.SeriesField{{Name: "value", Type: "float", Role: "value"}}),
+			func(context.Context, *strat.DataSub, int64, int64) ([]*orm.DataRecord, error) { return nil, nil }, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := catalog.RegisterDataSource(source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return catalog
+}
 
+func TestBackTestInitEnsuresThirdPartyBeforeLoop(t *testing.T) {
 	job := &strat.StratJob{
 		Symbol: &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"},
 		Strat: &strat.TradeStrat{
@@ -35,9 +43,14 @@ func TestBackTestInitEnsuresThirdPartyBeforeLoop(t *testing.T) {
 			},
 		},
 	}
-	bt := &BackTest{}
+	deps := completeBacktestDepsForTest(biz.RuntimeDeps{Config: config.NewSnapshot(&config.Config{
+		TimeRange: &config.TimeTuple{StartMS: 100_000, EndMS: 200_000},
+		Accounts:  map[string]*config.AccountConfig{"default": {}},
+	})})
 	steps := make([]string, 0, 3)
-	bt.seriesRuntime = data.NewSeriesRuntime(nil)
+	deps.Strategies.SetJobMap(deps.DefaultAccount, "BTC/USDT_1h", map[string]*strat.StratJob{"stg": job})
+	bt := &BackTest{BackTestLite: &BackTestLite{Trader: newBacktestTraderForTest(t, deps)}}
+	bt.seriesRuntime = data.NewSeriesRuntimeWithCatalog(backtestTestCatalog(t, "macro"), nil)
 	bt.seriesRuntime.EnsureFunc = func(ctx context.Context, plan *data.ThirdPartySeriesBootstrap) *errs.Error {
 		steps = append(steps, fmt.Sprintf("ensure:%d:%d", plan.StartMS, plan.EndMS))
 		if len(plan.Subs) != 1 || plan.Subs[0].Source != "macro" {
@@ -49,13 +62,6 @@ func TestBackTestInitEnsuresThirdPartyBeforeLoop(t *testing.T) {
 		steps = append(steps, "loop")
 		return nil
 	}
-	jobs := map[string]map[string]*strat.StratJob{
-		"BTC/USDT_1h": {"stg": job},
-	}
-	prevAccJobs := strat.AccJobs
-	strat.AccJobs = map[string]map[string]map[string]*strat.StratJob{config.DefAcc: jobs}
-	defer func() { strat.AccJobs = prevAccJobs }()
-
 	if _, err := bt.ensureThirdPartySeriesRange(); err != nil {
 		t.Fatalf("ensureThirdPartySeriesRange failed: %v", err)
 	}
@@ -68,55 +74,36 @@ func TestBackTestInitEnsuresThirdPartyBeforeLoop(t *testing.T) {
 	}
 }
 
-func TestAllowBacktestKlineDownload(t *testing.T) {
-	previous := config.Data.BTNoKlineDownload
-	defer func() { config.Data.BTNoKlineDownload = previous }()
-
-	config.Data.BTNoKlineDownload = false
-	if !allowBacktestKlineDownload(false) {
+func TestBacktestKlineDownloadUsesRuntimeConfig(t *testing.T) {
+	deps := completeBacktestDepsForTest(biz.RuntimeDeps{Config: config.NewSnapshot(&config.Config{
+		Accounts: map[string]*config.AccountConfig{"default": {}},
+	})})
+	if !backtestKlineDownloadAllowed(false, &deps) {
 		t.Fatal("normal backtests should download missing klines by default")
 	}
-	if allowBacktestKlineDownload(true) {
+	if backtestKlineDownloadAllowed(true, &deps) {
 		t.Fatal("optimization backtests should not download klines")
 	}
-
-	config.Data.BTNoKlineDownload = true
-	if allowBacktestKlineDownload(false) {
+	deps.Config = config.NewSnapshot(&config.Config{BTNoKlineDownload: true, Accounts: map[string]*config.AccountConfig{"default": {}}})
+	if backtestKlineDownloadAllowed(false, &deps) {
 		t.Fatal("bt_no_kline_download should disable implicit kline downloads")
 	}
 }
 
 func TestBackTestEnsureThirdPartyRangeUsesWarmupDepthAndRunWindow(t *testing.T) {
-	prevTimeRange := config.TimeRange
-	prevEnvReal := core.EnvReal
-	config.TimeRange = &config.TimeTuple{StartMS: 500_000, EndMS: 800_000}
-	core.EnvReal = false
-	defer func() {
-		config.TimeRange = prevTimeRange
-		core.EnvReal = prevEnvReal
-	}()
-
-	prevAccJobs := strat.AccJobs
-	strat.AccJobs = map[string]map[string]map[string]*strat.StratJob{
-		config.DefAcc: {
-			"BTC/USDT_1h": {
-				"macro": {
-					Symbol: &orm.ExSymbol{ID: 11, Symbol: "BTC/USDT"},
-					Strat: &strat.TradeStrat{
-						Name: "macro",
-						OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
-							return []*strat.DataSub{{Source: "macro", ExSymbol: s.Symbol, TimeFrame: "1d", WarmupNum: 3}}
-						},
-					},
-				},
-			},
+	deps := completeBacktestDepsForTest(biz.RuntimeDeps{Config: config.NewSnapshot(&config.Config{
+		TimeRange: &config.TimeTuple{StartMS: 500_000, EndMS: 800_000}, Accounts: map[string]*config.AccountConfig{"default": {}},
+	})})
+	job := &strat.StratJob{Symbol: &orm.ExSymbol{ID: 11, Symbol: "BTC/USDT"}, Strat: &strat.TradeStrat{
+		Name: "macro", OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			return []*strat.DataSub{{Source: "macro", ExSymbol: s.Symbol, TimeFrame: "1d", WarmupNum: 3}}
 		},
-	}
-	defer func() { strat.AccJobs = prevAccJobs }()
+	}}
+	deps.Strategies.SetJobMap(deps.DefaultAccount, "BTC/USDT_1h", map[string]*strat.StratJob{"macro": job})
 
 	var gotStart, gotEnd int64
-	bt := &BackTest{}
-	bt.seriesRuntime = data.NewSeriesRuntime(nil)
+	bt := &BackTest{BackTestLite: &BackTestLite{Trader: newBacktestTraderForTest(t, deps)}}
+	bt.seriesRuntime = data.NewSeriesRuntimeWithCatalog(backtestTestCatalog(t, "macro"), nil)
 	bt.seriesRuntime.EnsureFunc = func(ctx context.Context, plan *data.ThirdPartySeriesBootstrap) *errs.Error {
 		gotStart, gotEnd = plan.StartMS, plan.EndMS
 		return nil
@@ -131,8 +118,17 @@ func TestBackTestEnsureThirdPartyRangeUsesWarmupDepthAndRunWindow(t *testing.T) 
 }
 
 func TestBackTestEnsureFailureStopsBeforeLoop(t *testing.T) {
-	bt := &BackTest{}
-	bt.seriesRuntime = data.NewSeriesRuntime(nil)
+	deps := completeBacktestDepsForTest(biz.RuntimeDeps{Config: config.NewSnapshot(&config.Config{
+		TimeRange: &config.TimeTuple{StartMS: 1_000, EndMS: 2_000}, Accounts: map[string]*config.AccountConfig{"default": {}},
+	})})
+	job := &strat.StratJob{Symbol: &orm.ExSymbol{ID: 5, Symbol: "BTC/USDT"}, Strat: &strat.TradeStrat{
+		Name: "macro", OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			return []*strat.DataSub{{Source: "macro", ExSymbol: s.Symbol, TimeFrame: "1d", WarmupNum: 1}}
+		},
+	}}
+	deps.Strategies.SetJobMap(deps.DefaultAccount, "BTC/USDT_1h", map[string]*strat.StratJob{"macro": job})
+	bt := &BackTest{BackTestLite: &BackTestLite{Trader: newBacktestTraderForTest(t, deps)}}
+	bt.seriesRuntime = data.NewSeriesRuntimeWithCatalog(backtestTestCatalog(t, "macro"), nil)
 	bt.seriesRuntime.EnsureFunc = func(ctx context.Context, plan *data.ThirdPartySeriesBootstrap) *errs.Error {
 		return errs.NewMsg(core.ErrRunTime, "bootstrap ensure source=macro sid=5 tf=1d phase=ensure: fail")
 	}
@@ -141,32 +137,6 @@ func TestBackTestEnsureFailureStopsBeforeLoop(t *testing.T) {
 		loopCalls++
 		return nil
 	}
-
-	prevTimeRange := config.TimeRange
-	prevEnvReal := core.EnvReal
-	prevAccJobs := strat.AccJobs
-	config.TimeRange = &config.TimeTuple{StartMS: 1_000, EndMS: 2_000}
-	core.EnvReal = false
-	strat.AccJobs = map[string]map[string]map[string]*strat.StratJob{
-		config.DefAcc: {
-			"BTC/USDT_1h": {
-				"macro": {
-					Symbol: &orm.ExSymbol{ID: 5, Symbol: "BTC/USDT"},
-					Strat: &strat.TradeStrat{
-						Name: "macro",
-						OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
-							return []*strat.DataSub{{Source: "macro", ExSymbol: s.Symbol, TimeFrame: "1d", WarmupNum: 1}}
-						},
-					},
-				},
-			},
-		},
-	}
-	defer func() {
-		config.TimeRange = prevTimeRange
-		core.EnvReal = prevEnvReal
-		strat.AccJobs = prevAccJobs
-	}()
 
 	_, err := bt.ensureThirdPartySeriesRange()
 	if err == nil || !strings.Contains(err.Short(), "phase=ensure") {
@@ -240,7 +210,7 @@ func TestExplicitBacktestSeriesSyncDoesNotUseLegacyCatalog(t *testing.T) {
 	t.Cleanup(state.Close)
 	state.SetRunMode(core.RunModeBackTest)
 	snapshot := config.NewSnapshot(&config.Config{TimeRange: &config.TimeTuple{StartMS: 100, EndMS: 200}})
-	trader := biz.NewTraderWithRuntimeDeps(biz.RuntimeDeps{
+	trader := newBacktestTraderForTest(t, biz.RuntimeDeps{
 		Core: state, Config: snapshot, Strategies: strat.NewState(),
 	})
 	deps := trader.RuntimeDependencies()
@@ -250,7 +220,7 @@ func TestExplicitBacktestSeriesSyncDoesNotUseLegacyCatalog(t *testing.T) {
 			return []*strat.DataSub{{Source: "opt_runtime_missing_catalog_test", ExSymbol: s.Symbol, TimeFrame: "1d"}}
 		}},
 	}
-	deps.Strategies.Jobs(deps.DefaultAccount)["BTC/USDT_1h"] = map[string]*strat.StratJob{"test": job}
+	deps.Strategies.SetJobMap(deps.DefaultAccount, "BTC/USDT_1h", map[string]*strat.StratJob{"test": job})
 	backtest := &BackTest{BackTestLite: &BackTestLite{Trader: trader}}
 	backtest.seriesRuntime = data.NewSeriesRuntime(nil)
 	ensureCalls := 0
@@ -297,27 +267,21 @@ func TestBackTestCollectRuntimeSubsExcludeKlineWarmPath(t *testing.T) {
 }
 
 func TestBackTestEnsureThirdPartyUsesLoadedJobs(t *testing.T) {
-	prevTimeRange := config.TimeRange
-	prevEnvReal := core.EnvReal
-	prevAccJobs := strat.AccJobs
-	config.TimeRange = &config.TimeTuple{StartMS: 10_000, EndMS: 20_000}
-	core.EnvReal = false
+	deps := completeBacktestDepsForTest(biz.RuntimeDeps{Config: config.NewSnapshot(&config.Config{
+		TimeRange: &config.TimeTuple{StartMS: 10_000, EndMS: 20_000}, Accounts: map[string]*config.AccountConfig{"default": {}},
+	})})
 	job1 := &strat.StratJob{Symbol: &orm.ExSymbol{ID: 21, Symbol: "BTC/USDT"}, Strat: &strat.TradeStrat{Name: "a", OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
 		return []*strat.DataSub{{Source: "macro", ExSymbol: s.Symbol, TimeFrame: "1d", WarmupNum: 1}}
 	}}}
 	job2 := &strat.StratJob{Symbol: &orm.ExSymbol{ID: 22, Symbol: "ETH/USDT"}, Strat: &strat.TradeStrat{Name: "b", OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
 		return []*strat.DataSub{{Source: "flow", ExSymbol: s.Symbol, TimeFrame: "1d", WarmupNum: 2}}
 	}}}
-	strat.AccJobs = map[string]map[string]map[string]*strat.StratJob{config.DefAcc: {"BTC/USDT_1h": {"a": job1}, "ETH/USDT_1h": {"b": job2}}}
-	defer func() {
-		config.TimeRange = prevTimeRange
-		core.EnvReal = prevEnvReal
-		strat.AccJobs = prevAccJobs
-	}()
+	deps.Strategies.SetJobMap(deps.DefaultAccount, "BTC/USDT_1h", map[string]*strat.StratJob{"a": job1})
+	deps.Strategies.SetJobMap(deps.DefaultAccount, "ETH/USDT_1h", map[string]*strat.StratJob{"b": job2})
 
 	var calls int
-	bt := &BackTest{}
-	bt.seriesRuntime = data.NewSeriesRuntime(nil)
+	bt := &BackTest{BackTestLite: &BackTestLite{Trader: newBacktestTraderForTest(t, deps)}}
+	bt.seriesRuntime = data.NewSeriesRuntimeWithCatalog(backtestTestCatalog(t, "macro", "flow"), nil)
 	bt.seriesRuntime.EnsureFunc = func(ctx context.Context, plan *data.ThirdPartySeriesBootstrap) *errs.Error {
 		calls++
 		if len(plan.Subs) != 2 {

@@ -9,6 +9,7 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
 )
 
@@ -47,6 +48,73 @@ func TestExplicitStrategyStateUsesOwnSelectionClockAndStrictMode(t *testing.T) {
 	}
 	if got := runtimeTimeMSFor(second); got != 222 {
 		t.Fatalf("second runtime time=%d, want 222", got)
+	}
+}
+
+func TestStratJobOpenOrdersSnapshotIsRuntimeAndAccountScoped(t *testing.T) {
+	if _, ok := (&StratJob{Account: "account"}).OpenOrdersSnapshot(); ok {
+		t.Fatal("unbound job exposed an authoritative order snapshot")
+	}
+	makeState := func() (*State, *ormo.OrderState, *core.State) {
+		runtimeCore, err := core.NewState(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtimeCore.BackTestMode = true
+		state := NewStateWithRuntime(runtimeCore, nil, nil, nil, nil)
+		orders := ormo.NewOrderState()
+		state.BindRuntimeOrders(orders)
+		return state, orders, runtimeCore
+	}
+	first, firstOrders, firstCore := makeState()
+	defer firstCore.Close()
+	second, secondOrders, secondCore := makeState()
+	defer secondCore.Close()
+
+	addOrder := func(orders *ormo.OrderState, account string, id int64) {
+		open, lock := orders.GetOpenODs(account)
+		lock.Lock()
+		open[id] = &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: id}}
+		lock.Unlock()
+	}
+	addOrder(firstOrders, "first", 1)
+	addOrder(firstOrders, "other", 2)
+	addOrder(secondOrders, "first", 3)
+
+	firstJob := &StratJob{Account: "first", strategyState: first}
+	firstSnapshot, ok := firstJob.OpenOrdersSnapshot()
+	if !ok || len(firstSnapshot) != 1 || firstSnapshot[0].ID != 1 {
+		t.Fatalf("first snapshot = %#v, ok=%v", firstSnapshot, ok)
+	}
+	firstSnapshot[0].ID = 99
+	check, ok := firstJob.OpenOrdersSnapshot()
+	if !ok || check[0].ID != 1 {
+		t.Fatalf("snapshot mutated runtime state: %#v, ok=%v", check, ok)
+	}
+	secondJob := &StratJob{Account: "first", strategyState: second}
+	secondSnapshot, ok := secondJob.OpenOrdersSnapshot()
+	if !ok || len(secondSnapshot) != 1 || secondSnapshot[0].ID != 3 {
+		t.Fatalf("second runtime snapshot = %#v, ok=%v", secondSnapshot, ok)
+	}
+}
+
+func TestStratJobOpenOrdersSnapshotRequiresLiveSync(t *testing.T) {
+	runtimeCore, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeCore.Close()
+	runtimeCore.BackTestMode = false
+	state := NewStateWithRuntime(runtimeCore, nil, nil, nil, nil)
+	orders := ormo.NewOrderState()
+	state.BindRuntimeOrders(orders)
+	job := &StratJob{Account: "live", strategyState: state}
+	if _, ok := job.OpenOrdersSnapshot(); ok {
+		t.Fatal("unsynchronized live state was treated as authoritative")
+	}
+	orders.SetSyncStamp("live", 1)
+	if snapshot, ok := job.OpenOrdersSnapshot(); !ok || len(snapshot) != 0 {
+		t.Fatalf("synced live snapshot = %#v, ok=%v", snapshot, ok)
 	}
 }
 
@@ -149,7 +217,7 @@ func TestExplicitStrategyStateProjectsOnlyItsKlineFields(t *testing.T) {
 				return []*DataSub{{Source: orm.SeriesSourceKline, ExSymbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"}, TimeFrame: tf, Fields: []string{field}}}
 			}},
 		}
-		state.InfoJobs("default")[DataSubKey(orm.SeriesSourceKline, sid, tf)] = map[string]*StratJob{"job": job}
+		state.SetInfoJobMap("default", DataSubKey(orm.SeriesSourceKline, sid, tf), map[string]*StratJob{"job": job})
 		return state
 	}
 
@@ -182,31 +250,43 @@ func TestStateRegistriesAreIndependent(t *testing.T) {
 	first := NewState()
 	second := NewState()
 
-	first.Versions["first"] = 1
-	first.Envs["first"] = nil
-	first.TmpEnvs["first"] = nil
-	first.AccJobs["first"] = nil
-	first.AccInfoJobs["first"] = nil
-	first.PairStrats["first"] = nil
-	first.ForbidJobs["first"] = nil
-	first.WsSubJobs["first"] = nil
+	first.versions["first"] = 1
+	first.envs["first"] = nil
+	first.tmpEnvs["first"] = nil
+	first.accJobs["first"] = nil
+	first.accInfoJobs["first"] = nil
+	first.pairStrats["first"] = nil
+	first.forbidJobs["first"] = nil
+	first.wsSubJobs["first"] = nil
 	first.AccOdSubs["first"] = []FnOdChange{nil}
 	first.AccFailOpens["first"] = map[string]int{"reason": 1}
 	first.SetCachedStrategy("first", &TradeStrat{Name: "first"})
 
-	if len(second.Versions) != 0 || len(second.Envs) != 0 || len(second.TmpEnvs) != 0 ||
-		len(second.AccJobs) != 0 || len(second.AccInfoJobs) != 0 || len(second.PairStrats) != 0 ||
-		len(second.ForbidJobs) != 0 || len(second.WsSubJobs) != 0 || len(second.AccOdSubs) != 0 ||
+	if len(second.versions) != 0 || len(second.envs) != 0 || len(second.tmpEnvs) != 0 ||
+		len(second.accJobs) != 0 || len(second.accInfoJobs) != 0 || len(second.pairStrats) != 0 ||
+		len(second.forbidJobs) != 0 || len(second.wsSubJobs) != 0 || len(second.AccOdSubs) != 0 ||
 		len(second.AccFailOpens) != 0 || len(second.CachedStrategies()) != 0 {
 		t.Fatal("state registries are shared")
+	}
+}
+
+func TestStateSetForbidJobsIsInstanceLocal(t *testing.T) {
+	first := NewState()
+	second := NewState()
+	first.SetForbidJobs(map[string]map[string]bool{"BTC/USDT_1m": {"first": true}})
+	if got := jobForbidType(first, "BTC/USDT", "1m", "first"); got != 2 {
+		t.Fatalf("first runtime forbid type = %d, want 2", got)
+	}
+	if got := jobForbidType(second, "BTC/USDT", "1m", "first"); got != 0 {
+		t.Fatalf("second runtime forbid type = %d, want 0", got)
 	}
 }
 
 func TestStateResetIsLocal(t *testing.T) {
 	first := NewState()
 	second := NewState()
-	first.Versions["first"] = 1
-	second.Versions["second"] = 2
+	first.versions["first"] = 1
+	second.versions["second"] = 2
 	first.AddOdSub("first", nil)
 	second.AddOdSub("second", nil)
 	first.AddAccFailOpen("first", "reason")
@@ -217,11 +297,11 @@ func TestStateResetIsLocal(t *testing.T) {
 
 	first.Reset()
 
-	if len(first.Versions) != 0 || len(first.AccOdSubs) != 0 || len(first.AccFailOpens) != 0 ||
+	if len(first.versions) != 0 || len(first.AccOdSubs) != 0 || len(first.AccFailOpens) != 0 ||
 		len(first.CachedStrategies()) != 0 || first.WsSubUnWatch != nil {
 		t.Fatal("reset did not clear the first state")
 	}
-	if second.Versions["second"] != 2 || len(second.AccOdSubs) != 1 ||
+	if second.versions["second"] != 2 || len(second.AccOdSubs) != 1 ||
 		second.AccFailOpens["second"]["reason"] != 1 {
 		t.Fatal("reset changed the second state")
 	}
@@ -236,11 +316,11 @@ func TestLegacyStateTracksPackageGlobals(t *testing.T) {
 	const key = "legacy_state_test"
 	Versions = map[string]int{key: 3}
 
-	state := LegacyState()
-	if state.Versions[key] != 3 {
+	state := legacyStateView()
+	if state.versions[key] != 3 {
 		t.Fatal("legacy state did not track the current global map")
 	}
-	state.Versions[key] = 4
+	state.versions[key] = 4
 	if oldVersions[key] != 0 {
 		t.Fatal("legacy state did not bind the current global map")
 	}
@@ -248,11 +328,11 @@ func TestLegacyStateTracksPackageGlobals(t *testing.T) {
 
 func TestExplicitStrategyStatesUseIndependentCacheAndCleanup(t *testing.T) {
 	const name = "explicit_state_cleanup_probe"
-	oldFactory, hadFactory := StratMake[name]
+	oldFactory, hadFactory := GetStrategyFactory(name)
 	oldCache := cacheStrats
 	cacheStrats = make(map[string]*TradeStrat)
 	exits := 0
-	StratMake[name] = func(*config.RunPolicyConfig) *TradeStrat {
+	RegisterStrategy(name, func(*config.RunPolicyConfig) *TradeStrat {
 		return &TradeStrat{
 			WsSubs:     map[string]string{core.WsSubTrade: "_cur_"},
 			OnWsTrades: func(*StratJob, string, []*banexg.Trade) {},
@@ -260,12 +340,12 @@ func TestExplicitStrategyStatesUseIndependentCacheAndCleanup(t *testing.T) {
 				exits++
 			},
 		}
-	}
+	})
 	t.Cleanup(func() {
 		if hadFactory {
-			StratMake[name] = oldFactory
+			RegisterStrategy(name, oldFactory)
 		} else {
-			delete(StratMake, name)
+			deleteStratFactory(name)
 		}
 		cacheStrats = oldCache
 	})
@@ -273,12 +353,12 @@ func TestExplicitStrategyStatesUseIndependentCacheAndCleanup(t *testing.T) {
 	policy := &config.RunPolicyConfig{Name: name}
 	legacy := New(policy)
 	first, second := NewState(), NewState()
-	firstStgy := newStrategyWithState(first, policy)
-	secondStgy := newStrategyWithState(second, policy)
+	firstStgy := first.NewStrategy(policy)
+	secondStgy := second.NewStrategy(policy)
 	if firstStgy == secondStgy || firstStgy == legacy {
 		t.Fatal("explicit states reused a global strategy object")
 	}
-	if newStrategyWithState(first, policy) != firstStgy {
+	if first.NewStrategy(policy) != firstStgy {
 		t.Fatal("state-local strategy cache missed an equivalent policy")
 	}
 	firstStgy.WsSubs[core.WsSubTrade] = "FIRST"
@@ -299,10 +379,10 @@ func TestExplicitStrategyStatesUseIndependentCacheAndCleanup(t *testing.T) {
 	})
 	job := func(state *State, stgy *TradeStrat, pair string) *StratJob {
 		job := &StratJob{Strat: stgy, Symbol: &orm.ExSymbol{Symbol: pair}, TimeFrame: "1m"}
-		state.AccJobs[config.DefAcc] = map[string]map[string]*StratJob{
+		state.accJobs[config.DefAcc] = map[string]map[string]*StratJob{
 			pair + "_1m": {stgy.Name: job},
 		}
-		state.WsSubJobs[core.WsSubTrade] = map[string]map[*StratJob]bool{
+		state.wsSubJobs[core.WsSubTrade] = map[string]map[*StratJob]bool{
 			pair: {job: true},
 		}
 		return job
@@ -310,14 +390,14 @@ func TestExplicitStrategyStatesUseIndependentCacheAndCleanup(t *testing.T) {
 	job(first, firstStgy, "FIRST/USDT")
 	job(second, secondStgy, "SECOND/USDT")
 	WsSubJobs = map[string]map[string]map[*StratJob]bool{
-		core.WsSubTrade: {"FIRST/USDT": {first.AccJobs[config.DefAcc]["FIRST/USDT_1m"][firstStgy.Name]: true}},
+		core.WsSubTrade: {"FIRST/USDT": {first.accJobs[config.DefAcc]["FIRST/USDT_1m"][firstStgy.Name]: true}},
 	}
 
 	ExitStratJobsWithState(first)
 	if firstUnwatch != 1 || secondUnwatch != 0 || legacyUnwatch != 0 {
 		t.Fatalf("first cleanup callbacks = first %d, second %d, legacy %d", firstUnwatch, secondUnwatch, legacyUnwatch)
 	}
-	if len(first.WsSubJobs) != 1 || len(first.WsSubJobs[core.WsSubTrade]) != 1 {
+	if len(first.wsSubJobs) != 1 || len(first.wsSubJobs[core.WsSubTrade]) != 1 {
 		t.Fatal("first cleanup did not preserve independent registry shape")
 	}
 	if exits != 1 {

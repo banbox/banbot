@@ -13,8 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sasha-s/go-deadlock"
-
 	"github.com/banbox/banexg"
 	utils2 "github.com/banbox/banexg/utils"
 
@@ -43,49 +41,60 @@ type FileNode struct {
 	Stamp int64  `json:"stamp,omitempty"` // 最后修改时间戳（文件夹时忽略）
 }
 
-// 添加一个互斥锁来控制编译状态
-var buildMutex deadlock.Mutex
-
-func regApiDev(api fiber.Router) {
-	api.Get("/ws", websocket.New(onWsDev))
-	api.Get("/strat_tree", getStratTree)
-	api.Get("/bt_tasks", getBtTasks)
-	api.Get("/bt_options", getBtOptions)
-	api.Get("/symbol_info", getSymbolInfo)
-	api.Get("/symbol_gaps", getSymbolGaps)
-	api.Get("/symbol_data", getSymbolData)
-	api.Get("/series_ranges", getSeriesRanges)
-	api.Post("/file_op", handleFileOp)
-	api.Post("/new_strat", handleNewStrat)
-	api.Get("/text", getText)
-	api.Get("/texts", getTexts)
-	api.Post("/save_text", saveText)
+func (s *DevServer) RegAPI(api fiber.Router) {
+	api.Get("/ws", websocket.New(s.onWsDev))
+	api.Get("/strat_tree", s.getStratTree)
+	api.Get("/bt_tasks", s.getBtTasks)
+	api.Get("/bt_options", s.getBtOptions)
+	api.Get("/symbol_info", s.getSymbolInfo)
+	api.Get("/symbol_gaps", s.getSymbolGaps)
+	api.Get("/symbol_data", s.getSymbolData)
+	api.Get("/series_ranges", s.getSeriesRanges)
+	api.Post("/file_op", s.handleFileOp)
+	api.Post("/new_strat", s.handleNewStrat)
+	api.Get("/text", s.getText)
+	api.Get("/texts", s.getTexts)
+	api.Post("/save_text", s.saveText)
 	api.Get("/build_envs", getBuildEnvs)
-	api.Post("/build", handleBuild)
+	api.Post("/build", s.handleBuild)
 	api.Get("/logs", getLogs)
 	api.Get("/available_strats", getAvailableStrats)
-	api.Post("/run_backtest", handleRunBacktest)
-	api.Get("/bt_detail", getBtDetail)
-	api.Get("/bt_orders", getBtOrders)
-	api.Get("/bt_config", getBtConfig)
-	api.Get("/bt_logs", getBtLogs)
-	api.Get("/bt_html", getBtHtml)
-	api.Get("/bt_strat_tree", getBtStratTree)
-	api.Get("/bt_strat_text", getBtStratText)
-	api.Get("/symbols", GetSymbolsHandler)
-	api.Post("/data_tools", handleDataTools)
-	api.Get("/download", handleDownload)
-	api.Get("/compare_assets", getCompareAssets)
-	api.Post("/update_note", handleUpdateNote)
-	api.Post("/del_bt_reports", delBacktestReports)
+	api.Post("/run_backtest", s.handleRunBacktest)
+	api.Get("/bt_detail", s.getBtDetail)
+	api.Get("/bt_orders", s.getBtOrders)
+	api.Get("/bt_config", s.getBtConfig)
+	api.Get("/bt_logs", s.getBtLogs)
+	api.Get("/bt_html", s.getBtHtml)
+	api.Get("/bt_strat_tree", s.getBtStratTree)
+	api.Get("/bt_strat_text", s.getBtStratText)
+	api.Get("/symbols", s.getSymbolsHandler)
+	api.Post("/data_tools", s.handleDataTools)
+	api.Get("/download", s.handleDownload)
+	api.Get("/compare_assets", s.getCompareAssets)
+	api.Post("/update_note", s.handleUpdateNote)
+	api.Post("/del_bt_reports", s.delBacktestReports)
 }
 
-func onWsDev(c *websocket.Conn) {
-	NewWsClient(c).HandleForever()
+func (s *DevServer) onWsDev(c *websocket.Conn) {
+	s.wsMu.Lock()
+	if s.stopped.Load() {
+		s.wsMu.Unlock()
+		_ = c.NetConn().SetDeadline(time.Now())
+		_ = c.Close()
+		return
+	}
+	s.wg.Add(1)
+	s.wsMu.Unlock()
+	defer s.wg.Done()
+	client := s.NewWsClient(c)
+	if client.closed.Load() {
+		return
+	}
+	client.HandleForever()
 }
 
-func getStratTree(c *fiber.Ctx) error {
-	baseDir, err := getRootDir()
+func (s *DevServer) getStratTree(c *fiber.Ctx) error {
+	baseDir, err := s.getRootDir()
 	if err != nil {
 		return err
 	}
@@ -137,7 +146,7 @@ func getStratTree(c *fiber.Ctx) error {
 }
 
 // handleFileOp 处理文件操作请求
-func handleFileOp(c *fiber.Ctx) error {
+func (s *DevServer) handleFileOp(c *fiber.Ctx) error {
 	type FileOp struct {
 		Op     string `json:"op"`
 		Path   string `json:"path"`
@@ -148,7 +157,7 @@ func handleFileOp(c *fiber.Ctx) error {
 		return err
 	}
 
-	baseDir, err := getRootDir()
+	baseDir, err := s.getRootDir()
 	if err != nil {
 		return err
 	}
@@ -201,7 +210,7 @@ func handleFileOp(c *fiber.Ctx) error {
 	})
 }
 
-func handleNewStrat(c *fiber.Ctx) error {
+func (s *DevServer) handleNewStrat(c *fiber.Ctx) error {
 	type NewStratArgs struct {
 		Folder string `json:"folder" validate:"required"`
 		Name   string `json:"name" validate:"required"`
@@ -211,7 +220,7 @@ func handleNewStrat(c *fiber.Ctx) error {
 	if err := base.VerifyArg(c, args, base.ArgBody); err != nil {
 		return err
 	}
-	err := makeNewStrat(args.Folder, args.Name)
+	err := s.makeNewStrat(args.Folder, args.Name)
 	if err != nil {
 		return err
 	}
@@ -221,14 +230,14 @@ func handleNewStrat(c *fiber.Ctx) error {
 	})
 }
 
-func parsePath(curPath string) (string, error) {
+func (s *DevServer) parsePath(curPath string) (string, error) {
 	if curPath == "" {
 		return "", nil
 	}
 	if strings.HasPrefix(curPath, "$") || strings.HasPrefix(curPath, "@") {
-		curPath = config.ParsePath(curPath)
+		curPath = s.ParsePath(curPath)
 	} else {
-		baseDir, err := getRootDir()
+		baseDir, err := s.getRootDir()
 		if err != nil {
 			return "", err
 		}
@@ -242,7 +251,7 @@ func parsePath(curPath string) (string, error) {
 // @config.yml, which normally resolves to the shared data directory; writing
 // there before parsing lets concurrent requests overwrite one another. The
 // returned paths are absolute and can be passed directly to config.GetConfig.
-func prepareBacktestConfigFiles(configs map[string]string, paths []string) (string, []string, error) {
+func (s *DevServer) prepareBacktestConfigFiles(configs map[string]string, paths []string) (string, []string, error) {
 	tempDir, err := os.MkdirTemp("", "banbot-web-config-")
 	if err != nil {
 		return "", nil, err
@@ -289,7 +298,7 @@ func prepareBacktestConfigFiles(configs map[string]string, paths []string) (stri
 			resolved = append(resolved, target)
 			continue
 		}
-		source, pathErr := parsePath(rawPath)
+		source, pathErr := s.parsePath(rawPath)
 		if pathErr != nil {
 			cleanup()
 			return "", nil, pathErr
@@ -361,7 +370,7 @@ func backtestConfigKey(rawPath string) string {
 	return filepath.Clean(filepath.FromSlash(path))
 }
 
-func getText(c *fiber.Ctx) error {
+func (s *DevServer) getText(c *fiber.Ctx) error {
 	type TextArgs struct {
 		Path string `query:"path" validate:"required"`
 	}
@@ -372,7 +381,7 @@ func getText(c *fiber.Ctx) error {
 		return err
 	}
 
-	args.Path, err = parsePath(args.Path)
+	args.Path, err = s.parsePath(args.Path)
 	if err != nil {
 		return err
 	}
@@ -387,7 +396,7 @@ func getText(c *fiber.Ctx) error {
 	})
 }
 
-func getTexts(c *fiber.Ctx) error {
+func (s *DevServer) getTexts(c *fiber.Ctx) error {
 	type TextArgs struct {
 		Paths []string `query:"paths" validate:"required"`
 	}
@@ -401,7 +410,7 @@ func getTexts(c *fiber.Ctx) error {
 	contents := make(map[string]string)
 	var realPath string
 	for _, path := range args.Paths {
-		realPath, err = parsePath(path)
+		realPath, err = s.parsePath(path)
 		if err != nil {
 			return err
 		}
@@ -419,7 +428,7 @@ func getTexts(c *fiber.Ctx) error {
 	return c.JSON(contents)
 }
 
-func saveText(c *fiber.Ctx) error {
+func (s *DevServer) saveText(c *fiber.Ctx) error {
 	type SaveTextArgs struct {
 		Path    string `json:"path" validate:"required"`
 		Content string `json:"content" validate:"required"`
@@ -438,7 +447,7 @@ func saveText(c *fiber.Ctx) error {
 		})
 	}
 
-	args.Path, err = parsePath(args.Path)
+	args.Path, err = s.parsePath(args.Path)
 	if err != nil {
 		return err
 	}
@@ -460,8 +469,8 @@ func saveText(c *fiber.Ctx) error {
 		return err
 	}
 	if strings.HasSuffix(args.Path, ".go") {
-		status.DirtyBin = true
-		BroadcastStatus()
+		s.setDirtyBin()
+		s.BroadcastStatus()
 	}
 
 	return c.JSON(fiber.Map{
@@ -470,7 +479,7 @@ func saveText(c *fiber.Ctx) error {
 }
 
 // handleBuild 处理编译请求
-func handleBuild(c *fiber.Ctx) error {
+func (s *DevServer) handleBuild(c *fiber.Ctx) error {
 	type BuildArgs struct {
 		OS   string `json:"os"`
 		Arch string `json:"arch"`
@@ -482,24 +491,17 @@ func handleBuild(c *fiber.Ctx) error {
 	}
 
 	// 检查是否正在编译
-	buildMutex.Lock()
-	if status.Building {
-		buildMutex.Unlock()
+	if !s.beginBuild() {
 		return c.Status(400).JSON(fiber.Map{
 			"msg": "Another build is in progress",
 		})
 	}
-	status.DirtyBin = false
-	status.Building = true
-	BroadcastStatus()
-	buildMutex.Unlock()
+	s.BroadcastStatus()
 
 	// 在函数结束时确保重置编译状态
 	defer func() {
-		buildMutex.Lock()
-		status.Building = false
-		BroadcastStatus()
-		buildMutex.Unlock()
+		s.finishBuild()
+		s.BroadcastStatus()
 	}()
 
 	// 设置目标操作系统和架构
@@ -513,7 +515,7 @@ func handleBuild(c *fiber.Ctx) error {
 	}
 
 	// 设置输出路径
-	outputPath, err := parsePath(args.Path)
+	outputPath, err := s.parsePath(args.Path)
 	if err != nil {
 		return err
 	}
@@ -591,7 +593,7 @@ func getLogs(c *fiber.Ctx) error {
 }
 
 // getBtTasks 获取回测任务列表
-func getBtTasks(c *fiber.Ctx) error {
+func (s *DevServer) getBtTasks(c *fiber.Ctx) error {
 	type TaskArgs struct {
 		Mode     string `query:"mode"`
 		Path     string `query:"path"`
@@ -614,7 +616,7 @@ func getBtTasks(c *fiber.Ctx) error {
 		args.Limit = 20
 	}
 
-	qu, conn, err := ormu.Conn()
+	qu, conn, err := s.Conn()
 	if err != nil {
 		return err
 	}
@@ -646,7 +648,7 @@ func getBtTasks(c *fiber.Ctx) error {
 	for _, task := range tasks {
 		taskMap := task.ToMap()
 		if args.Assets {
-			appendTaskAssets(task, taskMap)
+			s.appendTaskAssets(task, taskMap)
 		}
 		result = append(result, taskMap)
 	}
@@ -668,11 +670,11 @@ type assetChartData struct {
 	Datasets []assetChartDataset `json:"datasets"`
 }
 
-func appendTaskAssets(task *ormu.Task, taskMap map[string]interface{}) {
+func (s *DevServer) appendTaskAssets(task *ormu.Task, taskMap map[string]interface{}) {
 	if task == nil || task.Path == "" || task.Status < int64(ormu.BtStatusDone) {
 		return
 	}
-	reportDirs, err := taskReportDirs(task)
+	reportDirs, err := s.taskReportDirs(task)
 	if err != nil {
 		return
 	}
@@ -763,8 +765,8 @@ func downsampleSeries(values []float64, maxPoints int) []float64 {
 }
 
 // getBtOptions 获取回测选项列表
-func getBtOptions(c *fiber.Ctx) error {
-	qu, conn, err2 := ormu.Conn()
+func (s *DevServer) getBtOptions(c *fiber.Ctx) error {
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -854,7 +856,7 @@ func getAvailableStrats(c *fiber.Ctx) error {
 }
 
 // handleRunBacktest 处理回测请求
-func handleRunBacktest(c *fiber.Ctx) error {
+func (s *DevServer) handleRunBacktest(c *fiber.Ctx) error {
 	type RunBtArgs struct {
 		Separate bool              `json:"separate"`
 		Configs  map[string]string `json:"configs" validate:"required"`
@@ -870,7 +872,7 @@ func handleRunBacktest(c *fiber.Ctx) error {
 	// Snapshot request-owned editor contents before parsing. In particular,
 	// @config.yml must never be written to the shared data directory because a
 	// concurrent request could otherwise change the file between hash and load.
-	configTempDir, paths, err := prepareBacktestConfigFiles(args.Configs, args.Paths)
+	configTempDir, paths, err := s.prepareBacktestConfigFiles(args.Configs, args.Paths)
 	if err != nil {
 		return err
 	}
@@ -911,7 +913,7 @@ func handleRunBacktest(c *fiber.Ctx) error {
 		return err2
 	}
 	hashVal := utils.MD5(cfgData)[:10]
-	backtestRoot := config.ParsePath("$backtest")
+	backtestRoot := s.BacktestDir()
 	basePath := filepath.Join(backtestRoot, hashVal)
 	// Reserve the output before writing the config. Mkdir is the allocation
 	// operation, so concurrent submissions of the same configuration receive
@@ -940,7 +942,7 @@ func handleRunBacktest(c *fiber.Ctx) error {
 	btPath := fmt.Sprintf("$backtest/%s", taskPath)
 
 	// 添加回测任务
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -1037,7 +1039,11 @@ func handleRunBacktest(c *fiber.Ctx) error {
 		backupOwned = true
 	}
 	keepOutput = true
-	taskNotifyChan <- task
+	select {
+	case <-s.ctx.Done():
+		return context.Canceled
+	case s.notify <- task:
+	}
 
 	return c.JSON(fiber.Map{
 		"code": 200,
@@ -1046,8 +1052,8 @@ func handleRunBacktest(c *fiber.Ctx) error {
 }
 
 // getBtPath 获取回测输出目录
-func getBtPath(taskID int64) (string, error) {
-	qu, conn, err2 := ormu.Conn()
+func (s *DevServer) getBtPath(taskID int64) (string, error) {
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return "", err2
 	}
@@ -1056,11 +1062,11 @@ func getBtPath(taskID int64) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("query task failed: %v", err)
 	}
-	return taskBaseDir(task)
+	return s.taskBaseDir(task)
 }
 
-func getBtReportPath(taskID int64, marker string) (string, error) {
-	qu, conn, connErr := ormu.Conn()
+func (s *DevServer) getBtReportPath(taskID int64, marker string) (string, error) {
+	qu, conn, connErr := s.Conn()
 	if connErr != nil {
 		return "", connErr
 	}
@@ -1069,7 +1075,7 @@ func getBtReportPath(taskID int64, marker string) (string, error) {
 	if queryErr != nil {
 		return "", fmt.Errorf("query task failed: %v", queryErr)
 	}
-	dirs, pathErr := taskReportDirs(task)
+	dirs, pathErr := s.taskReportDirs(task)
 	if pathErr != nil {
 		return "", pathErr
 	}
@@ -1091,7 +1097,7 @@ func parseBtResult(path string) (*opt.BTResult, error) {
 }
 
 // getBtDetail 获取回测详情
-func getBtDetail(c *fiber.Ctx) error {
+func (s *DevServer) getBtDetail(c *fiber.Ctx) error {
 	type DetailArgs struct {
 		TaskID int64 `query:"task_id" validate:"required"`
 	}
@@ -1100,7 +1106,7 @@ func getBtDetail(c *fiber.Ctx) error {
 		return err
 	}
 
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -1109,11 +1115,11 @@ func getBtDetail(c *fiber.Ctx) error {
 	if err != nil {
 		return fmt.Errorf("query task failed: %v", err)
 	}
-	basePath, pathErr := taskBaseDir(task)
+	basePath, pathErr := s.taskBaseDir(task)
 	if pathErr != nil {
 		return pathErr
 	}
-	reportDirs, pathErr := taskReportDirs(task)
+	reportDirs, pathErr := s.taskReportDirs(task)
 	if pathErr != nil {
 		return pathErr
 	}
@@ -1148,7 +1154,9 @@ func getBtDetail(c *fiber.Ctx) error {
 	}
 	var exsMap map[string]*orm.ExSymbol
 	if cfg != nil {
-		exsMap = orm.GetExSymbolMap(cfg.Exchange.Name, cfg.MarketType)
+		if symbols := s.symbols(); symbols != nil {
+			exsMap = symbols.GetExSymbolMap(cfg.Exchange.Name, cfg.MarketType)
+		}
 	}
 
 	return c.JSON(fiber.Map{
@@ -1160,7 +1168,7 @@ func getBtDetail(c *fiber.Ctx) error {
 }
 
 // getBtOrders 获取回测订单
-func getBtOrders(c *fiber.Ctx) error {
+func (s *DevServer) getBtOrders(c *fiber.Ctx) error {
 	type OrderArgs struct {
 		TaskID    int64  `query:"task_id" validate:"required"`
 		Page      int    `query:"page"`
@@ -1186,7 +1194,7 @@ func getBtOrders(c *fiber.Ctx) error {
 		args.PageSize = 20
 	}
 
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -1197,7 +1205,7 @@ func getBtOrders(c *fiber.Ctx) error {
 		return fmt.Errorf("query task failed: %v", err)
 	}
 
-	reportDirs, pathErr := taskReportDirs(task)
+	reportDirs, pathErr := s.taskReportDirs(task)
 	if pathErr != nil {
 		return pathErr
 	}
@@ -1210,13 +1218,11 @@ func getBtOrders(c *fiber.Ctx) error {
 			}
 			return statErr
 		}
-		cached, lock, loadErr := getGobOrders(dbPath)
+		cached, loadErr := s.getGobOrders(dbPath)
 		if loadErr != nil {
 			return loadErr
 		}
-		lock.Lock()
 		allOrders = append(allOrders, cached...)
-		lock.Unlock()
 	}
 
 	var orders = make([]*ormo.InOutOrder, 0, len(allOrders)/10)
@@ -1368,7 +1374,7 @@ func getBtOrders(c *fiber.Ctx) error {
 }
 
 // getBtConfig 获取回测配置
-func getBtConfig(c *fiber.Ctx) error {
+func (s *DevServer) getBtConfig(c *fiber.Ctx) error {
 	type ConfigArgs struct {
 		TaskID int64 `query:"task_id" validate:"required"`
 	}
@@ -1377,7 +1383,7 @@ func getBtConfig(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	btPath, err := s.getBtPath(args.TaskID)
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1385,7 +1391,7 @@ func getBtConfig(c *fiber.Ctx) error {
 	// 读取config.yml
 	configPath := filepath.Join(btPath, "config.yml")
 	if !utils.Exists(configPath) {
-		btPath, err = getBtReportPath(args.TaskID, "config.yml")
+		btPath, err = s.getBtReportPath(args.TaskID, "config.yml")
 		if err != nil {
 			return fmt.Errorf("get backtest path failed: %v", err)
 		}
@@ -1402,7 +1408,7 @@ func getBtConfig(c *fiber.Ctx) error {
 }
 
 // getBtLogs 获取回测日志
-func getBtLogs(c *fiber.Ctx) error {
+func (s *DevServer) getBtLogs(c *fiber.Ctx) error {
 	type LogArgs struct {
 		TaskID int64 `query:"task_id" validate:"required"`
 		End    int64 `query:"end"`
@@ -1413,7 +1419,7 @@ func getBtLogs(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtReportPath(args.TaskID, "out.log")
+	btPath, err := s.getBtReportPath(args.TaskID, "out.log")
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1439,7 +1445,7 @@ func getBtLogs(c *fiber.Ctx) error {
 }
 
 // getBtHtml 获取回测HTML报告
-func getBtHtml(c *fiber.Ctx) error {
+func (s *DevServer) getBtHtml(c *fiber.Ctx) error {
 	type HtmlArgs struct {
 		TaskID int64  `query:"task_id" validate:"required"`
 		Type   string `query:"type" validate:"required"` // assets 或 enters
@@ -1453,7 +1459,7 @@ func getBtHtml(c *fiber.Ctx) error {
 	if args.Type == "enters" {
 		marker = "enters.html"
 	}
-	btPath, err := getBtReportPath(args.TaskID, marker)
+	btPath, err := s.getBtReportPath(args.TaskID, marker)
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1477,7 +1483,7 @@ func getBtHtml(c *fiber.Ctx) error {
 }
 
 // getBtStratTree 获取回测策略代码文件树
-func getBtStratTree(c *fiber.Ctx) error {
+func (s *DevServer) getBtStratTree(c *fiber.Ctx) error {
 	type TreeArgs struct {
 		TaskID int64 `query:"task_id" validate:"required"`
 	}
@@ -1486,7 +1492,7 @@ func getBtStratTree(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtReportPath(args.TaskID, "detail.json")
+	btPath, err := s.getBtReportPath(args.TaskID, "detail.json")
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1541,7 +1547,7 @@ func getBtStratTree(c *fiber.Ctx) error {
 	})
 }
 
-func getBtStratText(c *fiber.Ctx) error {
+func (s *DevServer) getBtStratText(c *fiber.Ctx) error {
 	type TextArgs struct {
 		TaskID int64  `query:"task_id" validate:"required"`
 		Path   string `query:"path" validate:"required"`
@@ -1552,7 +1558,7 @@ func getBtStratText(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtReportPath(args.TaskID, "detail.json")
+	btPath, err := s.getBtReportPath(args.TaskID, "detail.json")
 	if err != nil {
 		return err
 	}
@@ -1572,7 +1578,7 @@ func getBtStratText(c *fiber.Ctx) error {
 }
 
 // GetSymbolsHandler 获取交易品种列表
-func GetSymbolsHandler(c *fiber.Ctx) error {
+func (s *DevServer) getSymbolsHandler(c *fiber.Ctx) error {
 	type SymbolArgs struct {
 		Exchange string `query:"exchange"`
 		Market   string `query:"market"`
@@ -1588,13 +1594,13 @@ func GetSymbolsHandler(c *fiber.Ctx) error {
 		return err
 	}
 	if strings.TrimSpace(args.Exchange) == "" {
-		args.Exchange = core.ExgName
+		args.Exchange, args.Market, _ = s.identity()
 	}
 	if strings.TrimSpace(args.Market) == "" {
-		args.Market = core.Market
+		_, args.Market, _ = s.identity()
 	}
 
-	if _, ok := exg.AllowExgIds[args.Exchange]; !ok && args.Exchange != "" {
+	if !exg.IsAllowedExgID(args.Exchange) && args.Exchange != "" {
 		return fmt.Errorf("invalid exchange: %s", args.Exchange)
 	}
 	if _, ok := banexg.AllMarketTypes[args.Market]; !ok && args.Market != "" {
@@ -1605,20 +1611,17 @@ func GetSymbolsHandler(c *fiber.Ctx) error {
 		args.Limit = 20
 	}
 
-	// 获取所有品种
-	allSymbols := orm.GetExSymbols(args.Exchange, args.Market)
-
-	if len(allSymbols) == 0 && args.Exchange != "" {
-		exchange, err := exg.GetWith(args.Exchange, args.Market, "")
-		if err != nil {
-			return err
-		}
-		err = orm.InitExg(exchange)
-		if err != nil {
-			return err
-		}
-		allSymbols = orm.GetExSymbols(args.Exchange, args.Market)
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
 	}
+	defer cleanup()
+	// 获取所有品种
+	symbols := deps.Symbols
+	if symbols == nil {
+		return fmt.Errorf("dev server symbol state is required")
+	}
+	allSymbols := symbols.GetExSymbols(args.Exchange, args.Market)
 
 	// 过滤
 	var filtered []*orm.ExSymbol
@@ -1685,23 +1688,34 @@ func GetSymbolsHandler(c *fiber.Ctx) error {
 }
 
 // getSymbolInfo 获取品种详情
-func getSymbolInfo(c *fiber.Ctx) error {
+func (s *DevServer) getSymbolInfo(c *fiber.Ctx) error {
 	type SymbolArgs struct {
-		ID int32 `query:"id" validate:"required"`
+		ID       int32  `query:"id" validate:"required"`
+		Exchange string `query:"exchange"`
+		Market   string `query:"market"`
 	}
 	var args = new(SymbolArgs)
 	if err_ := base.VerifyArg(c, args, base.ArgQuery); err_ != nil {
 		return err_
 	}
 
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	// 获取品种信息
-	symbol := orm.GetSymbolByID(args.ID)
+	symbols := deps.Symbols
+	if symbols == nil {
+		return fmt.Errorf("dev server symbol state is required")
+	}
+	symbol := symbols.GetSymbolByID(args.ID)
 	if symbol == nil {
 		return fmt.Errorf("symbol not found: %d", args.ID)
 	}
 
 	// 获取K线信息
-	sess, conn, err := orm.Conn(nil)
+	sess, conn, err := dataConnFor(c.Context(), deps)
 	if err != nil {
 		return err
 	}
@@ -1715,7 +1729,7 @@ func getSymbolInfo(c *fiber.Ctx) error {
 	var adjFactors []*orm.AdjInfo
 	if symbol.Combined {
 		var err *errs.Error
-		adjFactors, err = orm.GetAdjs(args.ID)
+		adjFactors, err = sess.GetAdjs(args.ID)
 		if err != nil {
 			return err
 		}
@@ -1729,7 +1743,7 @@ func getSymbolInfo(c *fiber.Ctx) error {
 }
 
 // getSymbolGaps 获取品种空洞数据
-func getSymbolGaps(c *fiber.Ctx) error {
+func (s *DevServer) getSymbolGaps(c *fiber.Ctx) error {
 	type GapsArgs struct {
 		ID        int32  `query:"id" validate:"required"`
 		TimeFrame string `query:"tf"`
@@ -1737,6 +1751,8 @@ func getSymbolGaps(c *fiber.Ctx) error {
 		EndMS     int64  `query:"end"`
 		Offset    int    `query:"offset"`
 		Limit     int    `query:"limit"`
+		Exchange  string `query:"exchange"`
+		Market    string `query:"market"`
 	}
 	var args = new(GapsArgs)
 	if err := base.VerifyArg(c, args, base.ArgQuery); err != nil {
@@ -1748,7 +1764,12 @@ func getSymbolGaps(c *fiber.Ctx) error {
 	}
 
 	// 查询范围数据（has_data=false表示空洞/无数据区间）
-	sess, conn, err := orm.Conn(nil)
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	sess, conn, err := dataConnFor(c.Context(), deps)
 	if err != nil {
 		return err
 	}
@@ -1775,13 +1796,15 @@ func getSymbolGaps(c *fiber.Ctx) error {
 }
 
 // getSymbolData 获取品种K线数据
-func getSymbolData(c *fiber.Ctx) error {
+func (s *DevServer) getSymbolData(c *fiber.Ctx) error {
 	type DataArgs struct {
 		ID        int32  `query:"id" validate:"required"`
 		TimeFrame string `query:"tf" validate:"required"`
 		StartMS   int64  `query:"start"`
 		EndMS     int64  `query:"end"`
 		Limit     int    `query:"limit"`
+		Exchange  string `query:"exchange"`
+		Market    string `query:"market"`
 	}
 	var args = new(DataArgs)
 	if err := base.VerifyArg(c, args, base.ArgQuery); err != nil {
@@ -1795,14 +1818,23 @@ func getSymbolData(c *fiber.Ctx) error {
 		args.StartMS = core.MSMinStamp
 	}
 
-	sess, conn, err := orm.Conn(nil)
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	sess, conn, err := dataConnFor(c.Context(), deps)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
 
 	// 查询K线数据
-	exs := orm.GetSymbolByID(args.ID)
+	symbols := deps.Symbols
+	if symbols == nil {
+		return fmt.Errorf("dev server symbol state is required")
+	}
+	exs := symbols.GetSymbolByID(args.ID)
 	data, err := sess.QuerySeries(exs, args.TimeFrame, args.StartMS, args.EndMS, args.Limit, false)
 	if err != nil {
 		return err
@@ -1844,7 +1876,7 @@ func getSymbolData(c *fiber.Ctx) error {
 	})
 }
 
-func getSeriesRanges(c *fiber.Ctx) error {
+func (s *DevServer) getSeriesRanges(c *fiber.Ctx) error {
 	type Args struct {
 		Source    string `query:"source"`
 		Table     string `query:"table"`
@@ -1853,6 +1885,8 @@ func getSeriesRanges(c *fiber.Ctx) error {
 		HasData   string `query:"has_data"`
 		Offset    int    `query:"offset"`
 		Limit     int    `query:"limit"`
+		Exchange  string `query:"exchange"`
+		Market    string `query:"market"`
 	}
 	var args Args
 	if err := base.VerifyArg(c, &args, base.ArgQuery); err != nil {
@@ -1863,7 +1897,12 @@ func getSeriesRanges(c *fiber.Ctx) error {
 		val := args.HasData == "true" || args.HasData == "1"
 		hasData = &val
 	}
-	sess, conn, err := orm.Conn(nil)
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	sess, conn, err := dataConnFor(c.Context(), deps)
 	if err != nil {
 		return err
 	}
@@ -1901,7 +1940,7 @@ func getBuildEnvs(c *fiber.Ctx) error {
 }
 
 // handleDownload 处理文件下载请求
-func handleDownload(c *fiber.Ctx) error {
+func (s *DevServer) handleDownload(c *fiber.Ctx) error {
 	type DownloadArgs struct {
 		Path string `query:"path" validate:"required"`
 	}
@@ -1911,7 +1950,7 @@ func handleDownload(c *fiber.Ctx) error {
 	}
 
 	// 解析路径
-	absPath, err := parsePath(args.Path)
+	absPath, err := s.parsePath(args.Path)
 	if err != nil {
 		return err
 	}
@@ -1937,7 +1976,7 @@ func handleDownload(c *fiber.Ctx) error {
 	return c.SendFile(absPath)
 }
 
-func getCompareAssets(c *fiber.Ctx) error {
+func (s *DevServer) getCompareAssets(c *fiber.Ctx) error {
 	ids := c.Query("ids")
 	if ids == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "ids is required")
@@ -1947,7 +1986,7 @@ func getCompareAssets(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "at least 2 ids are required")
 	}
 
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -1967,7 +2006,7 @@ func getCompareAssets(c *fiber.Ctx) error {
 		if task.Path == "" {
 			continue
 		}
-		reportDirs, pathErr := taskReportDirs(task)
+		reportDirs, pathErr := s.taskReportDirs(task)
 		if pathErr != nil {
 			return pathErr
 		}
@@ -2003,7 +2042,7 @@ func getCompareAssets(c *fiber.Ctx) error {
 	return c.Send(content)
 }
 
-func delBacktestReports(c *fiber.Ctx) error {
+func (s *DevServer) delBacktestReports(c *fiber.Ctx) error {
 	type DelArgs struct {
 		IDs    []int64  `json:"ids"`
 		Hashes []string `json:"hashes"`
@@ -2013,7 +2052,7 @@ func delBacktestReports(c *fiber.Ctx) error {
 		return err
 	}
 
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -2036,7 +2075,7 @@ func delBacktestReports(c *fiber.Ctx) error {
 			taskIDs[id] = struct{}{}
 		}
 		if task.Path != "" {
-			path, pathErr := taskBaseDir(task)
+			path, pathErr := s.taskBaseDir(task)
 			if pathErr != nil {
 				failNum++
 				log.Error("invalid backtest task path", zap.Int64("id", id), zap.String("path", task.Path), zap.Error(pathErr))
@@ -2046,7 +2085,7 @@ func delBacktestReports(c *fiber.Ctx) error {
 		}
 	}
 	for _, hash := range args.Hashes {
-		path, pathErr := taskBaseDir(&ormu.Task{Path: hash})
+		path, pathErr := s.taskBaseDir(&ormu.Task{Path: hash})
 		if pathErr != nil {
 			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("invalid backtest path: %v", pathErr))
 		}
@@ -2088,7 +2127,7 @@ func delBacktestReports(c *fiber.Ctx) error {
 }
 
 // handleUpdateNote 处理更新回测任务备注的请求
-func handleUpdateNote(c *fiber.Ctx) error {
+func (s *DevServer) handleUpdateNote(c *fiber.Ctx) error {
 	type UpdateNoteArgs struct {
 		TaskID int64  `json:"taskId" validate:"required"`
 		Note   string `json:"note"`
@@ -2098,7 +2137,7 @@ func handleUpdateNote(c *fiber.Ctx) error {
 		return err
 	}
 
-	qu, conn, err := ormu.Conn()
+	qu, conn, err := s.Conn()
 	if err != nil {
 		return err
 	}

@@ -30,81 +30,250 @@ import (
 	"github.com/banbox/banexg/errs"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/gofiber/fiber/v2"
+	"github.com/sasha-s/go-deadlock"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
 func regApiBiz(api fiber.Router) {
-	api.Get("/version", getVersion)
-	api.Get("/balance", getBalance)
-	api.Post("/refresh_wallet", postRefreshWallet)
-	api.Get("/today_num", getTodayNum)
-	api.Get("/statistics", getStatistics)
-	api.Get("/incomes", getIncomes)
-	api.Get("/task_pairs", getTaskPairs)
-	api.Get("/exs_map", getExsMap)
-	api.Get("/orders", getOrders)
-	api.Post("/calc_profits", postCalcProfits)
-	api.Post("/exit_order", postExitOrder)
-	api.Post("/close_exg_pos", postCloseExgPos)
-	api.Post("/delay_entry", postDelayEntry)
-	api.Get("/config", getConfig)
-	api.Get("/stg_jobs", getStratJobs)
-	api.Get("/performance", getPerformance)
-	api.Post("/start_down_trade", postStartDownTrade)
-	api.Get("/get_down_trade", getDownTrade)
-	api.Get("/group_sta", getGroupSta)
-	api.Get("/log", getLog)
-	api.Get("/bot_info", getBotInfo)
+	newAPIHandlers(nil).regApiBiz(api)
+}
+
+// apiHandlers owns the concrete runtime dependencies used by one API server.
+// A nil deps value preserves the legacy process-global entrypoint only.
+type apiHandlers struct {
+	deps   *biz.RuntimeDeps
+	remote *biz.RemoteCommandService
+}
+
+func newAPIHandlers(deps *biz.RuntimeDeps) *apiHandlers {
+	h := &apiHandlers{deps: deps}
+	if deps == nil {
+		h.remote = biz.NewRemoteCommandService()
+	} else {
+		h.remote = biz.NewRemoteCommandServiceWithRuntimeDeps(*deps)
+	}
+	return h
+}
+
+func (h *apiHandlers) regApiBiz(api fiber.Router) {
+	api.Get("/version", h.getVersion)
+	api.Get("/balance", h.getBalance)
+	api.Post("/refresh_wallet", h.postRefreshWallet)
+	api.Get("/today_num", h.getTodayNum)
+	api.Get("/statistics", h.getStatistics)
+	api.Get("/incomes", h.getIncomes)
+	api.Get("/task_pairs", h.getTaskPairs)
+	api.Get("/exs_map", h.getExsMap)
+	api.Get("/orders", h.getOrders)
+	api.Post("/calc_profits", h.postCalcProfits)
+	api.Post("/exit_order", h.postExitOrder)
+	api.Post("/close_exg_pos", h.postCloseExgPos)
+	api.Post("/delay_entry", h.postDelayEntry)
+	api.Get("/config", h.getConfig)
+	api.Get("/stg_jobs", h.getStratJobs)
+	api.Get("/performance", h.getPerformance)
+	api.Post("/start_down_trade", h.postStartDownTrade)
+	api.Get("/get_down_trade", h.getDownTrade)
+	api.Get("/group_sta", h.getGroupSta)
+	api.Get("/log", h.getLog)
+	api.Get("/bot_info", h.getBotInfo)
+}
+
+func (h *apiHandlers) runtime() bool { return h != nil && h.deps != nil }
+
+func (h *apiHandlers) wallet(account string) *biz.BanWallets {
+	if h.runtime() {
+		if h.deps.Trading == nil {
+			return nil
+		}
+		return h.deps.Trading.Wallet(account)
+	}
+	return biz.GetWallets(account)
+}
+
+func (h *apiHandlers) openOrders(account string) (map[int64]*ormo.InOutOrder, *deadlock.Mutex) {
+	if h.runtime() {
+		if h.deps.Orders == nil {
+			return nil, nil
+		}
+		return h.deps.Orders.GetOpenODs(account)
+	}
+	return ormo.GetOpenODs(account)
+}
+
+func (h *apiHandlers) taskID(account string) int64 {
+	if h.runtime() {
+		if h.deps.Orders == nil {
+			return -1
+		}
+		return h.deps.Orders.GetTaskID(account)
+	}
+	return ormo.GetTaskID(account)
+}
+
+func (h *apiHandlers) orderConn(write bool) (*ormo.Queries, *orm.TrackedDB, *errs.Error) {
+	if h.runtime() {
+		if h.deps.Orders == nil {
+			return nil, nil, errs.NewMsg(core.ErrBadConfig, "runtime orders are required")
+		}
+		return h.deps.Orders.Conn(write)
+	}
+	return ormo.Conn(orm.DbTrades, write)
+}
+
+func (h *apiHandlers) exchange() banexg.BanExchange {
+	if h.runtime() {
+		return h.deps.Exchange
+	}
+	return exg.Default
+}
+
+func (h *apiHandlers) market() string {
+	if h.runtime() && h.deps.Core != nil {
+		return h.deps.Core.Market
+	}
+	return core.Market
+}
+
+func (h *apiHandlers) exchangeName() string {
+	if h.runtime() && h.deps.Core != nil {
+		return h.deps.Core.ExgName
+	}
+	return core.ExgName
+}
+
+func (h *apiHandlers) startAt() int64 {
+	if h.runtime() && h.deps.Core != nil {
+		return h.deps.Core.StartAt
+	}
+	return core.StartAt
+}
+
+func (h *apiHandlers) noEnterUntil(account string) int64 {
+	if h.runtime() {
+		if h.deps.Core == nil {
+			return 0
+		}
+		until, _ := h.deps.Core.NoEnterUntilFor(account)
+		return until
+	}
+	until, _ := core.LegacyNoEnterUntilFor(account)
+	return until
+}
+
+func (h *apiHandlers) runEnv() string {
+	if h.runtime() && h.deps.Core != nil {
+		return h.deps.Core.RunEnv
+	}
+	return core.RunEnv
+}
+
+func (h *apiHandlers) lastProcessMS() int64 {
+	if h.runtime() {
+		if h.deps.Market != nil && h.deps.Market.PairCopied != nil {
+			return h.deps.Market.PairCopied.LastCopiedMs()
+		}
+		return 0
+	}
+	return core.LastCopiedMs
+}
+
+func (h *apiHandlers) nowMS() int64 {
+	if h.runtime() && h.deps.Clock != nil {
+		return h.deps.Clock.TimeMS()
+	}
+	return btime.UTCStamp()
+}
+
+func (h *apiHandlers) price(symbol string) float64 {
+	if h.runtime() {
+		if h.deps.Market == nil || h.deps.Market.Prices == nil {
+			return 0
+		}
+		return h.deps.Market.Prices.GetPriceSafeExpAt(h.nowMS(), symbol, "", com.PriceExpireMS)
+	}
+	return com.GetPriceSafe(symbol, "")
+}
+
+func (h *apiHandlers) jobs(account string) map[string]map[string]*strat.StratJob {
+	if h.runtime() {
+		if h.deps.Strategies == nil {
+			return nil
+		}
+		return h.deps.Strategies.JobMapsView(account)
+	}
+	return strat.GetJobs(account)
+}
+
+func (h *apiHandlers) strategyVersions() map[string]int {
+	if h.runtime() {
+		if h.deps.Strategies == nil {
+			return nil
+		}
+		return h.deps.Strategies.VersionsSnapshot()
+	}
+	return strat.LegacyVersionsSnapshot()
+}
+
+func (h *apiHandlers) configView() *config.Config {
+	if h.runtime() {
+		return h.deps.ConfigView()
+	}
+	return &config.Data
+}
+
+func (h *apiHandlers) symbolMap() map[string]*orm.ExSymbol {
+	if h.runtime() {
+		if h.deps.Symbols == nil || h.deps.Core == nil {
+			return nil
+		}
+		return h.deps.Symbols.GetExSymbolMap(h.deps.Core.ExgName, h.deps.Core.Market)
+	}
+	return orm.GetExSymbolMap(core.ExgName, core.Market)
 }
 
 type FnAccCB = func(acc string) error
-type FnAccDbCB = func(acc string, sess *orm.Queries) error
 
 func wrapAccount(c *fiber.Ctx, cb FnAccCB) error {
 	account := c.Get("X-Account")
 	if account == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "header `X-Account` missing")
 	}
+	if roles, ok := c.Locals("accounts").(map[string]string); ok {
+		if _, allowed := roles[account]; !allowed {
+			return fiber.NewError(fiber.StatusForbidden, "account unauthorized")
+		}
+	}
 	return cb(account)
 }
 
-func wrapAccDb(c *fiber.Ctx, cb FnAccDbCB) error {
-	return wrapAccount(c, func(acc string) error {
-		ctx := context.Background()
-		sess, conn, err := orm.Conn(ctx)
-		if err != nil {
-			return err
-		}
-		err_ := cb(acc, sess)
-		conn.Release()
-		return err_
-	})
-}
-
-func getVersion(c *fiber.Ctx) error {
+func (h *apiHandlers) getVersion(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"version": core.Version,
 	})
 }
 
-func getBalance(c *fiber.Ctx) error {
+func (h *apiHandlers) getBalance(c *fiber.Ctx) error {
 	return wrapAccount(c, func(account string) error {
-		wallet := biz.GetWallets(account)
+		wallet := h.wallet(account)
+		if wallet == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
+		}
 		return c.JSON(fiber.Map{
-			"items": walletItems(wallet),
+			"items": h.walletItems(wallet),
 			"total": wallet.FiatValue(true),
 		})
 	})
 }
 
-func walletItems(wallet *biz.BanWallets) []map[string]interface{} {
+func (h *apiHandlers) walletItems(wallet *biz.BanWallets) []map[string]interface{} {
 	items := make([]map[string]interface{}, 0)
 	for coin, item := range wallet.Items {
 		total := item.Total(true)
 		totalFiat := float64(0)
 		if total > 0 {
-			price := com.GetPriceSafe(coin, "")
+			price := h.price(coin)
 			if price > 0 {
 				totalFiat = total * price
 			}
@@ -121,11 +290,25 @@ func walletItems(wallet *biz.BanWallets) []map[string]interface{} {
 	return items
 }
 
-func postRefreshWallet(c *fiber.Ctx) error {
+func (h *apiHandlers) postRefreshWallet(c *fiber.Ctx) error {
 	return wrapAccount(c, func(account string) error {
-		wallet := biz.GetWallets(account)
-		if core.EnvReal {
-			rsp, err := exg.Default.FetchBalance(map[string]interface{}{
+		wallet := h.wallet(account)
+		if wallet == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
+		}
+		envReal := core.EnvReal
+		if h.runtime() {
+			if h.deps.Core == nil {
+				return errs.NewMsg(core.ErrBadConfig, "runtime core is required")
+			}
+			envReal = h.deps.Core.EnvReal
+		}
+		if envReal {
+			exchange := h.exchange()
+			if exchange == nil {
+				return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+			}
+			rsp, err := exchange.FetchBalance(map[string]interface{}{
 				banexg.ParamAccount: account,
 			})
 			if err != nil {
@@ -136,15 +319,18 @@ func postRefreshWallet(c *fiber.Ctx) error {
 			log.Info("RefreshWallet", zap.String("acc", account), zap.Any("rsp", rsp))
 		}
 		return c.JSON(fiber.Map{
-			"items": walletItems(wallet),
+			"items": h.walletItems(wallet),
 			"total": wallet.FiatValue(true),
 		})
 	})
 }
 
-func getTodayNum(c *fiber.Ctx) error {
+func (h *apiHandlers) getTodayNum(c *fiber.Ctx) error {
 	return wrapAccount(c, func(acc string) error {
-		openOds, lock := ormo.GetOpenODs(acc)
+		openOds, lock := h.openOrders(acc)
+		if lock == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime orders are required")
+		}
 		lock.Lock()
 		dayOpenNum := len(openOds)
 		dayOpenPft := float64(0)
@@ -155,13 +341,13 @@ func getTodayNum(c *fiber.Ctx) error {
 
 		// 获取今日完成的订单
 		tfMSecs := int64(utils2.TFToSecs("1d") * 1000)
-		nowMS := btime.UTCStamp()
+		nowMS := h.nowMS()
 		todayStartMS := utils2.AlignTfMSecs(nowMS, tfMSecs)
-		taskId := ormo.GetTaskID(acc)
+		taskId := h.taskID(acc)
 		dayDoneNum := 0
 		dayDonePft := float64(0)
 		if taskId > 0 {
-			sess, conn, err := ormo.Conn(orm.DbTrades, false)
+			sess, conn, err := h.orderConn(false)
 			if err != nil {
 				return err
 			}
@@ -190,25 +376,28 @@ func getTodayNum(c *fiber.Ctx) error {
 	})
 }
 
-func getStatistics(c *fiber.Ctx) error {
+func (h *apiHandlers) getStatistics(c *fiber.Ctx) error {
 	return wrapAccount(c, func(acc string) error {
-		sess, conn, err := ormo.Conn(orm.DbTrades, false)
+		sess, conn, err := h.orderConn(false)
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
-		taskId := ormo.GetTaskID(acc)
+		taskId := h.taskID(acc)
 		orders, err := sess.GetOrders(ormo.GetOrdersArgs{
 			TaskID: taskId,
 		})
 		if err != nil {
 			return err
 		}
-		wallets := biz.GetWallets(acc)
+		wallets := h.wallet(acc)
+		if wallets == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
+		}
 		var totalDuration int64 // All order holding seconds 所有订单持仓秒数
 		var profitSum, profitRateSum, totalCost float64
 		var doneProfitSum, doneProfitRateSum, doneTotalCost float64
-		var curMS = btime.UTCStamp()
+		var curMS = h.nowMS()
 		var odNum, winNum, lossNum, doneNum int
 		var winValue, lossValue float64
 		var bestPair string
@@ -274,7 +463,7 @@ func getStatistics(c *fiber.Ctx) error {
 		initBalance := wallets.TotalLegal(nil, true) - profitSum
 		ddPct, ddVal, _, _, _, _ := utils.CalcMaxDrawDown(dayProfits, initBalance)
 
-		jobs := strat.GetJobs(acc)
+		jobs := h.jobs(acc)
 		pairs := make(map[string]bool)
 		tfMap := make(map[string]bool)
 		for key := range jobs {
@@ -307,16 +496,16 @@ func getStatistics(c *fiber.Ctx) error {
 			"maxDrawdownPct":    ddPct * 100,
 			"maxDrawdownVal":    ddVal,
 			"totalCost":         totalCost,
-			"botStartMs":        core.StartAt,
+			"botStartMs":        h.startAt(),
 			"runTfs":            utils.KeysOfMap(tfMap),
-			"exchange":          core.ExgName,
-			"market":            core.Market,
+			"exchange":          h.exchangeName(),
+			"market":            h.market(),
 			"pairs":             utils.KeysOfMap(pairs),
 		})
 	})
 }
 
-func getOrders(c *fiber.Ctx) error {
+func (h *apiHandlers) getOrders(c *fiber.Ctx) error {
 	type OrderArgs struct {
 		StartMs   int64  `query:"startMs"`
 		StopMs    int64  `query:"stopMs"`
@@ -340,12 +529,12 @@ func getOrders(c *fiber.Ctx) error {
 		CurPrice float64 `json:"curPrice"`
 	}
 	getBotOrders := func(acc string) error {
-		sess, conn, err := ormo.Conn(orm.DbTrades, false)
+		sess, conn, err := h.orderConn(false)
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
-		taskId := ormo.GetTaskID(acc)
+		taskId := h.taskID(acc)
 		var symbols []string
 		if data.Symbols != "" {
 			symbols = strings.Split(data.Symbols, ",")
@@ -396,7 +585,7 @@ func getOrders(c *fiber.Ctx) error {
 			if od.ExitTag != "" && od.Exit != nil && od.Exit.Price > 0 {
 				price = od.Exit.Price
 			} else {
-				price = com.GetPriceSafe(od.Symbol, "")
+				price = h.price(od.Symbol)
 				if price > 0 {
 					od.UpdateProfits(price)
 					err = od.UpdateTrailing(price)
@@ -419,13 +608,17 @@ func getOrders(c *fiber.Ctx) error {
 		})
 	}
 	getExgOrders := func(acc string) error {
-		orders, err := exg.Default.FetchOrders(data.Symbols, data.StartMs, data.Limit, map[string]interface{}{
+		exchange := h.exchange()
+		if exchange == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+		}
+		orders, err := exchange.FetchOrders(data.Symbols, data.StartMs, data.Limit, map[string]interface{}{
 			banexg.ParamAccount: acc,
 		})
 		if err != nil {
 			return err
 		}
-		algoOrders, err := exg.Default.FetchOrders(data.Symbols, data.StartMs, data.Limit, map[string]interface{}{
+		algoOrders, err := exchange.FetchOrders(data.Symbols, data.StartMs, data.Limit, map[string]interface{}{
 			banexg.ParamAccount:   acc,
 			banexg.ParamAlgoOrder: true,
 		})
@@ -456,7 +649,11 @@ func getOrders(c *fiber.Ctx) error {
 		if data.Symbols != "" {
 			symbols = strings.Split(data.Symbols, ",")
 		}
-		posList, err := exg.Default.FetchPositions(symbols, map[string]interface{}{
+		exchange := h.exchange()
+		if exchange == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+		}
+		posList, err := exchange.FetchPositions(symbols, map[string]interface{}{
 			banexg.ParamAccount: acc,
 		})
 		if err != nil {
@@ -479,16 +676,23 @@ func getOrders(c *fiber.Ctx) error {
 	})
 }
 
-func postCalcProfits(c *fiber.Ctx) error {
+func (h *apiHandlers) postCalcProfits(c *fiber.Ctx) error {
 	return wrapAccount(c, func(acc string) error {
-		openOds, lock := ormo.GetOpenODs(acc)
+		openOds, lock := h.openOrders(acc)
+		if lock == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime orders are required")
+		}
 		if len(openOds) == 0 {
 			return nil
 		}
 		lock.Lock()
 		defer lock.Unlock()
-		items, err := exg.Default.FetchLastPrices(nil, map[string]interface{}{
-			banexg.ParamMarket:  core.Market,
+		exchange := h.exchange()
+		if exchange == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+		}
+		items, err := exchange.FetchLastPrices(nil, map[string]interface{}{
+			banexg.ParamMarket:  h.market(),
 			banexg.ParamAccount: acc,
 		})
 		if err != nil {
@@ -498,7 +702,14 @@ func postCalcProfits(c *fiber.Ctx) error {
 		for _, it := range items {
 			prices[it.Symbol] = it.Price
 		}
-		com.SetPrices(prices, "")
+		if h.runtime() {
+			if h.deps.Market == nil || h.deps.Market.Prices == nil {
+				return errs.NewMsg(core.ErrBadConfig, "runtime prices are required")
+			}
+			h.deps.Market.Prices.SetPricesAt(h.nowMS(), prices, "")
+		} else {
+			com.SetPrices(prices, "")
+		}
 		fails := make(map[string]bool)
 		for _, od := range openOds {
 			if price, ok := prices[od.Symbol]; ok {
@@ -519,7 +730,7 @@ func postCalcProfits(c *fiber.Ctx) error {
 	})
 }
 
-func postExitOrder(c *fiber.Ctx) error {
+func (h *apiHandlers) postExitOrder(c *fiber.Ctx) error {
 	type ForceExitArgs struct {
 		OrderID string `json:"orderId" validate:"required"`
 	}
@@ -540,7 +751,7 @@ func postExitOrder(c *fiber.Ctx) error {
 			}
 			orderID = parsed
 		}
-		res, err := biz.CloseBotOrdersRemote(biz.RemoteCommand{
+		res, err := h.remote.CloseOrders(biz.RemoteCommand{
 			Source:      biz.RemoteSourceWeb,
 			Actor:       c.IP(),
 			Account:     acc,
@@ -565,7 +776,7 @@ func postExitOrder(c *fiber.Ctx) error {
 	})
 }
 
-func postCloseExgPos(c *fiber.Ctx) error {
+func (h *apiHandlers) postCloseExgPos(c *fiber.Ctx) error {
 	type CloseArgs struct {
 		Symbol    string  `json:"symbol" validate:"required"`
 		Side      string  `json:"side"`
@@ -579,7 +790,7 @@ func postCloseExgPos(c *fiber.Ctx) error {
 	}
 	return wrapAccount(c, func(acc string) error {
 		doneNum := 0
-		res, err := biz.RunRemoteCommand(biz.RemoteCommand{
+		res, err := h.remote.Run(biz.RemoteCommand{
 			Source:      biz.RemoteSourceWeb,
 			Actor:       c.IP(),
 			Account:     acc,
@@ -591,7 +802,11 @@ func postCloseExgPos(c *fiber.Ctx) error {
 			ExecClose: func() (int, int, *errs.Error) {
 				var reqs []*CloseArgs
 				if data.Symbol == "all" {
-					posList, err := exg.Default.FetchPositions(nil, map[string]interface{}{
+					exchange := h.exchange()
+					if exchange == nil {
+						return 0, 0, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+					}
+					posList, err := exchange.FetchPositions(nil, map[string]interface{}{
 						banexg.ParamAccount: acc,
 					})
 					if err != nil {
@@ -618,10 +833,10 @@ func postCloseExgPos(c *fiber.Ctx) error {
 						banexg.ParamAccount:       acc,
 						banexg.ParamClientOrderId: fmt.Sprintf("bandash_%v", rand.Intn(1000)),
 					}
-					if banexg.IsContract(core.Market) {
+					if banexg.IsContract(h.market()) {
 						params[banexg.ParamPositionSide] = strings.ToUpper(q.Side)
 					}
-					res, err := exg.Default.CreateOrder(q.Symbol, q.OrderType, side, q.Amount, q.Price, params)
+					res, err := h.exchange().CreateOrder(q.Symbol, q.OrderType, side, q.Amount, q.Price, params)
 					if err != nil {
 						return closeNum, 0, err
 					}
@@ -649,7 +864,7 @@ func postCloseExgPos(c *fiber.Ctx) error {
 	})
 }
 
-func getIncomes(c *fiber.Ctx) error {
+func (h *apiHandlers) getIncomes(c *fiber.Ctx) error {
 	type CloseArgs struct {
 		InType    string `query:"intype" validate:"required"`
 		Symbol    string `query:"symbol"`
@@ -661,7 +876,11 @@ func getIncomes(c *fiber.Ctx) error {
 		return err
 	}
 	return wrapAccount(c, func(acc string) error {
-		items, err := exg.Default.FetchIncomeHistory(data.InType, data.Symbol, data.StartTime, data.Limit, map[string]interface{}{
+		exchange := h.exchange()
+		if exchange == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+		}
+		items, err := exchange.FetchIncomeHistory(data.InType, data.Symbol, data.StartTime, data.Limit, map[string]interface{}{
 			banexg.ParamAccount: acc,
 		})
 		if err != nil {
@@ -671,7 +890,7 @@ func getIncomes(c *fiber.Ctx) error {
 	})
 }
 
-func postDelayEntry(c *fiber.Ctx) error {
+func (h *apiHandlers) postDelayEntry(c *fiber.Ctx) error {
 	type DelayArgs struct {
 		Secs float64 `json:"secs"`
 	}
@@ -680,8 +899,8 @@ func postDelayEntry(c *fiber.Ctx) error {
 		return err
 	}
 	return wrapAccount(c, func(acc string) error {
-		untilMS := btime.UTCStamp() + int64(data.Secs*1000)
-		res, err := biz.RunRemoteCommand(biz.RemoteCommand{
+		untilMS := h.nowMS() + int64(data.Secs*1000)
+		res, err := h.remote.Run(biz.RemoteCommand{
 			Source:      biz.RemoteSourceWeb,
 			Actor:       c.IP(),
 			Account:     acc,
@@ -699,16 +918,20 @@ func postDelayEntry(c *fiber.Ctx) error {
 	})
 }
 
-func getConfig(c *fiber.Ctx) error {
+func (h *apiHandlers) getConfig(c *fiber.Ctx) error {
 	// 因在线更新配置有很多限制，大多数配置无法即刻生效，故暂不提供在线修改
-	data, err := config.DumpYaml(true)
+	cfg := h.configView()
+	if cfg == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime configuration is required")
+	}
+	data, err := cfg.Desensitize().DumpYaml()
 	if err != nil {
 		return err
 	}
 	return c.SendString(string(data))
 }
 
-func getStratJobs(c *fiber.Ctx) error {
+func (h *apiHandlers) getStratJobs(c *fiber.Ctx) error {
 	type JobItem struct {
 		Pair      string  `json:"pair"`
 		Strategy  string  `json:"strategy"`
@@ -718,14 +941,17 @@ func getStratJobs(c *fiber.Ctx) error {
 		LastBarMS int64   `json:"lastBarMS"`
 	}
 	return wrapAccount(c, func(acc string) error {
-		jobs := strat.GetJobs(acc)
+		jobs := h.jobs(acc)
 		items := make([]*JobItem, 0, len(jobs))
-		openOds, lock := ormo.GetOpenODs(acc)
+		openOds, lock := h.openOrders(acc)
+		if lock == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime orders are required")
+		}
 		lock.Lock()
 		defer lock.Unlock()
 		for pairTF, jobMap := range jobs {
 			arr := strings.Split(pairTF, "_")
-			price := com.GetPriceSafe(arr[0], "")
+			price := h.price(arr[0])
 			for stgName, job := range jobMap {
 				var odNum = 0
 				for _, od := range openOds {
@@ -746,12 +972,12 @@ func getStratJobs(c *fiber.Ctx) error {
 		}
 		return c.JSON(fiber.Map{
 			"jobs":   items,
-			"strats": strat.Versions,
+			"strats": h.strategyVersions(),
 		})
 	})
 }
 
-func getTaskPairs(c *fiber.Ctx) error {
+func (h *apiHandlers) getTaskPairs(c *fiber.Ctx) error {
 	type PairArgs struct {
 		Start int64 `query:"start"`
 		Stop  int64 `query:"stop"`
@@ -761,13 +987,13 @@ func getTaskPairs(c *fiber.Ctx) error {
 		return err_
 	}
 	return wrapAccount(c, func(acc string) error {
-		sess, conn, err := ormo.Conn(orm.DbTrades, false)
+		sess, conn, err := h.orderConn(false)
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
 		ctx := context.Background()
-		taskId := ormo.GetTaskID(acc)
+		taskId := h.taskID(acc)
 		if data.Stop == 0 {
 			data.Stop = math.MaxInt64
 		}
@@ -783,8 +1009,11 @@ func getTaskPairs(c *fiber.Ctx) error {
 	})
 }
 
-func getExsMap(c *fiber.Ctx) error {
-	exsMap := orm.GetExSymbolMap(core.ExgName, core.Market)
+func (h *apiHandlers) getExsMap(c *fiber.Ctx) error {
+	exsMap := h.symbolMap()
+	if exsMap == nil && h.runtime() {
+		return errs.NewMsg(core.ErrBadConfig, "runtime symbols and core are required")
+	}
 	return c.JSON(fiber.Map{
 		"data": exsMap,
 	})
@@ -801,7 +1030,7 @@ type GroupItem struct {
 	Orders    []*ormo.InOutOrder `json:"-"`
 }
 
-func getPerformance(c *fiber.Ctx) error {
+func (h *apiHandlers) getPerformance(c *fiber.Ctx) error {
 	type PerfArgs struct {
 		GroupBy   string   `query:"groupBy"`
 		Pairs     []string `query:"pairs"`
@@ -814,12 +1043,12 @@ func getPerformance(c *fiber.Ctx) error {
 		return err_
 	}
 	return wrapAccount(c, func(acc string) error {
-		sess, conn, err := ormo.Conn(orm.DbTrades, false)
+		sess, conn, err := h.orderConn(false)
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
-		taskId := ormo.GetTaskID(acc)
+		taskId := h.taskID(acc)
 		orders, err := sess.GetOrders(ormo.GetOrdersArgs{
 			TaskID:      taskId,
 			Pairs:       data.Pairs,
@@ -913,7 +1142,7 @@ type GroupSta struct {
 	MaxTime int64 `json:"maxTime"`
 }
 
-func getGroupSta(c *fiber.Ctx) error {
+func (h *apiHandlers) getGroupSta(c *fiber.Ctx) error {
 	type GroupStaArgs struct {
 		Symbol    string `query:"symbol"`
 		Strategy  string `query:"strategy"`
@@ -942,12 +1171,12 @@ func getGroupSta(c *fiber.Ctx) error {
 		}
 	}
 	return wrapAccount(c, func(acc string) error {
-		sess, conn, err := ormo.Conn(orm.DbTrades, false)
+		sess, conn, err := h.orderConn(false)
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
-		taskId := ormo.GetTaskID(acc)
+		taskId := h.taskID(acc)
 		var symbols []string
 		if data.Symbol != "" {
 			symbols = strings.Split(data.Symbol, ",")
@@ -990,7 +1219,7 @@ func getGroupSta(c *fiber.Ctx) error {
 	})
 }
 
-func postStartDownTrade(c *fiber.Ctx) error {
+func (h *apiHandlers) postStartDownTrade(c *fiber.Ctx) error {
 	type DownArgs struct {
 		StartTime string `json:"startTime" validate:"required"`
 		EndTime   string `json:"endTime" validate:"required"`
@@ -1009,7 +1238,11 @@ func postStartDownTrade(c *fiber.Ctx) error {
 		return err_
 	}
 	return wrapAccount(c, func(acc string) error {
-		rsp, err := exg.StartAccountDownload(exg.Default, data.Source, acc, startMS, endMS, btime.UTCStamp())
+		exchange := h.exchange()
+		if exchange == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+		}
+		rsp, err := exg.StartAccountDownload(exchange, data.Source, acc, startMS, endMS, h.nowMS())
 		if err != nil {
 			return err
 		}
@@ -1017,7 +1250,7 @@ func postStartDownTrade(c *fiber.Ctx) error {
 	})
 }
 
-func getDownTrade(c *fiber.Ctx) error {
+func (h *apiHandlers) getDownTrade(c *fiber.Ctx) error {
 	type DownArgs struct {
 		ID     string `query:"id" validate:"required"`
 		Source string `query:"source" validate:"required"`
@@ -1027,7 +1260,11 @@ func getDownTrade(c *fiber.Ctx) error {
 		return err_
 	}
 	return wrapAccount(c, func(acc string) error {
-		rsp, err := exg.GetAccountDownload(exg.Default, data.Source, acc, data.ID, btime.UTCStamp())
+		exchange := h.exchange()
+		if exchange == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+		}
+		rsp, err := exg.GetAccountDownload(exchange, data.Source, acc, data.ID, h.nowMS())
 		if err != nil {
 			return err
 		}
@@ -1035,7 +1272,7 @@ func getDownTrade(c *fiber.Ctx) error {
 	})
 }
 
-func getLog(c *fiber.Ctx) error {
+func (h *apiHandlers) getLog(c *fiber.Ctx) error {
 	type LogArgs struct {
 		End   int64 `query:"end"`   // 结束位置坐标，0表示末尾
 		Limit int64 `query:"limit"` // 读取字节数大小
@@ -1058,7 +1295,7 @@ func getLog(c *fiber.Ctx) error {
 	})
 }
 
-func getBotInfo(c *fiber.Ctx) error {
+func (h *apiHandlers) getBotInfo(c *fiber.Ctx) error {
 	percent, err := cpu.Percent(time.Second, false)
 	if err != nil {
 		return err
@@ -1068,12 +1305,12 @@ func getBotInfo(c *fiber.Ctx) error {
 		return err
 	}
 	return wrapAccount(c, func(acc string) error {
-		stopUntil, _ := core.LegacyNoEnterUntilFor(acc)
+		stopUntil := h.noEnterUntil(acc)
 		return c.JSON(fiber.Map{
 			"cpuPct":       percent[0],
 			"ramPct":       v.UsedPercent,
-			"lastProcess":  core.LastCopiedMs,
-			"env":          core.RunEnv,
+			"lastProcess":  h.lastProcessMS(),
+			"env":          h.runEnv(),
 			"allowTradeAt": stopUntil,
 		})
 	})

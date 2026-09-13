@@ -672,17 +672,30 @@ func SetRunPolicy(index bool, items ...*RunPolicyConfig) *errs.Error {
 
 // GetStaticPairs 合并pairs和run_policy.pairs返回，bool表示是否需要动态计算
 func GetStaticPairs() ([]string, bool) {
-	var res = make([]string, 0, len(Pairs))
-	res = append(res, Pairs...)
+	return Data.StaticPairs()
+}
+
+// StaticPairs returns this immutable configuration's explicit pair set and
+// whether a policy still requires dynamic pair discovery.
+func (c *Config) StaticPairs() ([]string, bool) {
+	if c == nil {
+		return nil, false
+	}
+	var res = make([]string, 0, len(c.Pairs))
+	res = append(res, c.Pairs...)
 	needCalc := false
-	for _, p := range RunPolicy {
+	for _, p := range c.RunPolicy {
+		if p == nil {
+			needCalc = true
+			continue
+		}
 		if len(p.Pairs) > 0 {
 			res = append(res, p.Pairs...)
 		} else {
 			needCalc = true
 		}
 	}
-	if len(Pairs) > 0 {
+	if len(c.Pairs) > 0 {
 		needCalc = false
 	}
 	if len(res) == 0 {

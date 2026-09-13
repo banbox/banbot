@@ -4,8 +4,6 @@ import (
 	"math"
 	"testing"
 
-	"github.com/banbox/banbot/btime"
-	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
@@ -61,46 +59,42 @@ func TestLiquidationWalletResetPolicy(t *testing.T) {
 
 func TestBacktestLiquidationCleanupSettlesContractOnce(t *testing.T) {
 	mgr := setupLocalCleanupTest(t, true, false)
-	oldChargeOnBomb, oldNetCost := config.ChargeOnBomb, config.BTNetCost
-	t.Cleanup(func() {
-		config.ChargeOnBomb, config.BTNetCost = oldChargeOnBomb, oldNetCost
-	})
-	config.ChargeOnBomb = false
-	config.BTNetCost = 0
 
 	const (
 		symbol  = "LIQUIDATIONCLEANUP/USDT:USDT"
 		initial = 100.0
 	)
-	restoreSymbols, err := orm.InstallFrozenExSymbols([]*orm.ExSymbol{{
+	err := mgr.symbols.SetExSymbols([]*orm.ExSymbol{{
 		ID: 1, Exchange: "binance", Market: banexg.MarketLinear, Symbol: symbol,
 	}})
 	if err != nil {
 		t.Fatalf("install test symbol: %v", err)
 	}
-	t.Cleanup(restoreSymbols)
 
-	btime.CurTimeMS = 1_700_000_000_000
-	com.SetBarPrice(symbol, 0.5)
+	mgr.clock.SetTimeMS(1_700_000_000_000)
+	mgr.prices.SetBarPriceAt(mgr.clock.TimeMS(), symbol, 0.5)
 	od := &ormo.InOutOrder{
 		IOrder: &ormo.IOrder{
 			ID: 1, Sid: 1, Symbol: symbol, Status: ormo.InOutStatusFullEnter,
 			Timeframe: "1m", Strategy: "liquidation-test", Leverage: 1,
-			EnterAt: btime.CurTimeMS - 60_000, Profit: -99.5,
+			EnterAt: mgr.clock.TimeMS() - 60_000, Profit: -99.5,
 		},
 		Enter: &ormo.ExOrder{
 			Enter: true, OrderType: banexg.OdTypeMarket, Side: banexg.OdSideBuy,
 			Price: 100, Average: 100, Amount: 1, Filled: 1, Status: ormo.OdStatusClosed,
 		},
 	}
-	wallets := GetWallets(config.DefAcc)
+	wallets := mgr.walletsForOrder()
 	wallets.Items["USDT"] = &ItemWallet{
 		Coin: "USDT", Pendings: map[string]float64{}, Frozens: map[string]float64{od.Key(): initial},
 	}
-	openOds, lock := ormo.GetOpenODs(config.DefAcc)
-	lock.Lock()
-	openOds[od.ID] = od
-	lock.Unlock()
+	orders := mgr.orderState()
+	orders.SetTask(mgr.Account, &ormo.BotTask{ID: 1})
+	od.TaskID = 1
+	od.BindState(orders)
+	if err := od.Save(); err != nil {
+		t.Fatalf("save open liquidated order: %v", err)
+	}
 
 	liquidationErr := wallets.UpdateOds([]*ormo.InOutOrder{od}, "USDT")
 	if liquidationErr == nil || liquidationErr.Code != core.ErrLiquidation {

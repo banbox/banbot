@@ -245,7 +245,7 @@ func (p *Provider[IDataFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPr
 	}
 	var pBar *utils.PrgBar
 	if p.showLog {
-		log.Info(fmt.Sprintf("warmup for %d pairs, %v jobs", len(warmJobs), jobNum))
+		p.deps.logger().Info(fmt.Sprintf("warmup for %d pairs, %v jobs", len(warmJobs), jobNum))
 		pBar = utils.NewPrgBar(jobNum*core.StepTotal, "warmup")
 		defer pBar.Close()
 		if pb != nil {
@@ -279,7 +279,7 @@ func (p *Provider[IDataFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPr
 		}
 	}
 	if len(skipWarms) > 0 {
-		log.Warn("warm lacks", zap.String("items", StrWarmLacks(skipWarms)))
+		p.deps.logger().Warn("warm lacks", zap.String("items", StrWarmLacks(skipWarms)))
 	}
 	return sinceMap, nil
 }
@@ -323,13 +323,12 @@ func NewHistProviderWithSymbolState(symbols *orm.SymbolState, callBack FnDataSer
 }
 
 // NewHistProviderWithRuntimeDeps binds all runtime-owned data dependencies to
-// the provider and every feeder it creates. A nil dependency set preserves
-// the legacy package facade.
-func NewHistProviderWithRuntimeDeps(deps *RuntimeDeps, callBack FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) *HistProvider {
-	if deps == nil {
-		return NewHistProvider(callBack, envEnd, getEnd, showLog, pBar)
+// the provider and every feeder it creates.
+func NewHistProviderWithRuntimeDeps(deps *RuntimeDeps, callBack FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) (*HistProvider, *errs.Error) {
+	if deps == nil || deps.Strategies == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "historical provider requires explicit strategy state")
 	}
-	return newHistProviderWithCatalog(deps, deps.Symbols, deps.Catalog, callBack, envEnd, getEnd, showLog, pBar)
+	return newHistProviderWithCatalog(deps, deps.Symbols, deps.Catalog, callBack, envEnd, getEnd, showLog, pBar), nil
 }
 
 func newHistProvider(deps *RuntimeDeps, symbols *orm.SymbolState, callBack FnDataSeries, envEnd FuncEnvEnd,
@@ -345,11 +344,7 @@ func newHistProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, cat
 	getEnd FnGetInt64, showLog bool, pBar *utils.StagedPrg) *HistProvider {
 	var wsSubs *strat.WsSubJobRegistry
 	if deps != nil {
-		strategyState := deps.Strategies
-		if strategyState == nil {
-			strategyState = strat.NewState()
-		}
-		wsSubs = strat.NewWsSubJobRegistryWithState(strategyState, symbols)
+		wsSubs = strat.NewWsSubJobRegistryWithState(deps.Strategies, symbols)
 	} else {
 		wsSubs = strat.NewWsSubJobRegistry(symbols)
 	}
@@ -552,7 +547,7 @@ func (p *HistProvider) downIfNeed() *errs.Error {
 	for _, h := range holders {
 		err = h.DownIfNeed(sess, exchange, pBar)
 		if err != nil {
-			log.Error("download ohlcv fail", zap.String("pair", h.getSymbol()), zap.Error(err))
+			p.deps.logger().Error("download ohlcv fail", zap.String("pair", h.getSymbol()), zap.Error(err))
 			return err
 		}
 	}
@@ -721,7 +716,7 @@ func (p *HistProvider) LoopMain() *errs.Error {
 	defer pBar.Close()
 	pBar.Last = timeRange.StartMS
 	if p.showLog {
-		log.Info("run data loop for backtest..")
+		p.deps.logger().Info("run data loop for backtest..")
 	}
 	err := runHistFeedersWithRuntimeDeps(p.deps, p.makeFeeders, p.dirtyVers, pBar)
 	if p.pBar != nil {
@@ -758,6 +753,15 @@ pBar: optional, used to display a progress bar
 */
 func RunHistFeeders(makeFeeders func() []IHistFeeder, versions chan int, pBar *utils.PrgBar) *errs.Error {
 	return runHistFeedersWithRuntimeDeps(nil, makeFeeders, versions, pBar)
+}
+
+// RunHistFeedersWithRuntimeDeps replays historical feeders using one explicit
+// runtime's clock and cancellation state.
+func RunHistFeedersWithRuntimeDeps(deps *RuntimeDeps, makeFeeders func() []IHistFeeder, versions chan int, pBar *utils.PrgBar) *errs.Error {
+	if deps == nil {
+		return errs.NewMsg(core.ErrBadConfig, "historical feeder replay requires explicit runtime dependencies")
+	}
+	return runHistFeedersWithRuntimeDeps(deps, makeFeeders, versions, pBar)
 }
 
 func runHistFeedersWithRuntimeDeps(deps *RuntimeDeps, makeFeeders func() []IHistFeeder, versions chan int, pBar *utils.PrgBar) *errs.Error {
@@ -916,10 +920,10 @@ func NewLiveProviderWithSymbolState(symbols *orm.SymbolState, callBack FnDataSer
 }
 
 // NewLiveProviderWithRuntimeDeps binds the provider, watcher, and all live
-// feeders to one runtime. A nil dependency set preserves legacy globals.
+// feeders to one runtime.
 func NewLiveProviderWithRuntimeDeps(deps *RuntimeDeps, callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error) {
-	if deps == nil {
-		return NewLiveProvider(callBack, envEnd)
+	if deps == nil || deps.Strategies == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "live provider requires explicit strategy state")
 	}
 	return newLiveProviderWithCatalog(deps, deps.Symbols, deps.Catalog, callBack, envEnd)
 }
@@ -935,11 +939,7 @@ func newLiveProvider(deps *RuntimeDeps, symbols *orm.SymbolState, callBack FnDat
 func newLiveProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, catalog *DataSourceCatalog, callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error) {
 	var wsSubs *strat.WsSubJobRegistry
 	if deps != nil {
-		strategyState := deps.Strategies
-		if strategyState == nil {
-			strategyState = strat.NewState()
-		}
-		wsSubs = strat.NewWsSubJobRegistryWithState(strategyState, symbols)
+		wsSubs = strat.NewWsSubJobRegistryWithState(deps.Strategies, symbols)
 	} else {
 		wsSubs = strat.NewWsSubJobRegistry(symbols)
 	}
@@ -1184,13 +1184,13 @@ func (p *LiveProvider) joinHandlers() {
 func (p *LiveProvider) runHandler(hold IDataFeeder, tfMSecs int64, msg *SeriesMsg, rows []*orm.DataSeries) {
 	_, err := hold.onNewData(tfMSecs, rows)
 	if err != nil {
-		log.Error("onNewData fail", zap.String("p", msg.Pair), zap.Error(err))
+		p.deps.logger().Error("onNewData fail", zap.String("p", msg.Pair), zap.Error(err))
 		return
 	}
 	if p.OnDataSeries != nil {
 		err = p.OnDataSeries(msg, rows)
 		if err != nil {
-			log.Error("OnDataSeries fail", zap.String("p", msg.Pair), zap.Error(err))
+			p.deps.logger().Error("OnDataSeries fail", zap.String("p", msg.Pair), zap.Error(err))
 		}
 	}
 }

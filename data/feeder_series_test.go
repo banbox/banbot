@@ -192,7 +192,7 @@ func TestRuntimeKlineProjectionUsesOwnedStrategyState(t *testing.T) {
 				return []*strat.DataSub{{Source: orm.SeriesSourceKline, ExSymbol: &orm.ExSymbol{ID: sid, Symbol: "BTC/USDT"}, TimeFrame: tf, Fields: []string{field}}}
 			}},
 		}
-		state.InfoJobs("default")[strat.DataSubKey(orm.SeriesSourceKline, sid, tf)] = map[string]*strat.StratJob{"job": job}
+		state.SetInfoJobMap("default", strat.DataSubKey(orm.SeriesSourceKline, sid, tf), map[string]*strat.StratJob{"job": job})
 		return state
 	}
 

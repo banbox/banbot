@@ -3,13 +3,13 @@ package biz
 import "sync"
 
 // TradingState owns the account-scoped managers and wallets for one Runtime.
-// The maps are deliberately concrete: lifecycle code can bind them directly,
-// while lookup and lazy writes use the per-runtime registry lock. The legacy
-// package maps remain available only through compatibility facades.
+// The registries remain concrete maps behind the state so lookup and lazy
+// writes use one per-runtime lock. The legacy package maps remain available
+// only through compatibility facades.
 type TradingState struct {
-	OrderManagers map[string]IOrderMgr
-	LiveManagers  map[string]*LiveOrderMgr
-	Wallets       map[string]*BanWallets
+	orderManagers map[string]IOrderMgr
+	liveManagers  map[string]*LiveOrderMgr
+	wallets       map[string]*BanWallets
 	registryMu    sync.RWMutex
 	triggerMu     sync.Mutex
 
@@ -19,9 +19,9 @@ type TradingState struct {
 
 func NewTradingState() *TradingState {
 	return &TradingState{
-		OrderManagers: make(map[string]IOrderMgr),
-		LiveManagers:  make(map[string]*LiveOrderMgr),
-		Wallets:       make(map[string]*BanWallets),
+		orderManagers: make(map[string]IOrderMgr),
+		liveManagers:  make(map[string]*LiveOrderMgr),
+		wallets:       make(map[string]*BanWallets),
 	}
 }
 
@@ -35,14 +35,14 @@ func (s *TradingState) ensure() {
 }
 
 func (s *TradingState) ensureLocked() {
-	if s.OrderManagers == nil {
-		s.OrderManagers = make(map[string]IOrderMgr)
+	if s.orderManagers == nil {
+		s.orderManagers = make(map[string]IOrderMgr)
 	}
-	if s.LiveManagers == nil {
-		s.LiveManagers = make(map[string]*LiveOrderMgr)
+	if s.liveManagers == nil {
+		s.liveManagers = make(map[string]*LiveOrderMgr)
 	}
-	if s.Wallets == nil {
-		s.Wallets = make(map[string]*BanWallets)
+	if s.wallets == nil {
+		s.wallets = make(map[string]*BanWallets)
 	}
 }
 
@@ -51,7 +51,7 @@ func (s *TradingState) OrderManager(account string) IOrderMgr {
 		return nil
 	}
 	s.registryMu.RLock()
-	manager := s.OrderManagers[account]
+	manager := s.orderManagers[account]
 	s.registryMu.RUnlock()
 	return manager
 }
@@ -61,7 +61,7 @@ func (s *TradingState) LiveManager(account string) *LiveOrderMgr {
 		return nil
 	}
 	s.registryMu.RLock()
-	manager := s.LiveManagers[account]
+	manager := s.liveManagers[account]
 	s.registryMu.RUnlock()
 	return manager
 }
@@ -72,10 +72,10 @@ func (s *TradingState) Wallet(account string) *BanWallets {
 	}
 	s.registryMu.Lock()
 	s.ensureLocked()
-	wallet := s.Wallets[account]
+	wallet := s.wallets[account]
 	if wallet == nil {
 		wallet = &BanWallets{Items: make(map[string]*ItemWallet), Account: account}
-		s.Wallets[account] = wallet
+		s.wallets[account] = wallet
 	}
 	s.registryMu.Unlock()
 	return wallet
@@ -90,9 +90,9 @@ func (s *TradingState) SetOrderManager(account string, manager IOrderMgr) {
 	s.registryMu.Lock()
 	s.ensureLocked()
 	if manager == nil {
-		delete(s.OrderManagers, account)
+		delete(s.orderManagers, account)
 	} else {
-		s.OrderManagers[account] = manager
+		s.orderManagers[account] = manager
 	}
 	s.registryMu.Unlock()
 }
@@ -106,9 +106,9 @@ func (s *TradingState) SetLiveManager(account string, manager *LiveOrderMgr) {
 	s.registryMu.Lock()
 	s.ensureLocked()
 	if manager == nil {
-		delete(s.LiveManagers, account)
+		delete(s.liveManagers, account)
 	} else {
-		s.LiveManagers[account] = manager
+		s.liveManagers[account] = manager
 	}
 	s.registryMu.Unlock()
 }
@@ -121,8 +121,8 @@ func (s *TradingState) OrderManagersSnapshot() map[string]IOrderMgr {
 		return nil
 	}
 	s.registryMu.RLock()
-	result := make(map[string]IOrderMgr, len(s.OrderManagers))
-	for account, manager := range s.OrderManagers {
+	result := make(map[string]IOrderMgr, len(s.orderManagers))
+	for account, manager := range s.orderManagers {
 		result[account] = manager
 	}
 	s.registryMu.RUnlock()
@@ -135,9 +135,23 @@ func (s *TradingState) LiveManagersSnapshot() map[string]*LiveOrderMgr {
 		return nil
 	}
 	s.registryMu.RLock()
-	result := make(map[string]*LiveOrderMgr, len(s.LiveManagers))
-	for account, manager := range s.LiveManagers {
+	result := make(map[string]*LiveOrderMgr, len(s.liveManagers))
+	for account, manager := range s.liveManagers {
 		result[account] = manager
+	}
+	s.registryMu.RUnlock()
+	return result
+}
+
+// WalletsSnapshot returns a typed copy of the wallet registry.
+func (s *TradingState) WalletsSnapshot() map[string]*BanWallets {
+	if s == nil {
+		return nil
+	}
+	s.registryMu.RLock()
+	result := make(map[string]*BanWallets, len(s.wallets))
+	for account, wallet := range s.wallets {
+		result[account] = wallet
 	}
 	s.registryMu.RUnlock()
 	return result
@@ -162,9 +176,9 @@ func (s *TradingState) Reset() {
 		return
 	}
 	s.registryMu.Lock()
-	s.OrderManagers = make(map[string]IOrderMgr)
-	s.LiveManagers = make(map[string]*LiveOrderMgr)
-	s.Wallets = make(map[string]*BanWallets)
+	s.orderManagers = make(map[string]IOrderMgr)
+	s.liveManagers = make(map[string]*LiveOrderMgr)
+	s.wallets = make(map[string]*BanWallets)
 	s.registryMu.Unlock()
 	s.snapshotMu.Lock()
 	s.snapshotCfg = nil

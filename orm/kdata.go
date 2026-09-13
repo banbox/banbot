@@ -495,7 +495,7 @@ func downOHLCV2DBRangeWithOptions(sess *Queries, exchange banexg.BanExchange, ex
 				if job.Reverse {
 					start, stop = job.End, job.Start
 				}
-					err := fetchApiOHLCVWithOptions(ctx, exchange, exs.Symbol, timeFrame, start, stop, chanKline, useArchive, options)
+				err := fetchApiOHLCVWithOptions(ctx, exchange, exs.Symbol, timeFrame, start, stop, chanKline, useArchive, options)
 				if err != nil {
 					setOutErr(err)
 					cancel()
@@ -1002,12 +1002,12 @@ func BulkDownOHLCVWithOptions(exchange banexg.BanExchange, exsList map[int32]*Ex
 	return contextualKlineOperationError("bulk download", fmt.Sprintf("%d pairs", len(exsList)), timeFrame, startMS, endMS, 0, err)
 }
 
-func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS, endMS int64) *errs.Error {
-	sess, conn, err := Conn(context.Background())
-	if err != nil {
-		return err
+// RepairKlineRangesWithQueries rebuilds range metadata using the caller's
+// storage-bound query handle. It never falls back to the legacy database.
+func RepairKlineRangesWithQueries(sess *Queries, exsList map[int32]*ExSymbol, timeFrames []string, startMS, endMS int64) *errs.Error {
+	if sess == nil {
+		return errs.NewMsg(core.ErrDbConnFail, "repair queries are required")
 	}
-	defer conn.Release()
 	for _, timeFrame := range timeFrames {
 		storageTF, storageErr := repairKlineStorageTimeframe(timeFrame)
 		if storageErr != nil {
@@ -1022,7 +1022,7 @@ func RepairKlineRanges(exsList map[int32]*ExSymbol, timeFrames []string, startMS
 			if start >= stop {
 				continue
 			}
-			if err = sess.repairKlineRangeFromPhysical(exs.ID, storageTF, start, stop); err != nil {
+			if err := sess.repairKlineRangeFromPhysical(exs.ID, storageTF, start, stop); err != nil {
 				return contextualKlineOperationError("repair", exs.Symbol, storageTF, start, stop, 0, err)
 			}
 		}
@@ -1289,7 +1289,15 @@ func parseDownArgsAt(tfMSecs int64, startMS, endMS int64, limit int, withUnFinis
 }
 
 func (q *Queries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, *errs.Error) {
-	ctx := context.Background()
+	return q.GetCalendarsWithContext(context.Background(), name, startMS, stopMS)
+}
+
+// GetCalendarsWithContext reads calendar ranges using the caller's runtime
+// cancellation scope.
+func (q *Queries) GetCalendarsWithContext(ctx context.Context, name string, startMS, stopMS int64) ([][2]int64, *errs.Error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !q.isQuestDB() {
 		cals, err := q.getCalendarsPg(ctx, name)
 		if err != nil {

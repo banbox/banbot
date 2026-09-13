@@ -2,15 +2,16 @@ package entry
 
 import (
 	"bytes"
-	"path/filepath"
+	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/banbox/banbot/config"
-	runtimectx "github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/web"
+	"github.com/banbox/banbot/web/dev"
 	"github.com/banbox/banexg/errs"
 	"github.com/spf13/cobra"
 )
@@ -46,7 +47,7 @@ func TestPanicStackContainsCaller(t *testing.T) {
 
 func TestConfigCommandParsesRepeatedConfigAndLegacyFlags(t *testing.T) {
 	var captured *config.CmdArgs
-	command := newConfigCommand("capture", "capture args", func(args *config.CmdArgs) *errs.Error {
+	command := newRuntimeConfigCommand("capture", "capture args", func(args *config.CmdArgs) *errs.Error {
 		captured = args
 		return nil
 	}, true, bindPairs)
@@ -65,12 +66,12 @@ func TestConfigCommandParsesRepeatedConfigAndLegacyFlags(t *testing.T) {
 	if want := []string{"first.yml", "second.yml"}; !reflect.DeepEqual([]string(captured.Configs), want) {
 		t.Fatalf("configs = %v, want %v", captured.Configs, want)
 	}
-	if want := []string{"BTC/USDT", "ETH/USDT"}; !reflect.DeepEqual(captured.Pairs, want) {
-		t.Fatalf("pairs = %v, want %v", captured.Pairs, want)
+	if captured.RawPairs != "BTC/USDT,ETH/USDT" {
+		t.Fatalf("raw pairs = %q, want BTC/USDT,ETH/USDT", captured.RawPairs)
 	}
 }
 
-func TestTickCommandsUseNonReentrantDataEntries(t *testing.T) {
+func TestTickCommandsReturnOnInvalidArguments(t *testing.T) {
 	for _, args := range [][]string{{"tick", "convert"}, {"tick", "to-kline"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			root := NewRootCommand()
@@ -84,55 +85,19 @@ func TestTickCommandsUseNonReentrantDataEntries(t *testing.T) {
 					t.Fatal("invalid tick invocation unexpectedly succeeded")
 				}
 			case <-time.After(time.Second):
-				t.Fatal("tick command nested the legacy gate")
-			}
-		})
-	}
-}
-
-func TestDataImportExportCommandsUseLegacyGate(t *testing.T) {
-	tests := []struct {
-		name string
-		args []string
-	}{
-		{
-			name: "export",
-			args: []string{"data", "export", "--no-default", "--config", filepath.Join(t.TempDir(), "missing.yml"), "--out", t.TempDir()},
-		},
-		{
-			name: "import",
-			args: []string{"data", "import", "--no-default", "--config", filepath.Join(t.TempDir(), "missing.yml"), "--in", filepath.Join(t.TempDir(), "missing")},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			root := NewRootCommand()
-			root.SetArgs(test.args)
-			unlock := runtimectx.LockLegacy()
-			done := make(chan error, 1)
-			go func() { done <- root.Execute() }()
-			select {
-			case err := <-done:
-				unlock()
-				t.Fatalf("data %s command bypassed the legacy gate: %v", test.name, err)
-			case <-time.After(50 * time.Millisecond):
-			}
-			unlock()
-			select {
-			case err := <-done:
-				if err == nil {
-					t.Fatalf("data %s command unexpectedly succeeded", test.name)
-				}
-			case <-time.After(time.Second):
-				t.Fatalf("data %s command did not run after gate release", test.name)
+				t.Fatal("tick command did not return")
 			}
 		})
 	}
 }
 
 func TestAddCommandSupportsCommandLocalFlags(t *testing.T) {
+	commandRegistryMu.RLock()
 	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
 	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		defer commandRegistryMu.Unlock()
 		extraCommands = extraCommands[:before]
 	})
 
@@ -157,166 +122,154 @@ func TestAddCommandSupportsCommandLocalFlags(t *testing.T) {
 	}
 }
 
-func TestRegisteredCommandGateModes(t *testing.T) {
+func TestRegisteredCommandsAreNotWrapped(t *testing.T) {
+	commandRegistryMu.RLock()
 	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
 	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		defer commandRegistryMu.Unlock()
 		extraCommands = extraCommands[:before]
 	})
 
-	legacyEntered := make(chan struct{})
-	releaseLegacy := make(chan struct{})
-	legacy := &cobra.Command{
-		Use: "legacy-extension",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			close(legacyEntered)
-			<-releaseLegacy
-			return nil
-		},
-	}
-	pureRan := make(chan struct{})
-	pure := &cobra.Command{
-		Use: "pure-extension",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			close(pureRan)
-			return nil
-		},
-	}
-	AddCommand("", legacy)
-	AddRuntimeCommand("", pure)
-
-	root := NewRootCommand()
-	registeredLegacy, _, err := root.Find([]string{"legacy-extension"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !hasLegacyGate(registeredLegacy) {
-		t.Fatal("legacy extension is missing its gate marker")
-	}
-	registeredPure, _, err := root.Find([]string{"pure-extension"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hasLegacyGate(registeredPure) {
-		t.Fatal("runtime extension unexpectedly acquired the legacy gate")
-	}
-
-	unlocked := false
-	unlock := runtimectx.LockLegacy()
-	t.Cleanup(func() {
-		if !unlocked {
-			unlock()
-		}
-		select {
-		case <-releaseLegacy:
-		default:
-			close(releaseLegacy)
-		}
-	})
-
-	root.SetArgs([]string{"pure-extension"})
-	pureDone := make(chan error, 1)
-	go func() { pureDone <- root.Execute() }()
-	select {
-	case err := <-pureDone:
-		if err != nil {
-			t.Fatalf("runtime extension returned error: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("runtime extension unexpectedly waited for the legacy gate")
-	}
-	unlock()
-	unlocked = true
-	select {
-	case <-pureRan:
-	default:
-		t.Fatal("runtime extension callback did not run")
-	}
-
-	legacyUnlock := runtimectx.LockLegacy()
-	legacyReleased := false
-	t.Cleanup(func() {
-		if !legacyReleased {
-			legacyUnlock()
-		}
-	})
-	root.SetArgs([]string{"legacy-extension"})
-	legacyDone := make(chan error, 1)
-	go func() { legacyDone <- root.Execute() }()
-	select {
-	case <-legacyEntered:
-		t.Fatal("legacy extension bypassed the held gate")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	legacyUnlock()
-	legacyReleased = true
-	select {
-	case <-legacyEntered:
-	case <-time.After(time.Second):
-		t.Fatal("legacy extension did not enter after gate release")
-	}
-	close(releaseLegacy)
-	select {
-	case err := <-legacyDone:
-		if err != nil {
-			t.Fatalf("legacy extension returned error: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("legacy extension did not finish")
-	}
-}
-
-func TestAddCommandDoesNotDoubleGateAlreadyGatedCommand(t *testing.T) {
-	before := len(extraCommands)
-	t.Cleanup(func() {
-		extraCommands = extraCommands[:before]
-	})
-
-	command := newConfigCommand("already-gated-extension", "capture", func(*config.CmdArgs) *errs.Error {
-		return nil
-	}, false)
+	command := &cobra.Command{Use: "extension", RunE: func(*cobra.Command, []string) error { return nil }}
+	runtimeCommand := &cobra.Command{Use: "runtime-extension", RunE: func(*cobra.Command, []string) error { return nil }}
 	AddCommand("", command)
-	root := NewRootCommand()
-	root.SetArgs([]string{"already-gated-extension"})
+	AddCommand("", runtimeCommand)
 
-	done := make(chan error, 1)
-	go func() { done <- root.Execute() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("already gated extension returned error: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("already gated extension appears to have nested the legacy gate")
+	root := NewRootCommand()
+	registered, _, err := root.Find([]string{"extension"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered != command || registered.RunE == nil {
+		t.Fatal("AddCommand changed the extension command")
+	}
+	registered, _, err = root.Find([]string{"runtime-extension"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered != runtimeCommand || registered.RunE == nil {
+		t.Fatal("second AddCommand changed the extension command")
 	}
 }
 
-func TestAddCommandCanInvokePublicLegacyEntry(t *testing.T) {
+func TestCommandRegistrySnapshotsConcurrentRegistration(t *testing.T) {
+	commandRegistryMu.RLock()
 	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
 	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		extraCommands = extraCommands[:before]
+		commandRegistryMu.Unlock()
+	})
+
+	var wait sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			name := fmt.Sprintf("concurrent-extension-%d", i)
+			AddCommandFactory("", func() *cobra.Command { return &cobra.Command{Use: name} })
+		}(i)
+	}
+	for i := 0; i < 16; i++ {
+		wait.Add(1)
+		go func() { defer wait.Done(); _ = NewRootCommand() }()
+	}
+	wait.Wait()
+	root := NewRootCommand()
+	for i := 0; i < 16; i++ {
+		if command, _, err := root.Find([]string{fmt.Sprintf("concurrent-extension-%d", i)}); err != nil || command == nil {
+			t.Fatalf("concurrent command %d missing: %v", i, err)
+		}
+	}
+}
+
+func TestCommandFactoryDoesNotReparentCommandsAcrossRoots(t *testing.T) {
+	commandRegistryMu.RLock()
+	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
+	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		extraCommands = extraCommands[:before]
+		commandRegistryMu.Unlock()
+	})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	AddCommandFactory("", func() *cobra.Command {
+		return &cobra.Command{Use: "factory-extension", RunE: func(*cobra.Command, []string) error {
+			close(started)
+			<-release
+			return nil
+		}}
+	})
+	first := NewRootCommand()
+	first.SetArgs([]string{"factory-extension"})
+	done := make(chan error, 1)
+	go func() { done <- first.Execute() }()
+	<-started
+	second := NewRootCommand()
+	command, _, err := second.Find([]string{"factory-extension"})
+	if err != nil || command == nil {
+		close(release)
+		t.Fatalf("second root command missing: %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAddCommandRejectsReattachment(t *testing.T) {
+	commandRegistryMu.RLock()
+	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
+	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		extraCommands = extraCommands[:before]
+		commandRegistryMu.Unlock()
+	})
+	AddCommand("", &cobra.Command{Use: "single-root-extension"})
+	_ = NewRootCommand()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("building a second root with a shared command did not panic")
+		}
+	}()
+	_ = NewRootCommand()
+}
+
+func TestAddCommandCanInvokePublicRuntimeEntry(t *testing.T) {
+	commandRegistryMu.RLock()
+	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
+	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		defer commandRegistryMu.Unlock()
 		extraCommands = extraCommands[:before]
 	})
 
 	command := &cobra.Command{
-		Use:         "nested-legacy-entry",
-		Annotations: map[string]string{legacyGateAnnotation: "1"},
+		Use: "nested-runtime-entry",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return RunSeriesDown(&config.CmdArgs{Tables: []string{"missing-nested-entry-fixture"}})
+			return RunSeriesDown(&config.CmdArgs{DataDir: t.TempDir(), NoDefault: true, ConfigData: "invalid: ["})
 		},
 	}
 	AddCommand("", command)
 	root := NewRootCommand()
-	root.SetArgs([]string{"nested-legacy-entry"})
+	root.SetArgs([]string{"nested-runtime-entry"})
 
 	done := make(chan error, 1)
 	go func() { done <- root.Execute() }()
 	select {
 	case err := <-done:
 		if err == nil {
-			t.Fatal("nested legacy entry unexpectedly succeeded")
+			t.Fatal("nested runtime entry unexpectedly succeeded")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("AddCommand callback deadlocked in public legacy entry")
+		t.Fatal("AddCommand callback did not reach the public runtime entry")
 	}
 }
 
@@ -383,189 +336,61 @@ func TestImplicitWebInvocationCompatibility(t *testing.T) {
 	}
 }
 
-func TestLegacyGateCompositionIsIdempotent(t *testing.T) {
-	var calls int
-	command := newConfigCommand("capture-gated", "capture", func(*config.CmdArgs) *errs.Error {
-		calls++
-		return nil
-	}, false)
-	if !hasLegacyGate(command) {
-		t.Fatal("newConfigCommand is missing its legacy gate marker")
-	}
-	if got := withLegacyCommand(command); got != command {
-		t.Fatal("withLegacyCommand replaced an already gated command")
-	}
-
-	done := make(chan error, 1)
-	go func() { done <- command.RunE(command, nil) }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("gated command returned error: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("gated command appears to have nested the non-reentrant legacy lock")
-	}
-	if calls != 1 {
-		t.Fatalf("command callback calls = %d, want 1", calls)
-	}
-}
-
-func TestWithLegacyCommandRecursivelyGatesDescendants(t *testing.T) {
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	grandchild := &cobra.Command{
-		Use: "grandchild",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			close(entered)
-			<-release
-			return nil
-		},
-	}
-	child := &cobra.Command{Use: "child"}
-	child.AddCommand(grandchild)
-	parent := &cobra.Command{Use: "parent"}
-	parent.AddCommand(child)
-
-	if got := withLegacyCommand(parent); got != parent {
-		t.Fatal("withLegacyCommand replaced the parent command")
-	}
-	if withLegacyCommand(parent) != parent {
-		t.Fatal("withLegacyCommand was not idempotent for the command tree")
-	}
-	for _, command := range []*cobra.Command{child, grandchild} {
-		if !hasLegacyGate(command) {
-			t.Fatalf("descendant %q is missing its legacy gate", command.Name())
-		}
-	}
-
-	root := &cobra.Command{Use: "test"}
-	root.AddCommand(parent)
-	root.SetArgs([]string{"parent", "child", "grandchild"})
-	unlocked := false
-	unlock := runtimectx.LockLegacy()
-	t.Cleanup(func() {
-		if !unlocked {
-			unlock()
-		}
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
+func TestTypedWebCommandRejectsInvalidFlags(t *testing.T) {
+	command := web.NewDevCommandWithFactory(func(*dev.CmdArgs) (*dev.DevServer, func(), error) {
+		t.Fatal("factory must not run for invalid command arguments")
+		return nil, nil, nil
 	})
-
-	done := make(chan error, 1)
-	go func() { done <- root.Execute() }()
-	select {
-	case <-entered:
-		t.Fatal("grandchild bypassed the legacy gate")
-	case <-time.After(50 * time.Millisecond):
-	}
-	unlock()
-	unlocked = true
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("grandchild did not enter after the legacy gate was released")
-	}
-	close(release)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("command tree returned error: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("command tree did not finish")
+	command.SetArgs([]string{"--invalid-run-dev-flag"})
+	if err := command.Execute(); err == nil {
+		t.Fatal("typed web command unexpectedly accepted an invalid flag")
 	}
 }
 
-func TestRunDevUsesLegacyGate(t *testing.T) {
-	unlocked := false
-	unlock := runtimectx.LockLegacy()
-	t.Cleanup(func() {
-		if !unlocked {
-			unlock()
-		}
-	})
-
-	done := make(chan error, 1)
-	go func() { done <- web.RunDev([]string{"--invalid-run-dev-flag"}) }()
-	select {
-	case err := <-done:
-		t.Fatalf("RunDev bypassed the legacy gate with error: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	unlock()
-	unlocked = true
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("RunDev unexpectedly accepted an invalid flag")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("RunDev did not enter after the legacy gate was released")
-	}
-}
-
-func TestLegacyGateMarkersCoverRootWebAndAdjExport(t *testing.T) {
+func TestCloseOrderCommandUsesExplicitRuntime(t *testing.T) {
 	root := NewRootCommand()
-	if !hasLegacyGate(root) {
-		t.Fatal("root command is missing its legacy gate marker")
-	}
-	command, _, err := root.Find([]string{"kline", "adj-export"})
+	_, _, err := root.Find([]string{"live", "close-order"})
 	if err != nil {
-		t.Fatalf("find adj-export: %v", err)
-	}
-	if !hasLegacyGate(command) {
-		t.Fatal("adj-export command is missing the config-command legacy gate")
-	}
-	webCommand := withLegacyCommand(web.NewCommand())
-	if !hasLegacyGate(webCommand) || withLegacyCommand(webCommand) != webCommand {
-		t.Fatal("web command gate is not idempotent")
+		t.Fatalf("find close-order: %v", err)
 	}
 }
 
-func TestLegacyGateMarkersCoverEntryDataCommands(t *testing.T) {
+func TestDownOrderCommandUsesExplicitRuntimeAndPreservesFlags(t *testing.T) {
 	root := NewRootCommand()
-	paths := [][]string{
-		{"trade"}, {"backtest"}, {"spider"}, {"init"}, {"web"},
-		{"data", "export"}, {"data", "import"},
-		{"kline", "down"}, {"kline", "repair-ranges"}, {"kline", "load"},
-		{"kline", "agg"}, {"kline", "export"}, {"kline", "purge"},
-		{"kline", "correct"}, {"kline", "verify"}, {"kline", "adj-calc"},
-		{"kline", "adj-export"}, {"series", "down"},
-		{"tick", "convert"}, {"tick", "to-kline"},
-		{"tool", "collect-opt"}, {"tool", "sim-bt"}, {"tool", "test-pickers"},
-		{"tool", "load-cal"}, {"tool", "data-server"}, {"tool", "calc-perfs"},
-		{"tool", "corr"}, {"tool", "merge-assets"}, {"tool", "cmp-orders"},
-		{"tool", "list-strats"}, {"tool", "bt-factor"}, {"tool", "bt-result"},
-		{"tool", "test-live-bars"}, {"live", "down-order"}, {"live", "close-order"},
-	}
-	for _, path := range paths {
-		command, _, err := root.Find(path)
-		if err != nil {
-			t.Fatalf("find %v: %v", path, err)
-		}
-		if !hasLegacyGate(command) {
-			t.Errorf("legacy command %v is missing its gate marker", path)
-		}
-	}
-
-	for _, path := range [][]string{{"series", "list"}, {"internal", "inspect-data-plan"}} {
-		command, _, err := root.Find(path)
-		if err != nil {
-			t.Fatalf("find pure command %v: %v", path, err)
-		}
-		if hasLegacyGate(command) {
-			t.Errorf("pure command %v unexpectedly has a legacy gate", path)
-		}
-	}
-	listStrats, _, err := root.Find([]string{"tool", "list-strats"})
+	command, _, err := root.Find([]string{"live", "down-order"})
 	if err != nil {
-		t.Fatalf("find list-strats: %v", err)
+		t.Fatalf("find down-order: %v", err)
 	}
-	if !hasLegacyGate(listStrats) {
-		t.Fatal("list-strats command is missing its legacy gate")
+	for _, name := range []string{"account", "exchange", "market", "timestart", "timeend", "pairs", "force"} {
+		if command.Flags().Lookup(name) == nil {
+			t.Fatalf("down-order lost --%s", name)
+		}
+	}
+}
+
+func TestCompareOrdersCommandUsesExplicitRuntimeAndPreservesFlags(t *testing.T) {
+	root := NewRootCommand()
+	command, _, err := root.Find([]string{"tool", "cmp-orders"})
+	if err != nil {
+		t.Fatalf("find cmp-orders: %v", err)
+	}
+	for _, name := range []string{"account", "bt-path", "bot-name", "amt-rate", "skip-unhit"} {
+		if command.Flags().Lookup(name) == nil {
+			t.Fatalf("cmp-orders lost --%s", name)
+		}
+	}
+}
+
+func TestSnapshotForOrderIdentityDoesNotMutatePrimarySnapshot(t *testing.T) {
+	primary := config.NewSnapshotWithDirs(&config.Config{Exchange: &config.ExchangeConfig{Name: "primary"}, MarketType: "spot"}, t.TempDir(), "")
+	child, err := snapshotForOrderIdentity(primary, "stored", "linear")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if primary.View().Exchange.Name != "primary" || primary.View().MarketType != "spot" {
+		t.Fatalf("primary snapshot was mutated: %#v", primary.View())
+	}
+	if child.View().Exchange.Name != "stored" || child.View().MarketType != "linear" {
+		t.Fatalf("child snapshot identity = %s/%s", child.View().Exchange.Name, child.View().MarketType)
 	}
 }

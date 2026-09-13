@@ -3,12 +3,15 @@ package data
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
@@ -20,7 +23,7 @@ import (
 )
 
 func TestWatchOhlcv(t *testing.T) {
-	t.Skip("integration test (requires watcher on 127.0.0.1:6789)")
+	testutil.RequireIntegration(t)
 	core.SetRunMode(core.RunModeLive)
 	err := initApp()
 	if err != nil {
@@ -137,6 +140,31 @@ type fetchExchange struct {
 
 func (fetchExchange) HasApi(string, string) bool { return true }
 
+type spiderTradeWatchExchange struct {
+	banexg.BanExchange
+	trades chan *banexg.Trade
+}
+
+type spiderIdentityExchange struct {
+	banexg.BanExchange
+	name   string
+	market string
+	jobs   [][2]string
+}
+
+func (s *spiderIdentityExchange) Info() *banexg.ExgInfo {
+	return &banexg.ExgInfo{ID: s.name, MarketType: s.market}
+}
+
+func (s *spiderIdentityExchange) UnWatchOHLCVs(jobs [][2]string, _ map[string]interface{}) *errs.Error {
+	s.jobs = append(s.jobs, jobs...)
+	return nil
+}
+
+func (s *spiderTradeWatchExchange) WatchTrades([]string, map[string]interface{}) (chan *banexg.Trade, *errs.Error) {
+	return s.trades, nil
+}
+
 type legacyFacadePanicExchange struct {
 	banexg.BanExchange
 }
@@ -233,7 +261,7 @@ func TestSeriesWatcherGapRecoveryUsesExplicitSymbolState(t *testing.T) {
 }
 
 func TestSaveKlines(t *testing.T) {
-	t.Skip("integration test (requires writable kline tables and backend-specific SQL support)")
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)
@@ -286,237 +314,291 @@ delete from kline_1d where sid=%v;
 	}
 }
 
-type stubSpiderQueries struct {
-	purgeCount int
-	purgeErr   *errs.Error
+func TestLiveSpidersKeepQueuesAndShutdownIndependent(t *testing.T) {
+	newServer := func() *utils.ServerIO {
+		return utils.NewServerIO("", "")
+	}
+	first := NewLiveSpider(newServer(), nil, nil)
+	second := NewLiveSpider(newServer(), nil, nil)
+	if first.writeQ == second.writeQ || first.sidMap == nil || second.sidMap == nil {
+		t.Fatal("spiders shared mutable queue or pending-series state")
+	}
+	first.workers.Add(1)
+	go first.consumeSeriesWriteQ(1)
+	second.workers.Add(1)
+	go second.consumeSeriesWriteQ(1)
+	first.Stop()
+	first.Join()
+	select {
+	case <-second.ctx.Done():
+		t.Fatal("stopping first spider cancelled second spider")
+	default:
+	}
+	second.Stop()
+	second.Join()
 }
 
-func (s *stubSpiderQueries) PurgeKlineUn() *errs.Error {
-	s.purgeCount++
-	return s.purgeErr
+type fakeSpiderStorage struct {
+	prepareCalls int
+	err          *errs.Error
 }
 
-type stubSpiderConn struct {
-	releaseCount int
+func (s *fakeSpiderStorage) Prepare(context.Context, *RuntimeDeps) *errs.Error {
+	s.prepareCalls++
+	return s.err
 }
 
-func (s *stubSpiderConn) Release() {
-	s.releaseCount++
-}
-
-func newSpiderTestRuntime(t *testing.T, recorder *runSpiderTestRecorder) spiderRuntime {
-	t.Helper()
-	return spiderRuntime{
-		newServer: func(addr, aesKey string) *utils.ServerIO {
-			recorder.addr = addr
-			return &utils.ServerIO{Addr: addr, Data: map[string]string{}, DataExp: map[string]int64{}}
-		},
-		ensureDBCompression: func(ctx context.Context) *errs.Error {
-			recorder.ensureCompressionCalls++
-			recorder.ensureCompressionCtx = ctx
-			return recorder.ensureCompressionErr
-		},
-		ormConn: func(ctx context.Context) (spiderQueries, spiderConnRelease, *errs.Error) {
-			recorder.ormConnCalls++
-			recorder.ormCtx = ctx
-			return recorder.queries, recorder.conn, recorder.ormErr
-		},
-		startWriteQ: func(workNum int) {
-			recorder.writeQCalls++
-			recorder.writeQWorkers = append(recorder.writeQWorkers, workNum)
-		},
-		startMonitor: func(spider *LiveSpider) {
-			recorder.monitorCalls++
-		},
-		startCron: func() {
-			recorder.cronCalls++
-		},
-		runForever: func(spider *LiveSpider) *errs.Error {
-			recorder.runForeverCalls++
-			recorder.runForeverSpider = spider
-			return recorder.runErr
-		},
+func testSpiderDeps() *RuntimeDeps {
+	return &RuntimeDeps{
+		Core:    &core.State{},
+		Clock:   btime.NewClockState(true, nil),
+		Config:  config.NewSnapshot(&config.Config{}),
+		Symbols: orm.NewSymbolState(),
+		Storage: orm.NewStorage(nil, true, "spider:test"),
 	}
 }
 
-type runSpiderTestRecorder struct {
-	addr                   string
-	writeQCalls            int
-	writeQWorkers          []int
-	ensureCompressionCalls int
-	ensureCompressionCtx   context.Context
-	ensureCompressionErr   *errs.Error
-	ormConnCalls           int
-	ormCtx                 context.Context
-	runForeverCalls        int
-	monitorCalls           int
-	cronCalls              int
-	runForeverSpider       *LiveSpider
-	queries                *stubSpiderQueries
-	conn                   *stubSpiderConn
-	ormErr                 *errs.Error
-	runErr                 *errs.Error
-}
-
-func TestRunSpiderSkipsStartupWhenCallbackNil(t *testing.T) {
-	queries := &stubSpiderQueries{}
-	conn := &stubSpiderConn{}
-	recorder := &runSpiderTestRecorder{queries: queries, conn: conn}
+func TestPrepareLiveSpiderSkipsActivationWithoutStartup(t *testing.T) {
 	resetDataSourcesForTest(t)
-	src := newStubRegistrySource("spider_no_callback_source")
-	if err := RegisterDataSource(src); err != nil {
-		t.Fatalf("RegisterDataSource failed: %v", err)
+	source := newStubRegistrySource("spider_no_callback_source")
+	if err := RegisterDataSource(source); err != nil {
+		t.Fatal(err)
 	}
-
-	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", nil)
+	storage := &fakeSpiderStorage{}
+	spider, err := prepareLiveSpider(context.Background(), &utils.ServerIO{Data: map[string]string{}, DataExp: map[string]int64{}},
+		testSpiderDeps(), nil, nil, storage)
 	if err != nil {
-		t.Fatalf("spiderRuntime.run failed: %v", err)
+		t.Fatal(err)
 	}
-	if src.subscribeCount != 0 {
-		t.Fatalf("expected no third-party activation without startup callback, got %d subscribe calls", src.subscribeCount)
-	}
-	if recorder.ensureCompressionCalls != 1 {
-		t.Fatalf("expected compression check once, got %d", recorder.ensureCompressionCalls)
-	}
-	if queries.purgeCount != 1 {
-		t.Fatalf("expected PurgeKlineUn once, got %d", queries.purgeCount)
-	}
-	if conn.releaseCount != 1 {
-		t.Fatalf("expected conn.Release once, got %d", conn.releaseCount)
-	}
-	if recorder.runForeverCalls != 1 {
-		t.Fatalf("expected RunForever once, got %d", recorder.runForeverCalls)
-	}
-	if recorder.writeQCalls != 1 || len(recorder.writeQWorkers) != 1 || recorder.writeQWorkers[0] != 5 {
-		t.Fatalf("expected write queue worker to start once with 5 workers, got calls=%d workers=%v", recorder.writeQCalls, recorder.writeQWorkers)
-	}
-	if recorder.monitorCalls != 1 || recorder.cronCalls != 1 {
-		t.Fatalf("expected monitor and cron to start once, got monitor=%d cron=%d", recorder.monitorCalls, recorder.cronCalls)
+	spider.Stop()
+	spider.Join()
+	if storage.prepareCalls != 1 || source.subscribeCount != 0 {
+		t.Fatalf("prepare=%d subscriptions=%d, want one storage preparation and no activation", storage.prepareCalls, source.subscribeCount)
 	}
 }
 
-func TestRunSpiderStartupActivatesSelectedSourcesOnce(t *testing.T) {
-	queries := &stubSpiderQueries{}
-	conn := &stubSpiderConn{}
-	recorder := &runSpiderTestRecorder{queries: queries, conn: conn}
+func TestPrepareLiveSpiderActivatesSelectedSourcesOnce(t *testing.T) {
 	resetDataSourcesForTest(t)
 	alpha := newStubRegistrySource("spider_activation_alpha")
 	beta := newStubRegistrySource("spider_activation_beta")
-	if err := RegisterDataSource(alpha); err != nil {
-		t.Fatalf("RegisterDataSource alpha failed: %v", err)
+	for _, source := range []*stubSeriesSource{alpha, beta} {
+		if err := RegisterDataSource(source); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := RegisterDataSource(beta); err != nil {
-		t.Fatalf("RegisterDataSource beta failed: %v", err)
-	}
-
-	startupCalls := 0
-	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", func(ctx context.Context, spider *LiveSpider) error {
-		startupCalls++
-		_, err := ActivateDataSources(ctx, []*strat.DataSub{
-			{Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 101}, TimeFrame: alpha.info.TimeFrame},
-			{Source: beta.info.Name, ExSymbol: &orm.ExSymbol{ID: 202}, TimeFrame: beta.info.TimeFrame},
-			{Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 303}, TimeFrame: alpha.info.TimeFrame},
-		}, stubDataSink{})
-		return err
-	})
+	storage := &fakeSpiderStorage{}
+	spider, err := prepareLiveSpider(context.Background(), &utils.ServerIO{Data: map[string]string{}, DataExp: map[string]int64{}},
+		testSpiderDeps(), nil, func(ctx context.Context, _ *LiveSpider) error {
+			_, err := ActivateDataSources(ctx, []*strat.DataSub{
+				{Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 101}, TimeFrame: alpha.info.TimeFrame},
+				{Source: beta.info.Name, ExSymbol: &orm.ExSymbol{ID: 202}, TimeFrame: beta.info.TimeFrame},
+				{Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 303}, TimeFrame: alpha.info.TimeFrame},
+			}, stubDataSink{})
+			return err
+		}, storage)
 	if err != nil {
-		t.Fatalf("spiderRuntime.run failed: %v", err)
+		t.Fatal(err)
 	}
-	if startupCalls != 1 {
-		t.Fatalf("expected startup callback once, got %d", startupCalls)
-	}
-	if alpha.subscribeCount != 1 || beta.subscribeCount != 1 {
-		t.Fatalf("expected grouped source activation once per source, got alpha=%d beta=%d", alpha.subscribeCount, beta.subscribeCount)
-	}
-	if len(alpha.subscribedSubs) != 1 || len(alpha.subscribedSubs[0]) != 2 {
-		t.Fatalf("expected alpha activation group of 2 subs, got %+v", alpha.subscribedSubs)
-	}
-	if len(beta.subscribedSubs) != 1 || len(beta.subscribedSubs[0]) != 1 {
-		t.Fatalf("expected beta activation group of 1 sub, got %+v", beta.subscribedSubs)
-	}
-	if recorder.runForeverCalls != 1 {
-		t.Fatalf("expected RunForever once after startup activation, got %d", recorder.runForeverCalls)
+	spider.Stop()
+	spider.Join()
+	if storage.prepareCalls != 1 || alpha.subscribeCount != 1 || beta.subscribeCount != 1 ||
+		len(alpha.subscribedSubs) != 1 || len(alpha.subscribedSubs[0]) != 2 ||
+		len(beta.subscribedSubs) != 1 || len(beta.subscribedSubs[0]) != 1 {
+		t.Fatalf("unexpected typed startup activation: prepare=%d alpha=%+v beta=%+v", storage.prepareCalls, alpha.subscribedSubs, beta.subscribedSubs)
 	}
 }
 
-func TestRunSpiderStartupUsesCoreContext(t *testing.T) {
-	queries := &stubSpiderQueries{}
-	conn := &stubSpiderConn{}
-	recorder := &runSpiderTestRecorder{queries: queries, conn: conn}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	oldCtx := core.Ctx
-	core.Ctx = ctx
-	t.Cleanup(func() {
-		core.Ctx = oldCtx
-	})
-	var startupCtx context.Context
+func TestLiveSpiderQueuePreservesCompleteDataSeries(t *testing.T) {
+	spider := NewLiveSpider(&utils.ServerIO{Data: map[string]string{}, DataExp: map[string]int64{}}, nil,
+		nil)
+	row := &orm.DataSeries{Source: "macro", Sid: 7, TimeMS: 100, EndMS: 200, TimeFrame: "1d", Closed: true,
+		Values: map[string]any{"value": 3.14}, ExSymbol: &orm.ExSymbol{ID: 7, Symbol: "CPI_US"}}
+	job := &SaveSeries{Sid: row.Sid, TimeFrame: row.TimeFrame, Rows: []*orm.DataSeries{row}, MsgAction: "ohlcv_macro"}
+	spider.writeQ <- job
+	got := <-spider.writeQ
+	if got.Rows[0] != row || got.Rows[0].Values["value"] != 3.14 || got.Rows[0].ExSymbol != row.ExSymbol {
+		t.Fatalf("spider queue changed data series fields: %#v", got.Rows[0])
+	}
+}
 
-	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", func(ctx context.Context, spider *LiveSpider) error {
-		startupCtx = ctx
-		return nil
-	})
+func TestLiveSpiderStopJoinsActualWatchAndPersistenceWorkers(t *testing.T) {
+	server := &utils.ServerIO{Data: map[string]string{}, DataExp: map[string]int64{}}
+	spider := NewLiveSpider(server, nil, nil)
+	spider.workers.Add(1)
+	go spider.consumeSeriesWriteQ(1)
+	miner := &Miner{
+		spider: spider, ExgName: "test", Market: banexg.MarketSpot,
+		exchange: &spiderTradeWatchExchange{trades: make(chan *banexg.Trade)}, Trades: NewPairSubs(),
+		retryWaits: btime.NewRetryWaits(0, nil),
+	}
+	miner.watchTrades([]string{"BTC/USDT"})
+	done := make(chan struct{})
+	go func() {
+		spider.Stop()
+		spider.Join()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("spider Stop/Join did not wait for blocked watch and persistence workers")
+	}
+}
+
+func TestLiveSpiderJoinDefersMinerCleanupUntilWorkersExit(t *testing.T) {
+	release := make(chan struct{})
+	cleaned := make(chan struct{}, 2)
+	spider := NewLiveSpider(&utils.ServerIO{Data: map[string]string{}, DataExp: map[string]int64{}}, nil, nil)
+	spider.miners["test:spot"] = &Miner{cleanup: func() { cleaned <- struct{}{} }}
+	spider.workers.Add(1)
+	go func() {
+		defer spider.workers.Done()
+		<-release
+	}()
+
+	spider.Stop()
+	select {
+	case <-cleaned:
+		t.Fatal("Stop cleaned miner runtime before worker exit")
+	default:
+	}
+	joined := make(chan struct{})
+	go func() {
+		spider.Join()
+		close(joined)
+	}()
+	select {
+	case <-cleaned:
+		t.Fatal("Join cleaned miner runtime before worker exit")
+	case <-joined:
+		t.Fatal("Join returned before worker exit")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("Join did not finish after worker exit")
+	}
+	select {
+	case <-cleaned:
+	case <-time.After(time.Second):
+		t.Fatal("Join did not clean miner runtime")
+	}
+	spider.Join()
+	select {
+	case <-cleaned:
+		t.Fatal("miner runtime cleanup was not idempotent")
+	default:
+	}
+}
+
+func TestLiveSpiderStopRejectsRacingMinerCreation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cleaned := make(chan struct{}, 1)
+	spider := NewLiveSpider(&utils.ServerIO{Data: map[string]string{}, DataExp: map[string]int64{}}, nil,
+		func(context.Context, string, string) (*RuntimeDeps, func(), *errs.Error) {
+			close(started)
+			<-release
+			return nil, func() { cleaned <- struct{}{} }, nil
+		})
+	created := make(chan *Miner, 1)
+	go func() { created <- spider.getMiner("test", banexg.MarketSpot) }()
+	<-started
+	joined := make(chan struct{})
+	go func() {
+		spider.Stop()
+		spider.Join()
+		close(joined)
+	}()
+	close(release)
+	if miner := <-created; miner != nil {
+		t.Fatalf("miner created after Spider.Stop: %#v", miner)
+	}
+	select {
+	case <-cleaned:
+	case <-time.After(time.Second):
+		t.Fatal("racing miner runtime cleanup was not called")
+	}
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("Spider Stop/Join blocked on racing miner creation")
+	}
+}
+
+func TestPairSubsConcurrentSubscribeClaimsPairsOnce(t *testing.T) {
+	subs := NewPairSubs()
+	const workers = 32
+	var wait sync.WaitGroup
+	results := make(chan []string, workers)
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			results <- subs.GetNewSubs([]string{"BTC/USDT", "ETH/USDT"})
+		}()
+	}
+	wait.Wait()
+	close(results)
+	claimed := make(map[string]int)
+	for pairs := range results {
+		for _, pair := range pairs {
+			claimed[pair]++
+		}
+	}
+	if claimed["BTC/USDT"] != 1 || claimed["ETH/USDT"] != 1 || subs.Len() != 2 {
+		t.Fatalf("concurrent subscription claims = %#v, size=%d", claimed, subs.Len())
+	}
+}
+
+func TestNewMinerRejectsMismatchedRuntimeIdentityAndCleansUp(t *testing.T) {
+	cleaned := false
+	spider := NewLiveSpider(&utils.ServerIO{Data: map[string]string{}, DataExp: map[string]int64{}}, testSpiderDeps(),
+		func(context.Context, string, string) (*RuntimeDeps, func(), *errs.Error) {
+			deps := testSpiderDeps()
+			deps.Exchange = &spiderIdentityExchange{name: "other", market: banexg.MarketSpot}
+			deps.ExchangeName, deps.MarketType = "other", banexg.MarketSpot
+			return deps, func() { cleaned = true }, nil
+		})
+	if miner, err := newMiner(spider, "expected", banexg.MarketSpot); err == nil || miner != nil {
+		t.Fatalf("newMiner accepted mismatched runtime identity: miner=%#v err=%v", miner, err)
+	}
+	if !cleaned {
+		t.Fatal("newMiner did not clean up rejected runtime")
+	}
+}
+
+func TestNewMinerKeepsRetryBackoffPerMiner(t *testing.T) {
+	spider := NewLiveSpider(&utils.ServerIO{Data: map[string]string{}, DataExp: map[string]int64{}}, testSpiderDeps(),
+		func(_ context.Context, name, market string) (*RuntimeDeps, func(), *errs.Error) {
+			deps := testSpiderDeps()
+			deps.Exchange = &spiderIdentityExchange{name: name, market: market}
+			deps.ExchangeName, deps.MarketType = name, market
+			return deps, nil, nil
+		})
+	first, err := newMiner(spider, "first", banexg.MarketSpot)
 	if err != nil {
-		t.Fatalf("spiderRuntime.run failed: %v", err)
+		t.Fatal(err)
 	}
-	if recorder.ormCtx != ctx {
-		t.Fatalf("expected orm connection to use core context")
+	second, err := newMiner(spider, "second", banexg.MarketSpot)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if recorder.ensureCompressionCtx != ctx {
-		t.Fatalf("expected compression check to use core context")
-	}
-	if startupCtx != ctx {
-		t.Fatalf("expected startup hook to use core context")
+	if first.retryWaits == second.retryWaits {
+		t.Fatal("miners share retry backoff state")
 	}
 }
 
-func TestRunSpiderStopsWhenCompressionCheckFails(t *testing.T) {
-	recorder := &runSpiderTestRecorder{
-		queries:              &stubSpiderQueries{},
-		conn:                 &stubSpiderConn{},
-		ensureCompressionErr: errs.NewMsg(core.ErrDbExecFail, "compression check failed"),
+func TestMinerUnSubPairsBuildsOnlyRealOHLCVJobs(t *testing.T) {
+	exchange := &spiderIdentityExchange{}
+	miner := &Miner{exchange: exchange, KLines: NewPairSubs()}
+	miner.KLines.Set("BTC/USDT", "ETH/USDT")
+	if err := miner.UnSubPairs(core.WsSubKLine, "BTC/USDT", "ETH/USDT"); err != nil {
+		t.Fatal(err)
 	}
-
-	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", nil)
-	if err == nil {
-		t.Fatal("expected compression check error")
-	}
-	if recorder.ensureCompressionCalls != 1 {
-		t.Fatalf("expected compression check once, got %d", recorder.ensureCompressionCalls)
-	}
-	if recorder.ormConnCalls != 0 || recorder.writeQCalls != 0 || recorder.runForeverCalls != 0 {
-		t.Fatalf("expected compression error to stop startup, got orm=%d writeQ=%d runForever=%d",
-			recorder.ormConnCalls, recorder.writeQCalls, recorder.runForeverCalls)
-	}
-}
-
-func TestRunSpiderStartupReturnsUnknownSourceError(t *testing.T) {
-	queries := &stubSpiderQueries{}
-	conn := &stubSpiderConn{}
-	recorder := &runSpiderTestRecorder{queries: queries, conn: conn}
-	resetDataSourcesForTest(t)
-
-	err := newSpiderTestRuntime(t, recorder).run(spiderContext(), "127.0.0.1:0", func(ctx context.Context, spider *LiveSpider) error {
-		_, err := ActivateDataSources(ctx, []*strat.DataSub{{
-			Source:    "spider_missing_source",
-			ExSymbol:  &orm.ExSymbol{ID: 404},
-			TimeFrame: "1d",
-		}}, stubDataSink{})
-		return err
-	})
-	if err == nil {
-		t.Fatalf("expected unknown source startup error")
-	}
-	if recorder.writeQCalls != 0 {
-		t.Fatalf("expected startup error to stop before write queue worker, got %d calls", recorder.writeQCalls)
-	}
-	if recorder.runForeverCalls != 0 {
-		t.Fatalf("expected startup error to stop before RunForever, got %d calls", recorder.runForeverCalls)
-	}
-	if recorder.monitorCalls != 0 || recorder.cronCalls != 0 {
-		t.Fatalf("expected startup error to stop before monitor/cron, got monitor=%d cron=%d", recorder.monitorCalls, recorder.cronCalls)
-	}
-	if conn.releaseCount != 1 {
-		t.Fatalf("expected conn.Release once even on startup error, got %d", conn.releaseCount)
+	if len(exchange.jobs) != 2 || exchange.jobs[0][0] == "" || exchange.jobs[1][0] == "" {
+		t.Fatalf("unexpected OHLCV unsubscribe jobs: %#v", exchange.jobs)
 	}
 }

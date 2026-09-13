@@ -65,7 +65,7 @@ func relayPolicyGroupsWithConfig(strategyState *State, cfg *config.Config, symbo
 		policies = nil
 	}
 	for _, pol := range policies {
-		stgy := newStrategyWithState(strategyState, pol)
+		stgy := strategyState.NewStrategy(pol)
 		tf := stgy.pickTimeFrame("", tfScores)
 		if tf == "" {
 			continue
@@ -127,7 +127,7 @@ func relayPolicyGroupsWithConfig(strategyState *State, cfg *config.Config, symbo
 		polGroups = append(polGroups, &PolicyGroup{StartMS: math.MaxInt64})
 	}
 	for _, pol := range policies {
-		stgy := newStrategyWithState(strategyState, pol)
+		stgy := strategyState.NewStrategy(pol)
 		tf := stgy.pickTimeFrame("", tfScores)
 		if tf == "" {
 			continue
@@ -320,7 +320,7 @@ func allAllowTFsForState(strategyState *State, cfg *config.Config) []string {
 			policy = pol.Clone()
 			policy.Dirt = ""
 		}
-		stagy := newStrategyWithState(strategyState, policy)
+		stagy := strategyState.NewStrategy(policy)
 		if stagy == nil {
 			continue
 		}

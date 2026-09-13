@@ -4,7 +4,6 @@ import (
 	"context"
 	"embed"
 	_ "embed"
-	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -24,7 +23,6 @@ import (
 	"github.com/banbox/banbot/rpc"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
-	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
@@ -625,140 +623,12 @@ func getBatchOrderManager(state *TradingState, account string) IOrderMgr {
 	return GetOdMgr(account)
 }
 
-func ResetVars() {
-	core.ResetLegacyNoEnterUntil()
-	com.DelPairCopieds()
-	core.ReplaceLegacyTfPairHits(nil)
-	core.ResetLegacyPerformance()
-	accLiveOdMgrs = make(map[string]*LiveOrderMgr)
-	accOdMgrs = make(map[string]IOrderMgr)
-	accWallets = make(map[string]*BanWallets)
-	core.LastBarMs = 0
-	core.ReplaceLegacyOdBooks(nil)
-	ormo.HistODs = make([]*ormo.InOutOrder, 0)
-	ormo.ResetVars()
-	strat.Envs = make(map[string]*ta.BarEnv)
-	strat.TmpEnvs = make(map[string]*ta.BarEnv)
-	strat.AccJobs = make(map[string]map[string]map[string]*strat.StratJob)
-	strat.AccInfoJobs = make(map[string]map[string]map[string]*strat.StratJob)
-	strat.PairStrats = make(map[string]map[string]*strat.TradeStrat)
-	strat.WsSubJobs = make(map[string]map[string]map[*strat.StratJob]bool)
-	strat.LegacyBatchState().Reset()
-	strat.ForbidJobs = make(map[string]map[string]bool)
-}
-
-type VarsBackup struct {
-	Pairs         []string
-	PairMap       map[string]bool
-	TFSecs        map[string]int
-	StgPairTfs    map[string]map[string]string
-	OrderMatchTfs map[string]bool
-	BotRunning    bool
-	CheckWallets  bool
-	NoEnterUntil  map[string]int64
-	PairCopiedMs  map[string][2]int64
-	TfPairHits    map[string]map[string]int
-	JobPerfs      map[string]*core.JobPerf
-	StratPerfSta  map[string]*core.PerfSta
-	AccLiveOdMgrs map[string]*LiveOrderMgr
-	AccOdMgrs     map[string]IOrderMgr
-	AccWallets    map[string]*BanWallets
-	LastBarMs     int64
-	OdBooks       map[string]*banexg.OrderBook
-	HistODs       []*ormo.InOutOrder
-	Envs          map[string]*ta.BarEnv
-	TmpEnvs       map[string]*ta.BarEnv
-	AccJobs       map[string]map[string]map[string]*strat.StratJob
-	AccInfoJobs   map[string]map[string]map[string]*strat.StratJob
-	PairStrats    map[string]map[string]*strat.TradeStrat
-	WsSubJobs     map[string]map[string]map[*strat.StratJob]bool
-	BatchTasks    map[string]*strat.BatchMap
-	ForbidJobs    map[string]map[string]bool
-	StratVersions map[string]int
-	PairHooks     strat.PairUpdateHooks
-	LastBatchMS   int64
-	OrmoBackup    *ormo.VarsBackup
-}
-
-// BackupVars 备份所有全局变量
-func BackupVars() *VarsBackup {
-	pairs, pairMap := core.LegacyPairStateSnapshot()
-	tfSecs, stgPairTfs := core.LegacyTimeFrameStateSnapshot()
-	orderMatchTfs := core.LegacyOrderMatchTfsSnapshot()
-	noEnterUntil := core.LegacyNoEnterUntilSnapshot()
-	tfPairHits := core.LegacyTfPairHitsSnapshot()
-	jobPerfs, stratPerfSta := core.LegacyPerformanceSnapshot()
-	batchTasks, lastBatchMS := strat.BackupLegacyBatchState()
-	return &VarsBackup{
-		Pairs:         pairs,
-		PairMap:       pairMap,
-		TFSecs:        tfSecs,
-		StgPairTfs:    stgPairTfs,
-		OrderMatchTfs: orderMatchTfs,
-		BotRunning:    core.BotRunning,
-		CheckWallets:  core.CheckWallets,
-		NoEnterUntil:  noEnterUntil,
-		PairCopiedMs:  com.GetPairCopieds(),
-		TfPairHits:    tfPairHits,
-		JobPerfs:      jobPerfs,
-		StratPerfSta:  stratPerfSta,
-		AccLiveOdMgrs: accLiveOdMgrs,
-		AccOdMgrs:     accOdMgrs,
-		AccWallets:    accWallets,
-		LastBarMs:     core.LastBarMs,
-		OdBooks:       core.LegacyOdBooksSnapshot(),
-		HistODs:       ormo.HistODs,
-		Envs:          strat.Envs,
-		TmpEnvs:       strat.TmpEnvs,
-		AccJobs:       strat.AccJobs,
-		AccInfoJobs:   strat.AccInfoJobs,
-		PairStrats:    strat.PairStrats,
-		WsSubJobs:     strat.WsSubJobs,
-		BatchTasks:    batchTasks,
-		ForbidJobs:    strat.ForbidJobs,
-		StratVersions: maps.Clone(strat.Versions),
-		PairHooks:     strat.SnapshotPairUpdateHooks(),
-		LastBatchMS:   lastBatchMS,
-		OrmoBackup:    ormo.BackupVars(),
-	}
-}
-
-// RestoreVars 从备份中恢复所有全局变量
-func RestoreVars(backup *VarsBackup) {
-	if backup == nil {
-		return
-	}
-	core.ReplaceLegacyPairState(backup.Pairs, backup.PairMap)
-	core.ReplaceLegacyTimeFrameState(backup.TFSecs, backup.StgPairTfs)
-	core.ReplaceLegacyOrderMatchTfs(backup.OrderMatchTfs)
-	core.BotRunning = backup.BotRunning
-	core.CheckWallets = backup.CheckWallets
-	core.ReplaceLegacyNoEnterUntil(backup.NoEnterUntil)
-	com.DelPairCopieds()
-	com.SetPairCopieds(backup.PairCopiedMs)
-	core.ReplaceLegacyTfPairHits(backup.TfPairHits)
-	core.ReplaceLegacyPerformance(backup.JobPerfs, backup.StratPerfSta)
-	accLiveOdMgrs = backup.AccLiveOdMgrs
-	accOdMgrs = backup.AccOdMgrs
-	accWallets = backup.AccWallets
-	core.LastBarMs = backup.LastBarMs
-	core.ReplaceLegacyOdBooks(backup.OdBooks)
-	ormo.HistODs = backup.HistODs
-	strat.Envs = backup.Envs
-	strat.TmpEnvs = backup.TmpEnvs
-	strat.AccJobs = backup.AccJobs
-	strat.AccInfoJobs = backup.AccInfoJobs
-	strat.PairStrats = backup.PairStrats
-	strat.WsSubJobs = backup.WsSubJobs
-	strat.RestoreLegacyBatchState(backup.BatchTasks, backup.LastBatchMS)
-	strat.ForbidJobs = backup.ForbidJobs
-	strat.Versions = backup.StratVersions
-	strat.SetPairUpdateHooks(backup.PairHooks)
-	ormo.RestoreVars(backup.OrmoBackup)
-}
-
 func InitDataDir() *errs.Error {
-	dataDir := config.GetDataDir()
+	return InitDataDirAt(config.GetDataDir())
+}
+
+// InitDataDirAt creates the developer data layout at an explicit directory.
+func InitDataDirAt(dataDir string) *errs.Error {
 	if dataDir == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "-datadir or env `BanDataDir` is required")
 	}

@@ -136,7 +136,7 @@ func TestLegacyStateUsesLegacyRegistries(t *testing.T) {
 	accTasks = make(map[string]*BotTask)
 	taskIdAccMap = make(map[int64]string)
 
-	legacy := LegacyState()
+	legacy := legacyStateView()
 	orders, _ := legacy.GetOpenODs("legacy")
 	orders[1] = &InOutOrder{}
 	legacy.SetSyncStamp("legacy", 7)
@@ -146,7 +146,7 @@ func TestLegacyStateUsesLegacyRegistries(t *testing.T) {
 
 	if len(accOpenODs["legacy"]) != 1 || accSyncStamps["legacy"] != 7 || accTasks["legacy"].ID != 11 ||
 		len(HistODs) != 1 || FakeOdId != 2 {
-		t.Fatal("LegacyState is not backed by legacy registries")
+		t.Fatal("legacy state view is not backed by compatibility registries")
 	}
 }
 

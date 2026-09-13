@@ -16,13 +16,13 @@ func TestLiveOrderMgrRuntimeDepsDispatchesOnlyRuntimeCallbacks(t *testing.T) {
 	runtimeState := strat.NewState()
 	runtimeState.AddOdSub(account, func(string, *ormo.InOutOrder, int) { runtimeCalls++ })
 
-	mgr := NewLiveOrderMgrWithRuntimeDeps(RuntimeDeps{
+	mgr := NewLiveOrderMgrWithRuntimeDeps(completeTraderDepsForTest(RuntimeDeps{
 		Core:       &core.State{},
 		Config:     config.NewSnapshot(&config.Config{Name: "g007-runtime"}),
 		Orders:     ormo.NewOrderState(),
 		Strategies: runtimeState,
 		Exchange:   &issue138Exchange{},
-	}, account, nil)
+	}), account, nil)
 	mgr.fireOdChange(&ormo.InOutOrder{Enter: &ormo.ExOrder{}}, strat.OdChgEnter)
 
 	if runtimeCalls != 1 || legacyCalls != 0 {

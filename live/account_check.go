@@ -95,6 +95,7 @@ func CheckLiveAccountsWithRuntimeDeps(deps biz.RuntimeDeps) {
 	if state == nil || !state.EnvReal || exchange == nil {
 		return
 	}
+	logger := deps.Logger()
 	cfg := deps.ConfigView()
 	accounts := deps.AccountConfigs()
 	var expected map[string]float64
@@ -134,13 +135,13 @@ func CheckLiveAccountsWithRuntimeDeps(deps biz.RuntimeDeps) {
 			res.warns = append(res.warns, accMsg("ip_any_warning", "IP restriction: any"))
 		}
 		summary := buildAccSummary(account, res)
-		log.Info("live account check", zap.String("acc", account), zap.String("summary", summary))
+		logger.Info("live account check", zap.String("acc", account), zap.String("summary", summary))
 		if len(res.warns) > 0 {
-			log.Warn("live account check", zap.String("acc", account), zap.String("warn", "WARN: "+strings.Join(res.warns, "; ")))
+			logger.Warn("live account check", zap.String("acc", account), zap.String("warn", "WARN: "+strings.Join(res.warns, "; ")))
 		}
 		if len(res.errors) > 0 {
 			errMsg := "ERROR: " + strings.Join(res.errors, "; ")
-			log.Error("account disabled", zap.String("acc", account), zap.String("error", errMsg))
+			logger.Error("account disabled", zap.String("acc", account), zap.String("error", errMsg))
 			sendRuntimeMessage(&deps, map[string]interface{}{
 				"type":    rpc.MsgTypeException,
 				"account": account,

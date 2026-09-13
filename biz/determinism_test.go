@@ -79,7 +79,7 @@ func TestRuntimeExecutionAccountViewUsesOwnedConfig(t *testing.T) {
 
 	deps := &RuntimeDeps{Config: config.NewSnapshot(&config.Config{
 		Accounts: map[string]*config.AccountConfig{"runtime-only": {}},
-	})}
+	}), Accounts: map[string]*config.AccountConfig{"runtime-only": {}}}
 	if got := slices.Collect(executionAccountNames(deps)); !slices.Equal(got, []string{"runtime-only"}) {
 		t.Fatalf("runtime accounts = %v, want [runtime-only]", got)
 	}
@@ -87,16 +87,16 @@ func TestRuntimeExecutionAccountViewUsesOwnedConfig(t *testing.T) {
 
 func TestFrozenReplayCanonicalizesMapOrderAndPreservesSuppliedSlice(t *testing.T) {
 	oldMode, oldData := core.BackTestMode, config.Data
-	oldPairs, oldFilters, oldMgr := config.Pairs, config.PairFilters, config.PairMgr
+	oldPairs, oldFilters, oldMgr := config.Data.Pairs, config.Data.PairFilters, config.Data.PairMgr
 	core.BackTestMode = true
 	config.Data.BTStrict = true
 	config.Data.BTNoKlineDownload = true
-	config.Pairs = []string{"BTC/USDT:USDT", "DOGE/USDT:USDT"}
-	config.PairFilters = nil
-	config.PairMgr = &config.PairMgrConfig{}
+	config.Data.Pairs = []string{"BTC/USDT:USDT", "DOGE/USDT:USDT"}
+	config.Data.PairFilters = nil
+	config.Data.PairMgr = &config.PairMgrConfig{}
 	t.Cleanup(func() {
 		core.BackTestMode, config.Data = oldMode, oldData
-		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+		config.Data.Pairs, config.Data.PairFilters, config.Data.PairMgr = oldPairs, oldFilters, oldMgr
 	})
 
 	insertions := [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}}

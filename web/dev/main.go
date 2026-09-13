@@ -1,10 +1,9 @@
 package dev
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"path/filepath"
-	"time"
 
 	utils2 "github.com/banbox/banexg/utils"
 
@@ -14,35 +13,50 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/basicauth"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 
-	"github.com/banbox/banbot/biz"
-	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/legacygate"
-	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/web/base"
-	"github.com/banbox/banexg/errs"
-	"github.com/banbox/banexg/log"
 	"github.com/gofiber/fiber/v2"
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
 )
 
-func Run(args []string) error {
-	return legacygate.With(func() error {
-		return run(args)
-	})
-}
+// ServerFactory is implemented by the entry layer. It owns runtime/session
+// construction and returns a cleanup function for borrowed resources.
+type ServerFactory func(*CmdArgs) (*DevServer, func(), error)
 
-func run(args []string) error {
+// Run executes the developer Web command. Supplying a factory keeps all
+// runtime ownership explicit; the optional form preserves the historical API
+// while returning a clear error when no runtime factory is available.
+func Run(args []string, factories ...ServerFactory) error {
 	if args == nil {
 		args = os.Args[1:]
 	}
-	command := NewCommand()
+	command := NewCommand(factories...)
 	command.SetArgs(args)
 	return command.Execute()
 }
 
-func NewCommand() *cobra.Command {
+// NewCommand preserves the public command-construction API. Embedders should
+// pass one typed factory so each command invocation owns an isolated runtime.
+func NewCommand(factories ...ServerFactory) *cobra.Command {
+	return newCommand(firstServerFactory(factories))
+}
+
+// NewCommandWithFactory constructs the developer Web command without using
+// package-global runtime setup. Entry supplies the explicit server runtime.
+func NewCommandWithFactory(factory ServerFactory) *cobra.Command {
+	return newCommand(factory)
+}
+
+func firstServerFactory(factories []ServerFactory) ServerFactory {
+	if len(factories) > 1 {
+		panic("at most one dev server factory may be supplied")
+	}
+	if len(factories) == 1 {
+		return factories[0]
+	}
+	return nil
+}
+
+func newCommand(factory ServerFactory) *cobra.Command {
 	isDocker := utils.IsDocker()
 	ag := &CmdArgs{}
 	defHost := "127.0.0.1"
@@ -54,7 +68,10 @@ func NewCommand() *cobra.Command {
 		Short: "run the Web UI",
 		Args:  cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return runWeb(ag)
+			if factory == nil {
+				return fmt.Errorf("typed dev server factory is required")
+			}
+			return runWebWithFactory(ag, factory)
 		},
 	}
 	command.Flags().IntVar(&ag.Port, "port", 8000, "port to listen on")
@@ -69,99 +86,61 @@ func NewCommand() *cobra.Command {
 	return command
 }
 
-func runWeb(ag *CmdArgs) error {
-	if err_ := validateWebAuth(ag.Host, ag.Password); err_ != nil {
-		return err_
+func runWebWithFactory(ag *CmdArgs, factory ServerFactory) error {
+	if err := validateWebAuth(ag.Host, ag.Password); err != nil {
+		return err
 	}
-
-	// 检查并设置日志文件输出
-	if ag.LogFile == "" {
-		cacheDir, err_ := utils2.GetCacheDir()
-		if err_ != nil {
-			return err_
+	server, cleanup, err := factory(ag)
+	if err != nil {
+		return err
+	}
+	if server == nil || server.Data == nil {
+		if cleanup != nil {
+			cleanup()
 		}
-		logDir := filepath.Join(cacheDir, "banbot")
-		if err := os.MkdirAll(logDir, 0755); err != nil {
-			return fmt.Errorf("failed to create log directory: %v", err)
+		return fmt.Errorf("typed dev server and data dependencies are required")
+	}
+	defer func() {
+		server.Stop()
+		server.Join()
+		if cleanup != nil {
+			cleanup()
 		}
-		logFileName := time.Now().Format("20060102150405") + ".log"
-		ag.LogFile = filepath.Join(logDir, logFileName)
+	}()
+	if err := server.collectBtResults(); err != nil {
+		return err
 	}
-	// 初始化基础数据
-	core.SetRunMode(core.RunModeLive)
-	banArg := &config.CmdArgs{
-		DataDir:     ag.DataDir,
-		LogLevel:    ag.LogLevel,
-		TimeZone:    ag.TimeZone,
-		Configs:     ag.Configs,
-		ConfigData:  ag.ConfigData,
-		Logfile:     ag.LogFile,
-		AutoCompact: true,
-	}
-	var err2 *errs.Error
-	if err2 = biz.SetupComsExg(banArg); err2 != nil {
-		return err2
-	}
-	if utils.IsDocker() {
-		// docker内运行banbot时，启动时外部传入了额外配置，更新到config.local.yml
-		err2 = config.UpdateLocal(ag.Configs, ag.ConfigData, false)
-		if err2 != nil {
-			return err2
-		}
-	}
-	err_ := collectBtResults()
-	if err_ != nil {
-		return err_
-	}
-	startBtTaskScheduler()
-	num := len(orm.GetAllExSymbols())
-	log.Info("loaded symbols", zap.Int("num", num))
+	server.startBtTaskScheduler()
 
-	// 新建web应用
-	app := fiber.New(fiber.Config{
-		AppName:      "banbot",
-		ErrorHandler: base.ErrHandler,
-		JSONEncoder:  utils2.Marshal,
-	})
-
-	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-	}))
+	app := fiber.New(fiber.Config{AppName: "banbot", ErrorHandler: base.ErrHandler, JSONEncoder: utils2.Marshal})
+	app.Use(cors.New(cors.Config{AllowOrigins: "*"}))
 	if ag.Password != "" {
-		app.Use(basicauth.New(basicauth.Config{
-			Users: map[string]string{"banbot": ag.Password},
-			Realm: "BanBot WebUI",
-		}))
+		app.Use(basicauth.New(basicauth.Config{Users: map[string]string{"banbot": ag.Password}, Realm: "BanBot WebUI"}))
 	}
-
-	// 注册API路由
-	base.RegApiKline(app.Group("/api/kline"))
-	base.RegApiCsv(app.Group("/api/kline"))
-	base.RegApiWebsocket(app.Group("/api/ws"))
-	regApiDev(app.Group("/api/dev"))
-
-	// 添加静态文件服务
-	err_ = ui.ServeStatic(app)
-	if err_ != nil {
-		return err_
+	base.RegApiKlineWithRuntimeDeps(app.Group("/api/kline"), *server.Data)
+	base.RegApiCsvAt(app.Group("/api/kline"), server.DataDir())
+	hub := base.NewWsHub(server.Data)
+	defer func() { hub.Close(); hub.Join() }()
+	base.RegApiWebsocketWithHub(app.Group("/api/ws"), hub)
+	server.RegAPI(app.Group("/api/dev"))
+	if err := ui.ServeStatic(app); err != nil {
+		return err
 	}
+	return listenWithContext(server.ctx, app, fmt.Sprintf("%s:%v", ag.Host, ag.Port))
+}
 
-	// 启动k线监听和websocket推送
-	//go base.RunReceiver()
-
-	bindUrl := fmt.Sprintf("%s:%v", ag.Host, ag.Port)
-	lang := utils.GetSystemLanguage()
-	openUrl := "http://" + bindUrl
-	if lang == "zh-CN" {
-		openUrl += "/zh-CN"
+func listenWithContext(ctx context.Context, app *fiber.App, address string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	// 延迟500ms打开浏览器
-	if utils.IsDocker() {
-		log.Info("please open browser to: " + openUrl)
-	} else {
-		utils.OpenBrowserDelay(openUrl, 500)
-	}
-
-	return app.Listen(bindUrl)
+	stopped := make(chan struct{})
+	defer close(stopped)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = app.Shutdown()
+		case <-stopped:
+		}
+	}()
+	return app.Listen(address)
 }

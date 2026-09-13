@@ -18,13 +18,12 @@ import (
 	"sync"
 
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/utils"
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/exg"
-	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
@@ -35,13 +34,30 @@ import (
 	"go.uber.org/zap"
 )
 
-type compareOrdersOptions struct {
-	configs    config.ArrString
-	backtest   string
-	botName    string
-	account    string
-	amountRate float64
-	skipUnhit  bool
+// CompareOrdersOptions describes one comparison without relying on process
+// configuration or the legacy runtime gate.
+type CompareOrdersOptions struct {
+	Backtest   string
+	BotName    string
+	Account    string
+	AmountRate float64
+	SkipUnhit  bool
+}
+
+// CompareOrdersDeps are the owned dependencies of one comparison command.
+// Identity is read from the stored SID in the backtest file by the entry
+// boundary before its runtime is constructed.
+type CompareOrdersDeps struct {
+	Runtime  biz.RuntimeDeps
+	Identity *orm.ExSymbol
+	Logger   *zap.Logger
+	dateLoc  func(int64, string) string
+	legacy   bool
+}
+
+type legacyCompareOrdersOptions struct {
+	configs config.ArrString
+	CompareOrdersOptions
 }
 
 /*
@@ -50,80 +66,125 @@ Compare the exchange export order records with the backtest order records.
 对比交易所导出订单记录和回测订单记录。
 */
 func CompareExgBTOrders(args []string) error {
-	return WithLegacySession(func(LegacySession) error {
-		command, _ := newCompareExgBTOrdersCommand()
-		command.SetArgs(args)
-		return command.Execute()
-	})
+	command := NewCompareExgBTOrdersCommand()
+	command.SetArgs(args)
+	return command.Execute()
 }
 
 func NewCompareExgBTOrdersCommand() *cobra.Command {
-	command, options := newCompareExgBTOrdersCommand()
-	command.RunE = func(_ *cobra.Command, _ []string) error {
-		return WithLegacySession(func(LegacySession) error {
-			return compareExgBTOrders(options)
-		})
+	options := &legacyCompareOrdersOptions{CompareOrdersOptions: CompareOrdersOptions{AmountRate: 0.1, SkipUnhit: true}}
+	command := &cobra.Command{
+		Use: "cmp-orders", Aliases: []string{"cmp_orders"},
+		Short: "compare exchange orders with a backtest", Args: cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error { return compareExgBTOrdersLegacy(options) },
 	}
+	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")
+	command.Flags().StringVar(&options.BotName, "bot-name", "", "bot name used for live trading")
+	command.Flags().StringVar(&options.Account, "account", "", "account whose API key will fetch orders")
+	command.Flags().StringVar(&options.Backtest, "bt-path", "", "backtest order file")
+	command.Flags().Float64Var(&options.AmountRate, "amt-rate", 0.1, "amount difference threshold from 0 to 1")
+	command.Flags().BoolVar(&options.SkipUnhit, "skip-unhit", true, "skip backtest pairs with no exchange orders")
 	return command
 }
 
-func newCompareExgBTOrdersCommand() (*cobra.Command, *compareOrdersOptions) {
-	options := &compareOrdersOptions{}
-	command := &cobra.Command{
-		Use:         "cmp-orders",
-		Aliases:     []string{"cmp_orders"},
-		Short:       "compare exchange orders with a backtest",
-		Args:        cobra.NoArgs,
-		Annotations: map[string]string{legacygate.Annotation: "1"},
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return compareExgBTOrders(options)
-		},
-	}
-	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")
-	command.Flags().StringVar(&options.botName, "bot-name", "", "bot name used for live trading")
-	command.Flags().StringVar(&options.account, "account", "", "account whose API key will fetch orders")
-	command.Flags().StringVar(&options.backtest, "bt-path", "", "backtest order file")
-	command.Flags().Float64Var(&options.amountRate, "amt-rate", 0.1, "amount difference threshold from 0 to 1")
-	command.Flags().BoolVar(&options.skipUnhit, "skip-unhit", true, "skip backtest pairs with no exchange orders")
-	return command, options
-}
-
-func compareExgBTOrders(options *compareOrdersOptions) error {
-	if options.account == "" || options.backtest == "" || options.botName == "" {
-		return errors.New("`exg-path/account` `bt-path` bot-name is required")
+func compareExgBTOrdersLegacy(options *legacyCompareOrdersOptions) error {
+	if options == nil {
+		return errs.NewMsg(core.ErrBadConfig, "comparison options are required")
 	}
 	core.SetRunMode(core.RunModeLive)
-	err := biz.SetupComs(&config.CmdArgs{Configs: options.configs})
+	if err := biz.SetupComs(&config.CmdArgs{Configs: options.configs}); err != nil {
+		return err
+	}
+	sid, err := ReadBacktestOrderSID(options.Backtest)
 	if err != nil {
 		return err
 	}
-	btOrders, pairNums, startMS, endMS, err_ := readBackTestOrders(options.backtest)
+	identity := orm.GetSymbolByID(sid)
+	if identity == nil {
+		return errs.NewMsg(core.ErrInvalidSymbol, "backtest symbol SID %d not found", sid)
+	}
+	exchange, err := exg.GetWith(identity.Exchange, identity.Market, "")
+	if err != nil {
+		return err
+	}
+	if _, err = orm.LoadMarkets(exchange, false); err != nil {
+		return err
+	}
+	return compareExgBTOrders(options.CompareOrdersOptions, CompareOrdersDeps{
+		Identity: identity, Logger: log.L(), legacy: true,
+	})
+}
+
+// ReadBacktestOrderSID returns the stored symbol identity of the first
+// backtest order. The caller must resolve this SID through its own storage.
+func ReadBacktestOrderSID(path string) (int32, *errs.Error) {
+	orders, _, _, _, err := readBackTestOrders(path)
+	if err != nil {
+		return 0, errs.New(errs.CodeIOReadFail, err)
+	}
+	if len(orders) == 0 || orders[0] == nil || orders[0].IOrder == nil || orders[0].Sid == 0 {
+		return 0, errs.NewMsg(errs.CodeParamInvalid, "no backtest order symbol SID found")
+	}
+	return int32(orders[0].Sid), nil
+}
+
+// CompareExgBTOrdersWithRuntimeDeps compares downloaded exchange orders with
+// a backtest using only one explicit runtime and its resolved identity.
+func CompareExgBTOrdersWithRuntimeDeps(options CompareOrdersOptions, deps CompareOrdersDeps) error {
+	deps.dateLoc = NewReportDeps(deps.Runtime).dateStrLoc
+	return compareExgBTOrders(options, deps)
+}
+
+func compareExgBTOrders(options CompareOrdersOptions, deps CompareOrdersDeps) error {
+	if options.Account == "" || options.Backtest == "" || options.BotName == "" {
+		return errors.New("`exg-path/account` `bt-path` bot-name is required")
+	}
+	if deps.Identity == nil || deps.Identity.Exchange == "" || deps.Identity.Market == "" {
+		return errs.NewMsg(core.ErrBadConfig, "stored backtest symbol identity is required")
+	}
+	if !deps.legacy {
+		if deps.Runtime.Config == nil || deps.Runtime.Config.DataDir == "" || deps.Runtime.Exchange == nil || deps.Runtime.Core == nil {
+			return errs.NewMsg(core.ErrBadConfig, "comparison runtime dependencies are required")
+		}
+		if deps.Runtime.Core.ExgName != deps.Identity.Exchange || deps.Runtime.Core.Market != deps.Identity.Market {
+			return errs.NewMsg(core.ErrBadConfig, "comparison runtime identity does not match stored backtest symbol")
+		}
+	}
+	logger := deps.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	dateLoc := deps.dateLoc
+	if dateLoc == nil {
+		dateLoc = btime.ToDateStrLoc
+	}
+	btOrders, pairNums, startMS, endMS, err_ := readBackTestOrders(options.Backtest)
 	if err_ != nil {
 		return err_
 	}
 	if len(btOrders) == 0 {
 		return errors.New("no batcktest orders found")
 	}
-	exs := orm.GetSymbolByID(int32(btOrders[0].Sid))
-	exchange, err := exg.GetWith(exs.Exchange, exs.Market, "")
-	if err != nil {
-		return err
+	dataDir := config.GetDataDir()
+	if !deps.legacy {
+		dataDir = deps.Runtime.Config.DataDir
 	}
-	_, err = orm.LoadMarkets(exchange, false)
-	if err != nil {
-		return err
-	}
-	outDir := filepath.Join(config.GetDataDir(), "exgOrders")
+	outDir := filepath.Join(dataDir, "exgOrders")
 	var exgOrders []*banexg.Order
-	exgOrders, err = loadExgOrders(options.account, exs.Exchange, exs.Market, startMS, endMS, pairNums)
+	var err *errs.Error
+	if deps.legacy {
+		exgOrders, err = loadExgOrders(options.Account, deps.Identity.Exchange, deps.Identity.Market, startMS, endMS, pairNums)
+	} else {
+		exgOrders, err = loadExgOrdersWithRuntimeDeps(deps.Runtime, options.Account, deps.Identity.Exchange, deps.Identity.Market, startMS, endMS, pairNums)
+	}
 	if err != nil {
 		return err
 	}
 	if len(exgOrders) == 0 {
 		return errors.New("no exchange orders to compare")
 	}
-	log.Info("loaded exchange orders", zap.Int("num", len(exgOrders)))
-	pairExgOds := buildExgOrders(exgOrders, options.botName)
+	logger.Info("loaded exchange orders", zap.Int("num", len(exgOrders)))
+	pairExgOds := buildExgOrders(exgOrders, options.BotName)
 	exgOdList := make([]*ormo.InOutOrder, 0)
 	for _, odList := range pairExgOds {
 		exgOdList = append(exgOdList, odList...)
@@ -147,7 +208,7 @@ func compareExgBTOrders(options *compareOrdersOptions) error {
 		tfMSecsFlt := float64(tfMSecs)
 		entFixMS := utils2.AlignTfMSecs(iod.RealEnterMS(), tfMSecs)
 		exgOds, _ := pairExgOds[iod.Symbol]
-		if options.skipUnhit && len(exgOds) == 0 {
+		if options.SkipUnhit && len(exgOds) == 0 {
 			continue
 		}
 		dirt := "long"
@@ -160,7 +221,7 @@ func compareExgBTOrders(options *compareOrdersOptions) error {
 		for _, exod := range exgOds {
 			if exod.Short == iod.Short && math.Abs(float64(exod.RealEnterMS()-entFixMS)) < tfMSecsFlt {
 				amtRate2 := exod.Enter.Filled / iod.Enter.Filled
-				if math.Abs(amtRate2-1) <= options.amountRate {
+				if math.Abs(amtRate2-1) <= options.AmountRate {
 					matches = append(matches, exod)
 				}
 			}
@@ -187,8 +248,8 @@ func compareExgBTOrders(options *compareOrdersOptions) error {
 		if matOd == nil {
 			// There is no corresponding record for backtesting orders
 			// 回测订单没有对应记录
-			entMSStr := btime.ToDateStrLoc(iod.RealEnterMS(), "")
-			exitMSStr := btime.ToDateStrLoc(iod.RealExitMS(), "")
+			entMSStr := dateLoc(iod.RealEnterMS(), "")
+			exitMSStr := dateLoc(iod.RealExitMS(), "")
 			entPriceStr := strconv.FormatFloat(iod.Enter.Price, 'f', 6, 64)
 			amtStr := strconv.FormatFloat(iod.Enter.Filled+iod.Exit.Filled, 'f', 6, 64)
 			feeStr := strconv.FormatFloat(iod.Enter.FeeQuote+iod.Exit.FeeQuote, 'f', 6, 64)
@@ -197,15 +258,15 @@ func compareExgBTOrders(options *compareOrdersOptions) error {
 			err_ = writer.Write([]string{"bt", iod.Symbol, iod.Timeframe, dirt, entMSStr, exitMSStr, entPriceStr,
 				exitPriceStr, amtStr, feeStr, profitStr, "0", "0", "", "", "", "", "", ""})
 			if err_ != nil {
-				log.Error("writer csv fail", zap.Error(err_))
+				logger.Error("writer csv fail", zap.Error(err_))
 			}
 		} else {
 			// 有匹配记录
 			if matOd.Exit == nil {
 				matOd.Exit = &ormo.ExOrder{}
 			}
-			entMSStr := btime.ToDateStrLoc(matOd.RealEnterMS(), "")
-			exitMSStr := btime.ToDateStrLoc(matOd.RealExitMS(), "")
+			entMSStr := dateLoc(matOd.RealEnterMS(), "")
+			exitMSStr := dateLoc(matOd.RealExitMS(), "")
 			entPriceStr := strconv.FormatFloat(matOd.Enter.Average, 'f', 6, 64)
 			amtStr := strconv.FormatFloat(matOd.Enter.Filled+matOd.Exit.Filled, 'f', 6, 64)
 			feeStr := strconv.FormatFloat(matOd.Enter.FeeQuote+matOd.Exit.FeeQuote, 'f', 6, 64)
@@ -241,7 +302,7 @@ func compareExgBTOrders(options *compareOrdersOptions) error {
 				exitPriceStr, amtStr, feeStr, profitStr, entDelayStr, exitDelayStr, priceDiff, amountDiff,
 				feeDiff, profitDiff, profitDfStr, reason})
 			if err_ != nil {
-				log.Error("writer csv fail", zap.Error(err_))
+				logger.Error("writer csv fail", zap.Error(err_))
 			}
 		}
 	}
@@ -255,8 +316,8 @@ func compareExgBTOrders(options *compareOrdersOptions) error {
 			if iod.Exit == nil {
 				iod.Exit = &ormo.ExOrder{}
 			}
-			entMSStr := btime.ToDateStrLoc(iod.RealEnterMS(), "")
-			exitMSStr := btime.ToDateStrLoc(iod.RealExitMS(), "")
+			entMSStr := dateLoc(iod.RealEnterMS(), "")
+			exitMSStr := dateLoc(iod.RealExitMS(), "")
 			entPriceStr := strconv.FormatFloat(iod.Enter.Average, 'f', 6, 64)
 			amtStr := strconv.FormatFloat(iod.Enter.Filled+iod.Exit.Filled, 'f', 6, 64)
 			feeStr := strconv.FormatFloat(iod.Enter.FeeQuote+iod.Exit.FeeQuote, 'f', 6, 64)
@@ -265,11 +326,11 @@ func compareExgBTOrders(options *compareOrdersOptions) error {
 			err_ = writer.Write([]string{"exg", iod.Symbol, iod.Timeframe, dirt, entMSStr, exitMSStr, entPriceStr,
 				exitPriceStr, amtStr, feeStr, profitStr, "0", "0", "", "", "", "", "", ""})
 			if err_ != nil {
-				log.Error("writer csv fail", zap.Error(err_))
+				logger.Error("writer csv fail", zap.Error(err_))
 			}
 		}
 	}
-	log.Info("dump compare result", zap.String("at", outPath))
+	logger.Info("dump compare result", zap.String("at", outPath))
 	// write raw exchange orders
 	outPath = fmt.Sprintf("%s/exg_orders_raw.csv", outDir)
 	rows := make([][]string, 0, len(exgOrders)+1)
@@ -296,14 +357,14 @@ func compareExgBTOrders(options *compareOrdersOptions) error {
 	if err != nil {
 		return err
 	}
-	log.Info("dump exchange raw orders", zap.String("at", outPath))
+	logger.Info("dump exchange raw orders", zap.String("at", outPath))
 	outPath = fmt.Sprintf("%s/exg_orders.csv", outDir)
-	log.Info("dump exchange orders", zap.String("at", outPath))
+	logger.Info("dump exchange orders", zap.String("at", outPath))
 	return DumpOrdersCSV(exgOdList, outPath)
 }
 
-func loadExgOrders(account, exgName, market string, startMS, endMS int64, pairNums map[string]int) ([]*banexg.Order, *errs.Error) {
-	save, err := biz.GetExgOrderSet(account, exgName, market)
+func loadExgOrdersWithRuntimeDeps(deps biz.RuntimeDeps, account, exgName, market string, startMS, endMS int64, pairNums map[string]int) ([]*banexg.Order, *errs.Error) {
+	save, err := biz.NewExgOrderSetWithRuntimeDeps(deps, account, exgName, market)
 	if err != nil {
 		return nil, err
 	}
@@ -325,6 +386,27 @@ func loadExgOrders(account, exgName, market string, startMS, endMS int64, pairNu
 		return exgOrders[i].Timestamp < exgOrders[j].Timestamp
 	})
 	return exgOrders, nil
+}
+
+func loadExgOrders(account, exgName, market string, startMS, endMS int64, pairNums map[string]int) ([]*banexg.Order, *errs.Error) {
+	save, err := biz.GetExgOrderSet(account, exgName, market)
+	if err != nil {
+		return nil, err
+	}
+	pairs := utils.KeysOfMap(pairNums)
+	if err = save.Download(startMS, endMS, pairs, true); err != nil {
+		return nil, err
+	}
+	pairOrders, err := save.Get(startMS, endMS, pairs, "")
+	if err != nil {
+		return nil, err
+	}
+	var orders []*banexg.Order
+	for _, items := range pairOrders {
+		orders = append(orders, items...)
+	}
+	sort.Slice(orders, func(i, j int) bool { return orders[i].Timestamp < orders[j].Timestamp })
+	return orders, nil
 }
 
 func readBackTestOrders(path string) ([]*ormo.InOutOrder, map[string]int, int64, int64, error) {
@@ -629,6 +711,9 @@ func MergeAssetsHtml(outPath string, files map[string]string, tags []string, use
 	for _, data := range allData {
 		maxSamples = max(maxSamples, len(data.Labels))
 	}
+	if maxSamples < 2 || minTime == math.MaxInt64 {
+		return errs.NewMsg(errs.CodeInvalidData, "assets data requires at least two samples")
+	}
 
 	// 生成最终的时间戳和标签
 	interval := (maxTime - minTime) / int64(maxSamples-1)
@@ -762,19 +847,80 @@ type FacArgs struct {
 	IntervalMS   int64
 }
 
+type FactorFunc func(FacArgs) ([]string, error)
+
 var (
-	FactorMap = make(map[string]func(FacArgs) ([]string, error))
+	factorRegistry   = make(map[string]FactorFunc)
+	factorRegistryMu sync.RWMutex
 )
 
-/*
-BtFactors 从全品种回测订单，对给定的截面因子进行滚动回测，输出回测结果到控制台和目录
-*/
+// RegisterFactor registers a process-wide factor definition.
+func RegisterFactor(name string, factor FactorFunc) {
+	if name == "" {
+		panic("factor name must not be empty")
+	}
+	if factor == nil {
+		panic("factor function must not be nil")
+	}
+	factorRegistryMu.Lock()
+	factorRegistry[name] = factor
+	factorRegistryMu.Unlock()
+}
+
+// GetFactor returns a registered factor definition.
+func GetFactor(name string) (FactorFunc, bool) {
+	factorRegistryMu.RLock()
+	factor, ok := factorRegistry[name]
+	factorRegistryMu.RUnlock()
+	return factor, ok
+}
+
+// UnregisterFactor removes a process-wide factor definition.
+func UnregisterFactor(name string) {
+	factorRegistryMu.Lock()
+	delete(factorRegistry, name)
+	factorRegistryMu.Unlock()
+}
+
+// SnapshotFactors returns a detached view of the factor registry.
+func SnapshotFactors() map[string]FactorFunc {
+	factorRegistryMu.RLock()
+	defer factorRegistryMu.RUnlock()
+	result := make(map[string]FactorFunc, len(factorRegistry))
+	for name, factor := range factorRegistry {
+		result[name] = factor
+	}
+	return result
+}
+
+// BtFactorsWithRuntimeDeps evaluates rolling factors with state owned by one
+// runtime. It does not initialize, reset, or restore process-wide state.
+func BtFactorsWithRuntimeDeps(args []string, deps biz.RuntimeDeps) error {
+	command, options := newBtFactorsCommand()
+	command.SetArgs(args)
+	if err := command.ParseFlags(args); err != nil {
+		return err
+	}
+	reportDeps := NewReportDeps(deps)
+	if err := reportDeps.validateResult(); err != nil {
+		return err
+	}
+	if options.output != "" {
+		options.output = reportDeps.Config.ParsePath(options.output)
+		if err := utils.EnsureDir(options.output, 0755); err != nil {
+			return err
+		}
+	}
+	return btFactorsWithReportDeps(options, reportDeps)
+}
+
+// BtFactors preserves the public serial tool facade. It initializes the
+// package-level compatibility runtime once, then calls the same typed core as
+// the explicit RuntimeDeps entrypoint.
 func BtFactors(args []string) error {
-	return WithLegacySession(func(LegacySession) error {
-		command, _ := newBtFactorsCommand()
-		command.SetArgs(args)
-		return command.Execute()
-	})
+	command := NewBtFactorsCommand()
+	command.SetArgs(args)
+	return command.Execute()
 }
 
 type btFactorsOptions struct {
@@ -788,14 +934,44 @@ type btFactorsOptions struct {
 	download bool
 }
 
+// NewBtFactorsCommand preserves the standalone compatibility command.
 func NewBtFactorsCommand() *cobra.Command {
 	command, options := newBtFactorsCommand()
 	command.RunE = func(_ *cobra.Command, _ []string) error {
-		return WithLegacySession(func(LegacySession) error {
-			return btFactors(options)
-		})
+		return btFactorsLegacy(options)
 	}
 	return command
+}
+
+// NewBtFactorsCommandWithRun builds the command for an explicit composition
+// root that owns runtime construction.
+func NewBtFactorsCommandWithRun(run func([]string) error) *cobra.Command {
+	command, options := newBtFactorsCommand()
+	command.RunE = func(_ *cobra.Command, _ []string) error {
+		if run == nil {
+			return errs.NewMsg(errs.CodeParamRequired, "factor runtime callback is required")
+		}
+		return run(options.args())
+	}
+	return command
+}
+
+func btFactorsLegacy(options *btFactorsOptions) error {
+	var logFile string
+	if options.output != "" {
+		options.output = config.ParsePath(options.output)
+		if err := utils.EnsureDir(options.output, 0755); err != nil {
+			return err
+		}
+		logFile = filepath.Join(options.output, "out.log")
+	}
+	core.SetRunMode(core.RunModeBackTest)
+	if err := biz.SetupComsExg(&config.CmdArgs{Configs: options.configs, Logfile: logFile}); err != nil {
+		return err
+	}
+	deps := legacyReplayReportDeps()
+	deps.Exchange = exg.Default
+	return btFactorsWithReportDeps(options, deps)
 }
 
 func newBtFactorsCommand() (*cobra.Command, *btFactorsOptions) {
@@ -805,10 +981,7 @@ func newBtFactorsCommand() (*cobra.Command, *btFactorsOptions) {
 		Aliases:     []string{"bt_factor"},
 		Short:       "backtest factors with orders",
 		Args:        cobra.NoArgs,
-		Annotations: map[string]string{legacygate.Annotation: "1"},
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return btFactors(options)
-		},
+		Annotations: map[string]string{},
 	}
 	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")
 	command.Flags().StringVar(&options.factor, "factor", "", "factor to test")
@@ -821,28 +994,37 @@ func newBtFactorsCommand() (*cobra.Command, *btFactorsOptions) {
 	return command, options
 }
 
-func btFactors(options *btFactorsOptions) error {
-	var err_ error
-	var logFile string
-	if options.output != "" {
-		options.output = config.ParsePath(options.output)
-		err_ = utils.EnsureDir(options.output, 0755)
-		if err_ != nil {
-			return err_
-		}
-		logFile = filepath.Join(options.output, "out.log")
+func (o *btFactorsOptions) args() []string {
+	args := make([]string, 0, len(o.configs)+12)
+	for _, path := range o.configs {
+		args = append(args, "--config", path)
 	}
-	core.SetRunMode(core.RunModeBackTest)
-	err := biz.SetupComsExg(&config.CmdArgs{
-		Configs: options.configs,
-		Logfile: logFile,
-	})
-	if err != nil {
-		return err
+	args = append(args, "--factor", o.factor, "--in", o.input, "--out", o.output,
+		"--min-back", o.minBack, "--max-back", o.maxBack, "--interval", o.interval)
+	if o.download {
+		args = append(args, "--down")
 	}
-	var startMs = config.TimeRange.StartMS
-	var endMS = config.TimeRange.EndMS
-	if len(config.StakeCurrency) == 0 {
+	return args
+}
+
+func btFactorsWithReportDeps(options *btFactorsOptions, deps *ReportDeps) error {
+	if deps == nil {
+		return errs.NewMsg(core.ErrBadConfig, "factor report dependencies are required")
+	}
+	var err error
+	cfg := deps.configView()
+	if cfg == nil || deps.Config == nil {
+		return errs.NewMsg(core.ErrBadConfig, "factor runtime config is required")
+	}
+	parsePath := deps.Config.ParsePath
+	exchange := deps.Exchange
+	dateStr := deps.dateStr
+	if cfg.TimeRange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "factor time range is required")
+	}
+	startMs := cfg.TimeRange.StartMS
+	endMS := cfg.TimeRange.EndMS
+	if len(cfg.StakeCurrency) == 0 {
 		return errors.New("`stake_currency` in yml is required")
 	}
 	var tfSecs int
@@ -850,9 +1032,9 @@ func btFactors(options *btFactorsOptions) error {
 	if options.input == "" {
 		return errors.New("--in is required")
 	} else {
-		options.input = config.ParsePath(options.input)
+		options.input = parsePath(options.input)
 	}
-	facFunc, ok := FactorMap[options.factor]
+	facFunc, ok := GetFactor(options.factor)
 	if !ok || facFunc == nil {
 		return errors.New("--factor is invalid")
 	}
@@ -883,7 +1065,8 @@ func btFactors(options *btFactorsOptions) error {
 				validOdNum += 1
 			}
 			if _, ok = pairMap[od.Symbol]; !ok {
-				exs, err := orm.GetExSymbolCur(od.Symbol)
+				var exs *orm.ExSymbol
+				exs, err = deps.symbol(od.Symbol)
 				if err != nil {
 					return err
 				}
@@ -928,14 +1111,20 @@ func btFactors(options *btFactorsOptions) error {
 	if options.download {
 		prgTotal := 10000
 		pBar := utils.NewPrgBar(prgTotal, "BulkDown")
-		err = orm.BulkDownOHLCV(exg.Default, exsMap, tf, startMs, endMS, 0, func(done int, total int) {
+		progress := func(done int, total int) {
 			newProgress := int64(prgTotal) * int64(done) / int64(total)
 			add := newProgress - pBar.Last
 			if add > 0 {
 				pBar.Last = newProgress
 				pBar.Add(int(add))
 			}
-		})
+		}
+		if deps.legacy {
+			err = orm.BulkDownOHLCV(exchange, exsMap, tf, startMs, endMS, 0, progress)
+		} else {
+			options := orm.NewKlineRuntimeOptions(deps.Core, cfg, deps.reportNowMS(), deps.Storage)
+			err = orm.BulkDownOHLCVWithOptions(exchange, exsMap, tf, startMs, endMS, 0, progress, options)
+		}
 		if err != nil {
 			return err
 		}
@@ -946,11 +1135,11 @@ func btFactors(options *btFactorsOptions) error {
 	rangeEnd := startMs + minBackMSecs
 	var testOrders []*ormo.InOutOrder
 	for rangeEnd+intvMSecs/5 < endMS {
-		pairOrders, err := CutOrdersInRange(orders, rangeStart, rangeEnd)
+		pairOrders, err := cutOrdersInRange(orders, rangeStart, rangeEnd, deps)
 		if err != nil {
 			return err
 		}
-		pairInfos, err := CalcPairStats(pairOrders, rangeStart, rangeEnd, tf)
+		pairInfos, err := calcPairStats(pairOrders, rangeStart, rangeEnd, tf, deps)
 		if err != nil {
 			return err
 		}
@@ -971,12 +1160,12 @@ func btFactors(options *btFactorsOptions) error {
 		if err_ != nil {
 			return err_
 		}
-		startDate := btime.ToDateStr(rangeStart, core.DefaultDateFmt)
-		endDate := btime.ToDateStr(rangeEnd, core.DefaultDateFmt)
+		startDate := dateStr(rangeStart, core.DefaultDateFmt)
+		endDate := dateStr(rangeEnd, core.DefaultDateFmt)
 		rangeStr := fmt.Sprintf("%s-%s", startDate, endDate)
-		log.Info("select pairs", zap.String("range", rangeStr), zap.Strings("arr", pairs))
+		deps.logger().Info("select pairs", zap.String("range", rangeStr), zap.Strings("arr", pairs))
 		// 使用选中品种，交易interval时间段
-		pairOrders, err = CutOrdersInRange(orders, rangeEnd, rangeEnd+intvMSecs)
+		pairOrders, err = cutOrdersInRange(orders, rangeEnd, rangeEnd+intvMSecs, deps)
 		if err != nil {
 			return err
 		}
@@ -990,15 +1179,11 @@ func btFactors(options *btFactorsOptions) error {
 			rangeStart = rangeEnd - maxBackMSecs
 		}
 	}
-	_, err = calcBtResult(testOrders, config.WalletAmounts, options.output)
+	_, err = calcBtResultWithDeps(testOrders, cfg.WalletAmounts, options.output, deps)
 	if err != nil {
 		return err
 	}
 	return nil
-}
-
-func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[string][]*ormo.InOutOrder, *errs.Error) {
-	return cutOrdersInRange(orders, startMS, endMS, nil)
 }
 
 // CutOrdersInRangeWithRuntimeDeps performs the same replay-window clipping
@@ -1007,11 +1192,14 @@ func CutOrdersInRangeWithRuntimeDeps(orders []*ormo.InOutOrder, startMS, endMS i
 	return cutOrdersInRange(orders, startMS, endMS, NewReportDeps(deps))
 }
 
+// CutOrdersInRange preserves the package-level serial report tool.
+func CutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64) (map[string][]*ormo.InOutOrder, *errs.Error) {
+	return cutOrdersInRange(orders, startMS, endMS, legacyReportDeps())
+}
+
 func cutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64, deps *ReportDeps) (map[string][]*ormo.InOutOrder, *errs.Error) {
-	if deps != nil {
-		if err := deps.validateSeries(); err != nil {
-			return nil, err
-		}
+	if err := deps.validateSeries(); err != nil {
+		return nil, err
 	}
 	pairOrders := make(map[string][]*ormo.InOutOrder)
 	cloneIds := make(map[int64]bool)
@@ -1047,25 +1235,17 @@ func cutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64, deps *Rep
 		tfMSecs := int64(minTfSecs * 1000)
 		var exs *orm.ExSymbol
 		var err *errs.Error
-		if deps == nil {
-			exs = orm.GetExSymbol2(core.ExgName, core.Market, pair)
-		} else {
-			exs, err = deps.symbol(pair)
-			if err != nil {
-				return nil, err
-			}
+		exs, err = deps.symbol(pair)
+		if err != nil {
+			return nil, err
 		}
 		var rows []*orm.DataSeries
-		if deps == nil {
-			_, rows, err = orm.GetSeries(exs, minTF, startMS, endMS, 1, false)
-		} else {
-			queries, release, queryErr := deps.queries()
-			if queryErr != nil {
-				return nil, queryErr
-			}
-			_, rows, err = queries.GetSeries(exs, minTF, startMS, endMS, 1, false)
-			release()
+		queries, release, queryErr := deps.queries()
+		if queryErr != nil {
+			return nil, queryErr
 		}
+		_, rows, err = queries.GetSeries(exs, minTF, startMS, endMS, 1, false)
+		release()
 		if err != nil {
 			return nil, err
 		}
@@ -1077,16 +1257,12 @@ func cutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64, deps *Rep
 			return nil, errs.New(core.ErrInvalidBars, err_)
 		}
 		openMS := rows[0].TimeMS
-		if deps == nil {
-			_, rows, err = orm.GetSeries(exs, minTF, 0, endMS, 1, false)
-		} else {
-			queries, release, queryErr := deps.queries()
-			if queryErr != nil {
-				return nil, queryErr
-			}
-			_, rows, err = queries.GetSeries(exs, minTF, 0, endMS, 1, false)
-			release()
+		queries, release, queryErr = deps.queries()
+		if queryErr != nil {
+			return nil, queryErr
 		}
+		_, rows, err = queries.GetSeries(exs, minTF, 0, endMS, 1, false)
+		release()
 		if err != nil {
 			return nil, err
 		}
@@ -1136,20 +1312,9 @@ func cutOrdersInRange(orders []*ormo.InOutOrder, startMS, endMS int64, deps *Rep
 	return pairOrders, nil
 }
 
-func BuildBtResult(args *config.CmdArgs) *errs.Error {
-	return WithLegacySession(func(session LegacySession) *errs.Error {
-		return BuildBtResultWithSession(args, session)
-	})
-}
-
-func BuildBtResultWithSession(args *config.CmdArgs, session LegacySession) *errs.Error {
-	session.require()
-	return buildBtResult(args)
-}
-
 // BuildBtResultWithRuntimeDeps builds a report from an explicit runtime. The
-// legacy command above remains the compatibility facade; this path does not
-// install or restore process-wide config, wallet, order, price, or core state.
+// path does not install or restore process-wide config, wallet, order, price,
+// or core state.
 func BuildBtResultWithRuntimeDeps(args *config.CmdArgs, deps biz.RuntimeDeps) *errs.Error {
 	if args == nil {
 		return errs.NewMsg(errs.CodeParamRequired, "build backtest result args are required")
@@ -1178,29 +1343,31 @@ func BuildBtResultWithRuntimeDeps(args *config.CmdArgs, deps biz.RuntimeDeps) *e
 	return err
 }
 
-func buildBtResult(args *config.CmdArgs) *errs.Error {
+// BuildBtResult preserves the public serial report tool. It initializes the
+// compatibility runtime once and then calls the same typed report core.
+func BuildBtResult(args *config.CmdArgs) *errs.Error {
+	if args == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "build backtest result args are required")
+	}
 	core.SetRunMode(core.RunModeBackTest)
 	if args.InPath == "" {
 		return errs.NewMsg(errs.CodeRunTime, "-in for orders.gob is required")
 	}
 	outDir := config.ParsePath(args.OutPath)
 	if outDir != "" {
-		err_ := utils.EnsureDir(outDir, 0755)
-		if err_ != nil {
-			return errs.New(errs.CodeIOWriteFail, err_)
+		if err := utils.EnsureDir(outDir, 0755); err != nil {
+			return errs.New(errs.CodeIOWriteFail, err)
 		}
 		args.Logfile = filepath.Join(outDir, "out.log")
 	}
-	err := biz.SetupComsExg(args)
+	if err := biz.SetupComsExg(args); err != nil {
+		return err
+	}
+	orders, err := ormo.LoadOrdersGob(config.ParsePath(args.InPath))
 	if err != nil {
 		return err
 	}
-	inPath := config.ParsePath(args.InPath)
-	orders, err := ormo.LoadOrdersGob(inPath)
-	if err != nil {
-		return err
-	}
-	_, err = calcBtResult(orders, config.WalletAmounts, outDir)
+	_, err = calcBtResultWithDeps(orders, config.WalletAmounts, outDir, legacyReplayReportDeps())
 	return err
 }
 
@@ -1298,8 +1465,8 @@ func BacktestToCompare() {
 }
 
 // BacktestToCompareWithRuntime runs the live comparison using one explicit
-// runtime. The child backtest process enters its own legacy session through
-// the normal CLI entry; the parent only reads the supplied runtime state.
+// runtime. The child backtest process uses the normal CLI entry; the parent
+// only reads the supplied runtime state.
 func BacktestToCompareWithRuntime(deps biz.RuntimeDeps) {
 	runtime, ok := runtimeBacktestCompareRuntime(deps)
 	if !ok {

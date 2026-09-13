@@ -15,6 +15,7 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/errs"
@@ -192,6 +193,45 @@ func TestRegisterDataSourceRejectsNil(t *testing.T) {
 	resetDataSourcesForTest(t)
 	if err := RegisterDataSource(nil); err == nil {
 		t.Fatalf("expected nil data source registration to fail")
+	}
+}
+
+func TestRuntimeCatalogFromRegisteredSourcesUsesFreshFactoryProviders(t *testing.T) {
+	resetDataSourcesForTest(t)
+	created := make([]*stubSeriesSource, 0, 3)
+	if err := RegisterDataSourceFactory("runtime_factory_test", func() DataSource {
+		src := newStubRegistrySource("runtime_factory_test")
+		created = append(created, src)
+		return src
+	}); err != nil {
+		t.Fatalf("register runtime factory: %v", err)
+	}
+	first, err := RuntimeCatalogFromRegisteredSources()
+	if err != nil {
+		t.Fatalf("first runtime catalog: %v", err)
+	}
+	second, err := RuntimeCatalogFromRegisteredSources()
+	if err != nil {
+		t.Fatalf("second runtime catalog: %v", err)
+	}
+	firstSource := first.GetDataSource("runtime_factory_test").(*stubSeriesSource)
+	secondSource := second.GetDataSource("runtime_factory_test").(*stubSeriesSource)
+	if firstSource == secondSource || firstSource == created[0] || secondSource == created[0] {
+		t.Fatalf("runtime catalogs reused a mutable provider: first=%p second=%p registered=%p", firstSource, secondSource, created[0])
+	}
+	firstSource.subscribeCount++
+	if secondSource.subscribeCount != 0 {
+		t.Fatalf("runtime provider state leaked: second subscriptions=%d", secondSource.subscribeCount)
+	}
+}
+
+func TestRuntimeCatalogFromRegisteredSourcesRejectsDirectRegistration(t *testing.T) {
+	resetDataSourcesForTest(t)
+	if err := RegisterDataSource(newStubRegistrySource("runtime_direct_registration_test")); err != nil {
+		t.Fatalf("register direct source: %v", err)
+	}
+	if _, err := RuntimeCatalogFromRegisteredSources(); err == nil || !strings.Contains(err.Error(), "runtime factory") {
+		t.Fatalf("runtime catalog error = %v, want factory guidance", err)
 	}
 }
 
@@ -460,7 +500,12 @@ func TestDataSourceCatalogIsolatesRuntimeLookupActivationAndHistory(t *testing.T
 	clockA := btime.NewClockState(true, nil)
 	clockA.SetTimeMS(100)
 	configSnapshot := config.NewSnapshot(&config.Config{TimeRange: &config.TimeTuple{StartMS: 100, EndMS: 200}})
-	providerA := NewHistProviderWithRuntimeDeps(&RuntimeDeps{Catalog: catalogA, Clock: clockA, Config: configSnapshot}, nil, nil, nil, false, nil)
+	providerA, providerErr := NewHistProviderWithRuntimeDeps(&RuntimeDeps{
+		Catalog: catalogA, Clock: clockA, Config: configSnapshot, Strategies: strat.NewState(),
+	}, nil, nil, nil, false, nil)
+	if providerErr != nil {
+		t.Fatal(providerErr)
+	}
 	providerA.seriesRepo = &stubSeriesRepo{}
 	if err := providerA.SetSeriesSubs(planA.Subs); err != nil {
 		t.Fatalf("historical provider catalog A: %v", err)
@@ -682,7 +727,7 @@ func TestRuntimeSeriesSourcesAndKlineFieldsStayOwned(t *testing.T) {
 				return []*strat.DataSub{{Source: sourceName, ExSymbol: exs, TimeFrame: "1d", Fields: []string{sourceField}}}
 			}},
 		}
-		state.Jobs("default")["primary"] = map[string]*strat.StratJob{"series": seriesJob}
+		state.SetJobMap("default", "primary", map[string]*strat.StratJob{"series": seriesJob})
 
 		klineJob := &strat.StratJob{
 			Symbol: exs,
@@ -690,7 +735,7 @@ func TestRuntimeSeriesSourcesAndKlineFieldsStayOwned(t *testing.T) {
 				return []*strat.DataSub{{Source: orm.SeriesSourceKline, ExSymbol: exs, TimeFrame: tf, Fields: []string{klineField}}}
 			}},
 		}
-		state.InfoJobs("default")[strat.DataSubKey(orm.SeriesSourceKline, sid, tf)] = map[string]*strat.StratJob{"kline": klineJob}
+		state.SetInfoJobMap("default", strat.DataSubKey(orm.SeriesSourceKline, sid, tf), map[string]*strat.StratJob{"kline": klineJob})
 		return state
 	}
 
@@ -1070,11 +1115,13 @@ func TestRegisteredSourceLookupsStayActivationFree(t *testing.T) {
 }
 
 func TestEnsureSeriesRangeTimescale(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	runEnsureSeriesRangeTest(t, "timescale")
 }
 
 func TestEnsureSeriesRangeQuestDB(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.yml"))
 	runEnsureSeriesRangeTest(t, "quest")
 }

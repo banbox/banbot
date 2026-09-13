@@ -64,6 +64,22 @@ type KlineSid struct {
 	Sid int32
 }
 
+// KlineExchangeFactory creates an adapter for a stored exchange/market
+// identity. The caller owns the adapters it returns.
+type KlineExchangeFactory func(context.Context, string, string) (banexg.BanExchange, *errs.Error)
+
+// KlineSyncDeps supplies the runtime-owned resources required to synchronize
+// stored kline timeframes. Symbols must contain every stored identity that can
+// be corrected; this operation is deliberately not limited to configured pairs.
+type KlineSyncDeps struct {
+	Context         context.Context
+	Queries         *Queries
+	Symbols         []*ExSymbol
+	ExchangeFactory KlineExchangeFactory
+	ConfirmAll      func(context.Context) (bool, error)
+	Logger          *zap.Logger
+}
+
 // QueryOHLCVBatch queries K-lines in batches using the legacy banexg.Kline representation.
 //
 // Deprecated: use QuerySeriesBatch, which returns DataSeries values, instead.
@@ -1329,7 +1345,15 @@ FixKInfoZeros
 修复kinfo表中start=0或stop=0的记录。通过查询实际K线数据范围来更新正确的start和stop值。
 */
 func (q *Queries) FixKInfoZeros() *errs.Error {
-	ctx := context.Background()
+	return q.FixKInfoZerosWithContext(context.Background())
+}
+
+// FixKInfoZerosWithContext repairs invalid kline range metadata using the
+// caller's cancellation scope.
+func (q *Queries) FixKInfoZerosWithContext(ctx context.Context) *errs.Error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	unlock := func() {}
 	locked := false
 	if q.isQuestDB() {
@@ -1479,7 +1503,110 @@ func SyncKlineTFs(args *config.CmdArgs, pb *utils.StagedPrg) *errs.Error {
 	return err
 }
 
+// SyncKlineTFsWithDeps synchronizes kline timeframe metadata using only the
+// supplied runtime resources. It never opens a legacy connection, reads the
+// package symbol catalog, or creates an exchange through the global facade.
+func SyncKlineTFsWithDeps(args *config.CmdArgs, deps KlineSyncDeps, pb *utils.StagedPrg) *errs.Error {
+	if args == nil {
+		return errs.NewMsg(core.ErrBadConfig, "kline sync arguments are required")
+	}
+	ctx := deps.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return errs.New(errs.CodeRunTime, err)
+	}
+	pairs := make(map[string]bool, len(args.Pairs))
+	for _, pair := range args.Pairs {
+		pairs[pair] = true
+	}
+	if len(pairs) == 0 && !args.Force {
+		if deps.ConfirmAll == nil {
+			return errs.NewMsg(core.ErrBadConfig, "kline sync confirmation is required for all symbols")
+		}
+		confirmed, err := deps.ConfirmAll(ctx)
+		if err != nil {
+			return errs.New(errs.CodeRunTime, err)
+		}
+		if !confirmed {
+			return nil
+		}
+	}
+	symbols := deps.Symbols
+	if len(pairs) > 0 {
+		symbols = make([]*ExSymbol, 0, len(deps.Symbols))
+		for _, item := range deps.Symbols {
+			if item != nil && pairs[item.Symbol] {
+				symbols = append(symbols, item)
+			}
+		}
+		if len(symbols) == 0 {
+			return nil
+		}
+	}
+	if deps.Queries == nil {
+		return errs.NewMsg(core.ErrBadConfig, "kline sync queries are required")
+	}
+	if deps.ExchangeFactory == nil {
+		return errs.NewMsg(core.ErrBadConfig, "kline sync exchange factory is required")
+	}
+	logger := deps.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	logger.Info("run kline data sync")
+
+	exchanges, err := prepareKlineSyncExchanges(ctx, symbols, deps.ExchangeFactory)
+	if err != nil {
+		return err
+	}
+	if err := deps.Queries.FixKInfoZerosWithContext(ctx); err != nil {
+		return err
+	}
+	if pb != nil {
+		pb.SetProgress("fixKInfoZeros", 1)
+	}
+	sidMap := make(map[int32]bool, len(symbols))
+	if len(pairs) > 0 {
+		for _, item := range symbols {
+			sidMap[item.ID] = true
+		}
+	}
+	return syncKlineInfosWithExchanges(ctx, deps.Queries, sidMap, func(done int, total int) {
+		if pb != nil {
+			pb.SetProgress("syncTfRanges", float64(done)/float64(total))
+		}
+	}, exchanges)
+}
+
+func prepareKlineSyncExchanges(ctx context.Context, symbols []*ExSymbol, factory KlineExchangeFactory) (map[string]banexg.BanExchange, *errs.Error) {
+	exchanges := make(map[string]banexg.BanExchange)
+	for _, item := range symbols {
+		if item == nil {
+			continue
+		}
+		key := item.Exchange + ":" + item.Market
+		if _, ok := exchanges[key]; ok {
+			continue
+		}
+		exchange, err := factory(ctx, item.Exchange, item.Market)
+		if err != nil {
+			return nil, err
+		}
+		if exchange == nil {
+			return nil, errs.NewMsg(core.ErrExgNotInit, "exchange factory returned nil for %s", key)
+		}
+		exchanges[key] = exchange
+	}
+	return exchanges, nil
+}
+
 func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.Error {
+	return syncKlineInfosWithExchanges(context.Background(), sess, sids, prg, nil)
+}
+
+func syncKlineInfosWithExchanges(ctx context.Context, sess *Queries, sids map[int32]bool, prg utils.PrgCB, exchanges map[string]banexg.BanExchange) *errs.Error {
 	// Build sid filter for GetKlineRanges (sranges-based, avoids soft-deleted data in QuestDB).
 	sidFilter := make([]int32, 0, len(sids))
 	for sid := range sids {
@@ -1525,7 +1652,7 @@ func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.E
 		var conn *pgxpool.Conn
 		var err *errs.Error
 		if sess.storage != nil {
-			sess2, conn, err = sess.storage.Conn(nil)
+			sess2, conn, err = sess.storage.Conn(ctx)
 		} else {
 			sess2, conn, err = Conn(nil)
 		}
@@ -1533,7 +1660,17 @@ func syncKlineInfos(sess *Queries, sids map[int32]bool, prg utils.PrgCB) *errs.E
 			return err
 		}
 		defer conn.Release()
-		if sess.exchange != nil {
+		if len(exchanges) > 0 {
+			exs := sess.symbolByID(sid)
+			if exs == nil {
+				return errs.NewMsg(core.ErrInvalidSymbol, "kline sync symbol %d is not in the supplied catalog", sid)
+			}
+			exchange := exchanges[exs.Exchange+":"+exs.Market]
+			if exchange == nil {
+				return errs.NewMsg(core.ErrExgNotInit, "kline sync exchange %s:%s is not initialized", exs.Exchange, exs.Market)
+			}
+			sess2 = sess2.WithExchange(exchange)
+		} else if sess.exchange != nil {
 			sess2 = sess2.WithExchange(sess.exchange)
 		}
 		if sess.symbols != nil {
@@ -1744,6 +1881,12 @@ type adjFactorCapability interface {
 }
 
 func CalcAdjFactors(args *config.CmdArgs, calculators ...AdjFactorCalculator) *errs.Error {
+	return CalcAdjFactorsWithExchange(args, exg.Default, calculators...)
+}
+
+// CalcAdjFactorsWithExchange runs an adapter-provided calculator without
+// consulting the process-wide default exchange.
+func CalcAdjFactorsWithExchange(args *config.CmdArgs, exchange banexg.BanExchange, calculators ...AdjFactorCalculator) *errs.Error {
 	if args == nil {
 		return errs.NewMsg(errs.CodeParamRequired, "command args are required")
 	}
@@ -1759,19 +1902,19 @@ func CalcAdjFactors(args *config.CmdArgs, calculators ...AdjFactorCalculator) *e
 		}
 		return calculators[0](args)
 	}
-	if exg.Default == nil {
+	if exchange == nil {
 		return errs.NewMsg(core.ErrExgNotInit, "exchange is required")
 	}
-	if capability, ok := exg.Default.(adjFactorCapability); ok && capability != nil {
+	if capability, ok := exchange.(adjFactorCapability); ok && capability != nil {
 		return capability.CalcAdjFactors(args)
 	}
-	if wrapper, ok := exg.Default.(*exg.BotExchange); ok && wrapper != nil && wrapper.BanExchange != nil {
+	if wrapper, ok := exchange.(*exg.BotExchange); ok && wrapper != nil && wrapper.BanExchange != nil {
 		if capability, ok := wrapper.BanExchange.(adjFactorCapability); ok && capability != nil {
 			return capability.CalcAdjFactors(args)
 		}
 	}
 	exchangeID := "unknown"
-	if info := exg.Default.Info(); info != nil && info.ID != "" {
+	if info := exchange.Info(); info != nil && info.ID != "" {
 		exchangeID = info.ID
 	}
 	return errs.NewMsg(errs.CodeNotImplement,

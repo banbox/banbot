@@ -2,9 +2,7 @@ package entry
 
 import (
 	"errors"
-	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -13,8 +11,8 @@ import (
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/runtime"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"github.com/sasha-s/go-deadlock"
 )
 
 // newEntryRuntime is a test-only adapter for exercising the legacy facade's
@@ -47,14 +45,6 @@ func newEntryRuntime(process *runtime.Process, mode string, startAt int64) (*run
 		}
 	}
 	return rt, nil
-}
-
-func runLegacyRunnerSession(run func(*runtime.Process) *errs.Error) *errs.Error {
-	process := runtime.NewProcess()
-	return runLegacyEntrySession(func() *errs.Error {
-		defer process.Close()
-		return run(process)
-	})
 }
 
 func TestExecuteBackTestPropagatesRunFailure(t *testing.T) {
@@ -195,186 +185,16 @@ func TestNewEntryRuntimeRejectsSeedSIDConflict(t *testing.T) {
 	}
 }
 
-func TestLegacyRunnerSessionCreatesOneProcess(t *testing.T) {
-	var calls int
-	var sessionProcess *runtime.Process
-	err := runLegacyRunnerSession(func(process *runtime.Process) *errs.Error {
-		calls++
-		sessionProcess = process
-		first, firstErr := process.NewRuntime(runtime.Options{})
-		if firstErr != nil {
-			return errs.New(core.ErrRunTime, firstErr)
-		}
-		second, secondErr := process.NewRuntime(runtime.Options{})
-		if secondErr != nil {
-			first.Close()
-			return errs.New(core.ErrRunTime, secondErr)
-		}
-		first.Close()
-		second.Close()
-		if first.Process != process || second.Process != process {
-			return errs.NewMsg(core.ErrRunTime, "session runtimes did not retain the session process")
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("runLegacyRunnerSession() error = %v", err)
-	}
-	if calls != 1 || sessionProcess == nil {
-		t.Fatalf("session callback calls/process = %d/%p, want 1/non-nil", calls, sessionProcess)
-	}
-}
-
-func TestLegacyRunnerClosesProcessBeforeReleasingGate(t *testing.T) {
-	callbackReady := make(chan struct{})
-	callbackReturned := make(chan struct{})
-	closeStarted := make(chan struct{})
-	releaseClose := make(chan struct{})
-	firstDone := make(chan *errs.Error, 1)
-	released := false
-	t.Cleanup(func() {
-		if !released {
-			close(releaseClose)
-		}
-	})
-
-	go func() {
-		firstDone <- runLegacyRunnerSession(func(process *runtime.Process) *errs.Error {
-			rt, err := process.NewRuntime(runtime.Options{})
-			if err != nil {
-				return errs.New(core.ErrRunTime, err)
-			}
-			rt.OnClose(func() {
-				close(closeStarted)
-				<-releaseClose
-			})
-			close(callbackReady)
-			close(callbackReturned)
-			return nil
-		})
-	}()
-
-	<-callbackReady
-	<-callbackReturned
-	secondEntered := make(chan struct{})
-	secondDone := make(chan struct{})
-	go func() {
-		_ = runLegacyEntrySession(func() *errs.Error {
-			close(secondEntered)
-			return nil
-		})
-		close(secondDone)
-	}()
-
-	select {
-	case <-secondEntered:
-		t.Fatal("legacy gate released before Process.Close completed")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	close(releaseClose)
-	released = true
-	select {
-	case err := <-firstDone:
-		if err != nil {
-			t.Fatalf("first legacy runner failed: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("first legacy runner did not close its process")
-	}
-	select {
-	case <-closeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("process close hook did not run")
-	}
-	select {
-	case <-secondDone:
-	case <-time.After(time.Second):
-		t.Fatal("legacy gate was not released after Process.Close")
-	}
-}
-
-func TestLegacyEntrySessionReleasesAfterError(t *testing.T) {
-	want := errs.NewMsg(core.ErrRunTime, "legacy entry failed")
-	if got := runLegacyEntrySession(func() *errs.Error { return want }); got != want {
-		t.Fatalf("runLegacyEntrySession() error = %v, want %v", got, want)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		runLegacyEntrySession(func() *errs.Error {
-			close(done)
-			return nil
-		})
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("legacy gate remained locked after callback error")
-	}
-}
-
-func TestLegacyEntrySessionReleasesAfterPanic(t *testing.T) {
-	var recovered any
-	func() {
-		defer func() { recovered = recover() }()
-		runLegacyEntrySession(func() *errs.Error { panic("legacy entry panic") })
-	}()
-	if recovered == nil {
-		t.Fatal("runLegacyEntrySession() did not propagate callback panic")
-	}
-
-	done := make(chan struct{})
-	go func() {
-		runLegacyEntrySession(func() *errs.Error {
-			close(done)
-			return nil
-		})
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("legacy gate remained locked after callback panic")
-	}
-}
-
-func TestExplicitRuntimeConstructionDoesNotWaitForLegacyEntryGate(t *testing.T) {
-	unlock := runtime.LockLegacy()
-	released := false
-	t.Cleanup(func() {
-		if !released {
-			unlock()
-		}
-	})
-
-	done := make(chan error, 1)
-	go func() {
-		rt, err := runtime.NewProcess().NewRuntime(runtime.Options{})
-		if rt != nil {
-			rt.Close()
-		}
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("explicit runtime construction failed: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("explicit runtime construction unexpectedly waited for legacy gate")
-	}
-	unlock()
-	released = true
-}
-
 func TestBacktestAndLiveRunnersUseIsolatedRuntimeDeps(t *testing.T) {
-	oldData, oldDataDir, oldExgName, oldMarket := config.Data, config.DataDir, core.ExgName, core.Market
+	oldData, oldDataDir, oldExgName, oldMarket, oldExchange := config.Data, config.DataDir, core.ExgName, core.Market, exg.Default
 	t.Cleanup(func() {
 		config.Data, config.DataDir = oldData, oldDataDir
 		core.ExgName, core.Market = oldExgName, oldMarket
+		exg.Default = oldExchange
 	})
 	config.DataDir = t.TempDir()
 	core.ExgName, core.Market = "test", "spot"
+	exg.Default = &banexg.Exchange{ExgInfo: &banexg.ExgInfo{ID: "test", MarketType: "spot"}}
 
 	process := runtime.NewProcess()
 	backtestRuntime, err := newEntryRuntime(process, core.RunModeBackTest, 100)
@@ -389,242 +209,52 @@ func TestBacktestAndLiveRunnersUseIsolatedRuntimeDeps(t *testing.T) {
 	t.Cleanup(backtestRuntime.Close)
 	t.Cleanup(liveRuntime.Close)
 
-	opt.WithLegacySession(func(session opt.LegacySession) struct{} {
-		backtest := opt.NewBackTestLiteWithRuntimeDeps(session, runtimeRunnerDeps(backtestRuntime), backtestRuntime.Symbols, true, nil, nil, nil)
-		liveTrader := live.NewCryptoTraderWithRuntimeDeps(liveRuntime, runtimeRunnerDeps(liveRuntime), liveRuntime.Symbols, nil)
-		backtestDeps := backtest.RuntimeDependencies()
-		liveDeps := liveTrader.RuntimeDependencies()
-		if backtestDeps.Core != backtestRuntime.Core || backtestDeps.Clock != backtestRuntime.Clock ||
-			backtestDeps.Market != backtestRuntime.Market || backtestDeps.Batch != backtestRuntime.Batch ||
-			backtestDeps.Symbols != backtestRuntime.Symbols {
-			t.Fatal("backtest runner did not retain its runtime dependencies")
-		}
-		if liveDeps.Core != liveRuntime.Core || liveDeps.Clock != liveRuntime.Clock ||
-			liveDeps.Market != liveRuntime.Market || liveDeps.Batch != liveRuntime.Batch ||
-			liveDeps.Symbols != liveRuntime.Symbols {
-			t.Fatal("live runner did not retain its runtime dependencies")
-		}
-
-		if !backtest.FeedDataSeries(&orm.DataSeries{
-			TimeMS: 300, TimeFrame: "1m", IsWarmUp: true,
-			ExSymbol: &orm.ExSymbol{Symbol: "BTC/USDT"},
-			Values: map[string]any{
-				"open": 10.0, "high": 12.0, "low": 9.0, "close": 11.0, "volume": 1.0,
-			},
-		}) {
-			t.Fatal("backtest runner rejected isolated runtime event")
-		}
-		if backtestRuntime.Clock.TimeMS() != 60_300 ||
-			backtestRuntime.Market.Prices.GetLastBarPriceAt("BTC/USDT") != 11 ||
-			backtestRuntime.Batch.LastBatchMS() != 60_300 {
-			t.Fatal("backtest runner did not consume its typed clock, market, and batch state")
-		}
-		backtestRuntime.Clock.SetTimeMS(111)
-		backtestRuntime.Core.BotRunning = false
-		backtestRuntime.Core.CheckWallets = true
-		backtestRuntime.Batch.SetLastBatchMS(333)
-		if liveRuntime.Clock.TimeMS() == 111 || !liveRuntime.Core.BotRunning || liveRuntime.Core.CheckWallets ||
-			liveRuntime.Market.Prices.GetLastBarPriceAt("BTC/USDT") != -1 || liveRuntime.Batch.LastBatchMS() != 0 {
-			t.Fatal("backtest runtime state leaked into the live runner")
-		}
-		if backtest.TimeMS() != 111 || liveTrader.TimeMS() < 1_000_000_000_000 {
-			t.Fatal("runners did not read their bound clocks")
-		}
-		return struct{}{}
-	})
-}
-
-func TestDistinctLegacyEntryPathsAreSerialized(t *testing.T) {
-	firstEntered := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	firstDone := make(chan error, 1)
-	go func() {
-		firstDone <- runConfigCommand(&config.CmdArgs{}, &legacyCommandFlags{}, func(*config.CmdArgs) *errs.Error {
-			close(firstEntered)
-			<-releaseFirst
-			return nil
-		})
-	}()
-	<-firstEntered
-
-	secondStarted := make(chan struct{})
-	secondDone := make(chan *errs.Error, 1)
-	go func() {
-		close(secondStarted)
-		secondDone <- RunSeriesDown(&config.CmdArgs{Tables: []string{"missing-legacy-gate-fixture"}})
-	}()
-	<-secondStarted
-	select {
-	case <-secondDone:
-		t.Fatal("series entry path overlapped an active config command")
-	case <-time.After(50 * time.Millisecond):
+	backtestRunnerDeps := backtestRuntime.BizDeps()
+	backtest, backtestErr := opt.NewBackTestLiteWithRuntimeDeps(backtestRunnerDeps, true, nil, nil, nil)
+	if backtestErr != nil {
+		t.Fatal(backtestErr)
+	}
+	liveRunnerDeps := liveRuntime.BizDeps()
+	liveTrader, traderErr := live.NewCryptoTraderWithRuntimeDeps(liveRunnerDeps, nil)
+	if traderErr != nil {
+		t.Fatal(traderErr)
+	}
+	backtestDeps := backtest.RuntimeDependencies()
+	liveDeps := liveTrader.RuntimeDependencies()
+	if backtestDeps.Core != backtestRuntime.Core || backtestDeps.Clock != backtestRuntime.Clock ||
+		backtestDeps.Market != backtestRuntime.Market || backtestDeps.Batch != backtestRuntime.Batch ||
+		backtestDeps.Symbols != backtestRuntime.Symbols {
+		t.Fatal("backtest runner did not retain its runtime dependencies")
+	}
+	if liveDeps.Core != liveRuntime.Core || liveDeps.Clock != liveRuntime.Clock ||
+		liveDeps.Market != liveRuntime.Market || liveDeps.Batch != liveRuntime.Batch ||
+		liveDeps.Symbols != liveRuntime.Symbols {
+		t.Fatal("live runner did not retain its runtime dependencies")
 	}
 
-	close(releaseFirst)
-	if err := <-firstDone; err != nil {
-		t.Fatalf("config command entry path returned error: %v", err)
+	if !backtest.FeedDataSeries(&orm.DataSeries{
+		TimeMS: 300, TimeFrame: "1m", IsWarmUp: true,
+		ExSymbol: &orm.ExSymbol{Symbol: "BTC/USDT"},
+		Values: map[string]any{
+			"open": 10.0, "high": 12.0, "low": 9.0, "close": 11.0, "volume": 1.0,
+		},
+	}) {
+		t.Fatal("backtest runner rejected isolated runtime event")
 	}
-	select {
-	case err := <-secondDone:
-		if err == nil {
-			t.Fatal("series entry path unexpectedly succeeded with an unknown source")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("series entry path remained blocked after runner release")
+	if backtestRuntime.Clock.TimeMS() != 60_300 ||
+		backtestRuntime.Market.Prices.GetLastBarPriceAt("BTC/USDT") != 11 ||
+		backtestRuntime.Batch.LastBatchMS() != 60_300 {
+		t.Fatal("backtest runner did not consume its typed clock, market, and batch state")
 	}
-}
-
-func TestRunSpiderWithUsesNonReentrantDataEntry(t *testing.T) {
-	oldDataDir, oldLoaded := config.DataDir, config.Loaded
-	oldCtx, oldStopAll := core.Ctx, core.StopAll
-	oldRunMode, oldLiveMode, oldBackTestMode := core.RunMode, core.LiveMode, core.BackTestMode
-	t.Cleanup(func() {
-		config.DataDir, config.Loaded = oldDataDir, oldLoaded
-		core.Ctx, core.StopAll = oldCtx, oldStopAll
-		core.RunMode, core.LiveMode, core.BackTestMode = oldRunMode, oldLiveMode, oldBackTestMode
-	})
-
-	config.Loaded = false
-	args := &config.CmdArgs{
-		DataDir:    t.TempDir(),
-		NoDefault:  true,
-		ConfigData: "invalid: [",
-		Logfile:    filepath.Join(t.TempDir(), "runner.log"),
+	backtestRuntime.Clock.SetTimeMS(111)
+	backtestRuntime.Core.BotRunning = false
+	backtestRuntime.Core.CheckWallets = true
+	backtestRuntime.Batch.SetLastBatchMS(333)
+	if liveRuntime.Clock.TimeMS() == 111 || !liveRuntime.Core.BotRunning || liveRuntime.Core.CheckWallets ||
+		liveRuntime.Market.Prices.GetLastBarPriceAt("BTC/USDT") != -1 || liveRuntime.Batch.LastBatchMS() != 0 {
+		t.Fatal("backtest runtime state leaked into the live runner")
 	}
-	unlock := runtime.LockLegacy()
-	released := false
-	t.Cleanup(func() {
-		if !released {
-			unlock()
-		}
-	})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = RunSpiderWith(args, nil)
-	}()
-
-	select {
-	case <-done:
-		t.Fatal("RunSpiderWith bypassed the held legacy gate")
-	case <-time.After(50 * time.Millisecond):
-	}
-	unlock()
-	released = true
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("RunSpiderWith remained blocked after the legacy gate was released")
-	}
-}
-
-func TestPublicLegacyEntryAPIsShareProcessGate(t *testing.T) {
-	oldDataDir, oldLoaded := config.DataDir, config.Loaded
-	oldCtx, oldStopAll := core.Ctx, core.StopAll
-	oldRunMode, oldLiveMode, oldBackTestMode := core.RunMode, core.LiveMode, core.BackTestMode
-	oldDeadlockDisabled := deadlock.Opts.Disable
-	t.Cleanup(func() {
-		config.DataDir, config.Loaded = oldDataDir, oldLoaded
-		core.Ctx, core.StopAll = oldCtx, oldStopAll
-		core.RunMode, core.LiveMode, core.BackTestMode = oldRunMode, oldLiveMode, oldBackTestMode
-		deadlock.Opts.Disable = oldDeadlockDisabled
-	})
-	config.Loaded = false
-
-	tests := []struct {
-		name string
-		run  func(*config.CmdArgs) *errs.Error
-	}{
-		{name: "down", run: RunDownData},
-		{name: "repair-ranges", run: RunRepairKlineRanges},
-		{name: "correct", run: RunKlineCorrect},
-		{name: "adjust", run: RunKlineAdjFactors},
-		{name: "verify", run: RunVerifyData},
-		{name: "spider", run: RunSpider},
-		{name: "spider-with", run: func(args *config.CmdArgs) *errs.Error { return RunSpiderWith(args, nil) }},
-		{name: "load", run: LoadKLinesToDB},
-		{name: "aggregate", run: AggKlineBigs},
-		{name: "series", run: func(args *config.CmdArgs) *errs.Error {
-			args.Tables = []string{"missing-legacy-gate-fixture"}
-			return RunSeriesDown(args)
-		}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			dataDir := t.TempDir()
-			args := &config.CmdArgs{
-				DataDir:    dataDir,
-				NoDefault:  true,
-				ConfigData: "invalid: [",
-				Logfile:    filepath.Join(dataDir, "runner.log"),
-			}
-			unlock := runtime.LockLegacy()
-			started := make(chan struct{})
-			done := make(chan struct{})
-			var got *errs.Error
-			var panicValue any
-			go func() {
-				close(started)
-				defer func() {
-					panicValue = recover()
-					close(done)
-				}()
-				got = test.run(args)
-			}()
-			<-started
-			select {
-			case <-done:
-				unlock()
-				t.Fatalf("%s completed while legacy gate was held: err=%v panic=%v", test.name, got, panicValue)
-			case <-time.After(50 * time.Millisecond):
-			}
-			unlock()
-			select {
-			case <-done:
-				if panicValue != nil {
-					t.Fatalf("%s panicked after gate release: %v", test.name, panicValue)
-				}
-			case <-time.After(time.Second):
-				t.Fatalf("%s did not finish after gate release", test.name)
-			}
-		})
-	}
-}
-
-func TestPublicRuntimeEntryAPIsBypassLegacyGate(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		run  func(*config.CmdArgs) *errs.Error
-	}{
-		{name: "backtest", run: RunBackTest},
-		{name: "trade", run: func(args *config.CmdArgs) *errs.Error { return RunTradeWith(args, nil) }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			dataDir := t.TempDir()
-			args := &config.CmdArgs{
-				DataDir:    dataDir,
-				NoDefault:  true,
-				ConfigData: "invalid: [",
-				Logfile:    filepath.Join(dataDir, "runner.log"),
-			}
-			unlock := runtime.LockLegacy()
-			defer unlock()
-			done := make(chan struct{})
-			var got *errs.Error
-			go func() {
-				defer close(done)
-				got = test.run(args)
-			}()
-			select {
-			case <-done:
-				if got == nil {
-					t.Fatal("runtime entry unexpectedly succeeded with invalid config")
-				}
-			case <-time.After(time.Second):
-				t.Fatal("runtime entry waited for the legacy gate")
-			}
-		})
+	if backtest.TimeMS() != 111 || liveTrader.TimeMS() < 1_000_000_000_000 {
+		t.Fatal("runners did not read their bound clocks")
 	}
 }

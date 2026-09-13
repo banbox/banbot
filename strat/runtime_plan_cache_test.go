@@ -8,8 +8,8 @@ import (
 
 func TestNewRefreshesEquivalentPolicyPointerOnCacheHit(t *testing.T) {
 	const name = "runtime_plan_cache_policy_fixture"
-	StratMake[name] = func(*config.RunPolicyConfig) *TradeStrat { return &TradeStrat{} }
-	t.Cleanup(func() { delete(StratMake, name) })
+	RegisterStrategy(name, func(*config.RunPolicyConfig) *TradeStrat { return &TradeStrat{} })
+	t.Cleanup(func() { deleteStratFactory(name) })
 
 	firstPolicy := &config.RunPolicyConfig{Name: name, Params: map[string]float64{}}
 	secondPolicy := firstPolicy.Clone()

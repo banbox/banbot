@@ -152,13 +152,13 @@ func TestStateAdmissionIsIsolatedAcrossInstances(t *testing.T) {
 
 	if first.PairEnabled("FIRST/USDT") || !first.PairEnabled("FIRST-POLICY/USDT") ||
 		!first.PairEnabled("FIRST-ADDED/USDT") {
-		t.Fatalf("first admission snapshot = %#v", first.PairsMap)
+		t.Fatalf("first admission snapshot = %#v", first.admission.Load().enabled)
 	}
 	if !second.PairEnabled("SECOND/USDT") || second.PairEnabled("FIRST-ADDED/USDT") {
-		t.Fatalf("second admission snapshot = %#v", second.PairsMap)
+		t.Fatalf("second admission snapshot = %#v", second.admission.Load().enabled)
 	}
-	if first.PairsMap["FIRST/USDT"] || !first.PairsMap["FIRST-ADDED/USDT"] {
-		t.Fatalf("legacy compatibility map was not published: %#v", first.PairsMap)
+	if first.PairEnabled("FIRST/USDT") || !first.PairEnabled("FIRST-ADDED/USDT") {
+		t.Fatalf("admission update was not published: %#v", first.admission.Load().enabled)
 	}
 }
 
@@ -183,8 +183,8 @@ func TestStateAdmissionSnapshotIncludesDiscoveredPairs(t *testing.T) {
 	if !slices.Contains(state.AdmissionPairs(), "DISCOVERED/USDT") {
 		t.Fatalf("new pair was not retained in compatibility list: %v", state.AdmissionPairs())
 	}
-	if !state.PairsMap["DISCOVERED/USDT"] {
-		t.Fatalf("compatibility map does not contain discovered pair: %#v", state.PairsMap)
+	if !state.PairEnabled("DISCOVERED/USDT") {
+		t.Fatalf("admission snapshot does not contain discovered pair: %#v", state.admission.Load().enabled)
 	}
 }
 
@@ -277,7 +277,7 @@ func TestStateAdmissionConcurrentSnapshotReads(t *testing.T) {
 
 	state.SetPairs([]string{"FINAL/USDT"}, nil)
 	if !state.PairEnabled("FINAL/USDT") || state.PairEnabled("BASE/USDT") {
-		t.Fatalf("final admission snapshot = %#v", state.PairsMap)
+		t.Fatalf("final admission snapshot = %#v", state.admission.Load().enabled)
 	}
 }
 

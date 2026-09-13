@@ -317,7 +317,14 @@ func LegacyDataSourceCatalog() *DataSourceCatalog {
 }
 
 func RegisterDataSource(src DataSource) error {
+	// Direct registration is retained for legacy callers only. Explicit Runtime
+	// construction rejects it because an arbitrary interface value cannot be
+	// cloned safely; register a factory for runtime-capable providers instead.
 	return legacyDataSourceCatalog.RegisterDataSource(src)
+}
+
+func RegisterDataSourceFactory(name string, factory DataSourceFactory) error {
+	return legacyDataSourceCatalog.RegisterDataSourceFactory(name, factory)
 }
 
 func GetDataSource(name string) DataSource {

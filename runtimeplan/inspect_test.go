@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
@@ -16,34 +17,27 @@ import (
 	ta "github.com/banbox/banta"
 )
 
-func TestInspectRestoresRefineTimeframeCache(t *testing.T) {
+func TestInspectDoesNotModifyLegacyRefineTimeframeCache(t *testing.T) {
+	const strategyName = "review_refine"
 	oldPolicies := config.RunPolicy
 	t.Cleanup(func() {
 		config.RunPolicy = oldPolicies
 		config.ClearRefineMap()
+	})
+	strat.RegisterStrategy(strategyName, func(*config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}}
 	})
 	config.RunPolicy = []*config.RunPolicyConfig{{Name: "review_refine", RefineTF: "15m"}}
 	config.ClearRefineMap()
 	if got := config.EnsureStratRefineTF("review_refine", "1h"); got != "15m" {
 		t.Fatalf("initial refine timeframe = %q", got)
 	}
-	cfg := &config.Config{
-		Exchange:      &config.ExchangeConfig{Name: "binance"},
-		MarketType:    "spot",
-		StakeCurrency: []string{"USDT"},
-		RunPolicy:     []*config.RunPolicyConfig{{Name: "review_refine", RefineTF: "5m"}},
-	}
-	restore, err := installRuntimeConfig(&RequestV1{TimeStartMS: 1_000_000_000_000, TimeEndMS: 1_000_003_600_000}, cfg)
-	if err != nil {
+	req := validRequest(t, strategyName)
+	if _, err := Inspect(req, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	if got := config.EnsureStratRefineTF("review_refine", "1h"); got != "5m" {
-		restore()
-		t.Fatalf("temporary refine timeframe = %q", got)
-	}
-	restore()
 	if got := config.EnsureStratRefineTF("review_refine", "1h"); got != "15m" {
-		t.Fatalf("restored refine timeframe = %q, want 15m", got)
+		t.Fatalf("legacy refine timeframe = %q, want 15m", got)
 	}
 }
 
@@ -55,17 +49,12 @@ func TestInspectUsesCallerDataDirWithoutChangingWorkingDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("TMPDIR", "/nonexistent")
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
 			RunTimeFrames: []string{"1h"},
-			OnStartUp: func(*strat.StratJob) {
-				if config.DataDir != dataDir {
-					t.Fatalf("config.DataDir = %q, want %q", config.DataDir, dataDir)
-				}
-			},
+			OnStartUp:     func(*strat.StratJob) {},
 		}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
 
 	if _, err = Inspect(validRequest(t, strategyName), dataDir); err != nil {
 		t.Fatal(err)
@@ -78,7 +67,71 @@ func TestInspectUsesCallerDataDirWithoutChangingWorkingDirectory(t *testing.T) {
 	}
 }
 
-func TestInspectSerializesLegacyGlobalState(t *testing.T) {
+func TestInspectAcceptsLegacyRequestWithoutStakeCurrency(t *testing.T) {
+	const strategyName = "runtime_plan_no_stake_fixture"
+	strat.RegisterStrategy(strategyName, func(*config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}}
+	})
+	req := validRequest(t, strategyName)
+	req.ConfigYAML = strings.Replace(req.ConfigYAML, "stake_currency: [USDT]\n", "", 1)
+	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
+	if _, err := Inspect(req, t.TempDir()); err != nil {
+		t.Fatalf("legacy request without stake currency was rejected: %v", err)
+	}
+}
+
+func TestInspectLeavesLegacyRuntimeGlobalsUntouched(t *testing.T) {
+	const strategyName = "runtime_plan_explicit_binding_fixture"
+	oldData, oldExchange, oldPairMgr := config.Data, config.Exchange, config.PairMgr
+	oldPolicies, oldTimeframes, oldStake := config.RunPolicy, config.RunTimeframes, config.StakeCurrency
+	oldPairs, oldRange, oldDataDir := config.Pairs, config.TimeRange, config.DataDir
+	oldExg, oldMarket := core.ExgName, core.Market
+	oldBacktest, oldLive, oldNet, oldTime, oldDefAcc := core.BackTestMode, core.LiveMode, core.NetDisable, btime.CurTimeMS, config.DefAcc
+	t.Cleanup(func() {
+		config.Data, config.Exchange, config.PairMgr = oldData, oldExchange, oldPairMgr
+		config.RunPolicy, config.RunTimeframes, config.StakeCurrency = oldPolicies, oldTimeframes, oldStake
+		config.Pairs, config.TimeRange, config.DataDir = oldPairs, oldRange, oldDataDir
+		core.ExgName, core.Market = oldExg, oldMarket
+		core.BackTestMode, core.LiveMode, core.NetDisable, btime.CurTimeMS, config.DefAcc = oldBacktest, oldLive, oldNet, oldTime, oldDefAcc
+	})
+	legacyRange := &config.TimeTuple{StartMS: 1, EndMS: 2}
+	legacyExchange := &config.ExchangeConfig{Name: "legacy"}
+	legacyPairMgr := &config.PairMgrConfig{}
+	legacyPolicies := []*config.RunPolicyConfig{{Name: "legacy"}}
+	config.Data = config.Config{Name: "legacy", StakeAmount: 99}
+	config.Exchange, config.PairMgr = legacyExchange, legacyPairMgr
+	config.RunPolicy, config.RunTimeframes, config.StakeCurrency = legacyPolicies, []string{"9m"}, []string{"LEG"}
+	config.Pairs, config.TimeRange, config.DataDir = []string{"LEG/USDT"}, legacyRange, "legacy-data-dir"
+	core.ExgName, core.Market = "legacy", "spot"
+	core.BackTestMode, core.LiveMode, core.NetDisable, btime.CurTimeMS, config.DefAcc = false, true, false, 123, "alpha"
+
+	strat.RegisterStrategy(strategyName, func(*config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}, OnStartUp: func(job *strat.StratJob) {
+			if got := job.Strat.GetStakeAmount(job); got != 17 {
+				t.Fatalf("callback stake amount = %v, want explicit runtime value 17", got)
+			}
+		}}
+	})
+	req := validRequest(t, strategyName)
+	req.ConfigYAML = strings.Replace(req.ConfigYAML, "market_type: linear\n", "market_type: linear\nstake_amount: 17\naccounts:\n  default:\n    max_pair: 1\n  alpha:\n    max_pair: 2\n", 1)
+	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
+	output, err := Inspect(req, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Policies) != 1 || len(output.Policies[0].SelectedSymbols) != 1 {
+		t.Fatalf("snapshot default account max_pair was not used: %+v", output.Policies)
+	}
+	if config.Data.Name != "legacy" || config.Exchange != legacyExchange || config.PairMgr != legacyPairMgr ||
+		config.RunPolicy[0] != legacyPolicies[0] || !slices.Equal(config.RunTimeframes, []string{"9m"}) ||
+		!slices.Equal(config.StakeCurrency, []string{"LEG"}) || !slices.Equal(config.Pairs, []string{"LEG/USDT"}) ||
+		config.TimeRange != legacyRange || config.DataDir != "legacy-data-dir" || core.ExgName != "legacy" ||
+		core.Market != "spot" || core.BackTestMode || !core.LiveMode || core.NetDisable || btime.CurTimeMS != 123 || config.DefAcc != "alpha" {
+		t.Fatal("Inspect modified legacy runtime globals")
+	}
+}
+
+func TestInspectRunsWithoutLegacyGlobalState(t *testing.T) {
 	fixtureID := strconv.FormatInt(time.Now().UnixNano(), 10)
 	firstStrategyName := "runtime_plan_serial_first_fixture_" + fixtureID
 	secondStrategyName := "runtime_plan_serial_second_fixture_" + fixtureID
@@ -87,7 +140,7 @@ func TestInspectSerializesLegacyGlobalState(t *testing.T) {
 	secondEntered := make(chan struct{})
 	var firstOnce, secondOnce sync.Once
 
-	strat.StratMake[firstStrategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(firstStrategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
 			RunTimeFrames: []string{"1h"},
 			OnStartUp: func(*strat.StratJob) {
@@ -95,18 +148,14 @@ func TestInspectSerializesLegacyGlobalState(t *testing.T) {
 				<-releaseFirst
 			},
 		}
-	}
-	strat.StratMake[secondStrategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	})
+	strat.RegisterStrategy(secondStrategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
 			RunTimeFrames: []string{"1h"},
 			OnStartUp: func(*strat.StratJob) {
 				secondOnce.Do(func() { close(secondEntered) })
 			},
 		}
-	}
-	t.Cleanup(func() {
-		delete(strat.StratMake, firstStrategyName)
-		delete(strat.StratMake, secondStrategyName)
 	})
 
 	firstDone := make(chan error, 1)
@@ -135,10 +184,10 @@ func TestInspectSerializesLegacyGlobalState(t *testing.T) {
 		_, err := Inspect(secondReq, secondDataDir)
 		secondDone <- err
 	}()
-	serial := true
+	parallel := false
 	select {
 	case <-secondEntered:
-		serial = false
+		parallel = true
 	case <-time.After(time.Second):
 	}
 	close(releaseFirst)
@@ -156,8 +205,8 @@ func TestInspectSerializesLegacyGlobalState(t *testing.T) {
 	}
 	waitInspect("first", firstDone)
 	waitInspect("second", secondDone)
-	if !serial {
-		t.Fatal("second Inspect entered before first Inspect restored legacy globals")
+	if !parallel {
+		t.Fatal("second Inspect waited for the first Inspect")
 	}
 }
 
@@ -178,12 +227,12 @@ func TestInspectDoesNotPolluteLegacySymbolFacade(t *testing.T) {
 			t.Fatalf("runtime plan symbol leaked into legacy facade: %+v", got)
 		}
 	}
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}, OnStartUp: func(*strat.StratJob) {
 			assertLegacyState()
 		}}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 
 	if _, err := Inspect(validRequest(t, strategyName), t.TempDir()); err != nil {
 		t.Fatal(err)
@@ -194,7 +243,7 @@ func TestInspectDoesNotPolluteLegacySymbolFacade(t *testing.T) {
 func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 	const strategyName = "runtime_plan_fixture"
 	startupCalls := 0
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		readSID := func(job *strat.StratJob) int64 {
 			value, ok := job.Env.Data.Load("sid")
 			sid, typed := value.(int64)
@@ -239,8 +288,8 @@ func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 				return []*strat.DataSub{{Source: "", TimeFrame: tf, WarmupNum: 3, Fields: []string{"close", "close"}, SeriesFields: []string{"close"}}}
 			},
 		}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 
 	req := validRequest(t, strategyName)
 	first, err := Inspect(req, t.TempDir())
@@ -291,10 +340,10 @@ func TestInspectCollectsCanonicalRuntimePlanWithoutDataAccess(t *testing.T) {
 
 func TestInspectIncludesFrameworkPairListAndScoreKlines(t *testing.T) {
 	const strategyName = "runtime_plan_framework_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{RunTimeFrames: []string{"3d"}, WarmupNum: 300}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 	req := validRequest(t, strategyName)
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "exchange:\n", "run_timeframes: [15m]\nexchange:\n", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
@@ -322,10 +371,10 @@ func TestInspectIncludesFrameworkPairListAndScoreKlines(t *testing.T) {
 
 func TestInspectIncludesFrameworkScoresForStrictFrozenPairs(t *testing.T) {
 	const strategyName = "runtime_plan_frozen_pairs_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{RunTimeFrames: []string{"8h"}, WarmupNum: 20}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 	req := validRequest(t, strategyName)
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "market_type: linear\n",
 		"market_type: linear\n"+
@@ -360,10 +409,10 @@ func TestInspectIncludesFrameworkScoresForStrictFrozenPairs(t *testing.T) {
 
 func TestInspectAllowsForcedPairFiltersWithoutConfiguredFilters(t *testing.T) {
 	const strategyName = "runtime_plan_forced_filters_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 	req := validRequest(t, strategyName)
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "exchange:\n", "pairmgr:\n  force_filters: true\nexchange:\n", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
@@ -375,10 +424,10 @@ func TestInspectAllowsForcedPairFiltersWithoutConfiguredFilters(t *testing.T) {
 
 func TestInspectRejectsConfiguredForcedPairFiltersWithoutRuntimeData(t *testing.T) {
 	const strategyName = "runtime_plan_configured_forced_filters_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 	req := validRequest(t, strategyName)
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "exchange:\n",
 		"pairmgr:\n  force_filters: true\npairlists:\n  - name: producer\n  - name: filter\nexchange:\n", 1)
@@ -391,15 +440,15 @@ func TestInspectRejectsConfiguredForcedPairFiltersWithoutRuntimeData(t *testing.
 
 func TestInspectFrameworkRequirementsCoverPolicyAndPreMaxPairSymbols(t *testing.T) {
 	const strategyName = "runtime_plan_framework_symbols_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
 			RunTimeFrames: []string{"1h"},
 			OnSymbols: func([]string) []string {
 				return []string{"SOL/USDT:USDT", "ETH/USDT:USDT", "BTC/USDT:USDT"}
 			},
 		}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 	req := validRequest(t, strategyName)
 	req.MarketUniverse = append(req.MarketUniverse, MarketSymbolV1{
 		SID: 3, Exchange: "binance", Market: "linear", Symbol: "SOL/USDT:USDT", ListMS: 1_600_000_000_000,
@@ -442,10 +491,10 @@ func TestInspectFrameworkRequirementsCoverPolicyAndPreMaxPairSymbols(t *testing.
 
 func TestInspectFrameworkPairScoresMirrorSubMinuteShortCircuit(t *testing.T) {
 	const strategyName = "runtime_plan_framework_subminute_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{RunTimeFrames: []string{"30s", "1h"}}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 	output, err := Inspect(validRequest(t, strategyName), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -460,30 +509,31 @@ func TestInspectFrameworkPairScoresMirrorSubMinuteShortCircuit(t *testing.T) {
 func TestInspectionBarEnvMatchesRuntimeSIDAndReuse(t *testing.T) {
 	envs := make(map[string]*ta.BarEnv)
 	symbol := &orm.ExSymbol{ID: 42, Exchange: "binance", Market: "linear", Symbol: "BTC/USDT:USDT"}
-	oldExchange, oldMarket := core.ExgName, core.Market
-	core.ExgName, core.Market = symbol.Exchange, symbol.Market
-	defer func() { core.ExgName, core.Market = oldExchange, oldMarket }()
-
-	first, err := inspectionBarEnv(envs, symbol, "1h")
+	runtimeCore, err := core.NewState(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := inspectionBarEnv(envs, symbol, "1h")
-	if err != nil {
-		t.Fatal(err)
+	defer runtimeCore.Close()
+	first, envErr := inspectionBarEnv(envs, symbol, "1h", runtimeCore)
+	if envErr != nil {
+		t.Fatal(envErr)
+	}
+	second, envErr := inspectionBarEnv(envs, symbol, "1h", runtimeCore)
+	if envErr != nil {
+		t.Fatal(envErr)
 	}
 	if first != second || len(envs) != 1 {
 		t.Fatalf("symbol/timeframe environment was not reused: first=%p second=%p count=%d", first, second, len(envs))
 	}
 	value, ok := first.Data.Load("sid")
-	if !ok || value != int64(symbol.ID) || first.MaxCache != core.NumTaCache {
+	if !ok || value != int64(symbol.ID) || first.MaxCache != runtimeCore.NumTaCache {
 		t.Fatalf("runtime environment metadata mismatch: sid=%v ok=%v max_cache=%d", value, ok, first.MaxCache)
 	}
 }
 
 func TestInspectFailsClosedAndPersistsCanonicalUnsupportedItems(t *testing.T) {
 	const strategyName = "runtime_plan_unsupported_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
 			RunTimeFrames: []string{"1h"},
 			OnSymbols: func(_ []string) []string {
@@ -498,8 +548,8 @@ func TestInspectFailsClosedAndPersistsCanonicalUnsupportedItems(t *testing.T) {
 				}
 			},
 		}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 
 	output, err := Inspect(validRequest(t, strategyName), t.TempDir())
 	if err == nil || output == nil {
@@ -518,7 +568,7 @@ func TestInspectFailsClosedAndPersistsCanonicalUnsupportedItems(t *testing.T) {
 
 func TestInspectCanonicalizesNondeterministicCallbackOrder(t *testing.T) {
 	const strategyName = "runtime_plan_map_order_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
 			RunTimeFrames: []string{"1h"},
 			OnDataSubs: func(_ *strat.StratJob) []*strat.DataSub {
@@ -530,8 +580,8 @@ func TestInspectCanonicalizesNondeterministicCallbackOrder(t *testing.T) {
 				return items
 			},
 		}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 
 	req := validRequest(t, strategyName)
 	var expected string
@@ -578,8 +628,8 @@ func TestInspectFailsClosedWithoutTimeframeScoresOrPolicyFilterData(t *testing.T
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			strat.StratMake[test.strategy] = test.make
-			t.Cleanup(func() { delete(strat.StratMake, test.strategy) })
+			strat.RegisterStrategy(test.strategy, test.make)
+			t.Cleanup(func() { strat.UnregisterStrategy(test.strategy) })
 			req := validRequest(t, test.strategy)
 			if test.configTail != "" {
 				req.ConfigYAML += test.configTail
@@ -596,15 +646,15 @@ func TestInspectFailsClosedWithoutTimeframeScoresOrPolicyFilterData(t *testing.T
 func TestInspectPreservesSelectionOrderAndAppliesMaxPairBeforeCoverage(t *testing.T) {
 	const strategyName = "runtime_plan_max_pair_fixture"
 	selectedOrder := []string{"ETH/USDT:USDT", "BTC/USDT:USDT", "ETH/USDT:USDT"}
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
 			RunTimeFrames: []string{"1h"},
 			OnSymbols: func([]string) []string {
 				return slices.Clone(selectedOrder)
 			},
 		}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 	req := validRequest(t, strategyName)
 	req.ConfigYAML = strings.Replace(req.ConfigYAML, "  - name: "+strategyName+"\n", "  - name: "+strategyName+"\n    max_pair: 1\n", 1)
 	req.ConfigSHA256 = rawHash([]byte(req.ConfigYAML))
@@ -641,10 +691,10 @@ func TestInspectPreservesSelectionOrderAndAppliesMaxPairBeforeCoverage(t *testin
 
 func TestInspectPreservesInitialSymbolOrderBeforeMaxPair(t *testing.T) {
 	const strategyName = "runtime_plan_initial_order_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{RunTimeFrames: []string{"1h"}}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 	req := validRequest(t, strategyName)
 	req.InitialSymbols = []string{"ETH/USDT:USDT", "BTC/USDT:USDT"}
 	req.InputPairsSHA256, _ = InputPairsSHA256(req.InitialSymbols)
@@ -664,7 +714,7 @@ func TestInspectPreservesInitialSymbolOrderBeforeMaxPair(t *testing.T) {
 
 func TestInspectRecordsOrderAPICallsWithRealStartupState(t *testing.T) {
 	const strategyName = "runtime_plan_order_effect_fixture"
-	strat.StratMake[strategyName] = func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy(strategyName, func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
 			RunTimeFrames: []string{"1h"},
 			OnStartUp: func(job *strat.StratJob) {
@@ -674,8 +724,8 @@ func TestInspectRecordsOrderAPICallsWithRealStartupState(t *testing.T) {
 				_ = job.OpenOrder(&strat.EnterReq{Tag: "forbidden"})
 			},
 		}
-	}
-	t.Cleanup(func() { delete(strat.StratMake, strategyName) })
+	})
+	t.Cleanup(func() { strat.UnregisterStrategy(strategyName) })
 	output, err := Inspect(validRequest(t, strategyName), t.TempDir())
 	if err == nil || output == nil || !hasUnsupportedCode(output.Unsupported, "startup_order_effect") {
 		t.Fatalf("order API effect was not rejected: output=%+v err=%v", output, err)
@@ -691,15 +741,15 @@ func TestEffectivePolicyMaxPairMatchesBacktestAccountFallback(t *testing.T) {
 		"zeta":  {MaxPair: 4},
 		"alpha": {MaxPair: 2},
 	}}
-	if got, errText := effectivePolicyMaxPair(policy, cfg); got != 2 || errText != "" {
+	if got, errText := effectivePolicyMaxPair(policy, cfg, ""); got != 2 || errText != "" {
 		t.Fatalf("fallback max pair = %d, %q; want lexicographic backtest default limit 2", got, errText)
 	}
-	cfg.Accounts[config.DefAcc] = &config.AccountConfig{MaxPair: 3}
-	if got, errText := effectivePolicyMaxPair(policy, cfg); got != 3 || errText != "" {
+	cfg.Accounts["default"] = &config.AccountConfig{MaxPair: 3}
+	if got, errText := effectivePolicyMaxPair(policy, cfg, "default"); got != 3 || errText != "" {
 		t.Fatalf("explicit default max pair = %d, %q; want 3", got, errText)
 	}
 	policy.MaxPair = 1
-	if got, errText := effectivePolicyMaxPair(policy, cfg); got != 1 || errText != "" {
+	if got, errText := effectivePolicyMaxPair(policy, cfg, "default"); got != 1 || errText != "" {
 		t.Fatalf("policy max pair = %d, %q; want 1", got, errText)
 	}
 }

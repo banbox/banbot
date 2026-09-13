@@ -23,6 +23,7 @@ import (
 	"github.com/banbox/banbot/rpc"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
+	"go.uber.org/zap"
 )
 
 const unconfiguredIdentity = "<runtime-unconfigured>"
@@ -133,6 +134,38 @@ func NewProcess() *Process {
 	}
 	process.runtimeCond = sync.NewCond(&process.runtimeMu)
 	return process
+}
+
+// runtimeExecutionAccounts selects and clones the mutable account state once
+// at the Runtime composition root. Downstream packages receive this owned map
+// directly and never infer it from an immutable config snapshot.
+func runtimeExecutionAccounts(state *core.State, snapshot *config.Snapshot, accounts map[string]*config.AccountConfig, defaultAccount string) map[string]*config.AccountConfig {
+	if accounts == nil && snapshot != nil && snapshot.View() != nil {
+		accounts = snapshot.View().Accounts
+	}
+	if state == nil || state.EnvReal {
+		return config.CloneAccountConfigsForRuntime(accounts)
+	}
+	if defaultAccount == "" {
+		defaultAccount = "default"
+	}
+	if len(accounts) == 0 {
+		return map[string]*config.AccountConfig{defaultAccount: {}}
+	}
+	if account := accounts[defaultAccount]; account != nil {
+		return config.CloneAccountConfigsForRuntime(map[string]*config.AccountConfig{defaultAccount: account})
+	}
+	names := make([]string, 0, len(accounts))
+	for name, account := range accounts {
+		if account != nil {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	if len(names) == 0 {
+		return map[string]*config.AccountConfig{defaultAccount: {}}
+	}
+	return config.CloneAccountConfigsForRuntime(map[string]*config.AccountConfig{defaultAccount: accounts[names[0]]})
 }
 
 func (p *Process) runtimeConditionLocked() *sync.Cond {
@@ -434,6 +467,7 @@ func (p *Process) Stop() {
 }
 
 type Options struct {
+	Logger      *zap.Logger
 	ID          string
 	Mode        string
 	Env         string
@@ -658,6 +692,9 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	if opts.Logger != nil {
+		coreState.Logger = opts.Logger
+	}
 	if opts.Mode == "" {
 		opts.Mode = core.RunModeOther
 	}
@@ -709,17 +746,13 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		coreState.Close()
 		return nil, allocatorErr
 	}
-	runtimeAccounts := biz.NormalizeRuntimeAccounts(biz.RuntimeDeps{
-		Core: coreState, Config: snapshot, Accounts: func() map[string]*config.AccountConfig {
-			if opts.Config != nil {
-				return opts.Config.Accounts
-			}
-			if snapshotConfig != nil {
-				return snapshotConfig.Accounts
-			}
-			return nil
-		}(), DefaultAccount: snapshot.DefaultAccount(),
-	})
+	configuredAccounts := map[string]*config.AccountConfig(nil)
+	if opts.Config != nil {
+		configuredAccounts = opts.Config.Accounts
+	} else if snapshotConfig != nil {
+		configuredAccounts = snapshotConfig.Accounts
+	}
+	runtimeAccounts := runtimeExecutionAccounts(coreState, snapshot, configuredAccounts, snapshot.DefaultAccount())
 	runtime := &Runtime{
 		Process:           p,
 		ID:                id,
@@ -742,28 +775,14 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		schedulerBorrowed: opts.SchedulerBorrowed,
 		closeDone:         make(chan struct{}),
 	}
-	runtime.Strategies.BindRuntimeAccounts(runtimeAccounts)
-	runtime.Strategies.BindRuntimeAccountsLock(&runtime.accountsMu)
-	runtime.Orders.BindCore(coreState)
-	runtime.Orders.BindRuntime(clock, runtime.Market.Prices, opts.Exchange, snapshotConfig)
 	runtime.Orders.SetLive(coreState.LiveMode)
-	if snapshotConfig != nil {
-		runtime.Orders.BindExecutionOptions(ormo.ExecutionOptions{
-			StrictBacktest: coreState.BackTestMode && snapshotConfig.BTStrict,
-			LegacyOrderMetrics: coreState.BackTestMode && snapshotConfig.BTStrict &&
-				snapshotConfig.BTNoKlineDownload && snapshotConfig.HistoricalCoverage != nil &&
-				snapshotConfig.BTLegacyOrderMetrics,
-		})
+	if bindErr := biz.BindRuntimeDeps(runtime.BizDeps()); bindErr != nil {
+		runtime.Close()
+		runtime.Join()
+		schedulerClaimReleased = true
+		return nil, fmt.Errorf("runtime: bind dependencies: %w", bindErr)
 	}
-	if snapshotConfig != nil && snapshot.DataDir != "" {
-		runtime.Orders.BindTradesPath(filepath.Join(snapshot.DataDir, fmt.Sprintf("orders_%s.db", snapshotConfig.Name)))
-	}
-	runtime.Strategies.BindRuntime(coreState, clock, snapshotConfig, symbols, opts.Exchange)
-	runtime.Notifications = biz.NewRuntimeNotifications(biz.RuntimeDeps{
-		Core: coreState, Clock: clock, Config: snapshot, Orders: runtime.Orders,
-		Trading: runtime.Trading, Market: runtime.Market, Dump: runtime.Dump,
-		DefaultAccount: snapshot.DefaultAccount(),
-	})
+	runtime.Notifications = biz.NewRuntimeNotifications(runtime.BizDeps())
 	runtime.OnClose(runtime.Notifications.Stop)
 	runtime.OnCloseWait(runtime.Notifications.Join)
 
@@ -887,7 +906,6 @@ func (r *Runtime) BizDeps() biz.RuntimeDeps {
 		Trading:        r.Trading,
 		Config:         r.Config,
 		Accounts:       r.Accounts,
-		AccountsOwned:  true,
 		AccountsMu:     &r.accountsMu,
 		Symbols:        r.Symbols,
 		Storage:        r.Storage,
@@ -896,6 +914,8 @@ func (r *Runtime) BizDeps() biz.RuntimeDeps {
 		Scheduler:      r.Scheduler(),
 		Notifications:  r.Notifications,
 		DefaultAccount: defaultAccount,
+		Catalog:        r.Catalog,
+		Callbacks:      r,
 	}
 }
 
@@ -905,25 +925,7 @@ func (r *Runtime) DataDeps() *data.RuntimeDeps {
 	if r == nil {
 		return nil
 	}
-	exchangeName, marketType := "", ""
-	if r.Core != nil {
-		exchangeName, marketType = r.Core.ExgName, r.Core.Market
-	}
-	return &data.RuntimeDeps{
-		Core:         r.Core,
-		Clock:        r.Clock,
-		Config:       r.Config,
-		Market:       r.Market,
-		Symbols:      r.Symbols,
-		Storage:      r.Storage,
-		Strategies:   r.Strategies,
-		Catalog:      r.Catalog,
-		Callbacks:    r,
-		Exchange:     r.Exchange,
-		Dump:         r.Dump,
-		ExchangeName: exchangeName,
-		MarketType:   marketType,
-	}
+	return r.BizDeps().DataDeps()
 }
 
 // EnterCallback admits a callback that may call Runtime.Close. Close changes

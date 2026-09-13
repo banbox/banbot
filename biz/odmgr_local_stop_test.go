@@ -8,25 +8,18 @@ import (
 )
 
 func TestInitLocalOrderMgrUsesScopedBacktestStop(t *testing.T) {
-	originalBiz := BackupVars()
-	originalAccounts := config.Accounts
 	originalStopAll := core.StopAll
-	t.Cleanup(func() {
-		RestoreVars(originalBiz)
-		config.Accounts = originalAccounts
-		core.StopAll = originalStopAll
-	})
-
-	config.Accounts = map[string]*config.AccountConfig{config.DefAcc: {}}
-	ResetVars()
+	t.Cleanup(func() { core.StopAll = originalStopAll })
+	trader := newCompleteTraderForTest(t, RuntimeDeps{Config: config.NewSnapshotWithDirs(&config.Config{Accounts: map[string]*config.AccountConfig{"default": {}}}, t.TempDir(), "")})
+	deps := *trader.RuntimeDependencies()
 	liveStopCalls := 0
 	localStopCalls := 0
 	core.StopAll = func() { liveStopCalls++ }
-	InitLocalOrderMgr(nil, false, func() { localStopCalls++ })
+	InitLocalOrderMgrWithRuntimeDeps(deps, nil, false, func() { localStopCalls++ })
 
-	odMgr, ok := GetOdMgr(config.DefAcc).(*LocalOrderMgr)
+	odMgr, ok := deps.Trading.OrderManager("default").(*LocalOrderMgr)
 	if !ok {
-		t.Fatalf("order manager type = %T, want *LocalOrderMgr", GetOdMgr(config.DefAcc))
+		t.Fatalf("order manager type = %T, want *LocalOrderMgr", deps.Trading.OrderManager("default"))
 	}
 	odMgr.stopBacktest()
 	if localStopCalls != 1 || liveStopCalls != 0 {

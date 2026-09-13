@@ -20,14 +20,37 @@ import (
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/web/base"
+	"github.com/banbox/banexg/errs"
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 )
 
 func regApiPub(api fiber.Router) {
-	api.Post("/login", postLogin)
+	newAPIHandlers(nil).regApiPub(api)
+}
+
+func (h *apiHandlers) regApiPub(api fiber.Router) {
+	api.Post("/login", h.postLogin)
 	api.Get("/ping", getPing)
-	api.Post("/strat_call", postStratCall)
+	api.Post("/strat_call", h.postStratCall)
+}
+
+func (h *apiHandlers) apiUsers() []*config.UserConfig {
+	if !h.runtime() {
+		return config.GetApiUsers()
+	}
+	cfg := h.configView()
+	if cfg == nil || cfg.APIServer == nil {
+		return nil
+	}
+	users := make([]*config.UserConfig, 0, len(cfg.Accounts)+len(cfg.APIServer.Users))
+	for name, account := range cfg.Accounts {
+		if account == nil || account.NoTrade || account.APIServer == nil {
+			continue
+		}
+		users = append(users, &config.UserConfig{Username: name, Password: account.APIServer.Pwd, AccRoles: map[string]string{name: account.APIServer.Role}})
+	}
+	return append(users, cfg.APIServer.Users...)
 }
 
 func getPing(c *fiber.Ctx) error {
@@ -36,7 +59,7 @@ func getPing(c *fiber.Ctx) error {
 	})
 }
 
-func postStratCall(c *fiber.Ctx) error {
+func (h *apiHandlers) postStratCall(c *fiber.Ctx) error {
 	var req = make(map[string]interface{})
 	if err := utils.Unmarshal(c.Body(), &req, utils.JsonNumAuto); err != nil {
 		return err
@@ -45,7 +68,7 @@ func postStratCall(c *fiber.Ctx) error {
 	if token == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "token required")
 	}
-	users := config.GetApiUsers()
+	users := h.apiUsers()
 	clientIP := c.IP()
 	var user *config.UserConfig
 	for _, u := range users {
@@ -61,6 +84,9 @@ func postStratCall(c *fiber.Ctx) error {
 	if user == nil {
 		return fiber.NewError(fiber.StatusUnauthorized, "unauthorized token")
 	}
+	if h.runtime() && h.deps.Strategies == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime strategy state is required")
+	}
 	strategy := utils.PopMapVal(req, "strategy", "")
 	if strategy == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "strategy required")
@@ -75,8 +101,7 @@ func postStratCall(c *fiber.Ctx) error {
 	jobs := make(map[string]map[string]*strat.StratJob)
 	var stg *strat.TradeStrat
 	for acc := range client.AccRoles {
-		strat.LockJobsRead()
-		jobMap := strat.GetJobs(acc)
+		jobMap := h.jobs(acc)
 		items := make(map[string]*strat.StratJob)
 		for pairTf, m := range jobMap {
 			if job, ok := m[strategy]; ok {
@@ -86,7 +111,6 @@ func postStratCall(c *fiber.Ctx) error {
 				}
 			}
 		}
-		strat.UnlockJobsRead()
 		if len(items) > 0 {
 			jobs[acc] = items
 		}
@@ -95,7 +119,16 @@ func postStratCall(c *fiber.Ctx) error {
 		return errors.New("no job running with strategy: " + strategy)
 	}
 	if stg.OnPostApi != nil {
-		if core.LiveMode {
+		var liveMode bool
+		if h.runtime() {
+			if h.deps.Core == nil || h.deps.Market == nil || h.deps.Market.Prices == nil || h.exchange() == nil {
+				return errs.NewMsg(core.ErrBadConfig, "runtime core, market, and exchange are required")
+			}
+			liveMode = h.deps.Core.LiveMode
+		} else {
+			liveMode = core.LiveMode
+		}
+		if liveMode {
 			seen := make(map[string]bool)
 			for _, jobMap := range jobs {
 				for _, job := range jobMap {
@@ -107,7 +140,13 @@ func postStratCall(c *fiber.Ctx) error {
 						continue
 					}
 					seen[symbol] = true
-					if err := com.RefreshLatestPrice(symbol); err != nil {
+					var err *errs.Error
+					if h.runtime() {
+						err = h.deps.Market.Prices.RefreshLatestPriceAt(h.nowMS(), h.exchange(), symbol)
+					} else {
+						err = com.RefreshLatestPrice(symbol)
+					}
+					if err != nil {
 						log.Warn("refresh latest price fail", zap.String("pair", symbol), zap.Error(err))
 					}
 				}
@@ -118,7 +157,18 @@ func postStratCall(c *fiber.Ctx) error {
 			log.Warn("OnPostApi fail", zap.String("strategy", strategy), zap.Any("msg", req), zap.Error(err_))
 		} else {
 			for acc, jobMap := range jobs {
-				odMgr := biz.GetOdMgr(acc)
+				var odMgr biz.IOrderMgr
+				if h.runtime() {
+					if h.deps.Trading == nil {
+						return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
+					}
+					odMgr = h.deps.Trading.OrderManager(acc)
+					if odMgr == nil {
+						return errs.NewMsg(core.ErrBadConfig, "runtime order manager is required")
+					}
+				} else {
+					odMgr = biz.GetOdMgr(acc)
+				}
 				for _, job := range jobMap {
 					_, _, err := odMgr.ProcessOrders(job)
 					if err != nil {
@@ -134,7 +184,7 @@ func postStratCall(c *fiber.Ctx) error {
 	}
 }
 
-func postLogin(c *fiber.Ctx) error {
+func (h *apiHandlers) postLogin(c *fiber.Ctx) error {
 	type LoginRequest struct {
 		Username string `json:"username" validate:"required"`
 		Password string `json:"password" validate:"required"`
@@ -145,7 +195,7 @@ func postLogin(c *fiber.Ctx) error {
 	}
 
 	clientIP := c.IP()
-	users := config.GetApiUsers()
+	users := h.apiUsers()
 	for _, u := range users {
 		if u.Username != req.Username || u.Password != req.Password {
 			continue
@@ -157,19 +207,18 @@ func postLogin(c *fiber.Ctx) error {
 		if expHours == 0 {
 			expHours = 168
 		}
-		token, err := CreateAuthToken(u.Username, config.APIServer.JWTSecretKey, expHours)
+		cfg := h.configView()
+		if cfg == nil || cfg.APIServer == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime api configuration is required")
+		}
+		token, err := CreateAuthToken(u.Username, cfg.APIServer.JWTSecretKey, expHours)
 		if err != nil {
 			return err
 		}
 		// 只返回有交易历史的账户
 		var accRoles = make(map[string]string)
-		sess, conn, err2 := ormo.Conn(orm.DbTrades, false)
-		if err2 != nil {
-			return err2
-		}
-		defer conn.Close()
 		for acc, role := range u.AccRoles {
-			isShow, err := accountToShow(sess, acc)
+			isShow, err := h.accountToShow(nil, acc)
 			if err != nil {
 				return err
 			}
@@ -178,29 +227,52 @@ func postLogin(c *fiber.Ctx) error {
 			}
 		}
 		return c.JSON(fiber.Map{
-			"name":     config.Name,
+			"name":     cfg.Name,
 			"token":    token,
-			"env":      core.RunEnv,
-			"market":   core.Market,
+			"env":      h.runEnv(),
+			"market":   h.market(),
 			"accounts": accRoles,
 		})
 	}
 	return fiber.NewError(fiber.StatusUnauthorized, "invalid username or password")
 }
 
-func accountToShow(sess *ormo.Queries, account string) (bool, error) {
-	if _, ok := config.Accounts[account]; ok {
+func (h *apiHandlers) accountToShow(sess *ormo.Queries, account string) (bool, error) {
+	cfg := h.configView()
+	if cfg == nil {
+		return false, errs.NewMsg(core.ErrBadConfig, "runtime configuration is required")
+	}
+	if _, ok := cfg.Accounts[account]; ok {
 		// 活跃账户，直接显示
 		return true, nil
 	}
-	taskID := ormo.GetTaskID(account)
+	taskID := h.taskID(account)
+	if sess == nil {
+		var conn *orm.TrackedDB
+		var err *errs.Error
+		sess, conn, err = h.orderConn(false)
+		if err != nil {
+			return false, err
+		}
+		defer conn.Close()
+	}
 	if taskID <= 0 {
-		taskName := config.Name
-		if core.EnvReal {
+		taskName := cfg.Name
+		var envReal bool
+		var runMode string
+		if h.runtime() {
+			if h.deps.Core == nil {
+				return false, errs.NewMsg(core.ErrBadConfig, "runtime core is required")
+			}
+			envReal, runMode = h.deps.Core.EnvReal, h.deps.Core.RunMode
+		} else {
+			envReal, runMode = core.EnvReal, core.RunMode
+		}
+		if envReal {
 			taskName += "/" + account
 		}
 		task, err := sess.FindTask(context.Background(), ormo.FindTaskParams{
-			Mode: core.RunMode,
+			Mode: runMode,
 			Name: taskName,
 		})
 		if err != nil {
@@ -244,6 +316,10 @@ func CreateAuthToken(user string, secret string, expHours float64) (string, erro
 }
 
 func AuthMiddleware(secret string) fiber.Handler {
+	return newAPIHandlers(nil).authMiddleware(secret)
+}
+
+func (h *apiHandlers) authMiddleware(secret string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		tokenStr := c.Get("X-Authorization")
 		if tokenStr == "" {
@@ -268,12 +344,17 @@ func AuthMiddleware(secret string) fiber.Handler {
 			return fiber.NewError(fiber.StatusUnauthorized, "invalid token3")
 		}
 		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-			user := claims["user"]
+			user, ok := claims["user"].(string)
+			if !ok || user == "" {
+				return fiber.NewError(fiber.StatusUnauthorized, "invalid token user")
+			}
 			c.Locals("user", user)
 			clientIP := c.IP()
-			users := config.GetApiUsers()
+			users := h.apiUsers()
+			matched := false
 			for _, u := range users {
 				if u.Username == user {
+					matched = true
 					if len(u.AllowIPs) > 0 && !utils.ArrContains(u.AllowIPs, clientIP) {
 						return fiber.NewError(fiber.StatusUnauthorized, "unauthorized from ip: "+clientIP)
 					}
@@ -281,6 +362,11 @@ func AuthMiddleware(secret string) fiber.Handler {
 					break
 				}
 			}
+			if !matched {
+				return fiber.NewError(fiber.StatusUnauthorized, "unknown token user")
+			}
+		} else {
+			return fiber.NewError(fiber.StatusUnauthorized, "invalid token claims")
 		}
 		return c.Next()
 	}

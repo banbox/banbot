@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -86,7 +87,7 @@ func TestRuntimeSharesOwnedAccountExecutionStateWithTrader(t *testing.T) {
 			"live": {StakePctAmt: 73},
 		},
 	}
-	rt, err := process.NewRuntime(Options{Config: source, Env: core.RunEnvProd})
+	rt, err := process.NewRuntime(Options{Config: source, Env: core.RunEnvProd, Exchange: &banexg.Exchange{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,10 +96,13 @@ func TestRuntimeSharesOwnedAccountExecutionStateWithTrader(t *testing.T) {
 		t.Fatalf("runtime account state = %#v, want preserved StakePctAmt", rt.Accounts)
 	}
 	deps := rt.BizDeps()
-	if !deps.AccountsOwned || deps.Accounts["live"] != rt.Accounts["live"] {
+	if deps.Accounts["live"] != rt.Accounts["live"] || deps.AccountsMu != &rt.accountsMu {
 		t.Fatal("Runtime.BizDeps did not expose its owned account execution state")
 	}
-	trader := biz.NewTraderWithRuntimeDeps(deps)
+	trader, traderErr := biz.NewTraderWithRuntimeDeps(deps)
+	if traderErr != nil {
+		t.Fatal(traderErr)
+	}
 	traderDeps := trader.RuntimeDependencies()
 	if traderDeps == nil || traderDeps.Accounts["live"] != rt.Accounts["live"] {
 		t.Fatal("Trader did not retain the Runtime-owned account execution state")
@@ -106,6 +110,48 @@ func TestRuntimeSharesOwnedAccountExecutionStateWithTrader(t *testing.T) {
 	rt.Accounts["live"].StakePctAmt = 11
 	if got := traderDeps.Accounts["live"].StakePctAmt; got != 11 {
 		t.Fatalf("Trader account state = %v, want shared value 11", got)
+	}
+}
+
+func TestRuntimeBizDepsProjectsAllRuntimeOwners(t *testing.T) {
+	wantExportedRuntimeFields := []string{
+		"Process", "ID", "Core", "Config", "Clock", "Market", "Symbols", "Storage", "Batch", "Strategies",
+		"Accounts", "Orders", "Trading", "Cron", "Notifications", "Catalog", "Exchange", "Dump",
+	}
+	runtimeType := reflect.TypeOf(Runtime{})
+	gotExportedRuntimeFields := make([]string, 0, len(wantExportedRuntimeFields))
+	for index := 0; index < runtimeType.NumField(); index++ {
+		field := runtimeType.Field(index)
+		if field.IsExported() {
+			gotExportedRuntimeFields = append(gotExportedRuntimeFields, field.Name)
+		}
+	}
+	if !reflect.DeepEqual(gotExportedRuntimeFields, wantExportedRuntimeFields) {
+		t.Fatalf("Runtime exported fields = %v, want %v; classify every added owner in BizDeps", gotExportedRuntimeFields, wantExportedRuntimeFields)
+	}
+	process := NewProcess()
+	defer process.Close()
+	exchange := &banexg.Exchange{}
+	catalog := data.NewDataSourceCatalog()
+	dump := &orm.DumpSink{}
+	rt, err := process.NewRuntime(Options{
+		Config:   &config.Config{Accounts: map[string]*config.AccountConfig{"default": {}}},
+		Exchange: exchange,
+		Catalog:  catalog,
+		Dump:     dump,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	deps := rt.BizDeps()
+	if deps.Core != rt.Core || deps.Clock != rt.Clock || deps.Market != rt.Market || deps.Batch != rt.Batch ||
+		deps.Strategies != rt.Strategies || deps.Orders != rt.Orders || deps.Trading != rt.Trading ||
+		deps.Config != rt.Config || deps.Accounts == nil || deps.AccountsMu != &rt.accountsMu ||
+		deps.Symbols != rt.Symbols || deps.Storage != rt.Storage || deps.Exchange != exchange || deps.Dump != dump ||
+		deps.Catalog != catalog || deps.Callbacks != rt || deps.Scheduler != rt.Scheduler() ||
+		deps.Notifications != rt.Notifications || deps.DefaultAccount != "default" {
+		t.Fatalf("biz dependency projection dropped a sentinel: %#v", deps)
 	}
 }
 
@@ -200,9 +246,9 @@ func TestRuntimeStatesAreIndependent(t *testing.T) {
 	if a.Core.Pairs[0] != "A/USDT" || b.Core.Pairs[0] != "B/USDT" {
 		t.Fatalf("runtime active pairs = %v/%v", a.Core.Pairs, b.Core.Pairs)
 	}
-	if !a.Core.PairsMap["A/USDT"] || a.Core.PairsMap["B/USDT"] ||
-		!b.Core.PairsMap["B/USDT"] || b.Core.PairsMap["A/USDT"] {
-		t.Fatalf("runtime pair maps leaked: %v/%v", a.Core.PairsMap, b.Core.PairsMap)
+	if !a.Core.PairEnabled("A/USDT") || a.Core.PairEnabled("B/USDT") ||
+		!b.Core.PairEnabled("B/USDT") || b.Core.PairEnabled("A/USDT") {
+		t.Fatalf("runtime pair maps leaked: %v/%v", a.Core.AdmissionPairs(), b.Core.AdmissionPairs())
 	}
 	a.Symbols.CacheExSymbol(&orm.ExSymbol{ID: 1, Exchange: "binance", Market: "spot", Symbol: "A/USDT"})
 	b.Symbols.CacheExSymbol(&orm.ExSymbol{ID: 2, Exchange: "binance", Market: "spot", Symbol: "B/USDT"})
@@ -306,25 +352,25 @@ func TestProcessStopOnlyStopsItsRuntimes(t *testing.T) {
 }
 
 func TestRuntimeCloseResetsAllOwnedState(t *testing.T) {
-	rt, err := NewProcess().NewRuntime(Options{})
+	rt, err := NewProcess().NewRuntime(Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt.Strategies.Versions["runtime"] = 1
+	rt.Strategies.SetVersion("runtime", 1)
 	rt.Orders.SetSyncStamp("account", 123)
 	rt.Trading.Wallet("account")
 	rt.Batch.SetLastBatchMS(456)
 
 	rt.Close()
 
-	if len(rt.Strategies.Versions) != 0 {
-		t.Fatalf("strategy state survived close: %v", rt.Strategies.Versions)
+	if versions := rt.Strategies.VersionsSnapshot(); len(versions) != 0 {
+		t.Fatalf("strategy state survived close: %v", versions)
 	}
 	if got := rt.Orders.GetSyncStamp("account"); got != 0 {
 		t.Fatalf("order state sync stamp survived close: %d", got)
 	}
-	if len(rt.Trading.Wallets) != 0 {
-		t.Fatalf("trading state survived close: %v", rt.Trading.Wallets)
+	if wallets := rt.Trading.WalletsSnapshot(); len(wallets) != 0 {
+		t.Fatalf("trading state survived close: %v", wallets)
 	}
 	if got := rt.Batch.LastBatchMS(); got != 0 {
 		t.Fatalf("batch state survived close: %d", got)
@@ -581,12 +627,12 @@ func TestRuntimeUsesConfigAndDefaultConcurNum(t *testing.T) {
 		t.Fatalf("concur num config/default = %d/%d, want 6/2", fromConfig.Core.ConcurNum, withDefault.Core.ConcurNum)
 	}
 	if len(fromConfig.Core.Pairs) != 1 || fromConfig.Core.Pairs[0] != "CFG/USDT" ||
-		!fromConfig.Core.PairsMap["CFG/USDT"] || fromConfig.Config.View().Pairs[0] != "CFG/USDT" {
-		t.Fatalf("config pairs were not installed as active pairs: %#v/%v", fromConfig.Core.Pairs, fromConfig.Core.PairsMap)
+		!fromConfig.Core.PairEnabled("CFG/USDT") || fromConfig.Config.View().Pairs[0] != "CFG/USDT" {
+		t.Fatalf("config pairs were not installed as active pairs: %#v/%v", fromConfig.Core.Pairs, fromConfig.Core.AdmissionPairs())
 	}
-	if len(withExplicitEmptyPairs.Core.Pairs) != 0 || len(withExplicitEmptyPairs.Core.PairsMap) != 0 ||
+	if len(withExplicitEmptyPairs.Core.Pairs) != 0 || len(withExplicitEmptyPairs.Core.AdmissionPairs()) != 0 ||
 		withExplicitEmptyPairs.Config.View().Pairs[0] != "CFG/USDT" {
-		t.Fatalf("explicit empty pairs did not override active config pairs: %#v/%v", withExplicitEmptyPairs.Core.Pairs, withExplicitEmptyPairs.Core.PairsMap)
+		t.Fatalf("explicit empty pairs did not override active config pairs: %#v/%v", withExplicitEmptyPairs.Core.Pairs, withExplicitEmptyPairs.Core.AdmissionPairs())
 	}
 }
 
@@ -866,25 +912,39 @@ func TestProcessNewRuntimeRejectsAfterClose(t *testing.T) {
 }
 
 func TestRuntimeBatchCanBackTrader(t *testing.T) {
-	rt, err := NewProcess().NewRuntime(Options{})
+	rt, err := NewProcess().NewRuntime(Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(rt.Close)
 
-	trader := biz.NewTrader(rt.Batch)
+	trader, traderErr := biz.NewTraderWithRuntimeDeps(rt.BizDeps())
+	if traderErr != nil {
+		t.Fatal(traderErr)
+	}
 	if trader.BatchState() != rt.Batch {
 		t.Fatal("trader did not retain the runtime batch state")
 	}
 }
 
-func TestRuntimeTraderBatchStatesDoNotLeak(t *testing.T) {
-	process := NewProcess()
-	first, err := process.NewRuntime(Options{})
+func TestRuntimeBizDepsBindingIsIdempotent(t *testing.T) {
+	rt, err := NewProcess().NewRuntime(Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := process.NewRuntime(Options{})
+	t.Cleanup(rt.Close)
+	if err := biz.BindRuntimeDeps(rt.BizDeps()); err != nil {
+		t.Fatalf("rebind identical Runtime.BizDeps: %v", err)
+	}
+}
+
+func TestRuntimeTraderBatchStatesDoNotLeak(t *testing.T) {
+	process := NewProcess()
+	first, err := process.NewRuntime(Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := process.NewRuntime(Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
 	if err != nil {
 		first.Close()
 		t.Fatal(err)
@@ -892,8 +952,14 @@ func TestRuntimeTraderBatchStatesDoNotLeak(t *testing.T) {
 	t.Cleanup(first.Close)
 	t.Cleanup(second.Close)
 
-	firstTrader := biz.NewTrader(first.Batch)
-	secondTrader := biz.NewTrader(second.Batch)
+	firstTrader, firstTraderErr := biz.NewTraderWithRuntimeDeps(first.BizDeps())
+	if firstTraderErr != nil {
+		t.Fatal(firstTraderErr)
+	}
+	secondTrader, secondTraderErr := biz.NewTraderWithRuntimeDeps(second.BizDeps())
+	if secondTraderErr != nil {
+		t.Fatal(secondTraderErr)
+	}
 	firstTask := &strat.JobEnv{Job: &strat.StratJob{Strat: &strat.TradeStrat{Name: "first"}}}
 	secondTask := &strat.JobEnv{Job: &strat.StratJob{Strat: &strat.TradeStrat{Name: "second"}}}
 	firstTrader.BatchState().AddTask("1m_default_first", "BTC/USDT_main", firstTask, 60_000, 100)
@@ -913,6 +979,39 @@ func TestRuntimeTraderBatchStatesDoNotLeak(t *testing.T) {
 	}
 	if got := secondTrader.BatchState().LastBatchMS(); got != 202 {
 		t.Fatalf("second runtime last batch ms after first reset = %d, want 202", got)
+	}
+}
+
+func TestTraderRejectsStatesBoundToAnotherRuntime(t *testing.T) {
+	process := NewProcess()
+	defer process.Close()
+	first, err := process.NewRuntime(Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := process.NewRuntime(Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	strategyDeps := second.BizDeps()
+	strategyDeps.Strategies = first.Strategies
+	if _, err := biz.NewTraderWithRuntimeDeps(strategyDeps); err == nil || !strings.Contains(err.Error(), "strategy state") {
+		t.Fatalf("cross-runtime strategy state error = %v", err)
+	}
+	if first.Strategies.Core != first.Core {
+		t.Fatal("rejected bind changed the first runtime strategy state")
+	}
+
+	orderDeps := second.BizDeps()
+	// Keep strategy bindings valid for second so this case reaches the order
+	// ownership verification.
+	orderDeps.Strategies = second.Strategies
+	orderDeps.Orders = first.Orders
+	if _, err := biz.NewTraderWithRuntimeDeps(orderDeps); err == nil || !strings.Contains(err.Error(), "order state") {
+		t.Fatalf("cross-runtime order state error = %v", err)
 	}
 }
 

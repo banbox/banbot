@@ -34,7 +34,7 @@ func TestStrictFlagPopulatesCommandArgs(t *testing.T) {
 		{flag: "--bt-strict=false", want: false, wantSet: true},
 	} {
 		var captured *config.CmdArgs
-		command := newConfigCommand("capture", "capture args", func(args *config.CmdArgs) *errs.Error {
+		command := newRuntimeConfigCommand("capture", "capture args", func(args *config.CmdArgs) *errs.Error {
 			captured = args
 			return nil
 		}, true, bindBTStrict)

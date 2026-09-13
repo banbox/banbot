@@ -1037,8 +1037,16 @@ type ServerIO struct {
 	connections *serverConnections
 	Data        map[string]string // Cache data available for remote access 缓存的数据，可供远程端访问
 	DataExp     map[string]int64  // Cache data expiration timestamp, 13 bits 缓存数据的过期时间戳，13位
+	dataMu      sync.RWMutex
 	InitConn    func(*BanConn)
 	OnConnExit  func(*BanConn, *errs.Error)
+	lifecycleMu sync.Mutex
+	listener    net.Listener
+	runDone     chan struct{}
+	stopCh      chan struct{}
+	stopped     bool
+	running     bool
+	workers     sync.WaitGroup
 }
 
 type serverConnections struct {
@@ -1051,14 +1059,30 @@ var (
 )
 
 func NewBanServer(addr, aesKey string) *ServerIO {
-	var server ServerIO
-	server.Addr = addr
-	server.aesKey = aesKey
-	server.connections = &serverConnections{}
-	server.Data = map[string]string{}
-	banServer = &server
+	server := newServerIO(addr, aesKey)
+	banServer = server
+	return server
+}
+
+// NewServerIO creates a standalone server. Unlike NewBanServer, it does not
+// register itself as the legacy process-wide server.
+func NewServerIO(addr, aesKey string) *ServerIO {
+	return newServerIO(addr, aesKey)
+}
+
+func newServerIO(addr, aesKey string) *ServerIO {
+	server := &ServerIO{
+		Addr:        addr,
+		aesKey:      aesKey,
+		connections: &serverConnections{},
+		runDone:     make(chan struct{}),
+		stopCh:      make(chan struct{}),
+		Data:        make(map[string]string),
+		DataExp:     make(map[string]int64),
+	}
+	close(server.runDone)
 	gob.Register(IOMsgRaw{})
-	return &server
+	return server
 }
 
 func (s *ServerIO) AddConnection(conn IBanConn) {
@@ -1095,24 +1119,78 @@ func (s *ServerIO) ConnectionsSnapshot() []IBanConn {
 }
 
 func (s *ServerIO) RunForever(intvSecs, timeoutSecs int) *errs.Error {
+	s.lifecycleMu.Lock()
+	if s.stopCh == nil {
+		s.stopCh = make(chan struct{})
+	}
+	if s.stopped {
+		s.lifecycleMu.Unlock()
+		return nil
+	}
+	if s.running {
+		s.lifecycleMu.Unlock()
+		return errs.NewMsg(core.ErrRunTime, "server is already running")
+	}
+	s.running = true
+	s.runDone = make(chan struct{})
+	done := s.runDone
+	s.lifecycleMu.Unlock()
 	ln, err_ := net.Listen("tcp", s.Addr)
 	if err_ != nil {
+		s.lifecycleMu.Lock()
+		s.running = false
+		close(done)
+		s.lifecycleMu.Unlock()
 		return errs.New(core.ErrNetConnect, err_)
 	}
-	defer ln.Close()
+	s.lifecycleMu.Lock()
+	if s.stopped {
+		s.lifecycleMu.Unlock()
+		_ = ln.Close()
+		s.lifecycleMu.Lock()
+		s.running = false
+		close(done)
+		s.lifecycleMu.Unlock()
+		return nil
+	}
+	s.listener = ln
+	s.lifecycleMu.Unlock()
+	defer func() {
+		_ = ln.Close()
+		s.lifecycleMu.Lock()
+		if s.listener == ln {
+			s.listener = nil
+		}
+		s.running = false
+		close(done)
+		s.lifecycleMu.Unlock()
+	}()
 	log.Info("banio started", zap.String("addr", s.Addr))
 	if intvSecs > 0 && timeoutSecs > 0 {
+		s.workers.Add(1)
 		go s.loopCheckTimeout(intvSecs, timeoutSecs)
 	}
 	for {
 		conn_, err_ := ln.Accept()
 		if err_ != nil {
+			if errors.Is(err_, net.ErrClosed) {
+				return nil
+			}
 			return errs.New(core.ErrNetConnect, err_)
 		}
 		conn := s.WrapConn(conn_)
-		log.Info("receive client", zap.String("remote", conn.GetRemote()))
+		s.lifecycleMu.Lock()
+		if s.stopped {
+			s.lifecycleMu.Unlock()
+			_ = conn.Close()
+			continue
+		}
 		s.AddConnection(conn)
+		s.workers.Add(1)
+		s.lifecycleMu.Unlock()
+		log.Info("receive client", zap.String("remote", conn.GetRemote()))
 		go func() {
+			defer s.workers.Done()
 			err := conn.RunForever()
 			if err != nil {
 				log.Warn("read client fail", zap.String("remote", conn.GetRemote()),
@@ -1124,6 +1202,58 @@ func (s *ServerIO) RunForever(intvSecs, timeoutSecs int) *errs.Error {
 			}
 		}()
 	}
+}
+
+// ListenAddr reports the bound listener address while RunForever is active.
+func (s *ServerIO) ListenAddr() string {
+	if s == nil {
+		return ""
+	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.listener == nil {
+		return ""
+	}
+	return s.listener.Addr().String()
+}
+
+// Stop closes this server's listener and current clients. It only signals
+// shutdown; callers that need completion should call Join separately.
+func (s *ServerIO) Stop() {
+	if s == nil {
+		return
+	}
+	s.lifecycleMu.Lock()
+	if !s.stopped {
+		s.stopped = true
+		if s.stopCh == nil {
+			s.stopCh = make(chan struct{})
+		}
+		close(s.stopCh)
+	}
+	listener := s.listener
+	s.lifecycleMu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+	}
+	for _, conn := range s.ConnectionsSnapshot() {
+		_ = conn.Close()
+	}
+}
+
+// Join waits for the current RunForever loop to return. Calling it before a
+// server starts is a no-op.
+func (s *ServerIO) Join() {
+	if s == nil {
+		return
+	}
+	s.lifecycleMu.Lock()
+	done := s.runDone
+	s.lifecycleMu.Unlock()
+	if done != nil {
+		<-done
+	}
+	s.workers.Wait()
 }
 
 type KeyValExpire struct {
@@ -1138,30 +1268,54 @@ type IOKeyVal struct {
 }
 
 func (s *ServerIO) SetVal(args *KeyValExpire) {
+	if s == nil || args == nil {
+		return
+	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	if s.Data == nil {
+		s.Data = make(map[string]string)
+	}
+	if s.DataExp == nil {
+		s.DataExp = make(map[string]int64)
+	}
 	if args.Val == "" {
 		// 删除值
 		delete(s.Data, args.Key)
+		delete(s.DataExp, args.Key)
 		return
 	}
 	s.Data[args.Key] = args.Val
 	if args.ExpireSecs > 0 {
 		s.DataExp[args.Key] = btime.TimeMS() + int64(args.ExpireSecs*1000)
+	} else {
+		delete(s.DataExp, args.Key)
 	}
 }
 
 func (s *ServerIO) GetVal(key string) string {
-	val, ok := s.Data[key]
-	if !ok {
+	if s == nil {
 		return ""
 	}
-	if exp, ok := s.DataExp[key]; ok {
-		if btime.TimeMS() >= exp {
-			delete(s.Data, key)
-			delete(s.DataExp, key)
-			return ""
-		}
+	s.dataMu.RLock()
+	val, ok := s.Data[key]
+	if !ok {
+		s.dataMu.RUnlock()
+		return ""
 	}
-	return val
+	exp, hasExp := s.DataExp[key]
+	s.dataMu.RUnlock()
+	if !hasExp || btime.TimeMS() < exp {
+		return val
+	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	if exp, ok := s.DataExp[key]; ok && btime.TimeMS() >= exp {
+		delete(s.Data, key)
+		delete(s.DataExp, key)
+		return ""
+	}
+	return s.Data[key]
 }
 
 func (s *ServerIO) Broadcast(msg *IOMsg) *errs.Error {
@@ -1208,8 +1362,15 @@ func (s *ServerIO) Broadcast(msg *IOMsg) *errs.Error {
 
 // loopCheckTimeout Server checks ping timeout and closes stale connections
 func (s *ServerIO) loopCheckTimeout(intvSecs, timeoutSecs int) {
+	defer s.workers.Done()
+	ticker := time.NewTicker(time.Duration(intvSecs) * time.Second)
+	defer ticker.Stop()
 	for {
-		core.Sleep(time.Duration(intvSecs) * time.Second)
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+		}
 		nowMS := btime.UTCStamp()
 		timeoutMS := int64(timeoutSecs * 1000)
 

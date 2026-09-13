@@ -8,6 +8,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banexg/errs"
 )
 
@@ -21,6 +22,7 @@ func TestContextualKlineOperationErrorMakesEmptyFailureAuditable(t *testing.T) {
 }
 
 func TestAutoFetchOhlcv(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)
@@ -51,6 +53,7 @@ func TestAutoFetchOhlcv(t *testing.T) {
 }
 
 func TestFetchOhlcvs(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)
@@ -70,6 +73,7 @@ func TestFetchOhlcvs(t *testing.T) {
 }
 
 func TestBulkDownOHLCV(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)

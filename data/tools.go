@@ -7,13 +7,11 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
-	"github.com/sasha-s/go-deadlock"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 	"io/fs"
@@ -24,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,15 +35,22 @@ tick数据的问题
 2. 有夜盘时，夜盘数据的日期实际是前一天
 */
 
-var (
-	ConcurNum = 5 // 并发处理的数量
-	// The following are used in Build1mWithTicks to build 1m candlesticks from ticks
-	// 下面几个在Build1mWithTicks中使用，从tick构建1m K线
-	symKLines = make(map[string][]*banexg.Kline) // 1M data for the current year, the key is the contract ID 当前年的1m数据，键是合约ID
-	klineLock deadlock.Mutex                     //symKlines的并发读写锁
-	timeMsMin = int64(0)
-	timeMsMax = int64(0)
-)
+// TickWorker owns one tick conversion invocation. Its candle buffer and
+// range filters must not be shared across concurrent commands.
+type TickWorker struct {
+	ConcurNum int
+	TimeMSMin int64
+	TimeMSMax int64
+	symKLines map[string][]*banexg.Kline
+	klineLock sync.Mutex
+}
+
+func NewTickWorker(concurNum int) *TickWorker {
+	if concurNum < 1 {
+		concurNum = 5
+	}
+	return &TickWorker{ConcurNum: concurNum, symKLines: make(map[string][]*banexg.Kline)}
+}
 
 type FuncConvert func(inPath string, file *zip.File, writer *zip.Writer) *errs.Error
 
@@ -128,7 +134,7 @@ func FindPathNames(inPath, suffix string) ([]string, *errs.Error) {
 	return result, nil
 }
 
-func convertFiles(inPath, outPath, srcSuffix string, makeOutPath func(string, string) string, convert FuncConvert) *errs.Error {
+func convertFiles(inPath, outPath, srcSuffix string, concurNum int, makeOutPath func(string, string) string, convert FuncConvert) *errs.Error {
 	names, err := FindPathNames(inPath, ".zip")
 	if err != nil {
 		return err
@@ -137,7 +143,7 @@ func convertFiles(inPath, outPath, srcSuffix string, makeOutPath func(string, st
 	names = names[1:]
 	pBar := utils.NewPrgBar(len(names)*core.StepTotal, "")
 	defer pBar.Close()
-	return utils.ParallelRun(names, ConcurNum, func(_ int, name string) *errs.Error {
+	return utils.ParallelRun(names, concurNum, func(_ int, name string) *errs.Error {
 		fileOutPath := makeOutPath(outPath, name)
 		_, err_ := os.Stat(fileOutPath)
 		if err_ == nil {
@@ -190,14 +196,13 @@ func isRawContract(name string) bool {
 }
 
 func RunFormatTick(args *config.CmdArgs) *errs.Error {
-	return legacygate.With(func() *errs.Error {
-		return RunFormatTickWithSession(args)
-	})
+	return RunFormatTickWithWorker(args, NewTickWorker(5))
 }
 
-// RunFormatTickWithSession runs the formatter while the caller owns the
-// legacy gate.
-func RunFormatTickWithSession(args *config.CmdArgs) *errs.Error {
+func RunFormatTickWithWorker(args *config.CmdArgs, worker *TickWorker) *errs.Error {
+	if worker == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "tick worker is required")
+	}
 	if args.InPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
 	}
@@ -270,22 +275,17 @@ func RunFormatTickWithSession(args *config.CmdArgs) *errs.Error {
 		name = strings.ReplaceAll(name, "marketdatacsv", "")
 		return filepath.Join(dirPath, name)
 	}
-	return convertFiles(args.InPath, args.OutPath, ".csv", makeOutPath, handleEntry)
+	return convertFiles(args.InPath, args.OutPath, ".csv", worker.ConcurNum, makeOutPath, handleEntry)
 }
 
 func Build1mWithTicks(args *config.CmdArgs) *errs.Error {
-	return legacygate.With(func() *errs.Error {
-		return Build1mWithTicksWithSession(args)
-	})
+	return Build1mWithTicksWithWorker(args, NewTickWorker(5))
 }
 
-// Build1mWithTicksWithSession runs the tick builder while the caller owns the
-// legacy gate.
-func Build1mWithTicksWithSession(args *config.CmdArgs) *errs.Error {
-	return build1mWithTicks(args)
-}
-
-func build1mWithTicks(args *config.CmdArgs) *errs.Error {
+func Build1mWithTicksWithWorker(args *config.CmdArgs, worker *TickWorker) *errs.Error {
+	if worker == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "tick worker is required")
+	}
 	if args.InPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
 	}
@@ -301,8 +301,8 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 	}
 	var dirPath = names[0]
 	names = names[1:]
-	if timeMsMin > 0 || timeMsMax > 0 {
-		log.Info("enable time filter", zap.Int64("min", timeMsMin), zap.Int64("maz", timeMsMax))
+	if worker.TimeMSMin > 0 || worker.TimeMSMax > 0 {
+		log.Info("enable time filter", zap.Int64("min", worker.TimeMSMin), zap.Int64("max", worker.TimeMSMax))
 	}
 	// Input: There is only a folder of years in the root directory, and a zip package for each trading day under each year folder, and the tick data of the day is stored in the contract name in each zip
 	// Output: A ZIP archive in the root directory every year, and each zip stores 1M data of the contract in CSV with the contract name
@@ -396,18 +396,18 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 		log.Info("calc 1m kline from ticks", zap.String("year", year))
 		totalNum := len(names) * core.StepTotal
 		pBar := utils.NewPrgBar(totalNum, "tickTo1m")
-		err = utils.ParallelRun(names, ConcurNum, func(_ int, name string) *errs.Error {
-			if timeMsMin > 0 || timeMsMax > 0 {
+		err = utils.ParallelRun(names, worker.ConcurNum, func(_ int, name string) *errs.Error {
+			if worker.TimeMSMin > 0 || worker.TimeMSMax > 0 {
 				// 过滤范围之外的数据
 				cleanName := strings.Split(filepath.Base(name), ".")[0]
 				cleanName = cleanName[len(cleanName)-8:]
 				timeObj, err_ := time.ParseInLocation("20060102", cleanName, loc)
 				if err_ == nil {
 					timeMS := timeObj.UnixMilli()
-					if timeMsMin > 0 && timeMS < timeMsMin {
+					if worker.TimeMSMin > 0 && timeMS < worker.TimeMSMin {
 						return nil
 					}
-					if timeMsMax > 0 && timeMS > timeMsMax {
+					if worker.TimeMSMax > 0 && timeMS > worker.TimeMSMax {
 						return nil
 					}
 				}
@@ -449,7 +449,7 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 				}
 				data[parts[len(parts)-1]] = sumVol
 			}
-			klineLock.Lock()
+			worker.klineLock.Lock()
 			for key, data := range symbolVolMap {
 				suffix, vol := "", -1.0
 				for sf, volume := range data {
@@ -458,18 +458,18 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 						vol = volume
 					}
 				}
-				oldData, _ := symKLines[key]
-				symKLines[key] = append(oldData, dayKlines[key+"_"+suffix]...)
+				oldData := worker.symKLines[key]
+				worker.symKLines[key] = append(oldData, dayKlines[key+"_"+suffix]...)
 			}
-			klineLock.Unlock()
+			worker.klineLock.Unlock()
 			return runErr
 		})
 		pBar.Close()
 		log.Info("save 1m kline", zap.String("year", year))
-		klineLock.Lock()
-		saveYear1m(args.OutPath, year)
-		symKLines = make(map[string][]*banexg.Kline)
-		klineLock.Unlock()
+		worker.klineLock.Lock()
+		saveYear1m(args.OutPath, year, worker.symKLines)
+		worker.symKLines = make(map[string][]*banexg.Kline)
+		worker.klineLock.Unlock()
 		if err != nil {
 			return err
 		}
@@ -477,7 +477,7 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
-func saveYear1m(outDir, year string) {
+func saveYear1m(outDir, year string, symKLines map[string][]*banexg.Kline) {
 	if len(symKLines) == 0 || year == "" {
 		return
 	}
@@ -719,6 +719,16 @@ func build1mSymbolTick(inPath string, fid int, file *zip.File, dones map[string]
 CalcFilePerfs calc sharpe/sortino ratio for input data
 */
 func CalcFilePerfs(args *config.CmdArgs) *errs.Error {
+	return CalcFilePerfsWithLogger(args, log.L())
+}
+
+func CalcFilePerfsWithLogger(args *config.CmdArgs, logger *zap.Logger) *errs.Error {
+	if args == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "arguments are required")
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	path := args.InPath
 	if path == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
@@ -740,7 +750,7 @@ func CalcFilePerfs(args *config.CmdArgs) *errs.Error {
 		return err
 	}
 	if len(rows) <= 1 {
-		log.Warn("file empty, skip CalcFilePerfs", zap.Int("rowNum", len(rows)))
+		logger.Warn("file empty, skip CalcFilePerfs", zap.Int("rowNum", len(rows)))
 		return nil
 	}
 	var names = rows[0]

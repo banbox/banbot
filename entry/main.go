@@ -14,7 +14,6 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/opt"
 	runtimectx "github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/utils"
@@ -60,7 +59,7 @@ func panicStack() []byte {
 func Execute(args []string) error {
 	command := NewRootCommand()
 	if isImplicitWebInvocation(args) {
-		command = withLegacyCommand(web.NewCommand())
+		command = web.NewDevCommandWithFactory(newDevWebServer)
 		command.SilenceErrors = true
 		command.SilenceUsage = true
 	}
@@ -82,6 +81,8 @@ func isImplicitWebInvocation(args []string) bool {
 
 // NewRootCommand builds the complete Cobra command tree.
 func NewRootCommand() *cobra.Command {
+	rootCommandMu.Lock()
+	defer rootCommandMu.Unlock()
 	root := &cobra.Command{
 		Use:           "banbot",
 		Short:         "Banbot quantitative trading and data tools",
@@ -89,14 +90,12 @@ func NewRootCommand() *cobra.Command {
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		Annotations:   map[string]string{legacyGateAnnotation: "1"},
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return web.RunDev([]string{})
-		},
+		RunE:          func(_ *cobra.Command, _ []string) error { return runDefaultWeb() },
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.SetVersionTemplate("banbot {{.Version}}\n")
 
+	extraGroups, extraCommands := commandRegistrySnapshot()
 	groups := make(map[string]*cobra.Command, len(commandGroups)+len(extraGroups))
 	allGroups := append(append([]commandGroup{}, commandGroups...), extraGroups...)
 	for _, group := range allGroups {
@@ -113,8 +112,14 @@ func NewRootCommand() *cobra.Command {
 	}
 
 	registerBuiltInCommands(root, groups)
-	registerExtraCommands(root, groups)
+	registerExtraCommands(root, groups, extraCommands)
 	return root
+}
+
+func runDefaultWeb() error {
+	command := web.NewDevCommandWithFactory(newDevWebServer)
+	command.SetArgs([]string{})
+	return command.Execute()
 }
 
 func installSignalHandler() {
@@ -134,119 +139,38 @@ func installSignalHandler() {
 	}()
 }
 
-func newConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
-	return newConfigCommandWithGate(name, help, run, allowDeadlock, true, binders...)
-}
-
 func newRuntimeConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
-	command := newConfigCommandWithGate(name, help, run, allowDeadlock, false, binders...)
-	// Keep the historical marker for command-tree compatibility. Unlike a
-	// legacy command, this callback does not acquire the gate.
-	command.Annotations = map[string]string{legacyGateAnnotation: "1"}
-	return command
-}
-
-func newConfigCommandWithGate(name, help string, run FuncEntry, allowDeadlock, legacyGate bool, binders ...flagBinder) *cobra.Command {
 	args := &config.CmdArgs{}
-	legacy := &legacyCommandFlags{}
+	options := &runtimeCommandFlags{}
 	command := &cobra.Command{
 		Use:   name,
 		Short: help,
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			args.BTStrictSet = command.Flags().Changed("bt-strict")
-			if !legacyGate {
-				args.NetDisable = legacy.netDisable
-				args.CPUProfile = legacy.cpuProfile
-				args.MemProfile = legacy.memProfile
-				if err := run(args); err != nil {
-					return err
-				}
-				return nil
+			args.NetDisable = options.netDisable
+			args.CPUProfile = options.cpuProfile
+			args.MemProfile = options.memProfile
+			if err := run(args); err != nil {
+				return err
 			}
-			return runConfigCommand(args, legacy, run)
+			return nil
 		},
 	}
-	if legacyGate {
-		command.Annotations = map[string]string{legacyGateAnnotation: "1"}
-	}
-	bindCommonFlags(args, legacy, command.Flags(), allowDeadlock)
+	bindCommonFlags(args, options, command.Flags(), allowDeadlock)
 	for _, bind := range binders {
 		bind(args, command.Flags())
 	}
 	return command
 }
 
-func newLegacySessionConfigCommand(name, help string, run func(*config.CmdArgs, opt.LegacySession) *errs.Error, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
-	args := &config.CmdArgs{}
-	legacy := &legacyCommandFlags{}
-	command := &cobra.Command{
-		Use:         name,
-		Short:       help,
-		Args:        cobra.NoArgs,
-		Annotations: map[string]string{legacyGateAnnotation: "1"},
-		RunE: func(command *cobra.Command, _ []string) error {
-			args.BTStrictSet = command.Flags().Changed("bt-strict")
-			return runConfigCommandWithLegacySession(args, legacy, run)
-		},
-	}
-	bindCommonFlags(args, legacy, command.Flags(), allowDeadlock)
-	for _, bind := range binders {
-		bind(args, command.Flags())
-	}
-	return command
-}
-
-const legacyGateAnnotation = legacygate.Annotation
-
-func hasLegacyGate(command *cobra.Command) bool {
-	return command != nil && command.Annotations != nil && command.Annotations[legacyGateAnnotation] == "1"
-}
-
-func markLegacyGate(command *cobra.Command) {
-	if command == nil {
-		return
-	}
-	if command.Annotations == nil {
-		command.Annotations = make(map[string]string)
-	}
-	command.Annotations[legacyGateAnnotation] = "1"
-}
-
-// withLegacyCommand serializes every runnable command in a Cobra tree that
-// still reaches package-level compatibility state.
-func withLegacyCommand(command *cobra.Command) *cobra.Command {
-	if command == nil {
-		return nil
-	}
-	if !hasLegacyGate(command) {
-		if run := command.RunE; run != nil {
-			command.RunE = func(cmd *cobra.Command, args []string) error {
-				return opt.WithCommandLegacySession(func(opt.LegacySession) error { return run(cmd, args) })
-			}
-		} else if run := command.Run; run != nil {
-			command.Run = func(cmd *cobra.Command, args []string) {
-				opt.WithCommandLegacySession(func(opt.LegacySession) struct{} {
-					run(cmd, args)
-					return struct{}{}
-				})
-			}
-		}
-		markLegacyGate(command)
-	}
-	for _, child := range command.Commands() {
-		withLegacyCommand(child)
-	}
-	return command
-}
-
-type legacyCommandFlags struct {
+type runtimeCommandFlags struct {
 	cpuProfile bool
 	memProfile bool
 	netDisable bool
 }
 
-func bindCommonFlags(args *config.CmdArgs, legacy *legacyCommandFlags, flags *pflag.FlagSet, allowDeadlock bool) {
+func bindCommonFlags(args *config.CmdArgs, options *runtimeCommandFlags, flags *pflag.FlagSet, allowDeadlock bool) {
 	flags.StringVar(&args.DataDir, "datadir", "", "path to the data directory")
 	flags.StringArrayVar((*[]string)(&args.Configs), "config", nil, "config path; may be repeated")
 	flags.BoolVar(&args.NoDefault, "no-default", false, "ignore config.yml and config.local.yml")
@@ -257,46 +181,9 @@ func bindCommonFlags(args *config.CmdArgs, legacy *legacyCommandFlags, flags *pf
 	if allowDeadlock {
 		flags.BoolVar(&args.DeadLock, "dlock", false, "enable deadlock detection")
 	}
-	flags.BoolVar(&legacy.cpuProfile, "cpu-profile", false, "enable CPU profiling")
-	flags.BoolVar(&legacy.memProfile, "mem-profile", false, "enable memory profiling")
-	flags.BoolVar(&legacy.netDisable, "net-off", false, "disable network requests")
-}
-
-func runConfigCommand(args *config.CmdArgs, legacy *legacyCommandFlags, run FuncEntry) error {
-	return opt.WithLegacySession(func(opt.LegacySession) error {
-		core.CPUProfile, core.MemProfile, core.NetDisable = legacy.cpuProfile, legacy.memProfile, legacy.netDisable
-		core.SetRunMode(core.RunModeOther)
-		args.Init()
-		startProfiles()
-		if err := run(args); err != nil {
-			return err
-		}
-		return nil
-	})
-}
-
-func runConfigCommandWithLegacySession(args *config.CmdArgs, legacy *legacyCommandFlags, run func(*config.CmdArgs, opt.LegacySession) *errs.Error) error {
-	return opt.WithLegacySession(func(session opt.LegacySession) error {
-		core.CPUProfile, core.MemProfile, core.NetDisable = legacy.cpuProfile, legacy.memProfile, legacy.netDisable
-		core.SetRunMode(core.RunModeOther)
-		args.Init()
-		startProfiles()
-		if err := run(args, session); err != nil {
-			return err
-		}
-		return nil
-	})
-}
-
-func startProfiles() func() {
-	cleanup, err := startProfilesFor(core.CPUProfile, core.MemProfile)
-	if err != nil {
-		panic(err)
-	}
-	if cleanup != nil {
-		core.AddExitCall(cleanup)
-	}
-	return cleanup
+	flags.BoolVar(&options.cpuProfile, "cpu-profile", false, "enable CPU profiling")
+	flags.BoolVar(&options.memProfile, "mem-profile", false, "enable memory profiling")
+	flags.BoolVar(&options.netDisable, "net-off", false, "disable network requests")
 }
 
 func startProfilesFor(cpuProfile, memProfile bool) (func(), *errs.Error) {
@@ -344,24 +231,10 @@ func startProfilesFor(cpuProfile, memProfile bool) (func(), *errs.Error) {
 	return cleanup, nil
 }
 
-func newPositionalCommand(name, help, argName string, run func(args []string) error) *cobra.Command {
-	return &cobra.Command{
-		Use:         fmt.Sprintf("%s %s", name, argName),
-		Short:       help,
-		Args:        cobra.ExactArgs(1),
-		Annotations: map[string]string{legacyGateAnnotation: "1"},
-		RunE: func(_ *cobra.Command, args []string) error {
-			return opt.WithLegacySession(func(opt.LegacySession) error {
-				core.SetRunMode(core.RunModeOther)
-				return run(args)
-			})
-		},
-	}
-}
-
 func newMergeAssetsCommand() *cobra.Command {
 	var outPath string
 	var lines string
+	var dataDir string
 	command := &cobra.Command{
 		Use:     "merge-assets FILE FILE [FILE...]",
 		Aliases: []string{"merge_assets"},
@@ -372,10 +245,17 @@ func newMergeAssetsCommand() *cobra.Command {
 				return errs.NewMsg(errs.CodeParamRequired, "--out is required")
 			}
 			filesMap := make(map[string]string, len(files))
-			for _, file := range files {
-				filesMap[config.ParsePath(file)] = ""
+			if dataDir == "" {
+				dataDir = os.Getenv("BanDataDir")
 			}
-			outPath = config.ParsePath(outPath)
+			if dataDir == "" {
+				dataDir = "."
+			}
+			snapshot := config.NewSnapshotWithDirs(nil, dataDir, "")
+			for _, file := range files {
+				filesMap[snapshot.ParsePath(file)] = ""
+			}
+			outPath = snapshot.ParsePath(outPath)
 			if err := opt.MergeAssetsHtml(outPath, filesMap, utils.SplitSolid(lines, ",", true), false); err != nil {
 				return err
 			}
@@ -384,6 +264,7 @@ func newMergeAssetsCommand() *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&outPath, "out", "merged_assets.html", "output HTML file")
+	command.Flags().StringVar(&dataDir, "datadir", "", "path used to resolve @/$ file paths")
 	command.Flags().StringVar(&lines, "lines", "Real,Available", "comma-separated line names to extract")
 	return command
 }

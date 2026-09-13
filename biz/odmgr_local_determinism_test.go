@@ -38,9 +38,9 @@ func TestFrozenReplayFillPendingOrdersPreservesSuppliedBusinessOrder(t *testing.
 	oldEnvReal := core.EnvReal
 	oldLiveMode := core.LiveMode
 	oldData := config.Data
-	oldPairs := config.Pairs
-	oldPairFilters := config.PairFilters
-	oldPairMgr := config.PairMgr
+	oldPairs := config.Data.Pairs
+	oldPairFilters := config.Data.PairFilters
+	oldPairMgr := config.Data.PairMgr
 	exg.Default = &deterministicFillExchange{}
 	core.BackTestMode = true
 	core.EnvReal = true
@@ -48,18 +48,18 @@ func TestFrozenReplayFillPendingOrdersPreservesSuppliedBusinessOrder(t *testing.
 	config.Data.BTLegacyWallet = true
 	config.Data.BTStrict = true
 	config.Data.BTNoKlineDownload = true
-	config.Pairs = []string{"DETERMINISTIC/USDT"}
-	config.PairFilters = nil
-	config.PairMgr = &config.PairMgrConfig{}
+	config.Data.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.Data.PairFilters = nil
+	config.Data.PairMgr = &config.PairMgrConfig{}
 	t.Cleanup(func() {
 		exg.Default = oldExchange
 		core.BackTestMode = oldBackTest
 		core.EnvReal = oldEnvReal
 		core.LiveMode = oldLiveMode
 		config.Data = oldData
-		config.Pairs = oldPairs
-		config.PairFilters = oldPairFilters
-		config.PairMgr = oldPairMgr
+		config.Data.Pairs = oldPairs
+		config.Data.PairFilters = oldPairFilters
+		config.Data.PairMgr = oldPairMgr
 	})
 
 	exs := &orm.ExSymbol{ID: 155, Symbol: "DETERMINISTIC/USDT"}
@@ -101,12 +101,12 @@ func TestFrozenReplayCallbackOrdersPreserveSuppliedOrder(t *testing.T) {
 	core.BackTestMode = true
 	config.Data.BTStrict = true
 	config.Data.BTNoKlineDownload = true
-	config.Pairs = []string{"DETERMINISTIC/USDT"}
-	config.PairFilters = nil
-	config.PairMgr = &config.PairMgrConfig{}
+	config.Data.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.Data.PairFilters = nil
+	config.Data.PairMgr = &config.PairMgrConfig{}
 	t.Cleanup(func() {
 		core.BackTestMode, config.Data = oldBackTest, oldData
-		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+		config.Data.Pairs, config.Data.PairFilters, config.Data.PairMgr = oldPairs, oldFilters, oldMgr
 	})
 
 	for _, permutation := range [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}} {
@@ -127,12 +127,12 @@ func TestFrozenReplayMapRescanCanonicalizesOrder(t *testing.T) {
 	core.BackTestMode = true
 	config.Data.BTStrict = true
 	config.Data.BTNoKlineDownload = true
-	config.Pairs = []string{"DETERMINISTIC/USDT"}
-	config.PairFilters = nil
-	config.PairMgr = &config.PairMgrConfig{}
+	config.Data.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.Data.PairFilters = nil
+	config.Data.PairMgr = &config.PairMgrConfig{}
 	t.Cleanup(func() {
 		core.BackTestMode, config.Data = oldMode, oldData
-		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+		config.Data.Pairs, config.Data.PairFilters, config.Data.PairMgr = oldPairs, oldFilters, oldMgr
 	})
 
 	for _, permutation := range [][]int64{{3, 1, 2}, {2, 3, 1}, {1, 2, 3}} {
@@ -153,12 +153,12 @@ func TestFrozenReplayMapBoundaryPreservesSuppliedOrder(t *testing.T) {
 	core.BackTestMode = true
 	config.Data.BTStrict = true
 	config.Data.BTNoKlineDownload = true
-	config.Pairs = []string{"DETERMINISTIC/USDT"}
-	config.PairFilters = nil
-	config.PairMgr = &config.PairMgrConfig{}
+	config.Data.Pairs = []string{"DETERMINISTIC/USDT"}
+	config.Data.PairFilters = nil
+	config.Data.PairMgr = &config.PairMgrConfig{}
 	t.Cleanup(func() {
 		core.BackTestMode, config.Data = oldMode, oldData
-		config.Pairs, config.PairFilters, config.PairMgr = oldPairs, oldFilters, oldMgr
+		config.Data.Pairs, config.Data.PairFilters, config.Data.PairMgr = oldPairs, oldFilters, oldMgr
 	})
 	orders := []*ormo.InOutOrder{
 		{IOrder: &ormo.IOrder{ID: 3}},

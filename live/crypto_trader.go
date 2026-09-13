@@ -11,7 +11,6 @@ import (
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
-	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg/utils"
 
@@ -27,6 +26,7 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 )
 
@@ -36,6 +36,7 @@ type CryptoTrader struct {
 	retiredProviders []*data.LiveProvider
 	symbols          *orm.SymbolState
 	dataDeps         *data.RuntimeDeps
+	apiServer        *web.ApiServer
 	scheduler        com.Scheduler
 	startup          CryptoTraderStartupFunc
 	runtimeCtx       context.Context
@@ -52,7 +53,6 @@ type CryptoTrader struct {
 	shutdownReady    bool
 	shutdownStarted  bool
 	cleanupDone      bool
-	legacyBackup     *biz.VarsBackup
 	previousUnWatch  func(map[string][]string)
 	providerBindings map[*data.LiveProvider]struct{}
 	initFn           func() *errs.Error
@@ -61,21 +61,25 @@ type CryptoTrader struct {
 	seriesRuntime    *data.SeriesRuntime
 	nowMSFn          func() int64
 	collectJobsFn    func() []*strat.StratJob
-	runtimeDepsErr   *errs.Error
 }
 
 type CryptoTraderStartupFunc func(ctx context.Context, trader *CryptoTrader) error
-
-var webStartAPIWithLifecycle = func(lifecycle RuntimeLifecycle) *errs.Error {
-	_, err := web.StartApiWithLifecycleInLegacySession(lifecycle)
-	return err
-}
 
 // RuntimeLifecycle is the small lifecycle surface a live trader needs.
 type RuntimeLifecycle interface {
 	Context() context.Context
 	OnClose(func())
 	OnCloseWait(func())
+}
+
+// NewCryptoTrader preserves the public legacy constructor for embedding
+// applications. New callers that need isolated state should use
+// NewCryptoTraderWithRuntimeDeps.
+func NewCryptoTrader() *CryptoTrader { return &CryptoTrader{} }
+
+// NewCryptoTraderWith preserves the public constructor with a startup hook.
+func NewCryptoTraderWith(startup CryptoTraderStartupFunc) *CryptoTrader {
+	return &CryptoTrader{startup: startup}
 }
 
 // runtimeShutdownLifecycle keeps component join callbacks in the trader's
@@ -151,195 +155,28 @@ func (l *runtimeShutdownLifecycle) LeaveCallback() {
 	}
 }
 
-func NewCryptoTrader() *CryptoTrader {
-	return NewCryptoTraderWithBatchState(strat.NewBatchState())
-}
-
-func NewCryptoTraderWith(startup CryptoTraderStartupFunc) *CryptoTrader {
-	trader := NewCryptoTraderWithBatchState(strat.NewBatchState())
-	trader.startup = startup
-	return trader
-}
-
-// NewCryptoTraderWithRuntime binds the trader to a runtime lifecycle and batch state.
-// A nil lifecycle keeps the constructor's private-state behavior.
-func NewCryptoTraderWithRuntime(lifecycle RuntimeLifecycle, batchState *strat.BatchState, startup CryptoTraderStartupFunc) *CryptoTrader {
-	return NewCryptoTraderWithRuntimeState(lifecycle, batchState, nil, startup)
-}
-
-// NewCryptoTraderWithRuntimeState binds the live trader to explicit runtime
-// symbol indexes as well as its lifecycle and batch state.
-func NewCryptoTraderWithRuntimeState(lifecycle RuntimeLifecycle, batchState *strat.BatchState, symbols *orm.SymbolState, startup CryptoTraderStartupFunc) *CryptoTrader {
-	trader := NewCryptoTraderWithBatchAndSymbolState(batchState, symbols)
-	return bindCryptoTraderRuntime(trader, lifecycle, startup)
-}
-
-// NewCryptoTraderWithRuntimeDeps binds lifecycle, typed mutable state, and
-// symbol indexes to an isolated live trader.
-func NewCryptoTraderWithRuntimeDeps(lifecycle RuntimeLifecycle, deps biz.RuntimeDeps, symbols *orm.SymbolState, startup CryptoTraderStartupFunc) *CryptoTrader {
-	resolvedSymbols, symbolsErr := resolveCryptoTraderSymbols(deps.Symbols, symbols, nil)
-	symbols = resolvedSymbols
-	deps.Symbols = symbols
-	trader := &CryptoTrader{Trader: biz.NewTraderWithRuntimeDeps(deps), symbols: symbols}
-	trader.dataDeps = makeDataRuntimeDeps(trader.RuntimeDependencies(), nil, symbols, callbackTracker(lifecycle))
-	trader.runtimeDepsErr = symbolsErr
-	if trader.runtimeDepsErr == nil {
-		trader.runtimeDepsErr = validateDataRuntimeDeps(trader.RuntimeDependencies(), symbols, nil)
+// NewCryptoTraderWithRuntimeDeps binds a live runner to one explicit runtime.
+// The lifecycle and callback barrier must come from the same dependency owner.
+func NewCryptoTraderWithRuntimeDeps(deps biz.RuntimeDeps, startup CryptoTraderStartupFunc) (*CryptoTrader, *errs.Error) {
+	boundTrader, err := biz.NewTraderWithRuntimeDeps(deps)
+	if err != nil {
+		return nil, err
 	}
-	return bindCryptoTraderRuntime(trader, lifecycle, startup)
-}
-
-// NewCryptoTraderWithRuntimeDataDeps is the explicit composition-root entry
-// point. The data dependency set is copied so provider state is fixed at the
-// constructor boundary and does not fall back to package facades.
-func NewCryptoTraderWithRuntimeDataDeps(lifecycle RuntimeLifecycle, deps biz.RuntimeDeps, symbols *orm.SymbolState, startup CryptoTraderStartupFunc, dataDeps *data.RuntimeDeps) *CryptoTrader {
-	var suppliedSymbols *orm.SymbolState
-	if dataDeps != nil {
-		suppliedSymbols = dataDeps.Symbols
+	lifecycle, ok := deps.Callbacks.(RuntimeLifecycle)
+	if !ok {
+		return nil, errs.NewMsg(core.ErrRunTime, "explicit live runtime callback owner must provide its lifecycle")
 	}
-	resolvedSymbols, symbolsErr := resolveCryptoTraderSymbols(deps.Symbols, symbols, suppliedSymbols)
-	symbols = resolvedSymbols
-	deps.Symbols = symbols
-	trader := &CryptoTrader{Trader: biz.NewTraderWithRuntimeDeps(deps), symbols: symbols}
-	trader.dataDeps = makeDataRuntimeDeps(trader.RuntimeDependencies(), dataDeps, symbols, callbackTracker(lifecycle))
-	trader.runtimeDepsErr = symbolsErr
-	if trader.runtimeDepsErr == nil {
-		trader.runtimeDepsErr = validateDataRuntimeDeps(trader.RuntimeDependencies(), symbols, dataDeps)
+	trader := &CryptoTrader{Trader: boundTrader}
+	bound := trader.RuntimeDependencies()
+	if err := validateCryptoTraderRuntimeDeps(bound, bound.Symbols); err != nil {
+		return nil, err
 	}
-	return bindCryptoTraderRuntime(trader, lifecycle, startup)
-}
-
-// resolveCryptoTraderSymbols ensures every constructor argument that can own
-// the symbol catalog refers to the same runtime instance. The first non-nil
-// value is retained; conflicting pointers fail closed instead of being
-// silently overwritten by a later dependency set.
-func resolveCryptoTraderSymbols(depsSymbols, explicitSymbols, suppliedSymbols *orm.SymbolState) (*orm.SymbolState, *errs.Error) {
-	resolved := explicitSymbols
-	if depsSymbols != nil {
-		if resolved != nil && resolved != depsSymbols {
-			return nil, errs.NewMsg(core.ErrRunTime, "trader runtime symbols do not match dependencies")
-		}
-		resolved = depsSymbols
+	trader.symbols = bound.Symbols
+	trader.dataDeps = bound.DataDeps()
+	if trader.dataDeps.IdentityErr != nil {
+		return nil, errs.New(core.ErrRunTime, trader.dataDeps.IdentityErr)
 	}
-	if suppliedSymbols != nil {
-		if resolved != nil && resolved != suppliedSymbols {
-			return nil, errs.NewMsg(core.ErrRunTime, "data runtime symbols do not match trader runtime")
-		}
-		resolved = suppliedSymbols
-	}
-	return resolved, nil
-}
-
-// validateDataRuntimeDeps rejects a second dependency set that points at a
-// different runtime. Catalogs and callback trackers are intentionally omitted:
-// they are provider-local extensions, while the state pointers below must be
-// the same objects used by Trader.
-func validateDataRuntimeDeps(deps *biz.RuntimeDeps, symbols *orm.SymbolState, supplied *data.RuntimeDeps) *errs.Error {
-	if deps == nil || supplied == nil {
-		return nil
-	}
-	if supplied.Core != nil && supplied.Core != deps.Core {
-		return errs.NewMsg(core.ErrRunTime, "data runtime core does not match trader runtime")
-	}
-	if supplied.Clock != nil && supplied.Clock != deps.Clock {
-		return errs.NewMsg(core.ErrRunTime, "data runtime clock does not match trader runtime")
-	}
-	if supplied.Config != nil && supplied.Config != deps.Config {
-		return errs.NewMsg(core.ErrRunTime, "data runtime config does not match trader runtime")
-	}
-	if supplied.Market != nil && supplied.Market != deps.Market {
-		return errs.NewMsg(core.ErrRunTime, "data runtime market does not match trader runtime")
-	}
-	if supplied.Symbols != nil && supplied.Symbols != symbols {
-		return errs.NewMsg(core.ErrRunTime, "data runtime symbols do not match trader runtime")
-	}
-	if supplied.Storage != nil && supplied.Storage != deps.Storage {
-		return errs.NewMsg(core.ErrRunTime, "data runtime storage does not match trader runtime")
-	}
-	if supplied.Strategies != nil && supplied.Strategies != deps.Strategies {
-		return errs.NewMsg(core.ErrRunTime, "data runtime strategies do not match trader runtime")
-	}
-	if supplied.Exchange != nil && supplied.Exchange != deps.Exchange {
-		return errs.NewMsg(core.ErrRunTime, "data runtime exchange does not match trader runtime")
-	}
-	if supplied.Dump != nil && supplied.Dump != deps.Dump {
-		return errs.NewMsg(core.ErrRunTime, "data runtime dump does not match trader runtime")
-	}
-	if supplied.ExchangeName != "" && deps.Core != nil && supplied.ExchangeName != deps.Core.ExgName {
-		return errs.NewMsg(core.ErrRunTime, "data runtime exchange name does not match trader runtime")
-	}
-	if supplied.MarketType != "" && deps.Core != nil && supplied.MarketType != deps.Core.Market {
-		return errs.NewMsg(core.ErrRunTime, "data runtime market type does not match trader runtime")
-	}
-	return nil
-}
-
-func makeDataRuntimeDeps(deps *biz.RuntimeDeps, supplied *data.RuntimeDeps, symbols *orm.SymbolState, trackers ...data.CallbackTracker) *data.RuntimeDeps {
-	if deps == nil {
-		return nil
-	}
-	result := &data.RuntimeDeps{
-		Core:       deps.Core,
-		Clock:      deps.Clock,
-		Config:     deps.Config,
-		Market:     deps.Market,
-		Symbols:    symbols,
-		Storage:    deps.Storage,
-		Strategies: deps.Strategies,
-		Dump:       deps.Dump,
-		Exchange:   deps.Exchange,
-	}
-	if supplied != nil {
-		copyDeps := *supplied
-		if copyDeps.Core != nil {
-			result.Core = copyDeps.Core
-		}
-		if copyDeps.Clock != nil {
-			result.Clock = copyDeps.Clock
-		}
-		if copyDeps.Config != nil {
-			result.Config = copyDeps.Config
-		}
-		if copyDeps.Storage != nil {
-			result.Storage = copyDeps.Storage
-		}
-		if copyDeps.Market != nil {
-			result.Market = copyDeps.Market
-		}
-		if copyDeps.Strategies != nil {
-			result.Strategies = copyDeps.Strategies
-		}
-		if copyDeps.Catalog != nil {
-			result.Catalog = copyDeps.Catalog
-		}
-		if copyDeps.Dump != nil {
-			result.Dump = copyDeps.Dump
-		}
-		if copyDeps.Callbacks != nil {
-			result.Callbacks = copyDeps.Callbacks
-		}
-		if copyDeps.Exchange != nil {
-			result.Exchange = copyDeps.Exchange
-		}
-		if copyDeps.ExchangeName != "" {
-			result.ExchangeName = copyDeps.ExchangeName
-		}
-		if copyDeps.MarketType != "" {
-			result.MarketType = copyDeps.MarketType
-		}
-	}
-	if len(trackers) > 0 && trackers[0] != nil {
-		// The lifecycle owner is the admission barrier. A supplied data tracker
-		// may carry unrelated accounting, but must not replace that barrier.
-		result.Callbacks = trackers[0]
-	}
-	result.Symbols = symbols
-	return result
-}
-
-func callbackTracker(lifecycle RuntimeLifecycle) data.CallbackTracker {
-	tracker, _ := lifecycle.(data.CallbackTracker)
-	return tracker
+	return bindCryptoTraderRuntime(trader, lifecycle, startup), nil
 }
 
 func bindCryptoTraderRuntime(trader *CryptoTrader, lifecycle RuntimeLifecycle, startup CryptoTraderStartupFunc) *CryptoTrader {
@@ -361,31 +198,7 @@ func bindCryptoTraderRuntime(trader *CryptoTrader, lifecycle RuntimeLifecycle, s
 	return trader
 }
 
-// NewCryptoTraderWithBatchState binds the trader to a composition root's
-// batch queue. A nil state creates a private state and never uses LegacyBatchState.
-func NewCryptoTraderWithBatchState(batchState *strat.BatchState) *CryptoTrader {
-	return NewCryptoTraderWithBatchAndSymbolState(batchState, nil)
-}
-
-// NewCryptoTraderWithBatchAndSymbolState binds the trader to explicit mutable
-// runtime state. A nil symbol state preserves the legacy facade.
-func NewCryptoTraderWithBatchAndSymbolState(batchState *strat.BatchState, symbols *orm.SymbolState) *CryptoTrader {
-	if batchState == nil {
-		batchState = strat.NewBatchState()
-	}
-	if symbols != nil {
-		return &CryptoTrader{
-			Trader:  biz.NewTraderWithRuntimeDeps(biz.RuntimeDeps{Batch: batchState, Symbols: symbols}),
-			symbols: symbols,
-		}
-	}
-	return &CryptoTrader{Trader: biz.NewTrader(batchState), symbols: symbols}
-}
-
 func (t *CryptoTrader) Init() *errs.Error {
-	if t.runtimeDepsErr != nil {
-		return t.runtimeDepsErr
-	}
 	if deps := t.RuntimeDependencies(); deps != nil && t.runtime == nil {
 		return errs.NewMsg(core.ErrRunTime, "explicit live runtime requires a lifecycle")
 	}
@@ -527,7 +340,7 @@ func (t *CryptoTrader) Init() *errs.Error {
 			exgName, market := t.marketIdentity()
 			err2 := dp.UnWatchJobs(exgName, market, msgType, pairs)
 			if err2 != nil {
-				log.Error("UnWatchJobs fail", zap.String("type", msgType), zap.Error(err2))
+				t.Logger().Error("UnWatchJobs fail", zap.String("type", msgType), zap.Error(err2))
 			}
 		}
 	}
@@ -546,33 +359,9 @@ func validateCryptoTraderRuntimeDeps(deps *biz.RuntimeDeps, symbols *orm.SymbolS
 	if deps == nil {
 		return nil
 	}
-	missing := make([]string, 0, 8)
-	if deps.Core == nil {
-		missing = append(missing, "core")
-	}
-	if deps.Clock == nil {
-		missing = append(missing, "clock")
-	}
-	if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
-		missing = append(missing, "strategy state")
-	}
-	if deps.Orders == nil {
-		missing = append(missing, "order state")
-	}
-	if deps.Trading == nil {
-		missing = append(missing, "trading state")
-	}
-	if symbols == nil {
-		missing = append(missing, "symbol state")
-	}
+	_ = symbols
 	if deps.Exchange == nil {
-		missing = append(missing, "exchange")
-	}
-	if deps.Config == nil || deps.Config.View() == nil {
-		missing = append(missing, "config")
-	}
-	if len(missing) > 0 {
-		return errs.NewMsg(core.ErrRunTime, "explicit live runtime requires %s", strings.Join(missing, ", "))
+		return errs.NewMsg(core.ErrRunTime, "explicit live runtime requires exchange")
 	}
 	return nil
 }
@@ -594,14 +383,8 @@ func (t *CryptoTrader) refreshPairJobs(isFirst bool) *errs.Error {
 	if t == nil {
 		return errs.NewMsg(core.ErrRunTime, "crypto trader is required")
 	}
-	state := t.coreStateForRun()
-	if state == nil {
-		if t.symbols != nil || t.dataDeps != nil {
-			return errs.NewMsg(core.ErrBadConfig,
-				"explicit live pair refresh requires complete runtime dependencies")
-		}
-		// Preserve the public legacy path for callers that have no Runtime.
-		return opt.RefreshPairJobsWithSymbolState(t.provider(), t.symbols, true, isFirst, nil)
+	if t.coreStateForRun() == nil || t.RuntimeDependencies() == nil {
+		return errs.NewMsg(core.ErrRunTime, "live pair refresh requires explicit runtime dependencies")
 	}
 	var clock *btime.ClockState
 	if t.dataDeps != nil {
@@ -616,22 +399,12 @@ func (t *CryptoTrader) refreshPairJobs(isFirst bool) *errs.Error {
 }
 
 func (t *CryptoTrader) startWebAPI() *errs.Error {
-	// The current Web API handlers are legacy process-global handlers. Starting
-	// them from an explicit Runtime would expose another runtime's config,
-	// strategy registry, orders, and storage, so the explicit runner leaves the
-	// legacy API disabled until the handlers receive typed dependencies.
-	if t.RuntimeDependencies() != nil {
-		if deps := t.RuntimeDependencies(); deps != nil {
-			if cfg := deps.ConfigView(); cfg != nil && cfg.APIServer != nil && cfg.APIServer.Enable {
-				return errs.NewMsg(core.ErrRunTime, "api_server.enable is not supported by an explicit runtime yet")
-			}
-		}
-		return nil
+	if deps := t.RuntimeDependencies(); deps != nil {
+		var err *errs.Error
+		t.apiServer, err = web.StartApiWithRuntimeDeps(&runtimeShutdownLifecycle{owner: t}, *deps)
+		return err
 	}
-	if t.runtime != nil {
-		return webStartAPIWithLifecycle(&runtimeShutdownLifecycle{owner: t})
-	}
-	return web.StartApiInLegacySession()
+	return web.StartApi()
 }
 
 func (t *CryptoTrader) initOdMgr() *errs.Error {
@@ -689,21 +462,23 @@ func (t *CryptoTrader) initOdMgr() *errs.Error {
 		if err != nil {
 			return err
 		}
-		var orders *ormo.OrderState
 		if deps != nil {
-			orders = deps.Orders
+			openOds, lock := deps.Orders.GetOpenODs(account)
+			lock.Lock()
+			msg := fmt.Sprintf("orders: %d restored, %d deleted, %d added, %d opened", len(oldList), len(delList), len(newList), len(openOds))
+			lock.Unlock()
+			sendRuntimeMessage(deps, map[string]interface{}{
+				"type": rpc.MsgTypeStatus, "account": account, "status": msg,
+			})
 		} else {
-			orders = ormo.LegacyState()
+			openOds, lock := ormo.GetOpenODs(account)
+			lock.Lock()
+			msg := fmt.Sprintf("orders: %d restored, %d deleted, %d added, %d opened", len(oldList), len(delList), len(newList), len(openOds))
+			lock.Unlock()
+			sendRuntimeMessage(nil, map[string]interface{}{
+				"type": rpc.MsgTypeStatus, "account": account, "status": msg,
+			})
 		}
-		openOds, lock := orders.GetOpenODs(account)
-		lock.Lock()
-		msg := fmt.Sprintf("orders: %d restored, %d deleted, %d added, %d opened", len(oldList), len(delList), len(newList), len(openOds))
-		lock.Unlock()
-		sendRuntimeMessage(deps, map[string]interface{}{
-			"type":    rpc.MsgTypeStatus,
-			"account": account,
-			"status":  msg,
-		})
 	}
 	return nil
 }
@@ -972,7 +747,7 @@ func (t *CryptoTrader) FeedDataSeries(evt *orm.DataSeries) {
 	}
 	defer t.endRuntimeCallback()
 	if err := t.feedDataSeries(evt); err != nil {
-		log.Error("handle data series fail", zap.Int32("sid", evt.Sid), zap.Error(err))
+		t.Logger().Error("handle data series fail", zap.Int32("sid", evt.Sid), zap.Error(err))
 	}
 }
 
@@ -983,6 +758,9 @@ func (t *CryptoTrader) feedDataSeries(evt *orm.DataSeries) *errs.Error {
 	exs, errSymbol := t.Trader.ResolveDataSeriesSymbol(evt)
 	if errSymbol != nil {
 		return errSymbol
+	}
+	if t.apiServer != nil && !evt.IsWarmUp {
+		t.apiServer.PublishSeries(&data.SeriesMsg{ExgName: exs.Exchange, Market: exs.Market, Pair: exs.Symbol, NotifySeries: data.NotifySeries{TFSecs: int((evt.EndMS - evt.TimeMS) / 1000), Rows: []*orm.DataSeries{evt}}})
 	}
 	view, errView := evt.OHLCV(exs)
 	if errView != nil {
@@ -1096,7 +874,7 @@ func (t *CryptoTrader) handleWarmupSeries(view *orm.SeriesOHLCV) {
 			waitNum = biz.TryFireBatchesWithState(batchState, execMS, view.IsWarmUp)
 		}
 		if waitNum > 0 {
-			log.Warn(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
+			t.Logger().Warn(fmt.Sprintf("batch job exec fail, wait: %v", waitNum))
 		}
 		batchState.SetLastBatchMS(barEndMS)
 	}
@@ -1195,7 +973,7 @@ func (t *CryptoTrader) runDelayedBatch() {
 		if deps := t.RuntimeDependencies(); deps != nil {
 			if deps.Dump != nil {
 				if err := deps.Dump.Flush(); err != nil {
-					log.Error("flush runtime dump fail", zap.Error(err))
+					t.Logger().Error("flush runtime dump fail", zap.Error(err))
 				}
 			}
 		} else {
@@ -1457,19 +1235,11 @@ func (t *CryptoTrader) prepareRunCleanup() {
 	if t == nil {
 		return
 	}
-	var backup *biz.VarsBackup
-	if t.runtime == nil && t.RuntimeDependencies() == nil {
-		backup = biz.BackupVars()
-	}
 	t.shutdownLock.Lock()
 	t.shutdownReady = true
 	t.cleanupDone = false
 	t.shutdownJoins = nil
 	t.shutdownStops = nil
-	t.legacyBackup = backup
-	if backup != nil {
-		t.previousUnWatch = strat.WsSubUnWatch
-	}
 	t.shutdownLock.Unlock()
 }
 
@@ -1512,7 +1282,6 @@ func (t *CryptoTrader) finishRunCleanup() {
 		return
 	}
 	t.cleanupDone = true
-	backup := t.legacyBackup
 	previousUnWatch := t.previousUnWatch
 	t.shutdownLock.Unlock()
 
@@ -1528,9 +1297,6 @@ func (t *CryptoTrader) finishRunCleanup() {
 		deps.Strategies.SetWsSubUnWatch(nil)
 	} else {
 		strat.WsSubUnWatch = previousUnWatch
-	}
-	if backup != nil {
-		biz.RestoreVars(backup)
 	}
 }
 
@@ -1694,9 +1460,6 @@ func (t *CryptoTrader) schedulerForRun() com.Scheduler {
 	if t == nil {
 		return nil
 	}
-	if t.runtime == nil && t.RuntimeDependencies() == nil {
-		return legacyScheduler(nil)
-	}
 	return t.scheduler
 }
 
@@ -1752,7 +1515,7 @@ func (t *CryptoTrader) startJobs() {
 	}
 	deps := t.RuntimeDependencies()
 	if deps != nil && t.runtime == nil {
-		log.Error("explicit live runtime jobs require a lifecycle")
+		t.Logger().Error("explicit live runtime jobs require a lifecycle")
 		return
 	}
 	if t.envReal() {
@@ -1797,42 +1560,22 @@ func (t *CryptoTrader) startJobs() {
 			}
 			cronDumpStratOutputsWithRuntime(scheduler, deps.Strategies, cfg, dataDir)
 		}
-	} else {
-		cronRefreshPairs(scheduler, dp, t.symbols, cronRefresh)
-		// 定时加载1h及以上周期K线
-		fetchHourKlines(scheduler, dp, t.symbols)
-		// Refresh the market regularly
-		cronLoadMarkets(scheduler)
-		// Check every 5 minutes to see if the global stop loss is triggered
-		cronFatalLossCheck(scheduler)
-		// Regularly check the candlestick timeout, updated every minute
-		cronKlineDelays(scheduler, dp, t.pairCopiedStateForRun(), t.currentTimeMS)
-		// The timer output is executed every 5 minutes: 01:30 06:30 11:30
-		cronKlineSummary(scheduler)
-		// 每分钟定时输出策略Outputs信息到BanDataDir/logs/[name]_[strat].log
-		cronDumpStratOutputs(scheduler)
 	}
-	// 实盘中定期回测对比
 	if deps != nil {
+		// 实盘中定期回测对比
 		cronBacktestInLiveWithRuntime(scheduler, *deps)
-	} else {
-		cronBacktestInLive(scheduler)
 	}
 	if t.envReal() {
 		// Check if the limit order submission is triggered at 15th secs of every minute
 		// 每分钟第15s检查是否触发限价单提交
 		if deps != nil {
 			cronCheckTriggerOdsWithRuntime(scheduler, *deps)
-		} else {
-			cronCheckTriggerOds(scheduler)
 		}
 		// Regularly update balance and synchronize exchange positions with local orders
 		// 定期更新余额，同步交易所持仓到本地订单
 		if deps != nil {
 			lifecycle := &runtimeShutdownLifecycle{owner: t}
 			StartLoopBalancePositionsWithRuntime(lifecycle, *deps)
-		} else if deps == nil {
-			StartLoopBalancePositions()
 		}
 		// 定期保存实盘钱包快照
 		if deps != nil {
@@ -1885,6 +1628,10 @@ func exitCleanUpWithExchange(scheduler com.Scheduler, exchange banexg.BanExchang
 }
 
 func exitCleanUpWithRuntime(scheduler com.Scheduler, exchange banexg.BanExchange, strategyState *strat.State, deps *biz.RuntimeDeps) {
+	logger := log.L()
+	if deps != nil {
+		logger = deps.Logger()
+	}
 	if scheduler != nil {
 		if stop := scheduler.Stop(); stop != nil {
 			<-stop.Done()
@@ -1894,18 +1641,18 @@ func exitCleanUpWithRuntime(scheduler com.Scheduler, exchange banexg.BanExchange
 		orm.FlushDumps()
 		orm.CloseDump()
 	}
-	var err *errs.Error
+	var cleanupErr *errs.Error
 	if deps != nil {
-		err = biz.CleanUpOdMgrWithState(deps.Trading)
+		cleanupErr = biz.CleanUpOdMgrWithState(deps.Trading)
 	} else {
-		err = biz.CleanUpOdMgr()
+		cleanupErr = biz.CleanUpOdMgr()
 	}
-	if err != nil {
-		log.Error("clean odMgr fail", zap.Error(err))
+	if cleanupErr != nil {
+		logger.Error("clean odMgr fail", zap.Error(cleanupErr))
 	}
 	if deps != nil && deps.Dump != nil {
 		if dumpErr := deps.Dump.Flush(); dumpErr != nil {
-			log.Error("flush runtime dump fail", zap.Error(dumpErr))
+			deps.Logger().Error("flush runtime dump fail", zap.Error(dumpErr))
 		}
 	}
 	if deps == nil {
@@ -1914,28 +1661,30 @@ func exitCleanUpWithRuntime(scheduler com.Scheduler, exchange banexg.BanExchange
 		strat.ExitStratJobsWithState(strategyState)
 	}
 	if deps == nil && exchange != nil {
-		err = exchange.Close()
-	}
-	if err != nil {
-		log.Error("close exg fail", zap.Error(err))
+		if closeErr := exchange.Close(); closeErr != nil {
+			logger.Error("close exg fail", zap.Error(closeErr))
+		}
 	}
 	var accounts map[string]*config.AccountConfig
-	var orders *ormo.OrderState
 	if deps != nil {
 		accounts = deps.AccountConfigs()
-		orders = deps.Orders
 	} else {
 		accounts = config.Accounts
-		orders = ormo.LegacyState()
 	}
 	for account, cfg := range accounts {
 		if cfg == nil || cfg.NoTrade {
 			continue
 		}
-		if orders == nil {
-			continue
+		var openOds map[int64]*ormo.InOutOrder
+		var lock *deadlock.Mutex
+		if deps != nil {
+			if deps.Orders == nil {
+				continue
+			}
+			openOds, lock = deps.Orders.GetOpenODs(account)
+		} else {
+			openOds, lock = ormo.GetOpenODs(account)
 		}
-		openOds, lock := orders.GetOpenODs(account)
 		lock.Lock()
 		openNum := len(openOds)
 		lock.Unlock()

@@ -218,7 +218,6 @@ func (provider runtimeWalletInfoProvider) GetSummary(account string) (float64, f
 }
 
 func NewRuntimeNotifications(deps RuntimeDeps) *rpc.Session {
-	deps.Accounts = normalizeRuntimeAccounts(deps)
 	session := rpc.NewSession(deps.Config, deps.Accounts)
 	session.Core, session.Clock = deps.Core, deps.Clock
 	session.Orders = NewTelegramOrderManagerWithRuntimeDeps(deps)

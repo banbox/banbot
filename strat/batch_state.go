@@ -227,18 +227,6 @@ func (s *BatchState) Reset() {
 	s.restore(make(map[string]*BatchMap), 0)
 }
 
-// BackupLegacyBatchState keeps the old shallow backup semantics for BackupVars only.
-func BackupLegacyBatchState() (map[string]*BatchMap, int64) {
-	legacyBatchState.lock.Lock()
-	defer legacyBatchState.lock.Unlock()
-	return legacyBatchState.tasks, legacyBatchState.lastMS.Load()
-}
-
-// RestoreLegacyBatchState restores a snapshot produced by BackupLegacyBatchState.
-func RestoreLegacyBatchState(tasks map[string]*BatchMap, lastMS int64) {
-	legacyBatchState.restore(tasks, lastMS)
-}
-
 func sortedBatchKeys(tasks map[string]*BatchMap) []string {
 	keys := make([]string, 0, len(tasks))
 	for key := range tasks {

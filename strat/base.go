@@ -19,7 +19,6 @@ import (
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"github.com/banbox/banexg/log"
 	ta "github.com/banbox/banta"
 	"go.uber.org/zap"
 )
@@ -280,7 +279,7 @@ func (s *StratJob) OpenOrder(req *EnterReq) *errs.Error {
 	err := s.openOrder(req)
 	if err != nil && q != nil {
 		fields := append(q.GetZapFields(s), zap.String("err", err.Short()))
-		log.Warn("OpenOrder fail", fields...)
+		s.runtimeCore.Log().Warn("OpenOrder fail", fields...)
 	}
 	return err
 }
@@ -301,7 +300,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	}
 	if !s.CanOpen(req.Short) {
 		if isLiveMode {
-			log.Warn("open order disabled",
+			s.runtimeCore.Log().Warn("open order disabled",
 				zap.String("strategy", s.Strat.Name),
 				zap.String("pair", symbol),
 				zap.String("tag", req.Tag),
@@ -390,7 +389,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		if avgVol > 0 && reqAmt/avgVol > openVolRate {
 			req.LegalCost = avgVol * openVolRate * enterPrice
 			if isLiveMode {
-				log.Info(fmt.Sprintf("%v open amt rate: %.1f > open_vol_rate(%.1f), cut to cost: %.1f",
+				s.runtimeCore.Log().Info(fmt.Sprintf("%v open amt rate: %.1f > open_vol_rate(%.1f), cut to cost: %.1f",
 					symbol, reqAmt/avgVol, openVolRate, req.LegalCost))
 			}
 		}
@@ -439,7 +438,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 			}
 			req.StopLoss = curSLPrice
 		} else if isLiveMode {
-			log.Warn("stopLoss disabled",
+			s.runtimeCore.Log().Warn("stopLoss disabled",
 				zap.String("strategy", s.Strat.Name),
 				zap.String("pair", symbol))
 		}
@@ -475,7 +474,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 			}
 			req.TakeProfit = curTPPrice
 		} else if isLiveMode {
-			log.Warn("takeProfit disabled", zap.String("stagy", s.Strat.Name), zap.String("pair", symbol))
+			s.runtimeCore.Log().Warn("takeProfit disabled", zap.String("stagy", s.Strat.Name), zap.String("pair", symbol))
 		}
 	}
 	if req.Limit > 0 && req.OrderType == 0 {
@@ -500,7 +499,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	}
 	if s.enqueueEntry(req) {
 		if isLiveMode {
-			log.Info("OpenOrder", req.GetZapFields(s)...)
+			s.runtimeCore.Log().Info("OpenOrder", req.GetZapFields(s)...)
 		}
 	}
 	return nil
@@ -537,7 +536,7 @@ func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error {
 	err := s.closeOrders(req)
 	if err != nil && q != nil {
 		fields := append(q.GetZapFields(s), zap.String("err", err.Short()))
-		log.Warn("CloseOrders fail", fields...)
+		s.runtimeCore.Log().Warn("CloseOrders fail", fields...)
 	}
 	return err
 }
@@ -554,7 +553,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 	}
 	dirtBoth := req.Dirt == core.OdDirtBoth
 	if !s.CloseShort && (dirtBoth || req.Dirt == core.OdDirtShort) || !s.CloseLong && (dirtBoth || req.Dirt == core.OdDirtLong) {
-		log.Warn("close order disabled",
+		s.runtimeCore.Log().Warn("close order disabled",
 			zap.String("strategy", s.Strat.Name),
 			zap.String("pair", s.Symbol.Symbol),
 			zap.String("tag", req.Tag),
@@ -636,7 +635,7 @@ func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
 	}
 	if s.enqueueExit(req) {
 		if s.runtimeLive() {
-			log.Info("CloseOrders", req.GetZapFields(s)...)
+			s.runtimeCore.Log().Info("CloseOrders", req.GetZapFields(s)...)
 		}
 	}
 	return nil
@@ -878,7 +877,7 @@ func (s *StratJob) GetTmpEnv(stamp int64, o, h, l, c, v, quote, buyVolume float6
 		state := s.strategyState
 		state.ensureMaps()
 		state.tmpEnvLock.Lock()
-		tmpEnvs = state.TmpEnvs
+		tmpEnvs = state.tmpEnvs
 		e, ok := tmpEnvs[envKey]
 		if !ok {
 			e = s.Env.Clone()
@@ -903,7 +902,7 @@ func (s *StratJob) GetTmpEnv(stamp int64, o, h, l, c, v, quote, buyVolume float6
 			if s.strategyState != nil && s.strategyState != legacyState {
 				state := s.strategyState
 				state.tmpEnvLock.Lock()
-				state.TmpEnvs[envKey] = e
+				state.tmpEnvs[envKey] = e
 				state.tmpEnvLock.Unlock()
 			} else {
 				lockTmpEnv.Lock()

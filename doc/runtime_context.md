@@ -2,6 +2,8 @@
 
 本文记录当前工作树已经实现的性能优先 `Process -> Runtime` 架构。它描述现状：High/Medium 的主要修复已落地，但不把 typed state、legacy gate 或局部双实例测试解释为完整的多 Runtime 业务并发隔离。
 
+剩余 legacy 边界集中于 spider、数据维护、旧 dev Web 与维护工具；因此 LegacyState/legacygate 还保留，不能宣称全部全局状态已删除。本文原有描述与新实施记录冲突时，以实施记录及当前源码为准。
+
 ## 1. 核心结论
 
 - `runctx.Key[T]` 和 btime Context helper 已删除。当前没有调用方需要通用 typed Context key；保留它会鼓励动态 service locator 和热路径查找。
@@ -44,12 +46,12 @@ registry 首次接管已有 `exsymbol_q` catalog 时，新增逻辑 symbol 会�
 
 ## 3. Legacy gate
 
-[`runtime.WithLegacy`/`LockLegacy`](../runtime/legacy.go) 使用同一个进程级互斥量，保护仍会安装、重置或恢复 package globals 的完整调用链。
+[`runtime.WithLegacy`/`LockLegacy`](../runtime/legacy.go) 使用同一个进程级互斥量，保护仍会使用或安装 package globals 的兼容调用链。
 
 当前覆盖范围：
 
-- legacy entry runner/API：backtest、trade；显式 Cobra `backtest`/`trade` 走独立 Runtime session，不获取该 gate；
-- entry 数据路径：data download、repair/verify/correct/adjust、series download、spider、load、aggregate、init、import、export，以及同类通过 `runConfigCommand` 执行的配置型命令；
+- backtest、trade、优化与报告入口已走显式 Runtime，不获取该 gate；旧 dev Web/API 与维护工具仍需兼容 gate；
+- entry 数据路径：repair/verify/correct/adjust、series download、spider、load、aggregate、init、import、export，以及同类通过 `runConfigCommand` 执行的配置型命令；
 - [`runtimeplan.Inspect`](../runtimeplan/inspect.go)，因为它仍临时安装并恢复 `config`、`core` 和 `btime` 状态。
 
 Cobra 的 legacy 配置型命令在 `runConfigCommand` 外层取得 gate，内部调用不加锁的 helper，避免同一 goroutine 重入互斥量；直接导出的 legacy entry API 则由各自 wrapper 取得同一 gate。显式 Cobra runner 通过 `openExplicitEntrySession` 创建自己的 Process、Storage、Exchange、Config 和 Runtime，不要求 `LegacySession`。一次显式 backtest/trade session 内创建一个 `Process`，该 session 内的 Runtime 共享 SID allocator；仍使用 legacy facade 的 session 继续串行化。
@@ -88,19 +90,13 @@ exsymbol pending marker 在原子 rename 发布后同步 recovery 目录。后�
 
 ## 7. Runtime runner 已消费与剩余边界
 
-entry 将 `rt.Core`、`rt.Clock`、`rt.Market`、`rt.Batch` 组成 `biz.RuntimeDeps`，并把 `rt.Symbols` 单独传给显式 backtest/live runner。当前直接消费如下：
+entry 的 trade/backtest/optimize/bt-opt/sim-bt/test-pickers/collect-opt/bt-result/bt-factor 均接入显式状态；优化工厂负责每轮创建和释放 Runtime，报告不临时安装任何全局状态。构造 API、订单事件时间、logger 和 registry 的迁移说明见实施记录。
 
-| typed dependency | runner 当前使用 |
-| --- | --- |
-| `Core` | live/backtest mode、env、`BotRunning`、`ParallelOnBar`、`OrderMatchTfs`、wallet check 标志 |
-| `Clock` | backtest event 时间推进、刷新时间和 live 时间读取 |
-| `Market` | bar price 写入与 Runtime 内价格查询状态 |
-| `Batch` | batch task、触发和 `LastBatchMS` |
-| `Symbols` | provider/feeder symbol lookup、pair refresh、watcher 与附加数据订阅 |
+`biz.RuntimeDeps.DataDeps()` 是统一数据依赖投影。Symbols、Storage、Catalog、Callbacks 和时钟跟随同一 owner；relay 使用私有核心、策略、订单和交易状态，借用父任务的外部资源。runner 不再提供部分状态/legacy 构造变体。
 
-`Runtime.Config` 已有实例所有权，但 runner 大量业务代码仍直接读取 legacy `config` globals。以下仍是 gate 下的串行边界：策略 `Envs`、`AccJobs`、`PairStrats`、hooks 和可变策略实例；jobs refresh/cache；订单管理器、open orders、钱包和 relay snapshot；交易所默认 session；ORM `pool`、`IsQuestDB`、范围/compact/dump 状态；以及仍使用 package facade 的 rpc、web、data、goods、opt/live 工具。
+显式 live 的 HTTP/API/auth 和 WebSocket 使用实例状态，WebSocket 慢客户端的监控发送有界且不阻塞交易循环；关闭等待所有接纳的 handler/writer 后完成。回调、provider、调度器的 stop/join 保护仍保留。
 
-显式 runner 已绕过 legacy gate，但仍有上述未迁移 facade；当前测试已验证 typed runner 的局部并发、取消和串行基线隔离，真实数据库/生产服务参与的两个完整 backtest/live runner 并发 E2E 仍待环境验收。
+尚在 legacy gate 内的是真实维护入口，包括 spider、数据/K线维护、旧 dev Web 与维护工具。这些仍需要逐入口迁移，随后才能删除 LegacyState 和对应 facade。当前代码及测试不能作为两个真实生产数据库 runner 并行 E2E 的替代证据。
 
 ## 8. Context 约束
 
@@ -108,7 +104,7 @@ Runtime context 用于取消树、deadline、startup/第三方数据源调用、
 
 ORM series table 的重入锁标记已从 `context.WithValue`/`Context.Value` 删除。repo 方法在需要时显式取得 process/table lock，并在同一方法边界释放；嵌套的 locked helper 只接受调用方已经建立的边界，不从 Context 推断状态。仓库其他独立功能若使用 Context 元数据，不代表 Runtime/ORM 可以恢复 service locator 模式。
 
-## 9. 决策与验证证据
+## 9. 既有设计决策与历史验证证据（本次验证见实施记录）
 
 - `Key[T]`：删除，无 alias、wrapper 或兼容层。
 - `banexg`：固定 `github.com/banbox/banexg v0.2.64`，`go.mod` 无本机绝对路径 replace，模块可从 Go proxy 下载。
@@ -124,7 +120,7 @@ ORM series table 的重入锁标记已从 `context.WithValue`/`Context.Value` �
 ## 10. 剩余风险
 
 - legacy globals 仍覆盖策略、jobs、订单、钱包、交易所 session、ORM pool 和若干后台 worker；gate 是当前正确性边界，也是并发能力限制。
-- live cron、订单/钱包循环、Web/RPC 与第三方组件尚未全部纳入 Runtime-owned stop/join；当前 reset 顺序只对已接线 runner 路径成立。
+- 生产 typed live 的主要 cron、订单/钱包循环与 Web 已接入实例生命周期；仍应对外部组件和自定义嵌入路径验证 stop/join，不能推断任意外部 goroutine 都自动归属 Runtime。
 - 未配置 registry 时，Process 内 allocator 和本地 lease 只协调同一主机的 single-writer；配置 registry 后 PostgreSQL 的 sequence/unique key 才是跨进程 SID 协调边界。
 - QuestDB snapshot 通过 schema、每 SID 行数和样本验证，不是逐单元格全表校验；WAL timeout、rename 中断和 backup 恢复仍需运维可见性。
 - 最终多 Runtime 并发承诺仍需迁移剩余 globals、删除临时全局安装，完成两个完整 runner 的确定性并发/取消/结果一致性验证，并持续运行全量测试和稳定 benchmark 对比。

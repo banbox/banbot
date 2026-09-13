@@ -112,7 +112,7 @@ func (r *WsSubJobRegistry) Refresh() {
 	var jobs map[string]map[string]map[*StratJob]bool
 	if r.state != nil {
 		r.state.ensureMaps()
-		jobs = r.state.WsSubJobs
+		jobs = r.state.wsSubJobs
 	} else {
 		jobs = WsSubJobs
 	}

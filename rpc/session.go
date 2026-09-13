@@ -11,7 +11,6 @@ import (
 	"github.com/banbox/banbot/core"
 	utils2 "github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
-	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
 )
@@ -89,7 +88,7 @@ func (s *Session) SendMsg(msg map[string]interface{}) {
 		return
 	}
 	if err := s.Start(); err != nil {
-		log.Error("start runtime notifications", zap.Error(err))
+		s.Core.Log().Error("start runtime notifications", zap.Error(err))
 		return
 	}
 	s.mu.RLock()

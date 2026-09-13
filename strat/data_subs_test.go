@@ -8,6 +8,7 @@ import (
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banexg"
 )
 
 func TestCollectDataSubsExplicitStateCanonicalizesSymbols(t *testing.T) {
@@ -214,5 +215,25 @@ func TestWsSubJobRegistriesIsolateRuntimeStates(t *testing.T) {
 	}
 	if pairs := registryB.Pairs(core.WsSubTrade); len(pairs) != 1 || pairs[0] != "ETH/USDT" {
 		t.Fatalf("runtime B pairs after rotation = %v, want ETH/USDT", pairs)
+	}
+}
+
+func TestRegisterWsJobPublishesRuntimeRegistry(t *testing.T) {
+	state := NewState()
+	job := &StratJob{
+		Symbol: &orm.ExSymbol{Symbol: "BTC/USDT"},
+		Strat: &TradeStrat{
+			WsSubs:     map[string]string{core.WsSubTrade: "_cur_"},
+			OnWsTrades: func(*StratJob, string, []*banexg.Trade) {},
+		},
+	}
+	if err := RegisterWsJob(state, job); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWsSubJobRegistryWithState(state, nil)
+	var got []*StratJob
+	registry.ForEach(core.WsSubTrade, "BTC/USDT", func(item *StratJob) { got = append(got, item) })
+	if len(got) != 1 || got[0] != job {
+		t.Fatalf("registered websocket jobs = %v, want supplied job", got)
 	}
 }

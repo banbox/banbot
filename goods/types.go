@@ -1,6 +1,8 @@
 package goods
 
 import (
+	"sync"
+
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -155,6 +157,7 @@ type FilterFactory func(base BaseFilter) IFilter
 
 // FilterRegistry holds all registered filter factories
 var filterRegistry = make(map[string]FilterFactory)
+var filterRegistryMu sync.RWMutex
 
 // RegisterFilter registers a custom filter factory with the given name
 // This allows users to create and register their own filters
@@ -176,21 +179,34 @@ var filterRegistry = make(map[string]FilterFactory)
 //	    })
 //	}
 func RegisterFilter(name string, factory FilterFactory) {
+	if name == "" {
+		panic("filter name must not be empty")
+	}
+	if factory == nil {
+		panic("filter factory must not be nil")
+	}
+	filterRegistryMu.Lock()
 	filterRegistry[name] = factory
+	filterRegistryMu.Unlock()
 }
 
 // GetFilterFactory returns the factory function for a given filter name
 func GetFilterFactory(name string) (FilterFactory, bool) {
+	filterRegistryMu.RLock()
 	factory, ok := filterRegistry[name]
+	filterRegistryMu.RUnlock()
 	return factory, ok
 }
 
 // CreateFilter creates a filter instance from config using the registry
 func CreateFilter(cfg *config.CommonPairFilter, allowEmpty bool) (IFilter, *errs.Error) {
+	if cfg == nil {
+		return nil, errs.NewMsg(errs.CodeParamRequired, "filter config is required")
+	}
 	base := BaseFilter{Name: cfg.Name, AllowEmpty: allowEmpty}
 
 	// Try to get from registry first
-	if factory, ok := filterRegistry[cfg.Name]; ok {
+	if factory, ok := GetFilterFactory(cfg.Name); ok {
 		filter := factory(base)
 		err := mapstructure.Decode(cfg.Items, &filter)
 		if err != nil {

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/banbox/banbot/internal/testutil"
 )
 
 func TestEnsureExSymbolRejectsIncompleteIdentity(t *testing.T) {
@@ -37,6 +39,7 @@ func TestEnsureExSymbolRejectsIncompleteIdentity(t *testing.T) {
 }
 
 func TestEnsureExSymbolReusesSyntheticIdentity(t *testing.T) {
+	testutil.RequireIntegration(t)
 	if err := initApp(); err != nil {
 		t.Fatalf("initApp failed: %v", err)
 	}

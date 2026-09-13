@@ -2,19 +2,14 @@ package dev
 
 import (
 	"fmt"
-	"github.com/sasha-s/go-deadlock"
-	"os"
 
-	"github.com/banbox/banbot/btime"
+	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/utils"
 	utils2 "github.com/banbox/banexg/utils"
 
-	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/exg"
-	"github.com/banbox/banbot/legacygate"
-	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/web/base"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -28,8 +23,6 @@ type DataToolsManager struct {
 	running    bool
 	runningMux deadlock.Mutex
 }
-
-type FnDataTool = func(args *DataToolsArgs, pBar *utils.StagedPrg) *errs.Error
 
 type DataToolsArgs struct {
 	Action      string `json:"action" validate:"required"`
@@ -47,16 +40,13 @@ type DataToolsArgs struct {
 	Config      string   `json:"config"`
 }
 
-var (
-	dataToolsMgr = &DataToolsManager{}
-	validActions = map[string]bool{
-		"download": true,
-		"export":   true,
-		"import":   true,
-		"purge":    true,
-		"correct":  true,
-	}
-)
+var validActions = map[string]bool{
+	"download": true,
+	"export":   true,
+	"import":   true,
+	"purge":    true,
+	"correct":  true,
+}
 
 // StartTask 开始一个任务
 func (m *DataToolsManager) StartTask() error {
@@ -77,187 +67,38 @@ func (m *DataToolsManager) EndTask() {
 	m.runningMux.Unlock()
 }
 
-// RunDataTools 执行数据工具任务
-func RunDataTools(args *DataToolsArgs) *errs.Error {
-	return legacygate.With(func() *errs.Error {
-		return runDataTools(args)
-	})
-}
-
-func runDataTools(args *DataToolsArgs) *errs.Error {
-	switch args.Action {
-	case "download":
-		return runDataTask(runDownloadData, args, []string{"downKline"}, []float64{1})
-	case "export":
-		return runDataTask(runExportData, args, []string{"holes", "kline"}, []float64{1, 5})
-	case "import":
-		return runDataTask(runImportData, args, []string{"kline", "range"}, []float64{3, 1})
-	case "purge":
-		return runDataTask(runPurgeData, args, []string{"purge"}, []float64{1})
-	case "correct":
-		return runDataTask(runCorrectData, args, []string{"syncTFs"}, []float64{1})
-	default:
-		return errs.NewMsg(errs.CodeParamInvalid, "invalid action")
+func (s *DevServer) runDataTools(deps *data.RuntimeDeps, args *DataToolsArgs) *errs.Error {
+	if s.maintenance == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "dev server maintenance runner is required")
 	}
-}
-
-func runDataTask(fn FnDataTool, args *DataToolsArgs, tasks []string, weights []float64) *errs.Error {
+	tasks, weights := dataToolProgress(args.Action)
 	pBar := utils.NewStagedPrg(tasks, weights)
 	pBar.AddTrigger("", func(task string, progress float64) {
-		BroadcastWS("", map[string]interface{}{
-			"type":     "heavyPrg",
-			"name":     task,
-			"progress": progress,
-		})
+		s.BroadcastWS("", map[string]interface{}{"type": "heavyPrg", "name": task, "progress": progress})
 	})
-	return fn(args, pBar)
+	return s.maintenance(s.ctx, deps, args, pBar)
 }
 
-// runDownloadData 下载数据
-func runDownloadData(args *DataToolsArgs, pBar *utils.StagedPrg) *errs.Error {
-	exsMap := make(map[int32]*orm.ExSymbol)
-	exchange, err := exg.GetWith(args.Exchange, args.Market, "")
-	if err != nil {
-		return err
+func dataToolProgress(action string) ([]string, []float64) {
+	switch action {
+	case "download":
+		return []string{"downKline"}, []float64{1}
+	case "export":
+		return []string{"holes", "kline"}, []float64{1, 5}
+	case "import":
+		return []string{"kline", "range"}, []float64{3, 1}
+	case "purge":
+		return []string{"purge"}, []float64{1}
+	default:
+		return []string{"syncTFs"}, []float64{1}
 	}
-	err = orm.InitExg(exchange)
-	if err != nil {
-		return err
-	}
-	for _, pair := range args.Pairs {
-		exs, err := orm.GetExSymbol(exchange, pair)
-		if err != nil {
-			return err
-		}
-		exsMap[exs.ID] = exs
-	}
-	log.Info("start download data",
-		zap.String("exchange", args.Exchange),
-		zap.String("market", args.Market),
-		zap.Int("symbolNum", len(exsMap)),
-		zap.Strings("timeframes", args.Periods),
-		zap.Int64("start", args.StartMs),
-		zap.Int64("end", args.EndMs))
-
-	startMs, endMs := args.StartMs, args.EndMs
-	for i, tf := range args.Periods {
-		prgBase := float64(i) / float64(len(args.Periods))
-		err = orm.BulkDownOHLCV(args.Exg, exsMap, tf, startMs, endMs, 0, func(done int, total int) {
-			pBar.SetProgress("downKline", prgBase+float64(done)/float64(total))
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	log.Info("download data completed")
-	return nil
-}
-
-// runExportData 导出数据
-func runExportData(args *DataToolsArgs, pBar *utils.StagedPrg) *errs.Error {
-	log.Info("start export data",
-		zap.String("folder", args.Folder),
-		zap.Int("concurrency", args.Concurrency))
-
-	// 创建临时配置文件
-	tmpFile, err := os.CreateTemp("", "export_config_*.yml")
-	if err != nil {
-		return errs.New(errs.CodeIOWriteFail, err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	// 写入配置内容
-	if _, err := tmpFile.WriteString(args.Config); err != nil {
-		tmpFile.Close()
-		return errs.New(errs.CodeIOWriteFail, err)
-	}
-	tmpFile.Close()
-
-	// 调用 orm.ExportKData
-	err2 := orm.ExportKData(tmpFile.Name(), args.Folder, args.Concurrency, pBar)
-	if err2 != nil {
-		return err2
-	}
-
-	log.Info("export data completed")
-	return nil
-}
-
-// runImportData 导入数据
-func runImportData(args *DataToolsArgs, pBar *utils.StagedPrg) *errs.Error {
-	log.Info("start import data",
-		zap.String("folder", args.Folder),
-		zap.Int("concurrency", args.Concurrency))
-
-	// 调用 orm.ImportData
-	err2 := orm.ImportData(args.Folder, args.Concurrency, pBar)
-	if err2 != nil {
-		return err2
-	}
-
-	log.Info("import data completed")
-	return nil
-}
-
-// runPurgeData 清理数据
-func runPurgeData(args *DataToolsArgs, pb *utils.StagedPrg) *errs.Error {
-	log.Info("start purge data",
-		zap.String("exchange", args.Exchange),
-		zap.String("market", args.Market),
-		zap.Strings("pairs", args.Pairs),
-		zap.Strings("timeframes", args.Periods),
-		zap.Int64("start", args.StartMs),
-		zap.Int64("end", args.EndMs))
-
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-
-	exsMap := make(map[string]bool)
-	var exsList []*orm.ExSymbol
-	for _, pair := range args.Pairs {
-		if exsMap[pair] {
-			continue
-		}
-		exsMap[pair] = true
-		exs := orm.GetExSymbol2(args.Exchange, args.Market, pair)
-		if exs != nil {
-			exsList = append(exsList, exs)
-		}
-	}
-	err = sess.DelKData(exsList, args.Periods, args.StartMs, args.EndMs)
-	if err != nil {
-		return err
-	}
-	log.Info("purge data completed")
-	return nil
-}
-
-// runCorrectData 修正数据
-func runCorrectData(args *DataToolsArgs, pb *utils.StagedPrg) *errs.Error {
-	log.Info("start correct data",
-		zap.String("exchange", args.Exchange),
-		zap.String("market", args.Market),
-		zap.Strings("pairs", args.Pairs))
-
-	err := orm.SyncKlineTFs(&config.CmdArgs{
-		Pairs: args.Pairs,
-		Force: true,
-	}, pb)
-	if err != nil {
-		log.Error("correct data failed", zap.Error(err))
-		return err
-	}
-
-	log.Info("correct data completed")
-	return nil
 }
 
 // handleDataTools 处理数据工具请求
-func handleDataTools(c *fiber.Ctx) error {
+func (s *DevServer) handleDataTools(c *fiber.Ctx) error {
+	if s.stopped.Load() {
+		return errs.NewMsg(errs.CodeRunTime, "dev server is stopping")
+	}
 	var args = new(DataToolsArgs)
 	if err := base.VerifyArg(c, args, base.ArgBody); err != nil {
 		return err
@@ -271,7 +112,11 @@ func handleDataTools(c *fiber.Ctx) error {
 
 	// 验证必填参数
 	if args.StartMs > 0 && args.EndMs == 0 {
-		args.EndMs = btime.UTCStamp()
+		if s.Data != nil && s.Data.Clock != nil {
+			args.EndMs = s.Data.Clock.TimeMS()
+		} else {
+			return errs.NewMsg(errs.CodeParamRequired, "dev server clock is required")
+		}
 	}
 	var errMsg string
 	mustMarket := false
@@ -298,7 +143,7 @@ func handleDataTools(c *fiber.Ctx) error {
 		})
 	}
 
-	if err := dataToolsMgr.StartTask(); err != nil {
+	if err := s.dataTools.StartTask(); err != nil {
 		return c.Status(400).JSON(fiber.Map{
 			"msg": err.Error(),
 		})
@@ -308,24 +153,28 @@ func handleDataTools(c *fiber.Ctx) error {
 	claimed := true
 	defer func() {
 		if claimed {
-			dataToolsMgr.EndTask()
+			s.dataTools.EndTask()
+		}
+	}()
+	deps, cleanup, err := s.dataFor(s.ctx, args.Exchange, args.Market)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if claimed {
+			cleanup()
 		}
 	}()
 
 	if mustMarket {
-		exchange, err2 := exg.GetWith(args.Exchange, args.Market, banexg.MarketSwap)
-		if err2 != nil {
-			return err2
-		}
-
-		err2 = orm.InitExg(exchange)
-		if err2 != nil {
-			return err2
-		}
-		args.Exg = exchange
+		args.Exg = deps.Exchange
 
 		if len(args.Pairs) == 0 {
-			exsMap := orm.GetExSymbols(args.Exchange, args.Market)
+			symbols := deps.Symbols
+			if symbols == nil {
+				return errs.NewMsg(errs.CodeParamRequired, "dev server symbol state is required")
+			}
+			exsMap := symbols.GetExSymbols(args.Exchange, args.Market)
 			for _, exs := range exsMap {
 				args.Pairs = append(args.Pairs, exs.Symbol)
 			}
@@ -343,7 +192,11 @@ func handleDataTools(c *fiber.Ctx) error {
 				singleNum := int((args.EndMs - args.StartMs) / tfMSec)
 				barNum += singleNum * len(args.Pairs)
 			}
-			totalMins := barNum/core.ConcurNum/core.DownKNumMin + 1
+			concurrency := 1
+			if s.Data != nil && s.Data.Config != nil && s.Data.Config.View() != nil && s.Data.Config.View().ConcurNum > 0 {
+				concurrency = s.Data.Config.View().ConcurNum
+			}
+			totalMins := barNum/concurrency/core.DownKNumMin + 1
 			msg += fmt.Sprintf("Cost Time: %d Hours %d Minutes", totalMins/60, totalMins%60)
 		} else if !mustMarket {
 			msg = fmt.Sprintf("\nFolder: %s", args.Folder)
@@ -356,13 +209,17 @@ func handleDataTools(c *fiber.Ctx) error {
 
 	// 尝试启动任务
 	if args.Action == "export" {
-		args.Folder = config.ParsePath(args.Folder)
+		args.Folder = s.ParsePath(args.Folder)
 	}
 
-	// 在goroutine中执行任务
+	// The server owns the callback lifetime so Stop/Join cannot leave a
+	// maintenance action running against a closed entry session.
+	s.wg.Add(1)
 	go func() {
-		defer dataToolsMgr.EndTask()
-		err := runDataTools(args)
+		defer s.wg.Done()
+		defer s.dataTools.EndTask()
+		defer cleanup()
+		err := s.runDataTools(deps, args)
 		if err != nil {
 			log.Error("data tools task failed",
 				zap.String("action", args.Action),

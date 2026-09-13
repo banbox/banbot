@@ -165,6 +165,13 @@ func (c *Config) NormalizeRuntime() *errs.Error {
 	if err != nil {
 		return err
 	}
+	return c.NormalizeRunPolicies()
+}
+
+// NormalizeRunPolicies prepares policy fields for an explicit runtime without
+// installing configuration into package-level state.
+func (c *Config) NormalizeRunPolicies() *errs.Error {
+	var err *errs.Error
 	counts := make(map[string]int)
 	for _, policy := range c.RunPolicy {
 		if policy == nil {

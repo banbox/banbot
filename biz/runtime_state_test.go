@@ -25,6 +25,7 @@ func TestTradingStateRegistryAccessIsSafeDuringReset(t *testing.T) {
 				_ = state.Wallet(account)
 				_ = state.OrderManagersSnapshot()
 				_ = state.LiveManagersSnapshot()
+				_ = state.WalletsSnapshot()
 			}
 		}()
 	}
@@ -40,8 +41,18 @@ func TestTradingStateRegistryAccessIsSafeDuringReset(t *testing.T) {
 	close(start)
 	wg.Wait()
 	state.Reset()
-	if len(state.OrderManagers) != 0 || len(state.LiveManagers) != 0 || len(state.Wallets) != 0 {
+	if len(state.OrderManagersSnapshot()) != 0 || len(state.LiveManagersSnapshot()) != 0 || len(state.WalletsSnapshot()) != 0 {
 		t.Fatalf("trading state was not reset: managers=%d live=%d wallets=%d",
-			len(state.OrderManagers), len(state.LiveManagers), len(state.Wallets))
+			len(state.OrderManagersSnapshot()), len(state.LiveManagersSnapshot()), len(state.WalletsSnapshot()))
+	}
+}
+
+func TestTradingStateWalletSnapshotDoesNotExposeRegistry(t *testing.T) {
+	state := NewTradingState()
+	wallet := state.Wallet("isolated")
+	snapshot := state.WalletsSnapshot()
+	delete(snapshot, "isolated")
+	if got := state.Wallet("isolated"); got != wallet {
+		t.Fatal("mutating wallet snapshot changed the runtime registry")
 	}
 }

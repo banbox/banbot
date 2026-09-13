@@ -17,7 +17,15 @@ import (
 	"go.uber.org/zap"
 )
 
-func ParseVerifyArgs(args *config.CmdArgs) (*VerifyArgs, *errs.Error) {
+// ParseVerifyArgsWithSymbolState resolves configured symbols from one runtime
+// catalog instead of package-level exchange and symbol state.
+func ParseVerifyArgsWithSymbolState(args *config.CmdArgs, symbols *SymbolState, exchange, market string) (*VerifyArgs, *errs.Error) {
+	if args == nil {
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "verify arguments are required")
+	}
+	if symbols == nil {
+		return nil, errs.NewMsg(core.ErrRunTime, "verify symbol state is required")
+	}
 	vArgs := &VerifyArgs{
 		BatchSize: args.BatchSize,
 	}
@@ -33,7 +41,7 @@ func ParseVerifyArgs(args *config.CmdArgs) (*VerifyArgs, *errs.Error) {
 			}
 			vArgs.Sids = append(vArgs.Sids, int32(sid))
 		} else {
-			exs := GetExSymbol2(config.Exchange.Name, core.Market, pair)
+			exs := symbols.GetExSymbol2(exchange, market, pair)
 			if exs == nil {
 				return nil, errs.NewMsg(core.ErrInvalidSymbol, "symbol not found: %s", pair)
 			}
@@ -65,7 +73,18 @@ type VerifyArgs struct {
 	BatchSize int      // 分批读取时间戳数量，默认500000
 }
 
-func VerifyDataRanges(args *VerifyArgs) ([]*VerifyTFResult, *errs.Error) {
+// VerifyDataRangesWithQueries reads range metadata through the supplied
+// storage-bound handle and resolves labels from the supplied runtime catalog.
+func VerifyDataRangesWithQueries(sess *Queries, symbols *SymbolState, args *VerifyArgs) ([]*VerifyTFResult, *errs.Error) {
+	if sess == nil {
+		return nil, errs.NewMsg(core.ErrDbConnFail, "verify queries are required")
+	}
+	if symbols == nil {
+		return nil, errs.NewMsg(core.ErrRunTime, "verify symbol state is required")
+	}
+	if args == nil {
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "verify arguments are required")
+	}
 	if args.BatchSize <= 0 {
 		args.BatchSize = 500000
 	}
@@ -75,7 +94,7 @@ func VerifyDataRanges(args *VerifyArgs) ([]*VerifyTFResult, *errs.Error) {
 	}
 	sids := args.Sids
 	if len(sids) == 0 {
-		allSids, err := listSRangeSids(tables)
+		allSids, err := sess.listSRangeSids(tables)
 		if err != nil {
 			return nil, err
 		}
@@ -87,19 +106,13 @@ func VerifyDataRanges(args *VerifyArgs) ([]*VerifyTFResult, *errs.Error) {
 	}
 	sort.Slice(sids, func(i, j int) bool { return sids[i] < sids[j] })
 
-	sess, conn, err := Conn(context.Background())
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Release()
-
 	totalJobs := len(sids) * len(tables)
 	pBar := utils.NewPrgBar(totalJobs, "verify")
 	defer pBar.Close()
 
 	var results []*VerifyTFResult
 	for _, sid := range sids {
-		exs := GetSymbolByID(sid)
+		exs := symbols.GetSymbolByID(sid)
 		symbol := fmt.Sprintf("sid:%d", sid)
 		if exs != nil {
 			symbol = exs.Symbol
@@ -290,12 +303,15 @@ func mergeIssues(issues []*VerifyIssue) []*VerifyIssue {
 	return merged
 }
 
-func listSRangeSids(tables []string) ([]int32, *errs.Error) {
-	unlock := LockCompactTableRead("sranges_q")
+func (q *Queries) listSRangeSids(tables []string) ([]int32, *errs.Error) {
+	if q == nil || q.db == nil {
+		return nil, errs.NewMsg(core.ErrDbConnFail, "verify queries are required")
+	}
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	ctx := context.Background()
-	sqlText, args := listSRangeSidsQuery(tables, IsQuestDB)
-	rows, err_ := pool.Query(ctx, sqlText, args...)
+	sqlText, args := listSRangeSidsQuery(tables, q.isQuestDB())
+	rows, err_ := q.db.Query(ctx, sqlText, args...)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}

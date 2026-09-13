@@ -7,13 +7,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	runtimepkg "github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/strat"
+	"github.com/banbox/banexg/errs"
 )
 
 type r1BacktestBar struct {
@@ -46,12 +46,14 @@ func newR1BacktestRunner(t *testing.T, process *runtimepkg.Process, id string, s
 		WalletAmounts: map[string]float64{"USDT": 1_000},
 		StakeCurrency: []string{"USDT"},
 	}
+	exchange := newBacktestRuntimeExchangeStub("test", "spot")
 	rt, err := process.NewRuntime(runtimepkg.Options{
 		ID:           id,
 		Mode:         core.RunModeBackTest,
 		Env:          core.RunEnvDryRun,
 		StartAt:      startMS,
 		Config:       runtimeConfig,
+		Exchange:     exchange,
 		ExchangeName: "test",
 		Market:       "spot",
 	})
@@ -60,23 +62,7 @@ func newR1BacktestRunner(t *testing.T, process *runtimepkg.Process, id string, s
 	}
 	symbol := &orm.ExSymbol{ID: 1, Exchange: "test", Market: "spot", Symbol: "BTC/USDT"}
 	rt.Symbols.CacheExSymbol(symbol)
-	deps := biz.RuntimeDeps{
-		Core:           rt.Core,
-		Clock:          rt.Clock,
-		Market:         rt.Market,
-		Batch:          rt.Batch,
-		Strategies:     rt.Strategies,
-		Orders:         rt.Orders,
-		Trading:        rt.Trading,
-		Config:         rt.Config,
-		Symbols:        rt.Symbols,
-		Storage:        rt.Storage,
-		Exchange:       rt.Exchange,
-		Scheduler:      rt.Cron,
-		Notifications:  rt.Notifications,
-		Dump:           rt.Dump,
-		DefaultAccount: "default",
-	}
+	deps := rt.BizDeps()
 	runner := &r1BacktestRunner{runtime: rt, symbol: symbol}
 	strategy := &strat.TradeStrat{
 		Name: "r1-" + id,
@@ -111,10 +97,14 @@ func newR1BacktestRunner(t *testing.T, process *runtimepkg.Process, id string, s
 		TimeFrame: "1m",
 		Account:   "default",
 	}
-	rt.Strategies.InfoJobs("default")[strat.DataSubKey("macro", symbol.ID, "1m")] = map[string]*strat.StratJob{
+	rt.Strategies.SetInfoJobMap("default", strat.DataSubKey("macro", symbol.ID, "1m"), map[string]*strat.StratJob{
 		strategy.Name: job,
+	})
+	var liteErr *errs.Error
+	runner.lite, liteErr = NewBackTestLiteWithRuntimeDeps(deps, true, nil, nil, nil)
+	if liteErr != nil {
+		t.Fatal(liteErr)
 	}
-	runner.lite = NewBackTestLiteWithRuntimeDataDepsOwned(deps, rt.Symbols, true, nil, nil, nil, nil)
 	return runner
 }
 
@@ -136,9 +126,7 @@ func (r *r1BacktestRunner) feed(bars []r1BacktestBar) bool {
 }
 
 func (r *r1BacktestRunner) snapshot() r1BacktestResult {
-	r.runtime.Core.TfPairHitsLock.RLock()
-	pairHits := r.runtime.Core.TfPairHits["1m"][r.symbol.Symbol]
-	r.runtime.Core.TfPairHitsLock.RUnlock()
+	pairHits := r.runtime.Core.DrainTfPairHits()["1m"][r.symbol.Symbol]
 	return r1BacktestResult{
 		times:    append([]int64(nil), r.result.times...),
 		prices:   append([]float64(nil), r.result.prices...),

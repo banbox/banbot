@@ -10,40 +10,26 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
 	"gopkg.in/yaml.v3"
 )
 
-func TestResetOptimizeTrialStakePctAmt(t *testing.T) {
-	oldAccounts, oldStakePct := config.Accounts, config.StakePct
-	t.Cleanup(func() {
-		config.Accounts, config.StakePct = oldAccounts, oldStakePct
+func TestDeriveBacktestSnapshotResetsTrialAccountState(t *testing.T) {
+	source := config.NewSnapshot(&config.Config{
+		TimeRange: &config.TimeTuple{StartMS: 100, EndMS: 200},
+		Accounts: map[string]*config.AccountConfig{
+			config.DefAcc: {StakePctAmt: 100, StakeRate: 1.5},
+		},
 	})
-	config.StakePct = 10
-	config.Accounts = map[string]*config.AccountConfig{
-		config.DefAcc: {StakePctAmt: 100, StakeRate: 1.5},
-		"secondary":   {StakePctAmt: 250, MaxStakeAmt: 300},
+	derived := deriveBacktestSnapshotForPolicies(source, nil)
+	if derived == nil || derived.View() == source.View() {
+		t.Fatal("trial did not receive an owned snapshot")
 	}
-
-	resetOptimizeTrialVars()
-	for account, cfg := range config.Accounts {
-		if cfg.StakePctAmt != 0 {
-			t.Fatalf("account %s retained previous trial stake base: %v", account, cfg.StakePctAmt)
-		}
-	}
-	if config.Accounts[config.DefAcc].StakeRate != 1.5 || config.Accounts["secondary"].MaxStakeAmt != 300 {
-		t.Fatal("trial reset changed persistent account sizing settings")
-	}
-
-	wallets := &biz.BanWallets{Account: config.DefAcc, Items: map[string]*biz.ItemWallet{
-		"USDT": {Coin: "USDT", Available: 1100},
-	}}
-	wallets.TryUpdateStakePctAmt()
-	if got := config.Accounts[config.DefAcc].StakePctAmt; got != 110 {
-		t.Fatalf("fresh trial stake base = %v, want 110", got)
+	derived.View().Accounts[config.DefAcc].StakeRate = 2
+	if got := source.View().Accounts[config.DefAcc].StakeRate; got != 1.5 {
+		t.Fatalf("trial account configuration leaked into source snapshot: %v", got)
 	}
 }
 

@@ -13,7 +13,9 @@ import (
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
@@ -32,13 +34,15 @@ func (e *balanceExchangeStub) FetchBalance(map[string]interface{}) (*banexg.Bala
 }
 
 type captureScheduler struct {
-	spec string
-	call func()
+	spec  string
+	call  func()
+	specs []string
 }
 
 func (s *captureScheduler) AddFunc(spec string, call func()) (cron.EntryID, error) {
 	s.spec = spec
 	s.call = call
+	s.specs = append(s.specs, spec)
 	return 1, nil
 }
 
@@ -46,8 +50,17 @@ func (s *captureScheduler) Start() {}
 
 func (s *captureScheduler) Stop() context.Context { return context.Background() }
 
+func (s *captureScheduler) hasSpec(spec string) bool {
+	for _, item := range s.specs {
+		if item == spec {
+			return true
+		}
+	}
+	return false
+}
+
 func TestCron(t *testing.T) {
-	t.Skip("integration test (manual cron timing inspection)")
+	testutil.RequireIntegration(t)
 	logger := cron.VerbosePrintfLogger(log2.New(os.Stdout, "cron: ", log2.LstdFlags))
 	loc, _ := time.LoadLocation("Asia/Shanghai")
 	bntpClock := cron.NewNtpClock(loc, "zh-CN")
@@ -113,6 +126,7 @@ func TestRuntimeBalanceWorkerUsesBoundDependencies(t *testing.T) {
 		Clock:    clock,
 		Market:   market,
 		Config:   runtimeConfig,
+		Accounts: config.CloneAccountConfigsForRuntime(runtimeConfig.View().Accounts),
 		Exchange: runtimeExchange,
 	}
 	bound := bindBalanceRuntimeDeps(deps)
@@ -134,12 +148,77 @@ func TestRuntimeBalanceWorkerUsesBoundDependencies(t *testing.T) {
 	lifecycle.closeAndWait()
 }
 
+func TestExplicitStartJobsIgnorePoisonedLegacyWorkerGlobals(t *testing.T) {
+	oldAccounts, oldBTInLive, oldEnvReal, oldExchange := config.Accounts, config.BTInLive, core.EnvReal, exg.Default
+	t.Cleanup(func() {
+		config.Accounts, config.BTInLive, core.EnvReal, exg.Default = oldAccounts, oldBTInLive, oldEnvReal, oldExchange
+	})
+	legacyExchange := &balanceExchangeStub{}
+	config.Accounts = map[string]*config.AccountConfig{"legacy": {}}
+	config.BTInLive = &config.BtInLiveConfig{Cron: "legacy-poisoned-cron"}
+	core.EnvReal = false
+	exg.Default = legacyExchange
+
+	state, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	state.EnvReal = true
+	state.Market = banexg.MarketLinear
+	scheduler := &captureScheduler{}
+	deps := completeCryptoTraderDepsForTest(biz.RuntimeDeps{
+		Core: state,
+		Config: config.NewSnapshot(&config.Config{
+			BTInLive:        &config.BtInLiveConfig{Cron: "runtime-cron"},
+			AccountPullSecs: 3600,
+			Accounts:        map[string]*config.AccountConfig{"runtime": {NoTrade: true}},
+		}),
+		Scheduler: scheduler,
+	})
+	lifecycle := newTestRuntimeLifecycle()
+	trader, err := newRuntimeCryptoTraderForTest(lifecycle, deps, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trader.dp = &data.LiveProvider{}
+	trader.startJobs()
+	lifecycle.closeAndWait()
+
+	if scheduler.hasSpec("legacy-poisoned-cron") {
+		t.Fatalf("explicit startJobs registered poisoned legacy cron: %#v", scheduler.specs)
+	}
+	if !scheduler.hasSpec("runtime-cron") || !scheduler.hasSpec("15,45 * * * * *") {
+		t.Fatalf("explicit startJobs missed runtime workers: %#v", scheduler.specs)
+	}
+	allowed := map[string]bool{
+		"0 0 * * * *":        true,
+		"30 3 */2 * * *":     true,
+		"30 * * * * *":       true,
+		"30 1-59/10 * * * *": true,
+		"31 * * * * *":       true,
+		"runtime-cron":       true,
+		"15,45 * * * * *":    true,
+	}
+	for _, spec := range scheduler.specs {
+		if !allowed[spec] {
+			t.Fatalf("explicit startJobs registered non-runtime worker %q: %#v", spec, scheduler.specs)
+		}
+	}
+	if legacyExchange.balanceCalls != 0 {
+		t.Fatalf("explicit startJobs used the legacy exchange: %d calls", legacyExchange.balanceCalls)
+	}
+}
+
 func TestBindBalanceRuntimeDepsSnapshotsAccounts(t *testing.T) {
 	const account = "runtime"
 	runtimeConfig := config.NewSnapshot(&config.Config{
 		Accounts: map[string]*config.AccountConfig{account: {}},
 	})
-	bound := bindBalanceRuntimeDeps(biz.RuntimeDeps{Config: runtimeConfig})
+	bound := bindBalanceRuntimeDeps(biz.RuntimeDeps{
+		Config:   runtimeConfig,
+		Accounts: config.CloneAccountConfigsForRuntime(runtimeConfig.View().Accounts),
+	})
 	source := runtimeConfig.View().Accounts
 
 	source[account].NoTrade = true

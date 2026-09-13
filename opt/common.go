@@ -11,9 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
@@ -44,7 +42,6 @@ var (
 		"good3t10": optGood3t10,
 	}
 	DefCalcOptBest = "good3"
-	AfterBacktest  func(bt *BackTest)
 )
 
 type OptGroup struct {
@@ -67,6 +64,8 @@ type OptInfo struct {
 
 type rollBtOpt struct {
 	args        *config.CmdArgs
+	snapshot    *config.Snapshot
+	factory     BacktestFactory
 	curMs       int64
 	allEndMs    int64
 	dateRange   *config.TimeTuple
@@ -81,6 +80,16 @@ type ValItem struct {
 	Score float64
 	Order int
 	Res   int
+}
+
+func clonePolicies(source []*config.RunPolicyConfig) []*config.RunPolicyConfig {
+	result := make([]*config.RunPolicyConfig, len(source))
+	for i, policy := range source {
+		if policy != nil {
+			result[i] = policy.Clone()
+		}
+	}
+	return result
 }
 
 func calcBestBy(items []*OptInfo, name string) *OptInfo {
@@ -108,11 +117,11 @@ func calcBestBy(items []*OptInfo, name string) *OptInfo {
 	return res
 }
 
-func (o *OptInfo) runGetBtResult(pol *config.RunPolicyConfig) *errs.Error {
+func (o *OptInfo) runGetBtResult(snapshot *config.Snapshot, factory BacktestFactory, pol *config.RunPolicyConfig) *errs.Error {
 	for k, v := range o.Params {
 		pol.Params[k] = v
 	}
-	bt, loss, err := runBTOnce()
+	bt, loss, err := runBTOnce(snapshot, factory, []*config.RunPolicyConfig{pol})
 	if err != nil {
 		return err
 	}
@@ -146,20 +155,19 @@ func (o *OptInfo) ToPol(source *config.RunPolicyConfig, idx int, name, dirt, tfS
 	return res
 }
 
-func newRollBtOpt(args *config.CmdArgs) (*rollBtOpt, *errs.Error) {
-	core.SetRunMode(core.RunModeBackTest)
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return nil, err
+func newRollBtOpt(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) (*rollBtOpt, *errs.Error) {
+	if args == nil || snapshot == nil || snapshot.View() == nil || snapshot.View().TimeRange == nil || factory == nil {
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "rolling optimization requires a runtime snapshot and backtest factory")
 	}
-	dateRange := config.TimeRange.Clone()
+	cfg := snapshot.View()
+	dateRange := cfg.TimeRange.Clone()
 	allStartMs, allEndMs := dateRange.StartMS, dateRange.EndMS
 	runMSecs := int64(utils2.TFToSecs(args.RunPeriod)) * 1000
 	reviewMSecs := int64(utils2.TFToSecs(args.ReviewPeriod)) * 1000
 	if runMSecs < utils2.SecsHour*1000 {
 		return nil, errs.NewMsg(errs.CodeParamInvalid, "`run-period` cannot be less than 1 hour")
 	}
-	outDir := filepath.Join(config.GetDataDir(), "backtest", "bt_opt_"+btOptHash(args))
+	outDir := filepath.Join(snapshot.DataDir, "backtest", "bt_opt_"+btOptHash(args, snapshot))
 	err_ := utils.EnsureDir(outDir, 0755)
 	if err_ != nil {
 		return nil, errs.New(errs.CodeIOWriteFail, err_)
@@ -167,9 +175,11 @@ func newRollBtOpt(args *config.CmdArgs) (*rollBtOpt, *errs.Error) {
 	log.Info("write bt over opt to", zap.String("dir", outDir))
 	args.OutPath = filepath.Join(outDir, "opt.log")
 	curMs := allStartMs + reviewMSecs
-	initPols := config.RunPolicy
+	initPols := clonePolicies(cfg.RunPolicy)
 	return &rollBtOpt{
 		args:        args,
+		snapshot:    snapshot,
+		factory:     factory,
 		curMs:       curMs,
 		allEndMs:    allEndMs,
 		dateRange:   dateRange,
@@ -190,7 +200,6 @@ func (t *rollBtOpt) setRunRange() {
 
 func (t *rollBtOpt) setTimeRange(startMS, endMS int64) {
 	t.dateRange = &config.TimeTuple{StartMS: startMS, EndMS: endMS}
-	config.TimeRange = t.dateRange
 }
 
 func (t *rollBtOpt) next(pairPicker string) (string, *errs.Error) {
@@ -202,8 +211,9 @@ func (t *rollBtOpt) next(pairPicker string) (string, *errs.Error) {
 		return "", err
 	}
 	if polStr == "" {
-		config.RunPolicy = t.initPols
-		polStr, err = runOptimize(t.args, 0)
+		reviewSnapshot := deriveBacktestSnapshot(t.snapshot, t.dateRange.StartMS, t.dateRange.EndMS,
+			t.snapshot.View().Pairs, t.initPols)
+		polStr, err = runOptimize(t.args, reviewSnapshot, t.factory, 0)
 		if err != nil {
 			return "", err
 		}
@@ -214,7 +224,7 @@ func (t *rollBtOpt) next(pairPicker string) (string, *errs.Error) {
 }
 
 func (t *rollBtOpt) dumpConfig() *errs.Error {
-	data, err := config.DumpYaml(true)
+	data, err := t.snapshot.View().Desensitize().DumpYaml()
 	if err != nil {
 		return err
 	}

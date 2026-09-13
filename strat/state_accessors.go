@@ -19,25 +19,25 @@ type infoJobRegistrySnapshot map[string]map[string]map[string]*StratJob
 
 func cloneJobRegistrySnapshot(s *State) *jobRegistrySnapshot {
 	result := &jobRegistrySnapshot{
-		jobs:       make(map[string]map[string]map[string]*StratJob, len(s.AccJobs)),
-		pairStrats: make(map[string]map[string]*TradeStrat, len(s.PairStrats)),
+		jobs:       make(map[string]map[string]map[string]*StratJob, len(s.accJobs)),
+		pairStrats: make(map[string]map[string]*TradeStrat, len(s.pairStrats)),
 	}
-	for account, accountJobs := range s.AccJobs {
+	for account, accountJobs := range s.accJobs {
 		byEnv := make(map[string]map[string]*StratJob, len(accountJobs))
 		for envKey, jobs := range accountJobs {
 			byEnv[envKey] = maps.Clone(jobs)
 		}
 		result.jobs[account] = byEnv
 	}
-	for pair, strategies := range s.PairStrats {
+	for pair, strategies := range s.pairStrats {
 		result.pairStrats[pair] = maps.Clone(strategies)
 	}
 	return result
 }
 
 func cloneInfoJobRegistrySnapshot(s *State) infoJobRegistrySnapshot {
-	result := make(infoJobRegistrySnapshot, len(s.AccInfoJobs))
-	for account, accountJobs := range s.AccInfoJobs {
+	result := make(infoJobRegistrySnapshot, len(s.accInfoJobs))
+	for account, accountJobs := range s.accInfoJobs {
 		bySubKey := make(map[string]map[string]*StratJob, len(accountJobs))
 		for subKey, jobs := range accountJobs {
 			bySubKey[subKey] = maps.Clone(jobs)
@@ -162,17 +162,15 @@ func sortedMapKeys[V any](items map[string]V) []string {
 	return keys
 }
 
-// Jobs returns the strategy jobs owned by this state. The returned map is the
-// state-owned map, so callers on the hot path can index it directly without a
-// dynamic lookup or a copy.
-func (s *State) Jobs(account string) map[string]map[string]*StratJob {
+// jobsLocked requires the primary registry write lock.
+func (s *State) jobsLocked(account string) map[string]map[string]*StratJob {
 	if s == nil {
 		return nil
 	}
-	jobs := s.AccJobs[account]
+	jobs := s.accJobs[account]
 	if jobs == nil {
 		jobs = make(map[string]map[string]*StratJob)
-		s.AccJobs[account] = jobs
+		s.accJobs[account] = jobs
 	}
 	if s != legacyState {
 		// The returned map is retained for legacy construction helpers that
@@ -193,7 +191,7 @@ func (s *State) LookupJob(account, pairTF, strategy string) *StratJob {
 	}
 	lockJobsReadForState(s)
 	defer unlockJobsReadForState(s)
-	accountJobs := s.AccJobs[account]
+	accountJobs := s.accJobs[account]
 	if accountJobs == nil {
 		return nil
 	}
@@ -312,15 +310,15 @@ func (s *State) PairStrategiesView() map[string]map[string]*TradeStrat {
 	return s.registrySnapshot().pairStrats
 }
 
-// InfoJobs returns the side-input jobs owned by this state.
-func (s *State) InfoJobs(account string) map[string]map[string]*StratJob {
+// infoJobsLocked requires the side-input registry write lock.
+func (s *State) infoJobsLocked(account string) map[string]map[string]*StratJob {
 	if s == nil {
 		return nil
 	}
-	jobs := s.AccInfoJobs[account]
+	jobs := s.accInfoJobs[account]
 	if jobs == nil {
 		jobs = make(map[string]map[string]*StratJob)
-		s.AccInfoJobs[account] = jobs
+		s.accInfoJobs[account] = jobs
 	}
 	if s != legacyState {
 		s.infoSnapshotDirty.Store(true)
@@ -335,7 +333,7 @@ func (s *State) Env(key string) (*ta.BarEnv, bool) {
 		return nil, false
 	}
 	s.envMu.RLock()
-	env, ok := s.Envs[key]
+	env, ok := s.envs[key]
 	s.envMu.RUnlock()
 	return env, ok
 }
@@ -348,10 +346,10 @@ func (s *State) SetEnv(key string, env *ta.BarEnv) {
 		return
 	}
 	s.envMu.Lock()
-	if s.Envs == nil {
-		s.Envs = make(map[string]*ta.BarEnv)
+	if s.envs == nil {
+		s.envs = make(map[string]*ta.BarEnv)
 	}
-	s.Envs[key] = env
+	s.envs[key] = env
 	s.envMu.Unlock()
 }
 
@@ -361,7 +359,7 @@ func (s *State) DeleteEnv(key string) {
 		return
 	}
 	s.envMu.Lock()
-	delete(s.Envs, key)
+	delete(s.envs, key)
 	s.envMu.Unlock()
 }
 
@@ -371,8 +369,8 @@ func (s *State) EnvKeys() []string {
 		return nil
 	}
 	s.envMu.RLock()
-	keys := make([]string, 0, len(s.Envs))
-	for key := range s.Envs {
+	keys := make([]string, 0, len(s.envs))
+	for key := range s.envs {
 		keys = append(keys, key)
 	}
 	s.envMu.RUnlock()
@@ -389,8 +387,58 @@ func (s *State) Version(name string) (int, bool) {
 	// version to persist on a newly created order.
 	lockJobsReadForState(s)
 	defer unlockJobsReadForState(s)
-	version, ok := s.Versions[name]
+	version, ok := s.versions[name]
 	return version, ok
+}
+
+// GetVersion reads the package-level compatibility registry. New runtimes
+// should call State.Version on their owned strategy state.
+func GetVersion(name string) (int, bool) {
+	return legacyStateView().Version(name)
+}
+
+// GetEnv reads one environment from the package-level compatibility registry.
+// New runtimes should call State.Env on their owned strategy state.
+func GetEnv(key string) (*ta.BarEnv, bool) {
+	return legacyStateView().Env(key)
+}
+
+// SetVersion publishes one strategy version. Loading code that already holds
+// the registry write lock updates the private map directly to avoid recursive
+// locking; other low-frequency callers should use this method.
+func (s *State) SetVersion(name string, version int) {
+	if s == nil || name == "" {
+		return
+	}
+	lockJobsWriteForState(s)
+	if s.versions == nil {
+		s.versions = make(map[string]int)
+	}
+	s.versions[name] = version
+	unlockJobsWriteForState(s)
+}
+
+// VersionsSnapshot returns an independent version registry for low-frequency
+// callers such as status APIs. Strategy reload updates the registry under
+// jobsMu, so the snapshot cannot race publication or expose mutable state.
+func (s *State) VersionsSnapshot() map[string]int {
+	if s == nil {
+		return nil
+	}
+	lockJobsReadForState(s)
+	versions := maps.Clone(s.versions)
+	unlockJobsReadForState(s)
+	return versions
+}
+
+// LegacyVersionsSnapshot returns a copy of the compatibility registry. New
+// runtimes should use State.VersionsSnapshot; this preserves legacy callers
+// without letting status readers borrow the mutable package map.
+func LegacyVersionsSnapshot() map[string]int {
+	lockJobsReadForState(nil)
+	versions := maps.Clone(Versions)
+	unlockJobsReadForState(nil)
+	return versions
 }
 
 // JobKeys returns a snapshot of the job keys for one account. It is intended
@@ -432,4 +480,29 @@ func (s *State) JobKeysAll() map[string]map[string]bool {
 		}
 	}
 	return result
+}
+
+// EnsureAccount creates empty registries before loading this account's jobs.
+func (s *State) EnsureAccount(account string) {
+	lockJobsWriteForState(s)
+	s.jobsLocked(account)
+	unlockJobsWriteForState(s)
+	lockInfoJobsWrite(s)
+	s.infoJobsLocked(account)
+	unlockInfoJobsWrite(s)
+}
+
+// SetJobMap publishes an owned copy of one environment's job membership.
+// Job execution state remains owned by the strategy event lifecycle.
+func (s *State) SetJobMap(account, environment string, jobs map[string]*StratJob) {
+	lockJobsWriteForState(s)
+	s.jobsLocked(account)[environment] = maps.Clone(jobs)
+	unlockJobsWriteForState(s)
+}
+
+// SetInfoJobMap publishes one side-input subscription's job membership.
+func (s *State) SetInfoJobMap(account, subscription string, jobs map[string]*StratJob) {
+	lockInfoJobsWrite(s)
+	s.infoJobsLocked(account)[subscription] = maps.Clone(jobs)
+	unlockInfoJobsWrite(s)
 }

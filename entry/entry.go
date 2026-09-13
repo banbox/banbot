@@ -1,33 +1,30 @@
 package entry
 
 import (
+	"bufio"
+	"context"
 	_ "embed"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
-	"github.com/banbox/banbot/exg"
-	"github.com/banbox/banbot/goods"
 	"github.com/banbox/banbot/live"
-	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
-	"go.uber.org/zap"
 )
 
 func runBackTestEntry(args *config.CmdArgs) *errs.Error {
 	return runExplicitBackTest(args)
-}
-
-func runLegacyEntrySession(run func() *errs.Error) *errs.Error {
-	return opt.WithLegacySession(func(opt.LegacySession) *errs.Error { return run() })
 }
 
 func RunBackTest(args *config.CmdArgs) *errs.Error {
@@ -53,135 +50,161 @@ func runTradeEntry(args *config.CmdArgs) *errs.Error {
 	return runExplicitTrade(args, nil)
 }
 
-func runtimeRunnerDeps(rt *runtime.Runtime) biz.RuntimeDeps {
-	return rt.BizDeps()
-}
-
-func runtimeRunnerDataDeps(rt *runtime.Runtime) *data.RuntimeDeps {
-	return rt.DataDeps()
-}
-
 func RunDownData(args *config.CmdArgs) *errs.Error {
-	return runLegacyEntrySession(func() *errs.Error { return runDownData(args) })
-}
-
-func runDownData(args *config.CmdArgs) *errs.Error {
-	core.SetRunMode(core.RunModeData)
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
-	}
-	pairs, err := goods.RefreshPairList(btime.TimeMS())
-	if err != nil {
-		return err
-	}
-	if len(pairs) == 0 {
-		log.Warn("no pairs to download")
-		return nil
-	}
-	log.Info("start down kline for pairs", zap.Int("num", len(pairs)), zap.Strings("tfs", args.TimeFrames))
-	exsMap := make(map[int32]*orm.ExSymbol)
-	for _, pair := range pairs {
-		exs, err := orm.GetExSymbolCur(pair)
-		if err != nil {
-			return err
-		}
-		exsMap[exs.ID] = exs
-	}
-	startMs, endMs := config.TimeRange.StartMS, config.TimeRange.EndMS
-	for _, tf := range args.TimeFrames {
-		err = orm.BulkDownOHLCV(exg.Default, exsMap, tf, startMs, endMs, 0, nil)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return runExplicitDownData(args)
 }
 
 func RunRepairKlineRanges(args *config.CmdArgs) *errs.Error {
-	return runLegacyEntrySession(func() *errs.Error { return runRepairKlineRanges(args) })
-}
-
-func runRepairKlineRanges(args *config.CmdArgs) *errs.Error {
-	core.SetRunMode(core.RunModeData)
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
-	}
-	pairs, dynamic := config.GetStaticPairs()
-	if dynamic || len(pairs) == 0 {
-		return errs.NewMsg(errs.CodeParamInvalid, "kline repair-ranges requires explicit pairs")
-	}
-	exsMap := make(map[int32]*orm.ExSymbol, len(pairs))
-	for _, pair := range pairs {
-		exs, getErr := orm.GetExSymbolCur(pair)
-		if getErr != nil {
-			return getErr
-		}
-		exsMap[exs.ID] = exs
-	}
-	return orm.RepairKlineRanges(exsMap, args.TimeFrames, config.TimeRange.StartMS, config.TimeRange.EndMS)
+	return runExplicitRepairKlineRanges(args)
 }
 
 func runExportData(args *config.CmdArgs) *errs.Error {
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
-	}
-	return biz.ExportKlines(args, nil)
+	return runKlineMaintenance(args, func(rt *runtime.Runtime, snap *config.Snapshot, q *orm.Queries) *errs.Error {
+		return biz.ExportKlinesWithRuntimeDeps(args, &biz.KlineMaintenanceDeps{
+			Context: rt.Context(), Queries: q, Symbols: rt.Symbols, Config: snap.View(), Exchange: rt.Exchange,
+			Logger: rt.Core.Log(), Location: snap.Location(),
+		}, nil)
+	})
 }
 
 func runPurgeData(args *config.CmdArgs) *errs.Error {
-	err := biz.SetupComsExg(args)
+	return runKlineMaintenance(args, func(rt *runtime.Runtime, snap *config.Snapshot, q *orm.Queries) *errs.Error {
+		return biz.PurgeKlinesWithRuntimeDeps(args, &biz.KlineMaintenanceDeps{
+			Context: rt.Context(), Queries: q, Symbols: rt.Symbols, Config: snap.View(), Exchange: rt.Exchange,
+			Logger: rt.Core.Log(), Location: snap.Location(),
+		})
+	})
+}
+
+func runExportAdjFactors(args *config.CmdArgs) *errs.Error {
+	return runKlineMaintenance(args, func(rt *runtime.Runtime, snap *config.Snapshot, q *orm.Queries) *errs.Error {
+		return biz.ExportAdjFactorsWithRuntimeDeps(args, &biz.KlineMaintenanceDeps{
+			Context: rt.Context(), Queries: q, Symbols: rt.Symbols, Config: snap.View(), Exchange: rt.Exchange,
+			Logger: rt.Core.Log(), Location: snap.Location(),
+		})
+	})
+}
+
+func runKlineMaintenance(args *config.CmdArgs, run func(*runtime.Runtime, *config.Snapshot, *orm.Queries) *errs.Error) *errs.Error {
+	s, snap, err := openExplicitEntrySession(args)
 	if err != nil {
 		return err
 	}
-	return biz.PurgeKlines(args)
+	defer s.close()
+	rt, err := s.newRuntime(snap, core.RunModeData, btime.UTCStamp())
+	if err != nil {
+		return err
+	}
+	defer func() { rt.Close(); rt.Join() }()
+	q, conn, err := rt.Storage.Conn(rt.Context())
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	q = q.WithSeriesSymbolState(rt.Symbols).WithExchange(rt.Exchange).WithKlineRuntimeOptions(orm.NewKlineRuntimeOptions(rt.Core, snap.View(), rt.Clock.TimeMS(), rt.Storage))
+	if snap.View().Exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "exchange config is required")
+	}
+	if err := q.LoadExgSymbols(snap.View().Exchange.Name); err != nil {
+		return err
+	}
+	return run(rt, snap, q)
 }
 
 func RunKlineCorrect(args *config.CmdArgs) *errs.Error {
-	return runLegacyEntrySession(func() *errs.Error { return runKlineCorrect(args) })
+	return runKlineCorrect(args)
 }
 
 func runKlineCorrect(args *config.CmdArgs) *errs.Error {
-	err := biz.SetupComs(args)
+	if args == nil {
+		return errs.NewMsg(core.ErrBadConfig, "kline sync arguments are required")
+	}
+	syncArgs := args
+	if len(args.Pairs) == 0 && !args.Force {
+		confirmed, confirmErr := confirmKlineCorrect(context.Background())
+		if confirmErr != nil {
+			return errs.New(errs.CodeRunTime, confirmErr)
+		}
+		if !confirmed {
+			return nil
+		}
+		copyArgs := *args
+		copyArgs.Force = true
+		syncArgs = &copyArgs
+	}
+	session, snapshot, err := openExplicitEntrySession(args)
 	if err != nil {
 		return err
 	}
-	return orm.SyncKlineTFs(args, nil)
+	defer session.close()
+	rt, err := session.newRuntime(snapshot, core.RunModeData, btime.UTCStamp())
+	if err != nil {
+		return err
+	}
+	defer func() { rt.Close(); rt.Join() }()
+	q, conn, err := rt.Storage.Conn(rt.Context())
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	allSymbols, err := loadStoredKlineSyncSymbols(rt.Context(), q)
+	if err != nil {
+		return err
+	}
+	symbols := orm.NewSymbolStateWithAllocator(rt.Symbols.SIDAllocator())
+	if err := symbols.SetExSymbols(allSymbols); err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
+	q = q.WithSeriesSymbolState(symbols).WithKlineRuntimeOptions(
+		orm.NewKlineRuntimeOptions(rt.Core, snapshot.View(), rt.Clock.TimeMS(), rt.Storage),
+	)
+	factory, closeFactory := session.spiderExchangeFactory(snapshot, rt.Exchange)
+	defer closeFactory()
+	return orm.SyncKlineTFsWithDeps(syncArgs, orm.KlineSyncDeps{
+		Context: rt.Context(), Queries: q, Symbols: allSymbols, Logger: rt.Core.Log(), ConfirmAll: confirmKlineCorrect,
+		ExchangeFactory: func(_ context.Context, exchange, market string) (banexg.BanExchange, *errs.Error) {
+			return factory(exchange, market)
+		},
+	}, nil)
+}
+
+func loadStoredKlineSyncSymbols(ctx context.Context, q *orm.Queries) ([]*orm.ExSymbol, *errs.Error) {
+	exchanges, err := q.ListExchanges(ctx)
+	if err != nil {
+		return nil, errs.New(core.ErrDbReadFail, err)
+	}
+	items := make([]*orm.ExSymbol, 0)
+	for _, exchange := range exchanges {
+		symbols, err := q.ListSymbols(ctx, exchange)
+		if err != nil {
+			return nil, errs.New(core.ErrDbReadFail, err)
+		}
+		items = append(items, symbols...)
+	}
+	return items, nil
+}
+
+func confirmKlineCorrect(_ context.Context) (bool, error) {
+	fmt.Println("KlineCorrect for all symbols would take a long time, input `y` to confirm (y/n):")
+	input, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(strings.ToLower(input)) == "y", nil
 }
 
 func RunKlineAdjFactors(args *config.CmdArgs) *errs.Error {
-	return runLegacyEntrySession(func() *errs.Error { return runKlineAdjFactors(args) })
+	return runKlineAdjFactors(args)
 }
 
 func runKlineAdjFactors(args *config.CmdArgs) *errs.Error {
-	err := biz.SetupComs(args)
-	if err != nil {
-		return err
-	}
-	return orm.CalcAdjFactors(args)
+	return runKlineMaintenance(args, func(rt *runtime.Runtime, _ *config.Snapshot, _ *orm.Queries) *errs.Error {
+		return orm.CalcAdjFactorsWithExchange(args, rt.Exchange)
+	})
 }
 
 func RunVerifyData(args *config.CmdArgs) *errs.Error {
-	return runLegacyEntrySession(func() *errs.Error { return runVerifyData(args) })
-}
-
-func runVerifyData(args *config.CmdArgs) *errs.Error {
-	err := biz.SetupComs(args)
-	if err != nil {
-		return err
-	}
-	vArgs, err := orm.ParseVerifyArgs(args)
-	if err != nil {
-		return err
-	}
-	results, err := orm.VerifyDataRanges(vArgs)
-	if err != nil {
-		return err
-	}
-	orm.PrintVerifyResults(results)
-	return nil
+	return runExplicitVerifyData(args)
 }
 
 func RunSpider(args *config.CmdArgs) *errs.Error {
@@ -193,34 +216,64 @@ func runSpider(args *config.CmdArgs) *errs.Error {
 }
 
 func RunSpiderWith(args *config.CmdArgs, startup data.SpiderStartupFunc) *errs.Error {
-	return runLegacyEntrySession(func() *errs.Error { return runSpiderWith(args, startup) })
+	return runSpiderWith(args, startup)
 }
 
 func runSpiderWith(args *config.CmdArgs, startup data.SpiderStartupFunc) *errs.Error {
-	core.SetRunMode(core.RunModeLive)
-	args.AutoCompact = true
-	if args.Logfile == "" {
-		args.Logfile = filepath.Join(config.GetLogsDir(), "spider.log")
-	}
-	err := biz.SetupComs(args)
+	session, snapshot, err := openExplicitEntrySession(args)
 	if err != nil {
 		return err
 	}
-	return data.RunSpiderWithSession(config.SpiderAddr, startup)
+	defer session.close()
+	rt, err := session.newRuntime(snapshot, core.RunModeLive, btime.UTCStamp())
+	if err != nil {
+		return err
+	}
+	defer func() { rt.Close(); rt.Join() }()
+	factory, closeFactory := session.spiderExchangeFactory(snapshot, rt.Exchange)
+	defer closeFactory()
+	runtimeFactory := data.SpiderRuntimeFactory(func(ctx context.Context, name, market string) (*data.RuntimeDeps, func(), *errs.Error) {
+		if name == rt.Core.ExgName && market == rt.Core.Market {
+			return rt.DataDeps(), func() {}, nil
+		}
+		return newDevChildRuntime(session, snapshot, ctx, name, market, factory)
+	})
+	addr := snapshot.View().SpiderAddr
+	if addr == "" {
+		addr = "127.0.0.1:6789"
+	}
+	return data.RunLiveSpiderWithRuntimeDeps(rt.Context(), addr, rt.DataDeps(), runtimeFactory, startup)
 }
 
 func LoadKLinesToDB(args *config.CmdArgs) *errs.Error {
-	return runLegacyEntrySession(func() *errs.Error { return loadKLinesToDB(args) })
+	return loadKLinesToDB(args)
 }
 
 func loadKLinesToDB(args *config.CmdArgs) *errs.Error {
-	err := biz.SetupComsExg(args)
+	if args == nil || args.InPath == "" {
+		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
+	}
+	session, snapshot, err := openExplicitEntrySession(args)
 	if err != nil {
 		return err
 	}
-	if args.InPath == "" {
-		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
+	defer session.close()
+	rt, err := session.newRuntime(snapshot, core.RunModeData, btime.UTCStamp())
+	if err != nil {
+		return err
 	}
+	defer func() { rt.Close(); rt.Join() }()
+	cfg := snapshot.View()
+	if cfg.Exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "exchange config is required")
+	}
+	sess, conn, err := rt.Storage.Conn(rt.Context())
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	sess = sess.WithSeriesSymbolState(rt.Symbols).WithExchange(rt.Exchange).
+		WithKlineRuntimeOptions(orm.NewKlineRuntimeOptions(rt.Core, cfg, rt.Clock.TimeMS(), rt.Storage))
 	names, err := data.FindPathNames(args.InPath, ".zip")
 	if err != nil {
 		return err
@@ -229,10 +282,13 @@ func loadKLinesToDB(args *config.CmdArgs) *errs.Error {
 	names = names[1:]
 	totalNum := len(names) * core.StepTotal
 	pBar := utils.NewPrgBar(totalNum, "load1m")
-	zArgs := []string{core.ExgName, core.Market, core.ContractType}
+	deps := &biz.KlineLoadRuntimeDeps{
+		Context: rt.Context(), Queries: sess, Symbols: rt.Symbols, Exchange: rt.Exchange,
+		ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType,
+	}
 	for _, name := range names {
 		fileInPath := filepath.Join(dirPath, name)
-		err = data.ReadZipCSVs(fileInPath, pBar, biz.LoadZipSeries, zArgs)
+		err = data.ReadZipCSVs(fileInPath, pBar, biz.LoadZipSeriesWithRuntimeDeps(deps), nil)
 		if err != nil {
 			return err
 		}
@@ -242,27 +298,62 @@ func loadKLinesToDB(args *config.CmdArgs) *errs.Error {
 }
 
 func AggKlineBigs(args *config.CmdArgs) *errs.Error {
-	return runLegacyEntrySession(func() *errs.Error { return aggKlineBigs(args) })
+	return aggKlineBigs(args)
 }
 
 func aggKlineBigs(args *config.CmdArgs) *errs.Error {
-	err := biz.SetupComsExg(args)
+	session, snapshot, err := openExplicitEntrySession(args)
 	if err != nil {
 		return err
 	}
-	return biz.AggBigKlines(args)
+	defer session.close()
+	rt, err := session.newRuntime(snapshot, core.RunModeData, btime.UTCStamp())
+	if err != nil {
+		return err
+	}
+	defer func() { rt.Close(); rt.Join() }()
+	cfg := snapshot.View()
+	if cfg.Exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "exchange config is required")
+	}
+	sess, conn, err := rt.Storage.Conn(rt.Context())
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	sess = sess.WithSeriesSymbolState(rt.Symbols).WithExchange(rt.Exchange).
+		WithKlineRuntimeOptions(orm.NewKlineRuntimeOptions(rt.Core, cfg, rt.Clock.TimeMS(), rt.Storage))
+	if err := sess.LoadExgSymbols(cfg.Exchange.Name); err != nil {
+		return err
+	}
+	var startMS, endMS int64
+	if cfg.TimeRange != nil {
+		startMS, endMS = cfg.TimeRange.StartMS, cfg.TimeRange.EndMS
+	}
+	return biz.AggBigKlinesWithRuntimeDeps(args, &biz.KlineAggRuntimeDeps{
+		Context: rt.Context(), Queries: sess, Symbols: rt.Symbols, Exchange: rt.Exchange,
+		ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType, StartMS: startMS, EndMS: endMS,
+	})
 }
 
 func runInit(args *config.CmdArgs) *errs.Error {
-	args.Init()
-	errs.PrintErr = utils.PrintErr
-	dataDir := config.GetDataDir()
+	if args == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "command arguments are required")
+	}
+	dataDir := args.DataDir
+	if dataDir == "" {
+		dataDir = os.Getenv("BanDataDir")
+	}
+	if dataDir == "" {
+		return errs.NewMsg(errs.CodeParamRequired, "-datadir is required")
+	}
+	args.DataDir = dataDir
 	fmt.Printf("BanDataDir=%s\n", dataDir)
-	err := biz.InitDataDir()
+	err := biz.InitDataDirAt(dataDir)
 	if err != nil {
 		return err
 	}
-	err = config.LoadConfig(args)
+	_, err = config.LoadRuntimeSnapshot(args)
 	if err != nil {
 		return err
 	}
@@ -271,29 +362,9 @@ func runInit(args *config.CmdArgs) *errs.Error {
 }
 
 func runDataExport(args *config.CmdArgs) *errs.Error {
-	if len(args.Configs) == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "-config is required")
-	}
-	cfgPath := args.Configs[len(args.Configs)-1]
-	args.Configs = args.Configs[:len(args.Configs)-1]
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
-	}
-	if args.OutPath == "" {
-		return errs.NewMsg(errs.CodeParamRequired, "-out is required")
-	}
-	cfgPath = config.ParsePath(cfgPath)
-	return orm.ExportKData(cfgPath, args.OutPath, args.Concur, nil)
+	return runExplicitDataExport(args)
 }
 
 func runDataImport(args *config.CmdArgs) *errs.Error {
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
-	}
-	if args.InPath == "" {
-		return errs.NewMsg(errs.CodeParamRequired, "-in is required")
-	}
-	return orm.ImportData(args.InPath, args.Concur, nil)
+	return runExplicitDataImport(args)
 }

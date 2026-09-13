@@ -11,16 +11,53 @@ import (
 // DataSourceCatalog owns the data sources available to one runtime.
 // The zero value is ready for use.
 type DataSourceCatalog struct {
-	mu       sync.RWMutex
-	sources  map[string]DataSource
-	statuses map[string]*DataSourceStatus
+	mu        sync.RWMutex
+	sources   map[string]DataSource
+	statuses  map[string]*DataSourceStatus
+	factories map[string]DataSourceFactory
 }
+
+// DataSourceFactory must return a fresh provider instance for every Runtime.
+// Use it for stateful providers; direct registrations are legacy-only.
+type DataSourceFactory func() DataSource
 
 func NewDataSourceCatalog() *DataSourceCatalog {
 	return &DataSourceCatalog{
-		sources:  make(map[string]DataSource),
-		statuses: make(map[string]*DataSourceStatus),
+		sources:   make(map[string]DataSource),
+		statuses:  make(map[string]*DataSourceStatus),
+		factories: make(map[string]DataSourceFactory),
 	}
+}
+
+// RuntimeCatalogFromRegisteredSources creates the explicit runtime catalog at
+// the process-registration boundary. Registrations remain process-scoped
+// definitions, while every Runtime receives its own catalog and status state.
+func RuntimeCatalogFromRegisteredSources() (*DataSourceCatalog, error) {
+	catalog := NewDataSourceCatalog()
+	legacyDataSourceCatalog.mu.RLock()
+	factories := make(map[string]DataSourceFactory, len(legacyDataSourceCatalog.factories))
+	for name, factory := range legacyDataSourceCatalog.factories {
+		factories[name] = factory
+	}
+	sources := make(map[string]DataSource, len(legacyDataSourceCatalog.sources))
+	for name, source := range legacyDataSourceCatalog.sources {
+		sources[name] = source
+	}
+	legacyDataSourceCatalog.mu.RUnlock()
+	for name := range sources {
+		factory := factories[name]
+		if factory == nil {
+			return nil, fmt.Errorf("data source %q is registered without a runtime factory; use RegisterDataSourceFactory", name)
+		}
+		source := factory()
+		if source == nil || source.Info() == nil || source.Info().Name != name {
+			return nil, fmt.Errorf("data source factory %q returned an invalid source", name)
+		}
+		if err := catalog.RegisterDataSource(source); err != nil {
+			return nil, err
+		}
+	}
+	return catalog, nil
 }
 
 func (c *DataSourceCatalog) initLocked() {
@@ -30,6 +67,34 @@ func (c *DataSourceCatalog) initLocked() {
 	if c.statuses == nil {
 		c.statuses = make(map[string]*DataSourceStatus)
 	}
+	if c.factories == nil {
+		c.factories = make(map[string]DataSourceFactory)
+	}
+}
+
+// RegisterDataSourceFactory registers a definition and retains the factory
+// needed to instantiate isolated providers for explicit Runtime catalogs.
+func (c *DataSourceCatalog) RegisterDataSourceFactory(name string, factory DataSourceFactory) error {
+	if name == "" {
+		return fmt.Errorf("data source factory name is required")
+	}
+	if factory == nil {
+		return fmt.Errorf("data source factory is nil")
+	}
+	src := factory()
+	if src == nil || src.Info() == nil || src.Info().Name != name {
+		return fmt.Errorf("data source factory returned nil source")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.initLocked()
+	if _, exists := c.sources[name]; exists {
+		return fmt.Errorf("data source %q already registered", name)
+	}
+	c.sources[name] = src
+	c.statuses[name] = newDataSourceStatus(src, src.Info())
+	c.factories[name] = factory
+	return nil
 }
 
 func (c *DataSourceCatalog) RegisterDataSource(src DataSource) error {

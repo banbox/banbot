@@ -18,17 +18,18 @@ func TestInitLocalLiveOrderMgrWithRuntimeDepsUsesOwnedAccounts(t *testing.T) {
 	})
 
 	trading := NewTradingState()
-	deps := RuntimeDeps{
-		Core:    &core.State{RunEnv: core.RunEnvDryRun},
-		Config:  config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{"runtime-only": {}}}),
-		Trading: trading,
-	}
+	deps := completeTraderDepsForTest(RuntimeDeps{
+		Core:     &core.State{RunEnv: core.RunEnvDryRun},
+		Config:   config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{"runtime-only": {}}}),
+		Accounts: map[string]*config.AccountConfig{"runtime-only": {}},
+		Trading:  trading,
+	})
 	InitLocalLiveOrderMgrWithRuntimeDeps(deps, nil, false)
 
-	if _, ok := trading.OrderManagers["runtime-only"]; !ok {
+	if trading.OrderManager("runtime-only") == nil {
 		t.Fatal("runtime-only local live manager was not initialized")
 	}
-	if _, ok := trading.OrderManagers["legacy-only"]; ok {
+	if trading.OrderManager("legacy-only") != nil {
 		t.Fatal("legacy account leaked into runtime local live managers")
 	}
 	if len(accOdMgrs) != 0 {

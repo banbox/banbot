@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banexg"
 	"github.com/jackc/pgx/v5"
 )
@@ -33,6 +34,34 @@ func TestExplicitQueryAlignmentUsesBoundExchange(t *testing.T) {
 	}
 	if got := q.alignOff(exs, hourMS); got != 0 {
 		t.Fatalf("short timeframe alignment offset = %d, want 0", got)
+	}
+}
+
+func TestSeriesForwardReadKeepsHistoricalEndAndClampsLiveUnfinishedBar(t *testing.T) {
+	const (
+		startMS = int64(1_767_225_600_000)
+		endMS   = startMS + 4*60*60*1000
+	)
+	exs := &ExSymbol{ID: 7, Exchange: "runtime", Market: banexg.MarketSpot, Symbol: "BTC/USDT"}
+	exchange := &questVisibilityExchangeStub{info: &banexg.ExgInfo{ID: exs.Exchange, MarketType: exs.Market}}
+	readEnd := func(backtest, withUnFinish bool) string {
+		var sqlText string
+		q := NewWithStorage(&visibilityDBStub{query: func(sql string, _ ...interface{}) (pgx.Rows, error) {
+			sqlText = sql
+			return newInterfaceRows(nil), nil
+		}}, NewStorage(nil, true, t.Name())).
+			WithExchange(exchange).
+			WithKlineRuntimeOptions(KlineRuntimeOptions{Backtest: backtest, NowMS: startMS, ClockValid: true})
+		if _, _, err := q.GetSeriesFields(exs, "1h", nil, startMS, endMS, 0, withUnFinish); err != nil {
+			t.Fatal(err)
+		}
+		return sqlText
+	}
+	if sqlText := readEnd(true, false); !strings.Contains(sqlText, "ts < cast(1767240000000000 as timestamp)") {
+		t.Fatalf("historical forward read was clipped: %s", sqlText)
+	}
+	if sqlText := readEnd(false, true); !strings.Contains(sqlText, "ts < cast(1767225600000000 as timestamp)") {
+		t.Fatalf("live unfinished-bar read was not clamped: %s", sqlText)
 	}
 }
 
@@ -568,6 +597,7 @@ func TestUpdateSeriesValidatesRowsBeforeRangeUpdate(t *testing.T) {
 }
 
 func TestInsertOHLCVSeriesAutoPostgresRollbackKeepsRecoveryJob(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesRepoTestApp(t, mustFindSeriesRepoConfig(t, "config.local.yml"))
 	if IsQuestDB {
 		t.Skip("postgres/timescale backend is not active")

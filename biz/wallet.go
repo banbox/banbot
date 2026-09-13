@@ -171,7 +171,9 @@ func InitFakeWallets(symbols ...string) {
 // runtime. It never writes the package-level wallet registry.
 func InitFakeWalletsWithRuntimeDeps(deps RuntimeDeps, symbols ...string) *BanWallets {
 	if deps.Trading == nil {
-		deps.Trading = NewTradingState()
+		// This constructor returns no error, and allocating into this value copy
+		// would make the new wallet unreachable by the runtime owner.
+		panic("runtime fake wallets require trading state")
 	}
 	account := deps.DefaultAccount
 	if account == "" {
@@ -551,14 +553,14 @@ func RestoreDryRunWalletSnapshotWithRuntimeDeps(deps RuntimeDeps) bool {
 	items, _, err := ormo.LoadLatestWalletSnapshot(task.ID, deps.DefaultAccount, deps.Orders)
 	if err != nil || len(items) == 0 {
 		if err != nil {
-			log.Warn("load runtime dry_run wallet snapshot fail, fallback to config wallet", zap.Error(err))
+			deps.Logger().Warn("load runtime dry_run wallet snapshot fail, fallback to config wallet", zap.Error(err))
 		}
 		return false
 	}
 	wallets := deps.Trading.Wallet(deps.DefaultAccount)
 	wallets.restoreFromItems(items)
 	wallets.TryUpdateStakePctAmt()
-	log.Info("runtime dry_run wallet restored", zap.Int("coins", len(wallets.Items)))
+	deps.Logger().Info("runtime dry_run wallet restored", zap.Int("coins", len(wallets.Items)))
 	return true
 }
 
@@ -619,16 +621,16 @@ func StartLiveWalletSnapshotsWithRuntimeDeps(deps RuntimeDeps, lifecycle WalletR
 func startLiveWalletSnapshotsForDeps(deps *RuntimeDeps, lifecycle WalletRuntimeLifecycle) {
 	if lifecycle == nil {
 		if deps != nil {
-			log.Error("runtime wallet snapshots require a lifecycle")
+			deps.Logger().Error("runtime wallet snapshots require a lifecycle")
 		}
 		return
 	}
 	if deps != nil && deps.Trading == nil {
-		log.Error("runtime wallet snapshots require trading state")
+		deps.Logger().Error("runtime wallet snapshots require trading state")
 		return
 	}
 	if deps != nil && deps.Clock == nil {
-		log.Error("runtime wallet snapshots require clock")
+		deps.Logger().Error("runtime wallet snapshots require clock")
 		return
 	}
 	ctx := lifecycle.Context()
@@ -660,7 +662,7 @@ func startLiveWalletSnapshotsForDeps(deps *RuntimeDeps, lifecycle WalletRuntimeL
 		}
 		if deps != nil {
 			if err := saveWalletSnapshotWithRuntimeDeps(deps, account, timeMS, true); err != nil {
-				log.Warn("save live wallet snapshot fail", zap.Error(err), zap.String("account", account))
+				deps.Logger().Warn("save live wallet snapshot fail", zap.Error(err), zap.String("account", account))
 			}
 		} else {
 			saveWalletSnapshot(account, timeMS, true, &liveSnapshotCfg)
@@ -688,10 +690,10 @@ func startLiveWalletSnapshotsForDeps(deps *RuntimeDeps, lifecycle WalletRuntimeL
 					}
 					if deps != nil {
 						if err := saveWalletSnapshotWithRuntimeDeps(deps, account, timeMS, false); err != nil {
-							log.Warn("save live wallet snapshot fail", zap.Error(err), zap.String("account", account))
+							deps.Logger().Warn("save live wallet snapshot fail", zap.Error(err), zap.String("account", account))
 						}
 					} else if err := saveWalletSnapshot(account, timeMS, false, &liveSnapshotCfg); err != nil {
-						log.Warn("save live wallet snapshot fail", zap.Error(err), zap.String("account", account))
+						deps.Logger().Warn("save live wallet snapshot fail", zap.Error(err), zap.String("account", account))
 					}
 				}
 			case <-done:
@@ -946,7 +948,7 @@ func (w *BanWallets) CostAva(odKey string, symbol string, amount float64, negati
 		wallet.lock.Unlock()
 		return 0, errs.NewMsg(core.ErrLowFunds, "wallet %s balance %.5f < %.5f", symbol, srcAmount, amount)
 	}
-	log.Debug("CostAva wallet", zap.String("key", odKey), zap.String("coin", symbol),
+	w.runtimeCore.Log().Debug("CostAva wallet", zap.String("key", odKey), zap.String("coin", symbol),
 		zap.Float64("ava", wallet.Available), zap.Float64("cost", realCost))
 	wallet.Available -= realCost
 	wallet.Pendings[odKey] = realCost
@@ -978,7 +980,7 @@ func (w *BanWallets) CostFrozen(odKey string, symbol string, amount float64) flo
 		frozenAmt = 0
 	}
 
-	log.Debug("CostFrozen wallet", zap.String("key", odKey), zap.String("coin", symbol),
+	w.runtimeCore.Log().Debug("CostFrozen wallet", zap.String("key", odKey), zap.String("coin", symbol),
 		zap.Float64("ava", wallet.Available), zap.Float64("add", frozenAmt-amount))
 	// Return the remaining portion of the freeze to available, either positive or negative.
 	// 将冻结的剩余部分归还到available，正负都有可能
@@ -1022,7 +1024,7 @@ func (w *BanWallets) ConfirmPending(odKey string, srcKey string, srcAmount float
 	leftPending := pendingAmt - srcAmount
 	delete(src.Pendings, odKey)
 
-	log.Debug("ConfirmPending wallet", zap.String("key", odKey), zap.String("from", srcKey),
+	w.runtimeCore.Log().Debug("ConfirmPending wallet", zap.String("key", odKey), zap.String("from", srcKey),
 		zap.Float64("ava", src.Available), zap.Float64("leftPend", leftPending))
 	// The remaining pending amount is returned to available (positive or negative)
 	src.Available += leftPending // 剩余的 pending 金额归还到 available（正负都可能）
@@ -1069,7 +1071,7 @@ func (w *BanWallets) Cancel(odKey string, symbol string, addAmount float64, from
 	}
 	wallet.Available += srcAmount
 	wallet.lock.Unlock()
-	log.Debug("cancel to ava", zap.String("tag", tag), zap.Float64("srcAmt", srcAmount),
+	w.runtimeCore.Log().Debug("cancel to ava", zap.String("tag", tag), zap.Float64("srcAmt", srcAmount),
 		zap.String("od", odKey), zap.String("coin", symbol), zap.Float64("ava", wallet.Available))
 }
 
@@ -1143,7 +1145,7 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 		// Futures contract, spot long order lock quote
 		// 期货合约，现货多单锁定quote
 		if legalCost < core.MinStakeAmount {
-			log.Warn(fmt.Sprintf("cost should >= %v, cur: %.2f, order: %v", core.MinStakeAmount, legalCost, od.Key()))
+			w.runtimeCore.Log().Warn(fmt.Sprintf("cost should >= %v, cur: %.2f, order: %v", core.MinStakeAmount, legalCost, od.Key()))
 		}
 
 		if isFuture {
@@ -1198,7 +1200,7 @@ func (w *BanWallets) ConfirmOdEnter(od *ormo.InOutOrder, enterPrice float64) {
 
 	parts, err := w.settlementSymbolParts(exs.Symbol)
 	if err != nil {
-		log.Error("resolve wallet symbol", zap.Error(err))
+		w.runtimeCore.Log().Error("resolve wallet symbol", zap.Error(err))
 		return
 	}
 	baseCode, quoteCode := parts[0], parts[1]
@@ -1237,7 +1239,7 @@ func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 	}
 	parts, err := w.settlementSymbolParts(exs.Symbol)
 	if err != nil {
-		log.Error("resolve wallet symbol", zap.Error(err))
+		w.runtimeCore.Log().Error("resolve wallet symbol", zap.Error(err))
 		return
 	}
 	baseCode, quoteCode := parts[0], parts[1]
@@ -1266,7 +1268,7 @@ func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 		if baseAmount > 0 {
 			_, err := w.CostAva(od.Key(), baseCode, baseAmount, false, 0.01)
 			if err != nil {
-				log.Error("exit order fail", zap.String("od", od.Key()))
+				w.runtimeCore.Log().Error("exit order fail", zap.String("od", od.Key()))
 			}
 		}
 	}
@@ -1284,7 +1286,7 @@ func (w *BanWallets) ConfirmOdExit(od *ormo.InOutOrder, exitPrice float64) {
 	curFee := subOd.FeeQuote
 	parts, err := w.settlementSymbolParts(exs.Symbol)
 	if err != nil {
-		log.Error("resolve wallet symbol", zap.Error(err))
+		w.runtimeCore.Log().Error("resolve wallet symbol", zap.Error(err))
 		return
 	}
 	baseCode, quoteCode := parts[0], parts[1]
@@ -1458,7 +1460,7 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 				// When the loss reaches the initial margin ratio, increase the margin for this order to avoid forced liquidation.
 				// 当亏损达到初始保证金比例时，为此订单增加保证金避免强平
 				lossPct := marginAddRate * 100
-				log.Debug("loss addMargin", zap.Float64("lossPct", lossPct),
+				w.runtimeCore.Log().Debug("loss addMargin", zap.Float64("lossPct", lossPct),
 					zap.String("od", odKey), zap.Float64("profit", od.Profit),
 					zap.Float64("margin", curMargin))
 				curMargin -= od.Profit
@@ -1468,7 +1470,7 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 		// 价格走势和预期相同。所需保证金增长
 		err := wallet.SetMargin(odKey, curMargin)
 		if err != nil {
-			log.Debug("cash lack, add margin fail", zap.String("od", odKey), zap.Error(err))
+			w.runtimeCore.Log().Debug("cash lack, add margin fail", zap.String("od", odKey), zap.Error(err))
 		}
 	}
 	return nil
@@ -1581,7 +1583,7 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 		prices = append(prices, price)
 	}
 	if len(skips) > 0 {
-		log.Info("skip pairs in wallet.calcLegal", zap.Int("num", len(skips)),
+		w.runtimeCore.Log().Info("skip pairs in wallet.calcLegal", zap.Int("num", len(skips)),
 			zap.String("pairs", strings.Join(skips, ",")))
 	}
 
@@ -1704,13 +1706,13 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 			return
 		}
 		if acc.StakePctAmt == 0 {
-			log.Debug("set runtime StakePctAmt by stake_pct", zap.Float64("totalLegal", rawLegal),
+			w.runtimeCore.Log().Debug("set runtime StakePctAmt by stake_pct", zap.Float64("totalLegal", rawLegal),
 				zap.Float64("amount", pctAmt))
 			acc.StakePctAmt = pctAmt
 		} else if math.Abs(pctAmt/acc.StakePctAmt-1) >= 0.2 {
 			dateMS := w.runtimeClock.TimeMS()
 			date := btime.ToDateStr(dateMS, core.DefaultDateFmt)
-			log.Debug("runtime stake amount changed by stake_pct", zap.String("d", date),
+			w.runtimeCore.Log().Debug("runtime stake amount changed by stake_pct", zap.String("d", date),
 				zap.Float64("old", acc.StakePctAmt), zap.Float64("new", pctAmt))
 			acc.StakePctAmt = pctAmt
 		}
@@ -1729,14 +1731,14 @@ func (w *BanWallets) TryUpdateStakePctAmt() {
 			// 四舍五入到十位
 			pctAmt := math.Round(legalValue*config.StakePct/1000) * 10
 			if acc.StakePctAmt == 0 {
-				log.Debug("set StakePctAmt by stake_pct", zap.Float64("totalLegal", rawLegal),
+				w.runtimeCore.Log().Debug("set StakePctAmt by stake_pct", zap.Float64("totalLegal", rawLegal),
 					zap.Float64("amount", pctAmt))
 				acc.StakePctAmt = pctAmt
 			} else if math.Abs(pctAmt/acc.StakePctAmt-1) >= 0.2 {
 				// Update only if total assets change by more than 20%
 				// 总资产变化超过20%才更新
 				date := btime.ToDateStr(btime.TimeMS(), core.DefaultDateFmt)
-				log.Debug("stake amount changed by stake_pct", zap.String("d", date),
+				w.runtimeCore.Log().Debug("stake amount changed by stake_pct", zap.String("d", date),
 					zap.Float64("old", acc.StakePctAmt), zap.Float64("new", pctAmt))
 				acc.StakePctAmt = pctAmt
 			}

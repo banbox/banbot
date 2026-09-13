@@ -1,24 +1,29 @@
 package web
 
 import (
+	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/web/dev"
 	"github.com/banbox/banbot/web/live"
 	"github.com/banbox/banexg/errs"
 	"github.com/spf13/cobra"
 )
 
-/*
-RunDev
+type DevServerFactory = dev.ServerFactory
 
-Run web UI robot panel
-运行web ui机器人面板
-*/
-func RunDev(args []string) error {
-	return dev.Run(args)
+// RunDev preserves the public Web utility entry. Pass a typed factory to keep
+// the invocation isolated from process-global runtime state.
+func RunDev(args []string, factories ...DevServerFactory) error {
+	return dev.Run(args, factories...)
 }
 
-func NewCommand() *cobra.Command {
-	return dev.NewCommand()
+// NewCommand preserves the public Cobra command API with optional explicit
+// runtime construction.
+func NewCommand(factories ...DevServerFactory) *cobra.Command {
+	return dev.NewCommand(factories...)
+}
+
+func NewDevCommandWithFactory(factory DevServerFactory) *cobra.Command {
+	return dev.NewCommandWithFactory(factory)
 }
 
 /*
@@ -31,18 +36,8 @@ func StartApi() *errs.Error {
 	return live.StartApi()
 }
 
-func StartApiWithLifecycle(lifecycle live.ServerLifecycle) (*live.ApiServer, *errs.Error) {
-	return live.StartApiWithLifecycle(lifecycle)
-}
+type ApiServer = live.ApiServer
 
-// StartApiWithLifecycleInLegacySession is used by a legacy runner that
-// already owns the process-wide compatibility gate.
-func StartApiWithLifecycleInLegacySession(lifecycle live.ServerLifecycle) (*live.ApiServer, *errs.Error) {
-	return live.StartApiWithLifecycleInLegacySession(lifecycle)
-}
-
-// StartApiInLegacySession is used by a legacy runner that already owns the
-// process-wide compatibility gate.
-func StartApiInLegacySession() *errs.Error {
-	return live.StartApiInLegacySession()
+func StartApiWithRuntimeDeps(lifecycle live.ServerLifecycle, deps biz.RuntimeDeps) (*ApiServer, *errs.Error) {
+	return live.StartApiWithRuntimeDeps(lifecycle, deps)
 }

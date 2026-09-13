@@ -848,7 +848,7 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 	stopUntil, _ := o.noEnterUntilFor(o.Account)
 	if curMS < stopUntil {
 		if o.isLive() {
-			log.Warn("any enter forbid", pairZapField)
+			o.Logger().Warn("any enter forbid", pairZapField)
 		}
 		o.addAccFailOpens(strat.FailOpenNoEntry, len(enters))
 		return nil, map[string]int{"AccNoEntry": rawNum}
@@ -1010,7 +1010,7 @@ func (o *OrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*or
 			var reasons map[string]int
 			enters, reasons = o.allowOrderEnter(exs, job.TimeFrame, enters)
 			if o.isLive() && len(enters) < rawNum {
-				log.Info("skip enters by allowOrderEnter", zap.Any("tags", reasons))
+				o.Logger().Info("skip enters by allowOrderEnter", zap.Any("tags", reasons))
 			}
 			for _, ent := range enters {
 				iorder, err := o.enterOrder(exs, job.TimeFrame, ent, false)
@@ -1130,7 +1130,7 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 	if doCheck {
 		enters, reasons := o.allowOrderEnter(exs, tf, []*strat.EnterReq{req})
 		if len(enters) == 0 {
-			log.Warn("skip enter by allowOrderEnter", zap.Any("reasons", reasons))
+			o.Logger().Warn("skip enter by allowOrderEnter", zap.Any("reasons", reasons))
 			return nil, nil
 		}
 	}
@@ -1152,7 +1152,7 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 	if o.runtimeDeps && o.walletDeps.Strategies != nil {
 		stgVer, _ = o.walletDeps.Strategies.Version(req.StratName)
 	} else {
-		stgVer, _ = strat.LegacyState().Version(req.StratName)
+		stgVer, _ = strat.GetVersion(req.StratName)
 	}
 	odSide := banexg.OdSideBuy
 	if req.Short {
@@ -1366,7 +1366,7 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 		if o.isLive() {
 			fields := req.GetZapFields(nil, zap.String("acc", o.Account), zap.String("pair", pairs),
 				zap.Int("all", len(openOds)))
-			log.Warn("no match orders to exit", fields...)
+			o.Logger().Warn("no match orders to exit", fields...)
 		}
 		return nil, nil
 	}
@@ -1557,7 +1557,7 @@ func (o *OrderMgr) exitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InO
 		req.ExitRate = 1
 		err := od.Save()
 		if err != nil {
-			log.Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
+			o.Logger().Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
 		}
 		return o.exitOrder(part, req)
 	}
@@ -1638,7 +1638,7 @@ func (o *OrderMgr) CutOrder(od *ormo.InOutOrder, enterRate, exitRate float64) *o
 	tgtKey, srcKey := od.Key(), part.Key()
 	parts, parseErr := o.priceSymbolParts(od.Symbol)
 	if parseErr != nil {
-		log.Error("resolve order symbol parts fail", zap.String("symbol", od.Symbol), zap.Error(parseErr))
+		o.Logger().Error("resolve order symbol parts fail", zap.String("symbol", od.Symbol), zap.Error(parseErr))
 		parts = [4]string{}
 	}
 	base, quote := parts[0], parts[1]
@@ -1669,7 +1669,7 @@ func (o *OrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 			if cfg := o.walletDeps.Strategies.GetStratPerf(od.Symbol, od.Strategy); cfg != nil && cfg.Enable {
 				if err2 := strat.CalcJobScoresWithState(o.walletDeps.Strategies, o.runtimeCore, o.orderState(), account,
 					od.Symbol, od.Timeframe, od.Strategy); err2 != nil {
-					log.Error("calc job performance fail", zap.Error(err2),
+					o.Logger().Error("calc job performance fail", zap.Error(err2),
 						zap.Strings("job", []string{od.Symbol, od.Timeframe, od.Strategy}))
 				}
 			}
@@ -1678,7 +1678,7 @@ func (o *OrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 		cfg := strat.GetStratPerf(od.Symbol, od.Strategy)
 		if cfg != nil && cfg.Enable && o.Account == config.DefAcc {
 			if err2 := strat.CalcJobScores(od.Symbol, od.Timeframe, od.Strategy); err2 != nil {
-				log.Error("calc job performance fail", zap.Error(err2),
+				o.Logger().Error("calc job performance fail", zap.Error(err2),
 					zap.Strings("job", []string{od.Symbol, od.Timeframe, od.Strategy}))
 			}
 		}

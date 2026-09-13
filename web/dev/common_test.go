@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/orm/ormu"
 )
 
@@ -24,6 +25,10 @@ run_policy:
   - name: first
   - name: second
 `
+
+func newTestDevServer(dataDir string) *DevServer {
+	return newDevServer(DevDeps{Data: &data.RuntimeDeps{Config: config.NewSnapshotWithDirs(nil, dataDir, "")}})
+}
 
 func writeSeparateReport(t *testing.T, dir string, orderNum int) {
 	t.Helper()
@@ -94,13 +99,14 @@ func TestCollectBtTaskResultWaitsForMissingSeparateReport(t *testing.T) {
 }
 
 func TestPrepareBacktestConfigFilesUsesRequestPrivateCopies(t *testing.T) {
-	firstDir, firstPaths, err := prepareBacktestConfigFiles(
+	server := newTestDevServer(t.TempDir())
+	firstDir, firstPaths, err := server.prepareBacktestConfigFiles(
 		map[string]string{"@config.yml": "name: first\n"}, []string{"@config.yml"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(firstDir)
-	secondDir, secondPaths, err := prepareBacktestConfigFiles(
+	secondDir, secondPaths, err := server.prepareBacktestConfigFiles(
 		map[string]string{"@config.yml": "name: second\n"}, []string{"@config.yml"})
 	if err != nil {
 		t.Fatal(err)
@@ -141,25 +147,25 @@ func TestPrepareBacktestConfigFilesRejectsBasenameCollision(t *testing.T) {
 	if err := os.WriteFile(secondPath, []byte("name: second\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if tempDir, paths, err := prepareBacktestConfigFiles(nil, []string{firstPath, secondPath}); err == nil {
+	server := newTestDevServer(t.TempDir())
+	if tempDir, paths, err := server.prepareBacktestConfigFiles(nil, []string{firstPath, secondPath}); err == nil {
 		_ = os.RemoveAll(tempDir)
 		t.Fatalf("basename collision was accepted with paths %q", paths)
 	}
 }
 
 func TestTaskReportDirsResolveSeparateChildren(t *testing.T) {
-	oldDataDir := config.DataDir
-	config.DataDir = t.TempDir()
-	t.Cleanup(func() { config.DataDir = oldDataDir })
+	dataDir := t.TempDir()
+	server := newTestDevServer(dataDir)
 	task := &ormu.Task{
 		Path: "abc",
 		Info: `{"separate":true,"reportPaths":["abc/policy_1","abc/policy_2"]}`,
 	}
-	dirs, err := taskReportDirs(task)
+	dirs, err := server.taskReportDirs(task)
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := filepath.Join(config.DataDir, "backtest", "abc")
+	root := filepath.Join(dataDir, "backtest", "abc")
 	want := []string{filepath.Join(root, "policy_1"), filepath.Join(root, "policy_2")}
 	if len(dirs) != len(want) || dirs[0] != want[0] || dirs[1] != want[1] {
 		t.Fatalf("separate report dirs = %q, want %q", dirs, want)
@@ -167,14 +173,12 @@ func TestTaskReportDirsResolveSeparateChildren(t *testing.T) {
 }
 
 func TestTaskReportDirsRejectTraversal(t *testing.T) {
-	oldDataDir := config.DataDir
-	config.DataDir = t.TempDir()
-	t.Cleanup(func() { config.DataDir = oldDataDir })
+	server := newTestDevServer(t.TempDir())
 	task := &ormu.Task{
 		Path: "abc",
 		Info: `{"separate":true,"reportPaths":["abc/../other"]}`,
 	}
-	if _, err := taskReportDirs(task); err == nil {
+	if _, err := server.taskReportDirs(task); err == nil {
 		t.Fatal("taskReportDirs accepted a report outside the task directory")
 	}
 }
@@ -196,10 +200,9 @@ func TestResolveReportRootRejectsTraversal(t *testing.T) {
 }
 
 func TestAppendTaskAssetsUsesValidatedSeparateReport(t *testing.T) {
-	oldDataDir := config.DataDir
-	config.DataDir = t.TempDir()
-	t.Cleanup(func() { config.DataDir = oldDataDir })
-	taskDir := filepath.Join(config.DataDir, "backtest", "abc")
+	dataDir := t.TempDir()
+	server := newTestDevServer(dataDir)
+	taskDir := filepath.Join(dataDir, "backtest", "abc")
 	if err := os.MkdirAll(filepath.Join(taskDir, "policy_1"), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +214,7 @@ func TestAppendTaskAssetsUsesValidatedSeparateReport(t *testing.T) {
 	}
 	task := &ormu.Task{Path: "abc", Status: ormu.BtStatusDone, Info: `{"separate":true,"reportPaths":["abc/policy_1"]}`}
 	result := make(map[string]interface{})
-	appendTaskAssets(task, result)
+	server.appendTaskAssets(task, result)
 	if len(result["reals"].([]float64)) != 2 {
 		t.Fatalf("assets were not loaded from separate report: %#v", result)
 	}

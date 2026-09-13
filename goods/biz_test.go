@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/rand"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/banbox/banbot/config"
@@ -11,6 +12,43 @@ import (
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg"
 )
+
+func TestFilterRegistrySupportsConcurrentRegistrationAndLookup(t *testing.T) {
+	const prefix = "runtime-filter-registry-test-"
+	const count = 32
+	var wg sync.WaitGroup
+	for i := range count {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := prefix + string(rune('a'+i))
+			RegisterFilter(name, func(base BaseFilter) IFilter { return &ShuffleFilter{BaseFilter: base} })
+			if _, ok := GetFilterFactory(name); !ok {
+				t.Errorf("filter %q was not found", name)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestFilterRegistryRejectsInvalidRegistration(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		factory FilterFactory
+	}{{factory: func(base BaseFilter) IFilter { return &ShuffleFilter{BaseFilter: base} }}, {name: "nil-factory"}} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("RegisterFilter(%q) did not panic", test.name)
+				}
+			}()
+			RegisterFilter(test.name, test.factory)
+		}()
+	}
+	if _, err := CreateFilter(nil, false); err == nil {
+		t.Fatal("CreateFilter accepted nil config")
+	}
+}
 
 func TestUseFrozenStaticPairsRequiresUnfilteredStrictHistoricalReplay(t *testing.T) {
 	previousBackTest, previousData := core.BackTestMode, config.Data

@@ -1,6 +1,7 @@
 package ormo
 
 import (
+	"reflect"
 	"time"
 
 	"github.com/banbox/banbot/btime"
@@ -109,10 +110,14 @@ var legacyOrderState = &OrderState{
 	taskIDAccounts:   &taskIdAccMap,
 }
 
-// LegacyState exposes the registries used by the existing package-level
-// compatibility APIs. Runtime code should pass an explicit OrderState.
-func LegacyState() *OrderState {
+func legacyStateView() *OrderState {
 	return legacyOrderState
+}
+
+// IsLegacyState reports whether state is the package compatibility view.
+// Explicit runtimes use it only to reject accidental global-state binding.
+func IsLegacyState(state *OrderState) bool {
+	return state == legacyOrderState
 }
 
 // GetOpenODs returns an account's open-order registry and its account lock.
@@ -473,6 +478,70 @@ func (s *OrderState) BindRuntime(clock *btime.ClockState, prices *com.PriceState
 	s.runtimePrices = prices
 	s.runtimeExchange = exchange
 	s.runtimeConfig = cfg
+}
+
+// CanBindRuntime reports whether this order state is unbound or already uses
+// the supplied runtime services. Construction checks it before rebinding so
+// two tasks cannot accidentally share and overwrite mutable order services.
+func (s *OrderState) CanBindRuntime(coreState *core.State, clock *btime.ClockState, prices *com.PriceState,
+	exchange banexg.BanExchange, cfg *config.Config) bool {
+	if s == nil {
+		return false
+	}
+	s.stateGuard.Lock()
+	defer s.stateGuard.Unlock()
+	return (s.runtimeCore == nil || s.runtimeCore == coreState) &&
+		(s.runtimeClock == nil || s.runtimeClock == clock) &&
+		(s.runtimePrices == nil || s.runtimePrices == prices) &&
+		(s.runtimeExchange == nil || sameRuntimeExchange(s.runtimeExchange, exchange)) &&
+		(s.runtimeConfig == nil || s.runtimeConfig == cfg)
+}
+
+// RuntimeBindingsMatch reports whether construction has already bound this
+// order state to the supplied runtime. It is read-only so downstream
+// consumers cannot race the composition root by rebinding shared state.
+func (s *OrderState) RuntimeBindingsMatch(coreState *core.State, clock *btime.ClockState, prices *com.PriceState,
+	exchange banexg.BanExchange, cfg *config.Config) bool {
+	if s == nil {
+		return false
+	}
+	s.stateGuard.Lock()
+	defer s.stateGuard.Unlock()
+	return s.runtimeCore == coreState && s.runtimeClock == clock && s.runtimePrices == prices &&
+		sameRuntimeExchange(s.runtimeExchange, exchange) && s.runtimeConfig == cfg
+}
+
+// BindRuntimeOnce claims an unbound order state for one composition root.
+// Unlike a check-then-bind sequence, the claim is held under stateGuard so a
+// second runtime cannot overwrite the services while construction is racing.
+func (s *OrderState) BindRuntimeOnce(coreState *core.State, clock *btime.ClockState, prices *com.PriceState,
+	exchange banexg.BanExchange, cfg *config.Config) bool {
+	if s == nil {
+		return false
+	}
+	s.stateGuard.Lock()
+	defer s.stateGuard.Unlock()
+	if s.runtimeCore != nil || s.runtimeClock != nil || s.runtimePrices != nil || s.runtimeExchange != nil || s.runtimeConfig != nil {
+		return s.runtimeCore == coreState && s.runtimeClock == clock && s.runtimePrices == prices &&
+			sameRuntimeExchange(s.runtimeExchange, exchange) && s.runtimeConfig == cfg
+	}
+	s.runtimeCore = coreState
+	s.runtimeClock = clock
+	s.runtimePrices = prices
+	s.runtimeExchange = exchange
+	s.runtimeConfig = cfg
+	return true
+}
+
+func sameRuntimeExchange(left, right banexg.BanExchange) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftType := reflect.TypeOf(left)
+	if leftType != reflect.TypeOf(right) || !leftType.Comparable() {
+		return false
+	}
+	return left == right
 }
 
 // TimeMS returns the timestamp owned by this order state. Explicit runtimes

@@ -15,7 +15,6 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	utils2 "github.com/banbox/banexg/utils"
@@ -41,12 +40,6 @@ func DecodeRequest(data []byte) (*RequestV1, error) {
 }
 
 func Inspect(req *RequestV1, dataDir string) (*OutputV1, error) {
-	unlock := legacygate.Lock()
-	defer unlock()
-	return inspect(req, dataDir)
-}
-
-func inspect(req *RequestV1, dataDir string) (*OutputV1, error) {
 	requestHash, cfg, err := validateRequest(req)
 	if err != nil {
 		return nil, err
@@ -54,12 +47,30 @@ func inspect(req *RequestV1, dataDir string) (*OutputV1, error) {
 	if !filepath.IsAbs(dataDir) {
 		return nil, fmt.Errorf("runtime data plan data directory must be absolute")
 	}
-	restoreConfig, err := installRuntimeConfig(req, cfg)
-	if err != nil {
-		return nil, err
+	if err := cfg.NormalizeRunPolicies(); err != nil {
+		return nil, fmt.Errorf("initialize runtime data plan config: %s", err.Short())
 	}
-	defer restoreConfig()
-	config.DataDir = dataDir
+	if cfg.PairMgr == nil {
+		cfg.PairMgr = &config.PairMgrConfig{}
+	}
+	if len(cfg.RunTimeframes) == 0 {
+		cfg.RunTimeframes = canonicalizedStrings(config.SplitTimeFrames(cfg.TimeFrames))
+	}
+	cfg.Pairs = slices.Clone(req.InitialSymbols)
+	cfg.TimeRange = &config.TimeTuple{StartMS: req.TimeStartMS, EndMS: req.TimeEndMS}
+	snapshot := config.NewSnapshotWithDirs(cfg, dataDir, "")
+	cfg = snapshot.View()
+
+	runtimeCore, coreErr := core.NewState(nil)
+	if coreErr != nil {
+		return nil, fmt.Errorf("initialize runtime data plan core state: %s", coreErr.Short())
+	}
+	defer runtimeCore.Close()
+	runtimeCore.SetRunMode(core.RunModeBackTest)
+	runtimeCore.ExgName, runtimeCore.Market = cfg.Exchange.Name, cfg.MarketType
+	runtimeCore.NetDisable = true
+	clock := btime.NewClockState(true, nil)
+	clock.SetTimeMS(req.TimeStartMS)
 
 	symbols := make([]*orm.ExSymbol, 0, len(req.MarketUniverse))
 	for _, item := range req.MarketUniverse {
@@ -73,7 +84,8 @@ func inspect(req *RequestV1, dataDir string) (*OutputV1, error) {
 		return nil, fmt.Errorf("install frozen market universe: %w", err)
 	}
 
-	semantic := collectSemanticPlan(req, cfg, symbolState)
+	strategyState := strat.NewStateWithRuntime(runtimeCore, clock, cfg, symbolState, nil)
+	semantic := collectSemanticPlan(req, cfg, symbolState, strategyState, runtimeCore, snapshot.DefaultAccount())
 	output := &OutputV1{
 		Version: Version, RequestSHA256: requestHash, SelectionMode: semantic.SelectionMode,
 		InitialSymbols: semantic.InitialSymbols, Policies: semantic.Policies,
@@ -196,63 +208,12 @@ func validateRequest(req *RequestV1) (string, *config.Config, error) {
 	return requestHash, &cfg, nil
 }
 
-func installRuntimeConfig(req *RequestV1, cfg *config.Config) (func(), error) {
-	oldData, oldExchange, oldPairMgr := config.Data, config.Exchange, config.PairMgr
-	oldPolicies, oldTFs, oldStake := config.RunPolicy, config.RunTimeframes, config.StakeCurrency
-	oldPairs, oldRange, oldDataDir := config.Pairs, config.TimeRange, config.DataDir
-	oldExg, oldMarket := core.ExgName, core.Market
-	oldBacktest, oldLive, oldNet := core.BackTestMode, core.LiveMode, core.NetDisable
-	oldTime := btime.CurTimeMS
-	restore := func() {
-		// RefineTF lookups are cached independently from RunPolicy. The
-		// inspection pass installs temporary policies below, so retaining that
-		// cache after restoring the old policy would return the temporary period
-		// for a same-named strategy. Clear it before the next caller observes
-		// the restored configuration; the first lookup repopulates it.
-		config.ClearRefineMap()
-		config.Data, config.Exchange, config.PairMgr = oldData, oldExchange, oldPairMgr
-		config.RunPolicy, config.RunTimeframes, config.StakeCurrency = oldPolicies, oldTFs, oldStake
-		config.Pairs, config.TimeRange, config.DataDir = oldPairs, oldRange, oldDataDir
-		core.ExgName, core.Market = oldExg, oldMarket
-		core.BackTestMode, core.LiveMode, core.NetDisable = oldBacktest, oldLive, oldNet
-		btime.CurTimeMS = oldTime
-	}
-
-	runTimeframes := canonicalizedStrings(cfg.RunTimeframes)
-	if len(runTimeframes) == 0 {
-		runTimeframes = canonicalizedStrings(config.SplitTimeFrames(cfg.TimeFrames))
-	}
-	pairMgr := cfg.PairMgr
-	if pairMgr == nil {
-		pairMgr = &config.PairMgrConfig{}
-	}
-	runtimeRange := &config.TimeTuple{StartMS: req.TimeStartMS, EndMS: req.TimeEndMS}
-	cfg.RunTimeframes = runTimeframes
-	cfg.Pairs = slices.Clone(req.InitialSymbols)
-	cfg.PairMgr = pairMgr
-	cfg.TimeRange = runtimeRange
-	config.Data = *cfg
-	config.Exchange = cfg.Exchange
-	config.PairMgr = pairMgr
-	config.StakeCurrency = slices.Clone(cfg.StakeCurrency)
-	config.RunTimeframes = runTimeframes
-	config.Pairs = slices.Clone(req.InitialSymbols)
-	config.TimeRange = runtimeRange
-	core.ExgName, core.Market = cfg.Exchange.Name, cfg.MarketType
-	core.BackTestMode, core.LiveMode, core.NetDisable = true, false, true
-	btime.CurTimeMS = req.TimeStartMS
-	config.ClearRefineMap()
-	if err := config.SetRunPolicy(true, cfg.RunPolicy...); err != nil {
-		restore()
-		return nil, fmt.Errorf("initialize runtime data plan policies: %s", err.Short())
-	}
-	return restore, nil
-}
-
-func collectSemanticPlan(req *RequestV1, cfg *config.Config, symbolState *orm.SymbolState) SemanticPlanV1 {
+func collectSemanticPlan(req *RequestV1, cfg *config.Config, symbolState *orm.SymbolState,
+	strategyState *strat.State, runtimeCore *core.State, defaultAccount string,
+) SemanticPlanV1 {
 	plan := SemanticPlanV1{
 		Version: Version, SelectionMode: SelectionMode, InitialSymbols: slices.Clone(req.InitialSymbols),
-		Policies: make([]PolicyV1, 0, len(config.RunPolicy)), Requirements: []RequirementV1{}, Unsupported: []UnsupportedV1{},
+		Policies: make([]PolicyV1, 0, len(cfg.RunPolicy)), Requirements: []RequirementV1{}, Unsupported: []UnsupportedV1{},
 	}
 	universe := make(map[string]*orm.ExSymbol, len(req.MarketUniverse))
 	envs := make(map[string]*ta.BarEnv)
@@ -273,7 +234,7 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config, symbolState *orm.Sy
 		// The static pair-list path does not read its one-bar discovery input.
 		frameworkPairListSymbols = nil
 	}
-	for _, policy := range config.RunPolicy {
+	for _, policy := range cfg.RunPolicy {
 		frameworkPairListSymbols = append(frameworkPairListSymbols, policy.Pairs...)
 	}
 	frameworkPairListSymbols = stableUniqueStrings(frameworkPairListSymbols)
@@ -281,15 +242,18 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config, symbolState *orm.Sy
 	// the 600-bar score requirements even when pair-list discovery is skipped.
 	frameworkPairScoreSymbols := slices.Clone(req.InitialSymbols)
 
-	for _, policy := range config.RunPolicy {
+	for _, policy := range cfg.RunPolicy {
 		policyID := policy.ID()
-		base, panicText := makeStrategy(policy)
+		base, panicText := makeStrategy(strategyState, policy)
 		if panicText != "" {
 			plan.Unsupported = append(plan.Unsupported, unsupported("constructor_panic", policyID, "", "", panicText))
 			plan.Policies = append(plan.Policies, PolicyV1{PolicyID: policyID, SelectedSymbols: []string{}, CoverageSymbols: []string{}, AllowedRunTimeframes: []string{}})
 			continue
 		}
-		baseAllowed := allowedTimeframes(base)
+		baseAllowed := allowedTimeframes(base, cfg.RunTimeframes)
+		if policy.RefineTF == nil && base.RefineTF != nil {
+			policy.RefineTF = base.RefineTF
+		}
 		if len(policy.Filters) > 0 {
 			plan.Unsupported = append(plan.Unsupported, unsupported("policy_filters_require_runtime_data", policyID, "", "", "run_policy filters cannot be evaluated without runtime market data"))
 			plan.Policies = append(plan.Policies, PolicyV1{PolicyID: policyID, SelectedSymbols: []string{}, CoverageSymbols: []string{}, AllowedRunTimeframes: baseAllowed})
@@ -323,7 +287,7 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config, symbolState *orm.Sy
 		}
 		selected = validSelected
 		frameworkPairScoreSymbols = append(frameworkPairScoreSymbols, selected...)
-		maxPair, maxPairErr := effectivePolicyMaxPair(policy, cfg)
+		maxPair, maxPairErr := effectivePolicyMaxPair(policy, cfg, defaultAccount)
 		if maxPairErr != "" {
 			plan.Unsupported = append(plan.Unsupported, unsupported("invalid_max_pair", policyID, "", "", maxPairErr))
 			selected = selected[:0]
@@ -353,7 +317,7 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config, symbolState *orm.Sy
 			jobPolicy, pairSpecific := policy.PairDup(symbol)
 			jobStrategy := base
 			if pairSpecific {
-				jobStrategy, panicText = makeStrategy(jobPolicy)
+				jobStrategy, panicText = makeStrategy(strategyState, jobPolicy)
 				if panicText != "" {
 					plan.Unsupported = append(plan.Unsupported, unsupported("constructor_panic", policyID, symbol, "", panicText))
 					continue
@@ -363,14 +327,14 @@ func collectSemanticPlan(req *RequestV1, cfg *config.Config, symbolState *orm.Sy
 					continue
 				}
 			}
-			allowed := allowedTimeframes(jobStrategy)
+			allowed := allowedTimeframes(jobStrategy, cfg.RunTimeframes)
 			for _, tf := range allowed {
 				if _, tfErr := utils2.TFToSecSafe(tf); tfErr != nil {
 					plan.Unsupported = append(plan.Unsupported, unsupported("invalid_timeframe", policyID, symbol, tf, tfErr.Error()))
 					continue
 				}
 				allowedSet[tf] = true
-				collectJob(&plan, universe, envs, policyID, jobStrategy, jobSymbol, tf)
+				collectJob(&plan, universe, envs, policyID, jobStrategy, jobSymbol, tf, defaultAccount, strategyState, runtimeCore)
 			}
 		}
 		allowed := make([]string, 0, len(allowedSet))
@@ -448,22 +412,23 @@ func collectFrameworkRequirements(plan *SemanticPlanV1, cfg *config.Config, univ
 }
 
 func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, envs map[string]*ta.BarEnv,
-	policyID string, strategy *strat.TradeStrat, symbol *orm.ExSymbol, tf string,
+	policyID string, strategy *strat.TradeStrat, symbol *orm.ExSymbol, tf, defaultAccount string, strategyState *strat.State, runtimeCore *core.State,
 ) {
 	if _, err := utils2.TFToSecSafe(tf); err != nil {
 		plan.Unsupported = append(plan.Unsupported, unsupported("invalid_timeframe", policyID, symbol.Symbol, tf, err.Error()))
 		return
 	}
-	env, err := inspectionBarEnv(envs, symbol, tf)
+	env, err := inspectionBarEnv(envs, symbol, tf, runtimeCore)
 	if err != nil {
 		plan.Unsupported = append(plan.Unsupported, unsupported("invalid_timeframe", policyID, symbol.Symbol, tf, err.Error()))
 		return
 	}
 	var effects []string
-	job := strat.NewInspectionJob(strategy, env, symbol, tf, config.DefAcc,
+	job := strat.NewInspectionJob(strategy, env, symbol, tf, defaultAccount,
 		func(name string) {
 			effects = append(effects, name)
 		})
+	job.BindRuntimeState(strategyState, runtimeCore, strategyState.Clock)
 	addRequirement(plan, RequirementV1{
 		PolicyID: policyID, JobExchange: symbol.Exchange, JobMarket: symbol.Market, JobSymbol: symbol.Symbol, JobTimeframe: tf,
 		Source: orm.SeriesSourceKline, TargetExchange: symbol.Exchange, TargetMarket: symbol.Market, TargetSymbol: symbol.Symbol,
@@ -472,7 +437,7 @@ func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, envs ma
 	if strategy.Policy.RefineTF == nil && strategy.RefineTF != nil {
 		strategy.Policy.RefineTF = strategy.RefineTF
 	}
-	matchTF, panicText := refineTimeframe(strategy.Name, tf)
+	matchTF, panicText := refineTimeframe(strategyState, strategy.Name, tf)
 	if panicText != "" {
 		plan.Unsupported = append(plan.Unsupported, unsupported("invalid_timeframe", policyID, symbol.Symbol, tf, "refine timeframe: "+panicText))
 		return
@@ -553,16 +518,16 @@ func collectJob(plan *SemanticPlanV1, universe map[string]*orm.ExSymbol, envs ma
 	}
 }
 
-func inspectionBarEnv(envs map[string]*ta.BarEnv, symbol *orm.ExSymbol, tf string) (*ta.BarEnv, error) {
+func inspectionBarEnv(envs map[string]*ta.BarEnv, symbol *orm.ExSymbol, tf string, runtimeCore *core.State) (*ta.BarEnv, error) {
 	key := strings.Join([]string{symbol.Symbol, tf}, "_")
 	if env := envs[key]; env != nil {
 		return env, nil
 	}
-	env, err := ta.NewBarEnv(core.ExgName, core.Market, symbol.Symbol, tf)
+	env, err := ta.NewBarEnv(symbol.Exchange, symbol.Market, symbol.Symbol, tf)
 	if err != nil {
 		return nil, err
 	}
-	env.MaxCache = core.NumTaCache
+	env.MaxCache = runtimeCore.NumTaCache
 	env.Data.Store("sid", int64(symbol.ID))
 	envs[key] = env
 	return env, nil
@@ -614,21 +579,21 @@ func collectSubscription(plan *SemanticPlanV1, policyID string, job *strat.Strat
 	})
 }
 
-func allowedTimeframes(strategy *strat.TradeStrat) []string {
+func allowedTimeframes(strategy *strat.TradeStrat, runtimeTimeframes []string) []string {
 	items := strategy.RunTimeFrames
 	if len(items) == 0 {
-		items = config.RunTimeframes
+		items = runtimeTimeframes
 	}
 	return canonicalizedStrings(items)
 }
 
-func makeStrategy(policy *config.RunPolicyConfig) (result *strat.TradeStrat, panicText string) {
+func makeStrategy(strategyState *strat.State, policy *config.RunPolicyConfig) (result *strat.TradeStrat, panicText string) {
 	defer func() {
 		if value := recover(); value != nil {
 			panicText = fmt.Sprint(value)
 		}
 	}()
-	result = strat.New(policy)
+	result = strategyState.NewStrategy(policy)
 	if result == nil {
 		panicText = "strategy constructor returned nil"
 	}
@@ -672,13 +637,13 @@ func callDataSubs(strategy *strat.TradeStrat, job *strat.StratJob) (result []*st
 	return strategy.OnDataSubs(job), ""
 }
 
-func refineTimeframe(strategyName, tf string) (result, panicText string) {
+func refineTimeframe(strategyState *strat.State, strategyName, tf string) (result, panicText string) {
 	defer func() {
 		if value := recover(); value != nil {
 			panicText = fmt.Sprint(value)
 		}
 	}()
-	return config.EnsureStratRefineTF(strategyName, tf), ""
+	return strategyState.RefineTimeFrame(strategyName, tf), ""
 }
 
 func addRequirement(plan *SemanticPlanV1, item RequirementV1) {
@@ -805,7 +770,7 @@ func stableUniqueStrings(items []string) []string {
 	return out
 }
 
-func effectivePolicyMaxPair(policy *config.RunPolicyConfig, cfg *config.Config) (int, string) {
+func effectivePolicyMaxPair(policy *config.RunPolicyConfig, cfg *config.Config, defaultAccount string) (int, string) {
 	if policy.MaxPair < 0 {
 		return 0, "run_policy max_pair must not be negative"
 	}
@@ -819,8 +784,8 @@ func effectivePolicyMaxPair(policy *config.RunPolicyConfig, cfg *config.Config) 
 		}
 	}
 	slices.Sort(names)
-	if slices.Contains(names, config.DefAcc) {
-		return checkedAccountMaxPair(cfg.Accounts[config.DefAcc].MaxPair)
+	if slices.Contains(names, defaultAccount) {
+		return checkedAccountMaxPair(cfg.Accounts[defaultAccount].MaxPair)
 	}
 	if len(names) > 0 {
 		return checkedAccountMaxPair(cfg.Accounts[names[0]].MaxPair)

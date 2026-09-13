@@ -1,13 +1,14 @@
 package live
 
 import (
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/legacygate"
-	"github.com/banbox/banexg/errs"
+	"github.com/banbox/banbot/core"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -77,75 +78,41 @@ func TestAPIServerStopAndJoinAreIdempotent(t *testing.T) {
 	server.Join()
 }
 
-func TestAPIServerReleasesLegacyGateOnStop(t *testing.T) {
-	unlocked := legacygate.Lock()
-	listenRelease := make(chan struct{})
-	server := newAPIServer(fiber.New(), func() error {
-		<-listenRelease
-		return nil
-	}, unlocked)
+func TestStartAPIWithLifecycleFinishesAfterListenFailure(t *testing.T) {
+	oldConfig, oldDataDir := config.APIServer, config.DataDir
+	config.DataDir = t.TempDir()
+	config.APIServer = &config.APIServerConfig{
+		Enable: true, BindIPAddr: "127.0.0.1", Port: -1,
+	}
+	t.Cleanup(func() {
+		config.APIServer, config.DataDir = oldConfig, oldDataDir
+	})
 
-	server.Stop()
-	entered := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		legacygate.With(func() struct{} {
-			close(entered)
-			return struct{}{}
-		})
-		close(done)
-	}()
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not release the legacy gate")
+	uiDir := filepath.Join(config.DataDir, "uidist")
+	if err := os.MkdirAll(uiDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(uiDir, "version.txt"), []byte(core.UIVersion), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	close(listenRelease)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("legacy gate callback did not finish")
+	server, err := startApiWithLifecycle(nil)
+	if err != nil || server == nil {
+		t.Fatalf("startApiWithLifecycle = %v, %v", server, err)
 	}
 	server.Join()
 }
 
-func TestAPIServerReleasesLegacyGateOnJoin(t *testing.T) {
-	unlocked := legacygate.Lock()
-	server := newAPIServer(fiber.New(), func() error { return nil }, unlocked)
-	server.Join()
-
-	done := make(chan struct{})
-	go func() {
-		legacygate.With(func() struct{} { return struct{}{} })
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Join did not release the legacy gate")
-	}
-}
-
-func TestStartApiWithLifecycleInLegacySessionDoesNotReacquireGate(t *testing.T) {
+func TestStartApiWithLifecycleAllowsDisabledAPI(t *testing.T) {
 	oldConfig := config.APIServer
 	config.APIServer = nil
 	t.Cleanup(func() { config.APIServer = oldConfig })
 
-	unlock := legacygate.Lock()
-	done := make(chan *errs.Error, 1)
-	go func() {
-		_, err := StartApiWithLifecycleInLegacySession(nil)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("legacy-session API start failed: %v", err)
-		}
-	case <-time.After(time.Second):
-		unlock()
-		t.Fatal("legacy-session API start reacquired the legacy gate")
+	server, err := startApiWithLifecycle(nil)
+	if err != nil || server != nil {
+		t.Fatalf("disabled API start = %v, %v; want nil, nil", server, err)
 	}
-	unlock()
 }

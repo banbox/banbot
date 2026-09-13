@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
@@ -23,10 +22,10 @@ import (
 type FuncMakeStrat = func(pol *config.RunPolicyConfig) *TradeStrat
 
 var (
-	StratMake   = make(map[string]FuncMakeStrat) // 已加载的策略缓存
-	cacheStrats = make(map[string]*TradeStrat)
-	cacheMu     sync.Mutex
-	stratMakeMu sync.RWMutex
+	stratFactories = make(map[string]FuncMakeStrat)
+	cacheStrats    = make(map[string]*TradeStrat)
+	cacheMu        sync.Mutex
+	stratMakeMu    sync.RWMutex
 )
 
 func New(pol *config.RunPolicyConfig) *TradeStrat {
@@ -39,7 +38,7 @@ func New(pol *config.RunPolicyConfig) *TradeStrat {
 		return obj
 	}
 	stratMakeMu.RLock()
-	makeFn, ok := StratMake[pol.Name]
+	makeFn, ok := stratFactories[pol.Name]
 	stratMakeMu.RUnlock()
 	var stgy *TradeStrat
 	if ok {
@@ -404,12 +403,12 @@ func (s *StratJob) InitBar(curOrders []*ormo.InOutOrder) {
 		for i, q := range enters {
 			fields := q.GetZapFields(s)
 			fields = append(fields, zap.Int("i", i))
-			log.Warn("ignore unhandle Entry", fields...)
+			s.runtimeCore.Log().Warn("ignore unhandle Entry", fields...)
 		}
 		for i, q := range exits {
 			fields := q.GetZapFields(s)
 			fields = append(fields, zap.Int("i", i))
-			log.Warn("ignore unhandle Exit", fields...)
+			s.runtimeCore.Log().Warn("ignore unhandle Exit", fields...)
 		}
 	} else {
 		_, _ = s.DrainOrderRequests()
@@ -452,14 +451,14 @@ func GetJobs(account string) map[string]map[string]*StratJob {
 	if !core.EnvReal {
 		account = config.DefAcc
 	}
-	return LegacyState().Jobs(account)
+	return legacyStateView().jobsLocked(account)
 }
 
 func GetInfoJobs(account string) map[string]map[string]*StratJob {
 	if !core.EnvReal {
 		account = config.DefAcc
 	}
-	return LegacyState().InfoJobs(account)
+	return legacyStateView().infoJobsLocked(account)
 }
 
 func GetHistOrders(args ormo.GetHistOrdersArgs) ([]*ormo.InOutOrder, *errs.Error) {
@@ -886,7 +885,7 @@ func FireOdChange(acc string, od *ormo.InOutOrder, evt int) {
 	subs, _ := accOdSubs[acc]
 	subs2, _ := accOdSubs["*"]
 	lockOdSub.Unlock()
-	fireOdChange(subs, subs2, acc, od, evt, nil)
+	fireOdChange(subs, subs2, acc, od, evt)
 }
 
 // FireOdChangeWithState dispatches an order event through one runtime's
@@ -900,45 +899,44 @@ func FireOdChangeWithState(state *State, acc string, od *ormo.InOutOrder, evt in
 	subs := append([]FnOdChange(nil), state.AccOdSubs[acc]...)
 	subs2 := append([]FnOdChange(nil), state.AccOdSubs["*"]...)
 	state.orderSubLock.Unlock()
-	fireOdChange(subs, subs2, acc, od, evt, state.Clock)
+	fireOdChange(subs, subs2, acc, od, evt)
 }
 
-func fireOdChange(subs, wildcard []FnOdChange, acc string, od *ormo.InOutOrder, evt int, clock *btime.ClockState) {
+// OrderEventTime returns the exchange timestamp associated with an order
+// callback. Callbacks that need the precise event time should read it from
+// the order instead of changing the runtime clock.
+func OrderEventTime(od *ormo.InOutOrder, evt int) int64 {
+	if od == nil {
+		return 0
+	}
+	switch evt {
+	case OdChgEnter:
+		if od.Enter != nil {
+			return od.Enter.CreateAt
+		}
+	case OdChgEnterFill:
+		if od.Enter != nil {
+			return od.Enter.UpdateAt
+		}
+	case OdChgExit:
+		if od.Exit != nil {
+			return od.Exit.CreateAt
+		}
+	case OdChgExitFill:
+		if od.Exit != nil {
+			return od.Exit.UpdateAt
+		}
+	}
+	return 0
+}
+
+func fireOdChange(subs, wildcard []FnOdChange, acc string, od *ormo.InOutOrder, evt int) {
 	subs = append(subs, wildcard...)
-	// 将模拟时间置为事件触发时间，并备份当前时间
-	evtTime := int64(0)
 	if od == nil {
 		return
 	}
-	if evt == OdChgEnter && od.Enter != nil {
-		evtTime = od.Enter.CreateAt
-	} else if evt == OdChgEnterFill && od.Enter != nil {
-		evtTime = od.Enter.UpdateAt
-	} else if evt == OdChgExit && od.Exit != nil {
-		evtTime = od.Exit.CreateAt
-	} else if evt == OdChgExitFill && od.Exit != nil {
-		evtTime = od.Exit.UpdateAt
-	}
-	backMS := int64(0)
-	if evtTime > 0 {
-		if clock != nil {
-			backMS = clock.TimeMS()
-			clock.SetTimeMS(evtTime)
-		} else {
-			backMS = btime.TimeMS()
-			btime.CurTimeMS = evtTime
-		}
-	}
 	for _, cb := range subs {
 		cb(acc, od, evt)
-	}
-	// 恢复原始时间
-	if evtTime > 0 {
-		if clock != nil {
-			clock.SetTimeMS(backMS)
-		} else {
-			btime.CurTimeMS = backMS
-		}
 	}
 }
 
@@ -946,18 +944,62 @@ func AddStratGroup(group string, items map[string]FuncMakeStrat) {
 	stratMakeMu.Lock()
 	defer stratMakeMu.Unlock()
 	for k, v := range items {
-		StratMake[group+":"+k] = v
+		if v == nil {
+			panic("strategy factory must not be nil")
+		}
+		stratFactories[group+":"+k] = v
 	}
+}
+
+// RegisterStrategy registers one process-wide strategy definition. Strategy
+// definitions are immutable during a Runtime; each State snapshots them.
+func RegisterStrategy(name string, factory FuncMakeStrat) {
+	if name == "" {
+		panic("strategy name must not be empty")
+	}
+	if factory == nil {
+		panic("strategy factory must not be nil")
+	}
+	stratMakeMu.Lock()
+	stratFactories[name] = factory
+	stratMakeMu.Unlock()
+}
+
+// GetStrategyFactory returns a registered process-wide strategy definition.
+func GetStrategyFactory(name string) (FuncMakeStrat, bool) {
+	stratMakeMu.RLock()
+	factory, ok := stratFactories[name]
+	stratMakeMu.RUnlock()
+	return factory, ok
+}
+
+// UnregisterStrategy removes a process-wide strategy definition. Callers must
+// not remove definitions still in use by an existing legacy facade; Runtime
+// states retain the construction snapshot they already own.
+func UnregisterStrategy(name string) {
+	deleteStratFactory(name)
+}
+
+func deleteStratFactory(name string) {
+	stratMakeMu.Lock()
+	delete(stratFactories, name)
+	stratMakeMu.Unlock()
 }
 
 func snapshotStratFactories() map[string]FuncMakeStrat {
 	stratMakeMu.RLock()
 	defer stratMakeMu.RUnlock()
-	factories := make(map[string]FuncMakeStrat, len(StratMake))
-	for name, makeFn := range StratMake {
+	factories := make(map[string]FuncMakeStrat, len(stratFactories))
+	for name, makeFn := range stratFactories {
 		factories[name] = makeFn
 	}
 	return factories
+}
+
+// SnapshotStrategyFactories returns a detached view of registered strategy
+// definitions.
+func SnapshotStrategyFactories() map[string]FuncMakeStrat {
+	return snapshotStratFactories()
 }
 
 func (w Warms) Update(pair, tf string, num int) {
@@ -976,14 +1018,14 @@ func (w Warms) Update(pair, tf string, num int) {
 JobForbidType 0 allow; 1 forbid; 2 forbid & occupy a slot
 */
 func JobForbidType(pair, tf, stratID string) int {
-	return jobForbidType(LegacyState(), pair, tf, stratID)
+	return jobForbidType(legacyStateView(), pair, tf, stratID)
 }
 
 func jobForbidType(state *State, pair, tf, stratID string) int {
 	if state == nil {
-		state = LegacyState()
+		state = legacyStateView()
 	}
-	if jobs, ok := state.ForbidJobs[fmt.Sprintf("%s_%s", pair, tf)]; ok {
+	if jobs, ok := state.forbidJobs[fmt.Sprintf("%s_%s", pair, tf)]; ok {
 		hold, ok2 := jobs[stratID]
 		if ok2 {
 			if hold {

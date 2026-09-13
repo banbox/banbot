@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"testing"
+
+	"github.com/banbox/banbot/internal/testutil"
 )
 
 func TestDb(t *testing.T) {
-	t.Skip("integration test")
+	testutil.RequireIntegration(t)
 	ctx := context.Background()
 
 	pq, conn, err2 := Conn(ctx)

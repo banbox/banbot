@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -16,13 +15,13 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/rpc"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	ta "github.com/banbox/banta"
 	"github.com/sasha-s/go-deadlock"
@@ -36,6 +35,11 @@ type Trader struct {
 	runtime    *RuntimeDeps
 }
 
+// runtimeDepsBindMu makes the cold-path composition step transactional across
+// the separately owned strategy and order states. It is never used by trading
+// callbacks or other runtime hot paths.
+var runtimeDepsBindMu sync.Mutex
+
 // RuntimeDeps is the mutable runtime state consumed directly by Trader.
 // Each explicit trader owns its strategy, order, trading, market, and clock
 // state; legacy package facades are used only by traders without RuntimeDeps.
@@ -48,19 +52,16 @@ type RuntimeDeps struct {
 	Orders     *ormo.OrderState
 	Trading    *TradingState
 	Config     *config.Snapshot
-	// Accounts is the execution-facing account map. Runtime composition roots may
-	// mark it owned so wallet and strategy state observe the same mutable
-	// StakePctAmt values; ordinary callers receive a defensive clone.
+	// Accounts is the execution-facing account map owned by the runtime root.
+	// Config remains immutable input; wallet and strategy state share this map.
 	Accounts map[string]*config.AccountConfig
-	// AccountsOwned marks a map already owned by the composition root. The
-	// Runtime uses this to let Trader, Wallet, and Strategy share one mutable
-	// execution view while ordinary callers still get a defensive clone.
-	AccountsOwned bool
 	// AccountsMu protects mutable execution fields (currently StakePctAmt) in
 	// Accounts. The composition root owns the lock and passes the same pointer
-	// to Trader, Wallet, and Strategy; nil keeps legacy/immutable callers cheap.
+	// to Trader, Wallet, and Strategy.
 	AccountsMu     *sync.RWMutex
 	Symbols        *orm.SymbolState
+	Catalog        *data.DataSourceCatalog
+	Callbacks      data.CallbackTracker
 	Storage        *orm.Storage
 	Exchange       banexg.BanExchange
 	Scheduler      com.Scheduler
@@ -99,24 +100,12 @@ func (d *RuntimeDeps) StrictHistoricalReplay() bool {
 	return d.StrictBacktest() && cfg != nil && cfg.BTNoKlineDownload && cfg.HistoricalCoverage != nil
 }
 
-// AccountConfigs returns the immutable account configuration owned by this
-// runtime. A nil result is intentional when an explicit runtime has no
-// configuration; callers must not fall back to config.Accounts in that case.
+// AccountConfigs returns the execution accounts owned by this runtime.
 func (d *RuntimeDeps) AccountConfigs() map[string]*config.AccountConfig {
-	if d == nil || d.Config == nil {
-		if d != nil {
-			return d.Accounts
-		}
+	if d == nil {
 		return nil
 	}
-	if d.Accounts != nil {
-		return d.Accounts
-	}
-	cfg := d.Config.View()
-	if cfg == nil {
-		return nil
-	}
-	return cfg.Accounts
+	return d.Accounts
 }
 
 type parallelError struct {
@@ -134,45 +123,47 @@ func selectParallelError(errCh <-chan parallelError) *errs.Error {
 	return selected.err
 }
 
-func NewTrader(batchState *strat.BatchState) Trader {
-	if batchState == nil {
-		batchState = strat.NewBatchState()
+// NewTraderWithRuntimeDeps binds a complete runtime to a Trader. Runtime
+// roots own construction; this function never supplies missing state.
+func NewTraderWithRuntimeDeps(deps RuntimeDeps) (Trader, *errs.Error) {
+	if err := validateTraderRuntimeDeps(deps); err != nil {
+		return Trader{}, err
 	}
-	return Trader{batchState: unsafe.Pointer(batchState)}
+	if !deps.Orders.RuntimeBindingsMatch(deps.Core, deps.Clock, deps.Market.Prices, deps.Exchange, deps.ConfigView()) {
+		return Trader{}, errs.NewMsg(core.ErrBadConfig, "order state is not bound to this runtime")
+	}
+	if !deps.Strategies.RuntimeBindingsMatch(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange, deps.AccountsMu, deps.Orders) {
+		return Trader{}, errs.NewMsg(core.ErrBadConfig, "strategy state is not bound to this runtime")
+	}
+	return Trader{batchState: unsafe.Pointer(deps.Batch), runtime: &deps}, nil
 }
 
-// NewTraderWithRuntimeDeps creates an isolated typed-state trader. Missing
-// dependencies get private state and never fall back to package facades.
-func NewTraderWithRuntimeDeps(deps RuntimeDeps) Trader {
-	if deps.Core == nil {
-		var err *errs.Error
-		deps.Core, err = core.NewState(nil)
-		if err != nil {
-			panic(err)
-		}
+// BindRuntimeDeps is the one-time composition-root binding step for the
+// strategy and order states. Trader deliberately only verifies this binding;
+// moving the mutation here keeps a partially assembled dependency value from
+// being completed invisibly by a downstream consumer.
+func BindRuntimeDeps(deps RuntimeDeps) *errs.Error {
+	if err := validateRuntimeStateBindings(deps); err != nil {
+		return err
 	}
-	if deps.Clock == nil {
-		deps.Clock = btime.NewClockState(deps.Core.BackTestMode, nil)
+	runtimeDepsBindMu.Lock()
+	defer runtimeDepsBindMu.Unlock()
+	if deps.Strategies.RuntimeBindingsMatch(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange, deps.AccountsMu, deps.Orders) &&
+		deps.Orders.RuntimeBindingsMatch(deps.Core, deps.Clock, deps.Market.Prices, deps.Exchange, deps.ConfigView()) {
+		return nil
 	}
-	if deps.Market == nil {
-		deps.Market = com.NewMarketStateWithExchange(deps.Core.ExgName, deps.Exchange)
-	} else if deps.Market.Prices == nil {
-		deps.Market.Prices = com.NewPriceStateWithExchange(deps.Core.ExgName, deps.Exchange)
+	if !deps.Strategies.CanBindRuntime(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange, deps.AccountsMu, deps.Orders) {
+		return errs.NewMsg(core.ErrBadConfig, "strategy state is already bound to another runtime")
 	}
-	if deps.Market.PairCopied == nil {
-		deps.Market.PairCopied = com.NewPairCopiedState()
+	if !deps.Orders.CanBindRuntime(deps.Core, deps.Clock, deps.Market.Prices, deps.Exchange, deps.ConfigView()) {
+		return errs.NewMsg(core.ErrBadConfig, "order state is already bound to another runtime")
 	}
-	if deps.Batch == nil {
-		deps.Batch = strat.NewBatchState()
+	if !deps.Strategies.BindRuntimeOnce(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange, deps.Accounts, deps.AccountsMu, deps.Orders) {
+		return errs.NewMsg(core.ErrBadConfig, "strategy state changed while binding runtime")
 	}
-	if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
-		deps.Strategies = strat.NewState()
+	if !deps.Orders.BindRuntimeOnce(deps.Core, deps.Clock, deps.Market.Prices, deps.Exchange, deps.ConfigView()) {
+		return errs.NewMsg(core.ErrBadConfig, "order state changed while binding runtime")
 	}
-	if deps.Orders == nil || deps.Orders == ormo.LegacyState() {
-		deps.Orders = ormo.NewOrderState()
-	}
-	deps.Orders.BindCore(deps.Core)
-	deps.Orders.BindRuntime(deps.Clock, deps.Market.Prices, deps.Exchange, deps.ConfigView())
 	if cfg := deps.ConfigView(); cfg != nil {
 		if deps.Config.DataDir != "" {
 			deps.Orders.BindTradesPath(filepath.Join(deps.Config.DataDir, fmt.Sprintf("orders_%s.db", cfg.Name)))
@@ -182,82 +173,77 @@ func NewTraderWithRuntimeDeps(deps RuntimeDeps) Trader {
 			LegacyOrderMetrics: deps.StrictHistoricalReplay() && cfg.BTLegacyOrderMetrics,
 		})
 	}
-	if deps.Trading == nil {
-		deps.Trading = NewTradingState()
-	} else {
-		deps.Trading.ensure()
-	}
-	if deps.DefaultAccount == "" && !deps.Core.EnvReal {
-		deps.DefaultAccount = "default"
-	}
-	deps.Accounts = normalizeRuntimeAccounts(deps)
-	deps.Strategies.BindRuntimeAccountsLock(deps.AccountsMu)
-	deps.Strategies.BindRuntime(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange)
 	for account := range deps.Accounts {
-		// Explicit strategy states start empty. Seed their account registries at
-		// construction time so the loader can populate them without consulting
-		// the legacy package maps or allocating on the bar-processing path.
-		deps.Strategies.Jobs(account)
-		deps.Strategies.InfoJobs(account)
+		deps.Strategies.EnsureAccount(account)
 	}
-	return Trader{batchState: unsafe.Pointer(deps.Batch), runtime: &deps}
+	return nil
 }
 
-// NormalizeRuntimeAccounts applies the same deterministic account selection
-// used by NewTraderWithRuntimeDeps. Composition roots can call it once and
-// pass the owned result to multiple domain states.
-func NormalizeRuntimeAccounts(deps RuntimeDeps) map[string]*config.AccountConfig {
-	return normalizeRuntimeAccounts(deps)
+func validateTraderRuntimeDeps(deps RuntimeDeps) *errs.Error {
+	if err := validateRuntimeStateBindings(deps); err != nil {
+		return err
+	}
+	missing := make([]string, 0, 6)
+	if deps.Batch == nil {
+		missing = append(missing, "batch state")
+	}
+	if deps.Trading == nil {
+		missing = append(missing, "trading state")
+	}
+	if deps.Config == nil || deps.Config.View() == nil {
+		missing = append(missing, "config")
+	}
+	if deps.Accounts == nil {
+		missing = append(missing, "accounts")
+	}
+	if deps.AccountsMu == nil {
+		missing = append(missing, "accounts lock")
+	}
+	if deps.Exchange == nil {
+		missing = append(missing, "exchange")
+	}
+	if deps.DefaultAccount == "" {
+		missing = append(missing, "default account")
+	}
+	if len(missing) > 0 {
+		return errs.NewMsg(core.ErrBadConfig, "runtime trader requires %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
-func normalizeRuntimeAccounts(deps RuntimeDeps) map[string]*config.AccountConfig {
-	if deps.Accounts != nil {
-		if deps.AccountsOwned {
-			return deps.Accounts
-		}
-		return cloneRuntimeAccounts(deps.Accounts)
+// requireRuntimeDeps is for explicit constructors that cannot return an
+// error. A missing dependency is a composition error, so continuing would
+// otherwise create a manager backed by an incomplete copy of RuntimeDeps.
+func requireRuntimeDeps(deps RuntimeDeps) {
+	if err := validateTraderRuntimeDeps(deps); err != nil {
+		panic(err)
 	}
-	accounts := map[string]*config.AccountConfig(nil)
-	if deps.Config != nil {
-		if cfg := deps.Config.View(); cfg != nil {
-			accounts = cfg.Accounts
-		}
-	}
-	if deps.Core == nil || deps.Core.EnvReal {
-		return cloneRuntimeAccounts(accounts)
-	}
-	account := deps.DefaultAccount
-	if account == "" {
-		account = "default"
-	}
-	if len(accounts) == 0 {
-		return map[string]*config.AccountConfig{account: {}}
-	}
-	if selected, ok := accounts[account]; ok {
-		return cloneRuntimeAccounts(map[string]*config.AccountConfig{account: selected})
-	}
-	// Config files may name credentials for a live account while backtests use
-	// the historical default key. Pick the same deterministic first account
-	// that the legacy config initializer uses when no explicit default exists.
-	names := make([]string, 0, len(accounts))
-	for name, selected := range accounts {
-		if selected != nil {
-			names = append(names, name)
-		}
-	}
-	slices.Sort(names)
-	if len(names) == 0 {
-		return map[string]*config.AccountConfig{account: {}}
-	}
-	return cloneRuntimeAccounts(map[string]*config.AccountConfig{account: accounts[names[0]]})
 }
 
-// cloneRuntimeAccounts takes ownership of account configuration at the
-// Trader boundary. Config snapshots are already copied, but callers may also
-// supply Accounts directly; copying both the map and nested credential/RPC
-// fields prevents later refreshes from racing with account iteration.
-func cloneRuntimeAccounts(accounts map[string]*config.AccountConfig) map[string]*config.AccountConfig {
-	return config.CloneAccountConfigsForRuntime(accounts)
+func validateRuntimeStateBindings(deps RuntimeDeps) *errs.Error {
+	missing := make([]string, 0, 6)
+	if deps.Core == nil {
+		missing = append(missing, "core")
+	}
+	if deps.Clock == nil {
+		missing = append(missing, "clock")
+	}
+	if deps.Market == nil || deps.Market.Prices == nil {
+		missing = append(missing, "market prices")
+	}
+	if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
+		missing = append(missing, "strategy state")
+	}
+	if deps.Orders == nil || ormo.IsLegacyState(deps.Orders) {
+		missing = append(missing, "order state")
+	}
+	if deps.Symbols == nil {
+		missing = append(missing, "symbol state")
+	}
+	if len(missing) > 0 {
+		return errs.NewMsg(core.ErrBadConfig, "runtime state binding requires %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 // RuntimeDependencies reports the explicit dependencies, or nil for legacy
@@ -271,12 +257,22 @@ func (t *Trader) RuntimeDependencies() *RuntimeDeps {
 
 func (t *Trader) strategyState() *strat.State {
 	if t == nil || t.runtime == nil {
-		return strat.LegacyState()
+		return nil
 	}
 	if t.runtime.Strategies == nil {
 		return nil
 	}
 	return t.runtime.Strategies
+}
+
+func (t *Trader) strategyEnv(key string) (*ta.BarEnv, bool) {
+	if state := t.strategyState(); state != nil {
+		return state.Env(key)
+	}
+	if t == nil || t.runtime == nil {
+		return strat.GetEnv(key)
+	}
+	return nil, false
 }
 
 func (t *Trader) accountName(account string) string {
@@ -490,11 +486,10 @@ func (t *Trader) OnEnvSeries(evt *orm.DataSeries) (*ta.BarEnv, *errs.Error) {
 	}
 	symbol := exs.Symbol
 	envKey := strings.Join([]string{symbol, evt.TimeFrame}, "_")
-	strategyState := t.strategyState()
-	if strategyState == nil {
+	if t != nil && t.runtime != nil && t.strategyState() == nil {
 		return nil, errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
 	}
-	env, ok := strategyState.Env(envKey)
+	env, ok := t.strategyEnv(envKey)
 	if !ok {
 		// 额外订阅1h没有对应的env，无需处理
 		return nil, nil
@@ -506,7 +501,7 @@ func (t *Trader) OnEnvSeries(evt *orm.DataSeries) (*ta.BarEnv, *errs.Error) {
 		} else if env.TimeStop > 0 && env.TimeStop < evt.TimeMS {
 			lackNum := int(math.Round(float64(evt.TimeMS-env.TimeStop) / float64(env.TFMSecs)))
 			if lackNum > 0 {
-				log.Warn("taEnv bar lack", zap.Int("num", lackNum), zap.String("env", envKey))
+				t.Logger().Warn("taEnv bar lack", zap.Int("num", lackNum), zap.String("env", envKey))
 			}
 		}
 	}
@@ -572,7 +567,7 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries, resolved ...*orm.ExSymb
 		return nil
 	}
 	strategyState := t.strategyState()
-	if strategyState == nil {
+	if t != nil && t.runtime != nil && strategyState == nil {
 		return errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
 	}
 	var exs *orm.ExSymbol
@@ -702,7 +697,7 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 	}
 	env, errEnv := t.OnEnvSeries(evt)
 	if errEnv != nil {
-		log.Error(fmt.Sprintf("%s/%s OnEnvSeries fail", symbol, evt.TimeFrame), zap.Error(errEnv))
+		t.Logger().Error(fmt.Sprintf("%s/%s OnEnvSeries fail", symbol, evt.TimeFrame), zap.Error(errEnv))
 		return errEnv
 	} else if env == nil {
 		return nil
@@ -712,7 +707,7 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 	barExpired := delaySecs >= max(60, tfSecs/2)
 	if barExpired {
 		if t.liveMode() && !evt.IsWarmUp {
-			log.Warn(fmt.Sprintf("%s/%s delay %v s, open order disabled for this data series", symbol, evt.TimeFrame, delaySecs))
+			t.Logger().Warn(fmt.Sprintf("%s/%s delay %v s, open order disabled for this data series", symbol, evt.TimeFrame, delaySecs))
 		} else {
 			barExpired = false
 		}
@@ -754,14 +749,14 @@ func (t *Trader) feedClosedSeriesSerial(evt *orm.DataSeries, env *ta.BarEnv, sym
 		}
 		if curErr := t.onAccountDataSeries(account, env, evt, allOrders, barExpired); curErr != nil {
 			if runErr != nil {
-				log.Error("onAccountDataSeries fail", zap.String("account", account), zap.Error(curErr))
+				t.Logger().Error("onAccountDataSeries fail", zap.String("account", account), zap.Error(curErr))
 			} else {
 				runErr = curErr
 			}
 		}
 	}
 	if t.liveMode() && len(accOdArr) > 0 {
-		log.Info("OnSeries", zap.String("pair", symbol), zap.String("tf", evt.TimeFrame),
+		t.Logger().Info("OnSeries", zap.String("pair", symbol), zap.String("tf", evt.TimeFrame),
 			zap.Strings("accOdNums", accOdArr))
 	}
 	return runErr
@@ -811,7 +806,7 @@ func (t *Trader) feedClosedSeriesParallel(evt *orm.DataSeries, env *ta.BarEnv, s
 		return err
 	}
 	if t.liveMode() && len(accOdArr) > 0 {
-		log.Info("OnSeries", zap.String("pair", symbol), zap.String("tf", evt.TimeFrame),
+		t.Logger().Info("OnSeries", zap.String("pair", symbol), zap.String("tf", evt.TimeFrame),
 			zap.Strings("accOdNums", accOdArr))
 	}
 	return nil
@@ -831,7 +826,7 @@ func (t *Trader) onAccountDataSeriesSerial(account string, env *ta.BarEnv, evt *
 	var jobs map[string]*strat.StratJob
 	var infoJobMap map[string]map[string]*strat.StratJob
 	strategyState := t.strategyState()
-	if strategyState == nil {
+	if t != nil && t.runtime != nil && strategyState == nil {
 		return errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
 	}
 	if t.runtime != nil {
@@ -933,7 +928,7 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 	var jobs map[string]*strat.StratJob
 	var infoJobMap map[string]map[string]*strat.StratJob
 	strategyState := t.strategyState()
-	if strategyState == nil {
+	if t != nil && t.runtime != nil && strategyState == nil {
 		return errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for data series")
 	}
 	if t.runtime != nil {
@@ -1073,7 +1068,7 @@ func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, ev
 	} else {
 		entryNum := job.PendingEntryCount()
 		if t.liveMode() && !isWarmup && entryNum > 0 {
-			log.Info("skip open orders by bar expired", zap.String("acc", account),
+			t.Logger().Info("skip open orders by bar expired", zap.String("acc", account),
 				zap.String("pair", t.seriesSymbol(evt)), zap.String("tf", evt.TimeFrame),
 				zap.Int("num", entryNum))
 			if t.runtime != nil {
@@ -1104,11 +1099,11 @@ func (t *Trader) OnEnvEnd(evt *orm.DataSeries) {
 	if evt != nil {
 		exs, err := t.ResolveDataSeriesSymbol(evt)
 		if err != nil {
-			log.Warn("resolve series symbol on env end fail", zap.Int32("sid", evt.Sid), zap.Error(err))
+			t.Logger().Warn("resolve series symbol on env end fail", zap.Int32("sid", evt.Sid), zap.Error(err))
 			return
 		}
 		if exs == nil {
-			log.Warn("series symbol missing on env end", zap.Int32("sid", evt.Sid))
+			t.Logger().Warn("series symbol missing on env end", zap.Int32("sid", evt.Sid))
 			return
 		}
 		symbol = exs.Symbol
@@ -1118,18 +1113,14 @@ func (t *Trader) OnEnvEnd(evt *orm.DataSeries) {
 		mgr := mgrs[acc]
 		err := mgr.OnEnvEnd(evt)
 		if err != nil {
-			log.Warn("close orders on env end fail", zap.String("acc", acc), zap.Error(err))
+			t.Logger().Warn("close orders on env end fail", zap.String("acc", acc), zap.Error(err))
 		}
 	}
 	if evt == nil {
 		return
 	}
 	envKey := strings.Join([]string{symbol, evt.TimeFrame}, "_")
-	strategyState := t.strategyState()
-	if strategyState == nil {
-		return
-	}
-	env, ok := strategyState.Env(envKey)
+	env, ok := t.strategyEnv(envKey)
 	if ok {
 		env.Reset()
 	}

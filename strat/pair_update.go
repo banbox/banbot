@@ -187,7 +187,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		strategyState = hooks.StrategyState
 	}
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	explicitStrategyState := strategyState != legacyState
 	if hooks.SymbolState == nil && explicitStrategyState {
@@ -316,8 +316,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 	var accLimits accStratLimits
 	if !req.ForceAdd {
 		accLimits, _ = newAccStratLimitsForState(strategyState)
-		for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, admissionState)) {
-			jobsMap := strategyState.AccJobs[acc]
+		for acc := range utils.MapKeys(strategyState.accJobs, strictBacktestFor(strategyState, admissionState)) {
+			jobsMap := strategyState.accJobs[acc]
 			for _, stgMap := range jobsMap {
 				if _, ok := stgMap[req.Strat.Name]; ok {
 					accLimits.tryAdd(acc, req.Strat.Name)
@@ -344,10 +344,10 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			continue
 		}
 		exs, _ := hooks.LookupSymbol(pair)
-		items, ok := strategyState.PairStrats[pair]
+		items, ok := strategyState.pairStrats[pair]
 		if !ok {
 			items = map[string]*TradeStrat{}
-			strategyState.PairStrats[pair] = items
+			strategyState.pairStrats[pair] = items
 		}
 		items[req.Strat.Name] = req.Strat
 		curMap[pair] = tf
@@ -356,8 +356,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		ensureStratJobWithRuntimeState(strategyState, admissionState, req.Strat, tf, exs, env, dirt, logWarm, accLimits, hooks.SymbolState)
 		if len(req.Strat.WsSubs) > 0 {
 			envKey := pair + "_" + tf
-			for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, admissionState)) {
-				jobsMap := strategyState.AccJobs[acc]
+			for acc := range utils.MapKeys(strategyState.accJobs, strictBacktestFor(strategyState, admissionState)) {
+				jobsMap := strategyState.accJobs[acc]
 				if stgMap, ok := jobsMap[envKey]; ok {
 					if job := stgMap[req.Strat.Name]; job != nil {
 						if err := regWsJobLockedWithState(strategyState, job); err != nil {
@@ -379,8 +379,8 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			continue
 		}
 		envKey := pair + "_" + tf
-		for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, admissionState)) {
-			accJobs := strategyState.AccJobs[acc]
+		for acc := range utils.MapKeys(strategyState.accJobs, strictBacktestFor(strategyState, admissionState)) {
+			accJobs := strategyState.accJobs[acc]
 			if stgMap, ok := accJobs[envKey]; ok {
 				if job, ok := stgMap[req.Strat.Name]; ok {
 					if req.CloseOnRemove {
@@ -441,7 +441,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		lockJobsWriteForState(strategyState)
 		locked = true
 		for _, removal := range removals {
-			accJobs := strategyState.AccJobs[removal.account]
+			accJobs := strategyState.accJobs[removal.account]
 			if stgMap := accJobs[removal.envKey]; stgMap != nil && stgMap[removal.name] == removal.job {
 				if jobHasOutstandingOrders(removal.job) {
 					// The job remains in AccJobs as the callback route for the
@@ -456,10 +456,10 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 				}
 			}
 			delete(curMap, removal.pair)
-			if items := strategyState.PairStrats[removal.pair]; items != nil && items[removal.name] == req.Strat {
+			if items := strategyState.pairStrats[removal.pair]; items != nil && items[removal.name] == req.Strat {
 				delete(items, removal.name)
 				if len(items) == 0 {
-					delete(strategyState.PairStrats, removal.pair)
+					delete(strategyState.pairStrats, removal.pair)
 				}
 			}
 			used := false
@@ -487,17 +487,17 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 }
 
 func collectAllWarmsLocked() Warms {
-	return collectAllWarmsLockedWithState(LegacyState())
+	return collectAllWarmsLockedWithState(legacyStateView())
 }
 
 func collectAllWarmsLockedWithState(strategyState *State) Warms {
 	if strategyState == nil {
-		strategyState = LegacyState()
+		strategyState = legacyStateView()
 	}
 	strategyState.ensureMaps()
 	all := make(Warms)
-	for acc := range utils.MapKeys(strategyState.AccJobs, strictBacktestFor(strategyState, nil)) {
-		accJobs := strategyState.AccJobs[acc]
+	for acc := range utils.MapKeys(strategyState.accJobs, strictBacktestFor(strategyState, nil)) {
+		accJobs := strategyState.accJobs[acc]
 		for _, stgMap := range accJobs {
 			for _, job := range stgMap {
 				pair := job.Symbol.Symbol

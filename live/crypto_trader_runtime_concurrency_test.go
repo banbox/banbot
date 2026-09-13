@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
@@ -63,23 +62,7 @@ func newR1LiveRunner(t *testing.T, process *runtimepkg.Process, id string, start
 	}
 	symbol := &orm.ExSymbol{ID: 1, Exchange: "test", Market: "spot", Symbol: "BTC/USDT"}
 	rt.Symbols.CacheExSymbol(symbol)
-	deps := biz.RuntimeDeps{
-		Core:           rt.Core,
-		Clock:          rt.Clock,
-		Market:         rt.Market,
-		Batch:          rt.Batch,
-		Strategies:     rt.Strategies,
-		Orders:         rt.Orders,
-		Trading:        rt.Trading,
-		Config:         rt.Config,
-		Symbols:        rt.Symbols,
-		Storage:        rt.Storage,
-		Exchange:       rt.Exchange,
-		Scheduler:      rt.Cron,
-		Notifications:  rt.Notifications,
-		Dump:           rt.Dump,
-		DefaultAccount: "default",
-	}
+	deps := rt.BizDeps()
 	runner := &r1LiveRunner{runtime: rt, symbol: symbol}
 	strategy := &strat.TradeStrat{
 		Name: "r1-" + id,
@@ -113,10 +96,13 @@ func newR1LiveRunner(t *testing.T, process *runtimepkg.Process, id string, start
 		TimeFrame: "1m",
 		Account:   "default",
 	}
-	rt.Strategies.InfoJobs("default")[strat.DataSubKey("macro", symbol.ID, "1m")] = map[string]*strat.StratJob{
+	rt.Strategies.SetInfoJobMap("default", strat.DataSubKey("macro", symbol.ID, "1m"), map[string]*strat.StratJob{
 		strategy.Name: job,
+	})
+	trader, traderErr := newRuntimeCryptoTraderForTest(rt, deps, nil)
+	if traderErr != nil {
+		t.Fatal(traderErr)
 	}
-	trader := NewCryptoTraderWithRuntimeDeps(rt, deps, rt.Symbols, nil)
 	runner.trader = trader
 	trader.initFn = func() *errs.Error {
 		trader.dp = &data.LiveProvider{}

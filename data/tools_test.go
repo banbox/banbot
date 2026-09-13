@@ -2,51 +2,20 @@ package data
 
 import (
 	"testing"
-	"time"
 
-	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/legacygate"
+	"github.com/banbox/banexg"
 )
 
-func TestPublicTickRunnersShareLegacyGate(t *testing.T) {
-	tests := []struct {
-		name string
-		run  func(*config.CmdArgs) error
-	}{
-		{name: "format", run: func(args *config.CmdArgs) error { return RunFormatTick(args) }},
-		{name: "to-kline", run: func(args *config.CmdArgs) error { return Build1mWithTicks(args) }},
+func TestTickWorkersKeepInvocationStateIsolated(t *testing.T) {
+	first, second := NewTickWorker(0), NewTickWorker(3)
+	first.TimeMSMin = 100
+	first.symKLines["first"] = []*banexg.Kline{{Time: 1}}
+	second.TimeMSMax = 200
+	second.symKLines["second"] = []*banexg.Kline{{Time: 2}}
+	if first.ConcurNum != 5 || second.ConcurNum != 3 || first.TimeMSMax != 0 || second.TimeMSMin != 0 {
+		t.Fatalf("worker options leaked: first=%+v second=%+v", first, second)
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			unlock := legacygate.Lock()
-			released := false
-			t.Cleanup(func() {
-				if !released {
-					unlock()
-				}
-			})
-
-			done := make(chan error, 1)
-			go func() { done <- test.run(&config.CmdArgs{}) }()
-			select {
-			case err := <-done:
-				unlock()
-				released = true
-				t.Fatalf("tick runner bypassed the legacy gate: %v", err)
-			case <-time.After(50 * time.Millisecond):
-			}
-
-			unlock()
-			released = true
-			select {
-			case err := <-done:
-				if err == nil {
-					t.Fatal("invalid tick invocation unexpectedly succeeded")
-				}
-			case <-time.After(time.Second):
-				t.Fatal("tick runner did not enter after the legacy gate was released")
-			}
-		})
+	if len(first.symKLines) != 1 || first.symKLines["second"] != nil || len(second.symKLines) != 1 || second.symKLines["first"] != nil {
+		t.Fatalf("worker candle buffers leaked: first=%v second=%v", first.symKLines, second.symKLines)
 	}
 }

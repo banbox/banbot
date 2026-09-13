@@ -2,342 +2,169 @@ package live
 
 import (
 	"fmt"
-	"math/rand"
-	"time"
+	"sort"
+	"strings"
 
 	"github.com/banbox/banbot/biz"
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/exg"
-	"github.com/banbox/banbot/legacygate"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
-	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"github.com/banbox/banexg/log"
-	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
 
-type tradeCloseOptions struct {
-	configs  config.ArrString
-	accounts string
-	pairs    string
-	strats   string
-	exchange bool
+type TradeCloseRequest struct {
+	Accounts, Pairs, Strategies []string
+	Exchange, Confirmed         bool
 }
 
-func RunTradeClose(args []string) error {
-	command := NewTradeCloseCommand()
-	command.SetArgs(args)
-	return command.Execute()
-}
+type TradeCloseResult struct{ Closed, Failed int }
 
-func NewTradeCloseCommand() *cobra.Command {
-	options := &tradeCloseOptions{}
-	command := &cobra.Command{
-		Use:     "close-order",
-		Aliases: []string{"close_order"},
-		Short:   "close orders by account, pair, or strategy",
-		Args:    cobra.NoArgs,
-		Annotations: map[string]string{
-			legacygate.Annotation: "1",
-		},
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return legacygate.With(func() error {
-				return runTradeClose(options)
-			})
-		},
+// CloseOrdersWithRuntimeDeps uses only the supplied runtime. It never falls
+// back to process-global configuration, exchange, or order-manager state.
+func CloseOrdersWithRuntimeDeps(deps biz.RuntimeDeps, request TradeCloseRequest) (*TradeCloseResult, *errs.Error) {
+	if deps.Core == nil || deps.Clock == nil || deps.ConfigView() == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "runtime core, clock, and config are required")
 	}
-	command.Flags().StringArrayVar((*[]string)(&options.configs), "config", nil, "config path; may be repeated")
-	command.Flags().StringVar(&options.accounts, "account", "", "comma-separated accounts; empty means all")
-	command.Flags().StringVar(&options.pairs, "pair", "", "comma-separated pairs; empty means all")
-	command.Flags().StringVar(&options.strats, "strat", "", "comma-separated strategies; empty means all")
-	command.Flags().BoolVar(&options.exchange, "exg", false, "close exchange positions directly")
-	return command
-}
-
-func runTradeClose(options *tradeCloseOptions) error {
-	core.SetRunMode(core.RunModeLive)
-	err := config.LoadConfig(&config.CmdArgs{
-		Configs:  options.configs,
-		LogLevel: "info",
-	})
+	if deps.Exchange == nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+	}
+	accounts := deps.AccountConfigs()
+	if len(accounts) == 0 {
+		return nil, errs.NewMsg(core.ErrBadConfig, "runtime accounts are required")
+	}
+	selected, err := closeSelectedAccounts(accounts, closeFilter(request.Accounts))
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	// 解析命令行参数
-	var accMap = utils.SplitToMap(options.accounts, ",")
-	var pairMap = utils.SplitToMap(options.pairs, ",")
-	var stratMap = utils.SplitToMap(options.strats, ",")
-
-	// 初始化订单管理器
-	err = biz.SetupComsExg(&config.CmdArgs{LogLevel: "info"})
-	if err != nil {
-		return err
+	if !request.Exchange && (deps.Orders == nil || deps.Trading == nil) {
+		return nil, errs.NewMsg(core.ErrBadConfig, "runtime orders and trading state are required")
 	}
-
-	// 查找符合要求的订单并平仓
-	err = cancelPendingOrders(accMap, pairMap)
-	if err != nil {
-		log.Error("cancelPendingOrders fail", zap.Error(err))
-	}
-	if options.exchange {
-		_, err = biz.RunRemoteCommand(biz.RemoteCommand{
-			Source:    biz.RemoteSourceCLI,
-			Actor:     "cli",
-			Account:   config.DefAcc,
-			Action:    biz.RemoteActionCloseOrder,
-			All:       true,
-			Confirmed: true,
-			ExitTag:   core.ExitTagCli,
+	pairs, strategies := closeFilter(request.Pairs), closeFilter(request.Strategies)
+	service, result := biz.NewRemoteCommandServiceWithRuntimeDeps(deps), &TradeCloseResult{}
+	for _, account := range selected {
+		account := account
+		commandResult, commandErr := service.Run(biz.RemoteCommand{
+			Source: biz.RemoteSourceCLI, Actor: "cli", Account: account, Action: biz.RemoteActionCloseOrder,
+			All: true, Confirmed: request.Confirmed, ExitTag: core.ExitTagCli,
 			ExecClose: func() (int, int, *errs.Error) {
-				if err := closeOrdersByPos(accMap, pairMap); err != nil {
-					return 0, 0, errs.New(errs.CodeRunTime, err)
+				if err := cancelPendingOrdersWithRuntimeDeps(deps, account, pairs); err != nil {
+					return 0, 0, err
 				}
-				return 0, 0, nil
+				if request.Exchange {
+					closed, err := closePositionsWithRuntimeDeps(deps, account, pairs)
+					return closed, 0, err
+				}
+				return closeLocalOrdersWithRuntimeDeps(deps, account, pairs, strategies)
 			},
 		})
+		if commandResult != nil {
+			result.Closed, result.Failed = result.Closed+commandResult.CloseNum, result.Failed+commandResult.FailNum
+		}
+		if commandErr != nil {
+			return result, commandErr
+		}
+	}
+	return result, nil
+}
+
+func closeFilter(values []string) map[string]bool {
+	result := make(map[string]bool)
+	for _, value := range values {
+		for _, item := range strings.Split(value, ",") {
+			if item = strings.TrimSpace(item); item != "" {
+				result[item] = true
+			}
+		}
+	}
+	return result
+}
+
+func closeSelectedAccounts(accounts map[string]*config.AccountConfig, filter map[string]bool) ([]string, *errs.Error) {
+	for account := range filter {
+		if cfg := accounts[account]; cfg == nil {
+			return nil, errs.NewMsg(errs.CodeParamInvalid, "account invalid: %s", account)
+		}
+	}
+	result := make([]string, 0, len(accounts))
+	for account, cfg := range accounts {
+		if cfg != nil && !cfg.NoTrade && (len(filter) == 0 || filter[account]) {
+			result = append(result, account)
+		}
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func cancelPendingOrdersWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs map[string]bool) *errs.Error {
+	params := map[string]interface{}{banexg.ParamAccount: account, banexg.ParamSettleCoins: deps.ConfigView().StakeCurrency}
+	orders, err := deps.Exchange.FetchOpenOrders("", 0, 1000, params)
+	if err != nil {
+		return err
+	}
+	algoParams := map[string]interface{}{banexg.ParamAccount: account, banexg.ParamAlgoOrder: true, banexg.ParamSettleCoins: deps.ConfigView().StakeCurrency}
+	if algo, algoErr := deps.Exchange.FetchOpenOrders("", 0, 1000, algoParams); algoErr != nil {
+		deps.Logger().Error("fetch open algo orders fail", zap.Error(algoErr))
 	} else {
-		_, err = biz.RunRemoteCommand(biz.RemoteCommand{
-			Source:    biz.RemoteSourceCLI,
-			Actor:     "cli",
-			Account:   config.DefAcc,
-			Action:    biz.RemoteActionCloseOrder,
-			All:       true,
-			Confirmed: true,
-			ExitTag:   core.ExitTagCli,
-			ExecClose: func() (int, int, *errs.Error) {
-				closeNum, err := closeOrdersByLocal(accMap, pairMap, stratMap)
-				if err != nil {
-					return closeNum, 0, errs.New(errs.CodeRunTime, err)
-				}
-				return closeNum, 0, nil
-			},
-		})
+		orders = append(orders, algo...)
 	}
-	return err
-}
-
-func closeOrdersByPos(accMap map[string]bool, pairMap map[string]bool) error {
-	exchange := exg.Default
-	odType := banexg.OdTypeMarket
-	closeNum := 0
-	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
+	for _, order := range orders {
+		if order == nil || (len(pairs) > 0 && !pairs[order.Symbol]) || (order.Status != "open" && order.Status != "partially_filled") {
 			continue
 		}
-		if len(accMap) > 0 {
-			if _, accOk := accMap[account]; !accOk {
-				continue
-			}
-		}
-		posList, err := exchange.FetchAccountPositions(nil, map[string]interface{}{
-			banexg.ParamAccount:     account,
-			banexg.ParamSettleCoins: config.StakeCurrency,
-		})
-		if err != nil {
-			return err
-		}
-		log.Info("fetch account pos", zap.String("acc", account), zap.Int("num", len(posList)))
-		exitPos := make([]*banexg.Position, 0, len(posList))
-		for _, pos := range posList {
-			if _, ok := pairMap[pos.Symbol]; !ok && len(pairMap) > 0 {
-				continue
-			}
-			exitPos = append(exitPos, pos)
-		}
-		if len(exitPos) > 0 {
-			for _, pos := range exitPos {
-				isShort := pos.Side == banexg.PosSideShort
-				exitSide := banexg.OdSideSell
-				params := map[string]interface{}{
-					banexg.ParamAccount:       account,
-					banexg.ParamClientOrderId: fmt.Sprintf("bancli_%v", rand.Intn(1000)),
-				}
-				if core.IsContract {
-					params[banexg.ParamPositionSide] = "LONG"
-					if isShort {
-						params[banexg.ParamPositionSide] = "SHORT"
-						exitSide = banexg.OdSideBuy
-					}
-				}
-				closeNum += 1
-				res, err := exchange.CreateOrder(pos.Symbol, odType, exitSide, pos.Contracts, 0, params)
-				if err != nil {
-					return err
-				}
-				if res.Status == "filled" {
-					log.Info("close pos ok", zap.String("acc", account), zap.String("pair", pos.Symbol),
-						zap.String("side", pos.Side), zap.Float64("price", res.Average),
-						zap.Float64("amount", res.Filled))
-				} else {
-					log.Warn("close fail", zap.String("acc", account), zap.String("pair", pos.Symbol),
-						zap.String("side", pos.Side), zap.String("status", res.Status))
-				}
-			}
+		_, cancelErr := deps.Exchange.CancelOrder(order.ID, order.Symbol, map[string]interface{}{banexg.ParamAccount: account})
+		if cancelErr != nil && cancelErr.Code != errs.CodeOrderNotFound && cancelErr.Code != errs.CodeOrderNotCancelable {
+			deps.Logger().Error("cancel order fail", zap.String("account", account), zap.String("order_id", order.ID), zap.Error(cancelErr))
 		}
 	}
-	log.Info("try close exchange positions", zap.Int("num", closeNum))
 	return nil
 }
 
-// cancelPendingOrders 取消所有账户在交易所的未成交挂单
-func cancelPendingOrders(accMap map[string]bool, pairMap map[string]bool) *errs.Error {
-	exchange := exg.Default
-	cancelNum := 0
-	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
-			continue
-		}
-		if len(accMap) > 0 {
-			if _, accOk := accMap[account]; !accOk {
-				continue
-			}
-		}
-		// 获取账户的所有未成交挂单
-		openOrders, err := exchange.FetchOpenOrders("", 0, 1000, map[string]interface{}{
-			banexg.ParamAccount:     account,
-			banexg.ParamSettleCoins: config.StakeCurrency,
-		})
-		if err != nil {
-			return err
-		}
-		openAlgoOrders, err := exchange.FetchOpenOrders("", 0, 1000, map[string]interface{}{
-			banexg.ParamAccount:     account,
-			banexg.ParamAlgoOrder:   true,
-			banexg.ParamSettleCoins: config.StakeCurrency,
-		})
-		if err != nil {
-			log.Error("fetch open algo orders fail", zap.Error(err))
-		} else {
-			openOrders = append(openOrders, openAlgoOrders...)
-		}
-		log.Info("fetch account open orders", zap.String("acc", account), zap.Int("num", len(openOrders)))
-
-		// 筛选需要取消的订单
-		cancelOrders := make([]*banexg.Order, 0, len(openOrders))
-		for _, order := range openOrders {
-			if _, ok := pairMap[order.Symbol]; !ok && len(pairMap) > 0 {
-				continue
-			}
-			// 只取消未成交或部分成交的订单
-			if order.Status == "open" || order.Status == "partially_filled" {
-				cancelOrders = append(cancelOrders, order)
-			}
-		}
-
-		// 取消订单
-		if len(cancelOrders) > 0 {
-			for _, order := range cancelOrders {
-				cancelNum += 1
-				res, err := exchange.CancelOrder(order.ID, order.Symbol, map[string]interface{}{
-					banexg.ParamAccount: account,
-				})
-				if err != nil {
-					if err.Code == errs.CodeOrderNotFound || err.Code == errs.CodeOrderNotCancelable {
-						log.Warn("cancel order skip, already cancelled on exchange", zap.String("acc", account),
-							zap.String("pair", order.Symbol), zap.String("orderId", order.ID))
-					} else {
-						log.Error("cancel order fail", zap.String("acc", account),
-							zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
-							zap.Error(err))
-					}
-					continue
-				}
-				if res.Status == "canceled" || res.Status == "cancelled" {
-					log.Info("cancel order ok", zap.String("acc", account),
-						zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
-						zap.String("side", order.Side), zap.Float64("amount", order.Amount))
-				} else {
-					log.Warn("cancel order unexpected status", zap.String("acc", account),
-						zap.String("pair", order.Symbol), zap.String("orderId", order.ID),
-						zap.String("status", res.Status))
-				}
-			}
-		}
-	}
-	log.Info("try cancel pending orders", zap.Int("num", cancelNum))
-	return nil
-}
-
-func closeOrdersByLocal(accMap map[string]bool, pairMap map[string]bool, stratMap map[string]bool) (int, error) {
-	err := ormo.InitTask(true, config.GetDataDir())
+func closePositionsWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs map[string]bool) (int, *errs.Error) {
+	positions, err := deps.Exchange.FetchAccountPositions(nil, map[string]interface{}{banexg.ParamAccount: account, banexg.ParamSettleCoins: deps.ConfigView().StakeCurrency})
 	if err != nil {
 		return 0, err
 	}
-	biz.InitLiveOrderMgr(sendOrderMsg)
-	biz.StartLiveOdMgr()
-	checkAccs := make(map[string][]*ormo.InOutOrder)
-	closeNum := 0
-	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
+	closed := 0
+	for _, position := range positions {
+		if position == nil || (len(pairs) > 0 && !pairs[position.Symbol]) {
 			continue
 		}
-		if len(accMap) > 0 {
-			if _, accOk := accMap[account]; !accOk {
-				continue
+		side := banexg.OdSideSell
+		params := map[string]interface{}{banexg.ParamAccount: account, banexg.ParamClientOrderId: fmt.Sprintf("bancli_%d_%d", deps.Clock.TimeMS(), closed)}
+		if deps.Core.IsContract {
+			params[banexg.ParamPositionSide] = "LONG"
+			if position.Side == banexg.PosSideShort {
+				params[banexg.ParamPositionSide], side = "SHORT", banexg.OdSideBuy
 			}
 		}
-		odMgr := biz.GetLiveOdMgr(account)
-		oldList, newList, delList, err := odMgr.SyncExgOrders()
-		if err != nil {
-			return closeNum, err
+		if _, err := deps.Exchange.CreateOrder(position.Symbol, banexg.OdTypeMarket, side, position.Contracts, 0, params); err != nil {
+			return closed, err
 		}
-		openOds, lock := ormo.GetOpenODs(account)
-		var exitOds []*ormo.InOutOrder
-		lock.Lock()
-		msg := fmt.Sprintf("orders: %d restored, %d deleted, %d added, %d opened", len(oldList), len(delList), len(newList), len(openOds))
-		log.Info(msg)
-		for _, od := range openOds {
-			if _, ok := pairMap[od.Symbol]; !ok && len(pairMap) > 0 {
-				continue
-			}
-			if _, ok := stratMap[od.Strategy]; !ok && len(stratMap) > 0 {
-				continue
-			}
-			exitOds = append(exitOds, od)
-		}
-		lock.Unlock()
-		if len(exitOds) > 0 {
-			checkAccs[account] = exitOds
-			log.Info("try exit orders", zap.String("acc", account), zap.Int("num", len(exitOds)))
-			exit_, _, err := biz.CloseAccOrders(account, exitOds, &strat.ExitReq{Tag: core.ExitTagCli})
-			if err != nil {
-				return closeNum, err
-			}
-			closeNum += exit_
+		closed++
+	}
+	return closed, nil
+}
+
+func closeLocalOrdersWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs, strategies map[string]bool) (int, int, *errs.Error) {
+	biz.InitLiveOrderMgrWithRuntimeDeps(deps, nil)
+	manager := deps.Trading.LiveManager(account)
+	if manager == nil {
+		return 0, 0, errs.NewMsg(core.ErrRunTime, "live order manager is not initialized: %s", account)
+	}
+	if _, _, _, err := manager.SyncExgOrders(); err != nil {
+		return 0, 0, err
+	}
+	openOrders, lock := deps.Orders.GetOpenODs(account)
+	lock.Lock()
+	matched := make([]*ormo.InOutOrder, 0, len(openOrders))
+	for _, order := range openOrders {
+		if order != nil && (len(pairs) == 0 || pairs[order.Symbol]) && (len(strategies) == 0 || strategies[order.Strategy]) {
+			matched = append(matched, order)
 		}
 	}
-	log.Info("closed orders", zap.Int("num", closeNum))
-	if len(checkAccs) == 0 {
-		log.Info("no match open orders to close")
-		return closeNum, nil
-	}
-	// 5s 超时
-	timeout := btime.TimeMS() + 5000
-	for {
-		core.Sleep(time.Second)
-		for account, odList := range checkAccs {
-			openOds := make([]*ormo.InOutOrder, 0)
-			for _, od := range odList {
-				if od.Status >= ormo.InOutStatusFullExit {
-					continue
-				}
-				openOds = append(openOds, od)
-			}
-			if len(openOds) == 0 {
-				delete(checkAccs, account)
-			} else {
-				log.Info("still open", zap.String("acc", account), zap.Int("num", len(openOds)))
-			}
-		}
-		if len(checkAccs) == 0 || btime.TimeMS() > timeout {
-			break
-		}
-	}
-	return closeNum, nil
+	lock.Unlock()
+	return biz.CloseAccOrdersWithState(deps.Trading, account, matched, &strat.ExitReq{Tag: core.ExitTagCli, Force: true})
 }

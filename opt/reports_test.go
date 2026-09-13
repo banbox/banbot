@@ -12,10 +12,64 @@ import (
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/utils"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+func TestBTResultLoggerIsScopedToReportRuntime(t *testing.T) {
+	firstCore, firstLogs := observer.New(zap.ErrorLevel)
+	secondCore, secondLogs := observer.New(zap.ErrorLevel)
+	first := &BTResult{
+		lastPlotMS: 2,
+		reportDeps: &ReportDeps{Core: &core.State{Logger: zap.New(firstCore)}},
+	}
+	second := &BTResult{
+		lastPlotMS: 3,
+		reportDeps: &ReportDeps{Core: &core.State{Logger: zap.New(secondCore)}},
+	}
+	wallets := &biz.BanWallets{}
+
+	first.logPlot(wallets, 1, 0, 0)
+	if got := firstLogs.Len(); got != 1 {
+		t.Fatalf("first report logger entries = %d, want 1", got)
+	}
+	if got := secondLogs.Len(); got != 0 {
+		t.Fatalf("second report logger entries after first result = %d, want 0", got)
+	}
+
+	second.logPlot(wallets, 2, 0, 0)
+	if got := firstLogs.Len(); got != 1 {
+		t.Fatalf("first report logger entries after second result = %d, want 1", got)
+	}
+	if got := secondLogs.Len(); got != 1 {
+		t.Fatalf("second report logger entries = %d, want 1", got)
+	}
+}
+
+func TestBTResultGroupMetricsUseReportDeps(t *testing.T) {
+	logCore, logs := observer.New(zap.WarnLevel)
+	result := &BTResult{reportDeps: &ReportDeps{
+		Core:   &core.State{Logger: zap.New(logCore)},
+		Config: config.NewSnapshot(&config.Config{WalletAmounts: map[string]float64{"USDT": 100}}),
+	}}
+	result.groupByPairs([]*ormo.InOutOrder{{
+		IOrder: &ormo.IOrder{Symbol: "BTC/USDT", Leverage: 1, Profit: 1},
+		Enter:  &ormo.ExOrder{Average: 1, Filled: 1},
+	}})
+	if len(result.PairGrps) != 1 {
+		t.Fatalf("pair groups = %d, want 1", len(result.PairGrps))
+	}
+	if got := logs.Len(); got != 1 {
+		t.Fatalf("runtime report metric warnings = %d, want 1", got)
+	}
+	if got := logs.All()[0].Message; got != "calc measure fail" {
+		t.Fatalf("runtime report metric warning = %q", got)
+	}
+}
 
 func TestLogStateUsesMonotonicEventTimeForPlots(t *testing.T) {
 	const (
@@ -86,30 +140,26 @@ func TestExplicitReportDepsDoNotUseLegacyStorageOrOrders(t *testing.T) {
 	}
 }
 
-func TestNormalizeBacktestResultRangeUsesConfiguredWindow(t *testing.T) {
-	previous := config.TimeRange
-	t.Cleanup(func() { config.TimeRange = previous })
-	config.TimeRange = &config.TimeTuple{StartMS: 1_651_363_200_000, EndMS: 1_786_492_800_000}
+func TestNormalizeBacktestResultRangeUsesRunWindow(t *testing.T) {
+	runRange := &config.TimeTuple{StartMS: 1_651_363_200_000, EndMS: 1_786_492_800_000}
 
-	result := &BTResult{StartMS: config.TimeRange.EndMS, EndMS: config.TimeRange.EndMS}
-	normalizeBacktestResultRange(result, false)
+	result := &BTResult{StartMS: runRange.EndMS, EndMS: runRange.EndMS}
+	normalizeBacktestResultRangeForTimeRange(result, false, runRange)
 
-	if result.StartMS != config.TimeRange.StartMS || result.EndMS != config.TimeRange.EndMS {
+	if result.StartMS != runRange.StartMS || result.EndMS != runRange.EndMS {
 		t.Fatalf("result range = %d-%d, want configured range %d-%d",
-			result.StartMS, result.EndMS, config.TimeRange.StartMS, config.TimeRange.EndMS)
+			result.StartMS, result.EndMS, runRange.StartMS, runRange.EndMS)
 	}
 }
 
 func TestNormalizeBacktestResultRangePreservesEarlyStop(t *testing.T) {
-	previous := config.TimeRange
-	t.Cleanup(func() { config.TimeRange = previous })
-	config.TimeRange = &config.TimeTuple{StartMS: 1_651_363_200_000, EndMS: 1_786_492_800_000}
+	runRange := &config.TimeTuple{StartMS: 1_651_363_200_000, EndMS: 1_786_492_800_000}
 
-	actualEnd := config.TimeRange.StartMS + 7*24*60*60*1000
-	result := &BTResult{StartMS: config.TimeRange.StartMS, EndMS: actualEnd}
-	normalizeBacktestResultRange(result, true)
+	actualEnd := runRange.StartMS + 7*24*60*60*1000
+	result := &BTResult{StartMS: runRange.StartMS, EndMS: actualEnd}
+	normalizeBacktestResultRangeForTimeRange(result, true, runRange)
 
-	if result.StartMS != config.TimeRange.StartMS || result.EndMS != actualEnd {
+	if result.StartMS != runRange.StartMS || result.EndMS != actualEnd {
 		t.Fatalf("early-stop result range = %d-%d, want %d-%d",
 			result.StartMS, result.EndMS, config.TimeRange.StartMS, actualEnd)
 	}
@@ -223,6 +273,30 @@ func TestCalcGroupEndProfitsUsesExitTimeAndFinalOrderProfit(t *testing.T) {
 	}
 }
 
+func TestPairPickerRegistry(t *testing.T) {
+	RegisterPairPicker("runtime-test", func(*BTResult) []string { return []string{"BTC/USDT"} })
+	t.Cleanup(func() { UnregisterPairPicker("runtime-test") })
+
+	if got := selectPairs(NewBTResult(), "runtime-test"); len(got) != 1 || got[0] != "BTC/USDT" {
+		t.Fatalf("registered pair picker result = %v", got)
+	}
+	if _, ok := SnapshotPairPickers()["runtime-test"]; !ok {
+		t.Fatal("pair picker snapshot omitted registered picker")
+	}
+}
+
+func TestExplicitPairPickerDoesNotReadLegacyDirectMap(t *testing.T) {
+	PairPickers["legacy-direct"] = func(*BTResult) []string { return []string{"legacy"} }
+	t.Cleanup(func() { delete(PairPickers, "legacy-direct") })
+
+	if got := selectPairs(&BTResult{reportDeps: &ReportDeps{}}, "legacy-direct"); got != nil {
+		t.Fatalf("explicit report used legacy direct picker: %v", got)
+	}
+	if got := selectPairs(NewBTResult(), "legacy-direct"); len(got) != 1 || got[0] != "legacy" {
+		t.Fatalf("legacy report lost direct picker compatibility: %v", got)
+	}
+}
+
 func TestCalcGroupEndProfitsIncludesAllProfitsAtFinalLabel(t *testing.T) {
 	const startMS = int64(1700000000000)
 	orders := []*ormo.InOutOrder{
@@ -237,6 +311,33 @@ func TestCalcGroupEndProfitsIncludesAllProfitsAtFinalLabel(t *testing.T) {
 		t.Fatalf("labels = %d, want 4", len(labels))
 	}
 	assertReportCurve(t, datasets[0], "zone", []float64{0, -7, -7, 5})
+}
+
+func TestCalcGroupEndProfitsWithRuntimeDepsUsesSnapshotLocation(t *testing.T) {
+	const startMS = int64(1704069000000) // 2024-01-01 00:30:00 UTC
+	deps := biz.RuntimeDeps{Config: config.NewSnapshotWithDirs(&config.Config{
+		Exchange: &config.ExchangeConfig{Name: "china"},
+	}, t.TempDir(), "")}
+
+	labels, datasets := CalcGroupEndProfitsWithRuntimeDeps([]*ormo.InOutOrder{
+		reportTestOrder(1, startMS, startMS+1000, "zone", 1),
+	}, func(o *ormo.InOutOrder) string {
+		return o.EnterTag
+	}, 1, deps)
+	if len(datasets) != 1 || len(labels) != 2 {
+		t.Fatalf("runtime end-profit curve = labels %v datasets %v", labels, datasets)
+	}
+	want := btime.MSToTime(startMS).In(deps.Config.Location()).Format(core.DefaultDateFmt)
+	if labels[0] != want {
+		t.Fatalf("runtime end-profit label = %q, want snapshot location %q", labels[0], want)
+	}
+}
+
+func TestCalcPairStatsLegacyFacadeKeepsEmptyInputUsable(t *testing.T) {
+	stats, err := CalcPairStats(nil, 0, 1, "1m")
+	if err != nil || len(stats) != 0 {
+		t.Fatalf("legacy pair stats = %v, %v; want empty successful result", stats, err)
+	}
 }
 
 func TestDumpEnterTagCumProfitsPreservesFourDigitValues(t *testing.T) {
@@ -270,6 +371,40 @@ func TestDumpEnterTagCumProfitsPreservesFourDigitValues(t *testing.T) {
 	}
 	if math.Abs(chart.Datasets[0].Data[1]+1029) > 1e-9 {
 		t.Fatalf("serialized final value = %v, want -1029 (not the old -100)", chart.Datasets[0].Data[1])
+	}
+}
+
+func TestDumpEnterTagCumProfitsWithRuntimeDepsUsesSnapshotLocation(t *testing.T) {
+	const startMS = int64(1704069000000) // 2024-01-01 00:30:00 UTC
+	path := t.TempDir() + "/enters.html"
+	deps := biz.RuntimeDeps{Config: config.NewSnapshotWithDirs(&config.Config{
+		Exchange: &config.ExchangeConfig{Name: "china"},
+	}, t.TempDir(), "")}
+	if err := DumpEnterTagCumProfitsWithRuntimeDeps(path, []*ormo.InOutOrder{
+		reportTestOrder(1, startMS, startMS+1000, "zone", 1),
+	}, 1, deps); err != nil {
+		t.Fatalf("DumpEnterTagCumProfitsWithRuntimeDeps failed: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated chart: %v", err)
+	}
+	const marker = "var chartData = "
+	start := bytes.Index(data, []byte(marker))
+	if start < 0 {
+		t.Fatal("generated chart does not contain chartData")
+	}
+	data = data[start+len(marker):]
+	end := bytes.IndexByte(data, '\n')
+	if end < 0 {
+		t.Fatal("generated chart chartData is not line terminated")
+	}
+	var chart Chart
+	if err := json.Unmarshal(data[:end], &chart); err != nil {
+		t.Fatalf("decode generated chart data: %v", err)
+	}
+	if got, want := chart.Labels[0], "2024-01-01 08:30:00"; got != want {
+		t.Fatalf("runtime chart label = %q, want snapshot-local %q", got, want)
 	}
 }
 
