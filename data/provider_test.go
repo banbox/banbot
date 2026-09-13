@@ -161,6 +161,9 @@ type stubDataFeeder struct {
 	waitStarted  chan struct{}
 	waitRelease  <-chan struct{}
 	waitOnce     sync.Once
+	warmStarted  chan struct{}
+	warmRelease  <-chan struct{}
+	warmOnce     sync.Once
 }
 
 type providerCallbackTracker struct {
@@ -231,6 +234,10 @@ func (f *stubDataFeeder) onNewData(int64, []*orm.DataSeries) (bool, *errs.Error)
 }
 func (f *stubDataFeeder) SubTfs(tfs []string, _ bool) []string { return tfs }
 func (f *stubDataFeeder) WarmTfs(_ int64, tfNums map[string]int, _ *utils.PrgBar) (int64, map[string][2]int, *errs.Error) {
+	if f.warmStarted != nil {
+		f.warmOnce.Do(func() { close(f.warmStarted) })
+		<-f.warmRelease
+	}
 	if f.warmLog != nil {
 		*f.warmLog = append(*f.warmLog, fmt.Sprintf("%s:%d", f.symbol, tfNums["1h"]))
 	}
@@ -880,6 +887,62 @@ func TestSubWarmPairsUsesStablePairOrder(t *testing.T) {
 	if !reflect.DeepEqual(created, []string{"BTC/USDT", "ETH/USDT", "SOL/USDT"}) ||
 		!reflect.DeepEqual(warmed, []string{"BTC/USDT:30", "ETH/USDT:20", "SOL/USDT:10"}) {
 		t.Fatalf("unstable warmup order: created=%v warmed=%v", created, warmed)
+	}
+}
+
+func TestProviderSubWarmPairsSerializesWarmups(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	secondCreated := make(chan struct{})
+	provider := &Provider[IDataFeeder]{
+		holders: make(map[string]IDataFeeder),
+		newFeeder: func(pair string, _ []string) (IDataFeeder, *errs.Error) {
+			feeder := &stubDataFeeder{symbol: pair}
+			if pair == "BTC/USDT" {
+				feeder.warmLog = nil
+				feeder.warmStarted = started
+				feeder.warmRelease = release
+			} else {
+				close(secondCreated)
+			}
+			return feeder, nil
+		},
+	}
+	firstDone := make(chan *errs.Error, 1)
+	go func() {
+		_, _, _, err := provider.SubWarmPairs(map[string]map[string]int{"BTC/USDT": {"1m": 1}}, false, nil)
+		firstDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first warmup did not start")
+	}
+	secondDone := make(chan *errs.Error, 1)
+	go func() {
+		_, _, _, err := provider.SubWarmPairs(map[string]map[string]int{"ETH/USDT": {"1m": 1}}, false, nil)
+		secondDone <- err
+	}()
+	select {
+	case <-secondCreated:
+		t.Fatal("second subscription interleaved with an active warmup")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	for _, done := range []<-chan *errs.Error{firstDone, secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("serialized subscription did not finish")
+		}
+	}
+	select {
+	case <-secondCreated:
+	default:
+		t.Fatal("second subscription was not started")
 	}
 }
 

@@ -447,7 +447,7 @@ func (s *State) JobKeys(account string) map[string]map[string]bool {
 	if s == nil {
 		return nil
 	}
-	jobs := s.JobMaps(account)
+	jobs := s.JobMapsView(account)
 	result := make(map[string]map[string]bool, len(jobs))
 	for pairTF, strategyJobs := range jobs {
 		ids := make(map[string]bool, len(strategyJobs))

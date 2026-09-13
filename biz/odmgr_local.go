@@ -202,13 +202,13 @@ func (o *LocalOrderMgr) updateProfitAndWallets(allOpens, curOrders []*ormo.InOut
 }
 
 func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap map[int64]bool, evt *orm.DataSeries) ([]*ormo.InOutOrder, *errs.Error) {
-	_, err := o.fillPendingOrders(orders, evt)
+	_, newOrderCount, err := o.fillPendingOrdersPass(orders, evt)
 	if err != nil {
 		return orders, err
 	}
 	// 在订单事件回调中可能触发新订单入场
 	checkCount := 0
-	for o.newOrdersInSim() > 0 {
+	for newOrderCount > 0 {
 		openOds, lock := o.openOrders()
 		var newOds []*ormo.InOutOrder
 		lock.Lock()
@@ -233,7 +233,7 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 			// openOds is a map, so its iteration order is not a historical
 			// order that frozen replay can preserve.
 			o.sortMapOrdersForBacktest(newOds)
-			_, err = o.fillPendingOrders(newOds, evt)
+			_, newOrderCount, err = o.fillPendingOrdersPass(newOds, evt)
 			if err != nil {
 				return orders, err
 			}
@@ -248,34 +248,27 @@ func (o *LocalOrderMgr) fillPendingOrdersAll(orders []*ormo.InOutOrder, curMap m
 	return orders, nil
 }
 
-func (o *LocalOrderMgr) newOrdersInSim() int {
+func (o *LocalOrderMgr) beginSimOrderMatch() {
 	if o != nil && o.runtimeDeps {
 		if o.runtimeCore != nil {
-			return o.runtimeCore.NewNumInSim
+			o.runtimeCore.BeginSimOrderMatch()
+		}
+		return
+	}
+	core.SimOrderMatch = true
+	core.NewNumInSim = 0
+}
+
+func (o *LocalOrderMgr) endSimOrderMatch() int {
+	if o != nil && o.runtimeDeps {
+		if o.runtimeCore != nil {
+			return o.runtimeCore.EndSimOrderMatch()
 		}
 		return 0
 	}
-	return core.NewNumInSim
-}
-
-func (o *LocalOrderMgr) setSimOrderMatch(enabled bool) {
-	if o != nil && o.runtimeDeps {
-		if o.runtimeCore != nil {
-			o.runtimeCore.SimOrderMatch = enabled
-		}
-		return
-	}
-	core.SimOrderMatch = enabled
-}
-
-func (o *LocalOrderMgr) resetSimOrderCount() {
-	if o != nil && o.runtimeDeps {
-		if o.runtimeCore != nil {
-			o.runtimeCore.NewNumInSim = 0
-		}
-		return
-	}
-	core.NewNumInSim = 0
+	count := core.NewNumInSim
+	core.SimOrderMatch = false
+	return count
 }
 
 func (o *LocalOrderMgr) sortMapOrdersForBacktest(orders []*ormo.InOutOrder) {
@@ -312,13 +305,15 @@ Fills orders waiting for exchange response. Cannot be used for real trading; can
 填充等待交易所响应的订单。不可用于实盘；可用于回测、模拟实盘等。
 */
 func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.DataSeries) (int, *errs.Error) {
+	affectNum, _, err := o.fillPendingOrdersPass(orders, evt)
+	return affectNum, err
+}
+
+func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *orm.DataSeries) (affectNum int,
+	newOrderCount int, resultErr *errs.Error) {
 	orders = executionOrderView(orders, o.executionDeps())
-	o.setSimOrderMatch(true)
-	o.resetSimOrderCount()
-	defer func() {
-		o.setSimOrderMatch(false)
-	}()
-	affectNum := 0
+	o.beginSimOrderMatch()
+	defer func() { newOrderCount = o.endSimOrderMatch() }()
 	bar := seriesOHLCVCompat(evt)
 	for _, od := range orders {
 		matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
@@ -331,7 +326,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 				// 已入场完成，尚未出现出场信号，检查是否触发止损The entry has been completed, but the exit signal has not yet appeared. Check whether the stop loss is triggered.
 				err := o.tryFillTriggers(od, bar, matchTf, 0)
 				if err != nil {
-					return 0, err
+					return 0, 0, err
 				}
 			}
 			continue
@@ -425,7 +420,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			err = o.fillPendingExit(od, price, fillMS)
 		}
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		affectNum += 1
 	}
@@ -448,7 +443,7 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 			}
 		}
 	}
-	return affectNum, nil
+	return affectNum, 0, nil
 }
 
 func stopEntryTriggered(isBuy bool, trigger, low, high float64) bool {

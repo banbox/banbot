@@ -3,12 +3,31 @@ package data
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
 )
+
+func TestSeriesWatcherInitMessagesSnapshotConcurrentWithAppend(t *testing.T) {
+	watcher := &SeriesWatcher{}
+	const writers = 16
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			watcher.addInitMsg(&utils.IOMsg{Action: "subscribe"})
+			_ = watcher.initMsgsSnapshot()
+		}()
+	}
+	wg.Wait()
+	if got := len(watcher.initMsgsSnapshot()); got != writers {
+		t.Fatalf("init message count = %d, want %d", got, writers)
+	}
+}
 
 func newWatcherListener(t *testing.T) (net.Listener, chan net.Conn, chan error) {
 	t.Helper()

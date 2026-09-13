@@ -13,6 +13,7 @@ import (
 	"github.com/banbox/banbot/runtime"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
+	"github.com/sasha-s/go-deadlock"
 )
 
 // newEntryRuntime is a test-only adapter for exercising the legacy facade's
@@ -68,6 +69,43 @@ func TestExecuteBackTestReturnsReportPath(t *testing.T) {
 	}
 	if outDir != "report" {
 		t.Fatalf("executeBackTest() output = %q, want report", outDir)
+	}
+}
+
+func TestOpenExplicitEntrySessionDoesNotChangeProcessDeadlockOptions(t *testing.T) {
+	previous := deadlock.Opts.Disable
+	deadlock.Opts.Disable = true
+	t.Cleanup(func() { deadlock.Opts.Disable = previous })
+
+	session, _, err := openExplicitEntrySession(&config.CmdArgs{
+		DeadLock:  true,
+		DataDir:   t.TempDir(),
+		NoDefault: true,
+		ConfigData: `
+name: isolated
+env: dry_run
+exchange:
+  name: binance
+market_type: linear
+time_start: "2024-01-01"
+time_end: "2024-01-02"
+stake_currency: [USDT]
+pairs: [BTC]
+accounts:
+  default: {}
+database:
+  url: "postgresql://127.0.0.1:1/banbot"
+  db_type: timescale
+`,
+	})
+	if session != nil {
+		t.Cleanup(session.close)
+	}
+	if session == nil && err == nil {
+		t.Fatal("session construction returned neither a session nor an error")
+	}
+	if !deadlock.Opts.Disable {
+		t.Fatal("runtime session changed the process-wide deadlock option")
 	}
 }
 

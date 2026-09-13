@@ -680,7 +680,7 @@ func collectBacktestJobsForBacktest(b *BackTest) ([]*strat.StratJob, *errs.Error
 	if deps.Strategies == nil || strat.IsLegacyState(deps.Strategies) {
 		return nil, errs.NewMsg(core.ErrRunTime, "runtime strategy state is required for backtest series")
 	}
-	return collectBacktestJobsFromMap(deps.Strategies.JobMaps(deps.DefaultAccount)), nil
+	return collectBacktestJobsFromMap(deps.Strategies.JobMapsView(deps.DefaultAccount)), nil
 }
 
 func collectBacktestJobsFromMap(jobsByEnv map[string]map[string]*strat.StratJob) []*strat.StratJob {
@@ -1215,7 +1215,6 @@ func newRelayRuntime(parent biz.RuntimeDeps, symbols *orm.SymbolState, group *st
 	state.ExgName, state.Market, state.ContractType = parent.Core.ExgName, parent.Core.Market, parent.Core.ContractType
 	state.IsContract = parent.Core.IsContract
 	state.NetDisable = parent.Core.NetDisable
-	state.SimOrderMatch = parent.Core.SimOrderMatch
 	state.ParallelOnBar = parent.Core.ParallelOnBar
 	state.NumTaCache, state.ConcurNum = parent.Core.NumTaCache, parent.Core.ConcurNum
 	state.SetPairs(parent.Core.AdmissionPairs(), nil)
@@ -1359,7 +1358,7 @@ func syncSimOrdersWithDeps(deps *biz.RuntimeDeps, isFirst bool, relayOpens, rela
 		if manager == nil {
 			continue
 		}
-		jobs := deps.Strategies.JobMaps(account)
+		jobs := deps.Strategies.JobMapsView(account)
 		openOrders, lock := deps.Orders.GetOpenODs(account)
 		current := make(map[string]*ormo.InOutOrder, len(openOrders))
 		lock.Lock()

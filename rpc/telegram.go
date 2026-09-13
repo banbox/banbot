@@ -111,6 +111,24 @@ type Telegram struct {
 	activeAccount string // 当前激活的账户
 }
 
+func (t *Telegram) chatID() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.chatId
+}
+
+func (t *Telegram) setChatID(chatID int64) {
+	t.mu.Lock()
+	t.chatId = chatID
+	t.mu.Unlock()
+}
+
+func (t *Telegram) activeAccountSnapshot() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.activeAccount
+}
+
 // updateHandler 消息处理器
 type updateHandler struct {
 	handlerType handlerType
@@ -280,13 +298,13 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 			return
 		}
 		if update.Message != nil {
-			res.chatId = update.Message.Chat.ID
+			res.setChatID(update.Message.Chat.ID)
 		} else {
 			chatID, _, _, _ := callbackMessageTarget(&update)
 			if chatID != 0 {
-				res.chatId = chatID
+				res.setChatID(chatID)
 			} else {
-				res.chatId = update.CallbackQuery.From.ID
+				res.setChatID(update.CallbackQuery.From.ID)
 			}
 		}
 		res.routeUpdate(res.telegramContext(), nil, &update)
@@ -380,15 +398,15 @@ func initCustomTgBot(res *Telegram, name string, item map[string]interface{}) *e
 
 	switch v := chatIdV.(type) {
 	case int:
-		res.chatId = int64(v)
+		res.setChatID(int64(v))
 	case int64:
-		res.chatId = v
+		res.setChatID(v)
 	case string:
 		chatId, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			return errs.NewMsg(errs.CodeParamInvalid, "%s.chat_id is invalid, must be a number: %v", name, err)
 		}
-		res.chatId = chatId
+		res.setChatID(chatId)
 	default:
 		return errs.NewMsg(errs.CodeParamInvalid, "%s.chat_id must be a number", name)
 	}
@@ -676,7 +694,7 @@ func (t *Telegram) send(msg *bot.SendMessageParams) error {
 	if len(msg.Text) > maxTelegramMsgLen {
 		msg.Text = msg.Text[:maxTelegramMsgLen-3] + "..."
 	}
-	log.Info("telegram sending message", zap.String("text", msg.Text), zap.Int64("chat_id", t.chatId), zap.Bool("off", t.bot == nil))
+	log.Info("telegram sending message", zap.String("text", msg.Text), zap.Int64("chat_id", t.chatID()), zap.Bool("off", t.bot == nil))
 	var err error
 	if t.bot == nil {
 		// 通过官方机器人发送
@@ -721,13 +739,14 @@ func makeDoSendMsgTelegram(t *Telegram) func([]map[string]string) []map[string]s
 		}
 
 		text := strings.Join(msgArr, "\n\n---\n\n")
+		chatID := t.chatID()
 		err := t.send(&bot.SendMessageParams{
-			ChatID: t.chatId,
+			ChatID: chatID,
 			Text:   text,
 		})
 		if err != nil {
 			log.Error("telegram send msg fail", zap.String("text", text),
-				zap.Int64("chat_id", t.chatId), zap.Error(err))
+				zap.Int64("chat_id", chatID), zap.Error(err))
 			return msgList
 		}
 
@@ -762,7 +781,7 @@ func (t *Telegram) setupCommandHandlers() {
 		if owner != nil {
 			defer owner.doneTask()
 		}
-		log.Info("Starting Telegram bot command listener", zap.Int64("chat_id", t.chatId))
+		log.Info("Starting Telegram bot command listener", zap.Int64("chat_id", t.chatID()))
 		defer func() {
 			if r := recover(); r != nil {
 				log.Error("Telegram bot panic", zap.Any("panic", r))
@@ -1055,16 +1074,17 @@ func (t *Telegram) isAuthorized(update *models.Update) bool {
 	if update == nil {
 		return false
 	}
+	authorizedChatID := t.chatID()
 	if update.CallbackQuery != nil {
 		userID := update.CallbackQuery.From.ID
 		chatID, _, _, _ := callbackMessageTarget(update)
-		if chatID == t.chatId || userID == t.chatId {
+		if chatID == authorizedChatID || userID == authorizedChatID {
 			return true
 		}
 		log.Warn("Unauthorized telegram callback attempt",
 			zap.Int64("user_id", userID),
 			zap.Int64("chat_id", chatID),
-			zap.Int64("authorized_chat_id", t.chatId))
+			zap.Int64("authorized_chat_id", authorizedChatID))
 		return false
 	}
 	if update.Message == nil || update.Message.From == nil {
@@ -1076,14 +1096,14 @@ func (t *Telegram) isAuthorized(update *models.Update) bool {
 	chatID := update.Message.Chat.ID
 
 	// 如果是私聊，检查用户ID；如果是群聊，检查群ID
-	if chatID == t.chatId || userID == t.chatId {
+	if chatID == authorizedChatID || userID == authorizedChatID {
 		return true
 	}
 
 	log.Warn("Unauthorized telegram command attempt",
 		zap.Int64("user_id", userID),
 		zap.Int64("chat_id", chatID),
-		zap.Int64("authorized_chat_id", t.chatId))
+		zap.Int64("authorized_chat_id", authorizedChatID))
 	return false
 }
 
@@ -1098,6 +1118,7 @@ func (t *Telegram) sendResponse(update *models.Update, response string) {
 
 // getOrdersList 获取订单列表
 func (t *Telegram) getOrdersList() string {
+	account := t.activeAccountSnapshot()
 	var response strings.Builder
 	title := t.langMsg("current_orders_title", "📊 当前订单列表")
 	response.WriteString(title + "\n")
@@ -1105,7 +1126,7 @@ func (t *Telegram) getOrdersList() string {
 
 	// 显示当前激活账户
 	activeAccountLabel := t.langMsg("active_account_label", "🎯 当前账户:")
-	response.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, t.activeAccount))
+	response.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, account))
 
 	if t.orders() == nil {
 		notInitialized := t.langMsg("order_manager_not_initialized", "❌ 订单管理器未初始化")
@@ -1124,9 +1145,9 @@ func (t *Telegram) getOrdersList() string {
 	calculating := t.langMsg("calculating", "计算中...")
 
 	// 只查询当前激活账户的订单
-	orders, err := t.orders().GetActiveOrders(t.activeAccount)
+	orders, err := t.orders().GetActiveOrders(account)
 	if err != nil {
-		log.Error("Failed to get orders", zap.String("account", t.activeAccount), zap.Error(err))
+		log.Error("Failed to get orders", zap.String("account", account), zap.Error(err))
 		errorMsg := t.langMsg("get_orders_failed", "❌ 获取订单失败:")
 		response.WriteString(fmt.Sprintf("%s %s\n", errorMsg, err.Error()))
 		response.WriteString(separatorLine)
@@ -1171,10 +1192,11 @@ func (t *Telegram) getOrdersList() string {
 
 // buildOrdersInlineKeyboard 构建订单列表对应的内联键盘（每单平仓 + 批量操作）
 func (t *Telegram) buildOrdersInlineKeyboard() *models.InlineKeyboardMarkup {
+	account := t.activeAccountSnapshot()
 	var rows = make([][]models.InlineKeyboardButton, 0)
 	if t.orders() != nil {
 		// 使用当前激活账户
-		orders, err := t.orders().GetActiveOrders(t.activeAccount)
+		orders, err := t.orders().GetActiveOrders(account)
 		if err == nil && len(orders) > 0 {
 			closePositionFormat := t.langMsg("close_position_format", "❌ 平仓 %d")
 			for _, od := range orders {
@@ -1220,7 +1242,8 @@ func (t *Telegram) closeOrders(orderID string) string {
 	}
 
 	// 使用当前激活账户平仓
-	err = t.orders().CloseOrder(t.activeAccount, id)
+	account := t.activeAccountSnapshot()
+	err = t.orders().CloseOrder(account, id)
 	if err == nil {
 		closeSuccessTitle := t.langMsg("close_success_title", "✅ 平仓成功")
 		orderIDLabel := t.langMsg("order_id_label", "📊 订单ID:")
@@ -1228,7 +1251,7 @@ func (t *Telegram) closeOrders(orderID string) string {
 		timeLabel := t.langMsg("time_label", "⏰ 时间:")
 		closeRequestSubmitted := t.langMsg("close_request_submitted", "已提交平仓请求，请等待执行完成。")
 		return fmt.Sprintf("%s\n\n%s <code>%d</code>\n%s <code>%s</code>\n%s %s\n\n%s",
-			closeSuccessTitle, orderIDLabel, id, accountTarget, t.activeAccount,
+			closeSuccessTitle, orderIDLabel, id, accountTarget, account,
 			timeLabel, time.Now().Format("15:04:05"), closeRequestSubmitted)
 	}
 
@@ -1242,6 +1265,7 @@ func (t *Telegram) closeOrders(orderID string) string {
 
 // closeAllOrders 平仓所有订单
 func (t *Telegram) closeAllOrders() string {
+	account := t.activeAccountSnapshot()
 	var response strings.Builder
 	batchCloseResultTitle := t.langMsg("batch_close_result_title", "🔄 批量平仓结果")
 	response.WriteString(batchCloseResultTitle + "\n")
@@ -1249,7 +1273,7 @@ func (t *Telegram) closeAllOrders() string {
 
 	// 显示当前激活账户
 	activeAccountLabel := t.langMsg("active_account_label", "🎯 当前账户:")
-	response.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, t.activeAccount))
+	response.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, account))
 
 	if t.orders() == nil {
 		notInitialized := t.langMsg("order_manager_not_initialized", "❌ 订单管理器未初始化")
@@ -1263,7 +1287,7 @@ func (t *Telegram) closeAllOrders() string {
 	failedLabel := t.langMsg("failed_label", "❌ 失败:")
 
 	// 只平仓当前激活账户的订单
-	successCount, failedCount, err := t.orders().CloseAllOrders(t.activeAccount)
+	successCount, failedCount, err := t.orders().CloseAllOrders(account)
 	if err != nil {
 		response.WriteString(fmt.Sprintf("%s %s\n", getOrdersFailed, err.Error()))
 		response.WriteString(separatorLine)
@@ -1278,6 +1302,7 @@ func (t *Telegram) closeAllOrders() string {
 
 // getTradingStatus 获取交易状态
 func (t *Telegram) getTradingStatus() string {
+	account := t.activeAccountSnapshot()
 	var response strings.Builder
 	tradingStatusTitle := t.langMsg("trading_status_title", "📊 交易状态")
 	response.WriteString(tradingStatusTitle + "\n")
@@ -1285,7 +1310,7 @@ func (t *Telegram) getTradingStatus() string {
 
 	// 显示当前激活账户
 	activeAccountLabel := t.langMsg("active_account_label", "🎯 当前账户:")
-	response.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, t.activeAccount))
+	response.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, account))
 
 	nowMS := t.nowMS()
 
@@ -1300,7 +1325,7 @@ func (t *Telegram) getTradingStatus() string {
 	shortOrderLabel := t.langMsg("short_order_label", "空单:")
 
 	// 检查当前激活账户是否被禁用
-	if untilMS, exists := t.noEnterUntilFor(t.activeAccount); exists && nowMS < untilMS {
+	if untilMS, exists := t.noEnterUntilFor(account); exists && nowMS < untilMS {
 		remainingMS := untilMS - nowMS
 		remaining := time.Duration(remainingMS) * time.Millisecond
 		response.WriteString(fmt.Sprintf("🚫 <b>%s</b> %s\n", statusLabel, tradingDisabledStatus))
@@ -1320,7 +1345,7 @@ func (t *Telegram) getTradingStatus() string {
 
 	// 获取当前账户的订单数量
 	if t.orders() != nil {
-		longCount, shortCount, err := t.orders().GetOrderStats(t.activeAccount)
+		longCount, shortCount, err := t.orders().GetOrderStats(account)
 		if err == nil {
 			response.WriteString(fmt.Sprintf("📈 <b>%s</b> %d | 📉 <b>%s</b> %d\n", longOrderLabel, longCount, shortOrderLabel, shortCount))
 		}
@@ -1338,7 +1363,8 @@ func (t *Telegram) disableTrading(hours int) string {
 		notInitialized := t.langMsg("order_manager_not_initialized", "订单管理器未初始化")
 		return fmt.Sprintf("%s: %s", errorLabel, notInitialized)
 	}
-	untilMS, err := t.orders().DisableTrading(t.activeAccount, hours)
+	account := t.activeAccountSnapshot()
+	untilMS, err := t.orders().DisableTrading(account, hours)
 	if err != nil {
 		errorLabel := t.langMsg("error_label", "❌ 错误")
 		return fmt.Sprintf("%s: %s", errorLabel, err.Error())
@@ -1346,7 +1372,7 @@ func (t *Telegram) disableTrading(hours int) string {
 
 	format := t.langMsg("trading_disabled_format", "🚫 <b>开单已禁用</b>\n\n🎯 <b>账户:</b> <code>%s</code>\n⏰ <b>禁用时长:</b> %d 小时\n📅 <b>恢复时间:</b> %s\n\n使用 <code>/enable</code> 可提前恢复开单")
 	disabledUntil := time.Unix(untilMS/1000, (untilMS%1000)*1000000)
-	return fmt.Sprintf(format, t.activeAccount, hours, disabledUntil.Format("2006-01-02 15:04:05"))
+	return fmt.Sprintf(format, account, hours, disabledUntil.Format("2006-01-02 15:04:05"))
 }
 
 // enableTrading 启用交易
@@ -1356,13 +1382,14 @@ func (t *Telegram) enableTrading() string {
 		notInitialized := t.langMsg("order_manager_not_initialized", "订单管理器未初始化")
 		return fmt.Sprintf("%s: %s", errorLabel, notInitialized)
 	}
-	if err := t.orders().EnableTrading(t.activeAccount); err != nil {
+	account := t.activeAccountSnapshot()
+	if err := t.orders().EnableTrading(account); err != nil {
 		errorLabel := t.langMsg("error_label", "❌ 错误")
 		return fmt.Sprintf("%s: %s", errorLabel, err.Error())
 	}
 
 	format := t.langMsg("trading_enabled_message", "✅ <b>开单已恢复</b>\n\n🎯 <b>账户:</b> <code>%s</code>\n\n该账户的交易功能已重新启用")
-	return fmt.Sprintf(format, t.activeAccount)
+	return fmt.Sprintf(format, account)
 }
 
 // IsTradingDisabled 检查指定账户是否被禁用交易（供外部调用）
@@ -1385,6 +1412,7 @@ func (t *Telegram) handleWalletCommand(ctx context.Context, b *bot.Bot, update *
 
 // getWalletSummary 获取钱包汇总信息
 func (t *Telegram) getWalletSummary() string {
+	account := t.activeAccountSnapshot()
 	var bld strings.Builder
 	walletTitle := t.langMsg("wallet_summary_title", "👛 钱包汇总")
 	bld.WriteString(fmt.Sprintf("<b>%s</b>\n", walletTitle))
@@ -1392,7 +1420,7 @@ func (t *Telegram) getWalletSummary() string {
 
 	// 显示当前激活账户
 	activeAccountLabel := t.langMsg("active_account_label", "🎯 当前账户:")
-	bld.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, t.activeAccount))
+	bld.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, account))
 
 	// 提前获取所有语言标签
 	totalAmount := t.langMsg("total_amount", "💼 总额:")
@@ -1403,7 +1431,7 @@ func (t *Telegram) getWalletSummary() string {
 	// 只查询当前激活账户的钱包信息
 	var total, ava, upol float64
 	if t.wallets() != nil {
-		total, ava, upol = t.wallets().GetSummary(t.activeAccount)
+		total, ava, upol = t.wallets().GetSummary(account)
 		bld.WriteString(fmt.Sprintf("<b>%s</b> <code>%.2f</code>\n", totalAmount, total))
 		bld.WriteString(fmt.Sprintf("<b>%s</b> <code>%.2f</code>\n", availableAmount, ava))
 		bld.WriteString(fmt.Sprintf("<b>%s</b> <code>%.2f</code>\n", unrealizedPnl, upol))
@@ -1460,13 +1488,14 @@ func (t *Telegram) handleSwitchCommand(ctx context.Context, b *bot.Bot, update *
 
 // getAccountList 获取账户列表
 func (t *Telegram) getAccountList() string {
+	activeAccount := t.activeAccountSnapshot()
 	var response strings.Builder
 	title := t.langMsg("account_list_title", "📋 账户列表")
 	response.WriteString(title + "\n")
 	response.WriteString(separatorLine + "\n\n")
 
 	activeAccountLabel := t.langMsg("active_account_label", "🎯 当前账户:")
-	response.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, t.activeAccount))
+	response.WriteString(fmt.Sprintf("<b>%s</b> <code>%s</code>\n\n", activeAccountLabel, activeAccount))
 
 	availableAccountsLabel := t.langMsg("available_accounts_label", "可用账户:")
 	response.WriteString(fmt.Sprintf("<b>%s</b>\n", availableAccountsLabel))
@@ -1475,7 +1504,7 @@ func (t *Telegram) getAccountList() string {
 		if cfg.NoTrade {
 			continue
 		}
-		if account == t.activeAccount {
+		if account == activeAccount {
 			response.WriteString(fmt.Sprintf("  ✅ <code>%s</code> (当前)\n", account))
 		} else {
 			response.WriteString(fmt.Sprintf("  • <code>%s</code>\n", account))
@@ -1488,13 +1517,14 @@ func (t *Telegram) getAccountList() string {
 
 // buildAccountInlineKeyboard 构建账户切换的内联键盘
 func (t *Telegram) buildAccountInlineKeyboard() *models.InlineKeyboardMarkup {
+	activeAccount := t.activeAccountSnapshot()
 	var rows = make([][]models.InlineKeyboardButton, 0)
 
 	for account, cfg := range t.accountConfigs() {
 		if cfg.NoTrade {
 			continue
 		}
-		if account != t.activeAccount {
+		if account != activeAccount {
 			rows = append(rows, []models.InlineKeyboardButton{{
 				Text:         fmt.Sprintf("🔄 切换到 %s", account),
 				CallbackData: fmt.Sprintf("switch:%s", account),

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/banbox/banbot/config"
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
@@ -68,6 +69,53 @@ func TestTelegramSharedHandlersMatchCommandsAndCallbacks(t *testing.T) {
 	}
 	if handler := tg.findUpdateHandler(telegramCallbackUpdate(42)); handler == nil {
 		t.Fatal("callback handler was not registered")
+	}
+}
+
+func TestTelegramRuntimeStateConcurrentAccess(t *testing.T) {
+	tg := newTelegramTestInstance(42)
+	tg.session = &Session{accounts: map[string]*config.AccountConfig{
+		"first":  {},
+		"second": {},
+	}}
+	tg.activeAccount = "first"
+
+	const iterations = 128
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			if i%2 == 0 {
+				tg.switchAccount("first")
+			} else {
+				tg.switchAccount("second")
+			}
+			tg.setChatID(int64(i + 1))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			_ = tg.getOrdersList()
+			_ = tg.getAccountList()
+			_ = tg.isAuthorized(&models.Update{Message: &models.Message{
+				From: &models.User{ID: 42},
+				Chat: models.Chat{ID: 42},
+			}})
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	if account := tg.activeAccountSnapshot(); account != "first" && account != "second" {
+		t.Fatalf("unexpected active account %q", account)
+	}
+	if chatID := tg.chatID(); chatID == 0 {
+		t.Fatal("chat ID was lost during concurrent updates")
 	}
 }
 

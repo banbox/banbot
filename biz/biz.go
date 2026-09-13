@@ -377,7 +377,7 @@ func InitOdSubsWithRuntimeDeps(deps *RuntimeDeps) {
 	if deps.Market != nil {
 		prices = deps.Market.Prices
 	}
-	stateMap := state.PairStrategies()
+	stateMap := state.PairStrategiesView()
 	subStgys := make(map[string]*strat.TradeStrat)
 	for _, items := range stateMap {
 		for stgName, stgy := range items {

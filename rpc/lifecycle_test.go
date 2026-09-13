@@ -16,6 +16,50 @@ func newLifecycleWebHook() *WebHook {
 	return NewWebHook("lifecycle", map[string]interface{}{"type": "test"})
 }
 
+func TestPrepareRequestConcurrentCacheMiss(t *testing.T) {
+	clientMutex.Lock()
+	previousClients := clientMap
+	clientMap = make(map[string]*http.Client)
+	clientMutex.Unlock()
+	t.Cleanup(func() {
+		clientMutex.Lock()
+		clientMap = previousClients
+		clientMutex.Unlock()
+	})
+
+	const requests = 64
+	start := make(chan struct{})
+	errs := make(chan error, requests)
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, req, err := prepareRequest(http.MethodGet, "http://example.test", "", "")
+			if err == nil && req.Body != nil {
+				req.Body.Close()
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("prepare request: %v", err)
+		}
+	}
+
+	clientMutex.RLock()
+	count := len(clientMap)
+	clientMutex.RUnlock()
+	if count != 1 {
+		t.Fatalf("expected one cached client, got %d", count)
+	}
+}
+
 func TestWebHookEnqueueCloseRaceDoesNotPanic(t *testing.T) {
 	hook := newLifecycleWebHook()
 

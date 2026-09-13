@@ -320,6 +320,53 @@ func TestStateAdmissionOverridesAreSynchronized(t *testing.T) {
 	wg.Wait()
 }
 
+func TestStateSerializesSimulationMatchPasses(t *testing.T) {
+	state, err := NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	firstDone := make(chan int, 1)
+	go func() {
+		state.BeginSimOrderMatch()
+		close(firstStarted)
+		state.AddSimOrder()
+		<-firstRelease
+		firstDone <- state.EndSimOrderMatch()
+	}()
+	<-firstStarted
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan int, 1)
+	go func() {
+		state.BeginSimOrderMatch()
+		close(secondStarted)
+		state.AddSimOrder()
+		state.AddSimOrder()
+		secondDone <- state.EndSimOrderMatch()
+	}()
+	select {
+	case <-secondStarted:
+		t.Fatal("second simulation pass interleaved with the first")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(firstRelease)
+	if got := <-firstDone; got != 1 {
+		t.Fatalf("first simulation count = %d, want 1", got)
+	}
+	select {
+	case got := <-secondDone:
+		if got != 2 {
+			t.Fatalf("second simulation count = %d, want 2", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second simulation pass did not run")
+	}
+}
+
 func BenchmarkSymbolParserColdMiss(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {

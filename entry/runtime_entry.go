@@ -20,7 +20,6 @@ import (
 	"github.com/banbox/banbot/runtime"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -54,9 +53,6 @@ func openExplicitEntrySession(args *config.CmdArgs) (*explicitEntrySession, *con
 	cfg := snapshot.View()
 	if cfg == nil || cfg.Database == nil {
 		return nil, nil, errs.NewMsg(core.ErrBadConfig, "database config is required")
-	}
-	if args.DeadLock {
-		deadlock.Opts.Disable = false
 	}
 	logArgs := *args
 	if logArgs.Logfile != "" {

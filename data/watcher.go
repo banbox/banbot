@@ -3,6 +3,7 @@ package data
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 
@@ -26,6 +27,7 @@ type SeriesWatcher struct {
 	jobs      map[string]map[string]*PairTFCache
 	jobLock   sync.RWMutex
 	initMsgs  []*utils.IOMsg
+	initMu    sync.RWMutex
 	OnDataMsg func(msg *SeriesMsg) // 收到爬虫K线消息
 	OnTrades  func(exgName, market, pair string, trades []*banexg.Trade)
 	OnDepth   func(dep *banexg.OrderBook)
@@ -92,12 +94,12 @@ func newSeriesWatcher(deps *RuntimeDeps, symbols *orm.SymbolState, addr string) 
 	res.Listens[core.WsSubTrade] = res.onTrades
 	res.Listens[core.WsSubDepth] = res.onBook
 	res.ReInitConn = func() {
-		if len(res.initMsgs) == 0 {
+		msgs := res.initMsgsSnapshot()
+		if len(msgs) == 0 {
 			return
 		}
-		for _, msg := range res.initMsgs {
-			err = res.WriteMsg(msg)
-			if err != nil {
+		for _, msg := range msgs {
+			if writeErr := res.WriteMsg(msg); writeErr != nil {
 				msgText, _ := utils2.MarshalString(msg)
 				log.Error("re init conn fail", zap.String("msg", msgText))
 				return
@@ -381,8 +383,21 @@ func (w *SeriesWatcher) SendMsg(action string, data interface{}) *errs.Error {
 	if err != nil {
 		return err
 	}
-	w.initMsgs = append(w.initMsgs, msg)
+	w.addInitMsg(msg)
 	return nil
+}
+
+func (w *SeriesWatcher) addInitMsg(msg *utils.IOMsg) {
+	w.initMu.Lock()
+	w.initMsgs = append(w.initMsgs, msg)
+	w.initMu.Unlock()
+}
+
+func (w *SeriesWatcher) initMsgsSnapshot() []*utils.IOMsg {
+	w.initMu.RLock()
+	msgs := slices.Clone(w.initMsgs)
+	w.initMu.RUnlock()
+	return msgs
 }
 
 func (w *SeriesWatcher) UnWatchJobs(exgName, marketType, jobType string, pairs []string) *errs.Error {

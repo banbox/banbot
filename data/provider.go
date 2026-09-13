@@ -85,6 +85,7 @@ func getExSymbol2WithRuntimeDeps(deps *RuntimeDeps, state *orm.SymbolState, exch
 type Provider[T IDataFeeder] struct {
 	holders   map[string]T
 	holdersMu sync.RWMutex
+	opMu      sync.Mutex
 	newFeeder func(pair string, tfs []string) (T, *errs.Error)
 	dirtyVers chan int
 	dirtyLast int
@@ -136,6 +137,12 @@ func (p *Provider[T]) replaceHolders(holders map[string]T) {
 }
 
 func (p *Provider[IDataFeeder]) UnSubPairs(pairs ...string) []string {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	return p.unSubPairs(pairs...)
+}
+
+func (p *Provider[IDataFeeder]) unSubPairs(pairs ...string) []string {
 	var removed []string
 	for _, pair := range pairs {
 		if _, ok := p.getHolder(pair); ok {
@@ -169,6 +176,12 @@ Return the trading pairs with the smallest period change (new/old pairs new peri
 	返回最小周期变化的交易对(新增/旧对新周期)、预热任务
 */
 func (p *Provider[IDataFeeder]) SubWarmPairs(items map[string]map[string]int, delOther bool, pBar *utils.StagedPrg) ([]IDataFeeder, map[string]int64, []string, *errs.Error) {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	return p.subWarmPairs(items, delOther, pBar)
+}
+
+func (p *Provider[IDataFeeder]) subWarmPairs(items map[string]map[string]int, delOther bool, pBar *utils.StagedPrg) ([]IDataFeeder, map[string]int64, []string, *errs.Error) {
 	registry := p.wsRegistry()
 	if registry == nil && p != nil && p.deps != nil {
 		return nil, nil, nil, errs.NewMsg(core.ErrBadConfig, "explicit data provider websocket registry is required")
@@ -555,7 +568,9 @@ func (p *HistProvider) downIfNeed() *errs.Error {
 }
 
 func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bool) *errs.Error {
-	newHolds, sinceMap, delPairs, err := p.Provider.SubWarmPairs(items, delOther, p.pBar)
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	newHolds, sinceMap, delPairs, err := p.subWarmPairs(items, delOther, p.pBar)
 	if err != nil {
 		return err
 	}
@@ -689,7 +704,9 @@ func (p *HistProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 }
 
 func (p *HistProvider) UnSubPairs(pairs ...string) *errs.Error {
-	_ = p.Provider.UnSubPairs(pairs...)
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	_ = p.unSubPairs(pairs...)
 	return nil
 }
 
@@ -1036,7 +1053,9 @@ func (p *LiveProvider) registerLifecycle() {
 }
 
 func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bool) *errs.Error {
-	newHolds, sinceMap, delPairs, err := p.Provider.SubWarmPairs(items, delOther, nil)
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	newHolds, sinceMap, delPairs, err := p.subWarmPairs(items, delOther, nil)
 	if err != nil {
 		return err
 	}
@@ -1136,7 +1155,9 @@ func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 }
 
 func (p *LiveProvider) UnSubPairs(pairs ...string) *errs.Error {
-	removed := p.Provider.UnSubPairs(pairs...)
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	removed := p.unSubPairs(pairs...)
 	if len(removed) == 0 {
 		return nil
 	}

@@ -2,8 +2,10 @@ package live
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
@@ -13,6 +15,48 @@ import (
 	"github.com/banbox/banbot/data"
 	"github.com/banbox/cron/v3"
 )
+
+func TestRuntimeRunGateSkipsOverlap(t *testing.T) {
+	var gate runtimeRunGate
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan struct{})
+	go func() {
+		gate.run(func() {
+			close(started)
+			<-release
+		})
+		close(firstDone)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first job did not start")
+	}
+	var calls atomic.Int32
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gate.run(func() { calls.Add(1) })
+		}()
+	}
+	wg.Wait()
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("overlapping jobs ran %d times", got)
+	}
+	close(release)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first job did not finish")
+	}
+	gate.run(func() { calls.Add(1) })
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("gate did not reopen, calls=%d", got)
+	}
+}
 
 type runtimeFatalSchedulerProbe struct {
 	addCalls atomic.Int32

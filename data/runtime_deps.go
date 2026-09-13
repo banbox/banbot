@@ -55,13 +55,6 @@ type RuntimeDeps struct {
 	MarketType   string
 }
 
-func (d *RuntimeDeps) dataSourceCatalog() *DataSourceCatalog {
-	if d == nil {
-		return legacyDataSourceCatalog
-	}
-	return d.Catalog
-}
-
 func (d *RuntimeDeps) storage() *orm.Storage {
 	if d == nil {
 		return nil

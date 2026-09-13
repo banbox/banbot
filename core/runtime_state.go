@@ -62,8 +62,6 @@ type State struct {
 	CPUProfile    bool
 	MemProfile    bool
 	NetDisable    bool
-	SimOrderMatch bool
-	NewNumInSim   int
 	ParallelOnBar bool
 	ConcurNum     int
 	SysLang       string
@@ -87,6 +85,44 @@ type State struct {
 	// explicit runtime code uses the typed accessors below instead of racing on
 	// direct access.
 	flagsMu sync.RWMutex
+
+	simOrderMu    sync.Mutex
+	simOrderMatch atomic.Bool
+	newNumInSim   atomic.Int64
+}
+
+// BeginSimOrderMatch serializes one runtime's simulated matching pass. The
+// counter belongs to that pass, so concurrent accounts must not reset it.
+func (s *State) BeginSimOrderMatch() {
+	if s == nil {
+		return
+	}
+	s.simOrderMu.Lock()
+	s.newNumInSim.Store(0)
+	s.simOrderMatch.Store(true)
+}
+
+func (s *State) EndSimOrderMatch() int {
+	if s == nil {
+		return 0
+	}
+	count := int(s.newNumInSim.Load())
+	s.simOrderMatch.Store(false)
+	s.simOrderMu.Unlock()
+	return count
+}
+
+func (s *State) AddSimOrder() {
+	if s != nil && s.simOrderMatch.Load() {
+		s.newNumInSim.Add(1)
+	}
+}
+
+func (s *State) NewSimOrderCount() int {
+	if s == nil {
+		return 0
+	}
+	return int(s.newNumInSim.Load())
 }
 
 // NewState creates a self-contained core state and derives a private

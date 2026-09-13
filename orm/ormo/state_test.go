@@ -175,15 +175,20 @@ func TestOrderStateSimulationCounterDoesNotUseLegacyCore(t *testing.T) {
 	})
 	core.SimOrderMatch = true
 	core.NewNumInSim = 0
-	runtimeCore := &core.State{SimOrderMatch: true}
+	runtimeCore, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeCore.BeginSimOrderMatch()
+	defer runtimeCore.EndSimOrderMatch()
 	state := NewOrderState()
 	state.BindCore(runtimeCore)
 	order := &InOutOrder{IOrder: &IOrder{TaskID: -1, Status: InOutStatusInit}}
 	order.BindState(state)
-	if err := order.Save(); err != nil {
-		t.Fatal(err)
+	if saveErr := order.Save(); saveErr != nil {
+		t.Fatal(saveErr)
 	}
-	if runtimeCore.NewNumInSim != 1 || core.NewNumInSim != 0 {
-		t.Fatalf("simulation counters runtime=%d legacy=%d, want 1/0", runtimeCore.NewNumInSim, core.NewNumInSim)
+	if runtimeCore.NewSimOrderCount() != 1 || core.NewNumInSim != 0 {
+		t.Fatalf("simulation counters runtime=%d legacy=%d, want 1/0", runtimeCore.NewSimOrderCount(), core.NewNumInSim)
 	}
 }

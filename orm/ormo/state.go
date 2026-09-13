@@ -580,9 +580,7 @@ func (s *OrderState) LegacyOrderMetrics() bool {
 func (s *OrderState) addSimOrder() {
 	if s != nil {
 		if s.runtimeCore != nil {
-			if s.runtimeCore.SimOrderMatch {
-				s.runtimeCore.NewNumInSim++
-			}
+			s.runtimeCore.AddSimOrder()
 			return
 		}
 		if s != legacyOrderState {

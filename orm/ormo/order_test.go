@@ -138,7 +138,8 @@ func TestExplicitOrderUsesBoundRuntimeDependencies(t *testing.T) {
 	}
 	defer coreState.Close()
 	coreState.SetRunMode(core.RunModeBackTest)
-	coreState.SimOrderMatch = true
+	coreState.BeginSimOrderMatch()
+	defer coreState.EndSimOrderMatch()
 	clock := btime.NewClockState(true, nil)
 	clock.SetTimeMS(100_000)
 	prices := com.NewPriceState("runtime-exchange")
@@ -167,7 +168,7 @@ func TestExplicitOrderUsesBoundRuntimeDependencies(t *testing.T) {
 		t.Fatal("runtime clock was not used by CanClose")
 	}
 	order.SetExit(0, "runtime-exit", banexg.OdTypeMarket, 0)
-	if got := coreState.NewNumInSim; got != 1 {
+	if got := coreState.NewSimOrderCount(); got != 1 {
 		t.Fatalf("runtime simulation counter = %d, want 1", got)
 	}
 	if core.NewNumInSim != 73 {

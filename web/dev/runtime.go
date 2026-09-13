@@ -108,17 +108,6 @@ func (s *DevServer) symbols() *orm.SymbolState {
 	return nil
 }
 
-func (s *DevServer) dataConn(ctx context.Context) (*orm.Queries, *pgxpool.Conn, *errs.Error) {
-	var storage *orm.Storage
-	if s != nil && s.Data != nil {
-		storage = s.Data.Storage
-	}
-	if storage == nil {
-		return nil, nil, errs.NewMsg(errs.CodeParamRequired, "dev server storage is required")
-	}
-	return storage.Conn(ctx)
-}
-
 func dataConnFor(ctx context.Context, deps *data.RuntimeDeps) (*orm.Queries, *pgxpool.Conn, *errs.Error) {
 	if deps == nil || deps.Storage == nil {
 		return nil, nil, errs.NewMsg(errs.CodeParamRequired, "dev server storage is required")

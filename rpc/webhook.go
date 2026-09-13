@@ -472,11 +472,16 @@ func prepareRequest(method, reqURL, body, proxy string) (*http.Client, *http.Req
 	// 根据proxy获取对应的client
 	clientMutex.RLock()
 	client, exists := clientMap[proxy]
-	if !exists {
-		client = createWebHookClient(proxy)
-		clientMap[proxy] = client
-	}
 	clientMutex.RUnlock()
+	if !exists {
+		clientMutex.Lock()
+		client, exists = clientMap[proxy]
+		if !exists {
+			client = createWebHookClient(proxy)
+			clientMap[proxy] = client
+		}
+		clientMutex.Unlock()
+	}
 
 	var reqBody io.Reader
 	if body != "" {

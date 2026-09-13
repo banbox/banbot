@@ -41,6 +41,7 @@ type CryptoTrader struct {
 	startup          CryptoTraderStartupFunc
 	runtimeCtx       context.Context
 	runtime          RuntimeLifecycle
+	pairRefreshGate  runtimeRunGate
 	runLock          sync.Mutex
 	runtimeLock      sync.Mutex
 	runtimeCount     int
@@ -383,6 +384,27 @@ func (t *CryptoTrader) refreshPairJobs(isFirst bool) *errs.Error {
 	if t == nil {
 		return errs.NewMsg(core.ErrRunTime, "crypto trader is required")
 	}
+	var refreshErr *errs.Error
+	t.pairRefreshGate.runWait(func() {
+		refreshErr = t.refreshPairJobsUnlocked(isFirst)
+	})
+	return refreshErr
+}
+
+// tryRefreshPairJobs prevents cron and direct refresh requests from
+// interleaving subscription rotation for one trader instance.
+func (t *CryptoTrader) tryRefreshPairJobs(isFirst bool) (bool, *errs.Error) {
+	if t == nil {
+		return false, errs.NewMsg(core.ErrRunTime, "crypto trader is required")
+	}
+	var refreshErr *errs.Error
+	ran := t.pairRefreshGate.run(func() {
+		refreshErr = t.refreshPairJobsUnlocked(isFirst)
+	})
+	return ran, refreshErr
+}
+
+func (t *CryptoTrader) refreshPairJobsUnlocked(isFirst bool) *errs.Error {
 	if t.coreStateForRun() == nil || t.RuntimeDependencies() == nil {
 		return errs.NewMsg(core.ErrRunTime, "live pair refresh requires explicit runtime dependencies")
 	}

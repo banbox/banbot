@@ -395,7 +395,7 @@ func (o *OrderMgr) setExit(od *ormo.InOutOrder, exitAt int64, tag, orderType str
 			odSide = banexg.OdSideBuy
 		}
 		if o.runtimeCore != nil {
-			o.runtimeCore.NewNumInSim += 1
+			o.runtimeCore.AddSimOrder()
 		}
 		od.Exit = &ormo.ExOrder{
 			TaskID:    od.TaskID,

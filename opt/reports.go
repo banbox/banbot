@@ -585,7 +585,7 @@ func (r *BTResult) strategyJobs(account string) map[string]map[string]*strat.Str
 	if deps.Strategies == nil {
 		return nil
 	}
-	return deps.Strategies.JobMaps(account)
+	return deps.Strategies.JobMapsView(account)
 }
 
 func (r *BTResult) orderMatchTfs() map[string]bool {

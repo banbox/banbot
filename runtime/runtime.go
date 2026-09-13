@@ -139,11 +139,8 @@ func NewProcess() *Process {
 // runtimeExecutionAccounts selects and clones the mutable account state once
 // at the Runtime composition root. Downstream packages receive this owned map
 // directly and never infer it from an immutable config snapshot.
-func runtimeExecutionAccounts(state *core.State, snapshot *config.Snapshot, accounts map[string]*config.AccountConfig, defaultAccount string) map[string]*config.AccountConfig {
-	if accounts == nil && snapshot != nil && snapshot.View() != nil {
-		accounts = snapshot.View().Accounts
-	}
-	if state == nil || state.EnvReal {
+func runtimeExecutionAccounts(prod bool, accounts map[string]*config.AccountConfig, defaultAccount string) map[string]*config.AccountConfig {
+	if prod {
 		return config.CloneAccountConfigsForRuntime(accounts)
 	}
 	if defaultAccount == "" {
@@ -166,6 +163,23 @@ func runtimeExecutionAccounts(state *core.State, snapshot *config.Snapshot, acco
 		return map[string]*config.AccountConfig{defaultAccount: {}}
 	}
 	return config.CloneAccountConfigsForRuntime(map[string]*config.AccountConfig{defaultAccount: accounts[names[0]]})
+}
+
+func runtimeDefaultAccount(prod bool, accounts map[string]*config.AccountConfig) string {
+	if !prod {
+		return "default"
+	}
+	names := make([]string, 0, len(accounts))
+	for name, account := range accounts {
+		if account != nil && !account.NoTrade {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
 }
 
 func (p *Process) runtimeConditionLocked() *sync.Cond {
@@ -517,13 +531,14 @@ type Runtime struct {
 	Strategies *strat.State
 	// Accounts is the mutable execution account state shared by Trader, Wallet,
 	// and Strategy for this Runtime. Config remains an immutable snapshot.
-	Accounts      map[string]*config.AccountConfig
-	accountsMu    sync.RWMutex
-	Orders        *ormo.OrderState
-	Trading       *biz.TradingState
-	Cron          com.Scheduler
-	Notifications *rpc.Session
-	Catalog       *data.DataSourceCatalog
+	Accounts       map[string]*config.AccountConfig
+	defaultAccount string
+	accountsMu     sync.RWMutex
+	Orders         *ormo.OrderState
+	Trading        *biz.TradingState
+	Cron           com.Scheduler
+	Notifications  *rpc.Session
+	Catalog        *data.DataSourceCatalog
 	// Exchange is a runtime dependency, not an ownership claim. The entry
 	// layer decides when the adapter session is closed.
 	Exchange          banexg.BanExchange
@@ -752,7 +767,9 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	} else if snapshotConfig != nil {
 		configuredAccounts = snapshotConfig.Accounts
 	}
-	runtimeAccounts := runtimeExecutionAccounts(coreState, snapshot, configuredAccounts, snapshot.DefaultAccount())
+	prod := opts.Env == core.RunEnvProd
+	defaultAccount := runtimeDefaultAccount(prod, configuredAccounts)
+	runtimeAccounts := runtimeExecutionAccounts(prod, configuredAccounts, defaultAccount)
 	runtime := &Runtime{
 		Process:           p,
 		ID:                id,
@@ -765,6 +782,7 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		Batch:             strat.NewBatchState(),
 		Strategies:        strat.NewState(),
 		Accounts:          runtimeAccounts,
+		defaultAccount:    defaultAccount,
 		Orders:            ormo.NewOrderState(),
 		Trading:           biz.NewTradingState(),
 		Cron:              scheduler,
@@ -892,10 +910,6 @@ func (r *Runtime) BizDeps() biz.RuntimeDeps {
 	if r == nil {
 		return biz.RuntimeDeps{}
 	}
-	defaultAccount := ""
-	if r.Config != nil {
-		defaultAccount = r.Config.DefaultAccount()
-	}
 	return biz.RuntimeDeps{
 		Core:           r.Core,
 		Clock:          r.Clock,
@@ -913,7 +927,7 @@ func (r *Runtime) BizDeps() biz.RuntimeDeps {
 		Dump:           r.Dump,
 		Scheduler:      r.Scheduler(),
 		Notifications:  r.Notifications,
-		DefaultAccount: defaultAccount,
+		DefaultAccount: r.defaultAccount,
 		Catalog:        r.Catalog,
 		Callbacks:      r,
 	}

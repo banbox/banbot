@@ -303,13 +303,6 @@ func (p *SeriesPlan) Activate(ctx context.Context, sink DataSink) ([]*strat.Data
 	return ActivateDataSources(ctx, p.Subs, sink)
 }
 
-func (p *SeriesPlan) ActivateWithCatalog(ctx context.Context, catalog *DataSourceCatalog, sink DataSink) ([]*strat.DataSub, error) {
-	if p == nil {
-		return nil, nil
-	}
-	return catalog.ActivateDataSources(ctx, p.Subs, sink)
-}
-
 var legacyDataSourceCatalog = NewDataSourceCatalog()
 
 func LegacyDataSourceCatalog() *DataSourceCatalog {
@@ -452,10 +445,6 @@ func CollectRuntimeDataSubs(jobs []*strat.StratJob) ([]*strat.DataSub, error) {
 	return collectRuntimeDataSubs(legacyDataSourceCatalog, jobs)
 }
 
-func CollectRuntimeDataSubsWithCatalog(catalog *DataSourceCatalog, jobs []*strat.StratJob) ([]*strat.DataSub, error) {
-	return collectRuntimeDataSubs(catalog, jobs)
-}
-
 func (c *DataSourceCatalog) CollectRuntimeDataSubs(jobs []*strat.StratJob) ([]*strat.DataSub, error) {
 	return collectRuntimeDataSubs(c, jobs)
 }
@@ -507,10 +496,14 @@ func EnsureThirdPartySeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs 
 }
 
 func EnsureRuntimeSeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {
-	return EnsureRuntimeSeriesRangeWithCatalog(legacyDataSourceCatalog, ctx, repo, jobs, startMS, endMS)
+	return ensureRuntimeSeriesRange(legacyDataSourceCatalog, ctx, repo, jobs, startMS, endMS)
 }
 
-func EnsureRuntimeSeriesRangeWithCatalog(catalog *DataSourceCatalog, ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {
+func (c *DataSourceCatalog) EnsureRuntimeSeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {
+	return ensureRuntimeSeriesRange(c, ctx, repo, jobs, startMS, endMS)
+}
+
+func ensureRuntimeSeriesRange(catalog *DataSourceCatalog, ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {
 	if startMS >= endMS {
 		return nil, nil
 	}
@@ -524,20 +517,12 @@ func EnsureRuntimeSeriesRangeWithCatalog(catalog *DataSourceCatalog, ctx context
 	return subs, nil
 }
 
-func (c *DataSourceCatalog) EnsureRuntimeSeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {
-	return EnsureRuntimeSeriesRangeWithCatalog(c, ctx, repo, jobs, startMS, endMS)
-}
-
 func EnsureThirdPartySeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*strat.DataSub, startMS, endMS int64) *errs.Error {
 	return EnsureSeriesSubsRange(ctx, repo, subs, startMS, endMS)
 }
 
 func EnsureSeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*strat.DataSub, startMS, endMS int64) *errs.Error {
 	return ensureSeriesSubsRange(legacyDataSourceCatalog, ctx, repo, subs, startMS, endMS)
-}
-
-func EnsureSeriesSubsRangeWithCatalog(catalog *DataSourceCatalog, ctx context.Context, repo orm.SeriesRepo, subs []*strat.DataSub, startMS, endMS int64) *errs.Error {
-	return ensureSeriesSubsRange(catalog, ctx, repo, subs, startMS, endMS)
 }
 
 func (c *DataSourceCatalog) EnsureSeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*strat.DataSub, startMS, endMS int64) *errs.Error {
@@ -678,14 +663,6 @@ func EnsureSeriesRange(ctx context.Context, src DataSource, sub *strat.DataSub, 
 
 func EnsureSeriesRangeWithRepo(ctx context.Context, repo orm.SeriesRepo, src DataSource, sub *strat.DataSub, startMS, endMS int64) *errs.Error {
 	return ensureSeriesRangeWithRepo(legacyDataSourceCatalog, ctx, repo, src, sub, startMS, endMS)
-}
-
-func EnsureSeriesRangeWithCatalog(ctx context.Context, catalog *DataSourceCatalog, src DataSource, sub *strat.DataSub, startMS, endMS int64) *errs.Error {
-	return ensureSeriesRangeWithRepo(catalog, ctx, orm.DefaultSeriesRepo(), src, sub, startMS, endMS)
-}
-
-func EnsureSeriesRangeWithCatalogAndRepo(ctx context.Context, catalog *DataSourceCatalog, repo orm.SeriesRepo, src DataSource, sub *strat.DataSub, startMS, endMS int64) *errs.Error {
-	return ensureSeriesRangeWithRepo(catalog, ctx, repo, src, sub, startMS, endMS)
 }
 
 func ensureSeriesRangeWithRepo(catalog *DataSourceCatalog, ctx context.Context, repo orm.SeriesRepo, src DataSource, sub *strat.DataSub, startMS, endMS int64) *errs.Error {

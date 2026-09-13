@@ -2,7 +2,9 @@ package runtime
 
 import (
 	"context"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -633,6 +635,43 @@ func TestRuntimeUsesConfigAndDefaultConcurNum(t *testing.T) {
 	if len(withExplicitEmptyPairs.Core.Pairs) != 0 || len(withExplicitEmptyPairs.Core.AdmissionPairs()) != 0 ||
 		withExplicitEmptyPairs.Config.View().Pairs[0] != "CFG/USDT" {
 		t.Fatalf("explicit empty pairs did not override active config pairs: %#v/%v", withExplicitEmptyPairs.Core.Pairs, withExplicitEmptyPairs.Core.AdmissionPairs())
+	}
+}
+
+func TestRuntimeDefaultAccountUsesEffectiveEnvironment(t *testing.T) {
+	tests := []struct {
+		name         string
+		configEnv    string
+		runtimeEnv   string
+		wantAccount  string
+		wantAccounts []string
+	}{
+		{name: "prod config overridden by dry run", configEnv: core.RunEnvProd, runtimeEnv: core.RunEnvDryRun, wantAccount: "default", wantAccounts: []string{"default"}},
+		{name: "dry run config overridden by prod", configEnv: core.RunEnvDryRun, runtimeEnv: core.RunEnvProd, wantAccount: "alpha", wantAccounts: []string{"alpha", "beta"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			process := NewProcess()
+			rt, err := process.NewRuntime(Options{
+				Env: test.runtimeEnv,
+				Config: &config.Config{Env: test.configEnv, Accounts: map[string]*config.AccountConfig{
+					"beta": {}, "alpha": {},
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(process.Close)
+
+			deps := rt.BizDeps()
+			if deps.DefaultAccount != test.wantAccount {
+				t.Fatalf("default account = %q, want %q", deps.DefaultAccount, test.wantAccount)
+			}
+			accounts := slices.Sorted(maps.Keys(rt.Accounts))
+			if !slices.Equal(accounts, test.wantAccounts) {
+				t.Fatalf("runtime accounts = %v, want %v", accounts, test.wantAccounts)
+			}
+		})
 	}
 }
 
