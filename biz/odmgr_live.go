@@ -56,10 +56,12 @@ type OdQItem struct {
 const (
 	AmtDust                          = 1e-8
 	odInfoLocalTrigger               = "LocalTrigger"
+	odInfoBybitSubmitUnconfirmed     = "BybitSubmitUnconfirmed"
 	restoreAmbiguousExgData          = "ambiguous_exchange_entries"
 	openOrderSnapshotLimit           = 1000
 	pendingMarketEntryReconcileAfter = 20 * time.Second
 	defaultMyTradeWatchRetry         = 5 * time.Second
+	unconfirmedBybitOrderRetry       = 2 * time.Second
 )
 
 var (
@@ -211,6 +213,26 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 
 			// 如果本地订单量大于实际持仓量,需要关闭部分订单
 			if localAmt > posAmt*1.02 {
+				// A position snapshot can arrive before the private fill stream. Reconcile
+				// submitted exits by their own exchange IDs before using the aggregate
+				// no-match fallback, so a sibling order is never chosen for that fill.
+				changed, pending := o.reconcilePendingExitOrders(curOds)
+				if changed {
+					localAmt = 0
+					for _, od := range curOds {
+						localAmt += od.HoldAmount()
+					}
+				}
+				if localAmt <= posAmt*1.02 {
+					continue
+				}
+				if pending {
+					log.Warn("defer local position mismatch while exit order is pending",
+						zap.String("acc", o.Account), zap.String("pair", symbol), zap.Bool("short", isShort),
+						zap.Float64("localAmt", localAmt), zap.Float64("exgAmt", posAmt))
+					continue
+				}
+
 				// 按数量降序排序
 				sort.Slice(curOds, func(i, j int) bool {
 					amtI := curOds[i].HoldAmount()
@@ -256,6 +278,75 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 		}
 	}
 	return closedList, nil
+}
+
+// normalizeAuthoritativeOrder makes a FetchOrder snapshot safe for the generic
+// out-of-order guard. Some exchanges expose an order's creation time as Timestamp,
+// even after it has filled. A direct FetchOrder result is authoritative, so retain
+// the latest known local timestamp instead of rejecting a completed snapshot.
+func normalizeAuthoritativeOrder(res *banexg.Order, localUpdateAt int64) *banexg.Order {
+	normalized := *res
+	normalized.Timestamp = max(res.Timestamp, res.LastTradeTimestamp, res.LastUpdateTimestamp, localUpdateAt)
+	return &normalized
+}
+
+// reconcilePendingExitOrders refreshes submitted exits by their exchange order IDs.
+// It returns pending=true when an exit cannot yet be authoritatively resolved; callers
+// must then avoid attributing a position delta to another local order.
+func (o *LiveOrderMgr) reconcilePendingExitOrders(ods []*ormo.InOutOrder) (changed, pending bool) {
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		exit := od.Exit
+		if exit == nil || exit.OrderID == "" || exit.Status == ormo.OdStatusClosed ||
+			od.Status >= ormo.InOutStatusFullExit {
+			lock.Unlock()
+			continue
+		}
+		orderID, symbol, odKey := exit.OrderID, od.Symbol, od.Key()
+		lock.Unlock()
+
+		res, err := exg.Default.FetchOrder(symbol, orderID, map[string]interface{}{
+			banexg.ParamAccount: o.Account,
+		})
+		if err != nil {
+			pending = true
+			log.Warn("reconcile pending exit fetch fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if res == nil || res.ID != orderID {
+			pending = true
+			log.Warn("reconcile pending exit invalid response", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID))
+			continue
+		}
+
+		lock = od.Lock()
+		exit = od.Exit
+		if exit == nil || exit.OrderID != orderID || exit.Status == ormo.OdStatusClosed ||
+			od.Status >= ormo.InOutStatusFullExit {
+			lock.Unlock()
+			continue
+		}
+		beforeFilled, beforeStatus := exit.Filled, od.Status
+		err = o.updateOdByExgRes(od, false, normalizeAuthoritativeOrder(res, exit.UpdateAt))
+		changed = changed || exit.Filled > beforeFilled+AmtDust || od.Status != beforeStatus
+		unresolved := od.Status < ormo.InOutStatusFullExit && exit.Status != ormo.OdStatusClosed
+		lock.Unlock()
+		if err != nil {
+			pending = true
+			log.Error("reconcile pending exit apply fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if unresolved {
+			pending = true
+		}
+	}
+	return changed, pending
 }
 
 /*
@@ -543,6 +634,15 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 		if len(clientMatches) == 1 {
 			return o.applyAuthoritativeEnterOrder(od, clientMatches[0])
 		}
+		if core.ExgName == "bybit" {
+			exOd, _, err := o.fetchBybitSubmittedOrder(od, od.Enter, od.EnterClientId())
+			if err != nil {
+				return err
+			}
+			if exOd != nil {
+				return o.applyAuthoritativeEnterOrder(od, exOd)
+			}
+		}
 		_, _, hasTarget := getEnterTriggerTarget(od)
 		isLegacyTrigger := hasTarget && od.GetInfoInt64(ormo.OdInfoStopAfter) > 0
 		if od.GetInfoInt64(odInfoLocalTrigger) > 0 || isLegacyTrigger {
@@ -599,7 +699,17 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 			od.DirtyMain = true
 			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
 			return nil
-		} else if tryOd.Status > ormo.OdStatusInit {
+		}
+		if core.ExgName == "bybit" {
+			exOd, _, err := o.fetchBybitSubmittedOrder(od, tryOd, od.ExitClientId())
+			if err != nil {
+				return err
+			}
+			if exOd != nil {
+				return o.updateOdByExgRes(od, false, exOd)
+			}
+		}
+		if tryOd.Status > ormo.OdStatusInit {
 			// You shouldn't go here.
 			// 这里不应该走到
 			log.Error("Exit Status Invalid", zap.String("acc", o.Account), zap.String("key", od.Key()),
@@ -1345,6 +1455,11 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 	if err != nil {
 		log.Error("ConsumeOrderQueue error", zap.String("acc", o.Account),
 			zap.String("action", action), zap.Error(err))
+		if core.ExgName == "bybit" && (action == ormo.OdActionEnter || action == ormo.OdActionExit) &&
+			isUncertainBybitSubmitErr(err) {
+			od.SetInfo(odInfoBybitSubmitUnconfirmed, action)
+			o.retryUnconfirmedBybitOrder(od, action)
+		}
 	}
 	if od.Enter != nil && od.Enter.OrderID != "" {
 		od.SetInfo(odInfoLocalTrigger, nil)
@@ -1964,6 +2079,11 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 	}
 	err = o.submitExgOrder(od, true)
 	if err != nil {
+		if core.ExgName == "bybit" && isUncertainBybitSubmitErr(err) {
+			log.Warn("Bybit entry submission remains unconfirmed; retain local order for reconciliation",
+				zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
+			return err
+		}
 		msg := "submit order fail, local exit"
 		log.Error(msg, zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
 		err = od.LocalExit(0, core.ExitTagFatalErr, od.InitPrice, err.Short(), "")
@@ -2131,9 +2251,17 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		}
 	}
 	side, amount, price := subOd.Side, subOd.Amount, subOd.Price
+	clientID := od.ClientId(true)
+	if core.ExgName == "bybit" {
+		if isEnter {
+			clientID = od.EnterClientId()
+		} else {
+			clientID = od.ExitClientId()
+		}
+	}
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
-		banexg.ParamClientOrderId: od.ClientId(true),
+		banexg.ParamClientOrderId: clientID,
 	}
 	if core.IsContract {
 		params[banexg.ParamPositionSide] = "LONG"
@@ -2174,7 +2302,30 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	if retryNum > 0 {
 		params[banexg.ParamRetry] = int(retryNum)
 	}
-	res, err := exchange.CreateOrder(od.Symbol, subOd.OrderType, side, amount, price, params)
+	var res *banexg.Order
+	if core.ExgName == "bybit" && od.GetInfoString(odInfoBybitSubmitUnconfirmed) == bybitSubmitAction(isEnter) {
+		var absent bool
+		res, absent, err = o.fetchBybitSubmittedOrder(od, subOd, clientID)
+		if err != nil {
+			return err
+		}
+		if !absent && res == nil {
+			return errs.NewMsg(errs.CodeRunTime, "unconfirmed Bybit order lookup returned no result")
+		}
+	}
+	if res == nil {
+		res, err = exchange.CreateOrder(od.Symbol, subOd.OrderType, side, amount, price, params)
+		if err != nil && core.ExgName == "bybit" && isUncertainBybitSubmitErr(err) {
+			// The exchange may already have accepted the request. Confirm by the fixed
+			// client ID before the queue schedules an idempotent retry.
+			var found *banexg.Order
+			found, _, _ = o.fetchBybitSubmittedOrder(od, subOd, clientID)
+			if found != nil {
+				res = found
+				err = nil
+			}
+		}
+	}
 	if err != nil {
 		if !isEnter && err.Code == errs.CodeReduceOnlyRejected {
 			msg := "ReduceOnly Order is rejected."
@@ -2194,6 +2345,9 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	if err != nil {
 		return err
 	}
+	if core.ExgName == "bybit" {
+		od.SetInfo(odInfoBybitSubmitUnconfirmed, nil)
+	}
 	if isEnter {
 		if od.Status == ormo.InOutStatusFullEnter {
 			// Place stop loss and take profit orders only after full entry
@@ -2210,6 +2364,92 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	return nil
 }
 
+// isUncertainBybitSubmitErr reports failures where Bybit may have accepted the
+// request even though the client did not receive a conclusive response.
+func isUncertainBybitSubmitErr(err *errs.Error) bool {
+	if err == nil {
+		return false
+	}
+	switch err.Code {
+	case errs.CodeNetFail, errs.CodeConnectFail, errs.CodeIOReadFail, errs.CodeIOWriteFail,
+		errs.CodeTimeout, errs.CodeInvalidResponse, errs.CodeServerError,
+		errs.CodeExecutionUnknown, errs.CodeDuplicateRequest:
+		return true
+	default:
+		return false
+	}
+}
+
+func bybitSubmitAction(isEnter bool) string {
+	if isEnter {
+		return ormo.OdActionEnter
+	}
+	return ormo.OdActionExit
+}
+
+// fetchBybitSubmittedOrder retrieves the exact order represented by clientID.
+// It distinguishes a confirmed absence from a lookup failure: only a confirmed
+// absence is eligible for another submission with the same idempotency key.
+func (o *LiveOrderMgr) fetchBybitSubmittedOrder(od *ormo.InOutOrder, subOd *ormo.ExOrder,
+	clientID string) (*banexg.Order, bool, *errs.Error) {
+	res, err := exg.Default.FetchOrder(od.Symbol, "", map[string]interface{}{
+		banexg.ParamAccount:       o.Account,
+		banexg.ParamClientOrderId: clientID,
+	})
+	if err != nil {
+		if err.Code == errs.CodeDataNotFound || err.Code == errs.CodeOrderNotFound {
+			return nil, true, nil
+		}
+		log.Warn("fetch unconfirmed Bybit order fail", zap.String("acc", o.Account),
+			zap.String("key", od.Key()), zap.String("clientId", clientID), zap.Error(err))
+		return nil, false, err
+	}
+	if !matchesBybitSubmittedOrder(od, subOd, clientID, res) {
+		if res != nil {
+			log.Warn("ignore mismatched Bybit client order lookup", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.String("clientId", clientID),
+				zap.String("orderId", res.ID))
+		}
+		return nil, false, errs.NewMsg(errs.CodeRunTime, "Bybit client order lookup does not match %s", od.Key())
+	}
+	return res, false, nil
+}
+
+func matchesBybitSubmittedOrder(od *ormo.InOutOrder, subOd *ormo.ExOrder, clientID string,
+	res *banexg.Order) bool {
+	if od == nil || subOd == nil || res == nil || res.ID == "" || res.ClientOrderID != clientID ||
+		res.Symbol != od.Symbol || (res.Side != "" && res.Side != subOd.Side) {
+		return false
+	}
+	wantPos := banexg.PosSideLong
+	if od.Short {
+		wantPos = banexg.PosSideShort
+	}
+	return res.PositionSide == "" || res.PositionSide == wantPos
+}
+
+// retryUnconfirmedBybitOrder retries only an order whose exchange result was
+// uncertain. The submission keeps the same Bybit client ID, so this is an
+// idempotent reconciliation attempt rather than a new order.
+func (o *LiveOrderMgr) retryUnconfirmedBybitOrder(od *ormo.InOutOrder, action string) {
+	time.AfterFunc(unconfirmedBybitOrderRetry, func() {
+		if od.GetInfoString(odInfoBybitSubmitUnconfirmed) != action {
+			return
+		}
+		if action == ormo.OdActionEnter && (od.Enter == nil || od.Enter.OrderID != "") {
+			return
+		}
+		if action == ormo.OdActionExit && (od.Exit == nil || od.Exit.OrderID != "" ||
+			od.Status >= ormo.InOutStatusFullExit) {
+			return
+		}
+		select {
+		case <-core.Ctx.Done():
+			return
+		case o.queue <- &OdQItem{Order: od, Action: action}:
+		}
+	})
+}
 func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *banexg.Order) *errs.Error {
 	if od == nil || res == nil {
 		return nil
@@ -3047,11 +3287,8 @@ func (o *LiveOrderMgr) applyAuthoritativeEnterOrder(od *ormo.InOutOrder, res *ba
 	}
 	wasFullEnter := od.Status == ormo.InOutStatusFullEnter && od.Enter.Status == ormo.OdStatusClosed
 
-	// Binance futures uses the order creation time as Timestamp. Use the latest
-	// known timestamp so an authoritative fetch is not rejected as older state.
-	normalized := *res
-	normalized.Timestamp = max(res.Timestamp, res.LastTradeTimestamp, res.LastUpdateTimestamp, od.Enter.UpdateAt)
-	err := o.updateOdByExgRes(od, true, &normalized)
+	err := o.updateOdByExgRes(od, true, normalizeAuthoritativeOrder(res, od.Enter.UpdateAt))
+
 	if err != nil || !od.IsDirty() {
 		return err
 	}

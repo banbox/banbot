@@ -301,3 +301,19 @@ func TestUpdateProfitsRejectsLegacyMetricsOutsideStrictHistoricalReplay(t *testi
 		})
 	}
 }
+
+func TestBybitOrderClientIDsUseDistinctStableMarkers(t *testing.T) {
+	oldName := config.Name
+	config.Name = "testbot"
+	t.Cleanup(func() { config.Name = oldName })
+
+	od := newTestOrder()
+	od.ID = 12345
+	od.SetInfo(OdInfoClientID, "user1")
+	if got, want := od.EnterClientId(), "testbot_12345_z_user1"; got != want {
+		t.Fatalf("entry client ID = %q, want %q", got, want)
+	}
+	if got, want := od.ExitClientId(), "testbot_12345_y_user1"; got != want {
+		t.Fatalf("exit client ID = %q, want %q", got, want)
+	}
+}

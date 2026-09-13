@@ -840,6 +840,20 @@ func (i *InOutOrder) ClientId(random bool) string {
 	return fmt.Sprintf("%s_%v_%v", config.Name, i.ID, client)
 }
 
+// EnterClientId returns the stable Bybit client ID for a normal entry order.
+// The z marker makes the ID reproducible after an uncertain submit response.
+func (i *InOutOrder) EnterClientId() string {
+	client := i.GetInfoString(OdInfoClientID)
+	return fmt.Sprintf("%s_%v_z_%v", config.Name, i.ID, client)
+}
+
+// ExitClientId returns the dedicated Bybit client ID for a normal exit order.
+// The y marker keeps entry and exit submissions of one local order distinct.
+func (i *InOutOrder) ExitClientId() string {
+	client := i.GetInfoString(OdInfoClientID)
+	return fmt.Sprintf("%s_%v_y_%v", config.Name, i.ID, client)
+}
+
 func fireOdEdit(od *InOutOrder, action string) {
 	if OdEditListener != nil && core.EnvReal && od.Status > InOutStatusInit && od.ID > 0 {
 		OdEditListener(od, action)
