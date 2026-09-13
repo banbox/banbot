@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
@@ -51,14 +52,29 @@ type IOrderMgrLive interface {
 
 type FuncHandleIOrder = func(order *ormo.InOutOrder) *errs.Error
 
+type liveEnterKey struct {
+	symbol    string
+	strategy  string
+	timeframe string
+	tag       string
+	short     bool
+}
+
+type liveEnterReservation struct {
+	key   liveEnterKey
+	until int64
+}
+
 type OrderMgr struct {
-	callBack    func(order *ormo.InOutOrder, isEnter bool)
-	afterEnter  FuncHandleIOrder
-	afterExit   FuncHandleIOrder
-	Account     string
-	BarMS       int64
-	simulOpen   int // Simultaneously open number in the current bar
-	simulOpenSt map[string]int
+	callBack      func(order *ormo.InOutOrder, isEnter bool)
+	afterEnter    FuncHandleIOrder
+	afterExit     FuncHandleIOrder
+	Account       string
+	BarMS         int64
+	simulOpen     int // Simultaneously open number in the current bar
+	simulOpenSt   map[string]int
+	liveEnterMu   sync.Mutex
+	liveEnterKeys map[liveEnterKey]int64
 }
 
 func GetOdMgr(account string) IOrderMgr {
@@ -113,6 +129,54 @@ func CleanUpOdMgr() *errs.Error {
 		}
 	}
 	return err
+}
+
+// reserveLiveEnter prevents the same live entry signal from being saved more than once
+// during one strategy timeframe. It is intentionally scoped to live mode callers: a
+// replayed or concurrently dispatched live bar must not produce duplicate exchange orders.
+func (o *OrderMgr) reserveLiveEnter(symbol, tf string, req *strat.EnterReq, nowMS int64) (liveEnterReservation, bool) {
+	tfMSecs := int64(utils.TFToSecs(tf)) * 1000
+	if tfMSecs <= 0 {
+		return liveEnterReservation{}, true
+	}
+	key := liveEnterKey{
+		symbol:    symbol,
+		strategy:  req.StratName,
+		timeframe: tf,
+		tag:       req.Tag,
+		short:     req.Short,
+	}
+	reservation := liveEnterReservation{
+		key:   key,
+		until: utils.AlignTfMSecs(nowMS, tfMSecs) + tfMSecs,
+	}
+	o.liveEnterMu.Lock()
+	defer o.liveEnterMu.Unlock()
+	if o.liveEnterKeys == nil {
+		o.liveEnterKeys = make(map[liveEnterKey]int64)
+	}
+	for oldKey, until := range o.liveEnterKeys {
+		if until <= nowMS {
+			delete(o.liveEnterKeys, oldKey)
+		}
+	}
+	if until, ok := o.liveEnterKeys[key]; ok && until > nowMS {
+		return liveEnterReservation{}, false
+	}
+	o.liveEnterKeys[key] = reservation.until
+	return reservation, true
+}
+
+// releaseLiveEnter releases a reservation only when saving its local order failed.
+func (o *OrderMgr) releaseLiveEnter(reservation liveEnterReservation) {
+	if reservation.until == 0 {
+		return
+	}
+	o.liveEnterMu.Lock()
+	defer o.liveEnterMu.Unlock()
+	if o.liveEnterKeys[reservation.key] == reservation.until {
+		delete(o.liveEnterKeys, reservation.key)
+	}
 }
 
 func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat.EnterReq) ([]*strat.EnterReq, map[string]int) {
@@ -259,7 +323,9 @@ func (o *OrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*or
 			if err != nil {
 				return entOrders, extOrders, err
 			}
-			entOrders = append(entOrders, iorder)
+			if iorder != nil {
+				entOrders = append(entOrders, iorder)
+			}
 		}
 	}
 	if len(exits) > 0 {
@@ -412,6 +478,21 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 		enterPrice = req.Limit
 	}
 	curTimeMS := btime.TimeMS()
+	var liveReservation liveEnterReservation
+	if core.LiveMode {
+		var ok bool
+		liveReservation, ok = o.reserveLiveEnter(exs.Symbol, tf, req, curTimeMS)
+		if !ok {
+			log.Warn("skip duplicate live enter",
+				zap.String("acc", o.Account),
+				zap.String("pair", exs.Symbol),
+				zap.String("strategy", req.StratName),
+				zap.String("tf", tf),
+				zap.String("tag", req.Tag),
+				zap.Bool("short", req.Short))
+			return nil, nil
+		}
+	}
 	taskId := ormo.GetTaskID(o.Account)
 	od := &ormo.InOutOrder{
 		IOrder: &ormo.IOrder{
@@ -498,6 +579,7 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 	}
 	err := od.Save()
 	if err != nil {
+		o.releaseLiveEnter(liveReservation)
 		return od, err
 	}
 	if o.afterEnter != nil {
