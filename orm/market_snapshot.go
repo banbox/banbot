@@ -76,6 +76,9 @@ func applyConfiguredMarketSnapshotForConfig(cfg *config.Config, dataDir string, 
 	if rawPath == "" {
 		return nil
 	}
+	if strings.TrimSpace(dataDir) == "" {
+		return errs.NewMsg(core.ErrBadConfig, "BanDataDir is required for a configured market snapshot")
+	}
 	expectedHash, _ := options["market_snapshot_sha256"].(string)
 	if decoded, err := hex.DecodeString(expectedHash); err != nil || len(decoded) != sha256.Size {
 		return errs.NewMsg(core.ErrBadConfig, "market_snapshot_sha256 is required")

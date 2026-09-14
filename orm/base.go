@@ -783,7 +783,7 @@ func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *e
 // process-wide symbol catalog. Runtime-owned callers pass their SymbolState so
 // contract-market capability reloads stay on the same task identity.
 func LoadMarketsWithSymbolState(state *SymbolState, exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *errs.Error) {
-	return loadMarketsWithRuntimeConfig(state, exchange, reload, &config.Data, config.GetDataDir(), nil, false)
+	return loadMarketsWithRuntimeConfig(state, exchange, reload, &config.Data, config.GetDataDirSafe(), nil, false)
 }
 
 // LoadMarketsWithRuntime loads markets using the runtime-owned configuration
@@ -793,7 +793,7 @@ func LoadMarketsWithRuntime(state *SymbolState, exchange banexg.BanExchange, rel
 	snapshot *config.Snapshot, runtimeCore *core.State,
 ) (banexg.MarketMap, *errs.Error) {
 	if snapshot == nil {
-		return loadMarketsWithRuntimeConfig(state, exchange, reload, &config.Data, config.GetDataDir(), nil, false)
+		return loadMarketsWithRuntimeConfig(state, exchange, reload, &config.Data, config.GetDataDirSafe(), nil, false)
 	}
 	return loadMarketsWithRuntimeConfig(state, exchange, reload, snapshot.View(), snapshot.DataDir, runtimeCore, true)
 }
