@@ -16,6 +16,7 @@ import (
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg/errs"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -51,23 +52,17 @@ func TestBTResultLoggerIsScopedToReportRuntime(t *testing.T) {
 }
 
 func TestBTResultGroupMetricsUseReportDeps(t *testing.T) {
-	logCore, logs := observer.New(zap.WarnLevel)
+	logCore, _ := observer.New(zap.WarnLevel)
 	result := &BTResult{reportDeps: &ReportDeps{
 		Core:   &core.State{Logger: zap.New(logCore)},
 		Config: config.NewSnapshot(&config.Config{WalletAmounts: map[string]float64{"USDT": 100}}),
 	}}
-	result.groupByPairs([]*ormo.InOutOrder{{
+	err := result.groupByPairs([]*ormo.InOutOrder{{
 		IOrder: &ormo.IOrder{Symbol: "BTC/USDT", Leverage: 1, Profit: 1},
 		Enter:  &ormo.ExOrder{Average: 1, Filled: 1},
 	}})
-	if len(result.PairGrps) != 1 {
-		t.Fatalf("pair groups = %d, want 1", len(result.PairGrps))
-	}
-	if got := logs.Len(); got != 1 {
-		t.Fatalf("runtime report metric warnings = %d, want 1", got)
-	}
-	if got := logs.All()[0].Message; got != "calc measure fail" {
-		t.Fatalf("runtime report metric warning = %q", got)
+	if err == nil || !strings.Contains(err.Error(), "market prices") {
+		t.Fatalf("runtime report metric error = %v, want report dependency error", err)
 	}
 }
 
@@ -208,6 +203,39 @@ func TestGroupByProfitsHandlesEmptyKMeansClusters(t *testing.T) {
 	result.groupByProfits(orders)
 	if len(result.ProfitGrps) != 1 {
 		t.Fatalf("profit groups = %d, want 1", len(result.ProfitGrps))
+	}
+}
+
+func TestBTResultCollectPropagatesGroupMeasureError(t *testing.T) {
+	previousMeasure := calcMeasureByOrdersFn
+	previousOrders := ormo.HistODs
+	t.Cleanup(func() {
+		calcMeasureByOrdersFn = previousMeasure
+		ormo.HistODs = previousOrders
+	})
+
+	want := errs.NewMsg(core.ErrRunTime, "historical coverage missing")
+	calcMeasureByOrdersFn = func([]*ormo.InOutOrder, *ReportDeps) (float64, float64, *errs.Error) {
+		return 0, 0, want
+	}
+	ormo.HistODs = []*ormo.InOutOrder{{
+		IOrder: &ormo.IOrder{
+			ID:        1,
+			Symbol:    "BTC/USDT",
+			Timeframe: "1h",
+			EnterAt:   1_700_000_000_000,
+			ExitAt:    1_700_003_600_000,
+			Leverage:  1,
+			Profit:    1,
+		},
+		Enter: &ormo.ExOrder{Filled: 1, Average: 1, FeeQuote: 0},
+		Exit:  &ormo.ExOrder{Filled: 1, Average: 2, FeeQuote: 0},
+	}}
+
+	result := NewBTResult()
+	result.TotalInvest = 1
+	if got := result.Collect(); got != want {
+		t.Fatalf("Collect error = %v, want %v", got, want)
 	}
 }
 

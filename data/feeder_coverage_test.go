@@ -66,23 +66,42 @@ func TestFeederBacktestWarmupBoundaryUsesBarEnd(t *testing.T) {
 	}
 }
 
-func TestHistoricalCoverageForFeeder(t *testing.T) {
-	previous := config.HistoricalCoverage
+func TestHistoricalCoverageForFeederRequiresStrictHistoricalReplay(t *testing.T) {
+	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
 	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
 		BaselineEndMS: 500,
 		Bars: map[string]map[string][]config.HistoricalCoverageRange{
 			"BNB/USDT:USDT": {"5m": {{StartMS: 100, StopMS: 400}}},
 		},
 	}
-	t.Cleanup(func() { config.HistoricalCoverage = previous })
-	if got := historicalCoverageForFeeder("BNB/USDT:USDT", false); got != nil {
-		t.Fatalf("live feeder received historical coverage: %#v", got)
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.HistoricalCoverage = previousMode, previousData, previousCoverage
+	})
+	for _, test := range []struct {
+		name       string
+		backtest   bool
+		strict     bool
+		noDownload bool
+	}{
+		{name: "non-strict backtest", backtest: true, noDownload: true},
+		{name: "download-enabled backtest", backtest: true, strict: true},
+		{name: "live", strict: true, noDownload: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core.BackTestMode = test.backtest
+			config.Data = config.Config{BTStrict: test.strict, BTNoKlineDownload: test.noDownload}
+			if got := historicalCoverageForFeeder("BNB/USDT:USDT"); got != nil {
+				t.Fatalf("feeder received historical coverage: %#v", got)
+			}
+		})
 	}
-	known := historicalCoverageForFeeder("BNB/USDT:USDT", true)
+	core.BackTestMode = true
+	config.Data = config.Config{BTStrict: true, BTNoKlineDownload: true}
+	known := historicalCoverageForFeeder("BNB/USDT:USDT")
 	if known == nil || !known.Allows("5m", 200) {
-		t.Fatalf("backtest feeder lost known coverage: %#v", known)
+		t.Fatalf("strict historical feeder lost known coverage: %#v", known)
 	}
-	missing := historicalCoverageForFeeder("BTC/USDT:USDT", true)
+	missing := historicalCoverageForFeeder("BTC/USDT:USDT")
 	if missing == nil || missing.Allows("5m", 200) || missing.Allows("5m", 500) {
 		t.Fatalf("missing symbol did not fail closed across the extension tail: %#v", missing)
 	}

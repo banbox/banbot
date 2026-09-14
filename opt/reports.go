@@ -460,7 +460,8 @@ var (
 	// PairPickers preserves the main-era direct registration surface. Direct
 	// map mutation is serial compatibility only; concurrent callers must use
 	// RegisterPairPicker and GetPairPicker.
-	PairPickers = make(map[string]func(r *BTResult) []string)
+	PairPickers           = make(map[string]func(r *BTResult) []string)
+	calcMeasureByOrdersFn = calcMeasureByOrders
 )
 
 func RegisterPairPicker(name string, picker PairPicker) {
@@ -712,7 +713,7 @@ func (r *BTResult) dumpBtFiles(reset bool) {
 	r.dumpDetail("")
 }
 
-func (r *BTResult) Collect() {
+func (r *BTResult) Collect() *errs.Error {
 	orders := r.historyOrders()
 	r.OrderNum = len(orders)
 	sumProfit := float64(0)
@@ -764,11 +765,17 @@ func (r *BTResult) Collect() {
 	r.ShowDrawDownVal = ddVal
 	if len(orders) > 0 {
 		r.WinRatePct = winCount * 100 / float64(len(orders))
-		r.groupByPairs(orders)
+		if err := r.groupByPairs(orders); err != nil {
+			return err
+		}
 		r.groupByDates(orders)
 		r.groupByProfits(orders)
-		r.groupByEnters(orders)
-		r.groupByExits(orders)
+		if err := r.groupByEnters(orders); err != nil {
+			return err
+		}
+		if err := r.groupByExits(orders); err != nil {
+			return err
+		}
 		labels, dsList := calcGroupEndProfitsWithDeps(orders, func(o *ormo.InOutOrder) string {
 			return fmt.Sprintf("%v:%v", o.Strategy, o.EnterTag)
 		}, ShowNum, r.reportRuntimeDeps())
@@ -783,12 +790,13 @@ func (r *BTResult) Collect() {
 	rangeSecs := (r.EndMS - r.StartMS) / 1000
 	sharpe, sortino, err := CalcMeasuresByReal(r.Plots.Real, rangeSecs, "", 0, 0)
 	if err != nil {
-		r.logger().Warn("calc sharpe/sortino fail", zap.Error(err))
+		return err
 	} else {
 		r.SharpeRatio, r.SortinoRatio = sharpe, sortino
 	}
 	r.CalcDiff = math.Abs((r.FinBalance-r.TotProfit)/r.TotalInvest - 1)
 	r.Stability = utils.CalcAssetStabilityScore(r.Plots.Real, 0)
+	return nil
 }
 
 func (r *BTResult) textMetrics(orders []*ormo.InOutOrder) string {
@@ -871,42 +879,54 @@ func renderTable(heads []string, rows [][]string, align tw.Align) string {
 	return b.String()
 }
 
-func (r *BTResult) groupByPairs(orders []*ormo.InOutOrder) {
-	groups := groupItemsWithDeps(orders, true, func(od *ormo.InOutOrder, i int) string {
+func (r *BTResult) groupByPairs(orders []*ormo.InOutOrder) *errs.Error {
+	groups, err := groupItemsWithDeps(orders, true, func(od *ormo.InOutOrder, i int) string {
 		return od.Symbol
 	}, r.reportRuntimeDeps())
+	if err != nil {
+		return err
+	}
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Sharpe > groups[j].Sharpe
 	})
 	r.PairGrps = groups
+	return nil
 }
 
 func textGroupPairs(r *BTResult) string {
 	return printGroups(r.PairGrps, "Pair", true, nil, nil)
 }
 
-func (r *BTResult) groupByEnters(orders []*ormo.InOutOrder) {
-	groups := groupItemsWithDeps(orders, true, func(od *ormo.InOutOrder, i int) string {
+func (r *BTResult) groupByEnters(orders []*ormo.InOutOrder) *errs.Error {
+	groups, err := groupItemsWithDeps(orders, true, func(od *ormo.InOutOrder, i int) string {
 		return fmt.Sprintf("%s:%s", od.Strategy, od.EnterTag)
 	}, r.reportRuntimeDeps())
+	if err != nil {
+		return err
+	}
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Title < groups[j].Title
 	})
 	r.EnterGrps = groups
+	return nil
 }
 
 func textGroupEntTags(r *BTResult) string {
 	return printGroups(r.EnterGrps, "Enter Tag", true, nil, nil)
 }
 
-func (r *BTResult) groupByExits(orders []*ormo.InOutOrder) {
-	groups := groupItemsWithDeps(orders, true, func(od *ormo.InOutOrder, i int) string {
+func (r *BTResult) groupByExits(orders []*ormo.InOutOrder) *errs.Error {
+	groups, err := groupItemsWithDeps(orders, true, func(od *ormo.InOutOrder, i int) string {
 		return fmt.Sprintf("%s:%s", od.Strategy, od.ExitTag)
 	}, r.reportRuntimeDeps())
+	if err != nil {
+		return err
+	}
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Title < groups[j].Title
 	})
 	r.ExitGrps = groups
+	return nil
 }
 
 func textGroupExitTags(r *BTResult) string {
@@ -966,7 +986,7 @@ func (r *BTResult) groupByProfits(orders []*ormo.InOutOrder) {
 		maxPct := strconv.FormatFloat(slices.Max(gp.Items)*100, 'f', 2, 64)
 		grpTitles = append(grpTitles, fmt.Sprintf("%s ~ %s%%", minPct, maxPct))
 	}
-	groups := groupItemsWithDeps(orders, false, func(od *ormo.InOutOrder, i int) string {
+	groups, _ := groupItemsWithDeps(orders, false, func(od *ormo.InOutOrder, i int) string {
 		return grpTitles[res.RowGIds[i]]
 	}, r.reportRuntimeDeps())
 	sort.Slice(groups, func(i, j int) bool {
@@ -1005,7 +1025,7 @@ func (r *BTResult) groupByDates(orders []*ormo.InOutOrder) {
 		bestTFSecs = utils2.TFToSecs(bestTF)
 	}
 	tfUnit := bestTF[1]
-	groups := groupItemsWithDeps(orders, false, func(od *ormo.InOutOrder, i int) string {
+	groups, _ := groupItemsWithDeps(orders, false, func(od *ormo.InOutOrder, i int) string {
 		entMS := od.RealEnterMS()
 		if tfUnit == 'Y' {
 			return r.dateStrLoc(entMS, "2006")
@@ -1061,9 +1081,9 @@ func makeEnterExits(orders []*ormo.InOutOrder) []string {
 }
 
 // groupItemsWithDeps calculates report groups from one report dependency owner.
-func groupItemsWithDeps(orders []*ormo.InOutOrder, measure bool, getTag func(od *ormo.InOutOrder, i int) string, deps *ReportDeps) []*RowItem {
+func groupItemsWithDeps(orders []*ormo.InOutOrder, measure bool, getTag func(od *ormo.InOutOrder, i int) string, deps *ReportDeps) ([]*RowItem, *errs.Error) {
 	if len(orders) == 0 {
-		return nil
+		return nil, nil
 	}
 	groups := make(map[string]*RowItem)
 	for i, od := range orders {
@@ -1101,23 +1121,21 @@ func groupItemsWithDeps(orders []*ormo.InOutOrder, measure bool, getTag func(od 
 		}
 	}
 	if measure {
-		logger := deps.logger()
 		// 分30份采样计算指标，太大的话会导致指标偏小
 		for _, gp := range groups {
-			sharpe, sortino, err := calcMeasureByOrders(gp.Orders, deps)
+			sharpe, sortino, err := calcMeasureByOrdersFn(gp.Orders, deps)
 			if err != nil {
-				logger.Warn("calc measure fail", zap.Error(err))
-			} else {
-				if !math.IsNaN(sharpe) && !math.IsInf(sharpe, 0) {
-					gp.Sharpe = sharpe
-				}
-				if !math.IsNaN(sortino) && !math.IsInf(sortino, 0) {
-					gp.Sortino = sortino
-				}
+				return nil, err
+			}
+			if !math.IsNaN(sharpe) && !math.IsInf(sharpe, 0) {
+				gp.Sharpe = sharpe
+			}
+			if !math.IsNaN(sortino) && !math.IsInf(sortino, 0) {
+				gp.Sortino = sortino
 			}
 		}
 	}
-	return utils.ValsOfMap(groups)
+	return utils.ValsOfMap(groups), nil
 }
 
 func printGroups(groups []*RowItem, title string, measure bool, extHeads []string, prcGrp func([]*ormo.InOutOrder) []string) string {
@@ -2214,7 +2232,9 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 	for _, od := range odList {
 		deps.Orders.AddHistoricalOrder(od)
 	}
-	btRes.Collect()
+	if err := btRes.Collect(); err != nil {
+		return nil, err
+	}
 	btRes.logger().Info("BackTest Reports:\n" + btRes.cmdReports(odList))
 	if outDir != "" {
 		btRes.OutDir = outDir

@@ -1248,22 +1248,57 @@ func (q *Queries) insertOHLCVRowsLocked(timeFrame string, rows []*DataSeries) (i
 }
 
 func (q *Queries) insertOHLCVSeriesPg(timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
+	ctx := context.Background()
+	if _, ok := q.db.(pgx.Tx); !ok {
+		beginner, ok := q.db.(dbBeginner)
+		if !ok {
+			return 0, NewDbErr(core.ErrDbExecFail, fmt.Errorf("database connection does not support transactions"))
+		}
+		tx, beginErr := beginner.Begin(ctx)
+		if beginErr != nil {
+			return 0, NewDbErr(core.ErrDbExecFail, beginErr)
+		}
+		n, insertErr := insertOHLCVSeriesPgTx(tx, timeFrame, rows)
+		if insertErr != nil {
+			_ = tx.Rollback(ctx)
+			return n, insertErr
+		}
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return n, NewDbErr(core.ErrDbExecFail, commitErr)
+		}
+		return n, nil
+	}
+	return insertOHLCVSeriesPgTx(q.db, timeFrame, rows)
+}
+
+func insertOHLCVSeriesPgTx(db DBTX, timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
 	tblName := "kline_" + timeFrame
 	fields := klineExtraFields(rows)
 	cols := klineInsertColumns("time", fields)
 	newSrc := func() *iterForAddOHLCVSeriesPg { return &iterForAddOHLCVSeriesPg{rows: rows, fields: fields} }
-	n, err := q.db.CopyFrom(context.Background(), pgx.Identifier{tblName}, cols, newSrc())
+	ctx := context.Background()
+	const savepoint = "banbot_kline_copy"
+	if _, err := db.Exec(ctx, "SAVEPOINT "+savepoint); err != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, err)
+	}
+	n, err := db.CopyFrom(ctx, pgx.Identifier{tblName}, cols, newSrc())
 	if err != nil {
+		if _, rollbackErr := db.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepoint); rollbackErr != nil {
+			return 0, NewDbErr(core.ErrDbExecFail, rollbackErr)
+		}
 		tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 		startMS := rows[0].TimeMS
 		endMS := rows[len(rows)-1].TimeMS + tfMSecs
-		if delErr := delKLinesPg(q, timeFrame, rows[0].Sid, startMS, endMS); delErr != nil {
+		if delErr := delKLinesPg(New(db), timeFrame, rows[0].Sid, startMS, endMS); delErr != nil {
 			return 0, delErr
 		}
-		n, err = q.db.CopyFrom(context.Background(), pgx.Identifier{tblName}, cols, newSrc())
+		n, err = db.CopyFrom(ctx, pgx.Identifier{tblName}, cols, newSrc())
 		if err != nil {
 			return 0, NewDbErr(core.ErrDbExecFail, err)
 		}
+	}
+	if _, releaseErr := db.Exec(ctx, "RELEASE SAVEPOINT "+savepoint); releaseErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, releaseErr)
 	}
 	return n, nil
 }

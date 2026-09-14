@@ -748,16 +748,13 @@ func newSeriesFeeder(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExSym
 	if err != nil {
 		return nil, err
 	}
-	var backtest bool
 	var preFire float64
 	if deps == nil {
-		backtest = core.BackTestMode
 		preFire = config.PreFire
 	} else {
-		backtest = deps.isBacktest()
 		preFire = deps.preFire()
 	}
-	coverage := historicalCoverageForFeederWithRuntime(deps, exs.Symbol, backtest)
+	coverage := historicalCoverageForFeederWithRuntime(deps, exs.Symbol)
 	return &SeriesFeeder{
 		Feeder: Feeder{
 			ExSymbol: exs,
@@ -773,18 +770,19 @@ func newSeriesFeeder(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExSym
 	}, nil
 }
 
-func historicalCoverageForFeeder(symbol string, backtest bool) *config.HistoricalCoverageConfig {
-	if !backtest {
+func historicalCoverageForFeeder(symbol string) *config.HistoricalCoverageConfig {
+	if !config.StrictHistoricalReplay(config.HistoricalCoverage) {
 		return nil
 	}
 	return config.HistoricalCoverageFor(symbol)
 }
 
-func historicalCoverageForFeederWithRuntime(deps *RuntimeDeps, symbol string, backtest bool) *config.HistoricalCoverageConfig {
+func historicalCoverageForFeederWithRuntime(deps *RuntimeDeps, symbol string) *config.HistoricalCoverageConfig {
 	if deps == nil {
-		return historicalCoverageForFeeder(symbol, backtest)
+		return historicalCoverageForFeeder(symbol)
 	}
-	if !backtest {
+	options := deps.KlineOptions()
+	if !options.StrictReplay || options.HistoricalCoverage == nil {
 		return nil
 	}
 	return deps.coverage(symbol)

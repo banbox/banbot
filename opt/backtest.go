@@ -893,7 +893,10 @@ func (b *BackTest) Run() *errs.Error {
 	}
 	b.logPlot(wallets, b.TimeMS(), -1, -1)
 	b.normalizeBacktestResultRange()
-	b.Collect()
+	if err := b.Collect(); err != nil {
+		b.Logger().Error("backtest report collect fail", zap.Error(err))
+		return err
+	}
 	b.runAfterBacktestCallback()
 	if !b.isOpt {
 		b.Logger().Info(fmt.Sprintf("Complete! cost: %.1fs, avg: %.1f bar/s", btCost, float64(b.BarNum)/btCost))
@@ -968,7 +971,10 @@ func (b *BackTest) cronDumpBtStatus() {
 		}
 		b.lastDumpMs = curTime
 		b.Logger().Info("dump backTest status to files...")
-		b.Collect()
+		if err := b.Collect(); err != nil {
+			b.Logger().Error("dump backTest status collect fail", zap.Error(err))
+			return
+		}
 		b.printBtResult(false)
 	})
 	if err_ != nil {

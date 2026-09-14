@@ -198,6 +198,8 @@ func (q *Queries) updateKHoles(sid int32, timeFrame string, startMS, endMS int64
 		// No holes found – mark the entire window as has_data=true in one atomic call.
 		ctx := context.Background()
 		tbl := "kline_" + timeFrame
+		// Reuse q so PostgreSQL callers stay inside the InsertOHLCVSeriesAuto
+		// transaction; acquiring a second connection here self-blocks on sranges.
 		if err := q.UpdateSRangesWithHoles(ctx, sid, tbl, timeFrame, startMS, endMS, nil); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
 		}

@@ -131,17 +131,17 @@ func TestSubtractMSRangesNoCoverage(t *testing.T) {
 	}
 }
 
-func TestReconcileDownloadedRangesIncludesEmptyAndPartialResponses(t *testing.T) {
+func TestUpdateDownloadedRangesIncludesEmptyAndPartialResponses(t *testing.T) {
 	ranges := []MSRange{{Start: 100, Stop: 200}, {Start: 400, Stop: 900}}
-	var reconciled []MSRange
-	if err := reconcileDownloadedRanges(ranges, func(item MSRange) *errs.Error {
-		reconciled = append(reconciled, item)
+	var updated []MSRange
+	if err := updateDownloadedRanges(ranges, func(item MSRange) *errs.Error {
+		updated = append(updated, item)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(reconciled, ranges) {
-		t.Fatalf("downloaded ranges were not all reconciled: got=%v want=%v", reconciled, ranges)
+	if !reflect.DeepEqual(updated, ranges) {
+		t.Fatalf("downloaded ranges were not all updated: got=%v want=%v", updated, ranges)
 	}
 }
 
