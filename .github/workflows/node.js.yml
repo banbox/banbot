@@ -8,10 +8,12 @@ on:
     branches: [ "main" ]
     paths:
       - 'web/ui/**'
+      - 'core/data.go'
   pull_request:
     branches: [ "main" ]
     paths:
       - 'web/ui/**'
+      - 'core/data.go'
 
 jobs:
   build:
