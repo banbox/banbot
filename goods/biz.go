@@ -432,6 +432,9 @@ func useFrozenStaticPairsWithRuntime(cfg *config.Config, state *core.State, pair
 	if cfg == nil {
 		return config.IsFrozenStaticPairs(pairs)
 	}
+	if state != nil && state.RunMode == core.RunModeData && len(pairs) > 0 {
+		return true
+	}
 	backtest := state != nil && state.BackTestMode
 	return len(pairs) > 0 && len(cfg.PairFilters) == 0 &&
 		(cfg.PairMgr == nil || !cfg.PairMgr.ForceFilters) && backtest && cfg.BTStrict && cfg.BTNoKlineDownload
