@@ -112,7 +112,7 @@ type TradeStrat struct {
 	StopEnterBars int // 限价单如果超过给定K线仍未入场则取消
 	EachMaxLong   int      // 单个品种最大同时开多数量，默认0不限制
 	EachMaxShort  int      // 单个品种最大同时开空数量，默认0不限制
-	RunTimeFrames []string // 允许运行的时间周期，不提供时使用全局配置
+	RunTimeFrames []string // 允许运行的时间周期，不提供时使用当前 Runtime 配置快照中的默认周期
 	Outputs       []string // 策略输出的文本文件内容，每个字符串是一行
 	Policy        *config.RunPolicyConfig // 运行时配置
 

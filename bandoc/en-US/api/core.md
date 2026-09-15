@@ -2,6 +2,12 @@
 
 The core package provides system core data structures, constants, and error definitions.
 
+## Runtime State
+
+Task-scoped mutable core state is represented by `core.State` and is owned by `runtime.Runtime` when a task is created. It contains the run mode and environment, symbol and market state, order books, job performance, and that task's own cancellation signal. New components should receive this state through Runtime-injected concrete state or dependency projections rather than reading or writing package-level variables.
+
+Package-level APIs such as `Setup`, `SetRunMode`, `SetRunEnv`, and `Sleep` remain for older embedded callers. They are compatibility paths and should not be used by new execution flows that must run alongside other tasks.
+
 ## Core Structures
 
 ### Param
@@ -266,4 +272,4 @@ Returns:
 - `bool` - Whether price cache is empty
 
 ### PrintStratGroups
-Print strategy group information. 
+Print strategy group information.

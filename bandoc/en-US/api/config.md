@@ -2,6 +2,10 @@
 
 The config package provides system configuration-related structures and methods.
 
+## Runtime Configuration
+
+Normal entry points parse configuration and then create a task-owned `config.Snapshot`. A Snapshot deep-copies the configuration and keeps explicit data and strategy directories; a Runtime treats it as read-only, so command-line overrides and account configuration from separate tasks cannot overwrite each other. New entry points should use `LoadRuntimeSnapshot` and the Runtime construction flow.
+
 ## Important Structures
 
 ### CmdArgs
@@ -211,7 +215,9 @@ Returns:
 - `*errs.Error` - Error information
 
 ### ApplyConfig
-Apply configuration to global state.
+Install configuration into the legacy package-level compatibility facade.
+
+Normal Runtime entry points do not use this function to carry task state; it remains for call chains that have not yet migrated.
 
 Parameters:
 - `args`: *CmdArgs - Command line argument object

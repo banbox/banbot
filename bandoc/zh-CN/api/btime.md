@@ -2,6 +2,12 @@
 
 btime 包提供了时间处理相关的功能。
 
+## 运行时钟
+
+每个 `runtime.Runtime` 持有独立的 `btime.ClockState`：回测推进自己的模拟时间，实盘读取实时 UTC 时间。任务内的业务代码应通过 Runtime 传入的 ClockState 读取或推进时间，避免不同任务互相影响。
+
+下方的包级时间函数保留给旧调用链；它们不能作为多个 Runtime 并行运行时的任务时钟。
+
 ## 公开方法
 
 ### TimeMS

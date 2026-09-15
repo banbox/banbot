@@ -2,6 +2,8 @@
 
 The live package provides real-time trading functionality.
 
+The live runner is bound to one Runtime's dependencies and lifecycle through `NewCryptoTraderWithRuntimeDeps`. Its market-data provider, strategies, orders, wallets, scheduler, and shutdown callbacks therefore belong to the same task; older constructors such as `NewCryptoTrader` are retained only for compatible embedded calls.
+
 ## Scheduled Task Related Methods
 
 ### CronRefreshPairs
@@ -183,4 +185,4 @@ Login request parameters struct.
 
 **Fields:**
 - `Username` (string): Username, required
-- `Password` (string): Password, required 
+- `Password` (string): Password, required

@@ -4,6 +4,8 @@ The data package provides functionality for data processing and management.
 
 The main data path in the `data` package now uses `orm.DataSeries`. The K-line Feeder/Provider types documented below remain for built-in OHLCV data; custom time-series data should use the generic data-source interfaces on this page.
 
+Providers, Feeders, Watchers, and the data-source runtime receive their owning Runtime's state and callback boundary through `data.RuntimeDeps`. One task's warmup, subscriptions, and clock are not reused by another task; older constructors without RuntimeDeps remain only for compatibility.
+
 ## Generic Time-Series Data
 
 ### DataSource

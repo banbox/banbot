@@ -2,6 +2,8 @@
 
 opt 包提供了策略优化相关的功能。
 
+回测和优化运行器通过 `NewBackTestLiteWithRuntimeDeps`、`NewBackTestWithRuntimeDeps` 接收一个 Runtime 的依赖。每个运行器使用自己的时钟、策略、订单、钱包和数据投影；优化过程中的每轮执行也按 Runtime 生命周期创建和释放。
+
 ## 主要结构体
 
 ### BackTest

@@ -2,6 +2,8 @@
 
 The opt package provides strategy optimization functionality.
 
+Backtest and optimization runners receive one Runtime's dependencies through `NewBackTestLiteWithRuntimeDeps` and `NewBackTestWithRuntimeDeps`. Each runner uses its own clock, strategies, orders, wallets, and data projection; optimization iterations also create and release their state with a Runtime lifecycle.
+
 ## Main Structures
 
 ### BackTest
@@ -162,4 +164,4 @@ Returns:
 Compare exchange backtest orders.
 
 Parameters:
-- `args []string` - Command line argument list 
+- `args []string` - Command line argument list

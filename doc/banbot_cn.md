@@ -332,7 +332,7 @@ type TradeStrat struct {
 	StopEnterBars int
 	EachMaxLong int // max number of long open orders for one pair, -1 for disable
 	EachMaxShort int // max number of short open orders for one pair, -1 for disable
-	RunTimeFrames []string // 允许运行的时间周期，不提供时使用全局配置
+	RunTimeFrames []string // 允许运行的时间周期，不提供时使用当前 Runtime 配置快照中的默认周期
 	Outputs []string // 策略输出的文本文件内容，每个字符串是一行
 	Policy *config.RunPolicyConfig
 	OnPairInfos func(s *StratJob) []*PairSub

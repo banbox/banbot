@@ -22,7 +22,7 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `StopEnterBars int` - 限价入场单超时K线数
 - `EachMaxLong int` - 每个交易对最大做多订单数，-1表示禁用
 - `EachMaxShort int` - 每个交易对最大做空订单数，-1表示禁用
-- `RunTimeFrames []string` - 允许运行的时间周期，不提供时使用全局配置
+- `RunTimeFrames []string` - 允许运行的时间周期；未提供时使用当前 Runtime 配置快照中的默认周期
 - `Outputs []string` - 策略输出的文本文件内容，每个字符串是一行
 - `Policy *config.RunPolicyConfig` - 策略运行配置
 - `OnDataSubs`: 声明 K 线扩展列或自定义时序数据订阅

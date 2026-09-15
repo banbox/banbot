@@ -2,6 +2,8 @@
 
 ## 背景与目标
 
+> 本文是双后端迁移的实施方案与历史设计记录。其中以 `IsQuestDB` 等包级开关描述的内容属于当时的兼容实现，不能作为当前任务运行态的模型。当前入口使用显式 `orm.Storage` 与 `runtime.Runtime`；有关任务所有权和兼容边界，请参阅 [运行时上下文架构](runtime_context.md)。
+
 banbot 从 v0.2.x（banbotraw）迁移至 v0.3.7 时，将时序 K 线存储从 **TimescaleDB**（PostgreSQL 超表扩展）切换到了 **QuestDB**（PGWire 协议）。现在需要在 v0.3.7 基础上**恢复对 TimescaleDB 的支持**，同时保留对 QuestDB 的完整支持，使用户可以在两者之间选择。
 
 本文档分析两个版本的核心差异，并给出优雅兼容两种数据库的架构方案。
@@ -144,7 +146,7 @@ PostgreSQL `sranges` 表设计与 `sranges_q` 的主要差异：
 
 `DatabaseConfig` 新增可选字段 `DbType`（`"questdb"` 或 `"timescale"`），优先级高于自动检测。
 
-引入全局变量 `IsQuestDB bool`（在 `orm` 包内），Setup 完成后设定，供所有查询函数分支判断。
+该实施阶段引入了包级 `IsQuestDB bool`（在 `orm` 包内），由旧 `Setup` 路径设定，供当时的查询分支判断。Runtime 路径以显式 `orm.Storage` 表达存储后端，不应把该兼容开关作为新任务之间共享状态的依据。
 
 ### 2.3 连接池差异处理
 

@@ -2,6 +2,10 @@
 
 config 包提供了系统配置相关的结构体和方法。
 
+## 运行时配置
+
+常规入口会先解析配置，再创建一份属于任务的 `config.Snapshot`。Snapshot 深拷贝配置并保存显式的数据/策略目录；Runtime 将其视为只读配置，因此不同任务的命令行覆盖和账户配置不会彼此改写。新入口应使用 `LoadRuntimeSnapshot` 与 Runtime 构造流程。
+
 ## 重要结构体
 
 ### CmdArgs
@@ -211,7 +215,9 @@ API服务器配置,包含以下字段:
 - `*errs.Error` - 错误信息
 
 ### ApplyConfig
-应用配置到全局状态。
+将配置安装到旧的包级兼容 facade。
+
+常规的 Runtime 入口不依赖此函数来传递任务状态；它保留给尚未迁移的旧调用链。
 
 参数：
 - `args`: *CmdArgs - 命令行参数对象
