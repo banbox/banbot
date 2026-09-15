@@ -498,7 +498,8 @@ func runExplicitDownData(args *config.CmdArgs) *errs.Error {
 		logger.Warn("no pairs to download")
 		return nil
 	}
-	logger.Info("start down kline for pairs", zap.Int("num", len(pairs)), zap.Strings("tfs", args.TimeFrames))
+	timeframes := cfg.RunTimeframes
+	logger.Info("start down kline for pairs", zap.Int("num", len(pairs)), zap.Strings("tfs", timeframes))
 	exsMap := make(map[int32]*orm.ExSymbol, len(pairs))
 	for _, pair := range pairs {
 		exs, symbolErr := rt.Symbols.GetExSymbolCur(pair)
@@ -512,7 +513,7 @@ func runExplicitDownData(args *config.CmdArgs) *errs.Error {
 		startMS, endMS = cfg.TimeRange.StartMS, cfg.TimeRange.EndMS
 	}
 	options := orm.NewKlineRuntimeOptions(rt.Core, cfg, rt.Clock.TimeMS(), rt.Storage)
-	for _, tf := range args.TimeFrames {
+	for _, tf := range timeframes {
 		if err := orm.BulkDownOHLCVWithOptions(rt.Exchange, exsMap, tf, startMS, endMS, 0, nil, options); err != nil {
 			return err
 		}
