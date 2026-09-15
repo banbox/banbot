@@ -9,7 +9,7 @@ It is highly recommended that you quickly get familiar with banbot through [deep
 :::
 
 ## Go Package Introduction & Dependencies
-Banbot is divided into several different packages based on functional characteristics and dependencies. Common global variables are mostly scattered across multiple packages. Below are the dependencies of all packages:
+Banbot is divided into packages by responsibility and dependency. When a task runs, `entry` creates an explicit `runtime.Runtime` for each backtest, live-trading, or optimization run. Configuration, clock, market and symbol state, strategies, orders, wallets, and data dependencies travel with that Runtime instead of using package-level mutable state to communicate between tasks. The package dependencies are listed below:
 
 #### [core](core.md)
 Types, methods, constants, and variables referenced by all other packages; for example, hyperparameter definitions, prices, simple EMA, error codes, etc.
@@ -97,54 +97,10 @@ The entry point for all cmd sub-commands and business logic.
 
 &emsp;optimize live data
 
-## Important Global Variables in Each Go Package
-```text
-core
-    Ctx context.Context // Global context, can select <- core.Ctx to respond to global exit events
-    StopAll func() // Trigger a global exit event
-    NoEnterUntil map[string]int64 // Prohibit opening orders until the given timestamp
-    RunMode string // RunModeLive / RunModeBackTest / RunModeOther
-    RunEnv string // RunEnvProd / RunEnvTest / RunEnvDryRun
-    StartAt int64 // Start time, 13-digit timestamp
-    LiveMode bool // Whether it is live mode: live trading + simulation
-    BackTestMode bool // Whether it is backtest mode
-    EnvReal bool // LiveMode && RunEnv != RunEnvDryRun, submit orders to the exchange (run_env: prod/test)
-    ExgName string // Current exchange name
-    Market string // Current market
-    IsContract bool // Whether the current market is a contract market (linear/inverse/option)
-    Pairs []string // All global trading pairs, in the order refreshed
-    OdBooks map[string]*banexg.OrderBook // Cache all received order books
+## Task Runtime and Compatibility Boundary
 
-btime
-    CurTimeMS int64 // Current timestamp, used only in backtest mode
-    LocShow *time.Location // Timezone for display
-    UTCLocale *time.Location
+`runtime.Process` manages only a small set of process-scoped construction resources, such as Runtime IDs and SID allocators shared by storage identity. Each `runtime.Runtime` owns its task's `core.State`, `config.Snapshot`, `btime.ClockState`, market and symbol state, strategy jobs, orders and wallets, scheduler, notifications, data directories, and explicit storage/exchange dependencies. Business packages receive narrow dependencies through `Runtime.BizDeps()` or `Runtime.DataDeps()`.
 
-biz
-    AccOdMgrs // Order book objects, never empty
-    AccLiveOdMgrs // Live trading order book objects, not empty in live trading
-    AccWallets // Wallets
+Consequently, backtest, live-trading, and optimization tasks created through the normal entry points have their own cancellation, shutdown, and mutable business state; one `Process` can create several Runtimes. `context.Context` is used only for cancellation, deadlines, and I/O lifecycles, not for business state.
 
-data
-    Spider // Spider
-
-orm
-    HistODs // Closed orders: fully exited, used only in backtesting
-    AccOpenODs // Open orders: not submitted, submitted but not entered, partially entered, fully entered, partially exited
-    AccTriggerODs // Limit entry orders not yet submitted, waiting for polling submission to the exchange, used only in live trading
-    AccTaskIDs // Current task IDs
-    AccTasks // Current tasks
-
-exg
-    Default  // Exchange object
-
-strat
-    StagyMap // Strategy registration map
-    Versions // Strategy versions
-    Envs // All involved K-line environments: Pair+TimeFrame
-    PairTFStags // Pair+TF+Strategy pair:[stratID]TradeStrat
-    AccJobs // All involved pairs account: pair_tf: [stratID]StratJob
-    AccInfoJobs // All involved auxiliary information pairs account: pair_tf: [stratID]StratJob
-    ForbidJobs // Prohibited strategy tasks pair_TF: stratID: empty
-```
-Note: All variables starting with Acc are maps that support multiple accounts.
+The repository retains a small number of package-level facades for compatibility with older embedded calls and selected maintenance commands, including legacy configuration, time, and trading-state accessors. Those paths are protected by a compatibility boundary and are not the state-access mechanism for new tasks; new code should receive state through construction parameters, concrete receivers, or Runtime dependency projections.

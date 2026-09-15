@@ -2,6 +2,10 @@
 
 The orm package provides database access and data model definition functionality.
 
+## Runtime Storage and Symbol State
+
+Explicit runners inject `orm.Storage` and `orm.SymbolState` into a Runtime. Storage is an explicit connection and backend-capability dependency, while SymbolState keeps the task's own symbol index, subscriptions, and recovery directory; the entry point that creates shared external resources is responsible for closing them. Package-level APIs such as `Setup` and `Conn` remain for legacy call chains and cannot obtain another Runtime's task state.
+
 ## Important Structures
 
 ### AdjFactor
@@ -117,13 +121,13 @@ See [Custom Time-Series Data](../guide/custom_data.md) for the complete registra
 
 ## Database Connection Related
 
-### Setup
+### Setup (Compatibility API)
 Initialize database connection pool.
 
 Returns:
 - `*errs.Error` - Error information during initialization
 
-### Conn
+### Conn (Compatibility API)
 Get database connection and query object.
 
 Parameters:

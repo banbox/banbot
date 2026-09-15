@@ -248,7 +248,7 @@ type TradeStrat struct {
 	StopEnterBars int
 	EachMaxLong int // max number of long open orders for one pair, -1 for disable
 	EachMaxShort int // max number of short open orders for one pair, -1 for disable
-	RunTimeFrames []string // Allowed running timeframes, use global configuration when not provided
+	RunTimeFrames []string // Allowed running timeframes; when omitted, use the current Runtime configuration snapshot default
 	Outputs []string // Text file content output by strategy, each string is a line
 	Policy *config.RunPolicyConfig
 	OnPairInfos func(s *StratJob) []*PairSub

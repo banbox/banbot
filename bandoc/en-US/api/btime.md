@@ -2,6 +2,12 @@
 
 The btime package provides time processing functionality.
 
+## Runtime Clock
+
+Each `runtime.Runtime` owns an independent `btime.ClockState`: a backtest advances its own simulated time, while live trading reads real UTC time. Business code inside a task should receive that ClockState through the Runtime and use it to read or advance time, avoiding interference between tasks.
+
+The package-level time functions below remain for legacy call chains; they are not a task clock for several Runtimes running in parallel.
+
 ## Public Methods
 
 ### TimeMS
@@ -106,4 +112,4 @@ Parameters:
 - `text string` - Input string
 
 Returns:
-- `int` - Number of digit characters 
+- `int` - Number of digit characters

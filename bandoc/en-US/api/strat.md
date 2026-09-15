@@ -22,7 +22,7 @@ Public fields:
 - `StopEnterBars int` - Timeout candlestick number for limit entry orders
 - `EachMaxLong int` - Maximum number of long orders per trading pair, -1 to disable
 - `EachMaxShort int` - Maximum number of short orders per trading pair, -1 to disable
-- `RunTimeFrames []string` - Allowed running time periods, use global configuration when not provided
+- `RunTimeFrames []string` - Allowed running time periods; when omitted, the default comes from the current Runtime configuration snapshot
 - `Outputs []string` - Content of the text file output by the strategy, where each string is one line
 - `Policy *config.RunPolicyConfig` - Strategy running configuration
 - `OnDataSubs` - Declares K-line extension columns or custom time-series subscriptions

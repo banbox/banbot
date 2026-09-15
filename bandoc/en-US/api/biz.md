@@ -2,6 +2,12 @@
 
 The biz package provides business logic layer functionality implementation.
 
+## Task Dependencies
+
+Current traders receive one Runtime's core state, clock, market, strategies, orders, wallets, configuration, storage, and exchange dependencies through `biz.RuntimeDeps`; `NewTraderWithRuntimeDeps` never falls back to dynamically finding missing state. Mutable business state such as order processing and wallets therefore belongs to the task that created it.
+
+`SetupComs` and older constructors without RuntimeDeps remain for compatibility and must not be used by new execution flows that need to run alongside other tasks.
+
 ## Main Structures
 
 ### LiveOrderMgr
@@ -65,7 +71,7 @@ Main fields:
 
 ## Public Methods
 
-### SetupComs
+### SetupComs (Compatibility API)
 Initialize basic components.
 
 Parameters:
@@ -83,7 +89,7 @@ Implementation Details:
 - Initialize core components, exchanges, ORM, and goods modules
 - Mainly used for basic infrastructure initialization during system startup
 
-### SetupComsExg
+### SetupComsExg (Compatibility API)
 Initialize exchange-related basic components.
 
 Parameters:
@@ -154,14 +160,6 @@ Parameters:
 
 Returns:
 - `int` - Number of triggered jobs
-
-### ResetVars
-Reset variables.
-
-Implementation Details:
-- Reset various global mappings and variables
-- Including order managers, wallets, candlestick environments, etc.
-- Used for cleaning up state during system restart or reset
 
 ### InitDataDir
 Initialize data directory.
@@ -308,4 +306,4 @@ Returns:
 Implementation Details:
 - Export price adjustment factor data
 - Include start time, factor values, etc.
-- Support timezone settings 
+- Support timezone settings

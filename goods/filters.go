@@ -237,6 +237,9 @@ func (f *VolumePairFilter) GenSymbolsWithRuntimeDeps(deps *RuntimeDeps, timeMS i
 	if deps == nil {
 		return f.filterWithRuntimeDeps(nil, pairs, timeMS)
 	}
+	if err := orm.EnsureCurSymbolsWithRuntimeConfig(state, exchange, pairs, cfg, deps.DataDir, deps.Core); err != nil {
+		return nil, err
+	}
 	copyDeps := *deps
 	copyDeps.Symbols = state
 	copyDeps.Exchange = exchange

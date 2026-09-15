@@ -5,6 +5,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 
 ## 技术架构与实现方案
 - 核心框架: 自定义事件驱动框架，支持回测与实盘模式。
+- 运行态: 每次回测、实盘或优化由独立的 `runtime.Runtime` 承载。配置快照、时钟、市场与交易对、策略、订单和钱包状态随任务传递；`context.Context` 仅用于取消、deadline 与 I/O 生命周期。
 - 数据库: SQLite（`banpub.db`）用于公共元数据（K线索引、日历、复权因子、范围管理、未完成K线等）；QuestDB（PGWire）可选用于大规模时序K线存储；交易/任务数据使用SQLite文件（`orders_ban.db`）。
 - 数据处理: 包含数据爬虫、清洗、存储及gRPC服务，为策略提供数据支持。
 - 订单管理: 支持本地模拟和实盘交易两种模式，精细化管理订单生命周期。
@@ -47,7 +48,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 
 ### `com/` (公共组件)
 - common.go: 公共数据和函数。
-- price.go: 全局价格管理,支持bar价格和订单簿(bid/ask)价格,提供带过期检查的安全价格获取,用于回测和实盘。
+- price.go: `MarketState` 的价格管理，支持 bar 价格和订单簿(bid/ask)价格，并提供带过期检查的安全价格获取；Runtime 使用自己的市场状态，旧包级访问接口仅作兼容。
 - price_live.go: 实盘价格管理,从交易所获取最新BookTicker并更新价格缓存,内置节流机制防止频繁请求。
 - cron.go: 定时任务管理,基于cron库实现。
 
@@ -57,11 +58,12 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - cmd_types.go: 命令行参数结构体。
 - cmd_biz.go: 命令行参数业务逻辑处理。
 
-### `core/` (核心类型与全局变量)
-- core.go: 设置运行模式和环境，提供`Setup`、`SetRunMode`、`SetRunEnv`、`Sleep`等函数。
+### `core/` (核心类型与任务状态)
+- runtime_state.go: `core.State`，保存单个 Runtime 的运行模式、市场、交易对、订单簿、任务性能和取消状态。
+- core.go: 旧调用链的运行模式/环境与休眠兼容接口；新增运行器通过 `core.State` 和 Runtime 依赖投影工作。
 - common.go: 缓存管理(ristretto)、退出回调、键生成等。函数：`GetCacheVal`、`SnapMem`、`RunExitCalls`等。
 - types.go: 核心数据结构：`Param`(参数配置)、`PerfSta`(性能统计)、`JobPerf`(任务性能)等。
-- data.go: 全局变量和状态，包括运行模式、市场信息、交易对管理、订单常量等，使用`deadlock.RWMutex`保护。
+- data.go: 旧的包级兼容 facade 与订单常量；任务级可变状态已由 `core.State` 管理。
 - calc.go: 基础计算工具，如EMA。
 - errors.go: 自定义错误码和错误名称。
 - utils.go: 核心层工具函数，如`GetPrice`、`SetPrice`、`IsMaker`、`SplitSymbol`等。
@@ -83,7 +85,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 
 ### `exg/` (交易所接口)
 - biz.go: 交易所接口初始化和封装。函数：`Setup`、`GetWith`、`PrecCost`、`PrecPrice`、`PrecAmount`、`GetLeverage`、`GetOdBook`等。
-- data.go: 交易所相关全局变量。
+- data.go: 旧的交易所兼容 facade；显式运行器在 Runtime 构造时传入自己的交易所 session。
 - ext.go: 交易所接口扩展，增加订单创建后的回调钩子。
 
 ### `goods/` (交易对筛选)
@@ -160,7 +162,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - base.go: 策略基类`TradeStrat`和任务`StratJob`核心逻辑，包括仓位计算、时间周期选择、订单bar上限等。
 - main.go: 策略加载和管理。
 - common.go: 策略通用函数：`New`、`Get`、`GetJobs`、`CalcJobScores`、`AddOdSub`、`FireOdChange`、`LoadStratJobs`等。
-- data.go: 策略全局数据结构，包括策略版本、bar环境、账户任务、WebSocket订阅任务等。
+- state.go / execution_state.go: Runtime 专属的策略注册表、任务、bar 环境、账户任务和 WebSocket 订阅状态；data.go 中的旧访问形式仅用于兼容。
 - pair_update.go: 运行时动态交易对管理`PairUpdateManager`，支持按策略增删交易对，处理关联订单平仓、WebSocket订阅注册/注销。
 - goods.go: 策略相关交易对处理逻辑，包括策略分组接力和交易对评分。
 - types.go: 策略自定义类型：`EnterReq`、`ExitReq`、`PairSub`、`BatchMap`、`JobEnv`等。

@@ -237,8 +237,19 @@ func RefreshPairListWithRuntimeDeps(deps *RuntimeDeps, timeMS int64) ([]string, 
 	}
 	cfg := deps.Config
 	pairs, _ := staticPairsWithConfig(cfg)
+	hadStaticPairs := len(pairs) > 0
 	allowFilter := false
 	var err *errs.Error
+	// Static pairs must be registered before any historical scoring/filtering
+	// resolves them through the runtime-owned SymbolState. Explicit runtimes do
+	// not populate the legacy package catalog during construction.
+	if len(pairs) > 0 {
+		err = orm.EnsureCurSymbolsWithRuntimeConfig(deps.Symbols, deps.Exchange, pairs,
+			deps.Config, deps.DataDir, deps.Core)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(pairs) > 0 {
 		if !useFrozenStaticPairsWithRuntime(cfg, deps.Core, pairs) {
 			pairVols, volErr := GetSymbolVolsWithRuntimeDeps(deps, pairs, "1h", 1, timeMS, true)
@@ -275,10 +286,12 @@ func RefreshPairListWithRuntimeDeps(deps *RuntimeDeps, timeMS int64) ([]string, 
 			log.Info(fmt.Sprintf("gen symbols from %s, num: %d", producer.GetName(), len(pairs)))
 		}
 	}
-	err = orm.EnsureCurSymbolsWithRuntimeConfig(deps.Symbols, deps.Exchange, pairs,
-		deps.Config, deps.DataDir, deps.Core)
-	if err != nil {
-		return nil, err
+	if !hadStaticPairs {
+		err = orm.EnsureCurSymbolsWithRuntimeConfig(deps.Symbols, deps.Exchange, pairs,
+			deps.Config, deps.DataDir, deps.Core)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if allowFilter {
 		filters, filterErr := GetPairFiltersWithConfig(pairFilters(cfg), false, cfg)
@@ -418,6 +431,9 @@ func staticPairsWithConfig(cfg *config.Config) ([]string, bool) {
 func useFrozenStaticPairsWithRuntime(cfg *config.Config, state *core.State, pairs []string) bool {
 	if cfg == nil {
 		return config.IsFrozenStaticPairs(pairs)
+	}
+	if state != nil && state.RunMode == core.RunModeData && len(pairs) > 0 {
+		return true
 	}
 	backtest := state != nil && state.BackTestMode
 	return len(pairs) > 0 && len(cfg.PairFilters) == 0 &&

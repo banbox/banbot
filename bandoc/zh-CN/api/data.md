@@ -4,6 +4,8 @@ data 包提供了数据处理和管理相关的功能。
 
 `data` 包的主链路已统一使用 `orm.DataSeries`。下文保留的 K 线 Feeder/Provider 类型用于内置 OHLCV 数据；自定义时序数据应使用本页的通用数据源接口。
 
+Provider、Feeder、Watcher 和数据源运行时通过 `data.RuntimeDeps` 取得所属 Runtime 的状态与回调边界。一个任务的数据预热、订阅和时钟不会被另一个任务复用；未提供 RuntimeDeps 的旧构造路径仅为兼容保留。
+
 ## 通用时序数据
 
 ### DataSource

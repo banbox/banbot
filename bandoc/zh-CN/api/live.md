@@ -2,6 +2,8 @@
 
 live 包提供了实时交易相关的功能。
 
+实盘运行器通过 `NewCryptoTraderWithRuntimeDeps` 绑定到一个 Runtime 的依赖和生命周期。这样行情 provider、策略、订单、钱包、调度器与关闭回调都归属同一任务；`NewCryptoTrader` 等旧构造函数仅用于兼容嵌入式调用。
+
 ## 定时任务相关方法
 
 ### CronRefreshPairs
