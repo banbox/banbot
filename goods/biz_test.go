@@ -96,6 +96,21 @@ func TestUseFrozenStaticPairsRequiresUnfilteredStrictHistoricalReplay(t *testing
 	}
 }
 
+func TestUseFrozenStaticPairsWithRuntimeDataModeSkipsVolumeLookup(t *testing.T) {
+	cfg := &config.Config{
+		PairFilters: []*config.CommonPairFilter{{Name: "VolumePairFilter"}},
+		PairMgr:     &config.PairMgrConfig{ForceFilters: true},
+	}
+	state := &core.State{RunMode: core.RunModeData}
+
+	if !useFrozenStaticPairsWithRuntime(cfg, state, []string{"BTC/USDT:USDT"}) {
+		t.Fatal("data runtime did not preserve static pairs before the implicit 1h volume lookup")
+	}
+	if useFrozenStaticPairsWithRuntime(cfg, state, nil) {
+		t.Fatal("data runtime accepted an empty static-pair list")
+	}
+}
+
 func TestBlockFilter(t *testing.T) {
 	f := BlockFilter{
 		BaseFilter: BaseFilter{
