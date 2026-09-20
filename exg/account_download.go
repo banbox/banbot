@@ -47,17 +47,8 @@ func GetAccountDownload(exchange banexg.BanExchange, source, account, downloadID
 // GetAccountDownloadCapability unwraps the local BotExchange boundary without
 // requiring callers to know how the runtime wraps a banexg adapter.
 func GetAccountDownloadCapability(exchange banexg.BanExchange) AccountDownloadCapability {
-	if exchange == nil {
-		return nil
-	}
-	if capability, ok := exchange.(AccountDownloadCapability); ok {
-		return capability
-	}
-	if wrapper, ok := exchange.(*BotExchange); ok && wrapper != nil && wrapper.BanExchange != nil {
-		capability, _ := wrapper.BanExchange.(AccountDownloadCapability)
-		return capability
-	}
-	return nil
+	capability, _ := getExchangeCapability[AccountDownloadCapability](exchange)
+	return capability
 }
 
 func callAccountDownload(call func() (*banexg.HttpRes, *errs.Error)) (res *banexg.HttpRes, err *errs.Error) {
@@ -83,17 +74,8 @@ type ArchiveURLCapability interface {
 
 // GetArchiveURLCapability unwraps the local BotExchange boundary.
 func GetArchiveURLCapability(exchange banexg.BanExchange) ArchiveURLCapability {
-	if exchange == nil {
-		return nil
-	}
-	if capability, ok := exchange.(ArchiveURLCapability); ok {
-		return capability
-	}
-	if wrapper, ok := exchange.(*BotExchange); ok && wrapper != nil && wrapper.BanExchange != nil {
-		capability, _ := wrapper.BanExchange.(ArchiveURLCapability)
-		return capability
-	}
-	return nil
+	capability, _ := getExchangeCapability[ArchiveURLCapability](exchange)
+	return capability
 }
 
 // BuildArchiveURL preserves the old ID-based facade while delegating URL

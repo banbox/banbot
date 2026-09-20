@@ -40,6 +40,9 @@ func (s *visibilityDBStub) Query(_ context.Context, sql string, args ...interfac
 }
 
 func (s *visibilityDBStub) QueryRow(_ context.Context, sql string, args ...interface{}) pgx.Row {
+	if s.queryRow == nil {
+		return scriptedRow{values: []any{int64(0)}}
+	}
 	return s.queryRow(sql, args...)
 }
 
@@ -734,6 +737,25 @@ func TestWaitForQuestCalendarTimestampVisibleNormalizesToMicroseconds(t *testing
 	}
 }
 
+func TestWaitForQuestCalendarTimestampVisibleTimeoutIsRetryable(t *testing.T) {
+	installQuestWaitScript(t, 2)
+	db := &visibilityDBStub{
+		queryRow: func(string, ...interface{}) pgx.Row {
+			return visibilityRowStub{scan: func(dest ...interface{}) error {
+				*dest[0].(**time.Time) = nil
+				return nil
+			}}
+		},
+	}
+
+	err := waitForQuestCalendarTimestampVisible(context.Background(), New(db), "spot", time.Unix(0, 0))
+	var typedErr *errs.Error
+	if !errors.As(err, &typedErr) || typedErr.Code != core.ErrDbReadFail ||
+		!strings.Contains(typedErr.Short(), "calendars_q market=spot") {
+		t.Fatalf("calendar visibility timeout = %v, want retryable timeout with table identity", err)
+	}
+}
+
 func TestWaitForQuestKlineRangeVisibleTimeoutKeepsPending(t *testing.T) {
 	installQuestWaitScript(t, 1)
 
@@ -1028,11 +1050,18 @@ func TestVerifyQuestRewriteTableSnapshotPropagatesHardQueryFailure(t *testing.T)
 
 func TestReplaceVerifiedQuestTableRejectsChangedSourceBeforeRename(t *testing.T) {
 	installQuestWaitScript(t, 1)
+	installMemoryQuestRewriteIntentStore(t, &memoryQuestRewriteIntentStore{})
 	execSQL := make([]string, 0, 1)
 	db := &visibilityDBStub{
 		exec: func(sql string, _ ...interface{}) (pgconn.CommandTag, error) {
 			execSQL = append(execSQL, sql)
 			return pgconn.CommandTag{}, nil
+		},
+		queryRow: func(sql string, _ ...interface{}) pgx.Row {
+			if strings.Contains(sql, "FROM tables()") {
+				return scriptedRow{values: []any{int64(0)}}
+			}
+			return scriptedRow{values: []any{int64(1)}}
 		},
 		query: func(sql string, _ ...interface{}) (pgx.Rows, error) {
 			switch {
@@ -1153,6 +1182,7 @@ func TestBuildQuestRewriteSQLPlacesPhysicalCastInsideSelect(t *testing.T) {
 }
 
 func TestReplaceVerifiedQuestTableDropsBackupOnlyAfterValidation(t *testing.T) {
+	installMemoryQuestRewriteIntentStore(t, &memoryQuestRewriteIntentStore{})
 	columns := []questTableColumn{{Name: "sid", Type: "INT", UpsertKey: true}, {Name: "metric", Type: "DOUBLE"}}
 	execSQL := make([]string, 0, 3)
 	db := &visibilityDBStub{
@@ -1181,6 +1211,7 @@ func TestReplaceVerifiedQuestTableDropsBackupOnlyAfterValidation(t *testing.T) {
 }
 
 func TestReplaceVerifiedQuestTableKeepsSourcePredicateAfterActivation(t *testing.T) {
+	installMemoryQuestRewriteIntentStore(t, &memoryQuestRewriteIntentStore{})
 	columns := []questTableColumn{
 		{Name: "sid", Type: "INT", UpsertKey: true},
 		{Name: "metric", Type: "DOUBLE"},
@@ -1229,6 +1260,7 @@ func TestReplaceVerifiedQuestTableKeepsSourcePredicateAfterActivation(t *testing
 
 func TestReplaceVerifiedQuestTableRestoresBackupWhenFinalValidationFails(t *testing.T) {
 	installQuestWaitScript(t, 1)
+	installMemoryQuestRewriteIntentStore(t, &memoryQuestRewriteIntentStore{})
 
 	execSQL := make([]string, 0, 4)
 	db := &visibilityDBStub{
@@ -1272,6 +1304,7 @@ func TestReplaceVerifiedQuestTableRestoresBackupWhenFinalValidationFails(t *test
 
 func TestReplaceVerifiedQuestTableRejectsCorruptionAfterAnyRow(t *testing.T) {
 	installQuestWaitScript(t, 1)
+	installMemoryQuestRewriteIntentStore(t, &memoryQuestRewriteIntentStore{})
 	columns := []questTableColumn{
 		{Name: "sid", Type: "INT", UpsertKey: true},
 		{Name: "ts", Type: "TIMESTAMP", Designated: true, UpsertKey: true},

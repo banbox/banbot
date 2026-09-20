@@ -95,9 +95,7 @@ func ToFloat64(value any) (float64, error) {
 }
 
 func ConvertFloat64(i interface{}) float64 {
-	switch i.(type) {
-	case int, int8, int16, int32, int64, float32, float64:
-	default:
+	if !isLegacyNumber(i) {
 		return 0
 	}
 	value, _ := ToFloat64(i)
@@ -138,13 +136,23 @@ func ToInt64(value any) (int64, error) {
 }
 
 func ConvertInt64(i interface{}) int64 {
-	switch i.(type) {
-	case int, int8, int16, int32, int64, float32, float64:
-	default:
+	if !isLegacyNumber(i) {
 		return 0
 	}
 	value, _ := ToInt64(i)
 	return value
+}
+
+// isLegacyNumber preserves the narrow input contract of the Convert* helpers.
+// The To* functions accept additional unsigned and string inputs, while the
+// legacy Convert* APIs intentionally return zero for those values.
+func isLegacyNumber(value any) bool {
+	switch value.(type) {
+	case int, int8, int16, int32, int64, float32, float64:
+		return true
+	default:
+		return false
+	}
 }
 
 // Calculate the function of the greatest common divisor (GCD) of two numbers using the Euclidean algorithm

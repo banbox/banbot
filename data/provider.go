@@ -805,13 +805,7 @@ func runHistFeedersWithRuntimeDeps(deps *RuntimeDeps, makeFeeders func() []IHist
 			ver = 0
 		}
 		if ver > oldVer || firstInit {
-			feeders := makeFeeders()
-			holds = make(histFeederHeap, len(feeders))
-			for i, feeder := range feeders {
-				holds[i] = histFeederHeapItem{feeder: feeder, order: nextOrder}
-				nextOrder++
-			}
-			heap.Init(&holds)
+			holds, nextOrder = initHistFeederHeap(makeFeeders, nextOrder)
 			oldVer = max(oldVer, ver)
 			firstInit = false
 		}
@@ -826,27 +820,7 @@ func runHistFeedersWithRuntimeDeps(deps *RuntimeDeps, makeFeeders func() []IHist
 		}
 		hold.CallNext()
 		batchTime := batch.TimeMS()
-		if batchTime > lastBarMs {
-			// 更新进度条
-			if pBar != nil {
-				var curMS int64
-				if deps == nil {
-					curMS = btime.TimeMS()
-				} else {
-					curMS = deps.timeMS()
-				}
-				if pBar.Last == 0 {
-					pBar.Last = curMS
-				} else if curMS > pBar.Last {
-					pBarAdd := (curMS - pBar.Last) / 1000
-					if pBarAdd > 0 {
-						pBar.Add(int(pBarAdd))
-						pBar.Last = curMS
-					}
-				}
-			}
-			lastBarMs = batchTime
-		}
+		lastBarMs = updateHistReplayProgress(pBar, lastBarMs, batchTime, deps)
 		// 这里不要使用多个goroutine加速，反而更慢，且导致多次回测结果略微差异
 		err := hold.RunBatch(batch)
 		if err != nil {
@@ -857,6 +831,39 @@ func runHistFeedersWithRuntimeDeps(deps *RuntimeDeps, makeFeeders func() []IHist
 		heap.Push(&holds, item)
 	}
 	return nil
+}
+
+func initHistFeederHeap(makeFeeders func() []IHistFeeder, nextOrder uint64) (histFeederHeap, uint64) {
+	feeders := makeFeeders()
+	holds := make(histFeederHeap, len(feeders))
+	for i, feeder := range feeders {
+		holds[i] = histFeederHeapItem{feeder: feeder, order: nextOrder}
+		nextOrder++
+	}
+	heap.Init(&holds)
+	return holds, nextOrder
+}
+
+func updateHistReplayProgress(pBar *utils.PrgBar, lastBarMs, batchTime int64, deps *RuntimeDeps) int64 {
+	if batchTime <= lastBarMs {
+		return lastBarMs
+	}
+	if pBar != nil {
+		curMS := btime.TimeMS()
+		if deps != nil {
+			curMS = deps.timeMS()
+		}
+		if pBar.Last == 0 {
+			pBar.Last = curMS
+		} else if curMS > pBar.Last {
+			pBarAdd := (curMS - pBar.Last) / 1000
+			if pBarAdd > 0 {
+				pBar.Add(int(pBarAdd))
+				pBar.Last = curMS
+			}
+		}
+	}
+	return batchTime
 }
 
 type histFeederHeapItem struct {

@@ -6,8 +6,11 @@ import (
 )
 
 func (d *RuntimeDeps) logger() *zap.Logger {
-	if d == nil {
+	if d == nil || d.Core == nil {
 		return log.L()
 	}
-	return d.Core.Log()
+	if logger := d.Core.Log(); logger != nil {
+		return logger
+	}
+	return log.L()
 }

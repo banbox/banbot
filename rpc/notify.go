@@ -23,6 +23,8 @@ var (
 	rpcInitMu     sync.Mutex
 	rpcStopDone   = closedRPCSignal()
 	rpcJoined     bool
+	rpcName       string
+	rpcWebhook    map[string]map[string]string
 )
 
 func closedRPCSignal() chan struct{} {
@@ -73,6 +75,17 @@ func stopAndJoinChannels(channels []IWebHook) {
 // InitRPC initializes the current RPC session. It is idempotent while the
 // session is open and starts a new generation after Stop or CleanUp.
 func InitRPC() *errs.Error {
+	cfg := config.Data
+	cfg.RPCChannels = config.RPCChannels
+	cfg.Webhook = config.Webhook
+	return InitRPCWithConfig(&cfg, config.Accounts)
+}
+
+// InitRPCWithConfig starts an RPC session from an owned configuration
+// snapshot. The legacy InitRPC wrapper remains for callers that still rely on
+// package configuration, while runtimes can now keep RPC setup isolated from
+// subsequent global configuration changes.
+func InitRPCWithConfig(cfg *config.Config, accounts map[string]*config.AccountConfig) *errs.Error {
 	rpcInitMu.Lock()
 	defer rpcInitMu.Unlock()
 
@@ -100,7 +113,7 @@ func InitRPC() *errs.Error {
 	rpcJoined = false
 	channelsMu.Unlock()
 
-	return initWebHooksForGeneration(generation)
+	return initWebHooksForGeneration(generation, cfg, accounts)
 }
 
 func initWebHooks() *errs.Error {
@@ -167,10 +180,15 @@ func buildChannels(cfg *config.Config, accounts map[string]*config.AccountConfig
 	return newChannels, nil
 }
 
-func initWebHooksForGeneration(generation uint64) *errs.Error {
-	cfg := config.Data
-	cfg.RPCChannels = config.RPCChannels
-	newChannels, err := buildChannels(&cfg, config.Accounts, NewTelegram)
+func initWebHooksForGeneration(generation uint64, cfg *config.Config, accounts map[string]*config.AccountConfig) *errs.Error {
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
+	owned := config.NewSnapshot(cfg).View()
+	if owned == nil {
+		owned = &config.Config{}
+	}
+	newChannels, err := buildChannels(owned, accounts, NewTelegram)
 	if err != nil {
 		return err
 	}
@@ -178,6 +196,8 @@ func initWebHooksForGeneration(generation uint64) *errs.Error {
 	valid := rpcReady && !rpcClosed && rpcGeneration == generation
 	if valid {
 		channels = append(channels, newChannels...)
+		rpcName = owned.Name
+		rpcWebhook = owned.Webhook
 	}
 	channelCount := len(channels)
 	channelsMu.Unlock()
@@ -215,13 +235,16 @@ func SendMsg(msg map[string]interface{}) {
 		return
 	}
 	account := utils.GetMapVal(msg, "account", "")
-	botName := config.Name
+	channelsMu.RLock()
+	botName := rpcName
+	webhook := rpcWebhook
+	channelsMu.RUnlock()
 	if account != "" {
 		botName += "/" + account
 	}
 	msg["name"] = botName
 	msgType := utils.GetMapVal(msg, "type", "")
-	item, ok := config.Webhook[msgType]
+	item, ok := webhook[msgType]
 	if !ok {
 		log.Error(fmt.Sprintf("webhook for %v not found!", msgType))
 		return

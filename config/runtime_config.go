@@ -19,10 +19,7 @@ func LoadRuntimeSnapshot(args *CmdArgs) (*Snapshot, *errs.Error) {
 		return nil, errs.NewMsg(core.ErrBadConfig, "command arguments are required")
 	}
 	input := *args
-	dataDir := input.DataDir
-	if dataDir == "" {
-		dataDir = os.Getenv("BanDataDir")
-	}
+	dataDir := ResolveDataDir(input.DataDir)
 	if dataDir == "" {
 		return nil, errs.NewMsg(core.ErrBadConfig, "runtime data directory is required")
 	}

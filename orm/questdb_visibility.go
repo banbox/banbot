@@ -210,13 +210,26 @@ func waitForQuestCondition(ctx context.Context, timeout, interval time.Duration,
 		if ok {
 			return true, nil
 		}
-		if time.Now().After(deadline) {
+		if !time.Now().Before(deadline) {
 			return false, nil
 		}
+		wait := interval
+		if wait <= 0 {
+			wait = 0
+		} else if deadlineWait := time.Until(deadline); deadlineWait < wait {
+			wait = deadlineWait
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return false, ctx.Err()
-		case <-time.After(interval):
+		case <-timer.C:
 		}
 	}
 }
@@ -312,31 +325,28 @@ func waitForQuestExsymbolVisible(ctx context.Context, q *Queries, sid int32) (*E
 }
 
 func waitForQuestExsymbolTimestampVisible(ctx context.Context, q *Queries, sid int32, want time.Time) error {
-	want = normalizeQuestTimestamp(want)
-	ok, err := questWaitForCondition(ctx, questReadAfterWriteTimeout, questReadAfterWritePollInterval, func() (bool, error) {
-		var maxTS *time.Time
-		if err := q.db.QueryRow(ctx, `SELECT max(ts) FROM exsymbol_q WHERE sid = $1`, sid).Scan(&maxTS); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return false, nil
-			}
-			return false, err
-		}
-		return maxTS != nil && !maxTS.Before(want), nil
-	})
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return errs.NewMsg(core.ErrDbReadFail, "questdb row version not visible before timeout: table=exsymbol_q sid=%d", sid)
-	}
-	return nil
+	return waitForQuestTimestampVisible(ctx, q, `SELECT max(ts) FROM exsymbol_q WHERE sid = $1`, []any{sid}, want,
+		func() error {
+			return errs.NewMsg(core.ErrDbReadFail, "questdb row version not visible before timeout: table=exsymbol_q sid=%d", sid)
+		})
 }
 
 func waitForQuestCalendarTimestampVisible(ctx context.Context, q *Queries, market string, want time.Time) error {
+	return waitForQuestTimestampVisible(ctx, q, `SELECT max(ts) FROM calendars_q WHERE market = $1`, []any{market}, want,
+		func() error {
+			return errs.NewMsg(core.ErrDbReadFail, "questdb row version not visible before timeout: table=calendars_q market=%s", market)
+		})
+}
+
+// waitForQuestTimestampVisible waits for QuestDB's WAL-applied max timestamp.
+// A successful INSERT can be temporarily invisible to a subsequent SELECT, so
+// timeout is reported as a retryable database-read error while query failures
+// and context cancellation are returned unchanged.
+func waitForQuestTimestampVisible(ctx context.Context, q *Queries, query string, args []any, want time.Time, timeoutErr func() error) error {
 	want = normalizeQuestTimestamp(want)
 	ok, err := questWaitForCondition(ctx, questReadAfterWriteTimeout, questReadAfterWritePollInterval, func() (bool, error) {
 		var maxTS *time.Time
-		if err := q.db.QueryRow(ctx, `SELECT max(ts) FROM calendars_q WHERE market = $1`, market).Scan(&maxTS); err != nil {
+		if err := q.db.QueryRow(ctx, query, args...).Scan(&maxTS); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return false, nil
 			}
@@ -348,7 +358,7 @@ func waitForQuestCalendarTimestampVisible(ctx context.Context, q *Queries, marke
 		return err
 	}
 	if !ok {
-		return errs.NewMsg(core.ErrDbReadFail, "questdb row version not visible before timeout: table=calendars_q market=%s", market)
+		return timeoutErr()
 	}
 	return nil
 }

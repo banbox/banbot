@@ -30,6 +30,29 @@ type PutOrderRes struct {
 	Err       *errs.Error
 }
 
+// getExchangeCapability resolves an optional capability from either the
+// adapter itself or the local BotExchange wrapper. Keeping this boundary in
+// one place prevents each capability facade from implementing subtly
+// different nil and wrapper handling.
+func getExchangeCapability[T any](exchange banexg.BanExchange) (T, bool) {
+	var zero T
+	if exchange == nil {
+		return zero, false
+	}
+	if capability, ok := exchange.(T); ok {
+		return capability, true
+	}
+	wrapper, ok := exchange.(*BotExchange)
+	if !ok || wrapper == nil || wrapper.BanExchange == nil {
+		return zero, false
+	}
+	capability, ok := wrapper.BanExchange.(T)
+	if !ok {
+		return zero, false
+	}
+	return capability, true
+}
+
 func (e *BotExchange) CreateOrder(symbol, odType, side string, amount, price float64, params map[string]interface{}) (*banexg.Order, *errs.Error) {
 	order, err := e.BanExchange.CreateOrder(symbol, odType, side, amount, price, params)
 	e.orderCallbackMu.RLock()

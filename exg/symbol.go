@@ -20,20 +20,8 @@ type PriceSymbolParserWithError func(pair string) ([4]string, *errs.Error)
 // GetPriceSymbolCapability unwraps the bot adapter and returns nil when the
 // installed banexg version does not provide this optional capability.
 func GetPriceSymbolCapability(exchange banexg.BanExchange) PriceSymbolCapability {
-	if exchange == nil {
-		return nil
-	}
-	if capability, ok := exchange.(PriceSymbolCapability); ok {
-		return capability
-	}
-	if wrapper, ok := exchange.(*BotExchange); ok {
-		if wrapper == nil || wrapper.BanExchange == nil {
-			return nil
-		}
-		capability, _ := wrapper.BanExchange.(PriceSymbolCapability)
-		return capability
-	}
-	return nil
+	capability, _ := getExchangeCapability[PriceSymbolCapability](exchange)
+	return capability
 }
 
 // NewPriceSymbolParserWithError adapts exchange-owned symbol semantics while

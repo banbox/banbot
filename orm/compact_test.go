@@ -34,12 +34,12 @@ func (s *scriptedCompactDB) Exec(_ context.Context, sql string, _ ...any) (pgcon
 	return pgconn.CommandTag{}, s.execErrAt[idx]
 }
 
-func (s *scriptedCompactDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+func (s *scriptedCompactDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.querySQL = append(s.querySQL, sql)
 	if s.queryRowFn != nil {
-		return s.queryRowFn(sql)
+		return s.queryRowFn(sql, args...)
 	}
 	if len(s.rows) == 0 {
 		return scriptedRow{err: errors.New("unexpected QueryRow")}
@@ -1001,6 +1001,7 @@ func TestCompactMaintenanceReconcilesBeforeReadingMissingSource(t *testing.T) {
 
 func TestReplaceVerifiedCompactTableRestoresBeforeDroppingInvalidActivation(t *testing.T) {
 	installQuestWaitScript(t, 1)
+	installMemoryQuestRewriteIntentStore(t, &memoryQuestRewriteIntentStore{})
 
 	var db *scriptedCompactDB
 	db = &scriptedCompactDB{
@@ -1023,7 +1024,10 @@ func TestReplaceVerifiedCompactTableRestoresBeforeDroppingInvalidActivation(t *t
 			}
 			return newInterfaceRows([][]any{{int32(7), time.UnixMilli(123).UTC(), nil, quality}}), nil
 		},
-		queryRowFn: func(sql string, _ ...any) pgx.Row {
+		queryRowFn: func(sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "FROM tables()") && len(args) == 1 && args[0] != "source" {
+				return countRow(0)
+			}
 			return countRow(1)
 		},
 	}
@@ -1052,6 +1056,7 @@ func TestReplaceVerifiedCompactTableRestoresBeforeDroppingInvalidActivation(t *t
 
 func TestReplaceVerifiedCompactTableRejectsCorruptionAfterAnyRow(t *testing.T) {
 	installQuestWaitScript(t, 1)
+	installMemoryQuestRewriteIntentStore(t, &memoryQuestRewriteIntentStore{})
 	meta := &TableCompactMeta{LatestByKeys: "sid, timeframe", PartitionBy: "DAY"}
 	columns := []questTableColumn{
 		{Name: "sid", Type: "INT", UpsertKey: true},
@@ -1100,7 +1105,10 @@ func TestReplaceVerifiedCompactTableRejectsCorruptionAfterAnyRow(t *testing.T) {
 					stream.valuesCalls = &valuesCalls
 					return stream, nil
 				},
-				queryRowFn: func(string, ...any) pgx.Row {
+				queryRowFn: func(sql string, args ...any) pgx.Row {
+					if strings.Contains(sql, "FROM tables()") && len(args) == 1 && args[0] != "source" {
+						return countRow(0)
+					}
 					return countRow(int64(len(rows)))
 				},
 			}

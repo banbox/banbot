@@ -73,33 +73,27 @@ func RunBTOverOpt(args *config.CmdArgs, snapshot *config.Snapshot, factory Backt
 		if err != nil {
 			return err
 		}
-		deps := bt.RuntimeDependencies()
-		if deps == nil || deps.Trading == nil || deps.Orders == nil {
-			if cleanup != nil {
-				cleanup()
+		err = runWithCleanup(cleanup, func() *errs.Error {
+			deps := bt.RuntimeDependencies()
+			if deps == nil || deps.Trading == nil || deps.Orders == nil {
+				return errs.NewMsg(errs.CodeRunTime, "backtest factory returned incomplete runtime dependencies")
 			}
-			return errs.NewMsg(errs.CodeRunTime, "backtest factory returned incomplete runtime dependencies")
-		}
-		wallets := deps.Trading.Wallet(bt.defaultAccount())
-		if lastWal != nil {
-			wallets.SetWallets(lastWal)
-		}
-		if err = restoreRollingResult(bt, lastRes, lastOrders); err != nil {
-			if cleanup != nil {
-				cleanup()
+			wallets := deps.Trading.Wallet(bt.defaultAccount())
+			if lastWal != nil {
+				wallets.SetWallets(lastWal)
 			}
+			if err := restoreRollingResult(bt, lastRes, lastOrders); err != nil {
+				return err
+			}
+			if err := bt.Run(); err != nil {
+				return err
+			}
+			lastRes, lastOrders = detachRollingResult(bt)
+			lastWal = wallets.DumpAvas()
+			return nil
+		})
+		if err != nil {
 			return err
-		}
-		if err = bt.Run(); err != nil {
-			if cleanup != nil {
-				cleanup()
-			}
-			return err
-		}
-		lastRes, lastOrders = detachRollingResult(bt)
-		lastWal = wallets.DumpAvas()
-		if cleanup != nil {
-			cleanup()
 		}
 		t.curMs += t.runMSecs
 	}
@@ -189,14 +183,9 @@ func RunRollBTPicker(args *config.CmdArgs, snapshot *config.Snapshot, factory Ba
 			if err != nil {
 				return err
 			}
-			if err = bt.Run(); err != nil {
-				if cleanup != nil {
-					cleanup()
-				}
+			err = runWithCleanup(cleanup, bt.Run)
+			if err != nil {
 				return err
-			}
-			if cleanup != nil {
-				cleanup()
 			}
 			score := bt.Score()
 			scores = append(scores, score)
@@ -236,6 +225,19 @@ func RunRollBTPicker(args *config.CmdArgs, snapshot *config.Snapshot, factory Ba
 	}
 	log.Info("Test Pickers finished", zap.String("at", t.outDir))
 	return nil
+}
+
+// runWithCleanup scopes a backtest run to its factory-owned cleanup function.
+// Keeping cleanup in one helper makes every error path release the isolated
+// runtime before the caller advances to the next window.
+func runWithCleanup(cleanup func(), run func() *errs.Error) *errs.Error {
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if run == nil {
+		return errs.NewMsg(errs.CodeRunTime, "backtest run function is required")
+	}
+	return run()
 }
 
 func btOptHash(args *config.CmdArgs, snapshot *config.Snapshot) string {
@@ -1382,46 +1384,59 @@ func parseOptLine(line string) *OptInfo {
 	res.Score = -loss
 	if paraStart >= 0 && paraStart < paraEnd {
 		paramStr := strings.TrimSpace(line[paraStart:paraEnd])
-		if len(paramStr) > 0 {
-			paraArr := strings.Split(paramStr, ",")
-			for _, str := range paraArr {
-				str = strings.TrimSpace(str)
-				if str == "" {
-					continue
-				}
-				arr := strings.SplitN(str, ":", 2)
-				if len(arr) < 2 {
-					continue
-				}
-				res.Params[strings.TrimSpace(arr[0])], _ = strconv.ParseFloat(strings.TrimSpace(arr[1]), 64)
-			}
-		}
+		parseOptParams(paramStr, res.Params)
 	}
 	prefStr := strings.TrimSpace(line[paraEnd:])
-	if len(prefStr) > 0 {
-		prefArr := strings.Split(prefStr, ",")
-		for _, str := range prefArr {
-			str = strings.TrimSpace(str)
-			if str == "" {
-				continue
-			}
-			arr := strings.SplitN(str, ":", 2)
-			if len(arr) < 2 {
-				continue
-			}
-			key, val := strings.TrimSpace(arr[0]), strings.TrimSpace(arr[1])
-			if key == "odNum" {
-				res.OrderNum, _ = strconv.Atoi(val)
-			} else if key == "profit" {
-				res.TotProfitPct, _ = strconv.ParseFloat(val[:len(val)-1], 64)
-			} else if key == "drawDown" {
-				res.ShowDrawDownPct, _ = strconv.ParseFloat(val[:len(val)-1], 64)
-			} else if key == "sharpe" {
-				res.SharpeRatio, _ = strconv.ParseFloat(val, 64)
-			} else if key == "id" {
-				res.ID = val
-			}
+	parseOptMetrics(prefStr, res)
+	return res
+}
+
+// parseOptParams decodes optimization parameters while retaining permissive
+// handling of malformed legacy fields.
+func parseOptParams(paramStr string, params map[string]float64) {
+	if len(paramStr) == 0 {
+		return
+	}
+	for _, item := range strings.Split(paramStr, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		arr := strings.SplitN(item, ":", 2)
+		if len(arr) < 2 {
+			continue
+		}
+		params[strings.TrimSpace(arr[0])], _ = strconv.ParseFloat(strings.TrimSpace(arr[1]), 64)
+	}
+}
+
+// parseOptMetrics decodes the trailing metrics portion of an optimization log
+// line, preserving its historical best-effort conversion semantics.
+func parseOptMetrics(metricStr string, res *OptInfo) {
+	if len(metricStr) == 0 {
+		return
+	}
+	for _, item := range strings.Split(metricStr, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		arr := strings.SplitN(item, ":", 2)
+		if len(arr) < 2 {
+			continue
+		}
+		key, val := strings.TrimSpace(arr[0]), strings.TrimSpace(arr[1])
+		switch key {
+		case "odNum":
+			res.OrderNum, _ = strconv.Atoi(val)
+		case "profit":
+			res.TotProfitPct, _ = strconv.ParseFloat(val[:len(val)-1], 64)
+		case "drawDown":
+			res.ShowDrawDownPct, _ = strconv.ParseFloat(val[:len(val)-1], 64)
+		case "sharpe":
+			res.SharpeRatio, _ = strconv.ParseFloat(val, 64)
+		case "id":
+			res.ID = val
 		}
 	}
-	return res
 }

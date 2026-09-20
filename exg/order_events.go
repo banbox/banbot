@@ -36,20 +36,8 @@ func HasNativeOrderEventCapability(exchange banexg.BanExchange) bool {
 }
 
 func nativeOrderEventCapability(exchange banexg.BanExchange) OrderEventCapability {
-	if exchange == nil {
-		return nil
-	}
-	if capability, ok := exchange.(OrderEventCapability); ok {
-		return capability
-	}
-	if wrapper, ok := exchange.(*BotExchange); ok {
-		if wrapper == nil || wrapper.BanExchange == nil {
-			return nil
-		}
-		capability, _ := wrapper.BanExchange.(OrderEventCapability)
-		return capability
-	}
-	return nil
+	capability, _ := getExchangeCapability[OrderEventCapability](exchange)
+	return capability
 }
 
 // RequireOrderEventCapability makes the live-trading compatibility boundary

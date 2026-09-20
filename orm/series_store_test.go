@@ -26,6 +26,21 @@ type stubStoreRepo struct {
 	coverageEnd   int64
 }
 
+func TestSeriesRecordRoundTripPreservesArbitraryValues(t *testing.T) {
+	info := NewSeriesInfo("funding", "1m", []SeriesField{{Name: "rate", Type: "DOUBLE"}, {Name: "note", Type: "STRING"}})
+	target := &ExSymbol{ID: 17, Symbol: "BTC/USDT"}
+	values := map[string]any{"rate": 0.125, "note": nil, "count": int64(3), "payload": map[string]any{"ok": true}}
+	event := &DataSeries{Sid: target.ID, TimeMS: 100, EndMS: 200, TimeFrame: info.TimeFrame, Values: values, ExSymbol: target}
+	record := SeriesToRecord(event)
+	if record == nil || record.Values["count"] != int64(3) || record.Values["note"] != nil {
+		t.Fatalf("record lost arbitrary values: %#v", record)
+	}
+	got := RecordToSeries(info, target, record)
+	if got == nil || got.Values["payload"].(map[string]any)["ok"] != true {
+		t.Fatalf("series lost arbitrary values: %#v", got)
+	}
+}
+
 func (s *stubStoreRepo) EnsureSeriesTable(ctx context.Context, info *SeriesInfo) *errs.Error {
 	s.ensureCalls++
 	return nil

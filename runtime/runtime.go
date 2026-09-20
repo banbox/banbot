@@ -736,21 +736,22 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	if opts.StartAt != 0 {
 		clock.SetTimeMS(opts.StartAt)
 	}
+	closeCoreOnError := func(err error) (*Runtime, error) {
+		coreState.Close()
+		return nil, err
+	}
 	var allocatorErr error
 	allocator, allocatorErr = p.initSymbolAllocator(storageNamespace, opts.DataDir, sidRegistry)
 	if allocatorErr != nil {
-		coreState.Close()
-		return nil, allocatorErr
+		return closeCoreOnError(allocatorErr)
 	}
 	symbols := orm.NewSymbolStateWithAllocatorAndIdentity(allocator, symbolExchange, symbolMarket)
 	if err := symbols.BindStorage(opts.Storage); err != nil {
-		coreState.Close()
-		return nil, fmt.Errorf("runtime: bind storage: %w", err)
+		return closeCoreOnError(fmt.Errorf("runtime: bind storage: %w", err))
 	}
 	if opts.DataDir != "" {
 		if err := orm.BindExSymbolRecoveryDir(symbols, opts.DataDir); err != nil {
-			coreState.Close()
-			return nil, fmt.Errorf("runtime: bind symbol recovery directory: %w", err)
+			return closeCoreOnError(fmt.Errorf("runtime: bind symbol recovery directory: %w", err))
 		}
 	}
 	if scheduler == nil {
@@ -758,8 +759,7 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	}
 	schedulerClaim, allocatorErr = p.claimScheduler(scheduler, opts.SchedulerBorrowed)
 	if allocatorErr != nil {
-		coreState.Close()
-		return nil, allocatorErr
+		return closeCoreOnError(allocatorErr)
 	}
 	configuredAccounts := map[string]*config.AccountConfig(nil)
 	if opts.Config != nil {

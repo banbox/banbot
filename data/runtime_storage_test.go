@@ -50,6 +50,12 @@ func TestExplicitRuntimeTimeRequiresClock(t *testing.T) {
 	}
 }
 
+func TestExplicitRuntimeLoggerWithoutCoreUsesFallback(t *testing.T) {
+	if logger := (&RuntimeDeps{}).logger(); logger == nil {
+		t.Fatal("runtime logger returned nil without core state")
+	}
+}
+
 func TestExplicitRuntimeIdentityRejectsAdapterMismatch(t *testing.T) {
 	deps := &RuntimeDeps{
 		ExchangeName: "runtime",

@@ -47,19 +47,8 @@ func buildLegacyClientOrderID(_ banexg.BanExchange, exchangeName, namespace stri
 // GetClientOrderCapability unwraps BotExchange and reports the optional
 // adapter-owned client-order formatter, if present.
 func GetClientOrderCapability(exchange banexg.BanExchange) ClientOrderCapability {
-	if exchange == nil {
-		return nil
-	}
-	if capability := banexg.GetClientOrderCapability(exchange); capability != nil {
-		return capability
-	}
-	if wrapper, ok := exchange.(*BotExchange); ok {
-		if wrapper == nil || wrapper.BanExchange == nil {
-			return nil
-		}
-		return banexg.GetClientOrderCapability(wrapper.BanExchange)
-	}
-	return nil
+	capability, _ := getExchangeCapability[ClientOrderCapability](exchange)
+	return capability
 }
 
 func callClientOrderCapability(capability ClientOrderCapability, namespace string, orderID int64, clientID string, randomize bool) (value string, err *errs.Error) {

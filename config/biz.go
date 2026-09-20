@@ -27,7 +27,7 @@ import (
 
 func GetDataDir() string {
 	if DataDir == "" {
-		DataDir = getEnvPath("BanDataDir")
+		DataDir = ResolveDataDir("")
 		if DataDir == "" {
 			panic("env `BanDataDir` or args `-datadir` is required")
 		}
@@ -37,9 +37,28 @@ func GetDataDir() string {
 
 func GetDataDirSafe() string {
 	if DataDir == "" {
-		DataDir = getEnvPath("BanDataDir")
+		DataDir = ResolveDataDir("")
 	}
 	return DataDir
+}
+
+// ResolveDataDir returns an absolute data directory from an explicit value or
+// the BanDataDir environment variable. It does not read or mutate the legacy
+// package-level DataDir, so runtime composition can resolve directories
+// without installing process-wide configuration.
+func ResolveDataDir(explicit string) string {
+	value := strings.TrimSpace(explicit)
+	if value == "" {
+		value = strings.TrimSpace(os.Getenv("BanDataDir"))
+	}
+	if value == "" {
+		return ""
+	}
+	absPath, err := filepath.Abs(value)
+	if err != nil {
+		panic(err)
+	}
+	return strings.TrimSpace(absPath)
 }
 
 func GetLogsDir() string {
