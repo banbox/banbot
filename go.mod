@@ -7,7 +7,7 @@ go 1.24.0
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
 	github.com/banbox/banexg v0.2.64
-	github.com/banbox/banta v0.3.8
+	github.com/banbox/banta v0.4.0
 	github.com/c-bata/goptuna v0.9.0
 	github.com/cloudwego/eino v0.6.0
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.1
@@ -29,6 +29,7 @@ require (
 require (
 	github.com/banbox/bntp v0.1.0
 	github.com/banbox/cron/v3 v3.1.2
+	github.com/fasthttp/websocket v1.5.12
 	github.com/felixge/fgprof v0.9.5
 	github.com/flopp/go-findfont v0.1.0
 	github.com/fogleman/gg v1.3.0
@@ -46,6 +47,7 @@ require (
 	github.com/spf13/pflag v1.0.9
 	golang.org/x/image v0.32.0
 	golang.org/x/sys v0.37.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	modernc.org/sqlite v1.39.1
 )
 
@@ -65,7 +67,6 @@ require (
 	github.com/ebitengine/purego v0.9.0 // indirect
 	github.com/eino-contrib/jsonschema v1.0.2 // indirect
 	github.com/evanphx/json-patch v0.5.2 // indirect
-	github.com/fasthttp/websocket v1.5.12 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.10 // indirect
 	github.com/getkin/kin-openapi v0.118.0 // indirect
@@ -136,7 +137,6 @@ require (
 	golang.org/x/term v0.36.0 // indirect
 	golang.org/x/tools v0.37.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b // indirect
-	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	modernc.org/libc v1.66.10 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

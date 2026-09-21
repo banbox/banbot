@@ -172,10 +172,16 @@ func (o *OrderMgr) backtestNetCost() float64 {
 }
 
 func (o *OrderMgr) accountLeverage() float64 {
+	var leverage float64
 	if o != nil && o.runtimeDeps {
-		return o.runtimeCfg.accountLeverage
+		leverage = o.runtimeCfg.accountLeverage
+	} else {
+		leverage = config.GetAccLeverage(o.Account)
 	}
-	return config.GetAccLeverage(o.Account)
+	if leverage == 0 {
+		return 1 // An omitted leverage must not cause infinite margin requirements.
+	}
+	return leverage
 }
 
 func (o *OrderMgr) takeOverTF(pair, defTF string) string {
@@ -1007,10 +1013,14 @@ func (o *OrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*or
 		var batchEntOrders, batchExtOrders []*ormo.InOutOrder
 		if len(enters) > 0 {
 			rawNum := len(enters)
+			logRejected := o.isLive()
+			for _, req := range enters {
+				logRejected = logRejected || req.Log
+			}
 			var reasons map[string]int
 			enters, reasons = o.allowOrderEnter(exs, job.TimeFrame, enters)
-			if o.isLive() && len(enters) < rawNum {
-				o.Logger().Info("skip enters by allowOrderEnter", zap.Any("tags", reasons))
+			if logRejected && len(enters) < rawNum {
+				o.Logger().Warn("skip enters by allowOrderEnter", zap.Any("tags", reasons))
 			}
 			for _, ent := range enters {
 				iorder, err := o.enterOrder(exs, job.TimeFrame, ent, false)
