@@ -176,7 +176,7 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	}
 }
 ```
-> You can use indicators in any callback function, but please note: **all indicators must be registered and called once in OnBar first**; otherwise, indicator calculations will result in errors.
+> You can use indicators in any callback function, but note that **all indicators must be called unconditionally once in the primary `OnData` handler**; otherwise, indicator calculations may be incorrect.
 
 ## banta: Technical Analysis Library
 The high-performance indicator library [banta](https://github.com/banbox/banta) is used in banbot. It caches the calculation state of indicators for each bar, which is the key to the high performance of banbot. You can visit [DeepWiki](https://deepwiki.com/banbox/banta) to learn more information about banta.
@@ -190,6 +190,8 @@ But it should be noted that only one operating environment `BarEnv` will be crea
 `banta.BarEnv` has several built-in original `Series`, namely: `Open`, `High`, `Low`, `Close`, `Volume`, which respectively save the sequence information of opening price, highest price, lowest price, closing price, and trading volume.
 
 `Series` is a special structure in `banta` for storing serialized data. All technical indicator functions in `banta` receive one or more `Series`, and return a `Series` after calculation.
+
+Current exports also include: `VWMA/VWAP`, `DEMA/T3/TEMA/MAMA/SSF/SWMA/TRIMA/VIDYA/ZLMA`, `DMI/ADX/AROONOSC/DX/SAR/PSAR/Ichimoku/KST`, `StochF/STOCHF/ULTOSC/Fisher/ROCR/TRIX/TSI/DPO/MOM/WilliamsPercent`, `Squeeze/NATR/Supertrend/Donchian/KeltnerChannel/PMAX`, `CMF/ADL/ADOSC/EFI/OBV/VPCI/MFI`, `LinReg/Slope/Correlation/LINEARREG_ANGLE`, `PivotHigh/PivotLow`, and `CDL*` candlestick patterns. Multi-return functions must receive values in the documented order.
 
 You can use `Series.Get(0)` to get the latest value of a series, such as `e.Close.Get(0)` to get the latest closing price;
 You can also use `Series.Range(0,5)` to get the 5 most recent values ​​of a series, which returns a `[]float64` array of length 5.

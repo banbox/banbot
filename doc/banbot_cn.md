@@ -6,16 +6,20 @@
 
 // 核心数据结构
 type Kline struct {
-	Time, Open, High, Low, Close, Volume, Info float64
+	Time int64
+	Open, High, Low, Close, Volume, Quote, BuyVolume float64
+	TradeNum int64
 }
 type BarEnv struct {
 	TimeStart, TimeStop int64
 	Exchange, MarketType, Symbol, TimeFrame string
 	TFMSecs int64 // 周期毫秒间隔
 	BarNum, MaxCache, VNum int
-	Open, High, Low, Close, Volume, Info *Series
-	Data map[string]interface{}
+	Open, High, Low, Close, Volume, Quote, BuyVolume, TradeNum *Series
+	Data sync.Map; Items map[int]*Series; Lock sync.Mutex
 }
+func NewBarEnv(exgName, market, symbol, timeframe string) (*BarEnv, error)
+func ParseTimeFrame(timeframe string) (int, error)
 type Series struct {
 	ID int; Env *BarEnv; Data []float64; Cols []*Series
 	Time int64; More interface{}
@@ -119,6 +123,92 @@ func DV(h, l, c *Series, period, maLen int) *Series // 252,2
 func UTBot(c, atr *Series, rate float64) *Series
 func STC(obj *Series, period, fast, slow int, alpha float64) *Series // 12,26,50,0.5
 func UpDown(obj *Series, vtype int) *Series // vtype: 0=TradingView, 1=classic
+func (s *Series) CrossUp(obj2 interface{}) bool; func (s *Series) CrossDown(obj2 interface{}) bool
+func HLCC4(h,l,c *Series) *Series; func OHLC4(o,h,l,c *Series) *Series
+func Sub(a,b *Series) *Series; func Abs(a *Series) *Series; func Change(a *Series) *Series
+func ADX(high, low, close *Series, period int, smoothing ...int) *Series
+func CCI(obj *Series, args ...interface{}) *Series // close,period 或 high,low,close,period
+func DEMA(obj *Series, period int) *Series
+func T3(obj *Series, period int) *Series
+func SSF(obj *Series, period int) *Series
+func TRIMA(obj *Series, period int) *Series
+func VIDYA(obj *Series, period int) *Series
+func ZLMA(obj *Series, period int) *Series
+func SWMA(obj *Series) *Series
+func MAMA(obj *Series, fast, slow float64) (*Series, *Series) // [MAMA, FAMA]
+func MOM(obj *Series, period int) *Series
+func AO(high, low *Series, fast, slow int) *Series
+func DPO(obj *Series, period int) *Series
+func Dpo(obj *Series, period int) *Series // DPO 别名
+func StochF(high, low, close *Series, period int, smooth ...int) (*Series, *Series) // [fastK, fastD]
+func STOCHF(close, high, low *Series, period int, smooth ...int) (*Series, *Series) // [fastK, fastD]
+func ULTOSC(high, low, close *Series, short, medium, long int) *Series
+func Fisher(high, low *Series, period int) *Series
+func WilliamsPercent(high, low, close *Series, period int) *Series
+func ROCR(obj *Series, period int) *Series
+func TRIX(obj *Series, period int) *Series
+func TSI(obj *Series, short, long int) *Series
+func Squeeze(high, low, close *Series, period int) *Series
+func NATR(high, low, close *Series, period int) *Series
+func Supertrend(high, low, close *Series, period int, multiplier float64) *Series
+func SAR(high, low *Series, step, max float64) *Series
+func PSAR(high, low *Series, step, max float64) *Series // SAR 别名
+func DX(high, low, close *Series, period int) *Series
+func AroonOsc(high, low *Series, period int) *Series
+func AROONOSC(high, low *Series, period int) *Series // AroonOsc 别名
+func Ichimoku(high, low, close *Series, conversion, base, span int) (*Series, *Series, *Series, *Series, *Series) // [conversion, base, spanA, spanB, lagging]
+func KST(obj *Series, r1, r2, r3, r4, s1, s2, s3, s4 int) *Series
+func ADOSC(env *BarEnv, fast, slow int) *Series
+func EFI(env *BarEnv, period int) *Series
+func OBV(close, volume *Series) *Series
+func VPCI(close, volume *Series, period int) *Series
+func Donchian(high, low *Series, period int) (*Series, *Series, *Series) // [upper, middle, lower]
+func DonchianPBand(high, low, close *Series, period int) *Series
+func KeltnerChannel(high, low, close *Series, period int, multiplier float64) (*Series, *Series, *Series) // [upper, middle, lower]
+func KeltnerWBand(high, low, close *Series, period int, mult float64) *Series
+func PMAX(high, low, close *Series, period int, multiplier float64) (*Series, *Series) // [pmax, moving average]
+func Correlation(a, b *Series, period int) *Series
+func Slope(obj *Series, period int) *Series
+func LINEARREG_ANGLE(obj *Series, period int) *Series
+func LinearRegAngle(obj *Series, period int) *Series // LINEARREG_ANGLE 别名
+func PivotHigh(src *Series, left, right int) *Series
+func PivotLow(src *Series, left, right int) *Series
+func WrapFloatArr(res *Series, period int, inVal float64) []float64 // 内部辅助函数
+func CDL3INSIDE(open, high, low, close *Series) *Series
+func CDL3LINESTRIKE(open, high, low, close *Series) *Series
+func CDL3OUTSIDE(open, high, low, close *Series) *Series
+func CDLDRAGONFLYDOJI(open, high, low, close *Series) *Series
+func CDLENGULFING(open, high, low, close *Series) *Series
+func CDLGRAVESTONEDOJI(open, high, low, close *Series) *Series
+func CDLHAMMER(open, high, low, close *Series) *Series
+func CDLHANGINGMAN(open, high, low, close *Series) *Series
+func CDLMORNINGSTAR(open, high, low, close *Series) *Series
+func CDLSHOOTINGSTAR(open, high, low, close *Series) *Series
+func VWMA(price, vol *Series, period int) *Series
+func VWAP(first, second *Series, rest ...*Series) *Series // 2参(close,volume)，4参(high,low,close,volume)；按 replay 段累计，不自动按日重置
+func DMI(high, low, close *Series, period int, smoothing ...int) (*Series, *Series, *Series) // [+DI,-DI,ADX]
+func STOCH(close, high, low *Series, period int) *Series // talib 参数顺序；不要与 Stoch(high,low,close,period) 混用
+func DV2(h, l, c *Series, period, maLen int) *Series
+func STDDEV(obj *Series, period int) *Series // StdDev 别名
+func HL2(h, l *Series) *Series
+func HLC3(h, l, c *Series) *Series
+func SMA(obj *Series, period int) *Series
+func EMA(obj *Series, period int) *Series
+func RMA(obj *Series, period int) *Series
+func WMA(obj *Series, period int) *Series
+func HMA(obj *Series, period int) *Series
+func SMMA(obj *Series, period int) *Series // RMA 别名
+func TEMA(obj *Series, period int) *Series
+func RSI(obj *Series, period int) *Series
+func RSI50(obj *Series, period int) *Series
+func CMO(obj *Series, period int) *Series
+func CMOBy(obj *Series, period, maType int) *Series
+func Highest(obj *Series, period int) *Series
+func Lowest(obj *Series, period int) *Series
+func HighestBar(obj *Series, period int) *Series
+func LowestBar(obj *Series, period int) *Series
+func LinReg(obj *Series, period int) *Series
+func LinRegAdv(obj *Series, period int, angle, intercept, degrees, r, slope, tsf bool) *Series
 // custom indicator example
 func MyExample(obj *Series, period int) *Series {
 	res := obj.To("_example", period) // create new series
@@ -172,10 +262,9 @@ func GetPriceSafeExp(symbol, side string, expMS int64) float64
 ### github.com/banbox/banbot/config
 ```go
 type RunPolicyConfig struct {
-	Name string; Filters []*CommonPairFilter; RunTimeframes []string
-	MaxPair, MaxOpen int; Dirt string; StrtgPerf *StrtgPerfConfig
-	Pairs []string; Params map[string]float64
-	PairParams map[string]map[string]float64
+	Name, TimeFrames string; Filters []*CommonPairFilter; RunTimeframes []string; RefineTF interface{}
+	MaxPair, MaxOpen, MaxSimulOpen, OrderBarMax int; StakeRate float64; Dirt string; StopLoss interface{}; StratPerf *StratPerfConfig
+	Pairs []string; Params map[string]float64; PairParams map[string]map[string]float64; More map[string]interface{}
 	Score float64; Index int
 }
 type DatabaseConfig struct {
@@ -184,6 +273,7 @@ type DatabaseConfig struct {
 	MaxPoolSize int
 	AutoCreate bool
 	DbType string // "questdb" 或 "timescale"；留空时按连接信息自动识别
+	SIDRegistryURL string
 	QdbMemPct float64
 	QdbMaxMemMB int
 }
@@ -192,6 +282,18 @@ func (c *RunPolicyConfig) DefInt(k string, dv int, p *core.Param) int
 ```
 ### github.com/banbox/banbot/orm
 ```go
+type AdjInfo struct {
+	*ExSymbol; Factor, CumFactor float64; StartMS, StopMS int64
+}
+type InfoKline struct { *banexg.PairTFKline; Sid int32; Adj *AdjInfo; IsWarmUp bool }
+type SeriesOHLCV struct {
+	Sid int32; ExSymbol *ExSymbol; Source string; Time, EndMS int64; TimeFrame string
+	Open, High, Low, Close, Volume, Quote, BuyVolume float64; TradeNum int64
+	Adj *AdjInfo; IsWarmUp, Closed bool
+}
+func (s *SeriesOHLCV) Symbol() string
+func (s *SeriesOHLCV) Bar() *banexg.Kline
+func (s *SeriesOHLCV) ToInfoKline() *InfoKline
 type ExSymbol struct {
 	ID int32; Exchange, ExgReal, Market, Symbol string
 	Combined bool; ListMs, DelistMs int64
@@ -212,18 +314,33 @@ type DataRecord struct {
 }
 type DataSeries struct {
 	Source string; Sid int32; TimeMS, EndMS int64; TimeFrame string
-	Closed, IsWarmUp bool; Values map[string]any; ExSymbol *ExSymbol
+	Closed, IsWarmUp bool; Values map[string]any; ExSymbol *ExSymbol; Adj *AdjInfo
 }
+func (evt *DataSeries) CloneWithExSymbol(exs *ExSymbol) *DataSeries
+func (evt *DataSeries) Symbol() string
+func (evt *DataSeries) EnsureExSymbol(extras ...*ExSymbol) *ExSymbol
+func (evt *DataSeries) FloatValue(key string) (float64, error)
+func (evt *DataSeries) FloatValueDefault(key string) (float64, bool)
+func (evt *DataSeries) IntValueDefault(key string) (int64, bool)
+func (evt *DataSeries) OpenValue/HighValue/LowValue/CloseValue/VolumeValue() (float64, error)
+func (evt *DataSeries) QuoteValue/BuyVolumeValue() float64
+func (evt *DataSeries) TradeNumValue() int64
+func (evt *DataSeries) HasOHLCV() bool
+func (evt *DataSeries) OHLCV(extras ...*ExSymbol) (*SeriesOHLCV, error)
 type SeriesFetchFunc func(ctx context.Context, target *ExSymbol, startMS, endMS int64) ([]*DataRecord, error)
 
 func GetExSymbols/GetExSymbolMap(exgName, market string) map[int32/*string*/]*ExSymbol
 func GetSymbolByID(id int32) *ExSymbol
 func GetExSymbolCur(symbol string) (*ExSymbol, *errs.Error)
 func GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.Error)
-func GetExSymbol2(exgName, market, symbol string) *ExSymbol
+func GetExSymbol2(exgName, market, symbol string, exgReal ...string) *ExSymbol
 func GetAllExSymbols() map[int32]*ExSymbol
 func EnsureExSymbol(exchange, market, symbol string, exgReal ...string) (*ExSymbol, error)
 func NewSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
+func DefaultKlineFields() []string
+func NormalizeSeriesFields(source string, fields []string) []string
+func MergeSeriesFields(groups ...[]string) []string
+func ResolveSeriesExSymbol(evt *DataSeries, extras ...*ExSymbol) *ExSymbol
 func DefaultSeriesStore() *SeriesStore
 func (s *SeriesStore) Ensure(ctx context.Context, info *SeriesInfo) *errs.Error
 func (s *SeriesStore) Write(ctx context.Context, info *SeriesInfo, target *ExSymbol, row *DataRecord) *errs.Error
@@ -258,8 +375,10 @@ type DataSource interface {
 }
 type FetchHistoryFunc func(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error)
 type SubscribeLiveFunc func(ctx context.Context, subs []*strat.DataSub, sink DataSink) error
+type DataSourceFactory func() DataSource
 
 func RegisterDataSource(src DataSource) error
+func RegisterDataSourceFactory(name string, factory DataSourceFactory) error
 func RegisterFuncDataSource(info *orm.SeriesInfo, fetch FetchHistoryFunc, subscribe SubscribeLiveFunc) error
 func GetDataSource(name string) DataSource
 func ListDataSources() []string
@@ -280,13 +399,13 @@ type ExitTrigger struct {
 	Tag string // 原因
 }
 type TriggerState struct {
-	*ExitTrigger; Range float64; Hit bool; OrderId string; Old *ExitTrigger
+	*ExitTrigger; Range float64; Hit bool; OrderId, ClientId string; Old *ExitTrigger
 }
 type ExOrder struct {
 	ID, TaskID, InoutID int64; Symbol string; Enter bool
 	OrderType, OrderID, Side string; CreateAt int64
 	Price, Average, Amount, Filled float64; Status int64
-	Fee float64; FeeType string; UpdateAt int64
+	Fee, FeeQuote float64; FeeType string; UpdateAt int64
 }
 type IOrder struct {
 	ID, TaskID int64; Symbol string; Sid int64; Timeframe string
@@ -330,9 +449,12 @@ type TradeStrat struct {
 	StakeRate float64 // 相对基础金额开单倍率
 	StopLoss float64 // 此策略默认止损比率，不带杠杆
 	StopEnterBars int
+	OrderOnRotation string // 品种切换时旧job：close、hold或open
 	EachMaxLong int // max number of long open orders for one pair, -1 for disable
 	EachMaxShort int // max number of short open orders for one pair, -1 for disable
+	TimeFrames string // 逗号分隔的策略时间周期
 	RunTimeFrames []string // 允许运行的时间周期，不提供时使用当前 Runtime 配置快照中的默认周期
+	RefineTF interface{} // 指定撮合周期，如"5m"、"3-6"或5
 	Outputs []string // 策略输出的文本文件内容，每个字符串是一行
 	Policy *config.RunPolicyConfig
 	OnPairInfos func(s *StratJob) []*PairSub
@@ -354,6 +476,7 @@ type TradeStrat struct {
 	PickTimeFrame func(symbol string, tfScores []*core.TfScore) string // 为指定币选择适合的交易周期
 	OnPostApi func(client *core.ApiClient, msg map[string]interface{}, jobs map[string]map[string]*StratJob) error // PostAPI时的策略回调
 	OnShutDown func(s *StratJob) // 机器人停止时回调
+	OnStratExit func() // 策略退出时回调
 }
 
 const ( OdChgNew = iota; OdChgEnter; OdChgEnterFill; OdChgExit; OdChgExitFill )
@@ -395,6 +518,8 @@ func (d *DataFields) Float64(name string) float64
 func (d *DataFields) Int64(name string) int64
 func (d *DataFields) String(name string) string
 func (d *DataFields) Raw(name string) any
+func (d *DataFields) RawValue(name string) (any, bool)
+func (d *DataFields) Has(name string) bool
 type StratJob struct {
 	Strat *TradeStrat
 	Env *ta.BarEnv
@@ -442,6 +567,8 @@ type EnterReq struct {
 	StopLossLimit float64 // 止损限制价格，不提供使用StopLoss
 	StopLossRate float64 // 止损退出比例，0表示全部退出，需介于(0,1]之间
 	StopLossTag string // 止损原因
+	ActivationPrice float64 // 追踪止损激活价格
+	CallbackPct float64 // 追踪止损回调百分比，[0.1, 10]
 	TakeProfitVal float64 // 入场价格到止盈价格的距离，用于计算TakeProfit
 	TakeProfit float64 // 止盈触发价格，不为空时在交易所提交一个止盈单。
 	TakeProfitLimit float64 // 止盈限制价格，不提供使用TakeProfit

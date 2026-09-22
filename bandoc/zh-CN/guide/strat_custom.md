@@ -176,7 +176,7 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	}
 }
 ```
-> 您可在任意回调函数中使用指标，但注意，**所有指标都必须先在OnBar中注册调用一遍**；否则指标计算会出现错误。
+> 您可在任意回调函数中使用指标，但注意，**所有指标都必须先在主周期 `OnData` 处理器中无条件调用一遍**；否则指标计算会出现错误。
 
 ## 技术指标库banta
 banbot使用高性能指标库[banta](https://github.com/banbox/banta)，它会对每个bar的指标计算状态进行缓存，这是banbot高性能的关键，您可访问[DeepWiki](https://deepwiki.com/banbox/banta)了解关于banta的更多信息。
@@ -190,6 +190,8 @@ banbot使用高性能指标库[banta](https://github.com/banbox/banta)，它会�
 `banta.BarEnv`中内置了几个原始的`Series`，即：`Open`,`High`,`Low`,`Close`,`Volume`，分别保存了开盘价、最高价、最低价、收盘价、成交量的序列信息。
 
 `Series`是`banta`中用于存储序列化数据的特殊结构体。`banta`中的所有技术指标函数，都是接收一个或多个`Series`，经过运算后，返回一个`Series`。
+
+当前可用指标还包括：`VWMA/VWAP`、`DEMA/T3/TEMA/MAMA/SSF/SWMA/TRIMA/VIDYA/ZLMA`、`DMI/ADX/AROONOSC/DX/SAR/PSAR/Ichimoku/KST`、`StochF/STOCHF/ULTOSC/Fisher/ROCR/TRIX/TSI/DPO/MOM/WilliamsPercent`、`Squeeze/NATR/Supertrend/Donchian/KeltnerChannel/PMAX`、`CMF/ADL/ADOSC/EFI/OBV/VPCI/MFI`、`LinReg/Slope/Correlation/LINEARREG_ANGLE`、`PivotHigh/PivotLow` 和 `CDL*` K线形态。多返回值函数须按知识库中注明的顺序接收。
 
 您可通过`Series.Get(0)`获取某个序列的最新值，比如`e.Close.Get(0)`获取最新收盘价；
 也可通过`Series.Range(0,5)`获取某个序列最近的5个值，返回长度为5的`[]float64`数组。

@@ -2,7 +2,7 @@ module github.com/banbox/banbot
 
 go 1.24.0
 
-// replace	github.com/banbox/banta => ../banta
+replace github.com/banbox/banta => ../banta
 
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
