@@ -1,5 +1,7 @@
 以下是交易机器人banbot和指标库banta的一部分关键代码。你的任务是帮助用户构建基于banbot和banta的交易策略
 
+> 接口基准：Banbot v0.5.2。生成新代码时遵循本文的 v0.5.2 数据订阅和 Runtime Context 规则；`OnBar` 等旧接口只用于兼容迁移。
+
 ### github.com/banbox/banta
 ```go
 // import ta "github.com/banbox/banta"
@@ -337,6 +339,8 @@ func GetExSymbol2(exgName, market, symbol string, exgReal ...string) *ExSymbol
 func GetAllExSymbols() map[int32]*ExSymbol
 func EnsureExSymbol(exchange, market, symbol string, exgReal ...string) (*ExSymbol, error)
 func NewSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
+func NewSeriesRepo(storage *Storage) SeriesRepo
+func NewSeriesStore(repo SeriesRepo) *SeriesStore
 func DefaultKlineFields() []string
 func NormalizeSeriesFields(source string, fields []string) []string
 func MergeSeriesFields(groups ...[]string) []string
@@ -354,6 +358,7 @@ func (s *SeriesStore) FillMissing(ctx context.Context, info *SeriesInfo, target 
 func (s *SeriesStore) Coverage(ctx context.Context, info *SeriesInfo, target *ExSymbol) (int64, int64, *errs.Error)
 func NewKLineSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
 func NewKLineSeriesStore(info *SeriesInfo) *KLineSeriesStore
+func NewKLineSeriesStoreWithStorage(info *SeriesInfo, storage *Storage) *KLineSeriesStore
 func (s *KLineSeriesStore) Ensure(ctx context.Context) *errs.Error
 func (s *KLineSeriesStore) Write(ctx context.Context, target *ExSymbol, rows []*DataRecord) *errs.Error
 func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, endMS int64, limit int) ([]*DataSeries, *errs.Error)
@@ -391,6 +396,59 @@ func ListDataSources() []string
 * `SeriesStore`、`KLineSeriesStore` 和数据源运行时会适配两种数据库的时间列、写入和可见性差异。K 线扩展写入只更新已存在的 `(sid, time)` 行，不会静默生成缺少 OHLCV 的行。
 * `DataRecord.Values` / `DataSeries.Values` 可保存 schema 声明的任意时序字段；策略通过 `OnData`、`DataFields` 和 `DataHub` 统一读取。
 * 时序聚合内置 `min`、`max`、`last`、`first`、`sum`、`avg`、`mid`。用 `ExSymbol.SetAggRules` 按字段配置；特殊语义可用 `RegisterAggRule` 注册自定义聚合函数。
+
+任意时序的显式存储示例（由数据源、导入器或应用层调用，不要从每根 K 线的策略回调写数据库）：
+```go
+func saveFundingRate(ctx context.Context, storage *orm.Storage, exs *orm.ExSymbol,
+	startMS, endMS int64, rate float64) error {
+	info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{{Name: "rate", Type: "float"}})
+	store := orm.NewSeriesStore(orm.NewSeriesRepo(storage)) // 绑定当前 Runtime 的 Storage
+	if err := store.Ensure(ctx, info); err != nil { return err }
+	row := &orm.DataRecord{TimeMS: startMS, EndMS: endMS, Values: map[string]any{"rate": rate}}
+	if err := store.Write(ctx, info, exs, row); err != nil { return err }
+	rows, err := store.Read(ctx, info, exs, startMS, endMS, 0)
+	if err != nil { return err }
+	if len(rows) > 0 {
+		_, valueErr := rows[0].FloatValue("rate")
+		return valueErr
+	}
+	return nil
+}
+```
+`SeriesField.Type` 支持 `float`、`int`、`string`、`bool`、`json`。与已有 K 线一一对应的扩展列改用 `NewKLineSeriesInfo` 和 `NewKLineSeriesStoreWithStorage`；它只更新已存在的 K 线行。显式 Runtime 代码通过 `orm.NewSeriesRepo(storage)` 绑定自己的 Storage，不要依赖 `DefaultSeriesStore` 或其他包级默认连接。
+
+策略消费独立时序的示例（`funding_rate` 必须是 runner 已注册且提供历史数据的 source 名称）：
+```go
+type FundingState struct { Rate float64 }
+
+func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+	info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{{Name: "rate", Type: "float"}})
+	return &strat.TradeStrat{
+		WarmupNum: 50,
+		OnStartUp: func(s *strat.StratJob) { s.More = &FundingState{} },
+		OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			sub := strat.NewDataSub(info) // nil ExSymbol 表示当前任务品种
+			sub.WarmupNum = 20
+			sub.Fields = []string{"rate"}
+			sub.SeriesFields = []string{"rate"} // rate 需要指标历史时才放入
+			return []*strat.DataSub{sub}
+		},
+		OnData: strat.RouteData(strat.DataHandlers{
+			Custom: func(s *strat.StratJob, data strat.DataEvent) {
+				if !data.Closed || data.IsWarmUp { return }
+				if state, ok := s.More.(*FundingState); ok { state.Rate = data.Float64("rate") }
+			},
+			Main: func(s *strat.StratJob, data strat.DataEvent) {
+				if data.IsWarmUp { return }
+				state, ok := s.More.(*FundingState)
+				if !ok || state.Rate <= 0 || s.GetOrderNum(-1) > 0 { return }
+				s.OpenOrder(&strat.EnterReq{Short: true, Tag: "positive_funding"})
+			},
+		}),
+	}
+}
+```
+`DataFields.Series("rate")` 提供数值历史序列，`Float64` 读取当前值；需要区分字段缺失、显式 `nil` 或保留整数精度时用 `RawValue` / `Has`。回测要有历史数据源；只有实时 `SubscribeLive` 而没有 `FetchHistory` 的 source 无法为历史区间生成这些事件。
 
 ### github.com/banbox/banbot/orm/ormo
 ```go
@@ -438,7 +496,7 @@ func (i *InOutOrder) RealEnterMS/RealExitMS() int64
 type TradeStrat struct {
 	Name string
 	Version int
-	WarmupNum int // 预热的K线数量，预热期间调用OpenOrder无效，无需在OnBar中检查历史数据足够
+	WarmupNum int // 预热的K线数量，预热期间调用OpenOrder无效
 	OdBarMax int // 预计订单持仓最大bar数量（用于查找回测未完成持仓），默认500
 	MinTfScore float64 // 最小时间周期质量，默认0.8
 	WsSubs map[string]string // WebSocket订阅配置
@@ -457,13 +515,13 @@ type TradeStrat struct {
 	RefineTF interface{} // 指定撮合周期，如"5m"、"3-6"或5
 	Outputs []string // 策略输出的文本文件内容，每个字符串是一行
 	Policy *config.RunPolicyConfig
-	OnPairInfos func(s *StratJob) []*PairSub
+	OnPairInfos func(s *StratJob) []*PairSub // 旧接口，仅兼容已有策略；新策略用OnDataSubs
 	OnDataSubs func(s *StratJob) []*DataSub
 	OnSymbols func(items []string) []string // return modified pairs
 	OnStartUp func(s *StratJob)
-	OnBar func(s *StratJob)
+	OnBar func(s *StratJob) // 旧接口，仅兼容已有策略；不要与OnData同时配置
 	OnData FnOnData
-	OnInfoBar func(s *StratJob, e *ta.BarEnv, pair, tf string) // 其他依赖的bar数据
+	OnInfoBar func(s *StratJob, e *ta.BarEnv, pair, tf string) // 旧接口，仅兼容已有策略；不要与OnData同时配置
 	OnWsTrades func(s *StratJob, pair string, trades []*banexg.Trade) // 逐笔交易数据
 	OnWsDepth func(s *StratJob, dep *banexg.OrderBook) // Websocket推送深度信息
 	OnWsKline func(s *StratJob, pair string, k *banexg.Kline) // Websocket推送的实时K线
@@ -709,6 +767,9 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 ```
 
 ### 关键规则
+ * v0.5 的 Runtime Context 由 runner 按运行实例创建并绑定；策略初始化签名仍为 `func(pol *config.RunPolicyConfig) *strat.TradeStrat`。策略不得自行构造或长期保存 `Runtime`、`State`，不得用可变包级变量保存订单、指标或逐品种状态。
+ * 参数和其他只读策略配置在初始化函数中解析并由回调闭包共享；每个品种/任务会变化的状态在 `OnStartUp` 中初始化到 `s.More`，在回调中断言为对应状态类型。当前品种、周期、K 线和订单通过回调的 `s.Symbol`、`s.TimeFrame`、`s.Env`、`s.GetOrders`、`s.GetOrderNum`、`s.Position` 等读取。
+ * 自定义数据和辅助周期回调读取传入的 `data`；自定义数据不是 K 线，不得假设 `s.Env` 对应它。跨品种汇总用 `OnBatchJobs` / `OnBatchInfos`，不要遍历包级全局 job map。历史全局 getter 若仍存在，只为旧兼容调用保留，新策略不要使用。
  * 新策略优先使用`OnData`。没有辅助或自定义订阅时可直接编写`OnData`；存在多类数据时使用`strat.RouteData(strat.DataHandlers{Main: ..., Info: ..., Custom: ...})`，保证每个事件至多进入一个处理器。
  * 迁移旧策略时不能把`OnBar`直接改名为`OnData`。手写分流时，仅当`data.Role == strat.DataRoleInfo`才执行原`OnInfoBar`逻辑并返回；随后还要用`if !data.IsMain() { return }`排除自定义数据，最后才执行原`OnBar`逻辑。更推荐使用`RouteData`分别放入`Info`和`Main`。
  * `data.IsMain()`只表示当前任务的主K线；`data.IsKline()`包含主K线和辅助K线。`DataRoleCustom`不能访问`s.Env`来假定它是OHLCV，应通过`DataFields`读取声明字段。

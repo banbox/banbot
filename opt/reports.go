@@ -376,7 +376,17 @@ func (d *ReportDeps) queries() (*orm.Queries, func(), *errs.Error) {
 		}, nil
 	}
 	if d.Storage != nil {
-		queries, conn, err := d.Storage.Conn(d.context())
+		ctx := d.context()
+		queries, conn, err := d.Storage.Conn(ctx)
+		// Explicit replay report collection runs after the feeder has finished.
+		// Some runtime paths cancel the feeder context before the final report
+		// queries execute, even though the storage is still open. Reacquire with
+		// a bounded process context so a completed local replay can persist its
+		// detail and order evidence instead of failing with DbConnFail/context
+		// canceled. The storage itself is still released by the callback below.
+		if err != nil && ctx != nil && ctx.Err() != nil {
+			queries, conn, err = d.Storage.Conn(context.Background())
+		}
 		if err != nil {
 			return nil, nil, err
 		}

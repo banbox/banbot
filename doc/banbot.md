@@ -1,5 +1,7 @@
 The following is part of the key code for trading bot banbot and indicator library banta. Your task is to help users build trading strategies based on banbot and banta
 
+> API baseline: Banbot v0.5.2. Generate new code using the v0.5.2 data-subscription and Runtime Context rules below; legacy callbacks such as `OnBar` are for compatibility and migration only.
+
 ### github.com/banbox/banta
 ```go
 // import ta "github.com/banbox/banta"
@@ -224,8 +226,8 @@ func MyExample(obj *Series, period int) *Series {
 ```
 ### Key Rules
 * When checking valid data length, you can use `e.Close.Len()`
-* All banta code executes once per K-line. All indicators should be executed unconditionally at the top of the user's `OnBar`, and additional conditional logic can be defined through `if` statements only after indicator calculations are complete
-* Use `Series.To` to create new series: `BarEnv.NewSeries` will unconditionally create new series, which can cause memory leaks when used inside indicators or `OnBar`. `To` internally prioritizes returning existing Series, and only calls `NewSeries` when it doesn't exist.
+* Calculate indicators on every relevant closed event, before branching on the signal. For new strategies, primary-K-line calculations belong in the `OnData` `Main` handler; auxiliary and custom streams use their own `Info` and `Custom` handlers.
+* Use `Series.To` to create new series: `BarEnv.NewSeries` unconditionally creates new series and can grow memory when called repeatedly from indicators or `OnData`. `To` first reuses an existing Series and creates one only when needed.
 * When comparing the closing price Close with HigherHigh or LowerLow, or performing a Cross, a Back(1) should generally be performed first to take the previous value; otherwise, the closing price will always be lower than HigherHigh or higher than LowerLow, and no signal will be triggered.
 
 
@@ -326,6 +328,9 @@ func MergeSeriesFields(groups ...[]string) []string
 func SeriesTableName(name, timeFrame string) string
 func NewSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
 func NewKLineSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
+func NewSeriesRepo(storage *Storage) SeriesRepo
+func NewSeriesStore(repo SeriesRepo) *SeriesStore
+func NewKLineSeriesStoreWithStorage(info *SeriesInfo, storage *Storage) *KLineSeriesStore
 func ResolveSeriesExSymbol(evt *DataSeries, extras ...*ExSymbol) *ExSymbol
 func DefaultSeriesStore() *SeriesStore
 func RegisterAggRule(name string, fn AggRuleFunc) bool
@@ -348,6 +353,67 @@ func RegisterFuncDataSource(info *orm.SeriesInfo, fetch FetchHistoryFunc, subscr
 func GetDataSource(name string) DataSource
 func ListDataSources() []string
 ```
+
+### v0.5.2 arbitrary-series storage and Runtime Context
+
+* TimescaleDB and QuestDB use the same ORM. A `SeriesInfo` declares a stream name, timeframe, and fields (`float`, `int`, `string`, `bool`, or `json`). Use `NewSeriesInfo` / `SeriesStore` for independent timestamps or shapes; use `NewKLineSeriesInfo` / `KLineSeriesStore` for extension fields on existing K-lines. K-line extension writes update existing `(sid, time)` rows and do not create bars without OHLCV.
+* Runtime-owned storage must be explicit: construct a store with `orm.NewSeriesStore(orm.NewSeriesRepo(storage))`, where `storage` belongs to that Runtime. For K-line extensions use `orm.NewKLineSeriesStoreWithStorage(info, storage)`. Do not use `DefaultSeriesStore` or package-level ORM configuration in code owned by an explicit Runtime.
+* A data provider/source owns ingestion and persistence. Register its schema and source with the runner so backtests can fetch history and live runs can subscribe. Strategy code should not issue SQL, perform database writes per candle, invent source names, or register a global source from a strategy factory.
+* When converting strategies, the strategy layer usually needs only a subscription and read path. Create a `DataSub` from a known registered series, return it from `OnDataSubs`, then read events through `OnData` / `DataFields` / `StratJob.Data`. A source without `FetchHistory` cannot feed a historical backtest.
+
+Storage/read example (application or data-provider code; `storage` is supplied by the current Runtime):
+```go
+func saveFundingRate(ctx context.Context, storage *orm.Storage, exs *orm.ExSymbol,
+	startMS, endMS int64, rate float64) error {
+	info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{{Name: "rate", Type: "float"}})
+	store := orm.NewSeriesStore(orm.NewSeriesRepo(storage))
+	if err := store.Ensure(ctx, info); err != nil { return err }
+	row := &orm.DataRecord{TimeMS: startMS, EndMS: endMS, Values: map[string]any{"rate": rate}}
+	if err := store.Write(ctx, info, exs, row); err != nil { return err }
+	rows, err := store.Read(ctx, info, exs, startMS, endMS, 0)
+	if err != nil { return err }
+	if len(rows) > 0 { _, valueErr := rows[0].FloatValue("rate"); return valueErr }
+	return nil
+}
+```
+
+Strategy-side subscription/read example (`funding_rate` must already be a registered historical source):
+```go
+type FundingState struct { Rate float64 }
+
+func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+	info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{{Name: "rate", Type: "float"}})
+	return &strat.TradeStrat{
+		WarmupNum: 50,
+		OnStartUp: func(s *strat.StratJob) { s.More = &FundingState{} },
+		OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			sub := strat.NewDataSub(info) // nil ExSymbol means the current job's symbol
+			sub.WarmupNum = 20
+			sub.Fields = []string{"rate"}
+			sub.SeriesFields = []string{"rate"} // include when numeric history is needed
+			return []*strat.DataSub{sub}
+		},
+		OnData: strat.RouteData(strat.DataHandlers{
+			Custom: func(s *strat.StratJob, data strat.DataEvent) {
+				if !data.Closed || data.IsWarmUp { return }
+				if state, ok := s.More.(*FundingState); ok { state.Rate = data.Float64("rate") }
+			},
+			Main: func(s *strat.StratJob, data strat.DataEvent) {
+				if data.IsWarmUp { return }
+				state, ok := s.More.(*FundingState)
+				if !ok || state.Rate <= 0 || s.GetOrderNum(-1) > 0 { return }
+				s.OpenOrder(&strat.EnterReq{Short: true, Tag: "positive_funding"})
+			},
+		}),
+	}
+}
+```
+`DataFields.Series("rate")` returns numeric history; `Float64` reads the current value. Use `RawValue` / `Has` when missing values, explicit `nil`, or exact integer values matter.
+
+Runtime Context guidance for generated strategy code:
+* The runner creates and binds one Runtime Context per run; the factory signature remains `func(pol *config.RunPolicyConfig) *strat.TradeStrat`. Do not construct or retain a `Runtime` or `State` in a strategy, and do not use mutable package globals for orders, indicators, or per-symbol state.
+* Parse parameters and other read-only settings in the factory and capture them in callback closures. Initialize state that changes for one symbol/job in `OnStartUp` and store it in `s.More`; type-assert it in callbacks. Read the current symbol, timeframe, K-lines, and orders from `s.Symbol`, `s.TimeFrame`, `s.Env`, `s.GetOrders`, `s.GetOrderNum`, and `s.Position`.
+* Read auxiliary/custom streams from the `data` event. Custom data is not a K-line; do not assume `s.Env` describes it. Use `OnBatchJobs` / `OnBatchInfos` for cross-symbol aggregation instead of iterating package-level job maps. Historical global getters may remain for compatibility; new strategies must not use them.
 
 ### Current custom-series strategy contracts
 ```go
@@ -427,7 +493,7 @@ func (i *InOutOrder) RealEnterMS/RealExitMS() int64
 type TradeStrat struct {
 	Name string
 	Version int
-	WarmupNum int // Number of K-lines for warmup, calling OpenOrder during warmup period is ineffective, no need to check sufficient historical data in OnBar
+	WarmupNum int // Number of K-lines for warmup; OpenOrder calls during warmup are ignored
 	OdBarMax int // Expected maximum bar count for order holding (used to find incomplete positions in backtesting), default 500
 	MinTfScore float64 // Minimum timeframe quality, default 0.8
 	WsSubs map[string]string // WebSocket subscription configuration
@@ -446,13 +512,13 @@ type TradeStrat struct {
 	RefineTF interface{} // matching timeframe selector, e.g. "5m", "3-6", or 5
 	Outputs []string // Text file content output by strategy, each string is a line
 	Policy *config.RunPolicyConfig
-	OnPairInfos func(s *StratJob) []*PairSub
+	OnPairInfos func(s *StratJob) []*PairSub // legacy compatibility API; new strategies use OnDataSubs
 	OnDataSubs func(s *StratJob) []*DataSub
 	OnSymbols func(items []string) []string // return modified pairs
 	OnStartUp func(s *StratJob)
-	OnBar func(s *StratJob)
+	OnBar func(s *StratJob) // legacy compatibility API; do not combine with OnData
 	OnData FnOnData
-	OnInfoBar func(s *StratJob, e *ta.BarEnv, pair, tf string) // Other dependent bar data
+	OnInfoBar func(s *StratJob, e *ta.BarEnv, pair, tf string) // legacy compatibility API; do not combine with OnData
 	OnWsTrades func(s *StratJob, pair string, trades []*banexg.Trade) // Tick-by-tick trade data
 	OnWsDepth func(s *StratJob, dep *banexg.OrderBook) // Websocket pushed depth information
 	OnWsKline func(s *StratJob, pair string, k *banexg.Kline) // Real-time K-line pushed by Websocket
@@ -606,11 +672,18 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 			// goLong, atrBase are variables that differ for each pair and will be updated, need to be recorded in More
 			s.More = &SmaOf2{goLong: false, atrBase: 1}
 		},
-		OnPairInfos: func(s *strat.StratJob) []*strat.PairSub {
-			// Only pass in OnPairInfos when multiple timeframes are required. For example, if the current primary timeframe is 15 minutes, you may also need 1 hour as a reference.
-			return []*strat.PairSub{{"_cur_", "1h", 50}}
+		OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+			// Subscribe to 1h K-lines in addition to the primary timeframe.
+			return []*strat.DataSub{{Source: "kline", TimeFrame: "1h", WarmupNum: 50}}
 		},
-		OnBar: func(s *strat.StratJob) {
+		OnData: strat.RouteData(strat.DataHandlers{
+			Info: func(s *strat.StratJob, data strat.DataEvent) {
+				// Store the 1h signal in this job's state for the main handler.
+				m, _ := s.More.(*SmaOf2)
+				closeSeries := data.Series("close")
+				m.goLong = ta.EMA(closeSeries, 20).Get(0) > ta.EMA(closeSeries, 25).Get(0)
+			},
+			Main: func(s *strat.StratJob, _ strat.DataEvent) {
 			e := s.Env; m, _ := s.More.(*SmaOf2)
 			c := e.Close.Get(0)
 			atr := ta.ATR(e.High, e.Low, e.Close, lenAtr)
@@ -621,19 +694,13 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 			maCross := ma5.Cross(ma20) // 1 for upward cross, -1 for downward cross, 0 for overlap or unknown, abs(maCross)-1 represents cross distance
 			// Don't repeatedly define maCrossUnder = ma20.Cross(ma50), should directly use maCross == -1
 			sma := ma20.Get(0)
-			if maCross == 1 && m.goLong && sma-c > atrBase*longRate && s.OrderNum == 0 {
+			if maCross == 1 && m.goLong && sma-c > atrBase*longRate && s.GetOrderNum(0) == 0 {
 				s.OpenOrder(&strat.EnterReq{Tag: "long"})
 			} else if maCross == -1 && !m.goLong && c-sma > atrBase*shortRate {
 				s.CloseOrders(&strat.ExitReq{Tag: "short"})
 			}
-		},
-		OnInfoBar: func(s *strat.StratJob, e *ta.BarEnv, pair, tf string) {
-			// Process data of a large timeframe of 1h and store the calculation results in `s.More` for use in `OnBar`
-			m, _ := s.More.(*SmaOf2)
-			emaFast := ta.EMA(e.Close, 20).Get(0)
-			emaSlow := ta.EMA(e.Close, 25).Get(0)
-			m.goLong = emaFast > emaSlow
-		},
+			},
+		}),
 		OnCheckExit: func(s *strat.StratJob, od *ormo.InOutOrder) *strat.ExitReq {
 			m, _ := s.More.(*SmaOf2)
 			holdNum := int((s.Env.TimeStop - od.EnterAt) / s.Env.TFMSecs)
@@ -657,17 +724,18 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 ```
 
 ### Key Rules
- * Most strategies only need `WarmupNum` and `OnBar`, do not add extra functions and logic unless necessary
- * In `OnBar`, you can call `OpenOrder` and `CloseOrders` one or more times for entry and exit. If you need to limit the maximum number of long or short orders, you can set `EachMaxLong` and `EachMaxShort` of `TradeStrat`. Setting to 1 means maximum 1 order, default 0 means no limit
+ * New strategies use `OnData`; do not combine it with legacy `OnBar` or `OnInfoBar`. Use `strat.RouteData(strat.DataHandlers{Main: ..., Info: ..., Custom: ...})` when the strategy consumes multiple data roles.
+ * Put primary-K-line order logic in the `Main` handler. Read auxiliary/custom inputs from their `data` event; custom data is not an OHLCV bar. Call `OpenOrder` and `CloseOrders` from the intended handler, and use `EachMaxLong` / `EachMaxShort` to limit concurrent orders per symbol.
+ * Do not migrate a legacy strategy by just renaming `OnBar` to `OnData`; route `DataRoleMain`, `DataRoleInfo`, and `DataRoleCustom` explicitly.
  * banbot will use the strategy initialization function `func(pol \*config.RunPolicyConfig) \*strat.TradeStrat` to create a strategy task `*strat.StratJob` for each symbol;
- * Some fixed unchanging information can generally be defined directly in the strategy initialization function (such as parameters parsed from pol), and then can be used directly in `OnBar/OnInfoBar` and other functions. For variable information that differs for each symbol, it should be recorded in `*strat.StratJob.More`.
+ * Read-only settings parsed in the strategy factory may be captured by the `OnData` callbacks. Mutable per-job state shared between handlers belongs in `*strat.StratJob.More`, initialized in `OnStartUp`.
  * If you need automatic stop loss after order profit, from maximum profit drawdown to a certain extent, you can set `DrawDownExit` to `true`, then pass in `GetDrawDownExitRate` function: `func(s *StratJob, od *ormo.InOutOrder, maxChg float64) float64`, returning 0 means no stop loss, returning 0.5 means stop loss at 50% drawdown from maximum profit. The maxChg parameter is the maximum profit of the order, such as 0.1 means long order price increase of 10% or short order price decrease of 10%
- * The strategy's trading timeframe TimeFrame is generally set in external yaml, no need to set in code. If you need other timeframes besides the one currently used by the strategy, you can return the required symbol code, timeframe, and warmup count in `OnPairInfos`. `_cur_` represents the current symbol. All other symbols and other timeframes need to be handled in `OnInfoBar` callbacks
+ * Configure the primary timeframe in YAML. Return additional symbols, K-line timeframes, or custom series from `OnDataSubs`; handle auxiliary K-lines in `RouteData.Info` and custom series in `RouteData.Custom`. `OnPairInfos` / `OnInfoBar` are legacy compatibility interfaces.
  * Note that hyperparameters parsed through `RunPolicyConfig` are fixed, unchanging, read-only, and can be directly shared by all `StratJobs` of this strategy, so do not save hyperparameters to structs, and especially do not save to `StratJob.More`. More should only record variables that differ for each symbol.
  * If you need to handle exit logic for each order individually on each bar, you can pass in `OnCheckExit` function, returning a non-`nil` `ExitReq` means closing this order;
- * `StratJob.More` is only used to store information that differs for each symbol, needs to be updated, and needs to be synchronized across multiple callback functions (such as indicators from other timeframes in `OnInfoBar` used in `OnBar`). In this case, you should implement the `OnStartUp` function and initialize `More` in it; if it's symbol-independent, define it directly before return and use it anywhere (such as parsed hyperparameter variables); if it's read-only, write it directly near the usage location.
+ * Use `StratJob.More` only for mutable per-job state shared between handlers (such as an auxiliary-timeframe signal read by the main handler). Initialize it in `OnStartUp`; capture immutable parameters in the factory closure.
  * To calculate the number of bars an order has been held, you can use `holdNum := s.Env.BarCount(od.EnterAt)`
- * Note that in most cases, you can implement unified exit logic directly in `OnBar` without needing to set exit logic for each order through `OnCheckExit`.
+ * In most cases, unified exit logic can live in the `OnData` `Main` handler; use `OnCheckExit` only when each order needs separate exit logic.
  * If you need to be notified when order status changes, you can pass in `OnOrderChange` function, where chgType indicates the order event type, possible values: `strat.OdChgNew, strat.OdChgEnter, strat.OdChgEnterFill, strat.OdChgExit, strat.OdChgExitFill`
  * Order stop loss can be passed in when calling `OpenOrder`, you can set `StopLoss/TakeProfit` to a certain stop loss/take profit price, but it's more recommended to use `StopLossVal/TakeProfitVal`, which represents the price range for take profit/stop loss (note this is not a ratio), it can automatically calculate the corresponding stop loss/take profit price based on whether `Short` is long/short and the current latest price. For example `{Short: true, StopLossVal:atr\*2}` means opening a short order with 2x atr stop loss. Or `{StopLossVal:price\*0.01}` means using 1% of price for stop loss.
  * The number of orders (fiat currency amount) for a single order is configured in the external yaml. It generally does not need to be set in the golang code. If you need to use a non-default order amount for a certain order, you can set the `CostRate` of `EnterReq`, which defaults to 1. Passing 0.5 means using 50% of the usual amount to open the order.
