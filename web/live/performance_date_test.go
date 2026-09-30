@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/runtime"
 )
 
 func TestPerformanceDateUsesRuntimeLocation(t *testing.T) {
@@ -27,7 +27,14 @@ stake_currency: [USDT]
 	if err != nil {
 		t.Fatal(err)
 	}
-	handlers := newAPIHandlers(&biz.RuntimeDeps{Config: snapshot})
+	process := runtime.NewProcess()
+	t.Cleanup(process.Close)
+	rt, createErr := process.NewRuntime(runtime.Options{Config: snapshot.View(), DisplayLocation: snapshot.Location()})
+	if createErr != nil {
+		t.Fatal(createErr)
+	}
+	deps := rt.BizDeps()
+	handlers := newAPIHandlers(&deps)
 	timestamp := time.Date(2026, 9, 30, 23, 0, 0, 0, time.UTC).UnixMilli()
 	for format, expected := range map[string]string{"2006-01": "2026-10", "2006-01-02": "2026-10-01"} {
 		if got := handlers.performanceDate(timestamp, format); got != expected {

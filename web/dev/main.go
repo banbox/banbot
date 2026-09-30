@@ -12,6 +12,7 @@ import (
 	"github.com/banbox/banbot/web/ui"
 	"github.com/gofiber/fiber/v2/middleware/basicauth"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 
 	"github.com/banbox/banbot/web/base"
 	"github.com/gofiber/fiber/v2"
@@ -112,7 +113,7 @@ func runWebWithFactory(ag *CmdArgs, factory ServerFactory) error {
 	}
 	server.startBtTaskScheduler()
 
-	app := fiber.New(fiber.Config{AppName: "banbot", ErrorHandler: base.ErrHandler, JSONEncoder: utils2.Marshal})
+	app := newWebApp()
 	app.Use(cors.New(cors.Config{AllowOrigins: "*"}))
 	if ag.Password != "" {
 		app.Use(basicauth.New(basicauth.Config{Users: map[string]string{"banbot": ag.Password}, Realm: "BanBot WebUI"}))
@@ -123,10 +124,24 @@ func runWebWithFactory(ag *CmdArgs, factory ServerFactory) error {
 	defer func() { hub.Close(); hub.Join() }()
 	base.RegApiWebsocketWithHub(app.Group("/api/ws"), hub)
 	server.RegAPI(app.Group("/api/dev"))
-	if err := ui.ServeStatic(app); err != nil {
+	if err := server.serveStatic(app); err != nil {
 		return err
 	}
 	return listenWithContext(server.ctx, app, fmt.Sprintf("%s:%v", ag.Host, ag.Port))
+}
+
+func newWebApp() *fiber.App {
+	app := fiber.New(fiber.Config{AppName: "banbot", ErrorHandler: base.ErrHandler, JSONEncoder: utils2.Marshal})
+	app.Use(recover.New())
+	return app
+}
+
+func (server *DevServer) serveStatic(app *fiber.App) error {
+	sysLang := ""
+	if server.Data.Core != nil {
+		sysLang = server.Data.Core.SysLang
+	}
+	return ui.ServeStaticAt(app, server.DataDir(), sysLang)
 }
 
 func listenWithContext(ctx context.Context, app *fiber.App, address string) error {

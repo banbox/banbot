@@ -22,8 +22,11 @@ func NewSnapshot(cfg *Config) *Snapshot {
 // NewSnapshotWithDirs creates an owned configuration snapshot with explicit
 // filesystem roots. Empty directories remain empty; this constructor never
 // reads the legacy package-level directory variables.
-func NewSnapshotWithDirs(cfg *Config, dataDir, strategyDir string) *Snapshot {
+func NewSnapshotWithDirs(cfg *Config, dataDir, strategyDir string, locations ...*time.Location) *Snapshot {
 	snapshot := &Snapshot{DataDir: dataDir, StrategyDir: strategyDir}
+	if len(locations) > 0 {
+		snapshot.location = locations[0]
+	}
 	if cfg == nil {
 		return snapshot
 	}

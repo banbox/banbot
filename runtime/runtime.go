@@ -22,6 +22,7 @@ import (
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/rpc"
 	"github.com/banbox/banbot/strat"
+	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"go.uber.org/zap"
 )
@@ -591,7 +592,7 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 
 	runtimeOrdinal := p.nextID.Add(1)
 	contractTypeExplicit := opts.ContractType != ""
-	snapshot := config.NewSnapshotWithDirs(opts.Config, opts.DataDir, opts.StrategyDir)
+	snapshot := config.NewSnapshotWithDirs(opts.Config, opts.DataDir, opts.StrategyDir, opts.DisplayLocation)
 	snapshotConfig := snapshot.View()
 	if snapshotConfig != nil {
 		if opts.ExchangeName == "" && snapshotConfig.Exchange != nil {
@@ -719,6 +720,7 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	coreState.SetRunMode(opts.Mode)
 	coreState.SetRunEnv(opts.Env)
 	coreState.StartAt = opts.StartAt
+	coreState.SysLang = utils.GetSystemLanguage()
 	coreState.ExgName = opts.ExchangeName
 	coreState.Market = opts.Market
 	coreState.ContractType = opts.ContractType

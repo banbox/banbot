@@ -276,7 +276,7 @@ func (s *explicitEntrySession) spiderExchangeFactory(snapshot *config.Snapshot, 
 			return nil, errs.NewMsg(core.ErrBadConfig, "exchange config is required")
 		}
 		cfg.Exchange.Name, cfg.MarketType = exchangeName, market
-		childSnapshot := config.NewSnapshotWithDirs(cfg, snapshot.DataDir, snapshot.StrategyDir)
+		childSnapshot := config.NewSnapshotWithDirs(cfg, snapshot.DataDir, snapshot.StrategyDir, snapshot.Location())
 		exchange, err := exg.NewForRuntime(childSnapshot, s.netDisable)
 		if err != nil {
 			return nil, err
@@ -337,7 +337,7 @@ func runExplicitBackTest(args *config.CmdArgs) *errs.Error {
 			session.logger.Info("start backtest", zap.Int("id", i+1), zap.String("name", policy.Name))
 			policyCfg := cfg.Clone()
 			policyCfg.RunPolicy = []*config.RunPolicyConfig{policy.Clone()}
-			policySnapshot := config.NewSnapshotWithDirs(policyCfg, snapshot.DataDir, snapshot.StrategyDir)
+			policySnapshot := config.NewSnapshotWithDirs(policyCfg, snapshot.DataDir, snapshot.StrategyDir, snapshot.Location())
 			policyOut := filepath.Join(outPath, fmt.Sprintf("policy_%d", i+1))
 			policyOut, runErr := runExplicitBackTestOnce(session, policySnapshot, policyOut, "")
 			if runErr != nil {

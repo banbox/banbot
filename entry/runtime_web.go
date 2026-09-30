@@ -112,7 +112,7 @@ func newDevChildRuntime(session *explicitEntrySession, parent *config.Snapshot, 
 		return nil, nil, errs.NewMsg(core.ErrBadConfig, "exchange config is required")
 	}
 	normalizeDevChildConfig(cfg, name, market)
-	snapshot := config.NewSnapshotWithDirs(cfg, parent.DataDir, parent.StrategyDir)
+	snapshot := config.NewSnapshotWithDirs(cfg, parent.DataDir, parent.StrategyDir, parent.Location())
 	exchange, err := exchangeFor(name, market)
 	if err != nil {
 		return nil, nil, err

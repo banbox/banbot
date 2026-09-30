@@ -40,6 +40,7 @@ var (
 	regHolds, _  = regexp.Compile("[{]([^}]+)[}]")
 	dockerStatus = 0
 	langCache    = ""
+	langCacheMu  sync.Mutex
 )
 
 /*
@@ -401,6 +402,8 @@ Possible return values (ISO 639-1 with optional ISO 3166-1 country code):
 ...
 */
 func GetSystemLanguage() string {
+	langCacheMu.Lock()
+	defer langCacheMu.Unlock()
 	if langCache != "" {
 		return langCache
 	}
