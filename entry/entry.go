@@ -220,7 +220,7 @@ func RunSpiderWith(args *config.CmdArgs, startup data.SpiderStartupFunc) *errs.E
 }
 
 func runSpiderWith(args *config.CmdArgs, startup data.SpiderStartupFunc) *errs.Error {
-	session, snapshot, err := openExplicitEntrySession(args)
+	session, snapshot, err := openExplicitEntrySession(args, "spider")
 	if err != nil {
 		return err
 	}

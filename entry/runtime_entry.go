@@ -42,7 +42,7 @@ type explicitEntrySession struct {
 	profileStop    func()
 }
 
-func openExplicitEntrySession(args *config.CmdArgs) (*explicitEntrySession, *config.Snapshot, *errs.Error) {
+func openExplicitEntrySession(args *config.CmdArgs, commands ...string) (*explicitEntrySession, *config.Snapshot, *errs.Error) {
 	if args == nil {
 		return nil, nil, errs.NewMsg(core.ErrBadConfig, "command arguments are required")
 	}
@@ -54,10 +54,7 @@ func openExplicitEntrySession(args *config.CmdArgs) (*explicitEntrySession, *con
 	if cfg == nil || cfg.Database == nil {
 		return nil, nil, errs.NewMsg(core.ErrBadConfig, "database config is required")
 	}
-	logArgs := *args
-	if logArgs.Logfile != "" {
-		logArgs.Logfile = snapshot.ParsePath(logArgs.Logfile)
-	}
+	logArgs := runtimeLogArgs(*args, snapshot, commands...)
 	logger, closeLogger, logErr := openEntryLogger(logArgs)
 	if logErr != nil {
 		return nil, nil, logErr
@@ -261,6 +258,7 @@ func (s *explicitEntrySession) newStorageRuntime(snapshot *config.Snapshot, mode
 	if err != nil {
 		return nil, errs.New(errs.CodeRunTime, err)
 	}
+	rt.Core.LogFile = s.logArgs.Logfile
 	return rt, nil
 }
 
@@ -415,7 +413,7 @@ func runExplicitBackTestOnce(session *explicitEntrySession, snapshot *config.Sna
 }
 
 func runExplicitTrade(args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *errs.Error {
-	session, snapshot, err := openExplicitEntrySession(args)
+	session, snapshot, err := openExplicitEntrySession(args, "trade")
 	if err != nil {
 		return err
 	}

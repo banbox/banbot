@@ -1,7 +1,9 @@
 package entry
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -11,6 +13,19 @@ import (
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
+
+func runtimeLogArgs(args config.CmdArgs, snapshot *config.Snapshot, commands ...string) config.CmdArgs {
+	if args.Logfile != "" {
+		args.Logfile = snapshot.ParsePath(args.Logfile)
+	} else if len(commands) > 0 {
+		name := filepath.Base(snapshot.View().Name)
+		if name == "." || name == string(filepath.Separator) {
+			name = "banbot"
+		}
+		args.Logfile = filepath.Join(snapshot.DataDir, "logs", fmt.Sprintf("%s-%s-%d.log", name, commands[0], os.Getpid()))
+	}
+	return args
+}
 
 // openEntryLogger owns only this command's outputs. banexg.InitLogger also
 // replaces its process-level loggers, so use the explicit writer constructor.

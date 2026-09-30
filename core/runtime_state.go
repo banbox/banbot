@@ -35,6 +35,7 @@ var legacyFlagsMu sync.RWMutex
 type State struct {
 	// Logger is bound before execution and never installed globally.
 	Logger       *zap.Logger
+	LogFile      string
 	RunMode      string
 	RunEnv       string
 	StartAt      int64

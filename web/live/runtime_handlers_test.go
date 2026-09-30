@@ -3,8 +3,11 @@ package live
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -16,6 +19,45 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/gofiber/fiber/v2"
 )
+
+func TestRuntimeLogAPIUsesOwnedFile(t *testing.T) {
+	first, second := testHandlerDeps(t), testHandlerDeps(t)
+	for index, deps := range []*biz.RuntimeDeps{first, second} {
+		content := fmt.Sprintf("runtime-log-%d", index)
+		deps.Core.LogFile = filepath.Join(t.TempDir(), "owned.log")
+		if err := os.WriteFile(deps.Core.LogFile, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		app := fiber.New()
+		app.Get("/log", newAPIHandlers(deps).getLog)
+		response, err := app.Test(httptest.NewRequest(http.MethodGet, "/log?end=-1&limit=20480", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result struct {
+			Data string `json:"data"`
+		}
+		err = json.NewDecoder(response.Body).Decode(&result)
+		response.Body.Close()
+		if err != nil || response.StatusCode != http.StatusOK || result.Data != content {
+			t.Fatalf("runtime log response = %+v, status %d, error %v", result, response.StatusCode, err)
+		}
+		deps.Core.LogFile = ""
+		response, err = app.Test(httptest.NewRequest(http.MethodGet, "/log", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var missing struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+		}
+		err = json.NewDecoder(response.Body).Decode(&missing)
+		response.Body.Close()
+		if err != nil || missing.Code != 400 || missing.Msg != "no log file" {
+			t.Fatalf("missing log response: %+v, %v", missing, err)
+		}
+	}
+}
 
 func TestRegApiBizLegacyRegistersRoutes(t *testing.T) {
 	app := fiber.New()

@@ -1290,6 +1290,9 @@ func (h *apiHandlers) getLog(c *fiber.Ctx) error {
 		return err_
 	}
 	logFile := log.LogFilePath()
+	if h.runtime() {
+		logFile = h.deps.Core.LogFile
+	}
 	if logFile == "" {
 		return c.JSON(fiber.Map{"code": 400, "msg": "no log file"})
 	}

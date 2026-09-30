@@ -13,7 +13,7 @@ import (
 func TestExplicitEntryRuntimePreservesSnapshotLocation(t *testing.T) {
 	process := runtime.NewProcess()
 	t.Cleanup(process.Close)
-	session := &explicitEntrySession{process: process, ctx: context.Background()}
+	session := &explicitEntrySession{process: process, ctx: context.Background(), logArgs: config.CmdArgs{Logfile: "owned.log"}}
 	location := time.FixedZone("entry-display", -5*60*60)
 	snapshot := config.NewSnapshotWithDirs(&config.Config{Env: core.RunEnvDryRun}, t.TempDir(), "", location)
 	for _, mode := range []string{core.RunModeLive, core.RunModeBackTest, core.RunModeData} {
@@ -23,6 +23,9 @@ func TestExplicitEntryRuntimePreservesSnapshotLocation(t *testing.T) {
 		}
 		if rt.Config.Location() != location {
 			t.Fatalf("%s entry lost display location: %v", mode, rt.Config.Location())
+		}
+		if rt.Core.LogFile != session.logArgs.Logfile {
+			t.Fatalf("%s entry lost log file: %q", mode, rt.Core.LogFile)
 		}
 	}
 }
