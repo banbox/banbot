@@ -66,6 +66,39 @@ func TestBTResultGroupMetricsUseReportDeps(t *testing.T) {
 	}
 }
 
+func TestBTResultGroupByPairsBreaksSharpeTiesBySymbol(t *testing.T) {
+	previousMeasure := calcMeasureByOrdersFn
+	t.Cleanup(func() { calcMeasureByOrdersFn = previousMeasure })
+	calcMeasureByOrdersFn = func(orders []*ormo.InOutOrder, _ *ReportDeps) (float64, float64, *errs.Error) {
+		if orders[0].Symbol == "Z/USDT" {
+			return 1, 0, nil
+		}
+		return 0, 0, nil
+	}
+
+	orders := make([]*ormo.InOutOrder, 0, 5)
+	for _, symbol := range []string{"D/USDT", "C/USDT", "B/USDT", "A/USDT", "Z/USDT"} {
+		orders = append(orders, &ormo.InOutOrder{
+			IOrder: &ormo.IOrder{Symbol: symbol, Leverage: 1},
+			Enter:  &ormo.ExOrder{Filled: 1, Average: 1},
+		})
+	}
+
+	for run := 0; run < 20; run++ {
+		result := &BTResult{}
+		if err := result.groupByPairs(orders); err != nil {
+			t.Fatal(err)
+		}
+		var titles []string
+		for _, group := range result.PairGrps {
+			titles = append(titles, group.Title)
+		}
+		if got, want := strings.Join(titles, ","), "Z/USDT,A/USDT,B/USDT,C/USDT,D/USDT"; got != want {
+			t.Fatalf("run %d pair order = %q, want %q", run, got, want)
+		}
+	}
+}
+
 func TestLogStateUsesMonotonicEventTimeForPlots(t *testing.T) {
 	const (
 		startMS  = int64(1700000000000)

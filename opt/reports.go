@@ -897,7 +897,10 @@ func (r *BTResult) groupByPairs(orders []*ormo.InOutOrder) *errs.Error {
 		return err
 	}
 	sort.Slice(groups, func(i, j int) bool {
-		return groups[i].Sharpe > groups[j].Sharpe
+		if groups[i].Sharpe != groups[j].Sharpe {
+			return groups[i].Sharpe > groups[j].Sharpe
+		}
+		return groups[i].Title < groups[j].Title
 	})
 	r.PairGrps = groups
 	return nil
