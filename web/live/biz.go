@@ -1030,6 +1030,13 @@ type GroupItem struct {
 	Orders    []*ormo.InOutOrder `json:"-"`
 }
 
+func (h *apiHandlers) performanceDate(timestamp int64, format string) string {
+	if h.deps != nil {
+		return btime.ToTime(timestamp).In(h.deps.Config.Location()).Format(format)
+	}
+	return btime.ToDateStrLoc(timestamp, format)
+}
+
 func (h *apiHandlers) getPerformance(c *fiber.Ctx) error {
 	type PerfArgs struct {
 		GroupBy   string   `query:"groupBy"`
@@ -1059,6 +1066,7 @@ func (h *apiHandlers) getPerformance(c *fiber.Ctx) error {
 		if err != nil {
 			return err
 		}
+		formatDate := h.performanceDate
 		var odKey func(od *ormo.InOutOrder) string
 		if data.GroupBy == "symbol" {
 			odKey = func(od *ormo.InOutOrder) string {
@@ -1068,19 +1076,19 @@ func (h *apiHandlers) getPerformance(c *fiber.Ctx) error {
 			tfMSecs := int64(utils2.TFToSecs("1M") * 1000)
 			odKey = func(od *ormo.InOutOrder) string {
 				dateMS := utils2.AlignTfMSecs(od.RealEnterMS(), tfMSecs)
-				return btime.ToDateStrLoc(dateMS, "2006-01")
+				return formatDate(dateMS, "2006-01")
 			}
 		} else if data.GroupBy == "week" {
 			tfMSecs := int64(utils2.TFToSecs("1w") * 1000)
 			odKey = func(od *ormo.InOutOrder) string {
 				dateMS := utils2.AlignTfMSecs(od.RealEnterMS(), tfMSecs)
-				return btime.ToDateStrLoc(dateMS, "2006-01-02")
+				return formatDate(dateMS, "2006-01-02")
 			}
 		} else if data.GroupBy == "day" {
 			tfMSecs := int64(utils2.TFToSecs("1d") * 1000)
 			odKey = func(od *ormo.InOutOrder) string {
 				dateMS := utils2.AlignTfMSecs(od.RealEnterMS(), tfMSecs)
-				return btime.ToDateStrLoc(dateMS, "2006-01-02")
+				return formatDate(dateMS, "2006-01-02")
 			}
 		} else {
 			return c.JSON(fiber.Map{"code": 400, "msg": "unsupport group type: " + data.GroupBy})

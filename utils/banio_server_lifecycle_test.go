@@ -23,10 +23,14 @@ func TestServerIOStopBeforeRunPreventsListener(t *testing.T) {
 
 func TestServerIOStopJoinsAcceptedClient(t *testing.T) {
 	oldMode, oldLive := core.RunMode, core.LiveMode
-	core.RunMode, core.LiveMode = core.RunModeLive, true
+	core.RunMode, core.LiveMode = "", false
 	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
 	server := NewBanServer("127.0.0.1:0", "")
 	done := make(chan struct{})
+	received := make(chan struct{}, 1)
+	server.InitConn = func(conn *BanConn) {
+		conn.Listens["regression"] = func(*IOMsgRaw) { received <- struct{}{} }
+	}
 	server.OnConnExit = func(*BanConn, *errs.Error) { close(done) }
 	go func() { _ = server.RunForever(0, 0) }()
 	deadline := time.Now().Add(time.Second)
@@ -41,6 +45,17 @@ func TestServerIOStopJoinsAcceptedClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	client := server.WrapConn(conn)
+	if err := client.WriteMsg(&IOMsg{Action: "regression", Data: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		server.Stop()
+		server.Join()
+		t.Fatal("server rejected traffic with uninitialized legacy mode")
+	}
 	for len(server.ConnectionsSnapshot()) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("server did not admit client")

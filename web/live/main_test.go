@@ -1,6 +1,7 @@
 package live
 
 import (
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -102,6 +103,15 @@ func TestStartAPIWithLifecycleFinishesAfterListenFailure(t *testing.T) {
 	server, err := startApiWithLifecycle(nil)
 	if err != nil || server == nil {
 		t.Fatalf("startApiWithLifecycle = %v, %v", server, err)
+	}
+	server.app.Get("/regression/panic", func(*fiber.Ctx) error { panic("regression") })
+	response, requestErr := server.app.Test(httptest.NewRequest("GET", "/regression/panic", nil))
+	if requestErr != nil {
+		t.Fatal(requestErr)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != fiber.StatusInternalServerError {
+		t.Fatalf("panic status = %d", response.StatusCode)
 	}
 	server.Join()
 }

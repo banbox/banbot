@@ -1191,7 +1191,7 @@ func (s *ServerIO) RunForever(intvSecs, timeoutSecs int) *errs.Error {
 		log.Info("receive client", zap.String("remote", conn.GetRemote()))
 		go func() {
 			defer s.workers.Done()
-			err := conn.RunForever()
+			err := conn.runForever(core.RunModeLive)
 			if err != nil {
 				log.Warn("read client fail", zap.String("remote", conn.GetRemote()),
 					zap.String("err", err.Message()))

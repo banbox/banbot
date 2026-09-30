@@ -19,6 +19,7 @@ import (
 	"github.com/banbox/banexg/log"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"go.uber.org/zap"
 )
 
@@ -159,6 +160,7 @@ func startAPIServer(lifecycle ServerLifecycle, cfg *config.APIServerConfig, deps
 		JSONEncoder:  utils.Marshal,
 	})
 
+	app.Use(recover.New())
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     strings.Join(cfg.CORSOrigins, ", "),
 		AllowMethods:     "*",
