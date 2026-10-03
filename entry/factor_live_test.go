@@ -31,10 +31,10 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-func TestFactorLiveStockFailsClosedBeforeRuntimeIO(t *testing.T) {
-	err := runFactorLive(context.Background(), runner.Config{}, "", []string{"does-not-exist.yml"}, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "stock Banexg") {
-		t.Fatalf("stock capability: %v", err)
+func TestFactorLiveUnsupportedBindingFailsClosedBeforeRuntimeIO(t *testing.T) {
+	err := runFactorLive(context.Background(), runner.Config{}, "unsupported-binding", []string{"does-not-exist.yml"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), `binding "unsupported-binding" is not registered`) {
+		t.Fatalf("unsupported binding: %v", err)
 	}
 	err = runFactorLive(context.Background(), runner.Config{Chunks: []runner.Chunk{{Path: "archive.gob"}}}, "", nil, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "refuses archive") {

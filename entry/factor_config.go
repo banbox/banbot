@@ -47,7 +47,7 @@ func importFactorJSON(path string) (string, error) {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return "", errors.New("factor config must contain one JSON object")
 	}
-	if legacy.Definition == "" {
+	if legacy.Definition == "" && legacy.Expressions == nil {
 		legacy.Definition = "momentum-vol"
 	}
 	// JSON was never a canonical YAML format. Its advanced configuration is
@@ -57,7 +57,11 @@ func importFactorJSON(path string) (string, error) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return "", err
 	}
-	policy := map[string]any{"name": legacy.Definition, "engine": config.EngineFactor, "factor": map[string]any{"config": fields}}
+	name := legacy.Definition
+	if name == "" && legacy.Expressions != nil {
+		name = "expressions"
+	}
+	policy := map[string]any{"name": name, "engine": config.EngineFactor, "factor": map[string]any{"config": fields}}
 	if legacy.StrategyID != "" {
 		policy["id"] = legacy.StrategyID
 	}
@@ -275,6 +279,30 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 			}
 		}
 		c.Mode = mode
+		if c.Expressions != nil {
+			// policy.name identifies a strategy; only factor.definition selects a Go builder.
+			explicitDefinition := false
+			for key := range policy.Factor {
+				explicitDefinition = explicitDefinition || strings.EqualFold(key, "definition")
+			}
+			if imported, ok := policy.Factor["config"].(map[string]any); ok {
+				for key := range imported {
+					explicitDefinition = explicitDefinition || strings.EqualFold(key, "definition")
+				}
+			}
+			if !explicitDefinition {
+				c.Definition = ""
+			}
+			if c.Expressions.Frequency == "" {
+				c.Expressions.Frequency = frequency
+			}
+			if c.Expressions.Frequency != frequency {
+				return nil, fmt.Errorf("run_policy[%d].factor.expressions.frequency must match run_timeframes", index)
+			}
+			if _, _, err := runner.CompileDefinition(c); err != nil {
+				return nil, fmt.Errorf("run_policy[%d].factor: %w", index, err)
+			}
+		}
 		if c.Manifest.Parameters == nil {
 			c.Manifest.Parameters = make(map[string]float64)
 		}
@@ -503,6 +531,11 @@ func deriveArchivePrice(c *runner.Config) error {
 	if c.Prices.Source == "" {
 		if _, ok := c.Snapshot.Schemas["tick"]; ok {
 			c.Prices = runner.PriceStream{Source: "tick", Frequency: "event", Field: "price"}
+		} else if c.Expressions != nil {
+			if _, ok := c.Snapshot.Schemas["kline"]; !ok {
+				return errors.New("factor: expressions require explicit prices when archive has no tick/kline price stream")
+			}
+			c.Prices = runner.PriceStream{Source: "kline", Frequency: c.Expressions.Frequency, Field: "close"}
 		} else {
 			c.Prices = runner.PriceStream{Source: c.Factor.Source, Frequency: c.Factor.Frequency, Field: c.Factor.Field}
 		}

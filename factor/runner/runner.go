@@ -12,6 +12,7 @@ import (
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/backtest"
+	"github.com/banbox/banbot/factor/expr"
 	"github.com/banbox/banbot/factor/research"
 	"io"
 	"os"
@@ -35,6 +36,7 @@ type PriceStream struct{ Source, Frequency, Field string }
 type Config struct {
 	ArtifactPath                                       string
 	Definition                                         string
+	Expressions                                        *expr.Spec        `json:"expressions,omitempty"`
 	ComputationGroup                                   *ComputationGroup `json:"-"`
 	ComputationContext                                 ComputationContext
 	Execution                                          ExecutionConfig

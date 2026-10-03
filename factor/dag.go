@@ -388,6 +388,19 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 		}
 		return nil
 	}
+	if arity, ok := pointwiseArity(spec.Operator); ok {
+		if count != arity {
+			return fmt.Errorf("factor: %s requires %d dependencies", spec.Operator, arity)
+		}
+		if spec.Operator == "constant" {
+			if _, exists := spec.Parameters["value"]; !exists || len(spec.Parameters) != 1 {
+				return errors.New("factor: constant requires one declared value")
+			}
+		} else if len(spec.Parameters) != 0 {
+			return fmt.Errorf("factor: %s does not accept scalar parameters", spec.Operator)
+		}
+		return nil
+	}
 	if spec.Operator == "field" {
 		if count != 0 || spec.Source == "" || spec.Field == "" {
 			return errors.New("factor: field requires source/field and no dependencies")

@@ -94,7 +94,16 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 		}
 		set("strategy_id", c.StrategyID, "registered strategy name", prefix+"id", prefix+"name")
 		set("account_id", c.AccountID, "configured default trading account", prefix+"account")
-		set("definition", c.Definition, "registered Go builder", prefix+"name")
+		set("definition", c.Definition, "registered Go builder", prefix+"factor.definition", prefix+"name")
+		if c.Expressions != nil {
+			set("expressions", c.Expressions, "declarative factor expressions", prefix+"factor.expressions", prefix+"factor.config.expressions")
+			plan, combo, err := runner.CompileDefinition(c)
+			if err != nil {
+				return err
+			}
+			set("factor_plan_hash", plan.Hash(), "compiled expression semantics")
+			set("combine", combo, "resolved expression combination", prefix+"factor.combo", prefix+"factor.expressions.combine")
+		}
 		set("execution_mode", c.Mode, "ordinary backtest events default", "execution.mode")
 		set("currency", c.Manifest.Currency, "USD default", prefix+"factor.manifest.currency", "stake_currency")
 		set("initial_nav", c.InitialNAV, "wallet capital times policy capital_weight; otherwise 10000", prefix+"capital_weight", prefix+"factor.initial_nav", "wallet_amounts."+c.Manifest.Currency)

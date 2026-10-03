@@ -2,9 +2,13 @@ package runner
 
 import (
 	"fmt"
+	"math"
+	"slices"
 
 	"github.com/banbox/banbot/factor"
+	"github.com/banbox/banbot/factor/expr"
 	"github.com/banbox/banbot/factor/research"
+	"github.com/banbox/banexg/utils"
 )
 
 // decisionEngine owns the shared CS definition and incremental computation.
@@ -26,7 +30,22 @@ func compileDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 	var plan *factor.Plan
 	var combo research.ComboSpec
 	var err error
-	if c.Plan != nil {
+	if c.Expressions != nil {
+		if c.Plan != nil || c.Definition != "" {
+			return nil, combo, fmt.Errorf("runner: expressions, plan and explicit definition are mutually exclusive")
+		}
+		plan, err = expr.Compile(*c.Expressions)
+		if err != nil {
+			return nil, combo, err
+		}
+		combo = c.Expressions.Combine
+		if combo.Method == "" {
+			combo.Method = research.Equal
+		}
+		if len(combo.Columns) == 0 {
+			combo.Columns = plan.Outputs()
+		}
+	} else if c.Plan != nil {
 		plan = c.Plan
 	} else {
 		builder, ok := definitionBuilder(c.Definition)
@@ -44,7 +63,47 @@ func compileDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 	if plan == nil || combo.Method == "" {
 		return nil, combo, fmt.Errorf("runner: definition requires plan and combiner")
 	}
+	if c.Expressions != nil {
+		if c.DecisionInterval > 0 {
+			// The runner advances one decision grid; bindings cannot change its cadence.
+			seconds, frequencyErr := utils.TFToSecSafe(plan.Frequency())
+			if frequencyErr != nil || int64(seconds)*1000 != c.DecisionInterval {
+				return nil, combo, fmt.Errorf("runner: expression frequency must match decision interval")
+			}
+		}
+		if err := validateExpressionCombo(plan, combo); err != nil {
+			return nil, combo, err
+		}
+	}
 	return plan, combo, nil
+}
+
+func validateExpressionCombo(plan *factor.Plan, combo research.ComboSpec) error {
+	if combo.Method != research.Equal && combo.Method != research.Fixed && combo.Method != research.HistoryIC {
+		return fmt.Errorf("runner: unsupported expression combine method %q", combo.Method)
+	}
+	if len(combo.Columns) == 0 {
+		return fmt.Errorf("runner: expression combine requires columns")
+	}
+	seen := map[string]bool{}
+	for _, name := range combo.Columns {
+		if !slices.Contains(plan.Outputs(), name) || seen[name] {
+			return fmt.Errorf("runner: unknown or repeated expression combine column %q", name)
+		}
+		seen[name] = true
+		if combo.Method == research.Fixed {
+			weight, ok := combo.Weights[name]
+			if !ok || math.IsNaN(weight) || math.IsInf(weight, 0) {
+				return fmt.Errorf("runner: fixed expression weight missing/nonfinite for %q", name)
+			}
+		}
+	}
+	for name := range combo.Weights {
+		if !seen[name] {
+			return fmt.Errorf("runner: expression weight references unknown combination column %q", name)
+		}
+	}
+	return nil
 }
 
 // Run-specific lineage and latency assumptions are supplied by each driver.

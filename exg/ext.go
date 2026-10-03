@@ -15,6 +15,9 @@ type BotExchange struct {
 	orderCallbackSet bool
 }
 
+// UnderlyingExchange exposes SDK-owned optional capabilities to integrations.
+func (e *BotExchange) UnderlyingExchange() banexg.BanExchange { return e.BanExchange }
+
 var (
 	AfterCreateOrder func(*PutOrderRes) *errs.Error
 )

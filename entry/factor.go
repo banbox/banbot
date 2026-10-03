@@ -145,5 +145,6 @@ func NewFactorCommandWithSink(factory FactorSinkFactory) *cobra.Command {
 	_ = archive.MarkFlagRequired("input")
 	_ = archive.MarkFlagRequired("out")
 	root.AddCommand(archive)
+	addExpressionCommands(root)
 	return root
 }

@@ -22,12 +22,16 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.HasPrefix(path, "execution.accounts."):
 		allowed = "mode store history sender_lease_dir live_provider funding_policy instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit"
 	case strings.HasSuffix(path, ".factor"):
-		allowed = "archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records config"
+		allowed = "archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records config definition expressions"
+	case strings.HasSuffix(path, ".expressions"):
+		allowed = "schema_version frequency bindings params lets outputs combine"
+	case strings.Contains(path, ".expressions.bindings."):
+		allowed = "source frequency sampling max_age_ms"
 	case strings.HasSuffix(path, ".decision"):
 		allowed = "interval_ms delay_ms latency_ms expiry_ms max_pending"
 	case strings.HasSuffix(path, ".prices"):
 		allowed = "source frequency field"
-	case strings.HasSuffix(path, ".combo"):
+	case strings.HasSuffix(path, ".combo"), strings.HasSuffix(path, ".expressions.combine"):
 		allowed = "method columns weights"
 	case strings.HasSuffix(path, ".portfolio"):
 		allowed = "builder k long_notional short_notional mode"
@@ -57,7 +61,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			return fmt.Errorf("%s cannot be null", field)
 		}
 		switch key {
-		case "archive", "store", "history", "sender_lease_dir", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "frequency", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder":
+		case "archive", "store", "history", "sender_lease_dir", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "frequency", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder", "definition", "sampling":
 			if text, ok := value.(string); !ok || strings.TrimSpace(text) == "" {
 				return fmt.Errorf("%s must be a nonempty string", field)
 			}
@@ -82,7 +86,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if item.Kind() >= reflect.Uint && item.Kind() <= reflect.Uint64 && item.Uint() > math.MaxInt64 {
 				return fmt.Errorf("%s exceeds int64", field)
 			}
-		case "page_rows", "prefetch_rows", "max_records", "max_pending", "k", "interval_ms", "expiry_ms", "horizon":
+		case "page_rows", "prefetch_rows", "max_records", "max_pending", "k", "interval_ms", "expiry_ms", "horizon", "schema_version", "max_age_ms":
 			if !nonnegativeInteger(value) || numeric(value) <= 0 {
 				return fmt.Errorf("%s must be a positive integer", field)
 			}
@@ -123,7 +127,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if reflect.TypeOf(value).Kind() != reflect.Slice {
 				return fmt.Errorf("%s must be a list", field)
 			}
-		case "snapshot", "combo", "portfolio", "decision", "research", "manifest", "prices", "universe", "costs", "accounts", "weights", "parameters", "schemas", "source_versions", "sid_map", "instruments", "config":
+		case "snapshot", "combo", "portfolio", "decision", "research", "manifest", "prices", "universe", "costs", "accounts", "weights", "parameters", "schemas", "source_versions", "sid_map", "instruments", "config", "expressions", "bindings", "params", "lets", "outputs", "combine":
 			if reflect.TypeOf(value).Kind() != reflect.Map {
 				return fmt.Errorf("%s must be a mapping", field)
 			}

@@ -307,6 +307,9 @@ func (s *Session) evaluateTS(node compiledNode, asset *assetState, sid int32, sn
 	if node.evaluate != nil {
 		return normalized(node.evaluate(inputs))
 	}
+	if value, ok := evaluatePointwise(node.spec, inputs); ok {
+		return value
+	}
 	if node.spec.Operator == "linear" {
 		value := 0.0
 		for i, input := range inputs {

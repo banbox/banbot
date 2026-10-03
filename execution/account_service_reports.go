@@ -159,6 +159,28 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 				default:
 				}
 			}
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			reconcile := func() bool {
+				if err := borrow.RefreshWorkingOrders(ctx, time.Now().UnixMilli()); err != nil {
+					fail("private-periodic-recovery", err, time.Now().UnixMilli())
+					return false
+				}
+				if recovery, ok := service.opts.Adapter.(interface {
+					RecoverCash(context.Context, *SharedAccountBorrow) error
+				}); ok {
+					if err := recovery.RecoverCash(ctx, borrow); err != nil {
+						fail("private-periodic-funding", err, time.Now().UnixMilli())
+						return false
+					}
+				}
+				if err := borrow.Reconcile(fmt.Sprintf("private-periodic-reconcile/%d", time.Now().UnixMilli()), time.Now().UnixMilli()); err != nil {
+					fail("private-periodic-reconcile", err, time.Now().UnixMilli())
+					return false
+				}
+				service.notifyCommitted()
+				return true
+			}
 			for {
 				select {
 				case <-ctx.Done():
@@ -166,6 +188,12 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 					// joins. Discard queued hints after stop, before closing the store.
 					service.joinReportSource(stream)
 					return
+				case <-ticker.C:
+					if !reconcile() {
+						cancel()
+						service.joinReportSource(stream)
+						return
+					}
 				case report, ok := <-stream:
 					if !ok {
 						if ctx.Err() == nil {
@@ -180,6 +208,14 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 						if err := borrow.Recover(report.OrderID); err != nil {
 							fail("private-recovery/"+report.OrderID, err, now)
 						} else {
+							if recovery, ok := service.opts.Adapter.(interface {
+								RecoverCash(context.Context, *SharedAccountBorrow) error
+							}); ok {
+								if err := recovery.RecoverCash(ctx, borrow); err != nil {
+									fail("private-funding/"+report.OrderID, err, now)
+									continue
+								}
+							}
 							if err := borrow.Reconcile(fmt.Sprintf("private-reconcile/%s/%d", report.OrderID, now), now); err != nil {
 								fail("private-reconcile-error/"+report.OrderID, err, now)
 							}

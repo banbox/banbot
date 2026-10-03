@@ -58,6 +58,8 @@ func preflightFactorStorageConfig(spec *config.RunSpec, c *runner.Config) error 
 	if c.Prices.Source == "" {
 		if c.Mode == runner.Events {
 			c.Prices = runner.PriceStream{Source: orm.SeriesSourceKline, Frequency: "1m", Field: "close"}
+		} else if c.Expressions != nil {
+			c.Prices = runner.PriceStream{Source: orm.SeriesSourceKline, Frequency: c.Expressions.Frequency, Field: "close"}
 		} else {
 			c.Prices = runner.PriceStream{Source: c.Factor.Source, Frequency: c.Factor.Frequency, Field: c.Factor.Field}
 		}

@@ -152,8 +152,8 @@ func (a *BanexgAdapter) invoke(ctx context.Context, call func() error) error {
 	return err
 }
 
-func (a *BanexgAdapter) params() map[string]any {
-	return map[string]any{banexg.ParamAccount: a.config.Account.Account, banexg.ParamRetry: 0}
+func (a *BanexgAdapter) params(ctx context.Context) map[string]any {
+	return map[string]any{banexg.ParamAccount: a.config.Account.Account, banexg.ParamRetry: 0, banexg.ParamContext: ctx}
 }
 
 func floatBoundary(value decimal.Decimal) (float64, error) {
@@ -211,7 +211,7 @@ func (a *BanexgAdapter) Submit(ctx context.Context, intent OrderIntent, clientID
 	if intent.PostOnly {
 		typeName = banexg.OdTypeLimitMaker
 	}
-	params := a.params()
+	params := a.params(ctx)
 	params[banexg.ParamClientOrderId] = clientID
 	params[banexg.ParamReduceOnly] = intent.ReduceOnly
 	var raw *banexg.Order
@@ -270,7 +270,7 @@ func (a *BanexgAdapter) Cancel(ctx context.Context, exchangeID string) (bool, er
 	}
 	var raw *banexg.Order
 	err = a.invoke(ctx, func() error {
-		result, e := a.exchange.CancelOrder(exchangeID, entry.Symbol, a.params())
+		result, e := a.exchange.CancelOrder(exchangeID, entry.Symbol, a.params(ctx))
 		raw = result
 		if e != nil {
 			return e
@@ -295,7 +295,8 @@ func (a *BanexgAdapter) Query(ctx context.Context, clientID, exchangeID string) 
 	if !ok {
 		return QueryResult{}, errors.New("execution: unmapped banexg query instrument")
 	}
-	params := a.params()
+	params := a.params(ctx)
+	params[banexg.ParamCompleteOrder] = true
 	params[banexg.ParamClientOrderId] = clientID
 	var raw *banexg.Order
 	err = a.invoke(ctx, func() error {
@@ -397,7 +398,7 @@ func (a *BanexgAdapter) Reports(ctx context.Context) (<-chan BanexgStreamReport,
 	}
 	var input chan *banexg.MyTrade
 	err := a.invoke(ctx, func() error {
-		stream, e := a.exchange.WatchMyTrades(a.params())
+		stream, e := a.exchange.WatchMyTrades(a.params(ctx))
 		input = stream
 		if e != nil {
 			return e
@@ -454,17 +455,19 @@ func (a *BanexgAdapter) fetchAccount(ctx context.Context) (*banexg.Balances, []*
 	var orders []*banexg.Order
 	err := a.invoke(ctx, func() error {
 		var e error
-		b, be := a.exchange.FetchBalance(a.params())
+		balanceParams := a.params(ctx)
+		balanceParams[banexg.ParamSettledCash] = true
+		b, be := a.exchange.FetchBalance(balanceParams)
 		balances = b
 		if be != nil {
 			return be
 		}
-		p, pe := a.exchange.FetchPositions(nil, a.params())
+		p, pe := a.exchange.FetchPositions(nil, a.params(ctx))
 		positions = p
 		if pe != nil {
 			return pe
 		}
-		params := a.params()
+		params := a.params(ctx)
 		params[banexg.ParamFullSnapshot] = true
 		o, oe := a.exchange.FetchOpenOrders("", 0, 0, params)
 		orders = o
@@ -496,6 +499,9 @@ func (a *BanexgAdapter) Snapshot(ctx context.Context) (VenueSnapshot, error) {
 	for _, position := range positions {
 		if position == nil {
 			return VenueSnapshot{}, errors.New("execution: nil banexg position")
+		}
+		if position.Contracts <= 0 {
+			continue
 		}
 		instrument, ok := a.bySymbol[position.Symbol]
 		if !ok {
@@ -530,7 +536,9 @@ func (a *BanexgAdapter) Snapshot(ctx context.Context) (VenueSnapshot, error) {
 		if err != nil {
 			return VenueSnapshot{}, err
 		}
-		query, err := a.orderSnapshot(raw, stored)
+		// Open-order inventory may omit cumulative fee/cost fields. Re-query
+		// known orders with the complete-order contract before reconciliation.
+		query, err := a.Query(ctx, stored.ClientID, raw.ID)
 		if err != nil {
 			return VenueSnapshot{}, err
 		}
@@ -645,7 +653,7 @@ func (a *BanexgAdapter) Observe(ctx context.Context, instrumentID string) (Visib
 	}
 	var book *banexg.OrderBook
 	err := a.invoke(ctx, func() error {
-		result, e := a.exchange.FetchOrderBook(entry.Symbol, 1, a.params())
+		result, e := a.exchange.FetchOrderBook(entry.Symbol, 1, a.params(ctx))
 		book = result
 		if e != nil {
 			return e

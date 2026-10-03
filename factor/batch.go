@@ -157,6 +157,8 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 						}
 						if node.evaluate != nil {
 							value = normalized(node.evaluate(inputs))
+						} else if pointwise, ok := evaluatePointwise(node.spec, inputs); ok {
+							value = pointwise
 						} else if node.spec.Operator == "linear" {
 							sum := 0.0
 							value = Numeric{0, Valid}

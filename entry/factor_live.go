@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -40,6 +41,10 @@ type FactorLiveBinding struct {
 	// VerifyFunding proves either authoritative cash settlement metadata or
 	// absence of funding obligations for the supplied policy and instruments.
 	VerifyFunding func(context.Context, string) (string, error)
+	// Sources are fresh account-local providers, never process-global closures.
+	Sources []data.DataSource
+	// BootstrapCapital seeds only an empty ledger from a verified flat account.
+	BootstrapCapital bool
 	// Close joins resources created by this factory, after account work joins.
 	// It also cleans partial resources when the factory returns an error. The
 	// entry session owns the shared SDK exchange; Close must not close it.
@@ -75,11 +80,14 @@ func RegisterFactorLiveBinding(name string, factory FactorLiveBindingFactory) er
 }
 
 func factorLiveFactory(name string) (FactorLiveBindingFactory, error) {
+	if name == "" || name == "banexg" {
+		return newBanexgFactorLiveBinding, nil
+	}
 	factorLiveBindings.RLock()
 	f := factorLiveBindings.items[name]
 	factorLiveBindings.RUnlock()
 	if f == nil {
-		return nil, fmt.Errorf("factor: unsupported live capability: binding %q is not registered; stock Banexg has no proven context-bound transport, complete account snapshot and stable client-ID recovery", name)
+		return nil, fmt.Errorf("factor: unsupported live capability: binding %q is not registered", name)
 	}
 	return f, nil
 }
@@ -280,10 +288,19 @@ func factorLiveAccountConfig(configs []runner.Config) (runner.Config, error) {
 		if cfg.Execution.HistoryPath != "" {
 			return runner.Config{}, errors.New("factor: cold history is only available for simulated replay")
 		}
-		if cfg.StrategyID == "" || seen[cfg.StrategyID] || len(cfg.Chunks) != 0 || cfg.AccountID != c.AccountID || cfg.Manifest.Currency != c.Manifest.Currency || cfg.Manifest.Costs.FundingPolicy != c.Manifest.Costs.FundingPolicy || cfg.Execution.StorePath != c.Execution.StorePath || cfg.Execution.SenderLeaseDir != c.Execution.SenderLeaseDir || !cfg.Execution.MarginRate.Equal(c.Execution.MarginRate) || !cfg.Execution.MaxAccountMargin.Equal(c.Execution.MaxAccountMargin) || !cfg.Execution.MaxVirtualGross.Equal(c.Execution.MaxVirtualGross) {
+		if cfg.StrategyID == "" || seen[cfg.StrategyID] || len(cfg.Chunks) != 0 || cfg.AccountID != c.AccountID || cfg.Manifest.Currency != c.Manifest.Currency || cfg.Manifest.Costs.FundingPolicy != c.Manifest.Costs.FundingPolicy || cfg.FundingSource != c.FundingSource || cfg.Execution.StorePath != c.Execution.StorePath || cfg.Execution.SenderLeaseDir != c.Execution.SenderLeaseDir || !cfg.Execution.MarginRate.Equal(c.Execution.MarginRate) || !cfg.Execution.MaxAccountMargin.Equal(c.Execution.MaxAccountMargin) || !cfg.Execution.MaxVirtualGross.Equal(c.Execution.MaxVirtualGross) {
 			return runner.Config{}, errors.New("factor: incompatible shared live account strategy declarations")
 		}
 		seen[cfg.StrategyID] = true
+		for source, version := range cfg.Snapshot.SourceVersions {
+			if previous := c.Snapshot.SourceVersions[source]; previous != "" && previous != version {
+				return runner.Config{}, errors.New("factor: conflicting shared live source versions")
+			}
+			if c.Snapshot.SourceVersions == nil {
+				c.Snapshot.SourceVersions = map[string]string{}
+			}
+			c.Snapshot.SourceVersions[source] = version
+		}
 		for sid, symbol := range cfg.Snapshot.SIDMap {
 			if previous, ok := c.Snapshot.SIDMap[sid]; ok && previous != symbol {
 				return runner.Config{}, errors.New("factor: conflicting live SID mapping")
@@ -393,6 +410,11 @@ func (s *explicitEntrySession) runFactorsLive(ctx context.Context, snapshot *con
 	if err != nil {
 		return err
 	}
+	for _, source := range binding.Sources {
+		if err := catalog.RegisterDataSource(source); err != nil {
+			return err
+		}
+	}
 	cfg := snapshot.View()
 	opts := biz.SharedExecutionOptions{StorePath: e.StorePath, SenderLeaseDir: e.SenderLeaseDir, Adapter: adapter, AuthoritativeSnapshot: true}
 	var bridge *biz.SharedOrderBridgeConfig
@@ -461,7 +483,22 @@ func (s *explicitEntrySession) runFactorsLive(ctx context.Context, snapshot *con
 	if err := account.ValidateAccountBindings(strategies); err != nil {
 		return err
 	}
+	if binding.BootstrapCapital {
+		capital := map[execution.StrategyID]decimal.Decimal{}
+		for _, cfg := range configs {
+			if cfg.InitialNAV <= 0 || math.IsNaN(cfg.InitialNAV) || math.IsInf(cfg.InitialNAV, 0) {
+				return errors.New("factor: explicit positive initial_nav required for live capital allocation")
+			}
+			capital[execution.StrategyID(cfg.StrategyID)] = decimal.NewFromFloat(cfg.InitialNAV)
+		}
+		if err := account.BootstrapCapital(ctx, capital, rt.Clock.TimeMS()); err != nil {
+			return err
+		}
+	}
 	if err := account.RecoverPersisted(ctx); err != nil {
+		return err
+	}
+	if err := adapter.RecoverCash(ctx, account); err != nil {
 		return err
 	}
 	if err := account.Reconcile("factor-live-startup", rt.Clock.TimeMS()); err != nil {
