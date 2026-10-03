@@ -342,7 +342,8 @@ func listSRangeSidsQuery(tables []string, questDB bool) (string, []any) {
 			whereClause = "AND (" + strings.Join(predicates, " OR ") + ")"
 		}
 		return fmt.Sprintf(`SELECT DISTINCT sid FROM (
-  SELECT sid, tbl FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms
+  SELECT sid, tbl FROM (SELECT * FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms)
   WHERE coalesce(is_deleted, false) = false %s
 ) ORDER BY sid`, whereClause), args
 	}

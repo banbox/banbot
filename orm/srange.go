@@ -222,8 +222,8 @@ func (q *Queries) loadSRangesSpansFromDB(ctx context.Context, sid int32, table, 
 	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data, ts
 FROM (
   SELECT start_ms, stop_ms, has_data, is_deleted, ts
-  FROM sranges_q
-  LATEST BY sid, tbl, timeframe, start_ms
+  FROM (SELECT * FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND start_ms < $5)
   WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms > $4 AND start_ms < $5
 )
 WHERE coalesce(is_deleted, false) = false
@@ -713,18 +713,25 @@ func batchInsertSranges(ctx context.Context, q *Queries, sid int32, tbl, tf stri
 // batchInsertSrangesDeleted. deleted controls the is_deleted literal written for
 // every row; has_data per-span is also inlined as a SQL literal.
 func batchInsertSrangesRows(ctx context.Context, q *Queries, sid int32, tbl, tf string, spans []srangeSpan, now time.Time, microOff *int, deleted bool) error {
+	if len(spans) == 0 {
+		return nil
+	}
+	first, err := q.reserveMetadataVersions(ctx, "sranges_q", len(spans), now.Add(time.Duration(*microOff)*time.Microsecond))
+	if err != nil {
+		return err
+	}
 	const colsPerRow = 6 // sid, ts, tbl, tf, start_ms, stop_ms
 	deletedLit := boolLit(deleted)
 	args := make([]any, 0, len(spans)*colsPerRow)
 	valueParts := make([]string, len(spans))
 	for i, s := range spans {
-		ts := now.Add(time.Duration(*microOff) * time.Microsecond)
+		ts := first.Add(time.Duration(i) * time.Microsecond)
 		(*microOff)++
 		p := i*colsPerRow + 1
 		valueParts[i] = fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,%s,%s)", p, p+1, p+2, p+3, p+4, p+5, boolLit(s.HasData), deletedLit)
 		args = append(args, sid, ts, tbl, tf, s.StartMs, s.StopMs)
 	}
 	sql := "INSERT INTO sranges_q (sid,ts,tbl,timeframe,start_ms,stop_ms,has_data,is_deleted) VALUES " + strings.Join(valueParts, ",")
-	_, err := q.db.Exec(ctx, sql, args...)
+	_, err = q.db.Exec(ctx, sql, args...)
 	return err
 }

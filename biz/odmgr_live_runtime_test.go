@@ -1,11 +1,13 @@
 package biz
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
@@ -94,13 +96,28 @@ func TestInitLiveOrderMgrWithRuntimeDepsKeepsLegacyManagersUntouched(t *testing.
 
 	trading := NewTradingState()
 	orders := ormo.NewOrderState()
+	registry := &execution.AccountRegistry{}
+	owner, err := registry.Acquire(execution.AccountKey{VenueSessionIdentity: "test", Account: "runtime", SettlementDomain: "USDT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender, err := execution.NewLegacySender(owner, []string{"USDT"}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { registry.Close(); sender.Close() })
+	exchange, err := execution.NewLegacyExchange(context.Background(), &issue138Exchange{}, "runtime", map[string]*execution.LegacySender{"runtime": sender})
+	if err != nil {
+		t.Fatal(err)
+	}
 	deps := completeTraderDepsForTest(RuntimeDeps{
-		Core:     &core.State{LiveMode: true, EnvReal: true, Market: banexg.MarketSpot},
-		Config:   config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{"runtime": {}}}),
-		Accounts: map[string]*config.AccountConfig{"runtime": {}},
-		Orders:   orders,
-		Trading:  trading,
-		Exchange: &issue138Exchange{},
+		Core:           &core.State{LiveMode: true, EnvReal: true, Market: banexg.MarketSpot},
+		Config:         config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{"runtime": {}}}),
+		Accounts:       map[string]*config.AccountConfig{"runtime": {}},
+		Orders:         orders,
+		Trading:        trading,
+		Exchange:       exchange,
+		DefaultAccount: "runtime",
 	})
 	InitLiveOrderMgrWithRuntimeDeps(deps, nil)
 

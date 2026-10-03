@@ -23,6 +23,8 @@
     path: string;
     name: string;
     content: string;
+    digest: string;
+    saveQueue?: Promise<void>;
   }
 
   const FILE_OPERATIONS = {
@@ -208,6 +210,7 @@
   });
 
   onDestroy(() => {
+    editor?.flushChanges();
     if ($site.dirtyBin){
       alerts.warning(m.code_modified_need_build(), 2);
       $site.compileNeed = true;
@@ -241,10 +244,15 @@
     if (tabIdx === -1) {
       // 获取文件内容
       const result = await getApi('/dev/text', { path });
+      if (result.code !== 200) {
+        alerts.error(result.msg || 'load file failed');
+        return;
+      }
       const content = result.data || '';
       
       // 检查是否达到最大标签页数量
       if ($tabs.length >= MAX_TABS) {
+        editor?.flushChanges();
         // 移除最早的标签页
         tabs.update(tabs => tabs.slice(1));
         if ($activeTab > 0) {
@@ -253,12 +261,12 @@
       }
       
       // 添加新标签页
-      tabs.update(tabs => [...tabs, { path, name, content }]);
+      tabs.update(tabs => [...tabs, { path, name, content, digest: result.digest ?? '' }]);
       $activeTab = $tabs.length - 1;
     } else {
       $activeTab = tabIdx;
     }
-    editor?.setValue(name, $tabs[$activeTab].content);
+    editor?.setValue(path, $tabs[$activeTab].content);
   }
 
   function clickTab(idx: number) {
@@ -335,32 +343,37 @@
     showCreateInput = false;
   }
 
-  async function onTextChange(value: string) {
-    const tab = $tabs[$activeTab];
+  function onTextChange(value: string, path?: string) {
+    const tab = $tabs.find(tab => tab.path === path);
     if(tab){
       tab.content = value;
-      const rsp = await postApi('/dev/save_text', { path: tab.path, content: value });
-      if (rsp.code !== 200) {
-        console.error('save file failed', rsp);
-        alerts.error(rsp.msg || 'save file failed');
-      }else{
-        if(tab.path.endsWith('.go')){
-          $site.dirtyBin = true;
+      // Serialize this tab's autosaves so each edit uses the last accepted version.
+      tab.saveQueue = (tab.saveQueue ?? Promise.resolve()).then(async () => {
+        const rsp = await postApi('/dev/save_text', { path: tab.path, content: value, digest: tab.digest });
+        if (rsp.code !== 200) {
+          console.error('save file failed', rsp);
+          alerts.error(rsp.msg || 'save file failed');
+        }else{
+          tab.digest = rsp.digest;
+          if(tab.path.endsWith('.go')){
+            $site.dirtyBin = true;
+          }
+          // 显示保存提示
+          showSaveIndicator = true;
+          if (saveIndicatorTimer) {
+            clearTimeout(saveIndicatorTimer);
+          }
+          saveIndicatorTimer = setTimeout(() => {
+            showSaveIndicator = false;
+          }, 2000) as unknown as number;
         }
-        // 显示保存提示
-        showSaveIndicator = true;
-        if (saveIndicatorTimer) {
-          clearTimeout(saveIndicatorTimer);
-        }
-        saveIndicatorTimer = setTimeout(() => {
-          showSaveIndicator = false;
-        }, 2000) as unknown as number;
-      }
+      });
     }
   }
 
   function closeTab(idx: number, event: MouseEvent) {
     event.stopPropagation();
+    editor?.flushChanges();
     tabs.update(tabs => {
       const newTabs = [...tabs];
       newTabs.splice(idx, 1);
@@ -378,6 +391,7 @@
 
   // 添加关闭所有标签页的函数
   function closeAllTabs() {
+    editor?.flushChanges();
     tabs.set([]);
     $activeTab = 0;
   }

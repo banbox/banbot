@@ -155,7 +155,7 @@ func (s *fileQuestRewriteIntentStore) Save(intent *questRewriteSwapIntent) error
 	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
 		return fmt.Errorf("persist QuestDB rewrite intent: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := publishRecoveryFile(tmp, path); err != nil {
 		return fmt.Errorf("activate QuestDB rewrite intent: %w", err)
 	}
 	return syncQuestRewriteIntentDir(s.root)
@@ -173,12 +173,7 @@ func (s *fileQuestRewriteIntentStore) Remove(table string) error {
 }
 
 func syncQuestRewriteIntentDir(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open QuestDB rewrite intent directory: %w", err)
-	}
-	err = errors.Join(dir.Sync(), dir.Close())
-	if err != nil {
+	if err := syncDirectory(path); err != nil {
 		return fmt.Errorf("sync QuestDB rewrite intent directory: %w", err)
 	}
 	return nil
@@ -263,8 +258,8 @@ func cleanupQuestRewriteFailure(ctx context.Context, db questRewriteExecDB, tabl
 
 func questExsymbolBySID(ctx context.Context, q *Queries, sid int32) (*ExSymbol, error) {
 	row := q.db.QueryRow(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, coalesce(agg_rules, '')
-FROM exsymbol_q
-LATEST BY sid
+FROM (SELECT * FROM exsymbol_q
+  LATEST BY sid WHERE sid = $1)
 WHERE sid = $1 AND coalesce(is_deleted, false) = false`, sid)
 	var item ExSymbol
 	if err := row.Scan(&item.ID, &item.Exchange, &item.ExgReal, &item.Market, &item.Symbol, &item.Combined, &item.ListMs, &item.DelistMs, &item.AggRules); err != nil {
@@ -1286,7 +1281,7 @@ func captureQuestCompactRewriteSnapshot(ctx context.Context, db questRewriteDB, 
 		return nil, fmt.Errorf("compact latest-by keys for %s: %w", table, err)
 	}
 	livePredicate := fmt.Sprintf("coalesce(%s, false) = false", quoteIdent("is_deleted"))
-	fromLatest := fmt.Sprintf("FROM %s LATEST BY %s WHERE %s", quoteIdent(table), latestBy, livePredicate)
+	fromLatest := fmt.Sprintf("FROM (SELECT * FROM %s LATEST BY %s) WHERE %s", quoteIdent(table), latestBy, livePredicate)
 	rowCount, fingerprint, err := streamQuestRewriteFingerprintFromClause(ctx, db, table, columns, fromLatest)
 	if err != nil {
 		return nil, err
@@ -1555,8 +1550,7 @@ func buildQuestCompactRewriteSQL(tmpTable, sourceTable string, meta *TableCompac
 	}
 	sqlText := fmt.Sprintf(`CREATE TABLE %s AS (
   SELECT %s
-  FROM %s
-  LATEST BY %s
+  FROM (SELECT * FROM %s LATEST BY %s)
   WHERE coalesce(%s, false) = false
 
 )`,

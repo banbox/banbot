@@ -25,7 +25,10 @@ func (s *repairDBStub) Query(context.Context, string, ...interface{}) (pgx.Rows,
 	panic("unexpected Query call")
 }
 
-func (s *repairDBStub) QueryRow(context.Context, string, ...interface{}) pgx.Row {
+func (s *repairDBStub) QueryRow(_ context.Context, sql string, _ ...interface{}) pgx.Row {
+	if row, ok := metadataTestQueryRow(sql); ok {
+		return row
+	}
 	panic("unexpected QueryRow call")
 }
 

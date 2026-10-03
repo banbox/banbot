@@ -15,6 +15,7 @@ import (
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
@@ -97,6 +98,10 @@ func InitLiveOrderMgr(callBack func(od *ormo.InOutOrder, isEnter bool)) {
 // admission to one explicit runtime. The legacy initializer remains available
 // for callers that still use the package facade.
 func InitLiveOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack func(od *ormo.InOutOrder, isEnter bool)) {
+	if deps.SharedExecution != nil {
+		initSharedOrderMgr(deps, callBack)
+		return
+	}
 	requireRuntimeDeps(deps)
 	initLiveOrderMgr(&deps, callBack)
 }
@@ -106,6 +111,9 @@ func InitLiveOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack func(od *ormo.In
 // account registry.
 func NewLiveOrderMgrWithRuntimeDeps(deps RuntimeDeps, account string, callBack func(od *ormo.InOutOrder, isEnter bool)) *LiveOrderMgr {
 	requireRuntimeDeps(deps)
+	if deps.SharedExecution != nil {
+		panic("biz: shared account cannot construct independent LiveOrderMgr")
+	}
 	return newLiveOrderMgrWithRuntimeDeps(account, callBack, &deps)
 }
 
@@ -218,6 +226,9 @@ func ensureLiveRuntimeDeps(deps *RuntimeDeps) {
 		return
 	}
 	requireRuntimeDeps(*deps)
+	if deps.Core.EnvReal && deps.SharedExecution == nil && !execution.IsLegacyExchange(deps.Exchange) {
+		panic("biz: production TS manager requires process-owned legacy sender exchange")
+	}
 }
 
 func (o *LiveOrderMgr) fireOdChange(od *ormo.InOutOrder, evt int) {

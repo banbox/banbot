@@ -117,7 +117,7 @@ func TestRuntimeSharesOwnedAccountExecutionStateWithTrader(t *testing.T) {
 
 func TestRuntimeBizDepsProjectsAllRuntimeOwners(t *testing.T) {
 	wantExportedRuntimeFields := []string{
-		"Process", "ID", "Core", "Config", "Clock", "Market", "Symbols", "Storage", "Batch", "Strategies",
+		"FactorState", "Process", "ID", "Core", "Config", "Clock", "Market", "Symbols", "Storage", "Batch", "Strategies",
 		"Accounts", "Orders", "Trading", "Cron", "Notifications", "Catalog", "Exchange", "Dump",
 	}
 	runtimeType := reflect.TypeOf(Runtime{})

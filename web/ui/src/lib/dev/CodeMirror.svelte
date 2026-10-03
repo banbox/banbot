@@ -35,6 +35,7 @@
   let element: HTMLDivElement | undefined = $state(undefined);
   let editor = $state<EditorView | null>(null);
   let value = $state('');
+  let documentName = '';
   let lang: LanguageSupport | undefined = $state(go());
   let useTab = $state(true);
   let langCode = $state('');
@@ -76,7 +77,7 @@
     width?: string;
     fontSize?: number;
     ready?: (view: EditorView) => void;
-    change?: (value: string) => void;
+    change?: (value: string, name?: string) => void;
     reconfigure?: (view: EditorView) => void;
   } = $props();
 
@@ -209,8 +210,8 @@
     });
   }
 
-  const debouncedChange = _.debounce((text: string) => {
-    change?.(text);
+  const debouncedChange = _.debounce((text: string, name: string) => {
+    change?.(text, name);
   }, 1000, {trailing: true});
 
   onMount(() => {
@@ -225,9 +226,9 @@
         if (!update_from_prop && change && transaction.docChanged) {
           const text = editor.state.doc.toString();
           if (debounce_msecs <= 0) {
-            change(text);
+            change(text, documentName);
           } else {
-            debouncedChange(text);
+            debouncedChange(text, documentName);
           }
         }
       }
@@ -236,12 +237,15 @@
   });
 
   onDestroy(() => {
+    debouncedChange.flush();
     editor?.destroy();
     debouncedChange.cancel();
   });
 
   export function setValue(name: string, text: string): void {
     if (!editor)return;
+    debouncedChange.flush();
+    documentName = name;
 
     // 这里将text按换行切分，如果行首是\t的行的数量超过行首空格的数量，则将useTab设置为true
     const lines = text.split('\n');
@@ -284,6 +288,10 @@
     } finally {
       update_from_prop = false;
     }
+  }
+
+  export function flushChanges(): void {
+    debouncedChange.flush();
   }
 
   // 获取编辑器内容

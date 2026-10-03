@@ -3,9 +3,12 @@ package data
 import (
 	"cmp"
 	"container/heap"
+	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
+	"net"
 	"slices"
 	"sync"
 
@@ -299,16 +302,26 @@ func (p *Provider[IDataFeeder]) warmJobs(warmJobs []*WarmJob, pb *utils.StagedPr
 
 type HistProvider struct {
 	Provider[IHistDataFeeder]
-	deps          *RuntimeDeps
-	catalog       *DataSourceCatalog
-	symbols       *orm.SymbolState
-	getEnd        FnGetInt64
-	maxTfSecs     int
-	pBar          *utils.StagedPrg
-	allowDownload bool
-	series        map[string]*HistSeriesFeeder
-	seriesCB      FnDataSeries
-	seriesRepo    orm.SeriesRepo
+	deps                      *RuntimeDeps
+	catalog                   *DataSourceCatalog
+	symbols                   *orm.SymbolState
+	getEnd                    FnGetInt64
+	maxTfSecs                 int
+	pBar                      *utils.StagedPrg
+	allowDownload             bool
+	series                    map[string]*HistSeriesFeeder
+	seriesCB                  FnDataSeries
+	seriesRepo                orm.SeriesRepo
+	seriesBatchRows           int
+	seriesPageBytes           int64
+	seriesPrefetchBudget      int
+	onTimeDrained             HistDrainObserver
+	genericKlineSubs          map[string][]Subscription
+	genericPageRows           int
+	genericSubscriptionsSet   bool
+	genericSubscriptionsReady bool
+	replayStarted             bool
+	compiledSubscriptions     *SubscriptionPlan
 
 	wsLoader *WsDataLoader
 	trades   map[string]*TradeFeeder
@@ -370,11 +383,18 @@ func newHistProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, cat
 	} else {
 		seriesRepo = orm.DefaultSeriesRepo()
 	}
-	p := &HistProvider{
+	var p *HistProvider
+	p = &HistProvider{
 		Provider: Provider[IHistDataFeeder]{
 			holders: make(map[string]IHistDataFeeder),
 			newFeeder: func(pair string, tfs []string) (IHistDataFeeder, *errs.Error) {
-				exs, err := resolveExSymbolCurWithRuntimeDeps(deps, symbols, pair)
+				var exs *orm.ExSymbol
+				var err *errs.Error
+				if subs := p.genericKlineSubs[pair]; len(subs) > 0 {
+					exs = subs[0].ExSymbol
+				} else {
+					exs, err = resolveExSymbolCurWithRuntimeDeps(deps, symbols, pair)
+				}
 				if err != nil {
 					return nil, err
 				}
@@ -388,6 +408,7 @@ func newHistProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, cat
 					return nil, err
 				}
 				feeder.OnEnvEnd = envEnd
+				configureKlineSubscriptions(feeder, p.genericKlineSubs[pair], p.genericPageRows, p.seriesPageBytes)
 				feeder.SubTfs(tfs, false)
 				return feeder, nil
 			},
@@ -416,10 +437,32 @@ func (p *HistProvider) SetAllowDownload(allow bool) {
 }
 
 func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
+	for _, sub := range subs {
+		if sub != nil && sub.ExSymbol != nil && orm.NormalizeSeriesSource(sub.Source) != orm.SeriesSourceKline && p.catalog.GetDataSource(sub.Source) == nil {
+			return errs.NewMsg(core.ErrBadConfig, "data source %q is not registered", sub.Source)
+		}
+	}
 	if len(subs) == 0 {
 		p.series = make(map[string]*HistSeriesFeeder)
 		return nil
 	}
+	seen := make(map[string]*strat.DataSub)
+	for _, sub := range subs {
+		if sub != nil && sub.ExSymbol != nil && orm.NormalizeSeriesSource(sub.Source) != orm.SeriesSourceKline {
+			cp := *sub
+			// An empty legacy projection means all source fields, so resolve it
+			// before unioning it with an explicit projection of the same stream.
+			if len(cp.Fields) == 0 {
+				if src := p.catalog.GetDataSource(cp.Source); src != nil && src.Info() != nil {
+					for _, field := range src.Info().Binding.Fields {
+						cp.Fields = append(cp.Fields, field.Name)
+					}
+				}
+			}
+			mergeDataSub(seen, &cp)
+		}
+	}
+	subs = sortedDataSubs(seen)
 	var timeRange *config.TimeTuple
 	if p.deps == nil {
 		timeRange = config.TimeRange
@@ -430,6 +473,10 @@ func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
 		return errs.NewMsg(core.ErrBadConfig, "time range is required for historical series subscriptions")
 	}
 	items := make(map[string]*HistSeriesFeeder)
+	pageRows, pageErr := p.seriesPageRows(subs)
+	if pageErr != nil {
+		return pageErr
+	}
 	var err error
 	for _, sub := range subs {
 		if sub == nil || sub.ExSymbol == nil || orm.NormalizeSeriesSource(sub.Source) == orm.SeriesSourceKline {
@@ -456,12 +503,23 @@ func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
 		if err != nil {
 			return errs.New(core.ErrBadConfig, err)
 		}
+		feeder.BatchRows = pageRows
+		feeder.BatchBytes = p.seriesPageBytes
 		if old := p.series[key]; old != nil && old.sameProjection(feeder) {
-			old.SetEndMS(timeRange.EndMS)
-			items[key] = old
-			continue
+			// Keep an existing cursor only if it already fits the new budget.
+			if len(old.rows) <= pageRows && orm.CheckDataSeriesBytes(orm.WithSeriesReadByteLimit(context.Background(), p.seriesPageBytes), old.rows) == nil {
+				old.BatchRows = pageRows
+				old.BatchBytes = p.seriesPageBytes
+				old.SetEndMS(timeRange.EndMS)
+				items[key] = old
+				continue
+			}
 		}
-		startMS, err_ := ThirdPartyWarmupStart([]*strat.DataSub{sub}, timeRange.StartMS)
+		ctx := context.Background()
+		if p.deps != nil {
+			ctx = p.deps.context()
+		}
+		startMS, err_ := p.subscriptionWarmupStart(ctx, sub, timeRange.StartMS)
 		if err_ != nil {
 			return errs.New(core.ErrBadConfig, err_)
 		}
@@ -472,7 +530,7 @@ func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
 			curMS = p.deps.timeMS()
 		}
 		if curMS > timeRange.StartMS {
-			startMS, err_ = ThirdPartyWarmupStart([]*strat.DataSub{sub}, curMS)
+			startMS, err_ = p.subscriptionWarmupStart(ctx, sub, curMS)
 			if err_ != nil {
 				return errs.New(core.ErrBadConfig, err_)
 			}
@@ -711,6 +769,10 @@ func (p *HistProvider) UnSubPairs(pairs ...string) *errs.Error {
 }
 
 func (p *HistProvider) LoopMain() *errs.Error {
+	if p.genericSubscriptionsSet && !p.genericSubscriptionsReady {
+		return errs.NewMsg(core.ErrBadConfig, "generic subscription initialization failed; discard provider")
+	}
+	p.replayStarted = true
 	if len(p.holderSnapshot()) == 0 && len(p.series) == 0 && len(p.trades) == 0 {
 		return errs.NewMsg(core.ErrBadConfig, "no pairs to run")
 	}
@@ -735,7 +797,7 @@ func (p *HistProvider) LoopMain() *errs.Error {
 	if p.showLog {
 		p.deps.logger().Info("run data loop for backtest..")
 	}
-	err := runHistFeedersWithRuntimeDeps(p.deps, p.makeFeeders, p.dirtyVers, pBar)
+	err := runHistFeedersWithDrainObserver(p.deps, p.makeFeeders, p.dirtyVers, pBar, p.onTimeDrained)
 	if p.pBar != nil {
 		p.pBar.SetProgress("runBT", 1)
 	}
@@ -782,6 +844,20 @@ func RunHistFeedersWithRuntimeDeps(deps *RuntimeDeps, makeFeeders func() []IHist
 }
 
 func runHistFeedersWithRuntimeDeps(deps *RuntimeDeps, makeFeeders func() []IHistFeeder, versions chan int, pBar *utils.PrgBar) *errs.Error {
+	return runHistFeedersWithDrainObserver(deps, makeFeeders, versions, pBar, nil)
+}
+
+// HistDrainObserver runs after all scheduled events at visibleMS have succeeded,
+// including the final timestamp. It is a replay boundary, not a universe barrier.
+type HistDrainObserver func(visibleMS int64) *errs.Error
+
+func (p *HistProvider) SetDrainObserver(observer HistDrainObserver) { p.onTimeDrained = observer }
+
+func RunHistFeedersWithDrainObserver(deps *RuntimeDeps, makeFeeders func() []IHistFeeder, versions chan int, pBar *utils.PrgBar, observer HistDrainObserver) *errs.Error {
+	return runHistFeedersWithDrainObserver(deps, makeFeeders, versions, pBar, observer)
+}
+
+func runHistFeedersWithDrainObserver(deps *RuntimeDeps, makeFeeders func() []IHistFeeder, versions chan int, pBar *utils.PrgBar, observer HistDrainObserver) *errs.Error {
 	var lastBarMs int64
 	var oldVer int
 	var holds histFeederHeap
@@ -814,6 +890,7 @@ func runHistFeedersWithRuntimeDeps(deps *RuntimeDeps, makeFeeders func() []IHist
 		}
 		item := heap.Pop(&holds).(histFeederHeapItem)
 		hold := item.feeder
+		visibleMS := hold.getNextMS()
 		batch := hold.GetBatch()
 		if batch == nil {
 			break
@@ -829,6 +906,14 @@ func runHistFeedersWithRuntimeDeps(deps *RuntimeDeps, makeFeeders func() []IHist
 		item.order = nextOrder
 		nextOrder++
 		heap.Push(&holds, item)
+		if observer != nil && holds[0].feeder.getNextMS() > visibleMS {
+			if deps != nil && deps.context().Err() != nil {
+				return nil
+			}
+			if err := observer(visibleMS); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -915,11 +1000,20 @@ type LiveProvider struct {
 	catalog *DataSourceCatalog
 	symbols *orm.SymbolState
 	*SeriesWatcher
-	OnDataSeries  func(msg *SeriesMsg, rows []*orm.DataSeries) *errs.Error
-	handlerLock   sync.Mutex
-	handlerWait   sync.WaitGroup
-	handlerStop   bool
-	lifecycleOnce sync.Once
+	OnDataSeries          func(msg *SeriesMsg, rows []*orm.DataSeries) *errs.Error
+	handlerLock           sync.Mutex
+	handlerWait           sync.WaitGroup
+	handlerStop           bool
+	lifecycleOnce         sync.Once
+	klineSubscriptionsSet bool
+	generationFactory     LiveProviderGenerationFactory
+	subscriptionSink      *SubscriptionInstallation
+	loopOnce              sync.Once
+	loopDone              chan struct{}
+	loopErr               *errs.Error
+	ingressLocks          sync.Map // pair -> *sync.Mutex, ordered feeder ingress
+	revisions             liveSeriesRevisionLedger
+	revisionStreams       int
 }
 
 func (p *LiveProvider) DataSourceCatalog() *DataSourceCatalog {
@@ -1028,6 +1122,20 @@ func newLiveProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, cat
 	watcher.OnDataMsg = makeOnSeriesMsg(provider)
 	watcher.OnTrades = makeOnTrade(provider)
 	watcher.OnDepth = makeOnDepth(provider)
+	provider.generationFactory = func(ctx context.Context, plan *SubscriptionPlan) (*LiveProvider, error) {
+		if deps == nil {
+			return nil, fmt.Errorf("provider generations require explicit runtime dependencies")
+		}
+		isolated, err := isolateSubscriptionDeps(deps, ctx, plan)
+		if err != nil {
+			return nil, err
+		}
+		next, createErr := NewLiveProviderWithRuntimeDeps(isolated, func(*orm.DataSeries) {}, func(*orm.DataSeries) {})
+		if createErr != nil {
+			return nil, createErr
+		}
+		return next, nil
+	}
 	provider.registerLifecycle()
 	// 立刻订阅实时价格
 	//err = watcher.SendMsg("subscribe", []string{
@@ -1044,7 +1152,7 @@ func newLiveProviderWithCatalog(deps *RuntimeDeps, symbols *orm.SymbolState, cat
 // may also register these callbacks; Stop and Join are intentionally
 // idempotent, and the once guard prevents duplicate registration on retries.
 func (p *LiveProvider) registerLifecycle() {
-	if p == nil || p.deps == nil || p.deps.Callbacks == nil {
+	if p == nil || p.deps == nil || p.deps.Callbacks == nil || p.deps.IsolatedSubscriptions {
 		return
 	}
 	lifecycle, ok := p.deps.Callbacks.(LifecycleRegistrar)
@@ -1116,7 +1224,7 @@ func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 				}
 			}
 		}
-		if len(jobs) > 0 {
+		if len(jobs) > 0 && p.SeriesWatcher != nil {
 			var exchangeName, market string
 			if p.deps == nil {
 				exchangeName, market = core.ExgName, core.Market
@@ -1139,6 +1247,9 @@ func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bo
 				exchangeName, market = core.ExgName, core.Market
 			} else {
 				exchangeName, market = p.deps.identity()
+			}
+			if p.SeriesWatcher == nil {
+				continue
 			}
 			err = p.WatchJobs(exchangeName, market, msgType, jobs...)
 			if err != nil {
@@ -1178,11 +1289,27 @@ func (p *LiveProvider) UnSubPairs(pairs ...string) *errs.Error {
 }
 
 func (p *LiveProvider) LoopMain() *errs.Error {
-	defer func() {
-		_ = p.Close()
-		p.Join()
-	}()
-	return p.RunForever()
+	p.loopOnce.Do(func() {
+		p.loopDone = make(chan struct{})
+		go func() {
+			defer close(p.loopDone)
+			p.loopErr = p.liveLoopError(p.RunForever())
+			_ = p.Close()
+			p.Join()
+		}()
+	})
+	<-p.loopDone
+	return p.loopErr
+}
+
+func (p *LiveProvider) liveLoopError(err *errs.Error) *errs.Error {
+	p.handlerLock.Lock()
+	stopped := p.handlerStop
+	p.handlerLock.Unlock()
+	if stopped && errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 func (p *LiveProvider) beginHandler() bool {
@@ -1210,15 +1337,42 @@ func (p *LiveProvider) joinHandlers() {
 }
 
 func (p *LiveProvider) runHandler(hold IDataFeeder, tfMSecs int64, msg *SeriesMsg, rows []*orm.DataSeries) {
+	if p.subscriptionSink != nil {
+		if projector, ok := hold.(interface {
+			enrichSubscriptionInput(string, []*orm.DataSeries) ([]*orm.DataSeries, *errs.Error)
+		}); ok {
+			projected, err := projector.enrichSubscriptionInput(utils2.SecsToTF(msg.TFSecs), rows)
+			if err != nil {
+				p.subscriptionSink.report(err)
+				return
+			}
+			rows = projected
+		}
+		accepted, gateErr := p.acceptRevisionRows(hold, tfMSecs, msg, rows)
+		if gateErr != nil {
+			p.subscriptionSink.report(gateErr)
+			return
+		}
+		rows = accepted
+		if len(rows) == 0 {
+			return
+		}
+	}
 	_, err := hold.onNewData(tfMSecs, rows)
 	if err != nil {
 		p.deps.logger().Error("onNewData fail", zap.String("p", msg.Pair), zap.Error(err))
+		if p.subscriptionSink != nil {
+			p.subscriptionSink.report(err)
+		}
 		return
 	}
 	if p.OnDataSeries != nil {
 		err = p.OnDataSeries(msg, rows)
 		if err != nil {
 			p.deps.logger().Error("OnDataSeries fail", zap.String("p", msg.Pair), zap.Error(err))
+			if p.subscriptionSink != nil {
+				p.subscriptionSink.report(err)
+			}
 		}
 	}
 }
@@ -1292,14 +1446,26 @@ func makeOnSeriesMsg(p *LiveProvider) func(msg *SeriesMsg) {
 		if !ok {
 			return
 		}
+		lockValue, _ := p.ingressLocks.LoadOrStore(msg.Pair, &sync.Mutex{})
+		ingressLock := lockValue.(*sync.Mutex)
+		// Acquire before dispatch so socket arrival order is also feeder order.
+		ingressLock.Lock()
+		lockOwned := true
+		defer func() {
+			if lockOwned {
+				ingressLock.Unlock()
+			}
+		}()
 		tfMSecs := int64(msg.TFSecs * 1000)
 		exs := getExSymbol2WithRuntimeDeps(p.deps, p.symbols, msg.ExgName, msg.Market, msg.Pair)
 		handleNewRows := func(rows []*orm.DataSeries) {
 			// Transfer the admission token explicitly to the asynchronous callback.
 			// The callback is admitted before Stop seals the provider.
 			admitted = false
+			lockOwned = false
 			go func() {
 				defer p.leaveHandler()
+				defer ingressLock.Unlock()
 				p.runHandler(hold, tfMSecs, msg, rows)
 			}()
 		}
@@ -1367,10 +1533,10 @@ func enrichStoredKlineFieldsWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol
 }
 
 func enrichStoredKlineFieldsWithRuntimeDepsAndReader(deps *RuntimeDeps, exs *orm.ExSymbol, tf string,
-	rows []*orm.DataSeries, reader klineFieldReader,
+	rows []*orm.DataSeries, reader klineFieldReader, extraFields ...[]string,
 ) ([]*orm.DataSeries, *errs.Error) {
 	if deps == nil {
-		return enrichStoredKlineFieldsWithReader(nil, exs, tf, rows, reader)
+		return enrichStoredKlineFieldsWithReader(nil, exs, tf, rows, reader, extraFields...)
 	}
 	var symbols *orm.SymbolState
 	var strategies *strat.State
@@ -1394,18 +1560,23 @@ func enrichStoredKlineFieldsWithRuntimeDepsAndReader(deps *RuntimeDeps, exs *orm
 			return sess.QuerySeriesFields(exs, tf, fields, startMS, endMS, 0, false)
 		}
 	}
-	return enrichStoredKlineFieldsWithState(strategies, symbols, exs, tf, rows, reader)
+	return enrichStoredKlineFieldsWithState(strategies, symbols, exs, tf, rows, reader, extraFields...)
 }
 
 func enrichStoredKlineFieldsWithReader(symbols *orm.SymbolState, exs *orm.ExSymbol, tf string,
-	rows []*orm.DataSeries, reader klineFieldReader,
+	rows []*orm.DataSeries, reader klineFieldReader, extraFields ...[]string,
 ) ([]*orm.DataSeries, *errs.Error) {
 	fields := strat.CollectKlineSubFieldsWithSymbolState(symbols, exs.ID, tf)
+	for _, extra := range extraFields {
+		if len(extra) > 0 {
+			fields = orm.MergeSeriesFields(fields, extra)
+		}
+	}
 	return enrichKlineFieldRows(exs, tf, fields, rows, reader)
 }
 
 func enrichStoredKlineFieldsWithState(strategies *strat.State, symbols *orm.SymbolState, exs *orm.ExSymbol, tf string,
-	rows []*orm.DataSeries, reader klineFieldReader,
+	rows []*orm.DataSeries, reader klineFieldReader, extraFields ...[]string,
 ) ([]*orm.DataSeries, *errs.Error) {
 	if exs == nil || len(rows) == 0 {
 		return rows, nil
@@ -1417,6 +1588,11 @@ func enrichStoredKlineFieldsWithState(strategies *strat.State, symbols *orm.Symb
 		// Explicit providers do not fall back to the process-wide strategy
 		// registry when no strategy state was supplied.
 		fields = orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil)
+	}
+	for _, extra := range extraFields {
+		if len(extra) > 0 {
+			fields = orm.MergeSeriesFields(fields, extra)
+		}
 	}
 	return enrichKlineFieldRows(exs, tf, fields, rows, reader)
 }

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"mime/multipart"
 	"net/http/httptest"
-	"strings"
+	"path/filepath"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
@@ -25,7 +25,7 @@ func TestCsvFilePathRejectsTraversal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(path, "/prices.CSV") {
+	if path != filepath.Join(dir, "prices.CSV") {
 		t.Fatalf("path = %q", path)
 	}
 }

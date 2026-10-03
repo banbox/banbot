@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
 	"github.com/banbox/banbot/btime"
@@ -12,6 +13,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/factor/runner"
 	"github.com/banbox/banbot/goods"
 	"github.com/banbox/banbot/live"
 	"github.com/banbox/banbot/opt"
@@ -26,6 +28,7 @@ import (
 
 type explicitEntrySession struct {
 	process        *runtime.Process
+	runSpec        *config.RunSpec
 	ctx            context.Context
 	cancel         context.CancelFunc
 	exchange       banexg.BanExchange
@@ -46,7 +49,28 @@ func openExplicitEntrySession(args *config.CmdArgs, commands ...string) (*explic
 	if args == nil {
 		return nil, nil, errs.NewMsg(core.ErrBadConfig, "command arguments are required")
 	}
-	snapshot, err := config.LoadRuntimeSnapshot(args)
+	spec, err := config.LoadRunSpec(args, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return openExplicitEntrySessionFromSpec(args, spec, commands...)
+}
+
+func openExplicitEntrySessionFromSpec(args *config.CmdArgs, spec *config.RunSpec, commands ...string) (*explicitEntrySession, *config.Snapshot, *errs.Error) {
+	return openExplicitEntrySessionFromSpecContext(context.Background(), args, spec, commands...)
+}
+
+func openExplicitEntrySessionFromSpecContext(parent context.Context, args *config.CmdArgs, spec *config.RunSpec, commands ...string) (*explicitEntrySession, *config.Snapshot, *errs.Error) {
+	if parent == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "session context is required")
+	}
+	if err := parent.Err(); err != nil {
+		return nil, nil, errs.New(core.ErrRunTime, err)
+	}
+	if args == nil || spec == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "command arguments and RunSpec are required")
+	}
+	snapshot, err := spec.RuntimeSnapshot()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -65,7 +89,7 @@ func openExplicitEntrySession(args *config.CmdArgs, commands ...string) (*explic
 			closeLogger()
 		}
 	}()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	storage, err := orm.OpenStorage(ctx, cfg.Database, snapshot.DataDir)
 	if err != nil {
 		cancel()
@@ -74,6 +98,7 @@ func openExplicitEntrySession(args *config.CmdArgs, commands ...string) (*explic
 	opened = true
 	return &explicitEntrySession{
 		process:     runtime.NewProcess(),
+		runSpec:     spec,
 		ctx:         ctx,
 		cancel:      cancel,
 		storage:     storage,
@@ -236,6 +261,25 @@ func (s *explicitEntrySession) newStorageRuntime(snapshot *config.Snapshot, mode
 		exchangeName = cfg.Exchange.Name
 	}
 	market, contractType = cfg.MarketType, cfg.ContractType
+	var legacy *runtime.LegacyExecutionOptions
+	if cfg.Env == core.RunEnvProd && (mode == core.RunModeLive || mode == core.RunModeOther) && s.exchange != nil {
+		leaseDir := filepath.Join(snapshot.DataDir, "execution", "leases")
+		if s.runSpec != nil {
+			if path, ok := s.runSpec.Config().Execution["sender_lease_dir"].(string); ok && path != "" {
+				var pathErr error
+				leaseDir, pathErr = s.runSpec.ResolvePath("execution.sender_lease_dir")
+				if pathErr != nil {
+					return nil, errs.New(core.ErrBadConfig, pathErr)
+				}
+			}
+		}
+		var pathErr error
+		leaseDir, pathErr = filepath.Abs(leaseDir)
+		if pathErr != nil {
+			return nil, errs.New(core.ErrBadConfig, pathErr)
+		}
+		legacy = &runtime.LegacyExecutionOptions{VenueSessionIdentity: exchangeName + ":" + cfg.Env, SenderLeaseDir: leaseDir}
+	}
 	rt, err := s.process.NewRuntime(runtime.Options{
 		Context:         s.ctx,
 		Logger:          s.logger,
@@ -254,6 +298,7 @@ func (s *explicitEntrySession) newStorageRuntime(snapshot *config.Snapshot, mode
 		ContractType:    contractType,
 		Pairs:           cfg.Pairs,
 		Catalog:         catalog,
+		LegacyExecution: legacy,
 	})
 	if err != nil {
 		return nil, errs.New(errs.CodeRunTime, err)
@@ -299,7 +344,25 @@ func (s *explicitEntrySession) spiderExchangeFactory(snapshot *config.Snapshot, 
 }
 
 func runExplicitBackTest(args *config.CmdArgs) *errs.Error {
-	session, snapshot, err := openExplicitEntrySession(args)
+	return runExplicitBackTestContext(context.Background(), args)
+}
+
+func runExplicitBackTestContext(ctx context.Context, args *config.CmdArgs) *errs.Error {
+	if err := ctx.Err(); err != nil {
+		return errs.New(core.ErrRunTime, err)
+	}
+	spec, specErr := config.LoadRunSpec(args, false)
+	if specErr != nil {
+		return specErr
+	}
+	engines := spec.Engines()
+	if slices.Contains(engines, config.EngineFactor) {
+		return unifiedFactorBacktestContext(ctx, args, spec)
+	}
+	if err := validateLegacyHistory(spec); err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
+	session, snapshot, err := openExplicitEntrySessionFromSpecContext(ctx, args, spec)
 	if err != nil {
 		return err
 	}
@@ -409,11 +472,35 @@ func runExplicitBackTestOnce(session *explicitEntrySession, snapshot *config.Sna
 			fmt.Printf("%s: %v\n", prgOut, rate)
 		})
 	}
-	return executeBackTest(b.OutDir, b.Run)
+	return executeBackTest(b.OutDir, func() *errs.Error { return b.RunContext(session.ctx) })
 }
 
 func runExplicitTrade(args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *errs.Error {
-	session, snapshot, err := openExplicitEntrySession(args, "trade")
+	return runExplicitTradeContext(context.Background(), args, startup)
+}
+
+func runExplicitTradeContext(ctx context.Context, args *config.CmdArgs, startup live.CryptoTraderStartupFunc) *errs.Error {
+	if err := ctx.Err(); err != nil {
+		return errs.New(core.ErrRunTime, err)
+	}
+	spec, err := config.LoadRunSpec(args, false)
+	if err != nil {
+		return err
+	}
+	if slices.Contains(spec.Engines(), config.EngineFactor) {
+		configs, buildErr := buildFactorConfigs(spec, runner.Trade)
+		if buildErr != nil {
+			return errs.New(core.ErrBadConfig, buildErr)
+		}
+		if runErr := runFactorLiveSpec(ctx, spec, configs, "", os.Stdout); runErr != nil {
+			return errs.New(core.ErrRunTime, runErr)
+		}
+		return nil
+	}
+	if err := validateLegacyHistory(spec); err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
+	session, snapshot, err := openExplicitEntrySessionFromSpecContext(ctx, args, spec, "trade")
 	if err != nil {
 		return err
 	}

@@ -1,0 +1,30 @@
+{
+  "Chunks":[{"Path":"chunk.gob","From":3600000,"To":100800002}],
+  "MaxRecords":100000,"MaxPending":32,"DecisionInterval":3600000,
+  "LatencyMS":1,"ExpiryMS":60000,"LabelWaitMS":0,
+  "Snapshot":{
+    "Universe":{"Version":"static-v1","Investable":[1,2,3],"Reference":[1,2,3],"Tradable":[1,2,3],"Evaluation":[1,2,3],"Tracked":[1,2,3],"Static":true},
+    "SIDMap":{"1":"asset-1","2":"asset-2","3":"asset-3"},
+    "Schemas":{"kline":"schema-v1","tick":"schema-v1","funding":"schema-v1"},
+    "SourceVersions":{"kline":"v1","tick":"v1","funding":"v1"},
+    "AdjustmentVersion":"raw","VisibilityPolicy":"available-at"
+  },
+  "Factor":{"Source":"kline","Field":"close","Frequency":"1h","Window":24,"DDOF":1,"WinsorTail":0.01,"Standardize":true},
+  "Manifest":{
+    "Currency":"USD","CodeRevision":"replace-with-source-revision",
+    "Portfolio":{"K":1,"LongNotional":0.5,"ShortNotional":0.5,"Mode":"full"},
+    "Labels":[{"Name":"1h","Kind":"executable-return","Horizon":3600000,"Overlapping":true,"PeriodsPerYear":8760}],
+    "Costs":{"FeeRate":0.001,"SlippageRate":0.001,"FundingPolicy":"required-stream"}
+  },
+  "StrategyID":"momentum-vol","AccountID":"paper-usd","InitialNAV":10000,
+  "Prices":{"Source":"tick","Frequency":"event","Field":"price"},"FundingSource":"funding",
+  "Execution":{
+    "StorePath":"new-paper.db","SenderLeaseDir":"paper-leases",
+    "MarginRate":"0.1","MaxAccountMargin":"10000","MaxVirtualGross":"20000","StrategyGrossLimit":"20000",
+    "Instruments":{
+      "1":{"ID":"asset-1","Version":"v1","Valuation":"linear_perpetual","SettlementCurrency":"USD","QuantityStep":"0.01","ContractSize":"1","PriceTick":"0.01","MoneyScale":8},
+      "2":{"ID":"asset-2","Version":"v1","Valuation":"linear_perpetual","SettlementCurrency":"USD","QuantityStep":"0.01","ContractSize":"1","PriceTick":"0.01","MoneyScale":8},
+      "3":{"ID":"asset-3","Version":"v1","Valuation":"linear_perpetual","SettlementCurrency":"USD","QuantityStep":"0.01","ContractSize":"1","PriceTick":"0.01","MoneyScale":8}
+    }
+  }
+}

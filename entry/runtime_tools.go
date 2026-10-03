@@ -79,6 +79,7 @@ func NewRuntimeKlineConsistencyCommand() *cobra.Command {
 		Short:   "compare live-trade klines with local data",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, values []string) error {
+			args.ExplicitFlags = explicitCommandFlags(command)
 			args.BTStrictSet = command.Flags().Changed("bt-strict")
 			args.NetDisable, args.CPUProfile, args.MemProfile = options.netDisable, options.cpuProfile, options.memProfile
 			return runExplicitKlineConsistency(args, values[0])

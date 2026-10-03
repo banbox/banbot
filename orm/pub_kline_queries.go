@@ -40,6 +40,7 @@ func (q *Queries) PurgeKlineUn() *errs.Error {
   sid        INT,
   timeframe  SYMBOL,
   ts         TIMESTAMP,
+  bar_ts     TIMESTAMP,
   stop_ms    LONG,
   expire_ms  LONG,
   open       DOUBLE,
@@ -71,8 +72,8 @@ func (q *Queries) DelKInfo(sid int32, timeFrame string) *errs.Error {
 	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
-FROM sranges_q
-LATEST BY sid, tbl, timeframe, start_ms
+FROM (SELECT * FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms WHERE sid = $1 AND tbl = $2 AND timeframe = $3)
 WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND coalesce(is_deleted, false) = false`, sid, tbl, timeFrame)
 	if err != nil {
 		return NewDbErr(core.ErrDbReadFail, err)
@@ -126,8 +127,8 @@ func (q *Queries) GetKlineRange(sid int32, timeFrame string) (int64, int64) {
 	row := q.db.QueryRow(ctx, `SELECT min(start_ms), max(stop_ms)
 FROM (
   SELECT start_ms, stop_ms
-  FROM sranges_q
-  LATEST BY sid, tbl, timeframe, start_ms
+  FROM (SELECT * FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms WHERE sid = $1 AND tbl = $2 AND timeframe = $3)
   WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND has_data = true AND coalesce(is_deleted, false) = false
 )`, sid, tbl, timeFrame)
 	var start, stop *int64
@@ -158,8 +159,8 @@ func (q *Queries) GetKlineRanges(sidList []int32, timeFrame string) map[int32][2
 	sqlText := fmt.Sprintf(`SELECT sid, min(start_ms), max(stop_ms)
 FROM (
   SELECT sid, start_ms, stop_ms
-  FROM sranges_q
-  LATEST BY sid, tbl, timeframe, start_ms
+  FROM (SELECT * FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms WHERE tbl = $1 AND timeframe = $2)
   WHERE tbl = $1 AND timeframe = $2 AND has_data = true AND coalesce(is_deleted, false) = false
     AND sid IN (%s)
 )
@@ -189,8 +190,8 @@ func (q *Queries) DelFactors(sid int32, startMS, endMS int64) *errs.Error {
 	unlock := q.LockCompactTableRead("adj_factors_q")
 	defer unlock()
 	sqlText := `SELECT sid, sub_id, start_ms, factor
-FROM adj_factors_q
-LATEST BY sid, sub_id, start_ms
+FROM (SELECT * FROM adj_factors_q
+  LATEST BY sid, sub_id, start_ms WHERE (sid = $1 OR sub_id = $1))
 WHERE (sid = $1 OR sub_id = $1) AND coalesce(is_deleted, false) = false`
 	args := []any{sid}
 	if startMS > 0 {
@@ -226,6 +227,11 @@ WHERE (sid = $1 OR sub_id = $1) AND coalesce(is_deleted, false) = false`
 	now := time.Now().UTC()
 	if len(items) > 0 {
 		const cols = 5
+		var err error
+		now, err = q.reserveMetadataVersions(ctx, "adj_factors_q", len(items), now)
+		if err != nil {
+			return NewDbErr(core.ErrDbExecFail, err)
+		}
 		batchArgs := make([]any, 0, len(items)*cols)
 		for i, k := range items {
 			batchArgs = append(batchArgs, now.Add(time.Duration(i)*time.Microsecond), k.sid, k.subId, k.startMs, k.factor)
@@ -246,8 +252,11 @@ func (q *Queries) DelKLineUn(sid int32, timeFrame string) *errs.Error {
 	}
 	unlock := q.LockCompactTableRead("kline_un_q")
 	defer unlock()
-	ts := time.Now().UTC()
-	_, err := q.db.Exec(ctx, `INSERT INTO kline_un_q (sid, timeframe, ts, stop_ms, expire_ms,
+	ts, err := q.reserveMetadataVersions(ctx, "kline_un_q", 1, time.Time{})
+	if err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	_, err = q.db.Exec(ctx, `INSERT INTO kline_un_q (sid, timeframe, ts, stop_ms, expire_ms,
 open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted)
 VALUES ($1, $2, $3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, true)`, sid, timeFrame, ts)
 	if err != nil {

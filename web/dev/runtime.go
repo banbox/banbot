@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
@@ -23,8 +24,9 @@ type DevServer struct {
 	Data        *data.RuntimeDeps
 	configPaths []string
 
-	runtimeFor  RuntimeFactory
-	maintenance DataToolsRunner
+	runtimeFor        RuntimeFactory
+	maintenance       DataToolsRunner
+	backtestPreflight func(*config.RunSpec) error
 
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -57,6 +59,8 @@ type DevDeps struct {
 	ConfigPaths []string
 	RuntimeFor  RuntimeFactory
 	Maintenance DataToolsRunner
+	// BacktestPreflight validates engine configuration without opening services.
+	BacktestPreflight func(*config.RunSpec) error
 }
 
 func NewDevServer(deps DevDeps) (*DevServer, *errs.Error) {
@@ -74,7 +78,7 @@ func newDevServer(deps DevDeps) *DevServer {
 	ctx, cancel := context.WithCancel(parent)
 	return &DevServer{Data: deps.Data,
 		configPaths: append([]string(nil), deps.ConfigPaths...),
-		runtimeFor:  deps.RuntimeFor, maintenance: deps.Maintenance, ctx: ctx, cancel: cancel,
+		runtimeFor:  deps.RuntimeFor, maintenance: deps.Maintenance, backtestPreflight: deps.BacktestPreflight, ctx: ctx, cancel: cancel,
 		notify: make(chan *ormu.Task, 100), runningBtTasks: make(map[int64]*exec.Cmd), taskStatusCache: make(map[int64]*taskStatusInfo), clients: make(map[*WsClient]struct{})}
 }
 

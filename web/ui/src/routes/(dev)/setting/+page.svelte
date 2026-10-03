@@ -18,6 +18,9 @@
   let theme: Extension | null = $state(oneDark);
   let editor: CodeMirror | null = $state(null);
   let configText = $state('');
+  let configDigests: Record<string, string> = {};
+  let savingConfig = false;
+  let loadedConfigPath = '';
   let tabs: Record<string, string> = {'config.local.yml': '$/config.local.yml', 'config.yml': '$/config.yml'};
 
   // 构建相关状态
@@ -131,30 +134,49 @@
   })
 
   async function loadConfig() {
-    const path = tabs[activeTab] ?? '';
+    const tab = activeTab;
+    const path = tabs[tab] ?? '';
+    loadedConfigPath = '';
     const rsp = await getApi('/dev/text', { path });
     if(rsp.code != 200) {
       alerts.error(rsp.msg || 'load config failed');
       return;
     }
+    if (activeTab !== tab) return;
+    configDigests[path] = rsp.digest ?? '';
+    configText = rsp.data ?? '';
     if (editor) {
-      editor.setValue(activeTab, rsp.data ?? '');
+      editor.setValue(tab, configText);
     }
+    loadedConfigPath = path;
   }
 
   async function saveConfig() {
+    if (savingConfig) return;
     const path = tabs[activeTab] ?? '';
-    const rsp = await postApi('/dev/save_text', {
-      path, content: configText
-    });
+    if (loadedConfigPath !== path) {
+      alerts.error('Wait for the file to load before saving');
+      return;
+    }
+    savingConfig = true;
+    let rsp;
+    try {
+      rsp = await postApi('/dev/save_text', {
+        path, content: editor?.getValue() ?? configText, digest: configDigests[path]
+      });
+    } finally {
+      savingConfig = false;
+    }
     if(rsp.code != 200) {
       alerts.error(rsp.msg || 'save config failed');
       return;
     }
+    configDigests[path] = rsp.digest;
     alerts.success(m.save_success());
   }
   
-  async function onTextChange(value: string) {
+  async function onTextChange(value: string, name?: string) {
+    if (name !== activeTab) return;
     configText = value;
   }
 

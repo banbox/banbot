@@ -20,6 +20,7 @@ import (
 )
 
 func TestQueriesSetAggRulesUpdatesExplicitStateOnly(t *testing.T) {
+	installMetadataVersionTestRoot(t)
 	oldQuestDB := IsQuestDB
 	defer func() { IsQuestDB = oldQuestDB }()
 
@@ -132,6 +133,7 @@ func TestUpdateSymbolBaseReservesSID(t *testing.T) {
 }
 
 func TestQueriesSetListMSUpdatesExplicitStateOnly(t *testing.T) {
+	installMetadataVersionTestRoot(t)
 	oldQuestDB := IsQuestDB
 	defer func() { IsQuestDB = oldQuestDB }()
 
@@ -941,6 +943,9 @@ func (s *setAggRulesDBStub) Query(context.Context, string, ...interface{}) (pgx.
 }
 
 func (s *setAggRulesDBStub) QueryRow(_ context.Context, sql string, _ ...interface{}) pgx.Row {
+	if row, ok := metadataTestQueryRow(sql); ok {
+		return row
+	}
 	if strings.Contains(sql, "LATEST BY sid") {
 		item := *s.item
 		return symbolStateRowStub{scan: func(dest ...interface{}) error {
@@ -1036,6 +1041,9 @@ func (s *sidAllocDBStub) Query(context.Context, string, ...interface{}) (pgx.Row
 }
 
 func (s *sidAllocDBStub) QueryRow(_ context.Context, sql string, args ...interface{}) pgx.Row {
+	if row, ok := metadataTestQueryRow(sql); ok {
+		return row
+	}
 	if s.queryDelay > 0 {
 		time.Sleep(s.queryDelay)
 	}

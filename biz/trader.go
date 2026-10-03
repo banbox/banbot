@@ -44,14 +44,16 @@ var runtimeDepsBindMu sync.Mutex
 // Each explicit trader owns its strategy, order, trading, market, and clock
 // state; legacy package facades are used only by traders without RuntimeDeps.
 type RuntimeDeps struct {
-	Core       *core.State
-	Clock      *btime.ClockState
-	Market     *com.MarketState
-	Batch      *strat.BatchState
-	Strategies *strat.State
-	Orders     *ormo.OrderState
-	Trading    *TradingState
-	Config     *config.Snapshot
+	SharedExecution   *SharedAccountBorrow
+	SharedOrderBridge *SharedOrderBridgeConfig
+	Core              *core.State
+	Clock             *btime.ClockState
+	Market            *com.MarketState
+	Batch             *strat.BatchState
+	Strategies        *strat.State
+	Orders            *ormo.OrderState
+	Trading           *TradingState
+	Config            *config.Snapshot
 	// Accounts is the execution-facing account map owned by the runtime root.
 	// Config remains immutable input; wallet and strategy state share this map.
 	Accounts map[string]*config.AccountConfig
@@ -135,6 +137,9 @@ func NewTraderWithRuntimeDeps(deps RuntimeDeps) (Trader, *errs.Error) {
 	if !deps.Strategies.RuntimeBindingsMatch(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange, deps.AccountsMu, deps.Orders) {
 		return Trader{}, errs.NewMsg(core.ErrBadConfig, "strategy state is not bound to this runtime")
 	}
+	if !deps.Strategies.OrderProcessorBindingsMatch(deps.Trading, deps.DefaultAccount) {
+		return Trader{}, errs.NewMsg(core.ErrBadConfig, "strategy order processor is not bound to this runtime")
+	}
 	return Trader{batchState: unsafe.Pointer(deps.Batch), runtime: &deps}, nil
 }
 
@@ -150,7 +155,7 @@ func BindRuntimeDeps(deps RuntimeDeps) *errs.Error {
 	defer runtimeDepsBindMu.Unlock()
 	if deps.Strategies.RuntimeBindingsMatch(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange, deps.AccountsMu, deps.Orders) &&
 		deps.Orders.RuntimeBindingsMatch(deps.Core, deps.Clock, deps.Market.Prices, deps.Exchange, deps.ConfigView()) {
-		return nil
+		return bindRuntimeOrderProcessor(deps)
 	}
 	if !deps.Strategies.CanBindRuntime(deps.Core, deps.Clock, deps.ConfigView(), deps.Symbols, deps.Exchange, deps.AccountsMu, deps.Orders) {
 		return errs.NewMsg(core.ErrBadConfig, "strategy state is already bound to another runtime")
@@ -163,6 +168,9 @@ func BindRuntimeDeps(deps RuntimeDeps) *errs.Error {
 	}
 	if !deps.Orders.BindRuntimeOnce(deps.Core, deps.Clock, deps.Market.Prices, deps.Exchange, deps.ConfigView()) {
 		return errs.NewMsg(core.ErrBadConfig, "order state changed while binding runtime")
+	}
+	if err := bindRuntimeOrderProcessor(deps); err != nil {
+		return err
 	}
 	if cfg := deps.ConfigView(); cfg != nil {
 		if deps.Config.DataDir != "" {

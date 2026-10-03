@@ -230,6 +230,7 @@ func (s *KLineSeriesStore) readRaw(ctx context.Context, target *ExSymbol, startM
 	tfMS := int64(utils2.TFToSecs(info.TimeFrame)) * 1000
 	source := NormalizeSeriesSource(info.Name)
 	out := make([]*DataSeries, 0)
+	byteCounter := SeriesByteCounter{Limit: SeriesReadByteLimit(ctx)}
 	for dbRows.Next() {
 		rec, err_ := scanKLineSeriesRecord(dbRows, binding.Fields)
 		if err_ != nil {
@@ -241,7 +242,7 @@ func (s *KLineSeriesStore) readRaw(ctx context.Context, target *ExSymbol, startM
 		if q.isQuestDB() && !seriesRangeCovered(rec.TimeMS, covered) {
 			continue
 		}
-		out = append(out, &DataSeries{
+		row := &DataSeries{
 			Source:    source,
 			Sid:       rec.Sid,
 			TimeMS:    rec.TimeMS,
@@ -250,7 +251,11 @@ func (s *KLineSeriesStore) readRaw(ctx context.Context, target *ExSymbol, startM
 			Closed:    true,
 			Values:    rec.Values,
 			ExSymbol:  target,
-		})
+		}
+		if err := byteCounter.AddSeries(row); err != nil {
+			return nil, NewDbErr(core.ErrDbReadFail, err)
+		}
+		out = append(out, row)
 		if q.isQuestDB() && limit > 0 && len(out) >= limit {
 			break
 		}

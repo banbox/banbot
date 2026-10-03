@@ -54,6 +54,31 @@ func TestNormalizeDataSubValidatesAndProjectsSeriesFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeDataSubSelectedProjectionKeepsNumericViewsScoped(t *testing.T) {
+	info := orm.NewSeriesInfo("quotes", "event", []orm.SeriesField{
+		{Name: "integer", Type: "int"}, {Name: "close", Type: "float"}, {Name: "bid", Type: "float"},
+	})
+	for _, fields := range [][]string{{"integer"}, {"close"}, {"integer", "close"}} {
+		sub := &strat.DataSub{Source: "quotes", TimeFrame: "event", ExSymbol: &orm.ExSymbol{ID: 1, Symbol: "asset"}, Fields: fields, Projection: orm.ProjectionSelected}
+		got, err := NormalizeDataSub(info, sub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got.Fields, fields) {
+			t.Fatalf("selected projection %v expanded to %v", fields, got.Fields)
+		}
+		for _, field := range got.SeriesFields {
+			found := false
+			for _, requested := range fields {
+				found = found || field == requested
+			}
+			if !found {
+				t.Fatalf("numeric view %q is outside projection %v", field, fields)
+			}
+		}
+	}
+}
+
 func TestNormalizeDataSubRejectsBadInput(t *testing.T) {
 	info := orm.NewSeriesInfo("custom_metric", "1h", []orm.SeriesField{{Name: "value", Type: "float"}})
 	cases := []struct {

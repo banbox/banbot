@@ -82,7 +82,10 @@ func (q *Queries) AddCalendars(ctx context.Context, arg []AddCalendarsParams) (i
 	}
 	unlock := q.LockCompactTableRead("calendars_q")
 	defer unlock()
-	now := time.Now().UTC()
+	now, err := q.reserveMetadataVersions(ctx, "calendars_q", len(arg), time.Time{})
+	if err != nil {
+		return 0, err
+	}
 	const cols = 4
 	args := make([]any, 0, len(arg)*cols)
 	for i, c := range arg {
@@ -107,7 +110,10 @@ func (q *Queries) AddAdjFactors(ctx context.Context, arg []AddAdjFactorsParams) 
 	}
 	unlock := q.LockCompactTableRead("adj_factors_q")
 	defer unlock()
-	now := time.Now().UTC()
+	now, err := q.reserveMetadataVersions(ctx, "adj_factors_q", len(arg), time.Time{})
+	if err != nil {
+		return 0, err
+	}
 	const cols = 5
 	args := make([]any, 0, len(arg)*cols)
 	for i, f := range arg {
@@ -134,8 +140,8 @@ func (q *Queries) GetAdjFactors(ctx context.Context, sid int32) ([]*AdjFactor, e
 
 func (q *Queries) getAdjFactorsQuest(ctx context.Context, sid int32) ([]*AdjFactor, error) {
 	rows, err := q.db.Query(ctx, `SELECT sid, sub_id, start_ms, factor
-FROM adj_factors_q
-LATEST BY sid, sub_id, start_ms
+FROM (SELECT * FROM adj_factors_q
+  LATEST BY sid, sub_id, start_ms WHERE sid = $1)
 WHERE sid = $1 AND coalesce(is_deleted, false) = false
 ORDER BY start_ms`, sid)
 	if err != nil {
@@ -179,13 +185,20 @@ func (q *Queries) DelAdjFactors(ctx context.Context, sid int32) error {
 
 // batchInsertAdjFactorsDeleted marks a list of adj_factor rows as deleted in one multi-row INSERT.
 func batchInsertAdjFactorsDeleted(ctx context.Context, q *Queries, factors []*AdjFactor, now time.Time) error {
+	if len(factors) == 0 {
+		return nil
+	}
+	now, err := q.reserveMetadataVersions(ctx, "adj_factors_q", len(factors), now)
+	if err != nil {
+		return err
+	}
 	const cols = 5 // ts, sid, sub_id, start_ms, factor
 	args := make([]any, 0, len(factors)*cols)
 	for i, f := range factors {
 		args = append(args, now.Add(time.Duration(i)*time.Microsecond), f.Sid, f.SubID, f.StartMs, f.Factor)
 	}
 	sql := "INSERT INTO adj_factors_q (ts,sid,sub_id,start_ms,factor,is_deleted) VALUES " + buildBatchValues(len(factors), cols, ",true")
-	_, err := q.db.Exec(ctx, sql, args...)
+	_, err = q.db.Exec(ctx, sql, args...)
 	return err
 }
 
@@ -200,8 +213,8 @@ func (q *Queries) GetInsKline(ctx context.Context, sid int32, timeframe string) 
 	defer unlock()
 	load := func() (*InsKline, error) {
 		row := q.db.QueryRow(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
-FROM ins_kline_q
-LATEST BY sid, timeframe
+FROM (SELECT * FROM ins_kline_q
+  LATEST BY sid, timeframe WHERE sid = $1 AND timeframe = $2)
 WHERE sid = $1 AND timeframe = $2 AND coalesce(is_deleted, false) = false`, sid, timeframe)
 		var i InsKline
 		if err := row.Scan(&i.Sid, &i.Timeframe, &i.Ts, &i.StartMs, &i.StopMs); err != nil {
@@ -236,8 +249,8 @@ func (q *Queries) GetAllInsKlines(ctx context.Context) ([]*InsKline, error) {
 	defer unlock()
 	load := func() ([]*InsKline, error) {
 		rows, err := q.db.Query(ctx, `SELECT sid, timeframe, ts, start_ms, stop_ms
-FROM ins_kline_q
-LATEST BY sid, timeframe
+FROM (SELECT * FROM ins_kline_q
+  LATEST BY sid, timeframe)
 WHERE coalesce(is_deleted, false) = false`)
 		if err != nil {
 			return nil, err
@@ -283,9 +296,13 @@ func (q *Queries) DelInsKline(ctx context.Context, sid int32, timeframe string, 
 	}
 	unlock := q.LockCompactTableRead("ins_kline_q")
 	defer unlock()
+	deleteTS, versionErr := q.reserveMetadataVersions(ctx, "ins_kline_q", 1, ts)
+	if versionErr != nil {
+		return versionErr
+	}
 	write := func() error {
 		_, err := q.db.Exec(ctx, `INSERT INTO ins_kline_q (sid, timeframe, ts, start_ms, stop_ms, is_deleted)
-	VALUES ($1, $2, $3, 0, 0, true)`, sid, timeframe, ts)
+	VALUES ($1, $2, $3, 0, 0, true)`, sid, timeframe, deleteTS)
 		return err
 	}
 	err := write()
@@ -320,7 +337,12 @@ func (q *Queries) AddInsKline(ctx context.Context, arg AddInsKlineParams) (time.
 	}
 	ts := time.Now().UTC()
 	if q.isQuestDB() {
-		ts = normalizeQuestTimestamp(ts)
+		var err error
+		ts, err = q.reserveMetadataVersions(ctx, "ins_kline_q", 1, time.Time{})
+		if err != nil {
+			insKlineLocksmu.Unlock()
+			return time.Time{}, err
+		}
 	}
 	insKlineLocks[key] = ts
 	insKlineLocksmu.Unlock()
@@ -395,8 +417,8 @@ func (q *Queries) ListExchanges(ctx context.Context) ([]string, error) {
 	unlock := q.LockCompactTableRead("exsymbol_q")
 	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT DISTINCT exchange
-FROM exsymbol_q
-LATEST BY sid
+FROM (SELECT * FROM exsymbol_q
+  LATEST BY sid)
 WHERE coalesce(is_deleted, false) = false
 ORDER BY exchange`)
 	if err != nil {
@@ -424,8 +446,8 @@ func (q *Queries) ListSymbols(ctx context.Context, exchange string) ([]*ExSymbol
 	unlock := q.LockCompactTableRead("exsymbol_q")
 	defer unlock()
 	rows, err := q.db.Query(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, coalesce(agg_rules, '')
-FROM exsymbol_q
-LATEST BY sid
+FROM (SELECT * FROM exsymbol_q
+  LATEST BY sid)
 WHERE exchange = $1 AND coalesce(is_deleted, false) = false
 ORDER BY sid`, exchange)
 	if err != nil {
@@ -605,7 +627,10 @@ func (q *Queries) addSymbolsLocked(ctx context.Context, state *SymbolState, lega
 		return 0, err
 	}
 	prepareSymbolSIDAllocation(allocator, state, dbMax)
-	now := time.Now().UTC()
+	now, err := q.reserveMetadataVersionsAtRoot(ctx, compactProcessLockRootForAllocator(allocator), "exsymbol_q", len(newArg), time.Time{})
+	if err != nil {
+		return 0, err
+	}
 	ids := make([]int32, len(newArg))
 	for i := range newArg {
 		key := exSymbolKey(newArg[i].Exchange, newArg[i].Market, newArg[i].Symbol)
@@ -745,7 +770,16 @@ func (q *Queries) addSymbolsQuestDBWithRegistry(ctx context.Context, state *Symb
 	if len(reservations) != len(missing) {
 		return 0, fmt.Errorf("SID registry returned %d rows for %d symbols", len(reservations), len(missing))
 	}
-	now := time.Now().UTC()
+	var floor time.Time
+	for _, reservation := range reservations {
+		if reservation.WriteTS.After(floor) {
+			floor = reservation.WriteTS
+		}
+	}
+	now, err := q.reserveMetadataVersionsAtRoot(ctx, compactProcessLockRootForAllocator(allocator), "exsymbol_q", len(reservations), floor)
+	if err != nil {
+		return 0, err
+	}
 	rows := make([]exSymbolRecoveryRow, len(reservations))
 	for i, reservation := range reservations {
 		item := &reservation.ExSymbol
@@ -874,8 +908,8 @@ func queryQuestDBCanonicalSymbol(ctx context.Context, q *Queries, requested AddS
 		return reader.lookupQuestCanonicalExSymbol(ctx, requested.Exchange, requested.Market, requested.Symbol)
 	}
 	row := q.db.QueryRow(ctx, `SELECT sid, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, coalesce(agg_rules, '')
-FROM exsymbol_q
-LATEST BY sid
+FROM (SELECT * FROM exsymbol_q
+  LATEST BY sid)
 WHERE exchange = $1 AND market = $2 AND symbol = $3 AND coalesce(is_deleted, false) = false
 ORDER BY sid
 LIMIT 1`,
@@ -918,7 +952,17 @@ func ensurePendingExSymbolMarkers(allocator *SIDAllocator, recoveryRoot string, 
 		return "", "", nil
 	}
 	rows = append([]exSymbolRecoveryRow(nil), rows...)
-	now := time.Now().UTC()
+	var now time.Time
+	for _, row := range rows {
+		if row.WriteTS.IsZero() {
+			var err error
+			now, err = reserveQuestMetadataVersions(context.Background(), compactProcessLockRootForAllocator(allocator), "exsymbol_q", len(rows), time.Time{}, nil)
+			if err != nil {
+				return "", "", err
+			}
+			break
+		}
+	}
 	for i := range rows {
 		if rows[i].WriteTS.IsZero() {
 			rows[i].WriteTS = now.Add(time.Duration(i) * time.Microsecond)
@@ -1066,7 +1110,10 @@ func (q *Queries) setListMS(ctx context.Context, state *SymbolState, arg SetList
 	if err != nil || item == nil {
 		return fmt.Errorf("SetListMS: sid %d not found: %w", arg.ID, err)
 	}
-	ts := time.Now().UTC()
+	ts, err := q.reserveMetadataVersionsAtRoot(ctx, compactProcessLockRootForAllocator(state.sidAllocator()), "exsymbol_q", 1, time.Time{})
+	if err != nil {
+		return err
+	}
 	_, err = q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules, is_deleted)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
 		item.ID, ts, item.Exchange, item.ExgReal, item.Market, item.Symbol, item.Combined, arg.ListMs, arg.DelistMs, item.AggRules)
@@ -1116,7 +1163,10 @@ func (q *Queries) setAggRules(ctx context.Context, state *SymbolState, arg SetAg
 	if err != nil || item == nil {
 		return fmt.Errorf("SetAggRules: sid %d not found: %w", arg.ID, err)
 	}
-	ts := time.Now().UTC()
+	ts, err := q.reserveMetadataVersionsAtRoot(ctx, compactProcessLockRootForAllocator(state.sidAllocator()), "exsymbol_q", 1, time.Time{})
+	if err != nil {
+		return err
+	}
 	_, err = q.db.Exec(ctx, `INSERT INTO exsymbol_q (sid, ts, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules, is_deleted)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)`,
 		item.ID, ts, item.Exchange, item.ExgReal, item.Market, item.Symbol, item.Combined, item.ListMs, item.DelistMs, arg.AggRules)

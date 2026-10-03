@@ -1535,7 +1535,7 @@ func newClientIOWithContext(ctx context.Context, addr, aesKey string, installLeg
 // NewClientIOWithState binds the client lifecycle and run mode to one runtime
 // state. A missing or empty state mode is deliberately treated as non-live;
 // this constructor never falls back to core.LiveMode.
-func NewClientIOWithState(state *core.State, addr, aesKey string) (*ClientIO, *errs.Error) {
+func NewClientIOWithState(state *core.State, addr, aesKey string, contexts ...context.Context) (*ClientIO, *errs.Error) {
 	ctx := context.Background()
 	runMode := core.RunModeOther
 	if state != nil {
@@ -1545,6 +1545,9 @@ func NewClientIOWithState(state *core.State, addr, aesKey string) (*ClientIO, *e
 		if state.RunMode != "" {
 			runMode = state.RunMode
 		}
+	}
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
 	}
 	client, err := newClientIOWithContext(ctx, addr, aesKey, false)
 	if client != nil {

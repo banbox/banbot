@@ -1,6 +1,7 @@
 package entry
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
@@ -41,9 +42,12 @@ func RunCmd() {
 		core.RunExitCalls()
 	}()
 
-	installSignalHandler()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopSignals := installSignalHandler(cancel)
+	defer stopSignals()
 	deadlock.Opts.Disable = true
-	if err := Execute(os.Args[1:]); err != nil {
+	if err := ExecuteContext(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		core.RunExitCalls()
 		os.Exit(1)
@@ -57,6 +61,18 @@ func panicStack() []byte {
 // Execute runs banbot with an explicit argument list. It is separated from
 // RunCmd so callers and tests can execute the Cobra command tree without exits.
 func Execute(args []string) error {
+	return ExecuteContext(context.Background(), args)
+}
+
+// ExecuteContext carries caller cancellation to explicit task/session owners,
+// including archive-only tasks that never register a database Runtime.
+func ExecuteContext(ctx context.Context, args []string) error {
+	if ctx == nil {
+		return fmt.Errorf("command context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	command := NewRootCommand()
 	if isImplicitWebInvocation(args) {
 		command = web.NewDevCommandWithFactory(newDevWebServer)
@@ -64,7 +80,7 @@ func Execute(args []string) error {
 		command.SilenceUsage = true
 	}
 	command.SetArgs(normalizeLegacyFlags(command, args))
-	return command.Execute()
+	return command.ExecuteContext(ctx)
 }
 
 func isImplicitWebInvocation(args []string) bool {
@@ -90,7 +106,7 @@ func NewRootCommand() *cobra.Command {
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		RunE:          func(_ *cobra.Command, _ []string) error { return runDefaultWeb() },
+		RunE:          func(command *cobra.Command, _ []string) error { return runDefaultWeb(command.Context()) },
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.SetVersionTemplate("banbot {{.Version}}\n")
@@ -116,17 +132,23 @@ func NewRootCommand() *cobra.Command {
 	return root
 }
 
-func runDefaultWeb() error {
+func runDefaultWeb(ctx context.Context) error {
 	command := web.NewDevCommandWithFactory(newDevWebServer)
 	command.SetArgs([]string{})
-	return command.Execute()
+	return command.ExecuteContext(ctx)
 }
 
-func installSignalHandler() {
+func installSignalHandler(cancel context.CancelFunc) func() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan struct{})
 	go func() {
-		<-sigChan
+		select {
+		case <-sigChan:
+		case <-done:
+			return
+		}
+		cancel()
 		// Stop is only cancellation. Wait for each explicit Runtime owner to
 		// join callbacks and flush state before the command returns; os.Exit
 		// would bypass the entry/session defers that close storage and exchange
@@ -137,9 +159,16 @@ func installSignalHandler() {
 		}
 		core.RunExitCalls()
 	}()
+	return func() { signal.Stop(sigChan); close(done) }
 }
 
 func newRuntimeConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
+	return newRuntimeConfigCommandContext(name, help, func(_ context.Context, args *config.CmdArgs) *errs.Error {
+		return run(args)
+	}, allowDeadlock, binders...)
+}
+
+func newRuntimeConfigCommandContext(name, help string, run func(context.Context, *config.CmdArgs) *errs.Error, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
 	args := &config.CmdArgs{}
 	options := &runtimeCommandFlags{}
 	command := &cobra.Command{
@@ -147,11 +176,12 @@ func newRuntimeConfigCommand(name, help string, run FuncEntry, allowDeadlock boo
 		Short: help,
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
+			args.ExplicitFlags = explicitCommandFlags(command)
 			args.BTStrictSet = command.Flags().Changed("bt-strict")
 			args.NetDisable = options.netDisable
 			args.CPUProfile = options.cpuProfile
 			args.MemProfile = options.memProfile
-			if err := run(args); err != nil {
+			if err := run(command.Context(), args); err != nil {
 				return err
 			}
 			return nil
@@ -162,6 +192,12 @@ func newRuntimeConfigCommand(name, help string, run FuncEntry, allowDeadlock boo
 		bind(args, command.Flags())
 	}
 	return command
+}
+
+func explicitCommandFlags(command *cobra.Command) map[string]bool {
+	result := make(map[string]bool)
+	command.Flags().Visit(func(flag *pflag.Flag) { result[flag.Name] = true })
+	return result
 }
 
 type runtimeCommandFlags struct {

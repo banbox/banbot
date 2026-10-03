@@ -40,6 +40,9 @@ func (s *visibilityDBStub) Query(_ context.Context, sql string, args ...interfac
 }
 
 func (s *visibilityDBStub) QueryRow(_ context.Context, sql string, args ...interface{}) pgx.Row {
+	if row, ok := metadataTestQueryRow(sql); ok {
+		return row
+	}
 	if s.queryRow == nil {
 		return scriptedRow{values: []any{int64(0)}}
 	}

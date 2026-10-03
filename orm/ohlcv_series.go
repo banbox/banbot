@@ -918,7 +918,7 @@ where sid=%d and ts >= cast(%v as timestamp) and ts < cast(%v as timestamp)
 order by ts`, projection, exs.ID, startMs*1000, finishEndMS*1000)
 	}
 	subTF, pgRows, err_ := queryHyper(q, timeframe, sql, limit)
-	rows, err_ := mapToSeriesFields(exs, timeframe, fields, pgRows, err_)
+	rows, err_ := mapToSeriesFieldsWithContext(q.seriesReadContext(), exs, timeframe, fields, pgRows, err_)
 	if err_ != nil {
 		return nil, "", NewDbErr(core.ErrDbReadFail, err_)
 	}
@@ -951,7 +951,7 @@ func (q *Queries) querySeriesPg(exs *ExSymbol, timeframe string, fields []string
 		sql += fmt.Sprintf(" LIMIT %d", limit)
 	}
 	pgRows, err := q.db.Query(context.Background(), sql)
-	rows, err := mapToSeriesFields(exs, timeframe, fields, pgRows, err)
+	rows, err := mapToSeriesFieldsWithContext(q.seriesReadContext(), exs, timeframe, fields, pgRows, err)
 	return rows, subTF, err
 }
 
@@ -1068,6 +1068,10 @@ func mapToSeries(exs *ExSymbol, timeframe string, pgRows pgx.Rows, err_ error) (
 }
 
 func mapToSeriesFields(exs *ExSymbol, timeframe string, fields []string, pgRows pgx.Rows, err_ error) ([]*DataSeries, error) {
+	return mapToSeriesFieldsWithContext(context.Background(), exs, timeframe, fields, pgRows, err_)
+}
+
+func mapToSeriesFieldsWithContext(ctx context.Context, exs *ExSymbol, timeframe string, fields []string, pgRows pgx.Rows, err_ error) ([]*DataSeries, error) {
 	if err_ != nil {
 		return nil, err_
 	}
@@ -1078,6 +1082,7 @@ func mapToSeriesFields(exs *ExSymbol, timeframe string, fields []string, pgRows 
 	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
 	var out []*DataSeries
+	byteCounter := SeriesByteCounter{Limit: SeriesReadByteLimit(ctx)}
 	var timeMS int64
 	values := make([]any, len(fields))
 	targets := make([]any, 1+len(fields))
@@ -1099,10 +1104,14 @@ func mapToSeriesFields(exs *ExSymbol, timeframe string, fields []string, pgRows 
 		if exs != nil {
 			sid = exs.ID
 		}
-		out = append(out, &DataSeries{
+		row := &DataSeries{
 			Source: SeriesSourceKline, Sid: sid, TimeMS: timeMS, EndMS: timeMS + tfMSecs,
 			TimeFrame: timeframe, Closed: true, Values: valueMap, ExSymbol: exs,
-		})
+		}
+		if err := byteCounter.AddSeries(row); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
 	}
 	return out, pgRows.Err()
 }

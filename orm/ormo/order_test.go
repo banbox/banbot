@@ -207,23 +207,16 @@ func useTempTradeDB(t *testing.T) {
 	orm.SetDbPath(orm.DbTrades, filepath.Join(testDBDir, t.Name()+".db"))
 }
 
-func initApp() *errs.Error {
-	var args config.CmdArgs
-	return config.LoadConfig(&args)
-}
-
 func TestGetOrders(t *testing.T) {
-	err := initApp()
-	if err != nil {
-		panic(err)
-	}
 	useTempTradeDB(t)
 	sess, conn, err := Conn(orm.DbTrades, true)
 	if err != nil {
-		panic(err)
+		t.Fatalf("open trade database: %v", err)
 	}
 	defer conn.Close()
-	sess.GetOrders(GetOrdersArgs{})
+	if _, err := sess.GetOrders(GetOrdersArgs{}); err != nil {
+		t.Fatalf("query orders: %v", err)
+	}
 }
 
 func TestSaveToDbRestoresIDsWhenEnterInsertFails(t *testing.T) {

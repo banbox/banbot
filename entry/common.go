@@ -1,6 +1,7 @@
 package entry
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -120,6 +121,7 @@ func commandRegistrySnapshot() ([]commandGroup, []registeredCommand) {
 }
 
 func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Command) {
+	root.AddCommand(newFactorCommand())
 	add := func(parent string, command *cobra.Command) {
 		if parent == "" {
 			root.AddCommand(command)
@@ -128,10 +130,12 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 		groups[parent].AddCommand(command)
 	}
 
-	add("", newRuntimeConfigCommand("trade", "live trade", runTradeEntry, false,
+	add("", newRuntimeConfigCommandContext("trade", "live trade", func(ctx context.Context, args *config.CmdArgs) *errs.Error {
+		return runExplicitTradeContext(ctx, args, nil)
+	}, false,
 		bindStakeAmount, bindPairs, bindSpider, bindOut))
 	add("", newInternalCommand())
-	add("", newRuntimeConfigCommand("backtest", "backtest with strategies and data", runBackTestEntry, true,
+	add("", newRuntimeConfigCommandContext("backtest", "backtest with strategies and data", runExplicitBackTestContext, true,
 		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate, bindBTStrict))
 	add("", newRuntimeConfigCommand("spider", "start the spider", runSpider, false))
 	add("", newRuntimeConfigCommand("optimize", "run hyperparameter optimization", func(args *config.CmdArgs) *errs.Error { return runExplicitOptimization(args, opt.RunOptimize) }, true,

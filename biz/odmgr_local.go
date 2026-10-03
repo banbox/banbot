@@ -11,6 +11,7 @@ import (
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
@@ -44,6 +45,10 @@ func InitLocalOrderMgrWithPriceState(callBack FnOdCb, showLog bool, prices *com.
 // accounting to one explicit Runtime. The legacy initializer remains the
 // compatibility path for callers that still use package state.
 func InitLocalOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack FnOdCb, showLog bool, stops ...func()) {
+	if deps.SharedExecution != nil {
+		initSharedOrderMgr(deps, callBack)
+		return
+	}
 	requireRuntimeDeps(deps)
 	initLocalOrderMgr(&deps, callBack, showLog, nil, nil, stops...)
 }
@@ -338,32 +343,7 @@ func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *or
 		price := exOrder.Price
 		odTFSecs := utils.TFToSecs(matchTf)
 		fillMS := exOrder.CreateAt + int64(o.backtestNetCost()*1000)
-		barStartMS := utils.AlignTfMSecs(fillMS, int64(odTFSecs*1000))
-		odIsBuy := exOrder.Side == banexg.OdSideBuy
-		var minRate float64
 		var fillBarRate float64
-		var isStopEnter bool
-		if exOrder.Enter && od.Stop > 0 && evt != nil {
-			// 使用触发价格，enterOrder中已判断有效性
-			trigPrice := od.Stop
-			lowVal, _ := evt.LowValue()
-			highVal, _ := evt.HighValue()
-			if !stopEntryTriggeredWith(odIsBuy, trigPrice, lowVal, highVal, o.legacyIntrabarEnabled()) {
-				// The bar has not crossed the stop in the order direction.
-				continue
-			}
-			price = trigPrice
-			od.Stop = 0
-			if strings.Contains(odType, "limit") && exOrder.Price > 0 && (exOrder.Price > trigPrice) == od.Short {
-				// 触发价满足，有额外限价单
-				price = exOrder.Price
-			}
-			minRate = float64((exOrder.CreateAt-barStartMS)/1000) / float64(odTFSecs)
-			minRate = o.simMarketRate(bar, trigPrice, odIsBuy, true, minRate)
-			fillBarRate = minRate
-			fillMS = evt.TimeMS + int64(float64(odTFSecs)*minRate)*1000
-			isStopEnter = true
-		}
 		if evt == nil {
 			if o.isBacktest() {
 				price = o.lastBarPrice(od.Symbol)
@@ -373,36 +353,19 @@ func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *or
 			if price < 0 {
 				continue
 			}
-		} else if strings.Contains(odType, "limit") && exOrder.Price > 0 {
-			lowVal, _ := evt.LowValue()
-			highVal, _ := evt.HighValue()
-			openVal, _ := evt.OpenValue()
-			if odIsBuy {
-				if price < lowVal {
-					continue
-				} else if price > openVal {
-					// 买价高于市价，以市价成交
-					// If the purchase price is higher than the market price, the transaction will be completed at the market price.
-					price = openVal
-				}
-			} else {
-				if price > highVal {
-					continue
-				} else if price < openVal {
-					// If the selling price is lower than the market price, the transaction will be done at the market price.
-					// 卖价低于市价，以市价成交
-					price = openVal
-				}
+		} else {
+			fill, matched := (execution.OHLCProfile{LegacyIntrabar: o.legacyIntrabarEnabled()}).MatchPending(bar, execution.OHLCOrder{
+				OrderType: odType, IsBuy: exOrder.Side == banexg.OdSideBuy,
+				Enter: exOrder.Enter, Short: od.Short, Price: exOrder.Price,
+				Stop: od.Stop, CreateAt: exOrder.CreateAt,
+			}, odTFSecs, o.backtestNetCost())
+			if fill.StopTriggered {
+				od.Stop = 0
 			}
-			if minRate == 0 {
-				minRate = float64((exOrder.CreateAt-barStartMS)/1000) / float64(odTFSecs)
+			if !matched {
+				continue
 			}
-			fillBarRate = o.simMarketRate(bar, exOrder.Price, odIsBuy, false, minRate)
-			fillMS = evt.TimeMS + int64(float64(odTFSecs)*fillBarRate)*1000
-		} else if !isStopEnter {
-			// 按网络延迟，模拟成交价格，和开盘价接近According to the network delay, the simulated transaction price is close to the opening price
-			fillBarRate = float64((fillMS-barStartMS)/1000) / float64(odTFSecs)
-			price = o.simMarketPrice(bar, fillBarRate)
+			price, fillMS, fillBarRate = fill.Price, fill.TimeMS, fill.Rate
 		}
 		var err *errs.Error
 		if exOrder.Enter {
@@ -451,13 +414,7 @@ func stopEntryTriggered(isBuy bool, trigger, low, high float64) bool {
 }
 
 func stopEntryTriggeredWith(isBuy bool, trigger, low, high float64, legacyIntrabar bool) bool {
-	if legacyIntrabar {
-		if isBuy {
-			return trigger <= high
-		}
-		return trigger >= low
-	}
-	return trigger >= low && trigger <= high
+	return (execution.OHLCProfile{LegacyIntrabar: legacyIntrabar}).StopEntryTriggered(isBuy, trigger, low, high)
 }
 
 func (o *LocalOrderMgr) simMarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {
@@ -488,11 +445,7 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	if exchange == nil {
 		return errs.NewMsg(core.ErrExgNotInit, "exchange is required to fill %s", od.Symbol)
 	}
-	market, err := exchange.GetMarket(od.Symbol)
-	if err != nil {
-		return err
-	}
-	entPrice, err := exchange.PrecPrice(market, price)
+	market, entPrice, err := execution.OHLCEntryPrice(exchange, od.Symbol, price)
 	if err != nil {
 		return err
 	}
@@ -503,8 +456,8 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 			// 现货空单，必须给定数量
 			return errs.NewMsg(core.ErrInvalidCost, "EnterAmount is required")
 		}
-		entAmount := od.QuoteCost / entPrice
-		exOrder.Amount, err = exchange.PrecAmount(market, entAmount)
+		var entAmount float64
+		entAmount, exOrder.Amount, err = execution.OHLCEntryAmount(exchange, market, od.QuoteCost, entPrice)
 		if err != nil || exOrder.Amount == 0 {
 			if err != nil {
 				if o.showLog {
@@ -602,81 +555,43 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 	if sl == nil && tp == nil {
 		return nil
 	}
-	if sl != nil && !sl.Hit {
-		// 空单止损，最高价超过止损价触发
-		// Short order stop loss, triggered when the highest price exceeds the stop loss price
-		// 多单止损，最低价跌破止损价触发
-		// Stop loss for long orders, triggered when the lowest price falls below the stop loss price
-		sl.Hit = od.Short && bar.High >= sl.Price || !od.Short && bar.Low <= sl.Price
+	fill := (execution.OHLCProfile{LegacyIntrabar: o.legacyIntrabarEnabled()}).MatchProtection(
+		bar, od.Short, ohlcProtectionView(sl), ohlcProtectionView(tp), afterRate,
+		float64(utils.TFToSecs(tf)), o.priceNow())
+	if sl != nil {
+		sl.Hit = fill.HitSL
 	}
-	if tp != nil && !tp.Hit {
-		// 空单止盈，最低价跌破止盈价触发
-		// Short order stop profit, the lowest price falls below the stop profit price to trigger
-		// 多单止盈，最高价突破止盈价触发
-		// Long order stop profit, the highest price breaks through the stop profit price to trigger
-		tp.Hit = od.Short && bar.Low <= tp.Price || !od.Short && bar.High >= tp.Price
+	if tp != nil {
+		tp.Hit = fill.HitTP
 	}
-	hitSL := sl != nil && sl.Hit
-	hitTP := tp != nil && tp.Hit
+	hitSL, hitTP := fill.HitSL, fill.HitTP
 	if !hitSL && !hitTP {
-		// 止损和止盈都未触发
 		return nil
 	}
 	od.DirtyInfo = true
-	tfSecs := float64(utils.TFToSecs(tf))
-	var fillPrice, trigPrice, amtRate float64
+	var amtRate float64
 	var exitTag string
 	if hitSL {
-		// Trigger stop loss and calculate execution price
-		// 触发止损，计算执行价格
-		trigPrice = sl.Price
 		amtRate = sl.Rate
-		fillPrice = getExcPrice(od, bar, sl.Price, sl.Limit, afterRate, tfSecs)
 		if sl.Tag != "" {
 			exitTag = sl.Tag
 		} else {
 			exitTag = core.ExitTagStopLoss
-			od.UpdateProfits(fillPrice)
+			od.UpdateProfits(fill.CandidatePrice)
 			if od.ProfitRate >= 0 {
 				exitTag = core.ExitTagSLTake
 			}
 		}
-	} else if hitTP {
-		// Trigger take profit and calculate execution price
-		// 触发止盈，计算执行价格
-		trigPrice = tp.Price
+	} else {
 		amtRate = tp.Rate
-		fillPrice = getExcPrice(od, bar, tp.Price, tp.Limit, afterRate, tfSecs)
-		if fillPrice == 0 && tp.Limit > 0 {
-			// 设置了限价止盈，强制使用止盈价出场
-			fillPrice = tp.Limit
-		}
 		if tp.Tag != "" {
 			exitTag = tp.Tag
 		} else {
 			exitTag = core.ExitTagTakeProfit
 		}
-	} else {
-		return nil
 	}
-	if fillPrice < 0 {
+	if !fill.Ready {
 		return nil
-	}
-	curMS := o.priceNow()
-	// The time when the simulation is triggered
-	// 模拟触发时的时间
-	var rate = float64(0) // 限价单触发不考虑网络延迟
-	odType := banexg.OdTypeMarket
-	if fillPrice > 0 {
-		odType = banexg.OdTypeLimit
-		rate += o.simMarketRate(bar, fillPrice, od.Short, true, afterRate)
-	} else {
-		// Stop time + network delay
-		// 触发时间+网络延迟
-		rate += o.simMarketRate(bar, trigPrice, od.Short, true, afterRate)
-		// Stop loss at market price and sell immediately
-		// 市价止损，立刻卖出
-		fillPrice = o.simMarketPrice(bar, rate)
 	}
 	if amtRate > 0 && amtRate <= 0.99 {
 		// Partial withdrawal
@@ -696,9 +611,7 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 	if hitSL && hitTP {
 		od.SetInfo(ormo.OdInfoSLTP, "yes")
 	}
-	cutSecs := tfSecs * (1 - rate)
-	exitAt := curMS - int64(cutSecs*1000)
-	err := o.localExit(od, exitAt, exitTag, fillPrice, "", odType)
+	err := o.localExit(od, fill.TimeMS, exitTag, fill.Price, "", fill.OrderType)
 	wallets := o.walletsForOrder()
 	wallets.ExitOd(od, od.Exit.Amount)
 	_ = o.finishOrder(od)
@@ -706,6 +619,13 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 	o.callBack(od, false)
 	o.fireOdChange(od, strat.OdChgExitFill)
 	return err
+}
+
+func ohlcProtectionView(trigger *ormo.TriggerState) *execution.OHLCProtection {
+	if trigger == nil {
+		return nil
+	}
+	return &execution.OHLCProtection{Price: trigger.Price, Limit: trigger.Limit, Hit: trigger.Hit}
 }
 
 func (o *LocalOrderMgr) onLowFunds() {
@@ -960,85 +880,7 @@ func simPriceByRate(bar *orm.SeriesOHLCV, rate float64) (float64, float64, float
 }
 
 func simPriceByRateWithLegacy(bar *orm.SeriesOHLCV, rate float64, legacyIntrabar bool) (float64, float64, float64) {
-	var (
-		a, b, c, pa, totalLen float64
-		aEndRate, bEndRate    float64
-		start, end, posRate   float64
-	)
-
-	openP := bar.Open
-	highP := bar.High
-	lowP := bar.Low
-	closeP := bar.Close
-	preMoveFactor, closeLegFactor := 0.3, 1.3
-	if legacyIntrabar {
-		preMoveFactor, closeLegFactor = 0, 1
-	}
-
-	if rate == 0 {
-		return openP, highP, lowP
-	}
-	if rate >= 0.999 {
-		return closeP, highP, lowP
-	}
-	newHigh, newLow := highP, lowP
-
-	if openP <= closeP {
-		// close > open, generally first moves down to the lower shadow line, then rises to the highest point, and finally retreats slightly to form the upper shadow line.
-		// 阳线  一般是先下调走出下影线，然后上升到最高点，最后略微回撤，出现上影线
-		pa = (openP - lowP) * preMoveFactor // a向下前的小幅向上回调，模拟震荡
-		a = openP + pa - lowP
-		b = highP - lowP
-		c = (highP - closeP) * closeLegFactor // 多加些，模拟震荡
-		totalLen = a + b + c + pa
-		if totalLen == 0 {
-			return closeP, highP, lowP
-		}
-		paEndRate := pa / totalLen
-		aEndRate = (pa + a) / totalLen
-		bEndRate = (pa + a + b) / totalLen
-		if rate <= paEndRate {
-			start, end, posRate = openP, openP+pa, rate/paEndRate
-		} else if rate <= aEndRate {
-			start, end, posRate = openP+pa, lowP, (rate-paEndRate)/(aEndRate-paEndRate)
-		} else if rate <= bEndRate {
-			start, end, posRate = lowP, highP, (rate-aEndRate)/(bEndRate-aEndRate)
-			newLow = closeP
-		} else {
-			start, end, posRate = highP, closeP, (rate-bEndRate)/(1-bEndRate)
-			newHigh, newLow = closeP, closeP
-		}
-	} else {
-		// close < open. generally rises first and goes out of the upper shadow line, then drops to the lowest point, and finally pulls back slightly to form a lower shadow line.
-		// 阴线  一般是先上升走出上影线，然后下降到最低点，最后略微回调，出现下影线
-		pa = (highP - openP) * preMoveFactor // a向上前的小幅向下回调，模拟震荡
-		a = highP - (openP - pa)
-		b = highP - lowP
-		c = (closeP - lowP) * closeLegFactor // 模拟震荡
-		totalLen = a + b + c + pa
-		if totalLen == 0 {
-			return closeP, highP, lowP
-		}
-		paEndRate := pa / totalLen
-		aEndRate = (pa + a) / totalLen
-		bEndRate = (pa + a + b) / totalLen
-		if rate <= paEndRate {
-			start, end, posRate = openP, openP-pa, rate/paEndRate
-		} else if rate <= aEndRate {
-			start, end, posRate = openP-pa, highP, (rate-paEndRate)/(aEndRate-paEndRate)
-		} else if rate <= bEndRate {
-			start, end, posRate = highP, lowP, (rate-aEndRate)/(bEndRate-aEndRate)
-			newHigh = closeP
-		} else {
-			start, end, posRate = lowP, closeP, (rate-bEndRate)/(1-bEndRate)
-			newHigh, newLow = closeP, closeP
-		}
-	}
-
-	newOpen := start*(1-posRate) + end*posRate
-	newHigh = max(newOpen, newHigh)
-	newLow = min(newOpen, newLow)
-	return newOpen, newHigh, newLow
+	return (execution.OHLCProfile{LegacyIntrabar: legacyIntrabar}).PriceRange(bar, rate)
 }
 
 func simMarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {
@@ -1046,7 +888,7 @@ func simMarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {
 }
 
 func simMarketPriceWithLegacy(bar *orm.SeriesOHLCV, rate float64, legacyIntrabar bool) float64 {
-	start, _, _ := simPriceByRateWithLegacy(bar, rate, legacyIntrabar)
+	start, _, _ := (execution.OHLCProfile{LegacyIntrabar: legacyIntrabar}).PriceRange(bar, rate)
 	return start
 }
 
@@ -1055,26 +897,7 @@ func cutSeriesFromRate(bar *orm.SeriesOHLCV, tfMSecs int64, rate float64) *orm.S
 }
 
 func cutSeriesFromRateWithLegacy(bar *orm.SeriesOHLCV, tfMSecs int64, rate float64, legacyIntrabar bool) *orm.SeriesOHLCV {
-	start, high, low := simPriceByRateWithLegacy(bar, rate, legacyIntrabar)
-	return &orm.SeriesOHLCV{
-		Sid:       bar.Sid,
-		ExSymbol:  bar.ExSymbol,
-		Source:    bar.Source,
-		Time:      bar.Time + int64(float64(tfMSecs)*rate),
-		EndMS:     bar.EndMS,
-		TimeFrame: bar.TimeFrame,
-		Open:      start,
-		High:      high,
-		Low:       low,
-		Close:     bar.Close,
-		Volume:    bar.Volume * (1 - rate),
-		Quote:     bar.Quote,
-		BuyVolume: bar.BuyVolume,
-		TradeNum:  bar.TradeNum,
-		Adj:       bar.Adj,
-		IsWarmUp:  bar.IsWarmUp,
-		Closed:    bar.Closed,
-	}
+	return (execution.OHLCProfile{LegacyIntrabar: legacyIntrabar}).CutBar(bar, tfMSecs, rate)
 }
 
 func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, minRate float64) float64 {
@@ -1082,211 +905,11 @@ func simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, m
 }
 
 func simMarketRateWithLegacy(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, minRate float64, legacyIntrabar bool) float64 {
-	if bar == nil {
-		return minRate
-	}
-	if isTrigger {
-		// For the order that triggers the price, it is not a pending order. If it is judged that it is not within the bar range, it is considered to be completed immediately.
-		// 对于触发价格的订单，不是挂单，判断如果未在bar范围内，则认为立刻成交
-		if price < bar.Low || price > bar.High {
-			return minRate
-		}
-	} else {
-		// Non-trigger mode, directly compare with the opening price
-		// 非触发模式，直接和开盘价对比
-		if isBuy && price >= bar.Open || !isBuy && price <= bar.Open {
-			// 开盘立刻成交。
-			return minRate
-		}
-	}
-
-	var (
-		a, b, c, pa, totalLen float64
-	)
-
-	openP := bar.Open
-	highP := bar.High
-	lowP := bar.Low
-	closeP := bar.Close
-	preMoveFactor, closeLegFactor := 0.3, 1.3
-	if legacyIntrabar {
-		preMoveFactor, closeLegFactor = 0, 1
-	}
-
-	if openP <= closeP {
-		// close > open. generally first moves down to the lower shadow line, then rises to the highest point, and finally retreats slightly to form the upper shadow line.
-		// 阳线  一般是先下调走出下影线，然后上升到最高点，最后略微回撤，出现上影线
-		pa = (openP - lowP) * preMoveFactor   // a向下前的小幅向上回调，模拟震荡
-		a = openP + pa - lowP                 // open~low. 开盘~最低
-		b = highP - lowP                      // low~high. 最低~最高
-		c = (highP - closeP) * closeLegFactor // high~close. 最高~收盘，模拟震荡
-		totalLen = a + b + c + pa
-		if totalLen == 0 {
-			return 0.5
-		}
-		if isTrigger {
-			// Trigger price, no need to consider buying and selling direction, direct comparison
-			// 触发价格，无需考虑买卖方向，直接比较
-			if !legacyIntrabar && price >= openP && price <= openP+pa {
-				// a向下前小幅向上回调时触发
-				rate := (price - openP) / totalLen
-				if rate >= minRate {
-					return rate
-				}
-			} else if price < openP {
-				// The trigger bid price is lower than the opening price, and it is triggered when the opening price is the lowest
-				// 触发买价低于开盘，在开盘~最低时触发
-				rate := (pa + openP + pa - price) / totalLen
-				if rate >= minRate {
-					return rate
-				}
-			}
-			// Otherwise, it will be triggered from the lowest to the highest
-			// 否则在最低~最高中触发
-			rate := (pa + a + price - lowP) / totalLen
-			if rate >= minRate {
-				return rate
-			} else {
-				// Triggered during the highest to closing time
-				// 在最高~收盘中触发
-				return (pa + a + b + highP - price) / totalLen
-			}
-		} else {
-			if isBuy {
-				// Buy order, triggered at opening ~ lowest price
-				// 买单，在开盘~最低时触发
-				rate := (pa + openP + pa - price) / totalLen
-				if rate >= minRate {
-					return rate
-				} else {
-					// Trigger at minimum to maximum
-					// 在最低~最高时触发
-					return (pa + a + price - lowP) / totalLen
-				}
-			} else {
-				// Sell order, triggered between the lowest and highest levels
-				// 卖单，在最低~最高中触发
-				rate := (pa + a + price - lowP) / totalLen
-				if rate >= minRate {
-					return rate
-				} else {
-					// Triggered during the highest to closing time
-					// 在最高~收盘中触发
-					return (pa + a + b + highP - price) / totalLen
-				}
-			}
-		}
-	} else {
-		// close < open. generally rises first and goes out of the upper shadow line, then drops to the lowest point, and finally pulls back slightly to form a lower shadow line.
-		// 阴线  一般是先上升走出上影线，然后下降到最低点，最后略微回调，出现下影线
-		pa = (highP - openP) * preMoveFactor // a向上前的小幅回调向下，模拟震荡
-		a = highP - (openP - pa)             // 开盘~最高
-		b = highP - lowP                     // 最高~最低
-		c = (closeP - lowP) * closeLegFactor // 最低~收盘，模拟震荡
-		totalLen = a + b + c + pa
-		if totalLen == 0 {
-			return 0.5
-		}
-		if isTrigger {
-			// Trigger price, no need to consider buying and selling direction, direct comparison
-			// 触发价格，无需考虑买卖方向，直接比较
-			if price < openP {
-				if price >= openP-pa {
-					// pa: 先小幅下降回调
-					rate := (openP - price) / totalLen
-					if rate >= minRate {
-						return rate
-					}
-				}
-				// If the trigger price is lower than the opening price, it must be triggered between the highest and lowest prices.
-				// 触发价低于开盘，必然在最高~最低中触发
-				rate := (pa + a + highP - price) / totalLen
-				if rate >= minRate {
-					return rate
-				} else {
-					// Triggered at the lowest price ~ closing price
-					// 在最低~收盘中触发
-					return (pa + a + b + price - lowP) / totalLen
-				}
-			} else {
-				// The trigger price is higher than the opening price, and is triggered between the opening price and the highest price.
-				// 触发价高于开盘，在开盘~最高中触发
-				rate := (pa + price - openP + pa) / totalLen
-				if rate >= minRate {
-					return rate
-				} else {
-					// Trigger between highest and lowest
-					// 在最高~最低中触发
-					return (pa + a + highP - price) / totalLen
-				}
-			}
-		} else {
-			if isBuy {
-				if price >= openP-pa {
-					// 在向上前的小幅回调中触发
-					rate := (openP - price) / totalLen
-					if rate >= minRate {
-						return rate
-					}
-				}
-				// Buy orders must be triggered between the highest and lowest prices.
-				// 买单，必然在最高~最低中触发
-				rate := (pa + a + highP - price) / totalLen
-				if rate >= minRate {
-					return rate
-				} else {
-					// Triggered at the lowest price ~ closing price
-					// 在最低~收盘中触发
-					return (pa + a + b + price - lowP) / totalLen
-				}
-			} else {
-				// Sell order, triggered from the opening to the highest price
-				// 卖单，在开盘~最高中触发
-				rate := (pa + price - openP + pa) / totalLen
-				if rate >= minRate {
-					return rate
-				} else {
-					// Trigger between highest and lowest
-					// 在最高~最低中触发
-					return (pa + a + highP - price) / totalLen
-				}
-			}
-		}
-	}
+	return (execution.OHLCProfile{LegacyIntrabar: legacyIntrabar}).MarketRate(bar, price, isBuy, isTrigger, minRate)
 }
 
 func legacyIntrabarEnabled() bool {
 	return core.BackTestMode && config.Data.BTLegacyIntrabar
-}
-
-/*
-计算平仓成交价格，0市价，-1不平仓，>0指定价格
-Calculate the transaction price for closing the position, 0 market price, -1 for not closing the position, >0 specified price
-*/
-func getExcPrice(od *ormo.InOutOrder, bar *orm.SeriesOHLCV, trigPrice, limit, afterRate, tfSecs float64) float64 {
-	if bar == nil {
-		return -1
-	}
-	if limit > 0 {
-		if od.Short && limit < bar.Low || !od.Short && limit > bar.High {
-			// 空单，平仓限价低于bar最低，不触发
-			// 多单，平仓限价高于bar最高，不触发
-			return -1
-		}
-		if od.Short && limit <= trigPrice || !od.Short && limit >= trigPrice {
-			// 简单起见，指定了Limit限价出场，则默认限价单成交，不考虑时间
-			return limit
-			// 空单，平仓限价低于触发价，可能是限价单
-			// 多单，平仓限价高于触发价，可能是限价单
-			//trigRate := simMarketRate(bar, trigPrice, od.Short, true, afterRate)
-			//rate := simMarketRate(bar, limit, od.Short, true, afterRate)
-			//if (rate-trigRate)*tfSecs > 30 {
-			//	// 触发后，限价单超过30s成交，认为限价单
-			//	return limit
-			//}
-		}
-	}
-	return 0
 }
 
 func makeLocalAfterEnter(o *LocalOrderMgr) FuncHandleIOrder {

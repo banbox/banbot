@@ -94,6 +94,9 @@ func (s *Snapshot) Location() *time.Location {
 }
 
 func (c *Config) NormalizeRuntime() *errs.Error {
+	if err := validateTimeSeriesPolicies(c.RunPolicy); err != nil {
+		return err
+	}
 	if c.Exchange == nil || c.Exchange.Name == "" {
 		return errs.NewMsg(core.ErrBadConfig, "exchange is required")
 	}
@@ -168,6 +171,9 @@ func (c *Config) NormalizeRuntime() *errs.Error {
 // NormalizeRunPolicies prepares policy fields for an explicit runtime without
 // installing configuration into package-level state.
 func (c *Config) NormalizeRunPolicies() *errs.Error {
+	if err := validateTimeSeriesPolicies(c.RunPolicy); err != nil {
+		return err
+	}
 	var err *errs.Error
 	counts := make(map[string]int)
 	for _, policy := range c.RunPolicy {

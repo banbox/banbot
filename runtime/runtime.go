@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
+	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
@@ -24,6 +26,7 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
 )
 
@@ -39,8 +42,8 @@ const (
 	closeClosed
 )
 
-// Process owns only process-scoped construction state. Runtime data never
-// lives here, so one Process can create independent runtimes.
+// Process owns construction state and explicitly borrowed account services.
+// Runtime data remains independent unless a shared service is requested.
 type Process struct {
 	nextID atomic.Uint64
 
@@ -51,6 +54,12 @@ type Process struct {
 	registered          bool
 	closed              bool
 	closeDone           chan struct{}
+	closeErr            error
+	accountOwners       execution.AccountRegistry
+	hasAccountOwners    bool
+	sharedAccountMu     sync.Mutex
+	sharedAccounts      map[execution.AccountKey]*biz.SharedAccount
+	legacySenders       map[string]*legacySenderBinding
 
 	symbolAllocatorMu sync.Mutex
 	symbolAllocators  map[string]*orm.SIDAllocator
@@ -71,8 +80,8 @@ type schedulerClaim struct {
 }
 
 // activeProcesses is a low-frequency lifecycle registry used by process
-// signal handling. It contains only Process owners with at least one active
-// Runtime; runtime data and dependencies remain owned by the Process itself.
+// signal handling. It contains Process owners with active runtimes or retained
+// account services; dependencies remain owned by the Process itself.
 var activeProcesses = struct {
 	sync.Mutex
 	items map[*Process]struct{}
@@ -221,7 +230,7 @@ func (p *Process) unregisterRuntime(target *Runtime) {
 		copy(p.runtimes[index:], p.runtimes[index+1:])
 		p.runtimes[len(p.runtimes)-1] = nil
 		p.runtimes = p.runtimes[:len(p.runtimes)-1]
-		if len(p.runtimes) == 0 && p.runtimeConstructing == 0 && p.registered {
+		if len(p.runtimes) == 0 && p.runtimeConstructing == 0 && p.registered && !p.hasAccountOwners {
 			p.registered = false
 			// Keep the process registry transition in the same critical
 			// section as the owner state transition. NewRuntime uses this
@@ -434,6 +443,7 @@ func (p *Process) Close() {
 	runtimes := slices.Clone(p.runtimes)
 	p.runtimeMu.Unlock()
 
+	p.accountOwners.Stop()
 	for _, runtime := range runtimes {
 		if runtime != nil {
 			runtime.Close()
@@ -443,6 +453,14 @@ func (p *Process) Close() {
 		if runtime != nil {
 			runtime.Join()
 		}
+	}
+	p.accountOwners.Join()
+	closeErr := p.closeSharedAccounts()
+	p.runtimeMu.Lock()
+	p.closeErr = closeErr
+	p.runtimeMu.Unlock()
+	if closeErr != nil {
+		log.Error("process shared account close failed", zap.Error(closeErr))
 	}
 
 	p.sidRegistryMu.Lock()
@@ -474,6 +492,7 @@ func (p *Process) Stop() {
 	p.runtimeMu.Lock()
 	runtimes := slices.Clone(p.runtimes)
 	p.runtimeMu.Unlock()
+	p.accountOwners.Stop()
 	for _, runtime := range runtimes {
 		if runtime != nil {
 			runtime.Stop()
@@ -482,15 +501,30 @@ func (p *Process) Stop() {
 }
 
 type Options struct {
-	Logger      *zap.Logger
-	ID          string
-	Mode        string
-	Env         string
-	StartAt     int64
-	Context     context.Context
-	Config      *config.Config
-	DataDir     string
-	StrategyDir string
+	LegacyExecution *LegacyExecutionOptions
+	// AccountOwnerKey opts into the P0 local owner foundation. Until the P4
+	// trading bridge exists, only Other mode without an exchange is admitted.
+	AccountOwnerKey *execution.AccountKey
+	// SharedExecution installs one process-owned ledger/executor/adapter for
+	// AccountOwnerKey. The legacy trading paths remain fenced until their bridge
+	// has completed its capability and migration checks.
+	SharedExecution *biz.SharedExecutionOptions
+	// SharedMarketData explicitly permits an exchange for realtime market-data
+	// ingestion in Other mode. It does not install legacy trading managers.
+	SharedMarketData  bool
+	SharedOrderBridge *biz.SharedOrderBridgeConfig
+	Logger            *zap.Logger
+	ID                string
+	Mode              string
+	Env               string
+	StartAt           int64
+	Context           context.Context
+	Config            *config.Config
+	// SourcePlanOptions supplies typed data namespace and read/queue budgets.
+	// Runtime compilation owns anchors and managed-readiness requirements.
+	SourcePlanOptions data.SubscriptionPlanOptions
+	DataDir           string
+	StrategyDir       string
 	// StorageNamespace explicitly distinguishes allocator ownership. When empty,
 	// allocator ownership is derived from canonical database identity; DataDir
 	// remains a recovery root and must not split allocators for the same DB.
@@ -520,32 +554,42 @@ type Options struct {
 // remaining domain managers will be added here as they leave their legacy
 // facades; no domain package imports runtime.
 type Runtime struct {
-	Process    *Process
-	ID         string
-	Core       *core.State
-	Config     *config.Snapshot
-	Clock      *btime.ClockState
-	Market     *com.MarketState
-	Symbols    *orm.SymbolState
-	Storage    *orm.Storage
-	Batch      *strat.BatchState
-	Strategies *strat.State
+	// FactorState is installed only for a task using the cross-sectional engine.
+	// Pure TS tasks retain their existing event and indicator state without it.
+	FactorState *FactorState
+	Process     *Process
+	ID          string
+	Core        *core.State
+	Config      *config.Snapshot
+	Clock       *btime.ClockState
+	Market      *com.MarketState
+	Symbols     *orm.SymbolState
+	Storage     *orm.Storage
+	Batch       *strat.BatchState
+	Strategies  *strat.State
 	// Accounts is the mutable execution account state shared by Trader, Wallet,
 	// and Strategy for this Runtime. Config remains an immutable snapshot.
-	Accounts       map[string]*config.AccountConfig
-	defaultAccount string
-	accountsMu     sync.RWMutex
-	Orders         *ormo.OrderState
-	Trading        *biz.TradingState
-	Cron           com.Scheduler
-	Notifications  *rpc.Session
-	Catalog        *data.DataSourceCatalog
+	Accounts          map[string]*config.AccountConfig
+	defaultAccount    string
+	accountsMu        sync.RWMutex
+	Orders            *ormo.OrderState
+	Trading           *biz.TradingState
+	Cron              com.Scheduler
+	Notifications     *rpc.Session
+	Catalog           *data.DataSourceCatalog
+	sourcePlanOptions data.SubscriptionPlanOptions
 	// Exchange is a runtime dependency, not an ownership claim. The entry
 	// layer decides when the adapter session is closed.
-	Exchange          banexg.BanExchange
-	Dump              *orm.DumpSink
-	schedulerClaim    *schedulerClaim
-	schedulerBorrowed bool
+	Exchange           banexg.BanExchange
+	Dump               *orm.DumpSink
+	schedulerClaim     *schedulerClaim
+	schedulerBorrowed  bool
+	accountOwner       *execution.AccountHandle
+	sharedExecution    *biz.SharedAccountBorrow
+	sharedMarketData   bool
+	sharedOrderBridge  *biz.SharedOrderBridgeConfig
+	factorLegacyTrader *biz.Trader
+	factorLegacySubs   []*strat.DataSub
 
 	closeMu           sync.Mutex
 	closeDone         chan struct{}
@@ -613,6 +657,41 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	}
 	if (opts.ExchangeName == "") != (opts.Market == "") {
 		return nil, fmt.Errorf("runtime: exchange and market must be provided together")
+	}
+	if opts.SharedExecution != nil && opts.AccountOwnerKey == nil {
+		return nil, fmt.Errorf("runtime: shared execution requires AccountOwnerKey")
+	}
+	if opts.LegacyExecution != nil {
+		if opts.SharedExecution != nil || opts.AccountOwnerKey != nil || opts.Exchange == nil || opts.Env != core.RunEnvProd || opts.Mode != core.RunModeLive && opts.Mode != core.RunModeOther {
+			return nil, fmt.Errorf("runtime: legacy execution requires one production TS exchange and no shared ledger")
+		}
+		if err := opts.LegacyExecution.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	if opts.SharedExecution != nil {
+		if err := opts.SharedExecution.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	if opts.SharedMarketData && opts.SharedExecution == nil {
+		return nil, fmt.Errorf("runtime: shared market data requires shared execution composition")
+	}
+	if opts.SharedOrderBridge != nil {
+		if opts.SharedExecution == nil {
+			return nil, fmt.Errorf("runtime: shared legacy bridge requires shared execution")
+		}
+		if err := opts.SharedOrderBridge.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	if opts.AccountOwnerKey != nil {
+		if err := opts.AccountOwnerKey.Validate(); err != nil {
+			return nil, err
+		}
+		if (opts.Exchange != nil && !opts.SharedMarketData && opts.SharedOrderBridge == nil) || (opts.Mode != "" && opts.Mode != core.RunModeOther && !(opts.SharedMarketData && opts.Mode == core.RunModeLive) && opts.SharedOrderBridge == nil) || (opts.Env == core.RunEnvProd && (opts.SharedExecution == nil || !opts.SharedExecution.AuthoritativeSnapshot || (!opts.SharedMarketData && opts.SharedOrderBridge == nil))) {
+			return nil, fmt.Errorf("runtime: account owner foundation supports non-trading composition only; shared trading bridge is not installed")
+		}
 	}
 	if err := validateRuntimeExchangeIdentity(opts.Exchange, opts.ExchangeName, opts.Market); err != nil {
 		return nil, err
@@ -771,8 +850,12 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	}
 	prod := opts.Env == core.RunEnvProd
 	defaultAccount := runtimeDefaultAccount(prod, configuredAccounts)
+	if opts.AccountOwnerKey != nil {
+		defaultAccount = opts.AccountOwnerKey.Account
+	}
 	runtimeAccounts := runtimeExecutionAccounts(prod, configuredAccounts, defaultAccount)
 	runtime := &Runtime{
+		sourcePlanOptions: opts.SourcePlanOptions,
 		Process:           p,
 		ID:                id,
 		Core:              coreState,
@@ -796,6 +879,75 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		closeDone:         make(chan struct{}),
 	}
 	runtime.Orders.SetLive(coreState.LiveMode)
+	if opts.LegacyExecution != nil {
+		wrapped, finishBinding, acquireErr := p.bindLegacyExchange(runtime, opts.Exchange, *opts.LegacyExecution)
+		if acquireErr != nil {
+			runtime.Close()
+			runtime.Join()
+			schedulerClaimReleased = true
+			return nil, acquireErr
+		}
+		runtime.Exchange = wrapped
+		runtime.Market = com.NewMarketStateWithExchange(opts.ExchangeName, wrapped)
+		runtime.OnClose(wrapped.Stop)
+		runtime.OnCloseWait(wrapped.Join)
+		defer func() { finishBinding(constructed) }()
+	}
+	if opts.AccountOwnerKey != nil {
+		var acquireErr error
+		runtime.accountOwner, acquireErr = p.accountOwners.Acquire(*opts.AccountOwnerKey)
+		if acquireErr != nil {
+			runtime.Close()
+			runtime.Join()
+			schedulerClaimReleased = true
+			return nil, acquireErr
+		}
+		runtime.OnClose(runtime.accountOwner.Release)
+		if opts.SharedExecution != nil {
+			runtime.sharedExecution, acquireErr = p.acquireSharedAccount(*opts.AccountOwnerKey, *opts.SharedExecution)
+			if acquireErr != nil {
+				runtime.Close()
+				runtime.Join()
+				schedulerClaimReleased = true
+				return nil, acquireErr
+			}
+			runtime.OnClose(runtime.sharedExecution.Release)
+			runtime.sharedMarketData = opts.SharedMarketData
+			runtime.sharedOrderBridge = opts.SharedOrderBridge
+			if bridge := opts.SharedOrderBridge; bridge != nil {
+				risk := bridge.Risk
+				risk.StrategyGrossLimits = maps.Clone(bridge.Risk.StrategyGrossLimits)
+				known := map[execution.StrategyID]bool{}
+				for _, binding := range bridge.Strategies {
+					known[binding.ID] = true
+				}
+				for id := range risk.StrategyGrossLimits {
+					if !known[id] {
+						delete(risk.StrategyGrossLimits, id)
+					}
+				}
+				acquireErr = runtime.sharedExecution.RegisterRiskPolicy("shared-risk-v1", risk)
+				if acquireErr == nil {
+					instruments := make([]execution.Instrument, 0, len(bridge.Instruments))
+					for _, instrument := range bridge.Instruments {
+						instruments = append(instruments, instrument)
+					}
+					acquireErr = runtime.sharedExecution.RegisterAccountQuotes(instruments, func(ctx context.Context, id string, now int64) (execution.VisibleQuote, error) {
+						if bridge.QuoteContext != nil {
+							return bridge.QuoteContext(ctx, id, now)
+						}
+						return bridge.Quote(id, now)
+					}, runtime.Clock.TimeMS)
+				}
+				if acquireErr != nil {
+					runtime.Close()
+					runtime.Join()
+					schedulerClaimReleased = true
+					return nil, acquireErr
+				}
+			}
+		}
+	}
 	if bindErr := biz.BindRuntimeDeps(runtime.BizDeps()); bindErr != nil {
 		runtime.Close()
 		runtime.Join()
@@ -819,6 +971,7 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		registerActiveProcess(p)
 	}
 	p.runtimes = append(p.runtimes, runtime)
+	p.hasAccountOwners = p.hasAccountOwners || runtime.accountOwner != nil || opts.LegacyExecution != nil
 	p.runtimeMu.Unlock()
 	constructed = true
 	return runtime, nil
@@ -913,25 +1066,27 @@ func (r *Runtime) BizDeps() biz.RuntimeDeps {
 		return biz.RuntimeDeps{}
 	}
 	return biz.RuntimeDeps{
-		Core:           r.Core,
-		Clock:          r.Clock,
-		Market:         r.Market,
-		Batch:          r.Batch,
-		Strategies:     r.Strategies,
-		Orders:         r.Orders,
-		Trading:        r.Trading,
-		Config:         r.Config,
-		Accounts:       r.Accounts,
-		AccountsMu:     &r.accountsMu,
-		Symbols:        r.Symbols,
-		Storage:        r.Storage,
-		Exchange:       r.Exchange,
-		Dump:           r.Dump,
-		Scheduler:      r.Scheduler(),
-		Notifications:  r.Notifications,
-		DefaultAccount: r.defaultAccount,
-		Catalog:        r.Catalog,
-		Callbacks:      r,
+		SharedExecution:   r.sharedExecution,
+		SharedOrderBridge: r.sharedOrderBridge,
+		Core:              r.Core,
+		Clock:             r.Clock,
+		Market:            r.Market,
+		Batch:             r.Batch,
+		Strategies:        r.Strategies,
+		Orders:            r.Orders,
+		Trading:           r.Trading,
+		Config:            r.Config,
+		Accounts:          r.Accounts,
+		AccountsMu:        &r.accountsMu,
+		Symbols:           r.Symbols,
+		Storage:           r.Storage,
+		Exchange:          r.Exchange,
+		Dump:              r.Dump,
+		Scheduler:         r.Scheduler(),
+		Notifications:     r.Notifications,
+		DefaultAccount:    r.defaultAccount,
+		Catalog:           r.Catalog,
+		Callbacks:         r,
 	}
 }
 
@@ -944,6 +1099,15 @@ func (r *Runtime) DataDeps() *data.RuntimeDeps {
 	return r.BizDeps().DataDeps()
 }
 
+// AccountOwner returns this runtime's borrowed local service, or nil for the
+// default legacy composition. It does not enable shared order managers.
+func (r *Runtime) AccountOwner() *execution.AccountHandle {
+	if r == nil {
+		return nil
+	}
+	return r.accountOwner
+}
+
 // EnterCallback admits a callback that may call Runtime.Close. Close changes
 // the phase before it waits for callbacks, so a callback closing its own
 // runtime can request asynchronous close without waiting for itself.
@@ -952,7 +1116,7 @@ func (r *Runtime) EnterCallback() bool {
 		return false
 	}
 	r.closeMu.Lock()
-	if r.closePhase != closeOpen {
+	if r.closePhase != closeOpen || r.Core != nil && r.Core.Context().Err() != nil {
 		r.closeMu.Unlock()
 		return false
 	}
@@ -1053,6 +1217,9 @@ func (r *Runtime) Stop() {
 	r.stopDone = make(chan struct{})
 	r.closeMu.Unlock()
 	defer r.finishStop()
+	if r.sharedExecution != nil {
+		r.sharedExecution.Stop()
+	}
 	r.stopScheduler()
 	if r.Core != nil {
 		r.Core.Stop()

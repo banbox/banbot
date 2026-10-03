@@ -485,7 +485,7 @@ func (j *PairTFCache) fillLacksWithDeps(deps *RuntimeDeps, symbols *orm.SymbolSt
 		}
 	}
 	if j.SubNextMS == 0 || j.SubNextMS >= startMS {
-		j.SubNextMS = endMS
+		j.SubNextMS = max(j.SubNextMS, endMS)
 		return nil, nil
 	}
 	if symbols == nil {

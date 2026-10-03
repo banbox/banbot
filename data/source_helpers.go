@@ -64,7 +64,14 @@ func normalizeDataSubFields(info *orm.SeriesInfo, sub *strat.DataSub) error {
 	sub.Fields = fields
 	seriesFields := orm.MergeSeriesFields(sub.SeriesFields)
 	if len(sub.SeriesFields) == 0 {
-		seriesFields = defaultSeries
+		for _, field := range defaultSeries {
+			for _, selected := range fields {
+				if field == selected {
+					seriesFields = append(seriesFields, field)
+					break
+				}
+			}
+		}
 	}
 	for _, field := range seriesFields {
 		if !available[field] {

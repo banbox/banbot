@@ -188,6 +188,7 @@ func GetStratPerf(pair, strat string) *config.StratPerfConfig {
 
 func (q *EnterReq) Clone() *EnterReq {
 	res := &EnterReq{
+		CommandID:       q.CommandID,
 		Tag:             q.Tag,
 		StratName:       q.StratName,
 		Short:           q.Short,
@@ -286,6 +287,7 @@ func (q *EnterReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 
 func (q *ExitReq) Clone() *ExitReq {
 	res := &ExitReq{
+		CommandID:  q.CommandID,
 		Tag:        q.Tag,
 		StratName:  q.StratName,
 		EnterTag:   q.EnterTag,
@@ -1273,7 +1275,7 @@ func GetJobInOutNum(job *StratJob) (int, int) {
 }
 
 func CheckJobInOutNum(job *StratJob, tag string, inNum, outNum int) {
-	msg := "not support, please call `biz.GetOdMgr(s.Account).ProcessOrders(nil, s)` manually"
+	msg := "not support, please call `biz.ProcessJobOrders(s)` manually"
 	snapshot := job.ExecutionSnapshot()
 	if len(snapshot.Entrys) > inNum {
 		log.Warn("OpenOrder "+msg, zap.String("method", tag))

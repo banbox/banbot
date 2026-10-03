@@ -192,7 +192,7 @@ func persistExSymbolRecoveryMarkerWithTempPrefix(root, target string, marker exS
 	if target == "" {
 		target = tmpPath + exSymbolRecoveryMarkerSuffix
 	}
-	if err := os.Rename(tmpPath, target); err != nil {
+	if err := publishRecoveryFile(tmpPath, target); err != nil {
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("publish exsymbol recovery marker: %w", err)
 	}
@@ -211,20 +211,6 @@ func writeAndSyncExSymbolRecoveryFile(file *os.File, payload []byte) error {
 		return io.ErrShortWrite
 	}
 	return syncExSymbolRecoveryFile(file)
-}
-
-func syncDirectory(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open directory %s for fsync: %w", path, err)
-	}
-	if err := dir.Sync(); err != nil {
-		return errors.Join(fmt.Errorf("fsync directory %s: %w", path, err), dir.Close())
-	}
-	if err := dir.Close(); err != nil {
-		return fmt.Errorf("close directory %s after fsync: %w", path, err)
-	}
-	return nil
 }
 
 func ensureExSymbolRecoveryDir(root string) error {
@@ -825,7 +811,7 @@ func waitForExSymbolRecoveryRows(ctx context.Context, q *Queries, rows []exSymbo
 	})
 }
 
-func replayMissingExSymbolRows(ctx context.Context, q *Queries, marker exSymbolRecoveryMarker, rows []exSymbolRecoveryRow) error {
+func replayMissingExSymbolRows(ctx context.Context, q *Queries, marker exSymbolRecoveryMarker, rows []exSymbolRecoveryRow, versionRoot string) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -838,6 +824,15 @@ func replayMissingExSymbolRows(ctx context.Context, q *Queries, marker exSymbolR
 	fallbackTS := marker.CreatedAt.UTC()
 	if fallbackTS.IsZero() {
 		fallbackTS = time.Now().UTC()
+	}
+	floor := fallbackTS.Add(time.Duration(len(marker.Rows)) * time.Microsecond)
+	for _, row := range rows {
+		if row.WriteTS.After(floor) {
+			floor = row.WriteTS
+		}
+	}
+	if _, err := q.reserveMetadataVersionsAtRoot(ctx, versionRoot, "exsymbol_q", 1, floor); err != nil {
+		return fmt.Errorf("reserve exsymbol recovery highwater: %w", err)
 	}
 	for i, row := range rows {
 		writeTS := row.WriteTS
@@ -977,7 +972,7 @@ func reconcilePendingExSymbolMarkersLocked(ctx context.Context, q *Queries, stat
 				return fmt.Errorf("reconcile exsymbol recovery marker %s: wait for missing rows: %w", path, err)
 			}
 			if !ready && len(replayable) > 0 {
-				if err := replayMissingExSymbolRows(ctx, q, marker, replayable); err != nil {
+				if err := replayMissingExSymbolRows(ctx, q, marker, replayable, compactProcessLockRootForAllocator(allocator)); err != nil {
 					return err
 				}
 				ready, err = waitForExSymbolRecoveryRows(ctx, q, unresolved)
@@ -1173,7 +1168,9 @@ func removePendingExSymbolMarkerRows(path string, rows []exSymbolRecoveryRow) er
 }
 
 func syncExistingExSymbolRecoveryFile(path string) error {
-	file, err := os.Open(path)
+	// FlushFileBuffers requires a writable handle on Windows. Opening without
+	// truncation also keeps Unix's existing file durability boundary.
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil

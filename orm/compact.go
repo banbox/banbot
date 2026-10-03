@@ -39,7 +39,7 @@ var compactTables = map[string]*TableCompactMeta{
 	},
 	"kline_un_q": {
 		LatestByKeys:     "sid, timeframe",
-		SelectCols:       "sid, timeframe, ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num",
+		SelectCols:       "sid, timeframe, ts, bar_ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num",
 		PartitionBy:      "MONTH",
 		DedupKeys:        "sid, timeframe, ts",
 		CheckInterval:    time.Hour,
@@ -666,8 +666,8 @@ func queryCompactStats(ctx context.Context, db compactDB, table string, meta *Ta
 		return totalRows, totalRows, false, nil
 	}
 	validSQL := fmt.Sprintf(`SELECT count(*) FROM (
-  SELECT 1 FROM %s LATEST BY %s WHERE coalesce(%s, false) = false
-)`, quoteIdent(table), meta.LatestByKeys, quoteIdent("is_deleted"))
+  SELECT * FROM %s LATEST BY %s
+) WHERE coalesce(%s, false) = false`, quoteIdent(table), meta.LatestByKeys, quoteIdent("is_deleted"))
 	var validRows int64
 	if err := db.QueryRow(ctx, validSQL).Scan(&validRows); err != nil {
 		return 0, 0, false, err

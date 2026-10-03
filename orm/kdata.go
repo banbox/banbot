@@ -1292,8 +1292,8 @@ func (q *Queries) GetCalendarsWithContext(ctx context.Context, name string, star
 	unlock := q.LockCompactTableRead("calendars_q")
 	defer unlock()
 	sqlText := `SELECT start_ms, stop_ms
-FROM calendars_q
-LATEST BY market, start_ms
+FROM (SELECT * FROM calendars_q
+  LATEST BY market, start_ms WHERE market = $1)
 WHERE market = $1 AND coalesce(is_deleted, false) = false`
 	args := []any{name}
 	if startMS > 0 {
@@ -1345,8 +1345,8 @@ func (q *Queries) SetCalendars(name string, items [][2]int64) *errs.Error {
 	defer unlock()
 
 	sqlText := `SELECT market, start_ms, stop_ms
-FROM calendars_q
-LATEST BY market, start_ms
+FROM (SELECT * FROM calendars_q
+  LATEST BY market, start_ms WHERE market = $1)
 WHERE market = $1 AND coalesce(is_deleted, false) = false`
 	if startMS > 0 {
 		sqlText += fmt.Sprintf(" AND stop_ms > %d", startMS)
@@ -1373,7 +1373,10 @@ WHERE market = $1 AND coalesce(is_deleted, false) = false`
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
 
-	now := time.Now().UTC()
+	now, err := q.reserveMetadataVersions(ctx, "calendars_q", len(olds)+len(items), time.Time{})
+	if err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
 	microOff := 0
 
 	if len(olds) > 0 {

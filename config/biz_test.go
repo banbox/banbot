@@ -15,18 +15,20 @@ import (
 )
 
 func TestLoadConfig(t *testing.T) {
-	args := CmdArgs{}
-	err := LoadConfig(&args)
+	previousDir := DataDir
+	t.Cleanup(func() { DataDir = previousDir })
+	path := migrationFixture(t, "config.yml", "time_start: '20240101'\ntime_end: '20240201'\nstake_amount: 100\nrun_policy: [{name: Demo}]\n")
+	args := CmdArgs{NoDefault: true, Configs: ArrString{path}, DataDir: filepath.Dir(path), ConfigData: "stake_amount: 200\n"}
+	cfg, err := GetConfig(&args, false)
 	if err != nil {
-		fmt.Printf("load data error: %s", err)
-		return
+		t.Fatal(err)
 	}
-	data, err2 := yaml.Marshal(Data)
-	if err2 != nil {
-		fmt.Printf("dump data error: %s", err2)
-		return
+	if cfg.StakeAmount != 200 || len(cfg.RunPolicy) != 1 {
+		t.Fatal("ordinary loading lost overlay values")
 	}
-	fmt.Println("result: \n", string(data))
+	if len(configBackups(t, path)) != 1 {
+		t.Fatal("ordinary loading did not migrate source")
+	}
 }
 
 func TestParseConfigsTimerangeOverridesEarlierStartEnd(t *testing.T) {

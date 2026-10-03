@@ -593,6 +593,7 @@ func TestExecCompactAbortsWhenSourceChanges(t *testing.T) {
 }
 
 func TestExecCompactRestoresSourceWhenActivationFails(t *testing.T) {
+	root := t.TempDir()
 	db := &scriptedCompactDB{
 		rows: []pgx.Row{
 			metricsRow(1000, 0, 10, 10, false),
@@ -604,7 +605,7 @@ func TestExecCompactRestoresSourceWhenActivationFails(t *testing.T) {
 		},
 		execErrAt: map[int]error{2: errors.New("activate failed")},
 	}
-	err := execCompactLocked(context.Background(), db, "ins_kline_q", compactTables["ins_kline_q"], 1000, 5, 10)
+	err := execCompactLockedAtRoot(context.Background(), db, "ins_kline_q", compactTables["ins_kline_q"], 1000, 5, 10, root)
 	if err == nil || !strings.Contains(err.Error(), "source restored") {
 		t.Fatalf("expected restored-source error, got %v", err)
 	}
@@ -742,7 +743,7 @@ func TestCaptureQuestCompactRewriteSnapshotPreservesSchemaTypesAndNulls(t *testi
 		t.Fatal("SQL NULL and false compared equal")
 	}
 	if !strings.Contains(fingerprintSQL, `"quality"`) ||
-		!strings.Contains(fingerprintSQL, `FROM "ins_kline_q" LATEST BY "sid", "timeframe" WHERE`) ||
+		!strings.Contains(fingerprintSQL, `FROM (SELECT * FROM "ins_kline_q" LATEST BY "sid", "timeframe") WHERE`) ||
 		!strings.Contains(fingerprintSQL, `ORDER BY "sid", "timeframe", "ts", "start_ms", "stop_ms", "is_deleted", "quality"`) ||
 		strings.Contains(fingerprintSQL, "LIMIT") || strings.Contains(fingerprintSQL, "WHERE FROM") {
 		t.Fatalf("snapshot query does not preserve full row/null/extended-field semantics: %q", fingerprintSQL)

@@ -70,19 +70,20 @@ LiveFeeder requires preheating for both new trading pairs and new cycles; HistFe
 */
 type Feeder struct {
 	*orm.ExSymbol
-	symbols         *orm.SymbolState
-	deps            *RuntimeDeps
-	States          []*PairTFCache
-	hour            *TfSeriesLoader
-	WaitData        *orm.DataSeries
-	CallBack        FnDataSeries
-	OnEnvEnd        FuncEnvEnd // If the futures main force switches or the stock is ex-rights, the position needs to be closed first 期货主力切换或股票除权，需先平仓
-	tfBars          map[string][]*orm.DataSeries
-	adjs            []*orm.AdjInfo // List of weighting factors 复权因子列表
-	adj             *orm.AdjInfo
-	isWarmUp        bool // Is it currently in preheating state? 当前是否预热状态
-	coverage        *config.HistoricalCoverageConfig
-	readKlineFields klineFieldReader
+	symbols            *orm.SymbolState
+	deps               *RuntimeDeps
+	States             []*PairTFCache
+	hour               *TfSeriesLoader
+	WaitData           *orm.DataSeries
+	CallBack           FnDataSeries
+	OnEnvEnd           FuncEnvEnd // If the futures main force switches or the stock is ex-rights, the position needs to be closed first 期货主力切换或股票除权，需先平仓
+	tfBars             map[string][]*orm.DataSeries
+	adjs               []*orm.AdjInfo // List of weighting factors 复权因子列表
+	adj                *orm.AdjInfo
+	isWarmUp           bool // Is it currently in preheating state? 当前是否预热状态
+	coverage           *config.HistoricalCoverageConfig
+	readKlineFields    klineFieldReader
+	subscriptionFields map[string][]string
 }
 
 func (f *Feeder) getStates() []*PairTFCache {
@@ -283,7 +284,12 @@ func (f *Feeder) onStateOhlcvsWithErr(state *PairTFCache, rows []*orm.DataSeries
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	state.Latest = rows[len(rows)-1]
+	latest := rows[len(rows)-1]
+	previousLatest, previousWait := state.Latest, state.WaitBar
+	state.Latest = latest
+	if f.deps != nil && f.deps.IsolatedSubscriptions && previousLatest != nil && previousLatest.TimeMS > latest.TimeMS {
+		state.Latest = previousLatest
+	}
 	if state.WaitBar != nil && state.WaitBar.TimeMS < rows[0].TimeMS {
 		rows = append([]*orm.DataSeries{state.WaitBar}, rows...)
 	}
@@ -291,14 +297,17 @@ func (f *Feeder) onStateOhlcvsWithErr(state *PairTFCache, rows []*orm.DataSeries
 	finishRows := rows
 	if !lastOk {
 		finishRows = rows[:len(rows)-1]
-		state.WaitBar = state.Latest
+		state.WaitBar = latest
+	}
+	if f.deps != nil && f.deps.IsolatedSubscriptions && previousWait != nil && previousWait.TimeMS > latest.TimeMS {
+		state.WaitBar = previousWait
 	}
 	tfMSecs := int64(state.TFSecs * 1000)
-	for len(finishRows) > 0 && finishRows[0].TimeMS < state.NextMS {
+	for len(finishRows) > 0 && finishRows[0].TimeMS < state.NextMS && (f.deps == nil || !f.deps.IsolatedSubscriptions) {
 		finishRows = finishRows[1:]
 	}
 	if len(finishRows) > 0 {
-		state.NextMS = finishRows[len(finishRows)-1].TimeMS + tfMSecs
+		state.NextMS = max(state.NextMS, finishRows[len(finishRows)-1].TimeMS+tfMSecs)
 		f.addTfKlines(state.TimeFrame, finishRows)
 		if err := f.fireCallBacks(state.TimeFrame, tfMSecs, applyAdjSeries(f.adj, finishRows), f.adj); err != nil {
 			return finishRows, err
@@ -357,6 +366,19 @@ func (f *Feeder) getTfKlines(tf string, endMS int64, limit int, pBar *utils.PrgB
 
 func (f *Feeder) addTfKlines(tf string, rows []*orm.DataSeries) {
 	olds, _ := f.tfBars[tf]
+	if f.deps != nil && f.deps.IsolatedSubscriptions {
+		for _, row := range rows {
+			index, exists := slices.BinarySearchFunc(olds, row.TimeMS, func(old *orm.DataSeries, timeMS int64) int {
+				return cmp.Compare(old.TimeMS, timeMS)
+			})
+			if exists {
+				olds[index] = row
+			} else {
+				olds = slices.Insert(olds, index, row)
+			}
+		}
+		rows = nil
+	}
 	var numTACache int
 	if f.deps == nil {
 		numTACache = core.NumTaCache
@@ -384,13 +406,13 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.Data
 	}
 	rows = f.filterHistoricalCoverageRows(timeFrame, rows)
 	var err *errs.Error
-	rows, err = enrichStoredKlineFieldsWithRuntimeDepsAndReader(f.deps, f.ExSymbol, timeFrame, rows, f.readKlineFields)
+	rows, err = enrichStoredKlineFieldsWithRuntimeDepsAndReader(f.deps, f.ExSymbol, timeFrame, rows, f.readKlineFields, f.subscriptionFields[timeFrame])
 	if err != nil {
 		f.deps.logger().Error("enrich stored kline fields fail", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Error(err))
 		return err
 	}
 	for _, row := range rows {
-		if !isLive || f.isWarmUp {
+		if (!isLive || f.isWarmUp) && (f.deps == nil || !f.deps.IsolatedSubscriptions) {
 			if f.deps == nil {
 				btime.CurTimeMS = row.TimeMS + tfMSecs
 			} else {
@@ -399,7 +421,9 @@ func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.Data
 		}
 		evt := row.CloneWithExSymbol(f.ExSymbol)
 		evt.TimeFrame = timeFrame
-		evt.Adj = adj
+		if adj != nil {
+			evt.Adj = adj
+		}
 		isWarmUp := f.isWarmUp
 		if !isWarmUp {
 			var backtest bool
@@ -903,6 +927,9 @@ func (f *SeriesFeeder) warmTfWithErr(tf string, rows []*orm.DataSeries) (int64, 
 	}
 	f.isWarmUp = true
 	defer func() { f.isWarmUp = false }()
+	if f.deps != nil && f.deps.IsolatedSubscriptions {
+		f.addTfKlines(tf, rows)
+	}
 	tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 	lastMS := rows[len(rows)-1].TimeMS + tfMSecs
 	envKey := strings.Join([]string{f.Symbol, tf}, "_")
@@ -1013,6 +1040,9 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 		useHour = true
 		firstReadHours = f.hour.FirstRead
 		hourBars = f.hour.ReadTo(endMS, true)
+		if f.hour.loadErr != nil {
+			return false, f.hour.loadErr
+		}
 	}
 	minState, minOhlcvs := state, ohlcvs
 	// 应该按周期从大到小触发
@@ -1211,6 +1241,11 @@ func (f *DBSeriesFeeder) SubTfs(timeFrames []string, delOther bool) []string {
 	consumerTf := physicalConsumerTimeframe(f.States)
 	f.allowPhysicalRead = consumerTf != ""
 	f.physicalConsumerTimeframe = consumerTf
+	if f.hour != nil {
+		f.hour.subscriptionFields = f.Feeder.subscriptionFields
+		f.hour.BatchRows = f.TfSeriesLoader.BatchRows
+		f.hour.BatchBytes = f.TfSeriesLoader.BatchBytes
+	}
 	return arr
 }
 
@@ -1273,6 +1308,9 @@ func (f *DBSeriesFeeder) setAdjIdx() {
 }
 
 func (f *DBSeriesFeeder) GetBatch() Batch {
+	if f.loadErr != nil {
+		return &seriesLoadErrorBatch{err: f.loadErr}
+	}
 	row := f.GetRow()
 	if row != nil {
 		return SeriesBatch{DataSeries: row}
@@ -1281,6 +1319,9 @@ func (f *DBSeriesFeeder) GetBatch() Batch {
 }
 
 func (f *DBSeriesFeeder) RunBatch(batch Batch) *errs.Error {
+	if failed, ok := batch.(*seriesLoadErrorBatch); ok {
+		return failed.err
+	}
 	f.syncSymbolState()
 	if row, ok := batch.(SeriesBatch); ok {
 		evt := row.CloneWithExSymbol(f.ExSymbol)
@@ -1361,6 +1402,9 @@ func newDBSeriesFeeder(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExS
 TfSeriesLoader 用于分批加载某个品种的指定周期K线，然后逐个读取的场景
 */
 type TfSeriesLoader struct {
+	BatchRows          int
+	BatchBytes         int64
+	subscriptionFields map[string][]string
 	*orm.ExSymbol
 	symbols                   *orm.SymbolState
 	deps                      *RuntimeDeps
@@ -1375,13 +1419,15 @@ type TfSeriesLoader struct {
 	caches    []*orm.DataSeries
 	nextMS    int64 // The 13-digit millisecond end timestamp of the next bar, math.MaxInt32 indicates the end 下一个bar的结束13位毫秒时间戳，math.MaxInt32表示结束
 	offsetMS  int64
+	loadErr   *errs.Error
 }
 
 func (f *TfSeriesLoader) context() context.Context {
+	ctx := context.Background()
 	if f.deps != nil {
-		return f.deps.context()
+		ctx = f.deps.context()
 	}
-	return context.Background()
+	return orm.WithSeriesReadByteLimit(ctx, f.BatchBytes)
 }
 
 func (f *TfSeriesLoader) questDB() bool {
@@ -1468,6 +1514,7 @@ func (f *TfSeriesLoader) Reset(since int64) {
 	f.nextMS = 0
 	f.offsetMS = since
 	f.caches = nil
+	f.loadErr = nil
 }
 
 func (f *TfSeriesLoader) ReadTo(end int64, force bool) []*orm.DataSeries {
@@ -1551,6 +1598,9 @@ func (f *TfSeriesLoader) DownIfNeed(sess *orm.Queries, exchange banexg.BanExchan
 }
 
 func (f *TfSeriesLoader) SetNext() {
+	if f.loadErr != nil {
+		return
+	}
 	if f.rowIdx+1 < len(f.caches) {
 		f.rowIdx += 1
 		f.nextMS = f.caches[f.rowIdx].EndMS
@@ -1560,6 +1610,7 @@ func (f *TfSeriesLoader) SetNext() {
 	endMS := f.EndMS
 	if endMS > 0 && f.nextMS >= endMS {
 		f.rowIdx = -1
+		f.caches = nil
 		// 将nextMS置为math.MaxInt64前，应备份到offsetMS，以便实盘读取更新的k线
 		f.offsetMS = max(f.offsetMS, f.nextMS)
 		f.nextMS = math.MaxInt64
@@ -1567,6 +1618,9 @@ func (f *TfSeriesLoader) SetNext() {
 	}
 	// After the cache reading is completed, re-read the database
 	// 缓存读取完毕，重新读取数据库
+	if f.BatchRows > 0 || f.BatchBytes > 0 {
+		f.caches = nil
+	}
 	batchSize := 3000
 	var backtest bool
 	if f.deps == nil {
@@ -1577,6 +1631,9 @@ func (f *TfSeriesLoader) SetNext() {
 	if backtest {
 		// QuestDB performs better with fewer, larger range queries than many small ones.
 		batchSize = 20000
+	}
+	if f.BatchRows > 0 {
+		batchSize = f.BatchRows
 	}
 	withUnFinish := !backtest
 	debugLoad := shouldLogBacktestSeriesDebugWithRuntime(f.deps)
@@ -1599,6 +1656,9 @@ func (f *TfSeriesLoader) SetNext() {
 		// isolated; use the base projection instead of consulting legacy jobs.
 		fields = orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil)
 	}
+	if extra := f.subscriptionFields[f.Timeframe]; len(extra) > 0 {
+		fields = orm.MergeSeriesFields(fields, extra)
+	}
 	var rows []*orm.DataSeries
 	var err *errs.Error
 	const maxSeriesLoadRetries = 3
@@ -1616,6 +1676,7 @@ func (f *TfSeriesLoader) SetNext() {
 		if connErr != nil {
 			err = connErr
 		} else {
+			sess = sess.WithReadContext(f.context())
 			if f.symbols != nil {
 				sess = sess.WithSeriesSymbolState(f.symbols)
 			}
@@ -1643,6 +1704,18 @@ func (f *TfSeriesLoader) SetNext() {
 		} else {
 			f.deps.sleep(time.Second * time.Duration(retry+1))
 		}
+	}
+	if err == nil {
+		if budgetErr := orm.CheckDataSeriesBytes(f.context(), rows); budgetErr != nil {
+			err = errs.New(core.ErrDbReadFail, budgetErr)
+		}
+	}
+	if err != nil && f.BatchBytes > 0 {
+		f.loadErr = err
+		f.caches = nil
+		f.rowIdx = -1
+		f.nextMS = f.offsetMS
+		return
 	}
 	if err != nil || len(rows) == 0 {
 		f.rowIdx = -1

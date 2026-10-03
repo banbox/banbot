@@ -12,6 +12,7 @@ func (i *ArrString) Set(value string) error {
 }
 
 type CmdArgs struct {
+	ExplicitFlags map[string]bool // Only flags supplied by the caller override explicit zero/empty YAML values.
 	Configs       ArrString
 	ConfigData    string
 	Logfile       string

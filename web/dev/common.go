@@ -576,7 +576,7 @@ func resolveReportRoot(rootDir, relPath string) (string, error) {
 		return "", err
 	}
 	path := filepath.FromSlash(strings.TrimSpace(relPath))
-	if path == "" || filepath.IsAbs(path) {
+	if !filepath.IsLocal(path) {
 		return "", fmt.Errorf("report path must be relative: %q", relPath)
 	}
 	resolved, err := filepath.Abs(filepath.Join(root, path))
@@ -595,6 +595,9 @@ func resolveReportRoot(rootDir, relPath string) (string, error) {
 // task after every configured policy has produced a report; a partial run is
 // left for the scheduler to collect after the child process exits.
 func collectBtTaskResult(rootDir, relPath string) (*ormu.Task, error) {
+	if unified, err := collectUnifiedBtTask(rootDir, relPath); err != nil || unified != nil {
+		return unified, err
+	}
 	task, err := collectBtTask(rootDir, relPath)
 	if err != nil || task != nil {
 		return task, err
@@ -750,6 +753,7 @@ func (s *DevServer) taskReportDirs(task *ormu.Task) ([]string, error) {
 	}
 	var info struct {
 		Separate    bool     `json:"separate"`
+		Unified     bool     `json:"unified"`
 		ReportPaths []string `json:"reportPaths"`
 	}
 	if err := utils.Unmarshal([]byte(task.Info), &info, utils.JsonNumDefault); err != nil {
@@ -757,7 +761,7 @@ func (s *DevServer) taskReportDirs(task *ormu.Task) ([]string, error) {
 		// behavior when an unrelated legacy payload is malformed.
 		return dirs, nil
 	}
-	if !info.Separate || len(info.ReportPaths) == 0 {
+	if (!info.Separate && !info.Unified) || len(info.ReportPaths) == 0 {
 		return dirs, nil
 	}
 	resolved := make([]string, 0, len(info.ReportPaths))
@@ -787,6 +791,9 @@ func (s *DevServer) taskReportDirs(task *ormu.Task) ([]string, error) {
 		resolved = append(resolved, rooted)
 	}
 	if len(resolved) > 0 {
+		if info.Unified {
+			return append(resolved, base), nil
+		}
 		return resolved, nil
 	}
 	return dirs, nil

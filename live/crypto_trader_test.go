@@ -1381,6 +1381,8 @@ func TestCryptoTraderRunEnsuresThirdPartyBeforeActivateAndLoop(t *testing.T) {
 		TimeFrame: alpha.info.TimeFrame, WarmupNum: 4,
 		Fields:       []string{"open", "high", "low", "close", "volume"},
 		SeriesFields: []string{"open", "high", "low", "close", "volume"},
+		Frequency:    orm.FrequencyBar,
+		Projection:   orm.ProjectionSelected,
 	}}
 	trader := newBareCryptoTraderForTest(nil)
 	steps := make([]string, 0, 4)

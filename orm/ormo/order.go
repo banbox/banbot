@@ -17,6 +17,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/utils"
@@ -343,16 +344,8 @@ func (i *InOutOrder) UpdateFee(price float64, forEnter bool) *errs.Error {
 	if !forEnter {
 		exOrder = i.Exit
 	}
-	//  dry-run 不用com.IsMaker最新价格判断是否限价单，因也是bar，会错取取close
-	var maker = strings.Contains(exOrder.OrderType, "limit")
-	if exOrder.OrderType == banexg.OdTypeLimit {
-		if maker {
-			exOrder.OrderType = banexg.OdTypeLimitMaker
-		} else {
-			exOrder.OrderType = "limit_taker"
-		}
-	}
-	fee, err := exchange.CalculateFee(i.Symbol, exOrder.OrderType, exOrder.Side, exOrder.Filled, price, maker, nil)
+	fee, err := execution.LegacyOrderFee(exchange, i.Symbol, &exOrder.OrderType,
+		exOrder.Side, exOrder.Filled, price)
 	if err != nil {
 		return err
 	}
@@ -806,6 +799,7 @@ func (i *InOutOrder) SetExitTrigger(key string, args *ExitTrigger, price float64
 		} else {
 			i.SetInfo(key, nil)
 		}
+		fireOdEdit(i, key)
 		return nil
 	} else if tg == nil {
 		tg = &TriggerState{}
@@ -970,7 +964,7 @@ func fireOdEdit(od *InOutOrder, action string) {
 	var envReal bool
 	if od != nil && od.state != nil {
 		listener = od.state.GetEditListener()
-		envReal = od.state.runtimeCore != nil && od.state.runtimeCore.EnvReal
+		envReal = od.state.softwareEditEnabled() || od.state.runtimeCore != nil && od.state.runtimeCore.EnvReal
 	} else {
 		listener = OdEditListener
 		envReal = core.EnvReal

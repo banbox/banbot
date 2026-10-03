@@ -1,10 +1,68 @@
 package strat
 
 import (
+	"fmt"
+	"reflect"
 	"sync"
 
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banexg/errs"
 )
+
+// FuncProcessOrders processes pending requests through a job's owning runtime.
+type FuncProcessOrders = func(*StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
+
+// BindOrderProcessor installs the execution callback once during composition.
+func (s *State) BindOrderProcessor(owner any, account string, process FuncProcessOrders) *errs.Error {
+	value := reflect.ValueOf(owner)
+	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() || process == nil {
+		return errs.NewMsg(core.ErrBadConfig, "order processor owner and callback are required")
+	}
+	s.runtimeBindMu.Lock()
+	defer s.runtimeBindMu.Unlock()
+	if s.orderProcessor == nil {
+		s.orderProcessor = process
+		s.orderProcessorOwner = owner
+		s.orderProcessorAccount = account
+	} else if s.orderProcessorOwner != owner || s.orderProcessorAccount != account {
+		return errs.NewMsg(core.ErrBadConfig, "strategy order processor belongs to another runtime account registry")
+	}
+	return nil
+}
+
+// OrderProcessorBindingsMatch verifies the composition root's account registry.
+func (s *State) OrderProcessorBindingsMatch(owner any, account string) bool {
+	s.runtimeBindMu.Lock()
+	defer s.runtimeBindMu.Unlock()
+	return s.orderProcessor != nil && s.orderProcessorOwner == owner && s.orderProcessorAccount == account
+}
+
+// ProcessRuntimeOrders reports whether this job belongs to an explicit runtime.
+// Runtime jobs never fall back to a process-wide account with the same name.
+func (s *StratJob) ProcessRuntimeOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error, bool) {
+	if s == nil {
+		return nil, nil, nil, false
+	}
+	if s.strategyState == nil {
+		if s.runtimeCore != nil || s.runtimeClock != nil || s.runtimePrices != nil || (s.Strat != nil && s.Strat.runtimeExplicit) {
+			return nil, nil, errs.NewMsg(core.ErrBadConfig, "job runtime strategy state is not bound"), true
+		}
+		return nil, nil, nil, false
+	}
+	if s.strategyState == legacyState {
+		return nil, nil, nil, false
+	}
+	state := s.strategyState
+	state.runtimeBindMu.Lock()
+	process := state.orderProcessor
+	state.runtimeBindMu.Unlock()
+	if process == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "job runtime order processor is not bound"), true
+	}
+	entered, exited, err := process(s)
+	return entered, exited, err, true
+}
 
 // ExecutionSnapshot is a coherent, short-lived view of a job's mutable
 // execution state. The order pointers are borrowed; the slices themselves are
@@ -34,6 +92,24 @@ type ExecutionSnapshot struct {
 type executionStateMu struct {
 	mu              sync.Mutex
 	orderProcessing bool
+	callbackEvent   string
+	callbackOrdinal int
+}
+
+// WithOrderEvent supplies stable provenance for actions queued by a callback.
+// The manager serializes callbacks; user code runs outside the queue mutex.
+func (s *StratJob) WithOrderEvent(eventID string, callback func()) {
+	state := s.executionState()
+	state.mu.Lock()
+	previous, ordinal := state.callbackEvent, state.callbackOrdinal
+	state.callbackEvent, state.callbackOrdinal = eventID, 0
+	state.mu.Unlock()
+	defer func() {
+		state.mu.Lock()
+		state.callbackEvent, state.callbackOrdinal = previous, ordinal
+		state.mu.Unlock()
+	}()
+	callback()
 }
 
 func (s *StratJob) executionState() *executionStateMu {
@@ -161,6 +237,26 @@ func (s *StratJob) SetOrderCounts(orderNum, enteredNum int) {
 	state.mu.Unlock()
 }
 
+// SetProjectedOrders publishes shared-ledger compatibility membership under
+// the same lock used by callback snapshots and request admission.
+func (s *StratJob) SetProjectedOrders(long, short []*ormo.InOutOrder) {
+	if s == nil {
+		return
+	}
+	state := s.executionState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	s.LongOrders = append([]*ormo.InOutOrder(nil), long...)
+	s.ShortOrders = append([]*ormo.InOutOrder(nil), short...)
+	s.OrderNum = len(long) + len(short)
+	s.EnteredNum = 0
+	for _, od := range append(append([]*ormo.InOutOrder(nil), long...), short...) {
+		if od.Enter != nil && od.Enter.Filled > 0 {
+			s.EnteredNum++
+		}
+	}
+}
+
 func (s *StratJob) AddOrderCount(delta int) {
 	if s == nil || delta == 0 {
 		return
@@ -181,6 +277,11 @@ func (s *StratJob) enqueueEntry(req *EnterReq) bool {
 		state.mu.Unlock()
 		return false
 	}
+	if req.CommandID == "" && state.callbackEvent != "" {
+		state.callbackOrdinal++
+		req = req.Clone()
+		req.CommandID = fmt.Sprintf("%s/entry/%d", state.callbackEvent, state.callbackOrdinal)
+	}
 	s.Entrys = append(s.Entrys, req)
 	s.OrderNum++
 	state.mu.Unlock()
@@ -196,6 +297,11 @@ func (s *StratJob) enqueueExit(req *ExitReq) bool {
 	if s.IsWarmUp {
 		state.mu.Unlock()
 		return false
+	}
+	if req.CommandID == "" && state.callbackEvent != "" {
+		state.callbackOrdinal++
+		req = req.Clone()
+		req.CommandID = fmt.Sprintf("%s/exit/%d", state.callbackEvent, state.callbackOrdinal)
 	}
 	s.Exits = append(s.Exits, req)
 	state.mu.Unlock()

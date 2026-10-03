@@ -530,6 +530,7 @@ func (r *dbSeriesRepo) QuerySeriesRange(ctx context.Context, info *SeriesInfo, s
 	defer rows.Close()
 
 	var out []*DataRecord
+	byteCounter := SeriesByteCounter{Limit: SeriesReadByteLimit(ctx)}
 	for rows.Next() {
 		rec, err_ := scanSeriesRecord(rows, binding.Fields)
 		if err_ != nil {
@@ -537,6 +538,9 @@ func (r *dbSeriesRepo) QuerySeriesRange(ctx context.Context, info *SeriesInfo, s
 		}
 		if q.isQuestDB() && !seriesRangeCovered(rec.TimeMS, covered) {
 			continue
+		}
+		if err := byteCounter.AddRecord(rec); err != nil {
+			return nil, NewDbErr(core.ErrDbReadFail, err)
 		}
 		out = append(out, rec)
 		if q.isQuestDB() && limit > 0 && len(out) >= limit {
@@ -1109,8 +1113,8 @@ func questSeriesDeleteMarkerVisible(ctx context.Context, q *Queries, table, time
 	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data
 FROM (
   SELECT start_ms, stop_ms, has_data, is_deleted
-  FROM sranges_q
-  LATEST BY sid, tbl, timeframe, start_ms
+  FROM (SELECT * FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND start_ms < $5)
   WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms > $4 AND start_ms < $5
 )
 WHERE coalesce(is_deleted, false) = false`,

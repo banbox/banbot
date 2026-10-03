@@ -1,9 +1,6 @@
 package strat
 
 import (
-	"strconv"
-	"strings"
-
 	"github.com/banbox/banbot/orm"
 )
 
@@ -41,31 +38,13 @@ func unlockInfoJobsReadForState(state *State) {
 }
 
 func DataSubKey(source string, sid int32, tf string) string {
-	source = orm.NormalizeSeriesSource(source)
-	var sidBuf [12]byte
-	sidText := strconv.AppendInt(sidBuf[:0], int64(sid), 10)
-	var key strings.Builder
-	key.Grow(len(source) + len(sidText) + len(tf) + 2)
-	key.WriteString(source)
-	key.WriteByte(':')
-	key.Write(sidText)
-	key.WriteByte(':')
-	key.WriteString(tf)
-	return key.String()
+	return (orm.StreamKey{Source: source, SID: sid, TimeFrame: tf}).String()
 }
 
 func ParseDataSubKey(key string) (string, int32, string, bool) {
-	parts := strings.SplitN(key, ":", 3)
-	if len(parts) != 3 {
-		return "", 0, "", false
-	}
-	sid64, err := strconv.ParseInt(parts[1], 10, 32)
-	if err != nil {
-		return "", 0, "", false
-	}
-	return parts[0], int32(sid64), parts[2], true
+	parsed, ok := orm.ParseStreamKey(key)
+	return parsed.Source, parsed.SID, parsed.TimeFrame, ok
 }
-
 func CollectDataSubs(job *StratJob) []*DataSub {
 	if job != nil && job.symbols != nil {
 		return CollectDataSubsWithSymbolState(job.symbols, job)
@@ -143,8 +122,15 @@ func CollectDataSubsWithSymbolState(symbols *orm.SymbolState, job *StratJob) []*
 			source := orm.NormalizeSeriesSource(sub.Source)
 			seriesFields := orm.MergeSeriesFields(sub.SeriesFields)
 			fields := orm.NormalizeSeriesFields(source, sub.Fields)
+			// Explicit default/all projections must remain declarations until the
+			// catalog expands the source schema before unioning subscriptions.
+			if sub.Projection == orm.ProjectionDefault || sub.Projection == orm.ProjectionAll {
+				fields = nil
+			}
 			if len(sub.SeriesFields) > 0 {
-				fields = orm.MergeSeriesFields(fields, seriesFields)
+				if sub.Projection == "" || sub.Projection == orm.ProjectionSelected {
+					fields = orm.MergeSeriesFields(fields, seriesFields)
+				}
 			}
 			out = append(out, &DataSub{
 				Source:       source,
@@ -153,6 +139,8 @@ func CollectDataSubsWithSymbolState(symbols *orm.SymbolState, job *StratJob) []*
 				WarmupNum:    sub.WarmupNum,
 				Fields:       fields,
 				SeriesFields: seriesFields,
+				Frequency:    sub.Frequency,
+				Projection:   sub.Projection,
 			})
 		}
 	}

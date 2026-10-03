@@ -8,6 +8,7 @@ import (
 )
 
 func TestDelInsKlineQuestDBUsesCurrentSchema(t *testing.T) {
+	installMetadataVersionTestRoot(t)
 	oldQuestDB := IsQuestDB
 	IsQuestDB = true
 	defer func() {

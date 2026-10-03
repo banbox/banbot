@@ -77,7 +77,7 @@ func newSeriesWatcher(deps *RuntimeDeps, symbols *orm.SymbolState, addr string) 
 	if deps == nil {
 		client, err = utils.NewClientIO(addr, "")
 	} else {
-		client, err = utils.NewClientIOWithState(deps.Core, addr, "")
+		client, err = utils.NewClientIOWithState(deps.Core, addr, "", deps.context())
 	}
 	if err != nil {
 		return nil, err
@@ -207,6 +207,9 @@ func (w *SeriesWatcher) getOrderBook(pair string) (*banexg.OrderBook, bool) {
 
 func (w *SeriesWatcher) setOrderBook(pair string, book *banexg.OrderBook) {
 	if w != nil && w.deps != nil {
+		if w.deps.IsolatedSubscriptions {
+			return
+		}
 		if w.deps.Core != nil {
 			w.deps.Core.SetOdBook(pair, book)
 		}
@@ -217,6 +220,9 @@ func (w *SeriesWatcher) setOrderBook(pair string, book *banexg.OrderBook) {
 
 func (w *SeriesWatcher) addTfPairHits(timeFrame, pair string, count int) {
 	if w != nil && w.deps != nil {
+		if w.deps.IsolatedSubscriptions {
+			return
+		}
 		if w.deps.Core != nil {
 			w.deps.Core.AddTfPairHits(timeFrame, pair, count)
 		}

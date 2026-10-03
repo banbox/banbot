@@ -677,6 +677,7 @@ func TestFindPendingExSymbolMarkerRetainsUpdatedStateWhenDirectorySyncFails(t *t
 }
 
 func TestReconcilePendingExSymbolMarkerReservesUnresolvedIdentityBeforeQuery(t *testing.T) {
+	installMetadataVersionTestRoot(t)
 	root := filepath.Join(t.TempDir(), "recovery")
 	allocator := NewSIDAllocator()
 	state := NewSymbolStateWithAllocatorAndIdentity(allocator, "binance", "spot")

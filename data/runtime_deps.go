@@ -35,17 +35,21 @@ type LifecycleRegistrar interface {
 // It is stored on a provider/feeder instance, never discovered dynamically.
 // A nil dependency set means that the caller is using the legacy package facade.
 type RuntimeDeps struct {
-	Core       *core.State
-	Clock      *btime.ClockState
-	Config     *config.Snapshot
-	Market     *com.MarketState
-	Symbols    *orm.SymbolState
-	Storage    *orm.Storage
-	Strategies *strat.State
-	Catalog    *DataSourceCatalog
-	Dump       *orm.DumpSink
-	Callbacks  CallbackTracker
-	Exchange   banexg.BanExchange
+	// Prepared subscriptions own cancellation and feeder state independently
+	// from active strategy jobs and the runtime's reception clock.
+	SubscriptionContext   context.Context
+	IsolatedSubscriptions bool
+	Core                  *core.State
+	Clock                 *btime.ClockState
+	Config                *config.Snapshot
+	Market                *com.MarketState
+	Symbols               *orm.SymbolState
+	Storage               *orm.Storage
+	Strategies            *strat.State
+	Catalog               *DataSourceCatalog
+	Dump                  *orm.DumpSink
+	Callbacks             CallbackTracker
+	Exchange              banexg.BanExchange
 	// IdentityErr records a fail-closed adapter metadata error discovered while
 	// binding this dependency set. Keeping it on the typed view preserves the
 	// original failure instead of silently treating a panic as empty identity.
@@ -263,6 +267,9 @@ func (d *RuntimeDeps) KlineOptions() orm.KlineRuntimeOptions {
 }
 
 func (d *RuntimeDeps) context() context.Context {
+	if d != nil && d.SubscriptionContext != nil {
+		return d.SubscriptionContext
+	}
 	if d != nil && d.Core != nil {
 		if ctx := d.Core.Context(); ctx != nil {
 			return ctx

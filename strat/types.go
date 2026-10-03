@@ -78,11 +78,12 @@ type TradeStrat struct {
 }
 
 const (
-	OdChgNew       = iota // New order 新订单
-	OdChgEnter            // Create an entry order 创建入场订单
-	OdChgEnterFill        // Order entry completed 订单入场完成
-	OdChgExit             // Order request to exit  订单请求退出
-	OdChgExitFill         // Order exit completed 订单退出完成
+	OdChgNew          = iota // New order 新订单
+	OdChgEnter               // Create an entry order 创建入场订单
+	OdChgEnterFill           // Order entry completed 订单入场完成
+	OdChgExit                // Order request to exit  订单请求退出
+	OdChgExitFill            // Order exit completed 订单退出完成
+	OdChgOrderChanged        // A real order was acknowledged, changed, or canceled; no synthetic fill.
 )
 
 type JobEnv struct {
@@ -108,14 +109,7 @@ type PairSub struct {
 	WarmupNum int
 }
 
-type DataSub struct {
-	Source       string
-	ExSymbol     *orm.ExSymbol
-	TimeFrame    string
-	WarmupNum    int
-	Fields       []string // fields fetched from the data source
-	SeriesFields []string // fields maintained as banta.Series; float fields by default
-}
+type DataSub = orm.Subscription
 
 type StratJob struct {
 	Strat         *TradeStrat
@@ -201,6 +195,7 @@ EnterReq
 打开一个订单。默认开多。如需开空short=False
 */
 type EnterReq struct {
+	CommandID       string  // Stable request identity; callback actions derive it from their source event.
 	Tag             string  // Entry signal 入场信号
 	StratName       string  // Strategy Name 策略名称
 	Short           bool    // Whether to short sell or not 是否做空
@@ -234,6 +229,7 @@ ExitReq
 请求平仓
 */
 type ExitReq struct {
+	CommandID  string  // Same ID and payload replay without submitting a second action.
 	Tag        string  // Exit signal 退出信号
 	StratName  string  // Strategy Name 策略名称
 	EnterTag   string  // Only exit orders with EnterTag as the entry signal 只退出入场信号为EnterTag的订单

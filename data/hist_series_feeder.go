@@ -12,18 +12,21 @@ import (
 )
 
 type HistSeriesFeeder struct {
-	info      *orm.SeriesInfo
-	target    *orm.ExSymbol
-	callback  FnDataSeries
-	store     *orm.SeriesStore
-	deps      *RuntimeDeps
-	warmEndMS int64
-	endMS     int64
-	offsetMS  int64
-	rowIdx    int
-	nextMS    int64
-	rows      []*orm.DataSeries
-	loadErr   *errs.Error
+	// BatchRows bounds each page. Zero preserves the legacy 20,000-row page.
+	BatchRows  int
+	BatchBytes int64
+	info       *orm.SeriesInfo
+	target     *orm.ExSymbol
+	callback   FnDataSeries
+	store      *orm.SeriesStore
+	deps       *RuntimeDeps
+	warmEndMS  int64
+	endMS      int64
+	offsetMS   int64
+	rowIdx     int
+	nextMS     int64
+	rows       []*orm.DataSeries
+	loadErr    *errs.Error
 }
 
 type seriesLoadErrorBatch struct {
@@ -146,6 +149,8 @@ func (f *HistSeriesFeeder) CallNext() {
 		f.nextMS = f.rows[f.rowIdx].EndMS
 		return
 	}
+	// Release the previous page before reading its replacement.
+	f.rows = nil
 	if f.endMS > 0 && f.offsetMS >= f.endMS {
 		f.rowIdx = -1
 		f.nextMS = math.MaxInt64
@@ -159,7 +164,26 @@ func (f *HistSeriesFeeder) CallNext() {
 	if f.deps != nil {
 		ctx = f.deps.context()
 	}
-	rows, err := f.store.Read(ctx, f.info, f.target, f.offsetMS, endMS, 20_000)
+	ctx = orm.WithSeriesReadByteLimit(ctx, f.BatchBytes)
+	if err := ctx.Err(); err != nil {
+		f.loadErr = errs.New(core.ErrDbReadFail, err)
+		f.rowIdx = -1
+		f.nextMS = f.offsetMS
+		return
+	}
+	pageRows := f.BatchRows
+	if pageRows <= 0 {
+		pageRows = 20_000
+	}
+	rows, err := f.store.Read(ctx, f.info, f.target, f.offsetMS, endMS, pageRows)
+	if err == nil {
+		if budgetErr := orm.CheckDataSeriesBytes(ctx, rows); budgetErr != nil {
+			err = errs.New(core.ErrDbReadFail, budgetErr)
+		}
+	}
+	if err == nil && ctx.Err() != nil {
+		err = errs.New(core.ErrDbReadFail, ctx.Err())
+	}
 	if err != nil {
 		f.loadErr = err
 		f.rowIdx = -1

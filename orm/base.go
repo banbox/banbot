@@ -210,7 +210,7 @@ func isQuestDuplicateColumnErr(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "column 'agg_rules' already exists")
+	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "column 'agg_rules' already exists") || strings.Contains(msg, "column 'bar_ts' already exists")
 }
 
 // execMultiSQLTx executes multiple semicolon-separated SQL statements inside a pgx.Tx.
@@ -1087,40 +1087,9 @@ create table if not exists schema_migrations (
 	}
 	initVersion := currentVersion
 
-	migrations := strings.Split(ddlQdbMigrations, "-- version")
-	for _, migration := range migrations {
-		migration = strings.TrimSpace(migration)
-		if migration == "" {
-			continue
-		}
-		lines := strings.SplitN(migration, "\n", 2)
-		if len(lines) < 2 {
-			continue
-		}
-		versionStr := strings.TrimSpace(lines[0])
-		version, err := strconv.ParseInt(versionStr, 10, 64)
-		if err != nil {
-			if strings.HasPrefix(versionStr, "--") {
-				// Header comments before the first "-- version N" section.
-				continue
-			}
-			log.Warn("invalid migration version", zap.String("version", versionStr))
-			continue
-		}
-		if version <= currentVersion {
-			continue
-		}
-		if err := execMultiSQL(ctx, pool, lines[1]); err != nil {
-			if isQuestDuplicateColumnErr(err) {
-				log.Warn("questdb migration column already exists, marking migration applied", zap.Int64("version", version), zap.Error(err))
-			} else {
-				return NewDbErr(core.ErrDbExecFail, err)
-			}
-		}
-		if _, err := pool.Exec(ctx, `insert into schema_migrations (version, applied_ts) values ($1,$2)`, version, time.Now().UTC()); err != nil {
-			return NewDbErr(core.ErrDbExecFail, err)
-		}
-		currentVersion = version
+	currentVersion, err = applyQuestDBMigrations(ctx, pool, ddlQdbMigrations, currentVersion)
+	if err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	if initVersion < currentVersion {
 		log.Info("database migration completed", zap.Int64("from", initVersion), zap.Int64("to", currentVersion))

@@ -2,16 +2,21 @@ package dev
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/banbox/banexg"
 	utils2 "github.com/banbox/banexg/utils"
@@ -285,7 +290,12 @@ func (s *DevServer) prepareBacktestConfigFiles(configs map[string]string, paths 
 			cleanup()
 			return "", nil, err
 		}
-		if err := os.WriteFile(target, []byte(text), 0644); err != nil {
+		data, pathErr := s.backtestConfigContents(rawPath, []byte(text))
+		if pathErr != nil {
+			cleanup()
+			return "", nil, pathErr
+		}
+		if err := os.WriteFile(target, data, 0644); err != nil {
 			cleanup()
 			return "", nil, err
 		}
@@ -304,6 +314,11 @@ func (s *DevServer) prepareBacktestConfigFiles(configs map[string]string, paths 
 			return "", nil, pathErr
 		}
 		data, readErr := os.ReadFile(source)
+		if readErr != nil {
+			cleanup()
+			return "", nil, readErr
+		}
+		data, readErr = s.backtestConfigContents(rawPath, data)
 		if readErr != nil {
 			cleanup()
 			return "", nil, readErr
@@ -370,6 +385,129 @@ func backtestConfigKey(rawPath string) string {
 	return filepath.Clean(filepath.FromSlash(path))
 }
 
+// Private request copies must retain advanced paths' original file bases.
+// Only the copy is normalized; the user's file and expressions stay intact.
+func (s *DevServer) backtestConfigContents(rawPath string, raw []byte) ([]byte, error) {
+	var fields map[string]any
+	if err := yaml.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	source := rawPath
+	if !filepath.IsAbs(source) {
+		var err error
+		source, err = s.parsePath(rawPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	changed := false
+	var walk func(string, any) error
+	walk = func(path string, value any) error {
+		switch item := value.(type) {
+		case map[string]any:
+			for key, child := range item {
+				field := key
+				if path != "" {
+					field = path + "." + key
+				}
+				text, ok := child.(string)
+				if ok && webAdvancedConfigPath(field) {
+					expanded := os.ExpandEnv(text)
+					if expanded != "" && expanded != ":memory:" && !filepath.IsAbs(expanded) && !strings.HasPrefix(expanded, "$") && !strings.HasPrefix(expanded, "@") {
+						resolved, err := filepath.Abs(filepath.Join(filepath.Dir(source), expanded))
+						if err != nil {
+							return err
+						}
+						item[key], changed = resolved, true
+					}
+				}
+				if err := walk(field, child); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, child := range item {
+				if err := walk(path+"[]", child); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk("", fields); err != nil {
+		return nil, err
+	}
+	if !changed {
+		return raw, nil
+	}
+	return yaml.Marshal(fields)
+}
+
+func webAdvancedConfigPath(path string) bool {
+	return config.IsAdvancedPathField(path)
+}
+
+func (s *DevServer) loadBacktestRunSpec(paths []string) (*config.RunSpec, *config.Config, []byte, error) {
+	spec, err := config.LoadRunSpec(&config.CmdArgs{Configs: paths, NoDefault: true, DataDir: s.DataDir()}, false)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	u := spec.Config()
+	if len(u.RunPolicy) == 0 {
+		return nil, nil, nil, errs.NewMsg(errs.CodeParamRequired, "run_policy is required")
+	}
+	if s.backtestPreflight != nil {
+		if err := s.backtestPreflight(spec); err != nil {
+			return nil, nil, nil, err
+		}
+	} else if slices.Contains(spec.Engines(), config.EngineFactor) {
+		return nil, nil, nil, fmt.Errorf("unified backtest preflight is not configured")
+	}
+	// This view supplies task-list metadata only. The runnable config remains
+	// the complete RunSpec and reaches the ordinary unified backtest command.
+	cfg := backtestTaskConfig(spec)
+	if slices.Contains(spec.Engines(), config.EngineTimeSeries) {
+		if err := validateWebTimeSeriesBacktest(cfg); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	raw, exportErr := spec.EffectiveYAML(false)
+	return spec, cfg, raw, exportErr
+}
+
+func backtestTaskConfig(spec *config.RunSpec) *config.Config {
+	u := spec.Config()
+	cfg := u.Root.Clone()
+	cfg.RunPolicy = nil
+	for _, policy := range u.RunPolicy {
+		cfg.RunPolicy = append(cfg.RunPolicy, policy.RunPolicyConfig.Clone())
+	}
+	return cfg
+}
+
+// Retain the Web TS profile without imposing it on factor-only research.
+func validateWebTimeSeriesBacktest(cfg *config.Config) error {
+	if cfg.TimeRange == nil || cfg.TimeRange.StartMS == 0 || cfg.TimeRange.EndMS == 0 {
+		return errs.NewMsg(errs.CodeParamRequired, "time_range is required")
+	}
+	if len(cfg.WalletAmounts) == 0 {
+		return errs.NewMsg(errs.CodeParamRequired, "wallet_amounts is required")
+	}
+	if cfg.StakeAmount == 0 && cfg.StakePct == 0 {
+		return errs.NewMsg(errs.CodeParamRequired, "stake_amount or stake_pct is required")
+	}
+	if len(cfg.StakeCurrency) == 0 {
+		return errs.NewMsg(errs.CodeParamRequired, "stake_currency is required")
+	}
+	if cfg.Exchange == nil || cfg.Exchange.Name == "" {
+		return errs.NewMsg(errs.CodeParamRequired, "exchange.name is required")
+	}
+	if cfg.Database == nil || cfg.Database.Url == "" {
+		return errs.NewMsg(errs.CodeParamRequired, "database.url is required")
+	}
+	return nil
+}
+
 func (s *DevServer) getText(c *fiber.Ctx) error {
 	type TextArgs struct {
 		Path string `query:"path" validate:"required"`
@@ -392,8 +530,14 @@ func (s *DevServer) getText(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"data": content,
+		"data":   content,
+		"digest": textDigest([]byte(content)),
 	})
+}
+
+func textDigest(content []byte) string {
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:])
 }
 
 func (s *DevServer) getTexts(c *fiber.Ctx) error {
@@ -432,12 +576,16 @@ func (s *DevServer) saveText(c *fiber.Ctx) error {
 	type SaveTextArgs struct {
 		Path    string `json:"path" validate:"required"`
 		Content string `json:"content" validate:"required"`
+		Digest  string `json:"digest"`
 	}
 
 	var args = new(SaveTextArgs)
 	err := base.VerifyArg(c, args, base.ArgBody)
 	if err != nil {
 		return err
+	}
+	if args.Digest == "" {
+		return c.Status(fiber.StatusPreconditionRequired).JSON(fiber.Map{"msg": "Read the file before saving; its original digest is required"})
 	}
 
 	// 检查内容是否为空
@@ -452,8 +600,9 @@ func (s *DevServer) saveText(c *fiber.Ctx) error {
 		return err
 	}
 
-	// 检查文件是否存在
-	_, err = os.Stat(args.Path)
+	// Compare the browser's version first, then pass the exact bytes to the
+	// canonical-path writer, which rechecks them under the shared write lock.
+	expected, err := os.ReadFile(args.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return c.Status(400).JSON(fiber.Map{
@@ -462,11 +611,14 @@ func (s *DevServer) saveText(c *fiber.Ctx) error {
 		}
 		return err
 	}
-
-	// 写入文件内容
-	err = os.WriteFile(args.Path, []byte(args.Content), 0644)
-	if err != nil {
-		return err
+	if textDigest(expected) != args.Digest {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"msg": "The file changed since it was read; reload it before saving"})
+	}
+	if writeErr := config.WriteConfigAtomic(args.Path, expected, []byte(args.Content)); writeErr != nil {
+		if strings.Contains(writeErr.Error(), "conflict") {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"msg": "The file changed while saving; reload it before saving"})
+		}
+		return writeErr
 	}
 	if strings.HasSuffix(args.Path, ".go") {
 		s.setDirtyBin()
@@ -474,7 +626,8 @@ func (s *DevServer) saveText(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"code": 200,
+		"code":   200,
+		"digest": textDigest([]byte(args.Content)),
 	})
 }
 
@@ -878,39 +1031,9 @@ func (s *DevServer) handleRunBacktest(c *fiber.Ctx) error {
 	}
 	defer os.RemoveAll(configTempDir)
 
-	// 加载并验证配置
-	cfg, err2 := config.GetConfig(&config.CmdArgs{Configs: paths, NoDefault: true}, false)
-	if err2 != nil {
-		return err2
-	}
-
-	// 检查必要的配置项
-	if len(cfg.RunPolicy) == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "run_policy is required")
-	}
-	if cfg.TimeRange.StartMS == 0 || cfg.TimeRange.EndMS == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "time_range is required")
-	}
-	if len(cfg.WalletAmounts) == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "wallet_amounts is required")
-	}
-	if cfg.StakeAmount == 0 && cfg.StakePct == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "stake_amount or stake_pct is required")
-	}
-	if len(cfg.StakeCurrency) == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "stake_currency is required")
-	}
-	if cfg.Exchange.Name == "" {
-		return errs.NewMsg(errs.CodeParamRequired, "exchange.name is required")
-	}
-	if cfg.Database.Url == "" {
-		return errs.NewMsg(errs.CodeParamRequired, "database.url is required")
-	}
-
-	// 获取配置内容并计算哈希
-	cfgData, err2 := cfg.DumpYaml()
-	if err2 != nil {
-		return err2
+	spec, cfg, cfgData, err := s.loadBacktestRunSpec(paths)
+	if err != nil {
+		return err
 	}
 	hashVal := utils.MD5(cfgData)[:10]
 	backtestRoot := s.BacktestDir()
@@ -1002,16 +1125,17 @@ func (s *DevServer) handleRunBacktest(c *fiber.Ctx) error {
 			backupOwned = true
 		}
 	}
-	if err = os.WriteFile(cfgPath, cfgData, 0644); err != nil {
-		return err
+	if writeErr := config.WriteConfigAtomic(cfgPath, nil, cfgData); writeErr != nil {
+		return writeErr
 	}
 
 	// 构建回测参数
-	btArgs := fmt.Sprintf("-out %s -prg uiPrg -no-default -config %s", btPath, btPath+"/config.yml")
-	if args.Separate {
-		btArgs = "-separate " + btArgs
-	}
+	btArgs := webBacktestArgs(spec, btPath, args.Separate)
 
+	startAt, stopAt := int64(0), int64(0)
+	if cfg.TimeRange != nil {
+		startAt, stopAt = cfg.TimeRange.StartMS, cfg.TimeRange.EndMS
+	}
 	task, err := qu.AddTask(context.Background(), ormu.AddTaskParams{
 		Mode:     "backtest",
 		Path:     taskPath,
@@ -1021,8 +1145,8 @@ func (s *DevServer) handleRunBacktest(c *fiber.Ctx) error {
 		Periods:  strings.Join(cfg.RunTimeFrames(), ","),
 		Pairs:    cfg.ShowPairs(),
 		CreateAt: btime.UTCStamp(),
-		StartAt:  cfg.TimeRange.StartMS,
-		StopAt:   cfg.TimeRange.EndMS,
+		StartAt:  startAt,
+		StopAt:   stopAt,
 		Status:   ormu.BtStatusInit,
 		Progress: 0,
 	})
@@ -1124,6 +1248,13 @@ func (s *DevServer) getBtDetail(c *fiber.Ctx) error {
 		return pathErr
 	}
 	btPath := firstReportDir(reportDirs, "detail.json")
+	unified, unifiedPath, unifiedErr := readUnifiedBacktestReport(basePath)
+	if unifiedErr != nil {
+		return unifiedErr
+	}
+	if unified != nil {
+		return c.JSON(fiber.Map{"path": unifiedPath, "task": task.ToMap(), "unified": unified})
+	}
 
 	configPath := filepath.Join(basePath, "config.yml")
 	if !utils.Exists(configPath) {
@@ -1131,10 +1262,11 @@ func (s *DevServer) getBtDetail(c *fiber.Ctx) error {
 	}
 	var cfg *config.Config
 	if utils.Exists(configPath) {
-		cfg, err2 = config.ParseConfig(configPath)
-		if err2 != nil {
-			return err2
+		spec, specErr := config.LoadRunSpec(&config.CmdArgs{Configs: []string{configPath}, NoDefault: true, DataDir: s.DataDir()}, false)
+		if specErr != nil {
+			return specErr
 		}
+		cfg = backtestTaskConfig(spec)
 	}
 
 	// 读取detail.json
@@ -1153,7 +1285,7 @@ func (s *DevServer) getBtDetail(c *fiber.Ctx) error {
 		}
 	}
 	var exsMap map[string]*orm.ExSymbol
-	if cfg != nil {
+	if cfg != nil && cfg.Exchange != nil {
 		if symbols := s.symbols(); symbols != nil {
 			exsMap = symbols.GetExSymbolMap(cfg.Exchange.Name, cfg.MarketType)
 		}

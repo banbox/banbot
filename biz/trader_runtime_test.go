@@ -92,6 +92,9 @@ func (runtimeDepsCallbackStub) LeaveCallback()      {}
 
 func TestRuntimeDepsDataProjectionRetainsAllDataDependencies(t *testing.T) {
 	wantRuntimeFields := []string{
+		// Shared execution/legacy bridge are account services. Data providers
+		// receive market/clock/callback dependencies, never trading authority.
+		"SharedExecution", "SharedOrderBridge",
 		"Core", "Clock", "Market", "Batch", "Strategies", "Orders", "Trading", "Config", "Accounts",
 		"AccountsMu", "Symbols", "Catalog", "Callbacks", "Storage", "Exchange", "Scheduler", "Notifications",
 		"Dump", "DefaultAccount",
@@ -100,6 +103,8 @@ func TestRuntimeDepsDataProjectionRetainsAllDataDependencies(t *testing.T) {
 		t.Fatalf("RuntimeDeps fields = %v, want %v; classify every added dependency in each narrow projection", got, wantRuntimeFields)
 	}
 	wantDataFields := []string{
+		// Generation preparation sets these only on an isolated provider copy.
+		"SubscriptionContext", "IsolatedSubscriptions",
 		"Core", "Clock", "Config", "Market", "Symbols", "Storage", "Strategies", "Catalog", "Dump",
 		"Callbacks", "Exchange", "IdentityErr", "ExchangeName", "MarketType",
 	}
@@ -123,6 +128,9 @@ func TestRuntimeDepsDataProjectionRetainsAllDataDependencies(t *testing.T) {
 		Exchange: exchange,
 	}
 	projected := deps.DataDeps()
+	if projected.SubscriptionContext != nil || projected.IsolatedSubscriptions {
+		t.Fatal("ordinary dependency projection inherited candidate lifecycle state")
+	}
 	if projected.Core != coreState || projected.Clock != clock || projected.Config != snapshot ||
 		projected.Market != market || projected.Symbols != symbols || projected.Storage != storage ||
 		projected.Strategies != strategies || projected.Catalog != catalog || projected.Dump != dump ||

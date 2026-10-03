@@ -107,68 +107,21 @@ args: NoDefault, Configs, TimeRange, MaxPoolSize, StakeAmount, StakePct, TimeFra
 */
 func GetConfig(args *CmdArgs, showLog bool) (*Config, *errs.Error) {
 	args.Init()
-	var paths []string
-	if !args.NoDefault {
-		dataDir := GetDataDir()
-		if dataDir == "" {
-			return nil, errs.NewMsg(errs.CodeParamRequired, "-datadir or env `BanDataDir` is required")
-		}
-		tryNames := []string{"config.yml", "config.local.yml"}
-		for _, name := range tryNames {
-			path := filepath.Join(dataDir, name)
-			if _, err := os.Stat(path); err == nil {
-				paths = append(paths, path)
-			}
-		}
-	}
-	configPaths := args.Configs
-	if len(configPaths) > 0 {
-		paths = append(paths, configPaths...)
-	}
-
-	// Handle ConfigData if provided
-	if args.ConfigData != "" {
-		// Create temporary file for ConfigData
-		tmpFile, err := os.CreateTemp("", "config_data_*.yml")
-		if err != nil {
-			return nil, errs.New(errs.CodeIOReadFail, err)
-		}
-		tmpPath := tmpFile.Name()
-
-		// Write ConfigData to temporary file
-		if _, err := tmpFile.WriteString(args.ConfigData); err != nil {
-			tmpFile.Close()
-			os.Remove(tmpPath)
-			return nil, errs.New(errs.CodeIOWriteFail, err)
-		}
-		tmpFile.Close()
-
-		// Add temporary file path to paths
-		paths = append(paths, tmpPath)
-
-		// Defer removal of temporary file
-		defer func() {
-			if err = os.Remove(tmpPath); err != nil {
-				log.Warn("Failed to remove temporary config file: " + err.Error())
-			}
-		}()
-	}
-
-	res, err2 := ParseConfigs(paths, showLog)
-	if err2 != nil {
-		return nil, err2
-	}
-	err := res.Apply(args)
+	spec, err := LoadRunSpec(args, showLog)
 	if err != nil {
-		return nil, errs.New(errs.CodeRunTime, err)
+		return nil, err
 	}
-	return res, nil
+	return spec.Config().TimeSeriesConfig()
 }
 
 func UpdateLocal(configPaths []string, configData string, noDefault bool) *errs.Error {
 	// 对于docker中启动，且传入了额外yml配置的，合并写入到config.local.yml，方便WebUI启动回测时保留额外的yml配置
 	items := make([]string, 0, len(configPaths)+1)
 	localCfgPath := filepath.Join(GetDataDir(), "config.local.yml")
+	expected, readErr := os.ReadFile(localCfgPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return errs.New(errs.CodeIOReadFail, readErr)
+	}
 	if _, err := os.Stat(localCfgPath); err == nil && !noDefault {
 		items = append(items, localCfgPath)
 	}
@@ -202,17 +155,22 @@ func UpdateLocal(configPaths []string, configData string, noDefault bool) *errs.
 	if err != nil {
 		return errs.New(errs.CodeIOReadFail, err)
 	}
-	err2 := utils2.WriteFile(localCfgPath, []byte(content))
-	if err2 != nil {
-		return err2
+	candidate, importErr := ImportV1YAML([]byte(content), localCfgPath)
+	if importErr != nil {
+		return errs.New(core.ErrBadConfig, importErr)
 	}
-	return nil
+	if _, err := ParseUnifiedYAML(candidate.YAML, localCfgPath); err != nil {
+		return err
+	}
+	return WriteConfigAtomic(localCfgPath, expected, candidate.YAML)
 }
 
 func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {
 	var res Config
 	var merged = make(map[string]interface{})
 	var llmMerged map[string]interface{}
+	var raws [][]byte
+	hasV2 := false
 	for _, path := range paths {
 		if showLog {
 			log.Info("Using " + path)
@@ -221,6 +179,12 @@ func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {
 		if err != nil {
 			return nil, errs.NewFull(core.ErrIOReadFail, err, "Read %s Fail", path)
 		}
+		_, version, versionErr := configDocument(rawData)
+		if versionErr != nil {
+			return nil, errs.NewFull(core.ErrBadConfig, versionErr, "%s", path)
+		}
+		raws = append(raws, rawData)
+		hasV2 = hasV2 || version == ConfigVersionV2
 		llmSection, err := extractLLMSection(rawData)
 		if err != nil {
 			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Parse LLM config from %s Fail", path)
@@ -238,20 +202,14 @@ func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {
 		if err != nil {
 			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Unmarshal %s Fail", path)
 		}
-		if _, ok := unpak["timerange"]; ok {
-			delete(merged, "time_start")
-			delete(merged, "time_end")
-		} else if _, hasStart := unpak["time_start"]; hasStart {
-			delete(merged, "timerange")
-		} else if _, hasEnd := unpak["time_end"]; hasEnd {
-			delete(merged, "timerange")
+		mergeConfigLayer(merged, unpak)
+	}
+	if hasV2 {
+		unified, err := parseUnifiedLayers(raws, paths)
+		if err != nil {
+			return nil, err
 		}
-		for key := range noExtends {
-			if _, ok := unpak[key]; ok {
-				delete(merged, key)
-			}
-		}
-		utils2.DeepCopyMap(merged, unpak)
+		return unified.TimeSeriesConfig()
 	}
 	err := mapstructure.Decode(merged, &res)
 	if err != nil {
@@ -265,6 +223,9 @@ func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {
 	if err := llm.ResolveModels(res.LLMModels); err != nil {
 		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "resolve LLM config Fail")
 	}
+	if err := validateTimeSeriesPolicies(res.RunPolicy); err != nil {
+		return nil, err
+	}
 	return &res, nil
 }
 
@@ -277,6 +238,17 @@ func ParseConfig(path string) (*Config, *errs.Error) {
 }
 
 func ParseYmlConfig(fileData []byte, path string) (*Config, *errs.Error) {
+	_, version, versionErr := configDocument(fileData)
+	if versionErr != nil {
+		return nil, errs.NewFull(core.ErrBadConfig, versionErr, "%s", path)
+	}
+	if version == ConfigVersionV2 {
+		unified, err := ParseUnifiedYAML(fileData, path)
+		if err != nil {
+			return nil, err
+		}
+		return unified.TimeSeriesConfig()
+	}
 	var res Config
 	llmSection, err := extractLLMSection(fileData)
 	if err != nil {
@@ -299,6 +271,9 @@ func ParseYmlConfig(fileData []byte, path string) (*Config, *errs.Error) {
 	}
 	if err := llm.ResolveModels(res.LLMModels); err != nil {
 		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "resolve LLM config Fail")
+	}
+	if err := validateTimeSeriesPolicies(res.RunPolicy); err != nil {
+		return nil, err
 	}
 	return &res, nil
 }
@@ -385,22 +360,7 @@ func MergeConfigPaths(paths []string, skips ...string) (string, error) {
 }
 
 func (c *Config) Apply(args *CmdArgs) error {
-	if args.BTStrictSet {
-		c.BTStrict = args.BTStrict
-	}
-	if args.TimeRange != "" {
-		c.TimeRangeRaw = args.TimeRange
-		c.TimeStart = ""
-		c.TimeEnd = ""
-	}
-	if args.TimeStart != "" {
-		c.TimeStart = args.TimeStart
-		c.TimeEnd = args.TimeEnd
-		c.TimeRangeRaw = ""
-	}
-	if args.MaxPoolSize > 0 {
-		c.Database.MaxPoolSize = args.MaxPoolSize
-	}
+	c.applyArguments(args)
 	var start, stop = int64(0), int64(0)
 	var err error
 	if c.TimeStart != "" {
@@ -426,30 +386,53 @@ func (c *Config) Apply(args *CmdArgs) error {
 	}
 	c.TimeRange = &TimeTuple{start, stop}
 	if c.HistoricalCoverage != nil {
-		if err = c.HistoricalCoverage.Normalize(c.TimeRange); err != nil {
-			return err
-		}
+		return c.HistoricalCoverage.Normalize(c.TimeRange)
 	}
-	if args.StakeAmount > 0 {
+	return nil
+}
+
+func (c *Config) applyArguments(args *CmdArgs) {
+	if args.BTStrictSet || args.ExplicitFlags["bt-strict"] {
+		c.BTStrict = args.BTStrict
+	}
+	if args.TimeRange != "" || args.ExplicitFlags["timerange"] {
+		c.TimeRangeRaw = args.TimeRange
+		c.TimeStart = ""
+		c.TimeEnd = ""
+	}
+	if args.TimeStart != "" || args.ExplicitFlags["timestart"] {
+		c.TimeStart = args.TimeStart
+		c.TimeEnd = args.TimeEnd
+		c.TimeRangeRaw = ""
+	}
+	if args.MaxPoolSize > 0 {
+		if c.Database == nil {
+			c.Database = &DatabaseConfig{}
+		}
+		c.Database.MaxPoolSize = args.MaxPoolSize
+	}
+	if args.StakeAmount > 0 || args.ExplicitFlags["stake-amount"] {
 		c.StakeAmount = args.StakeAmount
 	}
-	if args.StakePct > 0 {
+	if args.StakePct > 0 || args.ExplicitFlags["stake-pct"] {
 		c.StakePct = args.StakePct
 	}
 	// Parse TimeFrames field and populate RunTimeframes
 	if c.TimeFrames != "" && len(c.RunTimeframes) == 0 {
 		c.RunTimeframes = SplitTimeFrames(c.TimeFrames)
 	}
-	if len(args.TimeFrames) > 0 {
+	if len(args.TimeFrames) > 0 || args.ExplicitFlags["timeframes"] {
 		c.RunTimeframes = args.TimeFrames
 	}
-	if len(args.Pairs) > 0 {
+	if len(args.Pairs) > 0 || args.ExplicitFlags["pairs"] {
 		c.Pairs = args.Pairs
 	}
-	return nil
 }
 
 func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
+	if err := validateTimeSeriesPolicies(c.RunPolicy); err != nil {
+		return err
+	}
 	Loaded = true
 	Name = c.Name
 	Args = args
@@ -637,6 +620,9 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 
 // SetRunPolicy set run_policy and their indexs
 func SetRunPolicy(index bool, items ...*RunPolicyConfig) *errs.Error {
+	if err := validateTimeSeriesPolicies(items); err != nil {
+		return err
+	}
 	if items == nil {
 		items = make([]*RunPolicyConfig, 0)
 	}

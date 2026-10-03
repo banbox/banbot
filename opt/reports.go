@@ -1317,7 +1317,13 @@ func DumpOrdersCSV(orders []*ormo.InOutOrder, outPath string) error {
 	return dumpOrdersCSV(orders, outPath, legacyReportDeps())
 }
 
-func dumpOrdersCSV(orders []*ormo.InOutOrder, outPath string, deps *ReportDeps) error {
+// DumpOrdersCSVWithRuntimeDeps uses the run's timezone and configuration, so
+// reports from sibling runtimes do not borrow process-global settings.
+func DumpOrdersCSVWithRuntimeDeps(orders []*ormo.InOutOrder, outPath string, deps biz.RuntimeDeps) error {
+	return dumpOrdersCSV(orders, outPath, NewReportDeps(deps))
+}
+
+func dumpOrdersCSV(orders []*ormo.InOutOrder, outPath string, deps *ReportDeps) (resultErr error) {
 	sort.Slice(orders, func(i, j int) bool {
 		var a, b = orders[i], orders[j]
 		var ta, tb = a.RealEnterMS(), b.RealEnterMS()
@@ -1343,9 +1349,11 @@ func dumpOrdersCSV(orders []*ormo.InOutOrder, outPath string, deps *ReportDeps) 
 	if err_ != nil {
 		return err_
 	}
-	defer file.Close()
 	writer := csv.NewWriter(file)
-	defer writer.Flush()
+	defer func() {
+		writer.Flush()
+		resultErr = errors.Join(resultErr, writer.Error(), file.Close())
+	}()
 	heads := []string{"sid", "symbol", "timeframe", "direction", "leverage", "entAt", "entTag", "entPrice",
 		"entAmount", "entCost", "entFee", "exitAt", "exitTag", "exitPrice", "exitAmount", "exitGot",
 		"exitFee", "maxPftRate", "maxDrawDown", "profitRate", "profit", "strategy"}

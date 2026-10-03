@@ -475,11 +475,11 @@ func (q *Queries) queryUnfinish(sid int32, timeFrame string, barStartMS int64) (
 	unlock := q.LockCompactTableRead("kline_un_q")
 	defer unlock()
 	ctx := context.Background()
-	row := q.db.QueryRow(ctx, `SELECT cast(ts as long)/1000, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
-FROM kline_un_q
-LATEST BY sid, timeframe
+	row := q.db.QueryRow(ctx, `SELECT cast(coalesce(bar_ts, ts) as long)/1000, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
+FROM (SELECT * FROM kline_un_q
+  LATEST BY sid, timeframe WHERE sid = $1 AND timeframe = $2)
 WHERE sid = $1 AND timeframe = $2 AND coalesce(is_deleted, false) = false
-  AND cast(ts as long)/1000 >= $3`,
+  AND cast(coalesce(bar_ts, ts) as long)/1000 >= $3`,
 		sid, timeFrame, barStartMS,
 	)
 	var (
@@ -662,13 +662,16 @@ func (q *Queries) SetUnfinish(sid int32, tf string, endMS int64, bar *banexg.Kli
 	unlock := q.LockCompactTableRead("kline_un_q")
 	defer unlock()
 	expireMS := utils2.AlignTfMSecs(options.nowMS(), 60000) + 60000
-	ts := time.UnixMilli(bar.Time).UTC()
 	ctx := context.Background()
-	_, err := q.db.Exec(ctx, `INSERT INTO kline_un_q
-(sid, timeframe, ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num, is_deleted)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false)`,
+	ts, err := q.reserveMetadataVersions(ctx, "kline_un_q", 1, time.Time{})
+	if err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
+	_, err = q.db.Exec(ctx, `INSERT INTO kline_un_q
+(sid, timeframe, ts, stop_ms, expire_ms, open, high, low, close, volume, quote, buy_volume, trade_num, bar_ts, is_deleted)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, false)`,
 		sid, tf, ts, endMS, expireMS,
-		bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Quote, bar.BuyVolume, bar.TradeNum,
+		bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Quote, bar.BuyVolume, bar.TradeNum, time.UnixMilli(bar.Time).UTC(),
 	)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
@@ -1026,7 +1029,7 @@ func (q *Queries) refreshAgg(item *KlineAgg, sid int32, orgStartMS, orgEndMS int
 			return err
 		}
 		rows, err := q.db.Query(ctx, queryText, sid, time.UnixMilli(aggStart).UTC(), time.UnixMilli(endMS).UTC())
-		src, err = mapToSeriesFields(exs, aggFrom, fields, rows, err)
+		src, err = mapToSeriesFieldsWithContext(q.seriesReadContext(), exs, aggFrom, fields, rows, err)
 		return err
 	}()
 	err_ := readErr
@@ -1371,8 +1374,8 @@ func (q *Queries) FixKInfoZerosWithContext(ctx context.Context) *errs.Error {
 	var err_ error
 	if q.isQuestDB() {
 		rows, err_ = q.db.Query(ctx, `SELECT sid, tbl, timeframe
-FROM sranges_q
-LATEST BY sid, tbl, timeframe, start_ms
+FROM (SELECT * FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms)
 WHERE has_data = true AND coalesce(is_deleted, false) = false AND (stop_ms = 0 OR start_ms = 0)`)
 	} else {
 		rows, err_ = q.db.Query(ctx, `SELECT sid, tbl, timeframe

@@ -67,10 +67,11 @@ func newDevWebServer(args *dev.CmdArgs) (*dev.DevServer, func(), error) {
 		return newDevChildRuntime(session, snapshot, ctx, name, market, exchangeFor)
 	})
 	server, err := dev.NewDevServer(dev.DevDeps{
-		Data:        rt.BizDeps().DataDeps(),
-		ConfigPaths: configPathsForSnapshot(snapshot, args.Configs),
-		RuntimeFor:  runtimeFor,
-		Maintenance: devMaintenanceRunner(exchangeFor),
+		Data:              rt.BizDeps().DataDeps(),
+		ConfigPaths:       configPathsForSnapshot(snapshot, args.Configs),
+		RuntimeFor:        runtimeFor,
+		Maintenance:       devMaintenanceRunner(exchangeFor),
+		BacktestPreflight: ValidateBacktestRunSpec,
 	})
 	if err != nil {
 		closeExchanges()

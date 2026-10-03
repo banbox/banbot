@@ -36,12 +36,15 @@ type State struct {
 	Config *config.Config
 	// runtimeAccounts is the mutable execution account state owned by a Runtime.
 	// It is separate from Config because StakePctAmt changes while a run is live.
-	runtimeAccounts   map[string]*config.AccountConfig
-	runtimeAccountsMu *sync.RWMutex
-	runtimeOrders     *ormo.OrderState
-	Symbols           *orm.SymbolState
-	Exchange          banexg.BanExchange
-	factories         map[string]FuncMakeStrat
+	runtimeAccounts       map[string]*config.AccountConfig
+	runtimeAccountsMu     *sync.RWMutex
+	runtimeOrders         *ormo.OrderState
+	orderProcessor        FuncProcessOrders
+	orderProcessorOwner   any
+	orderProcessorAccount string
+	Symbols               *orm.SymbolState
+	Exchange              banexg.BanExchange
+	factories             map[string]FuncMakeStrat
 
 	versions    map[string]int
 	envs        map[string]*ta.BarEnv

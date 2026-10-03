@@ -3,6 +3,7 @@ package base
 import (
 	"encoding/csv"
 	"io"
+	"mime"
 	"os"
 	"path/filepath"
 	"sort"
@@ -55,6 +56,12 @@ func (h csvHandlers) postCsvUpload(c *fiber.Ctx) error {
 	file, err := c.FormFile("file")
 	if err != nil {
 		return &fiber.Error{Code: fiber.StatusBadRequest, Message: "file is required"}
+	}
+	// multipart normalizes Filename with filepath.Base, which would otherwise
+	// hide an unsafe original path on Windows before our boundary validation.
+	_, disposition, err := mime.ParseMediaType(file.Header.Get("Content-Disposition"))
+	if err != nil || disposition["filename"] != file.Filename {
+		return &fiber.Error{Code: fiber.StatusBadRequest, Message: "invalid csv file name"}
 	}
 	csvDir := h.csvDir()
 	dstPath, err := csvFilePath(csvDir, file.Filename)

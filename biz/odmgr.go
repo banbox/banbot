@@ -12,6 +12,7 @@ import (
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
@@ -458,18 +459,8 @@ func (o *OrderMgr) updateOrderFee(od *ormo.InOutOrder, price float64, forEnter b
 	if exOrder == nil {
 		return errs.NewMsg(errs.CodeRunTime, "fee order is nil for %s", od.Symbol)
 	}
-	// Keep the legacy order-type normalization while calculating through the
-	// manager-bound exchange for explicit Runtime managers.
-	maker := strings.Contains(exOrder.OrderType, "limit")
-	if exOrder.OrderType == banexg.OdTypeLimit {
-		if maker {
-			exOrder.OrderType = banexg.OdTypeLimitMaker
-		} else {
-			exOrder.OrderType = "limit_taker"
-		}
-	}
-	fee, err := exchange.CalculateFee(exOrder.Symbol, exOrder.OrderType, exOrder.Side,
-		exOrder.Filled, price, maker, nil)
+	fee, err := execution.LegacyOrderFee(exchange, exOrder.Symbol, &exOrder.OrderType,
+		exOrder.Side, exOrder.Filled, price)
 	if err != nil {
 		return err
 	}
@@ -840,6 +831,20 @@ func CleanUpOdMgrWithState(state *TradingState) *errs.Error {
 }
 
 func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat.EnterReq) ([]*strat.EnterReq, map[string]int) {
+	openOds, lock := o.openOrders()
+	lock.Lock()
+	openNum := len(openOds)
+	stratOdNum := make(map[string]int)
+	for _, od := range openOds {
+		stratOdNum[od.Strategy]++
+	}
+	lock.Unlock()
+	return o.allowOrderEnterWithCounts(exs, tf, enters, openNum, stratOdNum, nil, 0)
+}
+
+// allowOrderEnterWithCounts shares the admission rules with the account-owned
+// bridge. That path supplies committed counts instead of a Runtime projection.
+func (o *OrderMgr) allowOrderEnterWithCounts(exs *orm.ExSymbol, tf string, enters []*strat.EnterReq, openNum int, stratOdNum map[string]int, policies map[string]*config.RunPolicyConfig, barStopMS int64) ([]*strat.EnterReq, map[string]int) {
 	curMS := o.priceNow()
 	rawNum := len(enters)
 	if o.pairIsBanned(exs.Symbol, curMS) {
@@ -859,8 +864,10 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 		o.addAccFailOpens(strat.FailOpenNoEntry, len(enters))
 		return nil, map[string]int{"AccNoEntry": rawNum}
 	}
-	tfMSecs := int64(utils.TFToSecs(tf) * 1000)
-	barStopMS := utils.AlignTfMSecs(curMS, tfMSecs)
+	if barStopMS == 0 {
+		tfMSecs := int64(utils.TFToSecs(tf) * 1000)
+		barStopMS = utils.AlignTfMSecs(curMS, tfMSecs)
+	}
 	if o.BarMS < barStopMS {
 		o.BarMS = barStopMS
 		o.simulOpen = 0
@@ -868,7 +875,7 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 	}
 	maxOpenNum := o.maxOpenOrders()
 	orgNum := len(enters)
-	enters = o.checkOrderNum(enters, orgNum, maxOpenNum, "max_open_orders")
+	enters = o.checkOrderNum(enters, openNum, maxOpenNum, "max_open_orders")
 	if maxSimulOpen := o.maxSimulOpen(); len(enters) > 0 && maxSimulOpen > 0 {
 		enters = o.checkOrderNum(enters, o.simulOpen, maxSimulOpen, "max_simul_open")
 	}
@@ -885,14 +892,6 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 	}
 	// Check whether the maximum number of orders opened by the strategy is exceeded
 	// 检查是否超出策略最大开单数量
-	openOds, lock := o.openOrders()
-	lock.Lock()
-	stratOdNum := make(map[string]int)
-	for _, od := range openOds {
-		num, _ := stratOdNum[od.Strategy]
-		stratOdNum[od.Strategy] = num + 1
-	}
-	lock.Unlock()
 	skipNum := 0
 	res := make([]*strat.EnterReq, 0, len(enters))
 	for _, req := range enters {
@@ -904,13 +903,18 @@ func (o *OrderMgr) allowOrderEnter(exs *orm.ExSymbol, tf string, enters []*strat
 		// strategy-name limits above still apply.
 		var pol *config.RunPolicyConfig
 		var stgy *strat.TradeStrat
-		if o.runtimeDeps && o.walletDeps.Strategies != nil {
-			stgy = o.walletDeps.Strategies.Get(exs.Symbol, req.StratName)
+		if o.runtimeDeps {
+			if o.walletDeps.Strategies != nil {
+				stgy = o.walletDeps.Strategies.Get(exs.Symbol, req.StratName)
+			}
 		} else {
 			stgy = strat.Get(exs.Symbol, req.StratName)
 		}
 		if stgy != nil {
 			pol = stgy.Policy
+		}
+		if declared := policies[req.StratName]; declared != nil {
+			pol = declared
 		}
 		if pol != nil {
 			if pol.MaxOpen > 0 && num >= pol.MaxOpen {

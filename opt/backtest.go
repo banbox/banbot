@@ -822,12 +822,22 @@ func (b *BackTest) closeHistoricalBoundaries(eventMS int64) *errs.Error {
 }
 
 func (b *BackTest) Run() *errs.Error {
+	return b.RunContext(context.Background())
+}
+
+// RunContext distinguishes caller cancellation from an intentional local
+// early stop (for example liquidation). The Runtime owns input cancellation;
+// this context also prevents a stopped provider from publishing a full report.
+func (b *BackTest) RunContext(ctx context.Context) *errs.Error {
 	completed := false
 	defer func() {
 		if !completed && b != nil && b.outputOwned && b.OutDir != "" {
 			_ = os.RemoveAll(b.OutDir)
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return errs.New(core.ErrRunTime, err)
+	}
 	err := b.initRefreshCron()
 	if err != nil {
 		b.Logger().Error("init pair cron fail", zap.Error(err))
@@ -838,6 +848,9 @@ func (b *BackTest) Run() *errs.Error {
 		b.Logger().Error("backtest init fail", zap.Error(err))
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return errs.New(core.ErrRunTime, err)
+	}
 	if !b.isOpt {
 		b.cronDumpBtStatus()
 		b.schedulerForRun().Start()
@@ -847,7 +860,7 @@ func (b *BackTest) Run() *errs.Error {
 	if loopMainFn == nil {
 		loopMainFn = b.dp.LoopMain
 	}
-	err = b.resolveLoopError(loopMainFn())
+	err = b.resolveLoopErrorContext(ctx, loopMainFn())
 	if !b.isOpt {
 		b.stopRunScheduler()
 	}
@@ -884,6 +897,9 @@ func (b *BackTest) Run() *errs.Error {
 		b.Logger().Error("backtest clean orders fail", zap.Error(err))
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return errs.New(core.ErrRunTime, err)
+	}
 	if b.dataPrep {
 		completed = true
 		return nil
@@ -897,7 +913,13 @@ func (b *BackTest) Run() *errs.Error {
 		b.Logger().Error("backtest report collect fail", zap.Error(err))
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return errs.New(core.ErrRunTime, err)
+	}
 	b.runAfterBacktestCallback()
+	if err := ctx.Err(); err != nil {
+		return errs.New(core.ErrRunTime, err)
+	}
 	if !b.isOpt {
 		b.Logger().Info(fmt.Sprintf("Complete! cost: %.1fs, avg: %.1f bar/s", btCost, float64(b.BarNum)/btCost))
 		var failOpens string
@@ -941,6 +963,16 @@ func (b *BackTest) resolveLoopError(err *errs.Error) *errs.Error {
 	}
 	if b.BackTestLite != nil {
 		return b.BackTestLite.resolveLoopError(nil)
+	}
+	return nil
+}
+
+func (b *BackTest) resolveLoopErrorContext(ctx context.Context, err *errs.Error) *errs.Error {
+	if err := b.resolveLoopError(err); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return errs.New(core.ErrRunTime, err)
 	}
 	return nil
 }

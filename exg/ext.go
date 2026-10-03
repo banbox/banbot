@@ -42,6 +42,9 @@ func getExchangeCapability[T any](exchange banexg.BanExchange) (T, bool) {
 	if capability, ok := exchange.(T); ok {
 		return capability, true
 	}
+	if wrapper, ok := exchange.(interface{ UnderlyingExchange() banexg.BanExchange }); ok {
+		return getExchangeCapability[T](wrapper.UnderlyingExchange())
+	}
 	wrapper, ok := exchange.(*BotExchange)
 	if !ok || wrapper == nil || wrapper.BanExchange == nil {
 		return zero, false
@@ -96,9 +99,9 @@ func (e *BotExchange) SetOrderCallback(callback func(*PutOrderRes) *errs.Error) 
 // the optional instance-level capability. It returns false for foreign test or
 // third-party adapters that do not implement the capability.
 func SetOrderCallback(exchange banexg.BanExchange, callback func(*PutOrderRes) *errs.Error) bool {
-	if setter, ok := exchange.(interface {
+	if setter, ok := getExchangeCapability[interface {
 		SetOrderCallback(func(*PutOrderRes) *errs.Error)
-	}); ok {
+	}](exchange); ok {
 		setter.SetOrderCallback(callback)
 		return true
 	}

@@ -35,6 +35,7 @@ type OrderState struct {
 	doneOrderIDs     *map[int64]bool
 	fakeID           *int64
 	editListener     *func(*InOutOrder, string)
+	softwareEdits    bool
 	liveMode         bool
 	runtimeCore      *core.State
 	runtimeClock     *btime.ClockState
@@ -396,7 +397,25 @@ func (s *OrderState) SetEditListener(listener func(*InOutOrder, string)) {
 	}
 	s.stateGuard.Lock()
 	*s.editListener = listener
+	s.softwareEdits = false
 	s.stateGuard.Unlock()
+}
+
+// SetSoftwareEditListener routes edits through a runtime software executor in all modes.
+func (s *OrderState) SetSoftwareEditListener(listener func(*InOutOrder, string)) {
+	if s == nil || s.editListener == nil || s.stateGuard == nil {
+		return
+	}
+	s.stateGuard.Lock()
+	*s.editListener = listener
+	s.softwareEdits = true
+	s.stateGuard.Unlock()
+}
+func (s *OrderState) softwareEditEnabled() bool {
+	s.stateGuard.Lock()
+	enabled := s.softwareEdits
+	s.stateGuard.Unlock()
+	return enabled
 }
 
 // SaveDirtyODs saves dirty orders owned by this state and removes terminal
@@ -649,6 +668,7 @@ func (s *OrderState) Reset() {
 	}
 	if s.editListener != nil {
 		*s.editListener = nil
+		s.softwareEdits = false
 	}
 	if s.tasks != nil {
 		*s.tasks = make(map[string]*BotTask)

@@ -66,6 +66,15 @@ func (s *PairCopiedState) GetPairCopieds() map[string][2]int64 {
 	return data
 }
 
+func (s *PairCopiedState) GetPairCopied(pair string) [2]int64 {
+	if s == nil {
+		return [2]int64{}
+	}
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.values[pair]
+}
+
 func (s *PairCopiedState) DelPairCopieds(keys ...string) {
 	if s == nil {
 		return

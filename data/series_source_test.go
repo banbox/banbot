@@ -100,6 +100,7 @@ type stubSeriesRepo struct {
 	missingCalls     int
 	queryRows        []*orm.DataRecord
 	missing          []orm.MSRange
+	coverage         map[string][]orm.MSRange
 	coverageRows     []*orm.DataRecord
 	coverageStart    int64
 	coverageEnd      int64
@@ -150,7 +151,24 @@ func (s *stubSeriesRepo) MissingSeriesRanges(ctx context.Context, info *orm.Seri
 	if s.missing != nil {
 		return append([]orm.MSRange(nil), s.missing...), nil
 	}
-	return []orm.MSRange{{Start: startMS, Stop: endMS}}, nil
+	missing := []orm.MSRange{{Start: startMS, Stop: endMS}}
+	for _, covered := range s.coverage[fmt.Sprintf("%s:%d", info.Name, sid)] {
+		var remaining []orm.MSRange
+		for _, item := range missing {
+			if covered.Stop <= item.Start || covered.Start >= item.Stop {
+				remaining = append(remaining, item)
+				continue
+			}
+			if item.Start < covered.Start {
+				remaining = append(remaining, orm.MSRange{Start: item.Start, Stop: covered.Start})
+			}
+			if covered.Stop < item.Stop {
+				remaining = append(remaining, orm.MSRange{Start: covered.Stop, Stop: item.Stop})
+			}
+		}
+		missing = remaining
+	}
+	return missing, nil
 }
 
 func (s *stubSeriesRepo) UpdateSeriesRange(ctx context.Context, info *orm.SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
@@ -163,6 +181,13 @@ func (s *stubSeriesRepo) UpdateSeriesCoverage(ctx context.Context, info *orm.Ser
 	s.coverageStart = startMS
 	s.coverageEnd = endMS
 	s.coverageRows = append([]*orm.DataRecord(nil), rows...)
+	if s.updateErr == nil {
+		if s.coverage == nil {
+			s.coverage = make(map[string][]orm.MSRange)
+		}
+		key := fmt.Sprintf("%s:%d", info.Name, sid)
+		s.coverage[key] = append(s.coverage[key], orm.MSRange{Start: startMS, Stop: endMS})
+	}
 	return s.updateErr
 }
 
@@ -881,7 +906,6 @@ func TestThirdPartyWarmupStartRejectsNegativeWarmup(t *testing.T) {
 
 func TestEnsureThirdPartySeriesRangeDeduplicatesAndUsesCoverage(t *testing.T) {
 	resetDataSourcesForTest(t)
-	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	now := time.Now().UnixNano()
 	src := &stubSeriesSource{
 		info: &orm.SeriesInfo{
@@ -909,10 +933,11 @@ func TestEnsureThirdPartySeriesRangeDeduplicatesAndUsesCoverage(t *testing.T) {
 		}}, Symbol: &orm.ExSymbol{ID: int32(now % 1_000_000), Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"}},
 	}
 
+	repo := &stubSeriesRepo{}
 	ctx := context.Background()
 	startMS := int64(1_700_000_000_000)
 	endMS := int64(1_700_086_400_000)
-	subs, err := EnsureThirdPartySeriesRange(ctx, nil, jobs, startMS, endMS)
+	subs, err := EnsureThirdPartySeriesRange(ctx, repo, jobs, startMS, endMS)
 	if err != nil {
 		t.Fatalf("EnsureThirdPartySeriesRange failed: %v", err)
 	}
@@ -922,7 +947,7 @@ func TestEnsureThirdPartySeriesRangeDeduplicatesAndUsesCoverage(t *testing.T) {
 	if src.fetchCount != 1 {
 		t.Fatalf("expected one deduped fetch, got %d", src.fetchCount)
 	}
-	if _, err := EnsureThirdPartySeriesRange(ctx, nil, jobs, startMS, endMS); err != nil {
+	if _, err := EnsureThirdPartySeriesRange(ctx, repo, jobs, startMS, endMS); err != nil {
 		t.Fatalf("EnsureThirdPartySeriesRange second pass failed: %v", err)
 	}
 	if src.fetchCount != 1 {
@@ -951,7 +976,6 @@ func TestEnsureThirdPartySeriesRangeUnknownSource(t *testing.T) {
 
 func TestEnsureThirdPartySeriesRangePropagatesFetchFailure(t *testing.T) {
 	resetDataSourcesForTest(t)
-	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	src := newStubRegistrySource("macro_fetch_fail_test")
 	src.fetchErr = fmt.Errorf("fetch timeout")
 	if err := RegisterDataSource(src); err != nil {
@@ -1044,7 +1068,6 @@ func TestEnsureRuntimeSeriesRangeMarksEmptyFetchAsHole(t *testing.T) {
 
 func TestEnsureThirdPartySeriesRangeRejectsSourceMetadataMismatch(t *testing.T) {
 	resetDataSourcesForTest(t)
-	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	src := newStubRegistrySource("macro_tf_mismatch_test")
 	if err := RegisterDataSource(src); err != nil {
 		t.Fatalf("RegisterDataSource failed: %v", err)
@@ -1068,7 +1091,6 @@ func TestEnsureThirdPartySeriesRangeRejectsSourceMetadataMismatch(t *testing.T) 
 
 func TestEnsureThirdPartySeriesRangePropagatesRepoFailure(t *testing.T) {
 	resetDataSourcesForTest(t)
-	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	src := newStubRegistrySource("macro_repo_fail_test")
 	if err := RegisterDataSource(src); err != nil {
 		t.Fatalf("RegisterDataSource failed: %v", err)

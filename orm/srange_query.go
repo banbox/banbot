@@ -38,12 +38,15 @@ func (q *Queries) ListSeriesRangeSummaries(args ListSeriesRangeSummariesArgs) ([
 	fromSQL := fmt.Sprintf(`FROM sranges
   WHERE %s`, where)
 	if q.isQuestDB() {
+		keyArgs := args
+		keyArgs.HasData = nil
+		keyWhere, _ := buildSeriesRangeSummaryWhere(keyArgs)
 		fromSQL = fmt.Sprintf(`FROM (
     SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted
     FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms
     WHERE %s
   )
-  WHERE coalesce(is_deleted, false) = false`, where)
+  WHERE coalesce(is_deleted, false) = false AND %s`, keyWhere, where)
 	}
 	countSQL := fmt.Sprintf(`SELECT count(*) FROM (
   SELECT sid, tbl, timeframe, has_data, min(start_ms) AS start_ms, max(stop_ms) AS stop_ms, count(*) AS segments
@@ -138,6 +141,7 @@ func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Err
 	if args.Start > 0 {
 		whereParts = append(whereParts, fmt.Sprintf("start_ms >= %d", args.Start))
 	}
+	keyWhereClause := strings.Join(whereParts, " AND ")
 	if args.Stop > 0 {
 		whereParts = append(whereParts, fmt.Sprintf("stop_ms <= %d", args.Stop))
 	}
@@ -147,9 +151,9 @@ func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Err
 	whereClause := strings.Join(whereParts, " AND ")
 
 	countSQL := fmt.Sprintf(`SELECT count(*) FROM (
-  SELECT sid, is_deleted FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms WHERE %s
-) WHERE coalesce(is_deleted, false) = false
-`, whereClause)
+  SELECT * FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms WHERE %s
+) WHERE coalesce(is_deleted, false) = false AND %s
+`, keyWhereClause, whereClause)
 	var total int64
 	if err := q.db.QueryRow(ctx, countSQL).Scan(&total); err != nil {
 		return nil, 0, NewDbErr(core.ErrDbReadFail, err)
@@ -166,8 +170,8 @@ FROM (
   LATEST BY sid, tbl, timeframe, start_ms
   WHERE %s
 )
-WHERE coalesce(is_deleted, false) = false
-ORDER BY start_ms DESC`, whereClause)
+WHERE coalesce(is_deleted, false) = false AND %s
+ORDER BY start_ms DESC`, keyWhereClause, whereClause)
 	if args.Offset > 0 {
 		dataSQL += fmt.Sprintf(" OFFSET %d", args.Offset)
 	}

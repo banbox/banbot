@@ -19,7 +19,7 @@
   import { ChartCtx, ChartSave } from '$lib/kline/chart';
   import { persisted } from 'svelte-persisted-store';
   import { makePeriod } from '$lib/kline/coms';
-  import { derived } from 'svelte/store';
+  import { derived as storeDerived } from 'svelte/store';
   import { fmtDateStr, fmtDuration, curTZ } from '$lib/dateutil';
   import type { OverlayCreate } from 'klinecharts';
   import type { TradeInfo } from '$lib/kline/types';
@@ -29,6 +29,7 @@
   let id = $state('');
   let btPath = $state('');
   let detail = $state<BacktestDetail | null>(null);
+  let unified = $state<{Status: string; Errors?: string[]; Results: Record<string, unknown>[]} | null>(null);
   let activeTab = $state('overview');
   let theme: Extension = oneDark;
   let configText = $state('');
@@ -95,7 +96,7 @@
   onMount(async () => {
     id = page.url.searchParams.get('id') || '';
     await loadDetail();
-    if(task?.status !== 3) {
+    if(task?.status !== 3 && !unified) {
       setActiveTab('logs');
     }
     if(activeTab === 'strat_code') {
@@ -112,10 +113,14 @@
     console.log('load task detail', rsp);
     btPath = rsp.path;
     detail = rsp.detail;
+    unified = rsp.unified ?? null;
     task = rsp.task;
     exsMap = rsp.exsMap;
     if(detail) {
       odNums = detail.plots.odNum;
+    }else if (unified) {
+      odNums = [];
+      activeTab = 'overview';
     }else{
       odNums = [];
       setActiveTab('logs');
@@ -376,7 +381,7 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
     return `${minutes}m`;
   }
 
-  const klineLoad = derived(kcCtx, ($ctx) => $ctx.klineLoaded);
+  const klineLoad = storeDerived(kcCtx, ($ctx) => $ctx.klineLoaded);
   klineLoad.subscribe(val => {
     if (!drawOrder || !kc) return;
     const chart = kc.getChart();
@@ -458,6 +463,13 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
   // 定义导航菜单项
   let navItems = $derived.by(() => {
     const items = []
+    if (unified) {
+      return [
+        { id: 'overview', label: m.overview(), icon: 'home' },
+        { id: 'config', label: m.configuration(), icon: 'config' },
+        { id: 'logs', label: m.bt_logs(), icon: 'document-text' }
+      ];
+    }
     
     if (task?.status == 3) {
       if (detail) {
@@ -598,7 +610,20 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
           </label>
         </div>
       </div>
-      {#if activeTab === 'overview' && detail}
+      {#if activeTab === 'overview' && unified}
+        <div class="card bg-base-200">
+          <div class="card-body">
+            <h2 class="card-title">{m.overview()} <span class="badge" class:badge-success={unified.Status === 'complete'} class:badge-error={unified.Status !== 'complete'}>{unified.Status}</span></h2>
+            {#if unified.Errors?.length}
+              <div role="alert" class="alert alert-error"><pre class="whitespace-pre-wrap">{unified.Errors.join('\n')}</pre></div>
+            {/if}
+            {#each unified.Results as result}
+              <h3 class="font-semibold">{String(result.StrategyID ?? '')} · {String(result.Engine ?? 'factor')} · {String(result.AccountID ?? '')}</h3>
+              <pre class="overflow-auto max-h-[60vh] rounded-box bg-base-100 p-4 text-sm">{JSON.stringify(result, null, 2)}</pre>
+            {/each}
+          </div>
+        </div>
+      {:else if activeTab === 'overview' && detail}
         {#if task?.status == 3}
         <!-- 重要统计信息 -->
         {@const startMS = detail.startMS || task?.startAt || 0}
