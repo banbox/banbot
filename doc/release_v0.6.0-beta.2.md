@@ -23,4 +23,8 @@
 
 后端 `Version` 为 `v0.6.0-beta.2`。本次没有修改前端源码，`UIVersion` 保持 `v0.6.0-beta.1`，继续使用该版本的 `dist.zip`。
 
-正式 Go 包测试通过（排除被 Git 忽略的临时回放目录）；相关包 `go vet`、程序构建、VitePress 构建和本地文档链接检查通过。Windows Go 1.25.1 构建使用 `-ldflags=-checklinkname=0`。本地验证未覆盖真实交易所实盘验收。
+配套依赖固定为正式版本 `banexg v0.2.65`，移除本地目录 `replace`，提供共享执行所需的可选能力接口。
+
+使用 `GOWORK=off` 验证已发布的远程依赖：正式 Go 包测试通过（排除被 Git 忽略的临时回放目录）；相关包 `go vet`、程序构建、模块校验、VitePress 构建和本地文档链接检查通过。Windows Go 1.25.1 构建使用 `-ldflags=-checklinkname=0`。本地验证未覆盖真实交易所实盘验收。
+
+配套 banexg 的新增执行与 WebSocket 回归通过；其原有 `TestOdBookSide`、依赖 `local.json` 的实盘测试及缺少 `okx.md` 的文档生成测试未通过，默认 vet 仍有旧未命名结构体字段诊断，具体限制列于该依赖的发布说明。

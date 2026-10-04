@@ -4,12 +4,9 @@ go 1.24.0
 
 // replace github.com/banbox/banta => ../banta
 
-// Shared live execution requires the accompanying banexg capability changes.
-replace github.com/banbox/banexg => ../banexg
-
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
-	github.com/banbox/banexg v0.2.64
+	github.com/banbox/banexg v0.2.65
 	github.com/banbox/banta v0.4.1
 	github.com/c-bata/goptuna v0.9.0
 	github.com/cloudwego/eino v0.6.0

@@ -47,7 +47,7 @@ git tag -a v1.0.0 -m "Release v1.0.0"
 git push origin HEAD
 git push origin v1.0.0
 ```
-beta 标签在 GitHub 上创建 prerelease；发布说明应列出配置兼容性、验证范围及前端资源版本。
+beta 标签在 GitHub 上创建 prerelease；发布说明应列出配置兼容性、验证范围及前端资源版本。本地存在 `go.work` 时，发布验证应设置 `GOWORK=off`，并用 `go list -m -json` 确认依赖来自远程模块缓存，而非相邻开发目录。
 ### 如何引用本地go模块？
 1. 被引用模块执行`go mod init`添加`go.mod`文件，修改`module`后的模块名
 2. 在当前项目的`go.mod`中保留相应`require`，添加`replace 模块名 => 本地路径`。本地联调无需发布或创建标签。
