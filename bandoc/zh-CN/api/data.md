@@ -1,359 +1,88 @@
 # data 包
 
-data 包提供了数据处理和管理相关的功能。
-
-`data` 包的主链路已统一使用 `orm.DataSeries`。下文保留的 K 线 Feeder/Provider 类型用于内置 OHLCV 数据；自定义时序数据应使用本页的通用数据源接口。
-
-Provider、Feeder、Watcher 和数据源运行时通过 `data.RuntimeDeps` 取得所属 Runtime 的状态与回调边界。一个任务的数据预热、订阅和时钟不会被另一个任务复用；未提供 RuntimeDeps 的旧构造路径仅为兼容保留。
+`data` 负责历史回放、实时采集、订阅需求与数据源生命周期。Provider、Feeder 和 Watcher 统一传递 `orm.DataSeries`；默认 K 线和扩展字段都在 `Values map[string]any` 中。`FnDataSeries` 与 `FuncEnvEnd` 均为 `func(*orm.DataSeries)`。
 
 ## 通用时序数据
 
-### DataSource
+### DataSource 与 DataSink
 
-自定义 source 实现 `Info`、`FetchHistory` 和可选的 `SubscribeLive`。历史函数返回 `[]*orm.DataRecord`，实时函数通过 `DataSink.Emit(sub, rows)` 发送数据。使用 `RegisterDataSource` 注册完整实现，或使用 `RegisterFuncDataSource` 快速注册函数式实现。source 名称不可重复。
+```go
+type DataSink interface {
+    Emit(sub *orm.Subscription, rows []*orm.DataRecord) error
+}
+type DataSource interface {
+    Info() *orm.SeriesInfo
+    FetchHistory(ctx context.Context, sub *orm.Subscription, startMS, endMS int64) ([]*orm.DataRecord, error)
+    SubscribeLive(ctx context.Context, subs []*orm.Subscription, sink DataSink) error
+}
+```
 
-### SeriesRuntime
+`strat.DataSub` 是 `orm.Subscription` 的 alias，旧函数式 source 签名仍可使用它。`FetchHistory` 按 `[startMS,endMS)` 返回有真实时间区间的记录；不应伪造数据来覆盖未查询的区间。实时推送用 `sink.Emit`，省略实时函数不会自动轮询。
 
-`SeriesRuntime` 在回测和实盘启动时收集策略的 `DataSub`，按 `(source, sid, timeframe)` 合并字段和预热数量，补齐历史缺口后激活实时订阅。`HistSeriesFeeder` 会将独立序列按时间顺序与 K 线一起回放。
+### DataSourceCatalog
 
-策略在 `OnDataSubs` 中声明订阅，在 `OnData` 中接收嵌入了处理后 `*strat.DataFields` 的 `strat.DataEvent`；详见[自定义时序数据](../guide/custom_data.md)。
+`NewDataSourceCatalog()` 创建独立注册表。`RegisterDataSource` 注册实例；`RegisterDataSourceFactory(name, factory)` 注册创建独立实例的工厂；`RegisterFuncDataSource(info, fetch, subscribe)` 自动注册函数式工厂。每个 catalog 的 source 名称唯一。
 
-此package的重要概念如下：
-* Provider：K线数据提供者，可包含多个有相同起止时间的Feeder
-* Feeder：对应一个品种的数据源，可以包含多个周期的数据
-* Spider：实时监听多个交易所数据、存储数据库，并TCP通知订阅方
-* Miner：每个交易所+市场对应一个Miner
-* KLineWatcher：用于和Spider通信的客户端
+显式 Runtime 使用 `RuntimeCatalogFromRegisteredSources()` 从进程注册定义创建自己的实例和状态；只经包级 `RegisterDataSource` 注册且没有工厂的源会被拒绝。复杂源应注册工厂，每次返回独立 source，避免关闭一个任务时影响另一个任务。
 
-## Provider和Feeder
-回测和实盘时都需要订阅K线数据，也可能同时运行多个策略，每个策略同时订阅多个时间周期；故提出接口`IProvider`支持回测(HistProvider)和实盘(LiveProvider)。
+`GetDataSource`、`ListDataSources`、`ListDataSourceStatus` 有 catalog 方法和包级兼容入口。包级入口不是另一个 Runtime 的状态访问器。
 
-每个品种的K线数据可能被多个策略同时使用，为避免每个策略重复获取，提出接口`IKlineFeeder`支持回测(DBKlineFeeder)和实盘(KlineFeeder+KLineWatcher)。
+### SeriesRuntime / SeriesPlan
 
-每个KlineFeeder对应一个品种，可包含多个周期的数据，比如品种BTC可能被多个策略使用，订阅的周期有5m,1h,1d三个；为避免冗余数据读取，只会对最小周期(这里是5m)获取K线数据；其他更大周期数据会从最小周期聚合得到。
+传统 TS 任务使用 `NewSeriesRuntimeWithRuntimeDeps(deps, sink)`、`Plan/Ensure/Apply/ActivateNew`，从 job 收集非主 K 线订阅，补齐覆盖范围并激活新增 source。`HistSeriesFeeder` 将独立历史序列与 K 线按可见时间一起回放。`ThirdPartySeriesBootstrap` 是 `SeriesPlan` 的兼容 alias。
 
-#### Provider和Feeder适合的场景
-**起止时间一致的多品种、多周期数据读取**；比如回测或实盘都是对特定一段时间，运行一组策略，涉及一些品种的不同周期数据，建议使用Provider+Feeder。如果需要对多组不同的时间段分别获取数据，应实例化多个Provider+Feeder分开进行。
+### SubscriptionPlan
 
-#### Provider和Feeder不适合的场景
-**不同周期数据起止时间不一致**，比如对BTC的1m和1h都希望获得最近1k个K线用于回测或其他任务，如果强制使用Feeder，则1m实际会读取60*1k个K线，不如直接调用`orm.GetOHLCV`逐周期获取，或者分两次初始化Feeder分开读取。
+双引擎通过 `catalog.CompileSubscriptionPlan(ctx, requests, options)` 合并 `(source,sid,timeframe)` 需求，保留 consumer 的 required、新鲜度与 warmup，合并字段投影并取最大预热量。
 
+```go
+type SubscriptionPlanOptions struct {
+    Namespace string
+    AnchorMS, EndMS int64
+    PageRows, PrefetchRows int
+    PageBytes int64
+    RequireManagedLive bool
+}
+```
 
-## 重要结构体
+`Streams/Subscriptions/SourceMetadata/BudgetReport` 返回计划视图；`Bootstrap(ctx, repo)` 补齐历史。PageBytes 限制解码输入页，不是进程堆内存上限。事件流声明使用 `FrequencyEvent`、`TimeFrame: "event"`；计数预热需要 source 实现 `ObservationWarmupSource.WarmupStart`，不能将条数乘一个虚构周期。
 
-### Feeder
-每个Feeder对应一个交易对,可包含多个时间维度。
+### 实盘安装
 
-公开字段:
-- `ExSymbol *orm.ExSymbol` - 交易所交易对信息
-- `States []*PairTFCache` - 各时间维度的缓存状态
-- `WaitBar *banexg.Kline` - 等待中的K线数据
-- `CallBack FnPairKline` - K线数据回调函数
-- `OnEnvEnd FuncEnvEnd` - 环境结束回调函数(期货主力切换或股票除权时需要先平仓)
-- `isWarmUp bool` - 当前是否预热状态
+`PrepareLivePlan` 准备独立订阅、预热和启动缓冲；`SubscriptionInstallation.Activate` 激活，`CommitPrepared` 提供提交回调边界；`InstallLivePlan` 是准备并激活的入口。需要受管理的实盘源必须实现 `ManagedLiveSource.SubscribeManaged`，返回具有 `Stop()` 和 `Join() error` 的独立句柄；可用 `LiveSourceErrors` 报告异步失败。
 
-### IKlineFeeder
-K线数据馈送器接口。
+启动队列递归复制 Values，保留具体类型、typed nil、NULL、缺失键、时间信息和复权元数据。达到预算、源失败或取消会报错。`Stop` 先封闭接收，所属 owner 再调用 `Join` 等待已接纳回调和生产者；不要在回调中等待自己退出。候选代准备失败不能关闭仍在服务的旧代。
 
-公开方法:
-- `getSymbol() string` - 获取交易对名称
-- `getWaitBar() *banexg.Kline` - 获取等待中的K线
-- `setWaitBar(bar *banexg.Kline)` - 设置等待中的K线
-- `SubTfs(timeFrames []string, delOther bool) []string` - 订阅指定时间周期的数据
-- `WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.PrgBar) (int64, *errs.Error)` - 预热时间周期
-- `onNewBars(barTfMSecs int64, bars []*banexg.Kline) (bool, *errs.Error)` - 处理新K线数据
-- `getStates() []*PairTFCache` - 获取缓存状态
+## Provider 和 Feeder
 
-### KlineFeeder
-每个Feeder对应一个交易对,可包含多个时间维度。实盘使用。
+| 当前类型 | 职责 |
+| --- | --- |
+| `Feeder` / `SeriesFeeder` | 一个标的的多周期输入、预热、聚合与回调 |
+| `DBSeriesFeeder` | 数据库历史批次回放；`GetBatch/RunBatch/CallNext` 推进 |
+| `TfSeriesLoader` | 单标的单周期数据读取与 seek |
+| `HistSeriesFeeder` | 独立 source 的历史回放 |
+| `HistProvider` | 管理历史 feeder，按结束时间推进 |
+| `LiveProvider` | 管理实时 feeder 与 `SeriesWatcher` |
 
-公开字段:
-- `Feeder` - 继承自Feeder
-- `PreFire float64` - 提前触发bar的比率
-- `showLog bool` - 是否显示日志
+接口为 `IDataFeeder`、`IHistFeeder` 和 `IHistDataFeeder`，不是旧的 IKlineFeeder/IHistKlineFeeder。主要构造器：
 
-### IHistKlineFeeder
-历史K线数据馈送器接口,继承自IKlineFeeder。
+```go
+NewSeriesFeeder(exs *orm.ExSymbol, callback FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error)
+NewDBSeriesFeeder(exs *orm.ExSymbol, callback FnDataSeries, showLog bool) (*DBSeriesFeeder, *errs.Error)
+NewHistProvider(callback FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool, progress *utils.StagedPrg) *HistProvider
+NewLiveProvider(callback FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error)
+```
 
-额外公开方法:
-- `getNextMS() int64` - 获取下一个bar的结束时间戳
-- `DownIfNeed(sess *orm.Queries, exchange banexg.BanExchange, pBar *utils.PrgBar) *errs.Error` - 下载整个范围的K线
-- `SetSeek(since int64)` - 设置读取位置
-- `GetBar() *banexg.Kline` - 获取当前K线
-- `RunBar(bar *banexg.Kline) *errs.Error` - 运行K线对应的回调函数
-- `CallNext()` - 移动指针到下一个K线
-
-### HistKLineFeeder
-历史数据反馈器,是文件反馈器和数据库反馈器的基类。
-
-公开字段:
-- `KlineFeeder` - 继承自KlineFeeder
-- `TimeRange *config.TimeTuple` - 时间范围
-- `TradeTimes [][2]int64` - 可交易时间
-
-### DBKlineFeeder
-数据库读取K线的Feeder,用于回测。
-
-公开字段:
-- `HistKLineFeeder` - 继承自HistKLineFeeder
-- `offsetMS int64` - 偏移时间戳
-
-### IProvider
-数据提供者接口。
-
-公开方法:
-- `LoopMain() *errs.Error` - 主循环
-- `SubWarmPairs(items map[string]map[string]int, delOther bool) *errs.Error` - 订阅并预热交易对
-- `UnSubPairs(pairs ...string) *errs.Error` - 取消订阅交易对
-- `SetDirty()` - 设置脏标记
-
-### Provider
-数据提供者基类。
-
-公开字段:
-- `holders map[string]T` - 持有的Feeder映射
-- `newFeeder func(pair string, tfs []string) (T, *errs.Error)` - 创建新Feeder的函数
-- `dirtyVers chan int` - 脏版本通道
-- `showLog bool` - 是否显示日志
-
-### HistProvider
-历史数据提供者。
-
-公开字段:
-- `Provider[IHistKlineFeeder]` - 继承自Provider
-- `pBar *utils.StagedPrg` - 进度条
-
-### LiveProvider
-实时数据提供者。
-
-公开字段:
-- `Provider[IKlineFeeder]` - 继承自Provider
-- `*KLineWatcher` - K线监视器
-
-### NotifyKLines
-K线通知消息。
-
-公开字段:
-- `TFSecs int` - 时间周期(秒)
-- `Interval int` - 更新间隔(秒)
-- `Arr []*banexg.Kline` - K线数组
-
-### KLineMsg
-K线消息。
-
-公开字段:
-- `ExgName string` - 交易所名称
-- `Market string` - 市场类型
-- `Pair string` - 交易对
-- `TFSecs int` - 时间周期(秒)
-- `Interval int` - 更新间隔(秒)
-- `Arr []*banexg.Kline` - K线数组
-
-### SaveKline
-保存K线的任务。
-
-公开字段:
-- `Sid int32` - 交易对ID
-- `TimeFrame string` - 时间周期
-- `Arr []*banexg.Kline` - K线数组
-- `SkipFirst bool` - 是否跳过第一个
-- `MsgAction string` - 消息动作
-
-### FetchJob
-K线获取任务。
-
-公开字段:
-- `PairTFCache` - K线缓存
-- `Pair string` - 交易对
-- `CheckSecs int` - 检查间隔(秒)
-- `Since int64` - 开始时间戳
-- `NextRun int64` - 下次运行时间戳
-
-### Miner
-数据挖掘器。
-
-公开字段:
-- `ExgName string` - 交易所名称
-- `Market string` - 市场类型
-- `Fetchs map[string]*FetchJob` - 获取任务映射
-- `KlineReady bool` - K线是否就绪
-- `KlinePairs map[string]bool` - K线交易对映射
-- `TradeReady bool` - 交易是否就绪
-- `TradePairs map[string]bool` - 交易交易对映射
-- `BookReady bool` - 订单簿是否就绪
-- `BookPairs map[string]bool` - 订单簿交易对映射
-- `IsWatchPrice bool` - 是否监控价格
-
-### LiveSpider
-实时数据爬虫。
-
-公开字段:
-- `*utils.ServerIO` - 服务器IO
-- `miners map[string]*Miner` - 挖掘器映射
-
-### SubKLineState
-K线订阅状态。
-
-公开字段:
-- `Sid int32` - 交易对ID
-- `NextNotify float64` - 下次通知时间
-- `PrevBar *banexg.Kline` - 前一个K线
-
-### KLineWatcher
-K线监视器。
-
-公开字段:
-- `*utils.ClientIO` - 客户端IO
-- `jobs map[string]*PairTFCache` - 任务映射
-- `OnKLineMsg func(msg *KLineMsg)` - 收到K线消息的回调
-- `OnTrade func(exgName, market string, trade *banexg.Trade)` - 收到交易的回调
-
-### WatchJob
-监视任务。
-
-公开字段:
-- `Symbol string` - 交易对
-- `TimeFrame string` - 时间周期
-- `Since int64` - 开始时间戳
-
-## K线数据相关
-
-### NewKlineFeeder
-创建一个新的K线数据馈送器，用于处理实时K线数据。
-
-参数：
-- `exs *orm.ExSymbol` - 交易所交易对信息
-- `callBack FnPairKline` - K线数据回调函数
-- `showLog bool` - 是否显示日志
-
-返回：
-- `*KlineFeeder` - K线馈送器实例
-- `*errs.Error` - 错误信息
-
-### NewDBKlineFeeder
-创建一个新的数据库K线馈送器，用于从数据库读取历史K线数据。
+这些类型提供 `WithRuntimeDeps` 构造入口；显式任务应提供 Runtime 的配置、符号、存储、时钟、策略与回调边界。Provider 支持 `SubWarmPairs/UnSubPairs/LoopMain`，实盘资源支持 `Stop/Join`。公开回调 `Feeder.CallBack`、`Feeder.OnEnvEnd` 的输入均是 DataSeries，待处理值是 `WaitData`。
 
-参数：
-- `exs *orm.ExSymbol` - 交易所交易对信息
-- `callBack FnPairKline` - K线数据回调函数
-- `showLog bool` - 是否显示日志
+内置 K 线读取最小物理周期，再聚合派生周期；投影合并后扩展列经相同 Values 传递，存储补充只补缺键，显式 NULL 不被覆盖。聚合按字段规则执行；复权只修改框架支持的字段，自定义字段不被丢弃。分别需要不同起止范围时，可单独创建 Provider 或使用 SeriesStore/Queries.GetSeriesFields 等存取接口。
 
-返回：
-- `*DBKlineFeeder` - 数据库K线馈送器实例
-- `*errs.Error` - 错误信息
+## Spider 与 Watcher
 
-### NewHistProvider
-创建一个新的历史数据提供者，用于管理历史K线数据的获取和处理。
+`LiveSpider` 管理每个交易所/市场的 `Miner`，负责采集、存储与广播。当前消息为 `NotifySeries{TFSecs, Interval, Rows []*orm.DataSeries}`；`SeriesMsg` 嵌入它并增加 `ExgName/Market/Pair`。存储任务是 `SaveSeries`。旧 NotifyKLines/KLineMsg/SaveKline 文档字段已由这些结构替代。
 
-参数：
-- `callBack FnPairKline` - K线数据回调函数
-- `envEnd FuncEnvEnd` - 环境结束回调函数
-- `showLog bool` - 是否显示日志
-- `pBar *utils.StagedPrg` - 进度条对象
+`NewSeriesWatcherWithRuntimeDeps(deps, addr)` 创建所属任务的 TCP 客户端，`OnDataMsg func(*SeriesMsg)` 接收序列。`WatchJobs` 声明交易所、市场、类型和标的周期；`UnWatchJobs` 取消。Spider/Watcher 通过 BanIO 发送完整 Rows；网络 payload 使用 JSON，不能据此保证 map 内整数宽度或自定义 Go 类型自动往返，严格类型源必须有 schema 和解码校验。
 
-返回：
-- `*HistProvider` - 历史数据提供者实例
+## 数据工具
 
-### RunHistFeeders
-运行历史K线馈送器集合，用于批量处理历史数据。
-
-参数：
-- `makeFeeders func() []IHistKlineFeeder` - 创建馈送器列表的函数
-- `versions chan int` - 版本控制通道
-- `pBar *utils.PrgBar` - 进度条对象
-
-返回：
-- `*errs.Error` - 错误信息
-
-### SortFeeders
-对K线馈送器进行排序或插入操作。
-
-参数：
-- `holds []IHistKlineFeeder` - 现有的馈送器列表
-- `hold IHistKlineFeeder` - 待处理的馈送器
-- `insert bool` - 是否为插入操作
-
-返回：
-- `[]IHistKlineFeeder` - 处理后的馈送器列表
-
-### NewLiveProvider
-创建一个新的实时数据提供者，用于处理实时K线数据。
-
-参数：
-- `callBack FnPairKline` - K线数据回调函数
-- `envEnd FuncEnvEnd` - 环境结束回调函数
-
-返回：
-- `*LiveProvider` - 实时数据提供者实例
-- `*errs.Error` - 错误信息
-
-## 数据工具相关
-
-### FindPathNames
-查找指定路径下符合后缀名的所有文件。
-
-参数：
-- `inPath string` - 输入路径
-- `suffix string` - 文件后缀名
-
-返回：
-- `[]string` - 文件路径列表
-- `*errs.Error` - 错误信息
-
-### ReadZipCSVs
-读取ZIP压缩包中的CSV文件。
-
-参数：
-- `inPath string` - ZIP文件路径
-- `pBar *utils.PrgBar` - 进度条对象
-- `handle FuncReadZipItem` - 处理每个CSV文件的回调函数
-- `arg interface{}` - 传递给回调函数的参数
-
-返回：
-- `*errs.Error` - 错误信息
-
-### RunSpider
-运行数据爬虫服务。
-
-参数：
-- `addr string` - 服务监听地址
-
-返回：
-- `*errs.Error` - 错误信息
-
-### NewKlineWatcher
-创建一个新的K线数据监视器。
-
-参数：
-- `addr string` - 连接地址
-
-返回：
-- `*KLineWatcher` - K线监视器实例
-- `*errs.Error` - 错误信息
-
-### RunFormatTick
-运行Tick数据格式化工具。
-
-参数：
-- `args *config.CmdArgs` - 命令行参数
-
-返回：
-- `*errs.Error` - 错误信息
-
-### Build1mWithTicks
-使用Tick数据构建1分钟K线。
-
-参数：
-- `args *config.CmdArgs` - 命令行参数
-
-返回：
-- `*errs.Error` - 错误信息
-
-### CalcFilePerfs
-计算文件性能指标。
-
-参数：
-- `args *config.CmdArgs` - 命令行参数
-
-返回：
-- `*errs.Error` - 错误信息
+`FindPathNames`、`ReadZipCSVs` 处理文件，`RunFormatTick/Build1mWithTicks` 处理逐笔数据，`CalcFilePerfs` 分析文件。普通数据读取与数据源注册见[自定义时序数据](../guide/custom_data.md)，多因子原生图和回测/实盘组合见[因子 API](factor.md)。

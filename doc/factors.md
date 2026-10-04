@@ -1,16 +1,19 @@
 # 截面与多因子引擎架构及实施方案
 
-日期：2026-10-01。本文保留当时确认的业务需求和设计草案；当前实现与接口以 [better_arch.md](better_arch.md)、[实施记录](better_arch_implementation.md) 和 [当前架构](../docs/arch.md) 为准，不能把下面的伪代码直接当作已提供的 API。
+> 2026-10-04 校订：本文保留历史设计和测试口径。当前使用见[多因子指南](../bandoc/zh-CN/guide/factor.md)，逐包实施/暂缓与本次实际验证见[重构记录](strategy_engine_refactor.md)。缺失实施文档的链接已修复，历史结果不据此重新验收；真实 venue 与性能承诺仍需独立证据。
+
+
+日期：2026-10-01。本文保留当时确认的业务需求和设计草案；当前实现与接口以 [better_arch.md](better_arch.md)、[实施记录](strategy_engine_refactor.md) 和 [当前架构](app_arch.md) 为准，不能把下面的伪代码直接当作已提供的 API。
 
 2026-10-03 继续实施：统一 YAML/普通入口、领域内存执行、完整订阅、历史/实时共享决策和 mixed 已落地。本轮补齐归档增量决策读取、动态共享 Session 回收、调用方取消、多账户绑定资源失败清理及独立进程崩溃回归；原始任意字段、NULL、全部修订、PIT/成熟标签与账户归因要求继续有效。默认真实会话仍需 banexg 统一 context/Join/settled cash/完整恢复契约；物理断电和三模式全链路性能门槛仍以实际验收证据为准。
 
-本轮八包完整 race 通过；500 资产×17,520 小时×20 输出的单 CS 计算核规模通过，sampled heap 54.52 MiB、进程峰值 working set 86.777 MiB。三模式 8/32/128 列、1/10 消费者热链路矩阵及性能工具 smoke 有可复用入口；没有优化前 dirty 基线，不能宣称三模式 provider/DB/账户全链路 ≤5% 或硬内存预算已验收。实际命令、日志和范围统一见 [better_arch 实施记录](better_arch_implementation.md)。
+本轮八包完整 race 通过；500 资产×17,520 小时×20 输出的单 CS 计算核规模通过，sampled heap 54.52 MiB、进程峰值 working set 86.777 MiB。三模式 8/32/128 列、1/10 消费者热链路矩阵及性能工具 smoke 有可复用入口；没有优化前 dirty 基线，不能宣称三模式 provider/DB/账户全链路 ≤5% 或硬内存预算已验收。实际命令、日志和范围统一见 [better_arch 实施记录](strategy_engine_refactor.md)。
 
 QuestDB latest/tombstone、可变状态筛选、持久版本和 unfinished bar 时间分离也已补齐；新高水位初始化需停旧 writer 并等待 WAL，跨主机需外部 single-writer。追加完整 ORM race 与最终全仓 test/vet/build 通过；真实数据库、venue 恢复与统计性能验收仍保持独立要求。
 
 ## 1. 目标与已确认范围
 
-2026-10-03 本轮继续实现：研究消费者现可通过 `factor.research.labels: []` 关闭，交易回放不维护标签队列/累计器，固定或等权组合无需研究标签；research 与 HistoryIC 保留成熟标签契约。共享 TS 补齐 Relay 类型及入场 OrderType/StopBars/Leverage 默认。启动分页恢复包含已发送/导入终态和冷历史订单，缺历史权威证据即阻断。输入各支路共用页边界校验，保留任意字段类型、NULL 及取消语义。实施及验证范围见 [当前实施记录](better_arch_implementation.md)，真实 SDK/venue 与完整性能验收仍不可由本地测试替代。
+2026-10-03 本轮继续实现：研究消费者现可通过 `research.labels: []` 关闭，交易回放不维护标签队列/累计器，固定或等权组合无需研究标签；research 与 HistoryIC 保留成熟标签契约。共享 TS 补齐 Relay 类型及入场 OrderType/StopBars/Leverage 默认。启动分页恢复包含已发送/导入终态和冷历史订单，缺历史权威证据即阻断。输入各支路共用页边界校验，保留任意字段类型、NULL 及取消语义。实施及验证范围见 [当前实施记录](strategy_engine_refactor.md)，真实 SDK/venue 与完整性能验收仍不可由本地测试替代。
 
 在保留 banbot 时序策略能力的基础上，增加专门的截面与多因子研究、回测及实盘引擎。全部业务计算和编排使用 Go，时序指标使用 banta，优先复用现有时序读写、历史与实时数据源、运行态、行情接入、交易精度、日志及生命周期能力。允许为合理复用改造底层组件。
 
@@ -160,7 +163,7 @@ QuestDB 写成功与可读取不是同一状态。快照发布前等待预期 SI
 
 ### 6.1 数据订阅与策略任务解耦
 
-现有 DataSource 使用 `strat.DataSub`，它的订阅描述本身可复用，但包归属不理想。先增加不含 StratJob 的通用 Subscription/SubscriptionPlan：source、SID、frequency、fields、lookback、可见性与缺失策略。旧 DataSub 转换后调用同一 helper，避免第一阶段大范围更名。
+现有 DataSource 使用 `strat.DataSub`，它的订阅描述本身可复用，但包归属不理想。先增加不含 StratJob 的通用 Subscription/SubscriptionPlan：source、SID、timeframe、fields、lookback、可见性与缺失策略。旧 DataSub 转换后调用同一 helper，避免第一阶段大范围更名。
 
 引擎把 DAG 依赖合并为一份订阅计划。同 SID/源/周期的字段与预热取并集/最大值；只创建一份 feeder 和一份被共享的时序计算状态。账户不应影响行情订阅身份，但快照、计算参数或缺失语义不同不能强行共享。
 
@@ -205,7 +208,7 @@ QuestDB 写成功与可读取不是同一状态。快照发布前等待预期 SI
 
 批量后端调用 `banta/tav`，按资产/时间块计算，再按截面汇总；增量后端使用 `banta.Series/BarEnv`，每个闭合事件更新依赖节点一次。两者共享定义、缺失策略、时间对齐和输出约定。
 
-缓存边界为 Runtime 的计算 session：相同 `(snapshot/source version, SID, frequency, adjustment, node definition)` 才可共享。多策略消费相同只读结果；一个 owner 更新某个 BarEnv，其他 worker 读取冻结结果。不要让账户数量乘上全部指标状态。
+缓存边界为 Runtime 的计算 session：相同 `(snapshot/source version, SID, timeframe, adjustment, node definition)` 才可共享。多策略消费相同只读结果；一个 owner 更新某个 BarEnv，其他 worker 读取冻结结果。不要让账户数量乘上全部指标状态。
 
 初版可让回测默认走增量确保与实盘同语义，研究支持显式批量/auto；只有通过该节点的批量-增量一致性验收才选择 tav 后端。自定义仅增量节点可回放处理，只有批量实现的节点不能静默用于实盘。
 
@@ -233,7 +236,7 @@ QuestDB 写成功与可读取不是同一状态。快照发布前等待预期 SI
 // 示意 builder：实施时核对并确定具体函数签名。
 plan := factor.New("momentum_vol").
     Universe(factor.USDTPerpetuals()).
-    Frequency("1h").
+    TimeFrame("1h").
     Add("momentum", factor.Return("close", 24)).
     Add("volatility", factor.StdDev(factor.Return("close", 1), 24)).
     Transform(factor.WinsorZScore()).
@@ -398,4 +401,4 @@ OrderIntentID 派生稳定 ClientOrderID，格式/长度及查询能力由 banex
 - [Qlib DeepWiki](https://deepwiki.com/microsoft/qlib)，结合输入报告的 [processor.py](https://github.com/microsoft/qlib/blob/be725493eb1a6bbb42bf11b37aa7669f59610ff1/qlib/data/dataset/processor.py) 和 [PIT](https://github.com/microsoft/qlib/blob/be725493eb1a6bbb42bf11b37aa7669f59610ff1/qlib/data/pit.py)。
 - 其余项目的 revision 与证据见输入研究文档；本方案引用其设计归纳，不宣称本轮逐个重新执行或核验所有实现。
 
-本文保留原规划与研究依据；当前代码实施状态以 [better_arch 完成表](better_arch.md) 和 [实施记录](better_arch_implementation.md) 为准。本次继续实施后全仓测试 1,929 个顶层 PASS，vet/build 通过，七包专项 race 无告警；外部数据库、真实 venue 与完整性能验收仍按未完成项管理。
+本文保留原规划与研究依据；当前代码实施状态以 [better_arch 完成表](better_arch.md) 和 [实施记录](strategy_engine_refactor.md) 为准。本次继续实施后全仓测试 1,929 个顶层 PASS，vet/build 通过，七包专项 race 无告警；外部数据库、真实 venue 与完整性能验收仍按未完成项管理。

@@ -24,7 +24,7 @@ func TestReplayPreflightRejectsInvalidChoicesBeforeExecutionResources(t *testing
 		{"latency", "bounded", func(c *Config) { c.LatencyMS = 0 }},
 		{"expiry", "bounded", func(c *Config) { c.ExpiryMS = c.LatencyMS }},
 		{"label-wait", "bounded", func(c *Config) { c.LabelWaitMS = -1 }},
-		{"price", "observable", func(c *Config) { c.Prices.Frequency = "1h" }},
+		{"price", "observable", func(c *Config) { c.Prices.TimeFrame = "1h" }},
 		{"label", "label", func(c *Config) { c.Manifest.Labels[0].Horizon = 0 }},
 		{"label-rate", "label", func(c *Config) { c.Manifest.Labels[0].PeriodsPerYear = math.Inf(1) }},
 		{"funding", "funding stream", func(c *Config) { c.FundingSource = "" }},

@@ -1,97 +1,19 @@
 # exg Package
 
-The exg package provides exchange interface and trading-related functionality.
+exg creates banexg sessions and binds generic capabilities/execution wrappers at task construction. Exchange-specific behavior belongs in banexg, not exchange-name branches in banbot.
 
-## Function List
+## Explicit sessions
 
-### Setup
-Initialize exchange settings.
+NewForRuntime(snapshot *config.Snapshot, netDisable bool) (banexg.BanExchange, *errs.Error) creates a session from the snapshot without changing exg.Default. Account selection, environment, network policy and market options follow that snapshot. The entry/external creator closes the session; Runtime.Exchange is a borrowed dependency.
 
-Returns:
-- `*errs.Error` - Returns error information if initialization fails, nil otherwise
+Setup(), GetWith(name, market, contractType), GetLeverage/GetOdBook/GetTickers24Hr retain compatibility configuration/default-session paths. They are not isolated multi-Runtime constructors. The former GetTickers documentation name is corrected to GetTickers24Hr.
 
-### GetWith
-Get exchange instance based on specified exchange name, market, and contract type.
+## Precision and capabilities
 
-Parameters:
-- `name string` - Exchange name
-- `market string` - Market type
-- `contractType string` - Contract type
+PrecCost(exchange, symbol, cost), PrecPrice(exchange, symbol, price) and PrecAmount(exchange, symbol, amount) return a value and *errs.Error using the explicit task session. Normalized instrument metadata validates quantity steps, contract units, price precision and venue minima.
 
-Returns:
-- `banexg.BanExchange` - Exchange instance
-- `*errs.Error` - Returns error information if retrieval fails, nil otherwise
+GetAlignOffForExchangeChecked(exchange, symbol, tfSecs) returns offset/error from current market metadata. GetAlignOff(exchangeName, tfSecs) is legacy compatibility and does not establish symbol-specific alignment. Symbol parsing, order events, client-order IDs, funding and account download probe separate generic capabilities; missing capabilities fail explicitly.
 
-### PrecCost
-Process transaction cost amount according to exchange precision requirements.
+BotExchange wraps/forwards the underlying session. Order callbacks, context-aware requests and timeout/Unknown recovery retain account contracts. A live_provider name supplies no transport/account evidence.
 
-Parameters:
-- `exchange banexg.BanExchange` - Exchange instance
-- `symbol string` - Trading pair symbol
-- `cost float64` - Original cost amount
-
-Returns:
-- `float64` - Cost amount processed according to exchange precision
-- `*errs.Error` - Returns error information if processing fails, nil otherwise
-
-### PrecPrice
-Process transaction price according to exchange precision requirements.
-
-Parameters:
-- `exchange banexg.BanExchange` - Exchange instance
-- `symbol string` - Trading pair symbol
-- `price float64` - Original price
-
-Returns:
-- `float64` - Price processed according to exchange precision
-- `*errs.Error` - Returns error information if processing fails, nil otherwise
-
-### PrecAmount
-Process transaction amount according to exchange precision requirements.
-
-Parameters:
-- `exchange banexg.BanExchange` - Exchange instance
-- `symbol string` - Trading pair symbol
-- `amount float64` - Original amount
-
-Returns:
-- `float64` - Amount processed according to exchange precision
-- `*errs.Error` - Returns error information if processing fails, nil otherwise
-
-### GetLeverage
-Get leverage ratio for specified trading pair and notional value.
-
-Parameters:
-- `symbol string` - Trading pair symbol
-- `notional float64` - Notional value
-- `account string` - Account identifier
-
-Returns:
-- `float64, float64` - Returns two float values representing related leverage ratio values
-
-### GetOdBook
-Get order book data for specified trading pair.
-
-Parameters:
-- `pair string` - Trading pair symbol
-
-Returns:
-- `*banexg.OrderBook` - Order book data
-- `*errs.Error` - Returns error information if retrieval fails, nil otherwise
-
-### GetTickers
-Get market data for all trading pairs.
-
-Returns:
-- `map[string]*banexg.Ticker` - Market data mapping with trading pairs as keys
-- `*errs.Error` - Returns error information if retrieval fails, nil otherwise
-
-### GetAlignOff
-Get alignment offset for specified exchange and time frame.
-
-Parameters:
-- `exgName string` - Exchange name
-- `tfSecs int` - Time frame (in seconds)
-
-Returns:
-- `int` - Alignment offset 
+See [runtime](runtime.md), [live trading](../guide/live_trading.md) and [factor API](factor.md).

@@ -122,7 +122,9 @@ passes. They cannot prove old/new ≤5% acceptance.
 
 ## Windows race execution
 
-Latest local evidence is in [the validation report](architecture_validation_report.md):
+The historical report named architecture_validation_report.md is absent from this checkout;
+the figures below retain their original measurement scope. Current refactor evidence is in
+[the package review record](../doc/strategy_engine_refactor.md):
 the 24-asset/128-hour dualMA comparison against v0.5.7 ran 10 AB/BA pairs,
 with 1/10 consumer ratios 0.97854/0.99139 and inconclusive 95% intervals.
 Candidate-only optional research replay retained 0 pending frames when disabled;

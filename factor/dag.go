@@ -21,10 +21,10 @@ type NodeSpec struct {
 	Version                  string
 	Kind                     NodeKind
 	Source                   string
-	SourceFrequency          string
+	SourceTimeFrame          string
 	Field                    string
 	GroupField               string
-	Frequency                string
+	TimeFrame                string
 	Parameters               map[string]float64
 	OutputType               string
 	MissingPolicy            string
@@ -48,22 +48,22 @@ type Node struct {
 }
 
 func node(operator string, kind NodeKind, inputs ...*Node) *Node {
-	frequency := ""
+	timeframe := ""
 	if len(inputs) > 0 && inputs[0] != nil {
-		frequency = inputs[0].Spec.Frequency
+		timeframe = inputs[0].Spec.TimeFrame
 	}
 	version := "builtin-1/banta-0.4.1"
 	if kind == CS || kind == GROUP {
 		version = "builtin-2/banta-0.4.1"
 	}
-	return &Node{Spec: NodeSpec{Operator: operator, Version: version, Kind: kind, Frequency: frequency, Parameters: map[string]float64{}, OutputType: "float64+validity", MissingPolicy: "skip-invalid", AvailabilityPolicy: "closed-visible", SamplingPolicy: "source-events", ReferenceUniverse: "snapshot-reference", UniverseTransitionPolicy: "continue-per-asset", Incremental: true, Batch: true}, Inputs: inputs}
+	return &Node{Spec: NodeSpec{Operator: operator, Version: version, Kind: kind, TimeFrame: timeframe, Parameters: map[string]float64{}, OutputType: "float64+validity", MissingPolicy: "skip-invalid", AvailabilityPolicy: "closed-visible", SamplingPolicy: "source-events", ReferenceUniverse: "snapshot-reference", UniverseTransitionPolicy: "continue-per-asset", Incremental: true, Batch: true}, Inputs: inputs}
 }
 
-func Field(source, field, frequency string) *Node {
+func Field(source, field, timeframe string) *Node {
 	n := node("field", TS)
 	n.Spec.Source = source
 	n.Spec.Field = field
-	n.Spec.Frequency = frequency
+	n.Spec.TimeFrame = timeframe
 	return n
 }
 
@@ -71,9 +71,9 @@ func Field(source, field, frequency string) *Node {
 // Downstream TS periods count decision observations, NOT source publications.
 // To compute a native daily indicator, supply its output as a daily source and
 // sample that output here; this method never pretends hourly samples are days.
-func AsOfField(source, field, sourceFrequency, decisionFrequency string, maxAge int64) *Node {
-	n := Field(source, field, decisionFrequency)
-	n.Spec.SourceFrequency = sourceFrequency
+func AsOfField(source, field, sourceTimeFrame, decisionTimeFrame string, maxAge int64) *Node {
+	n := Field(source, field, decisionTimeFrame)
+	n.Spec.SourceTimeFrame = sourceTimeFrame
 	n.Spec.AvailabilityPolicy = "asof-latest"
 	n.Spec.SamplingPolicy = "decision-grid"
 	n.Spec.MaxAge = maxAge
@@ -112,21 +112,21 @@ func Quantile(input *Node, q float64) *Node {
 	n.Spec.Parameters["q"] = q
 	return n
 }
-func GroupDemean(input *Node, source, field string, sourceFrequency ...string) *Node {
+func GroupDemean(input *Node, source, field string, sourceTimeFrame ...string) *Node {
 	n := node("group-demean", GROUP, input)
 	n.Spec.Source = source
 	n.Spec.GroupField = field
-	if len(sourceFrequency) > 0 {
-		n.Spec.SourceFrequency = sourceFrequency[0]
+	if len(sourceTimeFrame) > 0 {
+		n.Spec.SourceTimeFrame = sourceTimeFrame[0]
 	}
 	return n
 }
-func GroupZScore(input *Node, source, field string, sourceFrequency ...string) *Node {
+func GroupZScore(input *Node, source, field string, sourceTimeFrame ...string) *Node {
 	n := node("group-zscore", GROUP, input)
 	n.Spec.Source = source
 	n.Spec.GroupField = field
-	if len(sourceFrequency) > 0 {
-		n.Spec.SourceFrequency = sourceFrequency[0]
+	if len(sourceTimeFrame) > 0 {
+		n.Spec.SourceTimeFrame = sourceTimeFrame[0]
 	}
 	return n
 }
@@ -165,7 +165,7 @@ type Plan struct {
 	hash      string
 	nodes     []compiledNode
 	outputs   map[string]int
-	frequency string
+	timeframe string
 	retention int
 	warmup    int
 }
@@ -174,11 +174,11 @@ func (p *Plan) Hash() string        { return p.hash }
 func (p *Plan) NodeCount() int      { return len(p.nodes) }
 func (p *Plan) WarmupLength() int   { return p.warmup }
 func (p *Plan) StateRetention() int { return p.retention }
-func (p *Plan) Frequency() string   { return p.frequency }
+func (p *Plan) TimeFrame() string   { return p.timeframe }
 
 type InputSpec struct {
 	Source       string
-	Frequency    string
+	TimeFrame    string
 	Fields       []string
 	WarmupLength int
 	AsOfLatest   bool
@@ -193,10 +193,10 @@ func (p *Plan) Inputs() []InputSpec {
 		if node.spec.Source == "" {
 			continue
 		}
-		key := node.spec.Source + "\x00" + node.spec.SourceFrequency
+		key := node.spec.Source + "\x00" + node.spec.SourceTimeFrame
 		input := inputs[key]
 		if input == nil {
-			input = &InputSpec{Source: node.spec.Source, Frequency: node.spec.SourceFrequency, AsOfLatest: node.spec.Operator != "field" || node.spec.AvailabilityPolicy == "asof-latest", MaxAge: node.spec.MaxAge}
+			input = &InputSpec{Source: node.spec.Source, TimeFrame: node.spec.SourceTimeFrame, AsOfLatest: node.spec.Operator != "field" || node.spec.AvailabilityPolicy == "asof-latest", MaxAge: node.spec.MaxAge}
 			inputs[key] = input
 		}
 		field := node.spec.Field
@@ -253,8 +253,8 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 		visiting[n] = true
 		spec := n.Spec
 		spec.Parameters = maps.Clone(spec.Parameters)
-		if spec.Source != "" && spec.SourceFrequency == "" {
-			spec.SourceFrequency = spec.Frequency
+		if spec.Source != "" && spec.SourceTimeFrame == "" {
+			spec.SourceTimeFrame = spec.TimeFrame
 		}
 		if spec.Operator == "label" {
 			return 0, errors.New("factor: inference cannot depend on label namespace")
@@ -262,10 +262,10 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 		if err := validateNode(spec, len(n.Inputs), n.Evaluate != nil); err != nil {
 			return 0, err
 		}
-		if plan.frequency == "" {
-			plan.frequency = spec.Frequency
-		} else if plan.frequency != spec.Frequency {
-			return 0, errors.New("factor: mixed frequencies require explicitly resampled input")
+		if plan.timeframe == "" {
+			plan.timeframe = spec.TimeFrame
+		} else if plan.timeframe != spec.TimeFrame {
+			return 0, errors.New("factor: mixed timeframes require explicitly resampled input")
 		}
 		inputs := make([]int, len(n.Inputs))
 		dependencyIDs := make([]string, len(inputs))
@@ -337,7 +337,7 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 }
 
 func validateNode(spec NodeSpec, count int, custom bool) error {
-	if spec.Version == "" || spec.Frequency == "" || spec.OutputType != "float64+validity" || spec.MissingPolicy != "skip-invalid" || (spec.AvailabilityPolicy != "closed-visible" && spec.AvailabilityPolicy != "asof-latest") || !spec.Incremental {
+	if spec.Version == "" || spec.TimeFrame == "" || spec.OutputType != "float64+validity" || spec.MissingPolicy != "skip-invalid" || (spec.AvailabilityPolicy != "closed-visible" && spec.AvailabilityPolicy != "asof-latest") || !spec.Incremental {
 		return fmt.Errorf("factor: incomplete or unsupported node contract %s", spec.Operator)
 	}
 	if spec.SamplingPolicy != "source-events" && spec.SamplingPolicy != "decision-grid" {
@@ -346,8 +346,8 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 	if spec.AvailabilityPolicy == "asof-latest" && (spec.SamplingPolicy != "decision-grid" || spec.MaxAge <= 0) {
 		return errors.New("factor: asof numeric source requires decision-grid sampling and positive max age")
 	}
-	if spec.Operator == "field" && spec.SourceFrequency != spec.Frequency && spec.AvailabilityPolicy != "asof-latest" {
-		return errors.New("factor: mixed source frequency requires explicit asof sampling")
+	if spec.Operator == "field" && spec.SourceTimeFrame != spec.TimeFrame && spec.AvailabilityPolicy != "asof-latest" {
+		return errors.New("factor: mixed source timeframe requires explicit asof sampling")
 	}
 	if spec.Kind != TS && spec.Kind != CS && spec.Kind != GROUP {
 		return errors.New("factor: invalid node kind")
@@ -458,8 +458,8 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 	return nil
 }
 
-func MomentumVolatility(source, field, frequency string, window int) (*Plan, error) {
-	price := Field(source, field, frequency)
+func MomentumVolatility(source, field, timeframe string, window int) (*Plan, error) {
+	price := Field(source, field, timeframe)
 	momentum := Return(price, window)
 	volatility := StdDev(Return(price, 1), window, 0)
 	zMomentum := ZScore(Winsorize(momentum, 0.01))

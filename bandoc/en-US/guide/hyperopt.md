@@ -1,3 +1,5 @@
+> Engine scope: optimize / bt-opt, parameter definitions and rolling selection on this page target time-series TradeStrat. entry.runExplicitOptimization uses a time-series Snapshot and opt.BacktestFactory, without assembling factor policies into the factor runner. General references to run_policy do not imply factor/mixed hyperparameter search support. Run explicit parameter configurations through [factor research/backtesting](./factor.md), retaining PIT and matured-label rules.
+
 ```shell
 bot optimize -out PATH [-opt-rounds 30] [-sampler bayes] 
 ```

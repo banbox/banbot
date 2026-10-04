@@ -283,7 +283,7 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 		launchSerial++
 		name := fmt.Sprintf("legacy_entry_%d_%d", time.Now().UnixNano(), launchSerial)
 		current := c
-		current.Prices = runner.PriceStream{Source: name, Frequency: "event", Field: "close"}
+		current.Prices = runner.PriceStream{Source: name, TimeFrame: "event", Field: "close"}
 		current.Snapshot.Schemas = map[string]string{name: "schema-v1"}
 		current.Snapshot.SourceVersions = map[string]string{name: "v1"}
 		plan, err := factor.New().Add("signal", factor.Field(name, "integer", "event")).Compile()

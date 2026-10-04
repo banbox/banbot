@@ -85,8 +85,11 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `Env *ta.BarEnv` - 指标运行环境
 - `Symbol string` - 交易对名称
 
-### BatchMap
-当前交易所-市场-时间周期下，所有标的的批量执行任务池。
+### BatchState / BatchMap
+
+`BatchState` 持有单个 trader 的批量队列和回测批次时间。使用 `NewBatchState` 创建实例，`AddTask` 入队、`TakeReady(currMS, deterministic)` 取出到期批次、`PendingCount` 查询、`Reset` 清空。严格回测开启确定性排序；普通模式不承诺顺序。`LegacyBatchState` 仅服务包级兼容调用。
+
+`BatchMap` 是队列内部的一个时间周期任务组，不是进程共享的市场状态。
 
 公开字段：
 - `Map map[string]*JobEnv` - 任务映射
@@ -265,3 +268,9 @@ strat 包提供了交易策略相关的功能定义和实现。
 
 ### ExitStratJobs
 退出所有策略任务。
+
+## 因子引擎集成
+
+TradeStrat 是时序域，图和组合在 factor/runner；DataHub rawMap 的 NULL/缺失语义与数值视图并存。
+
+[因子 API](factor.md) / [指南](../guide/factor.md)

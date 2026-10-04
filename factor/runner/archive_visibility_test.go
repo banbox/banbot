@@ -24,14 +24,14 @@ func archiveVisibilityFixture(t *testing.T, reception bool) (HistoricalInput, *f
 	for _, item := range []struct {
 		event, available, ingested int64
 		revision                   uint64
-		frequency                  string
+		timeframe                  string
 	}{
 		{10, 10, 12, 1, "event"}, {20, 21, 25, 1, "event"},
 		{10, 30, 31, 2, "event"}, {20, 32, 33, 2, "event"},
 		{50, 14, 15, 1, "event"}, {20, 22, 23, 1, "1h"},
 	} {
 		row := factor.VersionRecord{Series: orm.DataSeries{
-			Source: "series", Sid: 1, TimeFrame: item.frequency,
+			Source: "series", Sid: 1, TimeFrame: item.timeframe,
 			TimeMS: item.event, EndMS: item.event, Closed: true,
 			Values: map[string]any{"integer": int64(9007199254740993), "null": nil, "nested": map[string]any{"flag": true}, "revision": item.revision},
 		}, EventTime: item.event, AvailableAt: item.available, IngestedAt: item.ingested, Revision: item.revision, SourceVersion: "v1"}
@@ -198,7 +198,7 @@ func TestArchiveLatestPreservesBarrierReceptionInPublicationReplay(t *testing.T)
 	spec := factor.SnapshotSpec{GridTime: 20, DecisionTime: 23,
 		Universe: factor.Universe{Version: "u1", Investable: []int32{1}}, SIDMap: map[int32]string{1: "one"},
 		Schemas: map[string]string{"series": "s1"}, SourceVersions: map[string]string{"series": "v1"}, VisibilityPolicy: "publication"}
-	needs := []factor.Requirement{{SID: 1, Source: "series", Frequency: "event", EventTime: 20, AsOfLatest: true}}
+	needs := []factor.Requirement{{SID: 1, Source: "series", TimeFrame: "event", EventTime: 20, AsOfLatest: true}}
 	freeze := func(rows []factor.VersionRecord) *factor.Snapshot {
 		t.Helper()
 		var barrier factor.RoundBarrier

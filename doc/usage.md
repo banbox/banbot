@@ -49,3 +49,9 @@ bayes在60%情况下优于其他优化方法，首推。
 cmaes/ipop-cmaes/bipop-cmaes三种方法大部分情况下结果很类似，bipop-cmaes略优，在30%情况下优于其他方法。  
 tpe在15%情况下优于其他方法，可考虑用于对比。  
 random相比其他方法没有突出优势，不建议。
+
+## 2026-10-04 双引擎使用入口
+
+run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
+
+execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；factor trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

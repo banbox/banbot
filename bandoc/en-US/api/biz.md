@@ -103,37 +103,6 @@ Implementation Details:
 - Initialize exchange ORM module
 - Mainly used for initialization when exchange functionality is needed
 
-### LoadRefreshPairs
-Load and refresh trading pair information.
-
-Parameters:
-- `dp`: data.IProvider - Data provider interface
-- `showLog`: bool - Whether to display logs
-- `pBar`: *utils.StagedPrg - Progress bar object
-
-Returns:
-- `*errs.Error` - Error information
-
-Implementation Details:
-- Refresh trading pair list
-- Calculate trading pair time period scores
-- Load strategy tasks
-- Process incomplete orders
-- Subscribe to trading pairs that need preheating
-- Used during system startup or periodic trading pair information updates
-
-### AutoRefreshPairs
-Automatically refresh trading pair information.
-
-Parameters:
-- `dp`: data.IProvider - Data provider interface
-- `showLog`: bool - Whether to display logs
-
-Implementation Details:
-- Automatically call `LoadRefreshPairs`
-- Handle refresh failure error logs
-- Used for scheduled automatic trading pair information updates
-
 ### InitOdSubs
 Initialize order subscriptions.
 
@@ -197,15 +166,6 @@ Clean up order manager.
 Returns:
 - `*errs.Error` - Error information
 
-### RunDataServer
-Run data server.
-
-Parameters:
-- `args`: *config.CmdArgs - Command line arguments
-
-Returns:
-- `*errs.Error` - Error information
-
 ### InitLiveOrderMgr
 Initialize live order manager.
 
@@ -230,80 +190,28 @@ Verify trigger orders.
 ### StartLiveOdMgr
 Start live order manager.
 
-### LoadZipKline
-Load candlestick data from ZIP file.
+## Factor-engine integration
 
-Parameters:
-- `inPath`: string - Input path
-- `fid`: int - File ID
-- `file`: *zip.File - ZIP file object
-- `arg`: interface{} - Additional parameters
+Trader.FeedDataSeries drives time-series jobs. Shared-account bridges project execution state rather than implementing another account; AccountSink submits Full/Patch targets.
 
-Returns:
-- `*errs.Error` - Error information
+[Factor API](factor.md) / [Guide](../guide/factor.md)
 
-Implementation Details:
-- Parse candlestick data from ZIP file
-- Support multiple data formats
-- Handle timestamps and price data
-- Used for historical data import
 
-### LoadCalendars
-Load calendar data.
+## Current construction, tools and state boundaries
 
-Parameters:
-- `args`: *config.CmdArgs - Command line arguments
+The old names below are no longer callable same-name public entries. Use the actual RuntimeDeps/explicit store/clock/logger APIs rather than nonexistent compatibility aliases:
 
-Returns:
-- `*errs.Error` - Error information
+| Prior documentation name | Current entry |
+| --- | --- |
+| LoadRefreshPairs / AutoRefreshPairs | RefreshPairsWithRuntimeDeps, RefreshJobsWithRuntimeDeps |
+| RunDataServer | entry spider command |
+| LoadZipKline | LoadZipSeriesWithRuntimeDeps |
+| LoadCalendars | LoadCalendarsWithDeps |
+| ExportKlines / PurgeKlines | ExportKlinesWithRuntimeDeps / PurgeKlinesWithRuntimeDeps |
+| ExportAdjFactors | ExportAdjFactorsWithRuntimeDeps |
+| CalcCorrelation | CalcCorrelationWithRuntimeDeps |
+| RunHistKline | RunHistSeries / RunHistSeriesWithRuntimeDeps |
 
-Implementation Details:
-- Initialize basic components
-- Read calendar data in CSV format
-- Save calendar information grouped by exchange
-- Used for managing trading calendars
+Trader, wallets and jobs use the same Runtime.Accounts/AccountsMu. Shared-account bridges preserve TS projections; execution owns physical sends/ledger. Manager/wallet facades are legacy only; explicit business paths fail on missing dependencies rather than falling back to globals.
 
-### ExportKlines
-Export candlestick data.
-
-Parameters:
-- `args`: *config.CmdArgs - Command line arguments
-- `prg`: utils.PrgCB - Progress callback function
-
-Returns:
-- `*errs.Error` - Error information
-
-Implementation Details:
-- Export candlestick data for specified trading pairs
-- Support multiple time periods
-- Support adjustment factor processing
-- Used for data analysis and backup
-
-### PurgeKlines
-Clean up candlestick data.
-
-Parameters:
-- `args`: *config.CmdArgs - Command line arguments
-
-Returns:
-- `*errs.Error` - Error information
-
-Implementation Details:
-- Delete candlestick data based on specified conditions
-- Support filtering by trading pair and time period
-- Requires user confirmation before execution
-- Used for data cleanup and maintenance
-
-### ExportAdjFactors
-Export adjustment factors.
-
-Parameters:
-- `args`: *config.CmdArgs - Command line arguments
-
-Returns:
-- `*errs.Error` - Error information
-
-Implementation Details:
-- Export price adjustment factor data
-- Include start time, factor values, etc.
-- Support timezone settings
+See [runtime](runtime.md).

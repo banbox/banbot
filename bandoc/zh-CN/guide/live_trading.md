@@ -292,3 +292,17 @@ crontab -e
 ```shell
 chmod +x /ban/check_bot.sh
 ```
+
+## 多因子与截面引擎
+
+bot trade 可装配因子和混合策略，但 entry.RegisterFactorLiveBinding 必须提供真实 transport、symbol metadata、revision/publication 映射、funding 和账户对账证据。execution.live_provider 是注册名，verified-session 是用户工厂示例，不是内置已验收 venue；缺能力时启动明确失败，不自动降级 paper。
+
+移除 archive，先 Prepare/Warmup，再对账和 Commit；Observe 接收当轮可见记录，barrier 完成/超时后 Flush。Stop 后 Join 等待回调和计算，候选代失败保留旧代。实盘当前拒绝 history-ic；InitialNAV 不给真实账户充值。factor trade --dry-run 是独立历史 paper 回放。
+
+参见[多因子与截面指南](./factor.md)和[因子 API](../api/factor.md)。
+
+## 资源与控制接口的边界
+
+entry 为本次实盘装配 Runtime、账户状态、交易所、数据源和服务；停止后等待 worker/回调退出再释放拥有的资源。嵌入调用者应使用显式依赖并遵守资源所有者的 Close/Stop/Join 合同，不能通过更换包级配置来切换正在运行的账户。
+
+实盘 HTTP/WS 和 RPC 是控制与观察接口，使用当前会话的配置快照、账户、时钟、订单和钱包依赖；它们不拥有因子图或计算状态。开发 WebUI 使用任务工厂创建独立回测 Runtime，与实盘 ApiServer 的会话边界不同。见 [Web API](../api/web.md)、[RPC API](../api/rpc.md) 和 [Runtime API](../api/runtime.md)。

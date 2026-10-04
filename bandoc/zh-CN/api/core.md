@@ -62,14 +62,6 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 参数：
 - `env string` - 运行环境标识符
 
-### SetPairMs
-设置交易对的时间参数。
-
-参数：
-- `pair string` - 交易对名称
-- `barMS int64` - K线时间间隔(毫秒)
-- `waitMS int64` - 等待时间(毫秒)
-
 ### Sleep
 带有中断检查的休眠函数。
 
@@ -91,12 +83,6 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 返回：
 - `T` - 缓存值或默认值
 
-### SnapMem
-获取内存快照。
-
-参数：
-- `name string` - 快照名称
-
 ## 性能统计方法
 
 ### GetPerfSta
@@ -115,52 +101,6 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 - `outDir string` - 输出目录路径
 
 ## 价格相关方法
-
-### GetPrice
-获取交易对的最新价格。
-
-参数：
-- `symbol string` - 交易对符号
-- `side string` - banexg.OdSideBuy/OdSideBuy/""
-
-返回：
-- `float64` - 最新价格
-
-### GetPriceSafe
-安全地获取交易对价格，包含法币处理逻辑。
-
-参数：
-- `symbol string` - 交易对符号
-- `side string` - banexg.OdSideBuy/OdSideBuy/""
-
-返回：
-- `float64` - 处理后的价格
-
-### SetPrice
-设置交易对的最新价格。
-
-参数：
-- `pair string` - 交易对名称
-- `ask float64` - 卖一价
-- `bid float64` - 买一价
-
-### SetPrices
-批量设置多个交易对的价格。
-
-参数：
-- `data map[string]float64` - 交易对价格映射
-- `side string` - banexg.OdSideBuy/OdSideBuy/""
-
-### IsMaker
-判断当前价格是否为做市商价格。
-
-参数：
-- `pair string` - 交易对名称
-- `side string` - 交易方向
-- `price float64` - 价格
-
-返回：
-- `bool` - 是否为做市商价格
 
 ## 工具方法
 
@@ -265,11 +205,10 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 ### RunExitCalls
 执行退出时的回调函数。
 
-### IsPriceEmpty
-检查价格缓存是否为空。
 
-返回：
-- `bool` - 价格缓存是否为空
 
-### PrintStratGroups
-打印策略分组信息。
+## 当前职责与迁移后的接口
+
+价格函数现在属于 com，不属于 core；显式任务优先使用 Runtime.Market.Prices 的 PriceState 方法（GetPriceSafeExpAt/SetPriceAt/SetPricesAt，明确 nowMS），com 包级 GetPrice/SetPrice 等只为兼容。SetPairMs 也属于 com；PrintStratGroups 属于 strat，新任务使用 PrintStratGroupsWithState。SnapMem 已不是当前公共函数。CountDigit(text string) int 在 core，统计字符串中的 Unicode 数字字符。
+
+State 管理 admission/performance/cancel；Runtime 注入具体 state，包级 Setup/SetRunMode 等不提供多任务隔离。见[com](com.md)、[runtime](runtime.md)。

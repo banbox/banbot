@@ -104,3 +104,12 @@ The entry point for all cmd sub-commands and business logic.
 Consequently, backtest, live-trading, and optimization tasks created through the normal entry points have their own cancellation, shutdown, and mutable business state; one `Process` can create several Runtimes. `context.Context` is used only for cancellation, deadlines, and I/O lifecycles, not for business state.
 
 The repository retains a small number of package-level facades for compatibility with older embedded calls and selected maintenance commands, including legacy configuration, time, and trading-state accessors. Those paths are protected by a compatibility boundary and are not the state-access mechanism for new tasks; new code should receive state through construction parameters, concrete receivers, or Runtime dependency projections.
+
+## Factor runtime domain
+
+[Factor API](factor.md) covers graphs, snapshots, research and runners. execution provides accounts; runtime owns borrowing/lifecycle; entry assembles configuration/resources.
+
+
+## Instance runtime and service APIs
+
+[runtime](runtime.md) covers Process/Runtime ownership and shutdown; [com](com.md) covers market state/scheduling; [rpc](rpc.md) covers session notifications; [web](web.md) covers development factories and live HTTP/WS lifecycles.

@@ -24,7 +24,7 @@ func testSnapshot(t testing.TB, event int64, values map[int32]map[string]any) *S
 		sids = append(sids, sid)
 		sidMap[sid] = string(rune('A' + sid))
 		rows = append(rows, testRecord(sid, event, fields))
-		requirements = append(requirements, Requirement{SID: sid, Source: "prices", Frequency: "1h", EventTime: event})
+		requirements = append(requirements, Requirement{SID: sid, Source: "prices", TimeFrame: "1h", EventTime: event})
 	}
 	snapshot, err := Freeze(SnapshotSpec{DecisionTime: event, ReplayTime: event, Universe: Universe{Version: "universe-v1", Investable: sids, Reference: sids, Tradable: sids, Evaluation: sids, Static: true}, SIDMap: sidMap, Schemas: map[string]string{"prices": "schema-v1"}, SourceVersions: map[string]string{"prices": "prices-v1"}, VisibilityPolicy: "published-and-received"}, rows, requirements)
 	if err != nil {
@@ -62,7 +62,7 @@ func TestSnapshotPreservesTypesValidityAndImmutableAccess(t *testing.T) {
 	}
 }
 
-func TestVersionChunkReopenVisibilityConflictAndFrequency(t *testing.T) {
+func TestVersionChunkReopenVisibilityConflictAndTimeFrame(t *testing.T) {
 	store, err := NewVersionStore(4)
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +95,7 @@ func TestVersionChunkReopenVisibilityConflictAndFrequency(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(visible) != 2 {
-			t.Fatalf("frequencies collapsed: %#v", visible)
+			t.Fatalf("timeframes collapsed: %#v", visible)
 		}
 		for _, row := range visible {
 			if row.Series.TimeFrame == "1h" && row.Series.Values["close"] != filter.want {
@@ -155,7 +155,7 @@ func TestSnapshotBarrierLateFutureAndSparseSources(t *testing.T) {
 		t.Fatal("NULL row incorrectly counted missing")
 	}
 	rows := []VersionRecord{testRecord(1, 10, map[string]any{"close": 1.0})}
-	requirements := []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 10}, {SID: 2, Source: "prices", Frequency: "1h", EventTime: 10}}
+	requirements := []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 10}, {SID: 2, Source: "prices", TimeFrame: "1h", EventTime: 10}}
 	missing, err := Freeze(spec, rows, requirements)
 	if err != nil {
 		t.Fatal(err)
@@ -216,19 +216,19 @@ func TestSnapshotBarrierLateFutureAndSparseSources(t *testing.T) {
 	}
 }
 
-func TestSnapshotFrequencyIdentityAndCanonicalHash(t *testing.T) {
+func TestSnapshotTimeFrameIdentityAndCanonicalHash(t *testing.T) {
 	base := testSnapshot(t, 10, map[int32]map[string]any{1: {"close": 100.0}})
 	hour, _ := base.Row(1, "prices", "1h")
 	minute := hour
 	minute.Series.TimeFrame = "1m"
 	minute.Series.Values = map[string]any{"close": 7.0}
-	need := []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 10}, {SID: 1, Source: "prices", Frequency: "1m", EventTime: 10}}
+	need := []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 10}, {SID: 1, Source: "prices", TimeFrame: "1m", EventTime: 10}}
 	snapshot, err := Freeze(base.Spec(), []VersionRecord{minute, hour}, need)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if snapshot.Numeric(1, "prices", "1h", "close").Value != 100 || snapshot.Numeric(1, "prices", "1m", "close").Value != 7 {
-		t.Fatal("frequency fields crossed")
+		t.Fatal("timeframe fields crossed")
 	}
 	need[0], need[1] = need[1], need[0]
 	reordered, err := Freeze(base.Spec(), []VersionRecord{hour, minute}, need)

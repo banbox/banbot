@@ -10,7 +10,7 @@
 
 # 常见问题
 ### 如何进行函数性能测试？（不含IO）
-回测时添加`-cpu-profile`参数，启用性能测试，输出`cpu.profile`到回测目录下。然后执行下面命令可以查看结果
+回测时添加`-cpu-profile`参数，启用性能测试，输出`cpu.profile`到进程当前工作目录。命令退出时停止采样并关闭文件。然后执行下面命令可以查看结果
 ```shell
 go tool pprof -http :6060 cpu.profile
 ```
@@ -41,19 +41,24 @@ go tool pprof -http=:5079 ./grf.out
 ```
 
 ### 如何发布go模块新版本？
+先更新 `core/data.go` 的 `Version`；若修改了 `web/ui`，还需编译、打包前端并更新 `UIVersion`。未修改前端时沿用已有 `UIVersion` 及对应 release 的 `dist.zip`。发布源码不得依赖本地目录 `replace`：先发布配套依赖，再固定远程版本，验证构建、测试和文档后提交，为该提交创建并推送准确的版本标签：
 ```shell
-git tag v1.0.0
-git push origin --tags
+git tag -a v1.0.0 -m "Release v1.0.0"
+git push origin HEAD
+git push origin v1.0.0
 ```
+beta 标签在 GitHub 上创建 prerelease；发布说明应列出配置兼容性、验证范围及前端资源版本。
 ### 如何引用本地go模块？
 1. 被引用模块执行`go mod init`添加`go.mod`文件，修改`module`后的模块名
-2. 执行上面`git tag`添加新版本
-3. 在当前项目（和依赖当前项目的入口项目）添加依赖：`go get 模块名@version`
-4. 在当前项目（和依赖当前项目的入口项目）的`go.mod`中添加`replace`指令，改为本地绝对或相对路径
+2. 在当前项目的`go.mod`中保留相应`require`，添加`replace 模块名 => 本地路径`。本地联调无需发布或创建标签。
+3. 发布后若要使用远端版本，再执行`go get 模块名@version`并移除本地`replace`。
 
 ### 如何修改测试web UI？
-您只需将`web/ui/svelte.config.js`中的`adapter-static`改为`adapter-auto`，然后执行`npm run dev`，浏览器访问`http://localhost:5173`，即可实时预览ui变动。
+在`web/ui`目录安装依赖后执行`npm run dev`，浏览器访问`http://localhost:5173`，即可实时预览ui变动。开发服务器不需要更换`adapter-static`；该适配器用于生成打包进 Go 程序的静态页面。
 后端接口默认访问`http://localhost:8000`。
+
+### 如何编写新的运行时组件？
+通过 `config.LoadRunSpec` 加载统一配置，由 `entry` 装配任务级 `runtime.Runtime`，向组件传递明确的依赖。任务状态、时钟、存储和退出回调归该 Runtime 所有，避免新组件读取兼容包级变量。任意时序字段统一通过 `orm.DataSeries.Values` 传递。详见 [运行时上下文](runtime_context.md)、[时序数据](series_usage.md) 和 [包级架构审查](strategy_engine_refactor.md)。
 
 ### json
 It is not recommended to replace `encoding/json` with [sonic](https://github.com/bytedance/sonic/issues/574). The binary file will increase by 15M (on Windows)

@@ -74,7 +74,7 @@ func generationRuntimeFixture(t *testing.T) (*runtimectx.Runtime, runner.Config,
 	c.Mode, c.AccountID = runner.Trade, "default"
 	c.Manifest.Costs.FundingPolicy = "explicit-zero"
 	c.DecisionInterval, c.LatencyMS, c.ExpiryMS = 60000, 1, 120000
-	c.Prices = runner.PriceStream{Source: "kline", Frequency: "1m", Field: "close"}
+	c.Prices = runner.PriceStream{Source: "kline", TimeFrame: "1m", Field: "close"}
 	c.Snapshot.Universe = factor.Universe{Version: "u", Static: true, Investable: []int32{1, 2}, Reference: []int32{1, 2}, Evaluation: []int32{1, 2}, Tradable: []int32{1, 2}, Tracked: []int32{1, 2}}
 	c.Snapshot.SIDMap = map[int32]string{1: "BTC", 2: "ETH"}
 	c.Combo = research.ComboSpec{Method: research.Fixed, Columns: []string{"value"}, Weights: map[string]float64{"value": 1}}

@@ -92,6 +92,32 @@ func factorLiveFactory(name string) (FactorLiveBindingFactory, error) {
 	return f, nil
 }
 
+// resolveFactorLiveFactories applies the provider precedence per account:
+// explicit CLI name, account override, global execution default, then the
+// registry default. It validates every provider before opening any session.
+func resolveFactorLiveFactories(spec *config.RunSpec, accounts []string, cliName string) (map[string]FactorLiveBindingFactory, error) {
+	if spec == nil {
+		return nil, errors.New("factor: live configuration is required")
+	}
+	result := make(map[string]FactorLiveBindingFactory, len(accounts))
+	global, _ := spec.Config().Execution["live_provider"].(string)
+	for _, account := range accounts {
+		provider := cliName
+		if provider == "" {
+			provider, _ = spec.Config().AccountExecution[account]["live_provider"].(string)
+		}
+		if provider == "" {
+			provider = global
+		}
+		factory, err := factorLiveFactory(provider)
+		if err != nil {
+			return nil, fmt.Errorf("account %s: %w", account, err)
+		}
+		result[account] = factory
+	}
+	return result, nil
+}
+
 func closeFactorLiveBindings(bindings []FactorLiveBinding) (result error) {
 	for i := len(bindings) - 1; i >= 0; i-- {
 		if bindings[i].Close != nil {
@@ -163,13 +189,6 @@ func runFactorLiveSpec(ctx context.Context, spec *config.RunSpec, configs []runn
 	if err != nil {
 		return err
 	}
-	if name == "" {
-		name, _ = spec.Config().Execution["live_provider"].(string)
-	}
-	factory, err := factorLiveFactory(name)
-	if err != nil {
-		return err
-	}
 	groups := map[string][]runner.Config{}
 	mergedAccounts := map[string]runner.Config{}
 	var accounts []string
@@ -186,6 +205,10 @@ func runFactorLiveSpec(ctx context.Context, spec *config.RunSpec, configs []runn
 		}
 		mergedAccounts[account] = merged
 	}
+	factories, err := resolveFactorLiveFactories(spec, accounts, name)
+	if err != nil {
+		return err
+	}
 	session, snapshot, openErr := openExplicitEntrySessionFromSpecContext(ctx, &config.CmdArgs{}, spec, "factor", "trade")
 	if openErr != nil {
 		return openErr
@@ -199,7 +222,16 @@ func runFactorLiveSpec(ctx context.Context, spec *config.RunSpec, configs []runn
 	defer cancel()
 	writer := &factorLiveWriter{Writer: out}
 	results := make(chan error, len(accounts))
-	bindings, err = prepareFactorLiveBindings(ctx, factory, session.exchange, snapshot, accounts, mergedAccounts)
+	// prepareFactorLiveBindings is account-scoped; route each request to its
+	// already validated provider while retaining one cleanup lifecycle.
+	routedFactory := func(ctx context.Context, exchange banexg.BanExchange, snapshot *config.Snapshot, cfg runner.Config) (FactorLiveBinding, error) {
+		factory := factories[cfg.AccountID]
+		if factory == nil {
+			return FactorLiveBinding{}, fmt.Errorf("account %s: live provider is not configured", cfg.AccountID)
+		}
+		return factory(ctx, exchange, snapshot, cfg)
+	}
+	bindings, err = prepareFactorLiveBindings(ctx, routedFactory, session.exchange, snapshot, accounts, mergedAccounts)
 	if err != nil {
 		return err
 	}
@@ -250,7 +282,7 @@ func validateFactorLiveConfig(c runner.Config) error {
 		}
 		seen[unit.ID] = true
 	}
-	if c.Prices.Source == "" || c.Prices.Field == "" || c.Prices.Frequency != "event" && c.Prices.Frequency != "1m" {
+	if c.Prices.Source == "" || c.Prices.Field == "" || c.Prices.TimeFrame != "event" && c.Prices.TimeFrame != "1m" {
 		return errors.New("factor: live requires event or 1m observable price metadata")
 	}
 	return runner.ValidateLiveConfig(c)
@@ -633,7 +665,7 @@ func factorLiveKlineSubscriptions(engine *runner.Live, c runner.Config, symbols 
 			if symbol == nil || symbol.ID != sid || symbol.Symbol != c.Snapshot.SIDMap[sid] {
 				return fmt.Errorf("factor: live kline SID %d mapping is absent or mismatched", sid)
 			}
-			subs = append(subs, data.Subscription{Source: input.Source, ExSymbol: symbol, TimeFrame: input.Frequency, Fields: append([]string(nil), input.Fields...), WarmupNum: input.WarmupLength})
+			subs = append(subs, data.Subscription{Source: input.Source, ExSymbol: symbol, TimeFrame: input.TimeFrame, Fields: append([]string(nil), input.Fields...), WarmupNum: input.WarmupLength})
 		}
 		return nil
 	}
@@ -642,7 +674,7 @@ func factorLiveKlineSubscriptions(engine *runner.Live, c runner.Config, symbols 
 			return nil, err
 		}
 	}
-	if err := add(factor.InputSpec{Source: c.Prices.Source, Frequency: c.Prices.Frequency, Fields: []string{c.Prices.Field}}, engine.ExecutionSIDs()); err != nil {
+	if err := add(factor.InputSpec{Source: c.Prices.Source, TimeFrame: c.Prices.TimeFrame, Fields: []string{c.Prices.Field}}, engine.ExecutionSIDs()); err != nil {
 		return nil, err
 	}
 	return subs, nil

@@ -4,6 +4,8 @@
 BanBot 是一个用于数字货币量化交易的机器人后端服务。它使用Go语言构建，提供了强大的数据处理、策略执行、订单管理和实盘交易功能。项目采用模块化设计，将核心逻辑、数据处理、交易策略、数据库交互等功能清晰分离，易于扩展和维护。
 
 ## 技术架构与实现方案
+
+策略配置使用 `run_policy` 的 `engine: time_series|factor`；省略 engine 保持时序。因子原生图/表达式提供多列计算、截面组合、weights/events 回测，mixed replay 要求 events。`bot factor archive/research/backtest/trade` 与 `validate/explain` 是当前入口，旧 `tool bt_factor` 只处理 orders.gob 滚动筛选。详见[多因子指南](../bandoc/zh-CN/guide/factor.md)。真实会话缺验证能力时拒绝启动，不因配置名字自动变成可用 venue。
 - 核心框架: 自定义事件驱动框架，支持回测与实盘模式。
 - 运行态: 每次回测、实盘或优化由独立的 `runtime.Runtime` 承载。配置快照、时钟、市场与交易对、策略、订单和钱包状态随任务传递；`context.Context` 仅用于取消、deadline 与 I/O 生命周期。
 - 数据库: SQLite（`banpub.db`）用于公共元数据（K线索引、日历、复权因子、范围管理、未完成K线等）；QuestDB（PGWire）可选用于大规模时序K线存储；交易/任务数据使用SQLite文件（`orders_ban.db`）。
@@ -61,16 +63,16 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 ### `core/` (核心类型与任务状态)
 - runtime_state.go: `core.State`，保存单个 Runtime 的运行模式、市场、交易对、订单簿、任务性能和取消状态。
 - core.go: 旧调用链的运行模式/环境与休眠兼容接口；新增运行器通过 `core.State` 和 Runtime 依赖投影工作。
-- common.go: 缓存管理(ristretto)、退出回调、键生成等。函数：`GetCacheVal`、`SnapMem`、`RunExitCalls`等。
+- common.go: 缓存管理(ristretto)、退出回调、键生成等。函数：GetCacheVal、RunExitCalls 等；性能/取消状态使用 Runtime.Core。
 - types.go: 核心数据结构：`Param`(参数配置)、`PerfSta`(性能统计)、`JobPerf`(任务性能)等。
 - data.go: 旧的包级兼容 facade 与订单常量；任务级可变状态已由 `core.State` 管理。
 - calc.go: 基础计算工具，如EMA。
 - errors.go: 自定义错误码和错误名称。
-- utils.go: 核心层工具函数，如`GetPrice`、`SetPrice`、`IsMaker`、`SplitSymbol`等。
+- utils.go: 核心层工具如 SplitSymbol、GroupByPairQuotes；价格状态与兼容价格函数属于 com。
 
 ### `data/` (数据获取与处理)
 - provider.go: 数据提供者`IProvider`接口，`HistProvider`(回测)和`LiveProvider`(实盘)实现，支持订阅预热交易对、主循环等。
-- feeder.go: K线馈送器`IKlineFeeder`接口，`DBKlineFeeder`(回测)和`KlineFeeder`(实盘)实现，每个对应一个交易对的多周期数据。
+- feeder.go: 以统一 DataSeries 处理每个交易对的多周期序列；内置 K 线和扩展字段共用 Values，不能按旧 IKlineFeeder/DBKlineFeeder 名称编写新接口。当前源/provider API 见公开 data 文档。
 - spider.go: 实盘数据爬虫`LiveSpider`，通过WebSocket/API获取实时数据，包含多个`Miner`(每个交易所+市场一个)。
 - watcher.go: K线监视器`KLineWatcher`，客户端与爬虫通信，订阅K线、交易、订单簿数据。
 - ws_feeder.go: WebSocket数据喂食器。
@@ -95,7 +97,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 
 ### `live/` (实盘交易)
 - crypto_trader.go: 加密货币交易器`CryptoTrader`，初始化数据提供者、订单管理器、交易对更新钩子、任务管理、API服务等。
-- common.go: 定时任务：`CronRefreshPairs`、`CronLoadMarkets`、`CronFatalLossCheck`、`CronKlineDelays`、`CronCheckTriggerOds`等。
+- common.go: 交易器实例 cron 绑定 Runtime.Cron/clock/账户，不存在这些包级 Cron* 公共入口。
 - account_check.go: 实盘账户检查，验证交易/提现权限、IP设置、持仓模式、保证金模式，汇总余额。
 - tools.go: `trade_close`命令实现，支持按账户/交易对/策略筛选平仓。
 
@@ -105,11 +107,11 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - manager.go: LLM管理器，多模型故障转移、并发控制、统计追踪和自动禁用机制。
 
 ### `opt/` (回测与优化)
-- backtest.go: 回测引擎`BackTest`核心实现，包含`BTResult`结果结构。函数：`NewBackTest`、`RunBTOverOpt`、`RunRollBTPicker`等。
+- backtest.go: 回测引擎`BackTest`核心实现，结果结构在 reports.go，构造明确注入 RuntimeDeps。函数：NewBackTestWithRuntimeDeps、`RunBTOverOpt`、`RunRollBTPicker`等。
 - hyper_opt.go: 超参数优化，支持bayes/tpe/random/cmaes/ipop-cmaes/bipop-cmaes等算法。函数：`RunOptimize`、`CollectOptLog`等。
 - reports.go: 生成回测报告和图表，包含性能指标计算(夏普比率、索提诺比率、最大回撤等)。
 - sim_bt.go: 从日志运行滚动模拟回测。
-- common.go: 回测和优化通用函数，如`AvgGoodDesc`、`DescGroups`、`DumpLineGraph`等。
+- common.go: 回测和优化通用函数，如`AvgGoodDesc`、`DescGroups`等。
 - tools.go: 工具函数，如`CompareExgBTOrders`等。
 
 ### `orm/` (数据库交互)
@@ -179,7 +181,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - misc.go: 杂项工具。函数：`MD5`、`IsDocker`、`OpenBrowser`、`ReadInput`、`ReadConfirm`、`ParallelRun`等。
 - net_utils.go: 网络工具。函数：`DoHttp`等。
 - num_utils.go: 数字处理工具。
-- text_utils.go: 文本处理。函数：`SnakeToCamel`、`PadCenter`、`RandomStr`、`FormatWithMap`、`SplitSolid`、`GroupByPairQuotes`等。
+- text_utils.go: 文本处理。函数：`SnakeToCamel`、`PadCenter`、`RandomStr`、`FormatWithMap`、`SplitSolid`等。
 - tf_utils.go: 时间周期处理工具。
 - yaml_merge.go: YAML文件合并工具。
 

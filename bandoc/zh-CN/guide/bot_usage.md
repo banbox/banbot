@@ -351,3 +351,11 @@ banbot tool:
     bt_factor:      backtest factors with orders
     bt_result:      build backtest result from orders.gob and config
 ```
+
+## 多因子与截面引擎
+
+因子命令族包括 bot factor archive/research/backtest/trade 和表达式 validate/explain。普通 backtest/trade 也读取 engine: factor。backtest --mode weights|events 选择模拟方式；trade --dry-run 是历史 paper；真实 trade 需已验证 binding。--factor-config 兼容旧 JSON，保留原文件并写浅层 YAML，暂沿用历史 .v2.yml 文件后缀（配置无需版本标记）；路径按字段来源文件解析。
+
+本页 bot tool bt_factor 是 orders.gob / strat.FactorMap 旧滚动筛选工具，与新 factor runner 不同。
+
+参见[多因子与截面指南](./factor.md)和[因子 API](../api/factor.md)。

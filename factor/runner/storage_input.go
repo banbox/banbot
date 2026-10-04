@@ -299,7 +299,7 @@ func (s *storageInput) Next(ctx context.Context) (HistoricalBatch, error) {
 			if err != nil {
 				return HistoricalBatch{}, err
 			}
-			key := factor.StreamKey{SID: record.Series.Sid, Source: record.Series.Source, Frequency: record.Series.TimeFrame}
+			key := factor.StreamKey{SID: record.Series.Sid, Source: record.Series.Source, TimeFrame: record.Series.TimeFrame}
 			s.latest[key] = append(s.latest[key], clone)
 			s.retained++
 			batch.Records = append(batch.Records, record)

@@ -8,7 +8,6 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,6 +28,7 @@ const (
 )
 
 // PolicyV2 keeps the existing strategy fields and their sizing semantics.
+// Its historical type name does not require a version marker in YAML.
 // CapitalWeight is an optional account budget, never an alias for StakeRate.
 type PolicyV2 struct {
 	*RunPolicyConfig `yaml:",inline"`
@@ -37,6 +37,7 @@ type PolicyV2 struct {
 	Account          string         `yaml:"account,omitempty"`
 	CapitalWeight    *float64       `yaml:"capital_weight,omitempty"`
 	Factor           map[string]any `yaml:"factor,omitempty"`
+	ExplicitEngine   bool           `yaml:"-"`
 }
 
 // MarshalYAML explicitly keeps the legacy inline More map. yaml.v3 does not
@@ -53,7 +54,7 @@ func (p *PolicyV2) MarshalYAML() (any, error) {
 	if err := yaml.Unmarshal(raw, &fields); err != nil {
 		return nil, err
 	}
-	if p.Engine != "" && p.Engine != EngineTimeSeries {
+	if p.Engine != "" && (p.Engine != EngineTimeSeries || p.ExplicitEngine || p.ID != "" || p.Account != "" || p.CapitalWeight != nil) {
 		fields["engine"] = p.Engine
 	}
 	if p.ID != "" {
@@ -66,7 +67,11 @@ func (p *PolicyV2) MarshalYAML() (any, error) {
 		fields["capital_weight"] = *p.CapitalWeight
 	}
 	if p.Factor != nil {
-		fields["factor"] = p.Factor
+		for key, value := range p.Factor {
+			if _, exists := fields[key]; !exists {
+				fields[key] = value
+			}
+		}
 	}
 	return fields, nil
 }
@@ -81,92 +86,12 @@ type UnifiedConfig struct {
 	RunPolicy     []*PolicyV2
 	Data          map[string]any
 	Execution     map[string]any
-}
-
-// YAMLImport is an in-memory candidate. It does not authorize or perform a
-// file rewrite: disk migration still needs backups, conflict checks and rereads.
-type YAMLImport struct {
-	Original      []byte
-	YAML          []byte
-	SourceVersion int
-	Changed       bool
+	// AccountExecution contains factor execution overrides keyed by the
+	// existing root account name. Account credentials remain in Root.Accounts.
+	AccountExecution map[string]map[string]any
 }
 
 var v2PolicyKeys = []string{"engine", "id", "account", "capital_weight", "factor"}
-
-// ImportV1YAML minimally adds the format marker without expanding environment
-// expressions, paths, aliases or defaults. Reserved legacy More collisions fail
-// explicitly; their values cannot safely acquire a new meaning automatically.
-func ImportV1YAML(raw []byte, path string) (*YAMLImport, error) {
-	node, version, err := configDocument(raw)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	result := &YAMLImport{Original: bytes.Clone(raw), YAML: bytes.Clone(raw), SourceVersion: version}
-	if version == ConfigVersionV2 {
-		return result, nil
-	}
-	if err := legacyReservedKeys(node); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	if node != nil && node.Style&yaml.FlowStyle != 0 {
-		return nil, fmt.Errorf("%s: v1 flow mapping requires an explicit reviewed conversion", path)
-	}
-	newline := []byte("\n")
-	if bytes.Contains(raw, []byte("\r\n")) {
-		newline = []byte("\r\n")
-	}
-	offset := 0
-	if node != nil {
-		for line := 1; line < node.Line; line++ {
-			index := bytes.IndexByte(raw[offset:], '\n')
-			if index < 0 {
-				break
-			}
-			offset += index + 1
-		}
-	}
-	// Keep a UTF-8 BOM at the beginning of the document.
-	if offset == 0 && bytes.HasPrefix(raw, []byte{0xef, 0xbb, 0xbf}) {
-		offset = 3
-	}
-	var candidate []byte
-	if versionNode := nodeValue(node, "config_version"); versionNode != nil {
-		offset = 0
-		for line := 1; line < versionNode.Line; line++ {
-			offset += bytes.IndexByte(raw[offset:], '\n') + 1
-		}
-		offset += versionNode.Column - 1
-		if offset >= len(raw) || raw[offset] != '1' {
-			return nil, fmt.Errorf("%s: cannot safely replace the v1 marker", path)
-		}
-		candidate = bytes.Clone(raw)
-		candidate[offset] = '2'
-	} else {
-		marker := append([]byte("config_version: 2"), newline...)
-		candidate = make([]byte, 0, len(raw)+len(marker))
-		candidate = append(candidate, raw[:offset]...)
-		candidate = append(candidate, marker...)
-		candidate = append(candidate, raw[offset:]...)
-	}
-	var before, after map[string]any
-	if err := yaml.Unmarshal(raw, &before); err != nil {
-		return nil, err
-	}
-	if err := yaml.Unmarshal(candidate, &after); err != nil {
-		return nil, err
-	}
-	delete(after, "config_version")
-	delete(before, "config_version")
-	if len(before) == 0 && len(after) == 0 {
-		before, after = nil, nil
-	}
-	if !reflect.DeepEqual(before, after) {
-		return nil, fmt.Errorf("%s: cannot prove v1 conversion preserves all configuration values", path)
-	}
-	result.YAML, result.Changed = candidate, true
-	return result, nil
-}
 
 func configDocument(raw []byte) (*yaml.Node, int, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
@@ -224,32 +149,7 @@ func nodeValue(mapping *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 
-func legacyReservedKeys(root *yaml.Node) error {
-	if root == nil {
-		return nil
-	}
-	var values map[string]any
-	if err := root.Decode(&values); err != nil {
-		return err
-	}
-	for _, key := range []string{"data", "execution"} {
-		if _, exists := values[key]; exists {
-			return fmt.Errorf("v1 key %q conflicts with a v2 reserved field; explicit conversion required", key)
-		}
-	}
-	policies, _ := values["run_policy"].([]any)
-	for i, item := range policies {
-		policy, _ := item.(map[string]any)
-		for _, key := range v2PolicyKeys {
-			if _, exists := policy[key]; exists {
-				return fmt.Errorf("v1 run_policy[%d].%s is a legacy More parameter and conflicts with v2; explicit conversion required", i, key)
-			}
-		}
-	}
-	return nil
-}
-
-// ParseUnifiedYAML imports a source entirely in memory and produces a v2 DTO.
+// ParseUnifiedYAML parses legacy and explicit-engine sources in memory.
 // It never installs globals, opens services, or rewrites the source file.
 func ParseUnifiedYAML(raw []byte, path string) (*UnifiedConfig, *errs.Error) {
 	return parseUnifiedLayers([][]byte{raw}, []string{path})
@@ -286,10 +186,11 @@ func ParseUnifiedConfigs(paths []string, showLog bool) (*UnifiedConfig, *errs.Er
 func parseUnifiedLayers(raws [][]byte, paths []string, metadata ...*loadedConfigMetadata) (*UnifiedConfig, *errs.Error) {
 	merged := make(map[string]any)
 	llmMerged := make(map[string]any)
+	declaredAccounts, aliasedAccounts := make(map[string]bool), make(map[string]bool)
 	for i, raw := range raws {
-		candidate, err := ImportV1YAML(raw, paths[i])
+		_, version, err := configDocument(raw)
 		if err != nil {
-			return nil, errs.New(core.ErrBadConfig, err)
+			return nil, errs.NewFull(core.ErrBadConfig, err, "%s", paths[i])
 		}
 		section, err := extractLLMSection(raw)
 		if err != nil {
@@ -297,8 +198,20 @@ func parseUnifiedLayers(raws [][]byte, paths []string, metadata ...*loadedConfig
 		}
 		utils2.DeepCopyMap(llmMerged, section)
 		var layer map[string]any
-		if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(candidate.YAML))), &layer); err != nil {
+		if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(raw))), &layer); err != nil {
 			return nil, errs.New(core.ErrBadConfig, err)
+		}
+		if accounts, ok := layer["accounts"].(map[string]any); ok {
+			for name := range accounts {
+				declaredAccounts[name] = true
+			}
+		}
+		aliases, err := normalizeConfigLayer(layer, version == ConfigVersionV2)
+		if err != nil {
+			return nil, errs.NewFull(core.ErrBadConfig, err, "%s", paths[i])
+		}
+		for _, name := range aliases {
+			aliasedAccounts[name] = true
 		}
 		if err := validateV2Fields(layer); err != nil {
 			return nil, errs.NewFull(core.ErrBadConfig, err, "%s", paths[i])
@@ -307,6 +220,11 @@ func parseUnifiedLayers(raws [][]byte, paths []string, metadata ...*loadedConfig
 			recordLayerOrigins(meta.origins, merged, layer, paths[i])
 		}
 		mergeConfigLayer(merged, layer)
+	}
+	for name := range aliasedAccounts {
+		if !declaredAccounts[name] {
+			return nil, errs.NewMsg(core.ErrBadConfig, "execution.accounts.%s refers to an unknown account", name)
+		}
 	}
 	result, err := decodeUnified(merged)
 	if err != nil {
@@ -358,6 +276,20 @@ func validateV2Fields(layer map[string]any) error {
 			}
 		}
 	}
+	if accounts, ok := layer["accounts"].(map[string]any); ok {
+		for name, raw := range accounts {
+			fields, _ := raw.(map[string]any)
+			overrides := make(map[string]any)
+			for _, key := range accountExecutionKeys {
+				if value, exists := fields[key]; exists {
+					overrides[key] = value
+				}
+			}
+			if err := validateAdvanced("accounts."+name, overrides); err != nil {
+				return err
+			}
+		}
+	}
 	value := layer["run_policy"]
 	if value == nil {
 		return nil
@@ -370,6 +302,9 @@ func validateV2Fields(layer map[string]any) error {
 		policy, ok := value.(map[string]any)
 		if !ok {
 			return fmt.Errorf("run_policy[%d] must be a mapping", i)
+		}
+		if !hasPolicyEngine(policy) {
+			continue
 		}
 		for _, key := range []string{"engine", "id", "account"} {
 			if value, exists := policy[key]; exists {
@@ -397,6 +332,10 @@ func validateV2Fields(layer map[string]any) error {
 			if err := validateAdvanced(fmt.Sprintf("run_policy[%d].factor", i), fields); err != nil {
 				return err
 			}
+			return fmt.Errorf("run_policy[%d]: factor overrides require engine: factor", i)
+		}
+		if err := validateAdvanced(fmt.Sprintf("run_policy[%d]", i), factorFields(policy)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -409,6 +348,22 @@ func decodeUnified(merged map[string]any) (*UnifiedConfig, error) {
 	delete(rootValues, "data")
 	delete(rootValues, "execution")
 	result := &UnifiedConfig{ConfigVersion: ConfigVersionV2, Root: &Config{}}
+	result.AccountExecution = make(map[string]map[string]any)
+	if accounts, ok := rootValues["accounts"].(map[string]any); ok {
+		for name, raw := range accounts {
+			fields, _ := raw.(map[string]any)
+			overrides := make(map[string]any)
+			for _, key := range accountExecutionKeys {
+				if value, exists := fields[key]; exists {
+					overrides[key] = value
+					delete(fields, key)
+				}
+			}
+			if len(overrides) > 0 {
+				result.AccountExecution[name] = overrides
+			}
+		}
+	}
 	if err := mapstructure.Decode(rootValues, result.Root); err != nil {
 		return nil, err
 	}
@@ -424,15 +379,19 @@ func decodeUnified(merged map[string]any) (*UnifiedConfig, error) {
 				CapitalWeight       *float64 `mapstructure:"capital_weight"`
 				Factor              map[string]any
 			}
-			if err := mapstructure.Decode(fields, &extras); err != nil {
-				return nil, err
-			}
-			if extras.Engine != "" {
-				policy.Engine = extras.Engine
-			}
-			policy.ID, policy.Account, policy.CapitalWeight, policy.Factor = extras.ID, extras.Account, extras.CapitalWeight, extras.Factor
-			for _, key := range v2PolicyKeys {
-				delete(fields, key)
+			if hasPolicyEngine(fields) {
+				if err := mapstructure.Decode(fields, &extras); err != nil {
+					return nil, err
+				}
+				policy.Engine, policy.ExplicitEngine = extras.Engine, true
+				policy.ID, policy.Account, policy.CapitalWeight = extras.ID, extras.Account, extras.CapitalWeight
+				policy.Factor = factorFields(fields)
+				for key := range policy.Factor {
+					delete(fields, key)
+				}
+				for _, key := range v2PolicyKeys {
+					delete(fields, key)
+				}
 			}
 			if err := mapstructure.Decode(fields, policy.RunPolicyConfig); err != nil {
 				return nil, err
@@ -446,8 +405,8 @@ func decodeUnified(merged map[string]any) (*UnifiedConfig, error) {
 // Validate checks only configuration semantics. Market, strategy-definition,
 // data-source and execution capability validation belong to their adapters.
 func (c *UnifiedConfig) Validate() error {
-	if c == nil || c.Root == nil || c.ConfigVersion != ConfigVersionV2 {
-		return fmt.Errorf("a v2 root configuration is required")
+	if c == nil || c.Root == nil {
+		return fmt.Errorf("a root configuration is required")
 	}
 	if len(c.Root.RunPolicy) != 0 {
 		return fmt.Errorf("UnifiedConfig.RunPolicy is the sole strategy list; Root.RunPolicy must be empty")
@@ -458,11 +417,12 @@ func (c *UnifiedConfig) Validate() error {
 	if err := validateAdvanced("execution", c.Execution); err != nil {
 		return err
 	}
-	if overrides, ok := c.Execution["accounts"].(map[string]any); ok {
-		for name := range overrides {
-			if c.Root.Accounts[name] == nil {
-				return fmt.Errorf("execution.accounts.%s refers to an unknown account", name)
-			}
+	for name := range c.AccountExecution {
+		if c.Root.Accounts[name] == nil {
+			return fmt.Errorf("account execution override %q refers to an unknown account", name)
+		}
+		if err := validateAdvanced("accounts."+name, c.AccountExecution[name]); err != nil {
+			return err
 		}
 	}
 	groups := make(map[string][]*PolicyV2)
@@ -474,12 +434,14 @@ func (c *UnifiedConfig) Validate() error {
 		if policy.Engine != EngineTimeSeries && policy.Engine != EngineFactor {
 			return fmt.Errorf("run_policy[%d]: unsupported engine %q", i, policy.Engine)
 		}
-		if err := validateAdvanced(fmt.Sprintf("run_policy[%d].factor", i), policy.Factor); err != nil {
+		if err := validateAdvanced(fmt.Sprintf("run_policy[%d]", i), policy.Factor); err != nil {
 			return err
 		}
-		for _, key := range v2PolicyKeys {
-			if _, exists := policy.More[key]; exists {
-				return fmt.Errorf("run_policy[%d].More.%s conflicts with a v2 field", i, key)
+		if policy.ExplicitEngine {
+			for _, key := range v2PolicyKeys {
+				if _, exists := policy.More[key]; exists {
+					return fmt.Errorf("run_policy[%d].More.%s conflicts with an engine field", i, key)
+				}
 			}
 		}
 		if policy.Engine != EngineFactor && policy.Factor != nil {
@@ -562,7 +524,7 @@ func (c *UnifiedConfig) TimeSeriesConfig() (*Config, *errs.Error) {
 	if err := c.Validate(); err != nil {
 		return nil, errs.New(core.ErrBadConfig, err)
 	}
-	if len(c.Data) != 0 || len(c.Execution) != 0 {
+	if len(c.Data) != 0 || len(c.Execution) != 0 || len(c.AccountExecution) != 0 {
 		return nil, errs.NewMsg(core.ErrBadConfig, "advanced data/execution overrides require unified runtime assembly")
 	}
 	result := cloneConfigValue(c.Root).(*Config)
@@ -581,7 +543,7 @@ func (c *UnifiedConfig) TimeSeriesConfig() (*Config, *errs.Error) {
 	return result, nil
 }
 
-// MarshalYAML emits the same root keys and the single v2 strategy list.
+// MarshalYAML emits existing root keys and one shallow strategy list.
 func (c *UnifiedConfig) MarshalYAML() (any, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -597,7 +559,6 @@ func (c *UnifiedConfig) MarshalYAML() (any, error) {
 	if c.Root.LLMModels == nil {
 		delete(fields, "llm_models")
 	}
-	fields["config_version"] = ConfigVersionV2
 	if c.RunPolicy != nil {
 		fields["run_policy"] = c.RunPolicy
 	}
@@ -605,7 +566,28 @@ func (c *UnifiedConfig) MarshalYAML() (any, error) {
 		fields["data"] = c.Data
 	}
 	if c.Execution != nil {
-		fields["execution"] = c.Execution
+		execution := cloneStringMap(c.Execution)
+		if execution == nil {
+			execution = make(map[string]interface{})
+		}
+		fields["execution"] = execution
+	}
+	if len(c.AccountExecution) > 0 {
+		accounts, _ := fields["accounts"].(map[string]any)
+		if accounts == nil {
+			accounts = make(map[string]any)
+		}
+		for name, override := range c.AccountExecution {
+			account, _ := accounts[name].(map[string]any)
+			if account == nil {
+				account = make(map[string]any)
+			}
+			for key, value := range override {
+				account[key] = value
+			}
+			accounts[name] = account
+		}
+		fields["accounts"] = accounts
 	}
 	return fields, nil
 }
@@ -616,7 +598,7 @@ func validateTimeSeriesPolicies(policies []*RunPolicyConfig) *errs.Error {
 			return errs.NewMsg(core.ErrBadConfig, "nil run_policy[%d]", i)
 		}
 		if engine, ok := policy.More["engine"]; ok && engine == EngineFactor {
-			return errs.NewMsg(core.ErrBadConfig, "run_policy[%d]: factor cannot run through the legacy time_series configuration path; use config_version: 2 and unified runtime assembly", i)
+			return errs.NewMsg(core.ErrBadConfig, "run_policy[%d]: factor requires unified runtime assembly", i)
 		}
 	}
 	return nil

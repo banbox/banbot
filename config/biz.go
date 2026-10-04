@@ -155,80 +155,19 @@ func UpdateLocal(configPaths []string, configData string, noDefault bool) *errs.
 	if err != nil {
 		return errs.New(errs.CodeIOReadFail, err)
 	}
-	candidate, importErr := ImportV1YAML([]byte(content), localCfgPath)
-	if importErr != nil {
-		return errs.New(core.ErrBadConfig, importErr)
-	}
-	if _, err := ParseUnifiedYAML(candidate.YAML, localCfgPath); err != nil {
+	if _, err := ParseUnifiedYAML([]byte(content), localCfgPath); err != nil {
 		return err
 	}
-	return WriteConfigAtomic(localCfgPath, expected, candidate.YAML)
+	return WriteConfigAtomic(localCfgPath, expected, []byte(content))
 }
 
 func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {
-	var res Config
-	var merged = make(map[string]interface{})
-	var llmMerged map[string]interface{}
-	var raws [][]byte
-	hasV2 := false
-	for _, path := range paths {
-		if showLog {
-			log.Info("Using " + path)
-		}
-		rawData, err := os.ReadFile(ParsePath(path))
-		if err != nil {
-			return nil, errs.NewFull(core.ErrIOReadFail, err, "Read %s Fail", path)
-		}
-		_, version, versionErr := configDocument(rawData)
-		if versionErr != nil {
-			return nil, errs.NewFull(core.ErrBadConfig, versionErr, "%s", path)
-		}
-		raws = append(raws, rawData)
-		hasV2 = hasV2 || version == ConfigVersionV2
-		llmSection, err := extractLLMSection(rawData)
-		if err != nil {
-			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Parse LLM config from %s Fail", path)
-		}
-		if llmSection != nil {
-			if llmMerged == nil {
-				llmMerged = make(map[string]interface{})
-			}
-			utils2.DeepCopyMap(llmMerged, llmSection)
-		}
-
-		fileData := []byte(os.ExpandEnv(string(rawData)))
-		var unpak map[string]interface{}
-		err = yaml.Unmarshal(fileData, &unpak)
-		if err != nil {
-			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Unmarshal %s Fail", path)
-		}
-		mergeConfigLayer(merged, unpak)
-	}
-	if hasV2 {
-		unified, err := parseUnifiedLayers(raws, paths)
-		if err != nil {
-			return nil, err
-		}
-		return unified.TimeSeriesConfig()
-	}
-	err := mapstructure.Decode(merged, &res)
+	unified, err := ParseUnifiedConfigs(paths, showLog)
 	if err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode Config Fail")
-	}
-	if llmMerged != nil {
-		if err := applyLLMConfig(llmMerged, &res); err != nil {
-			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode LLM config Fail")
-		}
-	}
-	if err := llm.ResolveModels(res.LLMModels); err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "resolve LLM config Fail")
-	}
-	if err := validateTimeSeriesPolicies(res.RunPolicy); err != nil {
 		return nil, err
 	}
-	return &res, nil
+	return unified.TimeSeriesConfig()
 }
-
 func ParseConfig(path string) (*Config, *errs.Error) {
 	fileData, err := os.ReadFile(ParsePath(path))
 	if err != nil {
@@ -238,46 +177,12 @@ func ParseConfig(path string) (*Config, *errs.Error) {
 }
 
 func ParseYmlConfig(fileData []byte, path string) (*Config, *errs.Error) {
-	_, version, versionErr := configDocument(fileData)
-	if versionErr != nil {
-		return nil, errs.NewFull(core.ErrBadConfig, versionErr, "%s", path)
-	}
-	if version == ConfigVersionV2 {
-		unified, err := ParseUnifiedYAML(fileData, path)
-		if err != nil {
-			return nil, err
-		}
-		return unified.TimeSeriesConfig()
-	}
-	var res Config
-	llmSection, err := extractLLMSection(fileData)
+	unified, err := ParseUnifiedYAML(fileData, path)
 	if err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Parse LLM config from %s Fail", path)
-	}
-	fileData = []byte(os.ExpandEnv(string(fileData)))
-	var unpak map[string]interface{}
-	err = yaml.Unmarshal(fileData, &unpak)
-	if err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Unmarshal %s Fail", path)
-	}
-	err = mapstructure.Decode(unpak, &res)
-	if err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode Config Fail")
-	}
-	if llmSection != nil {
-		if err := applyLLMConfig(llmSection, &res); err != nil {
-			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode LLM config Fail")
-		}
-	}
-	if err := llm.ResolveModels(res.LLMModels); err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "resolve LLM config Fail")
-	}
-	if err := validateTimeSeriesPolicies(res.RunPolicy); err != nil {
 		return nil, err
 	}
-	return &res, nil
+	return unified.TimeSeriesConfig()
 }
-
 func extractLLMSection(rawData []byte) (map[string]interface{}, error) {
 	var unpak map[string]interface{}
 	if err := yaml.Unmarshal(rawData, &unpak); err != nil {

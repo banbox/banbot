@@ -223,7 +223,7 @@ func (l *Live) Warmup(ctx context.Context, r factor.VersionRecord) error {
 	}
 	var input *factor.InputSpec
 	for _, in := range l.engine.plan.Inputs() {
-		if in.Source == r.Series.Source && in.Frequency == r.Series.TimeFrame {
+		if in.Source == r.Series.Source && in.TimeFrame == r.Series.TimeFrame {
 			copy := in
 			input = &copy
 			break
@@ -239,7 +239,7 @@ func (l *Live) Warmup(ctx context.Context, r factor.VersionRecord) error {
 	if l.warmRows == nil {
 		l.warmRows = make(map[factor.StreamKey][]factor.VersionRecord)
 	}
-	key := factor.StreamKey{SID: r.Series.Sid, Source: r.Series.Source, Frequency: r.Series.TimeFrame}
+	key := factor.StreamKey{SID: r.Series.Sid, Source: r.Series.Source, TimeFrame: r.Series.TimeFrame}
 	for _, old := range l.warmRows[key] {
 		if old.EventTime == r.EventTime && old.Revision == r.Revision {
 			return errors.New("runner: duplicate warmup revision requires explicit reconciliation")
@@ -357,7 +357,7 @@ func (l *Live) Observe(ctx context.Context, r factor.VersionRecord) error {
 	l.warmRows = nil
 	u := l.c.Snapshot.Universe
 	executionSID := slices.Contains(u.Tracked, r.Series.Sid) || slices.Contains(u.Investable, r.Series.Sid) && slices.Contains(u.Tradable, r.Series.Sid)
-	if r.Series.Source == l.c.Prices.Source && r.Series.TimeFrame == l.c.Prices.Frequency && executionSID {
+	if r.Series.Source == l.c.Prices.Source && r.Series.TimeFrame == l.c.Prices.TimeFrame && executionSID {
 		n := factor.Number(r.Series.Values, l.c.Prices.Field)
 		if n.Validity == factor.Valid && n.Value > 0 {
 			q := withSpread(backtest.Quote{AtMS: r.EventTime, AvailableAt: max(r.AvailableAt, r.IngestedAt), Price: n.Value}, r.Series.Values)
@@ -371,8 +371,8 @@ func (l *Live) Observe(ctx context.Context, r factor.VersionRecord) error {
 		}
 	}
 	for _, in := range l.engine.plan.Inputs() {
-		if l.HasSID(r.Series.Sid) && r.Series.Source == in.Source && r.Series.TimeFrame == in.Frequency {
-			key := factor.StreamKey{SID: r.Series.Sid, Source: r.Series.Source, Frequency: r.Series.TimeFrame}
+		if l.HasSID(r.Series.Sid) && r.Series.Source == in.Source && r.Series.TimeFrame == in.TimeFrame {
+			key := factor.StreamKey{SID: r.Series.Sid, Source: r.Series.Source, TimeFrame: r.Series.TimeFrame}
 			old, ok := l.rows[key]
 			if !ok || r.EventTime > old.EventTime || r.EventTime == old.EventTime && r.Revision > old.Revision {
 				l.rows[key] = copy
@@ -560,7 +560,7 @@ func (l *Live) prepareRound(decision, cutoff int64) (factor.SnapshotSpec, factor
 	}
 	l.generation = token.Generation
 	for _, need := range needs {
-		if r, ok := l.rows[factor.StreamKey{SID: need.SID, Source: need.Source, Frequency: need.Frequency}]; ok {
+		if r, ok := l.rows[factor.StreamKey{SID: need.SID, Source: need.Source, TimeFrame: need.TimeFrame}]; ok {
 			if err = l.barrier.Observe(token, r, now); err != nil {
 				return spec, token, err
 			}

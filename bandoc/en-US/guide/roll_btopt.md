@@ -1,3 +1,5 @@
+> Engine scope: optimize / bt-opt, parameter definitions and rolling selection on this page target time-series TradeStrat. entry.runExplicitOptimization uses a time-series Snapshot and opt.BacktestFactory, without assembling factor policies into the factor runner. General references to run_policy do not imply factor/mixed hyperparameter search support. Run explicit parameter configurations through [factor research/backtesting](./factor.md), retaining PIT and matured-label rules.
+
 Before you start real-time simulation trading or live trading with your strategy, rolling optimization backtesting is absolutely the last test you should focus on.
 
 Many people may have experienced using hyperparameter optimization to multiply the returns of an initial strategy several times. This looks great, but when faced with such a beautifully presented backtest report, how confident are you that this set of parameters will continue to achieve good returns in the future?

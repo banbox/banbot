@@ -107,9 +107,9 @@ pairs: [BTC/USDT, ETH/USDT, DASH/USDT]
 * Rest Api：实盘交易时可启用rest api，然后通过web ui查看和管理机器人。
 
 ## 关键约定
-**策略任务(StratJob)**   
+**策略任务(StratJob)**\
 
-某个品种+某个策略+某个多空(both/long/short)+任意时间周期，只允许存在一个策略任务。  
+某个品种+某个策略+某个多空(both/long/short)+任意时间周期，只允许存在一个策略任务。\
 
 以一个简单均线策略`ma:demo`为例，可设置支持从`yml`配置传入长短周期参数：
 ```yaml
@@ -139,7 +139,7 @@ run_policy:
 
 第二组提供了`[5m 15m]`两个时间周期，则会计算每个时间周期的K线质量分数，选择符合分数的最小周期。
 
-第三组配置的`BTC/USDT`和第一组中重合了，会被忽略。  
+第三组配置的`BTC/USDT`和第一组中重合了，会被忽略。\
 
 注意：dirt参数忽略时，默认允许多空双开
 
@@ -169,3 +169,8 @@ run_policy:
   * 提交订单入场/离场请求到订单管理器执行
   * 推迟3s执行批量入场/离场（如3s内收到新品种K线，则取消执行再推迟3s）
 
+## 多因子与截面引擎
+
+决策周期不等于单个品种 OnBar：因子轮次使用已闭合且当前可见的多标的数据，区分 reference/investable/tradable。原始输入保留 DataSeries.Values 任意字段及 NULL，不由数值视图替代。
+
+参见[多因子与截面指南](./factor.md)和[因子 API](../api/factor.md)。

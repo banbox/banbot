@@ -1,90 +1,71 @@
+# BanIO 数据通信
 
-banbot 提供了内置的基于tcp的服务器-客户端数据交换接口，名为BanIO；
+BanIO 是 utils/banio.go 中的 TCP 服务器/客户端通信层，支持消息读写、订阅广播、请求结果等待、断线重连、压缩及可选加密。ServerIO 管理连接，ClientIO 嵌入 BanConn；创建资源的 owner 负责停止与等待退出。
 
-源代码：utils/banio.go
+## 消息和序列化
 
-支持：断线自动重连、自动数据压缩、订阅&广播机制
+```go
+type IOMsg struct {
+    Action string
+    Data any
+    NoEncrypt bool
+}
+type IOMsgRaw struct {
+    Action string
+    Data []byte
+    NoEncrypt bool
+}
+```
 
-主要涉及：ServerIO和ClientIO，一个服务器端可被多个客户端连接，每个连接都是BanConn。
+`WriteMsg` 将普通 payload 经 JSON 编码；字符串/字节数据直接使用其内容，之后压缩并按设置加密。外层 IOMsgRaw 使用 gob 封装。接收者拿到解码后的 payload 字节，再按 Action 解析对应 schema。此机制不是任意 Go 对象的深复制协议，JSON map 不自动保留整数宽度、指针或自定义 Go 类型；需要具体类型时由 schema 和解码校验保证。NULL 与缺键不能隐式转换为零。
+
+Spider 的当前消息是 `data.NotifySeries{TFSecs,Interval,Rows []*orm.DataSeries}`，`data.SeriesMsg` 增加 ExgName/Market/Pair。数据通过 Values map 传递自定义列，不再使用旧 Arr []*banexg.Kline。SeriesWatcher 解码 JSON payload，feeder 的内存缓冲与复权/聚合仍需遵守类型和 NULL 语义；不能因为传了完整 DataSeries 就宣称 JSON map 无损往返。
 
 ## BanConn
-`BanConn`实现的接口如下：
-```go
-type IBanConn interface {
-	WriteMsg(msg *IOMsg) *errs.Error
-	Write(data []byte, locked bool) *errs.Error
-	ReadMsg() (*IOMsgRaw, *errs.Error)
-	
-	SetData(val interface{}, tags ...string)
-    GetData(key string) (interface{}, bool)
-	DeleteData(tags ...string)
 
-    SetWait(key string, size int) string
-    GetWaitChan(key string) (chan []byte, bool)
-    CloseWaitChan(key string)
-    SendWaitRes(key string, data interface{}) *errs.Error
-    WaitResult(key string, timeout time.Duration) ([]byte, error)
-	
-	GetRemote() string
-	IsClosed() bool
-	RunForever() *errs.Error
-}
-```
-具体结构体如下：
+| 方法 | 用途 |
+| --- | --- |
+| `WriteMsg(*IOMsg)` / `Write(*IOMsgRaw)` | 编码/发送消息 |
+| `ReadMsg()` | 接收 IOMsgRaw |
+| `SetData/GetData/PopData/DeleteData` | 连接本地标签/订阅状态 |
+| `SetAesKey/GetAesKey` | 加密配置 |
+| `SetWait/GetWaitChan/CloseWaitChan` | 请求等待通道 |
+| `SendWaitRes` | 发送请求结果 |
+| `WaitResult(ctx,key,timeout)` | 可取消的等待，返回 `([]byte,*errs.Error)` |
+| `GetRemote/GetRemoteHost/IsClosed` | 连接信息 |
+| `RunForever` | 消息循环 |
+| `SetContext/Stop/Join/Close` | 具体 BanConn 生命周期 |
+
+`Listens map[string]ConnCB` 保存消息回调，DoConnect/ReInitConn 处理重连。共享标签与连接列表应通过方法访问，不直接并发修改 map。Stop 封闭输入并取消循环，owner 在回调外 Join 等待生产者和已接纳 handler；不要让 handler 等待自己退出。
+
+客户端改变服务器订阅标签：
+
 ```go
-type BanConn struct {
-	Conn        net.Conn               // 原始的socket连接
-	Data        map[string]interface{} // 消息订阅列表
-	Remote      string                 // 远端名称
-	Listens     map[string]ConnCB      // 消息处理函数
-	RefreshMS   int64                  // 连接就绪的时间戳
-	Ready       bool
-	IsReading   bool
-	DoConnect   func(conn *BanConn) // Reconnect function, no attempt to reconnect provided 重新连接函数，未提供不尝试重新连接
-	ReInitConn  func()              // Initialize callback function after successful reconnection 重新连接成功后初始化回调函数
-}
+err := conn.WriteMsg(&utils.IOMsg{Action: "subscribe", Data: []string{"key1"}})
+if err != nil { return err }
+err = conn.WriteMsg(&utils.IOMsg{Action: "unsubscribe", Data: []string{"key1"}})
 ```
 
-* `WriteMsg/Write/ReadMsg`用于发送/读取消息到远程目标，用于客户端和服务器消息通信
-* `SetData/GetData/DeleteData`用于本地标记此连接的相关信息
-* `SetWait/GetWaitChan`等5个方法，用于设置key等待结果写入；用于提交任务到远程后，等待远程返回数据场景
-* `RunForever`是持续运行连接，读取解析数据。
-* 如果需要修改当前连接在远程端的`Data`，可使用如下方式：
-```go
-conn.WriteMsg(&IOMsg{Action: "subscribe", Data: []string{"key1"})
-conn.WriteMsg(&IOMsg{Action: "unsubscribe", Data: []string{"key1"})
-```
+该片段嵌入已有 `conn utils.IBanConn`、返回 `*errs.Error` 的函数。服务端 Broadcast 对已订阅 msg.Action 的连接推送。
 
 ## ClientIO
-客户端`ClientIO`继承自`BanConn`，额外实现的方法有：
-```go
-func (c *ClientIO) GetVal(key string, timeout int) (string, *errs.Error)
-func (c *ClientIO) SetVal(args *KeyValExpire) *errs.Error
-```
-`GetVal/SetVal`用于从服务器端设置或读取数据(触发服务器的SetVal/GetVal)
 
+```go
+NewClientIOWithContext(ctx context.Context, addr, aesKey string) (*ClientIO, *errs.Error)
+NewClientIOWithState(state *core.State, addr, aesKey string, contexts ...context.Context) (*ClientIO, *errs.Error)
+```
+
+显式任务使用所属 context/state；包级 NewClientIO 是兼容入口。GetVal(key,timeout) 和 SetVal(*KeyValExpire) 访问服务器键值缓存，不是 SeriesStore，也不提供时序/PIT 查询。
 
 ## ServerIO
-服务器端`ServerIO`的相关定义如下：
-```go
-func NewBanServer(addr, name string) *ServerIO
-type ServerIO struct {
-	Addr     string
-	Name     string
-	Conns    []IBanConn
-	Data     map[string]string // Cache data available for remote access 缓存的数据，可供远程端访问
-	DataExp  map[string]int64  // Cache data expiration timestamp, 13 bits 缓存数据的过期时间戳，13位
-	InitConn func(*BanConn)
-}
-func (s *ServerIO) RunForever() *errs.Error
-func (s *ServerIO) SetVal(args *KeyValExpire)
-func (s *ServerIO) GetVal(key string) string
-func (s *ServerIO) Broadcast(msg *IOMsg) *errs.Error
-func (s *ServerIO) WrapConn(conn net.Conn) *BanConn
-```
-`Broadcast`遍历所有连接，对所有`GetData(msg.Action)`有数据的连接，视为已订阅，发送数据
-实现自定义Server时，一般需要传入`InitConn`，处理客户端发送的额外Action
 
-## 场景说明
-* 客户端一次性订阅服务器数据，服务器周期性推送；客户端可在建立连接后`WriteMsg`，发送subscribe；服务器定期调用Broadcast推送到多个客户端即可
-* 服务器发送任务到某个客户端执行，等待执行结果：服务器调用`SetWait`设置RequestID，然后`WriteMsg`发送任务信息(带RequestID)，然后可`WaitResult`获取结果。客户端完成任务后调用`SendWaitRes`发送RequestID对应结果，服务器`WaitResult`被触发收到任务结果。
+```go
+NewServerIO(addr, aesKey string) *ServerIO
+NewBanServer(addr, aesKey string) *ServerIO
+```
+
+第二个参数是 AES key，不是旧文档中的 name。`RunForever(intvSecs,timeoutSecs)` 开始服务；`ListenAddr` 返回实际地址。`AddConnection/RemoveConnection/ConnectionsSnapshot` 管理连接快照，`WrapConn` 包装 socket，`InitConn` 设置 Action 回调。`SetVal/GetVal` 管理可过期键值；`Broadcast` 发送订阅消息。停止服务调用 Stop，再由 owner Join 等待退出。
+
+## 请求结果等待
+
+调用方 SetWait 分配 request key，发送含该 key 的业务消息，再用 `WaitResult(ctx,key,timeout)` 等待。对端通过 SendWaitRes 回传；取消、超时和连接关闭必须处理错误并清理等待状态。BanIO 只提供通信机制，稳定业务 ID、幂等和策略执行证据属于上层执行领域。

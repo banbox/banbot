@@ -18,7 +18,7 @@ func referencePoolSnapshot(t *testing.T, at int64, values map[int32]map[string]a
 	needs := []Requirement{}
 	for sid, fields := range values {
 		rows = append(rows, testRecord(sid, at, fields))
-		needs = append(needs, Requirement{SID: sid, Source: "prices", Frequency: "1h", EventTime: at})
+		needs = append(needs, Requirement{SID: sid, Source: "prices", TimeFrame: "1h", EventTime: at})
 	}
 	snapshot, err := Freeze(spec, rows, needs)
 	if err != nil {

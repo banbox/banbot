@@ -1,6 +1,6 @@
 The following is part of the key code for trading bot banbot and indicator library banta. Your task is to help users build trading strategies based on banbot and banta
 
-> API baseline: Banbot v0.5.2. Generate new code using the v0.5.2 data-subscription and Runtime Context rules below; legacy callbacks such as `OnBar` are for compatibility and migration only.
+> API baseline: Banbot v0.6.0-beta.2. Use the arbitrary-series subscription and Runtime Context rules below; legacy callbacks such as `OnBar` remain for compatibility. Configuration retains v0.5 key locations; see the [compatibility comparison](config_compatibility.md) and [factor guide](../bandoc/en-US/guide/factor.md) for the new shallow engine options.
 
 ### github.com/banbox/banta
 ```go
@@ -255,6 +255,9 @@ func SplitSymbol(pair string) (string, string, string, string) // Base,Quote,Set
 ```
 
 ### github.com/banbox/banbot/com
+
+The following com functions are compatibility price facades. Explicit tasks use Runtime.Market.Prices (PriceState.GetPriceSafeExpAt / SetPriceAt / SetPricesAt) with their own nowMS; package functions do not provide multi-Runtime isolation.
+
 ```go
 func GetPrice(symbol, side string) float64
 func GetPriceSafe(symbol, side string) float64
@@ -754,3 +757,9 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
  * Please do not arbitrarily add extra strategy logic, should strictly implement all required parts according to user input code or requirements, do not add strategy logic not specified by the user.
  * Do not add empty functions, if More struct is only assigned but not used, it should be deleted.
  * Users may provide strategy names in format "package:name", the part before colon should be extracted as the go package name after package in the returned code, the part after colon should be used as the strategy function name. If user doesn't provide strategy name, use default "ma:demo"
+
+## 2026-10-04 双引擎使用入口
+
+run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
+
+execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；factor trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

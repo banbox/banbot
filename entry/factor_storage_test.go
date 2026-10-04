@@ -96,7 +96,7 @@ func TestStorageConfigPreflightRequiresExplicitApproximationBeforeSession(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if configs[0].Prices.Frequency != "1m" || !configs[0].Execution.MarginRate.IsPositive() {
+	if configs[0].Prices.TimeFrame != "1m" || !configs[0].Execution.MarginRate.IsPositive() {
 		t.Fatal("observable execution defaults missing")
 	}
 }

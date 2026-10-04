@@ -26,6 +26,35 @@ type generationSeriesSink struct {
 	revision func(*orm.Subscription, *orm.DataSeries) (LiveSeriesRevision, error)
 }
 
+func TestSubscriptionStartupClonesSeriesOwnership(t *testing.T) {
+	value := int64(9007199254740993)
+	bytes := []byte{1, 2}
+	nested := map[string][]int64{"a": {value}}
+	symbol := &orm.ExSymbol{ID: 7}
+	row := &orm.DataSeries{Source: "custom", Sid: 7, TimeMS: 10, EndMS: 20, TimeFrame: "event", Closed: true, IsWarmUp: true,
+		ExSymbol: symbol, Adj: &orm.AdjInfo{ExSymbol: symbol, Factor: 2},
+		Values: map[string]any{"integer": value, "pointer": &value, "bytes": bytes, "nested": nested, "null": nil, "nilmap": map[string]int(nil), "nilptr": (*int64)(nil)}}
+	rows := cloneStartupSeries([]*orm.DataSeries{row, nil, {Values: nil}, {Values: map[string]any{}}})
+	want := *row
+	if rows[0] == row || rows[0].Adj == row.Adj || rows[0].ExSymbol != symbol || !reflect.DeepEqual(*rows[0], want) {
+		t.Fatal("series metadata or ownership lost")
+	}
+	if rows[1] != nil || rows[2].Values != nil || rows[3].Values == nil || cloneStartupSeries(nil) != nil {
+		t.Fatal("nil/empty rows or maps changed")
+	}
+	value, bytes[0], nested["a"][0], row.Adj.Factor = 3, 9, 4, 5
+	got := rows[0].Values
+	if *got["pointer"].(*int64) != 9007199254740993 || got["bytes"].([]byte)[0] != 1 || got["nested"].(map[string][]int64)["a"][0] != 9007199254740993 || rows[0].Adj.Factor != 2 {
+		t.Fatal("queued series aliases mutable input")
+	}
+	if null, ok := got["null"]; !ok || null != nil || got["nilmap"].(map[string]int) != nil || got["nilptr"].(*int64) != nil {
+		t.Fatal("NULL or typed nil changed")
+	}
+	if _, ok := got["missing"]; ok {
+		t.Fatal("missing field introduced")
+	}
+}
+
 func (s *generationSeriesSink) SeriesRevision(sub *orm.Subscription, row *orm.DataSeries) (LiveSeriesRevision, error) {
 	if s.revision != nil {
 		return s.revision(sub, row)

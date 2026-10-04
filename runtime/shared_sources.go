@@ -81,9 +81,9 @@ func (r *Runtime) factorLiveRequests(engine *runner.Live, cfg runner.Config) ([]
 	for _, input := range engine.Inputs() {
 		inputs = append(inputs, scopedInput{input, engine.DataSIDs(), "factor:" + cfg.StrategyID})
 	}
-	inputs = append(inputs, scopedInput{factor.InputSpec{Source: cfg.Prices.Source, Frequency: cfg.Prices.Frequency, Fields: []string{cfg.Prices.Field}}, engine.ExecutionSIDs(), "execution-price:" + cfg.StrategyID})
+	inputs = append(inputs, scopedInput{factor.InputSpec{Source: cfg.Prices.Source, TimeFrame: cfg.Prices.TimeFrame, Fields: []string{cfg.Prices.Field}}, engine.ExecutionSIDs(), "execution-price:" + cfg.StrategyID})
 	if cfg.Manifest.Costs.FundingPolicy == "required-stream" {
-		inputs = append(inputs, scopedInput{factor.InputSpec{Source: cfg.FundingSource, Frequency: "event", Fields: []string{"rate", "mark", "account_amount", "settlement_id"}}, engine.FundingSIDs(), "execution-funding:" + cfg.StrategyID})
+		inputs = append(inputs, scopedInput{factor.InputSpec{Source: cfg.FundingSource, TimeFrame: "event", Fields: []string{"rate", "mark", "account_amount", "settlement_id"}}, engine.FundingSIDs(), "execution-funding:" + cfg.StrategyID})
 	}
 	var requests []data.SubscriptionRequest
 	for _, scope := range inputs {
@@ -93,8 +93,8 @@ func (r *Runtime) factorLiveRequests(engine *runner.Live, cfg runner.Config) ([]
 			if source == nil || source.Info() == nil {
 				return nil, fmt.Errorf("runtime: factor live source %s is not registered", input.Source)
 			}
-			if source.Info().TimeFrame != input.Frequency {
-				return nil, fmt.Errorf("runtime: factor live source frequency mismatch: %s", input.Source)
+			if source.Info().TimeFrame != input.TimeFrame {
+				return nil, fmt.Errorf("runtime: factor live source timeframe mismatch: %s", input.Source)
 			}
 		}
 		for _, sid := range scope.sids {
@@ -103,7 +103,7 @@ func (r *Runtime) factorLiveRequests(engine *runner.Live, cfg runner.Config) ([]
 			if symbol == nil || !accountFunding && cfg.Snapshot.SIDMap[sid] != symbol.Symbol {
 				return nil, fmt.Errorf("runtime: factor live SID %d identity mismatch", sid)
 			}
-			requests = append(requests, data.SubscriptionRequest{Subscription: data.Subscription{Source: input.Source, TimeFrame: input.Frequency, ExSymbol: symbol, WarmupNum: input.WarmupLength, Fields: input.Fields}, Consumer: scope.consumer, Required: true, MaxAgeMS: input.MaxAge})
+			requests = append(requests, data.SubscriptionRequest{Subscription: data.Subscription{Source: input.Source, TimeFrame: input.TimeFrame, ExSymbol: symbol, WarmupNum: input.WarmupLength, Fields: input.Fields}, Consumer: scope.consumer, Required: true, MaxAgeMS: input.MaxAge})
 		}
 	}
 	for _, legacy := range r.FactorLegacySubscriptions() {
@@ -204,7 +204,7 @@ func (s *factorsLiveSourceSink) WarmupSeries(sub *strat.DataSub, rows []*orm.Dat
 			continue
 		}
 		for _, input := range consumer.engine.Inputs() {
-			if input.Source != sub.Source || input.Frequency != sub.TimeFrame || input.WarmupLength == 0 {
+			if input.Source != sub.Source || input.TimeFrame != sub.TimeFrame || input.WarmupLength == 0 {
 				continue
 			}
 			start := max(0, len(rows)-input.WarmupLength)

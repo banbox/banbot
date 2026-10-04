@@ -218,9 +218,9 @@ func (s *FactorLiveSubscription) generation(plan *data.SubscriptionPlan, engines
 	for i, engine := range engines {
 		streams := map[string]bool{}
 		for _, input := range engine.Inputs() {
-			streams[input.Source+"/"+input.Frequency] = true
+			streams[input.Source+"/"+input.TimeFrame] = true
 		}
-		streams[cfgs[i].Prices.Source+"/"+cfgs[i].Prices.Frequency] = true
+		streams[cfgs[i].Prices.Source+"/"+cfgs[i].Prices.TimeFrame] = true
 		if cfgs[i].Manifest.Costs.FundingPolicy == "required-stream" {
 			streams[cfgs[i].FundingSource+"/event"] = true
 		}

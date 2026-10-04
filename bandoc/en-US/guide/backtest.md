@@ -87,3 +87,33 @@ Hyper-Optimization can automatically find the optimal combination of strategy pa
 ### Rolling Backtesting
 
 Rolling Backtesting is a more rigorous backtesting method that divides the data into multiple time windows, performing "training" (parameter optimization) and "testing" in each window to simulate the strategy's adaptability in different market environments. For details, please refer to the [Rolling Backtesting](./roll_btopt.md) documentation.
+
+## Factor and cross-sectional engine
+
+Ordinary bot backtest dispatches by engine. bot factor research emits matured labels/diagnostics; factor backtest --mode weights|events is the dedicated replay entry. Weights is an approximate quantity book; mixed replay requires events, observable tick/event or 1m prices, instrument units and risk limits. Latest-value storage requires explicit data.pit_policy: static-approximation; strict PIT needs version archives/attested providers.
+
+Factor JSON lines contain panels/decisions/diagnostics/summaries. Ordinary replay adds resolved.json and account-&lt;account&gt;/manifest.json plus event/posting Gob. Legacy orders.gob alone is not the factor report. Result.Unresolved retains labels beyond available history. Completion follows output closure and resource cleanup.
+
+See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
+
+## Strict replay and historical coverage
+
+`bt_strict: true` canonicalizes key execution order. It does not freeze database contents or imply a fixed overhead percentage. A backtest also needs `bt_no_kline_download: true` and valid `historical_coverage` to enable strict historical replay with a coverage contract. Prepare missing data before replay instead of relying on implicit downloads.
+
+`historical_coverage` records `baseline_end_ms`, optional `historical_result_end_ms`, and symbol/timeframe maps named `bars`, `physical_bars` and `listing_prefixes`. Ranges are `[start_ms, stop_ms)`. Baseline must follow the run start and be no later than its end; result end must be between baseline and run end. Rows physically present today are not automatically authorized coverage at a historical cutoff.
+
+Strict reads validate the current task’s fields, ranges and coverage contract; this is not a database-wide read-only switch. Preparation, source bootstrap and replay are separate phases. Refreshing symbols/subscriptions prepares requirements and initializes loaders again; it must not bypass coverage authorization through implicit backfill. Factor providers also need archive-version and visibility/PIT evidence; K-line switches do not establish that evidence.
+
+### Inspecting a data plan
+
+The internal command `bot internal inspect-data-plan --request request.json --output output.json` lets integration tools inspect a compiled strategy’s data requirements. The request must follow `runtimeplan.RequestV1`, including configuration, market snapshot/Universe, initial symbols, time range and compilation/source/configuration hashes. It does not accept ordinary config.yml as a download or backtest request. Use a complete generated request instead of placeholder hashes. The output file must already exist and is truncated before writing. Unsupported requirements can produce diagnostics and an error exit. Inspect uses local state without installing globals. Passing inspection proves plan inspection, not database coverage or venue readiness.
+
+### Metric sample units
+
+Check units before comparing reports. `opt.BTResult.WinRatePct` is a percentage; live `winRate` is a 0–1 fraction. `CalcExpectancy` counts nonnegative samples as wins. Expectancy is win rate × average win minus loss rate × average absolute loss, equal to the arithmetic mean of the input samples. Its ratio is `(1 + avgWin/avgLoss) × winRate - 1`, returning 0 when there are no losses.
+
+The live dashboard supplies daily `dayProfits`, so its expectancy is per daily sample, not per trade. `opt.BTResult` currently exports no expectancy field; live dashboard fields are not mandatory outputs of every backtest report. Factor weights, events and research IC/labels also have different units; see the [factor guide](./factor.md).
+
+### Backtest Runtime
+
+Ordinary entry points create a Runtime, clock, strategy jobs and account execution state for each task; Snapshot configuration is read-only. Development WebUI creates tasks through factories rather than switching package-level config/core/btime state between concurrent backtests. Embedded owners must request `Close` before `Join`; see [Runtime API](../api/runtime.md).

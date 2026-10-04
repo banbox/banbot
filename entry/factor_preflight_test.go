@@ -1,6 +1,7 @@
 package entry
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/factor/runner"
 	"github.com/shopspring/decimal"
@@ -21,7 +23,7 @@ func TestBacktestPreflightRejectsInvalidImportedReplayBeforeResources(t *testing
 		{"pending", "bounded", func(c *runner.Config) { c.MaxPending = 0 }},
 		{"latency", "bounded", func(c *runner.Config) { c.LatencyMS = 0 }},
 		{"labels", "label", func(c *runner.Config) { c.Manifest.Labels[0].Horizon = 0 }},
-		{"price", "observable", func(c *runner.Config) { c.Prices.Frequency = "1h" }},
+		{"price", "observable", func(c *runner.Config) { c.Prices.TimeFrame = "1h" }},
 		{"funding", "funding stream", func(c *runner.Config) { c.Manifest.Costs.FundingPolicy = "required-stream"; c.FundingSource = "" }},
 		{"builder", "unregistered portfolio", func(c *runner.Config) { c.Manifest.Portfolio.Builder = "missing-entry-builder" }},
 		{"risk", "risk limits", func(c *runner.Config) { c.Execution.MarginRate = decimal.Zero }},
@@ -66,7 +68,11 @@ func TestBacktestPreflightRejectsInvalidImportedReplayBeforeResources(t *testing
 				t.Fatalf("invalid imported replay passed preflight: %v expected=%s", err, test.reason)
 			}
 			out := filepath.Join(dir, "rejected-output")
-			if err := RunBackTest(&config.CmdArgs{Configs: config.ArrString{legacy + ".v2.yml"}, NoDefault: true, OutPath: out}); err == nil || !strings.Contains(err.Error(), test.reason) {
+			preflightErr := ValidateBacktestRunSpec(spec)
+			if err := unifiedFactorBacktestContext(context.Background(), &config.CmdArgs{OutPath: out}, spec); err == nil || err.Code != core.ErrBadConfig || !strings.Contains(err.Error(), preflightErr.Error()) {
+				t.Fatalf("execution and preflight differ: %v; preflight=%v", err, preflightErr)
+			}
+			if err := RunBackTest(&config.CmdArgs{Configs: config.ArrString{legacy + ".yml"}, NoDefault: true, OutPath: out}); err == nil || !strings.Contains(err.Error(), test.reason) {
 				t.Fatalf("CLI bypassed shared preflight: %v expected=%s", err, test.reason)
 			}
 			for _, resource := range []string{"rejected.db", "rejected-leases", "rejected-output"} {
@@ -75,6 +81,14 @@ func TestBacktestPreflightRejectsInvalidImportedReplayBeforeResources(t *testing
 				}
 			}
 		})
+	}
+}
+
+func TestUnifiedBacktestCancellationPrecedesInvalidConfig(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := unifiedFactorBacktestContext(ctx, &config.CmdArgs{}, nil); err == nil || err.Code != core.ErrRunTime || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("cancellation not returned first: %v", err)
 	}
 }
 

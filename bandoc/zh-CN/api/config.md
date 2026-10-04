@@ -4,7 +4,7 @@ config 包提供了系统配置相关的结构体和方法。
 
 ## 运行时配置
 
-常规入口会先解析配置，再创建一份属于任务的 `config.Snapshot`。Snapshot 深拷贝配置并保存显式的数据/策略目录；Runtime 将其视为只读配置，因此不同任务的命令行覆盖和账户配置不会彼此改写。新入口应使用 `LoadRuntimeSnapshot` 与 Runtime 构造流程。
+常规入口会先解析配置，再创建一份属于任务的 `config.Snapshot`。Snapshot 深拷贝配置并保存显式的数据/策略目录；Runtime 将其视为只读配置，因此不同任务的命令行覆盖和账户配置不会彼此改写。普通入口先使用 LoadRunSpec 解析唯一 policy 列表和字段来源，再由 RunSpec.RuntimeSnapshot 取得运行配置；单独 LoadRuntimeSnapshot 保留时序配置装配，不替代完整 TS/CS 路由。
 
 ## 重要结构体
 
@@ -185,13 +185,10 @@ API服务器配置,包含以下字段:
 - `string` - 策略目录的绝对路径。如果环境变量 `BanStratDir` 未设置,返回空字符串。
 
 ### LoadConfig
-加载并应用配置。
 
-参数：
-- `args`: *CmdArgs - 命令行参数对象
+兼容方法：加载后应用包级配置，不能用于新多任务运行器的状态隔离。普通入口使用 LoadRunSpec / RunSpec.RuntimeSnapshot；Snapshot.View 只读，Snapshot.Clone 取得独立容器副本，执行账户另行复制并使用同一锁。
 
-返回：
-- `*errs.Error` - 错误信息,如果成功则返回 nil
+参数 args *CmdArgs；返回 *errs.Error。
 
 ### GetConfig
 根据命令行参数获取配置。
@@ -225,12 +222,6 @@ API服务器配置,包含以下字段:
 
 返回：
 - `*errs.Error` - 错误信息
-
-### GetExgConfig
-获取当前交易所配置。
-
-返回：
-- `*ExgItemConfig` - 交易所配置对象
 
 ### GetTakeOverTF
 获取指定交易对的接管时间周期。
@@ -302,3 +293,16 @@ API服务器配置,包含以下字段:
 返回：
 - `*ExportConfig` - 导出配置对象
 - `*errs.Error` - 错误信息
+
+## 因子引擎集成
+
+RunSpec 保存唯一 policy 列表和字段来源；Snapshot 只读，执行账户另复制；capital_weight 不等于 stake_rate。
+
+[因子 API](factor.md) / [指南](../guide/factor.md)
+
+
+## 配置读取归属
+
+GetExgConfig 已不是当前导出 API；显式会话使用 Snapshot.View().Exchange。RPCChannels 是 Config 的配置映射（同时有旧 facade 变量），不是构造 Runtime 的方法；通知运行时由 rpc.Session 使用其 Snapshot 和账户配置。RunSpec.Config/Origins 返回所有权副本，Snapshot.View 按约定只读。
+
+统一入口 LoadRunSpec/LoadUnifiedConfigs 只读 YAML，不自动升级、备份或写回，config_version 不必填写；已有 1/2 标记仍接受。省略 engine 保留旧时序 More 参数语义，显式 engine 才启用新增身份、账户与预算字段。因子字段直接位于 run_policy[]；账户执行覆盖位于根 accounts.&lt;name&gt;，公共 execution 默认值仍保留。旧嵌套输入可解析，规范输出只使用浅层布局。

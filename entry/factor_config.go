@@ -61,14 +61,17 @@ func importFactorJSON(path string) (string, error) {
 	if name == "" && legacy.Expressions != nil {
 		name = "expressions"
 	}
-	policy := map[string]any{"name": name, "engine": config.EngineFactor, "factor": map[string]any{"config": fields}}
+	// Keep the complete runner JSON in the importer config block. The policy is
+	// flat at the YAML boundary (config is a direct policy key), while the
+	// config package still validates and normalizes this controlled payload.
+	policy := map[string]any{"name": name, "engine": config.EngineFactor, "config": fields}
 	if legacy.StrategyID != "" {
 		policy["id"] = legacy.StrategyID
 	}
 	if legacy.AccountID != "" {
 		policy["account"] = legacy.AccountID
 	}
-	canonical := map[string]any{"config_version": 2, "run_policy": []any{policy}}
+	canonical := map[string]any{"run_policy": []any{policy}}
 	if legacy.AccountID != "" {
 		canonical["accounts"] = map[string]any{legacy.AccountID: map[string]any{}}
 	}
@@ -79,7 +82,7 @@ func importFactorJSON(path string) (string, error) {
 	if _, err := config.ParseUnifiedYAML(converted, path); err != nil {
 		return "", err
 	}
-	target := path + ".v2.yml"
+	target := path + ".yml"
 	if existing, err := os.ReadFile(target); err == nil {
 		if !bytes.Equal(existing, converted) {
 			return "", fmt.Errorf("factor JSON import conflicts with %s", target)
@@ -185,7 +188,7 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 		if nav := u.Root.WalletAmounts[c.Manifest.Currency]; nav > 0 {
 			c.InitialNAV = nav
 		}
-		frequency := "1h"
+		timeframe := "1h"
 		frames := policy.RunTimeframes
 		if len(frames) == 0 {
 			frames = u.Root.RunTimeframes
@@ -194,14 +197,14 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 			return nil, fmt.Errorf("factor %s: one decision timeframe is required", policy.Name)
 		}
 		if len(frames) == 1 {
-			frequency = frames[0]
+			timeframe = frames[0]
 		}
-		seconds, err := utils.TFToSecSafe(frequency)
+		seconds, err := utils.TFToSecSafe(timeframe)
 		if err != nil || seconds <= 0 {
 			return nil, fmt.Errorf("factor %s: invalid decision timeframe", policy.Name)
 		}
-		c.DecisionInterval, c.Factor.Frequency = int64(seconds)*1000, frequency
-		c.Manifest.Labels = []research.LabelSpec{{Name: frequency, Kind: research.ExecutableReturn, Horizon: c.DecisionInterval, PeriodsPerYear: 365.25 * 86400000 / float64(c.DecisionInterval)}}
+		c.DecisionInterval, c.Factor.TimeFrame = int64(seconds)*1000, timeframe
+		c.Manifest.Labels = []research.LabelSpec{{Name: timeframe, Kind: research.ExecutableReturn, Horizon: c.DecisionInterval, PeriodsPerYear: 365.25 * 86400000 / float64(c.DecisionInterval)}}
 		c.StrategyID, c.AccountID = policy.ID, policyAccount(u, policy)
 		if c.StrategyID == "" {
 			c.StrategyID = policy.Name
@@ -293,11 +296,11 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 			if !explicitDefinition {
 				c.Definition = ""
 			}
-			if c.Expressions.Frequency == "" {
-				c.Expressions.Frequency = frequency
+			if c.Expressions.TimeFrame == "" {
+				c.Expressions.TimeFrame = timeframe
 			}
-			if c.Expressions.Frequency != frequency {
-				return nil, fmt.Errorf("run_policy[%d].factor.expressions.frequency must match run_timeframes", index)
+			if c.Expressions.TimeFrame != timeframe {
+				return nil, fmt.Errorf("run_policy[%d].factor.expressions.timeframe must match run_timeframes", index)
 			}
 			if _, _, err := runner.CompileDefinition(c); err != nil {
 				return nil, fmt.Errorf("run_policy[%d].factor: %w", index, err)
@@ -325,12 +328,12 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 			c.InitialNAV *= policyCapitalWeight(u, policy, c.AccountID)
 		}
 		for chunkIndex := range c.Chunks {
-			field := fmt.Sprintf("run_policy[%d].factor.chunks[%d].path", index, chunkIndex)
+			field := fmt.Sprintf("run_policy[%d].chunks[%d].path", index, chunkIndex)
 			if _, ok := policy.Factor["config"]; ok {
-				field = fmt.Sprintf("run_policy[%d].factor.config.Chunks[%d].Path", index, chunkIndex)
+				field = fmt.Sprintf("run_policy[%d].config.Chunks[%d].Path", index, chunkIndex)
 			}
 			if _, ok := policy.Factor["archive"]; ok {
-				field = fmt.Sprintf("run_policy[%d].factor.archive", index)
+				field = fmt.Sprintf("run_policy[%d].archive", index)
 			}
 			if !filepath.IsAbs(c.Chunks[chunkIndex].Path) {
 				path, err := spec.ResolvePath(field)
@@ -350,7 +353,7 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 		if _, imported := policy.Factor["config"]; imported {
 			for field, path := range map[string]*string{"StorePath": &c.Execution.StorePath, "SenderLeaseDir": &c.Execution.SenderLeaseDir, "HistoryPath": &c.Execution.HistoryPath} {
 				if *path != "" && !filepath.IsAbs(*path) {
-					resolved, err := spec.ResolvePath(fmt.Sprintf("run_policy[%d].factor.config.Execution.%s", index, field))
+					resolved, err := spec.ResolvePath(fmt.Sprintf("run_policy[%d].config.Execution.%s", index, field))
 					if err != nil {
 						return nil, err
 					}
@@ -362,8 +365,7 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 		for key, value := range u.Execution {
 			executionFields[key] = value
 		}
-		accountFields, _ := u.Execution["accounts"].(map[string]any)
-		accountOverrides, _ := accountFields[c.AccountID].(map[string]any)
+		accountOverrides := u.AccountExecution[c.AccountID]
 		for key, value := range accountOverrides {
 			executionFields[key] = value
 		}
@@ -387,7 +389,7 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 			}
 			field := "execution." + key
 			if _, overridden := accountOverrides[key]; overridden {
-				field = "execution.accounts." + c.AccountID + "." + key
+				field = "accounts." + c.AccountID + "." + key
 			}
 			path, err := spec.ResolvePath(field)
 			if err != nil {
@@ -530,14 +532,14 @@ func deriveArchiveIdentity(c *runner.Config) error {
 func deriveArchivePrice(c *runner.Config) error {
 	if c.Prices.Source == "" {
 		if _, ok := c.Snapshot.Schemas["tick"]; ok {
-			c.Prices = runner.PriceStream{Source: "tick", Frequency: "event", Field: "price"}
+			c.Prices = runner.PriceStream{Source: "tick", TimeFrame: "event", Field: "price"}
 		} else if c.Expressions != nil {
 			if _, ok := c.Snapshot.Schemas["kline"]; !ok {
 				return errors.New("factor: expressions require explicit prices when archive has no tick/kline price stream")
 			}
-			c.Prices = runner.PriceStream{Source: "kline", Frequency: c.Expressions.Frequency, Field: "close"}
+			c.Prices = runner.PriceStream{Source: "kline", TimeFrame: c.Expressions.TimeFrame, Field: "close"}
 		} else {
-			c.Prices = runner.PriceStream{Source: c.Factor.Source, Frequency: c.Factor.Frequency, Field: c.Factor.Field}
+			c.Prices = runner.PriceStream{Source: c.Factor.Source, TimeFrame: c.Factor.TimeFrame, Field: c.Factor.Field}
 		}
 	}
 	if c.Manifest.Costs.FundingPolicy == "" {
@@ -577,7 +579,7 @@ func inspectArchiveChunk(c *runner.Config, index int, sids map[int32]bool, schem
 		to = max(to, row.EventTime)
 		if sids != nil {
 			for _, input := range inputs {
-				if input.Source == row.Series.Source && input.Frequency == row.Series.TimeFrame {
+				if input.Source == row.Series.Source && input.TimeFrame == row.Series.TimeFrame {
 					sids[row.Series.Sid] = true
 					break
 				}

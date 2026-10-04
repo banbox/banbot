@@ -13,7 +13,7 @@ import (
 )
 
 func specFor(source string) Spec {
-	return Spec{SchemaVersion: 1, Frequency: "1h", Bindings: map[string]Binding{"kline": {Source: "prices", Frequency: "1h"}}, Outputs: map[string]string{"score": source}}
+	return Spec{SchemaVersion: 1, TimeFrame: "1h", Bindings: map[string]Binding{"kline": {Source: "prices", TimeFrame: "1h"}}, Outputs: map[string]string{"score": source}}
 }
 func mustCompile(t testing.TB, spec Spec) *factor.Plan {
 	t.Helper()
@@ -34,7 +34,7 @@ func snapshot(t testing.TB, event int64, values map[int32]map[string]any) *facto
 		sids = append(sids, sid)
 		sidMap[sid] = string(rune('A' + sid))
 		rows = append(rows, factor.Record(orm.DataSeries{Source: "prices", Sid: sid, TimeMS: event - 1, EndMS: event, Closed: true, TimeFrame: "1h", Values: fields}, 1, event, event, "prices-v1"))
-		requirements = append(requirements, factor.Requirement{SID: sid, Source: "prices", Frequency: "1h", EventTime: event})
+		requirements = append(requirements, factor.Requirement{SID: sid, Source: "prices", TimeFrame: "1h", EventTime: event})
 	}
 	s, err := factor.Freeze(factor.SnapshotSpec{DecisionTime: event, ReplayTime: event, Universe: factor.Universe{Version: "u1", Investable: sids, Reference: sids, Tradable: sids, Evaluation: sids, Static: true}, SIDMap: sidMap, Schemas: map[string]string{"prices": "s1"}, SourceVersions: map[string]string{"prices": "prices-v1"}, VisibilityPolicy: "published-and-received"}, rows, requirements)
 	if err != nil {
@@ -83,7 +83,7 @@ func TestForwardReferencesGoHashAndCSE(t *testing.T) {
 	if !reflect.DeepEqual(dsl.Inputs()[0].Fields, []string{"close"}) {
 		t.Fatal("unused let leaked into subscriptions")
 	}
-	shared := mustCompile(t, Spec{SchemaVersion: 1, Frequency: "1h", Bindings: spec.Bindings, Outputs: map[string]string{"a": "ts.return(kline.close,3)", "b": "ts.return(kline.close,3)"}})
+	shared := mustCompile(t, Spec{SchemaVersion: 1, TimeFrame: "1h", Bindings: spec.Bindings, Outputs: map[string]string{"a": "ts.return(kline.close,3)", "b": "ts.return(kline.close,3)"}})
 	if shared.NodeCount() != 2 {
 		t.Fatalf("CSE node count %d", shared.NodeCount())
 	}
@@ -191,9 +191,9 @@ func TestUnusedDefinitionsAndBudgets(t *testing.T) {
 
 func TestBindingAndAsOfIdentity(t *testing.T) {
 	spec := specFor("daily.value + kline.close")
-	spec.Bindings["daily"] = Binding{Source: "fundamental", Frequency: "event"}
+	spec.Bindings["daily"] = Binding{Source: "fundamental", TimeFrame: "event"}
 	if _, err := Compile(spec); err == nil {
-		t.Fatal("accepted implicit cross-frequency sampling")
+		t.Fatal("accepted implicit cross-timeframe sampling")
 	}
 	b := spec.Bindings["daily"]
 	b.Sampling = "asof"
@@ -205,7 +205,7 @@ func TestBindingAndAsOfIdentity(t *testing.T) {
 	spec.Bindings["daily"] = b
 	first := mustCompile(t, spec)
 	for _, input := range first.Inputs() {
-		if input.Source == "fundamental" && (!input.AsOfLatest || input.MaxAge != 1000 || input.Frequency != "event") {
+		if input.Source == "fundamental" && (!input.AsOfLatest || input.MaxAge != 1000 || input.TimeFrame != "event") {
 			t.Fatalf("wrong projection %+v", input)
 		}
 	}

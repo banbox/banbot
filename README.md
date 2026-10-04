@@ -49,7 +49,7 @@ Or immediately test your idea using the [Banbot Workflow](https://www.banbot.sit
 Please go to [BanBot Website](https://www.banbot.site/) for documents.
 
 ### Contributing
-Follow the [How to Contribute](/doc/contribute.md). Please do get hesitate to get touch via the [Discord](https://discord.com/invite/XXjA8ctqga) Chat to discuss development, new features, and the future roadmap.  
+Follow [How to Contribute](doc/contribute.md). Get in touch via [Discord](https://discord.com/invite/XXjA8ctqga) to discuss development, new features, and the roadmap.
 Unless you explicitly state otherwise, any contributions intentionally submitted for inclusion in a banbot workspace you create shall be licensed under AGPLv3, without any additional terms or conditions.
 
 ### Donate
@@ -62,3 +62,11 @@ If banbot made your life easier and you want to help us improve it further, or i
 
 ### LICENSE
 This project is dual-licensed under GNU AGPLv3 License and a commercial license. For free use and modifications of the code, you can use the AGPLv3 license. If you require commercial license with different terms, please contact me.
+
+### Strategy engines
+
+Choose run_policy.engine: time_series (default) for per-symbol callbacks or factor for native multi-factor/cross-sectional rounds. Mixed replay uses execution.mode: events and explicit account budgets. See the [English guide](bandoc/en-US/guide/factor.md), [中文指南](bandoc/zh-CN/guide/factor.md), [API](bandoc/en-US/api/factor.md) and [refactor record](doc/strategy_engine_refactor.md).
+
+Factor live needs application-registered verified transport, instrument/revision/funding evidence and startup reconciliation. Missing capabilities fail explicitly; SDK support alone does not prove real factor venue readiness. Paper/dry-run is separate historical simulation.
+
+Configuration retains v0.5 root keys without requiring a version marker, and ordinary loading leaves YAML unchanged. Explicit `run_policy[].engine` enables new engine options; factor fields belong directly to each policy and account execution overrides to root `accounts.<name>`. See the [compatibility comparison](doc/config_compatibility.md) and [configuration guide](bandoc/en-US/guide/configuration.md).

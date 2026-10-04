@@ -71,7 +71,7 @@ func CloneUniverse(u Universe) Universe             { return cloneUniverse(u) }
 type Requirement struct {
 	SID        int32
 	Source     string
-	Frequency  string
+	TimeFrame  string
 	EventTime  int64
 	AsOfLatest bool
 	MaxAge     int64
@@ -79,7 +79,7 @@ type Requirement struct {
 type StreamKey struct {
 	SID       int32
 	Source    string
-	Frequency string
+	TimeFrame string
 }
 type SnapshotStatus struct {
 	Expected []StreamKey
@@ -118,7 +118,7 @@ func Freeze(spec SnapshotSpec, records []VersionRecord, requirements []Requireme
 		if a.Source != b.Source {
 			return a.Source < b.Source
 		}
-		return a.Frequency < b.Frequency
+		return a.TimeFrame < b.TimeFrame
 	})
 	allSIDs := append(append(append(append(slices.Clone(spec.Universe.Reference), spec.Universe.Investable...), spec.Universe.Tradable...), spec.Universe.Evaluation...), spec.Universe.Tracked...)
 	for _, sid := range allSIDs {
@@ -129,7 +129,7 @@ func Freeze(spec SnapshotSpec, records []VersionRecord, requirements []Requireme
 	snapshot := &Snapshot{spec: spec, rows: make(map[StreamKey]VersionRecord)}
 	for _, row := range records {
 		if row.Series.TimeFrame == "" || row.Series.Sid <= 0 || row.Revision == 0 {
-			return nil, errors.New("factor: invalid snapshot stream identity; non-periodic sources must declare frequency=event")
+			return nil, errors.New("factor: invalid snapshot stream identity; non-periodic sources must declare timeframe=event")
 		}
 		if row.EventTime > spec.GridTime || row.AvailableAt > spec.DecisionTime || (spec.ReplayTime != 0 && row.IngestedAt > spec.ReplayTime) {
 			continue
@@ -164,10 +164,10 @@ func Freeze(spec SnapshotSpec, records []VersionRecord, requirements []Requireme
 	expected := make(map[StreamKey]bool)
 	sourceSet := make(map[string]bool)
 	for _, required := range requirements {
-		if required.SID <= 0 || required.Source == "" || required.Frequency == "" || required.EventTime > spec.GridTime || required.MaxAge < 0 {
+		if required.SID <= 0 || required.Source == "" || required.TimeFrame == "" || required.EventTime > spec.GridTime || required.MaxAge < 0 {
 			return nil, errors.New("factor: invalid barrier requirement")
 		}
-		key := StreamKey{required.SID, required.Source, required.Frequency}
+		key := StreamKey{required.SID, required.Source, required.TimeFrame}
 		if expected[key] {
 			return nil, errors.New("factor: duplicate snapshot requirement")
 		}
@@ -217,7 +217,7 @@ func sortStreams(keys []StreamKey) {
 		if keys[i].Source != keys[j].Source {
 			return keys[i].Source < keys[j].Source
 		}
-		return keys[i].Frequency < keys[j].Frequency
+		return keys[i].TimeFrame < keys[j].TimeFrame
 	})
 }
 func (s *Snapshot) ID() string         { return s.id }
@@ -230,8 +230,8 @@ func (s *Snapshot) Status() SnapshotStatus {
 	v.Sources = slices.Clone(v.Sources)
 	return v
 }
-func (s *Snapshot) Row(sid int32, source, frequency string) (VersionRecord, bool) {
-	row, ok := s.rows[StreamKey{sid, source, frequency}]
+func (s *Snapshot) Row(sid int32, source, timeframe string) (VersionRecord, bool) {
+	row, ok := s.rows[StreamKey{sid, source, timeframe}]
 	if !ok {
 		return VersionRecord{}, false
 	}
@@ -241,8 +241,8 @@ func (s *Snapshot) Row(sid int32, source, frequency string) (VersionRecord, bool
 	}
 	return copy, true
 }
-func (s *Snapshot) Numeric(sid int32, source, frequency, field string) Numeric {
-	row, ok := s.rows[StreamKey{sid, source, frequency}]
+func (s *Snapshot) Numeric(sid int32, source, timeframe, field string) Numeric {
+	row, ok := s.rows[StreamKey{sid, source, timeframe}]
 	if !ok {
 		return Number(nil, field)
 	}

@@ -4,7 +4,7 @@ The config package provides system configuration-related structures and methods.
 
 ## Runtime Configuration
 
-Normal entry points parse configuration and then create a task-owned `config.Snapshot`. A Snapshot deep-copies the configuration and keeps explicit data and strategy directories; a Runtime treats it as read-only, so command-line overrides and account configuration from separate tasks cannot overwrite each other. New entry points should use `LoadRuntimeSnapshot` and the Runtime construction flow.
+Normal entry points parse configuration and then create a task-owned `config.Snapshot`. A Snapshot deep-copies the configuration and keeps explicit data and strategy directories; a Runtime treats it as read-only, so command-line overrides and account configuration from separate tasks cannot overwrite each other. Normal entries first use LoadRunSpec for the single policy list and field origins, then RunSpec.RuntimeSnapshot for common runtime settings. LoadRuntimeSnapshot retains time-series configuration assembly rather than replacing unified TS/CS routing.
 
 ## Important Structures
 
@@ -185,13 +185,10 @@ Returns:
 - `string` - Absolute path of the strategy directory. Returns empty string if environment variable `BanStratDir` is not set.
 
 ### LoadConfig
-Load and apply configuration.
 
-Parameters:
-- `args`: *CmdArgs - Command line argument object
+Compatibility method: loads and applies package-level configuration; it is not an isolated multi-task entry. Normal entries use LoadRunSpec / RunSpec.RuntimeSnapshot. Snapshot.View is read-only, Snapshot.Clone owns copied containers, and execution accounts are copied separately with one shared lock.
 
-Returns:
-- `*errs.Error` - Error information, returns nil if successful
+Argument args *CmdArgs; returns *errs.Error.
 
 ### GetConfig
 Get configuration based on command line arguments.
@@ -225,12 +222,6 @@ Parameters:
 
 Returns:
 - `*errs.Error` - Error information
-
-### GetExgConfig
-Get current exchange configuration.
-
-Returns:
-- `*ExgItemConfig` - Exchange configuration object
 
 ### GetTakeOverTF
 Get takeover time frame for specified trading pair.
@@ -302,3 +293,16 @@ Parameters:
 Returns:
 - `*ExportConfig` - Export configuration object
 - `*errs.Error` - Error information
+
+## Factor-engine integration
+
+RunSpec retains one policy list and field origins; Snapshot is read-only and runtime accounts are copied separately. capital_weight is distinct from stake_rate.
+
+[Factor API](factor.md) / [Guide](../guide/factor.md)
+
+
+## Configuration ownership
+
+GetExgConfig is no longer an exported API; explicit sessions use Snapshot.View().Exchange. RPCChannels is a Config mapping (also retained as a compatibility variable), not a Runtime constructor. rpc.Session binds notifications to its snapshot/accounts. RunSpec.Config/Origins return owned copies; Snapshot.View is read-only by contract.
+
+LoadRunSpec/LoadUnifiedConfigs read YAML without automatically upgrading, backing up or rewriting it. config_version is optional; existing 1/2 markers remain accepted. Omitted engine retains legacy time-series More parameters; explicit engine enables new identity, account and budget fields. Factor fields live directly under run_policy[]; root accounts.&lt;name&gt; holds account execution overrides, while execution keeps shared defaults. Legacy nested input is readable; canonical output uses the shallow layout.

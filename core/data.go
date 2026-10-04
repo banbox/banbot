@@ -54,7 +54,7 @@ var (
 	exitCallsLock sync.Mutex
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.6.0-beta.1"
+	Version   = "v0.6.0-beta.2"
 	UIVersion = "v0.6.0-beta.1"
 	SysLang   string // language code for current system 当前系统语言设置
 )

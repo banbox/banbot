@@ -57,14 +57,14 @@ func preflightFactorStorageConfig(spec *config.RunSpec, c *runner.Config) error 
 	}
 	if c.Prices.Source == "" {
 		if c.Mode == runner.Events {
-			c.Prices = runner.PriceStream{Source: orm.SeriesSourceKline, Frequency: "1m", Field: "close"}
+			c.Prices = runner.PriceStream{Source: orm.SeriesSourceKline, TimeFrame: "1m", Field: "close"}
 		} else if c.Expressions != nil {
-			c.Prices = runner.PriceStream{Source: orm.SeriesSourceKline, Frequency: c.Expressions.Frequency, Field: "close"}
+			c.Prices = runner.PriceStream{Source: orm.SeriesSourceKline, TimeFrame: c.Expressions.TimeFrame, Field: "close"}
 		} else {
-			c.Prices = runner.PriceStream{Source: c.Factor.Source, Frequency: c.Factor.Frequency, Field: c.Factor.Field}
+			c.Prices = runner.PriceStream{Source: c.Factor.Source, TimeFrame: c.Factor.TimeFrame, Field: c.Factor.Field}
 		}
 	}
-	if c.Mode == runner.Events && c.Prices.Frequency != "event" && c.Prices.Frequency != "1m" {
+	if c.Mode == runner.Events && c.Prices.TimeFrame != "event" && c.Prices.TimeFrame != "1m" {
 		return errors.New("factor: events storage replay requires tick or 1m observable prices")
 	}
 	if c.Mode == runner.Events {
@@ -309,12 +309,12 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 			return nil
 		}
 		for _, input := range plan.Inputs() {
-			if err := add(input.Source, input.Frequency, input.Fields, input.WarmupLength, factorIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
+			if err := add(input.Source, input.TimeFrame, input.Fields, input.WarmupLength, factorIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
 				return nil, err
 			}
 		}
 		executionIDs := append(slices.Clone(c.Snapshot.Universe.Investable), c.Snapshot.Universe.Tracked...)
-		if err := add(c.Prices.Source, c.Prices.Frequency, []string{c.Prices.Field}, 0, executionIDs, "price:"+c.StrategyID, 0); err != nil {
+		if err := add(c.Prices.Source, c.Prices.TimeFrame, []string{c.Prices.Field}, 0, executionIDs, "price:"+c.StrategyID, 0); err != nil {
 			return nil, err
 		}
 		if c.Manifest.Costs.FundingPolicy == "required-stream" {
@@ -390,7 +390,7 @@ func (a *factorStorageAssembly) install(ctx context.Context, configs []runner.Co
 		meta[stream.Subscription.Source] = identity
 		streams = append(streams, runner.StorageStream{Subscription: stream.Subscription, WarmupStartMS: stream.WarmupStartMS, SourceVersion: identity.Version, SchemaHash: identity.SchemaHash})
 	}
-	// One source identity is shared across every frequency of that source.
+	// One source identity is shared across every timeframe of that source.
 	for i := range streams {
 		identity := meta[streams[i].Subscription.Source]
 		streams[i].SourceVersion = identity.Version

@@ -290,7 +290,7 @@ func TestFactorLiveEntryKlineStorageWarmupAndTypedLiveCallback(t *testing.T) {
 	delete(c.Execution.Instruments, 3)
 	c.Execution.StorePath, c.Execution.SenderLeaseDir = filepath.Join(dir, "account.db"), filepath.Join(dir, "lease")
 	c.DecisionInterval = 60000
-	c.Prices = runner.PriceStream{Source: "kline", Frequency: "1m", Field: "close"}
+	c.Prices = runner.PriceStream{Source: "kline", TimeFrame: "1m", Field: "close"}
 	c.Plan, err = factor.New().Add("integer", factor.Lag(factor.Field("kline", "integer", "1m"), 3)).Add("label", factor.Field("kline", "label", "1m")).Add("flag", factor.Field("kline", "flag", "1m")).Add("nullable", factor.Field("kline", "nullable", "1m")).Compile()
 	if err != nil {
 		t.Fatal(err)

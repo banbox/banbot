@@ -11,7 +11,7 @@ func TestDelayedPublicationUsesLogicalGridAndActualVisibility(t *testing.T) {
 	spec := base.Spec()
 	row, _ := base.Row(1, "prices", "1h")
 	row.AvailableAt, row.IngestedAt = 12, 13
-	reqs := []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 10}}
+	reqs := []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 10}}
 	before, err := Freeze(spec, []VersionRecord{row}, reqs)
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +63,7 @@ func TestBarrierCannotFreezeFutureVisibilityCutoff(t *testing.T) {
 	spec := base.Spec()
 	spec.GridTime, spec.DecisionTime, spec.ReplayTime = 10, 13, 13
 	var barrier RoundBarrier
-	needs := []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 10}}
+	needs := []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 10}}
 	token, err := barrier.Begin("plan", spec, needs, 20)
 	if err != nil {
 		t.Fatal(err)

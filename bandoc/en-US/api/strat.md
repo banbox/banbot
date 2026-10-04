@@ -85,8 +85,11 @@ Public fields:
 - `Env *ta.BarEnv` - Indicator runtime environment
 - `Symbol string` - Trading pair name
 
-### BatchMap
-Batch execution task pool for all targets in the current exchange market time cycle.
+### BatchState / BatchMap
+
+`BatchState` owns one trader’s batch queue and backtest batch timestamp. Create it with `NewBatchState`, enqueue with `AddTask`, consume ready batches with `TakeReady(currMS, deterministic)`, query `PendingCount`, and clear with `Reset`. Strict backtests use deterministic ordering; ordinary mode does not promise order. `LegacyBatchState` serves package compatibility calls only.
+
+`BatchMap` represents one timeframe task group inside the queue, rather than process-shared market state.
 
 Public fields:
 - `Map map[string]*JobEnv` - Task mapping
@@ -265,3 +268,9 @@ Returns:
 
 ### ExitStratJobs
 Exit all strategy jobs.
+
+## Factor-engine integration
+
+TradeStrat is time-series; graphs and combination live in factor/runner. DataHub rawMap NULL/missing semantics coexist with numerical views.
+
+[Factor API](factor.md) / [Guide](../guide/factor.md)

@@ -91,3 +91,12 @@ WebUI和Dashboard UI的服务器端&前端资源。
 因此，普通入口创建的回测、实盘和优化任务具有各自的取消、关闭和可变业务状态；同一 `Process` 可以创建多个 Runtime。`context.Context` 仅用于取消、deadline 与 I/O 生命周期，不承载业务状态。
 
 为兼容旧的嵌入式调用和部分维护命令，仓库仍保留少量包级 facade（例如旧的配置、时间与交易状态访问接口）。这些路径由兼容边界保护，不能作为新任务的状态访问方式；新代码应从构造参数、具体 receiver 或 Runtime 依赖投影取得状态。
+
+## 因子运行域
+
+[因子 API](factor.md)覆盖图、快照、研究和 runner；execution 提供共享账户，runtime 负责借用和生命周期，entry 负责配置及资源装配。
+
+
+## 实例运行与服务 API
+
+[runtime](runtime.md)说明 Process/Runtime owner 与取消/join；[com](com.md)说明市场状态和 scheduler；[rpc](rpc.md)说明实例通知；[web](web.md)说明开发工厂与实时 HTTP/WS 生命周期。

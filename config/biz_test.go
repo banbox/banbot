@@ -26,8 +26,8 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.StakeAmount != 200 || len(cfg.RunPolicy) != 1 {
 		t.Fatal("ordinary loading lost overlay values")
 	}
-	if len(configBackups(t, path)) != 1 {
-		t.Fatal("ordinary loading did not migrate source")
+	if len(configBackups(t, path)) != 0 {
+		t.Fatal("ordinary loading wrote to source")
 	}
 }
 

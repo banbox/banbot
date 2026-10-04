@@ -101,8 +101,7 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 		if err != nil {
 			return nil, err
 		}
-		accountOverrides, _ := u.Execution["accounts"].(map[string]any)
-		fields, _ := accountOverrides[account].(map[string]any)
+		fields := u.AccountExecution[account]
 		settings := map[string]any{}
 		for key, value := range fields {
 			switch key {
@@ -359,7 +358,7 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 			for _, consumer := range selected {
 				consumer.task.Clock.SetTimeMS(batch.AtMS)
 				for _, row := range batch.Records {
-					if row.Series.Source != consumer.base.Prices.Source || row.Series.TimeFrame != consumer.base.Prices.Frequency {
+					if row.Series.Source != consumer.base.Prices.Source || row.Series.TimeFrame != consumer.base.Prices.TimeFrame {
 						continue
 					}
 					symbol := consumer.task.Symbols.GetSymbolByID(row.Series.Sid)
@@ -404,7 +403,7 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 						continue
 					}
 					series := row.Series
-					if !series.IsWarmUp && series.Source == consumer.base.Prices.Source && series.TimeFrame == consumer.base.Prices.Frequency {
+					if !series.IsWarmUp && series.Source == consumer.base.Prices.Source && series.TimeFrame == consumer.base.Prices.TimeFrame {
 						if err := biz.GetOdMgrWithState(consumer.task.Trading, consumer.trader.RuntimeDependencies().DefaultAccount).UpdateByDataSeries(nil, &series); err != nil {
 							return err
 						}
@@ -504,7 +503,7 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 		// This account result records simulation assumptions, without claiming
 		// a factor definition, research labels or factor snapshot lineage.
 		manifest := research.ManifestSpec{Currency: owner.base.Manifest.Currency, Costs: owner.base.Manifest.Costs, CodeRevision: core.Version, ExecutionMode: string(runner.Events),
-			LatencyAssumption: fmt.Sprintf("shared paper execution; next visible quote after intent; price=%s/%s/%s; quote TTL=%dms; intent TTL=%dms", owner.base.Prices.Source, owner.base.Prices.Frequency, owner.base.Prices.Field, owner.base.DecisionInterval+owner.base.ExpiryMS, owner.base.ExpiryMS)}
+			LatencyAssumption: fmt.Sprintf("shared paper execution; next visible quote after intent; price=%s/%s/%s; quote TTL=%dms; intent TTL=%dms", owner.base.Prices.Source, owner.base.Prices.TimeFrame, owner.base.Prices.Field, owner.base.DecisionInterval+owner.base.ExpiryMS, owner.base.ExpiryMS)}
 		results = append(results, runner.Result{Engine: "time_series", AccountID: account, Account: &snapshot, Manifest: manifest})
 	}
 	return results, nil
@@ -548,7 +547,7 @@ func mergeMixedReplayUnits(base, extra map[int32]execution.Instrument) (map[int3
 }
 
 func mixedReplayExecutionSubscriptions(c runner.Config, symbol *orm.ExSymbol) []*orm.Subscription {
-	subs := []*orm.Subscription{{Source: c.Prices.Source, TimeFrame: c.Prices.Frequency, Fields: []string{c.Prices.Field}, ExSymbol: symbol}}
+	subs := []*orm.Subscription{{Source: c.Prices.Source, TimeFrame: c.Prices.TimeFrame, Fields: []string{c.Prices.Field}, ExSymbol: symbol}}
 	if c.Manifest.Costs.FundingPolicy == "required-stream" {
 		subs = append(subs, &orm.Subscription{Source: c.FundingSource, TimeFrame: "event", Fields: []string{"rate"}, ExSymbol: symbol})
 	}

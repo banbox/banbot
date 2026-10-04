@@ -119,7 +119,7 @@ func TestResolvedImportedValuesOverrideCommonDefaultsWithoutInventingOrigins(t *
 	}
 	values := artifact.Strategies[0]
 	for key, want := range map[string]any{"initial_nav": float64(12345), "decision_interval_ms": float64(300000), "currency": "USDT"} {
-		if values[key].Value != want || values[key].Origin.Source != legacyPath+".v2.yml" {
+		if values[key].Value != want || values[key].Origin.Source != legacyPath+".yml" {
 			t.Fatalf("imported %s value/origin lost: %+v", key, values[key])
 		}
 	}

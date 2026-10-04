@@ -210,7 +210,7 @@ func uniqueSIDs(sids []int32) []int32 {
 }
 
 type MomentumVolConfig struct {
-	Source, Field, Frequency string
+	Source, Field, TimeFrame string
 	Window, DDOF             int
 	WinsorTail               float64
 	Standardize              bool
@@ -225,7 +225,7 @@ func MomentumVolPlan(cfg MomentumVolConfig) (*factor.Plan, ComboSpec, error) {
 	if cfg.Window < 2 || cfg.DDOF < 0 || cfg.DDOF >= cfg.Window || cfg.WinsorTail < 0 || cfg.WinsorTail >= 0.5 {
 		return nil, ComboSpec{}, errors.New("research: invalid momentum/volatility parameters")
 	}
-	close := factor.Field(cfg.Source, cfg.Field, cfg.Frequency)
+	close := factor.Field(cfg.Source, cfg.Field, cfg.TimeFrame)
 	momentum := factor.Return(close, cfg.Window)
 	volatility := factor.StdDev(factor.Return(close, 1), cfg.Window, cfg.DDOF)
 	if cfg.WinsorTail > 0 {
@@ -242,7 +242,9 @@ func MomentumVolPlan(cfg MomentumVolConfig) (*factor.Plan, ComboSpec, error) {
 func DefaultMomentumVolPlan() (*factor.Plan, ComboSpec, error) {
 	return MomentumVolPlan(DefaultMomentumVolConfig())
 }
-func cloneCombo(spec ComboSpec) ComboSpec {
+
+// CloneComboSpec preserves column order and nil/empty containers.
+func CloneComboSpec(spec ComboSpec) ComboSpec {
 	spec.Columns = slices.Clone(spec.Columns)
 	spec.Weights = maps.Clone(spec.Weights)
 	return spec

@@ -40,18 +40,28 @@ func ValidateBacktestRunSpec(spec *config.RunSpec) error {
 	if !slices.Contains(spec.Engines(), config.EngineFactor) {
 		return validateLegacyHistory(spec)
 	}
+	_, err := validatedFactorBacktestConfigs(spec)
+	return err
+}
+
+// validatedFactorBacktestConfigs is the resource-free boundary shared by
+// preflight and execution. Storage inputs are assembled only after it succeeds.
+func validatedFactorBacktestConfigs(spec *config.RunSpec) ([]runner.Config, error) {
 	mode, err := factorBacktestMode(spec)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	configs, err := buildFactorConfigs(spec, mode)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := validateFactorReplayConfigs(configs); err != nil {
-		return err
+		return nil, err
 	}
-	return validateAccountHistoryPaths(spec, configs)
+	if err := validateAccountHistoryPaths(spec, configs); err != nil {
+		return nil, err
+	}
+	return configs, nil
 }
 
 func validateFactorReplayConfigs(configs []runner.Config) error {
@@ -71,18 +81,8 @@ func unifiedFactorBacktestContext(ctx context.Context, args *config.CmdArgs, spe
 	if err := ctx.Err(); err != nil {
 		return errs.New(core.ErrRunTime, err)
 	}
-	mode, err := factorBacktestMode(spec)
+	configs, err := validatedFactorBacktestConfigs(spec)
 	if err != nil {
-		return errs.New(core.ErrBadConfig, err)
-	}
-	configs, err := buildFactorConfigs(spec, mode)
-	if err != nil {
-		return errs.New(core.ErrBadConfig, err)
-	}
-	if err := validateFactorReplayConfigs(configs); err != nil {
-		return errs.New(core.ErrBadConfig, err)
-	}
-	if err := validateAccountHistoryPaths(spec, configs); err != nil {
 		return errs.New(core.ErrBadConfig, err)
 	}
 	configs, cleanup, err := prepareFactorStorageInputs(ctx, args, spec, configs)

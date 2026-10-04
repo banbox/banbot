@@ -20,9 +20,9 @@ The philosophy of golang is to compile everything (banbot and your strategy code
 So you only need to [pull the example strategy project](./init_project.md), use the built-in strategies or implement your own, and after compilation, you can experience all functions such as backtesting and live trading.
 
 ## What types of quantitative strategies are supported, and which types are not supported?
-**Supported Strategies**: Time-series strategies of 1-minute and above (multi-asset and multi-timeframe supported).
+**Supported Strategies**: Time-series strategies of 1-minute and above (multi-asset/multi-timeframe); multi-factor/cross-sectional research, weights/events backtests and mixed time-series/factor events replay.
 
-**Limited Support**: Multi-factor cross-sectional strategies, AI-driven strategies.
+Real factor/mixed live requires a verified session binding, current data/execution capabilities and account reconciliation. Missing evidence fails startup without paper fallback. See [Multi-factor strategies](./factor.md). AI-driven strategies still need application-supplied models and strategy logic.
 
 **Not Currently Supported**: High-frequency trading, arbitrage trading (including triangular arbitrage, cross-exchange arbitrage, and term arbitrage, etc.), pair trading, statistical arbitrage.
 
@@ -33,7 +33,7 @@ Not currently supported: Stocks, futures, foreign exchange, bonds, decentralized
 
 ## Is it stable? Can it be used for real trading in a production environment?
 
-We have been using Banbot in live trading since December 1, 2024. During this period, we have resolved many bugs, and the commonly used live trading features have all passed testing. However, the number of live trading users is still not sufficient at present, and there is a possibility that there are areas not yet covered that could lead to capital losses.
+We have used Banbot time-series strategies live since December 1, 2024 and resolved many bugs. This historical usage concerns those time-series paths; it does not certify real-venue acceptance of the new factor/mixed engine, which still requires current-session verification and reconciliation. The user base remains limited, and uncovered issues may cause capital losses.
 
 If you want to test the strategy with a small amount of capital, you can consider starting to use Banbot immediately. If you have a large amount of capital, we suggest that you first run a trial with a small amount of capital for a few months to observe the results.
 

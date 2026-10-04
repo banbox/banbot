@@ -6,21 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 )
 
-// Cleanup plan: keep the existing in-memory importer and overlay semantics;
-// add one shared file-write boundary, prove the full candidate before writes,
-// and regression-test failures, competing edits, and interrupted retries.
+// Configuration loads are read-only. Explicit edits share one atomic boundary.
 var configWriteLocks sync.Map
 
 func normalizedConfigPath(path string) (string, error) {
@@ -77,176 +73,30 @@ func configPathKey(path string) string {
 	return path
 }
 
-// LoadUnifiedConfigs migrates file inputs and rereads the committed v2 chain.
-// ParseUnifiedConfigs remains the read-only inspection API.
+// LoadUnifiedConfigs loads a configuration chain without changing source files.
 func LoadUnifiedConfigs(paths []string, showLog bool) (*UnifiedConfig, *errs.Error) {
-	return loadUnifiedSources(paths, nil, nil, showLog, nil)
+	return ParseUnifiedConfigs(paths, showLog)
 }
 
-// migrationHook is local fault injection; callers cannot bypass validation.
-type migrationHook func(stage, path string) error
-
-func loadUnifiedSources(paths []string, inline [][]byte, inlineNames []string, showLog bool, hook migrationHook, metadata ...*loadedConfigMetadata) (*UnifiedConfig, *errs.Error) {
-	fail := func(err error) (*UnifiedConfig, *errs.Error) { return nil, errs.New(core.ErrBadConfig, err) }
-	resolved := make([]string, len(paths))
-	for i, path := range paths {
-		var err error
-		resolved[i], err = normalizedConfigPath(path)
-		if err != nil {
-			return fail(err)
-		}
-	}
-	unlock := lockConfigPaths(resolved)
-	defer unlock()
+func loadUnifiedSources(paths []string, inline [][]byte, inlineNames []string, showLog bool, metadata ...*loadedConfigMetadata) (*UnifiedConfig, *errs.Error) {
 	raws := make([][]byte, len(paths))
-	candidates := make([][]byte, len(paths))
-	imports := make([]*YAMLImport, len(paths))
-	modes := make([]os.FileMode, len(paths))
-	var fileLocks []*os.File
-	defer func() {
-		for _, lock := range fileLocks {
-			releaseConfigFileLock(lock)
-		}
-	}()
-	for i, path := range resolved {
-		raw, err := os.ReadFile(path)
+	names := make([]string, len(paths))
+	for i, path := range paths {
+		resolved, err := normalizedConfigPath(path)
 		if err != nil {
-			return fail(fmt.Errorf("%s: %w", path, err))
+			return nil, errs.New(core.ErrBadConfig, err)
 		}
-		candidate, err := ImportV1YAML(raw, path)
+		raw, err := os.ReadFile(resolved)
 		if err != nil {
-			return fail(err)
+			return nil, errs.NewFull(core.ErrIOReadFail, err, "Read %s Fail", path)
 		}
-		info, err := os.Stat(path)
-		if err != nil {
-			return fail(err)
-		}
-		if !info.Mode().IsRegular() {
-			return fail(fmt.Errorf("%s: configuration must be a regular file", path))
-		}
-		raws[i], candidates[i], imports[i], modes[i] = raw, candidate.YAML, candidate, info.Mode().Perm()
-	}
-	// Acquire OS locks in the same order across processes and only once for
-	// duplicate paths. A dead process releases its lock without stale recovery.
-	var changedPaths []string
-	seenPaths := make(map[string]bool)
-	for i, path := range resolved {
-		if imports[i].Changed && !seenPaths[configPathKey(path)] {
-			changedPaths = append(changedPaths, path)
-			seenPaths[configPathKey(path)] = true
-		}
-	}
-	slices.SortFunc(changedPaths, func(a, b string) int { return strings.Compare(configPathKey(a), configPathKey(b)) })
-	changedPaths = slices.Compact(changedPaths)
-	for _, path := range changedPaths {
-		info, err := os.Stat(path)
-		if err != nil {
-			return fail(err)
-		}
-		dirInfo, err := os.Stat(filepath.Dir(path))
-		if err != nil {
-			return fail(err)
-		}
-		if info.Mode().Perm()&0222 == 0 || dirInfo.Mode().Perm()&0222 == 0 {
-			return fail(fmt.Errorf("%s: read-only configuration or directory; migration requires write access", path))
-		}
-		lock, err := acquireConfigFileLock(path)
-		if err != nil {
-			return fail(fmt.Errorf("%s: exclusive migration lock: %w", path, err))
-		}
-		fileLocks = append(fileLocks, lock)
-	}
-	for i, path := range resolved {
-		if err := verifySource(path, raws[i]); err != nil {
-			return fail(err)
-		}
-	}
-	names := append(slices.Clone(resolved), inlineNames...)
-	before, err := parseUnifiedLayers(append(slices.Clone(raws), inline...), names)
-	if err != nil {
-		return nil, err
-	}
-	after, err := parseUnifiedLayers(append(slices.Clone(candidates), inline...), names)
-	if err != nil {
-		return nil, err
-	}
-	if !reflect.DeepEqual(before, after) {
-		return fail(fmt.Errorf("configuration candidate chain is not equivalent"))
-	}
-	for _, meta := range metadata {
-		if meta.preflight != nil {
-			if err := meta.preflight(after); err != nil {
-				return fail(err)
-			}
-		}
-	}
-	// Each prefix must also be equivalent; per-layer importer already proves
-	// syntax values and prevents a later overlay from hiding reinterpretation.
-	committed := make(map[string]bool)
-	for i, path := range resolved {
-		if !imports[i].Changed {
-			continue
-		}
-		if committed[configPathKey(path)] {
-			continue
-		}
-		if err := invokeMigrationHook(hook, "before-backup", path); err != nil {
-			return fail(err)
-		}
-		if err := verifySource(path, raws[i]); err != nil {
-			return fail(err)
-		}
-		backup, err := backupConfig(path, raws[i], modes[i])
-		if err != nil {
-			return fail(fmt.Errorf("%s: backup: %w", path, err))
-		}
-		log.Info("Configuration migration backup: " + backup)
-		if err := invokeMigrationHook(hook, "before-replace", path); err != nil {
-			return fail(err)
-		}
-		if err := replaceConfig(path, raws[i], candidates[i], modes[i]); err != nil {
-			return fail(err)
-		}
-		committed[configPathKey(path)] = true
-		if err := invokeMigrationHook(hook, "after-replace", path); err != nil {
-			return fail(err)
-		}
-	}
-	for i, path := range resolved {
+		raws[i], names[i] = raw, resolved
 		if showLog {
-			log.Info("Using " + path)
+			log.Info("Using " + resolved)
 		}
-		if err := invokeMigrationHook(hook, "before-reread", path); err != nil {
-			return fail(err)
-		}
-		raw, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return fail(fmt.Errorf("%s: reread: %w", path, readErr))
-		}
-		if sha256.Sum256(raw) != sha256.Sum256(candidates[i]) {
-			return fail(fmt.Errorf("%s: configuration changed during migration reread; backups retained", path))
-		}
-		raws[i] = raw
 	}
-	result, err := parseUnifiedLayers(append(raws, inline...), names, metadata...)
-	if err != nil {
-		return nil, err
-	}
-	if !reflect.DeepEqual(result, after) {
-		return fail(fmt.Errorf("configuration reread chain differs from candidate; backups retained"))
-	}
-	return result, nil
+	return parseUnifiedLayers(append(raws, inline...), append(names, inlineNames...), metadata...)
 }
-
-func invokeMigrationHook(hook migrationHook, stage, path string) error {
-	if hook != nil {
-		if err := hook(stage, path); err != nil {
-			return fmt.Errorf("%s: %s: %w", path, stage, err)
-		}
-	}
-	return nil
-}
-
 func verifySource(path string, expected []byte) error {
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) && expected == nil {
@@ -262,28 +112,6 @@ func verifySource(path string, expected []byte) error {
 		return fmt.Errorf("%s: source edit conflict; configuration not overwritten", path)
 	}
 	return nil
-}
-
-func backupConfig(path string, raw []byte, mode os.FileMode) (string, error) {
-	file, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".bak."+time.Now().UTC().Format("20060102T150405")+".*")
-	if err != nil {
-		return "", err
-	}
-	name := file.Name()
-	if err := writeConfigFile(file, raw, mode); err != nil {
-		return name, err
-	}
-	if err := preserveConfigPermissions(path, name); err != nil {
-		return name, err
-	}
-	actual, err := os.ReadFile(name)
-	if err != nil {
-		return name, err
-	}
-	if !bytes.Equal(actual, raw) {
-		return name, fmt.Errorf("backup verification failed")
-	}
-	return name, nil
 }
 
 func writeConfigFile(file *os.File, raw []byte, mode os.FileMode) error {

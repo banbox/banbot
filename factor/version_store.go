@@ -25,7 +25,7 @@ type VersionRecord struct {
 
 type recordKey struct {
 	Source    string
-	Frequency string
+	TimeFrame string
 	SID       int32
 	Event     int64
 	Revision  uint64

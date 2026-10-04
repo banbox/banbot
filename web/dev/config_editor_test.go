@@ -129,7 +129,7 @@ func TestWebEditorConcurrentVersionedSavesKeepOneWinner(t *testing.T) {
 	}
 }
 
-func TestWebEditorRejectsVersionReadBeforeMigration(t *testing.T) {
+func TestWebEditorDigestSurvivesReadOnlyConfigLoad(t *testing.T) {
 	raw := []byte(separateTestConfig)
 	app, server, path := editorTestApp(t, raw)
 	_, read, err := editorRequest(app, http.MethodGet, "/text?path="+url.QueryEscape("$/config.yml"), nil)
@@ -139,30 +139,28 @@ func TestWebEditorRejectsVersionReadBeforeMigration(t *testing.T) {
 	if _, err := config.LoadRunSpec(&config.CmdArgs{Configs: []string{path}, NoDefault: true, DataDir: server.DataDir()}, false); err != nil {
 		t.Fatal(err)
 	}
-	migrated, err := os.ReadFile(path)
-	if err != nil || bytes.Equal(migrated, raw) {
-		t.Fatalf("migration did not change the source: %v", err)
+	loaded, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(loaded, raw) {
+		t.Fatalf("loading changed the editor source: %v", err)
 	}
 	status, _, err := editorRequest(app, http.MethodPost, "/save_text", map[string]any{
-		"path": "$/config.yml", "content": separateTestConfig + "# stale\n", "digest": read["digest"],
+		"path": "$/config.yml", "content": separateTestConfig + "# edited\n", "digest": read["digest"],
 	})
-	if err != nil || status != http.StatusConflict {
-		t.Fatalf("post-migration stale save status=%d error=%v", status, err)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("read-only load invalidated editor digest: status=%d error=%v", status, err)
 	}
 	actual, err := os.ReadFile(path)
-	if err != nil || !bytes.Equal(actual, migrated) {
-		t.Fatalf("migrated source overwritten: %v", err)
+	if err != nil || string(actual) != separateTestConfig+"# edited\n" {
+		t.Fatalf("editor save failed: %v", err)
 	}
 }
 
-const webFactorConfig = `config_version: 2
-run_policy:
+const webFactorConfig = `run_policy:
   - name: MomentumVol
     id: cross-section
     capital_weight: 0.5
     engine: factor
-    factor:
-      archive: fixtures/history.jsonl
+    archive: fixtures/history.jsonl
 execution:
   mode: events
 data:
@@ -199,7 +197,7 @@ func TestWebBacktestUsesUnifiedRunSpecWithoutTSProjection(t *testing.T) {
 			if !called || len(metadata.RunPolicy) != len(spec.Config().RunPolicy) || !strings.Contains(string(output), "engine: factor") || !strings.Contains(string(output), "namespace: research-input") {
 				t.Fatalf("unified Web config was projected to TS: metadata=%v output=%s", metadata.RunPolicy, output)
 			}
-			archive, err := spec.ResolvePath("run_policy[0].factor.archive")
+			archive, err := spec.ResolvePath("run_policy[0].archive")
 			if err != nil || archive != filepath.Join(server.DataDir(), "fixtures", "history.jsonl") {
 				t.Fatalf("archive lost original source base: %q error=%v", archive, err)
 			}
@@ -211,7 +209,7 @@ func TestWebBacktestUsesUnifiedRunSpecWithoutTSProjection(t *testing.T) {
 			if specErr != nil {
 				t.Fatal(specErr)
 			}
-			resolved, err := reloaded.ResolvePath("run_policy[0].factor.archive")
+			resolved, err := reloaded.ResolvePath("run_policy[0].archive")
 			if err != nil || archive != resolved {
 				t.Fatalf("queued config depends on deleted request temp directory: %q error=%v", resolved, err)
 			}
@@ -259,23 +257,25 @@ func TestWebBacktestPrivateCopyPreservesAllAdvancedPathBases(t *testing.T) {
 execution:
   store: ":memory:"
   sender_lease_dir: locks
-  accounts:
-    shared:
-      store: ../account.db
-      sender_lease_dir: ../account-locks
+accounts:
+  shared:
+    store: ../account.db
+    sender_lease_dir: ../account-locks
 run_policy:
   - name: MomentumVol
+    engine: factor
+    archive: ../history.jsonl
+    chunks:
+      - path: ../chunk.jsonl
+    config:
+      Chunks:
+        - Path: ../imported.jsonl
+      Execution:
+        StorePath: state.db
+        SenderLeaseDir: sender-locks
+  - name: Legacy
     archive: user-strategy-value
-    factor:
-      archive: ../history.jsonl
-      chunks:
-        - path: ../chunk.jsonl
-      config:
-        Chunks:
-          - Path: ../imported.jsonl
-        Execution:
-          StorePath: state.db
-          SenderLeaseDir: sender-locks
+    config: {path: user-value}
 `)
 	copy, err := server.backtestConfigContents("$/layers/overlay.yml", raw)
 	if err != nil {
@@ -287,10 +287,9 @@ run_policy:
 	}
 	data := fields["data"].(map[string]any)
 	execution := fields["execution"].(map[string]any)
-	account := execution["accounts"].(map[string]any)["shared"].(map[string]any)
+	account := fields["accounts"].(map[string]any)["shared"].(map[string]any)
 	policy := fields["run_policy"].([]any)[0].(map[string]any)
-	factorFields := policy["factor"].(map[string]any)
-	imported := factorFields["config"].(map[string]any)
+	imported := policy["config"].(map[string]any)
 	checks := []struct {
 		value    any
 		relative string
@@ -299,8 +298,8 @@ run_policy:
 		{execution["sender_lease_dir"], "layers/locks"},
 		{account["store"], "account.db"},
 		{account["sender_lease_dir"], "account-locks"},
-		{factorFields["archive"], "history.jsonl"},
-		{factorFields["chunks"].([]any)[0].(map[string]any)["path"], "chunk.jsonl"},
+		{policy["archive"], "history.jsonl"},
+		{policy["chunks"].([]any)[0].(map[string]any)["path"], "chunk.jsonl"},
 		{imported["Chunks"].([]any)[0].(map[string]any)["Path"], "imported.jsonl"},
 		{imported["Execution"].(map[string]any)["StorePath"], "layers/state.db"},
 		{imported["Execution"].(map[string]any)["SenderLeaseDir"], "layers/sender-locks"},
@@ -310,7 +309,8 @@ run_policy:
 			t.Fatalf("path %v lost original source base, want %s", check.value, check.relative)
 		}
 	}
-	if execution["store"] != ":memory:" || policy["archive"] != "user-strategy-value" || !bytes.Contains(raw, []byte("${WEB_TEST_ARCHIVE}")) {
+	legacy := fields["run_policy"].([]any)[1].(map[string]any)
+	if execution["store"] != ":memory:" || legacy["archive"] != "user-strategy-value" || legacy["config"].(map[string]any)["path"] != "user-value" || !bytes.Contains(raw, []byte("${WEB_TEST_ARCHIVE}")) {
 		t.Fatal("private normalization changed special path, custom strategy field, or original input")
 	}
 }

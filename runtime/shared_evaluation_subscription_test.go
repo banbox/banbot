@@ -65,8 +65,8 @@ func TestFactorLiveEvaluationOnlyHistoryCannotBlockInstallation(t *testing.T) {
 					t.Error(err)
 				}
 			}()
-			side := &missingEvaluationHistorySource{liveHistorySource: liveHistorySource{name: "side", frequency: "1h", field: "close"}}
-			tick := &liveHistorySource{name: "tick", frequency: "event", field: "price"}
+			side := &missingEvaluationHistorySource{liveHistorySource: liveHistorySource{name: "side", timeframe: "1h", field: "close"}}
+			tick := &liveHistorySource{name: "tick", timeframe: "event", field: "price"}
 			for _, source := range []data.DataSource{side, tick} {
 				if err := f.rt.Catalog.RegisterDataSource(source); err != nil {
 					t.Fatal(err)

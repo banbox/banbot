@@ -4,9 +4,9 @@ import "math"
 
 // Constant broadcasts a finite value on the plan's explicit decision grid.
 // It has no source subscription; the snapshot still supplies the active SIDs.
-func Constant(value float64, frequency string) *Node {
+func Constant(value float64, timeframe string) *Node {
 	n := node("constant", TS)
-	n.Spec.Frequency = frequency
+	n.Spec.TimeFrame = timeframe
 	n.Spec.Parameters["value"] = value
 	return n
 }

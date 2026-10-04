@@ -61,7 +61,7 @@ Fields:
 - `HasData bool` - Whether this range contains valid data
 
 ### KlineUn
-Unadjusted candlestick data structure, containing raw candlestick data.
+Unfinished candlestick data, containing raw values before the period closes.
 
 Fields:
 - `Sid int32` - Trading pair ID
@@ -113,11 +113,73 @@ Fields:
 
 ### SeriesInfo, DataRecord, and DataSeries
 
-Generic time-series data is no longer limited to K-lines. `SeriesInfo` defines the source, timeframe, table binding, and fields; `DataRecord` stores rows; and `DataSeries` is the shared event model for backtesting and live trading. `SeriesStore` provides high-level `Write`, `WriteBatch`, `Read`, `Missing`, `Delete`, and `Coverage` operations, while `SeriesRepo` adapts them to TimescaleDB and QuestDB.
+`SeriesInfo{Name, TimeFrame, Binding}` describes the source, timeframe, and physical table. `SeriesBinding` contains `Table/TimeColumn/EndColumn/SIDColumn/Fields`; omitted SIDColumn defaults to `sid`. `NewSeriesInfo` uses `ts/end_ms/sid` and a `name_timeframe` table. Logical field types are `float/int/string/bool/json`.
 
-Supported field types are `float`, `int`, `string`, `bool`, and `json`. `NewSeriesInfo(name, timeframe, fields)` creates a table binding using the default rules. To write extension columns to an existing K-line table, use `NewKLineSeriesInfo` and `KLineSeriesStore`.
+```go
+type DataRecord struct {
+    Sid int32
+    TimeMS, EndMS int64
+    Closed bool
+    Values map[string]any
+}
+type DataSeries struct {
+    Source string
+    Sid int32
+    TimeMS, EndMS int64
+    TimeFrame string
+    Closed, IsWarmUp bool
+    Values map[string]any
+    ExSymbol *ExSymbol
+    Adj *AdjInfo
+}
+```
 
-See [Custom Time-Series Data](../guide/custom_data.md) for the complete registration, storage, and strategy-consumption workflow.
+DataRecord stores rows; DataSeries carries backtest/live events. Times are milliseconds with `[TimeMS,EndMS)` intervals. Values retain concrete Go types and explicit nil; map lookup distinguishes NULL from an absent key. Storage writes declared schema columns only: int normalizes to int64, float to float64, and JSON uses database encoding. Fixed-column round trips cannot reconstruct original absent keys or every Go type.
+
+### Subscription
+
+`orm.Subscription` declares engine-independent data dependencies; `strat.DataSub` is its alias. Besides Source/ExSymbol/TimeFrame/WarmupNum/Fields/SeriesFields, it has Frequency (bar/event) and Projection (default/all/selected). `NormalizeSubscription` validates declarations; a valid event declaration does not mean every reader supports it. `StreamKey{Source,SID,TimeFrame}` excludes consumer/account; isolation belongs to its catalog/repository.
+
+### SeriesStore and BoundSeriesStore
+
+```go
+store := orm.NewSeriesStore(orm.NewSeriesRepo(storage))
+rates := store.Bind(info, target)
+err := rates.WriteBatch(ctx, rows) // []*orm.DataRecord
+events, err := rates.Read(ctx, startMS, endMS, limit) // []*orm.DataSeries
+```
+
+The snippet assumes initialized Storage, schema, target, ctx, and time bounds. `Bind` retains definition/target pointers without I/O. Supply info/target on SeriesStore, or omit them on the bound store:
+
+| Method | Purpose |
+| --- | --- |
+| `Ensure` | Ensure schema |
+| `Write/WriteBatch` | Write one/batched persistent rows |
+| `WriteSeries/WriteSeriesBatch` | Write runtime events |
+| `Read` | Read DataSeries |
+| `Missing/FillMissing` | Find gaps and fetch missing data |
+| `Coverage/UpdateCoverage` | Coverage and confirmed no-data ranges |
+| `Delete` | Delete a time range |
+
+`NormalizeDataRecords` skips nil rows, fills Sid=0, rejects foreign SIDs/invalid intervals, and sorts. `RecordToSeries` normalizes source and borrows Values; `RecordsToSeries` skips nil rows. `SeriesToRecord` and `CloneWithExSymbol` do not recursively clone ownership; asynchronous queues must isolate mutable input. `WithSeriesReadByteLimit` bounds decoded pages, not process RSS.
+
+### KLineSeriesStore and K-Line Field Reads
+
+Independent SeriesStore writes complete records. `NewKLineSeriesInfo` / `NewKLineSeriesStoreWithStorage(info, storage)` define/write extension columns on existing K-lines. `Write(ctx,target,rows)` updates existing `(sid,time)` rows and fails when a target K-line is missing. An extension's Name is a label, not an independent source; subscribe with `Source: "kline"`.
+
+`GetSeries/AutoFetchSeries` return `[]*DataSeries`; explicit Queries provide `GetSeriesFields`, `QuerySeriesFields`, and batched projections. Requested extensions travel with standard OHLCV through Values, feeders, and callbacks. GetOHLCV/AutoFetchOHLCV below are default K-line compatibility views and cannot transport arbitrary extension columns.
+
+### Aggregation and Adjustment
+
+`ResampleSeriesRecords` and `ResampleDataSeries` aggregate fields. `ExSymbol.AggRules` holds JSON field rules; `RegisterAggRule` adds custom rules. Supported rules include first/last/min/max/sum/avg/mid; unconfigured extension fields use last. first/last retain the selected raw value; numeric rules convert types and apply rule-specific NULL/missing-field validation. An aggregate is not a complete copy of input.
+
+`SeriesOHLCV`, `DataSeries.OHLCV`, and `AsKline` are local compatibility views, not replacements for Values. Feeder adjustment copies the field map and currently adjusts open/high/low/close/volume/buy_volume. Other custom fields, quote, and trade_num retain their values; they are not automatically multiplied by a price factor.
+
+### QuestDB WAL
+
+Successful INSERT/CTAS may still be unreadable. Dependent flows wait for expected rows, timestamps, ranges, or counts; timeouts retain recovery markers. Verify the replacement table snapshot before a swap; never DROP the old table based on one empty read. Same-process metadata read-after-write should use targeted visibility waits or owner-local caches/locks.
+
+See [Custom Time-Series Data](../guide/custom_data.md) and [Database](../guide/database.md).
 
 ## Database Connection Related
 
@@ -365,3 +427,9 @@ Parameters:
 - `exsList map[int32]*ExSymbol` - Trading pair list
 - `timeFrame string` - Time frame
 - `startMS int64` - Start time (milliseconds)
+
+## Factor-engine integration
+
+DataSeries.Values retains arbitrary types/NULL/missing keys; RecordToSeries conversion is not asynchronous deep copying. QuestDB visibility waits and replacement verification remain.
+
+[Factor API](factor.md) / [Guide](../guide/factor.md)

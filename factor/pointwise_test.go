@@ -140,7 +140,7 @@ func TestConstantIdentityBroadcastAndPointwiseValidation(t *testing.T) {
 	for name, root := range map[string]*Node{
 		"arity": badArity, "constant-value": badConstant,
 		"nan": Constant(math.NaN(), "1h"), "inf": Constant(math.Inf(1), "1h"),
-		"frequency": Add(x, Constant(1, "1d")), "nil": Neg(nil),
+		"timeframe": Add(x, Constant(1, "1d")), "nil": Neg(nil),
 		"period": StdDev(x, 0, 0), "ddof-negative": StdDev(x, 3, -1), "ddof-period": StdDev(x, 3, 3),
 	} {
 		if _, err := New().Add(name, root).Compile(); err == nil {

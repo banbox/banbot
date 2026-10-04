@@ -74,51 +74,25 @@ Fields:
 
 ## Main Features
 
-### NewBackTest
-Create a new backtest instance.
+### NewBackTestWithRuntimeDeps
 
-Parameters:
-- `isOpt bool` - Whether in hyperparameter optimization mode
-- `outDir string` - Output directory path
-
-Returns:
-- `*BackTest` - Backtest instance pointer
+Signature: NewBackTestWithRuntimeDeps(deps biz.RuntimeDeps, isOpt bool, outDir string) (*BackTest, *errs.Error). NewBackTest was removed. Pass complete dependencies from one Runtime; missing state fails. Lightweight replay uses NewBackTestLiteWithRuntimeDeps.
 
 ### RunBTOverOpt
-Run backtest mode based on continuous parameter tuning, approximating live trading conditions and avoiding using future information for parameter tuning.
 
-Parameters:
-- `args *config.CmdArgs` - Command line argument configuration
-
-Returns:
-- `*errs.Error` - Error information
+Signature: RunBTOverOpt(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. The entry injects the snapshot and isolated backtest factory; CmdArgs alone is insufficient. This is the TS optimization/report path, not factor/mixed parameter search.
 
 ### RunRollBTPicker
-Execute rolling backtest stock picker.
 
-Parameters:
-- `args *config.CmdArgs` - Command line argument configuration
-
-Returns:
-- `*errs.Error` - Error information
+Signature: RunRollBTPicker(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. The entry injects the snapshot and isolated backtest factory; CmdArgs alone is insufficient. This is the TS optimization/report path, not factor/mixed parameter search.
 
 ### RunOptimize
-Execute strategy parameter optimization.
 
-Parameters:
-- `args *config.CmdArgs` - Command line argument configuration
-
-Returns:
-- `*errs.Error` - Error information
+Signature: RunOptimize(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. The entry injects the snapshot and isolated backtest factory; CmdArgs alone is insufficient. This is the TS optimization/report path, not factor/mixed parameter search.
 
 ### CollectOptLog
-Collect and analyze optimization logs.
 
-Parameters:
-- `args *config.CmdArgs` - Command line argument configuration
-
-Returns:
-- `*errs.Error` - Error information
+Signature: CollectOptLog(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. The entry injects the snapshot and isolated backtest factory; CmdArgs alone is insufficient. This is the TS optimization/report path, not factor/mixed parameter search.
 
 ### NewBTResult
 Create a new backtest result instance.
@@ -146,22 +120,19 @@ Parameters:
 Returns:
 - `[]*OptInfo, []*OptInfo` - Good group and bad group optimization information lists
 
-### DumpLineGraph
-Generate and save line graph.
-
-Parameters:
-- `path string` - Output file path
-- `title string` - Chart title
-- `label []string` - Label list
-- `prec float64` - Precision
-- `tplData []byte` - Template data
-- `items []*ChartDs` - Chart datasets
-
-Returns:
-- `*errs.Error` - Error information
-
 ### CompareExgBTOrders
 Compare exchange backtest orders.
 
 Parameters:
 - `args []string` - Command line argument list
+
+## Factor-engine integration
+
+Optimization factories retain isolated Runtime ownership; factor JSON lines/account audit Gob differ from legacy orders.gob.
+
+[Factor API](factor.md) / [Guide](../guide/factor.md)
+
+
+## Factories, reports and resources
+
+BacktestFactory is func(snapshot *config.Snapshot, isOpt bool, outDir string) (*BackTest, func(), *errs.Error); cleanup releases only that run's owned state. Derived snapshots copy ranges/pairs/policies without sharing mutable execution accounts. NewReportDeps(biz.RuntimeDeps) binds reports to orders/clock/symbols/storage/logger, without installing globals. DumpLineGraph is no longer a public opt API. See [runtime](runtime.md).

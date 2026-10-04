@@ -31,10 +31,9 @@ func accountHistoryPath(spec *config.RunSpec, account string) (string, error) {
 	u := spec.Config()
 	field := "execution.history"
 	_, exists := u.Execution["history"]
-	accounts, _ := u.Execution["accounts"].(map[string]any)
-	settings, _ := accounts[account].(map[string]any)
+	settings := u.AccountExecution[account]
 	if _, overridden := settings["history"]; overridden {
-		field, exists = "execution.accounts."+account+".history", true
+		field, exists = "accounts."+account+".history", true
 	}
 	if !exists {
 		return "", nil

@@ -139,7 +139,7 @@ func replacementConfig(t *testing.T, f *sharedTriggerFixture, source string, dat
 	}
 	c.Snapshot.Schemas = map[string]string{source: "schema-v1", "price": "schema-v1", "funding": "schema-v1"}
 	c.Snapshot.SourceVersions = map[string]string{source: "v1", "price": "v1", "funding": "v1"}
-	c.Prices = runner.PriceStream{Source: "price", Frequency: "event", Field: "price"}
+	c.Prices = runner.PriceStream{Source: "price", TimeFrame: "event", Field: "price"}
 	c.FundingSource = "funding"
 	c.Plan, err = factor.New().Add("value", factor.Field(source, "value", "event")).Compile()
 	if err != nil {

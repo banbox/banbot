@@ -25,12 +25,12 @@ func factorYAMLFixture(t *testing.T) (string, string) {
 		for sid := int32(1); sid <= 4; sid++ {
 			price := 100 + float64(sid)*float64(bar*bar)
 			for _, source := range []string{"kline", "tick"} {
-				at, frequency, field := bar*hour, "1h", "close"
+				at, timeframe, field := bar*hour, "1h", "close"
 				if source == "tick" {
 					at++
-					frequency, field = "event", "price"
+					timeframe, field = "event", "price"
 				}
-				if err := store.Put(factor.VersionRecord{Series: orm.DataSeries{Source: source, Sid: sid, TimeMS: at - 1, EndMS: at, TimeFrame: frequency, Closed: true, Values: map[string]any{field: price, "big": int64(9007199254740993), "nullable": nil}}, EventTime: at, AvailableAt: at, IngestedAt: at, Revision: 1, SourceVersion: "v1"}); err != nil {
+				if err := store.Put(factor.VersionRecord{Series: orm.DataSeries{Source: source, Sid: sid, TimeMS: at - 1, EndMS: at, TimeFrame: timeframe, Closed: true, Values: map[string]any{field: price, "big": int64(9007199254740993), "nullable": nil}}, EventTime: at, AvailableAt: at, IngestedAt: at, Revision: 1, SourceVersion: "v1"}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -91,6 +91,35 @@ func TestUnifiedFactorYAMLCommandsAndOrdinaryBacktest(t *testing.T) {
 	}
 	if databases, _ := filepath.Glob(filepath.Join(dir, "*.db")); len(databases) > 0 {
 		t.Fatalf("ordinary factor replay created SQL: %v", databases)
+	}
+}
+
+func TestFlatFactorYAMLWithoutMarkerResolvesArchiveAndAccountOrigin(t *testing.T) {
+	dir, nested := factorYAMLFixture(t)
+	flat := filepath.Join(dir, "flat.yml")
+	raw, err := os.ReadFile(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Replace(string(raw), "config_version: 2\n", "", 1)
+	text = strings.Replace(text, "    factor:\n      archive: data.gob", "    archive: data.gob", 1)
+	text = strings.Replace(text, "execution: {mode: weights, funding_policy: explicit-zero}", "execution: {mode: weights, funding_policy: explicit-zero}\naccounts:\n  default:\n    history: account-history", 1)
+	if err := os.WriteFile(flat, []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := loadFactorRunSpec([]string{flat}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs, err := buildFactorConfigs(spec, runner.Weights)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 1 || configs[0].Chunks[0].Path != filepath.Join(dir, "data.gob") {
+		t.Fatalf("flat archive path = %+v", configs)
+	}
+	if got, err := accountHistoryPath(spec, "default"); err != nil || got != filepath.Join(dir, "account-history") {
+		t.Fatalf("account history path = %q, %v", got, err)
 	}
 }
 

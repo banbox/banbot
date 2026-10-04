@@ -1,358 +1,88 @@
 # data Package
 
-The data package provides functionality for data processing and management.
-
-The main data path in the `data` package now uses `orm.DataSeries`. The K-line Feeder/Provider types documented below remain for built-in OHLCV data; custom time-series data should use the generic data-source interfaces on this page.
-
-Providers, Feeders, Watchers, and the data-source runtime receive their owning Runtime's state and callback boundary through `data.RuntimeDeps`. One task's warmup, subscriptions, and clock are not reused by another task; older constructors without RuntimeDeps remain only for compatibility.
+`data` manages historical replay, live ingestion, subscription requirements, and source lifecycles. Providers, feeders, and watchers carry `orm.DataSeries`; both standard K-line fields and extension fields use `Values map[string]any`. `FnDataSeries` and `FuncEnvEnd` are `func(*orm.DataSeries)`.
 
 ## Generic Time-Series Data
 
-### DataSource
+### DataSource and DataSink
 
-A custom source implements `Info`, `FetchHistory`, and the optional `SubscribeLive`. The history function returns `[]*orm.DataRecord`, while the live function sends data through `DataSink.Emit(sub, rows)`. Register a complete implementation with `RegisterDataSource`, or use `RegisterFuncDataSource` for a function-based implementation. Source names must be unique.
+```go
+type DataSink interface {
+    Emit(sub *orm.Subscription, rows []*orm.DataRecord) error
+}
+type DataSource interface {
+    Info() *orm.SeriesInfo
+    FetchHistory(ctx context.Context, sub *orm.Subscription, startMS, endMS int64) ([]*orm.DataRecord, error)
+    SubscribeLive(ctx context.Context, subs []*orm.Subscription, sink DataSink) error
+}
+```
 
-### SeriesRuntime
+`strat.DataSub` is an alias of `orm.Subscription`, so existing function-source signatures remain valid. `FetchHistory` returns records with real intervals for `[startMS,endMS)`; do not invent records to cover unqueried ranges. Emit live batches through `sink.Emit`. Omitting a live function does not enable automatic polling.
 
-`SeriesRuntime` collects strategy `DataSub` subscriptions at backtest and live-trading startup, merging fields and warmup counts by `(source, sid, timeframe)`. It fills historical gaps before activating live subscriptions. `HistSeriesFeeder` replays independent series alongside K-lines in time order.
+### DataSourceCatalog
 
-Strategies declare subscriptions in `OnDataSubs` and receive a `strat.DataEvent` embedding the processed `*strat.DataFields` in `OnData`; see [Custom Time-Series Data](../guide/custom_data.md).
+`NewDataSourceCatalog()` creates an independent registry. `RegisterDataSource` registers an instance; `RegisterDataSourceFactory(name, factory)` registers a factory for independent instances; `RegisterFuncDataSource(info, fetch, subscribe)` registers a function-source factory automatically. Source names are unique within each catalog.
 
-The important concepts of this package are as follows:
-* **Provider**: A candlestick data provider, which can contain multiple Feeders with the same start and end times.
-* **Feeder**: Corresponds to a data source for a specific instrument and can include data for multiple timeframes.
-* **Spider**: Real-time monitoring of multiple exchange data, storing it in a database, and notifying subscribers via TCP.
-* **Miner**: Each exchange + market pair corresponds to one Miner.
-* **KLineWatcher**: A client used to communicate with the Spider.
+Explicit Runtimes use `RuntimeCatalogFromRegisteredSources()` to create local instances and status from process registrations. A source registered only through package-level `RegisterDataSource`, without a factory, is rejected. Register a factory for a complex source and return a fresh instance each time so stopping one task does not stop another.
 
-## Provider and Feeder
-Both backtesting and live trading require subscribing to candlestick data, and multiple strategies may run simultaneously, each subscribing to multiple timeframes. Therefore, the `IProvider` interface is introduced to support both backtesting (`HistProvider`) and live trading (`LiveProvider`).
+`GetDataSource`, `ListDataSources`, and `ListDataSourceStatus` have catalog methods and package-level compatibility entry points. The latter cannot retrieve another Runtime's state.
 
-candlestick data for a single instrument may be used by multiple strategies simultaneously. To avoid redundant data fetching by each strategy, the `IKlineFeeder` interface is introduced to support backtesting (`DBKlineFeeder`) and live trading (`KlineFeeder` + `KLineWatcher`).
+### SeriesRuntime / SeriesPlan
 
-Each `KlineFeeder` corresponds to one instrument and can include data for multiple timeframes. For example, the instrument BTC might be used by multiple strategies, subscribing to the 5m, 1h, and 1d timeframes. To avoid redundant data reading, only the smallest timeframe (in this case, 5m) will fetch the candlestick data; larger timeframe data will be aggregated from the smallest timeframe.
+Traditional TS tasks use `NewSeriesRuntimeWithRuntimeDeps(deps, sink)` and `Plan/Ensure/Apply/ActivateNew` to collect non-primary K-line subscriptions, fill coverage, and activate new sources. `HistSeriesFeeder` replays independent series with K-lines in visibility order. `ThirdPartySeriesBootstrap` is a compatibility alias of `SeriesPlan`.
 
-#### Suitable Scenarios for Provider and Feeder
-**Fetching data for multiple instruments and timeframes with consistent start and end times**. For example, during backtesting or live trading, a set of strategies is run over a specific period, involving multiple instruments and different timeframes. It is recommended to use `Provider` + `Feeder` in such cases. If data needs to be fetched for different time periods separately, multiple `Provider` + `Feeder` instances should be initialized.
+### SubscriptionPlan
 
-#### Unsuitable Scenarios for Provider and Feeder
-**Fetching data for different timeframes with inconsistent start and end times**. For example, if you want to fetch the last 1,000 candlesticks for both 1m and 1h timeframes for BTC for backtesting or other tasks, forcing the use of `Feeder` would result in the 1m timeframe fetching 60 * 1,000 candlesticks. In such cases, it is better to directly call `orm.GetOHLCV` to fetch data for each timeframe separately or initialize `Feeder` twice to fetch the data separately.
+Both engines use `catalog.CompileSubscriptionPlan(ctx, requests, options)` to merge `(source,sid,timeframe)` requirements, preserving consumer required/freshness/warmup requirements, unioning field projections, and taking the maximum warmup.
 
-## Important Structures
+```go
+type SubscriptionPlanOptions struct {
+    Namespace string
+    AnchorMS, EndMS int64
+    PageRows, PrefetchRows int
+    PageBytes int64
+    RequireManagedLive bool
+}
+```
 
-### Feeder
-Each Feeder corresponds to a trading pair and can contain multiple time dimensions.
+`Streams/Subscriptions/SourceMetadata/BudgetReport` expose plan views; `Bootstrap(ctx, repo)` fills history. PageBytes bounds decoded input pages, not process heap memory. Event streams use `FrequencyEvent` and `TimeFrame: "event"`; count-based warmup requires `ObservationWarmupSource.WarmupStart`, rather than multiplying observations by an invented interval.
 
-Public fields:
-- `ExSymbol *orm.ExSymbol` - Exchange trading pair information
-- `States []*PairTFCache` - Cache states for each time dimension
-- `WaitBar *banexg.Kline` - candlestick data waiting to be processed
-- `CallBack FnPairKline` - candlestick data callback function
-- `OnEnvEnd FuncEnvEnd` - Environment end callback function (requires position closing when futures main contract switches or stock has ex-rights)
-- `isWarmUp bool` - Whether currently in warm-up state
+### Live Installation
 
-### IKlineFeeder
-candlestick data feeder interface.
+`PrepareLivePlan` prepares independent subscriptions, warmup, and startup buffering. `SubscriptionInstallation.Activate` activates them; `CommitPrepared` supplies a commit callback boundary. `InstallLivePlan` prepares and activates. Sources requiring managed live operation implement `ManagedLiveSource.SubscribeManaged` and return an independent handle with `Stop()` and `Join() error`; `LiveSourceErrors` can report asynchronous failure.
 
-Public methods:
-- `getSymbol() string` - Get trading pair name
-- `getWaitBar() *banexg.Kline` - Get waiting candlestick
-- `setWaitBar(bar *banexg.Kline)` - Set waiting candlestick
-- `SubTfs(timeFrames []string, delOther bool) []string` - Subscribe to specified time periods
-- `WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.PrgBar) (int64, *errs.Error)` - Warm up time periods
-- `onNewBars(barTfMSecs int64, bars []*banexg.Kline) (bool, *errs.Error)` - Process new candlestick data
-- `getStates() []*PairTFCache` - Get cache states
+Startup buffering recursively clones Values, preserving concrete types, typed nil, NULL, missing keys, timestamps, and adjustment metadata. Budget overflow, source failure, and cancellation return errors. `Stop` seals intake; the owner then calls `Join` to wait for admitted callbacks and producers. A callback must not wait for itself. Failure to prepare a candidate generation must not close the serving generation.
 
-### KlineFeeder
-Each Feeder corresponds to a trading pair and can contain multiple time dimensions. Used in live trading.
-
-Public fields:
-- `Feeder` - Inherits from Feeder
-- `PreFire float64` - Ratio for triggering bar early
-- `showLog bool` - Whether to display logs
-
-### IHistKlineFeeder
-Historical candlestick data feeder interface, inherits from IKlineFeeder.
-
-Additional public methods:
-- `getNextMS() int64` - Get end timestamp of next bar
-- `DownIfNeed(sess *orm.Queries, exchange banexg.BanExchange, pBar *utils.PrgBar) *errs.Error` - Download candlesticks for entire range
-- `SetSeek(since int64)` - Set reading position
-- `GetBar() *banexg.Kline` - Get current candlestick
-- `RunBar(bar *banexg.Kline) *errs.Error` - Run callback function for candlestick
-- `CallNext()` - Move pointer to next candlestick
-
-### HistKLineFeeder
-Historical data feeder, base class for file feeder and database feeder.
-
-Public fields:
-- `KlineFeeder` - Inherits from KlineFeeder
-- `TimeRange *config.TimeTuple` - Time range
-- `TradeTimes [][2]int64` - Trading times
-
-### DBKlineFeeder
-Database candlestick feeder for backtesting.
-
-Public fields:
-- `HistKLineFeeder` - Inherits from HistKLineFeeder
-- `offsetMS int64` - Offset timestamp
-
-### IProvider
-Data provider interface.
-
-Public methods:
-- `LoopMain() *errs.Error` - Main loop
-- `SubWarmPairs(items map[string]map[string]int, delOther bool) *errs.Error` - Subscribe and warm up trading pairs
-- `UnSubPairs(pairs ...string) *errs.Error` - Unsubscribe trading pairs
-- `SetDirty()` - Set dirty flag
-
-### Provider
-Data provider base class.
-
-Public fields:
-- `holders map[string]T` - Map of held Feeders
-- `newFeeder func(pair string, tfs []string) (T, *errs.Error)` - Function to create new Feeder
-- `dirtyVers chan int` - Dirty version channel
-- `showLog bool` - Whether to display logs
-
-### HistProvider
-Historical data provider.
-
-Public fields:
-- `Provider[IHistKlineFeeder]` - Inherits from Provider
-- `pBar *utils.StagedPrg` - Progress bar
-
-### LiveProvider
-Real-time data provider.
-
-Public fields:
-- `Provider[IKlineFeeder]` - Inherits from Provider
-- `*KLineWatcher` - candlestick watcher
-
-### NotifyKLines
-candlestick notification message.
-
-Public fields:
-- `TFSecs int` - Time period (seconds)
-- `Interval int` - Update interval (seconds)
-- `Arr []*banexg.Kline` - candlestick array
-
-### KLineMsg
-candlestick message.
-
-Public fields:
-- `ExgName string` - Exchange name
-- `Market string` - Market type
-- `Pair string` - Trading pair
-- `TFSecs int` - Time period (seconds)
-- `Interval int` - Update interval (seconds)
-- `Arr []*banexg.Kline` - candlestick array
-
-### SaveKline
-Task for saving candlesticks.
-
-Public fields:
-- `Sid int32` - Trading pair ID
-- `TimeFrame string` - Time period
-- `Arr []*banexg.Kline` - candlestick array
-- `SkipFirst bool` - Whether to skip first
-- `MsgAction string` - Message action
-
-### FetchJob
-candlestick fetching task.
-
-Public fields:
-- `PairTFCache` - candlestick cache
-- `Pair string` - Trading pair
-- `CheckSecs int` - Check interval (seconds)
-- `Since int64` - Start timestamp
-- `NextRun int64` - Next run timestamp
-
-### Miner
-Data miner.
-
-Public fields:
-- `ExgName string` - Exchange name
-- `Market string` - Market type
-- `Fetchs map[string]*FetchJob` - Map of fetch tasks
-- `KlineReady bool` - Whether candlestick is ready
-- `KlinePairs map[string]bool` - Map of candlestick trading pairs
-- `TradeReady bool` - Whether trade is ready
-- `TradePairs map[string]bool` - Map of trade trading pairs
-- `BookReady bool` - Whether order book is ready
-- `BookPairs map[string]bool` - Map of order book trading pairs
-- `IsWatchPrice bool` - Whether to monitor price
-
-### LiveSpider
-Real-time data spider.
-
-Public fields:
-- `*utils.ServerIO` - Server IO
-- `miners map[string]*Miner` - Map of miners
-
-### SubKLineState
-candlestick subscription state.
-
-Public fields:
-- `Sid int32` - Trading pair ID
-- `NextNotify float64` - Next notification time
-- `PrevBar *banexg.Kline` - Previous candlestick
-
-### KLineWatcher
-candlestick watcher.
-
-Public fields:
-- `*utils.ClientIO` - Client IO
-- `jobs map[string]*PairTFCache` - Map of jobs
-- `OnKLineMsg func(msg *KLineMsg)` - Callback for receiving candlestick message
-- `OnTrade func(exgName, market string, trade *banexg.Trade)` - Callback for receiving trade
-
-### WatchJob
-Watch task.
-
-Public fields:
-- `Symbol string` - Trading pair
-- `TimeFrame string` - Time period
-- `Since int64` - Start timestamp
-
-## candlestick Data Related
-
-### NewKlineFeeder
-Create a new candlestick data feeder for handling real-time candlestick data.
-
-Parameters:
-- `exs *orm.ExSymbol` - Exchange trading pair information
-- `callBack FnPairKline` - candlestick data callback function
-- `showLog bool` - Whether to display logs
+## Providers and Feeders
 
-Returns:
-- `*KlineFeeder` - candlestick feeder instance
-- `*errs.Error` - Error information
+| Current type | Responsibility |
+| --- | --- |
+| `Feeder` / `SeriesFeeder` | Multi-period input, warmup, aggregation, and callbacks for one symbol |
+| `DBSeriesFeeder` | Database replay batches advanced with `GetBatch/RunBatch/CallNext` |
+| `TfSeriesLoader` | Reads and seeks one symbol/timeframe |
+| `HistSeriesFeeder` | Historical replay of an independent source |
+| `HistProvider` | Owns historical feeders and advances by end time |
+| `LiveProvider` | Owns live feeders and a `SeriesWatcher` |
 
-### NewDBKlineFeeder
-Create a new database candlestick feeder for reading historical candlestick data from database.
+Interfaces are `IDataFeeder`, `IHistFeeder`, and `IHistDataFeeder`, replacing the old IKlineFeeder/IHistKlineFeeder names. Main constructors:
 
-Parameters:
-- `exs *orm.ExSymbol` - Exchange trading pair information
-- `callBack FnPairKline` - candlestick data callback function
-- `showLog bool` - Whether to display logs
+```go
+NewSeriesFeeder(exs *orm.ExSymbol, callback FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error)
+NewDBSeriesFeeder(exs *orm.ExSymbol, callback FnDataSeries, showLog bool) (*DBSeriesFeeder, *errs.Error)
+NewHistProvider(callback FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool, progress *utils.StagedPrg) *HistProvider
+NewLiveProvider(callback FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error)
+```
 
-Returns:
-- `*DBKlineFeeder` - Database candlestick feeder instance
-- `*errs.Error` - Error information
+Use `WithRuntimeDeps` constructors for explicit tasks, supplying the Runtime's configuration, symbols, storage, clock, strategies, and callback boundary. Providers support `SubWarmPairs/UnSubPairs/LoopMain`; live resources support `Stop/Join`. `Feeder.CallBack` and `Feeder.OnEnvEnd` both receive DataSeries; the pending value is `WaitData`.
 
-### NewHistProvider
-Create a new historical data provider for managing historical candlestick data retrieval and processing.
+Built-in K-lines read the smallest physical period and aggregate derived periods. Merged projections pass extension fields through the same Values map. Storage enrichment fills absent keys without overwriting explicit NULL. Aggregation follows field rules, and adjustment changes only supported fields without dropping custom fields. For different time ranges, create separate providers or read through SeriesStore/Queries.GetSeriesFields.
 
-Parameters:
-- `callBack FnPairKline` - candlestick data callback function
-- `envEnd FuncEnvEnd` - Environment end callback function
-- `showLog bool` - Whether to display logs
-- `pBar *utils.StagedPrg` - Progress bar object
+## Spider and Watcher
 
-Returns:
-- `*HistProvider` - Historical data provider instance
+`LiveSpider` manages a `Miner` for each exchange/market, collecting, storing, and broadcasting data. The current message is `NotifySeries{TFSecs, Interval, Rows []*orm.DataSeries}`; `SeriesMsg` embeds it and adds `ExgName/Market/Pair`. The storage task is `SaveSeries`. These replace the documented NotifyKLines/KLineMsg/SaveKline structures.
 
-### RunHistFeeders
-Run historical candlestick feeder collection for batch processing of historical data.
+`NewSeriesWatcherWithRuntimeDeps(deps, addr)` creates the task's TCP client, with `OnDataMsg func(*SeriesMsg)` receiving series. `WatchJobs` declares exchange, market, type, symbol, and timeframe; `UnWatchJobs` cancels them. Spider/Watcher send complete Rows through BanIO. Network payloads use JSON, which does not guarantee integer widths or arbitrary Go types inside maps survive automatically. Strictly typed sources need a schema and decode validation.
 
-Parameters:
-- `makeFeeders func() []IHistKlineFeeder` - Function to create feeder list
-- `versions chan int` - Version control channel
-- `pBar *utils.PrgBar` - Progress bar object
+## Data Tools
 
-Returns:
-- `*errs.Error` - Error information
-
-### SortFeeders
-Sort or insert candlestick feeders.
-
-Parameters:
-- `holds []IHistKlineFeeder` - Existing feeder list
-- `hold IHistKlineFeeder` - Feeder to process
-- `insert bool` - Whether it's an insert operation
-
-Returns:
-- `[]IHistKlineFeeder` - Processed feeder list
-
-### NewLiveProvider
-Create a new real-time data provider for handling real-time candlestick data.
-
-Parameters:
-- `callBack FnPairKline` - candlestick data callback function
-- `envEnd FuncEnvEnd` - Environment end callback function
-
-Returns:
-- `*LiveProvider` - Real-time data provider instance
-- `*errs.Error` - Error information
-
-## Data Tools Related
-
-### FindPathNames
-Find all files with specified suffix in the given path.
-
-Parameters:
-- `inPath string` - Input path
-- `suffix string` - File suffix
-
-Returns:
-- `[]string` - List of file paths
-- `*errs.Error` - Error information
-
-### ReadZipCSVs
-Read CSV files from ZIP archive.
-
-Parameters:
-- `inPath string` - ZIP file path
-- `pBar *utils.PrgBar` - Progress bar object
-- `handle FuncReadZipItem` - Callback function for processing each CSV file
-- `arg interface{}` - Arguments passed to callback function
-
-Returns:
-- `*errs.Error` - Error information
-
-### RunSpider
-Run data spider service.
-
-Parameters:
-- `addr string` - Service listening address
-
-Returns:
-- `*errs.Error` - Error information
-
-### NewKlineWatcher
-Create a new candlestick data monitor.
-
-Parameters:
-- `addr string` - Connection address
-
-Returns:
-- `*KLineWatcher` - candlestick monitor instance
-- `*errs.Error` - Error information
-
-### RunFormatTick
-Run Tick data formatting tool.
-
-Parameters:
-- `args *config.CmdArgs` - Command line arguments
-
-Returns:
-- `*errs.Error` - Error information
-
-### Build1mWithTicks
-Build 1-minute candlesticks using Tick data.
-
-Parameters:
-- `args *config.CmdArgs` - Command line arguments
-
-Returns:
-- `*errs.Error` - Error information
-
-### CalcFilePerfs
-Calculate file performance metrics.
-
-Parameters:
-- `args *config.CmdArgs` - Command line arguments
-
-Returns:
-- `*errs.Error` - Error information
+`FindPathNames` and `ReadZipCSVs` handle files; `RunFormatTick/Build1mWithTicks` handle trades; `CalcFilePerfs` analyzes files. See [Custom Time-Series Data](../guide/custom_data.md) for storage and registration and [Factor API](factor.md) for native factor graphs and backtest/live composition.

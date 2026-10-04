@@ -31,17 +31,17 @@ func TestLiveWarmupBoundsSIDMajorHistoryAndNeverAdmitsHistoricalTargets(t *testi
 	limit := max(1, input.WarmupLength) + 1
 	for bar := 1; bar <= limit; bar++ {
 		at := int64(bar) * c.DecisionInterval
-		err = live.Warmup(context.Background(), factor.VersionRecord{Series: orm.DataSeries{Source: input.Source, TimeFrame: input.Frequency, Sid: 1, EndMS: at, Closed: true, IsWarmUp: true, Values: map[string]any{"close": float64(bar), "nullable": nil}}, EventTime: at, AvailableAt: at, IngestedAt: clock, Revision: 1, SourceVersion: "v1"})
+		err = live.Warmup(context.Background(), factor.VersionRecord{Series: orm.DataSeries{Source: input.Source, TimeFrame: input.TimeFrame, Sid: 1, EndMS: at, Closed: true, IsWarmUp: true, Values: map[string]any{"close": float64(bar), "nullable": nil}}, EventTime: at, AvailableAt: at, IngestedAt: clock, Revision: 1, SourceVersion: "v1"})
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	key := factor.StreamKey{SID: 1, Source: input.Source, Frequency: input.Frequency}
+	key := factor.StreamKey{SID: 1, Source: input.Source, TimeFrame: input.TimeFrame}
 	if len(live.warmRows[key]) != limit || live.pending != nil || live.sequence != 0 {
 		t.Fatal("warmup buffer/admission changed")
 	}
 	at := int64(limit+1) * c.DecisionInterval
-	if err := live.Warmup(context.Background(), factor.VersionRecord{Series: orm.DataSeries{Source: input.Source, TimeFrame: input.Frequency, Sid: 1, EndMS: at, Closed: true, Values: map[string]any{"close": 100.0}}, EventTime: at, AvailableAt: at, IngestedAt: clock, Revision: 1, SourceVersion: "v1"}); err == nil {
+	if err := live.Warmup(context.Background(), factor.VersionRecord{Series: orm.DataSeries{Source: input.Source, TimeFrame: input.TimeFrame, Sid: 1, EndMS: at, Closed: true, Values: map[string]any{"close": 100.0}}, EventTime: at, AvailableAt: at, IngestedAt: clock, Revision: 1, SourceVersion: "v1"}); err == nil {
 		t.Fatal("unbounded incomplete warmup accepted")
 	}
 }
@@ -76,7 +76,7 @@ func TestLiveWarmupReadinessRequiresCompleteDecisionSnapshots(t *testing.T) {
 					if scenario == "unaligned-events" {
 						at++
 					}
-					if err := live.Warmup(context.Background(), factor.VersionRecord{Series: orm.DataSeries{Source: input.Source, TimeFrame: input.Frequency, Sid: sid, EndMS: at, Closed: true, IsWarmUp: true, Values: map[string]any{"close": float64(bar) + float64(sid)}}, EventTime: at, AvailableAt: at, IngestedAt: clock, Revision: 1, SourceVersion: "v1"}); err != nil {
+					if err := live.Warmup(context.Background(), factor.VersionRecord{Series: orm.DataSeries{Source: input.Source, TimeFrame: input.TimeFrame, Sid: sid, EndMS: at, Closed: true, IsWarmUp: true, Values: map[string]any{"close": float64(bar) + float64(sid)}}, EventTime: at, AvailableAt: at, IngestedAt: clock, Revision: 1, SourceVersion: "v1"}); err != nil {
 						t.Fatal(err)
 					}
 				}

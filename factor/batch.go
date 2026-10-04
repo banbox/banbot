@@ -149,7 +149,7 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 				for time, snapshot := range snapshots {
 					var value Numeric
 					if node.spec.Operator == "field" {
-						value = snapshot.Numeric(sid, node.spec.Source, node.spec.SourceFrequency, node.spec.Field)
+						value = snapshot.Numeric(sid, node.spec.Source, node.spec.SourceTimeFrame, node.spec.Field)
 					} else {
 						inputs := make([]Numeric, len(node.inputs))
 						for i, input := range node.inputs {

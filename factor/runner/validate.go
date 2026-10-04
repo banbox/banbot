@@ -19,10 +19,10 @@ func ValidateReplayConfig(c Config, requireExecutionMetadata bool) error {
 	if c.Mode != Research && c.Mode != Weights && c.Mode != Events && c.Mode != Trade {
 		return errors.New("runner: unsupported mode")
 	}
-	if c.MaxRecords <= 0 || c.MaxPending <= 0 || c.DecisionInterval <= 0 || c.DecisionDelayMS < 0 || c.LatencyMS <= 0 || c.ExpiryMS <= c.LatencyMS || c.LabelWaitMS < 0 || c.Prices.Source == "" || c.Prices.Frequency == "" || c.Prices.Field == "" {
+	if c.MaxRecords <= 0 || c.MaxPending <= 0 || c.DecisionInterval <= 0 || c.DecisionDelayMS < 0 || c.LatencyMS <= 0 || c.ExpiryMS <= c.LatencyMS || c.LabelWaitMS < 0 || c.Prices.Source == "" || c.Prices.TimeFrame == "" || c.Prices.Field == "" {
 		return errors.New("runner: incomplete bounded replay/price configuration")
 	}
-	if (c.Mode == Events || c.Mode == Trade) && c.Prices.Frequency != "event" && c.Prices.Frequency != "1m" {
+	if (c.Mode == Events || c.Mode == Trade) && c.Prices.TimeFrame != "event" && c.Prices.TimeFrame != "1m" {
 		return errors.New("runner: events/trade require tick or 1m observable prices")
 	}
 	if c.Manifest.Costs.FundingPolicy != "explicit-zero" && c.Manifest.Costs.FundingPolicy != "required-stream" {

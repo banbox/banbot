@@ -8,3 +8,9 @@ entry 包提供了系统的入口点和命令行接口。
 
 ### RunCmd
 这是banbot的命令行入口方法，您可在自己的策略项目入口文件中调用此方法，以便从终端中访问banbot的各个子命令。
+
+## 因子引擎集成
+
+ValidateBacktestRunSpec 与执行共用无资源校验；混合 replay 要求 events。RegisterFactorLiveBinding 注册真实会话能力，未注册名明确失败。
+
+[因子 API](factor.md) / [指南](../guide/factor.md)

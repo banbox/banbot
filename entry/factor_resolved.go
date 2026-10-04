@@ -68,7 +68,7 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 			"currency": "Manifest.Currency", "initial_nav": "InitialNAV", "account_initial_nav": "AccountInitialNAV",
 			"max_records": "MaxRecords", "max_pending": "MaxPending", "decision_interval_ms": "DecisionInterval",
 			"decision_delay_ms": "DecisionDelayMS", "latency_ms": "LatencyMS", "expiry_ms": "ExpiryMS",
-			"price_source": "Prices.Source", "price_frequency": "Prices.Frequency", "price_field": "Prices.Field",
+			"price_source": "Prices.Source", "price_timeframe": "Prices.TimeFrame", "price_field": "Prices.Field",
 			"funding_source": "FundingSource", "funding_policy": "Manifest.Costs.FundingPolicy",
 			"visibility_policy": "Snapshot.VisibilityPolicy", "data_namespace": "ComputationContext.DataNamespace",
 			"margin_rate": "Execution.MarginRate", "max_account_margin": "Execution.MaxAccountMargin",
@@ -76,7 +76,7 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 		}
 		set := func(key string, value any, fallback string, fields ...string) {
 			if importedFields[key] != "" {
-				field := prefix + "factor.config." + importedFields[key]
+				field := prefix + "config." + importedFields[key]
 				if _, ok := spec.Origin(field); ok && (key != "account_initial_nav" || c.AccountInitialNAV != 0) {
 					// JSON overrides common defaults, then explicit policy IDs,
 					// data and account execution settings override JSON.
@@ -94,39 +94,39 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 		}
 		set("strategy_id", c.StrategyID, "registered strategy name", prefix+"id", prefix+"name")
 		set("account_id", c.AccountID, "configured default trading account", prefix+"account")
-		set("definition", c.Definition, "registered Go builder", prefix+"factor.definition", prefix+"name")
+		set("definition", c.Definition, "registered Go builder", prefix+"definition", prefix+"name")
 		if c.Expressions != nil {
-			set("expressions", c.Expressions, "declarative factor expressions", prefix+"factor.expressions", prefix+"factor.config.expressions")
+			set("expressions", c.Expressions, "declarative factor expressions", prefix+"expressions", prefix+"config.expressions")
 			plan, combo, err := runner.CompileDefinition(c)
 			if err != nil {
 				return err
 			}
 			set("factor_plan_hash", plan.Hash(), "compiled expression semantics")
-			set("combine", combo, "resolved expression combination", prefix+"factor.combo", prefix+"factor.expressions.combine")
+			set("combine", combo, "resolved expression combination", prefix+"combo", prefix+"expressions.combine")
 		}
 		set("execution_mode", c.Mode, "ordinary backtest events default", "execution.mode")
-		set("currency", c.Manifest.Currency, "USD default", prefix+"factor.manifest.currency", "stake_currency")
-		set("initial_nav", c.InitialNAV, "wallet capital times policy capital_weight; otherwise 10000", prefix+"capital_weight", prefix+"factor.initial_nav", "wallet_amounts."+c.Manifest.Currency)
+		set("currency", c.Manifest.Currency, "USD default", prefix+"manifest.currency", "stake_currency")
+		set("initial_nav", c.InitialNAV, "wallet capital times policy capital_weight; otherwise 10000", prefix+"capital_weight", prefix+"initial_nav", "wallet_amounts."+c.Manifest.Currency)
 		set("account_initial_nav", accountNAV, "unallocated account capital", "wallet_amounts."+c.Manifest.Currency)
-		set("max_records", c.MaxRecords, "100000 replay row default", "data.max_records", prefix+"factor.max_records")
-		set("max_pending", c.MaxPending, "64 pending evaluation default", prefix+"factor.decision.max_pending", prefix+"factor.max_pending")
-		set("decision_interval_ms", c.DecisionInterval, "1h decision default", prefix+"factor.decision.interval_ms", prefix+"run_timeframes", "run_timeframes")
-		set("decision_delay_ms", c.DecisionDelayMS, "zero publication delay", prefix+"factor.decision.delay_ms", prefix+"factor.decision_delay_ms")
-		set("latency_ms", c.LatencyMS, "1ms observable-event delay", prefix+"factor.decision.latency_ms", prefix+"factor.latency_ms")
-		set("expiry_ms", c.ExpiryMS, "60000ms target expiry", prefix+"factor.decision.expiry_ms", prefix+"factor.expiry_ms")
-		set("price_source", c.Prices.Source, "archive declared source or storage kline", prefix+"factor.prices.source")
-		set("price_frequency", c.Prices.Frequency, "archive declared frequency or events storage 1m", prefix+"factor.prices.frequency")
-		set("price_field", c.Prices.Field, "archive declared field or storage close", prefix+"factor.prices.field")
-		set("funding_source", c.FundingSource, "explicit required funding source", prefix+"factor.funding_source")
-		set("funding_policy", c.Manifest.Costs.FundingPolicy, "explicit simulation policy", "execution.accounts."+c.AccountID+".funding_policy", "execution.funding_policy", prefix+"factor.manifest.costs.funding_policy")
-		set("visibility_policy", c.Snapshot.VisibilityPolicy, "archive available-at identity", "data.pit_policy", prefix+"factor.snapshot.visibility_policy")
+		set("max_records", c.MaxRecords, "100000 replay row default", "data.max_records", prefix+"max_records")
+		set("max_pending", c.MaxPending, "64 pending evaluation default", prefix+"decision.max_pending", prefix+"max_pending")
+		set("decision_interval_ms", c.DecisionInterval, "1h decision default", prefix+"decision.interval_ms", prefix+"run_timeframes", "run_timeframes")
+		set("decision_delay_ms", c.DecisionDelayMS, "zero publication delay", prefix+"decision.delay_ms", prefix+"decision_delay_ms")
+		set("latency_ms", c.LatencyMS, "1ms observable-event delay", prefix+"decision.latency_ms", prefix+"latency_ms")
+		set("expiry_ms", c.ExpiryMS, "60000ms target expiry", prefix+"decision.expiry_ms", prefix+"expiry_ms")
+		set("price_source", c.Prices.Source, "archive declared source or storage kline", prefix+"prices.source")
+		set("price_timeframe", c.Prices.TimeFrame, "archive declared timeframe or events storage 1m", prefix+"prices.timeframe")
+		set("price_field", c.Prices.Field, "archive declared field or storage close", prefix+"prices.field")
+		set("funding_source", c.FundingSource, "explicit required funding source", prefix+"funding_source")
+		set("funding_policy", c.Manifest.Costs.FundingPolicy, "explicit simulation policy", "accounts."+c.AccountID+".funding_policy", "execution.funding_policy", prefix+"manifest.costs.funding_policy")
+		set("visibility_policy", c.Snapshot.VisibilityPolicy, "archive available-at identity", "data.pit_policy", prefix+"snapshot.visibility_policy")
 		set("data_namespace", namespace, "storage namespace or immutable archive identity", "data.namespace")
-		set("execution_history", c.Execution.HistoryPath, "file-free memory execution", "execution.accounts."+c.AccountID+".history", "execution.history", prefix+"factor.config.Execution.HistoryPath")
+		set("execution_history", c.Execution.HistoryPath, "file-free memory execution", "accounts."+c.AccountID+".history", "execution.history", prefix+"config.Execution.HistoryPath")
 		if input, ok := c.HistoricalInput.(interface{ InputBudgetReport() any }); ok {
 			set("input_budget", input.InputBudgetReport(), "compiled subscription input budget", "data.page_bytes", "data.page_rows", "data.prefetch_rows")
 		}
 		for name, value := range map[string]any{"margin_rate": c.Execution.MarginRate, "max_account_margin": c.Execution.MaxAccountMargin, "max_virtual_gross": c.Execution.MaxVirtualGross, "strategy_gross_limit": c.Execution.StrategyGrossLimit} {
-			set(name, value, "validated capital/leverage-derived risk", "execution.accounts."+c.AccountID+"."+name, "execution."+name, prefix+"factor.execution."+name)
+			set(name, value, "validated capital/leverage-derived risk", "accounts."+c.AccountID+"."+name, "execution."+name, prefix+"execution."+name)
 		}
 		strategies = append(strategies, values)
 	}

@@ -159,30 +159,6 @@ Parameters:
 Returns:
 - `string` - Formatted error message
 
-### GroupByPairQuotes
-Group trading pairs by quote currency.
-
-Format: `[key]:pairs...` converts to:
-```
-[key]
-Quote: Base1 Base2 ...
-```
-
-Parameters:
-- `items map[string][]string` - Trading pairs mapping
-
-Returns:
-- `string` - Formatted grouped string
-
-### CountDigit
-Count the number of digit characters in a string.
-
-Parameters:
-- `text string` - Input string
-
-Returns:
-- `int` - Number of digit characters
-
 ### SplitSolid
 Split string and ignore empty strings.
 
@@ -453,6 +429,8 @@ Returns:
 - `float64` - Expected profit
 - `float64` - Expectancy ratio
 
+Nonnegative samples count as wins. Expectancy `winRate * avgWin - lossRate * avgLoss` equals the sample arithmetic mean. The ratio is `(1 + avgWin/avgLoss) * winRate - 1`, where avgLoss is the mean absolute loss; it returns 0 without losses, and an empty input returns two zeros. This is not profit factor. The caller defines the sample unit; the live dashboard passes daily profits, rather than per-trade samples.
+
 ### CalcMaxDrawDown
 Calculate maximum drawdown.
 
@@ -540,17 +518,6 @@ Parameters:
 Returns:
 - `string` - File contents
 - `*errs.Error` - Error information
-
-### ReadLastNLines
-Read last N lines of a file.
-
-Parameters:
-- `filePath string` - File path
-- `lineCount int` - Number of lines to read
-
-Returns:
-- `[]string` - Last N lines content
-- `error` - Error information
 
 ### WriteCsvFile
 Write to CSV file.
@@ -725,3 +692,8 @@ Returns:
   - es-ES: Spanish
   etc.
 
+
+
+## Utility ownership corrections
+
+CountDigit(text string) int and GroupByPairQuotes(items map[string][]string, doSort bool) string belong to core. ReadLastNLines is no longer a public utils API; use actual exported file helpers.

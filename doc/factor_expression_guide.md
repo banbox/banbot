@@ -10,9 +10,9 @@
 
 ```yaml
 schema_version: 1
-frequency: 1h
+timeframe: 1h
 bindings:
-  kline: {source: kline, frequency: 1h}
+  kline: {source: kline, timeframe: 1h}
 params: {window: 24, reversal_window: 3}
 lets:
   price: 'positive(kline.close)'
@@ -35,15 +35,15 @@ go build -o banbot .
 ./banbot factor explain --spec formula.yml
 ```
 
-两条命令当前执行相同的编译检查，输出 JSON，包括 `hash`、`frequency`、`outputs`、`nodes`、`warmup`、`retention`、`inputs`、`combine`。它们不连接行情、数据库或账户，不能证明字段在真实数据中存在、历史长度足够或数据符合可见性要求。`--spec` 读取独立表达式映射，不读取整个策略配置；文件必须是一个 YAML 文档，大小不超过 1 MiB，未知配置字段会报错。
+两条命令当前执行相同的编译检查，输出 JSON，包括 `hash`、`timeframe`、`outputs`、`nodes`、`warmup`、`retention`、`inputs`、`combine`。它们不连接行情、数据库或账户，不能证明字段在真实数据中存在、历史长度足够或数据符合可见性要求。`--spec` 读取独立表达式映射，不读取整个策略配置；文件必须是一个 YAML 文档，大小不超过 1 MiB，未知配置字段会报错。
 
 ## 2. 配置字段与名称
 
 | 字段 | 用法 |
 |---|---|
 | `schema_version` | 必须为 `1` |
-| `frequency` | 决策频率，例如 `1h`、`1d`；策略中须匹配 `run_timeframes` |
-| `bindings` | 源别名到真实 `source`、源 `frequency` 及采样规则的映射 |
+| `timeframe` | 决策周期，例如 `1h`、`1d`；策略中须匹配 `run_timeframes` |
+| `bindings` | 源别名到真实 `source`、源 `timeframe` 及采样规则的映射 |
 | `params` | 有限数值参数，使用 `param.name` 引用 |
 | `lets` | 命名中间公式，使用 `factor.name` 引用 |
 | `outputs` | 至少一个公开输出，名字用于结果列和组合选择 |
@@ -57,7 +57,7 @@ factor.momentum   本定义集 lets 或 outputs 中的命名公式
 param.window      本定义集 params 中的编译期参数
 ```
 
-源别名不必与真实源名相同，例如 `prices: {source: kline, frequency: 1h}` 对应 `prices.close`。自定义数据源和字段同样适用，不要求固定 OHLCV 模型；原始数据继续通过 `orm.DataSeries.Values map[string]any` 提供。字段名包含连字符、空格等字符时写 `field("prices", "adjusted-close")`，参数是两个双引号字符串。
+源别名不必与真实源名相同，例如 `prices: {source: kline, timeframe: 1h}` 对应 `prices.close`。自定义数据源和字段同样适用，不要求固定 OHLCV 模型；原始数据继续通过 `orm.DataSeries.Values map[string]any` 提供。字段名包含连字符、空格等字符时写 `field("prices", "adjusted-close")`，参数是两个双引号字符串。
 
 参数名、因子名、绑定别名使用字母或下划线开头，后续可包含数字。绑定别名不能占用 `factor`、`param`、`label`、`ts`、`cs`、`group`。`lets` 和 `outputs` 共享因子名称空间，不能重名；可以前向引用，但不能成环。未使用的 `lets` 不增加最终计算和订阅，仍会接受语法、参数与引用校验。
 
@@ -121,7 +121,7 @@ combine:
   weights: {risk_adjusted: 0.7, reversal: 0.3}
 ```
 
-`fixed` 按给定权重直接相加，允许负权重，不自动归一化。每个选中列都必须有有限权重，权重不能指向未选中列；列名必须存在且不重复。非零权重列无效会使对应资产的组合分数无效，不会针对该资产临时重分配权重；零权重列不参与求值有效性判断。外层 `factor.combo` 如显式设置 `method`，会覆盖表达式内的整个组合配置。
+`fixed` 按给定权重直接相加，允许负权重，不自动归一化。每个选中列都必须有有限权重，权重不能指向未选中列；列名必须存在且不重复。非零权重列无效会使对应资产的组合分数无效，不会针对该资产临时重分配权重；零权重列不参与求值有效性判断。外层 `combo` 如显式设置 `method`，会覆盖表达式内的整个组合配置。
 
 `history-ic` 使用已经成熟且在决策时点可见的历史 IC，历史不足时退回等权。归档研究/回测需要配置可用标签；当前实盘驱动拒绝该方法，实盘使用 `fixed` 或 `equal`。未来标签不进入公式，不能写 `label.future_return`。
 
@@ -130,7 +130,6 @@ combine:
 下面是使用本地不可变归档的权重回测示例，保存为 `strategy.yml`。`data.gob` 需要包含所需资产的小时 K 线，并覆盖预热与研究标签区间。
 
 ```yaml
-config_version: 2
 wallet_amounts: {USD: 10000}
 execution: {mode: weights, funding_policy: explicit-zero}
 run_policy:
@@ -139,24 +138,23 @@ run_policy:
     engine: factor
     run_timeframes: [1h]
     params: {k: 3}
-    factor:
-      archive: data.gob
-      prices: {source: kline, frequency: 1h, field: close}
-      portfolio: {long_notional: 0.5, short_notional: 0.5, mode: full}
-      expressions:
-        schema_version: 1
-        frequency: 1h
-        bindings:
-          kline: {source: kline, frequency: 1h}
-        params: {window: 24}
-        outputs:
-          momentum: 'cs.zscore(ts.return(positive(kline.close), param.window))'
-        combine: {method: equal}
+    archive: data.gob
+    prices: {source: kline, timeframe: 1h, field: close}
+    portfolio: {long_notional: 0.5, short_notional: 0.5, mode: full}
+    expressions:
+      schema_version: 1
+      timeframe: 1h
+      bindings:
+        kline: {source: kline, timeframe: 1h}
+      params: {window: 24}
+      outputs:
+        momentum: 'cs.zscore(ts.return(positive(kline.close), param.window))'
+      combine: {method: equal}
 ```
 
-在表达式模式下，`run_policy.name` 是策略名称，无需注册同名 Go definition。不要同时指定 `factor.definition`；Go API 中的 `Config.Expressions` 也不能与 `Config.Plan` 或非空 `Config.Definition` 一起使用。策略内省略表达式 `frequency` 时会继承决策时间周期；独立 `formula.yml` 和 Go `expr.Spec` 则必须自行提供。
+在表达式模式下，`run_policy.name` 是策略名称，无需注册同名 Go definition。不要同时指定 `definition`；Go API 中的 `Config.Expressions` 也不能与 `Config.Plan` 或非空 `Config.Definition` 一起使用。策略内省略表达式 `timeframe` 时会继承决策时间周期；独立 `formula.yml` 和 Go `expr.Spec` 则必须自行提供。
 
-外层 `run_policy.params.k` 控制选股数量；`factor.expressions.params.window` 控制公式窗口，两者不会自动相互复制。
+外层 `run_policy.params.k` 控制选股数量；`expressions.params.window` 控制公式窗口，两者不会自动相互复制。
 
 ```sh
 ./banbot factor research --config strategy.yml
@@ -164,7 +162,7 @@ run_policy:
 ./banbot backtest --config strategy.yml
 ```
 
-`factor research` 使用统一驱动和成熟标签生成因子研究结果。普通配置默认提供一个决策周期的 executable-return 标签；需要自定义时可设置 `factor.research.labels`。归档驱动当前只支持一个 executable-return 标签周期，例如：
+`factor research` 使用统一驱动和成熟标签生成因子研究结果。普通配置默认提供一个决策周期的 executable-return 标签；需要自定义时可设置 `research.labels`。归档驱动当前只支持一个 executable-return 标签周期，例如：
 
 ```yaml
 research:
@@ -180,7 +178,7 @@ research:
 
 从普通历史数据库读取时，使用已有数据库、市场、交易对池和 `time_range` 基础配置，移除 `archive`，声明 `data.pit_policy: static-approximation`。普通最新值存储不能证明历史修订的严格 PIT；需要严格 PIT 时使用具有可见性和版本记录的不可变归档或受验证的历史输入。
 
-成交价格 `factor.prices` 独立于因子输入。资金费率、财务字段等不能作为隐式成交价格；归档模式未显式指定时只尝试已声明的通用 tick/kline 价格源。`events` 和真实交易还要求 tick/event 或 1m 可观察价格、执行单位及账户绑定。使用 `factor backtest --mode events` 或 `factor trade` 前须完成相应执行配置，单独一份公式不能提供这些资源。`funding_policy: explicit-zero` 是明确忽略资金费率的假设；需要真实资金费用时声明所需 funding 流。
+成交价格 `prices` 独立于因子输入。资金费率、财务字段等不能作为隐式成交价格；归档模式未显式指定时只尝试已声明的通用 tick/kline 价格源。`events` 和真实交易还要求 tick/event 或 1m 可观察价格、执行单位及账户绑定。使用 `factor backtest --mode events` 或 `factor trade` 前须完成相应执行配置，单独一份公式不能提供这些资源。`funding_policy: explicit-zero` 是明确忽略资金费率的假设；需要真实资金费用时声明所需 funding 流。
 
 ## 6. 用常规 Go 代码构建策略
 
@@ -216,10 +214,10 @@ func buildCodeFactors(c runner.Config, multi bool) (*factor.Plan, research.Combo
         }
         window = int(value)
     }
-    if c.Factor.Source == "" || c.Factor.Field == "" || c.Factor.Frequency == "" {
-        return nil, research.ComboSpec{}, fmt.Errorf("source, field and frequency are required")
+    if c.Factor.Source == "" || c.Factor.Field == "" || c.Factor.TimeFrame == "" {
+        return nil, research.ComboSpec{}, fmt.Errorf("source, field and timeframe are required")
     }
-    price := factor.Positive(factor.Field(c.Factor.Source, c.Factor.Field, c.Factor.Frequency))
+    price := factor.Positive(factor.Field(c.Factor.Source, c.Factor.Field, c.Factor.TimeFrame))
     momentum := factor.Return(price, window)
     builder := factor.New().Add("momentum", factor.ZScore(momentum))
     combo := research.ComboSpec{Method: research.Equal, Columns: []string{"momentum"}}
@@ -253,7 +251,6 @@ func main() { entry.RunCmd() }
 注册后，YAML 不需要 `expressions`；策略参数通过入口进入 `c.Manifest.Parameters`。以下归档配置与第 5 节使用相同的价格和持仓口径：
 
 ```yaml
-config_version: 2
 wallet_amounts: {USD: 10000}
 execution: {mode: weights, funding_policy: explicit-zero}
 run_policy:
@@ -262,13 +259,12 @@ run_policy:
     engine: factor
     run_timeframes: [1h]
     params: {window: 24, k: 3}
-    factor:
-      archive: data.gob
-      prices: {source: kline, frequency: 1h, field: close}
-      portfolio: {long_notional: 0.5, short_notional: 0.5, mode: full}
+    archive: data.gob
+    prices: {source: kline, timeframe: 1h, field: close}
+    portfolio: {long_notional: 0.5, short_notional: 0.5, mode: full}
 ```
 
-保存为 `code_strategy.yml`；将 `name` 改为 `CodeMomentumV1` 可选择单因子版本。也可以用 `factor.definition` 明确指定 Go definition，让 `run_policy.name` 使用其他策略展示名。
+保存为 `code_strategy.yml`；将 `name` 改为 `CodeMomentumV1` 可选择单因子版本。也可以用 `definition` 明确指定 Go definition，让 `run_policy.name` 使用其他策略展示名。
 
 ```sh
 go build -o factorbot ./cmd/factorbot
@@ -281,13 +277,13 @@ go build -o factorbot ./cmd/factorbot
 
 ### 自定义计算和持仓构建
 
-原生 Go builder 支持表达式白名单以外的节点，例如 `GroupDemean`、`GroupZScore`；其源频率、分类字段和可见性契约仍需由调用方明确提供，不能推断任意混合频率已经可用。新公式优先组合现有原生 `Add/Sub/Mul/Div/Neg/Abs/Log/Sqrt/Pow/Min/Max` 等节点，预热和公共子图仍由 Compile 推导。
+原生 Go builder 支持表达式白名单以外的节点，例如 `GroupDemean`、`GroupZScore`；其源周期、分类字段和可见性契约仍需由调用方明确提供，不能推断任意混合周期已经可用。新公式优先组合现有原生 `Add/Sub/Mul/Div/Neg/Abs/Log/Sqrt/Pow/Min/Max` 等节点，预热和公共子图仍由 Compile 推导。
 
 只有缺少原子计算时，才使用 `factor.Custom(version, inputs, evaluate)` 编写可信纯逐点函数。`inputs` 声明依赖，回调消费 `[]factor.Numeric` 并返回 Numeric；必须保留无效原因，不能偷偷读取账户、最新行情或修改共享状态。不同实现必须使用不同版本，编译器不会自动识别闭包代码。涉及历史状态的新算子需要内核支持和 Session/Batch、克隆与恢复测试，不能在 Custom 闭包中自建隐式滚动状态。
 
 因子和组合分数确定后，默认持仓构建器按 `score` 选择最高/最低各 `k` 个有效、可投资且可交易资产，根据 `long_notional`、`short_notional` 分配冻结 NAV 的名义权重。至少需要 `2*k` 个有效候选；不足或全部分数相同时跳过替换并保持已有组合，同时输出诊断。它输出的是目标组合，不是策略逐资产自行下单。
 
-需要行业约束、风险预算或其他持仓规则时，可使用 `runner.RegisterPortfolioBuilder` 注册独立版本名，并在 `factor.portfolio.builder` 中指定。其函数签名见 [definition.go](../factor/runner/definition.go)：消费冻结 Frame、Universe、PortfolioSpec 和 PortfolioDefinition，返回 TargetPortfolio、诊断和错误。也可在 Go Config 中传入 `PortfolioBuilder`，同时提供 manifest 的版本名。组合与账户状态应保持在各自运行实例中，不放进共享因子计算状态。
+需要行业约束、风险预算或其他持仓规则时，可使用 `runner.RegisterPortfolioBuilder` 注册独立版本名，并在 `portfolio.builder` 中指定。其函数签名见 [definition.go](../factor/runner/definition.go)：消费冻结 Frame、Universe、PortfolioSpec 和 PortfolioDefinition，返回 TargetPortfolio、诊断和错误。也可在 Go Config 中传入 `PortfolioBuilder`，同时提供 manifest 的版本名。组合与账户状态应保持在各自运行实例中，不放进共享因子计算状态。
 
 ## 7. 两种定义方式的回测与实盘
 
@@ -298,16 +294,15 @@ Go 和表达式只影响计划来源，后续命令、行情、执行和账户�
 | 因子研究 | `factor research --config strategy.yml` | 研究覆盖率、IC/RankIC 等，必须有成熟标签及所需观察价格 |
 | 权重回测 | `factor backtest --mode weights --config strategy.yml` | 按目标权重和成本口径回放，用于快速比较组合 |
 | 事件回测 | `factor backtest --mode events --config strategy.yml` | 通过账户账本与模拟执行器处理订单/成交，需要可观察执行价格及合约单位 |
-| 普通回测入口 | `backtest --config strategy.yml` | 使用统一 v2 策略配置，执行模式由配置/普通回测装配决定 |
+| 普通回测入口 | `backtest --config strategy.yml` | 使用统一策略配置，执行模式由配置/普通回测装配决定 |
 | 本地模拟回放 | `factor trade --dry-run --config strategy.yml` | 当前实现转换为 events 历史回放，不是连接实时行情的 paper trading |
 | 实盘 | `factor trade --config strategy.yml --live-provider binding-name` | 使用已注册、通过能力验证的实盘绑定及真实账户 |
 
 ### 数据库回测和事件执行
 
-归档示例可直接使用 `factor.archive`，无需数据库。如果使用已有行情数据库，将以下内容保存为策略覆盖配置，并与完整基础配置一起加载：
+归档示例可直接使用 `archive`，无需数据库。如果使用已有行情数据库，将以下内容保存为策略覆盖配置，并与完整基础配置一起加载：
 
 ```yaml
-config_version: 2
 data: {pit_policy: static-approximation}
 execution: {mode: weights, funding_policy: explicit-zero}
 run_policy:
@@ -316,10 +311,9 @@ run_policy:
     engine: factor
     run_timeframes: [1h]
     params: {window: 24, k: 3}
-    factor:
-      prices: {source: kline, frequency: 1m, field: close}
-      decision: {latency_ms: 1, expiry_ms: 120000}
-      portfolio: {long_notional: 0.5, short_notional: 0.5, mode: full}
+    prices: {source: kline, timeframe: 1m, field: close}
+    decision: {latency_ms: 1, expiry_ms: 120000}
+    portfolio: {long_notional: 0.5, short_notional: 0.5, mode: full}
 ```
 
 ```sh
@@ -327,7 +321,7 @@ run_policy:
 ./factorbot factor backtest --mode events --config base.yml --config code_storage.yml
 ```
 
-`base.yml` 必须提供数据库、市场、账户、交易对池和 `time_range`。表达式策略则在此覆盖配置中换成对应 `factor.expressions`，并移除 Go definition 选择。事件执行还需要可验证的 `execution.instruments`、保证金和账户/策略风险限制；普通存储装配可以从已验证市场信息补齐支持的单位，归档需要明确提供完整元数据。执行配置字段见 [advanced.go](../config/advanced.go)，校验条件见 [validate.go](../factor/runner/validate.go) 和 [factor_storage.go](../entry/factor_storage.go)。
+`base.yml` 必须提供数据库、市场、账户、交易对池和 `time_range`。表达式策略则在此覆盖配置中换成对应 `expressions`，并移除 Go definition 选择。事件执行还需要可验证的 `execution.instruments`、保证金和账户/策略风险限制；普通存储装配可以从已验证市场信息补齐支持的单位，归档需要明确提供完整元数据。执行配置字段见 [advanced.go](../config/advanced.go)，校验条件见 [validate.go](../factor/runner/validate.go) 和 [factor_storage.go](../entry/factor_storage.go)。
 
 小时/日线可作为因子输入，但 events 使用独立 tick/event 或 1m 价格流。仅有日 K 的研究归档不能充当真实事件撮合数据。费用、资金费率、延迟和有效期应在比较两种定义方式时保持相同；单因子 IC 也不能代替费用后的组合回测收益。
 
@@ -351,16 +345,16 @@ run_policy:
 
 ## 8. 多源与显式采样
 
-源频率与决策频率相同且按当前事件取值时，`sampling` 可省略。不同频率或 event 源必须显式声明 asof 和正的最大年龄，例如：
+源周期与决策周期相同且按当前事件取值时，`sampling` 可省略。不同周期或 event 源必须显式声明 asof 和正的最大年龄，例如：
 
 ```yaml
 schema_version: 1
-frequency: 1h
+timeframe: 1h
 bindings:
-  kline: {source: kline, frequency: 1h}
+  kline: {source: kline, timeframe: 1h}
   funding:
     source: funding
-    frequency: event
+    timeframe: event
     sampling: asof
     max_age_ms: 28800000
 outputs:
@@ -402,9 +396,9 @@ import (
 
 func main() {
     plan, err := expr.Compile(expr.Spec{
-        SchemaVersion: 1, Frequency: "1h",
+        SchemaVersion: 1, TimeFrame: "1h",
         Bindings: map[string]expr.Binding{
-            "kline": {Source: "kline", Frequency: "1h"},
+            "kline": {Source: "kline", TimeFrame: "1h"},
         },
         Outputs: map[string]string{
             "momentum": "cs.zscore(ts.return(positive(kline.close),1))",
@@ -427,7 +421,7 @@ func main() {
                 Values: map[string]any{"close": price, "nullable": nil},
             }, 1, at, at, "v1"))
             requirements = append(requirements, factor.Requirement{
-                SID: sid, Source: "kline", Frequency: "1h", EventTime: at,
+                SID: sid, Source: "kline", TimeFrame: "1h", EventTime: at,
             })
         }
         snapshot, err := factor.Freeze(factor.SnapshotSpec{
@@ -488,7 +482,7 @@ go test ./examples/crosssection -run '^$' -bench '^BenchmarkFactorVersions$' -be
 | 窗口或 `ddof` 超界 | 使用编译期整数参数；`ts.return(...,0)` 无效，零 lag 有效 |
 | `cyclic factor reference` | 将相互引用的 lets/outputs 改为无环依赖 |
 | `TS windows over cross-section results` | 先做时序窗口，再做截面变换 |
-| 频率不匹配或缺少 asof | 同频源用当前事件，异频/event 源显式配置采样和正最大年龄 |
+| 周期不匹配或缺少 asof | 同周期源用当前事件，不同周期/event 源显式配置采样和正最大年龄 |
 | 组合列或权重错误 | 核对 outputs、columns、weights，以及外层 combo 覆盖 |
 | 源码位置错误 | `outputs.name:行:列` 指公式字符串中的位置，不是 YAML 文件物理行号 |
 | 编译成功但结果无效 | 核对原始字段/类型、预热、有效样本、源可见性和年龄；不要统一填零 |
@@ -497,3 +491,9 @@ go test ./examples/crosssection -run '^$' -bench '^BenchmarkFactorVersions$' -be
 资源限制为单公式 16 KiB、全部公式文本 256 KiB、AST 节点 8192、解析/展开深度预算 64；`lets + outputs`、bindings 和 params 的声明数量分别不超过 512。解析器对内部递归层数也计数，因此嵌套括号/函数未必能达到 64 个。限制是编译边界，不是对任意资产数量下内存使用的保证。
 
 当前没有赋值、比较、逻辑条件、三元/`where`、自动填补、数组索引、注释或任意 Go/Python 调用；不支持 `^`、十六进制浮点及数字下划线。也没有跨定义库引用、自动候选生成或 `factor operators/generate/test` 命令。需要新的原子算法时按照架构文档中的扩展步骤修改 Go 内核，并补充独立数值和 Session/Batch 测试。
+
+## 2026-10-04 双引擎使用入口
+
+run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
+
+execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；factor trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

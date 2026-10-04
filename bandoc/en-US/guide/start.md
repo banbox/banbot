@@ -89,3 +89,9 @@ When scanning the green WeChat QR code, please add the note “banbot.”
 [Discord Server](https://discord.com/invite/XXjA8ctqga)
 
 [Telegram Group](https://t.me/banbot_quant)
+
+## Factor and cross-sectional engine
+
+Banbot supports time_series and factor engines: per-symbol event callbacks or Universe-wide factor rounds with multiple outputs, cross-sectional transforms and target portfolios. Both may appear in one run_policy; omitted engine retains time-series behavior.
+
+See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).

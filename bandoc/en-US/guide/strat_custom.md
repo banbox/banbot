@@ -508,7 +508,7 @@ For all open long orders, a stop loss of 50% of the position is set. When the pr
 Sometimes you may need to perform some calculations (such as correlation coefficients) for all symbols of the current strategy together, get some intermediate states to save, or open or close orders together.
 In this case, you can use the `OnBatchJobs` or `OnBatchInfos` callback function.
 `OnBatchJobs` is triggered only after main `OnData(RoleMain)`/`OnBar`; `OnBatchInfos` is triggered only after auxiliary `OnData(RoleInfo)`/`OnInfoBar`. They are enabled by `BatchInOut` and `BatchInfo`, respectively.
-> Note that the jobs parameter of OnBatchJobs is obtained from a map, so the order is not guaranteed.
+> Ordinary mode does not promise `OnBatchJobs` job order; strict backtests use deterministic ordering from the instance `BatchState`.
 ```go
 func calcCorrs(jobs []*strat.StratJob, isBig bool) {
 	// Calculate the average correlation coefficient between each symbol and other varieties, and save it to More
@@ -865,3 +865,15 @@ Set stop-loss for all orders in the specified direction for the current strategy
 
 **SetAllTakeProfit(dirt float64, args \*ormo.ExitTrigger)**  
 Set take-profit for all orders in the specified direction for the current strategy task. The parameter `dirt` can be `core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth`.
+
+## Factor and cross-sectional engine
+
+TradeStrat/OnBar belongs to time_series. Factors register native Plan/ComboSpec through runner.RegisterDefinition or declare multiple expressions outputs instead of per-symbol callbacks. Portfolio builders consume frozen Frame/Universe, never future labels. Mixed same-account policies declare id/account/capital_weight while state and lifecycle borrows remain independent.
+
+See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
+
+## Runtime and callback state
+
+Ordinary commands let entry create and close a task Runtime. Its configuration snapshot is read-only; accounts, clock, strategy jobs, prices and batch queue belong to that run. Embedded or concurrent tasks should use explicit Runtime dependencies instead of reading or writing package-level config/core/btime compatibility state inside callbacks. Job context and data events must come from the current task; live time and the advancing backtest clock are distinct.
+
+`BatchInOut`/`BatchInfo` use the trader’s `BatchState`. Strict replay orders ready batches and jobs deterministically; ordinary execution does not promise map order. Factor decisions freeze the entire Universe and produce target portfolios, which is a separate contract from time-series batch callbacks. See [Runtime API](../api/runtime.md) and the [factor guide](./factor.md).

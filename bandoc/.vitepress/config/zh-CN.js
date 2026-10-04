@@ -26,6 +26,7 @@ export default defineConfig({
                         { text: '数据库', link: '/zh-CN/guide/database' },
                         { text: '自定义时序数据', link: '/zh-CN/guide/custom_data' },
                         { text: '自定义策略', link: '/zh-CN/guide/strat_custom' },
+                        { text: '多因子与截面', link: '/zh-CN/guide/factor' },
                         { text: '回测', link: '/zh-CN/guide/backtest' },
                         { text: '品种管理器', link: '/zh-CN/guide/pair_filters' },
                         { text: '实时交易', link: '/zh-CN/guide/live_trading' },

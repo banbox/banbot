@@ -9,7 +9,7 @@
     "SourceVersions":{"kline":"v1","tick":"v1","funding":"v1"},
     "AdjustmentVersion":"raw","VisibilityPolicy":"available-at"
   },
-  "Factor":{"Source":"kline","Field":"close","Frequency":"1h","Window":24,"DDOF":1,"WinsorTail":0.01,"Standardize":true},
+  "Factor":{"Source":"kline","Field":"close","TimeFrame":"1h","Window":24,"DDOF":1,"WinsorTail":0.01,"Standardize":true},
   "Manifest":{
     "Currency":"USD","CodeRevision":"replace-with-source-revision",
     "Portfolio":{"K":1,"LongNotional":0.5,"ShortNotional":0.5,"Mode":"full"},
@@ -17,7 +17,7 @@
     "Costs":{"FeeRate":0.001,"SlippageRate":0.001,"FundingPolicy":"required-stream"}
   },
   "StrategyID":"momentum-vol","AccountID":"paper-usd","InitialNAV":10000,
-  "Prices":{"Source":"tick","Frequency":"event","Field":"price"},"FundingSource":"funding",
+  "Prices":{"Source":"tick","TimeFrame":"event","Field":"price"},"FundingSource":"funding",
   "Execution":{
     "StorePath":"new-paper.db","SenderLeaseDir":"paper-leases",
     "MarginRate":"0.1","MaxAccountMargin":"10000","MaxVirtualGross":"20000","StrategyGrossLimit":"20000",

@@ -37,7 +37,7 @@ func TestDAGCanonicalSharingParameterVersionAndDefensiveCopy(t *testing.T) {
 	}
 }
 
-func TestDAGRejectsCycleLabelsMissingCustomContractAndMixedFrequency(t *testing.T) {
+func TestDAGRejectsCycleLabelsMissingCustomContractAndMixedTimeFrame(t *testing.T) {
 	root := Field("prices", "close", "1h")
 	cycle := EMA(root, 3)
 	cycle.Inputs[0] = cycle
@@ -46,7 +46,7 @@ func TestDAGRejectsCycleLabelsMissingCustomContractAndMixedFrequency(t *testing.
 	custom := node("custom", TS, root)
 	custom.Spec.Version = ""
 	custom.Evaluate = func(values []Numeric) Numeric { return values[0] }
-	for name, n := range map[string]*Node{"cycle": cycle, "label": Return(label, 1), "custom": custom, "period": EMA(root, 0), "ddof": StdDev(root, 3, 3), "frequency": Linear([]*Node{root, Field("prices", "close", "1m")}, []float64{1, 1})} {
+	for name, n := range map[string]*Node{"cycle": cycle, "label": Return(label, 1), "custom": custom, "period": EMA(root, 0), "ddof": StdDev(root, 3, 3), "timeframe": Linear([]*Node{root, Field("prices", "close", "1m")}, []float64{1, 1})} {
 		if _, err := New().Add(name, n).Compile(); err == nil {
 			t.Fatalf("accepted invalid %s graph", name)
 		}

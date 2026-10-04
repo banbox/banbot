@@ -13,7 +13,7 @@ import (
 )
 
 func expressionConfig() *expr.Spec {
-	return &expr.Spec{SchemaVersion: 1, Frequency: "1h", Bindings: map[string]expr.Binding{"kline": {Source: "kline", Frequency: "1h"}}, Params: map[string]float64{"window": 3}, Lets: map[string]string{"mom": "ts.return(kline.close, param.window)"}, Outputs: map[string]string{"momentum": "cs.zscore(factor.mom)"}, Combine: research.ComboSpec{Method: research.Fixed, Weights: map[string]float64{"momentum": 1}}}
+	return &expr.Spec{SchemaVersion: 1, TimeFrame: "1h", Bindings: map[string]expr.Binding{"kline": {Source: "kline", TimeFrame: "1h"}}, Params: map[string]float64{"window": 3}, Lets: map[string]string{"mom": "ts.return(kline.close, param.window)"}, Outputs: map[string]string{"momentum": "cs.zscore(factor.mom)"}, Combine: research.ComboSpec{Method: research.Fixed, Weights: map[string]float64{"momentum": 1}}}
 }
 
 func TestExpressionDefinitionAndComboValidation(t *testing.T) {
@@ -73,7 +73,7 @@ func TestExpressionLiveDecisionMatchesGo(t *testing.T) {
 	c.Manifest.Portfolio.K = 1
 	sids := []int32{1, 2, 3, 4}
 	c.Snapshot.Universe = factor.Universe{Version: "live-expressions", Static: true, Investable: sids, Tradable: sids, Reference: sids, Evaluation: sids}
-	c.Prices = PriceStream{Source: "kline", Frequency: "1h", Field: "close"}
+	c.Prices = PriceStream{Source: "kline", TimeFrame: "1h", Field: "close"}
 	var baseline map[int64]map[int32]float64
 	for _, expressions := range []bool{false, true} {
 		if expressions {

@@ -19,18 +19,18 @@ func validateAdvanced(path string, fields map[string]any) error {
 		allowed = "namespace page_rows prefetch_rows page_bytes archive max_records pit_policy"
 	case path == "execution":
 		allowed = "mode store history sender_lease_dir live_provider funding_policy accounts instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit"
-	case strings.HasPrefix(path, "execution.accounts."):
+	case strings.HasPrefix(path, "execution.accounts."), strings.HasPrefix(path, "accounts.") && strings.Count(path, ".") == 1:
 		allowed = "mode store history sender_lease_dir live_provider funding_policy instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit"
-	case strings.HasSuffix(path, ".factor"):
+	case strings.HasSuffix(path, ".factor"), strings.HasPrefix(path, "run_policy[") && strings.HasSuffix(path, "]") && !strings.Contains(path, "."):
 		allowed = "archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records config definition expressions"
 	case strings.HasSuffix(path, ".expressions"):
-		allowed = "schema_version frequency bindings params lets outputs combine"
+		allowed = "schema_version timeframe bindings params lets outputs combine"
 	case strings.Contains(path, ".expressions.bindings."):
-		allowed = "source frequency sampling max_age_ms"
+		allowed = "source timeframe sampling max_age_ms"
 	case strings.HasSuffix(path, ".decision"):
 		allowed = "interval_ms delay_ms latency_ms expiry_ms max_pending"
 	case strings.HasSuffix(path, ".prices"):
-		allowed = "source frequency field"
+		allowed = "source timeframe field"
 	case strings.HasSuffix(path, ".combo"), strings.HasSuffix(path, ".expressions.combine"):
 		allowed = "method columns weights"
 	case strings.HasSuffix(path, ".portfolio"):
@@ -61,7 +61,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			return fmt.Errorf("%s cannot be null", field)
 		}
 		switch key {
-		case "archive", "store", "history", "sender_lease_dir", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "frequency", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder", "definition", "sampling":
+		case "archive", "store", "history", "sender_lease_dir", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "timeframe", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder", "definition", "sampling":
 			if text, ok := value.(string); !ok || strings.TrimSpace(text) == "" {
 				return fmt.Errorf("%s must be a nonempty string", field)
 			}

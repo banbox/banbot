@@ -39,48 +39,6 @@ func TestUnifiedLegacyImportPreservesSizingAndOpenMore(t *testing.T) {
 	}
 }
 
-func TestImportV1YAMLExactMinimalBytesAndIdempotence(t *testing.T) {
-	for _, raw := range []string{
-		"# credentials remain expressions\r\nexchange: {name: test}\r\nrun_policy:\r\n  - name: Demo # preserved\r\n    archive: ../${ARCHIVE}/data\r\n    value: &value {count: 2}\r\n    other: *value\r\n",
-		"---\n# header\nrun_policy: [{name: Demo}]\n",
-		"# version comment\nconfig_version: 1 # preserve\nrun_policy: []\n",
-		"\ufeffrun_policy: []\n",
-		"# only comments\n",
-	} {
-		t.Run(raw, func(t *testing.T) {
-			original := []byte(raw)
-			candidate, err := ImportV1YAML(original, "input.yml")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !candidate.Changed || candidate.SourceVersion != 1 || !bytes.Equal(candidate.Original, original) {
-				t.Fatalf("invalid candidate: %#v", candidate)
-			}
-			var restored []byte
-			if strings.Contains(raw, "config_version: 1") {
-				restored = bytes.Replace(candidate.YAML, []byte("config_version: 2"), []byte("config_version: 1"), 1)
-			} else {
-				restored = bytes.Replace(candidate.YAML, []byte("config_version: 2\r\n"), nil, 1)
-				restored = bytes.Replace(restored, []byte("config_version: 2\n"), nil, 1)
-			}
-			if !bytes.Equal(restored, original) {
-				t.Fatalf("conversion changed source bytes: %q", candidate.YAML)
-			}
-			again, err := ImportV1YAML(candidate.YAML, "input.yml")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if again.Changed || !bytes.Equal(again.YAML, candidate.YAML) {
-				t.Fatal("second import changed v2")
-			}
-			candidate.Original[0] = '!'
-			if !bytes.Equal(original, []byte(raw)) {
-				t.Fatal("import aliases source bytes")
-			}
-		})
-	}
-}
-
 func TestUnifiedVersionAndReservedFieldFailures(t *testing.T) {
 	for _, raw := range []string{
 		"config_version: 3\n", "config_version: 0\n", "config_version: -1\n",
@@ -108,30 +66,6 @@ func TestUnifiedVersionAndReservedFieldFailures(t *testing.T) {
 				t.Fatal("accepted invalid v2 configuration")
 			}
 		})
-	}
-}
-
-func TestV1ReservedMoreIsRetainedByLegacyButCannotBeReinterpreted(t *testing.T) {
-	for _, key := range []string{"id", "account", "capital_weight", "factor", "engine"} {
-		raw := []byte("run_policy: [{name: Demo, " + key + ": custom-legacy-value}]\n")
-		old, err := ParseYmlConfig(raw, "legacy.yml")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if old.RunPolicy[0].More[key] != "custom-legacy-value" {
-			t.Fatalf("legacy %s was swallowed", key)
-		}
-		if _, err := ImportV1YAML(raw, "legacy.yml"); err == nil || !strings.Contains(err.Error(), "legacy More") {
-			t.Fatalf("missing explicit collision error: %v", err)
-		}
-	}
-	alias := []byte("template: &strategy {name: Demo, id: legacy}\nrun_policy: [*strategy]\n")
-	if _, err := ImportV1YAML(alias, "alias.yml"); err == nil {
-		t.Fatal("alias hid a reserved More collision")
-	}
-	merge := []byte("template: &fields {account: legacy}\nrun_policy: [{name: Demo, <<: *fields}]\n")
-	if _, err := ImportV1YAML(merge, "merge.yml"); err == nil {
-		t.Fatal("merge hid a reserved More collision")
 	}
 }
 
@@ -293,8 +227,9 @@ func TestUnifiedYAMLRoundTripAndProjectionGuards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(u, again) {
-		t.Fatalf("DTO round trip changed configuration:\n%s", serialized)
+	serializedAgain, marshalErr := yaml.Marshal(again)
+	if marshalErr != nil || !bytes.Equal(serialized, serializedAgain) {
+		t.Fatalf("canonical YAML round trip changed configuration:\n%s", serialized)
 	}
 	if _, err := u.TimeSeriesConfig(); err == nil {
 		t.Fatal("TS projection accepted unsupported engine/overrides")

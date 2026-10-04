@@ -69,7 +69,7 @@ func TestFactorLiveSourceSubscribesAndSettlesFundingOutsideFactorPool(t *testing
 	}
 	c.Snapshot.Universe = factor.Universe{Version: "factor-only", Static: true, Investable: []int32{2}, Reference: []int32{2}, Tradable: []int32{2}, Tracked: []int32{2}, Evaluation: []int32{2}}
 	c.Snapshot.SIDMap = map[int32]string{2: "factor-only"}
-	c.Prices = runner.PriceStream{Source: "account_funding", Frequency: "event", Field: "mark"}
+	c.Prices = runner.PriceStream{Source: "account_funding", TimeFrame: "event", Field: "mark"}
 	c.FundingSource = "account_funding"
 	c.Snapshot.Schemas[c.FundingSource], c.Snapshot.SourceVersions[c.FundingSource] = "schema-v1", "v1"
 	c.Plan, err = factor.New().Add("close", factor.Field("account_funding", "mark", "event")).Compile()

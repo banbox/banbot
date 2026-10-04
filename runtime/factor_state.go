@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sync"
 
@@ -28,16 +27,11 @@ func (r *Runtime) InstallFactorReplay(configs []runner.Config, sinks []runner.Si
 	}
 	owned := make([]runner.Config, len(configs))
 	for index, cfg := range configs {
-		raw, err := json.Marshal(cfg)
+		copyConfig, err := runner.CloneConfig(cfg)
 		if err != nil {
 			return err
 		}
-		if err := json.Unmarshal(raw, &owned[index]); err != nil {
-			return err
-		}
-		owned[index].Plan, owned[index].ComputationGroup = cfg.Plan, cfg.ComputationGroup
-		owned[index].PortfolioBuilder = cfg.PortfolioBuilder
-		owned[index].HistoricalInput, owned[index].ObserveBatch = cfg.HistoricalInput, cfg.ObserveBatch
+		owned[index] = copyConfig
 	}
 	r.closeMu.Lock()
 	if r.FactorState != nil || r.Context().Err() != nil {

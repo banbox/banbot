@@ -61,7 +61,7 @@ K线插入任务结构体，用于管理K线数据的插入操作。
 - `HasData bool` - 此区间是否包含有效数据
 
 ### KlineUn
-未复权K线数据结构体，包含原始K线数据。
+未完成 K 线数据结构体，包含尚未闭合的原始数据。
 
 字段：
 - `Sid int32` - 交易对ID
@@ -113,11 +113,73 @@ K线数据聚合配置结构体，用于管理不同时间周期的K线聚合。
 
 ### SeriesInfo、DataRecord 与 DataSeries
 
-通用时序数据不再限定为 K 线。`SeriesInfo` 定义 source、周期、表绑定和字段；`DataRecord` 用于存储行；`DataSeries` 是回测和实盘的统一事件。`SeriesStore` 提供 `Write`、`WriteBatch`、`Read`、`Missing`、`Delete`、`Coverage` 等高层操作，并通过 `SeriesRepo` 适配 TimescaleDB 与 QuestDB。
+`SeriesInfo{Name, TimeFrame, Binding}` 描述 source、周期和物理表；`SeriesBinding` 包含 `Table/TimeColumn/EndColumn/SIDColumn/Fields`，省略 SIDColumn 时为 `sid`。`NewSeriesInfo` 默认使用 `ts/end_ms/sid`，生成 `name_timeframe` 表名；字段逻辑类型为 `float/int/string/bool/json`。
 
-字段类型支持 `float`、`int`、`string`、`bool` 和 `json`。`NewSeriesInfo(name, timeframe, fields)` 会按默认规则创建表绑定；需要写入既有 K 线表的扩展列时使用 `NewKLineSeriesInfo` 与 `KLineSeriesStore`。
+```go
+type DataRecord struct {
+    Sid int32
+    TimeMS, EndMS int64
+    Closed bool
+    Values map[string]any
+}
+type DataSeries struct {
+    Source string
+    Sid int32
+    TimeMS, EndMS int64
+    TimeFrame string
+    Closed, IsWarmUp bool
+    Values map[string]any
+    ExSymbol *ExSymbol
+    Adj *AdjInfo
+}
+```
 
-请参阅[自定义时序数据](../guide/custom_data.md)了解注册、存储和策略消费的完整流程。
+DataRecord 是持久行，DataSeries 是回测/实盘事件。时间单位为毫秒，区间为 `[TimeMS,EndMS)`。Values 保留 Go 具体类型和显式 nil；直接 map 查找可区分 NULL 与缺键。存储只写 schema 声明列：`int` 规范化为 int64，`float` 为 float64，JSON 经数据库编码；固定列往返不能恢复原始缺键或所有 Go 类型。
+
+### Subscription
+
+`orm.Subscription` 是引擎无关的数据依赖，`strat.DataSub` 为其 alias。除 Source/ExSymbol/TimeFrame/WarmupNum/Fields/SeriesFields 外，还包含 Frequency（bar/event）和 Projection（default/all/selected）。`NormalizeSubscription` 验证声明；合法 event 声明不代表每个 reader 都能读取它。`StreamKey{Source,SID,TimeFrame}` 不包含 consumer 或账户，隔离由所属 catalog/repository 负责。
+
+### SeriesStore 与 BoundSeriesStore
+
+```go
+store := orm.NewSeriesStore(orm.NewSeriesRepo(storage))
+rates := store.Bind(info, target)
+err := rates.WriteBatch(ctx, rows) // []*orm.DataRecord
+events, err := rates.Read(ctx, startMS, endMS, limit) // []*orm.DataSeries
+```
+
+示例假定已初始化 Storage、schema、target、ctx 和时间范围。`Bind` 保留定义和标的引用，不执行 I/O。下列方法可在 SeriesStore 上传入 info/target，或在绑定后的 store 上省略它们：
+
+| 方法 | 用途 |
+| --- | --- |
+| `Ensure` | 确保 schema |
+| `Write/WriteBatch` | 写单条/批量持久行 |
+| `WriteSeries/WriteSeriesBatch` | 写运行时事件 |
+| `Read` | 读取 DataSeries |
+| `Missing/FillMissing` | 查缺口并抓取补齐 |
+| `Coverage/UpdateCoverage` | 覆盖范围与确认无数据区间 |
+| `Delete` | 删除指定时间范围 |
+
+`NormalizeDataRecords` 跳过 nil 行、补齐 Sid=0、拒绝不同 sid 或无效区间并排序。`RecordToSeries` 规范化 source，借用 Values；`RecordsToSeries` 会跳过 nil 行。`SeriesToRecord` 和 `CloneWithExSymbol` 不提供递归所有权复制，异步排队需自行隔离可变输入。`WithSeriesReadByteLimit` 限制解码页预算，不能作为进程 RSS 上限。
+
+### KLineSeriesStore 与 K 线字段读取
+
+独立 SeriesStore 写完整记录。`NewKLineSeriesInfo` / `NewKLineSeriesStoreWithStorage(info, storage)` 定义并写既有 K 线的扩展列，`Write(ctx,target,rows)` 更新已有 `(sid,time)` 行；缺少目标 K 线时失败。不要把扩展标签 Name 当成独立 source，策略订阅仍使用 `Source: "kline"`。
+
+`GetSeries/AutoFetchSeries` 返回 `[]*DataSeries`；显式 Queries 提供 `GetSeriesFields`、`QuerySeriesFields` 和批量字段投影接口。字段读取包含默认 OHLCV 与所需扩展列，后续 feeder/回调保留 Values。下文 GetOHLCV/AutoFetchOHLCV 是默认 K 线兼容视图，不应通过这些固定字段 API 传递任意自定义列。
+
+### 聚合与复权
+
+`ResampleSeriesRecords`、`ResampleDataSeries` 按字段聚合；`ExSymbol.AggRules` 存储 JSON 列规则，`RegisterAggRule` 注册自定义规则。支持 first/last/min/max/sum/avg/mid；未配置的扩展字段使用 last。first/last 保留选中原始值，数值规则进行类型转换，并有各自 NULL/缺字段校验；聚合结果不等于完整复制输入。
+
+`SeriesOHLCV`、`DataSeries.OHLCV` 与 `AsKline` 是局部兼容视图，不能替代 Values。feeder 复权复制字段 map，按当前实现调整 open/high/low/close/volume/buy_volume；其余自定义字段、quote、trade_num 保留原值，不自动套用价格倍率。
+
+### QuestDB WAL
+
+INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须等待目标行、时间戳、范围或记录数可见；超时保留恢复标记。表替换前先核实替换表快照，不能据单次空查询 DROP 旧表。同进程元数据写后读优先使用定向可见性等待或所属缓存/锁。
+
+详见[自定义时序数据](../guide/custom_data.md)与[数据库](../guide/database.md)。
 
 ## 数据库连接相关
 
@@ -502,3 +564,9 @@ K线数据聚合配置结构体，用于管理不同时间周期的K线聚合。
 
 返回：
 - `[]*KlineAgg` - K线聚合配置列表
+
+## 因子引擎集成
+
+DataSeries.Values 保留任意类型/NULL/缺失；RecordToSeries 转换不代替异步深复制；QuestDB 写后读等待和替换前验证保留。
+
+[因子 API](factor.md) / [指南](../guide/factor.md)

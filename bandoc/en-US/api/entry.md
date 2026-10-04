@@ -8,3 +8,9 @@ Configuration-based commands parse a `config.Snapshot`, open explicit storage an
 
 ### RunCmd
 This is the command-line entry method for banbot. You can call this method in your strategy project's entry file to access various banbot subcommands from the terminal.
+
+## Factor-engine integration
+
+ValidateBacktestRunSpec and execution share resource-free checks; mixed replay requires events. RegisterFactorLiveBinding supplies verified current-session evidence.
+
+[Factor API](factor.md) / [Guide](../guide/factor.md)

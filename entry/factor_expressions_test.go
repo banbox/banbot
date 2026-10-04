@@ -16,9 +16,9 @@ func TestExpressionYAMLResearchAndBacktest(t *testing.T) {
 	_, path := factorYAMLFixture(t)
 	formula := `      expressions:
         schema_version: 1
-        frequency: 1h
+        timeframe: 1h
         bindings:
-          kline: {source: kline, frequency: 1h}
+          kline: {source: kline, timeframe: 1h}
         params: {window: 2}
         lets:
           mom: "ts.return(kline.close, param.window)"
@@ -54,7 +54,7 @@ func TestExpressionYAMLResearchAndBacktest(t *testing.T) {
 	for _, invalid := range []string{
 		strings.Replace(body, "schema_version: 1", "schema_version: 1\n        typo: 1", 1),
 		strings.Replace(body, "      expressions:", "      definition: momentum-vol\n      expressions:", 1),
-		strings.Replace(body, "frequency: 1h", "frequency: 1d", 1),
+		strings.Replace(body, "timeframe: 1h", "timeframe: 1d", 1),
 		strings.Replace(body, "cs.zscore(factor.mom)", "cs.zscore(label.future)", 1),
 	} {
 		if err := os.WriteFile(path, []byte(invalid), 0600); err != nil {
@@ -71,7 +71,7 @@ func TestExpressionYAMLResearchAndBacktest(t *testing.T) {
 }
 
 func TestExpressionsNeverUseFactorFieldAsPrice(t *testing.T) {
-	c := runner.Config{Expressions: &expr.Spec{Frequency: "1h"}}
+	c := runner.Config{Expressions: &expr.Spec{TimeFrame: "1h"}}
 	c.Factor.Source, c.Factor.Field = "funding", "rate"
 	c.Snapshot.Schemas = map[string]string{"funding": "v1"}
 	if err := deriveArchivePrice(&c); err == nil {
@@ -81,7 +81,7 @@ func TestExpressionsNeverUseFactorFieldAsPrice(t *testing.T) {
 
 func TestExpressionCompileCommandsWithoutData(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "expression.yml")
-	body := "schema_version: 1\nfrequency: 1h\nbindings:\n  kline: {source: kline, frequency: 1h}\noutputs:\n  momentum: 'cs.zscore(ts.return(kline.close, 3))'\n"
+	body := "schema_version: 1\ntimeframe: 1h\nbindings:\n  kline: {source: kline, timeframe: 1h}\noutputs:\n  momentum: 'cs.zscore(ts.return(kline.close, 3))'\n"
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -94,14 +94,15 @@ func TestExpressionCompileCommandsWithoutData(t *testing.T) {
 			t.Fatal(err)
 		}
 		var result struct {
-			Hash   string
-			Warmup int
+			Hash      string
+			Warmup    int
+			TimeFrame string
 		}
-		if err := json.Unmarshal(out.Bytes(), &result); err != nil || result.Hash == "" || result.Warmup != 3 {
+		if err := json.Unmarshal(out.Bytes(), &result); err != nil || result.Hash == "" || result.Warmup != 3 || result.TimeFrame != "1h" {
 			t.Fatalf("compile output: %s (%v)", out.Bytes(), err)
 		}
 	}
-	for _, invalid := range []string{body + "typo: 1\n", body + "---\n{}\n", strings.Repeat(" ", (1<<20)+1)} {
+	for _, invalid := range []string{body + "typo: 1\n", body + "---\n{}\n", strings.ReplaceAll(body, "timeframe:", "frequency:"), strings.Repeat(" ", (1<<20)+1)} {
 		if err := os.WriteFile(path, []byte(invalid), 0600); err != nil {
 			t.Fatal(err)
 		}

@@ -17,10 +17,10 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 
 1. 配置和命令参数进入 `entry`。
 2. 配置型入口创建 `runtime.Process` 与任务专属的 `runtime.Runtime`，并向其注入配置快照、存储、交易所和取消信号。
-3. 策略和交易对由 `goods`、`strat`、`biz` 在该 Runtime 内共同生成运行任务。
+3. `entry` 按唯一 RunSpec 的 `run_policy.engine` 选择 `time_series` / `factor`。时序任务由 `goods`、`strat`、`biz` 生成；因子任务使用 `factor/runner` 的定义、组合、Universe 与决策计划。
 4. 行情或第三方时序数据由 `data` 统一转换为 `orm.DataSeries`。
-5. `biz.Trader` 将数据分发到策略，策略产出进出场请求。
-6. `biz` 订单管理器按运行模式执行本地撮合或实盘交易所下单。
+5. 时序由 `biz.Trader` 分发到 jobs 产生进出场请求；因子由 VersionStore/Snapshot/Session 冻结当轮可见数据，组合多列输出并生成 Full/Patch 目标。
+6. 时序订单 manager 保留兼容投影，因子 AccountSink 与 mixed 策略进入 `execution.SharedAccount`，在保留归属/预算下净额执行。weights 使用近似 Book；真实 live 必须通过 verified binding 和账户对账。
 7. `orm` 持久化 K 线、时序数据、订单、任务和 UI 相关状态。
 8. `web`、`rpc`、`live` 提供可观测、控制和通知能力。
 
@@ -39,7 +39,7 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 - `core`：提供常量、通用错误和 `core.State`。`core.State` 保存一个 Runtime 的运行模式、市场、交易对、订单簿与取消状态；缓存等低频进程资源不随任务复制。
 - `btime`：通过 Runtime 持有的 `btime.ClockState` 维护回测/实盘时间语义。
 
-一个 `Process` 可创建多个 Runtime。任务之间不共享上述可变业务状态，因此回测与实盘等显式运行器可并行执行；它们只在明确的进程级资源（例如同一存储身份的 SID 分配器）上协调。`context.Context` 仅传递取消、deadline 和 I/O 生命周期，不作为业务状态容器。
+一个 `Process` 可创建多个 Runtime。任务之间不共享上述可变业务状态，显式运行器可以隔离任务状态；共享物理账户、SID registry、scheduler 或外部资源仍须遵守 owner/borrow 契约，不能据局部隔离测试宣称任意生产会话并发 E2E 已验收。`context.Context` 仅传递取消、deadline 和 I/O 生命周期，不作为业务状态容器。
 
 ### 2.3 交易业务层
 
@@ -85,11 +85,11 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 
 实盘交易入口。主要流程：
 
-1. 设置运行模式为实盘。
+1. 将实盘模式绑定到任务 Core/Clock，保留父 context 取消。
 2. 执行公共初始化和交易所初始化。
 3. 可选打开订单/数据转储文件。
 4. 标记机器人运行状态和启动时间。
-5. 创建 `live.CryptoTrader`。
+5. 使用 NewCryptoTraderWithRuntimeDeps 创建时序交易器；因子使用 runner.NewLive，mixed 保留策略投影。
 6. 初始化实时数据源、订单管理、策略任务、Telegram 控制、Web API、账户检查和第三方数据源。
 7. 启动实盘后台任务。
 8. 进入实时行情循环。
@@ -124,7 +124,7 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 
 超参数优化入口。它围绕回测引擎反复执行参数采样、回测评分和结果选择。采样策略支持多种优化器；每次采样会构造临时回测，计算评分后写入优化结果。
 
-#### `bt_opt`
+#### `bt-opt`
 
 滚动优化回测入口。它按 review period 和 run period 划分时间轴，在每个窗口内用历史窗口优化策略参数，再把优化结果应用到后续运行窗口，继承钱包和历史订单状态，尽量模拟实盘中“用过去调参、用未来验证”的过程。
 
@@ -602,8 +602,8 @@ QuestDB 和 PostgreSQL 在时间列、upsert、删除方式、JSON 字段和可�
 
 1. `banbot backtest`。
 2. `entry` 解析参数并调用 `RunBackTest`。
-3. `biz.SetupComsExg` 初始化环境。
-4. `opt.NewBackTest` 创建回测引擎和历史 provider。
+3. entry 解析 RunSpec，创建显式 Process/Runtime 与自建资源。
+4. 时序使用 opt.NewBackTestWithRuntimeDeps；因子/混合由 unified factor assembly 选择 runner/account 路径。
 5. `goods`、`strat` 构建交易对和策略任务。
 6. `data.SeriesRuntime` 补齐第三方时序。
 7. `HistProvider` 补齐和加载历史 K 线。
@@ -680,3 +680,9 @@ QuestDB 和 PostgreSQL 在时间列、upsert、删除方式、JSON 字段和可�
 - LLM 辅助：`llm/`。
 
 子 agent 分别完成了入口、实盘交易、策略/回测、数据源四个方向的只读调研；ORM 宽范围子任务因上下文限制失败，最终由主线直接阅读关键 ORM 文件和文档后汇总。
+
+## 2026-10-04 双引擎使用入口
+
+run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
+
+execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；factor trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

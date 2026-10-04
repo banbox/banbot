@@ -43,7 +43,7 @@ func TestLiveReferencePriceRowsFeedDAGWithoutExecutionQuote(t *testing.T) {
 	}
 	c.Plan = plan
 	c.Combo = research.ComboSpec{Method: research.Fixed, Columns: []string{"close"}, Weights: map[string]float64{"close": 1}}
-	c.Prices = PriceStream{Source: "kline", Frequency: "1h", Field: "close"}
+	c.Prices = PriceStream{Source: "kline", TimeFrame: "1h", Field: "close"}
 	sink := &scopedQuoteSink{}
 	live, err := NewLive(c, sink, func() int64 { return 3600002 }, nil)
 	if err != nil {
@@ -95,8 +95,8 @@ func TestLiveEvaluationOnlyRowsDoNotChangeTradingReadinessOrTargets(t *testing.T
 				t.Fatal(err)
 			}
 			defer live.Stop()
-			row := func(sid int32, source, frequency, field string, event int64, value float64) factor.VersionRecord {
-				return factor.VersionRecord{Series: orm.DataSeries{Source: source, TimeFrame: frequency, Sid: sid, Closed: true, TimeMS: event - 1, EndMS: event, Values: map[string]any{field: value}}, EventTime: event, AvailableAt: event, IngestedAt: clock, Revision: 1, SourceVersion: "v1"}
+			row := func(sid int32, source, timeframe, field string, event int64, value float64) factor.VersionRecord {
+				return factor.VersionRecord{Series: orm.DataSeries{Source: source, TimeFrame: timeframe, Sid: sid, Closed: true, TimeMS: event - 1, EndMS: event, Values: map[string]any{field: value}}, EventTime: event, AvailableAt: event, IngestedAt: clock, Revision: 1, SourceVersion: "v1"}
 			}
 			if mode != "absent" {
 				event := int64(3600000)
@@ -126,7 +126,7 @@ func TestLiveEvaluationOnlyRowsDoNotChangeTradingReadinessOrTargets(t *testing.T
 			}
 			clock = 3600004
 			for _, sid := range []int32{1, 2} {
-				if err := live.Observe(context.Background(), row(sid, c.Prices.Source, c.Prices.Frequency, c.Prices.Field, 3600003, 100)); err != nil {
+				if err := live.Observe(context.Background(), row(sid, c.Prices.Source, c.Prices.TimeFrame, c.Prices.Field, 3600003, 100)); err != nil {
 					t.Fatal(err)
 				}
 			}

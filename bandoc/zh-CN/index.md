@@ -11,6 +11,10 @@ hero:
       text: 文档
       link: /zh-CN/guide/start
 
+    - theme: alt
+      text: 多因子与截面
+      link: /zh-CN/guide/factor
+
 features:
   - title: 高性能
     details: 采用支持状态缓存的指标库，1秒轻松回测1年的数据

@@ -19,7 +19,7 @@ func (h *liveHistoryHandle) Stop()       { h.stopped = true }
 func (h *liveHistoryHandle) Join() error { h.joined = true; return nil }
 
 type liveHistorySource struct {
-	name, frequency, field string
+	name, timeframe, field string
 	subscriptions          []*orm.Subscription
 	sink                   data.DataSink
 	handle                 liveHistoryHandle
@@ -27,7 +27,7 @@ type liveHistorySource struct {
 }
 
 func (s *liveHistorySource) Info() *orm.SeriesInfo {
-	return orm.NewSeriesInfo(s.name, s.frequency, []orm.SeriesField{{Name: s.field, Type: "float"}})
+	return orm.NewSeriesInfo(s.name, s.timeframe, []orm.SeriesField{{Name: s.field, Type: "float"}})
 }
 func (s *liveHistorySource) FetchHistory(_ context.Context, sub *orm.Subscription, from, to int64) ([]*orm.DataRecord, error) {
 	s.fetches++
@@ -85,8 +85,8 @@ func TestFactorLiveSideHistoryWarmsBeforeFirstAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Stop()
-	side := &liveHistorySource{name: "side", frequency: "1h", field: "close"}
-	tick := &liveHistorySource{name: "tick", frequency: "event", field: "price"}
+	side := &liveHistorySource{name: "side", timeframe: "1h", field: "close"}
+	tick := &liveHistorySource{name: "tick", timeframe: "event", field: "price"}
 	for _, source := range []data.DataSource{side, tick} {
 		if err := f.rt.Catalog.RegisterDataSource(source); err != nil {
 			t.Fatal(err)
@@ -166,8 +166,8 @@ func TestFactorLiveSideObservationCountCannotSubstituteForReadyGrids(t *testing.
 		t.Fatal(err)
 	}
 	defer engine.Stop()
-	side := &liveHistorySource{name: "side", frequency: "1h", field: "close"}
-	tick := &liveHistorySource{name: "tick", frequency: "event", field: "price"}
+	side := &liveHistorySource{name: "side", timeframe: "1h", field: "close"}
+	tick := &liveHistorySource{name: "tick", timeframe: "event", field: "price"}
 	for _, source := range []data.DataSource{side, tick} {
 		if err := f.rt.Catalog.RegisterDataSource(source); err != nil {
 			t.Fatal(err)

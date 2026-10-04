@@ -1,3 +1,5 @@
+# 配置参考：默认启用时序示例；可选场景位于文末，取消注释后替换对应根配置。
+# v0.5 配置可直接读取，无需版本标记；相对资源路径基于声明它的 YAML 文件。
 name: local  # 机器人名称，用于在消息通知中区分不同机器人
 env: prod  # 运行环境，prod表示生产网络，test表示测试网络，dry_run表示模拟实盘交易
 leverage: 2  # 杠杆倍数，仅期货合约市场有效
@@ -5,7 +7,7 @@ limit_vol_secs: 5  # 按成交量取订单簿价格的过期时间，单位：�
 put_limit_secs: 120  # 在此预期时间内能成交的限价单，才提交到交易所，单位：秒，默认120
 account_pull_secs: 60  # 定期更新账户余额和持仓的间隔秒数，默认60秒
 market_type: spot  # 市场：spot现货，linear：U本位合约，inverse：币本位合约，option：期权合约
-contract_type: swap # swao永续合约，future到期合约
+contract_type: swap # swap永续合约，future到期合约
 odbook_ttl: 1000  # 订单簿过期时间，单位毫秒，默认500
 concur_num: 2  # 标的K线并发下载数，默认2个标的
 order_type: market  # 下单类型：market市价单  limit限价单
@@ -22,8 +24,13 @@ close_on_stuck: 20  # 超时20分钟未收到K线时自动全部平仓，默认2
 open_vol_rate: 1 # 未指定数量开单时，最大允许开单数量/平均蜡烛成交量的比值，默认1
 min_open_rate: 0.5 # 最小开单比率，余额不足单笔金额时，余额/单笔金额高于此比率允许开单，默认0.5即50%
 low_cost_action: ignore # 开单金额不足最小金额时的动作：ignore/keepBig/keepAll
+max_open_orders: 0 # 全局最大未平仓订单数，0 不限制
 max_simul_open: 0 # 在一个bar上最大同时打开订单数量
 bt_net_cost: 15 # 回测时下单延迟，可用于模拟滑点，单位：秒，默认15
+bt_no_kline_download: false # 回测是否禁止隐式 K 线下载；严格历史回放还需要 historical_coverage
+bt_legacy_intrabar: false # 对比历史结果时保留旧版 bar 内价格路径
+bt_legacy_order_metrics: false # 对比历史结果时保留旧版订单回撤统计
+bt_legacy_wallet_price: false # 对比历史结果时保留旧版保证金估值时点
 bt_strict: false # 是否启用严格回测模式；启用后固定关键执行顺序，确保回测结果可复现，可能降低回测速度
 relay_sim_unfinish: false  # 交易新品种时(回测/实盘)，是否从开始时间未平仓订单接力开始交易
 order_bar_max: 500  # 查找开始时间未平仓订单向前模拟最大bar数量
@@ -43,9 +50,14 @@ fatal_stop:  # 全局止损，当全局损失达到限制时，禁止下单
 fatal_stop_hours: 8  # 触发全局止损时，禁止开单的小时；默认8
 time_start: "20240701"  # 数据起始时间，支持多种格式，时间戳、日期、日期时间等
 time_end: "20250808"
+# timerange: '20240701-20250808' # time_start/time_end 的替代写法，不同时声明
+# timeframes: '5m,1h' # 旧版逗号分隔周期写法，优先使用 run_timeframes
+# kline_source: kline # 旧版保留字段；当前执行入口未使用它选择数据源
+# watch_jobs: {BTC/USDT: [1m, 5m]} # 保留的额外观察任务映射
 run_timeframes: [5m]  # 机器人允许运行的所有时间周期。策略会从中选择适合的最小周期，此处优先级低于run_policy
 run_policy:  # 运行的策略，可以多个策略同时运行；也可以一个策略配置不同参数同时运行多个版本
-  - name: Demo  # 策略名称
+  - engine: time_series
+    name: Demo  # 策略名称
     run_timeframes: [5m]  # 此策略支持的时间周期，提供时覆盖根层级的run_timeframes
     refine_tf: 1m  # 撮合周期，字符串或数字，数字表示相对timeframes减少倍数：'1m', '5m', '3-6', 5
     filters:  # 可使用pairlists中的所有过滤器
@@ -59,10 +71,11 @@ run_policy:  # 运行的策略，可以多个策略同时运行；也可以一�
     stake_rate: 1 # 此策略的开单倍率
     stop_loss: 0  # 此策略的止损比率，如 5% 或 0.05
     dirt: any # any/long/short
-    pairs: [BTC/USDT:USDT]
+    pairs: [BTC/USDT]
+    # timeframes: '5m' # 旧周期写法，可替代此策略的 run_timeframes
     params: {atr: 15}
     pair_params:
-      BTC/USDT:USDT: {atr:14}
+      BTC/USDT: {atr: 14}
     strat_perf: # 和根strat_perf配置相同
       enable: false
 strat_perf:
@@ -73,9 +86,9 @@ strat_perf:
   mid_weight: 0.2 # 收益中间档的开单权重
   bad_weight: 0.1 # 收益较差档开单权重
 pairs:  # 给定交易币种，如不为空，pairlists会被忽略
-- SOL/USDT:USDT
-- UNFI/USDT:USDT
-- SFP/USDT:USDT
+- SOL/USDT
+- UNFI/USDT
+- SFP/USDT
 pairmgr:
   cron: '25 1 0 */2 * *' # 秒 分钟 小时 天 月 星期
   offset: 0  # 标的列表忽略前n个
@@ -134,9 +147,11 @@ accounts:
       prod:
         api_key: vvv
         api_secret: vvv
+        # password: passphrase # 需要交易密码的交易所填写
       test:
         api_key: vvv
         api_secret: vvv
+        # password: passphrase # 需要交易密码的交易所填写
     rpc_channels:  # 发送通知或通过社交app控制
       - name: wx_bot
         to_user: ChannelUserID
@@ -152,6 +167,10 @@ exchange:  # 交易所配置
         taker: 0.0005
         maker: 0.0002
 database:  # 数据库配置
+  db_type: questdb # questdb / timescale；不填时由 URL 自动识别
+  # sid_registry_url: postgresql://user:password@127.0.0.1:5432/banbot # QuestDB 多写进程 SID 注册库
+  qdb_mem_pct: 0.3 # QuestDB 内存使用比例
+  qdb_max_mem_mb: 16384 # QuestDB 最大内存 MB
   retention: all
   max_pool_size: 50  # 连接池最大大小
   auto_create: true  # 数据库不存在时，是否自动创建
@@ -200,10 +219,13 @@ api_server:  # 供外部通过api控制机器人
   enable: true
   bind_ip: 127.0.0.1
   port: 8001
+  verbosity: info # 保留的 API 详细程度字段
+  CORS_origins: [] # 外部 Dashboard 的允许来源，例如 http://localhost:3000
   jwt_secret_key: nj234hujivhguih2rj3y4234nkjoghfy9088weurt
   users:
     - user: ban
-      pwd: 123
+      pwd: "123"
+      exp_hours: 168 # 登录 token 有效小时数
       allow_ips: []
       acc_roles: {user1: admin}
 
@@ -226,3 +248,224 @@ llm_models:
     completion_price: 60.0
     cache_price: 10
     payload: {}
+
+# === 可选场景 A：普通存储上的因子 weights 研究 ===
+# 这是覆盖示例；替换上方 run_policy，并按实际市场修改 pairs、market_type 和时间范围。
+# 数据库需有已导入行情及 metadata；static-approximation 明确允许最新值历史近似。
+# 不要把下列 data 和归档场景 B 的 data 同时启用。
+# data:
+#   namespace: factor-research
+#   page_rows: 1000
+#   prefetch_rows: 1000
+#   page_bytes: 10485760 # 逻辑解码载荷预算，0 不限；不是进程 RSS 限制
+#   max_records: 100000
+#   pit_policy: static-approximation
+# execution:
+#   mode: weights # 普通 backtest 支持 weights/events；factor research/trade 由命令选择
+#   funding_policy: explicit-zero # 明确忽略资金费；有结算流时使用 required-stream
+# run_policy:
+#   - engine: factor
+#     name: MyFactors
+#     id: my_factors # 稳定策略身份；同账户不能重复
+#     account: user1 # 指向根 accounts 中的账户
+#     run_timeframes: [1h] # 因子策略只允许一个决策周期
+#     initial_nav: 10000 # 研究/回测初始净值，不向实盘账户充值
+#     max_records: 100000
+#     params: {k: 1} # 策略/组合参数，与 expressions.params 分开
+#     expressions:
+#       schema_version: 1
+#       timeframe: 1h # 必须与 run_timeframes 一致
+#       bindings:
+#         bars: {source: kline, timeframe: 1h}
+#         # daily: {source: kline, timeframe: 1d, sampling: asof, max_age_ms: 86400000}
+#         # 跨周期 binding 必须指定 asof 和正的 max_age_ms，并有相应历史输入。
+#       params: {window: 24}
+#       lets:
+#         ret: 'ts.return(positive(bars.close), param.window)'
+#       outputs:
+#         momentum: 'cs.zscore(factor.ret)'
+#         rank: 'cs.rank(factor.ret)'
+#       combine:
+#         method: fixed # equal / fixed / history-ic；实盘不支持 history-ic
+#         columns: [momentum, rank]
+#         weights: {momentum: 0.7, rank: 0.3}
+#     portfolio:
+#       builder: top-bottom-k-v1 # 自定义 builder 需事先在程序中注册
+#       k: 1
+#       long_notional: 0.5
+#       short_notional: 0.5
+#       mode: full # full 完整目标 / patch 增量目标
+#     decision:
+#       interval_ms: 3600000
+#       delay_ms: 0 # 归档决策可见性延迟，不改变逻辑网格
+#       latency_ms: 1000
+#       expiry_ms: 3600000
+#       max_pending: 1000
+#     prices: {source: kline, timeframe: 1h, field: close} # weights 价格；events 见场景 C
+#     research:
+#       label_wait_ms: 0
+#       labels:
+#         - name: next_return
+#           kind: executable-return # 当前归档驱动支持一个决策周期的此标签
+#           horizon: 3600000
+#           overlapping: false
+#           periods_per_year: 8760
+#       # 等权/固定权重纯交易可用 labels: []；research/history-ic 不能关闭标签。
+#
+# 内置 Go definition 可替代整个 expressions：
+# run_policy:
+#   - engine: factor
+#     name: momentum-vol
+#     definition: momentum-vol # 默认为策略名；自定义 definition 需事先注册
+#     id: momentum
+#     account: user1
+#     run_timeframes: [1h]
+#     params: {window: 24, k: 1}
+#     combo: {method: equal, columns: [momentum, volatility]}
+#     # definition 和 expressions 互斥；表达式组合写在 expressions.combine。
+
+# === 可选场景 B：不可变版本归档与快照身份 ===
+# 替换场景 A 的 data，去掉其分页/namespace 配置；归档不接受存储订阅覆盖。
+# data:
+#   archive: ./archives/prices.gob # 所有因子策略的默认归档
+#   max_records: 100000
+#   pit_policy: available-at # available-at / strict
+# 下列字段直接加在因子 run_policy[] 下，无需 factor 包裹。
+# archive: ./archives/prices.gob # 此策略归档，覆盖 data.archive
+# 或用多个 chunk 替代 archive（二者不要同时声明）：
+# chunks:
+#   - path: ./archives/part-01.gob
+#     from: 1704067200000 # 毫秒，省略时扫描归档推导边界
+#     to: 1706745600000
+# snapshot:
+#   grid_time: 0 # 0 使用决策时点；运行器逐轮生成实际快照
+#   decision_time: 0
+#   replay_time: 0
+#   universe:
+#     version: universe-v1
+#     investable: [1, 2]
+#     reference: [1, 2]
+#     tradable: [1, 2]
+#     evaluation: [1, 2]
+#     tracked: [1, 2]
+#     static: true
+#   sid_map: {1: 'BTC/USDT:USDT', 2: 'ETH/USDT:USDT'}
+#   schemas: {kline: actual-schema-hash} # 必须对应真实归档 schema
+#   source_versions: {kline: actual-source-version}
+#   adjustment_version: raw
+#   visibility_policy: available-at
+# funding_source: funding # required-stream 时真实归档中需要对应结算流
+# manifest: # 可审计研究身份；须按真实数据/执行假设填写
+#   currency: USDT
+#   code_revision: actual-git-revision
+#   factor_plan_hash: actual-plan-hash
+#   universe_version: universe-v1
+#   visibility_policy: available-at
+#   execution_mode: weights
+#   latency_assumption: explicit-latency
+#   static_universe: true
+#   combo: {method: equal, columns: [momentum, volatility]}
+#   portfolio: {builder: top-bottom-k-v1, k: 1, long_notional: 0.5, short_notional: 0.5, mode: full}
+#   labels: [{name: next_return, kind: executable-return, horizon: 3600000, overlapping: false, periods_per_year: 8760}]
+#   parameters: {window: 24, k: 1}
+#   costs: {fee_rate: 0.0005, slippage_rate: 0.0001, funding_policy: explicit-zero}
+#   snapshots: [] # 运行时生成；旧研究身份可记录下面的 SnapshotReference
+#   # snapshots:
+#   #   - id: actual-snapshot-id
+#   #     content_digest: actual-content-digest
+#   #     adjustment_version: raw
+#   #     schemas: {kline: actual-schema-hash}
+#   #     source_versions: {kline: actual-source-version}
+#   #     revisions: {kline: 1}
+#
+# 旧 JSON runner 导入器使用精确 JSON 字段名，仅用于导入/复现。
+# config 是整个 runner 配置，不要与浅层 archive/expressions 等配置混用：
+# run_policy:
+#   - engine: factor
+#     name: momentum-vol
+#     run_timeframes: [1h]
+#     config:
+#       Definition: momentum-vol
+#       StrategyID: momentum
+#       AccountID: user1
+#       MaxRecords: 100000
+#       Chunks: [{Path: ./archives/prices.gob}]
+#       # 其余字段由 factor 命令 --factor-config 导入器从原 JSON 保留；优先维护上面的浅层 YAML。
+
+# === 可选场景 C：共享执行、账户覆盖与混合策略 ===
+# events/混合回测需真正可观察的 tick/event 或 1m 执行价格和标准 instrument 单位。
+# 以下 ID/SID/单位是示例，应与市场 metadata、快照 sid_map 和实际数据完全一致。
+# execution:
+#   mode: events
+#   funding_policy: explicit-zero
+#   margin_rate: '0.1'
+#   max_account_margin: '1'
+#   max_virtual_gross: '2'
+#   strategy_gross_limit: '1'
+#   instruments:
+#     1:
+#       id: 'BTC/USDT:USDT'
+#       version: metadata-v1
+#       valuation: linear_perpetual # 当前共享账本支持线性结算
+#       settlement_currency: USDT
+#       quantity_step: '0.001'
+#       contract_size: '1'
+#       price_tick: '0.1'
+#       money_scale: 8
+#       min_steps: 1
+#       min_notional: '5'
+#   # store: ./state/accounts.db # durable 存储路径
+#   # sender_lease_dir: ./state/leases # 发送所有权锁目录
+#   # history: ./cold/history.sqlite # 新路径；只适合 memory paper 历史归档
+#   # history 与 durable store/真实 trade 不兼容，不能作为恢复快照。
+#   # live_provider: banexg # 实盘默认适配；自定义名称需 RegisterFactorLiveBinding
+# accounts:
+#   user1:
+#     # 此处保留上方账户凭据、api_server、rpc_channels 等。
+#     # 下列执行字段直接放账户下；生效字段覆盖 execution 公共默认值。
+#     mode: events # 保留字段；当前因子入口不使用账户 mode，普通回测读取根 execution.mode
+#     funding_policy: explicit-zero
+#     margin_rate: '0.1'
+#     max_account_margin: '1'
+#     max_virtual_gross: '2'
+#     strategy_gross_limit: '1'
+#     # instruments: {1: ...} # 同 execution.instruments 结构；声明时替换该映射
+#     # store: ./state/user1.db
+#     # sender_lease_dir: ./state/user1-leases
+#     # history: ./cold/user1-history.sqlite
+#     # live_provider: banexg # CLI 显式选择 > 账户覆盖 > 公共值 > 默认
+# run_policy:
+#   - engine: time_series
+#     name: Demo # 替换为真正注册的时序策略
+#     id: ts_alpha
+#     account: user1
+#     capital_weight: 0.5 # 同账户多策略必须明确预算；合计不能超过 1
+#     run_timeframes: [1h]
+#   - engine: factor
+#     name: momentum-vol
+#     id: cs_alpha
+#     account: user1
+#     capital_weight: 0.5 # 资本份额，与 stake_rate 下单倍数不同
+#     run_timeframes: [1h]
+#     params: {window: 24, k: 1}
+#     prices: {source: kline, timeframe: 1m, field: close}
+#     # 每个实际交易 SID 都需 instrument/价格/funding 证据；本块只展示分配结构。
+# 实盘必须删除 archive/chunks，以 live/trade 模式提供 verified 会话能力。
+# 缺少 capability 时预检失败，不会自动回退 paper；initial_nav 不替代真实对账余额。
+
+# === 可选场景 D：旧版历史基线覆盖 ===
+# 只在复现已有历史结果时启用。bars/physical_bars/listing_prefixes 为实际证据，
+# 时间区间为毫秒 [start_ms, stop_ms)，baseline_end_ms 必须位于回测时间范围内。
+# historical_coverage:
+#   baseline_end_ms: 1725148800000
+#   historical_result_end_ms: 1725235200000
+#   bars:
+#     BTC/USDT:
+#       5m: [{start_ms: 1719792000000, stop_ms: 1725148800000}]
+#   physical_bars:
+#     BTC/USDT:
+#       1m: [{start_ms: 1719792000000, stop_ms: 1725148800000}]
+#   listing_prefixes:
+#     NEW/USDT:
+#       5m: [{start_ms: 1719792000000, stop_ms: 1722470400000}]
+# 配合 bt_no_kline_download 控制读取，不要用伪造范围替代数据可见性证明。

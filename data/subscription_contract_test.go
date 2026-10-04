@@ -90,7 +90,7 @@ func TestSubscriptionEventCompileAndInstallationBoundaries(t *testing.T) {
 	}
 }
 
-func TestSubscriptionExplicitProjectionAndCatalogFrequency(t *testing.T) {
+func TestSubscriptionExplicitProjectionAndCatalogTimeFrame(t *testing.T) {
 	catalog := NewDataSourceCatalog()
 	src := newStubRegistrySource("contract_all")
 	src.info.Binding.Fields = []orm.SeriesField{{Name: "value", Type: "float"}, {Name: "label", Type: "string"}}
@@ -107,7 +107,7 @@ func TestSubscriptionExplicitProjectionAndCatalogFrequency(t *testing.T) {
 	}
 	sub.TimeFrame = "1h"
 	if _, err := catalog.NormalizeSubscriptions([]Subscription{sub}); err == nil {
-		t.Fatal("accepted source frequency mismatch")
+		t.Fatal("accepted source timeframe mismatch")
 	}
 }
 

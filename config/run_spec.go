@@ -44,7 +44,7 @@ func (s *RunSpec) Origin(field string) (FieldOrigin, bool) {
 	if s == nil {
 		return FieldOrigin{}, false
 	}
-	origin, ok := s.origins[field]
+	origin, ok := s.origins[s.canonicalField(field)]
 	return origin, ok
 }
 func (s *RunSpec) Origins() map[string]FieldOrigin {
@@ -93,9 +93,9 @@ func (s *RunSpec) EffectiveYAML(redact bool) ([]byte, error) {
 	}
 	fields := cloneStringMap(s.effective)
 	// An effective artifact is independently loadable from its result directory;
-	// resolve advanced paths here while migrated user files stay unchanged.
+	// resolve advanced paths here while user files stay unchanged.
 	for field := range s.origins {
-		if !IsAdvancedPathField(field) {
+		if !IsAdvancedPathField(field) || strings.HasPrefix(field, "run_policy[") && !s.factorField(field) {
 			continue
 		}
 		path, err := s.ResolvePath(field)
@@ -124,10 +124,33 @@ func IsAdvancedPathField(field string) bool {
 	if field == "data.archive" || field == "execution.store" || field == "execution.history" || field == "execution.sender_lease_dir" {
 		return true
 	}
-	if strings.HasPrefix(field, "execution.accounts.") && (strings.HasSuffix(field, ".store") || strings.HasSuffix(field, ".history") || strings.HasSuffix(field, ".sender_lease_dir")) {
+	if (strings.HasPrefix(field, "accounts.") || strings.HasPrefix(field, "execution.accounts.")) && (strings.HasSuffix(field, ".store") || strings.HasSuffix(field, ".history") || strings.HasSuffix(field, ".sender_lease_dir")) {
 		return true
 	}
-	return strings.HasPrefix(field, "run_policy[") && (strings.HasSuffix(field, ".factor.archive") || (strings.Contains(field, ".factor.chunks[") && strings.HasSuffix(field, ".path")) || (strings.Contains(field, ".factor.config.Chunks[") && strings.HasSuffix(field, ".Path")) || strings.HasSuffix(field, ".factor.config.Execution.StorePath") || strings.HasSuffix(field, ".factor.config.Execution.HistoryPath") || strings.HasSuffix(field, ".factor.config.Execution.SenderLeaseDir"))
+	field = strings.Replace(field, "].factor.", "].", 1)
+	return strings.HasPrefix(field, "run_policy[") && (strings.HasSuffix(field, "].archive") || (strings.Contains(field, "].chunks[") && strings.HasSuffix(field, ".path")) || (strings.Contains(field, "].config.Chunks[") && strings.HasSuffix(field, ".Path")) || strings.HasSuffix(field, "].config.Execution.StorePath") || strings.HasSuffix(field, "].config.Execution.HistoryPath") || strings.HasSuffix(field, "].config.Execution.SenderLeaseDir"))
+}
+
+func (s *RunSpec) factorField(field string) bool {
+	if !strings.HasPrefix(field, "run_policy[") {
+		return false
+	}
+	end := strings.IndexByte(field, ']')
+	if end < 0 {
+		return false
+	}
+	index, err := strconv.Atoi(field[len("run_policy["):end])
+	return err == nil && index >= 0 && index < len(s.value.RunPolicy) && s.value.RunPolicy[index].Engine == EngineFactor
+}
+
+func (s *RunSpec) canonicalField(field string) string {
+	if strings.HasPrefix(field, "execution.accounts.") {
+		return strings.TrimPrefix(field, "execution.")
+	}
+	if s.factorField(field) {
+		return strings.Replace(field, "].factor.", "].", 1)
+	}
+	return field
 }
 
 func setEffectiveField(root map[string]any, path string, value any) {
@@ -187,6 +210,7 @@ func redactConfigFields(value any) {
 // ResolvePath resolves a final advanced path against its contributing source.
 // It never changes the source YAML or expands a runtime path back onto disk.
 func (s *RunSpec) ResolvePath(field string) (string, error) {
+	field = s.canonicalField(field)
 	value, ok := effectiveField(s.effective, field)
 	if !ok {
 		return "", fmt.Errorf("%s is not configured", field)
@@ -245,8 +269,8 @@ func effectiveField(root map[string]any, path string) (any, bool) {
 	return value, true
 }
 
-// LoadRunSpec is the normal entry boundary for both engines. File inputs are
-// migrated, while ConfigData is imported in memory without a temporary file.
+// LoadRunSpec is the read-only entry boundary for both engines. ConfigData is
+// parsed in memory without a temporary file.
 func LoadRunSpec(args *CmdArgs, showLog bool) (*RunSpec, *errs.Error) {
 	if args == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "command arguments are required")
@@ -295,10 +319,8 @@ func LoadRunSpec(args *CmdArgs, showLog bool) (*RunSpec, *errs.Error) {
 	}
 	origins := make(map[string]FieldOrigin)
 	effective := make(map[string]any)
-	metadata := &loadedConfigMetadata{origins: origins, effective: effective, preflight: func(value *UnifiedConfig) error {
-		return applyUnifiedArguments(cloneConfigValue(value).(*UnifiedConfig), &input)
-	}}
-	value, err := loadUnifiedSources(paths, inline, names, showLog, nil, metadata)
+	metadata := &loadedConfigMetadata{origins: origins, effective: effective}
+	value, err := loadUnifiedSources(paths, inline, names, showLog, metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -306,13 +328,10 @@ func LoadRunSpec(args *CmdArgs, showLog bool) (*RunSpec, *errs.Error) {
 		return nil, errs.New(core.ErrBadConfig, err)
 	}
 	applyCLIOrigins(effective, origins, value.Root, &input)
-	for i, policy := range value.RunPolicy {
+	for i := range value.RunPolicy {
 		path := fmt.Sprintf("run_policy[%d].engine", i)
 		if _, ok := origins[path]; !ok {
 			origins[path] = FieldOrigin{Source: "time_series", Kind: "default"}
-		}
-		if policies, ok := effective["run_policy"].([]any); ok {
-			policies[i].(map[string]any)["engine"] = policy.Engine
 		}
 	}
 	return &RunSpec{value: cloneConfigValue(value).(*UnifiedConfig), effective: cloneStringMap(effective), origins: origins, dataDir: dir, strategyDir: os.Getenv("BanStratDir"), args: input}, nil
@@ -334,7 +353,6 @@ func applyUnifiedArguments(value *UnifiedConfig, args *CmdArgs) error {
 type loadedConfigMetadata struct {
 	origins   map[string]FieldOrigin
 	effective map[string]any
-	preflight func(*UnifiedConfig) error
 }
 
 func recordLayerOrigins(origins map[string]FieldOrigin, merged, layer map[string]any, source string) {

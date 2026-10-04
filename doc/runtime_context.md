@@ -1,16 +1,16 @@
 # BanBot Runtime 上下文架构
 
-本文记录当前工作树已经实现的性能优先 `Process -> Runtime` 架构。它描述现状：High/Medium 的主要修复已落地，但不把 typed state、legacy gate 或局部双实例测试解释为完整的多 Runtime 业务并发隔离。
+更新：2026-10-04。本文记录当前工作树已经实现的性能优先 `Process -> Runtime` 架构。它描述现状：High/Medium 的主要修复已落地，但不把 typed state 或局部双实例测试解释为完整的多 Runtime 业务并发隔离。
 
-剩余 legacy 边界集中于 spider、数据维护、旧 dev Web 与维护工具；因此 LegacyState/legacygate 还保留，不能宣称全部全局状态已删除。本文原有描述与新实施记录冲突时，以实施记录及当前源码为准。
+领域包仍有兼容 facade，不能宣称全部全局状态已删除。本文原有 legacy gate / globals 安装描述已按现有源码校正，当前入口与验证见[重构记录](strategy_engine_refactor.md)。
 
 ## 1. 核心结论
 
 - `runctx.Key[T]` 和 btime Context helper 已删除。当前没有调用方需要通用 typed Context key；保留它会鼓励动态 service locator 和热路径查找。
 - 不实现 goroutine-local、`CurrentRuntime`、goroutine ID 映射或运行时 hack。
 - `context.Context` 只传递取消、deadline 和 I/O 生命周期。ORM series 的表锁由 repo 内部显式获取和释放，不通过 `Context.Value` 传递重入标记。
-- [`runtime.Process`](../runtime/runtime.go) 只持有 Runtime ID 计数器、按存储身份共享的 `*orm.SIDAllocator`，以及按 URL 复用的低频 `*orm.SymbolSIDRegistry`；[`runtime.Runtime`](../runtime/runtime.go) 组合各领域包拥有的 typed state。
-- legacy facade 仍是进程级兼容路径。统一 gate 只保证这些路径串行，不提供完整的多 Runtime 并发隔离。
+- [`runtime.Process`](../runtime/runtime.go) 持有共享账户 registry/owner 服务、scheduler claims、Runtime ID 计数器、按存储身份共享的 `*orm.SIDAllocator`，以及按 URL 复用的低频 `*orm.SymbolSIDRegistry`；[`runtime.Runtime`](../runtime/runtime.go) 组合各领域包拥有的 typed state。
+- legacy facade 仍是兼容路径，但当前 runtime 不存在 WithLegacy/LockLegacy 或 runtime/legacy.go；不能用已删除的 gate 证明并发隔离。
 
 ## 2. Process 与 Runtime 所有权
 
@@ -41,22 +41,19 @@ registry 首次接管已有 `exsymbol_q` catalog 时，新增逻辑 symbol 会�
 | `Cron` | 实例 scheduler，构造时绑定语言和时区 |
 | `Notifications` | `rpc.Session`：实例通知通道和远程命令依赖 |
 | `Exchange` | 显式交易所 session；关闭责任由构造入口承担 |
+| `FactorState` | 可选因子组件，持有 replay 配置和输出/账户 sink 借用 |
 
 领域类型仍由原包定义，`runtime` 负责构造、组合和关闭。`Runtime.Close` 先停止调度、通知及注册的后台任务，等待 callback/join，再清空 `Market`、`Symbols`、`Batch`、`Strategies`、`Orders`、`Trading` 并关闭 `Core`。`Storage` 和 `Exchange` 是显式依赖，不能因为一个 Runtime 关闭就误关另一个 Runtime 共享的连接；创建资源的入口负责关闭，`Process.Close` 释放其持有的 SID registry。
 
-## 3. Legacy gate
+## 3. 显式入口、inspection 与因子状态
 
-[`runtime.WithLegacy`/`LockLegacy`](../runtime/legacy.go) 使用同一个进程级互斥量，保护仍会使用或安装 package globals 的兼容调用链。
+entry 的普通 backtest/trade 根据 RunSpec 的 engine 装配时序、因子或 mixed；Web/CLI 预检共享无资源的因子配置验证。runtimeplan.Inspect 创建局部 Core、Clock、Symbols 和 strat.State，收集需求时不安装或恢复包 globals。
 
-当前覆盖范围：
+Runtime 的可选 FactorState 通过 runner.CloneConfig 接管配置容器，不再 JSON 往返和手工恢复句柄。列表顺序、重复项、nil/空容器保留；Plan、ComputationGroup、PortfolioBuilder、HistoricalInput、ObserveBatch 保持借用身份。复制保留非法 NaN/Inf 拒绝，但不代替 runner.ValidateReplayConfig/ValidateLiveConfig。
 
-- backtest、trade、优化与报告入口已走显式 Runtime，不获取该 gate；旧 dev Web/API 与维护工具仍需兼容 gate；
-- entry 数据路径：repair/verify/correct/adjust、series download、spider、load、aggregate、init、import、export，以及同类通过 `runConfigCommand` 执行的配置型命令；
-- [`runtimeplan.Inspect`](../runtimeplan/inspect.go)，因为它仍临时安装并恢复 `config`、`core` 和 `btime` 状态。
+Process 是账户发送权、共享账户和 SID registry/allocator 的 owner；Runtime 只释放自己的 SharedAccountBorrow。同一账户的多策略必须有稳定身份和资本预算，策略退出不得关闭其他借用者。entry 先关闭 Process，再释放其自建 Storage/Exchange。
 
-Cobra 的 legacy 配置型命令在 `runConfigCommand` 外层取得 gate，内部调用不加锁的 helper，避免同一 goroutine 重入互斥量；直接导出的 legacy entry API 则由各自 wrapper 取得同一 gate。显式 Cobra runner 通过 `openExplicitEntrySession` 创建自己的 Process、Storage、Exchange、Config 和 Runtime，不要求 `LegacySession`。一次显式 backtest/trade session 内创建一个 `Process`，该 session 内的 Runtime 共享 SID allocator；仍使用 legacy facade 的 session 继续串行化。
-
-以下 pure paths 不需要 gate：命令树构造、参数/legacy flag 规范化、help/version、`series list` 对已注册定义的只读 JSON 输出，以及 `runtimeplan.DecodeRequest` 的纯解码。它们不安装运行期全局状态。gate 不进入 bar、tick、价格或策略 callback 热路径。
+因子实时订阅使用 CompileFactorsLivePlan / SubscribeFactorsLive / InstallFactorsLive / BindFactorsLive，候选代 Prepare/Warmup/Commit，失败保留旧代。必须提供注册 verified binding、实时 revision/publication 与 funding/账户证据；普通 SDK 缺能力会失败，详见[指南](../bandoc/zh-CN/guide/factor.md)。
 
 ## 4. Live admission、stop 与 join
 
@@ -96,7 +93,7 @@ entry 的 trade/backtest/optimize/bt-opt/sim-bt/test-pickers/collect-opt/bt-resu
 
 显式 live 的 HTTP/API/auth 和 WebSocket 使用实例状态，WebSocket 慢客户端的监控发送有界且不阻塞交易循环；关闭等待所有接纳的 handler/writer 后完成。回调、provider、调度器的 stop/join 保护仍保留。
 
-尚在 legacy gate 内的是真实维护入口，包括 spider、数据/K线维护、旧 dev Web 与维护工具。这些仍需要逐入口迁移，随后才能删除 LegacyState 和对应 facade。当前代码及测试不能作为两个真实生产数据库 runner 并行 E2E 的替代证据。
+维护入口仍须按各自资源 owner 使用，包级兼容 facade 不能作为任务间通信方式；当前 runtime 不存在统一 legacy gate。当前局部与模拟测试不能作为两个真实生产数据库 runner 并行 E2E 的替代证据。
 
 ## 8. Context 约束
 
@@ -104,7 +101,7 @@ Runtime context 用于取消树、deadline、startup/第三方数据源调用、
 
 ORM series table 的重入锁标记已从 `context.WithValue`/`Context.Value` 删除。repo 方法在需要时显式取得 process/table lock，并在同一方法边界释放；嵌套的 locked helper 只接受调用方已经建立的边界，不从 Context 推断状态。仓库其他独立功能若使用 Context 元数据，不代表 Runtime/ORM 可以恢复 service locator 模式。
 
-## 9. 既有设计决策与历史验证证据（本次验证见实施记录）
+## 9. 历史设计决策与验证证据（保留原时点，本次验证见重构记录）
 
 - `Key[T]`：删除，无 alias、wrapper 或兼容层。
 - `banexg`：固定 `github.com/banbox/banexg v0.2.64`，`go.mod` 无本机绝对路径 replace，模块可从 Go proxy 下载。
@@ -119,8 +116,8 @@ ORM series table 的重入锁标记已从 `context.WithValue`/`Context.Value` �
 
 ## 10. 剩余风险
 
-- legacy globals 仍覆盖策略、jobs、订单、钱包、交易所 session、ORM pool 和若干后台 worker；gate 是当前正确性边界，也是并发能力限制。
+- 仍有包级兼容 facade；使用显式依赖和 owner 生命周期，不能以不存在的 gate 保证任意嵌入路径隔离。
 - 生产 typed live 的主要 cron、订单/钱包循环与 Web 已接入实例生命周期；仍应对外部组件和自定义嵌入路径验证 stop/join，不能推断任意外部 goroutine 都自动归属 Runtime。
 - 未配置 registry 时，Process 内 allocator 和本地 lease 只协调同一主机的 single-writer；配置 registry 后 PostgreSQL 的 sequence/unique key 才是跨进程 SID 协调边界。
 - QuestDB snapshot 通过 schema、每 SID 行数和样本验证，不是逐单元格全表校验；WAL timeout、rename 中断和 backup 恢复仍需运维可见性。
-- 最终多 Runtime 并发承诺仍需迁移剩余 globals、删除临时全局安装，完成两个完整 runner 的确定性并发/取消/结果一致性验证，并持续运行全量测试和稳定 benchmark 对比。
+- 最终多 Runtime 并发承诺仍需审查剩余兼容调用和外部 owner，完成两个完整 runner 的确定性并发/取消/结果一致性验证，并持续运行全量测试和稳定 benchmark 对比。

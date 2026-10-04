@@ -2,35 +2,27 @@
 
 The goods package provides functionality related to commodities and trading pairs.
 
+## Runtime-aware filters and pools
+
+RuntimeDeps contains Core, Clock, Config, DataDir, Symbols, Storage, Exchange and ShowLog. RuntimeFilter.FilterWithRuntimeDeps and RuntimeProducer.GenSymbolsWithRuntimeDeps are instance extensions; SymbolStateFilter/Producer and legacy interfaces remain supported. RefreshPairListWithRuntimeDeps/FilterPairsWithRuntimeDeps use task configuration, clocks and symbol identity. Frozen pools, forced filtering and order have distinct contracts.
+
 ## Important Structures
 
 ### IFilter
-Filter interface that all filters must implement.
-- `GetName() string` - Get filter name
-- `IsDisable() bool` - Check if filter is disabled
-- `IsNeedTickers() bool` - Check if tickers data is needed
-- `Filter(pairs []string, tickers map[string]*banexg.Ticker) ([]string, *errs.Error)` - Filter method
+
+The interface exposes GetName() string, IsDisable() bool and Filter(pairs []string, timeMS int64) ([]string, *errs.Error). IsNeedTickers is not part of the current interface; data/configuration comes through explicit RuntimeDeps or implementation state.
 
 ### IProducer
-Producer interface that inherits from IFilter, used to generate trading pair lists.
-- Inherits all methods from IFilter
-- `GenSymbols(tickers map[string]*banexg.Ticker) ([]string, *errs.Error)` - Generate trading pair list
+
+Extends IFilter with GenSymbols(timeMS int64) ([]string, *errs.Error). The old tickers parameter is not the current signature.
 
 ### BaseFilter
-Base filter structure, the base class for all concrete filters.
-- `Name string` - Filter name
-- `Disable bool` - Whether disabled
-- `NeedTickers bool` - Whether tickers data is needed
-- `AllowEmpty bool` - Whether empty results are allowed
+
+Public fields are Name string, Disable bool and AllowEmpty bool; there is no NeedTickers field.
 
 ### VolumePairFilter
-Volume filter that sorts all trading pairs in reverse order by volume value.
-- `Limit int` - Limit on number of returned results, takes first 100
-- `LimitRate float64` - Limit rate
-- `MinValue float64` - Minimum volume value
-- `RefreshSecs int` - Cache time in seconds
-- `BackTimeframe string` - Time period for calculating volume, defaults to days
-- `BackPeriod int` - Multiplier for time range obtained by multiplying with BackTimeframe
+
+Fields: BaseFilter, Limit int, LimitRate float64, MinValue float64, CacheSecs int and BackPeriod string. BackPeriod is a duration/timeframe string, not the old BackTimeframe/integer multiplier.
 
 ### PriceFilter
 Price filter configuration structure.
@@ -40,11 +32,8 @@ Price filter configuration structure.
 - `Max float64` - Maximum price
 
 ### RateOfChangeFilter
-Price change ratio filter, calculates (high-low)/low ratio over a period.
-- `BackDays int` - Number of candlestick days to look back
-- `Min float64` - Minimum price change ratio
-- `Max float64` - Maximum price change ratio
-- `RefreshPeriod int` - Cache time in seconds
+
+Fields: BaseFilter, BackDays int, Min/Max float64 and CacheSecs int. The cache field is CacheSecs, not RefreshPeriod.
 
 ### SpreadFilter
 Liquidity filter.
@@ -109,4 +98,4 @@ Refresh trading pair list to get the latest valid trading pairs.
 
 Returns:
 - `[]string` - List of valid trading pairs
-- `*errs.Error` - Error information during refresh 
+- `*errs.Error` - Error information during refresh

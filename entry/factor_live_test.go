@@ -455,14 +455,14 @@ func testFactorLiveBinding(t *testing.T, failure error, scoped bool, counts ...i
 	c.Mode = runner.Trade
 	name := fmt.Sprintf("entry_live_%d", time.Now().UnixNano())
 	c.Factor.Source = name
-	c.Factor.Frequency = "event"
+	c.Factor.TimeFrame = "event"
 	c.Factor.Window = 2
 	c.Plan, err = factor.New().Add("close", factor.Field(name, "close", "event")).Compile()
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.Combo = research.ComboSpec{Method: research.Fixed, Columns: []string{"close"}, Weights: map[string]float64{"close": 1}}
-	c.Prices = runner.PriceStream{Source: name, Frequency: "event", Field: "close"}
+	c.Prices = runner.PriceStream{Source: name, TimeFrame: "event", Field: "close"}
 	c.Manifest.Costs.FundingPolicy = "explicit-zero"
 	strategyCount := 1
 	if len(counts) > 0 {

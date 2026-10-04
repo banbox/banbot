@@ -62,14 +62,6 @@ Set system running environment.
 Parameters:
 - `env string` - Running environment identifier
 
-### SetPairMs
-Set time parameters for trading pair.
-
-Parameters:
-- `pair string` - Trading pair name
-- `barMS int64` - candlestick time interval (milliseconds)
-- `waitMS int64` - Wait time (milliseconds)
-
 ### Sleep
 Sleep function with interrupt check.
 
@@ -91,12 +83,6 @@ Parameters:
 Returns:
 - `T` - Cache value or default value
 
-### SnapMem
-Get memory snapshot.
-
-Parameters:
-- `name string` - Snapshot name
-
 ## Performance Statistics Methods
 
 ### GetPerfSta
@@ -115,52 +101,6 @@ Parameters:
 - `outDir string` - Output directory path
 
 ## Price Related Methods
-
-### GetPrice
-Get latest price for trading pair.
-
-Parameters:
-- `symbol string` - Trading pair symbol
-- `side string` - banexg.OdSideBuy/OdSideBuy/""
-
-Returns:
-- `float64` - Latest price
-
-### GetPriceSafe
-Safely get trading pair price, including fiat currency handling logic.
-
-Parameters:
-- `symbol string` - Trading pair symbol
-- `side string` - banexg.OdSideBuy/OdSideBuy/""
-
-Returns:
-- `float64` - Processed price
-
-### SetPrice
-Set latest price for trading pair.
-
-Parameters:
-- `pair string` - Trading pair name
-- `ask float64` - ask price
-- `bid float64` - bid price
-
-### SetPrices
-Batch set prices for multiple trading pairs.
-
-Parameters:
-- `data map[string]float64` - Trading pair price mapping
-- `side string` - banexg.OdSideBuy/OdSideBuy/""
-
-### IsMaker
-Determine if current price is a market maker price.
-
-Parameters:
-- `pair string` - Trading pair name
-- `side string` - Trading side
-- `price float64` - Price
-
-Returns:
-- `bool` - Whether it's a market maker price
 
 ## Utility Methods
 
@@ -265,11 +205,10 @@ Returns:
 ### RunExitCalls
 Execute callback functions on exit.
 
-### IsPriceEmpty
-Check if price cache is empty.
 
-Returns:
-- `bool` - Whether price cache is empty
 
-### PrintStratGroups
-Print strategy group information.
+## Current responsibilities and migrated APIs
+
+Price helpers belong to com, not core. Explicit tasks use Runtime.Market.Prices PriceState methods (GetPriceSafeExpAt/SetPriceAt/SetPricesAt with explicit nowMS). Package-level com GetPrice/SetPrice helpers are compatibility facades. SetPairMs is also in com. PrintStratGroups belongs to strat; explicit tasks use PrintStratGroupsWithState. SnapMem is no longer a public function. core.CountDigit(text string) int counts Unicode digit characters.
+
+State owns admission/performance/cancellation. Runtime injects concrete state; package Setup/SetRunMode does not provide multi-task isolation. See [com](com.md), [runtime](runtime.md).

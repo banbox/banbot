@@ -1,5 +1,8 @@
 # 因子表达式核心架构原理
 
+> 2026-10-04 校订：本文保留历史设计和测试口径。当前使用见[多因子指南](../bandoc/zh-CN/guide/factor.md)，逐包实施/暂缓与本次实际验证见[重构记录](strategy_engine_refactor.md)。缺失实施文档的链接已修复，历史结果不据此重新验收；真实 venue 与性能承诺仍需独立证据。
+
+
 Go builder 与因子表达式共享同一个截面、多因子计算内核：`factor.Node → factor.Plan → Session/Batch → Frame`。Go 代码直接构造节点，表达式则在启动时解析并转换为原生节点；执行时不逐 bar 解释字符串。常见因子可以通过公式、参数和命名中间项组合，只有新增原子算法才需要修改 Go。
 
 本篇说明当前实现及其边界。Go builder、表达式配置、测试及回测/实盘接入步骤见[因子构建与使用指南](factor_expression_guide.md)。
@@ -26,20 +29,20 @@ flowchart TD
 | 层 | 当前职责 | 主要源码 |
 |---|---|---|
 | 表达式前端 | 受限语法、名称绑定、参数检查、转换为原生节点 | [parser.go](../factor/expr/parser.go)、[compile.go](../factor/expr/compile.go) |
-| 计划内核 | 节点契约、频率校验、拓扑顺序、内容哈希、预热与保留长度 | [dag.go](../factor/dag.go)、[pointwise.go](../factor/pointwise.go) |
+| 计划内核 | 节点契约、周期校验、拓扑顺序、内容哈希、预热与保留长度 | [dag.go](../factor/dag.go)、[pointwise.go](../factor/pointwise.go) |
 | 数据与执行 | 冻结版本快照、数值视图、增量状态、批量计算 | [snapshot.go](../factor/snapshot.go)、[value.go](../factor/value.go)、[session.go](../factor/session.go)、[batch.go](../factor/batch.go) |
 | 策略装配 | 定义选择、组合、计算共享、研究与回放/实盘驱动 | [decision.go](../factor/runner/decision.go)、[computation.go](../factor/runner/computation.go) |
-| 入口 | v2 配置转换、输入和价格依赖、离线编译检查 | [factor_config.go](../entry/factor_config.go)、[factor_expression_commands.go](../entry/factor_expression_commands.go) |
+| 入口 | 统一配置装配、输入和价格依赖、离线编译检查 | [factor_config.go](../entry/factor_config.go)、[factor_expression_commands.go](../entry/factor_expression_commands.go) |
 
 依赖方向是 `expr → factor`，runner/entry 负责装配。表达式本身不查询数据库、不访问交易账户、不提交订单，也不执行任意 Go 或脚本。
 
 ## 2. 从表达式到可复用计划
 
-`expr.Spec` 包含 schema 版本、决策频率、数据源绑定、数值参数、`lets`、`outputs` 和组合配置。绑定别名与数据源名称可以不同；例如 `kline.close` 中的 `kline` 是绑定别名，最终节点保存绑定的真实 source、field 与频率。
+`expr.Spec` 包含 schema 版本、决策周期、数据源绑定、数值参数、`lets`、`outputs` 和组合配置。绑定别名与数据源名称可以不同；例如 `kline.close` 中的 `kline` 是绑定别名，最终节点保存绑定的真实 source、field 与周期。
 
 解析器使用 Go 标准库 `text/scanner`，按优先级生成包含位置的 AST。`* /` 高于 `+ -`，二元运算左结合，支持一元正负号和嵌套函数。名称必须显式属于 `alias.field`、`factor.name` 或 `param.name`；特殊字段名通过 `field("alias", "some-key")` 表达。参数在编译时绑定为有限数值，窗口参数还必须满足整数和范围限制。
 
-`lets` 和 `outputs` 属于同一个定义集合，可以前向引用，不能同名或形成循环。编译器会解析和校验所有声明，包括未使用的中间项；最终只将输出可达的节点交给完整计划。因此，一个未使用但非法的 `let` 仍会报错，一个未使用的合法字段引用不会增加最终订阅。`Plan.Inputs()` 汇总实际可达节点的 source、frequency、字段和采样要求。
+`lets` 和 `outputs` 属于同一个定义集合，可以前向引用，不能同名或形成循环。编译器会解析和校验所有声明，包括未使用的中间项；最终只将输出可达的节点交给完整计划。因此，一个未使用但非法的 `let` 仍会报错，一个未使用的合法字段引用不会增加最终订阅。`Plan.Inputs()` 汇总实际可达节点的 source、timeframe、字段和采样要求。
 
 转换阶段直接调用 `factor.Field/AsOfField/Return/StdDev/Rank/Add/Div/...` 等 builder。表达式里的算术具有独立原生 operator 身份，不统一包装成 `Custom` 回调。`expr.Compile` 只返回计算计划；runner 的 `CompileDefinition` 另外解析组合默认值并校验组合列和权重。
 
@@ -76,11 +79,11 @@ Session 和 Batch 共用 `evaluatePointwise`：多输入按声明顺序传播第
 
 ### PIT 与完整性屏障
 
-[`Freeze`](../factor/snapshot.go) 按 `(SID, source, frequency)` 选择当时可见的最新事件及修订。`EventTime <= GridTime`、`AvailableAt <= DecisionTime`，指定 `ReplayTime` 时还要求 `IngestedAt <= ReplayTime`。schema、source version、SID 映射、Universe、复权版本和可见性策略随快照固定；访问器返回独立副本，迟到数据或历史修订需要创建新快照并重新回放。
+[`Freeze`](../factor/snapshot.go) 按 `(SID, source, timeframe)` 选择当时可见的最新事件及修订。`EventTime <= GridTime`、`AvailableAt <= DecisionTime`，指定 `ReplayTime` 时还要求 `IngestedAt <= ReplayTime`。schema、source version、SID 映射、Universe、复权版本和可见性策略随快照固定；访问器返回独立副本，迟到数据或历史修订需要创建新快照并重新回放。
 
 `GridTime` 是逻辑观察时间，`DecisionTime` 是实际可见性截止时间，两者允许不同。屏障检查每个要求的流是否到达、是否为目标已闭合事件或满足 asof 时效；数据流已到达但字段 NULL 与整个数据流未到达是两种情况。只有 Ready 快照可以执行。
 
-同频默认字段使用 source-events，要求当前网格的已闭合事件。不同频率源必须显式绑定 `asof`/`asof-latest` 和正 `max_age_ms`，转换为决策频率的 `AsOfField`。asof 读取网格之前、截止时间已可见且未超龄的最新记录；之后的窗口每个决策观察推进一次，重复读取同一个源事件也算一次观察。
+同周期默认字段使用 source-events，要求当前网格的已闭合事件。不同周期源必须显式绑定 `asof`/`asof-latest` 和正 `max_age_ms`，转换为决策周期的 `AsOfField`。asof 读取网格之前、截止时间已可见且未超龄的最新记录；之后的窗口每个决策观察推进一次，重复读取同一个源事件也算一次观察。
 
 ### Session 与 Batch
 
@@ -110,9 +113,9 @@ Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame
 
 不同计划即使有部分相同子图，也不会自动共享状态。需要共享大量候选的公共子表达式，应把兼容的候选编入同一个多输出 Plan。完整计算共享不等于跨计划全局缓存，也不等于共享交易账户。
 
-表达式入口不能同时提供显式 Plan 或非空 definition；既有 Go 入口在传入 Plan 时优先使用该计划。v2 入口负责把 `factor.expressions` 转为 `expr.Spec`，补齐未填写的表达式频率并验证它与 `run_timeframes`/决策间隔一致。外层参数会进入 Go definition 的 Manifest.Parameters，表达式参数则单独控制公式；两种方式都使用外层持仓配置。成交价格通过独立 PriceStream 依赖获取：归档缺少可识别行情流时必须明确指定价格，不能把因子输入的资金费率等字段推断为成交价格。
+表达式入口不能同时提供显式 Plan 或非空 definition；既有 Go 入口在传入 Plan 时优先使用该计划。统一入口负责把 `expressions` 转为 `expr.Spec`，补齐未填写的表达式周期并验证它与 `run_timeframes`/决策间隔一致。外层参数会进入 Go definition 的 Manifest.Parameters，表达式参数则单独控制公式；两种方式都使用外层持仓配置。成交价格通过独立 PriceStream 依赖获取：归档缺少可识别行情流时必须明确指定价格，不能把因子输入的资金费率等字段推断为成交价格。
 
-`factor validate` 与 `factor explain` 当前执行相同的严格独立 YAML 编译检查，输出 hash、频率、输出列、节点数、预热、保留长度、实际 inputs 和组合，不加载行情或账户。它们不验证真实数据字段存在或预测策略收益；完整入口预检负责实际数据依赖。
+`factor validate` 与 `factor explain` 当前执行相同的严格独立 YAML 编译检查，输出 hash、周期、输出列、节点数、预热、保留长度、实际 inputs 和组合，不加载行情或账户。它们不验证真实数据字段存在或预测策略收益；完整入口预检负责实际数据依赖。
 
 ## 7. 资源限制、扩展与性能取舍
 
@@ -122,7 +125,7 @@ Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame
 
 新增普通公式直接组合已有函数。新增原子算子时，应依次完成：
 
-1. 在 builder/NodeSpec 中定义名称、不可变版本、参数、频率、有效性、预热、保留长度及后端能力，并补编译校验。
+1. 在 builder/NodeSpec 中定义名称、不可变版本、参数、周期、有效性、预热、保留长度及后端能力，并补编译校验。
 2. 增加 Session 与 Batch 实现；逐点逻辑优先放在共用 evaluator，状态逻辑同时验证初始化、缺样本、生命周期和安全克隆。
 3. 在表达式前端白名单、参数检查和转换中开放函数，补指南；目前没有自动算子目录注册机制。
 4. 用独立手算样本验证数值和 validity，再验证 Go/表达式 hash 与结果、Session/Batch、回放/实盘一致性，并记录性能。

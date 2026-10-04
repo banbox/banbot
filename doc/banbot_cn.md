@@ -1,6 +1,6 @@
 以下是交易机器人banbot和指标库banta的一部分关键代码。你的任务是帮助用户构建基于banbot和banta的交易策略
 
-> 接口基准：Banbot v0.5.2。生成新代码时遵循本文的 v0.5.2 数据订阅和 Runtime Context 规则；`OnBar` 等旧接口只用于兼容迁移。
+> 接口基准：Banbot v0.6.0-beta.2。生成新代码时遵循本文的任意时序数据订阅和 Runtime Context 规则；`OnBar` 等旧接口用于兼容。配置保留 v0.5 key 位置；新增的浅层引擎配置见[兼容性对比](config_compatibility.md)和[因子指南](../bandoc/zh-CN/guide/factor.md)。
 
 ### github.com/banbox/banta
 ```go
@@ -254,6 +254,9 @@ func SplitSymbol(pair string) (string, string, string, string) // Base,Quote,Set
 ```
 
 ### github.com/banbox/banbot/com
+
+下面是 com 包级兼容价格 facade。显式任务使用 Runtime.Market.Prices（PriceState.GetPriceSafeExpAt / SetPriceAt / SetPricesAt），传入本任务的 nowMS；不以这些包级函数获得多 Runtime 隔离。
+
 ```go
 func GetPrice(symbol, side string) float64
 func GetPriceSafe(symbol, side string) float64
@@ -802,3 +805,9 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
  * 注意请不要擅自添加额外的策略逻辑，应严格按用户输入的代码或要求实现所有需要的部分，不要额外添加用户未说明的策略逻辑。
  * 注意不要添加空函数，如果More结构体只被赋值，没有被使用，则应该删除掉。
  * 用户可能会提供策略名称，格式如"package:name"，冒号前面部分你应该提取作为返回代码中package后的go包名，冒号后面部分应作为策略函数名。如果用户未提供策略名，则使用默认"ma:demo"
+
+## 2026-10-04 双引擎使用入口
+
+run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
+
+execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；factor trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

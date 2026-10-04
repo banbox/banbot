@@ -12,14 +12,14 @@ func beginTestRound(t *testing.T, barrier *RoundBarrier, plan *Plan, snapshot *S
 	t.Helper()
 	requirements := make([]Requirement, 0, len(snapshot.status.Expected))
 	for _, key := range snapshot.status.Expected {
-		requirements = append(requirements, Requirement{SID: key.SID, Source: key.Source, Frequency: key.Frequency, EventTime: snapshot.spec.DecisionTime})
+		requirements = append(requirements, Requirement{SID: key.SID, Source: key.Source, TimeFrame: key.TimeFrame, EventTime: snapshot.spec.DecisionTime})
 	}
 	token, err := barrier.Begin(plan.Hash(), snapshot.Spec(), requirements, deadline)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, key := range snapshot.status.Expected {
-		row, _ := snapshot.Row(key.SID, key.Source, key.Frequency)
+		row, _ := snapshot.Row(key.SID, key.Source, key.TimeFrame)
 		if err := barrier.Observe(token, row, snapshot.spec.DecisionTime); err != nil {
 			t.Fatal(err)
 		}
@@ -110,7 +110,7 @@ func TestBarrierExpiryFreezeAndFailedComputationPreservePublication(t *testing.T
 	if _, err := barrier.Compute(token, owner, func() int64 { return 1000 }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := barrier.Begin(plan.Hash(), first.Spec(), []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 1000}}, 1500); err == nil {
+	if _, err := barrier.Begin(plan.Hash(), first.Spec(), []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 1000}}, 1500); err == nil {
 		t.Fatal("duplicate published decision admitted")
 	}
 	row, _ := first.Row(1, "prices", "1h")
@@ -137,7 +137,7 @@ func TestBarrierExpiryFreezeAndFailedComputationPreservePublication(t *testing.T
 	spec.SourceVersions["prices"] = "changed"
 	row, _ = third.Row(1, "prices", "1h")
 	row.SourceVersion = "changed"
-	failed, err := Freeze(spec, []VersionRecord{row}, []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 3000}})
+	failed, err := Freeze(spec, []VersionRecord{row}, []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 3000}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestBarrierIncompleteNeverProducesFrame(t *testing.T) {
 	owner, _ := NewSession(plan)
 	base := testSnapshot(t, 1000, map[int32]map[string]any{1: {"close": 1.0}, 2: {"close": 2.0}})
 	barrier := &RoundBarrier{}
-	need := []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 1000}, {SID: 2, Source: "prices", Frequency: "1h", EventTime: 1000}}
+	need := []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 1000}, {SID: 2, Source: "prices", TimeFrame: "1h", EventTime: 1000}}
 	token, err := barrier.Begin(plan.Hash(), base.Spec(), need, 1500)
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +250,7 @@ func TestBarrierDeadlineAfterPrivateEvaluationAndStopJoin(t *testing.T) {
 	}
 	barrier.Stop()
 	barrier.Join()
-	if _, err := barrier.Begin(plan.Hash(), first.Spec(), []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 1000}}, 2000); !errors.Is(err, ErrRoundStale) {
+	if _, err := barrier.Begin(plan.Hash(), first.Spec(), []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 1000}}, 2000); !errors.Is(err, ErrRoundStale) {
 		t.Fatalf("stopped barrier admitted work: %v", err)
 	}
 }

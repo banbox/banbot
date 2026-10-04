@@ -1,9 +1,14 @@
 banbot has a wide range of configuration options. By default, these are configured through the `yaml` configuration file.
 
-## Data Directory
-Every time you start backtesting or real trading, you need to pass in the `-datadir` parameter, which is the data directory. You can also configure the environment variable `BanDataDir` and ignore the `-datadir` parameter.
+The maintained field reference, including optional factor, account and historical replay examples, is [doc/config.yml](https://github.com/banbox/banbot/blob/main/doc/config.yml). See the [v0.5 compatibility comparison](https://github.com/banbox/banbot/blob/main/doc/config_compatibility.md) for exact key changes. Optional example blocks must be selected for the intended mode and filled with actual resources.
 
-You can store several yaml configuration files in the data directory. When backtesting, a `backtest` subdirectory will be automatically created in the data directory to store the backtest results.
+## Data Directory
+
+Ordinary entry points require a data directory by default: pass `--datadir /path/to/data` or set `BanDataDir`; the explicit argument takes precedence. Existing `config.yml` and `config.local.yml` files in that directory are loaded by default.
+
+Use `--no-default --config /absolute/config.yml` to skip default files. Loading explicit configuration alone then does not require a data directory. Configuration paths prefixed with `@` or `$` still require one, and output, storage and execution commands may impose their own directory requirements. Successful loading does not establish resource readiness.
+
+The directory can hold several YAML files; backtests normally write reports under its `backtest` subdirectory.
 
 ## Yaml Configuration File
 banbot can receive several configuration file paths from command line parameters. If the following configuration files have the same configuration as the previous ones, the previous ones will be overwritten.
@@ -20,6 +25,8 @@ It is recommended to store local related configurations in `config.local.yml`, s
 
 ## Complete Yaml configuration
 > You can use environment variables to replace sensitive content in the configuration, such as `${bnb_user1_key}`
+
+This is a field reference template. Register `Demo` in your application and replace placeholder credentials and market/account/symbol settings before execution. See the fields below and the [factor guide](./factor.md) for factor configuration.
 
 ```yaml
 name: local  # Bot name, used to distinguish different bots in message notifications
@@ -48,7 +55,7 @@ min_open_rate: 0.5  # Minimum open order ratio, allows order if balance / per or
 low_cost_action: ignore # Action when stake amount < the minimum amount: ignore/keepBig/keepAll
 max_simul_open: 0 # Maximum number of simultaneously open orders on one candlestick
 bt_net_cost: 15  # Order delay in backtest, can be used to simulate slippage, in seconds, default is 15
-bt_strict: false  # Enable strict backtest mode; canonicalizes key execution order for strictly reproducible results, adding 3%-5% execution time
+bt_strict: false  # Enable strict backtest mode; canonicalizes key execution order for strictly reproducible results, execution cost depends on the workload
 relay_sim_unfinish: false  # When trading a new symbol (backtesting/live trading), whether to trading from the open order relay at the beginning time
 order_bar_max: 500  # Find the maximum number of bars for forward simulation from the open orders at the start time.
 ntp_lang_code: none  # NTP (Network Time Protocol) real-time synchronization. The default is `none`(disabled). Supported codes: zh-CN, zh-HK, zh-TW, ja-JP, ko-KR, zh-SG, and global (indicating global NTP servers such as Google, Apple, Facebook, etc.).
@@ -64,7 +71,8 @@ time_start: "20230701"  # K-line start time, supports timestamp, date, date-time
 time_end: "20230808"
 run_timeframes: [5m]  # All allowed timeframes for the bot. The strategy will choose the most suitable minimum timeframe; this setting is lower priority than run_policy
 run_policy:  # The strategy to run, multiple strategies can run simultaneously or a strategy can be run with different parameters
-  - name: Demo  # Strategy name
+  - engine: time_series
+    name: Demo  # Strategy name
     run_timeframes: [5m]  # Timeframes supported by this strategy, overrides the root run_timeframes when provided
     refine_tf: 1m  # Matching period, a string or a number, where a number represents a reduction factor relative to timeframes: '1m', '5m', '3-6', 5
     filters:  # All filters from pairlists can be used
@@ -239,7 +247,7 @@ api_server:  # For external control of the bot or access to dashboard via API
   jwt_secret_key: fn234njkcu89234nbf
   users:
     - user: ban
-      pwd: 123
+      pwd: "123"
       allow_ips: []
       acc_roles:
         user1: admin  # The key here corresponds to "accounts", and the value can be admin/guest.
@@ -349,7 +357,7 @@ rpc_channels:
     min_intv_secs: 300          # Minimum sending interval (seconds)
     touser: 'recipient@abc.com'  # Recipient email address
 ```
-> **Sending Frequency**: It's recommended to set `min_intv_secs` to avoid frequent email sending
+> **Sending TimeFrame**: It's recommended to set `min_intv_secs` to avoid frequent email sending
 
 ## Live Trading Scheduled Backtest Comparison Feature
 
@@ -365,3 +373,49 @@ bt_in_live:
     - "trader1@example.com"
     - "manager@example.com"
 ```
+
+
+## Factor and mixed configuration fields
+
+Configuration keeps the v0.5 root keys and run_policy list without requiring config_version. Ordinary YAML loading is read-only: it creates no backups and rewrites no files. Omitted engine retains legacy time-series and open parameter semantics; explicit engine: time_series or factor enables the new id/account/capital_weight semantics. capital_weight differs from stake_rate. Factors accept one run_timeframes. Enabled advanced fields reject unknown keys and invalid NULL.
+
+| Path | Fields |
+| --- | --- |
+| data | namespace, page_rows, prefetch_rows, page_bytes, archive, max_records, pit_policy |
+| execution / accounts.&lt;name&gt; | mode, store, history, sender_lease_dir, live_provider, funding_policy, instruments, margin_rate, max_account_margin, max_virtual_gross, strategy_gross_limit |
+| run_policy[] | archive/chunks, snapshot, definition or expressions, combo, portfolio, decision, research, manifest, prices, funding_source, initial_nav, max_records, config |
+| run_policy[].decision | interval_ms, delay_ms, latency_ms, expiry_ms, max_pending |
+| run_policy[].snapshot | universe, sid_map, schemas, source_versions, adjustment_version, visibility_policy, grid_time, decision_time, replay_time |
+| run_policy[].expressions | schema_version, timeframe, bindings, params, lets, outputs, combine |
+| run_policy[].combo / run_policy[].expressions.combine | method: equal/fixed/history-ic, columns, weights |
+| run_policy[].portfolio | builder, k, long_notional, short_notional, mode: full/patch |
+| run_policy[].research | labels, label_wait_ms |
+| run_policy[].prices | source, timeframe, field |
+
+accounts.&lt;account&gt; overrides account settings; risk limits are absolute settlement-currency amounts. archive/store/history/sender_lease_dir follow the field's originating file, including multi-file overrides. Latest-value storage needs static-approximation. page_bytes bounds logical payload, not RSS. See [factor examples](./factor.md).
+
+
+Keep credentials and existing stake/leverage fields in root accounts.&lt;name&gt;. Put account-specific mode/store/history/funding_policy/instruments and risk overrides there too; execution retains shared defaults. Factor fields live directly under run_policy[], with cohesive expressions, snapshot, portfolio, decision and research groups. Legacy config_version: 1/2, factor wrappers and execution.accounts remain readable; current examples and canonical exports use the shallow structure.
+
+
+```yaml
+execution:
+  mode: events
+  funding_policy: explicit-zero
+accounts:
+  default:
+    stake_rate: 0.1
+    leverage: 2
+    history: cold/default-history.sqlite
+    max_virtual_gross: "20000"
+```
+
+This is an account overlay fragment; retain existing credentials. Account history and risk limits override shared defaults; omitted execution fields inherit execution.
+
+Use one spelling per field in each configuration file: declaring both `run_policy[].factor.archive` and `run_policy[].archive`, or the same account execution field in both root `accounts` and legacy `execution.accounts`, is a conflict. Across files, later layers still override earlier ones after aliases are normalized. Relative paths follow the file that supplied the final field. Canonical exports omit `config_version` and legacy wrappers.
+
+Existing v0.5 `timeframes` and `run_timeframes` keep their names. The v0.6-only `frequency` field uses `timeframe`; it has no alias. Legacy policies without explicit engine retain `More`, including names such as `id`, `account`, `archive` and `factor`. If a custom legacy parameter already uses `engine: factor` or `engine: time_series`, review that collision before upgrading.
+
+## Historical replay fields
+
+`bt_strict` controls execution ordering; `bt_no_kline_download` disables implicit K-line downloads during backtests. Valid `historical_coverage` and both flags form the strict historical replay contract. See the [backtest guide](./backtest.md#strict-replay-and-historical-coverage) for coverage fields and preparation/replay boundaries. Snapshot configuration is read-only; Runtime manages execution accounts separately. Do not switch active tasks by mutating global configuration.

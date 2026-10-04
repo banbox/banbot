@@ -72,13 +72,13 @@ BanBot UI 是一个为量化交易机器人 BanBot 设计的前端项目。它�
 
 #### 开发与回测 (Dev)
 - **src/lib/dev/CodeMirror.svelte**: 用于策略和配置编辑的代码编辑器,支持Go和YAML语法高亮。
-- **src/lib/dev/Monaco.svelte**: Monaco编辑器组件,提供更强大的代码编辑功能。
 - **src/lib/dev/AllConfig.svelte**: 展示所有配置项的抽屉组件。
 - **src/lib/dev/DrawerDataTools.svelte**: 数据工具抽屉，提供数据下载、导入、导出等功能。
 - **src/lib/dev/RangeSlider.svelte**: 范围选择滑块组件。
 - **src/lib/dev/websocket.ts**: 用于接收后端实时消息的WebSocket客户端。
 - **src/lib/dev/ban_hints.ts**: BanBot代码提示和自动完成配置。
 - **src/lib/treeview/**: 用于展示策略文件目录的树形组件。
+- **src/lib/series/SeriesViewer.svelte**: 任意时序数据查看器，选择数据源、SID、周期、字段与时间范围，以表格展示字段值。
 
 #### 实盘监控 (Dashboard)
 - **src/lib/dash/AddBot.svelte**: 添加（登录）新的机器人实例的组件。
@@ -96,6 +96,7 @@ BanBot UI 是一个为量化交易机器人 BanBot 设计的前端项目。它�
 - **src/routes/(dev)/optimize/+page.svelte**: 超参数优化页面。
 - **src/routes/(dev)/data/+page.svelte**: 本地数据管理页面。
 - **src/routes/(dev)/data/item/+page.svelte**: 单个品种的数据详情页。
+- **src/routes/(dev)/data/series/+page.svelte**: 开发环境中的任意时序数据查询页。
 - **src/routes/(dev)/setting/+page.svelte**: 全局配置、编译、语言等设置页面。
 - **src/routes/(dev)/trade/+page.svelte**: 实盘交易指引页面。
 
@@ -104,6 +105,7 @@ BanBot UI 是一个为量化交易机器人 BanBot 设计的前端项目。它�
 - **src/routes/dash/board/+page.svelte**: 机器人状态总览仪表盘。
 - **src/routes/dash/strat_job/+page.svelte**: 策略任务管理页面。
 - **src/routes/dash/kline/+page.svelte**: 实盘K线图页面。
+- **src/routes/dash/series/+page.svelte**: 当前机器人运行时的任意时序数据查询页。
 - **src/routes/dash/perf/+page.svelte**: 账户收益表现统计页面。
 - **src/routes/dash/order/+page.svelte**: 订单和持仓管理页面。
 - **src/routes/dash/rebate/+page.svelte**: 账户资金流水页面。
@@ -115,6 +117,8 @@ BanBot UI 是一个为量化交易机器人 BanBot 设计的前端项目。它�
 - **src/routes/kline/+page.svelte**: 一个独立的、可用于外部嵌入的K线图页面。
 
 ## 前端UI风格特征总结
+
+开发后端由 `web/dev.DevServer` 持有任务列表、订单缓存、WebSocket 客户端和数据工具状态，通过注入的 Runtime 工厂为请求解析数据依赖。实盘后端由 `web/live.ApiServer` 使用对应 Runtime，前端切换机器人不会把后端任务状态合并为进程全局状态。统一配置与因子入口的能力以 [当前架构](app_arch.md) 和 [因子指南](../bandoc/zh-CN/guide/factor.md) 为准；现有优化和订单报表界面不能替代因子研究产物。
 
 ### 1. 框架技术与基础风格
 - **技术栈**: 采用 SvelteKit + TypeScript，组件化开发，利用 Svelte 5 的符文（Runes）进行状态管理。

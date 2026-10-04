@@ -55,5 +55,5 @@ func sameReplayTimeline(a, b Config) bool {
 	if b.HistoricalInput != nil {
 		inputB = b.HistoricalInput.Identity()
 	}
-	return inputA == inputB && reflect.DeepEqual(a.Chunks, b.Chunks) && a.DecisionInterval == b.DecisionInterval && a.DecisionDelayMS == b.DecisionDelayMS && a.Prices.Source == b.Prices.Source && a.Prices.Frequency == b.Prices.Frequency && a.FundingSource == b.FundingSource && (a.Snapshot.ReplayTime != 0) == (b.Snapshot.ReplayTime != 0)
+	return inputA == inputB && reflect.DeepEqual(a.Chunks, b.Chunks) && a.DecisionInterval == b.DecisionInterval && a.DecisionDelayMS == b.DecisionDelayMS && a.Prices.Source == b.Prices.Source && a.Prices.TimeFrame == b.Prices.TimeFrame && a.FundingSource == b.FundingSource && (a.Snapshot.ReplayTime != 0) == (b.Snapshot.ReplayTime != 0)
 }

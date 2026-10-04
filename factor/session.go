@@ -136,7 +136,7 @@ func (s *Session) evaluate(snapshot *Snapshot, warmup bool) (Frame, error) {
 	}
 	for _, sid := range allSIDs {
 		if s.assets[sid] == nil {
-			env := &ta.BarEnv{Symbol: snapshot.spec.SIDMap[sid], TimeFrame: s.plan.frequency, Items: make(map[int]*ta.Series), MaxCache: s.plan.retention}
+			env := &ta.BarEnv{Symbol: snapshot.spec.SIDMap[sid], TimeFrame: s.plan.timeframe, Items: make(map[int]*ta.Series), MaxCache: s.plan.retention}
 			asset := &assetState{env: env, nodes: make([]*ta.Series, len(s.plan.nodes))}
 			for i := range asset.nodes {
 				asset.nodes[i] = env.NewSeries(nil)
@@ -276,9 +276,9 @@ func (p *Plan) snapshotIdentity(snapshot *Snapshot) (string, error) {
 			active = activeFactorSIDs(snapshot.spec)
 		}
 		for _, sid := range active {
-			key := StreamKey{sid, node.spec.Source, node.spec.SourceFrequency}
+			key := StreamKey{sid, node.spec.Source, node.spec.SourceTimeFrame}
 			if !expected[key] {
-				return "", fmt.Errorf("factor: active stream %d/%s/%s absent from declared barrier", sid, node.spec.Source, node.spec.SourceFrequency)
+				return "", fmt.Errorf("factor: active stream %d/%s/%s absent from declared barrier", sid, node.spec.Source, node.spec.SourceTimeFrame)
 			}
 			if node.spec.Operator == "field" && node.spec.AvailabilityPolicy == "asof-latest" {
 				row := snapshot.rows[key]
@@ -298,7 +298,7 @@ func (p *Plan) snapshotIdentity(snapshot *Snapshot) (string, error) {
 
 func (s *Session) evaluateTS(node compiledNode, asset *assetState, sid int32, snapshot *Snapshot, columns []map[int32]Numeric) Numeric {
 	if node.spec.Operator == "field" {
-		return snapshot.Numeric(sid, node.spec.Source, node.spec.SourceFrequency, node.spec.Field)
+		return snapshot.Numeric(sid, node.spec.Source, node.spec.SourceTimeFrame, node.spec.Field)
 	}
 	inputs := make([]Numeric, len(node.inputs))
 	for i, index := range node.inputs {

@@ -3,6 +3,7 @@ package data
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/core"
@@ -158,7 +159,7 @@ func cloneStartupSeries(rows []*orm.DataSeries) []*orm.DataSeries {
 	for i, row := range rows {
 		if row != nil {
 			copyRow := *row
-			copyRow.Values = cloneStartupRows([]*orm.DataRecord{{Values: row.Values}})[0].Values
+			copyRow.Values = cloneStartupValue(reflect.ValueOf(row.Values)).Interface().(map[string]any)
 			if row.Adj != nil {
 				copyAdj := *row.Adj
 				copyRow.Adj = &copyAdj

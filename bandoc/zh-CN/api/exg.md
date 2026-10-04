@@ -1,97 +1,19 @@
 # exg 包
 
-exg 包提供了交易所接口和交易相关的功能。
+exg 在任务构造边界创建 banexg session、绑定通用 capability 与执行包装。交易所差异归 banexg，不在 banbot 根据名称实现专属业务。
 
-## 函数列表
+## 显式会话
 
-### Setup
-初始化交易所设置。
+NewForRuntime(snapshot *config.Snapshot, netDisable bool) (banexg.BanExchange, *errs.Error) 从输入快照创建会话，不修改 exg.Default。账户选择、环境、网络禁用和市场参数来自快照。会话关闭由创建它的 entry/外部 owner 负责，Runtime.Exchange 是借用依赖。
 
-返回：
-- `*errs.Error` - 如果初始化过程中发生错误则返回错误信息，否则返回 nil
+Setup()、GetWith(name, market, contractType) 和 GetLeverage/GetOdBook/GetTickers24Hr 等无显式 session 的工具保留兼容配置/默认会话路径；不能把它们当作多个 Runtime 的隔离入口。原 GetTickers 文档名称已改为真实 GetTickers24Hr。
 
-### GetWith
-根据指定的交易所名称、市场和合约类型获取交易所实例。
+## 精度与能力
 
-参数：
-- `name string` - 交易所名称
-- `market string` - 市场类型
-- `contractType string` - 合约类型
+PrecCost(exchange, symbol, cost)、PrecPrice(exchange, symbol, price)、PrecAmount(exchange, symbol, amount) 返回数值和 *errs.Error，显式传入所属 session。实际数量步长、合约单位、价格精度和最小金额由标准 instrument metadata 验证。
 
-返回：
-- `banexg.BanExchange` - 交易所实例
-- `*errs.Error` - 如果获取过程中发生错误则返回错误信息，否则返回 nil
+GetAlignOffForExchangeChecked(exchange, symbol, tfSecs) 返回 offset/error，使用当前 session market metadata。GetAlignOff(exchangeName, tfSecs) 仅兼容旧调用，不证明符号级市场对齐。symbol parser、order events、client-order IDs、funding 和 account download 分别探测统一 capability；缺能力明确失败。
 
-### PrecCost
-根据交易所的精度要求，处理交易成本金额。
+BotExchange 包装底层 session 并转发统一接口；订单 callback、context-aware 请求及 timeout/Unknown 恢复保持账户合同。选择 live_provider 的名字不能制造 transport 或账户证明。
 
-参数：
-- `exchange banexg.BanExchange` - 交易所实例
-- `symbol string` - 交易对符号
-- `cost float64` - 原始成本金额
-
-返回：
-- `float64` - 按照交易所精度处理后的成本金额
-- `*errs.Error` - 如果处理过程中发生错误则返回错误信息，否则返回 nil
-
-### PrecPrice
-根据交易所的精度要求，处理交易价格。
-
-参数：
-- `exchange banexg.BanExchange` - 交易所实例
-- `symbol string` - 交易对符号
-- `price float64` - 原始价格
-
-返回：
-- `float64` - 按照交易所精度处理后的价格
-- `*errs.Error` - 如果处理过程中发生错误则返回错误信息，否则返回 nil
-
-### PrecAmount
-根据交易所的精度要求，处理交易数量。
-
-参数：
-- `exchange banexg.BanExchange` - 交易所实例
-- `symbol string` - 交易对符号
-- `amount float64` - 原始数量
-
-返回：
-- `float64` - 按照交易所精度处理后的数量
-- `*errs.Error` - 如果处理过程中发生错误则返回错误信息，否则返回 nil
-
-### GetLeverage
-获取指定交易对和名义价值下的杠杆率。
-
-参数：
-- `symbol string` - 交易对符号
-- `notional float64` - 名义价值
-- `account string` - 账户标识
-
-返回：
-- `float64, float64` - 返回两个浮点数，分别表示杠杆率的两个相关值
-
-### GetOdBook
-获取指定交易对的订单簿数据。
-
-参数：
-- `pair string` - 交易对符号
-
-返回：
-- `*banexg.OrderBook` - 订单簿数据
-- `*errs.Error` - 如果获取过程中发生错误则返回错误信息，否则返回 nil
-
-### GetTickers
-获取所有交易对的行情数据。
-
-返回：
-- `map[string]*banexg.Ticker` - 以交易对为键的行情数据映射
-- `*errs.Error` - 如果获取过程中发生错误则返回错误信息，否则返回 nil
-
-### GetAlignOff
-获取指定交易所和时间周期的对齐偏移量。
-
-参数：
-- `exgName string` - 交易所名称
-- `tfSecs int` - 时间周期（以秒为单位）
-
-返回：
-- `int` - 对齐偏移量
+见[runtime](runtime.md)、[实时交易](../guide/live_trading.md)及[因子 API](factor.md)。

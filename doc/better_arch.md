@@ -1,8 +1,11 @@
 # BanBot 时序与截面双引擎、共享执行的架构调整方案
 
+> 2026-10-04 校订：本文保留历史设计和测试口径。当前使用见[多因子指南](../bandoc/zh-CN/guide/factor.md)，逐包实施/暂缓与本次实际验证见[重构记录](strategy_engine_refactor.md)。缺失实施文档的链接已修复，历史结果不据此重新验收；真实 venue 与性能承诺仍需独立证据。
+
+
 日期：2026-10-02。研究基准：本地 HEAD `0674129986c50ae378045486956d83a351e4b00f`，以及当前工作区所有相关未提交修改和新增源码。
 
-实施更新：2026-10-03。第 2–12 节保留原调研与目标方案，其中“当前”、旧问题诊断和旧代码行号均描述上述调研快照，不再表示实施后现状；各节明确写出的实施更新例外。以下完成表与 [实施记录](better_arch_implementation.md) 表示当前结果；只有有源码和回归证据的条目标记完成。真实会话、断电和性能验收仍有缺口，不能把全部 A–G 标记完成。
+实施更新：2026-10-03。第 2–12 节保留原调研与目标方案，其中“当前”、旧问题诊断和旧代码行号均描述上述调研快照，不再表示实施后现状；各节明确写出的实施更新例外。以下完成表与 [实施记录](strategy_engine_refactor.md) 表示当前结果；只有有源码和回归证据的条目标记完成。真实会话、断电和性能验收仍有缺口，不能把全部 A–G 标记完成。
 
 ## 实施完成表
 
@@ -29,8 +32,8 @@
 | [x] | 7.5：稳定事件与动作身份 | Accepted→OrderChanged→真实 Fill 映射，callback 至少一次；稳定 EventID/CommandID 幂等。新内部 ID 使用长度编码避免分隔符碰撞，兼容旧持久身份。`execution/id_compatibility_test.go`、`biz/intent_bridge_test.go` |
 | [x] | 7.1：OHLC 模拟职责下沉 | `execution.OHLCProfile` 承担 intrabar、market/limit/stop、保护 hit/价格/时间、SDK 精度和公共费用；biz 保留钱包、拆单与策略回调。固定数值及真实 pending/protection 回归通过，两个模拟 profile 分别保留。`execution/ohlc_profile_test.go`、`biz/odmgr_local_profile_test.go` |
 | [x] | 8.1–8.3：统一配置与易用默认 | 保留根 key/run_policy/More，engine 缺省 TS；显式共享预算按账户校验，不自动均分；注册 Go builder 可替换，支持字段来源与高级覆盖。`config/unified_test.go`、`config/run_spec_test.go`、`config/advanced.go` |
-| [x] | 8.4：磁盘 YAML 等价迁移 | 原字节备份、权限/DACL、路径锁、源摘要冲突、同目录原子替换、全链重读、失败不启动；内存输入只转换内存。`config/migration_test.go` |
-| [x] | 8.4：旧 JSON 入口 importer | 保留原文件，生成并重读 v2 YAML；混用冲突拒绝，路径保留；不再以 JSON 为独立默认组装链。`entry/factor_unified_test.go` |
+| [x] | 8.4：YAML 只读兼容与编辑保存 | 普通加载不自动迁移、备份或写回；v0.5 key、More 和早期 v0.6 别名继续接受，规范导出使用浅层路径。编辑保存保留权限/DACL、路径锁、源摘要冲突与原子替换校验。`config/shallow_test.go`、`config/migration_test.go` |
+| [x] | 8.4：旧 JSON 入口 importer | 保留原文件，生成并重读浅层 YAML；混用冲突拒绝，路径保留；不再以 JSON 为独立默认组装链。`entry/factor_unified_test.go` |
 | [x] | 8.2：实际默认与来源导出 | 普通 backtest 输出独立 resolved.json，保留真正的币种/NAV/预算/周期/价格/资金费/风险及逐字段来源；用户 YAML 保持简洁，导入覆盖不伪标默认。`entry/factor_resolved_test.go` |
 | [x] | 8.3–8.4：Web 配置与回测整链 | Web/CLI 共用 RunSpec/preflight；保存要求原文摘要、路径锁与原子替换，拒绝 stale 保存；编辑切页/关闭前 flush，factor/mixed 读取统一 run/result 实际状态。`web/dev/config_editor_test.go`、`unified_backtest_report_test.go` |
 | [x] | 9.1：CS 池外 TS 标的 | 实际 TS jobs 补齐单位、报价与资金费 union；共享/独立账户皆可交易，不扩张 CS Reference/Investable，也不要求额外 DAG 历史。`entry/mixed_factor_backtest_test.go` |
@@ -50,7 +53,7 @@
 | [x] | 9.5、12：可复用性能比较工具 | dirty source/config/input/环境、工具管理构建、相同 workload 参数、运行前后输入/binary 核验、10 轮 AB/BA 和 paired-log 95% CI；smoke 无验收资格。9 项 Python 回归通过；v0.5.7 双均线计算/回调对比已执行，但 CI 跨过 5% 门槛，未宣称通过 |
 | [x] | 12：单 CS 两年计算核规模 | 500 资产×17,520 小时×20 输出，8 列/1 消费者，8,760,000 资产事件和 192,720,000 节点更新，874.002 秒 PASS；sampled heap 54.52 MiB、进程峰值 working set 86.777 MiB。不包含 provider/DB/账户/报告、TS/mixed 或 old/new 对照 |
 | [x] | 10.4：研究与接纳语义 | 研究标签成熟后更新 IC，live 缺成熟 provider 拒绝；TargetsAccepted、Fills、AccountFills 独立，研究不创建账户 |
-| [x] | 10.1、10.4：可选研究消费者 | `factor.research.labels: []` 关闭研究；weights/events/trade 不建立标签队列、累计器或 IC 历史，不因研究队列预算停止交易。标签启用时保留原评估；只有 HistoryIC 建立 IC 历史。live 无标签可运行，research/HistoryIC 仍要求成熟标签证据。`factor/runner/optional_research_test.go`、`entry/factor_optional_research_test.go` |
+| [x] | 10.1、10.4：可选研究消费者 | `run_policy[].research.labels: []` 关闭研究；weights/events/trade 不建立标签队列、累计器或 IC 历史，不因研究队列预算停止交易。标签启用时保留原评估；只有 HistoryIC 建立 IC 历史。live 无标签可运行，research/HistoryIC 仍要求成熟标签证据。`factor/runner/optional_research_test.go`、`entry/factor_optional_research_test.go` |
 | [x] | 10.4：Evaluation-only 不阻断实时安装 | live DAG 只订阅 Investable/Reference；Evaluation-only 不作为必需暖机历史。Reference 同样缺历史时仍拒绝安装；执行报价/资金费/legacy 订阅范围独立保留。`runtime/shared_evaluation_subscription_test.go` |
 | [x] | 7.4：Relay 与配置默认交易语义 | Relay 保留 market/limit/maker 类型，按当前被动侧报价重定价；共享入场继承配置 OrderType、StopBars、Leverage，退出继承配置类型并保留投影，显式请求优先。指定 OrderID 退出与旧 TS 一致自动 Force 跳过延迟但不改变样式。稳定命令身份在默认值解析前核验，重试不受新报价影响；不修改调用方请求。`runtime/shared_capabilities_test.go` |
 | [x] | 9.4：分页边界与取消完整性 | 仓库 reader/bootstrap/feeder 共用页校验，拒绝超行数、乱序、越界、nil/异 SID；合法字段类型别名不误判循环，结束时释放 Kline 缓存，最后一页取消不误报成功。`data/page_boundary_test.go`、`orm/series_budget_test.go` |
@@ -61,11 +64,11 @@
 | [ ] | 1.3、9.5、12：三模式 ≤5% 与大规模验收 | 已运行本机微基准、完整/专项 race 和 v0.5.7 双均线 10 轮 AB/BA；该计算/回调对比为 inconclusive。仍缺原 dirty-tree 固定基线、PG/Quest 全链路和三模式规模/交错置信区间，未标性能完成 |
 | [ ] | 9.4：预算范围与全进程内存验收 | 行和逻辑页字节预算已实现；48 小时两账户 SQLite/paper 归档全链路及两年 CS 计算核已测 sampled heap/进程 working set。普通数据库/纯 TS/mixed 与两年完整执行仍待测；活跃状态、返回集合、driver/allocator、聚合/warm cache 与全进程内存不在逻辑页硬预算内 |
 
-完整测试命令、实际结果和仍需完成的最小出口见 [better_arch_implementation.md](better_arch_implementation.md)。上述表是需求追踪表，不能把未勾选项解释为可安全省略的要求。
+完整测试命令、实际结果和仍需完成的最小出口见 [当前审查与重构记录](strategy_engine_refactor.md)。上述表是需求追踪表，不能把未勾选项解释为可安全省略的要求。
 
 本轮修订按用户最新要求明确：时序策略引擎与截面/多因子策略引擎长期并存、同等重要；日常配置保持现有 key 和使用习惯，以少量可选字段扩展；旧 YAML 默认备份并转换为等价新格式，运行阶段只使用新模型。以下目标方案替代上一版将时序配置移入 `time_series`、单独配置 `factor.strategies` 的建议。
 
-本文从业务需求重新确定边界，不把已有包结构、JSON 配置、SQLite 表或兼容桥接当作必须保留的设计。依据为 [业务需求](factors.md)、[实施记录](factor_implementation.md)、[当前架构说明](../docs/arch.md) 和下文引用的核心代码。初始调研由三个 `gpt-6.1-sol / high` 子 agent 与主 agent 完成；后续同模型并行实施结果见上表。未使用当前项目的 DeepWiki。
+本文从业务需求重新确定边界，不把已有包结构、JSON 配置、SQLite 表或兼容桥接当作必须保留的设计。依据为 [业务需求](factors.md)、[实施记录](strategy_engine_refactor.md)、[当前架构说明](app_arch.md) 和下文引用的核心代码。初始调研由三个 `gpt-6.1-sol / high` 子 agent 与主 agent 完成；后续同模型并行实施结果见上表。未使用当前项目的 DeepWiki。
 
 **推荐方向：时序与截面两个完整策略引擎，共享 Runtime、订阅与账户执行基础设施；回测默认内存执行状态，实盘使用事务账本。** 时序引擎继续拥有逐标的回调、指标与交易生命周期，截面引擎拥有跨标的快照、因子 DAG 与组合决策。二者均可独立运行或混合运行，不存在用因子引擎替代时序引擎的迁移终点。
 
@@ -81,7 +84,7 @@
 | TS 与 CS 在同账户、同合约共存 | 策略拥有虚拟仓位，账户拥有真实净仓位；全部发送、撤单与恢复经过同一个 owner |
 | 单独 TS、单独 CS、TS+CS 都简单可用 | 按实际启用的引擎装配资源；纯 TS 不创建截面屏障、因子 Session 或研究组件 |
 | 配置保持熟悉且可自由扩展 | 保留 `run_policy` 及既有 key；省略新引擎字段仍按时序执行；默认可推导项不必填，确有需要的高级项仍可配置 |
-| 旧 YAML 自动迁移 | 原文件先备份，验证等价后原子保存新格式；之后重读新格式，两个引擎只消费同一配置模型 |
+| 旧 YAML 兼容加载 | 普通加载只读，不自动备份或改写；旧输入在内存归一为同一配置模型 |
 | 同一份策略定义用于研究、回测和实盘 | 因子定义、缺失规则、可见时间、组合构建共享；输入驱动和执行后端可不同 |
 | 任意时序字段可读写 | `orm.DataSeries.Values map[string]any` 继续贯穿全链，保留扩展字段的具体类型、缺失与 NULL；不引入 typed OHLCV 快速路径 |
 | 决策只能使用当时可见的信息 | 冻结 Universe、SID 身份、数据版本与可见性截止；未来标签不能进入推理计划 |
@@ -262,7 +265,7 @@ WAL 写入成功不表示立即可读。对依赖可见性的后续步骤，等�
 
 ### 5.3 PIT 修订与最新序列不能混为一张表
 
-现有普通序列去重键是 `(sid, ts)`；在 Values 中添加 `revision` 不能保留多个版本。修订存储需要显式身份 `(source, frequency, sid, event_time, revision)`，并记录 `available_at`、`ingested_at` 和 source/schema 版本。查询先按决策可见时间过滤，再选择当时最高修订。
+现有普通序列去重键是 `(sid, ts)`；在 Values 中添加 `revision` 不能保留多个版本。修订存储需要显式身份 `(source, timeframe, sid, event_time, revision)`，并记录 `available_at`、`ingested_at` 和 source/schema 版本。查询先按决策可见时间过滤，再选择当时最高修订。
 
 数据库修订 reader、文件归档 reader 与实时 publication mapper 实现同一输入契约，输出 `DataSeries` 与版本信息。数据正常采集仍可维护最新序列用于普通 TS；不能从今天的最新表倒推出过去未归档的发布/修订时间。数据集必须声明是真实 PIT、static-universe 或显式近似，并把限制写入 manifest。
 
@@ -412,12 +415,11 @@ Sending/Unknown/CancelPending 不能按剩余量为零处理。真实成交按�
 
 统一 `run_policy` 中每项新增可选 `engine`：省略或 `time_series` 表示时序引擎，`factor` 表示截面/多因子引擎。`name` 仍为注册的 Go 策略名，`run_timeframes`、`pairs/filters`、`params` 继续表达周期、品种和策略参数。同一 name、不同引擎可通过引擎各自的注册表解析，不要求维护第二份策略清单。
 
-文件仅增加一个 `config_version: 2` 格式标记，用于可靠识别旧文件与防止重复转换；它不替代 source/schema、策略或执行账本版本。没有标记的现有 YAML 按 v1 导入，新文件模板由工具自动写入标记。以下配置模型已实现，示例片段与已有公共配置合用；普通数据库输入还需明确 PIT 与资金费政策，真实 live 需 verified binding。
+2026-10-04 配置修订：继续兼容 v0.5 YAML，不要求 `config_version`，普通加载只读、不自动备份和写回。已有 1/2 标记和早期 v0.6 嵌套输入仍接受；显式 engine 启用新的身份、账户与预算语义，未声明 engine 的旧策略保留 More 自定义参数。以下配置模型已实现，示例片段与已有公共配置合用；普通数据库输入还需明确 PIT 与资金费政策，真实 live 需 verified binding。
 
 纯时序策略仍可这样写：
 
 ```yaml
-config_version: 2
 run_policy:
   - name: Demo
     run_timeframes: [5m]
@@ -427,9 +429,9 @@ run_policy:
 混合运行只增加截面策略项，以及真正需要的共享资金分配：
 
 ```yaml
-config_version: 2
 run_policy:
   - name: Demo
+    engine: time_series
     run_timeframes: [5m]
     capital_weight: 0.5
     params: {atr: 15}
@@ -440,7 +442,7 @@ run_policy:
     params: {window: 24, k: 10}
 ```
 
-MomentumVol 示例的输入 close、处理器、组合方式、多空比例、预热与输出由注册的 Go 定义提供默认值。用户仍可替换策略和参数；并非只能运行这个 preset。`run_timeframes` 对 TS 保持原来的周期选择含义，对 factor 表示定义支持的决策频率，具体定义不支持多频率时校验报错，不增加重复的 `frequency/decision.interval` 必填项。
+MomentumVol 示例的输入 close、处理器、组合方式、多空比例、预热与输出由注册的 Go 定义提供默认值。用户仍可替换策略和参数；并非只能运行这个 preset。`run_timeframes` 对 TS 保持原来的周期选择含义，对 factor 表示定义支持的决策频率，具体定义不支持多频率时校验报错，不增加重复的 `timeframe/decision.interval` 必填项。
 
 `capital_weight` 是新增的可选共享预算份额，不是现有 `stake_rate` 的别名。**新旧纯 TS 配置即使包含多个策略，也默认保留原 stake sizing 和账户风控，不新增预算必填项。** 仅当用户显式设置共享预算，或同账户启用 TS+CS 混合时，多个参与策略才要求完整的显式份额；合计不超过 1，未分配部分留在账户，不自动按策略数平均。单个使用预算的策略可默认使用全部可分配资金；多 CS 的独立预算也需明确。一个 TS policy 下的多个 StratJob 使用该策略的同一预算，不能按 job 数再次切分。配置升级与接入统一 owner 都不自动启用预算新语义。多个账户按实际绑定分别校验，省略绑定沿用现有账户选择语义。
 
@@ -454,7 +456,7 @@ MomentumVol 示例的输入 close、处理器、组合方式、多空比例、�
 |---|---|---|
 | TS/CS 周期与品种 | 现有 `run_timeframes/pairs/pairlists`，策略级覆盖规则 | 沿用同名 key；截面 Reference 等特殊集合可在策略专用块中指定 |
 | 输入字段、预热与 retention | 策略声明、factor DAG、source schema | 策略声明或可选 `data` 覆盖；不重复手写完整订阅计划 |
-| 因子处理、合成和组合 | 注册 Go 定义及 `params` | factor 策略项下可选 `factor` 专用块提供 `combo/portfolio/decision/research` 等覆盖 |
+| 因子处理、合成和组合 | 注册 Go 定义及 `params` | factor 策略项直接提供 `combo/portfolio/decision/research` 等分组覆盖 |
 | 执行报价和资金费流 | 所选市场与已验证 adapter/source 的通用能力 | 可选 `execution` 指定真实来源和策略；不能默认用零资金费弥补缺源 |
 | 合约单位、精度、SID 和版本 | banexg metadata、SymbolState、数据源/归档 manifest | 离线或特殊数据显式覆盖并校验，不让普通用户逐标的填写 |
 | 模拟资金与费用 | 现有 `wallet_amounts`、成本配置及模拟 profile | 继续使用现有 key；仅新增原配置不能表达的模拟参数 |
@@ -462,7 +464,7 @@ MomentumVol 示例的输入 close、处理器、组合方式、多空比例、�
 | 分页、预取、迟到和截止 | 经测试的源/策略默认值 | 可选 `data` 和策略专用块显式调整 |
 | 研究标签与可复现证据 | 研究命令/策略定义，运行生成 manifest | 按需选择标签、归档和输出；不手填策略 hash、snapshot digest |
 
-`data` 与 `execution` 作为可选高级覆盖块保留，不是每份配置的必填骨架。账户身份、凭据和既有账户参数仍只放在 `accounts`；只有账户之间确有差异时，才在 `execution.accounts.<name>` 覆盖相应服务设置。同一值只有一个主配置位置，避免根层、账户层和每个策略同时登记一份相同风险上限。
+`data` 与 `execution` 作为可选高级覆盖块保留，不是每份配置的必填骨架。账户身份、凭据和既有账户参数仍只放在 `accounts`；只有账户之间确有差异时，才在 `accounts.<name>` 覆盖相应服务设置。同一值只有一个主配置位置，避免根层、账户层和每个策略同时登记一份相同风险上限。
 
 不再要求新增 `time_series.run_policy`、`factor.strategies`、`data.contexts` 或数据上下文引用来描述普通任务。上一版的深层示例不作为实现目标。复杂场景允许按需扩展，但每个新 key 应回答“现有字段或 Go 定义为什么不能表达这个用户选择”，不为内部组件的每个字段都建立配置。
 
@@ -484,31 +486,17 @@ MomentumVol 示例的输入 close、处理器、组合方式、多空比例、�
 
 新 DTO 仍放在 `config` 纯配置层，不能直接嵌入 `runner.Config` 形成 import cycle。先生成唯一的规范配置，再映射两种引擎的参数；Snapshot 深拷贝、dump、脱敏、hash 和 Web 编辑都基于新模型。内部 RunSpec 可以完整，保存给用户的 YAML 保持简洁，不把所有派生项和默认项都展开。
 
-### 8.4 旧 YAML 默认备份、等价转换、重读新格式
+### 8.4 只读兼容加载与规范导出
 
-本节的配置入口迁移已实现并有专项回归；本次验证只使用临时配置，未批量改写工作区用户配置。迁移发生在配置入口，执行与两个策略引擎只接收 v2，不维护 v1/v2 两条业务分支。
+2026-10-04 的浅层配置修订替代了此前自动备份、添加版本标记并写回 YAML 的方案。普通 LoadRunSpec/LoadUnifiedConfigs 保持原文件字节不变，不因配置只读而阻止正常读取；新旧输入统一规范为同一 RunSpec。
 
-```text
-读取文件并识别版本
-→ v1 导入器生成 v2 候选，保留原始表达
-→ 校验完整加载链的新旧有效配置与行为参数等价
-→ 为待转换原文件建立备份
-→ 原目录原子保存 v2
-→ 重读 v2，按原覆盖顺序装配任务
-```
+- 保留 v0.5 根级 key、默认 engine、覆盖顺序、空值和开放 More 参数。新增语义通过显式 engine 启用，不通过强制配置版本启用。
+- archive/chunks/expressions/definition/portfolio/decision/research/snapshot/manifest/prices/funding_source/initial_nav/max_records/config 等直接放在 run_policy[]；复杂字段保留各自分组。
+- 凭据和旧账户设置继续在根 accounts.<name>；账户执行覆盖也放在该账户下，execution 保留公共默认值。
+- 早期 config_version: 1/2、factor 包装层与 execution.accounts 作为兼容输入接受，规范导出只生成浅层结构。
+- 显式配置保存仍需冲突检查与原子写入；有效配置导出为独立产物，不在加载时把环境变量、密钥或 CLI 覆盖写回用户文件。
 
-1. **可靠识别。** 无 `config_version` 的旧 YAML 按 v1 解析；v2 文件不重复转换、不重复备份；高于已支持版本明确拒绝。格式版本不改变 TS 默认 engine。
-2. **最小编辑。** 优先保留原 key、顺序、注释、锚点、环境变量表达、开放策略参数和省略项；普通 TS 文件通常只需添加版本标记。需要改变形状的历史别名转换到规范 key；新默认与旧行为不同的字段显式补上等价值，不把所有默认值展开成几十行。
-3. **验证等价。** 对原加载链和候选加载链分别计算规范结果，比较策略清单、TS 引擎归属、账户/品种/周期、预算与计数、成本/profile、时间范围及参数；排除纯格式标记。保留显式空列表和覆盖来源。只改变排版或最终合并值相同，不足以证明每个 overlay 的后续覆盖行为相同。
-4. **备份原文。** 每个会改写的文件先建立唯一备份，例如 `config.yml.bak.20261002T103000.<id>`，保存精确原始字节和原有访问权限，不覆盖既有备份。备份位置在转换日志中显示，凭据和环境变量值不写日志。
-5. **原子保存。** 转换器和应用配置写入口共用按规范路径的写入锁，覆盖读取、备份、源摘要重验和原子替换；平台支持时同时使用文件排他保护。在同目录写临时新文件，保留源文件访问权限，完成写入检查，核对源文件摘要仍与读取时一致后替换。备份失败或检测到编辑冲突时不改写该文件；不能先覆盖再补备份，也不能把进程内锁当作任意外部编辑器的互斥证明。
-6. **多文件和重试。** 对 `config.yml/config.local.yml/--config` 文件逐个保留身份和相对基准，先准备并验证完整候选链，再备份和提交。不把它们合并成一份用户配置，避免抹掉覆盖规则。全部提交后重读，校验各文件内容摘要、完整覆盖链及候选的有效配置等价性，通过后才启动。跨文件不能假称一个原子事务；中途失败或重读发现竞争不启动任务，保留备份与具体冲突记录，下次识别已转 v2 和未转 v1 安全继续。
-7. **边界情况。** 无法证明等价、只读配置目录或写入失败时保持原文件，给出具体文件与原因，停止依赖该配置的启动。ConfigData、stdin 等没有原文件的输入只在内存转换，并在运行产物保存新格式快照；不制造不存在的源文件备份。涉及新增保留字段与旧 `More` 同名冲突时，保留原策略参数传递并显式处理，不能把原用户参数误解释为 engine。
-8. **转换完成。** 成功后重新读取 v2，后续运行仅使用新格式；转换幂等，不创建长期旁路解析器或每次运行再转换。备份用于恢复原配置；它不是订单数据库迁移或真实发送后的账户回滚工具。
-
-原文转换在环境变量展开之前完成，不能把启动时的密钥、CLI 参数或一次性的时间范围写回用户 YAML。有效配置导出是独立产物，与简洁的持久配置、原始备份分别保存。
-
-`--factor-config` 旧 JSON 同样只作为入口 importer：保留原文件和路径语义，生成可校验的 v2 YAML，转换完成后由统一入口运行。与同次 YAML 设置冲突时报错，不保留 JSON runner 作为第二条默认配置链。
+`--factor-config` 旧 JSON 仍作为入口 importer：保留原文件与路径语义，生成浅层 YAML，经统一入口读取。生成文件暂保留历史 `.v2.yml` 后缀，它不是 YAML 版本要求。与同次 YAML 设置冲突时仍报错。
 
 ### 8.5 配置验收：少配置、同功能、可恢复
 
@@ -537,7 +525,7 @@ MomentumVol 示例的输入 close、处理器、组合方式、多空比例、�
 | 事件分发 | 每流读取一次，以 DataSeries 分发；旧回调与因子版本输入分别适配 |
 | 决策视图 | 每消费者的 as-of、freshness、缺失/迟到规则、Universe 和快照冻结 |
 
-流共享身份至少是 `(数据命名空间, source, sid, frequency)`。同流字段取并集，预热满足各消费者，但同源不同 freshness、迟到截止、参考池和缺失政策不能被 union 擦除。`Plan.Inputs` 适合推导加载需求，不能代替细粒度 Requirement。
+流共享身份至少是 `(数据命名空间, source, sid, timeframe)`。同流字段取并集，预热满足各消费者，但同源不同 freshness、迟到截止、参考池和缺失政策不能被 union 擦除。`Plan.Inputs` 适合推导加载需求，不能代替细粒度 Requirement。
 
 当前 NormalizeSubscriptions 依赖 `TFToSecs > 0`，不能直接处理 event 频率（`data/series_source.go:588`）。新模型须显式支持规则 bar、非规则 event 与 calendar/sparse 能力。event 预热不能简单算 `count × timeframe`，需要有效观测数、最早读取时间或 as-of anchor；因子 decision-grid 窗口与原始源事件数也不是同一件事。
 
@@ -643,7 +631,7 @@ YAML 选择已注册 Go builder 和参数，用户自定义 Go 节点继续显�
 
 沿用现有值得保留的机制：停旧侧并 Join、保留备份、pending+freeze、导入前与最终提交前两次 preflight、成功才 ready，失败保留恢复标记。证据：`runtime/shared_migration.go:11`、`execution/migration.go:145,159,177,250,259`、`execution/settlement.go:410`。
 
-旧执行 schema → v4 流程（与 YAML 的 config_version: 2 分开）：
+旧执行 schema → v4 流程（与 YAML 配置格式分开）：
 
 1. 停止真实准入和发送，排空/确认回报与 owner，获得一致备份。WAL 数据库不能仅复制裸主文件冒充完整备份。
 2. shadow 导入账户/策略资金、全部角色 basis、活动 lot/intent/order/allocation、原期限/触发锚点、政策、游标、幂等事件和未归属/pending 状态。
@@ -658,7 +646,7 @@ YAML 选择已注册 Go builder 和参数，用户自定义 Go 节点继续显�
 | 阶段 | 工作 | 可审核出口与主要文件 |
 |---|---|---|
 | A：契约与基线 | 固定纯 TS、纯 CS、混合三种模式的代码/数据/配置与行为矩阵，准入/回调缺口、性能基线；修正文档漂移 | 两个完整引擎的能力与性能基线；TS 现有市场/功能不缩减，混合限制另列 |
-| B：规范配置与双引擎组装 | 保留 run_policy/key、engine 默认 TS、v2 DTO；旧 YAML 原文备份、等价最小转换、原子写回、重读校验；JSON importer、按需引擎状态与 CS 共享决策核心 | `config`、`entry`、`strat/biz`、`factor`；纯 TS 单/多策略无新增必填项，转换失败/并发/中断恢复回归；两引擎只消费新模型 |
+| B：规范配置与双引擎组装 | 保留 run_policy/key、engine 默认 TS、统一 DTO；旧 YAML 只读兼容、浅层规范导出；JSON importer、按需引擎状态与 CS 共享决策核心 | `config`、`entry`、`strat/biz`、`factor`；纯 TS 单/多策略无新增必填项，转换失败/并发/中断恢复回归；两引擎只消费新模型 |
 | C：执行领域与内存存储 | 小提交边界、MemoryStore、Paper/本地撮合下沉、文件报告；账户服务接收策略级更新 | `execution`、`biz/shared_*`、`factor/runner`、`opt`；内存与 SQLite 同输入逐提交状态一致 |
 | D：schema 和保留策略 | 先删镜像，再迁 attempt/合表/按需迁移表；独立实盘 durability | 新旧 schema shadow 对照、崩溃恢复、归档水位；不丢旧库存/游标/条件 |
 | E：完整订阅计划 | 中性订阅、event、字段投影、预热、统一安装；保留专用 reader | `data`、`strat`、`runtime/shared_sources`；相同字段/时间摘要，性能≤5%退化 |
@@ -669,14 +657,14 @@ YAML 选择已注册 Go builder 和参数，用户自定义 Go 节点继续显�
 
 每阶段做小而可回滚的变更，writer 与 reviewer 分离；有行为重构时先锁回归，再改代码。某阶段完成不要求一次迁完所有 globals、全仓库 UI 或全部市场；但尚存旧路径必须有清楚的账户隔离和禁止混用边界。
 
-配置升级与执行后端替换分别验收：转换为 v2 不改变原 TS 模拟 profile、支持市场或真实交易路线，也不自动迁移订单库。数据/执行的统一不能以要求用户改写全部策略、改配置习惯或牺牲原 TS 能力作为前提。
+配置升级与执行后端替换分别验收：浅层配置兼容不改变原 TS 模拟 profile、支持市场或真实交易路线，也不自动迁移订单库。数据/执行的统一不能以要求用户改写全部策略、改配置习惯或牺牲原 TS 能力作为前提。
 
 ### 12.1 必须覆盖的行为用例
 
 - 旧准入禁入/暂停/计数、0 值含义、请求接受与成交回调顺序、限价/Force/Relay/编辑能力矩阵。
 - 纯 TS、纯 CS、mixed 各自完成初始化、回测/实盘能力校验与停止；纯 TS 不创建 CS 屏障/研究队列，纯 CS 不创建伪 TS job。
 - TS 已支持市场/订单/优化能力在新架构保持；新增 CS 的首版市场限制不传播到 TS，同账户混合限制与独占模式分开验证。
-- 旧 YAML 自动备份并转换的有效配置与固定输入结果等价；原有 key/覆盖/空值/More/环境变量/路径保持，失败不改原文件、重试幂等，新格式不重复迁移。
+- 旧 YAML 只读加载的有效配置与固定输入结果等价；原有 key/覆盖/空值/More/环境变量/路径保持，不创建备份或改写文件。
 - TS +1、CS −0.6 净 +0.4；退出、反向减仓、部分成交与资金费不误作用其他策略，Full/Patch 不延长保留条件。
 - 内部交叉与真实成交区别、固定分配、尾差、重复报告、累计 highwater、零数量费用修正、外部仓位与强平。
 - 发送前 Commit 失败不联网；发送成功但 ACK 丢失、Unknown、Cancel ACK 后继续成交、重启恢复无第二笔盲发。
@@ -699,11 +687,11 @@ YAML 选择已注册 Go builder 和参数，用户自定义 Go 节点继续显�
 
 ## 13. 实施证据与未决项（更新于 2026-10-03）
 
-本轮已实施配置、执行域、CS 决策、订阅、普通存储输入、混合运行、sender ownership 和结果生命周期，并执行全仓 `go test ./... -count=1 -timeout 15m`、`go vet ./...`、`go build ./...`；本地全仓通过。已运行本机微基准，但没有生产交易、用户数据库迁移、物理断电或满足 5% 门槛的 old/new 全链路对照。源码、专项回归和实际命令结果见 [实施记录](better_arch_implementation.md)。
+本轮已实施配置、执行域、CS 决策、订阅、普通存储输入、混合运行、sender ownership 和结果生命周期，并执行全仓 `go test ./... -count=1 -timeout 15m`、`go vet ./...`、`go build ./...`；本地全仓通过。已运行本机微基准，但没有生产交易、用户数据库迁移、物理断电或满足 5% 门槛的 old/new 全链路对照。源码、专项回归和实际命令结果见 [实施记录](strategy_engine_refactor.md)。
 
 继续阶段补齐归档增量索引、Session 换代回收、调用方取消、binding 失败清理、私有流冻结和独立进程崩溃测试；独立需求审计补齐 §5.2 元数据查询/持久版本及未完成 K 线事件时间分离。本次进一步完成可选研究、Evaluation-only 安装边界、TS 默认/Relay/指定订单 Force、严格输入页及全部已发送终态历史恢复。最新全仓 test/vet/build 全部出口 0（1,929 顶层 PASS、45 skip），本次七包专项 race 无告警；前阶段八包及完整 ORM race 证据保留。单 CS 两年计算核、18 项短矩阵与性能工具 smoke 有证据；跨主机、真实数据库/venue 和全链路旧新性能边界仍按开头未勾选项管理。
 
-领域 MemoryStore、v2 YAML 自动转换、schema v4、策略级账户命令、订阅安装和实际计算共享已有实施证据；保留专用 holding/allocation/membership 表是符合第 6.2 节的设计选择。以下未决项仍不影响已有实现的真实状态，但阻止全量验收：
+领域 MemoryStore、旧 YAML 只读兼容、schema v4、策略级账户命令、订阅安装和实际计算共享已有实施证据；保留专用 holding/allocation/membership 表是符合第 6.2 节的设计选择。以下未决项仍不影响已有实现的真实状态，但阻止全量验收：
 
 | 未决项 | 最小验证与决策 |
 |---|---|

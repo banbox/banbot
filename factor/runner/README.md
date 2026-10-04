@@ -1,13 +1,12 @@
 # Factor runners: YAML, storage, archives and live execution
 
-Ordinary `backtest` and `trade` consume the same versioned YAML `RunSpec` as
+Ordinary `backtest` and `trade` consume the same YAML `RunSpec` as
 the factor commands. Omitted `engine` keeps the existing time-series behavior.
 Select a registered Go factor definition with `engine: factor`; arbitrary Go
 nodes and portfolio builders keep explicit versions and missing-data policies.
 For example, add this to the usual exchange/database/account configuration:
 
 ```yaml
-config_version: 2
 data:
   pit_policy: static-approximation
 execution:
@@ -44,7 +43,11 @@ import option: `banbot factor research --factor-config run.json`,
 `banbot factor backtest --mode weights|events --factor-config run.json`, or
 `banbot factor trade --dry-run --factor-config run.json`. Relative archive and
 ledger paths are resolved from the field's originating configuration file.
-JSON imports preserve the original and write a canonical `.v2.yml`. Panels,
+YAML loading is read-only and needs no version marker. Factor options such as
+`archive`, `expressions`, `portfolio` and `decision` live directly under each
+`run_policy` item. Root `accounts.<name>` holds account execution overrides;
+`execution` retains shared defaults. JSON imports preserve the original and
+write shallow canonical YAML to `.v2.yml` (the historical filename suffix). Panels,
 decisions, matured diagnostics and the final scalar summary stream as JSON
 lines. `Result.Unresolved` reports labels that extend beyond the supplied data.
 
@@ -58,13 +61,13 @@ The JSON file follows `runner.Config`. Declare immutable, non-overlapping
 `DecisionInterval`, `LatencyMS`, `ExpiryMS`; stable `Snapshot` universe/SID/schema/
 source-version maps; `Factor` parameters; `Manifest` code revision, currency,
 portfolio definition, executable-return labels, fees/slippage/funding policy;
-strategy/account identity, `InitialNAV`; and `Prices` source/frequency/field.
+strategy/account identity, `InitialNAV`; and `Prices` source/timeframe/field.
 For example:
 
 ```json
 {
-  "Factor": {"Source":"kline","Field":"close","Frequency":"1h","Window":24,"DDOF":1,"WinsorTail":0.01,"Standardize":true},
-  "Prices": {"Source":"tick","Frequency":"event","Field":"price"},
+  "Factor": {"Source":"kline","Field":"close","TimeFrame":"1h","Window":24,"DDOF":1,"WinsorTail":0.01,"Standardize":true},
+  "Prices": {"Source":"tick","TimeFrame":"event","Field":"price"},
   "DecisionInterval":3600000,"LatencyMS":1,"ExpiryMS":60000,
   "MaxRecords":100000,"MaxPending":32,"InitialNAV":10000,
   "StrategyID":"momentum-vol","AccountID":"paper-usd",
@@ -161,7 +164,7 @@ The legacy JSON import can also use `--live-provider verified-session`; it must
 have no archive chunks. An embedding application registers
 `entry.RegisterFactorLiveBinding` with the current session's verified Banexg
 transport, canonical symbol metadata, publication/revision mapper and funding
-policy verifier. Stock Banexg fails startup with an unsupported-capability error;
+policy verifier. A Banexg session lacking these proofs fails with an unsupported-capability error;
 configuration flags cannot replace transport or account-snapshot evidence.
 The entry owns the explicit Runtime, shared account service, private report
 stream and current source providers, and stops/joins them on cancellation or
@@ -195,3 +198,27 @@ chunks. Measurements include node updates, maximum retained raw/session/label
 sizes, real fills, throughput, allocations and sampled heap. Archive generation
 is outside the timed replay. This is a full runnable workload definition;
 smaller measured runs do not establish full two-year throughput or memory.
+
+## Configuration ownership when embedding
+
+Use `runner.CloneConfig(config)` when an owner retains a configuration beyond
+its caller's setup phase, such as runtime replay installation. It returns
+`(Config, error)` and independently copies chunks, all snapshot maps and universe
+lists, expression declarations, combination weights/columns, manifest labels and
+snapshot references, and execution instrument maps. Lists retain order and
+duplicates; nil and empty containers remain distinct. Decimal values retain their
+immutable value semantics. This is an ownership copy, not strategy validation;
+continue to call `ValidateReplayConfig` or `ValidateLiveConfig` as appropriate.
+
+Compiled plans, computation groups, portfolio builders, historical-input factories
+and observation callbacks remain borrowed handles. The owner must keep them
+usable throughout the run and stop/join drivers before releasing shared services.
+The copy never opens inputs or borrows accounts/sessions. It retains the former
+runtime installation boundary's JSON serializability check, including rejection
+of nonfinite configuration numbers, without decoding the configuration or dropping
+nonserialized handles. Raw records still travel through `DataSeries.Values` and
+`CloneVersionRecord`; configuration copying does not change their type/NULL rules.
+
+## Current guides and live provider names
+
+See the [guide](../../bandoc/en-US/guide/factor.md), [中文指南](../../bandoc/zh-CN/guide/factor.md) and [refactor record](../../doc/strategy_engine_refactor.md). verified-session above is an application registration example, not a built-in verified venue. Register entry.RegisterFactorLiveBinding("verified-session", factory) with real evidence first. Empty/banexg selects the built-in adapter; missing capabilities or unknown names fail explicitly. No live-venue acceptance or automatic paper fallback is implied.

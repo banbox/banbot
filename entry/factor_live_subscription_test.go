@@ -22,7 +22,7 @@ func (subscriptionPlanSink) ProcessSnapshot(context.Context, *factor.TargetPortf
 	return nil
 }
 
-func TestFactorLiveKlinePlanRetainsFieldsFrequenciesAndAllPools(t *testing.T) {
+func TestFactorLiveKlinePlanRetainsFieldsTimeFramesAndAllPools(t *testing.T) {
 	raw, err := os.ReadFile("../factor/runner/example.json")
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +46,7 @@ func TestFactorLiveKlinePlanRetainsFieldsFrequenciesAndAllPools(t *testing.T) {
 	}
 	for _, priceTF := range []string{"1m", "1h"} {
 		t.Run(priceTF, func(t *testing.T) {
-			c.Prices = runner.PriceStream{Source: "kline", Frequency: priceTF, Field: "mark"}
+			c.Prices = runner.PriceStream{Source: "kline", TimeFrame: priceTF, Field: "mark"}
 			engine, err := runner.NewLive(c, subscriptionPlanSink{}, func() int64 { return 3600002 }, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -97,7 +97,7 @@ func TestFactorLiveKlinePlanRetainsFieldsFrequenciesAndAllPools(t *testing.T) {
 			spec := factor.CloneSnapshotSpec(c.Snapshot)
 			spec.GridTime, spec.DecisionTime = 3600000, 3600002
 			record := factor.VersionRecord{Series: orm.DataSeries{Source: "kline", TimeFrame: "1h", Sid: 4, EndMS: 3600000, Closed: true, Values: map[string]any{"integer": int64(9007199254740993), "nullable": nil}}, EventTime: 3600000, AvailableAt: 3600001, IngestedAt: 3600001, Revision: 1, SourceVersion: "v1"}
-			researchSnapshot, err := factor.Freeze(spec, []factor.VersionRecord{record}, []factor.Requirement{{SID: 4, Source: "kline", Frequency: "1h", EventTime: 3600000}})
+			researchSnapshot, err := factor.Freeze(spec, []factor.VersionRecord{record}, []factor.Requirement{{SID: 4, Source: "kline", TimeFrame: "1h", EventTime: 3600000}})
 			if err != nil || !researchSnapshot.Status().Ready || !slices.Equal(researchSnapshot.Spec().Universe.Evaluation, []int32{4}) || researchSnapshot.Spec().SIDMap[4] != "asset-4" {
 				t.Fatal("live planning lost evaluation research metadata", err)
 			}

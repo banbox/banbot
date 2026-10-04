@@ -47,8 +47,9 @@ type Manifest struct {
 	diagnostics      []factor.Diagnostic
 }
 
-func cloneManifest(s ManifestSpec) ManifestSpec {
-	s.Combo = cloneCombo(s.Combo)
+// CloneManifestSpec copies owned containers without validation or normalization.
+func CloneManifestSpec(s ManifestSpec) ManifestSpec {
+	s.Combo = CloneComboSpec(s.Combo)
 	s.Parameters = maps.Clone(s.Parameters)
 	s.Labels = slices.Clone(s.Labels)
 	s.Snapshots = slices.Clone(s.Snapshots)
@@ -86,7 +87,7 @@ func BuildManifest(spec ManifestSpec) (*Manifest, error) {
 			return nil, err
 		}
 	}
-	spec = cloneManifest(spec)
+	spec = CloneManifestSpec(spec)
 	sort.Strings(spec.Combo.Columns)
 	spec.Combo.Columns = slices.Compact(spec.Combo.Columns)
 	sort.Slice(spec.Labels, func(i, j int) bool { return spec.Labels[i].Name < spec.Labels[j].Name })
@@ -132,7 +133,7 @@ func BuildManifest(spec ManifestSpec) (*Manifest, error) {
 }
 func (m *Manifest) ID() string                       { return m.id }
 func (m *Manifest) StrategyHash() string             { return m.strategyHash }
-func (m *Manifest) Spec() ManifestSpec               { return cloneManifest(m.spec) }
+func (m *Manifest) Spec() ManifestSpec               { return CloneManifestSpec(m.spec) }
 func (m *Manifest) Diagnostics() []factor.Diagnostic { return slices.Clone(m.diagnostics) }
 
 // WritePanel emits one deterministic JSON row per selected scalar. Invalid

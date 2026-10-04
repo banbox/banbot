@@ -65,6 +65,7 @@ Parameters:
 
 Returns:
 - `int64` - 13-digit milliseconds timestamp
+- `error` - Parse failure; check before using the timestamp
 
 ### ParseTimeMSBy
 Parse time string to 13-digit milliseconds timestamp according to specified time format.
@@ -75,6 +76,7 @@ Parameters:
 
 Returns:
 - `int64` - 13-digit milliseconds timestamp
+- `error` - Parse failure; check before using the timestamp
 
 ### ToDateStr
 Convert timestamp to UTC timezone time string.
@@ -105,11 +107,8 @@ Parameters:
 Returns:
 - `time.Time` - Time object
 
-### CountDigit
-Count number of digit characters in string.
 
-Parameters:
-- `text string` - Input string
 
-Returns:
-- `int` - Number of digit characters
+## Digit helpers and clocks
+
+CountDigit belongs to core, not btime. ClockState.TimeMS is task simulation time; UTCStamp is real UTC time. Backtest callbacks should use their task clock rather than package-level compatibility time.

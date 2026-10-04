@@ -401,8 +401,8 @@ func (s *DevServer) backtestConfigContents(rawPath string, raw []byte) ([]byte, 
 		}
 	}
 	changed := false
-	var walk func(string, any) error
-	walk = func(path string, value any) error {
+	var walk func(string, any, bool) error
+	walk = func(path string, value any, factorPolicy bool) error {
 		switch item := value.(type) {
 		case map[string]any:
 			for key, child := range item {
@@ -411,7 +411,7 @@ func (s *DevServer) backtestConfigContents(rawPath string, raw []byte) ([]byte, 
 					field = path + "." + key
 				}
 				text, ok := child.(string)
-				if ok && webAdvancedConfigPath(field) {
+				if ok && webAdvancedConfigPath(field) && (!strings.HasPrefix(field, "run_policy[") || factorPolicy) {
 					expanded := os.ExpandEnv(text)
 					if expanded != "" && expanded != ":memory:" && !filepath.IsAbs(expanded) && !strings.HasPrefix(expanded, "$") && !strings.HasPrefix(expanded, "@") {
 						resolved, err := filepath.Abs(filepath.Join(filepath.Dir(source), expanded))
@@ -421,20 +421,25 @@ func (s *DevServer) backtestConfigContents(rawPath string, raw []byte) ([]byte, 
 						item[key], changed = resolved, true
 					}
 				}
-				if err := walk(field, child); err != nil {
+				if err := walk(field, child, factorPolicy); err != nil {
 					return err
 				}
 			}
 		case []any:
 			for _, child := range item {
-				if err := walk(path+"[]", child); err != nil {
+				isFactor := factorPolicy
+				if path == "run_policy" {
+					policy, _ := child.(map[string]any)
+					isFactor = policy["engine"] == config.EngineFactor
+				}
+				if err := walk(path+"[]", child, isFactor); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	if err := walk("", fields); err != nil {
+	if err := walk("", fields, false); err != nil {
 		return nil, err
 	}
 	if !changed {

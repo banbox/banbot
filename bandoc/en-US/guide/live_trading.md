@@ -294,3 +294,17 @@ Grant execution permissions to the script:
 ```shell
 chmod +x /ban/check_bot.sh
 ```
+
+## Factor and cross-sectional engine
+
+bot trade assembles factor/mixed policies only with verified entry.RegisterFactorLiveBinding evidence: transport, symbol metadata, revision/publication mapping, funding and startup reconciliation. execution.live_provider selects a registered name; verified-session is an application example, not a built-in accepted venue. Missing capabilities fail startup without paper fallback.
+
+Remove archive, Prepare/Warmup, reconcile and Commit a generation. Observe current records and Flush complete/timed-out barriers. Stop then Join before releasing resources; failed candidates preserve the old generation. Live rejects history-ic; InitialNAV deposits no funds. factor trade --dry-run is separate historical paper replay.
+
+See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
+
+## Resource and control boundaries
+
+entry assembles the Runtime, accounts, exchange, sources and services for one live run. Shutdown waits for workers and callbacks before releasing owned resources. Embedded callers must inject dependencies and follow the owner’s Close/Stop/Join contract; changing package configuration cannot safely switch an active account.
+
+Live HTTP/WS and RPC provide control and observation through the session’s snapshot, accounts, clock, orders and wallets. They do not own the factor graph or computation state. Development WebUI factories create separate backtest Runtimes; their task boundary differs from the live ApiServer session. See [Web API](../api/web.md), [RPC API](../api/rpc.md) and [Runtime API](../api/runtime.md).

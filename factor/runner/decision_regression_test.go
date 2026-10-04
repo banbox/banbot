@@ -113,7 +113,7 @@ func TestLiveRecordRetentionOwnsTypedValues(t *testing.T) {
 			nested["items"].([]int64)[0] = 0
 			row.Series.Values["large"] = float64(0)
 			delete(row.Series.Values, "null")
-			key := factor.StreamKey{SID: 1, Source: "kline", Frequency: "1h"}
+			key := factor.StreamKey{SID: 1, Source: "kline", TimeFrame: "1h"}
 			stored := live.rows[key]
 			if warmup {
 				stored = live.warmRows[key][0]

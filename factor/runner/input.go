@@ -89,7 +89,7 @@ func (q *archiveEvents) Pop() any {
 }
 
 func archiveStream(row factor.VersionRecord) factor.StreamKey {
-	return factor.StreamKey{SID: row.Series.Sid, Source: row.Series.Source, Frequency: row.Series.TimeFrame}
+	return factor.StreamKey{SID: row.Series.Sid, Source: row.Series.Source, TimeFrame: row.Series.TimeFrame}
 }
 
 func newerArchiveRecord(row, old factor.VersionRecord) bool {

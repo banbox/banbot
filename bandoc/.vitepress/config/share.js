@@ -1,6 +1,11 @@
 export function getApiMenus(lang=''){
     const prefix = `${lang}/api`
     return [
+        {text: 'runtime', link: `${prefix}/runtime`},
+        {text: 'com', link: `${prefix}/com`},
+        {text: 'rpc', link: `${prefix}/rpc`},
+        {text: 'web', link: `${prefix}/web`},
+        {text: 'factor / cross-section', link: `${prefix}/factor`},
         {text: 'core', link: `${prefix}/core`},
         {text: 'btime', link: `${prefix}/btime`},
         {text: 'utils', link: `${prefix}/utils`},

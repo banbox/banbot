@@ -25,7 +25,7 @@ database:
   qdb_max_mem_mb: 16384  # 内存使用上限，单位 MB
 ```
 
-本机没有可连接的 QuestDB 时，banbot 会尝试安装并启动它。`qdb_mem_pct` 和 `qdb_max_mem_mb` 只对这一后端生效。QuestDB 的 WAL 写入是异步可见的：程序已处理写后可见性等待；若您通过外部 SQL 工具写入或校验数据，请不要依据一次紧随写入的查询结果做删除、覆盖或重建决定。
+本机没有可连接的 QuestDB 时，banbot 会尝试安装并启动它。`qdb_mem_pct` 和 `qdb_max_mem_mb` 只对这一后端生效。QuestDB 的 WAL 写入是异步可见的：框架相关写后读路径使用定向可见性等待或进程内缓存/锁；成功 INSERT 或 CTAS 不等于随后查询立刻可见。依赖写入结果时，应等待预期行、时间戳、范围或记录数，而非仅看一次空查询。DROP/RENAME 前必须验证替换表符合预期快照；等待超时必须保留恢复标记，不得把空读解释为无需恢复。外部 SQL 工具也需要遵守这些规则。
 
 ## TimescaleDB 配置
 
@@ -48,5 +48,9 @@ database:
 ## 时序数据语义
 
 无论选用哪个后端，banbot 都通过统一的时序接口管理 K 线和自定义数据，包括建表、写入、读取、覆盖范围和缺口回填。K 线覆盖范围由内部 `sranges` 机制维护，不应依赖历史版本中的 `KInfo`、`KHole` 等表作为外部集成契约。
+
+时序字段按 schema 写入固定列，支持 float/int/string/bool/json；默认 K 线和扩展字段统一通过 DataSeries.Values 传递。数据库整数为 64 位，JSON 的数据库编码与运行时任意 Go 类型不是同一合同；缺键与显式 NULL 的差别不能在固定列往返后恢复。
+
+QuestDB 自定义序列删除先更新 sranges 的有效覆盖范围，达到当前整理阈值后才重写物理表并验证替换快照；TimescaleDB 使用事务和物理删除。不要绕过仓储直接修改覆盖元数据。ormo 订单状态与 ormu UI 任务使用独立 SQLite，共享执行账户的 ledger/store 也有自己的持久化职责，不能混同为时序表。
 
 自定义时序数据的接入、存储和策略消费请参阅[自定义时序数据](./custom_data.md)。

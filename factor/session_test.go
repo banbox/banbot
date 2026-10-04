@@ -185,7 +185,7 @@ func TestSessionDefault26Bars24AssetsAndConstantMissing(t *testing.T) {
 	for _, score := range constant.Values["score"] {
 		compareNumeric(t, Numeric{0, Valid}, score, "constant zscore")
 	}
-	incomplete, err := Freeze(testSnapshot(t, 2000, map[int32]map[string]any{1: {"close": 7.0}, 2: {"close": 7.0}}).Spec(), []VersionRecord{testRecord(1, 2000, map[string]any{"close": 7.0})}, []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 2000}, {SID: 2, Source: "prices", Frequency: "1h", EventTime: 2000}})
+	incomplete, err := Freeze(testSnapshot(t, 2000, map[int32]map[string]any{1: {"close": 7.0}, 2: {"close": 7.0}}).Spec(), []VersionRecord{testRecord(1, 2000, map[string]any{"close": 7.0})}, []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 2000}, {SID: 2, Source: "prices", TimeFrame: "1h", EventTime: 2000}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestSessionDynamicUniverseTrackedContinuityWarmupAndBoundedRemoval(t *testi
 		for sid := range values {
 			row, _ := base.Row(sid, "prices", "1h")
 			rows = append(rows, row)
-			need = append(need, Requirement{SID: sid, Source: "prices", Frequency: "1h", EventTime: event})
+			need = append(need, Requirement{SID: sid, Source: "prices", TimeFrame: "1h", EventTime: event})
 		}
 		snapshot, err := Freeze(spec, rows, need)
 		if err != nil {
@@ -281,7 +281,7 @@ func TestSessionSourceIdentityAndCompleteActiveInputGate(t *testing.T) {
 	spec.SourceVersions["prices"] = "prices-v2"
 	row, _ := base.Row(1, "prices", "1h")
 	row.SourceVersion = "prices-v2"
-	need := []Requirement{{SID: 1, Source: "prices", Frequency: "1h", EventTime: 2000}}
+	need := []Requirement{{SID: 1, Source: "prices", TimeFrame: "1h", EventTime: 2000}}
 	changed, err := Freeze(spec, []VersionRecord{row}, need)
 	if err != nil {
 		t.Fatal(err)
@@ -342,7 +342,7 @@ func TestCustomExplicitPureContractAndNaNNormalization(t *testing.T) {
 	compareNumeric(t, frame.Values["double"][1], batch[0].Values["double"][1], "custom batch")
 }
 
-func TestMixedSourceAsOfFrequencyVisibilityAndExplicitSampling(t *testing.T) {
+func TestMixedSourceAsOfTimeFrameVisibilityAndExplicitSampling(t *testing.T) {
 	close := Field("prices", "close", "1h")
 	slow := AsOfField("fundamental", "value", "1d", "1h", 2500)
 	plan, err := New().Add("score", Linear([]*Node{close, slow}, []float64{1, 1})).Add("sampled-ema", EMA(slow, 2)).Add("group", GroupDemean(close, "classification", "sector", "event")).Compile()
@@ -351,7 +351,7 @@ func TestMixedSourceAsOfFrequencyVisibilityAndExplicitSampling(t *testing.T) {
 	}
 	inputs := plan.Inputs()
 	if len(inputs) != 3 {
-		t.Fatalf("subscription source/frequency union: %#v", inputs)
+		t.Fatalf("subscription source/timeframe union: %#v", inputs)
 	}
 	var snapshots []*Snapshot
 	session, _ := NewSession(plan)
@@ -368,7 +368,7 @@ func TestMixedSourceAsOfFrequencyVisibilityAndExplicitSampling(t *testing.T) {
 		for sid := int32(1); sid <= 2; sid++ {
 			price, _ := base.Row(sid, "prices", "1h")
 			rows = append(rows, price)
-			need = append(need, Requirement{SID: sid, Source: "prices", Frequency: "1h", EventTime: event})
+			need = append(need, Requirement{SID: sid, Source: "prices", TimeFrame: "1h", EventTime: event})
 			fundamental := testRecord(sid, 500, map[string]any{"value": int32(2)})
 			fundamental.Series.Source = "fundamental"
 			fundamental.Series.TimeFrame = "1d"
@@ -380,14 +380,14 @@ func TestMixedSourceAsOfFrequencyVisibilityAndExplicitSampling(t *testing.T) {
 			future.IngestedAt = 2800
 			future.Series.Values = map[string]any{"value": int32(4)}
 			rows = append(rows, future)
-			need = append(need, Requirement{SID: sid, Source: "fundamental", Frequency: "1d", EventTime: event, AsOfLatest: true, MaxAge: 2500})
+			need = append(need, Requirement{SID: sid, Source: "fundamental", TimeFrame: "1d", EventTime: event, AsOfLatest: true, MaxAge: 2500})
 			classification := fundamental
 			classification.Series.Source = "classification"
 			classification.Series.TimeFrame = "event"
 			classification.Series.Values = map[string]any{"sector": "A"}
 			classification.SourceVersion = "classification-v1"
 			rows = append(rows, classification)
-			need = append(need, Requirement{SID: sid, Source: "classification", Frequency: "event", EventTime: event, AsOfLatest: true})
+			need = append(need, Requirement{SID: sid, Source: "classification", TimeFrame: "event", EventTime: event, AsOfLatest: true})
 		}
 		snapshot, err := Freeze(spec, rows, need)
 		if err != nil {
@@ -403,7 +403,7 @@ func TestMixedSourceAsOfFrequencyVisibilityAndExplicitSampling(t *testing.T) {
 			want = 14
 		}
 		compareNumeric(t, Numeric{want, Valid}, frame.Values["score"][1], "daily asof revision visibility")
-		compareNumeric(t, Numeric{-10, Valid}, frame.Values["group"][1], "event-frequency classification")
+		compareNumeric(t, Numeric{-10, Valid}, frame.Values["group"][1], "event-timeframe classification")
 		if i == 2 {
 			compareNumeric(t, Numeric{2, Valid}, frame.Values["sampled-ema"][1], "explicit decision-grid sampling")
 		}

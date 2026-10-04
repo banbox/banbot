@@ -32,7 +32,7 @@ type Chunk struct {
 	Path     string
 	From, To int64
 }
-type PriceStream struct{ Source, Frequency, Field string }
+type PriceStream struct{ Source, TimeFrame, Field string }
 type Config struct {
 	ArtifactPath                                       string
 	Definition                                         string
@@ -356,7 +356,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			// Price availability and explicit funding settlements precede decisions at
 			// equal timestamps. Such prices cannot execute that new decision.
 			for _, r := range batch.Records {
-				if r.Series.Source == c.Prices.Source && r.Series.TimeFrame == c.Prices.Frequency {
+				if r.Series.Source == c.Prices.Source && r.Series.TimeFrame == c.Prices.TimeFrame {
 					n := factor.Number(r.Series.Values, c.Prices.Field)
 					if n.Validity != factor.Valid || n.Value <= 0 {
 						continue
@@ -488,7 +488,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			req := requirements(plan, spec.Universe, grid)
 			requested := map[factor.StreamKey]bool{}
 			for _, r := range req {
-				requested[factor.StreamKey{SID: r.SID, Source: r.Source, Frequency: r.Frequency}] = true
+				requested[factor.StreamKey{SID: r.SID, Source: r.Source, TimeFrame: r.TimeFrame}] = true
 			}
 			token, err := barrier.Begin(plan.Hash(), spec, req, now+c.ExpiryMS)
 			if err != nil {
@@ -499,7 +499,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				return result, err
 			}
 			for _, r := range visible {
-				if !requested[factor.StreamKey{SID: r.Series.Sid, Source: r.Series.Source, Frequency: r.Series.TimeFrame}] {
+				if !requested[factor.StreamKey{SID: r.Series.Sid, Source: r.Series.Source, TimeFrame: r.Series.TimeFrame}] {
 					continue
 				}
 				if err = barrier.Observe(token, r, now); err != nil {
@@ -654,7 +654,7 @@ func requirements(plan *factor.Plan, u factor.Universe, at int64) []factor.Requi
 		}
 		seen[sid] = true
 		for _, in := range plan.Inputs() {
-			out = append(out, factor.Requirement{SID: sid, Source: in.Source, Frequency: in.Frequency, EventTime: at, AsOfLatest: in.AsOfLatest, MaxAge: in.MaxAge})
+			out = append(out, factor.Requirement{SID: sid, Source: in.Source, TimeFrame: in.TimeFrame, EventTime: at, AsOfLatest: in.AsOfLatest, MaxAge: in.MaxAge})
 		}
 	}
 	return out

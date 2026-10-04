@@ -74,51 +74,25 @@ opt 包提供了策略优化相关的功能。
 
 ## 主要功能
 
-### NewBackTest
-创建一个新的回测实例。
+### NewBackTestWithRuntimeDeps
 
-参数：
-- `isOpt bool` - 是否为超参数优化模式
-- `outDir string` - 输出目录路径
-
-返回：
-- `*BackTest` - 回测实例指针
+实际签名为 NewBackTestWithRuntimeDeps(deps biz.RuntimeDeps, isOpt bool, outDir string) (*BackTest, *errs.Error)。NewBackTest 已删除；传入同一 Runtime 的完整依赖，缺失状态报错。轻量事件回放使用 NewBackTestLiteWithRuntimeDeps。
 
 ### RunBTOverOpt
-基于持续调参的回测模式，接近实盘情况，避免使用未来信息调参回测。
 
-参数：
-- `args *config.CmdArgs` - 命令行参数配置
-
-返回：
-- `*errs.Error` - 错误信息
+实际签名：RunBTOverOpt(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. 入口注入配置快照和隔离回测工厂，不能仅传 CmdArgs 调用；该路径是 TS 优化/报告，不是 factor/mixed 超参搜索。
 
 ### RunRollBTPicker
-执行滚动回测选股器。
 
-参数：
-- `args *config.CmdArgs` - 命令行参数配置
-
-返回：
-- `*errs.Error` - 错误信息
+实际签名：RunRollBTPicker(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. 入口注入配置快照和隔离回测工厂，不能仅传 CmdArgs 调用；该路径是 TS 优化/报告，不是 factor/mixed 超参搜索。
 
 ### RunOptimize
-执行策略参数优化。
 
-参数：
-- `args *config.CmdArgs` - 命令行参数配置
-
-返回：
-- `*errs.Error` - 错误信息
+实际签名：RunOptimize(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. 入口注入配置快照和隔离回测工厂，不能仅传 CmdArgs 调用；该路径是 TS 优化/报告，不是 factor/mixed 超参搜索。
 
 ### CollectOptLog
-收集并分析优化日志。
 
-参数：
-- `args *config.CmdArgs` - 命令行参数配置
-
-返回：
-- `*errs.Error` - 错误信息
+实际签名：CollectOptLog(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. 入口注入配置快照和隔离回测工厂，不能仅传 CmdArgs 调用；该路径是 TS 优化/报告，不是 factor/mixed 超参搜索。
 
 ### NewBTResult
 创建新的回测结果实例。
@@ -146,22 +120,19 @@ opt 包提供了策略优化相关的功能。
 返回：
 - `[]*OptInfo, []*OptInfo` - 好组和坏组的优化信息列表
 
-### DumpLineGraph
-生成折线图并保存。
-
-参数：
-- `path string` - 输出文件路径
-- `title string` - 图表标题
-- `label []string` - 标签列表
-- `prec float64` - 精度
-- `tplData []byte` - 模板数据
-- `items []*ChartDs` - 图表数据集
-
-返回：
-- `*errs.Error` - 错误信息
-
 ### CompareExgBTOrders
 比较交易所回测订单。
 
 参数：
 - `args []string` - 命令行参数列表
+
+## 因子引擎集成
+
+优化工厂保持独立 Runtime；因子研究 JSON lines/账户审计 Gob 不等同旧 orders.gob。
+
+[因子 API](factor.md) / [指南](../guide/factor.md)
+
+
+## 工厂、报告与资源
+
+BacktestFactory 的签名是 func(snapshot *config.Snapshot, isOpt bool, outDir string) (*BackTest, func(), *errs.Error)，cleanup 只释放本轮拥有状态。派生 Snapshot 复制时间范围、pairs、policies，账户/钱包不能与另一轮共享可变配置。报告通过 NewReportDeps(biz.RuntimeDeps) 绑定订单、clock、symbols、storage 和 logger，不安装 globals；DumpLineGraph 已不是公共 opt API。见[runtime](runtime.md)。

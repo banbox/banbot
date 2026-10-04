@@ -65,6 +65,7 @@ btime 包提供了时间处理相关的功能。
 
 返回：
 - `int64` - 13位毫秒时间戳
+- `error` - 解析失败；使用时间戳前必须检查
 
 ### ParseTimeMSBy
 根据指定的时间格式解析时间字符串为13位毫秒时间戳。
@@ -75,6 +76,7 @@ btime 包提供了时间处理相关的功能。
 
 返回：
 - `int64` - 13位毫秒时间戳
+- `error` - 解析失败；使用时间戳前必须检查
 
 ### ToDateStr
 将时间戳转换为UTC时区的时间字符串。
@@ -105,11 +107,8 @@ btime 包提供了时间处理相关的功能。
 返回：
 - `time.Time` - 时间对象
 
-### CountDigit
-计算字符串中数字字符的数量。
 
-参数：
-- `text string` - 输入字符串
 
-返回：
-- `int` - 数字字符的数量
+## 数字工具归属
+
+CountDigit 属于 core，不是 btime；ClockState.TimeMS 才是实例模拟时钟，UTCStamp 是真实 UTC 时间。不要在回测 callback 用包级时间 facade 代替任务 clock。

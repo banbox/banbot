@@ -159,30 +159,6 @@
 返回:
 - `string` - 格式化后的错误信息
 
-### GroupByPairQuotes
-将交易对按报价货币分组。
-
-格式: `[key]:pairs...` 转换为:
-```
-【key】
-Quote: Base1 Base2 ...
-```
-
-参数:
-- `items map[string][]string` - 交易对映射
-
-返回:
-- `string` - 格式化后的分组字符串
-
-### CountDigit
-计算字符串中数字字符的数量。
-
-参数:
-- `text string` - 输入字符串
-
-返回:
-- `int` - 数字字符的数量
-
 ### SplitSolid
 分割字符串并忽略空字符串。
 
@@ -453,6 +429,8 @@ Quote: Base1 Base2 ...
 - `float64` - 期望收益
 - `float64` - 收益期望比率
 
+非负样本计为胜，负样本计为败。期望值 `winRate * avgWin - lossRate * avgLoss` 等于输入样本的算术平均；收益期望比率为 `(1 + avgWin/avgLoss) * winRate - 1`，`avgLoss` 为亏损绝对值均值，无亏损时比率返回 0，空数组两个返回值均为 0。它不是 profit factor。采样单位由调用者决定，实盘面板传入每日收益，不能解释为每笔交易期望。
+
 ### CalcMaxDrawDown
 计算最大回撤。
 
@@ -540,17 +518,6 @@ Quote: Base1 Base2 ...
 返回:
 - `string` - 文件内容
 - `*errs.Error` - 错误信息
-
-### ReadLastNLines
-读取文件最后N行内容。
-
-参数:
-- `filePath string` - 文件路径
-- `lineCount int` - 要读取的行数
-
-返回:
-- `[]string` - 最后N行内容
-- `error` - 错误信息
 
 ### WriteCsvFile
 写入CSV文件。
@@ -726,3 +693,8 @@ Quote: Base1 Base2 ...
   - es-ES: 西班牙语
   等
 
+
+
+## 工具归属校正
+
+CountDigit(text string) int 和 GroupByPairQuotes(items map[string][]string, doSort bool) string 均属于 core。ReadLastNLines 已不是 utils 公共接口，文件工具应以实际导出方法为准。

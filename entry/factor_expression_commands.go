@@ -47,7 +47,7 @@ func addExpressionCommands(root *cobra.Command) {
 				return err
 			}
 			return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
-				"hash": plan.Hash(), "frequency": plan.Frequency(), "outputs": plan.Outputs(),
+				"hash": plan.Hash(), "timeframe": plan.TimeFrame(), "outputs": plan.Outputs(),
 				"nodes": plan.NodeCount(), "warmup": plan.WarmupLength(), "retention": plan.StateRetention(),
 				"inputs": plan.Inputs(), "combine": combo,
 			})

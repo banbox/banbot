@@ -1,9 +1,14 @@
 banbot有非常丰富的配置选项，默认情况下，这些都是通过`yaml`配置文件配置的。
 
-## 数据目录
-在每次启动回测或实盘时，您都需要传入`-datadir`参数，即数据目录。您也可以配置环境变量`BanDataDir`，然后忽略`-datadir`参数。
+完整字段参考及可选的因子、账户、历史回放示例统一维护在 [doc/config.yml](https://github.com/banbox/banbot/blob/main/doc/config.yml)。各 key 的变化见 [v0.5 兼容性对比](https://github.com/banbox/banbot/blob/main/doc/config_compatibility.md)。可选示例需按运行模式选择，并填入实际资源。
 
-您可以在数据目录中存放若干个yaml配置文件。回测时还会自动在数据目录下创建`backtest`子目录用于存储回测结果。
+## 数据目录
+
+普通入口默认需要数据目录：使用 `--datadir /path/to/data`，或设置环境变量 `BanDataDir`；显式参数优先。默认读取目录中存在的 `config.yml`、`config.local.yml`。
+
+使用 `--no-default --config /absolute/config.yml` 可跳过默认文件；仅提供显式配置时，配置加载本身不要求数据目录。但 `@`/`$` 前缀的配置路径仍需要数据目录，输出、存储及运行命令还可能有自己的目录要求。不要把加载成功等同于资源已就绪。
+
+数据目录可以保存多个 YAML；回测默认在其 `backtest` 子目录输出报告。
 
 ## Yaml配置文件
 banbot可以从命令行参数中接收若干个配置文件路径，后面的配置文件如果有和前面相同的配置，前面的会被覆盖。
@@ -18,6 +23,8 @@ banbot会尝试从数据目录下默认读取两个配置文件：`config.yml`�
 
 ## 完整Yaml配置
 > 您可使用环境变量替换配置中的敏感内容，比如`${bnb_user1_key}`
+
+这是字段参考模板，不是可直接交易的配置。`Demo` 必须由应用注册；凭据是占位内容，需按实际市场、账户和可用标的调整。因子配置参见本页末尾与[因子指南](./factor.md)。
 
 ```yaml
 name: local  # 机器人名称，用于在消息通知中区分不同机器人
@@ -46,7 +53,7 @@ min_open_rate: 0.5 # 最小开单比率，余额不足单笔金额时，余额/�
 low_cost_action: ignore # 开单金额不足最小金额时的动作：ignore/keepBig/keepAll
 max_simul_open: 0 # 在一个bar上最大同时打开订单数量
 bt_net_cost: 15 # 回测时下单延迟，可用于模拟滑点，单位：秒，默认15
-bt_strict: false # 是否启用严格回测模式；启用后固定关键执行顺序，确保回测结果可严格复现，增加3%～5%耗时
+bt_strict: false # 是否启用严格回测模式；启用后固定关键执行顺序，确保回测结果可严格复现，耗时取决于任务和数据
 relay_sim_unfinish: false  # 交易新品种时(回测/实盘)，是否从开始时间未平仓订单接力开始交易
 order_bar_max: 500  # 查找开始时间未平仓订单向前模拟最大bar数量
 ntp_lang_code: none  # ntp真实时间同步，默认none不启用，支持的代码：zh-CN, zh-HK, zh-TW, ja-JP, ko-KR, zh-SG, global(表示全球ntp服务器：google、apple、facebook...)
@@ -62,7 +69,8 @@ time_start: "20240701"  # K线起始时间，支持时间戳、日期、日期�
 time_end: "20250701"
 run_timeframes: [5m]  # 机器人允许运行的所有时间周期。策略会从中选择适合的最小周期，此处优先级低于run_policy
 run_policy:  # 运行的策略，可以多个策略同时运行；也可以一个策略配置不同参数同时运行多个版本
-  - name: Demo  # 策略名称
+  - engine: time_series
+    name: Demo  # 策略名称
     run_timeframes: [5m]  # 此策略支持的时间周期，提供时覆盖根层级的run_timeframes
     refine_tf: 1m  # 撮合周期，字符串或数字，数字表示相对timeframes减少倍数：'1m', '5m', '3-6', 5
     filters:  # 可使用pairlists中的所有过滤器
@@ -237,7 +245,7 @@ api_server:  # 供外部通过api控制机器人
   jwt_secret_key: bnlkrehnt40uyvjgnb234ro97gvb24
   users:
     - user: ban
-      pwd: 123
+      pwd: "123"
       allow_ips: []
       acc_roles:
         user1: admin  # 这里的键对应accounts，值可选admin/guest
@@ -363,3 +371,49 @@ bt_in_live:
     - "trader1@example.com"
     - "manager@example.com"
 ```
+
+
+## 因子与混合配置字段
+
+配置沿用 v0.5 的根 key 和 run_policy 列表，无需 config_version。普通 YAML 加载只读，不自动备份或改写。省略 engine 保留旧时序策略及开放参数语义；显式 engine: time_series 或 factor 才启用新 id/account/capital_weight 语义。capital_weight 分配资本而非 stake_rate；因子只接受一个 run_timeframes。已启用的高级配置拒绝未知键和非法 NULL。
+
+| Path | Fields |
+| --- | --- |
+| data | namespace, page_rows, prefetch_rows, page_bytes, archive, max_records, pit_policy |
+| execution / accounts.&lt;name&gt; | mode, store, history, sender_lease_dir, live_provider, funding_policy, instruments, margin_rate, max_account_margin, max_virtual_gross, strategy_gross_limit |
+| run_policy[] | archive/chunks, snapshot, definition or expressions, combo, portfolio, decision, research, manifest, prices, funding_source, initial_nav, max_records, config |
+| run_policy[].decision | interval_ms, delay_ms, latency_ms, expiry_ms, max_pending |
+| run_policy[].snapshot | universe, sid_map, schemas, source_versions, adjustment_version, visibility_policy, grid_time, decision_time, replay_time |
+| run_policy[].expressions | schema_version, timeframe, bindings, params, lets, outputs, combine |
+| run_policy[].combo / run_policy[].expressions.combine | method: equal/fixed/history-ic, columns, weights |
+| run_policy[].portfolio | builder, k, long_notional, short_notional, mode: full/patch |
+| run_policy[].research | labels, label_wait_ms |
+| run_policy[].prices | source, timeframe, field |
+
+accounts.&lt;account&gt; 覆盖账户设置；风险额度为结算货币绝对金额。archive/store/history/sender_lease_dir 相对字段来源文件定位，多 --config 不以最后一文件统一定位。最新值存储需 static-approximation；page_bytes 是逻辑载荷，不是 RSS。见[因子示例](./factor.md)。
+
+
+账户凭据、stake、leverage 等旧字段继续放在根 accounts.&lt;name&gt;；该账户的 mode/store/history/funding_policy/instruments 和风险覆盖也直接放在此处，公共默认值保留在 execution。因子字段直接放在 run_policy[]，无需 factor 包装层；expressions、snapshot、portfolio、decision、research 等具有内聚含义的分组继续保留。旧 config_version: 1/2、嵌套 factor 与 execution.accounts 输入仍可读取，但新文档及规范导出采用浅层结构。
+
+
+```yaml
+execution:
+  mode: events
+  funding_policy: explicit-zero
+accounts:
+  default:
+    stake_rate: 0.1
+    leverage: 2
+    history: cold/default-history.sqlite
+    max_virtual_gross: "20000"
+```
+
+这是合并到账户配置的结构片段；保留原账户凭据。账户 history 和风险上限覆盖公共默认值，未设置的执行项继承 execution。
+
+同一配置文件中的每个字段只使用一种路径：同时写 `run_policy[].factor.archive` 与 `run_policy[].archive`，或在根 `accounts` 与旧 `execution.accounts` 重复写同一账户执行字段，会报冲突。跨文件先规范别名，再按后层覆盖规则合并；相对路径跟随最终字段的来源文件。规范导出不输出 `config_version` 或旧包装层。
+
+v0.5 的 `timeframes`、`run_timeframes` 保持原名；仅 v0.6 新增的 `frequency` 统一为 `timeframe`，不保留别名。未显式声明引擎的旧策略继续保留 More，包括 `id`、`account`、`archive`、`factor` 等同名自定义参数。如果旧参数已使用 `engine: factor` 或 `engine: time_series`，升级前需核对该同名冲突。
+
+## 历史回放字段
+
+`bt_strict` 控制执行顺序；`bt_no_kline_download` 禁止回测隐式 K 线下载。有效 `historical_coverage` 与这两个开关一起构成严格历史回放合同；覆盖字段和准备/回放边界见[回测指南](./backtest.md#严格回放与历史覆盖)。配置快照只读，执行账户由 Runtime 单独管理；不要通过修改配置全局变量切换活动任务。

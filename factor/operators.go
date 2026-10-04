@@ -82,7 +82,7 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		groupTargets := make(map[string][]point)
 		keys := make(map[int32]string)
 		for _, p := range targets {
-			row, exists := snapshot.rows[StreamKey{p.sid, node.spec.Source, node.spec.SourceFrequency}]
+			row, exists := snapshot.rows[StreamKey{p.sid, node.spec.Source, node.spec.SourceTimeFrame}]
 			if !exists {
 				result[p.sid] = Numeric{math.NaN(), Missing}
 				continue

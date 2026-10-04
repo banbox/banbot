@@ -73,7 +73,7 @@ func TestLiveFundingSourceAlsoFeedsFactorFields(t *testing.T) {
 	if err = live.Observe(context.Background(), r); err != nil {
 		t.Fatal(err)
 	}
-	row, ok := live.rows[factor.StreamKey{SID: 1, Source: "funding", Frequency: "event"}]
+	row, ok := live.rows[factor.StreamKey{SID: 1, Source: "funding", TimeFrame: "event"}]
 	if !ok || row.Series.Values["signal"] != 42.0 {
 		t.Fatal("settlement callback swallowed factor fields")
 	}

@@ -72,7 +72,7 @@ func TestCloneVersionRecordValidationAndOwnership(t *testing.T) {
 	for name, mutate := range map[string]func(*VersionRecord){
 		"sid":           func(r *VersionRecord) { r.Series.Sid = 0 },
 		"source":        func(r *VersionRecord) { r.Series.Source = "" },
-		"frequency":     func(r *VersionRecord) { r.Series.TimeFrame = "" },
+		"timeframe":     func(r *VersionRecord) { r.Series.TimeFrame = "" },
 		"sourceVersion": func(r *VersionRecord) { r.SourceVersion = "" },
 		"revision":      func(r *VersionRecord) { r.Revision = 0 },
 		"available":     func(r *VersionRecord) { r.AvailableAt = -1 },

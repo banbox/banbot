@@ -136,7 +136,7 @@ func (b *RoundBarrier) Observe(token RoundToken, record VersionRecord, nowMS int
 	// Unrequested/future streams do not expand an unbounded pending buffer.
 	requested := false
 	for _, need := range round.requirements {
-		if need.SID == record.Series.Sid && need.Source == record.Series.Source && need.Frequency == record.Series.TimeFrame {
+		if need.SID == record.Series.Sid && need.Source == record.Series.Source && need.TimeFrame == record.Series.TimeFrame {
 			requested = true
 			break
 		}
@@ -148,7 +148,7 @@ func (b *RoundBarrier) Observe(token RoundToken, record VersionRecord, nowMS int
 		return nil
 	}
 	for key, old := range round.rows {
-		if key.Source == copy.Series.Source && key.Frequency == copy.Series.TimeFrame && key.SID == copy.Series.Sid {
+		if key.Source == copy.Series.Source && key.TimeFrame == copy.Series.TimeFrame && key.SID == copy.Series.Sid {
 			if old.EventTime > copy.EventTime || (old.EventTime == copy.EventTime && old.Revision > copy.Revision) {
 				return nil
 			}

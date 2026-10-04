@@ -22,11 +22,7 @@ func ValidateLiveConfig(c Config) error {
 	}
 	c.Manifest.ExecutionMode = "trade"
 	c.Manifest.LatencyAssumption = fmt.Sprintf("live completion clock; observable event after decision+%dms", c.LatencyMS)
-	c.Manifest.Combo = combo
-	c.Manifest.FactorPlanHash = plan.Hash()
-	c.Manifest.UniverseVersion = c.Snapshot.Universe.Version
-	c.Manifest.VisibilityPolicy = c.Snapshot.VisibilityPolicy
-	c.Manifest.StaticUniverse = c.Snapshot.Universe.Static
+	c.Manifest = decisionManifestSpec(c, plan, combo)
 	_, err = research.BuildManifest(c.Manifest)
 	return err
 }

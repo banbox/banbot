@@ -2,6 +2,7 @@ package expr
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"sort"
 	"strconv"
@@ -14,18 +15,28 @@ import (
 
 type Binding struct {
 	Source    string `json:"source" yaml:"source"`
-	Frequency string `json:"frequency" yaml:"frequency"`
+	TimeFrame string `json:"timeframe" yaml:"timeframe"`
 	Sampling  string `json:"sampling" yaml:"sampling"`
 	MaxAgeMS  int64  `json:"max_age_ms" yaml:"max_age_ms"`
 }
 type Spec struct {
 	SchemaVersion int                `json:"schema_version" yaml:"schema_version"`
-	Frequency     string             `json:"frequency" yaml:"frequency"`
+	TimeFrame     string             `json:"timeframe" yaml:"timeframe"`
 	Bindings      map[string]Binding `json:"bindings" yaml:"bindings"`
 	Params        map[string]float64 `json:"params" yaml:"params"`
 	Lets          map[string]string  `json:"lets" yaml:"lets"`
 	Outputs       map[string]string  `json:"outputs" yaml:"outputs"`
 	Combine       research.ComboSpec `json:"combine" yaml:"combine"`
+}
+
+// CloneSpec copies configuration maps and combination columns independently.
+func CloneSpec(s Spec) Spec {
+	s.Bindings = maps.Clone(s.Bindings)
+	s.Params = maps.Clone(s.Params)
+	s.Lets = maps.Clone(s.Lets)
+	s.Outputs = maps.Clone(s.Outputs)
+	s.Combine = research.CloneComboSpec(s.Combine)
+	return s
 }
 
 type compiler struct {
@@ -65,8 +76,8 @@ func Compile(spec Spec) (*factor.Plan, error) {
 	if spec.SchemaVersion != 1 {
 		return nil, fmt.Errorf("schema_version: expected 1, got %d", spec.SchemaVersion)
 	}
-	if strings.TrimSpace(spec.Frequency) == "" {
-		return nil, fmt.Errorf("frequency: decision frequency required")
+	if strings.TrimSpace(spec.TimeFrame) == "" {
+		return nil, fmt.Errorf("timeframe: decision timeframe required")
 	}
 	if len(spec.Outputs) == 0 {
 		return nil, fmt.Errorf("outputs: at least one output required")
@@ -79,13 +90,13 @@ func Compile(spec Spec) (*factor.Plan, error) {
 		if !identifier(name) || name == "factor" || name == "param" || name == "label" || name == "ts" || name == "cs" || name == "group" {
 			return nil, fmt.Errorf("bindings.%s: invalid or reserved alias", name)
 		}
-		if strings.TrimSpace(b.Source) == "" || strings.TrimSpace(b.Frequency) == "" {
-			return nil, fmt.Errorf("bindings.%s: source and frequency required", name)
+		if strings.TrimSpace(b.Source) == "" || strings.TrimSpace(b.TimeFrame) == "" {
+			return nil, fmt.Errorf("bindings.%s: source and timeframe required", name)
 		}
 		switch b.Sampling {
 		case "", "source-events":
-			if b.Frequency != spec.Frequency || b.MaxAgeMS != 0 {
-				return nil, fmt.Errorf("bindings.%s: cross-frequency data requires asof sampling and positive max_age_ms", name)
+			if b.TimeFrame != spec.TimeFrame || b.MaxAgeMS != 0 {
+				return nil, fmt.Errorf("bindings.%s: cross-timeframe data requires asof sampling and positive max_age_ms", name)
 			}
 		case "asof", "asof-latest":
 			if b.MaxAgeMS <= 0 {
@@ -242,9 +253,9 @@ func (c *compiler) field(path string, e *expression, alias, name string) (*facto
 		return nil, c.error(path, e, "field name must not be empty")
 	}
 	if b.Sampling == "asof" || b.Sampling == "asof-latest" {
-		return factor.AsOfField(b.Source, name, b.Frequency, c.spec.Frequency, b.MaxAgeMS), nil
+		return factor.AsOfField(b.Source, name, b.TimeFrame, c.spec.TimeFrame, b.MaxAgeMS), nil
 	}
-	return factor.Field(b.Source, name, b.Frequency), nil
+	return factor.Field(b.Source, name, b.TimeFrame), nil
 }
 func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 	c.depth++
@@ -258,7 +269,7 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		return factor.Constant(v, c.spec.Frequency), nil
+		return factor.Constant(v, c.spec.TimeFrame), nil
 	case 'r':
 		parts := strings.Split(e.text, ".")
 		if len(parts) != 2 {
@@ -277,7 +288,7 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 			if err != nil {
 				return nil, err
 			}
-			return factor.Constant(v, c.spec.Frequency), nil
+			return factor.Constant(v, c.spec.TimeFrame), nil
 		default:
 			return c.field(path, e, parts[0], parts[1])
 		}
