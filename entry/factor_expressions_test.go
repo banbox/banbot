@@ -34,7 +34,7 @@ func TestExpressionYAMLResearchAndBacktest(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
-	for _, args := range [][]string{{"factor", "research", "--config", path}, {"factor", "backtest", "--mode", "weights", "--config", path}} {
+	for _, args := range [][]string{{"research", "--no-default", "--config", path}, {"backtest", "--no-default", "--config", path}} {
 		command := NewRootCommand()
 		var out bytes.Buffer
 		command.SetOut(&out)
@@ -60,7 +60,7 @@ func TestExpressionYAMLResearchAndBacktest(t *testing.T) {
 		if err := os.WriteFile(path, []byte(invalid), 0600); err != nil {
 			t.Fatal(err)
 		}
-		spec, err := loadFactorRunSpec([]string{path}, "")
+		spec, err := loadFactorYAMLSpec([]string{path})
 		if err == nil {
 			_, err = buildFactorConfigs(spec, runner.Weights)
 		}
@@ -89,7 +89,7 @@ func TestExpressionCompileCommandsWithoutData(t *testing.T) {
 		cmd := NewRootCommand()
 		var out bytes.Buffer
 		cmd.SetOut(&out)
-		cmd.SetArgs([]string{"factor", name, "--spec", path})
+		cmd.SetArgs([]string{name, "--spec", path})
 		if err := cmd.Execute(); err != nil {
 			t.Fatal(err)
 		}
@@ -109,7 +109,7 @@ func TestExpressionCompileCommandsWithoutData(t *testing.T) {
 		cmd := NewRootCommand()
 		cmd.SetOut(&bytes.Buffer{})
 		cmd.SetErr(&bytes.Buffer{})
-		cmd.SetArgs([]string{"factor", "validate", "--spec", path})
+		cmd.SetArgs([]string{"validate", "--spec", path})
 		if err := cmd.Execute(); err == nil {
 			t.Fatal("invalid standalone spec accepted")
 		}

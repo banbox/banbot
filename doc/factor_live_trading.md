@@ -1,8 +1,10 @@
 # 因子与截面策略实盘
 
-`banbot factor trade --config <strategy.yaml>` 默认选择 `banexg` 实盘适配，也可显式指定 `--live-provider banexg`。这只选择装配路径：必须由当前会话证明 transport、instrument、revision/publication、funding 和账户恢复能力，缺能力明确拒绝启动。应用可通过 `RegisterFactorLiveBinding` 注册自己的完整会话集成。
+统一根命令 `banbot trade` 从同一 `run_policy` 装配时序、因子或混合实盘。每个任务拥有独立 Runtime 与取消上下文，但主动绑定同一账户的策略共享执行协调器和净仓账本，不能把运行态隔离理解为资金隔离。取消后先停止接收并 Join 在途工作，再释放共享资源。
 
-内置 SDK 适配按 **banexg** 统一能力探测，不以配置 flags 代替证明。交易所账户模式、条件单库存、手续费、资金费分页和网络控制全部位于 banexg；只有实现完整接口且通过当前会话验证的 instrument/account 才可准入。此前 Binance 线性永续、单向净持仓的接入目标不表示本次已完成真实 venue 验收。没有自动 paper 降级；`factor trade --dry-run` 是独立历史模拟。
+`banbot trade --config <strategy.yaml>` 默认选择 `banexg` 实盘适配，也可显式指定 `--live-provider banexg`。这只选择装配路径：必须由当前会话证明 transport、instrument、revision/publication、funding 和账户恢复能力，缺能力明确拒绝启动。应用可通过 `RegisterFactorLiveBinding` 注册自己的完整会话集成。
+
+内置 SDK 适配按 **banexg** 统一能力探测，不以配置 flags 代替证明。交易所账户模式、条件单库存、手续费、资金费分页和网络控制全部位于 banexg；只有实现完整接口且通过当前会话验证的 instrument/account 才可准入。此前 Binance 线性永续、单向净持仓的接入目标不表示本次已完成真实 venue 验收。没有自动 paper 降级；`trade --dry-run` 是独立历史模拟。
 
 ## 配置
 
@@ -50,4 +52,4 @@ go test ./entry -run '^TestFactorLiveProductionSmoke$' -count=1 -v
 
 run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
 
-execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；factor trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。
+execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

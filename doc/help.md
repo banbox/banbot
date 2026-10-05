@@ -5,7 +5,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 
 ## 技术架构与实现方案
 
-策略配置使用 `run_policy` 的 `engine: time_series|factor`；省略 engine 保持时序。因子原生图/表达式提供多列计算、截面组合、weights/events 回测，mixed replay 要求 events。`bot factor archive/research/backtest/trade` 与 `validate/explain` 是当前入口，旧 `tool bt_factor` 只处理 orders.gob 滚动筛选。详见[多因子指南](../bandoc/zh-CN/guide/factor.md)。真实会话缺验证能力时拒绝启动，不因配置名字自动变成可用 venue。
+策略配置使用 `run_policy` 的 `engine: time_series|factor`；省略 engine 保持时序。统一 `bot backtest` / `bot trade` 按同一配置启动时序、因子或混合引擎。因子原生图/表达式提供多列计算、截面组合、weights/events 回测，mixed replay 要求 events。研究使用根命令 `research`，归档使用 `data archive`，独立表达式使用根命令 `validate/explain --spec`；旧 `tool bt_factor` 只处理 orders.gob 滚动筛选。详见[多因子指南](../bandoc/zh-CN/guide/factor.md)。真实会话缺验证能力时拒绝启动，不因配置名字自动变成可用 venue。
 - 核心框架: 自定义事件驱动框架，支持回测与实盘模式。
 - 运行态: 每次回测、实盘或优化由独立的 `runtime.Runtime` 承载。配置快照、时钟、市场与交易对、策略、订单和钱包状态随任务传递；`context.Context` 仅用于取消、deadline 与 I/O 生命周期。
 - 数据库: SQLite（`banpub.db`）用于公共元数据（K线索引、日历、复权因子、范围管理、未完成K线等）；QuestDB（PGWire）可选用于大规模时序K线存储；交易/任务数据使用SQLite文件（`orders_ban.db`）。

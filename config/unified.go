@@ -121,6 +121,18 @@ func configDocument(raw []byte) (*yaml.Node, int, error) {
 	if err := root.Decode(&values); err != nil {
 		return nil, 0, err
 	}
+	for key := range values {
+		if key == "execution" {
+			continue
+		}
+		switch strings.ToLower(strings.ReplaceAll(key, "_", "")) {
+		case "artifactpath", "definition", "expressions", "computationcontext", "execution",
+			"mode", "chunks", "maxrecords", "maxpending", "decisioninterval", "decisiondelayms",
+			"latencyms", "expiryms", "labelwaitms", "snapshot", "factor", "combo", "manifest",
+			"strategyid", "accountid", "initialnav", "accountinitialnav", "prices", "fundingsource":
+			return nil, 0, fmt.Errorf("%s is not a unified YAML configuration field", key)
+		}
+	}
 	version := nodeValue(root, "config_version")
 	if version == nil {
 		if _, exists := values["config_version"]; exists {
@@ -188,6 +200,9 @@ func parseUnifiedLayers(raws [][]byte, paths []string, metadata ...*loadedConfig
 	llmMerged := make(map[string]any)
 	declaredAccounts, aliasedAccounts := make(map[string]bool), make(map[string]bool)
 	for i, raw := range raws {
+		if strings.EqualFold(filepath.Ext(paths[i]), ".json") {
+			return nil, errs.NewMsg(core.ErrBadConfig, "%s: configuration must use YAML", paths[i])
+		}
 		_, version, err := configDocument(raw)
 		if err != nil {
 			return nil, errs.NewFull(core.ErrBadConfig, err, "%s", paths[i])
@@ -489,6 +504,13 @@ func (c *UnifiedConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+// PolicyAccounts resolves the same account expansion used by validation.
+// Engine assembly must retain legacy TS policies that run on every active
+// production account when no specific account was selected.
+func (c *UnifiedConfig) PolicyAccounts(policy *PolicyV2) ([]string, error) {
+	return c.policyAccounts(policy)
 }
 
 func (c *UnifiedConfig) policyAccounts(policy *PolicyV2) ([]string, error) {

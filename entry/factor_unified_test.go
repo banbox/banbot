@@ -47,12 +47,20 @@ func factorYAMLFixture(t *testing.T) (string, string) {
 	return dir, path
 }
 
+func loadFactorYAMLSpec(paths []string) (*config.RunSpec, error) {
+	spec, err := config.LoadRunSpec(&config.CmdArgs{Configs: config.ArrString(paths), NoDefault: true}, false)
+	if err != nil {
+		return nil, err
+	}
+	return spec, nil
+}
+
 func TestUnifiedFactorYAMLCommandsAndOrdinaryBacktest(t *testing.T) {
 	dir, path := factorYAMLFixture(t)
 	command := NewRootCommand()
 	var out bytes.Buffer
 	command.SetOut(&out)
-	command.SetArgs([]string{"factor", "research", "--config", path})
+	command.SetArgs([]string{"research", "--no-default", "--config", path})
 	if err := command.Execute(); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +115,7 @@ func TestFlatFactorYAMLWithoutMarkerResolvesArchiveAndAccountOrigin(t *testing.T
 	if err := os.WriteFile(flat, []byte(text), 0600); err != nil {
 		t.Fatal(err)
 	}
-	spec, err := loadFactorRunSpec([]string{flat}, "")
+	spec, err := loadFactorYAMLSpec([]string{flat})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +142,7 @@ func TestFactorArchiveSchemaPreservesLargeIntegerAndRejectsLoss(t *testing.T) {
 	}
 	cmd := NewRootCommand()
 	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetArgs([]string{"factor", "archive", "--input", input, "--out", archive})
+	cmd.SetArgs([]string{"data", "archive", "--input", input, "--out", archive})
 	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "schema") {
 		t.Fatalf("lossy JSON integer accepted: %v", err)
 	}
@@ -146,7 +154,7 @@ func TestFactorArchiveSchemaPreservesLargeIntegerAndRejectsLoss(t *testing.T) {
 	}
 	cmd = NewRootCommand()
 	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetArgs([]string{"factor", "archive", "--input", input, "--out", archive, "--schema", schema})
+	cmd.SetArgs([]string{"data", "archive", "--input", input, "--out", archive, "--schema", schema})
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
@@ -164,64 +172,6 @@ func TestFactorArchiveSchemaPreservesLargeIntegerAndRejectsLoss(t *testing.T) {
 	}
 	if _, exists := values["missing"]; exists {
 		t.Fatal("missing became NULL")
-	}
-}
-
-func TestFactorJSONImporterRereadsYAMLAndPreservesSource(t *testing.T) {
-	dir, path := factorYAMLFixture(t)
-	spec, err := loadFactorRunSpec([]string{path}, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	configs, err := buildFactorConfigs(spec, runner.Weights)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := configs[0]
-	c.Chunks[0].Path = "data.gob"
-	legacy := filepath.Join(dir, "legacy.json")
-	raw, _ := json.Marshal(c)
-	if err := os.WriteFile(legacy, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	converted, err := importFactorJSON(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	again, err := importFactorJSON(legacy)
-	if err != nil || again != converted {
-		t.Fatal("non-idempotent importer", again, err)
-	}
-	source, _ := os.ReadFile(legacy)
-	if !bytes.Equal(source, raw) {
-		t.Fatal("JSON source overwritten")
-	}
-	spec, err = loadFactorRunSpec(nil, legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rebuilt, err := buildFactorConfigs(spec, runner.Weights)
-	if err != nil || rebuilt[0].Chunks[0].Path != filepath.Join(dir, "data.gob") {
-		t.Fatalf("path semantics changed: %+v %v", rebuilt, err)
-	}
-	commonDir := filepath.Join(dir, "common")
-	if err := os.Mkdir(commonDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	common := filepath.Join(commonDir, "runtime.yml")
-	if err := os.WriteFile(common, []byte("config_version: 2\nwallet_amounts: {USD: 20000}\nexecution: {funding_policy: explicit-zero}\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	combined, err := loadFactorRunSpec([]string{common}, legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	configs, err = buildFactorConfigs(combined, runner.Weights)
-	if err != nil || configs[0].Chunks[0].Path != filepath.Join(dir, "data.gob") {
-		t.Fatalf("common YAML overlay lost imported path base: %+v %v", configs, err)
-	}
-	if _, err := loadFactorRunSpec([]string{path}, legacy); err == nil {
-		t.Fatal("competing YAML factor definition admitted")
 	}
 }
 
@@ -255,7 +205,7 @@ func TestFactorArchiveFundingIdentityAndAccountOverrides(t *testing.T) {
 	if err := os.WriteFile(path, body, 0600); err != nil {
 		t.Fatal(err)
 	}
-	spec, err := loadFactorRunSpec([]string{path}, "")
+	spec, err := loadFactorYAMLSpec([]string{path})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -65,7 +65,7 @@ This project is dual-licensed under GNU AGPLv3 License and a commercial license.
 
 ### Strategy engines
 
-Choose run_policy.engine: time_series (default) for per-symbol callbacks or factor for native multi-factor/cross-sectional rounds. Mixed replay uses execution.mode: events and explicit account budgets. See the [English guide](bandoc/en-US/guide/factor.md), [中文指南](bandoc/zh-CN/guide/factor.md), [API](bandoc/en-US/api/factor.md) and [refactor record](doc/strategy_engine_refactor.md).
+Choose run_policy.engine: time_series (default) for per-symbol callbacks or factor for native multi-factor/cross-sectional rounds. Root `banbot backtest` / `banbot trade` run either or both from one YAML configuration. Mixed replay uses execution.mode: events and explicit account budgets. Factor research uses root `research`, version archives use `data archive`, and standalone expressions use root `validate` / `explain --spec`. See the [English guide](bandoc/en-US/guide/factor.md), [中文指南](bandoc/zh-CN/guide/factor.md), [API](bandoc/en-US/api/factor.md) and [refactor record](doc/strategy_engine_refactor.md).
 
 Factor live needs application-registered verified transport, instrument/revision/funding evidence and startup reconciliation. Missing capabilities fail explicitly; SDK support alone does not prove real factor venue readiness. Paper/dry-run is separate historical simulation.
 

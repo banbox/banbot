@@ -11,7 +11,17 @@ Universe distinguishes investable, reference, tradable, evaluation and tracked s
 All input travels through `orm.DataSeries.Values map[string]any`, retaining custom columns, concrete types, NULL and missing-key distinctions. Numerical indicator views do not replace raw Values.
 
 
-Ordinary `backtest`/`trade` examples locate base market configuration through `--datadir` or `BanDataDir` by default. To skip default files, pass `--no-default --config /absolute/config.yml`; `@`/`$` configuration paths still require a data directory. Factor-specific loaders accept explicit configuration, but archive, output and account resource requirements still apply.
+`backtest`/`trade`/`research` locate base market configuration through `--datadir` or `BanDataDir` by default. To skip default files, pass `--no-default --config /absolute/config.yml`; `@`/`$` configuration paths still require a data directory. Archive, output and account resource requirements still apply.
+
+## Unified commands
+
+`banbot backtest` and `banbot trade` load one `run_policy` and select the time-series, factor or mixed engine path. There is no separate factor startup command to select. Backtest mode comes from `--mode weights|events`, then `execution.mode`, then `events`; mixed replay requires `events`. A time-series-only run keeps its existing backtest behavior.
+
+Use root `research --config strategy.yml` for factor diagnostics, `data archive --input records.jsonl --out chunk.gob` for version archives, and root `validate --spec formula.yml` / `explain --spec formula.yml` for standalone expressions. Strategy configuration uses unified YAML only.
+
+For factor or mixed configurations, `trade --dry-run` selects historical `events` replay, not live paper trading. Time-series-only live simulation continues to use YAML `env: dry_run`; do not use the historical replay flag for that workflow. Real factor or mixed trading accepts `--live-provider` and requires a verified current-session binding. Strategy configuration uses YAML `run_policy`.
+
+Each task owns its explicit `runtime.Runtime`, configuration snapshot, clock, strategy state and cancellation context. Runtime isolation does not create an independent exchange balance: strategies intentionally bound to the same account share its execution coordinator and retain strategy-level attribution and capital budgets. Independent tasks should use distinct account/resource identities when they must not share execution. Cancellation stops intake, then joins in-flight callbacks and computation before releasing resources; releasing one consumer preserves other active borrowers.
 
 ## Configure the built-in definition
 
@@ -67,9 +77,9 @@ For Go strategies register `runner.RegisterDefinition(name, builder)`, where bui
 
 ```sh
 ./bot backtest --config base.yml --config factors.yml
-./bot factor research --config base.yml --config factors.yml
-./bot factor backtest --mode weights --config base.yml --config factors.yml
-./bot factor backtest --mode events --config base.yml --config factors.yml
+./bot research --config base.yml --config factors.yml
+./bot backtest --mode weights --config base.yml --config factors.yml
+./bot backtest --mode events --config base.yml --config factors.yml
 ```
 
 | Mode | Behavior |
@@ -83,7 +93,7 @@ Execution prices are separate from factor inputs. Events needs tick/event or an 
 For archive input set archive and match Universe, SIDMap, schemas, source versions and price streams to the file:
 
 ```sh
-./bot factor archive --input records.jsonl --out chunk.gob --max-records 100000
+./bot data archive --input records.jsonl --out chunk.gob --max-records 100000
 ```
 
 Input is factor.VersionRecord JSON lines. Use --schema fields.yml when concrete integer widths matter. Raw revisions remain available; round snapshots apply event-time, available/publication and local-reception gates. Archive DecisionDelayMS advances visibility cutoff while retaining decision cadence. Live uses actual receipt time.
@@ -120,9 +130,9 @@ verified-session is an application example name, not a built-in provider. Regist
 
 Provider precedence is explicit CLI selection, `accounts.<name>.live_provider`, `execution.live_provider`, then the built-in default. Keep account overrides in root `accounts`; each account can select its own registered binding. Startup validates every provider before opening sessions.
 
-Remove archive input and select execution.live_provider: verified-session. Start with `./bot trade --config live.yml` or `./bot factor trade --config live.yml`. An embedding program registers entry.RegisterFactorLiveBinding using the current session's verified banexg transport, canonical symbol metadata, publication/revision mapping and funding-policy verification.
+Remove archive input and select execution.live_provider: verified-session. Start with `./bot trade --config live.yml`. An embedding program registers entry.RegisterFactorLiveBinding using the current session's verified banexg transport, canonical symbol metadata, publication/revision mapping and funding-policy verification.
 
-**A stock session without this verified binding fails startup explicitly. YAML alone does not enable real factor trading; there is no automatic paper fallback. This guide does not claim end-to-end real-venue acceptance.** factor trade --dry-run is a separate historical paper replay.
+**A stock session without this verified binding fails startup explicitly. YAML alone does not enable real factor trading; there is no automatic paper fallback. This guide does not claim end-to-end real-venue acceptance.** trade --dry-run is a separate historical paper replay.
 
 Startup compiles requirements/plans, prepares history warmup and current subscriptions, reconciles the account and commits the generation. Round barriers consume closed and locally visible records, then Flush after completion/timeout according to missing-data policies. A failed candidate preserves the old generation. Stop cancels intake; Join waits for callbacks/computation before shared services are released.
 
@@ -130,7 +140,7 @@ Budgets come from reconciled account state; InitialNAV deposits no live funds. E
 
 ## Results and troubleshooting
 
-Factor commands stream panels, decisions, matured diagnostics and final scalar summaries as JSON lines. Ordinary backtests also write resolved.json with defaults/origins, account-&lt;account&gt;/manifest.json and versioned event/posting Gob chunks. Completion follows output sync/close and resource cleanup; primary and cleanup errors remain visible.
+Factor-engine runs stream panels, decisions, matured diagnostics and final scalar summaries as JSON lines. Ordinary backtests also write resolved.json with defaults/origins, account-&lt;account&gt;/manifest.json and versioned event/posting Gob chunks. Completion follows output sync/close and resource cleanup; primary and cleanup errors remain visible.
 
 execution.history: cold/history.sqlite optionally archives settled simulated history. The path must be new; it is not a resume snapshot and is refused for real trade/durable execution. Small replays default to MemoryStore. page_bytes bounds decoded logical payload rather than process RSS.
 

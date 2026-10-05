@@ -1,7 +1,14 @@
 # Factor runners: YAML, storage, archives and live execution
 
-Ordinary `backtest` and `trade` consume the same YAML `RunSpec` as
-the factor commands. Omitted `engine` keeps the existing time-series behavior.
+Root `backtest` and `trade` consume one YAML `RunSpec` and dispatch time-series,
+factor or mixed engines. Omitted `engine` keeps the existing time-series behavior.
+Factor backtest mode is selected by `--mode`,
+then `execution.mode`, then `events`; mixed replay requires `events`.
+
+Root `research` uses the same unified YAML loader, default files, `--datadir`
+and `--no-default` rules. To skip defaults, use
+`--no-default --config /absolute/runtime.yml`; `@`/`$` paths still need a data
+directory. Strategy configurations use YAML only. Archive JSONL is a data format.
 Select a registered Go factor definition with `engine: factor`; arbitrary Go
 nodes and portfolio builders keep explicit versions and missing-data policies.
 For example, add this to the usual exchange/database/account configuration:
@@ -28,7 +35,7 @@ and capital-derived risk limits; unsupported market units fail at assembly.
 Multiple strategies on one account declare their capital weights explicitly.
 Research needs no execution account; ordinary events and dry-run use MemoryStore.
 
-`banbot factor archive --input records.jsonl --out chunk.gob --max-records 100000`
+`banbot data archive --input records.jsonl --out chunk.gob --max-records 100000`
 freezes bounded `factor.VersionRecord` JSON lines. Declare field types with the
 archive schema (`--schema fields.yml`) when concrete integer widths matter.
 Typed decoding preserves large integers; untyped integers outside float64's
@@ -36,58 +43,21 @@ exact range are rejected rather than silently rounded. Conflicting types fail.
 Missing keys, NULLs, strings and arbitrary custom fields remain in
 `DataSeries.Values`; exporting an existing `VersionStore` preserves their types.
 
-Use `banbot factor research --config runtime.yml`,
-`banbot factor backtest --mode weights|events --config runtime.yml`, or
-`banbot factor trade --dry-run --config runtime.yml`. Legacy JSON remains an
-import option: `banbot factor research --factor-config run.json`,
-`banbot factor backtest --mode weights|events --factor-config run.json`, or
-`banbot factor trade --dry-run --factor-config run.json`. Relative archive and
+Use `banbot research --config runtime.yml`,
+`banbot backtest --mode weights|events --config runtime.yml`, or
+`banbot trade --dry-run --config runtime.yml`. Relative archive and
 ledger paths are resolved from the field's originating configuration file.
 YAML loading is read-only and needs no version marker. Factor options such as
 `archive`, `expressions`, `portfolio` and `decision` live directly under each
 `run_policy` item. Root `accounts.<name>` holds account execution overrides;
-`execution` retains shared defaults. JSON imports preserve the original and
-write shallow canonical YAML to `.v2.yml` (the historical filename suffix). Panels,
-decisions, matured diagnostics and the final scalar summary stream as JSON
+`execution` retains shared defaults. Panels, decisions, matured diagnostics and the final scalar summary stream as JSON
 lines. `Result.Unresolved` reports labels that extend beyond the supplied data.
 
-`example.json` is a complete three-asset configuration template. Replace its
-source revision, identities, source versions and chunk ranges to match the
-imported archive. At least 25 closed hourly observations are needed before the
-default 24-period momentum/volatility strategy becomes eligible.
-
-The JSON file follows `runner.Config`. Declare immutable, non-overlapping
-`Chunks` with `Path`, `From`, `To`; positive `MaxRecords`, `MaxPending`,
-`DecisionInterval`, `LatencyMS`, `ExpiryMS`; stable `Snapshot` universe/SID/schema/
-source-version maps; `Factor` parameters; `Manifest` code revision, currency,
-portfolio definition, executable-return labels, fees/slippage/funding policy;
-strategy/account identity, `InitialNAV`; and `Prices` source/timeframe/field.
-For example:
-
-```json
-{
-  "Factor": {"Source":"kline","Field":"close","TimeFrame":"1h","Window":24,"DDOF":1,"WinsorTail":0.01,"Standardize":true},
-  "Prices": {"Source":"tick","TimeFrame":"event","Field":"price"},
-  "DecisionInterval":3600000,"LatencyMS":1,"ExpiryMS":60000,
-  "MaxRecords":100000,"MaxPending":32,"InitialNAV":10000,
-  "StrategyID":"momentum-vol","AccountID":"paper-usd",
-  "FundingSource":"funding",
-  "Execution": {
-    "MarginRate":"0.1","MaxAccountMargin":"10000",
-    "MaxVirtualGross":"20000","StrategyGrossLimit":"20000",
-    "Instruments":{
-      "1":{"ID":"asset-1","Version":"v1","Valuation":"linear_perpetual",
-      "SettlementCurrency":"USD","QuantityStep":"0.01","ContractSize":"1",
-      "PriceTick":"0.01","MoneyScale":8}
-    }
-  }
-}
-```
-
-This excerpt must be completed with `Chunks`, `Snapshot`, and `Manifest` for
-the real archive. Risk gross and margin limits above are **absolute settlement
-currency amounts**, not leverage multipliers. Every SID needs its own declared
-instrument units; exchange names do not select behavior.
+At least 25 closed hourly observations are needed before the default 24-period
+momentum/volatility strategy becomes eligible. For complete unified YAML examples,
+see the [factor guide](../../bandoc/en-US/guide/factor.md). Risk gross and margin
+limits are absolute settlement-currency amounts, not leverage multipliers. Every
+SID needs declared instrument units; exchange names do not select behavior.
 
 Weights retain quantities between explicit decisions and charge actual changed
 notional. Events and dry-run trade use the shared account coordinator,
@@ -159,9 +129,9 @@ generations do not accumulate old sessions. Joining one borrower preserves the
 session and recursive indicator state still used by the remaining consumers.
 
 For current live trading use `banbot trade --config runtime.yml` with
-`execution.live_provider: verified-session`, or the factor-specific command.
-The legacy JSON import can also use `--live-provider verified-session`; it must
-have no archive chunks. An embedding application registers
+`execution.live_provider: verified-session`.
+Use `--live-provider verified-session` to override the configured provider;
+live configurations must have no archive chunks. An embedding application registers
 `entry.RegisterFactorLiveBinding` with the current session's verified Banexg
 transport, canonical symbol metadata, publication/revision mapper and funding
 policy verifier. A Banexg session lacking these proofs fails with an unsupported-capability error;

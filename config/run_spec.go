@@ -64,6 +64,27 @@ func (s *RunSpec) Engines() []string {
 	return slices.Compact(engines)
 }
 
+// WithExecutionMode returns a private RunSpec with a CLI mode override. The
+// effective configuration and provenance match the mode used by the engines.
+func (s *RunSpec) WithExecutionMode(mode, source string) *RunSpec {
+	copySpec := *s
+	copySpec.value = s.Config()
+	if copySpec.value.Execution == nil {
+		copySpec.value.Execution = make(map[string]any)
+	}
+	copySpec.value.Execution["mode"] = mode
+	copySpec.effective = cloneStringMap(s.effective)
+	execution, _ := copySpec.effective["execution"].(map[string]any)
+	if execution == nil {
+		execution = make(map[string]any)
+		copySpec.effective["execution"] = execution
+	}
+	execution["mode"] = mode
+	copySpec.origins = maps.Clone(s.origins)
+	copySpec.origins["execution.mode"] = FieldOrigin{Source: source, Kind: "cli"}
+	return &copySpec
+}
+
 // RuntimeSnapshot supplies common runtime settings and the TS subset without
 // routing factor policies through legacy TS validation. Resource assembly
 // still belongs to entry and must validate each engine's capabilities.
@@ -128,7 +149,7 @@ func IsAdvancedPathField(field string) bool {
 		return true
 	}
 	field = strings.Replace(field, "].factor.", "].", 1)
-	return strings.HasPrefix(field, "run_policy[") && (strings.HasSuffix(field, "].archive") || (strings.Contains(field, "].chunks[") && strings.HasSuffix(field, ".path")) || (strings.Contains(field, "].config.Chunks[") && strings.HasSuffix(field, ".Path")) || strings.HasSuffix(field, "].config.Execution.StorePath") || strings.HasSuffix(field, "].config.Execution.HistoryPath") || strings.HasSuffix(field, "].config.Execution.SenderLeaseDir"))
+	return strings.HasPrefix(field, "run_policy[") && (strings.HasSuffix(field, "].archive") || (strings.Contains(field, "].chunks[") && strings.HasSuffix(field, ".path")))
 }
 
 func (s *RunSpec) factorField(field string) bool {

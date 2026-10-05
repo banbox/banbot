@@ -115,7 +115,7 @@ Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame
 
 表达式入口不能同时提供显式 Plan 或非空 definition；既有 Go 入口在传入 Plan 时优先使用该计划。统一入口负责把 `expressions` 转为 `expr.Spec`，补齐未填写的表达式周期并验证它与 `run_timeframes`/决策间隔一致。外层参数会进入 Go definition 的 Manifest.Parameters，表达式参数则单独控制公式；两种方式都使用外层持仓配置。成交价格通过独立 PriceStream 依赖获取：归档缺少可识别行情流时必须明确指定价格，不能把因子输入的资金费率等字段推断为成交价格。
 
-`factor validate` 与 `factor explain` 当前执行相同的严格独立 YAML 编译检查，输出 hash、周期、输出列、节点数、预热、保留长度、实际 inputs 和组合，不加载行情或账户。它们不验证真实数据字段存在或预测策略收益；完整入口预检负责实际数据依赖。
+`validate` 与 `explain` 当前执行相同的严格独立 YAML 编译检查，输出 hash、周期、输出列、节点数、预热、保留长度、实际 inputs 和组合，不加载行情或账户。它们不验证真实数据字段存在或预测策略收益；完整入口预检负责实际数据依赖。
 
 ## 7. 资源限制、扩展与性能取舍
 

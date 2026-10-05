@@ -350,7 +350,7 @@ OrderIntentID 派生稳定 ClientOrderID，格式/长度及查询能力由 banex
 
 首版完成是 P0—P4 全部完成，不能以 P2 因子研究可用替代实盘目标。优先单策略/单合约验证，再二策略同合约，再多币池；共享执行先验证小账本，最后才扩大策略规模。
 
-建议新增 `factor research/backtest/trade` 命令组，backtest 用 mode=weights/events；复用 entry 的显式 session 和配置加载。命令名称为草案，不改旧 backtest/trade 默认行为。混合账户显式启用 shared execution 并声明策略预算。原策略格式与回调保持兼容，迁移后的账本格式需要版本和恢复工具，不隐式改写生产历史。
+当前统一使用根命令 `research`、`backtest` 和 `trade`，策略配置统一使用 YAML。backtest 按统一 YAML 装配时序、因子或混合引擎，因子 mode 依次取 CLI、execution.mode、默认 events；混合回放必须 events。混合账户显式启用 shared execution 并声明策略预算。原策略格式与回调保持兼容，迁移后的账本格式需要版本和恢复工具，不隐式改写生产历史。
 
 ## 13. 验收与性能验证
 

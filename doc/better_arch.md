@@ -33,7 +33,7 @@
 | [x] | 7.1：OHLC 模拟职责下沉 | `execution.OHLCProfile` 承担 intrabar、market/limit/stop、保护 hit/价格/时间、SDK 精度和公共费用；biz 保留钱包、拆单与策略回调。固定数值及真实 pending/protection 回归通过，两个模拟 profile 分别保留。`execution/ohlc_profile_test.go`、`biz/odmgr_local_profile_test.go` |
 | [x] | 8.1–8.3：统一配置与易用默认 | 保留根 key/run_policy/More，engine 缺省 TS；显式共享预算按账户校验，不自动均分；注册 Go builder 可替换，支持字段来源与高级覆盖。`config/unified_test.go`、`config/run_spec_test.go`、`config/advanced.go` |
 | [x] | 8.4：YAML 只读兼容与编辑保存 | 普通加载不自动迁移、备份或写回；v0.5 key、More 和早期 v0.6 别名继续接受，规范导出使用浅层路径。编辑保存保留权限/DACL、路径锁、源摘要冲突与原子替换校验。`config/shallow_test.go`、`config/migration_test.go` |
-| [x] | 8.4：旧 JSON 入口 importer | 保留原文件，生成并重读浅层 YAML；混用冲突拒绝，路径保留；不再以 JSON 为独立默认组装链。`entry/factor_unified_test.go` |
+| [x] | 8.4：统一 YAML 入口 | 策略配置仅使用统一 YAML；早期 JSON 导入路径已移除，不再生成转换文件。 |
 | [x] | 8.2：实际默认与来源导出 | 普通 backtest 输出独立 resolved.json，保留真正的币种/NAV/预算/周期/价格/资金费/风险及逐字段来源；用户 YAML 保持简洁，导入覆盖不伪标默认。`entry/factor_resolved_test.go` |
 | [x] | 8.3–8.4：Web 配置与回测整链 | Web/CLI 共用 RunSpec/preflight；保存要求原文摘要、路径锁与原子替换，拒绝 stale 保存；编辑切页/关闭前 flush，factor/mixed 读取统一 run/result 实际状态。`web/dev/config_editor_test.go`、`unified_backtest_report_test.go` |
 | [x] | 9.1：CS 池外 TS 标的 | 实际 TS jobs 补齐单位、报价与资金费 union；共享/独立账户皆可交易，不扩张 CS Reference/Investable，也不要求额外 DAG 历史。`entry/mixed_factor_backtest_test.go` |
@@ -97,7 +97,7 @@
 
 ### 1.2 不应当成业务不变量的实现选择
 
-以下内容可以调整：21 张 `exec_*` 表、`factor-config` JSON、归档作为所有因子回测的必经输入、传统与共享订单的两个执行事实源、运行器中重复的快照/组合组装、固定 Momentum/Vol CLI、按账户重新计算同一因子，以及把新职责继续堆进 `runtime/shared_*.go`。
+以下内容可以调整：21 张 `exec_*` 表、旧独立策略配置入口、归档作为所有因子回测的必经输入、传统与共享订单的两个执行事实源、运行器中重复的快照/组合组装、固定 Momentum/Vol CLI、按账户重新计算同一因子，以及把新职责继续堆进 `runtime/shared_*.go`。
 
 以下复杂性不能通过删类型、删表或删校验消失：限价与过期条件、部分成交、撤单期间成交、提交结果未知、策略保护触发、PIT 数据修订、预算版本、外部仓位、资金费和尾差归因。它们可以集中实现，不能用“统一目标仓位”掩盖。
 
@@ -193,7 +193,7 @@ flowchart TD
 
 ### 3.2 一个入口不是一个算法
 
-`trade`、`backtest` 按策略配置装配纯 TS、纯 CS 或混合任务；省略新增设置时保持当前时序运行习惯。`factor research` 与 `factor trade/backtest` 可以长期保留为截面专用入口，复用任务工厂和规范配置，无需为了统一组装而废弃一类引擎的命令。统一的是配置与基础设施，两种引擎各自提供完整的用户体验。
+`trade`、`backtest` 按策略配置装配纯 TS、纯 CS 或混合任务；省略新增设置时保持当前时序运行习惯。`research` 与 `trade/backtest` 可以长期保留为截面专用入口，复用任务工厂和规范配置，无需为了统一组装而废弃一类引擎的命令。统一的是配置与基础设施，两种引擎各自提供完整的用户体验。
 
 快速 weights 回测继续使用简化数量账，events 使用账户协调器与模拟 venue，live 使用真实 venue。weights 不需要完整订单状态机，且不承诺与 events 净值相同。简化项、资金费、滑点、可执行价格假设分别进入 manifest。
 
@@ -496,7 +496,7 @@ MomentumVol 示例的输入 close、处理器、组合方式、多空比例、�
 - 早期 config_version: 1/2、factor 包装层与 execution.accounts 作为兼容输入接受，规范导出只生成浅层结构。
 - 显式配置保存仍需冲突检查与原子写入；有效配置导出为独立产物，不在加载时把环境变量、密钥或 CLI 覆盖写回用户文件。
 
-`--factor-config` 旧 JSON 仍作为入口 importer：保留原文件与路径语义，生成浅层 YAML，经统一入口读取。生成文件暂保留历史 `.v2.yml` 后缀，它不是 YAML 版本要求。与同次 YAML 设置冲突时仍报错。
+策略配置只通过统一 YAML 加载，不提供旧 JSON runner 配置导入，也不提供内嵌 runner.Config 配置块。
 
 ### 8.5 配置验收：少配置、同功能、可恢复
 
@@ -602,7 +602,7 @@ YAML 选择已注册 Go builder 和参数，用户自定义 Go 节点继续显�
 
 保留 raw Values 的类型与 NULL；数值矩阵/数组是显式选择字段的派生视图。Snapshot/manifest 中的数据身份重复保存是冻结证据，不能和重复手工配置混为一谈。哈希编码必须区分具体类型、missing 与 NULL，不能以 JSON float64 中转代替原始字段归档。
 
-当前 `factor archive` 的普通 JSON 解码仍将 JSON 数字变成 float64，直接导出已有 VersionStore 才保留原具体类型（`entry/factor.go:122`、`factor/runner/README.md`）。因此大整数和具体整数类型的全链路兼容不能仅靠 Gob 输出宣称成立。输入转换应使用源 schema 引导数字解码与类型恢复，原始类型无法确定时显式记录/拒绝不兼容转换，不猜测所有数字都是 float；回归包含超过 float64 精确整数范围的值。
+当前 `data archive` 的普通 JSON 解码仍将 JSON 数字变成 float64，直接导出已有 VersionStore 才保留原具体类型（`entry/factor.go:122`、`factor/runner/README.md`）。因此大整数和具体整数类型的全链路兼容不能仅靠 Gob 输出宣称成立。输入转换应使用源 schema 引导数字解码与类型恢复，原始类型无法确定时显式记录/拒绝不兼容转换，不猜测所有数字都是 float；回归包含超过 float64 精确整数范围的值。
 
 ### 10.4 研究、执行和报告分别表达事实
 
@@ -646,7 +646,7 @@ YAML 选择已注册 Go builder 和参数，用户自定义 Go 节点继续显�
 | 阶段 | 工作 | 可审核出口与主要文件 |
 |---|---|---|
 | A：契约与基线 | 固定纯 TS、纯 CS、混合三种模式的代码/数据/配置与行为矩阵，准入/回调缺口、性能基线；修正文档漂移 | 两个完整引擎的能力与性能基线；TS 现有市场/功能不缩减，混合限制另列 |
-| B：规范配置与双引擎组装 | 保留 run_policy/key、engine 默认 TS、统一 DTO；旧 YAML 只读兼容、浅层规范导出；JSON importer、按需引擎状态与 CS 共享决策核心 | `config`、`entry`、`strat/biz`、`factor`；纯 TS 单/多策略无新增必填项，转换失败/并发/中断恢复回归；两引擎只消费新模型 |
+| B：规范配置与双引擎组装 | 保留 run_policy/key、engine 默认 TS、统一 DTO；旧 YAML 只读兼容、浅层规范导出；统一 YAML 入口、按需引擎状态与 CS 共享决策核心 | `config`、`entry`、`strat/biz`、`factor`；纯 TS 单/多策略无新增必填项，转换失败/并发/中断恢复回归；两引擎只消费新模型 |
 | C：执行领域与内存存储 | 小提交边界、MemoryStore、Paper/本地撮合下沉、文件报告；账户服务接收策略级更新 | `execution`、`biz/shared_*`、`factor/runner`、`opt`；内存与 SQLite 同输入逐提交状态一致 |
 | D：schema 和保留策略 | 先删镜像，再迁 attempt/合表/按需迁移表；独立实盘 durability | 新旧 schema shadow 对照、崩溃恢复、归档水位；不丢旧库存/游标/条件 |
 | E：完整订阅计划 | 中性订阅、event、字段投影、预热、统一安装；保留专用 reader | `data`、`strat`、`runtime/shared_sources`；相同字段/时间摘要，性能≤5%退化 |

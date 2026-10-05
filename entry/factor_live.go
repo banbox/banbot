@@ -20,6 +20,7 @@ import (
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/runner"
+	"github.com/banbox/banbot/live"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/strat"
@@ -55,6 +56,8 @@ type FactorLegacyLiveBinding struct {
 	Bridge        *biz.SharedOrderBridgeConfig
 	Jobs          []*strat.StratJob
 	Subscriptions []*strat.DataSub
+	automatic     bool
+	capital       map[execution.StrategyID]decimal.Decimal
 }
 
 type FactorLiveBindingFactory func(context.Context, banexg.BanExchange, *config.Snapshot, runner.Config) (FactorLiveBinding, error)
@@ -158,31 +161,28 @@ func closeFactorLiveSession(session *explicitEntrySession, bindings []FactorLive
 	return result
 }
 
-func runFactorLive(ctx context.Context, c runner.Config, name string, configs []string, out io.Writer) (resultErr error) {
-	if len(c.Chunks) != 0 {
-		return errors.New("factor: live trade refuses archive chunks; use --dry-run for archive replay")
-	}
-	_, err := factorLiveFactory(name)
-	if err != nil {
-		return err
-	}
-	if len(configs) == 0 {
-		return errors.New("factor: live trade requires --config runtime YAML")
-	}
-	spec, loadErr := config.LoadRunSpec(&config.CmdArgs{Configs: config.ArrString(configs)}, false)
-	if loadErr != nil {
-		return loadErr
-	}
-	return runFactorLiveSpec(ctx, spec, []runner.Config{c}, name, out)
-}
-
-func runFactorLiveSpec(ctx context.Context, spec *config.RunSpec, configs []runner.Config, name string, out io.Writer) (resultErr error) {
+// runFactorLiveSpecWithArgs is the CLI/runtime integration boundary for factor
+// live runs, preserving command arguments, logging and the startup lifecycle.
+func runFactorLiveSpecWithArgs(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec, configs []runner.Config, name string, out io.Writer, startup live.CryptoTraderStartupFunc) (resultErr error) {
 	if len(configs) == 0 || spec == nil {
 		return errors.New("factor: live strategies are required")
+	}
+	if args == nil {
+		args = &config.CmdArgs{}
 	}
 	for _, c := range configs {
 		if err := validateFactorLiveConfig(c); err != nil {
 			return err
+		}
+	}
+	for _, policy := range spec.Config().RunPolicy {
+		if policy.Engine == config.EngineTimeSeries {
+			if _, err := spec.Config().PolicyAccounts(policy); err != nil {
+				return err
+			}
+			if _, registered := strat.GetStrategyFactory(policy.Name); !registered {
+				return fmt.Errorf("mixed live: TS strategy %s is not registered", policy.Name)
+			}
 		}
 	}
 	sourceOptions, err := factorSourcePlanOptions(spec.Config().Data)
@@ -209,7 +209,7 @@ func runFactorLiveSpec(ctx context.Context, spec *config.RunSpec, configs []runn
 	if err != nil {
 		return err
 	}
-	session, snapshot, openErr := openExplicitEntrySessionFromSpecContext(ctx, &config.CmdArgs{}, spec, "factor", "trade")
+	session, snapshot, openErr := openExplicitEntrySessionFromSpecContext(ctx, args, spec, "factor", "trade")
 	if openErr != nil {
 		return openErr
 	}
@@ -218,10 +218,27 @@ func runFactorLiveSpec(ctx context.Context, spec *config.RunSpec, configs []runn
 	if err := session.ensureExchange(snapshot, core.RunModeLive); err != nil {
 		return err
 	}
+	if err := session.startProfiles(); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	writer := &factorLiveWriter{Writer: out}
-	results := make(chan error, len(accounts))
+	var tsAccounts []string
+	for _, policy := range spec.Config().RunPolicy {
+		if policy.Engine == config.EngineTimeSeries {
+			policyAccounts, err := spec.Config().PolicyAccounts(policy)
+			if err != nil {
+				return err
+			}
+			for _, account := range policyAccounts {
+				if groups[account] == nil && !slices.Contains(tsAccounts, account) {
+					tsAccounts = append(tsAccounts, account)
+				}
+			}
+		}
+	}
+	results := make(chan error, len(accounts)+len(tsAccounts))
 	// prepareFactorLiveBindings is account-scoped; route each request to its
 	// already validated provider while retaining one cleanup lifecycle.
 	routedFactory := func(ctx context.Context, exchange banexg.BanExchange, snapshot *config.Snapshot, cfg runner.Config) (FactorLiveBinding, error) {
@@ -236,14 +253,22 @@ func runFactorLiveSpec(ctx context.Context, spec *config.RunSpec, configs []runn
 		return err
 	}
 	for index, account := range accounts {
+		if _, err := session.prepareMixedLiveBinding(snapshot, mergedAccounts[account], &bindings[index]); err != nil {
+			return err
+		}
+	}
+	for index, account := range accounts {
 		group, binding := groups[account], bindings[index]
 		go func() {
-			err := session.runFactorsLive(ctx, snapshot, group, binding, writer, sourceOptions)
+			err := session.runFactorsLiveWithStartup(ctx, snapshot, group, binding, writer, startup, sourceOptions)
 			results <- err
 			cancel()
 		}()
 	}
-	for range accounts {
+	for _, account := range tsAccounts {
+		go func() { results <- session.runMixedLiveTSAccount(ctx, snapshot, account, startup); cancel() }()
+	}
+	for range len(accounts) + len(tsAccounts) {
 		resultErr = errors.Join(resultErr, <-results)
 	}
 	return resultErr
@@ -360,6 +385,10 @@ func factorLiveAccountConfig(configs []runner.Config) (runner.Config, error) {
 }
 
 func (s *explicitEntrySession) runFactorsLive(ctx context.Context, snapshot *config.Snapshot, configs []runner.Config, binding FactorLiveBinding, out io.Writer, sourceOptions ...data.SubscriptionPlanOptions) (resultErr error) {
+	return s.runFactorsLiveWithStartup(ctx, snapshot, configs, binding, out, nil, sourceOptions...)
+}
+
+func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, snapshot *config.Snapshot, configs []runner.Config, binding FactorLiveBinding, out io.Writer, startup live.CryptoTraderStartupFunc, sourceOptions ...data.SubscriptionPlanOptions) (resultErr error) {
 	for _, cfg := range configs {
 		if err := validateFactorLiveConfig(cfg); err != nil {
 			return err
@@ -376,6 +405,11 @@ func (s *explicitEntrySession) runFactorsLive(ctx context.Context, snapshot *con
 		return errors.New("factor: live runtime exchange configuration required")
 	}
 	policy := c.Manifest.Costs.FundingPolicy
+	tsCapital, err := s.prepareMixedLiveBinding(snapshot, c, &binding)
+	if err != nil {
+		return err
+	}
+	autoLegacy := binding.Legacy != nil && binding.Legacy.automatic
 	if (policy != "explicit-zero" && policy != "required-stream") || binding.VerifyFunding == nil {
 		return errors.New("factor: live funding policy requires verified session evidence")
 	}
@@ -448,10 +482,13 @@ func (s *explicitEntrySession) runFactorsLive(ctx context.Context, snapshot *con
 		}
 	}
 	cfg := snapshot.View()
+	if s.runSpec != nil {
+		cfg = mixedLiveAccountConfig(cfg, c.AccountID, mixedLivePolicies(s.runSpec, c.AccountID))
+	}
 	opts := biz.SharedExecutionOptions{StorePath: e.StorePath, SenderLeaseDir: e.SenderLeaseDir, Adapter: adapter, AuthoritativeSnapshot: true}
 	var bridge *biz.SharedOrderBridgeConfig
 	if binding.Legacy != nil {
-		if binding.Legacy.Bridge == nil || len(binding.Legacy.Jobs) == 0 {
+		if binding.Legacy.Bridge == nil || !autoLegacy && len(binding.Legacy.Jobs) == 0 {
 			return errors.New("factor: legacy bridge and configured jobs required")
 		}
 		copyBridge := *binding.Legacy.Bridge
@@ -476,11 +513,12 @@ func (s *explicitEntrySession) runFactorsLive(ctx context.Context, snapshot *con
 	if len(sourceOptions) > 0 {
 		planOptions = sourceOptions[0]
 	}
-	rt, err := s.process.NewRuntime(runtime.Options{Context: s.ctx, Logger: s.logger, Config: cfg, DataDir: snapshot.DataDir, StrategyDir: snapshot.StrategyDir, Mode: core.RunModeLive, Env: cfg.Env, Exchange: s.exchange, Storage: s.storage, ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType, ContractType: cfg.ContractType, Pairs: cfg.Pairs, Catalog: catalog, AccountOwnerKey: &binding.Account, SharedExecution: &opts, SharedOrderBridge: bridge, SharedMarketData: true, SourcePlanOptions: planOptions})
+	rt, err := s.process.NewRuntime(runtime.Options{Context: ctx, Logger: s.logger, Config: cfg, DataDir: snapshot.DataDir, StrategyDir: snapshot.StrategyDir, Mode: core.RunModeLive, Env: cfg.Env, Exchange: s.exchange, Storage: s.storage, ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType, ContractType: cfg.ContractType, Pairs: cfg.Pairs, Catalog: catalog, AccountOwnerKey: &binding.Account, SharedExecution: &opts, SharedOrderBridge: bridge, SharedMarketData: true, SourcePlanOptions: planOptions, NetDisable: s.netDisable, DisplayLocation: snapshot.Location()})
 	if err != nil {
 		return err
 	}
 	defer func() { rt.Close(); rt.Join() }()
+	rt.Core.LogFile = s.logArgs.Logfile
 	for _, symbol := range binding.Symbols {
 		if err := rt.Symbols.CacheExSymbolChecked(symbol); err != nil {
 			return err
@@ -500,7 +538,11 @@ func (s *explicitEntrySession) runFactorsLive(ctx context.Context, snapshot *con
 	for _, cfg := range configs {
 		strategies[execution.StrategyID(cfg.StrategyID)] = true
 	}
-	if binding.Legacy != nil {
+	if autoLegacy {
+		for _, configured := range bridge.Strategies {
+			strategies[configured.ID] = true
+		}
+	} else if binding.Legacy != nil {
 		for _, job := range binding.Legacy.Jobs {
 			if job == nil || job.Strat == nil {
 				return errors.New("factor: incomplete legacy job")
@@ -517,6 +559,9 @@ func (s *explicitEntrySession) runFactorsLive(ctx context.Context, snapshot *con
 	}
 	if binding.BootstrapCapital {
 		capital := map[execution.StrategyID]decimal.Decimal{}
+		for id, value := range tsCapital {
+			capital[id] = value
+		}
 		for _, cfg := range configs {
 			if cfg.InitialNAV <= 0 || math.IsNaN(cfg.InitialNAV) || math.IsInf(cfg.InitialNAV, 0) {
 				return errors.New("factor: explicit positive initial_nav required for live capital allocation")
@@ -543,8 +588,22 @@ func (s *explicitEntrySession) runFactorsLive(ctx context.Context, snapshot *con
 	if err != nil {
 		return err
 	}
-	if binding.Legacy != nil {
+	if autoLegacy {
+		if err := loadMixedLiveJobs(rt, &binding); err != nil {
+			return err
+		}
+	}
+	if binding.Legacy != nil && !autoLegacy {
 		if err := rt.BindFactorLegacyJobs(binding.Legacy.Jobs, binding.Legacy.Subscriptions); err != nil {
+			return err
+		}
+	}
+	if startup != nil {
+		trader, err := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps(), nil)
+		if err != nil {
+			return err
+		}
+		if err := startup(ctx, trader); err != nil {
 			return err
 		}
 	}

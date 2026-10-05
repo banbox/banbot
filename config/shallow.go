@@ -12,7 +12,7 @@ func hasPolicyEngine(fields map[string]any) bool {
 }
 
 var accountExecutionKeys = strings.Fields("mode store history sender_lease_dir live_provider funding_policy instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit")
-var factorPolicyKeys = strings.Fields("archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records config definition expressions")
+var factorPolicyKeys = strings.Fields("archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records definition expressions")
 
 func factorFields(fields map[string]any) map[string]any {
 	if fields["engine"] != EngineFactor {
@@ -104,6 +104,9 @@ func normalizeConfigLayer(layer map[string]any, marked bool) ([]string, error) {
 			}
 		}
 		if policy["engine"] == EngineFactor {
+			if _, exists := policy["config"]; exists {
+				return nil, fmt.Errorf("run_policy[%d].config: unknown advanced field", i)
+			}
 			if raw, exists := policy["factor"]; exists {
 				fields, ok := raw.(map[string]any)
 				if !ok {

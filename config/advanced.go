@@ -22,7 +22,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.HasPrefix(path, "execution.accounts."), strings.HasPrefix(path, "accounts.") && strings.Count(path, ".") == 1:
 		allowed = "mode store history sender_lease_dir live_provider funding_policy instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit"
 	case strings.HasSuffix(path, ".factor"), strings.HasPrefix(path, "run_policy[") && strings.HasSuffix(path, "]") && !strings.Contains(path, "."):
-		allowed = "archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records config definition expressions"
+		allowed = "archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records definition expressions"
 	case strings.HasSuffix(path, ".expressions"):
 		allowed = "schema_version timeframe bindings params lets outputs combine"
 	case strings.Contains(path, ".expressions.bindings."):
@@ -127,7 +127,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if reflect.TypeOf(value).Kind() != reflect.Slice {
 				return fmt.Errorf("%s must be a list", field)
 			}
-		case "snapshot", "combo", "portfolio", "decision", "research", "manifest", "prices", "universe", "costs", "accounts", "weights", "parameters", "schemas", "source_versions", "sid_map", "instruments", "config", "expressions", "bindings", "params", "lets", "outputs", "combine":
+		case "snapshot", "combo", "portfolio", "decision", "research", "manifest", "prices", "universe", "costs", "accounts", "weights", "parameters", "schemas", "source_versions", "sid_map", "instruments", "expressions", "bindings", "params", "lets", "outputs", "combine":
 			if reflect.TypeOf(value).Kind() != reflect.Map {
 				return fmt.Errorf("%s must be a mapping", field)
 			}

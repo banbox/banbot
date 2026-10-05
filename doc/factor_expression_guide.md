@@ -4,6 +4,8 @@
 
 直接写公式从第 1 节开始；用 Go 构建和注册策略见第 6 节；两种方式如何运行权重回测、事件回测及实盘见第 7 节；小样本数值和研究检验见第 9 节。
 
+本页使用统一根命令 `backtest`、`trade`、`research`、`validate`、`explain`，归档命令为 `data archive`。策略配置统一使用 YAML。回测和交易按同一 `run_policy` 自动装配时序、因子或混合引擎；因子回测模式依次取 `--mode`、`execution.mode`、默认 `events`，混合回放必须 `events`。本页 `trade --dry-run` 指因子/混合历史回放；纯时序实时模拟继续使用 `env: dry_run`。任务隔离及账户共享约定见[多因子指南](../bandoc/zh-CN/guide/factor.md)。
+
 ## 1. 先编写公式，再检查编译
 
 将下面内容保存为 `formula.yml`。这是独立的表达式定义，不包含账户、行情路径或交易设置。
@@ -31,8 +33,8 @@ combine:
 
 ```sh
 go build -o banbot .
-./banbot factor validate --spec formula.yml
-./banbot factor explain --spec formula.yml
+./banbot validate --spec formula.yml
+./banbot explain --spec formula.yml
 ```
 
 两条命令当前执行相同的编译检查，输出 JSON，包括 `hash`、`timeframe`、`outputs`、`nodes`、`warmup`、`retention`、`inputs`、`combine`。它们不连接行情、数据库或账户，不能证明字段在真实数据中存在、历史长度足够或数据符合可见性要求。`--spec` 读取独立表达式映射，不读取整个策略配置；文件必须是一个 YAML 文档，大小不超过 1 MiB，未知配置字段会报错。
@@ -157,12 +159,12 @@ run_policy:
 外层 `run_policy.params.k` 控制选股数量；`expressions.params.window` 控制公式窗口，两者不会自动相互复制。
 
 ```sh
-./banbot factor research --config strategy.yml
-./banbot factor backtest --mode weights --config strategy.yml
+./banbot research --config strategy.yml
+./banbot backtest --mode weights --config strategy.yml
 ./banbot backtest --config strategy.yml
 ```
 
-`factor research` 使用统一驱动和成熟标签生成因子研究结果。普通配置默认提供一个决策周期的 executable-return 标签；需要自定义时可设置 `research.labels`。归档驱动当前只支持一个 executable-return 标签周期，例如：
+`research` 使用统一驱动和成熟标签生成因子研究结果。普通配置默认提供一个决策周期的 executable-return 标签；需要自定义时可设置 `research.labels`。归档驱动当前只支持一个 executable-return 标签周期，例如：
 
 ```yaml
 research:
@@ -174,11 +176,11 @@ research:
       overlapping: true
 ```
 
-这段映射应放在 `factor` 下。纯交易回放使用固定/等权且不需要研究时，可显式设置 `research: {labels: []}`；`factor research` 和 `history-ic` 不能关闭标签。手工 Go 研究可另用 `research.ReturnLabel`、`LabelQueue`、`Evaluate`，并遵守各自标签的成熟和可见时间。
+这段映射应放在 `factor` 下。纯交易回放使用固定/等权且不需要研究时，可显式设置 `research: {labels: []}`；`research` 和 `history-ic` 不能关闭标签。手工 Go 研究可另用 `research.ReturnLabel`、`LabelQueue`、`Evaluate`，并遵守各自标签的成熟和可见时间。
 
 从普通历史数据库读取时，使用已有数据库、市场、交易对池和 `time_range` 基础配置，移除 `archive`，声明 `data.pit_policy: static-approximation`。普通最新值存储不能证明历史修订的严格 PIT；需要严格 PIT 时使用具有可见性和版本记录的不可变归档或受验证的历史输入。
 
-成交价格 `prices` 独立于因子输入。资金费率、财务字段等不能作为隐式成交价格；归档模式未显式指定时只尝试已声明的通用 tick/kline 价格源。`events` 和真实交易还要求 tick/event 或 1m 可观察价格、执行单位及账户绑定。使用 `factor backtest --mode events` 或 `factor trade` 前须完成相应执行配置，单独一份公式不能提供这些资源。`funding_policy: explicit-zero` 是明确忽略资金费率的假设；需要真实资金费用时声明所需 funding 流。
+成交价格 `prices` 独立于因子输入。资金费率、财务字段等不能作为隐式成交价格；归档模式未显式指定时只尝试已声明的通用 tick/kline 价格源。`events` 和真实交易还要求 tick/event 或 1m 可观察价格、执行单位及账户绑定。使用 `backtest --mode events` 或 `trade` 前须完成相应执行配置，单独一份公式不能提供这些资源。`funding_policy: explicit-zero` 是明确忽略资金费率的假设；需要真实资金费用时声明所需 funding 流。
 
 ## 6. 用常规 Go 代码构建策略
 
@@ -268,8 +270,8 @@ run_policy:
 
 ```sh
 go build -o factorbot ./cmd/factorbot
-./factorbot factor research --config code_strategy.yml
-./factorbot factor backtest --mode weights --config code_strategy.yml
+./factorbot research --config code_strategy.yml
+./factorbot backtest --mode weights --config code_strategy.yml
 ./factorbot backtest --config code_strategy.yml
 ```
 
@@ -291,12 +293,12 @@ Go 和表达式只影响计划来源，后续命令、行情、执行和账户�
 
 | 模式 | 命令 | 主要用途和输入条件 |
 |---|---|---|
-| 因子研究 | `factor research --config strategy.yml` | 研究覆盖率、IC/RankIC 等，必须有成熟标签及所需观察价格 |
-| 权重回测 | `factor backtest --mode weights --config strategy.yml` | 按目标权重和成本口径回放，用于快速比较组合 |
-| 事件回测 | `factor backtest --mode events --config strategy.yml` | 通过账户账本与模拟执行器处理订单/成交，需要可观察执行价格及合约单位 |
+| 因子研究 | `research --config strategy.yml` | 研究覆盖率、IC/RankIC 等，必须有成熟标签及所需观察价格 |
+| 权重回测 | `backtest --mode weights --config strategy.yml` | 按目标权重和成本口径回放，用于快速比较组合 |
+| 事件回测 | `backtest --mode events --config strategy.yml` | 通过账户账本与模拟执行器处理订单/成交，需要可观察执行价格及合约单位 |
 | 普通回测入口 | `backtest --config strategy.yml` | 使用统一策略配置，执行模式由配置/普通回测装配决定 |
-| 本地模拟回放 | `factor trade --dry-run --config strategy.yml` | 当前实现转换为 events 历史回放，不是连接实时行情的 paper trading |
-| 实盘 | `factor trade --config strategy.yml --live-provider binding-name` | 使用已注册、通过能力验证的实盘绑定及真实账户 |
+| 本地模拟回放 | `trade --dry-run --config strategy.yml` | 当前实现转换为 events 历史回放，不是连接实时行情的 paper trading |
+| 实盘 | `trade --config strategy.yml --live-provider binding-name` | 使用已注册、通过能力验证的实盘绑定及真实账户 |
 
 ### 数据库回测和事件执行
 
@@ -318,7 +320,7 @@ run_policy:
 
 ```sh
 ./factorbot backtest --config base.yml --config code_storage.yml
-./factorbot factor backtest --mode events --config base.yml --config code_storage.yml
+./factorbot backtest --mode events --config base.yml --config code_storage.yml
 ```
 
 `base.yml` 必须提供数据库、市场、账户、交易对池和 `time_range`。表达式策略则在此覆盖配置中换成对应 `expressions`，并移除 Go definition 选择。事件执行还需要可验证的 `execution.instruments`、保证金和账户/策略风险限制；普通存储装配可以从已验证市场信息补齐支持的单位，归档需要明确提供完整元数据。执行配置字段见 [advanced.go](../config/advanced.go)，校验条件见 [validate.go](../factor/runner/validate.go) 和 [factor_storage.go](../entry/factor_storage.go)。
@@ -336,7 +338,7 @@ run_policy:
 完成这些集成后，在包含市场/账户、资金费率政策及独立报价配置的 `live_base.yml` 上叠加策略：
 
 ```sh
-./factorbot factor trade --config live_base.yml --config code_live.yml --live-provider my_verified_binding
+./factorbot trade --config live_base.yml --config code_live.yml --live-provider my_verified_binding
 ```
 
 `code_live.yml` 可沿用上面的 Go 选择或表达式配置，但须移除 `archive`，使用实时行情源，并提供或由已验证绑定补齐 Universe、SID 映射、schema 和 source version。多策略共用账户时明确 `capital_weight` 和账户/策略风险限制；预算来自对账后的账户状态。实盘使用 `equal`/`fixed`，当前驱动拒绝 `history-ic`。
@@ -375,7 +377,7 @@ asof 后的时序窗口计数为决策观察次数。在小时决策上重复采
 
 新增公式推荐按以下顺序验证：
 
-1. `factor validate --spec` 检查名称、函数、窗口、采样、组合和依赖环。
+1. `validate --spec` 检查名称、函数、窗口、采样、组合和依赖环。
 2. 使用少量资产和短历史手算，检查每个时点及预热、NULL、缺字段、非法数值和恢复路径。
 3. 用相同快照比较 Session 与 Batch；历史分块时保持同一个 Session 连续推进，避免重复初始化 EMA。
 4. 使用成熟标签研究覆盖率、IC/RankIC、因子相关性和稳定性，再按相同费用与价格口径做交易回测。
@@ -496,4 +498,4 @@ go test ./examples/crosssection -run '^$' -bench '^BenchmarkFactorVersions$' -be
 
 run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
 
-execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；factor trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。
+execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

@@ -336,7 +336,9 @@ banbot tool:
 
 ## Factor and cross-sectional engine
 
-The factor family includes bot factor archive/research/backtest/trade and expression validate/explain. Ordinary backtest/trade also accept engine: factor. backtest --mode weights|events selects replay; trade --dry-run is historical paper; real trade needs verified binding. --factor-config preserves legacy JSON and writes shallow YAML using the historical .v2.yml filename suffix (no configuration version marker is required); paths follow originating fields.
+`bot backtest` and `bot trade` load one YAML `run_policy` and dispatch time-series, factor or mixed strategies. For factor replay, `backtest --mode weights|events` overrides `execution.mode`; absent both, the default is `events`. Mixed replay requires `events`. Factor/mixed `trade --dry-run` runs historical events replay; time-series live simulation continues to use `env: dry_run`. Real factor/mixed trading accepts `--live-provider` and requires a verified binding.
+
+Factor research is root `bot research --config strategy.yml`, archive conversion is `bot data archive`, and standalone expressions use root `bot validate --spec formula.yml` / `bot explain --spec formula.yml`. Strategy configuration uses unified YAML only; paths follow originating fields. Default files, `--datadir` and `--no-default` work the same for all engine types.
 
 bot tool bt_factor on this page is the legacy orders.gob / strat.FactorMap rolling-selection tool, separate from the native factor runner.
 

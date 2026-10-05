@@ -1,5 +1,7 @@
 # 因子与截面 API
 
+CLI 启动已统一：根命令 `backtest` / `trade` 从同一 YAML `RunSpec` 调度因子、时序或混合策略；根命令 `research`、`validate --spec`、`explain --spec` 与 `data archive` 分别提供研究、独立表达式编译和归档转换。下述嵌入 API 契约保持原用途。
+
 
 本页介绍 `factor`、`factor/expr`、`factor/research` 和 `factor/runner`。配置和可运行流程见 [多因子与截面策略](../guide/factor.md)。
 

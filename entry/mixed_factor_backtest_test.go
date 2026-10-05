@@ -71,7 +71,7 @@ func TestMixedStorageReplayTradesTSAssetOutsideFactorUniverse(t *testing.T) {
 			if separate {
 				account = "ts-only"
 			}
-			body := "config_version: 2\ntime_start: '20240101'\ntime_end: '202401010400'\nexchange: {name: mixedfixture}\nmarket_type: linear\npairs: ['ASSET1/USD:USD', 'ASSET2/USD:USD', 'ASSET3/USD:USD']\nstake_currency: [USD]\naccounts: {default: {}, ts-only: {}}\nexecution: {funding_policy: required-stream}\ndata: {pit_policy: static-approximation, page_rows: 32, prefetch_rows: 64, max_records: 1024}\nrun_policy:\n  - name: momentum-vol\n    engine: factor\n    factor: {funding_source: funding}\n    capital_weight: 0.5\n    pairs: ['ASSET1/USD:USD', 'ASSET2/USD:USD']\n    run_timeframes: [1h]\n    params: {window: 2, k: 1}\n  - name: outside-factor-ts\n    account: " + account + "\n    capital_weight: 0.5\n    pairs: ['ASSET3/USD:USD']\n    run_timeframes: [5m]\n"
+			body := "config_version: 2\ntime_start: '20240101'\ntime_end: '202401010400'\nexchange: {name: mixedfixture}\nmarket_type: linear\npairs: ['ASSET1/USD:USD', 'ASSET2/USD:USD', 'ASSET3/USD:USD']\nstake_currency: [USD]\naccounts: {default: {}, ts-only: {}}\nexecution: {funding_policy: required-stream}\ndata: {pit_policy: static-approximation, page_rows: 32, prefetch_rows: 64, max_records: 1024}\nrun_policy:\n  - name: momentum-vol\n    engine: factor\n    factor: {funding_source: funding}\n    capital_weight: 0.5\n    pairs: ['ASSET1/USD:USD', 'ASSET2/USD:USD']\n    run_timeframes: [1h]\n    params: {window: 2, k: 1}\n  - name: outside-factor-ts\n    account: " + account + "\n    capital_weight: 0.5\n    pairs: ['ASSET3/USD:USD']\n"
 			spec, loadErr := config.LoadRunSpec(&config.CmdArgs{NoDefault: true, DataDir: dir, ConfigData: body}, false)
 			if loadErr != nil {
 				t.Fatal(loadErr)
@@ -156,7 +156,7 @@ func TestMixedStorageReplayTradesTSAssetOutsideFactorUniverse(t *testing.T) {
 			}
 			callbacks, fills := 0, 0
 			strat.RegisterStrategy("outside-factor-ts", func(*config.RunPolicyConfig) *strat.TradeStrat {
-				return &strat.TradeStrat{OnBar: func(job *strat.StratJob) {
+				return &strat.TradeStrat{TimeFrames: "5m", OnBar: func(job *strat.StratJob) {
 					callbacks++
 					if job.Symbol.ID != 3 {
 						t.Fatal("TS pair policy was ignored")
@@ -235,7 +235,7 @@ func testMixedReplayAccounts(t *testing.T, separate, secondCS, funding bool, col
 	if err := os.WriteFile(path, body, 0600); err != nil {
 		t.Fatal(err)
 	}
-	spec, err := loadFactorRunSpec([]string{path}, "")
+	spec, err := loadFactorYAMLSpec([]string{path})
 	if err != nil {
 		t.Fatal(err)
 	}

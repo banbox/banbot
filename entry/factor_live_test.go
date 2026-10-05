@@ -32,11 +32,11 @@ import (
 )
 
 func TestFactorLiveUnsupportedBindingFailsClosedBeforeRuntimeIO(t *testing.T) {
-	err := runFactorLive(context.Background(), runner.Config{}, "unsupported-binding", []string{"does-not-exist.yml"}, io.Discard)
+	_, err := factorLiveFactory("unsupported-binding")
 	if err == nil || !strings.Contains(err.Error(), `binding "unsupported-binding" is not registered`) {
 		t.Fatalf("unsupported binding: %v", err)
 	}
-	err = runFactorLive(context.Background(), runner.Config{Chunks: []runner.Chunk{{Path: "archive.gob"}}}, "", nil, io.Discard)
+	err = validateFactorLiveConfig(runner.Config{Chunks: []runner.Chunk{{Path: "archive.gob"}}})
 	if err == nil || !strings.Contains(err.Error(), "refuses archive") {
 		t.Fatalf("real archive execution admitted: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestFactorLiveUnsupportedBindingFailsClosedBeforeRuntimeIO(t *testing.T) {
 
 func TestFactorLiveStaticPreflightRunsBeforeSessionAndFunding(t *testing.T) {
 	dir, path := factorYAMLFixture(t)
-	spec, err := loadFactorRunSpec([]string{path}, "")
+	spec, err := loadFactorYAMLSpec([]string{path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestFactorLiveStaticPreflightRunsBeforeSessionAndFunding(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			invalid := c
 			test.change(&invalid)
-			if err := runFactorLiveSpec(context.Background(), spec, []runner.Config{invalid}, name, io.Discard); err == nil || !strings.Contains(err.Error(), test.reason) {
+			if err := runFactorLiveSpecWithArgs(context.Background(), &config.CmdArgs{}, spec, []runner.Config{invalid}, name, io.Discard, nil); err == nil || !strings.Contains(err.Error(), test.reason) {
 				t.Fatalf("invalid config reached session initialization: %v", err)
 			}
 			if err := (&explicitEntrySession{}).runFactorLive(context.Background(), nil, invalid, binding, io.Discard); err == nil || !strings.Contains(err.Error(), test.reason) {
@@ -97,7 +97,7 @@ func TestFactorLiveStaticPreflightRunsBeforeSessionAndFunding(t *testing.T) {
 	other := c
 	other.StrategyID += "-other"
 	other.Execution.MaxVirtualGross = decimal.NewFromInt(30000)
-	if err := runFactorLiveSpec(context.Background(), spec, []runner.Config{c, other}, name, io.Discard); err == nil || !strings.Contains(err.Error(), "incompatible shared live") {
+	if err := runFactorLiveSpecWithArgs(context.Background(), &config.CmdArgs{}, spec, []runner.Config{c, other}, name, io.Discard, nil); err == nil || !strings.Contains(err.Error(), "incompatible shared live") {
 		t.Fatal("group incompatibility checked after session initialization", err)
 	}
 	if factories.Load() != 0 || funding.Load() != 0 {
@@ -177,43 +177,6 @@ func TestFactorLiveRejectsMissingUntrackedExecutionUnitsBeforeIO(t *testing.T) {
 	}
 	if transport.verified.Load() != 0 || exchange.snapshots.Load() != 0 {
 		t.Fatal("unit validation happened after transport/recovery IO")
-	}
-}
-
-func TestFactorCommandPreservesRunnerAndCleanupErrors(t *testing.T) {
-	dir, path := factorYAMLFixture(t)
-	spec, err := loadFactorRunSpec([]string{path}, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	configs, err := buildFactorConfigs(spec, runner.Events)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := configs[0]
-	c.Execution = runner.ExecutionConfig{Instruments: map[int32]execution.Instrument{}, MarginRate: decimal.RequireFromString("0.1"), MaxAccountMargin: decimal.NewFromInt(10000), MaxVirtualGross: decimal.NewFromInt(20000), StrategyGrossLimit: decimal.NewFromInt(10000)}
-	for sid, symbol := range c.Snapshot.SIDMap {
-		c.Execution.Instruments[sid] = execution.Instrument{ID: symbol, Version: "v1", Valuation: "linear_perpetual", SettlementCurrency: "USD", QuantityStep: decimal.RequireFromString("0.01"), PriceTick: decimal.RequireFromString("0.01"), ContractSize: decimal.NewFromInt(1), MoneyScale: 8}
-	}
-	body, err := json.Marshal(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy := filepath.Join(dir, "valid.json")
-	if err := os.WriteFile(legacy, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	primaryErr := errors.New("execution sink failed")
-	cleanupErr := errors.New("ledger close failed")
-	cmd := NewFactorCommandWithSink(func(context.Context, runner.Config, bool) (runner.Sink, func() error, error) {
-		return &failingEntryFactorSink{primaryErr}, func() error { return cleanupErr }, nil
-	})
-	cmd.SetArgs([]string{"backtest", "--mode", "events", "--factor-config", legacy})
-	cmd.SetOut(io.Discard)
-	cmd.SetErr(io.Discard)
-	err = cmd.Execute()
-	if !errors.Is(err, cleanupErr) || !errors.Is(err, primaryErr) {
-		t.Fatalf("primary/cleanup error lost: %v", err)
 	}
 }
 
@@ -611,5 +574,28 @@ func testFactorLiveBinding(t *testing.T, failure error, scoped bool, counts ...i
 	case <-serverDone:
 	case <-time.After(time.Second):
 		t.Fatal("provider socket was not joined")
+	}
+}
+
+func TestFactorCommandPreservesRunnerAndCleanupErrors(t *testing.T) {
+	_, path := factorEventsYAMLFixture(t)
+	body, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if err := os.WriteFile(path, bytes.Replace(body, []byte("mode: weights"), []byte("mode: events"), 1), 0600); err != nil {
+		t.Fatal(err)
+	}
+	primaryErr := errors.New("execution sink failed")
+	cleanupErr := errors.New("ledger close failed")
+	cmd := newStrategyBacktestCommand(func(context.Context, runner.Config, bool) (runner.Sink, func() error, error) {
+		return &failingEntryFactorSink{primaryErr}, func() error { return cleanupErr }, nil
+	})
+	cmd.SetArgs([]string{"--no-default", "--config", path})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	if !errors.Is(err, cleanupErr) || !errors.Is(err, primaryErr) {
+		t.Fatalf("primary/cleanup error lost: %v", err)
 	}
 }

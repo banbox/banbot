@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
@@ -78,12 +80,23 @@ func unifiedFactorBacktest(args *config.CmdArgs, spec *config.RunSpec) (resultEr
 }
 
 func unifiedFactorBacktestContext(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec) (resultErr *errs.Error) {
+	return unifiedFactorBacktestOutputContext(ctx, args, spec, nil)
+}
+
+func unifiedFactorBacktestOutputContext(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec, out io.Writer) (resultErr *errs.Error) {
 	if err := ctx.Err(); err != nil {
 		return errs.New(core.ErrRunTime, err)
 	}
 	configs, err := validatedFactorBacktestConfigs(spec)
 	if err != nil {
 		return errs.New(core.ErrBadConfig, err)
+	}
+	stopProfiles, profileErr := startProfilesFor(args.CPUProfile, args.MemProfile)
+	if profileErr != nil {
+		return profileErr
+	}
+	if stopProfiles != nil {
+		defer stopProfiles()
 	}
 	configs, cleanup, err := prepareFactorStorageInputs(ctx, args, spec, configs)
 	if err != nil {
@@ -111,6 +124,13 @@ func unifiedFactorBacktestContext(ctx context.Context, args *config.CmdArgs, spe
 	}
 	defer func() { joinError(closeStorage(), core.ErrRunTime) }()
 	base := args.OutPath
+	if strings.HasPrefix(base, "$") || strings.HasPrefix(base, "@") {
+		dir := config.ResolveDataDir(args.DataDir)
+		if dir == "" {
+			return errs.NewMsg(core.ErrBadConfig, "DataDir is required for prefixed output paths")
+		}
+		base = config.NewSnapshotWithDirs(nil, dir, "").ParsePath(base)
+	}
 	if base == "" {
 		dir := args.DataDir
 		if dir == "" {
@@ -150,13 +170,22 @@ func unifiedFactorBacktestContext(ctx context.Context, args *config.CmdArgs, spe
 	for i := range configs {
 		configs[i].ArtifactPath = filepath.Join(path, fmt.Sprintf("strategy-%d.json", i+1))
 	}
+	var writer io.Writer = file
+	if out != nil {
+		writer = io.MultiWriter(file, out)
+	}
 	if slices.Contains(spec.Engines(), config.EngineTimeSeries) {
-		results, err = runMixedFactorConfigs(ctx, spec, configs, file)
+		results, err = runMixedFactorConfigs(ctx, spec, configs, writer)
 	} else {
-		results, err = runFactorConfigs(ctx, configs, nil, file)
+		results, err = runFactorConfigs(ctx, configs, nil, writer)
 	}
 	if err != nil {
 		return errs.New(core.ErrRunTime, err)
+	}
+	if out != nil {
+		if err := writeFactorResults(out, results); err != nil {
+			return errs.New(core.ErrIOWriteFail, err)
+		}
 	}
 	return nil
 }

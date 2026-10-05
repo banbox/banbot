@@ -2,7 +2,6 @@ package entry
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,74 +9,78 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/factor/runner"
-	"github.com/shopspring/decimal"
+	"gopkg.in/yaml.v3"
 )
 
-func TestBacktestPreflightRejectsInvalidImportedReplayBeforeResources(t *testing.T) {
+func TestBacktestPreflightRejectsInvalidYAMLReplayBeforeResources(t *testing.T) {
 	tests := []struct {
 		name, reason string
-		change       func(*runner.Config)
+		change       func(map[string]any, map[string]any)
 	}{
-		{"pending", "bounded", func(c *runner.Config) { c.MaxPending = 0 }},
-		{"latency", "bounded", func(c *runner.Config) { c.LatencyMS = 0 }},
-		{"labels", "label", func(c *runner.Config) { c.Manifest.Labels[0].Horizon = 0 }},
-		{"price", "observable", func(c *runner.Config) { c.Prices.TimeFrame = "1h" }},
-		{"funding", "funding stream", func(c *runner.Config) { c.Manifest.Costs.FundingPolicy = "required-stream"; c.FundingSource = "" }},
-		{"builder", "unregistered portfolio", func(c *runner.Config) { c.Manifest.Portfolio.Builder = "missing-entry-builder" }},
-		{"risk", "risk limits", func(c *runner.Config) { c.Execution.MarginRate = decimal.Zero }},
-		{"units", "instrument", func(c *runner.Config) {
-			unit := c.Execution.Instruments[1]
-			unit.QuantityStep = decimal.Zero
-			c.Execution.Instruments[1] = unit
+		{"pending", "max_pending", func(root, policy map[string]any) { policy["decision"] = map[string]any{"max_pending": 0} }},
+		{"latency", "bounded", func(root, policy map[string]any) { policy["decision"] = map[string]any{"latency_ms": 0} }},
+		{"labels", "label", func(root, policy map[string]any) {
+			policy["research"] = map[string]any{"labels": []any{map[string]any{"name": "bad", "kind": "executable-return", "horizon": 0}}}
+		}},
+		{"price", "observable", func(root, policy map[string]any) {
+			policy["prices"] = map[string]any{"source": "tick", "timeframe": "1h", "field": "price"}
+		}},
+		{"funding", "funding stream", func(root, policy map[string]any) {
+			root["execution"].(map[string]any)["funding_policy"] = "required-stream"
+			policy["funding_source"] = ""
+		}},
+		{"builder", "unregistered portfolio", func(root, policy map[string]any) {
+			policy["portfolio"] = map[string]any{"builder": "missing-entry-builder"}
+		}},
+		{"risk", "risk limits", func(root, policy map[string]any) { root["execution"].(map[string]any)["margin_rate"] = "0" }},
+		{"units", "instrument", func(root, policy map[string]any) {
+			units := root["execution"].(map[string]any)["instruments"].(map[interface{}]interface{})
+			units[1].(map[string]any)["quantity_step"] = "0"
 		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			dir, path := factorYAMLFixture(t)
-			spec, err := loadFactorRunSpec([]string{path}, "")
+			dir, path := factorEventsYAMLFixture(t)
+			raw, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			configs, err := buildFactorConfigs(spec, runner.Weights)
+			var root map[string]any
+			if err = yaml.Unmarshal(raw, &root); err != nil {
+				t.Fatal(err)
+			}
+			policy := root["run_policy"].([]interface{})[0].(map[string]any)["factor"].(map[string]any)
+			settings := root["execution"].(map[string]any)
+			settings["mode"], settings["store"], settings["sender_lease_dir"] = "events", "rejected.db", "rejected-leases"
+			test.change(root, policy)
+			raw, err = yaml.Marshal(root)
 			if err != nil {
 				t.Fatal(err)
 			}
-			c := configs[0]
-			c.Mode = runner.Events
-			c.Chunks[0].Path = "data.gob"
-			c.Execution = runner.ExecutionConfig{StorePath: "rejected.db", SenderLeaseDir: "rejected-leases", Instruments: map[int32]execution.Instrument{}, MarginRate: decimal.RequireFromString("0.1"), MaxAccountMargin: decimal.NewFromInt(10000), MaxVirtualGross: decimal.NewFromInt(20000), StrategyGrossLimit: decimal.NewFromInt(10000)}
-			for sid, symbol := range c.Snapshot.SIDMap {
-				c.Execution.Instruments[sid] = execution.Instrument{ID: symbol, Version: "v1", Valuation: "linear_perpetual", SettlementCurrency: "USD", QuantityStep: decimal.RequireFromString("0.01"), PriceTick: decimal.RequireFromString("0.01"), ContractSize: decimal.NewFromInt(1), MoneyScale: 8}
-			}
-			test.change(&c)
-			body, err := json.Marshal(c)
-			if err != nil {
+			if err = os.WriteFile(path, raw, 0600); err != nil {
 				t.Fatal(err)
 			}
-			legacy := filepath.Join(dir, "invalid.json")
-			if err := os.WriteFile(legacy, body, 0600); err != nil {
-				t.Fatal(err)
+			spec, err := loadFactorYAMLSpec([]string{path})
+			preflightErr := err
+			if preflightErr == nil {
+				preflightErr = ValidateBacktestRunSpec(spec)
 			}
-			spec, err = loadFactorRunSpec(nil, legacy)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := ValidateBacktestRunSpec(spec); err == nil || !strings.Contains(err.Error(), test.reason) {
-				t.Fatalf("invalid imported replay passed preflight: %v expected=%s", err, test.reason)
+			if preflightErr == nil || !strings.Contains(preflightErr.Error(), test.reason) {
+				t.Fatalf("invalid YAML replay passed preflight: %v expected=%s", preflightErr, test.reason)
 			}
 			out := filepath.Join(dir, "rejected-output")
-			preflightErr := ValidateBacktestRunSpec(spec)
-			if err := unifiedFactorBacktestContext(context.Background(), &config.CmdArgs{OutPath: out}, spec); err == nil || err.Code != core.ErrBadConfig || !strings.Contains(err.Error(), preflightErr.Error()) {
-				t.Fatalf("execution and preflight differ: %v; preflight=%v", err, preflightErr)
+			if spec != nil {
+				if err := unifiedFactorBacktestContext(context.Background(), &config.CmdArgs{OutPath: out}, spec); err == nil || err.Code != core.ErrBadConfig || !strings.Contains(err.Error(), preflightErr.Error()) {
+					t.Fatalf("execution and preflight differ: %v; preflight=%v", err, preflightErr)
+				}
 			}
-			if err := RunBackTest(&config.CmdArgs{Configs: config.ArrString{legacy + ".yml"}, NoDefault: true, OutPath: out}); err == nil || !strings.Contains(err.Error(), test.reason) {
-				t.Fatalf("CLI bypassed shared preflight: %v expected=%s", err, test.reason)
+			if err := RunBackTest(&config.CmdArgs{Configs: config.ArrString{path}, NoDefault: true, OutPath: out}); err == nil || !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("CLI bypassed preflight: %v expected=%s", err, test.reason)
 			}
 			for _, resource := range []string{"rejected.db", "rejected-leases", "rejected-output"} {
 				if _, err := os.Stat(filepath.Join(dir, resource)); !os.IsNotExist(err) {
-					t.Fatalf("invalid replay created %s before rejection: %v", resource, err)
+					t.Fatalf("invalid replay created %s: %v", resource, err)
 				}
 			}
 		})
@@ -91,14 +94,13 @@ func TestUnifiedBacktestCancellationPrecedesInvalidConfig(t *testing.T) {
 		t.Fatalf("cancellation not returned first: %v", err)
 	}
 }
-
 func TestBacktestPreflightAcceptsOrdinaryStorageWithoutMarketUnits(t *testing.T) {
 	spec := storageEntrySpec(t, "static-approximation")
 	if err := ValidateBacktestRunSpec(spec); err != nil {
-		t.Fatalf("simple storage events configuration rejected before metadata assembly: %v", err)
+		t.Fatal(err)
 	}
 	configs, err := buildFactorConfigs(spec, runner.Events)
 	if err != nil || len(configs[0].Execution.Instruments) != 0 {
-		t.Fatalf("storage preflight created execution metadata: configs=%+v error=%v", configs, err)
+		t.Fatal("preflight created execution metadata", err)
 	}
 }

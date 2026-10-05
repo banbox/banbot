@@ -3,7 +3,6 @@ package entry
 import (
 	"encoding/json"
 	"fmt"
-	"slices"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/factor/runner"
@@ -63,40 +62,14 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 			return config.FieldOrigin{Kind: "derived", Source: fallback}
 		}
 		values := map[string]resolvedFactorValue{}
-		importedFields := map[string]string{
-			"strategy_id": "StrategyID", "account_id": "AccountID", "definition": "Definition",
-			"currency": "Manifest.Currency", "initial_nav": "InitialNAV", "account_initial_nav": "AccountInitialNAV",
-			"max_records": "MaxRecords", "max_pending": "MaxPending", "decision_interval_ms": "DecisionInterval",
-			"decision_delay_ms": "DecisionDelayMS", "latency_ms": "LatencyMS", "expiry_ms": "ExpiryMS",
-			"price_source": "Prices.Source", "price_timeframe": "Prices.TimeFrame", "price_field": "Prices.Field",
-			"funding_source": "FundingSource", "funding_policy": "Manifest.Costs.FundingPolicy",
-			"visibility_policy": "Snapshot.VisibilityPolicy", "data_namespace": "ComputationContext.DataNamespace",
-			"margin_rate": "Execution.MarginRate", "max_account_margin": "Execution.MaxAccountMargin",
-			"max_virtual_gross": "Execution.MaxVirtualGross", "strategy_gross_limit": "Execution.StrategyGrossLimit",
-		}
 		set := func(key string, value any, fallback string, fields ...string) {
-			if importedFields[key] != "" {
-				field := prefix + "config." + importedFields[key]
-				if _, ok := spec.Origin(field); ok && (key != "account_initial_nav" || c.AccountInitialNAV != 0) {
-					// JSON overrides common defaults, then explicit policy IDs,
-					// data and account execution settings override JSON.
-					before := 0
-					switch key {
-					case "strategy_id", "account_id", "initial_nav", "max_records":
-						before = 1
-					case "margin_rate", "max_account_margin", "max_virtual_gross", "strategy_gross_limit", "funding_policy":
-						before = 2
-					}
-					fields = slices.Insert(fields, min(before, len(fields)), field)
-				}
-			}
 			values[key] = resolvedFactorValue{value, origin(fallback, fields...)}
 		}
 		set("strategy_id", c.StrategyID, "registered strategy name", prefix+"id", prefix+"name")
 		set("account_id", c.AccountID, "configured default trading account", prefix+"account")
 		set("definition", c.Definition, "registered Go builder", prefix+"definition", prefix+"name")
 		if c.Expressions != nil {
-			set("expressions", c.Expressions, "declarative factor expressions", prefix+"expressions", prefix+"config.expressions")
+			set("expressions", c.Expressions, "declarative factor expressions", prefix+"expressions")
 			plan, combo, err := runner.CompileDefinition(c)
 			if err != nil {
 				return err
@@ -121,7 +94,7 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 		set("funding_policy", c.Manifest.Costs.FundingPolicy, "explicit simulation policy", "accounts."+c.AccountID+".funding_policy", "execution.funding_policy", prefix+"manifest.costs.funding_policy")
 		set("visibility_policy", c.Snapshot.VisibilityPolicy, "archive available-at identity", "data.pit_policy", prefix+"snapshot.visibility_policy")
 		set("data_namespace", namespace, "storage namespace or immutable archive identity", "data.namespace")
-		set("execution_history", c.Execution.HistoryPath, "file-free memory execution", "accounts."+c.AccountID+".history", "execution.history", prefix+"config.Execution.HistoryPath")
+		set("execution_history", c.Execution.HistoryPath, "file-free memory execution", "accounts."+c.AccountID+".history", "execution.history")
 		if input, ok := c.HistoricalInput.(interface{ InputBudgetReport() any }); ok {
 			set("input_budget", input.InputBudgetReport(), "compiled subscription input budget", "data.page_bytes", "data.page_rows", "data.prefetch_rows")
 		}

@@ -1,7 +1,6 @@
 package entry
 
 import (
-	"context"
 	"fmt"
 	"sync"
 
@@ -34,7 +33,7 @@ type CommandFactory func() *cobra.Command
 
 var (
 	commandGroups = []commandGroup{
-		{name: "data", help: "export and import data"},
+		{name: "data", help: "export, import and archive data"},
 		{name: "kline", help: "manage kline data"},
 		{name: "series", help: "manage custom series data"},
 		{name: "tick", help: "manage tick data"},
@@ -121,7 +120,6 @@ func commandRegistrySnapshot() ([]commandGroup, []registeredCommand) {
 }
 
 func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Command) {
-	root.AddCommand(newFactorCommand())
 	add := func(parent string, command *cobra.Command) {
 		if parent == "" {
 			root.AddCommand(command)
@@ -130,13 +128,11 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 		groups[parent].AddCommand(command)
 	}
 
-	add("", newRuntimeConfigCommandContext("trade", "live trade", func(ctx context.Context, args *config.CmdArgs) *errs.Error {
-		return runExplicitTradeContext(ctx, args, nil)
-	}, false,
-		bindStakeAmount, bindPairs, bindSpider, bindOut))
+	add("", newStrategyTradeCommand())
 	add("", newInternalCommand())
-	add("", newRuntimeConfigCommandContext("backtest", "backtest with strategies and data", runExplicitBackTestContext, true,
-		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate, bindBTStrict))
+	add("", newStrategyBacktestCommand(nil))
+	add("", newResearchCommand())
+	addExpressionCommands(root)
 	add("", newRuntimeConfigCommand("spider", "start the spider", runSpider, false))
 	add("", newRuntimeConfigCommand("optimize", "run hyperparameter optimization", func(args *config.CmdArgs) *errs.Error { return runExplicitOptimization(args, opt.RunOptimize) }, true,
 		bindOut, bindOptRounds, bindSampler, bindPicker, bindEachPairs, bindConcur, bindBTStrict))
@@ -150,6 +146,7 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 		bindOut, bindConcur))
 	add("data", newRuntimeConfigCommand("import", "import protobuf files into the database", runDataImport, true,
 		bindIn, bindConcur))
+	add("data", newFactorArchiveCommand())
 
 	add("kline", newRuntimeConfigCommand("down", "download kline data from an exchange", RunDownData, true,
 		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindTimeFrames, bindMedium))

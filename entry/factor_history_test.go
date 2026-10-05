@@ -17,7 +17,7 @@ func TestUnifiedHistoryPathResolutionAndPreflight(t *testing.T) {
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	spec, err := loadFactorRunSpec([]string{path}, "")
+	spec, err := loadFactorYAMLSpec([]string{path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestAccountHistoryPreflightRejectsCrossAccountFile(t *testing.T) {
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	spec, err := loadFactorRunSpec([]string{path}, "")
+	spec, err := loadFactorYAMLSpec([]string{path})
 	if err != nil {
 		t.Fatal(err)
 	}

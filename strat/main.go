@@ -406,7 +406,7 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 				newJobMap[subKey] = newStgMap
 				source, sid, tf, ok := ParseDataSubKey(subKey)
 				if ok {
-					if _, ok = tfSecs[tf]; !ok {
+					if _, ok = tfSecs[tf]; !ok && tf != "event" {
 						tfSecs[tf] = utils2.TFToSecs(tf)
 					}
 					if source == "kline" {

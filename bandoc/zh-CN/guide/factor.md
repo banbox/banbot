@@ -11,7 +11,17 @@ Universe 分别声明 investable、reference、tradable、evaluation 和 tracked
 输入统一使用 `orm.DataSeries.Values map[string]any`，包含自定义列、具体类型和 NULL；缺失键和显式 NULL 不等价。时序指标的数值视图不会替换原始字段。
 
 
-普通 `backtest`/`trade` 示例默认从 `--datadir` 或 `BanDataDir` 找到市场基础配置。需要跳过默认文件时提供 `--no-default --config /absolute/config.yml`；`@`/`$` 配置路径仍要求数据目录。因子专用加载器可使用显式配置，但归档、输出和账户资源要求仍需满足。
+`backtest`/`trade`/`research` 默认从 `--datadir` 或 `BanDataDir` 找到市场基础配置。需要跳过默认文件时提供 `--no-default --config /absolute/config.yml`；`@`/`$` 配置路径仍要求数据目录。归档、输出和账户资源要求仍需满足。
+
+## 统一命令
+
+`banbot backtest` 和 `banbot trade` 加载一份 `run_policy`，按配置选择时序、因子或混合引擎路径，无需另选因子启动命令。回测模式依次取 `--mode weights|events`、`execution.mode`、默认 `events`；混合回放必须使用 `events`。纯时序任务保留已有回测行为。
+
+因子诊断使用根命令 `research --config strategy.yml`，版本归档使用 `data archive --input records.jsonl --out chunk.gob`，独立表达式使用根命令 `validate --spec formula.yml` / `explain --spec formula.yml`。策略配置统一使用 YAML。
+
+因子或混合配置的 `trade --dry-run` 启动历史 `events` 回放，不是实时行情模拟。纯时序的实时模拟继续使用 YAML `env: dry_run`，不要用历史回放标志启动该流程。真实因子或混合交易可传 `--live-provider`，且必须具备当前会话已验证的 binding。策略配置使用 YAML `run_policy`。
+
+每个任务拥有显式 `runtime.Runtime`、配置快照、时钟、策略状态和取消上下文。运行态隔离不意味着交易所余额隔离：主动绑定同一账户的策略共享账户执行协调器，保留各自的持仓归因和资本预算。要求交易执行也互不影响的任务应使用不同账户及资源身份。取消时先停止接收，再等待在途回调和计算结束后释放资源；释放一个消费者不会停止仍在借用共享服务的其他消费者。
 
 ## 配置一个内置策略
 
@@ -67,9 +77,9 @@ run_policy:
 
 ```sh
 ./bot backtest --config base.yml --config factors.yml
-./bot factor research --config base.yml --config factors.yml
-./bot factor backtest --mode weights --config base.yml --config factors.yml
-./bot factor backtest --mode events --config base.yml --config factors.yml
+./bot research --config base.yml --config factors.yml
+./bot backtest --mode weights --config base.yml --config factors.yml
+./bot backtest --mode events --config base.yml --config factors.yml
 ```
 
 | 模式 | 适用范围 |
@@ -83,7 +93,7 @@ run_policy:
 用归档时，设置 `archive`，并使 Universe、SIDMap、schemas、source versions 和价格流匹配实际文件。归档制作命令：
 
 ```sh
-./bot factor archive --input records.jsonl --out chunk.gob --max-records 100000
+./bot data archive --input records.jsonl --out chunk.gob --max-records 100000
 ```
 
 输入为 `factor.VersionRecord` JSON lines；整数宽度需要 `--schema fields.yml` 显式声明。所有原始修订保留；快照按 event time、available/published time 和本地接收门槛选取当轮可见版本。归档 `DecisionDelayMS` 调整可见性截止，不改变逻辑决策网格；实盘使用实际接收时间。
@@ -120,9 +130,9 @@ verified-session 是用户工厂的示例注册名，不是内置 provider。先
 
 provider 选择顺序为显式 CLI 参数、`accounts.<账户名>.live_provider`、`execution.live_provider`、内置默认。账户覆盖直接放在根 `accounts`，可为不同账户选择各自已注册的 binding；启动在打开会话前验证所有 provider。
 
-真实实盘配置移除 archive，使用 `execution.live_provider: verified-session`，以 `./bot trade --config live.yml` 或 `./bot factor trade --config live.yml` 启动。嵌入程序必须通过 `entry.RegisterFactorLiveBinding` 接入当前会话已验证的 banexg transport、标准 symbol metadata、publication/revision 映射和 funding-policy 验证。
+真实实盘配置移除 archive，使用 `execution.live_provider: verified-session`，以 `./bot trade --config live.yml` 启动。嵌入程序必须通过 `entry.RegisterFactorLiveBinding` 接入当前会话已验证的 banexg transport、标准 symbol metadata、publication/revision 映射和 funding-policy 验证。
 
-**当前普通 banexg 会话缺少完整 verified binding 时会明确拒绝启动，不能仅凭 YAML 获得真实截面交易能力，也不会降级为 paper。本文没有宣称真实交易所端到端已验收。** 干运行使用独立的 `factor trade --dry-run` 历史 paper 回放，不是 verified live 的自动替代。
+**当前普通 banexg 会话缺少完整 verified binding 时会明确拒绝启动，不能仅凭 YAML 获得真实截面交易能力，也不会降级为 paper。本文没有宣称真实交易所端到端已验收。** 干运行使用独立的 `trade --dry-run` 历史 paper 回放，不是 verified live 的自动替代。
 
 启动先编译数据需求与决策计划，安装历史 warmup 和当前源订阅，对账账户后提交代际。轮次只接受闭合/当轮可见记录；barrier 达成或超时后 Flush，缺失数据按节点政策处理。候选代失败保留原代，取消时先 Stop 再 Join，等待回调/计算完成才释放共享资源。
 
@@ -130,7 +140,7 @@ provider 选择顺序为显式 CLI 参数、`accounts.<账户名>.live_provider`
 
 ## 读取结果与排障
 
-factor 命令输出 JSON lines：panel、decision、成熟 diagnostics 和最终标量 summary。普通回测另写 resolved.json（最终默认值和配置来源）、account-&lt;account&gt;/manifest.json 与版本化 event/posting Gob 块。成功必须在输出 sync/close 与资源 cleanup 之后判定，失败保留主错误和清理错误。
+因子引擎输出 JSON lines：panel、decision、成熟 diagnostics 和最终标量 summary。普通回测另写 resolved.json（最终默认值和配置来源）、account-&lt;account&gt;/manifest.json 与版本化 event/posting Gob 块。成功必须在输出 sync/close 与资源 cleanup 之后判定，失败保留主错误和清理错误。
 
 大型模拟可用 `execution.history: cold/history.sqlite` 归档已结算记录；必须新路径，不是恢复快照，真实 trade 和 durable store 不接受。小回测默认 MemoryStore；page_bytes 限制解码逻辑载荷，不是进程 RSS 上限。
 

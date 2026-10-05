@@ -261,7 +261,7 @@ llm_models:
 #   max_records: 100000
 #   pit_policy: static-approximation
 # execution:
-#   mode: weights # 普通 backtest 支持 weights/events；factor research/trade 由命令选择
+#   mode: weights # backtest 支持 weights/events；research/trade 由命令选择
 #   funding_policy: explicit-zero # 明确忽略资金费；有结算流时使用 required-stream
 # run_policy:
 #   - engine: factor
@@ -378,20 +378,6 @@ llm_models:
 #   #     source_versions: {kline: actual-source-version}
 #   #     revisions: {kline: 1}
 #
-# 旧 JSON runner 导入器使用精确 JSON 字段名，仅用于导入/复现。
-# config 是整个 runner 配置，不要与浅层 archive/expressions 等配置混用：
-# run_policy:
-#   - engine: factor
-#     name: momentum-vol
-#     run_timeframes: [1h]
-#     config:
-#       Definition: momentum-vol
-#       StrategyID: momentum
-#       AccountID: user1
-#       MaxRecords: 100000
-#       Chunks: [{Path: ./archives/prices.gob}]
-#       # 其余字段由 factor 命令 --factor-config 导入器从原 JSON 保留；优先维护上面的浅层 YAML。
-
 # === 可选场景 C：共享执行、账户覆盖与混合策略 ===
 # events/混合回测需真正可观察的 tick/event 或 1m 执行价格和标准 instrument 单位。
 # 以下 ID/SID/单位是示例，应与市场 metadata、快照 sid_map 和实际数据完全一致。

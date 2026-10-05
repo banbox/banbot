@@ -1,7 +1,6 @@
 package entry
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -27,121 +25,7 @@ import (
 	"github.com/banbox/banexg/utils"
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/shopspring/decimal"
-	"gopkg.in/yaml.v3"
 )
-
-// importFactorJSON is an entry-only importer. The original stays immutable;
-// execution rereads the generated v2 YAML through the normal RunSpec loader.
-func importFactorJSON(path string) (string, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	var legacy runner.Config
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&legacy); err != nil {
-		return "", err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return "", errors.New("factor config must contain one JSON object")
-	}
-	if legacy.Definition == "" && legacy.Expressions == nil {
-		legacy.Definition = "momentum-vol"
-	}
-	// JSON was never a canonical YAML format. Its advanced configuration is
-	// preserved verbatim under a checked importer block rather than dropping
-	// execution units, PIT declarations or simulation assumptions.
-	var fields map[string]any
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return "", err
-	}
-	name := legacy.Definition
-	if name == "" && legacy.Expressions != nil {
-		name = "expressions"
-	}
-	// Keep the complete runner JSON in the importer config block. The policy is
-	// flat at the YAML boundary (config is a direct policy key), while the
-	// config package still validates and normalizes this controlled payload.
-	policy := map[string]any{"name": name, "engine": config.EngineFactor, "config": fields}
-	if legacy.StrategyID != "" {
-		policy["id"] = legacy.StrategyID
-	}
-	if legacy.AccountID != "" {
-		policy["account"] = legacy.AccountID
-	}
-	canonical := map[string]any{"run_policy": []any{policy}}
-	if legacy.AccountID != "" {
-		canonical["accounts"] = map[string]any{legacy.AccountID: map[string]any{}}
-	}
-	converted, err := yaml.Marshal(canonical)
-	if err != nil {
-		return "", err
-	}
-	if _, err := config.ParseUnifiedYAML(converted, path); err != nil {
-		return "", err
-	}
-	target := path + ".yml"
-	if existing, err := os.ReadFile(target); err == nil {
-		if !bytes.Equal(existing, converted) {
-			return "", fmt.Errorf("factor JSON import conflicts with %s", target)
-		}
-		return target, nil
-	} else if !os.IsNotExist(err) {
-		return "", err
-	}
-	if current, err := os.ReadFile(path); err != nil || !bytes.Equal(current, raw) {
-		return "", fmt.Errorf("factor JSON changed during conversion: %s", path)
-	}
-	if err := config.WriteConfigAtomic(target, nil, converted); err != nil {
-		return "", err
-	}
-	if current, err := os.ReadFile(target); err != nil || !bytes.Equal(current, converted) {
-		return "", fmt.Errorf("factor YAML changed after conversion: %s", target)
-	}
-	return target, nil
-}
-
-func loadFactorRunSpec(paths []string, legacyPath string) (*config.RunSpec, error) {
-	if legacyPath != "" {
-		path, err := importFactorJSON(legacyPath)
-		if err != nil {
-			return nil, err
-		}
-		if len(paths) > 0 {
-			base, err := config.ParseUnifiedConfigs(paths, false)
-			if err != nil {
-				return nil, err
-			}
-			for _, policy := range base.RunPolicy {
-				if policy.Engine == config.EngineFactor {
-					return nil, errors.New("factor: --factor-config conflicts with YAML factor strategy definitions")
-				}
-			}
-			if len(base.RunPolicy) > 0 {
-				loaded, err := config.LoadRunSpec(&config.CmdArgs{Configs: paths, NoDefault: true}, false)
-				if err != nil {
-					return nil, err
-				}
-				imported, err := config.LoadRunSpec(&config.CmdArgs{Configs: []string{path}, NoDefault: true}, false)
-				if err != nil {
-					return nil, err
-				}
-				return loaded.AppendImportedPolicies(imported)
-			}
-		}
-		paths = append([]string{path}, paths...)
-	}
-	if len(paths) == 0 {
-		return nil, errors.New("factor: --config YAML is required")
-	}
-	spec, err := config.LoadRunSpec(&config.CmdArgs{Configs: paths, NoDefault: true}, false)
-	if err != nil {
-		return nil, err
-	}
-	return spec, nil
-}
 
 func decodeFactorFields(fields map[string]any, target any) error {
 	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
@@ -221,65 +105,52 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 			default:
 			}
 		}
-		if imported, ok := policy.Factor["config"].(map[string]any); ok {
-			// The importer block uses the exact JSON field contract.
-			raw, err := json.Marshal(imported)
-			if err != nil {
+		fields := make(map[string]any)
+		for key, value := range policy.Factor {
+			switch key {
+			case "archive", "portfolio", "decision", "research":
+			default:
+				fields[key] = value
+			}
+		}
+		if err := decodeFactorFields(fields, &c); err != nil {
+			return nil, fmt.Errorf("factor %s: %w", policy.Name, err)
+		}
+		if portfolio, ok := policy.Factor["portfolio"].(map[string]any); ok {
+			if err := decodeFactorFields(portfolio, &c.Manifest.Portfolio); err != nil {
 				return nil, err
 			}
-			dec := json.NewDecoder(bytes.NewReader(raw))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(&c); err != nil {
-				return nil, err
-			}
-		} else {
-			fields := make(map[string]any)
-			for key, value := range policy.Factor {
-				switch key {
-				case "archive", "portfolio", "decision", "research":
-				default:
-					fields[key] = value
+		}
+		if decision, ok := policy.Factor["decision"].(map[string]any); ok {
+			for key, value := range decision {
+				mapped := map[string]string{"interval_ms": "DecisionInterval", "delay_ms": "DecisionDelayMS", "latency_ms": "LatencyMS", "expiry_ms": "ExpiryMS", "max_pending": "MaxPending"}[key]
+				if mapped == "" {
+					return nil, fmt.Errorf("unknown factor decision key %s", key)
 				}
-			}
-			if err := decodeFactorFields(fields, &c); err != nil {
-				return nil, fmt.Errorf("factor %s: %w", policy.Name, err)
-			}
-			if portfolio, ok := policy.Factor["portfolio"].(map[string]any); ok {
-				if err := decodeFactorFields(portfolio, &c.Manifest.Portfolio); err != nil {
+				fields = map[string]any{mapped: value}
+				if err := decodeFactorFields(fields, &c); err != nil {
 					return nil, err
 				}
 			}
-			if decision, ok := policy.Factor["decision"].(map[string]any); ok {
-				for key, value := range decision {
-					mapped := map[string]string{"interval_ms": "DecisionInterval", "delay_ms": "DecisionDelayMS", "latency_ms": "LatencyMS", "expiry_ms": "ExpiryMS", "max_pending": "MaxPending"}[key]
-					if mapped == "" {
-						return nil, fmt.Errorf("unknown factor decision key %s", key)
-					}
-					fields = map[string]any{mapped: value}
-					if err := decodeFactorFields(fields, &c); err != nil {
+		}
+		if researchFields, ok := policy.Factor["research"].(map[string]any); ok {
+			for key, value := range researchFields {
+				switch key {
+				case "labels":
+					if err := decodeFactorFields(map[string]any{"Labels": value}, &c.Manifest); err != nil {
 						return nil, err
 					}
-				}
-			}
-			if researchFields, ok := policy.Factor["research"].(map[string]any); ok {
-				for key, value := range researchFields {
-					switch key {
-					case "labels":
-						if err := decodeFactorFields(map[string]any{"Labels": value}, &c.Manifest); err != nil {
-							return nil, err
-						}
-					case "label_wait_ms":
-						if err := decodeFactorFields(map[string]any{"LabelWaitMS": value}, &c); err != nil {
-							return nil, err
-						}
-					default:
-						return nil, fmt.Errorf("unknown factor research key %s", key)
+				case "label_wait_ms":
+					if err := decodeFactorFields(map[string]any{"LabelWaitMS": value}, &c); err != nil {
+						return nil, err
 					}
+				default:
+					return nil, fmt.Errorf("unknown factor research key %s", key)
 				}
 			}
-			if path, ok := policy.Factor["archive"].(string); ok && path != "" {
-				c.Chunks = []runner.Chunk{{Path: path}}
-			}
+		}
+		if path, ok := policy.Factor["archive"].(string); ok && path != "" {
+			c.Chunks = []runner.Chunk{{Path: path}}
 		}
 		c.Mode = mode
 		if c.Expressions != nil {
@@ -287,11 +158,6 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 			explicitDefinition := false
 			for key := range policy.Factor {
 				explicitDefinition = explicitDefinition || strings.EqualFold(key, "definition")
-			}
-			if imported, ok := policy.Factor["config"].(map[string]any); ok {
-				for key := range imported {
-					explicitDefinition = explicitDefinition || strings.EqualFold(key, "definition")
-				}
 			}
 			if !explicitDefinition {
 				c.Definition = ""
@@ -329,9 +195,6 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 		}
 		for chunkIndex := range c.Chunks {
 			field := fmt.Sprintf("run_policy[%d].chunks[%d].path", index, chunkIndex)
-			if _, ok := policy.Factor["config"]; ok {
-				field = fmt.Sprintf("run_policy[%d].config.Chunks[%d].Path", index, chunkIndex)
-			}
 			if _, ok := policy.Factor["archive"]; ok {
 				field = fmt.Sprintf("run_policy[%d].archive", index)
 			}
@@ -349,17 +212,6 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 				return nil, err
 			}
 			c.Execution.StorePath = path
-		}
-		if _, imported := policy.Factor["config"]; imported {
-			for field, path := range map[string]*string{"StorePath": &c.Execution.StorePath, "SenderLeaseDir": &c.Execution.SenderLeaseDir, "HistoryPath": &c.Execution.HistoryPath} {
-				if *path != "" && !filepath.IsAbs(*path) {
-					resolved, err := spec.ResolvePath(fmt.Sprintf("run_policy[%d].config.Execution.%s", index, field))
-					if err != nil {
-						return nil, err
-					}
-					*path = resolved
-				}
-			}
 		}
 		executionFields := make(map[string]any, len(u.Execution))
 		for key, value := range u.Execution {

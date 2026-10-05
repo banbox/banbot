@@ -20,7 +20,7 @@ func TestFactorYAMLEmptyLabelsDisablesResearch(t *testing.T) {
 	if err := os.WriteFile(path, body, 0600); err != nil {
 		t.Fatal(err)
 	}
-	spec, err := loadFactorRunSpec([]string{path}, "")
+	spec, err := loadFactorYAMLSpec([]string{path})
 	if err != nil {
 		t.Fatal(err)
 	}

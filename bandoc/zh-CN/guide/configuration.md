@@ -381,7 +381,7 @@ bt_in_live:
 | --- | --- |
 | data | namespace, page_rows, prefetch_rows, page_bytes, archive, max_records, pit_policy |
 | execution / accounts.&lt;name&gt; | mode, store, history, sender_lease_dir, live_provider, funding_policy, instruments, margin_rate, max_account_margin, max_virtual_gross, strategy_gross_limit |
-| run_policy[] | archive/chunks, snapshot, definition or expressions, combo, portfolio, decision, research, manifest, prices, funding_source, initial_nav, max_records, config |
+| run_policy[] | archive/chunks, snapshot, definition or expressions, combo, portfolio, decision, research, manifest, prices, funding_source, initial_nav, max_records |
 | run_policy[].decision | interval_ms, delay_ms, latency_ms, expiry_ms, max_pending |
 | run_policy[].snapshot | universe, sid_map, schemas, source_versions, adjustment_version, visibility_policy, grid_time, decision_time, replay_time |
 | run_policy[].expressions | schema_version, timeframe, bindings, params, lets, outputs, combine |

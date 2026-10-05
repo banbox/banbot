@@ -90,7 +90,7 @@ Rolling Backtesting is a more rigorous backtesting method that divides the data 
 
 ## Factor and cross-sectional engine
 
-Ordinary bot backtest dispatches by engine. bot factor research emits matured labels/diagnostics; factor backtest --mode weights|events is the dedicated replay entry. Weights is an approximate quantity book; mixed replay requires events, observable tick/event or 1m prices, instrument units and risk limits. Latest-value storage requires explicit data.pit_policy: static-approximation; strict PIT needs version archives/attested providers.
+`bot backtest` loads one `run_policy` and dispatches time-series, factor or mixed engines. Factor replay mode comes from `--mode weights|events`, then `execution.mode`, then `events`. Root `bot research` emits matured labels/diagnostics. Weights is an approximate quantity book; mixed replay requires events, observable tick/event or 1m prices, instrument units and risk limits. Latest-value storage requires explicit data.pit_policy: static-approximation; strict PIT needs version archives/attested providers.
 
 Factor JSON lines contain panels/decisions/diagnostics/summaries. Ordinary replay adds resolved.json and account-&lt;account&gt;/manifest.json plus event/posting Gob. Legacy orders.gob alone is not the factor report. Result.Unresolved retains labels beyond available history. Completion follows output closure and resource cleanup.
 

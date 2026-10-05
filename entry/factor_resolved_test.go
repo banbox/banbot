@@ -20,7 +20,7 @@ func TestResolvedFactorConfigurationReportsActualDefaultsAndOrigins(t *testing.T
 	if err := os.WriteFile(path, body, 0600); err != nil {
 		t.Fatal(err)
 	}
-	spec, err := loadFactorRunSpec([]string{path}, "")
+	spec, err := loadFactorYAMLSpec([]string{path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,9 +62,18 @@ func TestResolvedFactorConfigurationReportsActualDefaultsAndOrigins(t *testing.T
 	}
 }
 
-func TestResolvedImportedValuesOverrideCommonDefaultsWithoutInventingOrigins(t *testing.T) {
+func TestResolvedYAMLOverridesCommonDefaultsWithoutInventingOrigins(t *testing.T) {
 	dir, fixture := factorYAMLFixture(t)
-	spec, err := loadFactorRunSpec([]string{fixture}, "")
+	raw, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(dir, "override.yml")
+	body := strings.Replace(string(raw), "      archive: data.gob", "      archive: data.gob\n      initial_nav: 12345\n      manifest: {currency: USDT}\n      decision: {interval_ms: 300000}", 1)
+	if err := os.WriteFile(overlay, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := loadFactorYAMLSpec([]string{fixture, overlay})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,38 +81,7 @@ func TestResolvedImportedValuesOverrideCommonDefaultsWithoutInventingOrigins(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy := configs[0]
-	legacy.InitialNAV, legacy.DecisionInterval, legacy.Manifest.Currency = 12345, 300000, "USDT"
-	raw, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var imported map[string]any
-	if err := json.Unmarshal(raw, &imported); err != nil {
-		t.Fatal(err)
-	}
-	delete(imported, "MaxPending")
-	raw, err = json.Marshal(imported)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacyPath := filepath.Join(dir, "legacy.json")
-	if err := os.WriteFile(legacyPath, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	common := filepath.Join(dir, "common.yml")
-	if err := os.WriteFile(common, []byte("config_version: 2\nstake_currency: [USD]\nwallet_amounts: {USD: 10000}\nrun_timeframes: [1h]\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	spec, err = loadFactorRunSpec([]string{common}, legacyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	configs, err = buildFactorConfigs(spec, runner.Weights)
-	if err != nil {
-		t.Fatal(err)
-	}
-	output := filepath.Join(dir, "imported-resolved.json")
+	output := filepath.Join(dir, "resolved-overrides.json")
 	if err := writeResolvedFactorConfig(output, spec, configs); err != nil {
 		t.Fatal(err)
 	}
@@ -119,11 +97,11 @@ func TestResolvedImportedValuesOverrideCommonDefaultsWithoutInventingOrigins(t *
 	}
 	values := artifact.Strategies[0]
 	for key, want := range map[string]any{"initial_nav": float64(12345), "decision_interval_ms": float64(300000), "currency": "USDT"} {
-		if values[key].Value != want || values[key].Origin.Source != legacyPath+".yml" {
-			t.Fatalf("imported %s value/origin lost: %+v", key, values[key])
+		if values[key].Value != want || values[key].Origin.Source != overlay {
+			t.Fatalf("YAML %s value/origin lost: %+v", key, values[key])
 		}
 	}
 	if values["max_pending"].Value != float64(64) || values["max_pending"].Origin.Kind != "derived" {
-		t.Fatalf("omitted JSON field fabricated explicit origin: %+v", values["max_pending"])
+		t.Fatalf("omitted YAML field fabricated explicit origin: %+v", values["max_pending"])
 	}
 }

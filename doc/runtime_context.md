@@ -47,7 +47,7 @@ registry 首次接管已有 `exsymbol_q` catalog 时，新增逻辑 symbol 会�
 
 ## 3. 显式入口、inspection 与因子状态
 
-entry 的普通 backtest/trade 根据 RunSpec 的 engine 装配时序、因子或 mixed；Web/CLI 预检共享无资源的因子配置验证。runtimeplan.Inspect 创建局部 Core、Clock、Symbols 和 strat.State，收集需求时不安装或恢复包 globals。
+entry 的根命令 backtest/trade 加载同一 RunSpec，根据 run_policy 的 engine 装配时序、因子或 mixed。因子回测 mode 依次取 CLI、execution.mode、默认 events，mixed 要求 events。Web/CLI 预检共享无资源的因子配置验证。runtimeplan.Inspect 创建局部 Core、Clock、Symbols 和 strat.State，收集需求时不安装或恢复包 globals。
 
 Runtime 的可选 FactorState 通过 runner.CloneConfig 接管配置容器，不再 JSON 往返和手工恢复句柄。列表顺序、重复项、nil/空容器保留；Plan、ComputationGroup、PortfolioBuilder、HistoricalInput、ObserveBatch 保持借用身份。复制保留非法 NaN/Inf 拒绝，但不代替 runner.ValidateReplayConfig/ValidateLiveConfig。
 

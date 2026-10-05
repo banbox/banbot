@@ -169,6 +169,15 @@ func newRuntimeConfigCommand(name, help string, run FuncEntry, allowDeadlock boo
 }
 
 func newRuntimeConfigCommandContext(name, help string, run func(context.Context, *config.CmdArgs) *errs.Error, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
+	return newConfigCommandContext(name, help, func(ctx context.Context, args *config.CmdArgs) error {
+		if err := run(ctx, args); err != nil {
+			return err
+		}
+		return nil
+	}, allowDeadlock, binders...)
+}
+
+func newConfigCommandContext(name, help string, run func(context.Context, *config.CmdArgs) error, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
 	args := &config.CmdArgs{}
 	options := &runtimeCommandFlags{}
 	command := &cobra.Command{
@@ -176,6 +185,9 @@ func newRuntimeConfigCommandContext(name, help string, run func(context.Context,
 		Short: help,
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
+			if err := command.Context().Err(); err != nil {
+				return err
+			}
 			args.ExplicitFlags = explicitCommandFlags(command)
 			args.BTStrictSet = command.Flags().Changed("bt-strict")
 			args.NetDisable = options.netDisable

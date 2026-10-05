@@ -14,7 +14,6 @@
 | `run_policy[].factor.portfolio/decision/research` | `run_policy[].portfolio/decision/research` | 提升一级，内部 key 不改名 |
 | `run_policy[].factor.snapshot/manifest/prices/combo` | `run_policy[].snapshot/manifest/prices/combo` | 同上 |
 | `run_policy[].factor.funding_source/initial_nav/max_records` | `run_policy[].funding_source/initial_nav/max_records` | 标量直接放策略下 |
-| `run_policy[].factor.config` | `run_policy[].config` | 旧 runner JSON 的受控导入块，保留 JSON 字段契约 |
 | `execution.accounts.<账户名>.<字段>` | `accounts.<账户名>.<字段>` | 消除两处维护账户的问题；不移动原账户参数和凭据 |
 | 根 `execution` | 根 `execution` | 保留公共执行默认值，模式、持久化、provider 和风险限制属于相关设置 |
 | 根 `data` | 根 `data` | 保留公共数据身份、分页预算与历史可见性设置，不替代 database |
@@ -136,7 +135,7 @@ run_policy:
 
 - [浅层兼容边界](../config/shallow.go)、[统一模型与导出](../config/unified.go)、[原字段和合并集合](../config/types.go)
 - [来源和路径](../config/run_spec.go)、[只读加载与原子编辑](../config/migration.go)
-- [因子装配与 JSON 导入](../entry/factor_config.go)、[最终值来源](../entry/factor_resolved.go)、[Web 私有副本](../web/dev/api_dev.go)
+- [统一 YAML 因子装配](../entry/factor_config.go)、[最终值来源](../entry/factor_resolved.go)、[Web 私有副本](../web/dev/api_dev.go)
 - [v0.5 原模板及浅层回归](../config/shallow_test.go)、[entry 回放回归](../entry/factor_unified_test.go)、[Web 编辑与回测回归](../web/dev/config_editor_test.go)
 
 验证覆盖原 v0.5 模板不修改加载、只读文件、More 保留、别名冲突、根账户凭据与执行覆盖、来源和导出重载。配置及内存回放测试不等于真实数据库或交易所实盘验收。最终执行的测试、静态检查与文档校验随本次变更报告记录。

@@ -90,7 +90,7 @@ run_policy:
 
 ## 多因子与截面引擎
 
-普通 bot backtest 按 engine 装配。bot factor research 输出成熟标签和诊断；factor backtest --mode weights|events 提供因子专用入口。纯因子 weights 是近似数量账本，混合回放必须 events；events 需要 tick/event 或 1m 可观察价格、标准 instrument 单位及风险限制。最新值数据库需显式 data.pit_policy: static-approximation；严格 PIT 需要版本归档/受验证 provider。
+`bot backtest` 加载一份 `run_policy` 并调度时序、因子或混合引擎。因子回放模式依次取 `--mode weights|events`、`execution.mode`、默认 `events`。根命令 `bot research` 输出成熟标签和诊断。纯因子 weights 是近似数量账本，混合回放必须 events；events 需要 tick/event 或 1m 可观察价格、标准 instrument 单位及风险限制。最新值数据库需显式 data.pit_policy: static-approximation；严格 PIT 需要版本归档/受验证 provider。
 
 因子 JSON lines 输出 panel/decision/diagnostics/summary，普通回测另写 resolved.json 和 account-&lt;account&gt;/manifest.json、event/posting Gob。不能仅使用时序 orders.gob 判断因子结果；Result.Unresolved 保留超出数据尾部的标签。完成必须等待输出关闭与资源清理。
 

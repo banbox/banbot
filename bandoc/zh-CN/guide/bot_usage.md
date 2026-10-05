@@ -354,7 +354,9 @@ banbot tool:
 
 ## 多因子与截面引擎
 
-因子命令族包括 bot factor archive/research/backtest/trade 和表达式 validate/explain。普通 backtest/trade 也读取 engine: factor。backtest --mode weights|events 选择模拟方式；trade --dry-run 是历史 paper；真实 trade 需已验证 binding。--factor-config 兼容旧 JSON，保留原文件并写浅层 YAML，暂沿用历史 .v2.yml 文件后缀（配置无需版本标记）；路径按字段来源文件解析。
+`bot backtest` 和 `bot trade` 从同一 YAML `run_policy` 调度时序、因子或混合策略。因子回测的 `backtest --mode weights|events` 覆盖 `execution.mode`，两者均省略时默认 `events`；混合回放必须 `events`。因子/混合配置的 `trade --dry-run` 是历史 events 回放，纯时序实时模拟继续使用 `env: dry_run`。真实因子/混合交易可指定 `--live-provider`，且需要已验证的 binding。
+
+因子研究使用根命令 `bot research --config strategy.yml`，归档转换使用 `bot data archive`，独立表达式使用根命令 `bot validate --spec formula.yml` / `bot explain --spec formula.yml`。策略配置统一使用 YAML，路径按字段来源文件解析。各类引擎统一使用默认配置、`--datadir` 和 `--no-default` 规则。
 
 本页 bot tool bt_factor 是 orders.gob / strat.FactorMap 旧滚动筛选工具，与新 factor runner 不同。
 

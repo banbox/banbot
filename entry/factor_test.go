@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"github.com/banbox/banbot/factor"
-	"github.com/banbox/banbot/factor/research"
 	"github.com/banbox/banbot/factor/runner"
 	"github.com/banbox/banbot/orm"
 	"os"
@@ -26,7 +25,7 @@ func TestFactorArchiveCLIAndFreshRegistration(t *testing.T) {
 	root := NewRootCommand()
 	var out bytes.Buffer
 	root.SetOut(&out)
-	root.SetArgs([]string{"factor", "archive", "--input", input, "--out", path, "--max-records", "1"})
+	root.SetArgs([]string{"data", "archive", "--input", input, "--out", path, "--max-records", "1"})
 	if err = root.Execute(); err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +39,7 @@ func TestFactorArchiveCLIAndFreshRegistration(t *testing.T) {
 	}
 	for _, name := range []string{"research", "backtest", "trade"} {
 		fresh := NewRootCommand()
-		fresh.SetArgs([]string{"factor", name, "--help"})
+		fresh.SetArgs([]string{name, "--help"})
 		fresh.SetOut(&bytes.Buffer{})
 		if err = fresh.Execute(); err != nil {
 			t.Fatal(err)
@@ -48,44 +47,12 @@ func TestFactorArchiveCLIAndFreshRegistration(t *testing.T) {
 	}
 }
 func TestFactorResearchCLIRealArchiveStreamsValidJSON(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "data.gob")
-	store, _ := factor.NewVersionStore(100)
-	const hour int64 = 3600000
-	for bar := int64(1); bar <= 8; bar++ {
-		for sid := int32(1); sid <= 3; sid++ {
-			price := 100 + float64(sid)*float64(bar*bar)
-			for _, source := range []string{"kline", "tick"} {
-				at := bar * hour
-				freq, field := "1h", "close"
-				if source == "tick" {
-					at++
-					freq, field = "event", "price"
-				}
-				r := factor.VersionRecord{Series: orm.DataSeries{Source: source, Sid: sid, TimeMS: at - hour, EndMS: at, Closed: true, TimeFrame: freq, Values: map[string]any{field: price, "nullable": nil}}, EventTime: at, AvailableAt: at, IngestedAt: at, Revision: 1, SourceVersion: "v1"}
-				if err := store.Put(r); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
-	}
-	if _, err := store.Export(path); err != nil {
-		t.Fatal(err)
-	}
-	c := runner.Config{Chunks: []runner.Chunk{{Path: "data.gob", From: hour, To: 8*hour + 1}}, MaxRecords: 100, MaxPending: 8, DecisionInterval: hour, LatencyMS: 1, ExpiryMS: 100, Snapshot: factor.SnapshotSpec{Universe: factor.Universe{Version: "u", Investable: []int32{1, 2, 3}, Reference: []int32{1, 2, 3}, Tradable: []int32{1, 2, 3}, Evaluation: []int32{1, 2, 3}, Tracked: []int32{1, 2, 3}}, SIDMap: map[int32]string{1: "a", 2: "b", 3: "c"}, Schemas: map[string]string{"kline": "s", "tick": "s"}, SourceVersions: map[string]string{"kline": "v1", "tick": "v1"}, VisibilityPolicy: "available-at"}, Factor: research.MomentumVolConfig{Source: "kline", TimeFrame: "1h", Field: "close", Window: 2, DDOF: 1}, Manifest: research.ManifestSpec{Currency: "USD", CodeRevision: "test", Portfolio: research.PortfolioDefinition{K: 1, LongNotional: .5, ShortNotional: .5, Mode: factor.Full}, Labels: []research.LabelSpec{{Name: "1h", Kind: research.ExecutableReturn, Horizon: hour, PeriodsPerYear: 8760}}, Costs: research.CostSpec{FundingPolicy: "explicit-zero"}}, StrategyID: "s", AccountID: "a", InitialNAV: 10000, Prices: runner.PriceStream{Source: "tick", TimeFrame: "event", Field: "price"}}
-	raw, err := json.Marshal(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	configPath := filepath.Join(dir, "run.json")
-	if err = os.WriteFile(configPath, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
+	_, configPath := factorYAMLFixture(t)
 	cmd := NewRootCommand()
 	var out bytes.Buffer
 	cmd.SetOut(&out)
-	cmd.SetArgs([]string{"factor", "research", "--factor-config", configPath})
-	if err = cmd.Execute(); err != nil {
+	cmd.SetArgs([]string{"research", "--no-default", "--config", configPath})
+	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
 	lines := bytes.Split(bytes.TrimSpace(out.Bytes()), []byte{'\n'})
@@ -98,7 +65,7 @@ func TestFactorResearchCLIRealArchiveStreamsValidJSON(t *testing.T) {
 		}
 	}
 	var result runner.Result
-	if err = json.Unmarshal(lines[len(lines)-1], &result); err != nil {
+	if err := json.Unmarshal(lines[len(lines)-1], &result); err != nil {
 		t.Fatal(err)
 	}
 	if result.Decisions != 8 || result.Executions == 0 || result.StrategyHash == "" || len(result.Manifest.Snapshots) != 1 {

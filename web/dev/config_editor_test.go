@@ -267,12 +267,6 @@ run_policy:
     archive: ../history.jsonl
     chunks:
       - path: ../chunk.jsonl
-    config:
-      Chunks:
-        - Path: ../imported.jsonl
-      Execution:
-        StorePath: state.db
-        SenderLeaseDir: sender-locks
   - name: Legacy
     archive: user-strategy-value
     config: {path: user-value}
@@ -289,7 +283,6 @@ run_policy:
 	execution := fields["execution"].(map[string]any)
 	account := fields["accounts"].(map[string]any)["shared"].(map[string]any)
 	policy := fields["run_policy"].([]any)[0].(map[string]any)
-	imported := policy["config"].(map[string]any)
 	checks := []struct {
 		value    any
 		relative string
@@ -300,9 +293,6 @@ run_policy:
 		{account["sender_lease_dir"], "account-locks"},
 		{policy["archive"], "history.jsonl"},
 		{policy["chunks"].([]any)[0].(map[string]any)["path"], "chunk.jsonl"},
-		{imported["Chunks"].([]any)[0].(map[string]any)["Path"], "imported.jsonl"},
-		{imported["Execution"].(map[string]any)["StorePath"], "layers/state.db"},
-		{imported["Execution"].(map[string]any)["SenderLeaseDir"], "layers/sender-locks"},
 	}
 	for _, check := range checks {
 		if check.value != filepath.Join(server.DataDir(), filepath.FromSlash(check.relative)) {

@@ -3,6 +3,8 @@
 
 This page covers factor, factor/expr, factor/research and factor/runner. See [Multi-factor strategies](../guide/factor.md) for configuration and workflows.
 
+CLI startup is unified: root `backtest` / `trade` dispatch factor, time-series or mixed policies from one YAML `RunSpec`. Root `research`, `validate --spec`, `explain --spec` and `data archive` provide research, standalone compilation and archive conversion. Embedding APIs below retain their existing contracts.
+
 | Package | Components | Responsibility |
 | --- | --- | --- |
 | factor | Plan, Session, Batch, VersionStore, Snapshot, Universe, RoundBarrier, TargetPortfolio | Visibility snapshots and native computation |

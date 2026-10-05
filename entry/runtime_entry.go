@@ -248,6 +248,19 @@ func (s *explicitEntrySession) newRuntime(snapshot *config.Snapshot, mode string
 }
 
 func (s *explicitEntrySession) newStorageRuntime(snapshot *config.Snapshot, mode string, startAt int64) (*runtime.Runtime, *errs.Error) {
+	if s == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "runtime session is not configured")
+	}
+	return s.newStorageRuntimeContext(s.ctx, snapshot, mode, startAt)
+}
+
+func (s *explicitEntrySession) newStorageRuntimeContext(ctx context.Context, snapshot *config.Snapshot, mode string, startAt int64) (*runtime.Runtime, *errs.Error) {
+	if ctx == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "runtime context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errs.New(core.ErrRunTime, err)
+	}
 	if s == nil || s.process == nil || snapshot == nil || snapshot.View() == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "runtime session is not configured")
 	}
@@ -281,7 +294,7 @@ func (s *explicitEntrySession) newStorageRuntime(snapshot *config.Snapshot, mode
 		legacy = &runtime.LegacyExecutionOptions{VenueSessionIdentity: exchangeName + ":" + cfg.Env, SenderLeaseDir: leaseDir}
 	}
 	rt, err := s.process.NewRuntime(runtime.Options{
-		Context:         s.ctx,
+		Context:         ctx,
 		Logger:          s.logger,
 		Config:          cfg,
 		DataDir:         snapshot.DataDir,
@@ -355,6 +368,10 @@ func runExplicitBackTestContext(ctx context.Context, args *config.CmdArgs) *errs
 	if specErr != nil {
 		return specErr
 	}
+	return runExplicitBackTestSpecContext(ctx, args, spec)
+}
+
+func runExplicitBackTestSpecContext(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec) *errs.Error {
 	engines := spec.Engines()
 	if slices.Contains(engines, config.EngineFactor) {
 		return unifiedFactorBacktestContext(ctx, args, spec)
@@ -487,12 +504,16 @@ func runExplicitTradeContext(ctx context.Context, args *config.CmdArgs, startup 
 	if err != nil {
 		return err
 	}
+	return runExplicitTradeSpecContext(ctx, args, spec, startup)
+}
+
+func runExplicitTradeSpecContext(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec, startup live.CryptoTraderStartupFunc) *errs.Error {
 	if slices.Contains(spec.Engines(), config.EngineFactor) {
 		configs, buildErr := buildFactorConfigs(spec, runner.Trade)
 		if buildErr != nil {
 			return errs.New(core.ErrBadConfig, buildErr)
 		}
-		if runErr := runFactorLiveSpec(ctx, spec, configs, "", os.Stdout); runErr != nil {
+		if runErr := runFactorLiveSpecWithArgs(ctx, args, spec, configs, "", os.Stdout, startup); runErr != nil {
 			return errs.New(core.ErrRunTime, runErr)
 		}
 		return nil

@@ -146,6 +146,8 @@ func TestAdvancedOverridesStrictTypesAndAccountReferences(t *testing.T) {
 		"run_policy: [{name: CS, engine: factor, factor: {portfolio: {mode: wrong}}}]",
 		"run_policy: [{name: CS, engine: factor, factor: {chunks: [{path: x, unknown: 1}]}}]",
 		"run_policy: [{name: CS, engine: factor, factor: {snapshot: {typo: 1}}}]",
+		"run_policy: [{name: CS, engine: factor, config: {Definition: Custom}}]",
+		"run_policy: [{name: CS, engine: factor, factor: {config: {Definition: Custom}}}]",
 	} {
 		if _, err := ParseUnifiedYAML([]byte("config_version: 2\n"+block+"\n"), "bad.yml"); err == nil {
 			t.Fatalf("accepted %s", block)
@@ -154,7 +156,6 @@ func TestAdvancedOverridesStrictTypesAndAccountReferences(t *testing.T) {
 	for _, block := range []string{
 		"data: {archive: x, page_rows: 100, prefetch_rows: 50}",
 		"accounts: {a: {}}\nexecution: {accounts: {a: {margin_rate: '0.10000000000000000001'}}}",
-		"run_policy: [{name: CS, engine: factor, factor: {config: {Definition: Custom, Chunks: [{Path: old-relative.gob}]}}}]",
 		"run_policy: [{name: TS, custom_open_parameter: {any: [null, false]}}]",
 	} {
 		if _, err := ParseUnifiedYAML([]byte("config_version: 2\n"+block+"\n"), "valid.yml"); err != nil {
@@ -166,5 +167,34 @@ func TestAdvancedOverridesStrictTypesAndAccountReferences(t *testing.T) {
 	}
 	if _, err := ParseDurationOverride("-1ms"); err == nil {
 		t.Fatal("negative duration accepted")
+	}
+}
+
+func TestRunSpecRejectsStandaloneRunnerConfigBeforeMergingDefaults(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yml"), []byte("run_policy: [{name: momentum-vol, engine: factor}]\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	legacy := []byte(`{"Chunks": [{"Path": "archive.gob"}], "StrategyID": "old-factor"}`)
+	path := filepath.Join(dir, "runner.json")
+	if err := os.WriteFile(path, legacy, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		name string
+		args CmdArgs
+		want string
+	}{
+		{"file", CmdArgs{DataDir: dir, Configs: ArrString{path}}, "configuration must use YAML"},
+		{"inline", CmdArgs{DataDir: dir, ConfigData: string(legacy)}, "not a unified YAML configuration field"},
+		{"minimal-inline", CmdArgs{DataDir: dir, ConfigData: `{"Definition":"momentum-vol","Mode":"weights"}`}, "not a unified YAML configuration field"},
+		{"lowercase-inline", CmdArgs{DataDir: dir, ConfigData: `{"chunks":[],"snapshot":{}}`}, "not a unified YAML configuration field"},
+		{"yaml-runner-inline", CmdArgs{DataDir: dir, ConfigData: "mOdE: weights\n"}, "not a unified YAML configuration field"},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			if _, err := LoadRunSpec(&item.args, false); err == nil || !strings.Contains(err.Error(), item.want) {
+				t.Fatalf("old runner config silently used default strategies: %v", err)
+			}
+		})
 	}
 }
