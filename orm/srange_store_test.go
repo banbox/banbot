@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type srangeSnapshot struct {
@@ -429,6 +430,7 @@ func (r *staleCoveredRows) CommandTag() pgconn.CommandTag                { retur
 func (r *staleCoveredRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *staleCoveredRows) RawValues() [][]byte                          { return nil }
 func (r *staleCoveredRows) Conn() *pgx.Conn                              { return nil }
+func (r *staleCoveredRows) TypeMap() *pgtype.Map                         { return nil }
 func (r *staleCoveredRows) Values() ([]any, error)                       { return []any{r.startMS, r.stopMS, true}, nil }
 
 func (r *staleCoveredRows) Next() bool {

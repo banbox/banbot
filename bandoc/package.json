@@ -2,6 +2,9 @@
   "devDependencies": {
     "vitepress": "^1.6.4"
   },
+  "overrides": {
+    "vite": "^6.4.3"
+  },
   "scripts": {
     "dev": "vitepress dev",
     "build": "vitepress build",

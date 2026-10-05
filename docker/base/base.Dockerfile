@@ -1,4 +1,4 @@
-FROM golang:1.23
+FROM golang:1.26.8
 
 WORKDIR /ban
 
@@ -10,4 +10,3 @@ RUN go get -u github.com/banbox/banbot && \
     go mod download && \
     go build -o ../bot && \
     rm -f ../bot
-

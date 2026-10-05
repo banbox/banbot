@@ -17,6 +17,7 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type visibilityDBStub struct {
@@ -1465,6 +1466,7 @@ func (r *interfaceRows) CommandTag() pgconn.CommandTag {
 func (r *interfaceRows) FieldDescriptions() []pgconn.FieldDescription { return r.descriptions }
 func (r *interfaceRows) RawValues() [][]byte                          { return nil }
 func (r *interfaceRows) Conn() *pgx.Conn                              { return nil }
+func (r *interfaceRows) TypeMap() *pgtype.Map                         { return nil }
 func (r *interfaceRows) Values() ([]any, error) {
 	if r.valuesCalls != nil {
 		*r.valuesCalls++
@@ -1504,6 +1506,7 @@ func (r *rewriteSnapshotRows) CommandTag() pgconn.CommandTag                { re
 func (r *rewriteSnapshotRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *rewriteSnapshotRows) RawValues() [][]byte                          { return nil }
 func (r *rewriteSnapshotRows) Conn() *pgx.Conn                              { return nil }
+func (r *rewriteSnapshotRows) TypeMap() *pgtype.Map                         { return nil }
 func (r *rewriteSnapshotRows) Values() ([]any, error) {
 	item := r.items[r.idx]
 	return []any{int32(item[0]), item[1]}, nil

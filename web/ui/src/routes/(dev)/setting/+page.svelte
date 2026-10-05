@@ -194,7 +194,7 @@
     }
   }
 
-  async function switchLanguage(lang: string) {
+  async function switchLanguage(lang: (typeof locales)[number]) {
     if (lang === selectedLang) return;
     selectedLang = lang;
     const path = page.url.pathname || '/';
