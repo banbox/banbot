@@ -26,10 +26,15 @@
   import { pagination, orderCard } from '$lib/Snippets.svelte';
   import {getFirstValid, fmtNumber} from "$lib/common";
 
+  import type { UnifiedBacktestReport } from '$lib/dev/types';
+  import UnifiedReport from '$lib/results/UnifiedReport.svelte';
+  import { readUnifiedReport } from '$lib/results/report';
+
   let id = $state('');
   let btPath = $state('');
   let detail = $state<BacktestDetail | null>(null);
-  let unified = $state<{Status: string; Errors?: string[]; Results: Record<string, unknown>[]} | null>(null);
+  let unified = $state<UnifiedBacktestReport | null>(null);
+  let invalidUnified = $state<unknown>(null);
   let activeTab = $state('overview');
   let theme: Extension = oneDark;
   let configText = $state('');
@@ -96,7 +101,7 @@
   onMount(async () => {
     id = page.url.searchParams.get('id') || '';
     await loadDetail();
-    if(task?.status !== 3 && !unified) {
+    if(task?.status !== 3 && !unified && !invalidUnified) {
       setActiveTab('logs');
     }
     if(activeTab === 'strat_code') {
@@ -113,12 +118,14 @@
     console.log('load task detail', rsp);
     btPath = rsp.path;
     detail = rsp.detail;
-    unified = rsp.unified ?? null;
+    unified = readUnifiedReport(rsp.unified);
+    invalidUnified = rsp.unified && !unified ? rsp.unified : null;
+    if (invalidUnified) alerts.error(m.result_invalid_report());
     task = rsp.task;
     exsMap = rsp.exsMap;
     if(detail) {
       odNums = detail.plots.odNum;
-    }else if (unified) {
+    }else if (unified || invalidUnified) {
       odNums = [];
       activeTab = 'overview';
     }else{
@@ -463,7 +470,7 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
   // 定义导航菜单项
   let navItems = $derived.by(() => {
     const items = []
-    if (unified) {
+    if ((unified || invalidUnified) && !detail) {
       return [
         { id: 'overview', label: m.overview(), icon: 'home' },
         { id: 'config', label: m.configuration(), icon: 'config' },
@@ -611,18 +618,10 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
         </div>
       </div>
       {#if activeTab === 'overview' && unified}
-        <div class="card bg-base-200">
-          <div class="card-body">
-            <h2 class="card-title">{m.overview()} <span class="badge" class:badge-success={unified.Status === 'complete'} class:badge-error={unified.Status !== 'complete'}>{unified.Status}</span></h2>
-            {#if unified.Errors?.length}
-              <div role="alert" class="alert alert-error"><pre class="whitespace-pre-wrap">{unified.Errors.join('\n')}</pre></div>
-            {/if}
-            {#each unified.Results as result}
-              <h3 class="font-semibold">{String(result.StrategyID ?? '')} · {String(result.Engine ?? 'factor')} · {String(result.AccountID ?? '')}</h3>
-              <pre class="overflow-auto max-h-[60vh] rounded-box bg-base-100 p-4 text-sm">{JSON.stringify(result, null, 2)}</pre>
-            {/each}
-          </div>
-        </div>
+        <UnifiedReport report={unified} />
+      {:else if activeTab === 'overview' && invalidUnified}
+        <div role="alert" class="alert alert-error">{m.result_invalid_report()}</div>
+        <pre class="overflow-auto max-h-[60vh] rounded-box bg-base-100 p-4 text-sm">{JSON.stringify(invalidUnified, null, 2)}</pre>
       {:else if activeTab === 'overview' && detail}
         {#if task?.status == 3}
         <!-- 重要统计信息 -->

@@ -54,6 +54,10 @@ func decodeFactorFields(fields map[string]any, target any) error {
 // buildFactorConfigs derives ordinary defaults once from the single policy
 // list. Each runner receives a private config and account budget.
 func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config, error) {
+	return buildFactorConfigsWithArchiveInspection(spec, mode, true)
+}
+
+func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.Mode, inspectArchive bool) ([]runner.Config, error) {
 	u := spec.Config()
 	var result []runner.Config
 	identities := map[string]bool{}
@@ -270,11 +274,11 @@ func buildFactorConfigs(spec *config.RunSpec, mode runner.Mode) ([]runner.Config
 		if pit, ok := u.Data["pit_policy"].(string); ok && len(c.Chunks) > 0 && pit != "available-at" && pit != "strict" {
 			return nil, fmt.Errorf("data.pit_policy: unsupported archive visibility policy %q", pit)
 		}
-		if mode != runner.Trade && len(c.Chunks) > 0 {
+		if mode != runner.Trade && len(c.Chunks) > 0 && inspectArchive {
 			if err := deriveArchiveIdentity(&c); err != nil {
 				return nil, err
 			}
-		} else if mode != runner.Trade {
+		} else if mode != runner.Trade && len(c.Chunks) == 0 {
 			if err := preflightFactorStorageConfig(spec, &c); err != nil {
 				return nil, err
 			}

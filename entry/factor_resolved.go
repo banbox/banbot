@@ -6,16 +6,32 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/factor/runner"
+	"github.com/banbox/banbot/web/dev"
 )
 
 // Resolved values are a separate output: user YAML remains concise, and this
 // allowlist cannot accidentally serialize credentials or runtime resources.
-type resolvedFactorValue struct {
-	Value  any                `json:"value"`
-	Origin config.FieldOrigin `json:"origin"`
-}
+type resolvedFactorValue = dev.ResolvedValue
 
 func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runner.Config) error {
+	strategies, err := resolvedFactorValues(spec, configs)
+	if err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(struct {
+		Version    int                              `json:"version"`
+		Strategies []map[string]resolvedFactorValue `json:"strategies"`
+	}{1, strategies}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := config.WriteConfigAtomic(path, nil, append(body, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+func resolvedFactorValues(spec *config.RunSpec, configs []runner.Config) ([]map[string]resolvedFactorValue, error) {
 	u := spec.Config()
 	accountCapital, declaredCapital := map[string]float64{}, map[string]float64{}
 	for _, c := range configs {
@@ -31,7 +47,7 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 			continue
 		}
 		if position >= len(configs) {
-			return fmt.Errorf("resolved factor configuration does not match RunSpec")
+			return nil, fmt.Errorf("resolved factor configuration does not match RunSpec")
 		}
 		c := configs[position]
 		position++
@@ -63,7 +79,7 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 		}
 		values := map[string]resolvedFactorValue{}
 		set := func(key string, value any, fallback string, fields ...string) {
-			values[key] = resolvedFactorValue{value, origin(fallback, fields...)}
+			values[key] = resolvedFactorValue{Value: value, Origin: origin(fallback, fields...)}
 		}
 		set("strategy_id", c.StrategyID, "registered strategy name", prefix+"id", prefix+"name")
 		set("account_id", c.AccountID, "configured default trading account", prefix+"account")
@@ -72,7 +88,7 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 			set("expressions", c.Expressions, "declarative factor expressions", prefix+"expressions")
 			plan, combo, err := runner.CompileDefinition(c)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			set("factor_plan_hash", plan.Hash(), "compiled expression semantics")
 			set("combine", combo, "resolved expression combination", prefix+"combo", prefix+"expressions.combine")
@@ -104,17 +120,7 @@ func writeResolvedFactorConfig(path string, spec *config.RunSpec, configs []runn
 		strategies = append(strategies, values)
 	}
 	if position != len(configs) {
-		return fmt.Errorf("resolved factor configuration has undeclared strategies")
+		return nil, fmt.Errorf("resolved factor configuration has undeclared strategies")
 	}
-	body, err := json.MarshalIndent(struct {
-		Version    int                              `json:"version"`
-		Strategies []map[string]resolvedFactorValue `json:"strategies"`
-	}{1, strategies}, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := config.WriteConfigAtomic(path, nil, append(body, '\n')); err != nil {
-		return err
-	}
-	return nil
+	return strategies, nil
 }

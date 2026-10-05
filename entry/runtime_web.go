@@ -72,6 +72,7 @@ func newDevWebServer(args *dev.CmdArgs) (*dev.DevServer, func(), error) {
 		RuntimeFor:        runtimeFor,
 		Maintenance:       devMaintenanceRunner(exchangeFor),
 		BacktestPreflight: ValidateBacktestRunSpec,
+		InspectBacktest:   InspectBacktestRunSpec,
 	})
 	if err != nil {
 		closeExchanges()

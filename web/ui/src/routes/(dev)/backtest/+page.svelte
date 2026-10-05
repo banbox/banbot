@@ -15,6 +15,8 @@
   import {modals} from "$lib/stores/modals";
   import type {StrVal} from "$lib/common";
 
+  import { taskReport, reportIdentity, legacyMetric } from '$lib/results/report';
+
   let tasks = $state<BtTask[]>([]);
   let strats = $state<StrVal[]>([]);
   let periods = $state<string[]>([]);
@@ -125,7 +127,7 @@
   function taskTooltip(task: BtTask){
     var base = `ID: ${task.id}
 Path: $/backtest/${task.path}`
-    if(task.status === 3){
+    if(task.status === 3 && !taskReport(task).unified && !task.engines?.includes('factor')){
       return base + `
 ${m.max_open_orders()}: ${task.maxOpenOrders || '-'}
 ${m.bar_num()}: ${task.barNum || '-'}
@@ -135,7 +137,7 @@ ${m.show_drawdown()}: ${task.showDrawDownPct?.toFixed(2) || '-'}%
 ${m.tot_fee()}: ${task.totFee?.toFixed(2) || '-'}`
     }else if(task.status === 4){
       return base + `
-Error: ${task.info}`
+Error: ${taskReport(task).report?.Errors?.join('\n') || task.info}`
     }
     return base
   }
@@ -312,6 +314,11 @@ Error: ${task.info}`
   <!-- 结果列表 -->
   <div class="grid grid-cols-3 gap-6 mb-6">
     {#each tasks as task, tidx}
+      {@const metadata = taskReport(task)}
+      {@const identity = metadata.report ? reportIdentity(metadata.report) : null}
+      {@const isUnified = metadata.unified || !!task.engines?.includes('factor')}
+      {@const engines = identity?.engines || task.engines?.join(', ') || 'time_series'}
+      {@const executionMode = identity?.modes || task.executionMode || '-'}
       <div class="card bg-base-100 shadow hover:shadow-lg transition-shadow duration-200 cursor-pointer relative overflow-hidden {isTaskSelected(task) ? 'ring-2 ring-primary' : ''}"
            onclick={(e) => isMultiSelect ? toggleTaskSelection(task, e) : clickTask(task)} 
            onmouseenter={() => hoveredCard = tidx}
@@ -338,7 +345,7 @@ Error: ${task.info}`
               <div class="text-sm opacity-60">{task.periods}</div>
             </div>
             {#if task.status === 3}
-              <div class="text-2xl font-bold">{task.profitRate.toFixed(1)}%</div>
+              <div class="text-2xl font-bold">{legacyMetric(task.profitRate, isUnified, 1, '%')}</div>
             {:else if task.status === 4}
               <Icon name="alert" class="size-6 text-red-700"/>
             {:else}
@@ -353,41 +360,59 @@ Error: ${task.info}`
           </div>
 
           <!-- 第二行 -->
+          <div class="flex flex-wrap gap-2 mb-3 text-xs">
+            <span class="badge badge-outline">{m.result_engine()}: {engines}</span>
+            {#if executionMode !== '-'}<span class="badge badge-outline">{m.result_execution_mode()}: {executionMode}</span>{/if}
+            {#if identity}<span class="badge badge-outline">{m.result_account_id()}: {identity.accounts}</span>{/if}
+          </div>
+          {#if metadata.report}
+            <div class="space-y-1 mb-3 text-xs">
+              {#each metadata.report.Results || [] as result, resultIndex (resultIndex)}
+                {#if result.Engine === 'factor'}
+                  <div class="flex flex-wrap gap-x-3 gap-y-1">
+                    <span class="font-semibold">{result.StrategyID}</span>
+                    <span>{m.result_decisions()}: {result.Decisions}</span>
+                    <span class:text-error={result.Unresolved > 0}>{m.result_unresolved()}: {result.Unresolved}</span>
+                  </div>
+                {/if}
+              {/each}
+            </div>
+          {/if}
           <div class="flex justify-between items-center mb-5">
             <div class="text-sm opacity-60">
               {fmtDateStr(task.startAt, 'YYYYMMDD')} - {fmtDateStr(task.stopAt, 'YYYYMMDD')}
             </div>
             <div class="text-sm opacity-60">{showPairs(task.pairs)}</div>
             {#if task.status === 3}
-              <div class="text-sm opacity-80">{m.max_drawdown_short()}: {task.maxDrawdown.toFixed(1)}%</div>
+              <div class="text-sm opacity-80">{m.max_drawdown_short()}: {legacyMetric(task.maxDrawdown, isUnified, 1, '%')}</div>
             {:else if task.status === 4}
-              <div class="text-sm text-error">{task.info}</div>
+              <div class="text-sm text-error">{metadata.report?.Errors?.join('; ') || task.info || metadata.report?.Status || '-'}</div>
             {/if}
           </div>
         
           <div class="grid grid-cols-4 gap-4 mb-4">
             <div>
               <div class="text-xs opacity-60 mb-1">{m.sharpe_ratio()}</div>
-              <div class="text-base font-medium">{task.sharpe.toFixed(2)}</div>
+              <div class="text-base font-medium">{legacyMetric(task.sharpe, isUnified, 2)}</div>
             </div>
             <div>
               <div class="text-xs opacity-60 mb-1">{m.sortino_ratio()}</div>
-              <div class="text-base font-medium">{task.sortinoRatio ? task.sortinoRatio.toFixed(2) : '-'}</div>
+              <div class="text-base font-medium">{legacyMetric(task.sortinoRatio, isUnified, 2)}</div>
             </div>
             <div>
               <div class="text-xs opacity-60 mb-1">{m.order_num()}</div>
-              <div class="text-base font-medium">{task.orderNum}</div>
+              <div class="text-base font-medium">{legacyMetric(task.orderNum, isUnified)}</div>
             </div>
             <div>
               <div class="text-xs opacity-60 mb-1">{m.win_rate()}</div>
-              <div class="text-base font-medium">{task.winRate.toFixed(1)}%</div>
+              <div class="text-base font-medium">{legacyMetric(task.winRate, isUnified, 1, '%')}</div>
             </div>
           </div>
 
           <div class="grid grid-cols-3 gap-2 text-xs opacity-60 pt-3 border-t border-base-200">
-            <div>{m.leverage()}: {task.leverage}x</div>
-            <div>{m.init_amount()}: {task.walletAmount}</div>
-            <div>{m.stake_amount()}: {task.stakeAmount}</div>
+            <div>{m.leverage()}: {legacyMetric(task.leverage, isUnified, undefined, 'x')}</div>
+            <div>{m.init_amount()}: {legacyMetric(task.walletAmount, isUnified)}</div>
+            <div>{m.stake_amount()}: {legacyMetric(task.stakeAmount, isUnified)}</div>
           </div>
 
           <div class="flex justify-between items-center text-xs opacity-60 pt-3 border-t border-base-200">

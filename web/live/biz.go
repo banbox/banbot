@@ -57,6 +57,7 @@ func newAPIHandlers(deps *biz.RuntimeDeps) *apiHandlers {
 }
 
 func (h *apiHandlers) regApiBiz(api fiber.Router) {
+	h.regApiSeries(api)
 	api.Get("/version", h.getVersion)
 	api.Get("/balance", h.getBalance)
 	api.Post("/refresh_wallet", h.postRefreshWallet)

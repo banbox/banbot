@@ -16,16 +16,27 @@ import (
 // market-derived execution units until resource assembly. Explicit units are
 // checked even when requireExecutionMetadata is false.
 func ValidateReplayConfig(c Config, requireExecutionMetadata bool) error {
+	return validateReplayConfig(c, requireExecutionMetadata, true)
+}
+
+// ValidateStaticConfig checks a draft without inspecting inputs. Archive-derived
+// price identities and ranges remain unchecked until the ordinary preflight.
+func ValidateStaticConfig(c Config) error {
+	return validateReplayConfig(c, false, false)
+}
+
+func validateReplayConfig(c Config, requireExecutionMetadata, checkInputs bool) error {
 	if c.Mode != Research && c.Mode != Weights && c.Mode != Events && c.Mode != Trade {
 		return errors.New("runner: unsupported mode")
 	}
-	if c.MaxRecords <= 0 || c.MaxPending <= 0 || c.DecisionInterval <= 0 || c.DecisionDelayMS < 0 || c.LatencyMS <= 0 || c.ExpiryMS <= c.LatencyMS || c.LabelWaitMS < 0 || c.Prices.Source == "" || c.Prices.TimeFrame == "" || c.Prices.Field == "" {
+	if c.MaxRecords <= 0 || c.MaxPending <= 0 || c.DecisionInterval <= 0 || c.DecisionDelayMS < 0 || c.LatencyMS <= 0 || c.ExpiryMS <= c.LatencyMS || c.LabelWaitMS < 0 || checkInputs && (c.Prices.Source == "" || c.Prices.TimeFrame == "" || c.Prices.Field == "") {
 		return errors.New("runner: incomplete bounded replay/price configuration")
 	}
-	if (c.Mode == Events || c.Mode == Trade) && c.Prices.TimeFrame != "event" && c.Prices.TimeFrame != "1m" {
+	if (c.Mode == Events || c.Mode == Trade) && c.Prices.TimeFrame != "" && c.Prices.TimeFrame != "event" && c.Prices.TimeFrame != "1m" {
 		return errors.New("runner: events/trade require tick or 1m observable prices")
 	}
-	if c.Manifest.Costs.FundingPolicy != "explicit-zero" && c.Manifest.Costs.FundingPolicy != "required-stream" {
+	archiveFundingPending := !checkInputs && len(c.Chunks) > 0 && c.Manifest.Costs.FundingPolicy == ""
+	if !archiveFundingPending && c.Manifest.Costs.FundingPolicy != "explicit-zero" && c.Manifest.Costs.FundingPolicy != "required-stream" {
 		return errors.New("runner: funding must be required-stream or explicit-zero")
 	}
 	if c.Manifest.Costs.FundingPolicy == "required-stream" && c.FundingSource == "" {
@@ -67,6 +78,9 @@ func ValidateReplayConfig(c Config, requireExecutionMetadata bool) error {
 	}
 	lastTo := int64(0)
 	for _, chunk := range ranges {
+		if !checkInputs && chunk.From == 0 && chunk.To == 0 {
+			continue
+		}
 		if chunk.From <= lastTo || chunk.To < chunk.From {
 			return errors.New("runner: chunks must have strictly ordered non-overlapping replay ranges")
 		}

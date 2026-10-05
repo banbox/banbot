@@ -23,6 +23,19 @@ func RegApiKline(api fiber.Router) {
 	api.Post("/calc_ind", postCalcInd)
 }
 
+// RegApiSeries registers only the read-only data inspection routes.
+// The caller owns authentication and account authorization.
+func RegApiSeries(api fiber.Router) {
+	api.Get("/data_sources", getDataSources)
+	api.Get("/series", getSeries)
+}
+
+func RegApiSeriesWithRuntimeDeps(api fiber.Router, deps data.RuntimeDeps) {
+	h := klineHandlers{deps: &deps}
+	api.Get("/data_sources", h.getDataSources)
+	api.Get("/series", h.getSeries)
+}
+
 // RegApiKlineWithRuntimeDeps binds the read-only K-line routes to one runtime.
 // Indicator routes are pure and share the existing implementation.
 func RegApiKlineWithRuntimeDeps(api fiber.Router, deps data.RuntimeDeps) {

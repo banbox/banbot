@@ -1,6 +1,11 @@
 export interface BtTask {
   id: number; // 任务唯一标识
   mode: string; // 模式
+  engines?: string[];
+  executionMode?: string;
+  unified?: boolean;
+  run?: unknown;
+  reportPaths?: string[];
   args: string; // 参数
   config: string; // 配置
   path: string; // 路径
@@ -33,4 +38,96 @@ export interface BtTask {
   stakeAmount?: number;
   info?: string;
   note?: string;
+}
+
+// Version 1 run.json uses Go's exported field names (PascalCase).
+export interface FactorNumeric {
+  Value: number | null;
+  Validity: 'valid' | 'missing' | 'null' | 'not-numeric' | 'non-finite' | 'warmup';
+}
+
+export interface FactorSeriesSummary {
+  Sections: number;
+  MeanIC: number;
+  MeanRankIC: number;
+  ICIR: FactorNumeric;
+  RankICIR: FactorNumeric;
+  QuintileMean: FactorNumeric[];
+}
+
+export interface ResultBook {
+  Cash: number;
+  NAV: number;
+  Fees: number;
+  Slippage: number;
+  Funding: number;
+  Turnover: number;
+  Quantities: Record<string, number> | null;
+}
+
+export interface ResultManifest {
+  Currency: string;
+  CodeRevision: string;
+  FactorPlanHash: string;
+  UniverseVersion: string;
+  VisibilityPolicy: string;
+  ExecutionMode: string;
+  LatencyAssumption: string;
+  StaticUniverse: boolean;
+  Combo: { Method: string; Columns: string[] | null; Weights: Record<string, number> | null };
+  Portfolio: { Builder: string; K: number; LongNotional: number; ShortNotional: number; Mode: string };
+  Labels: { Name: string; Kind: string; Horizon: number; Overlapping: boolean; PeriodsPerYear: number }[] | null;
+  Parameters: Record<string, number> | null;
+  Costs: { FeeRate: number; SlippageRate: number; FundingPolicy: string };
+  Snapshots: {
+    ID: string; ContentDigest: string; AdjustmentVersion: string;
+    Schemas: Record<string, string> | null;
+    SourceVersions: Record<string, string> | null;
+    Revisions: Record<string, number> | null;
+  }[] | null;
+}
+
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+export interface UnifiedResult {
+  Engine: string;
+  StrategyID: string;
+  AccountID: string;
+  TargetsAccepted: number;
+  Fills: number;
+  AccountFills: number;
+  Account: {
+    AccountSettledCash: string;
+    UnassignedCash: string;
+    RiskFrozen: boolean;
+    SyntheticStrategyCash: Record<string, string> | null;
+    PnLReclassification: string;
+    Lots: JsonValue[] | null;
+    ActualPositions: JsonValue[] | null;
+    ExternalPositions: JsonValue[] | null;
+    Orders: JsonValue[] | null;
+    Checkpoint: number;
+  } | null;
+  Decisions: number;
+  Executions: number;
+  Skipped: number;
+  Incomplete: number;
+  Unresolved: number;
+  ManifestID: string;
+  StrategyHash: string;
+  Book: ResultBook;
+  Summary: Record<string, Record<string, FactorSeriesSummary>> | null;
+  Manifest: ResultManifest;
+  NodeCount: number;
+  MaxRawRecords: number;
+  MaxPendingEvaluations: number;
+  MaxRetainedValues: number;
+  NodeUpdates: Record<string, number> | null;
+}
+
+export interface UnifiedBacktestReport {
+  Version: 1;
+  Status: 'complete' | 'incomplete';
+  Errors?: string[];
+  Results: UnifiedResult[] | null;
 }

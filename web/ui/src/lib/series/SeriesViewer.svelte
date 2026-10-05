@@ -1,14 +1,16 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/state';
 	import { alerts } from '$lib/stores/alerts';
 	import { fmtDateStr } from '$lib/dateutil';
 	import type { ApiResult } from '$lib/netio';
+	import { seriesCell } from './values';
+	import * as m from '$lib/paraglide/messages';
 
-	type Request = (path: string, query?: Record<string, any>) => Promise<ApiResult>;
+	type Request = (path: string, query?: Record<string, unknown>) => Promise<ApiResult>;
 	type SourceStatus = { name: string; timeframe: string; table: string };
 	type SeriesField = { name?: string; Name?: string; type?: string; Type?: string };
-	type SeriesRow = Record<string, any>;
+	type SeriesRow = Record<string, unknown>;
 
 	interface Props {
 		request: Request;
@@ -28,6 +30,12 @@
 	let metadata = $state<SeriesField[]>([]);
 	let table = $state('');
 	let sourceOptions = $state<SourceStatus[]>([]);
+	let active = true;
+	let queryVersion = 0;
+	onDestroy(() => {
+		active = false;
+		queryVersion++;
+	});
 
 	function toDateTimeLocal(ms: number) {
 		const value = new Date(ms);
@@ -39,8 +47,8 @@
 		return value ? new Date(value).getTime() : 0;
 	}
 
-	function rowValues(row: SeriesRow): Record<string, any> {
-		return row.Values ?? row.values ?? {};
+	function rowValues(row: SeriesRow): Record<string, unknown> {
+		return (row.Values ?? row.values ?? {}) as Record<string, unknown>;
 	}
 
 	function fieldName(field: SeriesField) {
@@ -57,25 +65,28 @@
 		return Array.from(new Set(rows.flatMap((row) => Object.keys(rowValues(row))))).sort();
 	}
 
-	function valueText(value: any) {
-		if (value === undefined || value === null) return '-';
-		return typeof value === 'object' ? JSON.stringify(value) : String(value);
+	function valueText(row: SeriesRow, field: string) {
+		const cell = seriesCell(rowValues(row), field);
+		if (cell.kind === 'missing') return m.series_missing();
+		if (cell.kind === 'null') return m.series_null();
+		return cell.text;
 	}
 
 	function rowTime(row: SeriesRow, key: 'TimeMS' | 'EndMS') {
 		const lower = key === 'TimeMS' ? 'time_ms' : 'end_ms';
 		const camel = key === 'TimeMS' ? 'timeMS' : 'endMS';
-		return row[key] ?? row[camel] ?? row[lower] ?? 0;
+		return Number(row[key] ?? row[camel] ?? row[lower] ?? 0);
 	}
 
 	async function loadSources() {
 		const rsp = await request('/kline/data_sources');
-		if (rsp.code === 200) {
+		if (active && rsp.code === 200) {
 			sourceOptions = rsp.data ?? [];
 		}
 	}
 
 	async function loadSeries() {
+		if (!active) return;
 		const targetSID = Number(sid);
 		if (!source.trim() || !targetSID || !timeFrame.trim()) {
 			alerts.error('Source, SID and timeframe are required');
@@ -89,6 +100,7 @@
 		}
 
 		loading = true;
+		const version = ++queryVersion;
 		const rsp = await request('/kline/series', {
 			source: source.trim(),
 			sid: targetSID,
@@ -98,6 +110,7 @@
 			end: endMS,
 			limit: Math.min(Math.max(Number(limit) || 100, 1), 1000)
 		});
+		if (!active || version !== queryVersion) return;
 		loading = false;
 		if (rsp.code !== 200) {
 			alerts.error(rsp.msg || 'load series failed');
@@ -115,7 +128,7 @@
 			page.url.searchParams.get('tf') ?? page.url.searchParams.get('timeframe') ?? timeFrame;
 		fields = page.url.searchParams.get('fields') ?? fields;
 		await loadSources();
-		if (source && sid && timeFrame) {
+		if (active && source && sid && timeFrame) {
 			await loadSeries();
 		}
 	});
@@ -180,7 +193,7 @@
 		</div>
 		<datalist id="series-sources">
 			<option value="kline"></option>
-			{#each sourceOptions as item}
+			{#each sourceOptions as item (`${item.name}:${item.timeframe}`)}
 				<option value={item.name}>{item.name} ({item.timeframe})</option>
 			{/each}
 		</datalist>
@@ -190,7 +203,7 @@
 		<div class="flex flex-wrap items-center gap-2 text-sm text-base-content/70">
 			{#if table}<span>Table: {table}</span>{/if}
 			<span>{rows.length} rows</span>
-			{#each metadata as field}
+			{#each metadata as field (fieldName(field))}
 				<span class="badge badge-sm badge-outline"
 					>{fieldName(field)}{fieldType(field) ? ` (${fieldType(field)})` : ''}</span
 				>
@@ -203,7 +216,7 @@
 						<th>Start</th>
 						<th>End</th>
 						<th>Closed</th>
-						{#each visibleFields() as field}
+						{#each visibleFields() as field (field)}
 							<th>{field}</th>
 						{/each}
 					</tr>
@@ -216,13 +229,15 @@
 							></tr
 						>
 					{:else}
-						{#each rows as row}
+						{#each rows as row (row)}
 							<tr>
 								<td class="whitespace-nowrap">{fmtDateStr(rowTime(row, 'TimeMS'))}</td>
 								<td class="whitespace-nowrap">{fmtDateStr(rowTime(row, 'EndMS'))}</td>
 								<td>{(row.Closed ?? row.closed) ? 'yes' : 'no'}</td>
-								{#each visibleFields() as field}
-									<td class="max-w-80 break-all">{valueText(rowValues(row)[field])}</td>
+								{#each visibleFields() as field (field)}
+									<td class="max-w-80 break-all" title={seriesCell(rowValues(row), field).kind}
+										>{valueText(row, field)}</td
+									>
 								{/each}
 							</tr>
 						{/each}

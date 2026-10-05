@@ -64,6 +64,8 @@ func (s *DevServer) RegAPI(api fiber.Router) {
 	api.Post("/build", s.handleBuild)
 	api.Get("/logs", getLogs)
 	api.Get("/available_strats", getAvailableStrats)
+	api.Get("/strategy_catalog", getStrategyCatalog)
+	api.Post("/backtest_preflight", s.handleBacktestPreflight)
 	api.Post("/run_backtest", s.handleRunBacktest)
 	api.Get("/bt_detail", s.getBtDetail)
 	api.Get("/bt_orders", s.getBtOrders)
@@ -805,6 +807,7 @@ func (s *DevServer) getBtTasks(c *fiber.Ctx) error {
 	result := make([]map[string]interface{}, 0, len(tasks))
 	for _, task := range tasks {
 		taskMap := task.ToMap()
+		appendBacktestMetadata(task, taskMap)
 		if args.Assets {
 			s.appendTaskAssets(task, taskMap)
 		}
@@ -1258,7 +1261,9 @@ func (s *DevServer) getBtDetail(c *fiber.Ctx) error {
 		return unifiedErr
 	}
 	if unified != nil {
-		return c.JSON(fiber.Map{"path": unifiedPath, "task": task.ToMap(), "unified": unified})
+		taskMap := task.ToMap()
+		appendBacktestMetadata(task, taskMap)
+		return c.JSON(fiber.Map{"path": unifiedPath, "task": taskMap, "unified": unified})
 	}
 
 	configPath := filepath.Join(basePath, "config.yml")
@@ -1296,10 +1301,12 @@ func (s *DevServer) getBtDetail(c *fiber.Ctx) error {
 		}
 	}
 
+	taskMap := task.ToMap()
+	appendBacktestMetadata(task, taskMap)
 	return c.JSON(fiber.Map{
 		"path":   btPath,
 		"detail": detail,
-		"task":   task.ToMap(),
+		"task":   taskMap,
 		"exsMap": exsMap,
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/research"
+	"slices"
 	"sync"
 )
 
@@ -68,3 +69,20 @@ func definitionBuilder(name string) (DefinitionBuilder, bool) {
 
 // CompileDefinition exposes the same definition resolution used by both drivers.
 func CompileDefinition(c Config) (*factor.Plan, research.ComboSpec, error) { return compileDecision(c) }
+
+// DefinitionCatalog returns names from this executable's actual registrations.
+// Copies keep clients from mutating the registry and sorting stabilizes the UI.
+func DefinitionCatalog() (builders, portfolios []string) {
+	definitions.RLock()
+	defer definitions.RUnlock()
+	for name := range definitions.builders {
+		builders = append(builders, name)
+	}
+	portfolios = append(portfolios, "top-bottom-k-v1")
+	for name := range definitions.portfolios {
+		portfolios = append(portfolios, name)
+	}
+	slices.Sort(builders)
+	slices.Sort(portfolios)
+	return builders, portfolios
+}
