@@ -345,7 +345,7 @@ func (h klineHandlers) queries() (*orm.Queries, func(), *errs.Error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	q = q.WithSeriesSymbolState(h.deps.Symbols).WithKlineRuntimeOptions(h.deps.KlineOptions())
+	q = q.WithSeriesSymbolState(h.deps.Symbols).WithExchange(h.deps.Exchange).WithKlineRuntimeOptions(h.deps.KlineOptions())
 	return q, conn.Release, nil
 }
 func (h klineHandlers) parseShort(exchange, symbol string) (*orm.ExSymbol, *errs.Error) {
