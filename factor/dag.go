@@ -298,16 +298,22 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 			dependencyWarmup = max(dependencyWarmup, plan.nodes[index].spec.WarmupLength)
 		}
 		period := int(spec.Parameters["period"])
-		switch spec.Operator {
-		case "lag", "return":
-			spec.WarmupLength = dependencyWarmup + period
-			spec.StateRetention = max(spec.StateRetention, period+1)
-		case "ema", "stddev":
-			spec.WarmupLength = dependencyWarmup + period - 1
-			spec.StateRetention = max(spec.StateRetention, period)
-		default:
-			spec.WarmupLength = max(spec.WarmupLength, dependencyWarmup)
-			spec.StateRetention = max(spec.StateRetention, 1)
+		if _, technical := indicatorDefinition(spec.Operator); technical {
+			warmup, retention := indicatorLookback(spec)
+			spec.WarmupLength = dependencyWarmup + warmup
+			spec.StateRetention = max(spec.StateRetention, retention)
+		} else {
+			switch spec.Operator {
+			case "lag", "return":
+				spec.WarmupLength = dependencyWarmup + period
+				spec.StateRetention = max(spec.StateRetention, period+1)
+			case "ema", "stddev":
+				spec.WarmupLength = dependencyWarmup + period - 1
+				spec.StateRetention = max(spec.StateRetention, period)
+			default:
+				spec.WarmupLength = max(spec.WarmupLength, dependencyWarmup)
+				spec.StateRetention = max(spec.StateRetention, 1)
+			}
 		}
 		id, err := contentHash(struct {
 			Spec         NodeSpec
@@ -405,6 +411,9 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 			return errors.New("factor: custom evaluator must be a declared TS custom node")
 		}
 		return nil
+	}
+	if contract, exists := indicatorDefinition(spec.Operator); exists {
+		return validateIndicator(spec, count, contract)
 	}
 	if arity, ok := pointwiseArity(spec.Operator); ok {
 		if count != arity {

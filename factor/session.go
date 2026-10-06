@@ -34,8 +34,9 @@ func cloneFrame(frame Frame) Frame {
 func CloneFrame(frame Frame) Frame { return cloneFrame(frame) }
 
 type assetState struct {
-	env   *ta.BarEnv
-	nodes []*ta.Series
+	env       *ta.BarEnv
+	nodes     []*ta.Series
+	technical map[string][]*ta.Series
 }
 
 // Session is a computation owner, independent of trading accounts. One lock
@@ -228,7 +229,15 @@ func (s *Session) fork() (*Session, uint64, error) {
 		for i, series := range asset.nodes {
 			nodes[i] = env.Items[series.ID]
 		}
-		copy.assets[sid] = &assetState{env: env, nodes: nodes}
+		technical := make(map[string][]*ta.Series, len(asset.technical))
+		for id, series := range asset.technical {
+			cloned := make([]*ta.Series, len(series))
+			for i, input := range series {
+				cloned[i] = env.Items[input.ID]
+			}
+			technical[id] = cloned
+		}
+		copy.assets[sid] = &assetState{env: env, nodes: nodes, technical: technical}
 	}
 	return copy, s.revision, nil
 }
@@ -320,6 +329,12 @@ func (s *Session) evaluateTS(node compiledNode, asset *assetState, sid int32, sn
 		}
 		return numeric(value)
 	}
+	if _, ok := technicalOperatorArity(node.spec.Operator); ok {
+		return asset.evaluateTechnical(node, inputs)
+	}
+	if len(inputs) == 0 {
+		return Numeric{math.NaN(), NotNumeric}
+	}
 	input := inputs[0]
 	series := asset.nodes[node.inputs[0]]
 	period := int(node.spec.Parameters["period"])
@@ -334,6 +349,8 @@ func (s *Session) evaluateTS(node compiledNode, asset *assetState, sid int32, sn
 	case "stddev":
 		result, _ := ta.StdDevBy(series, period, int(node.spec.Parameters["ddof"]))
 		value = result.Get(0)
+	default:
+		return Numeric{math.NaN(), NotNumeric}
 	}
 	result := numeric(value)
 	if result.Validity != Valid {

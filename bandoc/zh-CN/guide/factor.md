@@ -140,6 +140,21 @@ run_policy:
 
 自定义 Go 策略通过 `runner.RegisterDefinition(name, builder)` 注册，builder 签名为 `func(runner.Config) (*factor.Plan, research.ComboSpec, error)`。自定义组合通过 `runner.RegisterPortfolioBuilder` 注册唯一版本名。字段节点、缺失策略和算子版本都应显式声明。详细接口见 [因子 API](../api/factor.md)。
 
+## 使用常见技术指标
+
+可将以下内容替换或加入 `expressions.outputs`，时序结果还可传给截面排名或组合：
+
+```yaml
+outputs:
+  rsi_rank: 'cs.rank(ts.rsi(kline.close,14))'
+  atr: 'ts.atr(kline.high,kline.low,kline.close,14)'
+  cci: 'ts.cci((kline.high+kline.low+kline.close)/3,20)'
+  macd_hist: 'ts.macd_hist(kline.close,12,26,9)'
+  band_width: 'ts.bbands_upper(kline.close,20,2,2)-ts.bbands_lower(kline.close,20,2,2)'
+```
+
+新增 18 类指标、22 个标量函数全部支持 Batch 与 Session。完整列表、参数、公式及预热长度见[常见技术指标](https://github.com/banbox/banbot/blob/v0.6.0-beta.7/doc/factor_indicators.md)和[API](../api/factor.md#常见技术指标)。周期按完整有效元组计数，缺字段或 NULL 保留原始无效原因并暂停本指标状态。`ts.roc` 使用百分比单位，`ts.return` 使用比例；历史分块保持同一个 Session，混合源周期使用显式 asof binding。
+
 ## 稳健表达式与研究扩展
 
 可在 outputs 中使用以下稳健截面处理和多暴露中性化：

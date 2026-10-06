@@ -98,6 +98,8 @@ Session 为每个活跃 SID 保存 banta 环境及各节点 Series，通过锁�
 
 编译时按依赖推导预热：lag/return 增加 period，EMA/std 增加 period−1。计划采用所有节点的最大保留长度；Session 会裁剪注册 Series 的数组，同时保留递归内核状态。因此连续运行不会保存全部原始历史，但不是每个节点都采用最小独立保留长度，预热估计也不保证缺样本时必然有效。
 
+beta.7 新增的技术指标使用独立版本及完整有效输入元组：多输入的任意一项无效时不推进该节点，恢复有效后继续。每个节点保存自己的有界输入 Series，避免 banta 底层缓存省略辅助输入身份而串扰；候选 Session 复制时同时重映射这些 Series。MACD 与布林带按输出分别建标量节点，预热及单位详见 [指标指南](factor_indicators.md)。旧 lag/return/EMA/std 的节点身份与数值规则保持兼容。
+
 Batch 必须给出显式 `maxRows`，从已知起点计算一段完整历史，静态池使用 tav 时序内核和同一截面/逐点实现。它按消费者计数释放不再需要的中间列，返回的历史 Frames 仍由调用者持有。动态 Universe 会回退到同一新 Session 连续回放。跨块延续 EMA 等状态应复用 Session，不能对每块重新调用 Batch 并期待与整段结果一致。
 
 实盘通过 [`RoundBarrier`](../factor/barrier.go) 处理 generation、冻结、取消及发布。候选计算 fork 有界 Session 状态，只有当前有效回合才能 commit；克隆失败、过期或取消不得推进 live owner。新增递归状态必须满足安全克隆契约。

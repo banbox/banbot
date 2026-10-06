@@ -19,6 +19,14 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 	if len(snapshots) == 0 {
 		return nil, nil
 	}
+	for _, node := range p.nodes {
+		if !node.spec.Batch {
+			return nil, fmt.Errorf("factor: operator %s has no batch capability", node.spec.Operator)
+		}
+		if err := validateNode(node.spec, len(node.inputs), node.evaluate != nil); err != nil {
+			return nil, err
+		}
+	}
 	// Validate the same immutable context/barrier contract before computation.
 	identity := ""
 	lastTime := int64(0)
@@ -78,9 +86,6 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 		frames[time] = Frame{SnapshotID: snapshot.id, PlanHash: p.hash, GridTime: snapshot.spec.GridTime, DecisionTime: snapshot.spec.DecisionTime, Values: make(map[string]map[int32]Numeric)}
 	}
 	for index, node := range p.nodes {
-		if !node.spec.Batch {
-			return nil, fmt.Errorf("factor: operator %s has no batch capability", node.spec.Operator)
-		}
 		columns[index] = make([]map[int32]Numeric, len(snapshots))
 		for time := range snapshots {
 			columns[index][time] = make(map[int32]Numeric, len(sids))
@@ -145,6 +150,25 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 							values[i] = data[i-period]
 						}
 					}
+				default:
+					if _, ok := technicalOperatorArity(node.spec.Operator); ok {
+						inputs := make([][]float64, len(node.inputs))
+						for i, input := range node.inputs {
+							inputs[i] = make([]float64, len(snapshots))
+							for time := range snapshots {
+								value := columns[input][time][sid]
+								inputs[i][time] = math.NaN()
+								if value.Validity == Valid {
+									inputs[i][time] = value.Value
+								}
+							}
+						}
+						var computed bool
+						values, computed = computeTechnicalBatch(node.spec, inputs)
+						if !computed {
+							return nil, fmt.Errorf("factor: invalid batch dependencies for %s", node.spec.Operator)
+						}
+					}
 				}
 				for time, snapshot := range snapshots {
 					var value Numeric
@@ -173,11 +197,23 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 								value = numeric(sum)
 							}
 						} else {
+							if len(values) != len(snapshots) {
+								return nil, fmt.Errorf("factor: unregistered batch operator %s", node.spec.Operator)
+							}
 							value = numeric(values[time])
-							if node.spec.Operator != "lag" && inputs[0].Validity != Valid {
-								value = Numeric{math.NaN(), inputs[0].Validity}
-							} else if value.Validity != Valid {
-								value.Validity = Warmup
+							if value.Validity != Valid {
+								_, technical := technicalOperatorArity(node.spec.Operator)
+								if !technical || math.IsNaN(values[time]) {
+									value.Validity = Warmup
+								}
+							}
+							if node.spec.Operator != "lag" {
+								for _, input := range inputs {
+									if input.Validity != Valid {
+										value = Numeric{math.NaN(), input.Validity}
+										break
+									}
+								}
 							}
 						}
 					}

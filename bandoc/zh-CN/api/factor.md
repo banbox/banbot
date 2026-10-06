@@ -13,6 +13,14 @@ CLI 启动已统一：根命令 `backtest` / `trade` 从同一 YAML `RunSpec` �
 | factor/backtest | Book | weights 近似数量账本，支持 allocation，不替代 execution 账户 |
 | factor/runner | Config、Run、NewLive、ComputationGroup、AccountSink | replay/live 驱动和账户目标投递 |
 
+## 常见技术指标
+
+Go 构造函数与 DSL 新增 18 类指标、22 个标量算子，均支持 `Plan.Batch` 与持续推进的 `Session`：`SMA/RMA/WMA/VWMA/RSI/ROC/MOM/TR/ATR/CCI/Stoch/WillR/OBV/MFI/Highest/Lowest`，以及各返回三个 `*Node` 的 `MACD`、`BBands`。完整函数签名、公式和有效性规则见[常见技术指标](https://github.com/banbox/banbot/blob/v0.6.0-beta.7/doc/factor_indicators.md)。
+
+`MACD(price,12,26,9)` 返回 line、signal、hist；DSL 分别写 `ts.macd`、`ts.macd_signal`、`ts.macd_hist`，每次显式传入四个参数。`BBands(price,20,2,2)` 返回 upper、middle、lower；DSL 的 `ts.bbands_upper/middle/lower` 均显式提供四个参数。周期为 `[1,10000]` 的整数，MACD 要求 fast < slow，布林带倍数为有限非负数。
+
+例如 `ts.atr(kline.high,kline.low,kline.close,14)` 显式声明多个输入，CCI 的典型价格写作 `ts.cci((kline.high+kline.low+kline.close)/3,20)`。`ROC` 返回百分比，原有 `Return` 返回比例。新指标仅在全部输入有效时推进一次；无效原因和原始 `DataSeries.Values` 的字段类型/NULL 语义继续保留。窗口按有效元组计数，跨周期需显式 asof 采样；缺失会延长实际预热时间。
+
 ## 注册与编译
 
 `runner.RegisterDefinition(name string, builder runner.DefinitionBuilder) error` 注册 Go 图；`DefinitionBuilder` 是 `func(runner.Config) (*factor.Plan, research.ComboSpec, error)`。同名重复注册失败。内置定义为 momentum-vol。

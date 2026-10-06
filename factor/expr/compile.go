@@ -328,6 +328,9 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 }
 
 func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
+	if n, handled, err := c.indicatorCall(path, e); handled {
+		return n, err
+	}
 	arities := map[string]int{"field": 2, "positive": 1, "abs": 1, "log": 1, "sqrt": 1, "pow": 2, "min": 2, "max": 2, "ts.lag": 2, "ts.return": 2, "ts.ema": 2, "ts.std": 3, "cs.rank": 1, "cs.zscore": 1, "cs.robust_zscore": 1, "cs.mad_winsorize": 2, "cs.winsorize": 2, "cs.quantile": 2, "group.residual": 2, "group.demean": 3, "group.zscore": 3}
 	if e.text == "group.ols" || e.text == "group.wls" {
 		minimum := 2
@@ -459,4 +462,120 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 		}
 		return factor.StdDev(a, period, int(ddof)), nil
 	}
+}
+
+func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool, error) {
+	inputCount, parameterCount := 1, 1
+	switch e.text {
+	case "ts.sma", "ts.rma", "ts.wma", "ts.rsi", "ts.roc", "ts.mom", "ts.cci", "ts.highest", "ts.lowest":
+	case "ts.vwma":
+		inputCount = 2
+	case "ts.tr":
+		inputCount, parameterCount = 3, 0
+	case "ts.atr", "ts.stoch", "ts.willr":
+		inputCount = 3
+	case "ts.obv":
+		inputCount, parameterCount = 2, 0
+	case "ts.mfi":
+		inputCount = 4
+	case "ts.macd", "ts.macd_signal", "ts.macd_hist", "ts.bbands_upper", "ts.bbands_middle", "ts.bbands_lower":
+		parameterCount = 3
+	default:
+		return nil, false, nil
+	}
+	count := inputCount + parameterCount
+	if len(e.args) != count {
+		return nil, true, c.error(path, e, "%s expects %d arguments, got %d", e.text, count, len(e.args))
+	}
+	inputs := make([]*factor.Node, inputCount)
+	for i := range inputs {
+		n, err := c.lower(path, e.args[i])
+		if err != nil {
+			return nil, true, err
+		}
+		if hasCrossSection(n) {
+			return nil, true, c.error(path, e.args[i], "TS indicators over cross-section results are not supported")
+		}
+		inputs[i] = n
+	}
+	parameters := make([]float64, parameterCount)
+	for i := range parameters {
+		arg := e.args[inputCount+i]
+		value, err := c.number(path, arg)
+		if err != nil {
+			return nil, true, err
+		}
+		if strings.HasPrefix(e.text, "ts.bbands_") && i > 0 {
+			if value < 0 {
+				return nil, true, c.error(path, arg, "standard deviation multiplier must be nonnegative")
+			}
+		} else if value < 1 || value > factor.MaxIndicatorPeriod || value != math.Trunc(value) {
+			return nil, true, c.error(path, arg, "window must be an integer in [1,%d]", factor.MaxIndicatorPeriod)
+		}
+		parameters[i] = value
+	}
+	a := inputs[0]
+	period := 0
+	if len(parameters) > 0 {
+		period = int(parameters[0])
+	}
+	var result *factor.Node
+	switch e.text {
+	case "ts.sma":
+		result = factor.SMA(a, period)
+	case "ts.rma":
+		result = factor.RMA(a, period)
+	case "ts.wma":
+		result = factor.WMA(a, period)
+	case "ts.vwma":
+		result = factor.VWMA(a, inputs[1], period)
+	case "ts.rsi":
+		result = factor.RSI(a, period)
+	case "ts.roc":
+		result = factor.ROC(a, period)
+	case "ts.mom":
+		result = factor.MOM(a, period)
+	case "ts.tr":
+		result = factor.TR(a, inputs[1], inputs[2])
+	case "ts.atr":
+		result = factor.ATR(a, inputs[1], inputs[2], period)
+	case "ts.cci":
+		result = factor.CCI(a, period)
+	case "ts.stoch":
+		result = factor.Stoch(a, inputs[1], inputs[2], period)
+	case "ts.willr":
+		result = factor.WillR(a, inputs[1], inputs[2], period)
+	case "ts.obv":
+		result = factor.OBV(a, inputs[1])
+	case "ts.mfi":
+		result = factor.MFI(a, inputs[1], inputs[2], inputs[3], period)
+	case "ts.highest":
+		result = factor.Highest(a, period)
+	case "ts.lowest":
+		result = factor.Lowest(a, period)
+	case "ts.macd", "ts.macd_signal", "ts.macd_hist":
+		if parameters[0] >= parameters[1] {
+			return nil, true, c.error(path, e, "MACD requires fast < slow")
+		}
+		line, signal, hist := factor.MACD(a, period, int(parameters[1]), int(parameters[2]))
+		switch e.text {
+		case "ts.macd":
+			result = line
+		case "ts.macd_signal":
+			result = signal
+		default:
+			result = hist
+		}
+	case "ts.bbands_upper", "ts.bbands_middle", "ts.bbands_lower":
+		upper, middle, lower := factor.BBands(a, period, parameters[1], parameters[2])
+		switch e.text {
+		case "ts.bbands_upper":
+			result = upper
+		case "ts.bbands_middle":
+			result = middle
+		default:
+			result = lower
+		}
+	}
+	return result, true, nil
 }

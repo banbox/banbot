@@ -140,6 +140,21 @@ Policy params.k controls portfolio selection; expressions.params.window controls
 
 For Go strategies register `runner.RegisterDefinition(name, builder)`, where builder is `func(runner.Config) (*factor.Plan, research.ComboSpec, error)`. Register a uniquely versioned portfolio builder with RegisterPortfolioBuilder. Declare node versions and missing-data policies. See [Factor API](../api/factor.md).
 
+## Add common technical indicators
+
+Replace or extend `expressions.outputs` with explicit scalar indicators, then combine or rank their results:
+
+```yaml
+outputs:
+  rsi_rank: 'cs.rank(ts.rsi(kline.close,14))'
+  atr: 'ts.atr(kline.high,kline.low,kline.close,14)'
+  cci: 'ts.cci((kline.high+kline.low+kline.close)/3,20)'
+  macd_hist: 'ts.macd_hist(kline.close,12,26,9)'
+  band_width: 'ts.bbands_upper(kline.close,20,2,2)-ts.bbands_lower(kline.close,20,2,2)'
+```
+
+The [API table](../api/factor.md#technical-indicators) lists 22 new functions across 18 indicator families. They support batch and incremental execution. Periods count complete valid input tuples; missing or NULL fields preserve their validity and pause indicator state. `ts.roc` uses percentage units; `ts.return` uses fractional units. Reuse one Session across historical chunks, and use explicit asof bindings for mixed source timeframes. The [indicator guide](https://github.com/banbox/banbot/blob/v0.6.0-beta.7/doc/factor_indicators.md) gives lookback, retention and edge-case rules.
+
 ## Robust expressions and research extensions
 
 Outputs can use robust cross-sectional transforms and multi-exposure neutralization:

@@ -73,6 +73,36 @@ run_policy:
     definition: CodeMomentumV1
 ```
 
+## Technical indicators
+
+All 22 scalar operators below support `Plan.Batch`, incremental `Session` and `factor/expr`. Inputs are ordinary field/expression nodes; custom columns continue through `DataSeries.Values`. The input names h/l/c/v below mean explicit high/low/close/volume nodes.
+
+| Go constructor | DSL functions | Meaning |
+| --- | --- | --- |
+| `SMA(x,n)` | `ts.sma(x,n)` | Arithmetic moving mean |
+| `RMA(x,n)` | `ts.rma(x,n)` | Wilder smoothing, seeded with an n-observation mean |
+| `WMA(x,n)` | `ts.wma(x,n)` | Weights 1 through n, newest weight n |
+| `VWMA(c,v,n)` | `ts.vwma(c,v,n)` | `sum(c*v)/sum(v)` |
+| `RSI(x,n)` | `ts.rsi(x,n)` | Wilder relative strength, 0–100 |
+| `ROC(x,n)` | `ts.roc(x,n)` | Percentage change, `100*(x-prev)/prev` |
+| `MOM(x,n)` | `ts.mom(x,n)` | Absolute change, `x-prev` |
+| `TR(h,l,c)` | `ts.tr(h,l,c)` | True range with previous valid close |
+| `ATR(h,l,c,n)` | `ts.atr(h,l,c,n)` | Wilder smoothing of true range |
+| `CCI(x,n)` | `ts.cci(x,n)` | Commodity channel index of the explicit price expression |
+| `Stoch(h,l,c,n)` | `ts.stoch(h,l,c,n)` | Raw stochastic %K, no extra smoothing |
+| `WillR(h,l,c,n)` | `ts.willr(h,l,c,n)` | Williams %R, normally -100–0 |
+| `OBV(c,v)` | `ts.obv(c,v)` | On-balance volume, initial value is first volume |
+| `MFI(h,l,c,v,n)` | `ts.mfi(h,l,c,v,n)` | Typical-price money flow index |
+| `Highest(x,n)`, `Lowest(x,n)` | `ts.highest(x,n)`, `ts.lowest(x,n)` | Rolling extremes |
+| `MACD(x,fast,slow,signal)` → line, signalLine, hist | `ts.macd(...)`, `ts.macd_signal(...)`, `ts.macd_hist(...)` | Fast-minus-slow EMA, signal EMA, line-minus-signal; histogram has no factor of 2 |
+| `BBands(x,n,up,down)` → upper, middle, lower | `ts.bbands_upper(...)`, `ts.bbands_middle(...)`, `ts.bbands_lower(...)` | SMA ± explicit multiples of population standard deviation |
+
+Every DSL call is scalar. MACD calls all take `(x,fast,slow,signal)`; every Bollinger call takes `(x,n,up,down)`, including middle. Periods must be integers in `[1,10000]`, MACD requires `fast < slow`, and band multipliers must be finite and nonnegative. `ROC` returns 10 for a move from 100 to 110; existing `Return` returns 0.1.
+
+New indicators advance only on complete valid input tuples. An invalid dependency propagates its original validity and skips that observation without resetting state. ROC/MOM periods count valid tuples; existing Return/Lag keep their original observation-position behavior. Flat Stoch is 50; flat RSI follows tav at 100; zero negative MFI flow remains undefined. Undefined NaN results retain `Warmup` validity; infinite results have `NonFinite` validity.
+
+Lookback is n-1 for rolling averages/extremes/bands, CCI, Stoch, WillR and MFI; n for RSI/ROC/MOM/ATR; 1 for TR; 0 for OBV; slow-1 for MACD line; slow+signal-2 for signal/hist. Upstream lookbacks accumulate, and missing observations can extend elapsed warmup. Continue the same Session across chunks for recursive state. See the repository [indicator guide](https://github.com/banbox/banbot/blob/v0.6.0-beta.7/doc/factor_indicators.md) for examples and retention formulas.
+
 ## Configuration ownership
 
 runner.CloneConfig(c Config) (Config, error) owns chunks, snapshot Universe lists/maps, expressions, combo, manifest and execution instruments. It preserves list order, duplicates and nil/empty distinctions. One JSON serialization check retains NaN/Inf rejection.

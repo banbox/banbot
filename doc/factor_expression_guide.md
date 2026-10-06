@@ -92,6 +92,10 @@ param.window      本定义集 params 中的编译期参数
 | `ts.ema(x,n)` | 沿用现有 banta EMA 初始化和递推口径 |
 | `ts.std(x,n,ddof)` | 标准差；必须显式传入 `ddof` |
 
+还支持 18 类常见技术指标、22 个标量函数：`ts.sma/rma/wma/vwma/rsi/roc/mom/tr/atr/cci/stoch/willr/obv/mfi/highest/lowest`，以及 `ts.macd/macd_signal/macd_hist`、`ts.bbands_upper/bbands_middle/bbands_lower`。完整参数表、Go 构造方式、公式、缺失数据与预热规则见[常见技术指标](factor_indicators.md)。全部支持 Batch 与持续推进的 Session。
+
+例如 `ts.cci((kline.high+kline.low+kline.close)/3,20)` 显式构造典型价格，`ts.atr(kline.high,kline.low,kline.close,14)` 提供三个输入，`ts.macd_hist(kline.close,12,26,9)` 选择 MACD 柱。`ts.roc` 返回百分比，`ts.return` 返回比例：100 到 110 分别为 `10` 与 `0.1`。新指标按完整有效元组推进，遇到无效字段不推进状态；原有 `ts.return/lag/ema/std` 保持原合同。
+
 窗口必须为整数常量或已绑定数值参数，范围为 1–10000；`ts.lag` 额外允许 0。`ddof` 必须是整数且满足 `0 <= ddof < n`，其中 `ddof=0` 是总体标准差。窗口参数不接受逐行字段，也不接受 `param.window + 1` 等计算表达式；先在 `params` 中给出最终数值。
 
 先时序再截面是受支持的组合，例如 `cs.zscore(ts.return(kline.close,24))`。当前不支持对截面或回归结果再做时序窗口，即使中间包裹了逐点函数，也会拒绝 `ts.ema(abs(cs.rank(kline.close)),24)`；零 lag 原值例外。
