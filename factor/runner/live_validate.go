@@ -44,11 +44,18 @@ func compileLiveDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 	if c.Manifest.Costs.FundingPolicy != "required-stream" && c.Manifest.Costs.FundingPolicy != "explicit-zero" {
 		return nil, combo, errors.New("runner: explicit live funding policy required")
 	}
+	method := c.Combo.Method
+	if method == "" && c.Expressions != nil {
+		method = c.Expressions.Combine.Method
+	}
+	if research.IsHistoryMethod(method) {
+		return nil, combo, errors.New("runner: live history-IC requires an explicit matured history provider; use fixed/equal")
+	}
 	plan, combo, err := compileDecision(c)
 	if err != nil {
 		return nil, combo, err
 	}
-	if combo.Method == research.HistoryIC {
+	if research.IsHistoryMethod(combo.Method) {
 		return nil, combo, errors.New("runner: live history-IC requires an explicit matured history provider; use fixed/equal")
 	}
 	return plan, combo, nil

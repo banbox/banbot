@@ -66,6 +66,76 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		}
 	case "zscore":
 		standardize(points, targets, result, true)
+	case "robust-zscore", "mad-winsorize":
+		median := percentile(points, .5)
+		deviations := make([]point, len(points))
+		for i, p := range points {
+			deviations[i] = point{p.sid, math.Abs(p.value - median)}
+		}
+		sort.Slice(deviations, func(i, j int) bool { return deviations[i].value < deviations[j].value })
+		scale := 1.4826 * percentile(deviations, .5)
+		for _, p := range targets {
+			value := 0.0
+			if node.spec.Operator == "robust-zscore" {
+				if scale > 0 {
+					value = (p.value - median) / scale
+				}
+			} else {
+				limit := node.spec.Parameters["multiple"] * scale
+				value = max(median-limit, min(median+limit, p.value))
+			}
+			result[p.sid] = numeric(value)
+		}
+	case "multi-residual", "weighted-residual":
+		first := 1
+		if node.spec.Operator == "weighted-residual" {
+			first = 2
+		}
+		rowFor := func(sid int32) ([]float64, bool) {
+			row := []float64{1}
+			for _, id := range node.inputs[first:] {
+				x, exists := columns[id][sid]
+				if !exists || x.Validity != Valid {
+					return nil, false
+				}
+				row = append(row, x.Value)
+			}
+			return row, true
+		}
+		var x [][]float64
+		var y, weights []float64
+		for _, p := range points {
+			row, ok := rowFor(p.sid)
+			if !ok {
+				continue
+			}
+			weight := 1.0
+			if first == 2 {
+				w, exists := columns[node.inputs[1]][p.sid]
+				if !exists || w.Validity != Valid || w.Value <= 0 {
+					continue
+				}
+				weight = w.Value
+			}
+			x, y, weights = append(x, row), append(y, p.value), append(weights, weight)
+		}
+		coef, _, err := LeastSquares(x, y, weights)
+		for _, p := range targets {
+			row, ok := rowFor(p.sid)
+			if !ok {
+				result[p.sid] = Numeric{math.NaN(), Missing}
+				continue
+			}
+			if err != nil || len(x) < len(row) {
+				result[p.sid] = Numeric{math.NaN(), Warmup}
+				continue
+			}
+			fit := 0.0
+			for i, value := range row {
+				fit += coef[i] * value
+			}
+			result[p.sid] = numeric(p.value - fit)
+		}
 	case "winsorize":
 		low := percentile(points, node.spec.Parameters["tail"])
 		high := percentile(points, 1-node.spec.Parameters["tail"])

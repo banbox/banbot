@@ -16,6 +16,9 @@ type ExecutableTarget struct {
 	Lot         VirtualLotID
 	SignedSteps int64
 	Instrument  string
+	// SourceSequence identifies the contributor's accepted revision even when
+	// another strategy owns the later account-combined replacement plan.
+	SourceSequence uint64 `json:",omitempty"`
 }
 type PortfolioRisk struct {
 	MarginRate          decimal.Decimal

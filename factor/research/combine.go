@@ -13,21 +13,33 @@ import (
 type ComboMethod string
 
 const (
-	Equal     ComboMethod = "equal"
-	Fixed     ComboMethod = "fixed"
-	HistoryIC ComboMethod = "history-ic"
+	Equal           ComboMethod = "equal"
+	Fixed           ComboMethod = "fixed"
+	HistoryIC       ComboMethod = "history-ic"
+	HistoryRankIC   ComboMethod = "history-rank-ic"
+	HistoryICIR     ComboMethod = "history-icir"
+	HistoryRankICIR ComboMethod = "history-rank-icir"
+	HistoryEWMA     ComboMethod = "history-ewma"
 )
 
 type ComboSpec struct {
-	Method  ComboMethod
-	Columns []string
-	Weights map[string]float64
+	Method        ComboMethod        `yaml:"method"`
+	Columns       []string           `yaml:"columns"`
+	Weights       map[string]float64 `yaml:"weights,omitempty"`
+	Label         string             `json:",omitempty" yaml:"label,omitempty"`
+	MinSamples    int                `json:",omitempty" yaml:"min_samples,omitempty"`
+	MinPairs      int                `json:",omitempty" yaml:"min_pairs,omitempty"`
+	MinConfidence float64            `json:",omitempty" yaml:"min_confidence,omitempty"`
+	Decay         float64            `json:",omitempty" yaml:"decay,omitempty"`
+	Direction     string             `json:",omitempty" yaml:"direction,omitempty"`
+	Fallback      string             `json:",omitempty" yaml:"fallback,omitempty"`
 }
 type ICSample struct {
 	Column                              string
 	Label                               string
 	DecisionTime, MatureAt, AvailableAt int64
 	IC                                  factor.Numeric
+	RankIC                              factor.Numeric
 	Samples                             int
 }
 
@@ -67,7 +79,7 @@ func (h *ICHistory) Add(asof int64, sample ICSample) error {
 		return errors.New("research: IC sample is not matured and visible at decision")
 	}
 	h.lastAsOf = asof
-	if !valid(sample.IC) {
+	if !valid(sample.IC) && !valid(sample.RankIC) {
 		return nil
 	}
 	rows := h.samples[sample.Column]
@@ -86,6 +98,120 @@ func (h *ICHistory) Add(asof int64, sample ICSample) error {
 	}
 	h.samples[sample.Column] = rows
 	return nil
+}
+func IsHistoryMethod(method ComboMethod) bool {
+	return method == HistoryIC || method == HistoryRankIC || method == HistoryICIR || method == HistoryRankICIR || method == HistoryEWMA
+}
+
+// ValidateComboSpec validates quality/fallback rules before any history exists,
+// so an invalid rule cannot become silently effective only after warmup.
+func ValidateComboSpec(spec ComboSpec) error {
+	if spec.Method != Equal && spec.Method != Fixed && !IsHistoryMethod(spec.Method) {
+		return errors.New("research: unsupported combination method")
+	}
+	if len(spec.Columns) == 0 {
+		return errors.New("research: combination requires columns")
+	}
+	for _, column := range spec.Columns {
+		if column == "" {
+			return errors.New("research: empty combination column")
+		}
+	}
+	if spec.MinSamples < 0 || spec.MinPairs < 0 || !finiteValues(spec.MinConfidence, spec.Decay) || spec.MinConfidence < 0 || spec.Decay < 0 || spec.Decay > 1 || (spec.Direction != "" && spec.Direction != "signed" && spec.Direction != "positive") || (spec.Fallback != "" && spec.Fallback != "equal" && spec.Fallback != "fixed" && spec.Fallback != "error") {
+		return errors.New("research: invalid IC quality/fallback rules")
+	}
+	if spec.Method == Fixed || (IsHistoryMethod(spec.Method) && spec.Fallback == "fixed") {
+		for _, column := range spec.Columns {
+			value, exists := spec.Weights[column]
+			if !exists || !finiteValues(value) {
+				return errors.New("research: fixed weight missing/nonfinite")
+			}
+		}
+	}
+	return nil
+}
+
+// QualityWeights selects only matured, published observations. Confidence is
+// an unadjusted mean/standard-error threshold; overlapping sections are not
+// claimed to be independent statistical evidence.
+func (h *ICHistory) QualityWeights(asof int64, spec ComboSpec) (map[string]float64, bool, error) {
+	if err := ValidateComboSpec(spec); err != nil {
+		return nil, false, err
+	}
+	if asof < h.lastAsOf {
+		return nil, false, errors.New("research: IC history time moved backwards")
+	}
+	if spec.MinSamples < 0 || spec.MinPairs < 0 || spec.MinConfidence < 0 || math.IsNaN(spec.MinConfidence) || math.IsInf(spec.MinConfidence, 0) || spec.Decay < 0 || spec.Decay > 1 || math.IsNaN(spec.Decay) || (spec.Direction != "" && spec.Direction != "signed" && spec.Direction != "positive") {
+		return nil, false, errors.New("research: invalid IC quality rules")
+	}
+	h.lastAsOf = asof
+	weights := make(map[string]float64)
+	total := 0.0
+	minimum := max(1, spec.MinSamples)
+	alpha := spec.Decay
+	if alpha == 0 {
+		alpha = .2
+	}
+	for _, name := range spec.Columns {
+		var stats running
+		var ewma float64
+		for _, sample := range h.samples[name] {
+			if sample.DecisionTime >= asof || sample.MatureAt > asof || sample.AvailableAt > asof || sample.Samples < max(2, spec.MinPairs) {
+				continue
+			}
+			v := sample.IC
+			if spec.Method == HistoryRankIC || spec.Method == HistoryRankICIR {
+				v = sample.RankIC
+			}
+			if !valid(v) {
+				continue
+			}
+			if stats.Count == 0 {
+				ewma = v.Value
+			} else {
+				ewma = alpha*v.Value + (1-alpha)*ewma
+			}
+			stats.add(v.Value)
+		}
+		if stats.Count < minimum {
+			continue
+		}
+		if spec.MinConfidence > 0 {
+			if stats.Count < 2 {
+				continue
+			}
+			se := math.Sqrt(stats.M2 / float64(stats.Count-1) / float64(stats.Count))
+			if stats.Mean == 0 || (se > 0 && math.Abs(stats.Mean)/se < spec.MinConfidence) {
+				continue
+			}
+		}
+		weight := stats.Mean
+		if spec.Method == HistoryEWMA {
+			weight = ewma
+		}
+		if spec.Method == HistoryICIR || spec.Method == HistoryRankICIR {
+			ir := stats.ir()
+			if !valid(ir) {
+				continue
+			}
+			weight = ir.Value
+		}
+		if spec.Direction == "positive" {
+			weight = max(0, weight)
+		}
+		if math.IsNaN(weight) || math.IsInf(weight, 0) {
+			continue
+		}
+		weights[name] = weight
+		total += math.Abs(weight)
+	}
+	if total == 0 {
+		return nil, false, nil
+	}
+	for name, weight := range weights {
+		weights[name] = weight / total
+	}
+	return weights, true, nil
 }
 func (h *ICHistory) Retained() int {
 	n := 0
@@ -130,6 +256,9 @@ func valid(n factor.Numeric) bool {
 // Combine uses inference columns only. Labels never select its pool. Missing
 // nonzero-weight inputs invalidate scores rather than renormalizing per asset.
 func Combine(frame factor.Frame, universe factor.Universe, spec ComboSpec, history *ICHistory) (map[int32]factor.Numeric, []factor.Diagnostic, error) {
+	if err := ValidateComboSpec(spec); err != nil {
+		return nil, nil, err
+	}
 	columns := slices.Clone(spec.Columns)
 	slices.Sort(columns)
 	columns = slices.Compact(columns)
@@ -151,19 +280,34 @@ func Combine(frame factor.Frame, universe factor.Universe, spec ComboSpec, histo
 			}
 			weights[name] = w
 		}
-	case HistoryIC:
+	case HistoryIC, HistoryRankIC, HistoryICIR, HistoryRankICIR, HistoryEWMA:
 		var ok bool
 		if history != nil {
 			var err error
-			weights, ok, err = history.Weights(frame.DecisionTime, columns)
+			quality := spec
+			quality.Columns = columns
+			weights, ok, err = history.QualityWeights(frame.DecisionTime, quality)
 			if err != nil {
 				return nil, nil, err
 			}
 		}
 		if !ok {
+			if spec.Fallback == "error" {
+				return nil, nil, errors.New("research: insufficient qualified historical IC")
+			}
+			if spec.Fallback != "" && spec.Fallback != "equal" && spec.Fallback != "fixed" {
+				return nil, nil, errors.New("research: invalid historical fallback")
+			}
 			weights = make(map[string]float64)
 			for _, name := range columns {
 				weights[name] = 1 / float64(len(columns))
+				if spec.Fallback == "fixed" {
+					w, exists := spec.Weights[name]
+					if !exists || math.IsNaN(w) || math.IsInf(w, 0) {
+						return nil, nil, errors.New("research: fixed fallback weight missing/nonfinite")
+					}
+					weights[name] = w
+				}
 			}
 			diagnostics = append(diagnostics, factor.Diagnostic{Code: "ic-equal-fallback", Detail: "no matured visible nonzero historical IC"})
 		}

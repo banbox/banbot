@@ -26,6 +26,7 @@ type AccountSink struct {
 	AccountID, StrategyID, Currency string
 	Instruments                     map[int32]execution.Instrument
 	FundingInstruments              map[int32]execution.Instrument
+	PolicySIDMap                    map[int32]string
 	Risk                            execution.PortfolioRisk
 	Paper                           *PaperAdapter
 	VisibleQuote                    func(context.Context, string, int64) (execution.VisibleQuote, error)
@@ -35,6 +36,9 @@ type AccountSink struct {
 	observed                        map[string]execution.VisibleQuote
 	marks                           map[string]decimal.Decimal
 	previous                        *factor.TargetPortfolio
+	previousAllocation              *factor.PortfolioTarget
+	acceptedPolicy                  map[string]accountAcceptedProposal
+	acceptedPolicyOrder             []string
 	paperMarket                     *paperMarket
 }
 

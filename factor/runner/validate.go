@@ -42,8 +42,10 @@ func validateReplayConfig(c Config, requireExecutionMetadata, checkInputs bool) 
 	if c.Manifest.Costs.FundingPolicy == "required-stream" && c.FundingSource == "" {
 		return errors.New("runner: required funding stream absent")
 	}
-	if len(c.Manifest.Labels) > 0 && (len(c.Manifest.Labels) != 1 || c.Manifest.Labels[0].Kind != research.ExecutableReturn) {
-		return errors.New("runner: archival pipeline currently requires one executable-return horizon")
+	for _, label := range c.Manifest.Labels {
+		if label.Kind != research.ExecutableReturn {
+			return errors.New("runner: archival pipeline requires executable-return horizons")
+		}
 	}
 	if len(c.Manifest.Labels) > 0 {
 		if _, err := research.NewLabelQueue(c.Manifest.Labels, 1, 1); err != nil {
@@ -60,7 +62,7 @@ func validateReplayConfig(c Config, requireExecutionMetadata, checkInputs bool) 
 	if err != nil {
 		return err
 	}
-	if len(c.Manifest.Labels) == 0 && (c.Mode == Research || combo.Method == research.HistoryIC) {
+	if len(c.Manifest.Labels) == 0 && (c.Mode == Research || research.IsHistoryMethod(combo.Method)) {
 		return errors.New("runner: research and history-IC require executable-return labels")
 	}
 	if _, err := resolveDecisionPortfolio(c); err != nil {
@@ -124,6 +126,28 @@ func validateReplayConfig(c Config, requireExecutionMetadata, checkInputs bool) 
 }
 
 func resolveDecisionPortfolio(c Config) (Config, error) {
+	if identity := portfolioBuilderIdentity(c.Manifest.Portfolio.Builder); identity != "" {
+		if c.Manifest.Portfolio.BuilderConfigHash != "" && c.Manifest.Portfolio.BuilderConfigHash != identity {
+			return c, errors.New("runner: portfolio builder identity conflict")
+		}
+		c.Manifest.Portfolio.BuilderConfigHash = identity
+	}
+	if err := c.Manifest.Portfolio.ValidatePolicy(); err != nil {
+		return c, err
+	}
+	if c.Manifest.Portfolio.Policy != "" {
+		policyConfig, err := c.Manifest.Portfolio.PolicyConfig()
+		if err != nil {
+			return c, err
+		}
+		if _, err := NewPortfolioPolicy(policyConfig); err != nil {
+			return c, err
+		}
+		c.Manifest.Portfolio, err = c.Manifest.Portfolio.ResolvePolicy()
+		if err != nil {
+			return c, err
+		}
+	}
 	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Builder != "" && c.Manifest.Portfolio.Builder != "top-bottom-k-v1" {
 		var ok bool
 		c.PortfolioBuilder, ok = portfolioBuilder(c.Manifest.Portfolio.Builder)
@@ -131,13 +155,14 @@ func resolveDecisionPortfolio(c Config) (Config, error) {
 			return c, fmt.Errorf("runner: unregistered portfolio builder %q", c.Manifest.Portfolio.Builder)
 		}
 	}
-	if c.PortfolioBuilder == nil && (c.Manifest.Portfolio.K <= 0 || c.Manifest.Portfolio.LongNotional+c.Manifest.Portfolio.ShortNotional <= 0) {
+	legacyBuilder := c.Manifest.Portfolio.Policy == "" || c.Manifest.Portfolio.Builder == "top-bottom-k-v1"
+	if c.PortfolioBuilder == nil && legacyBuilder && (c.Manifest.Portfolio.K <= 0 || c.Manifest.Portfolio.LongNotional+c.Manifest.Portfolio.ShortNotional <= 0) {
 		return c, errors.New("runner: top/bottom builder needs positive K and notional")
 	}
 	if c.PortfolioBuilder != nil && c.Manifest.Portfolio.Builder == "" {
 		return c, errors.New("runner: custom portfolio builder needs versioned manifest identity")
 	}
-	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Builder == "" {
+	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Builder == "" && c.Manifest.Portfolio.Policy == "" {
 		c.Manifest.Portfolio.Builder = "top-bottom-k-v1"
 	}
 	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Mode != factor.Full && c.Manifest.Portfolio.Mode != factor.Patch {

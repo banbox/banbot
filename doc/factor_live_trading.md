@@ -27,6 +27,16 @@
 
 周期恢复失败后停止该账户的报告工作器，需要重新启动账户会话并完成恢复、对账才能继续交易。REST 请求支持 context 取消；SDK 首次市场加载的等待和 WebSocket 建连仍受 SDK 自身超时控制，不能承诺即时中断。账户服务停止时先加入报告翻译工作器，入口会话随后关闭共享 SDK 连接。
 
+## 组合 policy、尾仓与热更新
+
+从 v0.6.0-beta.6 起，可在 `portfolio` 启用 lifecycle-v1，分别配置 rebalance、holding、transition、selection 和 allocation。原有无状态 builder 仍可使用。量化规则及配置见 [组合与持仓指南](factor_portfolio_guide.md)，完整自定义 policy 和原生研究接口见 [实施记录](factor_opt_implementation.md)。
+
+年龄依据策略首次真实成交，计划接纳不等于成交。min 保护普通退出，max 与 cohort 到期在缺 score 时也检查；quantity 渐退不会随 NAV 增长买回。待退出增仓先由 owner 取消/对账，未知订单不被当作已释放资金。
+
+执行目标、目标 sequence、policy checkpoint 与接纳证据在共享 owner 中原子提交，state version/ledger cursor 变化时使用同一冻结 Frame 重新提案。已 accepted 的发送失败保持原计划身份；重启和缓存淘汰后从持久接纳记录恢复，不能重复增加退出步骤。不同策略的状态、资金及成交来源保持独立。
+
+资产退出选币池后，实际持仓/在途/活跃批次仍自动保留 Tracked、执行价格及 funding；归零结算后再释放。仅执行范围的保留不会修改因子参考池。候选代在 warmup 前恢复所需元数据，成功切换才继承状态；配置或 schema 不兼容需要显式迁移。
+
 ## 小额实盘验收
 
 以下是现有显式生产 smoke 的执行说明，本次文档/重构任务没有运行，不能以本地模拟测试替代。应先提供满足统一接口的实际会话和完整账户证据。
@@ -46,7 +56,7 @@ go test ./entry -run '^TestFactorLiveProductionSmoke$' -count=1 -v
 
 ## 配套 SDK
 
-本次修改同时涉及相邻 `banexg` 仓库，`go.mod` 暂时通过 `replace github.com/banbox/banexg => ../banexg` 使用这些统一能力。部署需要一并携带 SDK 修改；发布支持这些接口的 banexg 版本后再改为对应版本并移除本地 replace。
+发布模块固定远程 banexg v0.2.65 与 banta v0.4.1；不依赖相邻目录 replace。本地 go.work 只用于开发，发布验收使用 GOWORK=off。交易所特有处理继续归 banexg，用户使用任一市场前仍须通过当前会话能力验证。
 
 ## 2026-10-04 双引擎使用入口
 

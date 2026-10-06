@@ -7,6 +7,7 @@ import (
 	"errors"
 	"github.com/banbox/banbot/execution"
 	"github.com/shopspring/decimal"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -128,6 +129,7 @@ func NewPaperSinkWithAccount(ctx context.Context, c Config, factory PaperAccount
 	// interval plus the configured arrival window. Execution still requires a
 	// strictly later quote; older valuation observations fail closed.
 	sink.QuoteTTLMS = c.DecisionInterval + c.ExpiryMS
+	sink.PolicySIDMap = maps.Clone(c.Snapshot.SIDMap)
 	if err := sink.RegisterExecution(); err != nil {
 		return nil, nil, errors.Join(err, cleanup())
 	}

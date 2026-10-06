@@ -63,6 +63,27 @@ func compileDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 	if plan == nil || combo.Method == "" {
 		return nil, combo, fmt.Errorf("runner: definition requires plan and combiner")
 	}
+	if research.IsHistoryMethod(combo.Method) && combo.Label == "" && len(c.Manifest.Labels) > 1 {
+		primary := c.Manifest.Labels[0]
+		for _, label := range c.Manifest.Labels[1:] {
+			if label.Horizon < primary.Horizon || label.Horizon == primary.Horizon && label.Name < primary.Name {
+				primary = label
+			}
+		}
+		combo.Label = primary.Name
+	}
+	if research.IsHistoryMethod(combo.Method) && combo.Label != "" {
+		found := false
+		for _, label := range c.Manifest.Labels {
+			if label.Name == combo.Label {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, combo, fmt.Errorf("runner: history label not declared")
+		}
+	}
 	if c.Expressions != nil {
 		if c.DecisionInterval > 0 {
 			// The runner advances one decision grid; bindings cannot change its cadence.
@@ -75,11 +96,14 @@ func compileDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 			return nil, combo, err
 		}
 	}
+	if err := research.ValidateComboSpec(combo); err != nil {
+		return nil, combo, err
+	}
 	return plan, combo, nil
 }
 
 func validateExpressionCombo(plan *factor.Plan, combo research.ComboSpec) error {
-	if combo.Method != research.Equal && combo.Method != research.Fixed && combo.Method != research.HistoryIC {
+	if combo.Method != research.Equal && combo.Method != research.Fixed && !research.IsHistoryMethod(combo.Method) {
 		return fmt.Errorf("runner: unsupported expression combine method %q", combo.Method)
 	}
 	if len(combo.Columns) == 0 {
@@ -159,16 +183,30 @@ func (e *decisionEngine) combine(frame factor.Frame, universe factor.Universe, h
 	return frame, diagnostics, nil
 }
 
-func (e *decisionEngine) buildPortfolio(frame factor.Frame, universe factor.Universe, sequence uint64, nav float64, executableAt, expireAt int64) (*factor.TargetPortfolio, []factor.Diagnostic, error) {
-	spec := factor.PortfolioSpec{
+func (e *decisionEngine) portfolioSpec(frame factor.Frame, universe factor.Universe, sequence uint64, nav float64, executableAt, expireAt int64) factor.PortfolioSpec {
+	return factor.PortfolioSpec{
 		StrategyID: e.strategyID, AccountID: e.accountID,
 		DecisionTime: frame.DecisionTime, ExecutableAt: executableAt, ExpireAt: expireAt,
 		PlanSequence: sequence, SnapshotID: frame.SnapshotID,
 		PlanHash: e.manifest.StrategyHash(), FactorPlanHash: e.plan.Hash(), UniverseVersion: universe.Version,
 		Budget: factor.FrozenBudget{Version: fmt.Sprint(sequence), Currency: e.currency, NAV: nav}, Mode: e.portfolio.Mode,
 	}
+}
+func (e *decisionEngine) buildPortfolio(frame factor.Frame, universe factor.Universe, sequence uint64, nav float64, executableAt, expireAt int64) (*factor.TargetPortfolio, []factor.Diagnostic, error) {
+	spec := e.portfolioSpec(frame, universe, sequence, nav, executableAt, expireAt)
 	if e.builder != nil {
 		return e.builder(factor.CloneFrame(frame), factor.CloneUniverse(universe), spec, e.portfolio)
+	}
+	if e.portfolio.Policy != "" && e.portfolio.Builder == "" {
+		if e.portfolio.Policy != "lifecycle-v1" {
+			// A complete custom policy owns selection and allocation itself.
+			return nil, nil, nil
+		}
+		config, err := e.portfolio.PolicyConfig()
+		if err != nil {
+			return nil, nil, err
+		}
+		return factor.SelectPortfolio(frame, universe, spec, config)
 	}
 	return factor.TopBottomKNotional(frame, "score", universe, spec, e.portfolio.K, e.portfolio.LongNotional, e.portfolio.ShortNotional)
 }

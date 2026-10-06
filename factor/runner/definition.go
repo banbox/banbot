@@ -17,8 +17,9 @@ type PortfolioBuilder func(factor.Frame, factor.Universe, factor.PortfolioSpec, 
 
 var definitions = struct {
 	sync.RWMutex
-	builders   map[string]DefinitionBuilder
-	portfolios map[string]PortfolioBuilder
+	builders          map[string]DefinitionBuilder
+	portfolios        map[string]PortfolioBuilder
+	portfolioIdentity map[string]string
 }{builders: map[string]DefinitionBuilder{
 	"momentum-vol": func(c Config) (*factor.Plan, research.ComboSpec, error) { return research.MomentumVolPlan(c.Factor) },
 }}
@@ -37,6 +38,33 @@ func RegisterPortfolioBuilder(name string, builder PortfolioBuilder) error {
 	}
 	definitions.portfolios[name] = builder
 	return nil
+}
+
+// RegisterPortfolioBuilderIdentity binds immutable native builder parameters
+// to strategy identity. Existing stateless builders retain their old contract.
+func RegisterPortfolioBuilderIdentity(name, hash string) error {
+	if name == "" || hash == "" {
+		return errors.New("runner: builder identity requires name and content hash")
+	}
+	definitions.Lock()
+	defer definitions.Unlock()
+	if definitions.portfolios[name] == nil {
+		return errors.New("runner: builder must be registered before its identity")
+	}
+	if definitions.portfolioIdentity == nil {
+		definitions.portfolioIdentity = map[string]string{}
+	}
+	if prior := definitions.portfolioIdentity[name]; prior != "" && prior != hash {
+		return errors.New("runner: builder identity already bound")
+	}
+	definitions.portfolioIdentity[name] = hash
+	return nil
+}
+
+func portfolioBuilderIdentity(name string) string {
+	definitions.RLock()
+	defer definitions.RUnlock()
+	return definitions.portfolioIdentity[name]
 }
 func portfolioBuilder(name string) (PortfolioBuilder, bool) {
 	definitions.RLock()

@@ -1,5 +1,7 @@
 # 截面与多因子引擎架构及实施方案
 
+> 2026-10-06 / v0.6.0-beta.6：组合生命周期、多期限和研究扩展已落地。当前配置见 [组合与持仓指南](factor_portfolio_guide.md)，源码与测试见 [扩展实施记录](factor_opt_implementation.md)。本文保留初版设计快照，早期关于“没有 policy/单 horizon/暂缓基础模型”的描述不代表本版本状态。
+
 > 2026-10-04 校订：本文保留历史设计和测试口径。当前使用见[多因子指南](../bandoc/zh-CN/guide/factor.md)，逐包实施/暂缓与本次实际验证见[重构记录](strategy_engine_refactor.md)。缺失实施文档的链接已修复，历史结果不据此重新验收；真实 venue 与性能承诺仍需独立证据。
 
 

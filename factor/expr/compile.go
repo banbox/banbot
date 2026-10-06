@@ -328,7 +328,28 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 }
 
 func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
-	arities := map[string]int{"field": 2, "positive": 1, "abs": 1, "log": 1, "sqrt": 1, "pow": 2, "min": 2, "max": 2, "ts.lag": 2, "ts.return": 2, "ts.ema": 2, "ts.std": 3, "cs.rank": 1, "cs.zscore": 1, "cs.winsorize": 2, "cs.quantile": 2, "group.residual": 2}
+	arities := map[string]int{"field": 2, "positive": 1, "abs": 1, "log": 1, "sqrt": 1, "pow": 2, "min": 2, "max": 2, "ts.lag": 2, "ts.return": 2, "ts.ema": 2, "ts.std": 3, "cs.rank": 1, "cs.zscore": 1, "cs.robust_zscore": 1, "cs.mad_winsorize": 2, "cs.winsorize": 2, "cs.quantile": 2, "group.residual": 2, "group.demean": 3, "group.zscore": 3}
+	if e.text == "group.ols" || e.text == "group.wls" {
+		minimum := 2
+		if e.text == "group.wls" {
+			minimum = 3
+		}
+		if len(e.args) < minimum {
+			return nil, c.error(path, e, "neutralization requires exposures")
+		}
+		nodes := make([]*factor.Node, len(e.args))
+		for i, arg := range e.args {
+			var err error
+			nodes[i], err = c.lower(path, arg)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if minimum == 3 {
+			return factor.WeightedResidual(nodes[0], nodes[1], nodes[2:]...), nil
+		}
+		return factor.MultiResidual(nodes[0], nodes[1:]...), nil
+	}
 	count, ok := arities[e.text]
 	if !ok {
 		return nil, c.error(path, e, "unknown function %q", e.text)
@@ -346,6 +367,19 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	if e.text == "group.demean" || e.text == "group.zscore" {
+		if e.args[1].kind != 's' || e.args[2].kind != 's' {
+			return nil, c.error(path, e, "group source and field must be string literals")
+		}
+		field, err := c.field(path, e, e.args[1].text, e.args[2].text)
+		if err != nil {
+			return nil, err
+		}
+		if e.text == "group.demean" {
+			return factor.GroupDemean(a, field.Spec.Source, field.Spec.Field, field.Spec.SourceTimeFrame), nil
+		}
+		return factor.GroupZScore(a, field.Spec.Source, field.Spec.Field, field.Spec.SourceTimeFrame), nil
+	}
 	switch e.text {
 	case "positive":
 		return factor.Positive(a), nil
@@ -359,6 +393,8 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 		return factor.Rank(a), nil
 	case "cs.zscore":
 		return factor.ZScore(a), nil
+	case "cs.robust_zscore":
+		return factor.RobustZScore(a), nil
 	case "pow", "min", "max", "group.residual":
 		b, err := c.lower(path, e.args[1])
 		if err != nil {
@@ -380,6 +416,11 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 		return nil, err
 	}
 	switch e.text {
+	case "cs.mad_winsorize":
+		if v <= 0 {
+			return nil, c.error(path, e.args[1], "MAD multiple must be positive")
+		}
+		return factor.MADWinsorize(a, v), nil
 	case "cs.winsorize":
 		if v < 0 || v >= .5 {
 			return nil, c.error(path, e.args[1], "winsorize tail must be [0,0.5)")

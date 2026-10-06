@@ -19,7 +19,10 @@ flowchart TD
     P --> X[Session / 有界 Batch]
     S --> X
     X --> F[Frame：因子列与有效性]
-    F --> C[组合分数、目标组合、执行]
+    F --> C[组合分数与理想 builder]
+    C --> H[可选 PortfolioPolicy / 真实持仓证据]
+    H --> T[PortfolioTarget / owner 原子接纳]
+    T --> O[共享执行 / 成交 / checkpoint]
     F --> R[研究诊断]
     L[成熟且可见的标签] --> R
 ```
@@ -32,6 +35,8 @@ flowchart TD
 | 计划内核 | 节点契约、周期校验、拓扑顺序、内容哈希、预热与保留长度 | [dag.go](../factor/dag.go)、[pointwise.go](../factor/pointwise.go) |
 | 数据与执行 | 冻结版本快照、数值视图、增量状态、批量计算 | [snapshot.go](../factor/snapshot.go)、[value.go](../factor/value.go)、[session.go](../factor/session.go)、[batch.go](../factor/batch.go) |
 | 策略装配 | 定义选择、组合、计算共享、研究与回放/实盘驱动 | [decision.go](../factor/runner/decision.go)、[computation.go](../factor/runner/computation.go) |
+| 组合生命周期 | 独立日程、选股、持仓约束、退出/批次与资金配置；每策略独立状态 | [policy.go](../factor/policy.go)、[policy_run.go](../factor/runner/policy_run.go) |
+| 接纳与证据 | 策略持仓/在途/成交来源；原子计划与状态接纳，版本和账本围栏 | [policy_acceptance.go](../execution/policy_acceptance.go)、[account_policy_sink.go](../factor/runner/account_policy_sink.go) |
 | 入口 | 统一配置装配、输入和价格依赖、离线编译检查 | [factor_config.go](../entry/factor_config.go)、[factor_expression_commands.go](../entry/factor_expression_commands.go) |
 
 依赖方向是 `expr → factor`，runner/entry 负责装配。表达式本身不查询数据库、不访问交易账户、不提交订单，也不执行任意 Go 或脚本。
@@ -99,9 +104,9 @@ Batch 必须给出显式 `maxRows`，从已知起点计算一段完整历史，�
 
 ## 5. 截面、组合与研究隔离
 
-截面算子在当前快照的 Reference 资产池中选取有效样本拟合统计量，再对活跃目标资产应用结果；Investable、Tradable、Evaluation 等资产集合分别承担可投资、可交易和研究角色，不应混为一个池。实现见 [operators.go](../factor/operators.go)。`cs.rank` 使用 0 起始平均名次；`group.residual(y,x)` 是单解释变量截面回归残差，其名称不表示已支持任意分类分组表达式。
+截面算子在当前快照的 Reference 资产池中选取有效样本拟合统计量，再对活跃目标资产应用结果；Investable、Tradable、Evaluation 等资产集合分别承担可投资、可交易和研究角色，不应混为一个池。实现见 [operators.go](../factor/operators.go)。`cs.rank` 使用 0 起始平均名次；`group.residual(y,x)` 保留单暴露口径，新增 `group.ols/wls` 支持多暴露，`group.demean/zscore` 从绑定源的原始字段读取分类。MAD 与多暴露 QR 的数值边界见 [研究扩展](factor_research_extensions.md)。
 
-Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame 之后调用 [`research.Combine`](../factor/research/combine.go)，支持 equal、fixed 和 history-ic；默认 equal 且选择全部输出，显式 columns 可选子集。非零权重输入无效时组合分数无效，不按资产重分配权重。固定权重按给定值求和，不自动归一化；history-ic 使用成熟且当时可见的历史 IC，缺少可用非零历史时等权回退。
+Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame 之后调用 [`research.Combine`](../factor/research/combine.go)，支持 equal、fixed 与历史 IC/RankIC/ICIR/EWMA；默认 equal 且选择全部输出，显式 columns 可选子集。非零权重输入无效时组合分数无效，不按资产重分配权重。固定权重按给定值求和，不自动归一化；历史方法使用成熟且当时可见的指定期限样本，质量门槛与回退可配置。每 horizon 独立成熟，共享当期 Frame，不重复计算 DAG。
 
 表达式和原生推断计划均拒绝 label 依赖。未来收益只进入有界 [`LabelQueue`](../factor/research/labels.go) 和 [`research.Evaluate`](../factor/research/diagnostics.go)，标签在成熟和可见后才用于研究或历史 IC。固定/等权纯交易回放可以关闭研究队列；研究模式及 history-ic 仍需要标签。标签隔离保证推断数据流的边界，研究者仍需自行设计训练、验证、测试区间以及跨边界标签处理，不能将隔离机制视为自动完成时间外验证。
 
@@ -121,7 +126,13 @@ Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame
 
 表达式编译有明确静态边界，见 [parser.go](../factor/expr/parser.go)：单式最多 16 KiB，总表达式文本 256 KiB，所有声明的 AST 总计最多 8192 节点，深度上限 64；lets+outputs、bindings、params 各组最多 512 项，窗口最大 10000。深度还检查展开后的引用 DAG。独立 CLI spec 文件最大 1 MiB，仅接受一个 YAML 文档并拒绝未知字段。这些是语法和结构上限，不是峰值内存 admission 或全链路吞吐保证。
 
-当前语言没有比较、条件、循环、模块导入、任意代码调用、分类分组表达式，也拒绝对含 CS/GROUP 结果的输入再做非零 TS 窗口。Go builder 的能力范围与表达式白名单不同。执行侧另有 Batch 行数、标签队列行/列和 IC 历史窗口限制；大量输出还会增加 Frame map、标签副本和研究列间两两相关的成本，不能只看解析节点数估算资源。
+当前语言没有比较、条件、循环、模块导入、任意代码调用，也拒绝对含 CS/GROUP 结果的输入再做非零 TS 窗口。分类分组通过已开放的 `group.demean/zscore` 表达。Go builder/policy 的能力范围与表达式白名单不同。执行侧另有 Batch 行数、标签队列行/列、IC 历史窗口、policy checkpoint 和近期接纳缓存限制；大量输出还会增加 Frame map、标签副本和研究列间两两相关的成本，不能只看解析节点数估算资源。
+
+## 8. 持仓状态与研究产物的边界
+
+有状态 policy 在每个 run/strategy 创建独立实例，输入为冻结 Frame/Universe/NAV、实际持仓、在途和真实 fill 证据；提案不提交订单，owner 接纳 receipt 后才切换状态。quantity 与 NAV-fraction 是不同目标基准，不能用决策价格把绝对数量转换成旧权重后偷偷执行。完整合同见 [组合指南](factor_portfolio_guide.md)。
+
+多期限成熟标签、参数产物、模型 fit/predict 和风险 builder 属于研究与组合扩展，不进入共享 DAG 的账户状态。模型/参数须有训练截止、可用时间、manifest 与 hash；推理只读取当时已发布的版本。生命周期和归因 API 消费调用者提供的可核验事件，不自动得到独立批次执行 PnL。实现/限制见 [实施记录](factor_opt_implementation.md)。
 
 新增普通公式直接组合已有函数。新增原子算子时，应依次完成：
 
@@ -132,6 +143,6 @@ Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame
 
 可信 Go 代码还可以使用 `Custom(version, inputs, evaluate)`，但它是显式依赖的纯逐点函数。闭包不得暗中持有可变计算状态或读取外部数据；hash 不包含闭包代码，调用者必须为不同实现提供不同版本。同版本且相同依赖的不同闭包可能错误去重，编译器不会自动识别该冲突。
 
-原生表达式消除了重复策略代码和运行时解析，但不保证比融合的 Go `Custom` 更快。多个原生算术节点会增加中间 map、Series 及分配；公共子图去重也只有在实际重复时收益明显。已有 [banstrats 对比报告](../../banstrats/examples/crosssection/BENCHMARK_expressions.md) 在 100 资产×256 根日线、单线程的三次中位数中，表达式编译约为原 Go 的 2.7–3.4 倍；多因子 Session/Batch 分别快 3.8%/13.8%，趋势慢 15.1%/18.8%，成交量动量慢 7.9%/12.3%。这些是整段数值执行数据，不代表单 bar 或完整交易回测，应随改动重测。
+原生表达式消除了重复策略代码和运行时解析，但不保证比融合的 Go `Custom` 更快。多个原生算术节点会增加中间 map、Series 及分配；公共子图去重也只有在实际重复时收益明显。可使用 banstrats 的 `examples/crosssection/performance_test.go` 对当前版本重测，分别比较编译、Session/Batch 数值执行与完整交易回测；本次发布没有验收全量性能基准。
 
 架构契约的可运行核对入口包括 [表达式编译测试](../factor/expr/compile_test.go)、[逐点测试](../factor/pointwise_test.go)、[runner 表达式测试](../factor/runner/expressions_test.go) 和 [入口测试](../entry/factor_expressions_test.go)。编写新因子及复现测试见[使用指南](factor_expression_guide.md)。

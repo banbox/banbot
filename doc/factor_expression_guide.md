@@ -105,12 +105,18 @@ param.window      本定义集 params 中的编译期参数
 | `cs.rank(x)` | 升序、0 起始名次，并列取平均名次；不是百分位 |
 | `cs.zscore(x)` | 使用参考池均值和总体标准差标准化；标准差为 0 时有效输出为 0 |
 | `cs.winsorize(x,tail)` | 将有效值限制在参考池两端分位点内，`0 <= tail < 0.5` |
+| `cs.mad_winsorize(x,k)` | 按参考中位数与缩放 MAD 截尾，k 必须为正 |
+| `cs.robust_zscore(x)` | 中位数 / `1.4826 × MAD` 稳健标准化，零 MAD 输出零 |
 | `cs.quantile(x,q)` | 参考池分位数，`0 <= q <= 1`；同一分位值广播给有有效输入的资产 |
 | `group.residual(y,x)` | 用参考池完整有效配对拟合带截距的一元截面回归，输出残差 |
+| `group.ols(y,x1,x2,...)` | 含截距的多暴露回归残差，共线暴露按声明顺序处理 |
+| `group.wls(y,weight,x1,x2,...)` | 正权重的多暴露加权回归残差 |
+| `group.demean(x,"source","field")` | 按原始分组字段计算组内去均值 |
+| `group.zscore(x,"source","field")` | 按原始分组字段计算组内标准化 |
 
 分位点使用排序值间的线性插值。例如 `[10,10,30]` 的 rank 为 `[0.5,0.5,2]`，中位数为 `10`。三项全相同时 rank 均为 `1`，z-score 均为 `0`。
 
-`group.residual` 沿用内核的有效性规则：`x` 无效的观测记为 Missing，完整配对不足时其他有效目标可能得到 Warmup。需要精确保留回归输入原始无效原因的策略，可以继续使用有明确依赖和版本的 Go 定义。`group.demean`、`group.zscore` 当前未开放为表达式函数。
+`group.residual` 沿用内核的有效性规则：`x` 无效的观测记为 Missing，完整配对不足时其他有效目标可能得到 Warmup。需要精确保留回归输入原始无效原因的策略，可以继续使用有明确依赖和版本的 Go 定义。分组函数的 source 须在 bindings 中声明，字段保留原始类型/NULL；慢频暴露应使用显式 asof 和 max_age_ms。统计量只在当时冻结的 Reference 拟合。详细数值合同见 [研究扩展](factor_research_extensions.md)。
 
 ## 4. 多因子组合
 
@@ -125,7 +131,7 @@ combine:
 
 `fixed` 按给定权重直接相加，允许负权重，不自动归一化。每个选中列都必须有有限权重，权重不能指向未选中列；列名必须存在且不重复。非零权重列无效会使对应资产的组合分数无效，不会针对该资产临时重分配权重；零权重列不参与求值有效性判断。外层 `combo` 如显式设置 `method`，会覆盖表达式内的整个组合配置。
 
-`history-ic` 使用已经成熟且在决策时点可见的历史 IC，历史不足时退回等权。归档研究/回测需要配置可用标签；当前实盘驱动拒绝该方法，实盘使用 `fixed` 或 `equal`。未来标签不进入公式，不能写 `label.future_return`。
+历史方法包括 `history-ic`、`history-rank-ic`、`history-icir`、`history-rank-icir`、`history-ewma`，只使用已成熟且在决策时可见的样本。通过 `label` 选择期限，`min_samples/min_pairs/min_confidence` 控制门槛，`direction` 控制方向，`fallback` 显式选择 equal/fixed/error；EWMA 的 decay 为 alpha。单标签省略 label 保持原身份，多标签省略时选择最短期限，同期限按名称稳定排序。当前实盘驱动拒绝全部历史方法，需接入成熟历史 provider 后才能启用。未来标签不进入公式，不能写 `label.future_return`。
 
 ## 5. 放入策略配置并运行
 
@@ -164,7 +170,7 @@ run_policy:
 ./banbot backtest --config strategy.yml
 ```
 
-`research` 使用统一驱动和成熟标签生成因子研究结果。普通配置默认提供一个决策周期的 executable-return 标签；需要自定义时可设置 `research.labels`。归档驱动当前只支持一个 executable-return 标签周期，例如：
+`research` 使用统一驱动和成熟标签生成因子研究结果。普通配置默认提供一个决策周期的 executable-return 标签；可通过 `research.labels` 同时声明多个期限，共享冻结 Frame 并分别捕获价格、成熟和报告 unresolved，例如：
 
 ```yaml
 research:
@@ -174,9 +180,14 @@ research:
       horizon: 3600000
       periods_per_year: 8766
       overlapping: true
+    - name: forward_16h
+      kind: executable-return
+      horizon: 57600000
+      periods_per_year: 547.5
+      overlapping: true
 ```
 
-这段映射应放在 `factor` 下。纯交易回放使用固定/等权且不需要研究时，可显式设置 `research: {labels: []}`；`research` 和 `history-ic` 不能关闭标签。手工 Go 研究可另用 `research.ReturnLabel`、`LabelQueue`、`Evaluate`，并遵守各自标签的成熟和可见时间。
+这段映射直接放在 `run_policy[]` 的策略条目下。各期限分别占用有界 max_pending；长周期可能在回放尾端未成熟，未完成结果不能当零收益。纯交易回放使用固定/等权且不需要研究时，可显式设置 `research: {labels: []}`；`research` 和全部历史合成方法不能关闭标签。手工 Go 研究可另用 `research.ReturnLabel`、`LabelQueue`、`Evaluate`，并遵守各自标签的成熟和可见时间。
 
 从普通历史数据库读取时，使用已有数据库、市场、交易对池和 `time_range` 基础配置，移除 `archive`，声明 `data.pit_policy: static-approximation`。普通最新值存储不能证明历史修订的严格 PIT；需要严格 PIT 时使用具有可见性和版本记录的不可变归档或受验证的历史输入。
 
@@ -286,6 +297,8 @@ go build -o factorbot ./cmd/factorbot
 因子和组合分数确定后，默认持仓构建器按 `score` 选择最高/最低各 `k` 个有效、可投资且可交易资产，根据 `long_notional`、`short_notional` 分配冻结 NAV 的名义权重。至少需要 `2*k` 个有效候选；不足或全部分数相同时跳过替换并保持已有组合，同时输出诊断。它输出的是目标组合，不是策略逐资产自行下单。
 
 需要行业约束、风险预算或其他持仓规则时，可使用 `runner.RegisterPortfolioBuilder` 注册独立版本名，并在 `portfolio.builder` 中指定。其函数签名见 [definition.go](../factor/runner/definition.go)：消费冻结 Frame、Universe、PortfolioSpec 和 PortfolioDefinition，返回 TargetPortfolio、诊断和错误。也可在 Go Config 中传入 `PortfolioBuilder`，同时提供 manifest 的版本名。组合与账户状态应保持在各自运行实例中，不放进共享因子计算状态。
+
+builder 产生理想权重；持仓年龄、调仓日程、退出曲线和批次使用 `PortfolioPolicy`。通过 `portfolio.policy: lifecycle-v1` 启用常见预设，或以带版本的工厂注册完整自定义 policy。最终 `PortfolioTarget` 可混合 NAV 权重和精确资产数量；旧 `TargetPortfolio` 保持纯权重。配置、恢复和自定义方法见 [组合与持仓指南](factor_portfolio_guide.md)。纯 CLI research 没有实际持仓证据源，不能直接启用有状态 policy；研究交易期限可先用 weights 参数扫描，再调用成本/生命周期报告 API。
 
 ## 7. 两种定义方式的回测与实盘
 

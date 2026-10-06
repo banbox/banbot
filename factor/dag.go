@@ -102,6 +102,14 @@ func StdDev(input *Node, period, ddof int) *Node {
 }
 func Rank(input *Node) *Node   { return node("rank", CS, input) }
 func ZScore(input *Node) *Node { return node("zscore", CS, input) }
+
+// RobustZScore centers at the reference median and scales by 1.4826*MAD.
+func RobustZScore(input *Node) *Node { return node("robust-zscore", CS, input) }
+func MADWinsorize(input *Node, multiple float64) *Node {
+	n := node("mad-winsorize", CS, input)
+	n.Spec.Parameters["multiple"] = multiple
+	return n
+}
 func Winsorize(input *Node, tail float64) *Node {
 	n := node("winsorize", CS, input)
 	n.Spec.Parameters["tail"] = tail
@@ -131,6 +139,16 @@ func GroupZScore(input *Node, source, field string, sourceTimeFrame ...string) *
 	return n
 }
 func Residual(y, x *Node) *Node { return node("residual", GROUP, y, x) }
+
+// MultiResidual fits an intercept and all exposures on the reference pool.
+func MultiResidual(y *Node, exposures ...*Node) *Node {
+	return node("multi-residual", GROUP, append([]*Node{y}, exposures...)...)
+}
+
+// WeightedResidual additionally requires positive, PIT-visible fit weights.
+func WeightedResidual(y, weights *Node, exposures ...*Node) *Node {
+	return node("weighted-residual", GROUP, append([]*Node{y, weights}, exposures...)...)
+}
 
 // Custom declares a versioned pure pointwise Go evaluator with explicit
 // dependencies. Stateful custom indicators require a separate tested contract;
@@ -357,9 +375,9 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 	}
 	expectedKind := TS
 	switch spec.Operator {
-	case "rank", "zscore", "winsorize", "quantile":
+	case "rank", "zscore", "winsorize", "quantile", "robust-zscore", "mad-winsorize":
 		expectedKind = CS
-	case "group-demean", "group-zscore", "residual":
+	case "group-demean", "group-zscore", "residual", "multi-residual", "weighted-residual":
 		expectedKind = GROUP
 	}
 	if spec.Kind != expectedKind {
@@ -424,6 +442,16 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 		}
 		return nil
 	}
+	if spec.Operator == "multi-residual" || spec.Operator == "weighted-residual" {
+		minimum := 2
+		if spec.Operator == "weighted-residual" {
+			minimum = 3
+		}
+		if count < minimum {
+			return errors.New("factor: neutralization needs response and exposures")
+		}
+		return nil
+	}
 	if count != 1 {
 		return fmt.Errorf("factor: %s requires one dependency", spec.Operator)
 	}
@@ -439,7 +467,11 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 				return errors.New("factor: invalid ddof")
 			}
 		}
-	case "rank", "zscore":
+	case "rank", "zscore", "robust-zscore":
+	case "mad-winsorize":
+		if spec.Parameters["multiple"] <= 0 {
+			return errors.New("factor: positive MAD multiple required")
+		}
 	case "winsorize":
 		if q := spec.Parameters["tail"]; q < 0 || q >= 0.5 {
 			return errors.New("factor: winsor tail must be [0,0.5)")

@@ -644,6 +644,10 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 				}
 			}
 		}
+		sink.PolicySIDMap = make(map[int32]string, len(cfg.Snapshot.SIDMap))
+		for sid, symbol := range cfg.Snapshot.SIDMap {
+			sink.PolicySIDMap[sid] = symbol
+		}
 		if err := sink.RegisterExecution(); err != nil {
 			return err
 		}

@@ -1,5 +1,7 @@
 # BanBot 时序与截面双引擎、共享执行的架构调整方案
 
+> 2026-10-06 扩展：DecisionEngine 后新增每策略 PortfolioPolicy，使用版本化 allocation 和 owner 原子 checkpoint；独立调仓、真实 fill 年龄、渐退/cohort 与动态尾仓订阅已贯通。多 horizon、历史 RankIC/ICIR/EWMA、稳健表达式及原生模型/风险/实验 API 见 [实施记录](factor_opt_implementation.md)。下表与历史章节仍保留原重构阶段的验收范围。
+
 > 2026-10-04 校订：本文保留历史设计和测试口径。当前使用见[多因子指南](../bandoc/zh-CN/guide/factor.md)，逐包实施/暂缓与本次实际验证见[重构记录](strategy_engine_refactor.md)。缺失实施文档的链接已修复，历史结果不据此重新验收；真实 venue 与性能承诺仍需独立证据。
 
 

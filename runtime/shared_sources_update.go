@@ -259,6 +259,19 @@ func (r *Runtime) InstallFactorsLive(provider *data.LiveProvider, engines []*run
 	if err := validateLiveMappers(engines, cfgs, mappers); err != nil {
 		return nil, err
 	}
+	var snapshot execution.AccountSnapshot
+	if account := r.SharedExecution(); account != nil {
+		var err error
+		snapshot, err = account.Snapshot(r.Context())
+		if err != nil {
+			return nil, err
+		}
+	}
+	var err error
+	cfgs, err = retainPolicyConsumers(engines, cfgs, nil, snapshot)
+	if err != nil {
+		return nil, err
+	}
 	plan, err := r.CompileFactorsLivePlan(engines, cfgs)
 	if err != nil {
 		return nil, err
@@ -416,6 +429,17 @@ func (s *FactorLiveSubscription) Update(ctx context.Context, engines []*runner.L
 	if err := s.validateLegacy(); err != nil {
 		return false, err
 	}
+	if s.runtime.SharedExecution() == nil {
+		return false, errors.New("runtime: dynamic subscriptions require serialized shared account ownership")
+	}
+	snapshot, err := s.runtime.SharedExecution().Snapshot(ctx)
+	if err != nil {
+		return false, err
+	}
+	cfgs, err = retainPolicyConsumers(engines, cfgs, previous, snapshot)
+	if err != nil {
+		return false, err
+	}
 	plan, err := s.runtime.CompileFactorsLivePlan(engines, cfgs)
 	if err != nil {
 		return false, err
@@ -522,6 +546,29 @@ func (s *FactorLiveSubscription) Update(ctx context.Context, engines []*runner.L
 	joinErr := previous.join()
 	s.retiredErr = errors.Join(s.retiredErr, joinErr)
 	return true, errors.Join(err, joinErr)
+}
+
+// Prepare only fresh candidate metadata; admission and policy state stay with
+// the current generation until the existing callback-boundary commit below.
+func retainPolicyConsumers(engines []*runner.Live, cfgs []runner.Config, previous *factorLiveGeneration, snapshot execution.AccountSnapshot) ([]runner.Config, error) {
+	owned := append([]runner.Config(nil), cfgs...)
+	old := map[string]*runner.Live{}
+	if previous != nil {
+		for _, consumer := range previous.sink.consumers {
+			old[consumer.cfg.StrategyID] = consumer.engine
+		}
+	}
+	for i, engine := range engines {
+		config, err := engine.RetainPolicyScope(old[cfgs[i].StrategyID], snapshot)
+		if err != nil {
+			return nil, err
+		}
+		if config.StrategyID != cfgs[i].StrategyID || config.AccountID != cfgs[i].AccountID || config.Prices != cfgs[i].Prices {
+			return nil, errors.New("runtime: candidate engine/config scope mismatch")
+		}
+		owned[i] = config
+	}
+	return owned, nil
 }
 
 func subscriptionPlanRequests(plan *data.SubscriptionPlan) []data.SubscriptionRequest {

@@ -74,6 +74,16 @@ func (s *SharedAccount) prepareStrategy(request StrategyRebalance, ctx context.C
 // The owner merges other strategies and commits all definitions and acceptance
 // events with the frozen account plan. Call it within WithState.
 func (s *SharedAccount) PrepareStrategiesWithCheckpoint(updates []StrategyRebalance, ctx context.Context, checkpoint *StrategyCheckpoint) (PreparedRebalance, error) {
+	var checkpoints []StrategyCheckpoint
+	if checkpoint != nil {
+		checkpoints = append(checkpoints, *checkpoint)
+	}
+	return s.PrepareStrategiesWithCheckpoints(updates, ctx, checkpoints)
+}
+
+// PrepareStrategiesWithCheckpoints freezes every strategy checkpoint in one
+// account transaction. Checkpoint contents participate in retry identity.
+func (s *SharedAccount) PrepareStrategiesWithCheckpoints(updates []StrategyRebalance, ctx context.Context, policyCheckpoints []StrategyCheckpoint) (PreparedRebalance, error) {
 	if !s.ready {
 		return PreparedRebalance{}, errors.New("execution: shared account is not reconciled")
 	}
@@ -97,7 +107,7 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoint(updates []StrategyRebala
 		owned[r.Strategy] = r.Mode
 	}
 	request := updates[0]
-	if checkpoint != nil {
+	for _, checkpoint := range policyCheckpoints {
 		for _, event := range checkpoint.Events {
 			if owned[event.Strategy] == "" {
 				return PreparedRebalance{}, errors.New("execution: acceptance event does not own strategy")
@@ -105,6 +115,12 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoint(updates []StrategyRebala
 		}
 	}
 	body, err := payload(updates)
+	if len(policyCheckpoints) > 0 {
+		body, err = payload(struct {
+			Updates     []StrategyRebalance
+			Checkpoints []StrategyCheckpoint
+		}{updates, policyCheckpoints})
+	}
 	if err != nil {
 		return PreparedRebalance{}, err
 	}
@@ -122,27 +138,7 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoint(updates []StrategyRebala
 		if accepted.Empty {
 			return PreparedRebalance{}, nil
 		}
-		var result PreparedRebalance
-		result.Plan, err = s.store.Plan(ctx, request.PlanID)
-		if err != nil {
-			return result, err
-		}
-		err = s.store.commit(ctx, func(tx *storeTxn) error {
-			rows, err := tx.Query(opListPlanOrders, s.store.accountID, request.PlanID)
-			if err != nil {
-				return err
-			}
-			defer rows.Close()
-			for rows.Next() {
-				var id string
-				if err := rows.Scan(&id); err != nil {
-					return err
-				}
-				result.OrderIDs = append(result.OrderIDs, id)
-			}
-			return rows.Err()
-		})
-		return result, err
+		return s.restorePreparedRebalance(ctx, request.PlanID)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return PreparedRebalance{}, err
 	}
@@ -273,9 +269,7 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoint(updates []StrategyRebala
 	revision.Empty = len(combined.Requests) == 0
 	data, _ := json.Marshal(revision)
 	var checkpoints []StrategyCheckpoint
-	if checkpoint != nil {
-		checkpoints = append(checkpoints, *checkpoint)
-	}
+	checkpoints = append(checkpoints, policyCheckpoints...)
 	for _, update := range updates {
 		checkpoints = append(checkpoints, StrategyCheckpoint{Strategy: update.Strategy, Name: name, Payload: data})
 	}
@@ -293,6 +287,31 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoint(updates []StrategyRebala
 		return PreparedRebalance{}, err
 	}
 	return s.prepareRebalanceWithCheckpoints(combined, ctx, checkpoints)
+}
+
+func (s *SharedAccount) restorePreparedRebalance(ctx context.Context, planID string) (PreparedRebalance, error) {
+	var result PreparedRebalance
+	var err error
+	result.Plan, err = s.store.Plan(ctx, planID)
+	if err != nil {
+		return result, err
+	}
+	err = s.store.commit(ctx, func(tx *storeTxn) error {
+		rows, err := tx.Query(opListPlanOrders, s.store.accountID, planID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			result.OrderIDs = append(result.OrderIDs, id)
+		}
+		return rows.Err()
+	})
+	return result, err
 }
 
 // Retire inherited zero declarations only after all corresponding execution

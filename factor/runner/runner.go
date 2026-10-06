@@ -40,8 +40,10 @@ type Config struct {
 	ComputationGroup                                   *ComputationGroup `json:"-"`
 	ComputationContext                                 ComputationContext
 	Execution                                          ExecutionConfig
-	Plan                                               *factor.Plan     `json:"-"`
-	PortfolioBuilder                                   PortfolioBuilder `json:"-"`
+	Plan                                               *factor.Plan                                          `json:"-"`
+	PortfolioBuilder                                   PortfolioBuilder                                      `json:"-"`
+	PolicyContext                                      func(context.Context, *factor.PortfolioContext) error `json:"-"`
+	PolicySIDMappingVersion                            string                                                `json:",omitempty"`
 	Mode                                               Mode
 	Chunks                                             []Chunk
 	HistoricalInput                                    HistoricalInputFactory                       `json:"-"`
@@ -99,12 +101,15 @@ type Result struct {
 	Manifest                                                           research.ManifestSpec
 	NodeCount, MaxRawRecords, MaxPendingEvaluations, MaxRetainedValues int
 	NodeUpdates                                                        map[string]uint64
+	UnresolvedByHorizon                                                map[string]int `json:",omitempty"`
 }
 type evaluation struct {
+	label             research.LabelSpec
 	frame             factor.Frame
 	begin, end        map[int32]backtest.Quote
 	weights, previous map[int32]float64
 	deadline          int64
+	previousColumns   map[string]map[int32]factor.Numeric
 }
 
 func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, runErr error) {
@@ -238,8 +243,31 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		}
 		return backtest.State{}
 	}
+	policy, err := newPolicyRun(c)
+	if err != nil {
+		return result, err
+	}
+	if policy != nil && book == nil {
+		if _, ok := sink.(PolicySink); !ok {
+			return result, errors.New("runner: lifecycle policy requires an allocation-capable sink and explicit position evidence")
+		}
+	}
+	var policyPending *pendingProposal
 	var history *research.ICHistory
-	if combo.Method == research.HistoryIC {
+	if research.IsHistoryMethod(combo.Method) {
+		if combo.Label != "" {
+			found := false
+			for _, label := range c.Manifest.Labels {
+				if label.Name == combo.Label {
+					labelSpec = label
+					found = true
+					break
+				}
+			}
+			if !found {
+				return result, errors.New("runner: history label not declared")
+			}
+		}
 		history, err = research.NewICHistory(256, labelSpec.Name, combo.Columns)
 		if err != nil {
 			return result, err
@@ -247,7 +275,11 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	}
 	var acc *research.Accumulator
 	if len(c.Manifest.Labels) > 0 {
-		acc, err = research.NewAccumulator(append(plan.Outputs(), "score"), []string{labelSpec.Name})
+		names := make([]string, len(c.Manifest.Labels))
+		for i, label := range c.Manifest.Labels {
+			names[i] = label.Name
+		}
+		acc, err = research.NewAccumulator(append(plan.Outputs(), "score"), names)
 		if err != nil {
 			return result, err
 		}
@@ -257,13 +289,18 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	var pending *factor.TargetPortfolio
 	var executed *factor.TargetPortfolio
 	var previousWeights map[int32]float64
+	var previousColumns map[string]map[int32]factor.Numeric
 	var evaluations []*evaluation
 	quotes := map[int32]backtest.Quote{}
 	var sequence uint64
 	lastTime := int64(0)
 	finish := func(now int64) error {
-		for len(evaluations) > 0 && evaluations[0].deadline <= now {
-			e := evaluations[0]
+		for i := 0; i < len(evaluations); {
+			e := evaluations[i]
+			if e.deadline > now {
+				i++
+				continue
+			}
 			labels := make([]research.Label, 0, len(c.Snapshot.Universe.Evaluation))
 			for _, sid := range c.Snapshot.Universe.Evaluation {
 				begin := e.begin[sid]
@@ -279,24 +316,24 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				if end.Price > 0 {
 					en = factor.Numeric{Value: end.Price, Validity: factor.Valid}
 				}
-				l, err := research.ReturnLabel(labelSpec, sid, e.frame.DecisionTime, bAt, bAt+labelSpec.Horizon, max(bAt+labelSpec.Horizon, now), bn, en)
+				l, err := research.ReturnLabel(e.label, sid, e.frame.DecisionTime, bAt, bAt+e.label.Horizon, max(bAt+e.label.Horizon, now), bn, en)
 				if err != nil {
 					return err
 				}
 				labels = append(labels, l)
 			}
-			report, err := research.Evaluate(e.frame, c.Snapshot.Universe, labels, research.EvaluationSpec{AsOf: now, PrimaryLabel: labelSpec.Name, CostRate: c.Manifest.Costs.FeeRate + c.Manifest.Costs.SlippageRate, CurrentWeights: e.weights, PreviousWeights: e.previous})
+			report, err := research.Evaluate(e.frame, c.Snapshot.Universe, labels, research.EvaluationSpec{AsOf: now, PrimaryLabel: e.label.Name, CostRate: c.Manifest.Costs.FeeRate + c.Manifest.Costs.SlippageRate, CurrentWeights: e.weights, PreviousWeights: e.previous, PreviousColumns: e.previousColumns})
 			if err != nil {
 				return err
 			}
 			if err = acc.Add(report); err != nil {
 				return err
 			}
-			if history != nil {
+			if history != nil && e.label.Name == labelSpec.Name {
 				for _, name := range combo.Columns {
 					lm := report.Columns[name].Labels[labelSpec.Name]
 					if lm.Pairs >= 2 {
-						if err = history.Add(now, research.ICSample{Column: name, Label: labelSpec.Name, DecisionTime: e.frame.DecisionTime, MatureAt: now, AvailableAt: now, IC: lm.IC, Samples: lm.Pairs}); err != nil {
+						if err = history.Add(now, research.ICSample{Column: name, Label: labelSpec.Name, DecisionTime: e.frame.DecisionTime, MatureAt: now, AvailableAt: now, IC: lm.IC, RankIC: lm.RankIC, Samples: lm.Pairs}); err != nil {
 							return err
 						}
 					}
@@ -307,8 +344,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 					return err
 				}
 			}
-			evaluations[0] = nil
-			evaluations = evaluations[1:]
+			copy(evaluations[i:], evaluations[i+1:])
+			evaluations[len(evaluations)-1] = nil
+			evaluations = evaluations[:len(evaluations)-1]
 		}
 		return nil
 	}
@@ -381,11 +419,11 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 						if q.AtMS >= e.frame.DecisionTime+c.LatencyMS && q.AtMS <= e.frame.DecisionTime+c.ExpiryMS {
 							if _, ok := e.begin[r.Series.Sid]; !ok {
 								e.begin[r.Series.Sid] = q
-								e.deadline = max(e.deadline, q.AtMS+labelSpec.Horizon+c.LabelWaitMS)
+								e.deadline = max(e.deadline, q.AtMS+e.label.Horizon+c.LabelWaitMS)
 							}
 						}
 						begin, ok := e.begin[r.Series.Sid]
-						if ok && q.AtMS == begin.AtMS+labelSpec.Horizon {
+						if ok && q.AtMS == begin.AtMS+e.label.Horizon {
 							e.end[r.Series.Sid] = q
 						}
 					}
@@ -413,6 +451,58 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if c.ObserveBatch != nil {
 				if err = c.ObserveBatch(ctx, batch); err != nil {
 					return result, err
+				}
+			}
+			if policyPending != nil {
+				if now >= policyPending.spec.ExpireAt {
+					policyPending = nil
+					result.Skipped++
+				} else {
+					policyPending, err = policy.refresh(ctx, c, policyPending, sink, book, quotes, now)
+					if err != nil {
+						return result, err
+					}
+					ready, readyErr := proposalReady(policyPending, policy.previous, quotes, now, c.Snapshot.Universe.Tracked)
+					if readyErr != nil {
+						return result, readyErr
+					}
+					if ready {
+						var receipt execution.PolicyReceipt
+						if book != nil {
+							receipt, err = book.AcceptProposal(policyPending.proposal, policyPending.version, policyPending.cursor, quotes, now, c.Manifest.Costs.FeeRate, c.Manifest.Costs.SlippageRate)
+						} else {
+							receipt, err = sink.(PolicySink).AcceptProposal(ctx, policyPending.proposal, policyPending.version, policyPending.cursor, copyQuotes(quotes), now)
+						}
+						if receipt.Accepted {
+							if acceptErr := policy.accepted(policyPending); acceptErr != nil {
+								return result, acceptErr
+							}
+							if policyPending.proposal.Target != nil {
+								result.Executions++
+								result.TargetsAccepted++
+								state := bookState()
+								if source, ok := sink.(StateSource); ok {
+									state, err = source.StrategyState(ctx, now)
+									if err != nil {
+										return result, err
+									}
+								}
+								if outputErr := emitAllocationAccepted(out, policyPending.proposal.Target, state, now); outputErr != nil {
+									return result, outputErr
+								}
+							}
+							policyPending = nil
+						}
+						if errors.Is(err, execution.ErrPolicyEvidenceChanged) {
+							err = nil
+						}
+						if err != nil {
+							return result, err
+						}
+						if receipt.SendError != nil {
+							return result, receipt.SendError
+						}
+					}
 				}
 			}
 			if pending != nil {
@@ -473,7 +563,11 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				return result, err
 			}
 			grid := now - c.DecisionDelayMS
-			if grid <= 0 || (grid-chunk.From)%c.DecisionInterval != 0 {
+			gridOffset := chunk.From
+			if policy != nil {
+				gridOffset = 0
+			}
+			if grid <= 0 || (grid-gridOffset)%c.DecisionInterval != 0 {
 				if c.timeline != nil {
 					c.timeline.leave()
 				}
@@ -510,6 +604,38 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if errors.Is(err, factor.ErrSnapshotIncomplete) {
 				if !warming {
 					result.Incomplete++
+					if policy != nil {
+						evidence, evidenceErr := policyEvidence(ctx, sink, book, now)
+						if evidenceErr != nil {
+							return result, evidenceErr
+						}
+						sequence = max(sequence+1, evidence.PlanSequence+1)
+						nav := c.InitialNAV
+						if book != nil {
+							nav = bookState().NAV
+						}
+						if source, ok := sink.(BudgetSource); ok {
+							nav, evidenceErr = source.StrategyNAV(ctx, now)
+							if evidenceErr != nil {
+								return result, evidenceErr
+							}
+						}
+						monitor, monitorErr := policyMonitoringFrame(plan.Hash(), grid, now, evidence)
+						if monitorErr != nil {
+							return result, monitorErr
+						}
+						sp := engine.portfolioSpec(monitor, spec.Universe, sequence, nav, now+c.LatencyMS, now+c.ExpiryMS)
+						candidate, candidateErr := policy.propose(ctx, c, monitor, spec.Universe, nil, sp, grid, evidence, quotes, true)
+						if candidateErr != nil {
+							return result, candidateErr
+						}
+						if err := emitAllocationDecision(out, monitor, candidate.proposal.Target, append(candidate.proposal.Reasons, factor.Diagnostic{Code: "policy-monitor-incomplete", Detail: "only expiry and hard exits checked; no ordinary ranking step"})); err != nil {
+							return result, err
+						}
+						if !candidate.noop {
+							policyPending = candidate
+						}
+					}
 				}
 				if c.timeline != nil {
 					c.timeline.leave()
@@ -545,35 +671,84 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 					return result, err
 				}
 			}
+			var evidence factor.PortfolioEvidence
+			if policy != nil {
+				evidence, err = policyEvidence(ctx, sink, book, now)
+				if err != nil {
+					return result, err
+				}
+				sequence = max(sequence, evidence.PlanSequence+1)
+			}
 			p, pdiag, err := engine.buildPortfolio(frame, spec.Universe, sequence, nav, now+c.LatencyMS, now+c.ExpiryMS)
 			if err != nil {
 				return result, err
 			}
 			diags = append(diags, pdiag...)
 			result.Decisions++
-			if out != nil {
+			var policyWeights map[int32]float64
+			if policy != nil {
+				portfolioSpec := engine.portfolioSpec(frame, spec.Universe, sequence, nav, now+c.LatencyMS, now+c.ExpiryMS)
+				proposal, proposalErr := policy.propose(ctx, c, frame, spec.Universe, p, portfolioSpec, grid, evidence, quotes, false)
+				if proposalErr != nil {
+					return result, proposalErr
+				}
+				diags = append(diags, proposal.proposal.Reasons...)
+				if outputErr := emitAllocationDecision(out, frame, proposal.proposal.Target, diags); outputErr != nil {
+					return result, outputErr
+				}
+				if proposal.proposal.Target == nil {
+					policyWeights = previousWeights
+				} else {
+					effective, effectiveErr := proposal.proposal.Target.EffectiveAllocations(policy.previous)
+					if effectiveErr != nil {
+						return result, effectiveErr
+					}
+					valued, valueErr := factor.NewPortfolioTarget(proposal.proposal.Target.Spec(), effective)
+					if valueErr != nil {
+						return result, valueErr
+					}
+					policyWeights = allocationWeights(valued, quotes)
+				}
+				if policyPending != nil {
+					result.Skipped++
+				}
+				policyPending = proposal
+				if proposal.noop {
+					policyPending = nil
+					result.Skipped++
+				}
+			} else if out != nil {
 				if err = out.Decision(factor.CloneFrame(frame), p, diags); err != nil {
 					return result, err
 				}
 			}
-			if p != nil {
+			if policy == nil && p != nil {
 				if pending != nil {
 					result.Skipped++
 				}
 				pending = p
-			} else {
+			} else if policy == nil {
 				result.Skipped++
 			}
 			if acc != nil {
-				if len(evaluations) >= c.MaxPending {
+				if len(evaluations)+len(c.Manifest.Labels) > c.MaxPending {
 					return result, errors.New("runner: pending label bound exceeded")
 				}
-				e := &evaluation{frame: frame, begin: map[int32]backtest.Quote{}, end: map[int32]backtest.Quote{}, previous: previousWeights, deadline: now + c.ExpiryMS + labelSpec.Horizon + c.LabelWaitMS}
+				var weights map[int32]float64
 				if p != nil {
-					e.weights = p.Targets()
-					previousWeights = e.weights
+					weights = p.Targets()
 				}
-				evaluations = append(evaluations, e)
+				if policy != nil {
+					weights = policyWeights
+				}
+				for _, label := range c.Manifest.Labels {
+					e := &evaluation{label: label, frame: frame, begin: map[int32]backtest.Quote{}, end: map[int32]backtest.Quote{}, previous: previousWeights, weights: weights, deadline: now + c.ExpiryMS + label.Horizon + c.LabelWaitMS, previousColumns: previousColumns}
+					evaluations = append(evaluations, e)
+				}
+				if weights != nil {
+					previousWeights = weights
+				}
+				previousColumns = factor.CloneFrame(frame).Values
 				result.MaxPendingEvaluations = max(result.MaxPendingEvaluations, len(evaluations))
 			}
 			if c.timeline != nil {
@@ -588,7 +763,16 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		}
 	}
 	result.Unresolved = len(evaluations)
+	if len(evaluations) > 0 {
+		result.UnresolvedByHorizon = map[string]int{}
+		for _, e := range evaluations {
+			result.UnresolvedByHorizon[e.label.Name]++
+		}
+	}
 	if pending != nil {
+		result.Skipped++
+	}
+	if policyPending != nil {
 		result.Skipped++
 	}
 	result.Book = bookState()

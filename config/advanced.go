@@ -32,9 +32,23 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.HasSuffix(path, ".prices"):
 		allowed = "source timeframe field"
 	case strings.HasSuffix(path, ".combo"), strings.HasSuffix(path, ".expressions.combine"):
-		allowed = "method columns weights"
+		allowed = "method columns weights min_samples min_pairs min_confidence decay direction fallback label"
 	case strings.HasSuffix(path, ".portfolio"):
-		allowed = "builder k long_notional short_notional mode"
+		allowed = "builder k long_notional short_notional mode policy policy_params rebalance selection holding transition allocation"
+	case strings.HasSuffix(path, ".rebalance"):
+		allowed = "every_bars anchor phase duration calendar calendar_version timezone"
+	case strings.HasSuffix(path, ".selection"):
+		allowed = "long_k short_k long_quantile short_quantile retain_rank dropout group_quota missing_scores"
+	case strings.HasSuffix(path, ".holding"):
+		allowed = "min_bars max_bars min_duration max_duration by_asset adopt cooldown_bars"
+	case strings.Contains(path, ".holding.by_asset."):
+		allowed = "min_bars max_bars min_duration max_duration"
+	case strings.HasSuffix(path, ".transition"):
+		allowed = "mode exit_steps basis period_bars startup sizing on_reselect ratio final_threshold alpha entry_window_bars by_asset"
+	case strings.Contains(path, ".transition.by_asset."):
+		allowed = "exit_steps ratio"
+	case strings.HasSuffix(path, ".allocation"):
+		allowed = "method reserve_ratio fixed_notional vol_target asset_cap group_caps turnover_limit net_cap beta_cap"
 	case strings.HasSuffix(path, ".research"):
 		allowed = "labels label_wait_ms"
 	case strings.HasSuffix(path, ".snapshot"):
@@ -71,11 +85,14 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if strings.HasSuffix(path, ".portfolio") {
 				valid = "full patch"
 			}
+			if strings.HasSuffix(path, ".transition") {
+				valid = "direct linear-exit cohort geometric target-step"
+			}
 			if !ok || !strings.Contains(" "+valid+" ", " "+text+" ") {
 				return fmt.Errorf("%s has unsupported mode %v", field, value)
 			}
 		case "method":
-			if text, ok := value.(string); !ok || (text != "equal" && text != "fixed" && text != "history-ic") {
+			if text, ok := value.(string); (!strings.HasSuffix(path, ".allocation")) && (!ok || !strings.Contains(" equal fixed history-ic history-rank-ic history-icir history-rank-icir history-ewma ", " "+text+" ")) {
 				return fmt.Errorf("%s has unsupported combo method %v", field, value)
 			}
 		case "page_bytes":
@@ -85,6 +102,18 @@ func validateAdvanced(path string, fields map[string]any) error {
 			item := reflect.ValueOf(value)
 			if item.Kind() >= reflect.Uint && item.Kind() <= reflect.Uint64 && item.Uint() > math.MaxInt64 {
 				return fmt.Errorf("%s exceeds int64", field)
+			}
+		case "every_bars", "exit_steps", "period_bars", "entry_window_bars":
+			if !nonnegativeInteger(value) || numeric(value) <= 0 {
+				return fmt.Errorf("%s must be a positive integer", field)
+			}
+		case "long_k", "short_k", "retain_rank", "dropout", "min_bars", "max_bars", "cooldown_bars", "phase", "anchor", "min_samples", "min_pairs":
+			if !nonnegativeInteger(value) {
+				return fmt.Errorf("%s must be a nonnegative integer", field)
+			}
+		case "duration", "min_duration", "max_duration":
+			if _, err := ParseDurationOverride(value); err != nil {
+				return fmt.Errorf("%s: %w", field, err)
 			}
 		case "page_rows", "prefetch_rows", "max_records", "max_pending", "k", "interval_ms", "expiry_ms", "horizon", "schema_version", "max_age_ms":
 			if !nonnegativeInteger(value) || numeric(value) <= 0 {
@@ -127,13 +156,13 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if reflect.TypeOf(value).Kind() != reflect.Slice {
 				return fmt.Errorf("%s must be a list", field)
 			}
-		case "snapshot", "combo", "portfolio", "decision", "research", "manifest", "prices", "universe", "costs", "accounts", "weights", "parameters", "schemas", "source_versions", "sid_map", "instruments", "expressions", "bindings", "params", "lets", "outputs", "combine":
+		case "snapshot", "combo", "portfolio", "decision", "research", "manifest", "prices", "universe", "costs", "accounts", "weights", "parameters", "schemas", "source_versions", "sid_map", "instruments", "expressions", "bindings", "params", "lets", "outputs", "combine", "policy_params", "rebalance", "selection", "holding", "transition", "allocation", "by_asset":
 			if reflect.TypeOf(value).Kind() != reflect.Map {
 				return fmt.Errorf("%s must be a mapping", field)
 			}
 		}
 		if nested, ok := value.(map[string]any); ok {
-			if key == "accounts" {
+			if key == "accounts" || key == "by_asset" {
 				for account, item := range nested {
 					overrides, ok := item.(map[string]any)
 					if !ok {

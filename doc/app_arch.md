@@ -19,10 +19,12 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 2. 配置型入口创建 `runtime.Process` 与任务专属的 `runtime.Runtime`，并向其注入配置快照、存储、交易所和取消信号。
 3. `entry` 按唯一 RunSpec 的 `run_policy.engine` 选择 `time_series` / `factor`。时序任务由 `goods`、`strat`、`biz` 生成；因子任务使用 `factor/runner` 的定义、组合、Universe 与决策计划。
 4. 行情或第三方时序数据由 `data` 统一转换为 `orm.DataSeries`。
-5. 时序由 `biz.Trader` 分发到 jobs 产生进出场请求；因子由 VersionStore/Snapshot/Session 冻结当轮可见数据，组合多列输出并生成 Full/Patch 目标。
+5. 时序由 `biz.Trader` 分发到 jobs 产生进出场请求；因子由 VersionStore/Snapshot/Session 冻结当轮可见数据，组合多列输出，由 builder 生成理想权重；可选 PortfolioPolicy 根据独立日程和真实持仓证据生成 Full/Patch 的 NAV 权重/绝对数量目标。
 6. 时序订单 manager 保留兼容投影，因子 AccountSink 与 mixed 策略进入 `execution.SharedAccount`，在保留归属/预算下净额执行。weights 使用近似 Book；真实 live 必须通过 verified binding 和账户对账。
 7. `orm` 持久化 K 线、时序数据、订单、任务和 UI 相关状态。
 8. `web`、`rpc`、`live` 提供可观测、控制和通知能力。
+
+v0.6.0-beta.6 的组合策略、原子 checkpoint 和尾仓订阅见 [组合与持仓指南](factor_portfolio_guide.md)；多期限与模型/风险/实验接口见 [研究扩展](factor_research_extensions.md)。有状态 policy 不改变共享 DAG 的数据/参考池，也不自行维护真实账户余额。研究模型与参数产物按训练截止和可用时间选择；原生诊断 API 不等同于完整 Web 研究平台或自动逐批收益报告。
 
 ## 2. 顶层架构分层
 

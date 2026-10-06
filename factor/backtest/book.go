@@ -3,6 +3,7 @@
 package backtest
 
 import (
+	"encoding/json"
 	"errors"
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/factor"
@@ -23,6 +24,14 @@ type Book struct {
 	marks                                   map[int32]Quote
 	previous                                *factor.TargetPortfolio
 	fundingIDs                              map[string]bool
+	previousAllocation                      *factor.PortfolioTarget
+	firstFill                               map[int32]int64
+	policyState                             json.RawMessage
+	stateVersion, ledgerCursor              uint64
+	policySequence                          uint64
+	policyLedgerCursor                      uint64
+	fillFacts                               []bookFillFact
+	acceptedProposals                       map[string]bookAcceptance
 }
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
@@ -30,7 +39,7 @@ func NewBook(nav float64) (*Book, error) {
 	if nav <= 0 || !finite(nav) {
 		return nil, errors.New("backtest: invalid initial strategy NAV")
 	}
-	return &Book{cash: nav, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingIDs: map[string]bool{}}, nil
+	return &Book{cash: nav, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
 }
 func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	if sid <= 0 || q.Price <= 0 || !finite(q.Price) || q.AtMS > now || q.AvailableAt > now || q.AtMS < 0 || q.AvailableAt < q.AtMS {
@@ -40,6 +49,7 @@ func (b *Book) Mark(sid int32, q Quote, now int64) error {
 		return errors.New("backtest: mark moved backwards")
 	}
 	b.marks[sid] = q
+	b.ledgerCursor++
 	return nil
 }
 func (b *Book) State() State {
@@ -91,10 +101,12 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 		b.fees += cost
 		b.slippage += math.Abs(delta * (price - q.Price))
 		b.turnover += notional
+		b.recordFirstFill(sid, qty, q.AtMS)
 		b.quantities[sid] = qty
 		b.marks[sid] = q
 	}
 	b.previous, err = factor.NewTargetPortfolio(spec, effective)
+	b.ledgerCursor++
 	return err
 }
 
@@ -115,6 +127,7 @@ func (b *Book) ApplyFunding(f Funding, now int64) error {
 	b.cash -= cost
 	b.funding += cost
 	b.fundingIDs[f.ID] = true
+	b.ledgerCursor++
 	return nil
 }
 

@@ -55,24 +55,25 @@ func (o SharedExecutionOptions) Same(other SharedExecutionOptions) bool {
 // SharedAccount is owned by Process. Its keeper is independent of Runtime
 // borrowers, so releasing the final Runtime does not invalidate the executor.
 type SharedAccount struct {
-	mu                sync.Mutex
-	ctx               context.Context
-	cancel            context.CancelFunc
-	owner             *AccountHandle
-	store             *Store
-	executor          *OwnerExecutor
-	opts              SharedExecutionOptions
-	ready             bool
-	closed            bool
-	closeErr          error
-	reportCancel      context.CancelFunc
-	reportDone        chan struct{}
-	reportErrors      chan error
-	reportShutdownErr error
-	failureFreezeMu   sync.Mutex
-	listeners         map[uint64]func()
-	listenerSerial    uint64
-	markets           map[string]accountMarket
+	mu                  sync.Mutex
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	owner               *AccountHandle
+	store               *Store
+	executor            *OwnerExecutor
+	opts                SharedExecutionOptions
+	ready               bool
+	closed              bool
+	closeErr            error
+	reportCancel        context.CancelFunc
+	reportDone          chan struct{}
+	reportErrors        chan error
+	reportShutdownErr   error
+	failureFreezeMu     sync.Mutex
+	listeners           map[uint64]func()
+	listenerSerial      uint64
+	markets             map[string]accountMarket
+	policyEvidenceCache map[StrategyID]policyFillCache
 }
 
 func NewSharedAccount(owner *AccountHandle, opts SharedExecutionOptions) (*SharedAccount, error) {

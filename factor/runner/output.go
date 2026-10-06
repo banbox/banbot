@@ -56,3 +56,30 @@ func (o *JSONOutput) TargetAccepted(p *factor.TargetPortfolio, s backtest.State,
 		Book              backtest.State
 	}{"target-accepted", p.ID(), at, s})
 }
+
+func (o *JSONOutput) DecisionAllocation(f factor.Frame, p *factor.PortfolioTarget, d []factor.Diagnostic) error {
+	columns := make([]string, 0, len(f.Values))
+	for name := range f.Values {
+		columns = append(columns, name)
+	}
+	sort.Strings(columns)
+	if err := research.WritePanel(o.Writer, f, columns, o.SIDs); err != nil {
+		return err
+	}
+	return json.NewEncoder(o.Writer).Encode(struct {
+		Kind         string
+		Version      int
+		DecisionTime int64
+		Diagnostics  []factor.Diagnostic
+		Portfolio    *factor.PortfolioTarget
+	}{"allocation-decision", factor.PortfolioTargetVersion, f.DecisionTime, d, p})
+}
+func (o *JSONOutput) AllocationAccepted(p *factor.PortfolioTarget, state backtest.State, at int64) error {
+	return json.NewEncoder(o.Writer).Encode(struct {
+		Kind      string
+		Version   int
+		Portfolio *factor.PortfolioTarget
+		AtMS      int64
+		Book      backtest.State
+	}{"allocation-accepted", factor.PortfolioTargetVersion, p, at, state})
+}

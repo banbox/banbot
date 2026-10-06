@@ -84,6 +84,13 @@ func resolvedFactorValues(spec *config.RunSpec, configs []runner.Config) ([]map[
 		set("strategy_id", c.StrategyID, "registered strategy name", prefix+"id", prefix+"name")
 		set("account_id", c.AccountID, "configured default trading account", prefix+"account")
 		set("definition", c.Definition, "registered Go builder", prefix+"definition", prefix+"name")
+		if c.Manifest.Portfolio.Policy != "" {
+			policyConfig, err := c.Manifest.Portfolio.PolicyConfig()
+			if err != nil {
+				return nil, err
+			}
+			set("portfolio", policyConfig, "normalized portfolio policy", prefix+"portfolio")
+		}
 		if c.Expressions != nil {
 			set("expressions", c.Expressions, "declarative factor expressions", prefix+"expressions")
 			plan, combo, err := runner.CompileDefinition(c)

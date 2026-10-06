@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // Live consumes provider records and flushes completed decision barriers using
@@ -30,6 +31,9 @@ type Live struct {
 	out                     Output
 	clock                   func() int64
 	engine                  *decisionEngine
+	policy                  *policyRun
+	policyPending           *pendingProposal
+	policyScope             atomic.Pointer[[]int32]
 	barrier                 factor.RoundBarrier
 	rows                    map[factor.StreamKey]factor.VersionRecord
 	quotes                  map[int32]backtest.Quote
@@ -45,6 +49,11 @@ type Live struct {
 }
 
 func NewLive(c Config, sink Sink, clock func() int64, out Output) (*Live, error) {
+	var err error
+	c, err = CloneConfig(c)
+	if err != nil {
+		return nil, err
+	}
 	c.Snapshot = factor.CloneSnapshotSpec(c.Snapshot)
 	c.Snapshot.TrackedQuotesOnly = true
 	// Live lineage is supplied by the provider context, never archival paths.
@@ -65,8 +74,19 @@ func NewLive(c Config, sink Sink, clock func() int64, out Output) (*Live, error)
 	if err != nil {
 		return nil, err
 	}
+	policy, err := newPolicyRun(c)
+	if err != nil {
+		engine.close()
+		return nil, err
+	}
+	if policy != nil {
+		if _, ok := sink.(PolicySink); !ok {
+			engine.close()
+			return nil, errors.New("runner: live policy requires allocation-capable account sink")
+		}
+	}
 	life, cancel := context.WithCancel(context.Background())
-	return &Live{c: c, sink: sink, out: out, clock: clock, engine: engine, rows: map[factor.StreamKey]factor.VersionRecord{}, quotes: map[int32]backtest.Quote{}, ctx: life, cancel: cancel, joined: make(chan struct{})}, nil
+	return &Live{c: c, sink: sink, out: out, clock: clock, engine: engine, policy: policy, rows: map[factor.StreamKey]factor.VersionRecord{}, quotes: map[int32]backtest.Quote{}, ctx: life, cancel: cancel, joined: make(chan struct{})}, nil
 }
 func (l *Live) Inputs() []factor.InputSpec { return l.engine.plan.Inputs() }
 
@@ -115,6 +135,15 @@ func (l *Live) InheritAdmission(previous *Live) error {
 	}
 	l.sequence = previous.sequence
 	l.lastDecision = previous.lastDecision
+	if previous.policy != nil {
+		if l.policy == nil || l.engine.manifest.StrategyHash() != previous.engine.manifest.StrategyHash() {
+			return errors.New("runner: live policy upgrade requires explicit checkpoint migration")
+		}
+		l.policy.state = append([]byte(nil), previous.policy.state...)
+		l.policy.version = previous.policy.version
+		l.policy.previous = previous.policy.previous
+		l.policy.sequence = previous.policy.sequence
+	}
 	if previous.previous != nil {
 		targets := previous.previous.Targets()
 		retained := l.ExecutionSIDs()
@@ -190,6 +219,9 @@ func (l *Live) DataSIDs() []int32 {
 func (l *Live) ExecutionSIDs() []int32 {
 	u := l.c.Snapshot.Universe
 	ids := append([]int32{}, u.Tracked...)
+	if scope := l.policyScope.Load(); scope != nil {
+		ids = append(ids, (*scope)...)
+	}
 	for _, sid := range u.Investable {
 		if slices.Contains(u.Tradable, sid) {
 			ids = append(ids, sid)
@@ -357,6 +389,9 @@ func (l *Live) Observe(ctx context.Context, r factor.VersionRecord) error {
 	l.warmRows = nil
 	u := l.c.Snapshot.Universe
 	executionSID := slices.Contains(u.Tracked, r.Series.Sid) || slices.Contains(u.Investable, r.Series.Sid) && slices.Contains(u.Tradable, r.Series.Sid)
+	if l.policy != nil {
+		executionSID = slices.Contains(l.ExecutionSIDs(), r.Series.Sid)
+	}
 	if r.Series.Source == l.c.Prices.Source && r.Series.TimeFrame == l.c.Prices.TimeFrame && executionSID {
 		n := factor.Number(r.Series.Values, l.c.Prices.Field)
 		if n.Validity == factor.Valid && n.Value > 0 {
@@ -450,6 +485,9 @@ func (l *Live) process(ctx context.Context) error {
 	return l.execute(ctx, l.clock())
 }
 func (l *Live) execute(ctx context.Context, now int64) error {
+	if l.policy != nil {
+		return l.executePolicy(ctx, now)
+	}
 	l.mu.Lock()
 	if l.stopped {
 		l.mu.Unlock()
@@ -605,6 +643,9 @@ func (l *Live) FlushAt(ctx context.Context, decision, cutoff int64) error {
 		l.engine.shared.mu.Unlock()
 	}
 	if errors.Is(err, factor.ErrSnapshotIncomplete) {
+		if l.policy != nil {
+			return l.monitorPolicy(ctx, spec.Universe, decision, token)
+		}
 		return nil
 	}
 	if err != nil {
@@ -632,6 +673,9 @@ func (l *Live) FlushAt(ctx context.Context, decision, cutoff int64) error {
 	l.sequence++
 	sequence := l.sequence
 	l.mu.Unlock()
+	if l.policy != nil {
+		return l.proposePolicyRound(ctx, frame, spec.Universe, sequence, nav, completed, decision, token, diag)
+	}
 	p, pdiag, err := l.engine.buildPortfolio(frame, spec.Universe, sequence, nav, completed+l.c.LatencyMS, decision+l.c.ExpiryMS)
 	if err != nil {
 		return err
@@ -670,6 +714,7 @@ func (l *Live) Stop() {
 	l.mu.Lock()
 	l.stopped = true
 	l.pending = nil
+	l.policyPending = nil
 	l.cancel()
 	l.barrier.Stop()
 	l.mu.Unlock()

@@ -2,6 +2,8 @@
 
 # 策略引擎逐包审查与重构完成记录
 
+> 2026-10-06 / v0.6.0-beta.6 新增组合层：见 [factor 扩展实施记录](factor_opt_implementation.md) 和 [组合指南](factor_portfolio_guide.md)。包含每 run 的 policy/quantity allocation、owner 原子接纳恢复、实时执行范围保留、multi-horizon、稳健变换与原生研究插件。本文的“无新增版本/发布”、单标签及接口盘点属于 2026-10-04 的历史重构记录。
+
 日期：2026-10-04。初始源码 HEAD e4fb5f73100a350c2bc445ae5c9fbcf4432933c3，以最终工作树符号为准。本文合并因子线、集成线和文档线的实际结果；历史设计见 better_arch.md / factors.md，不再将初始只读建议当作当前实施状态。
 
 ## 1. 最终结果与兼容边界

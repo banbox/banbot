@@ -20,6 +20,7 @@ type ColumnMetrics struct {
 	Missing             map[factor.Validity]int
 	Labels              map[string]LabelMetrics
 	TopQuintileTurnover float64
+	RankAutocorrelation factor.Numeric
 	RiskExposures       map[string]factor.Numeric
 }
 type Correlation struct {
@@ -228,6 +229,7 @@ func Evaluate(frame factor.Frame, universe factor.Universe, labels []Label, spec
 			m.Labels[label] = lm
 		}
 		if previous := spec.PreviousColumns[name]; previous != nil {
+			m.RankAutocorrelation = correlation(paired(sids, previous, values), true)
 			before, after := topQuintile(sids, previous), topQuintile(sids, values)
 			overlap := 0
 			for sid := range after {
@@ -313,14 +315,14 @@ type SeriesSummary struct {
 	QuintileMean       [5]factor.Numeric
 }
 type accumulatorSlot struct {
-	ic, rank running
-	q        [5]running
+	ic, rank     running
+	q            [5]running
+	lastDecision int64
 }
 
 // Accumulator stores O(columns*label horizons) scalar summaries, no panels.
 type Accumulator struct {
-	slots        map[string]map[string]*accumulatorSlot
-	lastDecision int64
+	slots map[string]map[string]*accumulatorSlot
 }
 
 func NewAccumulator(columns, labelNames []string) (*Accumulator, error) {
@@ -343,8 +345,8 @@ func NewAccumulator(columns, labelNames []string) (*Accumulator, error) {
 	return a, nil
 }
 func (a *Accumulator) Add(r Report) error {
-	if r.DecisionTime <= a.lastDecision {
-		return errors.New("research: repeated/out-of-order report")
+	if r.DecisionTime <= 0 {
+		return errors.New("research: invalid report decision time")
 	}
 	for name, m := range r.Columns {
 		slots, exists := a.slots[name]
@@ -355,11 +357,15 @@ func (a *Accumulator) Add(r Report) error {
 			if slots[label] == nil {
 				return errors.New("research: undeclared accumulator horizon")
 			}
+			if r.DecisionTime <= slots[label].lastDecision {
+				return errors.New("research: repeated/out-of-order report for column/horizon")
+			}
 		}
 	}
 	for name, m := range r.Columns {
 		for label, lm := range m.Labels {
 			s := a.slots[name][label]
+			s.lastDecision = r.DecisionTime
 			if valid(lm.IC) {
 				s.ic.add(lm.IC.Value)
 			}
@@ -373,7 +379,6 @@ func (a *Accumulator) Add(r Report) error {
 			}
 		}
 	}
-	a.lastDecision = r.DecisionTime
 	return nil
 }
 func (a *Accumulator) Summary() map[string]map[string]SeriesSummary {

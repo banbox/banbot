@@ -16,9 +16,17 @@ import (
 
 type PortfolioDefinition struct {
 	Builder                     string
+	BuilderConfigHash           string `json:",omitempty"`
 	K                           int
 	LongNotional, ShortNotional float64
 	Mode                        factor.PortfolioMode
+	Policy                      string                   `json:",omitempty"`
+	PolicyParams                json.RawMessage          `json:",omitempty"`
+	Rebalance                   *factor.RebalanceConfig  `json:",omitempty"`
+	Selection                   *factor.SelectionConfig  `json:",omitempty"`
+	Holding                     *factor.HoldingConfig    `json:",omitempty"`
+	Transition                  *factor.TransitionConfig `json:",omitempty"`
+	Allocation                  *factor.AllocationConfig `json:",omitempty"`
 }
 type CostSpec struct {
 	FeeRate, SlippageRate float64
@@ -49,6 +57,7 @@ type Manifest struct {
 
 // CloneManifestSpec copies owned containers without validation or normalization.
 func CloneManifestSpec(s ManifestSpec) ManifestSpec {
+	s.Portfolio = ClonePortfolioDefinition(s.Portfolio)
 	s.Combo = CloneComboSpec(s.Combo)
 	s.Parameters = maps.Clone(s.Parameters)
 	s.Labels = slices.Clone(s.Labels)
@@ -70,13 +79,17 @@ func hashJSON(v any) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 func BuildManifest(spec ManifestSpec) (*Manifest, error) {
-	if spec.Currency == "" || spec.CodeRevision == "" || spec.FactorPlanHash == "" || spec.UniverseVersion == "" || spec.VisibilityPolicy == "" || spec.ExecutionMode == "" || spec.LatencyAssumption == "" || (spec.Portfolio.K <= 0 && spec.Portfolio.Builder == "") || spec.Costs.FundingPolicy == "" {
+	if err := spec.Portfolio.ValidatePolicy(); err != nil {
+		return nil, err
+	}
+	legacyBuilder := spec.Portfolio.Policy == "" || spec.Portfolio.Builder == "top-bottom-k-v1"
+	if spec.Currency == "" || spec.CodeRevision == "" || spec.FactorPlanHash == "" || spec.UniverseVersion == "" || spec.VisibilityPolicy == "" || spec.ExecutionMode == "" || spec.LatencyAssumption == "" || (legacyBuilder && spec.Portfolio.K <= 0 && spec.Portfolio.Builder == "") || spec.Costs.FundingPolicy == "" {
 		return nil, errors.New("research: incomplete reproducibility manifest")
 	}
-	if len(spec.Labels) == 0 && (spec.ExecutionMode == "research" || spec.Combo.Method == HistoryIC) {
+	if len(spec.Labels) == 0 && (spec.ExecutionMode == "research" || IsHistoryMethod(spec.Combo.Method)) {
 		return nil, errors.New("research: research and history-IC manifests require labels")
 	}
-	if spec.Portfolio.LongNotional < 0 || spec.Portfolio.ShortNotional < 0 || (spec.Portfolio.LongNotional+spec.Portfolio.ShortNotional <= 0 && spec.Portfolio.Builder == "") || math.IsNaN(spec.Portfolio.LongNotional+spec.Portfolio.ShortNotional) || math.IsInf(spec.Portfolio.LongNotional+spec.Portfolio.ShortNotional, 0) {
+	if spec.Portfolio.LongNotional < 0 || spec.Portfolio.ShortNotional < 0 || (legacyBuilder && spec.Portfolio.LongNotional+spec.Portfolio.ShortNotional <= 0 && spec.Portfolio.Builder == "") || math.IsNaN(spec.Portfolio.LongNotional+spec.Portfolio.ShortNotional) || math.IsInf(spec.Portfolio.LongNotional+spec.Portfolio.ShortNotional, 0) {
 		return nil, errors.New("research: invalid portfolio notional fractions")
 	}
 	if spec.Costs.FeeRate < 0 || spec.Costs.SlippageRate < 0 {

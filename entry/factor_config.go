@@ -32,6 +32,12 @@ func decodeFactorFields(fields map[string]any, target any) error {
 		Result: target, ErrorUnused: true,
 		MatchName: func(key, field string) bool { return strings.EqualFold(strings.ReplaceAll(key, "_", ""), field) },
 		DecodeHook: func(from, to reflect.Type, value any) (any, error) {
+			if to == reflect.TypeOf(json.RawMessage{}) {
+				return json.Marshal(value)
+			}
+			if from != nil && (from.Kind() == reflect.Float32 || from.Kind() == reflect.Float64) && to.Kind() >= reflect.Int && to.Kind() <= reflect.Int64 {
+				return nil, fmt.Errorf("integer configuration field cannot accept a floating point value")
+			}
 			if to == reflect.TypeOf(decimal.Decimal{}) {
 				switch n := value.(type) {
 				case string:
@@ -103,9 +109,17 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 		for key, value := range policy.Params {
 			switch key {
 			case "window":
+				if value != float64(int(value)) {
+					return nil, fmt.Errorf("factor window must be an integer")
+				}
 				c.Factor.Window = int(value)
 			case "k":
+				if value != float64(int(value)) {
+					return nil, fmt.Errorf("factor k must be an integer")
+				}
 				c.Manifest.Portfolio.K = int(value)
+			case "swapPerBars", "holdBars":
+				return nil, fmt.Errorf("factor %s: %s has ambiguous semantics; use portfolio.rebalance or holding/transition", policy.Name, key)
 			default:
 			}
 		}
@@ -122,6 +136,9 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 		}
 		if portfolio, ok := policy.Factor["portfolio"].(map[string]any); ok {
 			if err := decodeFactorFields(portfolio, &c.Manifest.Portfolio); err != nil {
+				return nil, err
+			}
+			if err := c.Manifest.Portfolio.ValidatePolicy(); err != nil {
 				return nil, err
 			}
 		}
