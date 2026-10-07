@@ -2,7 +2,7 @@
 
 日期：2026-10-06。设计依据：[factor_opt.md](factor_opt.md)。实现保留未启用 policy 时的旧 builder、权重合同及配置身份；新增字段显式启用，未新增依赖、持仓账户或交易所特例。
 
-发布版本：`v0.6.0-beta.6`。操作配置与模式选择见 [组合指南](factor_portfolio_guide.md)，发布验收见 [版本说明](release_v0.6.0-beta.6.md)。banstrats 配套提供 `examples/crosssection/lifecycle/` YAML 与 `policyresearch` 离线 Go 演示。
+发布版本：`v0.6.0-beta.6`。操作配置与模式选择见 [组合指南](factor_portfolio_guide.md)，发布验收见 [版本说明](https://github.com/banbox/banbot/releases/tag/v0.6.0-beta.6)。banstrats 配套提供 `examples/crosssection/lifecycle/` YAML 与 `policyresearch` 离线 Go 演示。
 
 ## 阶段与源码对应
 
@@ -68,4 +68,4 @@ Windows 环境 `CGO_ENABLED=0` 且无 C 编译器，`go test -race` 无法运行
 
 禁用本机 workspace（`GOWORK=off`）并使用已发布的 banexg v0.2.65、banta v0.4.1 后，34 个正式包测试通过，`go mod verify` 通过，Windows 与 Linux amd64 主程序构建通过，版本输出为 `banbot v0.6.0-beta.6`。中英文 bandoc 构建通过；banstrats 全部截面示例测试与 vet 通过。示例回放发现的 ComboSpec YAML 字段命名回归已修复，并增加序列化测试。
 
-正式包 `go vet -composites=false` 与其余 33 包的默认 vet 通过；`strat` 默认 vet 的既有 `_testcom/all.go` 外部 Kline 未命名字段告警保留。临时实验目录及 race 的限制同上，完整发布说明见 [beta.6](release_v0.6.0-beta.6.md)。后端版本升级，UI 沿用 beta.5。
+正式包 `go vet -composites=false` 与其余 33 包的默认 vet 通过；`strat` 默认 vet 的既有 `_testcom/all.go` 外部 Kline 未命名字段告警保留。临时实验目录及 race 的限制同上，完整发布说明见 [beta.6](https://github.com/banbox/banbot/releases/tag/v0.6.0-beta.6)。后端版本升级，UI 沿用 beta.5。

@@ -139,8 +139,16 @@ func initializeExplicitExchange(exchange banexg.BanExchange, snapshot *config.Sn
 	if exchange == nil {
 		return errs.NewMsg(core.ErrBadConfig, "exchange is required")
 	}
-	if _, err := exchange.LoadMarkets(false, nil); err != nil {
-		return err
+	if hasExplicitMarketSnapshot(snapshot, mode) {
+		runtimeCore := &core.State{}
+		runtimeCore.SetRunMode(mode)
+		if _, err := orm.LoadMarketsWithRuntime(nil, exchange, false, snapshot, runtimeCore); err != nil {
+			return err
+		}
+	} else {
+		if _, err := exchange.LoadMarkets(false, nil); err != nil {
+			return err
+		}
 	}
 	info := exchange.Info()
 	if info == nil || !exchange.IsContract(info.MarketType) {

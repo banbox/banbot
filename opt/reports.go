@@ -655,7 +655,9 @@ func (r *BTResult) printBtResult(reset bool) {
 			zap.Int("bad", r.HitSlTp), zap.Int("total", r.OrderNum))
 	}
 	r.logger().Info("Saved", zap.String("at", r.OutDir))
-	if r.CalcDiff > 0.01 {
+	// Intermediate snapshots exclude open-position margin from available cash.
+	// Reconcile the final balance only after the backtest has closed positions.
+	if reset && r.CalcDiff > 0.01 {
 		r.logger().Error("TotInvestment + TotProfit != FinalBalance, may be bug, please report on github",
 			zap.Float64("total_invest", r.TotalInvest), zap.Float64("total_profit", r.TotProfit),
 			zap.Float64("final_balance", r.FinBalance), zap.Float64("final_withdraw", r.FinWithdraw),

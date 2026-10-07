@@ -1,6 +1,6 @@
-The following is part of the key code for trading bot banbot and indicator library banta. Your task is to help users build trading strategies based on banbot and banta
+The following interfaces and rules help convert strategy ideas or other code into banbot time-series, cross-sectional or multi-factor strategies. Cross-sectional and multi-factor strategies support YAML formulas or Go code.
 
-> API baseline: Banbot v0.6.0-beta.2. Use the arbitrary-series subscription and Runtime Context rules below; legacy callbacks such as `OnBar` remain for compatibility. Configuration retains v0.5 key locations; see the [compatibility comparison](config_compatibility.md) and [factor guide](../bandoc/en-US/guide/factor.md) for the new shallow engine options.
+> API baseline: Banbot v0.6.0-beta.8. Select the engine by strategy semantics; see “Cross-sectional and multi-factor strategies” below. New time-series code follows the arbitrary-series subscription and Runtime Context rules; legacy callbacks such as `OnBar` remain for compatibility. Configuration retains v0.5 key locations; see the [compatibility comparison](config_compatibility.md).
 
 ### github.com/banbox/banta
 ```go
@@ -636,6 +636,8 @@ type PairUpdateResult struct {
 }
 
 // Core methods
+type FuncMakeStrat = func(pol *config.RunPolicyConfig) *TradeStrat
+func RegisterStrategy(name string, factory FuncMakeStrat)
 func GetJobs(account string) map[string]map[string]*StratJob
 func GetInfoJobs(account string) map[string]map[string]*StratJob
 func (s *TradeStrat) UpdatePairs(req PairUpdateReq) (*PairUpdateResult, *errs.Error)
@@ -758,8 +760,457 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
  * Do not add empty functions, if More struct is only assigned but not used, it should be deleted.
  * Users may provide strategy names in format "package:name", the part before colon should be extracted as the go package name after package in the returned code, the part after colon should be used as the strategy function name. If user doesn't provide strategy name, use default "ma:demo"
 
-## 2026-10-04 双引擎使用入口
+## Cross-sectional and multi-factor strategies
 
-run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
+### Engines and definitions
 
-execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。
+Use this section to convert ranking, rotation, long/short selection, factor combinations and holding lifecycles to banbot. The preceding `TradeStrat`/banta callback rules apply to the time-series engine. The native factor engine uses a `factor.Plan`; its runner builds portfolio targets for account execution.
+
+| Strategy | Entry point |
+| --- | --- |
+| Per-symbol event signals and per-order exits | `engine: time_series` (default), `strat.TradeStrat.OnData` |
+| Cross-symbol ranking, neutralization, multi-factor portfolios and rebalancing | `engine: factor`, YAML `expressions` or Go `runner.RegisterDefinition` |
+| Batch comparisons/orders added to an existing time-series strategy | `TradeStrat.BatchInOut` + `OnBatchJobs`; auxiliary batches use `BatchInfo` + `OnBatchInfos` |
+
+A factor strategy returns a `Plan`, rather than `TradeStrat` callbacks that place ranked orders per symbol. In YAML, `expressions`, `definition`, `portfolio`, `prices`, `decision` and `research` belong directly under `run_policy[]`, alongside `engine`. The old `factor: {...}` nesting is accepted for compatibility; no version marker is needed.
+
+* Use one `run_timeframes` decision timeframe per factor entry. An expression strategy may use any name; a Go strategy selects its registered `definition` explicitly or uses name as the registered definition name. The built-in Go definition is `momentum-vol`.
+* `id` identifies the strategy; `account` selects the account. When an account with factor strategies has multiple participants, all participants require explicit `capital_weight`, totaling at most 1. This assigns strategy budgets; time-series `stake_rate` remains an order sizing multiplier.
+* `run_policy.params.k` / `portfolio.k` controls legacy selection. `expressions.params` belongs to `param.name` and does not inherit outer parameters. Go builders read outer `params` from `c.Manifest.Parameters`.
+
+### YAML multi-factor example
+
+This weights backtest requires `data.gob` with at least six assets, sufficient warmup history and subsequent visible prices. It combines momentum and low volatility, selects the top/bottom three assets, and assigns each side 50% of strategy NAV.
+
+```yaml
+wallet_amounts: {USD: 10000}
+execution: {mode: weights, funding_policy: explicit-zero}
+run_policy:
+  - name: MultiFactor
+    id: multi_v1
+    engine: factor
+    run_timeframes: [1h]
+    params: {k: 3}
+    archive: data.gob
+    prices: {source: kline, timeframe: 1h, field: close}
+    portfolio: {long_notional: 0.5, short_notional: 0.5, mode: full}
+    research: {labels: []}
+    expressions:
+      schema_version: 1
+      timeframe: 1h
+      bindings:
+        kline: {source: kline, timeframe: 1h}
+      params: {window: 24}
+      lets:
+        price: 'positive(kline.close)'
+        ret1: 'ts.return(factor.price, 1)'
+      outputs:
+        momentum: 'cs.zscore(ts.return(factor.price, param.window))'
+        low_vol: 'cs.zscore(-ts.std(factor.ret1, param.window, 0))'
+      combine:
+        method: fixed
+        weights: {momentum: 0.7, low_vol: 0.3}
+```
+
+Run `banbot backtest --mode weights --config strategy.yml`. For an ordinary history database, remove `archive`, load base database/market/universe/`time_range` settings, and explicitly set `data: {pit_policy: static-approximation}`. A latest-value history store cannot prove strict point-in-time (PIT) visibility.
+
+For research, remove `research: {labels: []}` from the example; the default label spans one decision period. Run `banbot research --config strategy.yml`. Multiple horizons use `research.labels: [{name: forward_16h, kind: executable-return, horizon: 57600000, periods_per_year: 547.5, overlapping: true}]`. Horizon is milliseconds; immature labels remain unresolved. History combiners require labels and cannot disable them.
+
+### Expression syntax and functions
+
+`alias.field` reads a binding field; `field("alias","field-name")` supports special field names. `factor.name` references this spec's lets/outputs; `param.name` references numeric parameters. Forward references are allowed; cycles are rejected, and unused declarations are validated. Supported syntax is numbers, scientific notation, parentheses, unary signs, arithmetic and the functions below; comparisons, conditional branches and future `label.*` references are unsupported.
+
+| Go (factor) | Formula |
+| --- | --- |
+| `Add/Sub/Mul/Div(a,b)`, `Neg(x)` | `+ - * /`, unary `-` |
+| `Positive/Abs/Log/Sqrt(x)` | `positive/abs/log/sqrt(x)` |
+| `Pow/Min/Max(a,b)` | `pow/min/max(a,b)` |
+| `Lag/Return/EMA(x,n)` | `ts.lag/return/ema(x,n)` |
+| `StdDev(x,n,ddof)` | `ts.std(x,n,ddof)` |
+| `SMA/RMA/WMA/RSI/ROC/MOM/CCI/Highest/Lowest(x,n)` | `ts.sma/rma/wma/rsi/roc/mom/cci/highest/lowest(x,n)` |
+| `VWMA(c,v,n)`, `TR(h,l,c)`, `ATR(h,l,c,n)` | `ts.vwma(c,v,n)`, `ts.tr(h,l,c)`, `ts.atr(h,l,c,n)` |
+| `Stoch/WillR(h,l,c,n)`, `OBV(c,v)`, `MFI(h,l,c,v,n)` | `ts.stoch/willr(h,l,c,n)`, `ts.obv(c,v)`, `ts.mfi(h,l,c,v,n)` |
+| `MACD(x,fast,slow,signal)` | `ts.macd/macd_signal/macd_hist(x,fast,slow,signal)` |
+| `BBands(x,n,up,down)` | `ts.bbands_upper/bbands_middle/bbands_lower(x,n,up,down)` |
+| `Rank/ZScore/RobustZScore(x)` | `cs.rank/zscore/robust_zscore(x)` |
+| `Winsorize(x,tail)`, `MADWinsorize(x,k)`, `Quantile(x,q)` | `cs.winsorize(x,tail)`, `cs.mad_winsorize(x,k)`, `cs.quantile(x,q)` |
+| `Residual(y,x)`, `MultiResidual(y,xs...)`, `WeightedResidual(y,w,xs...)` | `group.residual(y,x)`, `group.ols(y,x1,x2,...)`, `group.wls(y,w,x1,x2,...)` |
+| `GroupDemean/GroupZScore(x,source,field,sourceTF...)` | `group.demean/zscore(x,"alias","field")` |
+
+* Window arguments are integer constants or direct `param.name` references in [1,10000]; lag also permits 0. Expressions such as `param.window+1` are not window arguments. `ddof` must satisfy `0 <= ddof < n`; MACD requires `fast < slow`. Both nonnegative Bollinger multipliers are explicit.
+* `cs.rank` returns ascending, zero-based average ranks for ties, not percentiles. `cs.zscore` uses population standard deviation and returns zero for constant sections. `tail` is in [0,0.5), `q` in [0,1], and the MAD multiplier is positive. Robust z-score scales by `1.4826*MAD`.
+* Cross-sectional/regression statistics fit on frozen `Universe.Reference`. OLS/WLS include an intercept; WLS needs positive weights. Group fields retain raw types/NULL; the formula source argument is a binding alias.
+* Time series may precede cross-sectional transforms, e.g. `cs.rank(ts.rsi(kline.close,14))`. TS windows over CS/regression results are rejected, including through pointwise wrappers; zero lag is the identity exception.
+* `ts.return` is a ratio; `ts.roc` is a percentage. `max(x,1e-8)` bounds valid values and does not fill NULL, missing or warmup inputs. New technical indicators advance on complete valid tuples; lag/return/ema/std retain their individual contracts. `factor.MACD/BBands` return three nodes; distinguish them from the preceding banta signatures.
+
+Slow/event sources require explicit `asof` sampling onto the decision grid with a positive age bound. For example, add `funding: {source: funding, timeframe: event, sampling: asof, max_age_ms: 28800000}` to bindings and use `cs.zscore(-funding.rate)`; the input must provide that stream. Downstream windows count decision observations: 24 hourly samples are not 24 trading days.
+
+Save the `expressions` mapping alone as `formula.yml`; `banbot validate --spec formula.yml` / `banbot explain --spec formula.yml` checks compilation and dependencies. These commands do not validate actual data or accounts. A standalone spec needs an explicit timeframe, one YAML document and a size of at most 1 MiB.
+
+### github.com/banbox/banbot/factor/expr
+
+```go
+type Binding struct { Source, TimeFrame, Sampling string; MaxAgeMS int64 }
+type Spec struct {
+    SchemaVersion int; TimeFrame string
+    Bindings map[string]Binding; Params map[string]float64
+    Lets, Outputs map[string]string; Combine research.ComboSpec
+}
+func Compile(spec Spec) (*factor.Plan, error)
+```
+
+### github.com/banbox/banbot/factor
+
+Public strategy-building interfaces follow. Construct `Node`, `Builder` and `Plan` through these functions; `Node` inputs are numeric nodes, not banta *Series.
+
+```go
+type Validity string // Valid, Missing, Null, NotNumeric, NonFinite, Warmup
+type Numeric struct { Value float64; Validity Validity }
+func Number(values map[string]any, field string) Numeric
+
+// Node, Builder, Plan: construct nodes through these functions.
+func Field(source, field, timeframe string) *Node
+func AsOfField(source, field, sourceTimeFrame, decisionTimeFrame string, maxAge int64) *Node
+func Constant(value float64, timeframe string) *Node
+func Add(a, b *Node) *Node
+func Sub(a, b *Node) *Node
+func Mul(a, b *Node) *Node
+func Div(a, b *Node) *Node
+func Pow(a, b *Node) *Node
+func Min(a, b *Node) *Node
+func Max(a, b *Node) *Node
+func Neg(input *Node) *Node
+func Abs(input *Node) *Node
+func Log(input *Node) *Node
+func Sqrt(input *Node) *Node
+func Positive(input *Node) *Node
+func Linear(inputs []*Node, weights []float64) *Node
+func Lag(input *Node, period int) *Node
+func Return(input *Node, period int) *Node
+func EMA(input *Node, period int) *Node
+func StdDev(input *Node, period, ddof int) *Node
+func SMA(input *Node, period int) *Node
+func RMA(input *Node, period int) *Node
+func WMA(input *Node, period int) *Node
+func VWMA(price, volume *Node, period int) *Node
+func RSI(input *Node, period int) *Node
+func ROC(input *Node, period int) *Node
+func MOM(input *Node, period int) *Node
+func TR(high, low, close *Node) *Node
+func ATR(high, low, close *Node, period int) *Node
+func CCI(input *Node, period int) *Node
+func Stoch(high, low, close *Node, period int) *Node
+func WillR(high, low, close *Node, period int) *Node
+func OBV(close, volume *Node) *Node
+func MFI(high, low, close, volume *Node, period int) *Node
+func Highest(input *Node, period int) *Node
+func Lowest(input *Node, period int) *Node
+func MACD(input *Node, fast, slow, signal int) (line, signalLine, hist *Node)
+func BBands(input *Node, period int, stdUp, stdDown float64) (upper, middle, lower *Node)
+func Rank(input *Node) *Node
+func ZScore(input *Node) *Node
+func RobustZScore(input *Node) *Node
+func Winsorize(input *Node, tail float64) *Node
+func MADWinsorize(input *Node, multiple float64) *Node
+func Quantile(input *Node, q float64) *Node
+func GroupDemean(input *Node, source, field string, sourceTimeFrame ...string) *Node
+func GroupZScore(input *Node, source, field string, sourceTimeFrame ...string) *Node
+func Residual(y, x *Node) *Node
+func MultiResidual(y *Node, exposures ...*Node) *Node
+func WeightedResidual(y, weights *Node, exposures ...*Node) *Node
+func Custom(version string, inputs []*Node, evaluate func([]Numeric) Numeric) *Node
+
+func New() *Builder
+func (b *Builder) Add(name string, n *Node) *Builder
+func (b *Builder) Compile() (*Plan, error)
+func Compile(outputs map[string]*Node) (*Plan, error)
+type InputSpec struct {
+    Source, TimeFrame string; Fields []string
+    WarmupLength int; AsOfLatest bool; MaxAge int64
+}
+func (p *Plan) Hash() string
+func (p *Plan) TimeFrame() string
+func (p *Plan) Outputs() []string
+func (p *Plan) Inputs() []InputSpec
+func (p *Plan) WarmupLength() int
+func (p *Plan) StateRetention() int
+```
+
+`Custom` is a versioned pure pointwise function with explicit dependencies. Propagate invalid input reasons; do not read accounts/future quotes or hide rolling state in its closure. Change version when its implementation changes. A missing historical operator requires a kernel extension with Session/Batch verification.
+
+Frozen inputs and results (normally assembled by the runner; useful for manual numerical checks):
+
+```go
+type Universe struct {
+    Version string
+    Investable, Reference, Tradable, Evaluation, Tracked []int32
+    Static bool
+}
+type Frame struct {
+    GridTime, DecisionTime int64
+    SnapshotID, PlanHash string
+    Values map[string]map[int32]Numeric
+}
+type VersionRecord struct {
+    Series orm.DataSeries; EventTime int64; Revision uint64
+    AvailableAt, IngestedAt int64; SourceVersion string
+}
+type SnapshotSpec struct {
+    TrackedQuotesOnly bool
+    GridTime, DecisionTime, ReplayTime int64
+    Universe Universe; SIDMap map[int32]string
+    Schemas, SourceVersions map[string]string
+    AdjustmentVersion, VisibilityPolicy string
+}
+type Requirement struct {
+    SID int32; Source, TimeFrame string
+    EventTime int64; AsOfLatest bool; MaxAge int64
+}
+func Record(series orm.DataSeries, revision uint64, availableAt, ingestedAt int64, sourceVersion string) VersionRecord
+func Freeze(spec SnapshotSpec, records []VersionRecord, requirements []Requirement) (*Snapshot, error)
+func NewSession(plan *Plan) (*Session, error)
+func (s *Session) Warmup(snapshot *Snapshot) error
+func (s *Session) Evaluate(snapshot *Snapshot) (Frame, error)
+func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error)
+```
+
+`Investable` is the candidate pool, `Reference` the statistical pool, `Tradable` the eligible trading pool, `Evaluation` the research pool and `Tracked` the assets still monitored after removal. `Frame.Values[column][sid]` is a derived numeric view; `orm.DataSeries.Values map[string]any` retains arbitrary fields, types, missing values and NULL.
+
+`AvailableAt` is publication/visibility time, `IngestedAt` reception time and `Revision` revision identity. Freeze selects only versions visible and received at the cutoff. Incomplete closed data/barriers skip decisions instead of shrinking declared pools. Reuse one `Session` across history chunks; `Batch` initializes from the supplied history start. Past revisions require a new replay, leaving frozen results intact. `WarmupLength()` counts preceding observations without missing data; elapsed calendar bars do not guarantee valid output.
+
+### github.com/banbox/banbot/factor/research
+
+```go
+type ComboMethod string // Equal, Fixed, HistoryIC, HistoryRankIC, HistoryICIR, HistoryRankICIR, HistoryEWMA
+type ComboSpec struct {
+    Method ComboMethod; Columns []string; Weights map[string]float64
+    Label string; MinSamples, MinPairs int
+    MinConfidence, Decay float64; Direction, Fallback string
+}
+type PortfolioDefinition struct {
+    Builder, BuilderConfigHash string; K int
+    LongNotional, ShortNotional float64; Mode factor.PortfolioMode
+    Policy string; PolicyParams json.RawMessage
+    Rebalance *factor.RebalanceConfig; Selection *factor.SelectionConfig
+    Holding *factor.HoldingConfig; Transition *factor.TransitionConfig
+    Allocation *factor.AllocationConfig
+}
+```
+
+equal averages selected columns, defaulting to all outputs. fixed sums explicit weights, allows negatives and does not normalize them. An invalid nonzero-weight column invalidates that asset's score; weights are not reassigned per asset. Zero-weight columns do not affect validity. Selected columns must exist and be unique; avoid naming raw outputs score, which the runner generates. An explicit outer `combo.method` replaces the entire inner combination config.
+
+History methods are history-ic/history-rank-ic/history-icir/history-rank-icir/history-ewma and consume only matured, decision-visible samples. label selects the `horizon`; with multiple labels, omission selects the shortest `horizon`, then name. `min_samples` counts historical sections; `min_pairs` counts assets per section; `min_confidence` is a mean/standard-error threshold. EWMA `decay` is alpha (zero defaults to 0.2); direction is signed|positive and `fallback` is equal|fixed|error. Live currently rejects all history combiners.
+
+### Portfolio targets and holding policies (factor)
+
+```go
+type PortfolioMode string // Full = "full", Patch = "patch"
+type FrozenBudget struct { Version, Currency string; NAV float64 }
+type Diagnostic struct { Code, Detail string }
+type PortfolioSpec struct {
+    StrategyID, AccountID string
+    DecisionTime, ExecutableAt, ExpireAt int64; PlanSequence uint64
+    SnapshotID, PlanHash, FactorPlanHash, UniverseVersion string
+    Budget FrozenBudget; Mode PortfolioMode; Diagnostics []Diagnostic
+}
+func NewTargetPortfolio(spec PortfolioSpec, targets map[int32]float64) (*TargetPortfolio, error)
+func (p *TargetPortfolio) Spec() PortfolioSpec
+func (p *TargetPortfolio) ID() string
+func (p *TargetPortfolio) Targets() map[int32]float64
+func (p *TargetPortfolio) EffectiveTargets(previous *TargetPortfolio) (map[int32]float64, error)
+func (p *TargetPortfolio) Notional(sid int32) float64
+func TopBottomK(frame Frame, scoreName string, universe Universe, spec PortfolioSpec, k int) (*TargetPortfolio, []Diagnostic, error)
+func TopBottomKNotional(frame Frame, scoreName string, universe Universe, spec PortfolioSpec, k int, longNotional, shortNotional float64) (*TargetPortfolio, []Diagnostic, error)
+
+type AllocationBasis string // NAVFraction = "nav-fraction", AbsoluteQuantity = "absolute-quantity"
+type Allocation struct { Basis AllocationBasis; Value string }
+func NewPortfolioTarget(spec PortfolioSpec, allocations map[int32]Allocation) (*PortfolioTarget, error)
+func (p *PortfolioTarget) Spec() PortfolioSpec
+func (p *PortfolioTarget) ID() string
+func (p *PortfolioTarget) Version() int
+func (p *PortfolioTarget) AsWeightPortfolio() (*TargetPortfolio, error)
+func (p *PortfolioTarget) Allocations() map[int32]Allocation
+func (p *PortfolioTarget) EffectiveAllocations(previous *PortfolioTarget) (map[int32]Allocation, error)
+func PortfolioTargetFromWeights(p *TargetPortfolio) (*PortfolioTarget, error)
+```
+
+Positive weights are long, negative weights short; `FrozenBudget.NAV` is strategy NAV. `Full` zeros omitted prior targets owned by this strategy; `Patch` preserves omitted targets, and explicit zero exits. Default `TopBottomK` requires at least `2*k` valid investable/tradable scores even when one side's notional is zero. Insufficient/constant scores return a nil target and diagnostics; the runner skips replacement and preserves existing positions. Direct callers must check for nil. Use lifecycle selection or a custom builder for selection based only on the active side.
+
+`TargetPortfolio` represents ideal weights. `PortfolioTarget` supports both NAV fractions and absolute quantities. `Allocation.Value` is a signed plain decimal string; empty strings and scientific notation are rejected. `AbsoluteQuantity` means standard asset units, not contract counts; `AsWeightPortfolio` rejects quantity targets. EffectiveTargets/EffectiveAllocations validate strategy, account, currency and increasing plan sequence.
+
+`portfolio.policy: lifecycle-v1` enables rebalance and holding lifecycles. Replace the example's portfolio with:
+
+```yaml
+portfolio:
+  long_notional: 1
+  short_notional: 0
+  policy: lifecycle-v1
+  selection: {long_k: 3}
+  rebalance: {every_bars: 2}
+  holding: {min_bars: 16}
+  transition: {mode: linear-exit, exit_steps: 8, basis: quantity}
+  allocation: {method: equal, reserve_ratio: 0.02}
+```
+
+This computes hourly and normally rebalances every two hours. After 16 hours from the first actual fill, an asset begins an eight-step exit only when it drops out of selection. `holding.max_bars`/max_duration forces zero at a monitoring grid, bypassing normal rebalance gates and exit curves; use min when gradual exits should start only after the minimum age. These field types also support Go policies:
+
+```go
+type RebalanceConfig struct {
+    EveryBars int; Anchor int64; Phase int
+    Duration, Calendar, CalendarVersion, Timezone string
+}
+type SelectionConfig struct {
+    LongK, ShortK int; LongQuantile, ShortQuantile float64
+    RetainRank, Dropout int; GroupQuota map[string]int; MissingScores string
+}
+type HoldingRule struct { MinBars, MaxBars int; MinDuration, MaxDuration string }
+type HoldingOverride struct { MinBars, MaxBars *int; MinDuration, MaxDuration *string }
+type HoldingConfig struct {
+    MinBars, MaxBars int; MinDuration, MaxDuration string
+    ByAsset map[string]HoldingOverride; Adopt string; CooldownBars int
+}
+type TransitionRule struct { ExitSteps int; Ratio float64 }
+type TransitionConfig struct {
+    Mode string; ExitSteps int; Basis string; PeriodBars int
+    Startup, Sizing, OnReselect string; Ratio, FinalThreshold, Alpha float64
+    EntryWindowBars int; ByAsset map[string]TransitionRule
+}
+type AllocationConfig struct {
+    Method string; ReserveRatio, FixedNotional, VolTarget, AssetCap float64
+    GroupCaps map[string]float64; TurnoverLimit, NetCap, BetaCap float64
+}
+type PortfolioPolicyConfig struct {
+    Policy string; PolicyParams json.RawMessage
+    Rebalance RebalanceConfig; Selection SelectionConfig; Holding HoldingConfig
+    Transition TransitionConfig; Allocation AllocationConfig
+    LongNotional, ShortNotional float64
+}
+type PositionFillEvidence struct {
+    Quantity string; LedgerCursor, PlanSequence uint64; AtMS int64
+}
+type PositionEvidence struct {
+    Quantity, PendingQuantity string; FirstFillTime int64
+    IncreasingPending, PendingUnknown bool; Quantum string
+    FillEvents []PositionFillEvidence
+}
+type PortfolioContext struct {
+    Frame Frame; Universe Universe; Ideal *TargetPortfolio; Spec PortfolioSpec
+    GridTime, BarMillis int64; ScoreName string
+    Positions map[int32]PositionEvidence; Marks map[int32]float64
+    Groups map[int32]string; Volatility, Beta map[int32]float64
+    AssetNames map[int32]string; SIDMappingVersion string
+    StateVersion, LedgerCursor uint64; ForceExit map[int32]string
+    Previous *PortfolioTarget; PreserveIdealWeights bool
+    HoldingRules map[int32]HoldingRule; TransitionRules map[int32]TransitionRule
+    RebalanceDue *bool; CapitalLimit float64; RiskOnly bool
+}
+type PortfolioProposal struct {
+    Target *PortfolioTarget; NextState json.RawMessage; Reasons []Diagnostic
+    AcceptanceID string; ReconcileSIDs []int32; PlanSequence uint64
+    DecisionTime, ExpireAt int64
+}
+type PortfolioPolicy interface {
+    Propose(PortfolioContext, json.RawMessage) (PortfolioProposal, error)
+}
+type PortfolioPolicyFactory func(PortfolioPolicyConfig) (PortfolioPolicy, error)
+func NewLifecyclePolicy(config PortfolioPolicyConfig) (PortfolioPolicy, error)
+func SelectPortfolio(frame Frame, universe Universe, spec PortfolioSpec, c PortfolioPolicyConfig) (*TargetPortfolio, []Diagnostic, error)
+func SelectPortfolioScore(frame Frame, universe Universe, spec PortfolioSpec, c PortfolioPolicyConfig, scoreName string, groups map[int32]string) (*TargetPortfolio, []Diagnostic, error)
+func AllocateSelected(selected map[int32]float64, c PortfolioPolicyConfig, nav float64, scores, vol map[int32]float64) (map[int32]float64, error)
+```
+
+* rebalance supports every_bars, anchor/phase, duration or calendar/timezone/calendar_version; do not mix schedules. selection supports separate side K or quantiles, retain_rank buffers, dropout replacement counts and group_quota.
+* `transition.mode` is direct, linear-exit (exit_steps), cohort (period_bars is a multiple of every_bars), geometric (ratio/final_threshold) or target-step (alpha). Exit basis is quantity or weight: quantity anchors confirmed units; weight is converted using current NAV and can replenish units.
+* For cohorts, `startup: gradual|seed-all` and `sizing: entry-nav|current-nav` explicitly select budget behavior. `on_reselect: restore|resume|finish|new-cohort` controls reselection. Scheduled cohort windows are not actual fill holding durations.
+* `holding.by_asset` / `transition.by_asset` use SIDMap asset names. Holding pointers distinguish omission from explicit zero. Unknown first-fill age is not guessed; `adopt: adopt` explicitly starts age at adoption.
+* allocation.method supports equal, score, fixed-notional, inverse-volatility and vol-target. Supply `Groups`, `Volatility`, `Beta`, visible parameter rules and custom calendars via `Config.PolicyContext`; similarly named factor columns are not implicit risk evidence.
+* Each run receives a private policy instance. A policy reads frozen context and accepted JSON state, and returns targets, next state and diagnostics without sending orders or writing accounts. Advance state after atomic account acceptance. Accepted targets with send errors must not roll back state or generate duplicate plans. Preserve pending/partial-fill evidence; direction reversal waits for confirmed zero.
+
+### github.com/banbox/banbot/factor/runner
+
+```go
+type DefinitionBuilder func(Config) (*factor.Plan, research.ComboSpec, error)
+type PortfolioBuilder func(factor.Frame, factor.Universe, factor.PortfolioSpec, research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error)
+type PortfolioPolicyFactory = factor.PortfolioPolicyFactory
+func RegisterDefinition(name string, builder DefinitionBuilder) error
+func CompileDefinition(c Config) (*factor.Plan, research.ComboSpec, error)
+func RegisterPortfolioBuilder(name string, builder PortfolioBuilder) error
+func RegisterPortfolioBuilderIdentity(name, hash string) error
+func RegisterPortfolioPolicy(name string, factory PortfolioPolicyFactory) error
+```
+
+A Go `definition` returns a compiled graph and combiner. A stateless `PortfolioBuilder` consumes a frozen Frame containing original outputs and combined score, and returns ideal weights. Register complete custom policies with versioned names such as rotation-v1; YAML selects `portfolio.builder` / `portfolio.policy`. Use immutable versions/config hashes for strategy identity. Definition/builder code changes require recompilation.
+
+`Config` fields used by builders (strategy-facing fields only; account/input assembly fields omitted):
+
+```go
+// Selected fields used by DefinitionBuilder; other assembly fields omitted.
+type Config struct { // package runner
+    Definition string; Expressions *expr.Spec; Plan *factor.Plan
+    Factor research.MomentumVolConfig; Combo research.ComboSpec
+    Manifest research.ManifestSpec; PortfolioBuilder PortfolioBuilder
+    PolicyContext func(context.Context, *factor.PortfolioContext) error
+}
+// package research
+type MomentumVolConfig struct {
+    Source, Field, TimeFrame string; Window, DDOF int
+    WinsorTail float64; Standardize bool
+}
+type ManifestSpec struct { // selected strategy-facing fields
+    Parameters map[string]float64; Portfolio PortfolioDefinition
+    Combo ComboSpec; Labels []LabelSpec
+}
+type LabelKind string // ExecutableReturn, CloseToClose
+type LabelSpec struct {
+    Name string; Kind LabelKind; Horizon int64
+    Overlapping bool; PeriodsPerYear float64
+}
+```
+
+### Go multi-factor example
+
+```go
+package factors
+
+import (
+    "fmt"
+    "math"
+    "github.com/banbox/banbot/factor"
+    "github.com/banbox/banbot/factor/research"
+    "github.com/banbox/banbot/factor/runner"
+)
+
+func MultiFactorV1(c runner.Config) (*factor.Plan, research.ComboSpec, error) {
+    window := 24
+    if v, ok := c.Manifest.Parameters["window"]; ok {
+        if math.IsNaN(v) || math.IsInf(v, 0) || v < 2 || v > 10000 || v != math.Trunc(v) {
+            return nil, research.ComboSpec{}, fmt.Errorf("window must be an integer in [2,10000]")
+        }
+        window = int(v)
+    }
+    price := factor.Positive(factor.Field(c.Factor.Source, c.Factor.Field, c.Factor.TimeFrame))
+    momentum := factor.ZScore(factor.Return(price, window))
+    lowVol := factor.ZScore(factor.Neg(factor.StdDev(factor.Return(price, 1), window, 0)))
+    plan, err := factor.New().Add("momentum", momentum).Add("low_vol", lowVol).Compile()
+    return plan, research.ComboSpec{
+        Method: research.Fixed, Columns: []string{"momentum", "low_vol"},
+        Weights: map[string]float64{"momentum": 0.7, "low_vol": 0.3},
+    }, err
+}
+
+func init() {
+    if err := runner.RegisterDefinition("MultiFactorV1", MultiFactorV1); err != nil { panic(err) }
+}
+```
+
+Compile and import this package so init runs; the application's main calls `entry.RunCmd()`. In the earlier YAML, keep the display name, add `definition: MultiFactorV1`, change `params` to `{window: 24, k: 3}`, and remove `expressions`. Portfolio/price settings remain applicable. The unified command entry supplies `c.Factor` defaults for kline/close/decision timeframe; direct builder calls must supply them.
+
+### Execution and conversion rules
+
+* YAML `expressions` and Go definitions produce the same `Plan`. Expressions cannot coexist with `definition` or Go `Config.Plan`. A directly supplied `Plan` also needs explicit `Combo`. Strategies use the existing barriers, account ledger and exchange adapters.
+* `weights` is an approximate weight replay. Ordinary backtest defaults to `events` (overridden by `--mode` / `execution.mode`); mixed time-series/factor replay requires `events`. `events`/live need independent tick/event or 1m observable execution prices, instrument units and account evidence. Hourly/daily factor candles do not replace execution streams.
+* `decision.delay_ms` controls the visibility cutoff; `latency_ms` controls executable delay; `expiry_ms` controls target validity. Execution prices must be subsequent visible observations strictly after the decision and satisfy latency. Do not infer intrabar paths from current complete OHLC. Fees/slippage use `manifest.costs`; `funding_policy: explicit-zero` explicitly ignores funding, while actual funding requires `required-stream`.
+* Factor/mixed `trade --dry-run` is an events historical replay; pure time-series real-time simulation still uses `env: dry_run`. For live, remove `archive` and use a capability-verified built-in banexg binding or one registered through `entry.RegisterFactorLiveBinding`. Missing data, instrument units, transport or reconciliation capabilities fail startup. The built-in path currently supports production linear perpetuals with one-way net positions; exchange differences belong to banexg.
+* Preserve the requested factor direction, normalization, universe, rebalance schedule, holding and exit rules. Add no unrequested risk controls or hyperparameters. Future labels are research inputs, never current selection features; full-sample optima cannot set historical parameters. Pure CLI research has no position evidence and cannot run stateful policies.
+
+See the [expression guide](factor_expression_guide.md), [indicators](factor_indicators.md), [portfolio guide](factor_portfolio_guide.md), [live guide](factor_live_trading.md) and [API](../bandoc/en-US/api/factor.md). [Research extensions](factor_research_extensions.md) cover models, risk optimization, learned parameters and cost attribution as needed; they are optional for ordinary strategy conversion.

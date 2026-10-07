@@ -1,6 +1,6 @@
-以下是交易机器人banbot和指标库banta的一部分关键代码。你的任务是帮助用户构建基于banbot和banta的交易策略
+以下是交易机器人banbot和指标库banta的策略接口与关键规则。你的任务是帮助用户将策略灵感或其他代码转为banbot支持的时序、截面或多因子策略；截面与多因子可使用YAML公式或Go代码。
 
-> 接口基准：Banbot v0.6.0-beta.2。生成新代码时遵循本文的任意时序数据订阅和 Runtime Context 规则；`OnBar` 等旧接口用于兼容。配置保留 v0.5 key 位置；新增的浅层引擎配置见[兼容性对比](config_compatibility.md)和[因子指南](../bandoc/zh-CN/guide/factor.md)。
+> 接口基准：Banbot v0.6.0-beta.8。先按策略语义选择引擎，见本文末尾“截面与多因子策略”；时序新代码遵循任意时序数据订阅和 Runtime Context 规则，`OnBar` 等旧接口用于兼容。配置保留 v0.5 key 位置；参见[兼容性对比](config_compatibility.md)。
 
 ### github.com/banbox/banta
 ```go
@@ -675,6 +675,8 @@ type PairUpdateResult struct {
 }
 
 // 核心方法
+type FuncMakeStrat = func(pol *config.RunPolicyConfig) *TradeStrat
+func RegisterStrategy(name string, factory FuncMakeStrat)
 func GetJobs(account string) map[string]map[string]*StratJob
 func GetInfoJobs(account string) map[string]map[string]*StratJob
 func (s *TradeStrat) UpdatePairs(req PairUpdateReq) (*PairUpdateResult, *errs.Error)
@@ -806,8 +808,457 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
  * 注意不要添加空函数，如果More结构体只被赋值，没有被使用，则应该删除掉。
  * 用户可能会提供策略名称，格式如"package:name"，冒号前面部分你应该提取作为返回代码中package后的go包名，冒号后面部分应作为策略函数名。如果用户未提供策略名，则使用默认"ma:demo"
 
-## 2026-10-04 双引擎使用入口
+## 截面与多因子策略
 
-run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
+### 引擎与定义方式
 
-execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。
+本节用于将选股、轮动、多空排序、因子合成和持仓生命周期策略转为 banbot。前面的 `TradeStrat` / banta 回调规则适用于时序引擎；原生因子引擎使用 `factor.Plan`，由 runner 统一生成目标组合并交给账户执行。
+
+| 场景 | 入口 |
+| --- | --- |
+| 单品种逐事件信号、逐订单止盈止损 | `engine: time_series`（默认），`strat.TradeStrat.OnData` |
+| 同时点跨品种排名、中性化、多因子和统一调仓 | `engine: factor`，YAML `expressions` 或 Go `runner.RegisterDefinition` |
+| 延续已有时序策略，只增加批量比较/下单 | `TradeStrat.BatchInOut` + `OnBatchJobs`；辅助数据批处理用 `BatchInfo` + `OnBatchInfos` |
+
+因子策略不返回 `*strat.TradeStrat`，也不在逐品种回调中自行提交排名后的订单。YAML 中 `expressions`、`definition`、`portfolio`、`prices`、`decision`、`research` 与 `engine` 同在 `run_policy[]` 浅层；旧 `factor: {...}` 仅为兼容输入，不添加版本标记。
+
+* 每个因子条目使用一个 `run_timeframes` 决策周期。表达式策略的 `name` 可自定；Go 策略的 `definition` 选择已注册名称，省略时使用 `name`。内置 Go definition 为 `momentum-vol`。
+* `id` 标识策略，`account` 指定账户。含因子策略的共享账户有多个策略时，每个参与者都须显式给出 `capital_weight`，总和不超过 1；它分配策略预算，与时序 `stake_rate` 的开单倍率不同。
+* `run_policy.params.k` / `portfolio.k` 用于旧选股器；`expressions.params` 仅供 `param.name` 使用，不自动继承外层参数。Go builder 从 `c.Manifest.Parameters` 读外层 `params`。
+
+### YAML 多因子示例
+
+以下是权重回测配置；`data.gob` 须为含至少六个资产、足够预热历史及后续可见价格的归档。示例按动量和低波动合成分数，最高/最低各选三只，名义敞口各占策略 NAV 的 50%。
+
+```yaml
+wallet_amounts: {USD: 10000}
+execution: {mode: weights, funding_policy: explicit-zero}
+run_policy:
+  - name: MultiFactor
+    id: multi_v1
+    engine: factor
+    run_timeframes: [1h]
+    params: {k: 3}
+    archive: data.gob
+    prices: {source: kline, timeframe: 1h, field: close}
+    portfolio: {long_notional: 0.5, short_notional: 0.5, mode: full}
+    research: {labels: []}
+    expressions:
+      schema_version: 1
+      timeframe: 1h
+      bindings:
+        kline: {source: kline, timeframe: 1h}
+      params: {window: 24}
+      lets:
+        price: 'positive(kline.close)'
+        ret1: 'ts.return(factor.price, 1)'
+      outputs:
+        momentum: 'cs.zscore(ts.return(factor.price, param.window))'
+        low_vol: 'cs.zscore(-ts.std(factor.ret1, param.window, 0))'
+      combine:
+        method: fixed
+        weights: {momentum: 0.7, low_vol: 0.3}
+```
+
+`banbot backtest --mode weights --config strategy.yml` 运行权重回测。使用普通行情库时移除 `archive`，合并数据库、市场、品种池和 `time_range` 基础配置，并显式设置 `data: {pit_policy: static-approximation}`；最新值历史库不能证明严格 PIT（决策时点可见性）。
+
+研究时移除示例的 `research: {labels: []}`，默认产生一个决策周期的收益标签；用 `banbot research --config strategy.yml` 计算研究结果。多期限写 `research.labels: [{name: forward_16h, kind: executable-return, horizon: 57600000, periods_per_year: 547.5, overlapping: true}]`，`horizon` 为毫秒；未成熟标签保留为 unresolved，不填零。历史合成方法要求标签，不能关闭研究标签。
+
+### 表达式语法与函数
+
+`alias.field` 读取 binding 字段，`field("alias","field-name")` 支持特殊字段名；`factor.name` 引用当前 `lets` / `outputs`，`param.name` 引用数值参数。可前向引用，不允许环；未使用声明仍校验。支持数字、科学计数法、括号、一元正负号、四则运算和以下函数；没有比较、条件分支或未来 `label.*` 语法。
+
+| Go (factor) | Formula |
+| --- | --- |
+| `Add/Sub/Mul/Div(a,b)`, `Neg(x)` | `+ - * /`, unary `-` |
+| `Positive/Abs/Log/Sqrt(x)` | `positive/abs/log/sqrt(x)` |
+| `Pow/Min/Max(a,b)` | `pow/min/max(a,b)` |
+| `Lag/Return/EMA(x,n)` | `ts.lag/return/ema(x,n)` |
+| `StdDev(x,n,ddof)` | `ts.std(x,n,ddof)` |
+| `SMA/RMA/WMA/RSI/ROC/MOM/CCI/Highest/Lowest(x,n)` | `ts.sma/rma/wma/rsi/roc/mom/cci/highest/lowest(x,n)` |
+| `VWMA(c,v,n)`, `TR(h,l,c)`, `ATR(h,l,c,n)` | `ts.vwma(c,v,n)`, `ts.tr(h,l,c)`, `ts.atr(h,l,c,n)` |
+| `Stoch/WillR(h,l,c,n)`, `OBV(c,v)`, `MFI(h,l,c,v,n)` | `ts.stoch/willr(h,l,c,n)`, `ts.obv(c,v)`, `ts.mfi(h,l,c,v,n)` |
+| `MACD(x,fast,slow,signal)` | `ts.macd/macd_signal/macd_hist(x,fast,slow,signal)` |
+| `BBands(x,n,up,down)` | `ts.bbands_upper/bbands_middle/bbands_lower(x,n,up,down)` |
+| `Rank/ZScore/RobustZScore(x)` | `cs.rank/zscore/robust_zscore(x)` |
+| `Winsorize(x,tail)`, `MADWinsorize(x,k)`, `Quantile(x,q)` | `cs.winsorize(x,tail)`, `cs.mad_winsorize(x,k)`, `cs.quantile(x,q)` |
+| `Residual(y,x)`, `MultiResidual(y,xs...)`, `WeightedResidual(y,w,xs...)` | `group.residual(y,x)`, `group.ols(y,x1,x2,...)`, `group.wls(y,w,x1,x2,...)` |
+| `GroupDemean/GroupZScore(x,source,field,sourceTF...)` | `group.demean/zscore(x,"alias","field")` |
+
+* 窗口参数是整数常量或直接的 `param.name`，范围 1–10000；`lag` 另允许 0，不能写 `param.window+1`。`ddof` 必须满足 `0 <= ddof < n`；MACD 要求 `fast < slow`；布林带上下倍数均须显式给出且非负。
+* `cs.rank` 为升序、0 起始名次，并列取平均名次，不是百分位；`cs.zscore` 使用总体标准差，常数截面输出 0。`tail` 在 `[0,0.5)`，`q` 在 `[0,1]`，MAD 倍数须为正；robust z-score 使用 `1.4826*MAD`。
+* 所有截面/回归统计在冻结的 `Universe.Reference` 上拟合；OLS/WLS 含截距，WLS 需要正权重。分组字段保留原始类型/NULL，公式中的 source 是 binding 别名。
+* 可以先时序再截面，例如 `cs.rank(ts.rsi(kline.close,14))`；不支持对截面/回归结果再做时序窗口，即使包在逐点函数中也不行，零 lag 原值例外。
+* `ts.return` 返回比例，`ts.roc` 返回百分比。`max(x,1e-8)` 只对有效值设置下界，不补 NULL、缺字段或预热不足。新技术指标按完整有效输入元组推进；原有 lag/return/ema/std 保持各自语义。Go `factor.MACD/BBands` 返回三个节点，与前面的 banta 返回类型/列数分别看待。
+
+慢频或 event 源必须显式 asof 采样到决策周期，并限制数据年龄。例如在 `bindings` 增加 `funding: {source: funding, timeframe: event, sampling: asof, max_age_ms: 28800000}`，即可使用 `cs.zscore(-funding.rate)`；真实输入须提供该流。asof 后的窗口按决策观察次数计数，小时网格的 24 个观察不等于 24 个交易日。
+
+将 `expressions` 内的映射单独保存为 `formula.yml`，用 `banbot validate --spec formula.yml` / `banbot explain --spec formula.yml` 检查编译与依赖。它们不验证真实数据或账户；独立文件必须显式 `timeframe`、单 YAML 文档且不超过 1 MiB。
+
+### github.com/banbox/banbot/factor/expr
+
+```go
+type Binding struct { Source, TimeFrame, Sampling string; MaxAgeMS int64 }
+type Spec struct {
+    SchemaVersion int; TimeFrame string
+    Bindings map[string]Binding; Params map[string]float64
+    Lets, Outputs map[string]string; Combine research.ComboSpec
+}
+func Compile(spec Spec) (*factor.Plan, error)
+```
+
+### github.com/banbox/banbot/factor
+
+下面是策略构图所需的公开接口；`Node`、`Builder`、`Plan` 的内部实现不在策略中重写。`Node` 接受数值节点，不接受 banta `*Series`。
+
+```go
+type Validity string // Valid, Missing, Null, NotNumeric, NonFinite, Warmup
+type Numeric struct { Value float64; Validity Validity }
+func Number(values map[string]any, field string) Numeric
+
+// Node, Builder, Plan: construct nodes through these functions.
+func Field(source, field, timeframe string) *Node
+func AsOfField(source, field, sourceTimeFrame, decisionTimeFrame string, maxAge int64) *Node
+func Constant(value float64, timeframe string) *Node
+func Add(a, b *Node) *Node
+func Sub(a, b *Node) *Node
+func Mul(a, b *Node) *Node
+func Div(a, b *Node) *Node
+func Pow(a, b *Node) *Node
+func Min(a, b *Node) *Node
+func Max(a, b *Node) *Node
+func Neg(input *Node) *Node
+func Abs(input *Node) *Node
+func Log(input *Node) *Node
+func Sqrt(input *Node) *Node
+func Positive(input *Node) *Node
+func Linear(inputs []*Node, weights []float64) *Node
+func Lag(input *Node, period int) *Node
+func Return(input *Node, period int) *Node
+func EMA(input *Node, period int) *Node
+func StdDev(input *Node, period, ddof int) *Node
+func SMA(input *Node, period int) *Node
+func RMA(input *Node, period int) *Node
+func WMA(input *Node, period int) *Node
+func VWMA(price, volume *Node, period int) *Node
+func RSI(input *Node, period int) *Node
+func ROC(input *Node, period int) *Node
+func MOM(input *Node, period int) *Node
+func TR(high, low, close *Node) *Node
+func ATR(high, low, close *Node, period int) *Node
+func CCI(input *Node, period int) *Node
+func Stoch(high, low, close *Node, period int) *Node
+func WillR(high, low, close *Node, period int) *Node
+func OBV(close, volume *Node) *Node
+func MFI(high, low, close, volume *Node, period int) *Node
+func Highest(input *Node, period int) *Node
+func Lowest(input *Node, period int) *Node
+func MACD(input *Node, fast, slow, signal int) (line, signalLine, hist *Node)
+func BBands(input *Node, period int, stdUp, stdDown float64) (upper, middle, lower *Node)
+func Rank(input *Node) *Node
+func ZScore(input *Node) *Node
+func RobustZScore(input *Node) *Node
+func Winsorize(input *Node, tail float64) *Node
+func MADWinsorize(input *Node, multiple float64) *Node
+func Quantile(input *Node, q float64) *Node
+func GroupDemean(input *Node, source, field string, sourceTimeFrame ...string) *Node
+func GroupZScore(input *Node, source, field string, sourceTimeFrame ...string) *Node
+func Residual(y, x *Node) *Node
+func MultiResidual(y *Node, exposures ...*Node) *Node
+func WeightedResidual(y, weights *Node, exposures ...*Node) *Node
+func Custom(version string, inputs []*Node, evaluate func([]Numeric) Numeric) *Node
+
+func New() *Builder
+func (b *Builder) Add(name string, n *Node) *Builder
+func (b *Builder) Compile() (*Plan, error)
+func Compile(outputs map[string]*Node) (*Plan, error)
+type InputSpec struct {
+    Source, TimeFrame string; Fields []string
+    WarmupLength int; AsOfLatest bool; MaxAge int64
+}
+func (p *Plan) Hash() string
+func (p *Plan) TimeFrame() string
+func (p *Plan) Outputs() []string
+func (p *Plan) Inputs() []InputSpec
+func (p *Plan) WarmupLength() int
+func (p *Plan) StateRetention() int
+```
+
+`Custom` 是有版本、显式依赖的纯逐点函数；回调必须传播输入无效原因，不读取账户/未来行情，不在闭包保存滚动状态。改变实现需改变 version。缺少原生历史算子时须扩展内核并验证 Session/Batch 语义，不能用 Custom 隐藏状态。
+
+冻结输入与计算结果（一般由 runner 装配；手工数值验证时使用）：
+
+```go
+type Universe struct {
+    Version string
+    Investable, Reference, Tradable, Evaluation, Tracked []int32
+    Static bool
+}
+type Frame struct {
+    GridTime, DecisionTime int64
+    SnapshotID, PlanHash string
+    Values map[string]map[int32]Numeric
+}
+type VersionRecord struct {
+    Series orm.DataSeries; EventTime int64; Revision uint64
+    AvailableAt, IngestedAt int64; SourceVersion string
+}
+type SnapshotSpec struct {
+    TrackedQuotesOnly bool
+    GridTime, DecisionTime, ReplayTime int64
+    Universe Universe; SIDMap map[int32]string
+    Schemas, SourceVersions map[string]string
+    AdjustmentVersion, VisibilityPolicy string
+}
+type Requirement struct {
+    SID int32; Source, TimeFrame string
+    EventTime int64; AsOfLatest bool; MaxAge int64
+}
+func Record(series orm.DataSeries, revision uint64, availableAt, ingestedAt int64, sourceVersion string) VersionRecord
+func Freeze(spec SnapshotSpec, records []VersionRecord, requirements []Requirement) (*Snapshot, error)
+func NewSession(plan *Plan) (*Session, error)
+func (s *Session) Warmup(snapshot *Snapshot) error
+func (s *Session) Evaluate(snapshot *Snapshot) (Frame, error)
+func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error)
+```
+
+`Investable` 是候选池，`Reference` 是统计池，`Tradable` 是可交易池，`Evaluation` 是研究池，`Tracked` 用于退出后仍需监控的资产。`Frame.Values[column][sid]` 是数值视图；源数据一直保留 `orm.DataSeries.Values map[string]any` 的任意字段、类型、缺失和 NULL。
+
+`AvailableAt` 为源发布/可见时间，`IngestedAt` 为接收时间，`Revision` 标识修订；冻结只能选择当时可见且已接收的版本。闭合数据不足或屏障未齐时跳过该决策，不用缺席资产临时改变声明池。Session 跨历史分块连续推进，Batch 从传入历史起点初始化；已经处理的过去修订应另建回放，不改写已冻结结果。`WarmupLength()` 是无缺失条件下所需前置观察数，不保证经过相同数量的日历 bar 就有效。
+
+### github.com/banbox/banbot/factor/research
+
+```go
+type ComboMethod string // Equal, Fixed, HistoryIC, HistoryRankIC, HistoryICIR, HistoryRankICIR, HistoryEWMA
+type ComboSpec struct {
+    Method ComboMethod; Columns []string; Weights map[string]float64
+    Label string; MinSamples, MinPairs int
+    MinConfidence, Decay float64; Direction, Fallback string
+}
+type PortfolioDefinition struct {
+    Builder, BuilderConfigHash string; K int
+    LongNotional, ShortNotional float64; Mode factor.PortfolioMode
+    Policy string; PolicyParams json.RawMessage
+    Rebalance *factor.RebalanceConfig; Selection *factor.SelectionConfig
+    Holding *factor.HoldingConfig; Transition *factor.TransitionConfig
+    Allocation *factor.AllocationConfig
+}
+```
+
+`equal` 对所选列等权，默认选全部输出；`fixed` 按权重直接相加，允许负数且不自动归一化。非零权重列失效会令该资产 score 失效，不临时重分配权重；零权重列不影响有效性。组合列必须存在且不重复，避免把原始输出命名为 runner 生成的 `score`。显式外层 `combo.method` 覆盖完整内层组合配置。
+
+历史方法为 `history-ic/history-rank-ic/history-icir/history-rank-icir/history-ewma`，只使用已成熟且决策时可见的样本。`label` 选期限；多标签省略时取最短 horizon、同期限按名称排序。`min_samples` 统计历史截面数，`min_pairs` 是每截面资产数，`min_confidence` 为均值/标准误门槛；EWMA `decay` 是 alpha，零值默认 0.2；`direction: signed|positive`，`fallback: equal|fixed|error`。当前 live 拒绝全部历史合成方法。
+
+### 目标组合与持仓策略（factor）
+
+```go
+type PortfolioMode string // Full = "full", Patch = "patch"
+type FrozenBudget struct { Version, Currency string; NAV float64 }
+type Diagnostic struct { Code, Detail string }
+type PortfolioSpec struct {
+    StrategyID, AccountID string
+    DecisionTime, ExecutableAt, ExpireAt int64; PlanSequence uint64
+    SnapshotID, PlanHash, FactorPlanHash, UniverseVersion string
+    Budget FrozenBudget; Mode PortfolioMode; Diagnostics []Diagnostic
+}
+func NewTargetPortfolio(spec PortfolioSpec, targets map[int32]float64) (*TargetPortfolio, error)
+func (p *TargetPortfolio) Spec() PortfolioSpec
+func (p *TargetPortfolio) ID() string
+func (p *TargetPortfolio) Targets() map[int32]float64
+func (p *TargetPortfolio) EffectiveTargets(previous *TargetPortfolio) (map[int32]float64, error)
+func (p *TargetPortfolio) Notional(sid int32) float64
+func TopBottomK(frame Frame, scoreName string, universe Universe, spec PortfolioSpec, k int) (*TargetPortfolio, []Diagnostic, error)
+func TopBottomKNotional(frame Frame, scoreName string, universe Universe, spec PortfolioSpec, k int, longNotional, shortNotional float64) (*TargetPortfolio, []Diagnostic, error)
+
+type AllocationBasis string // NAVFraction = "nav-fraction", AbsoluteQuantity = "absolute-quantity"
+type Allocation struct { Basis AllocationBasis; Value string }
+func NewPortfolioTarget(spec PortfolioSpec, allocations map[int32]Allocation) (*PortfolioTarget, error)
+func (p *PortfolioTarget) Spec() PortfolioSpec
+func (p *PortfolioTarget) ID() string
+func (p *PortfolioTarget) Version() int
+func (p *PortfolioTarget) AsWeightPortfolio() (*TargetPortfolio, error)
+func (p *PortfolioTarget) Allocations() map[int32]Allocation
+func (p *PortfolioTarget) EffectiveAllocations(previous *PortfolioTarget) (map[int32]Allocation, error)
+func PortfolioTargetFromWeights(p *TargetPortfolio) (*PortfolioTarget, error)
+```
+
+权重正数做多、负数做空；`FrozenBudget.NAV` 是策略净值。`Full` 将本策略旧目标中省略的资产归零，`Patch` 保留省略目标，显式零表示清仓。默认 `TopBottomK` 按分数两端选股，要求至少 `2*k` 个有效、可投资且可交易候选，即使某侧 notional 为零；不足或分数全相同返回 nil 目标和诊断，runner 跳过替换并保留旧组合。直接调用者须检查目标非 nil。纯多头需仅按单侧数量选股时使用 lifecycle selection 或自定义 builder。
+
+`TargetPortfolio` 是理想权重；`PortfolioTarget` 可混合 NAV 权重和绝对数量。`Allocation.Value` 是有符号普通十进制字符串，不接受空值或科学计数法；`AbsoluteQuantity` 使用标准资产数量而非合约张数，`AsWeightPortfolio` 遇到数量目标会报错。EffectiveTargets/EffectiveAllocations 校验策略、账户、币种及递增计划序号。
+
+`portfolio.policy: lifecycle-v1` 启用调仓与持仓生命周期。例如用下段替换示例的 portfolio：
+
+```yaml
+portfolio:
+  long_notional: 1
+  short_notional: 0
+  policy: lifecycle-v1
+  selection: {long_k: 3}
+  rebalance: {every_bars: 2}
+  holding: {min_bars: 16}
+  transition: {mode: linear-exit, exit_steps: 8, basis: quantity}
+  allocation: {method: equal, reserve_ratio: 0.02}
+```
+
+每小时计算、每两小时普通调仓；首次实际成交满 16 小时后，只有排名落选才进入八步退出。`holding.max_bars/max_duration` 到期则在监控网格强制零目标，绕过普通调仓门和退出曲线；与“满期才开始渐退”的 min 不同。以下字段类型也适用于 Go policy：
+
+```go
+type RebalanceConfig struct {
+    EveryBars int; Anchor int64; Phase int
+    Duration, Calendar, CalendarVersion, Timezone string
+}
+type SelectionConfig struct {
+    LongK, ShortK int; LongQuantile, ShortQuantile float64
+    RetainRank, Dropout int; GroupQuota map[string]int; MissingScores string
+}
+type HoldingRule struct { MinBars, MaxBars int; MinDuration, MaxDuration string }
+type HoldingOverride struct { MinBars, MaxBars *int; MinDuration, MaxDuration *string }
+type HoldingConfig struct {
+    MinBars, MaxBars int; MinDuration, MaxDuration string
+    ByAsset map[string]HoldingOverride; Adopt string; CooldownBars int
+}
+type TransitionRule struct { ExitSteps int; Ratio float64 }
+type TransitionConfig struct {
+    Mode string; ExitSteps int; Basis string; PeriodBars int
+    Startup, Sizing, OnReselect string; Ratio, FinalThreshold, Alpha float64
+    EntryWindowBars int; ByAsset map[string]TransitionRule
+}
+type AllocationConfig struct {
+    Method string; ReserveRatio, FixedNotional, VolTarget, AssetCap float64
+    GroupCaps map[string]float64; TurnoverLimit, NetCap, BetaCap float64
+}
+type PortfolioPolicyConfig struct {
+    Policy string; PolicyParams json.RawMessage
+    Rebalance RebalanceConfig; Selection SelectionConfig; Holding HoldingConfig
+    Transition TransitionConfig; Allocation AllocationConfig
+    LongNotional, ShortNotional float64
+}
+type PositionFillEvidence struct {
+    Quantity string; LedgerCursor, PlanSequence uint64; AtMS int64
+}
+type PositionEvidence struct {
+    Quantity, PendingQuantity string; FirstFillTime int64
+    IncreasingPending, PendingUnknown bool; Quantum string
+    FillEvents []PositionFillEvidence
+}
+type PortfolioContext struct {
+    Frame Frame; Universe Universe; Ideal *TargetPortfolio; Spec PortfolioSpec
+    GridTime, BarMillis int64; ScoreName string
+    Positions map[int32]PositionEvidence; Marks map[int32]float64
+    Groups map[int32]string; Volatility, Beta map[int32]float64
+    AssetNames map[int32]string; SIDMappingVersion string
+    StateVersion, LedgerCursor uint64; ForceExit map[int32]string
+    Previous *PortfolioTarget; PreserveIdealWeights bool
+    HoldingRules map[int32]HoldingRule; TransitionRules map[int32]TransitionRule
+    RebalanceDue *bool; CapitalLimit float64; RiskOnly bool
+}
+type PortfolioProposal struct {
+    Target *PortfolioTarget; NextState json.RawMessage; Reasons []Diagnostic
+    AcceptanceID string; ReconcileSIDs []int32; PlanSequence uint64
+    DecisionTime, ExpireAt int64
+}
+type PortfolioPolicy interface {
+    Propose(PortfolioContext, json.RawMessage) (PortfolioProposal, error)
+}
+type PortfolioPolicyFactory func(PortfolioPolicyConfig) (PortfolioPolicy, error)
+func NewLifecyclePolicy(config PortfolioPolicyConfig) (PortfolioPolicy, error)
+func SelectPortfolio(frame Frame, universe Universe, spec PortfolioSpec, c PortfolioPolicyConfig) (*TargetPortfolio, []Diagnostic, error)
+func SelectPortfolioScore(frame Frame, universe Universe, spec PortfolioSpec, c PortfolioPolicyConfig, scoreName string, groups map[int32]string) (*TargetPortfolio, []Diagnostic, error)
+func AllocateSelected(selected map[int32]float64, c PortfolioPolicyConfig, nav float64, scores, vol map[int32]float64) (map[int32]float64, error)
+```
+
+* `rebalance` 支持 every_bars、anchor/phase、duration 或 calendar/timezone/calendar_version，不混用日程。`selection` 支持两侧 K 或 quantile、retain_rank 缓冲、dropout 换仓数和 group_quota。
+* `transition.mode` 支持 direct、linear-exit（exit_steps）、cohort（period_bars 为 every_bars 整数倍）、geometric（ratio/final_threshold）、target-step（alpha）。退出 basis 为 quantity 或 weight；quantity 锚定已确认数量，weight 每轮依最新 NAV 换算，可能回补。
+* cohort 的 `startup: gradual|seed-all`、`sizing: entry-nav|current-nav` 显式选择批次预算；`on_reselect: restore|resume|finish|new-cohort` 控制重选。计划批次窗口不等于所有成交订单的真实持仓时长。
+* `holding.by_asset` / `transition.by_asset` 使用 SIDMap 资产名覆盖默认值；holding 指针区分省略与显式零。缺首次成交证据时不猜年龄，明确接管才设 `adopt: adopt`。
+* `allocation.method` 支持 equal、score、fixed-notional、inverse-volatility、vol-target；Groups、Volatility、Beta、可见参数规则及自定义交易日程由 `Config.PolicyContext` 注入，不能把同名因子列当作隐式风险证据。
+* policy 每 run 创建私有实例，只读冻结 context 和已接纳 JSON 状态，返回目标、下一状态和诊断，不直接提交订单或写账户。账户原子接纳后才能推进状态；已接纳但发送失败不能回滚或重复生成新计划。保留在途/部分成交证据，反手等待原方向实际归零。
+
+### github.com/banbox/banbot/factor/runner
+
+```go
+type DefinitionBuilder func(Config) (*factor.Plan, research.ComboSpec, error)
+type PortfolioBuilder func(factor.Frame, factor.Universe, factor.PortfolioSpec, research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error)
+type PortfolioPolicyFactory = factor.PortfolioPolicyFactory
+func RegisterDefinition(name string, builder DefinitionBuilder) error
+func CompileDefinition(c Config) (*factor.Plan, research.ComboSpec, error)
+func RegisterPortfolioBuilder(name string, builder PortfolioBuilder) error
+func RegisterPortfolioBuilderIdentity(name, hash string) error
+func RegisterPortfolioPolicy(name string, factory PortfolioPolicyFactory) error
+```
+
+Go definition 编译图并返回合成规则；无状态 PortfolioBuilder 接收包含原始输出及合成 `score` 的冻结 Frame 并返回理想权重。完整自定义 policy 用带版本名（如 `rotation-v1`）注册，YAML 通过 `portfolio.builder` / `portfolio.policy` 选择；策略参数进入身份时使用不可变版本/配置 hash。definition 及 builder 改动后须重新编译程序。
+
+builder 使用的配置字段（只列策略侧字段，省略账户/输入装配字段）：
+
+```go
+// Selected fields used by DefinitionBuilder; other assembly fields omitted.
+type Config struct { // package runner
+    Definition string; Expressions *expr.Spec; Plan *factor.Plan
+    Factor research.MomentumVolConfig; Combo research.ComboSpec
+    Manifest research.ManifestSpec; PortfolioBuilder PortfolioBuilder
+    PolicyContext func(context.Context, *factor.PortfolioContext) error
+}
+// package research
+type MomentumVolConfig struct {
+    Source, Field, TimeFrame string; Window, DDOF int
+    WinsorTail float64; Standardize bool
+}
+type ManifestSpec struct { // selected strategy-facing fields
+    Parameters map[string]float64; Portfolio PortfolioDefinition
+    Combo ComboSpec; Labels []LabelSpec
+}
+type LabelKind string // ExecutableReturn, CloseToClose
+type LabelSpec struct {
+    Name string; Kind LabelKind; Horizon int64
+    Overlapping bool; PeriodsPerYear float64
+}
+```
+
+### Go 多因子示例
+
+```go
+package factors
+
+import (
+    "fmt"
+    "math"
+    "github.com/banbox/banbot/factor"
+    "github.com/banbox/banbot/factor/research"
+    "github.com/banbox/banbot/factor/runner"
+)
+
+func MultiFactorV1(c runner.Config) (*factor.Plan, research.ComboSpec, error) {
+    window := 24
+    if v, ok := c.Manifest.Parameters["window"]; ok {
+        if math.IsNaN(v) || math.IsInf(v, 0) || v < 2 || v > 10000 || v != math.Trunc(v) {
+            return nil, research.ComboSpec{}, fmt.Errorf("window must be an integer in [2,10000]")
+        }
+        window = int(v)
+    }
+    price := factor.Positive(factor.Field(c.Factor.Source, c.Factor.Field, c.Factor.TimeFrame))
+    momentum := factor.ZScore(factor.Return(price, window))
+    lowVol := factor.ZScore(factor.Neg(factor.StdDev(factor.Return(price, 1), window, 0)))
+    plan, err := factor.New().Add("momentum", momentum).Add("low_vol", lowVol).Compile()
+    return plan, research.ComboSpec{
+        Method: research.Fixed, Columns: []string{"momentum", "low_vol"},
+        Weights: map[string]float64{"momentum": 0.7, "low_vol": 0.3},
+    }, err
+}
+
+func init() {
+    if err := runner.RegisterDefinition("MultiFactorV1", MultiFactorV1); err != nil { panic(err) }
+}
+```
+
+将包编入策略程序并导入以执行 init；主入口调用 `entry.RunCmd()`。前面的 YAML 保留展示名称，增加 `definition: MultiFactorV1`、将 `params` 改为 `{window: 24, k: 3}` 并移除 `expressions`，即可使用同一组合/价格配置。统一命令入口提供 `c.Factor` 的 kline/close/决策周期默认值；手工调用 builder 须自行提供。
+
+### 运行与策略转换规则
+
+* 表达式和 Go definition 生成同种 Plan；表达式不能同时设置 definition 或 Go Config.Plan。直接传 Plan 还需显式 Combo；策略不自行重写屏障、资金账本或交易所适配。
+* `weights` 用于权重近似回放；普通 `backtest` 默认 events（可由 `--mode` / `execution.mode` 覆盖），混合时序/因子回放必须 events。events 和 live 使用独立 tick/event 或 1m 可见执行价格、合约单位与账户证据，小时/日因子 K 线不能代替成交流。
+* `decision.delay_ms` 控制数据可见性截止，`latency_ms` 控制可执行延迟，`expiry_ms` 控制目标有效期。成交需使用严格晚于决策并满足延迟的后续可见价格，不按当前完整 OHLC 虚构盘中路径。费用/滑点用 `manifest.costs`；`funding_policy: explicit-zero` 是显式忽略资金费，真实费用需要 required-stream。
+* `trade --dry-run` 对因子/混合是 events 历史回放；纯时序实时模拟仍用 `env: dry_run`。实盘移除 archive，使用经能力验证的内置 banexg 或 `entry.RegisterFactorLiveBinding` 注册绑定，缺数据、执行单位、transport 或对账能力会失败。当前内置路径支持生产环境线性永续、单向净持仓；策略不写交易所特例。
+* 保留原策略的因子方向、标准化、选股池、调仓日程、持仓和退出语义；未要求的风险控制或超参数不额外添加。未来标签用于研究，不能进入当期选股或从全样本最优反推历史参数。纯 CLI research 无真实持仓证据，不能使用有状态 policy。
+
+更完整用法见[表达式指南](factor_expression_guide.md)、[指标](factor_indicators.md)、[组合与持仓](factor_portfolio_guide.md)、[实盘](factor_live_trading.md)和[API](../bandoc/zh-CN/api/factor.md)。模型、风险优化、参数学习、成本归因等按需查看[研究扩展](factor_research_extensions.md)；这些扩展不作为普通策略转换的默认步骤。
