@@ -678,14 +678,13 @@ func queryCompactStats(ctx context.Context, db compactDB, table string, meta *Ta
 
 func queryCompactWalFallback(ctx context.Context, db compactDB, table string) (int64, bool, bool, error) {
 	var sequencerTxn, writerTxn int64
-	var lagTxnCount int64
 	var suspended bool
-	err := db.QueryRow(ctx, `SELECT sequencerTxn, writerTxn, writerLagTxnCount, suspended
-FROM wal_tables() WHERE name = $1`, table).Scan(&sequencerTxn, &writerTxn, &lagTxnCount, &suspended)
+	err := db.QueryRow(ctx, `SELECT sequencerTxn, writerTxn, suspended
+FROM wal_tables() WHERE name = $1`, table).Scan(&sequencerTxn, &writerTxn, &suspended)
 	if err != nil {
 		return 0, false, false, err
 	}
-	return sequencerTxn, writerTxn >= sequencerTxn && lagTxnCount == 0, suspended, nil
+	return sequencerTxn, !suspended && writerTxn == sequencerTxn, suspended, nil
 }
 
 func compactWalApplied(ctx context.Context, db compactDB, table string) (int64, bool, bool, error) {

@@ -586,11 +586,104 @@ func TestGeometricDistinctFromLinearAndTargetStepMinimumProtection(t *testing.T)
 	config.Transition = TransitionConfig{Mode: "target-step", Alpha: .125}
 	p, _ = NewLifecyclePolicy(config)
 	a := proposePolicy(t, p, entry, nil)
+	s, _ := DecodeLifecycleState(a.NextState)
+	s.Assets[1].Last = Allocation{NAVFraction, "1"}
+	a.NextState, _ = json.Marshal(s)
 	c := policyFixture(t, 2000, 2, map[int32]float64{2: 1})
 	c.Positions[1] = PositionEvidence{Quantity: "10", FirstFillTime: 1001}
 	protected := proposePolicy(t, p, c, a.NextState)
 	if protected.Target.Allocations()[1].Value != "1" || protected.Target.Allocations()[2].Value != "0" {
 		t.Fatal("target-step bypassed minimum age budget", protected.Target.Allocations())
+	}
+}
+
+func TestTargetStepInterpolatesNewAndExistingAssets(t *testing.T) {
+	for _, side := range []float64{1, -1} {
+		for _, alpha := range []float64{.1, 1} {
+			config := baseLifecycle()
+			config.ShortNotional = 1
+			config.Transition = TransitionConfig{Mode: "target-step", Alpha: alpha}
+			p, err := NewLifecyclePolicy(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			initial := proposePolicy(t, p, policyFixture(t, 1000, 1, map[int32]float64{1: side}), nil)
+			if got := mustQuantity(initial.Target.Allocations()[1].Value); math.Abs(got-side*alpha) > 1e-12 {
+				t.Fatalf("side %g alpha %g initial allocation %g", side, alpha, got)
+			}
+			s, _ := DecodeLifecycleState(initial.NextState)
+			s.Assets[1].Last = Allocation{NAVFraction, floatDecimal(side)}
+			state, _ := json.Marshal(s)
+			c := policyFixture(t, 2000, 2, map[int32]float64{2: side})
+			c.Positions[1] = PositionEvidence{Quantity: floatDecimal(10 * side), FirstFillTime: 1001}
+			result := proposePolicy(t, p, c, state)
+			for sid, want := range map[int32]float64{1: side * (1 - alpha), 2: side * alpha} {
+				if got := mustQuantity(result.Target.Allocations()[sid].Value); math.Abs(got-want) > 1e-12 {
+					t.Fatalf("side %g alpha %g SID %d allocation %g want %g", side, alpha, sid, got, want)
+				}
+			}
+		}
+	}
+}
+
+func TestTargetStepAdoptsExistingPositionAndPreservesRiskExit(t *testing.T) {
+	config := baseLifecycle()
+	config.Transition = TransitionConfig{Mode: "target-step", Alpha: .1}
+	p, _ := NewLifecyclePolicy(config)
+	c := policyFixture(t, 1000, 1, map[int32]float64{1: 1})
+	c.Positions[1] = PositionEvidence{Quantity: "5", FirstFillTime: 500}
+	initial := proposePolicy(t, p, c, nil)
+	if got := mustQuantity(initial.Target.Allocations()[1].Value); math.Abs(got-.55) > 1e-12 {
+		t.Fatalf("adopted position was treated as empty: %g", got)
+	}
+	c = policyFixture(t, 2000, 2, map[int32]float64{1: 1, 2: 1})
+	c.Positions[1] = PositionEvidence{Quantity: "5", FirstFillTime: 500}
+	c.ForceExit = map[int32]string{1: "risk"}
+	result := proposePolicy(t, p, c, initial.NextState)
+	if got := result.Target.Allocations()[1]; got != (Allocation{AbsoluteQuantity, "0"}) {
+		t.Fatal("target-step restored forced exit", got)
+	}
+}
+
+func TestTargetStepPreservesPausedMissingScoreAndCooldown(t *testing.T) {
+	for _, kind := range []string{"paused", "missing-score", "cooldown", "forced-pending"} {
+		t.Run(kind, func(t *testing.T) {
+			config := baseLifecycle()
+			config.Transition = TransitionConfig{Mode: "target-step", Alpha: .1}
+			p, err := NewLifecyclePolicy(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			initial := proposePolicy(t, p, policyFixture(t, 1000, 1, map[int32]float64{1: 1}), nil)
+			s, _ := DecodeLifecycleState(initial.NextState)
+			a := s.Assets[1]
+			a.Last = Allocation{NAVFraction, "0.5"}
+			c := policyFixture(t, 2000, 2, map[int32]float64{1: 1})
+			c.Positions[1] = PositionEvidence{Quantity: "5", FirstFillTime: 1001}
+			want := .5
+			switch kind {
+			case "paused":
+				a.Paused = true
+			case "missing-score":
+				c.Ideal = nil
+				c.ScoreName = "score"
+				delete(c.Frame.Values["score"], 1)
+			case "cooldown":
+				a.Last = Allocation{AbsoluteQuantity, "0"}
+				a.CooldownUntil = 3000
+				want = 0
+			case "forced-pending":
+				a.Last = Allocation{AbsoluteQuantity, "0"}
+				a.Forced = true
+				a.Exiting = true
+				want = 0
+			}
+			state, _ := json.Marshal(s)
+			result := proposePolicy(t, p, c, state)
+			if got := mustQuantity(result.Target.Allocations()[1].Value); math.Abs(got-want) > 1e-12 {
+				t.Fatalf("%s allocation %g want %g", kind, got, want)
+			}
+		})
 	}
 }
 func TestWeightExitRevaluesCurrentNAVAndResumeDoesNotRestore(t *testing.T) {

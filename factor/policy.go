@@ -638,6 +638,7 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 		point, scorePresent := c.Frame.Values[c.ScoreName][sid]
 		missingHeldScore := c.Ideal == nil && (!scorePresent || point.Validity != Valid || math.IsNaN(point.Value) || math.IsInf(point.Value, 0))
 		if !due || !selectionValid || missingHeldScore {
+			protected[sid] = true
 			continue
 		}
 		want, selected := desired[sid]
@@ -759,16 +760,29 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 	emit := len(hard) > 0 || due && selectionValid
 	if due && selectionValid {
 		if p.config.Transition.Mode == "target-step" {
-			for _, sid := range mapSIDs(s.Assets) {
-				if protected[sid] {
+			// Interpolate the union so new selections also enter from zero.
+			for sid := range s.Assets {
+				if _, selected := desired[sid]; !selected {
+					desired[sid] = 0
+				}
+			}
+			for _, sid := range mapSIDs(desired) {
+				a := s.Assets[sid]
+				if protected[sid] || hard[sid] || a != nil && a.Paused {
+					delete(desired, sid)
 					continue
 				}
-				a := s.Assets[sid]
-				previous, e := allocationWeight(a.Last, c, sid)
-				if e != nil {
-					return PortfolioProposal{}, e
+				previous := 0.0
+				if a != nil {
+					previous, err = allocationWeight(a.Last, c, sid)
+					if err != nil {
+						return PortfolioProposal{}, err
+					}
 				}
 				desired[sid] = previous + p.config.Transition.Alpha*(desired[sid]-previous)
+				if desired[sid] == 0 {
+					targets[sid] = Allocation{NAVFraction, "0"}
+				}
 			}
 		}
 		p.allocateRemainder(c, s, desired, targets, hard, &reasons)
