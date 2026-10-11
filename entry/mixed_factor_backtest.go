@@ -78,6 +78,17 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 	if len(configs) == 0 || configs[0].Mode != runner.Events {
 		return nil, errors.New("mixed backtest requires execution.mode: events")
 	}
+	configs = append([]runner.Config(nil), configs...)
+	for index, cfg := range configs {
+		if err := runner.ValidateReplayConfig(cfg, true); err != nil {
+			return nil, err
+		}
+		prepared, err := runner.PreparePortfolioConfig(cfg)
+		if err != nil {
+			return nil, err
+		}
+		configs[index] = prepared
+	}
 	u := spec.Config()
 	p := runtimepkg.NewProcess()
 	defer func() { p.Close(); resultErr = errors.Join(resultErr, p.CloseError()) }()

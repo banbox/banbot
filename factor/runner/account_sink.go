@@ -252,42 +252,12 @@ func (s *AccountSink) ObserveFunding(ctx context.Context, f backtest.Funding, no
 	if !ok {
 		return errors.New("runner: funding mark unavailable")
 	}
-	snap, err := s.Account.Snapshot(ctx)
-	if err != nil {
-		return err
+	quote, visible := s.observed[i.ID]
+	if !visible || quote.AtMS < 0 || quote.AtMS > f.AtMS || quote.ReceivedMS < quote.AtMS || quote.ReceivedMS > now || f.AvailableAt < f.AtMS || math.IsNaN(f.Rate) || math.IsInf(f.Rate, 0) {
+		return errors.New("runner: invalid funding chronology or rate")
 	}
-	if err = validateFundingAttribution(snap, i); err != nil {
-		return err
-	}
-	postings := []execution.CashPosting{}
-	byStrategy := map[execution.StrategyID]decimal.Decimal{}
-	delta := decimal.Zero
-	for _, lot := range snap.Lots {
-		if lot.Instrument.ID == i.ID {
-			amount := i.Notional(lot.SignedSteps, mark).Mul(decimal.NewFromFloat(f.Rate)).Neg().Round(i.MoneyScale)
-			byStrategy[lot.Strategy] = byStrategy[lot.Strategy].Add(amount)
-			delta = delta.Add(amount)
-		}
-	}
-	ids := make([]string, 0, len(byStrategy))
-	for id := range byStrategy {
-		ids = append(ids, string(id))
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		postings = append(postings, execution.CashPosting{Strategy: execution.StrategyID(id), Amount: byStrategy[execution.StrategyID(id)]})
-	}
-	if len(postings) == 0 {
-		postings = append(postings, execution.CashPosting{Amount: decimal.Zero})
-	}
-	var applied bool
-	if applied, err = s.Account.CashEventApplied(execution.CashEvent{ID: f.ID, Kind: execution.Funding, AccountDelta: delta, Postings: postings, AtMS: now}); err != nil {
-		return err
-	}
-	if applied && s.Paper != nil {
-		s.Paper.ApplyCash(delta)
-	}
-	return nil
+	_, err := s.Account.ApplyPaperFunding(ctx, execution.PaperFundingObservation{ID: f.ID, Instrument: i, Mark: mark, Rate: decimal.NewFromFloat(f.Rate), AtMS: f.AtMS, AvailableAt: f.AvailableAt}, now)
+	return err
 }
 
 // ObserveFundingRecord retains the venue's actual cash delta and settlement
@@ -331,26 +301,4 @@ func (s *AccountSink) ObserveFundingRecord(ctx context.Context, r factor.Version
 	}
 	_, err = s.Account.ApplyFunding(execution.FundingSettlement{ID: id, Instrument: i, Mark: mark, Rate: rate, AccountAmount: amount, AtMS: r.EventTime})
 	return err
-}
-func validateFundingAttribution(snap execution.AccountSnapshot, i execution.Instrument) error {
-	for _, lot := range snap.ExternalPositions {
-		if lot.Instrument.ID == i.ID && lot.SignedSteps != 0 {
-			return errors.New("runner: external position funding requires explicit unassigned reconciliation")
-		}
-	}
-	virtual, actual := decimal.Zero, decimal.Zero
-	for _, lot := range snap.Lots {
-		if lot.Instrument.ID == i.ID {
-			virtual = virtual.Add(decimal.NewFromInt(lot.SignedSteps))
-		}
-	}
-	for _, lot := range snap.ActualPositions {
-		if lot.Instrument.ID == i.ID {
-			actual = actual.Add(decimal.NewFromInt(lot.SignedSteps))
-		}
-	}
-	if !virtual.Equal(actual) {
-		return errors.New("runner: unassigned account funding exposure requires explicit reconciliation")
-	}
-	return nil
 }

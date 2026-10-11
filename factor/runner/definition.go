@@ -21,12 +21,21 @@ type PortfolioBuilder func(factor.Frame, factor.Universe, factor.PortfolioSpec, 
 // Use a PortfolioPolicy for state that must be committed with execution fills.
 type PortfolioFactory func(Config) (PortfolioBuilder, error)
 
+// PortfolioValidator checks parameters without constructing state or resources.
+// It receives an owned Config copy.
+type PortfolioValidator func(Config) error
+
+type portfolioFactoryRegistration struct {
+	create   PortfolioFactory
+	validate PortfolioValidator
+}
+
 var definitions = struct {
 	sync.RWMutex
 	builders          map[string]DefinitionBuilder
 	portfolios        map[string]PortfolioBuilder
 	portfolioIdentity map[string]string
-	factories         map[string]PortfolioFactory
+	factories         map[string]portfolioFactoryRegistration
 }{builders: map[string]DefinitionBuilder{
 	"momentum-vol": func(c Config) (*factor.Plan, research.ComboSpec, error) { return research.MomentumVolPlan(c.Factor) },
 }}
@@ -40,26 +49,36 @@ func RegisterPortfolioBuilder(name string, builder PortfolioBuilder) error {
 	if definitions.portfolios == nil {
 		definitions.portfolios = map[string]PortfolioBuilder{}
 	}
-	if _, exists := definitions.portfolios[name]; exists || definitions.factories[name] != nil {
+	if _, exists := definitions.portfolios[name]; exists || definitions.factories[name].create != nil {
 		return errors.New("runner: portfolio builder already registered")
 	}
 	definitions.portfolios[name] = builder
 	return nil
 }
 
-func RegisterPortfolioFactory(name string, factory PortfolioFactory) error {
+// RegisterPortfolioFactory optionally accepts one pure parameter validator.
+// Without it, preflight checks identity and registration; constructor errors
+// are checked by PreparePortfolioConfig before execution resource assembly.
+func RegisterPortfolioFactory(name string, factory PortfolioFactory, validators ...PortfolioValidator) error {
+	if len(validators) > 1 || len(validators) == 1 && validators[0] == nil {
+		return errors.New("runner: portfolio factory accepts at most one non-nil validator")
+	}
 	if name == "" || !strings.Contains(name, "-v") || factory == nil || name == "top-bottom-k-v1" {
 		return errors.New("runner: portfolio factory needs unique versioned name")
 	}
 	definitions.Lock()
 	defer definitions.Unlock()
-	if definitions.portfolios[name] != nil || definitions.factories[name] != nil {
+	if definitions.portfolios[name] != nil || definitions.factories[name].create != nil {
 		return errors.New("runner: portfolio factory already registered")
 	}
 	if definitions.factories == nil {
-		definitions.factories = map[string]PortfolioFactory{}
+		definitions.factories = map[string]portfolioFactoryRegistration{}
 	}
-	definitions.factories[name] = factory
+	registration := portfolioFactoryRegistration{create: factory}
+	if len(validators) == 1 {
+		registration.validate = validators[0]
+	}
+	definitions.factories[name] = registration
 	return nil
 }
 
@@ -67,18 +86,52 @@ func newPortfolioBuilder(name string, config Config) (PortfolioBuilder, bool, er
 	definitions.RLock()
 	factory, builder := definitions.factories[name], definitions.portfolios[name]
 	definitions.RUnlock()
-	if factory != nil {
+	if factory.create != nil {
 		owned, err := CloneConfig(config)
 		if err != nil {
 			return nil, true, err
 		}
-		builder, err = factory(owned)
+		builder, err = factory.create(owned)
 		if err == nil && builder == nil {
 			err = errors.New("runner: portfolio factory returned nil builder")
 		}
 		return builder, true, err
 	}
 	return builder, builder != nil, nil
+}
+
+func validatePortfolioBuilder(name string, config Config) (PortfolioBuilder, bool, error) {
+	definitions.RLock()
+	factory, builder := definitions.factories[name], definitions.portfolios[name]
+	definitions.RUnlock()
+	if factory.create == nil {
+		return builder, builder != nil, nil
+	}
+	if factory.validate != nil {
+		owned, err := CloneConfig(config)
+		if err != nil {
+			return nil, true, err
+		}
+		if err := factory.validate(owned); err != nil {
+			return nil, true, err
+		}
+	}
+	return nil, true, nil
+}
+
+// PreparePortfolioConfig constructs private portfolio state once for one run.
+// Call after preflight and before borrowing accounts or opening execution
+// stores, and pass the returned Config through that run only.
+func PreparePortfolioConfig(c Config) (Config, error) {
+	c, err := resolveDecisionPortfolio(c)
+	if err != nil {
+		return c, err
+	}
+	name := c.Manifest.Portfolio.Builder
+	if c.PortfolioBuilder == nil && name != "" && name != "top-bottom-k-v1" {
+		c.PortfolioBuilder, _, err = newPortfolioBuilder(name, c)
+	}
+	return c, err
 }
 
 // RegisterPortfolioBuilderIdentity binds immutable native builder parameters

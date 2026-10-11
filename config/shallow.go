@@ -11,8 +11,8 @@ func hasPolicyEngine(fields map[string]any) bool {
 	return fields["engine"] == EngineTimeSeries || fields["engine"] == EngineFactor
 }
 
-var accountExecutionKeys = strings.Fields("mode store history sender_lease_dir live_provider funding_policy instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit")
-var factorPolicyKeys = strings.Fields("archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records definition expressions")
+var accountExecutionKeys = strings.Fields("mode store history sender_lease_dir live_provider funding_policy paper_fill_model instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit")
+var factorPolicyKeys = strings.Fields("archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records definition expressions option_expiry_source terminal_settlement_source")
 
 func factorFields(fields map[string]any) map[string]any {
 	if fields["engine"] != EngineFactor {

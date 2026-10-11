@@ -168,19 +168,21 @@ func resolveDecisionPortfolio(c Config) (Config, error) {
 			return c, err
 		}
 	}
+	customBuilder := c.PortfolioBuilder != nil
 	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Builder != "" && c.Manifest.Portfolio.Builder != "top-bottom-k-v1" {
 		var ok bool
 		var err error
-		c.PortfolioBuilder, ok, err = newPortfolioBuilder(c.Manifest.Portfolio.Builder, c)
+		c.PortfolioBuilder, ok, err = validatePortfolioBuilder(c.Manifest.Portfolio.Builder, c)
 		if err != nil {
 			return c, err
 		}
 		if !ok {
 			return c, fmt.Errorf("runner: unregistered portfolio builder %q", c.Manifest.Portfolio.Builder)
 		}
+		customBuilder = true
 	}
 	legacyBuilder := c.Manifest.Portfolio.Policy == "" || c.Manifest.Portfolio.Builder == "top-bottom-k-v1"
-	if c.PortfolioBuilder == nil && legacyBuilder && (c.Manifest.Portfolio.K <= 0 || c.Manifest.Portfolio.LongNotional+c.Manifest.Portfolio.ShortNotional <= 0) {
+	if !customBuilder && legacyBuilder && (c.Manifest.Portfolio.K <= 0 || c.Manifest.Portfolio.LongNotional+c.Manifest.Portfolio.ShortNotional <= 0) {
 		return c, errors.New("runner: top/bottom builder needs positive K and notional")
 	}
 	if c.PortfolioBuilder != nil && c.Manifest.Portfolio.Builder == "" {
@@ -189,7 +191,7 @@ func resolveDecisionPortfolio(c Config) (Config, error) {
 	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Builder == "" && c.Manifest.Portfolio.Policy == "" {
 		c.Manifest.Portfolio.Builder = "top-bottom-k-v1"
 	}
-	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Mode != factor.Full && c.Manifest.Portfolio.Mode != factor.Patch {
+	if !customBuilder && c.Manifest.Portfolio.Mode != factor.Full && c.Manifest.Portfolio.Mode != factor.Patch {
 		return c, errors.New("runner: invalid portfolio mode")
 	}
 	if c.Manifest.Portfolio.LongNotional < 0 || c.Manifest.Portfolio.ShortNotional < 0 || math.IsNaN(c.Manifest.Portfolio.LongNotional+c.Manifest.Portfolio.ShortNotional) || math.IsInf(c.Manifest.Portfolio.LongNotional+c.Manifest.Portfolio.ShortNotional, 0) {

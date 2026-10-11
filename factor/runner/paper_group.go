@@ -42,7 +42,19 @@ func NewPaperSinks(ctx context.Context, configs []Config) ([]Sink, func() error,
 func NewPaperSinksWithAccounts(ctx context.Context, configs []Config, factory PaperAccountFactory) ([]Sink, func() error, error) {
 	sinks := make([]Sink, len(configs))
 	groups := map[string][]int{}
+	fillModels := map[string]execution.PaperFillModel{}
 	for i, c := range configs {
+		model := c.Execution.PaperFillModel
+		if err := model.Validate(); err != nil {
+			return nil, nil, fmt.Errorf("runner: shared paper account %s strategy %s: %w", c.AccountID, c.StrategyID, err)
+		}
+		if model == "" {
+			model = execution.PaperMidpoint
+		}
+		if prior, ok := fillModels[c.AccountID]; ok && prior != model {
+			return nil, nil, fmt.Errorf("runner: incompatible shared paper account %s fill models: %s and %s", c.AccountID, prior, model)
+		}
+		fillModels[c.AccountID] = model
 		groups[c.AccountID] = append(groups[c.AccountID], i)
 	}
 	var cleanups []func() error

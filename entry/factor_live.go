@@ -404,6 +404,17 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 	if snapshot == nil || snapshot.View() == nil || snapshot.View().Exchange == nil {
 		return errors.New("factor: live runtime exchange configuration required")
 	}
+	configs = append([]runner.Config(nil), configs...)
+	for index, cfg := range configs {
+		if err := runner.ValidateLiveConfig(cfg); err != nil {
+			return err
+		}
+		prepared, err := runner.PreparePortfolioConfig(cfg)
+		if err != nil {
+			return err
+		}
+		configs[index] = prepared
+	}
 	policy := c.Manifest.Costs.FundingPolicy
 	tsCapital, err := s.prepareMixedLiveBinding(snapshot, c, &binding)
 	if err != nil {

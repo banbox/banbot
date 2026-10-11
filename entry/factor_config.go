@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -143,8 +144,21 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 			}
 		}
 		if decision, ok := policy.Factor["decision"].(map[string]any); ok {
+			if enabled, _ := decision["source_event_decisions"].(bool); enabled {
+				source, _ := decision["source"].(string)
+				clockFrame, _ := decision["timeframe"].(string)
+				if source == "" || clockFrame == "" {
+					return nil, fmt.Errorf("factor %s: source-event decisions require explicit decision.source and decision.timeframe", policy.Name)
+				}
+				c.Factor.Source, c.Factor.TimeFrame = source, clockFrame
+			} else if decision["source"] != nil || decision["timeframe"] != nil {
+				return nil, fmt.Errorf("factor %s: decision.source/timeframe require source_event_decisions", policy.Name)
+			}
 			for key, value := range decision {
-				mapped := map[string]string{"interval_ms": "DecisionInterval", "delay_ms": "DecisionDelayMS", "latency_ms": "LatencyMS", "expiry_ms": "ExpiryMS", "max_pending": "MaxPending"}[key]
+				if key == "source" || key == "timeframe" {
+					continue
+				}
+				mapped := map[string]string{"interval_ms": "DecisionInterval", "delay_ms": "DecisionDelayMS", "latency_ms": "LatencyMS", "expiry_ms": "ExpiryMS", "max_pending": "MaxPending", "source_event_decisions": "SourceEventDecisions"}[key]
 				if mapped == "" {
 					return nil, fmt.Errorf("unknown factor decision key %s", key)
 				}
@@ -300,8 +314,23 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 				return nil, err
 			}
 		}
-		if _, _, err := runner.CompileDefinition(c); err != nil {
-			return nil, err
+		if mode == runner.Trade {
+			// Live drafts have a different label/capital contract. Reuse live
+			// rejection of replay-only capabilities before the legacy assembly.
+			replayOnly := c.SourceEventDecisions || c.OptionExpirySource != "" || c.TerminalSettlementSource != "" || c.Execution.PaperFillModel != ""
+			for _, instrument := range c.Execution.Instruments {
+				replayOnly = replayOnly || instrument.IsOption() || instrument.Option != nil
+			}
+			if replayOnly {
+				if err := runner.ValidateLiveConfig(c); err != nil {
+					return nil, fmt.Errorf("factor %s: %w", policy.Name, err)
+				}
+			}
+			if _, _, err := runner.CompileDefinition(c); err != nil {
+				return nil, err
+			}
+		} else if err := runner.ValidateStaticConfig(c); err != nil {
+			return nil, fmt.Errorf("factor %s: %w", policy.Name, err)
 		}
 		result = append(result, c)
 	}
@@ -499,6 +528,17 @@ func (w *synchronizedWriter) Write(body []byte) (int, error) {
 }
 
 func runFactorConfigs(ctx context.Context, configs []runner.Config, factory FactorSinkFactory, writer io.Writer) (results []runner.Result, resultErr error) {
+	configs = slices.Clone(configs)
+	for i, c := range configs {
+		if err := runner.ValidateReplayConfig(c, factory == nil && c.Mode == runner.Events); err != nil {
+			return nil, err
+		}
+		prepared, err := runner.PreparePortfolioConfig(c)
+		if err != nil {
+			return nil, err
+		}
+		configs[i] = prepared
+	}
 	process := runtimectx.NewProcess()
 	start := int64(0)
 	if len(configs) > 0 && len(configs[0].Chunks) > 0 {

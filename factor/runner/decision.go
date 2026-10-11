@@ -146,7 +146,7 @@ func decisionManifestSpec(c Config, plan *factor.Plan, combo research.ComboSpec)
 // Run-specific lineage and latency assumptions are supplied by each driver.
 func newDecisionEngine(c Config, plan *factor.Plan, combo research.ComboSpec) (*decisionEngine, error) {
 	var err error
-	c, err = resolveDecisionPortfolio(c)
+	c, err = PreparePortfolioConfig(c)
 	if err != nil {
 		return nil, err
 	}

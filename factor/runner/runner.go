@@ -171,6 +171,11 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	if err := ValidateReplayConfig(c, sink == nil); err != nil {
 		return result, err
 	}
+	var prepareErr error
+	c, prepareErr = PreparePortfolioConfig(c)
+	if prepareErr != nil {
+		return result, prepareErr
+	}
 	if c.HistoricalInput != nil {
 		c.Chunks = c.HistoricalInput.Ranges()
 	}

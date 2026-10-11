@@ -349,14 +349,3 @@ func TestAccountSinkPreservesUntouchedUnfilledTargets(t *testing.T) {
 		t.Fatal("pending stable intents lost")
 	}
 }
-func TestFundingRefusesUnassignedOrExternalPosition(t *testing.T) {
-	i := execution.Instrument{ID: "asset-1"}
-	for _, snap := range []execution.AccountSnapshot{{ExternalPositions: []execution.VirtualLot{{Instrument: i, SignedSteps: 1}}}, {ActualPositions: []execution.VirtualLot{{Instrument: i, SignedSteps: 2}}, Lots: []execution.VirtualLot{{Instrument: i, SignedSteps: 1}}}} {
-		if validateFundingAttribution(snap, i) == nil {
-			t.Fatal("unassigned funding charged to strategies")
-		}
-	}
-	if err := validateFundingAttribution(execution.AccountSnapshot{ActualPositions: []execution.VirtualLot{{Instrument: i, SignedSteps: 2}}, Lots: []execution.VirtualLot{{Instrument: i, SignedSteps: 1}, {Instrument: i, SignedSteps: 1}}}, i); err != nil {
-		t.Fatal(err)
-	}
-}
