@@ -46,7 +46,7 @@ func ReturnLabel(spec LabelSpec, sid int32, decision, begin, end, available int6
 	if err := validateLabelSpec(spec); err != nil {
 		return Label{}, err
 	}
-	if sid <= 0 || decision <= 0 || end <= begin || end-begin != spec.Horizon || available <= 0 || (spec.Kind == ExecutableReturn && begin <= decision) || (spec.Kind == CloseToClose && begin != decision) {
+	if sid <= 0 || decision <= 0 || end <= begin || end-begin != spec.Horizon || available < end || (spec.Kind == ExecutableReturn && begin <= decision) || (spec.Kind == CloseToClose && begin != decision) {
 		return Label{}, errors.New("research: label execution/statistical time mismatch")
 	}
 	n := factor.Numeric{Value: math.NaN(), Validity: factor.Missing}
@@ -84,7 +84,7 @@ func NewLabelQueue(specs []LabelSpec, maxRows, maxColumns int) (*LabelQueue, err
 func (q *LabelQueue) Add(row LabelObservation) error {
 	l := row.Label
 	s, exists := q.specs[l.Name]
-	if !exists || l.Kind != s.Kind || l.SID <= 0 || l.DecisionTime <= 0 || l.DecisionTime < q.watermark || l.EndAt <= l.BeginAt || l.EndAt-l.BeginAt != s.Horizon || l.MatureAt < l.EndAt || l.AvailableAt <= 0 || (s.Kind == ExecutableReturn && l.BeginAt <= l.DecisionTime) || (s.Kind == CloseToClose && l.BeginAt != l.DecisionTime) {
+	if !exists || l.Kind != s.Kind || l.SID <= 0 || l.DecisionTime <= 0 || l.DecisionTime < q.watermark || l.EndAt <= l.BeginAt || l.EndAt-l.BeginAt != s.Horizon || l.MatureAt < l.EndAt || l.AvailableAt < l.MatureAt || (s.Kind == ExecutableReturn && l.BeginAt <= l.DecisionTime) || (s.Kind == CloseToClose && l.BeginAt != l.DecisionTime) {
 		return errors.New("research: invalid or late label observation")
 	}
 	if len(row.Factors) > q.maxColumns || len(q.rows) >= q.maxRows {
@@ -113,7 +113,7 @@ func (q *LabelQueue) Schedule(name string, sid int32, decision, begin int64, val
 // Resolve accepts a realized return (or explicit missing return) for a queued
 // horizon; its original features are never replaced with future features.
 func (q *LabelQueue) Resolve(label Label) error {
-	if !label.Resolved || label.AvailableAt <= 0 || label.MatureAt < label.EndAt {
+	if !label.Resolved || label.AvailableAt < label.MatureAt || label.MatureAt < label.EndAt {
 		return errors.New("research: unresolved/invalid label publication")
 	}
 	for i, row := range q.rows {

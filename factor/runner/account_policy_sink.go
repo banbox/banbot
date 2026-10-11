@@ -306,6 +306,18 @@ func (s *AccountSink) AcceptProposal(ctx context.Context, proposal factor.Portfo
 			if err := i.Validate(); err != nil {
 				return execution.PolicyReceipt{}, err
 			}
+			if done, err := s.settledOption(ctx, i, now); err != nil {
+				return execution.PolicyReceipt{}, err
+			} else if done {
+				value, parseErr := decimal.NewFromString(targets[sid].Value)
+				if parseErr != nil {
+					return execution.PolicyReceipt{}, parseErr
+				}
+				if !value.IsZero() {
+					return execution.PolicyReceipt{}, errors.New("runner: allocation attempts to resurrect settled option")
+				}
+				continue
+			}
 			q, ok := quotes[sid]
 			if !ok || q.AtMS < sp.ExecutableAt || q.AtMS <= sp.DecisionTime || q.AvailableAt > now || q.AvailableAt < q.AtMS || q.AtMS > now || q.Price <= 0 || math.IsNaN(q.Price) || math.IsInf(q.Price, 0) {
 				return execution.PolicyReceipt{}, errors.New("runner: unavailable allocation executable quote")

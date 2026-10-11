@@ -26,8 +26,17 @@ func ValidateStaticConfig(c Config) error {
 }
 
 func validateReplayConfig(c Config, requireExecutionMetadata, checkInputs bool) error {
+	if err := c.Execution.PaperFillModel.Validate(); err != nil {
+		return err
+	}
+	if c.Execution.PaperFillModel != "" && c.Mode != Events {
+		return errors.New("runner: explicit paper fill model requires Events mode")
+	}
 	if c.Mode != Research && c.Mode != Weights && c.Mode != Events && c.Mode != Trade {
 		return errors.New("runner: unsupported mode")
+	}
+	if c.SourceEventDecisions && (c.Mode == Trade || c.DecisionDelayMS != 0 || c.Factor.Source == "" || c.Factor.TimeFrame == "") {
+		return errors.New("runner: source-event decisions require historical Research/Weights/Events, an explicit factor source/timeframe and zero decision delay")
 	}
 	if c.MaxRecords <= 0 || c.MaxPending <= 0 || c.DecisionInterval <= 0 || c.DecisionDelayMS < 0 || c.LatencyMS <= 0 || c.ExpiryMS <= c.LatencyMS || c.LabelWaitMS < 0 || checkInputs && (c.Prices.Source == "" || c.Prices.TimeFrame == "" || c.Prices.Field == "") {
 		return errors.New("runner: incomplete bounded replay/price configuration")
@@ -87,6 +96,17 @@ func validateReplayConfig(c Config, requireExecutionMetadata, checkInputs bool) 
 			return errors.New("runner: chunks must have strictly ordered non-overlapping replay ranges")
 		}
 		lastTo = chunk.To
+	}
+	for _, i := range c.Execution.Instruments {
+		if i.IsOption() && c.Mode != Events {
+			return errors.New("runner: cash options require Events paper accounting; Weights and live Trade unsupported")
+		}
+	}
+	if c.TerminalSettlementSource != "" && (c.Mode != Events && c.Mode != Weights || c.TerminalSettlementSource == c.Prices.Source || c.TerminalSettlementSource == c.FundingSource || c.TerminalSettlementSource == c.OptionExpirySource) {
+		return errors.New("runner: terminal settlement requires distinct explicit source and paper Events or Weights mode")
+	}
+	if c.OptionExpirySource != "" && (c.Mode != Events || c.OptionExpirySource == c.Prices.Source || c.OptionExpirySource == c.FundingSource) {
+		return errors.New("runner: option expiry needs a distinct explicit source and Events mode")
 	}
 	if c.Mode == Events || c.Mode == Trade {
 		if c.Execution.HistoryPath != "" && (c.Mode == Trade || c.Execution.StorePath != "" || c.Execution.SenderLeaseDir != "" || !filepath.IsAbs(c.Execution.HistoryPath)) {
@@ -150,7 +170,11 @@ func resolveDecisionPortfolio(c Config) (Config, error) {
 	}
 	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Builder != "" && c.Manifest.Portfolio.Builder != "top-bottom-k-v1" {
 		var ok bool
-		c.PortfolioBuilder, ok = portfolioBuilder(c.Manifest.Portfolio.Builder)
+		var err error
+		c.PortfolioBuilder, ok, err = newPortfolioBuilder(c.Manifest.Portfolio.Builder, c)
+		if err != nil {
+			return c, err
+		}
 		if !ok {
 			return c, fmt.Errorf("runner: unregistered portfolio builder %q", c.Manifest.Portfolio.Builder)
 		}

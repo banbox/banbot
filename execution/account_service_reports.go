@@ -337,6 +337,18 @@ func fundingActivityInstrument(ctx context.Context, store *Store, event Committe
 			return instrument, err
 		}
 		instrument = match.Instrument
+	case "TerminalSettlement":
+		var terminal TerminalSettlement
+		if err := json.Unmarshal(event.Payload, &terminal); err != nil {
+			return instrument, err
+		}
+		instrument = terminal.Instrument
+	case "OptionExpiry":
+		var expiry OptionExpiry
+		if err := json.Unmarshal(event.Payload, &expiry); err != nil {
+			return instrument, err
+		}
+		instrument = expiry.Instrument
 	case string(ExternalCashChange), string(Liquidation):
 		var external ExternalPositionEvent
 		if err := json.Unmarshal(event.Payload, &external); err != nil {

@@ -29,6 +29,23 @@ func ValidateLiveConfig(c Config) error {
 
 func compileLiveDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 	var combo research.ComboSpec
+	if c.Execution.PaperFillModel != "" {
+		return nil, combo, errors.New("runner: paper fill models cannot configure live execution")
+	}
+	if c.TerminalSettlementSource != "" {
+		return nil, combo, errors.New("runner: terminal settlement is historical paper only")
+	}
+	if c.OptionExpirySource != "" {
+		return nil, combo, errors.New("runner: option expiry is supported only by paper Events replay")
+	}
+	for _, instrument := range c.Execution.Instruments {
+		if instrument.IsOption() || instrument.Option != nil {
+			return nil, combo, errors.New("runner: live cash options require a venue-specific exercise and settlement adapter")
+		}
+	}
+	if c.SourceEventDecisions {
+		return nil, combo, errors.New("runner: source-event decisions are historical only")
+	}
 	if c.Execution.HistoryPath != "" {
 		return nil, combo, errors.New("runner: cold execution history is supported only by simulated replay")
 	}

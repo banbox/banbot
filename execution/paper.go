@@ -34,24 +34,48 @@ type paperOrder struct {
 }
 
 type PaperAdapter struct {
-	mu              sync.Mutex
-	cash, fee, slip decimal.Decimal
-	positions       map[string]paperPosition
-	fills           int
-	lastFill        FillReport
-	lastSourceAt    int64
-	totals          map[StrategyID]paperTotals
-	orders          map[string]*paperOrder
-	pending         map[string]*paperOrder // quote scans depend on resting orders, not fill history
-	quotes          map[string]VisibleQuote
-	clients         map[string]string
-	history         *Store
+	mu                  sync.Mutex
+	cash, fee, slip     decimal.Decimal
+	positions           map[string]paperPosition
+	fills               int
+	lastFill            FillReport
+	lastSourceAt        int64
+	totals              map[StrategyID]paperTotals
+	orders              map[string]*paperOrder
+	pending             map[string]*paperOrder // quote scans depend on resting orders, not fill history
+	quotes              map[string]VisibleQuote
+	clients             map[string]string
+	history             *Store
+	optionExpiries      map[string]string
+	terminalSettlements map[string]string
+	fillModel           PaperFillModel
 }
+
+type PaperFillModel string
+
+const (
+	PaperMidpoint PaperFillModel = "midpoint"
+	PaperBidAsk   PaperFillModel = "bid-ask"
+	// PaperMidEntryMarketExit assumes midpoint entry limits fill for research.
+	// Actual live execution of midpoint limits is not guaranteed.
+	PaperMidEntryMarketExit PaperFillModel = "mid-entry-market-exit"
+)
+
+func (m PaperFillModel) Validate() error {
+	if m != "" && m != PaperMidpoint && m != PaperBidAsk && m != PaperMidEntryMarketExit {
+		return errors.New("execution: unknown paper fill model")
+	}
+	return nil
+}
+
 type PaperMetrics struct {
 	Fills        int
 	LastFill     FillReport
 	LastSourceAt int64
 }
+
+// FillModel is immutable after construction.
+func (a *PaperAdapter) FillModel() PaperFillModel { return a.fillModel }
 
 func (a *PaperAdapter) Metrics() PaperMetrics {
 	a.mu.Lock()
@@ -74,25 +98,45 @@ func (a *PaperAdapter) StrategyFillCount(id StrategyID) int {
 }
 
 func NewPaperAdapter(cash, fee, slip decimal.Decimal) (*PaperAdapter, error) {
+	return NewPaperAdapterWithFillModel(cash, fee, slip, PaperMidpoint)
+}
+
+func NewPaperAdapterWithFillModel(cash, fee, slip decimal.Decimal, model PaperFillModel) (*PaperAdapter, error) {
+	if err := model.Validate(); err != nil {
+		return nil, err
+	}
 	if !cash.IsPositive() || fee.IsNegative() || slip.IsNegative() || slip.GreaterThanOrEqual(decimal.NewFromInt(1)) {
 		return nil, errors.New("execution: invalid paper cash/costs")
 	}
-	return &PaperAdapter{cash: cash, fee: fee, slip: slip, positions: map[string]paperPosition{}, totals: map[StrategyID]paperTotals{}, orders: map[string]*paperOrder{}, pending: map[string]*paperOrder{}, quotes: map[string]VisibleQuote{}, clients: map[string]string{}}, nil
+	return &PaperAdapter{fillModel: model, cash: cash, fee: fee, slip: slip, positions: map[string]paperPosition{}, totals: map[StrategyID]paperTotals{}, orders: map[string]*paperOrder{}, pending: map[string]*paperOrder{}, quotes: map[string]VisibleQuote{}, clients: map[string]string{}}, nil
 }
 func (a *PaperAdapter) Capabilities() AdapterCapabilities {
 	return AdapterCapabilities{StableTradeID: true, PostOnly: true, QueryClientID: true, AuthoritativeNotFound: true}
 }
 func (a *PaperAdapter) Submit(ctx context.Context, o OrderIntent, client string) (SubmitReceipt, error) {
+	o.Instrument = o.Instrument.Clone()
 	if err := ctx.Err(); err != nil {
 		return SubmitReceipt{}, err
 	}
 	if err := o.Instrument.Validate(); err != nil {
 		return SubmitReceipt{}, err
 	}
+	if err := o.Instrument.CheckExecutionTime(o.SubmitAtMS); err != nil {
+		return SubmitReceipt{}, err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.archiveSettled(ctx); err != nil {
 		return SubmitReceipt{}, err
+	}
+	if _, ok := a.terminalSettlements[terminalID(o.Instrument)]; ok {
+		return SubmitReceipt{}, errors.New("execution: terminal instrument cannot accept new orders")
+	}
+	if o.Instrument.IsOption() {
+		id, _ := (OptionExpiry{Instrument: o.Instrument}).identity()
+		if _, ok := a.optionExpiries[id]; ok {
+			return SubmitReceipt{}, errors.New("execution: paper option already settled")
+		}
 	}
 	if !canonicalID(client) || !canonicalID(o.ID) || o.Steps <= 0 || o.Side != Buy && o.Side != Sell || o.Limit.IsNegative() || !o.Observation.Price.IsPositive() {
 		return SubmitReceipt{}, errors.New("execution: invalid paper order")
@@ -152,7 +196,20 @@ func (a *PaperAdapter) Submit(ctx context.Context, o OrderIntent, client string)
 		sign = -1
 		mult = decimal.NewFromInt(1).Sub(a.slip)
 	}
-	price := o.Observation.Price.Mul(mult)
+	base := o.Observation.Price
+	if a.fillModel == PaperBidAsk || a.fillModel == PaperMidEntryMarketExit && o.ReduceOnly {
+		if !o.Observation.Bid.IsPositive() || o.Observation.Ask.LessThan(o.Observation.Bid) {
+			return SubmitReceipt{}, errors.New("execution: bid/ask paper execution needs explicit valid spread")
+		}
+		if o.Side == Buy {
+			base = o.Observation.Ask
+		} else {
+			base = o.Observation.Bid
+		}
+	} else if a.fillModel == PaperMidEntryMarketExit {
+		mult = decimal.NewFromInt(1)
+	}
+	price := base.Mul(mult)
 	ticks := price.Div(o.Instrument.PriceTick)
 	if sign > 0 {
 		ticks = ticks.Ceil()
@@ -173,11 +230,21 @@ func (a *PaperAdapter) Submit(ctx context.Context, o OrderIntent, client string)
 }
 
 func (a *PaperAdapter) fillLocked(o OrderIntent, price decimal.Decimal, nowMS, sourceMS int64, maker bool) (SubmitReceipt, error) {
+	if err := o.Instrument.CheckExecutionTime(nowMS); err != nil {
+		return SubmitReceipt{}, err
+	}
 	sign := int64(1)
 	if o.Side == Sell {
 		sign = -1
 	}
 	p := a.positions[o.Instrument.ID]
+	if p.steps != 0 {
+		previous, _ := payload(p.instrument)
+		incoming, _ := payload(o.Instrument)
+		if previous != incoming {
+			return SubmitReceipt{}, errors.New("execution: paper instrument descriptor changed with open exposure")
+		}
+	}
 	if o.ReduceOnly && (p.steps == 0 || (p.steps > 0) == (sign > 0) || o.Steps > absSteps(p.steps)) {
 		return SubmitReceipt{ExchangeID: "paper:" + o.ID, Rejected: true}, nil
 	}
@@ -201,7 +268,7 @@ func (a *PaperAdapter) fillLocked(o OrderIntent, price decimal.Decimal, nowMS, s
 	p.steps += delta
 	p.instrument = o.Instrument
 	a.positions[o.Instrument.ID] = p
-	a.cash = a.cash.Add(realized).Sub(fee)
+	a.cash = a.cash.Add(tradeCash(o.Instrument, o.Side, cost, realized, fee))
 	allocated := make(map[StrategyID]bool)
 	for _, allocation := range o.Allocations {
 		t := a.totals[allocation.Strategy]

@@ -476,19 +476,15 @@ func (s *SharedAccount) prepareRebalanceWithCheckpoints(request CombinedRebalanc
 		requested[r.Instrument.ID] = true
 	}
 	request.CarryTargets = nil
-	for _, target := range latestPlan.Targets {
-		if target.SignedSteps == 0 && !requested[target.Instrument] {
-			snapshot, err := s.store.Snapshot(operationCtx)
-			if err != nil {
-				return PreparedRebalance{}, err
-			}
-			latestPlan.Targets, err = s.retainedPlanTargets(operationCtx, latestPlan, snapshot)
-			if err != nil {
-				return PreparedRebalance{}, err
-			}
-			break
-		}
+	snapshot, err := s.store.Snapshot(operationCtx)
+	if err != nil {
+		return PreparedRebalance{}, err
 	}
+	latestPlan.Targets, err = s.retainedPlanTargets(operationCtx, latestPlan, snapshot)
+	if err != nil {
+		return PreparedRebalance{}, err
+	}
+
 	for _, target := range latestPlan.Targets {
 		if !requested[target.Instrument] {
 			request.CarryTargets = append(request.CarryTargets, target)

@@ -36,14 +36,14 @@ func validatePlanReservation(snapshot AccountSnapshot, plan Plan, risk Portfolio
 	currentNet := make(map[string]int64)
 	for _, lot := range snapshot.Lots {
 		mark, ok := risk.Marks[lot.Instrument.ID]
-		if !ok || !mark.IsPositive() {
+		if !ok || !lot.Instrument.ValidMark(mark) {
 			return errors.New("execution: risk reservation lacks current lot mark")
 		}
-		amount := lot.Instrument.Notional(absSteps(lot.SignedSteps), mark)
+		amount := lot.Instrument.RiskGross(lot.SignedSteps, mark)
 		if changed[lot.Instrument.ID] {
 			previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(amount)
 		}
-		nav[lot.Strategy] = nav[lot.Strategy].Add(lot.Unrealized(mark))
+		nav[lot.Strategy] = nav[lot.Strategy].Add(lot.EquityValue(mark))
 		if !changed[lot.Instrument.ID] {
 			instruments[lot.Instrument.ID] = lot.Instrument
 		}
@@ -59,14 +59,20 @@ func validatePlanReservation(snapshot AccountSnapshot, plan Plan, risk Portfolio
 		return projectionErr
 	}
 	desiredGross := make(map[StrategyID]decimal.Decimal)
+	strategyCollateral := make(map[StrategyID]decimal.Decimal)
+	previousCollateral := make(map[StrategyID]decimal.Decimal)
+	for _, lot := range snapshot.Lots {
+		previousCollateral[lot.Strategy] = previousCollateral[lot.Strategy].Add(lot.Instrument.Collateral(lot.SignedSteps, risk.Marks[lot.Instrument.ID], risk.MarginRate))
+	}
 	for _, lot := range projectedLots {
 		if !changed[lot.Instrument.ID] {
 			mark, ok := risk.Marks[lot.Instrument.ID]
-			if !ok || !mark.IsPositive() {
+			if !ok || !lot.Instrument.ValidMark(mark) {
 				return errors.New("execution: projected lot mark missing")
 			}
-			desiredGross[lot.Strategy] = desiredGross[lot.Strategy].Add(lot.Instrument.Notional(absSteps(lot.SignedSteps), mark))
-			previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(lot.Instrument.Notional(absSteps(lot.SignedSteps), mark))
+			desiredGross[lot.Strategy] = desiredGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
+			previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
+			strategyCollateral[lot.Strategy] = strategyCollateral[lot.Strategy].Add(lot.Instrument.Collateral(lot.SignedSteps, mark, risk.MarginRate))
 			instruments[lot.Instrument.ID] = lot.Instrument
 		}
 	}
@@ -81,7 +87,7 @@ func validatePlanReservation(snapshot AccountSnapshot, plan Plan, risk Portfolio
 			return errors.New("execution: target instrument missing from risk reservation")
 		}
 		mark, ok := risk.Marks[target.Instrument]
-		if !ok || !mark.IsPositive() {
+		if !ok || !instrument.ValidMark(mark) {
 			return errors.New("execution: target mark missing from risk reservation")
 		}
 		var err error
@@ -89,7 +95,8 @@ func validatePlanReservation(snapshot AccountSnapshot, plan Plan, risk Portfolio
 		if err != nil {
 			return err
 		}
-		desiredGross[target.Strategy] = desiredGross[target.Strategy].Add(instrument.Notional(absSteps(target.SignedSteps), mark))
+		desiredGross[target.Strategy] = desiredGross[target.Strategy].Add(instrument.RiskGross(target.SignedSteps, mark))
+		strategyCollateral[target.Strategy] = strategyCollateral[target.Strategy].Add(instrument.Collateral(target.SignedSteps, mark, risk.MarginRate))
 	}
 	for _, order := range snapshot.Orders {
 		if order.State == OrderUnknown || order.State == OrderSending || order.State == OrderCancelPending {
@@ -122,18 +129,18 @@ func validatePlanReservation(snapshot AccountSnapshot, plan Plan, risk Portfolio
 	desiredMargin, currentMargin, totalGross, previousTotal := decimal.Zero, decimal.Zero, decimal.Zero, decimal.Zero
 	for id, instrument := range instruments {
 		mark, ok := risk.Marks[id]
-		if !ok || !mark.IsPositive() {
+		if !ok || !instrument.ValidMark(mark) {
 			return errors.New("execution: account margin mark missing")
 		}
-		desiredMargin = desiredMargin.Add(instrument.Notional(absSteps(desiredNet[id]), mark).Mul(risk.MarginRate))
-		currentMargin = currentMargin.Add(instrument.Notional(absSteps(currentNet[id]), mark).Mul(risk.MarginRate))
+		desiredMargin = desiredMargin.Add(instrument.Collateral(desiredNet[id], mark, risk.MarginRate))
+		currentMargin = currentMargin.Add(instrument.Collateral(currentNet[id], mark, risk.MarginRate))
 	}
 	for strategy, amount := range desiredGross {
 		limit, ok := risk.StrategyGrossLimits[strategy]
 		if !ok || !limit.IsPositive() {
 			return errors.New("execution: strategy reservation gross limit missing")
 		}
-		if amount.GreaterThan(previousGross[strategy]) && (amount.GreaterThan(limit) || amount.Mul(risk.MarginRate).GreaterThan(nav[strategy])) {
+		if amount.GreaterThan(previousGross[strategy]) && amount.GreaterThan(limit) || strategyCollateral[strategy].GreaterThan(previousCollateral[strategy]) && strategyCollateral[strategy].GreaterThan(nav[strategy]) {
 			return errors.New("execution: strategy NAV/gross reservation no longer valid")
 		}
 		totalGross = totalGross.Add(amount)

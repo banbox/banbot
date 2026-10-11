@@ -313,6 +313,9 @@ func (s *Store) SavePlan(ctx context.Context, plan Plan) error {
 }
 
 func (s *Store) PrepareOrder(ctx context.Context, order OrderIntent, nowMS int64) error {
+	if err := order.Instrument.CheckExecutionTime(nowMS); err != nil {
+		return err
+	}
 	if err := order.Instrument.Validate(); err != nil {
 		return err
 	}
@@ -350,6 +353,9 @@ func (s *Store) PrepareOrder(ctx context.Context, order OrderIntent, nowMS int64
 			return nil
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err := s.rejectSettledOption(tx, order.Instrument); err != nil {
 			return err
 		}
 		var planBody string

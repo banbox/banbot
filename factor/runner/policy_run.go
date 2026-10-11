@@ -199,7 +199,7 @@ func (p *policyRun) accepted(pending *pendingProposal) error {
 	return nil
 }
 
-func proposalReady(p *pendingProposal, previous *factor.PortfolioTarget, quotes map[int32]backtest.Quote, now int64, declared []int32) (bool, error) {
+func proposalReady(ctx context.Context, sink Sink, p *pendingProposal, previous *factor.PortfolioTarget, quotes map[int32]backtest.Quote, now int64, declared []int32, books ...*backtest.Book) (bool, error) {
 	if p.noop {
 		return false, nil
 	}
@@ -219,6 +219,20 @@ func proposalReady(p *pendingProposal, previous *factor.PortfolioTarget, quotes 
 	}
 	omitted := FullZeroOmissions(p.proposal.Target, previous, declared)
 	for sid := range allocations {
+		var book *backtest.Book
+		if len(books) > 0 {
+			book = books[0]
+		}
+		settled, err := terminalQuoteExempt(ctx, sink, book, sid, allocations[sid].Value == "0")
+		if !settled && err == nil {
+			settled, err = optionQuoteExempt(ctx, sink, sid, allocations[sid].Value == "0", now)
+		}
+		if err != nil {
+			return false, err
+		}
+		if settled {
+			continue
+		}
 		if omitted[sid] {
 			continue
 		}

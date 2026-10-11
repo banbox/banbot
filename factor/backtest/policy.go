@@ -60,6 +60,11 @@ func (b *Book) ExecuteAllocation(p *factor.PortfolioTarget, quotes map[int32]Quo
 	}
 	quantities := map[int32]float64{}
 	for sid, a := range targets {
+		if done, err := b.TerminalQuoteExempt(sid, a.Value == "0"); err != nil {
+			return err
+		} else if done {
+			continue
+		}
 		q, ok := quotes[sid]
 		if !ok || q.AtMS <= spec.DecisionTime || q.AtMS < spec.ExecutableAt || q.AtMS > now || q.AvailableAt > now || q.AvailableAt < q.AtMS || q.Price <= 0 || !finite(q.Price) {
 			return errors.New("backtest: allocation requires a strictly later observable price")

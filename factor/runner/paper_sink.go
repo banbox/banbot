@@ -70,7 +70,7 @@ func NewPaperSinkWithAccount(ctx context.Context, c Config, factory PaperAccount
 			return nil, nil, err
 		}
 	}
-	adapter, err := NewPaperAdapter(decimal.NewFromFloat(accountNAV), decimal.NewFromFloat(c.Manifest.Costs.FeeRate), decimal.NewFromFloat(c.Manifest.Costs.SlippageRate))
+	adapter, err := execution.NewPaperAdapterWithFillModel(decimal.NewFromFloat(accountNAV), decimal.NewFromFloat(c.Manifest.Costs.FeeRate), decimal.NewFromFloat(c.Manifest.Costs.SlippageRate), c.Execution.PaperFillModel)
 	if err != nil {
 		return nil, nil, err
 	}

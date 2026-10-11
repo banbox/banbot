@@ -121,11 +121,15 @@ func openArchiveInput(ctx context.Context, c Config, chunk Chunk) (HistoricalInp
 	funding := map[int32]bool{}
 	all := c.ObserveBatch != nil || c.timeline != nil && c.timeline.allSourceEvents
 	for _, r := range rows {
-		if !all && r.Series.Source != c.Prices.Source && r.Series.Source != c.FundingSource {
+		if r.Series.Source == c.FundingSource && c.Manifest.Costs.FundingPolicy == "required-stream" && c.Execution.Instruments[r.Series.Sid].IsOption() {
+			return nil, errors.New("runner: option SID cannot have a perpetual funding stream")
+		}
+		clockSource := c.SourceEventDecisions && r.Series.Source == c.Factor.Source && r.Series.TimeFrame == c.Factor.TimeFrame
+		if !all && !clockSource && r.Series.Source != c.Prices.Source && r.Series.Source != c.FundingSource && r.Series.Source != c.OptionExpirySource && r.Series.Source != c.TerminalSettlementSource {
 			continue
 		}
 		at := max(r.EventTime, r.AvailableAt)
-		if c.Snapshot.ReplayTime != 0 {
+		if receiptScheduledSource(c, r.Series.Source) {
 			at = max(at, r.IngestedAt)
 		}
 		if at < chunk.From || at > chunk.To {
@@ -138,6 +142,9 @@ func openArchiveInput(ctx context.Context, c Config, chunk Chunk) (HistoricalInp
 	}
 	if c.Manifest.Costs.FundingPolicy == "required-stream" {
 		for _, sid := range c.Snapshot.Universe.Investable {
+			if c.Execution.Instruments[sid].IsOption() {
+				continue
+			}
 			if !funding[sid] {
 				return nil, errors.New("runner: funding stream missing SID in chunk")
 			}
@@ -148,6 +155,17 @@ func openArchiveInput(ctx context.Context, c Config, chunk Chunk) (HistoricalInp
 	}
 	sort.Slice(input.batches, func(i, j int) bool { return input.batches[i].AtMS < input.batches[j].AtMS })
 	return input, nil
+}
+
+// Execution and settlement streams must be delivered at observable receipt even when the
+// general replay policy uses publication clocks. Source-event decisions also
+// consume receipt clocks. This policy applies to archive and paged inputs.
+func receiptScheduledSource(c Config, source string) bool {
+	return c.Snapshot.ReplayTime != 0 || c.SourceEventDecisions ||
+		(c.Prices.Source != "" && source == c.Prices.Source) ||
+		(c.Manifest.Costs.FundingPolicy == "required-stream" && c.FundingSource != "" && source == c.FundingSource) ||
+		(c.OptionExpirySource != "" && source == c.OptionExpirySource) ||
+		(c.TerminalSettlementSource != "" && source == c.TerminalSettlementSource)
 }
 func (a *archiveInput) Next(ctx context.Context) (HistoricalBatch, error) {
 	if err := ctx.Err(); err != nil {
@@ -252,6 +270,7 @@ type replayInput struct {
 	next                      HistoricalBatch
 	loaded, ended             bool
 	decision, last, end, step int64
+	sourceEvents              bool
 }
 
 func newReplayInput(input HistoricalInput, c Config, chunk Chunk) *replayInput {
@@ -270,7 +289,10 @@ func newReplayInput(input HistoricalInput, c Config, chunk Chunk) *replayInput {
 	if from <= math.MaxInt64-c.DecisionDelayMS {
 		next = from + c.DecisionDelayMS
 	}
-	return &replayInput{input: input, decision: next, end: chunk.To, step: c.DecisionInterval, last: -1}
+	if c.SourceEventDecisions {
+		next = math.MaxInt64
+	}
+	return &replayInput{input: input, decision: next, end: chunk.To, step: c.DecisionInterval, last: -1, sourceEvents: c.SourceEventDecisions}
 }
 func (r *replayInput) Next(ctx context.Context) (HistoricalBatch, error) {
 	if !r.loaded && !r.ended {
@@ -303,7 +325,7 @@ func (r *replayInput) Next(ctx context.Context) (HistoricalBatch, error) {
 		r.loaded = false
 		r.last = at
 	}
-	if r.decision == at {
+	if !r.sourceEvents && r.decision == at {
 		if at > math.MaxInt64-r.step {
 			r.decision = math.MaxInt64
 		} else {

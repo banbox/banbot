@@ -37,6 +37,9 @@ func (s *Store) ApplyInternalMatch(ctx context.Context, match InternalMatch) (bo
 	if err := match.Instrument.Validate(); err != nil {
 		return false, err
 	}
+	if err := match.Instrument.CheckExecutionTime(match.AtMS); err != nil {
+		return false, err
+	}
 	q := match.Quote
 	if !canonicalID(match.ID) || !canonicalID(match.PlanID) || match.Steps <= 0 || match.BuyIntent == match.SellIntent || !q.Bid.IsPositive() || q.Ask.LessThan(q.Bid) || q.AtMS < 0 || q.AtMS > q.ReceivedMS || q.ReceivedMS > match.AtMS || q.ValidUntilMS <= match.AtMS || q.Bar < 0 {
 		return false, errors.New("execution: invalid or invisible internal quote")
@@ -54,6 +57,9 @@ func (s *Store) ApplyInternalMatch(ctx context.Context, match InternalMatch) (bo
 	err = s.commit(ctx, func(tx *storeTxn) error {
 		fresh, err := s.recordEvent(tx, match.ID, "InternalFill", body)
 		if err != nil || !fresh {
+			return err
+		}
+		if err := s.rejectSettledOption(tx, match.Instrument); err != nil {
 			return err
 		}
 		var planBody string
@@ -134,20 +140,25 @@ func (s *Store) ApplyInternalMatch(ctx context.Context, match InternalMatch) (bo
 			if err := s.writeLot(tx, lot); err != nil {
 				return err
 			}
-			if err := s.addCash(tx, intent.Strategy, realized); err != nil {
+			cash := tradeCash(match.Instrument, intent.Side, match.Instrument.Notional(match.Steps, price), realized, decimal.Zero)
+			if err := s.addCash(tx, intent.Strategy, cash); err != nil {
 				return err
 			}
 			delta := match.Steps
 			if intent.Side == Sell {
 				delta = -delta
 			}
-			if err := s.ledger(tx, LedgerEntry{EventID: match.ID, Kind: "InternalFill", Strategy: intent.Strategy, Lot: intent.Lot, QuantityDelta: delta, RealizedPnL: realized, AtMS: match.AtMS}); err != nil {
+			postingCash := decimal.Zero
+			if match.Instrument.IsOption() {
+				postingCash = cash
+			}
+			if err := s.ledger(tx, LedgerEntry{EventID: match.ID, Kind: "InternalFill", Strategy: intent.Strategy, Lot: intent.Lot, QuantityDelta: delta, CashDelta: postingCash, RealizedPnL: realized, AtMS: match.AtMS}); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(opInsertInternalAllocation, s.accountID, match.ID, string(intent.ID), match.Steps); err != nil {
 				return err
 			}
-			reclassified = reclassified.Add(realized)
+			reclassified = reclassified.Add(cash)
 		}
 		if err := s.reclassify(tx, match.ID, reclassified, match.AtMS); err != nil {
 			return err
@@ -173,6 +184,9 @@ type FundingSettlement struct {
 func (s *Store) ApplyFunding(ctx context.Context, event FundingSettlement) (bool, error) {
 	if err := event.Instrument.Validate(); err != nil {
 		return false, err
+	}
+	if event.Instrument.IsOption() {
+		return false, errors.New("execution: options have no perpetual funding")
 	}
 	if !canonicalID(event.ID) || !event.Mark.IsPositive() || event.AtMS < 0 {
 		return false, errors.New("execution: invalid funding settlement")
@@ -270,6 +284,9 @@ func (s *Store) ApplyExternalPosition(ctx context.Context, event ExternalPositio
 	if err := event.Instrument.Validate(); err != nil {
 		return false, err
 	}
+	if err := event.Instrument.CheckExecutionTime(event.AtMS); err != nil {
+		return false, err
+	}
 	if !canonicalID(event.ID) || event.Steps <= 0 || !event.Price.IsPositive() || event.AtMS < 0 || (event.Side != Buy && event.Side != Sell) || (event.Kind != ExternalCashChange && event.Kind != Liquidation) {
 		return false, errors.New("execution: invalid external position event")
 	}
@@ -281,6 +298,9 @@ func (s *Store) ApplyExternalPosition(ctx context.Context, event ExternalPositio
 	err = s.commit(ctx, func(tx *storeTxn) error {
 		fresh, err := s.recordEvent(tx, event.ID, string(event.Kind), body)
 		if err != nil || !fresh {
+			return err
+		}
+		if err := s.rejectSettledOption(tx, event.Instrument); err != nil {
 			return err
 		}
 		actual, err := s.actualPosition(tx, event.Instrument)
@@ -316,21 +336,29 @@ func (s *Store) ApplyExternalPosition(ctx context.Context, event ExternalPositio
 		if _, err := tx.Exec(opPutExternalPosition, s.accountID, event.Instrument.ID, external.SignedSteps, b); err != nil {
 			return err
 		}
-		if err := s.addCash(tx, "", virtualRealized.Sub(event.Fee)); err != nil {
+		if err := s.addCash(tx, "", tradeCash(event.Instrument, event.Side, notional, virtualRealized, event.Fee)); err != nil {
 			return err
 		}
 		delta := event.Steps
 		if event.Side == Sell {
 			delta = -delta
 		}
-		if err := s.ledger(tx, LedgerEntry{EventID: event.ID, Kind: string(event.Kind), QuantityDelta: delta, CashDelta: event.Fee.Neg(), RealizedPnL: virtualRealized, Fee: event.Fee, AtMS: event.AtMS}); err != nil {
+		postingCash := event.Fee.Neg()
+		if event.Instrument.IsOption() {
+			postingCash = tradeCash(event.Instrument, event.Side, notional, virtualRealized, event.Fee)
+		}
+		if err := s.ledger(tx, LedgerEntry{EventID: event.ID, Kind: string(event.Kind), QuantityDelta: delta, CashDelta: postingCash, RealizedPnL: virtualRealized, Fee: event.Fee, AtMS: event.AtMS}); err != nil {
 			return err
 		}
-		if err := s.reclassify(tx, event.ID, virtualRealized.Sub(realized), event.AtMS); err != nil {
+		reclassification := virtualRealized.Sub(realized)
+		if event.Instrument.IsOption() {
+			reclassification = decimal.Zero
+		}
+		if err := s.reclassify(tx, event.ID, reclassification, event.AtMS); err != nil {
 			return err
 		}
 		freeze := true
-		if err := s.commitAccountEvent(tx, event.ID, realized.Sub(event.Fee), &freeze); err != nil {
+		if err := s.commitAccountEvent(tx, event.ID, tradeCash(event.Instrument, event.Side, notional, realized, event.Fee), &freeze); err != nil {
 			return err
 		}
 		applied = true

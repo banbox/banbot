@@ -292,7 +292,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 			desiredMargin := decimal.Zero
 			gross := decimal.Zero
 			for _, p := range pendingRequests {
-				desiredMargin = desiredMargin.Add(p.request.Instrument.Notional(absSteps(p.coordination.DesiredSteps), p.observation.Price).Mul(request.Risk.MarginRate))
+				desiredMargin = desiredMargin.Add(p.request.Instrument.Collateral(p.coordination.DesiredSteps, p.observation.Price, request.Risk.MarginRate))
 				for _, t := range p.request.Targets {
 					gross = gross.Add(p.request.Instrument.Notional(absSteps(t.SignedSteps), p.observation.Price))
 				}
@@ -303,7 +303,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 					if !ok {
 						return errors.New("execution: missing untouched actual mark")
 					}
-					desiredMargin = desiredMargin.Add(position.Instrument.Notional(absSteps(position.SignedSteps), mark).Mul(request.Risk.MarginRate))
+					desiredMargin = desiredMargin.Add(position.Instrument.Collateral(position.SignedSteps, mark, request.Risk.MarginRate))
 				}
 			}
 			marks := make(map[string]decimal.Decimal)
@@ -319,43 +319,50 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 			}
 			currentMargin := decimal.Zero
 			for _, p := range pendingRequests {
-				currentMargin = currentMargin.Add(p.request.Instrument.Notional(absSteps(p.coordination.ProjectedSteps), p.observation.Price).Mul(request.Risk.MarginRate))
+				currentMargin = currentMargin.Add(p.request.Instrument.Collateral(p.coordination.ProjectedSteps, p.observation.Price, request.Risk.MarginRate))
 			}
 			for _, position := range projectedPositions {
 				if !seen[position.Instrument.ID] {
-					currentMargin = currentMargin.Add(position.Instrument.Notional(absSteps(position.SignedSteps), marks[position.Instrument.ID]).Mul(request.Risk.MarginRate))
+					currentMargin = currentMargin.Add(position.Instrument.Collateral(position.SignedSteps, marks[position.Instrument.ID], request.Risk.MarginRate))
 				}
 			}
 			previousGross := make(map[StrategyID]decimal.Decimal)
 			combinedGross := make(map[StrategyID]decimal.Decimal)
+			strategyCollateral := make(map[StrategyID]decimal.Decimal)
+			previousCollateral := make(map[StrategyID]decimal.Decimal)
+			for _, lot := range snapshot.Lots {
+				previousCollateral[lot.Strategy] = previousCollateral[lot.Strategy].Add(lot.Instrument.Collateral(lot.SignedSteps, marks[lot.Instrument.ID], request.Risk.MarginRate))
+			}
 			nav := make(map[StrategyID]decimal.Decimal)
 			for strategy, cash := range snapshot.SyntheticStrategyCash {
 				nav[strategy] = cash
 			}
 			for _, lot := range snapshot.Lots {
 				mark, ok := marks[lot.Instrument.ID]
-				if !ok || !mark.IsPositive() {
+				if !ok || !lot.Instrument.ValidMark(mark) {
 					return errors.New("execution: missing combined strategy valuation mark")
 				}
-				amount := lot.Instrument.Notional(absSteps(lot.SignedSteps), mark)
+				amount := lot.Instrument.RiskGross(lot.SignedSteps, mark)
 				if seen[lot.Instrument.ID] {
 					previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(amount)
 				}
-				nav[lot.Strategy] = nav[lot.Strategy].Add(lot.Unrealized(mark))
+				nav[lot.Strategy] = nav[lot.Strategy].Add(lot.EquityValue(mark))
 			}
 			for _, lot := range projectedLots {
 				if !seen[lot.Instrument.ID] {
 					mark, ok := marks[lot.Instrument.ID]
-					if !ok || !mark.IsPositive() {
+					if !ok || !lot.Instrument.ValidMark(mark) {
 						return errors.New("execution: projected lot mark missing")
 					}
-					combinedGross[lot.Strategy] = combinedGross[lot.Strategy].Add(lot.Instrument.Notional(absSteps(lot.SignedSteps), mark))
-					previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(lot.Instrument.Notional(absSteps(lot.SignedSteps), mark))
+					combinedGross[lot.Strategy] = combinedGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
+					previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
+					strategyCollateral[lot.Strategy] = strategyCollateral[lot.Strategy].Add(lot.Instrument.Collateral(lot.SignedSteps, mark, request.Risk.MarginRate))
 				}
 			}
 			for _, p := range pendingRequests {
 				for _, target := range p.request.Targets {
-					combinedGross[target.Strategy] = combinedGross[target.Strategy].Add(p.request.Instrument.Notional(absSteps(target.SignedSteps), p.observation.Price))
+					combinedGross[target.Strategy] = combinedGross[target.Strategy].Add(p.request.Instrument.RiskGross(target.SignedSteps, p.observation.Price))
+					strategyCollateral[target.Strategy] = strategyCollateral[target.Strategy].Add(p.request.Instrument.Collateral(target.SignedSteps, p.observation.Price, request.Risk.MarginRate))
 				}
 			}
 			oldTotalGross := decimal.Zero
@@ -365,7 +372,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 				if !ok || !limit.IsPositive() {
 					return errors.New("execution: missing combined strategy gross limit")
 				}
-				if amount.GreaterThan(previousGross[strategy]) && (amount.GreaterThan(limit) || amount.Mul(request.Risk.MarginRate).GreaterThan(nav[strategy])) {
+				if amount.GreaterThan(previousGross[strategy]) && amount.GreaterThan(limit) || strategyCollateral[strategy].GreaterThan(previousCollateral[strategy]) && strategyCollateral[strategy].GreaterThan(nav[strategy]) {
 					return errors.New("execution: combined strategy gross/NAV budget exceeded")
 				}
 				gross = gross.Add(amount)

@@ -96,6 +96,9 @@ func (e *OwnerExecutor) Send(id string, nowMS int64) error {
 		if err != nil {
 			return err
 		}
+		if err := preview.Intent.Instrument.CheckExecutionTime(nowMS); err != nil {
+			return err
+		}
 		if preview.Intent.PostOnly && !e.Adapter.Capabilities().PostOnly {
 			return errors.New("execution: adapter does not prove post-only support")
 		}

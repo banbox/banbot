@@ -38,5 +38,12 @@ func CloneConfig(c Config) (Config, error) {
 	c.Combo = research.CloneComboSpec(c.Combo)
 	c.Manifest = research.CloneManifestSpec(c.Manifest)
 	c.Execution.Instruments = maps.Clone(c.Execution.Instruments)
+	for sid, i := range c.Execution.Instruments {
+		if i.Option != nil {
+			option := *i.Option
+			i.Option = &option
+			c.Execution.Instruments[sid] = i
+		}
+	}
 	return c, nil
 }

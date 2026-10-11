@@ -256,6 +256,12 @@ func (s *Store) ApplyFill(ctx context.Context, report FillReport) (bool, error) 
 		if err != nil {
 			return err
 		}
+		if err := s.rejectSettledOption(tx, order.Intent.Instrument); err != nil {
+			return err
+		}
+		if err := order.Intent.Instrument.CheckExecutionTime(report.AtMS); err != nil {
+			return err
+		}
 		if order.State == OrderPrepared || order.State == OrderRejected {
 			return errors.New("execution: fill for unsent/rejected order")
 		}
@@ -380,14 +386,18 @@ func (s *Store) ApplyFill(ctx context.Context, report FillReport) (bool, error) 
 			if a.Side == Sell {
 				delta = -units
 			}
-			cash := realized.Sub(partFee)
+			cash := tradeCash(lot.Instrument, a.Side, partCost, realized, partFee)
 			if err := s.addCash(tx, a.Strategy, cash); err != nil {
 				return err
 			}
 			if err := s.addStrategyTotals(tx, a.Strategy, partFee, decimal.Zero); err != nil {
 				return err
 			}
-			if err := s.ledger(tx, LedgerEntry{EventID: report.EventID, Kind: "ExchangeFill", Strategy: a.Strategy, Lot: a.Lot, QuantityDelta: delta, CashDelta: partFee.Neg(), RealizedPnL: realized, Fee: partFee, AtMS: report.AtMS}); err != nil {
+			postingCash := partFee.Neg()
+			if lot.Instrument.IsOption() {
+				postingCash = cash
+			}
+			if err := s.ledger(tx, LedgerEntry{EventID: report.EventID, Kind: "ExchangeFill", Strategy: a.Strategy, Lot: a.Lot, QuantityDelta: delta, CashDelta: postingCash, RealizedPnL: realized, Fee: partFee, AtMS: report.AtMS}); err != nil {
 				return err
 			}
 			realizedTotal = realizedTotal.Add(realized)
@@ -426,7 +436,11 @@ func (s *Store) ApplyFill(ctx context.Context, report FillReport) (bool, error) 
 		if err := s.writeActual(tx, actual); err != nil {
 			return err
 		}
-		if err := s.reclassify(tx, report.EventID, realizedTotal.Sub(actualRealized), report.AtMS); err != nil {
+		reclassification := realizedTotal.Sub(actualRealized)
+		if order.Intent.Instrument.IsOption() {
+			reclassification = decimal.Zero
+		}
+		if err := s.reclassify(tx, report.EventID, reclassification, report.AtMS); err != nil {
 			return err
 		}
 		if err := s.ledger(tx, LedgerEntry{EventID: report.EventID, Kind: "RealAccountFill", QuantityDelta: func() int64 {
@@ -434,10 +448,10 @@ func (s *Store) ApplyFill(ctx context.Context, report FillReport) (bool, error) 
 				return -steps
 			}
 			return steps
-		}(), CashDelta: actualRealized.Sub(fee), RealizedPnL: actualRealized, Fee: fee, AtMS: report.AtMS}); err != nil {
+		}(), CashDelta: tradeCash(actual.Instrument, order.Intent.Side, cost, actualRealized, fee), RealizedPnL: actualRealized, Fee: fee, AtMS: report.AtMS}); err != nil {
 			return err
 		}
-		if err := s.commitAccountEvent(tx, report.EventID, actualRealized.Sub(fee), nil); err != nil {
+		if err := s.commitAccountEvent(tx, report.EventID, tradeCash(actual.Instrument, order.Intent.Side, cost, actualRealized, fee), nil); err != nil {
 			return err
 		}
 		applied = true
@@ -682,6 +696,23 @@ func (s *Store) Snapshot(ctx context.Context) (AccountSnapshot, error) {
 		if err != nil {
 			return err
 		}
+		// Committed terminal zero positions remain durable history, but have no
+		// valuation exposure and must not demand subsequent trading quotes.
+		activePositions := snapshot.ActualPositions[:0]
+		for _, position := range snapshot.ActualPositions {
+			if position.SignedSteps == 0 {
+				var kind, body string
+				err := tx.QueryRow(opReadEvent, s.accountID, terminalID(position.Instrument)).Scan(&kind, &body)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if err == nil && kind == "TerminalSettlement" {
+					continue
+				}
+			}
+			activePositions = append(activePositions, position)
+		}
+		snapshot.ActualPositions = activePositions
 		rows, err = tx.Query(opListExternalPositions, s.accountID)
 		if err != nil {
 			return err

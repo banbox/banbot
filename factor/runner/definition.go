@@ -5,6 +5,7 @@ import (
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/research"
 	"slices"
+	"strings"
 	"sync"
 )
 
@@ -15,11 +16,17 @@ type DefinitionBuilder func(Config) (*factor.Plan, research.ComboSpec, error)
 // PortfolioBuilder accepts frozen inference and budget evidence, never labels.
 type PortfolioBuilder func(factor.Frame, factor.Universe, factor.PortfolioSpec, research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error)
 
+// PortfolioFactory creates private strategy state for one replay/live run.
+// The factory's versioned name and Manifest.Parameters identify its behavior.
+// Use a PortfolioPolicy for state that must be committed with execution fills.
+type PortfolioFactory func(Config) (PortfolioBuilder, error)
+
 var definitions = struct {
 	sync.RWMutex
 	builders          map[string]DefinitionBuilder
 	portfolios        map[string]PortfolioBuilder
 	portfolioIdentity map[string]string
+	factories         map[string]PortfolioFactory
 }{builders: map[string]DefinitionBuilder{
 	"momentum-vol": func(c Config) (*factor.Plan, research.ComboSpec, error) { return research.MomentumVolPlan(c.Factor) },
 }}
@@ -33,11 +40,45 @@ func RegisterPortfolioBuilder(name string, builder PortfolioBuilder) error {
 	if definitions.portfolios == nil {
 		definitions.portfolios = map[string]PortfolioBuilder{}
 	}
-	if _, exists := definitions.portfolios[name]; exists {
+	if _, exists := definitions.portfolios[name]; exists || definitions.factories[name] != nil {
 		return errors.New("runner: portfolio builder already registered")
 	}
 	definitions.portfolios[name] = builder
 	return nil
+}
+
+func RegisterPortfolioFactory(name string, factory PortfolioFactory) error {
+	if name == "" || !strings.Contains(name, "-v") || factory == nil || name == "top-bottom-k-v1" {
+		return errors.New("runner: portfolio factory needs unique versioned name")
+	}
+	definitions.Lock()
+	defer definitions.Unlock()
+	if definitions.portfolios[name] != nil || definitions.factories[name] != nil {
+		return errors.New("runner: portfolio factory already registered")
+	}
+	if definitions.factories == nil {
+		definitions.factories = map[string]PortfolioFactory{}
+	}
+	definitions.factories[name] = factory
+	return nil
+}
+
+func newPortfolioBuilder(name string, config Config) (PortfolioBuilder, bool, error) {
+	definitions.RLock()
+	factory, builder := definitions.factories[name], definitions.portfolios[name]
+	definitions.RUnlock()
+	if factory != nil {
+		owned, err := CloneConfig(config)
+		if err != nil {
+			return nil, true, err
+		}
+		builder, err = factory(owned)
+		if err == nil && builder == nil {
+			err = errors.New("runner: portfolio factory returned nil builder")
+		}
+		return builder, true, err
+	}
+	return builder, builder != nil, nil
 }
 
 // RegisterPortfolioBuilderIdentity binds immutable native builder parameters
@@ -108,6 +149,9 @@ func DefinitionCatalog() (builders, portfolios []string) {
 	}
 	portfolios = append(portfolios, "top-bottom-k-v1")
 	for name := range definitions.portfolios {
+		portfolios = append(portfolios, name)
+	}
+	for name := range definitions.factories {
 		portfolios = append(portfolios, name)
 	}
 	slices.Sort(builders)

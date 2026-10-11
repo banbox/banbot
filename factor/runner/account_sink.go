@@ -13,6 +13,7 @@ import (
 )
 
 type ExecutionConfig struct {
+	PaperFillModel                                                    execution.PaperFillModel
 	StorePath, SenderLeaseDir, HistoryPath                            string
 	Instruments                                                       map[int32]execution.Instrument
 	MarginRate, MaxAccountMargin, MaxVirtualGross, StrategyGrossLimit decimal.Decimal
@@ -79,6 +80,10 @@ func (s *AccountSink) ObserveQuote(ctx context.Context, sid int32, q backtest.Qu
 	if !ok {
 		return fmt.Errorf("runner: missing instrument SID %d", sid)
 	}
+	spreadValid := q.Bid > 0 && q.Ask >= q.Bid && !math.IsNaN(q.Bid) && !math.IsNaN(q.Ask) && !math.IsInf(q.Bid, 0) && !math.IsInf(q.Ask, 0)
+	if s.Paper != nil && (s.Paper.FillModel() == execution.PaperBidAsk || s.Paper.FillModel() == execution.PaperMidEntryMarketExit) && !spreadValid {
+		return errors.New("runner: chosen paper fill model requires an explicitly observed finite bid/ask")
+	}
 	if s.marks == nil {
 		s.marks = map[string]decimal.Decimal{}
 	}
@@ -87,7 +92,7 @@ func (s *AccountSink) ObserveQuote(ctx context.Context, sid int32, q backtest.Qu
 		s.observed = map[string]execution.VisibleQuote{}
 	}
 	bid, ask := q.Price, q.Price
-	if q.Bid > 0 && q.Ask >= q.Bid {
+	if spreadValid {
 		bid, ask = q.Bid, q.Ask
 	}
 	s.observed[i.ID] = execution.VisibleQuote{Bid: decimal.NewFromFloat(bid), Ask: decimal.NewFromFloat(ask), AtMS: q.AtMS, ReceivedMS: q.AvailableAt, ValidUntilMS: q.AtMS + s.QuoteTTLMS, Bar: q.AtMS}
@@ -129,7 +134,7 @@ func (s *AccountSink) StrategyState(ctx context.Context, now int64) (backtest.St
 		if !ok {
 			return state, errors.New("runner: strategy NAV mark unavailable")
 		}
-		nav = nav.Add(lot.Unrealized(mark))
+		nav = nav.Add(lot.EquityValue(mark))
 		state.Quantities[sid] += decimal.NewFromInt(lot.SignedSteps).Mul(lot.Instrument.QuantityStep).Mul(lot.Instrument.ContractSize).InexactFloat64()
 	}
 	state.NAV = nav.InexactFloat64()
@@ -174,6 +179,14 @@ func (s *AccountSink) ProcessSnapshot(ctx context.Context, p *factor.TargetPortf
 		i, ok := s.Instruments[sid]
 		if !ok || i.SettlementCurrency != s.Currency {
 			return errors.New("runner: instrument/budget settlement mismatch")
+		}
+		if done, err := s.settledOption(ctx, i, now); err != nil {
+			return err
+		} else if done {
+			if targetsToExecute[sid] != 0 {
+				return errors.New("runner: target attempts to resurrect settled option")
+			}
+			continue
 		}
 		q, ok := quotes[sid]
 		if !ok || q.AtMS < sp.ExecutableAt || q.AtMS <= sp.DecisionTime || q.AvailableAt > now || q.AvailableAt < q.AtMS || q.AtMS > now || q.Price <= 0 || math.IsNaN(q.Price) || math.IsInf(q.Price, 0) {
@@ -232,6 +245,9 @@ func (s *AccountSink) ObserveFunding(ctx context.Context, f backtest.Funding, no
 	if !ok {
 		return errors.New("runner: funding instrument absent")
 	}
+	if i.IsOption() {
+		return errors.New("runner: cash-settled options do not accrue perpetual funding")
+	}
 	mark, ok := s.marks[i.ID]
 	if !ok {
 		return errors.New("runner: funding mark unavailable")
@@ -286,6 +302,9 @@ func (s *AccountSink) ObserveFundingRecord(ctx context.Context, r factor.Version
 	}
 	if !ok {
 		return errors.New("runner: funding instrument absent")
+	}
+	if i.IsOption() {
+		return errors.New("runner: cash-settled options do not accrue perpetual funding")
 	}
 	id, ok := r.Series.Values["settlement_id"].(string)
 	if !ok || id == "" || r.EventTime < 0 || r.EventTime > now || r.AvailableAt > now || r.IngestedAt > now {

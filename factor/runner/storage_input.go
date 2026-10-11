@@ -123,7 +123,7 @@ func (f *storageInputFactory) Open(ctx context.Context, c Config, chunk Chunk) (
 		}
 		cursor := &storageCursor{stream: stream, offset: stream.WarmupStartMS, lastAt: -1}
 		if f.options.PITPolicy == "strict" {
-			reader, err := f.options.VersionPages.Open(ctx, stream, stream.WarmupStartMS, chunk.To, c.Snapshot.ReplayTime != 0)
+			reader, err := f.options.VersionPages.Open(ctx, stream, stream.WarmupStartMS, chunk.To, receiptScheduledSource(c, stream.Subscription.Source))
 			if err != nil {
 				_ = input.Close()
 				return nil, err
@@ -166,7 +166,7 @@ func (s *storageInput) WarmupFrom() int64 {
 
 func (s *storageInput) visibility(r factor.VersionRecord) int64 {
 	at := max(r.EventTime, r.AvailableAt)
-	if s.config.Snapshot.ReplayTime != 0 {
+	if receiptScheduledSource(s.config, r.Series.Source) {
 		at = max(at, r.IngestedAt)
 	}
 	return at
@@ -319,7 +319,7 @@ func (s *storageInput) Visible(ctx context.Context, grid, now, replay int64) ([]
 	for key, rows := range s.latest {
 		latest := -1
 		for i, row := range rows {
-			if row.EventTime > grid || row.AvailableAt > now || replay != 0 && row.IngestedAt > replay {
+			if row.EventTime > grid || row.AvailableAt > now || row.IngestedAt > now || replay != 0 && row.IngestedAt > replay {
 				continue
 			}
 			if latest < 0 || row.EventTime > rows[latest].EventTime || row.EventTime == rows[latest].EventTime && row.Revision > rows[latest].Revision {
@@ -339,7 +339,7 @@ func (s *storageInput) Visible(ctx context.Context, grid, now, replay int64) ([]
 		// affect a later grid; late revisions of them remain behind selected event.
 		kept := rows[:0]
 		for i, row := range rows {
-			if i == latest || row.EventTime > grid {
+			if i == latest || row.EventTime > grid || row.AvailableAt > now || row.IngestedAt > now || replay != 0 && row.IngestedAt > replay {
 				kept = append(kept, row)
 			} else {
 				s.retained--

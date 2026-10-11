@@ -40,8 +40,11 @@ freezes bounded `factor.VersionRecord` JSON lines. Declare field types with the
 archive schema (`--schema fields.yml`) when concrete integer widths matter.
 Typed decoding preserves large integers; untyped integers outside float64's
 exact range are rejected rather than silently rounded. Conflicting types fail.
-Missing keys, NULLs, strings and arbitrary custom fields remain in
-`DataSeries.Values`; exporting an existing `VersionStore` preserves their types.
+Missing keys, NULLs, strings and arbitrary custom fields remain in the in-memory
+`DataSeries.Values map[string]any`. Gob export preserves concrete types supported
+by Gob: built-in values and registered concrete types. Custom concrete values in
+interface fields require the application's existing Gob registration; arbitrary
+in-memory values are not guaranteed to be Gob-exportable.
 
 Use `banbot research --config runtime.yml`,
 `banbot backtest --mode weights|events --config runtime.yml`, or
@@ -192,3 +195,34 @@ nonserialized handles. Raw records still travel through `DataSeries.Values` and
 ## Current guides and live provider names
 
 See the [guide](../../bandoc/en-US/guide/factor.md), [中文指南](../../bandoc/zh-CN/guide/factor.md) and [refactor record](../../doc/strategy_engine_refactor.md). verified-session above is an application registration example, not a built-in verified venue. Register entry.RegisterFactorLiveBinding("verified-session", factory) with real evidence first. Empty/banexg selects the built-in adapter; missing capabilities or unknown names fail explicitly. No live-venue acceptance or automatic paper fallback is implied.
+
+## Historical source-event decisions
+
+Set `SourceEventDecisions: true` for irregular source observations, such as
+information bars. Set `Factor.Source` and `Factor.TimeFrame` explicitly and keep
+`DecisionDelayMS: 0`. This clock supports historical `Research`, `Weights`, and
+paper `Events`; `Trade` and the live driver reject it. `DecisionInterval` remains
+a positive configuration/risk horizon, but does not create periodic decision
+batches in this mode.
+
+A decision uses `GridTime = EventTime` from a real **closed** record matching the
+selected factor source and timeframe. `DecisionTime` is its current batch's
+publication/receipt cutoff. Archive replay waits for both `AvailableAt` and
+`IngestedAt`, even when reception replay was not separately selected. Every
+requested SID/source must still satisfy the original complete snapshot barrier
+and PIT rules. If some SIDs arrive later for an incomplete grid, that grid can
+retry at the later receipt cutoff. A completed grid cannot be evaluated again
+or replaced by an older grid; such later source revisions fail explicitly.
+
+Quote, funding, expiry, other-source, and unclosed-record batches process ordinary
+execution and pending proposals without creating source decisions. No fabricated
+periodic ticks fill gaps between observed source records. A publication batch
+containing two distinct selected source event times is ambiguous for this clock
+and rejects before execution or decision processing. Split such observations
+into genuinely distinct publication/receipt batches rather than silently dropping
+one source grid or treating several grids as one observation.
+
+The clock choice and source identity participate in manifest replay assumptions,
+shared computation identity, and shared account timeline compatibility. Strategies
+that check gaps in fixed wall-clock units must adapt their own gap contract before
+using irregular source events; this runner does not reinterpret strategy history.

@@ -158,8 +158,10 @@ func (l *Live) executePolicy(ctx context.Context, now int64) error {
 	}
 	l.policyPending = refreshed
 	pending = refreshed
-	ready, err := proposalReady(pending, l.policy.previous, quotes, now, l.ExecutionSIDs())
+	declared := l.ExecutionSIDs()
+	previous := l.policy.previous
 	l.mu.Unlock()
+	ready, err := proposalReady(ctx, l.sink, pending, previous, quotes, now, declared)
 	if err != nil || !ready {
 		return err
 	}

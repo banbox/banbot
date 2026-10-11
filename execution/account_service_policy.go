@@ -187,7 +187,7 @@ func (b *SharedAccountBorrow) RegisterAccountQuotes(instruments []Instrument, qu
 		}
 		for _, i := range instruments {
 			if _, ok := s.markets[i.ID]; !ok {
-				s.markets[i.ID] = accountMarket{instrument: i, quote: quote, clock: clock}
+				s.markets[i.ID] = accountMarket{instrument: i.Clone(), quote: quote, clock: clock}
 			}
 		}
 		return nil
@@ -247,6 +247,18 @@ func (s *SharedAccount) accountRisk(ctx context.Context, request *CombinedRebala
 	}
 	validUntil := request.ExpiresMS
 	for id, i := range instruments {
+		{
+			done, err := s.store.PositionSettled(ctx, i)
+			if err != nil {
+				return risk, 0, err
+			}
+			if done {
+				if i.IsOption() {
+					risk.Marks[id] = decimal.Zero
+				}
+				continue
+			}
+		}
 		market, ok := s.markets[id]
 		if !ok || !sameAccountInstrument(market.instrument, i) {
 			return risk, 0, fmt.Errorf("execution: account mark provider/descriptor missing: %s", id)

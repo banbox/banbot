@@ -62,6 +62,9 @@ type Config struct {
 	timelineIndex                                      int
 	Prices                                             PriceStream
 	FundingSource                                      string
+	OptionExpirySource                                 string
+	TerminalSettlementSource                           string
+	SourceEventDecisions                               bool
 }
 
 // Sink must persist/idempotently coordinate targets before returning success.
@@ -196,6 +199,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	}
 	c.Manifest.ExecutionMode = string(c.Mode)
 	c.Manifest.LatencyAssumption = fmt.Sprintf("visibility cutoff=grid+%dms; observable-event-after-decision+%dms; no OHLC reconstruction", c.DecisionDelayMS, c.LatencyMS)
+	if c.SourceEventDecisions {
+		c.Manifest.LatencyAssumption = fmt.Sprintf("closed source-event grid=%s/%s; decision at publication/receipt; observable-event-after-decision+%dms; no synthetic periodic decisions", c.Factor.Source, c.Factor.TimeFrame, c.LatencyMS)
+	}
 	assumptions, err := runAssumptions(c)
 	if err != nil {
 		return result, err
@@ -252,6 +258,22 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			return result, errors.New("runner: lifecycle policy requires an allocation-capable sink and explicit position evidence")
 		}
 	}
+	terminalSIDs := map[int32]bool{}
+	originalPolicyContext := c.PolicyContext
+	c.PolicyContext = func(ctx context.Context, p *factor.PortfolioContext) error {
+		if originalPolicyContext != nil {
+			if err := originalPolicyContext(ctx, p); err != nil {
+				return err
+			}
+		}
+		if p.ForceExit == nil {
+			p.ForceExit = map[int32]string{}
+		}
+		for sid := range terminalSIDs {
+			p.ForceExit[sid] = "terminal-settlement"
+		}
+		return nil
+	}
 	var policyPending *pendingProposal
 	var history *research.ICHistory
 	if research.IsHistoryMethod(combo.Method) {
@@ -294,6 +316,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	quotes := map[int32]backtest.Quote{}
 	var sequence uint64
 	lastTime := int64(0)
+	lastSourceGrid := int64(0)
 	finish := func(now int64) error {
 		for i := 0; i < len(evaluations); {
 			e := evaluations[i]
@@ -371,6 +394,16 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				return result, nextErr
 			}
 			now := batch.AtMS
+			sourceGrid := int64(0)
+			if c.SourceEventDecisions {
+				sourceGrid, err = sourceDecisionGrid(c, batch)
+				if err != nil {
+					return result, err
+				}
+				if sourceGrid != 0 && sourceGrid <= lastSourceGrid {
+					return result, errors.New("runner: source decision grid was already evaluated or moved backwards")
+				}
+			}
 			if c.HistoricalInput != nil {
 				for _, record := range batch.Records {
 					digest, hashErr := factor.ContentHash(record)
@@ -381,6 +414,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				}
 			}
 			warming := now-c.DecisionDelayMS < chunk.From
+			decisionWarming := warming || c.SourceEventDecisions && sourceGrid != 0 && sourceGrid < chunk.From
 			result.MaxRawRecords = max(result.MaxRawRecords, input.MaxRetainedRecords())
 			if c.timeline != nil {
 				if err = c.timeline.enter(ctx, c.timelineIndex, now); err != nil {
@@ -395,11 +429,14 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			// equal timestamps. Such prices cannot execute that new decision.
 			for _, r := range batch.Records {
 				if r.Series.Source == c.Prices.Source && r.Series.TimeFrame == c.Prices.TimeFrame {
+					if r.EventTime > now || r.AvailableAt > now || r.IngestedAt > now {
+						return result, errors.New("runner: execution quote unavailable before publication or receipt")
+					}
 					n := factor.Number(r.Series.Values, c.Prices.Field)
 					if n.Validity != factor.Valid || n.Value <= 0 {
 						continue
 					}
-					q := backtest.Quote{AtMS: r.EventTime, AvailableAt: now, Price: n.Value}
+					q := backtest.Quote{AtMS: r.EventTime, AvailableAt: max(r.AvailableAt, r.IngestedAt), Price: n.Value}
 					q = withSpread(q, r.Series.Values)
 					if old, ok := quotes[r.Series.Sid]; ok && old.AtMS > q.AtMS {
 						continue
@@ -431,11 +468,14 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			}
 			for _, r := range batch.Records {
 				if r.Series.Source == c.FundingSource && c.Manifest.Costs.FundingPolicy == "required-stream" {
+					if r.AvailableAt > now || r.IngestedAt > now || r.EventTime != now {
+						return result, errors.New("runner: funding settlement unavailable or delivered late")
+					}
 					n := factor.Number(r.Series.Values, "rate")
 					if n.Validity != factor.Valid {
 						return result, errors.New("runner: invalid funding rate")
 					}
-					f := backtest.Funding{ID: fmt.Sprintf("%s:%d:%d", r.Series.Source, r.Series.Sid, r.EventTime), SID: r.Series.Sid, AtMS: r.EventTime, AvailableAt: r.AvailableAt, Rate: n.Value}
+					f := backtest.Funding{ID: fmt.Sprintf("%s:%d:%d", r.Series.Source, r.Series.Sid, r.EventTime), SID: r.Series.Sid, AtMS: r.EventTime, AvailableAt: max(r.AvailableAt, r.IngestedAt), Rate: n.Value}
 					if observer, ok := sink.(FundingObserver); ok && !warming {
 						if err = observer.ObserveFunding(ctx, f, now); err != nil {
 							return result, err
@@ -443,6 +483,49 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 					}
 					if book != nil && !warming {
 						if err = book.ApplyFunding(f, now); err != nil {
+							return result, err
+						}
+					}
+				}
+			}
+			if c.TerminalSettlementSource != "" && !warming {
+				for _, r := range batch.Records {
+					if r.Series.Source != c.TerminalSettlementSource {
+						continue
+					}
+					e, parseErr := terminalRecord(r, now)
+					if parseErr != nil {
+						return result, parseErr
+					}
+					if book != nil {
+						if _, err = book.ApplyTerminalSettlement(e, now); err != nil {
+							return result, err
+						}
+					} else {
+						observer, ok := sink.(interface {
+							ObserveTerminalSettlementRecord(context.Context, factor.VersionRecord, int64) error
+						})
+						if !ok {
+							return result, errors.New("runner: terminal settlement requires paper account sink")
+						}
+						if err = observer.ObserveTerminalSettlementRecord(ctx, r, now); err != nil {
+							return result, err
+						}
+					}
+					terminalSIDs[e.SID] = true
+					delete(quotes, e.SID)
+				}
+			}
+			if c.OptionExpirySource != "" && !warming {
+				observer, ok := sink.(interface {
+					ObserveOptionExpiryRecord(context.Context, factor.VersionRecord, int64) error
+				})
+				if !ok {
+					return result, errors.New("runner: option expiry requires account-backed Events sink")
+				}
+				for _, r := range batch.Records {
+					if r.Series.Source == c.OptionExpirySource {
+						if err = observer.ObserveOptionExpiryRecord(ctx, r, now); err != nil {
 							return result, err
 						}
 					}
@@ -462,7 +545,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 					if err != nil {
 						return result, err
 					}
-					ready, readyErr := proposalReady(policyPending, policy.previous, quotes, now, c.Snapshot.Universe.Tracked)
+					ready, readyErr := proposalReady(ctx, sink, policyPending, policy.previous, quotes, now, c.Snapshot.Universe.Tracked, book)
 					if readyErr != nil {
 						return result, readyErr
 					}
@@ -521,6 +604,16 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 						targetsToExecute = pending.Targets()
 					}
 					for sid := range targetsToExecute {
+						settled, err := terminalQuoteExempt(ctx, sink, book, sid, targetsToExecute[sid] == 0)
+						if !settled && err == nil {
+							settled, err = optionQuoteExempt(ctx, sink, sid, targetsToExecute[sid] == 0, now)
+						}
+						if err != nil {
+							return result, err
+						}
+						if settled {
+							continue
+						}
 						q, ok := quotes[sid]
 						if !ok || q.AtMS < sp.ExecutableAt || q.AvailableAt > now {
 							ready = false
@@ -567,7 +660,12 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if policy != nil {
 				gridOffset = 0
 			}
-			if grid <= 0 || (grid-gridOffset)%c.DecisionInterval != 0 {
+			decisionBatch := grid > 0 && (grid-gridOffset)%c.DecisionInterval == 0
+			if c.SourceEventDecisions {
+				grid = sourceGrid
+				decisionBatch = grid > 0
+			}
+			if !decisionBatch {
 				if c.timeline != nil {
 					c.timeline.leave()
 				}
@@ -602,7 +700,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			}
 			snapshot, err := barrier.Freeze(token, now)
 			if errors.Is(err, factor.ErrSnapshotIncomplete) {
-				if !warming {
+				if !decisionWarming {
 					result.Incomplete++
 					if policy != nil {
 						evidence, evidenceErr := policyEvidence(ctx, sink, book, now)
@@ -649,8 +747,11 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if err != nil {
 				return result, err
 			}
+			if c.SourceEventDecisions {
+				lastSourceGrid = grid
+			}
 			result.MaxRetainedValues = max(result.MaxRetainedValues, engine.session.RetainedValues())
-			if warming {
+			if decisionWarming {
 				if c.timeline != nil {
 					c.timeline.leave()
 				}
@@ -813,14 +914,16 @@ func runAssumptions(c Config) (string, error) {
 		ranges[i] = [2]int64{ch.From, ch.To}
 	}
 	body, err := json.Marshal(struct {
-		Prices                PriceStream
-		FundingSource         string
-		InitialNAV            float64
-		ExpiryMS, LabelWaitMS int64
-		ReceptionReplay       bool
-		Ranges                [][2]int64
-		Execution             ExecutionConfig
-	}{c.Prices, c.FundingSource, c.InitialNAV, c.ExpiryMS, c.LabelWaitMS, c.Snapshot.ReplayTime != 0, ranges, e})
+		Prices                                                      PriceStream
+		FundingSource, OptionExpirySource, TerminalSettlementSource string
+		SourceEventDecisions                                        bool
+		DecisionSource, DecisionTimeFrame                           string
+		InitialNAV                                                  float64
+		ExpiryMS, LabelWaitMS                                       int64
+		ReceptionReplay                                             bool
+		Ranges                                                      [][2]int64
+		Execution                                                   ExecutionConfig
+	}{c.Prices, c.FundingSource, c.OptionExpirySource, c.TerminalSettlementSource, c.SourceEventDecisions, c.Factor.Source, c.Factor.TimeFrame, c.InitialNAV, c.ExpiryMS, c.LabelWaitMS, c.Snapshot.ReplayTime != 0, ranges, e})
 	if err != nil {
 		return "", err
 	}

@@ -19,6 +19,7 @@ type State struct {
 	Quantities                                   map[int32]float64
 }
 type Book struct {
+	terminals                               map[int32]TerminalSettlement
 	cash, fees, slippage, funding, turnover float64
 	quantities                              map[int32]float64
 	marks                                   map[int32]Quote
@@ -42,6 +43,9 @@ func NewBook(nav float64) (*Book, error) {
 	return &Book{cash: nav, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
 }
 func (b *Book) Mark(sid int32, q Quote, now int64) error {
+	if _, ok := b.terminals[sid]; ok {
+		return errors.New("backtest: quote after committed terminal settlement")
+	}
 	if sid <= 0 || q.Price <= 0 || !finite(q.Price) || q.AtMS > now || q.AvailableAt > now || q.AtMS < 0 || q.AvailableAt < q.AtMS {
 		return errors.New("backtest: invalid/unavailable quote")
 	}
@@ -79,6 +83,11 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 	}
 	// Validate the whole portfolio before changing any cash or quantities.
 	for sid := range targets {
+		if done, err := b.TerminalQuoteExempt(sid, targets[sid] == 0); err != nil {
+			return err
+		} else if done {
+			continue
+		}
 		q, ok := quotes[sid]
 		if !ok || q.AtMS <= spec.DecisionTime || q.AtMS < spec.ExecutableAt || q.AtMS > now || q.AvailableAt > now || q.AvailableAt < q.AtMS || q.Price <= 0 || !finite(q.Price) {
 			return errors.New("backtest: target requires a strictly later observable price")
@@ -86,6 +95,9 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 	}
 	for _, sid := range sortedKeys(targets) {
 		w := targets[sid]
+		if done, _ := b.TerminalQuoteExempt(sid, w == 0); done {
+			continue
+		}
 		q := quotes[sid]
 		qty := w * spec.Budget.NAV / q.Price
 		delta := qty - b.quantities[sid]

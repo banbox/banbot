@@ -26,7 +26,8 @@ type TrainingWindow struct {
 }
 
 // VisibleTrainingRows purges labels reaching the test interval and applies a
-// pre-test embargo. Feature publication must precede its original decision.
+// pre-test embargo. Feature publication must precede its original decision;
+// label publication cannot precede maturity.
 func VisibleTrainingRows(rows []TrainingSample, window TrainingWindow) ([]TrainingSample, error) {
 	if window.Start <= 0 || window.End < window.Start || window.FitAsOf < window.End || window.TestStart <= window.FitAsOf || window.TestEnd < window.TestStart || window.EmbargoMS < 0 || window.MinSamples < 1 {
 		return nil, errors.New("research: invalid rolling training window")
@@ -36,7 +37,7 @@ func VisibleTrainingRows(rows []TrainingSample, window TrainingWindow) ([]Traini
 		if row.DecisionTime < window.Start || row.DecisionTime > window.End {
 			continue
 		}
-		if row.SID <= 0 || row.FeaturesAvailableAt <= 0 || row.FeaturesAvailableAt > row.DecisionTime || row.LabelEnd <= row.DecisionTime || row.MatureAt < row.LabelEnd || row.AvailableAt <= 0 {
+		if row.SID <= 0 || row.FeaturesAvailableAt <= 0 || row.FeaturesAvailableAt > row.DecisionTime || row.LabelEnd <= row.DecisionTime || row.MatureAt < row.LabelEnd || row.AvailableAt < row.MatureAt {
 			return nil, errors.New("research: invalid training sample chronology/features")
 		}
 		if row.MatureAt > window.FitAsOf || row.AvailableAt > window.FitAsOf || row.LabelEnd >= window.TestStart-window.EmbargoMS {

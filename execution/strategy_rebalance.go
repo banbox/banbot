@@ -317,6 +317,23 @@ func (s *SharedAccount) restorePreparedRebalance(ctx context.Context, planID str
 // Retire inherited zero declarations only after all corresponding execution
 // state settles. Newly supplied targets and immutable old plans stay intact.
 func (s *SharedAccount) retainedPlanTargets(ctx context.Context, plan Plan, snapshot AccountSnapshot) ([]ExecutableTarget, error) {
+	settled := make(map[string]bool)
+	for _, instrument := range plan.Instruments {
+		{
+			done, err := s.store.PositionSettled(ctx, instrument)
+			if err != nil {
+				return nil, err
+			}
+			settled[instrument.ID] = done
+		}
+	}
+	filtered := make([]ExecutableTarget, 0, len(plan.Targets))
+	for _, target := range plan.Targets {
+		if !settled[target.Instrument] {
+			filtered = append(filtered, target)
+		}
+	}
+	plan.Targets = filtered
 	type key struct {
 		instrument string
 		strategy   StrategyID

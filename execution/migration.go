@@ -385,7 +385,9 @@ func (s *Store) validateLegacyMigration(request LegacyMigration) error {
 		if lot.SignedSteps < 0 {
 			basis = basis.Neg()
 		}
-		virtualBasis = virtualBasis.Add(basis)
+		if !lot.Instrument.IsOption() {
+			virtualBasis = virtualBasis.Add(basis)
+		}
 	}
 	mapped := make(map[lotKey]bool)
 	for _, mapping := range request.RawLegacyMap {
@@ -425,7 +427,9 @@ func (s *Store) validateLegacyMigration(request LegacyMigration) error {
 		if position.SignedSteps < 0 {
 			basis = basis.Neg()
 		}
-		actualBasis = actualBasis.Add(basis)
+		if !position.Instrument.IsOption() {
+			actualBasis = actualBasis.Add(basis)
+		}
 	}
 	if len(actual) != len(proven) {
 		return errors.New("execution: unexplained venue position")

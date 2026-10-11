@@ -60,6 +60,9 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 	if snapshot.RiskFrozen {
 		return result, errors.New("execution: external account state freezes coordination")
 	}
+	if err := instrument.CheckExecutionTime(observation.AtMS); err != nil {
+		return result, err
+	}
 	if !observation.Price.IsPositive() || observation.AtMS < 0 || observation.ValidUntilMS <= observation.AtMS || !risk.MarginRate.IsPositive() || risk.MarginRate.GreaterThan(decimal.NewFromInt(1)) || !risk.MaxAccountMargin.IsPositive() || !risk.MaxVirtualGross.IsPositive() {
 		return result, errors.New("execution: invalid coordination observation/risk limits")
 	}
@@ -85,16 +88,16 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 	otherGross := make(map[StrategyID]decimal.Decimal)
 	for _, lot := range snapshot.Lots {
 		mark, ok := marks[lot.Instrument.ID]
-		if !ok || !mark.IsPositive() {
+		if !ok || !lot.Instrument.ValidMark(mark) {
 			return result, errors.New("execution: strategy valuation mark missing")
 		}
-		strategyNAV[lot.Strategy] = strategyNAV[lot.Strategy].Add(lot.Unrealized(mark))
+		strategyNAV[lot.Strategy] = strategyNAV[lot.Strategy].Add(lot.EquityValue(mark))
 		if lot.Instrument.ID == instrument.ID {
 			key := lotKey{lot.Strategy, lot.ID}
 			projected[key] = lot.SignedSteps
 			original[key] = lot.SignedSteps
 		} else {
-			otherGross[lot.Strategy] = otherGross[lot.Strategy].Add(lot.Instrument.Notional(absSteps(lot.SignedSteps), mark))
+			otherGross[lot.Strategy] = otherGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
 		}
 	}
 	projectedLots, projectedPositions, err := confirmedExposure(snapshot)
@@ -105,20 +108,20 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 	for _, lot := range projectedLots {
 		if lot.Instrument.ID != instrument.ID {
 			mark, ok := marks[lot.Instrument.ID]
-			if !ok || !mark.IsPositive() {
+			if !ok || !lot.Instrument.ValidMark(mark) {
 				return result, errors.New("execution: projected lot mark missing")
 			}
-			otherGross[lot.Strategy] = otherGross[lot.Strategy].Add(lot.Instrument.Notional(absSteps(lot.SignedSteps), mark))
+			otherGross[lot.Strategy] = otherGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
 		}
 	}
 	otherMargin := decimal.Zero
 	for _, position := range projectedPositions {
 		if position.Instrument.ID != instrument.ID {
 			mark, ok := marks[position.Instrument.ID]
-			if !ok || !mark.IsPositive() {
+			if !ok || !position.Instrument.ValidMark(mark) {
 				return result, errors.New("execution: projected position mark missing")
 			}
-			otherMargin = otherMargin.Add(position.Instrument.Notional(absSteps(position.SignedSteps), mark).Mul(risk.MarginRate))
+			otherMargin = otherMargin.Add(position.Instrument.Collateral(position.SignedSteps, mark, risk.MarginRate))
 		}
 	}
 	for _, position := range snapshot.ActualPositions {
@@ -169,6 +172,16 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 	}
 	seen := make(map[lotKey]bool)
 	targetGross := make(map[StrategyID]decimal.Decimal)
+	strategyCollateral := make(map[StrategyID]decimal.Decimal)
+	previousCollateral := make(map[StrategyID]decimal.Decimal)
+	for _, lot := range snapshot.Lots {
+		previousCollateral[lot.Strategy] = previousCollateral[lot.Strategy].Add(lot.Instrument.Collateral(lot.SignedSteps, marks[lot.Instrument.ID], risk.MarginRate))
+	}
+	for _, lot := range projectedLots {
+		if lot.Instrument.ID != instrument.ID {
+			strategyCollateral[lot.Strategy] = strategyCollateral[lot.Strategy].Add(lot.Instrument.Collateral(lot.SignedSteps, marks[lot.Instrument.ID], risk.MarginRate))
+		}
+	}
 	for id, n := range otherGross {
 		targetGross[id] = n
 	}
@@ -182,8 +195,9 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 		if err != nil {
 			return result, err
 		}
-		gross := instrument.Notional(absSteps(target.SignedSteps), observation.Price)
+		gross := instrument.RiskGross(target.SignedSteps, observation.Price)
 		targetGross[target.Strategy] = targetGross[target.Strategy].Add(gross)
+		strategyCollateral[target.Strategy] = strategyCollateral[target.Strategy].Add(instrument.Collateral(target.SignedSteps, observation.Price, risk.MarginRate))
 		delta, err := checkedSteps(target.SignedSteps, -projected[key])
 		if err != nil {
 			return result, err
@@ -216,22 +230,22 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 		previous := otherGross[strategy]
 		for key, n := range original {
 			if key.strategy == strategy {
-				previous = previous.Add(instrument.Notional(absSteps(n), observation.Price))
+				previous = previous.Add(instrument.RiskGross(n, observation.Price))
 			}
 		}
 		previousTotalGross = previousTotalGross.Add(previous)
 		if gross.GreaterThan(previous) && gross.GreaterThan(limit) {
 			return result, errors.New("execution: strategy gross budget exceeded")
 		}
-		if gross.GreaterThan(previous) && gross.Mul(risk.MarginRate).GreaterThan(strategyNAV[strategy]) {
+		if strategyCollateral[strategy].GreaterThan(previousCollateral[strategy]) && strategyCollateral[strategy].GreaterThan(strategyNAV[strategy]) {
 			return result, errors.New("execution: strategy NAV margin budget exceeded")
 		}
 	}
 	if result.VirtualGross.GreaterThan(previousTotalGross) && result.VirtualGross.GreaterThan(risk.MaxVirtualGross) {
 		return result, errors.New("execution: virtual gross exposure limit exceeded")
 	}
-	result.AccountMargin = instrument.Notional(absSteps(result.DesiredSteps), observation.Price).Mul(risk.MarginRate).Add(otherMargin)
-	currentMargin := instrument.Notional(absSteps(result.ProjectedSteps), observation.Price).Mul(risk.MarginRate).Add(otherMargin)
+	result.AccountMargin = instrument.Collateral(result.DesiredSteps, observation.Price, risk.MarginRate).Add(otherMargin)
+	currentMargin := instrument.Collateral(result.ProjectedSteps, observation.Price, risk.MarginRate).Add(otherMargin)
 	if result.AccountMargin.GreaterThan(currentMargin) && (result.AccountMargin.GreaterThan(risk.MaxAccountMargin) || result.AccountMargin.GreaterThan(equity)) {
 		return result, errors.New("execution: actual net margin allowance exceeded")
 	}

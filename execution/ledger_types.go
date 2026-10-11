@@ -8,12 +8,13 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// Instrument fixes the units of this first linear-settlement ledger. No venue
-// name is consulted. Inverse contracts require a different valuation contract.
+// Instrument fixes venue-independent units and valuation. Inverse contracts
+// require a different valuation contract. Cash options are paper/research only.
 type Instrument struct {
 	ID                 string
 	Version            string
-	Valuation          string // currently only "linear_perpetual"
+	Valuation          string          // linear_perpetual or cash_european_option
+	Option             *EuropeanOption `json:",omitempty"`
 	SettlementCurrency string
 	QuantityStep       decimal.Decimal
 	ContractSize       decimal.Decimal
@@ -24,8 +25,15 @@ type Instrument struct {
 }
 
 func (i Instrument) Validate() error {
-	if i.Valuation != "linear_perpetual" || !canonicalID(i.ID) || !canonicalID(i.Version) || !canonicalID(i.SettlementCurrency) || !i.QuantityStep.IsPositive() || !i.ContractSize.IsPositive() || !i.PriceTick.IsPositive() || i.MoneyScale < 0 || i.MoneyScale > 18 || i.MinSteps < 0 || i.MinNotional.IsNegative() {
-		return errors.New("execution: invalid linear instrument units/version/scale")
+	if !canonicalID(i.ID) || !canonicalID(i.Version) || !canonicalID(i.SettlementCurrency) || !i.QuantityStep.IsPositive() || !i.ContractSize.IsPositive() || !i.PriceTick.IsPositive() || i.MoneyScale < 0 || i.MoneyScale > 18 || i.MinSteps < 0 || i.MinNotional.IsNegative() {
+		return errors.New("execution: invalid instrument units/version/scale")
+	}
+	if i.Valuation == "cash_european_option" {
+		if i.Option == nil || !canonicalID(i.Option.UnderlyingID) || i.Option.UnderlyingID == i.ID || (i.Option.Right != "call" && i.Option.Right != "put") || !i.Option.Strike.IsPositive() || i.Option.ExpiryMS <= 0 || !i.Option.UnderlyingStressMax.IsPositive() {
+			return errors.New("execution: option requires European cash payoff identity and declared research stress bound")
+		}
+	} else if i.Valuation != "linear_perpetual" || i.Option != nil {
+		return errors.New("execution: unsupported valuation contract")
 	}
 	return nil
 }
@@ -144,6 +152,15 @@ func (l VirtualLot) Unrealized(mark decimal.Decimal) decimal.Decimal {
 	return value.Sub(l.CostBasis)
 }
 
+// EquityValue is the contribution added to settled cash. Option premiums have
+// already changed cash, so their contribution is signed market value, not PnL.
+func (l VirtualLot) EquityValue(mark decimal.Decimal) decimal.Decimal {
+	if l.Instrument.IsOption() {
+		return l.Instrument.Notional(l.SignedSteps, mark)
+	}
+	return l.Unrealized(mark)
+}
+
 type CashEventKind string
 
 const (
@@ -188,7 +205,7 @@ type AccountSnapshot struct {
 	AccountSettledCash    decimal.Decimal
 	UnassignedCash        decimal.Decimal
 	RiskFrozen            bool
-	SyntheticStrategyCash map[StrategyID]decimal.Decimal // capital + virtual realized PnL - fee + funding; never a venue withdrawal balance
+	SyntheticStrategyCash map[StrategyID]decimal.Decimal // capital + perpetual realized PnL or signed option cash flows - fee + funding; never a venue withdrawal balance
 	PnLReclassification   decimal.Decimal                // synthetic + unassigned cash minus actual settled cash
 	Lots                  []VirtualLot
 	ActualPositions       []VirtualLot
@@ -200,11 +217,14 @@ type AccountSnapshot struct {
 func (s AccountSnapshot) Equity(marks map[string]decimal.Decimal) (decimal.Decimal, error) {
 	value := s.AccountSettledCash
 	for _, lot := range s.ActualPositions {
+		if lot.SignedSteps == 0 {
+			continue
+		}
 		mark, ok := marks[lot.Instrument.ID]
-		if !ok || !mark.IsPositive() {
+		if !ok || !lot.Instrument.ValidMark(mark) {
 			return decimal.Zero, fmt.Errorf("execution: missing mark for %s", lot.Instrument.ID)
 		}
-		value = value.Add(lot.Unrealized(mark))
+		value = value.Add(lot.EquityValue(mark))
 	}
 	return value, nil
 }

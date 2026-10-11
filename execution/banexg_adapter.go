@@ -70,6 +70,11 @@ func missingBanexgBinding(value any) bool {
 // or cancels an order and never derives safety guarantees from venue names or
 // HasApi alone. All actual calls remain synchronous inside the owner gate.
 func NewBanexgAdapter(ctx context.Context, exchange banexg.BanExchange, config BanexgAdapterConfig) (*BanexgAdapter, error) {
+	for _, entry := range config.Instruments {
+		if entry.Instrument.Valuation != "linear_perpetual" {
+			return nil, errors.New("execution: live banexg supports linear perpetuals only; cash options are research/paper only")
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -184,6 +189,9 @@ func quantitySteps(value float64, instrument Instrument) (int64, error) {
 }
 
 func (a *BanexgAdapter) Submit(ctx context.Context, intent OrderIntent, clientID string) (SubmitReceipt, error) {
+	if intent.Instrument.Valuation != "linear_perpetual" {
+		return SubmitReceipt{}, errors.New("execution: live banexg rejects cash options")
+	}
 	entry, ok := a.byID[intent.Instrument.ID]
 	if !ok {
 		return SubmitReceipt{}, errors.New("execution: unmapped banexg instrument")
