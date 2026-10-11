@@ -1,5 +1,7 @@
 # 因子研究扩展与原生 Go 接口
 
+使用入口与支持范围见[统计套利指南](statarb_guide.md)；数值工具见[statistics 主题索引](../factor/statistics/README.md)。
+
 本页说明 `factor_opt.md` 的 P1/P2 研究接口。普通配置继续使用现有 `engine: factor`、表达式和组合配置；模型、风险优化和试验接口作为 Go 扩展提供，不需要新增 ML/求解器依赖。所有价格、暴露和分组字段继续从 `DataSeries.Values` 读取。
 
 ## 稳健变换和中性化

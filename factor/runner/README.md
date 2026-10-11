@@ -226,3 +226,68 @@ The clock choice and source identity participate in manifest replay assumptions,
 shared computation identity, and shared account timeline compatibility. Strategies
 that check gaps in fixed wall-clock units must adapt their own gap contract before
 using irregular source events; this runner does not reinterpret strategy history.
+
+## YAML clock, settlement and paper fill choices
+
+The unified YAML configuration exposes these choices through the ordinary
+`backtest --mode weights|events` and `research` commands:
+
+```yaml
+execution:
+  funding_policy: explicit-zero
+  paper_fill_model: midpoint  # Events only: midpoint, bid-ask, mid-entry-market-exit
+accounts:
+  default:
+    paper_fill_model: bid-ask # account override, shared by its strategies
+run_policy:
+  - name: MomentumVol
+    engine: factor
+    run_timeframes: [1h]      # positive calculation/risk horizon, also for labels
+    params: {window: 24, k: 10}
+    archive: information-bars.gob
+    decision:
+      source_event_decisions: true
+      source: information
+      timeframe: event       # exact archive stream identity, not a duration
+      delay_ms: 0
+    prices: {source: tick, timeframe: event, field: price}
+    terminal_settlement_source: terminal  # Weights or paper Events
+    # option_expiry_source: option-expiry # paper Events only
+```
+
+`decision.source` and `decision.timeframe` are required when source-event decisions
+are enabled, and rejected when the option is disabled. They select the runtime
+`Factor.Source/TimeFrame`; the built-in MomentumVol definition consequently reads
+its `close` values from that same stream. Expression bindings continue to select
+their own inputs, while `expressions.timeframe` must match `run_timeframes`.
+The source clock must contain real closed records and complete PIT snapshots;
+selecting a source does not manufacture observations. `event` is allowed as the
+clock timeframe; `run_timeframes` or `decision.interval_ms` still provides the
+positive risk horizon. Source-event decisions reject live Trade and nonzero delay.
+
+Settlement sources must differ from prices, funding and one another. Records and
+instrument contracts must satisfy the existing expiry/terminal validation rules.
+Explicit `execution.instruments` can carry a nested `option` contract using
+numeric SID keys; cash European options require paper Events accounting. Weights,
+live Trade and Banexg live execution reject unsupported option capability.
+The configuration does not imply that an exchange adapter can derive option
+contracts automatically. The spread-dependent fill models require actual visible
+bid/ask quotes; a missing spread is rejected, not inferred from candles.
+
+Canonical configuration export retains these YAML fields. `resolved.json` reports
+the selected clock, settlement sources, fill model and their file/account origins.
+Omitting `paper_fill_model` retains the existing midpoint default.
+
+## Stateful portfolio factories and statistical research
+
+Use `RegisterPortfolioFactory(name, factory, validator)` for private mutable
+state per run. The optional validator is a pure preflight check;
+`ValidateStaticConfig`, `ValidateReplayConfig` and `ValidateLiveConfig` never
+construct factory state. `PreparePortfolioConfig` constructs once after
+preflight and before execution resources are assembled. Replay/live entry points
+perform this preparation; embedded callers must pass the returned configuration
+through one run only. Legacy factories without a validator report constructor
+errors at preparation. State coupled to committed fills belongs in a
+`PortfolioPolicy`. See [definition.go](definition.go) for the API, the
+[statistical arbitrage guide](../../doc/statarb_guide.md) for the supported paths,
+and the [statistics index](../statistics/README.md) for research primitives.
