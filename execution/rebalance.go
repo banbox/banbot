@@ -135,7 +135,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 			if err != nil {
 				return err
 			}
-			projectedLots, projectedPositions, err := confirmedExposure(snapshot)
+			_, _, err = confirmedExposure(snapshot)
 			if err != nil {
 				return err
 			}
@@ -283,7 +283,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 				plan.Instruments = append(plan.Instruments, instrument)
 				added[target.Instrument] = true
 			}
-			projectedLots, projectedPositions, err = reservedCarriedExposure(snapshot, request.CarryTargets, plan.Instruments)
+			projectedLots, projectedPositions, err := reservedCarriedExposure(snapshot, request.CarryTargets, plan.Instruments)
 			if err != nil {
 				return err
 			}
@@ -303,7 +303,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 					if !ok {
 						return errors.New("execution: missing untouched actual mark")
 					}
-					desiredMargin = desiredMargin.Add(position.Instrument.Collateral(position.SignedSteps, mark, request.Risk.MarginRate))
+					desiredMargin = desiredMargin.Add(position.collateral(mark, request.Risk.MarginRate))
 				}
 			}
 			marks := make(map[string]decimal.Decimal)
@@ -323,7 +323,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 			}
 			for _, position := range projectedPositions {
 				if !seen[position.Instrument.ID] {
-					currentMargin = currentMargin.Add(position.Instrument.Collateral(position.SignedSteps, marks[position.Instrument.ID], request.Risk.MarginRate))
+					currentMargin = currentMargin.Add(position.collateral(marks[position.Instrument.ID], request.Risk.MarginRate))
 				}
 			}
 			previousGross := make(map[StrategyID]decimal.Decimal)
@@ -354,9 +354,9 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 					if !ok || !lot.Instrument.ValidMark(mark) {
 						return errors.New("execution: projected lot mark missing")
 					}
-					combinedGross[lot.Strategy] = combinedGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
-					previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
-					strategyCollateral[lot.Strategy] = strategyCollateral[lot.Strategy].Add(lot.Instrument.Collateral(lot.SignedSteps, mark, request.Risk.MarginRate))
+					combinedGross[lot.Strategy] = combinedGross[lot.Strategy].Add(lot.riskGross(mark))
+					previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(lot.riskGross(mark))
+					strategyCollateral[lot.Strategy] = strategyCollateral[lot.Strategy].Add(lot.collateral(mark, request.Risk.MarginRate))
 				}
 			}
 			for _, p := range pendingRequests {

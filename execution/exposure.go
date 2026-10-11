@@ -1,6 +1,9 @@
 package execution
 
-import "errors"
+import (
+	"errors"
+	"github.com/shopspring/decimal"
+)
 
 // confirmedExposure projects every instrument, including instruments omitted
 // from a new rebalance, using only acknowledged remaining allocations.
@@ -68,12 +71,35 @@ func confirmedExposure(snapshot AccountSnapshot) ([]VirtualLot, []VirtualLot, er
 	return virtual, actual, nil
 }
 
-// Untouched target declarations reserve possible future exposure, without
-// granting margin freed by a reduction that this plan will never execute.
-func reservedCarriedExposure(snapshot AccountSnapshot, targets []ExecutableTarget, instruments []Instrument) ([]VirtualLot, []VirtualLot, error) {
+// exposureReservation separates quantity projection from conservative risk.
+// Both gross and collateral reserve the maximum across possible carried states.
+type exposureReservation struct {
+	VirtualLot
+	alternatives []int64
+}
+
+func (r exposureReservation) riskGross(mark decimal.Decimal) decimal.Decimal {
+	amount := r.Instrument.RiskGross(r.SignedSteps, mark)
+	for _, n := range r.alternatives {
+		amount = decimal.Max(amount, r.Instrument.RiskGross(n, mark))
+	}
+	return amount
+}
+func (r exposureReservation) collateral(mark, rate decimal.Decimal) decimal.Decimal {
+	amount := r.Instrument.Collateral(r.SignedSteps, mark, rate)
+	for _, n := range r.alternatives {
+		amount = decimal.Max(amount, r.Instrument.Collateral(n, mark, rate))
+	}
+	return amount
+}
+
+// Untouched declarations reserve possible exposure without granting risk freed
+// by reductions that this plan will never execute. Non-carried orders retain
+// the existing confirmed remaining-allocation projection.
+func reservedCarriedExposure(snapshot AccountSnapshot, targets []ExecutableTarget, instruments []Instrument) ([]exposureReservation, []exposureReservation, error) {
 	lots, positions, err := confirmedExposure(snapshot)
-	if err != nil || len(targets) == 0 {
-		return lots, positions, err
+	if err != nil {
+		return nil, nil, err
 	}
 	type key struct {
 		instrument string
@@ -81,52 +107,54 @@ func reservedCarriedExposure(snapshot AccountSnapshot, targets []ExecutableTarge
 		lot        VirtualLotID
 	}
 	units := make(map[string]Instrument)
-	for _, instrument := range instruments {
-		units[instrument.ID] = instrument
+	for _, i := range instruments {
+		units[i.ID] = i
 	}
-	virtual := make(map[key]VirtualLot)
+	virtual := make(map[key]exposureReservation)
 	desired := make(map[key]int64)
 	for _, lot := range lots {
 		k := key{lot.Instrument.ID, lot.Strategy, lot.ID}
-		virtual[k] = lot
+		virtual[k] = exposureReservation{VirtualLot: lot}
 		desired[k] = lot.SignedSteps
-	}
-	for _, lot := range snapshot.Lots {
-		k := key{lot.Instrument.ID, lot.Strategy, lot.ID}
-		if absSteps(lot.SignedSteps) > absSteps(virtual[k].SignedSteps) {
-			virtual[k] = lot
-		}
 	}
 	carriedIDs := make(map[string]bool)
 	for _, target := range targets {
-		instrument, ok := units[target.Instrument]
+		i, ok := units[target.Instrument]
 		if !ok {
 			return nil, nil, errors.New("execution: carried reservation units missing")
 		}
 		k := key{target.Instrument, target.Strategy, target.Lot}
-		lot := virtual[k]
-		if lot.Instrument.ID != "" {
-			existing, _ := payload(lot.Instrument)
-			carried, _ := payload(instrument)
+		r := virtual[k]
+		if r.Instrument.ID != "" {
+			existing, _ := payload(r.Instrument)
+			carried, _ := payload(i)
 			if existing != carried {
 				return nil, nil, errors.New("execution: carried instrument units/version changed")
 			}
 		}
-		lot.Instrument, lot.Strategy, lot.ID = instrument, target.Strategy, target.Lot
-		if absSteps(target.SignedSteps) > absSteps(lot.SignedSteps) {
-			lot.SignedSteps = target.SignedSteps
-		}
-		virtual[k] = lot
+		r.Instrument, r.Strategy, r.ID = i, target.Strategy, target.Lot
+		r.alternatives = append(r.alternatives, target.SignedSteps)
+		virtual[k] = r
 		desired[k] = target.SignedSteps
 		carriedIDs[target.Instrument] = true
 	}
-	actual := make(map[string]VirtualLot)
-	for _, position := range positions {
-		actual[position.Instrument.ID] = position
+	for _, lot := range snapshot.Lots {
+		if len(targets) > 0 {
+			k := key{lot.Instrument.ID, lot.Strategy, lot.ID}
+			r := virtual[k]
+			r.alternatives = append(r.alternatives, lot.SignedSteps)
+			virtual[k] = r
+		}
 	}
-	for _, position := range snapshot.ActualPositions {
-		if carriedIDs[position.Instrument.ID] && absSteps(position.SignedSteps) > absSteps(actual[position.Instrument.ID].SignedSteps) {
-			actual[position.Instrument.ID] = position
+	actual := make(map[string]exposureReservation)
+	for _, p := range positions {
+		actual[p.Instrument.ID] = exposureReservation{VirtualLot: p}
+	}
+	for _, p := range snapshot.ActualPositions {
+		if carriedIDs[p.Instrument.ID] {
+			r := actual[p.Instrument.ID]
+			r.alternatives = append(r.alternatives, p.SignedSteps)
+			actual[p.Instrument.ID] = r
 		}
 	}
 	net := make(map[string]int64)
@@ -139,19 +167,17 @@ func reservedCarriedExposure(snapshot AccountSnapshot, targets []ExecutableTarge
 		}
 	}
 	for id, n := range net {
-		position := actual[id]
-		position.Instrument = units[id]
-		if absSteps(n) > absSteps(position.SignedSteps) {
-			position.SignedSteps = n
-		}
-		actual[id] = position
+		r := actual[id]
+		r.Instrument = units[id]
+		r.alternatives = append(r.alternatives, n)
+		actual[id] = r
 	}
-	lots, positions = nil, nil
-	for _, lot := range virtual {
-		lots = append(lots, lot)
+	var reservedLots, reservedPositions []exposureReservation
+	for _, r := range virtual {
+		reservedLots = append(reservedLots, r)
 	}
-	for _, position := range actual {
-		positions = append(positions, position)
+	for _, r := range actual {
+		reservedPositions = append(reservedPositions, r)
 	}
-	return lots, positions, nil
+	return reservedLots, reservedPositions, nil
 }

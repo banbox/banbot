@@ -312,7 +312,7 @@ func (a *PaperAdapter) applyOptionExpiryLocked(event OptionExpiry) bool {
 	p := a.positions[event.Instrument.ID]
 	a.cash = a.cash.Add(event.Instrument.Notional(p.steps, event.Instrument.OptionPayoff(event.Fixing)))
 	p.steps = 0
-	p.average = decimal.Zero
+	p.costBasis = decimal.Zero
 	p.instrument = event.Instrument
 	a.positions[event.Instrument.ID] = p
 	a.optionExpiries[id] = body

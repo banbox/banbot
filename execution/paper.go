@@ -12,7 +12,7 @@ import (
 
 type paperPosition struct {
 	steps      int64
-	average    decimal.Decimal
+	costBasis  decimal.Decimal
 	instrument Instrument
 }
 type paperTotals struct {
@@ -248,25 +248,13 @@ func (a *PaperAdapter) fillLocked(o OrderIntent, price decimal.Decimal, nowMS, s
 	if o.ReduceOnly && (p.steps == 0 || (p.steps > 0) == (sign > 0) || o.Steps > absSteps(p.steps)) {
 		return SubmitReceipt{ExchangeID: "paper:" + o.ID, Rejected: true}, nil
 	}
-	delta := sign * o.Steps
 	cost := o.Instrument.Notional(o.Steps, price)
 	fee := cost.Mul(a.fee).Round(o.Instrument.MoneyScale)
-	realized := decimal.Zero
-	if p.steps == 0 || (p.steps > 0) == (delta > 0) {
-		old := o.Instrument.Notional(absSteps(p.steps), p.average)
-		p.average = old.Add(cost).Div(o.Instrument.Notional(absSteps(p.steps)+o.Steps, decimal.NewFromInt(1)))
-	} else {
-		closed := min(absSteps(p.steps), o.Steps)
-		realized = o.Instrument.Notional(closed, price.Sub(p.average))
-		if p.steps < 0 {
-			realized = realized.Neg()
-		}
-		if o.Steps > absSteps(p.steps) {
-			p.average = price
-		}
-	}
-	p.steps += delta
 	p.instrument = o.Instrument
+	realized, err := p.applyTrade(o.Side, EntryIntent, o.Steps, cost, fee)
+	if err != nil {
+		return SubmitReceipt{}, err
+	}
 	a.positions[o.Instrument.ID] = p
 	a.cash = a.cash.Add(tradeCash(o.Instrument, o.Side, cost, realized, fee))
 	allocated := make(map[StrategyID]bool)
@@ -290,6 +278,18 @@ func (a *PaperAdapter) fillLocked(o OrderIntent, price decimal.Decimal, nowMS, s
 	a.lastSourceAt = sourceMS
 	a.lastFill = FillReport{EventID: "paper-fill:" + o.ID, OrderID: o.ID, Steps: o.Steps, Fee: fee, Price: price, Cost: cost, AtMS: nowMS}
 	return SubmitReceipt{ExchangeID: "paper:" + o.ID, Fills: []FillReport{a.lastFill}}, nil
+}
+
+// applyTrade shares the ledger's exact basis and partial-close rounding rules.
+// The position remains unchanged if quantity validation fails.
+func (p *paperPosition) applyTrade(side OrderSide, kind IntentKind, steps int64, cost, fee decimal.Decimal) (decimal.Decimal, error) {
+	lot := VirtualLot{Instrument: p.instrument, SignedSteps: p.steps, CostBasis: p.costBasis}
+	realized, err := updateLot(&lot, side, kind, steps, cost, fee)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	p.steps, p.costBasis = lot.SignedSteps, lot.CostBasis
+	return realized, nil
 }
 
 // AdvanceQuote consumes only a subsequent visible top-of-book observation.

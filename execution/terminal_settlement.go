@@ -120,7 +120,8 @@ func (s *Store) ApplyTerminalSettlement(ctx context.Context, event TerminalSettl
 		if err != nil || !fresh {
 			return err
 		}
-		// Unsent conditional intents can otherwise become orders after retirement.
+		// Unsent intents only remain executable while both plan and intent are valid.
+		// Submitted orders are checked independently below, even after plan expiry.
 		var planBody string
 		planErr := tx.QueryRow(opReadLatestPlan, s.accountID).Scan(&planBody)
 		if planErr != nil && !errors.Is(planErr, sql.ErrNoRows) {
@@ -147,7 +148,7 @@ func (s *Store) ApplyTerminalSettlement(ctx context.Context, event TerminalSettl
 				if err := tx.QueryRow(opReadIntentFilled, s.accountID, string(declared.ID), s.accountID, string(declared.ID)).Scan(&filled); err != nil {
 					return err
 				}
-				if filled < current.QuantitySteps && current.State != Canceled && current.State != Expired && (current.Conditions.ExpiresAtMS == 0 || current.Conditions.ExpiresAtMS > event.AtMS) {
+				if plan.ExpiresMS > event.AtMS && filled < current.QuantitySteps && current.State != Canceled && current.State != Expired && (current.Conditions.ExpiresAtMS == 0 || current.Conditions.ExpiresAtMS > event.AtMS) {
 					return errors.New("execution: pending terminal intent blocks settlement")
 				}
 			}
@@ -210,6 +211,7 @@ func (s *Store) ApplyTerminalSettlement(ctx context.Context, event TerminalSettl
 			return errors.New("execution: terminal actual/attributed quantities do not reconcile")
 		}
 		payoff := event.CashValue
+		realizedTotal := decimal.Zero
 		settle := func(lot *VirtualLot, kind string) error {
 			steps := lot.SignedSteps
 			if steps == 0 {
@@ -240,6 +242,7 @@ func (s *Store) ApplyTerminalSettlement(ctx context.Context, event TerminalSettl
 			if err := s.addCash(tx, lot.Strategy, realized); err != nil {
 				return err
 			}
+			realizedTotal = realizedTotal.Add(realized)
 			return s.ledger(tx, LedgerEntry{EventID: id, Kind: kind, Strategy: lot.Strategy, Lot: lot.ID, QuantityDelta: -steps, CashDelta: realized, RealizedPnL: realized, AtMS: event.AtMS})
 		}
 		for _, lot := range lots {
@@ -272,6 +275,11 @@ func (s *Store) ApplyTerminalSettlement(ctx context.Context, event TerminalSettl
 		if err := s.writeActual(tx, actual); err != nil {
 			return err
 		}
+		// Internal crosses can leave attributed and actual cost bases different.
+		// Closing them must release the same cash bridge as an exchange fill.
+		if err := s.reclassify(tx, id, realizedTotal.Sub(realized), event.AtMS); err != nil {
+			return err
+		}
 		if err := s.ledger(tx, LedgerEntry{EventID: id, Kind: "RealAccountTerminalSettlement", QuantityDelta: -steps, CashDelta: realized, RealizedPnL: realized, AtMS: event.AtMS}); err != nil {
 			return err
 		}
@@ -298,25 +306,35 @@ func (a *PaperAdapter) ApplyTerminalSettlement(ctx context.Context, event Termin
 	if err := a.validateTerminalSettlementLocked(event); err != nil {
 		return false, err
 	}
-	return a.applyTerminalSettlementLocked(event), nil
+	return a.applyTerminalSettlementLocked(event)
 }
 
-func (a *PaperAdapter) applyTerminalSettlementLocked(event TerminalSettlement) bool {
+func (a *PaperAdapter) applyTerminalSettlementLocked(event TerminalSettlement) (bool, error) {
 	id, body := event.identity()
 	if _, ok := a.terminalSettlements[id]; ok {
-		return false
+		return false, nil
+	}
+	p := a.positions[event.Instrument.ID]
+	realized := decimal.Zero
+	if p.steps != 0 {
+		side := Sell
+		if p.steps < 0 {
+			side = Buy
+		}
+		var err error
+		realized, err = p.applyTrade(side, ExitIntent, absSteps(p.steps), event.Instrument.Notional(absSteps(p.steps), event.CashValue), decimal.Zero)
+		if err != nil {
+			return false, err
+		}
 	}
 	if a.terminalSettlements == nil {
 		a.terminalSettlements = map[string]string{}
 	}
-	p := a.positions[event.Instrument.ID]
-	a.cash = a.cash.Add(event.Instrument.Notional(p.steps, event.CashValue.Sub(p.average)))
-	p.steps = 0
-	p.average = decimal.Zero
+	a.cash = a.cash.Add(realized)
 	p.instrument = event.Instrument
 	a.positions[event.Instrument.ID] = p
 	a.terminalSettlements[id] = body
-	return true
+	return true, nil
 }
 
 // ApplyTerminalSettlement owns the ledger and paper mutation under the same account
@@ -356,8 +374,8 @@ func (b *SharedAccountBorrow) ApplyTerminalSettlement(event TerminalSettlement) 
 			if err != nil || !applied {
 				return err
 			}
-			paper.applyTerminalSettlementLocked(event)
-			return nil
+			_, err = paper.applyTerminalSettlementLocked(event)
+			return err
 		})
 	})
 	if err == nil && applied {

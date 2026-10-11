@@ -70,9 +70,9 @@ func validatePlanReservation(snapshot AccountSnapshot, plan Plan, risk Portfolio
 			if !ok || !lot.Instrument.ValidMark(mark) {
 				return errors.New("execution: projected lot mark missing")
 			}
-			desiredGross[lot.Strategy] = desiredGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
-			previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
-			strategyCollateral[lot.Strategy] = strategyCollateral[lot.Strategy].Add(lot.Instrument.Collateral(lot.SignedSteps, mark, risk.MarginRate))
+			desiredGross[lot.Strategy] = desiredGross[lot.Strategy].Add(lot.riskGross(mark))
+			previousGross[lot.Strategy] = previousGross[lot.Strategy].Add(lot.riskGross(mark))
+			strategyCollateral[lot.Strategy] = strategyCollateral[lot.Strategy].Add(lot.collateral(mark, risk.MarginRate))
 			instruments[lot.Instrument.ID] = lot.Instrument
 		}
 	}
@@ -120,8 +120,10 @@ func validatePlanReservation(snapshot AccountSnapshot, plan Plan, risk Portfolio
 			desiredNet[id] = n
 		}
 	}
+	reservedMargin := make(map[string]decimal.Decimal)
 	for _, position := range reservedPositions {
 		if !changed[position.Instrument.ID] {
+			reservedMargin[position.Instrument.ID] = position.collateral(risk.Marks[position.Instrument.ID], risk.MarginRate)
 			desiredNet[position.Instrument.ID] = position.SignedSteps
 			currentNet[position.Instrument.ID] = position.SignedSteps
 		}
@@ -132,8 +134,13 @@ func validatePlanReservation(snapshot AccountSnapshot, plan Plan, risk Portfolio
 		if !ok || !instrument.ValidMark(mark) {
 			return errors.New("execution: account margin mark missing")
 		}
-		desiredMargin = desiredMargin.Add(instrument.Collateral(desiredNet[id], mark, risk.MarginRate))
-		currentMargin = currentMargin.Add(instrument.Collateral(currentNet[id], mark, risk.MarginRate))
+		if amount, ok := reservedMargin[id]; ok {
+			desiredMargin = desiredMargin.Add(amount)
+			currentMargin = currentMargin.Add(amount)
+		} else {
+			desiredMargin = desiredMargin.Add(instrument.Collateral(desiredNet[id], mark, risk.MarginRate))
+			currentMargin = currentMargin.Add(instrument.Collateral(currentNet[id], mark, risk.MarginRate))
+		}
 	}
 	for strategy, amount := range desiredGross {
 		limit, ok := risk.StrategyGrossLimits[strategy]
