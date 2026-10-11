@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -184,6 +185,10 @@ func init() {
 			dec.DisallowUnknownFields()
 			if err := dec.Decode(&t); err != nil {
 				return nil, err
+			}
+			var extra any
+			if err := dec.Decode(&extra); err != io.EOF {
+				return nil, errors.New("research: linear model parameters contain trailing JSON")
 			}
 		}
 		if !finiteValues(t.Ridge) || t.Ridge < 0 {

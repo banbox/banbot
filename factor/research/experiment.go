@@ -330,7 +330,7 @@ func SelectParameters(observations []ParameterObservation, spec ParameterSelecti
 		if row.BeginAt < spec.TrainStart || row.EndAt > spec.TrainEnd || row.AvailableAt > spec.AvailableAt {
 			continue
 		}
-		if row.SID <= 0 || row.Candidate == "" || row.EndAt <= row.BeginAt || row.AvailableAt <= 0 || !finiteValues(row.NetReturn) {
+		if row.SID <= 0 || row.Candidate == "" || row.EndAt <= row.BeginAt || row.AvailableAt < row.EndAt || !finiteValues(row.NetReturn) {
 			return ParameterArtifact{}, errors.New("research: invalid parameter observation")
 		}
 		global[row.Candidate] = append(global[row.Candidate], row)

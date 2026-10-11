@@ -62,22 +62,20 @@ func correlation(points []pair, rank bool) factor.Numeric {
 	}
 	xs, ys := make([]float64, len(points)), make([]float64, len(points))
 	for i, p := range points {
+		if !finiteValues(p.x, p.y) {
+			return invalid()
+		}
 		xs[i], ys[i] = p.x, p.y
 	}
 	if rank {
 		xs = ranks(xs)
 		ys = ranks(ys)
 	}
-	mx, my := 0.0, 0.0
-	for i := range xs {
-		mx += xs[i]
-		my += ys[i]
-	}
-	mx /= float64(len(xs))
-	my /= float64(len(ys))
+	centerScaled(xs)
+	centerScaled(ys)
 	vx, vy, c := 0.0, 0.0, 0.0
 	for i := range xs {
-		dx, dy := xs[i]-mx, ys[i]-my
+		dx, dy := xs[i], ys[i]
 		vx += dx * dx
 		vy += dy * dy
 		c += dx * dy
@@ -85,7 +83,11 @@ func correlation(points []pair, rank bool) factor.Numeric {
 	if vx == 0 || vy == 0 {
 		return invalid()
 	}
-	return factor.Numeric{Value: max(-1, min(1, c/math.Sqrt(vx*vy))), Validity: factor.Valid}
+	value := c / math.Sqrt(vx) / math.Sqrt(vy)
+	if !finiteValues(value) {
+		return invalid()
+	}
+	return factor.Numeric{Value: max(-1, min(1, value)), Validity: factor.Valid}
 }
 func ranks(values []float64) []float64 {
 	order := make([]int, len(values))
@@ -155,7 +157,7 @@ func Evaluate(frame factor.Frame, universe factor.Universe, labels []Label, spec
 	byLabel := make(map[string]map[int32]factor.Numeric)
 	labelKinds := make(map[string]LabelKind)
 	for _, label := range labels {
-		if label.Name == "" || label.SID <= 0 || label.DecisionTime <= 0 || label.BeginAt < label.DecisionTime || label.EndAt <= label.BeginAt || label.MatureAt < label.EndAt || label.AvailableAt <= 0 || (label.Kind != ExecutableReturn && label.Kind != CloseToClose) || (label.Kind == ExecutableReturn && label.BeginAt <= label.DecisionTime) || (label.Kind == CloseToClose && label.BeginAt != label.DecisionTime) {
+		if label.Name == "" || label.SID <= 0 || label.DecisionTime <= 0 || label.BeginAt < label.DecisionTime || label.EndAt <= label.BeginAt || label.MatureAt < label.EndAt || label.AvailableAt <= 0 || (label.Resolved && label.AvailableAt < label.MatureAt) || (label.Kind != ExecutableReturn && label.Kind != CloseToClose) || (label.Kind == ExecutableReturn && label.BeginAt <= label.DecisionTime) || (label.Kind == CloseToClose && label.BeginAt != label.DecisionTime) {
 			return Report{}, errors.New("research: invalid diagnostic label chronology")
 		}
 		if label.Resolved && label.DecisionTime == frame.DecisionTime && label.MatureAt <= spec.AsOf && label.AvailableAt <= spec.AsOf {

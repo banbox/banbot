@@ -379,9 +379,9 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 			return nil, err
 		}
 		if e.text == "group.demean" {
-			return factor.GroupDemean(a, field.Spec.Source, field.Spec.Field, field.Spec.SourceTimeFrame), nil
+			return factor.GroupDemeanByField(a, field), nil
 		}
-		return factor.GroupZScore(a, field.Spec.Source, field.Spec.Field, field.Spec.SourceTimeFrame), nil
+		return factor.GroupZScoreByField(a, field), nil
 	}
 	switch e.text {
 	case "positive":

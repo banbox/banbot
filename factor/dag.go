@@ -120,8 +120,13 @@ func Quantile(input *Node, q float64) *Node {
 	n.Spec.Parameters["q"] = q
 	return n
 }
+
+// GroupDemean samples the latest classification without an age limit for
+// compatibility. Use GroupDemeanByField to declare an explicit sampling contract.
 func GroupDemean(input *Node, source, field string, sourceTimeFrame ...string) *Node {
 	n := node("group-demean", GROUP, input)
+	n.Spec.AvailabilityPolicy = "asof-latest"
+	n.Spec.SamplingPolicy = "decision-grid"
 	n.Spec.Source = source
 	n.Spec.GroupField = field
 	if len(sourceTimeFrame) > 0 {
@@ -129,13 +134,55 @@ func GroupDemean(input *Node, source, field string, sourceTimeFrame ...string) *
 	}
 	return n
 }
+
+// GroupZScore retains the same unlimited-age latest contract as GroupDemean.
 func GroupZScore(input *Node, source, field string, sourceTimeFrame ...string) *Node {
 	n := node("group-zscore", GROUP, input)
+	n.Spec.AvailabilityPolicy = "asof-latest"
+	n.Spec.SamplingPolicy = "decision-grid"
 	n.Spec.Source = source
 	n.Spec.GroupField = field
 	if len(sourceTimeFrame) > 0 {
 		n.Spec.SourceTimeFrame = sourceTimeFrame[0]
 	}
+	return n
+}
+
+// GroupDemeanByField preserves the raw classification field's sampling contract.
+// The field is a declaration, not a numeric dependency: string and NULL values
+// continue to come directly from Snapshot.Values. Unlike GroupDemean's legacy
+// latest-value default, Field requires a current closed event and AsOfField
+// enforces its declared max age.
+func GroupDemeanByField(input, field *Node) *Node {
+	return groupByField("group-demean", input, field)
+}
+
+// GroupZScoreByField uses the same raw classification contract as GroupDemeanByField.
+func GroupZScoreByField(input, field *Node) *Node {
+	return groupByField("group-zscore", input, field)
+}
+
+func groupByField(operator string, input, field *Node) *Node {
+	n := node(operator, GROUP, input)
+	if field == nil {
+		return n // Compile reports the missing classification declaration.
+	}
+	spec := field.Spec
+	if spec.SourceTimeFrame == "" {
+		spec.SourceTimeFrame = spec.TimeFrame
+	}
+	if spec.Operator != "field" || spec.TimeFrame != n.Spec.TimeFrame {
+		return n
+	}
+	if err := validateNode(spec, len(field.Inputs), field.Evaluate != nil); err != nil {
+		return n
+	}
+	n.Spec.Source = spec.Source
+	n.Spec.SourceTimeFrame = spec.SourceTimeFrame
+	n.Spec.GroupField = spec.Field
+	n.Spec.AvailabilityPolicy = spec.AvailabilityPolicy
+	n.Spec.SamplingPolicy = spec.SamplingPolicy
+	n.Spec.MaxAge = spec.MaxAge
 	return n
 }
 func Residual(y, x *Node) *Node { return node("residual", GROUP, y, x) }
@@ -214,7 +261,7 @@ func (p *Plan) Inputs() []InputSpec {
 		key := node.spec.Source + "\x00" + node.spec.SourceTimeFrame
 		input := inputs[key]
 		if input == nil {
-			input = &InputSpec{Source: node.spec.Source, TimeFrame: node.spec.SourceTimeFrame, AsOfLatest: node.spec.Operator != "field" || node.spec.AvailabilityPolicy == "asof-latest", MaxAge: node.spec.MaxAge}
+			input = &InputSpec{Source: node.spec.Source, TimeFrame: node.spec.SourceTimeFrame, AsOfLatest: node.spec.AvailabilityPolicy == "asof-latest", MaxAge: node.spec.MaxAge}
 			inputs[key] = input
 		}
 		field := node.spec.Field
@@ -224,9 +271,9 @@ func (p *Plan) Inputs() []InputSpec {
 		input.Fields = append(input.Fields, field)
 		if node.spec.Operator == "field" {
 			input.WarmupLength = max(input.WarmupLength, p.warmup)
-			if node.spec.AvailabilityPolicy != "asof-latest" {
-				input.AsOfLatest = false
-			}
+		}
+		if node.spec.AvailabilityPolicy != "asof-latest" {
+			input.AsOfLatest = false
 		}
 		if input.MaxAge == 0 || (node.spec.MaxAge > 0 && node.spec.MaxAge < input.MaxAge) {
 			input.MaxAge = node.spec.MaxAge
@@ -367,10 +414,13 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 	if spec.SamplingPolicy != "source-events" && spec.SamplingPolicy != "decision-grid" {
 		return errors.New("factor: explicit sampling policy required")
 	}
-	if spec.AvailabilityPolicy == "asof-latest" && (spec.SamplingPolicy != "decision-grid" || spec.MaxAge <= 0) {
-		return errors.New("factor: asof numeric source requires decision-grid sampling and positive max age")
+	groupField := spec.Operator == "group-demean" || spec.Operator == "group-zscore"
+	// Legacy Go group builders permit unlimited-age latest classifications.
+	// Explicit ByField builders validate the Field contract before copying it.
+	if spec.AvailabilityPolicy == "asof-latest" && (spec.SamplingPolicy != "decision-grid" || spec.MaxAge < 0 || (spec.MaxAge == 0 && !groupField)) {
+		return errors.New("factor: asof source requires decision-grid sampling and positive max age (legacy groups permit zero)")
 	}
-	if spec.Operator == "field" && spec.SourceTimeFrame != spec.TimeFrame && spec.AvailabilityPolicy != "asof-latest" {
+	if (spec.Operator == "field" || groupField) && spec.SourceTimeFrame != spec.TimeFrame && spec.AvailabilityPolicy != "asof-latest" {
 		return errors.New("factor: mixed source timeframe requires explicit asof sampling")
 	}
 	if spec.Kind != TS && spec.Kind != CS && spec.Kind != GROUP {

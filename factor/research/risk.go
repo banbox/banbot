@@ -13,39 +13,49 @@ type CovarianceEstimate struct {
 
 // EstimateCovariance expects time rows with a stable declared asset order.
 // Invalid rows are rejected instead of silently changing the fitted universe.
+// Covariance outside float64 range is rejected rather than reporting infinite
+// risk or underflowing a nonzero variance to a risk-free asset.
 func EstimateCovariance(returns [][]float64, shrinkage float64, diagonal bool) (CovarianceEstimate, error) {
 	if len(returns) < 2 || len(returns[0]) == 0 || !finiteValues(shrinkage) || shrinkage < 0 || shrinkage > 1 {
 		return CovarianceEstimate{}, errors.New("research: invalid covariance inputs")
 	}
 	p := len(returns[0])
-	means := make([]float64, p)
 	for _, row := range returns {
 		if len(row) != p || !finiteValues(row...) {
 			return CovarianceEstimate{}, errors.New("research: invalid covariance row")
 		}
-		for j, v := range row {
-			means[j] += v / float64(len(returns))
+	}
+	columns := make([][]float64, p)
+	exponents := make([]int, p)
+	for j := range columns {
+		columns[j] = make([]float64, len(returns))
+		for i, row := range returns {
+			columns[j][i] = row[j]
 		}
+		exponents[j] = centerScaled(columns[j])
 	}
 	matrix := make([][]float64, p)
 	for i := range matrix {
 		matrix[i] = make([]float64, p)
 	}
-	for _, row := range returns {
-		for i := range row {
-			for j := 0; j <= i; j++ {
-				matrix[i][j] += (row[i] - means[i]) * (row[j] - means[j]) / float64(len(returns)-1)
-			}
-		}
-	}
 	for i := range matrix {
-		for j := 0; j < i; j++ {
-			if diagonal {
-				matrix[i][j] = 0
-			} else {
-				matrix[i][j] *= 1 - shrinkage
+		for j := 0; j <= i; j++ {
+			if i != j && (diagonal || shrinkage == 1) {
+				continue
 			}
-			matrix[j][i] = matrix[i][j]
+			sum := 0.0
+			for k, v := range columns[i] {
+				sum += v * columns[j][k]
+			}
+			value := sum / float64(len(returns)-1)
+			if i != j {
+				value *= 1 - shrinkage
+			}
+			cov := math.Ldexp(value, exponents[i]+exponents[j])
+			if !finiteValues(cov) || (cov == 0 && value != 0) {
+				return CovarianceEstimate{}, errors.New("research: covariance not representable")
+			}
+			matrix[i][j], matrix[j][i] = cov, cov
 		}
 	}
 	if diagonal {

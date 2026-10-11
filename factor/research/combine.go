@@ -72,24 +72,25 @@ func (h *ICHistory) Add(asof int64, sample ICSample) error {
 	if _, declared := h.samples[sample.Column]; !declared {
 		return errors.New("research: undeclared IC column")
 	}
-	if sample.Column == "" || sample.Label != h.label || sample.DecisionTime <= 0 || sample.MatureAt <= sample.DecisionTime || sample.AvailableAt <= 0 || sample.Samples < 2 {
+	if sample.Column == "" || sample.Label != h.label || sample.DecisionTime <= 0 || sample.MatureAt <= sample.DecisionTime || sample.AvailableAt < sample.MatureAt || sample.Samples < 2 {
 		return errors.New("research: invalid IC sample identity/maturity")
 	}
 	if sample.MatureAt > asof || sample.AvailableAt > asof || sample.DecisionTime >= asof {
 		return errors.New("research: IC sample is not matured and visible at decision")
 	}
-	h.lastAsOf = asof
-	if !valid(sample.IC) && !valid(sample.RankIC) {
-		return nil
-	}
 	rows := h.samples[sample.Column]
 	for _, old := range rows {
 		if old.DecisionTime == sample.DecisionTime {
-			if old != sample {
+			if !sameICSample(old, sample) {
 				return errors.New("research: conflicting IC cross section")
 			}
+			h.lastAsOf = asof
 			return nil
 		}
+	}
+	if !valid(sample.IC) && !valid(sample.RankIC) {
+		h.lastAsOf = asof
+		return nil
 	}
 	rows = append(rows, sample)
 	sort.Slice(rows, func(i, j int) bool { return rows[i].DecisionTime < rows[j].DecisionTime })
@@ -97,8 +98,22 @@ func (h *ICHistory) Add(asof int64, sample ICSample) error {
 		rows = slices.Clone(rows[len(rows)-h.window:])
 	}
 	h.samples[sample.Column] = rows
+	h.lastAsOf = asof
 	return nil
 }
+
+func sameICSample(a, b ICSample) bool {
+	return a.Column == b.Column && a.Label == b.Label && a.DecisionTime == b.DecisionTime &&
+		a.MatureAt == b.MatureAt && a.AvailableAt == b.AvailableAt && a.Samples == b.Samples &&
+		sameICNumeric(a.IC, b.IC) && sameICNumeric(a.RankIC, b.RankIC)
+}
+
+func sameICNumeric(a, b factor.Numeric) bool {
+	// Invalid derived values carry a reason, not a numeric payload. Keep reasons
+	// distinct while allowing NaN sentinels to survive idempotent redelivery.
+	return a.Validity == b.Validity && (a.Validity != factor.Valid || a.Value == b.Value || (math.IsNaN(a.Value) && math.IsNaN(b.Value)))
+}
+
 func IsHistoryMethod(method ComboMethod) bool {
 	return method == HistoryIC || method == HistoryRankIC || method == HistoryICIR || method == HistoryRankICIR || method == HistoryEWMA
 }

@@ -289,15 +289,15 @@ func (p *Plan) snapshotIdentity(snapshot *Snapshot) (string, error) {
 			if !expected[key] {
 				return "", fmt.Errorf("factor: active stream %d/%s/%s absent from declared barrier", sid, node.spec.Source, node.spec.SourceTimeFrame)
 			}
-			if node.spec.Operator == "field" && node.spec.AvailabilityPolicy == "asof-latest" {
+			if node.spec.AvailabilityPolicy == "asof-latest" {
 				row := snapshot.rows[key]
-				if row.EventTime > snapshot.spec.GridTime || snapshot.spec.GridTime-row.EventTime > node.spec.MaxAge {
+				if row.EventTime > snapshot.spec.GridTime || (node.spec.MaxAge > 0 && snapshot.spec.GridTime-row.EventTime > node.spec.MaxAge) {
 					return "", fmt.Errorf("factor: asof stream %d/%s exceeds declared max age", sid, node.spec.Source)
 				}
-			} else if node.spec.Operator == "field" {
+			} else {
 				row := snapshot.rows[key]
 				if !row.Series.Closed || row.EventTime != snapshot.spec.GridTime {
-					return "", fmt.Errorf("factor: TS stream %d/%s lacks current closed event", sid, node.spec.Source)
+					return "", fmt.Errorf("factor: stream %d/%s lacks current closed event", sid, node.spec.Source)
 				}
 			}
 		}
