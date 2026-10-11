@@ -1,6 +1,6 @@
 # 组合策略、换仓与持仓生命周期
 
-适用于 `v0.6.0-beta.6`。因子公式见 [表达式指南](factor_expression_guide.md)，高级研究 API 见 [研究扩展](factor_research_extensions.md)，源码与回归对应见 [实施记录](factor_opt_implementation.md)。
+适用于 `v0.6.0-beta.9`。因子公式见 [表达式指南](factor_expression_guide.md)，高级研究 API 见 [研究扩展](factor_research_extensions.md)，源码与回归对应见 [实施记录](factor_opt_implementation.md)。
 
 ## 先区分三个周期
 
@@ -42,6 +42,8 @@ run_policy:
 | geometric | 每步按剩余份额比例退出 | ratio、final_threshold、basis |
 | target-step | 每步向新目标移动 alpha 比例 | alpha，取值 (0,1] |
 
+target-step 对新旧资产统一插值，新资产从零权重开始。例如旧仓权重为 1、下一轮完全换到新资产，alpha 为 0.1 时，下一步目标为旧仓 0.9、新仓 0.1；首次从空仓建仓也只分配理想目标的 0.1。最短持有期保护、强制退出及预算/风险约束仍优先，因此约束生效时最终目标可能偏离无约束插值。alpha 小于 1 的渐进退出可能长期保留小额尾仓，不等同于固定步数归零。
+
 quantity 锚定退出开始时的已确认标准资产数量并向零取整；价格和 NAV 上涨不会补回退出仓，外部风险已减得更低时继续保持更低数量。weight 锚定权重，每轮乘最新冻结 NAV，可能因净值变化形成数量回补。第 N 个线性目标显式为零；最低交易额、在途和部分成交可能延迟真正清仓。
 
 `holding.max_bars/max_duration` 在到期后第一个监控网格直接形成零目标，绕过调仓门与普通退出曲线；想“满期后才开始渐退”使用 min。缺 score 不推进普通退出步骤，但仍检查最大期限和批次到期。反手默认等待原方向实际归零，未知在途不被当作已释放资金。
@@ -64,6 +66,12 @@ gradual 每轮建立 1/8 预算的批次；seed-all 用当前排名一次建立�
 ## 选股、覆盖和配置校验
 
 `selection.long_k/short_k` 独立控制两侧，或使用 long_quantile/short_quantile。retain_rank 提供持仓排名缓冲，dropout 控制普通轮次替换数量，group_quota 使用调用者提供的可见分组。分位选择不要求旧 K；完整自定义 policy 不要求未使用的 K 或 side notional。显式旧 builder 继续校验自己的合同。
+
+long_k/short_k 是当轮选择数量，不是实际持仓总数上限。最短持有期保护和渐进退出会保留落选旧仓，因此实际非零持仓可能超过 K；当前没有 max_long_positions/max_short_positions 配置。降低 K 会同时缩小候选范围。若只需控制调仓金额，可使用 allocation.turnover_limit；它不限制持仓数量，强制风险退出仍绕过普通换手预算。
+
+默认存储回测使用固定标的池，快照要求 Reference 与 Investable 中每个标的的所有计划输入在当前网格有效。新上市、退市或历史缺口可能令整轮跳过；每个标的有大量历史行并不意味着各决策时刻都有完整覆盖。因子窗口跨数据页累积，无需令 page_rows 大于最长窗口。
+
+回测结果及 run-completed/run artifact 的 Result.IncompleteStreams 汇总每个失败流的 SID、Source、TimeFrame、Missing、Invalid、FirstGridTime 和 LastGridTime；Missing 表示没有可见记录，Invalid 表示已有记录但不满足所需时间、关闭状态或最大年龄。计数对应非预热阶段被跳过的决策网格，按流汇总而非逐轮保存。检查这些流的上市/退市时间、数据缺口和可见时间后再调整标的池；这些诊断不会改变严格快照语义。
 
 ```yaml
 holding:

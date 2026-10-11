@@ -564,7 +564,7 @@ func TestWaitForCompactWalAppliedPollsTablesMetrics(t *testing.T) {
 func TestWaitForCompactWalAppliedFallsBackWhenMetricsAreUnknown(t *testing.T) {
 	db := &scriptedCompactDB{rows: []pgx.Row{
 		scriptedRow{values: []any{int64(1000), int64(0), nil, nil, false}},
-		scriptedRow{values: []any{int64(12), int64(12), int64(0), false}},
+		scriptedRow{values: []any{int64(12), int64(12), false}},
 	}}
 	txn, err := waitForCompactWalApplied(context.Background(), db, "sranges_q")
 	if err != nil {
@@ -575,6 +575,80 @@ func TestWaitForCompactWalAppliedFallsBackWhenMetricsAreUnknown(t *testing.T) {
 	}
 	if !strings.Contains(db.querySQL[1], "FROM wal_tables()") {
 		t.Fatalf("expected wal_tables fallback query, got %q", db.querySQL[1])
+	}
+}
+
+func TestCompactWalFallbackUsesSupportedColumns(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		writer    int64
+		suspended bool
+		applied   bool
+	}{
+		{"pending", 9, false, false},
+		{"applied", 10, false, true},
+		{"writer ahead", 11, false, false},
+		{"suspended at equal transaction", 10, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := &scriptedCompactDB{queryRowFn: func(sql string, args ...any) pgx.Row {
+				if strings.Contains(sql, "writerLagTxnCount") {
+					return scriptedRow{err: errors.New("Invalid column: writerLagTxnCount")}
+				}
+				if !strings.HasPrefix(sql, "SELECT sequencerTxn, writerTxn, suspended") || len(args) != 1 || args[0] != "sranges_q" {
+					t.Fatalf("unexpected fallback query: %s args=%v", sql, args)
+				}
+				return scriptedRow{values: []any{int64(10), tc.writer, tc.suspended}}
+			}}
+			txn, applied, suspended, err := queryCompactWalFallback(context.Background(), db, "sranges_q")
+			if err != nil || txn != 10 || applied != tc.applied || suspended != tc.suspended {
+				t.Fatalf("WAL result: txn=%d applied=%v suspended=%v err=%v", txn, applied, suspended, err)
+			}
+		})
+	}
+}
+
+func TestWaitForCompactWalFallbackPollsAndRejectsUnsafeState(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		writers   []int64
+		suspended bool
+		wantError string
+	}{
+		{"pending then applied", []int64{9, 10}, false, ""},
+		{"pending timeout", []int64{9, 9}, false, "timeout"},
+		{"writer ahead timeout", []int64{11, 11}, false, "timeout"},
+		{"suspended", []int64{10}, true, "suspended"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installCompactWaitScript(t, len(tc.writers))
+			db := &scriptedCompactDB{}
+			for _, writer := range tc.writers {
+				db.rows = append(db.rows,
+					scriptedRow{values: []any{int64(1000), int64(0), nil, nil, false}},
+					scriptedRow{values: []any{int64(10), writer, tc.suspended}})
+			}
+			txn, err := waitForCompactWalAppliedAtRoot(context.Background(), db, "sranges_q", t.TempDir())
+			if tc.wantError == "" {
+				if err != nil || txn != 10 {
+					t.Fatalf("WAL catchup: txn=%d err=%v", txn, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("expected %s error, got %v", tc.wantError, err)
+			}
+			if db.queryCount() != len(tc.writers)*2 || db.execCount() != 0 {
+				t.Fatalf("unsafe WAL handling: queries=%d writes=%d", db.queryCount(), db.execCount())
+			}
+		})
+	}
+}
+
+func TestCompactWalFallbackPropagatesQueryError(t *testing.T) {
+	want := errors.New("WAL catalog unavailable")
+	db := &scriptedCompactDB{rows: []pgx.Row{scriptedRow{err: want}}}
+	_, applied, suspended, err := queryCompactWalFallback(context.Background(), db, "sranges_q")
+	if !errors.Is(err, want) || applied || suspended {
+		t.Fatalf("unexpected failed query result: applied=%v suspended=%v err=%v", applied, suspended, err)
 	}
 }
 

@@ -209,12 +209,25 @@ func TestBarrierIncompleteNeverProducesFrame(t *testing.T) {
 	}
 	if _, err := barrier.Compute(token, owner, func() int64 { return 1000 }); !errors.Is(err, ErrSnapshotIncomplete) {
 		t.Fatalf("partial reference computed: %v", err)
+	} else {
+		var incomplete *SnapshotIncompleteError
+		if !errors.As(err, &incomplete) || len(incomplete.Status.Expected) != 2 || len(incomplete.Status.Arrived) != 1 || len(incomplete.Status.Invalid) != 0 {
+			t.Fatalf("incomplete error lacks stream status: %v", err)
+		}
+		incomplete.Status.Expected[0].SID = 99
 	}
 	if _, ok := barrier.Latest(); ok {
 		t.Fatal("incomplete frame published")
 	}
 	if len(owner.Updates()) != 0 {
 		t.Fatal("partial round advanced owner")
+	}
+	row, _ = base.Row(2, "prices", "1h")
+	if err := barrier.Observe(token, row, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := barrier.Compute(token, owner, func() int64 { return 1000 }); err != nil {
+		t.Fatalf("diagnostics mutated the round or prevented complete retry: %v", err)
 	}
 }
 

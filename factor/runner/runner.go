@@ -104,7 +104,8 @@ type Result struct {
 	Manifest                                                           research.ManifestSpec
 	NodeCount, MaxRawRecords, MaxPendingEvaluations, MaxRetainedValues int
 	NodeUpdates                                                        map[string]uint64
-	UnresolvedByHorizon                                                map[string]int `json:",omitempty"`
+	UnresolvedByHorizon                                                map[string]int     `json:",omitempty"`
+	IncompleteStreams                                                  []IncompleteStream `json:",omitempty"`
 }
 type evaluation struct {
 	label             research.LabelSpec
@@ -120,7 +121,18 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	c.Snapshot = factor.CloneSnapshotSpec(c.Snapshot)
 	c.Snapshot.TrackedQuotesOnly = true
 	inputDigest := sha256.New()
+	incompleteIndexes := make(map[factor.StreamKey]int)
 	defer func() {
+		sort.Slice(result.IncompleteStreams, func(i, j int) bool {
+			a, b := result.IncompleteStreams[i].StreamKey, result.IncompleteStreams[j].StreamKey
+			if a.SID != b.SID {
+				return a.SID < b.SID
+			}
+			if a.Source != b.Source {
+				return a.Source < b.Source
+			}
+			return a.TimeFrame < b.TimeFrame
+		})
 		if c.HistoricalInput != nil && result.Manifest.Currency != "" {
 			ref := research.SnapshotReference{ID: c.HistoricalInput.Identity(), AdjustmentVersion: c.Snapshot.AdjustmentVersion, Schemas: c.Snapshot.Schemas, SourceVersions: c.Snapshot.SourceVersions}
 			if runErr == nil {
@@ -702,6 +714,10 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if errors.Is(err, factor.ErrSnapshotIncomplete) {
 				if !decisionWarming {
 					result.Incomplete++
+					var incomplete *factor.SnapshotIncompleteError
+					if errors.As(err, &incomplete) {
+						recordIncompleteStreams(&result, incompleteIndexes, incomplete.Status, grid)
+					}
 					if policy != nil {
 						evidence, evidenceErr := policyEvidence(ctx, sink, book, now)
 						if evidenceErr != nil {

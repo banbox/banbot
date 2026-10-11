@@ -3,6 +3,7 @@ package factor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -11,6 +12,18 @@ var (
 	ErrRoundExpired = errors.New("factor: decision round expired")
 	ErrRoundFrozen  = errors.New("factor: round already frozen")
 )
+
+// SnapshotIncompleteError describes the rejected round without admitting a
+// partial snapshot. Status owns its slices; changing it cannot affect retries.
+type SnapshotIncompleteError struct {
+	Status SnapshotStatus
+}
+
+func (e *SnapshotIncompleteError) Error() string {
+	return fmt.Sprintf("%s: expected=%d arrived=%d invalid=%d", ErrSnapshotIncomplete, len(e.Status.Expected), len(e.Status.Arrived), len(e.Status.Invalid))
+}
+
+func (e *SnapshotIncompleteError) Unwrap() error { return ErrSnapshotIncomplete }
 
 type RoundKey struct {
 	GridTime        int64
@@ -181,7 +194,7 @@ func (b *RoundBarrier) Freeze(token RoundToken, nowMS int64) (*Snapshot, error) 
 		return nil, err
 	}
 	if !snapshot.status.Ready {
-		return nil, ErrSnapshotIncomplete
+		return nil, &SnapshotIncompleteError{Status: snapshot.Status()}
 	}
 	round.snapshot = snapshot
 	return snapshot, nil

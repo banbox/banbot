@@ -93,8 +93,8 @@ func metadataTestQueryRow(sql string) (pgx.Row, bool) {
 	if strings.HasPrefix(sql, "SELECT coalesce(cast(max(ts) as long), 0) FROM") {
 		return scriptedRow{values: []any{int64(0)}}, true
 	}
-	if strings.HasPrefix(sql, "SELECT sequencerTxn, writerTxn, writerLagTxnCount, suspended") {
-		return scriptedRow{values: []any{int64(0), int64(0), int64(0), false}}, true
+	if strings.HasPrefix(sql, "SELECT sequencerTxn, writerTxn, suspended") {
+		return scriptedRow{values: []any{int64(0), int64(0), false}}, true
 	}
 	return nil, false
 }
@@ -242,7 +242,7 @@ func TestQuestMetadataInitialSeedWaitsForOldWALAndReadsMaxOnce(t *testing.T) {
 			if walReads > 1 {
 				writer = 5
 			}
-			return scriptedRow{values: []any{int64(5), writer, int64(0), false}}
+			return scriptedRow{values: []any{int64(5), writer, false}}
 		}
 		maxReads++
 		if walReads != 2 {
@@ -277,7 +277,7 @@ func TestQuestMetadataInitialSeedTimeoutPreventsInsert(t *testing.T) {
 			if !strings.Contains(sql, "wal_tables()") {
 				t.Errorf("seed read incomplete WAL snapshot: %s", sql)
 			}
-			return scriptedRow{values: []any{int64(5), int64(4), int64(1), false}}
+			return scriptedRow{values: []any{int64(5), int64(4), false}}
 		},
 	}
 	_, err := New(db).AddCalendars(context.Background(), []AddCalendarsParams{{Name: "test", StartMs: 1, StopMs: 2}})
@@ -289,7 +289,7 @@ func TestQuestMetadataInitialSeedTimeoutPreventsInsert(t *testing.T) {
 	}
 	db.read = func(sql string, _ ...any) pgx.Row {
 		if strings.Contains(sql, "wal_tables()") {
-			return scriptedRow{values: []any{int64(5), int64(5), int64(0), false}}
+			return scriptedRow{values: []any{int64(5), int64(5), false}}
 		}
 		return scriptedRow{values: []any{time.Now().UnixMicro()}}
 	}
@@ -300,18 +300,53 @@ func TestQuestMetadataInitialSeedTimeoutPreventsInsert(t *testing.T) {
 
 func TestQuestMetadataInitialSeedRejectsSuspendedWAL(t *testing.T) {
 	installMetadataVersionTestRoot(t)
-	db := &metadataSeedDB{read: func(sql string, _ ...any) pgx.Row {
+	oldQuest := IsQuestDB
+	IsQuestDB = true
+	t.Cleanup(func() { IsQuestDB = oldQuest })
+	writes := 0
+	db := &metadataSeedDB{visibilityDBStub: visibilityDBStub{exec: func(string, ...any) (pgconn.CommandTag, error) {
+		writes++
+		return pgconn.CommandTag{}, nil
+	}}, read: func(sql string, _ ...any) pgx.Row {
 		if !strings.Contains(sql, "wal_tables()") {
 			t.Errorf("read max from suspended metadata WAL: %s", sql)
 		}
-		return scriptedRow{values: []any{int64(5), int64(4), int64(1), true}}
+		return scriptedRow{values: []any{int64(5), int64(5), true}}
 	}}
-	_, err := New(db).reserveMetadataVersions(context.Background(), "calendars_q", 1, time.Time{})
-	if err == nil || !strings.Contains(err.Error(), "suspended") {
-		t.Fatalf("suspended metadata WAL accepted: %v", err)
+	_, err := New(db).AddCalendars(context.Background(), []AddCalendarsParams{{Name: "test", StartMs: 1, StopMs: 2}})
+	if err == nil || !strings.Contains(err.Error(), "suspended") || writes != 0 {
+		t.Fatalf("suspended metadata WAL accepted: err=%v writes=%d", err, writes)
 	}
 	if _, err := os.Stat(filepath.Join(compactProcessLockRootFn(), "metadata_calendars_q.version")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("suspended snapshot published highwater: %v", err)
+	}
+}
+
+func TestQuestMetadataInitialSeedQueryErrorPreventsInsert(t *testing.T) {
+	installMetadataVersionTestRoot(t)
+	oldQuest := IsQuestDB
+	IsQuestDB = true
+	t.Cleanup(func() { IsQuestDB = oldQuest })
+	want := errors.New("WAL catalog unavailable")
+	writes := 0
+	db := &metadataSeedDB{
+		visibilityDBStub: visibilityDBStub{exec: func(string, ...any) (pgconn.CommandTag, error) {
+			writes++
+			return pgconn.CommandTag{}, nil
+		}},
+		read: func(sql string, _ ...any) pgx.Row {
+			if !strings.Contains(sql, "wal_tables()") {
+				t.Errorf("read metadata seed after failed WAL query: %s", sql)
+			}
+			return scriptedRow{err: want}
+		},
+	}
+	_, err := New(db).AddCalendars(context.Background(), []AddCalendarsParams{{Name: "test", StartMs: 1, StopMs: 2}})
+	if !errors.Is(err, want) || writes != 0 {
+		t.Fatalf("failed WAL query result: err=%v writes=%d", err, writes)
+	}
+	if _, err := os.Stat(filepath.Join(compactProcessLockRootFn(), "metadata_calendars_q.version")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed WAL query published highwater: %v", err)
 	}
 }
 

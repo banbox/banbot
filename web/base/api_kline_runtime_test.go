@@ -50,15 +50,15 @@ func runtimeKlineDownloadSQL(backend *pgproto3.Backend, sql string) bool {
 			}
 			fields = append(fields, pgproto3.FieldDescription{Name: []byte(name), DataTypeOID: oid, DataTypeSize: -1})
 		}
-	case sql == "SELECT sequencerTxn, writerTxn, writerLagTxnCount, suspended FROM wal_tables() WHERE name = 'ins_kline_q'":
-		for i, name := range []string{"sequencerTxn", "writerTxn", "writerLagTxnCount", "suspended"} {
+	case sql == "SELECT sequencerTxn, writerTxn, suspended FROM wal_tables() WHERE name = 'ins_kline_q'":
+		for i, name := range []string{"sequencerTxn", "writerTxn", "suspended"} {
 			oid := uint32(20)
-			if i == 3 {
+			if i == 2 {
 				oid = 16
 			}
 			fields = append(fields, pgproto3.FieldDescription{Name: []byte(name), DataTypeOID: oid, DataTypeSize: -1})
 		}
-		values = [][]byte{[]byte("0"), []byte("0"), []byte("0"), []byte("f")}
+		values = [][]byte{[]byte("0"), []byte("0"), []byte("f")}
 	case sql == `SELECT coalesce(cast(max(ts) as long), 0) FROM "ins_kline_q"`:
 		fields = []pgproto3.FieldDescription{{Name: []byte("coalesce"), DataTypeOID: 20, DataTypeSize: 8}}
 		values = [][]byte{[]byte("0")}
