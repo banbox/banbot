@@ -379,6 +379,8 @@
     "load_more": "Load More",
     "sharpe_ratio": "Sharpe Ratio",
     "sortino_ratio": "Sortino Ratio",
+    "ulcer_index": "Ulcer Index",
+    "ulcer_performance_index": "UPI",
     "max_drawdown": "Max Drawdown",
     "max_drawdown_short": "MDD",
     "win_rate": "Win Rate",

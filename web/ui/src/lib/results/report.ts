@@ -150,3 +150,8 @@ export function legacyMetric(
 	if (unified || value === undefined || !Number.isFinite(value)) return '-';
 	return (digits === undefined ? String(value) : value.toFixed(digits)) + suffix;
 }
+
+export function riskMetric(value: number | null | undefined, suffix = '', unavailable = false): string {
+	if (unavailable || value == null || !Number.isFinite(value)) return '--';
+	return value.toFixed(2) + suffix;
+}

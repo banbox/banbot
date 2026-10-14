@@ -379,6 +379,8 @@
   "load_more": "加载更多",
   "sharpe_ratio": "夏普比率",
   "sortino_ratio": "Sortino",
+  "ulcer_index": "溃疡指数",
+  "ulcer_performance_index": "UPI",
   "max_drawdown": "最大回撤",
   "max_drawdown_short": "最大回撤",
   "win_rate": "胜率",

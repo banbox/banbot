@@ -798,9 +798,10 @@ func CalcFilePerfsWithLogger(args *config.CmdArgs, logger *zap.Logger) *errs.Err
 	}
 	// calculate sharpe/sortino
 	type Col struct {
-		name string
-		data []decimal.Decimal
-		raw  []string
+		name            string
+		data            []decimal.Decimal
+		raw             []string
+		ulcerIndex, upi *float64
 	}
 	var items []*Col
 	val0 := decimal.NewFromInt(0)
@@ -813,10 +814,24 @@ func CalcFilePerfsWithLogger(args *config.CmdArgs, logger *zap.Logger) *errs.Err
 		if err_ != nil {
 			sortino = decimal.NewFromFloat(0)
 		}
+		nav := make([]float64, 0, len(cols[startCol+i]))
+		for _, text := range cols[startCol+i][1:] {
+			value, parseErr := strconv.ParseFloat(text, 64)
+			if parseErr != nil {
+				value = math.NaN()
+			}
+			nav = append(nav, value)
+		}
+		years := filePerfYears(rows, args, !isPrice)
+		ui, upi, _ := utils.CalcUlcerPerformance(nav, years, 0)
+		if !isPrice {
+			ui, upi, _ = utils.CalcUlcerPerformanceByReturns(nav, years, 0)
+		}
 		items = append(items, &Col{
-			name: names[startCol+i],
-			data: append(col, sharpe, sortino),
-			raw:  cols[startCol+i][1:],
+			name:       names[startCol+i],
+			data:       append(col, sharpe, sortino),
+			raw:        cols[startCol+i][1:],
+			ulcerIndex: ui, upi: upi,
 		})
 	}
 	// sort columns by sharpe ratio
@@ -854,8 +869,59 @@ func CalcFilePerfsWithLogger(args *config.CmdArgs, logger *zap.Logger) *errs.Err
 				row = append(row, item.data[len(item.data)-1].String())
 			}
 			outRows = append(outRows, row)
+			for _, metric := range []string{"ulcerIndex", "upi"} {
+				row = []string{metric}
+				for _, item := range items {
+					value := item.ulcerIndex
+					if metric == "upi" {
+						value = item.upi
+					}
+					text := "N/A"
+					if value != nil {
+						text = strconv.FormatFloat(*value, 'g', -1, 64)
+					}
+					row = append(row, text)
+				}
+				outRows = append(outRows, row)
+			}
 			break
 		}
 	}
 	return utils.WriteCsvFile(args.OutPath, outRows, false)
+}
+
+// Price inputs span the first through last observation. Return inputs need an
+// extra baseline interval; infer it only from uniform dates or an explicit TF.
+func filePerfYears(rows [][]string, args *config.CmdArgs, returns bool) float64 {
+	if len(rows) < 3 {
+		return 0
+	}
+	first, err1 := btime.ParseTimeMS(rows[1][0])
+	last, err2 := btime.ParseTimeMS(rows[len(rows)-1][0])
+	if err1 == nil && err2 == nil && last > first {
+		span := last - first
+		if returns {
+			step := span / int64(len(rows)-2)
+			for i := 2; i < len(rows); i++ {
+				prev, e1 := btime.ParseTimeMS(rows[i-1][0])
+				cur, e2 := btime.ParseTimeMS(rows[i][0])
+				if e1 != nil || e2 != nil || cur-prev != step {
+					return 0
+				}
+			}
+			span += step
+		}
+		return float64(span) / (utils.UlcerYearDays * 86400000)
+	}
+	if len(args.TimeFrames) == 1 {
+		seconds, err := utils2.ParseTimeFrame(args.TimeFrames[0])
+		if err == nil && seconds > 0 {
+			intervals := len(rows) - 2
+			if returns {
+				intervals++
+			}
+			return float64(intervals) * float64(seconds) / (utils.UlcerYearDays * 86400)
+		}
+	}
+	return 0
 }

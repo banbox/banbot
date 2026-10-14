@@ -15,7 +15,7 @@
   import {modals} from "$lib/stores/modals";
   import type {StrVal} from "$lib/common";
 
-  import { taskReport, reportIdentity, legacyMetric } from '$lib/results/report';
+  import { taskReport, reportIdentity, legacyMetric, riskMetric } from '$lib/results/report';
 
   let tasks = $state<BtTask[]>([]);
   let strats = $state<StrVal[]>([]);
@@ -265,8 +265,8 @@ Error: ${taskReport(task).report?.Errors?.join('\n') || task.info}`
 </style>
 
 <div class="container mx-auto max-w-[1500px] px-4 py-6">
-  <div class="flex justify-between items-center mb-6">
-    <div class="flex gap-4">
+  <div class="flex flex-wrap justify-between items-center gap-4 mb-6">
+    <div class="flex flex-wrap gap-4">
       <select class="select" bind:value={selectedStrat}>
         <option value="">{m.all_strats()}</option>
         {#each strats as item}
@@ -312,7 +312,7 @@ Error: ${taskReport(task).report?.Errors?.join('\n') || task.info}`
   </div>
 
   <!-- 结果列表 -->
-  <div class="grid grid-cols-3 gap-6 mb-6">
+  <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 mb-6">
     {#each tasks as task, tidx}
       {@const metadata = taskReport(task)}
       {@const identity = metadata.report ? reportIdentity(metadata.report) : null}
@@ -390,7 +390,7 @@ Error: ${taskReport(task).report?.Errors?.join('\n') || task.info}`
             {/if}
           </div>
         
-          <div class="grid grid-cols-4 gap-4 mb-4">
+          <div class="grid grid-cols-2 sm:grid-cols-3 gap-4 mb-4">
             <div>
               <div class="text-xs opacity-60 mb-1">{m.sharpe_ratio()}</div>
               <div class="text-base font-medium">{legacyMetric(task.sharpe, isUnified, 2)}</div>
@@ -398,6 +398,14 @@ Error: ${taskReport(task).report?.Errors?.join('\n') || task.info}`
             <div>
               <div class="text-xs opacity-60 mb-1">{m.sortino_ratio()}</div>
               <div class="text-base font-medium">{legacyMetric(task.sortinoRatio, isUnified, 2)}</div>
+            </div>
+            <div>
+              <div class="text-xs opacity-60 mb-1">{m.ulcer_index()}</div>
+              <div class="text-base font-medium">{riskMetric(task.ulcerIndex, '%', isUnified)}</div>
+            </div>
+            <div>
+              <div class="text-xs opacity-60 mb-1">{m.ulcer_performance_index()}</div>
+              <div class="text-base font-medium">{riskMetric(task.ulcerPerformanceIndex, '', isUnified)}</div>
             </div>
             <div>
               <div class="text-xs opacity-60 mb-1">{m.order_num()}</div>

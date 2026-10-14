@@ -49,7 +49,8 @@ func validateWebAuth(host, password string) error {
 
 var (
 	btInfoKeyList = []string{"maxOpenOrders", "showDrawDownPct", "barNum", "maxDrawDownVal", "showDrawDownVal", "totalInvest",
-		"totProfit", "totCost", "totFee", "totProfitPct", "sortinoRatio"}
+		"totProfit", "totCost", "totFee", "totProfitPct", "sortinoRatio",
+		"ulcerIndex", "ulcerPerformanceIndex", "ulcerSource"}
 	btInfoKeys = make(map[string]bool)
 	maxBtTasks = 3 // 最大并发回测任务数
 

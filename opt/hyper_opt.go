@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io/fs"
+	"math"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -1435,6 +1436,15 @@ func parseOptMetrics(metricStr string, res *OptInfo) {
 			res.ShowDrawDownPct, _ = strconv.ParseFloat(val[:len(val)-1], 64)
 		case "sharpe":
 			res.SharpeRatio, _ = strconv.ParseFloat(val, 64)
+		case "ulcerIndex", "upi":
+			value, err := strconv.ParseFloat(strings.TrimSuffix(val, "%"), 64)
+			if err == nil && !math.IsNaN(value) && !math.IsInf(value, 0) {
+				if key == "ulcerIndex" {
+					res.UlcerIndex = &value
+				} else {
+					res.UlcerPerformanceIndex = &value
+				}
+			}
 		case "id":
 			res.ID = val
 		}

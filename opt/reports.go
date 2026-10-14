@@ -42,53 +42,60 @@ import (
 )
 
 type BTResult struct {
-	MaxOpenOrders   int                    `json:"maxOpenOrders"`
-	MinReal         float64                `json:"minReal"`
-	MaxReal         float64                `json:"maxReal"`         // Maximum Assets 最大资产
-	MaxDrawDownPct  float64                `json:"maxDrawDownPct"`  // Maximum drawdown percentage 最大回撤百分比
-	ShowDrawDownPct float64                `json:"showDrawDownPct"` // Displays the maximum drawdown percentage 显示最大回撤百分比
-	MaxDrawDownVal  float64                `json:"maxDrawDownVal"`  // Maximum drawdown percentage 最大回撤金额
-	ShowDrawDownVal float64                `json:"showDrawDownVal"` // Displays the maximum drawdown percentage 显示最大回撤金额
-	MaxFundOccup    float64                `json:"maxFundOccup"`
-	MaxOccupForPair float64                `json:"maxOccupForPair"`
-	BarNum          int                    `json:"barNum"`
-	TimeNum         int                    `json:"timeNum"`
-	OrderNum        int                    `json:"orderNum"`
-	lastTime        int64                  // 上次bar的时间戳
-	lastPlotMS      int64                  // 上次资金曲线采样时间
-	histOdOff       int                    // 计算已完成订单利润的偏移
-	donePftLegal    float64                // 已完成订单利润
-	Plots           *PlotData              `json:"plots"`
-	EntLabels       []string               `json:"entLabels"`
-	EntDatasets     []*ChartDs             `json:"entDatasets"`
-	CreateMS        int64                  `json:"createMS"`
-	StartMS         int64                  `json:"startMS"`
-	EndMS           int64                  `json:"endMS"`
-	PlotEvery       int                    `json:"plotEvery"`
-	TotalInvest     float64                `json:"totalInvest"`
-	OutDir          string                 `json:"outDir"`
-	PairGrps        []*RowItem             `json:"pairGrps"`
-	DateGrps        []*RowItem             `json:"dateGrps"`
-	EnterGrps       []*RowItem             `json:"enterGrps"`
-	ExitGrps        []*RowItem             `json:"exitGrps"`
-	ProfitGrps      []*RowItem             `json:"profitGrps"`
-	DrawDowns       []*core.TimeValueRange `json:"drawDowns"`
-	TmpDrawDown     *core.TimeValueRange   `json:"-"`
-	TotProfit       float64                `json:"totProfit"`
-	TotCost         float64                `json:"totCost"`
-	TotFee          float64                `json:"totFee"`
-	TotProfitPct    float64                `json:"totProfitPct"`
-	TfHits          map[string]int         `json:"tfHits"`
-	WinRatePct      float64                `json:"winRatePct"`
-	FinBalance      float64                `json:"finBalance"`
-	FinWithdraw     float64                `json:"finWithdraw"`
-	SharpeRatio     float64                `json:"sharpeRatio"`
-	SortinoRatio    float64                `json:"sortinoRatio"`
-	CalcDiff        float64                `json:"calcDiff"`
-	Stability       float64                `json:"stability"`
-	HitSlTp         int                    `json:"hitSlTp"`
-	runtimeDeps     *biz.RuntimeDeps
-	reportDeps      *ReportDeps
+	MaxOpenOrders         int                    `json:"maxOpenOrders"`
+	MinReal               float64                `json:"minReal"`
+	MaxReal               float64                `json:"maxReal"`         // Maximum Assets 最大资产
+	MaxDrawDownPct        float64                `json:"maxDrawDownPct"`  // Maximum drawdown percentage 最大回撤百分比
+	ShowDrawDownPct       float64                `json:"showDrawDownPct"` // Displays the maximum drawdown percentage 显示最大回撤百分比
+	MaxDrawDownVal        float64                `json:"maxDrawDownVal"`  // Maximum drawdown percentage 最大回撤金额
+	ShowDrawDownVal       float64                `json:"showDrawDownVal"` // Displays the maximum drawdown percentage 显示最大回撤金额
+	MaxFundOccup          float64                `json:"maxFundOccup"`
+	MaxOccupForPair       float64                `json:"maxOccupForPair"`
+	BarNum                int                    `json:"barNum"`
+	TimeNum               int                    `json:"timeNum"`
+	OrderNum              int                    `json:"orderNum"`
+	lastTime              int64                  // 上次bar的时间戳
+	lastPlotMS            int64                  // 上次资金曲线采样时间
+	histOdOff             int                    // 计算已完成订单利润的偏移
+	donePftLegal          float64                // 已完成订单利润
+	Plots                 *PlotData              `json:"plots"`
+	EntLabels             []string               `json:"entLabels"`
+	EntDatasets           []*ChartDs             `json:"entDatasets"`
+	CreateMS              int64                  `json:"createMS"`
+	StartMS               int64                  `json:"startMS"`
+	EndMS                 int64                  `json:"endMS"`
+	PlotEvery             int                    `json:"plotEvery"`
+	TotalInvest           float64                `json:"totalInvest"`
+	OutDir                string                 `json:"outDir"`
+	PairGrps              []*RowItem             `json:"pairGrps"`
+	DateGrps              []*RowItem             `json:"dateGrps"`
+	EnterGrps             []*RowItem             `json:"enterGrps"`
+	ExitGrps              []*RowItem             `json:"exitGrps"`
+	ProfitGrps            []*RowItem             `json:"profitGrps"`
+	DrawDowns             []*core.TimeValueRange `json:"drawDowns"`
+	TmpDrawDown           *core.TimeValueRange   `json:"-"`
+	TotProfit             float64                `json:"totProfit"`
+	TotCost               float64                `json:"totCost"`
+	TotFee                float64                `json:"totFee"`
+	TotProfitPct          float64                `json:"totProfitPct"`
+	TfHits                map[string]int         `json:"tfHits"`
+	WinRatePct            float64                `json:"winRatePct"`
+	FinBalance            float64                `json:"finBalance"`
+	FinWithdraw           float64                `json:"finWithdraw"`
+	SharpeRatio           float64                `json:"sharpeRatio"`
+	SortinoRatio          float64                `json:"sortinoRatio"`
+	UlcerIndex            *float64               `json:"ulcerIndex"`
+	UlcerPerformanceIndex *float64               `json:"ulcerPerformanceIndex"`
+	UlcerSource           string                 `json:"ulcerSource,omitempty"`
+	ulcerDaily            utils.UlcerAccumulator
+	ulcerDay              int64
+	ulcerPending          float64
+	ulcerLastMS           int64
+	CalcDiff              float64 `json:"calcDiff"`
+	Stability             float64 `json:"stability"`
+	HitSlTp               int     `json:"hitSlTp"`
+	runtimeDeps           *biz.RuntimeDeps
+	reportDeps            *ReportDeps
 }
 
 // ReportDeps owns the state needed by report/replay helpers. It is deliberately
@@ -445,15 +452,18 @@ type PlotData struct {
 }
 
 type RowPart struct {
-	WinCount     int                `json:"winCount"`
-	OrderNum     int                `json:"orderNum"`
-	ProfitSum    float64            `json:"profitSum"`
-	ProfitPctSum float64            `json:"profitPctSum"`
-	CostSum      float64            `json:"costSum"`
-	Durations    []int              `json:"-"`
-	Orders       []*ormo.InOutOrder `json:"-"`
-	Sharpe       float64            `json:"sharpe"` // 夏普比率
-	Sortino      float64            `json:"sortino"`
+	WinCount              int                `json:"winCount"`
+	OrderNum              int                `json:"orderNum"`
+	ProfitSum             float64            `json:"profitSum"`
+	ProfitPctSum          float64            `json:"profitPctSum"`
+	CostSum               float64            `json:"costSum"`
+	Durations             []int              `json:"-"`
+	Orders                []*ormo.InOutOrder `json:"-"`
+	Sharpe                float64            `json:"sharpe"` // 夏普比率
+	Sortino               float64            `json:"sortino"`
+	UlcerIndex            *float64           `json:"ulcerIndex"`
+	UlcerPerformanceIndex *float64           `json:"ulcerPerformanceIndex"`
+	UlcerSource           string             `json:"ulcerSource,omitempty"`
 }
 
 type RowItem struct {
@@ -471,7 +481,7 @@ var (
 	// map mutation is serial compatibility only; concurrent callers must use
 	// RegisterPairPicker and GetPairPicker.
 	PairPickers           = make(map[string]func(r *BTResult) []string)
-	calcMeasureByOrdersFn = calcMeasureByOrders
+	calcMeasureByOrdersFn func([]*ormo.InOutOrder, *ReportDeps) (float64, float64, *errs.Error)
 )
 
 func RegisterPairPicker(name string, picker PairPicker) {
@@ -806,6 +816,7 @@ func (r *BTResult) Collect() *errs.Error {
 	} else {
 		r.SharpeRatio, r.SortinoRatio = sharpe, sortino
 	}
+	r.collectUlcer()
 	r.CalcDiff = math.Abs((r.FinBalance-r.TotProfit)/r.TotalInvest - 1)
 	r.Stability = utils.CalcAssetStabilityScore(r.Plots.Real, 0)
 	return nil
@@ -853,6 +864,7 @@ func (r *BTResult) textMetrics(orders []*ormo.InOutOrder) string {
 		{"TimeFrames", sortTfMap(r.TfHits)},
 		{"Win Rate", strconv.FormatFloat(r.WinRatePct, 'f', 1, 64) + "%"},
 		{"Sharpe/Sortino", sharpeStr + " / " + sortinoStr},
+		{"Ulcer Index / UPI", formatUlcer(r.UlcerIndex, true) + " / " + formatUlcer(r.UlcerPerformanceIndex, false)},
 	}
 	if len(orders) > 0 {
 		worstVal := strconv.FormatFloat(orders[0].Profit, 'f', 1, 64)
@@ -1138,7 +1150,16 @@ func groupItemsWithDeps(orders []*ormo.InOutOrder, measure bool, getTag func(od 
 	if measure {
 		// 分30份采样计算指标，太大的话会导致指标偏小
 		for _, gp := range groups {
-			sharpe, sortino, err := calcMeasureByOrdersFn(gp.Orders, deps)
+			curve, stake, years, curveErr := orderEquityCurve(gp.Orders, deps)
+			var sharpe, sortino float64
+			var err *errs.Error
+			if calcMeasureByOrdersFn != nil {
+				sharpe, sortino, err = calcMeasureByOrdersFn(gp.Orders, deps)
+			} else if curveErr != nil {
+				err = curveErr
+			} else {
+				sharpe, sortino, err = measuresByOrderCurve(curve)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -1148,6 +1169,10 @@ func groupItemsWithDeps(orders []*ormo.InOutOrder, measure bool, getTag func(od 
 			if !math.IsNaN(sortino) && !math.IsInf(sortino, 0) {
 				gp.Sortino = sortino
 			}
+			if curveErr == nil && len(curve) > 0 {
+				gp.UlcerIndex, gp.UlcerPerformanceIndex, _ = utils.CalcUlcerPerformance(append([]float64{stake}, curve...), years, 0)
+				gp.UlcerSource = "daily_order_equity"
+			}
 		}
 	}
 	return utils.ValsOfMap(groups), nil
@@ -1156,7 +1181,7 @@ func groupItemsWithDeps(orders []*ormo.InOutOrder, measure bool, getTag func(od 
 func printGroups(groups []*RowItem, title string, measure bool, extHeads []string, prcGrp func([]*ormo.InOutOrder) []string) string {
 	heads := []string{title, "Count", "Avg Profit %", "Tot Profit %", "Sum Profit", "Duration(h'm)", "Win Rate"}
 	if measure {
-		heads = append(heads, "Sharpe/Sortino")
+		heads = append(heads, "Sharpe/Sortino", "Ulcer Index / UPI (daily order equity)")
 	}
 	if len(extHeads) > 0 {
 		heads = append(heads, extHeads...)
@@ -1175,6 +1200,7 @@ func printGroups(groups []*RowItem, title string, measure bool, extHeads []strin
 			sharpeStr := strconv.FormatFloat(sta.Sharpe, 'f', 2, 64)
 			sortinoStr := strconv.FormatFloat(sta.Sortino, 'f', 2, 64)
 			row = append(row, sharpeStr+" / "+sortinoStr)
+			row = append(row, formatUlcer(sta.UlcerIndex, true)+" / "+formatUlcer(sta.UlcerPerformanceIndex, false))
 		}
 		if prcGrp != nil {
 			cols := prcGrp(sta.Orders)
@@ -1196,46 +1222,14 @@ func CalcMeasureByOrdersWithRuntimeDeps(ods []*ormo.InOutOrder, deps biz.Runtime
 }
 
 func calcMeasureByOrders(ods []*ormo.InOutOrder, deps *ReportDeps) (float64, float64, *errs.Error) {
-	if len(ods) == 0 {
-		return 0, 0, nil
-	}
-	initStake := float64(0)
-	if deps.legacy {
-		for key, val := range config.WalletAmounts {
-			initStake += val * com.GetPriceSafe(key, "")
-		}
-	} else {
-		cfg := deps.configView()
-		if cfg == nil || deps.Market == nil || deps.Market.Prices == nil {
-			return 0, 0, errs.NewMsg(core.ErrBadConfig, "runtime report config and market prices are required")
-		}
-		nowMS := int64(0)
-		if deps.Clock != nil {
-			nowMS = deps.Clock.TimeMS()
-		}
-		for key, val := range cfg.WalletAmounts {
-			price := deps.Market.Prices.GetPriceSafeExpAt(nowMS, key, "", com.PriceExpireMS)
-			if price < 0 {
-				return 0, 0, errs.NewMsg(core.ErrRunTime, "no valid runtime price for wallet currency: %s", key)
-			}
-			initStake += val * price
-		}
-	}
-	tf := "1d"
-	tfSecs := utils2.TFToSecs(tf)
-	tfMsecs := int64(tfSecs * 1000)
-	startMS, endMS := ormo.CalcTimeRange(ods)
-	startMS = utils2.AlignTfMSecs(startMS, tfMsecs)
-	endMS = utils2.AlignTfMSecs(endMS, tfMsecs) + tfMsecs
-	pairOrders := make(map[string][]*ormo.InOutOrder)
-	for _, od := range ods {
-		items, _ := pairOrders[od.Symbol]
-		pairOrders[od.Symbol] = append(items, od)
-	}
-	cumRets, err := calcCumCurveWithDeps(pairOrders, startMS, endMS, tf, initStake, deps)
+	cumRets, _, _, err := orderEquityCurve(ods, deps)
 	if err != nil {
 		return 0, 0, err
 	}
+	return measuresByOrderCurve(cumRets)
+}
+
+func measuresByOrderCurve(cumRets []float64) (float64, float64, *errs.Error) {
 	if len(cumRets) == 0 {
 		return 0, 0, nil
 	}
@@ -1245,8 +1239,55 @@ func calcMeasureByOrders(ods []*ormo.InOutOrder, deps *ReportDeps) (float64, flo
 		retRates[i] = (ret - lastRet) / lastRet
 		lastRet = ret
 	}
-	periods := utils2.TFToSecs("1y") / tfSecs
+	periods := utils2.TFToSecs("1y") / utils2.TFToSecs("1d")
 	return calcMeasures(retRates, periods, 0)
+}
+
+func orderEquityCurve(ods []*ormo.InOutOrder, deps *ReportDeps) ([]float64, float64, float64, *errs.Error) {
+	if len(ods) == 0 {
+		return nil, 0, 0, nil
+	}
+	initStake := float64(0)
+	if deps.legacy {
+		for key, val := range config.WalletAmounts {
+			initStake += val * com.GetPriceSafe(key, "")
+		}
+	} else {
+		cfg := deps.configView()
+		if cfg == nil || deps.Market == nil || deps.Market.Prices == nil {
+			return nil, 0, 0, errs.NewMsg(core.ErrBadConfig, "runtime report config and market prices are required")
+		}
+		nowMS := int64(0)
+		if deps.Clock != nil {
+			nowMS = deps.Clock.TimeMS()
+		}
+		for key, val := range cfg.WalletAmounts {
+			price := deps.Market.Prices.GetPriceSafeExpAt(nowMS, key, "", com.PriceExpireMS)
+			if price < 0 {
+				return nil, 0, 0, errs.NewMsg(core.ErrRunTime, "no valid runtime price for wallet currency: %s", key)
+			}
+			initStake += val * price
+		}
+	}
+	tf := "1d"
+	tfSecs := utils2.TFToSecs(tf)
+	tfMsecs := int64(tfSecs * 1000)
+	startMS, endMS := ormo.CalcTimeRange(ods)
+	if startMS < 100000000000 || endMS < startMS {
+		return nil, 0, 0, errs.NewMsg(core.ErrBadConfig, "order equity metrics require valid millisecond timestamps")
+	}
+	startMS = utils2.AlignTfMSecs(startMS, tfMsecs)
+	endMS = utils2.AlignTfMSecs(endMS, tfMsecs) + tfMsecs
+	pairOrders := make(map[string][]*ormo.InOutOrder)
+	for _, od := range ods {
+		items, _ := pairOrders[od.Symbol]
+		pairOrders[od.Symbol] = append(items, od)
+	}
+	cumRets, err := calcCumCurveWithDeps(pairOrders, startMS, endMS, tf, initStake, deps)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return cumRets, initStake, float64(endMS-startMS) / (utils.UlcerYearDays * 86400000), nil
 }
 
 func calcMeasures(returns []float64, periods int, riskFree float64) (float64, float64, *errs.Error) {
@@ -1566,6 +1607,59 @@ func (r *BTResult) DelBigObjects() {
 	}
 }
 
+func formatUlcer(value *float64, percent bool) string {
+	if value == nil {
+		return "N/A"
+	}
+	text := strconv.FormatFloat(*value, 'f', 3, 64)
+	if percent {
+		text += "%"
+	}
+	return text
+}
+
+// Daily UTC closes are collected before chart decimation. TotalLegal already
+// includes withdrawn capital, so withdrawals do not create drawdowns.
+func (r *BTResult) recordUlcer(timeMS int64, equity float64) {
+	if r.ulcerDaily.Count() == 0 {
+		if r.TotalInvest <= 0 {
+			return
+		}
+		r.ulcerDaily.Add(r.TotalInvest)
+		baselineMS := r.StartMS
+		if baselineMS == 0 {
+			baselineMS = timeMS
+		}
+		r.ulcerDay = baselineMS / 86400000
+		r.ulcerPending = r.TotalInvest
+	}
+	if timeMS < r.ulcerLastMS {
+		return
+	}
+	day := timeMS / 86400000
+	// A mark exactly at midnight is the close of the preceding day.
+	if timeMS > r.StartMS && timeMS%86400000 == 0 {
+		day--
+	}
+	for r.ulcerDay < day {
+		r.ulcerDaily.Add(r.ulcerPending)
+		r.ulcerDay++
+	}
+	r.ulcerPending, r.ulcerLastMS = equity, timeMS
+}
+
+func (r *BTResult) collectUlcer() {
+	years := float64(r.EndMS-r.StartMS) / (utils.UlcerYearDays * 86400000)
+	if r.ulcerDaily.Count() > 0 {
+		a := r.ulcerDaily
+		a.Add(r.ulcerPending)
+		r.UlcerIndex, r.UlcerPerformanceIndex, _ = a.Performance(years, 0)
+		r.UlcerSource = "daily_equity"
+		return
+	}
+	// Historical chart samples cannot recover drawdowns lost to decimation.
+}
+
 func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 	if r.StartMS == 0 {
 		r.StartMS = startMS
@@ -1576,6 +1670,7 @@ func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 		return
 	}
 	totalLegal := wallets.TotalLegal(nil, true)
+	r.recordUlcer(timeMS, totalLegal)
 	r.MinReal = min(r.MinReal, totalLegal)
 	if totalLegal > r.MaxReal {
 		r.MaxReal = totalLegal
@@ -1681,6 +1776,7 @@ func (r *BTResult) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, tot
 	avaLegal := wallets.AvaLegal(nil)
 	profitLegal := wallets.UnrealizedPOLLegal(nil)
 	drawLegal := wallets.GetWithdrawLegal(nil)
+	r.recordUlcer(timeMS, totalLegal)
 	curDate := r.dateStr(timeMS, "")
 	r.donePftLegal += r.doneProfits(r.histOdOff)
 	r.histOdOff = len(r.historyOrders())

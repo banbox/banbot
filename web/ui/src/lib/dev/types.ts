@@ -33,6 +33,8 @@ export interface BtTask {
   showDrawDownVal?: number; // 显示的回撤值
   totFee?: number; // 总费用
   sortinoRatio?: number; // 索提诺比率
+  ulcerIndex?: number | null;
+  ulcerPerformanceIndex?: number | null;
   leverage?: number;
   walletAmount?: number;
   stakeAmount?: number;

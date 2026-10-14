@@ -13,6 +13,8 @@ export interface GroupItem {
   costSum: number;
   sharpe: number;
   sortino: number;
+  ulcerIndex?: number | null;
+  ulcerPerformanceIndex?: number | null;
 }
 
 export interface BackTestPlots {
@@ -41,6 +43,8 @@ export interface BacktestDetail {
   maxDrawDownVal: number;
   sharpeRatio: number;
   sortinoRatio: number;
+  ulcerIndex?: number | null;
+  ulcerPerformanceIndex?: number | null;
   startMS: number;
   endMS: number;
   totalInvest: number;
@@ -85,6 +89,8 @@ export interface BackTestTask {
   showDrawDownVal: number;
   sharpe: number;
   sortinoRatio: number;
+  ulcerIndex?: number | null;
+  ulcerPerformanceIndex?: number | null;
   totCost: number;
   totFee: number;
 }

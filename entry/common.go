@@ -183,7 +183,7 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 		bindBTStrict), "test_pickers"))
 	add("tool", withAliases(newRuntimeConfigCommand("load-cal", "load calendars", runExplicitLoadCalendars, true, bindIn), "load_cal"))
 	add("tool", withAliases(newRuntimeConfigCommand("data-server", "serve a gRPC data feeder", runExplicitDataServer, true), "data_server"))
-	add("tool", withAliases(newRuntimeConfigCommand("calc-perfs", "calculate Sharpe and Sortino ratios for input data", data.CalcFilePerfs, true,
+	add("tool", withAliases(newRuntimeConfigCommand("calc-perfs", "calculate Sharpe, Sortino, Ulcer Index and UPI for input data", data.CalcFilePerfs, true,
 		bindIn, bindInType, bindOut), "calc_perfs"))
 	add("tool", newRuntimeConfigCommand("corr", "calculate a symbol correlation matrix", runExplicitCorrelation, true,
 		bindOut, bindOutType, bindTimeFrames, bindBatchSize, bindRunEvery))

@@ -177,7 +177,7 @@ BanBot 是一个用于数字货币量化交易的机器人后端服务。它使�
 - file_util.go: 文件和目录操作。函数：`CopyDir`、`Copy`、`Exists`、`EnsureDir`、`FindSubPath`、`ReadCSV`、`ReadXlsx`、`WriteCsvFile`等。
 - index.go: 工具包入口。
 - math.go: 数学计算。函数：`DecPow`、`DecArithMean`、`DecStdDev`等。
-- metrics.go: 性能指标计算。函数：`SharpeRatio`、`SortinoRatio`、`CalcExpectancy`、`CalcMaxDrawDown`、`AutoCorrPenalty`、`KMeansVals`等。
+- math.go / ulcer.go: 性能指标计算。函数：`SharpeRatio`、`SortinoRatio`、`CalcUlcerPerformance`、`CalcExpectancy`、`CalcMaxDrawDown`、`AutoCorrPenalty`、`KMeansVals`等。
 - misc.go: 杂项工具。函数：`MD5`、`IsDocker`、`OpenBrowser`、`ReadInput`、`ReadConfirm`、`ParallelRun`等。
 - net_utils.go: 网络工具。函数：`DoHttp`等。
 - num_utils.go: 数字处理工具。

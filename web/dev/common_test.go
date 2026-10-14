@@ -98,6 +98,47 @@ func TestCollectBtTaskResultWaitsForMissingSeparateReport(t *testing.T) {
 	}
 }
 
+func TestCollectBtTaskPreservesUlcerMetrics(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		metrics map[string]any
+	}{
+		{"valid", map[string]any{"ulcerIndex": 2.24, "ulcerPerformanceIndex": 1.41, "ulcerSource": "daily_equity"}},
+		{"undefined", map[string]any{"ulcerIndex": 0.0, "ulcerPerformanceIndex": nil, "ulcerSource": "daily_equity"}},
+		{"legacy", map[string]any{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "report")
+			writeSeparateReport(t, dir, 2)
+			detail, err := json.Marshal(tc.metrics)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "detail.json"), detail, 0644); err != nil {
+				t.Fatal(err)
+			}
+			task, err := collectBtTaskResult(root, "report")
+			if err != nil || task == nil {
+				t.Fatalf("collect: task=%v, error=%v", task, err)
+			}
+			var wire map[string]any
+			payload, err := json.Marshal(task.ToMap())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(payload, &wire); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"ulcerIndex", "ulcerPerformanceIndex", "ulcerSource"} {
+				if wire[key] != tc.metrics[key] {
+					t.Fatalf("%s = %v, want %v", key, wire[key], tc.metrics[key])
+				}
+			}
+		})
+	}
+}
+
 func TestPrepareBacktestConfigFilesUsesRequestPrivateCopies(t *testing.T) {
 	server := newTestDevServer(t.TempDir())
 	firstDir, firstPaths, err := server.prepareBacktestConfigFiles(

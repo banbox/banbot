@@ -254,8 +254,8 @@ func (r *BTResult) BriefLine() string {
 	if r == nil {
 		return ""
 	}
-	return fmt.Sprintf("odNum: %v, profit: %.1f%%, drawDown: %.1f%%, sharpe: %.2f",
-		r.OrderNum, r.TotProfitPct, r.ShowDrawDownPct, r.SharpeRatio)
+	return fmt.Sprintf("odNum: %v, profit: %.1f%%, drawDown: %.1f%%, sharpe: %.2f, ulcerIndex: %s, upi: %s",
+		r.OrderNum, r.TotProfitPct, r.ShowDrawDownPct, r.SharpeRatio, formatUlcer(r.UlcerIndex, true), formatUlcer(r.UlcerPerformanceIndex, false))
 }
 
 func (o *OptInfo) ToLine() string {

@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import {
 	legacyMetric,
+	riskMetric,
 	numericText,
 	readUnifiedReport,
 	reportIdentity,
@@ -35,6 +36,19 @@ const result = {
 	Summary: null
 };
 const report = { Version: 1, Status: 'incomplete', Errors: ['cleanup failed'], Results: [result] };
+
+test('risk metrics preserve percentage points, zero and negative UPI', () => {
+	assert.equal(riskMetric(2.243, '%'), '2.24%');
+	assert.equal(riskMetric(0, '%'), '0.00%');
+	assert.equal(riskMetric(-1.406), '-1.41');
+});
+
+test('missing and undefined risk metrics stay unavailable in old reports', () => {
+	for (const value of [undefined, null, NaN, Infinity, -Infinity]) {
+		assert.equal(riskMetric(value, '%'), '--');
+	}
+	assert.equal(riskMetric(2.24, '%', true), '--');
+});
 
 test('reads PascalCase v1 and preserves error, unresolved and negative funding values', () => {
 	const parsed = readUnifiedReport(report);
