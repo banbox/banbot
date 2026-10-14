@@ -2377,6 +2377,10 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 	if od.Enter.Amount == 0 {
 		if od.QuoteCost == 0 {
 			wallets := o.walletsForOrder()
+			// 余额长时间未主动拉取时，下单前先同步最新余额
+			if err = wallets.RefreshIfStale(WalletStaleMS); err != nil {
+				o.Logger().Warn("refresh stale wallet fail", zap.String("acc", o.Account), zap.Error(err))
+			}
 			_, err = wallets.EnterOd(od)
 			if err != nil {
 				if err.Code == core.ErrLowFunds || err.Code == core.ErrInvalidCost {

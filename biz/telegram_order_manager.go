@@ -204,7 +204,15 @@ type walletInfoProvider struct{}
 
 func (walletInfoProvider) GetSummary(account string) (totalLegal float64, availableLegal float64, unrealizedPOLLegal float64) {
 	w := GetWallets(account)
+	refreshStaleWalletForDisplay(w)
 	return w.TotalLegal(nil, true), w.AvaLegal(nil), w.UnrealizedPOLLegal(nil)
+}
+
+// refreshStaleWalletForDisplay 展示前若余额长时间未拉取，先同步最新余额
+func refreshStaleWalletForDisplay(w *BanWallets) {
+	if err := w.RefreshIfStale(WalletStaleMS); err != nil {
+		log.Warn("refresh stale wallet fail", zap.String("acc", w.Account), zap.Error(err))
+	}
 }
 
 type runtimeWalletInfoProvider struct{ state *TradingState }
@@ -214,6 +222,7 @@ func (provider runtimeWalletInfoProvider) GetSummary(account string) (float64, f
 	if wallet == nil {
 		return 0, 0, 0
 	}
+	refreshStaleWalletForDisplay(wallet)
 	return wallet.TotalLegal(nil, true), wallet.AvaLegal(nil), wallet.UnrealizedPOLLegal(nil)
 }
 

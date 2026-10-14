@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/banbox/banbot/btime"
@@ -71,7 +72,16 @@ type BanWallets struct {
 	runtimeCharge     bool
 	runtimeMargin     float64
 	runtimeBound      bool
+	// syncMS is the wall-clock time of the last successful FetchBalance applied
+	// to this wallet. WebSocket pushes are not counted since they may drift silently.
+	syncMS   atomic.Int64
+	syncLock sync.Mutex
 }
+
+// WalletStaleMS is the max age of exchange balances before they are fetched
+// again on demand (before entering orders or displaying wallets).
+// 余额距上次主动拉取超过此时长时，下单或展示前会自动重新拉取
+const WalletStaleMS = int64(60 * 60 * 1000)
 
 type walletSnapshotCompactCfg struct {
 	lastCheckMS   map[string]int64
@@ -1836,6 +1846,104 @@ func UpdateWalletByBalancesWithRuntime(wallets *BanWallets, item *banexg.Balance
 		return
 	}
 	UpdateWalletByBalances(wallets, item)
+}
+
+// LastSyncMS returns the wall-clock time of the last successful balance fetch, 0 if never.
+func (w *BanWallets) LastSyncMS() int64 {
+	if w == nil {
+		return 0
+	}
+	return w.syncMS.Load()
+}
+
+func (w *BanWallets) balanceExchange() banexg.BanExchange {
+	if w.runtimeBound {
+		return w.runtimeExg
+	}
+	return exg.Default
+}
+
+// SyncBalancesWith fetches balances from the given exchange (the wallet's bound
+// exchange if nil), applies them to the wallet and records the sync time.
+func (w *BanWallets) SyncBalancesWith(exchange banexg.BanExchange) (*banexg.Balances, *errs.Error) {
+	if w == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "wallet is required")
+	}
+	w.syncLock.Lock()
+	defer w.syncLock.Unlock()
+	return w.syncBalancesLocked(exchange)
+}
+
+func (w *BanWallets) syncBalancesLocked(exchange banexg.BanExchange) (*banexg.Balances, *errs.Error) {
+	if exchange == nil {
+		exchange = w.balanceExchange()
+	}
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "exchange is required to sync wallet %s", w.Account)
+	}
+	rsp, err := exchange.FetchBalance(map[string]interface{}{
+		banexg.ParamAccount: w.Account,
+	})
+	if err != nil {
+		return nil, err
+	}
+	UpdateWalletByBalances(w, rsp)
+	w.syncMS.Store(time.Now().UnixMilli())
+	return rsp, nil
+}
+
+// RefreshIfStale fetches balances from the exchange when the last successful fetch
+// is older than maxAgeMS (WalletStaleMS if <= 0). Concurrent callers share one fetch.
+// 距上次主动拉取余额超过maxAgeMS时，自动从交易所拉取最新余额
+func (w *BanWallets) RefreshIfStale(maxAgeMS int64) *errs.Error {
+	if w == nil || !w.envReal() {
+		return nil
+	}
+	return w.RefreshIfStaleWith(nil, maxAgeMS)
+}
+
+// RefreshIfStaleWith is RefreshIfStale using the given exchange (the wallet's bound
+// exchange if nil). The caller is responsible for checking the environment is real.
+func (w *BanWallets) RefreshIfStaleWith(exchange banexg.BanExchange, maxAgeMS int64) *errs.Error {
+	if w == nil {
+		return nil
+	}
+	if maxAgeMS <= 0 {
+		maxAgeMS = WalletStaleMS
+	}
+	if time.Now().UnixMilli()-w.syncMS.Load() < maxAgeMS {
+		return nil
+	}
+	w.syncLock.Lock()
+	defer w.syncLock.Unlock()
+	if time.Now().UnixMilli()-w.syncMS.Load() < maxAgeMS {
+		return nil
+	}
+	if _, err := w.syncBalancesLocked(exchange); err != nil {
+		return err
+	}
+	log.Info("refreshed stale wallet balances", zap.String("acc", w.Account))
+	return nil
+}
+
+// SyncWalletBalancesWithRuntime fetches and applies exchange balances only for
+// wallets bound to Runtime state, mirroring UpdateWalletByBalancesWithRuntime.
+func SyncWalletBalancesWithRuntime(wallets *BanWallets, exchange banexg.BanExchange) *errs.Error {
+	if wallets == nil {
+		return nil
+	}
+	if !wallets.runtimeBound {
+		// Still fetch so exchange failures surface, but never apply to an unbound wallet.
+		if exchange == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "exchange is required to sync wallet %s", wallets.Account)
+		}
+		_, err := exchange.FetchBalance(map[string]interface{}{
+			banexg.ParamAccount: wallets.Account,
+		})
+		return err
+	}
+	_, err := wallets.SyncBalancesWith(exchange)
+	return err
 }
 
 /*

@@ -261,11 +261,47 @@ func (h *apiHandlers) getBalance(c *fiber.Ctx) error {
 		if wallet == nil {
 			return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
 		}
+		// 余额长时间未拉取时，先同步最新余额再展示
+		if err := h.syncWallet(wallet, false); err != nil {
+			log.Warn("refresh stale wallet fail", zap.String("acc", account), zap.Error(err))
+		}
 		return c.JSON(fiber.Map{
 			"items": h.walletItems(wallet),
 			"total": wallet.FiatValue(true),
 		})
 	})
+}
+
+// syncWallet fetches the latest exchange balances into wallet. Unless force is set,
+// it only fetches when the last fetch is older than biz.WalletStaleMS.
+func (h *apiHandlers) syncWallet(wallet *biz.BanWallets, force bool) error {
+	envReal := core.EnvReal
+	if h.runtime() {
+		if h.deps.Core == nil {
+			return errs.NewMsg(core.ErrBadConfig, "runtime core is required")
+		}
+		envReal = h.deps.Core.EnvReal
+	}
+	if !envReal {
+		return nil
+	}
+	exchange := h.exchange()
+	if exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+	}
+	if !force {
+		if err := wallet.RefreshIfStaleWith(exchange, biz.WalletStaleMS); err != nil {
+			return err
+		}
+		return nil
+	}
+	rsp, err := wallet.SyncBalancesWith(exchange)
+	if err != nil {
+		return err
+	}
+	rsp.Info = nil
+	log.Info("RefreshWallet", zap.String("acc", wallet.Account), zap.Any("rsp", rsp))
+	return nil
 }
 
 func (h *apiHandlers) walletItems(wallet *biz.BanWallets) []map[string]interface{} {
@@ -297,27 +333,8 @@ func (h *apiHandlers) postRefreshWallet(c *fiber.Ctx) error {
 		if wallet == nil {
 			return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
 		}
-		envReal := core.EnvReal
-		if h.runtime() {
-			if h.deps.Core == nil {
-				return errs.NewMsg(core.ErrBadConfig, "runtime core is required")
-			}
-			envReal = h.deps.Core.EnvReal
-		}
-		if envReal {
-			exchange := h.exchange()
-			if exchange == nil {
-				return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
-			}
-			rsp, err := exchange.FetchBalance(map[string]interface{}{
-				banexg.ParamAccount: account,
-			})
-			if err != nil {
-				return err
-			}
-			biz.UpdateWalletByBalances(wallet, rsp)
-			rsp.Info = nil
-			log.Info("RefreshWallet", zap.String("acc", account), zap.Any("rsp", rsp))
+		if err := h.syncWallet(wallet, true); err != nil {
+			return err
 		}
 		return c.JSON(fiber.Map{
 			"items": h.walletItems(wallet),
@@ -461,6 +478,9 @@ func (h *apiHandlers) getStatistics(c *fiber.Ctx) error {
 		}
 
 		expProfit, expRatio := utils.CalcExpectancy(dayProfits)
+		if err := h.syncWallet(wallets, false); err != nil {
+			log.Warn("refresh stale wallet fail", zap.String("acc", acc), zap.Error(err))
+		}
 		initBalance := wallets.TotalLegal(nil, true) - profitSum
 		ddPct, ddVal, _, _, _, _ := utils.CalcMaxDrawDown(dayProfits, initBalance)
 

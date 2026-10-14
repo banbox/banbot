@@ -288,6 +288,11 @@ func updateBalancePosWithRuntime(deps *balanceRuntimeDeps) {
 		odNum := len(odList)
 		lock.Unlock()
 		if odNum == 0 {
+			// 无持仓时也需定期拉取，避免仅依赖推送导致余额长期不准确
+			wallet := deps.trading.Wallet(account)
+			if time.Now().UnixMilli()-wallet.LastSyncMS() >= biz.WalletStaleMS {
+				updateAccBalanceWithRuntime(deps, account)
+			}
 			continue
 		}
 		if deps.core != nil && (deps.core.Market == banexg.MarketLinear || deps.core.Market == banexg.MarketInverse) {
@@ -320,13 +325,8 @@ func updateAccBalanceWithRuntime(deps *balanceRuntimeDeps, account string) {
 		return
 	}
 	wallet := deps.trading.Wallet(account)
-	rsp, err := deps.exchange.FetchBalance(map[string]interface{}{
-		banexg.ParamAccount: account,
-	})
-	if err != nil {
+	if err := biz.SyncWalletBalancesWithRuntime(wallet, deps.exchange); err != nil {
 		logger.Error("UpdateBalance fail", zap.String("acc", account), zap.Error(err))
-	} else {
-		biz.UpdateWalletByBalancesWithRuntime(wallet, rsp)
 	}
 }
 
