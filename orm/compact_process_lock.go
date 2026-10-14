@@ -31,6 +31,10 @@ var (
 // compactProcessLockRoot retains the legacy-config root for existing callers.
 // Identity-aware callers should use CompactProcessLockRootForIdentity.
 func compactProcessLockRoot() string {
+	return dbIdentLockRoot("compact", compactProcessLockRootDataDir)
+}
+
+func compactProcessLockRootDataDir() string {
 	dataDir := config.GetDataDirSafe()
 	identity := CanonicalStorageIdentityForType("", databaseURL(), dataDir, databaseType())
 	if identity == "" {
