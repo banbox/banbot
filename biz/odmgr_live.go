@@ -946,7 +946,20 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 		}
 		_, _, hasTarget := getEnterTriggerTarget(od)
 		isLegacyTrigger := hasTarget && od.GetInfoInt64(ormo.OdInfoStopAfter) > 0
-		if od.GetInfoInt64(odInfoLocalTrigger) > 0 || isLegacyTrigger {
+		isLocalTrigger := od.GetInfoInt64(odInfoLocalTrigger) > 0 || isLegacyTrigger
+		if !isLocalTrigger {
+			// The entry may have filled before the restart, which keeps it out of the
+			// open-order snapshot above. Resolve it by its stable client id first, so
+			// the position stays managed and the same signal cannot enter twice.
+			exOd, lookErr := o.lookupRestoredEnter(od)
+			if lookErr != nil {
+				o.Logger().Warn("resolve restored entry fail", zap.String("acc", o.Account),
+					zap.String("key", od.Key()), zap.Error(lookErr))
+			} else if exOd != nil {
+				return o.applyAuthoritativeEnterOrder(od, exOd)
+			}
+		}
+		if isLocalTrigger {
 			// Market data is usually still cold during startup. Re-register persisted
 			// virtual entries and let VerifyTriggerOds evaluate them once data is ready.
 			od.SetInfo(odInfoLocalTrigger, int64(1))
@@ -1794,6 +1807,9 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 	if err != nil {
 		o.Logger().Error("ConsumeOrderQueue error", zap.String("acc", o.Account),
 			zap.String("action", action), zap.Error(err))
+		if submitUnconfirmedAction(od) == action {
+			o.scheduleSubmitReconcile(od, action, err)
+		}
 	}
 	if od.Enter != nil && od.Enter.OrderID != "" {
 		od.SetInfo(odInfoLocalTrigger, nil)
@@ -2114,12 +2130,9 @@ func (o *LiveOrderMgr) buildClientOrderID(od *ormo.InOutOrder, randomize bool) (
 	if o == nil || od == nil {
 		return "", errs.NewMsg(core.ErrBadConfig, "order and live manager are required")
 	}
-	namespace := o.orderNamespace
-	if namespace == "" && !o.runtimeDeps {
-		namespace = config.Name
-	}
-	if namespace == "" && o.runtimeDeps {
-		return "", errs.NewMsg(core.ErrBadConfig, "runtime order namespace is required")
+	namespace, err := o.clientOrderNamespace()
+	if err != nil {
+		return "", err
 	}
 	exchange := o.exchangeClient()
 	if exchange == nil {
@@ -2127,6 +2140,22 @@ func (o *LiveOrderMgr) buildClientOrderID(od *ormo.InOutOrder, randomize bool) (
 	}
 	return exg.BuildClientOrderIDChecked(exchange, o.exchangeName(), namespace,
 		od.ID, od.GetInfoString(ormo.OdInfoClientID), randomize)
+}
+
+// clientOrderNamespace resolves the identifier namespace shared by every
+// submission of this manager.
+func (o *LiveOrderMgr) clientOrderNamespace() (string, *errs.Error) {
+	if o == nil {
+		return "", errs.NewMsg(core.ErrBadConfig, "live manager is required")
+	}
+	namespace := o.orderNamespace
+	if namespace == "" && !o.runtimeDeps {
+		namespace = config.Name
+	}
+	if namespace == "" && o.runtimeDeps {
+		return "", errs.NewMsg(core.ErrBadConfig, "runtime order namespace is required")
+	}
+	return namespace, nil
 }
 
 func (o *LiveOrderMgr) orderEventOrderID(trade *banexg.MyTrade) string {
@@ -2510,6 +2539,13 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 	}
 	err = o.submitExgOrder(od, true)
 	if err != nil {
+		if submitUnconfirmedAction(od) == ormo.OdActionEnter {
+			// The exchange may already hold this entry. Destroying the local order
+			// would leave that position unmanaged, so it stays for reconciliation.
+			o.Logger().Warn("entry submission unconfirmed, retain local order",
+				zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
+			return err
+		}
 		msg := "submit order fail, local exit"
 		o.Logger().Error(msg, zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
 		err = o.localExit(od, 0, core.ExitTagFatalErr, od.InitPrice, err.Short(), "")
@@ -2684,10 +2720,15 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		}
 	}
 	side, amount, price := subOd.Side, subOd.Amount, subOd.Price
-	clientID, clientErr := o.buildClientOrderID(od, true)
+	clientID, clientErr := o.buildSubmitClientOrderID(od, isEnter)
 	if clientErr != nil {
 		return clientErr
 	}
+	action := ormo.OdActionExit
+	if isEnter {
+		action = ormo.OdActionEnter
+	}
+	reconciler := o.submitReconciler()
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
 		banexg.ParamClientOrderId: clientID,
@@ -2731,7 +2772,36 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	if retryNum > 0 {
 		params[banexg.ParamRetry] = int(retryNum)
 	}
-	res, err := exchange.CreateOrder(od.Symbol, subOd.OrderType, side, amount, price, params)
+	var res *banexg.Order
+	if reconciler != nil && submitUnconfirmedAction(od) == action {
+		// A previous attempt may have been accepted without an answer reaching
+		// this client. Resolve it by the stable id first, so only a confirmed
+		// absence is submitted again and the retry cannot open a second order.
+		found, _, lookErr := o.lookupSubmittedOrder(od, subOd, clientID, reconciler)
+		if lookErr != nil {
+			return lookErr
+		}
+		res = found
+	}
+	if res == nil {
+		res, err = exchange.CreateOrder(od.Symbol, subOd.OrderType, side, amount, price, params)
+		if err != nil && reconciler != nil {
+			if reconciler.IndeterminateSubmit(err) {
+				// The exchange may have accepted the order even though the response
+				// was lost, so the outcome stays unconfirmed until a lookup either
+				// adopts the order or the queue retries it.
+				found, _, lookErr := o.lookupSubmittedOrder(od, subOd, clientID, reconciler)
+				if lookErr == nil && found != nil {
+					res, err = found, nil
+				} else {
+					od.SetInfo(ormo.OdInfoSubmitUnconfirmed, action)
+				}
+			} else {
+				// A conclusive rejection ends the reconciliation of this submission.
+				clearSubmitUnconfirmed(od)
+			}
+		}
+	}
 	if err != nil {
 		if !isEnter && err.Code == errs.CodeReduceOnlyRejected {
 			msg := "ReduceOnly Order is rejected."
@@ -2750,6 +2820,9 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	err = o.updateOdByExgRes(od, isEnter, res)
 	if err != nil {
 		return err
+	}
+	if submitUnconfirmedAction(od) == action {
+		clearSubmitUnconfirmed(od)
 	}
 	if isEnter {
 		if od.Status == ormo.InOutStatusFullEnter {
