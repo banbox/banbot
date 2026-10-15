@@ -25,6 +25,13 @@ func TestRuntimeDefaultLogPaths(t *testing.T) {
 	if explicit.Logfile != filepath.Join(snapshot.DataDir, "custom.log") {
 		t.Fatalf("explicit path lost: %q", explicit.Logfile)
 	}
+	bt := runtimeLogArgs(config.CmdArgs{OutPath: "$/backtest/1"}, snapshot, "backtest")
+	if bt.Logfile != filepath.Join(snapshot.DataDir, "backtest", "1", "out.log") {
+		t.Fatalf("backtest log is not inside the output dir: %q", bt.Logfile)
+	}
+	if noOut := runtimeLogArgs(config.CmdArgs{}, snapshot, "backtest"); filepath.Dir(noOut.Logfile) != filepath.Join(snapshot.DataDir, "logs") {
+		t.Fatalf("backtest without output dir should fall back to the logs dir: %q", noOut.Logfile)
+	}
 	if runtimeLogArgs(config.CmdArgs{}, snapshot).Logfile != "" {
 		t.Fatal("non-live command unexpectedly enabled file logging")
 	}

@@ -18,11 +18,16 @@ func runtimeLogArgs(args config.CmdArgs, snapshot *config.Snapshot, commands ...
 	if args.Logfile != "" {
 		args.Logfile = snapshot.ParsePath(args.Logfile)
 	} else if len(commands) > 0 {
-		name := filepath.Base(snapshot.View().Name)
-		if name == "." || name == string(filepath.Separator) {
-			name = "banbot"
+		if commands[0] == "backtest" && args.OutPath != "" {
+			// the Web UI reads the task log from <out>/out.log
+			args.Logfile = filepath.Join(snapshot.ParsePath(args.OutPath), "out.log")
+		} else {
+			name := filepath.Base(snapshot.View().Name)
+			if name == "." || name == string(filepath.Separator) {
+				name = "banbot"
+			}
+			args.Logfile = filepath.Join(snapshot.DataDir, "logs", fmt.Sprintf("%s-%s-%d.log", name, commands[0], os.Getpid()))
 		}
-		args.Logfile = filepath.Join(snapshot.DataDir, "logs", fmt.Sprintf("%s-%s-%d.log", name, commands[0], os.Getpid()))
 	}
 	return args
 }
