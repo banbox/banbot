@@ -387,7 +387,7 @@ func runExplicitBackTestSpecContext(ctx context.Context, args *config.CmdArgs, s
 	if err := validateLegacyHistory(spec); err != nil {
 		return errs.New(core.ErrBadConfig, err)
 	}
-	session, snapshot, err := openExplicitEntrySessionFromSpecContext(ctx, args, spec)
+	session, snapshot, err := openExplicitEntrySessionFromSpecContext(ctx, args, spec, "backtest")
 	if err != nil {
 		return err
 	}
