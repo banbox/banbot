@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"github.com/banbox/banbot/core"
@@ -46,13 +47,6 @@ func (s *SeriesStore) WriteBatch(ctx context.Context, info *SeriesInfo, target *
 	if err := validateSeriesInfo(info); err != nil {
 		return err
 	}
-	if IsQuestDB {
-		binding := normalizedSeriesBinding(info.Binding)
-		tblLock := cptState.getTableLock(binding.Table)
-		tblLock.RLock()
-		defer tblLock.RUnlock()
-		ctx = withSeriesTableReadLockSkipped(ctx)
-	}
 	items, err := NormalizeDataRecords(target.ID, rows)
 	if err != nil {
 		return err
@@ -61,6 +55,9 @@ func (s *SeriesStore) WriteBatch(ctx context.Context, info *SeriesInfo, target *
 		return nil
 	}
 	repo := s.repoOrDefault()
+	if writer, ok := repo.(atomicSeriesWriter); ok {
+		return writer.WriteSeriesBatch(ctx, info, target.ID, items)
+	}
 	if err := repo.InsertSeriesBatch(ctx, info, items); err != nil {
 		return err
 	}
@@ -105,7 +102,31 @@ func (s *SeriesStore) Read(ctx context.Context, info *SeriesInfo, target *ExSymb
 	if err != nil {
 		return nil, err
 	}
-	return RecordsToSeries(info, target, rows), nil
+	if err := CheckDataRecordPage(ctx, rows, target.ID, startMS, endMS, limit); err != nil {
+		return nil, errs.New(core.ErrDbReadFail, err)
+	}
+	items := RecordsToSeries(info, target, rows)
+	if err := CheckDataSeriesBytes(ctx, items); err != nil {
+		return nil, errs.New(core.ErrDbReadFail, err)
+	}
+	return items, nil
+}
+
+// CheckDataRecordPage verifies a complete adapter page before it is retained or
+// published. A zero SID remains accepted for legacy target-bound sources.
+func CheckDataRecordPage(ctx context.Context, rows []*DataRecord, sid int32, startMS, endMS int64, limit int) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if limit > 0 && len(rows) > limit {
+		return fmt.Errorf("series page exceeded row limit: observed=%d limit=%d", len(rows), limit)
+	}
+	for i, row := range rows {
+		if row == nil || row.TimeMS < startMS || row.TimeMS >= endMS || (row.Sid != 0 && row.Sid != sid) || i > 0 && row.TimeMS <= rows[i-1].TimeMS {
+			return fmt.Errorf("series page contains a nil, foreign, unordered or out-of-range record")
+		}
+	}
+	return CheckDataRecordBytes(ctx, rows)
 }
 
 func (s *SeriesStore) Delete(ctx context.Context, info *SeriesInfo, target *ExSymbol, startMS, endMS int64) *errs.Error {
@@ -162,13 +183,6 @@ func (s *SeriesStore) UpdateCoverage(ctx context.Context, info *SeriesInfo, targ
 	}
 	if err := validateSeriesInfo(info); err != nil {
 		return err
-	}
-	if IsQuestDB {
-		binding := normalizedSeriesBinding(info.Binding)
-		tblLock := cptState.getTableLock(binding.Table)
-		tblLock.RLock()
-		defer tblLock.RUnlock()
-		ctx = withSeriesTableReadLockSkipped(ctx)
 	}
 	return s.repoOrDefault().UpdateSeriesCoverage(ctx, info, target.ID, startMS, endMS, rows)
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
@@ -34,7 +35,33 @@ If you need to download from the end to the beginning, you should make startMS>e
 如果需要从后往前下载，应该使startMS>endMS
 */
 func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeFrame string, startMS, endMS int64, out chan []*banexg.Kline) *errs.Error {
-	if core.NetDisable {
+	return fetchApiOHLCV(ctx, exchange, pair, timeFrame, startMS, endMS, out, true)
+}
+
+// FetchApiOHLCVWithOptions is the explicit-runtime counterpart to
+// FetchApiOHLCV. It does not inspect process-wide mode or network flags.
+func FetchApiOHLCVWithOptions(ctx context.Context, exchange banexg.BanExchange, pair, timeFrame string,
+	startMS, endMS int64, out chan []*banexg.Kline, options KlineRuntimeOptions,
+) *errs.Error {
+	return fetchApiOHLCVWithOptions(ctx, exchange, pair, timeFrame, startMS, endMS, out, true, options)
+}
+
+func fetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeFrame string, startMS, endMS int64,
+	out chan []*banexg.Kline, useArchive bool) *errs.Error {
+	return fetchApiOHLCVWithOptions(ctx, exchange, pair, timeFrame, startMS, endMS, out, useArchive,
+		LegacyKlineRuntimeOptions())
+}
+
+func fetchApiOHLCVWithOptions(ctx context.Context, exchange banexg.BanExchange, pair, timeFrame string, startMS, endMS int64,
+	out chan []*banexg.Kline, useArchive bool, options KlineRuntimeOptions,
+) *errs.Error {
+	if err := validateKlineRuntimeOptions(options); err != nil {
+		return err
+	}
+	if !options.allowDownload() {
+		return klineDownloadDisabledError("FetchApiOHLCV")
+	}
+	if options.NetDisable {
 		return nil
 	}
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
@@ -45,7 +72,7 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 		startMS, endMS = endMS, startMS
 	}
 	// 交易所返回的最后一个可能是未完成bar，需要过滤掉
-	endMS = utils2.AlignTfMSecs(min(endMS, btime.UTCStamp()), tfMSecs)
+	endMS = utils2.AlignTfMSecs(min(endMS, options.nowMS()), tfMSecs)
 	fetchNum := int((endMS - startMS) / tfMSecs)
 	if fetchNum == 0 {
 		return nil
@@ -55,6 +82,24 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 		batchSize = 1
 	}
 	curSince := startMS
+	archiveEnd := utils2.AlignTfMSecs(options.nowMS()-int64(48*time.Hour/time.Millisecond), tfMSecs)
+	archiveEnd = min(archiveEnd, endMS)
+	if useArchive && archiveEnd > curSince {
+		if archive, ok := exchange.(banexg.OHLCVArchiveFetcher); ok {
+			data, available, err := archive.FetchOHLCVArchive(ctx, pair, timeFrame, curSince, archiveEnd)
+			if err != nil {
+				return contextualKlineOperationError("fetch archive", pair, timeFrame, curSince, archiveEnd, 0, err)
+			}
+			if available {
+				log.Info("fetch kline from Binance Vision", zap.String("pair", pair), zap.String("tf", timeFrame),
+					zap.Int64("start", curSince), zap.Int64("end", archiveEnd), zap.Int("num", len(data)))
+				if !sendKlineBatches(ctx, out, data, int(batchSize)) {
+					return nil
+				}
+				curSince = archiveEnd
+			}
+		}
+	}
 	for curSince < endMS {
 		leftNum := (endMS - curSince) / tfMSecs
 		if leftNum <= 0 {
@@ -65,21 +110,47 @@ func FetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 			banexg.ParamDebug: DebugDownKLine,
 		})
 		if err != nil {
-			return err
+			return contextualKlineOperationError("fetch", pair, timeFrame, curSince, 0, curSize, err)
 		}
 		retSize := len(data)
 		log.Debug("fetch kline", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Int("curSize", curSize), zap.Int64("since", curSince),
 			zap.Int("rawSize", retSize), zap.Int("saveSize", len(data)))
-		if len(data) > 0 {
-			select {
-			case <-ctx.Done():
-				return nil
-			case out <- data:
-			}
+		if !sendKlineBatches(ctx, out, data, int(batchSize)) {
+			return nil
 		}
 		curSince = nextFetchSince(curSince, curSize, tfMSecs, data)
 	}
 	return nil
+}
+
+func sendKlineBatches(ctx context.Context, out chan []*banexg.Kline, data []*banexg.Kline, batchSize int) bool {
+	if len(data) == 0 {
+		return true
+	}
+	if batchSize <= 0 {
+		batchSize = core.KBatchSize
+	}
+	for start := 0; start < len(data); start += batchSize {
+		stop := min(len(data), start+batchSize)
+		select {
+		case <-ctx.Done():
+			return false
+		case out <- data[start:stop]:
+		}
+	}
+	return true
+}
+
+func contextualKlineOperationError(operation, pair, timeFrame string, startMS, endMS int64, limit int, opErr *errs.Error) *errs.Error {
+	if opErr == nil {
+		return nil
+	}
+	context := fmt.Sprintf("%s OHLCV pair=%s timeframe=%s start_ms=%d end_ms=%d limit=%d",
+		operation, pair, timeFrame, startMS, endMS, limit)
+	if strings.TrimSpace(opErr.Message()) == "" {
+		return errs.NewMsg(core.ErrRunTime, "%s failed with empty error code=%d", context, opErr.Code)
+	}
+	return errs.NewFull(opErr.Code, opErr, "%s", context)
 }
 
 func nextFetchSince(curSince int64, curSize int, tfMSecs int64, clean []*banexg.Kline) int64 {
@@ -103,13 +174,67 @@ Download K-line to database. This method should be called in a transaction, othe
 */
 func (q *Queries) DownOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
 	pBar *utils.PrgBar) (int, *errs.Error) {
-	return q.downOHLCV2DB(exchange, exs, timeFrame, startMS, endMS, 2, pBar)
+	return q.DownOHLCV2DBForRequestedTF(exchange, exs, timeFrame, timeFrame, startMS, endMS, pBar)
 }
 
-func (q *Queries) downOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
+// DownOHLCV2DBForRequestedTFWithOptions is the runtime-owned download entry.
+// All mode, clock, storage, and retry policy comes from options; the legacy
+// method above remains the compatibility facade.
+func (q *Queries) DownOHLCV2DBForRequestedTFWithOptions(exchange banexg.BanExchange, exs *ExSymbol,
+	storageTimeFrame, requestedTimeFrame string, startMS, endMS int64, pBar *utils.PrgBar,
+	options KlineRuntimeOptions,
+) (int, *errs.Error) {
+	if err := validateKlineRuntimeOptions(options); err != nil {
+		return 0, err
+	}
+	if !options.allowDownload() {
+		return 0, klineDownloadDisabledError("DownOHLCV2DB")
+	}
+	if requestedTimeFrame == "" {
+		requestedTimeFrame = storageTimeFrame
+	}
+	return q.downOHLCV2DBWithOptions(exchange, exs, storageTimeFrame, requestedTimeFrame,
+		startMS, endMS, 2, pBar, options)
+}
+
+// DownOHLCV2DBForRequestedTF downloads storageTimeFrame for requestedTimeFrame.
+// A derived 4h+ series is stored as 1h/1d, but must still use the Binance API.
+func (q *Queries) DownOHLCV2DBForRequestedTF(exchange banexg.BanExchange, exs *ExSymbol,
+	storageTimeFrame, requestedTimeFrame string, startMS, endMS int64, pBar *utils.PrgBar,
+) (int, *errs.Error) {
+	return q.DownOHLCV2DBForRequestedTFWithOptions(exchange, exs, storageTimeFrame, requestedTimeFrame,
+		startMS, endMS, pBar, LegacyKlineRuntimeOptions())
+}
+
+func (q *Queries) downOHLCV2DB(exchange banexg.BanExchange, exs *ExSymbol, storageTimeFrame, requestedTimeFrame string,
+	startMS, endMS int64,
 	retry int, pBar *utils.PrgBar) (int, *errs.Error) {
+	return q.downOHLCV2DBWithOptions(exchange, exs, storageTimeFrame, requestedTimeFrame,
+		startMS, endMS, retry, pBar, LegacyKlineRuntimeOptions())
+}
+
+func (q *Queries) downOHLCV2DBWithOptions(exchange banexg.BanExchange, exs *ExSymbol, storageTimeFrame, requestedTimeFrame string,
+	startMS, endMS int64, retry int, pBar *utils.PrgBar, options KlineRuntimeOptions,
+) (int, *errs.Error) {
+	if err := validateKlineRuntimeOptions(options); err != nil {
+		return 0, err
+	}
+	startMS, endMS = validKlineDownloadRange(exs, startMS, endMS)
+	return downOHLCV2DBRangeWithOptions(q, exchange, exs, storageTimeFrame, startMS, endMS, retry, pBar,
+		shouldUseOHLCVArchive(requestedTimeFrame), options)
+}
+
+func shouldUseOHLCVArchive(requestedTimeFrame string) bool {
+	secs, err := utils2.TFToSecSafe(requestedTimeFrame)
+	return err == nil && secs > 0 && secs < 4*utils2.SecsHour
+}
+
+func validKlineDownloadRange(exs *ExSymbol, startMS, endMS int64) (int64, int64) {
 	startMS = exs.GetValidStart(startMS)
-	return downOHLCV2DBRange(q, exchange, exs, timeFrame, startMS, endMS, retry, pBar)
+	if exs.DelistMs > 0 && (endMS == 0 || exs.DelistMs < endMS) {
+		endMS = exs.DelistMs
+	}
+	return startMS, endMS
 }
 
 /*
@@ -120,25 +245,92 @@ stepCB is used to update the progress. The total value is fixed at 1000 to preve
 stepCB 用于更新进度，总值固定1000，避免内部下载区间大于传入区间
 */
 func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
-	retry int, pBar *utils.PrgBar) (int, *errs.Error) {
-	if startMS >= endMS || exs.Combined || exs.DelistMs > 0 || core.NetDisable {
+	retry int, pBar *utils.PrgBar, useArchive bool) (int, *errs.Error) {
+	return downOHLCV2DBRangeWithOptions(sess, exchange, exs, timeFrame, startMS, endMS, retry, pBar,
+		useArchive, LegacyKlineRuntimeOptions())
+}
+
+func downOHLCV2DBRangeWithOptions(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
+	retry int, pBar *utils.PrgBar, useArchive bool, options KlineRuntimeOptions) (int, *errs.Error) {
+	if err := validateKlineRuntimeOptions(options); err != nil {
+		return 0, err
+	}
+	startMS, endMS = validKlineDownloadRange(exs, startMS, endMS)
+	if startMS >= endMS || exs.Combined || options.NetDisable {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
 		}
 		return 0, nil
 	}
 	var err *errs.Error
-	if sess == nil {
-		var conn *pgxpool.Conn
-		sess, conn, err = Conn(nil)
-		if err != nil {
-			if pBar != nil {
-				pBar.Add(core.StepTotal)
-			}
-			return 0, err
+	var releaseConn func()
+	var symbols *SymbolState
+	if sess != nil {
+		symbols = sess.symbols
+		if exchange == nil {
+			exchange = sess.exchange
 		}
-		defer conn.Release()
 	}
+	if sess == nil {
+		// A historical download can wait minutes for an exchange Retry-After.
+		// Do not hold one QuestDB connection across that external wait; the
+		// pool-backed session lets each DB operation acquire a live connection.
+		if options.Storage != nil {
+			if options.Storage.IsQuestDB() {
+				sess = options.Storage.NewQueries(options.Storage.Pool())
+			} else {
+				var conn *pgxpool.Conn
+				sess, conn, err = options.Storage.Conn(nil)
+				if err != nil {
+					if pBar != nil {
+						pBar.Add(core.StepTotal)
+					}
+					return 0, err
+				}
+				releaseConn = conn.Release
+			}
+		} else if IsQuestDB {
+			sess = New(pool)
+		} else {
+			var conn *pgxpool.Conn
+			sess, conn, err = Conn(nil)
+			if err != nil {
+				if pBar != nil {
+					pBar.Add(core.StepTotal)
+				}
+				return 0, err
+			}
+			releaseConn = conn.Release
+		}
+	} else if sess.isQuestDB() {
+		// A historical download can wait minutes for an exchange Retry-After.
+		// Acquire a pool connection only when an explicit Storage is available;
+		// otherwise preserve the legacy pool-backed session behavior.
+		if sess.storage != nil && sess.storage.Pool() != nil {
+			storage := sess.storage
+			// Use the pool as DBTX so each operation acquires its own
+			// connection and recursive retries do not accumulate leases.
+			sess = NewWithStorage(storage.Pool(), storage)
+		} else if pool != nil {
+			sess = New(pool)
+		}
+	}
+	// The session may have been acquired from a pool after the caller supplied
+	// its runtime dependencies. Keep both bindings on every query used below.
+	if symbols != nil {
+		sess = sess.WithSeriesSymbolState(symbols)
+	}
+	if exchange != nil {
+		sess = sess.WithExchange(exchange)
+	}
+	sess = sess.WithKlineRuntimeOptions(options)
+	if releaseConn != nil {
+		defer releaseConn()
+	}
+	if sess == nil || sess.db == nil {
+		return 0, errs.NewMsg(core.ErrDbConnFail, "database query is not configured")
+	}
+	isQuestDB := sess.isQuestDB()
 	tfSecs := utils2.TFToSecs(timeFrame)
 	tfMSecs := int64(tfSecs * 1000)
 
@@ -147,36 +339,6 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		return 0, NewDbErr(core.ErrDbReadFail, err_)
 	}
 	missing := subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered)
-	if len(missing) == 0 {
-		// If metadata says covered but no actual bars exist in the target range,
-		// wait briefly for QuestDB WAL visibility before forcing a redownload.
-		probe, probeErr := sess.QueryOHLCV(exs, timeFrame, startMS, endMS, 1, false)
-		if probeErr != nil {
-			return 0, probeErr
-		}
-		if len(probe) == 0 {
-			if IsQuestDB {
-				visible, waitErr := waitForQuestKlineWindowVisible(context.Background(), sess, exs.ID, timeFrame, startMS, endMS)
-				if waitErr != nil {
-					return 0, waitErr
-				}
-				if visible {
-					if pBar != nil {
-						pBar.Add(core.StepTotal)
-					}
-					return 0, nil
-				}
-			}
-			log.Warn("sranges covered but no kline rows after visibility wait, force redownload",
-				zap.Int32("sid", exs.ID),
-				zap.String("symbol", exs.Symbol),
-				zap.String("tf", timeFrame),
-				zap.Int64("start", startMS),
-				zap.Int64("end", endMS),
-			)
-			missing = []MSRange{{Start: startMS, Stop: endMS}}
-		}
-	}
 	if len(missing) == 0 {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
@@ -201,23 +363,24 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		}
 	}
 	close(chanDown)
-	insTs, err := AddInsJob(AddInsKlineParams{
+	insTsValue, addErr := sess.AddInsKline(context.Background(), AddInsKlineParams{
 		Sid:       exs.ID,
 		Timeframe: timeFrame,
 		StartMs:   curStart,
 		StopMs:    curEnd,
 	})
-	if err != nil {
+	if addErr != nil {
 		if pBar != nil {
 			pBar.Add(core.StepTotal)
 		}
-		return 0, err
+		return 0, NewDbErr(core.ErrDbExecFail, addErr)
 	}
+	insTs := insTsValue
 	if insTs.IsZero() {
 		waitCtx, cancel := context.WithTimeout(context.Background(), klineInsertWaitTimeout)
 		defer cancel()
 		grace := time.Duration(0)
-		if IsQuestDB {
+		if isQuestDB {
 			grace = klineInsertQuestVisibilityGrace
 		}
 		complete, waitErr := waitForKlineInsertCompletion(waitCtx, klineInsertWaitPoll, grace,
@@ -229,7 +392,7 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 				return len(subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, covered)) == 0, nil
 			},
 			func() (bool, error) {
-				return klineInsertFileLockActive(klineInsertLockRoot(), exs.ID, timeFrame)
+				return klineInsertFileLockActive(sess.insertLockRoot(), exs.ID, timeFrame)
 			})
 		if waitErr != nil {
 			if waitErr == context.DeadlineExceeded {
@@ -243,7 +406,7 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 			}
 			return 0, nil
 		}
-		if !IsQuestDB {
+		if !isQuestDB {
 			item, itemErr := sess.GetInsKline(waitCtx, exs.ID, timeFrame)
 			if itemErr != nil {
 				return 0, NewDbErr(core.ErrDbReadFail, itemErr)
@@ -256,12 +419,12 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 		if retry >= klineInsertMaxRetry {
 			return 0, errs.NewMsg(core.ErrRunTime, "kline insert owner exited without covering sid=%d tf=%s", exs.ID, timeFrame)
 		}
-		return downOHLCV2DBRange(sess, exchange, exs, timeFrame, startMS, endMS, retry+1, pBar)
+		return downOHLCV2DBRangeWithOptions(sess, exchange, exs, timeFrame, startMS, endMS, retry+1, pBar, useArchive, options)
 	}
 	clearInsJob := true
 	defer func() {
 		if !clearInsJob {
-			_ = releaseKlineInsertOwnership(exs.ID, timeFrame, insTs)
+			_ = sess.releaseInsertOwnership(exs.ID, timeFrame, insTs)
 			return
 		}
 		if err_ := sess.DelInsKline(context.Background(), exs.ID, timeFrame, insTs); err_ != nil {
@@ -319,7 +482,7 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 				if job.Reverse {
 					start, stop = job.End, job.Start
 				}
-				err := FetchApiOHLCV(ctx, exchange, exs.Symbol, timeFrame, start, stop, chanKline)
+				err := fetchApiOHLCVWithOptions(ctx, exchange, exs.Symbol, timeFrame, start, stop, chanKline, useArchive, options)
 				if err != nil {
 					setOutErr(err)
 					cancel()
@@ -367,9 +530,13 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	}()
 
 	wg.Wait()
+	if outErr != nil {
+		clearInsJob = false
+		return saveNum, outErr
+	}
 
 	// Unfinished bar (best-effort).
-	curMS := btime.UTCStamp()
+	curMS := options.nowMS()
 	curAlignMS := utils2.AlignTfMSecs(curMS, tfMSecs)
 	if endMS > curAlignMS {
 		data, fetchErr := exchange.FetchOHLCV(exs.Symbol, timeFrame, curAlignMS, 1, nil)
@@ -384,13 +551,13 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 	}
 
 	if saveNum > 0 {
-		if IsQuestDB {
+		if isQuestDB {
 			if waitErr := waitForQuestKlineTimestampVisible(context.Background(), sess, exs.ID, timeFrame, realEnd); waitErr != nil {
 				clearInsJob = false
 				return saveNum, waitErr
 			}
 		}
-		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, true, true)
+		updErr := sess.UpdateKRange(exs, timeFrame, realStart, realEnd+tfMSecs, false, true)
 		if updErr != nil {
 			clearInsJob = false
 			if outErr == nil {
@@ -400,14 +567,31 @@ func downOHLCV2DBRange(sess *Queries, exchange banexg.BanExchange, exs *ExSymbol
 					zap.String("err", updErr.Short()))
 			}
 		}
-		if outErr == nil && IsQuestDB {
+		if outErr == nil && isQuestDB {
 			if waitErr := waitForQuestKlineCoverageVisible(context.Background(), sess, exs.ID, timeFrame, realStart, realEnd+tfMSecs); waitErr != nil {
 				clearInsJob = false
 				outErr = waitErr
 			}
 		}
 	}
+	if outErr == nil {
+		outErr = updateDownloadedRanges(succDown, func(item MSRange) *errs.Error {
+			return sess.updateBigHyper(exs, timeFrame, item.Start, item.Stop)
+		})
+		if outErr != nil {
+			clearInsJob = false
+		}
+	}
 	return saveNum, outErr
+}
+
+func updateDownloadedRanges(ranges []MSRange, update func(MSRange) *errs.Error) *errs.Error {
+	for _, item := range ranges {
+		if err := update(item); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 /*
@@ -472,34 +656,83 @@ func (q *Queries) GetOHLCV(exs *ExSymbol, timeFrame string, startMS, endMS int64
 }
 
 func GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
+	return (&Queries{}).getAdjs(sid)
+}
+
+// GetAdjs returns adjustment factors using this query's Storage and optional
+// series symbol catalog. It is the explicit counterpart of the legacy facade.
+func (q *Queries) GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
+	return q.getAdjs(sid)
+}
+
+func (q *Queries) getAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
+	options, optionsErr := q.requireKlineRuntimeOptions()
+	if optionsErr != nil {
+		return nil, optionsErr
+	}
+	_, symbolErr := resolveQuerySymbolState(q, nil)
+	if symbolErr != nil {
+		return nil, errs.New(core.ErrBadConfig, symbolErr)
+	}
+	// Keep the cache limited to the legacy facade. Explicit Storage queries
+	// must retain both their database owner and symbol catalog for the whole
+	// operation, including the connection-acquisition path below.
+	explicitQuery := q != nil && q.usesExplicitExchange()
 	amLock.Lock()
 	cache, hasOld := adjMap[sid]
 	amLock.Unlock()
-	if hasOld {
+	if hasOld && !explicitQuery {
 		return cache, nil
 	}
 	ctx := context.Background()
-	sess, conn, err2 := Conn(ctx)
-	if err2 != nil {
-		return nil, err2
+	var release func()
+	if q == nil || q.db == nil {
+		original := q
+		var err2 *errs.Error
+		var conn *pgxpool.Conn
+		if original != nil && original.storage != nil && !original.storage.legacy {
+			q, conn, err2 = original.storage.Conn(ctx)
+		} else if original != nil && original.symbols != nil {
+			q, conn, err2 = original.symbols.Conn(ctx)
+		} else {
+			q, conn, err2 = Conn(ctx)
+		}
+		if err2 != nil {
+			return nil, err2
+		}
+		if q != nil && original != nil {
+			if original.symbols != nil {
+				q = q.WithSeriesSymbolState(original.symbols)
+			}
+			if original.options != nil {
+				q = q.WithKlineRuntimeOptions(*original.options)
+			}
+			if original.exchange != nil {
+				q = q.WithExchange(original.exchange)
+			}
+		}
+		release = conn.Release
 	}
-	defer conn.Release()
-	rows, err_ := sess.GetAdjFactors(ctx, sid)
+	if release != nil {
+		defer release()
+	}
+	rows, err_ := q.GetAdjFactors(ctx, sid)
 	if err_ != nil {
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}
 	// FACS has recorded the deadline in ascending order of time, from back to front
 	// facs已按时间升序，从后往前，记录截止时间
 	adjs := make([]*AdjInfo, 0, len(rows))
-	curEnd := btime.UTCStamp()
+	curEnd := options.nowMS()
 	for i := len(rows) - 1; i >= 0; i-- {
 		f := rows[i]
 		curSid := f.SubID
 		if curSid == 0 {
 			curSid = sid
 		}
+		exs := q.symbolByID(curSid)
 		adjs = append(adjs, &AdjInfo{
-			ExSymbol: GetSymbolByID(curSid),
+			ExSymbol: exs,
 			Factor:   f.Factor,
 			StartMS:  f.StartMs,
 			StopMS:   curEnd,
@@ -507,9 +740,11 @@ func GetAdjs(sid int32) ([]*AdjInfo, *errs.Error) {
 		curEnd = f.StartMs
 	}
 	utils.ReverseArr(adjs)
-	amLock.Lock()
-	adjMap[sid] = adjs
-	amLock.Unlock()
+	if !explicitQuery {
+		amLock.Lock()
+		adjMap[sid] = adjs
+		amLock.Unlock()
+	}
 	return adjs, nil
 }
 
@@ -524,8 +759,12 @@ func (q *Queries) GetAdjOHLCV(adjs []*AdjInfo, timeFrame string, startMS, endMS 
 	if len(adjs) == 0 {
 		return nil, nil
 	}
+	options, err := q.requireKlineRuntimeOptions()
+	if err != nil {
+		return nil, err
+	}
 	if endMS == 0 {
-		endMS = btime.UTCStamp()
+		endMS = options.nowMS()
 	}
 	revRead := startMS == 0 && limit > 0
 	var result []*banexg.Kline
@@ -694,8 +933,23 @@ Batch simultaneous download of K-line
 批量同时下载K线
 */
 func BulkDownOHLCV(exchange banexg.BanExchange, exsList map[int32]*ExSymbol, timeFrame string, startMS, endMS int64, limit int, prg utils.PrgCB) *errs.Error {
+	return BulkDownOHLCVWithOptions(exchange, exsList, timeFrame, startMS, endMS, limit, prg,
+		LegacyKlineRuntimeOptions())
+}
+
+// BulkDownOHLCVWithOptions downloads each symbol using the supplied runtime
+// policy and storage owner. It is safe for concurrent runtimes because every
+// worker derives its query handle from options.Storage.
+func BulkDownOHLCVWithOptions(exchange banexg.BanExchange, exsList map[int32]*ExSymbol, timeFrame string,
+	startMS, endMS int64, limit int, prg utils.PrgCB, options KlineRuntimeOptions) *errs.Error {
+	if err := validateKlineRuntimeOptions(options); err != nil {
+		return err
+	}
+	if !options.allowDownload() {
+		return klineDownloadDisabledError("BulkDownOHLCV")
+	}
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-	startMS, endMS = parseDownArgs(tfMSecs, startMS, endMS, limit, false)
+	startMS, endMS = parseDownArgsAt(tfMSecs, startMS, endMS, limit, false, options.nowMS())
 	downTF, err := GetDownTF(timeFrame)
 	if err != nil {
 		return err
@@ -713,14 +967,60 @@ func BulkDownOHLCV(exchange banexg.BanExchange, exsList map[int32]*ExSymbol, tim
 		}
 	}
 	sidList := utils.KeysOfMap(exsList)
-	return utils.ParallelRun(sidList, core.ConcurNum, func(_ int, i int32) *errs.Error {
+	err = utils.ParallelRun(sidList, options.concurrency(), func(_ int, i int32) *errs.Error {
 		exs, _ := exsList[i]
-		if exs.DelistMs > 0 {
-			return nil
-		}
-		_, dlErr := downOHLCV2DBRange(nil, exchange, exs, downTF, startMS, endMS, 2, pBar)
-		return dlErr
+		_, dlErr := downOHLCV2DBRangeWithOptions(nil, exchange, exs, downTF, startMS, endMS, 2, pBar,
+			shouldUseOHLCVArchive(timeFrame), options)
+		return contextualKlineOperationError("download", exs.Symbol, timeFrame, startMS, endMS, 0, dlErr)
 	})
+	return contextualKlineOperationError("bulk download", fmt.Sprintf("%d pairs", len(exsList)), timeFrame, startMS, endMS, 0, err)
+}
+
+// RepairKlineRangesWithQueries rebuilds range metadata using the caller's
+// storage-bound query handle. It never falls back to the legacy database.
+func RepairKlineRangesWithQueries(sess *Queries, exsList map[int32]*ExSymbol, timeFrames []string, startMS, endMS int64) *errs.Error {
+	if sess == nil {
+		return errs.NewMsg(core.ErrDbConnFail, "repair queries are required")
+	}
+	for _, timeFrame := range timeFrames {
+		storageTF, storageErr := repairKlineStorageTimeframe(timeFrame)
+		if storageErr != nil {
+			return storageErr
+		}
+		tfMSecs := int64(utils2.TFToSecs(storageTF) * 1000)
+		if tfMSecs <= 0 {
+			return errs.NewMsg(errs.CodeParamInvalid, "invalid timeframe: %s", timeFrame)
+		}
+		for _, exs := range exsList {
+			start, stop := repairKlineWindow(exs, startMS, endMS, tfMSecs)
+			if start >= stop {
+				continue
+			}
+			if err := sess.repairKlineRangeFromPhysical(exs.ID, storageTF, start, stop); err != nil {
+				return contextualKlineOperationError("repair", exs.Symbol, storageTF, start, stop, 0, err)
+			}
+		}
+	}
+	return nil
+}
+
+// repairKlineStorageTimeframe maps a requested consumer timeframe to the
+// table that physically stores its bars.  Unconfigured periods such as 4h
+// are read by aggregating their download timeframe (1h), so their metadata
+// must be rebuilt against that table rather than a nonexistent kline_4h.
+// Explicit configured aggregates retain their own physical table.
+func repairKlineStorageTimeframe(timeFrame string) (string, *errs.Error) {
+	if _, configuredAggregate := aggMap[timeFrame]; configuredAggregate {
+		return timeFrame, nil
+	}
+	return GetDownTF(timeFrame)
+}
+
+func repairKlineWindow(exs *ExSymbol, startMS, endMS, tfMSecs int64) (int64, int64) {
+	startMS = exs.GetValidStart(startMS)
+	startMS = ((startMS + tfMSecs - 1) / tfMSecs) * tfMSecs
+	endMS = (endMS / tfMSecs) * tfMSecs
+	return startMS, endMS
 }
 
 /*
@@ -735,26 +1035,62 @@ For combination varieties, return the unweighted candlestick and the weighting f
 */
 func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame string,
 	startMS, endMS int64, limit int, handler func(string, string, []*banexg.Kline, []*AdjInfo)) *errs.Error {
-	var exsMap, err = MapExSymbols(exchange, symbols)
+	return FastBulkOHLCVWithSymbolStateAndOptions(nil, exchange, symbols, timeFrame, startMS, endMS, limit, handler,
+		LegacyKlineRuntimeOptions())
+}
+
+// FastBulkOHLCVWithSymbolState keeps low-frequency symbol resolution and
+// listing-date updates on the supplied state. Row delivery is unchanged.
+func FastBulkOHLCVWithSymbolState(state *SymbolState, exchange banexg.BanExchange, symbols []string, timeFrame string,
+	startMS, endMS int64, limit int, handler func(string, string, []*banexg.Kline, []*AdjInfo)) *errs.Error {
+	return FastBulkOHLCVWithSymbolStateAndOptions(state, exchange, symbols, timeFrame, startMS, endMS, limit, handler,
+		LegacyKlineRuntimeOptions())
+}
+
+// FastBulkOHLCVWithSymbolStateAndOptions is the explicit-runtime counterpart
+// to FastBulkOHLCVWithSymbolState. It keeps symbol resolution, listing-date
+// updates, download policy, and query retries on the supplied state.
+func FastBulkOHLCVWithSymbolStateAndOptions(state *SymbolState, exchange banexg.BanExchange, symbols []string, timeFrame string,
+	startMS, endMS int64, limit int, handler func(string, string, []*banexg.Kline, []*AdjInfo), options KlineRuntimeOptions) *errs.Error {
+	if err := validateKlineRuntimeOptions(options); err != nil {
+		return err
+	}
+	canDownload := options.allowDownload()
+	if !canDownload && !options.strictHistoricalReplay() {
+		return klineDownloadDisabledError("FastBulkOHLCV")
+	}
+	var exsMap, err = MapExSymbolsWithSymbolState(state, exchange, symbols)
 	if len(exsMap) == 0 {
 		return err
 	}
 	if err != nil {
 		log.Error("resolve pairs fail", zap.String("err", err.Short()))
 	}
-	sess, conn, err := Conn(nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-	err = EnsureListDates(sess, exchange, exsMap, nil)
-	if err != nil {
-		return err
+	if canDownload {
+		var sess *Queries
+		var conn *pgxpool.Conn
+		var connErr *errs.Error
+		if options.Storage != nil {
+			sess, conn, connErr = options.Storage.Conn(nil)
+		} else if state != nil {
+			sess, conn, connErr = state.Conn(nil)
+		} else {
+			sess, conn, connErr = Conn(nil)
+		}
+		if connErr != nil {
+			return connErr
+		}
+		sess = sess.WithSeriesSymbolState(state).WithExchange(exchange).WithKlineRuntimeOptions(options)
+		err = EnsureListDatesWithStateAndOptions(sess, state, exchange, exsMap, nil, options)
+		conn.Release()
+		if err != nil {
+			return err
+		}
 	}
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-	exInfo := exchange.Info()
-	if exchange.HasApi(banexg.ApiFetchOHLCV, exInfo.MarketType) {
-		retErr := BulkDownOHLCV(exchange, exsMap, timeFrame, startMS, endMS, limit, nil)
+	queryStartMS, queryEndMS := parseDownArgsAt(tfMSecs, startMS, endMS, limit, false, options.nowMS())
+	if canDownload && exchange.HasApi(banexg.ApiFetchOHLCV, exchange.Info().MarketType) {
+		retErr := BulkDownOHLCVWithOptions(exchange, exsMap, timeFrame, startMS, endMS, limit, nil, options)
 		if retErr != nil {
 			return retErr
 		}
@@ -762,11 +1098,10 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 	if handler == nil {
 		return nil
 	}
-	sugStartMS, sugEndMS := parseDownArgs(tfMSecs, startMS, endMS, limit, false)
-	itemNum := (sugEndMS - sugStartMS) / tfMSecs
+	itemNum := (queryEndMS - queryStartMS) / tfMSecs
 	leftArr := make([]int32, 0, len(exsMap))
+	rawMap := make(map[int32]*ExSymbol)
 	if itemNum < int64(core.KBatchSize) {
-		rawMap := make(map[int32]*ExSymbol)
 		for sid, exs := range exsMap {
 			if exs.Combined {
 				leftArr = append(leftArr, sid)
@@ -774,39 +1109,107 @@ func FastBulkOHLCV(exchange banexg.BanExchange, symbols []string, timeFrame stri
 				rawMap[sid] = exs
 			}
 		}
-		if len(rawMap) > 0 {
-			bulkHandler := func(sid int32, klines []*banexg.Kline) {
-				exs, ok := exsMap[sid]
-				if !ok {
-					return
-				}
-				handler(exs.Symbol, timeFrame, klines, nil)
-			}
-			err = sess.QueryOHLCVBatch(rawMap, timeFrame, startMS, endMS, limit, bulkHandler)
-			if err != nil {
-				return err
-			}
-		}
 	} else {
 		leftArr = utils.KeysOfMap(exsMap)
 	}
-	// 单个数量过多，逐个查询
-	for _, sid := range leftArr {
-		exs := exsMap[sid]
-		adjs, klines, err := sess.GetOHLCV(exs, timeFrame, startMS, endMS, limit, false)
-		if err != nil {
+
+	type fastBulkResult struct {
+		symbol string
+		klines []*banexg.Kline
+		adjs   []*AdjInfo
+	}
+	results := make([]fastBulkResult, 0, len(exsMap))
+	const maxFastBulkQueryRetries = 3
+	for retry := 0; retry < maxFastBulkQueryRetries; retry++ {
+		results = results[:0]
+		var sess *Queries
+		var conn *pgxpool.Conn
+		var connErr *errs.Error
+		if options.Storage != nil {
+			sess, conn, connErr = options.Storage.Conn(nil)
+		} else if state != nil {
+			sess, conn, connErr = state.Conn(nil)
+		} else {
+			sess, conn, connErr = Conn(nil)
+		}
+		if connErr != nil {
+			err = connErr
+		} else {
+			sess = sess.WithSeriesSymbolState(state).WithExchange(exchange).WithKlineRuntimeOptions(options)
+			err = nil
+			if len(rawMap) > 0 {
+				bulkHandler := func(sid int32, klines []*banexg.Kline) {
+					exs, ok := exsMap[sid]
+					if !ok {
+						return
+					}
+					results = append(results, fastBulkResult{symbol: exs.Symbol, klines: klines})
+				}
+				err = sess.QueryOHLCVBatch(rawMap, timeFrame, queryStartMS, queryEndMS, 0, bulkHandler)
+			}
+			// 单个数量过多，逐个查询
+			if err == nil {
+				for _, sid := range leftArr {
+					exs := exsMap[sid]
+					adjs, klines, queryErr := sess.GetOHLCV(exs, timeFrame, queryStartMS, queryEndMS, 0, false)
+					if queryErr != nil {
+						err = queryErr
+						break
+					}
+					results = append(results, fastBulkResult{symbol: exs.Symbol, klines: klines, adjs: adjs})
+				}
+			}
+			conn.Release()
+		}
+		if err == nil {
+			for _, result := range results {
+				deliverFastBulkOHLCV(handler, result.symbol, timeFrame, result.klines, result.adjs)
+			}
+			return nil
+		}
+		if err.Code != core.ErrDbConnFail || retry == maxFastBulkQueryRetries-1 {
 			return err
 		}
-		handler(exs.Symbol, timeFrame, klines, adjs)
+		log.Warn("retry fast bulk kline query after transient db connection failure",
+			zap.String("tf", timeFrame), zap.Int("attempt", retry+1), zap.Error(err))
+		if !options.sleep(time.Second * time.Duration(retry+1)) {
+			return errs.NewMsg(core.ErrRunTime, "fast bulk kline query interrupted")
+		}
 	}
-	return nil
+	return err
+}
+
+func deliverFastBulkOHLCV(handler func(string, string, []*banexg.Kline, []*AdjInfo), symbol, timeframe string,
+	rows []*banexg.Kline, adjs []*AdjInfo,
+) {
+	handler(symbol, timeframe, rows, adjs)
+}
+
+func allowImplicitKlineDownload() bool {
+	return !core.BackTestMode || !config.Data.BTNoKlineDownload
+}
+
+func klineDownloadDisabledError(operation string) *errs.Error {
+	return errs.NewMsg(errs.CodeNotSupport, "%s: K-line download is disabled for strict backtests", operation)
 }
 
 func MapExSymbols(exchange banexg.BanExchange, symbols []string) (map[int32]*ExSymbol, *errs.Error) {
+	return MapExSymbolsWithSymbolState(nil, exchange, symbols)
+}
+
+// MapExSymbolsWithSymbolState resolves symbols without consulting the
+// package-level catalog when state is supplied.
+func MapExSymbolsWithSymbolState(state *SymbolState, exchange banexg.BanExchange, symbols []string) (map[int32]*ExSymbol, *errs.Error) {
 	var exsMap = make(map[int32]*ExSymbol)
 	var fails = make(map[string]*errs.Error)
 	for _, pair := range symbols {
-		exs, err := GetExSymbol(exchange, pair)
+		var exs *ExSymbol
+		var err *errs.Error
+		if state == nil {
+			exs, err = GetExSymbol(exchange, pair)
+		} else {
+			exs, err = state.GetExSymbol(exchange, pair)
+		}
 		if err != nil {
 			fails[pair] = err
 		} else {
@@ -832,6 +1235,10 @@ func MapExSymbols(exchange banexg.BanExchange, symbols []string) (map[int32]*ExS
 }
 
 func parseDownArgs(tfMSecs int64, startMS, endMS int64, limit int, withUnFinish bool) (int64, int64) {
+	return parseDownArgsAt(tfMSecs, startMS, endMS, limit, withUnFinish, btime.TimeMS())
+}
+
+func parseDownArgsAt(tfMSecs int64, startMS, endMS int64, limit int, withUnFinish bool, nowMS int64) (int64, int64) {
 	if startMS > 0 && startMS != core.MSMinStamp {
 		fixStartMS := utils2.AlignTfMSecs(startMS, tfMSecs)
 		if startMS > fixStartMS {
@@ -842,7 +1249,7 @@ func parseDownArgs(tfMSecs int64, startMS, endMS int64, limit int, withUnFinish 
 		}
 	}
 	if endMS == 0 {
-		endMS = btime.TimeMS()
+		endMS = nowMS
 	}
 	alignEndMS := utils2.AlignTfMSecs(endMS, tfMSecs)
 	if withUnFinish && endMS%tfMSecs > 0 {
@@ -856,8 +1263,16 @@ func parseDownArgs(tfMSecs int64, startMS, endMS int64, limit int, withUnFinish 
 }
 
 func (q *Queries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, *errs.Error) {
-	ctx := context.Background()
-	if !IsQuestDB {
+	return q.GetCalendarsWithContext(context.Background(), name, startMS, stopMS)
+}
+
+// GetCalendarsWithContext reads calendar ranges using the caller's runtime
+// cancellation scope.
+func (q *Queries) GetCalendarsWithContext(ctx context.Context, name string, startMS, stopMS int64) ([][2]int64, *errs.Error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !q.isQuestDB() {
 		cals, err := q.getCalendarsPg(ctx, name)
 		if err != nil {
 			return nil, NewDbErr(core.ErrDbReadFail, err)
@@ -874,11 +1289,11 @@ func (q *Queries) GetCalendars(name string, startMS, stopMS int64) ([][2]int64, 
 		}
 		return result, nil
 	}
-	unlock := LockCompactTableRead("calendars_q")
+	unlock := q.LockCompactTableRead("calendars_q")
 	defer unlock()
 	sqlText := `SELECT start_ms, stop_ms
-FROM calendars_q
-LATEST BY market, start_ms
+FROM (SELECT * FROM calendars_q
+  LATEST BY market, start_ms WHERE market = $1)
 WHERE market = $1 AND coalesce(is_deleted, false) = false`
 	args := []any{name}
 	if startMS > 0 {
@@ -911,7 +1326,7 @@ func (q *Queries) SetCalendars(name string, items [][2]int64) *errs.Error {
 	startMS, stopMS := items[0][0], items[len(items)-1][1]
 	ctx := context.Background()
 
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		// TimescaleDB: DELETE old rows for this market, then INSERT new.
 		if err := q.delCalendarsPg(ctx, name); err != nil {
 			return NewDbErr(core.ErrDbExecFail, err)
@@ -926,12 +1341,12 @@ func (q *Queries) SetCalendars(name string, items [][2]int64) *errs.Error {
 		}
 		return nil
 	}
-	unlock := LockCompactTableRead("calendars_q")
+	unlock := q.LockCompactTableRead("calendars_q")
 	defer unlock()
 
 	sqlText := `SELECT market, start_ms, stop_ms
-FROM calendars_q
-LATEST BY market, start_ms
+FROM (SELECT * FROM calendars_q
+  LATEST BY market, start_ms WHERE market = $1)
 WHERE market = $1 AND coalesce(is_deleted, false) = false`
 	if startMS > 0 {
 		sqlText += fmt.Sprintf(" AND stop_ms > %d", startMS)
@@ -958,7 +1373,10 @@ WHERE market = $1 AND coalesce(is_deleted, false) = false`
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
 
-	now := time.Now().UTC()
+	now, err := q.reserveMetadataVersions(ctx, "calendars_q", len(olds)+len(items), time.Time{})
+	if err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
+	}
 	microOff := 0
 
 	if len(olds) > 0 {
@@ -992,7 +1410,7 @@ WHERE market = $1 AND coalesce(is_deleted, false) = false`
 			return NewDbErr(core.ErrDbReadFail, err)
 		}
 	}
-	MarkTableForCompact("calendars_q", len(olds))
+	q.MarkTableForCompact("calendars_q", len(olds))
 	return nil
 }
 
@@ -1004,6 +1422,12 @@ For the 365 * 24 coin circle, it will not stop and return empty
 对于币圈365*24不休，返回空
 */
 func GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start, stop int64, full bool) ([][2]int64, *errs.Error) {
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	if exs == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange symbol is required")
+	}
 	exInfo := exchange.Info()
 	if exInfo.FullDay && exInfo.NoHoliday {
 		// 365天全年无休，且24小时可交易，不存在休息时间段

@@ -333,3 +333,13 @@ banbot tool:
     bt_factor:      backtest factors with orders
     bt_result:      build backtest result from orders.gob and config
 ```
+
+## Factor and cross-sectional engine
+
+`bot backtest` and `bot trade` load one YAML `run_policy` and dispatch time-series, factor or mixed strategies. For factor replay, `backtest --mode weights|events` overrides `execution.mode`; absent both, the default is `events`. Mixed replay requires `events`. Factor/mixed `trade --dry-run` runs historical events replay; time-series live simulation continues to use `env: dry_run`. Real factor/mixed trading accepts `--live-provider` and requires a verified binding.
+
+Factor research is root `bot research --config strategy.yml`, archive conversion is `bot data archive`, and standalone expressions use root `bot validate --spec formula.yml` / `bot explain --spec formula.yml`. Strategy configuration uses unified YAML only; paths follow originating fields. Default files, `--datadir` and `--no-default` work the same for all engine types.
+
+bot tool bt_factor on this page is the legacy orders.gob / strat.FactorMap rolling-selection tool, separate from the native factor runner.
+
+See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).

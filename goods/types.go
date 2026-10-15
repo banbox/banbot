@@ -1,7 +1,13 @@
 package goods
 
 import (
+	"sync"
+
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/go-viper/mapstructure/v2"
 )
@@ -12,9 +18,48 @@ type IFilter interface {
 	Filter(pairs []string, timeMS int64) ([]string, *errs.Error)
 }
 
+// SymbolStateFilter is an optional extension for filters that need symbol or
+// historical data. Existing custom filters can keep implementing IFilter and
+// are called through their legacy method by state-aware callers.
+type SymbolStateFilter interface {
+	FilterWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, pairs []string, timeMS int64) ([]string, *errs.Error)
+}
+
+// RuntimeDeps binds pair filters to one runtime's typed state. Filters use
+// these concrete fields directly, keeping the selection path independent of
+// package globals while preserving the existing IFilter API for legacy users.
+type RuntimeDeps struct {
+	Core     *core.State
+	Clock    *btime.ClockState
+	Config   *config.Config
+	DataDir  string
+	Symbols  *orm.SymbolState
+	Storage  *orm.Storage
+	Exchange banexg.BanExchange
+	ShowLog  bool
+}
+
+// RuntimeFilter is implemented by built-in filters that need runtime-owned
+// configuration or mutable state. Custom filters can continue implementing
+// SymbolStateFilter or IFilter.
+type RuntimeFilter interface {
+	FilterWithRuntimeDeps(deps *RuntimeDeps, pairs []string, timeMS int64) ([]string, *errs.Error)
+}
+
 type IProducer interface {
 	IFilter
 	GenSymbols(timeMS int64) ([]string, *errs.Error)
+}
+
+// SymbolStateProducer is the optional state-aware form of IProducer.
+type SymbolStateProducer interface {
+	IProducer
+	GenSymbolsWithSymbolState(state *orm.SymbolState, exchange banexg.BanExchange, timeMS int64) ([]string, *errs.Error)
+}
+
+// RuntimeProducer is the runtime-aware form of a pair producer.
+type RuntimeProducer interface {
+	GenSymbolsWithRuntimeDeps(deps *RuntimeDeps, timeMS int64) ([]string, *errs.Error)
 }
 
 type BaseFilter struct {
@@ -112,6 +157,7 @@ type FilterFactory func(base BaseFilter) IFilter
 
 // FilterRegistry holds all registered filter factories
 var filterRegistry = make(map[string]FilterFactory)
+var filterRegistryMu sync.RWMutex
 
 // RegisterFilter registers a custom filter factory with the given name
 // This allows users to create and register their own filters
@@ -133,21 +179,34 @@ var filterRegistry = make(map[string]FilterFactory)
 //	    })
 //	}
 func RegisterFilter(name string, factory FilterFactory) {
+	if name == "" {
+		panic("filter name must not be empty")
+	}
+	if factory == nil {
+		panic("filter factory must not be nil")
+	}
+	filterRegistryMu.Lock()
 	filterRegistry[name] = factory
+	filterRegistryMu.Unlock()
 }
 
 // GetFilterFactory returns the factory function for a given filter name
 func GetFilterFactory(name string) (FilterFactory, bool) {
+	filterRegistryMu.RLock()
 	factory, ok := filterRegistry[name]
+	filterRegistryMu.RUnlock()
 	return factory, ok
 }
 
 // CreateFilter creates a filter instance from config using the registry
 func CreateFilter(cfg *config.CommonPairFilter, allowEmpty bool) (IFilter, *errs.Error) {
+	if cfg == nil {
+		return nil, errs.NewMsg(errs.CodeParamRequired, "filter config is required")
+	}
 	base := BaseFilter{Name: cfg.Name, AllowEmpty: allowEmpty}
 
 	// Try to get from registry first
-	if factory, ok := filterRegistry[cfg.Name]; ok {
+	if factory, ok := GetFilterFactory(cfg.Name); ok {
 		filter := factory(base)
 		err := mapstructure.Decode(cfg.Items, &filter)
 		if err != nil {

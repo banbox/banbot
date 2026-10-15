@@ -4,18 +4,241 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
+	"io"
 	"math/big"
+	"net"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestBanConnWriteIdleDeadlineDiscardsConnection(t *testing.T) {
+	oldTimeout := banConnWriteIdleTimeout
+	banConnWriteIdleTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { banConnWriteIdleTimeout = oldTimeout })
+	left, right := net.Pipe()
+	conn := &BanConn{Conn: left, Ready: true}
+	t.Cleanup(func() {
+		_ = left.Close()
+		_ = right.Close()
+	})
+
+	started := time.Now()
+	err := conn.WriteMsg(&IOMsg{Action: "blocked"})
+	if err == nil {
+		t.Fatal("blocked write unexpectedly succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("blocked write took %s", elapsed)
+	}
+	if conn.getConn() != nil || conn.Ready {
+		t.Fatal("failed frame connection remained reusable")
+	}
+}
+
+func TestBanConnReadRejectsOversizedFrameBeforeAllocation(t *testing.T) {
+	left, right := net.Pipe()
+	conn := &BanConn{Conn: left, Ready: true}
+	t.Cleanup(func() {
+		_ = left.Close()
+		_ = right.Close()
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var header [4]byte
+		binary.LittleEndian.PutUint32(header[:], banConnMaxFrameBytes+1)
+		_, _ = right.Write(header[:])
+	}()
+	if _, err := conn.Read(); err == nil || !strings.Contains(err.Error(), "frame exceeds") {
+		t.Fatalf("oversized frame error=%v", err)
+	}
+	<-done
+}
+
+func TestDeCompressRejectsOversizedMessage(t *testing.T) {
+	payload := make([]byte, banConnMaxMessageBytes+1)
+	compressed, err := compress(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = deCompress(compressed); err == nil || !strings.Contains(err.Error(), "message exceeds") {
+		t.Fatalf("oversized message error=%v", err)
+	}
+}
+
+func TestBanConnWriteIdleDeadlineAllowsSlowProgress(t *testing.T) {
+	oldTimeout := banConnWriteIdleTimeout
+	banConnWriteIdleTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { banConnWriteIdleTimeout = oldTimeout })
+	left, right := net.Pipe()
+	conn := &BanConn{Conn: left, Ready: true}
+	t.Cleanup(func() {
+		_ = left.Close()
+		_ = right.Close()
+	})
+	payload := make([]byte, 256<<10)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(right, lenBuf); err != nil {
+			readDone <- err
+			return
+		}
+		remaining := int(binary.LittleEndian.Uint32(lenBuf))
+		buf := make([]byte, 32<<10)
+		for remaining > 0 {
+			size := min(len(buf), remaining)
+			if _, err := io.ReadFull(right, buf[:size]); err != nil {
+				readDone <- err
+				return
+			}
+			remaining -= size
+			time.Sleep(10 * time.Millisecond)
+		}
+		readDone <- nil
+	}()
+	started := time.Now()
+	if err := conn.WriteMsg(&IOMsg{Action: "slow", Data: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed <= banConnWriteIdleTimeout {
+		t.Fatalf("write completed too quickly to test idle deadline: %s", elapsed)
+	}
+}
+
+func TestBanConnCoreStopFromHandlerDoesNotDeadlock(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	state, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &BanConn{
+		Conn:    clientConn,
+		Data:    map[string]interface{}{},
+		Listens: map[string]ConnCB{},
+		Ready:   true,
+	}
+	state.OnExit(func() { _ = conn.Stop() })
+	callbackDone := make(chan struct{})
+	conn.Listens["stop"] = func(*IOMsgRaw) {
+		state.Stop()
+		close(callbackDone)
+	}
+	loopDone := make(chan struct{})
+	go func() {
+		_ = conn.RunForever()
+		close(loopDone)
+	}()
+
+	server := &BanConn{Conn: serverConn, Ready: true}
+	if err := server.Write(&IOMsgRaw{Action: "stop"}); err != nil {
+		t.Fatalf("write stop message: %v", err)
+	}
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("Core.Stop from BanConn handler deadlocked")
+	}
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("BanConn loop did not exit after Core.Stop")
+	}
+}
+
+func TestBanConnStopJoinWaitsForAdmittedHandler(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	conn := &BanConn{
+		Conn: clientConn,
+		Data: map[string]interface{}{},
+		Listens: map[string]ConnCB{"block": func(*IOMsgRaw) {
+			close(entered)
+			<-release
+		}},
+		Ready: true,
+	}
+	loopDone := make(chan struct{})
+	go func() {
+		_ = conn.RunForever()
+		close(loopDone)
+	}()
+
+	server := &BanConn{Conn: serverConn, Ready: true}
+	if err := server.Write(&IOMsgRaw{Action: "block"}); err != nil {
+		t.Fatalf("write blocking message: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("socket handler did not start")
+	}
+
+	joined := make(chan struct{})
+	go func() {
+		if err := conn.Stop(); err != nil {
+			t.Errorf("stop connection: %v", err)
+		}
+		conn.Join()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+		t.Fatal("Stop+Join returned before handler completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if conn.beginHandler() {
+		conn.handlerWait.Done()
+		t.Fatal("handler admitted after Stop")
+	}
+	close(release)
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("Join did not wait for handler")
+	}
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("connection loop did not exit after Stop")
+	}
+}
 
 func TestBanServer(t *testing.T) {
 	requireManualBanIOTest(t)
@@ -24,7 +247,7 @@ func TestBanServer(t *testing.T) {
 	go func() {
 		for {
 			time.Sleep(time.Millisecond * 300)
-			for _, conn := range server.Conns {
+			for _, conn := range server.ConnectionsSnapshot() {
 				if conn.IsClosed() {
 					continue
 				}
@@ -38,6 +261,103 @@ func TestBanServer(t *testing.T) {
 	err := server.RunForever(0, 0)
 	if err != nil {
 		panic(err)
+	}
+}
+
+func TestServerIOConnectionsConcurrentSnapshot(t *testing.T) {
+	server := NewBanServer("", "")
+	const count = 100
+	conns := make([]IBanConn, count)
+	for i := range conns {
+		left, right := net.Pipe()
+		conns[i] = server.WrapConn(left)
+		t.Cleanup(func() {
+			_ = left.Close()
+			_ = right.Close()
+		})
+	}
+
+	var wg sync.WaitGroup
+	for _, conn := range conns {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			server.AddConnection(conn)
+			server.RemoveConnection(conn)
+		}()
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				_ = server.ConnectionsSnapshot()
+			}
+		}()
+	}
+	wg.Wait()
+	if got := len(server.ConnectionsSnapshot()); got != 0 {
+		t.Fatalf("connections after removal = %d", got)
+	}
+}
+
+func TestNewServerIOKeepsLegacyServerStateUntouched(t *testing.T) {
+	oldServer, oldClient := banServer, banClient
+	banServer, banClient = nil, nil
+	t.Cleanup(func() { banServer, banClient = oldServer, oldClient })
+
+	legacy := NewBanServer("", "")
+	owned := NewServerIO("", "")
+	if banServer != legacy {
+		t.Fatal("NewServerIO replaced the legacy server")
+	}
+	if !HasBanConn() {
+		t.Fatal("legacy server was not visible to legacy connection helpers")
+	}
+	lock, err := GetNetLock("owned_constructor", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.GetVal("lock_owned_constructor") == "" {
+		t.Fatal("legacy net lock was not stored on the legacy server")
+	}
+	if owned.GetVal("lock_owned_constructor") != "" {
+		t.Fatal("legacy net lock was stored on the owned server")
+	}
+	if err := DelNetLock("owned_constructor", lock); err != nil {
+		t.Fatal(err)
+	}
+
+	banServer = nil
+	if HasBanConn() {
+		t.Fatal("owned server affected legacy connection detection")
+	}
+}
+
+func TestServerIOValuesConcurrentAndExpired(t *testing.T) {
+	server := NewServerIO("", "")
+	if server.DataExp == nil {
+		t.Fatal("owned server did not initialize expiration state")
+	}
+	const workers = 16
+	const iterations = 100
+	var wg sync.WaitGroup
+	for worker := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range iterations {
+				key := fmt.Sprintf("key-%d", i%4)
+				server.SetVal(&KeyValExpire{Key: key, Val: fmt.Sprintf("%d-%d", worker, i)})
+				_ = server.GetVal(key)
+			}
+		}()
+	}
+	wg.Wait()
+
+	server.SetVal(&KeyValExpire{Key: "expired", Val: "value"})
+	server.dataMu.Lock()
+	server.DataExp["expired"] = btime.TimeMS() - 1
+	server.dataMu.Unlock()
+	if got := server.GetVal("expired"); got != "" {
+		t.Fatalf("expired value = %q, want empty", got)
 	}
 }
 
@@ -90,6 +410,7 @@ func TestBanClient(t *testing.T) {
 
 func requireManualBanIOTest(t *testing.T) {
 	t.Helper()
+	testutil.RequireIntegration(t)
 	if os.Getenv("BANBOT_RUN_MANUAL_BANIO_TESTS") != "1" {
 		t.Skip("set BANBOT_RUN_MANUAL_BANIO_TESTS=1 for the external server/client smoke test")
 	}

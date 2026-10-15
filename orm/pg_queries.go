@@ -5,10 +5,10 @@ package orm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
@@ -17,6 +17,7 @@ import (
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
@@ -208,53 +209,87 @@ func (q *Queries) getKLineNumPg(sid int32, timeFrame string, start, end int64) i
 // ─────────────────────────────────────────────
 
 // refreshAggPg uses an in-DB INSERT … SELECT … GROUP BY for efficient aggregation in TimescaleDB.
-func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64, aggFrom string) *errs.Error {
+func (q *Queries) refreshAggPg(item *KlineAgg, sid int32, aggStart, endMS int64, aggFrom string, delistMS int64) (int64, int64, *errs.Error) {
 	if aggFrom == "" {
 		aggFrom = item.AggFrom
 	}
 	if aggFrom == "" {
-		return nil
+		return 0, 0, nil
 	}
 	fromTbl := "kline_" + aggFrom
 	toTbl := item.Table
 	tfMSecs := item.MSecs
+	fromTfMSecs := int64(utils2.TFToSecs(aggFrom) * 1000)
+	if fromTfMSecs <= 0 || tfMSecs%fromTfMSecs != 0 {
+		return 0, 0, errs.NewMsg(core.ErrBadConfig, "invalid aggregate source %s for %s", aggFrom, item.TimeFrame)
+	}
 	// Align windows (accounting for exchange-specific offset).
-	offMS := GetAlignOff(sid, tfMSecs)
+	exs := q.symbolByID(sid)
+	offMS := q.alignOff(exs, tfMSecs)
+	if offMS == 0 && exs == nil && q.usesLegacySymbolCatalog() {
+		offMS = GetAlignOff(sid, tfMSecs)
+	}
 	alignedStart := utils2.AlignTfMSecs(aggStart-offMS, tfMSecs) + offMS
 	alignedEnd := utils2.AlignTfMSecs(endMS-offMS, tfMSecs) + offMS
 	if alignedStart >= alignedEnd {
-		return nil
+		return 0, 0, nil
 	}
-
 	// Calculate bar group key in SQL: floor((time - offMS) / tfMSecs) * tfMSecs + offMS.
 	// For UTC-aligned exchanges offMS == 0 which simplifies to (time / tfMSecs) * tfMSecs.
 	groupExpr := buildAggGroupExpr(tfMSecs, offMS)
 
-	insertSQL := fmt.Sprintf(`INSERT INTO %s (sid, time, open, high, low, close, volume, quote, buy_volume, trade_num)
-SELECT $1,
+	insertSQL := fmt.Sprintf(`WITH complete AS MATERIALIZED (
+SELECT $1::integer AS sid,
        %s AS bar_time,
-       (array_agg(open ORDER BY time))[1],
-       MAX(high),
-       MIN(low),
-       (array_agg(close ORDER BY time DESC))[1],
-       SUM(volume),
-       SUM(quote),
-       SUM(buy_volume),
-       SUM(trade_num)
+       (array_agg(open ORDER BY time))[1] AS open,
+       MAX(high) AS high,
+       MIN(low) AS low,
+       (array_agg(close ORDER BY time DESC))[1] AS close,
+       SUM(volume) AS volume,
+       SUM(quote) AS quote,
+       SUM(buy_volume) AS buy_volume,
+       SUM(trade_num) AS trade_num
 FROM %s
 WHERE sid = $1 AND time >= $2 AND time < $3
 GROUP BY bar_time
-HAVING COUNT(*) > 0
+HAVING COUNT(*) = %d OR ($4::bigint > %s AND $4::bigint < %s + %d)
+), deleted AS (
+  DELETE FROM %s target
+  WHERE target.sid = $1 AND target.time >= $2 AND target.time < $3
+    AND NOT EXISTS (SELECT 1 FROM complete WHERE complete.bar_time = target.time)
+  RETURNING target.time
+)
+INSERT INTO %s (sid, time, open, high, low, close, volume, quote, buy_volume, trade_num)
+SELECT sid, bar_time, open, high, low, close, volume, quote, buy_volume, trade_num
+FROM complete
 ON CONFLICT (sid, time) DO UPDATE SET
   open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
   volume = EXCLUDED.volume, quote = EXCLUDED.quote, buy_volume = EXCLUDED.buy_volume, trade_num = EXCLUDED.trade_num`,
-		toTbl, groupExpr, fromTbl)
+		groupExpr, fromTbl, tfMSecs/fromTfMSecs, groupExpr, groupExpr, tfMSecs, toTbl, toTbl)
 
-	_, err := q.db.Exec(context.Background(), insertSQL, sid, alignedStart, alignedEnd)
+	_, err := q.db.Exec(context.Background(), insertSQL, sid, alignedStart, alignedEnd, delistMS)
 	if err != nil {
-		return NewDbErr(core.ErrDbExecFail, err)
+		return 0, 0, NewDbErr(core.ErrDbExecFail, err)
 	}
-	return nil
+	return alignedStart, alignedEnd, nil
+}
+
+func (q *Queries) getDelistMSPg(sid int32) (int64, *errs.Error) {
+	var delistMS int64
+	err := q.db.QueryRow(context.Background(),
+		"SELECT COALESCE((SELECT delist_ms FROM exsymbol WHERE id = $1), 0)", sid,
+	).Scan(&delistMS)
+	if err != nil {
+		return 0, NewDbErr(core.ErrDbReadFail, err)
+	}
+	return delistMS, nil
+}
+
+// allowPartialTerminalAggregate returns true only for a market that ended in
+// the middle of this aggregate candle. Its lower-timeframe bars are real
+// market data, while an active market's unfinished candle must remain absent.
+func allowPartialTerminalAggregate(delistMS, barStartMS, timeframeMS int64) bool {
+	return delistMS > barStartMS && delistMS < barStartMS+timeframeMS
 }
 
 // ─────────────────────────────────────────────
@@ -311,35 +346,102 @@ func (q *Queries) listExchangesPg(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-func (q *Queries) addSymbolsPg(ctx context.Context, arg []AddSymbolsParams) (int64, error) {
-	if len(arg) == 0 || ctx == nil {
+func (q *Queries) addSymbolsPg(ctx context.Context, state *SymbolState, arg []AddSymbolsParams) (result int64, retErr error) {
+	if len(arg) == 0 {
 		return 0, nil
 	}
-	// Sync maxSid from DB before assigning new IDs.
-	if latest := queryMaxSidFromPg(ctx, q.db); latest > maxSid {
-		maxSid = latest
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	state = symbolStateOrDefault(state)
+	if !isProductionDBHandle(q.db) {
+		return q.addSymbolsPgCompatibility(ctx, state, arg)
 	}
 	for i, s := range arg {
-		maxSid++
-		sid := maxSid
-		_, err := q.db.Exec(ctx, `INSERT INTO exsymbol (id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	ON CONFLICT (exchange, market, symbol) DO NOTHING`,
-			sid, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs, s.AggRules)
-		if err != nil {
+		row := q.db.QueryRow(ctx, `INSERT INTO public.exsymbol AS e
+  (exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (exchange, market, symbol)
+DO UPDATE SET exchange = e.exchange
+RETURNING id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules`,
+			s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs, s.AggRules)
+		var stored ExSymbol
+		if err := row.Scan(&stored.ID, &stored.Exchange, &stored.ExgReal, &stored.Market, &stored.Symbol,
+			&stored.Combined, &stored.ListMs, &stored.DelistMs, &stored.AggRules); err != nil {
 			return int64(i), err
+		}
+		key := exSymbolKey(stored.Exchange, stored.Market, stored.Symbol)
+		if err := state.sidAllocator().reserveSIDBatch([]sidReservation{{key: key, id: stored.ID}}); err != nil {
+			return int64(i), fmt.Errorf("reserve persisted exchange symbol %s sid %d: %w", key, stored.ID, err)
+		}
+		if err := state.cacheExSymbolChecked(&stored); err != nil {
+			return int64(i), fmt.Errorf("cache persisted exchange symbol %s sid %d: %w", key, stored.ID, err)
 		}
 	}
 	return int64(len(arg)), nil
 }
 
-func queryMaxSidFromPg(ctx context.Context, db DBTX) int32 {
+// addSymbolsPgCompatibility keeps in-memory DB doubles and old package-local
+// callers useful. Real database handles always use the sequence-backed path
+// above; this fallback is never a source of production persistence guarantees.
+func (q *Queries) addSymbolsPgCompatibility(ctx context.Context, state *SymbolState, arg []AddSymbolsParams) (result int64, retErr error) {
+	allocator := state.sidAllocator()
+	release, err := acquireLocalSIDReservationLease(ctx, allocator)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if releaseErr := release(); releaseErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("release exchange symbol SID lease: %w", releaseErr))
+		}
+	}()
+	dbMax, err := queryMaxSidFromPg(ctx, q.db)
+	if err != nil {
+		return 0, err
+	}
+	prepareSymbolSIDAllocation(allocator, state, dbMax)
+	for i, s := range arg {
+		sid := nextSymbolSID(allocator, state)
+		row := q.db.QueryRow(ctx, `INSERT INTO exsymbol (id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	ON CONFLICT (exchange, market, symbol) DO UPDATE SET exchange = exsymbol.exchange
+	RETURNING id, exchange, exg_real, market, symbol, combined, list_ms, delist_ms, agg_rules`,
+			sid, s.Exchange, s.ExgReal, s.Market, s.Symbol, s.Combined, s.ListMs, s.DelistMs, s.AggRules)
+		var stored ExSymbol
+		if err := row.Scan(&stored.ID, &stored.Exchange, &stored.ExgReal, &stored.Market, &stored.Symbol,
+			&stored.Combined, &stored.ListMs, &stored.DelistMs, &stored.AggRules); err != nil {
+			return int64(i), err
+		}
+		key := exSymbolKey(stored.Exchange, stored.Market, stored.Symbol)
+		if err := allocator.reserveSIDBatch([]sidReservation{{key: key, id: stored.ID}}); err != nil {
+			return int64(i), fmt.Errorf("reserve persisted exchange symbol %s sid %d: %w", key, stored.ID, err)
+		}
+		if err := state.cacheExSymbolChecked(&stored); err != nil {
+			return int64(i), fmt.Errorf("cache persisted exchange symbol %s sid %d: %w", key, stored.ID, err)
+		}
+	}
+	return int64(len(arg)), nil
+}
+
+func isProductionDBHandle(db DBTX) bool {
+	switch db.(type) {
+	case *SubQueries, *pgxpool.Pool, *pgxpool.Conn, *pgx.Conn, pgx.Tx:
+		return true
+	default:
+		return false
+	}
+}
+
+func queryMaxSidFromPg(ctx context.Context, db DBTX) (int32, error) {
 	var maxVal *int32
 	row := db.QueryRow(ctx, `SELECT max(id) FROM exsymbol`)
-	if err := row.Scan(&maxVal); err != nil || maxVal == nil {
-		return 0
+	if err := row.Scan(&maxVal); err != nil {
+		return 0, err
 	}
-	return *maxVal
+	if maxVal == nil {
+		return 0, nil
+	}
+	return *maxVal, nil
 }
 
 func (q *Queries) setListMSPg(ctx context.Context, arg SetListMSParams) error {
@@ -356,11 +458,6 @@ func (q *Queries) setAggRulesPg(ctx context.Context, arg SetAggRulesParams) erro
 		ctx = context.Background()
 	}
 	_, err := q.db.Exec(ctx, `UPDATE exsymbol SET agg_rules = $1 WHERE id = $2`, arg.AggRules, arg.ID)
-	if err == nil {
-		if exs := GetSymbolByID(arg.ID); exs != nil {
-			exs.AggRules = arg.AggRules
-		}
-	}
 	return err
 }
 
@@ -461,7 +558,7 @@ func (q *Queries) delAdjFactorsPg(ctx context.Context, sid int32) error {
 	return err
 }
 
-func delFactorsPg(ctx context.Context, sid int32, startMS, endMS int64) *errs.Error {
+func (q *Queries) delFactorsPg(ctx context.Context, sid int32, startMS, endMS int64) *errs.Error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -477,7 +574,7 @@ func delFactorsPg(ctx context.Context, sid int32, startMS, endMS int64) *errs.Er
 		sqlText += fmt.Sprintf(" AND start_ms < $%d", argIdx)
 		args = append(args, endMS)
 	}
-	_, err := pool.Exec(ctx, sqlText, args...)
+	_, err := q.db.Exec(ctx, sqlText, args...)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
@@ -549,9 +646,9 @@ func (q *Queries) delInsKlinePg(ctx context.Context, sid int32, timeframe string
 // kline_un (unfinished bar) operations for TimescaleDB
 // ─────────────────────────────────────────────
 
-func queryUnfinishPg(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline, int64, *int64, error) {
+func (q *Queries) queryUnfinishPg(sid int32, timeFrame string, barStartMS int64) (*banexg.Kline, int64, *int64, error) {
 	ctx := context.Background()
-	row := pool.QueryRow(ctx, `SELECT start_ms, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
+	row := q.db.QueryRow(ctx, `SELECT start_ms, open, high, low, close, volume, quote, buy_volume, trade_num, stop_ms, expire_ms
 FROM kline_un
 WHERE sid = $1 AND timeframe = $2 AND start_ms >= $3`,
 		sid, timeFrame, barStartMS,
@@ -574,10 +671,10 @@ WHERE sid = $1 AND timeframe = $2 AND start_ms >= $3`,
 	return bar, stopMs, &expireMsVal, nil
 }
 
-func setUnfinishPg(sid int32, tf string, endMS int64, bar *banexg.Kline) *errs.Error {
-	expireMS := utils2.AlignTfMSecs(btime.UTCStamp(), 60000) + 60000
+func (q *Queries) setUnfinishPg(sid int32, tf string, endMS int64, bar *banexg.Kline, options KlineRuntimeOptions) *errs.Error {
+	expireMS := utils2.AlignTfMSecs(options.nowMS(), 60000) + 60000
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO kline_un (sid, timeframe, start_ms, stop_ms, expire_ms,
+	_, err := q.db.Exec(ctx, `INSERT INTO kline_un (sid, timeframe, start_ms, stop_ms, expire_ms,
 open, high, low, close, volume, quote, buy_volume, trade_num)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 ON CONFLICT (sid, timeframe) DO UPDATE SET
@@ -593,20 +690,20 @@ ON CONFLICT (sid, timeframe) DO UPDATE SET
 	return nil
 }
 
-func delKLineUnPg(ctx context.Context, sid int32, timeFrame string) *errs.Error {
+func (q *Queries) delKLineUnPg(ctx context.Context, sid int32, timeFrame string) *errs.Error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	_, err := pool.Exec(ctx, `DELETE FROM kline_un WHERE sid = $1 AND timeframe = $2`, sid, timeFrame)
+	_, err := q.db.Exec(ctx, `DELETE FROM kline_un WHERE sid = $1 AND timeframe = $2`, sid, timeFrame)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil
 }
 
-func purgeKlineUnPg() *errs.Error {
+func (q *Queries) purgeKlineUnPg() *errs.Error {
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `TRUNCATE TABLE kline_un`)
+	_, err := q.db.Exec(ctx, `TRUNCATE TABLE kline_un`)
 	if err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
@@ -632,7 +729,7 @@ func (q *Queries) delKLinesPgBySid(timeFrame string, delSids map[int32]bool) *er
 		delList = append(delList, itoa(int64(sid)))
 	}
 	sidIn := strings.Join(delList, ",")
-	_, err_ := pool.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE sid IN (%s)", tblName, sidIn))
+	_, err_ := q.db.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE sid IN (%s)", tblName, sidIn))
 	if err_ != nil {
 		return NewDbErr(core.ErrDbExecFail, err_)
 	}
@@ -730,7 +827,11 @@ ORDER BY sid, time`, tblName, buildPgTimeFilter(startMs, finishEndMS), sidText)
 	callBack := func() {
 		if fromTfMSecs > 0 {
 			var lastDone bool
-			offMS := GetAlignOff(curSid, tfMSecs)
+			exs := exsMap[curSid]
+			offMS := q.alignOff(exs, tfMSecs)
+			if offMS == 0 && exs == nil && q.usesLegacySymbolCatalog() {
+				offMS = GetAlignOff(curSid, tfMSecs)
+			}
 			klineArr, lastDone = utils.BuildOHLCV(klineArr, tfMSecs, 0, nil, fromTfMSecs, offMS)
 			if !lastDone && len(klineArr) > 0 {
 				klineArr = klineArr[:len(klineArr)-1]

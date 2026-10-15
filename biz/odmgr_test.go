@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
@@ -27,6 +28,7 @@ buy at 3255.5597 would cost at least 525 secs to fill 7.1%
 buy at 3084.2145 would cost at least 525 secs to fill 3.5%
 */
 func TestCalcSecsForPrice(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)
@@ -70,6 +72,7 @@ func TestCalcSecsForPrice(t *testing.T) {
 }
 
 func TestOrmQueries(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)

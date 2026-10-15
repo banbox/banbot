@@ -16,13 +16,15 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 核心数据流是：
 
 1. 配置和命令参数进入 `entry`。
-2. 公共初始化由 `biz.SetupComs` 或 `biz.SetupComsExg` 完成。
-3. 策略和交易对由 `goods`、`strat`、`biz` 共同生成运行任务。
+2. 配置型入口创建 `runtime.Process` 与任务专属的 `runtime.Runtime`，并向其注入配置快照、存储、交易所和取消信号。
+3. `entry` 按唯一 RunSpec 的 `run_policy.engine` 选择 `time_series` / `factor`。时序任务由 `goods`、`strat`、`biz` 生成；因子任务使用 `factor/runner` 的定义、组合、Universe 与决策计划。
 4. 行情或第三方时序数据由 `data` 统一转换为 `orm.DataSeries`。
-5. `biz.Trader` 将数据分发到策略，策略产出进出场请求。
-6. `biz` 订单管理器按运行模式执行本地撮合或实盘交易所下单。
+5. 时序由 `biz.Trader` 分发到 jobs 产生进出场请求；因子由 VersionStore/Snapshot/Session 冻结当轮可见数据，组合多列输出，由 builder 生成理想权重；可选 PortfolioPolicy 根据独立日程和真实持仓证据生成 Full/Patch 的 NAV 权重/绝对数量目标。
+6. 时序订单 manager 保留兼容投影，因子 AccountSink 与 mixed 策略进入 `execution.SharedAccount`，在保留归属/预算下净额执行。weights 使用近似 Book；真实 live 必须通过 verified binding 和账户对账。
 7. `orm` 持久化 K 线、时序数据、订单、任务和 UI 相关状态。
 8. `web`、`rpc`、`live` 提供可观测、控制和通知能力。
+
+v0.6.0-beta.6 的组合策略、原子 checkpoint 和尾仓订阅见 [组合与持仓指南](factor_portfolio_guide.md)；多期限与模型/风险/实验接口见 [研究扩展](factor_research_extensions.md)。有状态 policy 不改变共享 DAG 的数据/参考池，也不自行维护真实账户余额。研究模型与参数产物按训练截止和可用时间选择；原生诊断 API 不等同于完整 Web 研究平台或自动逐批收益报告。
 
 ## 2. 顶层架构分层
 
@@ -34,9 +36,12 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 
 ### 2.2 配置与运行态层
 
-- `config`：负责命令参数、配置文件、运行策略、账户、数据库、API Server、通知和 LLM 配置。
-- `core`：保存运行模式、全局上下文、运行环境、缓存、退出钩子、常量与通用错误。
-- `btime`：维护回测/实盘时间语义，使回测循环和实盘运行共享时间访问方式。
+- `config`：负责命令参数、配置文件、运行策略、账户、数据库、API Server、通知和 LLM 配置；每次任务使用自己的 `config.Snapshot`。
+- `runtime`：组合任务专属的核心状态、配置快照、时钟、市场、策略、订单、钱包、数据目录、调度器和通知，并管理停止、关闭与等待。
+- `core`：提供常量、通用错误和 `core.State`。`core.State` 保存一个 Runtime 的运行模式、市场、交易对、订单簿与取消状态；缓存等低频进程资源不随任务复制。
+- `btime`：通过 Runtime 持有的 `btime.ClockState` 维护回测/实盘时间语义。
+
+一个 `Process` 可创建多个 Runtime。任务之间不共享上述可变业务状态，显式运行器可以隔离任务状态；共享物理账户、SID registry、scheduler 或外部资源仍须遵守 owner/borrow 契约，不能据局部隔离测试宣称任意生产会话并发 E2E 已验收。`context.Context` 仅传递取消、deadline 和 I/O 生命周期，不作为业务状态容器。
 
 ### 2.3 交易业务层
 
@@ -82,11 +87,11 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 
 实盘交易入口。主要流程：
 
-1. 设置运行模式为实盘。
+1. 将实盘模式绑定到任务 Core/Clock，保留父 context 取消。
 2. 执行公共初始化和交易所初始化。
 3. 可选打开订单/数据转储文件。
 4. 标记机器人运行状态和启动时间。
-5. 创建 `live.CryptoTrader`。
+5. 使用 NewCryptoTraderWithRuntimeDeps 创建时序交易器；因子使用 runner.NewLive，mixed 保留策略投影。
 6. 初始化实时数据源、订单管理、策略任务、Telegram 控制、Web API、账户检查和第三方数据源。
 7. 启动实盘后台任务。
 8. 进入实时行情循环。
@@ -121,7 +126,7 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 
 超参数优化入口。它围绕回测引擎反复执行参数采样、回测评分和结果选择。采样策略支持多种优化器；每次采样会构造临时回测，计算评分后写入优化结果。
 
-#### `bt_opt`
+#### `bt-opt`
 
 滚动优化回测入口。它按 review period 和 run period 划分时间轴，在每个窗口内用历史窗口优化策略参数，再把优化结果应用到后续运行窗口，继承钱包和历史订单状态，尽量模拟实盘中“用过去调参、用未来验证”的过程。
 
@@ -206,26 +211,18 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 
 实盘业务 API 覆盖版本、余额、钱包刷新、当日数量、统计、收益、任务交易对、交易所符号映射、订单、利润计算、平仓、交易所仓位关闭、延迟开仓、配置、策略任务、性能、交易下载、日志和机器人信息。
 
-## 4. 公共初始化流程
+## 4. 初始化与运行时组装
 
-多数后端入口最终都会调用 `biz.SetupComs` 或 `biz.SetupComsExg`。
+当前配置型入口通过 `openExplicitEntrySession` 组装一次任务执行：
 
-`SetupComs` 负责：
+1. 解析命令参数和 YAML，得到独立的 `config.Snapshot`。
+2. 创建任务父 `context.Context`、日志、显式 `orm.Storage`，并在需要时创建交易所 session。
+3. 创建 `runtime.Process`；它只管理 Runtime ID、SID 分配/注册等可安全共享的构造资源。
+4. 调用 `Process.NewRuntime` 创建任务自己的 `core.State`、`btime.ClockState`、市场和交易对状态、策略/订单/钱包状态、调度器、通知和数据源目录。
+5. 通过 `Runtime.BizDeps()` 与 `Runtime.DataDeps()` 向 `biz`、`live`、`opt`、`data` 等组件提供窄而显式的依赖。
+6. 任务结束时依次停止、关闭并等待 Runtime；创建存储和交易所资源的入口负责关闭这些资源。
 
-1. 初始化命令参数。
-2. 在实盘模式启用死锁检测。
-3. 创建全局 context 和停止函数。
-4. 初始化数据目录。
-5. 加载配置。
-6. 设置日志，实盘模式额外接入异常通知日志 core。
-7. 初始化 core 缓存和全局基础设施。
-8. 初始化邮件发送器。
-9. 加载语言消息。
-10. 初始化 utils、交易所、ORM、交易对过滤器。
-
-`SetupComsExg` 在此基础上再初始化当前交易所市场元数据，使后续 K 线、交易和交易对流程能使用统一的 `ExSymbol` 映射。
-
-这套初始化方式简化了入口开发，但也意味着大量模块依赖全局运行态，例如 `core`、`config`、`exg.Default`、`orm` 连接池、`goods` 过滤器和策略全局表。
+`biz.SetupComs`、`biz.SetupComsExg` 及其包级状态仍服务于旧的嵌入式调用和少数维护入口。这些兼容路径会被串行化，不能据此推导为所有旧接口均可多任务并行。
 
 ## 5. 策略、交易对与任务流程
 
@@ -239,14 +236,14 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 4. 动态交易对从交易所市场列表和过滤器生产。
 5. 后续过滤器按顺序执行，覆盖年龄、成交量、价格、涨跌幅、波动、相关性、黑名单、随机、偏移等维度。
 6. 应用 offset 和 limit。
-7. 写入 `core.Pairs` 和 `core.PairsMap`。
-8. 策略配置中显式声明的交易对也会加入 `PairsMap`，确保运行期能被识别。
+7. 写入当前 Runtime 的交易对集合和符号状态。
+8. 策略配置中显式声明的交易对也会加入该任务的映射，确保运行期能被识别。
 
 ### 5.2 策略任务加载
 
 `strat.LoadStratJobs` 是策略任务构建核心。主要流程：
 
-1. 清空或重置任务相关全局状态。
+1. 初始化或更新当前 Runtime 的策略、任务和订单相关状态。
 2. 遍历 `config.RunPolicy`。
 3. 通过策略工厂创建策略实例。
 4. 读取策略级交易对过滤和 `OnSymbols` 输出。
@@ -467,6 +464,17 @@ K 线落库流程强调“先写库、后广播”，使 live provider 收到的
 
 因此，自定义数据和 K 线最终共享同一策略事件模型。
 
+### 8.6 任意时序数据兼容性边界
+
+v0.4.3 相对于 v0.3.8 的核心升级是支持任意时序数据读写，并允许在已有
+K 线表中增加自定义列。v0.3.8 的 K 线专用存储限制不能作为新架构的回退
+目标。
+
+统一事件 `orm.DataSeries` 的 `Values map[string]any` 是保存和传递任意字段
+的兼容边界。默认 OHLCV、自定义列和独立时序数据都必须通过 `Values` 保留。任何扫描或缓存优化都必须保持
+显式 map 覆盖优先级，以及 `float`、`int`、`string`、`bool`、`json` 和 NULL
+的行为。
+
 ## 9. 存储架构
 
 ### 9.1 数据库分工
@@ -596,8 +604,8 @@ QuestDB 和 PostgreSQL 在时间列、upsert、删除方式、JSON 字段和可�
 
 1. `banbot backtest`。
 2. `entry` 解析参数并调用 `RunBackTest`。
-3. `biz.SetupComsExg` 初始化环境。
-4. `opt.NewBackTest` 创建回测引擎和历史 provider。
+3. entry 解析 RunSpec，创建显式 Process/Runtime 与自建资源。
+4. 时序使用 opt.NewBackTestWithRuntimeDeps；因子/混合由 unified factor assembly 选择 runner/account 路径。
 5. `goods`、`strat` 构建交易对和策略任务。
 6. `data.SeriesRuntime` 补齐第三方时序。
 7. `HistProvider` 补齐和加载历史 K 线。
@@ -651,7 +659,7 @@ QuestDB 和 PostgreSQL 在时间列、upsert、删除方式、JSON 字段和可�
 中优先级：
 
 - 拆分 `SetupComs` 初始化能力，降低入口不必要依赖。
-- 减少策略/回测/实盘共享全局状态，逐步引入运行上下文。
+- 继续迁移 spider、数据维护和旧 dev Web 等兼容入口，收窄包级 facade 的适用范围。
 - 抽象存储后端接口，减少业务代码中的后端分支。
 - 为 DataSource 热加载和多实例部署补充跨进程治理。
 
@@ -674,3 +682,9 @@ QuestDB 和 PostgreSQL 在时间列、upsert、删除方式、JSON 字段和可�
 - LLM 辅助：`llm/`。
 
 子 agent 分别完成了入口、实盘交易、策略/回测、数据源四个方向的只读调研；ORM 宽范围子任务因上下文限制失败，最终由主线直接阅读关键 ORM 文件和文档后汇总。
+
+## 2026-10-04 双引擎使用入口
+
+run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
+
+execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

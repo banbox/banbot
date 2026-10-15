@@ -26,6 +26,22 @@
   let tabs: Record<string, string> = $state({});
   let strats: string[] = $state([]);
   let searchQuery = $state('');
+  type Inspection = {
+    version: number;
+    engines: string[];
+    execution_mode: string;
+    data_checked: boolean;
+    strategies: {engine: string; name: string; id: string; account: string; timeframe?: string; resolved?: Record<string, unknown>}[];
+    warnings: {code: string; message: string}[];
+    origins: Record<string, {Source: string; Kind: string}>;
+    effective_config: string;
+  };
+  let catalog = $state<{definitions: string[]; portfolio_builders: string[]} | null>(null);
+  let inspection = $state<Inspection | null>(null);
+  let checking = $state(false);
+  let checkedDraft = $state('');
+  let checkError = $state('');
+  const currentDraft = $derived(JSON.stringify(tabs));
 
   let filteredStrats: string[] = $derived.by(() => {
     if (!searchQuery) return strats;
@@ -35,15 +51,14 @@
   });
 
   onMount(async () => {
-    let rsp = await getApi('/dev/available_strats');
-    if(rsp.code != 200) {
-      alerts.error(rsp.msg || 'load strats failed');
-      return;
-    }
-    strats = rsp.data;
     let arr = ['config.yml', 'config.local.yml'];
     let paths = arr.map(v => "@" + v);
-    rsp = await getApi('/dev/texts', { paths });
+    const [stratRsp, catalogRsp, rsp] = await Promise.all([
+      getApi('/dev/available_strats'), getApi('/dev/strategy_catalog'), getApi('/dev/texts', {paths})
+    ]);
+    if (stratRsp.code === 200) strats = stratRsp.data;
+    else alerts.error(stratRsp.msg || 'load strats failed');
+    if (catalogRsp.code === 200 && catalogRsp.data?.version === 1) catalog = catalogRsp.data;
     if(rsp.code != 200) {
       alerts.error(rsp.msg || 'load config failed');
       return;
@@ -74,6 +89,30 @@
     tabs[activeTab] = value;
   }
 
+  function editorConfigs() {
+    const configs: Record<string, string> = {};
+    const paths = Object.keys(tabs).map(key => `@${key}`);
+    for (const key of Object.keys(tabs)) configs[`@${key}`] = tabs[key];
+    return {configs, paths};
+  }
+
+  async function checkConfig() {
+    const draft = currentDraft;
+    checking = true;
+    checkError = '';
+    inspection = null;
+    const rsp = await postApi('/dev/backtest_preflight', editorConfigs());
+    checking = false;
+    if (draft !== currentDraft) { checkError = m.preflight_stale(); return; }
+    if (rsp.code !== 200) {
+      checkError = rsp.code === 404 || rsp.code === 503 ? m.preflight_unavailable() : rsp.msg || 'Configuration check failed';
+      return;
+    }
+    if (rsp.data?.version !== 1) { checkError = m.preflight_unavailable(); return; }
+    inspection = rsp.data;
+    checkedDraft = draft;
+  }
+
   async function startBacktest() {
     if (!configText) {
       alerts.error("config is empty");
@@ -81,14 +120,7 @@
     }
 
     // 可以同时开始多个，后端会逐个启动执行
-    const configs: Record<string, string> = {};
-    const paths: string[] = [];
-    for (const key in tabs) {
-      if (tabs.hasOwnProperty(key)) {
-        configs[`@${key}`] = tabs[key];
-        paths.push(`@${key}`);
-      }
-    }
+    const {configs, paths} = editorConfigs();
     const rsp = await postApi('/dev/run_backtest', {
       separate: separateStrat,
       configs: configs,
@@ -179,6 +211,16 @@ click={clickDuplicate} center={true} width={600}>
               </div>
             {/each}
           </div>
+          {#if catalog}
+            <h3 class="font-semibold mt-6 mb-2">{m.catalog_definitions()}</h3>
+            {#each catalog.definitions as definition (definition)}
+              <button class="btn btn-ghost btn-sm w-full justify-start" onclick={() => copyToClipboard(definition)}>{definition}</button>
+            {/each}
+            <h3 class="font-semibold mt-4 mb-2">{m.catalog_builders()}</h3>
+            {#each catalog.portfolio_builders as builder (builder)}
+              <button class="btn btn-ghost btn-sm w-full justify-start" onclick={() => copyToClipboard(builder)}>{builder}</button>
+            {/each}
+          {/if}
         </div>
 
         <!-- 右侧主内容区 -->
@@ -206,6 +248,43 @@ click={clickDuplicate} center={true} width={600}>
               <label for="config-drawer" class="link link-primary cursor-pointer">{m.full_config()}</label>
             </div>
             <CodeMirror bind:this={editor} change={onTextChange} {theme} class="flex-1 h-full"/>
+            <p class="text-sm opacity-70 mt-3">{m.catalog_factor_hint()}</p>
+            <section class="mt-4 rounded-lg bg-base-200 p-4" aria-label={m.preflight_static()}>
+              <div class="flex items-center justify-between gap-3">
+                <h3 class="font-semibold">{m.preflight_static()}</h3>
+                <button class="btn btn-outline btn-sm" disabled={checking} onclick={checkConfig}>{m.preflight_check()}</button>
+              </div>
+              {#if checkError}<p class="text-error mt-3" role="alert">{checkError}</p>{/if}
+              {#if inspection}
+                {#if checkedDraft !== currentDraft}
+                  <p class="text-warning mt-3" role="status">{m.preflight_stale()}</p>
+                {:else}
+                  <p class="text-success mt-3" role="status">{m.preflight_passed()}</p>
+                  <div class="flex gap-2 mt-2 flex-wrap">
+                    {#each inspection.engines as engine (engine)}<span class="badge badge-outline">{engine}</span>{/each}
+                    {#if inspection.execution_mode}<span class="badge">{inspection.execution_mode}</span>{/if}
+                  </div>
+                  <p class="text-sm mt-2">{m.preflight_data_unchecked()}</p>
+                  <div class="overflow-auto mt-3"><table class="table table-sm">
+                    <thead><tr><th>{m.result_engine()}</th><th>{m.result_strategy_id()}</th><th>{m.result_account_id()}</th><th>{m.timeframe()}</th></tr></thead>
+                    <tbody>{#each inspection.strategies as strategy, strategyIndex (strategyIndex)}
+                      <tr><td>{strategy.engine}</td><td>{strategy.id}</td><td>{strategy.account || '-'}</td><td>{strategy.timeframe || '-'}</td></tr>
+                    {/each}</tbody>
+                  </table></div>
+                  <details class="mt-3"><summary class="cursor-pointer">{m.preflight_resolved()}</summary>
+                    <pre class="text-xs overflow-auto max-h-80 mt-2">{JSON.stringify(inspection.strategies, null, 2)}</pre>
+                  </details>
+                  <details class="mt-3"><summary class="cursor-pointer">{m.preflight_origins()}</summary>
+                    <div class="overflow-auto"><table class="table table-xs"><tbody>
+                      {#each Object.entries(inspection.origins) as [field, origin] (field)}<tr><td>{field}</td><td>{origin.Kind}</td><td>{origin.Source}</td></tr>{/each}
+                    </tbody></table></div>
+                  </details>
+                  <details class="mt-3"><summary class="cursor-pointer">{m.preflight_effective()}</summary>
+                    <pre class="text-xs overflow-auto max-h-96 mt-2">{inspection.effective_config}</pre>
+                  </details>
+                {/if}
+              {/if}
+            </section>
           </div>
 
           <div class="flex gap-4 fixed bottom-0 left-0 right-0 p-2 w-[100%] bg-white flex justify-center">

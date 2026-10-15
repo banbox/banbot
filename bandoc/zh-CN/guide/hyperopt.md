@@ -1,3 +1,5 @@
+> 引擎范围：本页 optimize / bt-opt 及参数定义、滚动选择流程属于时序 TradeStrat 引擎。当前 entry.runExplicitOptimization 使用时序 Snapshot 和 opt.BacktestFactory，没有将 factor policies 装配到 factor runner；不能把 run_policy 的泛称解释为因子/混合超参搜索已提供。因子参数实验请使用[因子研究/回测](./factor.md)分别运行显式参数配置，并管理 PIT 与成熟标签。
+
 ```shell
 bot optimize -out PATH [-opt-rounds 30] [-sampler bayes] 
 ```

@@ -2,35 +2,27 @@
 
 goods 包提供了商品和交易对相关的功能。
 
+## Runtime 过滤与品种池
+
+RuntimeDeps 直接持有 Core、Clock、Config、DataDir、Symbols、Storage、Exchange、ShowLog。RuntimeFilter.FilterWithRuntimeDeps 与 RuntimeProducer.GenSymbolsWithRuntimeDeps 是实例扩展；SymbolStateFilter/Producer 和旧 IFilter/IProducer 保留兼容。RefreshPairListWithRuntimeDeps、FilterPairsWithRuntimeDeps 使用任务配置、时钟和 symbol 身份，不能回退读取另一任务的 globals。冻结静态池、强制过滤和排序有各自合同。
+
 ## 重要结构体
 
 ### IFilter
-过滤器接口，所有过滤器都必须实现此接口。
-- `GetName() string` - 获取过滤器名称
-- `IsDisable() bool` - 判断过滤器是否禁用
-- `IsNeedTickers() bool` - 判断是否需要行情数据
-- `Filter(pairs []string, tickers map[string]*banexg.Ticker) ([]string, *errs.Error)` - 过滤方法
+
+过滤器接口：GetName() string、IsDisable() bool、Filter(pairs []string, timeMS int64) ([]string, *errs.Error)。已无 IsNeedTickers 方法，行情/配置通过明确的 RuntimeDeps 或实现内部取得。
 
 ### IProducer
-生产者接口，继承自 IFilter 接口，用于生成交易对列表。
-- 继承 IFilter 的所有方法
-- `GenSymbols(tickers map[string]*banexg.Ticker) ([]string, *errs.Error)` - 生成交易对列表
+
+继承 IFilter，并提供 GenSymbols(timeMS int64) ([]string, *errs.Error)。旧文档的 tickers 参数不是当前签名。
 
 ### BaseFilter
-基础过滤器结构体，所有具体过滤器的基类。
-- `Name string` - 过滤器名称
-- `Disable bool` - 是否禁用
-- `NeedTickers bool` - 是否需要行情数据
-- `AllowEmpty bool` - 是否允许空结果
+
+公共字段为 Name string、Disable bool、AllowEmpty bool；没有 NeedTickers 字段。
 
 ### VolumePairFilter
-成交量过滤器，按成交量价值倒序排序所有交易对。
-- `Limit int` - 返回结果的数量限制，取前100个
-- `LimitRate float64` - 限制比率
-- `MinValue float64` - 最低成交量价值
-- `RefreshSecs int` - 缓存时间，以秒为单位
-- `BackTimeframe string` - 计算成交量的时间周期，默认为天
-- `BackPeriod int` - 与BackTimeframe相乘得到的时间范围的乘数
+
+字段为 BaseFilter、Limit int、LimitRate float64、MinValue float64、CacheSecs int、BackPeriod string。BackPeriod 是时间周期字符串，不能按旧 BackTimeframe/整数乘数配置。
 
 ### PriceFilter
 价格过滤器配置结构体。
@@ -40,11 +32,8 @@ goods 包提供了商品和交易对相关的功能。
 - `Max float64` - 最高价格
 
 ### RateOfChangeFilter
-价格变动比率过滤器，计算一段时间内(high-low)/low比值。
-- `BackDays int` - 回顾的K线天数
-- `Min float64` - 最小价格变动比率
-- `Max float64` - 最大价格变动比率
-- `RefreshPeriod int` - 缓存时间，秒
+
+字段为 BaseFilter、BackDays int、Min/Max float64、CacheSecs int；缓存秒数使用 CacheSecs，不是 RefreshPeriod。
 
 ### SpreadFilter
 流动性过滤器。

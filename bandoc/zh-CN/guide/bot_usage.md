@@ -351,3 +351,13 @@ banbot tool:
     bt_factor:      backtest factors with orders
     bt_result:      build backtest result from orders.gob and config
 ```
+
+## 多因子与截面引擎
+
+`bot backtest` 和 `bot trade` 从同一 YAML `run_policy` 调度时序、因子或混合策略。因子回测的 `backtest --mode weights|events` 覆盖 `execution.mode`，两者均省略时默认 `events`；混合回放必须 `events`。因子/混合配置的 `trade --dry-run` 是历史 events 回放，纯时序实时模拟继续使用 `env: dry_run`。真实因子/混合交易可指定 `--live-provider`，且需要已验证的 binding。
+
+因子研究使用根命令 `bot research --config strategy.yml`，归档转换使用 `bot data archive`，独立表达式使用根命令 `bot validate --spec formula.yml` / `bot explain --spec formula.yml`。策略配置统一使用 YAML，路径按字段来源文件解析。各类引擎统一使用默认配置、`--datadir` 和 `--no-default` 规则。
+
+本页 bot tool bt_factor 是 orders.gob / strat.FactorMap 旧滚动筛选工具，与新 factor runner 不同。
+
+参见[多因子与截面指南](./factor.md)和[因子 API](../api/factor.md)。

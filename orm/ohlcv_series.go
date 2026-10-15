@@ -2,13 +2,14 @@ package orm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -42,21 +43,24 @@ func SeriesToKLines(rows []*DataSeries, exs *ExSymbol) ([]*banexg.Kline, error) 
 	return klines, nil
 }
 
-type seriesOHLCVRow struct {
-	timeMS    int64
-	open      float64
-	high      float64
-	low       float64
-	close     float64
-	volume    float64
-	quote     float64
-	buyVolume float64
-	tradeNum  int64
+// seriesAlignOff resolves the aggregation boundary from the explicit symbol
+// identity. An adapter argument keeps runtime-owned queries away from the
+// process-wide exchange cache; omitted arguments retain the legacy facade.
+func seriesAlignOff(exs *ExSymbol, tfMSecs int64, exchange ...banexg.BanExchange) int64 {
+	if exs == nil {
+		return 0
+	}
+	if len(exchange) > 0 {
+		return int64(exg.GetAlignOffForExchange(exchange[0], exs.Symbol, int(tfMSecs/1000)) * 1000)
+	}
+	return int64(exg.GetAlignOffForSymbol(exs.Exchange, exs.Market, exs.Symbol, int(tfMSecs/1000)) * 1000)
 }
 
-type seriesSid struct {
-	seriesOHLCVRow
-	Sid int32
+func (q *Queries) alignOff(exs *ExSymbol, tfMSecs int64) int64 {
+	if q != nil && q.usesExplicitExchange() {
+		return seriesAlignOff(exs, tfMSecs, q.exchange)
+	}
+	return seriesAlignOff(exs, tfMSecs)
 }
 
 func (evt *DataSeries) BatchTimeMS() int64 {
@@ -68,7 +72,7 @@ func (evt *DataSeries) BatchTimeMS() int64 {
 
 // resampleOHLCVSeries preserves the K-line-specific aggregation contract while
 // keeping the query and feeder paths in DataSeries form.
-func resampleOHLCVSeries(exs *ExSymbol, tf string, rows, prev []*DataSeries, toTFMS int64,
+func resampleOHLCVSeries(state *SymbolState, exs *ExSymbol, tf string, rows, prev []*DataSeries, toTFMS int64,
 	preFire float64, fromTFMS, offMS int64, isWarmUp bool) ([]*DataSeries, bool, error) {
 	if len(rows) == 0 {
 		return nil, false, nil
@@ -86,22 +90,31 @@ func resampleOHLCVSeries(exs *ExSymbol, tf string, rows, prev []*DataSeries, toT
 	}
 	result := make([]*DataSeries, 0, cacheNum+len(prev))
 	var big *DataSeries
+	var bucketRows []*DataSeries
 	if len(prev) > 0 {
 		result = append(result, prev[:len(prev)-1]...)
 		var err error
-		big, err = cloneOHLCVSeries(prev[len(prev)-1], exs, tf, toTFMS, isWarmUp)
+		big, err = cloneOHLCVSeries(state, prev[len(prev)-1], exs, tf, toTFMS, isWarmUp)
 		if err != nil {
 			return nil, false, err
 		}
+		bucketRows = aggregationRows(prev[len(prev)-1])
 	}
-	aggCnt := 0
+	aggCnt := len(bucketRows)
+	flushExtra := func() error {
+		if big == nil || len(bucketRows) == 0 {
+			return nil
+		}
+		return mergeOHLCVExtraFields(big, bucketRows[0], bucketRows)
+	}
 	for _, row := range rows {
 		if row == nil {
 			return nil, false, fmt.Errorf("series event is nil")
 		}
 		timeAlign := utils2.AlignTfMSecsOffset(row.TimeMS+offsetMS, toTFMS, alignOffMS)
 		if big != nil && big.TimeMS == timeAlign {
-			if err := mergeOHLCVSeries(big, row); err != nil {
+			bucketRows = append(bucketRows, row)
+			if err := mergeOHLCVCore(big, row); err != nil {
 				return nil, false, err
 			}
 			big.Closed = row.Closed
@@ -111,19 +124,29 @@ func resampleOHLCVSeries(exs *ExSymbol, tf string, rows, prev []*DataSeries, toT
 		if aggCnt > aggNum {
 			aggNum = aggCnt
 		}
+		if err := flushExtra(); err != nil {
+			return nil, false, err
+		}
 		if keepOHLCVBucket(big, aggCnt, aggNum) {
+			big.aggRows = nil
 			result = append(result, big)
 		}
 		var err error
-		big, err = cloneOHLCVSeries(row, exs, tf, toTFMS, isWarmUp)
+		big, err = cloneOHLCVSeries(state, row, exs, tf, toTFMS, isWarmUp)
 		if err != nil {
 			return nil, false, err
 		}
 		big.TimeMS = timeAlign
 		big.EndMS = timeAlign + toTFMS
+		bucketRows = []*DataSeries{row}
+		big.aggRows = append([]*DataSeries(nil), bucketRows...)
 		aggCnt = 1
 	}
+	if err := flushExtra(); err != nil {
+		return nil, false, err
+	}
 	if keepOHLCVBucket(big, aggCnt, aggNum) {
+		big.aggRows = append([]*DataSeries(nil), bucketRows...)
 		result = append(result, big)
 	}
 	lastFinished := false
@@ -131,22 +154,27 @@ func resampleOHLCVSeries(exs *ExSymbol, tf string, rows, prev []*DataSeries, toT
 		finishMS := utils2.AlignTfMSecsOffset(rows[len(rows)-1].TimeMS+fromTFMS+offsetMS, toTFMS, alignOffMS)
 		lastFinished = finishMS > result[len(result)-1].TimeMS
 	}
+	for i, row := range result {
+		if i < len(result)-1 || lastFinished {
+			row.aggRows = nil
+		}
+	}
 	return result, lastFinished, nil
 }
 
-func cloneOHLCVSeries(row *DataSeries, exs *ExSymbol, tf string, toTFMS int64, isWarmUp bool) (*DataSeries, error) {
+func cloneOHLCVSeries(state *SymbolState, row *DataSeries, exs *ExSymbol, tf string, toTFMS int64, isWarmUp bool) (*DataSeries, error) {
 	if row == nil {
 		return nil, fmt.Errorf("series event is nil")
 	}
-	if _, err := ohlcvSeriesValues(row, 0); err != nil {
-		return nil, err
+	if err := validateOHLCVSeries(row); err != nil {
+		return nil, errs.New(core.ErrInvalidBars, err)
 	}
 	cp := *row
 	cp.Source = SeriesSourceKline
 	cp.TimeFrame = tf
 	cp.EndMS = cp.TimeMS + toTFMS
 	cp.IsWarmUp = isWarmUp
-	cp.ExSymbol = ResolveSeriesExSymbol(row, exs)
+	cp.ExSymbol = resolveSeriesExSymbol(state, row, exs)
 	if cp.Sid == 0 && cp.ExSymbol != nil {
 		cp.Sid = cp.ExSymbol.ID
 	}
@@ -154,25 +182,74 @@ func cloneOHLCVSeries(row *DataSeries, exs *ExSymbol, tf string, toTFMS int64, i
 	for key, val := range row.Values {
 		cp.Values[key] = val
 	}
+	cp.aggRows = aggregationRows(row)
 	return &cp, nil
 }
 
 func mergeOHLCVSeries(dst, src *DataSeries) error {
-	srcValues, err := ohlcvSeriesValues(src, 0)
+	return mergeOHLCVSeriesWithRows(dst, src, []*DataSeries{dst, src})
+}
+
+func mergeOHLCVSeriesWithRows(dst, src *DataSeries, rows []*DataSeries) error {
+	if dst == nil {
+		return errs.NewMsg(core.ErrInvalidBars, "series row is nil")
+	}
+	if src == nil {
+		return errs.NewMsg(core.ErrInvalidBars, "series row is nil")
+	}
+	if err := validateOHLCVSeries(src); err != nil {
+		return errs.New(core.ErrInvalidBars, err)
+	}
+	if dst.Values == nil {
+		dst.Values = make(map[string]any)
+	}
+	if err := mergeOHLCVCore(dst, src); err != nil {
+		return err
+	}
+	return mergeOHLCVExtraFields(dst, src, rows)
+}
+
+// mergeOHLCVCore updates the built-in OHLCV fields in one pass. Extension
+// fields are intentionally handled separately so resampling can evaluate
+// arbitrary aggregation functions once per bucket instead of once per row.
+func mergeOHLCVCore(dst, src *DataSeries) error {
+	if dst == nil || src == nil {
+		return errs.NewMsg(core.ErrInvalidBars, "series row is nil")
+	}
+	if err := validateOHLCVSeries(src); err != nil {
+		return errs.New(core.ErrInvalidBars, err)
+	}
+	srcVolume, err := src.VolumeValue()
 	if err != nil {
 		return err
 	}
-	if srcValues.volume <= 0 {
+	if srcVolume <= 0 {
 		return nil
 	}
 	dstVolume, valueErr := dst.VolumeValue()
 	if valueErr != nil {
 		return valueErr
 	}
+	srcOpen, err := src.OpenValue()
+	if err != nil {
+		return err
+	}
+	srcHigh, err := src.HighValue()
+	if err != nil {
+		return err
+	}
+	srcLow, err := src.LowValue()
+	if err != nil {
+		return err
+	}
+	srcClose, err := src.CloseValue()
+	if err != nil {
+		return err
+	}
 	if dstVolume == 0 {
-		dst.Values["open"] = srcValues.open
-		dst.Values["high"] = srcValues.high
-		dst.Values["low"] = srcValues.low
+		dst.Values["open"] = srcOpen
+		dst.Values["high"] = srcHigh
+		dst.Values["low"] = srcLow
 	} else {
 		dstHigh, valueErr := dst.HighValue()
 		if valueErr != nil {
@@ -182,18 +259,67 @@ func mergeOHLCVSeries(dst, src *DataSeries) error {
 		if valueErr != nil {
 			return valueErr
 		}
-		dst.Values["high"] = max(dstHigh, srcValues.high)
-		dst.Values["low"] = min(dstLow, srcValues.low)
+		dst.Values["high"] = max(dstHigh, srcHigh)
+		dst.Values["low"] = min(dstLow, srcLow)
 	}
-	dst.Values["close"] = srcValues.close
-	dst.Values["volume"] = dstVolume + srcValues.volume
-	dst.Values["quote"] = dst.QuoteValue() + srcValues.quote
-	dst.Values["buy_volume"] = dst.BuyVolumeValue() + srcValues.buyVolume
-	dst.Values["trade_num"] = dst.TradeNumValue() + srcValues.tradeNum
-	for field, val := range src.Values {
-		if !isKlineReservedField(field) {
-			dst.Values[field] = val
+	dst.Values["close"] = srcClose
+	dst.Values["volume"] = dstVolume + srcVolume
+	dst.Values["quote"] = dst.QuoteValue() + src.QuoteValue()
+	dst.Values["buy_volume"] = dst.BuyVolumeValue() + src.BuyVolumeValue()
+	dst.Values["trade_num"] = dst.TradeNumValue() + src.TradeNumValue()
+	return nil
+}
+
+func mergeOHLCVExtraFields(dst, src *DataSeries, rows []*DataSeries) error {
+	hasExtra := false
+	for _, row := range rows {
+		if row == nil {
+			continue
 		}
+		for key := range row.Values {
+			if !isKlineReservedField(key) {
+				hasExtra = true
+				break
+			}
+		}
+		if hasExtra {
+			break
+		}
+	}
+	if !hasExtra {
+		return nil
+	}
+	seriesRows := make([]*DataSeries, 0, len(rows))
+	dataRows := make([]*DataRecord, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		seriesRows = append(seriesRows, row)
+		dataRows = append(dataRows, SeriesToRecord(row))
+	}
+	if len(seriesRows) == 0 {
+		return nil
+	}
+
+	info := NewSeriesInfo(SeriesSourceKline, dst.TimeFrame, nil)
+	exs := ResolveSeriesExSymbol(dst, src.ExSymbol)
+	for _, field := range inferSeriesFields(seriesRows) {
+		if isKlineReservedField(field.Name) {
+			continue
+		}
+		fn, ok := GetAggRuleFunc(seriesAggRule(info, exs, field.Name))
+		if !ok {
+			fn, ok = GetAggRuleFunc("last")
+		}
+		if !ok {
+			return fmt.Errorf("aggregation rule for series field %q is unavailable", field.Name)
+		}
+		value, err := fn(dataRows, field)
+		if err != nil {
+			return err
+		}
+		dst.Values[field.Name] = value
 	}
 	return nil
 }
@@ -211,31 +337,123 @@ func (q *Queries) QuerySeries(exs *ExSymbol, timeframe string, startMs, endMs in
 }
 
 func (q *Queries) QuerySeriesFields(exs *ExSymbol, timeframe string, fields []string, startMs, endMs int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error) {
+	options, optionsErr := q.requireExplicitKlineRuntime()
+	if optionsErr != nil {
+		return nil, optionsErr
+	}
+	coverage := historicalCoverageForQueryWithOptions(exs.Symbol, options)
+	if err := validateHistoricalCoverageFields(coverage, fields); err != nil {
+		return nil, err
+	}
+	if coverage == nil {
+		return q.querySeriesFieldsRaw(exs, timeframe, fields, startMs, endMs, limit, withUnFinish)
+	}
+	read := func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish,
+		reverse bool,
+	) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+		rows, readErr := q.querySeriesFieldsRawMode(exs, timeframe, fields, readStartMS, readEndMS,
+			readLimit, readWithUnFinish, reverse)
+		return nil, rows, readErr
+	}
+	var rows []*DataSeries
+	var err *errs.Error
+	if q.usesExplicitExchange() {
+		_, rows, err = readHistoricalCoverageSeriesWithOptions(coverage, exs, timeframe, startMs, endMs, limit, withUnFinish,
+			read, coverageQueryOptionsFromKline(options), q.exchange)
+	} else {
+		_, rows, err = readHistoricalCoverageSeriesWithOptions(coverage, exs, timeframe, startMs, endMs, limit, withUnFinish,
+			read, coverageQueryOptionsFromKline(options))
+	}
+	return rows, err
+}
+
+func (q *Queries) querySeriesFieldsRaw(exs *ExSymbol, timeframe string, fields []string, startMs, endMs int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error) {
+	return q.querySeriesFieldsRawMode(exs, timeframe, fields, startMs, endMs, limit, withUnFinish,
+		startMs == 0 && limit > 0)
+}
+
+func (q *Queries) querySeriesFieldsRawMode(exs *ExSymbol, timeframe string, fields []string,
+	startMs, endMs int64, limit int, withUnFinish, revRead bool,
+) ([]*DataSeries, *errs.Error) {
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
 	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
-	revRead := startMs == 0 && limit > 0
-	startMs, endMs = parseDownArgs(tfMSecs, startMs, endMs, limit, withUnFinish)
+	boundedReverse := revRead && startMs > 0
+	options := q.klineRuntimeOptions()
+	startMs, endMs = parseDownArgsAt(tfMSecs, startMs, endMs, limit, withUnFinish, options.nowMS())
 	maxEndMs := endMs
 	finishEndMS := utils2.AlignTfMSecs(endMs, tfMSecs)
 	unFinishMS := int64(0)
 	if withUnFinish {
-		curMs := btime.UTCStamp()
+		curMs := options.nowMS()
 		unFinishMS = utils2.AlignTfMSecs(curMs, tfMSecs)
 		if finishEndMS > unFinishMS {
 			finishEndMS = unFinishMS
 		}
 	}
-	rows, subTF, err := q.querySeriesRows(exs, timeframe, fields, startMs, finishEndMS, limit, revRead)
+	coverage := historicalCoverageForQueryWithOptions(exs.Symbol, options)
+	coverageOptions := coverageQueryOptionsFromKline(options)
+	consumerIntervals := historicalCoverageIntervalsWithOptions(coverage, exs.Symbol, timeframe, startMs, finishEndMS, coverageOptions)
+	var listingPrefix historicalListingPrefix
+	var hasListingPrefix bool
+	if q.usesExplicitExchange() {
+		listingPrefix, hasListingPrefix = legacyListingPrefixProofWithOptions(
+			coverage, exs, timeframe, startMs, consumerIntervals, coverageOptions, q.exchange)
+	} else {
+		listingPrefix, hasListingPrefix = legacyListingPrefixProofWithOptions(
+			coverage, exs, timeframe, startMs, consumerIntervals, coverageOptions)
+	}
+	physicalStart, physicalStop, physicalBound, coverageErr := historicalPhysicalCoverageBoundsWithListingPrefixWithOptions(
+		coverage, exs.Symbol, timeframe, startMs, finishEndMS, hasListingPrefix, coverageOptions)
+	if coverageErr != nil {
+		return nil, coverageErr
+	}
+	if physicalBound {
+		if physicalStop <= physicalStart {
+			return nil, nil
+		}
+		startMs, finishEndMS = physicalStart, physicalStop
+	}
+	rows, subTF, err := q.querySeriesRows(exs, timeframe, fields, startMs, finishEndMS, limit,
+		revRead, boundedReverse || physicalBound)
 	if err != nil {
 		return nil, err
 	}
 	if revRead {
 		utils.ReverseArr(rows)
 	}
+	if hasListingPrefix && listingPrefix.minuteStartMS < listingPrefix.storageStartMS &&
+		shouldRestoreHistoricalListingPrefix(timeframe, subTF, listingPrefix, rows) {
+		queryStorageTF := subTF
+		if queryStorageTF == "" {
+			queryStorageTF = timeframe
+		}
+		if queryStorageTF != listingPrefix.storageTF {
+			return nil, errs.NewMsg(core.ErrBadConfig,
+				"historical listing prefix storage mismatch for %s %s: query=%s proof=%s",
+				exs.Symbol, timeframe, queryStorageTF, listingPrefix.storageTF)
+		}
+		minuteRows, minuteSubTF, listingErr := q.querySeriesRows(exs, "1m", fields,
+			listingPrefix.minuteStartMS, listingPrefix.storageStartMS, 0, false, true)
+		if listingErr != nil {
+			return nil, listingErr
+		}
+		if minuteSubTF != "" {
+			return nil, errs.NewMsg(core.ErrBadConfig,
+				"historical listing prefix for %s resolved 1m through %s", exs.Symbol, minuteSubTF)
+		}
+		if q.usesExplicitExchange() {
+			rows, listingErr = prependHistoricalListingPrefix(exs, listingPrefix, minuteRows, rows, q.exchange)
+		} else {
+			rows, listingErr = prependHistoricalListingPrefix(exs, listingPrefix, minuteRows, rows)
+		}
+		if listingErr != nil {
+			return nil, listingErr
+		}
+	}
 	if subTF != "" && len(rows) > 0 {
 		fromTFMS := int64(utils2.TFToSecs(subTF) * 1000)
 		var lastFinish bool
-		offMS := GetAlignOff(exs.ID, tfMSecs)
+		offMS := q.alignOff(exs, tfMSecs)
 		var err_ error
 		rows, lastFinish, err_ = ResampleDataSeries(exs, timeframe, rows, nil, tfMSecs, 0, fromTFMS, offMS, false)
 		if err_ != nil {
@@ -253,7 +471,8 @@ func (q *Queries) QuerySeriesFields(exs *ExSymbol, timeframe string, fields []st
 		}
 	}
 	if len(rows) == 0 && maxEndMs-endMs > tfMSecs {
-		return q.QuerySeriesFields(exs, timeframe, fields, endMs, maxEndMs, limit, withUnFinish)
+		return q.querySeriesFieldsRawMode(exs, timeframe, fields, endMs, maxEndMs, limit,
+			withUnFinish, revRead)
 	} else if withUnFinish && len(rows) > 0 && rows[len(rows)-1].TimeMS+tfMSecs == unFinishMS {
 		unbar, _, _ := getUnFinish(q, exs.ID, timeframe, unFinishMS, unFinishMS+tfMSecs, "query")
 		if unbar != nil {
@@ -261,6 +480,19 @@ func (q *Queries) QuerySeriesFields(exs *ExSymbol, timeframe string, fields []st
 		}
 	}
 	return rows, nil
+}
+
+func shouldRestoreHistoricalListingPrefix(timeframe, subTF string, prefix historicalListingPrefix,
+	rows []*DataSeries,
+) bool {
+	if len(rows) == 0 || rows[0] == nil {
+		return false
+	}
+	if subTF == "" {
+		return timeframe == prefix.storageTF && rows[0].TimeMS == prefix.bucketStartMS
+	}
+	return subTF == prefix.storageTF &&
+		(rows[0].TimeMS == prefix.bucketStartMS || rows[0].TimeMS == prefix.storageStartMS)
 }
 
 func (q *Queries) QuerySeriesBatch(exsMap map[int32]*ExSymbol, timeframe string, startMs, endMs int64, limit int, handle func(int32, []*DataSeries)) *errs.Error {
@@ -271,18 +503,44 @@ func (q *Queries) QuerySeriesBatchFields(exsMap map[int32]*ExSymbol, timeframe s
 	if len(exsMap) == 0 {
 		return nil
 	}
+	options, optionsErr := q.requireExplicitKlineRuntime()
+	if optionsErr != nil {
+		return optionsErr
+	}
+	if options.strictHistoricalReplay() {
+		sids := make([]int, 0, len(exsMap))
+		for sid := range exsMap {
+			sids = append(sids, int(sid))
+		}
+		sort.Ints(sids)
+		for _, value := range sids {
+			sid := int32(value)
+			exs := exsMap[sid]
+			rows, err := q.QuerySeriesFields(exs, timeframe, fields, startMs, endMs, limit, false)
+			if err != nil {
+				return err
+			}
+			handle(sid, rows)
+		}
+		return nil
+	}
+	return q.querySeriesBatchFieldsRaw(exsMap, timeframe, fields, startMs, endMs, limit, handle)
+}
+
+func (q *Queries) querySeriesBatchFieldsRaw(exsMap map[int32]*ExSymbol, timeframe string, fields []string, startMs, endMs int64, limit int, handle func(int32, []*DataSeries)) *errs.Error {
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
 	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
-	startMs, endMs = parseDownArgs(tfMSecs, startMs, endMs, limit, false)
+	options := q.klineRuntimeOptions()
+	startMs, endMs = parseDownArgsAt(tfMSecs, startMs, endMs, limit, false, options.nowMS())
 	finishEndMS := utils2.AlignTfMSecs(endMs, tfMSecs)
-	if core.LiveMode {
-		curMs := btime.TimeMS()
+	if options.Live {
+		curMs := options.nowMS()
 		unFinishMS := utils2.AlignTfMSecs(curMs, tfMSecs)
 		if finishEndMS > unFinishMS {
 			finishEndMS = unFinishMS
 		}
 	}
-	if !IsQuestDB {
+	if !q.isQuestDB() {
 		return q.querySeriesBatchPg(exsMap, timeframe, fields, startMs, finishEndMS, tfMSecs, handle)
 	}
 	sidTA := make([]string, 0, len(exsMap))
@@ -295,7 +553,7 @@ select cast(ts as long)/1000,%s from $tbl
 where ts >= cast(%v as timestamp) and ts < cast(%v as timestamp) and sid in (%v)
 order by sid,ts`, klineSelectProjection(fields, true), startMs*1000, finishEndMS*1000, sidText)
 	subTF, pgRows, err_ := queryHyper(q, timeframe, sql, 0)
-	return handleSeriesBatchFields(exsMap, timeframe, fields, tfMSecs, subTF, pgRows, err_, handle)
+	return handleSeriesBatchFieldsWithQuery(q, exsMap, timeframe, fields, tfMSecs, subTF, pgRows, err_, handle)
 }
 
 func (q *Queries) InsertSeries(timeFrame string, exs *ExSymbol, rows []*DataSeries, aggBig bool) (int64, *errs.Error) {
@@ -303,6 +561,9 @@ func (q *Queries) InsertSeries(timeFrame string, exs *ExSymbol, rows []*DataSeri
 }
 
 func (q *Queries) UpdateSeries(exs *ExSymbol, timeFrame string, startMS, endMS int64, rows []*DataSeries, aggBig bool, skipHoles ...bool) *errs.Error {
+	if _, err := q.requireKlineRuntimeOptions(); err != nil {
+		return err
+	}
 	if _, err := normalizeOHLCVSeries(rows, exs.ID); err != nil {
 		return err
 	}
@@ -311,15 +572,6 @@ func (q *Queries) UpdateSeries(exs *ExSymbol, timeFrame string, startMS, endMS i
 
 func AutoFetchSeries(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string, startMS, endMS int64,
 	limit int, withUnFinish bool, pBar *utils.PrgBar) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-	startMS, endMS = parseDownArgs(tfMSecs, startMS, endMS, limit, withUnFinish)
-	downTF, err := GetDownTF(timeFrame)
-	if err != nil {
-		if pBar != nil {
-			pBar.Add(core.StepTotal)
-		}
-		return nil, nil, err
-	}
 	sess, conn, err := Conn(nil)
 	if err != nil {
 		if pBar != nil {
@@ -328,11 +580,84 @@ func AutoFetchSeries(exchange banexg.BanExchange, exs *ExSymbol, timeFrame strin
 		return nil, nil, err
 	}
 	defer conn.Release()
-	_, err = sess.DownOHLCV2DB(exchange, exs, downTF, startMS, endMS, pBar)
-	if err != nil {
-		return nil, nil, err
+	return autoFetchSeriesWithOptions(timeFrame, startMS, endMS, limit, withUnFinish, pBar,
+		func(downTF string, downStartMS, downEndMS int64) *errs.Error {
+			_, downErr := sess.DownOHLCV2DBForRequestedTF(exchange, exs, downTF, timeFrame,
+				downStartMS, downEndMS, pBar)
+			return downErr
+		}, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+			return sess.GetSeries(exs, timeFrame, readStartMS, readEndMS, readLimit, readWithUnFinish)
+		}, LegacyKlineRuntimeOptions())
+}
+
+// AutoFetchSeries runs the same read/download policy on an explicit query
+// owner. Callers must keep q valid for the duration of the operation.
+func (q *Queries) AutoFetchSeries(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string,
+	startMS, endMS int64, limit int, withUnFinish bool, pBar *utils.PrgBar,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	options, optionsErr := q.requireExplicitKlineRuntime()
+	if optionsErr != nil {
+		return nil, nil, optionsErr
 	}
-	return sess.GetSeries(exs, timeFrame, startMS, endMS, limit, withUnFinish)
+	return q.AutoFetchSeriesWithOptions(exchange, exs, timeFrame, startMS, endMS, limit, withUnFinish, pBar,
+		options)
+}
+
+// AutoFetchSeriesWithOptions is the explicit-runtime counterpart to
+// AutoFetchSeries. Download gating and implicit range alignment use options;
+// reads remain on this query owner and therefore retain the DataSeries.Values
+// contract.
+func (q *Queries) AutoFetchSeriesWithOptions(exchange banexg.BanExchange, exs *ExSymbol, timeFrame string,
+	startMS, endMS int64, limit int, withUnFinish bool, pBar *utils.PrgBar, options KlineRuntimeOptions,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	if q == nil || q.db == nil {
+		return nil, nil, errs.NewMsg(core.ErrDbConnFail, "database query is not configured")
+	}
+	query := q.WithKlineRuntimeOptions(options)
+	if exchange != nil {
+		query = query.WithExchange(exchange)
+	}
+	if _, optionsErr := query.requireExplicitKlineRuntime(); optionsErr != nil {
+		return nil, nil, optionsErr
+	}
+	return autoFetchSeriesWithOptions(timeFrame, startMS, endMS, limit, withUnFinish, pBar,
+		func(downTF string, downStartMS, downEndMS int64) *errs.Error {
+			_, downErr := query.DownOHLCV2DBForRequestedTFWithOptions(exchange, exs, downTF, timeFrame,
+				downStartMS, downEndMS, pBar, options)
+			return downErr
+		}, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+			return query.GetSeries(exs, timeFrame, readStartMS, readEndMS, readLimit, readWithUnFinish)
+		}, options)
+}
+
+func autoFetchSeries(timeFrame string, startMS, endMS int64, limit int, withUnFinish bool, pBar *utils.PrgBar,
+	download func(string, int64, int64) *errs.Error, read seriesFieldsReader,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return autoFetchSeriesWithOptions(timeFrame, startMS, endMS, limit, withUnFinish, pBar, download, read,
+		LegacyKlineRuntimeOptions())
+}
+
+func autoFetchSeriesWithOptions(timeFrame string, startMS, endMS int64, limit int, withUnFinish bool, pBar *utils.PrgBar,
+	download func(string, int64, int64) *errs.Error, read seriesFieldsReader, options KlineRuntimeOptions,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	if options.allowDownload() {
+		downTF, err := GetDownTF(timeFrame)
+		if err != nil {
+			if pBar != nil {
+				pBar.Add(core.StepTotal)
+			}
+			return nil, nil, err
+		}
+		tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
+		downStartMS, downEndMS := parseDownArgsAt(tfMSecs, startMS, endMS, limit, withUnFinish, options.nowMS())
+		if err = download(downTF, downStartMS, downEndMS); err != nil {
+			return nil, nil, err
+		}
+		return read(downStartMS, downEndMS, limit, withUnFinish)
+	} else if pBar != nil {
+		pBar.Add(core.StepTotal)
+	}
+	return read(startMS, endMS, limit, withUnFinish)
 }
 
 func GetSeries(exs *ExSymbol, timeFrame string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
@@ -358,22 +683,108 @@ func (q *Queries) GetSeries(exs *ExSymbol, timeFrame string, startMS, endMS int6
 	return q.GetSeriesFields(exs, timeFrame, nil, startMS, endMS, limit, withUnFinish)
 }
 
-func (q *Queries) GetSeriesFields(exs *ExSymbol, timeFrame string, fields []string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
-	if exs.Exchange == "china" && exs.Market != banexg.MarketSpot {
-		parts := utils2.SplitParts(exs.Symbol)
-		if len(parts) >= 2 && parts[1].Val == "888" {
-			adjs, err := GetAdjs(exs.ID)
-			if err != nil {
-				return nil, nil, err
-			}
-			rows, err := q.GetAdjSeriesFields(adjs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
-			if err != nil {
-				return nil, nil, err
-			}
-			return adjs, bindSeriesTarget(rows, exs), nil
+// GetPhysicalSeriesFields is used by the feeder's internal canonical physical
+// timeframe loader. It accepts only the immutable PhysicalBars proof for the
+// requested storage timeframe; ordinary strategy reads remain Bars-gated.
+func (q *Queries) GetPhysicalSeriesFields(exs *ExSymbol, timeFrame string, fields []string,
+	startMS, endMS int64, limit int, withUnFinish bool,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return q.GetPhysicalSeriesFieldsForConsumer(exs, timeFrame, fields, timeFrame,
+		startMS, endMS, limit, withUnFinish)
+}
+
+// GetPhysicalSeriesFieldsForConsumer permits an internal physical loader to
+// use the extension tail only when its logical consumer is covered too.
+func (q *Queries) GetPhysicalSeriesFieldsForConsumer(exs *ExSymbol, timeFrame string, fields []string,
+	consumerTimeframe string, startMS, endMS int64, limit int, withUnFinish bool,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	options, optionsErr := q.requireExplicitKlineRuntime()
+	if optionsErr != nil {
+		return nil, nil, optionsErr
+	}
+	coverage := historicalCoverageForQueryWithOptions(exs.Symbol, options)
+	if coverage == nil {
+		return q.getSeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
+	}
+	storageTF, err := PhysicalKlineStorageTimeframe(timeFrame)
+	if err != nil {
+		return nil, nil, err
+	}
+	if storageTF != timeFrame {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig,
+			"physical series read requires canonical storage timeframe: %s via %s", timeFrame, storageTF)
+	}
+	if err = validateHistoricalCoverageFields(coverage, fields); err != nil {
+		return nil, nil, err
+	}
+	coverageOptions := coverageQueryOptionsFromKline(options)
+	intervals := historicalPhysicalCoverageIntervalsWithOptions(coverage, exs.Symbol, timeFrame, consumerTimeframe, startMS, endMS, coverageOptions)
+	// A derived consumer may legitimately begin with a partially listed bucket.
+	// Keep the physical loader aligned with the ordinary read path by restoring
+	// the separately proved listing prefix, but never apply it to a direct
+	// physical-timeframe read.
+	if consumerTimeframe != "" && consumerTimeframe != timeFrame {
+		if q.usesExplicitExchange() {
+			intervals = extendLegacyListingCoverageWithOptions(coverage, exs, consumerTimeframe, startMS, intervals, coverageOptions, q.exchange)
+		} else {
+			intervals = extendLegacyListingCoverageWithOptions(coverage, exs, consumerTimeframe, startMS, intervals, coverageOptions)
 		}
 	}
-	rows, err := q.QuerySeriesFields(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
+	return readHistoricalCoverageIntervals(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
+		intervals, func(readStartMS, readEndMS int64, readLimit int, readWithUnFinish, reverse bool) (
+			[]*AdjInfo, []*DataSeries, *errs.Error,
+		) {
+			return q.getSeriesFieldsRawMode(exs, timeFrame, fields, readStartMS, readEndMS,
+				readLimit, readWithUnFinish, reverse)
+		})
+}
+
+func (q *Queries) GetSeriesFields(exs *ExSymbol, timeFrame string, fields []string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	options, optionsErr := q.requireExplicitKlineRuntime()
+	if optionsErr != nil {
+		return nil, nil, optionsErr
+	}
+	coverage := historicalCoverageForQueryWithOptions(exs.Symbol, options)
+	if err := validateHistoricalCoverageFields(coverage, fields); err != nil {
+		return nil, nil, err
+	}
+	if coverage == nil {
+		return q.getSeriesFieldsRaw(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish)
+	}
+	read := func(startMS, endMS int64, limit int, withUnFinish, reverse bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+		return q.getSeriesFieldsRawMode(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish, reverse)
+	}
+	if q.usesExplicitExchange() {
+		return readHistoricalCoverageSeriesWithOptions(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
+			read, coverageQueryOptionsFromKline(options), q.exchange)
+	}
+	return readHistoricalCoverageSeriesWithOptions(coverage, exs, timeFrame, startMS, endMS, limit, withUnFinish,
+		read, coverageQueryOptionsFromKline(options))
+}
+
+func (q *Queries) getSeriesFieldsRaw(exs *ExSymbol, timeFrame string, fields []string, startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	return q.getSeriesFieldsRawMode(exs, timeFrame, fields, startMS, endMS, limit, withUnFinish,
+		startMS == 0 && limit > 0)
+}
+
+func (q *Queries) getSeriesFieldsRawMode(exs *ExSymbol, timeFrame string, fields []string,
+	startMS, endMS int64, limit int, withUnFinish, reverse bool,
+) ([]*AdjInfo, []*DataSeries, *errs.Error) {
+	// Combined is populated from banexg.Market.Combined at the symbol boundary.
+	if exs.Combined {
+		adjs, err := q.getAdjs(exs.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		rows, err := q.getAdjSeriesFieldsMode(adjs, timeFrame, fields, startMS, endMS, limit,
+			withUnFinish, reverse, q.querySeriesFieldsRawMode)
+		if err != nil {
+			return nil, nil, err
+		}
+		return adjs, bindSeriesTarget(rows, exs), nil
+	}
+	rows, err := q.querySeriesFieldsRawMode(exs, timeFrame, fields, startMS, endMS, limit,
+		withUnFinish, reverse)
 	return nil, rows, err
 }
 
@@ -399,13 +810,43 @@ func (q *Queries) GetAdjSeries(adjs []*AdjInfo, timeFrame string, startMS, endMS
 }
 
 func (q *Queries) GetAdjSeriesFields(adjs []*AdjInfo, timeFrame string, fields []string, startMS, endMS int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error) {
+	if _, err := q.requireExplicitKlineRuntime(); err != nil {
+		return nil, err
+	}
+	return q.getAdjSeriesFields(adjs, timeFrame, fields, startMS, endMS, limit, withUnFinish,
+		q.QuerySeriesFields)
+}
+
+type querySeriesFieldsFunc func(*ExSymbol, string, []string, int64, int64, int, bool) ([]*DataSeries, *errs.Error)
+
+type querySeriesFieldsModeFunc func(*ExSymbol, string, []string, int64, int64, int, bool,
+	bool,
+) ([]*DataSeries, *errs.Error)
+
+func (q *Queries) getAdjSeriesFields(adjs []*AdjInfo, timeFrame string, fields []string, startMS, endMS int64,
+	limit int, withUnFinish bool, read querySeriesFieldsFunc,
+) ([]*DataSeries, *errs.Error) {
+	return q.getAdjSeriesFieldsMode(adjs, timeFrame, fields, startMS, endMS, limit, withUnFinish,
+		startMS == 0 && limit > 0,
+		func(exs *ExSymbol, timeframe string, fields []string, startMS, endMS int64, limit int,
+			withUnFinish, reverse bool,
+		) ([]*DataSeries, *errs.Error) {
+			if reverse {
+				startMS = 0
+			}
+			return read(exs, timeframe, fields, startMS, endMS, limit, withUnFinish)
+		})
+}
+
+func (q *Queries) getAdjSeriesFieldsMode(adjs []*AdjInfo, timeFrame string, fields []string,
+	startMS, endMS int64, limit int, withUnFinish, revRead bool, read querySeriesFieldsModeFunc,
+) ([]*DataSeries, *errs.Error) {
 	if len(adjs) == 0 {
 		return nil, nil
 	}
 	if endMS == 0 {
-		endMS = btime.UTCStamp()
+		endMS = q.klineRuntimeOptions().nowMS()
 	}
-	revRead := startMS == 0 && limit > 0
 	var result []*DataSeries
 	if revRead {
 		utils.ReverseArr(adjs)
@@ -417,10 +858,7 @@ func (q *Queries) GetAdjSeriesFields(adjs []*AdjInfo, timeFrame string, fields [
 		}
 		start := max(f.StartMS, startMS)
 		stop := min(f.StopMS, endMS)
-		if revRead {
-			start = 0
-		}
-		rows, err := q.QuerySeriesFields(f.ExSymbol, timeFrame, fields, start, stop, limit, withUnFinish)
+		rows, err := read(f.ExSymbol, timeFrame, fields, start, stop, limit, withUnFinish, revRead)
 		if err != nil {
 			return nil, err
 		}
@@ -447,9 +885,12 @@ func (q *Queries) GetAdjSeriesFields(adjs []*AdjInfo, timeFrame string, fields [
 	return result, nil
 }
 
-func (q *Queries) querySeriesRows(exs *ExSymbol, timeframe string, fields []string, startMs, finishEndMS int64, limit int, revRead bool) ([]*DataSeries, string, *errs.Error) {
-	if !IsQuestDB {
-		rows, subTF, err := q.querySeriesPg(exs, timeframe, fields, startMs, finishEndMS, limit, revRead)
+func (q *Queries) querySeriesRows(exs *ExSymbol, timeframe string, fields []string, startMs, finishEndMS int64,
+	limit int, revRead, boundedReverse bool,
+) ([]*DataSeries, string, *errs.Error) {
+	if !q.isQuestDB() {
+		rows, subTF, err := q.querySeriesPg(exs, timeframe, fields, startMs, finishEndMS, limit,
+			revRead, boundedReverse)
 		if err != nil {
 			return nil, "", NewDbErr(core.ErrDbReadFail, err)
 		}
@@ -458,10 +899,14 @@ func (q *Queries) querySeriesRows(exs *ExSymbol, timeframe string, fields []stri
 	projection := klineSelectProjection(fields, false)
 	var sql string
 	if revRead {
+		lowerBound := ""
+		if boundedReverse {
+			lowerBound = fmt.Sprintf(" and ts >= cast(%v as timestamp)", startMs*1000)
+		}
 		sql = fmt.Sprintf(`
 select cast(ts as long)/1000,%s from $tbl
-where sid=%d and ts < cast(%v as timestamp)
-order by ts desc`, projection, exs.ID, finishEndMS*1000)
+where sid=%d%s and ts < cast(%v as timestamp)
+order by ts desc`, projection, exs.ID, lowerBound, finishEndMS*1000)
 	} else {
 		if limit == 0 {
 			tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
@@ -473,14 +918,16 @@ where sid=%d and ts >= cast(%v as timestamp) and ts < cast(%v as timestamp)
 order by ts`, projection, exs.ID, startMs*1000, finishEndMS*1000)
 	}
 	subTF, pgRows, err_ := queryHyper(q, timeframe, sql, limit)
-	rows, err_ := mapToSeriesFields(exs, timeframe, fields, pgRows, err_)
+	rows, err_ := mapToSeriesFieldsWithContext(q.seriesReadContext(), exs, timeframe, fields, pgRows, err_)
 	if err_ != nil {
 		return nil, "", NewDbErr(core.ErrDbReadFail, err_)
 	}
 	return rows, subTF, nil
 }
 
-func (q *Queries) querySeriesPg(exs *ExSymbol, timeframe string, fields []string, startMs, endMs int64, limit int, revRead bool) ([]*DataSeries, string, error) {
+func (q *Queries) querySeriesPg(exs *ExSymbol, timeframe string, fields []string, startMs, endMs int64,
+	limit int, revRead, boundedReverse bool,
+) ([]*DataSeries, string, error) {
 	tblName, subTF, rate := resolveTablePg(timeframe)
 	if limit > 0 && subTF != "" && rate > 1 {
 		limit = rate * (limit + 1)
@@ -488,9 +935,13 @@ func (q *Queries) querySeriesPg(exs *ExSymbol, timeframe string, fields []string
 	projection := klineSelectProjection(fields, false)
 	var sql string
 	if revRead {
+		timeFilter := fmt.Sprintf("time < %d", endMs)
+		if boundedReverse {
+			timeFilter = buildPgTimeFilter(startMs, endMs)
+		}
 		sql = fmt.Sprintf(`SELECT time,%s FROM %s
-	WHERE sid=%d AND time < %d
-	ORDER BY time DESC`, projection, tblName, exs.ID, endMs)
+	WHERE sid=%d AND %s
+	ORDER BY time DESC`, projection, tblName, exs.ID, timeFilter)
 	} else {
 		sql = fmt.Sprintf(`SELECT time,%s FROM %s
 	WHERE sid=%d AND %s
@@ -500,7 +951,7 @@ func (q *Queries) querySeriesPg(exs *ExSymbol, timeframe string, fields []string
 		sql += fmt.Sprintf(" LIMIT %d", limit)
 	}
 	pgRows, err := q.db.Query(context.Background(), sql)
-	rows, err := mapToSeriesFields(exs, timeframe, fields, pgRows, err)
+	rows, err := mapToSeriesFieldsWithContext(q.seriesReadContext(), exs, timeframe, fields, pgRows, err)
 	return rows, subTF, err
 }
 
@@ -531,7 +982,7 @@ func (q *Queries) querySeriesBatchPg(exsMap map[int32]*ExSymbol, timeframe strin
 WHERE %s AND sid IN (%s)
 ORDER BY sid, time`, klineSelectProjection(fields, true), tblName, buildPgTimeFilter(startMs, finishEndMS), sidText)
 	pgRows, err_ := q.db.Query(context.Background(), sql)
-	return handleSeriesBatchFields(exsMap, timeframe, fields, tfMSecs, subTF, pgRows, err_, handle)
+	return handleSeriesBatchFieldsWithQuery(q, exsMap, timeframe, fields, tfMSecs, subTF, pgRows, err_, handle)
 }
 
 func handleSeriesBatch(exsMap map[int32]*ExSymbol, timeframe string, tfMSecs int64, subTF string, pgRows pgx.Rows, err_ error, handle func(int32, []*DataSeries)) *errs.Error {
@@ -539,30 +990,35 @@ func handleSeriesBatch(exsMap map[int32]*ExSymbol, timeframe string, tfMSecs int
 }
 
 func handleSeriesBatchFields(exsMap map[int32]*ExSymbol, timeframe string, fields []string, tfMSecs int64, subTF string, pgRows pgx.Rows, err_ error, handle func(int32, []*DataSeries)) *errs.Error {
+	return handleSeriesBatchFieldsWithQuery(nil, exsMap, timeframe, fields, tfMSecs, subTF, pgRows, err_, handle)
+}
+
+func handleSeriesBatchFieldsWithQuery(q *Queries, exsMap map[int32]*ExSymbol, timeframe string, fields []string, tfMSecs int64, subTF string, pgRows pgx.Rows, err_ error, handle func(int32, []*DataSeries)) *errs.Error {
 	if err_ != nil {
 		return NewDbErr(core.ErrDbReadFail, err_)
 	}
 	defer pgRows.Close()
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
-	grouped := make(map[int32][]*DataSeries)
+	grouped := make(map[int32][]*DataSeries, len(exsMap))
+	var timeMS int64
+	var sid int32
+	values := make([]any, len(fields))
+	targets := make([]any, 2+len(fields))
+	targets[0] = &timeMS
+	for i := range values {
+		targets[i+1] = &values[i]
+	}
+	targets[len(targets)-1] = &sid
 	for pgRows.Next() {
-		var timeMS int64
-		var sid int32
-		values := make([]any, len(fields))
-		targets := make([]any, 2+len(fields))
-		targets[0] = &timeMS
-		for i := range values {
-			targets[i+1] = &values[i]
-		}
-		targets[len(targets)-1] = &sid
+		timeMS = 0
+		sid = 0
+		clear(values)
 		if err := pgRows.Scan(targets...); err != nil {
 			return NewDbErr(core.ErrDbReadFail, err)
 		}
 		valueMap := make(map[string]any, len(fields))
 		for i, field := range fields {
-			if values[i] != nil {
-				valueMap[field] = values[i]
-			}
+			valueMap[field] = values[i]
 		}
 		grouped[sid] = append(grouped[sid], &DataSeries{
 			Source: SeriesSourceKline, Sid: sid, TimeMS: timeMS, EndMS: timeMS + tfMSecs,
@@ -588,7 +1044,12 @@ func handleSeriesBatchFields(exsMap map[int32]*ExSymbol, timeframe string, field
 		if fromTFMS > 0 {
 			var lastDone bool
 			var err error
-			offMS := GetAlignOff(sid, tfMSecs)
+			var offMS int64
+			if q != nil {
+				offMS = q.alignOff(exs, tfMSecs)
+			} else {
+				offMS = seriesAlignOff(exs, tfMSecs)
+			}
 			seriesArr, lastDone, err = ResampleDataSeries(exs, timeframe, seriesArr, nil, tfMSecs, 0, fromTFMS, offMS, false)
 			if err != nil {
 				return errs.New(core.ErrInvalidBars, err)
@@ -607,6 +1068,10 @@ func mapToSeries(exs *ExSymbol, timeframe string, pgRows pgx.Rows, err_ error) (
 }
 
 func mapToSeriesFields(exs *ExSymbol, timeframe string, fields []string, pgRows pgx.Rows, err_ error) ([]*DataSeries, error) {
+	return mapToSeriesFieldsWithContext(context.Background(), exs, timeframe, fields, pgRows, err_)
+}
+
+func mapToSeriesFieldsWithContext(ctx context.Context, exs *ExSymbol, timeframe string, fields []string, pgRows pgx.Rows, err_ error) ([]*DataSeries, error) {
 	if err_ != nil {
 		return nil, err_
 	}
@@ -617,6 +1082,7 @@ func mapToSeriesFields(exs *ExSymbol, timeframe string, fields []string, pgRows 
 	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
 	var out []*DataSeries
+	byteCounter := SeriesByteCounter{Limit: SeriesReadByteLimit(ctx)}
 	var timeMS int64
 	values := make([]any, len(fields))
 	targets := make([]any, 1+len(fields))
@@ -632,83 +1098,118 @@ func mapToSeriesFields(exs *ExSymbol, timeframe string, fields []string, pgRows 
 		}
 		valueMap := make(map[string]any, len(fields))
 		for i, field := range fields {
-			if values[i] != nil {
-				valueMap[field] = values[i]
-			}
+			valueMap[field] = values[i]
 		}
 		sid := int32(0)
 		if exs != nil {
 			sid = exs.ID
 		}
-		out = append(out, &DataSeries{
+		row := &DataSeries{
 			Source: SeriesSourceKline, Sid: sid, TimeMS: timeMS, EndMS: timeMS + tfMSecs,
 			TimeFrame: timeframe, Closed: true, Values: valueMap, ExSymbol: exs,
-		})
+		}
+		if err := byteCounter.AddSeries(row); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
 	}
 	return out, pgRows.Err()
 }
 
-func (r *seriesOHLCVRow) toDataSeries(exs *ExSymbol, timeframe string, tfMSecs int64) *DataSeries {
-	sid := int32(0)
-	if exs != nil {
-		sid = exs.ID
-	}
-	return &DataSeries{
-		Source:    SeriesSourceKline,
-		Sid:       sid,
-		TimeMS:    r.timeMS,
-		EndMS:     r.timeMS + tfMSecs,
-		TimeFrame: timeframe,
-		Closed:    true,
-		Values: map[string]any{
-			"open":       r.open,
-			"high":       r.high,
-			"low":        r.low,
-			"close":      r.close,
-			"volume":     r.volume,
-			"quote":      r.quote,
-			"buy_volume": r.buyVolume,
-			"trade_num":  r.tradeNum,
-		},
-		ExSymbol: exs,
-	}
-}
-
 func (q *Queries) InsertOHLCVSeriesAuto(timeFrame string, exs *ExSymbol, rows []*DataSeries, aggBig bool) (int64, *errs.Error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	if _, err := q.requireKlineRuntimeOptions(); err != nil {
+		return 0, err
+	}
 	values, err := normalizeOHLCVSeries(rows, exs.ID)
 	if err != nil || len(values) == 0 {
 		return 0, err
 	}
-	startMS := values[0].timeMS
+	tblName := "kline_" + timeFrame
+	unlock, lockErr := q.tableReadLock(context.Background(), tblName)
+	if lockErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
+	startMS := values[0].TimeMS
 	tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-	lastMS := values[len(values)-1].timeMS
+	lastMS := values[len(values)-1].TimeMS
 	endMS := lastMS + tfMSecs
-	insTs, err := AddInsJob(AddInsKlineParams{
+	insTs, addErr := q.AddInsKline(context.Background(), AddInsKlineParams{
 		Sid:       exs.ID,
 		Timeframe: timeFrame,
 		StartMs:   startMS,
 		StopMs:    endMS,
 	})
-	if err != nil || insTs.IsZero() {
-		return 0, err
+	if addErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, addErr)
 	}
-	num, err := q.insertOHLCVRows(timeFrame, values)
+	if insTs.IsZero() {
+		return 0, nil
+	}
+	write := q
+	var tx pgx.Tx
+	if !q.isQuestDB() {
+		var txErr error
+		tx, write, txErr = q.begin(context.Background())
+		if txErr != nil {
+			return 0, NewDbErr(core.ErrDbExecFail, txErr)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+	}
+	num, err := write.insertOHLCVRowsLocked(timeFrame, values)
 	if err != nil {
 		return num, err
 	}
-	return num, q.finalizeKlineInsert(exs, timeFrame, startMS, endMS, lastMS, insTs, aggBig)
+	if err = write.finalizeKlineInsert(exs, timeFrame, startMS, endMS, lastMS, insTs, aggBig); err != nil {
+		return num, err
+	}
+	if tx != nil {
+		if err_ := tx.Commit(context.Background()); err_ != nil {
+			return num, NewDbErr(core.ErrDbExecFail, err_)
+		}
+	}
+	return num, nil
 }
 
 func (q *Queries) InsertOHLCVSeries(timeFrame string, sid int32, rows []*DataSeries) (int64, *errs.Error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	if _, err := q.requireKlineRuntimeOptions(); err != nil {
+		return 0, err
+	}
 	values, err := normalizeOHLCVSeries(rows, sid)
 	if err != nil || len(values) == 0 {
 		return 0, err
 	}
-	return q.insertOHLCVRows(timeFrame, values)
+	tblName := "kline_" + timeFrame
+	unlock, lockErr := q.tableReadLock(context.Background(), tblName)
+	if lockErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
+	return q.insertOHLCVRowsLocked(timeFrame, values)
 }
 
-func (q *Queries) insertOHLCVRows(timeFrame string, rows []ohlcvSeriesRow) (int64, *errs.Error) {
-	if !IsQuestDB {
+func (q *Queries) insertOHLCVRows(timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
+	if !q.isQuestDB() {
+		return q.insertOHLCVRowsLocked(timeFrame, rows)
+	}
+	tblName := "kline_" + timeFrame
+	unlock, lockErr := q.tableReadLock(context.Background(), tblName)
+	if lockErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
+	return q.insertOHLCVRowsLocked(timeFrame, rows)
+}
+
+// insertOHLCVRowsLocked writes rows while the caller holds the target table read lock.
+func (q *Queries) insertOHLCVRowsLocked(timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
+	if !q.isQuestDB() {
 		return q.insertOHLCVSeriesPg(timeFrame, rows)
 	}
 	tblName := "kline_" + timeFrame
@@ -741,9 +1242,9 @@ func (q *Queries) insertOHLCVRows(timeFrame string, rows []ohlcvSeriesRow) (int6
 			}
 			b.WriteByte(')')
 			vals := rows[k]
-			args = append(args, vals.sid, time.UnixMilli(vals.timeMS).UTC(), vals.open, vals.high, vals.low, vals.close, vals.volume, vals.quote, vals.buyVolume, vals.tradeNum)
+			args = append(args, vals.Sid, time.UnixMilli(vals.TimeMS).UTC(), klineWriteValue(vals, "open"), klineWriteValue(vals, "high"), klineWriteValue(vals, "low"), klineWriteValue(vals, "close"), klineWriteValue(vals, "volume"), klineWriteValue(vals, "quote"), klineWriteValue(vals, "buy_volume"), klineWriteValue(vals, "trade_num"))
 			for _, field := range fields {
-				args = append(args, vals.extras[field])
+				args = append(args, klineWriteValue(vals, field))
 			}
 		}
 		_, err := q.db.Exec(ctx, b.String(), args...)
@@ -755,55 +1256,88 @@ func (q *Queries) insertOHLCVRows(timeFrame string, rows []ohlcvSeriesRow) (int6
 	return total, nil
 }
 
-func (q *Queries) insertOHLCVSeriesPg(timeFrame string, rows []ohlcvSeriesRow) (int64, *errs.Error) {
+func (q *Queries) insertOHLCVSeriesPg(timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
+	ctx := context.Background()
+	if _, ok := q.db.(pgx.Tx); !ok {
+		beginner, ok := q.db.(dbBeginner)
+		if !ok {
+			return 0, NewDbErr(core.ErrDbExecFail, fmt.Errorf("database connection does not support transactions"))
+		}
+		tx, beginErr := beginner.Begin(ctx)
+		if beginErr != nil {
+			return 0, NewDbErr(core.ErrDbExecFail, beginErr)
+		}
+		n, insertErr := insertOHLCVSeriesPgTx(tx, timeFrame, rows)
+		if insertErr != nil {
+			_ = tx.Rollback(ctx)
+			return n, insertErr
+		}
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return n, NewDbErr(core.ErrDbExecFail, commitErr)
+		}
+		return n, nil
+	}
+	return insertOHLCVSeriesPgTx(q.db, timeFrame, rows)
+}
+
+func insertOHLCVSeriesPgTx(db DBTX, timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
 	tblName := "kline_" + timeFrame
 	fields := klineExtraFields(rows)
 	cols := klineInsertColumns("time", fields)
 	newSrc := func() *iterForAddOHLCVSeriesPg { return &iterForAddOHLCVSeriesPg{rows: rows, fields: fields} }
-	n, err := q.db.CopyFrom(context.Background(), pgx.Identifier{tblName}, cols, newSrc())
+	ctx := context.Background()
+	const savepoint = "banbot_kline_copy"
+	if _, err := db.Exec(ctx, "SAVEPOINT "+savepoint); err != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, err)
+	}
+	n, err := db.CopyFrom(ctx, pgx.Identifier{tblName}, cols, newSrc())
 	if err != nil {
+		if _, rollbackErr := db.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepoint); rollbackErr != nil {
+			return 0, NewDbErr(core.ErrDbExecFail, rollbackErr)
+		}
 		tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-		startMS := rows[0].timeMS
-		endMS := rows[len(rows)-1].timeMS + tfMSecs
-		if delErr := delKLinesPg(q, timeFrame, rows[0].sid, startMS, endMS); delErr != nil {
+		startMS := rows[0].TimeMS
+		endMS := rows[len(rows)-1].TimeMS + tfMSecs
+		if delErr := delKLinesPg(New(db), timeFrame, rows[0].Sid, startMS, endMS); delErr != nil {
 			return 0, delErr
 		}
-		n, err = q.db.CopyFrom(context.Background(), pgx.Identifier{tblName}, cols, newSrc())
+		n, err = db.CopyFrom(ctx, pgx.Identifier{tblName}, cols, newSrc())
 		if err != nil {
 			return 0, NewDbErr(core.ErrDbExecFail, err)
 		}
 	}
+	if _, releaseErr := db.Exec(ctx, "RELEASE SAVEPOINT "+savepoint); releaseErr != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, releaseErr)
+	}
 	return n, nil
 }
 
-type ohlcvSeriesRow struct {
-	sid    int32
-	timeMS int64
-	seriesOHLCVFields
-	extras map[string]any
+func ohlcvSeriesValues(row *DataSeries, sid int32) (*DataSeries, *errs.Error) {
+	if row == nil {
+		return nil, errs.NewMsg(core.ErrInvalidBars, "series row is nil")
+	}
+	if err := validateOHLCVSeries(row); err != nil {
+		return nil, errs.New(core.ErrInvalidBars, err)
+	}
+	item := *row
+	item.Sid = sid
+	item.Values = make(map[string]any, len(row.Values))
+	for key, value := range row.Values {
+		item.Values[key] = value
+	}
+	return &item, nil
 }
 
-func ohlcvSeriesValues(row *DataSeries, sid int32) (ohlcvSeriesRow, *errs.Error) {
+func validateOHLCVSeries(row *DataSeries) error {
 	if row == nil {
-		return ohlcvSeriesRow{}, errs.NewMsg(core.ErrInvalidBars, "series row is nil")
+		return fmt.Errorf("series event is nil")
 	}
-	fields, err := row.readOHLCVFields()
-	if err != nil {
-		return ohlcvSeriesRow{}, errs.New(core.ErrInvalidBars, err)
-	}
-	extras := make(map[string]any)
-	for key, val := range row.Values {
-		if isKlineReservedField(key) {
-			continue
+	for _, field := range []string{"open", "high", "low", "close", "volume"} {
+		if _, err := row.FloatValue(field); err != nil {
+			return err
 		}
-		extras[key] = val
 	}
-	return ohlcvSeriesRow{
-		sid:               sid,
-		timeMS:            row.TimeMS,
-		seriesOHLCVFields: fields,
-		extras:            extras,
-	}, nil
+	return nil
 }
 
 func isKlineReservedField(field string) bool {
@@ -815,10 +1349,24 @@ func isKlineReservedField(field string) bool {
 	}
 }
 
-func klineExtraFields(rows []ohlcvSeriesRow) []string {
+func klineWriteValue(row *DataSeries, field string) any {
+	if value, ok := row.Values[field]; ok {
+		return value
+	}
+	switch field {
+	case "quote", "buy_volume":
+		return float64(0)
+	case "trade_num":
+		return int64(0)
+	default:
+		return nil
+	}
+}
+
+func klineExtraFields(rows []*DataSeries) []string {
 	seen := make(map[string]bool)
 	for _, row := range rows {
-		for field := range row.extras {
+		for field := range row.Values {
 			if strings.TrimSpace(field) != "" && !isKlineReservedField(field) {
 				seen[field] = true
 			}
@@ -832,13 +1380,113 @@ func klineExtraFields(rows []ohlcvSeriesRow) []string {
 	return fields
 }
 
+func questKlineExtraColumns(columns []questTableColumn) []questTableColumn {
+	result := make([]questTableColumn, 0, len(columns))
+	for _, column := range columns {
+		if strings.TrimSpace(column.Name) == "" || isKlineReservedField(column.Name) {
+			continue
+		}
+		result = append(result, column)
+	}
+	return result
+}
+
+func buildQuestKlineAddColumnSQL(table string, column questTableColumn) (string, error) {
+	if strings.TrimSpace(column.Name) == "" {
+		return "", errors.New("questdb extension column has no name")
+	}
+	typeName := strings.TrimSpace(column.Type)
+	if typeName == "" {
+		return "", fmt.Errorf("questdb column %q has no type", column.Name)
+	}
+	for _, char := range typeName {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '_' && char != ' ' {
+			return "", fmt.Errorf("questdb column %q has invalid type %q", column.Name, column.Type)
+		}
+	}
+	return fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
+		quoteIdent(table), quoteIdent(column.Name), typeName), nil
+}
+
+func ensureQuestKlineExtraColumns(ctx context.Context, q *Queries, table string, columns []questTableColumn) error {
+	extraColumns := questKlineExtraColumns(columns)
+	if len(extraColumns) == 0 {
+		return nil
+	}
+	existing, err := queryQuestTableColumns(ctx, q, table)
+	if err != nil {
+		return err
+	}
+	existingByName := make(map[string]questTableColumn, len(existing))
+	for _, column := range existing {
+		existingByName[column.Name] = column
+	}
+	for _, column := range extraColumns {
+		if current, ok := existingByName[column.Name]; ok {
+			if !strings.EqualFold(strings.TrimSpace(current.Type), strings.TrimSpace(column.Type)) {
+				return fmt.Errorf("questdb extension column %q type mismatch: target=%q source=%q", column.Name, current.Type, column.Type)
+			}
+			continue
+		}
+		statement, err := buildQuestKlineAddColumnSQL(table, column)
+		if err != nil {
+			return err
+		}
+		if _, err := q.db.Exec(ctx, statement); err != nil && !isQuestDuplicateColumnErr(err) {
+			return err
+		}
+		existingByName[column.Name] = column
+	}
+	return nil
+}
+
+func questKlineDataFields(columns []questTableColumn) []string {
+	return questKlineDataFieldsForTime(columns, "ts")
+}
+
+func questKlineDataFieldsForTime(columns []questTableColumn, timeColumn string) []string {
+	fields := make([]string, 0, len(columns))
+	for _, column := range columns {
+		switch column.Name {
+		case "sid", "ts", "time", "end_ms":
+			continue
+		default:
+			if column.Name == timeColumn {
+				continue
+			}
+			fields = append(fields, column.Name)
+		}
+	}
+	return fields
+}
+
+func buildQuestKlineAggregateQuery(table string, columns []questTableColumn) (string, []string, error) {
+	timeColumn, _, err := questRewriteSchema(columns)
+	if err != nil {
+		return "", nil, err
+	}
+	if !questRewriteHasColumn(columns, "sid") {
+		return "", nil, fmt.Errorf("questdb kline table %q has no sid column", table)
+	}
+	fields := questKlineDataFieldsForTime(columns, timeColumn)
+	if len(fields) == 0 {
+		return "", nil, fmt.Errorf("questdb kline table %q has no data columns", table)
+	}
+	selectCols := append([]string{fmt.Sprintf("cast(%s as long)/1000", quoteIdent(timeColumn))}, quoteSeriesFields(fields)...)
+	return fmt.Sprintf(`SELECT %s
+FROM %s
+WHERE %s = $1 AND %s >= $2 AND %s < $3
+ORDER BY %s`, strings.Join(selectCols, ", "), quoteIdent(table), quoteIdent("sid"), quoteIdent(timeColumn), quoteIdent(timeColumn), quoteIdent(timeColumn)), fields, nil
+}
+
 func klineInsertColumns(timeColumn string, fields []string) []string {
 	cols := []string{"sid", timeColumn, "open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num"}
 	return append(cols, fields...)
 }
 
-func normalizeOHLCVSeries(rows []*DataSeries, sid int32) ([]ohlcvSeriesRow, *errs.Error) {
-	values := make([]ohlcvSeriesRow, 0, len(rows))
+func normalizeOHLCVSeries(rows []*DataSeries, sid int32) ([]*DataSeries, *errs.Error) {
+	values := make([]*DataSeries, 0, len(rows))
 	for _, row := range rows {
 		if row == nil {
 			continue
@@ -853,7 +1501,7 @@ func normalizeOHLCVSeries(rows []*DataSeries, sid int32) ([]ohlcvSeriesRow, *err
 }
 
 type iterForAddOHLCVSeriesPg struct {
-	rows   []ohlcvSeriesRow
+	rows   []*DataSeries
 	fields []string
 	idx    int
 }
@@ -865,9 +1513,9 @@ func (r *iterForAddOHLCVSeriesPg) Next() bool {
 
 func (r *iterForAddOHLCVSeriesPg) Values() ([]interface{}, error) {
 	row := r.rows[r.idx-1]
-	values := []interface{}{row.sid, row.timeMS, row.open, row.high, row.low, row.close, row.volume, row.quote, row.buyVolume, row.tradeNum}
+	values := []interface{}{row.Sid, row.TimeMS, klineWriteValue(row, "open"), klineWriteValue(row, "high"), klineWriteValue(row, "low"), klineWriteValue(row, "close"), klineWriteValue(row, "volume"), klineWriteValue(row, "quote"), klineWriteValue(row, "buy_volume"), klineWriteValue(row, "trade_num")}
 	for _, field := range r.fields {
-		values = append(values, row.extras[field])
+		values = append(values, klineWriteValue(row, field))
 	}
 	return values, nil
 }

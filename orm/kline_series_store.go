@@ -3,7 +3,9 @@ package orm
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -11,14 +13,24 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg/errs"
 	utils2 "github.com/banbox/banexg/utils"
+	"github.com/jackc/pgx/v5"
 )
 
 type KLineSeriesStore struct {
-	Info *SeriesInfo
+	Info     *SeriesInfo
+	Storage  *Storage
+	explicit bool
 }
 
 func NewKLineSeriesStore(info *SeriesInfo) *KLineSeriesStore {
 	return &KLineSeriesStore{Info: info}
+}
+
+// NewKLineSeriesStoreWithStorage binds series persistence to one database
+// identity. The legacy constructor remains available for callers that still
+// use the package-level ORM setup.
+func NewKLineSeriesStoreWithStorage(info *SeriesInfo, storage *Storage) *KLineSeriesStore {
+	return &KLineSeriesStore{Info: info, Storage: storage, explicit: true}
 }
 
 func NewKLineSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo {
@@ -40,16 +52,26 @@ func (s *KLineSeriesStore) Ensure(ctx context.Context) *errs.Error {
 	if err := validateKLineSeriesInfo(s.info()); err != nil {
 		return err
 	}
-	q, conn, err := Conn(ctx)
+	q, release, err := s.session(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
+	defer release()
 
-	binding := resolveKLineSeriesBinding(s.info())
+	binding := resolveKLineSeriesBindingForBackend(s.info(), q.isQuestDB())
+	unlock, lockErr := q.tableReadLock(ctx, binding.Table)
+	if lockErr != nil {
+		return NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
+	return s.ensureLocked(ctx, q)
+}
+
+func (s *KLineSeriesStore) ensureLocked(ctx context.Context, q *Queries) *errs.Error {
+	binding := resolveKLineSeriesBindingForBackend(s.info(), q.isQuestDB())
 	for _, field := range binding.Fields {
-		if _, err_ := q.db.Exec(ctx, buildKLineSeriesAddColumnSQL(binding.Table, field)); err_ != nil {
-			if shouldIgnoreKLineSeriesAddColumnError(err_) {
+		if _, err_ := q.db.Exec(ctx, buildKLineSeriesAddColumnSQLForBackend(binding.Table, field, q.isQuestDB())); err_ != nil {
+			if shouldIgnoreKLineSeriesAddColumnErrorForBackend(err_, q.isQuestDB()) {
 				continue
 			}
 			return NewDbErr(core.ErrDbExecFail, err_)
@@ -71,39 +93,41 @@ func (s *KLineSeriesStore) Write(ctx context.Context, target *ExSymbol, rows []*
 	if err := validateKLineSeriesInfo(s.info()); err != nil {
 		return err
 	}
-	if err := s.Ensure(ctx); err != nil {
-		return err
-	}
 	info := s.info()
-	binding := resolveKLineSeriesBinding(info)
-	items, err := normalizeKLineSeriesRows(target.ID, binding.Fields, rows)
+	items, err := normalizeKLineSeriesRows(target.ID, rows)
 	if err != nil {
 		return err
 	}
 	if len(items) == 0 {
 		return nil
 	}
-	q, conn, err := Conn(ctx)
+	q, release, err := s.session(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
+	defer release()
+	binding := resolveKLineSeriesBindingForBackend(info, q.isQuestDB())
+	unlock, lockErr := q.tableReadLock(ctx, binding.Table)
+	if lockErr != nil {
+		return NewDbErr(core.ErrDbExecFail, lockErr)
+	}
+	defer unlock()
+	if err := s.ensureLocked(ctx, q); err != nil {
+		return err
+	}
 
 	sqlText := buildKLineSeriesUpdateSQL(binding)
 	for _, row := range items {
 		args := make([]any, 0, len(binding.Fields)+2)
 		for _, field := range binding.Fields {
-			val, ok := row.Values[field.Name]
-			if !ok {
-				return errs.NewMsg(core.ErrBadConfig, "kline series row missing field %q", field.Name)
-			}
+			val := row.Values[field.Name]
 			normVal, err_ := normalizeSeriesFieldValue(field.Type, val)
 			if err_ != nil {
 				return errs.NewMsg(core.ErrBadConfig, "kline series row field %q invalid: %v", field.Name, err_)
 			}
 			args = append(args, normVal)
 		}
-		args = append(args, row.Sid, kLineSeriesTimeArg(binding.TimeColumn, row.TimeMS))
+		args = append(args, row.Sid, kLineSeriesTimeArgForBackend(binding.TimeColumn, row.TimeMS, q.isQuestDB()))
 		tag, err_ := q.db.Exec(ctx, sqlText, args...)
 		if err_ != nil {
 			return NewDbErr(core.ErrDbExecFail, err_)
@@ -113,7 +137,7 @@ func (s *KLineSeriesStore) Write(ctx context.Context, target *ExSymbol, rows []*
 				binding.Table, row.Sid, info.TimeFrame, row.TimeMS)
 		}
 	}
-	if IsQuestDB {
+	if q.isQuestDB() {
 		last := items[len(items)-1]
 		if err := waitForQuestKLineSeriesVisible(ctx, q, info, last); err != nil {
 			return err
@@ -136,17 +160,30 @@ func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, 
 	if err := validateKLineSeriesInfo(info); err != nil {
 		return nil, err
 	}
-	q, conn, err := Conn(ctx)
+	return s.readRaw(ctx, target, startMS, endMS, limit)
+}
+
+func (s *KLineSeriesStore) readRaw(ctx context.Context, target *ExSymbol, startMS, endMS int64, limit int) ([]*DataSeries, *errs.Error) {
+	info := s.info()
+	if err := validateKLineSeriesInfo(info); err != nil {
+		return nil, err
+	}
+	q, release, err := s.session(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Release()
+	defer release()
 
-	binding := resolveKLineSeriesBinding(info)
+	binding := resolveKLineSeriesBindingForBackend(info, q.isQuestDB())
+	unlock, lockErr := q.tableReadLock(ctx, binding.Table)
+	if lockErr != nil {
+		return nil, NewDbErr(core.ErrDbReadFail, lockErr)
+	}
+	defer unlock()
 	timeExpr := quoteIdent(binding.TimeColumn)
 	startArg, endArg := any(startMS), any(endMS)
 	var covered []MSRange
-	if IsQuestDB {
+	if q.isQuestDB() {
 		timeExpr = fmt.Sprintf("cast(%s as long)/1000", quoteIdent(binding.TimeColumn))
 		startArg = startMS * 1000
 		endArg = endMS * 1000
@@ -162,13 +199,13 @@ func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, 
 	selectCols := []string{quoteIdent(binding.SIDColumn), timeExpr}
 	for _, field := range binding.Fields {
 		colExpr := quoteIdent(field.Name)
-		if !IsQuestDB && field.Type == "json" {
+		if !q.isQuestDB() && field.Type == "json" {
 			colExpr = fmt.Sprintf("%s::text", colExpr)
 		}
 		selectCols = append(selectCols, colExpr)
 	}
 	timeFilter := fmt.Sprintf("%s >= $2 AND %s < $3", quoteIdent(binding.TimeColumn), quoteIdent(binding.TimeColumn))
-	if IsQuestDB {
+	if q.isQuestDB() {
 		timeFilter = fmt.Sprintf("cast(%s as long) >= $2 AND cast(%s as long) < $3",
 			quoteIdent(binding.TimeColumn), quoteIdent(binding.TimeColumn))
 	}
@@ -180,7 +217,7 @@ func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, 
 		quoteIdent(binding.TimeColumn),
 	)
 	args := []any{target.ID, startArg, endArg}
-	if limit > 0 && !IsQuestDB {
+	if limit > 0 && !q.isQuestDB() {
 		sqlText += " LIMIT $4"
 		args = append(args, limit)
 	}
@@ -193,6 +230,7 @@ func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, 
 	tfMS := int64(utils2.TFToSecs(info.TimeFrame)) * 1000
 	source := NormalizeSeriesSource(info.Name)
 	out := make([]*DataSeries, 0)
+	byteCounter := SeriesByteCounter{Limit: SeriesReadByteLimit(ctx)}
 	for dbRows.Next() {
 		rec, err_ := scanKLineSeriesRecord(dbRows, binding.Fields)
 		if err_ != nil {
@@ -201,10 +239,10 @@ func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, 
 		if len(rec.Values) == 0 {
 			continue
 		}
-		if IsQuestDB && !seriesRangeCovered(rec.TimeMS, covered) {
+		if q.isQuestDB() && !seriesRangeCovered(rec.TimeMS, covered) {
 			continue
 		}
-		out = append(out, &DataSeries{
+		row := &DataSeries{
 			Source:    source,
 			Sid:       rec.Sid,
 			TimeMS:    rec.TimeMS,
@@ -213,8 +251,12 @@ func (s *KLineSeriesStore) Read(ctx context.Context, target *ExSymbol, startMS, 
 			Closed:    true,
 			Values:    rec.Values,
 			ExSymbol:  target,
-		})
-		if IsQuestDB && limit > 0 && len(out) >= limit {
+		}
+		if err := byteCounter.AddSeries(row); err != nil {
+			return nil, NewDbErr(core.ErrDbReadFail, err)
+		}
+		out = append(out, row)
+		if q.isQuestDB() && limit > 0 && len(out) >= limit {
 			break
 		}
 	}
@@ -229,6 +271,24 @@ func (s *KLineSeriesStore) info() *SeriesInfo {
 		return nil
 	}
 	return s.Info
+}
+
+func (s *KLineSeriesStore) session(ctx context.Context) (*Queries, func(), *errs.Error) {
+	if s != nil && s.explicit && s.Storage == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "kline series store storage is required")
+	}
+	if s != nil && s.Storage != nil {
+		q, conn, err := s.Storage.Conn(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return q, conn.Release, nil
+	}
+	q, conn, err := Conn(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return q, conn.Release, nil
 }
 
 func validateKLineSeriesInfo(info *SeriesInfo) *errs.Error {
@@ -285,7 +345,7 @@ func validateKLineSeriesInfo(info *SeriesInfo) *errs.Error {
 	return nil
 }
 
-func normalizeKLineSeriesRows(sid int32, fields []SeriesField, rows []*DataRecord) ([]*DataRecord, *errs.Error) {
+func normalizeKLineSeriesRows(sid int32, rows []*DataRecord) ([]*DataRecord, *errs.Error) {
 	if sid <= 0 {
 		return nil, errs.NewMsg(core.ErrBadConfig, "kline series target sid is required")
 	}
@@ -301,11 +361,6 @@ func normalizeKLineSeriesRows(sid int32, fields []SeriesField, rows []*DataRecor
 		if cp.Sid != sid {
 			return nil, errs.NewMsg(core.ErrBadConfig, "kline series row sid %d does not match target sid %d", cp.Sid, sid)
 		}
-		for _, field := range fields {
-			if _, ok := cp.Values[field.Name]; !ok {
-				return nil, errs.NewMsg(core.ErrBadConfig, "kline series row missing field %q", field.Name)
-			}
-		}
 		items = append(items, &cp)
 	}
 	sort.Slice(items, func(i, j int) bool {
@@ -315,19 +370,27 @@ func normalizeKLineSeriesRows(sid int32, fields []SeriesField, rows []*DataRecor
 }
 
 func KLineSeriesTimeColumn() string {
-	if IsQuestDB {
+	return KLineSeriesTimeColumnForBackend(IsQuestDB)
+}
+
+func KLineSeriesTimeColumnForBackend(questDB bool) string {
+	if questDB {
 		return "ts"
 	}
 	return "time"
 }
 
 func resolveKLineSeriesBinding(info *SeriesInfo) SeriesBinding {
+	return resolveKLineSeriesBindingForBackend(info, IsQuestDB)
+}
+
+func resolveKLineSeriesBindingForBackend(info *SeriesInfo, questDB bool) SeriesBinding {
 	if info == nil {
 		return SeriesBinding{}
 	}
 	binding := normalizedSeriesBinding(info.Binding)
 	if isKLineSeriesBinding(info, binding) {
-		binding.TimeColumn = KLineSeriesTimeColumn()
+		binding.TimeColumn = KLineSeriesTimeColumnForBackend(questDB)
 	}
 	return binding
 }
@@ -337,22 +400,34 @@ func isKLineSeriesBinding(info *SeriesInfo, binding SeriesBinding) bool {
 }
 
 func kLineSeriesTimeArg(timeColumn string, timeMS int64) any {
-	if IsQuestDB {
+	return kLineSeriesTimeArgForBackend(timeColumn, timeMS, IsQuestDB)
+}
+
+func kLineSeriesTimeArgForBackend(timeColumn string, timeMS int64, questDB bool) any {
+	if questDB {
 		return time.UnixMilli(timeMS).UTC()
 	}
 	return timeMS
 }
 
 func buildKLineSeriesAddColumnSQL(table string, field SeriesField) string {
+	return buildKLineSeriesAddColumnSQLForBackend(table, field, IsQuestDB)
+}
+
+func buildKLineSeriesAddColumnSQLForBackend(table string, field SeriesField, questDB bool) string {
 	return fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
 		quoteIdent(table),
 		quoteIdent(field.Name),
-		seriesSQLType(field.Type),
+		seriesSQLTypeForBackend(field.Type, questDB),
 	)
 }
 
 func shouldIgnoreKLineSeriesAddColumnError(err error) bool {
-	return IsQuestDB && isQuestDuplicateColumnErr(err)
+	return shouldIgnoreKLineSeriesAddColumnErrorForBackend(err, IsQuestDB)
+}
+
+func shouldIgnoreKLineSeriesAddColumnErrorForBackend(err error, questDB bool) bool {
+	return questDB && isQuestDuplicateColumnErr(err)
 }
 
 func buildKLineSeriesUpdateSQL(binding SeriesBinding) string {
@@ -378,6 +453,7 @@ func scanKLineSeriesRecord(rows rowScanner, fields []SeriesField) (*DataRecord, 
 	targets = append(targets, &rec.Sid, &rec.TimeMS)
 	fieldTargets := make([]any, len(fields))
 	for i, field := range fields {
+		rec.Values[field.Name] = nil
 		switch field.Type {
 		case "float":
 			var val sql.NullFloat64
@@ -422,40 +498,41 @@ func scanKLineSeriesRecord(rows rowScanner, fields []SeriesField) (*DataRecord, 
 	return rec, nil
 }
 
-type rowScanner interface {
-	Scan(dest ...any) error
-}
-
 func waitForQuestKLineSeriesVisible(ctx context.Context, q *Queries, info *SeriesInfo, row *DataRecord) *errs.Error {
 	if info == nil || row == nil {
 		return nil
 	}
-	binding := resolveKLineSeriesBinding(info)
+	binding := resolveKLineSeriesBindingForBackend(info, q.isQuestDB())
 	if len(binding.Fields) == 0 {
 		return nil
 	}
-	field := binding.Fields[0]
-	want, ok := row.Values[field.Name]
-	if !ok {
-		return nil
-	}
-	normWant, err := normalizeSeriesFieldValue(field.Type, want)
-	if err != nil {
-		return errs.NewMsg(core.ErrBadConfig, "kline series row field %q invalid: %v", field.Name, err)
-	}
-	visible, err := waitForQuestCondition(ctx, 5*time.Second, questReadAfterWritePollInterval, func() (bool, error) {
-		var got any
-		sqlText := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1 AND %s = $2",
-			quoteIdent(field.Name),
-			quoteIdent(binding.Table),
-			quoteIdent(binding.SIDColumn),
-			quoteIdent(binding.TimeColumn),
-		)
-		err_ := q.db.QueryRow(ctx, sqlText, row.Sid, time.UnixMilli(row.TimeMS).UTC()).Scan(&got)
-		if err_ != nil {
-			return false, nil
+	want := make(map[string]any, len(binding.Fields))
+	for _, field := range binding.Fields {
+		normVal, err := normalizeSeriesFieldValue(field.Type, row.Values[field.Name])
+		if err != nil {
+			return errs.NewMsg(core.ErrBadConfig, "kline series row field %q invalid: %v", field.Name, err)
 		}
-		return fmt.Sprint(got) == fmt.Sprint(normWant), nil
+		want[field.Name] = normVal
+	}
+	selectCols := []string{quoteIdent(binding.SIDColumn), fmt.Sprintf("cast(%s as long)/1000", quoteIdent(binding.TimeColumn))}
+	for _, field := range binding.Fields {
+		selectCols = append(selectCols, quoteIdent(field.Name))
+	}
+	sqlText := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1 AND %s = $2",
+		strings.Join(selectCols, ", "),
+		quoteIdent(binding.Table),
+		quoteIdent(binding.SIDColumn),
+		quoteIdent(binding.TimeColumn),
+	)
+	visible, err := waitForQuestCondition(ctx, 5*time.Second, questReadAfterWritePollInterval, func() (bool, error) {
+		got, err_ := scanKLineSeriesRecord(q.db.QueryRow(ctx, sqlText, row.Sid, time.UnixMilli(row.TimeMS).UTC()), binding.Fields)
+		if err_ != nil {
+			if errors.Is(err_, pgx.ErrNoRows) {
+				return false, nil
+			}
+			return false, err_
+		}
+		return got.Sid == row.Sid && got.TimeMS == row.TimeMS && reflect.DeepEqual(got.Values, want), nil
 	})
 	if err != nil {
 		return NewDbErr(core.ErrDbReadFail, err)
@@ -463,6 +540,6 @@ func waitForQuestKLineSeriesVisible(ctx context.Context, q *Queries, info *Serie
 	if visible {
 		return nil
 	}
-	return errs.NewMsg(core.ErrDbReadFail, "questdb kline series row not visible in time: table=%s sid=%d time_ms=%d field=%s",
-		binding.Table, row.Sid, row.TimeMS, field.Name)
+	return errs.NewMsg(core.ErrDbReadFail, "questdb kline series row not visible in time: table=%s sid=%d time_ms=%d",
+		binding.Table, row.Sid, row.TimeMS)
 }

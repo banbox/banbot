@@ -49,7 +49,7 @@ func TestNewRejectsOnDataWithLegacyDataCallbacks(t *testing.T) {
 	for _, legacy := range []string{"OnBar", "OnInfoBar"} {
 		t.Run(legacy, func(t *testing.T) {
 			name := "test_dual_" + strings.ToLower(legacy)
-			StratMake[name] = func(*config.RunPolicyConfig) *TradeStrat {
+			RegisterStrategy(name, func(*config.RunPolicyConfig) *TradeStrat {
 				stgy := &TradeStrat{
 					OnData: func(*StratJob, DataEvent) {},
 				}
@@ -59,8 +59,8 @@ func TestNewRejectsOnDataWithLegacyDataCallbacks(t *testing.T) {
 					stgy.OnInfoBar = func(*StratJob, *ta.BarEnv, string, string) {}
 				}
 				return stgy
-			}
-			defer delete(StratMake, name)
+			})
+			defer deleteStratFactory(name)
 
 			defer func() {
 				got := fmt.Sprint(recover())

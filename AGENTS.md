@@ -1,13 +1,24 @@
-# Repo Guidance
+## 开发规约
+- banexg负责不同交易所的对接和封装，对外提供一致的接口和参数。禁止在banbot中直接针对不同交易所写独有的处理逻辑。
 
-## QuestDB WAL Rules
+## 任意时序数据兼容性
 
-- Treat QuestDB `WAL` tables as read-after-write asynchronous. A successful `INSERT` or `CREATE TABLE ... AS` does not mean a follow-up read will immediately see the new rows.
-- Do not make fallback or destructive decisions from a single immediate read after writing QuestDB tables. If behavior depends on visibility, wait for the expected row, timestamp, range, or count to become visible first.
-- Before `DROP` / `RENAME` table-swap flows, verify the replacement table matches the expected snapshot. Never delete the old table on an unchecked assumption.
-- Recovery markers such as pending insert jobs must be preserved when visibility checks time out. Do not clear recovery state just because a first read returns empty.
-- When a same-process write is followed by a same-process read on QuestDB metadata tables, prefer a targeted visibility wait or an in-process cache/lock over blind retry loops.
+- 从 v0.3.8 升级到 v0.4.* 的核心目标是支持任意时序数据的读写。v0.3.8 只允许存储 K 线数据，且不允许给已有 K 线表增加列；
+- `orm.DataSeries` 是统一的运行时数据模型。`DataSeries.Values map[string]any` 是任意字段读写、跨数据源传递的核心兼容能力，不能因为性能优化而移除、收窄或退回固定 K 线字段模型。
+- 不引入 typed OHLCV 快速路径，默认 K 线和扩展列都统一通过 `DataSeries.Values map[string]any` 传递。聚合、复权、序列化、DataHub、feeder、回测和实盘回调必须继续保留自定义字段及其类型/NULL 语义。
 
-## Testing Expectations
+## QuestDB WAL 规则
 
-- Any fix for QuestDB visibility or table-swap logic should include a targeted regression test for the timeout/polling path or the pre-drop verification path.
+- 将 QuestDB 的 `WAL` 表视为“写后读”异步模型。成功的 `INSERT` 或 `CREATE TABLE ... AS` 操作并不意味着后续读取能立即看到新增行。
+- 写入 QuestDB 表后，切勿仅凭单次即时读取的结果就做出回退或破坏性操作。如果后续逻辑依赖于数据的可见性，请务必先等待预期的行、时间戳、范围或记录数变为可见。
+- 在执行 `DROP` / `RENAME`（表替换）操作之前，务必验证用于替换的表是否符合预期的快照状态。切勿在未经核实的情况下删除旧表。
+- 当可见性检查超时（例如针对待处理插入任务的检查）时，必须保留恢复标记。切勿仅仅因为首次读取结果为空就清除恢复状态。
+- 当同一进程内对 QuestDB 元数据表进行写入后紧接着进行读取时，应优先采用针对性的可见性等待机制或进程内缓存/锁机制，而不是盲目使用重试循环。
+
+## 通用要求
+- 发新版本使用`git tag`，注意先修改`core/data.go`中`Version`，如果也修改了`web/ui`中的前端，编译后打包更新`UIVersion`为新版本号
+- 禁止针banbot/banexg/banta使用DeepWiki
+
+## 测试要求
+
+- 针对 QuestDB 可见性或表替换逻辑的任何修复，都应包含针对超时/轮询路径或删除前验证路径的专项回归测试。

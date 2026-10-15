@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
@@ -32,6 +33,7 @@ func getExchange(name string, market string, t *testing.T) banexg.BanExchange {
 }
 
 func TestGetExSymbol(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)

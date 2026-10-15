@@ -61,6 +61,27 @@ func TestSQLiteConcurrentFreshStartup(t *testing.T) {
 	}
 }
 
+func TestSQLiteSchemaInitializationIsScopedBySource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared.db")
+	trades, err := newDbLite(DbTrades, path, true, 2_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trades.Close()
+	pub, err := newDbLite(DbPub, path, true, 2_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	var count int
+	if err := pub.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='task'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("publication schema table count = %d, want 1", count)
+	}
+}
+
 func runSQLiteStartupHelper(t *testing.T) {
 	t.Helper()
 	startAt, err := strconv.ParseInt(os.Getenv(sqliteStartupAtEnv), 10, 64)

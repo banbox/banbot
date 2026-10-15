@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io/fs"
+	"math"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -16,11 +17,9 @@ import (
 	"time"
 
 	"github.com/anyongjin/go-bayesopt"
-	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/goods"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
@@ -39,28 +38,23 @@ RunBTOverOpt
 Backtesting mode based on continuous parameter tuning. Approach the real situation and avoid using future information to adjust parameters for backtesting.
 基于持续调参的回测模式。接近实盘情况，避免使用未来信息调参回测。
 */
-func RunBTOverOpt(args *config.CmdArgs) *errs.Error {
-	t, err := newRollBtOpt(args)
+func RunBTOverOpt(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error {
+	t, err := newRollBtOpt(args, snapshot, factory)
 	if err != nil || t == nil {
 		return err
 	}
-	originalTimeRange := config.TimeRange
-	defer func() { config.TimeRange = originalTimeRange }()
-	var allHisOds []*ormo.InOutOrder
 	var lastWal map[string]float64
 	var lastRes *BTResult
-	lastPols := config.RunPolicy
+	var lastOrders []*ormo.InOutOrder
+	lastPols := clonePolicies(t.initPols)
 	pbar := utils.NewPrgBar(int((t.allEndMs-t.curMs)/1000), "BtOpt")
 	defer pbar.Close()
-	backPols := config.RunPolicy
 	for t.curMs < t.allEndMs {
 		pbar.Add(int(t.runMSecs / 1000))
-		config.RunPolicy = backPols
 		polStr, err := t.next(args.PairPicker)
 		if err != nil {
 			return err
 		}
-		biz.ResetVars()
 		polList, err := parseRunPolicies(polStr)
 		if err != nil {
 			return err
@@ -71,27 +65,37 @@ func RunBTOverOpt(args *config.CmdArgs) *errs.Error {
 			t.curMs += t.runMSecs
 			continue
 		}
-		applyOptPolicies(lastPols, polList, args.Alpha)
-		lastPols = config.RunPolicy
-		wallets := biz.GetWallets(config.DefAcc)
-		core.BotRunning = true
+		lastPols = applyOptPolicies(lastPols, polList, args.Alpha)
 		t.setRunRange()
 		outDir := filepath.Join(t.outDir, args.Picker)
-		bt, err := NewBackTest(false, outDir)
+		runSnapshot := deriveBacktestSnapshot(t.snapshot, t.dateRange.StartMS, t.dateRange.EndMS,
+			t.snapshot.View().Pairs, lastPols)
+		bt, cleanup, err := t.factory(runSnapshot, false, outDir)
 		if err != nil {
 			return err
 		}
-		if lastWal != nil {
-			wallets.SetWallets(lastWal)
+		err = runWithCleanup(cleanup, func() *errs.Error {
+			deps := bt.RuntimeDependencies()
+			if deps == nil || deps.Trading == nil || deps.Orders == nil {
+				return errs.NewMsg(errs.CodeRunTime, "backtest factory returned incomplete runtime dependencies")
+			}
+			wallets := deps.Trading.Wallet(bt.defaultAccount())
+			if lastWal != nil {
+				wallets.SetWallets(lastWal)
+			}
+			if err := restoreRollingResult(bt, lastRes, lastOrders); err != nil {
+				return err
+			}
+			if err := bt.Run(); err != nil {
+				return err
+			}
+			lastRes, lastOrders = detachRollingResult(bt)
+			lastWal = wallets.DumpAvas()
+			return nil
+		})
+		if err != nil {
+			return err
 		}
-		if lastRes != nil {
-			bt.BTResult = lastRes
-		}
-		ormo.HistODs = allHisOds
-		bt.Run()
-		lastRes = bt.BTResult
-		allHisOds = ormo.HistODs
-		lastWal = wallets.DumpAvas()
 		t.curMs += t.runMSecs
 	}
 	err = t.dumpConfig()
@@ -102,13 +106,43 @@ func RunBTOverOpt(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
-func RunRollBTPicker(args *config.CmdArgs) *errs.Error {
-	t, err := newRollBtOpt(args)
+func restoreRollingResult(bt *BackTest, previous *BTResult, orders []*ormo.InOutOrder) *errs.Error {
+	if bt == nil || bt.RuntimeDependencies() == nil || bt.RuntimeDependencies().Orders == nil {
+		return errs.NewMsg(errs.CodeRunTime, "rolling backtest requires an order state")
+	}
+	deps := bt.RuntimeDependencies()
+	for _, order := range orders {
+		deps.Orders.AddHistoricalOrder(order)
+	}
+	if previous != nil {
+		previous.runtimeDeps = deps
+		previous.reportDeps = reportDepsFromRuntime(deps)
+		bt.BTResult = previous
+	}
+	return nil
+}
+
+func detachRollingResult(bt *BackTest) (*BTResult, []*ormo.InOutOrder) {
+	if bt == nil || bt.BTResult == nil {
+		return nil, nil
+	}
+	result := bt.BTResult
+	var orders []*ormo.InOutOrder
+	if deps := bt.RuntimeDependencies(); deps != nil && deps.Orders != nil {
+		orders = deps.Orders.HistoricalOrders()
+	}
+	// Cleanup resets the runtime's mutable registries. The next window binds
+	// this accumulated result to its own runtime before it is read again.
+	result.runtimeDeps = nil
+	result.reportDeps = nil
+	return result, orders
+}
+
+func RunRollBTPicker(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error {
+	t, err := newRollBtOpt(args, snapshot, factory)
 	if err != nil || t == nil {
 		return err
 	}
-	originalTimeRange := config.TimeRange
-	defer func() { config.TimeRange = originalTimeRange }()
 	pbar := utils.NewPrgBar(int((t.allEndMs-t.curMs)/1000), "RollPicker")
 	defer pbar.Close()
 	pickers, err := getTestPickers(args.Picker)
@@ -127,15 +161,12 @@ func RunRollBTPicker(args *config.CmdArgs) *errs.Error {
 		row2 := []string{row[0]}
 		items := make([]*ValItem, 0, len(pickers))
 		log.Info("test pickers for", zap.String("dt", row[0]))
-		backPols := config.RunPolicy
 		for i, picker := range pickers {
 			t.args.Picker = picker
-			config.RunPolicy = backPols
 			polStr, err := t.next(args.PairPicker)
 			if err != nil {
 				return err
 			}
-			biz.ResetVars()
 			polList, err := parseRunPolicies(polStr)
 			if err != nil {
 				return err
@@ -146,17 +177,17 @@ func RunRollBTPicker(args *config.CmdArgs) *errs.Error {
 				t.curMs += t.runMSecs
 				continue
 			}
-			err = config.SetRunPolicy(true, polList...)
-			if err != nil {
-				return err
-			}
-			core.BotRunning = true
 			t.setRunRange()
-			bt, err := NewBackTest(true, "")
+			runSnapshot := deriveBacktestSnapshot(t.snapshot, t.dateRange.StartMS, t.dateRange.EndMS,
+				t.snapshot.View().Pairs, polList)
+			bt, cleanup, err := t.factory(runSnapshot, true, "")
 			if err != nil {
 				return err
 			}
-			bt.Run()
+			err = runWithCleanup(cleanup, bt.Run)
+			if err != nil {
+				return err
+			}
 			score := bt.Score()
 			scores = append(scores, score)
 			row = append(row, strconv.FormatFloat(score, 'f', 1, 64))
@@ -197,7 +228,20 @@ func RunRollBTPicker(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
-func btOptHash(args *config.CmdArgs) string {
+// runWithCleanup scopes a backtest run to its factory-owned cleanup function.
+// Keeping cleanup in one helper makes every error path release the isolated
+// runtime before the caller advances to the next window.
+func runWithCleanup(cleanup func(), run func() *errs.Error) *errs.Error {
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if run == nil {
+		return errs.NewMsg(errs.CodeRunTime, "backtest run function is required")
+	}
+	return run()
+}
+
+func btOptHash(args *config.CmdArgs, snapshot *config.Snapshot) string {
 	raws := []string{
 		args.Sampler,
 		args.RunPeriod,
@@ -205,14 +249,20 @@ func btOptHash(args *config.CmdArgs) string {
 		strconv.FormatBool(args.EachPairs),
 		strconv.Itoa(args.OptRounds),
 	}
-	ymlData, err := config.DumpYaml(true)
+	var ymlData []byte
+	var err *errs.Error
+	if snapshot != nil {
+		ymlData, err = snapshot.View().Desensitize().DumpYaml()
+	}
 	if ymlData != nil {
 		raws = append(raws, string(ymlData))
 	} else {
 		log.Warn("dump config yaml fail", zap.Error(err))
 	}
-	for _, p := range config.RunPolicy {
-		raws = append(raws, p.Key())
+	if snapshot != nil && snapshot.View() != nil {
+		for _, p := range snapshot.View().RunPolicy {
+			raws = append(raws, p.Key())
+		}
 	}
 	res := utils.MD5([]byte(strings.Join(raws, "")))
 	return res[:10]
@@ -234,10 +284,9 @@ applyOptPolicies
 Update strategy group parameters using EMA to avoid significant differences in parameters before and after rolling backtesting
 使用EMA更新策略组参数，避免滚动回测前后参数差异较大
 */
-func applyOptPolicies(olds, pols []*config.RunPolicyConfig, alpha float64) {
+func applyOptPolicies(olds, pols []*config.RunPolicyConfig, alpha float64) []*config.RunPolicyConfig {
 	if alpha >= 1 {
-		_ = config.SetRunPolicy(true, pols...)
-		return
+		return clonePolicies(pols)
 	}
 	var data = make(map[string]*config.RunPolicyConfig)
 	for _, p := range olds {
@@ -261,21 +310,18 @@ func applyOptPolicies(olds, pols []*config.RunPolicyConfig, alpha float64) {
 			res = append(res, item)
 		}
 	}
-	_ = config.SetRunPolicy(true, res...)
+	return res
 }
 
-func RunOptimize(args *config.CmdArgs) *errs.Error {
+func RunOptimize(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error {
 	if args.OutPath == "" {
 		log.Warn("-out is required")
 		return nil
 	}
-	args.LogLevel = "warn"
-	core.SetRunMode(core.RunModeBackTest)
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
+	if snapshot == nil || snapshot.View() == nil || factory == nil {
+		return errs.NewMsg(errs.CodeParamInvalid, "optimization requires a runtime snapshot and backtest factory")
 	}
-	cfgStr, err := runOptimize(args, 0)
+	cfgStr, err := runOptimize(args, snapshot, factory, 0)
 	if err != nil {
 		return err
 	}
@@ -283,26 +329,25 @@ func RunOptimize(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
-func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
+func runOptimize(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory, minScore float64) (string, *errs.Error) {
 	var err *errs.Error
-	btime.CurTimeMS = config.TimeRange.StartMS
+	if args == nil || snapshot == nil || snapshot.View() == nil || snapshot.View().TimeRange == nil || factory == nil {
+		return "", errs.NewMsg(errs.CodeParamInvalid, "optimization requires a runtime snapshot and backtest factory")
+	}
+	cfg := snapshot.View()
 	// 列举所有标的
-	allPairs := config.Pairs
+	allPairs := slices.Clone(cfg.Pairs)
 	if len(allPairs) == 0 {
-		goods.ShowLog = false
-		allPairs, err = goods.RefreshPairList(btime.TimeMS())
-		if err != nil {
-			return "", err
-		}
+		return "", errs.NewMsg(errs.CodeParamInvalid, "optimization snapshot requires pairs")
 	}
 	if os.Getenv(optDataPreparedEnv) != "1" {
-		if err = prepareOptimizeData(); err != nil {
+		if err = prepareOptimizeData(snapshot, factory); err != nil {
 			return "", err
 		}
 	}
 	var logOuts []string
 	var sourceHints map[string]*config.RunPolicyConfig
-	groups := config.RunPolicy
+	groups := clonePolicies(cfg.RunPolicy)
 	if len(groups) <= 1 || args.Concur <= 1 {
 		logOuts = append(logOuts, args.OutPath)
 		file, err_ := os.Create(args.OutPath)
@@ -312,7 +357,7 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 		for _, gp := range groups {
 			// Bayesian optimization is carried out separately for each strategy, long and short, to find the best parameters
 			// 针对每个策略、多空单独进行贝叶斯优化，寻找最佳参数
-			err = optAndPrint(gp.Clone(), args, allPairs, file)
+			err = optAndPrint(gp.Clone(), args, snapshot, factory, allPairs, file)
 			if err != nil {
 				file.Close()
 				return "", err
@@ -332,8 +377,8 @@ func runOptimize(args *config.CmdArgs, minScore float64) (string, *errs.Error) {
 			return "", cmdErr
 		}
 		defer cleanup()
-		startStr := strconv.FormatInt(config.TimeRange.StartMS/1000, 10)
-		endStr := strconv.FormatInt(config.TimeRange.EndMS/1000, 10)
+		startStr := strconv.FormatInt(cfg.TimeRange.StartMS/1000, 10)
+		endStr := strconv.FormatInt(cfg.TimeRange.EndMS/1000, 10)
 		logOuts = optimizeLogPaths(args.OutPath, len(groups))
 		sourceHints = mapLogSources(logOuts, groups)
 		err = utils.ParallelRun(groups, args.Concur, func(i int, pol *config.RunPolicyConfig) *errs.Error {
@@ -475,6 +520,9 @@ func optimizeChildBaseArgs(args *config.CmdArgs) ([]string, func(), *errs.Error)
 	if args.NoDefault {
 		cmds = append(cmds, "-no-default")
 	}
+	if args.BTStrictSet {
+		cmds = append(cmds, "-bt-strict="+strconv.FormatBool(args.BTStrict))
+	}
 	if args.DataDir != "" {
 		cmds = append(cmds, "-datadir", args.DataDir)
 	}
@@ -506,12 +554,13 @@ func optimizeChildBaseArgs(args *config.CmdArgs) ([]string, func(), *errs.Error)
 	return cmds, cleanup, nil
 }
 
-func prepareOptimizeData() *errs.Error {
-	core.BotRunning = true
-	biz.ResetVars()
-	bt, err := NewBackTest(true, "")
+func prepareOptimizeData(snapshot *config.Snapshot, factory BacktestFactory) *errs.Error {
+	bt, cleanup, err := factory(snapshot.Clone(), true, "")
 	if err != nil {
 		return err
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 	bt.dp.SetAllowDownload(true)
 	bt.dataPrep = true
@@ -571,10 +620,10 @@ func sortOptLogs(path string) {
 optAndPrint optimize for raw policy group;
 write one or multiple optimize result to file.
 */
-func optAndPrint(pol *config.RunPolicyConfig, args *config.CmdArgs, allPairs []string, file *os.File) *errs.Error {
+func optAndPrint(pol *config.RunPolicyConfig, args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory, allPairs []string, file *os.File) *errs.Error {
 	file.WriteString(fmt.Sprintf("# run hyper optimize: %v, rounds: %v\n", args.Sampler, args.OptRounds))
-	startDt := btime.ToDateStr(config.TimeRange.StartMS, "")
-	endDt := btime.ToDateStr(config.TimeRange.EndMS, "")
+	startDt := btime.ToDateStr(snapshot.View().TimeRange.StartMS, "")
+	endDt := btime.ToDateStr(snapshot.View().TimeRange.EndMS, "")
 	file.WriteString(fmt.Sprintf("# date range: %v - %v\n", startDt, endDt))
 	file.WriteString(optSourceLine(pol) + "\n")
 	var res []*GroupScore
@@ -586,7 +635,10 @@ func optAndPrint(pol *config.RunPolicyConfig, args *config.CmdArgs, allPairs []s
 		res = make([]*GroupScore, 0, len(pairs))
 		for _, p := range pairs {
 			pol.Pairs = []string{p}
-			item := optForGroup(pol, args.Sampler, args.Picker, args.OptRounds, file)
+			item, err := optForGroup(pol, snapshot, factory, args.Sampler, args.Picker, args.OptRounds, file)
+			if err != nil {
+				return err
+			}
 			if item != nil {
 				res = append(res, item)
 			}
@@ -595,7 +647,10 @@ func optAndPrint(pol *config.RunPolicyConfig, args *config.CmdArgs, allPairs []s
 			return res[i].Score > res[j].Score
 		})
 	} else {
-		item := optForGroup(pol, args.Sampler, args.Picker, args.OptRounds, file)
+		item, err := optForGroup(pol, snapshot, factory, args.Sampler, args.Picker, args.OptRounds, file)
+		if err != nil {
+			return err
+		}
 		if item != nil {
 			res = append(res, item)
 		}
@@ -623,7 +678,7 @@ optForGroup
 Optimize the hyperparameters of a policy and automatically search for the best combination of long, short, and both.
 对某个策略超参数调优，自动搜索long/short/both的最佳组合。
 */
-func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int, flog *os.File) *GroupScore {
+func optForGroup(pol *config.RunPolicyConfig, snapshot *config.Snapshot, factory BacktestFactory, method, picker string, rounds int, flog *os.File) (*GroupScore, *errs.Error) {
 	groups := make([]*config.RunPolicyConfig, 0, 3)
 	var long, short, both *config.RunPolicyConfig
 	if pol.Dirt == "any" {
@@ -641,8 +696,10 @@ func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int,
 	var bestScore = -999.0
 	var bestPols []*config.RunPolicyConfig
 	for _, p := range groups {
-		config.RunPolicy = []*config.RunPolicyConfig{p}
-		orderNum := optForPol(p, method, picker, rounds, flog)
+		orderNum, err := optForPol(p, snapshot, factory, method, picker, rounds, flog)
+		if err != nil {
+			return nil, err
+		}
 		if p.Score > bestScore {
 			bestOdNum = orderNum
 			bestScore = p.Score
@@ -650,7 +707,7 @@ func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int,
 		}
 	}
 	if len(groups) == 1 {
-		return &GroupScore{groups, bestScore}
+		return &GroupScore{groups, bestScore}, nil
 	}
 	// long,short,both分别评估
 	minScore := min(long.Score, short.Score)
@@ -658,8 +715,10 @@ func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int,
 	if minScore > 0 && maxScore > 0 {
 		// 检查组合的是否优于long/short/both
 		flog.WriteString("\n========== union long/short ============\n")
-		_ = config.SetRunPolicy(true, long, short)
-		bt, loss := runBTOnce()
+		bt, loss, err := runBTOnce(snapshot, factory, []*config.RunPolicyConfig{long, short})
+		if err != nil {
+			return nil, err
+		}
 		line := fmt.Sprintf("loss: %5.2f \t%v\n", loss, bt.BriefLine())
 		flog.WriteString(line)
 		log.Warn(line)
@@ -675,23 +734,26 @@ func optForGroup(pol *config.RunPolicyConfig, method, picker string, rounds int,
 	if minScore < 0 || maxScore > minScore*5 {
 		// The long and short returns are seriously unbalanced, the parameters with high fixed returns remain unchanged, and the parameters with low returns are fine-tuned to find the best score of the combination
 		// 多空收益严重不均衡，固定收益高的参数不变，微调收益低的参数，寻找组合最佳分数
-		_ = config.SetRunPolicy(true, long, short)
 		var unionScore float64
 		if long.Score > short.Score {
-			optForPol(short, method, picker, rounds, flog)
+			if _, err := optForPol(short, deriveBacktestSnapshotForPolicies(snapshot, []*config.RunPolicyConfig{long, short}), factory, method, picker, rounds, flog); err != nil {
+				return nil, err
+			}
 			unionScore = short.Score
 		} else {
-			optForPol(long, method, picker, rounds, flog)
+			if _, err := optForPol(long, deriveBacktestSnapshotForPolicies(snapshot, []*config.RunPolicyConfig{long, short}), factory, method, picker, rounds, flog); err != nil {
+				return nil, err
+			}
 			unionScore = long.Score
 		}
 		if unionScore > bestScore {
-			return &GroupScore{[]*config.RunPolicyConfig{long, short}, unionScore}
+			return &GroupScore{[]*config.RunPolicyConfig{long, short}, unionScore}, nil
 		}
 	}
 	if len(bestPols) > 0 {
-		return &GroupScore{bestPols, bestScore}
+		return &GroupScore{bestPols, bestScore}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 type GroupScore struct {
@@ -704,9 +766,9 @@ optForPol
 Optimize policy tasks and support bayes, tpe, and cames
 Before calling this method, you need to set 'config. RunPolicy`
 对策略任务执行优化，支持bayes/tpe/cames等
-调用此方法前需要设置 `config.RunPolicy`
+调用此方法前传入当前策略与其运行时快照
 */
-func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, flog *os.File) int {
+func optForPol(pol *config.RunPolicyConfig, snapshot *config.Snapshot, factory BacktestFactory, method, picker string, rounds int, flog *os.File) (int, *errs.Error) {
 	title := pol.Key()
 	// 重置PairParams，避免影响传入参数
 	pol.PairParams = make(map[string]map[string]float64)
@@ -715,13 +777,13 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 	params := pol.HyperParams()
 	if len(params) == 0 {
 		log.Warn("no hyper params, skip optimize", zap.String("strat", title))
-		return 0
+		return 0, nil
 	}
 	detailDir := filepath.Join(filepath.Dir(flog.Name()), "detail")
 	err_ := utils.EnsureDir(detailDir, 0755)
 	if err_ != nil {
 		log.Warn("create detail dir fail", zap.String("path", detailDir), zap.Error(err_))
-		return 0
+		return 0, errs.New(core.ErrIOWriteFail, err_)
 	}
 	flog.WriteString(fmt.Sprintf("\n============== %s =============\n", title))
 	var resList = make([]*OptInfo, 0, rounds)
@@ -732,7 +794,10 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 			pol.Params[k] = v
 			ints[k] = pol.IsInt(k)
 		}
-		bt, loss := runBTOnce()
+		bt, loss, err := runBTOnce(snapshot, factory, []*config.RunPolicyConfig{pol})
+		if err != nil {
+			return 0, err
+		}
 		o := &OptInfo{Score: -loss, Params: data, Ints: ints, BTResult: bt.BTResult, ID: jobId}
 		line := o.ToLine()
 		flog.WriteString(line + "\n")
@@ -748,40 +813,42 @@ func optForPol(pol *config.RunPolicyConfig, method, picker string, rounds int, f
 	} else {
 		err = runGOptuna(method, rounds, params, runOptJob)
 	}
+	if err != nil {
+		return 0, err
+	}
 	best := calcBestBy(resList, picker)
 	if best.BTResult == nil {
 		best.ID = utils.RandomStr(6)
-		best.runGetBtResult(pol)
+		if err = best.runGetBtResult(snapshot, factory, pol); err != nil {
+			return 0, err
+		}
 		best.dumpDetail(filepath.Join(detailDir, best.ID+".json"))
 	}
 	line := fmt.Sprintf("[%s] %s", picker, best.ToLine())
 	flog.WriteString(line + "\n")
 	log.Warn(line)
-	if err != nil {
-		log.Error("optimize fail", zap.String("job", title), zap.Error(err))
-	}
 	pol.Params = best.Params
 	pol.Score = best.Score
-	return best.OrderNum
+	return best.OrderNum, nil
 }
 
-func runBTOnce() (*BackTest, float64) {
-	core.BotRunning = true
-	resetOptimizeTrialVars()
-	bt, err := NewBackTest(true, "")
+func runBTOnce(snapshot *config.Snapshot, factory BacktestFactory, policies []*config.RunPolicyConfig) (*BackTest, float64, *errs.Error) {
+	runSnapshot := deriveBacktestSnapshotForPolicies(snapshot, policies)
+	if runSnapshot == nil || factory == nil {
+		return nil, 0, errs.NewMsg(errs.CodeParamInvalid, "optimization trial requires a runtime snapshot and backtest factory")
+	}
+	bt, cleanup, err := factory(runSnapshot, true, "")
 	if err != nil {
-		panic(err)
+		return nil, 0, err
 	}
-	bt.Run()
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err = bt.Run(); err != nil {
+		return nil, 0, err
+	}
 	var loss = -bt.Score()
-	return bt, loss
-}
-
-func resetOptimizeTrialVars() {
-	biz.ResetVars()
-	for _, account := range config.Accounts {
-		account.StakePctAmt = 0
-	}
+	return bt, loss, nil
 }
 
 func runGOptuna(name string, rounds int, params []*core.Param, loop FuncOptTask) *errs.Error {
@@ -857,7 +924,11 @@ func runBayes(rounds int, params []*core.Param, loop FuncOptTask) *errs.Error {
 		bayesopt.WithRandomRounds(rounds / 2),
 	}
 	opt := bayesopt.New(bysParams, options...)
+	var runErr *errs.Error
 	_, _, err_ := opt.Optimize(func(m map[bayesopt.Param]float64) float64 {
+		if runErr != nil {
+			return 0
+		}
 		var data = make(map[string]float64)
 		for k, v := range m {
 			data[k.GetName()] = v
@@ -865,9 +936,18 @@ func runBayes(rounds int, params []*core.Param, loop FuncOptTask) *errs.Error {
 		for _, p := range params {
 			data[p.Name], _ = p.ToRegular(data[p.Name])
 		}
-		score, _ := loop(data)
+		score, err := loop(data)
+		if err != nil {
+			// bayesopt objectives cannot return errors, so stop and return it after Optimize unwinds.
+			runErr = err
+			opt.Stop()
+			return 0
+		}
 		return score
 	})
+	if runErr != nil {
+		return runErr
+	}
 	if err_ != nil {
 		return errs.New(errs.CodeRunTime, err_)
 	}
@@ -885,10 +965,13 @@ Sorts all policy tasks in reverse score order of output.
 收集分析RunOptimize生成的日志
 将所有策略任务按分数倒序排列输出。
 */
-func CollectOptLog(args *config.CmdArgs) *errs.Error {
+func CollectOptLog(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error {
 	if args.InPath == "" {
 		log.Warn("-in is required")
 		return nil
+	}
+	if snapshot == nil || snapshot.View() == nil || factory == nil {
+		return errs.NewMsg(errs.CodeParamInvalid, "optimization result collection requires a runtime snapshot and backtest factory")
 	}
 	info, err_ := os.Stat(args.InPath)
 	if err_ != nil {
@@ -898,11 +981,6 @@ func CollectOptLog(args *config.CmdArgs) *errs.Error {
 		sortOptLogs(args.InPath)
 		return nil
 	}
-	core.SetRunMode(core.RunModeBackTest)
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
-	}
 	paths := make([]string, 0)
 	filepath.WalkDir(args.InPath, func(path string, d fs.DirEntry, err error) error {
 		if strings.HasSuffix(path, ".log") {
@@ -910,7 +988,8 @@ func CollectOptLog(args *config.CmdArgs) *errs.Error {
 		}
 		return nil
 	})
-	res, err := collectOptLog(paths, 0, args.Picker, args.PairPicker, config.RunPolicy)
+	res, err := collectOptLogWithRuntime(paths, 0, args.Picker, args.PairPicker,
+		clonePolicies(snapshot.View().RunPolicy), nil, snapshot, factory)
 	if err != nil {
 		return err
 	}
@@ -919,16 +998,22 @@ func CollectOptLog(args *config.CmdArgs) *errs.Error {
 }
 
 func collectOptLog(paths []string, minScore float64, picker, pairSel string, sources []*config.RunPolicyConfig) (string, *errs.Error) {
-	return collectOptLogWithHints(paths, minScore, picker, pairSel, sources, nil)
+	return collectOptLogWithRuntime(paths, minScore, picker, pairSel, sources, nil, nil, nil)
 }
 
 func collectOptLogWithHints(paths []string, minScore float64, picker, pairSel string, sources []*config.RunPolicyConfig,
 	sourceHints map[string]*config.RunPolicyConfig) (string, *errs.Error) {
+	return collectOptLogWithRuntime(paths, minScore, picker, pairSel, sources, sourceHints, nil, nil)
+}
+
+func collectOptLogWithRuntime(paths []string, minScore float64, picker, pairSel string, sources []*config.RunPolicyConfig,
+	sourceHints map[string]*config.RunPolicyConfig, snapshot *config.Snapshot, factory BacktestFactory) (string, *errs.Error) {
 	res := make([]*OptGroup, 0)
 	detailDir := ""
 	for _, path := range paths {
 		var name, pair, dirt, tfStr string
 		var source *config.RunPolicyConfig
+		var runPolicies []*config.RunPolicyConfig
 		originSource := sourceHints[path]
 		inUnion := false
 		var items []*OptInfo
@@ -1010,6 +1095,7 @@ func collectOptLogWithHints(paths []string, minScore float64, picker, pairSel st
 			source = nil
 			inUnion = false
 			items = nil
+			runPolicies = nil
 			pickerMap = make(map[string]*OptInfo)
 		}
 		lines := strings.Split(string(fdata), "\n")
@@ -1060,7 +1146,7 @@ func collectOptLogWithHints(paths []string, minScore float64, picker, pairSel st
 						union.Dirt = "union"
 						inUnion = false
 						if needRun {
-							config.RunPolicy = []*config.RunPolicyConfig{
+							runPolicies = []*config.RunPolicyConfig{
 								long.ToPol(source, 0, name, dirt, tfStr, pair),
 								short.ToPol(source, 1, name, dirt, tfStr, pair),
 							}
@@ -1070,14 +1156,14 @@ func collectOptLogWithHints(paths []string, minScore float64, picker, pairSel st
 						if long == nil {
 							long = best
 							if needRun {
-								config.RunPolicy = []*config.RunPolicyConfig{
+								runPolicies = []*config.RunPolicyConfig{
 									long.ToPol(source, 0, name, dirt, tfStr, pair),
 								}
 							}
 						} else {
 							shortMain = best
 							if needRun {
-								config.RunPolicy = []*config.RunPolicyConfig{
+								runPolicies = []*config.RunPolicyConfig{
 									short.ToPol(source, 0, name, dirt, tfStr, pair),
 									shortMain.ToPol(source, 1, name, dirt, tfStr, pair),
 								}
@@ -1088,13 +1174,13 @@ func collectOptLogWithHints(paths []string, minScore float64, picker, pairSel st
 						if short == nil {
 							short = best
 							if needRun {
-								config.RunPolicy = []*config.RunPolicyConfig{
+								runPolicies = []*config.RunPolicyConfig{
 									short.ToPol(source, 0, name, dirt, tfStr, pair)}
 							}
 						} else {
 							longMain = best
 							if needRun {
-								config.RunPolicy = []*config.RunPolicyConfig{
+								runPolicies = []*config.RunPolicyConfig{
 									long.ToPol(source, 0, name, dirt, tfStr, pair),
 									longMain.ToPol(source, 1, name, dirt, tfStr, pair)}
 							}
@@ -1102,7 +1188,7 @@ func collectOptLogWithHints(paths []string, minScore float64, picker, pairSel st
 					} else {
 						both = best
 						if needRun {
-							config.RunPolicy = []*config.RunPolicyConfig{both.ToPol(source, 0, name, dirt, tfStr, pair)}
+							runPolicies = []*config.RunPolicyConfig{both.ToPol(source, 0, name, dirt, tfStr, pair)}
 						}
 					}
 					var dumpPath string
@@ -1120,7 +1206,12 @@ func collectOptLogWithHints(paths []string, minScore float64, picker, pairSel st
 						if best.BTResult == nil || len(best.PairGrps) == 0 {
 							best.ID = utils.RandomStr(6)
 							dumpPath = filepath.Join(detailDir, best.ID+".json")
-							best.runGetBtResult(config.RunPolicy[len(config.RunPolicy)-1])
+							if len(runPolicies) == 0 {
+								return "", errs.NewMsg(errs.CodeRunTime, "missing policy for optimize detail replay")
+							}
+							if err := best.runGetBtResult(snapshot, factory, runPolicies[len(runPolicies)-1]); err != nil {
+								return "", err
+							}
 							best.dumpDetail(dumpPath)
 						}
 						l := fmt.Sprintf("[%s] %s", picker, best.ToLine())
@@ -1294,46 +1385,68 @@ func parseOptLine(line string) *OptInfo {
 	res.Score = -loss
 	if paraStart >= 0 && paraStart < paraEnd {
 		paramStr := strings.TrimSpace(line[paraStart:paraEnd])
-		if len(paramStr) > 0 {
-			paraArr := strings.Split(paramStr, ",")
-			for _, str := range paraArr {
-				str = strings.TrimSpace(str)
-				if str == "" {
-					continue
-				}
-				arr := strings.SplitN(str, ":", 2)
-				if len(arr) < 2 {
-					continue
-				}
-				res.Params[strings.TrimSpace(arr[0])], _ = strconv.ParseFloat(strings.TrimSpace(arr[1]), 64)
-			}
-		}
+		parseOptParams(paramStr, res.Params)
 	}
 	prefStr := strings.TrimSpace(line[paraEnd:])
-	if len(prefStr) > 0 {
-		prefArr := strings.Split(prefStr, ",")
-		for _, str := range prefArr {
-			str = strings.TrimSpace(str)
-			if str == "" {
-				continue
+	parseOptMetrics(prefStr, res)
+	return res
+}
+
+// parseOptParams decodes optimization parameters while retaining permissive
+// handling of malformed legacy fields.
+func parseOptParams(paramStr string, params map[string]float64) {
+	if len(paramStr) == 0 {
+		return
+	}
+	for _, item := range strings.Split(paramStr, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		arr := strings.SplitN(item, ":", 2)
+		if len(arr) < 2 {
+			continue
+		}
+		params[strings.TrimSpace(arr[0])], _ = strconv.ParseFloat(strings.TrimSpace(arr[1]), 64)
+	}
+}
+
+// parseOptMetrics decodes the trailing metrics portion of an optimization log
+// line, preserving its historical best-effort conversion semantics.
+func parseOptMetrics(metricStr string, res *OptInfo) {
+	if len(metricStr) == 0 {
+		return
+	}
+	for _, item := range strings.Split(metricStr, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		arr := strings.SplitN(item, ":", 2)
+		if len(arr) < 2 {
+			continue
+		}
+		key, val := strings.TrimSpace(arr[0]), strings.TrimSpace(arr[1])
+		switch key {
+		case "odNum":
+			res.OrderNum, _ = strconv.Atoi(val)
+		case "profit":
+			res.TotProfitPct, _ = strconv.ParseFloat(val[:len(val)-1], 64)
+		case "drawDown":
+			res.ShowDrawDownPct, _ = strconv.ParseFloat(val[:len(val)-1], 64)
+		case "sharpe":
+			res.SharpeRatio, _ = strconv.ParseFloat(val, 64)
+		case "ulcerIndex", "upi":
+			value, err := strconv.ParseFloat(strings.TrimSuffix(val, "%"), 64)
+			if err == nil && !math.IsNaN(value) && !math.IsInf(value, 0) {
+				if key == "ulcerIndex" {
+					res.UlcerIndex = &value
+				} else {
+					res.UlcerPerformanceIndex = &value
+				}
 			}
-			arr := strings.SplitN(str, ":", 2)
-			if len(arr) < 2 {
-				continue
-			}
-			key, val := strings.TrimSpace(arr[0]), strings.TrimSpace(arr[1])
-			if key == "odNum" {
-				res.OrderNum, _ = strconv.Atoi(val)
-			} else if key == "profit" {
-				res.TotProfitPct, _ = strconv.ParseFloat(val[:len(val)-1], 64)
-			} else if key == "drawDown" {
-				res.ShowDrawDownPct, _ = strconv.ParseFloat(val[:len(val)-1], 64)
-			} else if key == "sharpe" {
-				res.SharpeRatio, _ = strconv.ParseFloat(val, 64)
-			} else if key == "id" {
-				res.ID = val
-			}
+		case "id":
+			res.ID = val
 		}
 	}
-	return res
 }

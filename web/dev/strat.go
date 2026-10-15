@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/utils"
 )
 
@@ -21,8 +20,8 @@ var (
 	errBadRoot  = errors.New("invalid strategy root dir, go.mod & main.go must be included")
 )
 
-func getRootDir() (string, error) {
-	stratDir := config.GetStratDir()
+func (s *DevServer) getRootDir() (string, error) {
+	stratDir := s.StrategyDir()
 	if stratDir != "" {
 		return stratDir, nil
 	}
@@ -50,13 +49,13 @@ func getRootDir() (string, error) {
 	return workDir, nil
 }
 
-func makeNewStrat(folder, name string) error {
+func (s *DevServer) makeNewStrat(folder, name string) error {
 	// 验证策略名称格式
 	if ok := reStratName.MatchString(name); !ok {
 		return fmt.Errorf("invalid strategy name format")
 	}
 
-	baseDir, err := getRootDir()
+	baseDir, err := s.getRootDir()
 	if err != nil {
 		return err
 	}

@@ -12,6 +12,20 @@ func TestNow(t *testing.T) {
 	fmt.Printf("time: %v", tm.Unix())
 }
 
+func TestToDateStrLocWithoutLegacyInitialization(t *testing.T) {
+	previous := LocShow
+	t.Cleanup(func() { LocShow = previous })
+	LocShow = nil
+	timestamp := time.Date(2026, 9, 30, 23, 0, 0, 0, time.UTC).UnixMilli()
+	if got := ToDateStrLoc(timestamp, "2006-01-02"); got != "2026-09-30" {
+		t.Fatalf("UTC fallback = %q", got)
+	}
+	LocShow = time.FixedZone("display", 8*60*60)
+	if got := ToDateStrLoc(timestamp, "2006-01-02"); got != "2026-10-01" {
+		t.Fatalf("configured location = %q", got)
+	}
+}
+
 func TestParseTimeMS(t *testing.T) {
 	// 设置时区为 UTC 以便测试结果一致
 	loc, _ := time.LoadLocation("UTC")

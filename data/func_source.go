@@ -33,11 +33,21 @@ func NewFuncDataSource(info *orm.SeriesInfo, fetch FetchHistoryFunc, subscribe S
 }
 
 func RegisterFuncDataSource(info *orm.SeriesInfo, fetch FetchHistoryFunc, subscribe SubscribeLiveFunc) error {
-	src, err := NewFuncDataSource(info, fetch, subscribe)
-	if err != nil {
+	return legacyDataSourceCatalog.RegisterFuncDataSource(info, fetch, subscribe)
+}
+
+func (c *DataSourceCatalog) RegisterFuncDataSource(info *orm.SeriesInfo, fetch FetchHistoryFunc, subscribe SubscribeLiveFunc) error {
+	if _, err := NewFuncDataSource(info, fetch, subscribe); err != nil {
 		return err
 	}
-	return RegisterDataSource(src)
+	return c.RegisterDataSourceFactory(info.Name, func() DataSource {
+		// FuncDataSource stores immutable callback definitions. Copy the schema
+		// too, so runtime-local providers cannot mutate a shared binding.
+		infoCopy := *info
+		infoCopy.Binding.Fields = append([]orm.SeriesField(nil), info.Binding.Fields...)
+		src, _ := NewFuncDataSource(&infoCopy, fetch, subscribe)
+		return src
+	})
 }
 
 func (s *FuncDataSource) Info() *orm.SeriesInfo {

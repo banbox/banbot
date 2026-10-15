@@ -3,6 +3,7 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
@@ -16,12 +17,15 @@ import (
 	"github.com/banbox/cron/v3"
 	"github.com/felixge/fgprof"
 	"io"
+	"iter"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +40,7 @@ var (
 	regHolds, _  = regexp.Compile("[{]([^}]+)[}]")
 	dockerStatus = 0
 	langCache    = ""
+	langCacheMu  sync.Mutex
 )
 
 /*
@@ -80,6 +85,14 @@ func KeysOfMap[M ~map[K]V, K comparable, V any](m M) []K {
 		r = append(r, k)
 	}
 	return r
+}
+
+func MapKeys[M ~map[K]V, K cmp.Ordered, V any](m M, sorted bool) iter.Seq[K] {
+	keys := maps.Keys(m)
+	if sorted {
+		return slices.Values(slices.Sorted(keys))
+	}
+	return keys
 }
 
 func ValsOfMap[M ~map[K]V, K comparable, V any](m M) []V {
@@ -389,6 +402,8 @@ Possible return values (ISO 639-1 with optional ISO 3166-1 country code):
 ...
 */
 func GetSystemLanguage() string {
+	langCacheMu.Lock()
+	defer langCacheMu.Unlock()
 	if langCache != "" {
 		return langCache
 	}
@@ -489,42 +504,72 @@ func normalizeLanguageCode(code string) string {
 }
 
 func StartCpuProfile(path string, port int) *errs.Error {
+	cleanup, err := StartCpuProfileScoped(path, port)
+	if err != nil {
+		return err
+	}
+	core.AddExitCall(cleanup)
+	return nil
+}
+
+var fgprofRouteOnce sync.Once
+
+// StartCpuProfileScoped starts CPU profiling and returns an idempotent cleanup
+// callback. StartCpuProfile preserves the legacy process-wide registration by
+// adding that callback to core.AddExitCall.
+func StartCpuProfileScoped(path string, port int) (func(), *errs.Error) {
 	if _, err_ := os.Stat(path); err_ == nil {
 		err_ = os.Remove(path)
 		if err_ != nil {
-			return errs.New(errs.CodeIOWriteFail, err_)
+			return nil, errs.New(errs.CodeIOWriteFail, err_)
 		}
 	}
 	f, err_ := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
 	if err_ != nil {
-		return errs.New(errs.CodeIOWriteFail, err_)
-	} else {
-		err_ = pprof.StartCPUProfile(f)
-		if err_ != nil {
-			return errs.New(errs.CodeRunTime, err_)
-		}
+		return nil, errs.New(errs.CodeIOWriteFail, err_)
+	}
+	if err_ = pprof.StartCPUProfile(f); err_ != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return nil, errs.New(errs.CodeRunTime, err_)
+	}
+	fgprofRouteOnce.Do(func() {
 		http.DefaultServeMux.Handle("/debug/fgprof", fgprof.Handler())
-		go func() {
-			log.Info("cpu profile http started", zap.Int("port", port))
-			err_ = http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
-			if err_ != nil {
-				log.Warn("serve fgprof fail", zap.Int("port", port), zap.Error(err_))
-			}
-		}()
-		core.ExitCalls = append(core.ExitCalls, func() {
+	})
+	server := &http.Server{Addr: fmt.Sprintf(":%d", port)}
+	go func() {
+		log.Info("cpu profile http started", zap.Int("port", port))
+		serveErr := server.ListenAndServe()
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			log.Warn("serve fgprof fail", zap.Int("port", port), zap.Error(serveErr))
+		}
+	}()
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
 			pprof.StopCPUProfile()
-			err_ = f.Close()
-			if err_ != nil {
-				log.Error("save cpu.profile fail", zap.Error(err_))
+			_ = server.Close()
+			if closeErr := f.Close(); closeErr != nil {
+				log.Error("save cpu.profile fail", zap.Error(closeErr))
 			}
 		})
 	}
-	return nil
+	return cleanup, nil
 }
 
 func NewCronScheduler(exp string) (cron.Schedule, error) {
+	return NewCronSchedulerWithLocation(exp, btime.LocShow)
+}
+
+// NewCronSchedulerWithLocation parses a cron expression against an explicit
+// location. Runtime-owned callers should use this form so schedule alignment
+// does not depend on process-wide display settings.
+func NewCronSchedulerWithLocation(exp string, location *time.Location) (cron.Schedule, error) {
+	if location == nil {
+		location = time.UTC
+	}
 	parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
-	return parser.Parse(exp, btime.LocShow)
+	return parser.Parse(exp, location)
 }
 
 func CronAlign(scd cron.Schedule, stamp time.Time) time.Time {

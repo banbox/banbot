@@ -7,28 +7,61 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/errs"
-	"github.com/banbox/banexg/utils"
 )
 
 type DataSink interface {
-	Emit(sub *strat.DataSub, rows []*orm.DataRecord) error
+	Emit(sub *orm.Subscription, rows []*orm.DataRecord) error
 }
 
 type DataSource interface {
 	Info() *orm.SeriesInfo
-	FetchHistory(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error)
-	SubscribeLive(ctx context.Context, subs []*strat.DataSub, sink DataSink) error
+	FetchHistory(ctx context.Context, sub *orm.Subscription, startMS, endMS int64) ([]*orm.DataRecord, error)
+	SubscribeLive(ctx context.Context, subs []*orm.Subscription, sink DataSink) error
 }
 
 type DataSourceVersioner interface {
 	Version() string
+}
+
+// ObservationWarmupSource resolves an irregular stream's lookback from actual
+// observations. It must fail when the requested visible history is incomplete.
+// A bar count is never multiplied by an invented event interval.
+type ObservationWarmupSource interface {
+	WarmupStart(context.Context, *orm.Subscription, int64) (int64, error)
+}
+
+func (c *DataSourceCatalog) SubscriptionWarmupStart(ctx context.Context, subs []*orm.Subscription, anchorMS int64) (int64, error) {
+	start := anchorMS
+	for _, sub := range subs {
+		if sub == nil {
+			continue
+		}
+		var at int64
+		var err error
+		if sub.TimeFrame == "event" && sub.WarmupNum > 0 {
+			source, ok := c.GetDataSource(sub.Source).(ObservationWarmupSource)
+			if !ok {
+				return 0, fmt.Errorf("source %s: event count warmup requires an observation-based source bootstrap", sub.Source)
+			}
+			at, err = source.WarmupStart(ctx, sub, anchorMS)
+			if err == nil && (at < 0 || at >= anchorMS) {
+				err = fmt.Errorf("source %s: invalid observation warmup start", sub.Source)
+			}
+		} else {
+			at, err = orm.SubscriptionWarmupStart(*sub, anchorMS)
+		}
+		if err != nil {
+			return 0, err
+		}
+		start = min(start, at)
+	}
+	return start, nil
 }
 
 type DataSourceOpStatus struct {
@@ -59,20 +92,32 @@ type DataSourceStatus struct {
 }
 
 type SeriesRuntime struct {
+	Catalog    *DataSourceCatalog
 	Repo       orm.SeriesRepo
 	Sink       DataSink
 	EnsureFunc func(ctx context.Context, plan *SeriesPlan) *errs.Error
-	ActivateFn func(ctx context.Context, subs []*strat.DataSub, sink DataSink) ([]*strat.DataSub, error)
+	ActivateFn func(ctx context.Context, subs []*orm.Subscription, sink DataSink) ([]*orm.Subscription, error)
 
 	active map[string][]string
 }
 
 func NewSeriesRuntime(sink DataSink) *SeriesRuntime {
-	return &SeriesRuntime{Sink: sink}
+	return &SeriesRuntime{Catalog: legacyDataSourceCatalog, Sink: sink}
+}
+
+func NewSeriesRuntimeWithCatalog(catalog *DataSourceCatalog, sink DataSink) *SeriesRuntime {
+	return &SeriesRuntime{Catalog: catalog, Sink: sink}
+}
+
+func NewSeriesRuntimeWithRuntimeDeps(deps *RuntimeDeps, sink DataSink) *SeriesRuntime {
+	if deps == nil {
+		return NewSeriesRuntime(sink)
+	}
+	return NewSeriesRuntimeWithCatalog(deps.Catalog, sink)
 }
 
 func (r *SeriesRuntime) Plan(jobs []*strat.StratJob, warmupAnchorMS, endMS int64) (*SeriesPlan, error) {
-	return NewSeriesPlan(jobs, warmupAnchorMS, endMS)
+	return newSeriesPlan(r.catalog(), jobs, warmupAnchorMS, endMS)
 }
 
 func (r *SeriesRuntime) Sync(ctx context.Context, jobs []*strat.StratJob, warmupAnchorMS, endMS int64) (*SeriesPlan, error) {
@@ -104,7 +149,7 @@ func (r *SeriesRuntime) Ensure(ctx context.Context, plan *SeriesPlan) error {
 	ensureFn := r.EnsureFunc
 	if ensureFn == nil {
 		ensureFn = func(ctx context.Context, plan *SeriesPlan) *errs.Error {
-			return plan.Ensure(ctx, r.repo())
+			return plan.ensure(ctx, r.catalog(), r.repo())
 		}
 	}
 	if err := ensureFn(ctx, plan); err != nil {
@@ -113,14 +158,16 @@ func (r *SeriesRuntime) Ensure(ctx context.Context, plan *SeriesPlan) error {
 	return nil
 }
 
-func (r *SeriesRuntime) ActivateNew(ctx context.Context, subs []*strat.DataSub) error {
+func (r *SeriesRuntime) ActivateNew(ctx context.Context, subs []*orm.Subscription) error {
 	newSubs := r.newSubs(subs)
 	if len(newSubs) == 0 {
 		return nil
 	}
 	activateFn := r.ActivateFn
 	if activateFn == nil {
-		activateFn = ActivateDataSources
+		activateFn = func(ctx context.Context, subs []*orm.Subscription, sink DataSink) ([]*orm.Subscription, error) {
+			return r.catalog().ActivateDataSources(ctx, subs, sink)
+		}
 	}
 	activated, err := activateFn(ctx, newSubs, r.Sink)
 	r.markActive(activated)
@@ -128,6 +175,13 @@ func (r *SeriesRuntime) ActivateNew(ctx context.Context, subs []*strat.DataSub) 
 		return wrapBootstrapActivateErr(newSubs, err)
 	}
 	return nil
+}
+
+func (r *SeriesRuntime) catalog() *DataSourceCatalog {
+	if r == nil {
+		return nil
+	}
+	return r.Catalog
 }
 
 func (r *SeriesRuntime) Active(key string) bool {
@@ -145,14 +199,14 @@ func (r *SeriesRuntime) repo() orm.SeriesRepo {
 	return nil
 }
 
-func (r *SeriesRuntime) newSubs(subs []*strat.DataSub) []*strat.DataSub {
+func (r *SeriesRuntime) newSubs(subs []*orm.Subscription) []*orm.Subscription {
 	if len(subs) == 0 {
 		return nil
 	}
 	if r.active == nil {
 		r.active = make(map[string][]string)
 	}
-	items := make([]*strat.DataSub, 0, len(subs))
+	items := make([]*orm.Subscription, 0, len(subs))
 	for _, sub := range subs {
 		key, ok := runtimeSubKey(sub)
 		have, active := r.active[key]
@@ -164,7 +218,7 @@ func (r *SeriesRuntime) newSubs(subs []*strat.DataSub) []*strat.DataSub {
 	return items
 }
 
-func (r *SeriesRuntime) markActive(subs []*strat.DataSub) {
+func (r *SeriesRuntime) markActive(subs []*orm.Subscription) {
 	if len(subs) == 0 {
 		return
 	}
@@ -195,7 +249,7 @@ func fieldsContain(have, want []string) bool {
 	return true
 }
 
-func runtimeSubKey(sub *strat.DataSub) (string, bool) {
+func runtimeSubKey(sub *orm.Subscription) (string, bool) {
 	if sub == nil || sub.ExSymbol == nil || sub.ExSymbol.ID <= 0 {
 		return "", false
 	}
@@ -203,11 +257,11 @@ func runtimeSubKey(sub *strat.DataSub) (string, bool) {
 	if source == orm.SeriesSourceKline {
 		return "", false
 	}
-	return strat.DataSubKey(source, sub.ExSymbol.ID, sub.TimeFrame), true
+	return sub.Key().String(), true
 }
 
 type SeriesPlan struct {
-	Subs    []*strat.DataSub
+	Subs    []*orm.Subscription
 	StartMS int64
 	EndMS   int64
 }
@@ -215,6 +269,14 @@ type SeriesPlan struct {
 type ThirdPartySeriesBootstrap = SeriesPlan
 
 func NewSeriesPlan(jobs []*strat.StratJob, warmupAnchorMS, endMS int64) (*SeriesPlan, error) {
+	return newSeriesPlan(legacyDataSourceCatalog, jobs, warmupAnchorMS, endMS)
+}
+
+func NewSeriesPlanWithCatalog(catalog *DataSourceCatalog, jobs []*strat.StratJob, warmupAnchorMS, endMS int64) (*SeriesPlan, error) {
+	return newSeriesPlan(catalog, jobs, warmupAnchorMS, endMS)
+}
+
+func newSeriesPlan(catalog *DataSourceCatalog, jobs []*strat.StratJob, warmupAnchorMS, endMS int64) (*SeriesPlan, error) {
 	if warmupAnchorMS <= 0 {
 		return nil, fmt.Errorf("bootstrap collect phase=collect: warmup anchor is required")
 	}
@@ -224,13 +286,13 @@ func NewSeriesPlan(jobs []*strat.StratJob, warmupAnchorMS, endMS int64) (*Series
 	if warmupAnchorMS > endMS {
 		return nil, fmt.Errorf("bootstrap collect phase=collect: warmup anchor must not exceed end time")
 	}
-	subs, err := CollectRuntimeDataSubs(jobs)
+	subs, err := collectRuntimeDataSubs(catalog, jobs)
 	if err != nil {
 		return nil, err
 	}
 	startMS := warmupAnchorMS
 	if len(subs) > 0 {
-		startMS, err = ThirdPartyWarmupStart(subs, warmupAnchorMS)
+		startMS, err = catalog.SubscriptionWarmupStart(context.Background(), subs, warmupAnchorMS)
 		if err != nil {
 			return nil, err
 		}
@@ -261,92 +323,67 @@ func (p *SeriesPlan) Ensure(ctx context.Context, repo orm.SeriesRepo) *errs.Erro
 	return EnsureSeriesSubsRange(ctx, repo, p.Subs, p.StartMS, p.EndMS)
 }
 
-func (p *SeriesPlan) Activate(ctx context.Context, sink DataSink) ([]*strat.DataSub, error) {
+func (p *SeriesPlan) ensure(ctx context.Context, catalog *DataSourceCatalog, repo orm.SeriesRepo) *errs.Error {
+	if p == nil {
+		return nil
+	}
+	return ensureSeriesSubsRange(catalog, ctx, repo, p.Subs, p.StartMS, p.EndMS)
+}
+
+func (p *SeriesPlan) Activate(ctx context.Context, sink DataSink) ([]*orm.Subscription, error) {
 	if p == nil {
 		return nil, nil
 	}
 	return ActivateDataSources(ctx, p.Subs, sink)
 }
 
-var (
-	dataSourcesMu sync.RWMutex
-	dataSources   = make(map[string]DataSource)
-	dataSourceSta = make(map[string]*DataSourceStatus)
-)
+var legacyDataSourceCatalog = NewDataSourceCatalog()
+
+func LegacyDataSourceCatalog() *DataSourceCatalog {
+	return legacyDataSourceCatalog
+}
 
 func RegisterDataSource(src DataSource) error {
-	if src == nil {
-		return fmt.Errorf("data source is nil")
-	}
-	info := src.Info()
-	if err := orm.ValidateSeriesInfo(info); err != nil {
-		return err
-	}
-	if info.Name == "" {
-		return fmt.Errorf("data source name is required")
-	}
-	dataSourcesMu.Lock()
-	defer dataSourcesMu.Unlock()
-	if _, ok := dataSources[info.Name]; ok {
-		updateDataSourceStatusLocked(info.Name, func(st *DataSourceStatus) {
-			st.DuplicateRegistrations++
-			st.LastError = dataSourceLastError(st, "duplicate registration")
-			st.Health = dataSourceHealth(st)
-		})
-		return fmt.Errorf("data source %q already registered", info.Name)
-	}
-	dataSources[info.Name] = src
-	dataSourceSta[info.Name] = newDataSourceStatus(src, info)
-	return nil
+	// Direct registration is retained for legacy callers only. Explicit Runtime
+	// construction rejects it because an arbitrary interface value cannot be
+	// cloned safely; register a factory for runtime-capable providers instead.
+	return legacyDataSourceCatalog.RegisterDataSource(src)
+}
+
+func RegisterDataSourceFactory(name string, factory DataSourceFactory) error {
+	return legacyDataSourceCatalog.RegisterDataSourceFactory(name, factory)
 }
 
 func GetDataSource(name string) DataSource {
-	dataSourcesMu.RLock()
-	defer dataSourcesMu.RUnlock()
-	return dataSources[name]
+	return legacyDataSourceCatalog.GetDataSource(name)
 }
 
 func ListDataSources() []string {
-	dataSourcesMu.RLock()
-	defer dataSourcesMu.RUnlock()
-	items := make([]string, 0, len(dataSources))
-	for name := range dataSources {
-		items = append(items, name)
-	}
-	sort.Strings(items)
-	return items
+	return legacyDataSourceCatalog.ListDataSources()
 }
 
 func ListDataSourceStatus() []*DataSourceStatus {
-	dataSourcesMu.RLock()
-	defer dataSourcesMu.RUnlock()
-	names := make([]string, 0, len(dataSourceSta))
-	for name := range dataSourceSta {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	items := make([]*DataSourceStatus, 0, len(names))
-	for _, name := range names {
-		cp := *dataSourceSta[name]
-		items = append(items, &cp)
-	}
-	return items
+	return legacyDataSourceCatalog.ListDataSourceStatus()
 }
 
-func ActivateDataSources(ctx context.Context, subs []*strat.DataSub, sink DataSink) ([]*strat.DataSub, error) {
+func ActivateDataSources(ctx context.Context, subs []*orm.Subscription, sink DataSink) ([]*orm.Subscription, error) {
+	return legacyDataSourceCatalog.ActivateDataSources(ctx, subs, sink)
+}
+
+func (c *DataSourceCatalog) ActivateDataSources(ctx context.Context, subs []*orm.Subscription, sink DataSink) ([]*orm.Subscription, error) {
 	if len(subs) == 0 {
 		return nil, nil
 	}
 	if sink == nil {
 		return nil, fmt.Errorf("data sink is required")
 	}
-	seen := make(map[string]*strat.DataSub)
+	seen := make(map[string]*orm.Subscription)
 	for _, sub := range subs {
 		normalized, err := validateActivationSub(sub)
 		if err != nil {
 			return nil, err
 		}
-		src := GetDataSource(normalized.Source)
+		src := c.GetDataSource(normalized.Source)
 		if src == nil {
 			return nil, fmt.Errorf("data source %q is not registered", normalized.Source)
 		}
@@ -360,21 +397,24 @@ func ActivateDataSources(ctx context.Context, subs []*strat.DataSub, sink DataSi
 		if err = normalizeDataSubFields(info, normalized); err != nil {
 			return nil, err
 		}
+		if len(normalized.Fields) > 0 {
+			normalized.Projection = orm.ProjectionSelected
+		}
 		mergeDataSub(seen, normalized)
 	}
-	grouped := make(map[string][]*strat.DataSub)
+	grouped := make(map[string][]*orm.Subscription)
 	for _, sub := range sortedDataSubs(seen) {
 		grouped[sub.Source] = append(grouped[sub.Source], sub)
 	}
-	activated := make([]*strat.DataSub, 0, len(seen))
+	activated := make([]*orm.Subscription, 0, len(seen))
 	for _, name := range sortedSourceNames(grouped) {
-		markDataSourceSubscription(name, DataSourceOpStatus{
+		c.markDataSourceSubscription(name, DataSourceOpStatus{
 			State: "subscribing",
 			AtMS:  time.Now().UnixMilli(),
 			Subs:  len(grouped[name]),
 		}, "")
-		if err := GetDataSource(name).SubscribeLive(ctx, grouped[name], sink); err != nil {
-			markDataSourceSubscription(name, DataSourceOpStatus{
+		if err := c.GetDataSource(name).SubscribeLive(ctx, grouped[name], sink); err != nil {
+			c.markDataSourceSubscription(name, DataSourceOpStatus{
 				State: "error",
 				Error: err.Error(),
 				AtMS:  time.Now().UnixMilli(),
@@ -383,7 +423,7 @@ func ActivateDataSources(ctx context.Context, subs []*strat.DataSub, sink DataSi
 			return activated, fmt.Errorf("activate data source %q: %w", name, err)
 		}
 		activated = append(activated, grouped[name]...)
-		markDataSourceSubscription(name, DataSourceOpStatus{
+		c.markDataSourceSubscription(name, DataSourceOpStatus{
 			State: "subscribed",
 			AtMS:  time.Now().UnixMilli(),
 			Subs:  len(grouped[name]),
@@ -392,22 +432,19 @@ func ActivateDataSources(ctx context.Context, subs []*strat.DataSub, sink DataSi
 	return activated, nil
 }
 
-func validateActivationSub(sub *strat.DataSub) (*strat.DataSub, error) {
+func validateActivationSub(sub *orm.Subscription) (*orm.Subscription, error) {
 	if sub == nil {
 		return nil, fmt.Errorf("data sub is required")
 	}
-	if sub.ExSymbol == nil || sub.ExSymbol.ID <= 0 {
-		return nil, fmt.Errorf("data sub exsymbol is required")
-	}
-	normalized := *sub
-	normalized.Source = orm.NormalizeSeriesSource(sub.Source)
-	if normalized.TimeFrame == "" {
-		return nil, fmt.Errorf("data sub timeframe is required")
-	}
-	return &normalized, nil
+	normalized, err := orm.NormalizeSubscription(*sub)
+	return &normalized, err
 }
 
-func validateBootstrapSub(sub *strat.DataSub) (*strat.DataSub, error) {
+func validateBootstrapSub(sub *orm.Subscription) (*orm.Subscription, error) {
+	return validateBootstrapSubWithCatalog(legacyDataSourceCatalog, sub)
+}
+
+func validateBootstrapSubWithCatalog(catalog *DataSourceCatalog, sub *orm.Subscription) (*orm.Subscription, error) {
 	normalized, err := validateActivationSub(sub)
 	if err != nil {
 		return nil, err
@@ -416,16 +453,37 @@ func validateBootstrapSub(sub *strat.DataSub) (*strat.DataSub, error) {
 		return nil, fmt.Errorf("data sub source is required")
 	}
 	if normalized.Source != orm.SeriesSourceKline {
-		if src := GetDataSource(normalized.Source); src != nil {
-			if err := normalizeDataSubFields(src.Info(), normalized); err != nil {
+		if src := catalog.GetDataSource(normalized.Source); src != nil {
+			if normalized.Frequency == orm.FrequencyEvent && normalized.WarmupNum > 0 {
+				if _, ok := src.(ObservationWarmupSource); !ok {
+					return nil, fmt.Errorf("source %s: event count warmup requires an observation-based source bootstrap", normalized.Source)
+				}
+			}
+			info := src.Info()
+			if err := orm.ValidateSeriesInfo(info); err != nil {
+				return nil, err
+			}
+			if normalized.Projection == orm.ProjectionAll {
+				normalized.Fields = nil
+			}
+			if err := normalizeDataSubFields(info, normalized); err != nil {
 				return nil, err
 			}
 		}
+	} else {
+		if normalized.Projection == orm.ProjectionAll {
+			return nil, fmt.Errorf("all kline fields require an explicit source schema")
+		}
+		normalized.Fields = orm.MergeSeriesFields(orm.NormalizeSeriesFields(normalized.Source, normalized.Fields), normalized.SeriesFields)
+	}
+	// The projection has been expanded before merging with other consumers.
+	if len(normalized.Fields) > 0 {
+		normalized.Projection = orm.ProjectionSelected
 	}
 	return normalized, nil
 }
 
-func sortedSourceNames(grouped map[string][]*strat.DataSub) []string {
+func sortedSourceNames(grouped map[string][]*orm.Subscription) []string {
 	items := make([]string, 0, len(grouped))
 	for name := range grouped {
 		items = append(items, name)
@@ -434,17 +492,25 @@ func sortedSourceNames(grouped map[string][]*strat.DataSub) []string {
 	return items
 }
 
-func CollectRuntimeDataSubs(jobs []*strat.StratJob) ([]*strat.DataSub, error) {
+func CollectRuntimeDataSubs(jobs []*strat.StratJob) ([]*orm.Subscription, error) {
+	return collectRuntimeDataSubs(legacyDataSourceCatalog, jobs)
+}
+
+func (c *DataSourceCatalog) CollectRuntimeDataSubs(jobs []*strat.StratJob) ([]*orm.Subscription, error) {
+	return collectRuntimeDataSubs(c, jobs)
+}
+
+func collectRuntimeDataSubs(catalog *DataSourceCatalog, jobs []*strat.StratJob) ([]*orm.Subscription, error) {
 	if len(jobs) == 0 {
 		return nil, nil
 	}
-	seen := make(map[string]*strat.DataSub)
+	seen := make(map[string]*orm.Subscription)
 	for _, job := range jobs {
 		if job == nil {
 			continue
 		}
 		for _, sub := range strat.CollectDataSubs(job) {
-			normalized, err := validateBootstrapSub(sub)
+			normalized, err := validateBootstrapSubWithCatalog(catalog, sub)
 			if err != nil {
 				return nil, fmt.Errorf("bootstrap collect: %w", err)
 			}
@@ -457,11 +523,11 @@ func CollectRuntimeDataSubs(jobs []*strat.StratJob) ([]*strat.DataSub, error) {
 	return sortedDataSubs(seen), nil
 }
 
-func mergeDataSub(seen map[string]*strat.DataSub, sub *strat.DataSub) {
+func mergeDataSub(seen map[string]*orm.Subscription, sub *orm.Subscription) {
 	if seen == nil || sub == nil || sub.ExSymbol == nil {
 		return
 	}
-	key := strat.DataSubKey(sub.Source, sub.ExSymbol.ID, sub.TimeFrame)
+	key := sub.Key().String()
 	if existing, ok := seen[key]; ok {
 		if sub.WarmupNum > existing.WarmupNum {
 			existing.WarmupNum = sub.WarmupNum
@@ -476,54 +542,70 @@ func mergeDataSub(seen map[string]*strat.DataSub, sub *strat.DataSub) {
 	seen[key] = &cp
 }
 
-func EnsureThirdPartySeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {
+func EnsureThirdPartySeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*orm.Subscription, *errs.Error) {
 	return EnsureRuntimeSeriesRange(ctx, repo, jobs, startMS, endMS)
 }
 
-func EnsureRuntimeSeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*strat.DataSub, *errs.Error) {
+func EnsureRuntimeSeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*orm.Subscription, *errs.Error) {
+	return ensureRuntimeSeriesRange(legacyDataSourceCatalog, ctx, repo, jobs, startMS, endMS)
+}
+
+func (c *DataSourceCatalog) EnsureRuntimeSeriesRange(ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*orm.Subscription, *errs.Error) {
+	return ensureRuntimeSeriesRange(c, ctx, repo, jobs, startMS, endMS)
+}
+
+func ensureRuntimeSeriesRange(catalog *DataSourceCatalog, ctx context.Context, repo orm.SeriesRepo, jobs []*strat.StratJob, startMS, endMS int64) ([]*orm.Subscription, *errs.Error) {
 	if startMS >= endMS {
 		return nil, nil
 	}
-	subs, err := CollectRuntimeDataSubs(jobs)
+	subs, err := collectRuntimeDataSubs(catalog, jobs)
 	if err != nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "%v", err)
 	}
-	if err := EnsureSeriesSubsRange(ctx, repo, subs, startMS, endMS); err != nil {
+	if err := ensureSeriesSubsRange(catalog, ctx, repo, subs, startMS, endMS); err != nil {
 		return nil, err
 	}
 	return subs, nil
 }
 
-func EnsureThirdPartySeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*strat.DataSub, startMS, endMS int64) *errs.Error {
+func EnsureThirdPartySeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*orm.Subscription, startMS, endMS int64) *errs.Error {
 	return EnsureSeriesSubsRange(ctx, repo, subs, startMS, endMS)
 }
 
-func EnsureSeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*strat.DataSub, startMS, endMS int64) *errs.Error {
+func EnsureSeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*orm.Subscription, startMS, endMS int64) *errs.Error {
+	return ensureSeriesSubsRange(legacyDataSourceCatalog, ctx, repo, subs, startMS, endMS)
+}
+
+func (c *DataSourceCatalog) EnsureSeriesSubsRange(ctx context.Context, repo orm.SeriesRepo, subs []*orm.Subscription, startMS, endMS int64) *errs.Error {
+	return ensureSeriesSubsRange(c, ctx, repo, subs, startMS, endMS)
+}
+
+func ensureSeriesSubsRange(catalog *DataSourceCatalog, ctx context.Context, repo orm.SeriesRepo, subs []*orm.Subscription, startMS, endMS int64) *errs.Error {
 	if startMS >= endMS {
 		return nil
 	}
 	for _, sub := range subs {
-		normalized, err := validateBootstrapSub(sub)
+		normalized, err := validateBootstrapSubWithCatalog(catalog, sub)
 		if err != nil {
 			return errs.NewMsg(core.ErrBadConfig, "bootstrap collect: %v", err)
 		}
 		if normalized.Source == orm.SeriesSourceKline {
 			continue
 		}
-		src := GetDataSource(normalized.Source)
+		src := catalog.GetDataSource(normalized.Source)
 		if src == nil {
 			return errs.NewMsg(core.ErrBadConfig,
 				"bootstrap ensure source=%s sid=%d tf=%s phase=ensure: data source is not registered",
 				normalized.Source, normalized.ExSymbol.ID, normalized.TimeFrame)
 		}
-		if err := EnsureSeriesRangeWithRepo(ctx, repoOrDefault(repo), src, normalized, startMS, endMS); err != nil {
+		if err := ensureSeriesRangeWithRepo(catalog, ctx, repoOrDefault(repo), src, normalized, startMS, endMS); err != nil {
 			return wrapBootstrapEnsureErr(normalized, err)
 		}
 	}
 	return nil
 }
 
-func sortedDataSubs(seen map[string]*strat.DataSub) []*strat.DataSub {
+func sortedDataSubs(seen map[string]*orm.Subscription) []*orm.Subscription {
 	if len(seen) == 0 {
 		return nil
 	}
@@ -532,14 +614,14 @@ func sortedDataSubs(seen map[string]*strat.DataSub) []*strat.DataSub {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	items := make([]*strat.DataSub, 0, len(keys))
+	items := make([]*orm.Subscription, 0, len(keys))
 	for _, key := range keys {
 		items = append(items, seen[key])
 	}
 	return items
 }
 
-func ThirdPartyWarmupStart(subs []*strat.DataSub, endMS int64) (int64, error) {
+func ThirdPartyWarmupStart(subs []*orm.Subscription, endMS int64) (int64, error) {
 	if len(subs) == 0 {
 		return endMS, nil
 	}
@@ -548,20 +630,10 @@ func ThirdPartyWarmupStart(subs []*strat.DataSub, endMS int64) (int64, error) {
 		if sub == nil {
 			continue
 		}
-		if sub.TimeFrame == "" {
-			return 0, fmt.Errorf("bootstrap collect source=%s sid=%d tf=%s phase=collect: data sub timeframe is required", sub.Source, bootstrapSubSID(sub), sub.TimeFrame)
+		candidate, err := orm.SubscriptionWarmupStart(*sub, endMS)
+		if err != nil {
+			return 0, fmt.Errorf("bootstrap collect source=%s sid=%d tf=%s phase=collect: %w", sub.Source, bootstrapSubSID(sub), sub.TimeFrame, err)
 		}
-		if sub.ExSymbol == nil || sub.ExSymbol.ID <= 0 {
-			return 0, fmt.Errorf("bootstrap collect source=%s sid=%d tf=%s phase=collect: data sub exsymbol is required", sub.Source, bootstrapSubSID(sub), sub.TimeFrame)
-		}
-		tfMS := int64(utils.TFToSecs(sub.TimeFrame)) * 1000
-		if tfMS <= 0 {
-			return 0, fmt.Errorf("bootstrap collect source=%s sid=%d tf=%s phase=collect: invalid timeframe", sub.Source, sub.ExSymbol.ID, sub.TimeFrame)
-		}
-		if sub.WarmupNum < 0 {
-			return 0, fmt.Errorf("bootstrap collect source=%s sid=%d tf=%s phase=collect: warmup must not be negative", sub.Source, sub.ExSymbol.ID, sub.TimeFrame)
-		}
-		candidate := endMS - int64(sub.WarmupNum)*tfMS
 		if candidate < startMS {
 			startMS = candidate
 		}
@@ -569,7 +641,7 @@ func ThirdPartyWarmupStart(subs []*strat.DataSub, endMS int64) (int64, error) {
 	return startMS, nil
 }
 
-func bootstrapSubSID(sub *strat.DataSub) int32 {
+func bootstrapSubSID(sub *orm.Subscription) int32 {
 	if sub == nil || sub.ExSymbol == nil {
 		return 0
 	}
@@ -583,7 +655,7 @@ func repoOrDefault(repo orm.SeriesRepo) orm.SeriesRepo {
 	return orm.DefaultSeriesRepo()
 }
 
-func wrapBootstrapEnsureErr(sub *strat.DataSub, err *errs.Error) *errs.Error {
+func wrapBootstrapEnsureErr(sub *orm.Subscription, err *errs.Error) *errs.Error {
 	if sub == nil || sub.ExSymbol == nil {
 		return err
 	}
@@ -592,11 +664,11 @@ func wrapBootstrapEnsureErr(sub *strat.DataSub, err *errs.Error) *errs.Error {
 		sub.Source, sub.ExSymbol.ID, sub.TimeFrame, err.Short())
 }
 
-func wrapBootstrapActivateErr(subs []*strat.DataSub, err error) error {
+func wrapBootstrapActivateErr(subs []*orm.Subscription, err error) error {
 	if err == nil || len(subs) == 0 {
 		return err
 	}
-	bySource := make(map[string]*strat.DataSub)
+	bySource := make(map[string]*orm.Subscription)
 	for _, sub := range subs {
 		if sub == nil {
 			continue
@@ -617,7 +689,7 @@ func wrapBootstrapActivateErr(subs []*strat.DataSub, err error) error {
 		orm.NormalizeSeriesSource(first.Source), bootstrapSubSID(first), first.TimeFrame, err)
 }
 
-func sortedSubSources(items map[string]*strat.DataSub) []string {
+func sortedSubSources(items map[string]*orm.Subscription) []string {
 	names := make([]string, 0, len(items))
 	for name := range items {
 		names = append(names, name)
@@ -626,11 +698,15 @@ func sortedSubSources(items map[string]*strat.DataSub) []string {
 	return names
 }
 
-func EnsureSeriesRange(ctx context.Context, src DataSource, sub *strat.DataSub, startMS, endMS int64) *errs.Error {
-	return EnsureSeriesRangeWithRepo(ctx, orm.DefaultSeriesRepo(), src, sub, startMS, endMS)
+func EnsureSeriesRange(ctx context.Context, src DataSource, sub *orm.Subscription, startMS, endMS int64) *errs.Error {
+	return ensureSeriesRangeWithRepo(legacyDataSourceCatalog, ctx, orm.DefaultSeriesRepo(), src, sub, startMS, endMS)
 }
 
-func EnsureSeriesRangeWithRepo(ctx context.Context, repo orm.SeriesRepo, src DataSource, sub *strat.DataSub, startMS, endMS int64) *errs.Error {
+func EnsureSeriesRangeWithRepo(ctx context.Context, repo orm.SeriesRepo, src DataSource, sub *orm.Subscription, startMS, endMS int64) *errs.Error {
+	return ensureSeriesRangeWithRepo(legacyDataSourceCatalog, ctx, repo, src, sub, startMS, endMS)
+}
+
+func ensureSeriesRangeWithRepo(catalog *DataSourceCatalog, ctx context.Context, repo orm.SeriesRepo, src DataSource, sub *orm.Subscription, startMS, endMS int64) *errs.Error {
 	if startMS >= endMS {
 		return nil
 	}
@@ -658,6 +734,23 @@ func EnsureSeriesRangeWithRepo(ctx context.Context, repo orm.SeriesRepo, src Dat
 		return errs.NewMsg(core.ErrBadConfig, "sub source %s does not match data source %s", sub.Source, info.Name)
 	}
 	store := orm.NewSeriesStore(repo)
+	if _, paged := src.(PagedHistorySource); paged || orm.SeriesReadByteLimit(ctx) > 0 {
+		return ensurePagedSeriesRange(catalog, ctx, store, src, sub, startMS, endMS)
+	}
+	if tf == "event" {
+		// Sparse rows do not describe coverage between observations. Fetch the
+		// declared interval directly; do not manufacture bar coverage holes.
+		rows, err := src.FetchHistory(ctx, sub, startMS, endMS)
+		if err != nil {
+			return errs.New(core.ErrDbReadFail, err)
+		}
+		for _, row := range rows {
+			if row != nil && (row.TimeMS < startMS || row.TimeMS >= endMS) {
+				return errs.NewMsg(core.ErrBadConfig, "event history source returned an observation outside its requested range")
+			}
+		}
+		return store.WriteBatch(ctx, info, sub.ExSymbol, rows)
+	}
 	rows := 0
 	err := store.FillMissing(ctx, info, sub.ExSymbol, startMS, endMS,
 		func(ctx context.Context, _ *orm.ExSymbol, gapStartMS, gapEndMS int64) ([]*orm.DataRecord, error) {
@@ -680,7 +773,9 @@ func EnsureSeriesRangeWithRepo(ctx context.Context, repo orm.SeriesRepo, src Dat
 		status.Error = err.Short()
 		errText = err.Short()
 	}
-	markDataSourceBackfill(info.Name, status, errText)
+	if catalog != nil {
+		catalog.markDataSourceBackfill(info.Name, status, errText)
+	}
 	return err
 }
 
@@ -710,7 +805,8 @@ func callerSource() string {
 			continue
 		}
 		fn := runtime.FuncForPC(pc)
-		if fn == nil || strings.Contains(fn.Name(), "github.com/banbox/banbot/data.RegisterDataSource") || strings.Contains(fn.Name(), "github.com/banbox/banbot/data.RegisterFuncDataSource") {
+		if fn == nil || strings.Contains(fn.Name(), "github.com/banbox/banbot/data.RegisterDataSource") ||
+			strings.Contains(fn.Name(), "DataSourceCatalog).RegisterDataSource") || strings.Contains(fn.Name(), "github.com/banbox/banbot/data.RegisterFuncDataSource") {
 			continue
 		}
 		return fmt.Sprintf("%s:%d", file, line)
@@ -719,27 +815,15 @@ func callerSource() string {
 }
 
 func markDataSourceBackfill(name string, status DataSourceOpStatus, lastErr string) {
-	dataSourcesMu.Lock()
-	defer dataSourcesMu.Unlock()
-	updateDataSourceStatusLocked(name, func(st *DataSourceStatus) {
-		st.LastBackfill = status
-		st.LastError = dataSourceLastError(st, lastErr)
-		st.Health = dataSourceHealth(st)
-	})
+	legacyDataSourceCatalog.markDataSourceBackfill(name, status, lastErr)
 }
 
 func markDataSourceSubscription(name string, status DataSourceOpStatus, lastErr string) {
-	dataSourcesMu.Lock()
-	defer dataSourcesMu.Unlock()
-	updateDataSourceStatusLocked(name, func(st *DataSourceStatus) {
-		st.Subscription = status
-		st.LastError = dataSourceLastError(st, lastErr)
-		st.Health = dataSourceHealth(st)
-	})
+	legacyDataSourceCatalog.markDataSourceSubscription(name, status, lastErr)
 }
 
-func updateDataSourceStatusLocked(name string, cb func(*DataSourceStatus)) {
-	st := dataSourceSta[name]
+func updateDataSourceStatusLocked(statuses map[string]*DataSourceStatus, name string, cb func(*DataSourceStatus)) {
+	st := statuses[name]
 	if st == nil {
 		return
 	}

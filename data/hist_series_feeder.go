@@ -12,17 +12,21 @@ import (
 )
 
 type HistSeriesFeeder struct {
-	info      *orm.SeriesInfo
-	target    *orm.ExSymbol
-	callback  FnDataSeries
-	store     *orm.SeriesStore
-	warmEndMS int64
-	endMS     int64
-	offsetMS  int64
-	rowIdx    int
-	nextMS    int64
-	rows      []*orm.DataSeries
-	loadErr   *errs.Error
+	// BatchRows bounds each page. Zero preserves the legacy 20,000-row page.
+	BatchRows  int
+	BatchBytes int64
+	info       *orm.SeriesInfo
+	target     *orm.ExSymbol
+	callback   FnDataSeries
+	store      *orm.SeriesStore
+	deps       *RuntimeDeps
+	warmEndMS  int64
+	endMS      int64
+	offsetMS   int64
+	rowIdx     int
+	nextMS     int64
+	rows       []*orm.DataSeries
+	loadErr    *errs.Error
 }
 
 type seriesLoadErrorBatch struct {
@@ -32,11 +36,29 @@ type seriesLoadErrorBatch struct {
 func (b *seriesLoadErrorBatch) TimeMS() int64 { return 0 }
 
 func NewHistSeriesFeeder(repo orm.SeriesRepo, info *orm.SeriesInfo, sub *strat.DataSub, callback FnDataSeries, warmEndMS int64) (*HistSeriesFeeder, error) {
+	return newHistSeriesFeeder(nil, repo, info, sub, callback, warmEndMS)
+}
+
+// NewHistSeriesFeederWithRuntimeDeps binds reads and callback time to one
+// runtime. A nil dependency set preserves the legacy package facade.
+func NewHistSeriesFeederWithRuntimeDeps(deps *RuntimeDeps, repo orm.SeriesRepo, info *orm.SeriesInfo,
+	sub *strat.DataSub, callback FnDataSeries, warmEndMS int64) (*HistSeriesFeeder, error) {
+	if deps == nil {
+		return NewHistSeriesFeeder(repo, info, sub, callback, warmEndMS)
+	}
+	return newHistSeriesFeeder(deps, repo, info, sub, callback, warmEndMS)
+}
+
+func newHistSeriesFeeder(deps *RuntimeDeps, repo orm.SeriesRepo, info *orm.SeriesInfo, sub *strat.DataSub,
+	callback FnDataSeries, warmEndMS int64) (*HistSeriesFeeder, error) {
 	if info == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "series info is required")
 	}
 	if sub == nil || sub.ExSymbol == nil || sub.ExSymbol.ID <= 0 {
 		return nil, errs.NewMsg(core.ErrBadConfig, "data sub exsymbol is required")
+	}
+	if deps != nil && repo == nil {
+		repo = orm.NewSeriesRepo(deps.Storage)
 	}
 	projected, err := projectSeriesInfo(info, sub.Fields)
 	if err != nil {
@@ -44,7 +66,7 @@ func NewHistSeriesFeeder(repo orm.SeriesRepo, info *orm.SeriesInfo, sub *strat.D
 	}
 	return &HistSeriesFeeder{
 		info: projected, target: sub.ExSymbol, callback: callback,
-		store: orm.NewSeriesStore(repo), warmEndMS: warmEndMS,
+		store: orm.NewSeriesStore(repo), deps: deps, warmEndMS: warmEndMS,
 	}, nil
 }
 
@@ -107,7 +129,11 @@ func (f *HistSeriesFeeder) RunBatch(batch Batch) *errs.Error {
 	}
 	evt := item.DataSeries
 	evt.IsWarmUp = evt.EndMS <= f.warmEndMS
-	btime.CurTimeMS = evt.EndMS
+	if f.deps == nil {
+		btime.CurTimeMS = evt.EndMS
+	} else {
+		f.deps.setTimeMS(evt.EndMS)
+	}
 	if f.callback != nil {
 		f.callback(evt)
 	}
@@ -123,6 +149,8 @@ func (f *HistSeriesFeeder) CallNext() {
 		f.nextMS = f.rows[f.rowIdx].EndMS
 		return
 	}
+	// Release the previous page before reading its replacement.
+	f.rows = nil
 	if f.endMS > 0 && f.offsetMS >= f.endMS {
 		f.rowIdx = -1
 		f.nextMS = math.MaxInt64
@@ -132,7 +160,30 @@ func (f *HistSeriesFeeder) CallNext() {
 	if endMS <= 0 {
 		endMS = math.MaxInt64
 	}
-	rows, err := f.store.Read(context.Background(), f.info, f.target, f.offsetMS, endMS, 20_000)
+	ctx := context.Background()
+	if f.deps != nil {
+		ctx = f.deps.context()
+	}
+	ctx = orm.WithSeriesReadByteLimit(ctx, f.BatchBytes)
+	if err := ctx.Err(); err != nil {
+		f.loadErr = errs.New(core.ErrDbReadFail, err)
+		f.rowIdx = -1
+		f.nextMS = f.offsetMS
+		return
+	}
+	pageRows := f.BatchRows
+	if pageRows <= 0 {
+		pageRows = 20_000
+	}
+	rows, err := f.store.Read(ctx, f.info, f.target, f.offsetMS, endMS, pageRows)
+	if err == nil {
+		if budgetErr := orm.CheckDataSeriesBytes(ctx, rows); budgetErr != nil {
+			err = errs.New(core.ErrDbReadFail, budgetErr)
+		}
+	}
+	if err == nil && ctx.Err() != nil {
+		err = errs.New(core.ErrDbReadFail, ctx.Err())
+	}
 	if err != nil {
 		f.loadErr = err
 		f.rowIdx = -1

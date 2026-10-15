@@ -1,6 +1,7 @@
 package dev
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,7 +9,41 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/data"
+	"github.com/gofiber/fiber/v2"
 )
+
+func TestPublicCommandRequiresExplicitFactory(t *testing.T) {
+	command := NewCommand()
+	command.SetArgs(nil)
+	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "typed dev server factory is required") {
+		t.Fatalf("NewCommand without factory error = %v", err)
+	}
+}
+
+func TestListenWithContextStopsFiber(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	app := fiber.New()
+	done := make(chan error, 1)
+	go func() { done <- listenWithContext(ctx, app, "127.0.0.1:0") }()
+	t.Cleanup(func() { _ = app.Shutdown() })
+	deadline := time.Now().Add(time.Second)
+	for len(app.GetRoutes()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Fiber listener did not stop after runtime context cancellation")
+	}
+}
 
 func TestValidateWebAuthRequiresPasswordOnPublicBind(t *testing.T) {
 	if err := validateWebAuth("0.0.0.0", ""); err == nil {
@@ -29,7 +64,16 @@ func TestMakeNewStratGeneratesCompilableProject(t *testing.T) {
 		t.Fatal("resolve test source path")
 	}
 	banbotRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
-	goMod := "module example.com/teststrats\n\ngo 1.24.0\n\nreplace github.com/banbox/banbot => " + strconv.Quote(banbotRoot) + "\n\nrequire github.com/banbox/banbot v0.0.0\n"
+	banexgRootCmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/banbox/banexg")
+	banexgRootCmd.Dir = banbotRoot
+	banexgRootBytes, err := banexgRootCmd.Output()
+	if err != nil {
+		t.Fatalf("resolve banexg module: %v", err)
+	}
+	banexgRoot := strings.TrimSpace(string(banexgRootBytes))
+	goMod := "module example.com/teststrats\n\ngo 1.24.0\n\nreplace github.com/banbox/banbot => " + strconv.Quote(banbotRoot) +
+		"\nreplace github.com/banbox/banexg => " + strconv.Quote(banexgRoot) +
+		"\n\nrequire github.com/banbox/banbot v0.0.0\n"
 	mainGo := "package main\n\nfunc main() {}\n"
 
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte(goMod), 0o644); err != nil {
@@ -55,7 +99,8 @@ func TestMakeNewStratGeneratesCompilableProject(t *testing.T) {
 	})
 	t.Setenv("BanStratDir", "")
 
-	if err := makeNewStrat("scratch", "Demo"); err != nil {
+	server := newDevServer(DevDeps{Data: &data.RuntimeDeps{Config: config.NewSnapshotWithDirs(nil, "", "")}})
+	if err := server.makeNewStrat("scratch", "Demo"); err != nil {
 		t.Fatal(err)
 	}
 	generatedTest := `package scratch

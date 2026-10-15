@@ -1,12 +1,14 @@
 package data
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
@@ -17,7 +19,6 @@ import (
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -27,18 +28,27 @@ func shouldLogBacktestSeriesDebug() bool {
 	return core.BackTestMode && config.Args != nil && strings.EqualFold(config.Args.LogLevel, "debug")
 }
 
+func shouldLogBacktestSeriesDebugWithRuntime(deps *RuntimeDeps) bool {
+	if deps == nil {
+		return shouldLogBacktestSeriesDebug()
+	}
+	return false
+}
+
 type FnDataSeries = func(evt *orm.DataSeries)
 type FuncEnvEnd = func(evt *orm.DataSeries)
 type FnGetInt64 = func() int64
 
 type PairTFCache struct {
-	TimeFrame  string
-	TFSecs     int
-	SubNextMS  int64 // Record the start timestamp of the next bar expected to be received. If it is inconsistent, the bar is missing and needs to be queried and updated. 记录子周期K线下一个期待收到的bar起始时间戳，如果不一致，则出现了bar缺失，需查询更新。
-	NextMS     int64 // 当前周期下一个K线期望的时间戳
-	WaitBar    *orm.DataSeries
-	Latest     *orm.DataSeries
-	AlignOffMS int64
+	TimeFrame    string
+	TFSecs       int
+	exSymbol     *orm.ExSymbol
+	physicalOnly bool
+	SubNextMS    int64 // Record the start timestamp of the next bar expected to be received. If it is inconsistent, the bar is missing and needs to be queried and updated. 记录子周期K线下一个期待收到的bar起始时间戳，如果不一致，则出现了bar缺失，需查询更新。
+	NextMS       int64 // 当前周期下一个K线期望的时间戳
+	WaitBar      *orm.DataSeries
+	Latest       *orm.DataSeries
+	AlignOffMS   int64
 }
 
 /*
@@ -60,15 +70,20 @@ LiveFeeder requires preheating for both new trading pairs and new cycles; HistFe
 */
 type Feeder struct {
 	*orm.ExSymbol
-	States   []*PairTFCache
-	hour     *TfSeriesLoader
-	WaitData *orm.DataSeries
-	CallBack FnDataSeries
-	OnEnvEnd FuncEnvEnd // If the futures main force switches or the stock is ex-rights, the position needs to be closed first 期货主力切换或股票除权，需先平仓
-	tfBars   map[string][]*orm.DataSeries
-	adjs     []*orm.AdjInfo // List of weighting factors 复权因子列表
-	adj      *orm.AdjInfo
-	isWarmUp bool // Is it currently in preheating state? 当前是否预热状态
+	symbols            *orm.SymbolState
+	deps               *RuntimeDeps
+	States             []*PairTFCache
+	hour               *TfSeriesLoader
+	WaitData           *orm.DataSeries
+	CallBack           FnDataSeries
+	OnEnvEnd           FuncEnvEnd // If the futures main force switches or the stock is ex-rights, the position needs to be closed first 期货主力切换或股票除权，需先平仓
+	tfBars             map[string][]*orm.DataSeries
+	adjs               []*orm.AdjInfo // List of weighting factors 复权因子列表
+	adj                *orm.AdjInfo
+	isWarmUp           bool // Is it currently in preheating state? 当前是否预热状态
+	coverage           *config.HistoricalCoverageConfig
+	readKlineFields    klineFieldReader
+	subscriptionFields map[string][]string
 }
 
 func (f *Feeder) getStates() []*PairTFCache {
@@ -107,15 +122,29 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 	}
 	// New records are added to adds, existing ones are deleted from oldTfs, and stateMap retains all
 	// 新增的记录到adds中，已有的从oldTfs中删除，stateMap保留全部的
-	exchange, err := exg.GetWith(f.Exchange, f.Market, "")
+	var exchange banexg.BanExchange
+	var err *errs.Error
+	if f.deps == nil {
+		exchange, err = exg.GetWith(f.Exchange, f.Market, "")
+	} else {
+		exchange = f.deps.exchange()
+		if exchange == nil {
+			f.deps.logger().Warn("runtime exchange is required", zap.String("ex", f.Exchange))
+			return nil
+		}
+	}
 	if err != nil {
-		log.Warn("get exchange fail", zap.String("ex", f.Exchange), zap.Error(err))
+		logger := zap.NewNop()
+		if f.deps != nil {
+			logger = f.deps.logger()
+		}
+		logger.Warn("get exchange fail", zap.String("ex", f.Exchange), zap.Error(err))
 		return nil
 	}
-	exgID := exchange.Info().ID
 	adds := make([]string, 0, len(timeFrames))
 	for _, tf := range timeFrames {
-		if _, ok := oldTfs[tf]; ok {
+		if sta, ok := stateMap[tf]; ok {
+			sta.physicalOnly = false
 			delete(oldTfs, tf)
 			continue
 		}
@@ -123,7 +152,7 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		sta := &PairTFCache{
 			TimeFrame:  tf,
 			TFSecs:     tfSecs,
-			AlignOffMS: int64(exg.GetAlignOff(exgID, tfSecs) * 1000),
+			AlignOffMS: int64(exg.GetAlignOffForExchange(exchange, f.Symbol, tfSecs) * 1000),
 		}
 		stateMap[tf] = sta
 		if minTfSecs == 0 || sta.TFSecs < minTfSecs {
@@ -139,7 +168,7 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		// 删除此次为传入的时间周期
 		for tf := range oldTfs {
 			if sta, ok := stateMap[tf]; ok {
-				if sta.TFSecs == minTfSecs {
+				if sta.TFSecs == minTfSecs && (minDel == nil || comparePairTFCache(sta, minDel) < 0) {
 					minDel = sta
 				}
 				delete(stateMap, tf)
@@ -147,11 +176,14 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		}
 	}
 	var newStates = utils.ValsOfMap(stateMap)
+	if len(newStates) == 0 {
+		f.States = nil
+		f.hour = nil
+		return adds
+	}
 	// Sort all periods from small to large. The first one must be the least common multiple of all subsequent states, so that all subsequent states can be updated from the first one.
 	// 对所有周期从小到大排序，第一个必须是后续所有states的最小公倍数，以便能从第一个更新后续所有
-	slices.SortFunc(newStates, func(a, b *PairTFCache) int {
-		return a.TFSecs - b.TFSecs
-	})
+	slices.SortFunc(newStates, comparePairTFCache)
 	hourSecs := 3600
 	maxTfSecs := newStates[len(newStates)-1].TFSecs
 	if maxTfSecs > hourSecs {
@@ -159,15 +191,14 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		if _, ok := stateMap["1h"]; !ok {
 			// 当需要1h以上级别数据，但未订阅1h时，需插入1h，以便后续从1h归集
 			sta := &PairTFCache{
-				TimeFrame:  "1h",
-				TFSecs:     hourSecs,
-				AlignOffMS: int64(exg.GetAlignOff(exgID, hourSecs) * 1000),
+				TimeFrame:    "1h",
+				TFSecs:       hourSecs,
+				physicalOnly: true,
+				AlignOffMS:   int64(exg.GetAlignOffForExchange(exchange, f.Symbol, hourSecs) * 1000),
 			}
 			stateMap["1h"] = sta
 			newStates = utils.ValsOfMap(stateMap)
-			slices.SortFunc(newStates, func(a, b *PairTFCache) int {
-				return a.TFSecs - b.TFSecs
-			})
+			slices.SortFunc(newStates, comparePairTFCache)
 		}
 	}
 	secs := make([]int, len(newStates))
@@ -184,16 +215,44 @@ func (f *Feeder) SubTfs(timeFrames []string, delOther bool) []string {
 		}
 	}
 	if maxTfSecs >= 3600 {
+		consumerTf := physicalConsumerTimeframe(newStates)
 		// 使用1h及以上周期数据，额外添加1h的loader
 		// 当使用DBSeriesFeeder时，如果最小周期是1h，应将f.hour置为nil
 		if f.hour == nil {
-			f.hour = NewTfSeriesLoader(f.ExSymbol, "1h")
+			f.hour = newTfSeriesLoader(f.deps, f.symbols, f.ExSymbol, "1h")
 		}
+		f.hour.allowPhysicalRead = consumerTf != ""
+		f.hour.physicalConsumerTimeframe = consumerTf
 	} else {
 		f.hour = nil
 	}
 	f.States = newStates
 	return adds
+}
+
+func physicalConsumerTimeframe(states []*PairTFCache) string {
+	const hourSecs = 3600
+	physical := false
+	var consumer *PairTFCache
+	for _, state := range states {
+		if state.TimeFrame == "1h" && state.physicalOnly {
+			physical = true
+		}
+		if state.TFSecs > hourSecs && (consumer == nil || state.TFSecs > consumer.TFSecs) {
+			consumer = state
+		}
+	}
+	if !physical || consumer == nil {
+		return ""
+	}
+	return consumer.TimeFrame
+}
+
+func comparePairTFCache(a, b *PairTFCache) int {
+	if order := cmp.Compare(a.TFSecs, b.TFSecs); order != 0 {
+		return order
+	}
+	return cmp.Compare(a.TimeFrame, b.TimeFrame)
 }
 
 /*
@@ -203,10 +262,34 @@ bars original unweighted K-line
 bars 原始未复权的K线
 */
 func (f *Feeder) onStateOhlcvs(state *PairTFCache, rows []*orm.DataSeries, lastOk bool) []*orm.DataSeries {
-	if len(rows) == 0 {
-		return nil
+	finishRows, err := f.onStateOhlcvsWithErr(state, rows, lastOk)
+	if err != nil {
+		f.deps.logger().Error("fire kline callback fail", zap.String("pair", f.Symbol), zap.Error(err))
 	}
-	state.Latest = rows[len(rows)-1]
+	return finishRows
+}
+
+func (f *Feeder) onStateOhlcvsWithErr(state *PairTFCache, rows []*orm.DataSeries, lastOk bool) ([]*orm.DataSeries, *errs.Error) {
+	for _, row := range rows {
+		if row == nil {
+			return nil, errs.NewMsg(core.ErrInvalidBars, "nil kline row cannot update state: pair=%s timeframe=%s", f.Symbol, state.TimeFrame)
+		}
+	}
+	if !state.physicalOnly && !lastOk && len(rows) > 0 && f.coverage != nil &&
+		!orm.HistoricalCoverageAllowsWithOptions(f.coverage, f.ExSymbol, state.TimeFrame,
+			rows[len(rows)-1].TimeMS, f.klineOptions()) {
+		lastOk = true
+	}
+	rows = f.filterHistoricalCoverageRows(state.TimeFrame, rows)
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	latest := rows[len(rows)-1]
+	previousLatest, previousWait := state.Latest, state.WaitBar
+	state.Latest = latest
+	if f.deps != nil && f.deps.IsolatedSubscriptions && previousLatest != nil && previousLatest.TimeMS > latest.TimeMS {
+		state.Latest = previousLatest
+	}
 	if state.WaitBar != nil && state.WaitBar.TimeMS < rows[0].TimeMS {
 		rows = append([]*orm.DataSeries{state.WaitBar}, rows...)
 	}
@@ -214,18 +297,23 @@ func (f *Feeder) onStateOhlcvs(state *PairTFCache, rows []*orm.DataSeries, lastO
 	finishRows := rows
 	if !lastOk {
 		finishRows = rows[:len(rows)-1]
-		state.WaitBar = state.Latest
+		state.WaitBar = latest
+	}
+	if f.deps != nil && f.deps.IsolatedSubscriptions && previousWait != nil && previousWait.TimeMS > latest.TimeMS {
+		state.WaitBar = previousWait
 	}
 	tfMSecs := int64(state.TFSecs * 1000)
-	for len(finishRows) > 0 && finishRows[0].TimeMS < state.NextMS {
+	for len(finishRows) > 0 && finishRows[0].TimeMS < state.NextMS && (f.deps == nil || !f.deps.IsolatedSubscriptions) {
 		finishRows = finishRows[1:]
 	}
 	if len(finishRows) > 0 {
-		state.NextMS = finishRows[len(finishRows)-1].TimeMS + tfMSecs
+		state.NextMS = max(state.NextMS, finishRows[len(finishRows)-1].TimeMS+tfMSecs)
 		f.addTfKlines(state.TimeFrame, finishRows)
-		f.fireCallBacks(state.TimeFrame, tfMSecs, applyAdjSeries(f.adj, finishRows), f.adj)
+		if err := f.fireCallBacks(state.TimeFrame, tfMSecs, applyAdjSeries(f.adj, finishRows), f.adj); err != nil {
+			return finishRows, err
+		}
 	}
-	return finishRows
+	return finishRows, nil
 }
 
 func (f *Feeder) getTfKlines(tf string, endMS int64, limit int, pBar *utils.PrgBar) ([]*orm.DataSeries, *errs.Error) {
@@ -239,51 +327,167 @@ func (f *Feeder) getTfKlines(tf string, endMS int64, limit int, pBar *utils.PrgB
 		}
 		return rows, nil
 	}
-	exchange, err := exg.GetWith(f.Exchange, f.Market, "")
+	var exchange banexg.BanExchange
+	var err *errs.Error
+	if f.deps == nil {
+		exchange, err = exg.GetWith(f.Exchange, f.Market, "")
+	} else {
+		exchange = f.deps.exchange()
+		if exchange == nil {
+			return nil, errs.NewMsg(core.ErrBadConfig, "runtime exchange is required")
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	adjs, rows, err := orm.AutoFetchSeries(exchange, f.ExSymbol, tf, 0, endMS, limit, false, pBar)
+	var adjs []*orm.AdjInfo
+	var fetchedRows []*orm.DataSeries
+	if f.deps != nil {
+		sess, conn, connErr := f.deps.conn()
+		if connErr != nil {
+			return nil, connErr
+		}
+		defer conn.Release()
+		if f.symbols != nil {
+			sess = sess.WithSeriesSymbolState(f.symbols)
+		}
+		adjs, fetchedRows, err = sess.AutoFetchSeriesWithOptions(exchange, f.ExSymbol, tf, 0, endMS, limit, false, pBar,
+			f.deps.KlineOptions())
+	} else {
+		adjs, fetchedRows, err = orm.AutoFetchSeries(exchange, f.ExSymbol, tf, 0, endMS, limit, false, pBar)
+	}
 	if err != nil {
 		return nil, err
 	}
-	f.tfBars[tf] = rows
-	rows = applyAdjSeriesList(f.ExSymbol, adjs, rows, core.AdjFront, 0, 0)
-	return rows, nil
+	f.tfBars[tf] = fetchedRows
+	fetchedRows = applyAdjSeriesList(f.ExSymbol, adjs, fetchedRows, core.AdjFront, 0, 0)
+	return fetchedRows, nil
 }
 
 func (f *Feeder) addTfKlines(tf string, rows []*orm.DataSeries) {
 	olds, _ := f.tfBars[tf]
-	if len(olds) > core.NumTaCache*2 {
-		olds = olds[len(olds)-core.NumTaCache*3/2:]
+	if f.deps != nil && f.deps.IsolatedSubscriptions {
+		for _, row := range rows {
+			index, exists := slices.BinarySearchFunc(olds, row.TimeMS, func(old *orm.DataSeries, timeMS int64) int {
+				return cmp.Compare(old.TimeMS, timeMS)
+			})
+			if exists {
+				olds[index] = row
+			} else {
+				olds = slices.Insert(olds, index, row)
+			}
+		}
+		rows = nil
+	}
+	var numTACache int
+	if f.deps == nil {
+		numTACache = core.NumTaCache
+	} else {
+		numTACache = f.deps.numTACache()
+	}
+	if len(olds) > numTACache*2 {
+		olds = olds[len(olds)-numTACache*3/2:]
 	}
 	f.tfBars[tf] = append(olds, rows...)
 }
 
-func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.DataSeries, adj *orm.AdjInfo) {
-	isLive := core.LiveMode
+func (f *Feeder) fireCallBacks(timeFrame string, tfMSecs int64, rows []*orm.DataSeries, adj *orm.AdjInfo) *errs.Error {
+	var isLive bool
+	if f.deps == nil {
+		isLive = core.LiveMode
+	} else {
+		isLive = f.deps.isLive()
+	}
 	pair := f.Symbol
-	rows = enrichStoredKlineFields(f.ExSymbol, timeFrame, rows)
 	for _, row := range rows {
-		if !isLive || f.isWarmUp {
-			btime.CurTimeMS = row.TimeMS + tfMSecs
+		if row == nil {
+			return errs.NewMsg(core.ErrInvalidBars, "nil kline row cannot be sent: pair=%s timeframe=%s", pair, timeFrame)
+		}
+	}
+	rows = f.filterHistoricalCoverageRows(timeFrame, rows)
+	var err *errs.Error
+	rows, err = enrichStoredKlineFieldsWithRuntimeDepsAndReader(f.deps, f.ExSymbol, timeFrame, rows, f.readKlineFields, f.subscriptionFields[timeFrame])
+	if err != nil {
+		f.deps.logger().Error("enrich stored kline fields fail", zap.String("pair", pair), zap.String("tf", timeFrame), zap.Error(err))
+		return err
+	}
+	for _, row := range rows {
+		if (!isLive || f.isWarmUp) && (f.deps == nil || !f.deps.IsolatedSubscriptions) {
+			if f.deps == nil {
+				btime.CurTimeMS = row.TimeMS + tfMSecs
+			} else {
+				f.deps.setTimeMS(row.TimeMS + tfMSecs)
+			}
 		}
 		evt := row.CloneWithExSymbol(f.ExSymbol)
 		evt.TimeFrame = timeFrame
-		evt.Adj = adj
-		evt.IsWarmUp = f.isWarmUp
+		if adj != nil {
+			evt.Adj = adj
+		}
+		isWarmUp := f.isWarmUp
+		if !isWarmUp {
+			var backtest bool
+			var timeRange *config.TimeTuple
+			if f.deps == nil {
+				backtest = core.BackTestMode
+				timeRange = config.TimeRange
+			} else {
+				backtest = f.deps.isBacktest()
+				timeRange = f.deps.timeRange()
+			}
+			isWarmUp = backtest && timeRange != nil && row.TimeMS+tfMSecs <= timeRange.StartMS
+		}
+		evt.IsWarmUp = isWarmUp
 		evt.Closed = true
 		f.CallBack(evt)
 	}
 	if isLive && !f.isWarmUp && len(rows) > 0 {
 		// 检查是否延迟
 		lastTime := rows[len(rows)-1].TimeMS
-		delay := btime.TimeMS() - (lastTime + tfMSecs)
+		var nowMS int64
+		if f.deps == nil {
+			nowMS = btime.TimeMS()
+		} else {
+			nowMS = f.deps.timeMS()
+		}
+		delay := nowMS - (lastTime + tfMSecs)
 		if delay > tfMSecs && tfMSecs >= 60000 {
 			barNum := delay / tfMSecs
-			log.Warn(fmt.Sprintf("%s/%s bar too late, delay %v bars, %v", pair, timeFrame, barNum, lastTime))
+			f.deps.logger().Warn(fmt.Sprintf("%s/%s bar too late, delay %v bars, %v", pair, timeFrame, barNum, lastTime))
 		}
 	}
+	return nil
+}
+
+func (f *Feeder) filterHistoricalCoverageRows(timeframe string, rows []*orm.DataSeries) []*orm.DataSeries {
+	if f.coverage == nil {
+		return rows
+	}
+	for _, state := range f.States {
+		if state.TimeFrame == timeframe && state.physicalOnly {
+			return rows
+		}
+	}
+	for index, row := range rows {
+		if orm.HistoricalCoverageAllowsWithOptions(f.coverage, f.ExSymbol, timeframe, row.TimeMS, f.klineOptions()) {
+			continue
+		}
+		filtered := append([]*orm.DataSeries(nil), rows[:index]...)
+		for _, remaining := range rows[index+1:] {
+			if orm.HistoricalCoverageAllowsWithOptions(f.coverage, f.ExSymbol, timeframe, remaining.TimeMS, f.klineOptions()) {
+				filtered = append(filtered, remaining)
+			}
+		}
+		return filtered
+	}
+	return rows
+}
+
+func (f *Feeder) klineOptions() orm.KlineRuntimeOptions {
+	if f != nil && f.deps != nil {
+		return f.deps.KlineOptions()
+	}
+	return orm.LegacyKlineRuntimeOptions()
 }
 
 func applyAdjSeries(adj *orm.AdjInfo, rows []*orm.DataSeries) []*orm.DataSeries {
@@ -438,15 +642,33 @@ func trimSeriesEnd(rows []*orm.DataSeries, cutEnd int64) []*orm.DataSeries {
 }
 
 func buildAggSeries(exs *orm.ExSymbol, tf string, rows []*orm.DataSeries, toTFMSecs int64, preFire float64, prev []*orm.DataSeries, fromTFMS, offMS int64, opts ...bool) ([]*orm.DataSeries, bool, *errs.Error) {
+	return buildAggSeriesWithSymbolState(nil, exs, tf, rows, toTFMSecs, preFire, prev, fromTFMS, offMS, opts...)
+}
+
+func buildAggSeriesWithSymbolState(symbols *orm.SymbolState, exs *orm.ExSymbol, tf string,
+	rows []*orm.DataSeries, toTFMSecs int64, preFire float64, prev []*orm.DataSeries, fromTFMS, offMS int64,
+	opts ...bool,
+) ([]*orm.DataSeries, bool, *errs.Error) {
 	isWarmUp := false
 	if len(opts) > 0 {
 		isWarmUp = opts[len(opts)-1]
 	}
-	aggRows, lastOk, err := orm.ResampleDataSeries(exs, tf, rows, prev, toTFMSecs, preFire, fromTFMS, offMS, isWarmUp)
+	aggRows, lastOk, err := orm.ResampleDataSeriesWithSymbolState(symbols, exs, tf, rows, prev,
+		toTFMSecs, preFire, fromTFMS, offMS, isWarmUp)
 	if err != nil {
 		return nil, false, errs.New(core.ErrInvalidBars, err)
 	}
 	return aggRows, lastOk, nil
+}
+
+func buildAggSeriesWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol, tf string,
+	rows []*orm.DataSeries, toTFMSecs int64, preFire float64, prev []*orm.DataSeries, fromTFMS, offMS int64,
+	opts ...bool,
+) ([]*orm.DataSeries, bool, *errs.Error) {
+	if deps == nil {
+		return buildAggSeries(exs, tf, rows, toTFMSecs, preFire, prev, fromTFMS, offMS, opts...)
+	}
+	return buildAggSeriesWithSymbolState(deps.Symbols, exs, tf, rows, toTFMSecs, preFire, prev, fromTFMS, offMS, opts...)
 }
 
 type IDataFeeder interface {
@@ -495,20 +717,99 @@ type SeriesFeeder struct {
 }
 
 func NewSeriesFeeder(exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error) {
-	adjs, err := orm.GetAdjs(exs.ID)
+	return NewSeriesFeederWithSymbolState(nil, exs, callBack, showLog)
+}
+
+func NewSeriesFeederWithSymbolState(symbols *orm.SymbolState, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error) {
+	return newSeriesFeeder(nil, symbols, exs, callBack, showLog)
+}
+
+// NewSeriesFeederWithRuntimeDeps binds all runtime-owned data dependencies to
+// the feeder. Legacy callers must use NewSeriesFeeder explicitly.
+func NewSeriesFeederWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error) {
+	if deps == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "series feeder requires explicit runtime dependencies")
+	}
+	if deps.Strategies == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "series feeder requires explicit strategy state")
+	}
+	if err := validateFeederRuntimeIdentity(deps, exs); err != nil {
+		return nil, err
+	}
+	return newSeriesFeeder(deps, deps.Symbols, exs, callBack, showLog)
+}
+
+func validateFeederRuntimeIdentity(deps *RuntimeDeps, exs *orm.ExSymbol) *errs.Error {
+	if exs == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "feeder symbol is required")
+	}
+	exchange, market, err := deps.ResolveIdentity()
+	if err != nil {
+		return errs.New(core.ErrRunTime, err)
+	}
+	if exs.Exchange != exchange || exs.Market != market {
+		return errs.NewMsg(core.ErrBadConfig, "feeder symbol identity %q/%q does not match runtime %q/%q", exs.Exchange, exs.Market, exchange, market)
+	}
+	return nil
+}
+
+func newSeriesFeeder(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error) {
+	var adjs []*orm.AdjInfo
+	var err *errs.Error
+	if deps != nil {
+		sess, conn, connErr := deps.conn()
+		if connErr != nil {
+			return nil, connErr
+		}
+		defer conn.Release()
+		if symbols != nil {
+			sess = sess.WithSeriesSymbolState(symbols)
+		}
+		adjs, err = sess.GetAdjs(exs.ID)
+	} else {
+		adjs, err = orm.GetAdjs(exs.ID)
+	}
 	if err != nil {
 		return nil, err
 	}
+	var preFire float64
+	if deps == nil {
+		preFire = config.PreFire
+	} else {
+		preFire = deps.preFire()
+	}
+	coverage := historicalCoverageForFeederWithRuntime(deps, exs.Symbol)
 	return &SeriesFeeder{
 		Feeder: Feeder{
 			ExSymbol: exs,
+			symbols:  symbols,
+			deps:     deps,
 			CallBack: callBack,
 			tfBars:   make(map[string][]*orm.DataSeries),
 			adjs:     adjs,
+			coverage: coverage,
 		},
-		PreFire: config.PreFire,
+		PreFire: preFire,
 		showLog: showLog,
 	}, nil
+}
+
+func historicalCoverageForFeeder(symbol string) *config.HistoricalCoverageConfig {
+	if !config.StrictHistoricalReplay(config.HistoricalCoverage) {
+		return nil
+	}
+	return config.HistoricalCoverageFor(symbol)
+}
+
+func historicalCoverageForFeederWithRuntime(deps *RuntimeDeps, symbol string) *config.HistoricalCoverageConfig {
+	if deps == nil {
+		return historicalCoverageForFeeder(symbol)
+	}
+	options := deps.KlineOptions()
+	if !options.StrictReplay || options.HistoricalCoverage == nil {
+		return nil
+	}
+	return deps.coverage(symbol)
 }
 
 func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.PrgBar) (int64, map[string][2]int, *errs.Error) {
@@ -523,8 +824,9 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 	maxEndMs := int64(0)
 	skips := make(map[string][2]int)
 	hourDone := f.hour == nil
-	debugWarm := shouldLogBacktestSeriesDebug()
-	for tf, warmNum := range tfNums {
+	debugWarm := shouldLogBacktestSeriesDebugWithRuntime(f.deps)
+	for _, tf := range sortedTimeframes(tfNums) {
+		warmNum := tfNums[tf]
 		tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 		endMS := utils2.AlignTfMSecs(curMS, tfMSecs)
 		if tfMSecs < int64(60000) || warmNum <= 0 {
@@ -535,14 +837,19 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 		if err != nil {
 			return 0, nil, err
 		}
+		bars = f.filterHistoricalCoverageRows(tf, bars)
 		if debugWarm {
 			var firstMS, lastMS int64
 			if len(bars) > 0 {
 				firstMS = bars[0].TimeMS
 				lastMS = bars[len(bars)-1].TimeMS
 			}
-			log.Debug("warm tf fetch",
-				zap.Bool("questdb", orm.IsQuestDB),
+			questDB := orm.IsQuestDB
+			if f.deps != nil {
+				questDB = f.deps.isQuestDB()
+			}
+			f.deps.logger().Debug("warm tf fetch",
+				zap.Bool("questdb", questDB),
 				zap.String("pair", f.Symbol),
 				zap.String("tf", tf),
 				zap.Int("warm_num", warmNum),
@@ -559,7 +866,10 @@ func (f *SeriesFeeder) WarmTfs(curMS int64, tfNums map[string]int, pBar *utils.P
 		if warmNum != len(bars) && f.showLog {
 			skips[fmt.Sprintf("%s_%s", f.Symbol, tf)] = [2]int{warmNum, len(bars)}
 		}
-		curEnd := f.warmTf(tf, bars)
+		curEnd, err := f.warmTfWithErr(tf, bars)
+		if err != nil {
+			return 0, nil, err
+		}
 		if !hourDone && tfMSecs == 3600000 {
 			f.hour.SetSeek(curEnd)
 			hourDone = true
@@ -590,20 +900,47 @@ Returns the ending timestamp (i.e. the starting timestamp of the next bar)
 返回结束的时间戳（即下一个bar开始时间戳）
 */
 func (f *SeriesFeeder) warmTf(tf string, rows []*orm.DataSeries) int64 {
-	if len(rows) == 0 {
+	lastMS, err := f.warmTfWithErr(tf, rows)
+	if err != nil {
+		f.deps.logger().Error("warm kline callback fail", zap.String("pair", f.Symbol), zap.String("tf", tf), zap.Error(err))
 		return 0
 	}
-	bakBt := core.BackTestMode
-	core.BackTestMode = true
-	defer func() {
-		core.BackTestMode = bakBt
-	}()
+	return lastMS
+}
+
+func (f *SeriesFeeder) warmTfWithErr(tf string, rows []*orm.DataSeries) (int64, *errs.Error) {
+	for _, row := range rows {
+		if row == nil {
+			return 0, errs.NewMsg(core.ErrInvalidBars, "nil kline row cannot warm: pair=%s timeframe=%s", f.Symbol, tf)
+		}
+	}
+	rows = f.filterHistoricalCoverageRows(tf, rows)
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	if f.deps == nil {
+		bakBt := core.BackTestMode
+		core.BackTestMode = true
+		defer func() {
+			core.BackTestMode = bakBt
+		}()
+	}
 	f.isWarmUp = true
+	defer func() { f.isWarmUp = false }()
+	if f.deps != nil && f.deps.IsolatedSubscriptions {
+		f.addTfKlines(tf, rows)
+	}
 	tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 	lastMS := rows[len(rows)-1].TimeMS + tfMSecs
 	envKey := strings.Join([]string{f.Symbol, tf}, "_")
-	if env, ok := strat.Envs[envKey]; ok {
-		env.Reset()
+	if f.deps == nil {
+		if env, ok := strat.GetEnv(envKey); ok {
+			env.Reset()
+		}
+	} else if f.deps.Strategies != nil {
+		if env, ok := f.deps.Strategies.Env(envKey); ok {
+			env.Reset()
+		}
 	}
 	if len(f.adjs) > 0 {
 		// 按复权信息分批调用
@@ -614,11 +951,15 @@ func (f *SeriesFeeder) warmTf(tf string, rows []*orm.DataSeries) int64 {
 		for i, row := range rows {
 			for row.TimeMS >= pAdj.StopMS {
 				if len(cache) > 0 {
-					f.fireCallBacks(tf, tfMSecs, cache, pAdj)
+					if err := f.fireCallBacks(tf, tfMSecs, cache, pAdj); err != nil {
+						return 0, err
+					}
 					cache = make([]*orm.DataSeries, 0, len(rows))
 				}
 				if pi >= len(f.adjs) {
-					f.fireCallBacks(tf, tfMSecs, rows[i:], nil)
+					if err := f.fireCallBacks(tf, tfMSecs, rows[i:], nil); err != nil {
+						return 0, err
+					}
 					forEnd = true
 					pAdj = nil
 					break
@@ -632,10 +973,14 @@ func (f *SeriesFeeder) warmTf(tf string, rows []*orm.DataSeries) int64 {
 			cache = append(cache, row)
 		}
 		if len(cache) > 0 {
-			f.fireCallBacks(tf, tfMSecs, cache, pAdj)
+			if err := f.fireCallBacks(tf, tfMSecs, cache, pAdj); err != nil {
+				return 0, err
+			}
 		}
 	} else {
-		f.fireCallBacks(tf, tfMSecs, rows, nil)
+		if err := f.fireCallBacks(tf, tfMSecs, rows, nil); err != nil {
+			return 0, err
+		}
 	}
 	for _, sta := range f.States {
 		if sta.TimeFrame == tf {
@@ -643,8 +988,7 @@ func (f *SeriesFeeder) warmTf(tf string, rows []*orm.DataSeries) int64 {
 			break
 		}
 	}
-	f.isWarmUp = false
-	return lastMS
+	return lastMS, nil
 }
 
 /*
@@ -658,6 +1002,11 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 	if len(rows) == 0 {
 		return false, nil
 	}
+	for _, row := range rows {
+		if row == nil {
+			return false, errs.NewMsg(core.ErrInvalidBars, "nil kline row cannot be processed: pair=%s", f.Symbol)
+		}
+	}
 	var err *errs.Error
 	state := f.States[0]
 	staMSecs := int64(state.TFSecs * 1000)
@@ -668,7 +1017,8 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 		if state.WaitBar != nil {
 			olds = append(olds, state.WaitBar)
 		}
-		ohlcvs, lastOk, err = buildAggSeries(f.ExSymbol, state.TimeFrame, rows, staMSecs, f.PreFire, olds, barTfMSecs, state.AlignOffMS, false, f.isWarmUp)
+		ohlcvs, lastOk, err = buildAggSeriesWithRuntimeDeps(f.deps, f.ExSymbol, state.TimeFrame, rows,
+			staMSecs, f.PreFire, olds, barTfMSecs, state.AlignOffMS, false, f.isWarmUp)
 		if err != nil {
 			return false, err
 		}
@@ -690,6 +1040,9 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 		useHour = true
 		firstReadHours = f.hour.FirstRead
 		hourBars = f.hour.ReadTo(endMS, true)
+		if f.hour.loadErr != nil {
+			return false, f.hour.loadErr
+		}
 	}
 	minState, minOhlcvs := state, ohlcvs
 	// 应该按周期从大到小触发
@@ -701,7 +1054,8 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 		if barTfMSecs < staMSecs {
 			// The last unfinished data should be kept here
 			// 这里应该保留最后未完成的数据
-			ohlcvs, _, err = buildAggSeries(f.ExSymbol, state.TimeFrame, rows, staMSecs, f.PreFire, nil, barTfMSecs, state.AlignOffMS, false, f.isWarmUp)
+			ohlcvs, _, err = buildAggSeriesWithRuntimeDeps(f.deps, f.ExSymbol, state.TimeFrame, rows,
+				staMSecs, f.PreFire, nil, barTfMSecs, state.AlignOffMS, false, f.isWarmUp)
 			if err != nil {
 				return false, err
 			}
@@ -721,7 +1075,7 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 				srcMSecs, srcAlignOff = hourMSecs, hourAlignOff
 			}
 			subEndMS := curRows[len(curRows)-1].TimeMS + srcMSecs
-			olds, err := state.fillLacks(f.Symbol, int(srcMSecs/1000), curRows[0].TimeMS, subEndMS)
+			olds, err := state.fillLacksWithRuntimeDeps(f.deps, f.ExSymbol, int(srcMSecs/1000), curRows[0].TimeMS, subEndMS)
 			if err != nil {
 				return false, err
 			}
@@ -729,11 +1083,14 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 				olds = append(olds, state.WaitBar)
 			}
 			bigTfMSecs := int64(state.TFSecs * 1000)
-			curOhlcvs, lastDone, err := buildAggSeries(f.ExSymbol, state.TimeFrame, curRows, bigTfMSecs, f.PreFire, olds, srcMSecs, srcAlignOff, false, f.isWarmUp)
+			curOhlcvs, lastDone, err := buildAggSeriesWithRuntimeDeps(f.deps, f.ExSymbol, state.TimeFrame,
+				curRows, bigTfMSecs, f.PreFire, olds, srcMSecs, srcAlignOff, false, f.isWarmUp)
 			if err != nil {
 				return false, err
 			}
-			f.onStateOhlcvs(state, curOhlcvs, lastDone)
+			if _, err := f.onStateOhlcvsWithErr(state, curOhlcvs, lastDone); err != nil {
+				return false, err
+			}
 		}
 	}
 	isWarmUp := false
@@ -751,7 +1108,10 @@ func (f *SeriesFeeder) onNewData(barTfMSecs int64, rows []*orm.DataSeries) (bool
 		// 对于4h及以上的实盘时，第一次会读取1h的一些k线，应当视为预热
 		f.isWarmUp = true
 	}
-	doneBars := f.onStateOhlcvs(minState, minOhlcvs, lastOk)
+	doneBars, err := f.onStateOhlcvsWithErr(minState, minOhlcvs, lastOk)
+	if err != nil {
+		return false, err
+	}
 	if isWarmUp {
 		f.isWarmUp = false
 	}
@@ -803,7 +1163,36 @@ Backtest mode: Read 3K bars each time, and backtest triggers in sequence accordi
 type DBSeriesFeeder struct {
 	SeriesFeeder
 	*TfSeriesLoader
+	symbols    *orm.SymbolState
 	TradeTimes [][2]int64 // Trading time 可交易时间
+}
+
+func (f *DBSeriesFeeder) syncSymbolState() {
+	state := f.symbols
+	if state == nil {
+		state = f.Feeder.symbols
+	}
+	if state == nil && f.TfSeriesLoader != nil {
+		state = f.TfSeriesLoader.symbols
+	}
+	deps := f.deps
+	if deps == nil {
+		deps = f.Feeder.deps
+	}
+	if deps == nil && f.TfSeriesLoader != nil {
+		deps = f.TfSeriesLoader.deps
+	}
+	if state == nil && deps != nil {
+		state = deps.Symbols
+	}
+	f.symbols = state
+	f.Feeder.symbols = state
+	f.deps = deps
+	f.Feeder.deps = deps
+	if f.TfSeriesLoader != nil {
+		f.TfSeriesLoader.symbols = state
+		f.TfSeriesLoader.deps = deps
+	}
 }
 
 /*
@@ -821,6 +1210,7 @@ func (f *DBSeriesFeeder) SetEndMS(ms int64) {
 }
 
 func (f *DBSeriesFeeder) SetSeek(since int64) {
+	f.syncSymbolState()
 	f.TfSeriesLoader.SetSeek(since)
 	if f.hour != nil {
 		f.hour.SetSeek(since)
@@ -837,6 +1227,7 @@ Add monitoring to States and return the newly added TimeFrames
 添加监听到States中，返回新增的TimeFrames
 */
 func (f *DBSeriesFeeder) SubTfs(timeFrames []string, delOther bool) []string {
+	f.syncSymbolState()
 	arr := f.Feeder.SubTfs(timeFrames, delOther)
 	minTF := ""
 	if len(f.States) > 0 {
@@ -847,10 +1238,19 @@ func (f *DBSeriesFeeder) SubTfs(timeFrames []string, delOther bool) []string {
 		f.hour = nil
 	}
 	f.SetTimeFrame(minTF)
+	consumerTf := physicalConsumerTimeframe(f.States)
+	f.allowPhysicalRead = consumerTf != ""
+	f.physicalConsumerTimeframe = consumerTf
+	if f.hour != nil {
+		f.hour.subscriptionFields = f.Feeder.subscriptionFields
+		f.hour.BatchRows = f.TfSeriesLoader.BatchRows
+		f.hour.BatchBytes = f.TfSeriesLoader.BatchBytes
+	}
 	return arr
 }
 
 func (f *DBSeriesFeeder) CallNext() {
+	f.syncSymbolState()
 	f.TfSeriesLoader.SetNext()
 	if f.rowIdx > 0 {
 		// 缓存索引移动
@@ -883,9 +1283,9 @@ func (f *DBSeriesFeeder) CallNext() {
 			// 重新复权预热
 			_, skips, err := f.WarmTfs(curMS, nil, nil)
 			if err != nil {
-				log.Error("next warm tf fail", zap.Error(err))
+				f.Feeder.deps.logger().Error("next warm tf fail", zap.Error(err))
 			} else if len(skips) > 0 {
-				log.Warn("warm lacks", zap.String("items", StrWarmLacks(skips)))
+				f.Feeder.deps.logger().Warn("warm lacks", zap.String("items", StrWarmLacks(skips)))
 			}
 			f.setAdjIdx()
 		}
@@ -908,6 +1308,9 @@ func (f *DBSeriesFeeder) setAdjIdx() {
 }
 
 func (f *DBSeriesFeeder) GetBatch() Batch {
+	if f.loadErr != nil {
+		return &seriesLoadErrorBatch{err: f.loadErr}
+	}
 	row := f.GetRow()
 	if row != nil {
 		return SeriesBatch{DataSeries: row}
@@ -916,6 +1319,10 @@ func (f *DBSeriesFeeder) GetBatch() Batch {
 }
 
 func (f *DBSeriesFeeder) RunBatch(batch Batch) *errs.Error {
+	if failed, ok := batch.(*seriesLoadErrorBatch); ok {
+		return failed.err
+	}
+	f.syncSymbolState()
 	if row, ok := batch.(SeriesBatch); ok {
 		evt := row.CloneWithExSymbol(f.ExSymbol)
 		if evt != nil {
@@ -929,22 +1336,63 @@ func (f *DBSeriesFeeder) RunBatch(batch Batch) *errs.Error {
 }
 
 func NewDBSeriesFeeder(exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*DBSeriesFeeder, *errs.Error) {
-	exchange, err := exg.GetWith(exs.Exchange, exs.Market, "")
+	return NewDBSeriesFeederWithSymbolState(nil, exs, callBack, showLog)
+}
+
+func NewDBSeriesFeederWithSymbolState(symbols *orm.SymbolState, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*DBSeriesFeeder, *errs.Error) {
+	return newDBSeriesFeeder(nil, symbols, exs, callBack, showLog)
+}
+
+// NewDBSeriesFeederWithRuntimeDeps binds the historical feeder to one
+// runtime's exchange, clock, configuration, and symbol state.
+func NewDBSeriesFeederWithRuntimeDeps(deps *RuntimeDeps, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*DBSeriesFeeder, *errs.Error) {
+	if deps == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "historical feeder requires explicit runtime dependencies")
+	}
+	if deps.Strategies == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "historical feeder requires explicit strategy state")
+	}
+	if err := validateFeederRuntimeIdentity(deps, exs); err != nil {
+		return nil, err
+	}
+	return newDBSeriesFeeder(deps, deps.Symbols, exs, callBack, showLog)
+}
+
+func newDBSeriesFeeder(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (*DBSeriesFeeder, *errs.Error) {
+	var exchange banexg.BanExchange
+	var err *errs.Error
+	if deps == nil {
+		exchange, err = exg.GetWith(exs.Exchange, exs.Market, "")
+	} else {
+		exchange = deps.exchange()
+		if exchange == nil {
+			err = errs.NewMsg(core.ErrBadConfig, "runtime exchange is required")
+		}
+	}
 	if err != nil {
 		return nil, err
+	}
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
 	}
 	var tradeTimes [][2]int64
 	market, err := exchange.GetMarket(exs.Symbol)
 	if err == nil {
 		tradeTimes = market.GetTradeTimes()
 	}
-	feeder, err := NewSeriesFeeder(exs, callBack, showLog)
+	var feeder *SeriesFeeder
+	if deps == nil {
+		feeder, err = NewSeriesFeederWithSymbolState(symbols, exs, callBack, showLog)
+	} else {
+		feeder, err = newSeriesFeeder(deps, symbols, exs, callBack, showLog)
+	}
 	if err != nil {
 		return nil, err
 	}
 	res := &DBSeriesFeeder{
 		SeriesFeeder:   *feeder,
-		TfSeriesLoader: NewTfSeriesLoader(exs, ""),
+		TfSeriesLoader: newTfSeriesLoader(deps, symbols, exs, ""),
+		symbols:        symbols,
 		TradeTimes:     tradeTimes,
 	}
 	return res, nil
@@ -954,9 +1402,16 @@ func NewDBSeriesFeeder(exs *orm.ExSymbol, callBack FnDataSeries, showLog bool) (
 TfSeriesLoader 用于分批加载某个品种的指定周期K线，然后逐个读取的场景
 */
 type TfSeriesLoader struct {
+	BatchRows          int
+	BatchBytes         int64
+	subscriptionFields map[string][]string
 	*orm.ExSymbol
-	Timeframe string
-	TFMSecs   int64
+	symbols                   *orm.SymbolState
+	deps                      *RuntimeDeps
+	Timeframe                 string
+	TFMSecs                   int64
+	allowPhysicalRead         bool
+	physicalConsumerTimeframe string
 
 	EndMS     int64
 	FirstRead bool
@@ -964,23 +1419,63 @@ type TfSeriesLoader struct {
 	caches    []*orm.DataSeries
 	nextMS    int64 // The 13-digit millisecond end timestamp of the next bar, math.MaxInt32 indicates the end 下一个bar的结束13位毫秒时间戳，math.MaxInt32表示结束
 	offsetMS  int64
+	loadErr   *errs.Error
+}
+
+func (f *TfSeriesLoader) context() context.Context {
+	ctx := context.Background()
+	if f.deps != nil {
+		ctx = f.deps.context()
+	}
+	return orm.WithSeriesReadByteLimit(ctx, f.BatchBytes)
+}
+
+func (f *TfSeriesLoader) questDB() bool {
+	if f != nil && f.deps != nil {
+		return f.deps.isQuestDB()
+	}
+	return orm.IsQuestDB
 }
 
 func NewTfSeriesLoader(exs *orm.ExSymbol, tf string) *TfSeriesLoader {
+	return NewTfSeriesLoaderWithSymbolState(nil, exs, tf)
+}
+
+func NewTfSeriesLoaderWithSymbolState(symbols *orm.SymbolState, exs *orm.ExSymbol, tf string) *TfSeriesLoader {
+	return newTfSeriesLoader(nil, symbols, exs, tf)
+}
+
+func newTfSeriesLoader(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExSymbol, tf string) *TfSeriesLoader {
 	tfMSecs := int64(0)
 	if tf != "" {
 		tfMSecs = int64(utils2.TFToSecs(tf) * 1000)
 	}
-	endMS := config.TimeRange.EndMS
-	if core.LiveMode {
+	endMS := int64(0)
+	var isLive bool
+	if deps == nil {
+		endMS = config.TimeRange.EndMS
+		isLive = core.LiveMode
+	} else {
+		if timeRange := deps.timeRange(); timeRange != nil {
+			endMS = timeRange.EndMS
+		}
+		isLive = deps.isLive()
+	}
+	if isLive {
 		// 实时模式下，EndMS截取为当前对齐时间
-		endMS = btime.UTCStamp()
+		if deps == nil {
+			endMS = btime.UTCStamp()
+		} else {
+			endMS = deps.utcStamp()
+		}
 		if tfMSecs > 0 {
 			endMS = utils2.AlignTfMSecs(endMS, tfMSecs)
 		}
 	}
 	return &TfSeriesLoader{
 		ExSymbol:  exs,
+		symbols:   symbols,
+		deps:      deps,
 		Timeframe: tf,
 		TFMSecs:   tfMSecs,
 		EndMS:     endMS,
@@ -1019,6 +1514,7 @@ func (f *TfSeriesLoader) Reset(since int64) {
 	f.nextMS = 0
 	f.offsetMS = since
 	f.caches = nil
+	f.loadErr = nil
 }
 
 func (f *TfSeriesLoader) ReadTo(end int64, force bool) []*orm.DataSeries {
@@ -1071,9 +1567,12 @@ func (f *TfSeriesLoader) DownIfNeed(sess *orm.Queries, exchange banexg.BanExchan
 		return err
 	}
 	if sess == nil {
-		ctx := context.Background()
 		var conn *pgxpool.Conn
-		sess, conn, err = orm.Conn(ctx)
+		if f.deps == nil {
+			sess, conn, err = orm.Conn(f.context())
+		} else {
+			sess, conn, err = f.deps.conn()
+		}
 		if err != nil {
 			if pBar != nil {
 				pBar.Add(core.StepTotal)
@@ -1082,11 +1581,26 @@ func (f *TfSeriesLoader) DownIfNeed(sess *orm.Queries, exchange banexg.BanExchan
 		}
 		defer conn.Release()
 	}
-	_, err = sess.DownOHLCV2DB(exchange, f.ExSymbol, downTf, btime.TimeMS(), f.EndMS, pBar)
+	var curMS int64
+	if f.deps == nil {
+		curMS = btime.TimeMS()
+	} else {
+		curMS = f.deps.timeMS()
+	}
+	if f.deps == nil {
+		_, err = sess.DownOHLCV2DBForRequestedTF(exchange, f.ExSymbol, downTf, f.Timeframe,
+			curMS, f.EndMS, pBar)
+	} else {
+		_, err = sess.DownOHLCV2DBForRequestedTFWithOptions(exchange, f.ExSymbol, downTf, f.Timeframe,
+			curMS, f.EndMS, pBar, f.deps.KlineOptions())
+	}
 	return err
 }
 
 func (f *TfSeriesLoader) SetNext() {
+	if f.loadErr != nil {
+		return
+	}
 	if f.rowIdx+1 < len(f.caches) {
 		f.rowIdx += 1
 		f.nextMS = f.caches[f.rowIdx].EndMS
@@ -1096,6 +1610,7 @@ func (f *TfSeriesLoader) SetNext() {
 	endMS := f.EndMS
 	if endMS > 0 && f.nextMS >= endMS {
 		f.rowIdx = -1
+		f.caches = nil
 		// 将nextMS置为math.MaxInt64前，应备份到offsetMS，以便实盘读取更新的k线
 		f.offsetMS = max(f.offsetMS, f.nextMS)
 		f.nextMS = math.MaxInt64
@@ -1103,52 +1618,125 @@ func (f *TfSeriesLoader) SetNext() {
 	}
 	// After the cache reading is completed, re-read the database
 	// 缓存读取完毕，重新读取数据库
-	sess, conn, err := orm.Conn(nil)
-	if err != nil {
-		f.rowIdx = -1
-		f.offsetMS = max(f.offsetMS, f.nextMS)
-		f.nextMS = math.MaxInt64
-		log.Error("get conn fail while loading kline", zap.Error(err))
-		return
+	if f.BatchRows > 0 || f.BatchBytes > 0 {
+		f.caches = nil
 	}
-	defer conn.Release()
 	batchSize := 3000
-	if core.BackTestMode {
+	var backtest bool
+	if f.deps == nil {
+		backtest = core.BackTestMode
+	} else {
+		backtest = f.deps.isBacktest()
+	}
+	if backtest {
 		// QuestDB performs better with fewer, larger range queries than many small ones.
 		batchSize = 20000
 	}
-	debugLoad := shouldLogBacktestSeriesDebug()
+	if f.BatchRows > 0 {
+		batchSize = f.BatchRows
+	}
+	withUnFinish := !backtest
+	debugLoad := shouldLogBacktestSeriesDebugWithRuntime(f.deps)
 	if debugLoad {
-		log.Debug("load tf bars request",
-			zap.Bool("questdb", orm.IsQuestDB),
+		f.deps.logger().Debug("load tf bars request",
+			zap.Bool("questdb", f.questDB()),
 			zap.String("pair", f.Symbol),
 			zap.String("tf", f.Timeframe),
 			zap.Int64("offset_ms", f.offsetMS),
 			zap.Int64("end_ms", endMS),
 			zap.Int("batch_size", batchSize))
 	}
-	fields := strat.CollectKlineSubFields(f.ExSymbol.ID, f.Timeframe)
-	_, rows, err := sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields, f.offsetMS, endMS, batchSize, true)
+	var fields []string
+	if f.deps != nil && f.deps.Strategies != nil {
+		fields = f.deps.Strategies.CollectKlineSubFields(f.symbols, f.ExSymbol.ID, f.Timeframe)
+	} else if f.deps == nil {
+		fields = strat.CollectKlineSubFieldsWithSymbolState(f.symbols, f.ExSymbol.ID, f.Timeframe)
+	} else {
+		// An explicit data dependency set without a strategy registry is still
+		// isolated; use the base projection instead of consulting legacy jobs.
+		fields = orm.NormalizeSeriesFields(orm.SeriesSourceKline, nil)
+	}
+	if extra := f.subscriptionFields[f.Timeframe]; len(extra) > 0 {
+		fields = orm.MergeSeriesFields(fields, extra)
+	}
+	var rows []*orm.DataSeries
+	var err *errs.Error
+	const maxSeriesLoadRetries = 3
+	for retry := 0; retry < maxSeriesLoadRetries; retry++ {
+		rows = nil
+		err = nil
+		var sess *orm.Queries
+		var conn *pgxpool.Conn
+		var connErr *errs.Error
+		if f.deps == nil {
+			sess, conn, connErr = orm.Conn(f.context())
+		} else {
+			sess, conn, connErr = f.deps.conn()
+		}
+		if connErr != nil {
+			err = connErr
+		} else {
+			sess = sess.WithReadContext(f.context())
+			if f.symbols != nil {
+				sess = sess.WithSeriesSymbolState(f.symbols)
+			}
+			if f.deps != nil {
+				sess = sess.WithKlineRuntimeOptions(f.deps.KlineOptions())
+			}
+			if f.allowPhysicalRead {
+				_, rows, err = sess.GetPhysicalSeriesFieldsForConsumer(f.ExSymbol, f.Timeframe, fields,
+					f.physicalConsumerTimeframe,
+					f.offsetMS, endMS, batchSize, withUnFinish)
+			} else {
+				_, rows, err = sess.GetSeriesFields(f.ExSymbol, f.Timeframe, fields,
+					f.offsetMS, endMS, batchSize, withUnFinish)
+			}
+			conn.Release()
+		}
+		if err == nil || err.Code != core.ErrDbConnFail || retry == maxSeriesLoadRetries-1 {
+			break
+		}
+		f.deps.logger().Warn("retry loading kline after transient db connection failure",
+			zap.String("pair", f.Symbol), zap.String("tf", f.Timeframe),
+			zap.Int("attempt", retry+1), zap.Error(err))
+		if f.deps == nil {
+			core.Sleep(time.Second * time.Duration(retry+1))
+		} else {
+			f.deps.sleep(time.Second * time.Duration(retry+1))
+		}
+	}
+	if err == nil {
+		if budgetErr := orm.CheckDataSeriesBytes(f.context(), rows); budgetErr != nil {
+			err = errs.New(core.ErrDbReadFail, budgetErr)
+		}
+	}
+	if err != nil && f.BatchBytes > 0 {
+		f.loadErr = err
+		f.caches = nil
+		f.rowIdx = -1
+		f.nextMS = f.offsetMS
+		return
+	}
 	if err != nil || len(rows) == 0 {
 		f.rowIdx = -1
 		f.offsetMS = max(f.offsetMS, f.nextMS)
 		f.nextMS = math.MaxInt64
 		if debugLoad {
-			log.Debug("load tf bars result",
-				zap.Bool("questdb", orm.IsQuestDB),
+			f.deps.logger().Debug("load tf bars result",
+				zap.Bool("questdb", f.questDB()),
 				zap.String("pair", f.Symbol),
 				zap.String("tf", f.Timeframe),
 				zap.Int("got", len(rows)),
 				zap.Error(err))
 		}
 		if err != nil {
-			log.Error("load series fail", zap.Error(err))
+			f.deps.logger().Error("load series fail", zap.Error(err))
 		}
 		return
 	}
 	if debugLoad {
-		log.Debug("load tf bars result",
-			zap.Bool("questdb", orm.IsQuestDB),
+		f.deps.logger().Debug("load tf bars result",
+			zap.Bool("questdb", f.questDB()),
 			zap.String("pair", f.Symbol),
 			zap.String("tf", f.Timeframe),
 			zap.Int("got", len(rows)),

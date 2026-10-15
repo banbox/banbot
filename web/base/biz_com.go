@@ -1,7 +1,6 @@
 package base
 
 import (
-	"fmt"
 	"github.com/sasha-s/go-deadlock"
 
 	"github.com/banbox/banbot/config"
@@ -12,8 +11,6 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
-	utils2 "github.com/banbox/banexg/utils"
-	"github.com/gofiber/contrib/websocket"
 	"go.uber.org/zap"
 )
 
@@ -21,8 +18,7 @@ var (
 	exgInits    = map[banexg.BanExchange]bool{}
 	exgInitLock deadlock.Mutex
 	receiver    *data.SeriesWatcher
-	wsSubs      = map[string]map[*WsClient]bool{}
-	wsSubLock   deadlock.Mutex
+	legacyWsHub = NewWsHub(nil)
 )
 
 func InitExg(exchange banexg.BanExchange) *errs.Error {
@@ -81,25 +77,6 @@ func ArrSeriesRows(rows []*orm.DataSeries) ([][]float64, *errs.Error) {
 	return res, nil
 }
 
-func SetSeriesSub(client *WsClient, isSub, lock bool, keys ...string) {
-	if lock {
-		wsSubLock.Lock()
-		defer wsSubLock.Unlock()
-	}
-	for _, key := range keys {
-		clients, ok := wsSubs[key]
-		if !ok {
-			clients = make(map[*WsClient]bool)
-			wsSubs[key] = clients
-		}
-		if isSub {
-			clients[client] = true
-		} else {
-			delete(clients, client)
-		}
-	}
-}
-
 func RunReceiver() {
 	var err *errs.Error
 	receiver, err = data.NewSeriesWatcher(config.SpiderAddr)
@@ -129,35 +106,4 @@ func RunReceiver() {
 	}
 }
 
-func seriesHandler(msg *data.SeriesMsg) {
-	if len(msg.Rows) == 0 {
-		return
-	}
-	wsSubLock.Lock()
-	defer wsSubLock.Unlock()
-	key := fmt.Sprintf("%s_%s_%s", msg.ExgName, msg.Market, msg.Pair)
-	clients, _ := wsSubs[key]
-	if len(clients) == 0 {
-		return
-	}
-	wsMsg := map[string]interface{}{
-		"a":      "subscribe",
-		"series": msg.Rows,
-		"secs":   msg.TFSecs,
-		"upd":    msg.Interval,
-	}
-	raw, marshalErr := utils2.Marshal(wsMsg)
-	if marshalErr != nil {
-		log.Warn("marshal ws series fail", zap.Error(marshalErr))
-		return
-	}
-
-	for c := range clients {
-		err_ := c.Conn.WriteMessage(websocket.TextMessage, raw)
-		if err_ != nil {
-			log.Debug("write to ws fail", zap.Error(err_))
-			c.Close(false)
-			delete(clients, c)
-		}
-	}
-}
+func seriesHandler(msg *data.SeriesMsg) { legacyWsHub.Publish(msg) }

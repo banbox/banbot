@@ -48,10 +48,14 @@ var (
 
 	lockOdBook  sync.Mutex // 确认不冲突，无需用deadlock
 	LockOdMatch sync.RWMutex
+	// exitCallsLock protects the legacy process-wide cleanup list. Explicit
+	// runtimes use State.OnExit; this lock keeps old callbacks safe when a
+	// signal handler and the command defer race to drain them.
+	exitCallsLock sync.Mutex
 
 	ConcurNum = 2 // The maximum number of K-line tasks to be downloaded at the same time. If it is too high, a 429 current limit will occur. 最大同时下载K线任务数，过大会出现429限流
-	Version   = "v0.4.1-beta.1"
-	UIVersion = "v0.4.0"
+	Version   = "v0.6.0-beta.12"
+	UIVersion = "v0.6.0-beta.12"
 	SysLang   string // language code for current system 当前系统语言设置
 )
 
@@ -76,6 +80,7 @@ const (
 const (
 	RunModeLive     = "live"
 	RunModeBackTest = "backtest"
+	RunModeData     = "data"
 	RunModeOther    = "other"
 )
 

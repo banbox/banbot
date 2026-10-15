@@ -13,7 +13,8 @@ import (
 )
 
 func TestBroadcastWSConcurrentWrites(t *testing.T) {
-	serverClient, browserClient := newTestWsClient(t)
+	server := newDevServer(DevDeps{})
+	serverClient, browserClient := newTestWsClient(t, server)
 	if tcpConn, ok := serverClient.Conn.UnderlyingConn().(*net.TCPConn); ok {
 		if err := tcpConn.SetWriteBuffer(1024); err != nil {
 			t.Fatal(err)
@@ -31,7 +32,7 @@ func TestBroadcastWSConcurrentWrites(t *testing.T) {
 			defer writers.Done()
 			defer func() { panics <- recover() }()
 			<-start
-			BroadcastWS("", map[string]interface{}{
+			server.BroadcastWS("", map[string]interface{}{
 				"type":    "test",
 				"writer":  id,
 				"payload": payload,
@@ -66,7 +67,8 @@ func TestBroadcastWSConcurrentWrites(t *testing.T) {
 }
 
 func TestWsClientCloseDoesNotWaitForBroadcast(t *testing.T) {
-	serverClient, browserClient := newTestWsClient(t)
+	server := newDevServer(DevDeps{})
+	serverClient, browserClient := newTestWsClient(t, server)
 	if tcpConn, ok := serverClient.Conn.UnderlyingConn().(*net.TCPConn); ok {
 		if err := tcpConn.SetWriteBuffer(1024); err != nil {
 			t.Fatal(err)
@@ -76,7 +78,7 @@ func TestWsClientCloseDoesNotWaitForBroadcast(t *testing.T) {
 	broadcastDone := make(chan any, 1)
 	go func() {
 		defer func() { broadcastDone <- recover() }()
-		BroadcastWS("", map[string]interface{}{
+		server.BroadcastWS("", map[string]interface{}{
 			"type":    "test",
 			"payload": strings.Repeat("x", 8<<20),
 		})
@@ -105,26 +107,99 @@ func TestWsClientCloseDoesNotWaitForBroadcast(t *testing.T) {
 		t.Fatal("broadcast did not stop after the peer closed")
 	}
 
-	wsLock.RLock()
-	_, exists := clients[serverClient]
-	wsLock.RUnlock()
+	server.wsMu.RLock()
+	_, exists := server.clients[serverClient]
+	server.wsMu.RUnlock()
 	if exists {
 		t.Fatal("closed websocket remains registered")
 	}
 }
 
-func newTestWsClient(t *testing.T) (*WsClient, *websocket.Conn) {
+func TestDevServersIsolateStatusClientsAndStop(t *testing.T) {
+	first := newDevServer(DevDeps{})
+	second := newDevServer(DevDeps{})
+	firstClient, firstBrowser := newTestWsClient(t, first)
+	_, secondBrowser := newTestWsClient(t, second)
+
+	first.SetStatus(ServerStatus{DirtyBin: true})
+	first.BroadcastStatus()
+	if _, payload, err := firstBrowser.ReadMessage(); err != nil || !strings.Contains(string(payload), `"dirtyBin":true`) {
+		t.Fatalf("first server did not receive its status: %v %s", err, payload)
+	}
+	if got := second.Status(); got != (ServerStatus{}) {
+		t.Fatalf("second server inherited first server status: %+v", got)
+	}
+
+	first.Stop()
+	deadline := time.Now().Add(time.Second)
+	for !firstClient.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !firstClient.closed.Load() {
+		t.Fatal("stopping first server did not close its client")
+	}
+	second.BroadcastWS("", map[string]interface{}{"type": "second"})
+	if _, payload, err := secondBrowser.ReadMessage(); err != nil || !strings.Contains(string(payload), `"second"`) {
+		t.Fatalf("second server stopped with first: %v %s", err, payload)
+	}
+}
+
+func TestDevServerStopJoinsWebSocketHandler(t *testing.T) {
+	server := newDevServer(DevDeps{})
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Get("/ws", devws.New(server.onWsDev))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- app.Listener(listener) }()
+	browser, _, err := websocket.DefaultDialer.Dial("ws://"+listener.Addr().String()+"/ws", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = browser.Close()
+		_ = app.Shutdown()
+		<-serverDone
+	})
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.wsMu.RLock()
+		connected := len(server.clients) == 1
+		server.wsMu.RUnlock()
+		if connected {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("websocket handler was not admitted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	server.Stop()
+	joined := make(chan struct{})
+	go func() {
+		server.Join()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("Join did not wait for the websocket handler to exit")
+	}
+}
+
+func newTestWsClient(t *testing.T, server *DevServer) (*WsClient, *websocket.Conn) {
 	t.Helper()
-	wsLock.Lock()
-	clients = make(map[*WsClient]bool)
-	wsLock.Unlock()
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	connected := make(chan *WsClient, 1)
-	handlerDone := make(chan struct{})
 	app.Get("/ws", devws.New(func(conn *devws.Conn) {
-		connected <- NewWsClient(conn)
-		<-handlerDone
+		client := server.NewWsClient(conn)
+		connected <- client
+		client.HandleForever()
 	}))
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -141,12 +216,8 @@ func newTestWsClient(t *testing.T) (*WsClient, *websocket.Conn) {
 	t.Cleanup(func() {
 		serverClient.Close()
 		_ = browserClient.Close()
-		close(handlerDone)
 		_ = app.Shutdown()
 		<-serverDone
-		wsLock.Lock()
-		clients = make(map[*WsClient]bool)
-		wsLock.Unlock()
 	})
 	return serverClient, browserClient
 }

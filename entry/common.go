@@ -2,11 +2,10 @@ package entry
 
 import (
 	"fmt"
+	"sync"
 
-	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/data"
-	"github.com/banbox/banbot/live"
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/web"
@@ -26,19 +25,25 @@ type commandGroup struct {
 type registeredCommand struct {
 	parent  string
 	command *cobra.Command
+	factory CommandFactory
 }
+
+// CommandFactory constructs a fresh Cobra command for one root tree.
+type CommandFactory func() *cobra.Command
 
 var (
 	commandGroups = []commandGroup{
-		{name: "data", help: "export and import data"},
+		{name: "data", help: "export, import and archive data"},
 		{name: "kline", help: "manage kline data"},
 		{name: "series", help: "manage custom series data"},
 		{name: "tick", help: "manage tick data"},
 		{name: "tool", help: "run maintenance and analysis tools"},
 		{name: "live", help: "manage live orders"},
 	}
-	extraGroups   []commandGroup
-	extraCommands []registeredCommand
+	extraGroups       []commandGroup
+	extraCommands     []registeredCommand
+	commandRegistryMu sync.RWMutex
+	rootCommandMu     sync.Mutex
 )
 
 // AddGroup registers a Cobra command group for applications embedding banbot.
@@ -46,25 +51,55 @@ func AddGroup(name, help string) {
 	if name == "" {
 		panic("command group name must not be empty")
 	}
-	if hasGroup(name) {
+	commandRegistryMu.Lock()
+	defer commandRegistryMu.Unlock()
+	if hasGroupLocked(name) {
 		return
 	}
 	extraGroups = append(extraGroups, commandGroup{name: name, help: help})
 }
 
-// AddCommand registers a Cobra command. Command-specific flags should be local
-// variables captured by RunE, so extending the CLI does not require CmdArgs changes.
+// AddCommand registers a Cobra command in the process-wide command registry.
+// Command-specific flags should be local variables captured by RunE, so
+// extending the CLI does not require CmdArgs changes.
 func AddCommand(parent string, command *cobra.Command) {
+	registerCommand(parent, command)
+}
+
+// AddCommandFactory registers an extension that can be materialized safely in
+// multiple root trees. Prefer it when an embedding process builds more than
+// one root or builds roots concurrently.
+func AddCommandFactory(parent string, factory CommandFactory) {
+	if factory == nil {
+		panic("command factory must not be nil")
+	}
+	commandRegistryMu.Lock()
+	defer commandRegistryMu.Unlock()
+	if parent != "" && !hasGroupLocked(parent) {
+		panic(fmt.Sprintf("no command group found: %s", parent))
+	}
+	extraCommands = append(extraCommands, registeredCommand{parent: parent, factory: factory})
+}
+
+func registerCommand(parent string, command *cobra.Command) {
 	if command == nil {
 		panic("command must not be nil")
 	}
-	if parent != "" && !hasGroup(parent) {
+	commandRegistryMu.Lock()
+	defer commandRegistryMu.Unlock()
+	if parent != "" && !hasGroupLocked(parent) {
 		panic(fmt.Sprintf("no command group found: %s", parent))
 	}
 	extraCommands = append(extraCommands, registeredCommand{parent: parent, command: command})
 }
 
 func hasGroup(name string) bool {
+	commandRegistryMu.RLock()
+	defer commandRegistryMu.RUnlock()
+	return hasGroupLocked(name)
+}
+
+func hasGroupLocked(name string) bool {
 	for _, group := range commandGroups {
 		if group.name == name {
 			return true
@@ -78,6 +113,12 @@ func hasGroup(name string) bool {
 	return false
 }
 
+func commandRegistrySnapshot() ([]commandGroup, []registeredCommand) {
+	commandRegistryMu.RLock()
+	defer commandRegistryMu.RUnlock()
+	return append([]commandGroup(nil), extraGroups...), append([]registeredCommand(nil), extraCommands...)
+}
+
 func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Command) {
 	add := func(parent string, command *cobra.Command) {
 		if parent == "" {
@@ -87,69 +128,75 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 		groups[parent].AddCommand(command)
 	}
 
-	add("", newConfigCommand("trade", "live trade", RunTrade, false,
-		bindStakeAmount, bindPairs, bindSpider, bindOut))
-	add("", newConfigCommand("backtest", "backtest with strategies and data", RunBackTest, true,
-		bindOut, bindTimeRange, bindTimeStart, bindTimeEnd, bindStakeAmount, bindPairs, bindProgress, bindSeparate))
-	add("", newConfigCommand("spider", "start the spider", RunSpider, false))
-	add("", newConfigCommand("optimize", "run hyperparameter optimization", opt.RunOptimize, true,
-		bindOut, bindOptRounds, bindSampler, bindPicker, bindEachPairs, bindConcur))
-	add("", newConfigCommand("init", "initialize config.yml/config.local.yml in the data directory", runInit, true))
-	add("", withAliases(newConfigCommand("bt-opt", "run rolling backtests with hyperparameter optimization", opt.RunBTOverOpt, true,
+	add("", newStrategyTradeCommand())
+	add("", newInternalCommand())
+	add("", newStrategyBacktestCommand(nil))
+	add("", newResearchCommand())
+	addExpressionCommands(root)
+	add("", newRuntimeConfigCommand("spider", "start the spider", runSpider, false))
+	add("", newRuntimeConfigCommand("optimize", "run hyperparameter optimization", func(args *config.CmdArgs) *errs.Error { return runExplicitOptimization(args, opt.RunOptimize) }, true,
+		bindOut, bindOptRounds, bindSampler, bindPicker, bindEachPairs, bindConcur, bindBTStrict))
+	add("", newRuntimeConfigCommand("init", "initialize config.yml/config.local.yml in the data directory", runInit, true))
+	add("", withAliases(newRuntimeConfigCommand("bt-opt", "run rolling backtests with hyperparameter optimization", func(args *config.CmdArgs) *errs.Error { return runExplicitOptimization(args, opt.RunBTOverOpt) }, true,
 		bindReviewPeriod, bindRunPeriod, bindOptRounds, bindSampler, bindPicker, bindEachPairs,
-		bindConcur, bindAlpha, bindPairPicker), "bt_opt"))
-	add("", web.NewCommand())
+		bindConcur, bindAlpha, bindPairPicker, bindBTStrict), "bt_opt"))
+	add("", web.NewDevCommandWithFactory(newDevWebServer))
 
-	add("data", newConfigCommand("export", "export data from the database to protobuf files", runDataExport, true,
+	add("data", newRuntimeConfigCommand("export", "export data from the database to protobuf files", runDataExport, true,
 		bindOut, bindConcur))
-	add("data", newConfigCommand("import", "import protobuf files into the database", runDataImport, true,
+	add("data", newRuntimeConfigCommand("import", "import protobuf files into the database", runDataImport, true,
 		bindIn, bindConcur))
+	add("data", newFactorArchiveCommand())
 
-	add("kline", newConfigCommand("down", "download kline data from an exchange", RunDownData, true,
+	add("kline", newRuntimeConfigCommand("down", "download kline data from an exchange", RunDownData, true,
 		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindTimeFrames, bindMedium))
-	add("kline", newConfigCommand("load", "load kline data from zip or CSV files", LoadKLinesToDB, true, bindIn))
-	add("kline", newConfigCommand("agg", "aggregate kline data into larger timeframes", AggKlineBigs, true,
+	add("kline", newRuntimeConfigCommand("repair-ranges", "rebuild kline range metadata from stored bars", RunRepairKlineRanges, true,
+		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindTimeFrames))
+	add("kline", newRuntimeConfigCommand("load", "load kline data from zip or CSV files", LoadKLinesToDB, true, bindIn))
+	add("kline", newRuntimeConfigCommand("agg", "aggregate kline data into larger timeframes", AggKlineBigs, true,
 		bindPairs, bindTimeFrames))
-	add("kline", newConfigCommand("export", "export kline data from the database to CSV files", runExportData, true,
+	add("kline", newRuntimeConfigCommand("export", "export kline data from the database to CSV files", runExportData, true,
 		bindOut, bindPairs, bindTimeFrames, bindAdjustment, bindTimeZone))
-	add("kline", newConfigCommand("purge", "delete matching kline data", runPurgeData, true,
+	add("kline", newRuntimeConfigCommand("purge", "delete matching kline data", runPurgeData, true,
 		bindRealExchange, bindPairs, bindTimeFrames))
-	add("kline", newConfigCommand("correct", "synchronize klines between timeframes", RunKlineCorrect, true, bindPairs))
-	add("kline", newConfigCommand("verify", "verify kline data against series-range metadata", RunVerifyData, true,
+	add("kline", newRuntimeConfigCommand("correct", "synchronize klines between timeframes", runKlineCorrect, true, bindPairs))
+	add("kline", newRuntimeConfigCommand("verify", "verify kline data against series-range metadata", RunVerifyData, true,
 		bindPairs, bindTables, bindBatchSize))
-	add("kline", withAliases(newConfigCommand("adj-calc", "recalculate adjustment factors", RunKlineAdjFactors, true,
+	add("kline", withAliases(newRuntimeConfigCommand("adj-calc", "recalculate adjustment factors", runKlineAdjFactors, true,
 		bindOut, bindPairs), "adj_calc"))
-	add("kline", withAliases(newConfigCommand("adj-export", "export adjustment factors to CSV", biz.ExportAdjFactors, true,
+	add("kline", withAliases(newRuntimeConfigCommand("adj-export", "export adjustment factors to CSV", runExportAdjFactors, true,
 		bindOut, bindPairs, bindTimeZone), "adj_export"))
 
-	add("series", newConfigCommand("down", "download registered custom series", RunSeriesDown, true,
+	add("series", newRuntimeConfigCommand("down", "download registered custom series", RunSeriesDown, true,
 		bindTimeRange, bindTimeStart, bindTimeEnd, bindPairs, bindSeriesSources))
 	add("series", newSeriesListCommand())
 
-	add("tick", newConfigCommand("convert", "convert tick data formats", data.RunFormatTick, true, bindIn, bindOut))
-	add("tick", withAliases(newConfigCommand("to-kline", "build klines from tick data", data.Build1mWithTicks, true, bindIn, bindOut), "to_kline"))
+	add("tick", newRuntimeConfigCommand("convert", "convert tick data formats", data.RunFormatTick, true, bindIn, bindOut))
+	add("tick", withAliases(newRuntimeConfigCommand("to-kline", "build klines from tick data", data.Build1mWithTicks, true, bindIn, bindOut), "to_kline"))
 
-	add("tool", withAliases(newConfigCommand("collect-opt", "collect and rank optimization results", opt.CollectOptLog, true,
+	add("tool", withAliases(newRuntimeConfigCommand("collect-opt", "collect and rank optimization results", func(args *config.CmdArgs) *errs.Error { return runExplicitOptimization(args, opt.CollectOptLog) }, true,
 		bindIn, bindPicker), "collect_opt"))
-	add("tool", withAliases(newConfigCommand("sim-bt", "run a backtest simulation from a report", opt.RunSimBT, true, bindIn), "sim_bt"))
-	add("tool", withAliases(newConfigCommand("test-pickers", "test pickers in rolling backtests", opt.RunRollBTPicker, true,
-		bindReviewPeriod, bindRunPeriod, bindOptRounds, bindSampler, bindEachPairs, bindConcur, bindPicker, bindPairPicker), "test_pickers"))
-	add("tool", withAliases(newConfigCommand("load-cal", "load calendars", biz.LoadCalendars, true, bindIn), "load_cal"))
-	add("tool", withAliases(newConfigCommand("data-server", "serve a gRPC data feeder", biz.RunDataServer, true), "data_server"))
-	add("tool", withAliases(newConfigCommand("calc-perfs", "calculate Sharpe and Sortino ratios for input data", data.CalcFilePerfs, true,
+	add("tool", withAliases(newRuntimeConfigCommand("sim-bt", "run a backtest simulation from a report", runExplicitSimulation, true,
+		bindIn, bindBTStrict), "sim_bt"))
+	add("tool", withAliases(newRuntimeConfigCommand("test-pickers", "test pickers in rolling backtests", func(args *config.CmdArgs) *errs.Error { return runExplicitOptimization(args, opt.RunRollBTPicker) }, true,
+		bindReviewPeriod, bindRunPeriod, bindOptRounds, bindSampler, bindEachPairs, bindConcur, bindPicker, bindPairPicker,
+		bindBTStrict), "test_pickers"))
+	add("tool", withAliases(newRuntimeConfigCommand("load-cal", "load calendars", runExplicitLoadCalendars, true, bindIn), "load_cal"))
+	add("tool", withAliases(newRuntimeConfigCommand("data-server", "serve a gRPC data feeder", runExplicitDataServer, true), "data_server"))
+	add("tool", withAliases(newRuntimeConfigCommand("calc-perfs", "calculate Sharpe, Sortino, Ulcer Index and UPI for input data", data.CalcFilePerfs, true,
 		bindIn, bindInType, bindOut), "calc_perfs"))
-	add("tool", newConfigCommand("corr", "calculate a symbol correlation matrix", biz.CalcCorrelation, true,
+	add("tool", newRuntimeConfigCommand("corr", "calculate a symbol correlation matrix", runExplicitCorrelation, true,
 		bindOut, bindOutType, bindTimeFrames, bindBatchSize, bindRunEvery))
 	add("tool", newMergeAssetsCommand())
-	add("tool", opt.NewCompareExgBTOrdersCommand())
+	add("tool", NewRuntimeCompareExgBTOrdersCommand())
 	add("tool", strat.NewListStratsCommand())
-	add("tool", opt.NewBtFactorsCommand())
-	add("tool", withAliases(newConfigCommand("bt-result", "build a backtest result from orders.gob and config", opt.BuildBtResult, true,
-		bindIn, bindOut), "bt_result"))
-	add("tool", withAliases(newPositionalCommand("test-live-bars", "compare live-trade klines with local data", "DUMP_FILE", biz.TestKLineConsistency), "test_live_bars"))
+	add("tool", opt.NewBtFactorsCommandWithRun(runExplicitFactors))
+	add("tool", withAliases(newRuntimeConfigCommand("bt-result", "build a backtest result from orders.gob and config", runExplicitReport, true,
+		bindIn, bindOut, bindBTStrict), "bt_result"))
+	add("tool", NewRuntimeKlineConsistencyCommand())
 
-	add("live", biz.NewDownExgOrdersCommand())
-	add("live", live.NewTradeCloseCommand())
+	add("live", NewRuntimeDownExgOrdersCommand())
+	add("live", NewRuntimeTradeCloseCommand())
 }
 
 func withAliases(command *cobra.Command, aliases ...string) *cobra.Command {
@@ -157,13 +204,23 @@ func withAliases(command *cobra.Command, aliases ...string) *cobra.Command {
 	return command
 }
 
-func registerExtraCommands(root *cobra.Command, groups map[string]*cobra.Command) {
-	for _, item := range extraCommands {
+func registerExtraCommands(root *cobra.Command, groups map[string]*cobra.Command, commands []registeredCommand) {
+	for _, item := range commands {
+		command := item.command
+		if item.factory != nil {
+			command = item.factory()
+		}
+		if command == nil {
+			panic("command factory returned nil")
+		}
+		if command.Parent() != nil {
+			panic(fmt.Sprintf("command %q is already attached; use AddCommandFactory when building multiple roots", command.Name()))
+		}
 		if item.parent == "" {
-			root.AddCommand(item.command)
+			root.AddCommand(command)
 			continue
 		}
-		groups[item.parent].AddCommand(item.command)
+		groups[item.parent].AddCommand(command)
 	}
 }
 
@@ -285,4 +342,8 @@ func bindRunEvery(args *config.CmdArgs, flags *pflag.FlagSet) {
 
 func bindSeparate(args *config.CmdArgs, flags *pflag.FlagSet) {
 	flags.BoolVar(&args.Separate, "separate", false, "backtest each policy separately")
+}
+
+func bindBTStrict(args *config.CmdArgs, flags *pflag.FlagSet) {
+	flags.BoolVar(&args.BTStrict, "bt-strict", false, "enable strict backtest mode")
 }

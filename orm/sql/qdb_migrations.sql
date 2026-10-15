@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS kline_un_q (
   sid        INT,
   timeframe  SYMBOL,
   ts         TIMESTAMP,
+  bar_ts     TIMESTAMP,
   stop_ms    LONG,
   expire_ms  LONG,
   open       DOUBLE,
@@ -149,3 +150,8 @@ DEDUP UPSERT KEYS(sid, timeframe, ts);
 
 -- version 4
 ALTER TABLE exsymbol_q ADD COLUMN agg_rules STRING;
+
+-- version 5
+-- Old rows keep NULL bar_ts and readers fall back to the original ts.
+-- New rows use ts exclusively for append-only metadata versions.
+ALTER TABLE kline_un_q ADD COLUMN bar_ts TIMESTAMP;

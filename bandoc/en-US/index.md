@@ -11,6 +11,10 @@ hero:
       text: Document
       link: /en-US/guide/start
 
+    - theme: alt
+      text: Multi-factor strategies
+      link: /en-US/guide/factor
+
 features:
   - title: High Performance
     details: Use an indicator library that supports state caching, 1 second backtesting 1 year of data

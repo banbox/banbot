@@ -1,6 +1,11 @@
 package strat
 
 import (
+	"sync"
+	"sync/atomic"
+
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
@@ -25,8 +30,8 @@ type TradeStrat struct {
 	WsSubs          map[string]string
 	DrawDownExit    bool
 	HedgeOff        bool    // turn off future hedge mode 关闭合约双向持仓
-	BatchInOut      bool    // Whether to batch execute entry/exit 是否批量执行入场/出场
-	BatchInfo       bool    // whether to perform batch processing after OninfoBar 是否对OnInfoBar后执行批量处理
+	BatchInOut      bool    // Whether to batch execute entry/exit after the main OnData/OnBar 是否在主周期OnData/OnBar后批量执行入场/出场
+	BatchInfo       bool    // Whether to batch process after auxiliary OnData/OnInfoBar 是否在辅助周期OnData/OnInfoBar后执行批量处理
 	StakeRate       float64 // Relative basic amount billing rate 相对基础金额开单倍率
 	StopLoss        float64 // Default stoploss without leverage 此策略默认止损比率，不带杠杆
 	StopEnterBars   int
@@ -39,6 +44,17 @@ type TradeStrat struct {
 	Outputs         []string    // The content of the text file output by the strategy, where each string is one line 策略输出的文本文件内容，每个字符串是一行
 	Policy          *config.RunPolicyConfig
 
+	// Explicit runtimes bind these concrete dependencies once while loading a
+	// strategy. Legacy strategies leave them nil and keep the compatibility
+	// facade behavior.
+	runtimeConfig     *config.Config
+	runtimeAccounts   map[string]*config.AccountConfig
+	runtimeAccountsMu *sync.RWMutex
+	runtimeCore       *core.State
+	runtimeClock      *btime.ClockState
+	runtimeExplicit   bool
+	outputState       *tradeStratOutputState
+
 	OnPairInfos         func(s *StratJob) []*PairSub
 	OnDataSubs          func(s *StratJob) []*DataSub
 	OnSymbols           func(items []string) []string // return modified pairs
@@ -50,8 +66,8 @@ type TradeStrat struct {
 	OnWsDepth           func(s *StratJob, dep *banexg.OrderBook)               // Websocket order book websocket推送深度信息
 	OnWsKline           func(s *StratJob, pair string, k *banexg.Kline)        // websocket real-time kline(may unfinish) Websocket推送的实时K线
 	OnWsData            func(s *StratJob, evt *orm.DataSeries)
-	OnBatchJobs         func(jobs []*StratJob)                              // All target jobs at the current time, used for bulk opening/closing of orders 当前时间所有标的job，用于批量开单/平仓
-	OnBatchInfos        func(tf string, jobs map[string]*JobEnv)            // All info marked jobs at the current time, used for batch processing 当前时间所有info标的job，用于批量处理
+	OnBatchJobs         func(jobs []*StratJob)                              // Main-timeframe jobs after OnData(RoleMain)/OnBar, used for bulk opening/closing 主周期OnData(RoleMain)/OnBar后的job，用于批量开单/平仓
+	OnBatchInfos        func(tf string, jobs map[string]*JobEnv)            // Auxiliary-timeframe jobs after OnData(RoleInfo)/OnInfoBar 辅助周期OnData(RoleInfo)/OnInfoBar后的job，用于批量处理
 	OnCheckExit         func(s *StratJob, od *ormo.InOutOrder) *ExitReq     // Custom order exit logic 自定义订单退出逻辑
 	OnOrderChange       func(s *StratJob, od *ormo.InOutOrder, chgType int) // Order update callback 订单更新回调
 	GetDrawDownExitRate CalcDDExitRate                                      // Calculate the ratio of tracking profit taking, drawdown, and exit 计算跟踪止盈回撤退出的比率
@@ -62,11 +78,12 @@ type TradeStrat struct {
 }
 
 const (
-	OdChgNew       = iota // New order 新订单
-	OdChgEnter            // Create an entry order 创建入场订单
-	OdChgEnterFill        // Order entry completed 订单入场完成
-	OdChgExit             // Order request to exit  订单请求退出
-	OdChgExitFill         // Order exit completed 订单退出完成
+	OdChgNew          = iota // New order 新订单
+	OdChgEnter               // Create an entry order 创建入场订单
+	OdChgEnterFill           // Order entry completed 订单入场完成
+	OdChgExit                // Order request to exit  订单请求退出
+	OdChgExitFill            // Order exit completed 订单退出完成
+	OdChgOrderChanged        // A real order was acknowledged, changed, or canceled; no synthetic fill.
 )
 
 type JobEnv struct {
@@ -92,14 +109,7 @@ type PairSub struct {
 	WarmupNum int
 }
 
-type DataSub struct {
-	Source       string
-	ExSymbol     *orm.ExSymbol
-	TimeFrame    string
-	WarmupNum    int
-	Fields       []string // fields fetched from the data source
-	SeriesFields []string // fields maintained as banta.Series; float fields by default
-}
+type DataSub = orm.Subscription
 
 type StratJob struct {
 	Strat         *TradeStrat
@@ -129,6 +139,55 @@ type StratJob struct {
 	ShortTPPrice  float64           // Default short take profit price when opening a position 开仓时默认做空止盈价格
 	IsWarmUp      bool              // whether in a preheating state 当前是否处于预热状态
 	More          interface{}       // Additional information for policy customization 策略自定义的额外信息
+
+	symbols            *orm.SymbolState
+	strategyState      *State
+	runtimeCore        *core.State
+	runtimePrices      *com.PriceState
+	runtimeClock       *btime.ClockState
+	inspectEffect      func(string)
+	dataHubConfigured  bool
+	pairRemovalPending bool
+	executionStateMu   atomic.Pointer[executionStateMu]
+}
+
+// BindRuntimeMarket attaches the explicit market clock to a job. Strategy
+// callbacks keep using direct receiver fields, while typed runtimes avoid the
+// legacy package price/time facades.
+func (s *StratJob) BindRuntimeMarket(prices *com.PriceState, clock *btime.ClockState) {
+	if s == nil {
+		return
+	}
+	s.runtimePrices = prices
+	s.runtimeClock = clock
+}
+
+// BindRuntimeState attaches the explicit state used by strategy callbacks.
+func (s *StratJob) BindRuntimeState(state *State, coreState *core.State, clock *btime.ClockState) {
+	if s == nil {
+		return
+	}
+	s.strategyState = state
+	s.runtimeCore = coreState
+	s.runtimeClock = clock
+}
+
+// OpenOrdersSnapshot returns this job account's runtime-owned order view.
+func (s *StratJob) OpenOrdersSnapshot() ([]*ormo.InOutOrder, bool) {
+	if s == nil || s.strategyState == nil {
+		return nil, false
+	}
+	return s.strategyState.OpenOrdersSnapshot(s.Account)
+}
+
+// NewInspectionJob creates the inert job state passed to startup-time
+// callbacks while keeping the effect hook outside strategy-facing fields.
+func NewInspectionJob(strategy *TradeStrat, env *ta.BarEnv, symbol *orm.ExSymbol, tf, account string, effect func(string)) *StratJob {
+	return &StratJob{
+		Strat: strategy, Env: env, DataHub: NewDataHub(), Symbol: symbol, TimeFrame: tf, Account: account,
+		TPMaxs: make(map[int64]float64), CloseLong: true, CloseShort: true,
+		ExgStopLoss: true, ExgTakeProfit: true, inspectEffect: effect,
+	}
 }
 
 /*
@@ -136,6 +195,7 @@ EnterReq
 打开一个订单。默认开多。如需开空short=False
 */
 type EnterReq struct {
+	CommandID       string  // Stable request identity; callback actions derive it from their source event.
 	Tag             string  // Entry signal 入场信号
 	StratName       string  // Strategy Name 策略名称
 	Short           bool    // Whether to short sell or not 是否做空
@@ -169,6 +229,7 @@ ExitReq
 请求平仓
 */
 type ExitReq struct {
+	CommandID  string  // Same ID and payload replay without submitting a second action.
 	Tag        string  // Exit signal 退出信号
 	StratName  string  // Strategy Name 策略名称
 	EnterTag   string  // Only exit orders with EnterTag as the entry signal 只退出入场信号为EnterTag的订单

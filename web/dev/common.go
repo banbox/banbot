@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/banbox/banbot/com"
-	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
 
 	"github.com/banbox/banbot/orm/ormo"
@@ -50,23 +49,11 @@ func validateWebAuth(host, password string) error {
 
 var (
 	btInfoKeyList = []string{"maxOpenOrders", "showDrawDownPct", "barNum", "maxDrawDownVal", "showDrawDownVal", "totalInvest",
-		"totProfit", "totCost", "totFee", "totProfitPct", "sortinoRatio"}
-	btInfoKeys      = make(map[string]bool)
-	maxBtTasks      = 3 // 最大并发回测任务数
-	runBtTasks      = make(map[int64]*exec.Cmd)
-	runBtTasksMutex deadlock.Mutex
+		"totProfit", "totCost", "totFee", "totProfitPct", "sortinoRatio",
+		"ulcerIndex", "ulcerPerformanceIndex", "ulcerSource"}
+	btInfoKeys = make(map[string]bool)
+	maxBtTasks = 3 // 最大并发回测任务数
 
-	// 缓存回测任务订单到内存，加速分页查看。
-	cacheOrders []*ormo.InOutOrder
-	cachePath   string
-	ordersLock  deadlock.Mutex
-
-	// 任务状态更新缓存，避免频繁写入数据库
-	taskStatusCache      = make(map[int64]*taskStatusInfo)
-	taskStatusCacheMutex deadlock.Mutex
-
-	// 任务通知channel，用于通知调度器有新任务
-	taskNotifyChan = make(chan *ormu.Task, 100)
 )
 
 type taskStatusInfo struct {
@@ -81,27 +68,28 @@ func init() {
 	}
 }
 
-func getGobOrders(path string) ([]*ormo.InOutOrder, *deadlock.Mutex, *errs.Error) {
-	ordersLock.Lock()
-	defer ordersLock.Unlock()
-	if cachePath == path {
-		return cacheOrders, &ordersLock, nil
+func (s *DevServer) getGobOrders(path string) ([]*ormo.InOutOrder, *errs.Error) {
+	s.ordersMu.Lock()
+	defer s.ordersMu.Unlock()
+	if s.cachePath == path {
+		return append([]*ormo.InOutOrder(nil), s.cacheOrders...), nil
 	}
 	orders, err := ormo.LoadOrdersGob(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	cacheOrders = orders
-	cachePath = path
-	return cacheOrders, &ordersLock, nil
+	s.cacheOrders = orders
+	s.cachePath = path
+	return append([]*ormo.InOutOrder(nil), s.cacheOrders...), nil
 }
 
 // 执行单个回测任务
-func executeBtTask(task *ormu.Task) {
+func (s *DevServer) executeBtTask(task *ormu.Task) {
 	defer func() {
-		runBtTasksMutex.Lock()
-		delete(runBtTasks, task.ID)
-		runBtTasksMutex.Unlock()
+		s.taskMu.Lock()
+		delete(s.runningBtTasks, task.ID)
+		s.taskMu.Unlock()
+		s.wg.Done()
 	}()
 
 	// 获取当前执行文件路径
@@ -113,36 +101,36 @@ func executeBtTask(task *ormu.Task) {
 
 	// 构建命令
 	cmdArgsStr := "backtest " + task.Args
-	cmd := exec.Command(exePath, strings.Split(cmdArgsStr, " ")...)
-	cmd.Env = append(os.Environ(), "BanDataDir="+config.GetDataDir())
-	cmd.Env = append(cmd.Env, "BanStratDir="+config.GetStratDir())
+	cmd := exec.CommandContext(s.ctx, exePath, strings.Split(cmdArgsStr, " ")...)
+	cmd.Env = append(os.Environ(), "BanDataDir="+s.DataDir())
+	cmd.Env = append(cmd.Env, "BanStratDir="+s.StrategyDir())
 
 	// 添加到运行列表
-	runBtTasksMutex.Lock()
-	runBtTasks[task.ID] = cmd
-	runBtTasksMutex.Unlock()
+	s.taskMu.Lock()
+	s.runningBtTasks[task.ID] = cmd
+	s.taskMu.Unlock()
 
-	if err := updateTaskStatus(task.ID, int64(ormu.BtStatusRunning), 0); err != nil {
+	if err := s.updateTaskStatus(task.ID, int64(ormu.BtStatusRunning), 0); err != nil {
 		return
 	}
 
-	err = runBtCommand(cmd, task)
+	err = s.runBtCommand(cmd, task)
 
 	// 收集并更新任务结果
-	updateBtTaskResult(task, err)
+	s.updateBtTaskResult(task, err)
 }
 
 // 更新任务状态，基于taskID进行缓存，每个task间隔5s才更新一次数据库
-func updateTaskStatus(taskID int64, status int64, progress float64) error {
-	taskStatusCacheMutex.Lock()
-	cached, exists := taskStatusCache[taskID]
+func (s *DevServer) updateTaskStatus(taskID int64, status int64, progress float64) error {
+	s.taskMu.Lock()
+	cached, exists := s.taskStatusCache[taskID]
 	now := time.Now()
 
 	// 检查是否需要更新数据库
 	needUpdate := false
 	if !exists {
 		needUpdate = true
-		taskStatusCache[taskID] = &taskStatusInfo{
+		s.taskStatusCache[taskID] = &taskStatusInfo{
 			status:       status,
 			progress:     progress,
 			lastUpdateAt: now,
@@ -157,14 +145,14 @@ func updateTaskStatus(taskID int64, status int64, progress float64) error {
 		cached.status = status
 		cached.progress = progress
 	}
-	taskStatusCacheMutex.Unlock()
+	s.taskMu.Unlock()
 
 	if !needUpdate {
 		return nil
 	}
 
 	// 获取数据库连接并更新
-	qu, conn, err := ormu.Conn()
+	qu, conn, err := s.Conn()
 	if err != nil {
 		log.Error("connect to db failed", zap.Error(err))
 		return err
@@ -183,7 +171,7 @@ func updateTaskStatus(taskID int64, status int64, progress float64) error {
 }
 
 // 执行回测命令并处理输出
-func runBtCommand(cmd *exec.Cmd, task *ormu.Task) error {
+func (s *DevServer) runBtCommand(cmd *exec.Cmd, task *ormu.Task) error {
 	stdOut, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Error("get stdout failed", zap.Error(err))
@@ -206,6 +194,10 @@ func runBtCommand(cmd *exec.Cmd, task *ormu.Task) error {
 
 	// 处理输出
 	var b strings.Builder
+	// Stdout and stderr are consumed concurrently. strings.Builder is not
+	// safe for concurrent writes, so keep the critical section limited to the
+	// two append operations and leave scanning/progress handling parallel.
+	var outputMu sync.Mutex
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -217,12 +209,14 @@ func runBtCommand(cmd *exec.Cmd, task *ormu.Task) error {
 		for scanner.Scan() {
 			line := scanner.Text()
 			if strings.HasPrefix(line, prefix) {
-				if err := handleProgress(line[len(prefix):], task.ID); err != nil {
+				if err := s.handleProgress(line[len(prefix):], task.ID); err != nil {
 					log.Error("handle progress failed", zap.Error(err))
 				}
 			} else {
+				outputMu.Lock()
 				b.WriteString(line)
 				b.WriteString("\n")
+				outputMu.Unlock()
 			}
 		}
 		if err := scanner.Err(); err != nil {
@@ -235,8 +229,10 @@ func runBtCommand(cmd *exec.Cmd, task *ormu.Task) error {
 		defer wg.Done()
 		scanner := utils2.ReadScanner(stdErr)
 		for scanner.Scan() {
+			outputMu.Lock()
 			b.WriteString(scanner.Text())
 			b.WriteString("\n")
+			outputMu.Unlock()
 		}
 		if err := scanner.Err(); err != nil {
 			log.Error("stderr scanner error", zap.Error(err))
@@ -248,7 +244,7 @@ func runBtCommand(cmd *exec.Cmd, task *ormu.Task) error {
 
 	// 等待命令执行完成
 	err = cmd.Wait()
-	BroadcastWS("", map[string]interface{}{
+	s.BroadcastWS("", map[string]interface{}{
 		"type":     "btPrg",
 		"taskId":   task.ID,
 		"progress": 1,
@@ -264,30 +260,41 @@ func runBtCommand(cmd *exec.Cmd, task *ormu.Task) error {
 }
 
 // 处理进度更新
-func handleProgress(progressStr string, taskID int64) error {
+func (s *DevServer) handleProgress(progressStr string, taskID int64) error {
 	prgVal, err := strconv.ParseFloat(progressStr, 64)
 	if err != nil {
 		log.Warn("invalid progress", zap.String("progress", progressStr))
 		return err
 	}
-	BroadcastWS("", map[string]interface{}{
+	s.BroadcastWS("", map[string]interface{}{
 		"type":     "btPrg",
 		"taskId":   taskID,
 		"progress": prgVal,
 	})
-	return updateTaskStatus(taskID, int64(ormu.BtStatusRunning), prgVal)
+	return s.updateTaskStatus(taskID, int64(ormu.BtStatusRunning), prgVal)
 }
 
 // 更新回测任务结果
-func updateBtTaskResult(task *ormu.Task, errTask error) {
-	qu, conn, err2 := ormu.Conn()
+func (s *DevServer) updateBtTaskResult(task *ormu.Task, errTask error) {
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		log.Error("get dev conn fail", zap.Error(err2))
 		return
 	}
 	defer conn.Close()
-	btRoot := fmt.Sprintf("%s/backtest", config.GetDataDir())
-	taskRes, err := collectBtTask(btRoot, task.Path)
+	btRoot := s.BacktestDir()
+	taskRes, err := collectBtTaskResult(btRoot, task.Path)
+	if errTask != nil {
+		if updateErr := qu.UpdateTask(context.Background(), ormu.UpdateTaskParams{
+			Status:   int64(ormu.BtStatusFail),
+			Progress: 1,
+			Info:     errTask.Error(),
+			ID:       task.ID,
+		}); updateErr != nil {
+			log.Error("update failed backtest task status fail", zap.Error(updateErr))
+		}
+		return
+	}
 	if err != nil {
 		var errMsg string
 		if errTask != nil {
@@ -332,20 +339,32 @@ func updateBtTaskResult(task *ormu.Task, errTask error) {
 }
 
 // 启动后台任务处理
-func startBtTaskScheduler() {
+func (s *DevServer) startBtTaskScheduler() {
+	s.wg.Add(1)
 	go func() {
-		for task := range taskNotifyChan {
-			runBtTasksMutex.Lock()
-			runningCount := len(runBtTasks)
-			runBtTasksMutex.Unlock()
-
-			if runningCount >= maxBtTasks {
-				// 队列已满，将任务放回channel等待处理
-				go func(t *ormu.Task) {
-					time.Sleep(500 * time.Millisecond)
-					taskNotifyChan <- t
-				}(task)
-				continue
+		defer s.wg.Done()
+		for {
+			var task *ormu.Task
+			select {
+			case <-s.ctx.Done():
+				return
+			case task = <-s.notify:
+			}
+			for {
+				s.taskMu.Lock()
+				runningCount := len(s.runningBtTasks)
+				s.taskMu.Unlock()
+				if runningCount < maxBtTasks {
+					break
+				}
+				// Keep the retry inside the owned scheduler so Stop can cancel it.
+				timer := time.NewTimer(500 * time.Millisecond)
+				select {
+				case <-s.ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 			}
 
 			// 检查任务状态是否为待执行
@@ -353,25 +372,26 @@ func startBtTaskScheduler() {
 				continue
 			}
 
-			runBtTasksMutex.Lock()
-			_, exist := runBtTasks[task.ID]
+			s.taskMu.Lock()
+			_, exist := s.runningBtTasks[task.ID]
 			if !exist {
-				runBtTasks[task.ID] = nil
+				s.runningBtTasks[task.ID] = nil
 			}
-			runBtTasksMutex.Unlock()
+			s.taskMu.Unlock()
 
 			if exist {
 				continue
 			}
 
 			// 启动新的回测任务
-			go executeBtTask(task)
+			s.wg.Add(1)
+			go s.executeBtTask(task)
 		}
 	}()
 }
 
-func collectBtResults() error {
-	qu, conn, err2 := ormu.Conn()
+func (s *DevServer) collectBtResults() error {
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -389,7 +409,7 @@ func collectBtResults() error {
 	}
 
 	addNum, delNum := 0, 0
-	btRoot := fmt.Sprintf("%s/backtest", config.GetDataDir())
+	btRoot := s.BacktestDir()
 	err := utils2.EnsureDir(btRoot, 0755)
 	if err != nil {
 		return err
@@ -406,13 +426,26 @@ func collectBtResults() error {
 		if err != nil {
 			return err
 		}
+		relPath = filepath.ToSlash(relPath)
 		if _, ok := taskMap[relPath]; ok {
+			// A registered task owns its complete output subtree. Separate
+			// policy reports live below this directory and must never be
+			// re-discovered as independent tasks.
 			delete(taskMap, relPath)
-			return nil
+			return filepath.SkipDir
 		}
 
-		task, err := collectBtTask(btRoot, relPath)
+		separateDir, readErr := hasPolicyReportDirs(fullPath)
+		if readErr != nil {
+			return readErr
+		}
+		task, err := collectBtTaskResult(btRoot, relPath)
 		if err != nil || task == nil {
+			if err == nil && separateDir {
+				// Keep partial --separate output below the parent task. A
+				// policy report is not a standalone Web task.
+				return filepath.SkipDir
+			}
 			return err
 		}
 
@@ -435,6 +468,12 @@ func collectBtResults() error {
 			Info:        task.Info,
 		})
 		addNum += 1
+		// A discovered report owns its complete subtree. This is required for
+		// --separate runs, where policy_1/policy_2 are reports of the parent
+		// task rather than independent tasks.
+		if err == nil {
+			return filepath.SkipDir
+		}
 		return err
 	})
 	if err != nil {
@@ -455,10 +494,16 @@ func collectBtResults() error {
 }
 
 func collectBtTask(rootDir, relPath string) (*ormu.Task, error) {
-	btDir := filepath.Join(rootDir, relPath)
+	btDir, pathErr := resolveReportRoot(rootDir, relPath)
+	if pathErr != nil {
+		return nil, pathErr
+	}
 	fileInfo, err := os.Stat(filepath.Join(btDir, "assets.html"))
 	if os.IsNotExist(err) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	// 读取并解析 detail.json
@@ -521,8 +566,283 @@ func collectBtTask(rootDir, relPath string) (*ormu.Task, error) {
 	}, nil
 }
 
-func MergeConfig(inText string, skips ...string) (string, error) {
-	dataDir := config.GetDataDir()
+// resolveReportRoot resolves a persisted report path below rootDir. Report
+// discovery normally supplies paths produced by filepath.Walk, but callers
+// can also pass database values; reject traversal before touching the
+// filesystem so a malformed task cannot turn collection into an arbitrary
+// file read.
+func resolveReportRoot(rootDir, relPath string) (string, error) {
+	root, err := filepath.Abs(rootDir)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.FromSlash(strings.TrimSpace(relPath))
+	if !filepath.IsLocal(path) {
+		return "", fmt.Errorf("report path must be relative: %q", relPath)
+	}
+	resolved, err := filepath.Abs(filepath.Join(root, path))
+	if err != nil {
+		return "", err
+	}
+	if !pathWithin(resolved, root) || resolved == root {
+		return "", fmt.Errorf("report path escapes output root: %q", relPath)
+	}
+	return resolved, nil
+}
+
+// collectBtTaskResult reads either a regular report or a --separate report.
+// Separate backtests keep the task root as a metadata directory and put one
+// complete report in policy_1, policy_2, ... . We only publish the parent
+// task after every configured policy has produced a report; a partial run is
+// left for the scheduler to collect after the child process exits.
+func collectBtTaskResult(rootDir, relPath string) (*ormu.Task, error) {
+	if unified, err := collectUnifiedBtTask(rootDir, relPath); err != nil || unified != nil {
+		return unified, err
+	}
+	task, err := collectBtTask(rootDir, relPath)
+	if err != nil || task != nil {
+		return task, err
+	}
+	return collectSeparateBtTask(rootDir, relPath)
+}
+
+func collectSeparateBtTask(rootDir, relPath string) (*ormu.Task, error) {
+	btDir, pathErr := resolveReportRoot(rootDir, relPath)
+	if pathErr != nil {
+		return nil, pathErr
+	}
+	configPath := filepath.Join(btDir, "config.yml")
+	hasPolicyDir, err := hasPolicyReportDirs(btDir)
+	if err != nil {
+		return nil, err
+	}
+	if !hasPolicyDir {
+		return nil, nil
+	}
+	cfg, cfgErr := config.GetConfig(&config.CmdArgs{
+		Configs:   []string{configPath},
+		NoDefault: true,
+	}, false)
+	if cfgErr != nil || cfg == nil || len(cfg.RunPolicy) <= 1 {
+		return nil, cfgErr
+	}
+
+	// Require the expected contiguous policy directories. This avoids
+	// publishing a task while one policy is still running or when an old,
+	// unrelated directory happens to be present below the task root.
+	children := make([]*ormu.Task, 0, len(cfg.RunPolicy))
+	reportPaths := make([]string, 0, len(cfg.RunPolicy))
+	for i := range cfg.RunPolicy {
+		policyRel := filepath.Join(relPath, fmt.Sprintf("policy_%d", i+1))
+		child, childErr := collectBtTask(rootDir, policyRel)
+		if childErr != nil {
+			return nil, childErr
+		}
+		if child == nil {
+			return nil, nil
+		}
+		children = append(children, child)
+		reportPaths = append(reportPaths, filepath.ToSlash(policyRel))
+	}
+
+	createMS := int64(0)
+	if info, statErr := os.Stat(configPath); statErr == nil {
+		createMS = info.ModTime().UnixMilli()
+	}
+	if createMS == 0 {
+		createMS = children[0].CreateAt
+	}
+
+	// Metrics from independent policy runs do not have a mathematically
+	// correct parent aggregation (each report starts with its own wallet).
+	// Keep the order count and explicit child paths, while leaving the
+	// per-policy metrics in their own reports for consumers to inspect.
+	infoData := map[string]interface{}{
+		"separate":    true,
+		"reportPaths": reportPaths,
+		"policyCount": len(children),
+	}
+	infoText, marshalErr := utils.MarshalString(infoData)
+	if marshalErr != nil {
+		return nil, marshalErr
+	}
+	orderNum := int64(0)
+	for _, child := range children {
+		orderNum += child.OrderNum
+	}
+	return &ormu.Task{
+		Mode:     "backtest",
+		Path:     relPath,
+		Strats:   strings.Join(cfg.Strats(), ","),
+		Periods:  strings.Join(cfg.RunTimeFrames(), ","),
+		Pairs:    cfg.ShowPairs(),
+		CreateAt: createMS,
+		StartAt:  utils.AlignTfMSecs(cfg.TimeRange.StartMS, int64(utils.TFToSecs("1d")*1000)),
+		StopAt:   utils.AlignTfMSecs(cfg.TimeRange.EndMS, int64(utils.TFToSecs("1d")*1000)),
+		Status:   ormu.BtStatusDone,
+		Progress: 1,
+		OrderNum: orderNum,
+		Info:     infoText,
+	}, nil
+}
+
+func hasPolicyReportDirs(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "policy_") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// taskBaseDir resolves a task path below the configured backtest root. Task
+// paths are persisted by the server, but validating the boundary here keeps a
+// malformed row from turning the report APIs into arbitrary file readers.
+func (s *DevServer) taskBaseDir(task *ormu.Task) (string, error) {
+	if task == nil {
+		return "", fmt.Errorf("backtest task is required")
+	}
+	rawPath := strings.TrimSpace(task.Path)
+	if rawPath == "" {
+		return "", fmt.Errorf("backtest task path is empty")
+	}
+	path := filepath.FromSlash(rawPath)
+	if filepath.IsAbs(path) {
+		return "", fmt.Errorf("backtest task path must be relative: %q", task.Path)
+	}
+	root, err := filepath.Abs(s.BacktestDir())
+	if err != nil {
+		return "", err
+	}
+	base, err := filepath.Abs(filepath.Join(root, path))
+	if err != nil {
+		return "", err
+	}
+	if !pathWithin(base, root) || base == root {
+		return "", fmt.Errorf("backtest task path escapes output root: %q", task.Path)
+	}
+	return base, nil
+}
+
+func pathWithin(path, parent string) bool {
+	rel, err := filepath.Rel(parent, path)
+	if err != nil || rel == "." || rel == ".." {
+		return err == nil && rel == "."
+	}
+	return !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// taskReportDirs returns the report directories owned by a task. A regular
+// task has one directory. A completed --separate task records child reports in
+// Info.reportPaths; only paths below the task directory are accepted. The
+// order is stable so handlers consistently pick policy_1 as the summary view.
+func (s *DevServer) taskReportDirs(task *ormu.Task) ([]string, error) {
+	base, err := s.taskBaseDir(task)
+	if err != nil {
+		return nil, err
+	}
+	dirs := []string{base}
+	if strings.TrimSpace(task.Info) == "" {
+		return dirs, nil
+	}
+	var info struct {
+		Separate    bool     `json:"separate"`
+		Unified     bool     `json:"unified"`
+		ReportPaths []string `json:"reportPaths"`
+	}
+	if err := utils.Unmarshal([]byte(task.Info), &info, utils.JsonNumDefault); err != nil {
+		// Info predates separate reports for older tasks. Keep the regular path
+		// behavior when an unrelated legacy payload is malformed.
+		return dirs, nil
+	}
+	if (!info.Separate && !info.Unified) || len(info.ReportPaths) == 0 {
+		return dirs, nil
+	}
+	resolved := make([]string, 0, len(info.ReportPaths))
+	for _, rawPath := range info.ReportPaths {
+		relPath := filepath.FromSlash(strings.TrimSpace(rawPath))
+		if relPath == "" || filepath.IsAbs(relPath) {
+			return nil, fmt.Errorf("invalid separate report path: %q", rawPath)
+		}
+		root := s.BacktestDir()
+		rooted, err := filepath.Abs(filepath.Join(root, relPath))
+		if err != nil {
+			return nil, err
+		}
+		if !pathWithin(rooted, base) {
+			// Older callers may store paths relative to the task directory
+			// ("policy_1") instead of relative to the backtest root
+			// ("task/policy_1"). Accept that form only after the same boundary
+			// check; traversal remains rejected.
+			if hasParentPathComponent(relPath) {
+				return nil, fmt.Errorf("separate report path escapes task directory: %q", rawPath)
+			}
+			rooted, err = filepath.Abs(filepath.Join(base, relPath))
+			if err != nil || !pathWithin(rooted, base) {
+				return nil, fmt.Errorf("separate report path escapes task directory: %q", rawPath)
+			}
+		}
+		resolved = append(resolved, rooted)
+	}
+	if len(resolved) > 0 {
+		if info.Unified {
+			return append(resolved, base), nil
+		}
+		return resolved, nil
+	}
+	return dirs, nil
+}
+
+func firstReportDir(dirs []string, marker string) string {
+	if len(dirs) == 0 {
+		return ""
+	}
+	if marker == "" {
+		return dirs[0]
+	}
+	for _, dir := range dirs {
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return dir
+		}
+	}
+	return dirs[0]
+}
+
+func reportFilePath(reportDir, rawPath string) (string, error) {
+	relPath := filepath.FromSlash(strings.TrimSpace(rawPath))
+	if relPath == "" || filepath.IsAbs(relPath) {
+		return "", fmt.Errorf("report file path must be relative: %q", rawPath)
+	}
+	path, err := filepath.Abs(filepath.Join(reportDir, relPath))
+	if err != nil {
+		return "", err
+	}
+	if !pathWithin(path, reportDir) {
+		return "", fmt.Errorf("report file path escapes report directory: %q", rawPath)
+	}
+	return path, nil
+}
+
+func hasParentPathComponent(path string) bool {
+	for _, part := range strings.FieldsFunc(path, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *DevServer) MergeConfig(inText string, skips ...string) (string, error) {
+	dataDir := s.DataDir()
 	if dataDir == "" {
 		return "", errs.NewMsg(errs.CodeParamRequired, "-datadir is empty")
 	}
@@ -534,9 +854,7 @@ func MergeConfig(inText string, skips ...string) (string, error) {
 			paths = append(paths, path)
 		}
 	}
-	if config.Args != nil && len(config.Args.Configs) > 0 {
-		paths = append(paths, config.Args.Configs...)
-	}
+	paths = append(paths, s.configPaths...)
 	if inText != "" {
 		tmp, err := os.CreateTemp(os.TempDir(), "tmp_cfg")
 		if err != nil {

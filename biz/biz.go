@@ -4,12 +4,9 @@ import (
 	"context"
 	"embed"
 	_ "embed"
-	"fmt"
-	"maps"
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/banbox/banbot/com"
@@ -26,7 +23,6 @@ import (
 	"github.com/banbox/banbot/rpc"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
-	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
@@ -118,15 +114,28 @@ var refreshPairsCache struct {
 }
 
 func RefreshPairs(showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]string, map[string]map[string]float64, *errs.Error) {
+	return RefreshPairsWithSymbolState(nil, showLog, timeMS, pBar)
+}
+
+// RefreshPairsWithSymbolState keeps symbol discovery and timeframe scoring on
+// one runtime's symbol state. The legacy refresh cache is intentionally used
+// only by the legacy facade because it also restores process-global core pairs.
+func RefreshPairsWithSymbolState(symbols *orm.SymbolState, showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]string, map[string]map[string]float64, *errs.Error) {
+	if symbols == nil {
+		return refreshPairsLegacy(showLog, timeMS, pBar)
+	}
+	// A symbol catalog alone does not identify the exchange, configuration,
+	// strategy registry, or pair admission state that owns a refresh. Refuse
+	// this ambiguous compatibility path instead of combining one Runtime's
+	// symbols with process-global dependencies.
+	return nil, nil, errs.NewMsg(core.ErrBadConfig,
+		"explicit pair refresh requires complete runtime dependencies")
+}
+
+func refreshPairsLegacy(showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]string, map[string]map[string]float64, *errs.Error) {
 	c := &refreshPairsCache
 	if core.BackTestMode && c.timeMS == timeMS && c.pairTfScores != nil {
-		core.Pairs = slices.Clone(c.corePairs)
-		core.PairsMap = maps.Clone(c.pairsMap)
-		for pair := range core.BanPairsUntil {
-			if _, ok := core.PairsMap[pair]; !ok {
-				delete(core.BanPairsUntil, pair)
-			}
-		}
+		core.ReplaceLegacyPairState(c.corePairs, c.pairsMap)
 		if pBar != nil {
 			pBar.SetProgress("loadPairs", 1)
 			pBar.SetProgress("tfScores", 1)
@@ -160,24 +169,30 @@ func RefreshPairs(showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]string, 
 		c.timeMS = timeMS
 		c.pairs = pairs
 		c.pairTfScores = pairTfScores
-		c.corePairs = slices.Clone(core.Pairs)
-		c.pairsMap = maps.Clone(core.PairsMap)
+		c.corePairs, c.pairsMap = core.LegacyPairStateSnapshot()
 	}
 	return pairs, pairTfScores, nil
 }
 
 func RefreshJobs(pairs []string, pairTfScores map[string]map[string]float64, showLog bool, pBar *utils.StagedPrg) (map[string]map[string]int, *errs.Error) {
-	warms, accOds, err := strat.LoadStratJobs(pairs, pairTfScores)
+	return RefreshJobsWithSymbolState(nil, pairs, pairTfScores, showLog, pBar)
+}
+
+// RefreshJobsWithSymbolState loads strategy jobs against the supplied symbol state.
+func RefreshJobsWithSymbolState(symbols *orm.SymbolState, pairs []string, pairTfScores map[string]map[string]float64, showLog bool, pBar *utils.StagedPrg) (map[string]map[string]int, *errs.Error) {
+	warms, accOds, err := strat.LoadStratJobsWithSymbolState(symbols, pairs, pairTfScores)
 	if err != nil {
 		return nil, err
 	}
 	if len(accOds) > 0 {
-		for acc, odList := range accOds {
+		for acc := range executionMapKeys(accOds) {
+			odList := accOds[acc]
 			odMgr := GetOdMgr(acc)
 			err = odMgr.ExitAndFill(odList, &strat.ExitReq{Tag: core.ExitTagPairDel})
 			if err != nil {
 				return nil, err
 			}
+			strat.FinalizePairRotation(nil)
 			log.Info("exit old orders as pair rotation", zap.Int("num", len(odList)))
 		}
 	}
@@ -188,6 +203,86 @@ func RefreshJobs(pairs []string, pairTfScores map[string]map[string]float64, sho
 		pBar.SetProgress("loadJobs", 1)
 	}
 	return warms, nil
+}
+
+// RefreshJobsWithRuntimeDeps is the explicit-runtime counterpart to
+// RefreshJobsWithSymbolState. Every mutable registry used by job loading and
+// pair-rotation exits comes from deps; the legacy function above remains the
+// serialized compatibility path.
+func RefreshJobsWithRuntimeDeps(deps *RuntimeDeps, symbols *orm.SymbolState, pairs []string,
+	pairTfScores map[string]map[string]float64, showLog bool, pBar *utils.StagedPrg) (map[string]map[string]int, *errs.Error) {
+	if deps == nil {
+		return RefreshJobsWithSymbolState(symbols, pairs, pairTfScores, showLog, pBar)
+	}
+	warms, accOds, err := strat.LoadStratJobsWithState(deps.Strategies, deps.Core, symbols, pairs, pairTfScores, deps.Orders)
+	if err != nil {
+		return nil, err
+	}
+	if len(accOds) > 0 {
+		for acc := range executionMapKeys(accOds, deps) {
+			odList := accOds[acc]
+			odMgr := GetOdMgrWithState(deps.Trading, acc)
+			if odMgr == nil {
+				return nil, errs.NewMsg(core.ErrRunTime, "order manager is required for pair rotation: %s", acc)
+			}
+			if err = odMgr.ExitAndFill(odList, &strat.ExitReq{Tag: core.ExitTagPairDel}); err != nil {
+				return nil, err
+			}
+			strat.FinalizePairRotation(deps.Strategies, deps.Core)
+			log.Info("exit old orders as pair rotation", zap.Int("num", len(odList)))
+		}
+	}
+	if showLog {
+		strat.PrintStratGroupsWithState(deps.Strategies, deps.Core)
+	}
+	if pBar != nil {
+		pBar.SetProgress("loadJobs", 1)
+	}
+	return warms, nil
+}
+
+// RefreshPairsWithRuntimeDeps is the explicit pair-selection path. It keeps
+// pair admission and ban timestamps on the runtime core instead of the legacy
+// package registries.
+func RefreshPairsWithRuntimeDeps(deps *RuntimeDeps, showLog bool, timeMS int64,
+	pBar *utils.StagedPrg) ([]string, map[string]map[string]float64, *errs.Error) {
+	if deps == nil {
+		return RefreshPairsWithSymbolState(nil, showLog, timeMS, pBar)
+	}
+	if deps.Exchange == nil || deps.Symbols == nil {
+		return nil, nil, errs.NewMsg(core.ErrBadConfig, "runtime exchange and symbol state are required")
+	}
+	dataDir := ""
+	if deps.Config != nil {
+		dataDir = deps.Config.DataDir
+	}
+	pairs, err := goods.RefreshPairListWithRuntimeDeps(&goods.RuntimeDeps{
+		Core: deps.Core, Clock: deps.Clock, Config: deps.ConfigView(), DataDir: dataDir, Storage: deps.Storage,
+		Symbols: deps.Symbols, Exchange: deps.Exchange, ShowLog: showLog,
+	}, timeMS)
+	if err != nil {
+		return nil, nil, err
+	}
+	if pBar != nil {
+		pBar.SetProgress("loadPairs", 1)
+	}
+	allPairs := append([]string(nil), pairs...)
+	if cfg := deps.ConfigView(); cfg != nil {
+		for _, policy := range cfg.RunPolicy {
+			if policy != nil {
+				allPairs = append(allPairs, policy.Pairs...)
+			}
+		}
+	}
+	allPairs, _ = utils.UniqueItems(allPairs)
+	pairTfScores, err := strat.CalcPairTfScoresWithState(deps.Strategies, deps.Symbols, deps.Exchange, allPairs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if pBar != nil {
+		pBar.SetProgress("tfScores", 1)
+	}
+	return pairs, pairTfScores, nil
 }
 
 /*
@@ -209,7 +304,7 @@ func InitOdSubs() {
 		return
 	}
 	strat.LockJobsRead()
-	for acc := range strat.AccJobs {
+	for acc := range executionMapKeys(strat.AccJobs) {
 		strat.AddOdSub(acc, func(acc string, od *ormo.InOutOrder, evt int) {
 			stgy, ok := subStgys[od.Strategy]
 			if !ok {
@@ -232,7 +327,7 @@ func InitOdSubs() {
 			job, _ := its[od.Strategy]
 			strat.UnlockJobsRead()
 			if job != nil {
-				if core.LiveMode && !job.IsWarmUp {
+				if core.LiveMode && !job.IsWarmUpState() {
 					if err := com.RefreshLatestPrice(job.Symbol.Symbol); err != nil {
 						log.Warn("refresh latest price fail", zap.String("pair", job.Symbol.Symbol), zap.Error(err))
 					}
@@ -245,27 +340,109 @@ func InitOdSubs() {
 					if evt == strat.OdChgExitFill {
 						openOds, lock := ormo.GetOpenODs(acc)
 						lock.Lock()
-						job.UpdateOrders(utils.ValsOfMap(openOds))
+						job.UpdateOrders(executionOpenOrders(openOds))
 						lock.Unlock()
 					}
 					stgy.OnOrderChange(job, od, evt)
 				}
-				if len(job.Entrys) > 0 || len(job.Exits) > 0 {
+				requests := job.ExecutionSnapshot()
+				if len(requests.Entrys) > 0 || len(requests.Exits) > 0 {
 					_, _, err := GetOdMgr(acc).ProcessOrders(job)
 					if err != nil {
 						log.Error("process orders fail", zap.Error(err))
 					}
 				}
+				// A close-on-remove job remains in AccJobs until its terminal
+				// callback so this route stays valid across pair rotation.
+				strat.FinalizePairRotation(nil)
 			}
 		})
 	}
 	strat.UnlockJobsRead()
 }
 
+// InitOdSubsWithRuntimeDeps registers order callbacks against one explicit
+// runtime. The callback closure captures typed state once, so order events do
+// not discover a runtime through package globals.
+func InitOdSubsWithRuntimeDeps(deps *RuntimeDeps) {
+	if deps == nil {
+		InitOdSubs()
+		return
+	}
+	state := deps.Strategies
+	if state == nil {
+		return
+	}
+	var prices *com.PriceState
+	if deps.Market != nil {
+		prices = deps.Market.Prices
+	}
+	stateMap := state.PairStrategiesView()
+	subStgys := make(map[string]*strat.TradeStrat)
+	for _, items := range stateMap {
+		for stgName, stgy := range items {
+			if stgy.OnOrderChange != nil || stgy.HedgeOff {
+				subStgys[stgName] = stgy
+			}
+		}
+	}
+	if len(subStgys) == 0 {
+		return
+	}
+	for _, acc := range state.Accounts() {
+		account := acc
+		state.AddOdSub(account, func(_ string, od *ormo.InOutOrder, evt int) {
+			stgy := subStgys[od.Strategy]
+			if stgy == nil {
+				return
+			}
+			pairTF := strings.Join([]string{od.Symbol, od.Timeframe}, "_")
+			job := state.LookupJob(account, pairTF, od.Strategy)
+			if job == nil {
+				return
+			}
+			if deps.Core != nil && deps.Core.LiveMode && !job.IsWarmUpState() && prices != nil && deps.Clock != nil && deps.Exchange != nil {
+				if err := prices.RefreshLatestPriceAt(deps.Clock.TimeMS(), deps.Exchange, job.Symbol.Symbol); err != nil {
+					log.Warn("refresh latest price fail", zap.String("pair", job.Symbol.Symbol), zap.Error(err))
+				}
+			}
+			if stgy.HedgeOff && evt == strat.OdChgEnterFill {
+				closeSideOrders(job, !od.Short)
+			}
+			if stgy.OnOrderChange != nil {
+				if evt == strat.OdChgExitFill {
+					if deps.Orders != nil {
+						openOds, lock := deps.Orders.GetOpenODs(account)
+						lock.Lock()
+						job.UpdateOrders(executionOpenOrders(openOds, deps))
+						lock.Unlock()
+					} else {
+						job.UpdateOrders(nil)
+					}
+				}
+				stgy.OnOrderChange(job, od, evt)
+			}
+			requests := job.ExecutionSnapshot()
+			if len(requests.Entrys) > 0 || len(requests.Exits) > 0 {
+				mgr := GetOdMgrWithState(deps.Trading, account)
+				if mgr != nil {
+					if _, _, err := mgr.ProcessOrders(job); err != nil {
+						log.Error("process orders fail", zap.Error(err))
+					}
+				}
+			}
+			// A close-on-remove job remains in AccJobs until its terminal
+			// callback so this route stays valid across pair rotation.
+			strat.FinalizePairRotation(state, deps.Core)
+		})
+	}
+}
+
 func closeSideOrders(s *strat.StratJob, isShort bool) {
-	var closeList = s.LongOrders
+	snapshot := s.ExecutionSnapshot()
+	var closeList = snapshot.LongOrders
 	if isShort {
-		closeList = s.ShortOrders
+		closeList = snapshot.ShortOrders
 	}
 	if len(closeList) > 0 {
 		for _, o := range closeList {
@@ -281,9 +458,6 @@ func closeSideOrders(s *strat.StratJob, isShort bool) {
 	}
 }
 
-// Preventing Concurrent Modification of BatchTasks
-var lockBatch = deadlock.Mutex{} // 防止并发修改BatchTasks
-
 /*
 AddBatchJob
 Add batch entry tasks.
@@ -292,114 +466,127 @@ Even if the job has no entry tasks, this method should be called to postpone the
 即使job没有入场任务，也应该调用此方法，用于推迟入场时间TFEnterMS
 */
 func AddBatchJob(account, tf string, job *strat.StratJob, infoEnv *ta.BarEnv) {
-	lockBatch.Lock()
-	defer lockBatch.Unlock()
-	key := fmt.Sprintf("%s_%s_%s", tf, account, job.Strat.Name)
-	tasks, ok := strat.BatchTasks[key]
-	if !ok {
-		tasks = &strat.BatchMap{
-			Map:     make(map[string]*strat.JobEnv),
-			TFMSecs: int64(utils2.TFToSecs(tf) * 1000),
-		}
-		strat.BatchTasks[key] = tasks
+	AddBatchJobWithState(strat.LegacyBatchState(), account, tf, job, infoEnv)
+}
+
+// AddBatchJobWithState adds a task to one trader's batch state.
+func AddBatchJobWithState(state *strat.BatchState, account, tf string, job *strat.StratJob, infoEnv *ta.BarEnv) {
+	addBatchJobWithRuntimeDeps(nil, state, account, tf, job, infoEnv)
+}
+
+// AddBatchJobWithRuntimeDeps schedules a batch task using the runtime clock.
+// Explicit runners must use this path so task admission never observes the
+// process-wide simulated timestamp.
+func AddBatchJobWithRuntimeDeps(deps *RuntimeDeps, state *strat.BatchState, account, tf string, job *strat.StratJob, infoEnv *ta.BarEnv) {
+	addBatchJobWithRuntimeDeps(deps, state, account, tf, job, infoEnv)
+}
+
+func addBatchJobWithRuntimeDeps(deps *RuntimeDeps, state *strat.BatchState, account, tf string, job *strat.StratJob, infoEnv *ta.BarEnv) {
+	if state == nil || job == nil || job.Strat == nil || job.Symbol == nil {
+		return
 	}
-	// Delay 3s to wait for execution
-	// 推迟3s等待执行
-	tasks.ExecMS = btime.TimeMS() + core.DelayBatchMS
+	key := tf + "_" + account + "_" + job.Strat.Name
 	var pair = job.Symbol.Symbol
 	var pairKey = pair + "_main"
 	if infoEnv != nil {
 		pair = infoEnv.Symbol
 		pairKey = pair + "_info"
 	}
-	tasks.Map[pairKey] = &strat.JobEnv{Job: job, Env: infoEnv, Symbol: pair}
-}
-
-type batchReadyItem struct {
-	timeframe string
-	account   string
-	mainJobs  []*strat.StratJob
-	infoJobs  map[string]*strat.JobEnv
-	stgy      *strat.TradeStrat
+	var nowMS int64
+	if deps == nil {
+		nowMS = btime.TimeMS()
+	} else if deps.Clock != nil {
+		nowMS = deps.Clock.TimeMS()
+	}
+	state.AddTask(key, pairKey, &strat.JobEnv{Job: job, Env: infoEnv, Symbol: pair},
+		int64(utils2.TFToSecs(tf)*1000), nowMS+core.DelayBatchMS)
 }
 
 func TryFireBatches(currMS int64, isWarmUp bool) int {
-	// Collect ready items and remove them from BatchTasks while holding lockBatch,
-	// then execute callbacks outside the lock to avoid deadlock when strategy
-	// callbacks call AddBatchJob (which also acquires lockBatch).
-	var readyItems []batchReadyItem
-	var waitNum = 0
-	lockBatch.Lock()
-	for key, tasks := range strat.BatchTasks {
-		if currMS < tasks.ExecMS {
-			if tasks.ExecMS-currMS < tasks.TFMSecs/2 {
-				// Batch processing time has not yet arrived
-				// 尚未到达批量处理时间
-				waitNum += 1
-			}
-			continue
-		}
-		var mainJobs []*strat.StratJob
-		var infoJobs = make(map[string]*strat.JobEnv)
-		var stgy *strat.TradeStrat
-		for _, task := range tasks.Map {
-			stgy = task.Job.Strat
-			if task.Env == nil {
-				mainJobs = append(mainJobs, task.Job)
-			} else {
-				infoJobs[task.Symbol] = task
-			}
-		}
-		if stgy == nil {
-			continue
-		}
-		arr := strings.Split(key, "_")
-		timeframe, account := arr[0], arr[1]
-		delete(strat.BatchTasks, key)
-		readyItems = append(readyItems, batchReadyItem{
-			timeframe: timeframe,
-			account:   account,
-			mainJobs:  mainJobs,
-			infoJobs:  infoJobs,
-			stgy:      stgy,
-		})
+	return TryFireBatchesWithState(strat.LegacyBatchState(), currMS, isWarmUp)
+}
+
+// TryFireBatchesWithState removes ready tasks under the state lock and runs callbacks after unlocking.
+func TryFireBatchesWithState(state *strat.BatchState, currMS int64, isWarmUp bool) int {
+	return tryFireBatches(state, currMS, isWarmUp, nil)
+}
+
+// TryFireBatchesWithRuntimeDeps is the explicit-runtime batch execution path.
+// It resolves both open orders and order managers from the supplied runtime;
+// no package-level order registry is consulted on this hot path.
+func TryFireBatchesWithRuntimeDeps(deps *RuntimeDeps, state *strat.BatchState, currMS int64, isWarmUp bool) int {
+	if deps == nil {
+		return TryFireBatchesWithState(state, currMS, isWarmUp)
 	}
-	lockBatch.Unlock()
+	if deps.Orders == nil || deps.Trading == nil {
+		log.Error("runtime batch execution requires typed order and trading state")
+		return 0
+	}
+	return tryFireBatches(state, currMS, isWarmUp, deps)
+}
+
+func tryFireBatches(state *strat.BatchState, currMS int64, isWarmUp bool,
+	deps *RuntimeDeps) int {
+	if state == nil {
+		return 0
+	}
+	var orderState *ormo.OrderState
+	var trading *TradingState
+	var defaultAccount string
+	if deps != nil {
+		orderState = deps.Orders
+		trading = deps.Trading
+		defaultAccount = deps.DefaultAccount
+	}
+	readyItems, waitNum := state.TakeReady(currMS, strictBacktestFor(deps))
 
 	var err *errs.Error
 	for _, item := range readyItems {
-		openOds, lock := ormo.GetOpenODs(item.account)
+		openOds, lock := getBatchOpenOrders(orderState, item.Account)
 		lock.Lock()
-		allOrders := utils.ValsOfMap(openOds)
+		allOrders := executionOpenOrders(openOds, deps)
 		lock.Unlock()
-		for _, job := range item.mainJobs {
+		for _, job := range item.MainJobs {
+			bindBatchJobRuntime(job, deps)
 			job.InitBar(allOrders)
 		}
-		if len(item.infoJobs) > 0 {
+		if len(item.InfoJobs) > 0 {
 			num1, num2 := 0, 0
-			for _, j := range item.infoJobs {
-				num1 += len(j.Job.Entrys)
-				num2 += len(j.Job.Exits)
+			for _, j := range item.InfoJobs {
+				bindBatchJobRuntime(j.Job, deps)
+				inNum, outNum := strat.GetJobInOutNum(j.Job)
+				num1 += inNum
+				num2 += outNum
 			}
-			item.stgy.OnBatchInfos(item.timeframe, item.infoJobs)
+			item.Strategy.OnBatchInfos(item.TimeFrame, item.InfoJobs)
 			num3, num4 := 0, 0
-			for _, j := range item.infoJobs {
-				num3 += len(j.Job.Entrys)
-				num4 += len(j.Job.Exits)
+			for _, j := range item.InfoJobs {
+				inNum, outNum := strat.GetJobInOutNum(j.Job)
+				num3 += inNum
+				num4 += outNum
 			}
 			if num3 > num1 || num4 > num2 {
 				log.Warn("Open/Close order in OnBatchInfos not support, please call `biz.GetOdMgr(s.Account).ProcessOrders(s)` manually")
 			}
 		}
-		if len(item.mainJobs) > 0 {
+		if len(item.MainJobs) > 0 {
 			// Check all batch tasks at this time and decide which ones to enter or exit
 			// 检查此时间所有批量任务，决定哪些入场或那些出场
-			item.stgy.OnBatchJobs(item.mainJobs)
+			item.Strategy.OnBatchJobs(item.MainJobs)
 			// Perform entry/exit tasks
 			// 执行入场/出场任务
 			if !isWarmUp {
-				odMgr := GetOdMgr(item.account)
-				for _, job := range item.mainJobs {
+				account := item.Account
+				if defaultAccount != "" {
+					account = defaultAccount
+				}
+				odMgr := getBatchOrderManager(trading, account)
+				if odMgr == nil {
+					log.Error("process orders fail: order manager is not initialized", zap.String("account", account))
+					continue
+				}
+				for _, job := range item.MainJobs {
+					bindBatchJobRuntime(job, deps)
 					_, _, err = odMgr.ProcessOrders(job)
 					if err != nil {
 						log.Error("process orders fail", zap.Error(err))
@@ -411,118 +598,37 @@ func TryFireBatches(currMS int64, isWarmUp bool) int {
 	return waitNum
 }
 
-func ResetVars() {
-	core.NoEnterUntil = make(map[string]int64)
-	com.DelPairCopieds()
-	core.TfPairHits = make(map[string]map[string]int)
-	core.JobPerfs = make(map[string]*core.JobPerf)
-	core.StratPerfSta = make(map[string]*core.PerfSta)
-	accLiveOdMgrs = make(map[string]*LiveOrderMgr)
-	accOdMgrs = make(map[string]IOrderMgr)
-	accWallets = make(map[string]*BanWallets)
-	core.LastBarMs = 0
-	core.OdBooks = make(map[string]*banexg.OrderBook)
-	ormo.HistODs = make([]*ormo.InOutOrder, 0)
-	ormo.ResetVars()
-	strat.Envs = make(map[string]*ta.BarEnv)
-	strat.TmpEnvs = make(map[string]*ta.BarEnv)
-	strat.AccJobs = make(map[string]map[string]map[string]*strat.StratJob)
-	strat.AccInfoJobs = make(map[string]map[string]map[string]*strat.StratJob)
-	strat.PairStrats = make(map[string]map[string]*strat.TradeStrat)
-	strat.WsSubJobs = make(map[string]map[string]map[*strat.StratJob]bool)
-	strat.BatchTasks = make(map[string]*strat.BatchMap)
-	strat.ForbidJobs = make(map[string]map[string]bool)
-	strat.LastBatchMS = 0
-}
-
-type VarsBackup struct {
-	Pairs         []string
-	PairMap       map[string]bool
-	NoEnterUntil  map[string]int64
-	PairCopiedMs  map[string][2]int64
-	TfPairHits    map[string]map[string]int
-	JobPerfs      map[string]*core.JobPerf
-	StratPerfSta  map[string]*core.PerfSta
-	AccLiveOdMgrs map[string]*LiveOrderMgr
-	AccOdMgrs     map[string]IOrderMgr
-	AccWallets    map[string]*BanWallets
-	LastBarMs     int64
-	OdBooks       map[string]*banexg.OrderBook
-	HistODs       []*ormo.InOutOrder
-	Envs          map[string]*ta.BarEnv
-	TmpEnvs       map[string]*ta.BarEnv
-	AccJobs       map[string]map[string]map[string]*strat.StratJob
-	AccInfoJobs   map[string]map[string]map[string]*strat.StratJob
-	PairStrats    map[string]map[string]*strat.TradeStrat
-	WsSubJobs     map[string]map[string]map[*strat.StratJob]bool
-	BatchTasks    map[string]*strat.BatchMap
-	ForbidJobs    map[string]map[string]bool
-	LastBatchMS   int64
-	OrmoBackup    *ormo.VarsBackup
-}
-
-// BackupVars 备份所有全局变量
-func BackupVars() *VarsBackup {
-	return &VarsBackup{
-		Pairs:         slices.Clone(core.Pairs),
-		PairMap:       maps.Clone(core.PairsMap),
-		NoEnterUntil:  core.NoEnterUntil,
-		PairCopiedMs:  com.GetPairCopieds(),
-		TfPairHits:    core.TfPairHits,
-		JobPerfs:      core.JobPerfs,
-		StratPerfSta:  core.StratPerfSta,
-		AccLiveOdMgrs: accLiveOdMgrs,
-		AccOdMgrs:     accOdMgrs,
-		AccWallets:    accWallets,
-		LastBarMs:     core.LastBarMs,
-		OdBooks:       core.OdBooks,
-		HistODs:       ormo.HistODs,
-		Envs:          strat.Envs,
-		TmpEnvs:       strat.TmpEnvs,
-		AccJobs:       strat.AccJobs,
-		AccInfoJobs:   strat.AccInfoJobs,
-		PairStrats:    strat.PairStrats,
-		WsSubJobs:     strat.WsSubJobs,
-		BatchTasks:    strat.BatchTasks,
-		ForbidJobs:    strat.ForbidJobs,
-		LastBatchMS:   strat.LastBatchMS,
-		OrmoBackup:    ormo.BackupVars(),
-	}
-}
-
-// RestoreVars 从备份中恢复所有全局变量
-func RestoreVars(backup *VarsBackup) {
-	if backup == nil {
+func bindBatchJobRuntime(job *strat.StratJob, deps *RuntimeDeps) {
+	if job == nil || deps == nil {
 		return
 	}
-	core.Pairs = backup.Pairs
-	core.PairsMap = backup.PairMap
-	core.NoEnterUntil = backup.NoEnterUntil
-	com.DelPairCopieds()
-	com.SetPairCopieds(backup.PairCopiedMs)
-	core.TfPairHits = backup.TfPairHits
-	core.JobPerfs = backup.JobPerfs
-	core.StratPerfSta = backup.StratPerfSta
-	accLiveOdMgrs = backup.AccLiveOdMgrs
-	accOdMgrs = backup.AccOdMgrs
-	accWallets = backup.AccWallets
-	core.LastBarMs = backup.LastBarMs
-	core.OdBooks = backup.OdBooks
-	ormo.HistODs = backup.HistODs
-	strat.Envs = backup.Envs
-	strat.TmpEnvs = backup.TmpEnvs
-	strat.AccJobs = backup.AccJobs
-	strat.AccInfoJobs = backup.AccInfoJobs
-	strat.PairStrats = backup.PairStrats
-	strat.WsSubJobs = backup.WsSubJobs
-	strat.BatchTasks = backup.BatchTasks
-	strat.ForbidJobs = backup.ForbidJobs
-	strat.LastBatchMS = backup.LastBatchMS
-	ormo.RestoreVars(backup.OrmoBackup)
+	var prices *com.PriceState
+	if deps.Market != nil {
+		prices = deps.Market.Prices
+	}
+	job.BindRuntimeMarket(prices, deps.Clock)
+}
+
+func getBatchOpenOrders(state *ormo.OrderState, account string) (map[int64]*ormo.InOutOrder, *deadlock.Mutex) {
+	if state != nil {
+		return state.GetOpenODs(account)
+	}
+	return ormo.GetOpenODs(account)
+}
+
+func getBatchOrderManager(state *TradingState, account string) IOrderMgr {
+	if state != nil {
+		return state.OrderManager(account)
+	}
+	return GetOdMgr(account)
 }
 
 func InitDataDir() *errs.Error {
-	dataDir := config.GetDataDir()
+	return InitDataDirAt(config.GetDataDir())
+}
+
+// InitDataDirAt creates the developer data layout at an explicit directory.
+func InitDataDirAt(dataDir string) *errs.Error {
 	if dataDir == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "-datadir or env `BanDataDir` is required")
 	}

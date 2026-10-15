@@ -2,8 +2,6 @@ package core
 
 import (
 	"fmt"
-	"github.com/banbox/banexg/utils"
-	"regexp"
 	"slices"
 	"strings"
 )
@@ -45,37 +43,26 @@ func GroupByPairQuotes(items map[string][]string, doSort bool) string {
 	return b.String()
 }
 
-var (
-	reCoinSplit = regexp.MustCompile("[/:-]")
-	splitCache  = map[string][4]string{}
-)
-
 /*
 SplitSymbol
 return Base，Quote，Settle，Identifier
 */
 func SplitSymbol(pair string) (string, string, string, string) {
-	if cache, ok := splitCache[pair]; ok {
-		return cache[0], cache[1], cache[2], cache[3]
-	}
-	if ExgName == "china" {
-		parts := utils.SplitParts(pair)
-		code := parts[0].Val
-		yearMon := parts[1].Val
-		splitCache[pair] = [4]string{code, "CNY", "CNY", yearMon}
-	} else {
-		parts := reCoinSplit.Split(pair, -1)
-		settle, ident := "", ""
-		if len(parts) > 2 {
-			settle = parts[2]
-			if len(parts) > 3 {
-				ident = parts[3]
-			}
-		} else if len(parts) < 2 {
-			return parts[0], "", "", ""
+	parts := splitSymbolParts(pair)
+	return parts[0], parts[1], parts[2], parts[3]
+}
+
+func splitSymbolParts(pair string) [4]string {
+	var parts [4]string
+	start := 0
+	for field := 0; field < len(parts); field++ {
+		rel := strings.IndexAny(pair[start:], "/:-")
+		if rel < 0 {
+			parts[field] = pair[start:]
+			break
 		}
-		splitCache[pair] = [4]string{parts[0], parts[1], settle, ident}
+		parts[field] = pair[start : start+rel]
+		start += rel + 1
 	}
-	cache, _ := splitCache[pair]
-	return cache[0], cache[1], cache[2], cache[3]
+	return parts
 }

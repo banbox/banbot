@@ -2,6 +2,12 @@
 
 btime 包提供了时间处理相关的功能。
 
+## 运行时钟
+
+每个 `runtime.Runtime` 持有独立的 `btime.ClockState`：回测推进自己的模拟时间，实盘读取实时 UTC 时间。任务内的业务代码应通过 Runtime 传入的 ClockState 读取或推进时间，避免不同任务互相影响。
+
+下方的包级时间函数保留给旧调用链；它们不能作为多个 Runtime 并行运行时的任务时钟。
+
 ## 公开方法
 
 ### TimeMS
@@ -59,6 +65,7 @@ btime 包提供了时间处理相关的功能。
 
 返回：
 - `int64` - 13位毫秒时间戳
+- `error` - 解析失败；使用时间戳前必须检查
 
 ### ParseTimeMSBy
 根据指定的时间格式解析时间字符串为13位毫秒时间戳。
@@ -69,6 +76,7 @@ btime 包提供了时间处理相关的功能。
 
 返回：
 - `int64` - 13位毫秒时间戳
+- `error` - 解析失败；使用时间戳前必须检查
 
 ### ToDateStr
 将时间戳转换为UTC时区的时间字符串。
@@ -99,11 +107,8 @@ btime 包提供了时间处理相关的功能。
 返回：
 - `time.Time` - 时间对象
 
-### CountDigit
-计算字符串中数字字符的数量。
 
-参数：
-- `text string` - 输入字符串
 
-返回：
-- `int` - 数字字符的数量
+## 数字工具归属
+
+CountDigit 属于 core，不是 btime；ClockState.TimeMS 才是实例模拟时钟，UTCStamp 是真实 UTC 时间。不要在回测 callback 用包级时间 facade 代替任务 clock。

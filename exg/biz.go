@@ -1,6 +1,8 @@
 package exg
 
 import (
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/banbox/banbot/btime"
@@ -32,7 +34,44 @@ func Setup() *errs.Error {
 }
 
 func create(name, market, contractType string) (banexg.BanExchange, *errs.Error) {
-	var exgOpts, _ = config.Exchange.Items[config.Exchange.Name]
+	return createConfigured(name, market, contractType, config.Exchange, config.Accounts, config.BakAccounts, core.RunEnv, core.NetDisable)
+}
+
+func NewForRuntime(snapshot *config.Snapshot, netDisable bool) (banexg.BanExchange, *errs.Error) {
+	if snapshot == nil || snapshot.View() == nil || snapshot.View().Exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "runtime exchange configuration is required")
+	}
+	cfg := snapshot.View()
+	accounts := make(map[string]*config.AccountConfig)
+	backups := make(map[string]*config.AccountConfig)
+	for _, name := range slices.Sorted(maps.Keys(cfg.Accounts)) {
+		account := cfg.Accounts[name]
+		if account == nil {
+			continue
+		}
+		if account.NoTrade {
+			backups[name] = account
+		} else if cfg.Env == core.RunEnvProd {
+			accounts[name] = account
+		} else if accounts["default"] == nil || name == "default" {
+			accounts["default"] = account
+		}
+	}
+	if cfg.Env != core.RunEnvProd && len(accounts) == 0 {
+		accounts["default"] = &config.AccountConfig{}
+	}
+	return createConfigured(cfg.Exchange.Name, cfg.MarketType, cfg.ContractType, cfg.Exchange, accounts, backups, cfg.Env, netDisable)
+}
+
+func createConfigured(name, market, contractType string, exchangeConfig *config.ExchangeConfig,
+	accounts, backups map[string]*config.AccountConfig, env string, netDisable bool) (banexg.BanExchange, *errs.Error) {
+	var exgOpts map[string]interface{}
+	if exchangeConfig != nil {
+		exgOpts = exchangeConfig.Items[name]
+		if exgOpts == nil && exchangeConfig.Name == name {
+			exgOpts = exchangeConfig.Items[exchangeConfig.Name]
+		}
+	}
 	var options = map[string]interface{}{}
 	for key, val := range exgOpts {
 		key = utils.SnakeToCamel(key)
@@ -49,8 +88,9 @@ func create(name, market, contractType string) (banexg.BanExchange, *errs.Error)
 	}
 	accs := map[string]map[string]interface{}{}
 	var defAcc string
-	for key, acc := range config.BakAccounts {
-		sec := acc.GetApiSecret()
+	for _, key := range slices.Sorted(maps.Keys(backups)) {
+		acc := backups[key]
+		sec := acc.GetApiSecretFor(name, env)
 		accs[key] = map[string]interface{}{
 			banexg.OptApiKey:    sec.APIKey,
 			banexg.OptApiSecret: sec.APISecret,
@@ -59,11 +99,12 @@ func create(name, market, contractType string) (banexg.BanExchange, *errs.Error)
 		}
 		defAcc = key
 	}
-	for key, acc := range config.Accounts {
+	for _, key := range slices.Sorted(maps.Keys(accounts)) {
+		acc := accounts[key]
 		if acc.NoTrade {
 			continue
 		}
-		sec := acc.GetApiSecret()
+		sec := acc.GetApiSecretFor(name, env)
 		accs[key] = map[string]interface{}{
 			banexg.OptApiKey:    sec.APIKey,
 			banexg.OptApiSecret: sec.APISecret,
@@ -83,14 +124,14 @@ func create(name, market, contractType string) (banexg.BanExchange, *errs.Error)
 	if contractType != "" {
 		options[banexg.OptContractType] = contractType
 	}
-	if core.RunEnv == core.RunEnvTest {
-		options[banexg.OptEnv] = core.RunEnv
+	if env == core.RunEnvTest {
+		options[banexg.OptEnv] = env
 	}
 	exchange, err := bex.New(name, options)
 	if err != nil {
 		return exchange, err
 	}
-	if core.NetDisable {
+	if netDisable {
 		exchange.SetNetDisable(true)
 	}
 	return &BotExchange{BanExchange: exchange}, nil
@@ -198,19 +239,4 @@ func GetTickers24Hr() (map[string]*banexg.Ticker, *errs.Error) {
 	expires := time.Second * 3600
 	core.Cache.SetWithTTL("tickers", tickersMap, 1, expires)
 	return tickersMap, nil
-}
-
-/*
-GetAlignOff Obtain the time offset of the aggregation for the specified period, in seconds 获取指定周期聚合的时间偏移，单位：秒
-*/
-func GetAlignOff(exgName string, tfSecs int) int {
-	if tfSecs < 86400 {
-		return 0
-	}
-	if exgName == "china" {
-		// 中国市场，期货夜盘属于次日日线数据，夜盘一般21点开始，当日收盘一般15点，取中间18，即推迟6个小时
-		// 又考虑时差8小时，累计推迟14小时
-		return 50400
-	}
-	return 0
 }

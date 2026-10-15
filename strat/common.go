@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
@@ -23,9 +22,10 @@ import (
 type FuncMakeStrat = func(pol *config.RunPolicyConfig) *TradeStrat
 
 var (
-	StratMake   = make(map[string]FuncMakeStrat) // 已加载的策略缓存
-	cacheStrats = make(map[string]*TradeStrat)
-	cacheMu     sync.Mutex
+	stratFactories = make(map[string]FuncMakeStrat)
+	cacheStrats    = make(map[string]*TradeStrat)
+	cacheMu        sync.Mutex
+	stratMakeMu    sync.RWMutex
 )
 
 func New(pol *config.RunPolicyConfig) *TradeStrat {
@@ -34,9 +34,12 @@ func New(pol *config.RunPolicyConfig) *TradeStrat {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 	if obj, ok := cacheStrats[cacheKey]; ok {
+		obj.Policy = pol
 		return obj
 	}
-	makeFn, ok := StratMake[pol.Name]
+	stratMakeMu.RLock()
+	makeFn, ok := stratFactories[pol.Name]
+	stratMakeMu.RUnlock()
 	var stgy *TradeStrat
 	if ok {
 		stgy = makeFn(pol)
@@ -185,6 +188,7 @@ func GetStratPerf(pair, strat string) *config.StratPerfConfig {
 
 func (q *EnterReq) Clone() *EnterReq {
 	res := &EnterReq{
+		CommandID:       q.CommandID,
 		Tag:             q.Tag,
 		StratName:       q.StratName,
 		Short:           q.Short,
@@ -283,6 +287,7 @@ func (q *EnterReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 
 func (q *ExitReq) Clone() *ExitReq {
 	res := &ExitReq{
+		CommandID:  q.CommandID,
 		Tag:        q.Tag,
 		StratName:  q.StratName,
 		EnterTag:   q.EnterTag,
@@ -347,6 +352,12 @@ func (q *ExitReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 }
 
 func (s *StratJob) UpdateOrders(curOrders []*ormo.InOutOrder) {
+	if s.recordInspectEffect("UpdateOrders") {
+		return
+	}
+	state := s.executionState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	s.LongOrders = nil
 	s.ShortOrders = nil
 	enteredNum := 0
@@ -367,30 +378,43 @@ func (s *StratJob) UpdateOrders(curOrders []*ormo.InOutOrder) {
 }
 
 func (s *StratJob) InitBar(curOrders []*ormo.InOutOrder) {
-	s.CheckMS = btime.TimeMS()
-	s.LastBarMS = s.Env.TimeStop
-	if s.IsWarmUp {
+	if s.recordInspectEffect("InitBar") {
+		return
+	}
+	checkMS := s.runtimeTimeMS()
+	lastBarMS := s.Env.TimeStop
+	state := s.executionState()
+	state.mu.Lock()
+	s.CheckMS = checkMS
+	s.LastBarMS = lastBarMS
+	isWarmUp := s.IsWarmUp
+	orderNum := s.OrderNum
+	state.mu.Unlock()
+	if isWarmUp {
+		state.mu.Lock()
 		s.LongOrders = nil
 		s.ShortOrders = nil
-	} else if s.OrderNum > 0 || core.LiveMode {
+		state.mu.Unlock()
+	} else if orderNum > 0 || s.runtimeLive() {
 		// 针对实盘，重启后OrderNum状态重置，本地未平仓订单无法更新到StratJob中，这里每次都检查
 		s.UpdateOrders(curOrders)
 	}
-	if core.LiveMode && !s.IsWarmUp {
+	if s.runtimeLive() && !isWarmUp {
 		// print warning before clear
-		for i, q := range s.Entrys {
+		enters, exits := s.DrainOrderRequests()
+		for i, q := range enters {
 			fields := q.GetZapFields(s)
 			fields = append(fields, zap.Int("i", i))
-			log.Warn("ignore unhandle Entry", fields...)
+			s.runtimeCore.Log().Warn("ignore unhandle Entry", fields...)
 		}
-		for i, q := range s.Exits {
+		for i, q := range exits {
 			fields := q.GetZapFields(s)
 			fields = append(fields, zap.Int("i", i))
-			log.Warn("ignore unhandle Exit", fields...)
+			s.runtimeCore.Log().Warn("ignore unhandle Exit", fields...)
 		}
+	} else {
+		_, _ = s.DrainOrderRequests()
 	}
-	s.Entrys = nil
-	s.Exits = nil
 }
 
 func CheckCustomExits(job *StratJob) *errs.Error {
@@ -429,26 +453,14 @@ func GetJobs(account string) map[string]map[string]*StratJob {
 	if !core.EnvReal {
 		account = config.DefAcc
 	}
-	jobs, ok := AccJobs[account]
-	if !ok {
-		jobs = map[string]map[string]*StratJob{}
-		AccJobs[account] = jobs
-	}
-	return jobs
+	return legacyStateView().jobsLocked(account)
 }
 
 func GetInfoJobs(account string) map[string]map[string]*StratJob {
 	if !core.EnvReal {
 		account = config.DefAcc
 	}
-	lockInfoJobs.Lock()
-	jobs, ok := AccInfoJobs[account]
-	if !ok {
-		jobs = map[string]map[string]*StratJob{}
-		AccInfoJobs[account] = jobs
-	}
-	lockInfoJobs.Unlock()
-	return jobs
+	return legacyStateView().infoJobsLocked(account)
 }
 
 func GetHistOrders(args ormo.GetHistOrdersArgs) ([]*ormo.InOutOrder, *errs.Error) {
@@ -585,6 +597,122 @@ func GetHistOrders(args ormo.GetHistOrdersArgs) ([]*ormo.InOutOrder, *errs.Error
 	return orders, nil
 }
 
+// GetHistOrdersWithState filters the in-memory history owned by an explicit
+// runtime. It deliberately never consults the package-level history facade;
+// callers that pass nil retain the legacy behavior above.
+func GetHistOrdersWithState(state *ormo.OrderState, args ormo.GetHistOrdersArgs) ([]*ormo.InOutOrder, *errs.Error) {
+	if state == nil {
+		return GetHistOrders(args)
+	}
+	pairMap := make(map[string]bool, len(args.Pairs))
+	for _, pair := range args.Pairs {
+		pairMap[pair] = true
+	}
+	orders := make([]*ormo.InOutOrder, 0)
+	for _, od := range state.HistoricalOrders() {
+		if od == nil {
+			continue
+		}
+		if args.TaskID > 0 && od.TaskID != args.TaskID {
+			continue
+		}
+		if args.Strategy != "" && od.Strategy != args.Strategy {
+			continue
+		}
+		if len(args.Pairs) > 0 && !pairMap[od.Symbol] {
+			continue
+		}
+		if args.TimeFrame != "" && od.Timeframe != args.TimeFrame {
+			continue
+		}
+		if args.Dirt == core.OdDirtLong && od.Short || args.Dirt == core.OdDirtShort && !od.Short {
+			continue
+		}
+		if args.EnterTag != "" && od.EnterTag != args.EnterTag || args.ExitTag != "" && od.ExitTag != args.ExitTag {
+			continue
+		}
+		if args.CloseAfter > 0 && od.ExitAt < args.CloseAfter || args.CloseBefore > 0 && od.ExitAt >= args.CloseBefore {
+			continue
+		}
+		orders = append(orders, od)
+	}
+	slices.SortFunc(orders, func(a, b *ormo.InOutOrder) int {
+		return int(a.ID - b.ID)
+	})
+	if args.AfterID > 0 {
+		orders = slices.DeleteFunc(orders, func(od *ormo.InOutOrder) bool { return od.ID <= int64(args.AfterID) })
+	} else if args.AfterID < 0 {
+		target := int64(-args.AfterID)
+		filtered := make([]*ormo.InOutOrder, 0, len(orders))
+		for i := len(orders) - 1; i >= 0; i-- {
+			if orders[i].ID < target {
+				filtered = append(filtered, orders[i])
+			}
+		}
+		orders = filtered
+	}
+	if !args.IDAsc {
+		slices.Reverse(orders)
+	}
+	if args.Limit > 0 && len(orders) > args.Limit {
+		orders = orders[:args.Limit]
+	}
+	return orders, nil
+}
+
+// CalcJobScoresWithState updates strategy and performance counters owned by
+// one runtime. It is the explicit counterpart to CalcJobScores and keeps all
+// hot-path state in the supplied concrete receivers.
+func CalcJobScoresWithState(strategyState *State, coreState *core.State, orderState *ormo.OrderState,
+	account, pair, tf, stgy string,
+) *errs.Error {
+	if strategyState == nil || coreState == nil || orderState == nil {
+		return CalcJobScores(pair, tf, stgy)
+	}
+	cfg := strategyState.GetStratPerf(pair, stgy)
+	if cfg == nil {
+		return nil
+	}
+	orders, err := GetHistOrdersWithState(orderState, ormo.GetHistOrdersArgs{
+		TaskID: orderState.GetTaskID(account), Strategy: stgy, TimeFrame: tf,
+		Pairs: []string{pair}, Limit: cfg.MaxOdNum,
+	})
+	if err != nil {
+		return err
+	}
+	totalPft := 0.0
+	for _, od := range orders {
+		totalPft += od.ProfitRate
+	}
+	prefKey := core.KeyStratPairTf(stgy, pair, tf)
+	coreState.WithPerformance(func(jobPerfs map[string]*core.JobPerf, stratPerfSta map[string]*core.PerfSta) {
+		sta := stratPerfSta[stgy]
+		if sta == nil {
+			sta = &core.PerfSta{}
+			stratPerfSta[stgy] = sta
+		}
+		sta.OdNum++
+		if len(orders) < cfg.MinOdNum {
+			return
+		}
+		perf := jobPerfs[prefKey]
+		if perf == nil {
+			perf = &core.JobPerf{Num: len(orders), TotProfit: totalPft, Score: 1}
+			jobPerfs[prefKey] = perf
+		} else {
+			perf.Num = len(orders)
+		}
+		prefs := make([]*core.JobPerf, 0)
+		for key, item := range jobPerfs {
+			if strings.HasPrefix(key, stgy) {
+				prefs = append(prefs, item)
+			}
+		}
+		perf.Score = defaultCalcJobScore(cfg, sta, perf, prefs)
+	})
+	return nil
+}
+
 func CalcJobScores(pair, tf, stgy string) *errs.Error {
 	cfg := GetStratPerf(pair, stgy)
 	orders, err := GetHistOrders(ormo.GetHistOrdersArgs{
@@ -597,37 +725,47 @@ func CalcJobScores(pair, tf, stgy string) *errs.Error {
 	if err != nil {
 		return err
 	}
-	sta := core.GetPerfSta(stgy)
-	sta.OdNum += 1
-	if len(orders) < cfg.MinOdNum {
-		return nil
-	}
+	var updated bool
 	totalPft := 0.0
-	for _, od := range orders {
-		totalPft += od.ProfitRate
+	if len(orders) >= cfg.MinOdNum {
+		for _, od := range orders {
+			totalPft += od.ProfitRate
+		}
 	}
 	var prefKey = core.KeyStratPairTf(stgy, pair, tf)
-	perf, _ := core.JobPerfs[prefKey]
-	if perf == nil {
-		perf = &core.JobPerf{
-			Num:       len(orders),
-			TotProfit: totalPft,
-			Score:     1,
+	core.WithLegacyPerformance(func(jobPerfs map[string]*core.JobPerf, stratPerfSta map[string]*core.PerfSta) {
+		sta := stratPerfSta[stgy]
+		if sta == nil {
+			sta = &core.PerfSta{}
+			stratPerfSta[stgy] = sta
 		}
-		core.JobPerfs[prefKey] = perf
-	} else {
-		perf.Num = len(orders)
-	}
-	// collect all trade jobs for this strategy & calculate stake rate
-	// 收集此策略所有任务，计算开单倍率
-	var prefs []*core.JobPerf
-	for key, p := range core.JobPerfs {
-		if strings.HasPrefix(key, stgy) {
-			prefs = append(prefs, p)
+		sta.OdNum++
+		if len(orders) < cfg.MinOdNum {
+			return
 		}
-	}
-	perf.Score = defaultCalcJobScore(cfg, sta, perf, prefs)
-	if core.LiveMode {
+		perf := jobPerfs[prefKey]
+		if perf == nil {
+			perf = &core.JobPerf{
+				Num:       len(orders),
+				TotProfit: totalPft,
+				Score:     1,
+			}
+			jobPerfs[prefKey] = perf
+		} else {
+			perf.Num = len(orders)
+		}
+		// Collect all trade jobs for this strategy while the compatibility
+		// performance lock is held; score calculation mutates these values.
+		var prefs []*core.JobPerf
+		for key, p := range jobPerfs {
+			if strings.HasPrefix(key, stgy) {
+				prefs = append(prefs, p)
+			}
+		}
+		perf.Score = defaultCalcJobScore(cfg, sta, perf, prefs)
+		updated = true
+	})
+	if updated && core.LiveMode {
 		// Real disk mode, immediately save to data directory
 		// 实盘模式，立刻保存到数据目录
 		core.DumpPerfs(config.GetDataDir())
@@ -749,36 +887,121 @@ func FireOdChange(acc string, od *ormo.InOutOrder, evt int) {
 	subs, _ := accOdSubs[acc]
 	subs2, _ := accOdSubs["*"]
 	lockOdSub.Unlock()
-	subs = append(subs, subs2...)
-	// 将模拟时间置为事件触发时间，并备份当前时间
-	evtTime := int64(0)
-	if evt == OdChgEnter {
-		evtTime = od.Enter.CreateAt
-	} else if evt == OdChgEnterFill {
-		evtTime = od.Enter.UpdateAt
-	} else if evt == OdChgExit {
-		evtTime = od.Exit.CreateAt
-	} else if evt == OdChgExitFill && od.Exit != nil {
-		evtTime = od.Exit.UpdateAt
+	fireOdChange(subs, subs2, acc, od, evt)
+}
+
+// FireOdChangeWithState dispatches an order event through one runtime's
+// strategy callbacks. A nil state keeps the legacy global behavior.
+func FireOdChangeWithState(state *State, acc string, od *ormo.InOutOrder, evt int) {
+	if state == nil {
+		FireOdChange(acc, od, evt)
+		return
 	}
-	backMS := int64(0)
-	if evtTime > 0 {
-		backMS = btime.TimeMS()
-		btime.CurTimeMS = evtTime
+	state.orderSubLock.Lock()
+	subs := append([]FnOdChange(nil), state.AccOdSubs[acc]...)
+	subs2 := append([]FnOdChange(nil), state.AccOdSubs["*"]...)
+	state.orderSubLock.Unlock()
+	fireOdChange(subs, subs2, acc, od, evt)
+}
+
+// OrderEventTime returns the exchange timestamp associated with an order
+// callback. Callbacks that need the precise event time should read it from
+// the order instead of changing the runtime clock.
+func OrderEventTime(od *ormo.InOutOrder, evt int) int64 {
+	if od == nil {
+		return 0
+	}
+	switch evt {
+	case OdChgEnter:
+		if od.Enter != nil {
+			return od.Enter.CreateAt
+		}
+	case OdChgEnterFill:
+		if od.Enter != nil {
+			return od.Enter.UpdateAt
+		}
+	case OdChgExit:
+		if od.Exit != nil {
+			return od.Exit.CreateAt
+		}
+	case OdChgExitFill:
+		if od.Exit != nil {
+			return od.Exit.UpdateAt
+		}
+	}
+	return 0
+}
+
+func fireOdChange(subs, wildcard []FnOdChange, acc string, od *ormo.InOutOrder, evt int) {
+	subs = append(subs, wildcard...)
+	if od == nil {
+		return
 	}
 	for _, cb := range subs {
 		cb(acc, od, evt)
 	}
-	// 恢复原始时间
-	if evtTime > 0 {
-		btime.CurTimeMS = backMS
-	}
 }
 
 func AddStratGroup(group string, items map[string]FuncMakeStrat) {
+	stratMakeMu.Lock()
+	defer stratMakeMu.Unlock()
 	for k, v := range items {
-		StratMake[group+":"+k] = v
+		if v == nil {
+			panic("strategy factory must not be nil")
+		}
+		stratFactories[group+":"+k] = v
 	}
+}
+
+// RegisterStrategy registers one process-wide strategy definition. Strategy
+// definitions are immutable during a Runtime; each State snapshots them.
+func RegisterStrategy(name string, factory FuncMakeStrat) {
+	if name == "" {
+		panic("strategy name must not be empty")
+	}
+	if factory == nil {
+		panic("strategy factory must not be nil")
+	}
+	stratMakeMu.Lock()
+	stratFactories[name] = factory
+	stratMakeMu.Unlock()
+}
+
+// GetStrategyFactory returns a registered process-wide strategy definition.
+func GetStrategyFactory(name string) (FuncMakeStrat, bool) {
+	stratMakeMu.RLock()
+	factory, ok := stratFactories[name]
+	stratMakeMu.RUnlock()
+	return factory, ok
+}
+
+// UnregisterStrategy removes a process-wide strategy definition. Callers must
+// not remove definitions still in use by an existing legacy facade; Runtime
+// states retain the construction snapshot they already own.
+func UnregisterStrategy(name string) {
+	deleteStratFactory(name)
+}
+
+func deleteStratFactory(name string) {
+	stratMakeMu.Lock()
+	delete(stratFactories, name)
+	stratMakeMu.Unlock()
+}
+
+func snapshotStratFactories() map[string]FuncMakeStrat {
+	stratMakeMu.RLock()
+	defer stratMakeMu.RUnlock()
+	factories := make(map[string]FuncMakeStrat, len(stratFactories))
+	for name, makeFn := range stratFactories {
+		factories[name] = makeFn
+	}
+	return factories
+}
+
+// SnapshotStrategyFactories returns a detached view of registered strategy
+// definitions.
+func SnapshotStrategyFactories() map[string]FuncMakeStrat {
+	return snapshotStratFactories()
 }
 
 func (w Warms) Update(pair, tf string, num int) {
@@ -797,7 +1020,14 @@ func (w Warms) Update(pair, tf string, num int) {
 JobForbidType 0 allow; 1 forbid; 2 forbid & occupy a slot
 */
 func JobForbidType(pair, tf, stratID string) int {
-	if jobs, ok := ForbidJobs[fmt.Sprintf("%s_%s", pair, tf)]; ok {
+	return jobForbidType(legacyStateView(), pair, tf, stratID)
+}
+
+func jobForbidType(state *State, pair, tf, stratID string) int {
+	if state == nil {
+		state = legacyStateView()
+	}
+	if jobs, ok := state.forbidJobs[fmt.Sprintf("%s_%s", pair, tf)]; ok {
 		hold, ok2 := jobs[stratID]
 		if ok2 {
 			if hold {
@@ -815,7 +1045,8 @@ return map[pair_tf][stratID]bool
 */
 func GetJobKeys() map[string]map[string]bool {
 	jobs := make(map[string]map[string]bool)
-	for _, jobsMap := range AccJobs {
+	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+		jobsMap := AccJobs[acc]
 		for pairTF, stgMap := range jobsMap {
 			idMap := make(map[string]bool)
 			for polID := range stgMap {
@@ -833,6 +1064,24 @@ func AddAccFailOpen(acc, tag string) {
 }
 
 func AddAccFailOpens(acc, tag string, num int) {
+	addAccFailOpens(nil, acc, tag, num)
+}
+
+// AddAccFailOpensWithState records a failed-entry reason in one runtime's
+// strategy state. The legacy helper above remains the package facade.
+func AddAccFailOpensWithState(state *State, acc, tag string, num int) {
+	if state == nil {
+		AddAccFailOpens(acc, tag, num)
+		return
+	}
+	state.AddAccFailOpens(acc, tag, num)
+}
+
+func addAccFailOpens(state *State, acc, tag string, num int) {
+	if state != nil {
+		state.AddAccFailOpens(acc, tag, num)
+		return
+	}
 	lockAccFailOpen.Lock()
 	tagMap, ok1 := accFailOpens[acc]
 	if !ok1 {
@@ -845,10 +1094,29 @@ func AddAccFailOpens(acc, tag string, num int) {
 }
 
 func DumpAccFailOpens() string {
+	return dumpAccFailOpens(nil)
+}
+
+// DumpAccFailOpensWithState returns failed-entry counters owned by a runtime.
+func DumpAccFailOpensWithState(state *State) string {
+	return dumpAccFailOpens(state)
+}
+
+func dumpAccFailOpens(state *State) string {
+	if state != nil {
+		state.failOpenLock.Lock()
+		defer state.failOpenLock.Unlock()
+		return formatFailOpenCounts(state.AccFailOpens)
+	}
 	lockAccFailOpen.Lock()
+	defer lockAccFailOpen.Unlock()
+	return formatFailOpenCounts(accFailOpens)
+}
+
+func formatFailOpenCounts(counts map[string]map[string]int) string {
 	var b strings.Builder
 	isFirst := true
-	for k, v := range accFailOpens {
+	for k, v := range counts {
 		if isFirst {
 			isFirst = false
 		} else {
@@ -858,15 +1126,19 @@ func DumpAccFailOpens() string {
 		b.WriteString(": ")
 		b.WriteString(utils.MapToStr(v, true, 0))
 	}
-	lockAccFailOpen.Unlock()
 	return b.String()
 }
 
 func newAccStratLimits() (accStratLimits, int) {
+	return newAccStratLimitsForState(nil)
+}
+
+func newAccStratLimitsForState(state *State) (accStratLimits, int) {
 	res := make(accStratLimits)
 	maxJobNum := 1
-	for acc, cfg := range config.Accounts {
-		if cfg.NoTrade {
+	accounts := runtimeAccountsFor(state)
+	for acc, cfg := range accounts {
+		if cfg == nil || cfg.NoTrade {
 			continue
 		}
 		res[acc] = &stgLimits{
@@ -914,7 +1186,7 @@ print strategy+timeframe from `core.StgPairTfs`
 从core.StgPairTfs输出策略+时间周期的币种信息到控制台
 */
 func PrintStratGroups() {
-	text := core.GroupByPairQuotes(map[string][]string{"Pairs": core.Pairs}, false)
+	text := core.GroupByPairQuotes(map[string][]string{"Pairs": core.LegacyAdmissionPairs()}, false)
 	log.Info("global pairs", zap.String("res", "\n"+text))
 	for acc, jobMap := range AccJobs {
 		allows := make(map[string][]string)
@@ -924,7 +1196,7 @@ func PrintStratGroups() {
 			pair, tf := arrP[0], arrP[1]
 			for stratID := range stratMap {
 				key := fmt.Sprintf("%s_%s", stratID, tf)
-				if ok, _ := core.PairsMap[pair]; ok {
+				if core.LegacyPairEnabled(pair) {
 					arr, _ := allows[key]
 					allows[key] = append(arr, pair)
 				} else {
@@ -944,16 +1216,71 @@ func PrintStratGroups() {
 	}
 }
 
+// PrintStratGroupsWithState is the typed logging view used by Runtime
+// runners. It intentionally performs the same low-frequency formatting as
+// PrintStratGroups while reading only the supplied strategy/core registries.
+func PrintStratGroupsWithState(strategyState *State, coreState *core.State) {
+	if strategyState == nil {
+		PrintStratGroups()
+		return
+	}
+	strategyState.ensureMaps()
+	if coreState == nil && strategyState != legacyState {
+		coreState = strategyState.Core
+	}
+	pairs := []string(nil)
+	if coreState != nil {
+		pairs = coreState.AdmissionPairs()
+	} else {
+		pairs = core.LegacyAdmissionPairs()
+	}
+	log.Info("global pairs", zap.String("res", "\n"+core.GroupByPairQuotes(map[string][]string{"Pairs": pairs}, false)))
+	for _, acc := range strategyState.Accounts() {
+		jobMap := strategyState.JobMapsView(acc)
+		allows := make(map[string][]string)
+		disables := make(map[string][]string)
+		for pairTF, stratMap := range jobMap {
+			arrP := strings.Split(pairTF, "_")
+			if len(arrP) != 2 {
+				continue
+			}
+			pair, tf := arrP[0], arrP[1]
+			for stratID := range stratMap {
+				key := fmt.Sprintf("%s_%s", stratID, tf)
+				enabled := false
+				if coreState != nil {
+					enabled = coreState.PairEnabled(pair)
+				} else {
+					enabled = core.LegacyPairEnabled(pair)
+				}
+				if enabled {
+					allows[key] = append(allows[key], pair)
+				} else {
+					disables[key] = append(disables[key], pair)
+				}
+			}
+		}
+		if len(allows) > 0 {
+			log.Info("group jobs by strat_tf", zap.String("acc", acc), zap.String("res", "\n"+core.GroupByPairQuotes(allows, true)))
+		}
+		if len(disables) > 0 {
+			log.Info("group disable jobs by strat_tf", zap.String("acc", acc), zap.String("res", "\n"+core.GroupByPairQuotes(disables, true)))
+		}
+	}
+}
+
 func GetJobInOutNum(job *StratJob) (int, int) {
-	return len(job.Entrys), len(job.Exits)
+	snapshot := job.ExecutionSnapshot()
+	return len(snapshot.Entrys), len(snapshot.Exits)
 }
 
 func CheckJobInOutNum(job *StratJob, tag string, inNum, outNum int) {
-	msg := "not support, please call `biz.GetOdMgr(s.Account).ProcessOrders(nil, s)` manually"
-	if len(job.Entrys) > inNum {
+	msg := "not support, please call `biz.ProcessJobOrders(s)` manually"
+	snapshot := job.ExecutionSnapshot()
+	if len(snapshot.Entrys) > inNum {
 		log.Warn("OpenOrder "+msg, zap.String("method", tag))
 	}
-	if len(job.Exits) > outNum {
+	if len(snapshot.Exits) > outNum {
 		log.Warn("CloseOrder "+msg, zap.String("method", tag))
 	}
 }

@@ -26,6 +26,20 @@ func Conn(path string, write bool) (*Queries, *orm.TrackedDB, *errs.Error) {
 	return New(db), db, nil
 }
 
+func (s *OrderState) BindTradesPath(path string) {
+	s.tradesPath = path
+}
+
+func (s *OrderState) Conn(write bool) (*Queries, *orm.TrackedDB, *errs.Error) {
+	if s == nil || s == legacyOrderState {
+		return Conn(orm.DbTrades, write)
+	}
+	if s.tradesPath == "" {
+		return nil, nil, errs.NewMsg(core.ErrDbConnFail, "runtime trades database path is required")
+	}
+	return Conn(s.tradesPath, write)
+}
+
 func GetTaskID(account string) int64 {
 	task := GetTask(account)
 	if task != nil {
@@ -52,26 +66,37 @@ func GetTaskAcc(id int64) string {
 }
 
 func GetOpenODs(account string) (map[int64]*InOutOrder, *deadlock.Mutex) {
+	openOrders, lock, _ := GetOpenODsStatus(account)
+	return openOrders, lock
+}
+
+// GetOpenODsStatus is the order snapshot API for callers that must fail closed
+// when a live database reload was not successful. The legacy GetOpenODs API
+// intentionally keeps its two-return-value contract for the rest of Banbot.
+func GetOpenODsStatus(account string) (map[int64]*InOutOrder, *deadlock.Mutex, bool) {
 	if !core.EnvReal {
 		account = config.DefAcc
 	} else if account == "" {
 		log.Warn("get open ods fail, unknown account")
-		return make(map[int64]*InOutOrder), &deadlock.Mutex{}
+		return make(map[int64]*InOutOrder), &deadlock.Mutex{}, false
 	}
 	isReload := false
+	authoritative := true
 	mOpenLock.Lock()
 	if core.LiveMode {
 		cfg, ok := config.Accounts[account]
 		if ok && cfg.NoTrade {
 			mOpenLock.Unlock()
-			return make(map[int64]*InOutOrder), &deadlock.Mutex{}
+			return make(map[int64]*InOutOrder), &deadlock.Mutex{}, true
 		}
 		curMS := btime.UTCStamp()
 		stamp, _ := accSyncStamps[account]
+		authoritative = stamp > 0
 		if curMS-stamp > odSyncIntvMS {
 			// 超过同步间隔，强制同步一次
 			accSyncStamps[account] = curMS
 			isReload = true
+			authoritative = false
 		}
 	}
 	val, ok := accOpenODs[account]
@@ -90,9 +115,17 @@ func GetOpenODs(account string) (map[int64]*InOutOrder, *deadlock.Mutex) {
 		err := loadOpenODs(account, val)
 		if err != nil {
 			log.Error("loadOpenODs fail", zap.String("acc", account), zap.Error(err))
+			// Keep retrying and keep the snapshot explicitly non-authoritative
+			// until a later reload succeeds.
+			mOpenLock.Lock()
+			accSyncStamps[account] = -max(btime.UTCStamp(), int64(1))
+			mOpenLock.Unlock()
+			authoritative = false
+		} else {
+			authoritative = true
 		}
 	}
-	return val, lock
+	return val, lock, authoritative
 }
 
 func loadOpenODs(account string, odMap map[int64]*InOutOrder) *errs.Error {
@@ -238,43 +271,4 @@ func SaveDirtyODs(path string, account string) *errs.Error {
 		}
 	}
 	return odErr
-}
-
-func ResetVars() {
-	accOpenODs = make(map[string]map[int64]*InOutOrder)
-	accTriggerODs = make(map[string]map[string]map[int64]*InOutOrder)
-	lockOpenMap = make(map[string]*deadlock.Mutex)
-	lockTriggerMap = make(map[string]*deadlock.Mutex)
-	lockOds = make(map[string]*deadlock.Mutex)
-	accTasks = make(map[string]*BotTask)
-	taskIdAccMap = make(map[int64]string)
-}
-
-// VarsBackup 存储 ormo 包相关全局变量的备份
-type VarsBackup struct {
-	AccOpenODs    map[string]map[int64]*InOutOrder
-	AccTriggerODs map[string]map[string]map[int64]*InOutOrder
-	AccTasks      map[string]*BotTask
-	TaskIdAccMap  map[int64]string
-}
-
-// BackupVars 备份所有全局变量
-func BackupVars() *VarsBackup {
-	return &VarsBackup{
-		AccOpenODs:    accOpenODs,
-		AccTriggerODs: accTriggerODs,
-		AccTasks:      accTasks,
-		TaskIdAccMap:  taskIdAccMap,
-	}
-}
-
-// RestoreVars 从备份中恢复所有全局变量
-func RestoreVars(backup *VarsBackup) {
-	if backup == nil {
-		return
-	}
-	accOpenODs = backup.AccOpenODs
-	accTriggerODs = backup.AccTriggerODs
-	accTasks = backup.AccTasks
-	taskIdAccMap = backup.TaskIdAccMap
 }

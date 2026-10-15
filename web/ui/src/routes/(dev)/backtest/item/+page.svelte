@@ -19,16 +19,22 @@
   import { ChartCtx, ChartSave } from '$lib/kline/chart';
   import { persisted } from 'svelte-persisted-store';
   import { makePeriod } from '$lib/kline/coms';
-  import { derived } from 'svelte/store';
+  import { derived as storeDerived } from 'svelte/store';
   import { fmtDateStr, fmtDuration, curTZ } from '$lib/dateutil';
   import type { OverlayCreate } from 'klinecharts';
   import type { TradeInfo } from '$lib/kline/types';
   import { pagination, orderCard } from '$lib/Snippets.svelte';
   import {getFirstValid, fmtNumber} from "$lib/common";
 
+  import type { UnifiedBacktestReport } from '$lib/dev/types';
+  import UnifiedReport from '$lib/results/UnifiedReport.svelte';
+  import { readUnifiedReport, riskMetric } from '$lib/results/report';
+
   let id = $state('');
   let btPath = $state('');
   let detail = $state<BacktestDetail | null>(null);
+  let unified = $state<UnifiedBacktestReport | null>(null);
+  let invalidUnified = $state<unknown>(null);
   let activeTab = $state('overview');
   let theme: Extension = oneDark;
   let configText = $state('');
@@ -95,7 +101,7 @@
   onMount(async () => {
     id = page.url.searchParams.get('id') || '';
     await loadDetail();
-    if(task?.status !== 3) {
+    if(task?.status !== 3 && !unified && !invalidUnified) {
       setActiveTab('logs');
     }
     if(activeTab === 'strat_code') {
@@ -112,10 +118,16 @@
     console.log('load task detail', rsp);
     btPath = rsp.path;
     detail = rsp.detail;
+    unified = readUnifiedReport(rsp.unified);
+    invalidUnified = rsp.unified && !unified ? rsp.unified : null;
+    if (invalidUnified) alerts.error(m.result_invalid_report());
     task = rsp.task;
     exsMap = rsp.exsMap;
     if(detail) {
       odNums = detail.plots.odNum;
+    }else if (unified || invalidUnified) {
+      odNums = [];
+      activeTab = 'overview';
     }else{
       odNums = [];
       setActiveTab('logs');
@@ -376,7 +388,7 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
     return `${minutes}m`;
   }
 
-  const klineLoad = derived(kcCtx, ($ctx) => $ctx.klineLoaded);
+  const klineLoad = storeDerived(kcCtx, ($ctx) => $ctx.klineLoaded);
   klineLoad.subscribe(val => {
     if (!drawOrder || !kc) return;
     const chart = kc.getChart();
@@ -423,6 +435,8 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
     costSum: number;
     sharpe: number;
     sortino: number;
+    ulcerIndex?: number | null;
+    ulcerPerformanceIndex?: number | null;
     [key: string]: any;
   }
 
@@ -458,6 +472,13 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
   // 定义导航菜单项
   let navItems = $derived.by(() => {
     const items = []
+    if ((unified || invalidUnified) && !detail) {
+      return [
+        { id: 'overview', label: m.overview(), icon: 'home' },
+        { id: 'config', label: m.configuration(), icon: 'config' },
+        { id: 'logs', label: m.bt_logs(), icon: 'document-text' }
+      ];
+    }
     
     if (task?.status == 3) {
       if (detail) {
@@ -530,10 +551,10 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
 </script>
 
 <div class="px-4 py-6 flex-1 flex flex-col">
-  <div class="flex justify-between items-center mb-6">
-    <div class="flex items-center gap-4">
+  <div class="flex flex-wrap justify-between items-center gap-4 mb-6">
+    <div class="flex flex-wrap items-center gap-4 min-w-0">
       <h1 class="text-2xl font-bold">{m.bt_report()}: {id}</h1>
-      <div class="text-sm opacity-75">{btPath}</div>
+      <div class="text-sm opacity-75 break-all">{btPath}</div>
     </div>
     <button class="btn btn-sm btn-ghost gap-2" onclick={() => history.back()}>
       <Icon name="double-left" class="size-4" />
@@ -541,9 +562,9 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
     </button>
   </div>
 
-  <div class="flex gap-4 flex-1">
+  <div class="flex flex-col md:flex-row gap-4 flex-1 min-w-0">
     <!-- 左侧导航 -->
-    <div class="w-[13%] flex-shrink-0">
+    <div class="w-full md:w-[13%] flex-shrink-0">
       <ul class="menu w-full bg-base-200 rounded-box">
         {#each navItems as item}
           <li>
@@ -584,7 +605,7 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
     </div>
 
     <!-- 右侧内容 -->
-    <div class="flex-1 flex flex-col">
+    <div class="flex-1 flex flex-col min-w-0">
       <!-- K线图区域 -->
       <div class="h-[60vh] flex flex-col" class:hidden={activeTab !== 'analysis'}>
         <Chart class="border" bind:this={kc} ctx={kcCtx} save={kcSave} customLoad={true}/>
@@ -598,14 +619,19 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
           </label>
         </div>
       </div>
-      {#if activeTab === 'overview' && detail}
+      {#if activeTab === 'overview' && unified}
+        <UnifiedReport report={unified} />
+      {:else if activeTab === 'overview' && invalidUnified}
+        <div role="alert" class="alert alert-error">{m.result_invalid_report()}</div>
+        <pre class="overflow-auto max-h-[60vh] rounded-box bg-base-100 p-4 text-sm">{JSON.stringify(invalidUnified, null, 2)}</pre>
+      {:else if activeTab === 'overview' && detail}
         {#if task?.status == 3}
         <!-- 重要统计信息 -->
         {@const startMS = detail.startMS || task?.startAt || 0}
         {@const endMS = detail.endMS || task?.stopAt || 0}
         {@const durationDays = (endMS - startMS) / (24 * 60 * 60 * 1000)}
         {@const annualizedReturnPct = calcAnnualizedReturnPct(startMS, endMS, detail.totProfitPct)}
-        <div class="stats bg-base-100 stats-vertical lg:stats-horizontal shadow mb-6">
+        <div class="grid grid-cols-2 lg:grid-cols-4 2xl:grid-cols-8 bg-base-100 shadow mb-6">
           {@render statCard(
             m.init_amount(),
             'text-success',
@@ -645,6 +671,8 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
             formatNumber(detail.sharpeRatio, 2),
             formatNumber(detail.sortinoRatio, 2)
           )}
+          {@render statCard(m.ulcer_index(), '', riskMetric(detail.ulcerIndex, '%'), '')}
+          {@render statCard(m.ulcer_performance_index(), '', riskMetric(detail.ulcerPerformanceIndex), '')}
         </div>
 
         <!-- 次要统计信息 -->
@@ -715,7 +743,9 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
                 { title: m.win_rate(), field: 'winCount', format: (v, g) => formatPercent(v * 100 / (g.orderNum || 1)) },
                 { title: m.tot_profit(), field: 'profitSum', format: v => formatNumber(v) },
                 { title: m.profit_rate(), field: 'profitSum', format: (v, g) => formatPercent(v * 100 / g.costSum) },
-                { title: m.sharpe_ratio() + '/' + m.sortino_ratio(), field: 'sharpe', format: (v, g) => `${formatNumber(v, 2)} / ${formatNumber(g.sortino, 2)}` }
+                { title: m.sharpe_ratio() + '/' + m.sortino_ratio(), field: 'sharpe', format: (v, g) => `${formatNumber(v, 2)} / ${formatNumber(g.sortino, 2)}` },
+                { title: m.ulcer_index(), field: 'ulcerIndex', format: v => riskMetric(v, '%') },
+                { title: m.ulcer_performance_index(), field: 'ulcerPerformanceIndex', format: v => riskMetric(v) }
               ])}
             {/if}
 
@@ -787,6 +817,8 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
                       <th>{m.tot_profit()}</th>
                       <th>{m.profit_rate()}</th>
                       <th>{m.sharpe_ratio()}/{m.sortino_ratio()}</th>
+                      <th>{m.ulcer_index()}</th>
+                      <th>{m.ulcer_performance_index()}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -798,6 +830,8 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
                         <td>{formatNumber(group.profitSum)}</td>
                         <td>{formatPercent(group.profitSum * 100 / group.costSum)}</td>
                         <td>{formatNumber(group.sharpe, 2)} / {formatNumber(group.sortino, 2)}</td>
+                        <td>{riskMetric(group.ulcerIndex, '%')}</td>
+                        <td>{riskMetric(group.ulcerPerformanceIndex)}</td>
                       </tr>
                     {/each}
                   </tbody>
@@ -817,6 +851,8 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
                       <th>{m.tot_profit()}</th>
                       <th>{m.profit_rate()}</th>
                       <th>{m.sharpe_ratio()}/{m.sortino_ratio()}</th>
+                      <th>{m.ulcer_index()}</th>
+                      <th>{m.ulcer_performance_index()}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -828,6 +864,8 @@ ${m.holding()}: ${fmtDuration((td.exit_at - td.enter_at) / 1000)}`;
                         <td>{formatNumber(group.profitSum)}</td>
                         <td>{formatPercent(group.profitSum * 100 / group.costSum)}</td>
                         <td>{formatNumber(group.sharpe, 2)} / {formatNumber(group.sortino, 2)}</td>
+                        <td>{riskMetric(group.ulcerIndex, '%')}</td>
+                        <td>{riskMetric(group.ulcerPerformanceIndex)}</td>
                       </tr>
                     {/each}
                   </tbody>

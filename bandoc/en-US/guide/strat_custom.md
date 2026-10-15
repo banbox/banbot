@@ -105,14 +105,14 @@ type TradeStrat struct {
     WsSubs        map[string]string    // websocket subscription: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 	DrawDownExit  bool    // Whether to enable retracement stop loss (i.e. trailing stop loss)
     HedgeOff      bool    // turn off future hedge mode
-	BatchInOut    bool    // Whether to batch execute entry/exit
-	BatchInfo     bool    // whether to perform batch processing after OninfoBar
+	BatchInOut    bool    // Whether to batch execute entry/exit after main OnData(RoleMain)/OnBar
+	BatchInfo     bool    // Whether to batch process after auxiliary OnData(RoleInfo)/OnInfoBar
 	StakeRate     float64 // Relative basic amount billing rate
     StopLoss      float64 // Default stop loss rate for all orders opened by this strategy (without leverage).
 	StopEnterBars int     // If the limit order exceeds the given K line and still does not enter the market, it will be cancelled
 	EachMaxLong   int      // max number of long open orders for one pair
 	EachMaxShort  int      // max number of short open orders for one pair
-	RunTimeFrames []string // Allow running time period, use global configuration when not provided
+	RunTimeFrames []string // Allowed running periods; when omitted, use the current Runtime configuration snapshot default
 	Outputs       []string // The content of the text file output by the strategy, where each string is one line
 	Policy        *config.RunPolicyConfig
 
@@ -176,7 +176,7 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	}
 }
 ```
-> You can use indicators in any callback function, but please note: **all indicators must be registered and called once in OnBar first**; otherwise, indicator calculations will result in errors.
+> You can use indicators in any callback function, but note that **all indicators must be called unconditionally once in the primary `OnData` handler**; otherwise, indicator calculations may be incorrect.
 
 ## banta: Technical Analysis Library
 The high-performance indicator library [banta](https://github.com/banbox/banta) is used in banbot. It caches the calculation state of indicators for each bar, which is the key to the high performance of banbot. You can visit [DeepWiki](https://deepwiki.com/banbox/banta) to learn more information about banta.
@@ -190,6 +190,8 @@ But it should be noted that only one operating environment `BarEnv` will be crea
 `banta.BarEnv` has several built-in original `Series`, namely: `Open`, `High`, `Low`, `Close`, `Volume`, which respectively save the sequence information of opening price, highest price, lowest price, closing price, and trading volume.
 
 `Series` is a special structure in `banta` for storing serialized data. All technical indicator functions in `banta` receive one or more `Series`, and return a `Series` after calculation.
+
+Current exports also include: `VWMA/VWAP`, `DEMA/T3/TEMA/MAMA/SSF/SWMA/TRIMA/VIDYA/ZLMA`, `DMI/ADX/AROONOSC/DX/SAR/PSAR/Ichimoku/KST`, `StochF/STOCHF/ULTOSC/Fisher/ROCR/TRIX/TSI/DPO/MOM/WilliamsPercent`, `Squeeze/NATR/Supertrend/Donchian/KeltnerChannel/PMAX`, `CMF/ADL/ADOSC/EFI/OBV/VPCI/MFI`, `LinReg/Slope/Correlation/LINEARREG_ANGLE`, `PivotHigh/PivotLow`, and `CDL*` candlestick patterns. Multi-return functions must receive values in the documented order.
 
 You can use `Series.Get(0)` to get the latest value of a series, such as `e.Close.Get(0)` to get the latest closing price;
 You can also use `Series.Range(0,5)` to get the 5 most recent values ​​of a series, which returns a `[]float64` array of length 5.
@@ -505,7 +507,8 @@ For all open long orders, a stop loss of 50% of the position is set. When the pr
 ## Batch task processing
 Sometimes you may need to perform some calculations (such as correlation coefficients) for all symbols of the current strategy together, get some intermediate states to save, or open or close orders together.
 In this case, you can use the `OnBatchJobs` or `OnBatchInfos` callback function.
-> Note that the jobs parameter of OnBatchJobs is obtained from a map, so the order is not guaranteed.
+`OnBatchJobs` is triggered only after main `OnData(RoleMain)`/`OnBar`; `OnBatchInfos` is triggered only after auxiliary `OnData(RoleInfo)`/`OnInfoBar`. They are enabled by `BatchInOut` and `BatchInfo`, respectively.
+> Ordinary mode does not promise `OnBatchJobs` job order; strict backtests use deterministic ordering from the instance `BatchState`.
 ```go
 func calcCorrs(jobs []*strat.StratJob, isBig bool) {
 	// Calculate the average correlation coefficient between each symbol and other varieties, and save it to More
@@ -862,3 +865,15 @@ Set stop-loss for all orders in the specified direction for the current strategy
 
 **SetAllTakeProfit(dirt float64, args \*ormo.ExitTrigger)**  
 Set take-profit for all orders in the specified direction for the current strategy task. The parameter `dirt` can be `core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth`.
+
+## Factor and cross-sectional engine
+
+TradeStrat/OnBar belongs to time_series. Factors register native Plan/ComboSpec through runner.RegisterDefinition or declare multiple expressions outputs instead of per-symbol callbacks. Portfolio builders consume frozen Frame/Universe, never future labels. Mixed same-account policies declare id/account/capital_weight while state and lifecycle borrows remain independent.
+
+See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
+
+## Runtime and callback state
+
+Ordinary commands let entry create and close a task Runtime. Its configuration snapshot is read-only; accounts, clock, strategy jobs, prices and batch queue belong to that run. Embedded or concurrent tasks should use explicit Runtime dependencies instead of reading or writing package-level config/core/btime compatibility state inside callbacks. Job context and data events must come from the current task; live time and the advancing backtest clock are distinct.
+
+`BatchInOut`/`BatchInfo` use the trader’s `BatchState`. Strict replay orders ready batches and jobs deterministically; ordinary execution does not promise map order. Factor decisions freeze the entire Universe and produce target portfolios, which is a separate contract from time-series batch callbacks. See [Runtime API](../api/runtime.md) and the [factor guide](./factor.md).

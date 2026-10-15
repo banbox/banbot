@@ -1,10 +1,12 @@
 package strat
 
 import (
+	"cmp"
 	"fmt"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
@@ -29,15 +31,41 @@ RelayPolicyGroups 获取需要接力开单的策略分组
 用于对不同起止时间且不同周期的策略，划分不同组，提高整体效率
 */
 func RelayPolicyGroups() []*PolicyGroup {
+	return RelayPolicyGroupsWithSymbolState(nil)
+}
+
+func RelayPolicyGroupsWithSymbolState(symbols *orm.SymbolState) []*PolicyGroup {
+	return relayPolicyGroupsWithConfig(nil, nil, symbols, btime.TimeMS())
+}
+
+// RelayPolicyGroupsWithState groups policies from an explicit strategy state
+// and clock. It is the runtime-owned counterpart of RelayPolicyGroups.
+func RelayPolicyGroupsWithState(state *State, symbols *orm.SymbolState) []*PolicyGroup {
+	if state == nil || state == legacyState {
+		return RelayPolicyGroupsWithSymbolState(symbols)
+	}
+	if symbols == nil {
+		symbols = state.Symbols
+	}
+	return relayPolicyGroupsWithConfig(state, state.Config, symbols, runtimeTimeMSFor(state))
+}
+
+func relayPolicyGroupsWithConfig(strategyState *State, cfg *config.Config, symbols *orm.SymbolState, currentMS int64) []*PolicyGroup {
 	tfScores := make(map[string]float64)
-	allowTfs := allAllowTFs()
+	allowTfs := allAllowTFsForState(strategyState, cfg)
 	for _, tf := range allowTfs {
 		tfScores[tf] = 1
 	}
 	// 记录每个策略的最小使用周期
 	polTFs := make(map[string]int)
-	for _, pol := range config.RunPolicy {
-		stgy := New(pol)
+	policies := config.RunPolicy
+	if cfg != nil {
+		policies = cfg.RunPolicy
+	} else if strategyState != nil && strategyState != legacyState {
+		policies = nil
+	}
+	for _, pol := range policies {
+		stgy := strategyState.NewStrategy(pol)
 		tf := stgy.pickTimeFrame("", tfScores)
 		if tf == "" {
 			continue
@@ -52,6 +80,7 @@ func RelayPolicyGroups() []*PolicyGroup {
 				Strat:     stgy,
 				DataHub:   NewDataHub(),
 				TimeFrame: tf,
+				symbols:   symbols,
 			}
 			infos := CollectDataSubs(job)
 			for _, it := range infos {
@@ -75,7 +104,10 @@ func RelayPolicyGroups() []*PolicyGroup {
 		})
 	}
 	slices.SortFunc(items, func(a, b *core.StrInt64) int {
-		return int(a.Int - b.Int)
+		if order := cmp.Compare(a.Int, b.Int); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.Str, b.Str)
 	})
 	// 当某个周期与组内最小周期倍率超过5倍，则归为新的组
 	curGpId := 0
@@ -89,13 +121,13 @@ func RelayPolicyGroups() []*PolicyGroup {
 		gp[it.Str] = curGpId
 	}
 	// 计算每个分组开始时间
-	curTime := btime.TimeMS()
+	curTime := currentMS
 	polGroups := make([]*PolicyGroup, 0, curGpId+1)
 	for i := 0; i <= curGpId; i++ {
 		polGroups = append(polGroups, &PolicyGroup{StartMS: math.MaxInt64})
 	}
-	for _, pol := range config.RunPolicy {
-		stgy := New(pol)
+	for _, pol := range policies {
+		stgy := strategyState.NewStrategy(pol)
 		tf := stgy.pickTimeFrame("", tfScores)
 		if tf == "" {
 			continue
@@ -112,8 +144,37 @@ func RelayPolicyGroups() []*PolicyGroup {
 // CalcPairTfScores Calculate the K-line quality score of each dimension of the trading pair
 // 计算交易对各维度K线质量分数
 func CalcPairTfScores(exchange banexg.BanExchange, pairs []string) (map[string]map[string]float64, *errs.Error) {
+	return CalcPairTfScoresWithSymbolState(nil, exchange, pairs)
+}
+
+// CalcPairTfScoresWithSymbolState keeps symbol lookup and K-line loading on
+// the supplied runtime state. Scoring itself remains the existing hot loop.
+func CalcPairTfScoresWithSymbolState(symbols *orm.SymbolState, exchange banexg.BanExchange, pairs []string) (map[string]map[string]float64, *errs.Error) {
+	return calcPairTfScoresWithConfig(nil, nil, symbols, exchange, 0, pairs)
+}
+
+// CalcPairTfScoresWithState calculates scores using the supplied runtime
+// strategy configuration. The hot loop still uses direct typed fields; only
+// the low-frequency timeframe selection is changed.
+func CalcPairTfScoresWithState(state *State, symbols *orm.SymbolState, exchange banexg.BanExchange, pairs []string) (map[string]map[string]float64, *errs.Error) {
+	if state == nil || state == legacyState {
+		return CalcPairTfScoresWithSymbolState(symbols, exchange, pairs)
+	}
+	if symbols == nil {
+		symbols = state.Symbols
+	}
+	if exchange == nil {
+		exchange = state.Exchange
+	}
+	return calcPairTfScoresWithConfig(state, state.Config, symbols, exchange, runtimeTimeMSFor(state), pairs)
+}
+
+func calcPairTfScoresWithConfig(strategyState *State, cfg *config.Config, symbols *orm.SymbolState, exchange banexg.BanExchange, endMS int64, pairs []string) (map[string]map[string]float64, *errs.Error) {
+	if strategyState == nil && exchange == nil && symbols == nil {
+		exchange = exg.Default
+	}
 	pairTfScores := make(map[string]map[string]float64)
-	allowTfs := allAllowTFs()
+	allowTfs := allAllowTFsForState(strategyState, cfg)
 	if len(allowTfs) == 0 {
 		return pairTfScores, errs.NewMsg(core.ErrBadConfig, "run_timeframes is required in config")
 	}
@@ -130,6 +191,10 @@ func CalcPairTfScores(exchange banexg.BanExchange, pairs []string) (map[string]m
 			pairTfScores[pair] = map[string]float64{wsModeTf: 1.0}
 		}
 		return pairTfScores, nil
+	}
+	if exchange == nil {
+		return pairTfScores, errs.NewMsg(core.ErrExgNotInit,
+			"runtime exchange is required to score strategy pairs")
 	}
 	handle := func(pair, timeFrame string, arr []*banexg.Kline, adjs []*orm.AdjInfo) {
 		tfScores, ok := pairTfScores[pair]
@@ -153,8 +218,12 @@ func CalcPairTfScores(exchange banexg.BanExchange, pairs []string) (map[string]m
 		tfScores[timeFrame] = score
 	}
 	backNum := 600
+	options := orm.LegacyKlineRuntimeOptions()
+	if strategyState != nil && strategyState != legacyState {
+		options = orm.NewKlineRuntimeOptions(strategyState.Core, cfg, endMS, strategyStorage(symbols))
+	}
 	for _, tf := range allowTfs {
-		err := orm.FastBulkOHLCV(exchange, pairs, tf, 0, 0, backNum, handle)
+		err := orm.FastBulkOHLCVWithSymbolStateAndOptions(symbols, exchange, pairs, tf, 0, endMS, backNum, handle, options)
 		if err != nil {
 			return pairTfScores, err
 		}
@@ -227,12 +296,31 @@ func calcKlineScore(arr []*banexg.Kline, pipChg float64, prevNum int) float64 {
 }
 
 func allAllowTFs() []string {
-	var groups = [][]string{config.RunTimeframes}
-	for _, pol := range config.RunPolicy {
+	return allAllowTFsForConfig(nil)
+}
+
+func allAllowTFsForConfig(cfg *config.Config) []string {
+	return allAllowTFsForState(nil, cfg)
+}
+
+func allAllowTFsForState(strategyState *State, cfg *config.Config) []string {
+	runTimeframes := config.RunTimeframes
+	policies := config.RunPolicy
+	if cfg != nil {
+		runTimeframes = cfg.RunTimeframes
+		policies = cfg.RunPolicy
+	} else if strategyState != nil && strategyState != legacyState {
+		runTimeframes = nil
+		policies = nil
+	}
+	var groups = [][]string{runTimeframes}
+	for _, pol := range policies {
+		policy := pol
 		if pol.Dirt == "any" {
-			pol.Dirt = ""
+			policy = pol.Clone()
+			policy.Dirt = ""
 		}
-		stagy := New(pol)
+		stagy := strategyState.NewStrategy(policy)
 		if stagy == nil {
 			continue
 		}

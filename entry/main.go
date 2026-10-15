@@ -1,18 +1,22 @@
 package entry
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/opt"
+	runtimectx "github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banbot/web"
 	"github.com/banbox/banexg/errs"
@@ -26,6 +30,7 @@ import (
 func RunCmd() {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "banbot panic raw stack:\n%s", panicStack())
 			if err, ok := recovered.(*errs.Error); ok {
 				log.Error("banbot panic", zap.Any("error", err))
 			} else {
@@ -37,27 +42,46 @@ func RunCmd() {
 		core.RunExitCalls()
 	}()
 
-	installSignalHandler()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopSignals := installSignalHandler(cancel)
+	defer stopSignals()
 	deadlock.Opts.Disable = true
 	cobra.MousetrapHelpText = ""
-	if err := Execute(os.Args[1:]); err != nil {
+	if err := ExecuteContext(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		core.RunExitCalls()
 		os.Exit(1)
 	}
 }
 
+func panicStack() []byte {
+	return debug.Stack()
+}
+
 // Execute runs banbot with an explicit argument list. It is separated from
 // RunCmd so callers and tests can execute the Cobra command tree without exits.
 func Execute(args []string) error {
+	return ExecuteContext(context.Background(), args)
+}
+
+// ExecuteContext carries caller cancellation to explicit task/session owners,
+// including archive-only tasks that never register a database Runtime.
+func ExecuteContext(ctx context.Context, args []string) error {
+	if ctx == nil {
+		return fmt.Errorf("command context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	command := NewRootCommand()
 	if isImplicitWebInvocation(args) {
-		command = web.NewCommand()
+		command = web.NewDevCommandWithFactory(newDevWebServer)
 		command.SilenceErrors = true
 		command.SilenceUsage = true
 	}
 	command.SetArgs(normalizeLegacyFlags(command, args))
-	return command.Execute()
+	return command.ExecuteContext(ctx)
 }
 
 func isImplicitWebInvocation(args []string) bool {
@@ -74,6 +98,8 @@ func isImplicitWebInvocation(args []string) bool {
 
 // NewRootCommand builds the complete Cobra command tree.
 func NewRootCommand() *cobra.Command {
+	rootCommandMu.Lock()
+	defer rootCommandMu.Unlock()
 	root := &cobra.Command{
 		Use:           "banbot",
 		Short:         "Banbot quantitative trading and data tools",
@@ -81,13 +107,12 @@ func NewRootCommand() *cobra.Command {
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return web.RunDev([]string{})
-		},
+		RunE:          func(command *cobra.Command, _ []string) error { return runDefaultWeb(command.Context()) },
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.SetVersionTemplate("banbot {{.Version}}\n")
 
+	extraGroups, extraCommands := commandRegistrySnapshot()
 	groups := make(map[string]*cobra.Command, len(commandGroups)+len(extraGroups))
 	allGroups := append(append([]commandGroup{}, commandGroups...), extraGroups...)
 	for _, group := range allGroups {
@@ -104,41 +129,97 @@ func NewRootCommand() *cobra.Command {
 	}
 
 	registerBuiltInCommands(root, groups)
-	registerExtraCommands(root, groups)
+	registerExtraCommands(root, groups, extraCommands)
 	return root
 }
 
-func installSignalHandler() {
+func runDefaultWeb(ctx context.Context) error {
+	command := web.NewDevCommandWithFactory(newDevWebServer)
+	command.SetArgs([]string{})
+	return command.ExecuteContext(ctx)
+}
+
+func installSignalHandler(cancel context.CancelFunc) func() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan struct{})
 	go func() {
-		<-sigChan
+		select {
+		case <-sigChan:
+		case <-done:
+			return
+		}
+		cancel()
+		// Stop is only cancellation. Wait for each explicit Runtime owner to
+		// join callbacks and flush state before the command returns; os.Exit
+		// would bypass the entry/session defers that close storage and exchange
+		// resources.
+		runtimectx.StopAndWaitProcesses()
 		if core.StopAll != nil {
 			core.StopAll()
 		}
 		core.RunExitCalls()
-		os.Exit(0)
 	}()
+	return func() { signal.Stop(sigChan); close(done) }
 }
 
-func newConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
+func newRuntimeConfigCommand(name, help string, run FuncEntry, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
+	return newRuntimeConfigCommandContext(name, help, func(_ context.Context, args *config.CmdArgs) *errs.Error {
+		return run(args)
+	}, allowDeadlock, binders...)
+}
+
+func newRuntimeConfigCommandContext(name, help string, run func(context.Context, *config.CmdArgs) *errs.Error, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
+	return newConfigCommandContext(name, help, func(ctx context.Context, args *config.CmdArgs) error {
+		if err := run(ctx, args); err != nil {
+			return err
+		}
+		return nil
+	}, allowDeadlock, binders...)
+}
+
+func newConfigCommandContext(name, help string, run func(context.Context, *config.CmdArgs) error, allowDeadlock bool, binders ...flagBinder) *cobra.Command {
 	args := &config.CmdArgs{}
+	options := &runtimeCommandFlags{}
 	command := &cobra.Command{
 		Use:   name,
 		Short: help,
 		Args:  cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return runConfigCommand(args, run)
+		RunE: func(command *cobra.Command, _ []string) error {
+			if err := command.Context().Err(); err != nil {
+				return err
+			}
+			args.ExplicitFlags = explicitCommandFlags(command)
+			args.BTStrictSet = command.Flags().Changed("bt-strict")
+			args.NetDisable = options.netDisable
+			args.CPUProfile = options.cpuProfile
+			args.MemProfile = options.memProfile
+			if err := run(command.Context(), args); err != nil {
+				return err
+			}
+			return nil
 		},
 	}
-	bindCommonFlags(args, command.Flags(), allowDeadlock)
+	bindCommonFlags(args, options, command.Flags(), allowDeadlock)
 	for _, bind := range binders {
 		bind(args, command.Flags())
 	}
 	return command
 }
 
-func bindCommonFlags(args *config.CmdArgs, flags *pflag.FlagSet, allowDeadlock bool) {
+func explicitCommandFlags(command *cobra.Command) map[string]bool {
+	result := make(map[string]bool)
+	command.Flags().Visit(func(flag *pflag.Flag) { result[flag.Name] = true })
+	return result
+}
+
+type runtimeCommandFlags struct {
+	cpuProfile bool
+	memProfile bool
+	netDisable bool
+}
+
+func bindCommonFlags(args *config.CmdArgs, options *runtimeCommandFlags, flags *pflag.FlagSet, allowDeadlock bool) {
 	flags.StringVar(&args.DataDir, "datadir", "", "path to the data directory")
 	flags.StringArrayVar((*[]string)(&args.Configs), "config", nil, "config path; may be repeated")
 	flags.BoolVar(&args.NoDefault, "no-default", false, "ignore config.yml and config.local.yml")
@@ -149,59 +230,60 @@ func bindCommonFlags(args *config.CmdArgs, flags *pflag.FlagSet, allowDeadlock b
 	if allowDeadlock {
 		flags.BoolVar(&args.DeadLock, "dlock", false, "enable deadlock detection")
 	}
-	flags.BoolVar(&core.CPUProfile, "cpu-profile", false, "enable CPU profiling")
-	flags.BoolVar(&core.MemProfile, "mem-profile", false, "enable memory profiling")
-	flags.BoolVar(&core.NetDisable, "net-off", false, "disable network requests")
+	flags.BoolVar(&options.cpuProfile, "cpu-profile", false, "enable CPU profiling")
+	flags.BoolVar(&options.memProfile, "mem-profile", false, "enable memory profiling")
+	flags.BoolVar(&options.netDisable, "net-off", false, "disable network requests")
 }
 
-func runConfigCommand(args *config.CmdArgs, run FuncEntry) error {
-	core.SetRunMode(core.RunModeOther)
-	args.Init()
-	startProfiles()
-	if err := run(args); err != nil {
-		return err
-	}
-	return nil
-}
-
-func startProfiles() {
-	if core.MemProfile {
+func startProfilesFor(cpuProfile, memProfile bool) (func(), *errs.Error) {
+	var cleanups []func()
+	if memProfile && !cpuProfile {
+		server := &http.Server{Addr: ":6060"}
 		go func() {
 			log.Info("memory profile server listening", zap.String("address", ":6060"))
-			if err := http.ListenAndServe(":6060", nil); err != nil {
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Error("memory profile server failed", zap.Error(err))
 			}
 		}()
+		cleanups = append(cleanups, func() { _ = server.Close() })
 	}
-	if !core.CPUProfile {
-		return
+	if cpuProfile {
+		wd, err := os.Getwd()
+		if err != nil {
+			for i := len(cleanups) - 1; i >= 0; i-- {
+				cleanups[i]()
+			}
+			return nil, errs.New(errs.CodeRunTime, err)
+		}
+		outPath := filepath.Join(wd, "cpu.profile")
+		cleanup, profileErr := utils.StartCpuProfileScoped(outPath, 6060)
+		if profileErr != nil {
+			for i := len(cleanups) - 1; i >= 0; i-- {
+				cleanups[i]()
+			}
+			return nil, profileErr
+		}
+		cleanups = append(cleanups, cleanup)
+		log.Info("CPU profile started", zap.String("path", outPath))
 	}
-	wd, err := os.Getwd()
-	if err != nil {
-		panic(err)
+	if len(cleanups) == 0 {
+		return nil, nil
 	}
-	outPath := filepath.Join(wd, "cpu.profile")
-	if err = utils.StartCpuProfile(outPath, 6060); err != nil {
-		panic(err)
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			for i := len(cleanups) - 1; i >= 0; i-- {
+				cleanups[i]()
+			}
+		})
 	}
-	log.Info("CPU profile started", zap.String("path", outPath))
-}
-
-func newPositionalCommand(name, help, argName string, run func(args []string) error) *cobra.Command {
-	return &cobra.Command{
-		Use:   fmt.Sprintf("%s %s", name, argName),
-		Short: help,
-		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			core.SetRunMode(core.RunModeOther)
-			return run(args)
-		},
-	}
+	return cleanup, nil
 }
 
 func newMergeAssetsCommand() *cobra.Command {
 	var outPath string
 	var lines string
+	var dataDir string
 	command := &cobra.Command{
 		Use:     "merge-assets FILE FILE [FILE...]",
 		Aliases: []string{"merge_assets"},
@@ -212,10 +294,17 @@ func newMergeAssetsCommand() *cobra.Command {
 				return errs.NewMsg(errs.CodeParamRequired, "--out is required")
 			}
 			filesMap := make(map[string]string, len(files))
-			for _, file := range files {
-				filesMap[config.ParsePath(file)] = ""
+			if dataDir == "" {
+				dataDir = os.Getenv("BanDataDir")
 			}
-			outPath = config.ParsePath(outPath)
+			if dataDir == "" {
+				dataDir = "."
+			}
+			snapshot := config.NewSnapshotWithDirs(nil, dataDir, "")
+			for _, file := range files {
+				filesMap[snapshot.ParsePath(file)] = ""
+			}
+			outPath = snapshot.ParsePath(outPath)
 			if err := opt.MergeAssetsHtml(outPath, filesMap, utils.SplitSolid(lines, ",", true), false); err != nil {
 				return err
 			}
@@ -224,6 +313,7 @@ func newMergeAssetsCommand() *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&outPath, "out", "merged_assets.html", "output HTML file")
+	command.Flags().StringVar(&dataDir, "datadir", "", "path used to resolve @/$ file paths")
 	command.Flags().StringVar(&lines, "lines", "Real,Available", "comma-separated line names to extract")
 	return command
 }

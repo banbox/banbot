@@ -13,6 +13,16 @@ func Conn() (*Queries, *orm.TrackedDB, *errs.Error) {
 	return New(db), db, nil
 }
 
+// ConnAt opens a server-owned SQLite file without consulting the mutable
+// global DbPub path alias.
+func ConnAt(path string) (*Queries, *orm.TrackedDB, *errs.Error) {
+	db, err := orm.DbLite(orm.DbPub, path, true, 10000)
+	if err != nil {
+		return nil, nil, err
+	}
+	return New(db), db, nil
+}
+
 const (
 	BtStatusInit = iota + 1
 	BtStatusRunning

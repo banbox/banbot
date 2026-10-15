@@ -15,7 +15,25 @@ package orm
 import (
 	"reflect"
 	"testing"
+	"time"
+
+	"github.com/banbox/banexg/errs"
 )
+
+func TestNormalizeSRangeSpansPrefersLatestRowVersion(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0).UTC()
+	got := normalizeSRangeSpans([]srangeSpan{
+		{StartMs: 0, StopMs: 100, HasData: true, Ts: base},
+		{StartMs: 50, StopMs: 150, HasData: false, Ts: base.Add(time.Second)},
+	})
+	want := []srangeSpan{
+		{StartMs: 0, StopMs: 50, HasData: true},
+		{StartMs: 50, StopMs: 150, HasData: false},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized spans = %+v, want %+v", got, want)
+	}
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. mergeMSRanges comprehensive edge cases
@@ -110,6 +128,20 @@ func TestSubtractMSRangesNoCoverage(t *testing.T) {
 	want := []MSRange{{Start: 0, Stop: 100}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("want=%v got=%v", want, got)
+	}
+}
+
+func TestUpdateDownloadedRangesIncludesEmptyAndPartialResponses(t *testing.T) {
+	ranges := []MSRange{{Start: 100, Stop: 200}, {Start: 400, Stop: 900}}
+	var updated []MSRange
+	if err := updateDownloadedRanges(ranges, func(item MSRange) *errs.Error {
+		updated = append(updated, item)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(updated, ranges) {
+		t.Fatalf("downloaded ranges were not all updated: got=%v want=%v", updated, ranges)
 	}
 }
 

@@ -29,16 +29,32 @@ func UpdateSeriesCoverage(ctx context.Context, info *SeriesInfo, sid int32, star
 	if err := validateSeriesInfo(info); err != nil {
 		return err
 	}
+	holes, err := seriesCoverageHoles(sid, startMS, endMS, rows)
+	if err != nil {
+		return err
+	}
+	q, conn, err2 := Conn(ctx)
+	if err2 != nil {
+		return err2
+	}
+	defer conn.Release()
+	if err_ := q.UpdateSRangesWithHoles(ctx, sid, info.Binding.Table, info.TimeFrame, startMS, endMS, holes); err_ != nil {
+		return NewDbErr(core.ErrDbExecFail, err_)
+	}
+	return nil
+}
+
+func seriesCoverageHoles(sid int32, startMS, endMS int64, rows []*DataRecord) ([]MSRange, *errs.Error) {
 	covered := make([]MSRange, 0, len(rows))
 	for _, row := range rows {
 		if row == nil {
 			continue
 		}
 		if row.Sid != 0 && row.Sid != sid {
-			return errs.NewMsg(core.ErrBadConfig, "series row sid %d does not match target sid %d", row.Sid, sid)
+			return nil, errs.NewMsg(core.ErrBadConfig, "series row sid %d does not match target sid %d", row.Sid, sid)
 		}
 		if row.EndMS <= row.TimeMS {
-			return errs.NewMsg(core.ErrBadConfig, "series row end_ms must be greater than time_ms")
+			return nil, errs.NewMsg(core.ErrBadConfig, "series row end_ms must be greater than time_ms")
 		}
 		curStart := max(startMS, row.TimeMS)
 		curEnd := min(endMS, row.EndMS)
@@ -46,14 +62,5 @@ func UpdateSeriesCoverage(ctx context.Context, info *SeriesInfo, sid int32, star
 			covered = append(covered, MSRange{Start: curStart, Stop: curEnd})
 		}
 	}
-	holes := subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, mergeMSRanges(covered))
-	q, conn, err := Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-	if err_ := q.UpdateSRangesWithHoles(ctx, sid, info.Binding.Table, info.TimeFrame, startMS, endMS, holes); err_ != nil {
-		return NewDbErr(core.ErrDbExecFail, err_)
-	}
-	return nil
+	return subtractMSRanges(MSRange{Start: startMS, Stop: endMS}, mergeMSRanges(covered)), nil
 }

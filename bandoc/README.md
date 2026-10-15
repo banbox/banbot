@@ -5,6 +5,21 @@ You can also use this repository as a knowledge base and interact with it throug
 
 website: https://docs.banbot.site
 
+Both language trees include [factor/cross-sectional workflows](en-US/guide/factor.md),
+[中文多因子指南](zh-CN/guide/factor.md) and the corresponding API pages.
+When editing engine behavior, update concepts/configuration/strategy/backtest/live/CLI
+and sidebar/API navigation together. From the repository root, run:
+
+```shell
+npm ci --prefix bandoc --no-audit --no-fund
+npm run build --prefix bandoc
+python scripts/check_documentation_links.py
+```
+
+The link check supports VitePress language roots, extensionless pages and public assets;
+it does not fetch external links or validate fragment anchors. Live provider examples
+require an application-registered verified factory and do not certify real-venue readiness.
+
 ## Compilation and Deployment
 To compile the bot documentation:
 ```shell

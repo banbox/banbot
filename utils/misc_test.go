@@ -1,11 +1,24 @@
 package utils
 
 import (
+	"slices"
 	"sync"
 	"testing"
 
 	"github.com/banbox/banexg/errs"
 )
+
+func TestMapKeysSortsOnlyWhenRequested(t *testing.T) {
+	items := map[string]int{"z": 1, "a": 2, "m": 3}
+	if got := slices.Collect(MapKeys(items, true)); !slices.Equal(got, []string{"a", "m", "z"}) {
+		t.Fatalf("sorted keys = %v", got)
+	}
+	got := slices.Collect(MapKeys(items, false))
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"a", "m", "z"}) {
+		t.Fatalf("unsorted iterator lost keys: %v", got)
+	}
+}
 
 func TestParallelRunReturnsLowestStartedErrorIndex(t *testing.T) {
 	const taskNum = 8

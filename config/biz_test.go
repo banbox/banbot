@@ -6,25 +6,29 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/llm"
 	"gopkg.in/yaml.v3"
 )
 
 func TestLoadConfig(t *testing.T) {
-	args := CmdArgs{}
-	err := LoadConfig(&args)
+	previousDir := DataDir
+	t.Cleanup(func() { DataDir = previousDir })
+	path := migrationFixture(t, "config.yml", "time_start: '20240101'\ntime_end: '20240201'\nstake_amount: 100\nrun_policy: [{name: Demo}]\n")
+	args := CmdArgs{NoDefault: true, Configs: ArrString{path}, DataDir: filepath.Dir(path), ConfigData: "stake_amount: 200\n"}
+	cfg, err := GetConfig(&args, false)
 	if err != nil {
-		fmt.Printf("load data error: %s", err)
-		return
+		t.Fatal(err)
 	}
-	data, err2 := yaml.Marshal(Data)
-	if err2 != nil {
-		fmt.Printf("dump data error: %s", err2)
-		return
+	if cfg.StakeAmount != 200 || len(cfg.RunPolicy) != 1 {
+		t.Fatal("ordinary loading lost overlay values")
 	}
-	fmt.Println("result: \n", string(data))
+	if len(configBackups(t, path)) != 0 {
+		t.Fatal("ordinary loading wrote to source")
+	}
 }
 
 func TestParseConfigsTimerangeOverridesEarlierStartEnd(t *testing.T) {
@@ -185,6 +189,77 @@ func TestRunPolicyToYamlRoundTrip(t *testing.T) {
 	}
 }
 
+func TestConfigClonePreservesOmittedFieldsAndDesensitizesLLMKeys(t *testing.T) {
+	temperature := 0.25
+	orig := &Config{
+		CloseOnStuck:         7,
+		BTLegacyIntrabar:     true,
+		BTLegacyOrderMetrics: true,
+		BTLegacyWallet:       true,
+		BTNoKlineDownload:    true,
+		HistoricalCoverage: &HistoricalCoverageConfig{
+			BaselineEndMS: 200,
+			Bars: map[string]map[string][]HistoricalCoverageRange{
+				"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 200}}},
+			},
+		},
+		NTPLangCode:  "en-US",
+		ShowLangCode: "zh-CN",
+		BTInLive: &BtInLiveConfig{
+			Cron: "0 3 * * *", Acount: "primary", MailTo: []string{"ops@example.com"},
+		},
+		TimeFrames: "1h,4h",
+		LLMModels: map[string]*llm.LLMModelConfig{
+			"primary": {
+				Name: "gpt-probe", APIType: "openai", APIKey: "llm-secret", BaseURL: "https://llm.example",
+				Temperature: &temperature,
+				Payload:     map[string]interface{}{"response_format": map[string]interface{}{"type": "json_object"}},
+			},
+		},
+	}
+
+	clone := orig.Clone()
+	if clone.CloseOnStuck != orig.CloseOnStuck || !clone.BTLegacyIntrabar || !clone.BTLegacyOrderMetrics ||
+		!clone.BTLegacyWallet || !clone.BTNoKlineDownload ||
+		clone.HistoricalCoverage == nil ||
+		clone.NTPLangCode != orig.NTPLangCode ||
+		clone.ShowLangCode != orig.ShowLangCode || clone.TimeFrames != orig.TimeFrames ||
+		!reflect.DeepEqual(clone.BTInLive, orig.BTInLive) || !reflect.DeepEqual(clone.LLMModels, orig.LLMModels) {
+		t.Fatalf("config clone lost fields:\n got: %#v\nwant: %#v", clone, orig)
+	}
+	clone.BTInLive.MailTo[0] = "changed@example.com"
+	clone.HistoricalCoverage.Bars["BTC/USDT:USDT"]["1h"][0].StartMS = 150
+	clone.LLMModels["primary"].BaseURL = "https://changed.example"
+	*clone.LLMModels["primary"].Temperature = 1
+	clone.LLMModels["primary"].Payload["response_format"].(map[string]interface{})["type"] = "text"
+	if orig.BTInLive.MailTo[0] != "ops@example.com" ||
+		orig.HistoricalCoverage.Bars["BTC/USDT:USDT"]["1h"][0].StartMS != 100 ||
+		orig.LLMModels["primary"].BaseURL != "https://llm.example" ||
+		*orig.LLMModels["primary"].Temperature != 0.25 ||
+		orig.LLMModels["primary"].Payload["response_format"].(map[string]interface{})["type"] != "json_object" {
+		t.Fatal("config clone shares omitted mutable fields")
+	}
+
+	sanitized := orig.Desensitize()
+	model := sanitized.LLMModels["primary"]
+	if model == nil || model.APIKey != "" || model.Name != "gpt-probe" || model.BaseURL != "https://llm.example" {
+		t.Fatalf("LLM model secret retained or non-sensitive fields lost: %#v", model)
+	}
+	if orig.LLMModels["primary"].APIKey != "llm-secret" {
+		t.Fatal("desensitizing LLM config mutated the source")
+	}
+}
+
+func TestParseYmlConfigBTNoKlineDownload(t *testing.T) {
+	cfg, err := ParseYmlConfig([]byte("bt_no_kline_download: true\n"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.BTNoKlineDownload {
+		t.Fatal("bt_no_kline_download was not parsed")
+	}
+}
+
 func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 	oldData := Data
 	oldExchange := Exchange
@@ -228,6 +303,9 @@ func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 			}},
 		},
 		Mail: &MailConfig{Username: "mailer", Password: "mail-password"},
+		LLMModels: map[string]*llm.LLMModelConfig{
+			"primary": {Name: "gpt-probe", APIKey: "llm-secret", BaseURL: "https://llm.example"},
+		},
 	}
 
 	first, err := DumpYaml(true)
@@ -244,7 +322,7 @@ func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 	for _, secret := range []string{
 		"prod-key", "prod-secret", "prod-password", "test-key", "test-secret", "test-password",
 		"account-password", "db-password", "telegram-token", "telegram-chat", "jwt-secret",
-		"operator-password", "mail-password",
+		"operator-password", "mail-password", "llm-secret",
 	} {
 		if strings.Contains(string(first), secret) {
 			t.Fatalf("desensitized YAML contains %q:\n%s", secret, first)
@@ -289,4 +367,79 @@ func TestDesensitizeDoesNotMutateOrShareSensitiveConfig(t *testing.T) {
 		sanitized.APIServer.Users[0].AllowIPs[0] != "10.0.0.1" {
 		t.Fatal("API server secret was retained or non-sensitive fields were dropped")
 	}
+	if model := sanitized.LLMModels["primary"]; model == nil || model.APIKey != "" || model.BaseURL != "https://llm.example" {
+		t.Fatal("LLM secret was retained or non-sensitive fields were dropped")
+	}
+}
+
+func TestGetApiSecretForUsesExplicitExchangeAndEnvironment(t *testing.T) {
+	oldExchange, oldEnv := Exchange, core.RunEnv
+	t.Cleanup(func() {
+		Exchange, core.RunEnv = oldExchange, oldEnv
+	})
+	Exchange = &ExchangeConfig{Name: "legacy"}
+	core.RunEnv = core.RunEnvProd
+	account := &AccountConfig{Exchanges: map[string]*ExgApiSecrets{
+		"legacy":  {Prod: &ApiSecretConfig{APIKey: "legacy-prod"}},
+		"runtime": {Prod: &ApiSecretConfig{APIKey: "runtime-prod"}, Test: &ApiSecretConfig{APIKey: "runtime-test"}},
+	}}
+	if got := account.GetApiSecretFor("runtime", core.RunEnvTest).APIKey; got != "runtime-test" {
+		t.Fatalf("explicit test credentials = %q, want runtime-test", got)
+	}
+	if got := account.GetApiSecretFor("runtime", core.RunEnvProd).APIKey; got != "runtime-prod" {
+		t.Fatalf("explicit prod credentials = %q, want runtime-prod", got)
+	}
+	if got := account.GetApiSecret().APIKey; got != "legacy-prod" {
+		t.Fatalf("legacy credentials = %q, want legacy-prod", got)
+	}
+}
+
+func TestRuntimeAccountUpdatesDoNotRaceWithConfigDump(t *testing.T) {
+	runtimeAccount := &AccountConfig{
+		StakePctAmt: 42,
+		RPCChannels: []map[string]interface{}{{"options": map[string]interface{}{"format": "compact"}}},
+		APIServer:   &AccPwdRole{Pwd: "password", Role: "admin"},
+		Exchanges: map[string]*ExgApiSecrets{
+			"binance": {Prod: &ApiSecretConfig{APIKey: "key", APISecret: "secret"}},
+		},
+	}
+	runtimeAccounts := map[string]*AccountConfig{"primary": runtimeAccount}
+	snapshot := &Config{Accounts: cloneAccountConfigs(runtimeAccounts)}
+
+	snapshotAccount := snapshot.Accounts["primary"]
+	if snapshotAccount == runtimeAccount || snapshotAccount.APIServer == runtimeAccount.APIServer ||
+		snapshotAccount.Exchanges["binance"] == runtimeAccount.Exchanges["binance"] ||
+		snapshotAccount.Exchanges["binance"].Prod == runtimeAccount.Exchanges["binance"].Prod {
+		t.Fatal("config snapshot shares account secrets with runtime state")
+	}
+	if snapshotAccount.StakePctAmt != 0 {
+		t.Fatalf("legacy config snapshot retained runtime StakePctAmt: %v", snapshotAccount.StakePctAmt)
+	}
+	snapshotAccount.RPCChannels[0]["options"].(map[string]interface{})["format"] = "verbose"
+	if runtimeAccount.RPCChannels[0]["options"].(map[string]interface{})["format"] != "compact" {
+		t.Fatal("config snapshot shares nested account RPC state")
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				runtimeAccount.NoTrade = !runtimeAccount.NoTrade
+				runtimeAccount.StakePctAmt++
+			}
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		if _, err := snapshot.Desensitize().DumpYaml(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(done)
+	wg.Wait()
 }

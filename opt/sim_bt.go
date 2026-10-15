@@ -2,21 +2,20 @@ package opt
 
 import (
 	"bufio"
-	"github.com/banbox/banbot/biz"
-	"github.com/banbox/banbot/utils"
-	"github.com/banbox/banexg"
-	"go.uber.org/zap"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm/ormo"
+	"github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"go.uber.org/zap"
 )
 
 type BTSection struct {
@@ -31,65 +30,75 @@ Perform rolling simulation backtest, extract trading symbols for each time range
 
 执行滚动模拟回测，从日志文件中提取每个区间的交易品种，并进行回测；导出订单记录和enters2.html
 */
-func RunSimBT(args *config.CmdArgs) *errs.Error {
+// RunSimBT replays report sections through isolated backtest runtimes.
+func RunSimBT(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error {
 	if args.InPath == "" {
 		log.Warn("-in is required")
 		return nil
 	}
-	// load config
-	configPath := filepath.Join(args.InPath, "config.yml")
-	if !utils.Exists(configPath) {
+	if !utils.Exists(filepath.Join(args.InPath, "config.yml")) {
 		return errs.NewMsg(errs.CodeIOReadFail, "not a valid backtest report dir, `config.yml` not exist!")
 	}
-	args.Configs = append(args.Configs, configPath)
-	core.SetRunMode(core.RunModeBackTest)
-	err := biz.SetupComsExg(args)
-	if err != nil {
-		return err
+	if snapshot == nil || snapshot.View() == nil || factory == nil {
+		return errs.NewMsg(errs.CodeParamInvalid, "simulation requires a runtime snapshot and backtest factory")
 	}
-	config.PairMgr = &config.PairMgrConfig{}
+	cfg := snapshot.View()
 
 	logPath := filepath.Join(args.InPath, "out.log")
-	sections, err := parseLogFile(logPath)
+	sections, err := parseLogFile(logPath, cfg.MarketType, cfg.TimeRange.EndMS)
 	if err != nil {
 		return err
 	}
 
 	// 收集所有订单
 	var allOrders []*ormo.InOutOrder
+	var reportDeps *ReportDeps
 	for i, sec := range sections {
 		log.Info("run section", zap.Int64("start", sec.StartMS), zap.Int64("end", sec.EndMS))
 
-		// 更新配置
-		config.TimeRange.StartMS = sec.StartMS
-		config.TimeRange.EndMS = sec.EndMS
-		config.Pairs = utils.KeysOfMap(sec.PairMap)
-
-		// 执行回测
-		core.BotRunning = true
-		biz.ResetVars()
-		bt, err := NewBackTest(true, "")
+		runSnapshot := deriveSimulationSnapshot(snapshot, sec.StartMS, sec.EndMS,
+			sectionPairs(sec.PairMap, cfg.BTStrict), cfg.RunPolicy)
+		bt, cleanup, err := factory(runSnapshot, true, "")
 		if err != nil {
 			return err
 		}
-		bt.Run()
+		if err = bt.Run(); err != nil {
+			if cleanup != nil {
+				cleanup()
+			}
+			return err
+		}
 
 		// 收集订单
-		allOrders = append(allOrders, ormo.HistODs...)
+		runtimeDeps := bt.RuntimeDependencies()
+		if runtimeDeps == nil || runtimeDeps.Orders == nil {
+			if cleanup != nil {
+				cleanup()
+			}
+			return errs.NewMsg(errs.CodeRunTime, "simulation backtest did not retain runtime orders")
+		}
+		if reportDeps == nil {
+			reportDeps = reportDepsFromRuntime(runtimeDeps)
+		}
+		orders := runtimeDeps.Orders.HistoricalOrders()
+		allOrders = append(allOrders, orders...)
+		if cleanup != nil {
+			cleanup()
+		}
 
 		// 输出进度
 		log.Info("finished", zap.Int("current", i+1), zap.Int("total", len(sections)),
-			zap.Int("orders", len(ormo.HistODs)))
+			zap.Int("orders", len(orders)))
 	}
 
 	// 保存订单
-	err = saveOrders(allOrders, filepath.Join(args.InPath, "orders2"))
+	err = saveOrders(allOrders, filepath.Join(args.InPath, "orders2"), reportDeps)
 	if err != nil {
 		return err
 	}
 	// 生成enters并保存
 	outPath := filepath.Join(args.InPath, "enters2.html")
-	err = DumpEnterTagCumProfits(outPath, allOrders, 600)
+	err = dumpEnterTagCumProfitsWithDeps(outPath, allOrders, 600, reportDeps)
 	if err != nil {
 		return err
 	}
@@ -100,8 +109,23 @@ func RunSimBT(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
+func deriveSimulationSnapshot(source *config.Snapshot, startMS, endMS int64, pairs []string,
+	policies []*config.RunPolicyConfig) *config.Snapshot {
+	derived := deriveBacktestSnapshot(source, startMS, endMS, pairs, policies)
+	if derived != nil && derived.View() != nil {
+		// Simulation sections must replay exactly the pairs captured in the log;
+		// runtime pair rotation would change the historical workload.
+		derived.View().PairMgr = &config.PairMgrConfig{}
+	}
+	return derived
+}
+
+func sectionPairs(pairMap map[string]bool, strict bool) []string {
+	return slices.Collect(utils.MapKeys(pairMap, strict))
+}
+
 // parseLogFile 解析日志文件，提取每个回测区间的信息
-func parseLogFile(logPath string) ([]*BTSection, *errs.Error) {
+func parseLogFile(logPath, market string, endMS int64) ([]*BTSection, *errs.Error) {
 	file, err := os.Open(logPath)
 	if err != nil {
 		return nil, errs.New(errs.CodeIOReadFail, err)
@@ -146,9 +170,9 @@ func parseLogFile(logPath string) ([]*BTSection, *errs.Error) {
 				suffix := "/" + quote
 				codes := strings.Split(matches[2], " ")
 				isInverse := false
-				if core.Market == banexg.MarketLinear {
+				if market == banexg.MarketLinear {
 					suffix += ":" + quote
-				} else if core.Market == banexg.MarketInverse {
+				} else if market == banexg.MarketInverse {
 					isInverse = true
 				}
 				for _, p := range codes {
@@ -165,22 +189,22 @@ func parseLogFile(logPath string) ([]*BTSection, *errs.Error) {
 	}
 
 	if sec != nil {
-		sec.EndMS = config.TimeRange.EndMS
+		sec.EndMS = endMS
 		sections = append(sections, sec)
 	}
 	return sections, nil
 }
 
 // saveOrders 保存订单到CSV和GOB文件
-func saveOrders(orders []*ormo.InOutOrder, outPath string) *errs.Error {
+func saveOrders(orders []*ormo.InOutOrder, outPath string, deps *ReportDeps) *errs.Error {
 	// 保存为CSV
 	csvPath := outPath + ".csv"
-	if err := DumpOrdersCSV(orders, csvPath); err != nil {
+	if err := dumpOrdersCSV(orders, csvPath, deps); err != nil {
 		return errs.New(errs.CodeIOWriteFail, err)
 	}
 
 	// 保存为GOB
-	err2 := ormo.DumpOrdersGob(outPath + ".gob")
+	err2 := ormo.DumpOrdersGobItems(outPath+".gob", orders)
 	if err2 != nil {
 		return err2
 	}

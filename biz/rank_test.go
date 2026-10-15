@@ -2,6 +2,7 @@ package biz
 
 import (
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/internal/testutil"
 	"sort"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 
 // TestPairRankings calculates rankings for source pairs across multiple cron-triggered refreshes
 func TestPairRankings(t *testing.T) {
+	testutil.RequireIntegration(t)
 	core.BackTestMode = true
 	args := &config.CmdArgs{NoDefault: false}
 

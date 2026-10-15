@@ -1,3 +1,5 @@
+> 引擎范围：本页 optimize / bt-opt 及参数定义、滚动选择流程属于时序 TradeStrat 引擎。当前 entry.runExplicitOptimization 使用时序 Snapshot 和 opt.BacktestFactory，没有将 factor policies 装配到 factor runner；不能把 run_policy 的泛称解释为因子/混合超参搜索已提供。因子参数实验请使用[因子研究/回测](./factor.md)分别运行显式参数配置，并管理 PIT 与成熟标签。
+
 在将您的策略开始实时模拟交易/实盘交易之前，滚动优化回测绝对是您应该关注的最后一项测试。
 
 很多人应该都有过用超参数优化让初始策略的收益翻好几倍的经历。这看起来很不错，然而当你面对这样一份非常漂亮的回测报告时，你到底有多大把握这组参数在未来的一段时间依然能取得较好收益呢？

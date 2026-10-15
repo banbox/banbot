@@ -136,7 +136,7 @@
     const closeNum = rsp.closeNum ?? 0;
     const failNum = rsp.failNum ?? 0;
     
-    let message = m.closed_positions({close: closeNum, fail: failNum});
+    let message: string = m.closed_positions({close: closeNum, fail: failNum});
     if (rsp.errMsg) {
       message += `\n${rsp.errMsg}`;
     }
@@ -186,7 +186,7 @@
 
     const closeNum = rsp.close_num ?? 0;
     const doneNum = rsp.done_num ?? 0;
-    let message = m.closed_orders({num: closeNum});
+    let message: string = m.closed_orders({num: closeNum});
     if (doneNum) {
       message += m.filled_orders({num: doneNum});
     }

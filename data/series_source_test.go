@@ -6,13 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/errs"
@@ -49,17 +52,10 @@ func newStubRegistrySource(name string) *stubSeriesSource {
 
 func resetDataSourcesForTest(t *testing.T) {
 	t.Helper()
-	dataSourcesMu.Lock()
-	old := dataSources
-	oldSta := dataSourceSta
-	dataSources = make(map[string]DataSource)
-	dataSourceSta = make(map[string]*DataSourceStatus)
-	dataSourcesMu.Unlock()
+	old := legacyDataSourceCatalog
+	legacyDataSourceCatalog = NewDataSourceCatalog()
 	t.Cleanup(func() {
-		dataSourcesMu.Lock()
-		dataSources = old
-		dataSourceSta = oldSta
-		dataSourcesMu.Unlock()
+		legacyDataSourceCatalog = old
 	})
 }
 
@@ -104,6 +100,7 @@ type stubSeriesRepo struct {
 	missingCalls     int
 	queryRows        []*orm.DataRecord
 	missing          []orm.MSRange
+	coverage         map[string][]orm.MSRange
 	coverageRows     []*orm.DataRecord
 	coverageStart    int64
 	coverageEnd      int64
@@ -154,7 +151,24 @@ func (s *stubSeriesRepo) MissingSeriesRanges(ctx context.Context, info *orm.Seri
 	if s.missing != nil {
 		return append([]orm.MSRange(nil), s.missing...), nil
 	}
-	return []orm.MSRange{{Start: startMS, Stop: endMS}}, nil
+	missing := []orm.MSRange{{Start: startMS, Stop: endMS}}
+	for _, covered := range s.coverage[fmt.Sprintf("%s:%d", info.Name, sid)] {
+		var remaining []orm.MSRange
+		for _, item := range missing {
+			if covered.Stop <= item.Start || covered.Start >= item.Stop {
+				remaining = append(remaining, item)
+				continue
+			}
+			if item.Start < covered.Start {
+				remaining = append(remaining, orm.MSRange{Start: item.Start, Stop: covered.Start})
+			}
+			if covered.Stop < item.Stop {
+				remaining = append(remaining, orm.MSRange{Start: covered.Stop, Stop: item.Stop})
+			}
+		}
+		missing = remaining
+	}
+	return missing, nil
 }
 
 func (s *stubSeriesRepo) UpdateSeriesRange(ctx context.Context, info *orm.SeriesInfo, sid int32, startMS, endMS int64) *errs.Error {
@@ -167,6 +181,13 @@ func (s *stubSeriesRepo) UpdateSeriesCoverage(ctx context.Context, info *orm.Ser
 	s.coverageStart = startMS
 	s.coverageEnd = endMS
 	s.coverageRows = append([]*orm.DataRecord(nil), rows...)
+	if s.updateErr == nil {
+		if s.coverage == nil {
+			s.coverage = make(map[string][]orm.MSRange)
+		}
+		key := fmt.Sprintf("%s:%d", info.Name, sid)
+		s.coverage[key] = append(s.coverage[key], orm.MSRange{Start: startMS, Stop: endMS})
+	}
 	return s.updateErr
 }
 
@@ -197,6 +218,52 @@ func TestRegisterDataSourceRejectsNil(t *testing.T) {
 	resetDataSourcesForTest(t)
 	if err := RegisterDataSource(nil); err == nil {
 		t.Fatalf("expected nil data source registration to fail")
+	}
+}
+
+func TestRuntimeCatalogFromRegisteredSourcesUsesFreshFactoryProviders(t *testing.T) {
+	resetDataSourcesForTest(t)
+	created := make([]*stubSeriesSource, 0, 3)
+	if err := RegisterDataSourceFactory("runtime_factory_test", func() DataSource {
+		src := newStubRegistrySource("runtime_factory_test")
+		created = append(created, src)
+		return src
+	}); err != nil {
+		t.Fatalf("register runtime factory: %v", err)
+	}
+	first, err := RuntimeCatalogFromRegisteredSources()
+	if err != nil {
+		t.Fatalf("first runtime catalog: %v", err)
+	}
+	second, err := RuntimeCatalogFromRegisteredSources()
+	if err != nil {
+		t.Fatalf("second runtime catalog: %v", err)
+	}
+	firstSource := first.GetDataSource("runtime_factory_test").(*stubSeriesSource)
+	secondSource := second.GetDataSource("runtime_factory_test").(*stubSeriesSource)
+	if firstSource == secondSource || firstSource == created[0] || secondSource == created[0] {
+		t.Fatalf("runtime catalogs reused a mutable provider: first=%p second=%p registered=%p", firstSource, secondSource, created[0])
+	}
+	firstSource.subscribeCount++
+	if secondSource.subscribeCount != 0 {
+		t.Fatalf("runtime provider state leaked: second subscriptions=%d", secondSource.subscribeCount)
+	}
+}
+
+func TestRuntimeCatalogFromRegisteredSourcesRejectsDirectRegistration(t *testing.T) {
+	resetDataSourcesForTest(t)
+	if err := RegisterDataSource(newStubRegistrySource("runtime_direct_registration_test")); err != nil {
+		t.Fatalf("register direct source: %v", err)
+	}
+	if _, err := RuntimeCatalogFromRegisteredSources(); err == nil || !strings.Contains(err.Error(), "runtime factory") {
+		t.Fatalf("runtime catalog error = %v, want factory guidance", err)
+	}
+}
+
+func TestDataSourceCatalogRejectsNilReceiver(t *testing.T) {
+	var catalog *DataSourceCatalog
+	if err := catalog.RegisterDataSource(nil); err == nil || !strings.Contains(err.Error(), "catalog") {
+		t.Fatalf("nil catalog error = %v, want an explicit catalog error", err)
 	}
 }
 
@@ -384,6 +451,111 @@ func TestActivateDataSourcesRequiresSink(t *testing.T) {
 	}
 }
 
+func TestDataSourceCatalogIsolatesRuntimeLookupActivationAndHistory(t *testing.T) {
+	resetDataSourcesForTest(t)
+	const sourceName = "macro_catalog_isolation_test"
+	const sid int32 = 707
+	newSource := func(field string) *stubSeriesSource {
+		src := newStubRegistrySource(sourceName)
+		src.info.Binding.Fields = []orm.SeriesField{{Name: field, Type: "float", Role: "value"}}
+		return src
+	}
+	catalogA := NewDataSourceCatalog()
+	catalogB := NewDataSourceCatalog()
+	sourceA := newSource("runtime_a")
+	sourceB := newSource("runtime_b")
+	if err := catalogA.RegisterDataSource(sourceA); err != nil {
+		t.Fatalf("register catalog A source: %v", err)
+	}
+	if err := catalogB.RegisterDataSource(sourceB); err != nil {
+		t.Fatalf("register catalog B source: %v", err)
+	}
+	global := newSource("legacy_global")
+	if err := RegisterDataSource(global); err != nil {
+		t.Fatalf("register legacy source: %v", err)
+	}
+
+	job := func(field string) *strat.StratJob {
+		exs := &orm.ExSymbol{ID: sid, Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"}
+		return &strat.StratJob{
+			Symbol: exs,
+			Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+				return []*strat.DataSub{{Source: sourceName, ExSymbol: exs, TimeFrame: "1d", Fields: []string{field}}}
+			}},
+		}
+	}
+
+	runtimeA := NewSeriesRuntimeWithCatalog(catalogA, stubDataSink{})
+	runtimeB := NewSeriesRuntimeWithCatalog(catalogB, stubDataSink{})
+	runtimeA.Repo = &stubSeriesRepo{}
+	runtimeB.Repo = &stubSeriesRepo{}
+	planA, err := runtimeA.Plan([]*strat.StratJob{job("runtime_a")}, 100, 200)
+	if err != nil {
+		t.Fatalf("plan catalog A: %v", err)
+	}
+	planB, err := runtimeB.Plan([]*strat.StratJob{job("runtime_b")}, 100, 200)
+	if err != nil {
+		t.Fatalf("plan catalog B: %v", err)
+	}
+	if len(planA.Subs) != 1 || !slices.Contains(planA.Subs[0].Fields, "runtime_a") || slices.Contains(planA.Subs[0].Fields, "runtime_b") {
+		t.Fatalf("catalog A planned fields leaked: %+v", planA.Subs)
+	}
+	if len(planB.Subs) != 1 || !slices.Contains(planB.Subs[0].Fields, "runtime_b") || slices.Contains(planB.Subs[0].Fields, "runtime_a") {
+		t.Fatalf("catalog B planned fields leaked: %+v", planB.Subs)
+	}
+	if err := runtimeA.Ensure(context.Background(), planA); err != nil {
+		t.Fatalf("ensure catalog A: %v", err)
+	}
+	if err := runtimeB.Ensure(context.Background(), planB); err != nil {
+		t.Fatalf("ensure catalog B: %v", err)
+	}
+	if sourceA.fetchCount != 1 || sourceB.fetchCount != 1 || global.fetchCount != 0 {
+		t.Fatalf("history lookup crossed catalogs: fetch A=%d B=%d global=%d", sourceA.fetchCount, sourceB.fetchCount, global.fetchCount)
+	}
+	if err := runtimeA.ActivateNew(context.Background(), planA.Subs); err != nil {
+		t.Fatalf("activate catalog A: %v", err)
+	}
+	if err := runtimeB.ActivateNew(context.Background(), planB.Subs); err != nil {
+		t.Fatalf("activate catalog B: %v", err)
+	}
+	if sourceA.subscribeCount != 1 || sourceB.subscribeCount != 1 || global.subscribeCount != 0 {
+		t.Fatalf("activation crossed catalogs: subscribe A=%d B=%d global=%d", sourceA.subscribeCount, sourceB.subscribeCount, global.subscribeCount)
+	}
+
+	clockA := btime.NewClockState(true, nil)
+	clockA.SetTimeMS(100)
+	configSnapshot := config.NewSnapshot(&config.Config{TimeRange: &config.TimeTuple{StartMS: 100, EndMS: 200}})
+	providerA, providerErr := NewHistProviderWithRuntimeDeps(&RuntimeDeps{
+		Catalog: catalogA, Clock: clockA, Config: configSnapshot, Strategies: strat.NewState(),
+	}, nil, nil, nil, false, nil)
+	if providerErr != nil {
+		t.Fatal(providerErr)
+	}
+	providerA.seriesRepo = &stubSeriesRepo{}
+	if err := providerA.SetSeriesSubs(planA.Subs); err != nil {
+		t.Fatalf("historical provider catalog A: %v", err)
+	}
+	feeder := providerA.series[strat.DataSubKey(sourceName, sid, "1d")]
+	if feeder == nil {
+		t.Fatalf("provider A did not create a series feeder")
+	}
+	projectedFields := make([]string, 0, len(feeder.info.Binding.Fields))
+	for _, field := range feeder.info.Binding.Fields {
+		projectedFields = append(projectedFields, field.Name)
+	}
+	if !slices.Contains(projectedFields, "runtime_a") || slices.Contains(projectedFields, "runtime_b") {
+		t.Fatalf("provider A projected fields=%v", projectedFields)
+	}
+
+	noCatalogRuntime := NewSeriesRuntimeWithCatalog(nil, stubDataSink{})
+	if err := noCatalogRuntime.ActivateNew(context.Background(), planA.Subs); err == nil {
+		t.Fatalf("explicit runtime without catalog unexpectedly used legacy source")
+	}
+	if global.subscribeCount != 0 {
+		t.Fatalf("explicit runtime without catalog subscribed through legacy catalog: %d", global.subscribeCount)
+	}
+}
+
 func TestSeriesRuntimeSyncLiveEnsuresThenActivatesNewSubs(t *testing.T) {
 	job := &strat.StratJob{
 		Symbol: &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"},
@@ -553,6 +725,128 @@ func TestCollectRuntimeDataSubsRejectsMalformedSubs(t *testing.T) {
 	}
 }
 
+func TestRuntimeSeriesSourcesAndKlineFieldsStayOwned(t *testing.T) {
+	resetDataSourcesForTest(t)
+
+	const sid int32 = 91
+	const tf = "1m"
+	exs := &orm.ExSymbol{ID: sid, Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"}
+
+	newSource := func(name, field string) *stubSeriesSource {
+		src := newStubRegistrySource(name)
+		src.info.Binding.Fields = []orm.SeriesField{{Name: field, Type: "float", Role: "value"}}
+		if err := RegisterDataSource(src); err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+		return src
+	}
+	sourceA := newSource("macro_runtime_a", "runtime_source_a")
+	sourceB := newSource("macro_runtime_b", "runtime_source_b")
+	sourceGlobal := newSource("macro_runtime_global", "runtime_source_global")
+
+	makeState := func(sourceName, sourceField, klineField string) *strat.State {
+		state := strat.NewState()
+		seriesJob := &strat.StratJob{
+			Symbol: exs,
+			Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+				return []*strat.DataSub{{Source: sourceName, ExSymbol: exs, TimeFrame: "1d", Fields: []string{sourceField}}}
+			}},
+		}
+		state.SetJobMap("default", "primary", map[string]*strat.StratJob{"series": seriesJob})
+
+		klineJob := &strat.StratJob{
+			Symbol: exs,
+			Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+				return []*strat.DataSub{{Source: orm.SeriesSourceKline, ExSymbol: exs, TimeFrame: tf, Fields: []string{klineField}}}
+			}},
+		}
+		state.SetInfoJobMap("default", strat.DataSubKey(orm.SeriesSourceKline, sid, tf), map[string]*strat.StratJob{"kline": klineJob})
+		return state
+	}
+
+	first := makeState(sourceA.info.Name, "runtime_source_a", "runtime_field_a")
+	second := makeState(sourceB.info.Name, "runtime_source_b", "runtime_field_b")
+
+	oldJobs, oldInfoJobs := strat.AccJobs, strat.AccInfoJobs
+	strat.AccJobs = map[string]map[string]map[string]*strat.StratJob{
+		"legacy": {
+			"primary": {
+				"global": {
+					Symbol: exs,
+					Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+						return []*strat.DataSub{{Source: sourceGlobal.info.Name, ExSymbol: exs, TimeFrame: "1d", Fields: []string{"runtime_source_global"}}}
+					}},
+				},
+			},
+		},
+	}
+	strat.AccInfoJobs = map[string]map[string]map[string]*strat.StratJob{
+		"legacy": {
+			strat.DataSubKey(orm.SeriesSourceKline, sid, tf): {
+				"global": {
+					Symbol: exs,
+					Strat: &strat.TradeStrat{OnDataSubs: func(*strat.StratJob) []*strat.DataSub {
+						return []*strat.DataSub{{Source: orm.SeriesSourceKline, ExSymbol: exs, TimeFrame: tf, Fields: []string{"global_field"}}}
+					}},
+				},
+			},
+		},
+	}
+	t.Cleanup(func() {
+		strat.AccJobs = oldJobs
+		strat.AccInfoJobs = oldInfoJobs
+	})
+
+	activate := func(name string, state *strat.State, wantSource *stubSeriesSource) {
+		t.Helper()
+		subs, err := CollectRuntimeDataSubs(state.CollectJobs())
+		if err != nil {
+			t.Fatalf("%s collect: %v", name, err)
+		}
+		if len(subs) != 1 || subs[0].Source != wantSource.info.Name || !slices.Contains(subs[0].Fields, wantSource.info.Binding.Fields[0].Name) {
+			t.Fatalf("%s collected subscriptions=%+v, want only %s", name, subs, wantSource.info.Name)
+		}
+		activated, err := ActivateDataSources(context.Background(), subs, stubDataSink{})
+		if err != nil {
+			t.Fatalf("%s activate: %v", name, err)
+		}
+		if len(activated) != 1 || wantSource.subscribeCount != 1 || len(wantSource.subscribedSubs) != 1 {
+			t.Fatalf("%s activated=%+v subscribe_count=%d groups=%d", name, activated, wantSource.subscribeCount, len(wantSource.subscribedSubs))
+		}
+		if got := activated[0].Fields; !slices.Contains(got, wantSource.info.Binding.Fields[0].Name) {
+			t.Fatalf("%s activated fields=%v, want %s", name, got, wantSource.info.Binding.Fields[0].Name)
+		}
+	}
+	activate("first", first, sourceA)
+	activate("second", second, sourceB)
+	if sourceGlobal.subscribeCount != 0 {
+		t.Fatalf("legacy source leaked into explicit runtimes: subscribe_count=%d", sourceGlobal.subscribeCount)
+	}
+
+	project := func(name string, state *strat.State, field string, value any) {
+		t.Helper()
+		var requested []string
+		got, err := enrichStoredKlineFieldsWithRuntimeDepsAndReader(&RuntimeDeps{Strategies: state}, exs, tf,
+			[]*orm.DataSeries{{TimeMS: 100, EndMS: 60_100, Values: map[string]any{"close": 3.0}}},
+			func(_ *orm.ExSymbol, _ string, fields []string, _, _ int64) ([]*orm.DataSeries, *errs.Error) {
+				requested = append([]string(nil), fields...)
+				return []*orm.DataSeries{{TimeMS: 100, Values: map[string]any{field: value}}}, nil
+			})
+		if err != nil || len(got) != 1 {
+			t.Fatalf("%s projection=(%v,%v)", name, got, err)
+		}
+		gotValue, ok := got[0].Values[field]
+		if !ok || gotValue != value {
+			t.Fatalf("%s projected value=%v present=%v, want %v", name, gotValue, ok, value)
+		}
+		if !slices.Contains(requested, field) || slices.Contains(requested, "global_field") {
+			t.Fatalf("%s reader fields=%v, want owned %q without global field", name, requested, field)
+		}
+	}
+	project("first", first, "runtime_field_a", int64(7))
+	project("second", second, "runtime_field_b", nil)
+}
+
 func TestNewThirdPartySeriesBootstrapPlansWarmupOnce(t *testing.T) {
 	jobs := []*strat.StratJob{{
 		Strat: &strat.TradeStrat{
@@ -612,7 +906,6 @@ func TestThirdPartyWarmupStartRejectsNegativeWarmup(t *testing.T) {
 
 func TestEnsureThirdPartySeriesRangeDeduplicatesAndUsesCoverage(t *testing.T) {
 	resetDataSourcesForTest(t)
-	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	now := time.Now().UnixNano()
 	src := &stubSeriesSource{
 		info: &orm.SeriesInfo{
@@ -640,10 +933,11 @@ func TestEnsureThirdPartySeriesRangeDeduplicatesAndUsesCoverage(t *testing.T) {
 		}}, Symbol: &orm.ExSymbol{ID: int32(now % 1_000_000), Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"}},
 	}
 
+	repo := &stubSeriesRepo{}
 	ctx := context.Background()
 	startMS := int64(1_700_000_000_000)
 	endMS := int64(1_700_086_400_000)
-	subs, err := EnsureThirdPartySeriesRange(ctx, nil, jobs, startMS, endMS)
+	subs, err := EnsureThirdPartySeriesRange(ctx, repo, jobs, startMS, endMS)
 	if err != nil {
 		t.Fatalf("EnsureThirdPartySeriesRange failed: %v", err)
 	}
@@ -653,7 +947,7 @@ func TestEnsureThirdPartySeriesRangeDeduplicatesAndUsesCoverage(t *testing.T) {
 	if src.fetchCount != 1 {
 		t.Fatalf("expected one deduped fetch, got %d", src.fetchCount)
 	}
-	if _, err := EnsureThirdPartySeriesRange(ctx, nil, jobs, startMS, endMS); err != nil {
+	if _, err := EnsureThirdPartySeriesRange(ctx, repo, jobs, startMS, endMS); err != nil {
 		t.Fatalf("EnsureThirdPartySeriesRange second pass failed: %v", err)
 	}
 	if src.fetchCount != 1 {
@@ -682,7 +976,6 @@ func TestEnsureThirdPartySeriesRangeUnknownSource(t *testing.T) {
 
 func TestEnsureThirdPartySeriesRangePropagatesFetchFailure(t *testing.T) {
 	resetDataSourcesForTest(t)
-	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	src := newStubRegistrySource("macro_fetch_fail_test")
 	src.fetchErr = fmt.Errorf("fetch timeout")
 	if err := RegisterDataSource(src); err != nil {
@@ -775,7 +1068,6 @@ func TestEnsureRuntimeSeriesRangeMarksEmptyFetchAsHole(t *testing.T) {
 
 func TestEnsureThirdPartySeriesRangeRejectsSourceMetadataMismatch(t *testing.T) {
 	resetDataSourcesForTest(t)
-	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	src := newStubRegistrySource("macro_tf_mismatch_test")
 	if err := RegisterDataSource(src); err != nil {
 		t.Fatalf("RegisterDataSource failed: %v", err)
@@ -799,7 +1091,6 @@ func TestEnsureThirdPartySeriesRangeRejectsSourceMetadataMismatch(t *testing.T) 
 
 func TestEnsureThirdPartySeriesRangePropagatesRepoFailure(t *testing.T) {
 	resetDataSourcesForTest(t)
-	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	src := newStubRegistrySource("macro_repo_fail_test")
 	if err := RegisterDataSource(src); err != nil {
 		t.Fatalf("RegisterDataSource failed: %v", err)
@@ -846,11 +1137,13 @@ func TestRegisteredSourceLookupsStayActivationFree(t *testing.T) {
 }
 
 func TestEnsureSeriesRangeTimescale(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.local.yml"))
 	runEnsureSeriesRangeTest(t, "timescale")
 }
 
 func TestEnsureSeriesRangeQuestDB(t *testing.T) {
+	testutil.RequireIntegration(t)
 	initSeriesSourceTestApp(t, mustFindSeriesSourceConfig(t, "config.yml"))
 	runEnsureSeriesRangeTest(t, "quest")
 }
@@ -871,7 +1164,7 @@ func mustFindSeriesSourceConfig(t *testing.T, name string) string {
 			return abs
 		}
 	}
-	t.Fatalf("series source test config %q not found in candidates: %v", name, candidates)
+	t.Skipf("series source integration config %q not found; checked %v", name, candidates)
 	return ""
 }
 

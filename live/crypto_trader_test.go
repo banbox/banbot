@@ -4,14 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/banbox/banbot/biz"
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
+	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
+	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banbot/orm/ormo"
+	runtimepkg "github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/strat"
+	banutils "github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
+	ta "github.com/banbox/banta"
 )
 
 type stubTraderDataSource struct {
@@ -20,6 +34,1172 @@ type stubTraderDataSource struct {
 	subscribedSubs [][]*strat.DataSub
 	emissions      [][]*orm.DataRecord
 	subscribeErr   error
+}
+
+type testRuntimeLifecycle struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	exchange  banexg.BanExchange
+	hooks     []func()
+	waitHooks []func()
+}
+
+type runtimeDepsCallbackTracker struct{}
+
+func (runtimeDepsCallbackTracker) EnterCallback() bool { return true }
+func (runtimeDepsCallbackTracker) LeaveCallback()      {}
+
+type closeErrorExchange struct {
+	banexg.BanExchange
+	closed bool
+}
+
+func (e *closeErrorExchange) Close() *errs.Error {
+	e.closed = true
+	return errs.NewMsg(errs.CodeRunTime, "close failed")
+}
+
+func completeCryptoTraderDepsForTest(deps biz.RuntimeDeps) biz.RuntimeDeps {
+	if deps.Core == nil {
+		deps.Core = &core.State{}
+	}
+	if deps.Clock == nil {
+		deps.Clock = btime.NewClockState(deps.Core.BackTestMode, nil)
+	}
+	if deps.Market == nil {
+		deps.Market = com.NewMarketState(deps.Core.ExgName)
+	}
+	if deps.Batch == nil {
+		deps.Batch = strat.NewBatchState()
+	}
+	if deps.Strategies == nil {
+		deps.Strategies = strat.NewState()
+	}
+	if deps.Orders == nil {
+		deps.Orders = ormo.NewOrderState()
+	}
+	if deps.Trading == nil {
+		deps.Trading = biz.NewTradingState()
+	}
+	if deps.Config == nil {
+		deps.Config = config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{"default": {}}})
+	}
+	if deps.Accounts == nil {
+		deps.Accounts = config.CloneAccountConfigsForRuntime(deps.Config.View().Accounts)
+	}
+	if len(deps.Accounts) == 0 {
+		deps.Accounts = map[string]*config.AccountConfig{"default": {}}
+	}
+	if deps.AccountsMu == nil {
+		deps.AccountsMu = &sync.RWMutex{}
+	}
+	if deps.Symbols == nil {
+		deps.Symbols = orm.NewSymbolState()
+	}
+	if deps.Exchange == nil {
+		deps.Exchange = &banexg.Exchange{}
+	}
+	if deps.DefaultAccount == "" {
+		deps.DefaultAccount = "default"
+	}
+	return deps
+}
+
+// newCryptoTraderForTest constructs intentionally incomplete fixtures for
+// lower-level lifecycle tests. Production callers use the fail-fast exported
+// constructor.
+func newCryptoTraderForTest(deps biz.RuntimeDeps) *CryptoTrader {
+	deps = completeCryptoTraderDepsForTest(deps)
+	if err := biz.BindRuntimeDeps(deps); err != nil {
+		panic(err)
+	}
+	traderState, err := biz.NewTraderWithRuntimeDeps(deps)
+	if err != nil {
+		panic(err)
+	}
+	trader := &CryptoTrader{Trader: traderState}
+	bound := trader.RuntimeDependencies()
+	trader.symbols = bound.Symbols
+	trader.dataDeps = bound.DataDeps()
+	return trader
+}
+
+func newBareCryptoTraderForTest(startup CryptoTraderStartupFunc) *CryptoTrader {
+	return &CryptoTrader{Trader: biz.Trader{}, startup: startup}
+}
+
+func newBoundCryptoTraderForTest(lifecycle RuntimeLifecycle, startup CryptoTraderStartupFunc) *CryptoTrader {
+	return bindCryptoTraderRuntime(newBareCryptoTraderForTest(startup), lifecycle, startup)
+}
+
+func newRuntimeCryptoTraderForTest(lifecycle RuntimeLifecycle, deps biz.RuntimeDeps, startup CryptoTraderStartupFunc) (*CryptoTrader, *errs.Error) {
+	return bindCryptoTraderRuntime(newCryptoTraderForTest(deps), lifecycle, startup), nil
+}
+
+func newTestRuntimeLifecycle() *testRuntimeLifecycle {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &testRuntimeLifecycle{ctx: ctx, cancel: cancel}
+}
+
+func (r *testRuntimeLifecycle) Context() context.Context {
+	return r.ctx
+}
+
+func (r *testRuntimeLifecycle) Exchange() banexg.BanExchange {
+	return r.exchange
+}
+
+func (r *testRuntimeLifecycle) OnClose(call func()) {
+	if call != nil {
+		r.hooks = append(r.hooks, call)
+	}
+}
+
+func (r *testRuntimeLifecycle) OnCloseWait(call func()) {
+	if call != nil {
+		r.waitHooks = append(r.waitHooks, call)
+	}
+}
+
+func (r *testRuntimeLifecycle) close() {
+	r.cancel()
+	for _, call := range r.hooks {
+		call()
+	}
+}
+
+func (r *testRuntimeLifecycle) stop() {
+	r.close()
+}
+
+func (r *testRuntimeLifecycle) closeAndWait() {
+	r.close()
+	for _, call := range r.waitHooks {
+		call()
+	}
+}
+
+type blockingReadConn struct {
+	net.Conn
+	readStarted chan struct{}
+	readOnce    sync.Once
+}
+
+func (c *blockingReadConn) Read(buf []byte) (int, error) {
+	c.readOnce.Do(func() { close(c.readStarted) })
+	return c.Conn.Read(buf)
+}
+
+func newStubLiveProvider(conn net.Conn) *data.LiveProvider {
+	client := &banutils.ClientIO{BanConn: banutils.BanConn{
+		Conn:    conn,
+		Data:    map[string]interface{}{},
+		Listens: map[string]banutils.ConnCB{},
+		Ready:   true,
+	}}
+	return &data.LiveProvider{SeriesWatcher: &data.SeriesWatcher{ClientIO: client}}
+}
+
+func TestNewCryptoTraderOwnsBatchState(t *testing.T) {
+	first := newBareCryptoTraderForTest(nil)
+	second := newBareCryptoTraderForTest(nil)
+	firstState := first.Trader.BatchState()
+	secondState := second.Trader.BatchState()
+	if firstState == nil || secondState == nil || firstState == secondState {
+		t.Fatal("crypto traders must own distinct batch states")
+	}
+	zero := &CryptoTrader{}
+	zeroState := zero.batchStateForRun()
+	if zeroState == nil || zeroState != zero.Trader.BatchState() {
+		t.Fatal("zero-value crypto trader did not lazily create a private batch state")
+	}
+}
+
+func TestRuntimeShutdownLifecycleOnCloseRunsOnce(t *testing.T) {
+	lifecycle := newTestRuntimeLifecycle()
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	shutdown := &runtimeShutdownLifecycle{owner: trader}
+	var calls int
+	shutdown.OnClose(func() { calls++ })
+
+	lifecycle.closeAndWait()
+
+	if calls != 1 {
+		t.Fatalf("shutdown callback calls = %d, want 1", calls)
+	}
+}
+
+func TestCryptoTraderExplicitRuntimeRejectsIncompleteWebAPIDeps(t *testing.T) {
+	state, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	cfg := &config.Config{
+		Exchange:      &config.ExchangeConfig{Name: "binance"},
+		StakeCurrency: []string{"USDT"},
+		APIServer:     &config.APIServerConfig{Enable: true},
+	}
+	snapshot := config.NewSnapshotWithDirs(cfg, t.TempDir(), "")
+	trader := newCryptoTraderForTest(biz.RuntimeDeps{Core: state, Config: snapshot})
+	if err := trader.startWebAPI(); err == nil || !strings.Contains(err.Error(), "runtime") {
+		t.Fatalf("startWebAPI error = %v, want missing runtime dependencies error", err)
+	}
+}
+
+func TestCryptoTraderExplicitRuntimeRequiresLifecycle(t *testing.T) {
+	state, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	trader := newCryptoTraderForTest(biz.RuntimeDeps{Core: state})
+	if err := trader.Init(); err == nil || !strings.Contains(err.Error(), "lifecycle") {
+		t.Fatalf("explicit runtime Init error = %v, want lifecycle requirement", err)
+	}
+	if err := trader.runWithDeps(); err == nil || !strings.Contains(err.Error(), "lifecycle") {
+		t.Fatalf("explicit runtime run error = %v, want lifecycle requirement", err)
+	}
+}
+
+func TestExplicitRuntimeStartJobsDoesNotUseLegacyPathWithoutLifecycle(t *testing.T) {
+	oldEnvReal := core.EnvReal
+	core.EnvReal = false
+	t.Cleanup(func() { core.EnvReal = oldEnvReal })
+
+	state := &core.State{EnvReal: true}
+	trader := newCryptoTraderForTest(biz.RuntimeDeps{Core: state})
+	trader.dp = &data.LiveProvider{}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("explicit runtime startJobs panicked through legacy path: %v", recovered)
+		}
+	}()
+	trader.startJobs()
+}
+
+func TestCryptoTraderRuntimeDepsRetainOneSymbolState(t *testing.T) {
+	symbols := orm.NewSymbolState()
+	catalog := data.NewDataSourceCatalog()
+	callbacks := runtimeDepsCallbackTracker{}
+	trader := newCryptoTraderForTest(biz.RuntimeDeps{
+		Symbols: symbols, Catalog: catalog, Callbacks: callbacks,
+	})
+	if trader.symbols != symbols || trader.RuntimeDependencies() == nil || trader.RuntimeDependencies().Symbols != symbols {
+		t.Fatal("crypto trader did not retain the supplied symbol state")
+	}
+	if trader.dataDeps.Symbols != symbols || trader.dataDeps.Catalog != catalog || trader.dataDeps.Callbacks != callbacks {
+		t.Fatal("runtime data projection did not retain its catalog, callback tracker, and symbol state")
+	}
+}
+
+func TestCryptoTraderWithRuntimeDepsRejectsMissingState(t *testing.T) {
+	state, err := core.NewState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	if _, err := NewCryptoTraderWithRuntimeDeps(biz.RuntimeDeps{Core: state}, nil); err == nil ||
+		!strings.Contains(err.Error(), "clock") {
+		t.Fatalf("explicit live constructor error = %v, want missing-state error", err)
+	}
+}
+
+func TestCryptoTraderWithRuntimeDepsRequiresCallbackOwnerLifecycle(t *testing.T) {
+	rt, err := runtimepkg.NewProcess().NewRuntime(runtimepkg.Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rt.Close)
+	deps := rt.BizDeps()
+	deps.Callbacks = runtimeDepsCallbackTracker{}
+	if _, runErr := NewCryptoTraderWithRuntimeDeps(deps, nil); runErr == nil ||
+		!strings.Contains(runErr.Error(), "callback owner") {
+		t.Fatalf("explicit live constructor error = %v, want callback owner lifecycle", runErr)
+	}
+}
+
+func TestCryptoTraderExplicitRuntimeRequiresExchangeInsteadOfGlobalFallback(t *testing.T) {
+	oldDefault := exg.Default
+	global := &banexg.Exchange{}
+	exg.Default = global
+	t.Cleanup(func() { exg.Default = oldDefault })
+
+	deps := completeCryptoTraderDepsForTest(biz.RuntimeDeps{})
+	deps.Exchange = nil
+	if _, err := NewCryptoTraderWithRuntimeDeps(deps, nil); err == nil || !strings.Contains(err.Error(), "exchange") {
+		t.Fatalf("explicit live constructor error = %v, want missing exchange", err)
+	}
+}
+
+func TestCryptoTraderExplicitRuntimeUsesBoundExchange(t *testing.T) {
+	exchange := &banexg.Exchange{}
+	trader := newCryptoTraderForTest(biz.RuntimeDeps{Exchange: exchange})
+	if got := trader.exchangeForRun(); got != exchange {
+		t.Fatalf("explicit runtime exchange = %p, want %p", got, exchange)
+	}
+}
+
+func TestExplicitPairRefreshRequiresOwnedOrderState(t *testing.T) {
+	deps := completeCryptoTraderDepsForTest(biz.RuntimeDeps{Exchange: &banexg.Exchange{}})
+	deps.Orders = nil
+	_, err := NewCryptoTraderWithRuntimeDeps(deps, nil)
+	if err == nil || !strings.Contains(err.Error(), "order state") {
+		t.Fatalf("missing runtime order state error = %v", err)
+	}
+}
+
+func TestCryptoTraderRuntimeLifecycleUsesBoundExchange(t *testing.T) {
+	oldDefault := exg.Default
+	legacy := &banexg.Exchange{}
+	bound := &banexg.Exchange{}
+	exg.Default = legacy
+	t.Cleanup(func() { exg.Default = oldDefault })
+
+	lifecycle := newTestRuntimeLifecycle()
+	lifecycle.exchange = bound
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	if got := trader.exchangeForRun(); got != bound {
+		t.Fatalf("runtime lifecycle exchange = %p, want bound exchange %p", got, bound)
+	}
+}
+
+func TestCryptoTraderEmitRejectsForeignRuntimeSymbol(t *testing.T) {
+	symbols := orm.NewSymbolStateWithIdentity("runtime", "spot")
+	if err := symbols.SetExSymbols([]*orm.ExSymbol{{
+		ID: 7, Exchange: "runtime", Market: "spot", Symbol: "RUNTIME/USDT",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	trader := newCryptoTraderForTest(biz.RuntimeDeps{Symbols: symbols})
+	trader.dp = &data.LiveProvider{}
+	var notifications int
+	trader.dp.OnDataSeries = func(*data.SeriesMsg, []*orm.DataSeries) *errs.Error {
+		notifications++
+		return nil
+	}
+
+	err := trader.Emit(&strat.DataSub{
+		Source:    "macro",
+		ExSymbol:  &orm.ExSymbol{ID: 7, Exchange: "legacy", Market: "spot", Symbol: "LEGACY/USDT"},
+		TimeFrame: "1d",
+	}, []*orm.DataRecord{{TimeMS: 1, EndMS: 2}})
+	if err == nil {
+		t.Fatal("Emit accepted a foreign runtime symbol")
+	}
+	if notifications != 0 {
+		t.Fatalf("foreign Emit sent %d notifications", notifications)
+	}
+}
+
+func TestCryptoTraderEmitPropagatesTraderFeedError(t *testing.T) {
+	symbols := orm.NewSymbolStateWithIdentity("runtime", "spot")
+	exs := &orm.ExSymbol{ID: 7, Exchange: "runtime", Market: "spot", Symbol: "RUNTIME/USDT"}
+	if err := symbols.SetExSymbols([]*orm.ExSymbol{exs}); err != nil {
+		t.Fatal(err)
+	}
+	trader := newCryptoTraderForTest(biz.RuntimeDeps{Symbols: symbols})
+	trader.dp = &data.LiveProvider{}
+	notifications := 0
+	trader.dp.OnDataSeries = func(*data.SeriesMsg, []*orm.DataSeries) *errs.Error {
+		notifications++
+		return nil
+	}
+
+	err := trader.Emit(&strat.DataSub{ExSymbol: exs, TimeFrame: "1m"}, []*orm.DataRecord{{
+		TimeMS: 1, EndMS: 2,
+		Values: map[string]any{
+			"open": 1.0, "high": 2.0, "low": 1.0, "close": "bad", "volume": 1.0,
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("Emit feed error = %v, want invalid bar error", err)
+	}
+	if notifications != 0 {
+		t.Fatalf("provider callback count after feed error = %d, want 0", notifications)
+	}
+}
+
+func TestCryptoTraderRuntimeCloseSkipsPendingBatchTimer(t *testing.T) {
+	lifecycle := newTestRuntimeLifecycle()
+	t.Cleanup(lifecycle.close)
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	state := trader.Trader.BatchState()
+
+	called := make(chan struct{}, 1)
+	job := &strat.StratJob{
+		Strat: &strat.TradeStrat{
+			Name: "pending-timer",
+			OnBatchInfos: func(string, map[string]*strat.JobEnv) {
+				called <- struct{}{}
+			},
+		},
+		Symbol: &orm.ExSymbol{Symbol: "BTC/USDT"},
+	}
+	state.AddTask("1m_default_pending-timer", "BTC/USDT_info", &strat.JobEnv{
+		Job: job, Env: &ta.BarEnv{}, Symbol: "BTC/USDT",
+	}, 60_000, 0)
+	trader.delayExecBatchAfter(100 * time.Millisecond)
+	lifecycle.closeAndWait()
+	trader.runtimeLock.Lock()
+	pending := len(trader.runtimeTimers)
+	trader.runtimeLock.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending runtime timers after close = %d, want 0", pending)
+	}
+
+	select {
+	case <-called:
+		t.Fatal("closed runtime timer executed a batch callback")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestCryptoTraderRuntimeCloseWaitsForReadyBatchTimer(t *testing.T) {
+	lifecycle := newTestRuntimeLifecycle()
+	t.Cleanup(lifecycle.close)
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	state := trader.Trader.BatchState()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	job := &strat.StratJob{
+		Strat: &strat.TradeStrat{
+			Name: "ready-timer",
+			OnBatchInfos: func(string, map[string]*strat.JobEnv) {
+				close(entered)
+				<-release
+			},
+		},
+		Symbol: &orm.ExSymbol{Symbol: "BTC/USDT"},
+	}
+	state.AddTask("1m_default_ready-timer", "BTC/USDT_info", &strat.JobEnv{
+		Job: job, Env: &ta.BarEnv{}, Symbol: "BTC/USDT",
+	}, 60_000, 0)
+	trader.delayExecBatchAfter(0)
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("ready timer did not enter its batch callback")
+	}
+	closeDone := make(chan struct{})
+	go func() {
+		lifecycle.close()
+		trader.joinRuntimeCallbacks()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		t.Fatal("runtime shutdown joined before ready timer callback completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime shutdown did not join ready timer callback")
+	}
+}
+
+func TestCryptoTraderRuntimeStopFromBatchCallbacksDoesNotDeadlock(t *testing.T) {
+	rt, err := runtimepkg.NewProcess().NewRuntime(runtimepkg.Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rt.Close)
+	deps := rt.BizDeps()
+	biz.InitLocalOrderMgrWithRuntimeDeps(deps, nil, false)
+	state := rt.Batch
+	infoDone := make(chan struct{})
+	mainDone := make(chan struct{})
+	strategy := &strat.TradeStrat{
+		Name: "runtime-stop-batch",
+		OnBatchInfos: func(string, map[string]*strat.JobEnv) {
+			rt.Stop()
+			close(infoDone)
+		},
+		OnBatchJobs: func([]*strat.StratJob) {
+			rt.Stop()
+			close(mainDone)
+		},
+	}
+	symbol := &orm.ExSymbol{Symbol: "BTC/USDT"}
+	infoJob := &strat.StratJob{Strat: strategy, Env: &ta.BarEnv{}, Symbol: symbol}
+	mainJob := &strat.StratJob{Strat: strategy, Env: &ta.BarEnv{}, Symbol: symbol}
+	state.AddTask("1m_default_runtime-stop-batch", "BTC/USDT_info", &strat.JobEnv{
+		Job: infoJob, Env: &ta.BarEnv{}, Symbol: symbol.Symbol,
+	}, 60_000, 0)
+	state.AddTask("1m_default_runtime-stop-batch", "BTC/USDT_main", &strat.JobEnv{
+		Job: mainJob, Symbol: symbol.Symbol,
+	}, 60_000, 0)
+	trader, traderErr := newRuntimeCryptoTraderForTest(rt, deps, nil)
+	if traderErr != nil {
+		t.Fatal(traderErr)
+	}
+	trader.delayExecBatchAfter(0)
+
+	select {
+	case <-infoDone:
+	case <-time.After(time.Second):
+		t.Fatal("Runtime.Stop from OnBatchInfos deadlocked")
+	}
+	select {
+	case <-mainDone:
+	case <-time.After(time.Second):
+		t.Fatal("Runtime.Stop from OnBatchJobs did not return")
+	}
+	trader.joinRuntimeCallbacks()
+}
+
+func TestCryptoTraderRuntimeStopClosesLiveProviderLoop(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() {
+		core.RunMode, core.LiveMode = oldMode, oldLive
+	})
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() { _ = serverConn.Close() })
+	conn := &blockingReadConn{Conn: clientConn, readStarted: make(chan struct{})}
+	provider := newStubLiveProvider(conn)
+	lifecycle := newTestRuntimeLifecycle()
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	trader.dp = provider
+	loopDone := make(chan struct{})
+	go func() {
+		_ = provider.LoopMain()
+		close(loopDone)
+	}()
+	select {
+	case <-conn.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("live provider loop did not start reading")
+	}
+
+	lifecycle.stop()
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Runtime.Stop did not terminate live provider loop")
+	}
+}
+
+func TestCryptoTraderRuntimeStopWaitsForProviderHandlers(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
+
+	serverConn, clientConn := net.Pipe()
+	server := &banutils.BanConn{Conn: serverConn, Ready: true}
+	t.Cleanup(func() { _ = server.Close() })
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	provider := newStubLiveProvider(clientConn)
+	provider.Listens["block"] = func(*banutils.IOMsgRaw) {
+		close(entered)
+		<-release
+	}
+	lifecycle := newTestRuntimeLifecycle()
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	trader.dp = provider
+	go func() { _ = provider.LoopMain() }()
+	if err := server.Write(&banutils.IOMsgRaw{Action: "block"}); err != nil {
+		t.Fatalf("write blocking message: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider handler did not start")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		lifecycle.closeAndWait()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+		t.Fatal("runtime stop returned before provider handler completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime stop did not join provider handler")
+	}
+	trader.joinRuntimeCallbacks()
+}
+
+func TestCryptoTraderRuntimeCloseJoinsHandlerBeforeReset(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
+
+	rt, err := runtimepkg.NewProcess().NewRuntime(runtimepkg.Options{
+		Mode:     core.RunModeLive,
+		Env:      core.RunEnvDryRun,
+		Config:   &config.Config{},
+		Exchange: &banexg.Exchange{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	server := &banutils.BanConn{Conn: serverConn, Ready: true}
+	provider := newStubLiveProvider(clientConn)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHandler)
+	provider.Listens["block"] = func(*banutils.IOMsgRaw) {
+		if got := rt.Batch.LastBatchMS(); got != 123 {
+			t.Errorf("handler observed batch state %d before close completed, want 123", got)
+		}
+		close(entered)
+		<-release
+		if got := rt.Batch.LastBatchMS(); got != 123 {
+			t.Errorf("handler observed batch state %d while in flight, want 123", got)
+		}
+	}
+	rt.Batch.SetLastBatchMS(123)
+	trader, traderErr := newRuntimeCryptoTraderForTest(rt, rt.BizDeps(), nil)
+	if traderErr != nil {
+		t.Fatal(traderErr)
+	}
+	trader.dp = provider
+
+	loopDone := make(chan struct{})
+	go func() {
+		_ = provider.LoopMain()
+		close(loopDone)
+	}()
+	if err := server.Write(&banutils.IOMsgRaw{Action: "block"}); err != nil {
+		t.Fatalf("write blocking message: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider handler did not start")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		rt.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		t.Fatal("runtime close returned before provider handler completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := rt.Batch.LastBatchMS(); got != 123 {
+		t.Fatalf("batch state reset while handler was in flight: got %d, want 123", got)
+	}
+	releaseHandler()
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime close did not join provider handler")
+	}
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("provider loop did not exit after runtime close")
+	}
+	if got := rt.Batch.LastBatchMS(); got != 0 {
+		t.Fatalf("batch state after runtime close = %d, want 0", got)
+	}
+
+	secondCloseDone := make(chan struct{})
+	go func() {
+		rt.Close()
+		close(secondCloseDone)
+	}()
+	select {
+	case <-secondCloseDone:
+	case <-time.After(time.Second):
+		t.Fatal("repeated runtime close did not return")
+	}
+}
+
+func TestCryptoTraderDropsEmitAfterRuntimeClose(t *testing.T) {
+	lifecycle := newTestRuntimeLifecycle()
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	trader.dp = &data.LiveProvider{}
+	var notifications int
+	trader.dp.OnDataSeries = func(*data.SeriesMsg, []*orm.DataSeries) *errs.Error {
+		notifications++
+		return nil
+	}
+	sub := &strat.DataSub{
+		Source:    "macro",
+		ExSymbol:  &orm.ExSymbol{ID: 1, Symbol: "CPI_US"},
+		TimeFrame: "1d",
+	}
+	rows := []*orm.DataRecord{{TimeMS: 1, EndMS: 2}}
+	if err := trader.Emit(sub, rows); err != nil {
+		t.Fatalf("Emit before close returned error: %v", err)
+	}
+	if notifications != 1 {
+		t.Fatalf("notifications before close = %d, want 1", notifications)
+	}
+
+	lifecycle.closeAndWait()
+	if err := trader.Emit(sub, rows); err != nil {
+		t.Fatalf("Emit after close returned error: %v", err)
+	}
+	if notifications != 1 {
+		t.Fatalf("callback ran after runtime close: notifications=%d, want 1", notifications)
+	}
+	lifecycle.closeAndWait()
+}
+
+func TestCryptoTraderRuntimeStopFromProviderHandlerDoesNotDeadlock(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() {
+		core.RunMode, core.LiveMode = oldMode, oldLive
+	})
+
+	rt, err := runtimepkg.NewProcess().NewRuntime(runtimepkg.Options{
+		Mode: core.RunModeLive,
+		Env:  core.RunEnvDryRun,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rt.Close)
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() { _ = serverConn.Close() })
+	server := &banutils.BanConn{Conn: serverConn, Ready: true}
+	provider := newStubLiveProvider(clientConn)
+	stopDone := make(chan struct{})
+	provider.Listens["stop"] = func(*banutils.IOMsgRaw) {
+		rt.Stop()
+		close(stopDone)
+	}
+	trader := newBoundCryptoTraderForTest(rt, nil)
+	trader.dp = provider
+	loopDone := make(chan struct{})
+	go func() {
+		_ = provider.LoopMain()
+		close(loopDone)
+	}()
+	if err := server.Write(&banutils.IOMsgRaw{Action: "stop"}); err != nil {
+		t.Fatalf("write stop message: %v", err)
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Runtime.Stop from provider handler deadlocked")
+	}
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("provider loop did not exit after Runtime.Stop")
+	}
+}
+
+func TestCryptoTraderRuntimeCloseFromProviderHandlerJoinsBeforeReset(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() {
+		core.RunMode, core.LiveMode = oldMode, oldLive
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	runtimeConfig := &config.Config{SpiderAddr: listener.Addr().String()}
+	rt, err := runtimepkg.NewProcess().NewRuntime(runtimepkg.Options{
+		Mode: core.RunModeLive, Env: core.RunEnvDryRun, Config: runtimeConfig, Exchange: &banexg.Exchange{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rt.Close)
+	rt.Batch.SetLastBatchMS(123)
+
+	accepted := make(chan net.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+	handlerDone := make(chan struct{})
+	deps := rt.BizDeps()
+	trader, traderErr := newRuntimeCryptoTraderForTest(rt, deps, nil)
+	if traderErr != nil {
+		t.Fatal(traderErr)
+	}
+	// Keep this provider's websocket registry unfiltered so the test can invoke
+	// the real OnTrades wrapper without constructing a full symbol job.
+	trader.dataDeps.Symbols = nil
+	tradeJob := &strat.StratJob{Symbol: &orm.ExSymbol{Symbol: "BTC/USDT"}, Strat: &strat.TradeStrat{
+		WsSubs: map[string]string{core.WsSubTrade: "_cur_"},
+		OnWsTrades: func(*strat.StratJob, string, []*banexg.Trade) {
+			rt.Close()
+			if got := rt.Batch.LastBatchMS(); got != 123 {
+				t.Errorf("runtime state reset while provider handler was active: got %d, want 123", got)
+			}
+			close(handlerDone)
+		},
+	}}
+	if err := strat.RegisterWsJob(rt.Strategies, tradeJob); err != nil {
+		t.Fatal(err)
+	}
+	provider, providerErr := data.NewLiveProviderWithRuntimeDeps(trader.dataDeps, nil, nil)
+	if providerErr != nil {
+		t.Fatal(providerErr)
+	}
+	_ = listener.Close()
+	var serverConn net.Conn
+	select {
+	case serverConn = <-accepted:
+	case acceptErr := <-acceptErr:
+		t.Fatal(acceptErr)
+	case <-time.After(time.Second):
+		t.Fatal("typed live provider did not connect")
+	}
+	t.Cleanup(func() {
+		if serverConn != nil {
+			_ = serverConn.Close()
+		}
+	})
+	trader.dp = provider
+
+	go func() {
+		provider.OnTrades("runtime", "spot", "BTC/USDT", []*banexg.Trade{{}})
+	}()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Runtime.Close from provider handler did not return")
+	}
+	rt.Join()
+	if got := rt.Batch.LastBatchMS(); got != 0 {
+		t.Fatalf("batch state after Runtime.Close = %d, want 0", got)
+	}
+}
+
+func TestCryptoTraderTypedCleanupUsesRuntimeStrategyState(t *testing.T) {
+	oldLegacyJobs, oldUnWatch := strat.AccJobs, strat.WsSubUnWatch
+	t.Cleanup(func() {
+		strat.AccJobs = oldLegacyJobs
+		strat.WsSubUnWatch = oldUnWatch
+	})
+
+	legacyCalled := false
+	strat.AccJobs = map[string]map[string]map[string]*strat.StratJob{
+		"legacy": {
+			"legacy_env": {
+				"legacy": {Strat: &strat.TradeStrat{
+					OnShutDown: func(*strat.StratJob) { legacyCalled = true },
+				}},
+			},
+		},
+	}
+	typedCalled := false
+	typedState := strat.NewState()
+	typedState.SetJobMap("typed", "typed_env", map[string]*strat.StratJob{
+		"typed": {Strat: &strat.TradeStrat{
+			OnShutDown: func(*strat.StratJob) { typedCalled = true },
+		}},
+	})
+
+	trader := newCryptoTraderForTest(biz.RuntimeDeps{Strategies: typedState})
+	trader.enableRuntimeCleanup()
+	trader.finishRunCleanup()
+	if !typedCalled {
+		t.Fatal("typed strategy shutdown callback did not run")
+	}
+	if legacyCalled {
+		t.Fatal("typed live cleanup fell back to legacy strategy state")
+	}
+}
+
+func TestCryptoTraderLegacyCleanupLogsCloseErrorWithoutPanic(t *testing.T) {
+	oldAccounts := config.Accounts
+	config.Accounts = map[string]*config.AccountConfig{}
+	t.Cleanup(func() { config.Accounts = oldAccounts })
+	exchange := &closeErrorExchange{}
+	exitCleanUpWithRuntime(nil, exchange, nil, nil)
+	if !exchange.closed {
+		t.Fatal("legacy cleanup did not close exchange")
+	}
+}
+
+func TestCryptoTraderSetProviderFromProviderHandlerDefersJoinToOwner(t *testing.T) {
+	oldMode, oldLive := core.RunMode, core.LiveMode
+	core.RunMode = core.RunModeLive
+	core.LiveMode = true
+	t.Cleanup(func() { core.RunMode, core.LiveMode = oldMode, oldLive })
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	server := &banutils.BanConn{Conn: serverConn, Ready: true}
+	oldProvider := newStubLiveProvider(clientConn)
+	newProvider := &data.LiveProvider{}
+	lifecycle := newTestRuntimeLifecycle()
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	trader.dp = oldProvider
+
+	handlerStarted := make(chan struct{})
+	swapped := make(chan struct{})
+	handlerBlocked := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHandler)
+	accepted := make(chan bool, 1)
+	oldProvider.SeriesWatcher.ClientIO.Listens["replace"] = func(*banutils.IOMsgRaw) {
+		close(handlerStarted)
+		accepted <- trader.setProvider(newProvider)
+		close(swapped)
+		close(handlerBlocked)
+		<-release
+	}
+
+	loopDone := make(chan struct{})
+	go func() {
+		_ = oldProvider.LoopMain()
+		close(loopDone)
+	}()
+	if err := server.Write(&banutils.IOMsgRaw{Action: "replace"}); err != nil {
+		t.Fatalf("write provider replacement message: %v", err)
+	}
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("provider handler did not start")
+	}
+	select {
+	case <-swapped:
+	case <-time.After(time.Second):
+		t.Fatal("setProvider waited for the replacing provider handler")
+	}
+	if !<-accepted {
+		t.Fatal("setProvider rejected the active runtime replacement")
+	}
+	if !oldProvider.SeriesWatcher.ClientIO.IsClosed() {
+		t.Fatal("setProvider did not stop the retired provider immediately")
+	}
+	if got := trader.provider(); got != newProvider {
+		t.Fatalf("current provider = %p, want replacement %p", got, newProvider)
+	}
+	select {
+	case <-handlerBlocked:
+	case <-time.After(time.Second):
+		t.Fatal("provider handler did not reach its blocking point")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		lifecycle.closeAndWait()
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+		t.Fatal("owner shutdown joined before the provider handler returned")
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseHandler()
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("owner shutdown did not join the retired provider")
+	}
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("retired provider loop did not exit")
+	}
+
+	trader.runtimeLock.Lock()
+	deferred := providerInList(trader.retiredProviders, oldProvider)
+	current := trader.dp
+	trader.runtimeLock.Unlock()
+	if deferred || current != nil {
+		t.Fatalf("provider ownership after shutdown: retired=%v current=%p", deferred, current)
+	}
+}
+
+func TestCryptoTraderRuntimeStateResetsBetweenRuns(t *testing.T) {
+	lifecycle := newTestRuntimeLifecycle()
+	t.Cleanup(lifecycle.close)
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	trader.initFn = func() *errs.Error {
+		trader.dp = &data.LiveProvider{}
+		return nil
+	}
+	trader.collectJobsFn = func() []*strat.StratJob { return nil }
+	trader.startJobsFn = func() {}
+	var runs int
+	trader.loopMainFn = func() *errs.Error {
+		runs++
+		if trader.runtimeStopped.Load() {
+			t.Fatalf("runtime stop state leaked into run %d", runs)
+		}
+		return nil
+	}
+	for range 2 {
+		if err := trader.runWithDeps(); err != nil {
+			t.Fatalf("runWithDeps failed: %v", err)
+		}
+	}
+	if runs != 2 {
+		t.Fatalf("runs = %d, want 2", runs)
+	}
+}
+
+func TestCryptoTraderRuntimeCloseWaitsForInitBeforeReset(t *testing.T) {
+	rt, err := runtimepkg.NewProcess().NewRuntime(runtimepkg.Options{Config: &config.Config{}, Exchange: &banexg.Exchange{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.Batch.SetLastBatchMS(123)
+
+	initStarted := make(chan struct{})
+	releaseInit := make(chan struct{})
+	startCalled := make(chan struct{}, 1)
+	loopCalled := make(chan struct{}, 1)
+	trader, traderErr := newRuntimeCryptoTraderForTest(rt, rt.BizDeps(), nil)
+	if traderErr != nil {
+		t.Fatal(traderErr)
+	}
+	trader.initFn = func() *errs.Error {
+		close(initStarted)
+		<-releaseInit
+		if !trader.setProvider(&data.LiveProvider{}) {
+			return errs.NewMsg(core.ErrRunTime, "runtime is stopped")
+		}
+		return nil
+	}
+	trader.startJobsFn = func() { startCalled <- struct{}{} }
+	trader.loopMainFn = func() *errs.Error {
+		loopCalled <- struct{}{}
+		return nil
+	}
+
+	traderDone := make(chan *errs.Error, 1)
+	go func() { traderDone <- trader.runWithDeps() }()
+	select {
+	case <-initStarted:
+	case <-time.After(time.Second):
+		t.Fatal("trader init did not start")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		rt.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		t.Error("runtime close returned before in-flight init completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := rt.Batch.LastBatchMS(); got != 123 {
+		t.Errorf("batch state reset while init was in flight: got %d, want 123", got)
+	}
+
+	close(releaseInit)
+	select {
+	case runErr := <-traderDone:
+		if runErr == nil {
+			t.Error("trader run continued after runtime close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("trader run did not finish after init release")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime close did not finish after init release")
+	}
+	select {
+	case <-startCalled:
+		t.Error("startJobs ran after runtime close")
+	default:
+	}
+	select {
+	case <-loopCalled:
+		t.Error("loopMain ran after runtime close")
+	default:
+	}
+	if got := rt.Batch.LastBatchMS(); got != 0 {
+		t.Errorf("batch state after runtime close = %d, want 0", got)
+	}
+}
+
+func TestCryptoTraderRunUsesRuntimeContext(t *testing.T) {
+	lifecycle := newTestRuntimeLifecycle()
+	wantCtx := lifecycle.Context()
+	var startupCtx, bootstrapCtx context.Context
+	trader := newBoundCryptoTraderForTest(lifecycle, func(ctx context.Context, _ *CryptoTrader) error {
+		startupCtx = ctx
+		return nil
+	})
+	trader.initFn = func() *errs.Error {
+		trader.dp = &data.LiveProvider{}
+		return nil
+	}
+	job := &strat.StratJob{
+		Symbol: &orm.ExSymbol{ID: 7, Exchange: "binance", Market: "spot", Symbol: "BTC/USDT"},
+		Strat: &strat.TradeStrat{
+			OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+				return []*strat.DataSub{{Source: "macro", ExSymbol: s.Symbol, TimeFrame: "1d"}}
+			},
+		},
+	}
+	trader.collectJobsFn = func() []*strat.StratJob { return []*strat.StratJob{job} }
+	trader.nowMSFn = func() int64 { return 200_000_000 }
+	trader.seriesRuntime = data.NewSeriesRuntime(trader)
+	trader.seriesRuntime.EnsureFunc = func(ctx context.Context, _ *data.ThirdPartySeriesBootstrap) *errs.Error {
+		bootstrapCtx = ctx
+		return nil
+	}
+	trader.seriesRuntime.ActivateFn = func(context.Context, []*strat.DataSub, data.DataSink) ([]*strat.DataSub, error) {
+		return nil, nil
+	}
+	trader.startJobsFn = func() {}
+	trader.loopMainFn = func() *errs.Error { return nil }
+	if err := trader.runWithDeps(); err != nil {
+		t.Fatalf("runWithDeps failed: %v", err)
+	}
+	if startupCtx != wantCtx || bootstrapCtx != wantCtx {
+		t.Fatalf("runtime context was not propagated: startup=%p bootstrap=%p want=%p", startupCtx, bootstrapCtx, wantCtx)
+	}
+
+	backgroundTrader := newBareCryptoTraderForTest(nil)
+	if got := backgroundTrader.runContext(); got != context.Background() {
+		t.Fatalf("trader without runtime context = %p, want context.Background", got)
+	}
 }
 
 func newStubTraderDataSource(name string) *stubTraderDataSource {
@@ -153,7 +1333,7 @@ func TestCryptoTraderEmitRoutesThirdPartyRowsThroughOnData(t *testing.T) {
 }
 
 func TestCryptoTraderRunSkipsStartupWhenCallbackNil(t *testing.T) {
-	trader := NewCryptoTrader()
+	trader := newBareCryptoTraderForTest(nil)
 	initCalls := 0
 	startCalls := 0
 	loopCalls := 0
@@ -201,8 +1381,10 @@ func TestCryptoTraderRunEnsuresThirdPartyBeforeActivateAndLoop(t *testing.T) {
 		TimeFrame: alpha.info.TimeFrame, WarmupNum: 4,
 		Fields:       []string{"open", "high", "low", "close", "volume"},
 		SeriesFields: []string{"open", "high", "low", "close", "volume"},
+		Frequency:    orm.FrequencyBar,
+		Projection:   orm.ProjectionSelected,
 	}}
-	trader := NewCryptoTrader()
+	trader := newBareCryptoTraderForTest(nil)
 	steps := make([]string, 0, 4)
 	trader.initFn = func() *errs.Error {
 		trader.dp = &data.LiveProvider{}
@@ -251,7 +1433,7 @@ func TestCryptoTraderRunEnsuresThirdPartyBeforeActivateAndLoop(t *testing.T) {
 }
 
 func TestCryptoTraderRunEnsureFailureStopsBeforeActivateAndLoop(t *testing.T) {
-	trader := NewCryptoTrader()
+	trader := newBareCryptoTraderForTest(nil)
 	trader.initFn = func() *errs.Error {
 		trader.dp = &data.LiveProvider{}
 		return nil
@@ -295,7 +1477,7 @@ func TestCryptoTraderRunEnsureFailureStopsBeforeActivateAndLoop(t *testing.T) {
 }
 
 func TestCryptoTraderRunActivateFailureStopsBeforeLoop(t *testing.T) {
-	trader := NewCryptoTrader()
+	trader := newBareCryptoTraderForTest(nil)
 	trader.initFn = func() *errs.Error {
 		trader.dp = &data.LiveProvider{}
 		return nil
@@ -340,7 +1522,7 @@ func TestCryptoTraderRunActivateFailureStopsBeforeLoop(t *testing.T) {
 }
 
 func TestCryptoTraderRunMarksPartiallyActivatedSourcesRetryable(t *testing.T) {
-	trader := NewCryptoTrader()
+	trader := newBareCryptoTraderForTest(nil)
 	trader.initFn = func() *errs.Error {
 		trader.dp = &data.LiveProvider{}
 		return nil
@@ -398,7 +1580,7 @@ func TestCryptoTraderRunStartupActivatesSelectedSourcesOnce(t *testing.T) {
 		t.Fatalf("RegisterDataSource beta failed: %v", err)
 	}
 
-	trader := NewCryptoTraderWith(func(ctx context.Context, trader *CryptoTrader) error {
+	trader := newBareCryptoTraderForTest(func(ctx context.Context, trader *CryptoTrader) error {
 		_, err := data.ActivateDataSources(ctx, []*strat.DataSub{
 			{Source: alpha.info.Name, ExSymbol: &orm.ExSymbol{ID: 101, Symbol: "BTC/USDT"}, TimeFrame: alpha.info.TimeFrame},
 			{Source: beta.info.Name, ExSymbol: &orm.ExSymbol{ID: 202, Symbol: "ETH/USDT"}, TimeFrame: beta.info.TimeFrame},
@@ -443,7 +1625,7 @@ func TestCryptoTraderRunStartupActivatesSelectedSourcesOnce(t *testing.T) {
 }
 
 func TestCryptoTraderRunStartupReturnsUnknownSourceError(t *testing.T) {
-	trader := NewCryptoTraderWith(func(ctx context.Context, trader *CryptoTrader) error {
+	trader := newBareCryptoTraderForTest(func(ctx context.Context, trader *CryptoTrader) error {
 		_, err := data.ActivateDataSources(ctx, []*strat.DataSub{{
 			Source:    "bot_missing_source",
 			ExSymbol:  &orm.ExSymbol{ID: 404, Symbol: "BTC/USDT"},
@@ -476,7 +1658,7 @@ func TestCryptoTraderRunStartupReturnsUnknownSourceError(t *testing.T) {
 
 func TestCryptoTraderRunStartupReturnsCallbackError(t *testing.T) {
 	want := errors.New("startup boom")
-	trader := NewCryptoTraderWith(func(ctx context.Context, trader *CryptoTrader) error {
+	trader := newBareCryptoTraderForTest(func(ctx context.Context, trader *CryptoTrader) error {
 		return want
 	})
 	startCalls := 0

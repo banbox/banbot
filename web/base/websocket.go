@@ -3,24 +3,31 @@ package base
 import (
 	"fmt"
 	"github.com/banbox/banbot/orm"
-	utils2 "github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
 	"github.com/gofiber/contrib/websocket"
 	"go.uber.org/zap"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type WsClient struct {
-	Conn   *websocket.Conn
-	Subs   map[string]bool
-	remote string
+	Conn      *websocket.Conn
+	Subs      map[string]bool
+	remote    string
+	hub       *WsHub
+	writeMu   sync.Mutex
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 func NewWsClient(c *websocket.Conn) *WsClient {
-	return &WsClient{Conn: c, Subs: make(map[string]bool), remote: c.RemoteAddr().String()}
+	return &WsClient{Conn: c, Subs: make(map[string]bool), remote: c.RemoteAddr().String(), hub: legacyWsHub}
 }
 
 func (c *WsClient) HandleForever() {
+	defer c.Close(true)
 	log.Debug("ws client joined", zap.String("ip", c.remote))
 	for {
 		if c.Conn == nil {
@@ -70,26 +77,25 @@ func (c *WsClient) WriteMsg(msg map[string]interface{}) {
 		log.Warn("marshal ws msg fail", zap.Error(err))
 		return
 	}
-	err = c.Conn.WriteMessage(websocket.TextMessage, data)
+	err = c.write(data)
 	if err != nil {
 		log.Warn("write ws msg fail", zap.Error(err))
 	}
 }
 
 func (c *WsClient) Subscribe(msg map[string]interface{}) {
-	exs := parseExSymbol(msg)
+	exs := c.parseExSymbol(msg)
 	if exs == nil {
 		return
 	}
 	key := fmt.Sprintf("%s_%s_%s", exs.Exchange, exs.Market, exs.Symbol)
-	c.Subs[key] = true
-	SetSeriesSub(c, true, true, key)
+	c.hub.setSubscription(c, true, key)
 }
 
-func parseExSymbol(msg map[string]interface{}) *orm.ExSymbol {
+func (c *WsClient) parseExSymbol(msg map[string]interface{}) *orm.ExSymbol {
 	exchange := utils.GetMapVal(msg, "exchange", "")
 	symbol := utils.GetMapVal(msg, "symbol", "")
-	exs, err2 := orm.ParseShort(exchange, symbol)
+	exs, err2 := c.hub.parseSymbol(exchange, symbol)
 	if err2 != nil {
 		log.Info("invalid ws subscribe", zap.String("exg", exchange), zap.String("pair", symbol))
 		return nil
@@ -98,22 +104,25 @@ func parseExSymbol(msg map[string]interface{}) *orm.ExSymbol {
 }
 
 func (c *WsClient) UnSubscribe(msg map[string]interface{}) {
-	exs := parseExSymbol(msg)
+	exs := c.parseExSymbol(msg)
 	if exs == nil {
 		return
 	}
 	key := fmt.Sprintf("%s_%s_%s", exs.Exchange, exs.Market, exs.Symbol)
-	if _, ok := c.Subs[key]; ok {
-		SetSeriesSub(c, false, true, key)
-		delete(c.Subs, key)
-	}
+	c.hub.setSubscription(c, false, key)
 }
 
-func (c *WsClient) Close(lock bool) {
-	keys := utils2.KeysOfMap(c.Subs)
-	SetSeriesSub(c, false, lock, keys...)
-	c.Subs = nil
-	_ = c.Conn.Close()
-	c.Conn = nil
-	log.Debug("ws client removed", zap.String("addr", c.remote))
+func (c *WsClient) Close(_ bool) {
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		c.hub.remove(c)
+		// fasthttp/websocket permits Close concurrently with all methods.
+		// Do not take writeMu: Close must interrupt a stalled network write.
+		if c.Conn != nil {
+			// fasthttp's default hijack wrapper defers the actual Close until
+			// the handler returns. A network deadline also interrupts its reader.
+			_ = c.Conn.NetConn().SetDeadline(time.Now())
+			_ = c.Conn.Close()
+		}
+	})
 }

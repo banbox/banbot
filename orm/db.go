@@ -6,7 +6,11 @@ package orm
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/banbox/banbot/core"
+	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -22,12 +26,191 @@ func New(db DBTX) *Queries {
 	return &Queries{db: db}
 }
 
+// NewWithStorage binds a low-level database handle to an explicit Storage
+// owner. The generated query methods remain allocation-free; the owner is
+// consulted only for backend selection and coordination-sensitive helpers.
+func NewWithStorage(db DBTX, storage *Storage) *Queries {
+	return &Queries{db: db, storage: storage}
+}
+
 type Queries struct {
-	db DBTX
+	db       DBTX
+	storage  *Storage
+	symbols  *SymbolState
+	options  *KlineRuntimeOptions
+	exchange banexg.BanExchange
+}
+
+func (q *Queries) Storage() *Storage {
+	if q == nil {
+		return nil
+	}
+	return q.storage
+}
+
+func (q *Queries) isQuestDB() bool {
+	if q != nil && q.storage != nil {
+		return q.storage.IsQuestDB()
+	}
+	return IsQuestDB
+}
+
+func (q *Queries) processLockRoot() string {
+	if q != nil && q.storage != nil {
+		return q.storage.ProcessLockRoot()
+	}
+	return compactProcessLockRootFn()
+}
+
+func (q *Queries) symbolByID(id int32) *ExSymbol {
+	if q != nil {
+		if q.symbols != nil {
+			return q.symbols.GetSymbolByID(id)
+		}
+		if q.storage != nil {
+			if q.storage.legacy {
+				return GetSymbolByID(id)
+			}
+			return nil
+		}
+	}
+	return GetSymbolByID(id)
+}
+
+// usesLegacySymbolCatalog reports whether this query handle is still using
+// the package-level symbol registry. Explicit Storage and SymbolState owners
+// must never fall back to that registry when a SID is absent.
+func (q *Queries) usesLegacySymbolCatalog() bool {
+	if q == nil {
+		return true
+	}
+	if q.symbols != nil {
+		return false
+	}
+	return q.storage == nil || q.storage.legacy
+}
+
+// requireSymbolState makes explicit database handles fail closed when a
+// symbol operation was not given the matching runtime catalog. Only the
+// package-level legacy handles are allowed to use the default catalog.
+func (q *Queries) requireSymbolState() (*SymbolState, error) {
+	if q == nil {
+		return nil, fmt.Errorf("symbol query is required")
+	}
+	if q.symbols != nil {
+		return q.symbols, nil
+	}
+	if q.storage != nil && !q.storage.legacy {
+		return nil, fmt.Errorf("explicit storage requires an explicit symbol state")
+	}
+	return loadDefaultSymbolState(), nil
+}
+
+type dbBeginner interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+func (q *Queries) begin(ctx context.Context) (pgx.Tx, *Queries, error) {
+	beginner, ok := q.db.(dbBeginner)
+	if !ok {
+		return nil, nil, fmt.Errorf("database connection does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tx, q.WithTx(tx), nil
 }
 
 func (q *Queries) WithTx(tx pgx.Tx) *Queries {
 	return &Queries{
-		db: tx,
+		db:       tx,
+		storage:  q.storage,
+		symbols:  q.symbols,
+		options:  q.options,
+		exchange: q.exchange,
 	}
+}
+
+// WithSeriesSymbolState returns a query handle that resolves adjustment
+// constituent SIDs from the supplied runtime catalog.
+func (q *Queries) WithSeriesSymbolState(symbols *SymbolState) *Queries {
+	if q == nil {
+		return &Queries{symbols: symbols}
+	}
+	copy := *q
+	copy.symbols = symbols
+	return &copy
+}
+
+// WithKlineRuntimeOptions binds the low-frequency replay and clock policy to
+// this query handle. The value is copied so callers can reuse their options
+// without sharing mutable query state.
+func (q *Queries) WithKlineRuntimeOptions(options KlineRuntimeOptions) *Queries {
+	if q == nil {
+		return &Queries{options: &options}
+	}
+	copy := *q
+	copy.options = &options
+	return &copy
+}
+
+// WithExchange binds the runtime-owned exchange session used by explicit
+// aggregate and market-metadata helpers. Legacy callers can leave it unset.
+func (q *Queries) WithExchange(exchange banexg.BanExchange) *Queries {
+	if q == nil {
+		return &Queries{exchange: exchange}
+	}
+	copy := *q
+	copy.exchange = exchange
+	return &copy
+}
+
+func (q *Queries) hasExplicitKlineRuntime() bool {
+	return q != nil && (q.symbols != nil || (q.storage != nil && !q.storage.legacy))
+}
+
+func (q *Queries) usesExplicitExchange() bool {
+	return q != nil && (q.exchange != nil || q.hasExplicitKlineRuntime())
+}
+
+// requireKlineRuntimeOptions rejects an incomplete explicit query instead of
+// silently borrowing the process-wide replay policy. The package-level query
+// facade remains compatible with its legacy defaults.
+func (q *Queries) requireKlineRuntimeOptions() (KlineRuntimeOptions, *errs.Error) {
+	if q != nil && q.options != nil {
+		options := *q.options
+		if err := validateKlineRuntimeOptions(options); err != nil {
+			return KlineRuntimeOptions{}, err
+		}
+		return options, nil
+	}
+	if q.hasExplicitKlineRuntime() {
+		return KlineRuntimeOptions{}, errs.NewMsg(core.ErrBadConfig,
+			"explicit query requires K-line runtime options")
+	}
+	return LegacyKlineRuntimeOptions(), nil
+}
+
+// requireExplicitKlineRuntime validates the complete dependency set needed by
+// explicit series reads. An explicit storage/catalog without its exchange
+// session would otherwise reach alignment helpers with a nil adapter and
+// silently fall back to a process-wide exchange cache (or return offset 0).
+func (q *Queries) requireExplicitKlineRuntime() (KlineRuntimeOptions, *errs.Error) {
+	options, err := q.requireKlineRuntimeOptions()
+	if err != nil {
+		return KlineRuntimeOptions{}, err
+	}
+	if q != nil && q.usesExplicitExchange() && q.exchange == nil {
+		return KlineRuntimeOptions{}, errs.NewMsg(core.ErrExgNotInit,
+			"explicit query requires an exchange adapter")
+	}
+	return options, nil
+}
+
+func (q *Queries) klineRuntimeOptions() KlineRuntimeOptions {
+	if q != nil && q.options != nil {
+		return *q.options
+	}
+	return LegacyKlineRuntimeOptions()
 }

@@ -19,7 +19,10 @@ const (
 	klineInsertMaxRetry    = 10
 )
 
-var klineInsertQuestVisibilityGrace = 3 * time.Second
+// QuestDB may take longer to publish sranges_q while many historical K-line
+// batches are being written concurrently. Keep the owner/recovery grace long
+// enough to absorb that WAL backlog; callers still validate the physical rows.
+var klineInsertQuestVisibilityGrace = 30 * time.Second
 
 type klineInsertLockOwner struct {
 	PID   int    `json:"pid"`
@@ -42,6 +45,13 @@ func klineInsertLockRoot() string {
 		return ""
 	}
 	return filepath.Join(dataDir, "locks", "kline_insert")
+}
+
+func (q *Queries) insertLockRoot() string {
+	if q.storage != nil {
+		return filepath.Join(q.storage.ProcessLockRoot(), "kline_insert")
+	}
+	return klineInsertLockRoot()
 }
 
 func klineInsertLockPath(root string, sid int32, timeframe string) string {

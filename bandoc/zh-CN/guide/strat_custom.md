@@ -105,14 +105,14 @@ type TradeStrat struct {
     WsSubs        map[string]string    // websocket订阅: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 	DrawDownExit  bool // 是否启用回撤止损（即跟踪止损）
     HedgeOff      bool    // 关闭合约双向持仓
-	BatchInOut    bool    // 是否批量执行入场/出场
-	BatchInfo     bool    // 是否对OnInfoBar后执行批量处理
+	BatchInOut    bool    // 是否在主周期OnData(RoleMain)/OnBar后批量执行入场/出场
+	BatchInfo     bool    // 是否在辅助周期OnData(RoleInfo)/OnInfoBar后执行批量处理
 	StakeRate     float64 // 相对基础金额开单倍率
     StopLoss      float64 // 此策略打开所有订单的默认止损比率（不带杠杆）
 	StopEnterBars int // 限价单如果超过给定K线仍未入场则取消
 	EachMaxLong   int      // 单个品种最大同时开多数量，默认0不限制
 	EachMaxShort  int      // 单个品种最大同时开空数量，默认0不限制
-	RunTimeFrames []string // 允许运行的时间周期，不提供时使用全局配置
+	RunTimeFrames []string // 允许运行的时间周期，不提供时使用当前 Runtime 配置快照中的默认周期
 	Outputs       []string // 策略输出的文本文件内容，每个字符串是一行
 	Policy        *config.RunPolicyConfig // 运行时配置
 
@@ -176,7 +176,7 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	}
 }
 ```
-> 您可在任意回调函数中使用指标，但注意，**所有指标都必须先在OnBar中注册调用一遍**；否则指标计算会出现错误。
+> 您可在任意回调函数中使用指标，但注意，**所有指标都必须先在主周期 `OnData` 处理器中无条件调用一遍**；否则指标计算会出现错误。
 
 ## 技术指标库banta
 banbot使用高性能指标库[banta](https://github.com/banbox/banta)，它会对每个bar的指标计算状态进行缓存，这是banbot高性能的关键，您可访问[DeepWiki](https://deepwiki.com/banbox/banta)了解关于banta的更多信息。
@@ -190,6 +190,8 @@ banbot使用高性能指标库[banta](https://github.com/banbox/banta)，它会�
 `banta.BarEnv`中内置了几个原始的`Series`，即：`Open`,`High`,`Low`,`Close`,`Volume`，分别保存了开盘价、最高价、最低价、收盘价、成交量的序列信息。
 
 `Series`是`banta`中用于存储序列化数据的特殊结构体。`banta`中的所有技术指标函数，都是接收一个或多个`Series`，经过运算后，返回一个`Series`。
+
+当前可用指标还包括：`VWMA/VWAP`、`DEMA/T3/TEMA/MAMA/SSF/SWMA/TRIMA/VIDYA/ZLMA`、`DMI/ADX/AROONOSC/DX/SAR/PSAR/Ichimoku/KST`、`StochF/STOCHF/ULTOSC/Fisher/ROCR/TRIX/TSI/DPO/MOM/WilliamsPercent`、`Squeeze/NATR/Supertrend/Donchian/KeltnerChannel/PMAX`、`CMF/ADL/ADOSC/EFI/OBV/VPCI/MFI`、`LinReg/Slope/Correlation/LINEARREG_ANGLE`、`PivotHigh/PivotLow` 和 `CDL*` K线形态。多返回值函数须按知识库中注明的顺序接收。
 
 您可通过`Series.Get(0)`获取某个序列的最新值，比如`e.Close.Get(0)`获取最新收盘价；
 也可通过`Series.Range(0,5)`获取某个序列最近的5个值，返回长度为5的`[]float64`数组。
@@ -506,7 +508,8 @@ s.SetAllStopLoss(core.OdDirtLong, &ormo.ExitTrigger{
 ## 批量任务处理
 有时候您可能需要针对当前策略的所有品种一起进行某些计算（比如相关系数），得到一些中间状态保存，或者一起进行开单或平仓。
 这时候您可以使用`OnBatchJobs`或`OnBatchInfos`回调函数。
-> 注意OnBatchJobs的jobs参数是从map得到，不保证顺序
+其中，`OnBatchJobs`仅在主周期`OnData(RoleMain)`/`OnBar`后触发，`OnBatchInfos`仅在辅助周期`OnData(RoleInfo)`/`OnInfoBar`后触发；分别由`BatchInOut`和`BatchInfo`开启。
+> 普通模式不保证 `OnBatchJobs` 的 jobs 顺序；严格回测由实例 `BatchState` 提供确定性排序。
 ```go
 func calcCorrs(jobs []*strat.StratJob, isBig bool) {
 	// 计算各个品种与其他品种的平均相关系数，并保存到More中
@@ -865,3 +868,15 @@ api_server:  # 供外部通过api控制机器人
 
 **SetAllTakeProfit(dirt float64, args \*ormo.ExitTrigger)**  
 对当前策略任务的所有指定方向订单设置止盈，参数dirt的值可为`core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth`。
+
+## 多因子与截面引擎
+
+本页 TradeStrat/OnBar 属于 time_series。因子用 runner.RegisterDefinition 产生原生 Plan/ComboSpec，或 expressions 声明多输出，不再为每个品种注册 OnBar。portfolio builder 只消费冻结 Frame/Universe，未来标签不进入当期推理。混合同账户策略明确 id/account/capital_weight，状态和 Stop/Join 借用仍独立。
+
+参见[多因子与截面指南](./factor.md)和[因子 API](../api/factor.md)。
+
+## 运行实例与回调状态
+
+普通命令由 entry 创建并关闭任务级 Runtime。配置快照只读；账户、时钟、策略作业、价格及批量队列属于本次运行。嵌入运行或同进程多任务时，使用显式 Runtime 依赖，避免在回调内读写包级 config/core/btime 兼容状态。`StratJob` 的运行上下文和数据事件应来自当前任务；实盘时间与回测推进时间不能混用。
+
+`BatchInOut`/`BatchInfo` 使用 trader 实例的 `BatchState`；严格回测固定就绪批次和作业顺序，普通运行不承诺 map 顺序。因子截面计算则冻结整个 Universe 后生成目标组合；时序批量回调不等于因子引擎。参见 [Runtime API](../api/runtime.md) 和[因子指南](./factor.md)。

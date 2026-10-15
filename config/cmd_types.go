@@ -12,6 +12,7 @@ func (i *ArrString) Set(value string) error {
 }
 
 type CmdArgs struct {
+	ExplicitFlags map[string]bool // Only flags supplied by the caller override explicit zero/empty YAML values.
 	Configs       ArrString
 	ConfigData    string
 	Logfile       string
@@ -55,6 +56,13 @@ type CmdArgs struct {
 	RunEveryTF    string  // run once every n timeframe
 	BatchSize     int
 	Separate      bool // Used for backtesting. When true, the strategy combination is tested separately. 用于回测，true时策略组合单独测试
-	Inited        bool
-	DeadLock      bool
+
+	BTStrict    bool
+	BTStrictSet bool
+	NetDisable  bool
+	CPUProfile  bool
+	MemProfile  bool
+
+	Inited   bool
+	DeadLock bool
 }

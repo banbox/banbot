@@ -1,9 +1,6 @@
 package biz
 
 import (
-	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -18,7 +15,7 @@ func exitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 		}
 		isShort := od.PositionSide == banexg.PosSideShort
 		var openOds []*ormo.InOutOrder
-		accOpenOds, lock := ormo.GetOpenODs(o.Account)
+		accOpenOds, lock := o.openOrders()
 		lock.Lock()
 		for _, iod := range accOpenOds {
 			if iod.Short != isShort || iod.Symbol != od.Symbol || iod.Enter.Side == od.Side {
@@ -57,7 +54,7 @@ func exitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 			}
 		}
 		// 检查是否有剩余数量，创建相反订单 Check if there is a remaining quantity and create an opposite order
-		createInv := !od.ReduceOnly && filled > AmtDust && config.TakeOverStrat != ""
+		createInv := !od.ReduceOnly && filled > AmtDust && o.takeOverStrategy() != ""
 		if len(doneParts) == 0 && !createInv {
 			return true
 		}
@@ -85,12 +82,12 @@ func exitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 
 func (o *LiveOrderMgr) makeInOutOd(pair string, short bool, average, filled float64, odType string,
 	feeCost float64, feeQuote float64, feeName string, enterAt int64, entStatus int, entOdId string) *ormo.InOutOrder {
-	exs, err := orm.GetExSymbolCur(pair)
+	exs, err := o.exSymbolCur(pair)
 	if err != nil {
 		log.Error("get exSymbol fail", zap.Error(err))
 		return nil
 	}
-	defTF := config.GetTakeOverTF(pair, "")
+	defTF := o.takeOverTF(pair, "")
 	if defTF != "" {
 		log.Error("no strat job found for trade", zap.String("pair", pair),
 			zap.String("id", entOdId))
@@ -103,7 +100,7 @@ func (o *LiveOrderMgr) makeInOutOd(pair string, short bool, average, filled floa
 		log.Error("save third order fail", zap.String("key", iod.Key()), zap.Error(err))
 		return nil
 	}
-	openOds, lock := ormo.GetOpenODs(o.Account)
+	openOds, lock := o.openOrders()
 	lock.Lock()
 	openOds[iod.ID] = iod
 	lock.Unlock()
@@ -117,7 +114,7 @@ func traceExgOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 			return false
 		}
 		isShort := od.PositionSide == banexg.PosSideShort
-		if core.IsContract {
+		if o.isContract() {
 			if !isShort && od.Side == banexg.OdSideSell || isShort && od.Side == banexg.OdSideBuy {
 				// Ignore closed orders 忽略平仓的订单
 				return false
@@ -126,7 +123,7 @@ func traceExgOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 			// 现货市场卖出即平仓，忽略平仓
 			return false
 		}
-		feeName, feeCost, feeQuote := getFeeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Amount, od.Average)
+		feeName, feeCost, feeQuote := o.feeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Amount, od.Average)
 		iod := o.makeInOutOd(od.Symbol, isShort, od.Average, od.Filled, od.Type, feeCost, feeQuote, feeName,
 			od.Timestamp, ormo.OdStatusClosed, od.ID)
 		if iod != nil {

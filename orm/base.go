@@ -6,12 +6,14 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sasha-s/go-deadlock"
@@ -39,6 +41,8 @@ type questExecer interface {
 
 var (
 	pool           *pgxpool.Pool
+	defaultStorage *Storage
+	storageMu      sync.RWMutex
 	dbPathMap      = make(map[string]string)
 	dbPathInit     = make(map[string]bool)
 	dbPathLock     = deadlock.Mutex{}
@@ -77,6 +81,20 @@ var ddlPgSchema2 string
 //go:embed sql/pg_migrations.sql
 var ddlPgMigrations string
 
+const legacyPgCalendarRenameSQL = `DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'calendars' AND column_name = 'name'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'calendars' AND column_name = 'market'
+    ) THEN
+        ALTER TABLE public.calendars RENAME COLUMN name TO market;
+    END IF;
+END
+$$;`
+
 var (
 	DbTrades = "trades"
 	// DbPub stores mutable relational/meta data (calendars/adj_factors/sranges/ins_kline/kline_un + ui task).
@@ -93,6 +111,13 @@ func SetupWithAutoCompact(autoCompact bool) *errs.Error {
 
 func setup(autoCompact bool) *errs.Error {
 	stopCompactWorker()
+	storageMu.Lock()
+	oldStorage := defaultStorage
+	defaultStorage = nil
+	storageMu.Unlock()
+	if oldStorage != nil {
+		oldStorage.closeFn = nil
+	}
 	if pool != nil {
 		pool.Close()
 		pool = nil
@@ -102,6 +127,11 @@ func setup(autoCompact bool) *errs.Error {
 	if err2 != nil {
 		return err2
 	}
+	storageMu.Lock()
+	defaultStorage = NewStorage(pool, IsQuestDB,
+		CanonicalStorageIdentityForType("", databaseURL(), config.GetDataDirSafe(), databaseType()))
+	defaultStorage.legacy = true
+	storageMu.Unlock()
 	initSQLitePaths()
 	{
 		// Ensure banpub.db exists and schema is initialized (task table only).
@@ -180,7 +210,7 @@ func isQuestDuplicateColumnErr(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "column 'agg_rules' already exists")
+	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "column 'agg_rules' already exists") || strings.Contains(msg, "column 'bar_ts' already exists")
 }
 
 // execMultiSQLTx executes multiple semicolon-separated SQL statements inside a pgx.Tx.
@@ -199,32 +229,33 @@ func execMultiSQLTx(ctx context.Context, tx pgx.Tx, sqlText string) error {
 }
 
 func pgConnPool() (*pgxpool.Pool, *errs.Error) {
-	dbCfg := config.Database
-	if dbCfg == nil {
-		return nil, errs.NewMsg(core.ErrBadConfig, "database config is missing!")
+	dbPool, questDB, err := pgConnPoolForConfig(context.Background(), config.Database)
+	if err == nil {
+		IsQuestDB = questDB
 	}
-	poolCfg, err_ := pgxpool.ParseConfig(dbCfg.Url)
+	return dbPool, err
+}
+
+func pgConnPoolForConfig(ctx context.Context, dbCfg *config.DatabaseConfig) (*pgxpool.Pool, bool, *errs.Error) {
+	if dbCfg == nil {
+		return nil, false, errs.NewMsg(core.ErrBadConfig, "database config is missing!")
+	}
+	poolCfg, err_ := pgxpool.ParseConfig(normalizeDatabaseURL(dbCfg.Url))
 	if err_ != nil {
-		return nil, errs.New(core.ErrBadConfig, err_)
+		return nil, false, errs.New(core.ErrBadConfig, err_)
 	}
 
 	// Detect DB type from explicit config or port heuristic.
-	dbType := strings.ToLower(strings.TrimSpace(dbCfg.DbType))
+	questDB, backendKnown, backendErr := databaseBackendForPoolConfig(dbCfg, poolCfg)
+	if backendErr != nil {
+		return nil, false, errs.New(core.ErrBadConfig, backendErr)
+	}
 	port := uint16(0)
 	if poolCfg.ConnConfig != nil {
 		port = poolCfg.ConnConfig.Port
 	}
-	switch dbType {
-	case "questdb":
-		IsQuestDB = true
-	case "timescale", "timescaledb", "postgres", "postgresql":
-		IsQuestDB = false
-	default:
-		// Auto-detect by port: 8812 = QuestDB default, 5432 = PostgreSQL default.
-		IsQuestDB = port != 5432
-	}
 
-	if IsQuestDB {
+	if questDB {
 		// QuestDB uses the PostgreSQL wire protocol, but (unlike Postgres/TimescaleDB) it doesn't benefit from
 		// pgx's statement cache when our SQL strings are dynamic. Disable the statement/describe cache and run
 		// in non-caching exec mode to reduce per-query overhead (especially under concurrency).
@@ -244,52 +275,111 @@ func pgConnPool() (*pgxpool.Pool, *errs.Error) {
 	defer connCancel()
 	dbPool, err_ := pgxpool.NewWithConfig(connCtx, poolCfg)
 	if err_ != nil {
-		return nil, errs.New(core.ErrDbConnFail, err_)
+		return nil, false, errs.New(core.ErrDbConnFail, err_)
 	}
 	// Ping to verify connectivity; if QuestDB is not reachable, try to auto-start it.
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer pingCancel()
 	if err_ = dbPool.Ping(pingCtx); err_ != nil {
 		dbPool.Close()
-		if IsQuestDB {
+		if questDB {
 			if ensureErr := ensureQuestDB(port); ensureErr != nil {
-				return nil, ensureErr
+				return nil, false, ensureErr
 			}
 		} else {
-			return nil, errs.New(core.ErrDbConnFail, err_)
+			return nil, false, errs.New(core.ErrDbConnFail, err_)
 		}
 		// Retry after QuestDB is started.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer retryCancel()
 		dbPool, err_ = pgxpool.NewWithConfig(retryCtx, poolCfg)
 		if err_ != nil {
-			return nil, errs.New(core.ErrDbConnFail, err_)
+			return nil, false, errs.New(core.ErrDbConnFail, err_)
 		}
 	}
 
 	// When auto-detect is still ambiguous (non-5432, non-8812), probe QuestDB-specific syntax.
-	if dbType == "" && port != 5432 && port != 8812 {
+	if !backendKnown {
 		var n int64
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer probeCancel()
 		if probeErr := dbPool.QueryRow(probeCtx, `select count() from tables()`).Scan(&n); probeErr != nil {
 			// QuestDB probe failed – treat as TimescaleDB/PostgreSQL.
-			IsQuestDB = false
+			questDB = false
 		}
 	}
 
-	return dbPool, nil
+	return dbPool, questDB, nil
+}
+
+// databaseBackendForConfig returns the backend selected without connecting.
+// The result is marked unknown for non-standard ports because those require
+// the same QuestDB probe used by the actual pool setup.
+func databaseBackendForConfig(dbCfg *config.DatabaseConfig) (bool, bool, error) {
+	if dbCfg == nil {
+		return false, false, fmt.Errorf("database config is missing")
+	}
+	poolCfg, err := pgxpool.ParseConfig(normalizeDatabaseURL(dbCfg.Url))
+	if err != nil {
+		return false, false, err
+	}
+	return databaseBackendForPoolConfig(dbCfg, poolCfg)
+}
+
+func databaseBackendForPoolConfig(dbCfg *config.DatabaseConfig, poolCfg *pgxpool.Config) (bool, bool, error) {
+	if dbCfg == nil || poolCfg == nil || poolCfg.ConnConfig == nil {
+		return false, false, fmt.Errorf("database connection config is missing")
+	}
+	dbType := strings.ToLower(strings.TrimSpace(dbCfg.DbType))
+	port := poolCfg.ConnConfig.Port
+	switch dbType {
+	case "questdb", "quest":
+		return true, true, nil
+	case "timescale", "timescaledb", "postgres", "postgresql", "postgresql+timescale":
+		return false, true, nil
+	case "":
+		// Auto-detect by port: 8812 = QuestDB default, 5432 = PostgreSQL default.
+		if port == 8812 {
+			return true, true, nil
+		}
+		if port == 5432 {
+			return false, true, nil
+		}
+		// Keep the historical optimistic QuestDB choice until the probe runs.
+		return true, false, nil
+	default:
+		return false, false, fmt.Errorf("unsupported database type %q", dbCfg.DbType)
+	}
+}
+
+// normalizeDatabaseURL accepts legacy configs that bracket an IPv4 host. URL
+// brackets are valid for IPv6 only, but older worker configs used them around
+// 127.0.0.1; normalize that form before pgx parses the connection string.
+func normalizeDatabaseURL(raw string) string {
+	return strings.ReplaceAll(raw, "@[127.0.0.1]", "@127.0.0.1")
 }
 
 func Conn(ctx context.Context) (*Queries, *pgxpool.Conn, *errs.Error) {
-	if ctx == nil {
-		ctx = context.Background()
+	storageMu.RLock()
+	current := defaultStorage
+	storageMu.RUnlock()
+	if current != nil {
+		return current.Conn(ctx)
 	}
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return nil, nil, errs.New(core.ErrDbConnFail, err)
+	if pool == nil {
+		return nil, nil, errs.NewMsg(core.ErrDbConnFail, "database pool is not configured")
 	}
-	return New(&SubQueries{db: conn}), conn, nil
+	current = NewStorage(pool, IsQuestDB,
+		CanonicalStorageIdentityForType("", databaseURL(), config.GetDataDirSafe(), databaseType()))
+	current.legacy = true
+	storageMu.Lock()
+	if defaultStorage == nil {
+		defaultStorage = current
+	} else {
+		current = defaultStorage
+	}
+	storageMu.Unlock()
+	return current.Conn(ctx)
 }
 
 func SetDbPath(key, path string) {
@@ -337,8 +427,10 @@ func DbLite(src string, path string, write bool, timeoutMs int64) (*TrackedDB, *
 	}
 	dbPathLock.Unlock()
 
-	// 构建缓存键：路径+读写模式
-	cacheKey := path
+	// Include the schema source in the key. Trade and publication databases
+	// may intentionally point at the same file during tests or migrations, but
+	// they must not share a pool or a one-time schema initialization marker.
+	cacheKey := src + "\x00" + path
 	if write {
 		cacheKey += ":write"
 	} else {
@@ -428,7 +520,8 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 	// 初始化数据库结构（如果需要）
 	dbPathLock.Lock()
 	defer dbPathLock.Unlock()
-	if _, ok := dbPathInit[path]; !ok {
+	initKey := src + "\x00" + path
+	if _, ok := dbPathInit[initKey]; !ok {
 		ddl, tbl := ddlTrade, "bottask"
 		if src == DbPub {
 			ddl, tbl = ddlBanpub, "task"
@@ -454,7 +547,7 @@ func newDbLite(src, path string, write bool, timeoutMs int64) (*sql.DB, *errs.Er
 				return nil, errs.New(core.ErrDbExecFail, err_)
 			}
 		}
-		dbPathInit[path] = true
+		dbPathInit[initKey] = true
 	}
 	return db, nil
 }
@@ -554,15 +647,29 @@ func (q *Queries) NewTx(ctx context.Context) (*Tx, *Queries, *errs.Error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	tx, err := pool.Begin(ctx)
+	var tx pgx.Tx
+	var err error
+	if q != nil && q.storage != nil {
+		if q.storage.pool == nil {
+			err = fmt.Errorf("storage pool is not configured")
+		} else {
+			tx, err = q.storage.pool.Begin(ctx)
+		}
+	} else if pool != nil {
+		tx, err = pool.Begin(ctx)
+	} else {
+		err = fmt.Errorf("database pool is not configured")
+	}
 	if err != nil {
 		return nil, nil, errs.New(core.ErrDbConnFail, err)
 	}
 	allowShow := false
-	if it, ok := q.db.(*SubQueries); ok {
-		allowShow = it.ShowLog
+	if q != nil {
+		if it, ok := q.db.(*SubQueries); ok {
+			allowShow = it.ShowLog
+		}
 	}
-	nq := q.WithTx(&SubQueries{db: tx, ShowLog: allowShow})
+	nq := q.WithTx(&SubQueries{db: tx, ShowLog: allowShow, storage: q.storage})
 	return &Tx{tx: tx}, nq, nil
 }
 
@@ -577,11 +684,15 @@ func (q *Queries) Exec(sql string, args ...interface{}) *errs.Error {
 type SubQueries struct {
 	db      DBTX
 	ShowLog bool
+	storage *Storage
 }
 
 func (q *SubQueries) Begin(ctx context.Context) (pgx.Tx, error) {
 	if tx, ok := q.db.(pgx.Tx); ok {
 		return tx.Begin(ctx)
+	}
+	if beginner, ok := q.db.(dbBeginner); ok {
+		return beginner.Begin(ctx)
 	}
 	return nil, fmt.Errorf("db is not pgx.Tx")
 }
@@ -665,20 +776,101 @@ func (q *SubQueries) CopyFrom(ctx context.Context, tableName pgx.Identifier, col
 }
 
 func LoadMarkets(exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *errs.Error) {
-	exInfo := exchange.Info()
-	args := make(map[string]interface{})
-	if exInfo.ID == "china" && exInfo.MarketType != banexg.MarketSpot {
-		items := GetExSymbols(exInfo.ID, exInfo.MarketType)
-		symbols := make([]string, 0, len(items))
-		for _, it := range items {
-			if it.Symbol == "" {
-				return nil, errs.NewMsg(errs.CodeRunTime, "symbol empty for sid: %v", it.ID)
-			}
-			symbols = append(symbols, it.Symbol)
-		}
-		args[banexg.ParamSymbols] = symbols
+	return LoadMarketsWithSymbolState(nil, exchange, reload)
+}
+
+// LoadMarketsWithSymbolState loads exchange markets without consulting the
+// process-wide symbol catalog. Runtime-owned callers pass their SymbolState so
+// contract-market capability reloads stay on the same task identity.
+func LoadMarketsWithSymbolState(state *SymbolState, exchange banexg.BanExchange, reload bool) (banexg.MarketMap, *errs.Error) {
+	return loadMarketsWithRuntimeConfig(state, exchange, reload, &config.Data, config.GetDataDirSafe(), nil, false)
+}
+
+// LoadMarketsWithRuntime loads markets using the runtime-owned configuration
+// and core mode. The legacy LoadMarkets/LoadMarketsWithSymbolState facades
+// pass nil and retain their process-wide behavior.
+func LoadMarketsWithRuntime(state *SymbolState, exchange banexg.BanExchange, reload bool,
+	snapshot *config.Snapshot, runtimeCore *core.State,
+) (banexg.MarketMap, *errs.Error) {
+	if snapshot == nil {
+		return loadMarketsWithRuntimeConfig(state, exchange, reload, &config.Data, config.GetDataDirSafe(), nil, false)
 	}
-	return exchange.LoadMarkets(reload, args)
+	return loadMarketsWithRuntimeConfig(state, exchange, reload, snapshot.View(), snapshot.DataDir, runtimeCore, true)
+}
+
+// LoadMarketsWithRuntimeConfig is the config-level counterpart used by
+// domain helpers that already carry a cloned Config but not its Snapshot.
+// dataDir is the only filesystem root consulted for a configured snapshot.
+func LoadMarketsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, reload bool,
+	cfg *config.Config, dataDir string, runtimeCore *core.State,
+) (banexg.MarketMap, *errs.Error) {
+	return loadMarketsWithRuntimeConfig(state, exchange, reload, cfg, dataDir, runtimeCore, true)
+}
+
+func loadMarketsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, reload bool,
+	cfg *config.Config, dataDir string, runtimeCore *core.State, explicit bool,
+) (banexg.MarketMap, *errs.Error) {
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	if !explicit {
+		legacyConfig := config.Data
+		legacyConfig.Exchange = config.Exchange
+		cfg = &legacyConfig
+	}
+	if hasConfiguredMarketSnapshotForConfig(cfg, runtimeCore, explicit) {
+		markets := make(banexg.MarketMap)
+		if err := applyConfiguredMarketSnapshotForConfig(cfg, dataDir, runtimeCore, explicit, exchange, markets); err != nil {
+			return nil, err
+		}
+		return markets, nil
+	}
+	exInfo := exchange.Info()
+	if exInfo == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange info is required")
+	}
+	markets, err := exchange.LoadMarkets(reload, nil)
+	if err != nil || len(markets) > 0 || !exchange.IsContract(exInfo.MarketType) {
+		return markets, err
+	}
+	var items map[int32]*ExSymbol
+	if state != nil {
+		items = state.GetExSymbols(exInfo.ID, exInfo.MarketType)
+	} else {
+		items = GetExSymbols(exInfo.ID, exInfo.MarketType)
+	}
+	if len(items) == 0 {
+		return markets, nil
+	}
+	loader := symbolScopedMarketLoader(exchange)
+	if loader == nil {
+		// A symbol-scoped reload is an adapter capability, not a generic
+		// contract-market assumption. Keep the adapter's result unchanged when
+		// it does not opt into that operation.
+		return markets, nil
+	}
+	symbols := make([]string, 0, len(items))
+	for _, it := range items {
+		if it == nil || it.Symbol == "" {
+			return nil, errs.NewMsg(errs.CodeRunTime, "symbol empty for cached market")
+		}
+		symbols = append(symbols, it.Symbol)
+	}
+	return loader.LoadMarketsForSymbols(true, symbols)
+}
+
+func symbolScopedMarketLoader(exchange banexg.BanExchange) banexg.SymbolScopedMarketLoader {
+	if exchange == nil {
+		return nil
+	}
+	if loader, ok := exchange.(banexg.SymbolScopedMarketLoader); ok {
+		return loader
+	}
+	if wrapper, ok := exchange.(*exg.BotExchange); ok && wrapper != nil {
+		loader, _ := wrapper.BanExchange.(banexg.SymbolScopedMarketLoader)
+		return loader
+	}
+	return nil
 }
 
 func InitExg(exchange banexg.BanExchange) *errs.Error {
@@ -700,19 +892,29 @@ func InitExg(exchange banexg.BanExchange) *errs.Error {
 	}
 	marketType := exchange.Info().MarketType
 	if marketType == banexg.MarketLinear || marketType == banexg.MarketInverse {
-		err = exchange.LoadLeverageBrackets(false, map[string]interface{}{
-			banexg.ParamAccount: validAcc,
-		})
-		if err != nil {
-			log.Error("LoadLeverageBrackets fail, skip, maint margin calculation may have large deviation",
-				zap.String("err", err.Short()))
-			err = exchange.InitLeverageBrackets()
-			if err != nil {
-				log.Warn("InitLeverageBrackets fail", zap.String("err", err.Short()))
-			}
-		}
+		initializeLeverageBrackets(exchange, validAcc)
 	}
 	return nil
+}
+
+func initializeLeverageBrackets(exchange banexg.BanExchange, account string) {
+	if hasConfiguredMarketSnapshot() {
+		if err := exchange.InitLeverageBrackets(); err != nil {
+			log.Warn("InitLeverageBrackets fail", zap.String("err", err.Short()))
+		}
+		return
+	}
+	err := exchange.LoadLeverageBrackets(false, map[string]interface{}{
+		banexg.ParamAccount: account,
+	})
+	if err == nil {
+		return
+	}
+	log.Error("LoadLeverageBrackets fail, skip, maint margin calculation may have large deviation",
+		zap.String("err", err.Short()))
+	if err = exchange.InitLeverageBrackets(); err != nil {
+		log.Warn("InitLeverageBrackets fail", zap.String("err", err.Short()))
+	}
 }
 
 func (a *AdjInfo) Apply(bars []*banexg.Kline, adj int) []*banexg.Kline {
@@ -741,7 +943,37 @@ func (a *AdjInfo) Apply(bars []*banexg.Kline, adj int) []*banexg.Kline {
 	return result
 }
 
+func isTransientDBConnError(err_ error) bool {
+	if err_ == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err_, &opErr) {
+		return true
+	}
+	if errors.Is(err_, io.EOF) {
+		return true
+	}
+	msg := strings.ToLower(err_.Error())
+	for _, marker := range []string{
+		"broken pipe",
+		"unexpected eof",
+		"connection reset",
+		"connection refused",
+		"connection closed",
+		"use of closed network connection",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func NewDbErr(code int, err_ error) *errs.Error {
+	if isTransientDBConnError(err_) {
+		return errs.New(core.ErrDbConnFail, err_)
+	}
 	var opErr *net.OpError
 	var pgErr *pgconn.ConnectError
 	if errors.As(err_, &opErr) {
@@ -814,7 +1046,8 @@ func tryRepairQuestDBMissingPartition(ctx context.Context, db DBTX, err error, r
 	return true, nil
 }
 
-// runQdbMigrations executes QuestDB schema migrations (best-effort, non-transactional).
+// runQdbMigrations executes QuestDB schema migrations as ordered, non-transactional
+// steps. Every database, visibility, and migration error is returned to the caller.
 func runQdbMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -854,40 +1087,9 @@ create table if not exists schema_migrations (
 	}
 	initVersion := currentVersion
 
-	migrations := strings.Split(ddlQdbMigrations, "-- version")
-	for _, migration := range migrations {
-		migration = strings.TrimSpace(migration)
-		if migration == "" {
-			continue
-		}
-		lines := strings.SplitN(migration, "\n", 2)
-		if len(lines) < 2 {
-			continue
-		}
-		versionStr := strings.TrimSpace(lines[0])
-		version, err := strconv.ParseInt(versionStr, 10, 64)
-		if err != nil {
-			if strings.HasPrefix(versionStr, "--") {
-				// Header comments before the first "-- version N" section.
-				continue
-			}
-			log.Warn("invalid migration version", zap.String("version", versionStr))
-			continue
-		}
-		if version <= currentVersion {
-			continue
-		}
-		if err := execMultiSQL(ctx, pool, lines[1]); err != nil {
-			if isQuestDuplicateColumnErr(err) {
-				log.Warn("questdb migration column already exists, marking migration applied", zap.Int64("version", version), zap.Error(err))
-			} else {
-				return NewDbErr(core.ErrDbExecFail, err)
-			}
-		}
-		if _, err := pool.Exec(ctx, `insert into schema_migrations (version, applied_ts) values ($1,$2)`, version, time.Now().UTC()); err != nil {
-			return NewDbErr(core.ErrDbExecFail, err)
-		}
-		currentVersion = version
+	currentVersion, err = applyQuestDBMigrations(ctx, pool, ddlQdbMigrations, currentVersion)
+	if err != nil {
+		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	if initVersion < currentVersion {
 		log.Info("database migration completed", zap.Int64("from", initVersion), zap.Int64("to", currentVersion))
@@ -951,6 +1153,13 @@ func runPgMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 		return NewDbErr(core.ErrDbReadFail, err)
 	}
 	if tblCount == 0 {
+		// Some pre-migration installations have the legacy calendars.name
+		// column but no sranges table. The current base schema creates indexes
+		// on calendars.market, so reconcile that one prerequisite before the
+		// base DDL rather than attempting the later migration after it fails.
+		if _, err2 := pool.Exec(ctx, legacyPgCalendarRenameSQL); err2 != nil {
+			return NewDbErr(core.ErrDbExecFail, err2)
+		}
 		log.Info("initializing timescaledb base schema...")
 		if err2 := execMultiSQL(ctx, pool, ddlPgSchema); err2 != nil {
 			return NewDbErr(core.ErrDbExecFail, err2)

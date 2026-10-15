@@ -2,6 +2,12 @@
 
 biz 包提供了业务逻辑层的功能实现。
 
+## 任务依赖
+
+当前交易器通过 `biz.RuntimeDeps` 接收一个 Runtime 的核心状态、时钟、市场、策略、订单、钱包、配置、存储与交易所依赖；`NewTraderWithRuntimeDeps` 不会回退查找缺失状态。订单处理和钱包等可变业务状态因此归属创建它们的任务。
+
+`SetupComs` 与不带 RuntimeDeps 的旧构造路径仍用于兼容，不能用于需要和其他任务并行的新增执行流程。
+
 ## 主要结构体
 
 ### LiveOrderMgr
@@ -65,7 +71,7 @@ biz 包提供了业务逻辑层的功能实现。
 
 ## 公开方法
 
-### SetupComs
+### SetupComs（兼容接口）
 初始化基础组件。
 
 参数：
@@ -83,7 +89,7 @@ biz 包提供了业务逻辑层的功能实现。
 - 初始化核心组件、交易所、ORM和商品模块
 - 主要用于系统启动时的基础设施初始化
 
-### SetupComsExg
+### SetupComsExg（兼容接口）
 初始化交易所相关的基础组件。
 
 参数：
@@ -96,37 +102,6 @@ biz 包提供了业务逻辑层的功能实现。
 - 调用 `SetupComs` 完成基础初始化
 - 初始化交易所的 ORM 模块
 - 主要用于需要交易所功能时的初始化
-
-### LoadRefreshPairs
-加载并刷新交易对信息。
-
-参数：
-- `dp`: data.IProvider - 数据提供者接口
-- `showLog`: bool - 是否显示日志
-- `pBar`: *utils.StagedPrg - 进度条对象
-
-返回：
-- `*errs.Error` - 错误信息
-
-实现细节：
-- 刷新交易对列表
-- 计算交易对时间周期得分
-- 加载策略任务
-- 处理未完成订单
-- 订阅需要预热的交易对
-- 用于系统启动或定期更新交易对信息时
-
-### AutoRefreshPairs
-自动刷新交易对信息。
-
-参数：
-- `dp`: data.IProvider - 数据提供者接口
-- `showLog`: bool - 是否显示日志
-
-实现细节：
-- 自动调用 `LoadRefreshPairs`
-- 处理刷新失败的错误日志
-- 用于定时自动刷新交易对信息
 
 ### InitOdSubs
 初始化订单订阅。
@@ -154,14 +129,6 @@ biz 包提供了业务逻辑层的功能实现。
 
 返回：
 - `int` - 触发的任务数量
-
-### ResetVars
-重置变量。
-
-实现细节：
-- 重置各种全局映射和变量
-- 包括订单管理器、钱包、K线环境等
-- 用于系统重启或重置时清理状态
 
 ### InitDataDir
 初始化数据目录。
@@ -199,15 +166,6 @@ biz 包提供了业务逻辑层的功能实现。
 返回：
 - `*errs.Error` - 错误信息
 
-### RunDataServer
-运行数据服务器。
-
-参数：
-- `args`: *config.CmdArgs - 命令行参数
-
-返回：
-- `*errs.Error` - 错误信息
-
 ### InitLiveOrderMgr
 初始化实时订单管理器。
 
@@ -232,109 +190,6 @@ biz 包提供了业务逻辑层的功能实现。
 ### StartLiveOdMgr
 启动实时订单管理器。
 
-### LoadZipKline
-从ZIP文件加载K线数据。
-
-参数：
-- `inPath`: string - 输入路径
-- `fid`: int - 文件ID
-- `file`: *zip.File - ZIP文件对象
-- `arg`: interface{} - 附加参数
-
-返回：
-- `*errs.Error` - 错误信息
-
-实现细节：
-- 解析 ZIP 文件中的 K 线数据
-- 支持多种数据格式
-- 处理时间戳和价格数据
-- 用于历史数据导入
-
-### LoadCalendars
-加载日历数据。
-
-参数：
-- `args`: *config.CmdArgs - 命令行参数
-
-返回：
-- `*errs.Error` - 错误信息
-
-实现细节：
-- 初始化基础组件
-- 读取 CSV 格式的日历数据
-- 按交易所分组保存日历信息
-- 用于管理交易日历
-
-### ExportKlines
-导出K线数据。
-
-参数：
-- `args`: *config.CmdArgs - 命令行参数
-- `prg`: utils.PrgCB - 进度回调函数
-
-返回：
-- `*errs.Error` - 错误信息
-
-实现细节：
-- 导出指定交易对的 K 线数据
-- 支持多个时间周期
-- 支持调整因子处理
-- 用于数据分析和备份
-
-### PurgeKlines
-清理K线数据。
-
-参数：
-- `args`: *config.CmdArgs - 命令行参数
-
-返回：
-- `*errs.Error` - 错误信息
-
-实现细节：
-- 删除指定条件的 K 线数据
-- 支持按交易对、时间周期筛选
-- 需要用户确认后执行
-- 用于数据清理和维护
-
-### ExportAdjFactors
-导出调整因子。
-
-参数：
-- `args`: *config.CmdArgs - 命令行参数
-
-返回：
-- `*errs.Error` - 错误信息
-
-实现细节：
-- 导出价格调整因子数据
-- 包含开始时间、因子值等信息
-- 支持时区设置
-- 用于价格校准和回测
-
-### CalcCorrelation
-计算相关性。
-
-参数：
-- `args`: *config.CmdArgs - 命令行参数
-
-返回：
-- `*errs.Error` - 错误信息
-
-实现细节：
-- 计算交易对之间的相关性
-- 支持批量计算
-- 可输出 CSV 或图像格式
-- 用于交易对选择和风险控制
-
-### RunHistKline
-运行历史K线数据。
-
-参数：
-- `args`: *RunHistArgs - 运行参数
-
-返回：
-- `*errs.Error` - 错误信息
-
 ### InitFakeWallets
 初始化模拟钱包。
 
@@ -352,3 +207,29 @@ biz 包提供了业务逻辑层的功能实现。
 
 ### WatchLiveBalances
 监控实时余额。
+
+## 因子引擎集成
+
+Trader.FeedDataSeries 驱动时序 jobs；共享账户桥接是 execution 投影，不是第二套账户。AccountSink 投递独立 Full/Patch 目标。
+
+[因子 API](factor.md) / [指南](../guide/factor.md)
+
+
+## 当前构造、工具和状态边界
+
+旧文档中下列方法不再是可直接调用的同名公共入口。采用实际 RuntimeDeps/显式 store/clock/logger，不添加不存在的兼容别名：
+
+| Prior documentation name | Current entry |
+| --- | --- |
+| LoadRefreshPairs / AutoRefreshPairs | RefreshPairsWithRuntimeDeps, RefreshJobsWithRuntimeDeps |
+| RunDataServer | entry spider command |
+| LoadZipKline | LoadZipSeriesWithRuntimeDeps |
+| LoadCalendars | LoadCalendarsWithDeps |
+| ExportKlines / PurgeKlines | ExportKlinesWithRuntimeDeps / PurgeKlinesWithRuntimeDeps |
+| ExportAdjFactors | ExportAdjFactorsWithRuntimeDeps |
+| CalcCorrelation | CalcCorrelationWithRuntimeDeps |
+| RunHistKline | RunHistSeries / RunHistSeriesWithRuntimeDeps |
+
+Trader、wallet、StratJob 的可变账户配置来自同一 Runtime.Accounts/AccountsMu；共享账户桥接保存 TS 投影，而 execution 是物理账户发送/账本 owner。获取 manager/wallet 的无 deps facade 仅用于旧调用，显式业务路径不缺字段后回退到 globals。
+
+见[runtime](runtime.md)。

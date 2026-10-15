@@ -169,3 +169,9 @@ Note: When the dirt parameter is omitted, it means both long/short orders are al
     * Trigger the OnBar, OnCheckExit, GetDrawDownExitRate, OnInfoBar methods for all strategy jobs, and collect entry/exit requests.
     * Submit the entry/exit requests to the order manager for execution.
     * Delay execution of batch entry/exit by 3 seconds (if new candlestick data is received within 3 seconds, cancel execution and delay another 3 seconds).
+
+## Factor and cross-sectional engine
+
+A decision interval is distinct from per-symbol OnBar. Factor rounds use closed, currently visible multi-symbol data and distinguish reference/investable/tradable membership. DataSeries.Values retains arbitrary typed fields and NULL alongside numerical indicator views.
+
+See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).

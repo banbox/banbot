@@ -3,13 +3,13 @@ package utils
 import (
 	"os"
 	"testing"
+
+	"github.com/banbox/banbot/internal/testutil"
 )
 
 // TestMailSender_SendMailWithAttachment 测试发送带附件的邮件
 func TestMailSender_SendMailWithAttachment(t *testing.T) {
-	if os.Getenv("BANBOT_TEST_SMTP") != "1" {
-		t.Skip("set BANBOT_TEST_SMTP=1 to run the external SMTP integration test")
-	}
+	testutil.RequireIntegration(t)
 
 	from := os.Getenv("SMTP_FROM")
 	password := os.Getenv("SMTP_PASSWORD")

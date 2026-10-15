@@ -10,7 +10,15 @@
 *.db-wal
 doc/verify.log
 .omx
-tmp
+# Keep the Go module boundary while ignoring local scratch contents.
+/tmp/*
+!/tmp/go.mod
+.tmp
+biz/qdbdata
+.omx*
+.*
+!.gitattributes
+doc/change-review
 
 # If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
@@ -73,4 +81,3 @@ vendor/
 *.log
 coverage/
 .cache/
-tmp/

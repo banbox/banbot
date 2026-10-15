@@ -25,7 +25,7 @@ database:
   qdb_max_mem_mb: 16384  # Maximum memory usage in MB
 ```
 
-When no QuestDB is reachable locally, banbot attempts to install and start it. `qdb_mem_pct` and `qdb_max_mem_mb` apply only to this backend. QuestDB WAL writes become visible asynchronously: the program waits for visibility after its own writes; if you write or validate data through an external SQL tool, do not make deletion, replacement, or rebuild decisions from a single query immediately after a write.
+When no QuestDB is reachable locally, banbot attempts to install and start it. `qdb_mem_pct` and `qdb_max_mem_mb` apply only to this backend. QuestDB WAL writes become visible asynchronously: relevant framework read-after-write paths use targeted visibility waits or owner-local caches/locks. Successful INSERT or CTAS does not guarantee an immediate read sees it. Wait for expected rows, timestamps, ranges, or counts. Before DROP/RENAME, verify the replacement matches its expected snapshot. Timeouts retain recovery markers; an empty read is not evidence that recovery is unnecessary. External SQL tools must follow the same rules.
 
 ## TimescaleDB Configuration
 
@@ -49,4 +49,8 @@ When `db_type` is not set, banbot detects the backend from the connection port: 
 
 Regardless of the backend, banbot uses a unified time-series interface to manage K-lines and custom data, including table creation, writes, reads, coverage, and gap backfilling. K-line coverage is maintained by the internal `sranges` mechanism; do not treat legacy `KInfo` or `KHole` tables as an external integration contract.
 
-See [Custom Time-Series Data](./custom_data.md) for custom time-series integration, storage, and strategy consumption.
+Time-series schemas store fixed float/int/string/bool/json columns; default K-lines and extensions use the same DataSeries.Values runtime map. Database integers are 64-bit. Database JSON encoding is not the same contract as arbitrary Go values; fixed-column round trips cannot restore absent-key versus explicit-NULL distinctions.
+
+QuestDB custom-series deletion updates effective sranges coverage first, then rewrites physical data only when the current compaction threshold is reached, verifying the replacement snapshot. TimescaleDB uses transactions and physical deletion. Do not bypass the repository to alter coverage metadata. ormo order state and ormu UI tasks use separate SQLite files; shared execution ledgers/stores also have their own persistence responsibility, separate from time-series tables.
+
+See [Custom Time-Series Data](./custom_data.md) for integration, storage, and consumption.

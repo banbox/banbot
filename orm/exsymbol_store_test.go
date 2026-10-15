@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/banbox/banbot/internal/testutil"
 )
 
 func TestEnsureSymbolsStoresCanonicalExSymbol(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		t.Fatalf("initApp failed: %v", err)

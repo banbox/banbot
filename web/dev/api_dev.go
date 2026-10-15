@@ -2,18 +2,21 @@ package dev
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/sasha-s/go-deadlock"
+	"gopkg.in/yaml.v3"
 
 	"github.com/banbox/banexg"
 	utils2 "github.com/banbox/banexg/utils"
@@ -43,49 +46,62 @@ type FileNode struct {
 	Stamp int64  `json:"stamp,omitempty"` // 最后修改时间戳（文件夹时忽略）
 }
 
-// 添加一个互斥锁来控制编译状态
-var buildMutex deadlock.Mutex
-
-func regApiDev(api fiber.Router) {
-	api.Get("/ws", websocket.New(onWsDev))
-	api.Get("/strat_tree", getStratTree)
-	api.Get("/bt_tasks", getBtTasks)
-	api.Get("/bt_options", getBtOptions)
-	api.Get("/symbol_info", getSymbolInfo)
-	api.Get("/symbol_gaps", getSymbolGaps)
-	api.Get("/symbol_data", getSymbolData)
-	api.Get("/series_ranges", getSeriesRanges)
-	api.Post("/file_op", handleFileOp)
-	api.Post("/new_strat", handleNewStrat)
-	api.Get("/text", getText)
-	api.Get("/texts", getTexts)
-	api.Post("/save_text", saveText)
+func (s *DevServer) RegAPI(api fiber.Router) {
+	api.Get("/ws", websocket.New(s.onWsDev))
+	api.Get("/strat_tree", s.getStratTree)
+	api.Get("/bt_tasks", s.getBtTasks)
+	api.Get("/bt_options", s.getBtOptions)
+	api.Get("/symbol_info", s.getSymbolInfo)
+	api.Get("/symbol_gaps", s.getSymbolGaps)
+	api.Get("/symbol_data", s.getSymbolData)
+	api.Get("/series_ranges", s.getSeriesRanges)
+	api.Post("/file_op", s.handleFileOp)
+	api.Post("/new_strat", s.handleNewStrat)
+	api.Get("/text", s.getText)
+	api.Get("/texts", s.getTexts)
+	api.Post("/save_text", s.saveText)
 	api.Get("/build_envs", getBuildEnvs)
-	api.Post("/build", handleBuild)
+	api.Post("/build", s.handleBuild)
 	api.Get("/logs", getLogs)
 	api.Get("/available_strats", getAvailableStrats)
-	api.Post("/run_backtest", handleRunBacktest)
-	api.Get("/bt_detail", getBtDetail)
-	api.Get("/bt_orders", getBtOrders)
-	api.Get("/bt_config", getBtConfig)
-	api.Get("/bt_logs", getBtLogs)
-	api.Get("/bt_html", getBtHtml)
-	api.Get("/bt_strat_tree", getBtStratTree)
-	api.Get("/bt_strat_text", getBtStratText)
-	api.Get("/symbols", GetSymbolsHandler)
-	api.Post("/data_tools", handleDataTools)
-	api.Get("/download", handleDownload)
-	api.Get("/compare_assets", getCompareAssets)
-	api.Post("/update_note", handleUpdateNote)
-	api.Post("/del_bt_reports", delBacktestReports)
+	api.Get("/strategy_catalog", getStrategyCatalog)
+	api.Post("/backtest_preflight", s.handleBacktestPreflight)
+	api.Post("/run_backtest", s.handleRunBacktest)
+	api.Get("/bt_detail", s.getBtDetail)
+	api.Get("/bt_orders", s.getBtOrders)
+	api.Get("/bt_config", s.getBtConfig)
+	api.Get("/bt_logs", s.getBtLogs)
+	api.Get("/bt_html", s.getBtHtml)
+	api.Get("/bt_strat_tree", s.getBtStratTree)
+	api.Get("/bt_strat_text", s.getBtStratText)
+	api.Get("/symbols", s.getSymbolsHandler)
+	api.Post("/data_tools", s.handleDataTools)
+	api.Get("/download", s.handleDownload)
+	api.Get("/compare_assets", s.getCompareAssets)
+	api.Post("/update_note", s.handleUpdateNote)
+	api.Post("/del_bt_reports", s.delBacktestReports)
 }
 
-func onWsDev(c *websocket.Conn) {
-	NewWsClient(c).HandleForever()
+func (s *DevServer) onWsDev(c *websocket.Conn) {
+	s.wsMu.Lock()
+	if s.stopped.Load() {
+		s.wsMu.Unlock()
+		_ = c.NetConn().SetDeadline(time.Now())
+		_ = c.Close()
+		return
+	}
+	s.wg.Add(1)
+	s.wsMu.Unlock()
+	defer s.wg.Done()
+	client := s.NewWsClient(c)
+	if client.closed.Load() {
+		return
+	}
+	client.HandleForever()
 }
 
-func getStratTree(c *fiber.Ctx) error {
-	baseDir, err := getRootDir()
+func (s *DevServer) getStratTree(c *fiber.Ctx) error {
+	baseDir, err := s.getRootDir()
 	if err != nil {
 		return err
 	}
@@ -137,7 +153,7 @@ func getStratTree(c *fiber.Ctx) error {
 }
 
 // handleFileOp 处理文件操作请求
-func handleFileOp(c *fiber.Ctx) error {
+func (s *DevServer) handleFileOp(c *fiber.Ctx) error {
 	type FileOp struct {
 		Op     string `json:"op"`
 		Path   string `json:"path"`
@@ -148,7 +164,7 @@ func handleFileOp(c *fiber.Ctx) error {
 		return err
 	}
 
-	baseDir, err := getRootDir()
+	baseDir, err := s.getRootDir()
 	if err != nil {
 		return err
 	}
@@ -201,7 +217,7 @@ func handleFileOp(c *fiber.Ctx) error {
 	})
 }
 
-func handleNewStrat(c *fiber.Ctx) error {
+func (s *DevServer) handleNewStrat(c *fiber.Ctx) error {
 	type NewStratArgs struct {
 		Folder string `json:"folder" validate:"required"`
 		Name   string `json:"name" validate:"required"`
@@ -211,7 +227,7 @@ func handleNewStrat(c *fiber.Ctx) error {
 	if err := base.VerifyArg(c, args, base.ArgBody); err != nil {
 		return err
 	}
-	err := makeNewStrat(args.Folder, args.Name)
+	err := s.makeNewStrat(args.Folder, args.Name)
 	if err != nil {
 		return err
 	}
@@ -221,14 +237,14 @@ func handleNewStrat(c *fiber.Ctx) error {
 	})
 }
 
-func parsePath(curPath string) (string, error) {
+func (s *DevServer) parsePath(curPath string) (string, error) {
 	if curPath == "" {
 		return "", nil
 	}
 	if strings.HasPrefix(curPath, "$") || strings.HasPrefix(curPath, "@") {
-		curPath = config.ParsePath(curPath)
+		curPath = s.ParsePath(curPath)
 	} else {
-		baseDir, err := getRootDir()
+		baseDir, err := s.getRootDir()
 		if err != nil {
 			return "", err
 		}
@@ -237,7 +253,269 @@ func parsePath(curPath string) (string, error) {
 	return curPath, nil
 }
 
-func getText(c *fiber.Ctx) error {
+// prepareBacktestConfigFiles snapshots all configuration inputs for one Web
+// request into a private temporary directory. The editor commonly sends
+// @config.yml, which normally resolves to the shared data directory; writing
+// there before parsing lets concurrent requests overwrite one another. The
+// returned paths are absolute and can be passed directly to config.GetConfig.
+func (s *DevServer) prepareBacktestConfigFiles(configs map[string]string, paths []string) (string, []string, error) {
+	tempDir, err := os.MkdirTemp("", "banbot-web-config-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(tempDir)
+	}
+
+	pathTargets := make(map[string]string, len(configs)+len(paths))
+	targetOwners := make(map[string]string, len(configs)+len(paths))
+	targetOwnerKeys := make(map[string]string, len(configs)+len(paths))
+	for rawPath, text := range configs {
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		relPath, pathErr := backtestConfigTempPath(rawPath)
+		if pathErr != nil {
+			cleanup()
+			return "", nil, pathErr
+		}
+		key := backtestConfigKey(rawPath)
+		if owner := targetOwners[relPath]; owner != "" &&
+			(owner != rawPath || targetOwnerKeys[relPath] != key) {
+			cleanup()
+			return "", nil, fmt.Errorf("configuration paths %q and %q resolve to the same temporary file", owner, rawPath)
+		}
+		targetOwners[relPath] = rawPath
+		targetOwnerKeys[relPath] = key
+		target := filepath.Join(tempDir, relPath)
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		data, pathErr := s.backtestConfigContents(rawPath, []byte(text))
+		if pathErr != nil {
+			cleanup()
+			return "", nil, pathErr
+		}
+		if err := os.WriteFile(target, data, 0644); err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		pathTargets[key] = target
+	}
+
+	resolved := make([]string, 0, len(paths))
+	for _, rawPath := range paths {
+		if target := pathTargets[backtestConfigKey(rawPath)]; target != "" {
+			resolved = append(resolved, target)
+			continue
+		}
+		source, pathErr := s.parsePath(rawPath)
+		if pathErr != nil {
+			cleanup()
+			return "", nil, pathErr
+		}
+		data, readErr := os.ReadFile(source)
+		if readErr != nil {
+			cleanup()
+			return "", nil, readErr
+		}
+		data, readErr = s.backtestConfigContents(rawPath, data)
+		if readErr != nil {
+			cleanup()
+			return "", nil, readErr
+		}
+		relPath, relErr := backtestConfigTempPath(rawPath)
+		if relErr != nil {
+			cleanup()
+			return "", nil, relErr
+		}
+		key := backtestConfigKey(rawPath)
+		if owner := targetOwners[relPath]; owner != "" &&
+			(owner != rawPath || targetOwnerKeys[relPath] != key) {
+			cleanup()
+			return "", nil, fmt.Errorf("configuration paths %q and %q resolve to the same temporary file", owner, rawPath)
+		}
+		targetOwners[relPath] = rawPath
+		targetOwnerKeys[relPath] = key
+		target := filepath.Join(tempDir, relPath)
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		if _, statErr := os.Stat(target); os.IsNotExist(statErr) {
+			if err := os.WriteFile(target, data, 0644); err != nil {
+				cleanup()
+				return "", nil, err
+			}
+		} else if statErr != nil {
+			cleanup()
+			return "", nil, statErr
+		}
+		pathTargets[key] = target
+		resolved = append(resolved, target)
+	}
+	return tempDir, resolved, nil
+}
+
+func backtestConfigTempPath(rawPath string) (string, error) {
+	path := strings.TrimSpace(rawPath)
+	if path == "" {
+		return "", fmt.Errorf("configuration path is empty")
+	}
+	if path[0] == '$' || path[0] == '@' {
+		path = strings.TrimLeft(path[1:], "\\/")
+	}
+	path = filepath.Clean(filepath.FromSlash(path))
+	if path == "." || path == ".." || strings.HasPrefix(path, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("configuration path escapes temporary directory: %q", rawPath)
+	}
+	if filepath.IsAbs(path) {
+		path = filepath.Base(path)
+	}
+	if path == "" || path == "." {
+		return "", fmt.Errorf("configuration path is invalid: %q", rawPath)
+	}
+	return path, nil
+}
+
+func backtestConfigKey(rawPath string) string {
+	path := strings.TrimSpace(rawPath)
+	if path != "" && (path[0] == '$' || path[0] == '@') {
+		path = strings.TrimLeft(path[1:], "\\/")
+	}
+	return filepath.Clean(filepath.FromSlash(path))
+}
+
+// Private request copies must retain advanced paths' original file bases.
+// Only the copy is normalized; the user's file and expressions stay intact.
+func (s *DevServer) backtestConfigContents(rawPath string, raw []byte) ([]byte, error) {
+	var fields map[string]any
+	if err := yaml.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	source := rawPath
+	if !filepath.IsAbs(source) {
+		var err error
+		source, err = s.parsePath(rawPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	changed := false
+	var walk func(string, any, bool) error
+	walk = func(path string, value any, factorPolicy bool) error {
+		switch item := value.(type) {
+		case map[string]any:
+			for key, child := range item {
+				field := key
+				if path != "" {
+					field = path + "." + key
+				}
+				text, ok := child.(string)
+				if ok && webAdvancedConfigPath(field) && (!strings.HasPrefix(field, "run_policy[") || factorPolicy) {
+					expanded := os.ExpandEnv(text)
+					if expanded != "" && expanded != ":memory:" && !filepath.IsAbs(expanded) && !strings.HasPrefix(expanded, "$") && !strings.HasPrefix(expanded, "@") {
+						resolved, err := filepath.Abs(filepath.Join(filepath.Dir(source), expanded))
+						if err != nil {
+							return err
+						}
+						item[key], changed = resolved, true
+					}
+				}
+				if err := walk(field, child, factorPolicy); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, child := range item {
+				isFactor := factorPolicy
+				if path == "run_policy" {
+					policy, _ := child.(map[string]any)
+					isFactor = policy["engine"] == config.EngineFactor
+				}
+				if err := walk(path+"[]", child, isFactor); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk("", fields, false); err != nil {
+		return nil, err
+	}
+	if !changed {
+		return raw, nil
+	}
+	return yaml.Marshal(fields)
+}
+
+func webAdvancedConfigPath(path string) bool {
+	return config.IsAdvancedPathField(path)
+}
+
+func (s *DevServer) loadBacktestRunSpec(paths []string) (*config.RunSpec, *config.Config, []byte, error) {
+	spec, err := config.LoadRunSpec(&config.CmdArgs{Configs: paths, NoDefault: true, DataDir: s.DataDir()}, false)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	u := spec.Config()
+	if len(u.RunPolicy) == 0 {
+		return nil, nil, nil, errs.NewMsg(errs.CodeParamRequired, "run_policy is required")
+	}
+	if s.backtestPreflight != nil {
+		if err := s.backtestPreflight(spec); err != nil {
+			return nil, nil, nil, err
+		}
+	} else if slices.Contains(spec.Engines(), config.EngineFactor) {
+		return nil, nil, nil, fmt.Errorf("unified backtest preflight is not configured")
+	}
+	// This view supplies task-list metadata only. The runnable config remains
+	// the complete RunSpec and reaches the ordinary unified backtest command.
+	cfg := backtestTaskConfig(spec)
+	if slices.Contains(spec.Engines(), config.EngineTimeSeries) {
+		if err := validateWebTimeSeriesBacktest(cfg); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	raw, exportErr := spec.EffectiveYAML(false)
+	return spec, cfg, raw, exportErr
+}
+
+func backtestTaskConfig(spec *config.RunSpec) *config.Config {
+	u := spec.Config()
+	cfg := u.Root.Clone()
+	cfg.RunPolicy = nil
+	for _, policy := range u.RunPolicy {
+		cfg.RunPolicy = append(cfg.RunPolicy, policy.RunPolicyConfig.Clone())
+	}
+	return cfg
+}
+
+// Retain the Web TS profile without imposing it on factor-only research.
+func validateWebTimeSeriesBacktest(cfg *config.Config) error {
+	if cfg.TimeRange == nil || cfg.TimeRange.StartMS == 0 || cfg.TimeRange.EndMS == 0 {
+		return errs.NewMsg(errs.CodeParamRequired, "time_range is required")
+	}
+	if len(cfg.WalletAmounts) == 0 {
+		return errs.NewMsg(errs.CodeParamRequired, "wallet_amounts is required")
+	}
+	if cfg.StakeAmount == 0 && cfg.StakePct == 0 {
+		return errs.NewMsg(errs.CodeParamRequired, "stake_amount or stake_pct is required")
+	}
+	if len(cfg.StakeCurrency) == 0 {
+		return errs.NewMsg(errs.CodeParamRequired, "stake_currency is required")
+	}
+	if cfg.Exchange == nil || cfg.Exchange.Name == "" {
+		return errs.NewMsg(errs.CodeParamRequired, "exchange.name is required")
+	}
+	if cfg.Database == nil || cfg.Database.Url == "" {
+		return errs.NewMsg(errs.CodeParamRequired, "database.url is required")
+	}
+	return nil
+}
+
+func (s *DevServer) getText(c *fiber.Ctx) error {
 	type TextArgs struct {
 		Path string `query:"path" validate:"required"`
 	}
@@ -248,7 +526,7 @@ func getText(c *fiber.Ctx) error {
 		return err
 	}
 
-	args.Path, err = parsePath(args.Path)
+	args.Path, err = s.parsePath(args.Path)
 	if err != nil {
 		return err
 	}
@@ -259,11 +537,17 @@ func getText(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"data": content,
+		"data":   content,
+		"digest": textDigest([]byte(content)),
 	})
 }
 
-func getTexts(c *fiber.Ctx) error {
+func textDigest(content []byte) string {
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:])
+}
+
+func (s *DevServer) getTexts(c *fiber.Ctx) error {
 	type TextArgs struct {
 		Paths []string `query:"paths" validate:"required"`
 	}
@@ -277,7 +561,7 @@ func getTexts(c *fiber.Ctx) error {
 	contents := make(map[string]string)
 	var realPath string
 	for _, path := range args.Paths {
-		realPath, err = parsePath(path)
+		realPath, err = s.parsePath(path)
 		if err != nil {
 			return err
 		}
@@ -295,16 +579,20 @@ func getTexts(c *fiber.Ctx) error {
 	return c.JSON(contents)
 }
 
-func saveText(c *fiber.Ctx) error {
+func (s *DevServer) saveText(c *fiber.Ctx) error {
 	type SaveTextArgs struct {
 		Path    string `json:"path" validate:"required"`
 		Content string `json:"content" validate:"required"`
+		Digest  string `json:"digest"`
 	}
 
 	var args = new(SaveTextArgs)
 	err := base.VerifyArg(c, args, base.ArgBody)
 	if err != nil {
 		return err
+	}
+	if args.Digest == "" {
+		return c.Status(fiber.StatusPreconditionRequired).JSON(fiber.Map{"msg": "Read the file before saving; its original digest is required"})
 	}
 
 	// 检查内容是否为空
@@ -314,13 +602,14 @@ func saveText(c *fiber.Ctx) error {
 		})
 	}
 
-	args.Path, err = parsePath(args.Path)
+	args.Path, err = s.parsePath(args.Path)
 	if err != nil {
 		return err
 	}
 
-	// 检查文件是否存在
-	_, err = os.Stat(args.Path)
+	// Compare the browser's version first, then pass the exact bytes to the
+	// canonical-path writer, which rechecks them under the shared write lock.
+	expected, err := os.ReadFile(args.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return c.Status(400).JSON(fiber.Map{
@@ -329,24 +618,28 @@ func saveText(c *fiber.Ctx) error {
 		}
 		return err
 	}
-
-	// 写入文件内容
-	err = os.WriteFile(args.Path, []byte(args.Content), 0644)
-	if err != nil {
-		return err
+	if textDigest(expected) != args.Digest {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"msg": "The file changed since it was read; reload it before saving"})
+	}
+	if writeErr := config.WriteConfigAtomic(args.Path, expected, []byte(args.Content)); writeErr != nil {
+		if strings.Contains(writeErr.Error(), "conflict") {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"msg": "The file changed while saving; reload it before saving"})
+		}
+		return writeErr
 	}
 	if strings.HasSuffix(args.Path, ".go") {
-		status.DirtyBin = true
-		BroadcastStatus()
+		s.setDirtyBin()
+		s.BroadcastStatus()
 	}
 
 	return c.JSON(fiber.Map{
-		"code": 200,
+		"code":   200,
+		"digest": textDigest([]byte(args.Content)),
 	})
 }
 
 // handleBuild 处理编译请求
-func handleBuild(c *fiber.Ctx) error {
+func (s *DevServer) handleBuild(c *fiber.Ctx) error {
 	type BuildArgs struct {
 		OS   string `json:"os"`
 		Arch string `json:"arch"`
@@ -358,24 +651,17 @@ func handleBuild(c *fiber.Ctx) error {
 	}
 
 	// 检查是否正在编译
-	buildMutex.Lock()
-	if status.Building {
-		buildMutex.Unlock()
+	if !s.beginBuild() {
 		return c.Status(400).JSON(fiber.Map{
 			"msg": "Another build is in progress",
 		})
 	}
-	status.DirtyBin = false
-	status.Building = true
-	BroadcastStatus()
-	buildMutex.Unlock()
+	s.BroadcastStatus()
 
 	// 在函数结束时确保重置编译状态
 	defer func() {
-		buildMutex.Lock()
-		status.Building = false
-		BroadcastStatus()
-		buildMutex.Unlock()
+		s.finishBuild()
+		s.BroadcastStatus()
 	}()
 
 	// 设置目标操作系统和架构
@@ -389,7 +675,7 @@ func handleBuild(c *fiber.Ctx) error {
 	}
 
 	// 设置输出路径
-	outputPath, err := parsePath(args.Path)
+	outputPath, err := s.parsePath(args.Path)
 	if err != nil {
 		return err
 	}
@@ -467,7 +753,7 @@ func getLogs(c *fiber.Ctx) error {
 }
 
 // getBtTasks 获取回测任务列表
-func getBtTasks(c *fiber.Ctx) error {
+func (s *DevServer) getBtTasks(c *fiber.Ctx) error {
 	type TaskArgs struct {
 		Mode     string `query:"mode"`
 		Path     string `query:"path"`
@@ -490,7 +776,7 @@ func getBtTasks(c *fiber.Ctx) error {
 		args.Limit = 20
 	}
 
-	qu, conn, err := ormu.Conn()
+	qu, conn, err := s.Conn()
 	if err != nil {
 		return err
 	}
@@ -521,8 +807,9 @@ func getBtTasks(c *fiber.Ctx) error {
 	result := make([]map[string]interface{}, 0, len(tasks))
 	for _, task := range tasks {
 		taskMap := task.ToMap()
+		appendBacktestMetadata(task, taskMap)
 		if args.Assets {
-			appendTaskAssets(task, taskMap)
+			s.appendTaskAssets(task, taskMap)
 		}
 		result = append(result, taskMap)
 	}
@@ -544,11 +831,16 @@ type assetChartData struct {
 	Datasets []assetChartDataset `json:"datasets"`
 }
 
-func appendTaskAssets(task *ormu.Task, taskMap map[string]interface{}) {
+func (s *DevServer) appendTaskAssets(task *ormu.Task, taskMap map[string]interface{}) {
 	if task == nil || task.Path == "" || task.Status < int64(ormu.BtStatusDone) {
 		return
 	}
-	assetPath := filepath.Join(config.GetDataDir(), "backtest", task.Path, "assets.html")
+	reportDirs, err := s.taskReportDirs(task)
+	if err != nil {
+		return
+	}
+	reportDir := firstReportDir(reportDirs, "assets.html")
+	assetPath := filepath.Join(reportDir, "assets.html")
 	if !utils.Exists(assetPath) {
 		return
 	}
@@ -634,8 +926,8 @@ func downsampleSeries(values []float64, maxPoints int) []float64 {
 }
 
 // getBtOptions 获取回测选项列表
-func getBtOptions(c *fiber.Ctx) error {
-	qu, conn, err2 := ormu.Conn()
+func (s *DevServer) getBtOptions(c *fiber.Ctx) error {
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -725,7 +1017,7 @@ func getAvailableStrats(c *fiber.Ctx) error {
 }
 
 // handleRunBacktest 处理回测请求
-func handleRunBacktest(c *fiber.Ctx) error {
+func (s *DevServer) handleRunBacktest(c *fiber.Ctx) error {
 	type RunBtArgs struct {
 		Separate bool              `json:"separate"`
 		Configs  map[string]string `json:"configs" validate:"required"`
@@ -738,84 +1030,62 @@ func handleRunBacktest(c *fiber.Ctx) error {
 		return err
 	}
 
-	// 写入配置内容
-	var realPath string
-	var err error
-	for path, text := range args.Configs {
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
-		realPath, err = parsePath(path)
-		if err != nil {
-			return err
-		}
-		err2 := utils.WriteFile(realPath, []byte(text))
-		if err2 != nil {
-			return err2
-		}
-	}
-	var paths []string
-	for _, path := range args.Paths {
-		realPath, err = parsePath(path)
-		if err != nil {
-			return err
-		}
-		paths = append(paths, realPath)
-	}
-
-	// 加载并验证配置
-	cfg, err2 := config.GetConfig(&config.CmdArgs{Configs: paths, NoDefault: true}, false)
-	if err2 != nil {
-		return err2
-	}
-
-	// 检查必要的配置项
-	if len(cfg.RunPolicy) == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "run_policy is required")
-	}
-	if cfg.TimeRange.StartMS == 0 || cfg.TimeRange.EndMS == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "time_range is required")
-	}
-	if len(cfg.WalletAmounts) == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "wallet_amounts is required")
-	}
-	if cfg.StakeAmount == 0 && cfg.StakePct == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "stake_amount or stake_pct is required")
-	}
-	if len(cfg.StakeCurrency) == 0 {
-		return errs.NewMsg(errs.CodeParamRequired, "stake_currency is required")
-	}
-	if cfg.Exchange.Name == "" {
-		return errs.NewMsg(errs.CodeParamRequired, "exchange.name is required")
-	}
-	if cfg.Database.Url == "" {
-		return errs.NewMsg(errs.CodeParamRequired, "database.url is required")
-	}
-
-	// 获取配置内容并计算哈希
-	cfgData, err2 := cfg.DumpYaml()
-	if err2 != nil {
-		return err2
-	}
-	hashVal := utils.MD5(cfgData)[:10]
-	btPath := fmt.Sprintf("$backtest/%s", hashVal)
-	absPath := config.ParsePath(btPath)
-
-	// 创建目标目录
-	if err = os.MkdirAll(absPath, 0755); err != nil {
+	// Snapshot request-owned editor contents before parsing. In particular,
+	// @config.yml must never be written to the shared data directory because a
+	// concurrent request could otherwise change the file between hash and load.
+	configTempDir, paths, err := s.prepareBacktestConfigFiles(args.Configs, args.Paths)
+	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(configTempDir)
+
+	spec, cfg, cfgData, err := s.loadBacktestRunSpec(paths)
+	if err != nil {
+		return err
+	}
+	hashVal := utils.MD5(cfgData)[:10]
+	backtestRoot := s.BacktestDir()
+	basePath := filepath.Join(backtestRoot, hashVal)
+	// Reserve the output before writing the config. Mkdir is the allocation
+	// operation, so concurrent submissions of the same configuration receive
+	// hash, hash_1, hash_2, ... without sharing report files.
+	absPath, err := config.AllocateOutputDir(basePath)
+	if err != nil {
+		return err
+	}
+	keepOutput := false
+	backupAbs := ""
+	backupOwned := false
+	defer func() {
+		if !keepOutput {
+			_ = os.RemoveAll(absPath)
+		}
+		if backupAbs != "" && !backupOwned {
+			_ = os.RemoveAll(backupAbs)
+		}
+	}()
+	relPath, err := filepath.Rel(backtestRoot, absPath)
+	if err != nil {
+		_ = os.RemoveAll(absPath)
+		return err
+	}
+	taskPath := filepath.ToSlash(relPath)
+	btPath := fmt.Sprintf("$backtest/%s", taskPath)
 
 	// 添加回测任务
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
 	defer conn.Close()
 
-	// 移动配置文件
+	// Keep the old UI "backup" action useful: archive the original hash
+	// directory under a unique path before adding the newly allocated task.
+	// The new run always writes to its reserved directory, so backup/overwrite
+	// can never truncate another task's reports.
 	cfgPath := filepath.Join(absPath, "config.yml")
-	if utils.Exists(cfgPath) {
+	baseConfigPath := filepath.Join(basePath, "config.yml")
+	if utils.Exists(baseConfigPath) && args.DupMode == "backup" {
 		oldTasks, err2 := qu.FindTasks(context.Background(), ormu.FindTasksParams{
 			Mode: "backtest",
 			Path: hashVal,
@@ -827,19 +1097,27 @@ func handleRunBacktest(c *fiber.Ctx) error {
 		if len(oldTasks) > 0 {
 			old = oldTasks[0]
 		}
-		backupPath := ""
-		if args.DupMode == "" {
-			return fmt.Errorf("already_exist")
-		} else if args.DupMode == "backup" {
-			backupPath = hashVal + "_bak"
-			if old != nil {
-				backupPath = hashVal + "_" + strconv.FormatInt(old.ID, 10)
-			}
-			realPath = config.ParsePath(fmt.Sprintf("$backtest/%s", backupPath))
-			err = utils.CopyDir(absPath, realPath)
-			if err != nil {
-				return err
-			}
+		backupBase := hashVal + "_bak"
+		if old != nil {
+			backupBase = hashVal + "_" + strconv.FormatInt(old.ID, 10)
+		}
+		var allocErr error
+		backupAbs, allocErr = config.AllocateOutputDir(filepath.Join(backtestRoot, backupBase))
+		if allocErr != nil {
+			_ = os.RemoveAll(absPath)
+			return allocErr
+		}
+		backupPathRel, relErr := filepath.Rel(backtestRoot, backupAbs)
+		if relErr != nil {
+			_ = os.RemoveAll(absPath)
+			_ = os.RemoveAll(backupAbs)
+			return relErr
+		}
+		backupPath := filepath.ToSlash(backupPathRel)
+		if err = utils.CopyDir(basePath, backupAbs); err != nil {
+			_ = os.RemoveAll(absPath)
+			_ = os.RemoveAll(backupAbs)
+			return err
 		}
 		if old != nil {
 			err = qu.SetTaskPath(context.Background(), ormu.SetTaskPathParams{
@@ -849,49 +1127,65 @@ func handleRunBacktest(c *fiber.Ctx) error {
 			if err != nil {
 				return err
 			}
+			// Once the old row points at the copied directory, that row owns the
+			// backup even if registering the new task fails below. Keep it in that
+			// case; otherwise the old task would reference a deleted report.
+			backupOwned = true
 		}
 	}
-	if err = os.WriteFile(cfgPath, cfgData, 0644); err != nil {
-		return err
+	if writeErr := config.WriteConfigAtomic(cfgPath, nil, cfgData); writeErr != nil {
+		return writeErr
 	}
 
 	// 构建回测参数
-	btArgs := fmt.Sprintf("-out %s -prg uiPrg -no-default -config %s", btPath, btPath+"/config.yml")
-	if args.Separate {
-		btArgs = "-separate " + btArgs
-	}
+	btArgs := webBacktestArgs(spec, btPath, args.Separate)
 
+	startAt, stopAt := int64(0), int64(0)
+	if cfg.TimeRange != nil {
+		startAt, stopAt = cfg.TimeRange.StartMS, cfg.TimeRange.EndMS
+	}
 	task, err := qu.AddTask(context.Background(), ormu.AddTaskParams{
 		Mode:     "backtest",
-		Path:     hashVal,
+		Path:     taskPath,
 		Args:     btArgs,
 		Config:   string(cfgData),
 		Strats:   strings.Join(cfg.Strats(), ","),
 		Periods:  strings.Join(cfg.RunTimeFrames(), ","),
 		Pairs:    cfg.ShowPairs(),
 		CreateAt: btime.UTCStamp(),
-		StartAt:  cfg.TimeRange.StartMS,
-		StopAt:   cfg.TimeRange.EndMS,
+		StartAt:  startAt,
+		StopAt:   stopAt,
 		Status:   ormu.BtStatusInit,
 		Progress: 0,
 	})
 	if err != nil {
 		return err
 	}
-	log.Info("add backtest", zap.Int64("id", task.ID), zap.String("hash", hashVal))
+	log.Info("add backtest", zap.Int64("id", task.ID), zap.String("path", taskPath))
 
 	// 通知任务调度器有新任务
-	taskNotifyChan <- task
+	// If there was no old database row, the backup has no owner until this new
+	// task is accepted. Preserve it only after AddTask succeeds; failures before
+	// that point are cleaned by the defer above.
+	if backupAbs != "" && !backupOwned {
+		backupOwned = true
+	}
+	keepOutput = true
+	select {
+	case <-s.ctx.Done():
+		return context.Canceled
+	case s.notify <- task:
+	}
 
 	return c.JSON(fiber.Map{
 		"code": 200,
-		"data": hashVal,
+		"data": taskPath,
 	})
 }
 
 // getBtPath 获取回测输出目录
-func getBtPath(taskID int64) (string, error) {
-	qu, conn, err2 := ormu.Conn()
+func (s *DevServer) getBtPath(taskID int64) (string, error) {
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return "", err2
 	}
@@ -900,7 +1194,24 @@ func getBtPath(taskID int64) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("query task failed: %v", err)
 	}
-	return filepath.Join(config.GetDataDir(), "backtest", task.Path), nil
+	return s.taskBaseDir(task)
+}
+
+func (s *DevServer) getBtReportPath(taskID int64, marker string) (string, error) {
+	qu, conn, connErr := s.Conn()
+	if connErr != nil {
+		return "", connErr
+	}
+	defer conn.Close()
+	task, queryErr := qu.GetTask(context.Background(), taskID)
+	if queryErr != nil {
+		return "", fmt.Errorf("query task failed: %v", queryErr)
+	}
+	dirs, pathErr := s.taskReportDirs(task)
+	if pathErr != nil {
+		return "", pathErr
+	}
+	return firstReportDir(dirs, marker), nil
 }
 
 // parseBtResult 解析回测结果
@@ -918,7 +1229,7 @@ func parseBtResult(path string) (*opt.BTResult, error) {
 }
 
 // getBtDetail 获取回测详情
-func getBtDetail(c *fiber.Ctx) error {
+func (s *DevServer) getBtDetail(c *fiber.Ctx) error {
 	type DetailArgs struct {
 		TaskID int64 `query:"task_id" validate:"required"`
 	}
@@ -927,7 +1238,7 @@ func getBtDetail(c *fiber.Ctx) error {
 		return err
 	}
 
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -936,15 +1247,36 @@ func getBtDetail(c *fiber.Ctx) error {
 	if err != nil {
 		return fmt.Errorf("query task failed: %v", err)
 	}
-	btPath := filepath.Join(config.GetDataDir(), "backtest", task.Path)
+	basePath, pathErr := s.taskBaseDir(task)
+	if pathErr != nil {
+		return pathErr
+	}
+	reportDirs, pathErr := s.taskReportDirs(task)
+	if pathErr != nil {
+		return pathErr
+	}
+	btPath := firstReportDir(reportDirs, "detail.json")
+	unified, unifiedPath, unifiedErr := readUnifiedBacktestReport(basePath)
+	if unifiedErr != nil {
+		return unifiedErr
+	}
+	if unified != nil {
+		taskMap := task.ToMap()
+		appendBacktestMetadata(task, taskMap)
+		return c.JSON(fiber.Map{"path": unifiedPath, "task": taskMap, "unified": unified})
+	}
 
-	configPath := filepath.Join(btPath, "config.yml")
+	configPath := filepath.Join(basePath, "config.yml")
+	if !utils.Exists(configPath) {
+		configPath = filepath.Join(btPath, "config.yml")
+	}
 	var cfg *config.Config
 	if utils.Exists(configPath) {
-		cfg, err2 = config.ParseConfig(configPath)
-		if err2 != nil {
-			return err2
+		spec, specErr := config.LoadRunSpec(&config.CmdArgs{Configs: []string{configPath}, NoDefault: true, DataDir: s.DataDir()}, false)
+		if specErr != nil {
+			return specErr
 		}
+		cfg = backtestTaskConfig(spec)
 	}
 
 	// 读取detail.json
@@ -963,20 +1295,24 @@ func getBtDetail(c *fiber.Ctx) error {
 		}
 	}
 	var exsMap map[string]*orm.ExSymbol
-	if cfg != nil {
-		exsMap = orm.GetExSymbolMap(cfg.Exchange.Name, cfg.MarketType)
+	if cfg != nil && cfg.Exchange != nil {
+		if symbols := s.symbols(); symbols != nil {
+			exsMap = symbols.GetExSymbolMap(cfg.Exchange.Name, cfg.MarketType)
+		}
 	}
 
+	taskMap := task.ToMap()
+	appendBacktestMetadata(task, taskMap)
 	return c.JSON(fiber.Map{
 		"path":   btPath,
 		"detail": detail,
-		"task":   task.ToMap(),
+		"task":   taskMap,
 		"exsMap": exsMap,
 	})
 }
 
 // getBtOrders 获取回测订单
-func getBtOrders(c *fiber.Ctx) error {
+func (s *DevServer) getBtOrders(c *fiber.Ctx) error {
 	type OrderArgs struct {
 		TaskID    int64  `query:"task_id" validate:"required"`
 		Page      int    `query:"page"`
@@ -1002,7 +1338,7 @@ func getBtOrders(c *fiber.Ctx) error {
 		args.PageSize = 20
 	}
 
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -1013,13 +1349,25 @@ func getBtOrders(c *fiber.Ctx) error {
 		return fmt.Errorf("query task failed: %v", err)
 	}
 
-	dbPath := filepath.Join(config.GetDataDir(), "backtest", task.Path, "orders.gob")
-	allOrders, lock, err2 := getGobOrders(dbPath)
-	if err2 != nil {
-		return err2
+	reportDirs, pathErr := s.taskReportDirs(task)
+	if pathErr != nil {
+		return pathErr
 	}
-	lock.Lock()
-	defer lock.Unlock()
+	allOrders := make([]*ormo.InOutOrder, 0)
+	for _, reportDir := range reportDirs {
+		dbPath := filepath.Join(reportDir, "orders.gob")
+		if _, statErr := os.Stat(dbPath); statErr != nil {
+			if os.IsNotExist(statErr) && len(reportDirs) > 1 {
+				continue
+			}
+			return statErr
+		}
+		cached, loadErr := s.getGobOrders(dbPath)
+		if loadErr != nil {
+			return loadErr
+		}
+		allOrders = append(allOrders, cached...)
+	}
 
 	var orders = make([]*ormo.InOutOrder, 0, len(allOrders)/10)
 	for _, od := range allOrders {
@@ -1170,7 +1518,7 @@ func getBtOrders(c *fiber.Ctx) error {
 }
 
 // getBtConfig 获取回测配置
-func getBtConfig(c *fiber.Ctx) error {
+func (s *DevServer) getBtConfig(c *fiber.Ctx) error {
 	type ConfigArgs struct {
 		TaskID int64 `query:"task_id" validate:"required"`
 	}
@@ -1179,13 +1527,20 @@ func getBtConfig(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	btPath, err := s.getBtPath(args.TaskID)
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
 
 	// 读取config.yml
 	configPath := filepath.Join(btPath, "config.yml")
+	if !utils.Exists(configPath) {
+		btPath, err = s.getBtReportPath(args.TaskID, "config.yml")
+		if err != nil {
+			return fmt.Errorf("get backtest path failed: %v", err)
+		}
+		configPath = filepath.Join(btPath, "config.yml")
+	}
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("read config file failed: %v", err)
@@ -1197,7 +1552,7 @@ func getBtConfig(c *fiber.Ctx) error {
 }
 
 // getBtLogs 获取回测日志
-func getBtLogs(c *fiber.Ctx) error {
+func (s *DevServer) getBtLogs(c *fiber.Ctx) error {
 	type LogArgs struct {
 		TaskID int64 `query:"task_id" validate:"required"`
 		End    int64 `query:"end"`
@@ -1208,7 +1563,7 @@ func getBtLogs(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	btPath, err := s.getBtReportPath(args.TaskID, "out.log")
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1234,7 +1589,7 @@ func getBtLogs(c *fiber.Ctx) error {
 }
 
 // getBtHtml 获取回测HTML报告
-func getBtHtml(c *fiber.Ctx) error {
+func (s *DevServer) getBtHtml(c *fiber.Ctx) error {
 	type HtmlArgs struct {
 		TaskID int64  `query:"task_id" validate:"required"`
 		Type   string `query:"type" validate:"required"` // assets 或 enters
@@ -1244,7 +1599,11 @@ func getBtHtml(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	marker := "assets.html"
+	if args.Type == "enters" {
+		marker = "enters.html"
+	}
+	btPath, err := s.getBtReportPath(args.TaskID, marker)
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1268,7 +1627,7 @@ func getBtHtml(c *fiber.Ctx) error {
 }
 
 // getBtStratTree 获取回测策略代码文件树
-func getBtStratTree(c *fiber.Ctx) error {
+func (s *DevServer) getBtStratTree(c *fiber.Ctx) error {
 	type TreeArgs struct {
 		TaskID int64 `query:"task_id" validate:"required"`
 	}
@@ -1277,7 +1636,7 @@ func getBtStratTree(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	btPath, err := s.getBtReportPath(args.TaskID, "detail.json")
 	if err != nil {
 		return fmt.Errorf("get backtest path failed: %v", err)
 	}
@@ -1332,7 +1691,7 @@ func getBtStratTree(c *fiber.Ctx) error {
 	})
 }
 
-func getBtStratText(c *fiber.Ctx) error {
+func (s *DevServer) getBtStratText(c *fiber.Ctx) error {
 	type TextArgs struct {
 		TaskID int64  `query:"task_id" validate:"required"`
 		Path   string `query:"path" validate:"required"`
@@ -1343,12 +1702,16 @@ func getBtStratText(c *fiber.Ctx) error {
 		return err
 	}
 
-	btPath, err := getBtPath(args.TaskID)
+	btPath, err := s.getBtReportPath(args.TaskID, "detail.json")
 	if err != nil {
 		return err
 	}
 
-	content, err2 := utils.ReadTextFile(filepath.Join(btPath, args.Path))
+	filePath, pathErr := reportFilePath(btPath, args.Path)
+	if pathErr != nil {
+		return pathErr
+	}
+	content, err2 := utils.ReadTextFile(filePath)
 	if err2 != nil {
 		return err2
 	}
@@ -1359,7 +1722,7 @@ func getBtStratText(c *fiber.Ctx) error {
 }
 
 // GetSymbolsHandler 获取交易品种列表
-func GetSymbolsHandler(c *fiber.Ctx) error {
+func (s *DevServer) getSymbolsHandler(c *fiber.Ctx) error {
 	type SymbolArgs struct {
 		Exchange string `query:"exchange"`
 		Market   string `query:"market"`
@@ -1375,13 +1738,13 @@ func GetSymbolsHandler(c *fiber.Ctx) error {
 		return err
 	}
 	if strings.TrimSpace(args.Exchange) == "" {
-		args.Exchange = core.ExgName
+		args.Exchange, args.Market, _ = s.identity()
 	}
 	if strings.TrimSpace(args.Market) == "" {
-		args.Market = core.Market
+		_, args.Market, _ = s.identity()
 	}
 
-	if _, ok := exg.AllowExgIds[args.Exchange]; !ok && args.Exchange != "" {
+	if !exg.IsAllowedExgID(args.Exchange) && args.Exchange != "" {
 		return fmt.Errorf("invalid exchange: %s", args.Exchange)
 	}
 	if _, ok := banexg.AllMarketTypes[args.Market]; !ok && args.Market != "" {
@@ -1392,20 +1755,17 @@ func GetSymbolsHandler(c *fiber.Ctx) error {
 		args.Limit = 20
 	}
 
-	// 获取所有品种
-	allSymbols := orm.GetExSymbols(args.Exchange, args.Market)
-
-	if len(allSymbols) == 0 && args.Exchange != "" {
-		exchange, err := exg.GetWith(args.Exchange, args.Market, "")
-		if err != nil {
-			return err
-		}
-		err = orm.InitExg(exchange)
-		if err != nil {
-			return err
-		}
-		allSymbols = orm.GetExSymbols(args.Exchange, args.Market)
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
 	}
+	defer cleanup()
+	// 获取所有品种
+	symbols := deps.Symbols
+	if symbols == nil {
+		return fmt.Errorf("dev server symbol state is required")
+	}
+	allSymbols := symbols.GetExSymbols(args.Exchange, args.Market)
 
 	// 过滤
 	var filtered []*orm.ExSymbol
@@ -1472,23 +1832,34 @@ func GetSymbolsHandler(c *fiber.Ctx) error {
 }
 
 // getSymbolInfo 获取品种详情
-func getSymbolInfo(c *fiber.Ctx) error {
+func (s *DevServer) getSymbolInfo(c *fiber.Ctx) error {
 	type SymbolArgs struct {
-		ID int32 `query:"id" validate:"required"`
+		ID       int32  `query:"id" validate:"required"`
+		Exchange string `query:"exchange"`
+		Market   string `query:"market"`
 	}
 	var args = new(SymbolArgs)
 	if err_ := base.VerifyArg(c, args, base.ArgQuery); err_ != nil {
 		return err_
 	}
 
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	// 获取品种信息
-	symbol := orm.GetSymbolByID(args.ID)
+	symbols := deps.Symbols
+	if symbols == nil {
+		return fmt.Errorf("dev server symbol state is required")
+	}
+	symbol := symbols.GetSymbolByID(args.ID)
 	if symbol == nil {
 		return fmt.Errorf("symbol not found: %d", args.ID)
 	}
 
 	// 获取K线信息
-	sess, conn, err := orm.Conn(nil)
+	sess, conn, err := dataConnFor(c.Context(), deps)
 	if err != nil {
 		return err
 	}
@@ -1502,7 +1873,7 @@ func getSymbolInfo(c *fiber.Ctx) error {
 	var adjFactors []*orm.AdjInfo
 	if symbol.Combined {
 		var err *errs.Error
-		adjFactors, err = orm.GetAdjs(args.ID)
+		adjFactors, err = sess.GetAdjs(args.ID)
 		if err != nil {
 			return err
 		}
@@ -1516,7 +1887,7 @@ func getSymbolInfo(c *fiber.Ctx) error {
 }
 
 // getSymbolGaps 获取品种空洞数据
-func getSymbolGaps(c *fiber.Ctx) error {
+func (s *DevServer) getSymbolGaps(c *fiber.Ctx) error {
 	type GapsArgs struct {
 		ID        int32  `query:"id" validate:"required"`
 		TimeFrame string `query:"tf"`
@@ -1524,6 +1895,8 @@ func getSymbolGaps(c *fiber.Ctx) error {
 		EndMS     int64  `query:"end"`
 		Offset    int    `query:"offset"`
 		Limit     int    `query:"limit"`
+		Exchange  string `query:"exchange"`
+		Market    string `query:"market"`
 	}
 	var args = new(GapsArgs)
 	if err := base.VerifyArg(c, args, base.ArgQuery); err != nil {
@@ -1535,7 +1908,12 @@ func getSymbolGaps(c *fiber.Ctx) error {
 	}
 
 	// 查询范围数据（has_data=false表示空洞/无数据区间）
-	sess, conn, err := orm.Conn(nil)
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	sess, conn, err := dataConnFor(c.Context(), deps)
 	if err != nil {
 		return err
 	}
@@ -1562,13 +1940,15 @@ func getSymbolGaps(c *fiber.Ctx) error {
 }
 
 // getSymbolData 获取品种K线数据
-func getSymbolData(c *fiber.Ctx) error {
+func (s *DevServer) getSymbolData(c *fiber.Ctx) error {
 	type DataArgs struct {
 		ID        int32  `query:"id" validate:"required"`
 		TimeFrame string `query:"tf" validate:"required"`
 		StartMS   int64  `query:"start"`
 		EndMS     int64  `query:"end"`
 		Limit     int    `query:"limit"`
+		Exchange  string `query:"exchange"`
+		Market    string `query:"market"`
 	}
 	var args = new(DataArgs)
 	if err := base.VerifyArg(c, args, base.ArgQuery); err != nil {
@@ -1582,14 +1962,23 @@ func getSymbolData(c *fiber.Ctx) error {
 		args.StartMS = core.MSMinStamp
 	}
 
-	sess, conn, err := orm.Conn(nil)
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	sess, conn, err := dataConnFor(c.Context(), deps)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
 
 	// 查询K线数据
-	exs := orm.GetSymbolByID(args.ID)
+	symbols := deps.Symbols
+	if symbols == nil {
+		return fmt.Errorf("dev server symbol state is required")
+	}
+	exs := symbols.GetSymbolByID(args.ID)
 	data, err := sess.QuerySeries(exs, args.TimeFrame, args.StartMS, args.EndMS, args.Limit, false)
 	if err != nil {
 		return err
@@ -1631,7 +2020,7 @@ func getSymbolData(c *fiber.Ctx) error {
 	})
 }
 
-func getSeriesRanges(c *fiber.Ctx) error {
+func (s *DevServer) getSeriesRanges(c *fiber.Ctx) error {
 	type Args struct {
 		Source    string `query:"source"`
 		Table     string `query:"table"`
@@ -1640,6 +2029,8 @@ func getSeriesRanges(c *fiber.Ctx) error {
 		HasData   string `query:"has_data"`
 		Offset    int    `query:"offset"`
 		Limit     int    `query:"limit"`
+		Exchange  string `query:"exchange"`
+		Market    string `query:"market"`
 	}
 	var args Args
 	if err := base.VerifyArg(c, &args, base.ArgQuery); err != nil {
@@ -1650,7 +2041,12 @@ func getSeriesRanges(c *fiber.Ctx) error {
 		val := args.HasData == "true" || args.HasData == "1"
 		hasData = &val
 	}
-	sess, conn, err := orm.Conn(nil)
+	deps, cleanup, err := s.dataFor(c.Context(), args.Exchange, args.Market)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	sess, conn, err := dataConnFor(c.Context(), deps)
 	if err != nil {
 		return err
 	}
@@ -1688,7 +2084,7 @@ func getBuildEnvs(c *fiber.Ctx) error {
 }
 
 // handleDownload 处理文件下载请求
-func handleDownload(c *fiber.Ctx) error {
+func (s *DevServer) handleDownload(c *fiber.Ctx) error {
 	type DownloadArgs struct {
 		Path string `query:"path" validate:"required"`
 	}
@@ -1698,7 +2094,7 @@ func handleDownload(c *fiber.Ctx) error {
 	}
 
 	// 解析路径
-	absPath, err := parsePath(args.Path)
+	absPath, err := s.parsePath(args.Path)
 	if err != nil {
 		return err
 	}
@@ -1724,7 +2120,7 @@ func handleDownload(c *fiber.Ctx) error {
 	return c.SendFile(absPath)
 }
 
-func getCompareAssets(c *fiber.Ctx) error {
+func (s *DevServer) getCompareAssets(c *fiber.Ctx) error {
 	ids := c.Query("ids")
 	if ids == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "ids is required")
@@ -1734,7 +2130,7 @@ func getCompareAssets(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "at least 2 ids are required")
 	}
 
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -1754,7 +2150,12 @@ func getCompareAssets(c *fiber.Ctx) error {
 		if task.Path == "" {
 			continue
 		}
-		path := filepath.Join(config.GetDataDir(), "backtest", task.Path, "assets.html")
+		reportDirs, pathErr := s.taskReportDirs(task)
+		if pathErr != nil {
+			return pathErr
+		}
+		reportDir := firstReportDir(reportDirs, "assets.html")
+		path := filepath.Join(reportDir, "assets.html")
 		if !utils.Exists(path) {
 			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("assets.html not found for id %s, path: %s", id, path))
 		}
@@ -1785,7 +2186,7 @@ func getCompareAssets(c *fiber.Ctx) error {
 	return c.Send(content)
 }
 
-func delBacktestReports(c *fiber.Ctx) error {
+func (s *DevServer) delBacktestReports(c *fiber.Ctx) error {
 	type DelArgs struct {
 		IDs    []int64  `json:"ids"`
 		Hashes []string `json:"hashes"`
@@ -1795,7 +2196,7 @@ func delBacktestReports(c *fiber.Ctx) error {
 		return err
 	}
 
-	qu, conn, err2 := ormu.Conn()
+	qu, conn, err2 := s.Conn()
 	if err2 != nil {
 		return err2
 	}
@@ -1804,6 +2205,7 @@ func delBacktestReports(c *fiber.Ctx) error {
 	// 构建files参数
 	files := make(map[string]bool)
 	tasks := make([]int64, 0, len(args.IDs))
+	taskIDs := make(map[int64]struct{}, len(args.IDs))
 	failNum := 0
 	for _, id := range args.IDs {
 		task, err := qu.GetTask(context.Background(), id)
@@ -1812,14 +2214,25 @@ func delBacktestReports(c *fiber.Ctx) error {
 			log.Error("query task fail", zap.Int64("id", id), zap.Error(err))
 			continue
 		}
-		tasks = append(tasks, id)
+		if _, seen := taskIDs[id]; !seen {
+			tasks = append(tasks, id)
+			taskIDs[id] = struct{}{}
+		}
 		if task.Path != "" {
-			path := filepath.Join(config.GetDataDir(), "backtest", task.Path)
+			path, pathErr := s.taskBaseDir(task)
+			if pathErr != nil {
+				failNum++
+				log.Error("invalid backtest task path", zap.Int64("id", id), zap.String("path", task.Path), zap.Error(pathErr))
+				continue
+			}
 			files[path] = utils.Exists(path)
 		}
 	}
 	for _, hash := range args.Hashes {
-		path := filepath.Join(config.GetDataDir(), "backtest", hash)
+		path, pathErr := s.taskBaseDir(&ormu.Task{Path: hash})
+		if pathErr != nil {
+			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("invalid backtest path: %v", pathErr))
+		}
 		files[path] = utils.Exists(path)
 		rows, err := qu.FindTasks(context.Background(), ormu.FindTasksParams{
 			Path: hash,
@@ -1829,7 +2242,10 @@ func delBacktestReports(c *fiber.Ctx) error {
 			continue
 		}
 		for _, r := range rows {
-			tasks = append(tasks, r.ID)
+			if _, seen := taskIDs[r.ID]; !seen {
+				tasks = append(tasks, r.ID)
+				taskIDs[r.ID] = struct{}{}
+			}
 		}
 	}
 	for path, exist := range files {
@@ -1855,7 +2271,7 @@ func delBacktestReports(c *fiber.Ctx) error {
 }
 
 // handleUpdateNote 处理更新回测任务备注的请求
-func handleUpdateNote(c *fiber.Ctx) error {
+func (s *DevServer) handleUpdateNote(c *fiber.Ctx) error {
 	type UpdateNoteArgs struct {
 		TaskID int64  `json:"taskId" validate:"required"`
 		Note   string `json:"note"`
@@ -1865,7 +2281,7 @@ func handleUpdateNote(c *fiber.Ctx) error {
 		return err
 	}
 
-	qu, conn, err := ormu.Conn()
+	qu, conn, err := s.Conn()
 	if err != nil {
 		return err
 	}

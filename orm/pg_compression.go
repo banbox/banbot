@@ -36,16 +36,29 @@ type compressionState struct {
 // EnsureTimescaleCompression keeps banbot's K-line compression settings in sync.
 // It is a no-op for QuestDB and PostgreSQL databases without TimescaleDB.
 func EnsureTimescaleCompression(ctx context.Context) *errs.Error {
-	if IsQuestDB {
+	return ensureTimescaleCompressionWithPool(ctx, IsQuestDB, pool)
+}
+
+// EnsureTimescaleCompressionWithStorage keeps compression setup on the
+// caller-owned database instead of consulting the legacy default pool.
+func EnsureTimescaleCompressionWithStorage(ctx context.Context, storage *Storage) *errs.Error {
+	if storage == nil {
+		return errs.NewMsg(core.ErrDbConnFail, "storage is not configured")
+	}
+	return ensureTimescaleCompressionWithPool(ctx, storage.IsQuestDB(), storage.Pool())
+}
+
+func ensureTimescaleCompressionWithPool(ctx context.Context, questDB bool, db *pgxpool.Pool) *errs.Error {
+	if questDB {
 		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if pool == nil {
+	if db == nil {
 		return errs.NewMsg(core.ErrDbConnFail, "database is not initialized")
 	}
-	if err := ensureTimescaleCompression(ctx, pool); err != nil {
+	if err := ensureTimescaleCompression(ctx, db); err != nil {
 		return NewDbErr(core.ErrDbExecFail, err)
 	}
 	return nil

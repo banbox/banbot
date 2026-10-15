@@ -62,33 +62,26 @@ func ClearRefineMap() {
 	refineLock.Unlock()
 }
 
-func GetStratRefineTF(stratName, timeframe string) (string, bool) {
+func lookupStratRefineTF(stratName, timeframe string) (string, bool) {
 	refineLock.RLock()
-	outTf := ""
+	defer refineLock.RUnlock()
 	if tfMap, ok := refineTfMap[stratName]; ok {
-		subTf, ok2 := tfMap[timeframe]
-		if ok2 {
-			outTf = subTf
+		if subTf, ok := tfMap[timeframe]; ok && subTf != "" {
+			return subTf, true
 		}
 	}
-	refineLock.RUnlock()
-	if outTf != "" {
+	return "", false
+}
+
+func GetStratRefineTF(stratName, timeframe string) (string, bool) {
+	if outTf, ok := lookupStratRefineTF(stratName, timeframe); ok {
 		return outTf, true
 	}
 	return timeframe, false
 }
 
 func EnsureStratRefineTF(stratName, timeframe string) string {
-	refineLock.RLock()
-	outTf := ""
-	if tfMap, ok := refineTfMap[stratName]; ok {
-		subTf, ok2 := tfMap[timeframe]
-		if ok2 {
-			outTf = subTf
-		}
-	}
-	refineLock.RUnlock()
-	if outTf != "" {
+	if outTf, ok := lookupStratRefineTF(stratName, timeframe); ok {
 		return outTf
 	}
 	refineLock.Lock()

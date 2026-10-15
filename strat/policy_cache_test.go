@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/goods"
 )
 
 func TestNewCacheUsesCompletePolicyIdentity(t *testing.T) {
@@ -12,15 +13,15 @@ func TestNewCacheUsesCompletePolicyIdentity(t *testing.T) {
 	oldCache := cacheStrats
 	cacheStrats = make(map[string]*TradeStrat)
 	t.Cleanup(func() {
-		delete(StratMake, name)
+		deleteStratFactory(name)
 		cacheStrats = oldCache
 	})
 
 	makeCalls := 0
-	StratMake[name] = func(*config.RunPolicyConfig) *TradeStrat {
+	RegisterStrategy(name, func(*config.RunPolicyConfig) *TradeStrat {
 		makeCalls++
 		return &TradeStrat{}
-	}
+	})
 
 	policies := []*config.RunPolicyConfig{
 		{Name: name, StopLoss: "2%", Params: map[string]float64{"threshold": 0.0036}},
@@ -49,15 +50,15 @@ func TestNewCacheIsConcurrentSafe(t *testing.T) {
 	oldCache := cacheStrats
 	cacheStrats = make(map[string]*TradeStrat)
 	t.Cleanup(func() {
-		delete(StratMake, name)
+		deleteStratFactory(name)
 		cacheStrats = oldCache
 	})
 
 	makeCalls := 0
-	StratMake[name] = func(*config.RunPolicyConfig) *TradeStrat {
+	RegisterStrategy(name, func(*config.RunPolicyConfig) *TradeStrat {
 		makeCalls++
 		return &TradeStrat{}
-	}
+	})
 	base := &config.RunPolicyConfig{Name: name, StopLoss: "2%", Params: map[string]float64{"threshold": 0.003938123456789}}
 	const count = 32
 	results := make(chan *TradeStrat, count)
@@ -82,4 +83,25 @@ func TestNewCacheIsConcurrentSafe(t *testing.T) {
 	if makeCalls != 1 {
 		t.Fatalf("strategy factory called %d times, want 1", makeCalls)
 	}
+}
+
+func TestLegacyPolicyFiltersAreConcurrentSafe(t *testing.T) {
+	old := polFilters
+	polFilters = make(map[string][]goods.IFilter)
+	t.Cleanup(func() { polFilters = old })
+	pol := &config.RunPolicyConfig{
+		Name:    "legacy-policy-filter-concurrency",
+		Filters: []*config.CommonPairFilter{{Name: "ShuffleFilter"}},
+	}
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := getPolicyPairs(pol, []string{"BTC/USDT", "ETH/USDT"}); err != nil {
+				t.Errorf("get policy pairs: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
 }

@@ -4,8 +4,8 @@ import "math"
 
 /*
 CalcExpectancy
-Calculate expected returns and risk return ratio
-计算收益期望、风险回报率
+Calculate expected returns and expectancy ratio
+计算收益期望、收益期望比率
 */
 func CalcExpectancy(profits []float64) (float64, float64) {
 	if len(profits) == 0 {

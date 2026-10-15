@@ -235,7 +235,11 @@ func ToDateStr(timestamp int64, format string) string {
 }
 
 func ToDateStrLoc(timestamp int64, format string) string {
-	t := ToTime(timestamp).In(LocShow)
+	location := LocShow
+	if location == nil {
+		location = UTCLocale
+	}
+	t := ToTime(timestamp).In(location)
 	if format == "" {
 		format = core.DefaultDateFmt
 	}

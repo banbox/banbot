@@ -1,12 +1,7 @@
 package live
 
 import (
-	"fmt"
-	"os"
-	"path/filepath"
-	"slices"
-	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/banbox/banbot/biz"
@@ -15,7 +10,7 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
-	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/goods"
 	"github.com/banbox/banbot/opt"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
@@ -23,309 +18,327 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
 )
 
-var (
-	lastNotifyDelay = int64(0)
-	lastRefreshMS   = int64(0)
-)
-
-func CronRefreshPairs(dp data.IProvider, afterRefresh ...func() error) {
-	if config.PairMgr.Cron != "" {
-		_, err_ := com.Cron().AddFunc(config.PairMgr.Cron, func() {
-			curMS := btime.TimeMS()
-			if curMS-lastRefreshMS < config.MinPairCronGapMS {
-				return
-			}
-			lastRefreshMS = curMS
-			err := opt.RefreshPairJobs(dp, true, false, nil)
+// refreshPairJobsWithRuntime rotates pairs inside one explicitly owned live
+// runtime. Legacy callers must not enter this path.
+func refreshPairJobsWithRuntime(dp data.IProvider, symbols *orm.SymbolState, deps *biz.RuntimeDeps,
+	clock *btime.ClockState, exchange banexg.BanExchange, showLog, isFirst bool) *errs.Error {
+	if deps == nil {
+		return errs.NewMsg(core.ErrBadConfig, "live pair refresh requires explicit runtime dependencies")
+	}
+	if deps.Config == nil || deps.Config.View() == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime config is required")
+	}
+	cfg := deps.Config.View()
+	pairMgr := cfg.PairMgr
+	if pairMgr == nil {
+		pairMgr = &config.PairMgrConfig{}
+	}
+	state := deps.Core
+	if state == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime core state is required")
+	}
+	if symbols == nil {
+		symbols = deps.Symbols
+	}
+	if symbols == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime symbol state is required")
+	}
+	if deps.Symbols == nil {
+		deps.Symbols = symbols
+	}
+	if clock == nil {
+		clock = deps.Clock
+	}
+	if clock == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime clock is required")
+	}
+	if err := validateCryptoTraderRuntimeDeps(deps, symbols); err != nil {
+		return err
+	}
+	if dp == nil {
+		return errs.NewMsg(core.ErrRunTime, "live provider is required")
+	}
+	if exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "runtime exchange is required")
+	}
+	curTime := clock.TimeMS()
+	envReal := state.EnvReal
+	var err *errs.Error
+	if isFirst {
+		if pairMgr.Cron != "" {
+			location := deps.Config.Location()
+			schedule, err := utils.NewCronSchedulerWithLocation(pairMgr.Cron, location)
 			if err != nil {
-				log.Error("RefreshPairJobs fail", zap.Error(err))
-				return
+				return errs.New(errs.CodeRunTime, err)
 			}
-			if len(afterRefresh) > 0 && afterRefresh[0] != nil {
-				if err := afterRefresh[0](); err != nil {
-					log.Error("RefreshPairJobs post-refresh fail", zap.Error(err))
-				}
-			}
-		})
-		if err_ != nil {
-			log.Error("add RefreshPairList fail", zap.Error(err_))
+			curTime = utils.CronAlign(schedule, btime.ToTime(curTime)).UnixMilli()
+		} else if !envReal && !state.LiveMode && pairMgr.UseLatest && cfg.TimeRange != nil {
+			curTime = min(curTime, cfg.TimeRange.EndMS)
 		}
 	}
-}
 
-func FetchHourKlines(dp *data.LiveProvider) {
-	endMap := make(map[int32]int64)
-	_, err := com.Cron().AddFunc("0 0 * * * *", func() {
-		exsList := orm.GetHourOnlySymbols()
-		if len(exsList) == 0 {
-			return
-		}
-		log.Info("FetchHourKlines", zap.Int("num", len(exsList)))
-		for sid := range exsList {
-			if _, ok := endMap[sid]; !ok {
-				endMap[sid] = 0
-			}
-		}
-		for sid := range endMap {
-			if _, ok := exsList[sid]; !ok {
-				delete(endMap, sid)
-			}
-		}
-		data.DownEmitHourKlines(dp, endMap)
-	})
+	var pairs []string
+	pairs, err = goods.RefreshPairListWithRuntimeDeps(&goods.RuntimeDeps{
+		Core: deps.Core, Clock: deps.Clock, Config: cfg, DataDir: deps.Config.DataDir, Storage: deps.Storage,
+		Symbols: symbols, Exchange: exchange, ShowLog: showLog,
+	}, curTime)
 	if err != nil {
-		log.Error("add FetchHourKlines fail", zap.Error(err))
+		return err
 	}
-}
-
-func CronLoadMarkets() {
-	// 2小时更新一次市场行情
-	_, err := com.Cron().AddFunc("30 3 */2 * * *", func() {
-		_, _ = orm.LoadMarkets(exg.Default, true)
-	})
+	allPairs := make([]string, 0, len(pairs))
+	allPairs = append(allPairs, pairs...)
+	for _, policy := range cfg.RunPolicy {
+		allPairs = append(allPairs, policy.Pairs...)
+	}
+	allPairs, _ = utils.UniqueItems(allPairs)
+	pairTfScores, err := strat.CalcPairTfScoresWithState(deps.Strategies, symbols, exchange, allPairs)
 	if err != nil {
-		log.Error("add CronLoadMarkets fail", zap.Error(err))
+		return err
 	}
-}
-
-func CronFatalLossCheck() {
-	checkIntvs := utils.KeysOfMap(config.FatalStop)
-	if len(checkIntvs) == 0 {
-		return
+	state.SetPairs(pairs, policyPairs(cfg.RunPolicy))
+	warms, exitOrders, loadErr := strat.LoadStratJobsWithState(deps.Strategies, state, symbols, pairs, pairTfScores, deps.Orders)
+	if loadErr != nil {
+		return loadErr
 	}
-	minIntv := slices.Min(checkIntvs)
-	if minIntv < 1 {
-		log.Error("fatal_stop invalid, min is 1, skip", zap.Int("current", minIntv))
-		return
-	}
-	cronStr := fmt.Sprintf("35 */%v * * * *", min(5, minIntv))
-	maxIntv := slices.Max(checkIntvs)
-	_, err := com.Cron().AddFunc(cronStr, biz.MakeCheckFatalStop(maxIntv))
-	if err != nil {
-		log.Error("add CronFatalLossCheck fail", zap.Error(err))
-	}
-}
-
-func CronKlineDelays(dp *data.LiveProvider) {
-	logDelay := func(msgText string) {
-		curMS := btime.TimeMS()
-		log.Warn(msgText)
-		if curMS-lastNotifyDelay > 600000 {
-			// Delay reminders are sent every 10 minutes
-			// 10 分钟发送一次延迟提醒
-			lastNotifyDelay = curMS
-			rpc.SendMsg(map[string]interface{}{
-				"type":   rpc.MsgTypeException,
-				"status": msgText,
-			})
-		}
-	}
-	stuckCount := 0
-	_, err_ := com.Cron().AddFunc("30 * * * * *", func() {
-		jobs := dp.GetJobs("ohlcv")
-		if len(jobs) == 0 {
-			return
-		}
-		curMS := btime.TimeMS()
-		delaySecs := int((curMS - core.LastCopiedMs) / 1000)
-		if delaySecs > 120 {
-			// It should be received every minute, alert if haven't been received for more than 2 minutes
-			// 应该每分钟都能收到，超过2分钟未收到爬虫推送报警
-			logDelay("Listen to the spider kline timeout!")
-			stuckCount += 1
-			if stuckCount > config.CloseOnStuck {
-				// 超时未收到K线，全部平仓
-				for account, cfg := range config.Accounts {
-					if cfg.NoTrade {
-						continue
-					}
-					openOds, lock := ormo.GetOpenODs(account)
-					lock.Lock()
-					var odList = utils.ValsOfMap(openOds)
-					lock.Unlock()
-					if len(odList) > 0 {
-						closeNum, failNum, err := biz.CloseAccOrders(account, odList, &strat.ExitReq{
-							Tag:   core.ExitTagDataStuck,
-							Force: true,
-						})
-						if err != nil {
-							log.Error("close orders on stuck fail", zap.String("acc", account),
-								zap.Int("success", closeNum), zap.Int("fail", failNum), zap.Error(err))
-						} else {
-							log.Warn(fmt.Sprintf("close orders on stuck: %s, %d closed, %d failed",
-								account, closeNum, failNum))
-						}
-					}
-				}
-				// 防止频繁检查
-				stuckCount = 0
-			}
-			return
-		}
-		stuckCount = 0
-		var fails = make(map[string][]string)
-		copied := com.GetPairCopieds()
-		for pair, wait := range copied {
-			if wait[0]+wait[1]*2 > curMS {
-				continue
-			}
-			timeoutMin := strconv.Itoa(int((curMS-wait[0])/60000)) + "mins"
-			arr, _ := fails[timeoutMin]
-			fails[timeoutMin] = append(arr, pair)
-		}
-		if len(fails) > 0 {
-			failText := core.GroupByPairQuotes(fails, false)
-			logDelay("Listen to the spider kline timeout:" + failText)
-		}
-	})
-	if err_ != nil {
-		log.Error("add Monitor Klines fail", zap.Error(err_))
-	}
-}
-
-func CronKlineSummary() {
-	_, err_ := com.Cron().AddFunc("30 1-59/10 * * * *", func() {
-		core.TfPairHitsLock.Lock()
-		var pairGroups = make(map[string][]string)
-		for tf, tfMap := range core.TfPairHits {
-			hitMap := make(map[int][]string)
-			for pair, num := range tfMap {
-				arr, _ := hitMap[num]
-				hitMap[num] = append(arr, pair)
-			}
-			for num, arr := range hitMap {
-				arrLen := len(arr)
-				pairGroups[fmt.Sprintf("%s_%v: %v", tf, num, arrLen)] = arr
-			}
-			core.TfPairHits[tf] = make(map[string]int)
-		}
-		core.TfPairHitsLock.Unlock()
-		if len(pairGroups) > 0 {
-			staText := core.GroupByPairQuotes(pairGroups, true)
-			log.Info(fmt.Sprintf("receive bars in 10 mins:\n%s", staText))
-		}
-	})
-	if err_ != nil {
-		log.Error("add Receive Klines Summary fail", zap.Error(err_))
-	}
-}
-
-func CronDumpStratOutputs() {
-	_, err_ := com.Cron().AddFunc("31 * * * * *", func() {
-		groups := make(map[string][]string)
-		for _, items := range strat.PairStrats {
-			for _, stgy := range items {
-				if len(stgy.Outputs) == 0 {
-					continue
-				}
-				rows, _ := groups[stgy.Name]
-				groups[stgy.Name] = append(rows, stgy.Outputs...)
-				stgy.Outputs = nil
-			}
-		}
-		for name, lines := range groups {
-			name = strings.ReplaceAll(name, ":", "_")
-			fname := fmt.Sprintf("%s_%s.log", config.Name, name)
-			outPath := filepath.Join(config.GetLogsDir(), fname)
-			file, err := os.OpenFile(outPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				log.Error("create strategy output file fail", zap.String("name", name), zap.Error(err))
-				continue
-			}
-			_, err = file.WriteString(strings.Join(lines, "\n"))
-			if err != nil {
-				log.Error("write strategy output fail", zap.String("name", name), zap.Error(err))
-			}
-			_, _ = file.WriteString("\n")
-			err = file.Close()
-			if err != nil {
-				log.Error("close strategy output fail", zap.String("name", name), zap.Error(err))
-			}
-		}
-	})
-	if err_ != nil {
-		log.Error("add CronDumpStratOutputs fail", zap.Error(err_))
-	}
-}
-
-func CronCheckTriggerOds() {
-	// Check every minute 15 seconds to see if the limit order submission is triggered
-	// 在每分钟的15s检查是否触发限价单提交
-	_, err_ := com.Cron().AddFunc("15,45 * * * * *", biz.VerifyTriggerOds)
-	if err_ != nil {
-		log.Error("add VerifyTriggerOds fail", zap.Error(err_))
-	}
-}
-
-func CronBacktestInLive() {
-	if config.BTInLive != nil && config.BTInLive.Cron != "" {
-		_, err := com.Cron().AddFunc(config.BTInLive.Cron, opt.BacktestToCompare)
-		if err != nil {
-			log.Error("add CronBacktestInLive fail", zap.Error(err))
-		}
-	}
-}
-
-func StartLoopBalancePositions() {
-	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
+	for acc, orders := range exitOrders {
+		if len(orders) == 0 {
 			continue
 		}
-		updateAccBalance(account)
+		mgr := biz.GetOdMgrWithState(deps.Trading, acc)
+		if mgr == nil {
+			return errs.NewMsg(core.ErrRunTime, "order manager is required for pair rotation: %s", acc)
+		}
+		if err := mgr.ExitAndFill(orders, &strat.ExitReq{Tag: core.ExitTagPairDel}); err != nil {
+			return err
+		}
+		strat.FinalizePairRotation(deps.Strategies, deps.Core)
+		deps.Logger().Info("exit old orders as pair rotation", zap.Int("num", len(orders)))
 	}
+	if showLog {
+		strat.PrintStratGroupsWithState(deps.Strategies, state)
+	}
+	if isFirst {
+		biz.InitOdSubsWithRuntimeDeps(deps)
+	}
+	symbols.ResetSubSymbol()
+	if err := dp.SubWarmPairs(warms, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func policyPairs(policies []*config.RunPolicyConfig) []string {
+	if len(policies) == 0 {
+		return nil
+	}
+	pairs := make([]string, 0)
+	for _, policy := range policies {
+		if policy != nil {
+			pairs = append(pairs, policy.Pairs...)
+		}
+	}
+	pairs, _ = utils.UniqueItems(pairs)
+	return pairs
+}
+
+var backtestToCompareWithRuntime = opt.BacktestToCompareWithRuntime
+
+func cronBacktestInLiveWithRuntime(scheduler com.Scheduler, deps biz.RuntimeDeps) {
+	if scheduler == nil || deps.Config == nil {
+		return
+	}
+	cfg := deps.Config.View()
+	if cfg == nil || cfg.BTInLive == nil || cfg.BTInLive.Cron == "" {
+		return
+	}
+	_, err := scheduler.AddFunc(cfg.BTInLive.Cron, func() {
+		backtestToCompareWithRuntime(deps)
+	})
+	if err != nil {
+		deps.Logger().Error("add runtime CronBacktestInLive fail", zap.Error(err))
+	}
+}
+
+// StartLoopBalancePositionsWithRuntime ties the polling worker to an
+// explicit runtime.
+type balanceRuntimeDeps struct {
+	exchange banexg.BanExchange
+	core     *core.State
+	config   *config.Config
+	accounts map[string]*config.AccountConfig
+	orders   *ormo.OrderState
+	trading  *biz.TradingState
+	interval time.Duration
+}
+
+// snapshotBalanceAccounts copies the low-frequency account configuration at
+// the worker boundary. The worker may outlive a config refresh, so retaining
+// either the source map or its AccountConfig pointers would reintroduce a
+// concurrent map/pointer mutation race.
+func snapshotBalanceAccounts(accounts map[string]*config.AccountConfig) map[string]*config.AccountConfig {
+	if accounts == nil {
+		return nil
+	}
+	snapshot := config.NewSnapshotWithDirs(&config.Config{Accounts: accounts}, "", "")
+	if snapshot == nil || snapshot.View() == nil {
+		return nil
+	}
+	return snapshot.View().Accounts
+}
+
+func bindBalanceRuntimeDeps(deps biz.RuntimeDeps) *balanceRuntimeDeps {
+	bound := &balanceRuntimeDeps{
+		exchange: deps.Exchange,
+		core:     deps.Core,
+		orders:   deps.Orders,
+		trading:  deps.Trading,
+		interval: time.Minute,
+	}
+	if bound.orders == nil {
+		bound.orders = ormo.NewOrderState()
+	}
+	if bound.trading == nil {
+		bound.trading = biz.NewTradingState()
+	}
+	if deps.Config != nil {
+		bound.config = deps.Config.View()
+	}
+	if bound.config != nil {
+		if bound.config.AccountPullSecs > 0 {
+			bound.interval = time.Duration(bound.config.AccountPullSecs) * time.Second
+		}
+	}
+	bound.accounts = snapshotBalanceAccounts(deps.AccountConfigs())
+	return bound
+}
+
+func StartLoopBalancePositionsWithRuntime(lifecycle RuntimeLifecycle, runtimeDeps ...biz.RuntimeDeps) {
+	if lifecycle == nil {
+		log.Error("runtime balance worker requires a lifecycle")
+		return
+	}
+	if len(runtimeDeps) == 0 {
+		log.Error("runtime balance worker requires explicit dependencies")
+		return
+	}
+	deps := bindBalanceRuntimeDeps(runtimeDeps[0])
+	ctx := lifecycle.Context()
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+	for account, cfg := range deps.accounts {
+		if cfg == nil || cfg.NoTrade {
+			continue
+		}
+		updateAccBalanceWithRuntime(deps, account)
+	}
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
+	stop := make(chan struct{})
+	ticker := time.NewTicker(deps.interval)
+	var wait sync.WaitGroup
+	wait.Add(1)
 	go func() {
-		ticker := time.NewTicker(time.Duration(config.AccountPullSecs) * time.Second)
-		core.ExitCalls = append(core.ExitCalls, ticker.Stop)
+		defer wait.Done()
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				updateBalancePos()
+				updateBalancePosWithRuntime(deps)
+			case <-done:
+				return
+			case <-stop:
+				return
 			}
 		}
 	}()
+	var stopOnce sync.Once
+	lifecycle.OnClose(func() {
+		ticker.Stop()
+		stopOnce.Do(func() { close(stop) })
+	})
+	lifecycle.OnCloseWait(wait.Wait)
 }
 
-func updateBalancePos() {
-	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
+func updateBalancePosWithRuntime(deps *balanceRuntimeDeps) {
+	if deps == nil {
+		return
+	}
+	logger := deps.core.Log()
+	for account, cfg := range deps.accounts {
+		if cfg == nil || cfg.NoTrade {
 			continue
 		}
-		odList, lock := ormo.GetOpenODs(account)
+		if deps.orders == nil || deps.trading == nil {
+			continue
+		}
+		odList, lock := deps.orders.GetOpenODs(account)
 		lock.Lock()
 		odNum := len(odList)
 		lock.Unlock()
 		if odNum == 0 {
+			// 无持仓时也需定期拉取，避免仅依赖推送导致余额长期不准确
+			wallet := deps.trading.Wallet(account)
+			if time.Now().UnixMilli()-wallet.LastSyncMS() >= biz.WalletStaleMS {
+				updateAccBalanceWithRuntime(deps, account)
+			}
 			continue
 		}
-		if core.Market == banexg.MarketLinear || core.Market == banexg.MarketInverse {
+		if deps.core != nil && (deps.core.Market == banexg.MarketLinear || deps.core.Market == banexg.MarketInverse) {
 			// 定期同步仓位检查不匹配订单，现货不支持
-			odMgr := biz.GetLiveOdMgr(account)
+			odMgr := biz.GetLiveOdMgrWithState(deps.trading, account)
+			if odMgr == nil {
+				continue
+			}
 			_, err := odMgr.SyncLocalOrders()
 			if err != nil {
-				log.Error("SyncLocalOrders fail", zap.String("acc", account), zap.Error(err))
+				logger.Error("SyncLocalOrders fail", zap.String("acc", account), zap.Error(err))
 			}
 		}
-		updateAccBalance(account)
+		updateAccBalanceWithRuntime(deps, account)
 	}
 }
 
-func updateAccBalance(account string) {
-	wallet := biz.GetWallets(account)
-	rsp, err := exg.Default.FetchBalance(map[string]interface{}{
-		banexg.ParamAccount: account,
-	})
-	if err != nil {
-		log.Error("UpdateBalance fail", zap.String("acc", account), zap.Error(err))
-	} else {
-		biz.UpdateWalletByBalances(wallet, rsp)
+func updateAccBalanceWithRuntime(deps *balanceRuntimeDeps, account string) {
+	if deps == nil {
+		log.Error("UpdateBalance requires a runtime exchange", zap.String("acc", account))
+		return
+	}
+	logger := deps.core.Log()
+	if deps.exchange == nil {
+		logger.Error("UpdateBalance requires a runtime exchange", zap.String("acc", account))
+		return
+	}
+	if deps.trading == nil {
+		logger.Error("UpdateBalance requires runtime trading state", zap.String("acc", account))
+		return
+	}
+	wallet := deps.trading.Wallet(account)
+	if err := biz.SyncWalletBalancesWithRuntime(wallet, deps.exchange); err != nil {
+		logger.Error("UpdateBalance fail", zap.String("acc", account), zap.Error(err))
 	}
 }
 
 func sendOrderMsg(od *ormo.InOutOrder, isEnter bool) {
+	sendOrderMsgWithOrderState(od, isEnter, nil)
+}
+
+func sendOrderMsgWithOrderState(od *ormo.InOutOrder, isEnter bool, orderState *ormo.OrderState) {
+	sendOrderMsgWithRuntime(od, isEnter, orderState, nil)
+}
+
+func sendOrderMsgWithRuntime(od *ormo.InOutOrder, isEnter bool, orderState *ormo.OrderState, notifications *rpc.Session) {
 	msgType := rpc.MsgTypeExit
 	subOd := od.Exit
 	action := "Close Long"
@@ -344,7 +357,12 @@ func sendOrderMsg(od *ormo.InOutOrder, isEnter bool) {
 		return
 	}
 	filled, price := subOd.Filled, subOd.Average
-	account := ormo.GetTaskAcc(od.TaskID)
+	var account string
+	if orderState != nil {
+		account = orderState.GetTaskAcc(od.TaskID)
+	} else {
+		account = ormo.GetTaskAcc(od.TaskID)
+	}
 	if account == "" {
 		log.Info("skip send rpc msg, unknown account", zap.Int64("task_id", od.TaskID), zap.String("key", od.Key()),
 			zap.Int64("status", subOd.Status), zap.Float64("filled", filled))
@@ -355,7 +373,7 @@ func sendOrderMsg(od *ormo.InOutOrder, isEnter bool) {
 			zap.Int64("status", subOd.Status), zap.Float64("filled", filled))
 		return
 	}
-	rpc.SendMsg(map[string]interface{}{
+	message := map[string]interface{}{
 		"type":          msgType,
 		"account":       account,
 		"action":        action,
@@ -375,5 +393,10 @@ func sendOrderMsg(od *ormo.InOutOrder, isEnter bool) {
 		"profit_rate":   od.ProfitRate,
 		"max_pft_rate":  od.MaxPftRate,
 		"max_draw_down": od.MaxDrawDown,
-	})
+	}
+	if notifications != nil {
+		notifications.SendMsg(message)
+	} else {
+		rpc.SendMsg(message)
+	}
 }

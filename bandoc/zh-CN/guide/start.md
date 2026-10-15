@@ -89,3 +89,9 @@ banbot是一个高性能、易用、多品种、多策略、多周期、多账�
 [Discord服务器](https://discord.com/invite/XXjA8ctqga)
 
 [telegram群组](https://t.me/banbot_quant)
+
+## 多因子与截面引擎
+
+Banbot 支持 time_series 和 factor 双引擎：前者按品种事件驱动，后者每轮冻结 Universe，计算多列因子、截面变换和组合目标。两者可在同一 run_policy 中组合，省略 engine 保持时序行为。
+
+参见[多因子与截面指南](./factor.md)和[因子 API](../api/factor.md)。

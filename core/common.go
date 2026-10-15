@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"strings"
@@ -16,9 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var (
-	Cache *ristretto.Cache
-)
+var Cache *ristretto.Cache
 
 func Setup() *errs.Error {
 	var err_ error
@@ -43,11 +42,31 @@ func GetCacheVal[T any](key interface{}, defVal T) T {
 	return defVal
 }
 
-func RunExitCalls() {
-	for _, method := range ExitCalls {
-		method()
+// AddExitCall registers a process-wide cleanup callback for the legacy
+// facade. Runtime-owned code should use State.OnExit instead; this helper is
+// retained for compatibility with process-level profiling and legacy loops.
+func AddExitCall(method func()) {
+	if method == nil {
+		return
 	}
+	exitCallsLock.Lock()
+	ExitCalls = append(ExitCalls, method)
+	exitCallsLock.Unlock()
+}
+
+// RunExitCalls drains the legacy cleanup list exactly once per registration.
+// Taking a snapshot before running callbacks avoids holding the lock across
+// arbitrary cleanup and makes concurrent signal/defer drains idempotent.
+func RunExitCalls() {
+	exitCallsLock.Lock()
+	calls := ExitCalls
 	ExitCalls = nil
+	exitCallsLock.Unlock()
+	for _, method := range calls {
+		if method != nil {
+			method()
+		}
+	}
 }
 
 func KeyStratPairTf(stagy, pair, tf string) string {
@@ -70,6 +89,11 @@ func (p *JobPerf) GetAmount(amount float64) float64 {
 }
 
 func GetPerfSta(stagy string) *PerfSta {
+	legacyFlagsMu.Lock()
+	defer legacyFlagsMu.Unlock()
+	if StratPerfSta == nil {
+		StratPerfSta = make(map[string]*PerfSta)
+	}
 	p, ok := StratPerfSta[stagy]
 	if !ok || p == nil {
 		p = &PerfSta{}
@@ -99,8 +123,24 @@ func (p *PerfSta) Log2(profit float64) float64 {
 }
 
 func DumpPerfs(outDir string) {
+	jobPerfs, stratPerfSta := LegacyPerformanceSnapshot()
+	dumpPerfs(outDir, jobPerfs, stratPerfSta)
+}
+
+func (s *State) DumpPerfs(outDir string) {
+	if s == nil {
+		return
+	}
+	jobPerfs, stratPerfSta := s.PerformanceSnapshot()
+	dumpPerfs(outDir, jobPerfs, stratPerfSta)
+}
+
+func dumpPerfs(outDir string, jobPerfs map[string]*JobPerf, stratPerfSta map[string]*PerfSta) {
 	perfs := make(map[string]map[string]string)
-	for key, pf := range JobPerfs {
+	for key, pf := range jobPerfs {
+		if pf == nil {
+			continue
+		}
 		parts := strings.Split(key, "_")
 		data, ok := perfs[parts[0]]
 		if !ok {
@@ -111,7 +151,10 @@ func DumpPerfs(outDir string) {
 		data[cacheKey] = fmt.Sprintf("%v|%.5f|%.5f", pf.Num, pf.TotProfit, pf.Score)
 	}
 	res := make(map[string]interface{})
-	for name, sta := range StratPerfSta {
+	for name, sta := range stratPerfSta {
+		if sta == nil {
+			continue
+		}
 		perf, _ := perfs[name]
 		res[name] = map[string]interface{}{
 			"od_num":     sta.OdNum,
@@ -307,7 +350,28 @@ func GetOdBook(pair string) (*banexg.OrderBook, bool) {
 
 func SetOdBook(pair string, book *banexg.OrderBook) {
 	lockOdBook.Lock()
+	if OdBooks == nil {
+		OdBooks = make(map[string]*banexg.OrderBook)
+	}
 	OdBooks[pair] = book
+	lockOdBook.Unlock()
+}
+
+// LegacyOdBooksSnapshot returns a stable compatibility order-book index.
+func LegacyOdBooksSnapshot() map[string]*banexg.OrderBook {
+	lockOdBook.Lock()
+	result := maps.Clone(OdBooks)
+	lockOdBook.Unlock()
+	return result
+}
+
+// ReplaceLegacyOdBooks restores the compatibility order-book index.
+func ReplaceLegacyOdBooks(books map[string]*banexg.OrderBook) {
+	lockOdBook.Lock()
+	OdBooks = maps.Clone(books)
+	if OdBooks == nil {
+		OdBooks = make(map[string]*banexg.OrderBook)
+	}
 	lockOdBook.Unlock()
 }
 

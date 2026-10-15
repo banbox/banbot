@@ -2,14 +2,27 @@ package orm
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
+	"github.com/banbox/banbot/internal/testutil"
+	"github.com/banbox/banexg/errs"
 )
 
+func TestContextualKlineOperationErrorMakesEmptyFailureAuditable(t *testing.T) {
+	err := contextualKlineOperationError("download", "BTC/USDT:USDT", "15m", 1_785_024_000_000, 1_785_628_800_000, 672,
+		errs.NewMsg(errs.CodeRunTime, ""))
+	if err == nil || !strings.Contains(err.Message(), "BTC/USDT:USDT") ||
+		!strings.Contains(err.Message(), "empty error code") {
+		t.Fatalf("fetch error = %#v", err)
+	}
+}
+
 func TestAutoFetchOhlcv(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)
@@ -40,6 +53,7 @@ func TestAutoFetchOhlcv(t *testing.T) {
 }
 
 func TestFetchOhlcvs(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)
@@ -59,6 +73,7 @@ func TestFetchOhlcvs(t *testing.T) {
 }
 
 func TestBulkDownOHLCV(t *testing.T) {
+	testutil.RequireIntegration(t)
 	err := initApp()
 	if err != nil {
 		panic(err)

@@ -48,6 +48,30 @@ func TestCollectDataSubsPreservesRequestedFields(t *testing.T) {
 	}
 }
 
+func TestStratJobSetDataConfiguresSubscriptionsOnce(t *testing.T) {
+	calls := 0
+	job := &StratJob{
+		Strat: &TradeStrat{
+			OnDataSubs: func(s *StratJob) []*DataSub {
+				calls++
+				return []*DataSub{{Source: "macro", ExSymbol: s.Symbol, TimeFrame: "1d"}}
+			},
+		},
+		Symbol:    &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"},
+		TimeFrame: "1m",
+	}
+	evt := &orm.DataSeries{
+		Source: "macro", Sid: 7, TimeMS: 100, EndMS: 200, TimeFrame: "1d",
+		Values: map[string]any{"value": 1.0},
+	}
+	job.SetData(evt)
+	evt.TimeMS, evt.EndMS = 200, 300
+	job.SetData(evt)
+	if calls != 1 {
+		t.Fatalf("OnDataSubs called %d times, want once", calls)
+	}
+}
+
 func TestDataHubBuildsConfiguredAndDefaultSeries(t *testing.T) {
 	hub := NewDataHub(2)
 	exs := &orm.ExSymbol{ID: 7, Symbol: "BTC/USDT"}
@@ -78,6 +102,12 @@ func TestDataHubBuildsConfiguredAndDefaultSeries(t *testing.T) {
 	if fields.Series("status") != nil || fields.String("status") != "ok" {
 		t.Fatalf("non-series value not retained: %v", fields.Raw("status"))
 	}
+	if raw, ok := fields.RawValue("trade_num"); !ok || raw != int64(3) {
+		t.Fatalf("raw series value lost its type: %T(%v), present=%v", raw, raw, ok)
+	}
+	if raw, ok := fields.RawValue("missing"); ok || raw != nil || fields.Has("missing") {
+		t.Fatalf("missing field reported as present: %v/%v", raw, ok)
+	}
 
 	hub.Set(&orm.DataSeries{
 		Source: "macro", Sid: 7, TimeMS: 100, EndMS: 200, TimeFrame: "1m",
@@ -102,6 +132,29 @@ func TestDataHubBuildsConfiguredAndDefaultSeries(t *testing.T) {
 	missingFields := missingHub.Get("1m", "macro", 7)
 	if missingFields.Series("a").Len() != missingFields.Series("b").Len() || !math.IsNaN(missingFields.Series("b").Get(0)) {
 		t.Fatal("missing configured fields must append NaN to keep series aligned")
+	}
+}
+
+func TestDataHubRawValuesPreserveNullAndMissingSemantics(t *testing.T) {
+	hub := NewDataHub()
+	hub.Set(&orm.DataSeries{
+		Source: "macro", Sid: 7, TimeMS: 100, EndMS: 200, TimeFrame: "1m",
+		Values: map[string]any{"count": int64(4), "label": "old", "nullable": nil},
+	})
+	fields := hub.Set(&orm.DataSeries{
+		Source: "macro", Sid: 7, TimeMS: 200, EndMS: 300, TimeFrame: "1m",
+		Values: map[string]any{"count": uint8(5), "nullable": nil},
+	})
+	if raw, ok := fields.RawValue("count"); !ok {
+		t.Fatal("count was not present in the latest event")
+	} else if value, ok := raw.(uint8); !ok || value != 5 {
+		t.Fatalf("count raw type = %T(%v), want uint8(5)", raw, raw)
+	}
+	if raw, ok := fields.RawValue("nullable"); !ok || raw != nil || !fields.Has("nullable") {
+		t.Fatalf("explicit nil was not preserved: %v/%v", raw, ok)
+	}
+	if raw, ok := fields.RawValue("label"); ok || raw != nil || fields.Has("label") {
+		t.Fatalf("missing label inherited a stale value: %v/%v", raw, ok)
 	}
 }
 

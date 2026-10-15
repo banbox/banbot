@@ -2,6 +2,8 @@ package orm
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -59,11 +61,11 @@ func (q *Queries) mergeSpansIntoPg(ctx context.Context, sid int32, table, timefr
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	tx, txq, err2 := q.NewTx(ctx)
-	if err2 != nil {
-		return err2
+	tx, txq, err := q.begin(ctx)
+	if err != nil {
+		return err
 	}
-	defer func() { _ = tx.Close(ctx, false) }()
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Read existing rows that overlap the window so we can recover any overhanging parts.
 	rows, err := txq.db.Query(ctx, `SELECT start_ms, stop_ms, has_data FROM sranges
@@ -72,13 +74,14 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <=
 	if err != nil {
 		return err
 	}
-	var overhangSegs []srangeSpan
+	var spans, overhangSegs []srangeSpan
 	for rows.Next() {
 		var s srangeSpan
 		if scanErr := rows.Scan(&s.StartMs, &s.StopMs, &s.HasData); scanErr != nil {
 			rows.Close()
 			return scanErr
 		}
+		spans = append(spans, s)
 		if s.StartMs < startMs {
 			overhangSegs = append(overhangSegs, srangeSpan{StartMs: s.StartMs, StopMs: startMs, HasData: s.HasData})
 		}
@@ -88,14 +91,6 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <=
 	}
 	rows.Close()
 	if err = rows.Err(); err != nil {
-		return err
-	}
-
-	// Delete all existing rows overlapping the window.
-	_, err = txq.db.Exec(ctx, `DELETE FROM sranges
-WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <= $5`,
-		sid, table, timeframe, startMs, stopMs)
-	if err != nil {
 		return err
 	}
 
@@ -119,6 +114,27 @@ WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <=
 		return allSegs[i].HasData && !allSegs[j].HasData
 	})
 	allSegs = mergeSRangeSpans(allSegs)
+	current := append([]srangeSpan(nil), spans...)
+	sort.Slice(current, func(i, j int) bool {
+		if current[i].StartMs != current[j].StartMs {
+			return current[i].StartMs < current[j].StartMs
+		}
+		if current[i].StopMs != current[j].StopMs {
+			return current[i].StopMs < current[j].StopMs
+		}
+		return current[i].HasData && !current[j].HasData
+	})
+	current = mergeSRangeSpans(current)
+	if slices.Equal(current, allSegs) {
+		return nil
+	}
+	// Delete all existing rows overlapping the window only when the logical spans changed.
+	_, err = txq.db.Exec(ctx, `DELETE FROM sranges
+WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND stop_ms >= $4 AND start_ms <= $5`,
+		sid, table, timeframe, startMs, stopMs)
+	if err != nil {
+		return err
+	}
 	for _, s := range allSegs {
 		_, err = txq.db.Exec(ctx, `INSERT INTO sranges (sid, tbl, timeframe, start_ms, stop_ms, has_data)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -129,10 +145,7 @@ ON CONFLICT (sid, tbl, timeframe, start_ms) DO UPDATE
 			return err
 		}
 	}
-	if closeErr := tx.Close(ctx, true); closeErr != nil {
-		return closeErr
-	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // UpdateSRangesPg is the TimescaleDB equivalent of UpdateSRanges.
@@ -280,6 +293,18 @@ func delKInfoPg(ctx context.Context, sid int32, tbl, timeFrame string) error {
 	return err
 }
 
+func (q *Queries) delKInfoPg(ctx context.Context, sid int32, tbl, timeFrame string) error {
+	if q == nil || q.db == nil {
+		return fmt.Errorf("database query is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, err := q.db.Exec(ctx, `DELETE FROM sranges WHERE sid = $1 AND tbl = $2 AND timeframe = $3`,
+		sid, tbl, timeFrame)
+	return err
+}
+
 // GetKlineRangePg returns (minStartMs, maxStopMs) for has_data=true segments in TimescaleDB.
 func getKlineRangePg(ctx context.Context, sid int32, tbl, timeFrame string) (int64, int64) {
 	if ctx == nil {
@@ -288,6 +313,25 @@ func getKlineRangePg(ctx context.Context, sid int32, tbl, timeFrame string) (int
 	row := pool.QueryRow(ctx, `SELECT min(start_ms), max(stop_ms)
 FROM sranges
 WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND has_data = true`,
+		sid, tbl, timeFrame)
+	var start, stop *int64
+	_ = row.Scan(&start, &stop)
+	if start == nil || stop == nil {
+		return 0, 0
+	}
+	return *start, *stop
+}
+
+func (q *Queries) getKlineRangePg(ctx context.Context, sid int32, tbl, timeFrame string) (int64, int64) {
+	if q == nil || q.db == nil {
+		return 0, 0
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	row := q.db.QueryRow(ctx, `SELECT min(start_ms), max(stop_ms)
+	FROM sranges
+	WHERE sid = $1 AND tbl = $2 AND timeframe = $3 AND has_data = true`,
 		sid, tbl, timeFrame)
 	var start, stop *int64
 	_ = row.Scan(&start, &stop)
@@ -309,6 +353,35 @@ FROM sranges
 WHERE tbl = $1 AND timeframe = $2 AND has_data = true AND sid IN (` + sidIn + `)
 GROUP BY sid`
 	rows, err := pool.Query(ctx, sql, tbl, timeFrame)
+	if err != nil {
+		return res
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sid int32
+		var start, stop int64
+		if err := rows.Scan(&sid, &start, &stop); err != nil {
+			continue
+		}
+		res[sid] = [2]int64{start, stop}
+	}
+	return res
+}
+
+func (q *Queries) getKlineRangesPg(ctx context.Context, sidList []int32, tbl, timeFrame string) map[int32][2]int64 {
+	res := make(map[int32][2]int64)
+	if q == nil || q.db == nil || len(sidList) == 0 {
+		return res
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sidIn := buildIntList(sidList)
+	sql := `SELECT sid, min(start_ms), max(stop_ms)
+	FROM sranges
+	WHERE tbl = $1 AND timeframe = $2 AND has_data = true AND sid IN (` + sidIn + `)
+	GROUP BY sid`
+	rows, err := q.db.Query(ctx, sql, tbl, timeFrame)
 	if err != nil {
 		return res
 	}

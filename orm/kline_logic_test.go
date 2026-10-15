@@ -1,10 +1,120 @@
 package orm
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/banbox/banbot/core"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestValidKlineDownloadRange(t *testing.T) {
+	exs := &ExSymbol{ListMs: 200, DelistMs: 800}
+	start, end := validKlineDownloadRange(exs, 100, 900)
+	if start != 200 || end != 800 {
+		t.Fatalf("download range = %d/%d, want 200/800", start, end)
+	}
+	start, end = validKlineDownloadRange(&ExSymbol{}, 100, 900)
+	if start != 100 || end != 900 {
+		t.Fatalf("active download range = %d/%d, want 100/900", start, end)
+	}
+	start, end = validKlineDownloadRange(&ExSymbol{ListMs: 200, DelistMs: 800}, 100, 0)
+	if start != 200 || end != 800 {
+		t.Fatalf("unbounded delisted range = %d/%d, want 200/800", start, end)
+	}
+	start, end = validKlineDownloadRange(&ExSymbol{DelistMs: 800}, 900, 0)
+	if start != 900 || end != 800 {
+		t.Fatalf("post-delist range = %d/%d, want 900/800", start, end)
+	}
+}
+
+func TestRepairKlineWindowAlignsAndDoesNotClampDelistedTail(t *testing.T) {
+	exs := &ExSymbol{ListMs: 200, DelistMs: 800}
+	start, end := repairKlineWindow(exs, 100, 950, 100)
+	if start != 200 || end != 900 {
+		t.Fatalf("repair range = %d/%d, want 200/900", start, end)
+	}
+	start, end = repairKlineWindow(&ExSymbol{ListMs: 201}, 100, 999, 100)
+	if start != 300 || end != 900 {
+		t.Fatalf("aligned repair range = %d/%d, want 300/900", start, end)
+	}
+}
+
+func TestRefreshAggPgReturnsRepairedWindow(t *testing.T) {
+	const (
+		base = int64(1_700_000_100_000)
+		sid  = int32(-101)
+	)
+	lockAlignOff.Lock()
+	alignOffs[sid] = map[int64]int64{300_000: 0}
+	lockAlignOff.Unlock()
+	t.Cleanup(func() {
+		lockAlignOff.Lock()
+		delete(alignOffs, sid)
+		lockAlignOff.Unlock()
+	})
+	db := &visibilityDBStub{exec: func(sql string, _ ...interface{}) (pgconn.CommandTag, error) {
+		if !strings.Contains(sql, "DELETE FROM kline_5m target") || !strings.Contains(sql, "INSERT INTO kline_5m") ||
+			!strings.Contains(sql, "SELECT $1::integer AS sid") ||
+			!strings.Contains(sql, "HAVING COUNT(*) = 5 OR ($4::bigint >") ||
+			!strings.Contains(sql, "ON CONFLICT (sid, time) DO UPDATE") {
+			t.Fatalf("unexpected aggregation SQL: %s", sql)
+		}
+		return pgconn.NewCommandTag("INSERT 0 2"), nil
+	}}
+	start, end, err := New(db).refreshAggPg(NewKlineAgg("5m", "kline_5m", "1m", "", "", "", "", ""), sid, base, base+900_000, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start != base || end != base+900_000 {
+		t.Fatalf("repair window = %d/%d, want %d/%d", start, end, base, base+900_000)
+	}
+}
+
+func TestAllowPartialTerminalAggregate(t *testing.T) {
+	const day = int64(86_400_000)
+	const start = int64(1_700_000_000_000)
+	if allowPartialTerminalAggregate(0, start, day) {
+		t.Fatal("active market must not produce a partial aggregate")
+	}
+	if allowPartialTerminalAggregate(start, start, day) {
+		t.Fatal("a delisting at candle open must not produce a partial aggregate")
+	}
+	if allowPartialTerminalAggregate(start+day, start, day) {
+		t.Fatal("a complete candle ending at delisting must use normal aggregation")
+	}
+	if !allowPartialTerminalAggregate(start+day/2, start, day) {
+		t.Fatal("a delisting inside the candle must preserve real terminal bars")
+	}
+}
+
+func TestAggregateEndForTerminalDelist(t *testing.T) {
+	const day = int64(86_400_000)
+	const start = int64(1_700_000_000_000)
+	if got := aggregateEndForTerminalDelist(start+day/2, start, start+day/2, day); got != start+day {
+		t.Fatalf("terminal delisting aggregate end=%d, want %d", got, start+day)
+	}
+	if got := aggregateEndForTerminalDelist(start+day/3, start, start+day/2, day); got != start {
+		t.Fatalf("unreached delisting aggregate end=%d, want %d", got, start)
+	}
+	if got := aggregateEndForTerminalDelist(start+2*day, start+day, 0, day); got != start+day {
+		t.Fatalf("active market aggregate end=%d, want %d", got, start+day)
+	}
+}
+
+func TestExactKlineHolesPreservesInteriorAndTrailingGaps(t *testing.T) {
+	got := exactKlineHoles([]int64{100, 200, 400}, 100, 100, 600)
+	want := []MSRange{{Start: 300, Stop: 400}, {Start: 500, Stop: 600}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("holes = %+v, want %+v", got, want)
+	}
+	got = exactKlineHoles(nil, 100, 100, 600)
+	want = []MSRange{{Start: 100, Stop: 600}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("empty physical window holes = %+v, want %+v", got, want)
+	}
+}
 
 func TestParseDownArgsAlignStartAndInferEndByLimit(t *testing.T) {
 	tfMSecs := int64(60_000) // 1m
@@ -79,6 +189,16 @@ func TestGetDownTFInvalid(t *testing.T) {
 	}
 	if _, err := GetDownTF("25h"); err == nil {
 		t.Fatal("GetDownTF(25h) should fail")
+	}
+}
+
+func TestRepairKlineStorageTimeframeUsesPhysicalStorage(t *testing.T) {
+	got, err := repairKlineStorageTimeframe("4h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "1h" {
+		t.Fatalf("repairKlineStorageTimeframe(4h) = %s, want 1h", got)
 	}
 }
 

@@ -33,4 +33,3 @@ func TestSubtractMSRanges(t *testing.T) {
 		t.Fatalf("subtractMSRanges[1] got %#v", out[1])
 	}
 }
-

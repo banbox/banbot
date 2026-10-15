@@ -12,7 +12,6 @@ import (
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	utils2 "github.com/banbox/banexg/utils"
-	"github.com/sasha-s/go-deadlock"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 	"io/fs"
@@ -23,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,15 +35,22 @@ tick数据的问题
 2. 有夜盘时，夜盘数据的日期实际是前一天
 */
 
-var (
-	ConcurNum = 5 // 并发处理的数量
-	// The following are used in Build1mWithTicks to build 1m candlesticks from ticks
-	// 下面几个在Build1mWithTicks中使用，从tick构建1m K线
-	symKLines = make(map[string][]*banexg.Kline) // 1M data for the current year, the key is the contract ID 当前年的1m数据，键是合约ID
-	klineLock deadlock.Mutex                     //symKlines的并发读写锁
-	timeMsMin = int64(0)
-	timeMsMax = int64(0)
-)
+// TickWorker owns one tick conversion invocation. Its candle buffer and
+// range filters must not be shared across concurrent commands.
+type TickWorker struct {
+	ConcurNum int
+	TimeMSMin int64
+	TimeMSMax int64
+	symKLines map[string][]*banexg.Kline
+	klineLock sync.Mutex
+}
+
+func NewTickWorker(concurNum int) *TickWorker {
+	if concurNum < 1 {
+		concurNum = 5
+	}
+	return &TickWorker{ConcurNum: concurNum, symKLines: make(map[string][]*banexg.Kline)}
+}
 
 type FuncConvert func(inPath string, file *zip.File, writer *zip.Writer) *errs.Error
 
@@ -127,7 +134,7 @@ func FindPathNames(inPath, suffix string) ([]string, *errs.Error) {
 	return result, nil
 }
 
-func convertFiles(inPath, outPath, srcSuffix string, makeOutPath func(string, string) string, convert FuncConvert) *errs.Error {
+func convertFiles(inPath, outPath, srcSuffix string, concurNum int, makeOutPath func(string, string) string, convert FuncConvert) *errs.Error {
 	names, err := FindPathNames(inPath, ".zip")
 	if err != nil {
 		return err
@@ -136,7 +143,7 @@ func convertFiles(inPath, outPath, srcSuffix string, makeOutPath func(string, st
 	names = names[1:]
 	pBar := utils.NewPrgBar(len(names)*core.StepTotal, "")
 	defer pBar.Close()
-	return utils.ParallelRun(names, ConcurNum, func(_ int, name string) *errs.Error {
+	return utils.ParallelRun(names, concurNum, func(_ int, name string) *errs.Error {
 		fileOutPath := makeOutPath(outPath, name)
 		_, err_ := os.Stat(fileOutPath)
 		if err_ == nil {
@@ -189,6 +196,13 @@ func isRawContract(name string) bool {
 }
 
 func RunFormatTick(args *config.CmdArgs) *errs.Error {
+	return RunFormatTickWithWorker(args, NewTickWorker(5))
+}
+
+func RunFormatTickWithWorker(args *config.CmdArgs, worker *TickWorker) *errs.Error {
+	if worker == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "tick worker is required")
+	}
 	if args.InPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
 	}
@@ -261,14 +275,17 @@ func RunFormatTick(args *config.CmdArgs) *errs.Error {
 		name = strings.ReplaceAll(name, "marketdatacsv", "")
 		return filepath.Join(dirPath, name)
 	}
-	return convertFiles(args.InPath, args.OutPath, ".csv", makeOutPath, handleEntry)
+	return convertFiles(args.InPath, args.OutPath, ".csv", worker.ConcurNum, makeOutPath, handleEntry)
 }
 
 func Build1mWithTicks(args *config.CmdArgs) *errs.Error {
-	return build1mWithTicks(args)
+	return Build1mWithTicksWithWorker(args, NewTickWorker(5))
 }
 
-func build1mWithTicks(args *config.CmdArgs) *errs.Error {
+func Build1mWithTicksWithWorker(args *config.CmdArgs, worker *TickWorker) *errs.Error {
+	if worker == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "tick worker is required")
+	}
 	if args.InPath == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
 	}
@@ -284,8 +301,8 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 	}
 	var dirPath = names[0]
 	names = names[1:]
-	if timeMsMin > 0 || timeMsMax > 0 {
-		log.Info("enable time filter", zap.Int64("min", timeMsMin), zap.Int64("maz", timeMsMax))
+	if worker.TimeMSMin > 0 || worker.TimeMSMax > 0 {
+		log.Info("enable time filter", zap.Int64("min", worker.TimeMSMin), zap.Int64("max", worker.TimeMSMax))
 	}
 	// Input: There is only a folder of years in the root directory, and a zip package for each trading day under each year folder, and the tick data of the day is stored in the contract name in each zip
 	// Output: A ZIP archive in the root directory every year, and each zip stores 1M data of the contract in CSV with the contract name
@@ -379,18 +396,18 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 		log.Info("calc 1m kline from ticks", zap.String("year", year))
 		totalNum := len(names) * core.StepTotal
 		pBar := utils.NewPrgBar(totalNum, "tickTo1m")
-		err = utils.ParallelRun(names, ConcurNum, func(_ int, name string) *errs.Error {
-			if timeMsMin > 0 || timeMsMax > 0 {
+		err = utils.ParallelRun(names, worker.ConcurNum, func(_ int, name string) *errs.Error {
+			if worker.TimeMSMin > 0 || worker.TimeMSMax > 0 {
 				// 过滤范围之外的数据
 				cleanName := strings.Split(filepath.Base(name), ".")[0]
 				cleanName = cleanName[len(cleanName)-8:]
 				timeObj, err_ := time.ParseInLocation("20060102", cleanName, loc)
 				if err_ == nil {
 					timeMS := timeObj.UnixMilli()
-					if timeMsMin > 0 && timeMS < timeMsMin {
+					if worker.TimeMSMin > 0 && timeMS < worker.TimeMSMin {
 						return nil
 					}
-					if timeMsMax > 0 && timeMS > timeMsMax {
+					if worker.TimeMSMax > 0 && timeMS > worker.TimeMSMax {
 						return nil
 					}
 				}
@@ -432,7 +449,7 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 				}
 				data[parts[len(parts)-1]] = sumVol
 			}
-			klineLock.Lock()
+			worker.klineLock.Lock()
 			for key, data := range symbolVolMap {
 				suffix, vol := "", -1.0
 				for sf, volume := range data {
@@ -441,18 +458,18 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 						vol = volume
 					}
 				}
-				oldData, _ := symKLines[key]
-				symKLines[key] = append(oldData, dayKlines[key+"_"+suffix]...)
+				oldData := worker.symKLines[key]
+				worker.symKLines[key] = append(oldData, dayKlines[key+"_"+suffix]...)
 			}
-			klineLock.Unlock()
+			worker.klineLock.Unlock()
 			return runErr
 		})
 		pBar.Close()
 		log.Info("save 1m kline", zap.String("year", year))
-		klineLock.Lock()
-		saveYear1m(args.OutPath, year)
-		symKLines = make(map[string][]*banexg.Kline)
-		klineLock.Unlock()
+		worker.klineLock.Lock()
+		saveYear1m(args.OutPath, year, worker.symKLines)
+		worker.symKLines = make(map[string][]*banexg.Kline)
+		worker.klineLock.Unlock()
 		if err != nil {
 			return err
 		}
@@ -460,7 +477,7 @@ func build1mWithTicks(args *config.CmdArgs) *errs.Error {
 	return nil
 }
 
-func saveYear1m(outDir, year string) {
+func saveYear1m(outDir, year string, symKLines map[string][]*banexg.Kline) {
 	if len(symKLines) == 0 || year == "" {
 		return
 	}
@@ -702,6 +719,16 @@ func build1mSymbolTick(inPath string, fid int, file *zip.File, dones map[string]
 CalcFilePerfs calc sharpe/sortino ratio for input data
 */
 func CalcFilePerfs(args *config.CmdArgs) *errs.Error {
+	return CalcFilePerfsWithLogger(args, log.L())
+}
+
+func CalcFilePerfsWithLogger(args *config.CmdArgs, logger *zap.Logger) *errs.Error {
+	if args == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "arguments are required")
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	path := args.InPath
 	if path == "" {
 		return errs.NewMsg(errs.CodeParamRequired, "--in is required")
@@ -723,7 +750,7 @@ func CalcFilePerfs(args *config.CmdArgs) *errs.Error {
 		return err
 	}
 	if len(rows) <= 1 {
-		log.Warn("file empty, skip CalcFilePerfs", zap.Int("rowNum", len(rows)))
+		logger.Warn("file empty, skip CalcFilePerfs", zap.Int("rowNum", len(rows)))
 		return nil
 	}
 	var names = rows[0]
@@ -771,9 +798,10 @@ func CalcFilePerfs(args *config.CmdArgs) *errs.Error {
 	}
 	// calculate sharpe/sortino
 	type Col struct {
-		name string
-		data []decimal.Decimal
-		raw  []string
+		name            string
+		data            []decimal.Decimal
+		raw             []string
+		ulcerIndex, upi *float64
 	}
 	var items []*Col
 	val0 := decimal.NewFromInt(0)
@@ -786,10 +814,24 @@ func CalcFilePerfs(args *config.CmdArgs) *errs.Error {
 		if err_ != nil {
 			sortino = decimal.NewFromFloat(0)
 		}
+		nav := make([]float64, 0, len(cols[startCol+i]))
+		for _, text := range cols[startCol+i][1:] {
+			value, parseErr := strconv.ParseFloat(text, 64)
+			if parseErr != nil {
+				value = math.NaN()
+			}
+			nav = append(nav, value)
+		}
+		years := filePerfYears(rows, args, !isPrice)
+		ui, upi, _ := utils.CalcUlcerPerformance(nav, years, 0)
+		if !isPrice {
+			ui, upi, _ = utils.CalcUlcerPerformanceByReturns(nav, years, 0)
+		}
 		items = append(items, &Col{
-			name: names[startCol+i],
-			data: append(col, sharpe, sortino),
-			raw:  cols[startCol+i][1:],
+			name:       names[startCol+i],
+			data:       append(col, sharpe, sortino),
+			raw:        cols[startCol+i][1:],
+			ulcerIndex: ui, upi: upi,
 		})
 	}
 	// sort columns by sharpe ratio
@@ -827,8 +869,59 @@ func CalcFilePerfs(args *config.CmdArgs) *errs.Error {
 				row = append(row, item.data[len(item.data)-1].String())
 			}
 			outRows = append(outRows, row)
+			for _, metric := range []string{"ulcerIndex", "upi"} {
+				row = []string{metric}
+				for _, item := range items {
+					value := item.ulcerIndex
+					if metric == "upi" {
+						value = item.upi
+					}
+					text := "N/A"
+					if value != nil {
+						text = strconv.FormatFloat(*value, 'g', -1, 64)
+					}
+					row = append(row, text)
+				}
+				outRows = append(outRows, row)
+			}
 			break
 		}
 	}
 	return utils.WriteCsvFile(args.OutPath, outRows, false)
+}
+
+// Price inputs span the first through last observation. Return inputs need an
+// extra baseline interval; infer it only from uniform dates or an explicit TF.
+func filePerfYears(rows [][]string, args *config.CmdArgs, returns bool) float64 {
+	if len(rows) < 3 {
+		return 0
+	}
+	first, err1 := btime.ParseTimeMS(rows[1][0])
+	last, err2 := btime.ParseTimeMS(rows[len(rows)-1][0])
+	if err1 == nil && err2 == nil && last > first {
+		span := last - first
+		if returns {
+			step := span / int64(len(rows)-2)
+			for i := 2; i < len(rows); i++ {
+				prev, e1 := btime.ParseTimeMS(rows[i-1][0])
+				cur, e2 := btime.ParseTimeMS(rows[i][0])
+				if e1 != nil || e2 != nil || cur-prev != step {
+					return 0
+				}
+			}
+			span += step
+		}
+		return float64(span) / (utils.UlcerYearDays * 86400000)
+	}
+	if len(args.TimeFrames) == 1 {
+		seconds, err := utils2.ParseTimeFrame(args.TimeFrames[0])
+		if err == nil && seconds > 0 {
+			intervals := len(rows) - 2
+			if returns {
+				intervals++
+			}
+			return float64(intervals) * float64(seconds) / (utils.UlcerYearDays * 86400)
+		}
+	}
+	return 0
 }

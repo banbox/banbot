@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
@@ -32,38 +31,32 @@ type WalletSnapshotSummary struct {
 	WithdrawLegal      float64 `json:"withdraw_legal"`
 }
 
-var (
-	walletSnapshotOnce sync.Once
-	walletSnapshotErr  *errs.Error
-)
-
 const (
 	walletSnapshotCompactHourMS   = int64(60 * 60 * 1000)
 	walletSnapshotDeleteBatchSize = 200
 )
 
 func ensureWalletSnapshotTables(db *orm.TrackedDB) *errs.Error {
-	walletSnapshotOnce.Do(func() {
-		ctx := context.Background()
-		stmts := []string{
-			`CREATE TABLE IF NOT EXISTS wallet_snapshot (
+	ctx := context.Background()
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS wallet_snapshot (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				task_id INTEGER NOT NULL,
 				account TEXT NOT NULL,
 				time_ms INTEGER NOT NULL,
 				created_at INTEGER NOT NULL
 			)`,
-			`CREATE INDEX IF NOT EXISTS idx_ws_task_time ON wallet_snapshot (task_id, time_ms)`,
-			`CREATE INDEX IF NOT EXISTS idx_ws_account_time ON wallet_snapshot (account, time_ms)`,
-			`CREATE TABLE IF NOT EXISTS wallet_snapshot_compact (
+		`CREATE INDEX IF NOT EXISTS idx_ws_task_time ON wallet_snapshot (task_id, time_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_ws_account_time ON wallet_snapshot (account, time_ms)`,
+		`CREATE TABLE IF NOT EXISTS wallet_snapshot_compact (
 				task_id INTEGER NOT NULL,
 				account TEXT NOT NULL,
 				compacted_until_ms INTEGER NOT NULL,
 				updated_at INTEGER NOT NULL,
 				PRIMARY KEY (task_id, account)
 			)`,
-			`CREATE INDEX IF NOT EXISTS idx_wsc_task_account ON wallet_snapshot_compact (task_id, account)`,
-			`CREATE TABLE IF NOT EXISTS wallet_snapshot_item (
+		`CREATE INDEX IF NOT EXISTS idx_wsc_task_account ON wallet_snapshot_compact (task_id, account)`,
+		`CREATE TABLE IF NOT EXISTS wallet_snapshot_item (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				snapshot_id INTEGER NOT NULL,
 				coin TEXT NOT NULL,
@@ -74,9 +67,9 @@ func ensureWalletSnapshotTables(db *orm.TrackedDB) *errs.Error {
 				used_upol REAL NOT NULL,
 				withdraw REAL NOT NULL
 			)`,
-			`CREATE INDEX IF NOT EXISTS idx_wsi_snapshot ON wallet_snapshot_item (snapshot_id)`,
-			`CREATE INDEX IF NOT EXISTS idx_wsi_coin ON wallet_snapshot_item (coin)`,
-			`CREATE TABLE IF NOT EXISTS wallet_snapshot_summary (
+		`CREATE INDEX IF NOT EXISTS idx_wsi_snapshot ON wallet_snapshot_item (snapshot_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_wsi_coin ON wallet_snapshot_item (coin)`,
+		`CREATE TABLE IF NOT EXISTS wallet_snapshot_summary (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				snapshot_id INTEGER NOT NULL,
 				base_currency TEXT NOT NULL,
@@ -85,23 +78,28 @@ func ensureWalletSnapshotTables(db *orm.TrackedDB) *errs.Error {
 				unrealized_pol_legal REAL NOT NULL,
 				withdraw_legal REAL NOT NULL
 			)`,
-			`CREATE INDEX IF NOT EXISTS idx_wss_snapshot ON wallet_snapshot_summary (snapshot_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_wss_snapshot ON wallet_snapshot_summary (snapshot_id)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return errs.New(core.ErrDbExecFail, err)
 		}
-		for _, stmt := range stmts {
-			if _, err := db.ExecContext(ctx, stmt); err != nil {
-				walletSnapshotErr = errs.New(core.ErrDbExecFail, err)
-				return
-			}
-		}
-	})
-	return walletSnapshotErr
+	}
+	return nil
 }
 
-func SaveWalletSnapshot(taskID int64, account string, timeMS int64, items []*WalletSnapshotItem, summary *WalletSnapshotSummary) *errs.Error {
+func snapshotOrderState(states []*OrderState) *OrderState {
+	if len(states) > 0 {
+		return states[0]
+	}
+	return nil
+}
+
+func SaveWalletSnapshot(taskID int64, account string, timeMS int64, items []*WalletSnapshotItem, summary *WalletSnapshotSummary, states ...*OrderState) *errs.Error {
 	if len(items) == 0 {
 		return nil
 	}
-	_, conn, err := Conn(orm.DbTrades, true)
+	_, conn, err := snapshotOrderState(states).Conn(true)
 	if err != nil {
 		return err
 	}
@@ -176,8 +174,8 @@ func SaveWalletSnapshot(taskID int64, account string, timeMS int64, items []*Wal
 	return nil
 }
 
-func LoadLatestWalletSnapshot(taskID int64, account string) ([]*WalletSnapshotItem, *WalletSnapshotSummary, *errs.Error) {
-	_, conn, err := Conn(orm.DbTrades, true)
+func LoadLatestWalletSnapshot(taskID int64, account string, states ...*OrderState) ([]*WalletSnapshotItem, *WalletSnapshotSummary, *errs.Error) {
+	_, conn, err := snapshotOrderState(states).Conn(true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -245,8 +243,8 @@ func LoadLatestWalletSnapshot(taskID int64, account string) ([]*WalletSnapshotIt
 	return items, summary, nil
 }
 
-func LoadWalletSnapshotCompactUntil(taskID int64, account string) (int64, *errs.Error) {
-	_, conn, err := Conn(orm.DbTrades, false)
+func LoadWalletSnapshotCompactUntil(taskID int64, account string, states ...*OrderState) (int64, *errs.Error) {
+	_, conn, err := snapshotOrderState(states).Conn(false)
 	if err != nil {
 		return 0, err
 	}
@@ -267,8 +265,8 @@ func LoadWalletSnapshotCompactUntil(taskID int64, account string) (int64, *errs.
 	return compactedUntilMS, nil
 }
 
-func SaveWalletSnapshotCompactUntil(taskID int64, account string, compactedUntilMS int64) *errs.Error {
-	_, conn, err := Conn(orm.DbTrades, true)
+func SaveWalletSnapshotCompactUntil(taskID int64, account string, compactedUntilMS int64, states ...*OrderState) *errs.Error {
+	_, conn, err := snapshotOrderState(states).Conn(true)
 	if err != nil {
 		return err
 	}
@@ -289,8 +287,8 @@ func SaveWalletSnapshotCompactUntil(taskID int64, account string, compactedUntil
 	return nil
 }
 
-func FindEarliestWalletSnapshotTime(taskID int64, account string, beforeMS int64) (int64, *errs.Error) {
-	_, conn, err := Conn(orm.DbTrades, false)
+func FindEarliestWalletSnapshotTime(taskID int64, account string, beforeMS int64, states ...*OrderState) (int64, *errs.Error) {
+	_, conn, err := snapshotOrderState(states).Conn(false)
 	if err != nil {
 		return 0, err
 	}
@@ -313,11 +311,11 @@ func FindEarliestWalletSnapshotTime(taskID int64, account string, beforeMS int64
 	return timeMS, nil
 }
 
-func CompactWalletSnapshotsByHour(taskID int64, account string, startMS int64, endMS int64) (int, *errs.Error) {
+func CompactWalletSnapshotsByHour(taskID int64, account string, startMS int64, endMS int64, states ...*OrderState) (int, *errs.Error) {
 	if endMS <= startMS {
 		return 0, nil
 	}
-	_, conn, err := Conn(orm.DbTrades, true)
+	_, conn, err := snapshotOrderState(states).Conn(true)
 	if err != nil {
 		return 0, err
 	}

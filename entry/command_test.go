@@ -2,11 +2,16 @@ package entry
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/web"
+	"github.com/banbox/banbot/web/dev"
 	"github.com/banbox/banexg/errs"
 	"github.com/spf13/cobra"
 )
@@ -32,9 +37,17 @@ func TestRootCommandExposesCobraHelp(t *testing.T) {
 	}
 }
 
+func TestPanicStackContainsCaller(t *testing.T) {
+	stack := string(panicStack())
+	if !strings.Contains(stack, "TestPanicStackContainsCaller") ||
+		!strings.Contains(stack, "runtime/debug.Stack") {
+		t.Fatalf("panic stack does not contain its caller: %s", stack)
+	}
+}
+
 func TestConfigCommandParsesRepeatedConfigAndLegacyFlags(t *testing.T) {
 	var captured *config.CmdArgs
-	command := newConfigCommand("capture", "capture args", func(args *config.CmdArgs) *errs.Error {
+	command := newRuntimeConfigCommand("capture", "capture args", func(args *config.CmdArgs) *errs.Error {
 		captured = args
 		return nil
 	}, true, bindPairs)
@@ -53,14 +66,38 @@ func TestConfigCommandParsesRepeatedConfigAndLegacyFlags(t *testing.T) {
 	if want := []string{"first.yml", "second.yml"}; !reflect.DeepEqual([]string(captured.Configs), want) {
 		t.Fatalf("configs = %v, want %v", captured.Configs, want)
 	}
-	if want := []string{"BTC/USDT", "ETH/USDT"}; !reflect.DeepEqual(captured.Pairs, want) {
-		t.Fatalf("pairs = %v, want %v", captured.Pairs, want)
+	if captured.RawPairs != "BTC/USDT,ETH/USDT" {
+		t.Fatalf("raw pairs = %q, want BTC/USDT,ETH/USDT", captured.RawPairs)
+	}
+}
+
+func TestTickCommandsReturnOnInvalidArguments(t *testing.T) {
+	for _, args := range [][]string{{"tick", "convert"}, {"tick", "to-kline"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			root := NewRootCommand()
+			root.SetArgs(args)
+			done := make(chan error, 1)
+			go func() { done <- root.Execute() }()
+
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("invalid tick invocation unexpectedly succeeded")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("tick command did not return")
+			}
+		})
 	}
 }
 
 func TestAddCommandSupportsCommandLocalFlags(t *testing.T) {
+	commandRegistryMu.RLock()
 	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
 	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		defer commandRegistryMu.Unlock()
 		extraCommands = extraCommands[:before]
 	})
 
@@ -82,6 +119,157 @@ func TestAddCommandSupportsCommandLocalFlags(t *testing.T) {
 	root.SetArgs([]string{"hello", "--greeting", "nihao"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("custom command returned error: %v", err)
+	}
+}
+
+func TestRegisteredCommandsAreNotWrapped(t *testing.T) {
+	commandRegistryMu.RLock()
+	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
+	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		defer commandRegistryMu.Unlock()
+		extraCommands = extraCommands[:before]
+	})
+
+	command := &cobra.Command{Use: "extension", RunE: func(*cobra.Command, []string) error { return nil }}
+	runtimeCommand := &cobra.Command{Use: "runtime-extension", RunE: func(*cobra.Command, []string) error { return nil }}
+	AddCommand("", command)
+	AddCommand("", runtimeCommand)
+
+	root := NewRootCommand()
+	registered, _, err := root.Find([]string{"extension"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered != command || registered.RunE == nil {
+		t.Fatal("AddCommand changed the extension command")
+	}
+	registered, _, err = root.Find([]string{"runtime-extension"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered != runtimeCommand || registered.RunE == nil {
+		t.Fatal("second AddCommand changed the extension command")
+	}
+}
+
+func TestCommandRegistrySnapshotsConcurrentRegistration(t *testing.T) {
+	commandRegistryMu.RLock()
+	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
+	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		extraCommands = extraCommands[:before]
+		commandRegistryMu.Unlock()
+	})
+
+	var wait sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			name := fmt.Sprintf("concurrent-extension-%d", i)
+			AddCommandFactory("", func() *cobra.Command { return &cobra.Command{Use: name} })
+		}(i)
+	}
+	for i := 0; i < 16; i++ {
+		wait.Add(1)
+		go func() { defer wait.Done(); _ = NewRootCommand() }()
+	}
+	wait.Wait()
+	root := NewRootCommand()
+	for i := 0; i < 16; i++ {
+		if command, _, err := root.Find([]string{fmt.Sprintf("concurrent-extension-%d", i)}); err != nil || command == nil {
+			t.Fatalf("concurrent command %d missing: %v", i, err)
+		}
+	}
+}
+
+func TestCommandFactoryDoesNotReparentCommandsAcrossRoots(t *testing.T) {
+	commandRegistryMu.RLock()
+	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
+	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		extraCommands = extraCommands[:before]
+		commandRegistryMu.Unlock()
+	})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	AddCommandFactory("", func() *cobra.Command {
+		return &cobra.Command{Use: "factory-extension", RunE: func(*cobra.Command, []string) error {
+			close(started)
+			<-release
+			return nil
+		}}
+	})
+	first := NewRootCommand()
+	first.SetArgs([]string{"factory-extension"})
+	done := make(chan error, 1)
+	go func() { done <- first.Execute() }()
+	<-started
+	second := NewRootCommand()
+	command, _, err := second.Find([]string{"factory-extension"})
+	if err != nil || command == nil {
+		close(release)
+		t.Fatalf("second root command missing: %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAddCommandRejectsReattachment(t *testing.T) {
+	commandRegistryMu.RLock()
+	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
+	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		extraCommands = extraCommands[:before]
+		commandRegistryMu.Unlock()
+	})
+	AddCommand("", &cobra.Command{Use: "single-root-extension"})
+	_ = NewRootCommand()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("building a second root with a shared command did not panic")
+		}
+	}()
+	_ = NewRootCommand()
+}
+
+func TestAddCommandCanInvokePublicRuntimeEntry(t *testing.T) {
+	commandRegistryMu.RLock()
+	before := len(extraCommands)
+	commandRegistryMu.RUnlock()
+	t.Cleanup(func() {
+		commandRegistryMu.Lock()
+		defer commandRegistryMu.Unlock()
+		extraCommands = extraCommands[:before]
+	})
+
+	command := &cobra.Command{
+		Use: "nested-runtime-entry",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return RunSeriesDown(&config.CmdArgs{DataDir: t.TempDir(), NoDefault: true, ConfigData: "invalid: ["})
+		},
+	}
+	AddCommand("", command)
+	root := NewRootCommand()
+	root.SetArgs([]string{"nested-runtime-entry"})
+
+	done := make(chan error, 1)
+	go func() { done <- root.Execute() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("nested runtime entry unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AddCommand callback did not reach the public runtime entry")
 	}
 }
 
@@ -145,5 +333,64 @@ func TestImplicitWebInvocationCompatibility(t *testing.T) {
 		if got := isImplicitWebInvocation(test.args); got != test.want {
 			t.Fatalf("isImplicitWebInvocation(%v) = %v, want %v", test.args, got, test.want)
 		}
+	}
+}
+
+func TestTypedWebCommandRejectsInvalidFlags(t *testing.T) {
+	command := web.NewDevCommandWithFactory(func(*dev.CmdArgs) (*dev.DevServer, func(), error) {
+		t.Fatal("factory must not run for invalid command arguments")
+		return nil, nil, nil
+	})
+	command.SetArgs([]string{"--invalid-run-dev-flag"})
+	if err := command.Execute(); err == nil {
+		t.Fatal("typed web command unexpectedly accepted an invalid flag")
+	}
+}
+
+func TestCloseOrderCommandUsesExplicitRuntime(t *testing.T) {
+	root := NewRootCommand()
+	_, _, err := root.Find([]string{"live", "close-order"})
+	if err != nil {
+		t.Fatalf("find close-order: %v", err)
+	}
+}
+
+func TestDownOrderCommandUsesExplicitRuntimeAndPreservesFlags(t *testing.T) {
+	root := NewRootCommand()
+	command, _, err := root.Find([]string{"live", "down-order"})
+	if err != nil {
+		t.Fatalf("find down-order: %v", err)
+	}
+	for _, name := range []string{"account", "exchange", "market", "timestart", "timeend", "pairs", "force"} {
+		if command.Flags().Lookup(name) == nil {
+			t.Fatalf("down-order lost --%s", name)
+		}
+	}
+}
+
+func TestCompareOrdersCommandUsesExplicitRuntimeAndPreservesFlags(t *testing.T) {
+	root := NewRootCommand()
+	command, _, err := root.Find([]string{"tool", "cmp-orders"})
+	if err != nil {
+		t.Fatalf("find cmp-orders: %v", err)
+	}
+	for _, name := range []string{"account", "bt-path", "bot-name", "amt-rate", "skip-unhit"} {
+		if command.Flags().Lookup(name) == nil {
+			t.Fatalf("cmp-orders lost --%s", name)
+		}
+	}
+}
+
+func TestSnapshotForOrderIdentityDoesNotMutatePrimarySnapshot(t *testing.T) {
+	primary := config.NewSnapshotWithDirs(&config.Config{Exchange: &config.ExchangeConfig{Name: "primary"}, MarketType: "spot"}, t.TempDir(), "")
+	child, err := snapshotForOrderIdentity(primary, "stored", "linear")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if primary.View().Exchange.Name != "primary" || primary.View().MarketType != "spot" {
+		t.Fatalf("primary snapshot was mutated: %#v", primary.View())
+	}
+	if child.View().Exchange.Name != "stored" || child.View().MarketType != "linear" {
+		t.Fatalf("child snapshot identity = %s/%s", child.View().Exchange.Name, child.View().MarketType)
 	}
 }

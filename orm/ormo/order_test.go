@@ -2,12 +2,20 @@ package ormo
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
+	botexg "github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
 
@@ -54,28 +62,161 @@ func newTestOrder() *InOutOrder {
 	}
 }
 
+func newFilledTestOrder() *InOutOrder {
+	order := newTestOrder()
+	order.Status = InOutStatusFullEnter
+	order.Enter.Average = 100
+	order.Enter.Filled = 1
+	return order
+}
+
+type clientIDExchangeStub struct {
+	banexg.BanExchange
+	id string
+}
+
+type runtimeOrderExchangeStub struct {
+	clientIDExchangeStub
+	feeCalls int
+}
+
+func (s *runtimeOrderExchangeStub) CalculateFee(string, string, string, float64, float64, bool, map[string]interface{}) (*banexg.Fee, *errs.Error) {
+	s.feeCalls++
+	return &banexg.Fee{Currency: "USDT", Cost: 1, QuoteCost: 1}, nil
+}
+
+func (s *clientIDExchangeStub) Info() *banexg.ExgInfo {
+	return &banexg.ExgInfo{ID: s.id}
+}
+
+func (s *clientIDExchangeStub) BuildClientOrderID(namespace string, orderID int64, clientID string, _ bool) string {
+	if s.id == "okx" {
+		return fmt.Sprintf("abcdef%012d0000", orderID)
+	}
+	return fmt.Sprintf("%s_%d_%s", namespace, orderID, clientID)
+}
+
+func TestClientIDDelegatesFormatToExchangeBoundary(t *testing.T) {
+	oldName, oldExgName, oldDefault := config.Name, core.ExgName, botexg.Default
+	t.Cleanup(func() {
+		config.Name, core.ExgName, botexg.Default = oldName, oldExgName, oldDefault
+	})
+	config.Name = "bot"
+	order := newTestOrder()
+	order.ID = 42
+
+	botexg.Default = &clientIDExchangeStub{id: "binance"}
+	if got := order.ClientId(false); got != "bot_42_" {
+		t.Fatalf("standard client ID = %q, want bot_42_", got)
+	}
+
+	botexg.Default = &clientIDExchangeStub{id: "okx"}
+	got := order.ClientId(false)
+	if len(got) != 22 || strings.Contains(got, "_") {
+		t.Fatalf("compact client ID = %q, want 22 alphanumeric characters", got)
+	}
+
+	botexg.Default = nil
+	core.ExgName = "okx"
+	got = order.ClientId(false)
+	if len(got) != 22 || strings.Contains(got, "_") {
+		t.Fatalf("legacy compact client ID = %q, want 22 alphanumeric characters", got)
+	}
+}
+
+func TestExplicitOrderUsesBoundRuntimeDependencies(t *testing.T) {
+	oldDefault, oldName, oldExgName, oldSimCount := botexg.Default, config.Name, core.ExgName, core.NewNumInSim
+	t.Cleanup(func() {
+		botexg.Default, config.Name, core.ExgName, core.NewNumInSim = oldDefault, oldName, oldExgName, oldSimCount
+	})
+	botexg.Default = nil
+	config.Name, core.ExgName, core.NewNumInSim = "legacy", "legacy-exchange", 73
+
+	coreState, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coreState.Close()
+	coreState.SetRunMode(core.RunModeBackTest)
+	coreState.BeginSimOrderMatch()
+	defer coreState.EndSimOrderMatch()
+	clock := btime.NewClockState(true, nil)
+	clock.SetTimeMS(100_000)
+	prices := com.NewPriceState("runtime-exchange")
+	prices.SetPriceAt(clock.TimeMS(), "BTC/USDT", 111, 109)
+	exchange := &runtimeOrderExchangeStub{clientIDExchangeStub: clientIDExchangeStub{id: "runtime-exchange"}}
+	state := NewOrderState()
+	state.BindCore(coreState)
+	state.BindRuntime(clock, prices, exchange, &config.Config{
+		Name:     "runtime-name",
+		Exchange: &config.ExchangeConfig{Name: "runtime-exchange"},
+	})
+	order := newFilledTestOrder()
+	order.EnterAt = 0
+	order.BindState(state)
+
+	if err := order.UpdateFee(100, true); err != nil {
+		t.Fatal(err)
+	}
+	if exchange.feeCalls != 1 {
+		t.Fatalf("runtime exchange fee calls = %d, want 1", exchange.feeCalls)
+	}
+	if got := order.ClientId(false); got != "runtime-name_0_" {
+		t.Fatalf("runtime client ID = %q, want runtime-name_0_", got)
+	}
+	if !order.CanClose() {
+		t.Fatal("runtime clock was not used by CanClose")
+	}
+	order.SetExit(0, "runtime-exit", banexg.OdTypeMarket, 0)
+	if got := coreState.NewSimOrderCount(); got != 1 {
+		t.Fatalf("runtime simulation counter = %d, want 1", got)
+	}
+	if core.NewNumInSim != 73 {
+		t.Fatalf("legacy simulation counter changed to %d", core.NewNumInSim)
+	}
+
+	clock.SetTimeMS(100_001)
+	if err := order.LocalExit(0, "runtime-local-exit", 0, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := order.Exit.Price; got != 110 {
+		t.Fatalf("runtime price = %v, want 110", got)
+	}
+}
+
+func enableStrictHistoricalOrderMetricsTest(t *testing.T) {
+	t.Helper()
+	originalMode, originalData, originalCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
+	t.Cleanup(func() {
+		core.BackTestMode, config.Data, config.HistoricalCoverage = originalMode, originalData, originalCoverage
+	})
+	core.BackTestMode = true
+	config.Data.BTStrict = true
+	config.Data.BTNoKlineDownload = true
+	config.Data.BTLegacyOrderMetrics = true
+	config.HistoricalCoverage = &config.HistoricalCoverageConfig{
+		BaselineEndMS: 2,
+		Bars: map[string]map[string][]config.HistoricalCoverageRange{
+			"BTC/USDT:USDT": {"1h": {{StartMS: 0, StopMS: 2}}},
+		},
+	}
+}
+
 func useTempTradeDB(t *testing.T) {
 	t.Helper()
 	orm.SetDbPath(orm.DbTrades, filepath.Join(testDBDir, t.Name()+".db"))
 }
 
-func initApp() *errs.Error {
-	var args config.CmdArgs
-	return config.LoadConfig(&args)
-}
-
 func TestGetOrders(t *testing.T) {
-	err := initApp()
-	if err != nil {
-		panic(err)
-	}
 	useTempTradeDB(t)
 	sess, conn, err := Conn(orm.DbTrades, true)
 	if err != nil {
-		panic(err)
+		t.Fatalf("open trade database: %v", err)
 	}
 	defer conn.Close()
-	sess.GetOrders(GetOrdersArgs{})
+	if _, err := sess.GetOrders(GetOrdersArgs{}); err != nil {
+		t.Fatalf("query orders: %v", err)
+	}
 }
 
 func TestSaveToDbRestoresIDsWhenEnterInsertFails(t *testing.T) {
@@ -220,5 +361,56 @@ func TestTriggerStateClientIDSurvivesDecodeAndClone(t *testing.T) {
 	clone := state.Clone()
 	if clone.ClientId != state.ClientId || clone.OrderId != state.OrderId {
 		t.Fatalf("cloned trigger identity mismatch: %+v", clone)
+	}
+}
+
+func TestUpdateProfitsPreservesLegacyDrawdownRate(t *testing.T) {
+	enableStrictHistoricalOrderMetricsTest(t)
+
+	legacy := newFilledTestOrder()
+	legacy.UpdateProfits(110)
+	legacy.UpdateProfits(95)
+	if math.Abs(legacy.MaxDrawDown-1.5) > 1e-12 {
+		t.Fatalf("legacy max drawdown = %v, want 1.5", legacy.MaxDrawDown)
+	}
+
+	continuousLoss := newFilledTestOrder()
+	continuousLoss.UpdateProfits(95)
+	if math.Abs(continuousLoss.MaxDrawDown-0.05) > 1e-12 {
+		t.Fatalf("legacy loss drawdown = %v, want 0.05", continuousLoss.MaxDrawDown)
+	}
+
+	config.Data.BTLegacyOrderMetrics = false
+	current := newFilledTestOrder()
+	current.UpdateProfits(110)
+	current.UpdateProfits(95)
+	if current.MaxDrawDown != -5 {
+		t.Fatalf("current max drawdown = %v, want -5", current.MaxDrawDown)
+	}
+}
+
+func TestUpdateProfitsRejectsLegacyMetricsOutsideStrictHistoricalReplay(t *testing.T) {
+	enableStrictHistoricalOrderMetricsTest(t)
+	strictCoverage := config.HistoricalCoverage
+	for _, test := range []struct {
+		name   string
+		change func()
+	}{
+		{name: "non-strict", change: func() { config.Data.BTStrict = false }},
+		{name: "download-enabled", change: func() { config.Data.BTNoKlineDownload = false }},
+		{name: "missing coverage", change: func() { config.HistoricalCoverage = nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core.BackTestMode = true
+			config.Data = config.Config{BTLegacyOrderMetrics: true, BTStrict: true, BTNoKlineDownload: true}
+			config.HistoricalCoverage = strictCoverage
+			test.change()
+			order := newFilledTestOrder()
+			order.UpdateProfits(110)
+			order.UpdateProfits(95)
+			if order.MaxDrawDown != -5 {
+				t.Fatalf("current max drawdown = %v, want -5", order.MaxDrawDown)
+			}
+		})
 	}
 }

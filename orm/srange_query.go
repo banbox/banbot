@@ -31,19 +31,22 @@ type ListSeriesRangeSummariesArgs struct {
 }
 
 func (q *Queries) ListSeriesRangeSummaries(args ListSeriesRangeSummariesArgs) ([]*SeriesRangeSummary, int64, *errs.Error) {
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	ctx := context.Background()
 	where, params := buildSeriesRangeSummaryWhere(args)
 	fromSQL := fmt.Sprintf(`FROM sranges
   WHERE %s`, where)
-	if IsQuestDB {
+	if q.isQuestDB() {
+		keyArgs := args
+		keyArgs.HasData = nil
+		keyWhere, _ := buildSeriesRangeSummaryWhere(keyArgs)
 		fromSQL = fmt.Sprintf(`FROM (
     SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted
     FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms
     WHERE %s
   )
-  WHERE coalesce(is_deleted, false) = false`, where)
+  WHERE coalesce(is_deleted, false) = false AND %s`, keyWhere, where)
 	}
 	countSQL := fmt.Sprintf(`SELECT count(*) FROM (
   SELECT sid, tbl, timeframe, has_data, min(start_ms) AS start_ms, max(stop_ms) AS stop_ms, count(*) AS segments
@@ -78,7 +81,7 @@ OFFSET $%d LIMIT $%d`, fromSQL, len(params)-1, len(params))
 		if err := rows.Scan(&r.Sid, &r.Table, &r.Source, &r.Timeframe, &r.StartMs, &r.StopMs, &r.HasData, &r.Segments); err != nil {
 			return nil, 0, NewDbErr(core.ErrDbReadFail, err)
 		}
-		r.Symbol = GetSymbolByID(r.Sid)
+		r.Symbol = q.symbolByID(r.Sid)
 		out = append(out, &r)
 	}
 	if err := rows.Err(); err != nil {
@@ -123,7 +126,7 @@ func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Err
 	if args.Sid == 0 {
 		return nil, 0, errs.NewMsg(core.ErrDbReadFail, "sid is required")
 	}
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	ctx := context.Background()
 
@@ -138,6 +141,7 @@ func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Err
 	if args.Start > 0 {
 		whereParts = append(whereParts, fmt.Sprintf("start_ms >= %d", args.Start))
 	}
+	keyWhereClause := strings.Join(whereParts, " AND ")
 	if args.Stop > 0 {
 		whereParts = append(whereParts, fmt.Sprintf("stop_ms <= %d", args.Stop))
 	}
@@ -147,9 +151,9 @@ func (q *Queries) FindSRanges(args FindSRangesArgs) ([]*SRange, int64, *errs.Err
 	whereClause := strings.Join(whereParts, " AND ")
 
 	countSQL := fmt.Sprintf(`SELECT count(*) FROM (
-  SELECT sid, is_deleted FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms WHERE %s
-) WHERE coalesce(is_deleted, false) = false
-`, whereClause)
+  SELECT * FROM sranges_q LATEST BY sid, tbl, timeframe, start_ms WHERE %s
+) WHERE coalesce(is_deleted, false) = false AND %s
+`, keyWhereClause, whereClause)
 	var total int64
 	if err := q.db.QueryRow(ctx, countSQL).Scan(&total); err != nil {
 		return nil, 0, NewDbErr(core.ErrDbReadFail, err)
@@ -166,8 +170,8 @@ FROM (
   LATEST BY sid, tbl, timeframe, start_ms
   WHERE %s
 )
-WHERE coalesce(is_deleted, false) = false
-ORDER BY start_ms DESC`, whereClause)
+WHERE coalesce(is_deleted, false) = false AND %s
+ORDER BY start_ms DESC`, keyWhereClause, whereClause)
 	if args.Offset > 0 {
 		dataSQL += fmt.Sprintf(" OFFSET %d", args.Offset)
 	}
@@ -194,20 +198,12 @@ ORDER BY start_ms DESC`, whereClause)
 }
 
 func (q *Queries) ListSRangesBySid(ctx context.Context, sid int32) ([]*SRange, error) {
-	unlock := LockCompactTableRead("sranges_q")
+	unlock := q.LockCompactTableRead("sranges_q")
 	defer unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	rows, err := q.db.Query(ctx, `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
-FROM (
-  SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted
-  FROM sranges_q
-  LATEST BY sid, tbl, timeframe, start_ms
-  WHERE sid = $1
-)
-WHERE coalesce(is_deleted, false) = false
-ORDER BY tbl, timeframe, start_ms`, sid)
+	rows, err := q.db.Query(ctx, listSRangesBySidQuery(q.isQuestDB()), sid)
 	if err != nil {
 		return nil, err
 	}
@@ -221,4 +217,22 @@ ORDER BY tbl, timeframe, start_ms`, sid)
 		out = append(out, &r)
 	}
 	return out, rows.Err()
+}
+
+func listSRangesBySidQuery(questDB bool) string {
+	if !questDB {
+		return `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
+FROM sranges
+WHERE sid = $1
+ORDER BY tbl, timeframe, start_ms`
+	}
+	return `SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data
+FROM (
+  SELECT sid, tbl, timeframe, start_ms, stop_ms, has_data, is_deleted
+  FROM sranges_q
+  LATEST BY sid, tbl, timeframe, start_ms
+  WHERE sid = $1
+)
+WHERE coalesce(is_deleted, false) = false
+ORDER BY tbl, timeframe, start_ms`
 }
