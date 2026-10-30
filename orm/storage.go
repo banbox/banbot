@@ -32,8 +32,8 @@ func NewStorage(pool *pgxpool.Pool, questDB bool, identity string) *Storage {
 }
 
 // OpenStorage opens a runtime-owned pool from an immutable database config.
-// Schema migrations and application setup remain explicit lifecycle steps;
-// opening a pool has no package-global side effects.
+// Schema migrations (EnsureSchema) and application setup remain explicit
+// lifecycle steps; opening a pool has no package-global side effects.
 func OpenStorage(ctx context.Context, dbCfg *config.DatabaseConfig, dataDir string) (*Storage, *errs.Error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -49,6 +49,48 @@ func OpenStorage(ctx context.Context, dbCfg *config.DatabaseConfig, dataDir stri
 	storage := &Storage{pool: dbPool, questDB: questDB, identity: identity}
 	storage.closeFn = dbPool.Close
 	return storage, nil
+}
+
+var (
+	schemaReadyMu sync.Mutex
+	schemaReady   = map[string]bool{}
+
+	runStoragePgMigrations  = runPgMigrations
+	runStorageQdbMigrations = runQdbMigrationsAtRoot
+)
+
+// EnsureSchema initializes or upgrades the banbot schema when the database
+// config enables auto_create. It is the explicit lifecycle step that
+// OpenStorage leaves to callers; each storage identity is migrated at most
+// once per process.
+func (s *Storage) EnsureSchema(ctx context.Context, dbCfg *config.DatabaseConfig) *errs.Error {
+	if s == nil {
+		return errs.NewMsg(core.ErrDbConnFail, "storage is not configured")
+	}
+	if dbCfg == nil || !dbCfg.AutoCreate {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	schemaReadyMu.Lock()
+	defer schemaReadyMu.Unlock()
+	if s.identity != "" && schemaReady[s.identity] {
+		return nil
+	}
+	var err *errs.Error
+	if s.questDB {
+		err = runStorageQdbMigrations(ctx, s.pool, s.ProcessLockRoot())
+	} else {
+		err = runStoragePgMigrations(ctx, s.pool)
+	}
+	if err != nil {
+		return err
+	}
+	if s.identity != "" {
+		schemaReady[s.identity] = true
+	}
+	return nil
 }
 
 // Pool returns the owned pool for low-level lifecycle operations. Callers must

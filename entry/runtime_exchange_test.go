@@ -117,6 +117,23 @@ func TestInitializeExplicitExchangeUsesSnapshotBracketsAndLogsFallback(t *testin
 	}
 }
 
+func TestInitializeExplicitExchangeMissingCredsIsWarning(t *testing.T) {
+	var output bytes.Buffer
+	logger := zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewProductionEncoderConfig()), zapcore.AddSync(&output), zap.DebugLevel))
+	stub := &explicitExchangeStub{info: &banexg.ExgInfo{MarketType: banexg.MarketLinear}, contract: true}
+	stub.loadBracketErr = errs.NewMsg(errs.CodeCredsRequired, "credential required")
+	if err := initializeExplicitExchange(stub, nil, false, core.RunModeBackTest, logger); err != nil {
+		t.Fatal(err)
+	}
+	if stub.initCalls != 1 {
+		t.Fatalf("default brackets not initialized, init=%d", stub.initCalls)
+	}
+	text := output.String()
+	if !strings.Contains(text, "warn") || strings.Contains(text, "error") {
+		t.Fatalf("missing creds should log a warning only: %s", text)
+	}
+}
+
 func explicitMarketSnapshotFixture(t *testing.T, invalidHash bool) *config.Snapshot {
 	t.Helper()
 	const symbol = "BTC/USDT:USDT"

@@ -7,9 +7,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestStorageCloseConcurrent(t *testing.T) {
@@ -269,5 +271,71 @@ func TestStorageBoundCompactStateAndRewriteIntentAreIsolated(t *testing.T) {
 	}
 	if err := clearQuestRewriteSwapIntentAtRoot("source", firstRoot); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStorageEnsureSchemaRunsBackendMigrationOncePerIdentity(t *testing.T) {
+	oldPg, oldQdb := runStoragePgMigrations, runStorageQdbMigrations
+	t.Cleanup(func() { runStoragePgMigrations, runStorageQdbMigrations = oldPg, oldQdb })
+	var pgCalls, qdbCalls int
+	var qdbRoot string
+	runStoragePgMigrations = func(context.Context, *pgxpool.Pool) *errs.Error {
+		pgCalls++
+		return nil
+	}
+	runStorageQdbMigrations = func(_ context.Context, _ *pgxpool.Pool, root string) *errs.Error {
+		qdbCalls++
+		qdbRoot = root
+		return nil
+	}
+	autoCreate := &config.DatabaseConfig{AutoCreate: true}
+
+	if err := NewStorage(nil, false, "database:ensure-schema-off").EnsureSchema(context.Background(), &config.DatabaseConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if pgCalls != 0 {
+		t.Fatalf("auto_create=false ran %d migrations", pgCalls)
+	}
+
+	pg := NewStorage(nil, false, "database:ensure-schema-pg")
+	for range 2 {
+		if err := pg.EnsureSchema(context.Background(), autoCreate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pgCalls != 1 || qdbCalls != 0 {
+		t.Fatalf("timescale schema calls pg=%d qdb=%d", pgCalls, qdbCalls)
+	}
+
+	quest := NewStorage(nil, true, "database:ensure-schema-qdb")
+	if err := quest.EnsureSchema(context.Background(), autoCreate); err != nil {
+		t.Fatal(err)
+	}
+	if qdbCalls != 1 || qdbRoot != quest.ProcessLockRoot() {
+		t.Fatalf("questdb schema calls=%d root=%q want %q", qdbCalls, qdbRoot, quest.ProcessLockRoot())
+	}
+}
+
+func TestStorageEnsureSchemaRetriesAfterFailure(t *testing.T) {
+	oldPg := runStoragePgMigrations
+	t.Cleanup(func() { runStoragePgMigrations = oldPg })
+	calls := 0
+	runStoragePgMigrations = func(context.Context, *pgxpool.Pool) *errs.Error {
+		calls++
+		if calls == 1 {
+			return errs.NewMsg(core.ErrDbExecFail, "migration failed")
+		}
+		return nil
+	}
+	storage := NewStorage(nil, false, "database:ensure-schema-retry")
+	autoCreate := &config.DatabaseConfig{AutoCreate: true}
+	if err := storage.EnsureSchema(context.Background(), autoCreate); err == nil {
+		t.Fatal("expected first migration failure")
+	}
+	if err := storage.EnsureSchema(context.Background(), autoCreate); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("failed migration was cached, calls=%d", calls)
 	}
 }

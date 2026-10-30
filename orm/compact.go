@@ -263,9 +263,13 @@ func lockCompactTableReadExclusiveProcessAtRootForBackend(ctx context.Context, t
 }
 
 func lockAllCompactTablesRead(ctx context.Context) (func(), error) {
+	return lockAllCompactTablesReadAtRoot(ctx, IsQuestDB, compactProcessLockRootFn())
+}
+
+func lockAllCompactTablesReadAtRoot(ctx context.Context, questDB bool, root string) (func(), error) {
 	unlocks := make([]func(), 0, len(compactTableOrder))
 	for _, table := range compactTableOrder {
-		unlock, err := lockCompactTableRead(ctx, table)
+		unlock, err := lockCompactTableReadAtRoot(ctx, table, questDB, root)
 		if err != nil {
 			for i := len(unlocks) - 1; i >= 0; i-- {
 				unlocks[i]()

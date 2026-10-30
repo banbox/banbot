@@ -37,7 +37,7 @@ BanBot文档项目旨在为BanBot量化交易机器人的用户和开发者提�
 - faq.md: 提供了常见问题解答。
 - hyperopt.md: 介绍了如何使用超参数优化功能。
 - init_project.md: 指导用户如何初始化一个新的 BanBot 策略项目。
-- install.md: 提供了安装 BanBot 运行环境的说明，包括 TimeScaleDB 和 Go。
+- database.md: 介绍 QuestDB/TimescaleDB 两种存储后端的选择、配置、TimescaleDB 部署步骤和 schema 自动初始化。
 - live_trading.md: 详细介绍了如何部署 BanBot 进行实盘交易，包括编译、配置和启动机器人。
 - pair_filters.md: 介绍了所有可用的交易对过滤器及其配置。
 - quick_local.md: 提供了在本地环境中快速配置和运行 BanBot 的分步指南。

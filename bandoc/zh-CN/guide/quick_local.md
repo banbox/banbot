@@ -10,7 +10,7 @@
 如果希望本地安装启动，您可按照下面步骤快速在本地配置并运行banbot：
 
 ## Step 1. 本地安装
-您需要安装Golang开发环境，建议使用最新版本。banbot 支持 QuestDB 和 TimescaleDB 存储 K 线及其他时序数据：使用 QuestDB 时，首次连接失败会自动下载安装；使用 TimescaleDB 时请先自行部署。详细配置请参阅[数据库](./database.md)。
+您需要安装Golang开发环境，建议使用最新版本。banbot 支持 QuestDB 和 TimescaleDB 存储 K 线及其他时序数据：`bot init` 生成的默认配置使用 QuestDB，本机连接失败时 banbot 会自动下载安装并启动它；使用 TimescaleDB 时请先自行部署 PostgreSQL 和 TimescaleDB 扩展，并在配置中切换数据库。详细配置请参阅[数据库](./database.md)。
 
 您也可以查看B站的[安装教程视频](https://www.bilibili.com/video/BV1QuLozqEzg/)
 
@@ -110,6 +110,18 @@ accounts:
 exchange:
   binance:
     proxy: http://127.0.0.1:10808  # 设置为no，禁用系统代理
+```
+
+::: tip TIP
+回测和下载 K 线不需要 API 密钥；未配置时只会输出一条警告，并使用默认的杠杆分层计算维持保证金。实盘交易才必须配置密钥。
+:::
+
+如果使用 TimescaleDB，请在 `config.local.yml` 中追加数据库配置覆盖默认的 QuestDB，部署步骤见[数据库](./database.md#部署-timescaledb)：
+```yaml
+database:
+  db_type: timescale
+  url: postgresql://banbot:your-password@127.0.0.1:5432/banbot?sslmode=disable
+  auto_create: true  # 首次运行任意命令时自动建表
 ```
 
 ## Step 5. 启动WebUI

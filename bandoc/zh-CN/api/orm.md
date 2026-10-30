@@ -184,10 +184,32 @@ INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须�
 ## 数据库连接相关
 
 ### Setup（兼容接口）
-初始化数据库连接池。
+初始化包级全局数据库连接池；`auto_create` 为 true 时执行 schema 迁移，随后加载品种和市场信息。新代码请使用 `OpenStorage` + `Storage.EnsureSchema`。
 
 返回：
 - `*errs.Error` - 初始化过程中的错误信息
+
+### OpenStorage
+按数据库配置打开一个由调用方持有的连接池（`*Storage`），不修改包级全局状态。QuestDB 本机不可达时会尝试自动安装启动。
+
+参数：
+- `ctx context.Context` - 上下文对象
+- `dbCfg *config.DatabaseConfig` - 数据库配置
+- `dataDir string` - 数据目录，用于计算存储标识
+
+返回：
+- `*Storage` - 存储对象，使用完毕后调用 `Close`
+- `*errs.Error` - 错误信息
+
+### Storage.EnsureSchema
+当 `dbCfg.AutoCreate` 为 true 时，按后端执行 QuestDB 或 TimescaleDB 的 schema 初始化/迁移；同一进程内每个存储标识只成功执行一次，失败可重试。`OpenStorage` 不会自动建表，命令行运行时入口会在打开存储后调用它。
+
+参数：
+- `ctx context.Context` - 上下文对象
+- `dbCfg *config.DatabaseConfig` - 数据库配置
+
+返回：
+- `*errs.Error` - 迁移错误信息
 
 ### Conn（兼容接口）
 获取数据库连接和查询对象。

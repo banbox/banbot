@@ -39,7 +39,43 @@ database:
   auto_create: true
 ```
 
-`auto_create: true` 会在连接成功后初始化或升级 banbot 所需的 schema，不会创建 PostgreSQL 服务、用户或数据库。生产环境请为 banbot 使用单独的数据库账号，并按您的部署要求设置 TLS、密码和网络访问控制。
+`auto_create: true` 时，每个命令（如 `kline down`、`backtest`、`trade`、`web`）在连接成功后都会初始化或升级 banbot 所需的 schema（表、hypertable 和迁移版本），该过程幂等，可重复执行；它不会创建 PostgreSQL 服务、用户或数据库。若设为 `false`，请确保 schema 已由其他启用 `auto_create` 的实例初始化，否则会出现 `relation "exsymbol" does not exist` 等错误。生产环境请为 banbot 使用单独的数据库账号，并按您的部署要求设置 TLS、密码和网络访问控制。
+
+### 部署 TimescaleDB
+
+无论使用哪种安装方式，都需要满足：
+
+1. `postgresql.conf` 中 `shared_preload_libraries` 包含 `timescaledb`，修改后重启 PostgreSQL；
+2. 为 banbot 创建用户和数据库；
+3. 由超级用户在目标数据库中执行 `CREATE EXTENSION IF NOT EXISTS timescaledb;`。banbot 初始化 schema 时也会执行此语句，但普通账号通常没有创建该扩展的权限，提前创建可避免初始化失败。
+
+::: code-group
+```shell [MacOS (Homebrew)]
+brew tap timescale/tap
+brew install timescale/tap/timescaledb   # 会同时安装依赖的 PostgreSQL
+timescaledb_move.sh                       # 将扩展文件复制到 PostgreSQL 目录
+# 自动调优并写入 shared_preload_libraries，路径以 brew 输出的 PostgreSQL 版本为准
+timescaledb-tune --quiet --yes --conf-path=/opt/homebrew/var/postgresql@18/postgresql.conf
+brew services restart postgresql@18
+```
+```shell [Docker]
+docker run -d --name timescaledb -p 5432:5432 \
+  -e POSTGRES_PASSWORD=your-password \
+  -v /opt/tsdb:/var/lib/postgresql/data \
+  timescale/timescaledb:latest-pg17
+```
+:::
+
+然后创建用户、数据库和扩展（Docker 方式请通过 `docker exec -it timescaledb psql -U postgres` 执行）：
+
+```sql
+CREATE ROLE banbot LOGIN PASSWORD 'your-password';
+CREATE DATABASE banbot OWNER banbot;
+\c banbot
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+```
+
+`bot init` 生成的 `config.yml` 默认使用 QuestDB。使用 TimescaleDB 时，请在 `config.local.yml` 中按上文配置 `database`，覆盖默认值。
 
 ## 自动识别
 

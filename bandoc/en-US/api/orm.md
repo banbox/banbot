@@ -184,10 +184,32 @@ See [Custom Time-Series Data](../guide/custom_data.md) and [Database](../guide/d
 ## Database Connection Related
 
 ### Setup (Compatibility API)
-Initialize database connection pool.
+Initialize the package-level database connection pool; when `auto_create` is true it runs schema migrations, then loads symbols and market info. New code should use `OpenStorage` + `Storage.EnsureSchema`.
 
 Returns:
 - `*errs.Error` - Error information during initialization
+
+### OpenStorage
+Open a caller-owned connection pool (`*Storage`) from a database config without modifying package-level globals. When a local QuestDB is unreachable, it tries to install and start it automatically.
+
+Parameters:
+- `ctx context.Context` - Context object
+- `dbCfg *config.DatabaseConfig` - Database configuration
+- `dataDir string` - Data directory, used to compute the storage identity
+
+Returns:
+- `*Storage` - Storage object; call `Close` when done
+- `*errs.Error` - Error information
+
+### Storage.EnsureSchema
+When `dbCfg.AutoCreate` is true, run the QuestDB or TimescaleDB schema initialization/migrations for the storage backend. Within one process each storage identity is migrated successfully at most once, and failures can be retried. `OpenStorage` does not create tables; the command-line runtime entry calls this right after opening storage.
+
+Parameters:
+- `ctx context.Context` - Context object
+- `dbCfg *config.DatabaseConfig` - Database configuration
+
+Returns:
+- `*errs.Error` - Migration error information
 
 ### Conn (Compatibility API)
 Get database connection and query object.

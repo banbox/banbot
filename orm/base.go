@@ -910,8 +910,12 @@ func initializeLeverageBrackets(exchange banexg.BanExchange, account string) {
 	if err == nil {
 		return
 	}
-	log.Error("LoadLeverageBrackets fail, skip, maint margin calculation may have large deviation",
-		zap.String("err", err.Short()))
+	if err.Code == errs.CodeCredsRequired {
+		log.Warn("no API credentials, use default leverage brackets for maint margin", zap.String("err", err.Short()))
+	} else {
+		log.Error("LoadLeverageBrackets fail, skip, maint margin calculation may have large deviation",
+			zap.String("err", err.Short()))
+	}
 	if err = exchange.InitLeverageBrackets(); err != nil {
 		log.Warn("InitLeverageBrackets fail", zap.String("err", err.Short()))
 	}
@@ -1049,6 +1053,12 @@ func tryRepairQuestDBMissingPartition(ctx context.Context, db DBTX, err error, r
 // runQdbMigrations executes QuestDB schema migrations as ordered, non-transactional
 // steps. Every database, visibility, and migration error is returned to the caller.
 func runQdbMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
+	return runQdbMigrationsAtRoot(ctx, pool, compactProcessLockRootFn())
+}
+
+// runQdbMigrationsAtRoot is runQdbMigrations bound to an explicit compact
+// coordination root, so runtime-owned Storage does not consult package globals.
+func runQdbMigrationsAtRoot(ctx context.Context, pool *pgxpool.Pool, root string) *errs.Error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1061,7 +1071,7 @@ func runQdbMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 			return nil
 		}
 	}
-	unlockCompactTables, lockErr := lockAllCompactTablesRead(ctx)
+	unlockCompactTables, lockErr := lockAllCompactTablesReadAtRoot(ctx, true, root)
 	if lockErr != nil {
 		return NewDbErr(core.ErrDbExecFail, lockErr)
 	}
