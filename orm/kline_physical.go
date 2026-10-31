@@ -23,6 +23,7 @@ type PhysicalKlineGap struct {
 
 // PhysicalKlineManifest proves which physical rows back a requested consumer
 // timeframe. DataSHA256 hashes timestamps and every stored OHLCV field in order.
+// Complete describes physical continuity, not exchange accuracy or tradability.
 type PhysicalKlineManifest struct {
 	SID                   int32              `json:"sid"`
 	Exchange              string             `json:"exchange"`

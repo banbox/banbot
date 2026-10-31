@@ -22,6 +22,9 @@ type PolicyCheckpoint struct {
 	Payload         json.RawMessage
 	PlanSequence    uint64
 	ProposalHash    string
+	// Remote state-only updates use the same writer lease as target commands.
+	StrategyEpoch    uint64 `json:",omitempty"`
+	StrategySequence uint64 `json:",omitempty"`
 }
 type PolicyAcceptance struct {
 	ID                    string
@@ -147,6 +150,10 @@ func validProposalHash(value string) bool {
 }
 
 func (s *SharedAccount) acceptPolicy(ctx context.Context, request PolicyAcceptance, now int64) (PolicyReceipt, error) {
+	return s.acceptPolicyWithRecords(ctx, request, now, nil)
+}
+
+func (s *SharedAccount) acceptPolicyWithRecords(ctx context.Context, request PolicyAcceptance, now int64, records []StrategyCheckpoint) (PolicyReceipt, error) {
 	if !s.ready || !canonicalID(request.ID) || request.ExpectedLedgerCursor < 0 || len(request.Checkpoints) == 0 {
 		return PolicyReceipt{}, errors.New("execution: invalid policy acceptance")
 	}
@@ -189,7 +196,7 @@ func (s *SharedAccount) acceptPolicy(ctx context.Context, request PolicyAcceptan
 		}
 		receipt := accepted.Receipt
 		if len(request.Updates) > 0 {
-			prepared, err := s.PrepareStrategiesWithCheckpoints(request.Updates, ctx, policyRecords(request.Checkpoints, accepted, name))
+			prepared, err := s.PrepareStrategiesWithCheckpoints(request.Updates, ctx, append(policyRecords(request.Checkpoints, accepted, name), records...))
 			if err != nil {
 				return receipt, err
 			}
@@ -231,7 +238,7 @@ func (s *SharedAccount) acceptPolicy(ctx context.Context, request PolicyAcceptan
 		accepted.Sequences[c.Strategy] = c.PlanSequence
 		accepted.ProposalHashes[c.Strategy] = c.ProposalHash
 	}
-	checkpoints := policyRecords(request.Checkpoints, accepted, name)
+	checkpoints := append(policyRecords(request.Checkpoints, accepted, name), records...)
 	var prepared PreparedRebalance
 	if len(request.Updates) > 0 {
 		prepared, err = s.PrepareStrategiesWithCheckpoints(request.Updates, ctx, checkpoints)

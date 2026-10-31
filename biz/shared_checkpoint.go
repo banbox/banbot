@@ -54,12 +54,50 @@ func loadSharedCheckpoint(store *execution.Store, ctx context.Context, version s
 	if state.Commands == nil {
 		state.Commands = map[string]sharedTSCommand{}
 	}
+	if err := state.loadPendingIndex(); err != nil {
+		return state, err
+	}
 	for _, key := range state.ActiveOrders {
 		if _, err := state.loadOrder(key); err != nil {
 			return state, err
 		}
 	}
+	for _, order := range state.Orders {
+		if pending, ok := state.pendingOrders[sharedPendingKey{order.Strategy, order.Lot}]; ok {
+			hydratePendingOrder(order, pending)
+		}
+	}
 	return state, nil
+}
+
+func (state *sharedTSCheckpoint) loadPendingIndex() error {
+	if state.pendingOrders != nil {
+		return nil
+	}
+	definitions, err := state.store.LoadPendingBook(state.ctx)
+	if err != nil {
+		return err
+	}
+	state.pendingOrders = make(map[sharedPendingKey]execution.PendingOrder, len(definitions))
+	for _, definition := range definitions {
+		state.pendingOrders[sharedPendingKey{definition.Order.Strategy, definition.Order.Lot}] = definition.Order
+	}
+	return nil
+}
+
+func hydratePendingOrder(order *sharedTSOrder, pending execution.PendingOrder) {
+	order.PendingOrder = pending
+	if pending.LastProtection == "" {
+		return
+	}
+	order.SourceExit = nil
+	order.ExitTag = string(pending.LastProtection)
+	if pending.LastProtection == execution.StopLossProtection && order.Request.StopLossTag != "" {
+		order.ExitTag = order.Request.StopLossTag
+	}
+	if pending.LastProtection == execution.TakeProfitProtection && order.Request.TakeProfitTag != "" {
+		order.ExitTag = order.Request.TakeProfitTag
+	}
 }
 
 func (state *sharedTSCheckpoint) loadOrder(key string) (*sharedTSOrder, error) {
@@ -76,6 +114,12 @@ func (state *sharedTSCheckpoint) loadOrder(key string) (*sharedTSOrder, error) {
 	}
 	if sharedOrderKey(order.Strategy, order.ID) != key {
 		return nil, errors.New("biz: shared order checkpoint identity mismatch")
+	}
+	if err := state.loadPendingIndex(); err != nil {
+		return nil, err
+	}
+	if pending, ok := state.pendingOrders[sharedPendingKey{order.Strategy, order.Lot}]; ok {
+		hydratePendingOrder(&order, pending)
 	}
 	state.Orders[key] = &order
 	return &order, nil

@@ -40,11 +40,11 @@ func (s *AccountSink) CancelIncreasingPending(ctx context.Context, sids []int32,
 		}
 		ids = append(ids, i.ID)
 	}
-	return s.Account.CancelPolicyEntriesContext(ctx, execution.StrategyID(s.StrategyID), ids, now)
+	return s.application().CancelPolicyEntriesContext(ctx, execution.StrategyID(s.StrategyID), ids, now)
 }
 
 func (s *AccountSink) PolicyEvidence(ctx context.Context, now int64) (factor.PortfolioEvidence, error) {
-	e, err := s.Account.PolicyEvidenceContext(ctx, execution.StrategyID(s.StrategyID))
+	e, err := s.application().PolicyEvidenceContext(ctx, execution.StrategyID(s.StrategyID))
 	if err != nil {
 		return factor.PortfolioEvidence{}, err
 	}
@@ -141,7 +141,7 @@ func (s *AccountSink) PolicyEvidence(ctx context.Context, now int64) (factor.Por
 		p.FillEvents = append(p.FillEvents, factor.PositionFillEvidence{Quantity: qty.String(), LedgerCursor: fill.Cursor, PlanSequence: fill.PlanSequence, AtMS: fill.AtMS})
 		result.Positions[sid] = p
 	}
-	risk, err := s.Account.AccountRisk(ctx, now)
+	risk, err := s.application().AccountRisk(ctx, now)
 	if err != nil {
 		return result, err
 	}
@@ -175,7 +175,7 @@ func (s *AccountSink) RestorePolicy(ctx context.Context, name string) (json.RawM
 	if name != "" && name != execution.PolicyCheckpointName {
 		return nil, 0, 0, errors.New("runner: unsupported policy checkpoint name")
 	}
-	e, err := s.Account.PolicyEvidenceContext(ctx, execution.StrategyID(s.StrategyID))
+	e, err := s.application().PolicyEvidenceContext(ctx, execution.StrategyID(s.StrategyID))
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -218,7 +218,10 @@ func (s *AccountSink) AcceptProposal(ctx context.Context, proposal factor.Portfo
 		}
 	}
 	proposalHash := hex.EncodeToString(hash[:])
-	if receipt, found, err := s.Account.ResumePolicyContext(ctx, execution.StrategyID(s.StrategyID), id, proposalHash, now); err != nil || found {
+	if receipt, found, err := s.application().ResumePolicyContext(ctx, execution.StrategyID(s.StrategyID), id, proposalHash, now); err != nil || found {
+		if err == nil && receipt.Accepted {
+			_, _, _, err = s.RestorePolicy(ctx, execution.PolicyCheckpointName)
+		}
 		return receipt, err
 	}
 	request := execution.PolicyAcceptance{ID: id, ExpectedLedgerCursor: int64(ledgerCursor), DecisionMS: proposal.DecisionTime, ExpiresMS: proposal.ExpireAt}
@@ -233,6 +236,7 @@ func (s *AccountSink) AcceptProposal(ctx context.Context, proposal factor.Portfo
 	if proposal.Target != nil {
 		p := proposal.Target
 		sp := p.Spec()
+		request.DecisionMS, request.ExpiresMS = sp.DecisionTime, sp.ExpireAt
 		if sp.AccountID != s.AccountID || sp.StrategyID != s.StrategyID || sp.Budget.Currency != s.Currency || now < sp.ExecutableAt || now >= sp.ExpireAt {
 			return execution.PolicyReceipt{}, errors.New("runner: allocation/account identity or execution window mismatch")
 		}
@@ -246,7 +250,7 @@ func (s *AccountSink) AcceptProposal(ctx context.Context, proposal factor.Portfo
 		}
 		omissions := FullZeroOmissions(p, s.previousAllocation, declared)
 		if len(omissions) > 0 {
-			ownerEvidence, err := s.Account.PolicyEvidenceContext(ctx, execution.StrategyID(s.StrategyID))
+			ownerEvidence, err := s.application().PolicyEvidenceContext(ctx, execution.StrategyID(s.StrategyID))
 			if err != nil {
 				return execution.PolicyReceipt{}, err
 			}
@@ -383,7 +387,7 @@ func (s *AccountSink) AcceptProposal(ctx context.Context, proposal factor.Portfo
 		return execution.PolicyReceipt{}, errors.New("runner: encoded policy checkpoint exceeds bounded owner storage")
 	}
 	request.Checkpoints = []execution.PolicyCheckpoint{{Strategy: execution.StrategyID(s.StrategyID), ExpectedVersion: stateVersion, Payload: payload, PlanSequence: checkpoint.Sequence, ProposalHash: proposalHash}}
-	receipt, err := s.Account.AcceptPolicyBatchContext(ctx, request, now)
+	receipt, err := s.application().AcceptPolicyBatchContext(ctx, request, now)
 	if receipt.Accepted {
 		s.previousAllocation = checkpoint.Target
 		if s.acceptedPolicy == nil {

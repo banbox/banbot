@@ -19,6 +19,28 @@ type syncStampExchange struct {
 	err *errs.Error
 }
 
+func TestProductionLegacyLiveConstructorIsRetired(t *testing.T) {
+	previous := core.EnvReal
+	core.EnvReal = true
+	t.Cleanup(func() { core.EnvReal = previous })
+	for _, construct := range []struct {
+		name string
+		run  func()
+	}{
+		{"initializer", func() { InitLiveOrderMgr(nil) }},
+		{"constructor", func() { newLiveOrderMgr("default", nil) }},
+	} {
+		t.Run(construct.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("production legacy constructor must fail before creating a sender or manager")
+				}
+			}()
+			construct.run()
+		})
+	}
+}
+
 func (e *syncStampExchange) FetchOpenOrders(string, int64, int, map[string]interface{}) ([]*banexg.Order, *errs.Error) {
 	return nil, e.err
 }
@@ -119,6 +141,19 @@ func TestInitLiveOrderMgrWithRuntimeDepsKeepsLegacyManagersUntouched(t *testing.
 		Exchange:       exchange,
 		DefaultAccount: "runtime",
 	})
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("production must not construct the retired live manager, even with a fenced legacy SDK")
+			}
+		}()
+		InitLiveOrderMgrWithRuntimeDeps(deps, nil)
+	}()
+	if trading.LiveManager("runtime") != nil || orders.GetEditListener() != nil {
+		t.Fatal("rejected production construction installed legacy state")
+	}
+	// Keep the original isolation scenario available as an offline specification.
+	deps.Core.EnvReal = false
 	InitLiveOrderMgrWithRuntimeDeps(deps, nil)
 
 	if trading.LiveManager("runtime") == nil {

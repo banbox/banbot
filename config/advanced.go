@@ -75,7 +75,15 @@ func validateAdvanced(path string, fields map[string]any) error {
 			return fmt.Errorf("%s cannot be null", field)
 		}
 		switch key {
-		case "archive", "store", "history", "sender_lease_dir", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "timeframe", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder", "definition", "sampling", "option_expiry_source", "terminal_settlement_source", "paper_fill_model":
+		case "order_mode":
+			if value != "local" && value != "exchange_first" {
+				return fmt.Errorf("%s must be local or exchange_first", field)
+			}
+		case "protection_mode":
+			if value != "software" && value != "native_preferred" {
+				return fmt.Errorf("%s must be software or native_preferred", field)
+			}
+		case "archive", "store", "history", "sender_lease_dir", "hub_socket", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "timeframe", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder", "definition", "sampling", "option_expiry_source", "terminal_settlement_source", "paper_fill_model":
 			if text, ok := value.(string); !ok || strings.TrimSpace(text) == "" {
 				return fmt.Errorf("%s must be a nonempty string", field)
 			}

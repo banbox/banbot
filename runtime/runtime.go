@@ -501,6 +501,8 @@ func (p *Process) Stop() {
 }
 
 type Options struct {
+	HubOrderBridge  *biz.HubOrderBridgeConfig
+	HubMarketData   bool // public inputs for remote Hub execution; no local account owner
 	LegacyExecution *LegacyExecutionOptions
 	// AccountOwnerKey opts into the P0 local owner foundation. Until the P4
 	// trading bridge exists, only Other mode without an exchange is admitted.
@@ -587,7 +589,9 @@ type Runtime struct {
 	accountOwner       *execution.AccountHandle
 	sharedExecution    *biz.SharedAccountBorrow
 	sharedMarketData   bool
+	hubMarketData      bool
 	sharedOrderBridge  *biz.SharedOrderBridgeConfig
+	hubOrderBridge     *biz.HubOrderBridgeConfig
 	factorLegacyTrader *biz.Trader
 	factorLegacySubs   []*strat.DataSub
 
@@ -657,6 +661,17 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	}
 	if (opts.ExchangeName == "") != (opts.Market == "") {
 		return nil, fmt.Errorf("runtime: exchange and market must be provided together")
+	}
+	if opts.HubOrderBridge != nil {
+		if opts.SharedExecution != nil || opts.SharedOrderBridge != nil || opts.LegacyExecution != nil || opts.AccountOwnerKey != nil || opts.SharedMarketData || (opts.Env != core.RunEnvProd && opts.Env != core.RunEnvDryRun) || opts.Mode != core.RunModeLive && opts.Mode != core.RunModeData {
+			return nil, fmt.Errorf("runtime: Hub bridge requires live/dry-run remote execution without local owner")
+		}
+		if err := opts.HubOrderBridge.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	if opts.HubMarketData && (opts.Exchange == nil || opts.SharedExecution != nil || opts.SharedOrderBridge != nil || opts.LegacyExecution != nil || opts.AccountOwnerKey != nil || opts.SharedMarketData || (opts.Env != core.RunEnvProd && opts.Env != core.RunEnvDryRun) || (opts.Mode != core.RunModeLive && opts.Mode != core.RunModeData)) {
+		return nil, fmt.Errorf("runtime: Hub public market data requires remote live/dry-run composition without local execution")
 	}
 	if opts.SharedExecution != nil && opts.AccountOwnerKey == nil {
 		return nil, fmt.Errorf("runtime: shared execution requires AccountOwnerKey")
@@ -893,6 +908,12 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		runtime.OnCloseWait(wrapped.Join)
 		defer func() { finishBinding(constructed) }()
 	}
+	if opts.HubOrderBridge != nil {
+		runtime.hubOrderBridge = opts.HubOrderBridge
+		bridge := opts.HubOrderBridge.Bridge
+		runtime.sharedOrderBridge = &bridge
+	}
+	runtime.hubMarketData = opts.HubMarketData
 	if opts.AccountOwnerKey != nil {
 		var acquireErr error
 		runtime.accountOwner, acquireErr = p.accountOwners.Acquire(*opts.AccountOwnerKey)
@@ -1065,9 +1086,14 @@ func (r *Runtime) BizDeps() biz.RuntimeDeps {
 	if r == nil {
 		return biz.RuntimeDeps{}
 	}
+	bridge := r.sharedOrderBridge
+	if r.hubOrderBridge != nil {
+		bridge = nil
+	}
 	return biz.RuntimeDeps{
+		HubOrderBridge:    r.hubOrderBridge,
 		SharedExecution:   r.sharedExecution,
-		SharedOrderBridge: r.sharedOrderBridge,
+		SharedOrderBridge: bridge,
 		Core:              r.Core,
 		Clock:             r.Clock,
 		Market:            r.Market,

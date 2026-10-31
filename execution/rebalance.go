@@ -14,10 +14,11 @@ import (
 )
 
 type InstrumentRebalance struct {
-	Instrument        Instrument
-	Targets           []ExecutableTarget
-	Quote             VisibleQuote
-	IntentConstraints []EligibleIntent // original contributor conditions/checkpoints, keyed strategy/lot/side/kind
+	Instrument              Instrument
+	Targets                 []ExecutableTarget
+	Quote                   VisibleQuote
+	IntentConstraints       []EligibleIntent // original contributor conditions/checkpoints, keyed strategy/lot/side/kind
+	ConditionalReservations []ConditionalReservation
 }
 type CombinedRebalance struct {
 	PlanID           string
@@ -175,6 +176,18 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 				if err := r.Instrument.Validate(); err != nil {
 					return err
 				}
+				for _, reservation := range r.ConditionalReservations {
+					if err := reservation.Validate(); err != nil {
+						return err
+					}
+					if reservation.Intent.Account != e.Store.key || reservation.Intent.Instrument != r.Instrument.ID {
+						return errors.New("execution: foreign conditional reservation")
+					}
+					if err := NativeConditionalSupport(e.Adapter, reservation.Condition); err != nil {
+						return err
+					}
+					plan.ConditionalIntents = append(plan.ConditionalIntents, reservation)
+				}
 				plan.ContributorConstraints = append(plan.ContributorConstraints, r.IntentConstraints...)
 				plan.Instruments = append(plan.Instruments, r.Instrument)
 				plan.RebalancedInstruments = append(plan.RebalancedInstruments, r.Instrument.ID)
@@ -210,7 +223,11 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 					kind     IntentKind
 				}
 				constraints := make(map[contributorKey]EligibleIntent)
+				exclusive := ExclusiveOrderLot(snapshot, r.Instrument.ID, r.Targets, r.IntentConstraints)
 				for _, constraint := range r.IntentConstraints {
+					if constraint.VenueLimit != nil && !exclusive {
+						return errors.New("execution: resting limit conflicts with another instrument contributor")
+					}
 					if constraint.Conditions.PostOnly && !e.Adapter.Capabilities().PostOnly {
 						return errors.New("execution: adapter does not prove post-only support")
 					}
@@ -240,11 +257,12 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 						}
 						intent := EligibleIntent{ID: VirtualIntentID("virtual-" + rebalanceID(request.PlanID, "/", r.Instrument.ID, "/", delta.Strategy, "/", delta.Lot, "/", part.kind)), Account: e.Store.key, Strategy: delta.Strategy, Lot: delta.Lot, Instrument: r.Instrument.ID, Kind: part.kind, Side: delta.Side, QuantitySteps: part.steps, State: Eligible, Conditions: IntentConditions{CreatedBar: q.Bar}}
 						if constraint, ok := constraints[contributorKey{delta.Strategy, delta.Lot, delta.Side, part.kind}]; ok {
-							available, err := constraint.Evaluate(price, request.DecisionMS, q.Bar)
+							available, err := constraint.AvailableForSubmission(price, request.DecisionMS, q.Bar)
 							if err != nil || available < part.steps {
 								return errors.Join(errors.New("execution: contributor is not eligible for frozen target delta"), err)
 							}
 							intent.Conditions = constraint.Conditions
+							intent.VenueLimit = constraint.VenueLimit
 							intent.Triggered, intent.TrailingActive, intent.TrailingAnchor = constraint.Triggered, constraint.TrailingActive, constraint.TrailingAnchor
 						}
 						p.intents = append(p.intents, intent)
@@ -467,6 +485,16 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 					if units != 0 {
 						return errors.New("execution: unallocated strategy delta after crossing")
 					}
+				}
+				for _, reservation := range p.request.ConditionalReservations {
+					condition := reservation.Condition
+					intent := reservation.Intent
+					order := OrderIntent{ID: "conditional-" + rebalanceID(plan.ID, intent.ID), PlanID: plan.ID, Instrument: p.request.Instrument, Side: intent.Side, Steps: intent.QuantitySteps, Limit: condition.Limit, Observation: p.observation, ReduceOnly: true, Risk: &frozenRisk, Conditional: &condition,
+						Allocations: []FillAllocation{{ID: string(intent.ID), IntentID: intent.ID, Strategy: intent.Strategy, Lot: intent.Lot, Side: intent.Side, Kind: ExitIntent, Steps: intent.QuantitySteps}}}
+					if err := e.Store.PrepareOrder(ctx, order, request.DecisionMS); err != nil {
+						return err
+					}
+					result.OrderIDs = append(result.OrderIDs, order.ID)
 				}
 			}
 			return nil

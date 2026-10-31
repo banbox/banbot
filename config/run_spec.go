@@ -142,10 +142,10 @@ func (s *RunSpec) EffectiveYAML(redact bool) ([]byte, error) {
 // IsAdvancedPathField identifies paths whose base is their declaring config
 // file, including normalized [] indices used by private Web snapshots.
 func IsAdvancedPathField(field string) bool {
-	if field == "data.archive" || field == "execution.store" || field == "execution.history" || field == "execution.sender_lease_dir" {
+	if field == "data.archive" || field == "execution.store" || field == "execution.history" || field == "execution.sender_lease_dir" || field == "execution.hub_socket" {
 		return true
 	}
-	if (strings.HasPrefix(field, "accounts.") || strings.HasPrefix(field, "execution.accounts.")) && (strings.HasSuffix(field, ".store") || strings.HasSuffix(field, ".history") || strings.HasSuffix(field, ".sender_lease_dir")) {
+	if (strings.HasPrefix(field, "accounts.") || strings.HasPrefix(field, "execution.accounts.")) && (strings.HasSuffix(field, ".store") || strings.HasSuffix(field, ".history") || strings.HasSuffix(field, ".sender_lease_dir") || strings.HasSuffix(field, ".hub_socket")) {
 		return true
 	}
 	field = strings.Replace(field, "].factor.", "].", 1)

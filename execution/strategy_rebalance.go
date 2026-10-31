@@ -22,8 +22,15 @@ const (
 // lots of that strategy; Patch changes the supplied lots. The account owner
 // carries every other strategy and resolves quotes for omitted Full exits.
 type StrategyRebalance struct {
-	Strategy              StrategyID
-	PlanID                string
+	Strategy StrategyID
+	PlanID   string
+	// Epoch fences replaced writers; Sequence preserves the writer's original
+	// command order independently of account plan acceptance order.
+	StrategyEpoch         uint64          `json:",omitempty"`
+	StrategySequence      uint64          `json:",omitempty"`
+	ExpectedRevision      *uint64         `json:",omitempty"`
+	ProposalHash          string          `json:",omitempty"`
+	ProposalState         json.RawMessage `json:",omitempty"`
 	DecisionMS, ExpiresMS int64
 	Mode                  TargetUpdateMode
 	Requests              []InstrumentRebalance
@@ -105,6 +112,13 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoints(updates []StrategyRebal
 			return PreparedRebalance{}, errors.New("execution: strategy batch requires one plan and decision clock")
 		}
 		owned[r.Strategy] = r.Mode
+		var instruments []string
+		for _, input := range r.Requests {
+			instruments = append(instruments, input.Instrument.ID)
+		}
+		if err := s.validateContributorInstruments(ctx, r.Strategy, instruments); err != nil {
+			return PreparedRebalance{}, err
+		}
 	}
 	request := updates[0]
 	for _, checkpoint := range policyCheckpoints {
@@ -142,8 +156,36 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoints(updates []StrategyRebal
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return PreparedRebalance{}, err
 	}
+	ordering, err := s.strategyOrderingCheckpoints(ctx, updates)
+	if err != nil {
+		return PreparedRebalance{}, err
+	}
 	if len(s.markets) == 0 {
 		return PreparedRebalance{}, errors.New("execution: strategy targets require registered account policy and quotes")
+	}
+	// Include factor revisions in the same reservation revocation gate as
+	// pending orders. Do this before projecting acknowledged allocations.
+	if err := s.revokeConditionalReservations(ctx, updates); err != nil {
+		return PreparedRebalance{}, err
+	}
+	revoked, pendingCheckpoint, err := s.revokeConflictingReservations(ctx, updates)
+	if err != nil {
+		return PreparedRebalance{}, err
+	}
+	if pendingCheckpoint != nil {
+		hasPendingCheckpoint := false
+		for _, checkpoint := range policyCheckpoints {
+			if checkpoint.Strategy == PendingBookStrategy && checkpoint.Name == PendingBookName {
+				hasPendingCheckpoint = true
+			}
+		}
+		if !hasPendingCheckpoint {
+			policyCheckpoints = append(policyCheckpoints, *pendingCheckpoint)
+		}
+	}
+	updates, policyCheckpoints, err = s.mergeNativePreflightState(ctx, updates, policyCheckpoints)
+	if err != nil {
+		return PreparedRebalance{}, err
 	}
 	snapshot, err := s.store.Snapshot(ctx)
 	if err != nil {
@@ -174,6 +216,9 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoints(updates []StrategyRebal
 	for _, target := range latest.Targets {
 		targets[targetKey{target.Instrument, target.Strategy, target.Lot}] = target
 	}
+	for _, target := range revoked {
+		targets[targetKey{target.Instrument, target.Strategy, target.Lot}] = target
+	}
 	requests := make(map[string]InstrumentRebalance)
 	for _, update := range updates {
 		seenInstruments := make(map[string]bool)
@@ -197,6 +242,11 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoints(updates []StrategyRebal
 					return PreparedRebalance{}, errors.New("execution: foreign strategy contributor condition")
 				}
 			}
+			for _, reservation := range input.ConditionalReservations {
+				if reservation.Intent.Strategy != update.Strategy {
+					return PreparedRebalance{}, errors.New("execution: foreign strategy conditional reservation")
+				}
+			}
 			if update.Mode == StrategyTargetsPatch && len(input.Targets) == 0 {
 				continue
 			}
@@ -210,10 +260,12 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoints(updates []StrategyRebal
 				}
 				prior.Targets = append(prior.Targets, input.Targets...)
 				prior.IntentConstraints = append(prior.IntentConstraints, input.IntentConstraints...)
+				prior.ConditionalReservations = append(prior.ConditionalReservations, input.ConditionalReservations...)
 				requests[input.Instrument.ID] = prior
 			} else {
 				input.Targets = append([]ExecutableTarget(nil), input.Targets...)
 				input.IntentConstraints = append([]EligibleIntent(nil), input.IntentConstraints...)
+				input.ConditionalReservations = append([]ConditionalReservation(nil), input.ConditionalReservations...)
 				requests[input.Instrument.ID] = input
 			}
 		}
@@ -270,6 +322,7 @@ func (s *SharedAccount) PrepareStrategiesWithCheckpoints(updates []StrategyRebal
 	data, _ := json.Marshal(revision)
 	var checkpoints []StrategyCheckpoint
 	checkpoints = append(checkpoints, policyCheckpoints...)
+	checkpoints = append(checkpoints, ordering...)
 	for _, update := range updates {
 		checkpoints = append(checkpoints, StrategyCheckpoint{Strategy: update.Strategy, Name: name, Payload: data})
 	}
@@ -346,7 +399,7 @@ func (s *SharedAccount) retainedPlanTargets(ctx context.Context, plan Plan, snap
 		}
 	}
 	if len(zero) == 0 {
-		return plan.Targets, nil
+		return s.nativeFillTargets(ctx, plan, plan.Targets)
 	}
 	active := make(map[key]bool)
 	for _, lot := range snapshot.Lots {
@@ -380,5 +433,88 @@ func (s *SharedAccount) retainedPlanTargets(ctx context.Context, plan Plan, snap
 			targets = append(targets, target)
 		}
 	}
-	return targets, nil
+	return s.nativeFillTargets(ctx, plan, targets)
+}
+
+// Revocation can settle native fills after the caller constructed its pending
+// checkpoint. Preserve those economic changes without changing retry identity.
+func (s *SharedAccount) mergeNativePreflightState(ctx context.Context, updates []StrategyRebalance, checkpoints []StrategyCheckpoint) ([]StrategyRebalance, []StrategyCheckpoint, error) {
+	book, err := s.store.LoadPendingBook(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	current := make(map[string]PendingDefinition, len(book))
+	for _, definition := range book {
+		current[pendingIdentity(definition.Order.Strategy, definition.Order.Lot)] = definition
+	}
+	changed := make(map[string]PendingDefinition)
+	checkpoints = append([]StrategyCheckpoint(nil), checkpoints...)
+	for n := range checkpoints {
+		checkpoint := &checkpoints[n]
+		if checkpoint.Strategy != PendingBookStrategy || checkpoint.Name != PendingBookName {
+			continue
+		}
+		var incoming []PendingDefinition
+		if err := json.Unmarshal(checkpoint.Payload, &incoming); err != nil {
+			return nil, nil, err
+		}
+		for i := range incoming {
+			definition := &incoming[i]
+			key := pendingIdentity(definition.Order.Strategy, definition.Order.Lot)
+			latest, exists := current[key]
+			if !exists || latest.Order.LastNativeFill == "" || latest.Order.LastNativeFill == definition.Order.LastNativeFill {
+				continue
+			}
+			if latest.Order.Entry.ID != definition.Order.Entry.ID || latest.Instrument.ID != definition.Instrument.ID {
+				return nil, nil, errors.New("execution: stale pending checkpoint replaces a native-filled lot")
+			}
+			exit := definition.Order.Exit
+			var localTrigger EligibleIntent
+			var localKind string
+			var localDone bool
+			if exit != nil {
+				for kind, trigger := range definition.Order.Protections {
+					if trigger.ID == exit.ID && trigger.Triggered {
+						localTrigger, localKind, localDone = trigger, kind, definition.Order.ProtectionDone[kind]
+					}
+				}
+			}
+			copyNativeFill(&definition.Order, latest.Order)
+			if exit != nil && exit.State != Filled && exit.State != Canceled && exit.State != Expired && localKind != "" {
+				definition.Order.Protections[localKind] = localTrigger
+				definition.Order.ProtectionDone[localKind] = localDone
+			}
+			changed[key] = *definition
+		}
+		merged, err := PendingBookCheckpoint(incoming)
+		if err != nil {
+			return nil, nil, err
+		}
+		checkpoint.Payload = merged.Payload
+	}
+	if len(changed) == 0 {
+		return updates, checkpoints, nil
+	}
+	updates = append([]StrategyRebalance(nil), updates...)
+	for n := range updates {
+		updates[n].Requests = append([]InstrumentRebalance(nil), updates[n].Requests...)
+		for i := range updates[n].Requests {
+			request := &updates[n].Requests[i]
+			request.Targets = append([]ExecutableTarget(nil), request.Targets...)
+			for j := range request.Targets {
+				target := &request.Targets[j]
+				if latest, exists := changed[pendingIdentity(target.Strategy, target.Lot)]; exists && latest.Instrument.ID == request.Instrument.ID {
+					target.SignedSteps = latest.Order.Desired
+				}
+			}
+			reservations := make([]ConditionalReservation, 0, len(request.ConditionalReservations))
+			for _, reservation := range request.ConditionalReservations {
+				if _, stale := changed[pendingIdentity(reservation.Intent.Strategy, reservation.Intent.Lot)]; !stale {
+					reservations = append(reservations, reservation)
+				}
+			}
+			request.ConditionalReservations = reservations
+		}
+	}
+	return updates, checkpoints, nil
 }

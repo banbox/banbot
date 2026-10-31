@@ -66,7 +66,7 @@ func (tx *storeTxn) memoryRead(operation storageOperation, args []any) ([][]any,
 		var atMS int64
 		owner := memoryKey{argString(args[0]), argString(args[1]), argString(args[2])}
 		observe := func(r memoryRecord) {
-			if r.Kind != "ExchangeFill" && r.Kind != "InternalFill" {
+			if r.Kind != "ExchangeFill" && r.Kind != "InternalFill" && r.Kind != "ExternalAttribution" {
 				return
 			}
 			if (operation == opReadLotEntryBuy || operation == opReadLotEntryStepsBuy) && r.Quantity > 0 || (operation == opReadLotEntrySell || operation == opReadLotEntryStepsSell) && r.Quantity < 0 {
@@ -80,7 +80,7 @@ func (tx *storeTxn) memoryRead(operation storageOperation, args []any) ([][]any,
 		for _, key := range tx.memory.postingsByLot[owner] {
 			observe(tx.memory.records[recordsLedger][key])
 		}
-		tx.visitHistory(recordsLedger, " AND strategy=? AND lot=? AND event_type IN ('ExchangeFill','InternalFill')", []any{owner.first, owner.second}, observe)
+		tx.visitHistory(recordsLedger, " AND strategy=? AND lot=? AND event_type IN ('ExchangeFill','InternalFill','ExternalAttribution')", []any{owner.first, owner.second}, observe)
 		return [][]any{{atMS}}, nil
 	case opListAttemptEvents:
 		records := tx.selectRecordsWhere(recordsEvent, " AND event_type=? AND order_id=?", []any{"OrderAttempt", argString(args[1])}, func(r memoryRecord) bool {

@@ -204,7 +204,16 @@ type liveEntryExchange struct {
 func (e *liveEntryExchange) Info() *banexg.ExgInfo {
 	return &banexg.ExgInfo{ID: "entrytest", MarketType: "linear"}
 }
-func (e *liveEntryExchange) HasApi(string, string) bool { return true }
+func (e *liveEntryExchange) HasApi(api, _ string) bool {
+	switch api {
+	case banexg.ApiCreateOrder, banexg.ApiCancelOrder, banexg.ApiFetchOrder,
+		banexg.ApiFetchOpenOrders, banexg.ApiFetchBalance, banexg.ApiFetchPositions,
+		banexg.ApiFetchOrderBook, banexg.ApiWatchMyTrades:
+		return true
+	default:
+		return false
+	}
+}
 func (e *liveEntryExchange) FetchBalance(map[string]any) (*banexg.Balances, *errs.Error) {
 	e.snapshots.Add(1)
 	return &banexg.Balances{Total: map[string]float64{"USD": e.cash}}, nil

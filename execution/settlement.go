@@ -70,6 +70,11 @@ func (s *Store) ApplyInternalMatch(ctx context.Context, match InternalMatch) (bo
 		if err := json.Unmarshal([]byte(planBody), &plan); err != nil {
 			return err
 		}
+		for _, reservation := range plan.ConditionalIntents {
+			if reservation.Intent.ID == match.BuyIntent || reservation.Intent.ID == match.SellIntent {
+				return errors.New("execution: dormant conditional reservation cannot be internally matched")
+			}
+		}
 		if match.AtMS < plan.DecisionMS || match.AtMS >= plan.ExpiresMS {
 			return errors.New("execution: internal plan expired")
 		}
@@ -248,6 +253,42 @@ func (s *Store) ApplyFunding(ctx context.Context, event FundingSettlement) (bool
 				return err
 			}
 			assigned = assigned.Add(amount)
+		}
+		var externalBody string
+		err = tx.QueryRow(opReadExternalPosition, s.accountID, event.Instrument.ID).Scan(&externalBody)
+		if err == nil {
+			var external VirtualLot
+			if err := json.Unmarshal([]byte(externalBody), &external); err != nil {
+				return err
+			}
+			if external.SignedSteps != 0 {
+				a, _ := payload(external.Instrument)
+				b, _ := payload(event.Instrument)
+				if a != b {
+					return errors.New("execution: external funding instrument revision mismatch")
+				}
+				// Like virtual lots, quarantine accrues the modelled funding for
+				// its signed exposure. Only the unexplained remainder is residual;
+				// both postings remain in unassigned cash until explicit adoption.
+				amount := event.Instrument.Notional(external.SignedSteps, event.Mark).Mul(event.Rate).Neg()
+				external.Funding = external.Funding.Add(amount)
+				externalBody, err = payload(external)
+				if err != nil {
+					return err
+				}
+				if _, err := tx.Exec(opPutExternalPosition, s.accountID, event.Instrument.ID, external.SignedSteps, externalBody); err != nil {
+					return err
+				}
+				if err := s.addCash(tx, "", amount); err != nil {
+					return err
+				}
+				if err := s.ledger(tx, LedgerEntry{EventID: event.ID, Kind: "ExternalFunding", CashDelta: amount, AtMS: event.AtMS}); err != nil {
+					return err
+				}
+				assigned = assigned.Add(amount)
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
 		}
 		residual := event.AccountAmount.Sub(assigned)
 		if !residual.IsZero() {

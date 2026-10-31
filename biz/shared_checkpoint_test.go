@@ -18,8 +18,8 @@ func TestSharedCheckpointSplitsLegacyFactsAndReadsCold(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	old := sharedTSCheckpoint{Version: "v1", Serial: 100, Orders: map[string]*sharedTSOrder{
-		"ts/1": {ID: 1, Strategy: "ts", Lot: "imported-lot", Canceled: true, Entry: execution.EligibleIntent{State: execution.Canceled}},
-		"ts/2": {ID: 2, Strategy: "ts", Lot: "legacy/ts/2", Entry: execution.EligibleIntent{State: execution.PendingCondition}},
+		"ts/1": {ID: 1, PendingOrder: execution.PendingOrder{Strategy: "ts", Lot: "imported-lot", Canceled: true, Entry: execution.EligibleIntent{State: execution.Canceled}}},
+		"ts/2": {ID: 2, PendingOrder: execution.PendingOrder{Strategy: "ts", Lot: "legacy/ts/2", Entry: execution.EligibleIntent{State: execution.PendingCondition}}},
 	}}
 	command, err := sharedCommand(&old, "entry-1", "original")
 	if err != nil {

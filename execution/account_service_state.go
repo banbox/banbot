@@ -38,6 +38,23 @@ func (s *SharedAccount) ReadQuote(callerCtx context.Context, id string, now int6
 	return quote, err
 }
 
+// ReadLimitPrice keeps read-only liquidity transport under the same owner
+// admission and bounded context as quote collection.
+func (s *SharedAccount) ReadLimitPrice(callerCtx context.Context, provider func(context.Context, string, OrderSide, int) (float64, error), id string, side OrderSide, seconds int) (float64, error) {
+	var price float64
+	if provider == nil {
+		return 0, errors.New("execution: limit-price provider unavailable")
+	}
+	err := s.owner.DoLocal(s.owner.Token(), func(ctx context.Context) error {
+		ctx, cancel := joinedOperationContext(ctx, callerCtx)
+		defer cancel()
+		var err error
+		price, err = provider(ctx, id, side, seconds)
+		return err
+	})
+	return price, err
+}
+
 // AdvancePaperQuote settles resting maker orders before processing this quote's
 // strategy decisions. Recovery also picks up a prior simulated fill whose local
 // persistence was interrupted; observing the same quote cannot lose that fill.
@@ -66,7 +83,7 @@ func (s *SharedAccount) AdvancePaperQuote(ctx context.Context, id string, quote 
 			return err
 		}
 		for _, order := range snapshot.Orders {
-			if order.Intent.Instrument.ID != id || !order.Intent.PostOnly || order.State == OrderPrepared {
+			if order.Intent.Instrument.ID != id || !order.Intent.Limit.IsPositive() || order.State == OrderPrepared {
 				continue
 			}
 			result, err := paper.Query(ctx, order.ClientID, order.ExchangeID)

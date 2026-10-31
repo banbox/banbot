@@ -44,6 +44,7 @@ var runtimeDepsBindMu sync.Mutex
 // Each explicit trader owns its strategy, order, trading, market, and clock
 // state; legacy package facades are used only by traders without RuntimeDeps.
 type RuntimeDeps struct {
+	HubOrderBridge    *HubOrderBridgeConfig
 	SharedExecution   *SharedAccountBorrow
 	SharedOrderBridge *SharedOrderBridgeConfig
 	Core              *core.State

@@ -15,7 +15,10 @@ func (r *Runtime) failFactorLive(provider *data.LiveProvider, cancel context.Can
 	if err == nil {
 		return
 	}
-	freezeErr := r.sharedExecution.FreezeFailure("factor-source-error", r.Clock.TimeMS())
+	var freezeErr error
+	if r.sharedExecution != nil {
+		freezeErr = r.sharedExecution.FreezeFailure("factor-source-error", r.Clock.TimeMS())
+	}
 	select {
 	case failures <- errors.Join(err, freezeErr):
 	default:
@@ -40,7 +43,7 @@ func (r *Runtime) failFactorLive(provider *data.LiveProvider, cancel context.Can
 // The consumer must stamp actual publication/reception times and use a real
 // visible bid/ask quote for live internal matching.
 func (r *Runtime) NewFactorLiveProvider(consume data.FnDataSeries, end data.FuncEnvEnd) (*data.LiveProvider, *errs.Error) {
-	if r == nil || !r.sharedMarketData || r.sharedExecution == nil || r.Exchange == nil || consume == nil || r.Core.BackTestMode {
+	if r == nil || !(r.hubMarketData || r.sharedMarketData && r.sharedExecution != nil) || r.Exchange == nil || consume == nil || r.Core.BackTestMode {
 		return nil, errs.NewMsg(core.ErrBadConfig, "factor live provider requires explicit shared realtime market-data composition")
 	}
 	return data.NewLiveProviderWithRuntimeDeps(r.DataDeps(), consume, end)

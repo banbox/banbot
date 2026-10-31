@@ -106,11 +106,11 @@ const (
 
 var sqliteStatements = map[storageOperation]string{
 	opListRecoveryOrders:          "SELECT id FROM exec_order WHERE account=? AND id>? AND (attempt>0 OR exchange_id<>'') ORDER BY id LIMIT ?",
-	opReadLotEntryStepsBuy:        "SELECT COALESCE(sum(quantity),0) FROM exec_ledger WHERE account=? AND strategy=? AND lot=? AND kind IN ('ExchangeFill','InternalFill') AND quantity>0",
-	opReadLotEntryStepsSell:       "SELECT COALESCE(sum(-quantity),0) FROM exec_ledger WHERE account=? AND strategy=? AND lot=? AND kind IN ('ExchangeFill','InternalFill') AND quantity<0",
+	opReadLotEntryStepsBuy:        "SELECT COALESCE(sum(quantity),0) FROM exec_ledger WHERE account=? AND strategy=? AND lot=? AND kind IN ('ExchangeFill','InternalFill','ExternalAttribution') AND quantity>0",
+	opReadLotEntryStepsSell:       "SELECT COALESCE(sum(-quantity),0) FROM exec_ledger WHERE account=? AND strategy=? AND lot=? AND kind IN ('ExchangeFill','InternalFill','ExternalAttribution') AND quantity<0",
 	opListStrategyCheckpointPage:  "SELECT name,payload FROM exec_checkpoint WHERE account=?1 AND kind='strategy' AND strategy=?2 AND name>?4 AND name>=?3 AND substr(name,1,length(?3))=?3 ORDER BY name LIMIT ?5",
-	opReadLotEntryBuy:             "SELECT COALESCE(max(at_ms),0) FROM exec_ledger WHERE account=? AND strategy=? AND lot=? AND kind IN ('ExchangeFill','InternalFill') AND quantity>0",
-	opReadLotEntrySell:            "SELECT COALESCE(max(at_ms),0) FROM exec_ledger WHERE account=? AND strategy=? AND lot=? AND kind IN ('ExchangeFill','InternalFill') AND quantity<0",
+	opReadLotEntryBuy:             "SELECT COALESCE(max(at_ms),0) FROM exec_ledger WHERE account=? AND strategy=? AND lot=? AND kind IN ('ExchangeFill','InternalFill','ExternalAttribution') AND quantity>0",
+	opReadLotEntrySell:            "SELECT COALESCE(max(at_ms),0) FROM exec_ledger WHERE account=? AND strategy=? AND lot=? AND kind IN ('ExchangeFill','InternalFill','ExternalAttribution') AND quantity<0",
 	opListAttemptEvents:           "SELECT payload FROM exec_event WHERE account=? AND kind='OrderAttempt' AND json_extract(payload,'$.OrderID')=? ORDER BY checkpoint",
 	opPutStrategyCheckpoint:       "INSERT INTO exec_checkpoint(account,kind,strategy,name,payload) VALUES(?,'strategy',?,?,?) ON CONFLICT(account,kind,strategy,name) DO UPDATE SET payload=excluded.payload",
 	opReadIntentRuntime:           "SELECT COALESCE(runtime_payload,payload) FROM exec_virtual_intent WHERE account=? AND id=?",

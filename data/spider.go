@@ -51,27 +51,12 @@ func (s *LiveSpider) consumeSeriesWriteQ(workNum int) {
 	var saves sync.WaitGroup
 	defer saves.Wait()
 	guard := make(chan struct{}, workNum)
-	defer close(guard)
-	setOne := func() bool {
-		logged := false
-		for {
-			select {
-			case guard <- struct{}{}:
-				return true
-			case <-s.ctx.Done():
-				return false
-			case <-time.After(20 * time.Second):
-				if !logged {
-					log.Error("wait save in spider timeout")
-					logged = true
-				}
-			}
-		}
-	}
 	mntSta := newPeriodSta("1m")
 	hourSta := newPeriodSta("1h")
 	ema := core.NewEMA(0.1)
 	lastDelayWarn := int64(0)
+	// Queue order, not storage completion order, defines each symbol's facts.
+	predecessors := make(map[int32]<-chan struct{})
 	for {
 		var save *SaveSeries
 		select {
@@ -81,9 +66,6 @@ func (s *LiveSpider) consumeSeriesWriteQ(workNum int) {
 		}
 		if save == nil {
 			continue
-		}
-		if !setOne() {
-			return
 		}
 		deps := save.Deps
 		if deps == nil {
@@ -96,9 +78,17 @@ func (s *LiveSpider) consumeSeriesWriteQ(workNum int) {
 			lastDelayWarn = nowMS
 			log.Warn("series save task consume slowly", zap.Int("waitMS", int(waitMa)), zap.Int("waitNum", len(s.writeQ)))
 		}
+		previous := predecessors[save.Sid]
+		completed := make(chan struct{})
+		predecessors[save.Sid] = completed
 		saves.Add(1)
-		go func(job *SaveSeries) {
+		go func(job *SaveSeries, previous <-chan struct{}, completed chan struct{}) {
 			defer saves.Done()
+			defer close(completed)
+			if !acquireSeriesWriteSlot(s.ctx, previous, guard) {
+				return
+			}
+			defer func() { <-guard }()
 			start := time.Now()
 			var saveCost, totalCost time.Duration
 			tfSecs := utils2.TFToSecs(job.TimeFrame)
@@ -115,11 +105,14 @@ func (s *LiveSpider) consumeSeriesWriteQ(workNum int) {
 						zap.Duration("saveDb", saveCost), zap.Duration("send", totalCost-saveCost),
 						zap.Int("num", len(job.Rows)), zap.String("barEnd", barEndStr))
 				}
-				<-guard
 			}()
+			// Persistence and its closed-fact observation remain in the original
+			// per-SID queue order even when another storage operation is slow.
 			// Remove from sidMap when job is consumed
 			s.sidMu.Lock()
-			delete(s.sidMap, job.Sid)
+			if s.sidMap[job.Sid] == job {
+				delete(s.sidMap, job.Sid)
+			}
 			s.sidMu.Unlock()
 			deps := job.Deps
 			if deps == nil {
@@ -130,6 +123,9 @@ func (s *LiveSpider) consumeSeriesWriteQ(workNum int) {
 				return
 			}
 			saveCost = time.Since(start)
+			if observeErr := s.observeClosedSeries(job.Rows); observeErr != nil {
+				log.Error("closed series observer failed", zap.Error(observeErr))
+			}
 			// After the series is written to the database, notify robots to avoid repeated insertion.
 			// 写入时序数据到数据库后，才发消息通知机器人，避免重复插入。
 			err := s.Broadcast(&utils.IOMsg{
@@ -144,7 +140,7 @@ func (s *LiveSpider) consumeSeriesWriteQ(workNum int) {
 			if err != nil {
 				log.Error("broadCast kline fail", zap.String("action", job.MsgAction), zap.Error(err))
 			}
-		}(save)
+		}(save, previous, completed)
 	}
 }
 
@@ -303,6 +299,9 @@ func readSpiderBatch[T comparable](ctx context.Context, updates <-chan T) ([]T, 
 }
 
 type LiveSpider struct {
+	feedMu         sync.RWMutex
+	closedObserver ClosedSeriesObserver
+	pinnedFeeds    map[string]bool
 	*utils.ServerIO
 	deps        *RuntimeDeps
 	miners      map[string]*Miner
@@ -576,6 +575,15 @@ func (m *Miner) UnSubPairs(jobType string, pairs ...string) *errs.Error {
 		}
 		return nil
 	} else if jobType == "ohlcv" {
+		m.spider.feedMu.RLock()
+		defer m.spider.feedMu.RUnlock()
+		unpinned := make([]string, 0, len(pairs))
+		for _, pair := range pairs {
+			if !m.spider.pinnedFeeds[m.ExgName+"\x00"+m.Market+"\x00"+pair] {
+				unpinned = append(unpinned, pair)
+			}
+		}
+		pairs = unpinned
 		m.KLineApis.Remove(pairs...)
 		m.lockBarState.Lock()
 		for _, p := range pairs {

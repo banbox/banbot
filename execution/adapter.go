@@ -102,6 +102,11 @@ func (e *OwnerExecutor) Send(id string, nowMS int64) error {
 		if preview.Intent.PostOnly && !e.Adapter.Capabilities().PostOnly {
 			return errors.New("execution: adapter does not prove post-only support")
 		}
+		if preview.Intent.Conditional != nil {
+			if err := NativeConditionalSupport(e.Adapter, *preview.Intent.Conditional); err != nil {
+				return err
+			}
+		}
 		if preview.Intent.Risk != nil {
 			plan, err := e.Store.Plan(ctx, preview.Intent.PlanID)
 			if err != nil {
@@ -134,7 +139,7 @@ func (e *OwnerExecutor) Send(id string, nowMS int64) error {
 				if err := json.Unmarshal([]byte(body), &intent); err != nil {
 					return err
 				}
-				available, err := intent.Evaluate(order.Intent.Observation.Price, nowMS, order.Intent.Observation.Bar)
+				available, err := intent.AvailableForSubmission(order.Intent.Observation.Price, nowMS, order.Intent.Observation.Bar)
 				if err != nil || available < allocation.Steps-order.AllocationFilled[allocation.ID] {
 					return errors.Join(errors.New("execution: contributor condition expired or no longer eligible at send"), err)
 				}
@@ -153,6 +158,9 @@ func (e *OwnerExecutor) Send(id string, nowMS int64) error {
 			}
 			if nowMS < plan.DecisionMS || nowMS >= plan.ExpiresMS || order.Intent.Observation.ValidUntilMS <= nowMS || plan.Sequence != latest {
 				return errors.New("execution: prepared intent/observation expired or superseded")
+			}
+			if err := e.Store.validateConditionalSend(context.WithValue(ctx, storeTxContextKey{}, scopedStoreTx{e.Store, tx}), order.Intent, plan); err != nil {
+				return err
 			}
 			for _, prerequisite := range order.Intent.RequiresFilled {
 				prior, err := e.Store.readOrder(ctx, tx, prerequisite)

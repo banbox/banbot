@@ -235,7 +235,7 @@ func (tx *storeTxn) stageRecord(kind recordKind, key memoryKey, r memoryRecord) 
 	case recordsLedger:
 		if !present {
 			tx.indexRecord(tx.memory.postingsByEvent, memoryKey{r.Account, r.EventId, ""}, key)
-			if r.Kind == "ExchangeFill" || r.Kind == "InternalFill" {
+			if r.Kind == "ExchangeFill" || r.Kind == "InternalFill" || r.Kind == "ExternalAttribution" {
 				tx.indexRecord(tx.memory.postingsByLot, memoryKey{r.Account, r.Strategy, r.Lot}, key)
 			}
 		}
@@ -320,7 +320,7 @@ func (tx *storeTxn) indexedRecords(kind recordKind, index map[memoryKey][]memory
 		}
 	}
 	tx.visitHistory(kind, where, args, func(r memoryRecord) {
-		if kind != recordsLedger || owner.second == "" || r.Kind == "ExchangeFill" || r.Kind == "InternalFill" {
+		if kind != recordsLedger || owner.second == "" || r.Kind == "ExchangeFill" || r.Kind == "InternalFill" || r.Kind == "ExternalAttribution" {
 			records = append(records, r)
 		}
 	})

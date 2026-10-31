@@ -23,10 +23,11 @@ type paperTotals struct {
 // PaperAdapter is a deterministic local venue simulator. Full market fills
 // include directional slippage, tick rounding and fees. It has no network I/O;
 // optional indexed history can spill settled receipts through its bound store.
-// Ordinary limits reject when the modeled price exceeds their bound. Post-only
-// orders rest at their limit until a later visible bid/ask touches it. The model
-// assumes sufficient liquidity for a full fill; maker fees use the configured
-// fee rate and no taker slippage is charged. Recovery is process-local only.
+// Ordinary limits rest when the modeled price exceeds their bound. Resting
+// limits and post-only orders fill when a later visible bid/ask touches them.
+// The model assumes sufficient liquidity for a full fill; maker fees use the configured
+// fee rate and no taker slippage is charged. The default is process-local;
+// NewDurablePaperAdapter opts into a committed venue operation journal.
 type paperOrder struct {
 	intent OrderIntent
 	client string
@@ -34,6 +35,7 @@ type paperOrder struct {
 }
 
 type PaperAdapter struct {
+	journal             *paperJournal
 	mu                  sync.Mutex
 	cash, fee, slip     decimal.Decimal
 	positions           map[string]paperPosition
@@ -113,7 +115,7 @@ func NewPaperAdapterWithFillModel(cash, fee, slip decimal.Decimal, model PaperFi
 func (a *PaperAdapter) Capabilities() AdapterCapabilities {
 	return AdapterCapabilities{StableTradeID: true, PostOnly: true, QueryClientID: true, AuthoritativeNotFound: true}
 }
-func (a *PaperAdapter) Submit(ctx context.Context, o OrderIntent, client string) (SubmitReceipt, error) {
+func (a *PaperAdapter) submitLocked(ctx context.Context, o OrderIntent, client string) (SubmitReceipt, error) {
 	o.Instrument = o.Instrument.Clone()
 	if err := ctx.Err(); err != nil {
 		return SubmitReceipt{}, err
@@ -124,8 +126,6 @@ func (a *PaperAdapter) Submit(ctx context.Context, o OrderIntent, client string)
 	if err := o.Instrument.CheckExecutionTime(o.SubmitAtMS); err != nil {
 		return SubmitReceipt{}, err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if err := a.archiveSettled(ctx); err != nil {
 		return SubmitReceipt{}, err
 	}
@@ -218,7 +218,12 @@ func (a *PaperAdapter) Submit(ctx context.Context, o OrderIntent, client string)
 	}
 	price = ticks.Mul(o.Instrument.PriceTick)
 	if o.Limit.IsPositive() && (sign > 0 && price.GreaterThan(o.Limit) || sign < 0 && price.LessThan(o.Limit)) {
-		return SubmitReceipt{Rejected: true}, nil
+		result := QueryResult{Found: true, Authoritative: true, Complete: true, Receipt: SubmitReceipt{ExchangeID: "paper:" + o.ID}}
+		o.Allocations = append([]FillAllocation(nil), o.Allocations...)
+		a.orders[o.ID] = &paperOrder{intent: o, client: client, result: result}
+		a.pending[o.ID] = a.orders[o.ID]
+		a.clients[client] = o.ID
+		return result.Receipt, nil
 	}
 	receipt, err := a.fillLocked(o, price, o.SubmitAtMS, o.Observation.AtMS, false)
 	if err != nil {
@@ -294,36 +299,43 @@ func (p *paperPosition) applyTrade(side OrderSide, kind IntentKind, steps int64,
 
 // AdvanceQuote consumes only a subsequent visible top-of-book observation.
 // Returned order IDs must be recovered by their account owner to persist fills.
-func (a *PaperAdapter) AdvanceQuote(ctx context.Context, instrument string, q VisibleQuote, nowMS int64) ([]string, error) {
+func (a *PaperAdapter) advanceQuoteLocked(ctx context.Context, instrument string, q VisibleQuote, nowMS int64) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if !q.Bid.IsPositive() || q.Ask.LessThan(q.Bid) || q.AtMS < 0 || q.AtMS > q.ReceivedMS || q.ReceivedMS > nowMS || q.ValidUntilMS <= nowMS {
 		return nil, errors.New("execution: passive paper quote is not visible/valid")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if previous, ok := a.quotes[instrument]; ok && (previous.AtMS > q.AtMS || previous.ReceivedMS > q.ReceivedMS) {
 		return nil, nil
 	}
 	a.quotes[instrument] = q
 	var ids []string
+	prices := make(map[string]decimal.Decimal)
 	for id, order := range a.pending {
 		o := order.intent
-		if o.Instrument.ID != instrument || !o.PostOnly || order.result.Canceled || order.result.Receipt.Rejected || len(order.result.Receipt.Fills) > 0 {
+		if o.Instrument.ID != instrument || !o.Limit.IsPositive() || order.result.Canceled || order.result.Receipt.Rejected || len(order.result.Receipt.Fills) > 0 {
 			continue
 		}
 		if q.AtMS <= o.Observation.AtMS || q.ReceivedMS <= o.SubmitAtMS {
 			continue
 		}
-		if o.Side == Buy && q.Ask.LessThanOrEqual(o.Limit) || o.Side == Sell && q.Bid.GreaterThanOrEqual(o.Limit) {
+		// Round toward the permitted side of the bound without changing the
+		// original intent used for idempotent submission identity.
+		ticks, remainder := o.Limit.QuoRem(o.Instrument.PriceTick, 0)
+		if o.Side == Sell && remainder.IsPositive() {
+			ticks = ticks.Add(decimal.NewFromInt(1))
+		}
+		price := ticks.Mul(o.Instrument.PriceTick)
+		if price.IsPositive() && (o.Side == Buy && q.Ask.LessThanOrEqual(price) || o.Side == Sell && q.Bid.GreaterThanOrEqual(price)) {
 			ids = append(ids, id)
+			prices[id] = price
 		}
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
 		order := a.orders[id]
-		receipt, err := a.fillLocked(order.intent, order.intent.Limit, nowMS, q.AtMS, true)
+		receipt, err := a.fillLocked(order.intent, prices[id], nowMS, q.AtMS, true)
 		if err != nil {
 			return nil, err
 		}
@@ -332,12 +344,10 @@ func (a *PaperAdapter) AdvanceQuote(ctx context.Context, instrument string, q Vi
 	}
 	return ids, nil
 }
-func (a *PaperAdapter) Cancel(ctx context.Context, exchangeID string) (bool, error) {
+func (a *PaperAdapter) cancelLocked(ctx context.Context, exchangeID string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	order, ok := a.orders[strings.TrimPrefix(exchangeID, "paper:")]
 	if !ok {
 		var err error
@@ -364,6 +374,9 @@ func (a *PaperAdapter) Query(ctx context.Context, client, exchangeID string) (Qu
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := a.durableReadyLocked(); err != nil {
+		return QueryResult{}, err
+	}
 	id := a.clients[client]
 	if id == "" {
 		id = strings.TrimPrefix(exchangeID, "paper:")
@@ -393,6 +406,9 @@ func (a *PaperAdapter) Snapshot(ctx context.Context) (VenueSnapshot, error) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := a.durableReadyLocked(); err != nil {
+		return VenueSnapshot{}, err
+	}
 	positions := map[string]int64{}
 	for id, p := range a.positions {
 		positions[id] = p.steps
@@ -406,8 +422,47 @@ func (a *PaperAdapter) Snapshot(ctx context.Context) (VenueSnapshot, error) {
 	sort.Slice(open, func(i, j int) bool { return open[i].Receipt.ExchangeID < open[j].Receipt.ExchangeID })
 	return VenueSnapshot{Cash: a.cash.String(), Positions: positions, OpenOrders: open}, nil
 }
-func (a *PaperAdapter) ApplyCash(amount decimal.Decimal) {
+
+// ApplyCash is an explicit simulated venue adjustment. Account funding uses
+// the same operation under its shared ledger/journal transaction.
+func (a *PaperAdapter) ApplyCash(amount decimal.Decimal) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.cash = a.cash.Add(amount)
+	return a.mutatePaperLocked(context.Background(), paperOperation{Kind: "cash", Cash: &amount}, func(context.Context) error { a.cash = a.cash.Add(amount); return nil })
+}
+
+func (a *PaperAdapter) Submit(ctx context.Context, order OrderIntent, client string) (SubmitReceipt, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var receipt SubmitReceipt
+	err := a.mutatePaperLocked(ctx, paperOperation{Kind: "submit", Submit: &paperSubmitOperation{order, client, order.SubmitAtMS}}, func(ctx context.Context) error {
+		var err error
+		receipt, err = a.submitLocked(ctx, order, client)
+		return err
+	})
+	return receipt, err
+}
+
+func (a *PaperAdapter) AdvanceQuote(ctx context.Context, instrument string, quote VisibleQuote, nowMS int64) ([]string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var ids []string
+	err := a.mutatePaperLocked(ctx, paperOperation{Kind: "quote", Quote: &paperQuoteOperation{instrument, quote, nowMS}}, func(ctx context.Context) error {
+		var err error
+		ids, err = a.advanceQuoteLocked(ctx, instrument, quote, nowMS)
+		return err
+	})
+	return ids, err
+}
+
+func (a *PaperAdapter) Cancel(ctx context.Context, exchangeID string) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var canceled bool
+	err := a.mutatePaperLocked(ctx, paperOperation{Kind: "cancel", Cancel: exchangeID}, func(ctx context.Context) error {
+		var err error
+		canceled, err = a.cancelLocked(ctx, exchangeID)
+		return err
+	})
+	return canceled && err == nil, err
 }

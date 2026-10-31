@@ -28,6 +28,10 @@ func confirmedExposure(snapshot AccountSnapshot) ([]VirtualLot, []VirtualLot, er
 		if order.State != OrderAcknowledged && order.State != OrderPartial {
 			continue
 		}
+		// Dormant exits do not free holdings; actual fills are already in Lots.
+		if order.Intent.Conditional != nil {
+			continue
+		}
 		n := order.Intent.Steps - order.FilledSteps
 		if n < 0 {
 			return nil, nil, errors.New("execution: order highwater exceeds quantity")

@@ -132,3 +132,75 @@ func TestFactorLiveSourceSubscribesAndSettlesFundingOutsideFactorPool(t *testing
 		t.Fatalf("outside funding missing or duplicated: %+v", snapshot)
 	}
 }
+
+type hubOwnedFundingApplication struct{ runner.AccountApplication }
+
+func (hubOwnedFundingApplication) ExecutionOwnsFunding() bool { return true }
+
+func TestHubFactorFundingOwnedByExecutionPreservesExplicitDAGInput(t *testing.T) {
+	f := newSharedTriggerFixture(t)
+	f.rt.Clock.SetTimeMS(104)
+	c := replacementConfig(t, f, "signal", []int32{1}, []int32{1})
+	c.Manifest.Costs.FundingPolicy = "required-stream"
+	for _, name := range []string{"signal", "price", "funding"} {
+		if err := f.rt.Catalog.RegisterDataSource(&replacementSource{name: name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	application := hubOwnedFundingApplication{AccountApplication: f.rt.SharedExecution()}
+	sink := &runner.AccountSink{Application: application, AccountID: c.AccountID, StrategyID: c.StrategyID, Currency: c.Manifest.Currency, Instruments: c.Execution.Instruments, AuthoritativeFunding: true}
+	engine, err := runner.NewLive(c, sink, f.rt.Clock.TimeMS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Stop()
+	requests, err := f.rt.factorLiveRequests(engine, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range requests {
+		if request.Subscription.Source == "funding" {
+			t.Fatal("robot subscribed to implicit private funding")
+		}
+	}
+	c.Plan, err = factor.New().Add("value", factor.Field("funding", "mark", "event")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicit, err := runner.NewLive(c, sink, f.rt.Clock.TimeMS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer explicit.Stop()
+	requests, err = f.rt.factorLiveRequests(explicit, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, request := range requests {
+		if request.Subscription.Source == "funding" {
+			found = true
+			if slices.Contains(request.Subscription.Fields, "account_amount") {
+				t.Fatal("explicit public input expanded to private settlement fields")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("explicit funding DAG input removed")
+	}
+	before, err := f.rt.SharedExecution().Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := factor.VersionRecord{Series: orm.DataSeries{Source: "funding", TimeFrame: "event", Sid: 1, TimeMS: 101, EndMS: 101, Closed: true, Values: map[string]any{"mark": 100.0, "rate": 0.01, "settlement_id": "owner-only", "account_amount": "-1"}}, EventTime: 101, AvailableAt: 101, IngestedAt: 102, Revision: 1, SourceVersion: "v1"}
+	if err := explicit.Observe(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	after, err := f.rt.SharedExecution().Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.AccountSettledCash.Equal(before.AccountSettledCash) {
+		t.Fatal("robot applied funding settlement twice")
+	}
+}

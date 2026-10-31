@@ -27,9 +27,13 @@ func (s *SharedAccount) sendTime(now int64) int64 {
 }
 
 // ValidateAccountBindings checks restored contributors and descriptors before
-// admission. Holdings outside a factor universe still require an active owner.
+// admission. A durable Hub contributor remains account-owned while its robot is
+// offline; other holdings outside a factor universe still require a live job.
 func (b *SharedAccountBorrow) ValidateAccountBindings(strategies map[StrategyID]bool) error {
 	return b.use(func(s *SharedAccount) error {
+		if s.opts.TakeoverStrategy != "" && !strategies[s.opts.TakeoverStrategy] {
+			return errors.New("execution: takeover strategy has no configured live job")
+		}
 		snapshot, err := s.store.Snapshot(b.ctx)
 		if err != nil {
 			return err
@@ -43,9 +47,26 @@ func (b *SharedAccountBorrow) ValidateAccountBindings(strategies map[StrategyID]
 		}
 		checkStrategy := func(id StrategyID) error {
 			if !strategies[id] {
+				if err := s.validateRestoredContributor(b.ctx, id); err == nil {
+					return nil
+				} else if !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
 				return fmt.Errorf("execution: restored contributor has no configured live job: %s", id)
 			}
 			return nil
+		}
+		pending, err := s.store.LoadPendingBook(b.ctx)
+		if err != nil {
+			return err
+		}
+		for _, definition := range pending {
+			if err := check(definition.Instrument); err != nil {
+				return err
+			}
+			if err := checkStrategy(definition.Order.Strategy); err != nil {
+				return err
+			}
 		}
 		for _, lot := range snapshot.Lots {
 			if err := check(lot.Instrument); err != nil {
@@ -225,8 +246,18 @@ func (s *SharedAccount) accountRisk(ctx context.Context, request *CombinedRebala
 			strategies[a.Strategy] = true
 		}
 	}
+	// A historical descriptor with only zero targets is not exposure. Requiring
+	// its mark would let a dormant symbol block protection on active markets.
+	carried := make(map[string]bool)
+	for _, target := range latest.Targets {
+		if target.SignedSteps != 0 {
+			carried[target.Instrument] = true
+		}
+	}
 	for _, i := range latest.Instruments {
-		instruments[i.ID] = i
+		if carried[i.ID] {
+			instruments[i.ID] = i
+		}
 	}
 	for _, t := range latest.Targets {
 		strategies[t.Strategy] = true

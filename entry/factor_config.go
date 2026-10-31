@@ -241,48 +241,11 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 				c.Chunks[chunkIndex].Path = path
 			}
 		}
-		if store, ok := u.Execution["store"].(string); ok && store != "" {
-			path, err := spec.ResolvePath("execution.store")
-			if err != nil {
-				return nil, err
-			}
-			c.Execution.StorePath = path
-		}
-		executionFields := make(map[string]any, len(u.Execution))
-		for key, value := range u.Execution {
-			executionFields[key] = value
-		}
-		accountOverrides := u.AccountExecution[c.AccountID]
-		for key, value := range accountOverrides {
-			executionFields[key] = value
-		}
-		if funding, ok := executionFields["funding_policy"].(string); ok {
-			c.Manifest.Costs.FundingPolicy = funding
-		}
-		settings := make(map[string]any)
-		for key, value := range executionFields {
-			switch key {
-			case "store", "history", "sender_lease_dir", "live_provider", "funding_policy", "accounts", "mode":
-			default:
-				settings[key] = value
-			}
-		}
-		if err := decodeFactorFields(settings, &c.Execution); err != nil {
+		if err := applyAccountExecutionConfig(spec, c.AccountID, &c.Execution); err != nil {
 			return nil, err
 		}
-		for key, destination := range map[string]*string{"store": &c.Execution.StorePath, "history": &c.Execution.HistoryPath, "sender_lease_dir": &c.Execution.SenderLeaseDir} {
-			if _, exists := executionFields[key]; !exists {
-				continue
-			}
-			field := "execution." + key
-			if _, overridden := accountOverrides[key]; overridden {
-				field = "accounts." + c.AccountID + "." + key
-			}
-			path, err := spec.ResolvePath(field)
-			if err != nil {
-				return nil, err
-			}
-			*destination = path
+		if funding, ok := accountExecutionFields(u, c.AccountID)["funding_policy"].(string); ok {
+			c.Manifest.Costs.FundingPolicy = funding
 		}
 		if maxRecords, ok := u.Data["max_records"]; ok {
 			if err := decodeFactorFields(map[string]any{"MaxRecords": maxRecords}, &c); err != nil {

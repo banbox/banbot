@@ -16,6 +16,12 @@ import (
 // ingress. It must not reuse the previous provider's feeders or socket.
 type LiveProviderGenerationFactory func(context.Context, *SubscriptionPlan) (*LiveProvider, error)
 
+// LiveEnvironmentEndSink opts a managed strategy consumer into contract-roll
+// events. Factor-only consumers retain their existing grid-flush behavior.
+type LiveEnvironmentEndSink interface {
+	EnvironmentEnded(*orm.DataSeries) error
+}
+
 // SetGenerationFactory supports custom typed transports before installation.
 func (p *LiveProvider) SetGenerationFactory(factory LiveProviderGenerationFactory) error {
 	if p == nil || factory == nil || p.klineSubscriptionsSet {
@@ -146,9 +152,49 @@ func (p *LiveProvider) configureSubscriptionIngress(ctx context.Context, plan *S
 				installation.report(emitErr)
 			}
 		})
+		if _, handlesEnd := installation.sink.(LiveEnvironmentEndSink); handlesEnd {
+			endFeeder, ok := feeder.(interface{ bindSubscriptionEnvEnd(FuncEnvEnd) })
+			if !ok {
+				return nil, errs.NewMsg(core.ErrBadConfig, "managed environment end requires a SeriesFeeder")
+			}
+			endFeeder.bindSubscriptionEnvEnd(func(row *orm.DataSeries) {
+				if row == nil {
+					installation.report(fmt.Errorf("kline provider emitted nil environment end"))
+					return
+				}
+				copyRow := *row
+				copyRow.Source = orm.NormalizeSeriesSource(copyRow.Source)
+				key := orm.Subscription{Source: copyRow.Source, TimeFrame: copyRow.TimeFrame, ExSymbol: &orm.ExSymbol{ID: copyRow.Sid}}
+				sub := subscriptions[key.Key()]
+				if sub == nil || sub.ExSymbol.Symbol != pair || copyRow.ExSymbol != nil && *copyRow.ExSymbol != *sub.ExSymbol {
+					installation.report(fmt.Errorf("kline provider emitted an undeclared or foreign environment end"))
+					return
+				}
+				copyRow.ExSymbol = sub.ExSymbol
+				if err := installation.environmentEnded(&copyRow); err != nil {
+					installation.report(err)
+				}
+			})
+		}
 		return feeder, nil
 	}
 	return nil
+}
+
+func (s *SubscriptionInstallation) environmentEnded(row *orm.DataSeries) error {
+	s.mu.Lock()
+	if s.stopped || s.ctx.Err() != nil {
+		s.mu.Unlock()
+		return context.Canceled
+	}
+	if !s.active {
+		s.mu.Unlock()
+		return fmt.Errorf("environment end before subscription activation")
+	}
+	s.callbacks.Add(1)
+	s.mu.Unlock()
+	defer s.callbacks.Done()
+	return s.sink.(LiveEnvironmentEndSink).EnvironmentEnded(cloneStartupSeries([]*orm.DataSeries{row})[0])
 }
 
 func cloneStartupSeries(rows []*orm.DataSeries) []*orm.DataSeries {
@@ -178,6 +224,8 @@ func (f *SeriesFeeder) bindSubscriptionIngress(deps *RuntimeDeps, symbols *orm.S
 	// Live series dispatch already flushes each completed decision grid.
 	f.OnEnvEnd = func(*orm.DataSeries) {}
 }
+
+func (f *SeriesFeeder) bindSubscriptionEnvEnd(callback FuncEnvEnd) { f.OnEnvEnd = callback }
 
 // The revision mapper consumes the same typed projection as the final callback.
 // Enrich before revision admission, then reuse these rows through aggregation

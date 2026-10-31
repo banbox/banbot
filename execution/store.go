@@ -225,6 +225,27 @@ func (s *Store) SavePlan(ctx context.Context, plan Plan) error {
 		}
 		seen[intent.ID] = true
 	}
+	type conditionalKey struct {
+		strategy StrategyID
+		lot      VirtualLotID
+		kind     ProtectionKind
+	}
+	conditionalSeen := make(map[conditionalKey]bool)
+	for _, reservation := range plan.ConditionalIntents {
+		if err := reservation.Validate(); err != nil {
+			return err
+		}
+		intent := reservation.Intent
+		if intent.Account != s.key || seen[intent.ID] {
+			return errors.New("execution: duplicate or foreign conditional plan intent")
+		}
+		key := conditionalKey{intent.Strategy, intent.Lot, reservation.Condition.Kind}
+		if conditionalSeen[key] {
+			return errors.New("execution: duplicate conditional protection kind")
+		}
+		conditionalSeen[key] = true
+		seen[intent.ID] = true
+	}
 	body, err := payload(plan)
 	if err != nil {
 		return err
@@ -274,7 +295,11 @@ func (s *Store) SavePlan(ctx context.Context, plan Plan) error {
 		if _, err := tx.Exec(opInsertPlan, s.accountID, plan.ID, plan.Sequence, body); err != nil {
 			return err
 		}
-		for _, intent := range plan.Intents {
+		intents := append([]EligibleIntent(nil), plan.Intents...)
+		for _, reservation := range plan.ConditionalIntents {
+			intents = append(intents, reservation.Intent)
+		}
+		for _, intent := range intents {
 			definition := intent
 			definition.State = ""
 			definition.FilledSteps = 0
@@ -366,6 +391,9 @@ func (s *Store) PrepareOrder(ctx context.Context, order OrderIntent, nowMS int64
 		if err := json.Unmarshal([]byte(planBody), &plan); err != nil {
 			return err
 		}
+		if _, err := conditionalReservationFor(plan, order); err != nil {
+			return err
+		}
 		if nowMS < plan.DecisionMS || nowMS >= plan.ExpiresMS {
 			return errors.New("execution: plan outside validity")
 		}
@@ -387,6 +415,11 @@ func (s *Store) PrepareOrder(ctx context.Context, order OrderIntent, nowMS int64
 		if frozen {
 			return errors.New("execution: external/reconciliation risk freeze")
 		}
+		if order.Conditional != nil {
+			if err := s.validateConditionalSend(context.WithValue(ctx, storeTxContextKey{}, scopedStoreTx{s, tx}), order, plan); err != nil {
+				return err
+			}
+		}
 		newAllocation := make(map[VirtualIntentID]int64)
 		for _, a := range order.Allocations {
 			var intentBody string
@@ -403,7 +436,10 @@ func (s *Store) PrepareOrder(ctx context.Context, order OrderIntent, nowMS int64
 			if intent.Conditions.PostOnly && !order.PostOnly {
 				return errors.New("execution: frozen order drops contributor post-only condition")
 			}
-			available, err := intent.Evaluate(observation.Price, nowMS, observation.Bar)
+			if limit := intent.Conditions.Limit; limit.IsPositive() && (!order.Limit.IsPositive() || order.Side == Buy && order.Limit.GreaterThan(limit) || order.Side == Sell && order.Limit.LessThan(limit)) {
+				return errors.New("execution: frozen order drops contributor limit")
+			}
+			available, err := intent.AvailableForSubmission(observation.Price, nowMS, observation.Bar)
 			if err != nil {
 				return err
 			}

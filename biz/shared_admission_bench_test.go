@@ -105,7 +105,7 @@ func sharedAdmissionBenchmarkFixture(b *testing.B, ended int) (*SharedOrderMgr, 
 			Strategy: strategyName, Lot: lot, Instrument: instrument.ID, Kind: execution.EntryIntent,
 			Side: execution.Buy, QuantitySteps: 1, FilledSteps: 1, State: execution.Filled,
 		}
-		order := &sharedTSOrder{ID: id, StrategyName: strategyName, Strategy: strategyName, Lot: lot, Symbol: "BTC/USDT:USDT", SID: 1, TimeFrame: "1m", Entry: entry, CreatedMS: barMS - 60000, Request: strat.EnterReq{StratName: strategyName, Amount: 1}}
+		order := &sharedTSOrder{ID: id, StrategyName: strategyName, PendingOrder: execution.PendingOrder{Strategy: strategyName, Lot: lot, Entry: entry}, Symbol: "BTC/USDT:USDT", SID: 1, TimeFrame: "1m", CreatedMS: barMS - 60000, Request: strat.EnterReq{StratName: strategyName, Amount: 1}}
 		if i < 2 {
 			order.Desired = 1
 			snapshot.Lots = append(snapshot.Lots, execution.VirtualLot{Strategy: strategyName, ID: lot, Instrument: instrument, SignedSteps: 1})

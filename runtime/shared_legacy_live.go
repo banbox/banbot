@@ -95,9 +95,12 @@ func (r *Runtime) BindFactorLegacyJobs(jobs []*strat.StratJob, subs []*strat.Dat
 		r.Strategies.SetInfoJobMap(r.defaultAccount, key, jobs)
 	}
 	biz.InitLocalOrderMgrWithRuntimeDeps(r.BizDeps(), nil, false)
-	manager, ok := biz.GetOdMgrWithState(r.Trading, r.defaultAccount).(*biz.SharedOrderMgr)
+	manager, ok := biz.GetOdMgrWithState(r.Trading, r.defaultAccount).(interface{ BindJobs([]*strat.StratJob) error })
 	if !ok {
 		return errors.New("runtime: legacy shared facade unavailable")
+	}
+	if remote, ok := manager.(*biz.HubOrderMgr); ok && r.factorLegacyTrader == nil {
+		r.OnCloseWait(func() { _ = remote.CleanUp() })
 	}
 	if err := manager.BindJobs(jobs); err != nil {
 		return err

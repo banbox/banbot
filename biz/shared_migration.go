@@ -144,7 +144,7 @@ func legacyProjectionCheckpoint(account execution.AccountKey, request execution.
 		if state.Orders[key] != nil {
 			return nil, errors.New("biz: duplicate legacy source identity")
 		}
-		state.Orders[key] = &sharedTSOrder{ID: row.ID, StrategyName: row.Strategy, Strategy: binding.ID, Lot: mapping.Lot, Symbol: row.Symbol, SID: int32(row.Sid), TimeFrame: row.Timeframe, Request: req, Entry: entry, Desired: desired, Canceled: canceled, ExitTag: row.ExitTag, Protections: map[string]execution.EligibleIntent{}, ProtectionDone: map[string]bool{}}
+		state.Orders[key] = &sharedTSOrder{ID: row.ID, StrategyName: row.Strategy, PendingOrder: execution.PendingOrder{Strategy: binding.ID, Lot: mapping.Lot, Entry: entry, Desired: desired, Canceled: canceled, Protections: map[string]execution.EligibleIntent{}, ProtectionDone: map[string]bool{}}, Symbol: row.Symbol, SID: int32(row.Sid), TimeFrame: row.Timeframe, Request: req, ExitTag: row.ExitTag}
 		record := state.Orders[key]
 		initialEntrySteps := filled.IntPart()
 		record.SourceEntrySteps = &initialEntrySteps

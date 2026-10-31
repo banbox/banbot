@@ -105,6 +105,10 @@ func validatePlanReservation(snapshot AccountSnapshot, plan Plan, risk Portfolio
 		if order.State != OrderAcknowledged && order.State != OrderPartial {
 			continue
 		}
+		// A dormant reduce-only reservation cannot release carried risk early.
+		if order.Intent.Conditional != nil {
+			continue
+		}
 		remaining := order.Intent.Steps - order.FilledSteps
 		if order.Intent.Side == Sell {
 			remaining = -remaining

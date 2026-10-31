@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	utils2 "github.com/banbox/banexg/utils"
 )
@@ -98,6 +99,42 @@ func TestPhysicalKlineCollectorReportsCompleteRange(t *testing.T) {
 	_, _, count, missing, _, _ := collector.finish()
 	if count != 3 || len(missing) != 0 {
 		t.Fatalf("count=%d missing=%#v", count, missing)
+	}
+}
+
+func TestPhysicalKlineCollectorDetectsWholeMissingArchiveDay(t *testing.T) {
+	const minute = int64(time.Minute / time.Millisecond)
+	const day = 24 * 60 * minute
+	start := time.Date(2026, time.June, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	stop := start + 30*day
+	missingStart := start + 28*day
+	collector := newPhysicalKlineCollector(start, stop, minute)
+	for timestamp := start; timestamp < stop; timestamp += minute {
+		if timestamp >= missingStart && timestamp < missingStart+day {
+			continue
+		}
+		if err := collector.addRow(timestamp, 1, 2, 0.5, 1.5, 10, 15, 4, 3); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, last, count, missing, _, _ := collector.finish()
+	wantMissing := []PhysicalKlineGap{{StartMS: missingStart, StopMS: missingStart + day}}
+	if first != start || last != stop-minute || count != 29*24*60 || !reflect.DeepEqual(missing, wantMissing) {
+		t.Fatalf("summary=%d/%d/%d missing=%v, want missing=%v", first, last, count, missing, wantMissing)
+	}
+}
+
+func TestPhysicalKlineCollectorFlatZeroVolumeIsOnlyPhysicalCoverage(t *testing.T) {
+	collector := newPhysicalKlineCollector(0, 3*60_000, 60_000)
+	for timestamp := int64(0); timestamp < 3*60_000; timestamp += 60_000 {
+		if err := collector.addRow(timestamp, 10, 10, 10, 10, 0, 0, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _, count, missing, _, _ := collector.finish()
+	// Flat bars can be legitimate; physical completeness must not imply tradability.
+	if count != 3 || len(missing) != 0 {
+		t.Fatalf("count=%d missing=%v", count, missing)
 	}
 }
 

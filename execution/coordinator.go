@@ -137,6 +137,9 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 		if order.State != OrderAcknowledged && order.State != OrderPartial {
 			continue
 		}
+		if order.Intent.Conditional != nil {
+			continue
+		}
 		if order.Intent.Instrument.ID != instrument.ID {
 			continue
 		}

@@ -47,7 +47,7 @@ func terminalQuoteExempt(ctx context.Context, sink Sink, book *backtest.Book, si
 	if !ok {
 		return false, nil
 	}
-	done, err := account.Account.TerminalSettled(ctx, i)
+	done, err := account.application().TerminalSettled(ctx, i)
 	if err != nil || !done {
 		return false, err
 	}

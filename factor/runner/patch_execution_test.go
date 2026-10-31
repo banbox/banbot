@@ -90,7 +90,7 @@ func TestAccountPatchKeepsDriftedQuantityAndAbsoluteTarget(t *testing.T) {
 	}
 }
 
-func TestPaperLimitRejectsSlippageAndTickCrossingWithoutMutation(t *testing.T) {
+func TestPaperLimitRestsAcrossSlippageAndTickCrossingWithoutMutation(t *testing.T) {
 	for _, side := range []execution.OrderSide{execution.Buy, execution.Sell} {
 		for _, slip := range []string{"0.01", "0"} {
 			t.Run(string(side)+slip, func(t *testing.T) {
@@ -108,15 +108,26 @@ func TestPaperLimitRejectsSlippageAndTickCrossingWithoutMutation(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !r.Rejected || len(r.Fills) != 0 || a.Metrics().Fills != 0 {
-					t.Fatal("out-of-limit fill accepted")
+				if r.Rejected || r.ExchangeID == "" || len(r.Fills) != 0 || a.Metrics().Fills != 0 {
+					t.Fatal("nonmarketable limit must rest without an out-of-limit fill", r)
 				}
 				snap, err := a.Snapshot(context.Background())
 				if err != nil {
 					t.Fatal(err)
 				}
-				if snap.Cash != "1000" || len(snap.Positions) != 0 {
-					t.Fatalf("rejection mutated account: %+v", snap)
+				if snap.Cash != "1000" || len(snap.Positions) != 0 || len(snap.OpenOrders) != 1 {
+					t.Fatalf("resting limit mutated account or lost reservation: %+v", snap)
+				}
+				if slip == "0" {
+					bound := decimal.RequireFromString(limit)
+					ids, err := a.AdvanceQuote(context.Background(), "i", execution.VisibleQuote{Bid: bound, Ask: bound, AtMS: 12, ReceivedMS: 12, ValidUntilMS: 100}, 12)
+					if err != nil || len(ids) != 0 || a.Metrics().Fills != 0 {
+						t.Fatalf("fractional-bound quote filled before executable tick: ids=%v metrics=%+v err=%v", ids, a.Metrics(), err)
+					}
+					retry, err := a.Submit(context.Background(), o, "c")
+					if err != nil || retry.Rejected || len(retry.Fills) != 0 {
+						t.Fatalf("resting-price rounding changed original submission identity: %+v %v", retry, err)
+					}
 				}
 				// A wider limit accepts the same tick-rounded price and charges fees.
 				fillPrice := decimal.NewFromInt(101)
@@ -124,6 +135,7 @@ func TestPaperLimitRejectsSlippageAndTickCrossingWithoutMutation(t *testing.T) {
 					fillPrice = decimal.NewFromInt(99)
 				}
 				o.Limit = fillPrice
+				o.ID = "wider-limit"
 				r, err = a.Submit(context.Background(), o, "accepted")
 				if err != nil || r.Rejected || len(r.Fills) != 1 {
 					t.Fatalf("valid limit rejected: %+v %v", r, err)
@@ -132,12 +144,21 @@ func TestPaperLimitRejectsSlippageAndTickCrossingWithoutMutation(t *testing.T) {
 				if !r.Fills[0].Price.Equal(fillPrice) || !r.Fills[0].Fee.Equal(fee) {
 					t.Fatalf("tick/fee changed: %+v", r.Fills[0])
 				}
+				visible := decimal.NewFromInt(100)
+				ids, err := a.AdvanceQuote(context.Background(), "i", execution.VisibleQuote{Bid: visible, Ask: visible, AtMS: 13, ReceivedMS: 13, ValidUntilMS: 100}, 13)
+				if err != nil || len(ids) != 1 || ids[0] != "o" {
+					t.Fatalf("later limit-touch quote did not fill original resting order: %v %v", ids, err)
+				}
+				final, err := a.Query(context.Background(), "c", "paper:o")
+				if err != nil || final.Receipt.Rejected || len(final.Receipt.Fills) != 1 || !final.Receipt.Fills[0].Price.Equal(visible) || a.Metrics().Fills != 2 {
+					t.Fatalf("resting order did not fill at its bound: %+v %v", final, err)
+				}
 			})
 		}
 	}
 }
 
-func TestPaperLimitRejectionPersistsWithoutLedgerFill(t *testing.T) {
+func TestPaperLimitRestingAndCancellationPersistWithoutLedgerFill(t *testing.T) {
 	ctx := context.Background()
 	key := execution.AccountKey{VenueSessionIdentity: "paper-limit", Account: "a", SettlementDomain: "USD"}
 	store, err := execution.OpenStore(filepath.Join(t.TempDir(), "ledger.db"), key)
@@ -170,7 +191,7 @@ func TestPaperLimitRejectionPersistsWithoutLedgerFill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != execution.OrderRejected || stored.FilledSteps != 0 || !stored.ReportedFee.IsZero() {
+	if stored.State != execution.OrderAcknowledged || stored.FilledSteps != 0 || !stored.ReportedFee.IsZero() {
 		t.Fatalf("phantom fill: %+v", stored)
 	}
 	snap, err := store.Snapshot(ctx)
@@ -178,6 +199,71 @@ func TestPaperLimitRejectionPersistsWithoutLedgerFill(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(snap.Lots) != 0 || len(snap.ActualPositions) != 0 || !snap.AccountSettledCash.IsZero() || a.Metrics().Fills != 0 {
-		t.Fatalf("rejected order posted ledger fill: %+v", snap)
+		t.Fatalf("resting order posted ledger fill: %+v", snap)
+	}
+	if err := owner.Cancel(order.ID, 12); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = store.Order(ctx, order.ID)
+	if err != nil || stored.State != execution.OrderCanceled || stored.FilledSteps != 0 || !stored.ReportedFee.IsZero() {
+		t.Fatalf("resting limit cancellation did not persist without fills: %+v %v", stored, err)
+	}
+	snap, err = store.Snapshot(ctx)
+	if err != nil || len(snap.Orders) != 0 || len(snap.Lots) != 0 || len(snap.ActualPositions) != 0 || !snap.AccountSettledCash.IsZero() || a.Metrics().Fills != 0 {
+		t.Fatalf("canceled resting limit posted phantom ledger fill: %+v %v", snap, err)
+	}
+}
+
+func TestPaperRestingLimitRoundsHighPrecisionBoundsExactly(t *testing.T) {
+	for _, test := range []struct {
+		name, limit, executable string
+		side                    execution.OrderSide
+	}{
+		{"buy-below-first-tick", "0.999999999999999999", "0", execution.Buy},
+		{"buy-below-second-tick", "1.999999999999999999", "1", execution.Buy},
+		{"sell-above-first-tick", "1.000000000000000001", "2", execution.Sell},
+		{"sell-above-second-tick", "2.000000000000000001", "3", execution.Sell},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			adapter, err := NewPaperAdapter(decimal.NewFromInt(1000), decimal.Zero, decimal.Zero)
+			if err != nil {
+				t.Fatal(err)
+			}
+			price := decimal.NewFromInt(3)
+			if test.side == execution.Sell {
+				price = decimal.NewFromInt(1)
+			}
+			bound := decimal.RequireFromString(test.limit)
+			order := execution.OrderIntent{ID: "precision", Instrument: execution.Instrument{ID: "i", Version: "v1", Valuation: "linear_perpetual", SettlementCurrency: "USD", QuantityStep: decimal.NewFromInt(1), ContractSize: decimal.NewFromInt(1), PriceTick: decimal.NewFromInt(1), MoneyScale: 8}, Side: test.side, Steps: 1, Limit: bound, Observation: execution.ExecutionObservation{Price: price, AtMS: 10}, SubmitAtMS: 10}
+			receipt, err := adapter.Submit(ctx, order, "precision-client")
+			if err != nil || receipt.Rejected || len(receipt.Fills) != 0 {
+				t.Fatalf("limit did not rest: %+v %v", receipt, err)
+			}
+			ids, err := adapter.AdvanceQuote(ctx, "i", execution.VisibleQuote{Bid: bound, Ask: bound, AtMS: 11, ReceivedMS: 11, ValidUntilMS: 100}, 11)
+			if err != nil || len(ids) != 0 {
+				t.Fatalf("fractional boundary filled before inward tick: %v %v", ids, err)
+			}
+			snapshot, err := adapter.Snapshot(ctx)
+			if err != nil || snapshot.Cash != "1000" || len(snapshot.Positions) != 0 || len(snapshot.OpenOrders) != 1 || adapter.Metrics().Fills != 0 {
+				t.Fatalf("fractional boundary mutated venue: %+v metrics=%+v err=%v", snapshot, adapter.Metrics(), err)
+			}
+			executable := decimal.RequireFromString(test.executable)
+			if !executable.IsPositive() {
+				ids, err = adapter.AdvanceQuote(ctx, "i", execution.VisibleQuote{Bid: decimal.NewFromInt(1), Ask: decimal.NewFromInt(1), AtMS: 12, ReceivedMS: 12, ValidUntilMS: 100}, 12)
+				if err != nil || len(ids) != 0 || adapter.Metrics().Fills != 0 {
+					t.Fatal("sub-tick buy limit executed above original bound", ids, err)
+				}
+				return
+			}
+			ids, err = adapter.AdvanceQuote(ctx, "i", execution.VisibleQuote{Bid: executable, Ask: executable, AtMS: 12, ReceivedMS: 12, ValidUntilMS: 100}, 12)
+			if err != nil || len(ids) != 1 || ids[0] != order.ID {
+				t.Fatal("inward executable tick did not fill", ids, err)
+			}
+			result, err := adapter.Query(ctx, "precision-client", receipt.ExchangeID)
+			if err != nil || len(result.Receipt.Fills) != 1 || !result.Receipt.Fills[0].Price.Equal(executable) {
+				t.Fatalf("fill lost exact inward tick: %+v %v", result, err)
+			}
+		})
 	}
 }

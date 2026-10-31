@@ -49,7 +49,8 @@ type Plan struct {
 	DecisionMS             int64
 	ExpiresMS              int64
 	Intents                []EligibleIntent
-	Targets                []ExecutableTarget // complete account-combined executable view
+	ConditionalIntents     []ConditionalReservation // dormant venue reductions, never locally crossed
+	Targets                []ExecutableTarget       // complete account-combined executable view
 	RequestHash            string
 	CarriedIntents         []EligibleIntent
 	CarriedTargets         []ExecutableTarget // frozen untouched membership; never initiates execution
@@ -83,6 +84,7 @@ type OrderIntent struct {
 	RequiresFilled []string       // preceding decrease legs, never bypassed by Send
 	Risk           *PortfolioRisk // coordinated plans freeze bounded quote/risk reservations
 	Allocations    []FillAllocation
+	Conditional    *ConditionalOrder `json:",omitempty"`
 }
 
 type ExecutionObservation struct {

@@ -94,7 +94,7 @@ func TestRuntimeDepsDataProjectionRetainsAllDataDependencies(t *testing.T) {
 	wantRuntimeFields := []string{
 		// Shared execution/legacy bridge are account services. Data providers
 		// receive market/clock/callback dependencies, never trading authority.
-		"SharedExecution", "SharedOrderBridge",
+		"HubOrderBridge", "SharedExecution", "SharedOrderBridge",
 		"Core", "Clock", "Market", "Batch", "Strategies", "Orders", "Trading", "Config", "Accounts",
 		"AccountsMu", "Symbols", "Catalog", "Callbacks", "Storage", "Exchange", "Scheduler", "Notifications",
 		"Dump", "DefaultAccount",
@@ -123,7 +123,8 @@ func TestRuntimeDepsDataProjectionRetainsAllDataDependencies(t *testing.T) {
 	callbacks := runtimeDepsCallbackStub{}
 	exchange := &banexg.Exchange{}
 	deps := RuntimeDeps{
-		Core: coreState, Clock: clock, Config: snapshot, Market: market, Symbols: symbols,
+		HubOrderBridge: &HubOrderBridgeConfig{},
+		Core:           coreState, Clock: clock, Config: snapshot, Market: market, Symbols: symbols,
 		Storage: storage, Strategies: strategies, Catalog: catalog, Dump: dump, Callbacks: callbacks,
 		Exchange: exchange,
 	}

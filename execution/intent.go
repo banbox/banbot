@@ -70,6 +70,7 @@ type EligibleIntent struct {
 	Triggered      bool
 	TrailingActive bool
 	TrailingAnchor decimal.Decimal
+	VenueLimit     *OrderPolicy `json:",omitempty"` // submission permission; never changes internal matching
 }
 
 func (i *EligibleIntent) Validate() error {

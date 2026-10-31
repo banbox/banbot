@@ -53,7 +53,17 @@ func (s *explicitEntrySession) prepareMixedLiveBinding(snapshot *config.Snapshot
 	if len(policies) == 0 {
 		return capital, nil
 	}
+	u := s.runSpec.Config()
+	if u.Root.Env == core.RunEnvProd {
+		account := u.Root.Accounts[c.AccountID]
+		if len(u.Root.FatalStop) > 0 || u.Root.Leverage > 0 || account != nil && account.Leverage > 0 {
+			return nil, fmt.Errorf("mixed live: account %s legacy fatal_stop and dynamic leverage require ledger-native migration", c.AccountID)
+		}
+	}
 	if binding.Legacy != nil {
+		if binding.Legacy.Bridge != nil {
+			binding.Legacy.Bridge.OrderPolicy = execution.OrderPolicy{Mode: c.Execution.OrderMode, NearLimitBPS: c.Execution.NearLimitBPS, ProtectionMode: c.Execution.ProtectionMode}
+		}
 		if binding.Legacy.automatic {
 			return binding.Legacy.capital, nil
 		}
@@ -89,6 +99,7 @@ func (s *explicitEntrySession) prepareMixedLiveBinding(snapshot *config.Snapshot
 	}
 	e := c.Execution
 	bridge := &biz.SharedOrderBridgeConfig{Version: "v1", Instruments: map[string]execution.Instrument{}, Strategies: map[string]biz.SharedStrategyBinding{}, IntentTTLMS: c.ExpiryMS, Risk: execution.PortfolioRisk{MarginRate: e.MarginRate, MaxAccountMargin: e.MaxAccountMargin, MaxVirtualGross: e.MaxVirtualGross, StrategyGrossLimits: map[execution.StrategyID]decimal.Decimal{}}}
+	bridge.OrderPolicy = execution.OrderPolicy{Mode: e.OrderMode, NearLimitBPS: e.NearLimitBPS, ProtectionMode: e.ProtectionMode}
 	for _, unit := range e.Instruments {
 		bridge.Instruments[unit.ID] = unit
 	}
@@ -129,7 +140,6 @@ func (s *explicitEntrySession) prepareMixedLiveBinding(snapshot *config.Snapshot
 			binding.AccountInstruments = append(binding.AccountInstruments, execution.BanexgInstrument{Symbol: pair, Instrument: unit})
 		}
 	}
-	u := s.runSpec.Config()
 	for _, p := range u.RunPolicy {
 		if p.Engine != config.EngineTimeSeries || !mixedLivePolicyAccount(u, p, c.AccountID) {
 			continue
@@ -195,6 +205,31 @@ func loadMixedLiveJobs(rt *runtimepkg.Runtime, binding *FactorLiveBinding) error
 func (s *explicitEntrySession) runMixedLiveTSAccount(ctx context.Context, snapshot *config.Snapshot, account string, startup live.CryptoTraderStartupFunc) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if snapshot.View().Env == core.RunEnvProd {
+		configs, err := buildTimeSeriesLiveConfigs(s.runSpec)
+		if err != nil {
+			return err
+		}
+		c, exists := configs[account]
+		if !exists {
+			return fmt.Errorf("time-series execution: account %s has no explicit strategy binding", account)
+		}
+		factories, err := resolveFactorLiveFactories(s.runSpec, []string{account}, "")
+		if err != nil {
+			return err
+		}
+		binding, err := factories[account](ctx, s.exchange, snapshot, c)
+		if binding.Close != nil {
+			defer binding.Close()
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := s.prepareMixedLiveBinding(snapshot, c, &binding); err != nil {
+			return err
+		}
+		return s.runTimeSeriesExecutionAccount(ctx, snapshot, c, binding, startup)
 	}
 	cfg := mixedLiveAccountConfig(snapshot.View(), account, mixedLivePolicies(s.runSpec, account))
 	scoped := config.NewSnapshotWithDirs(cfg, snapshot.DataDir, snapshot.StrategyDir, snapshot.Location())

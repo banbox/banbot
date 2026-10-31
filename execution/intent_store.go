@@ -67,6 +67,16 @@ type StrategyAcceptedEvent struct {
 	Kind      IntentKind
 	CommandID string
 	AtMS      int64
+	Metadata  *TimeSeriesMetadata `json:",omitempty"`
+}
+
+// SaveProjectionMetadata atomically persists a projection's compact index and
+// point-readable records. Projection recovery must not create trading events.
+func (s *Store) SaveProjectionMetadata(ctx context.Context, checkpoint StrategyCheckpoint) error {
+	if len(checkpoint.Events) != 0 {
+		return errors.New("execution: projection metadata cannot accept trading events")
+	}
+	return s.saveAcceptedCheckpoint(ctx, checkpoint)
 }
 
 func (s *Store) saveAcceptedCheckpoint(ctx context.Context, checkpoint StrategyCheckpoint) error {

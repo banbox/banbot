@@ -161,21 +161,25 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 			}
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
-			reconcile := func() bool {
+			reconcile := func(reason string) bool {
 				if err := borrow.RefreshWorkingOrders(ctx, time.Now().UnixMilli()); err != nil {
-					fail("private-periodic-recovery", err, time.Now().UnixMilli())
+					fail(reason+"-recovery", err, time.Now().UnixMilli())
 					return false
 				}
 				if recovery, ok := service.opts.Adapter.(interface {
 					RecoverCash(context.Context, *SharedAccountBorrow) error
 				}); ok {
 					if err := recovery.RecoverCash(ctx, borrow); err != nil {
-						fail("private-periodic-funding", err, time.Now().UnixMilli())
+						fail(reason+"-funding", err, time.Now().UnixMilli())
 						return false
 					}
 				}
-				if err := borrow.Reconcile(fmt.Sprintf("private-periodic-reconcile/%d", time.Now().UnixMilli()), time.Now().UnixMilli()); err != nil {
-					fail("private-periodic-reconcile", err, time.Now().UnixMilli())
+				if err := borrow.Reconcile(fmt.Sprintf(reason+"-reconcile/%d", time.Now().UnixMilli()), time.Now().UnixMilli()); err != nil {
+					fail(reason+"-reconcile", err, time.Now().UnixMilli())
+					return false
+				}
+				if err := borrow.AdvancePendingExecution(ctx, time.Now().UnixMilli()); err != nil {
+					fail(reason+"-pending-execution", err, time.Now().UnixMilli())
 					return false
 				}
 				service.notifyCommitted()
@@ -189,7 +193,7 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 					service.joinReportSource(stream)
 					return
 				case <-ticker.C:
-					if !reconcile() {
+					if !reconcile("private-periodic") {
 						cancel()
 						service.joinReportSource(stream)
 						return
@@ -202,7 +206,21 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 						return
 					}
 					now := time.Now().UnixMilli()
-					if report.Err != nil || report.UnassignedExchangeID != "" || report.OrderID == "" {
+					if report.ExternalOrder != nil {
+						if err := borrow.RecoverExternalReport(ctx, report); err != nil {
+							fail("private-external/"+report.UnassignedExchangeID, err, now)
+						} else if err := borrow.Reconcile(fmt.Sprintf("private-external-reconcile/%s/%d", report.UnassignedExchangeID, now), now); err != nil {
+							fail("private-external-reconcile/"+report.UnassignedExchangeID, err, now)
+						} else if err := borrow.AdvancePendingExecution(ctx, time.Now().UnixMilli()); err != nil {
+							fail("private-external-pending/"+report.UnassignedExchangeID, err, time.Now().UnixMilli())
+						}
+					} else if report.AccountChanged && report.Err == nil && report.UnassignedExchangeID == "" && report.OrderID == "" {
+						if !reconcile("private-account") {
+							cancel()
+							service.joinReportSource(stream)
+							return
+						}
+					} else if report.Err != nil || report.UnassignedExchangeID != "" || report.OrderID == "" {
 						fail("private-report/"+report.UnassignedExchangeID, errors.Join(report.Err, errors.New("execution: unassigned private account report")), now)
 					} else {
 						if err := borrow.Recover(report.OrderID); err != nil {
@@ -218,6 +236,8 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 							}
 							if err := borrow.Reconcile(fmt.Sprintf("private-reconcile/%s/%d", report.OrderID, now), now); err != nil {
 								fail("private-reconcile-error/"+report.OrderID, err, now)
+							} else if err := borrow.AdvancePendingExecution(ctx, time.Now().UnixMilli()); err != nil {
+								fail("private-pending-execution/"+report.OrderID, err, time.Now().UnixMilli())
 							}
 						}
 					}
@@ -296,7 +316,8 @@ func (b *SharedAccountBorrow) Freeze(id string, now int64) error {
 }
 
 // ApplyExternalPosition is the explicit manual/forced trade path. Attribution
-// remains unassigned; liquidation never guesses an affected strategy by symbol.
+// remains unassigned unless configured takeover proves its opening history;
+// liquidation never guesses an affected strategy by symbol.
 func (b *SharedAccountBorrow) ApplyExternalPosition(event ExternalPositionEvent) (bool, error) {
 	var applied bool
 	err := b.use(func(s *SharedAccount) error {
@@ -304,6 +325,9 @@ func (b *SharedAccountBorrow) ApplyExternalPosition(event ExternalPositionEvent)
 		return s.owner.DoLocal(s.owner.Token(), func(ctx context.Context) error {
 			var err error
 			applied, err = s.store.ApplyExternalPosition(ctx, event)
+			if err == nil && s.opts.TakeoverStrategy != "" {
+				_, err = s.store.AutoTakeoverExternal(ctx, s.opts.TakeoverStrategy, event.AtMS)
+			}
 			return err
 		})
 	})
@@ -349,6 +373,12 @@ func fundingActivityInstrument(ctx context.Context, store *Store, event Committe
 			return instrument, err
 		}
 		instrument = expiry.Instrument
+	case "ExternalAttribution":
+		var attribution ExternalAttribution
+		if err := json.Unmarshal(event.Payload, &attribution); err != nil {
+			return instrument, err
+		}
+		instrument = attribution.Instrument
 	case string(ExternalCashChange), string(Liquidation):
 		var external ExternalPositionEvent
 		if err := json.Unmarshal(event.Payload, &external); err != nil {

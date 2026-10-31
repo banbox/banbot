@@ -90,6 +90,17 @@ func NewLive(c Config, sink Sink, clock func() int64, out Output) (*Live, error)
 }
 func (l *Live) Inputs() []factor.InputSpec { return l.engine.plan.Inputs() }
 
+// ExecutionOwnsFunding separates account settlement from model inputs. A hub
+// strategy may still explicitly subscribe to funding data in its factor DAG.
+func (l *Live) ExecutionOwnsFunding() bool {
+	account, ok := l.sink.(*AccountSink)
+	if !ok {
+		return false
+	}
+	owner, ok := account.Application.(interface{ ExecutionOwnsFunding() bool })
+	return ok && owner.ExecutionOwnsFunding()
+}
+
 // SharesComputation reports actual mutable session aliasing, rather than
 // rejecting unrelated sessions that happen to use the same group container.
 func (l *Live) SharesComputation(other *Live) bool {
@@ -367,7 +378,7 @@ func (l *Live) Observe(ctx context.Context, r factor.VersionRecord) error {
 		l.mu.Unlock()
 		return errors.New("runner: live record not observable")
 	}
-	isFunding := r.Series.Source == l.c.FundingSource && l.c.Manifest.Costs.FundingPolicy == "required-stream" && l.HasFundingSID(r.Series.Sid)
+	isFunding := !l.ExecutionOwnsFunding() && r.Series.Source == l.c.FundingSource && l.c.Manifest.Costs.FundingPolicy == "required-stream" && l.HasFundingSID(r.Series.Sid)
 	if !l.HasSID(r.Series.Sid) && !isFunding {
 		l.mu.Unlock()
 		return errors.New("runner: undeclared live SID")

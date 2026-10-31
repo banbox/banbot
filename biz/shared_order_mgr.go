@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -35,18 +36,23 @@ type SharedStrategyBinding struct {
 // SharedOrderBridgeConfig fixes strategy attribution and instrument units.
 // Quote must return an actually visible bid/ask, not an OHLC future range.
 type SharedOrderBridgeConfig struct {
-	Version      string
-	Instruments  map[string]execution.Instrument
-	Strategies   map[string]SharedStrategyBinding
-	Risk         execution.PortfolioRisk
-	Quote        func(string, int64) (execution.VisibleQuote, error)
-	QuoteContext func(context.Context, string, int64) (execution.VisibleQuote, error)
-	IntentTTLMS  int64
+	OrderPolicy       execution.OrderPolicy
+	DefaultLimitPrice func(context.Context, string, execution.OrderSide, int) (float64, error)
+	Version           string
+	Instruments       map[string]execution.Instrument
+	Strategies        map[string]SharedStrategyBinding
+	Risk              execution.PortfolioRisk
+	Quote             func(string, int64) (execution.VisibleQuote, error)
+	QuoteContext      func(context.Context, string, int64) (execution.VisibleQuote, error)
+	IntentTTLMS       int64
 }
 
 func (c *SharedOrderBridgeConfig) Validate() error {
 	if c == nil || c.Version == "" || len(c.Instruments) == 0 || len(c.Strategies) == 0 || c.Quote == nil && c.QuoteContext == nil || c.IntentTTLMS <= 0 {
 		return errors.New("biz: incomplete shared legacy bridge declaration")
+	}
+	if err := c.OrderPolicy.Validate(); err != nil {
+		return err
 	}
 	seen := map[execution.StrategyID]bool{}
 	for name, b := range c.Strategies {
@@ -75,31 +81,21 @@ func (c *SharedOrderBridgeConfig) Validate() error {
 }
 
 type sharedTSOrder struct {
+	execution.PendingOrder
 	ID               int64
 	StrategyName     string
-	Strategy         execution.StrategyID
-	Lot              execution.VirtualLotID
 	Symbol           string
 	SID              int32
 	TimeFrame        string
 	Request          strat.EnterReq
-	Entry            execution.EligibleIntent
-	Exit             *execution.EligibleIntent
-	ResumeEntrySteps int64
 	SourceTaskID     int64
 	SourceEntrySteps *int64 `json:",omitempty"`
 	SourceInfo       map[string]any
 	SourceExit       *ormo.ExOrder
 	SourceLotFees    decimal.Decimal
-	NativeExitOrders []string
 	CreatedMS        int64
 	InitPrice        float64
-	Desired          int64
-	Canceled         bool
 	ExitTag          string
-	Protections      map[string]execution.EligibleIntent
-	ProtectionLevels map[string]decimal.Decimal
-	ProtectionDone   map[string]bool
 	FeedExpiry       bool
 	CreatedFeedBar   int64
 }
@@ -115,6 +111,13 @@ type sharedTSCheckpoint struct {
 	Accepted       []execution.StrategyAcceptedEvent `json:"-"`
 	store          *execution.Store
 	ctx            context.Context
+	pendingOrders  map[sharedPendingKey]execution.PendingOrder
+	carriedPending map[sharedPendingKey]execution.PendingDefinition
+}
+
+type sharedPendingKey struct {
+	Strategy execution.StrategyID
+	Lot      execution.VirtualLotID
 }
 
 type sharedTSCommand struct {
@@ -174,6 +177,14 @@ type sharedJobIdentity struct{ Strategy, Symbol, TimeFrame string }
 
 func sharedFeedKey(sid int32, tf string) string { return fmt.Sprintf("%d/%s", sid, tf) }
 
+func sharedProtectionSpecs(req strat.EnterReq) []execution.PositionProtection {
+	return []execution.PositionProtection{
+		{Kind: execution.StopLossProtection, Level: decimal.NewFromFloat(req.StopLoss), Distance: decimal.NewFromFloat(req.StopLossVal), Limit: decimal.NewFromFloat(req.StopLossLimit), Rate: decimal.NewFromFloat(req.StopLossRate)},
+		{Kind: execution.TakeProfitProtection, Level: decimal.NewFromFloat(req.TakeProfit), Distance: decimal.NewFromFloat(req.TakeProfitVal), Limit: decimal.NewFromFloat(req.TakeProfitLimit), Rate: decimal.NewFromFloat(req.TakeProfitRate)},
+		{Kind: execution.TrailingProtection, TrailingPercent: decimal.NewFromFloat(req.CallbackPct), ActivationPrice: decimal.NewFromFloat(req.ActivationPrice)},
+	}
+}
+
 // SharedOrderMgr implements the existing request facade without inheriting a
 // Local/LiveOrderMgr network path. All fills and cash remain in SharedAccount.
 type SharedOrderMgr struct {
@@ -195,7 +206,45 @@ func NewSharedOrderMgr(deps RuntimeDeps, account *SharedAccountBorrow, config *S
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	return &SharedOrderMgr{deps: deps, account: account, config: config, callback: callback, jobs: map[sharedJobIdentity]*strat.StratJob{}}, nil
+	manager := &SharedOrderMgr{deps: deps, account: account, config: config, callback: callback, jobs: map[sharedJobIdentity]*strat.StratJob{}}
+	if err := account.WithState(func(s *SharedAccount) error {
+		state, err := loadSharedCheckpoint(s.Store(), account.Context(), config.Version)
+		if err != nil {
+			return err
+		}
+		if len(state.Orders) == 0 {
+			return nil
+		}
+		definitions, err := manager.pendingDefinitions(&state)
+		if err != nil {
+			return err
+		}
+		feeds := make(map[execution.PendingFeedID]execution.PendingFeedProgress, len(state.Feeds))
+		for id, progress := range state.Feeds {
+			feeds[execution.PendingFeedID(id)] = execution.PendingFeedProgress{EndMS: progress.EndMS, Bars: progress.Bars}
+		}
+		legacy := make(map[sharedPendingKey]*sharedTSOrder, len(state.Orders))
+		for _, old := range state.Orders {
+			legacy[sharedPendingKey{old.Strategy, old.Lot}] = old
+		}
+		var bindings []execution.LegacyPendingFeedBinding
+		for n := range definitions {
+			order := &definitions[n].Order
+			old := legacy[sharedPendingKey{order.Strategy, order.Lot}]
+			if old == nil || !old.FeedExpiry || old.Request.StopBars <= 0 || order.EntryFeedExpiry != nil {
+				continue
+			}
+			if old.CreatedFeedBar < 0 || old.CreatedFeedBar > math.MaxInt64-int64(old.Request.StopBars) {
+				return errors.New("biz: invalid legacy entry feed deadline")
+			}
+			bindings = append(bindings, execution.LegacyPendingFeedBinding{Strategy: order.Strategy, Lot: order.Lot,
+				Expiry: execution.PendingFeedExpiry{Feed: execution.PendingFeedID(sharedFeedKey(old.SID, old.TimeFrame)), ExpiresAtBar: old.CreatedFeedBar + int64(old.Request.StopBars)}})
+		}
+		return s.SeedPendingBookWithFeeds(account.Context(), definitions, feeds, bindings)
+	}); err != nil {
+		return nil, err
+	}
+	return manager, nil
 }
 
 // BindJobs restores projections into configured jobs without trading or replaying
@@ -279,6 +328,9 @@ func (m *SharedOrderMgr) mutate(change func(*SharedAccount, *sharedTSCheckpoint,
 		if err != nil {
 			return err
 		}
+		if err := m.restoreTakeovers(m.account.Context(), s.Store(), &state, snapshot); err != nil {
+			return err
+		}
 		state.Serial++
 		if err := change(s, &state, snapshot, now, state.Serial); err != nil {
 			if errors.Is(err, errSharedCommandReplay) {
@@ -312,6 +364,11 @@ func (m *SharedOrderMgr) mutate(change func(*SharedAccount, *sharedTSCheckpoint,
 						owned.Targets = append(owned.Targets, target)
 					}
 				}
+				for _, reservation := range r.ConditionalReservations {
+					if reservation.Intent.Strategy == binding.ID {
+						owned.ConditionalReservations = append(owned.ConditionalReservations, reservation)
+					}
+				}
 				for _, intent := range r.IntentConstraints {
 					if intent.Strategy == binding.ID {
 						owned.IntentConstraints = append(owned.IntentConstraints, intent)
@@ -323,7 +380,15 @@ func (m *SharedOrderMgr) mutate(change func(*SharedAccount, *sharedTSCheckpoint,
 			}
 			updates = append(updates, update)
 		}
-		prepared, err := s.PrepareStrategiesWithCheckpoint(updates, m.account.Context(), &checkpoint)
+		definitions, err := m.pendingDefinitions(&state)
+		if err != nil {
+			return err
+		}
+		pendingCheckpoint, err := execution.PendingBookCheckpoint(definitions)
+		if err != nil {
+			return err
+		}
+		prepared, err := s.PrepareStrategiesWithCheckpoints(updates, m.account.Context(), []execution.StrategyCheckpoint{checkpoint, pendingCheckpoint})
 		if err != nil {
 			return err
 		}
@@ -378,6 +443,12 @@ func (m *SharedOrderMgr) EnterOrder(exs *orm.ExSymbol, tf string, req *strat.Ent
 func (m *SharedOrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq, sourceInfo map[string]any, relay bool) (*ormo.InOutOrder, *errs.Error) {
 	if exs == nil || req == nil {
 		return nil, sharedBridgeError(errors.New("biz: missing shared entry symbol/request"))
+	}
+	if m.deps.Core != nil && m.deps.Core.EnvReal {
+		defaults := makeRuntimeOrderConfig(m.deps, m.deps.DefaultAccount)
+		if req.Leverage != 0 || defaults.accountLeverage != 0 {
+			return nil, sharedBridgeError(errors.New("biz: live execution does not support requested leverage changes"))
+		}
 	}
 	instrument, ok := m.config.Instruments[exs.Symbol]
 	if !ok {
@@ -446,6 +517,20 @@ func (m *SharedOrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.Ent
 			if copy.Short {
 				price = q.Ask
 			}
+			if !relay && m.config.DefaultLimitPrice != nil {
+				side := execution.Buy
+				if copy.Short {
+					side = execution.Sell
+				}
+				value, err := s.ReadLimitPrice(m.account.Context(), m.config.DefaultLimitPrice, instrument.ID, side, defaults.limitVolSecs)
+				if err != nil {
+					return err
+				}
+				if value <= 0 {
+					return errors.New("biz: execution default limit price unavailable")
+				}
+				price = decimal.NewFromFloat(value)
+			}
 			copy.Limit = price.InexactFloat64()
 		}
 		if !relay && copy.Limit > 0 && copy.StopBars == 0 {
@@ -459,11 +544,12 @@ func (m *SharedOrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.Ent
 		if err != nil {
 			return err
 		}
-		state.Orders[sharedOrderKey(binding.ID, id)] = &sharedTSOrder{ID: id, StrategyName: name, Strategy: binding.ID, Lot: lot, Symbol: exs.Symbol, SID: exs.ID, TimeFrame: tf, Request: bridge.Original, Entry: bridge.Intent, Protections: map[string]execution.EligibleIntent{}, ProtectionDone: map[string]bool{}}
+		state.Orders[sharedOrderKey(binding.ID, id)] = &sharedTSOrder{ID: id, StrategyName: name, PendingOrder: execution.PendingOrder{Strategy: binding.ID, Lot: lot, Entry: bridge.Intent, Protections: map[string]execution.EligibleIntent{}, ProtectionDone: map[string]bool{}}, Symbol: exs.Symbol, SID: exs.ID, TimeFrame: tf, Request: bridge.Original}
 		record := state.Orders[sharedOrderKey(binding.ID, id)]
 		if q.Bar == 0 && copy.StopBars > 0 {
-			record.FeedExpiry = true
-			record.CreatedFeedBar = state.Feeds[sharedFeedKey(exs.ID, tf)].Bars
+			if err := s.BindPendingFeedExpiry(m.account.Context(), &record.PendingOrder, execution.PendingFeedID(sharedFeedKey(exs.ID, tf)), int64(copy.StopBars)); err != nil {
+				return err
+			}
 		}
 		record.CreatedMS, record.InitPrice = c.NowMS, q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2)).InexactFloat64()
 		record.SourceInfo = map[string]any{}
@@ -730,6 +816,20 @@ func (m *SharedOrderMgr) exitOpenOrders(pairs string, req *strat.ExitReq, timefr
 					if od.Request.Short {
 						price = q.Bid
 					}
+					if m.config.DefaultLimitPrice != nil {
+						side := execution.Sell
+						if od.Request.Short {
+							side = execution.Buy
+						}
+						value, err := s.ReadLimitPrice(m.account.Context(), m.config.DefaultLimitPrice, instrument.ID, side, defaults.limitVolSecs)
+						if err != nil {
+							return err
+						}
+						if value <= 0 {
+							return errors.New("biz: execution default exit limit price unavailable")
+						}
+						price = decimal.NewFromFloat(value)
+					}
 					localReq.Limit = price.InexactFloat64()
 				}
 			}
@@ -791,12 +891,17 @@ func (m *SharedOrderMgr) exitOpenOrders(pairs string, req *strat.ExitReq, timefr
 				}
 			}
 			if bridge.CancelEntrySteps > 0 {
-				od.Entry.QuantitySteps -= bridge.CancelEntrySteps
+				remainingSteps := od.Entry.QuantitySteps - bridge.CancelEntrySteps
+				// A fully unfilled cancellation retains its source quantity; the
+				// terminal state, not an invalid zero-sized intent, prevents reuse.
+				if remainingSteps > 0 {
+					od.Entry.QuantitySteps = remainingSteps
+				}
 				od.Desired = filled
 				if od.Request.Short {
 					od.Desired = -od.Desired
 				}
-				if od.Entry.QuantitySteps <= filled {
+				if remainingSteps <= filled {
 					od.Canceled = true
 					od.Entry.State = execution.Canceled
 				}
@@ -812,6 +917,7 @@ func (m *SharedOrderMgr) exitOpenOrders(pairs string, req *strat.ExitReq, timefr
 					od.ResumeEntrySteps = pending - bridge.CancelEntrySteps
 				}
 				od.Exit = bridge.Reduction
+				od.LastProtection = ""
 				od.SourceExit, od.NativeExitOrders = nil, nil
 				reduction := bridge.Reduction.QuantitySteps
 				od.Desired = filled - reduction
@@ -1070,7 +1176,18 @@ func (m *SharedOrderMgr) failClosed(cause error, source string) {
 func (m *SharedOrderMgr) LastError() error     { m.mu.Lock(); defer m.mu.Unlock(); return m.lastError }
 func (m *SharedOrderMgr) CleanUp() *errs.Error { m.account.Release(); return nil }
 func (m *SharedOrderMgr) OnEnvEnd(evt *orm.DataSeries) *errs.Error {
-	return m.UpdateByDataSeries(nil, evt)
+	if evt == nil {
+		return nil
+	}
+	exs := orm.ResolveSeriesExSymbolWithSymbolState(m.deps.Symbols, evt)
+	if exs == nil || exs.Symbol == "" {
+		return sharedBridgeError(errors.New("biz: environment end requires a resolved symbol"))
+	}
+	_, err := m.ExitOpenOrders(exs.Symbol, &strat.ExitReq{
+		Tag:  core.ExitTagEnvEnd,
+		Dirt: core.OdDirtBoth,
+	})
+	return err
 }
 
 // UpdateByDataSeries evaluates software protections at one actually observable
@@ -1078,6 +1195,11 @@ func (m *SharedOrderMgr) OnEnvEnd(evt *orm.DataSeries) *errs.Error {
 func (m *SharedOrderMgr) UpdateByDataSeries(_ []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
 	if evt == nil {
 		return nil
+	}
+	if _, err := m.account.ObservePendingFeed(m.account.Context(), execution.PendingFeedObservation{
+		Feed: execution.PendingFeedID(sharedFeedKey(evt.Sid, evt.TimeFrame)), EndMS: evt.EndMS, Closed: evt.Closed, WarmUp: evt.IsWarmUp,
+	}); err != nil {
+		return sharedBridgeError(err)
 	}
 	if err := m.account.WithState(func(s *SharedAccount) error {
 		now := m.deps.Clock.TimeMS()
@@ -1095,167 +1217,40 @@ func (m *SharedOrderMgr) UpdateByDataSeries(_ []*ormo.InOutOrder, evt *orm.DataS
 		return sharedBridgeError(err)
 	}
 	err := m.mutate(func(s *SharedAccount, state *sharedTSCheckpoint, snapshot execution.AccountSnapshot, now, serial int64) error {
-		if evt.Closed && !evt.IsWarmUp {
-			if state.Feeds == nil {
-				state.Feeds = map[string]sharedFeedProgress{}
-			}
-			key := sharedFeedKey(evt.Sid, evt.TimeFrame)
-			progress := state.Feeds[key]
-			if evt.EndMS > progress.EndMS {
-				progress.EndMS = evt.EndMS
-				progress.Bars++
-				state.Feeds[key] = progress
-			}
-		}
+		quotes := make(map[string]execution.VisibleQuote)
+		var requests []execution.PendingProtectionRequest
 		for _, od := range state.Orders {
 			if od.SID != evt.Sid {
 				continue
 			}
-			if od.Exit != nil && od.Exit.State != execution.Canceled && od.Exit.State != execution.Filled {
-				// An outstanding explicit exit owns this reduction; software
-				// protection cannot replace its amount or venue limit.
-				continue
+			instrument, ok := m.config.Instruments[od.Symbol]
+			if !ok {
+				return fmt.Errorf("biz: pending order instrument %s is not configured", od.Symbol)
 			}
-			instrument := m.config.Instruments[od.Symbol]
 			q, err := m.quote(s, instrument.ID, now)
 			if err != nil {
 				return err
 			}
 			now = s.SendTime(now)
-			price := q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2))
-			var signed int64
-			basis := decimal.Zero
-			for _, lot := range snapshot.Lots {
-				if lot.Strategy == od.Strategy && lot.ID == od.Lot {
-					signed = lot.SignedSteps
-					basis = lot.CostBasis
-				}
-			}
-			filled := signed
-			if filled < 0 {
-				filled = -filled
-			}
-			if filled == 0 {
-				continue
-			}
-			fillPrice := basis.Div(decimal.NewFromInt(filled).Mul(instrument.QuantityStep).Mul(instrument.ContractSize))
-			od.Entry.FilledSteps = max(od.Entry.FilledSteps, filled)
-			if od.ProtectionLevels == nil {
-				od.ProtectionLevels = map[string]decimal.Decimal{}
-			}
-			for _, kind := range []string{"stop_loss", "take_profit", "trailing"} {
-				if od.ProtectionDone[kind] {
+			quotes[instrument.ID] = q
+			requests = append(requests, execution.PendingProtectionRequest{Order: &od.PendingOrder, Instrument: instrument, Specs: sharedProtectionSpecs(od.Request), Policy: m.config.OrderPolicy})
+		}
+		triggered, err := s.AdvancePendingProtections(m.account.Context(), requests, quotes, now)
+		if err != nil {
+			return err
+		}
+		for _, trigger := range triggered {
+			for _, od := range state.Orders {
+				if od.Strategy != trigger.Strategy || od.Lot != trigger.Lot {
 					continue
 				}
-				trigger, exists := od.Protections[kind]
-				if !exists {
-					level, limit, rate := float64(0), float64(0), float64(0)
-					direction := execution.Sell
-					if od.Request.Short {
-						direction = execution.Buy
-					}
-					switch kind {
-					case "stop_loss":
-						level, limit, rate = od.Request.StopLoss, od.Request.StopLossLimit, od.Request.StopLossRate
-						if level == 0 && od.Request.StopLossVal > 0 {
-							level = fillPrice.InexactFloat64()
-							if od.Request.Short {
-								level += od.Request.StopLossVal
-							} else {
-								level -= od.Request.StopLossVal
-							}
-						}
-					case "take_profit":
-						level, limit, rate = od.Request.TakeProfit, od.Request.TakeProfitLimit, od.Request.TakeProfitRate
-						if level == 0 && od.Request.TakeProfitVal > 0 {
-							level = fillPrice.InexactFloat64()
-							if od.Request.Short {
-								level -= od.Request.TakeProfitVal
-							} else {
-								level += od.Request.TakeProfitVal
-							}
-						}
-					case "trailing":
-						if od.Request.CallbackPct == 0 {
-							continue
-						}
-					}
-					if kind != "trailing" && level <= 0 {
-						continue
-					}
-					if rate == 0 {
-						rate = 1
-					}
-					steps, _ := execution.QuantitySteps(decimal.NewFromInt(filled).Mul(decimal.NewFromFloat(rate)), decimal.NewFromInt(1))
-					if steps == 0 {
-						continue
-					}
-					conditions := execution.IntentConditions{Limit: decimal.NewFromFloat(limit), CreatedBar: q.Bar}
-					if kind == "stop_loss" {
-						conditions.Stop = decimal.NewFromFloat(level)
-					} else if kind == "take_profit" {
-						od.ProtectionLevels[kind] = decimal.NewFromFloat(level)
-					} else {
-						conditions.ActivationPrice = decimal.NewFromFloat(od.Request.ActivationPrice)
-						conditions.TrailingPercent = decimal.NewFromFloat(od.Request.CallbackPct)
-					}
-					trigger = execution.EligibleIntent{ID: execution.VirtualIntentID(fmt.Sprintf("legacy-%s/%s", kind, od.Lot)), Account: s.AccountKey(), Strategy: od.Strategy, Lot: od.Lot, Instrument: instrument.ID, Kind: execution.ExitIntent, Side: direction, QuantitySteps: steps, Conditions: conditions}
+				od.SourceExit = nil
+				od.ExitTag = string(trigger.Kind)
+				if trigger.Kind == execution.StopLossProtection && od.Request.StopLossTag != "" {
+					od.ExitTag = od.Request.StopLossTag
 				}
-				if kind == "take_profit" && !trigger.Triggered {
-					level := od.ProtectionLevels[kind]
-					trigger.Triggered = trigger.Side == execution.Sell && price.GreaterThanOrEqual(level) || trigger.Side == execution.Buy && price.LessThanOrEqual(level)
-					if !trigger.Triggered {
-						od.Protections[kind] = trigger
-						continue
-					}
-				}
-				steps, err := trigger.Evaluate(price, now, q.Bar)
-				if err != nil {
-					return err
-				}
-				od.Protections[kind] = trigger
-				if steps > 0 {
-					if err := m.cancelPending(s, snapshot, od); err != nil {
-						return err
-					}
-					snapshot, err = s.Store().Snapshot(context.Background())
-					if err != nil {
-						return err
-					}
-					signed = 0
-					for _, lot := range snapshot.Lots {
-						if lot.Strategy == od.Strategy && lot.ID == od.Lot {
-							signed = lot.SignedSteps
-						}
-					}
-					finalFilled := signed
-					if finalFilled < 0 {
-						finalFilled = -finalFilled
-					}
-					if steps >= filled {
-						steps = finalFilled
-						trigger.QuantitySteps = steps
-						od.Protections[kind] = trigger
-					}
-					filled = finalFilled
-					od.Canceled = true
-					exit := trigger
-					od.Exit = &exit
-					od.SourceExit, od.NativeExitOrders = nil, nil
-					od.Entry.State = execution.Canceled
-					od.Desired = max(int64(0), filled-min(filled, steps))
-					if signed < 0 {
-						od.Desired = -od.Desired
-					}
-					od.ExitTag = kind
-					if kind == "stop_loss" && od.Request.StopLossTag != "" {
-						od.ExitTag = od.Request.StopLossTag
-					}
-					if kind == "take_profit" && od.Request.TakeProfitTag != "" {
-						od.ExitTag = od.Request.TakeProfitTag
-					}
-					od.ProtectionDone[kind] = true
-					break
+				if trigger.Kind == execution.TakeProfitProtection && od.Request.TakeProfitTag != "" {
+					od.ExitTag = od.Request.TakeProfitTag
 				}
 			}
 		}
@@ -1418,6 +1413,9 @@ func (m *SharedOrderMgr) projectSnapshot(restore bool, orderID int64) error {
 		if err != nil {
 			return err
 		}
+		if err := m.restoreTakeovers(m.account.Context(), s.Store(), &state, snapshot); err != nil {
+			return err
+		}
 		cursor, err := s.Store().ProjectionCursor(context.Background(), name)
 		if err != nil {
 			return err
@@ -1514,6 +1512,7 @@ func (m *SharedOrderMgr) projectSnapshot(restore bool, orderID int64) error {
 				od.Info[key] = value
 			}
 			od.Info["shared_lot"], od.Info["shared_checkpoint"] = string(record.Lot), snapshot.Checkpoint
+			od.Info["execution_protection"] = record.ProtectionPlacement
 			// Restore the read facade from durable protection definitions without
 			// firing edit callbacks or submitting orders during projection.
 			for _, kind := range []string{"stop_loss", "take_profit"} {
@@ -1902,145 +1901,98 @@ func (m *SharedOrderMgr) coordinate(s *SharedAccount, state *sharedTSCheckpoint,
 			return result, errors.New("biz: legacy quote expired during collection")
 		}
 	}
+	quotes := make(map[string]execution.VisibleQuote, len(requests))
+	for id, request := range requests {
+		quotes[id] = request.Quote
+	}
+	definitions, err := m.pendingDefinitions(state)
+	if err != nil {
+		return result, err
+	}
+	records := make(map[sharedPendingKey]*sharedTSOrder, len(state.Orders))
 	for _, od := range state.Orders {
-		instrument := m.config.Instruments[od.Symbol]
-		q := requests[instrument.ID].Quote
-		if od.FeedExpiry && od.Request.StopBars > 0 && state.Feeds[sharedFeedKey(od.SID, od.TimeFrame)].Bars-od.CreatedFeedBar >= int64(od.Request.StopBars) {
-			od.Entry.State = execution.Expired
+		records[sharedPendingKey{od.Strategy, od.Lot}] = od
+	}
+	list, err := s.CoordinatePending(m.account.Context(), definitions, quotes, now)
+	if err != nil {
+		return result, err
+	}
+	for _, definition := range definitions {
+		key := sharedPendingKey{definition.Order.Strategy, definition.Order.Lot}
+		if record := records[key]; record != nil {
+			record.PendingOrder = definition.Order
+		} else {
+			state.carriedPending[key] = definition
 		}
-		var filled int64
-		for _, lot := range snapshot.Lots {
-			if lot.Strategy == od.Strategy && lot.ID == od.Lot {
-				filled = lot.SignedSteps
-			}
-		}
-		if !od.Canceled && od.Entry.State != execution.Filled {
-			if filled < 0 {
-				od.Entry.FilledSteps = -filled
-			} else {
-				od.Entry.FilledSteps = filled
-			}
-			if od.Entry.FilledSteps >= od.Entry.QuantitySteps {
-				od.Entry.State = execution.Filled
-				od.Desired = filled
-			} else {
-				available, err := od.Entry.Evaluate(q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2)), now, q.Bar)
-				if err != nil {
-					return result, err
-				}
-				if available > 0 {
-					od.Desired = od.Entry.QuantitySteps
-					if od.Request.Short {
-						od.Desired = -od.Desired
-					}
-				}
-				if od.Entry.State == execution.Expired {
-					if err := m.cancelPending(s, snapshot, od); err != nil {
-						return result, err
-					}
-					snapshot, err = s.Store().Snapshot(context.Background())
-					if err != nil {
-						return result, err
-					}
-					filled = 0
-					for _, lot := range snapshot.Lots {
-						if lot.Strategy == od.Strategy && lot.ID == od.Lot {
-							filled = lot.SignedSteps
-							od.Entry.FilledSteps = filled
-							if filled < 0 {
-								od.Entry.FilledSteps = -filled
-							}
-						}
-					}
-					od.Canceled = true
-					od.Desired = filled
-				}
-			}
-		}
-		if od.ResumeEntrySteps > 0 && filled == od.Desired {
-			remaining := filled
-			if remaining < 0 {
-				remaining = -remaining
-			}
-			od.Entry.QuantitySteps = remaining + od.ResumeEntrySteps
-			od.Entry.FilledSteps = remaining
-			od.Entry.State = execution.PendingCondition
-			od.Canceled = false
-			od.ResumeEntrySteps = 0
-			// The next observed round reevaluates the original pending conditions.
-		}
-		desired := od.Desired
-		confirmedExit := false
-		for _, order := range snapshot.Orders {
-			if order.State != execution.OrderAcknowledged && order.State != execution.OrderPartial {
-				continue
-			}
-			for _, allocation := range order.Intent.Allocations {
-				if allocation.Kind == execution.ExitIntent && allocation.Strategy == od.Strategy && allocation.Lot == od.Lot && allocation.Steps > order.AllocationFilled[allocation.ID] {
-					confirmedExit = true
-				}
-			}
-		}
-		if len(od.NativeExitOrders) > 0 {
-			canceledNative := false
-			var reportedExit int64
-			for _, id := range od.NativeExitOrders {
-				order, err := s.Store().Order(context.Background(), id)
-				if err != nil {
-					return result, err
-				}
-				canceledNative = canceledNative || order.State == execution.OrderCanceled || order.State == execution.OrderRejected
-				for _, allocation := range order.Intent.Allocations {
-					if allocation.Kind == execution.ExitIntent && allocation.Strategy == od.Strategy && allocation.Lot == od.Lot {
-						reportedExit += order.AllocationFilled[allocation.ID]
-					}
-				}
-			}
-			od.Exit.FilledSteps = reportedExit
-			if canceledNative && !confirmedExit {
-				od.Desired, desired, od.Exit.State = filled, filled, execution.Canceled
-			}
-			if !confirmedExit {
-				od.NativeExitOrders = nil
-			}
-		}
-		if od.Exit != nil && desired == filled && od.Exit.State != execution.Canceled {
-			od.Exit.State = execution.Filled
-		}
-		exitReduction := filled > 0 && desired >= 0 && desired < filled || filled < 0 && desired <= 0 && desired > filled
-		if od.Exit != nil && exitReduction && !confirmedExit {
-			available, err := od.Exit.Evaluate(q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2)), now, q.Bar)
-			if err != nil {
-				return result, err
-			}
-			if available == 0 {
-				desired = filled
-			}
-		}
-		requests[instrument.ID].Targets = append(requests[instrument.ID].Targets, execution.ExecutableTarget{Strategy: od.Strategy, Lot: od.Lot, SignedSteps: desired})
-		filledAbs, desiredAbs := filled, desired
-		if filledAbs < 0 {
-			filledAbs = -filledAbs
-		}
-		if desiredAbs < 0 {
-			desiredAbs = -desiredAbs
-		}
-		if desiredAbs > filledAbs {
-			requests[instrument.ID].IntentConstraints = append(requests[instrument.ID].IntentConstraints, od.Entry)
-		}
-		if desiredAbs < filledAbs && od.Exit != nil {
-			requests[instrument.ID].IntentConstraints = append(requests[instrument.ID].IntentConstraints, *od.Exit)
-		}
+	}
 
-	}
-	var list []execution.InstrumentRebalance
-	for _, r := range requests {
-		list = append(list, *r)
-	}
-	sort.Slice(list, func(i, j int) bool { return list[i].Instrument.ID < list[j].Instrument.ID })
 	body, _ := json.Marshal(state)
 	hash := sha256.Sum256(body)
 	risk := m.config.Risk
 	risk.Marks = marks
-	return execution.CombinedRebalance{PlanID: "legacy-" + hex.EncodeToString(hash[:16]), DecisionMS: now, ExpiresMS: now + m.config.IntentTTLMS, Requests: list, Risk: risk}, nil
+	return execution.CombinedRebalance{PlanID: "legacy-" + hex.EncodeToString(hash[:16]), DecisionMS: now, ExpiresMS: math.MaxInt64, Requests: list, Risk: risk}, nil
+}
+
+func (m *SharedOrderMgr) pendingDefinitions(state *sharedTSCheckpoint) ([]execution.PendingDefinition, error) {
+	// The account book can contain adopted lots before BindJobs creates their
+	// facade metadata. Retain their coordinated state across this mutation.
+	if state.carriedPending == nil {
+		state.carriedPending = make(map[sharedPendingKey]execution.PendingDefinition)
+		if state.store != nil {
+			definitions, err := state.store.LoadPendingBook(state.ctx)
+			if err != nil {
+				return nil, err
+			}
+			snapshot, err := state.store.Snapshot(state.ctx)
+			if err != nil {
+				return nil, err
+			}
+			live := make(map[sharedPendingKey]bool)
+			for _, lot := range snapshot.Lots {
+				if lot.SignedSteps != 0 {
+					live[sharedPendingKey{lot.Strategy, lot.ID}] = true
+				}
+			}
+			for _, order := range snapshot.Orders {
+				if order.State == execution.OrderFilled || order.State == execution.OrderCanceled || order.State == execution.OrderRejected {
+					continue
+				}
+				for _, allocation := range order.Intent.Allocations {
+					live[sharedPendingKey{allocation.Strategy, allocation.Lot}] = true
+				}
+			}
+			for _, definition := range definitions {
+				order := definition.Order
+				key := sharedPendingKey{order.Strategy, order.Lot}
+				entryActive := !order.Canceled && order.Entry.State != execution.Filled && order.Entry.State != execution.Canceled && order.Entry.State != execution.Expired
+				if order.Desired != 0 || order.ResumeEntrySteps != 0 || entryActive || live[key] {
+					state.carriedPending[key] = definition
+				}
+			}
+		}
+	}
+	var definitions []execution.PendingDefinition
+	for _, order := range state.Orders {
+		delete(state.carriedPending, sharedPendingKey{order.Strategy, order.Lot})
+		if sharedEmptyCanceledEntry(order) {
+			continue
+		}
+		instrument, ok := m.config.Instruments[order.Symbol]
+		if !ok {
+			return nil, fmt.Errorf("biz: pending instrument %s is not configured", order.Symbol)
+		}
+		definitions = append(definitions, execution.PendingDefinition{Order: order.PendingOrder, Instrument: instrument, Specs: sharedProtectionSpecs(order.Request), Policy: m.config.OrderPolicy})
+	}
+	for _, definition := range state.carriedPending {
+		definitions = append(definitions, definition)
+	}
+	return definitions, nil
+}
+
+// Older facade checkpoints could retain a zero-sized source after an entirely
+// unfilled cancellation. Keep its history, but never admit it as an intent.
+func sharedEmptyCanceledEntry(order *sharedTSOrder) bool {
+	return order.Canceled && order.Entry.State == execution.Canceled && order.Entry.QuantitySteps == 0 &&
+		order.Entry.FilledSteps == 0 && order.Entry.ReservedSteps == 0 && order.Desired == 0 &&
+		order.ResumeEntrySteps == 0 && order.Exit == nil && len(order.NativeExitOrders) == 0
 }

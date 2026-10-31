@@ -413,6 +413,9 @@ func (s *Store) ApplyFill(ctx context.Context, report FillReport) (bool, error) 
 			}
 		}
 		filled := order.FilledSteps + steps
+		if err := s.applyNativeFillState(ctx, tx, order, report, filled); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(opUpdateFillHighwater, filled, order.ReportedFee.Add(fee).String(), order.ReportedCost.Add(cost).String(), mode, s.accountID, report.OrderID); err != nil {
 			return err
 		}

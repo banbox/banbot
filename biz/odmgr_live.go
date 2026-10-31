@@ -15,7 +15,6 @@ import (
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
@@ -179,6 +178,7 @@ func newLiveOrderMgr(account string, callBack func(od *ormo.InOutOrder, isEnter 
 }
 
 func newLiveOrderMgrWithRuntimeDeps(account string, callBack func(od *ormo.InOutOrder, isEnter bool), deps *RuntimeDeps) *LiveOrderMgr {
+	ensureLiveRuntimeDeps(deps)
 	res := &LiveOrderMgr{
 		OrderMgr: OrderMgr{
 			callBack: callBack,
@@ -193,7 +193,6 @@ func newLiveOrderMgrWithRuntimeDeps(account string, callBack func(od *ormo.InOut
 		unMatchTrades: map[string]*banexg.MyTrade{},
 	}
 	if deps != nil {
-		ensureLiveRuntimeDeps(deps)
 		res.OrderMgr.bindRuntimeDeps(*deps)
 		res.coreState = res.runtimeCore
 		if deps.Config != nil {
@@ -223,11 +222,14 @@ func newLiveOrderMgrWithRuntimeDeps(account string, callBack func(od *ormo.InOut
 
 func ensureLiveRuntimeDeps(deps *RuntimeDeps) {
 	if deps == nil {
+		if core.EnvReal {
+			panic("biz: production TS orders require execution; the legacy live manager is retired")
+		}
 		return
 	}
 	requireRuntimeDeps(*deps)
-	if deps.Core.EnvReal && deps.SharedExecution == nil && !execution.IsLegacyExchange(deps.Exchange) {
-		panic("biz: production TS manager requires process-owned legacy sender exchange")
+	if deps.Core.EnvReal && deps.SharedExecution == nil {
+		panic("biz: production TS orders require shared execution; the legacy live manager is retired")
 	}
 }
 

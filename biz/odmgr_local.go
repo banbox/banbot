@@ -45,6 +45,10 @@ func InitLocalOrderMgrWithPriceState(callBack FnOdCb, showLog bool, prices *com.
 // accounting to one explicit Runtime. The legacy initializer remains the
 // compatibility path for callers that still use package state.
 func InitLocalOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack FnOdCb, showLog bool, stops ...func()) {
+	if deps.HubOrderBridge != nil {
+		initHubOrderMgr(deps, callBack)
+		return
+	}
 	if deps.SharedExecution != nil {
 		initSharedOrderMgr(deps, callBack)
 		return

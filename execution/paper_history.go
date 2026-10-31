@@ -13,11 +13,14 @@ type archivedPaperOrder struct {
 	Result QueryResult
 }
 
-// BindStore enables cold receipt read-through only when the account explicitly
-// selected indexed history. File-free paper sessions retain their existing path.
+// BindStore restores the opt-in durable venue journal or enables indexed cold
+// receipt read-through. File-free paper sessions retain their existing path.
 func (a *PaperAdapter) BindStore(store *Store) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.journal != nil {
+		return a.bindJournalLocked(store)
+	}
 	if a.history != nil && a.history != store {
 		return errors.New("execution: paper venue already belongs to another history store")
 	}

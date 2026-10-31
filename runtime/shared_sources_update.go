@@ -221,7 +221,7 @@ func (s *FactorLiveSubscription) generation(plan *data.SubscriptionPlan, engines
 			streams[input.Source+"/"+input.TimeFrame] = true
 		}
 		streams[cfgs[i].Prices.Source+"/"+cfgs[i].Prices.TimeFrame] = true
-		if cfgs[i].Manifest.Costs.FundingPolicy == "required-stream" {
+		if cfgs[i].Manifest.Costs.FundingPolicy == "required-stream" && !engine.ExecutionOwnsFunding() {
 			streams[cfgs[i].FundingSource+"/event"] = true
 		}
 		g.sink.consumers = append(g.sink.consumers, &factorLiveSourceSink{runtime: s.runtime, engine: engine, cfg: cfgs[i], mapper: mappers[i], fail: func(err error) { s.fail(g, err) }, streams: streams})
@@ -355,7 +355,7 @@ func protectAccountSubscriptions(snapshot execution.AccountSnapshot, g *factorLi
 				strategyPrices[strategy][consumer.cfg.Snapshot.SIDMap[sid]] = true
 			}
 		}
-		if consumer.cfg.Manifest.Costs.FundingPolicy == "required-stream" {
+		if consumer.cfg.Manifest.Costs.FundingPolicy == "required-stream" && !consumer.engine.ExecutionOwnsFunding() {
 			strategyNeedsFunding[strategy] = true
 			requiresFunding = true
 			for _, sid := range consumer.engine.FundingSIDs() {

@@ -292,8 +292,8 @@ func (s *Store) ApplyTerminalSettlement(ctx context.Context, event TerminalSettl
 	return applied, err
 }
 
-// ApplyTerminalSettlement is process-local paper venue settlement. It validates before
-// mutating; durable account dedup lives in Store, as with paper fill receipts.
+// ApplyTerminalSettlement validates before mutation and journals the venue
+// settlement when durable paper mode is enabled.
 func (a *PaperAdapter) ApplyTerminalSettlement(ctx context.Context, event TerminalSettlement) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -303,10 +303,16 @@ func (a *PaperAdapter) ApplyTerminalSettlement(ctx context.Context, event Termin
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if err := a.validateTerminalSettlementLocked(event); err != nil {
-		return false, err
-	}
-	return a.applyTerminalSettlementLocked(event)
+	var applied bool
+	err := a.mutatePaperLocked(ctx, paperOperation{Kind: "terminal", Terminal: &event}, func(context.Context) error {
+		if err := a.validateTerminalSettlementLocked(event); err != nil {
+			return err
+		}
+		var err error
+		applied, err = a.applyTerminalSettlementLocked(event)
+		return err
+	})
+	return applied && err == nil, err
 }
 
 func (a *PaperAdapter) applyTerminalSettlementLocked(event TerminalSettlement) (bool, error) {
@@ -338,15 +344,15 @@ func (a *PaperAdapter) applyTerminalSettlementLocked(event TerminalSettlement) (
 }
 
 // ApplyTerminalSettlement owns the ledger and paper mutation under the same account
-// serialization boundary. Paper remains process-local and cannot be restarted
-// from the ledger; this adds no restart or real venue settlement capability.
+// serialization boundary. Durable paper commits the venue journal and ledger
+// together; ordinary backtests retain their process-local behavior.
 func (b *SharedAccountBorrow) ApplyTerminalSettlement(event TerminalSettlement) (bool, error) {
 	var applied bool
 	err := b.use(func(s *SharedAccount) error {
 		return s.owner.DoLocal(s.owner.Token(), func(ctx context.Context) error {
 			paper, ok := s.opts.Adapter.(*PaperAdapter)
 			if !ok {
-				return errors.New("execution: cash terminal instruments require a process-local paper adapter")
+				return errors.New("execution: cash terminal instruments require a paper adapter")
 			}
 			// Validate venue state before the durable commit without changing it.
 			paper.mu.Lock()
@@ -370,18 +376,20 @@ func (b *SharedAccountBorrow) ApplyTerminalSettlement(event TerminalSettlement) 
 			if actualSteps != paper.positions[event.Instrument.ID].steps || !snapshot.AccountSettledCash.Equal(paper.cash) {
 				return errors.New("execution: terminal settlement requires reconciled paper cash and actual quantities")
 			}
-			applied, err = s.store.ApplyTerminalSettlement(ctx, event)
-			if err != nil || !applied {
+			return paper.mutatePaperLocked(ctx, paperOperation{Kind: "terminal", Terminal: &event}, func(ctx context.Context) error {
+				applied, err = s.store.ApplyTerminalSettlement(ctx, event)
+				if err != nil || !applied {
+					return err
+				}
+				_, err = paper.applyTerminalSettlementLocked(event)
 				return err
-			}
-			_, err = paper.applyTerminalSettlementLocked(event)
-			return err
+			})
 		})
 	})
 	if err == nil && applied {
 		b.service.notifyCommitted()
 	}
-	return applied, err
+	return applied && err == nil, err
 }
 
 func (a *PaperAdapter) validateTerminalSettlementLocked(event TerminalSettlement) error {

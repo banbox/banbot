@@ -12,20 +12,46 @@ import (
 
 type fakeBanexgSession struct {
 	banexg.BanExchange
-	create       func(string, string, string, float64, float64, map[string]any) (*banexg.Order, *errs.Error)
-	query        func(string, string, map[string]any) (*banexg.Order, *errs.Error)
-	cancel       func(string, string, map[string]any) (*banexg.Order, *errs.Error)
-	balances     *banexg.Balances
-	positions    []*banexg.Position
-	orders       []*banexg.Order
-	book         *banexg.OrderBook
-	creates      int
-	snapshots    int
-	fullSnapshot bool
-	trades       chan *banexg.MyTrade
+	create         func(string, string, string, float64, float64, map[string]any) (*banexg.Order, *errs.Error)
+	query          func(string, string, map[string]any) (*banexg.Order, *errs.Error)
+	cancel         func(string, string, map[string]any) (*banexg.Order, *errs.Error)
+	balances       *banexg.Balances
+	positions      []*banexg.Position
+	orders         []*banexg.Order
+	book           *banexg.OrderBook
+	creates        int
+	snapshots      int
+	fullSnapshot   bool
+	trades         chan *banexg.MyTrade
+	balanceStream  chan *banexg.Balances
+	watchBalance   func(map[string]any) (chan *banexg.Balances, *errs.Error)
+	positionStream chan []*banexg.Position
+	watchPositions func(map[string]any) (chan []*banexg.Position, *errs.Error)
 }
 
-func (e *fakeBanexgSession) HasApi(string, string) bool { return true }
+func (e *fakeBanexgSession) HasApi(api, _ string) bool {
+	switch api {
+	case banexg.ApiWatchBalance:
+		return e.balanceStream != nil || e.watchBalance != nil
+	case banexg.ApiWatchPositions:
+		return e.positionStream != nil || e.watchPositions != nil
+	default:
+		return true
+	}
+}
+
+func (e *fakeBanexgSession) WatchPositions(params map[string]any) (chan []*banexg.Position, *errs.Error) {
+	if e.watchPositions != nil {
+		return e.watchPositions(params)
+	}
+	return e.positionStream, nil
+}
+func (e *fakeBanexgSession) WatchBalance(params map[string]any) (chan *banexg.Balances, *errs.Error) {
+	if e.watchBalance != nil {
+		return e.watchBalance(params)
+	}
+	return e.balanceStream, nil
+}
 func (e *fakeBanexgSession) WatchMyTrades(map[string]any) (chan *banexg.MyTrade, *errs.Error) {
 	return e.trades, nil
 }
@@ -413,5 +439,17 @@ func TestBanexgOwnerStoreBindingAndFrozenLimitMetadata(t *testing.T) {
 	_, err = adapter.Submit(context.Background(), OrderIntent{ID: "limit-order", Instrument: ledgerInstrument(), Side: Sell, Steps: 3, Limit: intentPrice("101"), ReduceOnly: true}, "limit-client")
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBanexgConditionalCannotDegradeIntoMarketOrder(t *testing.T) {
+	_, _, exchange, _, config := banexgFixture(t)
+	adapter, err := NewBanexgAdapter(context.Background(), exchange, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = adapter.Submit(context.Background(), OrderIntent{Conditional: &ConditionalOrder{Kind: StopLossProtection}}, "conditional-client")
+	if err == nil || exchange.creates != 0 {
+		t.Fatal("unproven conditional reached ordinary SDK submission", err, exchange.creates)
 	}
 }

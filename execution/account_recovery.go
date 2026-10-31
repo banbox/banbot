@@ -33,7 +33,15 @@ func (b *SharedAccountBorrow) RefreshWorkingOrders(ctx context.Context, now int6
 			if err != nil {
 				return err
 			}
-			if now >= plan.ExpiresMS {
+			expired := now >= plan.ExpiresMS
+			for _, allocation := range current.Intent.Allocations {
+				intent, err := s.store.Intent(operationCtx, allocation.IntentID)
+				if err != nil {
+					return err
+				}
+				expired = expired || intent.State == Expired || intent.State == Canceled || intent.Conditions.ExpiresAtMS > 0 && now >= intent.Conditions.ExpiresAtMS
+			}
+			if expired {
 				if err := executor.Cancel(current.Intent.ID, now); err != nil {
 					return err
 				}

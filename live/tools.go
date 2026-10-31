@@ -28,7 +28,13 @@ func CloseOrdersWithRuntimeDeps(deps biz.RuntimeDeps, request TradeCloseRequest)
 	if deps.Core == nil || deps.Clock == nil || deps.ConfigView() == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "runtime core, clock, and config are required")
 	}
-	if deps.Exchange == nil {
+	if deps.Core.EnvReal && deps.SharedExecution == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "production close requires a bound execution account; the legacy close sender is retired")
+	}
+	if deps.SharedExecution != nil && request.Exchange {
+		return nil, errs.NewMsg(core.ErrBadConfig, "execution close requires attributed strategy orders; raw venue position closing is not supported")
+	}
+	if deps.Exchange == nil && deps.SharedExecution == nil {
 		return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
 	}
 	accounts := deps.AccountConfigs()
@@ -38,6 +44,13 @@ func CloseOrdersWithRuntimeDeps(deps biz.RuntimeDeps, request TradeCloseRequest)
 	selected, err := closeSelectedAccounts(accounts, closeFilter(request.Accounts))
 	if err != nil {
 		return nil, err
+	}
+	if deps.SharedExecution != nil {
+		for _, account := range selected {
+			if account != deps.DefaultAccount || account != deps.SharedExecution.AccountKey().Account {
+				return nil, errs.NewMsg(core.ErrBadConfig, "close account does not match the bound execution owner")
+			}
+		}
 	}
 	if !request.Exchange && (deps.Orders == nil || deps.Trading == nil) {
 		return nil, errs.NewMsg(core.ErrBadConfig, "runtime orders and trading state are required")
@@ -50,6 +63,9 @@ func CloseOrdersWithRuntimeDeps(deps biz.RuntimeDeps, request TradeCloseRequest)
 			Source: biz.RemoteSourceCLI, Actor: "cli", Account: account, Action: biz.RemoteActionCloseOrder,
 			All: true, Confirmed: request.Confirmed, ExitTag: core.ExitTagCli,
 			ExecClose: func() (int, int, *errs.Error) {
+				if deps.SharedExecution != nil {
+					return closeLocalOrdersWithRuntimeDeps(deps, account, pairs, strategies)
+				}
 				if err := cancelPendingOrdersWithRuntimeDeps(deps, account, pairs); err != nil {
 					return 0, 0, err
 				}
@@ -149,13 +165,19 @@ func closePositionsWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs m
 }
 
 func closeLocalOrdersWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs, strategies map[string]bool) (int, int, *errs.Error) {
-	biz.InitLiveOrderMgrWithRuntimeDeps(deps, nil)
-	manager := deps.Trading.LiveManager(account)
-	if manager == nil {
-		return 0, 0, errs.NewMsg(core.ErrRunTime, "live order manager is not initialized: %s", account)
-	}
-	if _, _, _, err := manager.SyncExgOrders(); err != nil {
-		return 0, 0, err
+	if deps.SharedExecution != nil {
+		if _, ok := deps.Trading.OrderManager(account).(*biz.SharedOrderMgr); !ok {
+			return 0, 0, errs.NewMsg(core.ErrRunTime, "execution order manager is not initialized: %s", account)
+		}
+	} else {
+		biz.InitLiveOrderMgrWithRuntimeDeps(deps, nil)
+		manager := deps.Trading.LiveManager(account)
+		if manager == nil {
+			return 0, 0, errs.NewMsg(core.ErrRunTime, "live order manager is not initialized: %s", account)
+		}
+		if _, _, _, err := manager.SyncExgOrders(); err != nil {
+			return 0, 0, err
+		}
 	}
 	openOrders, lock := deps.Orders.GetOpenODs(account)
 	lock.Lock()

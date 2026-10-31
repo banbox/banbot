@@ -110,6 +110,24 @@ func (h *FactorLiveGenerationHarness) Stopped(index int) bool {
 	return p.handlerStop
 }
 
+// EndEnvironment drives the callback installed on the actual managed feeder.
+func (h *FactorLiveGenerationHarness) EndEnvironment(index int, row *orm.DataSeries) error {
+	h.mu.Lock()
+	p := h.providers[index]
+	h.mu.Unlock()
+	if h.Stopped(index) {
+		return context.Canceled
+	}
+	holder, found := p.getHolder(row.ExSymbol.Symbol)
+	if !found {
+		return fmt.Errorf("fixture generation lacks holder")
+	}
+	holder.(*generationWarmupFeeder).OnEnvEnd(row)
+	p.subscriptionSink.mu.Lock()
+	defer p.subscriptionSink.mu.Unlock()
+	return p.subscriptionSink.firstErr
+}
+
 func (h *FactorLiveGenerationHarness) Cached(index int, pair, timeframe string, timeMS int64) *orm.DataSeries {
 	h.mu.Lock()
 	p := h.providers[index]

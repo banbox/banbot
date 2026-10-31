@@ -63,7 +63,7 @@ func (l *Live) RetainPolicyScope(previous *Live, snapshot execution.AccountSnaps
 	if !ok {
 		return Config{}, errors.New("runner: automatic policy scope requires native account evidence")
 	}
-	evidence, err := account.Account.PolicyEvidenceContext(context.Background(), execution.StrategyID(config.StrategyID))
+	evidence, err := account.application().PolicyEvidenceContext(context.Background(), execution.StrategyID(config.StrategyID))
 	if err != nil {
 		return Config{}, err
 	}

@@ -208,3 +208,53 @@ func TestBanexgRecoverCashPartialCommitReplaysBeforeWatermark(t *testing.T) {
 		t.Fatal("partial replay duplicated settlement or did not commit complete watermark")
 	}
 }
+
+func TestBanexgRecoverCashDistinctFundingTypesAtSameTime(t *testing.T) {
+	borrow, adapter, exchange, _, floor, _ := fundingRecoveryFixture(t)
+	rows := []banexg.FundingCash{
+		{ID: "funding/USDT/42", Symbol: "BTC/USDT:USDT", Currency: "USDT", Amount: "-0.125", Mark: "100", Rate: "0.001", AtMS: floor + 1},
+		{ID: "funding/SPECIAL_FUNDING_FEE/USDT/42", Symbol: "BTC/USDT:USDT", Currency: "USDT", Amount: "0.25", Mark: "100", Rate: "-0.0025", AtMS: floor + 1},
+	}
+	exchange.fetch = func(context.Context, string, string, int64, int64) ([]banexg.FundingCash, *errs.Error) {
+		return rows, nil
+	}
+	for i := 0; i < 2; i++ {
+		if err := adapter.RecoverCash(context.Background(), borrow); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, _, _ := fundingRecoveryEvents(t, borrow)
+	if !snapshot.AccountSettledCash.Equal(decimal.RequireFromString("1000.125")) {
+		t.Fatalf("funding types lost or replayed: %s", snapshot.AccountSettledCash)
+	}
+	err := borrow.WithState(func(service *SharedAccount) error {
+		events, err := service.store.EventsAfter(context.Background(), 0, 512)
+		if err != nil {
+			return err
+		}
+		found := map[string]int{}
+		for _, event := range events {
+			if event.ID == rows[0].ID || event.ID == rows[1].ID {
+				var funding FundingSettlement
+				if err := json.Unmarshal(event.Payload, &funding); err != nil {
+					return err
+				}
+				expected := rows[0]
+				if event.ID == rows[1].ID {
+					expected = rows[1]
+				}
+				if funding.AtMS != expected.AtMS || funding.Rate.String() != expected.Rate {
+					t.Fatalf("funding type changed: %+v", funding)
+				}
+				found[event.ID]++
+			}
+		}
+		if found[rows[0].ID] != 1 || found[rows[1].ID] != 1 {
+			t.Fatalf("funding IDs not independently idempotent: %+v", found)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

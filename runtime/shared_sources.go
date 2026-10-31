@@ -82,7 +82,7 @@ func (r *Runtime) factorLiveRequests(engine *runner.Live, cfg runner.Config) ([]
 		inputs = append(inputs, scopedInput{input, engine.DataSIDs(), "factor:" + cfg.StrategyID})
 	}
 	inputs = append(inputs, scopedInput{factor.InputSpec{Source: cfg.Prices.Source, TimeFrame: cfg.Prices.TimeFrame, Fields: []string{cfg.Prices.Field}}, engine.ExecutionSIDs(), "execution-price:" + cfg.StrategyID})
-	if cfg.Manifest.Costs.FundingPolicy == "required-stream" {
+	if cfg.Manifest.Costs.FundingPolicy == "required-stream" && !engine.ExecutionOwnsFunding() {
 		inputs = append(inputs, scopedInput{factor.InputSpec{Source: cfg.FundingSource, TimeFrame: "event", Fields: []string{"rate", "mark", "account_amount", "settlement_id"}}, engine.FundingSIDs(), "execution-funding:" + cfg.StrategyID})
 	}
 	var requests []data.SubscriptionRequest

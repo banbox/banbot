@@ -133,7 +133,7 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 	add("", newStrategyBacktestCommand(nil))
 	add("", newResearchCommand())
 	addExpressionCommands(root)
-	add("", newRuntimeConfigCommand("spider", "start the spider", runSpider, false))
+	add("", newHubCommand())
 	add("", newRuntimeConfigCommand("optimize", "run hyperparameter optimization", func(args *config.CmdArgs) *errs.Error { return runExplicitOptimization(args, opt.RunOptimize) }, true,
 		bindOut, bindOptRounds, bindSampler, bindPicker, bindEachPairs, bindConcur, bindBTStrict))
 	add("", newRuntimeConfigCommand("init", "initialize config.yml/config.local.yml in the data directory", runInit, true))
@@ -188,6 +188,7 @@ func registerBuiltInCommands(root *cobra.Command, groups map[string]*cobra.Comma
 	add("tool", newRuntimeConfigCommand("corr", "calculate a symbol correlation matrix", runExplicitCorrelation, true,
 		bindOut, bindOutType, bindTimeFrames, bindBatchSize, bindRunEvery))
 	add("tool", newMergeAssetsCommand())
+	add("tool", newDataAuditCommand())
 	add("tool", NewRuntimeCompareExgBTOrdersCommand())
 	add("tool", strat.NewListStratsCommand())
 	add("tool", opt.NewBtFactorsCommandWithRun(runExplicitFactors))

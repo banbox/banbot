@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/banbox/banbot/execution"
@@ -13,6 +14,9 @@ import (
 )
 
 type ExecutionConfig struct {
+	OrderMode                                                         execution.OrderMode
+	ProtectionMode                                                    execution.ProtectionMode
+	NearLimitBPS                                                      decimal.Decimal
 	PaperFillModel                                                    execution.PaperFillModel
 	StorePath, SenderLeaseDir, HistoryPath                            string
 	Instruments                                                       map[int32]execution.Instrument
@@ -23,7 +27,10 @@ type ExecutionConfig struct {
 // It retains every other strategy's absolute positions, including zero targets
 // needed to close this strategy's prior Full scope.
 type AccountSink struct {
+	// Account is used only by in-process paper/lifecycle integration. Strategy
+	// queries and commands use Application when executing through the hub.
 	Account                         *execution.SharedAccountBorrow
+	Application                     AccountApplication
 	AccountID, StrategyID, Currency string
 	Instruments                     map[int32]execution.Instrument
 	FundingInstruments              map[int32]execution.Instrument
@@ -44,6 +51,12 @@ type AccountSink struct {
 }
 
 func (s *AccountSink) RegisterExecution() error {
+	if err := s.validateApplication(context.Background()); err != nil {
+		return err
+	}
+	if s.Application != nil {
+		return nil // Account policies and public/private streams belong to the hub.
+	}
 	cap, ok := s.Risk.StrategyGrossLimits[execution.StrategyID(s.StrategyID)]
 	if !ok || !cap.IsPositive() {
 		return errors.New("runner: explicit factor strategy policy required")
@@ -99,6 +112,9 @@ func (s *AccountSink) ObserveQuote(ctx context.Context, sid int32, q backtest.Qu
 	if s.paperMarket != nil {
 		s.paperMarket.observe(i.ID, s.observed[i.ID])
 	}
+	if s.Application != nil {
+		return nil // Robot observations never drive the hub's execution clock.
+	}
 	return s.Account.AdvancePaperQuote(ctx, i.ID, s.observed[i.ID], now)
 }
 func (s *AccountSink) StrategyNAV(ctx context.Context, now int64) (float64, error) {
@@ -106,11 +122,11 @@ func (s *AccountSink) StrategyNAV(ctx context.Context, now int64) (float64, erro
 	return state.NAV, err
 }
 func (s *AccountSink) StrategyState(ctx context.Context, now int64) (backtest.State, error) {
-	snap, err := s.Account.Snapshot(ctx)
+	snap, err := s.application().Snapshot(ctx)
 	if err != nil {
 		return backtest.State{}, err
 	}
-	risk, err := s.Account.AccountRisk(ctx, now)
+	risk, err := s.application().AccountRisk(ctx, now)
 	if err != nil {
 		return backtest.State{}, err
 	}
@@ -138,7 +154,7 @@ func (s *AccountSink) StrategyState(ctx context.Context, now int64) (backtest.St
 		state.Quantities[sid] += decimal.NewFromInt(lot.SignedSteps).Mul(lot.Instrument.QuantityStep).Mul(lot.Instrument.ContractSize).InexactFloat64()
 	}
 	state.NAV = nav.InexactFloat64()
-	totals, err := s.Account.StrategyTotals(ctx, id)
+	totals, err := s.application().StrategyTotals(ctx, id)
 	if err != nil {
 		return state, err
 	}
@@ -154,7 +170,22 @@ func (s *AccountSink) ProcessSnapshot(ctx context.Context, p *factor.TargetPortf
 		return errors.New("runner: nil target portfolio")
 	}
 	sp := p.Spec()
-	if sp.AccountID != s.AccountID || sp.StrategyID != s.StrategyID || sp.Budget.Currency != s.Currency || now < sp.ExecutableAt || now >= sp.ExpireAt {
+	if sp.AccountID != s.AccountID || sp.StrategyID != s.StrategyID || sp.Budget.Currency != s.Currency {
+		return errors.New("runner: portfolio/account budget identity mismatch")
+	}
+	if recovery, ok := s.application().(TargetRecoveryApplication); ok {
+		recovered, err := recovery.ResumeStrategyTargetContext(ctx, execution.StrategyID(s.StrategyID), p.ID(), p.ID())
+		if err != nil {
+			return err
+		}
+		if err := s.restoreTargetState(recovered.State); err != nil {
+			return err
+		}
+		if recovered.Found {
+			return nil
+		}
+	}
+	if now < sp.ExecutableAt || now >= sp.ExpireAt {
 		return errors.New("runner: portfolio/account budget identity or execution window mismatch")
 	}
 	effective, err := p.EffectiveTargets(s.previous)
@@ -227,14 +258,28 @@ func (s *AccountSink) ProcessSnapshot(ctx context.Context, p *factor.TargetPortf
 		}
 		request.Requests = append(request.Requests, execution.InstrumentRebalance{Instrument: i, Targets: []execution.ExecutableTarget{{Strategy: execution.StrategyID(s.StrategyID), Lot: execution.VirtualLotID(fmt.Sprintf("factor:%d", sid)), SignedSteps: steps}}, Quote: visible})
 	}
-	if err = s.Account.RebalanceStrategyContext(ctx, request, now); err != nil {
+	next, err := factor.NewTargetPortfolio(sp, effective)
+	if err != nil {
 		return err
 	}
-	s.previous, err = factor.NewTargetPortfolio(sp, effective)
-	return err
+	if _, ok := s.application().(TargetRecoveryApplication); ok {
+		request.ProposalHash = p.ID()
+		request.ProposalState, err = json.Marshal(accountTargetCheckpoint{Version: 1, Spec: sp, Targets: effective})
+		if err != nil {
+			return err
+		}
+	}
+	if err = s.application().RebalanceStrategyContext(ctx, request, now); err != nil {
+		return err
+	}
+	s.previous = next
+	return nil
 }
 
 func (s *AccountSink) ObserveFunding(ctx context.Context, f backtest.Funding, now int64) error {
+	if s.Application != nil {
+		return errors.New("runner: funding observations are owned by the execution hub")
+	}
 	if s.AuthoritativeFunding {
 		return errors.New("runner: live funding requires authoritative cash metadata")
 	}
@@ -263,6 +308,9 @@ func (s *AccountSink) ObserveFunding(ctx context.Context, f backtest.Funding, no
 // ObserveFundingRecord retains the venue's actual cash delta and settlement
 // identity. Decimal strings cross the source boundary without float rounding.
 func (s *AccountSink) ObserveFundingRecord(ctx context.Context, r factor.VersionRecord, now int64) error {
+	if s.Application != nil {
+		return errors.New("runner: authoritative funding is owned by the execution hub")
+	}
 	if !s.AuthoritativeFunding {
 		return errors.New("runner: authoritative funding is not enabled")
 	}

@@ -284,8 +284,8 @@ func (s *Store) ApplyOptionExpiry(ctx context.Context, event OptionExpiry) (bool
 	return applied, err
 }
 
-// ApplyOptionExpiry is process-local paper venue settlement. It validates before
-// mutating; durable account dedup lives in Store, as with paper fill receipts.
+// ApplyOptionExpiry validates before mutation and journals the venue settlement
+// when durable paper mode is enabled.
 func (a *PaperAdapter) ApplyOptionExpiry(ctx context.Context, event OptionExpiry) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -295,10 +295,15 @@ func (a *PaperAdapter) ApplyOptionExpiry(ctx context.Context, event OptionExpiry
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if err := a.validateOptionExpiryLocked(event); err != nil {
-		return false, err
-	}
-	return a.applyOptionExpiryLocked(event), nil
+	var applied bool
+	err := a.mutatePaperLocked(ctx, paperOperation{Kind: "option", Option: &event}, func(context.Context) error {
+		if err := a.validateOptionExpiryLocked(event); err != nil {
+			return err
+		}
+		applied = a.applyOptionExpiryLocked(event)
+		return nil
+	})
+	return applied && err == nil, err
 }
 
 func (a *PaperAdapter) applyOptionExpiryLocked(event OptionExpiry) bool {
@@ -320,15 +325,15 @@ func (a *PaperAdapter) applyOptionExpiryLocked(event OptionExpiry) bool {
 }
 
 // ApplyOptionExpiry owns the ledger and paper mutation under the same account
-// serialization boundary. Paper remains process-local and cannot be restarted
-// from the ledger; this adds no restart or real venue settlement capability.
+// serialization boundary. Durable paper commits the venue journal and ledger
+// together; ordinary backtests retain their process-local behavior.
 func (b *SharedAccountBorrow) ApplyOptionExpiry(event OptionExpiry) (bool, error) {
 	var applied bool
 	err := b.use(func(s *SharedAccount) error {
 		return s.owner.DoLocal(s.owner.Token(), func(ctx context.Context) error {
 			paper, ok := s.opts.Adapter.(*PaperAdapter)
 			if !ok {
-				return errors.New("execution: cash options require a process-local paper adapter")
+				return errors.New("execution: cash options require a paper adapter")
 			}
 			// Validate venue state before the durable commit without changing it.
 			paper.mu.Lock()
@@ -340,18 +345,20 @@ func (b *SharedAccountBorrow) ApplyOptionExpiry(event OptionExpiry) (bool, error
 				return err
 			}
 			var err error
-			applied, err = s.store.ApplyOptionExpiry(ctx, event)
-			if err != nil || !applied {
-				return err
-			}
-			paper.applyOptionExpiryLocked(event)
-			return nil
+			return paper.mutatePaperLocked(ctx, paperOperation{Kind: "option", Option: &event}, func(ctx context.Context) error {
+				applied, err = s.store.ApplyOptionExpiry(ctx, event)
+				if err != nil || !applied {
+					return err
+				}
+				paper.applyOptionExpiryLocked(event)
+				return nil
+			})
 		})
 	})
 	if err == nil && applied {
 		b.service.notifyCommitted()
 	}
-	return applied, err
+	return applied && err == nil, err
 }
 
 func (a *PaperAdapter) validateOptionExpiryLocked(event OptionExpiry) error {

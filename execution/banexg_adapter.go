@@ -139,6 +139,12 @@ func (a *BanexgAdapter) BindStore(store *Store) error {
 	return errors.New("execution: banexg adapter already bound to a different store")
 }
 
+// The pinned SDK does not prove complete native conditional recovery or the
+// midpoint trigger reference. Creation support alone cannot enable delegation.
+func (a *BanexgAdapter) NativeConditionalCapabilities() ConditionalCapabilities {
+	return ConditionalCapabilities{}
+}
+
 func (a *BanexgAdapter) Capabilities() AdapterCapabilities {
 	return AdapterCapabilities{PostOnly: a.proof.PostOnly, QueryClientID: a.proof.QueryClientID, AuthoritativeNotFound: a.proof.AuthoritativeNotFound, CumulativeReports: true}
 }
@@ -189,6 +195,9 @@ func quantitySteps(value float64, instrument Instrument) (int64, error) {
 }
 
 func (a *BanexgAdapter) Submit(ctx context.Context, intent OrderIntent, clientID string) (SubmitReceipt, error) {
+	if intent.Conditional != nil {
+		return SubmitReceipt{}, errors.New("execution: banexg native conditional lifecycle is unproven")
+	}
 	if intent.Instrument.Valuation != "linear_perpetual" {
 		return SubmitReceipt{}, errors.New("execution: live banexg rejects cash options")
 	}
@@ -394,61 +403,118 @@ func (a *BanexgAdapter) orderSnapshot(raw *banexg.Order, order StoredOrder) (Que
 type BanexgStreamReport struct {
 	OrderID              string // recovery wake-up only; streamed partial fee reports never mutate books
 	UnassignedExchangeID string
+	ExternalOrder        *ExternalOrderHint
+	AccountChanged       bool // wake-up only; balances/positions require an authoritative snapshot
 	Err                  error
 }
 
-// Reports translates private order/trade updates into recovery hints. The
-// account owner queries authoritative cumulative snapshots before accounting.
+// Reports translates private trade/status, balance and position updates into recovery hints.
+// The account owner queries authoritative cumulative snapshots before accounting.
 // Unknown/manual identities are explicit unassigned events requiring a freeze.
 func (a *BanexgAdapter) Reports(ctx context.Context) (<-chan BanexgStreamReport, error) {
 	if !a.exchange.HasApi(banexg.ApiWatchMyTrades, "") {
 		return nil, errors.New("execution: banexg private reports unsupported")
 	}
+	streamCtx, cancel := context.WithCancel(ctx)
 	var input chan *banexg.MyTrade
-	err := a.invoke(ctx, func() error {
-		stream, e := a.exchange.WatchMyTrades(a.params(ctx))
+	var balances chan *banexg.Balances
+	var positions chan []*banexg.Position
+	err := a.invoke(streamCtx, func() error {
+		stream, e := a.exchange.WatchMyTrades(a.params(streamCtx))
 		input = stream
 		if e != nil {
 			return e
 		}
+		if input == nil {
+			return errors.New("execution: nil banexg private report stream")
+		}
+		if a.exchange.HasApi(banexg.ApiWatchBalance, "") {
+			balances, e = a.exchange.WatchBalance(a.params(streamCtx))
+			if e != nil {
+				return e
+			}
+			if balances == nil {
+				return errors.New("execution: nil banexg private balance stream")
+			}
+		}
+		if a.exchange.HasApi(banexg.ApiWatchPositions, "") {
+			positions, e = a.exchange.WatchPositions(a.params(streamCtx))
+			if e != nil {
+				return e
+			}
+			if positions == nil {
+				return errors.New("execution: nil banexg private position stream")
+			}
+		}
 		return nil
 	})
 	if err != nil {
+		cancel()
 		return nil, err
-	}
-	if input == nil {
-		return nil, errors.New("execution: nil banexg private report stream")
 	}
 	output := make(chan BanexgStreamReport, 64)
 	go func() {
 		defer close(output)
+		defer cancel()
+		emit := func(report BanexgStreamReport) bool {
+			select {
+			case output <- report:
+				return true
+			case <-streamCtx.Done():
+				return false
+			}
+		}
 		for {
 			select {
-			case <-ctx.Done():
+			case <-streamCtx.Done():
 				return
+			case position, ok := <-positions:
+				if !ok {
+					emit(BanexgStreamReport{Err: errors.New("execution: banexg private position stream closed; reconcile before admission")})
+					return
+				}
+				// Position pushes can be partial, mutable or out of order. Do not
+				// inspect their fields or overwrite the ledger with pushed quantities.
+				if position == nil {
+					if !emit(BanexgStreamReport{Err: errors.New("execution: nil banexg private position report")}) {
+						return
+					}
+				} else if !emit(BanexgStreamReport{AccountChanged: true}) {
+					return
+				}
+			case balance, ok := <-balances:
+				if !ok {
+					emit(BanexgStreamReport{Err: errors.New("execution: banexg private balance stream closed; reconcile before admission")})
+					return
+				}
+				if balance == nil {
+					if !emit(BanexgStreamReport{Err: errors.New("execution: nil banexg private balance report")}) {
+						return
+					}
+				} else if !emit(BanexgStreamReport{AccountChanged: true}) {
+					return
+				}
 			case trade, ok := <-input:
 				if !ok {
-					select {
-					case output <- BanexgStreamReport{Err: errors.New("execution: banexg private stream closed; reconcile before admission")}:
-					case <-ctx.Done():
-					}
+					emit(BanexgStreamReport{Err: errors.New("execution: banexg private stream closed; reconcile before admission")})
 					return
 				}
 				report := BanexgStreamReport{}
 				if trade == nil {
 					report.Err = errors.New("execution: nil banexg private report")
 				} else {
-					stored, err := a.storedIdentity(ctx, trade.ClientID, trade.Order)
+					stored, err := a.storedIdentity(streamCtx, trade.ClientID, trade.Order)
 					if err != nil {
 						report.UnassignedExchangeID = trade.Order
 						report.Err = err
+						if errors.Is(err, sql.ErrNoRows) && canonicalID(trade.Order) && canonicalID(trade.Symbol) {
+							report.ExternalOrder = &ExternalOrderHint{Symbol: trade.Symbol, ExchangeID: trade.Order, ClientID: trade.ClientID}
+						}
 					} else {
 						report.OrderID = stored.Intent.ID
 					}
 				}
-				select {
-				case output <- report:
-				case <-ctx.Done():
+				if !emit(report) {
 					return
 				}
 			}

@@ -161,6 +161,26 @@ func closeFactorLiveSession(session *explicitEntrySession, bindings []FactorLive
 	return result
 }
 
+func factorLiveUsesHub(u *config.UnifiedConfig, configs []runner.Config, name string) (bool, error) {
+	hubMode := name == "" || name == "banexg" || name == "hub"
+	if name == "" {
+		hasHub, hasEmbedded := false, false
+		for _, c := range configs {
+			provider, _ := accountExecutionFields(u, c.AccountID)["live_provider"].(string)
+			if provider == "" || provider == "banexg" || provider == "hub" {
+				hasHub = true
+			} else {
+				hasEmbedded = true
+			}
+		}
+		if hasHub && hasEmbedded {
+			return false, errors.New("factor: cannot mix default Hub and embedded execution providers in one robot")
+		}
+		hubMode = hasHub
+	}
+	return hubMode, nil
+}
+
 // runFactorLiveSpecWithArgs is the CLI/runtime integration boundary for factor
 // live runs, preserving command arguments, logging and the startup lifecycle.
 func runFactorLiveSpecWithArgs(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec, configs []runner.Config, name string, out io.Writer, startup live.CryptoTraderStartupFunc) (resultErr error) {
@@ -170,10 +190,20 @@ func runFactorLiveSpecWithArgs(ctx context.Context, args *config.CmdArgs, spec *
 	if args == nil {
 		args = &config.CmdArgs{}
 	}
+	hubMode, err := factorLiveUsesHub(spec.Config(), configs, name)
+	if err != nil {
+		return err
+	}
 	for _, c := range configs {
-		if err := validateFactorLiveConfig(c); err != nil {
+		if hubMode && spec.Config().Root.Env == core.RunEnvDryRun && c.Manifest.Costs.FundingPolicy != "explicit-zero" {
+			return errors.New("factor: dry_run Hub requires funding_policy: explicit-zero until simulated funding ingestion is supported")
+		}
+		if err := validateFactorLiveConfigMode(c, !hubMode); err != nil {
 			return err
 		}
+	}
+	if !hubMode && spec.Config().Root.Env == core.RunEnvDryRun {
+		return errors.New("factor: dry_run requires Hub paper execution; embedded live adapters are forbidden")
 	}
 	for _, policy := range spec.Config().RunPolicy {
 		if policy.Engine == config.EngineTimeSeries {
@@ -205,6 +235,35 @@ func runFactorLiveSpecWithArgs(ctx context.Context, args *config.CmdArgs, spec *
 		}
 		mergedAccounts[account] = merged
 	}
+	var tsAccounts []string
+	for _, policy := range spec.Config().RunPolicy {
+		if policy.Engine == config.EngineTimeSeries {
+			policyAccounts, err := spec.Config().PolicyAccounts(policy)
+			if err != nil {
+				return err
+			}
+			for _, account := range policyAccounts {
+				if groups[account] == nil && !slices.Contains(tsAccounts, account) {
+					tsAccounts = append(tsAccounts, account)
+				}
+			}
+		}
+	}
+	if hubMode {
+		return runFactorHubSpec(ctx, args, spec, groups, mergedAccounts, accounts, tsAccounts, out, startup, sourceOptions)
+	}
+	var tsConfigs map[string]runner.Config
+	var tsFactories map[string]FactorLiveBindingFactory
+	if len(tsAccounts) > 0 && spec.Config().Root.Env == core.RunEnvProd {
+		tsConfigs, err = buildTimeSeriesLiveConfigs(spec)
+		if err != nil {
+			return err
+		}
+		tsFactories, err = resolveFactorLiveFactories(spec, tsAccounts, "")
+		if err != nil {
+			return err
+		}
+	}
 	factories, err := resolveFactorLiveFactories(spec, accounts, name)
 	if err != nil {
 		return err
@@ -224,20 +283,6 @@ func runFactorLiveSpecWithArgs(ctx context.Context, args *config.CmdArgs, spec *
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	writer := &factorLiveWriter{Writer: out}
-	var tsAccounts []string
-	for _, policy := range spec.Config().RunPolicy {
-		if policy.Engine == config.EngineTimeSeries {
-			policyAccounts, err := spec.Config().PolicyAccounts(policy)
-			if err != nil {
-				return err
-			}
-			for _, account := range policyAccounts {
-				if groups[account] == nil && !slices.Contains(tsAccounts, account) {
-					tsAccounts = append(tsAccounts, account)
-				}
-			}
-		}
-	}
 	results := make(chan error, len(accounts)+len(tsAccounts))
 	// prepareFactorLiveBindings is account-scoped; route each request to its
 	// already validated provider while retaining one cleanup lifecycle.
@@ -257,6 +302,21 @@ func runFactorLiveSpecWithArgs(ctx context.Context, args *config.CmdArgs, spec *
 			return err
 		}
 	}
+	tsBindings := map[string]FactorLiveBinding{}
+	for _, account := range tsAccounts {
+		if tsFactories == nil {
+			continue
+		}
+		binding, err := tsFactories[account](ctx, session.exchange, snapshot, tsConfigs[account])
+		bindings = append(bindings, binding)
+		if err != nil {
+			return err
+		}
+		if _, err := session.prepareMixedLiveBinding(snapshot, tsConfigs[account], &bindings[len(bindings)-1]); err != nil {
+			return err
+		}
+		tsBindings[account] = bindings[len(bindings)-1]
+	}
 	for index, account := range accounts {
 		group, binding := groups[account], bindings[index]
 		go func() {
@@ -266,7 +326,14 @@ func runFactorLiveSpecWithArgs(ctx context.Context, args *config.CmdArgs, spec *
 		}()
 	}
 	for _, account := range tsAccounts {
-		go func() { results <- session.runMixedLiveTSAccount(ctx, snapshot, account, startup); cancel() }()
+		go func() {
+			if binding, ok := tsBindings[account]; ok {
+				results <- session.runTimeSeriesExecutionAccount(ctx, snapshot, tsConfigs[account], binding, startup)
+			} else {
+				results <- session.runMixedLiveTSAccount(ctx, snapshot, account, startup)
+			}
+			cancel()
+		}()
 	}
 	for range len(accounts) + len(tsAccounts) {
 		resultErr = errors.Join(resultErr, <-results)
@@ -276,7 +343,9 @@ func runFactorLiveSpecWithArgs(ctx context.Context, args *config.CmdArgs, spec *
 
 // Check all choices that need no session evidence before creating resources.
 // Binding-specific symbol and venue capabilities are checked after preparation.
-func validateFactorLiveConfig(c runner.Config) error {
+func validateFactorLiveConfig(c runner.Config) error { return validateFactorLiveConfigMode(c, true) }
+
+func validateFactorLiveConfigMode(c runner.Config, local bool) error {
 	if c.Execution.HistoryPath != "" {
 		return errors.New("factor: cold history is only available for simulated replay")
 	}
@@ -287,7 +356,7 @@ func validateFactorLiveConfig(c runner.Config) error {
 	if !e.MarginRate.IsPositive() || e.MarginRate.GreaterThan(decimal.NewFromInt(1)) || !e.MaxAccountMargin.IsPositive() || !e.MaxVirtualGross.IsPositive() || !e.StrategyGrossLimit.IsPositive() || len(e.Instruments) == 0 {
 		return errors.New("factor: live requires explicit instrument units and positive absolute risk limits")
 	}
-	if !filepath.IsAbs(e.StorePath) || !filepath.IsAbs(e.SenderLeaseDir) {
+	if local && (!filepath.IsAbs(e.StorePath) || !filepath.IsAbs(e.SenderLeaseDir)) {
 		return errors.New("factor: live ledger and sender lease paths must be absolute")
 	}
 	for _, sid := range append(slices.Clone(c.Snapshot.Universe.Tracked), c.Snapshot.Universe.Investable...) {
@@ -518,7 +587,12 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 		copyBridge.QuoteContext = func(ctx context.Context, id string, _ int64) (execution.VisibleQuote, error) {
 			return adapter.Observe(ctx, id)
 		}
+		copyBridge.DefaultLimitPrice = adapter.DefaultLimitPrice
 		bridge = &copyBridge
+	}
+	opts.TakeoverStrategy, err = executionTakeoverOwner(cfg, bridge)
+	if err != nil {
+		return err
 	}
 	var planOptions data.SubscriptionPlanOptions
 	if len(sourceOptions) > 0 {

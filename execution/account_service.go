@@ -27,9 +27,13 @@ type SharedExecutionOptions struct {
 	SenderLeaseDir        string
 	Adapter               ExecutionAdapter
 	AuthoritativeSnapshot bool
+	TakeoverStrategy      StrategyID
 }
 
 func (o SharedExecutionOptions) Validate() error {
+	if o.TakeoverStrategy != "" && !canonicalID(string(o.TakeoverStrategy)) {
+		return errors.New("execution: invalid takeover strategy")
+	}
 	if o.Memory {
 		if paper, simulated := o.Adapter.(*PaperAdapter); !simulated || paper == nil || o.StorePath != "" || o.SenderLeaseDir != "" {
 			return errors.New("execution: memory account requires a simulated venue and no store or sender lease paths")
@@ -49,31 +53,32 @@ func (o SharedExecutionOptions) Validate() error {
 }
 
 func (o SharedExecutionOptions) Same(other SharedExecutionOptions) bool {
-	return o.Memory == other.Memory && filepath.Clean(o.HistoryPath) == filepath.Clean(other.HistoryPath) && filepath.Clean(o.StorePath) == filepath.Clean(other.StorePath) && filepath.Clean(o.SenderLeaseDir) == filepath.Clean(other.SenderLeaseDir) && o.Adapter == other.Adapter && o.AuthoritativeSnapshot == other.AuthoritativeSnapshot
+	return o.Memory == other.Memory && filepath.Clean(o.HistoryPath) == filepath.Clean(other.HistoryPath) && filepath.Clean(o.StorePath) == filepath.Clean(other.StorePath) && filepath.Clean(o.SenderLeaseDir) == filepath.Clean(other.SenderLeaseDir) && o.Adapter == other.Adapter && o.AuthoritativeSnapshot == other.AuthoritativeSnapshot && o.TakeoverStrategy == other.TakeoverStrategy
 }
 
 // SharedAccount is owned by Process. Its keeper is independent of Runtime
 // borrowers, so releasing the final Runtime does not invalidate the executor.
 type SharedAccount struct {
-	mu                  sync.Mutex
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	owner               *AccountHandle
-	store               *Store
-	executor            *OwnerExecutor
-	opts                SharedExecutionOptions
-	ready               bool
-	closed              bool
-	closeErr            error
-	reportCancel        context.CancelFunc
-	reportDone          chan struct{}
-	reportErrors        chan error
-	reportShutdownErr   error
-	failureFreezeMu     sync.Mutex
-	listeners           map[uint64]func()
-	listenerSerial      uint64
-	markets             map[string]accountMarket
-	policyEvidenceCache map[StrategyID]policyFillCache
+	mu                   sync.Mutex
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	owner                *AccountHandle
+	store                *Store
+	executor             *OwnerExecutor
+	opts                 SharedExecutionOptions
+	ready                bool
+	policyCancellationID string // only set while the serialized cancellation is executing
+	closed               bool
+	closeErr             error
+	reportCancel         context.CancelFunc
+	reportDone           chan struct{}
+	reportErrors         chan error
+	reportShutdownErr    error
+	failureFreezeMu      sync.Mutex
+	listeners            map[uint64]func()
+	listenerSerial       uint64
+	markets              map[string]accountMarket
+	policyEvidenceCache  map[StrategyID]policyFillCache
 }
 
 func NewSharedAccount(owner *AccountHandle, opts SharedExecutionOptions) (*SharedAccount, error) {
@@ -229,7 +234,8 @@ func (b *SharedAccountBorrow) StrategyTotals(ctx context.Context, strategy Strat
 // unmatched/manual order persists a risk freeze before returning. A failed or
 // incomplete snapshot never publishes ready and never clears a prior freeze.
 func (b *SharedAccountBorrow) Reconcile(id string, nowMS int64) error {
-	return b.use(func(s *SharedAccount) error {
+	adopted := false
+	err := b.use(func(s *SharedAccount) error {
 		s.ready = false
 		return s.owner.DoLocal(s.owner.Token(), func(ownerCtx context.Context) error {
 			ownerCtx, done := joinedOperationContext(ownerCtx, b.ctx)
@@ -239,6 +245,9 @@ func (b *SharedAccountBorrow) Reconcile(id string, nowMS int64) error {
 			}
 			ctx, cancel := context.WithTimeout(ownerCtx, 15*time.Second)
 			defer cancel()
+			if err := s.store.requireNoAccountPolicyCancellation(ctx, ""); err != nil {
+				return err
+			}
 			venue, err := s.opts.Adapter.Snapshot(ctx)
 			if err != nil {
 				return err
@@ -270,6 +279,13 @@ func (b *SharedAccountBorrow) Reconcile(id string, nowMS int64) error {
 			if err != nil {
 				return err
 			}
+			if s.opts.TakeoverStrategy != "" && takeoverSnapshotMatches(local, cash, venue.Positions) {
+				records, err := s.store.AutoTakeoverExternal(ctx, s.opts.TakeoverStrategy, nowMS)
+				if err != nil {
+					return err
+				}
+				adopted = len(records) > 0
+			}
 			// The prefix labels the caller, while the timestamp and full snapshot
 			// identify its revision. Repeated startup prefixes never alias a new
 			// authoritative snapshot; identical revisions remain idempotent.
@@ -286,6 +302,10 @@ func (b *SharedAccountBorrow) Reconcile(id string, nowMS int64) error {
 			return err
 		})
 	})
+	if adopted {
+		b.service.notifyCommitted()
+	}
+	return err
 }
 
 // RecoverPersisted refreshes all transmitted durable orders before startup
@@ -415,9 +435,29 @@ func (s *SharedAccount) prepareRebalanceWithCheckpoints(request CombinedRebalanc
 	// A touched instrument may contain another strategy's still-pending target.
 	// Preserve its contributor definition; plan membership alone cannot prevent
 	// a replacement delta from losing its limit or renewing its expiry.
+	confirmed, readErr := s.store.Snapshot(operationCtx)
+	if readErr != nil {
+		return PreparedRebalance{}, readErr
+	}
+	projectedLots, _, readErr := confirmedExposure(confirmed)
+	if readErr != nil {
+		return PreparedRebalance{}, readErr
+	}
 	for index := range request.Requests {
 		r := &request.Requests[index]
 		for _, target := range r.Targets {
+			projected := int64(0)
+			for _, lot := range projectedLots {
+				if lot.Strategy == target.Strategy && lot.ID == target.Lot && lot.Instrument.ID == r.Instrument.ID {
+					projected = lot.SignedSteps
+				}
+			}
+			// Settled inherited quantities have no new execution delta. Carrying
+			// a canceled reservation's old placement permission would resurrect
+			// its sole-owner admission after a contributor transition.
+			if target.SignedSteps == projected {
+				continue
+			}
 			carried := false
 			for _, old := range latestPlan.Targets {
 				if old.Strategy == target.Strategy && old.Lot == target.Lot && old.Instrument == r.Instrument.ID && old.SignedSteps == target.SignedSteps {
@@ -561,6 +601,9 @@ func (s *SharedAccount) rebalance(request CombinedRebalance, nowMS int64, ctx co
 }
 
 func (s *SharedAccount) sendPreparedRebalance(prepared PreparedRebalance, nowMS int64, ctx context.Context) error {
+	if err := s.store.requireNoAccountPolicyCancellation(ctx, s.policyCancellationID); err != nil {
+		return err
+	}
 	for _, id := range prepared.OrderIDs {
 		order, err := s.store.Order(context.Background(), id)
 		if err != nil {

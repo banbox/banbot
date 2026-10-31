@@ -536,6 +536,15 @@ func runExplicitTradeSpecContext(ctx context.Context, args *config.CmdArgs, spec
 		}
 		return nil
 	}
+	if (spec.Config().Root.Env == core.RunEnvProd || spec.Config().Root.Env == core.RunEnvDryRun) && (len(spec.Config().Execution) > 0 || len(spec.Config().AccountExecution) > 0) {
+		if err := runTimeSeriesExecution(ctx, args, spec, startup); err != nil {
+			return errs.New(core.ErrRunTime, err)
+		}
+		return nil
+	}
+	if spec.Config().Root.Env == core.RunEnvProd || spec.Config().Root.Env == core.RunEnvDryRun {
+		return errs.NewMsg(core.ErrBadConfig, "time-series execution: prod/dry_run requires explicit execution ledger, risk, funding and protection declarations; the legacy live sender is disabled")
+	}
 	if err := validateLegacyHistory(spec); err != nil {
 		return errs.New(core.ErrBadConfig, err)
 	}

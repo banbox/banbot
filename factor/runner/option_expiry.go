@@ -32,13 +32,13 @@ func (s *AccountSink) ObserveOptionExpiryRecord(ctx context.Context, r factor.Ve
 }
 
 func (s *AccountSink) settledOption(ctx context.Context, i execution.Instrument, now int64) (bool, error) {
-	if done, err := s.Account.TerminalSettled(ctx, i); err != nil || done {
+	if done, err := s.application().TerminalSettled(ctx, i); err != nil || done {
 		return done, err
 	}
 	if !i.IsOption() || now < i.Option.ExpiryMS {
 		return false, nil
 	}
-	return s.Account.OptionSettled(ctx, i)
+	return s.application().OptionSettled(ctx, i)
 }
 
 // optionQuoteExempt uses committed account settlement, never an elapsed clock

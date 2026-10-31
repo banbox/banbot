@@ -99,3 +99,18 @@ func TestCloseOrdersWithRuntimeDepsHonorsPairFilter(t *testing.T) {
 		t.Fatalf("unmatched pair triggered mutations: cancel=%v create=%v", exchange.cancelCalls, exchange.createCalls)
 	}
 }
+
+func TestProductionCloseCannotBypassExecutionOwner(t *testing.T) {
+	for _, raw := range []bool{false, true} {
+		exchange := &closeToolExchange{}
+		deps := closeToolDeps(exchange)
+		deps.Core.EnvReal = true
+		_, err := CloseOrdersWithRuntimeDeps(deps, TradeCloseRequest{Accounts: []string{"a"}, Exchange: raw, Confirmed: true})
+		if err == nil {
+			t.Fatal("retired production close path accepted without an execution owner")
+		}
+		if len(exchange.openCalls)+len(exchange.positionCalls)+len(exchange.cancelCalls)+len(exchange.createCalls) != 0 {
+			t.Fatal("rejected production close accessed the venue", exchange)
+		}
+	}
+}
