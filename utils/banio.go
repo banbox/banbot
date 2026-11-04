@@ -560,14 +560,32 @@ func (c *BanConn) CloseWaitChan(key string) {
 	c.lockWait.Unlock()
 }
 
+// CloseAllWaits closes every pending wait chan, so goroutines blocked in WaitResult
+// fail fast (ErrNetConnect) instead of waiting for their timeout. It is called when the connection is gone.
+func (c *BanConn) CloseAllWaits() {
+	c.lockWait.Lock()
+	for key, out := range c.waits {
+		close(out)
+		delete(c.waits, key)
+	}
+	c.lockWait.Unlock()
+}
+
 // SetWaitResult set result for key
 func (c *BanConn) SetWaitResult(key string, data []byte) error {
-	out, ok := c.GetWaitChan(key)
+	// send under the lock so a concurrent CloseWaitChan can not close the chan mid-send (panic)
+	c.lockWait.Lock()
+	defer c.lockWait.Unlock()
+	out, ok := c.waits[key]
 	if !ok {
 		return fmt.Errorf("key not found: %s", key)
 	}
-	out <- data
-	return nil
+	select {
+	case out <- data:
+		return nil
+	default:
+		return fmt.Errorf("wait chan full: %s", key)
+	}
 }
 
 func (c *BanConn) SendWaitRes(key string, data interface{}) *errs.Error {
@@ -583,9 +601,11 @@ func (c *BanConn) WaitResult(ctx context.Context, key string, timeout time.Durat
 	if !ok {
 		return nil, errs.NewMsg(errs.CodeRunTime, "key not found: %s", key)
 	}
-	var res []byte
 	select {
-	case res = <-out:
+	case res, ok := <-out:
+		if !ok {
+			return nil, errs.NewMsg(core.ErrNetConnect, "connection closed while waiting for key: %s", key)
+		}
 		c.CloseWaitChan(key)
 		return res, nil
 	case <-ctx.Done():
@@ -661,14 +681,9 @@ func (c *BanConn) runForever(runMode string) *errs.Error {
 		}
 		if strings.HasPrefix(msg.Action, "__res__") {
 			requestID := msg.Action[7:]
-			if out, ok := c.GetWaitChan(requestID); ok {
-				select {
-				case out <- msg.Data:
-					break
-				default:
-					log.Error("wait chan full, closing and skip", zap.String("requestID", requestID))
-					c.CloseWaitChan(requestID)
-				}
+			if err_ := c.SetWaitResult(requestID, msg.Data); err_ != nil && strings.HasPrefix(err_.Error(), "wait chan full") {
+				log.Error("wait chan full, closing and skip", zap.String("requestID", requestID))
+				c.CloseWaitChan(requestID)
 			}
 			continue
 		}
@@ -1197,6 +1212,7 @@ func (s *ServerIO) RunForever(intvSecs, timeoutSecs int) *errs.Error {
 					zap.String("err", err.Message()))
 			}
 			s.RemoveConnection(conn)
+			conn.CloseAllWaits()
 			if s.OnConnExit != nil {
 				s.OnConnExit(conn, err)
 			}

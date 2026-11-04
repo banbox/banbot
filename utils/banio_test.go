@@ -10,6 +10,7 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/internal/testutil"
+	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
 	"io"
@@ -658,5 +659,32 @@ func TestBanConnConcurrentLargeData(t *testing.T) {
 
 	if receivedCount != int64(concurrentCount) {
 		t.Errorf("message count mismatch: expected %d, received %d", concurrentCount, receivedCount)
+	}
+}
+
+func TestWaitResultFailsFastWhenWaitsClosed(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	srv := NewBanServer("", "")
+	conn := srv.WrapConn(left)
+	defer conn.Close()
+	key := conn.SetWait("", 1)
+	done := make(chan *errs.Error, 1)
+	go func() {
+		_, err := conn.WaitResult(context.Background(), key, time.Minute)
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	conn.CloseAllWaits()
+	select {
+	case err := <-done:
+		if err == nil || err.Code != core.ErrNetConnect {
+			t.Fatalf("expected ErrNetConnect, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitResult did not return after CloseAllWaits")
+	}
+	if err := conn.SetWaitResult(key, []byte("x")); err == nil {
+		t.Fatal("SetWaitResult must fail for a closed wait")
 	}
 }
