@@ -8,6 +8,7 @@ import (
 	utils2 "github.com/banbox/banexg/utils"
 
 	"github.com/banbox/banbot/utils"
+	"github.com/banbox/banexg/log"
 
 	"github.com/banbox/banbot/web/ui"
 	"github.com/gofiber/fiber/v2/middleware/basicauth"
@@ -127,7 +128,21 @@ func runWebWithFactory(ag *CmdArgs, factory ServerFactory) error {
 	if err := server.serveStatic(app); err != nil {
 		return err
 	}
-	return listenWithContext(server.ctx, app, fmt.Sprintf("%s:%v", ag.Host, ag.Port))
+	bindUrl := fmt.Sprintf("%s:%v", ag.Host, ag.Port)
+	lang := utils.GetSystemLanguage()
+	openUrl := "http://" + bindUrl
+	if lang == "zh-CN" {
+		openUrl += "/zh-CN"
+	}
+
+	// 延迟500ms打开浏览器
+	if utils.IsDocker() {
+		log.Info("please open browser to: " + openUrl)
+	} else {
+		utils.OpenBrowserDelay(openUrl, 500)
+	}
+
+	return listenWithContext(server.ctx, app, bindUrl)
 }
 
 func newWebApp() *fiber.App {
