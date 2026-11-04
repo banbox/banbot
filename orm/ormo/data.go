@@ -59,6 +59,13 @@ const (
 	OdInfoTakeProfit   = "TakeProfit"
 	OdInfoClientID     = "ClientID"
 	OdInfoRetry        = "Retry"
+	// OdInfoSubmitUnconfirmed holds the queue action (OdActionEnter/OdActionExit)
+	// whose exchange result could not be confirmed; the retry reuses the same
+	// client order id instead of submitting a new order.
+	OdInfoSubmitUnconfirmed = "SubmitUnconfirmed"
+	// OdInfoSubmitReconcileTries counts reconciliation attempts for the
+	// unconfirmed submission, so reconciliation is bounded.
+	OdInfoSubmitReconcileTries = "SubmitReconcileTries"
 	OdInfoSLTP         = "SL_TP"
 )
 

@@ -51,16 +51,60 @@ func GetClientOrderCapability(exchange banexg.BanExchange) ClientOrderCapability
 	return capability
 }
 
-func callClientOrderCapability(capability ClientOrderCapability, namespace string, orderID int64, clientID string, randomize bool) (value string, err *errs.Error) {
+func callClientOrderCapability(capability ClientOrderCapability, namespace string, orderID int64, clientID string, randomize bool) (string, *errs.Error) {
+	return guardClientOrderID(func() string {
+		return capability.BuildClientOrderID(namespace, orderID, clientID, randomize)
+	})
+}
+
+func guardClientOrderID(build func() string) (value string, err *errs.Error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			value = ""
 			err = errs.NewMsg(core.ErrRunTime, "client order capability panicked: %v", recovered)
 		}
 	}()
-	value = capability.BuildClientOrderID(namespace, orderID, clientID, randomize)
+	value = build()
 	if value == "" {
 		return "", errs.NewMsg(core.ErrRunTime, "client order capability returned an empty identifier")
 	}
 	return value, nil
+}
+
+// ClientOrderPurposeCapability is the optional adapter contract for stable
+// per-purpose identifiers. Adapters without it keep the randomized identifier.
+type ClientOrderPurposeCapability = banexg.ClientOrderPurposeCapability
+
+// SubmitReconcileCapability is the optional adapter contract for resolving a
+// submission whose response never reached the client.
+type SubmitReconcileCapability = banexg.SubmitReconcileCapability
+
+// GetClientOrderPurposeCapability unwraps BotExchange and reports whether the
+// adapter can build a stable identifier for one purpose of a local order.
+func GetClientOrderPurposeCapability(exchange banexg.BanExchange) ClientOrderPurposeCapability {
+	capability, _ := getExchangeCapability[ClientOrderPurposeCapability](exchange)
+	return capability
+}
+
+// GetSubmitReconcileCapability unwraps BotExchange and reports whether the
+// adapter can confirm the exchange-side result of an uncertain submission.
+func GetSubmitReconcileCapability(exchange banexg.BanExchange) SubmitReconcileCapability {
+	capability, _ := getExchangeCapability[SubmitReconcileCapability](exchange)
+	return capability
+}
+
+// BuildPurposeClientOrderIDChecked returns an identifier that is stable for one
+// purpose of one local order, so entry and exit cannot collide and a resubmit
+// reuses the same idempotency key. It fails when the adapter has no such
+// contract, and callers then fall back to BuildClientOrderIDChecked.
+func BuildPurposeClientOrderIDChecked(exchange banexg.BanExchange, namespace string, orderID int64,
+	clientID string, purpose banexg.ClientOrderPurpose) (string, *errs.Error) {
+	capability := GetClientOrderPurposeCapability(exchange)
+	if capability == nil {
+		return "", errs.NewMsg(errs.CodeNotSupport,
+			"exchange adapter does not provide client order purpose capability")
+	}
+	return guardClientOrderID(func() string {
+		return capability.BuildPurposeClientOrderID(namespace, orderID, clientID, purpose)
+	})
 }
