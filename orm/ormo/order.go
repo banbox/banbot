@@ -1744,6 +1744,11 @@ func CalcTimeRange(odList []*InOutOrder) (int64, int64) {
 	for _, od := range odList {
 		curEnter := od.RealEnterMS()
 		curExit := od.RealExitMS()
+		// RealEnterMS prefers Enter.UpdateAt, which can be stamped after the order already exited
+		// (late entry-order update); an order cannot start after it ended.
+		if curExit > 0 && curEnter > curExit {
+			curEnter = curExit
+		}
 		if curEnter > 0 && (startMS == 0 || curEnter < startMS) {
 			startMS = curEnter
 		}

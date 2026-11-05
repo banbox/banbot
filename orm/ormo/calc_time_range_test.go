@@ -15,3 +15,14 @@ func TestCalcTimeRangeIgnoresUnenteredOrder(t *testing.T) {
 		t.Fatalf("got %d..%d", start, end)
 	}
 }
+
+// Enter.UpdateAt stamped after the exit (late entry-order update) must not make start > end.
+func TestCalcTimeRangeEnterUpdatedAfterExit(t *testing.T) {
+	od := &InOutOrder{IOrder: &IOrder{EnterAt: 1690819200000, ExitAt: 1690855648680},
+		Enter: &ExOrder{CreateAt: 1690819200000, UpdateAt: 1690857683000},
+		Exit:  &ExOrder{CreateAt: 1690855648680, UpdateAt: 1690855648680}}
+	start, end := CalcTimeRange([]*InOutOrder{od})
+	if start > end || end != 1690855648680 {
+		t.Fatalf("got %d..%d", start, end)
+	}
+}
