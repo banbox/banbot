@@ -1739,13 +1739,13 @@ func CalcTimeRange(odList []*InOutOrder) (int64, int64) {
 	if len(odList) == 0 {
 		return 0, 0
 	}
-	startMS := odList[0].RealEnterMS()
-	endMS := odList[0].RealExitMS()
+	// An order that never entered (RealEnterMS == 0) must not pin the range start to 0.
+	var startMS, endMS int64
 	for _, od := range odList {
 		curEnter := od.RealEnterMS()
 		curExit := od.RealExitMS()
-		if curEnter > 0 {
-			startMS = min(startMS, curEnter)
+		if curEnter > 0 && (startMS == 0 || curEnter < startMS) {
+			startMS = curEnter
 		}
 		endMS = max(endMS, curExit)
 	}
