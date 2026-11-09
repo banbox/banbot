@@ -162,3 +162,29 @@ func enableLegacyWalletReplay(t *testing.T) {
 	core.BackTestMode = true
 	config.Data.BTLegacyWallet = true
 }
+
+func TestWalletValuationFallsBackToLastBarPriceInBacktest(t *testing.T) {
+	originalData := config.Data
+	originalBacktest := core.BackTestMode
+	originalTime := btime.CurTimeMS
+	t.Cleanup(func() {
+		config.Data = originalData
+		core.BackTestMode = originalBacktest
+		btime.CurTimeMS = originalTime
+	})
+	core.BackTestMode = true
+	btime.CurTimeMS = 3_000_000
+	symbol := "HELD-VALUATION"
+	com.SetBarPrice(symbol, 50)
+	btime.CurTimeMS += com.PriceExpireMS + 1
+	w := &BanWallets{Items: map[string]*ItemWallet{
+		symbol: {Available: 10, Pendings: map[string]float64{}, Frozens: map[string]float64{}},
+	}}
+	if got := w.TotalLegal(nil, false); got != 500 {
+		t.Fatalf("stale held coin must keep last bar price: got %v want 500", got)
+	}
+	config.Data.BTLegacyWallet = true
+	if got := w.TotalLegal(nil, false); got != 0 {
+		t.Fatalf("legacy wallet keeps old skip behaviour: got %v", got)
+	}
+}

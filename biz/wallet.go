@@ -1529,6 +1529,27 @@ func (w *BanWallets) markPrice(symbol string) float64 {
 	return walletMarkPrice(symbol)
 }
 
+// valuationPrice prices a wallet item for equity. The mark price expires 60s after the last bar, so a coin
+// held across a slow timeframe (8h/1d) had no fresh price when equity was sampled and its whole holding was
+// dropped from the total (equity collapsed to ~0 with 100% drawdown and a distorted UPI). Backtests (except
+// legacy/strict wallet compatibility, which keeps the old behaviour) fall back to the last bar price.
+func (w *BanWallets) valuationPrice(symbol string) float64 {
+	price := w.markPrice(symbol)
+	if price != -1 || w == nil || w.stableBacktest() {
+		return price
+	}
+	if w.runtimeBound {
+		if !w.runtimeBacktest {
+			return price
+		}
+		return w.runtimePrices.GetLastBarPriceAt(symbol)
+	}
+	if !core.BackTestMode {
+		return price
+	}
+	return com.GetLastBarPrice(symbol)
+}
+
 func stableWalletBacktest() bool {
 	return core.BackTestMode && (config.Data.BTLegacyWallet || config.Data.BTStrict)
 }
@@ -1573,7 +1594,7 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 	}
 	for key := range keys {
 		item := data[key]
-		price := w.markPrice(key)
+		price := w.valuationPrice(key)
 		if price == -1 {
 			skips = append(skips, key)
 			continue
