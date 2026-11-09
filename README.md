@@ -41,7 +41,7 @@ go [runbanbot](https://github.com/banbox/runbanbot) to get started with Docker i
 ### Work with AI
 Download the [banbot.md](doc/banbot.md) file, then attach this file to any AI conversation to tell it the strategy you want to test.
 
-[中文版 banbot.md](doc/banbot_cn.md)
+中文版（按引擎拆分）：[时序策略](doc/banbot_ts_cn.md)、[截面因子](doc/banbot_factor_cn.md)、[统计套利](doc/banbot_statarb_cn.md)。更多文档见 [doc/README.md](doc/README.md)。
 
 Or immediately test your idea using the [Banbot Workflow](https://www.banbot.site/zh-CN/ai).
 
@@ -65,7 +65,7 @@ This project is dual-licensed under GNU AGPLv3 License and a commercial license.
 
 ### Strategy engines
 
-Choose run_policy.engine: time_series (default) for per-symbol callbacks or factor for native multi-factor/cross-sectional rounds. Root `banbot backtest` / `banbot trade` run either or both from one YAML configuration. Mixed replay uses execution.mode: events and explicit account budgets. Factor research uses root `research`, version archives use `data archive`, and standalone expressions use root `validate` / `explain --spec`. See the [English guide](bandoc/en-US/guide/factor.md), [中文指南](bandoc/zh-CN/guide/factor.md), [API](bandoc/en-US/api/factor.md) and [refactor record](doc/strategy_engine_refactor.md).
+Choose run_policy.engine: time_series (default) for per-symbol callbacks or factor for native multi-factor/cross-sectional rounds. Root `banbot backtest` / `banbot trade` run either or both from one YAML configuration. Mixed replay uses execution.mode: events and explicit account budgets. Factor research uses root `research`, version archives use `data archive`, and standalone expressions use root `validate` / `explain --spec`. See the [English guide](bandoc/en-US/guide/factor.md), [中文指南](bandoc/zh-CN/guide/factor.md), [API](bandoc/en-US/api/factor.md).
 
 Factor live needs application-registered verified transport, instrument/revision/funding evidence and startup reconciliation. Missing capabilities fail explicitly; SDK support alone does not prove real factor venue readiness. Paper/dry-run is separate historical simulation.
 

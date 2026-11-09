@@ -1,6 +1,6 @@
 # 组合策略、换仓与持仓生命周期
 
-适用于 `v0.6.0-beta.9`。因子公式见 [表达式指南](factor_expression_guide.md)，高级研究 API 见 [研究扩展](factor_research_extensions.md)，源码与回归对应见 [实施记录](factor_opt_implementation.md)。
+适用于 `v0.6.0-beta.9`。因子公式见 [表达式指南](factor_expression_guide.md)，高级研究 API 见 [研究扩展](factor_research_extensions.md)。
 
 ## 先区分三个周期
 

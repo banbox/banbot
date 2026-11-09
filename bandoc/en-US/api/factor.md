@@ -167,7 +167,7 @@ Model builders produce predicted ideal portfolios. Lifecycle retain/dropout stil
 
 Reports do not infer fill age from target admission. Do not invent BatchID attribution when aggregate lots cannot prove it. Ordinary CLI does not automatically collect complete per-batch fill reports. Trial corruption/content conflicts refuse recovery and preserve the file; multiple processes require external owner serialization. CompareTrials does not select models by sorting out-of-sample performance.
 
-Implementation and fuller Go examples are in repository code paths `doc/factor_opt_implementation.md` and `doc/factor_research_extensions.md`. Costs, capacity and model validity require independent out-of-sample validation.
+Fuller Go examples are in `doc/factor_research_extensions.md`. Costs, capacity and model validity require independent out-of-sample validation.
 
 ## Replay and live
 

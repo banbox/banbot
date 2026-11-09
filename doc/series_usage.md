@@ -135,9 +135,3 @@ K 线扩展定义的 Name 可以是业务标签，不是独立 source 名；订�
 Spider 的 NotifySeries/SeriesMsg 已直接携带 DataSeries.Rows，不再传 Arr []*banexg.Kline。BanIO 内部消息外壳使用 gob，payload 经 JSON、压缩及可选加密；DataSeries.Values 的 JSON map 不会自动保留任意整数宽度或自定义 Go 类型，类型严格的源需 schema/解码校验，因子 JSON archive 导入使用 schema。进程内 startup 缓冲采用递归复制，不经过 JSON，可保留具体类型、typed nil、NULL 与缺键。
 
 QuestDB INSERT/CTAS 成功后不保证立即可读。依赖后续读取时等待目标行、时间戳、范围或记录数可见，替换前验证新表预期快照；超时保留恢复标记。不要依据一次空读清理恢复状态或删除旧表。同进程元数据优先用定向可见性等待或所属缓存/锁。
-
-## 2026-10-04 双引擎使用入口
-
-run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
-
-execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

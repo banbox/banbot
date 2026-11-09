@@ -110,7 +110,7 @@ RegisterPortfolioPolicy creates independent instances using versioned names and 
 
 swapPerBars/holdBars are not global aliases: use every_bars, min/max_bars or period_bars. Unknown, fractional, conflicting or unused fields fail validation. Geometric requires ratio/final_threshold in (0,1); target-step requires alpha in (0,1]. Exit transitions require quantity or weight basis; other transitions reject basis. Quantity outputs use versioned allocation-decision/allocation-accepted records and require a compatible consumer.
 
-Implementation boundaries are documented in repository paths `doc/factor_opt_implementation.md` and `doc/factor_research_extensions.md`. Holidays and custom schedules use RebalanceDue callbacks; heterogeneous or fill-based cohort lifetimes require a custom policy.
+Multi-horizon, robust neutralization, model and risk builders are documented in `doc/factor_research_extensions.md`. Holidays and custom schedules use RebalanceDue callbacks; heterogeneous or fill-based cohort lifetimes require a custom policy.
 
 ## Writing strategies in Go: three entry points
 

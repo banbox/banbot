@@ -2,7 +2,7 @@
 
 更新：2026-10-04。本文记录当前工作树已经实现的性能优先 `Process -> Runtime` 架构。它描述现状：High/Medium 的主要修复已落地，但不把 typed state 或局部双实例测试解释为完整的多 Runtime 业务并发隔离。
 
-领域包仍有兼容 facade，不能宣称全部全局状态已删除。本文原有 legacy gate / globals 安装描述已按现有源码校正，当前入口与验证见[重构记录](strategy_engine_refactor.md)。
+领域包仍有兼容 facade，不能宣称全部全局状态已删除。本文原有 legacy gate / globals 安装描述已按现有源码校正。
 
 ## 1. 核心结论
 
@@ -69,7 +69,7 @@ live runner 当前建立了三层停机边界：
 
 [`core.SplitSymbol`](../core/utils.go) 不再读取 `core.ExgName`，也没有 China 特判；默认 parser 只处理通用分隔符语法。Runtime-owned `Market.Prices` 内持有 [`core.SymbolParser`](../core/symbol_parser.go)，可在构造边界注入 typed `SymbolParserStrategy`。
 
-交易所价格语义由 `banexg v0.2.64` 的 capability 和 `MapMarket` 提供。banbot 在构造边界绑定 adapter parser，不按交易所名称补写专属 quote/settle 或合约月份逻辑。旧 `com` facade 按 exchange 保存独立 `PriceState`，保留基础品种别名和切换交易所后恢复旧价格的兼容行为。
+交易所价格语义由 `banexg` 的 capability 和 `MapMarket` 提供。banbot 在构造边界绑定 adapter parser，不按交易所名称补写专属 quote/settle 或合约月份逻辑。旧 `com` facade 按 exchange 保存独立 `PriceState`，保留基础品种别名和切换交易所后恢复旧价格的兼容行为。
 
 parser 使用并发缓存和 hot/warm 原子指针；exchange adapter 只在 cache miss 调用。价格和 runner 热路径继续使用具体 receiver、字段和局部变量，不通过 Context 查找服务。
 
@@ -101,20 +101,7 @@ Runtime context 用于取消树、deadline、startup/第三方数据源调用、
 
 ORM series table 的重入锁标记已从 `context.WithValue`/`Context.Value` 删除。repo 方法在需要时显式取得 process/table lock，并在同一方法边界释放；嵌套的 locked helper 只接受调用方已经建立的边界，不从 Context 推断状态。仓库其他独立功能若使用 Context 元数据，不代表 Runtime/ORM 可以恢复 service locator 模式。
 
-## 9. 历史设计决策与验证证据（保留原时点，本次验证见重构记录）
-
-- `Key[T]`：删除，无 alias、wrapper 或兼容层。
-- `banexg`：固定 `github.com/banbox/banexg v0.2.64`，`go.mod` 无本机绝对路径 replace，模块可从 Go proxy 下载。
-- 性能：typed hot paths 保持具体 receiver；现有 symbol parser、price state 等代表性 benchmark 报告零分配。该证据不是全链路 benchmark，也没有证明所有路径均低于 5% 回归阈值。
-- 历史账本基线：旧策略工作树快照的配置 SHA-256 记录为 `87bed31c92dd4769bf17ae218181c958f984fd3b5d63983c3141e4a4b9484a7b`；当时的 `Total Orders/BarNum = 733/1568085`、`Final Balance = 693.79`。
-- 2026-09-06 复验：在 `/data/quant/strat1` 运行 `./bot backtest -config @adv.yml`，退出码为 0；`Total Orders/BarNum = 0/1626569`、`Final Balance = 3000.00`、`Total Profit = 0.0%`、`Total Fee = 0.00`；elapsed `2:25.27`、user `53.70s`、最大 RSS `1064760 KB`，输出目录为 `/data/ban/data/backtest/18fbb39e60`。
-- 可比性：本次复验使用的 `/data/quant/strat1` 策略工作树状态不同于历史账本对应的旧快照，因此两次结果不能直接比较，也不得表述为当前指标与历史基线一致。
-- 变更后验证：`go vet ./...` 和 `go build ./...` 均通过；定向 package 测试和 race 测试均通过。`go test ./orm -count=1` 仍受外部 QuestDB WAL 可见性和 Binance linear `MATIC/USDT:USDT` market fixture 缺失影响，`TestBulkDownOHLCV` 未能完成；这属于外部环境限制，不改变已通过的编译、静态检查和 Runtime 回归证据。代表性 benchmark 已运行，typed hot paths 的代表性 benchmark 为零分配。
-- 测试：已有回归覆盖 legacy gate 互斥、runner typed deps、双 Runtime 局部状态隔离、第三方 source/字段投影隔离（相同 SID/timeframe、全局第三组 job、显式 NULL）、live provider/socket admission-stop-join、Context.Value 移除、QuestDB WAL 轮询/硬错误、CTAS 删除前验证、series NULL、recovery marker 和 SID reservation。
-
-这些证据支持当前迁移切片，不支持“完整多 Runtime 并发隔离已经完成”的结论。
-
-## 10. 剩余风险
+## 9. 剩余风险
 
 - 仍有包级兼容 facade；使用显式依赖和 owner 生命周期，不能以不存在的 gate 保证任意嵌入路径隔离。
 - 生产 typed live 的主要 cron、订单/钱包循环与 Web 已接入实例生命周期；仍应对外部组件和自定义嵌入路径验证 stop/join，不能推断任意外部 goroutine 都自动归属 Runtime。

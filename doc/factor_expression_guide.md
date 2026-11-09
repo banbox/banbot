@@ -510,9 +510,3 @@ go test ./examples/crosssection -run '^$' -bench '^BenchmarkFactorVersions$' -be
 资源限制为单公式 16 KiB、全部公式文本 256 KiB、AST 节点 8192、解析/展开深度预算 64；`lets + outputs`、bindings 和 params 的声明数量分别不超过 512。解析器对内部递归层数也计数，因此嵌套括号/函数未必能达到 64 个。限制是编译边界，不是对任意资产数量下内存使用的保证。
 
 当前没有赋值、比较、逻辑条件、三元/`where`、自动填补、数组索引、注释或任意 Go/Python 调用；不支持 `^`、十六进制浮点及数字下划线。也没有跨定义库引用、自动候选生成或 `factor operators/generate/test` 命令。需要新的原子算法时按照架构文档中的扩展步骤修改 Go 内核，并补充独立数值和 Session/Batch 测试。
-
-## 2026-10-04 双引擎使用入口
-
-run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
-
-execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

@@ -2,7 +2,7 @@
 
 当前时序策略使用 `TradeStrat`、`StratJob` 和实例 `State`，因子/截面使用 `factor/runner` 的 Go definition 或启动编译的 expressions。Go 策略需要编入当前可执行程序；表达式不要求同名 Go definition。两引擎原始数据保留 `DataSeries.Values` 的类型/NULL，自定义字段不收窄为 OHLCV。
 
-见[自定义策略](../bandoc/zh-CN/guide/strat_custom.md)、[因子指南](../bandoc/zh-CN/guide/factor.md)及[审查记录](../doc/strategy_engine_refactor.md)。以下保留历史动态加载方案调研，不表示当前策略装配已经使用其中某个 loader，也不能据历史比例做性能承诺。
+见[自定义策略](../bandoc/zh-CN/guide/strat_custom.md)、[因子指南](../bandoc/zh-CN/guide/factor.md)。以下保留历史动态加载方案调研，不表示当前策略装配已经使用其中某个 loader，也不能据历史比例做性能承诺。
 
 ## 历史调研：策略热加载的几种方案
 由于策略经常需要增删或更新，需要和机器人分开分发。go不支持二进制分发包，目前调研到下面几种动态加载方案。  

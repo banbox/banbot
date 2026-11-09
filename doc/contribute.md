@@ -58,7 +58,7 @@ beta 标签在 GitHub 上创建 prerelease；发布说明应列出配置兼容�
 后端接口默认访问`http://localhost:8000`。
 
 ### 如何编写新的运行时组件？
-通过 `config.LoadRunSpec` 加载统一配置，由 `entry` 装配任务级 `runtime.Runtime`，向组件传递明确的依赖。任务状态、时钟、存储和退出回调归该 Runtime 所有，避免新组件读取兼容包级变量。任意时序字段统一通过 `orm.DataSeries.Values` 传递。详见 [运行时上下文](runtime_context.md)、[时序数据](series_usage.md) 和 [包级架构审查](strategy_engine_refactor.md)。
+通过 `config.LoadRunSpec` 加载统一配置，由 `entry` 装配任务级 `runtime.Runtime`，向组件传递明确的依赖。任务状态、时钟、存储和退出回调归该 Runtime 所有，避免新组件读取兼容包级变量。任意时序字段统一通过 `orm.DataSeries.Values` 传递。详见 [运行时上下文](runtime_context.md)和[时序数据](series_usage.md)。
 
 ### json
 It is not recommended to replace `encoding/json` with [sonic](https://github.com/bytedance/sonic/issues/574). The binary file will increase by 15M (on Windows)

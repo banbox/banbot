@@ -110,7 +110,7 @@ cohort 的入场窗口结束后不再补足原计划，迟到真实 fill 按原�
 
 `swapPerBars`/`holdBars` 未作为全局别名：使用明确的 every_bars、min/max_bars 或 period_bars。未知字段、非整数 bar、冲突/未使用字段及不支持的目标消费端会拒绝运行。数量目标输出为版本化 `allocation-decision`/`allocation-accepted`，不会隐式转回旧权重格式。
 
-实施与边界见仓库 `doc/factor_opt_implementation.md`，多期限、稳健中性化、历史合成、参数扫描、模型与风险 builder 见 `doc/factor_research_extensions.md`。研究报告与高级插件提供原生 Go API；当前 CLI 不自动生成完整逐批成交归因。历史 IC 系列在 live 未接成熟历史 provider 前仍禁用。
+多期限、稳健中性化、历史合成、参数扫描、模型与风险 builder 见 `doc/factor_research_extensions.md`。研究报告与高级插件提供原生 Go API；当前 CLI 不自动生成完整逐批成交归因。历史 IC 系列在 live 未接成熟历史 provider 前仍禁用。
 
 ## 用 Go 写策略：三种入口
 

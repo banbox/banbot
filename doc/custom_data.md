@@ -779,9 +779,3 @@ OnData: strat.RouteData(strat.DataHandlers{
 8. **所有新接入的第三方时序数据都应先注册 source，再通过 `DataSub + ExSymbol.sid` 接入统一主链路。**
 9. **管理端和 Dashboard 的明细查看统一使用 `/api/kline/series`；该接口只读，不替代数据源的写入与补齐流程。**
 10. **性能优化不得回退 v0.4.3 的任意时序数据和 K 线自定义列能力；`DataSeries.Values` 是必须保留的通用兼容边界。**
-
-## 2026-10-04 双引擎使用入口
-
-run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
-
-execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

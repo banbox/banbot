@@ -29,7 +29,7 @@
 
 ## 组合 policy、尾仓与热更新
 
-从 v0.6.0-beta.6 起，可在 `portfolio` 启用 lifecycle-v1，分别配置 rebalance、holding、transition、selection 和 allocation。原有无状态 builder 仍可使用。量化规则及配置见 [组合与持仓指南](factor_portfolio_guide.md)，完整自定义 policy 和原生研究接口见 [实施记录](factor_opt_implementation.md)。
+从 v0.6.0-beta.6 起，可在 `portfolio` 启用 lifecycle-v1，分别配置 rebalance、holding、transition、selection 和 allocation。原有无状态 builder 仍可使用。量化规则及配置见 [组合与持仓指南](factor_portfolio_guide.md)，完整自定义 policy 和原生研究接口见[研究扩展](factor_research_extensions.md)。
 
 年龄依据策略首次真实成交，计划接纳不等于成交。min 保护普通退出，max 与 cohort 到期在缺 score 时也检查；quantity 渐退不会随 NAV 增长买回。待退出增仓先由 owner 取消/对账，未知订单不被当作已释放资金。
 
@@ -58,8 +58,6 @@ go test ./entry -run '^TestFactorLiveProductionSmoke$' -count=1 -v
 
 发布模块固定远程 banexg v0.2.65 与 banta v0.4.1；不依赖相邻目录 replace。本地 go.work 只用于开发，发布验收使用 GOWORK=off。交易所特有处理继续归 banexg，用户使用任一市场前仍须通过当前会话能力验证。
 
-## 2026-10-04 双引擎使用入口
+## 实盘 provider 约定
 
-run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
-
-execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。
+`execution.live_provider: verified-session` 只是用户工厂的示例名，必须先 `entry.RegisterFactorLiveBinding("verified-session", factory)` 注册并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级为 paper；`trade --dry-run` 是历史模拟。最新值数据库必须显式声明 `static-approximation`；任意字段/NULL 通过 `DataSeries.Values` 保留。

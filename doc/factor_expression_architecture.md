@@ -1,6 +1,6 @@
 # 因子表达式核心架构原理
 
-> 2026-10-04 校订：本文保留历史设计和测试口径。当前使用见[多因子指南](../bandoc/zh-CN/guide/factor.md)，逐包实施/暂缓与本次实际验证见[重构记录](strategy_engine_refactor.md)。缺失实施文档的链接已修复，历史结果不据此重新验收；真实 venue 与性能承诺仍需独立证据。
+> 本文说明因子表达式的设计原则与数据流；使用方式见[多因子指南](../bandoc/zh-CN/guide/factor.md)。
 
 
 Go builder 与因子表达式共享同一个截面、多因子计算内核：`factor.Node → factor.Plan → Session/Batch → Frame`。Go 代码直接构造节点，表达式则在启动时解析并转换为原生节点；执行时不逐 bar 解释字符串。常见因子可以通过公式、参数和命名中间项组合，只有新增原子算法才需要修改 Go。
@@ -134,7 +134,7 @@ Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame
 
 有状态 policy 在每个 run/strategy 创建独立实例，输入为冻结 Frame/Universe/NAV、实际持仓、在途和真实 fill 证据；提案不提交订单，owner 接纳 receipt 后才切换状态。quantity 与 NAV-fraction 是不同目标基准，不能用决策价格把绝对数量转换成旧权重后偷偷执行。完整合同见 [组合指南](factor_portfolio_guide.md)。
 
-多期限成熟标签、参数产物、模型 fit/predict 和风险 builder 属于研究与组合扩展，不进入共享 DAG 的账户状态。模型/参数须有训练截止、可用时间、manifest 与 hash；推理只读取当时已发布的版本。生命周期和归因 API 消费调用者提供的可核验事件，不自动得到独立批次执行 PnL。实现/限制见 [实施记录](factor_opt_implementation.md)。
+多期限成熟标签、参数产物、模型 fit/predict 和风险 builder 属于研究与组合扩展，不进入共享 DAG 的账户状态。模型/参数须有训练截止、可用时间、manifest 与 hash；推理只读取当时已发布的版本。生命周期和归因 API 消费调用者提供的可核验事件，不自动得到独立批次执行 PnL。实现与限制见[研究扩展](factor_research_extensions.md)。
 
 新增普通公式直接组合已有函数。新增原子算子时，应依次完成：
 

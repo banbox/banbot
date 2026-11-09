@@ -6,7 +6,7 @@ ormo/ormu依赖orm，不可反向依赖，避免出现依赖环
 
 因子历史读取需要区分 latest-value 的 `static-approximation` 和严格 PIT 版本/可见性证据。`RecordToSeries` 转换借用 Values，不代替异步队列所需的独立复制。QuestDB WAL 写后读需等待目标可见；表替换必须先验证快照，超时保留恢复标记。共享执行账户的 MemoryStore/SQL ledger 与 ormo 的时序订单投影有不同职责。
 
-见[自定义数据](../doc/custom_data.md)、[因子指南](../bandoc/zh-CN/guide/factor.md)和[重构记录](../doc/strategy_engine_refactor.md)。
+见[自定义数据](../doc/custom_data.md)和[因子指南](../bandoc/zh-CN/guide/factor.md)。
 
 
 ## 统一读写与处理

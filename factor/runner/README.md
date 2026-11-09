@@ -198,7 +198,7 @@ nonserialized handles. Raw records still travel through `DataSeries.Values` and
 
 ## Current guides and live provider names
 
-See the [guide](../../bandoc/en-US/guide/factor.md), [中文指南](../../bandoc/zh-CN/guide/factor.md) and [refactor record](../../doc/strategy_engine_refactor.md). verified-session above is an application registration example, not a built-in verified venue. Register entry.RegisterFactorLiveBinding("verified-session", factory) with real evidence first. Empty/banexg selects the built-in adapter; missing capabilities or unknown names fail explicitly. No live-venue acceptance or automatic paper fallback is implied.
+See the [guide](../../bandoc/en-US/guide/factor.md), [中文指南](../../bandoc/zh-CN/guide/factor.md). verified-session above is an application registration example, not a built-in verified venue. Register entry.RegisterFactorLiveBinding("verified-session", factory) with real evidence first. Empty/banexg selects the built-in adapter; missing capabilities or unknown names fail explicitly. No live-venue acceptance or automatic paper fallback is implied.
 
 ## Historical source-event decisions
 

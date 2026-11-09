@@ -145,7 +145,7 @@ Full 将遗漏的旧资产目标归零；Patch 保留遗漏目标。身份包含
 
 报告不从目标接纳时间推断成交时长；聚合 lot 无法证明逐批归因时不能伪造 BatchID。普通 CLI 不自动采集完整逐批成交报告。trial 损坏/内容冲突会拒绝恢复且保留文件，多进程写入需外层 owner 串行管理；CompareTrials 不按样本外表现排序做模型选择。
 
-实现与更完整 Go 用法见仓库代码路径 `doc/factor_opt_implementation.md`、`doc/factor_research_extensions.md`。真实成本、容量与模型有效性须独立样本外验证。
+更完整 Go 用法见仓库 `doc/factor_research_extensions.md`。真实成本、容量与模型有效性须独立样本外验证。
 
 ## replay 与 live
 

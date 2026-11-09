@@ -16,4 +16,4 @@ SeriesRuntime/HistSeriesFeeder 支持 TS 自定义源；双引擎 SubscriptionPl
 
 实盘受管理 source 返回独立 Stop/Join 句柄。Prepare/Warmup/Commit 候选代失败保留旧代；owner Stop封闭输入后 Join等待接纳回调，再释放所属资源。Spider消息是 NotifySeries/SeriesMsg.Rows；BanIO payload 是 JSON，不能将其视为任意 Go 类型的无损复制。
 
-strict PIT 需要版本与可见性证据，数据库latest-value必须明确 static-approximation。见[时序指南](../doc/series_usage.md)、[多因子指南](../bandoc/zh-CN/guide/factor.md)、[BanIO](../doc/banio.md)与[审查记录](../doc/strategy_engine_refactor.md)。
+strict PIT 需要版本与可见性证据，数据库latest-value必须明确 static-approximation。见[时序指南](../doc/series_usage.md)、[多因子指南](../bandoc/zh-CN/guide/factor.md)与[BanIO](../doc/banio.md)。

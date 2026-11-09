@@ -1,6 +1,6 @@
 # Architecture performance evidence
 
-These tools cover `doc/better_arch.md` sections 9.5 and 12. They do not reconstruct
+These tools collect architecture performance and race-test evidence. They do not reconstruct
 the missing pre-optimization dirty tree, prove physical power-loss durability, or
 replace PG/QuestDB/provider/account acceptance. No new project dependencies.
 
@@ -123,8 +123,7 @@ passes. They cannot prove old/new ≤5% acceptance.
 ## Windows race execution
 
 The historical report named architecture_validation_report.md is absent from this checkout;
-the figures below retain their original measurement scope. Current refactor evidence is in
-[the package review record](../doc/strategy_engine_refactor.md):
+the figures below retain their original measurement scope. Earlier refactor evidence:
 the 24-asset/128-hour dualMA comparison against v0.5.7 ran 10 AB/BA pairs,
 with 1/10 consumer ratios 0.97854/0.99139 and inconclusive 95% intervals.
 Candidate-only optional research replay retained 0 pending frames when disabled;

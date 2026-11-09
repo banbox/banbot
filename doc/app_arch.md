@@ -24,7 +24,7 @@ BanBot 是一个以量化交易为核心的 Go 后端系统，覆盖策略配置
 7. `orm` 持久化 K 线、时序数据、订单、任务和 UI 相关状态。
 8. `web`、`rpc`、`live` 提供可观测、控制和通知能力。
 
-v0.6.0-beta.6 的组合策略、原子 checkpoint 和尾仓订阅见 [组合与持仓指南](factor_portfolio_guide.md)；多期限与模型/风险/实验接口见 [研究扩展](factor_research_extensions.md)。有状态 policy 不改变共享 DAG 的数据/参考池，也不自行维护真实账户余额。研究模型与参数产物按训练截止和可用时间选择；原生诊断 API 不等同于完整 Web 研究平台或自动逐批收益报告。
+组合策略、原子 checkpoint 和尾仓订阅见 [组合与持仓指南](factor_portfolio_guide.md)；多期限与模型/风险/实验接口见 [研究扩展](factor_research_extensions.md)。有状态 policy 不改变共享 DAG 的数据/参考池，也不自行维护真实账户余额。研究模型与参数产物按训练截止和可用时间选择；原生诊断 API 不等同于完整 Web 研究平台或自动逐批收益报告。
 
 ## 2. 顶层架构分层
 
@@ -625,66 +625,3 @@ QuestDB 和 PostgreSQL 在时间列、upsert、删除方式、JSON 字段和可�
 7. 实盘模式激活 `SubscribeLive`。
 8. 数据源通过 sink emit。
 9. `Trader` 把数据写入 DataHub 并触发策略 `OnData`。
-
-## 12. 架构分析与不够优雅的地方
-
-### 12.3 策略任务和订单流程耦合较深
-
-策略任务、订单管理、钱包、DataHub、pair rotation、订单回调之间交互紧密。好处是策略接口能力强；坏处是任务增删、订单恢复、批量回调和实盘异步成交叠加时理解成本高。
-
-建议增加一份运行期状态机文档，并把订单状态转换、策略回调触发点和钱包变更点显式建模，配套状态迁移测试。
-
-### 12.4 实盘异步一致性需要更强可观测性
-
-实盘订单经历异步队列、交易所提交、私有成交回报、轮询回补、本地数据库更新和对账。该模型天然是最终一致的，短时间内 Web/API/Telegram 查询到 pending 或中间状态是正常现象。
-
-建议对外部控制接口返回更明确的状态语义，例如 accepted、submitted、confirmed、filled、reconciled，并在 UI 中展示订单从请求到交易所确认的状态轨迹。
-
-### 12.5 行情完整性判断逻辑复杂
-
-实时 K 线在 watcher、provider、feeder 中都有未完成 bar、等待 bar、缺失修复、多周期聚合和 fallback 逻辑。该设计适应性强，但边界复杂。
-
-建议把 bar 完成判定和多周期聚合抽成可独立测试的状态机，增加重连、乱序、延迟、缺失、1m/5m/1h 混合周期的测试矩阵。
-
-
-## 13. 优化建议优先级
-
-高优先级：
-
-- 增强实盘订单状态可观测性和外部控制幂等性。
-- 把 QuestDB 写后读可见性规则继续固化到所有写后判断、表交换和恢复状态清理流程。
-- 为实时 K 线完成判定、多周期聚合、重连缺失补齐增加专门测试。
-- 为远控入口统一命令、审计、限流和权限模型。
-
-中优先级：
-
-- 拆分 `SetupComs` 初始化能力，降低入口不必要依赖。
-- 继续迁移 spider、数据维护和旧 dev Web 等兼容入口，收窄包级 facade 的适用范围。
-- 抽象存储后端接口，减少业务代码中的后端分支。
-- 为 DataSource 热加载和多实例部署补充跨进程治理。
-
-低优先级：
-
-- 清理小型重复逻辑和冗余字段赋值。
-- 补充面向架构的包级 README。
-- 将开发 Web 的命令执行和文件操作边界文档化。
-
-## 14. 本轮梳理依据
-
-本轮梳理重点查看了以下代码与文档区域：
-
-- 入口与命令：`main.go`、`entry/`。
-- 公共初始化与交易业务：`biz/`、`live/`、`rpc/`。
-- 策略、交易对与回测优化：`strat/`、`goods/`、`opt/`。
-- 数据与行情：`data/`、`com/`、`doc/custom_data.md`。
-- 存储：`orm/`、`orm/ormo/`、`orm/ormu/`、`doc/db.md`、`orm/readme.md`。
-- Web/API：`web/main.go`、`web/base/`、`web/dev/`、`web/live/`。
-- LLM 辅助：`llm/`。
-
-子 agent 分别完成了入口、实盘交易、策略/回测、数据源四个方向的只读调研；ORM 宽范围子任务因上下文限制失败，最终由主线直接阅读关键 ORM 文件和文档后汇总。
-
-## 2026-10-04 双引擎使用入口
-
-run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
-
-execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。
