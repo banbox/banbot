@@ -159,12 +159,13 @@ func runtimeExecutionAccounts(prod bool, accounts map[string]*config.AccountConf
 	if len(accounts) == 0 {
 		return map[string]*config.AccountConfig{defaultAccount: {}}
 	}
-	if account := accounts[defaultAccount]; account != nil {
+	if account := accounts[defaultAccount]; account != nil && !account.NoTrade {
 		return config.CloneAccountConfigsForRuntime(map[string]*config.AccountConfig{defaultAccount: account})
 	}
 	names := make([]string, 0, len(accounts))
 	for name, account := range accounts {
-		if account != nil {
+		// no_trade accounts never carry orders (legacy: they go to BakAccounts and a blank default account is used)
+		if account != nil && !account.NoTrade {
 			names = append(names, name)
 		}
 	}
@@ -863,7 +864,9 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	} else if snapshotConfig != nil {
 		configuredAccounts = snapshotConfig.Accounts
 	}
-	prod := opts.Env == core.RunEnvProd
+	// Only live runs bind real accounts (legacy EnvReal = live && env != dry_run). A backtest/data run
+	// from a config with env: prod must not require a tradable account.
+	prod := opts.Env == core.RunEnvProd && opts.Mode != core.RunModeBackTest
 	defaultAccount := runtimeDefaultAccount(prod, configuredAccounts)
 	if opts.AccountOwnerKey != nil {
 		defaultAccount = opts.AccountOwnerKey.Account

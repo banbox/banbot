@@ -401,6 +401,10 @@ func filterByMinCostWithRuntime(exchange banexg.BanExchange, symbols []*SymbolVo
 			accCost = curCost
 		}
 	}
+	if accCost <= 0 {
+		// Only no_trade accounts (or none): backtests then run on the implicit default account, which uses the global stake.
+		accCost = stakeAmount(cfg, "default", nil)
+	}
 	for _, item := range symbols {
 		mar, err := exchange.GetMarket(item.Symbol)
 		if err != nil {

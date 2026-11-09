@@ -397,7 +397,14 @@ func runExplicitBackTestSpecContext(ctx context.Context, args *config.CmdArgs, s
 	if err := validateLegacyHistory(spec); err != nil {
 		return errs.New(core.ErrBadConfig, err)
 	}
-	session, snapshot, err := openExplicitEntrySessionFromSpecContext(ctx, args, spec)
+	sessionArgs := args
+	if args != nil && args.Logfile == "" && args.OutPath != "" {
+		// like the legacy backtest: keep the run log next to the results; bansite validates and archives <out>/out.log
+		copied := *args
+		copied.Logfile = filepath.Join(args.OutPath, "out.log")
+		sessionArgs = &copied
+	}
+	session, snapshot, err := openExplicitEntrySessionFromSpecContext(ctx, sessionArgs, spec)
 	if err != nil {
 		return err
 	}
