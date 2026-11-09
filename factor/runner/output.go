@@ -83,3 +83,12 @@ func (o *JSONOutput) AllocationAccepted(p *factor.PortfolioTarget, state backtes
 		Book      backtest.State
 	}{"allocation-accepted", factor.PortfolioTargetVersion, p, at, state})
 }
+
+// Nav writes the decision-time mark-to-market equity ("nav" event: AtMS, NAV, Cash; consumers aggregate to days).
+func (o *JSONOutput) Nav(s backtest.State, at int64) error {
+	return json.NewEncoder(o.Writer).Encode(struct {
+		Kind      string
+		AtMS      int64
+		NAV, Cash float64
+	}{"nav", at, s.NAV, s.Cash})
+}

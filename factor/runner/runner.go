@@ -91,6 +91,12 @@ type Output interface {
 	Evaluation(research.Report) error
 	Executed(*factor.TargetPortfolio, backtest.State, int64) error
 }
+// NavOutput is an optional Output extension: Nav receives the mark-to-market strategy state at every decision
+// time (weights mode), so consumers get an equity curve that is valued every decision period instead of only at
+// executed rebalances.
+type NavOutput interface {
+	Nav(state backtest.State, at int64) error
+}
 type Result struct {
 	Engine, StrategyID, AccountID                                      string
 	TargetsAccepted                                                    int
@@ -777,6 +783,11 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 					c.timeline.leave()
 				}
 				continue
+			}
+			if navOut, ok := out.(NavOutput); ok && book != nil {
+				if err = navOut.Nav(book.State(), now); err != nil {
+					return result, err
+				}
 			}
 			frame, diags, err := engine.combine(frame, spec.Universe, history)
 			if err != nil {
