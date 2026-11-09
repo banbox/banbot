@@ -41,6 +41,7 @@ banbot 是一个 Go 编写的量化交易系统，覆盖：策略配置、交易
 | `biz/ live/` | Trader、各类订单管理器（本地/实盘/共享/Hub）、钱包、检查点与接管、远程命令、实盘主控制器 | [05_biz_orders_live.md](05_biz_orders_live.md) |
 | `execution/` | 账户级执行：单写入者 AccountOwner、VirtualLot/Plan/StoredOrder、账本、Hub RPC、恢复与对账 | [06_execution.md](06_execution.md) |
 | `factor/` | 因子 DAG 与表达式、Session/Batch、组合与生命周期策略、版本存储、统计套利、研究与回测 | [07_factor_engine.md](07_factor_engine.md) |
+| `kb/` | 策略知识库（ts/factor/statarb 中英文 Markdown），`kb.GetKB(lang, names...)` 读取嵌入内容 | [../README.md](../README.md)「AI 知识库」 |
 | `entry/ opt/ web/ rpc/ llm/` | CLI 与装配、回测与超参优化、开发/实盘 Web API、通知与 Telegram、LLM | [08_entry_opt_web_rpc.md](08_entry_opt_web_rpc.md) |
 
 既有的专题文档（保持独立）：
@@ -48,7 +49,7 @@ banbot 是一个 Go 编写的量化交易系统，覆盖：策略配置、交易
 - 架构流程：[../app_arch.md](../app_arch.md)、[../runtime_context.md](../runtime_context.md)、[../db.md](../db.md)、[../banio.md](../banio.md)、[../help_ui.md](../help_ui.md)
 - 时序数据：[../series_usage.md](../series_usage.md)、[../custom_data.md](../custom_data.md)
 - 因子/统计套利：`../factor_*.md`、[../statarb_guide.md](../statarb_guide.md)
-- 策略编写知识库：`../banbot_ts_cn.md`、`../banbot_factor_cn.md`、`../banbot_statarb_cn.md`
+- 策略编写知识库：[../../kb/](../../kb/)（`kb_{ts,factor,statarb}_{cn,en}.md`；代码中用 `kb.GetKB("cn"|"en", "ts"|"factor"|"statarb")`，见 [../README.md](../README.md)）
 - execution 子目录自带：`execution/HUB.md`、`RECOVERY.md`、`TS_MIGRATION.md`、`CROSSVENUE.md`、`OPTIONS.md`
 
 ## 4. 核心数据流
@@ -74,7 +75,7 @@ banbot 是一个 Go 编写的量化交易系统，覆盖：策略配置、交易
 
 | 想做的事 | 先看 |
 |----------|------|
-| 新增时序策略/回调 | [04](04_strategy_runtime.md)「扩展与修改指南」，知识库 `banbot_ts_cn.md` |
+| 新增时序策略/回调 | [04](04_strategy_runtime.md)「扩展与修改指南」，知识库 `kb/kb_ts_cn.md` |
 | 新增因子/算子/表达式函数 | [07](07_factor_engine.md)，`factor_expression_*.md` |
 | 新增品种过滤器 | [03](03_exchange_goods.md)（`goods/filters.go`、注册方式见文档） |
 | 新增数据源/自定义序列 | [02](02_data_storage.md)，`custom_data.md`、`series_usage.md` |

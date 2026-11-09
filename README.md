@@ -41,7 +41,22 @@ go [runbanbot](https://github.com/banbox/runbanbot) to get started with Docker i
 ### Work with AI
 Download the [banbot.md](doc/banbot.md) file, then attach this file to any AI conversation to tell it the strategy you want to test.
 
-中文版（按引擎拆分）：[时序策略](doc/banbot_ts_cn.md)、[截面因子](doc/banbot_factor_cn.md)、[统计套利](doc/banbot_statarb_cn.md)。更多文档见 [doc/README.md](doc/README.md)。
+Per-engine knowledge bases (Chinese / English), attach whichever matches your strategy:
+
+| Engine | 中文 | English |
+|--------|------|---------|
+| Time series | [kb_ts_cn.md](kb/kb_ts_cn.md) | [kb_ts_en.md](kb/kb_ts_en.md) |
+| Cross-sectional factor | [kb_factor_cn.md](kb/kb_factor_cn.md) | [kb_factor_en.md](kb/kb_factor_en.md) |
+| Statistical arbitrage | [kb_statarb_cn.md](kb/kb_statarb_cn.md) | [kb_statarb_en.md](kb/kb_statarb_en.md) |
+
+They are also embedded in the Go package `github.com/banbox/banbot/kb` and can be loaded from code:
+
+```go
+// lang: "cn" | "en"; names: "ts" | "factor" | "statarb" (at least one, joined by kb.Separator)
+text, err := kb.GetKB("en", "ts", "factor")
+```
+
+More docs: [doc/README.md](doc/README.md).
 
 Or immediately test your idea using the [Banbot Workflow](https://www.banbot.site/zh-CN/ai).
 

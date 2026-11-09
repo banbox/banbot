@@ -1,6 +1,6 @@
 # 模块介绍：时序策略引擎与运行时（strat / runtime / runtimeplan）
 
-> 依据：当前工作树源码（2026-11-09）。参考 `doc/runtime_context.md`、`doc/banbot_ts_cn.md`、`doc/banbot.md`，文档内容以源码为准。
+> 依据：当前工作树源码（2026-11-09）。参考 `doc/runtime_context.md`、`kb/kb_ts_cn.md`、`kb/kb_ts_en.md`，文档内容以源码为准。
 > 阅读范围：`strat/` 中 types、state、common、base（开单/平仓主路径）、main（加载与轮换）、execution_state、pair_update、batch_state、data_event、datahub 核心、data_subs；`runtime/runtime.go` 的所有权、构造、停机与回调准入，`time_series_live.go`、`shared_legacy_live.go`、`shared_account.go`、`factor_state.go`；`runtimeplan/inspect.go` 主流程。
 > 未逐行精读（只看签名与调用关系）：`strat/goods.go`、`strat/state_accessors.go`、`strat/data.go` 的 WS 注册表、`strat/output_state.go`、`strat/datahub.go` 的字段更新细节、`strat/base.go` 中价格/金额换算段、`runtime/shared_sources*.go` 与 `shared_live.go`（因子实时订阅，归因子模块）、`runtimeplan` 的需求收集细节。
 
@@ -147,7 +147,7 @@
 
 ## 扩展与修改指南
 
-- **新增 `TradeStrat` 字段或回调**：改 `strat/types.go`；若回调参与启动/订阅阶段，还需在 `runtimeplan/inspect.go` 的 `collectJob`/`call*` 中加入调用（否则 Inspect 不会覆盖，计划可能漏订阅）；若与 `OnData` 存在互斥，改 `validateDataCallbacks`（`data_event.go:50`）。同时更新 `doc/banbot_ts_cn.md` §3.1。
+- **新增 `TradeStrat` 字段或回调**：改 `strat/types.go`；若回调参与启动/订阅阶段，还需在 `runtimeplan/inspect.go` 的 `collectJob`/`call*` 中加入调用（否则 Inspect 不会覆盖，计划可能漏订阅）；若与 `OnData` 存在互斥，改 `validateDataCallbacks`（`data_event.go:50`）。同时更新 `kb/kb_ts_cn.md` 与 `kb/kb_ts_en.md` §3.1。
 - **新增 `EnterReq`/`ExitReq` 字段**：改结构体 → `openOrder`/`closeOrders` 校验与使用 → `Clone()` 与 `GetZapFields()`（`common.go:189,227,288,307`）。漏掉 `Clone` 会导致异步日志与 `CommandID` 丢失。
 - **新增订单事件类型**：`types.go` 增加 `OdChg*` → `common.go:FireOdChange`、`OrderEventTime`（`common.go:910`）→ 各调用方（`biz`）。
 - **修改 Job 生命周期**：三段逻辑在 `main.go`（创建 → 轮换清理 → info 注册），与 `pair_update.go`、`FinalizePairRotation` 协同。`PairRemovalPending` 与 `jobHasOutstandingOrders` 的语义必须保持一致，否则会出现“已删 Job 仍接收终态事件”或“空 Job 永久残留”。

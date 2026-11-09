@@ -10,10 +10,17 @@
 
 | 文件 | 内容 |
 |------|------|
-| [banbot_ts_cn.md](banbot_ts_cn.md) | 时序策略引擎（`engine: time_series`）接口与规则 |
-| [banbot_factor_cn.md](banbot_factor_cn.md) | 截面因子 / 多因子策略（`engine: factor`） |
-| [banbot_statarb_cn.md](banbot_statarb_cn.md) | 统计套利、配对策略与研究运行合同 |
-| [banbot.md](banbot.md) | 英文版（基线 v0.6.0-beta.8，尚未随中文三篇更新） |
+| [kb_ts_cn.md](../kb/kb_ts_cn.md) / [en](../kb/kb_ts_en.md) | 时序策略引擎（`engine: time_series`）接口与规则 |
+| [kb_factor_cn.md](../kb/kb_factor_cn.md) / [en](../kb/kb_factor_en.md) | 截面因子 / 多因子策略（`engine: factor`） |
+| [kb_statarb_cn.md](../kb/kb_statarb_cn.md) / [en](../kb/kb_statarb_en.md) | 统计套利、配对策略与研究运行合同 |
+| [banbot.md](banbot.md) | 旧版英文单文件（基线 v0.6.0-beta.8，已被 `kb_*_en.md` 取代） |
+
+知识库文件位于 `kb/` 目录，并通过 `go:embed` 内置于 Go 包 `github.com/banbox/banbot/kb`，可在代码中读取：
+
+```go
+// 第一个参数 "cn" | "en"；其后至少一个主题名："ts" | "factor" | "statarb"
+text, err := kb.GetKB("cn", "ts", "factor")
+```
 
 ## 架构与实现
 
