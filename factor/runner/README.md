@@ -1,5 +1,9 @@
 # Factor runners: YAML, storage, archives and live execution
 
+Shortest Go entry points: `RegisterFactor` (cross-section factors with `Params`) and
+`RegisterPairs` (rolling-regression pairs trading bound to its own portfolio builder);
+see the [factor guide](../../bandoc/en-US/guide/factor.md#writing-strategies-in-go-three-entry-points).
+
 Root `backtest` and `trade` consume one YAML `RunSpec` and dispatch time-series,
 factor or mixed engines. Omitted `engine` keeps the existing time-series behavior.
 Factor backtest mode is selected by `--mode`,

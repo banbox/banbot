@@ -146,6 +146,9 @@ func validateReplayConfig(c Config, requireExecutionMetadata, checkInputs bool) 
 }
 
 func resolveDecisionPortfolio(c Config) (Config, error) {
+	if c.Manifest.Portfolio.Builder == "" && c.PortfolioBuilder == nil && c.Expressions == nil && c.Plan == nil {
+		c.Manifest.Portfolio.Builder = boundDefinitionBuilder(c.Definition)
+	}
 	if identity := portfolioBuilderIdentity(c.Manifest.Portfolio.Builder); identity != "" {
 		if c.Manifest.Portfolio.BuilderConfigHash != "" && c.Manifest.Portfolio.BuilderConfigHash != identity {
 			return c, errors.New("runner: portfolio builder identity conflict")

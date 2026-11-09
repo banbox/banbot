@@ -112,6 +112,69 @@ swapPerBars/holdBars are not global aliases: use every_bars, min/max_bars or per
 
 Implementation boundaries are documented in repository paths `doc/factor_opt_implementation.md` and `doc/factor_research_extensions.md`. Holidays and custom schedules use RebalanceDue callbacks; heterogeneous or fill-based cohort lifetimes require a custom policy.
 
+## Writing strategies in Go: three entry points
+
+Pick the engine first. All three share the same YAML and `DataSeries.Values`; they differ in how a signal becomes a position:
+
+| Need | Engine | Entry point |
+| --- | --- | --- |
+| Independent timing per symbol | time series | `strat.AddStratGroup` + `TradeStrat` (see [custom strategies](./strat_custom.md)) |
+| Score the whole market, long/short top/bottom-k | factor | `runner.RegisterFactor` |
+| Spread regression between two symbols (stat-arb) | factor | `runner.RegisterPairs` |
+| Custom portfolio or lifecycle | factor | `RegisterDefinition` + `RegisterPortfolioFactory` |
+
+### Cross-section factor in one call
+
+```go
+func init() {
+	runner.RegisterFactor("my-mom", func(c runner.FactorContext) (runner.FactorSpec, error) {
+		w := c.Params.Int("window", 24)
+		return runner.FactorSpec{Outputs: map[string]*factor.Node{
+			"mom": factor.ZScore(factor.Return(c.Close(), w)),
+		}}, c.Params.Err()
+	})
+}
+```
+
+```yaml
+run_policy:
+  - {name: my-mom, id: mom, engine: factor, run_timeframes: [1h], params: {window: 24, k: 10}}
+```
+
+`c.Params` works like `pol.Param` in time-series strategies: it reads `params` with defaults. `Int` with a fractional value or `Bool` with a value other than 0/1 reports through `Err()` instead of truncating; `Unused()` lists parameter names nobody read (typos). Several outputs are mixed with equal weights unless `FactorSpec.Combine` says otherwise.
+
+### Statistical arbitrage: declare the pairs
+
+```go
+func init() {
+	runner.RegisterPairs("eth-btc", func(p *runner.Params) (runner.PairsSpec, error) {
+		return runner.PairsSpec{
+			Pairs:  []runner.Pair{{Y: "ETH/USDT:USDT", X: "BTC/USDT:USDT"}},
+			Window: p.Int("window", 120),
+			Band: statistics.BandConfig{
+				Entry: p.Float("entry", 2), Exit: p.Float("exit", 0.5),
+				Stop: p.Float("stop", 4), MaxHold: p.Int("maxHold", 0),
+			},
+		}, p.Err()
+	})
+}
+```
+
+```yaml
+pairs: ['ETH/USDT:USDT', 'BTC/USDT:USDT']
+run_policy:
+  - {name: eth-btc, id: pair1, engine: factor, run_timeframes: [1h], params: {window: 120, entry: 2}}
+```
+
+Behavior:
+- A rolling regression of `ln(Y) = α + β·ln(X)`; z = residual / residual std. `z ≤ -Entry` goes long the spread (buy Y, sell X), `z ≥ Entry` short, `|z| ≤ Exit` flat.
+- Optional `Stop` closes at `|z| ≥ Stop` and blocks re-entry until z is back inside `Exit`; `MaxHold` behaves the same. `LongOnly`/`ShortOnly` restrict direction.
+- β is frozen at entry while a pair is open (no churn from β drift) and refreshed on the next entry. One pair's gross is `Gross` (default `1/pairs`) of strategy NAV: Y leg `s·G/(1+|β|)`, X leg `-s·G·β/(1+|β|)`.
+- Both symbols must be in the run's universe and tradable set, otherwise construction fails. Each run owns its own windows and state machines; with an incomplete window or missing input the previous target is kept and nothing trades.
+- The strategy binds its own portfolio builder, so YAML needs only `name`; an explicit `portfolio.builder` still wins.
+
+`statistics.BandTrader` (hysteresis state machine) and `statistics.RollingSpread` (O(1) rolling spread z-score) are engine independent. A time-series strategy can use them in `OnBar`: feed both log prices to `RollingSpread.Observe`, pass `Z` to `BandTrader.Step`, and map the returned -1/0/+1 to `EnterReq`/`ExitReq`.
+
 ## Write multiple expressions
 
 Expressions compile to native nodes at startup. Replace the policy above with this two-output definition; outputs share underlying field and temporal nodes:

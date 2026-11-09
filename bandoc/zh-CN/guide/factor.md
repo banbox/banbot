@@ -112,6 +112,69 @@ cohort 的入场窗口结束后不再补足原计划，迟到真实 fill 按原�
 
 实施与边界见仓库 `doc/factor_opt_implementation.md`，多期限、稳健中性化、历史合成、参数扫描、模型与风险 builder 见 `doc/factor_research_extensions.md`。研究报告与高级插件提供原生 Go API；当前 CLI 不自动生成完整逐批成交归因。历史 IC 系列在 live 未接成熟历史 provider 前仍禁用。
 
+## 用 Go 写策略：三种入口
+
+先选引擎，再选最短入口。三者共用同一份 YAML 与 `DataSeries.Values`，差别只在“信号如何变成仓位”：
+
+| 需求 | 引擎 | 入口 |
+| --- | --- | --- |
+| 每个品种独立择时 | 时序 | `strat.AddStratGroup` + `TradeStrat`（见[自定义策略](./strat_custom.md)） |
+| 全市场打分后多空 top/bottom-k | 因子 | `runner.RegisterFactor`（下例） |
+| 两个及以上品种的价差回归（统计套利） | 因子 | `runner.RegisterPairs`（下例） |
+| 需要自定义组合/生命周期 | 因子 | `RegisterDefinition` + `RegisterPortfolioFactory`（本页上文） |
+
+### 截面因子：一次注册
+
+```go
+func init() {
+	runner.RegisterFactor("my-mom", func(c runner.FactorContext) (runner.FactorSpec, error) {
+		w := c.Params.Int("window", 24)
+		return runner.FactorSpec{Outputs: map[string]*factor.Node{
+			"mom": factor.ZScore(factor.Return(c.Close(), w)),
+		}}, c.Params.Err()
+	})
+}
+```
+
+```yaml
+run_policy:
+  - {name: my-mom, id: mom, engine: factor, run_timeframes: [1h], params: {window: 24, k: 10}}
+```
+
+`c.Params` 与时序策略的 `pol.Param` 作用一致：读取 `params`，缺省用默认值。`Int` 遇到小数、`Bool` 遇到非 0/1 会通过 `Err()` 报错而不是截断；`Unused()` 可列出拼错、从未被读取的参数名。多个输出默认等权合成，需要其他方式时设置 `FactorSpec.Combine`。
+
+### 统计套利：声明配对即可
+
+```go
+func init() {
+	runner.RegisterPairs("eth-btc", func(p *runner.Params) (runner.PairsSpec, error) {
+		return runner.PairsSpec{
+			Pairs:  []runner.Pair{{Y: "ETH/USDT:USDT", X: "BTC/USDT:USDT"}},
+			Window: p.Int("window", 120),
+			Band: statistics.BandConfig{
+				Entry: p.Float("entry", 2), Exit: p.Float("exit", 0.5),
+				Stop: p.Float("stop", 4), MaxHold: p.Int("maxHold", 0),
+			},
+		}, p.Err()
+	})
+}
+```
+
+```yaml
+pairs: ['ETH/USDT:USDT', 'BTC/USDT:USDT']
+run_policy:
+  - {name: eth-btc, id: pair1, engine: factor, run_timeframes: [1h], params: {window: 120, entry: 2}}
+```
+
+行为约定：
+- 对 `ln(Y) = α + β·ln(X)` 做滚动回归，z = 残差 / 残差标准差。`z ≤ -Entry` 做多价差（买 Y 卖 X），`z ≥ Entry` 做空价差，`|z| ≤ Exit` 平仓。
+- `Stop`（可选）在 `|z| ≥ Stop` 时平仓，并且在 z 回到 `Exit` 内之前不再入场；`MaxHold`（可选）同理。`LongOnly`/`ShortOnly` 限制方向。
+- 对冲比 β 在持仓期间固定为入场时的值，避免 β 漂移引起反复调仓；下一次入场刷新。单对总敞口为 `Gross`（默认 `1/配对数`）占策略 NAV，Y 腿 `s·G/(1+|β|)`，X 腿 `-s·G·β/(1+|β|)`。
+- 配对的两个品种必须都在本次运行的 universe 与可交易集合内，否则构造时报错。每次运行拥有独立的滚动窗口与状态机；窗口未满或输入缺失时保持上一目标，不产生交易。
+- 策略自动绑定自己的组合构造器，YAML 中只需 `name`；显式指定 `portfolio.builder` 时以显式为准。
+
+`statistics.BandTrader`（滞回状态机）与 `statistics.RollingSpread`（O(1) 更新的滚动价差 z-score）不依赖任何引擎，时序策略也可直接在 `OnBar` 中使用：把两个品种的对数价格喂给 `RollingSpread.Observe`，再把 `Z` 交给 `BandTrader.Step`，用返回的 -1/0/+1 决定 `EnterReq`/`ExitReq`。
+
 ## 用表达式编写多因子
 
 表达式在启动时编译为原生图，运行时不逐事件解释字符串。以下替换上面的 `run_policy`；两个命名输出共享底层字段和时序节点：

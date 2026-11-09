@@ -36,6 +36,7 @@ var definitions = struct {
 	portfolios        map[string]PortfolioBuilder
 	portfolioIdentity map[string]string
 	factories         map[string]portfolioFactoryRegistration
+	bound             map[string]string
 }{builders: map[string]DefinitionBuilder{
 	"momentum-vol": func(c Config) (*factor.Plan, research.ComboSpec, error) { return research.MomentumVolPlan(c.Factor) },
 }}
@@ -179,6 +180,25 @@ func RegisterDefinition(name string, builder DefinitionBuilder) error {
 	definitions.builders[name] = builder
 	return nil
 }
+
+// bindDefinitionBuilder makes `definition` use `builder` whenever the run does
+// not name a portfolio builder itself, so a strategy that ships its own
+// portfolio logic (for example RegisterPairs) needs only one name in YAML.
+func bindDefinitionBuilder(definition, builder string) {
+	definitions.Lock()
+	defer definitions.Unlock()
+	if definitions.bound == nil {
+		definitions.bound = map[string]string{}
+	}
+	definitions.bound[definition] = builder
+}
+
+func boundDefinitionBuilder(definition string) string {
+	definitions.RLock()
+	defer definitions.RUnlock()
+	return definitions.bound[definition]
+}
+
 func definitionBuilder(name string) (DefinitionBuilder, bool) {
 	if name == "" {
 		name = "momentum-vol"
