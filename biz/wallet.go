@@ -76,6 +76,9 @@ type BanWallets struct {
 	// to this wallet. WebSocket pushes are not counted since they may drift silently.
 	syncMS   atomic.Int64
 	syncLock sync.Mutex
+	// skipWarned records coins already reported by calcLegal as having no valid
+	// mark price, so the (per-bar, high frequency) warning is emitted once per coin.
+	skipWarned sync.Map
 }
 
 // WalletStaleMS is the max age of exchange balances before they are fetched
@@ -1593,8 +1596,21 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 		prices = append(prices, price)
 	}
 	if len(skips) > 0 {
-		w.runtimeCore.Log().Info("skip pairs in wallet.calcLegal", zap.Int("num", len(skips)),
-			zap.String("pairs", strings.Join(skips, ",")))
+		// A coin without a fresh price is normal (pair not loaded / no recent bar), and
+		// calcLegal runs several times per bar: log each coin once at Info, rest at Debug.
+		var fresh []string
+		for _, sym := range skips {
+			if _, loaded := w.skipWarned.LoadOrStore(sym, struct{}{}); !loaded {
+				fresh = append(fresh, sym)
+			}
+		}
+		if len(fresh) > 0 {
+			w.runtimeCore.Log().Info("skip pairs in wallet.calcLegal (first time, later repeats at debug level)",
+				zap.Int("num", len(fresh)), zap.String("pairs", strings.Join(fresh, ",")))
+		} else {
+			w.runtimeCore.Log().Debug("skip pairs in wallet.calcLegal", zap.Int("num", len(skips)),
+				zap.String("pairs", strings.Join(skips, ",")))
+		}
 	}
 
 	return amounts, coins, prices
