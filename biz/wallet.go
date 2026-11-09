@@ -1542,12 +1542,34 @@ func (w *BanWallets) valuationPrice(symbol string) float64 {
 		if !w.runtimeBacktest {
 			return price
 		}
-		return w.runtimePrices.GetLastBarPriceAt(symbol)
+		return lastBarPriceOfCoin(w.runtimePrices.GetLastBarPriceAt, symbol)
 	}
 	if !core.BackTestMode {
 		return price
 	}
-	return com.GetLastBarPrice(symbol)
+	return lastBarPriceOfCoin(com.GetLastBarPrice, symbol)
+}
+
+// valuationQuotes are the quote currencies tried to price a held base coin from its pair's last bar.
+var valuationQuotes = []string{"USDT", "USDC", "FDUSD", "BUSD", "USD"}
+
+// lastBarPriceOfCoin returns the last bar price of a wallet item. Bar prices are stored under the pair
+// ("BNB/USDT"); the plain coin key ("BNB") is not always there, so a held base coin was never valued
+// (job 16: 28k skipped valuations, equity ~0 / drawdown 100% on slow timeframes). Falls back to the
+// coin's USDT-like pair (spot, then perpetual) when the plain key has no price.
+func lastBarPriceOfCoin(get func(string) float64, coin string) float64 {
+	if p := get(coin); p != -1 || strings.Contains(coin, "/") {
+		return p
+	}
+	for _, q := range valuationQuotes {
+		if p := get(coin + "/" + q); p > 0 {
+			return p
+		}
+		if p := get(coin + "/" + q + ":" + q); p > 0 {
+			return p
+		}
+	}
+	return -1
 }
 
 func stableWalletBacktest() bool {

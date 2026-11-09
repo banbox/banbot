@@ -188,3 +188,18 @@ func TestWalletValuationFallsBackToLastBarPriceInBacktest(t *testing.T) {
 		t.Fatalf("legacy wallet keeps old skip behaviour: got %v", got)
 	}
 }
+
+func TestLastBarPriceOfCoinFallsBackToPair(t *testing.T) {
+	prices := map[string]float64{"BNB/USDT": 300, "SOL/USDT:USDT": 150, "ETH": 2000}
+	get := func(k string) float64 {
+		if v, ok := prices[k]; ok {
+			return v
+		}
+		return -1
+	}
+	for coin, want := range map[string]float64{"BNB": 300, "SOL": 150, "ETH": 2000, "NONE": -1, "BNB/USDT": 300} {
+		if got := lastBarPriceOfCoin(get, coin); got != want {
+			t.Fatalf("%s: got %v want %v", coin, got, want)
+		}
+	}
+}
