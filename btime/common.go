@@ -30,6 +30,9 @@ func NewRetryWaits(rate float64, waits []int64) *RetryWaits {
 		}
 		res.sleeps = append(res.sleeps, v)
 	}
+	if len(res.sleeps) == 0 {
+		res.sleeps = []int64{3000, 6000, 12000, 30000}
+	}
 	return res
 }
 

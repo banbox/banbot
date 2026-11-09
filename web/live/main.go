@@ -154,6 +154,10 @@ func validateAPIRuntimeDeps(deps *biz.RuntimeDeps) *errs.Error {
 }
 
 func startAPIServer(lifecycle ServerLifecycle, cfg *config.APIServerConfig, deps *biz.RuntimeDeps) (*apiServer, *errs.Error) {
+	// An empty HMAC key lets anyone forge valid JWTs, so refuse to start without one.
+	if strings.TrimSpace(cfg.JWTSecretKey) == "" {
+		return nil, errs.NewMsg(core.ErrBadConfig, "api_server.jwt_secret_key is required when api_server.enable is true")
+	}
 	app := fiber.New(fiber.Config{
 		AppName:      "banbot",
 		ErrorHandler: base.ErrHandler,

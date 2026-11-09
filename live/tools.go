@@ -46,10 +46,8 @@ func CloseOrdersWithRuntimeDeps(deps biz.RuntimeDeps, request TradeCloseRequest)
 		return nil, err
 	}
 	if deps.SharedExecution != nil {
-		for _, account := range selected {
-			if account != deps.DefaultAccount || account != deps.SharedExecution.AccountKey().Account {
-				return nil, errs.NewMsg(core.ErrBadConfig, "close account does not match the bound execution owner")
-			}
+		if !closeAccountsMatchOwner(selected, deps.SharedExecution.AccountKey().Account) {
+			return nil, errs.NewMsg(core.ErrBadConfig, "close account does not match the bound execution owner")
 		}
 	}
 	if !request.Exchange && (deps.Orders == nil || deps.Trading == nil) {
@@ -189,4 +187,16 @@ func closeLocalOrdersWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs
 	}
 	lock.Unlock()
 	return biz.CloseAccOrdersWithState(deps.Trading, account, matched, &strat.ExitReq{Tag: core.ExitTagCli, Force: true})
+}
+
+// closeAccountsMatchOwner reports whether every selected account is the one
+// bound to the execution owner. The check is against the owner only: the
+// runtime default account is unrelated to which account the owner may close.
+func closeAccountsMatchOwner(selected []string, owner string) bool {
+	for _, account := range selected {
+		if account != owner {
+			return false
+		}
+	}
+	return true
 }

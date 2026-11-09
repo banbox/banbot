@@ -90,3 +90,21 @@ func TestParallelRunProcessesEachItemWithinLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestIsDockerConcurrentFirstCall(t *testing.T) {
+	var wg sync.WaitGroup
+	results := make([]bool, 16)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = IsDocker()
+		}(i)
+	}
+	wg.Wait()
+	for _, r := range results {
+		if r != results[0] {
+			t.Fatal("IsDocker results differ between concurrent calls")
+		}
+	}
+}

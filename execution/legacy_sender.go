@@ -75,7 +75,7 @@ func (s *LegacySender) Close() error {
 	return s.err
 }
 
-// LegacyExchange gates every SDK v0.2.64 operation that can write venue state.
+// LegacyExchange gates every SDK operation (written against v0.2.64) that can write venue state.
 // Call is gated too because dynamically named APIs may change account state.
 // Read methods retain the supplied exchange's existing implementation.
 type LegacyExchange struct {

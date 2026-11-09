@@ -67,3 +67,32 @@ func TestAtomicStrictlyLaterPricesExpiryAndFullZero(t *testing.T) {
 		t.Fatal(b.State())
 	}
 }
+
+func TestExecuteAdvancesLedgerAndPreviousOnlyOnSuccess(t *testing.T) {
+	b, _ := NewBook(1000)
+	p := portfolio(t, 1, map[int32]float64{1: 1})
+	if b.Execute(p, map[int32]Quote{1: {AtMS: 10, AvailableAt: 11, Price: 100}}, 11, 0, 0) == nil {
+		t.Fatal("invalid quote accepted")
+	}
+	if b.ledgerCursor != 0 || b.previous != nil {
+		t.Fatal("failed execute left partial state")
+	}
+	if err := b.Execute(p, map[int32]Quote{1: {AtMS: 11, AvailableAt: 11, Price: 100}}, 11, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if b.ledgerCursor != 1 || b.previous == nil {
+		t.Fatal("successful execute did not commit previous/ledger")
+	}
+}
+
+func TestExecuteRejectsUnrepresentableQuantityBeforeMutation(t *testing.T) {
+	b, _ := NewBook(1000)
+	p := portfolio(t, 1, map[int32]float64{1: .5})
+	q := map[int32]Quote{1: {AtMS: 11, AvailableAt: 11, Price: 5e-324}}
+	if err := b.Execute(p, q, 11, 0, 0); err == nil {
+		t.Fatal("infinite quantity accepted")
+	}
+	if s := b.State(); s.NAV != 1000 || len(s.Quantities) != 0 {
+		t.Fatalf("state mutated by rejected execute: %+v", s)
+	}
+}

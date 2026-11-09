@@ -50,3 +50,10 @@ func TestStratJobCanOpenUsesEnvBeforeLegacyMarket(t *testing.T) {
 		t.Fatal("legacy zero-value job no longer follows core.Market")
 	}
 }
+
+func TestStratJobCloseOrdersNilReq(t *testing.T) {
+	job := &StratJob{}
+	if err := job.closeOrders(nil); err == nil {
+		t.Fatal("closeOrders(nil) must return an error")
+	}
+}

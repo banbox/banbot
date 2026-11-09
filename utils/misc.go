@@ -39,6 +39,7 @@ import (
 var (
 	regHolds, _  = regexp.Compile("[{]([^}]+)[}]")
 	dockerStatus = 0
+	dockerOnce   sync.Once
 	langCache    = ""
 	langCacheMu  sync.Mutex
 )
@@ -331,29 +332,29 @@ func MD5(data []byte) string {
 }
 
 func IsDocker() bool {
-	if dockerStatus != 0 {
-		return dockerStatus == 1
-	}
-	dockerStatus = -1
+	dockerOnce.Do(func() {
+		dockerStatus = detectDocker()
+	})
+	return dockerStatus == 1
+}
+
+func detectDocker() int {
 	if _, err := os.Stat("/.dockerenv"); err == nil {
-		dockerStatus = 1
-		return true
+		return 1
 	}
 	file, err := os.Open("/proc/1/cgroup")
 	if err != nil {
-		return false
+		return -1
 	}
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		if strings.Contains(scanner.Text(), "docker") {
-			dockerStatus = 1
-			return true
+			return 1
 		}
 	}
-
-	return false
+	return -1
 }
 
 func OpenBrowser(url string) error {

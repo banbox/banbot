@@ -3,7 +3,7 @@ version: '3.8'
 services:
   questdb:
     container_name: questdb
-    image: questdb/questdb:latest
+    image: questdb/questdb:9.3.2
     ports:
       - "9000:9000" # Web console + REST
       - "8812:8812" # PGWire

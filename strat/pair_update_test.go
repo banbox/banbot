@@ -755,3 +755,22 @@ func TestFinalizePairRotationWithoutCoreDoesNotUseLegacy(t *testing.T) {
 			core.StgPairTfs, core.LegacyAdmissionPairs())
 	}
 }
+
+func TestUpdatePairs_CloseOnRemoveMissingHookHasNoSideEffects(t *testing.T) {
+	resetStratGlobals()
+	SetPairUpdateHooks(PairUpdateHooks{
+		LookupSymbol: func(pair string) (*orm.ExSymbol, *errs.Error) {
+			return &orm.ExSymbol{ID: 1, Symbol: pair}, nil
+		},
+	})
+	seedJobWithOrder("BTC/USDT", "1s", "stg", true)
+	stg := PairStrats["BTC/USDT"]["stg"]
+	job := AccJobs[config.DefAcc]["BTC/USDT_1s"]["stg"]
+	before := job.MaxOpenLong
+	if _, err := stg.UpdatePairs(PairUpdateReq{Remove: []string{"BTC/USDT"}, CloseOnRemove: true}); err == nil {
+		t.Fatal("expected error without ExitOrders hook")
+	}
+	if job.pairRemovalPending || job.MaxOpenLong != before {
+		t.Fatalf("failed update left side effects: pending=%v maxLong=%d->%d", job.pairRemovalPending, before, job.MaxOpenLong)
+	}
+}

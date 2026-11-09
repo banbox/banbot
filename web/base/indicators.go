@@ -253,7 +253,6 @@ func (d *DrawInd) Calc(kline [][]float64, params []float64) ([]map[string]float6
 	var env = &ta.BarEnv{
 		TimeFrame:  timeFrame,
 		TFMSecs:    tfMSecs,
-		Exchange:   "binance",
 		MarketType: "linear",
 	}
 	figures := d.Figures

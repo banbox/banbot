@@ -269,7 +269,7 @@ func (c *DataSourceCatalog) CompileSubscriptionPlan(ctx context.Context, request
 		if stream.Subscription.Frequency == orm.FrequencyBar {
 			seconds, _ := utils.TFToSecSafe(stream.Subscription.TimeFrame)
 			step := int64(seconds) * 1000
-			if start >= 0 && options.EndMS >= start {
+			if step > 0 && start >= 0 && options.EndMS >= start {
 				stream.EstimatedRows = (options.EndMS - start) / step
 				stream.EstimateKnown = true
 			}
@@ -429,8 +429,11 @@ func (p *SubscriptionPlan) warmupLive(installation *SubscriptionInstallation) er
 		// observations preceding that boundary, not a partial first interval.
 		historyEnd := p.options.AnchorMS
 		if sub.Frequency == orm.FrequencyBar {
-			seconds, _ := utils.TFToSecSafe(sub.TimeFrame)
+			seconds, tfErr := utils.TFToSecSafe(sub.TimeFrame)
 			step := int64(seconds) * 1000
+			if tfErr != nil || step <= 0 {
+				return fmt.Errorf("invalid warmup timeframe %q for %s", sub.TimeFrame, sub.Source)
+			}
 			stream.WarmupStartMS = p.options.AnchorMS/step*step - int64(sub.WarmupNum)*step
 			historyEnd = p.options.AnchorMS / step * step
 		}

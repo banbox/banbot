@@ -529,14 +529,26 @@ func (l *Live) execute(ctx context.Context, now int64) error {
 		required = p.Targets()
 	}
 	quotes := copyQuotes(l.quotes)
+	l.mu.Unlock()
+	// Settled terminal/option instruments need no fresh quote when flattened,
+	// mirroring the replay path; the exemption reads account state, so it runs
+	// outside l.mu.
 	for sid := range required {
+		settled, err := terminalQuoteExempt(ctx, l.sink, nil, sid, targets[sid] == 0)
+		if !settled && err == nil {
+			settled, err = optionQuoteExempt(ctx, l.sink, sid, targets[sid] == 0, now)
+		}
+		if err != nil {
+			return err
+		}
+		if settled {
+			continue
+		}
 		q, ok := quotes[sid]
 		if !ok || q.AtMS < sp.ExecutableAt || q.AvailableAt > now {
-			l.mu.Unlock()
 			return nil
 		}
 	}
-	l.mu.Unlock()
 	if err = ctx.Err(); err != nil {
 		return err
 	}

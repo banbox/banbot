@@ -139,6 +139,9 @@ func convertFiles(inPath, outPath, srcSuffix string, concurNum int, makeOutPath 
 	if err != nil {
 		return err
 	}
+	if len(names) == 0 {
+		return errs.NewMsg(errs.CodeParamInvalid, "no zip file found in %s", inPath)
+	}
 	var dirPath = names[0]
 	names = names[1:]
 	pBar := utils.NewPrgBar(len(names)*core.StepTotal, "")
@@ -162,6 +165,9 @@ func isRawContract(name string) bool {
 		return false
 	}
 	// 检查是否以价差前缀开始
+	if name == "" {
+		return false
+	}
 	if name[0] == 'S' || name[0] == 'I' {
 		parts := strings.Split(name, " ")
 		prefix := strings.ToUpper(parts[0])
@@ -299,6 +305,9 @@ func Build1mWithTicksWithWorker(args *config.CmdArgs, worker *TickWorker) *errs.
 	if err_ := utils.EnsureDir(args.OutPath, 0755); err_ != nil {
 		return errs.New(errs.CodeIOWriteFail, err_)
 	}
+	if len(names) == 0 {
+		return errs.NewMsg(errs.CodeParamInvalid, "no zip file found in %s", args.InPath)
+	}
 	var dirPath = names[0]
 	names = names[1:]
 	if worker.TimeMSMin > 0 || worker.TimeMSMax > 0 {
@@ -400,6 +409,9 @@ func Build1mWithTicksWithWorker(args *config.CmdArgs, worker *TickWorker) *errs.
 			if worker.TimeMSMin > 0 || worker.TimeMSMax > 0 {
 				// 过滤范围之外的数据
 				cleanName := strings.Split(filepath.Base(name), ".")[0]
+				if len(cleanName) < 8 {
+					return nil
+				}
 				cleanName = cleanName[len(cleanName)-8:]
 				timeObj, err_ := time.ParseInLocation("20060102", cleanName, loc)
 				if err_ == nil {
@@ -661,7 +673,7 @@ func build1mSymbolTick(inPath string, fid int, file *zip.File, dones map[string]
 	for _, t := range ticks {
 		curMinMS := utils2.AlignTfMSecs(t.timeMS, 60000)
 		price, volume := t.price, t.volume
-		keyValid := strings.HasPrefix(oldKey, t.symbol)
+		keyValid := strings.HasPrefix(oldKey, t.symbol+"_")
 		if bar1m == nil || oldMinMS == 0 || curMinMS > oldMinMS || !keyValid {
 			saveBar()
 			if !keyValid {

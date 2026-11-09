@@ -194,3 +194,23 @@ func TestSyncExgOrdersClearsRuntimeAuthorityOnReloadFailure(t *testing.T) {
 		t.Fatalf("failed reload retained authority stamp %d", stamp)
 	}
 }
+
+func TestThirdPartyTFRequiresTakeOverJob(t *testing.T) {
+	oldStrat := config.TakeOverStrat
+	oldTFs, oldPairTFs := core.LegacyTimeFrameStateSnapshot()
+	t.Cleanup(func() {
+		config.TakeOverStrat = oldStrat
+		core.ReplaceLegacyTimeFrameState(oldTFs, oldPairTFs)
+	})
+	config.TakeOverStrat = "takeover"
+	mgr := &LiveOrderMgr{}
+
+	core.ReplaceLegacyTimeFrameState(map[string]int{}, map[string]map[string]string{})
+	if tf, ok := mgr.thirdPartyTF("A/USDT"); ok || tf != "" {
+		t.Fatalf("no job must be reported as missing, got %q %v", tf, ok)
+	}
+	core.ReplaceLegacyTimeFrameState(map[string]int{}, map[string]map[string]string{"takeover": {"A/USDT": "5m"}})
+	if tf, ok := mgr.thirdPartyTF("A/USDT"); !ok || tf != "5m" {
+		t.Fatalf("existing job must be found, got %q %v", tf, ok)
+	}
+}

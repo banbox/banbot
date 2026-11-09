@@ -705,10 +705,10 @@ func initLangFile(dataDir, lang string) *errs.Error {
 
 		// 对于 messages.json 文件，进行合并更新
 		if fileName == "messages.json" {
-			err := mergeMessagesFile(targetPath, sourceData)
-			if err == nil {
-				continue
+			if err := syncMessagesFile(targetPath, sourceData); err != nil {
+				return err
 			}
+			continue
 		}
 		err := utils.WriteFile(targetPath, sourceData)
 		if err != nil {
@@ -716,6 +716,24 @@ func initLangFile(dataDir, lang string) *errs.Error {
 		}
 	}
 
+	return nil
+}
+
+// syncMessagesFile merges embedded messages into an existing user file. The
+// embedded copy is written only when the user file does not exist; an existing
+// file that cannot be read or parsed is kept untouched so user edits are never
+// overwritten by a failed merge.
+func syncMessagesFile(targetPath string, sourceData []byte) *errs.Error {
+	if _, statErr := os.Stat(targetPath); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return utils.WriteFile(targetPath, sourceData)
+		}
+		log.Warn("stat messages file fail, keep it", zap.String("file", targetPath), zap.Error(statErr))
+		return nil
+	}
+	if err := mergeMessagesFile(targetPath, sourceData); err != nil {
+		log.Warn("merge messages file fail, keep user file", zap.String("file", targetPath), zap.Error(err))
+	}
 	return nil
 }
 

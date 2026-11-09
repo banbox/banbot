@@ -3,6 +3,7 @@ package dev
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 
@@ -93,9 +94,17 @@ func (s *DevServer) handleBacktestPreflight(c *fiber.Ctx) error {
 		}
 	}
 	inspection.Origins = spec.Origins()
+	// LoadRunSpec may record symlink-resolved sources (e.g. /var -> /private/var on macOS).
+	resolved := make([]string, len(paths))
+	for index, path := range paths {
+		resolved[index] = path
+		if real, err := filepath.EvalSymlinks(path); err == nil {
+			resolved[index] = real
+		}
+	}
 	remap := func(origin config.FieldOrigin) config.FieldOrigin {
 		for index, path := range paths {
-			if origin.Source == path {
+			if origin.Source == path || origin.Source == resolved[index] {
 				origin.Source = args.Paths[index]
 				break
 			}

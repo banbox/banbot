@@ -472,7 +472,11 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 				num, _ := o.zeroAmts[od.Symbol]
 				o.zeroAmts[od.Symbol] = num + 1
 			}
-			err = o.localExit(od, fillMS, core.ExitTagFatalErr, od.InitPrice, err.Error(), "")
+			reason := "zero entry amount"
+			if err != nil {
+				reason = err.Error()
+			}
+			err = o.localExit(od, fillMS, core.ExitTagFatalErr, od.InitPrice, reason, "")
 			_, quote, _, _ := core.SplitSymbol(od.Symbol)
 			wallets.Cancel(od.Key(), quote, 0, true)
 			o.fireOdChange(od, strat.OdChgExitFill)
@@ -616,6 +620,10 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 		od.SetInfo(ormo.OdInfoSLTP, "yes")
 	}
 	err := o.localExit(od, fill.TimeMS, exitTag, fill.Price, "", fill.OrderType)
+	if err != nil && od.Exit == nil {
+		// localExit failed before the exit leg was built; continuing would panic on od.Exit
+		return err
+	}
 	wallets := o.walletsForOrder()
 	wallets.ExitOd(od, od.Exit.Amount)
 	_ = o.finishOrder(od)

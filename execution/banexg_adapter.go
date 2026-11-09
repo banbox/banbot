@@ -16,7 +16,8 @@ import (
 
 // BanexgExecutionTransport binds the entire synchronous SDK invocation to the
 // owner context, including SDK semaphore/retry waits before HTTP dispatch.
-// An HTTP client timeout alone is insufficient in banexg v0.2.64. Plain SDK
+// An HTTP client timeout alone is insufficient (established against banexg
+// v0.2.64; the gate stays version-independent). Plain SDK
 // sessions fail startup until the composition supplies this verified binding.
 type BanexgExecutionTransport interface {
 	Verify(context.Context, banexg.BanExchange, AccountKey) (BanexgExecutionProof, error)

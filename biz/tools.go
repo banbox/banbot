@@ -119,6 +119,10 @@ func loadZipSeriesWithRuntimeDeps(inPath string, _ int, file *zip.File, deps *Kl
 	sort.Slice(klines, func(i, j int) bool {
 		return klines[i].Time < klines[j].Time
 	})
+	if len(klines) == 0 {
+		log.Warn("no valid kline rows in csv, skip", zap.String("id", exs.Symbol), zap.String("path", inPath))
+		return nil
+	}
 	startMS, endMS := klines[0].Time, klines[len(klines)-1].Time
 	timeFrame := utils2.SecsToTF(int(tfMSecs / 1000))
 	timeFrame, err = orm.GetDownTF(timeFrame)
@@ -566,7 +570,7 @@ func PurgeKlinesWithRuntimeDeps(args *config.CmdArgs, deps *KlineMaintenanceDeps
 		exsList = filtered
 	}
 	if len(exsList) == 0 {
-		return errs.NewMsg(errs.CodeRunTime, "pairs is required")
+		return errs.NewMsg(errs.CodeRunTime, "no matching pairs found for the given arguments")
 	}
 	// 输出信息要求确认
 	// Output information requires confirmation
@@ -650,7 +654,8 @@ func ExportAdjFactorsWithRuntimeDeps(args *config.CmdArgs, deps *KlineMaintenanc
 			}
 			rows = append(rows, row)
 		}
-		path := filepath.Join(args.OutPath, symbol+"_adj.csv")
+		cleanSymbol := strings.ReplaceAll(strings.ReplaceAll(symbol, "/", "_"), ":", "_")
+		path := filepath.Join(args.OutPath, cleanSymbol+"_adj.csv")
 		err = utils.WriteCsvFile(path, rows, false)
 		if err != nil {
 			return err
@@ -719,9 +724,11 @@ func calcCorrelation(args *config.CmdArgs, deps *CorrelationRuntimeDeps) *errs.E
 	tf := args.TimeFrames[0]
 	tfMSecs := int64(utils2.TFToSecs(tf) * 1000)
 	gapTFMSecs := int64(utils2.TFToSecs(args.RunEveryTF) * 1000)
+	if tfMSecs <= 0 || gapTFMSecs <= 0 {
+		return errs.NewMsg(errs.CodeParamInvalid, "invalid --timeframes or --run-every: %s, %s", tf, args.RunEveryTF)
+	}
 	if int(gapTFMSecs/tfMSecs) < args.BatchSize {
-		log.Error("run-every is too small for current batch-size and timeframe")
-		return nil
+		return errs.NewMsg(errs.CodeParamInvalid, "run-every is too small for current batch-size and timeframe")
 	}
 	var startMs, endMS int64
 	if timeRange := deps.Runtime.ConfigView().TimeRange; timeRange != nil {
@@ -1368,9 +1375,10 @@ func (s *ExgOrderSet) Get(startMS, endMS int64, pairs []string, botName string) 
 	return result, nil
 }
 
-// TestKLineConsistency checks the consistency of K-line data in dump files
+// KlineConsistencyDeps carries the dependencies of TestKLineConsistencyWithRuntimeDeps,
+// which checks the consistency of K-line data in dump files.
 // It verifies:
-// 1. Each K-line's time is within 2 minutes of its row time
+// 1. Each K-line's time is within 1 minute of its row time
 // 2. The interval between consecutive K-lines matches the timeframe
 // 3. Reports any missing K-lines
 type KlineConsistencyDeps struct {
@@ -1569,7 +1577,7 @@ func TestKLineConsistencyWithRuntimeDeps(path string, deps KlineConsistencyDeps)
 			tfMSecs := int64(utils2.TFToSecs(tf)) * 1000
 			timeDiff := float64(row.Time-kline.Time-tfMSecs) / 60000
 			if timeDiff > 1 {
-				fmt.Printf("K-line time (%d) differs from row time (%d) by more than 2 minutes for symbol %s timeframe %s\n",
+				fmt.Printf("K-line time (%d) differs from row time (%d) by more than 1 minute for symbol %s timeframe %s\n",
 					kline.Time, row.Time, symbol, envKeyArr[1])
 			}
 

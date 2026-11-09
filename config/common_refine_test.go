@@ -34,3 +34,19 @@ func TestStratRefineTFLookupAndEnsureShareCacheSemantics(t *testing.T) {
 		t.Fatalf("cached ensure = %q; want 15m", got)
 	}
 }
+
+func TestEnsureStratRefineTFInvalidRangeFallsBackWithoutPanic(t *testing.T) {
+	oldPolicies := RunPolicy
+	t.Cleanup(func() {
+		RunPolicy = oldPolicies
+		ClearRefineMap()
+	})
+	RunPolicy = []*RunPolicyConfig{{Name: "bad_refine", RefineTF: "3-"}}
+	ClearRefineMap()
+	if got := EnsureStratRefineTF("bad_refine", "1h"); got != "1h" {
+		t.Fatalf("invalid refine range = %q; want original timeframe", got)
+	}
+	if got := EnsureStratRefineTF("bad_refine", "1h"); got != "1h" {
+		t.Fatalf("cached invalid refine range = %q; want original timeframe", got)
+	}
+}

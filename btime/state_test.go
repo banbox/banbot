@@ -37,3 +37,10 @@ func TestClockStateAdvanceMSIsAtomic(t *testing.T) {
 		t.Fatalf("clock time = %d, want %d", got, 100+calls)
 	}
 }
+
+func TestRetryWaitsAllNonPositive(t *testing.T) {
+	r := NewRetryWaits(1, []int64{0, -1})
+	if r.SetFail("k") <= 0 {
+		t.Fatal("expected positive next retry")
+	}
+}

@@ -88,7 +88,10 @@ func EnsureStratRefineTF(stratName, timeframe string) string {
 	outTf, err := parseRefineTf(stratName, timeframe)
 	refineLock.Unlock()
 	if err != nil {
-		panic(err)
+		// invalid refine_ratio: fall back to the original timeframe (parseRefineTf caches it too)
+		log.Error("invalid refine tf, use original timeframe", zap.String("strat", stratName),
+			zap.String("tf", timeframe), zap.Error(err))
+		return timeframe
 	}
 	return outTf
 }

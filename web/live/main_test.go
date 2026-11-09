@@ -83,7 +83,7 @@ func TestStartAPIWithLifecycleFinishesAfterListenFailure(t *testing.T) {
 	oldConfig, oldDataDir := config.APIServer, config.DataDir
 	config.DataDir = t.TempDir()
 	config.APIServer = &config.APIServerConfig{
-		Enable: true, BindIPAddr: "127.0.0.1", Port: -1,
+		Enable: true, BindIPAddr: "127.0.0.1", Port: -1, JWTSecretKey: "test-secret",
 	}
 	t.Cleanup(func() {
 		config.APIServer, config.DataDir = oldConfig, oldDataDir

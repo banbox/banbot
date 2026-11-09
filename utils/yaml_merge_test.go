@@ -43,3 +43,20 @@ func TestMergeYamlStr(t *testing.T) {
 		t.Fatalf("unexpected merged YAML:\ngot:  %#v\nwant: %#v\noutput:\n%s", got, want, data)
 	}
 }
+
+func TestStripYamlComments(t *testing.T) {
+	cases := map[string]string{
+		"pwd: abc#1":           "pwd: abc#1",
+		"a: b # note":          "a: b",
+		"# full line":          "",
+		"s: \"x # y\" # c":     "s: \"x # y\"",
+		"s: 'x # y'":           "s: 'x # y'",
+		"url: http://h/p#frag": "url: http://h/p#frag",
+		"k: don't # c":         "k: don't",
+	}
+	for in, want := range cases {
+		if got := stripYamlComments(in); got != want {
+			t.Errorf("%q: got %q want %q", in, got, want)
+		}
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -730,5 +731,23 @@ func TestTurnoverAfterCapsReportsConflictAndNeverBuysBackQuantityExit(t *testing
 	}
 	if gross > .1+1e-12 {
 		t.Fatal("turnover violates risk caps", gross)
+	}
+}
+
+func TestLifecycleExitAnchorWeightErrorPropagates(t *testing.T) {
+	config := baseLifecycle()
+	config.Holding.MinBars = 16
+	config.Rebalance.EveryBars = 2
+	config.Transition = TransitionConfig{Mode: "linear-exit", Basis: "quantity", ExitSteps: 8}
+	p, err := NewLifecyclePolicy(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := proposePolicy(t, p, policyFixture(t, 1000, 1, map[int32]float64{1: 1}), nil).NextState
+	c := policyFixture(t, 17000, 2, map[int32]float64{2: 1})
+	c.Positions[1] = PositionEvidence{Quantity: "8", FirstFillTime: 1000, Quantum: "1"}
+	delete(c.Marks, 1)
+	if _, err := p.Propose(c, state); err == nil || !strings.Contains(err.Error(), "missing quantity valuation") {
+		t.Fatalf("missing valuation for exit anchor must propagate, got %v", err)
 	}
 }

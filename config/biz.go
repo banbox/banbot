@@ -462,16 +462,9 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 	RunTimeframes = c.RunTimeframes
 	WatchJobs = c.WatchJobs
 	if c.StratPerf == nil {
-		c.StratPerf = &StratPerfConfig{
-			MinOdNum:  5,
-			MaxOdNum:  30,
-			MinJobNum: 10,
-			MidWeight: 0.3,
-			BadWeight: 0.15,
-		}
-	} else {
-		c.StratPerf.Validate()
+		c.StratPerf = &StratPerfConfig{}
 	}
+	c.StratPerf.Validate()
 	StratPerf = c.StratPerf
 	Pairs, _ = utils2.UniqueItems(c.Pairs)
 	err := SetRunPolicy(true, c.RunPolicy...)
@@ -698,14 +691,18 @@ func (p *StratPerfConfig) Validate() {
 	if p.MinOdNum < 5 {
 		p.MinOdNum = 5
 	}
-	if p.MaxOdNum < 8 {
+	if p.MaxOdNum == 0 {
+		p.MaxOdNum = 30
+	} else if p.MaxOdNum < 8 {
 		p.MaxOdNum = 8
 	}
-	if p.MinJobNum < 7 {
+	if p.MinJobNum == 0 {
+		p.MinJobNum = 10
+	} else if p.MinJobNum < 7 {
 		p.MinJobNum = 7
 	}
 	if p.MidWeight == 0 {
-		p.MidWeight = 0.4
+		p.MidWeight = 0.3
 	}
 	if p.BadWeight == 0 {
 		p.BadWeight = 0.15
@@ -1485,6 +1482,9 @@ func GetApiUsers() []*UserConfig {
 			},
 		})
 	}
+	if APIServer == nil {
+		return res
+	}
 	return append(res, APIServer.Users...)
 }
 
@@ -1602,16 +1602,33 @@ func GetLangMsgBy(lang, code, defVal string) string {
 		text, ok := langMap[lang]
 		if ok {
 			return text
-		} else {
-			for _, text = range langMap {
-				return text
-			}
+		}
+		if text, ok := pickFallbackLang(langMap); ok {
+			return text
 		}
 	}
 	if defVal != "" {
 		return defVal
 	}
 	return code
+}
+
+// pickFallbackLang deterministically picks a fallback text: en-US, zh-CN first, then the smallest key.
+func pickFallbackLang(langMap map[string]string) (string, bool) {
+	for _, l := range []string{"en-US", "zh-CN"} {
+		if text, ok := langMap[l]; ok {
+			return text, true
+		}
+	}
+	if len(langMap) == 0 {
+		return "", false
+	}
+	keys := make([]string, 0, len(langMap))
+	for k := range langMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return langMap[keys[0]], true
 }
 
 // SplitTimeFrames split comma-separated timeframes string to []string
@@ -1662,7 +1679,7 @@ func parsePairs(exchangeName, market string, stakeCurrency []string, pairs ...st
 		} else if market == banexg.MarketInverse {
 			result = append(result, fmt.Sprintf("%s/%s:%s", p, quote, p))
 		} else {
-			return nil, errs.NewMsg(core.ErrBadConfig, "option market don't support short pair")
+			return nil, errs.NewMsg(core.ErrBadConfig, "short pair `%s` is only supported for spot/linear/inverse market, current market: %s", p, market)
 		}
 	}
 	return result, nil

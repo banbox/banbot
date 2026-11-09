@@ -444,10 +444,7 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 	}
 	// 检查止盈
-	curTPPrice := s.LongTPPrice
-	if req.Short {
-		curTPPrice = s.ShortTPPrice
-	}
+	var curTPPrice float64
 	if req.TakeProfitLimit > 0 && req.TakeProfit == 0 {
 		req.TakeProfit = req.TakeProfitLimit
 	}
@@ -542,6 +539,9 @@ func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error {
 }
 
 func (s *StratJob) closeOrders(req *ExitReq) *errs.Error {
+	if req == nil {
+		return errs.NewMsg(errs.CodeParamRequired, "req cannot be nil")
+	}
 	if s.GetOrderNum(float64(req.Dirt)) == 0 {
 		return nil
 	}

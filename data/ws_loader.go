@@ -375,6 +375,9 @@ func (l *WsDataLoader) SplitBigZip(zipPath string, info *WsSymbol) *errs.Error {
 				continue
 			}
 			item := parseCsvWsTrade(line)
+			if item == nil {
+				continue
+			}
 			hour := int(item.Timestamp / 3600000 % 24)
 			if item.Timestamp > 0 {
 				if hour != prevHour {

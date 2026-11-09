@@ -1100,7 +1100,7 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 	odKey := od.Key()
 	exs := w.symbolByID(int32(od.Sid))
 	if exs == nil {
-		panic(fmt.Sprintf("EnterOd invalid sid of order: %v", od.Sid))
+		return 0, errs.NewMsg(core.ErrRunTime, "EnterOd invalid sid of order %s: %v", odKey, od.Sid)
 	}
 	var legalCost float64
 
@@ -2012,8 +2012,10 @@ func watchLiveBalancesWithRuntime(lifecycle WalletRuntimeLifecycle) {
 			banexg.ParamAccount: account,
 		})
 		if err != nil {
-			log.Error("watch balance err", zap.Error(err))
-			return
+			// One failing account must not stop the others, nor skip OnCloseWait
+			// registration for the watchers already started.
+			log.Error("watch balance err", zap.String("account", account), zap.Error(err))
+			continue
 		}
 		wallets.IsWatch = true
 		wait.Add(1)

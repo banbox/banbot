@@ -24,6 +24,10 @@ var (
 	PriceExpireMS          = int64(60000)
 )
 
+// PriceStrictExpireMS is the stricter staleness limit (10s) used by GetPrice and
+// IsMaker, which panic/decide on the price; GetPriceSafe tolerates PriceExpireMS.
+const PriceStrictExpireMS = int64(10000)
+
 func init() {
 	legacyPriceCurrent.Store(&legacyPriceBinding{state: legacyPrices})
 }
@@ -112,7 +116,7 @@ func GetPriceExp(symbol string, side string, expMS int64) float64 {
 }
 
 func GetPrice(symbol string, side string) float64 {
-	return GetPriceExp(symbol, side, 10000)
+	return GetPriceExp(symbol, side, PriceStrictExpireMS)
 }
 
 func SetBarPrice(pair string, price float64) {
@@ -132,7 +136,7 @@ func SetPrices(data map[string]float64, side string) {
 }
 
 func IsMaker(pair, side string, price float64) bool {
-	curPrice := GetPriceExp(pair, side, 10000)
+	curPrice := GetPriceExp(pair, side, PriceStrictExpireMS)
 	isBuy := side == banexg.OdSideBuy
 	isLow := price < curPrice
 	return isBuy == isLow

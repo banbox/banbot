@@ -1259,7 +1259,11 @@ func (f *DBSeriesFeeder) CallNext() {
 			old := f.caches[f.rowIdx-1]
 			tf := f.Timeframe
 			closeVal, _ := old.CloseValue()
-			f.OnEnvEnd(&orm.DataSeries{
+			envEnd := f.OnEnvEnd
+			if envEnd == nil {
+				envEnd = func(*orm.DataSeries) {}
+			}
+			envEnd(&orm.DataSeries{
 				Source:    orm.SeriesSourceKline,
 				Sid:       f.ExSymbol.ID,
 				TimeMS:    old.EndMS,

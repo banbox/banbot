@@ -1652,8 +1652,10 @@ func (o *OrderMgr) CutOrder(od *ormo.InOutOrder, enterRate, exitRate float64) *o
 	tgtKey, srcKey := od.Key(), part.Key()
 	parts, parseErr := o.priceSymbolParts(od.Symbol)
 	if parseErr != nil {
+		// Without base/quote the wallet split cannot be done; do not call
+		// CutPart with empty coin names.
 		o.Logger().Error("resolve order symbol parts fail", zap.String("symbol", od.Symbol), zap.Error(parseErr))
-		parts = [4]string{}
+		return part
 	}
 	base, quote := parts[0], parts[1]
 	wallets := o.walletsForOrder()
@@ -1664,7 +1666,6 @@ func (o *OrderMgr) CutOrder(od *ormo.InOutOrder, enterRate, exitRate float64) *o
 
 /*
 finishOrder
-sess 可为nil
 It will be saved internally to the database during the actual trading.
 实盘时内部会保存到数据库。
 */
@@ -1707,9 +1708,15 @@ func (o *OrderMgr) CleanUp() *errs.Error {
 func CloseAccOrders(acc string, odList []*ormo.InOutOrder, req *strat.ExitReq) (int, int, *errs.Error) {
 	var odMgr IOrderMgr
 	if core.EnvReal {
-		odMgr = GetLiveOdMgr(acc)
+		// Avoid wrapping a nil *LiveOrderMgr into a non-nil interface.
+		if live := GetLiveOdMgr(acc); live != nil {
+			odMgr = live
+		}
 	} else {
 		odMgr = GetOdMgr(acc)
+	}
+	if odMgr == nil {
+		return 0, len(odList), errs.NewMsg(errs.CodeRunTime, "order manager not found for account: %s", acc)
 	}
 
 	closeNum, failNum := 0, 0

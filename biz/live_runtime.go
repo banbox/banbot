@@ -147,7 +147,8 @@ func calcRuntimeFatalLoss(wallet *BanWallets, orders []*ormo.InOutOrder, interva
 	profit := 0.0
 	for i := len(orders) - 1; i >= 0; i-- {
 		if orders[i].RealEnterMS() < minMS {
-			break
+			// GetOrders order is not guaranteed (default id desc), so never break early.
+			continue
 		}
 		profit += orders[i].Profit
 	}

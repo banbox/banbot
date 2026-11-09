@@ -708,12 +708,7 @@ func (f *CorrelationFilter) filterWithRuntimeDeps(deps *RuntimeDeps, state *orm.
 	if f.BackNum < 10 {
 		return nil, errs.NewMsg(errs.CodeParamInvalid, "`CorrelationFilter.back_num` should >= 10, cur: %v", f.BackNum)
 	}
-	if f.TopRate > 0 {
-		rateNum := int(math.Round(float64(len(symbols)) * f.TopRate))
-		if f.TopN == 0 || f.TopN > rateNum {
-			f.TopN = rateNum
-		}
-	}
+	topN := correlationTopN(f.TopN, f.TopRate, len(symbols))
 	var skips []string
 	var names = make([]string, 0, len(symbols))
 	var dataArr = make([][]float64, 0, len(symbols))
@@ -782,7 +777,7 @@ func (f *CorrelationFilter) filterWithRuntimeDeps(deps *RuntimeDeps, state *orm.
 				continue
 			}
 			result = append(result, names[i])
-			if f.TopN > 0 && len(result) >= f.TopN {
+			if topN > 0 && len(result) >= topN {
 				break
 			}
 		}
@@ -829,11 +824,22 @@ func (f *CorrelationFilter) filterWithRuntimeDeps(deps *RuntimeDeps, state *orm.
 			continue
 		}
 		result = append(result, names[item.Id])
-		if f.TopN > 0 && len(result) >= f.TopN {
+		if topN > 0 && len(result) >= topN {
 			break
 		}
 	}
 	return result, nil
+}
+
+// correlationTopN resolves the effective top count without mutating the filter.
+func correlationTopN(topN int, topRate float64, total int) int {
+	if topRate > 0 {
+		rateNum := int(math.Round(float64(total) * topRate))
+		if topN == 0 || topN > rateNum {
+			return rateNum
+		}
+	}
+	return topN
 }
 
 func betterCorrelationCandidate(value float64, id int, currentValue float64, currentID int, ascending bool) bool {
@@ -921,11 +927,13 @@ func (f *BlockFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Er
 }
 
 func (f *OffsetFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	var res = symbols
+	res := slices.Clone(symbols)
 	if f.Reverse {
 		slices.Reverse(res)
 	}
-	if f.Offset < len(res) {
+	if f.Offset >= len(res) {
+		res = res[:0]
+	} else if f.Offset > 0 {
 		res = res[f.Offset:]
 	}
 	if f.Rate > 0 && f.Rate < 1 {
@@ -939,8 +947,9 @@ func (f *OffsetFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.E
 }
 
 func (f *ShuffleFilter) Filter(symbols []string, timeMS int64) ([]string, *errs.Error) {
-	rand.New(rand.NewSource(int64(f.Seed))).Shuffle(len(symbols), func(i, j int) {
-		symbols[i], symbols[j] = symbols[j], symbols[i]
+	res := slices.Clone(symbols)
+	rand.New(rand.NewSource(int64(f.Seed))).Shuffle(len(res), func(i, j int) {
+		res[i], res[j] = res[j], res[i]
 	})
-	return symbols, nil
+	return res, nil
 }

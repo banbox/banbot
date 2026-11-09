@@ -208,7 +208,11 @@ func CreateFilter(cfg *config.CommonPairFilter, allowEmpty bool) (IFilter, *errs
 	// Try to get from registry first
 	if factory, ok := GetFilterFactory(cfg.Name); ok {
 		filter := factory(base)
-		err := mapstructure.Decode(cfg.Items, &filter)
+		// Squash so that BaseFilter fields (e.g. `disable`) decode from the flat yaml items.
+		dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{Squash: true, Result: &filter})
+		if err == nil {
+			err = dec.Decode(cfg.Items)
+		}
 		if err != nil {
 			return nil, errs.New(errs.CodeUnmarshalFail, err)
 		}

@@ -441,9 +441,9 @@ func (t *CryptoTrader) initOdMgr() *errs.Error {
 				biz.InitFakeWalletsWithRuntimeDeps(*deps)
 			}
 			biz.InitLocalLiveOrderMgrWithRuntimeDeps(*deps, t.orderCB, true)
-			dp.OnDataSeries = func(msg *data.SeriesMsg, rows []*orm.DataSeries) *errs.Error {
+			dp.OnDataSeries = t.wrapRuntimeDataSeries(func(msg *data.SeriesMsg, rows []*orm.DataSeries) *errs.Error {
 				return biz.CallLocalLiveOdMgrsDataWithRuntime(*deps, msg, rows)
-			}
+			})
 			t.bindProviderRuntimeCallbacks(dp)
 			return nil
 		}
@@ -451,7 +451,7 @@ func (t *CryptoTrader) initOdMgr() *errs.Error {
 			biz.InitFakeWallets()
 		}
 		biz.InitLocalLiveOrderMgr(t.orderCB, true)
-		dp.OnDataSeries = biz.CallLocalLiveOdMgrsData
+		dp.OnDataSeries = t.wrapRuntimeDataSeries(biz.CallLocalLiveOdMgrsData)
 		t.bindProviderRuntimeCallbacks(dp)
 		return nil
 	}
@@ -1133,16 +1133,26 @@ func (t *CryptoTrader) bindProviderRuntimeCallbacks(dp *data.LiveProvider) {
 		dp.OnDepth = wrapDepth(dp.OnDepth)
 	}
 	if dp.OnDataSeries != nil {
-		callback := dp.OnDataSeries
-		dp.OnDataSeries = func(msg *data.SeriesMsg, rows []*orm.DataSeries) *errs.Error {
-			if !t.beginRuntimeCallback() {
-				return nil
-			}
-			defer t.endRuntimeCallback()
-			return callback(msg, rows)
-		}
+		dp.OnDataSeries = t.wrapRuntimeDataSeries(dp.OnDataSeries)
 	}
 	t.runtimeLock.Unlock()
+}
+
+// wrapRuntimeDataSeries puts a data-series callback behind the Runtime
+// admission barrier. Callbacks assigned after bindProviderRuntimeCallbacks
+// (the provider is already registered there and the bind is deduplicated)
+// must be wrapped by the assigner, otherwise they could run after Runtime close.
+func (t *CryptoTrader) wrapRuntimeDataSeries(callback func(*data.SeriesMsg, []*orm.DataSeries) *errs.Error) func(*data.SeriesMsg, []*orm.DataSeries) *errs.Error {
+	if callback == nil {
+		return nil
+	}
+	return func(msg *data.SeriesMsg, rows []*orm.DataSeries) *errs.Error {
+		if !t.beginRuntimeCallback() {
+			return nil
+		}
+		defer t.endRuntimeCallback()
+		return callback(msg, rows)
+	}
 }
 
 func (t *CryptoTrader) beginRuntimeCallback() bool {

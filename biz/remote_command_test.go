@@ -162,3 +162,61 @@ func TestRemoteCommandServiceTradingSwitch(t *testing.T) {
 		t.Fatal("expected enable to clear NoEnterUntil")
 	}
 }
+
+func TestRemoteCommandServiceCloseRejectsNonPositiveOrderIDWithoutAll(t *testing.T) {
+	oldAccounts := config.Accounts
+	config.Accounts = map[string]*config.AccountConfig{"acc": {}}
+	defer func() { config.Accounts = oldAccounts }()
+
+	for _, id := range []int64{0, -1} {
+		calls := 0
+		_, err := NewRemoteCommandService().Run(RemoteCommand{
+			Source: RemoteSourceTelegram, Actor: "tg", Account: "acc", Action: RemoteActionCloseOrder,
+			OrderID: id, Confirmed: true,
+			ExecClose: func() (int, int, *errs.Error) { calls++; return 1, 0, nil },
+		})
+		if err == nil || calls != 0 {
+			t.Fatalf("order id %d must be rejected without All, err=%v calls=%d", id, err, calls)
+		}
+	}
+}
+
+func TestRemoteCommandServiceRejectsConcurrentDuplicateInFlight(t *testing.T) {
+	oldAccounts := config.Accounts
+	config.Accounts = map[string]*config.AccountConfig{"acc": {}}
+	defer func() { config.Accounts = oldAccounts }()
+
+	svc := NewRemoteCommandService()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	calls := 0
+	cmd := RemoteCommand{
+		Source: RemoteSourceWeb, Actor: "user", Account: "acc", Action: RemoteActionCloseOrder,
+		Idempotency: "dup", OrderID: 1, Confirmed: true,
+		ExecClose: func() (int, int, *errs.Error) {
+			calls++
+			close(started)
+			<-release
+			return 1, 0, nil
+		},
+	}
+	done := make(chan struct{})
+	go func() {
+		_, _ = svc.Run(cmd)
+		close(done)
+	}()
+	<-started
+	// advance past the per-action rate window so only the in-flight guard can stop it
+	svc.mu.Lock()
+	svc.now = func() time.Time { return time.Now().Add(5 * time.Second) }
+	svc.mu.Unlock()
+	if _, err := svc.Run(cmd); err == nil {
+		t.Fatal("expected in-progress rejection for concurrent duplicate")
+	}
+	close(release)
+	<-done
+	res, err := svc.Run(cmd)
+	if err != nil || !res.Idempotent || calls != 1 {
+		t.Fatalf("after completion res=%+v err=%v calls=%d", res, err, calls)
+	}
+}

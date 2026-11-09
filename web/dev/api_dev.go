@@ -169,6 +169,24 @@ func (s *DevServer) handleFileOp(c *fiber.Ctx) error {
 		return err
 	}
 	srcPath := filepath.Join(baseDir, op.Path)
+	if !pathWithin(srcPath, baseDir) {
+		return fiber.NewError(fiber.StatusBadRequest, "path escapes root dir")
+	}
+	// rename/cut/delete must not act on the root dir itself
+	if srcPath == filepath.Clean(baseDir) && (op.Op == "rename" || op.Op == "cut" || op.Op == "delete") {
+		return fiber.NewError(fiber.StatusBadRequest, "cannot modify root dir")
+	}
+	switch op.Op {
+	case "newFile", "newFolder", "rename":
+		if !pathWithin(filepath.Join(srcPath, op.Target), baseDir) ||
+			(op.Op == "rename" && !pathWithin(filepath.Join(filepath.Dir(srcPath), op.Target), baseDir)) {
+			return fiber.NewError(fiber.StatusBadRequest, "target escapes root dir")
+		}
+	case "cut", "copy":
+		if !pathWithin(filepath.Join(baseDir, op.Target, filepath.Base(srcPath)), baseDir) {
+			return fiber.NewError(fiber.StatusBadRequest, "target escapes root dir")
+		}
+	}
 
 	switch op.Op {
 	case "newFile":
@@ -243,12 +261,19 @@ func (s *DevServer) parsePath(curPath string) (string, error) {
 	}
 	if strings.HasPrefix(curPath, "$") || strings.HasPrefix(curPath, "@") {
 		curPath = s.ParsePath(curPath)
+		if s != nil && s.Data != nil && s.Data.Config != nil && s.Data.Config.DataDir != "" &&
+			!pathWithin(curPath, filepath.Clean(s.Data.Config.DataDir)) {
+			return "", fmt.Errorf("path escapes data dir: %q", curPath)
+		}
 	} else {
 		baseDir, err := s.getRootDir()
 		if err != nil {
 			return "", err
 		}
 		curPath = filepath.Join(baseDir, curPath)
+		if !pathWithin(curPath, filepath.Clean(baseDir)) {
+			return "", fmt.Errorf("path escapes root dir: %q", curPath)
+		}
 	}
 	return curPath, nil
 }

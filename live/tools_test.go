@@ -114,3 +114,12 @@ func TestProductionCloseCannotBypassExecutionOwner(t *testing.T) {
 		}
 	}
 }
+
+func TestCloseAccountsMatchOwnerIgnoresDefaultAccount(t *testing.T) {
+	if !closeAccountsMatchOwner([]string{"owner"}, "owner") {
+		t.Fatal("owner account must be accepted")
+	}
+	if closeAccountsMatchOwner([]string{"owner", "other"}, "owner") {
+		t.Fatal("foreign account must be rejected")
+	}
+}

@@ -30,6 +30,9 @@ import (
 func insertKLinesPg(q *Queries, timeFrame string, sid int32, arr []*banexg.Kline) (int64, *errs.Error) {
 	tblName := "kline_" + timeFrame
 	cols := []string{"sid", "time", "open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num"}
+	if len(arr) == 0 {
+		return 0, nil
+	}
 	rows := make([]*KlineSid, 0, len(arr))
 	for _, k := range arr {
 		rows = append(rows, &KlineSid{Kline: *k, Sid: sid})
@@ -37,10 +40,16 @@ func insertKLinesPg(q *Queries, timeFrame string, sid int32, arr []*banexg.Kline
 	newSrc := func() *iterForAddKLinesPg { return &iterForAddKLinesPg{rows: rows} }
 	n, err := q.db.CopyFrom(context.Background(), pgx.Identifier{tblName}, cols, newSrc())
 	if err != nil {
-		// On conflict (duplicate), fall back to DELETE + retry with a fresh iterator.
+		// CopyFrom failed (typically duplicate keys): fall back to DELETE + retry with a fresh
+		// iterator. The window is computed from min/max time since arr is not guaranteed sorted.
+		// Note: DELETE and the retried COPY are not in one transaction.
 		tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
-		startMS := arr[0].Time
-		endMS := arr[len(arr)-1].Time + tfMSecs
+		startMS, endMS := arr[0].Time, arr[0].Time
+		for _, k := range arr {
+			startMS = min(startMS, k.Time)
+			endMS = max(endMS, k.Time)
+		}
+		endMS += tfMSecs
 		if delErr := delKLinesPg(q, timeFrame, sid, startMS, endMS); delErr != nil {
 			return 0, delErr
 		}

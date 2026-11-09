@@ -10,11 +10,37 @@ import (
 )
 
 var (
-	commentRe   = regexp.MustCompile(`(\s+|\b|^)#[^\n]*`)
 	emptyLineRe = regexp.MustCompile(`\n(\s*\n)+`)
 	keyStartRe  = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]`)
 	commaRe     = regexp.MustCompile(`:($|\s)`)
 )
+
+// stripYamlComments removes real inline comments only: '#' at line start or preceded
+// by whitespace, and not inside quotes. Values like abc#1 are kept intact.
+func stripYamlComments(text string) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		var quote byte
+		for j := 0; j < len(line); j++ {
+			c := line[j]
+			if quote != 0 {
+				if quote == '"' && c == '\\' {
+					j++
+				} else if c == quote {
+					quote = 0
+				}
+				continue
+			}
+			if (c == '"' || c == '\'') && (j == 0 || strings.IndexByte(" \t[{,", line[j-1]) >= 0) {
+				quote = c
+			} else if c == '#' && (j == 0 || line[j-1] == ' ' || line[j-1] == '\t') {
+				lines[i] = strings.TrimRight(line[:j], " \t")
+				break
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
 
 // MergeYamlStr 合并多个yaml文件内容，保持键的顺序
 func MergeYamlStr(paths []string, skips ...string) (string, error) {
@@ -32,7 +58,7 @@ func MergeYamlStr(paths []string, skips ...string) (string, error) {
 		// 删除注释和多余空行
 		text := strings.ReplaceAll(string(content), "\r\n", "\n")
 		text = strings.ReplaceAll(text, "\r", "\n")
-		text = commentRe.ReplaceAllString(text, "")
+		text = stripYamlComments(text)
 		text = emptyLineRe.ReplaceAllString(text, "\n")
 
 		lines := strings.Split(text, "\n")

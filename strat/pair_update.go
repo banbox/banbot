@@ -272,6 +272,26 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 			allowedSet[p] = true
 		}
 	}
+	if req.CloseOnRemove && hooks.ExitOrders == nil {
+		// Validate before any side effect (open limits, unwatch, shutdown).
+		for _, pair := range removes {
+			tf, ok := curMap[pair]
+			if !ok {
+				continue
+			}
+			envKey := pair + "_" + tf
+			for _, accJobs := range strategyState.accJobs {
+				job := accJobs[envKey][req.Strat.Name]
+				if job == nil {
+					continue
+				}
+				snapshot := job.ExecutionSnapshot()
+				if snapshot.EnteredNum > 0 || len(snapshot.LongOrders) > 0 || len(snapshot.ShortOrders) > 0 {
+					return nil, errs.NewMsg(core.ErrRunTime, "ExitOrders hook is required to close removed pair orders")
+				}
+			}
+		}
+	}
 	removals := make([]pairRemoval, 0, len(removes))
 	pendingUnwatches := make(map[string][]string)
 	shutdownJobs := make([]*StratJob, 0, len(removes))

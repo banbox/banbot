@@ -47,8 +47,13 @@ func RegisterFactor(name string, build func(FactorContext) (FactorSpec, error)) 
 		return errors.New("runner: factor needs name and build function")
 	}
 	return RegisterDefinition(name, func(c Config) (*factor.Plan, research.ComboSpec, error) {
-		spec, err := build(FactorContext{TimeFrame: c.Factor.TimeFrame, Params: c.Params()})
+		params := c.Params()
+		spec, err := build(FactorContext{TimeFrame: c.Factor.TimeFrame, Params: params})
 		if err != nil {
+			return nil, research.ComboSpec{}, err
+		}
+		// A builder that forgets to return Params.Err() must not hide bad values.
+		if err = params.Err(); err != nil {
 			return nil, research.ComboSpec{}, err
 		}
 		if len(spec.Outputs) == 0 {

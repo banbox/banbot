@@ -613,7 +613,7 @@ func (w *SeriesWatcher) onBook(msg *utils.IOMsgRaw) {
 	if len(parts) < 4 {
 		return
 	}
-	msgType, exgName, market, pair := parts[0], parts[1], parts[2], parts[3]
+	msgType, exgName, market, pair := parts[0], parts[1], parts[2], strings.Join(parts[3:], "_")
 	if runtimeExg, runtimeMarket := w.identity(); exgName != runtimeExg || market != runtimeMarket {
 		return
 	}

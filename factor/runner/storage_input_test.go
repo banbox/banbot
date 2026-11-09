@@ -429,3 +429,32 @@ func TestStorageRejectsUnorderedForeignAndOverBudgetPages(t *testing.T) {
 		})
 	}
 }
+
+func TestStorageOpenClosesEarlierReadersOnMetadataMismatch(t *testing.T) {
+	closed := false
+	stream := func(source string) StorageStream {
+		return StorageStream{Subscription: orm.Subscription{Source: source, TimeFrame: "event", ExSymbol: &orm.ExSymbol{ID: 1}}, SourceVersion: "v1", SchemaHash: "s1"}
+	}
+	options := StorageInputOptions{Namespace: "strict", PITPolicy: "strict", FromMS: 100, ToMS: 300, PageRows: 1, PrefetchRows: 2, Streams: []StorageStream{stream("a"), stream("b")}, VersionPages: strictFixtureFactory{closed: &closed}}
+	factory, err := NewStorageInputFactory(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := Config{MaxRecords: 10, Snapshot: factor.SnapshotSpec{VisibilityPolicy: "strict", ReplayTime: 1, SourceVersions: map[string]string{"a": "v1", "b": "other"}, Schemas: map[string]string{"a": "s1", "b": "s1"}}}
+	if _, err = factory.Open(context.Background(), c, factory.Ranges()[0]); err == nil {
+		t.Fatal("metadata mismatch accepted")
+	}
+	if !closed {
+		t.Fatal("reader opened for an earlier stream leaked")
+	}
+}
+
+func TestStorageVisibleRejectsClosedInput(t *testing.T) {
+	s := &storageInput{latest: map[factor.StreamKey][]factor.VersionRecord{}}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Visible(context.Background(), 1, 1, 0); err == nil {
+		t.Fatal("closed input silently returned no rows")
+	}
+}

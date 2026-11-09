@@ -691,6 +691,9 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 			lock.Unlock()
 			odMgr := t.orderManager(account)
 			if len(allOrders) > 0 {
+				if odMgr == nil {
+					return errs.NewMsg(core.ErrRunTime, "order manager is not available for account %s", account)
+				}
 				if updateErr := odMgr.UpdateByDataSeries(allOrders, evt); updateErr != nil {
 					return updateErr
 				}
@@ -1014,6 +1017,7 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 		if handledJobs[job] {
 			continue
 		}
+		t.bindJobRuntime(job)
 		fields := job.SetData(evt)
 		job.SetWarmUp(isWarmup)
 		num1, num2 := strat.GetJobInOutNum(job)
@@ -1094,6 +1098,9 @@ func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, ev
 		err := strat.CheckCustomExits(job)
 		if err != nil {
 			return err
+		}
+		if odMgr == nil {
+			return errs.NewMsg(core.ErrRunTime, "order manager is not available for account %s", account)
 		}
 		_, _, err = odMgr.ProcessOrders(job)
 		if err != nil {

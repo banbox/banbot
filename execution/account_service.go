@@ -257,14 +257,21 @@ func (b *SharedAccountBorrow) Reconcile(id string, nowMS int64) error {
 				return err
 			}
 			known := make(map[string]bool)
+			// Orders whose cancel/outcome is still unresolved are locally owned: a
+			// matching venue open order is not a manual order and must not freeze.
+			// They are not required to be present (the cancel may have landed), and
+			// the uncertain-order guard keeps ordinary submission blocked.
+			uncertain := make(map[string]bool)
 			for _, o := range local.Orders {
 				if o.State == OrderAcknowledged || o.State == OrderPartial {
 					known[o.ExchangeID] = true
+				} else if (o.State == OrderCancelPending || o.State == OrderUnknown) && o.ExchangeID != "" {
+					uncertain[o.ExchangeID] = true
 				}
 			}
 			seen := make(map[string]bool)
 			for _, o := range venue.OpenOrders {
-				if !o.Found || !o.Authoritative || !o.Complete || o.Canceled || o.Receipt.ExchangeID == "" || !known[o.Receipt.ExchangeID] || seen[o.Receipt.ExchangeID] {
+				if !o.Found || !o.Authoritative || !o.Complete || o.Canceled || o.Receipt.ExchangeID == "" || !(known[o.Receipt.ExchangeID] || uncertain[o.Receipt.ExchangeID]) || seen[o.Receipt.ExchangeID] {
 					freezeErr := s.freezeFailure(context.Background(), id+"/unmatched-order", nowMS)
 					return errors.Join(errors.New("execution: unmatched or incomplete venue open order freezes shared account"), freezeErr)
 				}
@@ -553,7 +560,7 @@ func (b *SharedAccountBorrow) Rebalance(request CombinedRebalance, nowMS int64) 
 
 func (b *SharedAccountBorrow) RebalanceAtCheckpoint(request CombinedRebalance, checkpoint, nowMS int64) error {
 	return b.use(func(s *SharedAccount) error {
-		current, err := s.store.Snapshot(context.Background())
+		current, err := s.store.Snapshot(b.ctx)
 		if err != nil {
 			return err
 		}
@@ -568,11 +575,11 @@ func (b *SharedAccountBorrow) RebalanceAtCheckpoint(request CombinedRebalance, c
 // change a cash/fill checkpoint. Callers rebuild on ErrSharedCheckpoint.
 func (b *SharedAccountBorrow) RebalanceAtVersion(request CombinedRebalance, checkpoint int64, expectedPlanID string, nowMS int64) error {
 	return b.use(func(s *SharedAccount) error {
-		current, err := s.store.Snapshot(context.Background())
+		current, err := s.store.Snapshot(b.ctx)
 		if err != nil {
 			return err
 		}
-		latest, err := s.store.LatestPlan(context.Background())
+		latest, err := s.store.LatestPlan(b.ctx)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
@@ -628,7 +635,7 @@ func (b *SharedAccountBorrow) Recover(id string) error {
 	return b.use(func(s *SharedAccount) error { s.ready = false; return s.executorFor(b.ctx).Recover(id) })
 }
 func (b *SharedAccountBorrow) ApplyTrade(report FillReport) error {
-	return b.use(func(s *SharedAccount) error { return s.executor.ApplyTrade(report) })
+	return b.use(func(s *SharedAccount) error { return s.executorFor(b.ctx).ApplyTrade(report) })
 }
 
 // ProjectionEvents returns committed state only. Callbacks run outside owner

@@ -349,3 +349,9 @@ func BenchmarkLegacyPriceFacadeSetBarPrice(b *testing.B) {
 		SetBarPrice("BTC/USDT:USDT", 100)
 	}
 }
+
+func TestPriceStrictExpireIsStricterThanSafeExpire(t *testing.T) {
+	if PriceStrictExpireMS != 10000 || PriceStrictExpireMS >= PriceExpireMS {
+		t.Fatalf("strict=%d safe=%d", PriceStrictExpireMS, PriceExpireMS)
+	}
+}

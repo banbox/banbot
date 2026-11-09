@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm/ormo"
 )
 
@@ -55,5 +56,52 @@ func TestCalcRuntimeFatalLossUsesWindowBoundedByRuntimeStart(t *testing.T) {
 	}
 	if got := calcRuntimeFatalLoss(wallet, orders, 60, nowMS, nowMS-10*60_000); got <= 0 || got >= 0.1 {
 		t.Fatalf("runtime-start bounded loss rate = %v, want only post-start loss", got)
+	}
+}
+
+func TestCalcFatalLossIgnoresOrderOfOrders(t *testing.T) {
+	wallet := &BanWallets{Items: map[string]*ItemWallet{
+		"USDT": {Coin: "USDT", Available: 100},
+	}}
+	const nowMS int64 = 3_600_000
+	// descending order (ormo default id desc): recent first, then an old order, then another recent one
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{EnterAt: nowMS - 1*60_000, Profit: -10}},
+		{IOrder: &ormo.IOrder{EnterAt: nowMS - 50*60_000, Profit: -100}},
+		{IOrder: &ormo.IOrder{EnterAt: nowMS - 2*60_000, Profit: -10}},
+	}
+	asc := []*ormo.InOutOrder{orders[1], orders[2], orders[0]}
+	a := calcRuntimeFatalLoss(wallet, orders, 5, nowMS, 0)
+	b := calcRuntimeFatalLoss(wallet, asc, 5, nowMS, 0)
+	if a != b || a <= 0.1 {
+		t.Fatalf("loss must not depend on order: desc=%v asc=%v", a, b)
+	}
+}
+
+func TestFeeLeftRateZeroFee(t *testing.T) {
+	if got := feeLeftRate(0, 0); got != 1 {
+		t.Fatalf("feeLeftRate(0,0)=%v want 1", got)
+	}
+	if got := feeLeftRate(1, 4); got != 0.25 {
+		t.Fatalf("feeLeftRate(1,4)=%v", got)
+	}
+}
+
+func TestCalcFatalLossWindowBoundedByProcessStart(t *testing.T) {
+	wallet := &BanWallets{Items: map[string]*ItemWallet{
+		"USDT": {Coin: "USDT", Available: 100},
+	}}
+	const nowMS int64 = 3_600_000
+	oldNow, oldStart, oldBT := btime.CurTimeMS, core.StartAt, core.BackTestMode
+	core.BackTestMode = true
+	btime.SetTimeMS(nowMS)
+	core.StartAt = nowMS - 10*60_000
+	defer func() { btime.SetTimeMS(oldNow); core.StartAt = oldStart; core.BackTestMode = oldBT }()
+	orders := []*ormo.InOutOrder{
+		{IOrder: &ormo.IOrder{EnterAt: nowMS - 30*60_000, Profit: -100}},
+		{IOrder: &ormo.IOrder{EnterAt: nowMS - 2*60_000, Profit: -10}},
+	}
+	if got := calcFatalLoss(wallet, orders, 60); got <= 0 || got >= 0.1 {
+		t.Fatalf("loss rate = %v, want only post-start loss", got)
 	}
 }

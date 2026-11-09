@@ -305,3 +305,85 @@ func TestCompareSymbolVolUsesNumericTotalOrderAndSymbolTieBreak(t *testing.T) {
 		}
 	}
 }
+
+func TestOffsetFilterOutOfRangeAndNoMutation(t *testing.T) {
+	input := []string{"A", "B", "C"}
+	got, err := (&OffsetFilter{Offset: 3}).Filter(input, 0)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("offset>=len = %v, %v; want empty", got, err)
+	}
+	got, _ = (&OffsetFilter{Offset: 10}).Filter(input, 0)
+	if len(got) != 0 {
+		t.Fatalf("offset>len = %v; want empty", got)
+	}
+	got, _ = (&OffsetFilter{Reverse: true, Offset: 1}).Filter(input, 0)
+	if !slices.Equal(got, []string{"B", "A"}) {
+		t.Fatalf("reverse+offset = %v", got)
+	}
+	if !slices.Equal(input, []string{"A", "B", "C"}) {
+		t.Fatalf("input mutated: %v", input)
+	}
+}
+
+func TestShuffleFilterDoesNotMutateInput(t *testing.T) {
+	input := []string{"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX"}
+	orig := slices.Clone(input)
+	if _, err := (&ShuffleFilter{Seed: 7}).Filter(input, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(input, orig) {
+		t.Fatalf("input mutated: %v", input)
+	}
+}
+
+func TestCorrelationTopNDoesNotStick(t *testing.T) {
+	f := &CorrelationFilter{TopRate: 0.5}
+	if got := correlationTopN(f.TopN, f.TopRate, 4); got != 2 {
+		t.Fatalf("topN = %d, want 2", got)
+	}
+	if f.TopN != 0 {
+		t.Fatalf("filter TopN mutated: %d", f.TopN)
+	}
+	if got := correlationTopN(f.TopN, f.TopRate, 10); got != 5 {
+		t.Fatalf("topN after larger refresh = %d, want 5", got)
+	}
+}
+
+func TestSetupWithAllPairlistsDisabled(t *testing.T) {
+	old := config.PairFilters
+	defer func() { config.PairFilters = old }()
+	config.PairFilters = []*config.CommonPairFilter{{Name: "OffsetFilter", Items: map[string]interface{}{"disable": true}}}
+	if err := Setup(); err != nil {
+		t.Fatalf("Setup error = %v", err)
+	}
+}
+
+func TestCreateFilterDecodesBaseFilterDisable(t *testing.T) {
+	f, err := CreateFilter(&config.CommonPairFilter{Name: "OffsetFilter", Items: map[string]interface{}{"disable": true, "limit": 3}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.IsDisable() {
+		t.Fatal("disable: true not decoded into BaseFilter")
+	}
+	if f.GetName() != "OffsetFilter" {
+		t.Fatalf("name lost: %q", f.GetName())
+	}
+	if !f.(*OffsetFilter).AllowEmpty {
+		t.Fatal("AllowEmpty lost")
+	}
+}
+
+func TestLegacyRefreshPairListNoPanicWithoutProducer(t *testing.T) {
+	oldMgr, oldProducer := config.PairMgr, pairProducer
+	defer func() { config.PairMgr, pairProducer = oldMgr, oldProducer }()
+	config.PairMgr = nil
+	if _, err := RefreshPairList(0); err == nil {
+		t.Fatal("expected error when PairMgr is nil")
+	}
+	config.PairMgr = &config.PairMgrConfig{}
+	pairProducer = nil
+	if _, err := RefreshPairList(0); err == nil {
+		t.Fatal("expected error when pairProducer is nil")
+	}
+}

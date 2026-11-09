@@ -282,7 +282,7 @@ func initDashBot(res *Telegram, name string, item map[string]interface{}) *errs.
 		if err2 != nil {
 			log.Error("send onGetSecret fail", zap.Error(err2))
 		} else {
-			log.Info("Manage Your Bot On https://t.me/trade_banbot?start=" + res.secret)
+			log.Info("Manage Your Bot On https://t.me/trade_banbot?start=<secret>", zap.Int("secret_len", len(res.secret)))
 		}
 	}
 	ioClient.Listens["telegram_cmd"] = func(msg *utils2.IOMsgRaw) {
@@ -1235,7 +1235,7 @@ func (t *Telegram) closeOrders(orderID string) string {
 
 	// 解析订单ID
 	id, err := strconv.ParseInt(orderID, 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		errorLabel := t.langMsg("error_label", "❌ 错误")
 		invalidOrderID := t.langMsg("invalid_order_id", "无效的订单ID")
 		return fmt.Sprintf("%s: %s", errorLabel, invalidOrderID)

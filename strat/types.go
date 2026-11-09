@@ -26,7 +26,7 @@ type TradeStrat struct {
 	Version         int
 	WarmupNum       int
 	OdBarMax        int     // default: 500. Estimated maximum bar hold number for orders (used to find unfinished positions for backtesting) 预计订单持仓最大bar数量（用于查找回测未完成持仓）
-	MinTfScore      float64 // Minimum time cycle quality, default 0.8 最小时间周期质量，默认0.8
+	MinTfScore      float64 // Minimum time cycle quality, default 0.75 最小时间周期质量，默认0.75
 	WsSubs          map[string]string
 	DrawDownExit    bool
 	HedgeOff        bool    // turn off future hedge mode 关闭合约双向持仓

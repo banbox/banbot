@@ -1683,3 +1683,24 @@ func TestCryptoTraderRunStartupReturnsCallbackError(t *testing.T) {
 		t.Fatalf("expected startup error to stop before jobs/loop, got start=%d loop=%d", startCalls, loopCalls)
 	}
 }
+
+func TestCryptoTraderWrapRuntimeDataSeriesRejectsAfterClose(t *testing.T) {
+	lifecycle := newTestRuntimeLifecycle()
+	t.Cleanup(lifecycle.close)
+	trader := newBoundCryptoTraderForTest(lifecycle, nil)
+	calls := 0
+	wrapped := trader.wrapRuntimeDataSeries(func(*data.SeriesMsg, []*orm.DataSeries) *errs.Error {
+		calls++
+		return nil
+	})
+	if err := wrapped(&data.SeriesMsg{}, nil); err != nil || calls != 1 {
+		t.Fatalf("open runtime: err=%v calls=%d, want nil/1", err, calls)
+	}
+	lifecycle.closeAndWait()
+	if err := wrapped(&data.SeriesMsg{}, nil); err != nil || calls != 1 {
+		t.Fatalf("closed runtime: err=%v calls=%d, want callback skipped", err, calls)
+	}
+	if trader.wrapRuntimeDataSeries(nil) != nil {
+		t.Fatal("nil callback must stay nil")
+	}
+}

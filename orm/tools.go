@@ -631,6 +631,7 @@ func runExportKlinesWithDeps(deps KDataTransferDeps, jobs []*ExportKlineJob, out
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			var file *os.File
 			sess, release, err := deps.conn()
 			if err != nil {
@@ -639,7 +640,6 @@ func runExportKlinesWithDeps(deps KDataTransferDeps, jobs []*ExportKlineJob, out
 				return
 			}
 			defer func() {
-				wg.Done()
 				release()
 				if file != nil {
 					_ = file.Close()

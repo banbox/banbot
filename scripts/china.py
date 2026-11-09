@@ -3,9 +3,15 @@ import tushare as ts
 import datetime
 import csv
 from typing import *
-# tushare的token可从淘宝买
-pro = ts.pro_api('20231208200557-1dec8335-58b2-4535-97cd-7d19b7b57f0f')
-pro._DataApi__http_url = 'http://tsapi.majors.ltd:7000'
+import os
+import sys
+# tushare的token可从淘宝买；通过环境变量 TUSHARE_TOKEN 传入，禁止硬编码到代码库
+_token = os.environ.get('TUSHARE_TOKEN', '')
+if not _token:
+    sys.exit('please set env TUSHARE_TOKEN first')
+pro = ts.pro_api(_token)
+# 第三方代理端点，可通过 TUSHARE_HTTP_URL 覆盖
+pro._DataApi__http_url = os.environ.get('TUSHARE_HTTP_URL', 'http://tsapi.majors.ltd:7000')
 
 
 def down_calendars():

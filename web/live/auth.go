@@ -2,6 +2,8 @@ package live
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"strings"
@@ -72,7 +74,7 @@ func (h *apiHandlers) postStratCall(c *fiber.Ctx) error {
 	clientIP := c.IP()
 	var user *config.UserConfig
 	for _, u := range users {
-		if u.Password == token {
+		if u.Password != "" && secureEqual(u.Password, token) {
 			if len(u.AllowIPs) == 0 || utils.ArrContains(u.AllowIPs, clientIP) {
 				user = u
 			} else {
@@ -184,6 +186,12 @@ func (h *apiHandlers) postStratCall(c *fiber.Ctx) error {
 	}
 }
 
+// secureEqual compares two strings in constant time (independent of the common prefix length).
+func secureEqual(a, b string) bool {
+	ha, hb := sha256.Sum256([]byte(a)), sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
+}
+
 func (h *apiHandlers) postLogin(c *fiber.Ctx) error {
 	type LoginRequest struct {
 		Username string `json:"username" validate:"required"`
@@ -197,7 +205,7 @@ func (h *apiHandlers) postLogin(c *fiber.Ctx) error {
 	clientIP := c.IP()
 	users := h.apiUsers()
 	for _, u := range users {
-		if u.Username != req.Username || u.Password != req.Password {
+		if !secureEqual(u.Username, req.Username) || !secureEqual(u.Password, req.Password) {
 			continue
 		}
 		if len(u.AllowIPs) > 0 && !utils.ArrContains(u.AllowIPs, clientIP) {
@@ -339,7 +347,7 @@ func (h *apiHandlers) authMiddleware(secret string) fiber.Handler {
 
 		if err != nil || !token.Valid {
 			if err != nil {
-				log.Warn("invalid token3", zap.String("token", tokenStr), zap.Error(err))
+				log.Warn("invalid token3", zap.Error(err))
 			}
 			return fiber.NewError(fiber.StatusUnauthorized, "invalid token3")
 		}

@@ -1561,6 +1561,14 @@ tryFillExit
 Try to close a position, used to update the closing status of the robot's order from a third-party transaction
 尝试平仓，用于从第三方交易中更新机器人订单的平仓状态
 */
+// feeLeftRate returns the remaining fee ratio; a zero original fee must not yield NaN.
+func feeLeftRate(left, org float64) float64 {
+	if org == 0 {
+		return 1
+	}
+	return left / org
+}
+
 func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, odTime int64, orderID, odType,
 	feeName string, feeCost float64, feeQuote float64) (float64, float64, *ormo.InOutOrder) {
 	orgFeeCost := feeCost
@@ -1571,7 +1579,7 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 			o.Logger().Error("local exit no enter order fail", zap.String("acc", o.Account),
 				zap.String("key", iod.Key()), zap.Error(err))
 		}
-		return filled, feeCost / orgFeeCost, iod
+		return filled, feeLeftRate(feeCost, orgFeeCost), iod
 	}
 	var avaAmount float64
 	// Should a small order be split?
@@ -1638,7 +1646,7 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 	part.Status = ormo.InOutStatusFullExit
 	part.DirtyMain = true
 	o.fireOdChange(part, strat.OdChgExitFill)
-	return filled, feeCost / orgFeeCost, part
+	return filled, feeLeftRate(feeCost, orgFeeCost), part
 }
 
 func (o *LiveOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
@@ -2657,6 +2665,9 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		price := sellPrice
 		if subOd.Side == banexg.OdSideBuy {
 			price = buyPrice
+		}
+		if !(price > 0) {
+			return errs.NewMsg(core.ErrRunTime, "no valid limit price for %s", od.Key())
 		}
 		subOd.Price, err = exg.PrecPrice(exchange, od.Symbol, price)
 		if err != nil {
@@ -4412,6 +4423,20 @@ func (o *LiveOrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 	return o.OrderMgr.finishOrder(od)
 }
 
+// drainLeverageStream consumes the stream until it closes; returns false if ctx is done.
+func (o *LiveOrderMgr) drainLeverageStream(ctx context.Context, out <-chan *banexg.AccountConfig) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case _, ok := <-out:
+			if !ok {
+				return true
+			}
+		}
+	}
+}
+
 func (o *LiveOrderMgr) WatchLeverages() {
 	if !o.isContract() {
 		return
@@ -4427,30 +4452,29 @@ func (o *LiveOrderMgr) WatchLeverages() {
 		defer func() {
 			atomic.StoreInt32(&o.isWatchAccConfig, 0)
 		}()
-		out, err := exchange.WatchAccountConfig(map[string]interface{}{
-			banexg.ParamAccount: o.Account,
-		})
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			o.Logger().Error("WatchLeverages error", zap.Error(err))
-			return
-		}
-		if out == nil {
-			o.Logger().Warn("WatchLeverages returned nil stream", zap.String("acc", o.Account))
-			return
-		}
 		for {
+			out, err := exchange.WatchAccountConfig(map[string]interface{}{
+				banexg.ParamAccount: o.Account,
+			})
+			if err != nil || out == nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if err != nil {
+					o.Logger().Error("WatchLeverages error, retrying", zap.Error(err))
+				} else {
+					o.Logger().Warn("WatchLeverages returned nil stream, retrying", zap.String("acc", o.Account))
+				}
+			} else if !o.drainLeverageStream(ctx, out) {
+				return
+			}
+			// stream failed or closed: wait then resubscribe, same as WatchMyTrades
 			select {
 			case <-ctx.Done():
 				return
-			case _, ok := <-out:
-				if !ok {
-					return
-				}
+			case <-time.After(defaultMyTradeWatchRetry):
 			}
 		}
 	}) {
@@ -4516,16 +4540,18 @@ Calculate the percentage of account balance loss in the last n minutes at the sy
 */
 func calcFatalLoss(wallets *BanWallets, orders []*ormo.InOutOrder, backMins int) float64 {
 	minTimeMS := btime.TimeMS() - int64(backMins)*60000
-	minTimeMS = min(minTimeMS, core.StartAt)
+	// The window never reaches before the process start (same as calcRuntimeFatalLoss).
+	minTimeMS = max(minTimeMS, core.StartAt)
 	sumProfit := float64(0)
 	for i := len(orders) - 1; i >= 0; i-- {
 		od := orders[i]
 		if od.RealEnterMS() < minTimeMS {
-			break
+			// order of orders is not guaranteed, never break early
+			continue
 		}
 		sumProfit += od.Profit
 	}
-	if sumProfit >= 0 {
+	if sumProfit >= 0 || wallets == nil {
 		return 0
 	}
 	lossVal := math.Abs(sumProfit)

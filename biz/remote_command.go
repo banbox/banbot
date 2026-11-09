@@ -53,6 +53,7 @@ type RemoteCommandService struct {
 	deps    *RuntimeDeps
 	mu      sync.Mutex
 	seen    map[string]*RemoteCommandResult
+	pending map[string]bool // idempotency keys currently executing
 	lastHit map[string]time.Time
 	now     func() time.Time
 }
@@ -60,6 +61,7 @@ type RemoteCommandService struct {
 func NewRemoteCommandService() *RemoteCommandService {
 	return &RemoteCommandService{
 		seen:    make(map[string]*RemoteCommandResult),
+		pending: make(map[string]bool),
 		lastHit: make(map[string]time.Time),
 		now:     time.Now,
 	}
@@ -107,6 +109,12 @@ func (s *RemoteCommandService) Run(cmd RemoteCommand) (*RemoteCommandResult, *er
 			cp.Idempotent = true
 			return &cp, nil
 		}
+		if s.pending[cmd.Idempotency] {
+			// the same command is still executing; never run it twice concurrently
+			s.auditLocked(cmd, "in_progress", nil, nil)
+			s.mu.Unlock()
+			return nil, errs.NewMsg(core.ErrOutOfResource, "remote command already in progress")
+		}
 	}
 	now := s.now()
 	rateKey := cmd.Source + ":" + cmd.Actor + ":" + cmd.Action
@@ -116,6 +124,9 @@ func (s *RemoteCommandService) Run(cmd RemoteCommand) (*RemoteCommandResult, *er
 		return nil, errs.NewMsg(core.ErrOutOfResource, "remote command rate limited")
 	}
 	s.lastHit[rateKey] = now
+	if hasIdempotency {
+		s.pending[cmd.Idempotency] = true
+	}
 	s.mu.Unlock()
 
 	var res *RemoteCommandResult
@@ -130,6 +141,9 @@ func (s *RemoteCommandService) Run(cmd RemoteCommand) (*RemoteCommandResult, *er
 	}
 
 	s.mu.Lock()
+	if hasIdempotency {
+		delete(s.pending, cmd.Idempotency)
+	}
 	if err == nil {
 		if hasIdempotency {
 			s.seen[cmd.Idempotency] = res
@@ -145,6 +159,10 @@ func (s *RemoteCommandService) Run(cmd RemoteCommand) (*RemoteCommandResult, *er
 func (s *RemoteCommandService) runClose(cmd RemoteCommand) (*RemoteCommandResult, *errs.Error) {
 	if cmd.All && !cmd.Confirmed {
 		return nil, errs.NewMsg(errs.CodeParamInvalid, "close all requires confirmation")
+	}
+	if !cmd.All && cmd.OrderID <= 0 {
+		// OrderID<=0 must never fall through to "close every order"; that needs explicit All.
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "invalid order id: %d", cmd.OrderID)
 	}
 	if cmd.ExecClose == nil {
 		return nil, errs.NewMsg(errs.CodeParamRequired, "close executor required")

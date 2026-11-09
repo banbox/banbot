@@ -443,3 +443,30 @@ func TestRuntimeAccountUpdatesDoNotRaceWithConfigDump(t *testing.T) {
 	close(done)
 	wg.Wait()
 }
+
+func TestGetLangMsgByDeterministicFallback(t *testing.T) {
+	old := langMsgs
+	defer func() { langMsgs = old }()
+	langMsgs = map[string]map[string]string{
+		"c1": {"ja-JP": "ja", "de-DE": "de", "zh-CN": "zh"},
+		"c2": {"ja-JP": "ja", "de-DE": "de"},
+	}
+	for i := 0; i < 50; i++ {
+		if got := GetLangMsgBy("fr-FR", "c1", ""); got != "zh" {
+			t.Fatalf("c1 got %q", got)
+		}
+		if got := GetLangMsgBy("fr-FR", "c2", ""); got != "de" {
+			t.Fatalf("c2 got %q", got)
+		}
+	}
+}
+
+func TestGetApiUsersNilAPIServer(t *testing.T) {
+	old, oldAcc := APIServer, Accounts
+	defer func() { APIServer, Accounts = old, oldAcc }()
+	APIServer = nil
+	Accounts = map[string]*AccountConfig{}
+	if got := GetApiUsers(); len(got) != 0 {
+		t.Fatalf("got %v", got)
+	}
+}

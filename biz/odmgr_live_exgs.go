@@ -80,6 +80,12 @@ func exitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 	}
 }
 
+// thirdPartyTF returns the timeframe of the take-over job for pair; ok is false when no job exists.
+func (o *LiveOrderMgr) thirdPartyTF(pair string) (string, bool) {
+	tf := o.takeOverTF(pair, "")
+	return tf, tf != ""
+}
+
 func (o *LiveOrderMgr) makeInOutOd(pair string, short bool, average, filled float64, odType string,
 	feeCost float64, feeQuote float64, feeName string, enterAt int64, entStatus int, entOdId string) *ormo.InOutOrder {
 	exs, err := o.exSymbolCur(pair)
@@ -87,8 +93,8 @@ func (o *LiveOrderMgr) makeInOutOd(pair string, short bool, average, filled floa
 		log.Error("get exSymbol fail", zap.Error(err))
 		return nil
 	}
-	defTF := o.takeOverTF(pair, "")
-	if defTF != "" {
+	defTF, ok := o.thirdPartyTF(pair)
+	if !ok {
 		log.Error("no strat job found for trade", zap.String("pair", pair),
 			zap.String("id", entOdId))
 		return nil

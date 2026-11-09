@@ -245,9 +245,11 @@ func (s *State) SetCheckWallets(check bool) {
 }
 
 func (s *State) SetRunMode(mode string) {
+	s.flagsMu.Lock()
 	s.RunMode = mode
 	s.LiveMode = mode == RunModeLive
 	s.BackTestMode = mode == RunModeBackTest
+	s.flagsMu.Unlock()
 }
 
 // OnExit registers a callback for this Runtime. Registering after Stop runs
@@ -267,12 +269,14 @@ func (s *State) OnExit(call func()) {
 }
 
 func (s *State) SetRunEnv(env string) {
+	s.flagsMu.Lock()
 	s.RunEnv = env
 	if s.LiveMode {
 		s.EnvReal = env != RunEnvDryRun
 	} else {
 		s.EnvReal = false
 	}
+	s.flagsMu.Unlock()
 }
 
 // PairEnabled reports whether a symbol belongs to this Runtime's active pair

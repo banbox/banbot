@@ -701,7 +701,10 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 			if a.AnchorQuantity == "" {
 				a.AnchorQuantity = "0"
 			}
-			a.AnchorWeight, _ = allocationWeight(a.Last, c, sid)
+			a.AnchorWeight, err = allocationWeight(a.Last, c, sid)
+			if err != nil {
+				return PortfolioProposal{}, err
+			}
 		}
 		a.ExitStep++
 		steps := p.config.Transition.ExitSteps

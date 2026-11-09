@@ -119,6 +119,7 @@ func (f *storageInputFactory) Open(ctx context.Context, c Config, chunk Chunk) (
 	input := &storageInput{factory: f, config: c, latest: map[factor.StreamKey][]factor.VersionRecord{}}
 	for _, stream := range f.options.Streams {
 		if c.Snapshot.SourceVersions[stream.Subscription.Source] != stream.SourceVersion || c.Snapshot.Schemas[stream.Subscription.Source] != stream.SchemaHash {
+			_ = input.Close()
 			return nil, fmt.Errorf("runner: storage source %s metadata differs from snapshot", stream.Subscription.Source)
 		}
 		cursor := &storageCursor{stream: stream, offset: stream.WarmupStartMS, lastAt: -1}
@@ -314,6 +315,9 @@ func (s *storageInput) Next(ctx context.Context) (HistoricalBatch, error) {
 func (s *storageInput) Visible(ctx context.Context, grid, now, replay int64) ([]factor.VersionRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if s.closed {
+		return nil, errors.New("runner: storage input closed")
 	}
 	var result []factor.VersionRecord
 	for key, rows := range s.latest {

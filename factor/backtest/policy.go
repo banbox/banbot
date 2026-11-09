@@ -143,7 +143,10 @@ func (b *Book) PolicyEvidence(now int64) (factor.PortfolioEvidence, error) {
 	}
 	if b.previousAllocation != nil {
 		e.PlanSequence = b.previousAllocation.Spec().PlanSequence
-		e.Previous, _ = factor.NewPortfolioTarget(b.previousAllocation.Spec(), b.previousAllocation.Allocations())
+		var err error
+		if e.Previous, err = factor.NewPortfolioTarget(b.previousAllocation.Spec(), b.previousAllocation.Allocations()); err != nil {
+			return e, err
+		}
 	} else if b.previous != nil {
 		e.PlanSequence = b.previous.Spec().PlanSequence
 	}

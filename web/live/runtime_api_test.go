@@ -45,7 +45,7 @@ func TestEnabledRuntimeAPIStartsWithOwnedRoutesAndStops(t *testing.T) {
 	}
 	port := reservation.Addr().(*net.TCPAddr).Port
 	_ = reservation.Close()
-	deps.Config = config.NewSnapshotWithDirs(&config.Config{APIServer: &config.APIServerConfig{Enable: true, BindIPAddr: "127.0.0.1", Port: port}}, dataDir, "")
+	deps.Config = config.NewSnapshotWithDirs(&config.Config{APIServer: &config.APIServerConfig{Enable: true, BindIPAddr: "127.0.0.1", Port: port, JWTSecretKey: "test-secret"}}, dataDir, "")
 	deps.Core.ExgName, deps.Core.Market = "runtime-api", "spot"
 	deps.Symbols = orm.NewSymbolStateWithIdentity("runtime-api", "spot")
 	if err := deps.Symbols.SetExSymbols([]*orm.ExSymbol{{ID: 10, Exchange: "runtime-api", Market: "spot", Symbol: "OWNED/USDT"}}); err != nil {

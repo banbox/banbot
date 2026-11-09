@@ -28,6 +28,9 @@ func Setup() *errs.Error {
 	if err != nil {
 		return err
 	}
+	if len(fts) == 0 {
+		return nil
+	}
 	producer, ok := fts[0].(IProducer)
 	if !ok {
 		return errs.NewMsg(core.ErrBadConfig, "first pair filter must be IProducer")
@@ -140,6 +143,9 @@ func RefreshPairListWithSymbolState(state *orm.SymbolState, exchange banexg.BanE
 	if exchange == nil {
 		exchange = exg.Default
 	}
+	if config.PairMgr == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "`pairmgr` config is not loaded")
+	}
 	var allowFilter = false
 	var err *errs.Error
 	pairs, _ := config.GetStaticPairs()
@@ -154,6 +160,9 @@ func RefreshPairListWithSymbolState(state *orm.SymbolState, exchange banexg.BanE
 		allowFilter = config.PairMgr.ForceFilters
 	} else {
 		allowFilter = true
+		if pairProducer == nil {
+			return nil, errs.NewMsg(core.ErrBadConfig, "pair filters are required for dynamic pairs")
+		}
 		if producer, ok := pairProducer.(SymbolStateProducer); ok {
 			pairs, err = producer.GenSymbolsWithSymbolState(state, exchange, timeMS)
 		} else {

@@ -235,3 +235,18 @@ func validatePairsForTest(c Config) error {
 	_, _, err := validatePortfolioBuilder(boundDefinitionBuilder(c.Definition), c)
 	return err
 }
+
+func TestRegisterFactorChecksParamErrorsItself(t *testing.T) {
+	err := RegisterFactor("test-simple-unchecked-param", func(c FactorContext) (FactorSpec, error) {
+		w := c.Params.Int("window", 12)
+		return FactorSpec{Outputs: map[string]*factor.Node{"a": factor.Rank(factor.Return(c.Close(), w))}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := Config{Definition: "test-simple-unchecked-param", Factor: research.MomentumVolConfig{TimeFrame: "1h"}}
+	c.Manifest.Parameters = map[string]float64{"window": 1.5}
+	if _, _, err = CompileDefinition(c); err == nil {
+		t.Fatal("unchecked param error silently ignored")
+	}
+}

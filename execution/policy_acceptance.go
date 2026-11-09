@@ -13,7 +13,6 @@ import (
 
 const PolicyCheckpointName = "portfolio-policy-v1"
 const MaxPolicyStateBytes = 1 << 20
-const maxPolicyStateBytes = MaxPolicyStateBytes
 
 type PolicyCheckpoint struct {
 	Strategy        StrategyID
@@ -68,7 +67,7 @@ func readPolicyState(ctx context.Context, store *Store, strategy StrategyID, nam
 		return state, err
 	}
 	err = json.Unmarshal(body, &state)
-	if err == nil && (state.Version == 0 || !json.Valid(state.Payload) || len(state.Payload) > maxPolicyStateBytes) {
+	if err == nil && (state.Version == 0 || !json.Valid(state.Payload) || len(state.Payload) > MaxPolicyStateBytes) {
 		err = errors.New("execution: invalid portfolio policy state envelope")
 	}
 	return state, err
@@ -165,7 +164,7 @@ func (s *SharedAccount) acceptPolicyWithRecords(ctx context.Context, request Pol
 		if c.Name == "" {
 			c.Name = PolicyCheckpointName
 		}
-		if !canonicalID(string(c.Strategy)) || c.Name != PolicyCheckpointName || seen[c.Strategy] || c.ExpectedVersion == ^uint64(0) || len(c.Payload) > maxPolicyStateBytes || !json.Valid(c.Payload) {
+		if !canonicalID(string(c.Strategy)) || c.Name != PolicyCheckpointName || seen[c.Strategy] || c.ExpectedVersion == ^uint64(0) || len(c.Payload) > MaxPolicyStateBytes || !json.Valid(c.Payload) {
 			return PolicyReceipt{}, errors.New("execution: invalid policy checkpoint")
 		}
 		seen[c.Strategy] = true

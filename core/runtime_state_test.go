@@ -373,3 +373,31 @@ func BenchmarkSymbolParserColdMiss(b *testing.B) {
 		NewSymbolParser("binance").Split("COIN/USDT:USDT")
 	}
 }
+
+func TestStateSetRunModeAndEnvConcurrent(t *testing.T) {
+	state, err := NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				state.SetRunMode(RunModeLive)
+				state.SetRunEnv(RunEnvProd)
+			}
+		}()
+	}
+	wg.Wait()
+	if !state.LiveMode || state.BackTestMode || !state.EnvReal {
+		t.Fatalf("unexpected flags live=%v bt=%v real=%v", state.LiveMode, state.BackTestMode, state.EnvReal)
+	}
+	state.SetRunMode(RunModeBackTest)
+	state.SetRunEnv(RunEnvProd)
+	if state.EnvReal {
+		t.Fatal("EnvReal must be false outside live mode")
+	}
+}

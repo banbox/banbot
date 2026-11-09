@@ -101,7 +101,7 @@ pairlists:  # 交易对过滤器，按从上到下的顺序逐个过滤应用。
     limit: 100  # 取前100个
     limit_rate: 1 # 按比例截取
     min_value: 100000  # 最低成交量价值
-    cache_secs: 7200  # 缓存时间
+    cache_secs: 7200  # 缓存时间（暂未实现，当前不生效）
     back_period: 3d  # 计算成交量时间周期
   - name: PriceFilter  # 价格过滤器
     max_unit_value: 100  # 最大允许的单位价格变动对应的价值(针对定价货币，一般是USDT)。
@@ -112,8 +112,8 @@ pairlists:  # 交易对过滤器，按从上到下的顺序逐个过滤应用。
     back_days: 5  # 回顾的K线天数
     min: 0.03  # 最小价格变动比率
     max: 10  # 最大价格变动比率
-    cache_secs: 1440  # 缓存时间，秒
-  - name: SpreadFilter  # 流动性过滤器
+    cache_secs: 1440  # 缓存时间，秒（暂未实现，当前不生效）
+  - name: SpreadFilter  # 流动性过滤器（暂未实现，当前直接放行，不做过滤）
     max_ratio: 0.005  # 公式：1-bid/ask，买卖价差占价格的最大比率
   - name: CorrelationFilter  # 相关性过滤器
     min: -1  # 用于过滤当前币种与全市场平均相关性；默认0，表示不启用

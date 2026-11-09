@@ -164,8 +164,8 @@ func cronBacktestInLiveWithRuntime(scheduler com.Scheduler, deps biz.RuntimeDeps
 	}
 }
 
-// StartLoopBalancePositionsWithRuntime ties the polling worker to an
-// explicit runtime.
+// balanceRuntimeDeps is the immutable dependency snapshot used by the
+// balance/position polling worker (see StartLoopBalancePositionsWithRuntime).
 type balanceRuntimeDeps struct {
 	exchange banexg.BanExchange
 	core     *core.State
@@ -217,6 +217,8 @@ func bindBalanceRuntimeDeps(deps biz.RuntimeDeps) *balanceRuntimeDeps {
 	return bound
 }
 
+// StartLoopBalancePositionsWithRuntime ties the polling worker to an
+// explicit runtime.
 func StartLoopBalancePositionsWithRuntime(lifecycle RuntimeLifecycle, runtimeDeps ...biz.RuntimeDeps) {
 	if lifecycle == nil {
 		log.Error("runtime balance worker requires a lifecycle")

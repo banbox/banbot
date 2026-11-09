@@ -81,6 +81,11 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 		// Patch leaves omitted quantities unchanged despite price or NAV drift.
 		targets = p.Targets()
 	}
+	// Build the next previous-portfolio first so a failure leaves no partial state.
+	next, err := factor.NewTargetPortfolio(spec, effective)
+	if err != nil {
+		return err
+	}
 	// Validate the whole portfolio before changing any cash or quantities.
 	for sid := range targets {
 		if done, err := b.TerminalQuoteExempt(sid, targets[sid] == 0); err != nil {
@@ -92,10 +97,15 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 		if !ok || q.AtMS <= spec.DecisionTime || q.AtMS < spec.ExecutableAt || q.AtMS > now || q.AvailableAt > now || q.AvailableAt < q.AtMS || q.Price <= 0 || !finite(q.Price) {
 			return errors.New("backtest: target requires a strictly later observable price")
 		}
+		if !finite(targets[sid] * spec.Budget.NAV / q.Price) {
+			return errors.New("backtest: unrepresentable executable quantity")
+		}
 	}
 	for _, sid := range sortedKeys(targets) {
 		w := targets[sid]
-		if done, _ := b.TerminalQuoteExempt(sid, w == 0); done {
+		if done, err := b.TerminalQuoteExempt(sid, w == 0); err != nil {
+			return err
+		} else if done {
 			continue
 		}
 		q := quotes[sid]
@@ -117,9 +127,9 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 		b.quantities[sid] = qty
 		b.marks[sid] = q
 	}
-	b.previous, err = factor.NewTargetPortfolio(spec, effective)
+	b.previous = next
 	b.ledgerCursor++
-	return err
+	return nil
 }
 
 // Funding is an explicit realized settlement, never an inferred venue schedule.

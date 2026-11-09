@@ -2,6 +2,10 @@
 
 面向用户的完整文档在 [banbot.site](https://www.banbot.site/)（源码见 `bandoc/`）。本目录是仓库内的开发者与 AI 参考资料。
 
+## 项目总览与模块文档
+
+从 [project/README.md](project/README.md) 开始：项目整体概况，以及 `project/01~08` 按模块拆分的实现文档（文件地图、核心类型、关键流程、修改指南、已知问题）。
+
 ## AI 知识库（附给 AI 对话即可生成策略）
 
 | 文件 | 内容 |

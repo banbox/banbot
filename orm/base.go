@@ -1067,8 +1067,7 @@ func runQdbMigrationsAtRoot(ctx context.Context, pool *pgxpool.Pool, root string
 	{
 		var n int64
 		if err := pool.QueryRow(ctx, `select count() from tables()`).Scan(&n); err != nil {
-			log.Warn("skip questdb migrations (non-questdb backend detected)", zap.Error(err))
-			return nil
+			return NewDbErr(core.ErrDbReadFail, fmt.Errorf("probe questdb tables() before migrations: %w", err))
 		}
 	}
 	unlockCompactTables, lockErr := lockAllCompactTablesReadAtRoot(ctx, true, root)
