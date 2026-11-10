@@ -243,6 +243,11 @@ type ExitReq struct {
 	FilledOnly bool    // Only exit orders that have already entered when True True时只退出已入场的订单
 	Force      bool    // Whether to force exit 是否强制退出
 	Log        bool    // 是否自动记录错误日志
+	// 071 (backtest data_gap exits only): the first bar after the hole. GapNextOpen is its open price (0 = unknown)
+	// and GapRecoverMS the time it became known; the fill uses the worse (for the position) of the last close and
+	// this open, at min(last bar + confirmation delay, GapRecoverMS).
+	GapNextOpen  float64
+	GapRecoverMS int64
 }
 
 type accStratLimits map[string]*stgLimits

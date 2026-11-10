@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/research"
@@ -53,6 +54,7 @@ func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error {
 		return errors.New("runner: pairs strategy needs name and build function")
 	}
 	builderName := name + "-pairs-v1"
+	pairsLegResolvers.Store(builderName, build)
 	err := RegisterDefinition(name, func(c Config) (*factor.Plan, research.ComboSpec, error) {
 		spec, err := resolvePairsSpec(build, c)
 		if err != nil {
@@ -169,6 +171,14 @@ func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder,
 			lx, okX := values[st.x]
 			if !okY || !okX || ly.Validity != factor.Valid || lx.Validity != factor.Valid {
 				diags = append(diags, factor.Diagnostic{Code: "pair-input-missing", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
+				if st.pos != 0 {
+					// 067: a leg has no data this period (PIT universe drop / delisting): close the pair and pause it;
+					// it may reopen when both legs are back
+					st.pos, st.beta = 0, 0
+					st.trader.Reset()
+					ready = true // the closed pair must reach the ledger even if no other pair is ready
+					diags = append(diags, factor.Diagnostic{Code: "pair-closed-missing-leg", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
+				}
 				continue
 			}
 			point, ok := st.spread.Observe(lx.Value, ly.Value)
@@ -212,4 +222,41 @@ func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder,
 		p, err := factor.NewTargetPortfolio(target, weights)
 		return p, nil, err
 	}, nil
+}
+
+// pairsLegResolvers maps a registered pairs portfolio builder name to its spec constructor, so the runner can
+// derive the pair legs of a run (070: per-pair PIT).
+var pairsLegResolvers sync.Map
+
+// registeredPairLegs returns the (Y, X) SIDs of the run's pairs strategy, nil when the run is not a pairs one.
+func registeredPairLegs(c Config) [][2]int32 {
+	name := c.Manifest.Portfolio.Builder
+	if name == "" {
+		name = boundDefinitionBuilder(c.Definition)
+	}
+	v, ok := pairsLegResolvers.Load(name)
+	if !ok {
+		return nil
+	}
+	build, _ := v.(func(*Params) (PairsSpec, error))
+	if build == nil {
+		return nil
+	}
+	spec, err := resolvePairsSpec(build, c)
+	if err != nil {
+		return nil
+	}
+	sids := make(map[string]int32, len(c.Snapshot.SIDMap))
+	for sid, symbol := range c.Snapshot.SIDMap {
+		sids[symbol] = sid
+	}
+	var out [][2]int32
+	for _, p := range spec.Pairs {
+		y, okY := sids[p.Y]
+		x, okX := sids[p.X]
+		if okY && okX {
+			out = append(out, [2]int32{y, x})
+		}
+	}
+	return out
 }

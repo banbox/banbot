@@ -50,6 +50,16 @@ func TestReportUlcerDailySamplingAndBaseline(t *testing.T) {
 	if r.UlcerIndex == nil || r.UlcerPerformanceIndex == nil || math.Abs(*r.UlcerIndex-*wantUI) > 1e-10 || math.Abs(*r.UlcerPerformanceIndex-*wantUPI) > 1e-8 || r.UlcerSource != "daily_equity" {
 		t.Fatalf("metrics %+v", r)
 	}
+	// 052: the full daily series (baseline + one close per day) is kept, never decimated
+	wantEq := []float64{100, 90, 95, 105}
+	if len(r.DailyEquity) != len(wantEq) {
+		t.Fatalf("daily equity %v", r.DailyEquity)
+	}
+	for i, v := range wantEq {
+		if r.DailyEquity[i][1] != v {
+			t.Fatalf("daily equity[%d]=%v want %v", i, r.DailyEquity[i], v)
+		}
+	}
 }
 
 func TestReportUlcerCarriesMissingDays(t *testing.T) {

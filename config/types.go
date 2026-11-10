@@ -115,6 +115,11 @@ type Config struct {
 	BTLegacyWallet       bool                              `yaml:"bt_legacy_wallet_price,omitempty" mapstructure:"bt_legacy_wallet_price"`
 	BTNoKlineDownload    bool                              `yaml:"bt_no_kline_download,omitempty" mapstructure:"bt_no_kline_download"`
 	BTStrict             bool                              `yaml:"bt_strict,omitempty" mapstructure:"bt_strict"`
+	BTSlippageBps        float64                           `yaml:"bt_slippage_bps,omitempty" mapstructure:"bt_slippage_bps"`             // 053: one-sided adverse slippage (bp) on market/stop fills in backtests, 0=off
+	BTFundingApr         float64                           `yaml:"bt_funding_apr,omitempty" mapstructure:"bt_funding_apr"`               // 055: approximate funding cost of LONG contract positions in backtests, percent per year (10 = 10%/y); shorts get no credit; 0=off
+	BTGapBars            int                               `yaml:"bt_gap_bars,omitempty" mapstructure:"bt_gap_bars"`                     // backtest data-gap guard: >N missing bars between two bars of a symbol force-closes its open orders at the last known price (0=off)
+	BTDelistPenaltyBps   float64                           `yaml:"bt_delist_penalty_bps,omitempty" mapstructure:"bt_delist_penalty_bps"` // 071: extra adverse bp on a delist exit (data never resumes), on top of bt_slippage_bps; 0=off
+	BTGapMinHours        float64                           `yaml:"bt_gap_min_hours,omitempty" mapstructure:"bt_gap_min_hours"`           // the hole must also exceed this many hours (default 48)
 	HistoricalCoverage   *HistoricalCoverageConfig         `yaml:"historical_coverage,omitempty" mapstructure:"historical_coverage"`
 	RelaySimUnFinish     bool                              `yaml:"relay_sim_unfinish,omitempty" mapstructure:"relay_sim_unfinish"`
 	NTPLangCode          string                            `yaml:"ntp_lang_code,omitempty" mapstructure:"ntp_lang_code"`

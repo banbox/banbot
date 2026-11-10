@@ -149,6 +149,20 @@ func (p *PriceState) GetLastBarPriceAt(symbol string) float64 {
 	return -1
 }
 
+// GetLastBarTimeAt is the time (ms) the last bar price of symbol was registered; 0 when there is none.
+func (p *PriceState) GetLastBarTimeAt(symbol string) int64 {
+	if p == nil {
+		return 0
+	}
+	p.lockBars.RLock()
+	item, ok := p.barPrices[symbol]
+	p.lockBars.RUnlock()
+	if ok {
+		return item.Int
+	}
+	return 0
+}
+
 func (p *PriceState) SetBarPriceAt(nowMS int64, pair string, price float64) {
 	if p == nil {
 		return

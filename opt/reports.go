@@ -54,6 +54,10 @@ type BTResult struct {
 	BarNum                int                    `json:"barNum"`
 	TimeNum               int                    `json:"timeNum"`
 	OrderNum              int                    `json:"orderNum"`
+	DelistExits           int                    `json:"delistExits"`        // orders force-closed at the last bar because the symbol's data ended early (exit tag delist)
+	GapExits              int                    `json:"gapExits"`           // 051: orders force-closed because of a kline hole (exit tag data_gap)
+	GapExitPnlShare       float64                `json:"gapExitPnlShare"`    // 071: sum|profit| of data_gap exits / sum|profit| of all orders
+	DelistExitPnlShare    float64                `json:"delistExitPnlShare"` // 071: same for delist exits
 	lastTime              int64                  // 上次bar的时间戳
 	lastPlotMS            int64                  // 上次资金曲线采样时间
 	histOdOff             int                    // 计算已完成订单利润的偏移
@@ -87,6 +91,7 @@ type BTResult struct {
 	UlcerIndex            *float64               `json:"ulcerIndex"`
 	UlcerPerformanceIndex *float64               `json:"ulcerPerformanceIndex"`
 	UlcerSource           string                 `json:"ulcerSource,omitempty"`
+	DailyEquity           [][2]float64           `json:"dailyEquity,omitempty"` // 052: [UTC day end ms, equity], every day, never decimated
 	ulcerDaily            utils.UlcerAccumulator
 	ulcerDay              int64
 	ulcerPending          float64
@@ -744,8 +749,19 @@ func (r *BTResult) Collect() *errs.Error {
 	winCount := float64(0)
 	tfHits := make(map[string]int)
 	hitSlTp := 0
+	gapExits, delistExits := 0, 0
+	absAll, absGap, absDelist := 0.0, 0.0, 0.0
 	for _, od := range orders {
+		absAll += math.Abs(od.Profit)
+		if od.ExitTag == "delist" { // biz.ExitTagDelist
+			delistExits++
+			absDelist += math.Abs(od.Profit)
+		}
 		sumProfit += od.Profit
+		if od.ExitTag == "data_gap" { // biz.ExitTagDataGap
+			gapExits++
+			absGap += math.Abs(od.Profit)
+		}
 		sumFee += od.Enter.FeeQuote
 		if od.Exit != nil {
 			sumFee += od.Exit.FeeQuote
@@ -766,6 +782,12 @@ func (r *BTResult) Collect() *errs.Error {
 		}
 	}
 	r.HitSlTp = hitSlTp
+	r.GapExits = gapExits
+	r.DelistExits = delistExits
+	if absAll > 0 {
+		r.GapExitPnlShare = absGap / absAll
+		r.DelistExitPnlShare = absDelist / absAll
+	}
 	r.TfHits = tfHits
 	r.TotProfit = sumProfit
 	r.TotCost = utils.NanInfTo(sumCost, 0)
@@ -1399,7 +1421,7 @@ func dumpOrdersCSV(orders []*ormo.InOutOrder, outPath string, deps *ReportDeps) 
 	}()
 	heads := []string{"sid", "symbol", "timeframe", "direction", "leverage", "entAt", "entTag", "entPrice",
 		"entAmount", "entCost", "entFee", "exitAt", "exitTag", "exitPrice", "exitAmount", "exitGot",
-		"exitFee", "maxPftRate", "maxDrawDown", "profitRate", "profit", "strategy"}
+		"exitFee", "maxPftRate", "maxDrawDown", "profitRate", "profit", "strategy", "funding"}
 	if err_ = writer.Write(heads); err_ != nil {
 		return err_
 	}
@@ -1424,6 +1446,12 @@ func dumpOrdersCSV(orders []*ormo.InOutOrder, outPath string, deps *ReportDeps) 
 		if od.Exit != nil {
 			row[13], row[14], row[15], row[16] = calcExOrder(od.Exit)
 		}
+		// 055: approximated funding is booked inside the exit fee (wallet/profit); the csv reports it separately
+		funding := od.GetInfoFloat64("funding")
+		if od.Exit != nil && funding != 0 {
+			row[16] = strconv.FormatFloat(od.Exit.FeeQuote-funding, 'f', 8, 64)
+		}
+		row[22] = strconv.FormatFloat(funding, 'f', 8, 64)
 		row[17] = strconv.FormatFloat(od.MaxPftRate, 'f', 4, 64)
 		row[18] = strconv.FormatFloat(od.MaxDrawDown, 'f', 4, 64)
 		row[19] = strconv.FormatFloat(od.ProfitRate, 'f', 4, 64)
@@ -1632,6 +1660,7 @@ func (r *BTResult) recordUlcer(timeMS int64, equity float64) {
 		}
 		r.ulcerDay = baselineMS / 86400000
 		r.ulcerPending = r.TotalInvest
+		r.DailyEquity = append(r.DailyEquity, [2]float64{float64(r.ulcerDay * 86400000), r.TotalInvest})
 	}
 	if timeMS < r.ulcerLastMS {
 		return
@@ -1643,6 +1672,7 @@ func (r *BTResult) recordUlcer(timeMS int64, equity float64) {
 	}
 	for r.ulcerDay < day {
 		r.ulcerDaily.Add(r.ulcerPending)
+		r.DailyEquity = append(r.DailyEquity, [2]float64{float64((r.ulcerDay + 1) * 86400000), r.ulcerPending})
 		r.ulcerDay++
 	}
 	r.ulcerPending, r.ulcerLastMS = equity, timeMS
@@ -1653,6 +1683,9 @@ func (r *BTResult) collectUlcer() {
 	if r.ulcerDaily.Count() > 0 {
 		a := r.ulcerDaily
 		a.Add(r.ulcerPending)
+		if n := len(r.DailyEquity); n == 0 || r.DailyEquity[n-1][0] != float64((r.ulcerDay+1)*86400000) {
+			r.DailyEquity = append(r.DailyEquity, [2]float64{float64((r.ulcerDay + 1) * 86400000), r.ulcerPending})
+		}
 		r.UlcerIndex, r.UlcerPerformanceIndex, _ = a.Performance(years, 0)
 		r.UlcerSource = "daily_equity"
 		return

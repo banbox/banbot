@@ -176,7 +176,44 @@ func ParseConfig(path string) (*Config, *errs.Error) {
 	return ParseYmlConfig(fileData, path)
 }
 
+// knownBtKeys lists the `bt_*` yaml keys this build understands (from the Config struct tags).
+func knownBtKeys() map[string]bool {
+	known := map[string]bool{}
+	t := reflect.TypeOf(Config{})
+	for i := 0; i < t.NumField(); i++ {
+		name := strings.Split(t.Field(i).Tag.Get("yaml"), ",")[0]
+		if strings.HasPrefix(name, "bt_") {
+			known[name] = true
+		}
+	}
+	return known
+}
+
+// warnUnknownBtKeys (deploy guard) logs a WARN for every top-level `bt_*` key this banbot build does not know:
+// such a key is silently ignored by the non-strict parser, i.e. the backtest would run WITHOUT the requested
+// slippage / funding / gap handling (typically an older compile_version than the config expects).
+func warnUnknownBtKeys(fileData []byte, path string) []string {
+	var top map[string]interface{}
+	if err := yaml.Unmarshal(fileData, &top); err != nil {
+		return nil
+	}
+	known := knownBtKeys()
+	var unknown []string
+	for key := range top {
+		if strings.HasPrefix(key, "bt_") && !known[key] {
+			unknown = append(unknown, key)
+		}
+	}
+	sort.Strings(unknown)
+	for _, key := range unknown {
+		log.Warn(fmt.Sprintf("unknown backtest config key %q in %s is IGNORED (banbot BtFeatureLevel=%d): the backtest runs without it; check compile_version/banbot version",
+			key, path, core.BtFeatureLevel))
+	}
+	return unknown
+}
+
 func ParseYmlConfig(fileData []byte, path string) (*Config, *errs.Error) {
+	warnUnknownBtKeys(fileData, path)
 	unified, err := ParseUnifiedYAML(fileData, path)
 	if err != nil {
 		return nil, err
@@ -854,6 +891,11 @@ func (c *Config) Clone() *Config {
 		BTLegacyOrderMetrics: c.BTLegacyOrderMetrics,
 		BTLegacyWallet:       c.BTLegacyWallet,
 		BTNoKlineDownload:    c.BTNoKlineDownload,
+		BTSlippageBps:        c.BTSlippageBps,
+		BTFundingApr:         c.BTFundingApr,
+		BTGapBars:            c.BTGapBars,
+		BTGapMinHours:        c.BTGapMinHours,
+		BTDelistPenaltyBps:   c.BTDelistPenaltyBps,
 		BTStrict:             c.BTStrict,
 		HistoricalCoverage:   c.HistoricalCoverage.Clone(),
 		RelaySimUnFinish:     c.RelaySimUnFinish,

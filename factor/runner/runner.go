@@ -34,17 +34,28 @@ type Chunk struct {
 }
 type PriceStream struct{ Source, TimeFrame, Field string }
 type Config struct {
-	ArtifactPath                                       string
-	Definition                                         string
-	Expressions                                        *expr.Spec        `json:"expressions,omitempty"`
-	ComputationGroup                                   *ComputationGroup `json:"-"`
-	ComputationContext                                 ComputationContext
-	Execution                                          ExecutionConfig
-	Plan                                               *factor.Plan                                          `json:"-"`
-	PortfolioBuilder                                   PortfolioBuilder                                      `json:"-"`
-	PolicyContext                                      func(context.Context, *factor.PortfolioContext) error `json:"-"`
-	PolicySIDMappingVersion                            string                                                `json:",omitempty"`
-	Mode                                               Mode
+	ArtifactPath            string
+	Definition              string
+	Expressions             *expr.Spec        `json:"expressions,omitempty"`
+	ComputationGroup        *ComputationGroup `json:"-"`
+	ComputationContext      ComputationContext
+	Execution               ExecutionConfig
+	Plan                    *factor.Plan                                          `json:"-"`
+	PortfolioBuilder        PortfolioBuilder                                      `json:"-"`
+	PolicyContext           func(context.Context, *factor.PortfolioContext) error `json:"-"`
+	PolicySIDMappingVersion string                                                `json:",omitempty"`
+	Mode                    Mode
+	// PITMinUniverseRatio (067): weights-mode decisions drop instruments without input at the grid and go on, as
+	// long as >= this share (default 0.5, min 2 names) of the Investable universe remains; < 0 disables the PIT
+	// reduction (old behaviour: skip the whole decision).
+	PITMinUniverseRatio float64 `json:",omitempty"`
+	// PITDelistPenaltyBps (071): extra adverse penalty (bp of notional) when a held instrument drops out of the PIT
+	// universe; refunded and replaced by the worse-of-gap rule if its data later resumes. 0 = default 100, <0 = off.
+	PITDelistPenaltyBps float64 `json:",omitempty"`
+	// PITPairs (070): statarb pair legs (SIDs). Set explicitly or derived from the registered pairs strategy. In
+	// pairs mode the PIT decision is per pair: a pair with a missing leg is closed and paused, the others go on,
+	// and the "universe too small" fallback does not apply.
+	PITPairs                                           [][2]int32 `json:",omitempty"`
 	Chunks                                             []Chunk
 	HistoricalInput                                    HistoricalInputFactory                       `json:"-"`
 	ObserveBatch                                       func(context.Context, HistoricalBatch) error `json:"-"`
@@ -91,6 +102,7 @@ type Output interface {
 	Evaluation(research.Report) error
 	Executed(*factor.TargetPortfolio, backtest.State, int64) error
 }
+
 // NavOutput is an optional Output extension: Nav receives the mark-to-market strategy state at every decision
 // time (weights mode), so consumers get an equity curve that is valued every decision period instead of only at
 // executed rebalances.
@@ -112,7 +124,33 @@ type Result struct {
 	NodeUpdates                                                        map[string]uint64
 	UnresolvedByHorizon                                                map[string]int     `json:",omitempty"`
 	IncompleteStreams                                                  []IncompleteStream `json:",omitempty"`
+	// 067 point-in-time universe: instruments whose input stream was missing at a decision grid (data ended /
+	// delisted / hole) are dropped from that decision's universe instead of voiding the whole decision.
+	// UniverseDrops = cumulative dropped instrument-decisions; DelistExits = positions closed at their last
+	// valid mark because the instrument dropped out while held (weights ledger).
+	UniverseDrops         int `json:",omitempty"`
+	UniverseDropDecisions int `json:",omitempty"`
+	DelistExits           int `json:",omitempty"`
+	// 070: pairs mode periods in which every pair was paused (a leg missing); not counted in Incomplete.
+	PausedPeriods int `json:",omitempty"`
+	// 071: cumulative adverse cost of PIT exits (recovered gaps: adjustment to the worse price; delist: penalty).
+	PITGapLoss, PITDelistLoss float64
+	// UniverseNominal is the Investable universe size before PIT reduction (avg effective size =
+	// UniverseNominal - UniverseDrops/UniverseDecisions).
+	UniverseNominal, UniverseDecisions int                `json:",omitempty"`
+	DroppedBySID                       map[int32]int      `json:",omitempty"`
+	UniverseDropLog                    []UniverseDropItem `json:",omitempty"`
 }
+
+// UniverseDropItem is one decision's PIT universe reduction (bounded log, see maxUniverseDropLog).
+type UniverseDropItem struct {
+	GridTime int64
+	Dropped  []int32
+	Exited   []int32 `json:",omitempty"`
+}
+
+const maxUniverseDropLog = 2000
+
 type evaluation struct {
 	label             research.LabelSpec
 	frame             factor.Frame
@@ -265,6 +303,17 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		if err != nil {
 			return result, err
 		}
+		switch {
+		case c.PITDelistPenaltyBps == 0:
+			book.SetPITDelistPenaltyBps(defaultPITDelistPenaltyBps)
+		case c.PITDelistPenaltyBps > 0:
+			book.SetPITDelistPenaltyBps(c.PITDelistPenaltyBps)
+		}
+		result.UniverseNominal = len(c.Snapshot.Universe.Investable)
+	}
+	pairLegs := c.PITPairs
+	if len(pairLegs) == 0 {
+		pairLegs = registeredPairLegs(c)
 	}
 	bookState := func() backtest.State {
 		if book != nil {
@@ -722,6 +771,95 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				}
 			}
 			snapshot, err := barrier.Freeze(token, now)
+			var pitDiag *factor.Diagnostic
+			pausedSkip := false
+			if errors.Is(err, factor.ErrSnapshotIncomplete) && book != nil && policy == nil && c.PITMinUniverseRatio >= 0 {
+				var incomplete *factor.SnapshotIncompleteError
+				if errors.As(err, &incomplete) {
+					var reduced factor.Universe
+					var dropped []int32
+					var ok, allPaused bool
+					if len(pairLegs) > 0 {
+						reduced, dropped, allPaused, ok = pitReducePairs(spec.Universe, incomplete.Status, pairLegs)
+					} else {
+						reduced, dropped, ok = pitReduceUniverse(spec.Universe, incomplete.Status, c.PITMinUniverseRatio)
+					}
+					if ok && len(reduced.Investable) == 0 {
+						// 070: every leg of every pair is gone: close what is held, pause, skip the period without
+						// counting it as incomplete
+						if !decisionWarming {
+							exited := book.ExitAtLastMark(dropped, c.Manifest.Costs.FeeRate, c.Manifest.Costs.SlippageRate)
+							if pending, err = backtest.DropTargets(pending, dropped); err != nil {
+								return result, err
+							}
+							if executed, err = backtest.DropTargets(executed, dropped); err != nil {
+								return result, err
+							}
+							result.DelistExits += len(exited)
+							result.PausedPeriods++
+						}
+						pausedSkip, ok = true, false
+					}
+					if ok {
+						if !decisionWarming && allPaused {
+							result.PausedPeriods++
+						}
+						pitSpec := spec
+						pitSpec.Universe = reduced
+						pitToken, beginErr := barrier.Begin(plan.Hash(), pitSpec, requirements(plan, reduced, grid), now+c.ExpiryMS)
+						if beginErr != nil {
+							return result, beginErr
+						}
+						pitRequested := map[factor.StreamKey]bool{}
+						for _, r := range requirements(plan, reduced, grid) {
+							pitRequested[factor.StreamKey{SID: r.SID, Source: r.Source, TimeFrame: r.TimeFrame}] = true
+						}
+						for _, r := range visible {
+							if !pitRequested[factor.StreamKey{SID: r.Series.Sid, Source: r.Series.Source, TimeFrame: r.Series.TimeFrame}] {
+								continue
+							}
+							if observeErr := barrier.Observe(pitToken, r, now); observeErr != nil {
+								return result, observeErr
+							}
+						}
+						pitSnap, pitErr := barrier.Freeze(pitToken, now)
+						if pitErr == nil {
+							snapshot, err, spec = pitSnap, nil, pitSpec
+							var exited []int32
+							if !decisionWarming {
+								exited = book.ExitAtLastMark(dropped, c.Manifest.Costs.FeeRate, c.Manifest.Costs.SlippageRate)
+								if pending, err = backtest.DropTargets(pending, dropped); err != nil {
+									return result, err
+								}
+								if executed, err = backtest.DropTargets(executed, dropped); err != nil {
+									return result, err
+								}
+								result.UniverseDrops += len(dropped)
+								result.UniverseDropDecisions++
+								result.DelistExits += len(exited)
+								if result.DroppedBySID == nil {
+									result.DroppedBySID = map[int32]int{}
+								}
+								for _, sid := range dropped {
+									result.DroppedBySID[sid]++
+								}
+								if len(result.UniverseDropLog) < maxUniverseDropLog {
+									result.UniverseDropLog = append(result.UniverseDropLog, UniverseDropItem{GridTime: grid, Dropped: dropped, Exited: exited})
+								}
+							}
+							pitDiag = &factor.Diagnostic{Code: "pit-universe-drop", Detail: fmt.Sprintf("dropped %d instruments without input at this grid: %v", len(dropped), dropped)}
+						} else {
+							err = pitErr
+						}
+					}
+				}
+			}
+			if pausedSkip {
+				if c.timeline != nil {
+					c.timeline.leave()
+				}
+				continue
+			}
 			if errors.Is(err, factor.ErrSnapshotIncomplete) {
 				if !decisionWarming {
 					result.Incomplete++
@@ -817,7 +955,13 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				return result, err
 			}
 			diags = append(diags, pdiag...)
+			if pitDiag != nil {
+				diags = append(diags, *pitDiag)
+			}
 			result.Decisions++
+			if book != nil {
+				result.UniverseDecisions++
+			}
 			var policyWeights map[int32]float64
 			if policy != nil {
 				portfolioSpec := engine.portfolioSpec(frame, spec.Universe, sequence, nav, now+c.LatencyMS, now+c.ExpiryMS)
@@ -909,6 +1053,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		result.Skipped++
 	}
 	result.Book = bookState()
+	if book != nil {
+		result.PITGapLoss, result.PITDelistLoss = book.PITExitLosses()
+	}
 	if source, ok := sink.(StateSource); ok {
 		result.Book, err = source.StrategyState(ctx, lastTime)
 		if err != nil {

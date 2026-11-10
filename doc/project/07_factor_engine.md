@@ -54,6 +54,7 @@
 | 文件 | 作用 |
 |---|---|
 | `book.go` | `Book`：现金、数量、标记价、费用、资金费、滑点、权重目标执行（`Execute`） |
+| `pit.go` | `Book.ExitAtLastMark`（宇宙剔除标的按最后标记价平仓，含费用、滑点与 `SetPITDelistPenaltyBps` 的退市惩罚）、`DropTargets` |
 | `policy.go` | 绝对数量分配执行（`ExecuteAllocation`）、`PolicyEvidence`、`RestorePolicy`、`AcceptProposal` |
 | `terminal.go` | 终止结算与终止标的报价豁免（`ApplyTerminalSettlement`） |
 
@@ -98,8 +99,8 @@
 | `pairs.go` / `simple.go` | 统计套利配对 builder（`PairsSpec`，使用 `statistics.BandTrader`）、简单因子注册 |
 | `params.go` / `scan.go` / `config.go` | 参数容器（`Params`，`Unused` 校验）、参数扫描、运行配置辅助 |
 | `terminal.go` / `option_expiry.go` | 终止标的与期权到期结算相关处理 |
-| `source_events.go` / `timeline.go` / `incomplete.go` | 数据源事件、同账户回放时间线排序、未完整数据处理 |
-| `output.go` / `artifact.go` | 输出适配（`TargetAccepted` 优先，回退 `Executed`）、运行产物 `.run-*.json` 原子写入 |
+| `source_events.go` / `timeline.go` / `incomplete.go` | 数据源事件、同账户回放时间线排序、未完整数据处理（`IncompleteStream` 汇总；`pitReduceUniverse` 推导决策网格的时点宇宙） |
+| `output.go` / `artifact.go` | 输出适配（`TargetAccepted` 优先，回退 `Executed`；可选扩展 `NavOutput.Nav`，`JSONOutput` 实现为 `nav` 事件 `{Kind, AtMS, NAV, Cash}`）、运行产物 `.run-*.json` 原子写入 |
 
 ### factor/statistics（统计工具箱）
 
@@ -169,9 +170,11 @@
 1. `PreparePortfolioConfig`（`runner.go:175`，`definition.go:126`）解析组合定义。
 2. `compileDecision` → `newDecisionEngine`（`decision.go:147`，`decision.go:18` 调用 `expr.Compile`）。
 3. 按 chunk 循环 `driver.Next`，每批：更新报价与资金费、终止结算、`ObserveBatch`、策略 propose/accept、`ProcessSnapshot`、`finish`。
-4. 在决策网格上：`barrier.Begin/Observe/Freeze` → `engine.evaluate` → `combine` → `buildPortfolio`（`decision.go:195`）。
+4. 在决策网格上：`barrier.Begin/Observe/Freeze`（Weights 模式下快照不完整时见下文时点宇宙）→ Weights 模式向 `NavOutput` 输出该决策时刻的逐价值权益 → `engine.evaluate` → `combine` → `buildPortfolio`（`decision.go:195`）。
 5. 输入：归档路径 `openArchiveInput`（`input.go:99`）全量读取 `OpenVersionStore` 记录后按可见性分批；分页路径 `storageInputFactory.Open`（`storage_input.go:109`）→ `fill` → `Next` → `Visible`。
 6. 共享回放 `RunMany`（`computation.go:167`）为每个配置启动 goroutine 调用 `Run`（`computation.go:215-225`），同账户事件经 `replayTimeline`（`timeline.go`）排序。
+
+时点宇宙（PIT）：Weights 模式（账本存在、无 policy）下，网格上缺输入或输入无效的 Investable 标的（数据终止/未上市/空洞）被剔除，决策在缩减后的宇宙上继续，而不是整次跳过。Reference 标的不剔除；若缺失的还有其他流，或剩余 Investable 少于 `max(2, PITMinUniverseRatio × 原数量)`（默认 0.5，`< 0` 关闭 PIT，回到跳过整次决策），则不缩减。`Config.PITDelistPenaltyBps`（0=默认 100bp，<0 关）为被剔除持仓平仓时额外的不利惩罚；若该标的数据之后恢复，惩罚被退回并改按“缺口前后更差价”规则计价（累计成本见 `Result.PITGapLoss/PITDelistLoss`）。缩减宇宙的 `Version` 带 `#pit-<hash>` 后缀；被剔除且仍持仓的标的由 `Book.ExitAtLastMark` 按最后有效标记价（含费用与滑点）平仓，并从 pending/executed/previous 目标中移除（`DropTargets`）。`Result` 记录 `UniverseDrops`、`UniverseDropDecisions`、`DelistExits`、`DroppedBySID` 与有界的 `UniverseDropLog`（上限 2000）；决策诊断带 `pit-universe-drop`。配对模式下 PIT 按配对判定（`Config.PITPairs`，显式给出或由已注册配对策略的 `registeredPairLegs` 推导）：某腿缺数据的配对平仓并暂停（诊断 `pair-closed-missing-leg`，`BandTrader.Reset`），其余配对继续，“宇宙过小”回退不适用；两腿恢复后可重新开仓；所有配对同期暂停的周期计入 `Result.PausedPeriods`，不计入 `Incomplete`。`Result` 另含 `UniverseNominal/UniverseDecisions`（平均有效宇宙 = Nominal − Drops/Decisions）。
 
 回测账本在 `Run` 中的调用：`NewBook`（`runner.go:258`）→ `Mark`（`:463`）→ `ApplyFunding`（`:502`）→ `ApplyTerminalSettlement`（`:518`）→ `AcceptProposal`（`:572`，allocation 路径）或 `Execute`（`:646`，Weights 模式）→ `EndChunk`（`:881`）。
 

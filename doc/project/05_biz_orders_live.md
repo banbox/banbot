@@ -28,6 +28,7 @@
 | `biz/job_orders.go` | `ProcessJobOrders`：策略异步回调发起下单（几乎无非测试调用方） |
 | `biz/odmgr.go` | `IOrderMgr`/`IOrderMgrLive` 接口；`OrderMgr` 基类（入单、出单、利润、追踪止损、注册表、`CloseAccOrders`） |
 | `biz/odmgr_local.go` | `LocalOrderMgr`：回测/模拟撮合（挂单、止损止盈、限价超时、清仓） |
+| `biz/bar_gap.go` | 回测 K 线空洞守卫 `guardBarGap`（`ExitTagDataGap`）与退市平仓 `exitDelisted`/`sweepDelisted`（`ExitTagDelist`） |
 | `biz/odmgr_local_live.go` | `LocalLiveOrderMgr`：dry-run 实盘，市价按 ask/bid 即时成交，挂单按 K 线推进 |
 | `biz/odmgr_live.go` | `LiveOrderMgr`（4710 行）：实盘下单、成交回报、同步对账、触发单、熔断 |
 | `biz/odmgr_live_exgs.go` | 交易所成交反推本地订单：`exitByMyOrder`、`traceExgOrder`、`makeInOutOd` |
@@ -120,6 +121,9 @@
 - 止损止盈：`tryFillTriggers`（:551）→ `MatchProtection`，部分平仓先 `CutOrder`（odmgr.go:1648）。
 - 限价超时：:396-412 按 `OdInfoStopAfter` 调 `localExit`（`ExitTagEntExp`）。
 - 回调三处触发：fillPendingEnter、fillPendingExit、tryFillTriggers → `callBack(od, isEnter)` 与 `strat.FireOdChange`（odmgr.go:619）。
+- 滑点：`LocalOrderMgr.ohlcProfile()` 按 `bt_slippage_bps` 构造 `OHLCProfile.SlippageBps`；市价单、市价止损入场、止损/止盈出场及强平类出场（`ExitAndFill`）按不利方向加滑点，止损不优于开盘跳空价；限价单不加滑点。
+- 资金费：`updateOrderFee` 在回测出场腿调用 `addApproxFunding`，对多头合约单按 `bt_funding_apr` 计 入场名义 × 年化 × 持仓年数，加入 `Exit.Fee/FeeQuote`，并写入订单 info `funding`；反向合约不计，标 `funding_skipped=inverse`，空头不计。
+- 数据空洞与退市（`bt_gap_bars>0` 且非实盘）：`Trader.feedClosedSeries` 在登记新 bar 价格前调用 `guardBarGap`——上一根 bar 结束到新 bar 开始的缺口同时超过 `bt_gap_bars` 个周期与 `bt_gap_min_hours`（默认 48）小时时，该标的未平订单以最后已知价格强平（tag `data_gap`）；`sweepDelistedAll` 每 6 小时模拟时间扫描一次，按同一规则把数据已终止的标的强平（tag `delist`），`CleanUp` 开头也会执行。`delist` 成交时间取该标的最后有效 bar 的时间（`PriceState.GetLastBarTimeAt`），保证金、持仓时长与 `max_open_orders` 槽位随之释放；`data_gap` 在数据恢复时触发，成交时间为 `min(最后 bar + 确认延迟, 恢复时间)`（`gapFillTime`；确认延迟 = `max(bt_gap_bars×周期, bt_gap_min_hours)`），不早于最后 bar。成交价由 `applyExitPolicy` 决定：`data_gap` 取最后收盘价与缺口后首根开盘价中对持仓更差者（`ExitReq.GapNextOpen/GapRecoverMS`），`delist` 取最后收盘价再按 `bt_delist_penalty_bps` 向不利方向偏移；之后仍叠加 `bt_slippage_bps`。
 - 入场后伪时间 +1ms（`makeLocalAfterEnter`，:919-931），防止同 key 钱包扣款冲突。
 
 ### 6. dry-run 本地实盘（LocalLiveOrderMgr）
@@ -156,6 +160,7 @@
 - 回测/模拟：`EnterOd`（wallet.go:1099）→ 成交后 `ConfirmOdEnter`（:1199）；出场 `ExitOd`（:1235）→ `ConfirmOdExit`（:1287）；部分平仓 `CutPart`（:1344）；保证金与爆仓 `UpdateOds`（:1378，`marginRatio > 0.99` 返回 `ErrLiquidation` 并 Reset）。
 - 实盘（`w.envReal()`）：Confirm/Exit 直接返回，不做本地记账，余额以交易所为准。
 - 同步：`SyncBalancesWith`（:1868）→ `FetchBalance` → `UpdateWalletByBalances`（:1766）；下单前 `odmgr_live.go:2468` 调 `RefreshIfStale`（`WalletStaleMS=1h`）；WebSocket 推送 `WatchLiveBalances`（:1953）。
+- 估值：`calcLegal` 以 `valuationPrice` 取价。标记价在最后一根 bar 后 60 秒过期；回测中（`bt_legacy_wallet_price`/`bt_strict` 的兼容钱包除外，保持旧行为）过期后回退到最后一根 bar 价，且持有的基础币（如 `BNB`）无同名 key 时依次尝试 `BNB/{USDT,USDC,FDUSD,BUSD,USD}` 及其永续 `:{quote}`（`lastBarPriceOfCoin`）。仍无价的币被跳过，`skipWarned` 保证每币只打一次 Info，之后降为 Debug。
 - 快照：实盘 `live/crypto_trader.go:1604-1608` 启动 `StartLiveWalletSnapshots`，5 分钟写 `ormo.SaveWalletSnapshot`，超 7 天按小时压缩。
 
 ### 12. 共享检查点、接管与迁移
@@ -187,8 +192,8 @@
 
 ## 配置项与外部依赖
 
-- **配置键**（`config/types.go`，默认值见 `config/runtime_config.go:118-136`、`config/biz.go:352-416`）：`stake_currency`、`take_over_strat`、`order_type`、`limit_vol_secs`（默认 10）、`put_limit_secs`（默认 180）、`od_book_ttl`（默认 500）、`stop_enter_bars`、`max_open_orders`、`max_simul_open`、`bt_net_cost`（秒，`odmgr_local.go:349` 乘 1000）、`bt_legacy_intrabar`、`fatal_stop_hours`（默认 8）、`leverage`、`wallet_amounts`、`accounts[*].leverage/max_open_orders/no_trade`、`close_on_stuck`、`account_pull_secs`。
-- **运行时快照**：`runtimeOrderConfig` 与 `RuntimeDeps.Config.View()`；旧路径读 `config.GetTakeOverTF`（`config/biz.go:618`）、`config.GetAccLeverage`（:625）、`config.DefAcc`。
+- **配置键**（`config/types.go`，默认值见 `config/runtime_config.go:118-136`、`config/biz.go:352-416`）：`stake_currency`、`take_over_strat`、`order_type`、`limit_vol_secs`（默认 10）、`put_limit_secs`（默认 180）、`od_book_ttl`（默认 500）、`stop_enter_bars`、`max_open_orders`、`max_simul_open`、`bt_net_cost`（秒，`odmgr_local.go:349` 乘 1000）、`bt_legacy_intrabar`、`bt_slippage_bps`、`bt_funding_apr`、`bt_gap_bars`、`bt_gap_min_hours`、`bt_delist_penalty_bps`、`fatal_stop_hours`（默认 8）、`leverage`、`wallet_amounts`、`accounts[*].leverage/max_open_orders/no_trade`、`close_on_stuck`、`account_pull_secs`。
+- **运行时快照**：`runtimeOrderConfig`（含 `slippageBps/gapBars/gapMinHours/fundingApr/delistPenaltyBps`） 与 `RuntimeDeps.Config.View()`；旧路径读 `config.GetTakeOverTF`（`config/biz.go:618`）、`config.GetAccLeverage`（:625）、`config.DefAcc`。
 - **策略级**：`RunPolicyConfig.MaxOpen` / `MaxSimulOpen`（`strat.TradeStrat.Policy`）。
 - **环境变量**：数据目录 `BanDataDir`（`biz/biz.go:InitDataDir`，:626）。`biz/*` 中其余文件无 Getenv。
 - **交易所（banexg）**：`FetchOpenOrders`、`FetchAccountPositions`、`FetchOrder`、`FetchOrders`、`CreateOrder`、`CancelOrder`、`EditOrder`、`SetLeverage`/`GetLeverage`、`FetchOrderBook`、`FetchBalance`、`WatchMyTrades`、`WatchAccountConfig`、`CalculateFee`；参数 `ParamAccount`、`ParamFullSnapshot`、`ParamRetry`、`ParamAlgoOrder`。exg 适配层：`GetOrderEventCapability`、`BuildClientOrderIDChecked`、`PrecAmount`/`PrecPrice`、`SetOrderCallback`。

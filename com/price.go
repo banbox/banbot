@@ -103,6 +103,10 @@ func GetLastBarPrice(symbol string) float64 {
 	return syncLegacyPriceParser().GetLastBarPriceAt(symbol)
 }
 
+func GetLastBarTime(symbol string) int64 {
+	return syncLegacyPriceParser().GetLastBarTimeAt(symbol)
+}
+
 func GetPriceSafe(symbol string, side string) float64 {
 	return GetPriceSafeExp(symbol, side, PriceExpireMS)
 }

@@ -51,7 +51,7 @@
 | `backtest.go`（1438 行） | `BackTest` 与 `BackTestLite`：`Init`、`FeedDataSeries`、`RunContext`（主循环、清仓、结果收集）、第三方序列补齐、订单回调、清算。 |
 | `hyper_opt.go`（1452 行） | 超参优化：`RunOptimize`、`runOptimize`（进程内或子进程并行）、`optAndPrint`、`optForGroup`、`runBayes`、`runGOptuna`、滚动回测 `RunRollBTPicker`/`RunBTOverOpt`、日志收集 `CollectOptLog`。 |
 | `common.go`（574 行） | `OptInfo`、`OptGroup`、`ValItem`、`rollBtOpt`，策略参数 `ToPol`，图表 `Chart`/`ChartDs`，`DescGroups`、`AvgGoodDesc`。 |
-| `reports.go`（2513 行） | `BTResult`、`ReportDeps`、`PairPicker` 注册表、报告/图表生成、订单统计。 |
+| `reports.go`（2513 行） | `BTResult`、`ReportDeps`、`PairPicker` 注册表、报告/图表生成、订单统计；`BTResult` 含 `DelistExits`/`GapExits`（退市/数据空洞强平单数）、`GapExitPnlShare`/`DelistExitPnlShare`（对应强平单 Σ|利润| 占全部订单 Σ|利润| 的比例）与 `dailyEquity`（`[UTC 日末 ms, 权益]`，逐日、不抽样，随 Ulcer 日权益采集）；`orders.csv` 末列 `funding` 为近似资金费，`exitFee` 不含该部分。 |
 | `tools.go`（1862 行） | 订单对比（`CompareExgBTOrdersWithRuntimeDeps`，旧版入口未接入 CLI）、`FacArgs`/`FactorFunc` 因子注册、`BtFactors`、`BuildBtResult`、资产报告合并、结果压缩。 |
 | `sim_bt.go` | `sim-bt`：从报告回放一段时间的回测。 |
 | `runtime_factory.go` | `BacktestFactory` 类型：`(snapshot, isOpt, outDir) -> (*BackTest, cleanup, err)`。 |

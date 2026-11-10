@@ -15,6 +15,21 @@ import (
 // profile and must not infer visible prices from this future bar range.
 type OHLCProfile struct {
 	LegacyIntrabar bool
+	// SlippageBps (053) is the one-sided adverse slippage in basis points applied to market-type fills (market
+	// orders, market stop entries, market stop-loss/take-profit exits). 0 = off (historical behaviour). Stops also
+	// never fill better than the bar's opening gap.
+	SlippageBps float64
+}
+
+// Slip moves price against the trader: buys pay more, sells receive less.
+func (p OHLCProfile) Slip(price float64, isBuy bool) float64 {
+	if p.SlippageBps <= 0 || price <= 0 {
+		return price
+	}
+	if isBuy {
+		return price * (1 + p.SlippageBps/10000)
+	}
+	return price * (1 - p.SlippageBps/10000)
 }
 
 func (p OHLCProfile) MarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {
@@ -93,6 +108,16 @@ func (p OHLCProfile) MatchPending(bar *orm.SeriesOHLCV, order OHLCOrder, tfSecs 
 		fill.Rate = float64((fill.TimeMS-barStartMS)/1000) / float64(tfSecs)
 		fill.Price = p.MarketPrice(bar, fill.Rate)
 	}
+	if p.SlippageBps > 0 && !(strings.Contains(order.OrderType, "limit") && order.Price > 0) {
+		ref := fill.Price
+		if fill.StopTriggered {
+			// a stop never fills better than the opening gap beyond its trigger
+			if order.IsBuy && bar.Open > ref || !order.IsBuy && bar.Open < ref {
+				ref = bar.Open
+			}
+		}
+		fill.Price = p.Slip(ref, order.IsBuy)
+	}
 	return fill, true
 }
 
@@ -156,6 +181,13 @@ func (p OHLCProfile) MatchProtection(bar *orm.SeriesOHLCV, short bool, sl, tp *O
 	} else {
 		fill.Rate = p.MarketRate(bar, fill.TriggerPrice, short, true, afterRate)
 		fill.Price = p.MarketPrice(bar, fill.Rate)
+		if p.SlippageBps > 0 {
+			ref := fill.TriggerPrice
+			if fill.HitSL && (!short && bar.Open < ref || short && bar.Open > ref) {
+				ref = bar.Open // gap through the stop: filled at the open, not at the trigger
+			}
+			fill.Price = p.Slip(ref, short) // exit of a long sells, exit of a short buys
+		}
 	}
 	fill.TimeMS = nowMS - int64(tfSecs*(1-fill.Rate)*1000)
 	fill.Ready = true

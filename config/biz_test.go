@@ -470,3 +470,30 @@ func TestGetApiUsersNilAPIServer(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestParseYmlConfigBTGapGuard(t *testing.T) {
+	cfg, err := ParseYmlConfig([]byte("bt_gap_bars: 3\nbt_gap_min_hours: 24\n"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BTGapBars != 3 || cfg.BTGapMinHours != 24 {
+		t.Fatalf("bt_gap_* not parsed: %d %v", cfg.BTGapBars, cfg.BTGapMinHours)
+	}
+	if cl := cfg.Clone(); cl.BTGapBars != 3 || cl.BTGapMinHours != 24 {
+		t.Fatal("bt_gap_* lost on Clone")
+	}
+}
+
+func TestParseYmlConfigBTSlippage(t *testing.T) {
+	cfg, err := ParseYmlConfig([]byte("bt_slippage_bps: 5\n"), "")
+	if err != nil || cfg.BTSlippageBps != 5 || cfg.Clone().BTSlippageBps != 5 {
+		t.Fatalf("bt_slippage_bps: %v %v", cfg, err)
+	}
+}
+
+func TestWarnUnknownBtKeys(t *testing.T) {
+	got := warnUnknownBtKeys([]byte("bt_slippage_bps: 5\nbt_gap_bars: 3\nbt_future_knob: 1\nbt_other: 2\nname: x\n"), "t.yml")
+	if len(got) != 2 || got[0] != "bt_future_knob" || got[1] != "bt_other" {
+		t.Fatalf("unknown bt keys: %v", got)
+	}
+}

@@ -61,7 +61,7 @@
 | `attempt.go` | `OrderAttempt`：提交/撤单/恢复的不可变审计记录 |
 | `quantity.go` | `QuantitySteps`、`AllocateSteps`：步长取整与按需求比例分配 |
 | `limit_price.go` | 被动限价算法（与交易所无关的纯函数） |
-| `ohlc_profile.go` | 回测用 OHLC 撮合（历史延迟、对齐、止损限价顺序） |
+| `ohlc_profile.go` | 回测用 OHLC 撮合（历史延迟、对齐、止损限价顺序；`SlippageBps` 与 `Slip` 对市价类成交加单边不利滑点） |
 
 ### 待执行（pending）
 | 文件 | 作用 |

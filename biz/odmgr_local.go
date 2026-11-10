@@ -27,6 +27,8 @@ type LocalOrderMgr struct {
 	zeroAmts     map[string]int
 	stopBacktest func()
 	simMu        sync.Mutex
+	// 066: simulated time of the last in-run delist sweep
+	lastDelistSweepMS int64
 }
 
 type FnOdCb = func(od *ormo.InOutOrder, isEnter bool)
@@ -358,7 +360,7 @@ func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *or
 				continue
 			}
 		} else {
-			fill, matched := (execution.OHLCProfile{LegacyIntrabar: o.legacyIntrabarEnabled()}).MatchPending(bar, execution.OHLCOrder{
+			fill, matched := o.ohlcProfile().MatchPending(bar, execution.OHLCOrder{
 				OrderType: odType, IsBuy: exOrder.Side == banexg.OdSideBuy,
 				Enter: exOrder.Enter, Short: od.Short, Price: exOrder.Price,
 				Stop: od.Stop, CreateAt: exOrder.CreateAt,
@@ -563,7 +565,7 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 	if sl == nil && tp == nil {
 		return nil
 	}
-	fill := (execution.OHLCProfile{LegacyIntrabar: o.legacyIntrabarEnabled()}).MatchProtection(
+	fill := o.ohlcProfile().MatchProtection(
 		bar, od.Short, ohlcProtectionView(sl), ohlcProtectionView(tp), afterRate,
 		float64(utils.TFToSecs(tf)), o.priceNow())
 	if sl != nil {
@@ -773,7 +775,26 @@ func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitRe
 		if price < 0 {
 			return errs.NewMsg(core.ErrRunTime, "no historical price for %s", od.Symbol)
 		}
-		err := o.fillPendingExit(od, price, timeMS)
+		if o.isBacktest() && price > 0 {
+			price = o.applyExitPolicy(od, req, price)
+			// 053: forced exits (data gap, bot_stop, force) are market fills and pay the slippage too; a long
+			// exit sells (adverse = lower), a short exit buys (adverse = higher)
+			price = o.ohlcProfile().Slip(price, od.Short)
+		}
+		fillMS := timeMS
+		if o.isBacktest() && (req.Tag == ExitTagDelist || req.Tag == ExitTagDataGap) {
+			// 066: the fill time of a delist / data-gap exit is the time of the symbol's last valid bar, not
+			// the current (or backtest end) clock: funding, holding span and margin release follow it
+			if last := o.lastBarTime(od.Symbol); last > 0 && last < fillMS {
+				fillMS = last
+			}
+			if req.Tag == ExitTagDataGap {
+				// 071: a recovered gap is only confirmed after the confirmation delay (or at recovery when
+				// earlier): funding and the holding span run until then, not until the last pre-gap bar
+				fillMS = o.gapFillTime(od, fillMS, timeMS, req)
+			}
+		}
+		err := o.fillPendingExit(od, price, fillMS)
 		if err != nil {
 			return err
 		}
@@ -782,6 +803,9 @@ func (o *LocalOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitRe
 }
 
 func (o *LocalOrderMgr) CleanUp() *errs.Error {
+	if err := o.exitDelisted(); err != nil {
+		return err
+	}
 	exitReq := &strat.ExitReq{
 		Tag:   core.ExitTagBotStop,
 		Dirt:  core.OdDirtBoth,
@@ -937,4 +961,18 @@ func makeLocalAfterEnter(o *LocalOrderMgr) FuncHandleIOrder {
 		}
 		return nil
 	}
+}
+
+// ohlcProfile builds the backtest matching profile (intrabar path + 053 slippage) from this runtime's config.
+func (o *LocalOrderMgr) ohlcProfile() execution.OHLCProfile {
+	p := execution.OHLCProfile{LegacyIntrabar: o.legacyIntrabarEnabled()}
+	if !o.isBacktest() {
+		return p
+	}
+	if o.runtimeDeps {
+		p.SlippageBps = o.runtimeCfg.slippageBps
+		return p
+	}
+	p.SlippageBps = config.Data.BTSlippageBps
+	return p
 }

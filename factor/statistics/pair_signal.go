@@ -92,6 +92,10 @@ func (b *BandTrader) Step(z float64) int {
 	return b.pos
 }
 
+// Reset flattens the trader without blocking re-entry (067: a leg lost its data; the pair is closed and paused,
+// and may open again once both legs are back and the band says so).
+func (b *BandTrader) Reset() { b.pos, b.held, b.blocked = 0, 0, false }
+
 func (b *BandTrader) close(block bool) {
 	b.pos, b.held, b.blocked = 0, 0, block
 }

@@ -33,6 +33,10 @@ type Book struct {
 	policyLedgerCursor                      uint64
 	fillFacts                               []bookFillFact
 	acceptedProposals                       map[string]bookAcceptance
+	// 071 PIT exits: positions closed because the instrument dropped out; resolved at recovery / end of run
+	pitExits            map[int32]pitExit
+	pitPenaltyBps       float64
+	gapLoss, delistLoss float64
 }
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
@@ -51,6 +55,9 @@ func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	}
 	if old, ok := b.marks[sid]; ok && q.AtMS < old.AtMS {
 		return errors.New("backtest: mark moved backwards")
+	}
+	if ex, ok := b.pitExits[sid]; ok && q.AtMS > ex.atMS {
+		b.resolveRecovered(sid, ex, q.Price)
 	}
 	b.marks[sid] = q
 	b.ledgerCursor++

@@ -24,6 +24,7 @@
 | --- | --- |
 | `main.go` | 进程入口，调用 `entry.RunCmd()` |
 | `core/core.go` | `SetRunMode/SetRunEnv`（写全局）、`Sleep`（基于全局 `Ctx`） |
+| `core/bt_features.go` | `BtFeatureLevel`（当前 3）：本构建的回测能力级别，必须单行 `const BtFeatureLevel = N`；bansite 编译前从源码解析它，拒绝无法满足配置中 `bt_*` 键的构建。1=滑点/资金费/空洞/回测末退市；2=退市与空洞按最后有效 bar 成交、运行中退市巡检、因子 PIT 宇宙、未知 `bt_*` 键 WARN；3=空洞/退市成交价规则与 `bt_delist_penalty_bps`、`gapExitPnlShare/delistExitPnlShare`、配对暂停与 `pausedPeriods` |
 | `core/data.go` | 全局变量与常量：运行模式/环境、`Version="v0.7.1"`、`UIVersion="v0.6.0"`、标签常量（EnterTag/ExitTag）、订单类型、`Ctx/StopAll/BotRunning` |
 | `core/runtime_state.go` | `State` 及其类型安全访问器（pairs 准入快照、ban、no_enter、timeframe、JobPerf/PerfSta、OdBook、订单撮合开关、tf hits、exit 回调、Stop/Close）；另有大量 `Legacy*` 进程级门面 |
 | `core/runtime_logger.go` | `(*State).Log()`：绑定的 logger，零值 State 返回 nop logger |
@@ -115,7 +116,7 @@
 
 ### com
 
-- **`PriceState`**（`com/price_state.go`）：`bidPrices/askPrices`（按 side，加 `lockPrices`）、`barPrices`（加 `lockBars`）、`parser *core.SymbolParser`。方法：`GetPriceSafeExpAt`（无效返回 -1，法币直接返回 1）、`GetLastBarPriceAt`、`SetBarPriceAt/SetPriceAt/SetPricesAt`、`IsPriceEmpty`、`Reset`、`RefreshLatestPriceAt`（实盘刷新）。
+- **`PriceState`**（`com/price_state.go`）：`bidPrices/askPrices`（按 side，加 `lockPrices`）、`barPrices`（加 `lockBars`）、`parser *core.SymbolParser`。方法：`GetPriceSafeExpAt`（无效返回 -1，法币直接返回 1）、`GetLastBarPriceAt`、`GetLastBarTimeAt`（最后一根 bar 价格的登记时间，无则 0；旧门面 `com.GetLastBarTime`）、`SetBarPriceAt/SetPriceAt/SetPricesAt`、`IsPriceEmpty`、`Reset`、`RefreshLatestPriceAt`（实盘刷新）。
 - **`MarketState`**（`com/market_state.go`）：`Prices *PriceState`、`PairCopied *PairCopiedState`。`NewMarketStateWithExchange(exg, exchange)` 绑定适配器的符号解析。
 - **`PairCopiedState`**：`values map[string][2]int64`（pair → [barMS, waitMS]），`lastBarMs`/`lastCopiedMs` 为 atomic，只增不减（`atomicMax`），删除时重算。
 - **`Scheduler`**（`com/cron.go`）：`AddFunc/Start/Stop`，内部是 `banbox/cron/v3` 并使用 NTP 时钟。
@@ -229,7 +230,7 @@
 - 交易环境：`env`（prod/test/dry_run，默认 dry_run）、`exchange.name`、`market_type`（spot/linear/inverse/margin…）、`stake_currency`（必填）、`pairs`、`pairlists`、`pairmgr`。
 - 资金：`stake_amount`、`stake_pct`、`max_stake_amt`、`wallet_amounts`、`draw_balance_over`、`low_cost_action`（ignore/keepBig/keepAll）、`leverage`、`margin_add_rate`。
 - 执行：`order_type`、`limit_vol_secs`、`put_limit_secs`、`stop_enter_bars`、`close_on_stuck`、`order_bar_max`、`max_open_orders`、`max_simul_open`、`fatal_stop`、`fatal_stop_hours`、`relay_sim_unfinish`、`take_over_strat`。
-- 回测：`timerange` 或 `time_start/time_end`、`bt_net_cost`、`bt_strict`、`bt_no_kline_download`、`bt_legacy_*`（历史兼容开关）、`historical_coverage`。
+- 回测：`timerange` 或 `time_start/time_end`、`bt_net_cost`、`bt_strict`、`bt_no_kline_download`、`bt_legacy_*`（历史兼容开关）、`bt_slippage_bps`（市价/止损成交的单边不利滑点，bp，0=关）、`bt_funding_apr`（回测中多头合约持仓的近似资金费，年化百分比，0=关）、`bt_gap_bars` / `bt_gap_min_hours`（K 线空洞守卫与退市判定，见 05）、`bt_delist_penalty_bps`（退市强平在 `bt_slippage_bps` 之外额外的不利 bp，0=关）、`historical_coverage`。解析时 `config/biz.go:warnUnknownBtKeys` 按 `Config` 结构体 yaml 标签（`knownBtKeys`）对本构建不认识的顶层 `bt_*` 键打 WARN（非严格解析会静默忽略它们，WARN 带 `BtFeatureLevel`）。
 - 时间与 K 线：`timeframes`、`run_timeframes`、`kline_source`、`concur_num`、`odbook_ttl`、`ntp_lang_code`、`show_lang_code`。
 - 服务：`database`（url、auto_create、db_type、sid_registry_url、max_pool_size、qdb_mem_pct、qdb_max_mem_mb）、`api_server`（bind_ip、port、jwt_secret_key、users、CORS_origins）、`spider_addr`（默认 127.0.0.1:6789）、`mail`、`webhook`、`rpc_channels`、`bt_in_live`、`llm_models`、`strat_perf`。
 - 策略：`run_policy[]`（见 `RunPolicyConfig`）。v2 额外支持 `engine`（time_series/factor）、`id`、`account`、`capital_weight`、`factor{...}`（展开为扁平键）。

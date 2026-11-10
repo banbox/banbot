@@ -135,3 +135,51 @@ func TestOHLCProfilePreservesSDKMarketsPrecisionAndFees(t *testing.T) {
 		})
 	}
 }
+
+func TestOHLCProfileSlippage053(t *testing.T) {
+	const startMS = int64(1_700_000_040_000)
+	approx := func(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
+	p0 := OHLCProfile{LegacyIntrabar: true}
+	p := OHLCProfile{LegacyIntrabar: true, SlippageBps: 10}
+	bar := &orm.SeriesOHLCV{Time: startMS, Open: 100, High: 110, Low: 90, Close: 105}
+	// market buy/sell: adverse by 10bp from the unslipped fill, limit orders untouched
+	for _, buy := range []bool{true, false} {
+		o := OHLCOrder{OrderType: banexg.OdTypeMarket, IsBuy: buy, Enter: buy, CreateAt: startMS}
+		base, _ := p0.MatchPending(bar, o, 60, 15)
+		got, _ := p.MatchPending(bar, o, 60, 15)
+		want := base.Price * (1 - 0.001)
+		if buy {
+			want = base.Price * (1 + 0.001)
+		}
+		if !approx(got.Price, want) {
+			t.Fatalf("market buy=%v got %v want %v", buy, got.Price, want)
+		}
+	}
+	lim := OHLCOrder{OrderType: banexg.OdTypeLimit, IsBuy: true, Enter: true, Price: 95, CreateAt: startMS}
+	b0, _ := p0.MatchPending(bar, lim, 60, 15)
+	b1, _ := p.MatchPending(bar, lim, 60, 15)
+	if b0.Price != b1.Price {
+		t.Fatalf("limit fill must not slip: %v vs %v", b0.Price, b1.Price)
+	}
+	// stop-loss of a long: trigger 95 inside the bar -> 95 slipped down; gap open below trigger -> open slipped
+	f := p.MatchProtection(bar, false, &OHLCProtection{Price: 95}, nil, 0, 60, startMS+60000)
+	if !f.Ready || !approx(f.Price, 95*(1-0.001)) {
+		t.Fatalf("sl price %v ready %v", f.Price, f.Ready)
+	}
+	gap := &orm.SeriesOHLCV{Time: startMS, Open: 80, High: 82, Low: 70, Close: 75}
+	f = p.MatchProtection(gap, false, &OHLCProtection{Price: 95}, nil, 0, 60, startMS+60000)
+	if !approx(f.Price, 80*(1-0.001)) {
+		t.Fatalf("gap sl must fill at open (slipped), got %v", f.Price)
+	}
+	// short stop-loss: buys, gap up
+	up := &orm.SeriesOHLCV{Time: startMS, Open: 120, High: 125, Low: 118, Close: 121}
+	f = p.MatchProtection(up, true, &OHLCProtection{Price: 105}, nil, 0, 60, startMS+60000)
+	if !approx(f.Price, 120*(1+0.001)) {
+		t.Fatalf("short gap sl got %v", f.Price)
+	}
+	// off: unchanged
+	f0 := p0.MatchProtection(bar, false, &OHLCProtection{Price: 95}, nil, 0, 60, startMS+60000)
+	if f0.Price == f.Price {
+		t.Fatal("sanity")
+	}
+}

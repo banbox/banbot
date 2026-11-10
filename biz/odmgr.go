@@ -68,6 +68,11 @@ type runtimeOrderConfig struct {
 	maxSimulOpen         int
 	backtestNetCost      float64
 	legacyIntrabar       bool
+	slippageBps          float64
+	gapBars              int     // bt_gap_bars (also arms the delist exit)
+	gapMinHours          float64 // bt_gap_min_hours
+	delistPenaltyBps     float64 // bt_delist_penalty_bps (071)
+	fundingApr           float64
 	accountLeverage      float64
 	accountMaxOpenOrders int
 }
@@ -233,6 +238,17 @@ func (o *OrderMgr) lastBarPrice(symbol string) float64 {
 		return -1
 	}
 	return com.GetLastBarPrice(symbol)
+}
+
+// lastBarTime is the time the last bar price of symbol was registered (0 = never).
+func (o *OrderMgr) lastBarTime(symbol string) int64 {
+	if o != nil && o.prices != nil {
+		return o.prices.GetLastBarTimeAt(symbol)
+	}
+	if o != nil && o.runtimeDeps {
+		return 0
+	}
+	return com.GetLastBarTime(symbol)
 }
 
 func (o *OrderMgr) exchangeClient() banexg.BanExchange {
@@ -446,7 +462,11 @@ func (o *OrderMgr) canClose(od *ormo.InOutOrder) bool {
 
 func (o *OrderMgr) updateOrderFee(od *ormo.InOutOrder, price float64, forEnter bool) *errs.Error {
 	if o == nil || !o.runtimeDeps {
-		return od.UpdateFee(price, forEnter)
+		err := od.UpdateFee(price, forEnter)
+		if err == nil && !forEnter && od.Exit != nil && o != nil && core.BackTestMode {
+			addApproxFunding(od, config.Data.BTFundingApr, core.IsContract, core.Market == banexg.MarketInverse, o.priceNow())
+		}
+		return err
 	}
 	exchange := o.exchangeClient()
 	if exchange == nil {
@@ -474,8 +494,49 @@ func (o *OrderMgr) updateOrderFee(od *ormo.InOutOrder, price float64, forEnter b
 		od.DirtyEnter = true
 	} else {
 		od.DirtyExit = true
+		if o.isBacktest() {
+			addApproxFunding(od, o.runtimeCfg.fundingApr, o.isContract(), o.marketType() == banexg.MarketInverse, o.priceNow())
+		}
 	}
 	return nil
+}
+
+// addApproxFunding (055) charges a constant-rate funding cost on the exit leg of a LONG contract order:
+// entry notional x apr% x holding years. The backtest has no historical funding series, so this is a
+// conservative approximation (shorts are not credited). Fee and FeeQuote are both raised so the wallet and the
+// order profit stay consistent (contract fees are quote-denominated).
+//
+// The cost is also stored in the order info as "funding" (orders.csv writes it in its own column and reports
+// exitFee without it). Inverse contracts are coin-margined: the notional here would be wrong, so they get no
+// funding charge and are tagged funding_skipped=inverse.
+func addApproxFunding(od *ormo.InOutOrder, aprPct float64, contract, inverse bool, nowMS int64) {
+	if aprPct <= 0 || !contract || od == nil || od.Short || od.Enter == nil || od.Exit == nil {
+		return
+	}
+	if inverse {
+		od.SetInfo("funding_skipped", "inverse")
+		return
+	}
+	exitMS := od.Exit.UpdateAt
+	if exitMS <= od.EnterAt {
+		exitMS = nowMS
+	}
+	cost := fundingApproxCost(od.Enter.Average*od.Enter.Filled, aprPct, exitMS-od.EnterAt)
+	if cost <= 0 {
+		return
+	}
+	od.Exit.Fee += cost
+	od.Exit.FeeQuote += cost
+	od.DirtyExit = true
+	od.SetInfo("funding", cost)
+}
+
+// fundingApproxCost is notional x apr% x (holdMS in years).
+func fundingApproxCost(notional, aprPct float64, holdMS int64) float64 {
+	if aprPct <= 0 || notional <= 0 || holdMS <= 0 {
+		return 0
+	}
+	return notional * aprPct / 100 * float64(holdMS) / (365 * 86400000)
 }
 
 func (o *OrderMgr) localExit(od *ormo.InOutOrder, exitAt int64, tag string, price float64, msg, odType string) *errs.Error {
@@ -597,6 +658,11 @@ func makeRuntimeOrderConfig(deps RuntimeDeps, account string) runtimeOrderConfig
 		result.backtestNetCost = 15
 	}
 	result.legacyIntrabar = cfg.BTLegacyIntrabar
+	result.slippageBps = cfg.BTSlippageBps
+	result.gapBars = cfg.BTGapBars
+	result.gapMinHours = cfg.BTGapMinHours
+	result.delistPenaltyBps = cfg.BTDelistPenaltyBps
+	result.fundingApr = cfg.BTFundingApr
 	result.accountLeverage = cfg.Leverage
 	if acc := cfg.Accounts[account]; acc != nil {
 		if acc.Leverage > 0 {

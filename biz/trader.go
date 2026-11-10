@@ -662,6 +662,18 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 	if closeErr != nil {
 		return errs.New(core.ErrInvalidBars, closeErr)
 	}
+	if !evt.IsWarmUp {
+		// backtest data-gap guard (bt_gap_bars): runs before the new bar's price is registered
+		if genv, ok := t.strategyEnv(symbol + "_" + evt.TimeFrame); ok && genv != nil {
+			nextOpen, _ := evt.FloatValue("open")
+			if gerr := t.guardBarGap(evt.TimeMS, evt.TimeFrame, symbol, genv.TimeStop, genv.TFMSecs, nextOpen); gerr != nil {
+				return gerr
+			}
+		}
+		if derr := t.sweepDelistedAll(evt.TimeMS); derr != nil {
+			return derr
+		}
+	}
 	state := t.coreState()
 	var odMatch bool
 	if state == nil {
