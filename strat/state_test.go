@@ -39,9 +39,15 @@ func TestExplicitStrategyStateUsesOwnSelectionClockAndStrictMode(t *testing.T) {
 	secondClock.SetTimeMS(222)
 	second := NewStateWithRuntime(secondCore, secondClock, &config.Config{BTStrict: false}, nil, nil)
 
-	if !strictBacktestFor(first, firstCore) || strictBacktestFor(second, secondCore) {
-		t.Fatalf("strict mode leaked between runtimes: first=%v second=%v",
-			strictBacktestFor(first, firstCore), strictBacktestFor(second, secondCore))
+	// stable iteration order is on for every backtest runtime (issue 111), bt_strict or not; a live runtime is not.
+	liveCore, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := NewStateWithRuntime(liveCore, btime.NewClockState(true, nil), &config.Config{BTStrict: true}, nil, nil)
+	if !strictBacktestFor(first, firstCore) || !strictBacktestFor(second, secondCore) || strictBacktestFor(live, liveCore) {
+		t.Fatalf("ordered mode wrong: first=%v second=%v live=%v",
+			strictBacktestFor(first, firstCore), strictBacktestFor(second, secondCore), strictBacktestFor(live, liveCore))
 	}
 	if got := runtimeTimeMSFor(first); got != 111 {
 		t.Fatalf("first runtime time=%d, want 111", got)

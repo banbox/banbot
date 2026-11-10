@@ -1045,7 +1045,7 @@ return map[pair_tf][stratID]bool
 */
 func GetJobKeys() map[string]map[string]bool {
 	jobs := make(map[string]map[string]bool)
-	for acc := range utils.MapKeys(AccJobs, config.StrictBacktest()) {
+	for acc := range utils.MapKeys(AccJobs, config.OrderedBacktest()) {
 		jobsMap := AccJobs[acc]
 		for pairTF, stgMap := range jobsMap {
 			idMap := make(map[string]bool)

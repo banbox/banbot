@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"container/heap"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"maps"
@@ -863,6 +864,7 @@ func runHistFeedersWithDrainObserver(deps *RuntimeDeps, makeFeeders func() []IHi
 	var holds histFeederHeap
 	var nextOrder uint64
 	var firstInit = true
+	barOrder := histBarOrderFor(deps)
 	for {
 		if deps != nil && deps.Core != nil {
 			select {
@@ -881,7 +883,7 @@ func runHistFeedersWithDrainObserver(deps *RuntimeDeps, makeFeeders func() []IHi
 			ver = 0
 		}
 		if ver > oldVer || firstInit {
-			holds, nextOrder = initHistFeederHeap(makeFeeders, nextOrder)
+			holds, nextOrder = initHistFeederHeap(makeFeeders, nextOrder, barOrder)
 			oldVer = max(oldVer, ver)
 			firstInit = false
 		}
@@ -918,11 +920,11 @@ func runHistFeedersWithDrainObserver(deps *RuntimeDeps, makeFeeders func() []IHi
 	return nil
 }
 
-func initHistFeederHeap(makeFeeders func() []IHistFeeder, nextOrder uint64) (histFeederHeap, uint64) {
+func initHistFeederHeap(makeFeeders func() []IHistFeeder, nextOrder uint64, barOrder histBarOrder) (histFeederHeap, uint64) {
 	feeders := makeFeeders()
 	holds := make(histFeederHeap, len(feeders))
 	for i, feeder := range feeders {
-		holds[i] = histFeederHeapItem{feeder: feeder, order: nextOrder}
+		holds[i] = histFeederHeapItem{feeder: feeder, order: nextOrder, barOrder: barOrder}
 		nextOrder++
 	}
 	heap.Init(&holds)
@@ -952,8 +954,56 @@ func updateHistReplayProgress(pBar *utils.PrgBar, lastBarMs, batchTime int64, de
 }
 
 type histFeederHeapItem struct {
-	feeder IHistFeeder
-	order  uint64
+	feeder   IHistFeeder
+	order    uint64
+	barOrder histBarOrder
+}
+
+// histBarOrder selects how feeders due at the same bar time are ordered. Backtests (issue 112) use a neutral
+// pseudo-random priority hash(bar time, symbol, seed) so that no symbol systematically wins limited capital;
+// everything else keeps the symbol-ascending order.
+type histBarOrder struct {
+	hashed bool
+	seed   uint64
+}
+
+func histBarOrderFor(deps *RuntimeDeps) histBarOrder {
+	if deps != nil {
+		if deps.Core == nil || !deps.Core.BackTestMode {
+			return histBarOrder{}
+		}
+		if cfg := deps.configView(); cfg != nil {
+			return histBarOrder{hashed: true, seed: cfg.BTBarOrderSeed}
+		}
+		return histBarOrder{hashed: true, seed: config.Data.BTBarOrderSeed}
+	}
+	if !config.OrderedBacktest() {
+		return histBarOrder{}
+	}
+	return histBarOrder{hashed: true, seed: config.Data.BTBarOrderSeed}
+}
+
+// BarPriority is the neutral, reproducible priority of a symbol within one bar time: 64-bit FNV-1a over
+// (seed, barMS, symbol). Lower value is processed first.
+func BarPriority(barMS int64, symbol string, seed uint64) uint64 {
+	const offset, prime = 14695981039346656037, 1099511628211
+	h := uint64(offset)
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[:8], seed)
+	binary.LittleEndian.PutUint64(buf[8:], uint64(barMS))
+	for _, c := range buf {
+		h ^= uint64(c)
+		h *= prime
+	}
+	for i := 0; i < len(symbol); i++ {
+		h ^= uint64(symbol[i])
+		h *= prime
+	}
+	// final avalanche (FNV low bits of similar inputs are correlated)
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	return h
 }
 
 type histFeederHeap []histFeederHeapItem
@@ -971,6 +1021,12 @@ func (h histFeederHeap) Less(i, j int) bool {
 	if aMS != math.MaxInt64 {
 		aSymbol, bSymbol := a.feeder.getSymbol(), b.feeder.getSymbol()
 		if aSymbol != bSymbol {
+			if a.barOrder.hashed {
+				ha, hb := BarPriority(aMS, aSymbol, a.barOrder.seed), BarPriority(bMS, bSymbol, a.barOrder.seed)
+				if ha != hb {
+					return ha < hb
+				}
+			}
 			return aSymbol < bSymbol
 		}
 	}

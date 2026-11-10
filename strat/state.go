@@ -281,16 +281,17 @@ func runtimeCoreFor(state *State, coreState *core.State) *core.State {
 	return nil
 }
 
+// strictBacktestFor is used ONLY to pick a stable iteration order; every backtest uses one (issue 111), so it no
+// longer depends on `bt_strict`.
 func strictBacktestFor(state *State, coreState *core.State) bool {
 	if state != nil && state != legacyState {
 		runtimeCore := runtimeCoreFor(state, coreState)
-		cfg := state.Config
-		return runtimeCore != nil && cfg != nil && runtimeCore.BackTestMode && cfg.BTStrict
+		return runtimeCore != nil && runtimeCore.BackTestMode
 	}
 	if coreState != nil {
-		return coreState.BackTestMode && config.Data.BTStrict
+		return coreState.BackTestMode
 	}
-	return core.BackTestMode && config.Data.BTStrict
+	return core.BackTestMode
 }
 
 func runtimeAccountsFor(state *State) map[string]*config.AccountConfig {

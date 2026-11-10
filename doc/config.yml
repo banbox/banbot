@@ -31,7 +31,8 @@ bt_no_kline_download: false # 回测是否禁止隐式 K 线下载；严格历�
 bt_legacy_intrabar: false # 对比历史结果时保留旧版 bar 内价格路径
 bt_legacy_order_metrics: false # 对比历史结果时保留旧版订单回撤统计
 bt_legacy_wallet_price: false # 对比历史结果时保留旧版保证金估值时点
-bt_strict: false # 是否启用严格回测模式；启用后固定关键执行顺序，确保回测结果可复现，可能降低回测速度
+bt_strict: false # 严格回测模式（重放覆盖/兼容钱包语义）；执行顺序的确定性（回测结果逐位可复现）自 BtFeatureLevel 5 起对所有回测默认生效，与此项无关
+bt_bar_order_seed: 0 # 回测同一根 bar 多品种的处理顺序按 hash(bar时间, 品种, 此盐) 升序（中性、可复现；BtFeatureLevel 6），改变盐=换一种确定性顺序
 relay_sim_unfinish: false  # 交易新品种时(回测/实盘)，是否从开始时间未平仓订单接力开始交易
 order_bar_max: 500  # 查找开始时间未平仓订单向前模拟最大bar数量
 ntp_lang_code: none  # ntp真实时间同步，默认none不启用，支持的代码：zh-CN, zh-HK, zh-TW, ja-JP, ko-KR, zh-SG, global(表示全球ntp服务器：google、apple、facebook...)

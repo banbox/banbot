@@ -1186,3 +1186,78 @@ func TestRunHistFeedersWithRuntimeDepsRejectsNilDeps(t *testing.T) {
 		t.Fatalf("nil runtime dependencies error = %v, want explicit dependency error", err)
 	}
 }
+
+func withBacktestMode(t *testing.T, seed uint64) {
+	prevMode, prevSeed := core.BackTestMode, config.Data.BTBarOrderSeed
+	core.BackTestMode = true
+	config.Data.BTBarOrderSeed = seed
+	t.Cleanup(func() { core.BackTestMode, config.Data.BTBarOrderSeed = prevMode, prevSeed })
+}
+
+func replaySymbolOrder(t *testing.T, symbols []string, times []int64) []histFeederBatch {
+	var runs []histFeederBatch
+	feeders := make([]IHistFeeder, 0, len(symbols))
+	for _, sym := range symbols {
+		feeders = append(feeders, &stubHistFeeder{symbol: sym, times: times, runs: &runs})
+	}
+	if err := RunHistFeeders(func() []IHistFeeder { return feeders }, make(chan int, 1), nil); err != nil {
+		t.Fatalf("RunHistFeeders returned error: %v", err)
+	}
+	return runs
+}
+
+// issue 112: backtests order same-bar symbols by hash(bar time, symbol, seed): reproducible, not alphabetical,
+// independent of the input slice order and roughly uniform in "who is first".
+func TestRunHistFeedersNeutralBarPriority(t *testing.T) {
+	withBacktestMode(t, 0)
+	var symbols []string
+	for i := 0; i < 24; i++ {
+		symbols = append(symbols, fmt.Sprintf("S%02d/USDT", i))
+	}
+	times := make([]int64, 1000)
+	for i := range times {
+		times[i] = int64(i+1) * 900000
+	}
+	base := replaySymbolOrder(t, symbols, times)
+	rev := slices.Clone(symbols)
+	slices.Reverse(rev)
+	for i := 0; i < 20; i++ {
+		if got := replaySymbolOrder(t, rev, times); !reflect.DeepEqual(got, base) {
+			t.Fatalf("run %d differs from baseline", i)
+		}
+	}
+	first := map[string]int{}
+	for i := 0; i < len(base); i += len(symbols) {
+		first[base[i].symbol]++
+	}
+	if len(first) != len(symbols) {
+		t.Fatalf("only %d of %d symbols ever first: %v", len(first), len(symbols), first)
+	}
+	exp := float64(len(times)) / float64(len(symbols))
+	var chi float64
+	for _, sym := range symbols {
+		d := float64(first[sym]) - exp
+		chi += d * d / exp
+	}
+	// df=23: 99.9% quantile is 49.7
+	if chi > 49.7 {
+		t.Fatalf("first-place counts not uniform, chi2=%.1f: %v", chi, first)
+	}
+	// seed changes the order
+	core.BackTestMode = true
+	config.Data.BTBarOrderSeed = 7
+	if got := replaySymbolOrder(t, symbols, times); reflect.DeepEqual(got, base) {
+		t.Fatal("seed has no effect")
+	}
+}
+
+// non-backtest keeps symbol-ascending order
+func TestRunHistFeedersLiveKeepsSymbolOrder(t *testing.T) {
+	prev := core.BackTestMode
+	core.BackTestMode = false
+	defer func() { core.BackTestMode = prev }()
+	runs := replaySymbolOrder(t, []string{"c", "b", "a"}, []int64{100})
+	if runs[0].symbol != "a" || runs[1].symbol != "b" || runs[2].symbol != "c" {
+		t.Fatalf("got %v", runs)
+	}
+}

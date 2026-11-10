@@ -14,4 +14,13 @@ package core
 //	   exits follow the same rules, per-pair statarb pause + pausedPeriods (v0.7.90-trend.10)
 //	4  factor/statarb manifest.costs.funding_apr (long-notional funding approximation), PIT universe drop of
 //	   not-yet-listed instruments under the lifecycle policy (v0.7.90-trend.11)
-const BtFeatureLevel = 4
+//	5  ordered backtest (issue 111): every fill-relevant map / set walk (job-per-symbol order within one bar, account,
+//	   open-order, batch, rotation, wallet-settle and wallet order view) uses a stable key order in EVERY backtest, not
+//	   only with bt_strict. Builds < 5 give different fills / UPI on identical reruns of multi-symbol strategies
+//	   (capital competition between symbols on the same bar); no new config key, so bansite does not need to require
+//	   it - it marks "results are bit-reproducible" (v0.7.90-trend.12)
+//	6  neutral same-bar priority (issue 112): symbols due on the same bar time are replayed in hash(bar time, symbol,
+//	   bt_bar_order_seed) order instead of symbol-ascending order, so limited capital is not systematically taken by
+//	   early-alphabet names; reproducible for identical input. Changes every multi-symbol backtest result once more
+//	   (single-pair results are unchanged). bansite requires >= 6 for every compile (v0.7.90-trend.13)
+const BtFeatureLevel = 6

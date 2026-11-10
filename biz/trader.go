@@ -93,6 +93,15 @@ func (d *RuntimeDeps) StrictBacktest() bool {
 	return d.Core != nil && d.Core.BackTestMode && cfg != nil && cfg.BTStrict
 }
 
+// OrderedBacktest reports whether this runtime is a backtest, in which every fill-relevant iteration uses a stable
+// order regardless of `bt_strict` (see config.OrderedBacktest).
+func (d *RuntimeDeps) OrderedBacktest() bool {
+	if d == nil {
+		return config.OrderedBacktest()
+	}
+	return d.Core != nil && d.Core.BackTestMode
+}
+
 // StrictHistoricalReplay reports the legacy order-metric compatibility mode
 // using only this runtime's configuration snapshot.
 func (d *RuntimeDeps) StrictHistoricalReplay() bool {
@@ -736,7 +745,7 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 			barExpired = false
 		}
 	}
-	if t.parallelOnBar() && !strictBacktestFor(t.runtime) {
+	if t.parallelOnBar() && !orderedBacktestFor(t.runtime) {
 		return t.feedClosedSeriesParallel(evt, env, symbol, odMatch, accOrders, barExpired)
 	}
 	return t.feedClosedSeriesSerial(evt, env, symbol, odMatch, accOrders, barExpired)
@@ -837,7 +846,7 @@ func (t *Trader) feedClosedSeriesParallel(evt *orm.DataSeries, env *ta.BarEnv, s
 }
 
 func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.DataSeries, curOrders []*ormo.InOutOrder, barExpired bool) *errs.Error {
-	if t.parallelOnBar() && !strictBacktestFor(t.runtime) {
+	if t.parallelOnBar() && !orderedBacktestFor(t.runtime) {
 		return t.onAccountDataSeriesParallel(account, env, evt, curOrders, barExpired)
 	}
 	return t.onAccountDataSeriesSerial(account, env, evt, curOrders, barExpired)
@@ -977,12 +986,12 @@ func (t *Trader) onAccountDataSeriesParallel(account string, env *ta.BarEnv, evt
 	odMgr := t.orderManager(account)
 	isWarmup := evt.IsWarmUp
 	var wg sync.WaitGroup
-	parallelOnBar := t.parallelOnBar() && !strictBacktestFor(t.runtime)
+	parallelOnBar := t.parallelOnBar() && !orderedBacktestFor(t.runtime)
 	jobKeys := make([]string, 0, len(jobs))
 	for key := range jobs {
 		jobKeys = append(jobKeys, key)
 	}
-	if strictBacktestFor(t.runtime) {
+	if orderedBacktestFor(t.runtime) {
 		sort.Strings(jobKeys)
 	}
 	var errCh chan parallelError

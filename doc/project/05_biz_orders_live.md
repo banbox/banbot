@@ -22,7 +22,7 @@
 | `biz/runtime_logger.go` | Trader/RuntimeDeps/OrderMgr 的 logger 取值 |
 | `biz/runtime_state.go` | `TradingState`：按账户注册 OrderManager / LiveManager / Wallet |
 | `biz/live_runtime.go` | 批量平单 `CloseAccOrdersWithState`、致命亏损熔断 `MakeCheckFatalStopWithRuntime` |
-| `biz/determinism.go` | 回测确定性：strict 模式下 map 排序遍历 |
+| `biz/determinism.go` | 回测确定性：**所有**回测（`config.OrderedBacktest()` / `RuntimeDeps.OrderedBacktest()`，与 `bt_strict` 无关）按稳定键（账户名/job key/开仓时间+ID）遍历 map；品种间同 bar 先后由 `data/provider.go` 回放堆的哈希序决定（`bt_bar_order_seed`，issue 112，BtFeatureLevel 6），本文件只负责单品种内部的稳定顺序；`bt_strict` 仅再控制重放覆盖与兼容钱包语义（`strictBacktestFor`） |
 | `biz/data_server.go` | gRPC FeaFeeder 服务（默认 `:6789`，收发上限 100MB 硬编码） |
 | `biz/remote_command.go` | `RemoteCommandService`：校验、幂等、1 秒限频、审计；平仓与交易开关 |
 | `biz/job_orders.go` | `ProcessJobOrders`：策略异步回调发起下单（几乎无非测试调用方） |
@@ -223,7 +223,7 @@
 - **改钱包记账**：`wallet.go` 的 Enter/Exit/Confirm 同时服务回测与实盘（实盘 Confirm 直接返回），改动后检查 `wallet_exit_test.go`、`wallet_partial_exit_test.go`、`wallet_liquidation_test.go`。
 - **改检查点格式**：同时改 `loadSharedCheckpoint` 与 `splitSharedCheckpoint`，并处理 `StorageVersion` 校验（版本不符直接报错，需显式迁移）。键前缀（`legacy-ts/order:id:`、`legacy-ts/order:lot:`、`legacy-ts/command:`）是持久格式，不可随意改。
 - **Hub journal 结构变更**：必须 bump `Bridge.Version`，否则旧 journal 被静默接受（`hub_order_mgr.go:149` 只比较 Version）。
-- **改 K 线/数据系列处理**：串行与并行两条路径（`feedClosedSeriesSerial/Parallel`、`onAccountDataSeriesSerial/Parallel`）都要同步。strict 回测强制串行且按 key 排序（`trader.go:724/825/970`）。
+- **改 K 线/数据系列处理**：串行与并行两条路径（`feedClosedSeriesSerial/Parallel`、`onAccountDataSeriesSerial/Parallel`）都要同步。所有回测（不仅 strict）强制串行且按 key 排序（`orderedBacktestFor`，issue 111：此前非 strict 回测按 Go map 随机序处理同一 bar 的多品种，资金不足时先到先得 -> 同参数重跑订单数/UPI 不一致）。
 - **易踩坑**：
   - 运行时路径不要调用 legacy 门面（`GetOdMgr`、`strat.GetJobs`、`FindOpenOrders`、`core.Legacy*`）。
   - 确定性遍历用 `determinism.go` 的 `executionMapKeys` / `executionStratJobs`；回测中 map 迭代后用 `sortMapOrdersForBacktest`。

@@ -1041,7 +1041,7 @@ func setAdmissionSnapshot(state *core.State, active map[string]bool) {
 }
 
 func rotationOpenOrderView(orders map[int64]*ormo.InOutOrder) []*ormo.InOutOrder {
-	return rotationOpenOrderViewWithStrict(orders, config.StrictBacktest())
+	return rotationOpenOrderViewWithStrict(orders, config.OrderedBacktest())
 }
 
 func rotationOpenOrderViewWithStrict(orders map[int64]*ormo.InOutOrder, strict bool) []*ormo.InOutOrder {

@@ -712,6 +712,14 @@ func StrictBacktest() bool {
 	return core.BackTestMode && Data.BTStrict
 }
 
+// OrderedBacktest reports whether every set / map walk that can influence fills (symbol order within one bar,
+// account / job / open-order / wallet-settle order, capital competition between symbols) must use a stable key
+// order. It is on for EVERY backtest, independent of `bt_strict` (which additionally selects replay-coverage and
+// legacy-wallet semantics): without it two identical runs could fill different orders (issue 111).
+func OrderedBacktest() bool {
+	return core.BackTestMode
+}
+
 // IsFrozenStaticPairs reports whether strict replay may use the submitted
 // static universe without discovering market data or applying pair filters.
 func IsFrozenStaticPairs(pairs []string) bool {
@@ -894,6 +902,7 @@ func (c *Config) Clone() *Config {
 		BTSlippageBps:        c.BTSlippageBps,
 		BTFundingApr:         c.BTFundingApr,
 		BTGapBars:            c.BTGapBars,
+		BTBarOrderSeed:       c.BTBarOrderSeed,
 		BTGapMinHours:        c.BTGapMinHours,
 		BTDelistPenaltyBps:   c.BTDelistPenaltyBps,
 		BTStrict:             c.BTStrict,

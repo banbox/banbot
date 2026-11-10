@@ -2,7 +2,9 @@ package research
 
 import (
 	"errors"
+	"maps"
 	"math"
+	"slices"
 	"sort"
 
 	"github.com/banbox/banbot/factor"
@@ -264,7 +266,8 @@ func Evaluate(frame factor.Frame, universe factor.Universe, labels []Label, spec
 	delta := 0.0
 	gross := 0.0
 	complete := true
-	for sid := range weights {
+	// sorted keys: float sums over map order differ in the last digits between identical runs (issue 112)
+	for _, sid := range slices.Sorted(maps.Keys(weights)) {
 		w, old := spec.CurrentWeights[sid], spec.PreviousWeights[sid]
 		if math.IsNaN(w) || math.IsInf(w, 0) || math.IsNaN(old) || math.IsInf(old, 0) {
 			return Report{}, errors.New("research: nonfinite performance weight")

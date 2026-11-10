@@ -316,6 +316,11 @@ func (d *ReportDeps) strictBacktest() bool {
 	return d.Core.BackTestMode && cfg != nil && cfg.BTStrict
 }
 
+// orderedBacktest: every backtest walks maps / open orders in a stable order (config.OrderedBacktest).
+func (d *ReportDeps) orderedBacktest() bool {
+	return d != nil && d.Core != nil && d.Core.BackTestMode
+}
+
 func (d *ReportDeps) wallet() *biz.BanWallets {
 	if d.Trading != nil {
 		return d.Trading.Wallet(d.account())
@@ -2353,7 +2358,7 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 		openNum := len(openOds)
 		btRes.MaxOpenOrders = max(btRes.MaxOpenOrders, openNum)
 		lock.Unlock()
-		strict := deps.strictBacktest()
+		strict := deps.orderedBacktest()
 		for code := range utils.MapKeys(settleMap, strict) {
 			odArr := settleMap[code]
 			err = wallets.UpdateOds(odArr, code)
@@ -2404,7 +2409,7 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 
 func reportOpenOrderViewWithDeps(orders map[int64]*ormo.InOutOrder, deps *ReportDeps) []*ormo.InOutOrder {
 	result := utils2.ValsOfMap(orders)
-	strict := deps.strictBacktest()
+	strict := deps.orderedBacktest()
 	if strict {
 		slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
 			if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {

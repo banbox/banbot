@@ -12,7 +12,15 @@ import (
 )
 
 func executionMapKeys[M ~map[K]V, K cmp.Ordered, V any](items M, deps ...*RuntimeDeps) iter.Seq[K] {
-	return utils.MapKeys(items, strictBacktestFor(deps...))
+	return utils.MapKeys(items, orderedBacktestFor(deps...))
+}
+
+// orderedBacktestFor: stable iteration order for all backtests (not only bt_strict).
+func orderedBacktestFor(deps ...*RuntimeDeps) bool {
+	if len(deps) > 0 {
+		return deps[0].OrderedBacktest()
+	}
+	return config.OrderedBacktest()
 }
 
 func strictBacktestFor(deps ...*RuntimeDeps) bool {
@@ -42,7 +50,7 @@ func executionAccountNames(deps ...*RuntimeDeps) iter.Seq[string] {
 			}
 		}
 	}
-	if strictBacktestFor(runtimeDeps) {
+	if orderedBacktestFor(runtimeDeps) {
 		return utils.MapKeys(accounts, true)
 	}
 	return func(yield func(string) bool) {
@@ -56,7 +64,7 @@ func executionAccountNames(deps ...*RuntimeDeps) iter.Seq[string] {
 
 func executionStratJobs(jobs map[string]*strat.StratJob, deps ...*RuntimeDeps) iter.Seq[*strat.StratJob] {
 	return func(yield func(*strat.StratJob) bool) {
-		if strictBacktestFor(deps...) {
+		if orderedBacktestFor(deps...) {
 			for key := range executionMapKeys(jobs, deps...) {
 				if !yield(jobs[key]) {
 					return
@@ -74,7 +82,7 @@ func executionStratJobs(jobs map[string]*strat.StratJob, deps ...*RuntimeDeps) i
 
 func executionJobEnvs(jobs map[string]*strat.JobEnv, deps ...*RuntimeDeps) iter.Seq[*strat.JobEnv] {
 	return func(yield func(*strat.JobEnv) bool) {
-		if strictBacktestFor(deps...) {
+		if orderedBacktestFor(deps...) {
 			for key := range executionMapKeys(jobs, deps...) {
 				if !yield(jobs[key]) {
 					return
@@ -93,7 +101,7 @@ func executionJobEnvs(jobs map[string]*strat.JobEnv, deps ...*RuntimeDeps) iter.
 func executionOpenOrders(orders map[int64]*ormo.InOutOrder, deps ...*RuntimeDeps) []*ormo.InOutOrder {
 	result := utils.ValsOfMap(orders)
 	// Maps have no supplied order to preserve, including during frozen replays.
-	if strictBacktestFor(deps...) {
+	if orderedBacktestFor(deps...) {
 		slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
 			if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {
 				return order

@@ -1351,7 +1351,7 @@ func syncSimOrdersWithDeps(deps *biz.RuntimeDeps, isFirst bool, relayOpens, rela
 		return errs.NewMsg(core.ErrRunTime, "runtime relay state is incomplete")
 	}
 	accounts := deps.AccountConfigs()
-	strict := deps.StrictBacktest()
+	strict := deps.OrderedBacktest()
 	if isFirst {
 		closeNums := make(map[string]int)
 		for _, account := range runtimeAccountNames(accounts) {

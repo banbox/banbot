@@ -538,7 +538,7 @@ func tryFireBatches(state *strat.BatchState, currMS int64, isWarmUp bool,
 		trading = deps.Trading
 		defaultAccount = deps.DefaultAccount
 	}
-	readyItems, waitNum := state.TakeReady(currMS, strictBacktestFor(deps))
+	readyItems, waitNum := state.TakeReady(currMS, orderedBacktestFor(deps))
 
 	var err *errs.Error
 	for _, item := range readyItems {

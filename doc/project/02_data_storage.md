@@ -164,7 +164,7 @@
 ### 5. 回测回放
 
 - `NewHistProviderWithRuntimeDeps`（data/provider.go:353）→ `SetSeriesSubs`（:439，独立序列建 HistSeriesFeeder）→ `SubWarmPairs`（:628）→ `subWarmPairs`（:187）→ newFeeder（:390，`NewDBSeriesFeederWithRuntimeDeps`）→ `WarmTfs`（feeder.go:815）→ `getTfKlines`（:319，`AutoFetchSeriesWithOptions`）。
-- 运行：`LoopMain`（provider.go:771）→ `runHistFeedersWithDrainObserver`（:860）按 `getNextMS` 的最小堆调度；每步 `GetBatch` → `CallNext` → `RunBatch` → `onNewData`（feeder.go:1001）→ `onStateOhlcvsWithErr`（:272）→ `fireCallBacks`（:394）。
+- 运行：`LoopMain`（provider.go:771）→ `runHistFeedersWithDrainObserver`（:860）按 `getNextMS` 的最小堆调度（同一 bar 时间的并列项：回测 `histBarOrderFor` 为哈希序，键 = `BarPriority(barMS, symbol, bt_bar_order_seed)`，64 位 FNV-1a 加终混，中性、可复现、与输入顺序及品种增删无关；非回测保持品种名升序；再并列按品种名/插入序，issue 112）；每步 `GetBatch` → `CallNext` → `RunBatch` → `onNewData`（feeder.go:1001）→ `onStateOhlcvsWithErr`（:272）→ `fireCallBacks`（:394）。
 - 独立序列回放：`HistSeriesFeeder.CallNext`（hist_series_feeder.go:143）→ `orm.SeriesStore.Read`。
 - 逐笔回放：`TradeFeeder.CallNext`（ws_feeder.go:161）→ `loadNextBatch`（:205）→ `WsDataLoader.LoadTrades`（ws_loader.go:270）。缓存未命中时 `submitTask` → `downloadWorker` → `downloadJob`（:616，归档 URL 经 `exg.BuildArchiveURL*`）→ `SplitBigZip`（:347）→ 每小时 `.bin`（`writeBinaryTrades`，:773）。
 

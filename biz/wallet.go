@@ -1490,7 +1490,7 @@ func (w *BanWallets) UpdateOds(odList []*ormo.InOutOrder, currency string) *errs
 }
 
 func legacyWalletOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
-	if !stableWalletBacktest() || len(orders) < 2 {
+	if !core.BackTestMode || len(orders) < 2 {
 		return orders
 	}
 	result := slices.Clone(orders)
@@ -1502,7 +1502,7 @@ func legacyWalletOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
 
 func (w *BanWallets) walletOrderView(orders []*ormo.InOutOrder) []*ormo.InOutOrder {
 	if w != nil && w.runtimeBound {
-		if !w.runtimeBacktest || (!w.runtimeBTLegacy && !w.runtimeBTStrict) || len(orders) < 2 {
+		if !w.runtimeBacktest || len(orders) < 2 {
 			return orders
 		}
 		result := slices.Clone(orders)

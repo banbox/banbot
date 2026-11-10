@@ -10,7 +10,7 @@ import (
 	"github.com/banbox/banbot/orm/ormo"
 )
 
-func TestDeterministicWalletOrderingIsOptIn(t *testing.T) {
+func TestWalletOrderViewIsSortedInEveryBacktest(t *testing.T) {
 	oldMode, oldData := core.BackTestMode, config.Data
 	t.Cleanup(func() {
 		core.BackTestMode, config.Data = oldMode, oldData
@@ -21,10 +21,15 @@ func TestDeterministicWalletOrderingIsOptIn(t *testing.T) {
 		{IOrder: &ormo.IOrder{ID: 2}},
 		{IOrder: &ormo.IOrder{ID: 1}},
 	}
-	if got := legacyWalletOrderView(orders); got[0].ID != 2 || &got[0] != &orders[0] {
-		t.Fatal("default backtest behavior unexpectedly reordered orders")
+	// issue 111: the order view is stable in every backtest, not only with bt_strict / bt_legacy_wallet_price
+	if got := legacyWalletOrderView(orders); got[0].ID != 1 || orders[0].ID != 2 {
+		t.Fatal("backtest order view did not sort a clone")
 	}
-	config.Data.BTStrict = true
+	core.BackTestMode = false
+	if got := legacyWalletOrderView(orders); got[0].ID != 2 || &got[0] != &orders[0] {
+		t.Fatal("non-backtest order view unexpectedly reordered orders")
+	}
+	core.BackTestMode, config.Data.BTStrict = true, true
 	if got := legacyWalletOrderView(orders); got[0].ID != 1 || orders[0].ID != 2 {
 		t.Fatal("deterministic order view did not sort a clone")
 	}
