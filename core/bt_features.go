@@ -12,4 +12,6 @@ package core
 //	3  071 exit policy: data_gap exits fill at the worse of last close / first post-gap open at min(last+confirm delay,
 //	   recovery), delist exits pay bt_delist_penalty_bps; BTResult gapExitPnlShare/delistExitPnlShare; factor/statarb PIT
 //	   exits follow the same rules, per-pair statarb pause + pausedPeriods (v0.7.90-trend.10)
-const BtFeatureLevel = 3
+//	4  factor/statarb manifest.costs.funding_apr (long-notional funding approximation), PIT universe drop of
+//	   not-yet-listed instruments under the lifecycle policy (v0.7.90-trend.11)
+const BtFeatureLevel = 4

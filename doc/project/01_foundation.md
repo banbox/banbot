@@ -24,7 +24,7 @@
 | --- | --- |
 | `main.go` | 进程入口，调用 `entry.RunCmd()` |
 | `core/core.go` | `SetRunMode/SetRunEnv`（写全局）、`Sleep`（基于全局 `Ctx`） |
-| `core/bt_features.go` | `BtFeatureLevel`（当前 3）：本构建的回测能力级别，必须单行 `const BtFeatureLevel = N`；bansite 编译前从源码解析它，拒绝无法满足配置中 `bt_*` 键的构建。1=滑点/资金费/空洞/回测末退市；2=退市与空洞按最后有效 bar 成交、运行中退市巡检、因子 PIT 宇宙、未知 `bt_*` 键 WARN；3=空洞/退市成交价规则与 `bt_delist_penalty_bps`、`gapExitPnlShare/delistExitPnlShare`、配对暂停与 `pausedPeriods` |
+| `core/bt_features.go` | `BtFeatureLevel`（当前 4）：本构建的回测能力级别，必须单行 `const BtFeatureLevel = N`；bansite 编译前从源码解析它，拒绝无法满足配置中 `bt_*` 键的构建。1=滑点/资金费/空洞/回测末退市；2=退市与空洞按最后有效 bar 成交、运行中退市巡检、因子 PIT 宇宙、未知 `bt_*` 键 WARN；3=空洞/退市成交价规则与 `bt_delist_penalty_bps`、`gapExitPnlShare/delistExitPnlShare`、配对暂停与 `pausedPeriods`；4=因子/统计套利 `manifest.costs.funding_apr`（多头名义额近似资金费）、lifecycle policy 下未上市标的的 PIT 剔除 |
 | `core/data.go` | 全局变量与常量：运行模式/环境、`Version="v0.7.1"`、`UIVersion="v0.6.0"`、标签常量（EnterTag/ExitTag）、订单类型、`Ctx/StopAll/BotRunning` |
 | `core/runtime_state.go` | `State` 及其类型安全访问器（pairs 准入快照、ban、no_enter、timeframe、JobPerf/PerfSta、OdBook、订单撮合开关、tf hits、exit 回调、Stop/Close）；另有大量 `Legacy*` 进程级门面 |
 | `core/runtime_logger.go` | `(*State).Log()`：绑定的 logger，零值 State 返回 nop logger |

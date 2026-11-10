@@ -21,6 +21,12 @@ func (o *navCapture) Nav(s backtest.State, _ int64) error { o.navs = append(o.na
 
 func pitConfig(t *testing.T, lastBar map[int32]int64, bars int64, minRatio float64) Config {
 	t.Helper()
+	return pitConfigFrom(t, nil, lastBar, bars, minRatio)
+}
+
+// pitConfigFrom is pitConfig with a per-instrument first bar (late listing).
+func pitConfigFrom(t *testing.T, firstBar, lastBar map[int32]int64, bars int64, minRatio float64) Config {
+	t.Helper()
 	c := archiveConfig(t, false)
 	c.Mode = Weights
 	c.Manifest.Costs.FundingPolicy = "explicit-zero"
@@ -48,6 +54,9 @@ func pitConfig(t *testing.T, lastBar map[int32]int64, bars int64, minRatio float
 	price := map[int32]float64{1: 200, 2: 100, 3: 300} // 3 is the top score -> long; 2 the bottom -> short
 	for _, sid := range sids {
 		for bar := int64(1); bar <= bars; bar++ {
+			if bar < firstBar[sid] {
+				continue
+			}
 			if bar > lastBar[sid] {
 				break
 			}

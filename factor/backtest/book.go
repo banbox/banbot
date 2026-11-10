@@ -34,6 +34,7 @@ type Book struct {
 	fillFacts                               []bookFillFact
 	acceptedProposals                       map[string]bookAcceptance
 	// 071 PIT exits: positions closed because the instrument dropped out; resolved at recovery / end of run
+	fundingApr          float64 // 081: percent per year charged on long notional, see SetFundingApr
 	pitExits            map[int32]pitExit
 	pitPenaltyBps       float64
 	gapLoss, delistLoss float64
@@ -55,6 +56,9 @@ func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	}
 	if old, ok := b.marks[sid]; ok && q.AtMS < old.AtMS {
 		return errors.New("backtest: mark moved backwards")
+	}
+	if old, ok := b.marks[sid]; ok && b.fundingApr > 0 {
+		b.accrueFunding(sid, old, q.AtMS)
 	}
 	if ex, ok := b.pitExits[sid]; ok && q.AtMS > ex.atMS {
 		b.resolveRecovered(sid, ex, q.Price)

@@ -116,3 +116,53 @@ func (b *Book) resolveRecovered(sid int32, ex pitExit, next float64) {
 // PITExitLosses returns the cumulative adverse cost booked by PIT exits: gap = hindsight-avoiding adjustment of
 // recovered gaps, delist = penalty of exits whose data never resumed (so far).
 func (b *Book) PITExitLosses() (gap, delist float64) { return b.gapLoss, b.delistLoss }
+
+// NeverSeenAll reports whether none of the SIDs was ever marked, held, or PIT-exited (instruments that are not
+// listed yet). Dropping such SIDs from the universe cannot desynchronise any position/policy state (081).
+func (b *Book) NeverSeenAll(sids []int32) bool {
+	for _, sid := range sids {
+		if _, ok := b.marks[sid]; ok {
+			return false
+		}
+		if b.quantities[sid] != 0 {
+			return false
+		}
+		if _, ok := b.pitExits[sid]; ok {
+			return false
+		}
+		if _, ok := b.firstFill[sid]; ok {
+			return false
+		}
+		if b.previousAllocation != nil {
+			if _, ok := b.previousAllocation.Allocations()[sid]; ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// maxFundingAccrualMS caps one accrual step so a data hole is not charged as continuous holding (positions across
+// holes are PIT-exited anyway).
+const maxFundingAccrualMS = 3 * 24 * 3600 * 1000
+
+// SetFundingApr (081) enables the funding approximation: percent per year charged on the notional of LONG
+// positions (qty x last mark) for the time between two marks of the instrument; shorts are neither charged nor
+// credited (conservative, same convention as bt_funding_apr of the order engine). The charge is booked into
+// State.Funding and reduces cash. Real per-settlement funding (ApplyFunding) is independent of it.
+func (b *Book) SetFundingApr(apr float64) {
+	if apr > 0 && finite(apr) {
+		b.fundingApr = apr
+	}
+}
+
+func (b *Book) accrueFunding(sid int32, old Quote, atMS int64) {
+	qty := b.quantities[sid]
+	if qty <= 0 || atMS <= old.AtMS || old.Price <= 0 {
+		return
+	}
+	dt := float64(min(atMS-old.AtMS, maxFundingAccrualMS))
+	cost := qty * old.Price * b.fundingApr / 100 * dt / (365.25 * 24 * 3600 * 1000)
+	b.cash -= cost
+	b.funding += cost
+}

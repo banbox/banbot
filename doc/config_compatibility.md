@@ -56,7 +56,7 @@
 | `snapshot` | `grid_time/decision_time/replay_time/universe/sid_map/schemas/source_versions/adjustment_version/visibility_policy` |
 | `snapshot.universe` | `version/investable/reference/tradable/evaluation/tracked/static` |
 | `manifest` | `currency/code_revision/factor_plan_hash/universe_version/visibility_policy/execution_mode/latency_assumption/static_universe/combo/portfolio/labels/parameters/costs/snapshots` |
-| `manifest.costs` | `fee_rate/slippage_rate/funding_policy` |
+| `manifest.costs` | `fee_rate/slippage_rate/funding_policy/funding_apr` |
 | `chunks[]` | `path/from/to` |
 
 这些集合内部参数相互关联且可能较多，继续拆成数十个策略标量不利于维护，因此保留语义分组，只删除 factor 中间层。组内仍校验未知 key、NULL 和类型；策略的其他自定义字段仍属于开放 More。

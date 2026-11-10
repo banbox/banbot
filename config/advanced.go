@@ -58,7 +58,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.HasSuffix(path, ".manifest"):
 		allowed = "currency code_revision factor_plan_hash universe_version visibility_policy execution_mode latency_assumption static_universe combo portfolio labels parameters costs snapshots"
 	case strings.HasSuffix(path, ".costs"):
-		allowed = "fee_rate slippage_rate funding_policy"
+		allowed = "fee_rate slippage_rate funding_policy funding_apr"
 	case strings.Contains(path, ".chunks["):
 		allowed = "path from to"
 	case strings.Contains(path, ".labels["):
@@ -131,7 +131,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if !nonnegativeInteger(value) {
 				return fmt.Errorf("%s must be a nonnegative integer", field)
 			}
-		case "initial_nav", "long_notional", "short_notional", "fee_rate", "slippage_rate", "periods_per_year":
+		case "initial_nav", "long_notional", "short_notional", "fee_rate", "slippage_rate", "funding_apr", "periods_per_year":
 			number := numeric(value)
 			if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
 				return fmt.Errorf("%s must be a finite nonnegative number", field)

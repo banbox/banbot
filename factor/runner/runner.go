@@ -303,6 +303,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		if err != nil {
 			return result, err
 		}
+		book.SetFundingApr(c.Manifest.Costs.FundingApr)
 		switch {
 		case c.PITDelistPenaltyBps == 0:
 			book.SetPITDelistPenaltyBps(defaultPITDelistPenaltyBps)
@@ -773,7 +774,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			snapshot, err := barrier.Freeze(token, now)
 			var pitDiag *factor.Diagnostic
 			pausedSkip := false
-			if errors.Is(err, factor.ErrSnapshotIncomplete) && book != nil && policy == nil && c.PITMinUniverseRatio >= 0 {
+			if errors.Is(err, factor.ErrSnapshotIncomplete) && book != nil && c.PITMinUniverseRatio >= 0 {
 				var incomplete *factor.SnapshotIncompleteError
 				if errors.As(err, &incomplete) {
 					var reduced factor.Universe
@@ -783,6 +784,12 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 						reduced, dropped, allPaused, ok = pitReducePairs(spec.Universe, incomplete.Status, pairLegs)
 					} else {
 						reduced, dropped, ok = pitReduceUniverse(spec.Universe, incomplete.Status, c.PITMinUniverseRatio)
+					}
+					if ok && policy != nil && !book.NeverSeenAll(dropped) {
+						// 081: the lifecycle policy owns opaque per-SID state (holding steps, previous allocation) that
+						// cannot be scrubbed from here, so only instruments never seen (not yet listed, never held) are
+						// dropped under a policy; delisted / gapped ones keep the old skip behaviour.
+						ok = false
 					}
 					if ok && len(reduced.Investable) == 0 {
 						// 070: every leg of every pair is gone: close what is held, pause, skip the period without
