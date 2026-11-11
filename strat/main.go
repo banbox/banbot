@@ -387,47 +387,9 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 	}
 	setAdmissionSnapshot(state, newPairs)
 	// 从AccInfoJobs中移除已取消的项
-	lockInfoJobsWrite(strategyState)
-	for acc := range utils.MapKeys(strategyState.accInfoJobs, strict) {
-		jobMap := strategyState.accInfoJobs[acc]
-		newJobMap := make(map[string]map[string]*StratJob)
-		for subKey := range utils.MapKeys(jobMap, strict) {
-			stgMap := jobMap[subKey]
-			newStgMap := make(map[string]*StratJob)
-			for name := range utils.MapKeys(stgMap, strict) {
-				job := stgMap[name]
-				if _, ok := exitJobs[job]; !ok {
-					newStgMap[name] = job
-					matchTf := strategyState.refineTimeFrame(job.Strat.Name, job.TimeFrame)
-					pairTfs.Update(job.Symbol.Symbol, matchTf, 0)
-				}
-			}
-			if len(newStgMap) > 0 {
-				newJobMap[subKey] = newStgMap
-				source, sid, tf, ok := ParseDataSubKey(subKey)
-				if ok {
-					if _, ok = tfSecs[tf]; !ok && tf != "event" {
-						tfSecs[tf] = utils2.TFToSecs(tf)
-					}
-					if source == "kline" {
-						var exs *orm.ExSymbol
-						if symbols == nil {
-							exs = orm.GetSymbolByID(sid)
-						} else {
-							exs = symbols.GetSymbolByID(sid)
-						}
-						if exs != nil {
-							pairTfs.Update(exs.Symbol, tf, 0)
-							envKeys[strings.Join([]string{exs.Symbol, tf}, "_")] = true
-							initBarEnvWithState(strategyState, state, exs, tf)
-						}
-					}
-				}
-			}
-		}
-		strategyState.accInfoJobs[acc] = newJobMap
+	if lockErr := pruneAccInfoJobs(strategyState, state, symbols, exitJobs, pairTfs, envKeys, tfSecs, strict); lockErr != nil {
+		return nil, nil, lockErr
 	}
-	unlockInfoJobsWrite(strategyState)
 	// Ensure that all pairs and TFs are recorded in the returned data to prevent them from being removed by the data subscriber
 	// 确保所有pair、tf都在返回的中有记录，防止被数据订阅端移除
 	for _, pairMap := range stgPairTfs {
@@ -816,28 +778,30 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 			if hasInfoSubs && !hasSideInputHandler {
 				panic(fmt.Sprintf("%s: side-input subscriptions require `OnData`, `OnInfoBar`, or `BatchInfo` + `OnBatchInfos`", stgy.Name))
 			}
-			lockInfoJobsWrite(strategyState)
-			infoJobs := strategyState.infoJobsLocked(account)
-			for _, s := range subs {
-				if s == nil || s.ExSymbol == nil {
-					continue
+			func() {
+				lockInfoJobsWrite(strategyState)
+				defer unlockInfoJobsWrite(strategyState)
+				infoJobs := strategyState.infoJobsLocked(account)
+				for _, s := range subs {
+					if s == nil || s.ExSymbol == nil {
+						continue
+					}
+					hasInfoSubs = true
+					if orm.NormalizeSeriesSource(s.Source) == orm.SeriesSourceKline {
+						pair := s.ExSymbol.Symbol
+						initBarEnvWithState(strategyState, state, s.ExSymbol, s.TimeFrame)
+						logWarm(pair, s.TimeFrame, s.WarmupNum)
+					}
+					jobKey := DataSubKey(s.Source, s.ExSymbol.ID, s.TimeFrame)
+					items, ok := infoJobs[jobKey]
+					if !ok {
+						items = make(map[string]*StratJob)
+						infoJobs[jobKey] = items
+					}
+					// 这里需要stratID+pair作为键，否则多个品种订阅同一个额外品种数据时，只记录了最后一个
+					items[strings.Join([]string{stgy.Name, exs.Symbol}, "_")] = job
 				}
-				hasInfoSubs = true
-				if orm.NormalizeSeriesSource(s.Source) == orm.SeriesSourceKline {
-					pair := s.ExSymbol.Symbol
-					initBarEnvWithState(strategyState, state, s.ExSymbol, s.TimeFrame)
-					logWarm(pair, s.TimeFrame, s.WarmupNum)
-				}
-				jobKey := DataSubKey(s.Source, s.ExSymbol.ID, s.TimeFrame)
-				items, ok := infoJobs[jobKey]
-				if !ok {
-					items = make(map[string]*StratJob)
-					infoJobs[jobKey] = items
-				}
-				// 这里需要stratID+pair作为键，否则多个品种订阅同一个额外品种数据时，只记录了最后一个
-				items[strings.Join([]string{stgy.Name, exs.Symbol}, "_")] = job
-			}
-			unlockInfoJobsWrite(strategyState)
+			}()
 		}
 	}
 }
@@ -1351,5 +1315,67 @@ func listStrats(prefix string) error {
 	}
 	sort.Strings(arr)
 	fmt.Println(strings.Join(arr, "\n"))
+	return nil
+}
+
+// ensureSubTfSecs records the seconds of a data subscription's timeframe. A custom source has no kline period (tf may
+// be empty or invalid): that is reported as an error, never a panic inside the locked registry update.
+func ensureSubTfSecs(tfSecs map[string]int, source, subKey, tf string) *errs.Error {
+	secs, err := utils2.TFToSecSafe(tf)
+	if err != nil {
+		return errs.NewMsg(core.ErrBadConfig, "invalid timeframe %q in data subscription %q (source=%s): %v", tf, subKey, source, err)
+	}
+	tfSecs[tf] = secs
+	return nil
+}
+
+// pruneAccInfoJobs drops the cancelled jobs from accInfoJobs and records the timeframes of the remaining
+// subscriptions. The unlock is deferred: a panic inside must not leave the info-jobs lock held, or Runtime.Close
+// (deferred by the caller) would wait on it forever and hide the panic (the process hung with no output, issue 129).
+func pruneAccInfoJobs(strategyState *State, state *core.State, symbols *orm.SymbolState, exitJobs map[*StratJob]bool,
+	pairTfs Warms, envKeys map[string]bool, tfSecs map[string]int, strict bool) *errs.Error {
+	lockInfoJobsWrite(strategyState)
+	defer unlockInfoJobsWrite(strategyState)
+	for acc := range utils.MapKeys(strategyState.accInfoJobs, strict) {
+		jobMap := strategyState.accInfoJobs[acc]
+		newJobMap := make(map[string]map[string]*StratJob)
+		for subKey := range utils.MapKeys(jobMap, strict) {
+			stgMap := jobMap[subKey]
+			newStgMap := make(map[string]*StratJob)
+			for name := range utils.MapKeys(stgMap, strict) {
+				job := stgMap[name]
+				if _, ok := exitJobs[job]; !ok {
+					newStgMap[name] = job
+					matchTf := strategyState.refineTimeFrame(job.Strat.Name, job.TimeFrame)
+					pairTfs.Update(job.Symbol.Symbol, matchTf, 0)
+				}
+			}
+			if len(newStgMap) > 0 {
+				newJobMap[subKey] = newStgMap
+				source, sid, tf, ok := ParseDataSubKey(subKey)
+				if ok {
+					if _, ok = tfSecs[tf]; !ok && tf != "event" {
+						if tfErr := ensureSubTfSecs(tfSecs, source, subKey, tf); tfErr != nil {
+							return tfErr
+						}
+					}
+					if source == "kline" {
+						var exs *orm.ExSymbol
+						if symbols == nil {
+							exs = orm.GetSymbolByID(sid)
+						} else {
+							exs = symbols.GetSymbolByID(sid)
+						}
+						if exs != nil {
+							pairTfs.Update(exs.Symbol, tf, 0)
+							envKeys[strings.Join([]string{exs.Symbol, tf}, "_")] = true
+							initBarEnvWithState(strategyState, state, exs, tf)
+						}
+					}
+				}
+			}
+		}
+		strategyState.accInfoJobs[acc] = newJobMap
+	}
 	return nil
 }
