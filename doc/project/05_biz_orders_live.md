@@ -22,7 +22,7 @@
 | `biz/runtime_logger.go` | Trader/RuntimeDeps/OrderMgr 的 logger 取值 |
 | `biz/runtime_state.go` | `TradingState`：按账户注册 OrderManager / LiveManager / Wallet |
 | `biz/live_runtime.go` | 批量平单 `CloseAccOrdersWithState`、致命亏损熔断 `MakeCheckFatalStopWithRuntime` |
-| `biz/determinism.go` | 回测确定性：**所有**回测（`config.OrderedBacktest()` / `RuntimeDeps.OrderedBacktest()`，与 `bt_strict` 无关）按稳定键（账户名/job key/开仓时间+ID）遍历 map；品种间同 bar 先后由 `data/provider.go` 回放堆的哈希序决定（`bt_bar_order_seed`，issue 112，BtFeatureLevel 6），本文件只负责单品种内部的稳定顺序；`bt_strict` 仅再控制重放覆盖与兼容钱包语义（`strictBacktestFor`） |
+| `biz/determinism.go` | 回测确定性：**所有**回测（`config.OrderedBacktest()` / `RuntimeDeps.OrderedBacktest()`，与 `bt_strict` 无关）按稳定键（账户名/job key/开仓时间+ID）遍历 map；品种间同 bar 先后由 `data/provider.go` 回放堆的哈希序决定（`bt_bar_order_seed`，issue 112，BtFeatureLevel 6），本文件只负责单品种内部的稳定顺序（`executionOpenOrders` 先抽取（开仓时间, ID）键再排序，避免比较器内重复取值）；`bt_strict` 仅再控制重放覆盖与兼容钱包语义（`strictBacktestFor`） |
 | `biz/data_server.go` | gRPC FeaFeeder 服务（默认 `:6789`，收发上限 100MB 硬编码） |
 | `biz/remote_command.go` | `RemoteCommandService`：校验、幂等、1 秒限频、审计；平仓与交易开关 |
 | `biz/job_orders.go` | `ProcessJobOrders`：策略异步回调发起下单（几乎无非测试调用方） |

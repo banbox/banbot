@@ -7,6 +7,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"sync/atomic"
 	"testing"
 
 	"github.com/banbox/banbot/factor"
@@ -162,9 +163,9 @@ func storageFixture(t *testing.T, c Config, page int) (HistoricalInputFactory, i
 	for _, s := range streams {
 		list = append(list, s)
 	}
-	calls := 0
+	var calls atomic.Int64
 	factory, err := NewStorageInputFactory(StorageInputOptions{Namespace: "fixture", PITPolicy: "static-approximation", FromMS: c.Chunks[0].From, ToMS: c.Chunks[0].To, PageRows: page, Streams: list, QueryPage: func(ctx context.Context, sub orm.Subscription, start, end int64, limit int) ([]*orm.DataSeries, error) {
-		calls++
+		calls.Add(1)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -182,7 +183,6 @@ func storageFixture(t *testing.T, c Config, page int) (HistoricalInputFactory, i
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = calls
 	return factory, len(records)
 }
 

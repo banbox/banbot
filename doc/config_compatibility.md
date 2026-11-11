@@ -63,7 +63,7 @@
 
 `accounts.<账户名>` 可直接添加 `mode/store/history/sender_lease_dir/live_provider/funding_policy/instruments/margin_rate/max_account_margin/max_virtual_gross/strategy_gross_limit`。根 `execution` 提供公共默认值，账户字段覆盖相应默认值；具体入口仍决定 mode 等设置是否适用，普通因子回测模式由根 `execution.mode` 选择。新执行参数与原账户凭据在内部区分，不会被解码为交易所 API 凭据。
 
-根 `data` 支持 `namespace/page_rows/prefetch_rows/page_bytes/archive/max_records/pit_policy`；database 仍提供连接设置。page_bytes 限制逻辑载荷而非 RSS，归档驱动不能套用存储订阅的分页覆盖。
+根 `data` 支持 `namespace/page_rows/prefetch_rows/prefetch_concurrency/page_bytes/archive/max_records/pit_policy`；database 仍提供连接设置。page_bytes 限制逻辑载荷而非 RSS，归档驱动不能套用存储订阅的分页覆盖。
 
 ## 4. 兼容边界
 

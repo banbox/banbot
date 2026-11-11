@@ -104,7 +104,7 @@ func resolvedFactorValues(spec *config.RunSpec, configs []runner.Config) ([]map[
 		set("currency", c.Manifest.Currency, "USD default", prefix+"manifest.currency", "stake_currency")
 		set("initial_nav", c.InitialNAV, "wallet capital times policy capital_weight; otherwise 10000", prefix+"capital_weight", prefix+"initial_nav", "wallet_amounts."+c.Manifest.Currency)
 		set("account_initial_nav", accountNAV, "unallocated account capital", "wallet_amounts."+c.Manifest.Currency)
-		set("max_records", c.MaxRecords, "100000 replay row default", "data.max_records", prefix+"max_records")
+		set("max_records", c.MaxRecords, "500000 replay row default", "data.max_records", prefix+"max_records")
 		set("max_pending", c.MaxPending, "64 pending evaluation default", prefix+"decision.max_pending", prefix+"max_pending")
 		set("decision_interval_ms", c.DecisionInterval, "1h decision default", prefix+"decision.interval_ms", prefix+"run_timeframes", "run_timeframes")
 		set("decision_delay_ms", c.DecisionDelayMS, "zero publication delay", prefix+"decision.delay_ms", prefix+"decision_delay_ms")

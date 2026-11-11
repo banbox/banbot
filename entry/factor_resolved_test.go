@@ -51,7 +51,7 @@ func TestResolvedFactorConfigurationReportsActualDefaultsAndOrigins(t *testing.T
 	if values["max_pending"].Value != float64(7) || values["max_pending"].Origin.Source != path || values["max_pending"].Origin.Kind != "file" {
 		t.Fatalf("overridden decision origin lost: %+v", values["max_pending"])
 	}
-	if values["max_records"].Value != float64(100000) || values["max_records"].Origin.Kind != "derived" || values["latency_ms"].Value != float64(1) {
+	if values["max_records"].Value != float64(defaultFactorMaxRecords) || values["max_records"].Origin.Kind != "derived" || values["latency_ms"].Value != float64(1) {
 		t.Fatalf("actual defaults missing: %s", raw)
 	}
 	if values["account_initial_nav"].Value != float64(10000) || values["data_namespace"].Value != "storage-fixture" {

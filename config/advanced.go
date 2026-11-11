@@ -16,7 +16,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 	var allowed string
 	switch {
 	case path == "data":
-		allowed = "namespace page_rows prefetch_rows page_bytes archive max_records pit_policy"
+		allowed = "namespace page_rows prefetch_rows prefetch_concurrency page_bytes archive max_records pit_policy"
 	case path == "execution":
 		allowed = strings.Join(accountExecutionKeys, " ") + " accounts"
 	case strings.HasPrefix(path, "execution.accounts."), strings.HasPrefix(path, "accounts.") && strings.Count(path, ".") == 1:
@@ -123,7 +123,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if _, err := ParseDurationOverride(value); err != nil {
 				return fmt.Errorf("%s: %w", field, err)
 			}
-		case "page_rows", "prefetch_rows", "max_records", "max_pending", "k", "interval_ms", "expiry_ms", "horizon", "schema_version", "max_age_ms":
+		case "page_rows", "prefetch_rows", "prefetch_concurrency", "max_records", "max_pending", "k", "interval_ms", "expiry_ms", "horizon", "schema_version", "max_age_ms":
 			if !nonnegativeInteger(value) || numeric(value) <= 0 {
 				return fmt.Errorf("%s must be a positive integer", field)
 			}

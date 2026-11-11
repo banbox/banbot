@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/banbox/banbot/config"
@@ -105,11 +106,14 @@ func TestMixedStorageReplayTradesTSAssetOutsideFactorUniverse(t *testing.T) {
 			}
 			anchor, end := snapshot.View().TimeRange.StartMS, snapshot.View().TimeRange.EndMS
 			queried := map[string]bool{}
+			var queriedMu sync.Mutex
 			query := func(ctx context.Context, sub orm.Subscription, start, stop int64, limit int) ([]*orm.DataSeries, error) {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
+				queriedMu.Lock()
 				queried[fmt.Sprintf("%d/%s/%s", sub.ExSymbol.ID, sub.Source, sub.TimeFrame)] = true
+				queriedMu.Unlock()
 				interval := int64(60000)
 				switch sub.TimeFrame {
 				case "1h":

@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"sync"
 
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/orm"
@@ -26,9 +27,14 @@ type StorageInputOptions struct {
 	Namespace, PITPolicy   string
 	FromMS, ToMS           int64
 	PageRows, PrefetchRows int
-	Streams                []StorageStream
-	QueryPage              func(context.Context, orm.Subscription, int64, int64, int) ([]*orm.DataSeries, error)
-	VersionPages           VersionPageFactory
+	// PrefetchConcurrency bounds simultaneous background page reads across every
+	// input opened from the factory (each holds one database connection). 0 selects
+	// DefaultPrefetchConcurrency.
+	PrefetchConcurrency int
+	Streams             []StorageStream
+	// QueryPage must tolerate concurrent calls for K-line streams (read-ahead).
+	QueryPage    func(context.Context, orm.Subscription, int64, int64, int) ([]*orm.DataSeries, error)
+	VersionPages VersionPageFactory
 }
 
 // VersionPageFactory is an explicit PIT-capable storage adapter. It must return
@@ -45,6 +51,9 @@ type VersionPageReader interface {
 type storageInputFactory struct {
 	options  StorageInputOptions
 	identity string
+	// psem is shared by all inputs of this factory so the bound holds per process
+	// even when several strategies replay in lockstep.
+	psem chan struct{}
 }
 
 func NewStorageInputFactory(options StorageInputOptions) (HistoricalInputFactory, error) {
@@ -100,7 +109,15 @@ func NewStorageInputFactory(options StorageInputOptions) (HistoricalInputFactory
 		return nil, err
 	}
 	digest := sha256.Sum256(raw)
-	return &storageInputFactory{options: options, identity: hex.EncodeToString(digest[:])}, nil
+	concurrency := options.PrefetchConcurrency
+	if concurrency == 0 {
+		concurrency = DefaultPrefetchConcurrency
+	}
+	if concurrency < 0 || concurrency > maxPrefetchConcurrency {
+		return nil, errors.New("runner: prefetch concurrency must be within 1..32")
+	}
+	options.PrefetchConcurrency = concurrency
+	return &storageInputFactory{options: options, identity: hex.EncodeToString(digest[:]), psem: make(chan struct{}, concurrency)}, nil
 }
 func (f *storageInputFactory) Identity() string { return f.identity }
 func (f *storageInputFactory) Ranges() []Chunk {
@@ -147,8 +164,28 @@ type storageCursor struct {
 	rows           []factor.VersionRecord
 	index          int
 	done           bool
+	// ahead holds the page after the current one while it is being read in the
+	// background (static-approximation path only). Its offset is fully determined
+	// by the page already received, so overlapping the read with replay changes
+	// latency only, never page contents or order.
+	ahead chan pageRead
 }
+
+type pageRead struct {
+	rows []*orm.DataSeries
+	err  error
+}
+
+// DefaultPrefetchConcurrency keeps the extra database connections one replay
+// process may hold at 4 (the synchronous path keeps its own single connection).
+const DefaultPrefetchConcurrency = 4
+
+const maxPrefetchConcurrency = 32
+
 type storageInput struct {
+	pctx              context.Context
+	pcancel           context.CancelFunc
+	pwg               sync.WaitGroup
 	factory           *storageInputFactory
 	config            Config
 	cursors           []*storageCursor
@@ -199,7 +236,15 @@ func (s *storageInput) fill(ctx context.Context, cursor *storageCursor) error {
 		if end < math.MaxInt64 {
 			end++
 		}
-		rows, err := options.QueryPage(ctx, cursor.stream.Subscription, cursor.offset, end, options.PageRows)
+		var rows []*orm.DataSeries
+		var err error
+		if cursor.ahead != nil {
+			read := <-cursor.ahead
+			cursor.ahead = nil
+			rows, err = read.rows, read.err
+		} else {
+			rows, err = options.QueryPage(ctx, cursor.stream.Subscription, cursor.offset, end, options.PageRows)
+		}
 		if err != nil {
 			return err
 		}
@@ -225,6 +270,7 @@ func (s *storageInput) fill(ctx context.Context, cursor *storageCursor) error {
 				cursor.done = true
 			} else {
 				cursor.offset = lastTime + 1
+				s.startAhead(ctx, cursor, end, len(rows))
 			}
 		}
 	}
@@ -251,6 +297,41 @@ func (s *storageInput) fill(ctx context.Context, cursor *storageCursor) error {
 		cursor.rows = append(cursor.rows, clone)
 	}
 	return s.checkBound()
+}
+
+// Memory bound: pages already read ahead wait unconsumed in their channel (at most
+// one per stream, <= PrefetchRows = PageRows x streams <= MaxRecords/2 rows) and are
+// not counted by checkBound, so resident rows stay <= 1.5 x MaxRecords.
+// startAhead reads the next page of a static cursor in the background. A page
+// shorter than the budget may still be followed by data (byte-limited reads),
+// so the successor is requested exactly as the synchronous path would.
+func (s *storageInput) startAhead(ctx context.Context, cursor *storageCursor, end int64, got int) {
+	// Only database-backed K-line pages are read ahead: that reader takes its own
+	// pooled connection per call. Other sources keep the single-goroutine contract.
+	if cursor.stream.Subscription.Source != orm.SeriesSourceKline || cursor.offset > s.factory.options.ToMS || got == 0 {
+		return
+	}
+	// pctx derives from the ctx of the first Next call; callers must pass the same
+	// run-scoped context to every Next (a short per-call ctx would cancel read-ahead).
+	if s.pctx == nil {
+		s.pctx, s.pcancel = context.WithCancel(ctx)
+	}
+	ch := make(chan pageRead, 1)
+	cursor.ahead = ch
+	sub, offset, limit, query, pctx, sem := cursor.stream.Subscription, cursor.offset, s.factory.options.PageRows, s.factory.options.QueryPage, s.pctx, s.factory.psem
+	s.pwg.Add(1)
+	go func() {
+		defer s.pwg.Done()
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		case <-pctx.Done():
+			ch <- pageRead{err: pctx.Err()}
+			return
+		}
+		rows, err := query(pctx, sub, offset, end, limit)
+		ch <- pageRead{rows: rows, err: err}
+	}()
 }
 func (s *storageInput) checkBound() error {
 	count := s.retained
@@ -373,6 +454,10 @@ func (s *storageInput) Close() error {
 		return nil
 	}
 	s.closed = true
+	if s.pcancel != nil {
+		s.pcancel()
+	}
+	s.pwg.Wait()
 	var err error
 	for _, cursor := range s.cursors {
 		if cursor.version != nil {

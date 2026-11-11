@@ -72,7 +72,7 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 		if policy.Engine != config.EngineFactor {
 			continue
 		}
-		c := runner.Config{Mode: mode, MaxRecords: 100000, MaxPending: 64, LatencyMS: 1, ExpiryMS: 60000, InitialNAV: 10000, Definition: policy.Name, Factor: research.DefaultMomentumVolConfig()}
+		c := runner.Config{Mode: mode, MaxRecords: defaultFactorMaxRecords, MaxPending: 64, LatencyMS: 1, ExpiryMS: 60000, InitialNAV: 10000, Definition: policy.Name, Factor: research.DefaultMomentumVolConfig()}
 		if c.Definition == "MomentumVol" {
 			c.Definition = "momentum-vol"
 		}
@@ -491,6 +491,12 @@ func inspectArchiveChunk(c *runner.Config, index int, sids map[int32]bool, schem
 	}
 	return nil
 }
+
+// defaultFactorMaxRecords bounds the rows a replay may retain; the storage input
+// derives its page budget from half of it (page = budget / streams), so a small
+// bound means thousands of tiny database pages per run. 500000 keeps replay
+// memory near 650 MB at ~20 symbols while cutting page reads ~5x.
+const defaultFactorMaxRecords = 500000
 
 type synchronizedWriter struct {
 	mu     sync.Mutex

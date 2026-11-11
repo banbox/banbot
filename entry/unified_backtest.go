@@ -1,6 +1,7 @@
 package entry
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -163,16 +164,21 @@ func unifiedFactorBacktestOutputContext(ctx context.Context, args *config.CmdArg
 	if err != nil {
 		return errs.New(core.ErrIOWriteFail, err)
 	}
+	// Only the file side is buffered; stdout (out) keeps per-event delivery because
+	// bansite derives progress and the run start time from the decision events.
+	// Every exit path (return, error, panic unwinding) reaches the deferred finish,
+	// whose Sync flushes the buffer before the file is closed.
+	events := newBufferedEventFile(file)
 	var results []runner.Result
 	defer func() {
-		resultErr = finishUnifiedFactorBacktest(path, file, closeStorage, results, resultErr)
+		resultErr = finishUnifiedFactorBacktest(path, events, closeStorage, results, resultErr)
 	}()
 	for i := range configs {
 		configs[i].ArtifactPath = filepath.Join(path, fmt.Sprintf("strategy-%d.json", i+1))
 	}
-	var writer io.Writer = file
+	var writer io.Writer = events
 	if out != nil {
-		writer = io.MultiWriter(file, out)
+		writer = io.MultiWriter(events, out)
 	}
 	if slices.Contains(spec.Engines(), config.EngineTimeSeries) {
 		results, err = runMixedFactorConfigs(ctx, spec, configs, writer)
@@ -190,9 +196,33 @@ func unifiedFactorBacktestOutputContext(ctx context.Context, args *config.CmdArg
 	return nil
 }
 
+// eventsFile is the events.jsonl handle finishUnifiedFactorBacktest syncs and closes.
+type eventsFile interface {
+	Sync() error
+	Close() error
+}
+
+// bufferedEventFile batches the many small JSON event lines into large file writes
+// (one write syscall per line dominated statarb runs). Bytes and order are
+// unchanged; Sync flushes first, so Sync+Close persists everything written.
+type bufferedEventFile struct {
+	*os.File
+	buffer *bufio.Writer
+}
+
+func newBufferedEventFile(file *os.File) *bufferedEventFile {
+	return &bufferedEventFile{File: file, buffer: bufio.NewWriterSize(file, 1<<20)}
+}
+
+func (f *bufferedEventFile) Write(p []byte) (int, error) { return f.buffer.Write(p) }
+
+func (f *bufferedEventFile) Sync() error {
+	return errors.Join(f.buffer.Flush(), f.File.Sync())
+}
+
 // Completion includes closing the output and storage runtime. Publish the
 // aggregate status only after both have joined, preserving every failure.
-func finishUnifiedFactorBacktest(path string, file *os.File, cleanup func() error, results []runner.Result, resultErr *errs.Error) *errs.Error {
+func finishUnifiedFactorBacktest(path string, file eventsFile, cleanup func() error, results []runner.Result, resultErr *errs.Error) *errs.Error {
 	joinError := func(cause error, code int) {
 		if cause != nil {
 			var primary error

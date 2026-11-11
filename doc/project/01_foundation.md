@@ -234,7 +234,7 @@
 - 时间与 K 线：`timeframes`、`run_timeframes`、`kline_source`、`concur_num`、`odbook_ttl`、`ntp_lang_code`、`show_lang_code`。
 - 服务：`database`（url、auto_create、db_type、sid_registry_url、max_pool_size、qdb_mem_pct、qdb_max_mem_mb）、`api_server`（bind_ip、port、jwt_secret_key、users、CORS_origins）、`spider_addr`（默认 127.0.0.1:6789）、`mail`、`webhook`、`rpc_channels`、`bt_in_live`、`llm_models`、`strat_perf`。
 - 策略：`run_policy[]`（见 `RunPolicyConfig`）。v2 额外支持 `engine`（time_series/factor）、`id`、`account`、`capital_weight`、`factor{...}`（展开为扁平键）。
-- 高级覆盖：`data`（namespace、page_rows、prefetch_rows、page_bytes、archive、max_records、pit_policy）、`execution`（mode、store、history、sender_lease_dir、hub_socket、live_provider、funding_policy、order_mode、paper_fill_model、instruments、margin_rate…）、`accounts.<name>.<exec key>`。白名单见 `config/advanced.go` 的 `validateAdvanced`。
+- 高级覆盖：`data`（namespace、page_rows、prefetch_rows、prefetch_concurrency、page_bytes、archive、max_records、pit_policy）、`execution`（mode、store、history、sender_lease_dir、hub_socket、live_provider、funding_policy、order_mode、paper_fill_model、instruments、margin_rate…）、`accounts.<name>.<exec key>`。白名单见 `config/advanced.go` 的 `validateAdvanced`。
 
 ### 外部依赖
 

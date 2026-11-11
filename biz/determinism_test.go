@@ -199,3 +199,55 @@ func TestDataOnlySeriesUsesStableAccountAndJobOrderWhenDeterministic(t *testing.
 		t.Fatalf("data-only callbacks = %v", got)
 	}
 }
+
+// executionOpenOrders must equal a naive (enter-time, id) sort after any mutation of the
+// open-order map (add, delete, replace, re-time, re-id).
+func TestExecutionOpenOrdersMatchesNaiveSort(t *testing.T) {
+	enableStrictBacktest(t)
+	fresh := func(m map[int64]*ormo.InOutOrder) []int64 {
+		list := make([]*ormo.InOutOrder, 0, len(m))
+		for _, od := range m {
+			list = append(list, od)
+		}
+		slices.SortFunc(list, func(a, b *ormo.InOutOrder) int {
+			if a.RealEnterMS() != b.RealEnterMS() {
+				return int(a.RealEnterMS() - b.RealEnterMS())
+			}
+			return int(a.ID - b.ID)
+		})
+		return orderIDs(list)
+	}
+	open := map[int64]*ormo.InOutOrder{}
+	var next int64 = 1
+	seed := uint64(12345)
+	rnd := func(n int) int {
+		seed = seed*6364136223846793005 + 1442695040888963407
+		return int((seed >> 33) % uint64(n))
+	}
+	for step := 0; step < 4000; step++ {
+		switch rnd(5) {
+		case 0:
+			open[next] = &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: next, EnterAt: int64(rnd(50))}}
+			next++
+		case 1:
+			for id := range open {
+				delete(open, id)
+				break
+			}
+		case 2:
+			for _, od := range open {
+				od.EnterAt = int64(rnd(50))
+				break
+			}
+		case 3:
+			for id, od := range open {
+				nu := &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: od.ID, EnterAt: od.EnterAt}}
+				open[id] = nu
+				break
+			}
+		}
+		if got, want := orderIDs(executionOpenOrders(open)), fresh(open); !slices.Equal(got, want) {
+			t.Fatalf("step %d: cached %v != fresh %v", step, got, want)
+		}
+	}
+}

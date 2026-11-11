@@ -385,6 +385,12 @@ func (a *factorStorageAssembly) install(ctx context.Context, configs []runner.Co
 			return nil, err
 		}
 	}
+	prefetchConcurrency := 0
+	if value, ok := u.Data["prefetch_concurrency"]; ok {
+		if err := decodeFactorFields(map[string]any{"PrefetchConcurrency": value}, &struct{ PrefetchConcurrency *int }{&prefetchConcurrency}); err != nil {
+			return nil, err
+		}
+	}
 	plan, err := a.runtime.Catalog.CompileSubscriptionPlan(ctx, requests, data.SubscriptionPlanOptions{Namespace: namespace, AnchorMS: timeRange.StartMS, EndMS: timeRange.EndMS, PageRows: page, PrefetchRows: prefetch, PageBytes: pageBytes})
 	if err != nil {
 		return nil, err
@@ -429,7 +435,7 @@ func (a *factorStorageAssembly) install(ctx context.Context, configs []runner.Co
 		}
 		return rows, nil
 	}
-	factory, err := runner.NewStorageInputFactory(runner.StorageInputOptions{Namespace: namespace, PITPolicy: "static-approximation", FromMS: timeRange.StartMS, ToMS: timeRange.EndMS, PageRows: options.PageRows, PrefetchRows: options.PrefetchRows, Streams: streams, QueryPage: queryPage})
+	factory, err := runner.NewStorageInputFactory(runner.StorageInputOptions{Namespace: namespace, PITPolicy: "static-approximation", FromMS: timeRange.StartMS, ToMS: timeRange.EndMS, PageRows: options.PageRows, PrefetchRows: options.PrefetchRows, PrefetchConcurrency: prefetchConcurrency, Streams: streams, QueryPage: queryPage})
 	if err != nil {
 		return nil, err
 	}

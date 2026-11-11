@@ -28,7 +28,7 @@
 | `dag.go` | `NodeSpec`/`Node`/`Builder`；`Compile` 生成 `Plan`（循环检测、拓扑排序、公共子表达式去重、warmup/retention 推导、`Inputs()`） |
 | `session.go` | 有状态增量计算 `Session`（`NewSession`、`Warmup`、`Evaluate`、`fork`/`commit`）；`Frame` |
 | `batch.go` | `Plan.Batch` 整段历史计算；静态 universe 走 `banta/tav`，动态 universe 退化为 `Session` |
-| `value.go` | `Numeric`（值 + `Validity`）、`Number()`、`contentHash`（按位哈希，`-0` 与 `+0` 不同） |
+| `value.go` | `Numeric`（值 + `Validity`）、`Number()`、`contentHash`（按位哈希，`-0` 与 `+0` 不同；`map[string]any` 标量行走无 fmt 的快速编码，输出字节与反射路径一致）、`cloneValues`（标量行直接拷贝 map，其余走反射深拷贝） |
 | `operators.go` | 截面算子：rank、zscore、robust-zscore、winsorize、quantile、group 系列、residual |
 | `indicators.go` / `indicators_runtime.go` | 技术指标声明、参数校验、lookback；增量与批量实现（含 RSI 的 Wilder 状态） |
 | `snapshot.go` | `Universe`、`SnapshotSpec`、`Freeze` 冻结输入（PIT 视图）、`Requirement`/`StreamKey`/`SnapshotStatus` |
@@ -89,7 +89,7 @@
 | `computation.go` | 共享计算：`ComputationGroup`、`sharedComputation`、`computationKey`、`RunMany`（多消费者 lockstep） |
 | `decision.go` | `compileDecision`、`decisionEngine`（`evaluate`→`combine`→`buildPortfolio`） |
 | `input.go` | 归档输入 `archiveInput`（`OpenVersionStore` 全量加载后分批）与 `replayInput` |
-| `storage_input.go` | 分页存储输入：strict（需 `VersionPageFactory`）与 static-approximation（`QueryPage`）两种可见性策略 |
+| `storage_input.go` | 分页存储输入：strict（需 `VersionPageFactory`）与 static-approximation（`QueryPage`）两种可见性策略；static 路径对 K 线流在后台预读下一页（页内容与顺序不变，`QueryPage` 对 K 线流须可并发调用）。后台并发由 `data.prefetch_concurrency`（缺省 4，范围 1..32，不进入输入身份）限制，且在同一 factory 的所有输入间共享：**每个回测进程额外占用的 Postgres 连接 ≤ `prefetch_concurrency`（缺省 4），另加每个正在回放的输入同步读取的 1 个**。已预读但未消费的页（每流至多一页，≤ `prefetch_rows` = 页大小×流数 ≤ `max_records/2` 行）不计入保留预算，常驻行数上界为 1.5×`max_records`；`pctx` 派生自首次 `Next` 的 ctx，调用方须全程传同一个运行级 ctx。页大小 = `prefetch_rows / 流数`，`prefetch_rows` 缺省取 `max_records / 2`，`max_records` 缺省 500000（`entry/factor_config.go:defaultFactorMaxRecords`；它进入输入身份哈希，因此改默认值会改变 ManifestID，不影响指标与事件） |
 | `account_sink.go` | `AccountSink`：`RegisterExecution`、`ObserveQuote`、`StrategyState`（NAV）、`ProcessSnapshot`、资金费观测 |
 | `account_policy_sink.go` | `PolicyEvidence` 重建持仓、`RestorePolicy`、`AcceptProposal`（checkpoint 提交）、`CancelIncreasingPending` |
 | `account_application.go` | `AccountQueries`/`AccountCommands`/`AccountApplication` 接口与校验 |

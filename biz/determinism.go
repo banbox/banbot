@@ -98,16 +98,40 @@ func executionJobEnvs(jobs map[string]*strat.JobEnv, deps ...*RuntimeDeps) iter.
 	}
 }
 
+// executionOpenOrders returns the open orders; backtests get them ordered by
+// (real enter time, id). Sort keys are extracted once per order instead of being
+// recomputed by a comparator call per comparison, which dominated order-heavy
+// backtests (every bar event sorts every open order of the account).
 func executionOpenOrders(orders map[int64]*ormo.InOutOrder, deps ...*RuntimeDeps) []*ormo.InOutOrder {
-	result := utils.ValsOfMap(orders)
 	// Maps have no supplied order to preserve, including during frozen replays.
-	if orderedBacktestFor(deps...) {
-		slices.SortFunc(result, func(a, b *ormo.InOutOrder) int {
-			if order := cmp.Compare(a.RealEnterMS(), b.RealEnterMS()); order != 0 {
-				return order
+	if !orderedBacktestFor(deps...) || len(orders) < 2 {
+		return utils.ValsOfMap(orders)
+	}
+	type keyed struct {
+		ms, id int64
+		od     *ormo.InOutOrder
+	}
+	items := make([]keyed, 0, len(orders))
+	for _, od := range orders {
+		items = append(items, keyed{od.RealEnterMS(), od.ID, od})
+	}
+	slices.SortFunc(items, func(a, b keyed) int {
+		if a.ms != b.ms {
+			if a.ms < b.ms {
+				return -1
 			}
-			return cmp.Compare(a.ID, b.ID)
-		})
+			return 1
+		}
+		if a.id < b.id {
+			return -1
+		} else if a.id > b.id {
+			return 1
+		}
+		return 0
+	})
+	result := make([]*ormo.InOutOrder, len(items))
+	for i := range items {
+		result[i] = items[i].od
 	}
 	return result
 }

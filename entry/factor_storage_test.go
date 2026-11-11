@@ -6,6 +6,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/banbox/banbot/config"
@@ -147,10 +148,13 @@ func TestStorageEntryAssemblyPagesTypedRowsAndExtendsActualTSNeeds(t *testing.T)
 		t.Fatal(err)
 	}
 	anchor, end := snapshot.View().TimeRange.StartMS, snapshot.View().TimeRange.EndMS
-	calls, maxLimit := 0, 0
+	var calls, maxLimit int
+	var callsMu sync.Mutex // read-ahead may call the page reader concurrently
 	query := func(ctx context.Context, sub orm.Subscription, start, stop int64, limit int) ([]*orm.DataSeries, error) {
+		callsMu.Lock()
 		calls++
 		maxLimit = max(maxLimit, limit)
+		callsMu.Unlock()
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}

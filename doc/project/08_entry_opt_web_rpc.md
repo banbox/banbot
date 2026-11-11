@@ -141,7 +141,7 @@
 
 ### 4.2 时序/因子统一回测 `backtest`
 1. `strategy_commands.go:15` `newStrategyBacktestCommand`：`config.LoadRunSpec` 后判断 `spec.Engines()`。
-2. 含 `factor` 引擎：`unifiedFactorBacktestOutputContext`（`unified_backtest.go:86`）→ `validatedFactorBacktestConfigs`（:51）→ `prepareFactorStorageInputs`（`factor_storage.go:146`）→ 写 `config.yml`、`resolved.json`、`events.jsonl`（`O_EXCL`）→ 混合走 `runMixedFactorConfigs`，纯因子走 `runFactorConfigs` → `finishUnifiedFactorBacktest`（:195）写 `run.json`，状态为 `complete` 或 `incomplete`。
+2. 含 `factor` 引擎：`unifiedFactorBacktestOutputContext`（`unified_backtest.go:86`）→ `validatedFactorBacktestConfigs`（:51）→ `prepareFactorStorageInputs`（`factor_storage.go:146`）→ 写 `config.yml`、`resolved.json`、`events.jsonl`（`O_EXCL`）→ 混合走 `runMixedFactorConfigs`，纯因子走 `runFactorConfigs`（events.jsonl 一侧经 `bufferedEventFile` 1MiB 缓冲，stdout 一侧仍逐事件即时写出——bansite 依赖 stdout 的 decision 事件取进度与起算时间；缓冲在 `finishUnifiedFactorBacktest` 的 `Sync` 中先 flush 再关文件，覆盖正常/错误/panic 展开路径，字节与顺序不变） → `finishUnifiedFactorBacktest`（:195）写 `run.json`，状态为 `complete` 或 `incomplete`。
 3. 纯时序：`runExplicitBackTestSpecContext`（`runtime_entry.go:392`）→ 若 `args.Separate` 则按 policy 逐个运行 → `runExplicitBackTestOnce`（:480）→ `session.newRuntime(RunModeBackTest)` → `opt.NewBackTestWithRuntimeDeps`（`backtest.go:456`）→ `BackTest.RunContext`（`backtest.go:831`）。
 
 ### 4.3 实盘 `trade`
