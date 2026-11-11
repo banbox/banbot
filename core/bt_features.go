@@ -26,4 +26,13 @@ package core
 //	7  bt_no_kline_download without bt_strict (issue 134): nothing is downloaded and orm.FastBulkOHLCV (static-pair volume
 //	   filter, pair/timeframe scoring) reads the library; bt_strict still needs historical_coverage; symbols of unknown
 //	   listing time are read as stored with a WARN instead of failing the run (v0.7.90-trend.14)
-const BtFeatureLevel = 7
+//	8  factor PIT repair: the PIT universe reduction works for the production static pool (Reference == Investable ==
+//	   Tradable == Evaluation == Tracked; only Reference-only instruments are never dropped), also per pair in statarb;
+//	   under the lifecycle policy an instrument that delists / has a hole while held is closed at its last mark and
+//	   forgotten by the policy checkpoint, decisions go on (before: every later decision was voided and the position
+//	   kept); the pit_min_universe_ratio gate uses a rolling denominator (survivors of the last accepted decision), so
+//	   gradual delistings below half of the nominal pool keep being decided; static pairs missing from the current
+//	   market table resolve from the catalog only in factor Weights storage replay and only when stored kline ranges
+//	   overlap the backtest window; factor strategy keys pit_min_universe_ratio / pit_delist_penalty_bps; Result.Pairs (pair-level statistics),
+//	   Result.Attribution (long/short attribution) and the panel output switch
+const BtFeatureLevel = 8

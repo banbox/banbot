@@ -88,6 +88,12 @@ banbot trade --dry-run --config runtime.yml
 `static-approximation`；strict PIT 需要不可变 archive 或具有证据的版本页提供者。
 回测资金费可以显式声明零费简化；真实永续资金费不能由此推断为零。
 
+Weights 回测的时点宇宙（PIT）按配对判定：某腿在决策网格缺数据（退市、未上市、缺口）时，含该腿的配对平仓并暂停，其余配对继续交易，两腿恢复后可重新开仓；五池相同的静态池同样适用。所有配对同期暂停的周期计入 `Result.PausedPeriods`，不计 `Incomplete`。被平仓腿的退市惩罚由策略条目的 `pit_delist_penalty_bps` 配置（0=默认 100bp，<0 关）。交易所当前市场表已不再列出的永续，在因子存储回放的 Weights 模式下可写入静态 `pairs`：按库内记录解析，条件是库内 K 线范围与回测窗口相交（见 factor_portfolio_guide）；其他模式不支持。
+
+## 每对独立结果与归因
+
+`RegisterPairs` 策略的 Weights 回测在 `Result.Pairs` 给出每对的 `Episodes`（`StartMS/EndMS/Dir/EntryZ/ExitZ/Beta/Bars/Reason/PnL`；`Reason` 为 `exit`、`stop`、`maxhold`、`leg_missing`、`end`，总量上限 400 条在各对间均分（每对至少 10 条），真实数量见 `EpisodeCount`）以及 `PnL`、`Trades`、`Wins`、`WinRate`、`InMarketBars`、`Bars`、`PausedBars`、`AvgHoldBars`、`LastBeta`、`Turnover`。逐对 `PnL`（占初始 NAV 的比例）按该对自身的目标权重（叠加进净权重之前的两项）乘以两腿在相邻决策之间的收益逐期累加，是对账本成交的近似：账本按延迟后的价格成交、含成本、权重在决策之间随价格漂移，且共享品种的各对在账本中按净权重成交。成本不分摊到各对，`Turnover`（`|Δw|` 累计）是成本的代理。对账用 `Result.PairsGrossPnL`（各对之和）、`PairsNAVReturn`（NAV 变化占初始 NAV）与 `PairsResidual`（二者之差，约等于成本加执行近似）。`Result.Attribution` 额外给出多/空腿盈亏、平均敞口、成本合计与 `TopSymbols`，用于识别单一品种贡献过大。
+
 ## 时钟与状态的归属
 
 周期决策与不规则 source-event 决策共用 runner，区别只在真实观察如何触发决策。

@@ -103,7 +103,8 @@ func (b *BandTrader) Position() int
 - **窗口**=最近 N 个**可用观测**，非日历 bar；某腿无效的 bar 不进窗口，覆盖时间会拉长。
 - **Full/Patch**：目标为 NAV 比例；Full 下未入目标的 SID 视为 0。平仓对被从目标删除，故**不得设 `portfolio.mode: patch`**（Patch 只改目标内 SID，未列出的仓位永不平仓）；缺省 full。
 - **nil 目标 vs 空目标**：nil（f）= 本轮无新目标；引擎不替换待执行目标，Weights 账本数量不变（沿用此前持仓），`Result.Skipped++`，评估权重不更新；已提交未成交目标仍按窗口执行或过期。非 nil 空 map（所有对平仓）= Full 下全部清零，无需报价即可执行。预热期（窗口未满）为 nil，就绪后无仓位即为空目标。
-- 单腿整根 kline 缺失时该轮无决策回调（`pair-input-missing` 对应值无效/价格<=0）。
+- 单腿整根 kline 缺失时：Weights 回测由按对 PIT 处理（见下条，该腿被剔、该对平仓并暂停）；无 PIT 的路径（Events/Trade、`pit_min_universe_ratio` 之外的拒绝场景）该轮无决策回调（`pair-input-missing` 对应值无效/价格<=0）。
+- Weights 回测的 PIT 按配对判定：某腿在决策网格缺数据（退市、未上市、缺口）时，该腿被剔出宇宙，含该腿的配对平仓并暂停（诊断 `pair-closed-missing-leg`），其余配对继续交易；两腿恢复后可重新开仓。五池相同的静态池同样适用；所有配对同期暂停的周期计入 `Result.PausedPeriods`，不计 `Incomplete`。`pit_delist_penalty_bps` 为被平仓腿的退市惩罚（0=默认 100，<0 关）。
 
 ### 2.5 YAML
 
@@ -121,7 +122,7 @@ run_policy:
 
 - `params` 键即 build 读取键；未知键仅在 build 调用 `Unused()` 时报错；改任一参数即新策略身份（manifest hash）。
 - 加载器把 `params.window` 写入 `Factor.Window`、`params.k` 写入 `portfolio.K`（配对不用）；配对窗口由 `PairsSpec.Window` 决定，宜与 `window` 一致。`swapPerBars`/`holdBars` 在因子策略中被加载器拒绝（`maxHold` 可用）。
-- `research` 命令对配对只输出 `logp` 面板与标签诊断；绩效来自 `backtest --mode weights|events`。
+- `research` 命令对配对只输出 `logp` 面板与标签诊断；绩效来自 `backtest --mode weights|events`。Weights 回测的 `Result.Pairs` 给出每对独立结果（Episodes：入/出场时间、Dir、EntryZ/ExitZ、冻结 Beta、Bars、Reason=exit|stop|maxhold|leg_missing|end、PnL；汇总 PnL、Trades、WinRate、InMarketBars、PausedBars、AvgHoldBars、LastBeta、Turnover，Episode 总量上限 400 条在各对间均分（每对至少 10 条），超出看 EpisodeCount）。逐对 PnL 为按各对自身目标权重和决策时刻价格的近似归因（不含成本，成本以 Turnover 为代理）；对账看 `PairsGrossPnL`、`PairsNAVReturn`、`PairsResidual`（残差≈成本+执行近似）。`Result.Attribution` 另给多/空腿盈亏、敞口、成本与 `TopSymbols`（单一品种贡献占比）。
 
 ### 2.6 价格流、成交时点与成本（Weights）
 

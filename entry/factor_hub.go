@@ -192,7 +192,7 @@ func (s *explicitEntrySession) runFactorHubAccount(ctx context.Context, snapshot
 		sink.Clock = rt.Clock.TimeMS
 		configs[i].ComputationGroup = group
 		configs[i].ComputationContext = runner.ComputationContext{DataNamespace: rt.ID, ClockDomain: rt.ID, SamplingIdentity: "live-publication-v1"}
-		engine, err := runner.NewLive(configs[i], sink, rt.Clock.TimeMS, &runner.JSONOutput{Writer: out, SIDs: c.Snapshot.Universe.Evaluation})
+		engine, err := runner.NewLive(configs[i], sink, rt.Clock.TimeMS, &runner.JSONOutput{Writer: out, SIDs: c.Snapshot.Universe.Evaluation, NoPanel: c.Panel == "none"})
 		if err != nil {
 			return err
 		}

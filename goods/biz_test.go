@@ -11,6 +11,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 )
 
 func TestFilterRegistrySupportsConcurrentRegistrationAndLookup(t *testing.T) {
@@ -385,5 +386,46 @@ func TestLegacyRefreshPairListNoPanicWithoutProducer(t *testing.T) {
 	pairProducer = nil
 	if _, err := RefreshPairList(0); err == nil {
 		t.Fatal("expected error when pairProducer is nil")
+	}
+}
+
+type retiredPairsExchange struct {
+	banexg.BanExchange
+	listed map[string]bool
+}
+
+func (e *retiredPairsExchange) Info() *banexg.ExgInfo {
+	return &banexg.ExgInfo{ID: "binance", MarketType: "linear"}
+}
+
+func (e *retiredPairsExchange) GetMarket(symbol string) (*banexg.Market, *errs.Error) {
+	if e.listed[symbol] {
+		return &banexg.Market{Symbol: symbol}, nil
+	}
+	return nil, errs.NewMsg(core.ErrInvalidSymbol, "no market")
+}
+
+// Only factor Weights backtests (AllowRetiredPairs) re-admit static pairs the exchange no longer lists, and only
+// when the catalog has them; a listed symbol dropped by the cost filter and unknown symbols stay dropped.
+func TestKeepRetiredStaticPairsGating(t *testing.T) {
+	state := orm.NewSymbolState()
+	if err := state.SetExSymbols([]*orm.ExSymbol{
+		{ID: 1, Exchange: "binance", Market: "linear", Symbol: "BTC/USDT:USDT"},
+		{ID: 3, Exchange: "binance", Market: "linear", Symbol: "ETH/USDT:USDT"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	vols := []*SymbolVol{{Symbol: "BTC/USDT:USDT"}, {Symbol: "MATIC/USDT:USDT"}, {Symbol: "ETH/USDT:USDT"}}
+	exchange := &retiredPairsExchange{listed: map[string]bool{"BTC/USDT:USDT": true, "ETH/USDT:USDT": true}}
+	cfg := &config.Config{TimeRange: &config.TimeTuple{StartMS: 1000, EndMS: 9000}}
+	kept := []string{"BTC/USDT:USDT"}
+	for name, deps := range map[string]*RuntimeDeps{
+		"flag off (time series / Events / Trade / mixed)": {Symbols: state, Exchange: exchange, Config: cfg},
+		"no config": {AllowRetiredPairs: true, Symbols: state, Exchange: exchange},
+		"unknown to catalog (listed ETH is cost-filtered, MATIC unknown)": {AllowRetiredPairs: true, Symbols: state, Exchange: exchange, Config: cfg},
+	} {
+		if got := keepRetiredStaticPairs(deps, vols, kept); !slices.Equal(got, kept) {
+			t.Fatalf("%s: pairs = %v, want %v", name, got, kept)
+		}
 	}
 }

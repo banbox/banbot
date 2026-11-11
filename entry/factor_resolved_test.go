@@ -105,3 +105,45 @@ func TestResolvedYAMLOverridesCommonDefaultsWithoutInventingOrigins(t *testing.T
 		t.Fatalf("omitted YAML field fabricated explicit origin: %+v", values["max_pending"])
 	}
 }
+
+func TestPITKeysFromYAMLReachRunnerConfig(t *testing.T) {
+	dir, fixture := factorYAMLFixture(t)
+	raw, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		extra      string
+		ratio, bps float64
+		wantErr    bool
+	}{
+		{"", 0, 0, false},
+		{"      pit_min_universe_ratio: 0.8\n      pit_delist_penalty_bps: 250\n", 0.8, 250, false},
+		{"      pit_min_universe_ratio: -1\n      pit_delist_penalty_bps: -1\n", -1, -1, false},
+		{"      pit_min_universe_ratio: 1.5\n", 0, 0, true},
+		{"      pit_delist_penalty_bps: abc\n", 0, 0, true},
+	} {
+		overlay := filepath.Join(dir, "pit.yml")
+		body := strings.Replace(string(raw), "      archive: data.gob\n", "      archive: data.gob\n"+tc.extra, 1)
+		if err := os.WriteFile(overlay, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		spec, err := loadFactorYAMLSpec([]string{overlay})
+		var configs []runner.Config
+		if err == nil {
+			configs, err = buildFactorConfigs(spec, runner.Weights)
+		}
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("%q must be rejected", tc.extra)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%q: %v", tc.extra, err)
+		}
+		if configs[0].PITMinUniverseRatio != tc.ratio || configs[0].PITDelistPenaltyBps != tc.bps {
+			t.Fatalf("%q: ratio=%v bps=%v", tc.extra, configs[0].PITMinUniverseRatio, configs[0].PITDelistPenaltyBps)
+		}
+	}
+}

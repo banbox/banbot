@@ -179,6 +179,19 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 					if err := decodeFactorFields(map[string]any{"LabelWaitMS": value}, &c); err != nil {
 						return nil, err
 					}
+				case "panel":
+					mode, isString := value.(string)
+					if !isString {
+						return nil, fmt.Errorf("factor research.panel must be the string all or none, got %v", value)
+					}
+					switch strings.ToLower(strings.TrimSpace(mode)) {
+					case "", "all":
+						c.Panel = ""
+					case "none":
+						c.Panel = "none"
+					default:
+						return nil, fmt.Errorf("factor research.panel must be all or none, got %v", value)
+					}
 				default:
 					return nil, fmt.Errorf("unknown factor research key %s", key)
 				}
@@ -554,7 +567,7 @@ func runFactorConfigs(ctx context.Context, configs []runner.Config, factory Fact
 				}
 			}
 		}
-		outputs[i] = &runner.JSONOutput{Writer: writer, SIDs: c.Snapshot.Universe.Evaluation}
+		outputs[i] = &runner.JSONOutput{Writer: writer, SIDs: c.Snapshot.Universe.Evaluation, NoPanel: c.Panel == "none"}
 	}
 	for index := range configs {
 		if configs[index].ComputationContext.DataNamespace == "" {

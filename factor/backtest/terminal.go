@@ -31,6 +31,9 @@ func (b *Book) ApplyTerminalSettlement(e TerminalSettlement, now int64) (bool, e
 	if b.terminals == nil {
 		b.terminals = map[int32]TerminalSettlement{}
 	}
+	if m, ok := b.marks[e.SID]; ok {
+		b.attr.move(e.SID, b.quantities[e.SID], m.Price, value)
+	}
 	b.cash += amount
 	delete(b.quantities, e.SID)
 	delete(b.firstFill, e.SID)

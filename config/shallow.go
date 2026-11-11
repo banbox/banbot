@@ -12,7 +12,7 @@ func hasPolicyEngine(fields map[string]any) bool {
 }
 
 var accountExecutionKeys = strings.Fields("mode store history sender_lease_dir hub_socket live_provider funding_policy protection_mode order_mode near_limit_bps paper_fill_model instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit")
-var factorPolicyKeys = strings.Fields("archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records definition expressions option_expiry_source terminal_settlement_source")
+var factorPolicyKeys = strings.Fields("archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records definition expressions option_expiry_source terminal_settlement_source pit_min_universe_ratio pit_delist_penalty_bps")
 
 func factorFields(fields map[string]any) map[string]any {
 	if fields["engine"] != EngineFactor {

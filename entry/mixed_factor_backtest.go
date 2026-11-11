@@ -467,7 +467,7 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 	outputs := make([]runner.Output, len(configs))
 	writer = &synchronizedWriter{writer: writer}
 	for i := range configs {
-		outputs[i] = &runner.JSONOutput{Writer: writer, SIDs: configs[i].Snapshot.Universe.Evaluation}
+		outputs[i] = &runner.JSONOutput{Writer: writer, SIDs: configs[i].Snapshot.Universe.Evaluation, NoPanel: configs[i].Panel == "none"}
 		if configs[i].ComputationContext.DataNamespace == "" {
 			configs[i].ComputationContext.DataNamespace = "mixed-replay"
 		}

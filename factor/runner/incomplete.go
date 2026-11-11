@@ -47,11 +47,20 @@ func recordIncompleteStreams(result *Result, indexes map[factor.StreamKey]int, s
 }
 
 // pitReduceUniverse (067) derives the point-in-time universe of one decision grid: Investable instruments with a
-// missing or invalid required stream are dropped (data ended / not yet listed / hole). Reference instruments are
-// never dropped (the plan may depend on them), and the reduction is refused (ok=false -> the old "skip the whole
-// decision" behaviour) when anything else is missing or fewer than max(2, minRatio x Investable) instruments
-// remain. The reduced universe carries a derived Version so sessions never see one version with two contents.
-func pitReduceUniverse(u factor.Universe, status factor.SnapshotStatus, minRatio float64) (factor.Universe, []int32, bool) {
+// missing or invalid required stream are dropped (data ended / not yet listed / hole) from every pool, Reference
+// included (the production static pool has Reference == Investable). Reference-only instruments (Reference \
+// Investable: the plan may depend on them) are never dropped, and the reduction is refused (ok=false -> the old
+// "skip the whole decision" behaviour) when any instrument outside Investable is missing or fewer than
+// minRatio x alive instruments remain, where alive is the Investable survivor count of the last accepted
+// decision (rolling denominator, the nominal count before the first one): gradual delistings keep being accepted,
+// a mass loss within one round is refused. A reduction that passes the gate but leaves fewer than 2 instruments is
+// accepted too when the nominal pool has at least 3 (a 2-name pool keeps the refusal); the runner then closes the dropped positions and pauses the period instead of deciding on a
+// degenerate cross-section. The reduced universe carries a derived Version so sessions never see one
+// version with two contents.
+func pitReduceUniverse(u factor.Universe, status factor.SnapshotStatus, minRatio float64, alive int) (factor.Universe, []int32, bool) {
+	if alive <= 0 || alive > len(u.Investable) {
+		alive = len(u.Investable)
+	}
 	if minRatio == 0 {
 		minRatio = 0.5
 	}
@@ -65,9 +74,6 @@ func pitReduceUniverse(u factor.Universe, status factor.SnapshotStatus, minRatio
 	invest := make(map[int32]bool, len(u.Investable))
 	for _, sid := range u.Investable {
 		invest[sid] = true
-	}
-	for _, sid := range u.Reference {
-		delete(invest, sid)
 	}
 	bad := map[int32]bool{}
 	for _, key := range status.Expected {
@@ -99,7 +105,7 @@ func pitReduceUniverse(u factor.Universe, status factor.SnapshotStatus, minRatio
 	reduced := u
 	reduced.Investable, reduced.Reference = keep(u.Investable), keep(u.Reference)
 	reduced.Tradable, reduced.Evaluation = keep(u.Tradable), keep(u.Evaluation)
-	if len(reduced.Investable) < 2 || float64(len(reduced.Investable)) < minRatio*float64(len(u.Investable)) {
+	if float64(len(reduced.Investable)) < minRatio*float64(alive) || len(reduced.Investable) < 2 && len(u.Investable) < 3 {
 		return u, nil, false
 	}
 	sum := sha256.Sum256([]byte(fmt.Sprint(dropped)))
@@ -113,7 +119,8 @@ const defaultPITDelistPenaltyBps = 100
 // instruments without input at the grid are dropped whatever remains (no "universe too small" fallback) and the
 // builder closes and pauses every pair that lost a leg. allPaused reports that no pair has both legs left. The
 // reduced Investable may be empty (both legs of every pair gone): the caller then closes the book and skips the
-// period as paused. Reference instruments missing -> refuse (ok=false), as in the weights mode.
+// period as paused. Missing instruments outside Investable (Reference-only) -> refuse (ok=false), as in the weights
+// mode.
 func pitReducePairs(u factor.Universe, status factor.SnapshotStatus, pairs [][2]int32) (factor.Universe, []int32, bool, bool) {
 	ok := make(map[factor.StreamKey]bool, len(status.Arrived))
 	for _, key := range status.Arrived {
@@ -125,9 +132,6 @@ func pitReducePairs(u factor.Universe, status factor.SnapshotStatus, pairs [][2]
 	invest := make(map[int32]bool, len(u.Investable))
 	for _, sid := range u.Investable {
 		invest[sid] = true
-	}
-	for _, sid := range u.Reference {
-		delete(invest, sid)
 	}
 	bad := map[int32]bool{}
 	for _, key := range status.Expected {

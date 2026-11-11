@@ -76,6 +76,14 @@ type PortfolioProposal struct {
 type PortfolioPolicy interface {
 	Propose(PortfolioContext, json.RawMessage) (PortfolioProposal, error)
 }
+
+// AssetForgetter is implemented by policies whose checkpoint can be scrubbed of instruments that left the
+// point-in-time universe (data ended / hole). The returned checkpoint carries no trace of the SIDs (holding
+// steps, exit state, cohort ownership), as if they had never been held; it must be deterministic.
+type AssetForgetter interface {
+	ForgetAssets(raw json.RawMessage, sids []int32) (json.RawMessage, error)
+}
+
 type PortfolioPolicyFactory func(PortfolioPolicyConfig) (PortfolioPolicy, error)
 
 func ClonePositionEvidence(positions map[int32]PositionEvidence) map[int32]PositionEvidence {
@@ -201,6 +209,40 @@ func DecodeLifecycleState(raw json.RawMessage) (LifecycleState, error) {
 		return s, errors.New("factor: too many active lifecycle assets")
 	}
 	return s, nil
+}
+
+// ForgetAssets removes the SIDs from the lifecycle checkpoint: asset state, identity and cohort contributions
+// (cohorts left without contributions are dropped). An empty checkpoint stays empty.
+func (p *LifecyclePolicy) ForgetAssets(raw json.RawMessage, sids []int32) (json.RawMessage, error) {
+	if len(raw) == 0 || len(sids) == 0 {
+		return raw, nil
+	}
+	s, err := DecodeLifecycleState(raw)
+	if err != nil {
+		return nil, err
+	}
+	gone := make(map[int32]bool, len(sids))
+	for _, sid := range sids {
+		gone[sid] = true
+		delete(s.Assets, sid)
+		delete(s.AssetIdentities, sid)
+	}
+	var cohorts []PortfolioCohort
+	for _, cohort := range s.Cohorts {
+		kept := make([]CohortContribution, 0, len(cohort.Contributions))
+		for _, x := range cohort.Contributions {
+			if !gone[x.SID] {
+				kept = append(kept, x)
+			}
+		}
+		if len(kept) == 0 && len(cohort.Contributions) > 0 {
+			continue
+		}
+		cohort.Contributions = kept
+		cohorts = append(cohorts, cohort)
+	}
+	s.Cohorts = cohorts
+	return json.Marshal(s)
 }
 func (p *LifecyclePolicy) Config() PortfolioPolicyConfig { return ClonePortfolioPolicyConfig(p.config) }
 func scheduleRound(c RebalanceConfig, grid, bar int64) (int64, error) {

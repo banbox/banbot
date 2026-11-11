@@ -26,7 +26,7 @@ func ritaHoleConfig(t *testing.T, sids []int32, holes map[int32][2]int64, last m
 		t.Fatal(err)
 	}
 	const hour int64 = 3600000
-	price := map[int32]float64{1: 200, 2: 100, 3: 300, 4: 150}
+	price := map[int32]float64{1: 200, 2: 100, 3: 300, 4: 150, 5: 120, 6: 180}
 	for _, sid := range sids {
 		for bar := int64(1); bar <= bars; bar++ {
 			if l, ok := last[sid]; ok && bar > l {

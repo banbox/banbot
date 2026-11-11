@@ -128,6 +128,9 @@ func PreparePortfolioConfig(c Config) (Config, error) {
 	if err != nil {
 		return c, err
 	}
+	if c.observe == nil {
+		c.observe = &runObservers{} // builder state reports into the Result of the run that uses this Config
+	}
 	name := c.Manifest.Portfolio.Builder
 	if c.PortfolioBuilder == nil && name != "" && name != "top-bottom-k-v1" {
 		c.PortfolioBuilder, _, err = newPortfolioBuilder(name, c)

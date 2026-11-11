@@ -389,7 +389,7 @@ Configuration keeps the v0.5 root keys and run_policy list without requiring con
 | run_policy[].expressions | schema_version, timeframe, bindings, params, lets, outputs, combine |
 | run_policy[].combo / run_policy[].expressions.combine | method: equal/fixed/history-ic, columns, weights |
 | run_policy[].portfolio | builder, k, long_notional, short_notional, mode: full/patch |
-| run_policy[].research | labels, label_wait_ms |
+| run_policy[].research | labels, label_wait_ms, panel (all/none) |
 | run_policy[].prices | source, timeframe, field |
 
 accounts.&lt;account&gt; overrides account settings; risk limits are absolute settlement-currency amounts. archive/store/history/sender_lease_dir follow the field's originating file, including multi-file overrides. Latest-value storage needs static-approximation. page_bytes bounds logical payload, not RSS. See [factor examples](./factor.md).

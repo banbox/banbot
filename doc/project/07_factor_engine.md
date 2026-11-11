@@ -34,7 +34,7 @@
 | `snapshot.go` | `Universe`、`SnapshotSpec`、`Freeze` 冻结输入（PIT 视图）、`Requirement`/`StreamKey`/`SnapshotStatus` |
 | `allocation.go` | `PortfolioTarget`、`Allocation`；十进制精确数量运算（`big.Rat`）、默认量子 1e-18 |
 | `portfolio.go` | `PortfolioSpec`、`FrozenBudget`、`TargetPortfolio`（Full/Patch 生效目标）、`TopBottomK*` |
-| `policy.go` | `LifecyclePolicy.Propose` 主流程；`LifecycleState`、`AssetLifecycle`、`PortfolioCohort`；checkpoint 编解码 |
+| `policy.go` | `LifecyclePolicy.Propose` 主流程；`LifecycleState`、`AssetLifecycle`、`PortfolioCohort`；checkpoint 编解码；`AssetForgetter`/`LifecyclePolicy.ForgetAssets`（PIT 剔除时清洗 checkpoint） |
 | `policy_config.go` | 组合策略 JSON 配置结构（Rebalance/Selection/Holding/Transition/Allocation）与 `NormalizePortfolioPolicyConfig` |
 | `policy_cohort.go` | cohort 模式：批次创建、成交对账、过期与内部转移 |
 | `policy_constraints.go` | 保留（retention）、剩余预算分配、风险约束（资产/边、组、净值、beta、换手） |
@@ -54,7 +54,8 @@
 | 文件 | 作用 |
 |---|---|
 | `book.go` | `Book`：现金、数量、标记价、费用、资金费、滑点、权重目标执行（`Execute`） |
-| `pit.go` | `Book.SetFundingApr`（多头名义额 × 年化% × 两次标记间隔近似资金费，空头不计，单次最多计 3 天，记入 `State.Funding` 并扣现金，配置键 `manifest.costs.funding_apr`）、`Book.NeverSeenAll`（标的从未有标记/持仓，可安全剔除）、`Book.ExitAtLastMark`（宇宙剔除标的按最后标记价平仓，含费用、滑点与 `SetPITDelistPenaltyBps` 的退市惩罚）、`DropTargets` |
+| `pit.go` | `Book.SetFundingApr`（多头名义额 × 年化% × 两次标记间隔近似资金费，空头不计，单次最多计 3 天，记入 `State.Funding` 并扣现金，配置键 `manifest.costs.funding_apr`）、`Book.NeverSeenAll`（标的从未有标记/持仓，可安全剔除）、`Book.ExitAtLastMark`（宇宙剔除标的按最后标记价平仓，含费用、滑点与 `SetPITDelistPenaltyBps` 的退市惩罚）、`Book.ForgetPolicyAssets`（lifecycle policy 清洗被剔标的状态）、`DropTargets` |
+| `attribution.go` | 多空腿/逐标的归因累加器（`Book.EnableAttribution`、`SampleExposure`、`Attribution`）：只在价格变动点累加，不读写账本数值 |
 | `policy.go` | 绝对数量分配执行（`ExecuteAllocation`）、`PolicyEvidence`、`RestorePolicy`、`AcceptProposal` |
 | `terminal.go` | 终止结算与终止标的报价豁免（`ApplyTerminalSettlement`） |
 
@@ -97,10 +98,11 @@
 | `validate.go` / `live_validate.go` | 回放/实盘配置校验，`resolveDecisionPortfolio` |
 | `risk_builder.go` / `model_builder.go` | 自定义风险优化与模型组合 builder 的配置与构造 |
 | `pairs.go` / `simple.go` | 统计套利配对 builder（`PairsSpec`，使用 `statistics.BandTrader`）、简单因子注册 |
+| `pairs_report.go` / `report.go` | 每对独立结果的记账（`pairStats`、`pairsTracker.report`）与结果类型（`PairResult`、`PairEpisode`、`Attribution`、`SymbolContribution`、`buildAttribution`）；`runObservers` 把 factory 内创建的配对状态带回 `Result` |
 | `params.go` / `scan.go` / `config.go` | 参数容器（`Params`，`Unused` 校验）、参数扫描、运行配置辅助 |
 | `terminal.go` / `option_expiry.go` | 终止标的与期权到期结算相关处理 |
 | `source_events.go` / `timeline.go` / `incomplete.go` | 数据源事件、同账户回放时间线排序、未完整数据处理（`IncompleteStream` 汇总；`pitReduceUniverse` 推导决策网格的时点宇宙） |
-| `output.go` / `artifact.go` | 输出适配（`TargetAccepted` 优先，回退 `Executed`；可选扩展 `NavOutput.Nav`，`JSONOutput` 实现为 `nav` 事件 `{Kind, AtMS, NAV, Cash}`）、运行产物 `.run-*.json` 原子写入 |
+| `output.go` / `artifact.go` | 输出适配（`TargetAccepted` 优先，回退 `Executed`；可选扩展 `NavOutput.Nav`，`JSONOutput` 实现为 `nav` 事件 `{Kind, AtMS, NAV, Cash}`；`JSONOutput.NoPanel` 跳过每个决策的 panel 行）、运行产物 `.run-*.json` 原子写入 |
 
 ### factor/statistics（统计工具箱）
 
@@ -174,7 +176,9 @@
 5. 输入：归档路径 `openArchiveInput`（`input.go:99`）全量读取 `OpenVersionStore` 记录后按可见性分批；分页路径 `storageInputFactory.Open`（`storage_input.go:109`）→ `fill` → `Next` → `Visible`。
 6. 共享回放 `RunMany`（`computation.go:167`）为每个配置启动 goroutine 调用 `Run`（`computation.go:215-225`），同账户事件经 `replayTimeline`（`timeline.go`）排序。
 
-时点宇宙（PIT）：Weights 模式（账本存在）下，lifecycle policy 运行时只剔除“从未出现过”的标的（未上市；policy 的逐标的状态不透明无法清洗，已有标记/持仓/配对的标的仍走跳过整次决策），无 policy 时剔除全部缺数据标的；网格上缺输入或输入无效的 Investable 标的（数据终止/未上市/空洞）被剔除，决策在缩减后的宇宙上继续，而不是整次跳过。Reference 标的不剔除；若缺失的还有其他流，或剩余 Investable 少于 `max(2, PITMinUniverseRatio × 原数量)`（默认 0.5，`< 0` 关闭 PIT，回到跳过整次决策），则不缩减。`Config.PITDelistPenaltyBps`（0=默认 100bp，<0 关）为被剔除持仓平仓时额外的不利惩罚；若该标的数据之后恢复，惩罚被退回并改按“缺口前后更差价”规则计价（累计成本见 `Result.PITGapLoss/PITDelistLoss`）。缩减宇宙的 `Version` 带 `#pit-<hash>` 后缀；被剔除且仍持仓的标的由 `Book.ExitAtLastMark` 按最后有效标记价（含费用与滑点）平仓，并从 pending/executed/previous 目标中移除（`DropTargets`）。`Result` 记录 `UniverseDrops`、`UniverseDropDecisions`、`DelistExits`、`DroppedBySID` 与有界的 `UniverseDropLog`（上限 2000）；决策诊断带 `pit-universe-drop`。配对模式下 PIT 按配对判定（`Config.PITPairs`，显式给出或由已注册配对策略的 `registeredPairLegs` 推导）：某腿缺数据的配对平仓并暂停（诊断 `pair-closed-missing-leg`，`BandTrader.Reset`），其余配对继续，“宇宙过小”回退不适用；两腿恢复后可重新开仓；所有配对同期暂停的周期计入 `Result.PausedPeriods`，不计入 `Incomplete`。`Result` 另含 `UniverseNominal/UniverseDecisions`（平均有效宇宙 = Nominal − Drops/Decisions）。
+时点宇宙（PIT）：Weights 模式（账本存在）下，网格上缺输入或输入无效的 Investable 标的（数据终止/未上市/空洞）被剔除，决策在缩减后的宇宙上继续，而不是整次跳过。生产形态下五个池相同（`Reference=Investable=Tradable=Evaluation=Tracked`，见 `entry/factor_storage.go:assembleFactorStorageInputs`）：可剔除集合是 Investable，`refOnly = Reference \ Investable` 里的标的（仅作参照）缺数据则不缩减；缩减后各池（含 Reference，截面算子 `crossSection` 以它为总体）都去掉被剔标的。若缺失的还有 Investable 之外的流，或剩余 Investable 少于 `PITMinUniverseRatio × 上一次被接受决策时的存活数`（滚动分母，首个决策用名义池大小；默认 0.5，被拒绝的决策不更新分母，完整快照与被接受的缩减决策都会把分母更新为当时的存活数；`< 0` 关闭 PIT），则不缩减（回到跳过整次决策）。逐个退市（30→29→28…）始终被接受，单轮内大面积缺失被拒绝；连续多轮“每轮少一点”的慢中断与逐步退市无法区分，同样被接受；单轮之内就永久失去超过 `1−ratio` 的标的则一直被拒绝（视为数据中断）。缩减后存活不足 2 个但通过门槛时（名义池 ≥3），被剔标的照常平仓并暂停该周期（计入 `PausedPeriods` 与 `UniverseDrops`，不计 `Incomplete`）；名义池只有 2 个时仍拒绝缩减。配对模式 `pitReducePairs` 没有比例门槛。`UniverseNominal` 仍是静态名义池，平均有效宇宙口径不变。`Config.PITMinUniverseRatio` 与 `Config.PITDelistPenaltyBps` 可由策略条目的 `pit_min_universe_ratio`（≤1，0=默认，<0 关 PIT）与 `pit_delist_penalty_bps`（有限数）配置；`PITDelistPenaltyBps`（0=默认 100bp，<0 关）为被剔除持仓平仓时额外的不利惩罚；若该标的数据之后恢复，惩罚被退回并改按“缺口前后更差价”规则计价（累计成本见 `Result.PITGapLoss/PITDelistLoss`）。缩减宇宙的 `Version` 带 `#pit-<hash>` 后缀；被剔除且仍持仓的标的由 `Book.ExitAtLastMark` 按最后有效标记价（含费用与滑点）平仓，并从 pending/executed/previous 目标中移除（`DropTargets`）。`Result` 记录 `UniverseDrops`、`UniverseDropDecisions`、`DelistExits`、`DroppedBySID` 与有界的 `UniverseDropLog`（上限 2000）；决策诊断带 `pit-universe-drop`。配对模式下 PIT 按配对判定（`Config.PITPairs`，显式给出或由已注册配对策略的 `registeredPairLegs` 推导）：某腿缺数据的配对平仓并暂停（诊断 `pair-closed-missing-leg`，`BandTrader.Reset`），其余配对继续，“宇宙过小”回退不适用；两腿恢复后可重新开仓；所有配对同期暂停的周期计入 `Result.PausedPeriods`，不计入 `Incomplete`。`Result` 另含 `UniverseNominal/UniverseDecisions`（平均有效宇宙 = Nominal − Drops/Decisions）。
+
+lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态（退市、空洞，非“从未出现过”），先由 `Book.ExitAtLastMark` 按最后有效价平仓（与无 policy 路径一致），再由 `Book.ForgetPolicyAssets` 清洗：policy checkpoint（经 `factor.AssetForgetter.ForgetAssets`，`LifecyclePolicy` 删除其 `Assets`/`AssetIdentities` 与 cohort 贡献，空 cohort 丢弃）、`previousAllocation` 与未确认成交事实；有变化时 `stateVersion++`，`policyRun` 据此重载状态；在途 `policyPending` 作废（计入 `Result.Skipped`），随后决策在缩减宇宙上继续，被剔标的对 policy 等同未曾持有（不占名额/持有期/冷却）。数据恢复后该标的当作新标的重新入选。策略未实现 `AssetForgetter`，或账本证据来自外部 `PolicySink` 时，回到“整轮不缩减、计入 `Incomplete`”。
 
 回测账本在 `Run` 中的调用：`NewBook`（`runner.go:258`）→ `Mark`（`:463`）→ `ApplyFunding`（`:502`）→ `ApplyTerminalSettlement`（`:518`）→ `AcceptProposal`（`:572`，allocation 路径）或 `Execute`（`:646`，Weights 模式）→ `EndChunk`（`:881`）。
 
@@ -207,6 +211,29 @@
 
 `runner/pairs.go` 构造 `PairsSpec` 与带状交易器：`statistics.NewBandTrader` + `NewRollingSpread`，逐 bar 调用 `Observe`（`pairs.go:174`）与 `Step`（`:188`）；闭包捕获为空（满足 `Custom` 节点的 CSE 安全要求，`pairs.go:62`）。`BandTrader` 每个实例只能服务一个价差；Stop 之后阻塞再入场直到 |z| ≤ Exit。
 
+### 10. 结果统计（`Result.Attribution` / `Result.Pairs`）
+
+`Result` 与运行产物（`run.json` 的 `Results[]`、`run-completed` 事件）按 Go 字段名序列化（无 json 标签，键名即字段名，首字母大写）；以下新增字段均 `omitempty`，旧消费方按结构体解码时忽略未知字段即可。
+
+**多空腿归因 `Result.Attribution`**（仅 Weights 模式，账本存在时；factor 与 statarb 通用）。`Run` 对 `Book` 调用 `EnableAttribution`，并在每个决策时刻（NAV 事件处）调用 `SampleExposure`。累加器位于账本所有改变持仓数量/标记价/现金的入口：`Mark`（按旧数量重估到新标记价）、`Execute` 与 `ExecuteAllocation`（成交前先把旧数量重估到成交报价，再按持仓变化拆分多/空腿换手）、`ExitAtLastMark`（含惩罚）、`resolveRecovered`（惩罚退回与缺口损失）、`ApplyTerminalSettlement`（按结算价与最后标记价之差）、`ApplyFunding`/`accrueFunding`。补丁（Patch）模式与 policy 路径共用 `Execute`/`ExecuteAllocation`，无其他入口。字段（货币额，成本为正数）：
+
+- `InitialNAV`、`FinalNAV`；`LongPnL`/`ShortPnL`（价格变动盈亏，按价格变动时持仓方向归入多/空腿，未扣成本）及 `LongPnLPct`/`ShortPnLPct`（占初始 NAV）。
+- `LongTurnover`/`ShortTurnover`：成交名义额按腿拆分（多头腿数量 `max(q,0)`、空头腿 `min(q,0)` 的变动），符号翻转两腿都计，二者之和等于 `Book.Turnover`。
+- `AvgLongExposure`/`AvgShortExposure`：决策时刻多/空头总市值 / NAV 的均值，`ExposureSamples` 为样本数。
+- `Fees`、`Slippage`、`Funding`、`PITCost`（= `PITGapLoss + PITDelistLoss`）。
+- 对账：`FinalNAV − InitialNAV = LongPnL + ShortPnL − Fees − Slippage − Funding − PITCost + Residual`，`Residual` 仅为浮点舍入（测试断言 `|Residual| < 1e-9 × InitialNAV`）。
+- `TopSymbols`（至多 20 个，按 `|Net|` 降序）：`Symbol`、`PnL`、`Costs`（该标的的费用+滑点+资金费+PIT 成本）、`Net = PnL − Costs`、`NetPct`（占初始 NAV）、`Share = Net / Σ|Net|`（范围 [-1,1]，接近 ±1 表示单一标的决定结果）；所有标的的 `Net` 之和等于 NAV 变化。
+- 累加器是账本的纯旁路观察者，开启前后 NAV 序列逐位一致（`attribution_test.go`）。
+
+**配对独立结果 `Result.Pairs`**（仅 `RegisterPairs` 策略）：`PairResult{Y, X, Episodes, EpisodeCount, PnL, Trades, Wins, WinRate, InMarketBars, Bars, PausedBars, AvgHoldBars, LastBeta, Turnover}`。
+
+- `Episodes[]` 为 `PairEpisode{StartMS, EndMS, Dir(+1 做多价差/-1 做空), EntryZ, ExitZ, Beta(入场冻结), Bars, Reason, PnL}`；总量上限 400 条在各对间均分（每对至少 10 条，保留最早的），真实数量见 `EpisodeCount`；`run-completed` 事件行整体序列化 `Result`，体量受该上限约束。`Reason`：`exit`（|z| ≤ Exit）、`stop`（|z| ≥ Stop）、`maxhold`、`leg_missing`（腿缺数据被平仓并暂停，`ExitZ=0`）、`end`（运行结束时仍持仓，`EndMS` 为最后一次决策时间）。`Bars` 为持仓决策数（含入场当期，不含平仓当期）。
+- 记账：`pairsTracker` 随 builder 一起由 portfolio factory 创建（`Config.observe` 经 `runObservers` 在运行结束时汇总；`PreparePortfolioConfig` 在其为空时创建，`Run` 只在为空时创建，所以入口先 Prepare 再 Run 的路径同样有效；`Run` 开始时调用 `reset` 清空记账，同一已 Prepare 的 Config 再次运行也不会累计，但 builder 自身的交易状态按既有约定仍应只用于一次运行），只写不读，不改变 builder 输出的权重。每个决策，该对上一次决策的目标权重（`wY`、`wX`，即叠加进净权重之前的两项）持有到本次决策，收益为 `wY·rY + wX·rX`（`rY/rX` 为两腿在相邻决策之间的简单收益，取自 builder 输入的对数价字段）乘以上一次决策的 `Budget.NAV`；`PnL` 为累计值占初始 NAV 的比例，持仓期的收益同时累加到当前 `Episode.PnL`。同一品种出现在多对时按各对权重自然拆分。
+- `Bars` = 双腿有效且回归窗口已满的决策数；`PausedBars` = 因某腿缺数据暂停的决策数；`InMarketBars` = 持仓决策数；`AvgHoldBars = InMarketBars / Trades`（运行结束时仍持仓的一次计入 `Trades`，`Wins` 以 `PnL>0` 计）；`LastBeta` 为最近一次入场冻结的 Beta；`Turnover` 为决策时刻 `|Δ wY| + |Δ wX|` 的累计（NAV 比例，是成本的代理，成本不分摊到各对）。
+- 对账（`Result` 上）：`PairsGrossPnL` = 各对 `PnL` 之和，`PairsNAVReturn` = `Book.NAV / InitialNAV − 1`，`PairsResidual = PairsNAVReturn − PairsGrossPnL`，即成本（费用、滑点、资金费、PIT 成本）加执行近似残差（账本按延迟后的价格成交、权重在决策之间随价格漂移、各对共享品种时账本按净权重成交）。成交价与决策价一致且无延迟差时残差等于成本的相反数。
+
+**Panel 行开关**：`research.panel: none`（`Config.Panel`，默认 `all`）使 `JSONOutput` 不再写每个决策的“品种数×列数” panel 行（`Decision` 与 `DecisionAllocation`）；`{"Kind"...}` 事件行、`Result.Summary`（由 runner 的 `Accumulator` 在内存中累计，不读取已写出的行）与所有账本数值不受影响。
+
 ## 配置项与外部依赖
 
 ### 配置来源
@@ -219,6 +246,7 @@
   - `transition`：`mode`（direct/target-step/linear-exit/geometric/cohort）、`basis`、`exit_steps`、`ratio`、`final_threshold`、`alpha`、`period_bars`、`startup`、`sizing`、`on_reselect`、`entry_window_bars`、`by_asset`。
   - `allocation`：`method`、`reserve_ratio`、`fixed_notional`、`vol_target`、`asset_cap`、`group_caps`、`turnover_limit`、`net_cap`、`beta_cap`。
   - cohort 要求 `every_bars > 0`，calendar/duration 调度与 cohort 互斥（`policy_config.go:303`）。
+- `run_policy[].factor.research` 键：`labels`、`label_wait_ms`、`panel`（字符串 `all`/`none`，其他类型或取值报错，见第 10 节）。
 - 运行配置：`runner/runner.go:36` 的 `Config`（含 `Chunks`、`HistoricalInput`、`ComputationGroup`、`Execution`、`Manifest`、`DecisionInterval`、`LatencyMS`、`ExpiryMS`、`MaxRecords`、`Snapshot.VisibilityPolicy` 等）。`Execution` 中含 `StorePath`、`SenderLeaseDir`、`HistoryPath`、`MarginRate` 等。
 - 研究默认值：动量因子窗口 24、1h、winsor 0.01（`research/combine.go:379`）；优化迭代默认 500、上限 10000（`risk.go:141-146`）；滚动窗口上限 100000（`model.go:84`）；Kalman 拟合 4000 次评估（`kalman_fit.go`）。
 - 版本常量：`"builtin-1/banta-0.4.1"`（`dag.go:55`）与 `"indicators-1/banta-0.4.1"`（`indicators.go:13`）须与 banta 版本同步；`MaxIndicatorPeriod = 10000`（`indicators.go:9`）。
@@ -292,5 +320,7 @@
 ## 已知限制与设计取舍
 
 - live 路径的 `combine` 没有 IC 历史，回退为等权或固定权重。
+- `Result.Pairs` 的逐对盈亏是按决策时刻价格与各对自身目标权重的近似归因，不等于账本成交盈亏；成本不分摊到各对；仅回放（`Run`）路径汇总，实盘不输出；运行出错提前返回时 `Pairs`/`Attribution` 可能缺失。
+- `Result.Attribution.TopSymbols` 只统计账本（Weights 模式）持仓的标的，其他模式（Events/Trade 由账户 sink 记账）不输出 `Attribution`。
 - `storage_input` 对输入做 prune，属设计行为。
 - `Session` 路径在 `Warmup` 之后不再记录上一个 DecisionTime；`research.RestoreModel` 不校验系数个数；`Manifest` 的 strategy hash 排除部分字段。

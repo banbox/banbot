@@ -41,7 +41,7 @@
 
 新身份及预算字段通过显式 `engine` 启用：`engine` 只接受 `time_series/factor` 两种引擎；`id` 是唯一策略身份；`account` 绑定已有且未禁用的根账户；`capital_weight` 是 `[0,1]` 的资本比例，不是 stake_rate 的别名。
 
-因子专属一级字段为 `archive/chunks/snapshot/combo/portfolio/decision/research/manifest/prices/funding_source/initial_nav/max_records/config/definition/expressions`，全部直接位于 `run_policy[]`。`name` 默认选择 Go definition；表达式策略不要求注册同名 builder，不与显式 definition 同时使用。
+因子专属一级字段为 `archive/chunks/snapshot/combo/portfolio/decision/research/manifest/prices/funding_source/initial_nav/max_records/config/definition/expressions/pit_min_universe_ratio/pit_delist_penalty_bps`，全部直接位于 `run_policy[]`；后两者是回测时点宇宙参数（`pit_min_universe_ratio` ≤1，0=默认 0.5，<0 关闭 PIT 缩减；`pit_delist_penalty_bps` 为有限数，0=默认 100，<0 关闭退市惩罚）。`name` 默认选择 Go definition；表达式策略不要求注册同名 builder，不与显式 definition 同时使用。
 
 | 保留的分组（均直接位于 run_policy 下） | 子 key |
 | --- | --- |
@@ -50,7 +50,7 @@
 | `combo`、`expressions.combine` | `method/columns/weights` |
 | `portfolio` | `builder/k/long_notional/short_notional/mode` |
 | `decision` | `interval_ms/delay_ms/latency_ms/expiry_ms/max_pending` |
-| `research` | `labels/label_wait_ms` |
+| `research` | `labels/label_wait_ms/panel` |
 | `research.labels[]` | `name/kind/horizon/overlapping/periods_per_year` |
 | `prices` | `source/timeframe/field` |
 | `snapshot` | `grid_time/decision_time/replay_time/universe/sid_map/schemas/source_versions/adjustment_version/visibility_policy` |

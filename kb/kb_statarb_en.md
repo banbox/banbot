@@ -103,7 +103,8 @@ Weights (`pos∈{-1,0,+1}`, `G` = that pair's Gross, `β` the frozen value, `N=1
 - **Window** = the most recent N **usable observations**, not calendar bars; a bar with an invalid leg does not enter the window, so the covered time stretches.
 - **Full/Patch**: the target is a NAV fraction; under Full, SIDs not in the target are treated as 0. Closed pairs are removed from the target, so **`portfolio.mode: patch` must not be set** (Patch only changes SIDs inside the target; unlisted positions are never closed); default is full.
 - **nil target vs empty target**: nil (f) = no new target this round; the engine does not replace the pending target, the Weights ledger count is unchanged (prior holdings carry on), `Result.Skipped++`, and evaluation weights are not updated; an already-submitted unfilled target still executes within its window or expires. A non-nil empty map (all pairs closed) = under Full, everything is zeroed, and it executes without needing a quote. The warm-up period (window not full) is nil; once ready, having no positions yields an empty target.
-- If a leg's entire kline is missing, there is no decision callback that round (`pair-input-missing` corresponds to an invalid value / price<=0).
+- If a leg's entire kline is missing: Weights backtests handle it with the per-pair PIT (next bullet: the leg is dropped, its pair closed and paused); on paths without PIT (Events/Trade) there is no decision callback that round (`pair-input-missing` corresponds to an invalid value / price<=0).
+- PIT in Weights backtests is decided per pair: when a leg has no data at the decision grid (delisting, not yet listed, gap) that leg is dropped from the universe, the pair holding it is closed and paused (diagnostic `pair-closed-missing-leg`), and the other pairs keep trading; once both legs are back the pair can reopen. It applies to the static pool with identical five pools as well; periods in which every pair is paused count in `Result.PausedPeriods`, not in `Incomplete`. `pit_delist_penalty_bps` is the delist penalty of the closed leg (0 = default 100, < 0 off).
 
 ### 2.5 YAML
 
@@ -121,7 +122,7 @@ run_policy:
 
 - `params` keys are the keys build reads; unknown keys error only if build calls `Unused()`; changing any parameter creates a new strategy identity (manifest hash).
 - The loader writes `params.window` into `Factor.Window` and `params.k` into `portfolio.K` (not used by pairs); the pairs window is determined by `PairsSpec.Window`, which should match `window`. `swapPerBars`/`holdBars` are rejected by the loader in factor strategies (`maxHold` is allowed).
-- For pairs, the `research` command outputs only the `logp` panel and label diagnostics; performance comes from `backtest --mode weights|events`.
+- For pairs, the `research` command outputs only the `logp` panel and label diagnostics; performance comes from `backtest --mode weights|events`. A Weights backtest's `Result.Pairs` gives each pair's own result (Episodes: entry/exit time, Dir, EntryZ/ExitZ, frozen Beta, Bars, Reason=exit|stop|maxhold|leg_missing|end, PnL; totals PnL, Trades, WinRate, InMarketBars, PausedBars, AvgHoldBars, LastBeta, Turnover; Episodes are capped at 400 in total, shared equally by the pairs (at least 10 per pair); see EpisodeCount for the real count). Per-pair PnL is an approximate attribution using each pair's own target weights and decision-time prices (before costs; Turnover is the cost proxy); reconcile with `PairsGrossPnL`, `PairsNAVReturn`, `PairsResidual` (residual ≈ costs + execution approximation). `Result.Attribution` adds long/short leg PnL, exposure, costs and `TopSymbols` (single-instrument contribution share).
 
 ### 2.6 Price Stream, Fill Timing and Costs (Weights)
 

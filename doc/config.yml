@@ -305,6 +305,7 @@ llm_models:
 #     prices: {source: kline, timeframe: 1h, field: close} # weights 价格；events 见场景 C
 #     research:
 #       label_wait_ms: 0
+#       panel: all # all(默认)|none：none 不写每个决策的 panel 行，事件/Summary/账本不变
 #       labels:
 #         - name: next_return
 #           kind: executable-return # 当前归档驱动支持一个决策周期的此标签

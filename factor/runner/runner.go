@@ -76,6 +76,11 @@ type Config struct {
 	OptionExpirySource                                 string
 	TerminalSettlementSource                           string
 	SourceEventDecisions                               bool
+	// Panel selects the research panel rows ("" or "all": one row per instrument and column at every decision,
+	// "none": no panel rows; events, run.json Summary and every ledger number are unaffected).
+	Panel string `json:",omitempty"`
+	// observe collects state of strategy builders created for this run (see runObservers).
+	observe *runObservers
 }
 
 // Sink must persist/idempotently coordinate targets before returning success.
@@ -140,6 +145,15 @@ type Result struct {
 	UniverseNominal, UniverseDecisions int                `json:",omitempty"`
 	DroppedBySID                       map[int32]int      `json:",omitempty"`
 	UniverseDropLog                    []UniverseDropItem `json:",omitempty"`
+
+	// Attribution (weights mode): long / short leg PnL, costs, exposure and top instruments, see Attribution.
+	Attribution *Attribution `json:",omitempty"`
+	// Pairs (RegisterPairs strategies): one result per pair, see PairResult. PairsGrossPnL is the sum of the
+	// pairs' PnL (fraction of the initial NAV, no costs, decision-time prices); PairsNAVReturn is the Book's
+	// NAV change over the initial NAV; PairsResidual = PairsNAVReturn - PairsGrossPnL, i.e. costs (fees, slippage,
+	// funding, PIT exits) plus the execution approximation (later fill prices, weight drift between decisions).
+	Pairs                                        []PairResult `json:",omitempty"`
+	PairsGrossPnL, PairsNAVReturn, PairsResidual float64      `json:",omitempty"`
 }
 
 // UniverseDropItem is one decision's PIT universe reduction (bounded log, see maxUniverseDropLog).
@@ -216,7 +230,14 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		return result, err
 	}
 	var prepareErr error
+	// A Config prepared by the caller (PreparePortfolioConfig) already carries the observers its builder reports to.
+	if c.observe == nil {
+		c.observe = &runObservers{}
+	}
 	c, prepareErr = PreparePortfolioConfig(c)
+	if prepareErr == nil && c.observe != nil && c.observe.reset != nil {
+		c.observe.reset() // result bookkeeping is per Run even when a prepared Config is run again
+	}
 	if prepareErr != nil {
 		return result, prepareErr
 	}
@@ -304,6 +325,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			return result, err
 		}
 		book.SetFundingApr(c.Manifest.Costs.FundingApr)
+		book.EnableAttribution()
 		switch {
 		case c.PITDelistPenaltyBps == 0:
 			book.SetPITDelistPenaltyBps(defaultPITDelistPenaltyBps)
@@ -348,6 +370,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		return nil
 	}
 	var policyPending *pendingProposal
+	// pitAlive: Investable survivors of the last accepted decision (0 = none yet: the nominal pool is used), the
+	// rolling denominator of the PITMinUniverseRatio gate; rejected decisions leave it unchanged.
+	pitAlive := 0
 	var history *research.ICHistory
 	if research.IsHistoryMethod(combo.Method) {
 		if combo.Label != "" {
@@ -772,6 +797,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				}
 			}
 			snapshot, err := barrier.Freeze(token, now)
+			if err == nil {
+				pitAlive = len(spec.Universe.Investable) // complete snapshot: the whole pool is alive
+			}
 			var pitDiag *factor.Diagnostic
 			pausedSkip := false
 			if errors.Is(err, factor.ErrSnapshotIncomplete) && book != nil && c.PITMinUniverseRatio >= 0 {
@@ -783,18 +811,50 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 					if len(pairLegs) > 0 {
 						reduced, dropped, allPaused, ok = pitReducePairs(spec.Universe, incomplete.Status, pairLegs)
 					} else {
-						reduced, dropped, ok = pitReduceUniverse(spec.Universe, incomplete.Status, c.PITMinUniverseRatio)
+						reduced, dropped, ok = pitReduceUniverse(spec.Universe, incomplete.Status, c.PITMinUniverseRatio, pitAlive)
 					}
+					// 081/083: under the lifecycle policy only instruments never seen (not yet listed, never held) are
+					// dropped without further ado. Seen ones (delisted / gapped) are dropped too when the policy can
+					// scrub its checkpoint (AssetForgetter) and the Book is the evidence source: the Book closes them
+					// at the last mark and the checkpoint / previous allocation forget them (forgetDropped).
+					scrubPolicy := false
 					if ok && policy != nil && !book.NeverSeenAll(dropped) {
-						// 081: the lifecycle policy owns opaque per-SID state (holding steps, previous allocation) that
-						// cannot be scrubbed from here, so only instruments never seen (not yet listed, never held) are
-						// dropped under a policy; delisted / gapped ones keep the old skip behaviour.
-						ok = false
+						_, forgets := policy.policy.(factor.AssetForgetter)
+						_, external := sink.(PolicySink)
+						if !forgets || external {
+							ok = false
+						} else {
+							scrubPolicy = true
+						}
 					}
-					if ok && len(reduced.Investable) == 0 {
-						// 070: every leg of every pair is gone: close what is held, pause, skip the period without
-						// counting it as incomplete
+					forgetDropped := func() error {
+						if !scrubPolicy || decisionWarming {
+							return nil
+						}
+						if policyPending != nil {
+							// computed against a universe that still held the dropped instruments
+							result.Skipped++
+							policyPending = nil
+						}
+						return book.ForgetPolicyAssets(dropped, policy.policy.(factor.AssetForgetter).ForgetAssets)
+					}
+					tiny := ok && len(pairLegs) == 0 && len(reduced.Investable) < 2
+					if ok && (len(reduced.Investable) == 0 || tiny) {
+						// 070: every leg of every pair is gone (or, weights mode, fewer than 2 instruments survive a
+						// gate-passing reduction): close what is held, pause, skip the period without counting it as
+						// incomplete
+						pitAlive = len(reduced.Investable)
 						if !decisionWarming {
+							if tiny {
+								result.UniverseDrops += len(dropped)
+								result.UniverseDropDecisions++
+								if result.DroppedBySID == nil {
+									result.DroppedBySID = map[int32]int{}
+								}
+								for _, sid := range dropped {
+									result.DroppedBySID[sid]++
+								}
+							}
 							exited := book.ExitAtLastMark(dropped, c.Manifest.Costs.FeeRate, c.Manifest.Costs.SlippageRate)
 							if pending, err = backtest.DropTargets(pending, dropped); err != nil {
 								return result, err
@@ -804,6 +864,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 							}
 							result.DelistExits += len(exited)
 							result.PausedPeriods++
+							if err = forgetDropped(); err != nil {
+								return result, err
+							}
 						}
 						pausedSkip, ok = true, false
 					}
@@ -832,6 +895,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 						pitSnap, pitErr := barrier.Freeze(pitToken, now)
 						if pitErr == nil {
 							snapshot, err, spec = pitSnap, nil, pitSpec
+							pitAlive = len(reduced.Investable) // accepted: the next gate compares against this survivor count
 							var exited []int32
 							if !decisionWarming {
 								exited = book.ExitAtLastMark(dropped, c.Manifest.Costs.FeeRate, c.Manifest.Costs.SlippageRate)
@@ -844,6 +908,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 								result.UniverseDrops += len(dropped)
 								result.UniverseDropDecisions++
 								result.DelistExits += len(exited)
+								if err = forgetDropped(); err != nil {
+									return result, err
+								}
 								if result.DroppedBySID == nil {
 									result.DroppedBySID = map[int32]int{}
 								}
@@ -928,6 +995,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 					c.timeline.leave()
 				}
 				continue
+			}
+			if book != nil {
+				book.SampleExposure()
 			}
 			if navOut, ok := out.(NavOutput); ok && book != nil {
 				if err = navOut.Nav(book.State(), now); err != nil {
@@ -1062,6 +1132,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	result.Book = bookState()
 	if book != nil {
 		result.PITGapLoss, result.PITDelistLoss = book.PITExitLosses()
+		result.Attribution = buildAttribution(book.Attribution(), c.Snapshot.SIDMap)
 	}
 	if source, ok := sink.(StateSource); ok {
 		result.Book, err = source.StrategyState(ctx, lastTime)
@@ -1078,6 +1149,16 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	}
 	if acc != nil {
 		result.Summary = acc.Summary()
+	}
+	if c.observe != nil && c.observe.pairs != nil {
+		result.Pairs = c.observe.pairs(c.InitialNAV)
+		for _, p := range result.Pairs {
+			result.PairsGrossPnL += p.PnL
+		}
+		if c.InitialNAV > 0 && result.Book.NAV > 0 {
+			result.PairsNAVReturn = fin(result.Book.NAV/c.InitialNAV - 1)
+			result.PairsResidual = fin(result.PairsNAVReturn - result.PairsGrossPnL)
+		}
 	}
 	result.NodeCount = plan.NodeCount()
 	result.NodeUpdates = engine.session.Updates()

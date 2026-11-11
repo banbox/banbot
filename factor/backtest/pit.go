@@ -1,6 +1,8 @@
 package backtest
 
 import (
+	"bytes"
+	"encoding/json"
 	"math"
 	"sort"
 
@@ -33,6 +35,7 @@ func (b *Book) ExitAtLastMark(sids []int32, fee, slip float64) []int32 {
 		b.pitExits[sid] = pitExit{qty: qty, price: mark.Price, atMS: mark.AtMS, penalty: pen}
 		b.cash -= pen
 		b.delistLoss += pen
+		b.attr.addPIT(sid, pen)
 		if qty > 0 {
 			price *= 1 - slip
 		} else {
@@ -43,6 +46,7 @@ func (b *Book) ExitAtLastMark(sids []int32, fee, slip float64) []int32 {
 		b.fees += cost
 		b.slippage += math.Abs(qty * (price - mark.Price))
 		b.turnover += math.Abs(qty * mark.Price)
+		b.attr.trade(sid, qty, 0, mark.Price, cost, math.Abs(qty*(price-mark.Price)))
 		delete(b.quantities, sid)
 		delete(b.firstFill, sid)
 		closed = append(closed, sid)
@@ -56,6 +60,62 @@ func (b *Book) ExitAtLastMark(sids []int32, fee, slip float64) []int32 {
 		}
 	}
 	return closed
+}
+
+// ForgetPolicyAssets (lifecycle policy under PIT drops) removes instruments that left the point-in-time universe
+// from the policy checkpoint (scrub), the previous allocation target and the unacknowledged fill facts, and bumps the
+// state version (only when something changed) so the runner reloads the policy's view from PolicyEvidence. Call it after ExitAtLastMark: the
+// positions are already flat, so the policy sees the instruments as never held. A nil scrub leaves the checkpoint.
+func (b *Book) ForgetPolicyAssets(sids []int32, scrub func(json.RawMessage, []int32) (json.RawMessage, error)) error {
+	if len(sids) == 0 {
+		return nil
+	}
+	changed := false
+	if scrub != nil && len(b.policyState) > 0 {
+		next, err := scrub(append(json.RawMessage(nil), b.policyState...), sids)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(next, b.policyState) {
+			changed = true
+		}
+		b.policyState = next
+	}
+	if b.previousAllocation != nil {
+		kept := b.previousAllocation.Allocations()
+		for _, sid := range sids {
+			if _, ok := kept[sid]; ok {
+				delete(kept, sid)
+				changed = true
+			}
+		}
+		if changed {
+			next, err := factor.NewPortfolioTarget(b.previousAllocation.Spec(), kept)
+			if err != nil {
+				return err
+			}
+			b.previousAllocation = next
+			changed = true
+		}
+	}
+	gone := make(map[int32]bool, len(sids))
+	for _, sid := range sids {
+		gone[sid] = true
+	}
+	remaining := b.fillFacts[:0]
+	for _, fill := range b.fillFacts {
+		if !gone[fill.sid] {
+			remaining = append(remaining, fill)
+		}
+	}
+	if len(remaining) != len(b.fillFacts) {
+		changed = true
+	}
+	b.fillFacts = remaining
+	if changed {
+		b.stateVersion++
+	}
+	return nil
 }
 
 // DropTargets returns p without the given SIDs (same spec/sequence). Nil-safe.
@@ -101,6 +161,7 @@ func (b *Book) resolveRecovered(sid int32, ex pitExit, next float64) {
 	delete(b.pitExits, sid)
 	b.cash += ex.penalty
 	b.delistLoss -= ex.penalty
+	b.attr.addPIT(sid, -ex.penalty)
 	var loss float64
 	if ex.qty > 0 && next < ex.price {
 		loss = ex.qty * (ex.price - next)
@@ -110,6 +171,7 @@ func (b *Book) resolveRecovered(sid int32, ex pitExit, next float64) {
 	if loss > 0 {
 		b.cash -= loss
 		b.gapLoss += loss
+		b.attr.addPIT(sid, loss)
 	}
 }
 
@@ -165,4 +227,5 @@ func (b *Book) accrueFunding(sid int32, old Quote, atMS int64) {
 	cost := qty * old.Price * b.fundingApr / 100 * dt / (365.25 * 24 * 3600 * 1000)
 	b.cash -= cost
 	b.funding += cost
+	b.attr.addFunding(sid, cost)
 }

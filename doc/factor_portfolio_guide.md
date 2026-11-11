@@ -69,9 +69,11 @@ gradual 每轮建立 1/8 预算的批次；seed-all 用当前排名一次建立�
 
 long_k/short_k 是当轮选择数量，不是实际持仓总数上限。最短持有期保护和渐进退出会保留落选旧仓，因此实际非零持仓可能超过 K；当前没有 max_long_positions/max_short_positions 配置。降低 K 会同时缩小候选范围。若只需控制调仓金额，可使用 allocation.turnover_limit；它不限制持仓数量，强制风险退出仍绕过普通换手预算。
 
-默认存储回测使用固定标的池，快照要求 Reference 与 Investable 中每个标的的所有计划输入在当前网格有效。新上市、退市或历史缺口可能令整轮跳过；每个标的有大量历史行并不意味着各决策时刻都有完整覆盖。因子窗口跨数据页累积，无需令 page_rows 大于最长窗口。
+默认存储回测使用固定标的池，快照要求 Reference 与 Investable 中每个标的的所有计划输入在当前网格有效。Weights 回测中 Investable 标的在某网格缺数据（新上市、退市、历史缺口）会被时点宇宙（PIT）剔除，决策在缩减后的宇宙上继续：各池（含 Reference）去掉该标的，持仓按最后有效价平仓（含费用、滑点与 `pit_delist_penalty_bps` 退市惩罚；`lifecycle-v1` 同样处理并清洗 policy 状态），数据恢复后当作新标的重新入选；记入 `UniverseDrops`/`DelistExits`/`DroppedBySID`。只有仅属 Reference 的标的缺数据、一轮内存活标的少于 `pit_min_universe_ratio × 上一次被接受决策时的存活数`（滚动分母，默认 0.5，<0 关闭 PIT；逐个退市始终被接受，单轮大面积缺失被拒绝）或非 Weights 模式才整轮跳过并计入 `Incomplete`。每个标的有大量历史行并不意味着各决策时刻都有完整覆盖。静态 `pairs` 中交易所当前市场表已不再列出（如已摘牌移除）的永续，仅在**因子存储回放的 Weights 模式**（全部 run_policy 都是 factor 引擎、模式为 Weights）下按库内记录解析并保留在池内，条件是库内 K 线范围（1d/1h/15m/5m/1m 的 range 元数据）与回测窗口相交，不依赖可能是合成标记的 `delist_ms`；窗口开始前就已无数据的品种仍报 `symbol not found`。Weights 账本不使用交易所市场元数据（数量不取整、费用来自 manifest），所以这类品种只是不参与“最小下单额”过滤；时序引擎、混合回放、Events/Trade 模式保持原行为，池里有这类品种会明确报 `symbol ... not found in the exchange market table`。因子窗口跨数据页累积，无需令 page_rows 大于最长窗口。
 
 回测结果及 run-completed/run artifact 的 Result.IncompleteStreams 汇总每个失败流的 SID、Source、TimeFrame、Missing、Invalid、FirstGridTime 和 LastGridTime；Missing 表示没有可见记录，Invalid 表示已有记录但不满足所需时间、关闭状态或最大年龄。计数对应非预热阶段被跳过的决策网格，按流汇总而非逐轮保存。检查这些流的上市/退市时间、数据缺口和可见时间后再调整标的池；这些诊断不会改变严格快照语义。
+
+Weights 回测的 `Result.Attribution` 把 NAV 变化拆为多头腿盈亏、空头腿盈亏与成本（费用、滑点、资金费、PIT 成本），并给出各腿换手、决策时刻平均多/空敞口（占 NAV）以及按 `|净贡献|` 排序的 `TopSymbols`（至多 20 个，`Share` 接近 ±1 说明单一品种决定结果）；`FinalNAV − InitialNAV = LongPnL + ShortPnL − 成本 + Residual`，`Residual` 只是浮点舍入。归因是账本的旁路累加，不改变任何成交或净值。`research.panel: none` 关闭每个决策的 panel 行（品种数×列数，长回测可达百万行），事件行、`Summary` 与账本数值不变，默认 `all`。
 
 ```yaml
 holding:

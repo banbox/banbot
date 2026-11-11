@@ -98,6 +98,7 @@ func (b *Book) ExecuteAllocation(p *factor.PortfolioTarget, quotes map[int32]Quo
 	for _, sid := range sids {
 		qty := quantities[sid]
 		q := quotes[sid]
+		b.attrRevalue(sid, q.Price)
 		delta := qty - b.quantities[sid]
 		if delta != 0 {
 			b.fillFacts = append(b.fillFacts, bookFillFact{sid: sid, quantity: delta, cursor: b.ledgerCursor + 1, sequence: spec.PlanSequence, at: q.AtMS})
@@ -113,6 +114,7 @@ func (b *Book) ExecuteAllocation(p *factor.PortfolioTarget, quotes map[int32]Quo
 		b.fees += cost
 		b.slippage += math.Abs(delta * (price - q.Price))
 		b.turnover += math.Abs(delta * q.Price)
+		b.attr.trade(sid, b.quantities[sid], qty, q.Price, cost, math.Abs(delta*(price-q.Price)))
 		b.recordFirstFill(sid, qty, q.AtMS)
 		b.quantities[sid] = qty
 		b.marks[sid] = q

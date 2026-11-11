@@ -355,7 +355,7 @@ func EnsureCurSymbolsWithSymbolState(state *SymbolState, exchange banexg.BanExch
 			exInfo.ID, exInfo.MarketType, state.identityExchange, state.identityMarket)
 	}
 	return ensureCurSymbolsWithRuntimeConfig(state, exchange, exInfo.ID, exInfo.MarketType, symbols,
-		&config.Data, config.GetDataDir(), nil, false)
+		&config.Data, config.GetDataDir(), nil, false, false)
 }
 
 // EnsureCurSymbolsWithRuntimeConfig registers current markets using the
@@ -363,6 +363,15 @@ func EnsureCurSymbolsWithSymbolState(state *SymbolState, exchange banexg.BanExch
 // entrypoint when market snapshots or contract reloads are configured per run.
 func EnsureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, symbols []string,
 	cfg *config.Config, dataDir string, runtimeCore *core.State,
+) *errs.Error {
+	return EnsureCurSymbolsWithRuntimeConfigRetired(state, exchange, symbols, cfg, dataDir, runtimeCore, false)
+}
+
+// EnsureCurSymbolsWithRuntimeConfigRetired is EnsureCurSymbolsWithRuntimeConfig for factor Weights backtests:
+// with allowRetired, symbols missing from the current market table are resolved from the stored catalog when
+// RetiredSymbolReplayable holds (see there). Every other caller keeps the strict behaviour.
+func EnsureCurSymbolsWithRuntimeConfigRetired(state *SymbolState, exchange banexg.BanExchange, symbols []string,
+	cfg *config.Config, dataDir string, runtimeCore *core.State, allowRetired bool,
 ) *errs.Error {
 	if state == nil {
 		return errs.NewMsg(core.ErrRunTime, "runtime symbol state is required")
@@ -379,16 +388,16 @@ func EnsureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanEx
 			exInfo.ID, exInfo.MarketType, state.identityExchange, state.identityMarket)
 	}
 	return ensureCurSymbolsWithRuntimeConfig(state, exchange, exInfo.ID, exInfo.MarketType, symbols,
-		cfg, dataDir, runtimeCore, true)
+		cfg, dataDir, runtimeCore, true, allowRetired)
 }
 
 func ensureCurSymbols(state *SymbolState, exchange banexg.BanExchange, exchangeName, marketType string, symbols []string) *errs.Error {
 	return ensureCurSymbolsWithRuntimeConfig(state, exchange, exchangeName, marketType, symbols,
-		&config.Data, config.GetDataDir(), nil, false)
+		&config.Data, config.GetDataDir(), nil, false, false)
 }
 
 func ensureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, exchangeName, marketType string,
-	symbols []string, cfg *config.Config, dataDir string, runtimeCore *core.State, explicit bool,
+	symbols []string, cfg *config.Config, dataDir string, runtimeCore *core.State, explicit, allowRetired bool,
 ) *errs.Error {
 	if state == nil {
 		state = loadDefaultSymbolState()
@@ -404,7 +413,21 @@ func ensureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanEx
 	for _, symbol := range symbols {
 		mar, ok := marMap[symbol]
 		if !ok {
-			return errs.NewMsg(core.ErrInvalidSymbol, "symbol %s not found", symbol)
+			// Factor Weights backtests may pin instruments the exchange no longer lists (delisted perpetuals dropped
+			// from the current market table) when the catalog has their history inside the backtest window.
+			var stored *ExSymbol
+			if allowRetired {
+				var storedErr *errs.Error
+				stored, storedErr = storedRetiredSymbol(state, exchangeName, marketType, symbol, cfg)
+				if storedErr != nil {
+					return storedErr
+				}
+			}
+			if stored == nil {
+				return errs.NewMsg(core.ErrInvalidSymbol, "symbol %s not found in the exchange market table (symbols removed from the exchange are only supported by factor Weights backtests with stored data inside the time range)", symbol)
+			}
+			exsList = append(exsList, stored)
+			continue
 		}
 		exsList = append(exsList, &ExSymbol{
 			Exchange: exchangeName,
@@ -416,6 +439,60 @@ func ensureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanEx
 		})
 	}
 	return state.EnsureSymbols(exsList, exchangeName)
+}
+
+// retiredRangeTimeFrames are the stored timeframes whose range metadata proves a retired symbol has data.
+var retiredRangeTimeFrames = []string{"1d", "1h", "15m", "5m", "1m"}
+
+// klineRangeLookup returns the stored [start, stop) range of a symbol/timeframe (0, 0 = none). Replaced in tests.
+var klineRangeLookup = func(state *SymbolState, sid int32, timeFrame string) (int64, int64, error) {
+	q, conn, err := state.Conn(nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer conn.Release()
+	start, stop := q.GetKlineRange(sid, timeFrame)
+	return start, stop, nil
+}
+
+// RetiredSymbolReplayable reports whether a symbol missing from the exchange's current market table can still be
+// replayed: the catalog knows it and its stored kline range (range metadata of the common timeframes, not the
+// possibly synthetic DelistMs) overlaps the backtest window cfg.TimeRange. A symbol whose data ends before the
+// window starts is not replayable (it would be dropped from every decision grid and only dilute the pool).
+func RetiredSymbolReplayable(state *SymbolState, exchangeName, marketType, symbol string, cfg *config.Config) bool {
+	exs, err := storedRetiredSymbol(state, exchangeName, marketType, symbol, cfg)
+	return err == nil && exs != nil
+}
+
+// storedRetiredSymbol returns a copy of the stored identity (listing/delisting times kept, so ensuring it never
+// rewrites the catalog row) of a symbol that the catalog knows and whose stored data overlaps the backtest window;
+// nil = not replayable.
+func storedRetiredSymbol(state *SymbolState, exchangeName, marketType, symbol string, cfg *config.Config) (*ExSymbol, *errs.Error) {
+	if state == nil || cfg == nil || cfg.TimeRange == nil || cfg.TimeRange.StartMS <= 0 {
+		return nil, nil
+	}
+	if state.SymbolCount() == 0 {
+		// load the stored catalog without inserting anything
+		if err := state.EnsureSymbols(nil, exchangeName); err != nil {
+			return nil, err
+		}
+	}
+	item := state.GetExSymbol2(exchangeName, marketType, symbol)
+	if item == nil || item.ID <= 0 {
+		return nil, nil
+	}
+	startMS, endMS := cfg.TimeRange.StartMS, cfg.TimeRange.EndMS
+	for _, tf := range retiredRangeTimeFrames {
+		lo, hi, err := klineRangeLookup(state, item.ID, tf)
+		if err != nil {
+			return nil, errs.New(core.ErrDbReadFail, err)
+		}
+		if hi > 0 && hi >= startMS && (endMS <= 0 || lo < endMS) {
+			cp := *item
+			return &cp, nil
+		}
+	}
+	return nil, nil
 }
 
 func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {

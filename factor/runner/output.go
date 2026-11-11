@@ -13,6 +13,9 @@ import (
 type JSONOutput struct {
 	Writer io.Writer
 	SIDs   []int32
+	// NoPanel skips the per-decision panel rows (instruments x columns). Event lines are unchanged; the
+	// evaluation Summary is computed by the runner's accumulator and does not read written rows.
+	NoPanel bool
 }
 
 func (o *JSONOutput) Decision(f factor.Frame, p *factor.TargetPortfolio, d []factor.Diagnostic) error {
@@ -21,7 +24,7 @@ func (o *JSONOutput) Decision(f factor.Frame, p *factor.TargetPortfolio, d []fac
 		columns = append(columns, name)
 	}
 	sort.Strings(columns)
-	if err := research.WritePanel(o.Writer, f, columns, o.SIDs); err != nil {
+	if err := o.writePanel(f, columns); err != nil {
 		return err
 	}
 	event := struct {
@@ -63,7 +66,7 @@ func (o *JSONOutput) DecisionAllocation(f factor.Frame, p *factor.PortfolioTarge
 		columns = append(columns, name)
 	}
 	sort.Strings(columns)
-	if err := research.WritePanel(o.Writer, f, columns, o.SIDs); err != nil {
+	if err := o.writePanel(f, columns); err != nil {
 		return err
 	}
 	return json.NewEncoder(o.Writer).Encode(struct {
@@ -91,4 +94,11 @@ func (o *JSONOutput) Nav(s backtest.State, at int64) error {
 		AtMS      int64
 		NAV, Cash float64
 	}{"nav", at, s.NAV, s.Cash})
+}
+
+func (o *JSONOutput) writePanel(f factor.Frame, columns []string) error {
+	if o.NoPanel {
+		return nil
+	}
+	return research.WritePanel(o.Writer, f, columns, o.SIDs)
 }

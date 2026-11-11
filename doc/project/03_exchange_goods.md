@@ -144,7 +144,7 @@
 
 1. 校验 `deps` 各字段（Symbols / Exchange / Config / Core 必须非空）。
 2. `staticPairsWithConfig(cfg)`：合并 `cfg.Pairs` 与各 `RunPolicy.Pairs` 并去重。
-3. 有静态标的：`EnsureCurSymbolsWithRuntimeConfig`；若非冻结（`useFrozenStaticPairsWithRuntime`，回测严格模式下可冻结）则用 `GetSymbolVolsWithRuntimeDeps` 计算量并 `filterByMinCostWithRuntime`；`allowFilter = ForceFilters`。
+3. 有静态标的：`EnsureCurSymbolsWithRuntimeConfig`；若非冻结（`useFrozenStaticPairsWithRuntime`，回测严格模式下可冻结）则用 `GetSymbolVolsWithRuntimeDeps` 计算量并 `filterByMinCostWithRuntime`，仅 `RuntimeDeps.AllowRetiredPairs`（因子 Weights 存储回放）时，因交易所已无该市场而被过滤、但库内 K 线范围与回测窗口相交的静态品种由 `keepRetiredStaticPairs` 放回；`allowFilter = ForceFilters`。
 4. 无静态标的：重建过滤器链（`GetPairFiltersWithConfig(pairFilters(cfg), false, cfg)`），`filters[0]` 必须是 `IProducer`；优先 `RuntimeProducer` → `SymbolStateProducer` → `GenSymbols`。
 5. 无论静态与否，`EnsureCurSymbolsWithRuntimeConfig` 都会在候选确定后执行一次。
 6. `allowFilter` 为真时调用 `FilterPairsWithRuntimeDeps(filters[1:], deps, pairs, timeMS)`（goods/biz.go:340），逐个 `RuntimeFilter` / `SymbolStateFilter` / `IFilter`。
@@ -159,7 +159,7 @@
 
 ### 10. 最小下单额过滤
 
-`filterByMinCostWithRuntime`（filters.go）：取所有非 NoTrade 账户的 `stakeAmount` 最大值（若为 0 则用 default 账户的 stake），对每个标的 `minCost = Limits.Amount.Min * Price`，超过则跳过并记录。无市场或无 `Limits.Amount` 则放行。
+`filterByMinCostWithRuntime`（filters.go）：取所有非 NoTrade 账户的 `stakeAmount` 最大值（若为 0 则用 default 账户的 stake），对每个标的 `minCost = Limits.Amount.Min * Price`，超过则跳过并记录。无市场或无 `Limits.Amount` 的标的同样不进入结果（`AllowRetiredPairs` 时库内有窗口内数据的由 `keepRetiredStaticPairs` 放回）。
 
 ## 配置项与外部依赖
 

@@ -38,6 +38,9 @@ type Book struct {
 	pitExits            map[int32]pitExit
 	pitPenaltyBps       float64
 	gapLoss, delistLoss float64
+	// attribution observer (nil unless EnableAttribution); never read by the ledger itself
+	attr    *attribution
+	initNAV float64
 }
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
@@ -45,7 +48,7 @@ func NewBook(nav float64) (*Book, error) {
 	if nav <= 0 || !finite(nav) {
 		return nil, errors.New("backtest: invalid initial strategy NAV")
 	}
-	return &Book{cash: nav, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
+	return &Book{initNAV: nav, cash: nav, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
 }
 func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	if _, ok := b.terminals[sid]; ok {
@@ -63,6 +66,7 @@ func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	if ex, ok := b.pitExits[sid]; ok && q.AtMS > ex.atMS {
 		b.resolveRecovered(sid, ex, q.Price)
 	}
+	b.attrRevalue(sid, q.Price)
 	b.marks[sid] = q
 	b.ledgerCursor++
 	return nil
@@ -120,6 +124,7 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 			continue
 		}
 		q := quotes[sid]
+		b.attrRevalue(sid, q.Price)
 		qty := w * spec.Budget.NAV / q.Price
 		delta := qty - b.quantities[sid]
 		price := q.Price
@@ -134,6 +139,7 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 		b.fees += cost
 		b.slippage += math.Abs(delta * (price - q.Price))
 		b.turnover += notional
+		b.attr.trade(sid, b.quantities[sid], qty, q.Price, cost, math.Abs(delta*(price-q.Price)))
 		b.recordFirstFill(sid, qty, q.AtMS)
 		b.quantities[sid] = qty
 		b.marks[sid] = q
@@ -159,6 +165,7 @@ func (b *Book) ApplyFunding(f Funding, now int64) error {
 	cost := b.quantities[f.SID] * q.Price * f.Rate
 	b.cash -= cost
 	b.funding += cost
+	b.attr.addFunding(f.SID, cost)
 	b.fundingIDs[f.ID] = true
 	b.ledgerCursor++
 	return nil

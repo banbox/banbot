@@ -253,8 +253,8 @@ func RefreshPairListWithRuntimeDeps(deps *RuntimeDeps, timeMS int64) ([]string, 
 	// resolves them through the runtime-owned SymbolState. Explicit runtimes do
 	// not populate the legacy package catalog during construction.
 	if len(pairs) > 0 {
-		err = orm.EnsureCurSymbolsWithRuntimeConfig(deps.Symbols, deps.Exchange, pairs,
-			deps.Config, deps.DataDir, deps.Core)
+		err = orm.EnsureCurSymbolsWithRuntimeConfigRetired(deps.Symbols, deps.Exchange, pairs,
+			deps.Config, deps.DataDir, deps.Core, deps.AllowRetiredPairs)
 		if err != nil {
 			return nil, err
 		}
@@ -265,7 +265,8 @@ func RefreshPairListWithRuntimeDeps(deps *RuntimeDeps, timeMS int64) ([]string, 
 			if volErr != nil {
 				return nil, volErr
 			}
-			pairs, _ = filterByMinCostWithRuntime(deps.Exchange, pairVols, cfg, deps.ShowLog)
+			kept, _ := filterByMinCostWithRuntime(deps.Exchange, pairVols, cfg, deps.ShowLog)
+			pairs = keepRetiredStaticPairs(deps, pairVols, kept)
 		}
 		allowFilter = pairMgrForceFilters(cfg)
 	} else if len(pairs) == 0 {
@@ -435,6 +436,38 @@ func staticPairsWithConfig(cfg *config.Config) ([]string, bool) {
 		}
 	}
 	return result, needCalc
+}
+
+// keepRetiredStaticPairs re-admits static pairs that the min-cost filter dropped only because the exchange no longer
+// lists them. Only with deps.AllowRetiredPairs (factor Weights backtests, which need no exchange market metadata:
+// quantities are unrounded floats, costs come from the manifest) and only for symbols whose stored data overlaps the
+// backtest window (orm.RetiredSymbolReplayable); the order is that of vols.
+func keepRetiredStaticPairs(deps *RuntimeDeps, vols []*SymbolVol, kept []string) []string {
+	if deps == nil || !deps.AllowRetiredPairs || deps.Symbols == nil || deps.Exchange == nil || deps.Config == nil {
+		return kept
+	}
+	info := deps.Exchange.Info()
+	if info == nil {
+		return kept
+	}
+	has := make(map[string]bool, len(kept))
+	for _, symbol := range kept {
+		has[symbol] = true
+	}
+	out := make([]string, 0, len(vols))
+	for _, item := range vols {
+		if has[item.Symbol] {
+			out = append(out, item.Symbol)
+			continue
+		}
+		if _, err := deps.Exchange.GetMarket(item.Symbol); err == nil {
+			continue // listed, dropped by the cost filter
+		}
+		if orm.RetiredSymbolReplayable(deps.Symbols, info.ID, info.MarketType, item.Symbol, deps.Config) {
+			out = append(out, item.Symbol)
+		}
+	}
+	return out
 }
 
 func useFrozenStaticPairsWithRuntime(cfg *config.Config, state *core.State, pairs []string) bool {

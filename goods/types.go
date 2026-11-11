@@ -37,6 +37,9 @@ type RuntimeDeps struct {
 	Storage  *orm.Storage
 	Exchange banexg.BanExchange
 	ShowLog  bool
+	// AllowRetiredPairs (factor Weights backtests only): static pairs the exchange no longer lists stay in the pool
+	// when the catalog has their data inside the backtest window (orm.RetiredSymbolReplayable).
+	AllowRetiredPairs bool
 }
 
 // RuntimeFilter is implemented by built-in filters that need runtime-owned

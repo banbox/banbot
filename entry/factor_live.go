@@ -738,7 +738,7 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 		}
 		configs[index].ComputationGroup = group
 		configs[index].ComputationContext = runner.ComputationContext{DataNamespace: rt.ID, ClockDomain: rt.ID, SamplingIdentity: "live-publication-v1"}
-		engine, err := runner.NewLive(configs[index], sink, rt.Clock.TimeMS, &runner.JSONOutput{Writer: writer, SIDs: cfg.Snapshot.Universe.Evaluation})
+		engine, err := runner.NewLive(configs[index], sink, rt.Clock.TimeMS, &runner.JSONOutput{Writer: writer, SIDs: cfg.Snapshot.Universe.Evaluation, NoPanel: cfg.Panel == "none"})
 		if err != nil {
 			return err
 		}

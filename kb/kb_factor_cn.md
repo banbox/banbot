@@ -29,6 +29,7 @@
 | `prices` | `{source, timeframe, field}` 成交/估值价格流，见 1.7 |
 | `funding_source` | 资金费流 source 名（`required-stream` 必填；存储回放订阅 `{funding_source, event, rate}`） |
 | `option_expiry_source` `terminal_settlement_source` | 期权到期 / 终局结算流 source，见 7.2 |
+| `pit_min_universe_ratio` `pit_delist_penalty_bps` | 回测 PIT 参数：`pit_min_universe_ratio`（≤1，0=默认 0.5，<0 关闭 PIT 缩减）为一轮内至少保留的 Investable 比例，分母是上一次被接受决策时的存活数（滚动，首个决策用名义池）；`pit_delist_penalty_bps`（有限数，0=默认 100，<0 关）为被剔持仓平仓时额外的不利惩罚 bp，数据恢复则退回并改按缺口前后更差价计价 |
 | `initial_nav` | 策略初始 NAV（正数）；缺省 `wallet_amounts[manifest.currency]`，无则 10000；再乘 `capital_weight` |
 | `max_records` | 每批最大记录数，缺省 100000；被 `data.max_records` 覆盖 |
 | `expressions` `combo` `decision` `research` `portfolio` `manifest` `snapshot` | 见第 2 节、1.4–1.6、4.2、1.9 |
@@ -81,7 +82,7 @@ Events 归档回放最小示例：`execution: {mode: events, funding_policy: exp
 
 - `labels`：`[{name, kind, horizon, overlapping, periods_per_year}]`。`kind` 归档流水线只接受 `executable-return`（`close-to-close` 拒绝）；`horizon`（毫秒）与 `periods_per_year` 为正数；`overlapping` 布尔（默认 false）。
 - 未写 `research` 时自动一个标签：`name=run_timeframes 值`，`executable-return`，`horizon=决策间隔`，`periods_per_year=365.25×86400000/决策间隔毫秒`；写了 `research.labels` 则覆盖 `manifest.labels`。
-- `labels: []`：回测不生成标签；`research`/历史 IC 必须有标签。`label_wait_ms`≥0，默认 0。
+- `labels: []`：回测不生成标签；`research`/历史 IC 必须有标签。`label_wait_ms`≥0，默认 0。`research.panel`：`all`（默认）或 `none`。
 - 示例：`labels: [{name: forward_16h, kind: executable-return, horizon: 57600000, periods_per_year: 547.875, overlapping: true}]`。未成熟标签记 unresolved（`Result.Unresolved`），不得填零；未来标签不得进入当期选股。
 
 ### 1.6 源事件决策（Information bars 等不规则观测）
@@ -167,7 +168,7 @@ expressions:
 - `--schema` YAML 为 `{source: {field: type}}`，类型 `int int8 int16 int32 int64 uint uint8 uint16 uint32 uint64 float float32 float64 string bool json`。大整数需显式类型（无类型整数超 float64 精确范围被拒），同字段类型冲突报错；缺失键/NULL/字符串/自定义字段保留在 `Values`。
 - 归档身份推导：SID 集合、schema 摘要、source 版本、静态 `Universe`（`archive-static`）；`visibility_policy` 缺省 `available-at`；`adjustment_version` 缺省 `raw`；同 source 的 `SourceVersion` 档内须一致。
 - 存储回放：`pit_policy: static-approximation` 必须显式声明；标的池取策略级 `pairs`（缺省配置交易对），五池相同、静态，版本 `storage-static:<hash>`；K 线 schema 变化报错；需交易所/数据库。
-- 快照要求：Reference 与 Investable 中每个标的的所有计划输入在当前决策网格都必须有可见闭合记录，否则整轮跳过（计入 `IncompleteStreams`：SID、Source、TimeFrame、Missing、Invalid、FirstGridTime、LastGridTime）；上市、退市、数据缺口都会跳过。
+- 快照要求：Reference 与 Investable 中每个标的的所有计划输入在当前决策网格都必须有可见闭合记录。Weights 回测中，Investable 标的缺数据（上市前、退市后、数据缺口）会被时点宇宙（PIT）剔除，决策在缩减后的宇宙上继续（各池含 Reference 都去掉该标的；持仓按最后有效价平仓；`lifecycle-v1` 同样处理，policy 状态一并清洗，数据恢复后当新标的重新入选）；剔除记入 `UniverseDrops`/`DelistExits`/`DroppedBySID`，不记 `Incomplete`。仅属 Reference、不属 Investable 的标的缺数据、一轮内存活标的少于 `pit_min_universe_ratio × 上一次被接受决策时的存活数`（滚动分母，默认 0.5；逐个退市始终被接受，单轮大面积缺失被拒绝；存活不足 2 个但通过门槛时平仓并暂停该周期，计 `PausedPeriods`）、`pit_min_universe_ratio < 0`、或 Events/Trade 模式，则整轮跳过并计入 `IncompleteStreams`（SID、Source、TimeFrame、Missing、Invalid、FirstGridTime、LastGridTime）。
 - `Universe` 五池：`Investable` 候选；`Reference` 统计池；`Tradable` 可交易池（打分与选股均要求）；`Evaluation` 研究池；`Tracked` 退出后仍监控。
 - 快照不得混用不同 revision（冲突需显式 reconciliation）；迟到的资金费拒绝而非计入后续仓位。
 
@@ -377,7 +378,7 @@ func (p *Plan) Hash/TimeFrame/Outputs/Inputs/WarmupLength/StateRetention/NodeCou
 - `banbot trade --dry-run --config cfg.yml`：因子/混合 Events 历史回放（强制 events；纯时序模拟仍用 `env: dry_run`）。
 - `banbot trade --config cfg.yml [--live-provider NAME]`：实盘。
 - `--no-default` 跳过 `config.yml`、`config.local.yml`；`@`/`$` 路径需数据目录；归档回放可纯离线。
-- 事件 JSON 行写 stdout 与 `events.jsonl`。`--out DIR` 已存在则用 `DIR_1`、`DIR_2`…；缺省 `<DataDir|BanDataDir|归档目录>/backtest/factor`。产物：`config.yml`（生效配置）、`resolved.json`（各字段实际值与来源）、`events.jsonl`、`strategy-N.json`、`run.json`（`{Version, Status(complete|incomplete), Errors, Results}`；有 Unresolved 即 incomplete）；Events 另有 `account-<account>/manifest.json`、`chunk-NNNNNN.gob`。`Result` 含 Decisions、Executions、Skipped、Incomplete、Unresolved、TargetsAccepted、Fills、Book、Account、Summary、IncompleteStreams 等。
+- 事件 JSON 行写 stdout 与 `events.jsonl`。`--out DIR` 已存在则用 `DIR_1`、`DIR_2`…；缺省 `<DataDir|BanDataDir|归档目录>/backtest/factor`。产物：`config.yml`（生效配置）、`resolved.json`（各字段实际值与来源）、`events.jsonl`、`strategy-N.json`、`run.json`（`{Version, Status(complete|incomplete), Errors, Results}`；有 Unresolved 即 incomplete）；Events 另有 `account-<account>/manifest.json`、`chunk-NNNNNN.gob`。`Result` 含 Decisions、Executions、Skipped、Incomplete、Unresolved、TargetsAccepted、Fills、Book、Account、Summary、IncompleteStreams 等；Weights 回测另有 `Attribution`（多头/空头腿盈亏、换手、平均敞口、费用/滑点/资金费/PIT 成本、`TopSymbols` 逐标的净贡献与占比，`FinalNAV−InitialNAV = LongPnL+ShortPnL−成本+Residual`，Residual 仅浮点舍入）；配对策略另有 `Pairs`（每对 Episodes、PnL、Trades、WinRate、InMarketBars、PausedBars、AvgHoldBars、LastBeta、Turnover）与对账项 `PairsGrossPnL/PairsNAVReturn/PairsResidual`（逐对盈亏按决策时刻价格近似、不含成本，残差≈成本+执行近似）。`research.panel: none` 不写每决策的 panel 行（事件行、Summary、账本不变，百万行级输出时使用）。
 
 ### 7.2 回放语义
 

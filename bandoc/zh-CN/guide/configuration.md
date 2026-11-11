@@ -387,7 +387,7 @@ bt_in_live:
 | run_policy[].expressions | schema_version, timeframe, bindings, params, lets, outputs, combine |
 | run_policy[].combo / run_policy[].expressions.combine | method: equal/fixed/history-ic, columns, weights |
 | run_policy[].portfolio | builder, k, long_notional, short_notional, mode: full/patch |
-| run_policy[].research | labels, label_wait_ms |
+| run_policy[].research | labels, label_wait_ms, panel (all/none) |
 | run_policy[].prices | source, timeframe, field |
 
 accounts.&lt;account&gt; 覆盖账户设置；风险额度为结算货币绝对金额。archive/store/history/sender_lease_dir 相对字段来源文件定位，多 --config 不以最后一文件统一定位。最新值存储需 static-approximation；page_bytes 是逻辑载荷，不是 RSS。见[因子示例](./factor.md)。

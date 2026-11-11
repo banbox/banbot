@@ -6,9 +6,9 @@ import (
 )
 
 // rita round6 (3): an instrument that has market data and then loses 1/3 of the run (data ends at bar 16 of 24).
-//   - lifecycle policy: NOT dropped (081 NeverSeenAll=false) -> the decisions stay skipped -> Incomplete counts them,
-//     so bansite skipped_ratio = Incomplete/(Decisions+Incomplete) flags it;
-//   - weights mode: PIT (067) drops it (UniverseDrops), Incomplete stays 0 (by design, reported via universe_drops /
+//   - lifecycle policy: dropped like in weights mode (the Book closes it, the policy checkpoint forgets it), the
+//     decisions go on, Incomplete stays 0;
+//   - weights mode: PIT (067) drops it (UniverseDrops), Incomplete stays 0 (reported via universe_drops /
 //     universe_avg_ratio / delist_exits).
 func TestRitaMidRunMissingInstrument(t *testing.T) {
 	const bars = 24
@@ -26,8 +26,8 @@ func TestRitaMidRunMissingInstrument(t *testing.T) {
 	}
 	ratio := float64(r.Incomplete) / float64(max(r.Decisions+r.Incomplete, 1))
 	t.Logf("policy: decisions=%d incomplete=%d drops=%d exits=%d skipped_ratio=%.2f", r.Decisions, r.Incomplete, r.UniverseDrops, r.DelistExits, ratio)
-	if r.Incomplete == 0 || ratio <= 0.2 {
-		t.Fatalf("policy mode must flag a 1/3 missing instrument: %.2f", ratio)
+	if r.Incomplete != 0 || r.UniverseDrops == 0 || r.DelistExits > 1 {
+		t.Fatalf("policy mode must drop the dead instrument and keep deciding: %.2f", ratio)
 	}
 	w := pitConfigFrom(t, nil, map[int32]int64{1: bars, 2: bars, 3: 16}, bars, 0)
 	rw, err := Run(context.Background(), w, nil, nil)

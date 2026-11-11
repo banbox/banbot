@@ -118,6 +118,8 @@ func resolvedFactorValues(spec *config.RunSpec, configs []runner.Config) ([]map[
 		set("decision_timeframe", c.Factor.TimeFrame, "default factor timeframe", prefix+"decision.timeframe", prefix+"run_timeframes", "run_timeframes")
 		set("option_expiry_source", c.OptionExpirySource, "no option expiry stream", prefix+"option_expiry_source")
 		set("terminal_settlement_source", c.TerminalSettlementSource, "no terminal settlement stream", prefix+"terminal_settlement_source")
+		set("pit_min_universe_ratio", c.PITMinUniverseRatio, "0 = default 0.5 (<0 disables the PIT universe reduction)", prefix+"pit_min_universe_ratio")
+		set("pit_delist_penalty_bps", c.PITDelistPenaltyBps, "0 = default 100bp (<0 disables the delist penalty)", prefix+"pit_delist_penalty_bps")
 		set("paper_fill_model", c.Execution.PaperFillModel, "midpoint paper default", "accounts."+c.AccountID+".paper_fill_model", "execution.paper_fill_model")
 		set("funding_source", c.FundingSource, "explicit required funding source", prefix+"funding_source")
 		set("funding_policy", c.Manifest.Costs.FundingPolicy, "explicit simulation policy", "accounts."+c.AccountID+".funding_policy", "execution.funding_policy", prefix+"manifest.costs.funding_policy")

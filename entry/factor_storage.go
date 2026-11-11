@@ -141,6 +141,22 @@ type factorStorageAssembly struct {
 	bootstrap func(context.Context, *data.SubscriptionPlan) error
 }
 
+// weightsOnlyFactorRun reports whether the run is factor Weights replay only (no time-series policy, no Events/Trade
+// strategy): the one path validated for static pairs the exchange no longer lists.
+func weightsOnlyFactorRun(spec *config.RunSpec, configs []runner.Config) bool {
+	for _, policy := range spec.Config().RunPolicy {
+		if policy.Engine != config.EngineFactor {
+			return false
+		}
+	}
+	for i := range configs {
+		if configs[i].Mode != runner.Weights {
+			return false
+		}
+	}
+	return len(configs) > 0
+}
+
 // prepareFactorStorageInputs keeps the source session alive until all replay
 // consumers have stopped and joined. It never exports a temporary archive.
 func prepareFactorStorageInputs(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec, configs []runner.Config) ([]runner.Config, func() error, error) {
@@ -174,7 +190,7 @@ func prepareFactorStorageInputs(ctx context.Context, args *config.CmdArgs, spec 
 	if err != nil {
 		return nil, nil, errors.Join(err, cleanup())
 	}
-	pairs, pairErr := goods.RefreshPairListWithRuntimeDeps(&goods.RuntimeDeps{Core: task.Core, Clock: task.Clock, Config: snapshot.View(), DataDir: snapshot.DataDir, Symbols: task.Symbols, Storage: task.Storage, Exchange: task.Exchange}, task.Clock.TimeMS())
+	pairs, pairErr := goods.RefreshPairListWithRuntimeDeps(&goods.RuntimeDeps{Core: task.Core, Clock: task.Clock, Config: snapshot.View(), DataDir: snapshot.DataDir, Symbols: task.Symbols, Storage: task.Storage, Exchange: task.Exchange, AllowRetiredPairs: weightsOnlyFactorRun(spec, configs)}, task.Clock.TimeMS())
 	if pairErr != nil {
 		return nil, nil, errors.Join(pairErr, cleanup())
 	}

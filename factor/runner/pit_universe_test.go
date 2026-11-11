@@ -27,6 +27,12 @@ func pitConfig(t *testing.T, lastBar map[int32]int64, bars int64, minRatio float
 // pitConfigFrom is pitConfig with a per-instrument first bar (late listing).
 func pitConfigFrom(t *testing.T, firstBar, lastBar map[int32]int64, bars int64, minRatio float64) Config {
 	t.Helper()
+	return pitConfigFn(t, func(sid int32, bar int64) bool { return bar >= firstBar[sid] && bar <= lastBar[sid] }, bars, minRatio)
+}
+
+// pitConfigFn is pitConfig with an arbitrary per-instrument presence function (late listing, delisting, holes).
+func pitConfigFn(t *testing.T, present func(sid int32, bar int64) bool, bars int64, minRatio float64) Config {
+	t.Helper()
 	c := archiveConfig(t, false)
 	c.Mode = Weights
 	c.Manifest.Costs.FundingPolicy = "explicit-zero"
@@ -46,7 +52,7 @@ func pitConfigFrom(t *testing.T, firstBar, lastBar map[int32]int64, bars int64, 
 		t.Fatal(err)
 	}
 	c.Combo = research.ComboSpec{Method: research.Fixed, Columns: []string{"close"}, Weights: map[string]float64{"close": 1}}
-	store, err := factor.NewVersionStore(200)
+	store, err := factor.NewVersionStore(400)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,11 +60,8 @@ func pitConfigFrom(t *testing.T, firstBar, lastBar map[int32]int64, bars int64, 
 	price := map[int32]float64{1: 200, 2: 100, 3: 300} // 3 is the top score -> long; 2 the bottom -> short
 	for _, sid := range sids {
 		for bar := int64(1); bar <= bars; bar++ {
-			if bar < firstBar[sid] {
+			if !present(sid, bar) {
 				continue
-			}
-			if bar > lastBar[sid] {
-				break
 			}
 			at := bar * hour
 			err = store.Put(factor.VersionRecord{Series: orm.DataSeries{Source: "kline", TimeFrame: "1h", Sid: sid, TimeMS: at - hour, EndMS: at, Closed: true, Values: map[string]any{"close": price[sid]}}, EventTime: at, AvailableAt: at, IngestedAt: at, Revision: 1, SourceVersion: "v1"})

@@ -81,7 +81,11 @@ func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error {
 		if err != nil {
 			return nil, err
 		}
-		return newPairsBuilder(spec, c.Snapshot.SIDMap)
+		builder, tracker, err := newTrackedPairsBuilder(spec, c.Snapshot.SIDMap)
+		if err == nil && c.observe != nil {
+			c.observe.pairs, c.observe.reset = tracker.report, tracker.resetStats
+		}
+		return builder, err
 	}, func(c Config) error {
 		_, err := resolvePairsSpec(build, c)
 		return err
@@ -134,9 +138,17 @@ type pairState struct {
 	trader *statistics.BandTrader
 	beta   float64 // hedge ratio frozen at entry
 	pos    int
+	stats  pairStats // result bookkeeping only; never read by the trading logic
 }
 
 func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder, error) {
+	b, _, err := newTrackedPairsBuilder(spec, sidMap)
+	return b, err
+}
+
+// newTrackedPairsBuilder is newPairsBuilder plus the tracker that reports per-pair results after the run. The
+// tracker is write-only state of the builder: weights are computed exactly as without it.
+func newTrackedPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder, *pairsTracker, error) {
 	sids := make(map[string]int32, len(sidMap))
 	for sid, symbol := range sidMap {
 		sids[symbol] = sid
@@ -146,19 +158,21 @@ func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder,
 		y, okY := sids[pair.Y]
 		x, okX := sids[pair.X]
 		if !okY || !okX {
-			return nil, fmt.Errorf("runner: pair %s/%s has a symbol missing from this run's universe", pair.Y, pair.X)
+			return nil, nil, fmt.Errorf("runner: pair %s/%s has a symbol missing from this run's universe", pair.Y, pair.X)
 		}
 		rs, err := statistics.NewRollingSpread(spec.Window)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		bt, err := statistics.NewBandTrader(spec.Band)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		states[i] = &pairState{y: y, x: x, spread: rs, trader: bt}
 	}
-	return func(frame factor.Frame, universe factor.Universe, target factor.PortfolioSpec, _ research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error) {
+	tracker := &pairsTracker{states: states, names: spec.Pairs}
+	tracker.resetStats()
+	build := func(frame factor.Frame, universe factor.Universe, target factor.PortfolioSpec, _ research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error) {
 		tradable := make(map[int32]bool, len(universe.Tradable))
 		for _, sid := range universe.Tradable {
 			tradable[sid] = true
@@ -166,12 +180,18 @@ func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder,
 		values := frame.Values[pairsLogOutput]
 		var diags []factor.Diagnostic
 		ready := false
+		navPrev := tracker.lastNAV
+		tracker.lastNAV = target.Budget.NAV
+		tracker.lastMS = frame.DecisionTime
 		for _, st := range states {
 			ly, okY := values[st.y]
 			lx, okX := values[st.x]
 			if !okY || !okX || ly.Validity != factor.Valid || lx.Validity != factor.Valid {
 				diags = append(diags, factor.Diagnostic{Code: "pair-input-missing", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
+				st.stats.paused++
+				st.stats.prevOK = false
 				if st.pos != 0 {
+					st.stats.closeEpisode(frame.DecisionTime, 0, "leg_missing")
 					// 067: a leg has no data this period (PIT universe drop / delisting): close the pair and pause it;
 					// it may reopen when both legs are back
 					st.pos, st.beta = 0, 0
@@ -181,12 +201,14 @@ func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder,
 				}
 				continue
 			}
+			st.stats.accrue(ly.Value, lx.Value, navPrev)
 			point, ok := st.spread.Observe(lx.Value, ly.Value)
 			if !ok {
 				diags = append(diags, factor.Diagnostic{Code: "pair-warmup", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
 				continue
 			}
 			ready = true
+			st.stats.bars++
 			if !tradable[st.y] || !tradable[st.x] {
 				// Never open on an untradable leg; an existing position keeps its state
 				// but the target below drops to flat only through the band rules.
@@ -199,19 +221,22 @@ func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder,
 			if st.pos != 0 && (prev == 0 || prev != st.pos) {
 				st.beta = point.Beta
 			}
+			st.stats.observeStep(prev, st.pos, point.Z, st.beta, frame.DecisionTime, spec.Band)
 		}
 		if !ready {
 			return nil, append(diags, factor.Diagnostic{Code: "pairs-not-ready", Detail: "no pair has a full window; keep previous portfolio"}), nil
 		}
 		weights := map[int32]float64{}
 		for _, st := range states {
-			if st.pos == 0 {
-				continue
+			var wy, wx float64
+			if st.pos != 0 {
+				norm := 1 + math.Abs(st.beta)
+				s := float64(st.pos) * spec.Gross / norm
+				wy, wx = s, -s*st.beta
+				weights[st.y] += wy
+				weights[st.x] += wx
 			}
-			norm := 1 + math.Abs(st.beta)
-			s := float64(st.pos) * spec.Gross / norm
-			weights[st.y] += s
-			weights[st.x] += -s * st.beta
+			st.stats.setWeights(wy, wx)
 		}
 		for sid, w := range weights {
 			if w == 0 {
@@ -221,7 +246,8 @@ func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder,
 		target.Diagnostics = slices.Clone(diags)
 		p, err := factor.NewTargetPortfolio(target, weights)
 		return p, nil, err
-	}, nil
+	}
+	return build, tracker, nil
 }
 
 // pairsLegResolvers maps a registered pairs portfolio builder name to its spec constructor, so the runner can

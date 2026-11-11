@@ -50,7 +50,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.HasSuffix(path, ".allocation"):
 		allowed = "method reserve_ratio fixed_notional vol_target asset_cap group_caps turnover_limit net_cap beta_cap"
 	case strings.HasSuffix(path, ".research"):
-		allowed = "labels label_wait_ms"
+		allowed = "labels label_wait_ms panel"
 	case strings.HasSuffix(path, ".snapshot"):
 		allowed = "grid_time decision_time replay_time universe sid_map schemas source_versions adjustment_version visibility_policy"
 	case strings.HasSuffix(path, ".universe"):
@@ -135,6 +135,16 @@ func validateAdvanced(path string, fields map[string]any) error {
 			number := numeric(value)
 			if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
 				return fmt.Errorf("%s must be a finite nonnegative number", field)
+			}
+		case "pit_min_universe_ratio", "pit_delist_penalty_bps":
+			// 0 = default; pit_min_universe_ratio < 0 disables the PIT reduction (and must not exceed 1),
+			// pit_delist_penalty_bps < 0 switches the delist penalty off
+			number := numeric(value)
+			if math.IsNaN(number) || math.IsInf(number, 0) {
+				return fmt.Errorf("%s must be a finite number", field)
+			}
+			if key == "pit_min_universe_ratio" && number > 1 {
+				return fmt.Errorf("%s must be <= 1", field)
 			}
 		case "margin_rate", "max_account_margin", "max_virtual_gross", "strategy_gross_limit":
 			switch value.(type) {

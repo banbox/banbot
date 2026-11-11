@@ -198,6 +198,7 @@
 - 标的身份由 `exchange + market + symbol` 决定，`exg_real` 仅作元数据（见 doc/custom_data.md 3.3）。
 - 加载：`LoadExgSymbols`（orm/exsymbol.go:50）→ `ListSymbols`（pub_meta_queries.go:439，`LATEST BY sid`）→ `cacheExgSymbolsForState`（exsymbol.go:95）。
 - 新增：`EnsureSymbols`（exsymbol.go:428）→ `reserveStateSymbols`（:549）→ `addSymbolsLocked`（pub_meta_queries.go:495）。QuestDB 路径：先写 pending marker，再 INSERT，逐行标记 Inserted，可见后确认并删除标记。
+- 按当前市场表登记：`EnsureCurSymbols*`（`ensureCurSymbolsWithRuntimeConfig`）只接受交易所当前市场表里的品种，否则 `symbol ... not found in the exchange market table`；例外仅限 `EnsureCurSymbolsWithRuntimeConfigRetired(allowRetired=true)`（因子存储回放且全部 run_policy 为 factor、全部配置为 Weights 时由 `entry/factor_storage.go:weightsOnlyFactorRun` 经 `goods.RuntimeDeps.AllowRetiredPairs` 打开）：库内有该品种、且其 1d/1h/15m/5m/1m 的 K 线 range 元数据与回测窗口 `TimeRange` 相交（`RetiredSymbolReplayable`；不看可能是合成标记的 `DelistMs`）时，按库内记录原样解析（复制存量 ListMs/DelistMs，不改写目录行）；数据早于窗口开始的、未知的品种仍报错。
 - SID 分配：`SIDAllocator`（symbol_state.go:15）原子递增；reservation 通过 `reservationKeys` 反查，保证同一 SID 不被两个逻辑键占用。PG 下由 `SymbolSIDRegistry.Reserve`（sid_registry.go:193，ON CONFLICT 返回既有行）保证唯一。
 
 ## 配置项与外部依赖
