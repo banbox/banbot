@@ -253,10 +253,34 @@ func RefreshPairListWithRuntimeDeps(deps *RuntimeDeps, timeMS int64) ([]string, 
 	// resolves them through the runtime-owned SymbolState. Explicit runtimes do
 	// not populate the legacy package catalog during construction.
 	if len(pairs) > 0 {
-		err = orm.EnsureCurSymbolsWithRuntimeConfigRetired(deps.Symbols, deps.Exchange, pairs,
-			deps.Config, deps.DataDir, deps.Core, deps.AllowRetiredPairs)
-		if err != nil {
-			return nil, err
+		if deps.AllowRetiredPairs {
+			// factor Weights backtest (PIT rule): a pool member without any stored data in this window is unavailable for it,
+			// not a reason to fail the run; the rest of the pool goes on
+			skipped, skipErr := orm.EnsureCurSymbolsSkippingUnavailable(deps.Symbols, deps.Exchange, pairs, deps.Config, deps.DataDir, deps.Core)
+			if skipErr != nil {
+				return nil, skipErr
+			}
+			if len(skipped) > 0 {
+				drop := make(map[string]bool, len(skipped))
+				names := make([]string, len(skipped))
+				for i, sp := range skipped {
+					drop[sp.Symbol], names[i] = true, sp.Symbol
+				}
+				kept := make([]string, 0, len(pairs)-len(skipped))
+				for _, sym := range pairs {
+					if !drop[sym] {
+						kept = append(kept, sym)
+					}
+				}
+				pairs, deps.SkippedPairs = kept, skipped
+				log.Warn(fmt.Sprintf("pool members without stored data inside the backtest window skipped: %s", strings.Join(names, ",")))
+			}
+		} else {
+			err = orm.EnsureCurSymbolsWithRuntimeConfigRetired(deps.Symbols, deps.Exchange, pairs,
+				deps.Config, deps.DataDir, deps.Core, false)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	if len(pairs) > 0 {

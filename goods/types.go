@@ -40,6 +40,9 @@ type RuntimeDeps struct {
 	// AllowRetiredPairs (factor Weights backtests only): static pairs the exchange no longer lists stay in the pool
 	// when the catalog has their data inside the backtest window (orm.RetiredSymbolReplayable).
 	AllowRetiredPairs bool
+	// SkippedPairs is set by RefreshPairListWithRuntimeDeps (AllowRetiredPairs only): static pairs with no stored data inside
+	// the backtest window (retired before it / listed after it) that were left out of the pool (BtFeatureLevel 9).
+	SkippedPairs []orm.SkippedPair
 }
 
 // RuntimeFilter is implemented by built-in filters that need runtime-owned

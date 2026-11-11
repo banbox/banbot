@@ -144,7 +144,7 @@
 
 1. 校验 `deps` 各字段（Symbols / Exchange / Config / Core 必须非空）。
 2. `staticPairsWithConfig(cfg)`：合并 `cfg.Pairs` 与各 `RunPolicy.Pairs` 并去重。
-3. 有静态标的：`EnsureCurSymbolsWithRuntimeConfig`；若非冻结（`useFrozenStaticPairsWithRuntime`，回测严格模式下可冻结）则用 `GetSymbolVolsWithRuntimeDeps` 计算量并 `filterByMinCostWithRuntime`，仅 `RuntimeDeps.AllowRetiredPairs`（因子 Weights 存储回放）时，因交易所已无该市场而被过滤、但库内 K 线范围与回测窗口相交的静态品种由 `keepRetiredStaticPairs` 放回；`allowFilter = ForceFilters`。
+3. 有静态标的：`EnsureCurSymbolsWithRuntimeConfig`（`AllowRetiredPairs` 时为 `EnsureCurSymbolsSkippingUnavailable`：窗口内无存量 K 线的退市品种从池中拿掉并记入 `RuntimeDeps.SkippedPairs`，见 02 文档）；若非冻结（`useFrozenStaticPairsWithRuntime`，回测严格模式下可冻结）则用 `GetSymbolVolsWithRuntimeDeps` 计算量并 `filterByMinCostWithRuntime`，仅 `RuntimeDeps.AllowRetiredPairs`（因子 Weights 存储回放）时，因交易所已无该市场而被过滤、但库内 K 线范围与回测窗口相交的静态品种由 `keepRetiredStaticPairs` 放回；`allowFilter = ForceFilters`。
 4. 无静态标的：重建过滤器链（`GetPairFiltersWithConfig(pairFilters(cfg), false, cfg)`），`filters[0]` 必须是 `IProducer`；优先 `RuntimeProducer` → `SymbolStateProducer` → `GenSymbols`。
 5. 无论静态与否，`EnsureCurSymbolsWithRuntimeConfig` 都会在候选确定后执行一次。
 6. `allowFilter` 为真时调用 `FilterPairsWithRuntimeDeps(filters[1:], deps, pairs, timeMS)`（goods/biz.go:340），逐个 `RuntimeFilter` / `SymbolStateFilter` / `IFilter`。

@@ -355,7 +355,7 @@ func EnsureCurSymbolsWithSymbolState(state *SymbolState, exchange banexg.BanExch
 			exInfo.ID, exInfo.MarketType, state.identityExchange, state.identityMarket)
 	}
 	return ensureCurSymbolsWithRuntimeConfig(state, exchange, exInfo.ID, exInfo.MarketType, symbols,
-		&config.Data, config.GetDataDir(), nil, false, false)
+		&config.Data, config.GetDataDir(), nil, false, false, nil)
 }
 
 // EnsureCurSymbolsWithRuntimeConfig registers current markets using the
@@ -388,43 +388,109 @@ func EnsureCurSymbolsWithRuntimeConfigRetired(state *SymbolState, exchange banex
 			exInfo.ID, exInfo.MarketType, state.identityExchange, state.identityMarket)
 	}
 	return ensureCurSymbolsWithRuntimeConfig(state, exchange, exInfo.ID, exInfo.MarketType, symbols,
-		cfg, dataDir, runtimeCore, true, allowRetired)
+		cfg, dataDir, runtimeCore, true, allowRetired, nil)
+}
+
+// EnsureCurSymbolsSkippingUnavailable is EnsureCurSymbolsWithRuntimeConfigRetired(allowRetired=true) for factor Weights
+// backtests with the PIT rule for pool members that have no data in this run: a symbol missing from the exchange's
+// market table whose catalog identity is known but whose stored kline ranges do not overlap the backtest window (it
+// delisted before the window, or lists after it) is not an error; it is left out of the registration and returned in
+// skipped (the caller drops it from the pool). Symbols the catalog does not know still fail with ErrInvalidSymbol, and
+// so does a pool in which no member is available at all. Pools whose members all have data behave exactly as before.
+func EnsureCurSymbolsSkippingUnavailable(state *SymbolState, exchange banexg.BanExchange, symbols []string,
+	cfg *config.Config, dataDir string, runtimeCore *core.State,
+) (skipped []SkippedPair, err *errs.Error) {
+	if state == nil {
+		return nil, errs.NewMsg(core.ErrRunTime, "runtime symbol state is required")
+	}
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	exInfo := exchange.Info()
+	if exInfo == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange info is required")
+	}
+	if !state.acceptsIdentity(exInfo.ID, exInfo.MarketType) {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange %s market %s does not match symbol state identity %s:%s",
+			exInfo.ID, exInfo.MarketType, state.identityExchange, state.identityMarket)
+	}
+	err = ensureCurSymbolsWithRuntimeConfig(state, exchange, exInfo.ID, exInfo.MarketType, symbols,
+		cfg, dataDir, runtimeCore, true, true, &skipped)
+	return skipped, err
 }
 
 func ensureCurSymbols(state *SymbolState, exchange banexg.BanExchange, exchangeName, marketType string, symbols []string) *errs.Error {
 	return ensureCurSymbolsWithRuntimeConfig(state, exchange, exchangeName, marketType, symbols,
-		&config.Data, config.GetDataDir(), nil, false, false)
+		&config.Data, config.GetDataDir(), nil, false, false, nil)
 }
 
-func ensureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, exchangeName, marketType string,
-	symbols []string, cfg *config.Config, dataDir string, runtimeCore *core.State, explicit, allowRetired bool,
-) *errs.Error {
-	if state == nil {
-		state = loadDefaultSymbolState()
+// SkippedPair is a pool member left out of a run because it has no stored data inside the window (run.json skipped_pairs).
+type SkippedPair struct {
+	Symbol string `json:"symbol"`
+	// Reason: data_ends_before_window (retired / data stops before the window starts), data_starts_after_window (lists after
+	// the window ends) or no_stored_data.
+	Reason string `json:"reason"`
+}
+
+// retiredWindowReason says why a catalog-known symbol has no stored data inside cfg.TimeRange.
+func retiredWindowReason(state *SymbolState, exchangeName, marketType, symbol string, cfg *config.Config) string {
+	item := state.GetExSymbol2(exchangeName, marketType, symbol)
+	if item == nil {
+		var err error
+		if item, err = catalogSymbolLookup(state, exchangeName, marketType, symbol); err != nil || item == nil {
+			return "no_stored_data"
+		}
 	}
-	if exchange == nil {
-		return errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	var lo, hi int64
+	for _, tf := range retiredRangeTimeFrames {
+		a, b, err := klineRangeLookup(state, item.ID, tf)
+		if err != nil || b <= 0 {
+			continue
+		}
+		if lo == 0 || a < lo {
+			lo = a
+		}
+		hi = max(hi, b)
 	}
+	switch {
+	case hi <= 0:
+		return "no_stored_data"
+	case hi < cfg.TimeRange.StartMS:
+		return "data_ends_before_window"
+	case cfg.TimeRange.EndMS > 0 && lo >= cfg.TimeRange.EndMS:
+		return "data_starts_after_window"
+	}
+	return "no_stored_data"
+}
+
+// resolveEnsureList turns the requested symbols into the identities to register: markets of the exchange's current
+// table, stored identities of retired symbols (allowRetired), and, when skipped is given, retired symbols the catalog
+// knows but that have no stored data inside the window are left out and appended to *skipped (a pool in which every
+// symbol is unavailable is an ErrInvalidSymbol).
+func resolveEnsureList(state *SymbolState, marMap banexg.MarketMap, exchangeName, marketType string, symbols []string,
+	cfg *config.Config, allowRetired bool, skipped *[]SkippedPair,
+) ([]*ExSymbol, *errs.Error) {
 	exsList := make([]*ExSymbol, 0, len(symbols))
-	marMap, err := loadMarketsWithRuntimeConfig(state, exchange, false, cfg, dataDir, runtimeCore, explicit)
-	if err != nil {
-		return err
-	}
 	for _, symbol := range symbols {
 		mar, ok := marMap[symbol]
 		if !ok {
 			// Factor Weights backtests may pin instruments the exchange no longer lists (delisted perpetuals dropped
 			// from the current market table) when the catalog has their history inside the backtest window.
 			var stored *ExSymbol
+			known := false
 			if allowRetired {
 				var storedErr *errs.Error
-				stored, storedErr = storedRetiredSymbol(state, exchangeName, marketType, symbol, cfg)
+				stored, known, storedErr = storedRetiredLookup(state, exchangeName, marketType, symbol, cfg)
 				if storedErr != nil {
-					return storedErr
+					return nil, storedErr
 				}
 			}
+			if stored == nil && known && skipped != nil {
+				*skipped = append(*skipped, SkippedPair{Symbol: symbol, Reason: retiredWindowReason(state, exchangeName, marketType, symbol, cfg)}) // known to the catalog, no stored data in this window: unavailable, not an error
+				continue
+			}
 			if stored == nil {
-				return errs.NewMsg(core.ErrInvalidSymbol, "symbol %s not found in the exchange market table (symbols removed from the exchange are only supported by factor Weights backtests with stored data inside the time range)", symbol)
+				return nil, errs.NewMsg(core.ErrInvalidSymbol, "symbol %s not found in the exchange market table (symbols removed from the exchange are only supported by factor Weights backtests with stored data inside the time range)", symbol)
 			}
 			exsList = append(exsList, stored)
 			continue
@@ -438,7 +504,55 @@ func ensureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanEx
 			DelistMs: mar.Expiry,
 		})
 	}
+	if skipped != nil && len(symbols) > 0 && len(*skipped) == len(symbols) {
+		names := make([]string, len(*skipped))
+		for i, sp := range *skipped {
+			names[i] = sp.Symbol
+		}
+		return nil, errs.NewMsg(core.ErrInvalidSymbol, "no pool member has stored data inside the backtest window (unavailable: %s)", strings.Join(names, ","))
+	}
+	return exsList, nil
+}
+
+func ensureCurSymbolsWithRuntimeConfig(state *SymbolState, exchange banexg.BanExchange, exchangeName, marketType string,
+	symbols []string, cfg *config.Config, dataDir string, runtimeCore *core.State, explicit, allowRetired bool, skipped *[]SkippedPair,
+) *errs.Error {
+	if state == nil {
+		state = loadDefaultSymbolState()
+	}
+	if exchange == nil {
+		return errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	marMap, err := loadMarketsWithRuntimeConfig(state, exchange, false, cfg, dataDir, runtimeCore, explicit)
+	if err != nil {
+		return err
+	}
+	exsList, resErr := resolveEnsureList(state, marMap, exchangeName, marketType, symbols, cfg, allowRetired, skipped)
+	if resErr != nil {
+		return resErr
+	}
 	return state.EnsureSymbols(exsList, exchangeName)
+}
+
+// catalogSymbolLookup reads one symbol identity from the stored catalog (exsymbol); nil = the catalog does not know it.
+// Replaced in tests.
+var catalogSymbolLookup = func(state *SymbolState, exchangeName, marketType, symbol string) (*ExSymbol, error) {
+	q, conn, cerr := state.Conn(nil)
+	if cerr != nil {
+		return nil, cerr
+	}
+	defer conn.Release()
+	list, err := q.ListSymbols(context.Background(), exchangeName)
+	if err != nil {
+		return nil, err
+	}
+	for _, exs := range list {
+		if exs != nil && exs.Market == marketType && exs.Symbol == symbol && !exs.Combined {
+			cp := *exs
+			return &cp, nil
+		}
+	}
+	return nil, nil
 }
 
 // retiredRangeTimeFrames are the stored timeframes whose range metadata proves a retired symbol has data.
@@ -468,31 +582,46 @@ func RetiredSymbolReplayable(state *SymbolState, exchangeName, marketType, symbo
 // rewrites the catalog row) of a symbol that the catalog knows and whose stored data overlaps the backtest window;
 // nil = not replayable.
 func storedRetiredSymbol(state *SymbolState, exchangeName, marketType, symbol string, cfg *config.Config) (*ExSymbol, *errs.Error) {
+	item, _, err := storedRetiredLookup(state, exchangeName, marketType, symbol, cfg)
+	return item, err
+}
+
+// storedRetiredLookup is storedRetiredSymbol that also says whether the catalog knows the symbol at all (known with a
+// nil item = known, but no stored data inside the window).
+func storedRetiredLookup(state *SymbolState, exchangeName, marketType, symbol string, cfg *config.Config) (*ExSymbol, bool, *errs.Error) {
 	if state == nil || cfg == nil || cfg.TimeRange == nil || cfg.TimeRange.StartMS <= 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	if state.SymbolCount() == 0 {
 		// load the stored catalog without inserting anything
 		if err := state.EnsureSymbols(nil, exchangeName); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	item := state.GetExSymbol2(exchangeName, marketType, symbol)
 	if item == nil || item.ID <= 0 {
-		return nil, nil
+		// the runtime state may hold only the symbols registered so far (it is not necessarily empty): ask the stored catalog
+		// itself, without touching the state
+		var err error
+		if item, err = catalogSymbolLookup(state, exchangeName, marketType, symbol); err != nil {
+			return nil, false, errs.New(core.ErrDbReadFail, err)
+		}
+		if item == nil || item.ID <= 0 {
+			return nil, false, nil
+		}
 	}
 	startMS, endMS := cfg.TimeRange.StartMS, cfg.TimeRange.EndMS
 	for _, tf := range retiredRangeTimeFrames {
 		lo, hi, err := klineRangeLookup(state, item.ID, tf)
 		if err != nil {
-			return nil, errs.New(core.ErrDbReadFail, err)
+			return nil, true, errs.New(core.ErrDbReadFail, err)
 		}
 		if hi > 0 && hi >= startMS && (endMS <= 0 || lo < endMS) {
 			cp := *item
-			return &cp, nil
+			return &cp, true, nil
 		}
 	}
-	return nil, nil
+	return nil, true, nil
 }
 
 func EnsureSymbols(symbols []*ExSymbol, exchanges ...string) *errs.Error {

@@ -35,4 +35,8 @@ package core
 //	   market table resolve from the catalog only in factor Weights storage replay and only when stored kline ranges
 //	   overlap the backtest window; factor strategy keys pit_min_universe_ratio / pit_delist_penalty_bps; Result.Pairs (pair-level statistics),
 //	   Result.Attribution (long/short attribution) and the panel output switch
-const BtFeatureLevel = 8
+//	9  factor Weights backtests (PIT rule): a static pool member the exchange no longer lists whose catalog identity is known
+//	   but that has no stored kline inside the backtest window (delisted before it / listed after it) is left out of the pool
+//	   for that window (WARN, goods.RuntimeDeps.SkippedPairs) instead of failing the run with InvalidSymbol; all members
+//	   unavailable still fails; statarb legs are unchanged. Pools whose members all have data are byte-identical (v0.7.90-trend.16)
+const BtFeatureLevel = 9

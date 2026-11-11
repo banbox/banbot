@@ -10,6 +10,7 @@ import (
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/factor/runner"
+	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg/errs"
 )
 
@@ -103,5 +104,30 @@ func TestUnifiedBacktestArtifactFailurePreservesPrimaryAndCleanup(t *testing.T) 
 		if !strings.Contains(got.Error(), reason) {
 			t.Fatalf("lost error %q: %v", reason, got)
 		}
+	}
+}
+
+// run.json carries skipped_pairs only when the pair refresh left a member out; otherwise the file is byte-identical to before.
+func TestRunJSONSkippedPairsOnlyWhenSkipped(t *testing.T) {
+	read := func(skipped []orm.SkippedPair) string {
+		dir := t.TempDir()
+		file, ferr := os.Create(filepath.Join(dir, "events.jsonl"))
+		if ferr != nil {
+			t.Fatal(ferr)
+		}
+		if got := finishUnifiedFactorBacktestSkipped(dir, file, func() error { return nil }, nil, nil, skipped); got != nil {
+			t.Fatal(got)
+		}
+		b, err := os.ReadFile(filepath.Join(dir, "run.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	if plain := read(nil); strings.Contains(plain, "skipped_pairs") || plain != "{\"Version\":1,\"Status\":\"complete\",\"Results\":null}\n" {
+		t.Fatalf("no skip must not change the file: %q", plain)
+	}
+	if got := read([]orm.SkippedPair{{Symbol: "MATIC/USDT:USDT", Reason: "data_ends_before_window"}}); !strings.Contains(got, `"skipped_pairs":[{"symbol":"MATIC/USDT:USDT","reason":"data_ends_before_window"}]`) {
+		t.Fatalf("%q", got)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/factor/runner"
+	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg/errs"
 )
 
@@ -99,7 +100,7 @@ func unifiedFactorBacktestOutputContext(ctx context.Context, args *config.CmdArg
 	if stopProfiles != nil {
 		defer stopProfiles()
 	}
-	configs, cleanup, err := prepareFactorStorageInputs(ctx, args, spec, configs)
+	configs, cleanup, skippedPairs, err := prepareFactorStorageInputsReport(ctx, args, spec, configs)
 	if err != nil {
 		return errs.New(core.ErrBadConfig, err)
 	}
@@ -171,7 +172,7 @@ func unifiedFactorBacktestOutputContext(ctx context.Context, args *config.CmdArg
 	events := newBufferedEventFile(file)
 	var results []runner.Result
 	defer func() {
-		resultErr = finishUnifiedFactorBacktest(path, events, closeStorage, results, resultErr)
+		resultErr = finishUnifiedFactorBacktestSkipped(path, events, closeStorage, results, resultErr, skippedPairs)
 	}()
 	for i := range configs {
 		configs[i].ArtifactPath = filepath.Join(path, fmt.Sprintf("strategy-%d.json", i+1))
@@ -223,6 +224,12 @@ func (f *bufferedEventFile) Sync() error {
 // Completion includes closing the output and storage runtime. Publish the
 // aggregate status only after both have joined, preserving every failure.
 func finishUnifiedFactorBacktest(path string, file eventsFile, cleanup func() error, results []runner.Result, resultErr *errs.Error) *errs.Error {
+	return finishUnifiedFactorBacktestSkipped(path, file, cleanup, results, resultErr, nil)
+}
+
+// finishUnifiedFactorBacktestSkipped writes run.json; skipped (pool members without stored data inside the window, BtFeatureLevel 9)
+// becomes the `skipped_pairs` field, present only when something was skipped so every other run.json stays byte-identical.
+func finishUnifiedFactorBacktestSkipped(path string, file eventsFile, cleanup func() error, results []runner.Result, resultErr *errs.Error, skipped []orm.SkippedPair) *errs.Error {
 	joinError := func(cause error, code int) {
 		if cause != nil {
 			var primary error
@@ -249,7 +256,9 @@ func finishUnifiedFactorBacktest(path string, file eventsFile, cleanup func() er
 		Status  string
 		Errors  []string `json:",omitempty"`
 		Results []runner.Result
-	}{1, status, reasons, results}
+		// SkippedPairs: pool members the engine left out for this window (no stored klines inside it); omitted when none
+		SkippedPairs []orm.SkippedPair `json:"skipped_pairs,omitempty"`
+	}{1, status, reasons, results, skipped}
 	body, err := json.Marshal(artifact)
 	if err == nil {
 		if writeErr := config.WriteConfigAtomic(filepath.Join(path, "run.json"), nil, append(body, '\n')); writeErr != nil {

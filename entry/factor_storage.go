@@ -160,42 +160,52 @@ func weightsOnlyFactorRun(spec *config.RunSpec, configs []runner.Config) bool {
 // prepareFactorStorageInputs keeps the source session alive until all replay
 // consumers have stopped and joined. It never exports a temporary archive.
 func prepareFactorStorageInputs(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec, configs []runner.Config) ([]runner.Config, func() error, error) {
+	out, cleanup, _, err := prepareFactorStorageInputsReport(ctx, args, spec, configs)
+	return out, cleanup, err
+}
+
+// prepareFactorStorageInputsReport is prepareFactorStorageInputs that also returns the pool members the pair refresh left
+// out because they have no stored data inside the backtest window (run.json skipped_pairs; nil when none).
+func prepareFactorStorageInputsReport(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec, configs []runner.Config) ([]runner.Config, func() error, []orm.SkippedPair, error) {
+	var skippedOut []orm.SkippedPair
 	if ctx == nil {
-		return nil, nil, errors.New("factor: historical storage context is required")
+		return nil, nil, nil, errors.New("factor: historical storage context is required")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	needed := false
 	for i := range configs {
 		if len(configs[i].Chunks) == 0 {
 			needed = true
 			if err := preflightFactorStorageConfig(spec, &configs[i]); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 	}
 	if !needed {
-		return configs, func() error { return nil }, nil
+		return configs, func() error { return nil }, nil, nil
 	}
 	session, snapshot, openErr := openExplicitEntrySessionFromSpecContext(ctx, args, spec, "factor", "historical")
 	if openErr != nil {
-		return nil, nil, openErr
+		return nil, nil, nil, openErr
 	}
 	cleanup := func() error { session.close(); return session.process.CloseError() }
 	if err := session.ensureExchange(snapshot, core.RunModeBackTest); err != nil {
-		return nil, nil, errors.Join(err, cleanup())
+		return nil, nil, nil, errors.Join(err, cleanup())
 	}
 	task, err := session.newStorageRuntime(snapshot, core.RunModeBackTest, snapshot.View().TimeRange.StartMS)
 	if err != nil {
-		return nil, nil, errors.Join(err, cleanup())
+		return nil, nil, nil, errors.Join(err, cleanup())
 	}
-	pairs, pairErr := goods.RefreshPairListWithRuntimeDeps(&goods.RuntimeDeps{Core: task.Core, Clock: task.Clock, Config: snapshot.View(), DataDir: snapshot.DataDir, Symbols: task.Symbols, Storage: task.Storage, Exchange: task.Exchange, AllowRetiredPairs: weightsOnlyFactorRun(spec, configs)}, task.Clock.TimeMS())
+	pairDeps := &goods.RuntimeDeps{Core: task.Core, Clock: task.Clock, Config: snapshot.View(), DataDir: snapshot.DataDir, Symbols: task.Symbols, Storage: task.Storage, Exchange: task.Exchange, AllowRetiredPairs: weightsOnlyFactorRun(spec, configs)}
+	pairs, pairErr := goods.RefreshPairListWithRuntimeDeps(pairDeps, task.Clock.TimeMS())
+	skippedOut = pairDeps.SkippedPairs
 	if pairErr != nil {
-		return nil, nil, errors.Join(pairErr, cleanup())
+		return nil, nil, nil, errors.Join(pairErr, cleanup())
 	}
 	if len(pairs) == 0 {
-		return nil, nil, errors.Join(errors.New("factor: historical storage universe has no ordinary pairs"), cleanup())
+		return nil, nil, nil, errors.Join(errors.New("factor: historical storage universe has no ordinary pairs"), cleanup())
 	}
 	repo := orm.NewSeriesRepo(task.Storage)
 	query := func(readCtx context.Context, sub orm.Subscription, start, end int64, limit int) ([]*orm.DataSeries, error) {
@@ -203,7 +213,7 @@ func prepareFactorStorageInputs(ctx context.Context, args *config.CmdArgs, spec 
 	}
 	prepared, assembleErr := assembleFactorStorageInputs(ctx, spec, task, configs, pairs, query)
 	if assembleErr != nil {
-		return nil, nil, errors.Join(assembleErr, cleanup())
+		return nil, nil, nil, errors.Join(assembleErr, cleanup())
 	}
 	for i := range prepared {
 		c := &prepared[i]
@@ -221,7 +231,7 @@ func prepareFactorStorageInputs(ctx context.Context, args *config.CmdArgs, spec 
 			symbol := task.Symbols.GetSymbolByID(sid)
 			market, marketErr := task.Exchange.GetMarket(symbol.Symbol)
 			if marketErr != nil {
-				return nil, nil, errors.Join(marketErr, cleanup())
+				return nil, nil, nil, errors.Join(marketErr, cleanup())
 			}
 			info := task.Exchange.Info()
 			info.CurrByCodeLock.Lock()
@@ -229,16 +239,16 @@ func prepareFactorStorageInputs(ctx context.Context, args *config.CmdArgs, spec 
 			info.CurrByCodeLock.Unlock()
 			unit, unitErr := execution.InstrumentFromBanexgMarket(symbol.Symbol, market, currency)
 			if unitErr != nil {
-				return nil, nil, errors.Join(unitErr, cleanup())
+				return nil, nil, nil, errors.Join(unitErr, cleanup())
 			}
 			if unit.SettlementCurrency != c.Manifest.Currency {
-				return nil, nil, errors.Join(errors.New("factor: market settlement metadata differs from configured currency"), cleanup())
+				return nil, nil, nil, errors.Join(errors.New("factor: market settlement metadata differs from configured currency"), cleanup())
 			}
 			units[sid] = unit
 		}
 		c.Execution.Instruments = units
 	}
-	return prepared, cleanup, nil
+	return prepared, cleanup, skippedOut, nil
 }
 
 func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task *runtimectx.Runtime, configs []runner.Config, pairs []string, query func(context.Context, orm.Subscription, int64, int64, int) ([]*orm.DataSeries, error)) ([]runner.Config, error) {
