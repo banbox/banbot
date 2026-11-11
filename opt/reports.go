@@ -99,8 +99,14 @@ type BTResult struct {
 	CalcDiff              float64 `json:"calcDiff"`
 	Stability             float64 `json:"stability"`
 	HitSlTp               int     `json:"hitSlTp"`
-	runtimeDeps           *biz.RuntimeDeps
-	reportDeps            *ReportDeps
+	// Liquidation contract (BtFeatureLevel 10): present only when the account was liquidated (wallet BOMB with
+	// charge_on_bomb off). Equity is 0 from LiquidatedAtMS to the end of the run window.
+	Liquidated       bool   `json:"liquidated,omitempty"`
+	LiquidatedAtMS   int64  `json:"liquidated_at_ms,omitempty"`
+	LiquidatedSymbol string `json:"liquidated_symbol,omitempty"`
+	LiquidatedReason string `json:"liquidated_reason,omitempty"`
+	runtimeDeps      *biz.RuntimeDeps
+	reportDeps       *ReportDeps
 }
 
 // ReportDeps owns the state needed by report/replay helpers. It is deliberately
@@ -798,6 +804,11 @@ func (r *BTResult) Collect() *errs.Error {
 	r.TotCost = utils.NanInfTo(sumCost, 0)
 	r.TotFee = sumFee
 	r.TotProfitPct = r.TotProfit * 100 / r.TotalInvest
+	if r.Liquidated {
+		// equity is 0 after the liquidation: the whole investment is lost
+		r.TotProfit = -r.TotalInvest
+		r.TotProfitPct = -100
+	}
 	if r.MinReal > r.MaxReal {
 		r.MinReal = r.MaxReal
 	}
@@ -835,6 +846,9 @@ func (r *BTResult) Collect() *errs.Error {
 	if wallets != nil {
 		r.FinWithdraw = wallets.GetWithdrawLegal(nil)
 		r.FinBalance = wallets.AvaLegal(nil) + r.FinWithdraw
+		if r.Liquidated {
+			r.FinBalance = 0
+		}
 	}
 	rangeSecs := (r.EndMS - r.StartMS) / 1000
 	sharpe, sortino, err := CalcMeasuresByReal(r.Plots.Real, rangeSecs, "", 0, 0)
@@ -892,6 +906,9 @@ func (r *BTResult) textMetrics(orders []*ormo.InOutOrder) string {
 		{"Win Rate", strconv.FormatFloat(r.WinRatePct, 'f', 1, 64) + "%"},
 		{"Sharpe/Sortino", sharpeStr + " / " + sortinoStr},
 		{"Ulcer Index / UPI", formatUlcer(r.UlcerIndex, true) + " / " + formatUlcer(r.UlcerPerformanceIndex, false)},
+	}
+	if r.Liquidated {
+		rows2 = append(rows2, []string{"Liquidated", fmt.Sprintf("%s at %s", r.LiquidatedSymbol, r.dateStr(r.LiquidatedAtMS, ""))})
 	}
 	if len(orders) > 0 {
 		worstVal := strconv.FormatFloat(orders[0].Profit, 'f', 1, 64)
@@ -1681,6 +1698,52 @@ func (r *BTResult) recordUlcer(timeMS int64, equity float64) {
 		r.ulcerDay++
 	}
 	r.ulcerPending, r.ulcerLastMS = equity, timeMS
+}
+
+// applyLiquidation turns the state after a liquidation into the reported result: equity 0 from the liquidation to the
+// end of the run window (plot samples, daily equity, drawdown, min assets), so the ratios are not computed on a
+// shorter, more flattering window. The caller has already closed the positions.
+func (r *BTResult) applyLiquidation(wallets *biz.BanWallets, atMS int64, symbol, reason string) {
+	r.Liquidated, r.LiquidatedAtMS, r.LiquidatedSymbol, r.LiquidatedReason = true, atMS, symbol, reason
+	r.ulcerDaily.AllowZero()
+	plotMS := max(atMS, r.lastPlotMS)
+	r.logPlot(wallets, plotMS, -1, 0)
+	if n := len(r.Plots.Real); n > 0 {
+		r.Plots.Available[n-1], r.Plots.UnrealizedPOL[n-1] = 0, 0
+	}
+	r.MinReal = 0
+	if r.MaxReal > 0 {
+		r.MaxDrawDownPct = 100
+		r.MaxDrawDownVal = r.MaxReal
+	}
+	if r.TmpDrawDown != nil {
+		r.TmpDrawDown.SetEnd(atMS, 0)
+	}
+	// keep the sampling density of the pre-liquidation curve over the zero tail (capped), then close at the window end
+	if endMS := r.EndMS; endMS > plotMS && len(r.Plots.Real) > 0 {
+		step := int64(0)
+		if n := int64(len(r.Plots.Real)); r.StartMS > 0 && plotMS > r.StartMS {
+			step = (plotMS - r.StartMS) / n
+		}
+		count := int64(1)
+		if step > 0 {
+			count = min((endMS-plotMS)/step, int64(ShowNum*4))
+		}
+		last := len(r.Plots.Real) - 1
+		for i := int64(1); i <= count; i++ {
+			ms := plotMS + (endMS-plotMS)*i/count
+			r.Plots.Labels = append(r.Plots.Labels, r.dateStr(ms, ""))
+			r.Plots.OdNum = append(r.Plots.OdNum, 0)
+			r.Plots.JobNum = append(r.Plots.JobNum, r.Plots.JobNum[last])
+			r.Plots.Real = append(r.Plots.Real, 0)
+			r.Plots.Available = append(r.Plots.Available, 0)
+			r.Plots.Profit = append(r.Plots.Profit, r.Plots.Profit[last])
+			r.Plots.UnrealizedPOL = append(r.Plots.UnrealizedPOL, 0)
+			r.Plots.WithDraw = append(r.Plots.WithDraw, r.Plots.WithDraw[last])
+		}
+		r.lastPlotMS = endMS
+		r.recordUlcer(endMS, 0)
+	}
 }
 
 func (r *BTResult) collectUlcer() {

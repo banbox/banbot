@@ -31,6 +31,12 @@ const (
 	runtimeMinPairCronGapMS int64 = 30 * 60 * 1000
 )
 
+type liquidationInfo struct {
+	atMS   int64
+	symbol string
+	reason string
+}
+
 type BackTestLite struct {
 	biz.Trader
 	*BTResult
@@ -39,6 +45,7 @@ type BackTestLite struct {
 	isOpt        bool // whether is hyper optimization
 	runErr       *errs.Error
 	stoppedEarly bool
+	liquidation  *liquidationInfo // the account blew up (charge_on_bomb off): the run ends normally, see BTResult.applyLiquidation
 }
 
 type BackTest struct {
@@ -405,13 +412,15 @@ func (b *BackTestLite) onLiquidation(symbol string) {
 		b.TotalInvest += newVal - oldVal
 		b.Logger().Warn(fmt.Sprintf("wallet %s BOMB at %s, reset wallet and continue..", symbol, date))
 	} else {
-		b.Logger().Warn(fmt.Sprintf("wallet %s BOMB at %s, exit", symbol, date))
-		if !b.isOpt {
-			if state := b.runtimeCore(); state != nil {
-				state.Stop()
-			}
+		reason := fmt.Sprintf("wallet %s BOMB at %s, exit", symbol, date)
+		b.Logger().Warn(reason)
+		// Every backtest mode (plain, optimisation trial, holdout) ends the same way: stop feeding, close the
+		// positions and report equity 0 from here to the end of the window. The runtime context is NOT cancelled
+		// (that used to turn a bankrupt strategy into an engine failure, "context canceled").
+		if b.liquidation == nil {
+			b.liquidation = &liquidationInfo{atMS: b.TimeMS(), symbol: symbol, reason: reason}
+			b.dp.Terminate()
 		}
-		b.dp.Terminate()
 	}
 }
 
@@ -907,8 +916,14 @@ func (b *BackTest) RunContext(ctx context.Context) *errs.Error {
 	if wallets == nil {
 		return errs.NewMsg(core.ErrRunTime, "runtime wallet is required for backtest")
 	}
-	b.logPlot(wallets, b.TimeMS(), -1, -1)
-	b.normalizeBacktestResultRange()
+	if liq := b.liquidation; liq != nil {
+		relabelLiquidationExits(b.historyOrders())
+		b.normalizeBacktestResultRange()
+		b.applyLiquidation(wallets, liq.atMS, liq.symbol, liq.reason)
+	} else {
+		b.logPlot(wallets, b.TimeMS(), -1, -1)
+		b.normalizeBacktestResultRange()
+	}
 	if err := b.Collect(); err != nil {
 		b.Logger().Error("backtest report collect fail", zap.Error(err))
 		return err
@@ -933,6 +948,15 @@ func (b *BackTest) RunContext(ctx context.Context) *errs.Error {
 	}
 	completed = true
 	return nil
+}
+
+// relabelLiquidationExits marks the forced closes made at the liquidation (the end-of-run clean up uses bot_stop).
+func relabelLiquidationExits(orders []*ormo.InOutOrder) {
+	for _, od := range orders {
+		if od.ExitTag == core.ExitTagBotStop {
+			od.ExitTag = core.ExitTagLiquidation
+		}
+	}
 }
 
 func (b *BackTest) normalizeBacktestResultRange() {

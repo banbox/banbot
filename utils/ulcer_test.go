@@ -83,3 +83,31 @@ func TestUlcerReturnsUseUnobservedBaseline(t *testing.T) {
 		t.Fatal("replaced first price should become baseline and no drawdown")
 	}
 }
+
+func TestUlcerAllowZeroCountsLiquidationAsFullDrawdown(t *testing.T) {
+	var strict UlcerAccumulator
+	var a UlcerAccumulator
+	a.AllowZero()
+	for _, v := range []float64{100, 120, 0, 0} {
+		strict.Add(v)
+		a.Add(v)
+	}
+	if _, _, err := strict.Performance(1, 0); err == nil {
+		t.Fatal("zero equity must stay invalid without AllowZero")
+	}
+	ui, upi, err := a.Performance(1, 0)
+	if err != nil || ui == nil || upi == nil {
+		t.Fatalf("ui=%v upi=%v err=%v", ui, upi, err)
+	}
+	wantUI := math.Sqrt((0 + 0 + 100*100 + 100*100) / 4.0)
+	if math.Abs(*ui-wantUI) > 1e-9 || math.Abs(*upi-(-100/wantUI)) > 1e-9 {
+		t.Fatalf("ui=%v upi=%v want ui=%v", *ui, *upi, wantUI)
+	}
+	var neg UlcerAccumulator
+	neg.AllowZero()
+	neg.Add(100)
+	neg.Add(-1)
+	if _, _, err := neg.Performance(1, 0); err == nil {
+		t.Fatal("negative equity must stay invalid")
+	}
+}

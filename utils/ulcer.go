@@ -15,8 +15,13 @@ type UlcerAccumulator struct {
 	priorPeak, priorSum    float64
 	priorFirst             float64
 	invalid                bool
+	allowZero              bool // a liquidated account (equity exactly 0) is a -100% drawdown, not an invalid curve
 	priorInvalid           bool
 }
+
+// AllowZero makes an equity of exactly 0 valid: it counts as a 100% drawdown from the peak and a final CAGR of -100%.
+// Negative / NaN / Inf values stay invalid.
+func (a *UlcerAccumulator) AllowZero() { a.allowZero = true }
 
 func (a *UlcerAccumulator) Add(value float64) {
 	a.priorPeak, a.priorSum = a.peak, a.sum
@@ -27,11 +32,15 @@ func (a *UlcerAccumulator) Add(value float64) {
 	}
 	a.count++
 	a.last = value
-	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+	if (value < 0 || (value == 0 && !a.allowZero)) || math.IsNaN(value) || math.IsInf(value, 0) {
 		a.invalid = true
 		return
 	}
 	a.peak = math.Max(a.peak, value)
+	if a.peak <= 0 {
+		a.invalid = true
+		return
+	}
 	dd := 100 * (value/a.peak - 1)
 	a.sum += dd * dd
 }

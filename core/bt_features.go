@@ -39,4 +39,9 @@ package core
 //	   but that has no stored kline inside the backtest window (delisted before it / listed after it) is left out of the pool
 //	   for that window (WARN, goods.RuntimeDeps.SkippedPairs) instead of failing the run with InvalidSymbol; all members
 //	   unavailable still fails; statarb legs are unchanged. Pools whose members all have data are byte-identical (v0.7.90-trend.16)
-const BtFeatureLevel = 9
+//	10 account liquidation (wallet BOMB, charge_on_bomb off) ends EVERY backtest (plain run, optimisation trial, holdout /
+//	   full-range run) normally with exit code 0 instead of failing with "context canceled": positions are closed at the
+//	   liquidation bar (exit tag "liquidation"), equity is 0 from there to the end of the run window (total profit -100%,
+//	   max drawdown 100%, flat zero equity curve, finite sharpe / ulcer / UPI) and detail.json carries liquidated,
+//	   liquidated_at_ms, liquidated_symbol, liquidated_reason (v0.7.90-trend.17). Runs that never liquidate are byte-identical
+const BtFeatureLevel = 10

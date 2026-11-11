@@ -85,3 +85,8 @@ and CSV, UPI is dimensionless. Historical reports without full observations
 remain unavailable. Keep maximum drawdown, worst daily loss,
 and recovery duration separate; UI/UPI measures path comfort and does not
 replace shock limits.
+
+
+## Liquidated accounts
+
+A backtest whose account is liquidated (wallet BOMB, `charge_on_bomb` off) reports equity 0 from the liquidation to the end of the run window. `UlcerAccumulator.AllowZero` makes that exact zero valid: it is a 100% drawdown from the peak each day and the final CAGR is -100%, so `UPI = -100 / UI`. Negative or non-finite equity stays invalid.
