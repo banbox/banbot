@@ -92,7 +92,7 @@ func TestResolveEnsureListSkipsUnavailableMembers(t *testing.T) {
 	if err != nil || len(got) != 2 || got[0].Symbol != "BTC/USDT:USDT" || got[1].Symbol != "ALIVE/USDT:USDT" {
 		t.Fatalf("got %+v %v", got, err)
 	}
-	if len(skipped) != 2 || skipped[0] != (SkippedPair{"DEAD/USDT:USDT", "data_ends_before_window"}) || skipped[1] != (SkippedPair{"LATE/USDT:USDT", "data_starts_after_window"}) {
+	if len(skipped) != 2 || skipped[0] != (SkippedPair{Symbol: "DEAD/USDT:USDT", Reason: "data_ends_before_window"}) || skipped[1] != (SkippedPair{Symbol: "LATE/USDT:USDT", Reason: "data_starts_after_window"}) {
 		t.Fatalf("skipped %v", skipped)
 	}
 	// every member with data: nothing skipped, identical to the strict resolution

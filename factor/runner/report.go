@@ -56,6 +56,10 @@ type PairResult struct {
 	AvgHoldBars  float64
 	LastBeta     float64 // hedge ratio frozen at the latest entry
 	Turnover     float64
+	// Unavailable ("leg_unavailable") marks a pair skipped for the whole run because UnavailableLeg (one or both legs,
+	// comma separated) has no data inside the run window; the pair has no bars and no trades (BtFeatureLevel 11).
+	Unavailable    string `json:",omitempty"`
+	UnavailableLeg string `json:",omitempty"`
 }
 
 // SymbolContribution is one instrument's share of the strategy result. PnL is the price-move profit of the held

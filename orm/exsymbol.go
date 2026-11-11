@@ -430,6 +430,9 @@ type SkippedPair struct {
 	// Reason: data_ends_before_window (retired / data stops before the window starts), data_starts_after_window (lists after
 	// the window ends) or no_stored_data.
 	Reason string `json:"reason"`
+	// Pair is set for a statarb pair skipped because one of its legs is unavailable (Reason "leg_unavailable", Symbol is
+	// that leg, Pair is "Y/X" as the strategy names it); empty for pool-level entries.
+	Pair string `json:"pair,omitempty"`
 }
 
 // retiredWindowReason says why a catalog-known symbol has no stored data inside cfg.TimeRange.

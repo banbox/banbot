@@ -55,7 +55,10 @@ type Config struct {
 	// PITPairs (070): statarb pair legs (SIDs). Set explicitly or derived from the registered pairs strategy. In
 	// pairs mode the PIT decision is per pair: a pair with a missing leg is closed and paused, the others go on,
 	// and the "universe too small" fallback does not apply.
-	PITPairs                                           [][2]int32 `json:",omitempty"`
+	PITPairs [][2]int32 `json:",omitempty"`
+	// UnavailableSymbols (BtFeatureLevel 11): pool symbols the engine left out of this run because they have no stored
+	// data inside its window (symbol -> reason). A pairs strategy skips the pairs that use them instead of failing.
+	UnavailableSymbols                                 map[string]string `json:"-"`
 	Chunks                                             []Chunk
 	HistoricalInput                                    HistoricalInputFactory                       `json:"-"`
 	ObserveBatch                                       func(context.Context, HistoricalBatch) error `json:"-"`
@@ -154,6 +157,9 @@ type Result struct {
 	// funding, PIT exits) plus the execution approximation (later fill prices, weight drift between decisions).
 	Pairs                                        []PairResult `json:",omitempty"`
 	PairsGrossPnL, PairsNAVReturn, PairsResidual float64      `json:",omitempty"`
+	// AllPairsUnavailable: every pair of the run was skipped (a leg without data in the window); the run ends normally
+	// with no trades and a flat equity curve (BtFeatureLevel 11).
+	AllPairsUnavailable bool `json:",omitempty"`
 }
 
 // UniverseDropItem is one decision's PIT universe reduction (bounded log, see maxUniverseDropLog).
@@ -1152,9 +1158,12 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	}
 	if c.observe != nil && c.observe.pairs != nil {
 		result.Pairs = c.observe.pairs(c.InitialNAV)
+		allSkipped := len(result.Pairs) > 0
 		for _, p := range result.Pairs {
 			result.PairsGrossPnL += p.PnL
+			allSkipped = allSkipped && p.Unavailable != ""
 		}
+		result.AllPairsUnavailable = allSkipped
 		if c.InitialNAV > 0 && result.Book.NAV > 0 {
 			result.PairsNAVReturn = fin(result.Book.NAV/c.InitialNAV - 1)
 			result.PairsResidual = fin(result.PairsNAVReturn - result.PairsGrossPnL)

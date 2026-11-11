@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/banbox/banbot/factor"
@@ -81,7 +82,7 @@ func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error {
 		if err != nil {
 			return nil, err
 		}
-		builder, tracker, err := newTrackedPairsBuilder(spec, c.Snapshot.SIDMap)
+		builder, tracker, err := newTrackedPairsBuilderSkipping(spec, c.Snapshot.SIDMap, c.UnavailableSymbols)
 		if err == nil && c.observe != nil {
 			c.observe.pairs, c.observe.reset = tracker.report, tracker.resetStats
 		}
@@ -133,12 +134,15 @@ func resolvePairsSpec(build func(*Params) (PairsSpec, error), c Config) (PairsSp
 }
 
 type pairState struct {
-	y, x   int32
-	spread *statistics.RollingSpread
-	trader *statistics.BandTrader
-	beta   float64 // hedge ratio frozen at entry
-	pos    int
-	stats  pairStats // result bookkeeping only; never read by the trading logic
+	y, x int32
+	// unavailable is the leg (symbol) that has no data at all inside this run's window and was left out of its
+	// universe by the engine (BtFeatureLevel 11); the pair is skipped for the whole run: never traded, no spread.
+	unavailable string
+	spread      *statistics.RollingSpread
+	trader      *statistics.BandTrader
+	beta        float64 // hedge ratio frozen at entry
+	pos         int
+	stats       pairStats // result bookkeeping only; never read by the trading logic
 }
 
 func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder, error) {
@@ -149,6 +153,16 @@ func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder,
 // newTrackedPairsBuilder is newPairsBuilder plus the tracker that reports per-pair results after the run. The
 // tracker is write-only state of the builder: weights are computed exactly as without it.
 func newTrackedPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder, *pairsTracker, error) {
+	return newTrackedPairsBuilderSkipping(spec, sidMap, nil)
+}
+
+// newTrackedPairsBuilderSkipping is newTrackedPairsBuilder for a run whose universe may lack legs the engine left out
+// because they have no stored data inside the run window (unavailable: symbol -> reason). Such a pair was chosen on
+// information from before the window (point in time), so it is not an error and not removed from the strategy: it is
+// skipped for this run and the other pairs trade as usual. A pair with a leg that is neither in the universe nor in
+// unavailable is still an error. Every pair keeps its Gross share: skipped pairs leave their exposure idle, the
+// remaining pairs are never scaled up (no hidden leverage when pairs drop out).
+func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, unavailable map[string]string) (PortfolioBuilder, *pairsTracker, error) {
 	sids := make(map[string]int32, len(sidMap))
 	for sid, symbol := range sidMap {
 		sids[symbol] = sid
@@ -158,7 +172,20 @@ func newTrackedPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioB
 		y, okY := sids[pair.Y]
 		x, okX := sids[pair.X]
 		if !okY || !okX {
-			return nil, nil, fmt.Errorf("runner: pair %s/%s has a symbol missing from this run's universe", pair.Y, pair.X)
+			var missing []string
+			if !okY {
+				missing = append(missing, pair.Y)
+			}
+			if !okX {
+				missing = append(missing, pair.X)
+			}
+			for _, sym := range missing {
+				if _, gone := unavailable[sym]; !gone {
+					return nil, nil, fmt.Errorf("runner: pair %s/%s has a symbol missing from this run's universe", pair.Y, pair.X)
+				}
+			}
+			states[i] = &pairState{y: -1, x: -1, unavailable: strings.Join(missing, ",")}
+			continue
 		}
 		rs, err := statistics.NewRollingSpread(spec.Window)
 		if err != nil {
@@ -172,6 +199,13 @@ func newTrackedPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioB
 	}
 	tracker := &pairsTracker{states: states, names: spec.Pairs}
 	tracker.resetStats()
+	allUnavailable := true
+	for _, st := range states {
+		if st.unavailable == "" {
+			allUnavailable = false
+			break
+		}
+	}
 	build := func(frame factor.Frame, universe factor.Universe, target factor.PortfolioSpec, _ research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error) {
 		tradable := make(map[int32]bool, len(universe.Tradable))
 		for _, sid := range universe.Tradable {
@@ -183,7 +217,16 @@ func newTrackedPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioB
 		navPrev := tracker.lastNAV
 		tracker.lastNAV = target.Budget.NAV
 		tracker.lastMS = frame.DecisionTime
+		if allUnavailable {
+			// No pair can trade in this run: an explicit flat target at every decision (equity stays at the initial value).
+			target.Diagnostics = []factor.Diagnostic{{Code: "pairs-all-unavailable", Detail: "every pair has a leg without data in the run window"}}
+			p, err := factor.NewTargetPortfolio(target, map[int32]float64{})
+			return p, nil, err
+		}
 		for _, st := range states {
+			if st.unavailable != "" {
+				continue
+			}
 			ly, okY := values[st.y]
 			lx, okX := values[st.x]
 			if !okY || !okX || ly.Validity != factor.Valid || lx.Validity != factor.Valid {

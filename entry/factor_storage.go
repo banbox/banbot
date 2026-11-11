@@ -248,6 +248,16 @@ func prepareFactorStorageInputsReport(ctx context.Context, args *config.CmdArgs,
 		}
 		c.Execution.Instruments = units
 	}
+	if len(skippedOut) > 0 {
+		// BtFeatureLevel 11: a pairs strategy skips the pairs whose legs the pool refresh left out (no data in the window).
+		unavailable := make(map[string]string, len(skippedOut))
+		for _, s := range skippedOut {
+			unavailable[s.Symbol] = s.Reason
+		}
+		for i := range prepared {
+			prepared[i].UnavailableSymbols = unavailable
+		}
+	}
 	return prepared, cleanup, skippedOut, nil
 }
 

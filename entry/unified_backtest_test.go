@@ -131,3 +131,44 @@ func TestRunJSONSkippedPairsOnlyWhenSkipped(t *testing.T) {
 		t.Fatalf("%q", got)
 	}
 }
+
+// BtFeatureLevel 11: pairs a statarb run skipped join skipped_pairs (leg_unavailable + pair) and all_pairs_unavailable marks a run
+// without any usable pair; a run without such pairs writes neither key.
+func TestRunJSONPairsUnavailable(t *testing.T) {
+	read := func(results []runner.Result, skipped []orm.SkippedPair) string {
+		dir := t.TempDir()
+		file, ferr := os.Create(filepath.Join(dir, "events.jsonl"))
+		if ferr != nil {
+			t.Fatal(ferr)
+		}
+		if got := finishUnifiedFactorBacktestSkipped(dir, file, func() error { return nil }, results, nil, skipped); got != nil {
+			t.Fatal(got)
+		}
+		b, err := os.ReadFile(filepath.Join(dir, "run.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	pool := []orm.SkippedPair{{Symbol: "MATIC/USDT:USDT", Reason: "data_ends_before_window"}}
+	ok := runner.Result{Pairs: []runner.PairResult{{Y: "AVAX/USDT:USDT", X: "GALA/USDT:USDT"}}}
+	if got := read([]runner.Result{ok}, pool); strings.Contains(got, "leg_unavailable") || strings.Contains(got, "all_pairs_unavailable") {
+		t.Fatalf("a run without skipped pairs must not change: %q", got)
+	}
+	part := runner.Result{Pairs: []runner.PairResult{{Y: "AVAX/USDT:USDT", X: "GALA/USDT:USDT"}, {Y: "DOGE/USDT:USDT", X: "MATIC/USDT:USDT", Unavailable: "leg_unavailable", UnavailableLeg: "MATIC/USDT:USDT"}}}
+	got := read([]runner.Result{part}, pool)
+	if !strings.Contains(got, `{"symbol":"MATIC/USDT:USDT","reason":"leg_unavailable","pair":"DOGE/USDT:USDT/MATIC/USDT:USDT"}`) || strings.Contains(got, "all_pairs_unavailable") {
+		t.Fatalf("%q", got)
+	}
+	if !strings.Contains(got, `{"symbol":"MATIC/USDT:USDT","reason":"data_ends_before_window"}`) {
+		t.Fatalf("pool-level entry lost: %q", got)
+	}
+	all := part
+	all.AllPairsUnavailable = true
+	if got = read([]runner.Result{all}, pool); !strings.Contains(got, `"all_pairs_unavailable":true`) {
+		t.Fatalf("%q", got)
+	}
+	if len(pool) != 1 {
+		t.Fatal("the caller's list must not be modified")
+	}
+}

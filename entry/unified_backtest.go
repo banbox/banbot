@@ -251,6 +251,18 @@ func finishUnifiedFactorBacktestSkipped(path string, file eventsFile, cleanup fu
 			status = "incomplete"
 		}
 	}
+	// BtFeatureLevel 11: pairs a statarb run skipped (a leg without data in the window) join skipped_pairs; when every pair
+	// was skipped the run is a normal no-trade run flagged all_pairs_unavailable. Both fields are omitted otherwise.
+	allUnavailable := false
+	skipped = slices.Clone(skipped)
+	for _, result := range results {
+		for _, pair := range result.Pairs {
+			if pair.Unavailable != "" {
+				skipped = append(skipped, orm.SkippedPair{Symbol: pair.UnavailableLeg, Reason: pair.Unavailable, Pair: pair.Y + "/" + pair.X})
+			}
+		}
+		allUnavailable = allUnavailable || result.AllPairsUnavailable
+	}
 	artifact := struct {
 		Version int
 		Status  string
@@ -258,7 +270,9 @@ func finishUnifiedFactorBacktestSkipped(path string, file eventsFile, cleanup fu
 		Results []runner.Result
 		// SkippedPairs: pool members the engine left out for this window (no stored klines inside it); omitted when none
 		SkippedPairs []orm.SkippedPair `json:"skipped_pairs,omitempty"`
-	}{1, status, reasons, results, skipped}
+		// AllPairsUnavailable: every statarb pair was skipped, no trades (BtFeatureLevel 11)
+		AllPairsUnavailable bool `json:"all_pairs_unavailable,omitempty"`
+	}{1, status, reasons, results, skipped, allUnavailable}
 	body, err := json.Marshal(artifact)
 	if err == nil {
 		if writeErr := config.WriteConfigAtomic(filepath.Join(path, "run.json"), nil, append(body, '\n')); writeErr != nil {

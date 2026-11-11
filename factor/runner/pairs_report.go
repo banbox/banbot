@@ -135,6 +135,9 @@ func (t *pairsTracker) report(initialNAV float64) []PairResult {
 			r.WinRate = float64(r.Wins) / float64(r.Trades)
 			r.AvgHoldBars = float64(r.InMarketBars) / float64(r.Trades)
 		}
+		if st.unavailable != "" {
+			r.Unavailable, r.UnavailableLeg = "leg_unavailable", st.unavailable
+		}
 		out[i] = r
 	}
 	return out

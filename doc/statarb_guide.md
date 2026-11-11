@@ -88,7 +88,7 @@ banbot trade --dry-run --config runtime.yml
 `static-approximation`；strict PIT 需要不可变 archive 或具有证据的版本页提供者。
 回测资金费可以显式声明零费简化；真实永续资金费不能由此推断为零。
 
-Weights 回测的时点宇宙（PIT）按配对判定：某腿在决策网格缺数据（退市、未上市、缺口）时，含该腿的配对平仓并暂停，其余配对继续交易，两腿恢复后可重新开仓；五池相同的静态池同样适用。所有配对同期暂停的周期计入 `Result.PausedPeriods`，不计 `Incomplete`。被平仓腿的退市惩罚由策略条目的 `pit_delist_penalty_bps` 配置（0=默认 100bp，<0 关）。交易所当前市场表已不再列出的永续，在因子存储回放的 Weights 模式下可写入静态 `pairs`：按库内记录解析，条件是库内 K 线范围与回测窗口相交（见 factor_portfolio_guide）；其他模式不支持。
+Weights 回测的时点宇宙（PIT）按配对判定：某腿在决策网格缺数据（退市、未上市、缺口）时，含该腿的配对平仓并暂停，其余配对继续交易，两腿恢复后可重新开仓；某腿在整个运行窗口内都没有数据（如留出段里已退市的品种）时，含该腿的配对整次运行跳过（`PairResult.Unavailable`、`run.json` 的 `skipped_pairs` 带 `leg_unavailable` 与配对），其余配对照常运行且每对仍用原来的 `gross` 份额（不放大）；全部配对都不可用时回测正常结束、无交易并带 `all_pairs_unavailable`；五池相同的静态池同样适用。所有配对同期暂停的周期计入 `Result.PausedPeriods`，不计 `Incomplete`。被平仓腿的退市惩罚由策略条目的 `pit_delist_penalty_bps` 配置（0=默认 100bp，<0 关）。交易所当前市场表已不再列出的永续，在因子存储回放的 Weights 模式下可写入静态 `pairs`：按库内记录解析，条件是库内 K 线范围与回测窗口相交（见 factor_portfolio_guide）；其他模式不支持。
 
 ## 每对独立结果与归因
 

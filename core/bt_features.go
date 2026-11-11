@@ -44,4 +44,11 @@ package core
 //	   liquidation bar (exit tag "liquidation"), equity is 0 from there to the end of the run window (total profit -100%,
 //	   max drawdown 100%, flat zero equity curve, finite sharpe / ulcer / UPI) and detail.json carries liquidated,
 //	   liquidated_at_ms, liquidated_symbol, liquidated_reason (v0.7.90-trend.17). Runs that never liquidate are byte-identical
-const BtFeatureLevel = 10
+//	11 statarb legs that have no stored data inside the run window (retired / not yet listed; the pool refresh already
+//	   leaves them out) no longer fail the run with "pair ... has a symbol missing from this run's universe": the pairs
+//	   that use them are skipped for the whole run (PairResult.Unavailable, run.json skipped_pairs entries with reason
+//	   leg_unavailable + pair, per-pair Gross share unchanged so the other pairs are never scaled up), the other pairs
+//	   trade as usual; when every pair is skipped the run ends normally with no trades, a flat equity curve and
+//	   run.json all_pairs_unavailable. A leg absent for any other reason is still an error. ts and factor runs and
+//	   statarb runs whose legs all have data are byte-identical (v0.7.90-trend.18)
+const BtFeatureLevel = 11
