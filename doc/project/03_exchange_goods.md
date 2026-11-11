@@ -153,7 +153,7 @@
 
 ### 9. 历史量与 OHLCV 过滤的公共管线
 
-- `getSymbolVolsWithOptions`（filters.go）→ `orm.FastBulkOHLCVWithSymbolStateAndOptions`，回调中对每个标的取最近 `num` 根，计算 `mean(close*volume)`，并以最新收盘价作为 `Price`。
+- `getSymbolVolsWithOptions`（filters.go）→ `orm.FastBulkOHLCVWithSymbolStateAndOptions`，回调中对每个标的取最近 `num` 根，计算 `mean(close*volume)`，并以最新收盘价作为 `Price`。`bt_no_kline_download` 下（非 strict）不下载、直接读库；strict 且无 `historical_coverage` 时返回 download-disabled 错误。
 - `filterByOHLCVWithRuntimeDeps`（filters.go）→ 同一批量读取，`orm.ApplyAdj(adjs, arr, core.AdjFront, endMS, 0)` 后交给各过滤器回调，结果按原顺序保留。
 - `RuntimeDeps.querySeries`（filters.go）用于 `CorrelationFilter` 的单标的序列读取，会附带 `WithSeriesSymbolState` / `WithExchange` / `WithKlineRuntimeOptions`。
 

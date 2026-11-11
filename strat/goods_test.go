@@ -7,6 +7,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 )
 
@@ -78,6 +79,25 @@ func TestCalcPairTfScoresWithSymbolStateDoesNotUseLegacyDefault(t *testing.T) {
 	}
 }
 
+// noMarketExchange is a stub exchange that knows no market: symbol resolution fails with an error instead of
+// dereferencing the nil embedded interface, and the calls prove which exchange was consulted.
+type noMarketExchange struct {
+	banexg.BanExchange
+	getMarketCalls int
+}
+
+func (e *noMarketExchange) GetMarket(symbol string) (*banexg.Market, *errs.Error) {
+	e.getMarketCalls++
+	return nil, errs.NewMsg(errs.CodeNoMarketForPair, "unknown %s", symbol)
+}
+
+func (e *noMarketExchange) Info() *banexg.ExgInfo {
+	return &banexg.ExgInfo{ID: "binance", MarketType: "linear"}
+}
+
+// A legacy (nil state / nil config) scoring run falls back to exg.Default. Without download (bt_no_kline_download,
+// non-strict) it reads the library: it gets as far as resolving the symbol through the default exchange and fails
+// there, not with the old "download is disabled" error.
 func TestCalcPairTfScoresLegacyNilKeepsDefaultFallback(t *testing.T) {
 	oldMode, oldData := core.BackTestMode, config.Data
 	oldTimeframes, oldDefault := config.RunTimeframes, exg.Default
@@ -89,10 +109,22 @@ func TestCalcPairTfScoresLegacyNilKeepsDefaultFallback(t *testing.T) {
 	core.BackTestMode = true
 	config.Data.BTNoKlineDownload = true
 	config.RunTimeframes = []string{"15m"}
-	exg.Default = &pairUpdateTestExchange{}
+	stub := &noMarketExchange{}
+	exg.Default = stub
 
 	_, err := CalcPairTfScores(nil, []string{"BTC/USDT:USDT"})
-	if err == nil || err.Code != errs.CodeNotSupport {
-		t.Fatalf("legacy scoring fallback error = %v, want CodeNotSupport", err)
+	if err == nil || err.Code == errs.CodeNotSupport {
+		t.Fatalf("legacy scoring fallback error = %v, want a symbol resolution error (no download-disabled rejection)", err)
+	}
+	if stub.getMarketCalls == 0 {
+		t.Fatal("the default exchange was not consulted")
+	}
+
+	// strict replay without historical coverage is still rejected before any symbol is resolved
+	config.Data.BTStrict = true
+	stub.getMarketCalls = 0
+	_, err = CalcPairTfScores(nil, []string{"BTC/USDT:USDT"})
+	if err == nil || err.Code != errs.CodeNotSupport || stub.getMarketCalls != 0 {
+		t.Fatalf("strict without coverage: error = %v, calls %d, want CodeNotSupport and no resolution", err, stub.getMarketCalls)
 	}
 }

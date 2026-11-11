@@ -1153,9 +1153,6 @@ func TestStrictBacktestRejectsEveryPublicKlineDownloadEntry(t *testing.T) {
 			_, err := (&Queries{}).DownOHLCV2DB(nil, nil, "1m", 1, 2, nil)
 			return err
 		}},
-		{"FastBulkOHLCV", func() *errs.Error {
-			return FastBulkOHLCV(nil, nil, "1m", 1, 2, 0, nil)
-		}},
 		{"EnsureListDates", func() *errs.Error {
 			return EnsureListDates(nil, nil, nil, nil)
 		}},
@@ -1190,18 +1187,44 @@ func TestStrictFastBulkAllowsAuditedDatabaseReadPath(t *testing.T) {
 	}
 }
 
-func TestFastBulkRejectsCoverageOutsideStrictHistoricalReplay(t *testing.T) {
-	previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
-	core.BackTestMode = true
-	config.Data = config.Config{BTNoKlineDownload: true}
-	config.HistoricalCoverage = &config.HistoricalCoverageConfig{}
-	t.Cleanup(func() {
-		core.BackTestMode, config.Data, config.HistoricalCoverage = previousMode, previousData, previousCoverage
-	})
-
-	err := FastBulkOHLCV(nil, nil, "1h", 100, 500, 0, nil)
-	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "download is disabled") {
-		t.Fatalf("non-strict FastBulk coverage bypass error=%v", err)
+// FastBulkOHLCV under bt_no_kline_download: a plain backtest reads the library (no download), bt_strict needs
+// historical_coverage, bt_strict with coverage is the audited replay.
+func TestFastBulkNoDownloadMatrix(t *testing.T) {
+	cases := []struct {
+		name     string
+		strict   bool
+		coverage *config.HistoricalCoverageConfig
+		reject   bool
+	}{
+		{"non-strict no coverage reads locally", false, nil, false},
+		{"non-strict with coverage config reads locally", false, &config.HistoricalCoverageConfig{}, false},
+		{"strict without coverage is rejected", true, nil, true},
+		{"strict with coverage is allowed", true, &config.HistoricalCoverageConfig{
+			BaselineEndMS: 1000,
+			Bars: map[string]map[string][]config.HistoricalCoverageRange{
+				"BTC/USDT:USDT": {"1h": {{StartMS: 100, StopMS: 500}}},
+			},
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			previousMode, previousData, previousCoverage := core.BackTestMode, config.Data, config.HistoricalCoverage
+			core.BackTestMode = true
+			config.Data = config.Config{BTStrict: tc.strict, BTNoKlineDownload: true}
+			config.HistoricalCoverage = tc.coverage
+			t.Cleanup(func() {
+				core.BackTestMode, config.Data, config.HistoricalCoverage = previousMode, previousData, previousCoverage
+			})
+			err := FastBulkOHLCV(nil, nil, "1h", 100, 500, 0, nil)
+			if tc.reject {
+				if err == nil || !strings.Contains(err.Error(), "FastBulkOHLCV") ||
+					!strings.Contains(strings.ToLower(err.Error()), "download is disabled") {
+					t.Fatalf("error=%v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("rejected: %v", err)
+			}
+		})
 	}
 }
 
@@ -1223,10 +1246,16 @@ func TestStrictEnsureListDatesAllowsOnlyReadOnlyMetadataPaths(t *testing.T) {
 	if ensureErr := EnsureListDates(nil, linear, map[int32]*ExSymbol{known.ID: known}, nil); ensureErr != nil {
 		t.Fatalf("linear list-date no-op was rejected: %v", ensureErr)
 	}
+	// a plain no-download backtest reads a symbol of unknown listing time as stored (WARN only)
+	if ensureErr := EnsureListDates(nil, linear, map[int32]*ExSymbol{unknown.ID: unknown}, nil); ensureErr != nil {
+		t.Fatalf("unknown linear list date must not fail a non-strict run: %v", ensureErr)
+	}
+	config.Data.BTStrict = true // strict replay cannot be audited without the listing time
 	if ensureErr := EnsureListDates(nil, linear, map[int32]*ExSymbol{unknown.ID: unknown}, nil); ensureErr == nil ||
 		!strings.Contains(strings.ToLower(ensureErr.Error()), "download is disabled") {
-		t.Fatalf("unknown linear list date error=%v", ensureErr)
+		t.Fatalf("strict unknown linear list date error=%v", ensureErr)
 	}
+	config.Data.BTStrict = false
 
 	spot, err := exg.GetWith("binance", "spot", "")
 	if err != nil {
@@ -1235,9 +1264,13 @@ func TestStrictEnsureListDatesAllowsOnlyReadOnlyMetadataPaths(t *testing.T) {
 	if ensureErr := EnsureListDates(nil, spot, map[int32]*ExSymbol{known.ID: known}, nil); ensureErr != nil {
 		t.Fatalf("known spot list date was rejected: %v", ensureErr)
 	}
+	if ensureErr := EnsureListDates(nil, spot, map[int32]*ExSymbol{unknown.ID: unknown}, nil); ensureErr != nil {
+		t.Fatalf("unknown spot list date must not fail a non-strict run: %v", ensureErr)
+	}
+	config.Data.BTStrict = true
 	if ensureErr := EnsureListDates(nil, spot, map[int32]*ExSymbol{unknown.ID: unknown}, nil); ensureErr == nil ||
 		!strings.Contains(strings.ToLower(ensureErr.Error()), "download is disabled") {
-		t.Fatalf("unknown spot list date error=%v", ensureErr)
+		t.Fatalf("strict unknown spot list date error=%v", ensureErr)
 	}
 }
 

@@ -1056,7 +1056,9 @@ func FastBulkOHLCVWithSymbolStateAndOptions(state *SymbolState, exchange banexg.
 		return err
 	}
 	canDownload := options.allowDownload()
-	if !canDownload && !options.strictHistoricalReplay() {
+	// Without download a plain (non-strict) backtest reads whatever the library holds; a strict replay
+	// (bt_strict + bt_no_kline_download) additionally needs the historical coverage it is audited against.
+	if !canDownload && options.StrictReplay && !options.strictHistoricalReplay() {
 		return klineDownloadDisabledError("FastBulkOHLCV")
 	}
 	var exsMap, err = MapExSymbolsWithSymbolState(state, exchange, symbols)

@@ -23,4 +23,7 @@ package core
 //	   bt_bar_order_seed) order instead of symbol-ascending order, so limited capital is not systematically taken by
 //	   early-alphabet names; reproducible for identical input. Changes every multi-symbol backtest result once more
 //	   (single-pair results are unchanged). bansite requires >= 6 for every compile (v0.7.90-trend.13)
-const BtFeatureLevel = 6
+//	7  bt_no_kline_download without bt_strict (issue 134): nothing is downloaded and orm.FastBulkOHLCV (static-pair volume
+//	   filter, pair/timeframe scoring) reads the library; bt_strict still needs historical_coverage; symbols of unknown
+//	   listing time are read as stored with a WARN instead of failing the run (v0.7.90-trend.14)
+const BtFeatureLevel = 7

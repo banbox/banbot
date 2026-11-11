@@ -1030,14 +1030,28 @@ func EnsureListDatesWithStateAndOptions(sess *Queries, state *SymbolState, excha
 		return errs.NewMsg(core.ErrBadConfig, "EnsureListDates: exchange is required")
 	}
 	if !canDownload {
-		for _, exs := range exsMap {
-			if exs == nil || exs.ListMs == 0 {
+		// Listing time unknown: a strict replay cannot be audited without it; a plain no-download backtest reads
+		// what the library holds for the symbol and only warns.
+		check := func(exs *ExSymbol) *errs.Error {
+			if exs != nil && exs.ListMs != 0 {
+				return nil
+			}
+			if options.StrictReplay {
 				return klineDownloadDisabledError("EnsureListDates")
+			}
+			if exs != nil {
+				log.Warn("listing time unknown, reading the stored klines as they are", zap.String("symbol", exs.Symbol))
+			}
+			return nil
+		}
+		for _, exs := range exsMap {
+			if err := check(exs); err != nil {
+				return err
 			}
 		}
 		for _, exs := range exsList {
-			if exs == nil || exs.ListMs == 0 {
-				return klineDownloadDisabledError("EnsureListDates")
+			if err := check(exs); err != nil {
+				return err
 			}
 		}
 		return nil
