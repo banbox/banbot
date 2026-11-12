@@ -132,6 +132,12 @@ const (
 	ExitTagExitDelay    = "exit_delay"
 )
 
+// Liquidation causes (BtFeatureLevel 12), detail.json / run.json liquidated_cause.
+const (
+	LiquidationMargin         = "margin_liquidation" // the wallet margin check (unrealized loss > 99% of the balance)
+	LiquidationEquityDepleted = "equity_depleted"    // account value (NAV) <= 0 without a margin call
+)
+
 var (
 	TfPairHitsLock deadlock.RWMutex
 	Ctx            context.Context // Used to stop all goroutines at the same time 用于全部goroutine同时停止

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/backtest"
@@ -160,6 +161,17 @@ type Result struct {
 	// AllPairsUnavailable: every pair of the run was skipped (a leg without data in the window); the run ends normally
 	// with no trades and a flat equity curve (BtFeatureLevel 11).
 	AllPairsUnavailable bool `json:",omitempty"`
+	// Bankruptcy (BtFeatureLevel 12): the strategy NAV reached <= 0 at a decision (weights mode); positions were closed at
+	// the last marks, NAV is 0 from LiquidatedAtMS and no further decision was taken. LiquidatedNAV is the NAV before the
+	// write-off (<= 0). The report layer carries the zero NAV to the end of the run window.
+	Liquidated       bool    `json:",omitempty"`
+	LiquidatedAtMS   int64   `json:",omitempty"`
+	LiquidatedCause  string  `json:",omitempty"`
+	LiquidatedReason string  `json:",omitempty"`
+	LiquidatedNAV    float64 `json:",omitempty"`
+	// WindowEndMS is the end of the last chunk of the run window, written only with Liquidated so the report layer can
+	// carry the zero NAV to the end of the window.
+	WindowEndMS int64 `json:",omitempty"`
 }
 
 // UniverseDropItem is one decision's PIT universe reduction (bounded log, see maxUniverseDropLog).
@@ -638,6 +650,24 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if c.ObserveBatch != nil {
 				if err = c.ObserveBatch(ctx, batch); err != nil {
 					return result, err
+				}
+			}
+			if book != nil && !warming && !book.Liquidated() {
+				if nav := book.State().NAV; nav <= 0 {
+					result.Liquidated, result.LiquidatedAtMS, result.LiquidatedCause = true, now, core.LiquidationEquityDepleted
+					result.LiquidatedNAV = book.Liquidate()
+					result.WindowEndMS = windowEndMS(c.Chunks)
+					result.LiquidatedReason = fmt.Sprintf("strategy NAV %.6f <= 0 at %d, positions closed at the last marks, exit", result.LiquidatedNAV, now)
+					pending, policyPending = nil, nil
+					if navOut, ok := out.(NavOutput); ok {
+						if err = navOut.Nav(book.State(), now); err != nil {
+							return result, err
+						}
+					}
+					if c.timeline != nil {
+						c.timeline.leave()
+					}
+					break
 				}
 			}
 			if policyPending != nil {
@@ -1121,6 +1151,18 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		if err = input.Close(); err != nil {
 			return result, err
 		}
+		if result.Liquidated {
+			break // bankrupt: the remaining chunks are never read
+		}
+	}
+	if book != nil && !book.Liquidated() {
+		// the last marks already left the account at <= 0 (no decision followed): same bankruptcy, at the last event
+		if nav := book.State().NAV; nav <= 0 {
+			result.Liquidated, result.LiquidatedAtMS, result.LiquidatedCause = true, lastTime, core.LiquidationEquityDepleted
+			result.LiquidatedNAV = book.Liquidate()
+			result.WindowEndMS = windowEndMS(c.Chunks)
+			result.LiquidatedReason = fmt.Sprintf("strategy NAV %.6f <= 0 at %d (end of the run), positions closed at the last marks, exit", result.LiquidatedNAV, lastTime)
+		}
 	}
 	result.Unresolved = len(evaluations)
 	if len(evaluations) > 0 {
@@ -1164,7 +1206,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			allSkipped = allSkipped && p.Unavailable != ""
 		}
 		result.AllPairsUnavailable = allSkipped
-		if c.InitialNAV > 0 && result.Book.NAV > 0 {
+		if c.InitialNAV > 0 && (result.Book.NAV > 0 || result.Liquidated) {
 			result.PairsNAVReturn = fin(result.Book.NAV/c.InitialNAV - 1)
 			result.PairsResidual = fin(result.PairsNAVReturn - result.PairsGrossPnL)
 		}
@@ -1172,6 +1214,12 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	result.NodeCount = plan.NodeCount()
 	result.NodeUpdates = engine.session.Updates()
 	return result, nil
+}
+func windowEndMS(chunks []Chunk) int64 {
+	if len(chunks) == 0 {
+		return 0
+	}
+	return chunks[len(chunks)-1].To
 }
 func withSpread(q backtest.Quote, values map[string]any) backtest.Quote {
 	bid, ask := factor.Number(values, "bid"), factor.Number(values, "ask")

@@ -105,8 +105,12 @@ type BTResult struct {
 	LiquidatedAtMS   int64  `json:"liquidated_at_ms,omitempty"`
 	LiquidatedSymbol string `json:"liquidated_symbol,omitempty"`
 	LiquidatedReason string `json:"liquidated_reason,omitempty"`
-	runtimeDeps      *biz.RuntimeDeps
-	reportDeps       *ReportDeps
+	// LiquidatedCause (BtFeatureLevel 12): core.LiquidationMargin (the wallet margin check) or
+	// core.LiquidationEquityDepleted (account value <= 0 without a margin call). Level 10 / 11 detail.json has no cause
+	// (it can only be a margin liquidation).
+	LiquidatedCause string `json:"liquidated_cause,omitempty"`
+	runtimeDeps     *biz.RuntimeDeps
+	reportDeps      *ReportDeps
 }
 
 // ReportDeps owns the state needed by report/replay helpers. It is deliberately
@@ -1703,8 +1707,21 @@ func (r *BTResult) recordUlcer(timeMS int64, equity float64) {
 // applyLiquidation turns the state after a liquidation into the reported result: equity 0 from the liquidation to the
 // end of the run window (plot samples, daily equity, drawdown, min assets), so the ratios are not computed on a
 // shorter, more flattering window. The caller has already closed the positions.
-func (r *BTResult) applyLiquidation(wallets *biz.BanWallets, atMS int64, symbol, reason string) {
+func (r *BTResult) applyLiquidation(wallets *biz.BanWallets, atMS int64, symbol, reason, cause string) {
 	r.Liquidated, r.LiquidatedAtMS, r.LiquidatedSymbol, r.LiquidatedReason = true, atMS, symbol, reason
+	r.LiquidatedCause = cause
+	if r.ulcerDaily.Invalid() || r.ulcerPending < 0 {
+		// a daily close <= 0 before the liquidation (the bankruptcy bar itself, or a stale cached unrealized profit) made
+		// the Ulcer metrics undefined (UPI stored as 0). The account is at 0 from here on: count such closes as 0.
+		var a utils.UlcerAccumulator
+		a.AllowZero()
+		for i := range r.DailyEquity {
+			r.DailyEquity[i][1] = max(r.DailyEquity[i][1], 0)
+			a.Add(r.DailyEquity[i][1])
+		}
+		r.ulcerDaily = a
+		r.ulcerPending = max(r.ulcerPending, 0)
+	}
 	r.ulcerDaily.AllowZero()
 	plotMS := max(atMS, r.lastPlotMS)
 	r.logPlot(wallets, plotMS, -1, 0)
@@ -1761,6 +1778,36 @@ func (r *BTResult) collectUlcer() {
 	// Historical chart samples cannot recover drawdowns lost to decimation.
 }
 
+// freshEquity: the logged equity is read from the open orders (default; off only with bt_fresh_equity: false, see config.Config.FreshEquity).
+func (r *BTResult) freshEquity() bool {
+	deps := r.reportRuntimeDeps()
+	if deps == nil || deps.Config == nil {
+		return false
+	}
+	return deps.Config.View().FreshEquity()
+}
+
+// equityNow is the account value for the equity curve: the wallet total with its cached unrealized profit (legacy), or
+// by default the balance plus the open orders' profit read now (BanWallets.EquityWithOrders, the same value the
+// bankruptcy check uses; bt_fresh_equity: false keeps the cache).
+func (r *BTResult) equityNow(wallets *biz.BanWallets) float64 {
+	if !r.freshEquity() {
+		return wallets.TotalLegal(nil, true)
+	}
+	deps := r.reportRuntimeDeps()
+	if deps.Orders == nil {
+		return wallets.TotalLegal(nil, true)
+	}
+	openOds, lock := deps.Orders.GetOpenODs(r.reportAccount())
+	lock.Lock()
+	open := make([]*ormo.InOutOrder, 0, len(openOds))
+	for _, od := range openOds {
+		open = append(open, od)
+	}
+	lock.Unlock()
+	return wallets.EquityWithOrders(open)
+}
+
 func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 	if r.StartMS == 0 {
 		r.StartMS = startMS
@@ -1770,7 +1817,7 @@ func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
 	if wallets == nil {
 		return
 	}
-	totalLegal := wallets.TotalLegal(nil, true)
+	totalLegal := r.equityNow(wallets)
 	r.recordUlcer(timeMS, totalLegal)
 	r.MinReal = min(r.MinReal, totalLegal)
 	if totalLegal > r.MaxReal {
@@ -1872,10 +1919,13 @@ func (r *BTResult) logPlot(wallets *biz.BanWallets, timeMS int64, odNum int, tot
 		}
 	}
 	if totalLegal < 0 {
-		totalLegal = wallets.TotalLegal(nil, true)
+		totalLegal = r.equityNow(wallets)
 	}
 	avaLegal := wallets.AvaLegal(nil)
 	profitLegal := wallets.UnrealizedPOLLegal(nil)
+	if r.freshEquity() {
+		profitLegal = totalLegal - wallets.TotalLegal(nil, false)
+	}
 	drawLegal := wallets.GetWithdrawLegal(nil)
 	r.recordUlcer(timeMS, totalLegal)
 	curDate := r.dateStr(timeMS, "")

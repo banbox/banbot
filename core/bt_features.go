@@ -51,4 +51,16 @@ package core
 //	   trade as usual; when every pair is skipped the run ends normally with no trades, a flat equity curve and
 //	   run.json all_pairs_unavailable. A leg absent for any other reason is still an error. ts and factor runs and
 //	   statarb runs whose legs all have data are byte-identical (v0.7.90-trend.18)
-const BtFeatureLevel = 11
+//	12 account bankruptcy (issue 162): a run whose account value (wallet balance + unrealized profit of the open orders, read
+//	   from the orders) is <= 0 at any bar is a liquidation with cause equity_depleted (detail.json liquidated_cause;
+//	   the wallet margin check keeps cause margin_liquidation): equity 0 to the end of the window, total -100%, max drawdown
+//	   100%, finite negative UPI, nothing is opened any more. Pre-liquidation daily closes <= 0 are counted as 0 in the
+//	   Ulcer metrics of a liquidated run. The account value is only read from the open orders on contract markets; a spot
+//	   holding is a wallet coin that is already valued at the market price.
+//	   The equity curve (plots, daily equity, drawdown, Sharpe, Ulcer/UPI) uses that same fresh account value by default
+//	   (config bt_fresh_equity, default on; false restores the cached-UnrealizedPOL curve for comparison with older results,
+//	   the bankruptcy check stays fresh): it removes the stale-cache samples that counted realized losses twice.
+//	   factor / stat-arb: a decision with NAV <= 0 closes the book at the marks, NAV 0 to the window end, run.json
+//	   liquidated / liquidated_cause equity_depleted. Orders, fills and final balance are unchanged; the curve metrics of
+//	   multi-symbol time-series runs differ from level 11 (bt_fresh_equity: false reproduces them)
+const BtFeatureLevel = 12

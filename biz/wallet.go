@@ -1676,6 +1676,40 @@ func (w *BanWallets) TotalLegal(symbols []string, withUPol bool) float64 {
 	return w.LegalValue(LegalValueTotal, symbols, withUPol)
 }
 
+// EquityWithOrders is the account value now: the balance (Available + Withdraw + frozen margin, legal value) plus the
+// unrealized profit of the given open orders summed from the orders themselves. Unlike TotalLegal(nil, true) it does not
+// use the cached ItemWallet.UnrealizedPOL, which is only refreshed by UpdateOds and keeps the profit of orders that were
+// closed afterwards (their realized result is already in the balance, so the cached value counts it twice).
+// Orders are in the pricing (stake) currency; the sum order is stable (by order ID) like UpdateOds.
+// Only contract markets add the orders' profit: a contract position freezes margin and leaves no base coin in the wallet.
+// A spot holding is a base coin in the wallet that TotalLegal already values at the market price, so its unrealized
+// profit is inside the balance and adding it again would count it twice.
+func (w *BanWallets) EquityWithOrders(orders []*ormo.InOutOrder) float64 {
+	equity := w.TotalLegal(nil, false)
+	if !w.contractMarket() {
+		return equity
+	}
+	live := make([]*ormo.InOutOrder, 0, len(orders))
+	for _, od := range orders {
+		if od != nil && od.Status < ormo.InOutStatusFullExit {
+			live = append(live, od)
+		}
+	}
+	slices.SortFunc(live, func(a, b *ormo.InOutOrder) int { return cmp.Compare(a.ID, b.ID) })
+	for _, od := range live {
+		equity += od.Profit
+	}
+	return equity
+}
+
+// contractMarket reports whether the wallets belong to a linear/inverse/option market.
+func (w *BanWallets) contractMarket() bool {
+	if w.runtimeBound {
+		return w.runtimeCore != nil && banexg.IsContract(w.runtimeCore.Market)
+	}
+	return core.IsContract
+}
+
 func (w *BanWallets) UnrealizedPOLLegal(symbols []string) float64 {
 	return w.LegalValue(LegalValueUnrealizedPOL, symbols, false)
 }

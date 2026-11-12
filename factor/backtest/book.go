@@ -41,6 +41,8 @@ type Book struct {
 	// attribution observer (nil unless EnableAttribution); never read by the ledger itself
 	attr    *attribution
 	initNAV float64
+	// liquidated: the book was written off (Liquidate)
+	liquidated bool
 }
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
@@ -174,6 +176,24 @@ func (b *Book) ApplyFunding(f Funding, now int64) error {
 // EndChunk drops deduplication IDs only after the caller advances past all
 // settlements in an immutable, non-overlapping chunk.
 func (b *Book) EndChunk() { clear(b.fundingIDs) }
+
+// Liquidate closes every position at its last mark and writes the account off: NAV is 0 from here on (the part of a
+// negative NAV below zero is not carried: limited liability, same as the single-account liquidation). It returns the
+// NAV before the write-off. Nothing is traded afterwards; the runner stops deciding. Fees and slippage of the forced
+// close are not charged (the NAV is already <= 0).
+func (b *Book) Liquidate() float64 {
+	before := b.State().NAV
+	for _, sid := range sortedKeys(b.quantities) {
+		b.attrRevalue(sid, b.marks[sid].Price)
+	}
+	b.quantities = map[int32]float64{}
+	b.cash = 0
+	b.liquidated = true
+	return before
+}
+
+// Liquidated reports whether Liquidate was called.
+func (b *Book) Liquidated() bool { return b.liquidated }
 func sortedKeys(values map[int32]float64) []int32 {
 	keys := make([]int32, 0, len(values))
 	for sid := range values {

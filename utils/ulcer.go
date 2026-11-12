@@ -60,6 +60,9 @@ func (a *UlcerAccumulator) ReplaceLast(value float64) {
 
 func (a *UlcerAccumulator) Count() int { return a.count }
 
+// Invalid reports whether a non-positive / non-finite value was added (the metrics are then undefined).
+func (a *UlcerAccumulator) Invalid() bool { return a.invalid }
+
 // Performance returns UI in percentage points and UPI as a dimensionless ratio.
 // UPI uses compound annual growth less an annual risk-free rate (a fraction).
 // A zero UI has an undefined UPI, represented by nil for JSON-safe reporting.

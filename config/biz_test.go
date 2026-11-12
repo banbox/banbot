@@ -497,3 +497,20 @@ func TestWarnUnknownBtKeys(t *testing.T) {
 		t.Fatalf("unknown bt keys: %v", got)
 	}
 }
+
+func TestFreshEquityDefaultsOnAndCloneKeepsExplicitOff(t *testing.T) {
+	if !(&Config{}).FreshEquity() || !(*Config)(nil).FreshEquity() {
+		t.Fatal("bt_fresh_equity must default to on")
+	}
+	off := false
+	c := &Config{BTFreshEquity: &off}
+	if c.FreshEquity() {
+		t.Fatal("explicit bt_fresh_equity: false must turn it off")
+	}
+	if cl := c.Clone(); cl.FreshEquity() || cl.BTFreshEquity == c.BTFreshEquity {
+		t.Fatal("Clone must copy the explicit off value into its own pointer")
+	}
+	if !(&Config{}).Clone().FreshEquity() {
+		t.Fatal("Clone of an unset config stays on")
+	}
+}

@@ -869,6 +869,20 @@ func (c *Config) ShowPairs() string {
 	return showPairs
 }
 
+func cloneBoolPtr(p *bool) *bool {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+// FreshEquity reports whether the backtest equity (curve and bankruptcy check) is read from the open orders now
+// (BtFeatureLevel 12). Default on; only an explicit bt_fresh_equity: false selects the legacy cached-UnrealizedPOL curve.
+func (c *Config) FreshEquity() bool {
+	return c == nil || c.BTFreshEquity == nil || *c.BTFreshEquity
+}
+
 func (c *Config) Clone() *Config {
 	res := &Config{
 		Name:                 c.Name,
@@ -905,6 +919,7 @@ func (c *Config) Clone() *Config {
 		BTBarOrderSeed:       c.BTBarOrderSeed,
 		BTGapMinHours:        c.BTGapMinHours,
 		BTDelistPenaltyBps:   c.BTDelistPenaltyBps,
+		BTFreshEquity:        cloneBoolPtr(c.BTFreshEquity),
 		BTStrict:             c.BTStrict,
 		HistoricalCoverage:   c.HistoricalCoverage.Clone(),
 		RelaySimUnFinish:     c.RelaySimUnFinish,

@@ -90,3 +90,5 @@ replace shock limits.
 ## Liquidated accounts
 
 A backtest whose account is liquidated (wallet BOMB, `charge_on_bomb` off) reports equity 0 from the liquidation to the end of the run window. `UlcerAccumulator.AllowZero` makes that exact zero valid: it is a 100% drawdown from the peak each day and the final CAGR is -100%, so `UPI = -100 / UI`. Negative or non-finite equity stays invalid.
+
+A run whose account value reaches 0 or below without a margin call (realized losses, fees and funding ate the balance; BtFeatureLevel 12) is treated the same way (`liquidated_cause` `equity_depleted`, margin liquidations are `margin_liquidation`). Non-positive daily closes before that moment are counted as 0 so the Ulcer metrics stay defined. The factor / stat-arb engines follow the same rule on the strategy NAV (`run.json` `Liquidated*`, report layer `AllowZero`).

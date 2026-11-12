@@ -71,7 +71,7 @@ func TestApplyLiquidationZeroEquityMetrics(t *testing.T) {
 	endMS := start + 40*day
 	r.EndMS = endMS
 	wallet.Items["USDT"].Available = 3
-	r.applyLiquidation(wallet, liqMS, "BTC/USDT:USDT", "wallet BTC/USDT:USDT BOMB at x, exit")
+	r.applyLiquidation(wallet, liqMS, "BTC/USDT:USDT", "wallet BTC/USDT:USDT BOMB at x, exit", core.LiquidationMargin)
 	r.collectUlcer()
 	sharpe, sortino, err := CalcMeasuresByReal(r.Plots.Real, (endMS-start)/1000, "", 0, 0)
 	if err != nil {
@@ -110,5 +110,50 @@ func TestApplyLiquidationZeroEquityMetrics(t *testing.T) {
 	plain, _ := json.Marshal(NewBTResult())
 	if strings.Contains(string(plain), "liquidated") {
 		t.Fatal("a normal result must not carry liquidation keys")
+	}
+}
+
+// A liquidated run whose logged equity was <= 0 before the liquidation (the bankruptcy bar itself, or a stale cached
+// unrealized profit) still gets finite Ulcer metrics: UPI is a negative number, never an undefined value stored as 0.
+func TestApplyLiquidationClampsNonPositiveDailyCloses(t *testing.T) {
+	const day = int64(86400000)
+	deps := legacyReplayReportDeps()
+	start := int64(1700006400000)
+	deps.Clock.SetTimeMS(start)
+	deps.Market.Prices.SetPricesAt(start, map[string]float64{"USDT": 1}, "")
+	wallet := biz.InitFakeWalletsWithRuntimeDeps(deps.bizRuntimeDeps())
+	wallet.Items = map[string]*biz.ItemWallet{"USDT": {Coin: "USDT", Available: 1000}}
+	r := NewBTResult()
+	r.reportDeps = deps
+	r.TotalInvest = 1000
+	r.StartMS = start
+	r.PlotEvery = 1
+	for i := int64(0); i < 10; i++ {
+		wallet.Items["USDT"].Available = 1000 - float64(i)*100 // 1000 ... 100
+		if i >= 8 {
+			wallet.Items["USDT"].Available = -60 // equity <= 0 closes
+		}
+		r.TimeNum++
+		r.logState(start, start+i*day, 0)
+		r.logPlot(wallet, start+i*day, 0, -1)
+	}
+	r.EndMS = start + 20*day
+	wallet.Items["USDT"].Available = 0
+	if !r.ulcerDaily.Invalid() {
+		t.Fatal("fixture: the non-positive closes should have made the Ulcer accumulator invalid")
+	}
+	r.applyLiquidation(wallet, start+9*day, "", "wallet equity -60 <= 0, exit", core.LiquidationEquityDepleted)
+	r.collectUlcer()
+	if r.UlcerIndex == nil || r.UlcerPerformanceIndex == nil || *r.UlcerPerformanceIndex >= 0 || math.IsNaN(*r.UlcerPerformanceIndex) {
+		t.Fatalf("ulcer %v upi %v", r.UlcerIndex, r.UlcerPerformanceIndex)
+	}
+	for _, d := range r.DailyEquity {
+		if d[1] < 0 {
+			t.Fatalf("negative daily close kept: %v", d)
+		}
+	}
+	raw, _ := json.Marshal(r)
+	if !strings.Contains(string(raw), `"liquidated_cause":"equity_depleted"`) {
+		t.Fatalf("detail json lacks the cause: %s", raw[len(raw)-300:])
 	}
 }

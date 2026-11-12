@@ -35,6 +35,7 @@ type liquidationInfo struct {
 	atMS   int64
 	symbol string
 	reason string
+	cause  string // core.LiquidationMargin / core.LiquidationEquityDepleted
 }
 
 type BackTestLite struct {
@@ -46,6 +47,7 @@ type BackTestLite struct {
 	runErr       *errs.Error
 	stoppedEarly bool
 	liquidation  *liquidationInfo // the account blew up (charge_on_bomb off): the run ends normally, see BTResult.applyLiquidation
+	eqDirty      bool             // the wallet or an open order changed since the last equity check, see checkEquityDepleted
 }
 
 type BackTest struct {
@@ -276,6 +278,10 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 		default:
 		}
 	}
+	if b.liquidation != nil {
+		// a bankrupt account opens nothing any more
+		return false
+	}
 	b.SetTimeMS(seriesEndMS(evt))
 	if orm.NormalizeSeriesSource(evt.Source) != orm.SeriesSourceKline || !evt.HasOHLCV() {
 		if err := b.Trader.FeedDataSeries(evt); err != nil {
@@ -305,6 +311,7 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 		b.TimeNum += 1
 		if !evt.IsWarmUp {
 			b.setCheckWallets(true)
+			b.eqDirty = true
 		}
 	}
 	if errRun := b.Trader.FeedDataSeries(evt); errRun != nil {
@@ -314,6 +321,9 @@ func (b *BackTestLite) FeedDataSeries(evt *orm.DataSeries) bool {
 			b.Logger().Error("FeedDataSeries fail", zap.String("p", evt.Symbol()), zap.Error(errRun))
 			b.setRunError(errRun)
 		}
+		return false
+	}
+	if !evt.IsWarmUp && b.eqDirty && b.checkEquityDepleted(evt.Symbol()) {
 		return false
 	}
 	if !b.botRunning() {
@@ -418,13 +428,76 @@ func (b *BackTestLite) onLiquidation(symbol string) {
 		// positions and report equity 0 from here to the end of the window. The runtime context is NOT cancelled
 		// (that used to turn a bankrupt strategy into an engine failure, "context canceled").
 		if b.liquidation == nil {
-			b.liquidation = &liquidationInfo{atMS: b.TimeMS(), symbol: symbol, reason: reason}
+			b.liquidation = &liquidationInfo{atMS: b.TimeMS(), symbol: symbol, reason: reason, cause: core.LiquidationMargin}
 			b.dp.Terminate()
 		}
 	}
 }
 
+// checkEquityDepleted ends the run as a bankruptcy (liquidation cause equity_depleted) when the account value is <= 0:
+// the wallet balance plus the unrealized profit of the open orders, both read now (not the wallet's cached
+// UnrealizedPOL, which can still hold orders closed after its last refresh). The margin check in
+// BanWallets.UpdateOds only fires for an unrealized loss above 99% of a positive balance, so an account whose realized
+// losses (stops, fees, funding) ate the balance was never liquidated and kept trading on borrowed margin. It runs only
+// when an order changed or a new bar time started (eqDirty). charge_on_bomb keeps its own "reset wallet" behaviour.
+func (b *BackTestLite) checkEquityDepleted(symbol string) bool {
+	b.eqDirty = false
+	if b.liquidation != nil {
+		return true
+	}
+	if cfg := b.runConfig(); cfg != nil && cfg.ChargeOnBomb {
+		return false
+	}
+	deps := b.RuntimeDependencies()
+	if deps == nil || deps.Orders == nil || deps.Trading == nil {
+		return false
+	}
+	account := b.defaultAccount()
+	if deps.DefaultAccount != "" {
+		account = deps.DefaultAccount
+	}
+	wallets := deps.Trading.Wallet(account)
+	if wallets == nil {
+		return false
+	}
+	openOds, lock := deps.Orders.GetOpenODs(account)
+	lock.Lock()
+	open := make([]*ormo.InOutOrder, 0, len(openOds))
+	for _, od := range openOds {
+		open = append(open, od)
+	}
+	lock.Unlock()
+	equity := wallets.EquityWithOrders(open)
+	if equity > 0 {
+		return false
+	}
+	date := btime.ToDateStr(b.TimeMS(), "")
+	reason := fmt.Sprintf("wallet equity %.4f <= 0 at %s (%s), exit", equity, date, symbol)
+	b.Logger().Warn(reason)
+	b.liquidation = &liquidationInfo{atMS: b.TimeMS(), symbol: symbol, reason: reason, cause: core.LiquidationEquityDepleted}
+	b.dp.Terminate()
+	return true
+}
+
+// checkFinalBalance: the positions are closed now (end of the run window or early stop). A balance <= 0 left after that
+// closing (the last marks were still positive: exit slippage, fees, funding, the delist penalty ate the rest) is a
+// bankruptcy at the end of the run, same as equity_depleted during it.
+func (b *BackTestLite) checkFinalBalance(wallets *biz.BanWallets) {
+	if b.liquidation != nil || wallets == nil {
+		return
+	}
+	if cfg := b.runConfig(); cfg != nil && cfg.ChargeOnBomb {
+		return
+	}
+	if equity := wallets.EquityWithOrders(nil); equity <= 0 {
+		reason := fmt.Sprintf("wallet equity %.4f <= 0 at %s (final balance after closing the positions), exit", equity, btime.ToDateStr(b.TimeMS(), ""))
+		b.Logger().Warn(reason)
+		b.liquidation = &liquidationInfo{atMS: b.TimeMS(), reason: reason, cause: core.LiquidationEquityDepleted}
+	}
+}
+
 func (b *BackTestLite) orderCB(order *ormo.InOutOrder, isEnter bool) {
+	b.eqDirty = true
 	account := b.defaultAccount()
 	var deps *biz.RuntimeDeps
 	if b != nil {
@@ -916,10 +989,11 @@ func (b *BackTest) RunContext(ctx context.Context) *errs.Error {
 	if wallets == nil {
 		return errs.NewMsg(core.ErrRunTime, "runtime wallet is required for backtest")
 	}
+	b.checkFinalBalance(wallets)
 	if liq := b.liquidation; liq != nil {
 		relabelLiquidationExits(b.historyOrders())
 		b.normalizeBacktestResultRange()
-		b.applyLiquidation(wallets, liq.atMS, liq.symbol, liq.reason)
+		b.applyLiquidation(wallets, liq.atMS, liq.symbol, liq.reason, liq.cause)
 	} else {
 		b.logPlot(wallets, b.TimeMS(), -1, -1)
 		b.normalizeBacktestResultRange()
