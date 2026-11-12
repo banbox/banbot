@@ -119,6 +119,11 @@ type DataSeries struct {
 	aggRows []*DataSeries
 }
 
+// HasNoAggRows reports that the private aggregation bookkeeping is empty, i.e.
+// the series is fully described by its exported fields (as every cloned
+// version-store record is).
+func (s *DataSeries) HasNoAggRows() bool { return s.aggRows == nil }
+
 func ResolveSeriesExSymbol(evt *DataSeries, extras ...*ExSymbol) *ExSymbol {
 	return resolveSeriesExSymbol(nil, evt, extras...)
 }

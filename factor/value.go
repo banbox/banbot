@@ -261,6 +261,11 @@ func ContentHash(value any) (string, error) { return contentHash(value) }
 var hashBufPool = sync.Pool{New: func() any { return bytes.NewBuffer(make([]byte, 0, 512)) }}
 
 func contentHash(value any) (string, error) {
+	if r, ok := value.(VersionRecord); ok {
+		if digest, ok := contentHashRecord(r); ok {
+			return digest, nil
+		}
+	}
 	buffer := hashBufPool.Get().(*bytes.Buffer)
 	buffer.Reset()
 	defer hashBufPool.Put(buffer)

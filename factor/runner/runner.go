@@ -197,6 +197,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	c.Snapshot = factor.CloneSnapshotSpec(c.Snapshot)
 	c.Snapshot.TrackedQuotesOnly = true
 	inputDigest := sha256.New()
+	var recordHasher factor.RecordHasher
 	incompleteIndexes := make(map[factor.StreamKey]int)
 	defer func() {
 		sort.Slice(result.IncompleteStreams, func(i, j int) bool {
@@ -521,12 +522,12 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				}
 			}
 			if c.HistoricalInput != nil {
-				for _, record := range batch.Records {
-					digest, hashErr := factor.ContentHash(record)
+				for i := range batch.Records {
+					digest, hashErr := recordHasher.Digest(&batch.Records[i])
 					if hashErr != nil {
 						return result, hashErr
 					}
-					_, _ = io.WriteString(inputDigest, digest)
+					_, _ = inputDigest.Write(digest[:])
 				}
 			}
 			warming := now-c.DecisionDelayMS < chunk.From

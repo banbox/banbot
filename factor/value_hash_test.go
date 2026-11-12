@@ -257,3 +257,63 @@ func BenchmarkLegacyContentHashRecord(b *testing.B) {
 		}
 	}
 }
+
+func randomHashRecord(r *rand.Rand, i int) VersionRecord {
+	rec := VersionRecord{Revision: uint64(r.Intn(3)), EventTime: r.Int63() - r.Int63(), AvailableAt: int64(r.Intn(1e9)), IngestedAt: int64(i), SourceVersion: fmt.Sprintf("v%d;é", r.Intn(4))}
+	rec.Series.Source = []string{"kline", "", "funding;"}[r.Intn(3)]
+	rec.Series.TimeFrame = []string{"1m", "", "1d"}[r.Intn(3)]
+	rec.Series.Sid = int32(r.Intn(100000) - 50)
+	rec.Series.TimeMS = r.Int63()
+	rec.Series.EndMS = -r.Int63()
+	rec.Series.Closed = r.Intn(2) == 0
+	rec.Series.IsWarmUp = r.Intn(2) == 0
+	rec.Series.Values = randomValues(r)
+	return rec
+}
+
+// TestRecordHasherMatchesLegacy pins the reflection-free record encoder to the
+// reference implementation, including key-order cache reuse across records.
+func TestRecordHasherMatchesLegacy(t *testing.T) {
+	r := rand.New(rand.NewSource(21))
+	var h RecordHasher
+	kline := map[string]any{"open": 1.5, "high": 2.0, "low": 1.0, "close": 1.7, "volume": 1e6, "quote": 12.5, "n": int64(3), "k10": nil, "s": "x"}
+	for i := 0; i < 30000; i++ {
+		rec := randomHashRecord(r, i)
+		if i%3 == 0 {
+			// scalar-only rows sharing one key set exercise the cached order
+			rec.Series.Values = map[string]any{}
+			for k, v := range kline {
+				if i%2 == 0 || k != "s" {
+					rec.Series.Values[k] = v
+				}
+			}
+			rec.Series.Values["close"] = r.NormFloat64()
+		}
+		want, werr := legacyContentHash(rec)
+		got, gerr := h.Digest(&rec)
+		if (werr == nil) != (gerr == nil) || string(got[:]) != want {
+			t.Fatalf("record %d digest mismatch\nwant %s\ngot  %s\n%+v", i, want, got[:], rec)
+		}
+		if via, _ := contentHash(rec); via != want {
+			t.Fatalf("record %d contentHash mismatch", i)
+		}
+	}
+	if !recordLayout.ok {
+		t.Fatal("fast record layout disabled")
+	}
+}
+
+func BenchmarkRecordHasherDigest(b *testing.B) {
+	rec := VersionRecord{Revision: 1, EventTime: 1, SourceVersion: "storage-latest:abc"}
+	rec.Series.Source = "kline"
+	rec.Series.TimeFrame = "1m"
+	rec.Series.Sid = 5
+	rec.Series.Values = map[string]any{"close": 100.25, "open": 100.0, "high": 101.0, "low": 99.5, "volume": 12345.5}
+	var h RecordHasher
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := h.Digest(&rec); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
