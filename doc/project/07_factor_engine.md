@@ -41,6 +41,8 @@
 | `policy_selection.go` | 分数排序、多空选股、`AllocateSelected` 权重分配 |
 | `barrier.go` | `RoundBarrier`：一个决策轮的 Begin/Observe/Freeze/Compute/Cancel/Stop |
 | `version_store.go` | `VersionStore`：有界内存分片；`Export`（gob + `os.Link` 原子发布）与 `OpenVersionStore`（校验 hash） |
+| `record_hash.go` | `RecordHasher`：标量 Values 的 `VersionRecord` 不经反射直接写出 canonical 字节再 sha256，摘要与 `ContentHash(record)` 逐位相同（回放 `InputDigest` 逐记录折入的就是它）。键序按键集缓存（长度相同且缓存键全在 map 中即同一键集）。`VersionRecord`/`orm.DataSeries` 的字段名或类型与 `init` 时预期不符、记录带 `ExSymbol`/`Adj`/私有聚合缓存（`DataSeries.HasNoAggRows`）或 Values 含非标量时自动退回反射路径（结果不变，只是变慢）；`TestRecordHasherMatchesLegacy` 对照旧实现并断言快路径仍启用 |
+| `version_store.go`（接管/浅复制） | `CloneVersionRecord` 深复制；`AdoptVersionRecord` 校验身份并去掉运行时对象，标量 Values 按引用接管（调用方独占该 map），否则深复制，返回是否全标量；`CloneScalarRecord` 对已接管的全标量记录用 `maps.Clone` 复制 |
 
 ### factor/expr（表达式前端）
 
@@ -183,6 +185,8 @@ NAV 破产（BtFeatureLevel 12，issue 162）：Weights 模式在每个决策点
 lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态（退市、空洞，非“从未出现过”），先由 `Book.ExitAtLastMark` 按最后有效价平仓（与无 policy 路径一致），再由 `Book.ForgetPolicyAssets` 清洗：policy checkpoint（经 `factor.AssetForgetter.ForgetAssets`，`LifecyclePolicy` 删除其 `Assets`/`AssetIdentities` 与 cohort 贡献，空 cohort 丢弃）、`previousAllocation` 与未确认成交事实；有变化时 `stateVersion++`，`policyRun` 据此重载状态；在途 `policyPending` 作废（计入 `Result.Skipped`），随后决策在缩减宇宙上继续，被剔标的对 policy 等同未曾持有（不占名额/持有期/冷却）。数据恢复后该标的当作新标的重新入选。策略未实现 `AssetForgetter`，或账本证据来自外部 `PolicySink` 时，回到“整轮不缩减、计入 `Incomplete`”。
 
 回测账本在 `Run` 中的调用：`NewBook`（`runner.go:258`）→ `Mark`（`:463`）→ `ApplyFunding`（`:502`）→ `ApplyTerminalSettlement`（`:518`）→ `AcceptProposal`（`:572`，allocation 路径）或 `Execute`（`:646`，Weights 模式）→ `EndChunk`（`:881`）。
+
+**存储输入的 1m 价格流**：`StorageInputOptions.OwnedPages`（仅 `entry/factor_storage.go` 对数据库 K 线读取器打开，默认 false）声明 `QueryPage` 返回的是新解码、无他处引用的行：`fill` 用 `AdoptVersionRecord` 接管其 Values，`Next` 给保留历史用 `CloneScalarRecord`。约定：`QueryPage` 返回的行不得被别处引用或复用；给读取器加缓存时必须返回新建的 map，或关闭该开关。批次按 (Sid, Source, TimeFrame) 序访问游标组装（`fill` 顺序不变），`sortHistoricalRecords` 在批次已严格有序时跳过排序（无并列，结果同排序）。以上不改变记录内容、`MaxRawRecords` 与各摘要。`BenchmarkStorageReplay1m` 度量该路径。
 
 ### 5. 组合策略（lifecycle-v1）提案
 
