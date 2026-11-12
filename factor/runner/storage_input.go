@@ -159,6 +159,20 @@ func (f *storageInputFactory) Open(ctx context.Context, c Config, chunk Chunk) (
 		}
 		input.cursors = append(input.cursors, cursor)
 	}
+	// Batches are assembled in record order (Sid, Source, TimeFrame) so the common
+	// single-timeframe batch needs no sort; fill order stays the stream order.
+	input.assembly = make([]*storageCursor, len(input.cursors))
+	copy(input.assembly, input.cursors)
+	sort.SliceStable(input.assembly, func(i, j int) bool {
+		a, b := input.assembly[i].stream.Subscription, input.assembly[j].stream.Subscription
+		if a.ExSymbol.ID != b.ExSymbol.ID {
+			return a.ExSymbol.ID < b.ExSymbol.ID
+		}
+		if a.Source != b.Source {
+			return a.Source < b.Source
+		}
+		return a.TimeFrame < b.TimeFrame
+	})
 	return input, nil
 }
 
@@ -197,6 +211,7 @@ type storageInput struct {
 	factory           *storageInputFactory
 	config            Config
 	cursors           []*storageCursor
+	assembly          []*storageCursor // cursors in batch-record order
 	latest            map[factor.StreamKey][]factor.VersionRecord
 	retained, maximum int
 	closed            bool
@@ -408,7 +423,7 @@ func (s *storageInput) Next(ctx context.Context) (HistoricalBatch, error) {
 		// consecutive batches carry similar record counts: skip the doubling regrowth
 		batch.Records = make([]factor.VersionRecord, 0, s.batchHint)
 	}
-	for _, cursor := range s.cursors {
+	for _, cursor := range s.assembly {
 		for {
 			if cursor.index == len(cursor.rows) {
 				if err := s.fill(ctx, cursor); err != nil {
