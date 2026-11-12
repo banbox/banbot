@@ -32,6 +32,11 @@ type StorageInputOptions struct {
 	// DefaultPrefetchConcurrency.
 	PrefetchConcurrency int
 	Streams             []StorageStream
+	// OwnedPages declares that QueryPage returns freshly decoded rows that
+	// nothing else references (true for the database K-line reader). Their Values
+	// maps are then adopted instead of copied when every value is a basic scalar;
+	// replay results are unchanged.
+	OwnedPages bool
 	// QueryPage must tolerate concurrent calls for K-line streams (read-ahead).
 	QueryPage    func(context.Context, orm.Subscription, int64, int64, int) ([]*orm.DataSeries, error)
 	VersionPages VersionPageFactory
@@ -164,6 +169,9 @@ type storageCursor struct {
 	rows           []factor.VersionRecord
 	index          int
 	done           bool
+	// scalarPage: every row of the current page is an adopted scalar-only record,
+	// so Next can copy it with the allocation-light factor.CloneScalarRecord.
+	scalarPage bool
 	// ahead holds the page after the current one while it is being read in the
 	// background (static-approximation path only). Its offset is fully determined
 	// by the page already received, so overlapping the read with replay changes
@@ -192,6 +200,8 @@ type storageInput struct {
 	latest            map[factor.StreamKey][]factor.VersionRecord
 	retained, maximum int
 	closed            bool
+	// batchHint is the largest batch seen so far (capacity hint for the next one).
+	batchHint int
 }
 
 func (s *storageInput) WarmupFrom() int64 {
@@ -215,8 +225,10 @@ func (s *storageInput) fill(ctx context.Context, cursor *storageCursor) error {
 	}
 	cursor.rows = nil
 	cursor.index = 0
+	cursor.scalarPage = false
 	options := s.factory.options
 	var records []factor.VersionRecord
+	owned := false
 	if cursor.version != nil {
 		rows, err := cursor.version.NextPage(ctx, options.PageRows)
 		if errors.Is(err, io.EOF) {
@@ -252,6 +264,8 @@ func (s *storageInput) fill(ctx context.Context, cursor *storageCursor) error {
 			return errors.New("runner: page reader exceeded requested row budget")
 		}
 		var lastTime int64 = -1
+		records = make([]factor.VersionRecord, 0, len(rows))
+		owned = options.OwnedPages && cursor.stream.Subscription.Source == orm.SeriesSourceKline
 		for _, row := range rows {
 			if row == nil || row.TimeMS < cursor.offset || row.TimeMS <= lastTime || row.TimeMS >= end {
 				return errors.New("runner: static page returned nil, duplicate, unordered or out-of-range observation")
@@ -281,15 +295,29 @@ func (s *storageInput) fill(ctx context.Context, cursor *storageCursor) error {
 		cursor.done = true
 		return nil
 	}
+	if owned {
+		// records was built above from this call's own rows: convert in place.
+		allScalar := true
+		for i := range records {
+			record := records[i]
+			if err := s.checkPageRecord(cursor, record); err != nil {
+				return err
+			}
+			adopted, scalar, err := factor.AdoptVersionRecord(record)
+			if err != nil {
+				return err
+			}
+			allScalar = allScalar && scalar
+			records[i] = adopted
+		}
+		cursor.rows, cursor.scalarPage = records, allScalar
+		return s.checkBound()
+	}
+	cursor.rows = make([]factor.VersionRecord, 0, len(records))
 	for _, record := range records {
-		if record.Series.Sid != cursor.stream.Subscription.ExSymbol.ID || record.Series.Source != cursor.stream.Subscription.Source || record.Series.TimeFrame != cursor.stream.Subscription.TimeFrame || record.SourceVersion != cursor.stream.SourceVersion {
-			return errors.New("runner: storage page returned foreign stream/version")
+		if err := s.checkPageRecord(cursor, record); err != nil {
+			return err
 		}
-		at := s.visibility(record)
-		if at < cursor.lastAt {
-			return errors.New("runner: storage pages are not visibility ordered")
-		}
-		cursor.lastAt = at
 		clone, err := factor.CloneVersionRecord(record)
 		if err != nil {
 			return err
@@ -297,6 +325,18 @@ func (s *storageInput) fill(ctx context.Context, cursor *storageCursor) error {
 		cursor.rows = append(cursor.rows, clone)
 	}
 	return s.checkBound()
+}
+
+func (s *storageInput) checkPageRecord(cursor *storageCursor, record factor.VersionRecord) error {
+	if record.Series.Sid != cursor.stream.Subscription.ExSymbol.ID || record.Series.Source != cursor.stream.Subscription.Source || record.Series.TimeFrame != cursor.stream.Subscription.TimeFrame || record.SourceVersion != cursor.stream.SourceVersion {
+		return errors.New("runner: storage page returned foreign stream/version")
+	}
+	at := s.visibility(record)
+	if at < cursor.lastAt {
+		return errors.New("runner: storage pages are not visibility ordered")
+	}
+	cursor.lastAt = at
+	return nil
 }
 
 // Memory bound: pages already read ahead wait unconsumed in their channel (at most
@@ -364,6 +404,10 @@ func (s *storageInput) Next(ctx context.Context) (HistoricalBatch, error) {
 		return HistoricalBatch{}, io.EOF
 	}
 	batch := HistoricalBatch{AtMS: next}
+	if s.batchHint > 0 {
+		// consecutive batches carry similar record counts: skip the doubling regrowth
+		batch.Records = make([]factor.VersionRecord, 0, s.batchHint)
+	}
 	for _, cursor := range s.cursors {
 		for {
 			if cursor.index == len(cursor.rows) {
@@ -377,9 +421,14 @@ func (s *storageInput) Next(ctx context.Context) (HistoricalBatch, error) {
 			record := cursor.rows[cursor.index]
 			cursor.rows[cursor.index] = factor.VersionRecord{}
 			cursor.index++
-			clone, err := factor.CloneVersionRecord(record)
-			if err != nil {
-				return HistoricalBatch{}, err
+			var clone factor.VersionRecord
+			if cursor.scalarPage {
+				clone = factor.CloneScalarRecord(record)
+			} else {
+				var err error
+				if clone, err = factor.CloneVersionRecord(record); err != nil {
+					return HistoricalBatch{}, err
+				}
 			}
 			key := factor.StreamKey{SID: record.Series.Sid, Source: record.Series.Source, TimeFrame: record.Series.TimeFrame}
 			s.latest[key] = append(s.latest[key], clone)
@@ -391,6 +440,7 @@ func (s *storageInput) Next(ctx context.Context) (HistoricalBatch, error) {
 		}
 	}
 	sortHistoricalRecords(batch.Records)
+	s.batchHint = max(s.batchHint, len(batch.Records))
 	return batch, nil
 }
 func (s *storageInput) Visible(ctx context.Context, grid, now, replay int64) ([]factor.VersionRecord, error) {

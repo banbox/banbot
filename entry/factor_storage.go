@@ -455,7 +455,7 @@ func (a *factorStorageAssembly) install(ctx context.Context, configs []runner.Co
 		}
 		return rows, nil
 	}
-	factory, err := runner.NewStorageInputFactory(runner.StorageInputOptions{Namespace: namespace, PITPolicy: "static-approximation", FromMS: timeRange.StartMS, ToMS: timeRange.EndMS, PageRows: options.PageRows, PrefetchRows: options.PrefetchRows, PrefetchConcurrency: prefetchConcurrency, Streams: streams, QueryPage: queryPage})
+	factory, err := runner.NewStorageInputFactory(runner.StorageInputOptions{Namespace: namespace, PITPolicy: "static-approximation", FromMS: timeRange.StartMS, ToMS: timeRange.EndMS, PageRows: options.PageRows, PrefetchRows: options.PrefetchRows, PrefetchConcurrency: prefetchConcurrency, Streams: streams, QueryPage: queryPage, OwnedPages: true})
 	if err != nil {
 		return nil, err
 	}

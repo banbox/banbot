@@ -458,3 +458,72 @@ func TestStorageVisibleRejectsClosedInput(t *testing.T) {
 		t.Fatal("closed input silently returned no rows")
 	}
 }
+
+// TestStorageOwnedPagesMatchCopiedPages replays the same K-line pages with and
+// without OwnedPages (Values adopted instead of copied): batches, visibility and
+// the isolation between the batch records and the retained history must agree.
+func TestStorageOwnedPagesMatchCopiedPages(t *testing.T) {
+	const tf = "1m"
+	build := func(withNonScalar bool) func(context.Context, orm.Subscription, int64, int64, int) ([]*orm.DataSeries, error) {
+		return func(_ context.Context, sub orm.Subscription, start, end int64, limit int) ([]*orm.DataSeries, error) {
+			var rows []*orm.DataSeries
+			for ts := (start + 59999) / 60000 * 60000; ts < end && len(rows) < limit && ts <= 600000; ts += 60000 {
+				values := map[string]any{"close": float64(ts) / 1000, "open": 1.5, "volume": nil}
+				if withNonScalar && ts == 120000 {
+					values["extra"] = []any{1.0, "x"}
+				}
+				rows = append(rows, &orm.DataSeries{Source: orm.SeriesSourceKline, Sid: sub.ExSymbol.ID, TimeMS: ts, EndMS: ts + 60000, TimeFrame: tf, Closed: true, Values: values, ExSymbol: sub.ExSymbol})
+			}
+			return rows, nil
+		}
+	}
+	replay := func(owned, nonScalar bool) (batches []HistoricalBatch, visible [][]factor.VersionRecord, maxRetained int) {
+		var streams []StorageStream
+		for sid := int32(1); sid <= 3; sid++ {
+			streams = append(streams, StorageStream{Subscription: orm.Subscription{Source: orm.SeriesSourceKline, TimeFrame: tf, ExSymbol: &orm.ExSymbol{ID: sid}}, SourceVersion: "v1", SchemaHash: "s1"})
+		}
+		factory, err := NewStorageInputFactory(StorageInputOptions{Namespace: "own", PITPolicy: "static-approximation", FromMS: 60000, ToMS: 600000, PageRows: 3, PrefetchRows: 9, Streams: streams, QueryPage: build(nonScalar), OwnedPages: owned})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := Config{MaxRecords: 100, Snapshot: factor.SnapshotSpec{VisibilityPolicy: "static-approximation", SourceVersions: map[string]string{orm.SeriesSourceKline: "v1"}, Schemas: map[string]string{orm.SeriesSourceKline: "s1"}}}
+		input, err := factory.Open(context.Background(), c, factory.Ranges()[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer input.Close()
+		for {
+			batch, err := input.Next(context.Background())
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, err := input.Visible(context.Background(), batch.AtMS, batch.AtMS, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// mutating handed-out records must not reach retained history
+			for _, r := range batch.Records {
+				r.Series.Values["close"] = -1.0
+			}
+			batches, visible = append(batches, batch), append(visible, v)
+		}
+		return batches, visible, input.(*storageInput).MaxRetainedRecords()
+	}
+	for _, nonScalar := range []bool{false, true} {
+		wb, wv, wm := replay(false, nonScalar)
+		gb, gv, gm := replay(true, nonScalar)
+		if len(wb) == 0 || wm != gm || !reflect.DeepEqual(wb, gb) || !reflect.DeepEqual(wv, gv) {
+			t.Fatalf("owned pages diverge (nonScalar=%v): batches %d/%d retained %d/%d", nonScalar, len(wb), len(gb), wm, gm)
+		}
+		for _, v := range gv {
+			for _, r := range v {
+				if r.Series.Values["close"] == -1.0 {
+					t.Fatal("batch mutation leaked into retained history")
+				}
+			}
+		}
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -50,10 +51,47 @@ func cloneRecord(record VersionRecord) (VersionRecord, error) {
 // its raw Values without creating an archive store. Concrete field types and
 // NULLs are preserved; mutable runtime symbol/adjustment objects are omitted.
 func CloneVersionRecord(record VersionRecord) (VersionRecord, error) {
-	if record.Series.Sid <= 0 || record.Series.Source == "" || record.Series.TimeFrame == "" || record.SourceVersion == "" || record.Revision == 0 || record.AvailableAt < 0 || record.IngestedAt < 0 {
+	if !validVersionIdentity(record) {
 		return VersionRecord{}, errors.New("factor: invalid version identity/visibility")
 	}
 	return cloneRecord(record)
+}
+
+func validVersionIdentity(record VersionRecord) bool {
+	return !(record.Series.Sid <= 0 || record.Series.Source == "" || record.Series.TimeFrame == "" || record.SourceVersion == "" || record.Revision == 0 || record.AvailableAt < 0 || record.IngestedAt < 0)
+}
+
+// stripRuntimeSeries drops runtime symbol/adjustment objects and private
+// bookkeeping, keeping only the exported observation fields.
+func stripRuntimeSeries(record VersionRecord, values map[string]any) VersionRecord {
+	record.Series = orm.DataSeries{Source: record.Series.Source, Sid: record.Series.Sid, TimeMS: record.Series.TimeMS, EndMS: record.Series.EndMS, TimeFrame: record.Series.TimeFrame, Closed: record.Series.Closed, IsWarmUp: record.Series.IsWarmUp, Values: values}
+	return record
+}
+
+// AdoptVersionRecord is CloneVersionRecord for a record whose Values map the
+// caller exclusively owns and will not touch again (a freshly decoded storage
+// row): scalar-only Values are taken by reference instead of copied. Anything
+// else is deep-cloned exactly as CloneVersionRecord does. scalar reports whether
+// Values holds only basic scalars, i.e. whether CloneScalarRecord applies to the
+// result.
+func AdoptVersionRecord(record VersionRecord) (out VersionRecord, scalar bool, err error) {
+	if !validVersionIdentity(record) {
+		return VersionRecord{}, false, errors.New("factor: invalid version identity/visibility")
+	}
+	if isScalarMap(record.Series.Values) {
+		return stripRuntimeSeries(record, record.Series.Values), true, nil
+	}
+	out, err = cloneRecord(record)
+	return out, false, err
+}
+
+// CloneScalarRecord copies a record previously returned by AdoptVersionRecord
+// with scalar == true (identity validated, runtime objects stripped, Values
+// scalar-only). It is the allocation-light equivalent of CloneVersionRecord for
+// such records.
+func CloneScalarRecord(record VersionRecord) VersionRecord {
+	record.Series.Values = maps.Clone(record.Series.Values)
+	return record
 }
 
 // VersionStore holds one explicitly bounded raw source chunk. Export/reopen

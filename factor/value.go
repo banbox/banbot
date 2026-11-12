@@ -238,6 +238,15 @@ func isScalarLeaf(v any) bool {
 	return false
 }
 
+func isScalarMap(values map[string]any) bool {
+	for _, v := range values {
+		if !isScalarLeaf(v) {
+			return false
+		}
+	}
+	return true
+}
+
 func cloneScalarValues(values map[string]any) (map[string]any, bool) {
 	if values == nil {
 		return nil, true

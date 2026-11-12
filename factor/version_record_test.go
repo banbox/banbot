@@ -1,6 +1,7 @@
 package factor
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/banbox/banbot/orm"
@@ -114,5 +115,33 @@ func BenchmarkSingleRecordStoreBoundary(b *testing.B) {
 		if _, err := store.Records(); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestAdoptAndCloneScalarRecord(t *testing.T) {
+	rec := VersionRecord{Series: orm.DataSeries{Source: "kline", TimeFrame: "1m", Sid: 3, Values: map[string]any{"close": 1.5, "v": nil}, ExSymbol: &orm.ExSymbol{ID: 3}}, EventTime: 5, Revision: 1, SourceVersion: "v"}
+	adopted, scalar, err := AdoptVersionRecord(rec)
+	want, werr := CloneVersionRecord(rec)
+	if err != nil || werr != nil || !scalar || adopted.Series.ExSymbol != nil {
+		t.Fatalf("adopt scalar: %v %v %v %+v", err, werr, scalar, adopted)
+	}
+	a, _ := legacyContentHash(adopted)
+	b, _ := legacyContentHash(want)
+	if a != b {
+		t.Fatal("adopted record differs from cloned record")
+	}
+	cp := CloneScalarRecord(adopted)
+	cp.Series.Values["close"] = 9.0
+	if adopted.Series.Values["close"] != 1.5 {
+		t.Fatal("CloneScalarRecord aliases Values")
+	}
+	rec.Series.Values = map[string]any{"s": []any{1.0}}
+	adopted, scalar, err = AdoptVersionRecord(rec)
+	if err != nil || scalar || reflect.ValueOf(adopted.Series.Values["s"]).Pointer() == reflect.ValueOf(rec.Series.Values["s"]).Pointer() {
+		t.Fatal("non-scalar Values must be deep-cloned")
+	}
+	rec.SourceVersion = ""
+	if _, _, err = AdoptVersionRecord(rec); err == nil {
+		t.Fatal("invalid identity accepted")
 	}
 }

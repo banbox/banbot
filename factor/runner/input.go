@@ -18,23 +18,36 @@ type HistoricalBatch struct {
 	Records []factor.VersionRecord
 }
 
+func historicalRecordLess(a, b *factor.VersionRecord) bool {
+	if a.EventTime != b.EventTime {
+		return a.EventTime < b.EventTime
+	}
+	if a.Series.Sid != b.Series.Sid {
+		return a.Series.Sid < b.Series.Sid
+	}
+	if a.Series.Source != b.Series.Source {
+		return a.Series.Source < b.Series.Source
+	}
+	if a.Series.TimeFrame != b.Series.TimeFrame {
+		return a.Series.TimeFrame < b.Series.TimeFrame
+	}
+	return a.Revision < b.Revision
+}
+
 func sortHistoricalRecords(rows []factor.VersionRecord) {
-	sort.Slice(rows, func(i, j int) bool {
-		a, b := rows[i], rows[j]
-		if a.EventTime != b.EventTime {
-			return a.EventTime < b.EventTime
+	// Batches assembled cursor by cursor are usually already ordered; a strictly
+	// increasing run needs no sort (no ties, so the result is the same).
+	ordered := true
+	for i := 1; i < len(rows); i++ {
+		if !historicalRecordLess(&rows[i-1], &rows[i]) {
+			ordered = false
+			break
 		}
-		if a.Series.Sid != b.Series.Sid {
-			return a.Series.Sid < b.Series.Sid
-		}
-		if a.Series.Source != b.Series.Source {
-			return a.Series.Source < b.Series.Source
-		}
-		if a.Series.TimeFrame != b.Series.TimeFrame {
-			return a.Series.TimeFrame < b.Series.TimeFrame
-		}
-		return a.Revision < b.Revision
-	})
+	}
+	if ordered {
+		return
+	}
+	sort.Slice(rows, func(i, j int) bool { return historicalRecordLess(&rows[i], &rows[j]) })
 }
 
 // HistoricalInputFactory opens independent bounded readers. Identity includes
