@@ -11,13 +11,17 @@ import (
 //
 //	NAV - initial NAV = LongPnL + ShortPnL - Fees - Slippage - Funding - PITCost
 //
+// Funding (approximation and settlements) is an account-level item only: it is in AttributionReport.Funding and not in
+// any symbol's Costs / Net (the net-notional charge belongs to the book, not to one instrument), so the symbols'
+// Net sums to NAV change + Funding.
+//
 // Price-change points covered: Mark (revaluation of the held quantity between two marks), Execute /
 // ExecuteAllocation (the held quantity is revalued to the fill quote before the trade; the trade then changes the
 // quantity), ExitAtLastMark (quantity removed at the last mark, penalty booked), resolveRecovered (penalty refund
 // and gap loss), ApplyTerminalSettlement (quantity cashed at the settlement value instead of the last mark),
 // ApplyFunding and accrueFunding (costs). Those are all code paths that change a quantity, a mark or cash.
 
-type symbolAttr struct{ pnl, fees, slippage, funding, pit, turnover float64 }
+type symbolAttr struct{ pnl, fees, slippage, pit, turnover float64 }
 
 type attribution struct {
 	longPnL, shortPnL, longTurn, shortTurn float64
@@ -74,11 +78,6 @@ func (a *attribution) trade(sid int32, old, next, price, cost, slip float64) {
 	s.turnover += math.Abs(next-old) * price
 }
 
-func (a *attribution) addFunding(sid int32, cost float64) {
-	if a != nil {
-		a.sym(sid).funding += cost
-	}
-}
 func (a *attribution) addPIT(sid int32, cost float64) {
 	if a != nil {
 		a.sym(sid).pit += cost
@@ -98,6 +97,7 @@ func (b *Book) attrRevalue(sid int32, to float64) {
 // SampleExposure records the long and short gross exposure (position value / NAV) at this instant; the report
 // averages the samples. The runner calls it once per decision time.
 func (b *Book) SampleExposure() {
+	b.settleFunding()
 	if b.attr == nil {
 		return
 	}
@@ -121,7 +121,7 @@ func (b *Book) SampleExposure() {
 }
 
 // SymbolAttribution is one instrument's contribution: PnL = price-move profit (before costs), Costs = fees +
-// slippage + funding + PIT exit costs, Net = PnL - Costs.
+// slippage + PIT exit costs (no funding), Net = PnL - Costs.
 type SymbolAttribution struct {
 	SID                       int32
 	PnL, Costs, Net, Turnover float64
@@ -154,7 +154,7 @@ func (b *Book) Attribution() *AttributionReport {
 	}
 	r.Residual = (st.NAV - b.initNAV) - (r.LongPnL + r.ShortPnL - r.Fees - r.Slippage - r.Funding - r.PITCost)
 	for sid, s := range a.bySID {
-		costs := s.fees + s.slippage + s.funding + s.pit
+		costs := s.fees + s.slippage + s.pit
 		r.Symbols = append(r.Symbols, SymbolAttribution{SID: sid, PnL: s.pnl, Costs: costs, Net: s.pnl - costs, Turnover: s.turnover})
 	}
 	sort.Slice(r.Symbols, func(i, j int) bool {

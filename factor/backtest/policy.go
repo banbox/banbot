@@ -35,6 +35,7 @@ func (b *Book) recordFirstFill(sid int32, qty float64, at int64) {
 // ExecuteAllocation keeps absolute asset units independent of changing NAV and
 // prices. Omitted Patch assets retain their actual absolute quantities.
 func (b *Book) ExecuteAllocation(p *factor.PortfolioTarget, quotes map[int32]Quote, now int64, fee, slip float64) error {
+	b.settleFunding()
 	if p == nil || fee < 0 || slip < 0 || slip >= 1 || !finite(fee) || !finite(slip) {
 		return errors.New("backtest: invalid allocation target/costs")
 	}
@@ -125,6 +126,7 @@ func (b *Book) ExecuteAllocation(p *factor.PortfolioTarget, quotes map[int32]Quo
 }
 
 func (b *Book) PolicyEvidence(now int64) (factor.PortfolioEvidence, error) {
+	b.settleFunding()
 	e := factor.PortfolioEvidence{Positions: map[int32]factor.PositionEvidence{}, Marks: map[int32]string{}, StateVersion: b.stateVersion, LedgerCursor: b.ledgerCursor, State: append(json.RawMessage(nil), b.policyState...)}
 	for sid, qty := range b.quantities {
 		e.Positions[sid] = factor.PositionEvidence{Quantity: strconv.FormatFloat(qty, 'f', -1, 64), PendingQuantity: "0", FirstFillTime: b.firstFill[sid]}

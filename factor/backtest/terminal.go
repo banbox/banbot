@@ -14,6 +14,7 @@ type TerminalSettlement struct {
 }
 
 func (b *Book) ApplyTerminalSettlement(e TerminalSettlement, now int64) (bool, error) {
+	b.settleFunding()
 	if e.Source == "" || e.SourceVersion == "" || e.SID <= 0 || e.CashValue.IsNegative() || e.EventMS <= 0 || e.PublishedMS < e.EventMS || e.ReceivedMS < e.PublishedMS || now < e.ReceivedMS {
 		return false, errors.New("backtest: invalid/unobservable terminal settlement")
 	}

@@ -45,11 +45,13 @@ func TestPolicyPITDisabledStillSkips(t *testing.T) {
 	}
 }
 
-// 081: manifest.costs.funding_apr charges long notional; zero by default.
+// 081: manifest.costs.funding_apr charges the net long notional (level 13); zero by default. The book is long-only
+// here (a hedged book pays less, see backtest.TestFundingNetNotional).
 func TestFundingAprChargesLongBook(t *testing.T) {
 	const bars = 14
 	for _, apr := range []float64{0, 50} {
 		c := pitConfig(t, map[int32]int64{1: bars, 2: bars, 3: bars}, bars, 0)
+		c.Manifest.Portfolio.ShortNotional = 0
 		c.Manifest.Costs.FundingApr = apr
 		result, err := Run(context.Background(), c, nil, nil)
 		if err != nil {
@@ -58,5 +60,28 @@ func TestFundingAprChargesLongBook(t *testing.T) {
 		if (apr == 0) != (result.Book.Funding == 0) || result.Book.Funding < 0 {
 			t.Fatalf("apr=%v funding=%v", apr, result.Book.Funding)
 		}
+	}
+}
+
+// 164: the same funding_apr on a long/short (hedged) book charges far less than on a long-only one: the net long
+// notional is charged, not every long leg; the symbols' costs carry no funding, the account-level total does.
+func TestFundingAprHedgedBookChargesNet(t *testing.T) {
+	const bars = 14
+	run := func(short float64) Result {
+		c := pitConfig(t, map[int32]int64{1: bars, 2: bars, 3: bars}, bars, 0)
+		c.Manifest.Costs.FundingApr = 50
+		c.Manifest.Portfolio.ShortNotional = short
+		result, err := Run(context.Background(), c, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	longOnly, hedged := run(0), run(1)
+	if longOnly.Book.Funding <= 0 || hedged.Book.Funding < 0 || hedged.Book.Funding >= longOnly.Book.Funding {
+		t.Fatalf("funding long-only %v hedged %v", longOnly.Book.Funding, hedged.Book.Funding)
+	}
+	if a := hedged.Attribution; a == nil || a.Funding != hedged.Book.Funding {
+		t.Fatalf("attribution %+v", a)
 	}
 }

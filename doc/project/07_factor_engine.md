@@ -56,7 +56,7 @@
 | 文件 | 作用 |
 |---|---|
 | `book.go` | `Book`：现金、数量、标记价、费用、资金费、滑点、权重目标执行（`Execute`） |
-| `pit.go` | `Book.SetFundingApr`（多头名义额 × 年化% × 两次标记间隔近似资金费，空头不计，单次最多计 3 天，记入 `State.Funding` 并扣现金，配置键 `manifest.costs.funding_apr`）、`Book.NeverSeenAll`（标的从未有标记/持仓，可安全剔除）、`Book.ExitAtLastMark`（宇宙剔除标的按最后标记价平仓，含费用、滑点与 `SetPITDelistPenaltyBps` 的退市惩罚）、`Book.ForgetPolicyAssets`（lifecycle policy 清洗被剔标的状态）、`DropTargets` |
+| `pit.go` | `Book.SetFundingApr`/`Book.accrueFunding`/`Book.settleFunding`（近似资金费，BtFeatureLevel 13 起按账户整体净多头名义额计：`max(0, Σ多头名义额 − Σ空头名义额) × 年化% × 两次标记间隔`，净空头为 0 不付不收；按计费步（`Mark` 的 `now`，同一批价格）归并，不按各品种的报价时间 `AtMS`：各品种逐个标记，各自带符号项〔多头为正、空头为负，各按自己的间隔加权〕累加后对 0 取下限，现金随累加增量扣减，该步结束后即净额，与标记顺序无关；步内报价时间错位仍抵消；持仓腿在该步缺 bar 时，只要账本持有空头，`settleFunding` 就以其最后有效价的名义额补上该步的项并记 `fundingBilled`，该腿下次标记不再重复计这段时间；没有空头的账本不补项，每条多头腿仍在自己的标记点按自己的间隔计，与旧逐腿口径逐位相同；`settleFunding` 在读写现金/持仓的入口与下一步开始时调用；资金费只记账户级（`AttributionReport.Funding`），不进品种的 `Costs`/`Net`，品种 `Net` 合计 = NAV 变动 + `Funding`；单次最多计 3 天，记入 `State.Funding` 并扣现金，配置键 `manifest.costs.funding_apr`）、`Book.NeverSeenAll`（标的从未有标记/持仓，可安全剔除）、`Book.ExitAtLastMark`（宇宙剔除标的按最后标记价平仓，含费用、滑点与 `SetPITDelistPenaltyBps` 的退市惩罚）、`Book.ForgetPolicyAssets`（lifecycle policy 清洗被剔标的状态）、`DropTargets` |
 | `attribution.go` | 多空腿/逐标的归因累加器（`Book.EnableAttribution`、`SampleExposure`、`Attribution`）：只在价格变动点累加，不读写账本数值 |
 | `policy.go` | 绝对数量分配执行（`ExecuteAllocation`）、`PolicyEvidence`、`RestorePolicy`、`AcceptProposal` |
 | `terminal.go` | 终止结算与终止标的报价豁免（`ApplyTerminalSettlement`） |
@@ -221,14 +221,14 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 
 `Result` 与运行产物（`run.json` 的 `Results[]`、`run-completed` 事件）按 Go 字段名序列化（无 json 标签，键名即字段名，首字母大写）；以下新增字段均 `omitempty`，旧消费方按结构体解码时忽略未知字段即可。
 
-**多空腿归因 `Result.Attribution`**（仅 Weights 模式，账本存在时；factor 与 statarb 通用）。`Run` 对 `Book` 调用 `EnableAttribution`，并在每个决策时刻（NAV 事件处）调用 `SampleExposure`。累加器位于账本所有改变持仓数量/标记价/现金的入口：`Mark`（按旧数量重估到新标记价）、`Execute` 与 `ExecuteAllocation`（成交前先把旧数量重估到成交报价，再按持仓变化拆分多/空腿换手）、`ExitAtLastMark`（含惩罚）、`resolveRecovered`（惩罚退回与缺口损失）、`ApplyTerminalSettlement`（按结算价与最后标记价之差）、`ApplyFunding`/`accrueFunding`。补丁（Patch）模式与 policy 路径共用 `Execute`/`ExecuteAllocation`，无其他入口。字段（货币额，成本为正数）：
+**多空腿归因 `Result.Attribution`**（仅 Weights 模式，账本存在时；factor 与 statarb 通用）。`Run` 对 `Book` 调用 `EnableAttribution`，并在每个决策时刻（NAV 事件处）调用 `SampleExposure`。累加器位于账本所有改变持仓数量/标记价/现金的入口：`Mark`（按旧数量重估到新标记价）、`Execute` 与 `ExecuteAllocation`（成交前先把旧数量重估到成交报价，再按持仓变化拆分多/空腿换手）、`ExitAtLastMark`（含惩罚）、`resolveRecovered`（惩罚退回与缺口损失）、`ApplyTerminalSettlement`（按结算价与最后标记价之差）、`ApplyFunding`/`accrueFunding`（只改账户级 `Funding`）。补丁（Patch）模式与 policy 路径共用 `Execute`/`ExecuteAllocation`，无其他入口。字段（货币额，成本为正数）：
 
 - `InitialNAV`、`FinalNAV`；`LongPnL`/`ShortPnL`（价格变动盈亏，按价格变动时持仓方向归入多/空腿，未扣成本）及 `LongPnLPct`/`ShortPnLPct`（占初始 NAV）。
 - `LongTurnover`/`ShortTurnover`：成交名义额按腿拆分（多头腿数量 `max(q,0)`、空头腿 `min(q,0)` 的变动），符号翻转两腿都计，二者之和等于 `Book.Turnover`。
 - `AvgLongExposure`/`AvgShortExposure`：决策时刻多/空头总市值 / NAV 的均值，`ExposureSamples` 为样本数。
 - `Fees`、`Slippage`、`Funding`、`PITCost`（= `PITGapLoss + PITDelistLoss`）。
 - 对账：`FinalNAV − InitialNAV = LongPnL + ShortPnL − Fees − Slippage − Funding − PITCost + Residual`，`Residual` 仅为浮点舍入（测试断言 `|Residual| < 1e-9 × InitialNAV`）。
-- `TopSymbols`（至多 20 个，按 `|Net|` 降序）：`Symbol`、`PnL`、`Costs`（该标的的费用+滑点+资金费+PIT 成本）、`Net = PnL − Costs`、`NetPct`（占初始 NAV）、`Share = Net / Σ|Net|`（范围 [-1,1]，接近 ±1 表示单一标的决定结果）；所有标的的 `Net` 之和等于 NAV 变化。
+- `TopSymbols`（至多 20 个，按 `|Net|` 降序）：`Symbol`、`PnL`、`Costs`（该标的的费用+滑点+PIT 成本，不含资金费：资金费是账户级一项，只在 `Funding`）、`Net = PnL − Costs`、`NetPct`（占初始 NAV）、`Share = Net / Σ|Net|`（范围 [-1,1]，接近 ±1 表示单一标的决定结果）；所有标的的 `Net` 之和等于 NAV 变化加 `Funding`（`Share` 与集中度只看品种 `Net`）。
 - 累加器是账本的纯旁路观察者，开启前后 NAV 序列逐位一致（`attribution_test.go`）。
 
 **配对独立结果 `Result.Pairs`**（仅 `RegisterPairs` 策略）：`PairResult{Y, X, Episodes, EpisodeCount, PnL, Trades, Wins, WinRate, InMarketBars, Bars, PausedBars, AvgHoldBars, LastBeta, Turnover, Unavailable, UnavailableLeg}`（后两项仅整次运行被跳过的配对有值，见下“不可用的腿”）。

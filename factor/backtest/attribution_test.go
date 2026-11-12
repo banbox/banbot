@@ -92,9 +92,10 @@ func TestAttributionReconcilesToNAV(t *testing.T) {
 		net += s.Net
 		pnl += s.PnL
 	}
-	if math.Abs(net-(st.NAV-r.InitialNAV)) > 1e-9*r.InitialNAV || math.Abs(pnl-(r.LongPnL+r.ShortPnL)) > 1e-9*r.InitialNAV {
+	if math.Abs(net-r.Funding-(st.NAV-r.InitialNAV)) > 1e-9*r.InitialNAV || math.Abs(pnl-(r.LongPnL+r.ShortPnL)) > 1e-9*r.InitialNAV {
 		t.Fatalf("symbol sums net=%v pnl=%v vs nav change %v / leg pnl %v", net, pnl, st.NAV-r.InitialNAV, r.LongPnL+r.ShortPnL)
 	}
+	// funding is account-level: the symbols' Net is before it, so net - Funding is the NAV change (checked above)
 	if r.Funding <= 0 || r.Fees <= 0 || r.Slippage <= 0 {
 		t.Fatalf("costs missing: %+v", r)
 	}

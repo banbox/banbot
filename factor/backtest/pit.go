@@ -15,6 +15,7 @@ import (
 // rebalances never ask for a quote of a dead instrument. Returns the SIDs actually closed. The mark time is not
 // advanced; NAV is continuous (qty x last mark -> cash minus costs).
 func (b *Book) ExitAtLastMark(sids []int32, fee, slip float64) []int32 {
+	b.settleFunding()
 	sorted := append([]int32(nil), sids...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	var closed []int32
@@ -208,24 +209,106 @@ func (b *Book) NeverSeenAll(sids []int32) bool {
 // holes are PIT-exited anyway).
 const maxFundingAccrualMS = 3 * 24 * 3600 * 1000
 
-// SetFundingApr (081) enables the funding approximation: percent per year charged on the notional of LONG
-// positions (qty x last mark) for the time between two marks of the instrument; shorts are neither charged nor
-// credited (conservative, same convention as bt_funding_apr of the order engine). The charge is booked into
-// State.Funding and reduces cash. Real per-settlement funding (ApplyFunding) is independent of it.
+// SetFundingApr (081, net basis since BtFeatureLevel 13) enables the funding approximation: percent per year charged
+// on the NET LONG notional of the whole book, max(0, long notional - short notional), for the time between marks.
+// A pure long book pays on its long notional (as before); a fully hedged book pays 0; a net short book pays 0 and
+// receives nothing (conservative, no credit for shorts). The charge is booked into State.Funding and reduces cash
+// (an account-level item: Attribution carries it only in AttributionReport.Funding, never in a symbol's costs).
+// Real per-settlement funding (ApplyFunding) is independent of it.
 func (b *Book) SetFundingApr(apr float64) {
 	if apr > 0 && finite(apr) {
 		b.fundingApr = apr
 	}
 }
 
-func (b *Book) accrueFunding(sid int32, old Quote, atMS int64) {
+const fundingYearMS = 365.25 * 24 * 3600 * 1000
+
+// fundingStep is the accumulator of one engine billing step (the `now` of the Mark calls: all quotes the runner
+// delivers for one batch time). Marks of one step may carry slightly different quote times (AtMS), the step groups
+// them.
+//
+// Each marked instrument adds its signed funding term (qty x previous mark price x apr x its own interval, capped;
+// negative for a short) and the cash follows the change of max(0, sum): the sum is exactly the step's net charge once
+// the step is complete, and the order the instruments are marked in does not change it. An instrument that is held
+// but has no mark in the step (a missing bar) still hedges: when the book holds a short, settleFunding adds its term
+// at its last valid price for the step's time (and remembers that the time is already billed, fundingBilled, so its
+// next mark does not bill it again). A book without shorts never adds such terms: every long leg is charged at its own
+// marks over its own interval, bit for bit as before the net basis.
+func (b *Book) accrueFunding(sid int32, old Quote, atMS, now int64) {
 	qty := b.quantities[sid]
-	if qty <= 0 || atMS <= old.AtMS || old.Price <= 0 {
+	if qty == 0 {
 		return
 	}
-	dt := float64(min(atMS-old.AtMS, maxFundingAccrualMS))
-	cost := qty * old.Price * b.fundingApr / 100 * dt / (365.25 * 24 * 3600 * 1000)
-	b.cash -= cost
-	b.funding += cost
-	b.attr.addFunding(sid, cost)
+	b.fundingMarked[sid] = now
+	from := old.AtMS
+	if t, ok := b.fundingBilled[sid]; ok {
+		delete(b.fundingBilled, sid)
+		from = max(from, t)
+	}
+	if atMS <= from || old.Price <= 0 {
+		return
+	}
+	dt := float64(min(atMS-from, maxFundingAccrualMS))
+	b.addFundingTerm(qty * old.Price * b.fundingApr / 100 * dt / fundingYearMS)
+}
+
+// addFundingTerm adds one signed term to the step's sum and books the change of max(0, sum).
+func (b *Book) addFundingTerm(c float64) {
+	if c == 0 {
+		return
+	}
+	prev := b.fundingNet
+	b.fundingNet += c
+	var delta float64
+	if prev >= 0 && b.fundingNet >= 0 {
+		delta = c // no floor involved: exactly the term (bitwise the per-leg charge of a long-only book)
+	} else {
+		delta = math.Max(b.fundingNet, 0) - math.Max(prev, 0)
+	}
+	if delta != 0 {
+		b.cash -= delta
+		b.funding += delta
+	}
+}
+
+// settleFunding completes the pending billing step: held instruments without a mark in the step take part in the
+// net with their last valid price when the book holds a short (see accrueFunding). Called before anything reads or
+// changes the cash or the quantities, and when the next step starts.
+func (b *Book) settleFunding() {
+	if !b.fundingPending {
+		return
+	}
+	b.fundingPending = false
+	var missing []int32
+	short := false
+	for sid, qty := range b.quantities {
+		if qty < 0 {
+			short = true
+		}
+		if qty != 0 {
+			if t, ok := b.fundingMarked[sid]; !ok || t != b.fundingStep {
+				missing = append(missing, sid)
+			}
+		}
+	}
+	if !short || len(missing) == 0 {
+		return
+	}
+	sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+	for _, sid := range missing {
+		m, ok := b.marks[sid]
+		if !ok || m.Price <= 0 {
+			continue
+		}
+		from := m.AtMS
+		if t, ok := b.fundingBilled[sid]; ok {
+			from = max(from, t)
+		}
+		if b.fundingStep <= from {
+			continue
+		}
+		dt := float64(min(b.fundingStep-from, maxFundingAccrualMS))
+		b.fundingBilled[sid] = b.fundingStep
+		b.addFundingTerm(b.quantities[sid] * m.Price * b.fundingApr / 100 * dt / fundingYearMS)
+	}
 }

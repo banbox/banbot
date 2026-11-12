@@ -31,8 +31,9 @@ type PortfolioDefinition struct {
 type CostSpec struct {
 	FeeRate, SlippageRate float64
 	FundingPolicy         string
-	// FundingApr (081): approximate funding of LONG weights-mode positions, percent per year (10 = 10%/y), accrued on
-	// held notional between price marks; shorts get no credit. 0 = off (explicit-zero as declared).
+	// FundingApr (081): approximate funding of weights-mode books, percent per year (10 = 10%/y), accrued between
+	// price marks on the NET long notional max(0, long - short) of the whole book (BtFeatureLevel 13; before: on every
+	// long leg); a net short book pays and receives nothing. 0 = off (explicit-zero as declared).
 	FundingApr float64 `json:",omitempty"`
 }
 type SnapshotReference struct {

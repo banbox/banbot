@@ -63,4 +63,9 @@ package core
 //	   factor / stat-arb: a decision with NAV <= 0 closes the book at the marks, NAV 0 to the window end, run.json
 //	   liquidated / liquidated_cause equity_depleted. Orders, fills and final balance are unchanged; the curve metrics of
 //	   multi-symbol time-series runs differ from level 11 (bt_fresh_equity: false reproduces them)
-const BtFeatureLevel = 12
+//	13 factor / stat-arb funding approximation (manifest.costs.funding_apr) is charged on the NET long notional of the
+//	   book, max(0, long - short), instead of on every long leg (hedged books were over-charged): pure long books are
+//	   unchanged, a fully hedged book pays 0, a net short book pays 0 (no credit). Orders and fills are unchanged, only
+//	   Funding / NAV / curves of books with shorts differ from level 12; ts (order engine) bt_funding_apr is unchanged
+//	   (long positions only). Level 12 has no separate release; v0.7.90-trend.19 is level 13
+const BtFeatureLevel = 13

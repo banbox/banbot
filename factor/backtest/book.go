@@ -34,7 +34,12 @@ type Book struct {
 	fillFacts                               []bookFillFact
 	acceptedProposals                       map[string]bookAcceptance
 	// 071 PIT exits: positions closed because the instrument dropped out; resolved at recovery / end of run
-	fundingApr          float64 // 081: percent per year charged on long notional, see SetFundingApr
+	fundingApr          float64         // 081: percent per year charged on the net long notional, see SetFundingApr
+	fundingStep         int64           // billing step (Mark `now`) of fundingNet
+	fundingNet          float64         // signed funding terms of the step so far (floored at 0 when booked)
+	fundingPending      bool            // the step has terms / marks not settled yet, see settleFunding
+	fundingMarked       map[int32]int64 // instrument -> last billing step it was marked in
+	fundingBilled       map[int32]int64 // instrument -> time its funding is already billed up to (no mark of its own)
 	pitExits            map[int32]pitExit
 	pitPenaltyBps       float64
 	gapLoss, delistLoss float64
@@ -50,7 +55,7 @@ func NewBook(nav float64) (*Book, error) {
 	if nav <= 0 || !finite(nav) {
 		return nil, errors.New("backtest: invalid initial strategy NAV")
 	}
-	return &Book{initNAV: nav, cash: nav, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
+	return &Book{initNAV: nav, cash: nav, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingMarked: map[int32]int64{}, fundingBilled: map[int32]int64{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
 }
 func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	if _, ok := b.terminals[sid]; ok {
@@ -62,8 +67,15 @@ func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	if old, ok := b.marks[sid]; ok && q.AtMS < old.AtMS {
 		return errors.New("backtest: mark moved backwards")
 	}
-	if old, ok := b.marks[sid]; ok && b.fundingApr > 0 {
-		b.accrueFunding(sid, old, q.AtMS)
+	if b.fundingApr > 0 {
+		if now != b.fundingStep {
+			b.settleFunding()
+			b.fundingStep, b.fundingNet = now, 0
+		}
+		if old, ok := b.marks[sid]; ok {
+			b.fundingPending = true
+			b.accrueFunding(sid, old, q.AtMS, now)
+		}
 	}
 	if ex, ok := b.pitExits[sid]; ok && q.AtMS > ex.atMS {
 		b.resolveRecovered(sid, ex, q.Price)
@@ -74,6 +86,7 @@ func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	return nil
 }
 func (b *Book) State() State {
+	b.settleFunding()
 	nav := b.cash
 	for _, sid := range sortedKeys(b.quantities) {
 		qty := b.quantities[sid]
@@ -82,6 +95,7 @@ func (b *Book) State() State {
 	return State{b.cash, nav, b.fees, b.slippage, b.funding, b.turnover, maps.Clone(b.quantities)}
 }
 func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now int64, fee, slip float64) error {
+	b.settleFunding()
 	if p == nil || fee < 0 || slip < 0 || slip >= 1 || !finite(fee) || !finite(slip) {
 		return errors.New("backtest: invalid target/costs")
 	}
@@ -154,6 +168,7 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 // Funding is an explicit realized settlement, never an inferred venue schedule.
 // Entries must be delivered at their settlement event with prior availability.
 func (b *Book) ApplyFunding(f Funding, now int64) error {
+	b.settleFunding()
 	if f.ID == "" || f.SID <= 0 || f.AtMS != now || f.AvailableAt > now || f.AvailableAt < 0 || !finite(f.Rate) {
 		return errors.New("backtest: funding settlement unavailable or delivered late")
 	}
@@ -167,7 +182,6 @@ func (b *Book) ApplyFunding(f Funding, now int64) error {
 	cost := b.quantities[f.SID] * q.Price * f.Rate
 	b.cash -= cost
 	b.funding += cost
-	b.attr.addFunding(f.SID, cost)
 	b.fundingIDs[f.ID] = true
 	b.ledgerCursor++
 	return nil

@@ -63,8 +63,9 @@ type PairResult struct {
 }
 
 // SymbolContribution is one instrument's share of the strategy result. PnL is the price-move profit of the held
-// quantity (before costs), Costs = fees + slippage + funding + PIT exit costs, Net = PnL - Costs, all in currency
-// and summing over all instruments to the NAV change. NetPct = Net / initial NAV; Share = Net / sum(|Net|) over
+// quantity (before costs), Costs = fees + slippage + PIT exit costs (no funding: funding is an account-level item,
+// Attribution.Funding), Net = PnL - Costs, all in currency and summing over all instruments to the NAV change plus
+// Attribution.Funding. NetPct = Net / initial NAV; Share = Net / sum(|Net|) over
 // all instruments (in [-1, 1]; a value near +-1 means one instrument decides the result).
 type SymbolContribution struct {
 	Symbol                         string
