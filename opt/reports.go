@@ -670,7 +670,9 @@ func (r *BTResult) doneProfits(off int) float64 {
 	return total
 }
 
-func (r *BTResult) printBtResult(reset bool) {
+// printBtResult prints the report and writes the result files. The returned error is the one that matters for the
+// caller's exit status: detail.json is the machine-readable result, so failing to write it fails the run.
+func (r *BTResult) printBtResult(reset bool) *errs.Error {
 	if cfg := r.runtimeConfig(); cfg != nil && cfg.StratPerf != nil && cfg.StratPerf.Enable {
 		if r.reportRuntimeDeps().legacy {
 			core.DumpPerfs(r.OutDir)
@@ -693,7 +695,7 @@ func (r *BTResult) printBtResult(reset bool) {
 			zap.Float64("final_balance", r.FinBalance), zap.Float64("final_withdraw", r.FinWithdraw),
 			zap.Float64("calc_diff", r.CalcDiff))
 	}
-	r.dumpBtFiles(reset)
+	return r.dumpBtFiles(reset)
 }
 
 func (r *BTResult) cmdReports(orders []*ormo.InOutOrder) string {
@@ -729,7 +731,7 @@ func (r *BTResult) cmdReports(orders []*ormo.InOutOrder) string {
 	return b.String()
 }
 
-func (r *BTResult) dumpBtFiles(reset bool) {
+func (r *BTResult) dumpBtFiles(reset bool) *errs.Error {
 	csvPath := fmt.Sprintf("%s/orders.csv", r.OutDir)
 	orders := r.historyOrders()
 	err_ := dumpOrdersCSV(orders, csvPath, r.reportRuntimeDeps())
@@ -752,7 +754,7 @@ func (r *BTResult) dumpBtFiles(reset bool) {
 
 	r.DumpCharts()
 
-	r.dumpDetail("")
+	return r.dumpDetail("")
 }
 
 func (r *BTResult) Collect() *errs.Error {
@@ -1630,7 +1632,9 @@ func (r *BTResult) Score() float64 {
 	return CalcBtScore(r.TotProfitPct, r.ShowDrawDownPct)
 }
 
-func (r *BTResult) dumpDetail(outPath string) {
+// dumpDetail writes detail.json (outPath "" = OutDir/detail.json). The file is written whole or not at all (temp file +
+// rename); a failure is logged and returned, never swallowed: a run without its detail.json has no result.
+func (r *BTResult) dumpDetail(outPath string) *errs.Error {
 	if outPath == "" {
 		outPath = fmt.Sprintf("%s/detail.json", r.OutDir)
 	}
@@ -1640,12 +1644,19 @@ func (r *BTResult) dumpDetail(outPath string) {
 	data, err_ := utils2.Marshal(r)
 	if err_ != nil {
 		r.logger().Error("marshal backtest detail fail", zap.Error(err_))
-		return
+		return errs.New(errs.CodeMarshalFail, err_)
 	}
-	err_ = os.WriteFile(outPath, data, 0644)
+	tmpPath := outPath + ".tmp"
+	err_ = os.WriteFile(tmpPath, data, 0644)
+	if err_ == nil {
+		err_ = os.Rename(tmpPath, outPath)
+	}
 	if err_ != nil {
-		r.logger().Error("write backtest detail fail", zap.Error(err_))
+		_ = os.Remove(tmpPath)
+		r.logger().Error("write backtest detail fail", zap.String("path", outPath), zap.Error(err_))
+		return errs.New(errs.CodeIOWriteFail, err_)
 	}
+	return nil
 }
 
 /*
@@ -2508,7 +2519,9 @@ func calcBtResultWithDeps(odList []*ormo.InOutOrder, funds map[string]float64, o
 	btRes.logger().Info("BackTest Reports:\n" + btRes.cmdReports(odList))
 	if outDir != "" {
 		btRes.OutDir = outDir
-		btRes.dumpBtFiles(true)
+		if err := btRes.dumpBtFiles(true); err != nil {
+			return nil, err
+		}
 		btRes.logger().Info("Saved", zap.String("at", outDir))
 	}
 	if btRes.CalcDiff > 0.01 {

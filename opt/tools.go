@@ -1767,6 +1767,17 @@ func collectGoFiles(rootPath string) ([]string, error) {
 // ZipBacktestResult 压缩回测结果为zip数据
 // maxFileSize: 最大允许的文件大小(字节)，超过此大小的文件不添加到zip中，0表示不限制
 func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFileSize int64) ([]byte, error) {
+	return zipBacktestResult(resultPath, cleanIfSuccess, withOrders, maxFileSize, false, 0)
+}
+
+// ZipBacktestResultStrict is ZipBacktestResult for shipping a finished run to the site: detail.json is the result, so it
+// is never skipped. It must exist, is limited by maxDetailSize (0 = unlimited) instead of maxFileSize, and any failure to
+// read or add it is an error that leaves resultPath untouched (the other files are still skipped by maxFileSize as before).
+func ZipBacktestResultStrict(resultPath string, cleanIfSuccess, withOrders bool, maxFileSize, maxDetailSize int64) ([]byte, error) {
+	return zipBacktestResult(resultPath, cleanIfSuccess, withOrders, maxFileSize, true, maxDetailSize)
+}
+
+func zipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFileSize int64, strictDetail bool, maxDetailSize int64) ([]byte, error) {
 	if !utils.Exists(resultPath) {
 		return nil, fmt.Errorf("backtest result not exist: %s", resultPath)
 	}
@@ -1800,14 +1811,26 @@ func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFi
 			fileName = filepath.Base(filePath)
 		}
 
+		isDetail := strictDetail && fileName == "detail.json"
 		// 跳过不存在的文件
 		if !utils.Exists(filePath) {
+			if isDetail {
+				return nil, fmt.Errorf("backtest result file detail.json is missing in %s", resultPath)
+			}
 			log.Debug("File not found, skipping", zap.String("file", fileName))
 			continue
 		}
 
 		// 检查文件大小
-		if maxFileSize > 0 {
+		if isDetail {
+			fileInfo, err := os.Stat(filePath)
+			if err != nil {
+				return nil, fmt.Errorf("stat detail.json: %w", err)
+			}
+			if maxDetailSize > 0 && fileInfo.Size() > maxDetailSize {
+				return nil, fmt.Errorf("detail.json is %d bytes, over the %d byte limit of a shipped result", fileInfo.Size(), maxDetailSize)
+			}
+		} else if maxFileSize > 0 {
 			fileInfo, err := os.Stat(filePath)
 			if err != nil {
 				log.Warn("Failed to stat file", zap.String("file", fileName), zap.Error(err))
@@ -1823,6 +1846,9 @@ func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFi
 		// 读取文件内容
 		fileData, err := os.ReadFile(filePath)
 		if err != nil {
+			if isDetail {
+				return nil, fmt.Errorf("read detail.json: %w", err)
+			}
 			log.Warn("Failed to read file", zap.String("file", fileName), zap.Error(err))
 			continue
 		}
@@ -1832,12 +1858,18 @@ func ZipBacktestResult(resultPath string, cleanIfSuccess, withOrders bool, maxFi
 
 		w, err := zipWriter.Create(zipPath)
 		if err != nil {
+			if isDetail {
+				return nil, fmt.Errorf("zip detail.json: %w", err)
+			}
 			log.Warn("Failed to create zip entry", zap.String("file", fileName), zap.Error(err))
 			continue
 		}
 
 		// 写入文件内容
 		if _, err = w.Write(fileData); err != nil {
+			if isDetail {
+				return nil, fmt.Errorf("zip detail.json: %w", err)
+			}
 			log.Warn("Failed to write to zip", zap.String("file", fileName), zap.Error(err))
 			continue
 		}

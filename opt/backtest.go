@@ -1018,7 +1018,9 @@ func (b *BackTest) RunContext(ctx context.Context) *errs.Error {
 		if failOpens != "" {
 			b.Logger().Info("fail open tag nums:\n" + failOpens)
 		}
-		b.printBtResult(true)
+		if err := b.printBtResult(true); err != nil {
+			return err
+		}
 	}
 	completed = true
 	return nil
