@@ -1,6 +1,6 @@
 # 08 应用编排与接口模块：entry / opt / web / rpc / llm
 
-> 基于当前源码（分支 main，`core.Version = v0.7.1`，`core.UIVersion = v0.6.0`）梳理。文中 `文件:行号` 均经过核对。
+> 基于当前源码（分支 main，`core.Version = v0.7.3`，`core.UIVersion = v0.6.0`）梳理。文中 `文件:行号` 均经过核对。
 >
 > 本文描述 entry/opt/web/rpc/llm 的当前实现，行号仅作定位参考。
 
