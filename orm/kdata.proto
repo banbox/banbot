@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package orm;
 
-option go_package = ".";
+option go_package = "github.com/banbox/banbot/orm;orm";
 
 // KlineBlock represents a block of k-line data
 message KlineBlock {
@@ -16,6 +16,7 @@ message KlineBlock {
   repeated double close = 8;  // close prices
   repeated double volume = 9; // volumes
   repeated double info = 10;  // additional info (used for china market)
+  bytes series = 11; // Versioned generic DataSeries payload including schema, types, NULLs and timestamps
 }
 
 // AdjFactorBlock represents adjustment factors data
@@ -40,6 +41,8 @@ message ExSymbolBlock{
   string symbol = 5;
   int64 list_ms = 6;
   int64 delist_ms = 7;
+  bool combined = 8;
+  string agg_rules = 9;
 }
 
 message KHoleBlock{
@@ -49,6 +52,7 @@ message KHoleBlock{
 }
 
 message EXInfo{
+  uint32 archive_version = 5;
   repeated ExSymbolBlock symbols = 1;
   repeated KHoleBlock kHoles = 2;
   repeated AdjFactorBlock adjFactors = 3;

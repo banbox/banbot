@@ -15,6 +15,7 @@ import (
 	"github.com/banbox/banexg/errs"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func KLinesToSeries(exs *ExSymbol, tf string, bars []*banexg.Kline, adj *AdjInfo, isWarmUp, closed bool) []*DataSeries {
@@ -1175,6 +1176,18 @@ func (q *Queries) InsertOHLCVSeriesAuto(timeFrame string, exs *ExSymbol, rows []
 }
 
 func (q *Queries) InsertOHLCVSeries(timeFrame string, sid int32, rows []*DataSeries) (int64, *errs.Error) {
+	return q.InsertOHLCVSeriesContext(context.Background(), timeFrame, sid, rows)
+}
+
+// InsertOHLCVSeriesContext carries cancellation through the table lock and
+// storage write. The caller retains ownership of any existing transaction.
+func (q *Queries) InsertOHLCVSeriesContext(ctx context.Context, timeFrame string, sid int32, rows []*DataSeries) (int64, *errs.Error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, err)
+	}
 	if len(rows) == 0 {
 		return 0, nil
 	}
@@ -1186,12 +1199,12 @@ func (q *Queries) InsertOHLCVSeries(timeFrame string, sid int32, rows []*DataSer
 		return 0, err
 	}
 	tblName := "kline_" + timeFrame
-	unlock, lockErr := q.tableReadLock(context.Background(), tblName)
+	unlock, lockErr := q.tableReadLock(ctx, tblName)
 	if lockErr != nil {
 		return 0, NewDbErr(core.ErrDbExecFail, lockErr)
 	}
 	defer unlock()
-	return q.insertOHLCVRowsLocked(timeFrame, values)
+	return q.insertOHLCVRowsLockedContext(ctx, timeFrame, values)
 }
 
 func (q *Queries) insertOHLCVRows(timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
@@ -1209,11 +1222,14 @@ func (q *Queries) insertOHLCVRows(timeFrame string, rows []*DataSeries) (int64, 
 
 // insertOHLCVRowsLocked writes rows while the caller holds the target table read lock.
 func (q *Queries) insertOHLCVRowsLocked(timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
+	return q.insertOHLCVRowsLockedContext(context.Background(), timeFrame, rows)
+}
+
+func (q *Queries) insertOHLCVRowsLockedContext(ctx context.Context, timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
 	if !q.isQuestDB() {
-		return q.insertOHLCVSeriesPg(timeFrame, rows)
+		return q.insertOHLCVSeriesPgContext(ctx, timeFrame, rows)
 	}
 	tblName := "kline_" + timeFrame
-	ctx := context.Background()
 	fields := klineExtraFields(rows)
 	cols := klineInsertColumns("ts", fields)
 	colsPerRow := len(cols)
@@ -1256,9 +1272,38 @@ func (q *Queries) insertOHLCVRowsLocked(timeFrame string, rows []*DataSeries) (i
 	return total, nil
 }
 
+// SubQueries exposes the pgx.Tx method set even when its underlying handle
+// is a pool connection. Inspect that handle before deciding SAVEPOINT is valid.
+func isOHLCVTransaction(db DBTX) bool {
+	for {
+		if sub, ok := db.(*SubQueries); ok {
+			db = sub.db
+			continue
+		}
+		break
+	}
+	switch db.(type) {
+	case *pgx.Conn, *pgxpool.Conn, *pgxpool.Pool:
+		return false
+	default:
+		_, ok := db.(pgx.Tx)
+		return ok
+	}
+}
+
 func (q *Queries) insertOHLCVSeriesPg(timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
-	ctx := context.Background()
-	if _, ok := q.db.(pgx.Tx); !ok {
+	return q.insertOHLCVSeriesPgContext(context.Background(), timeFrame, rows)
+}
+
+// Cleanup must survive caller cancellation without waiting indefinitely.
+func rollbackOHLCVTransaction(ctx context.Context, tx pgx.Tx) {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = tx.Rollback(cleanup)
+}
+
+func (q *Queries) insertOHLCVSeriesPgContext(ctx context.Context, timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
+	if !isOHLCVTransaction(q.db) {
 		beginner, ok := q.db.(dbBeginner)
 		if !ok {
 			return 0, NewDbErr(core.ErrDbExecFail, fmt.Errorf("database connection does not support transactions"))
@@ -1267,48 +1312,78 @@ func (q *Queries) insertOHLCVSeriesPg(timeFrame string, rows []*DataSeries) (int
 		if beginErr != nil {
 			return 0, NewDbErr(core.ErrDbExecFail, beginErr)
 		}
-		n, insertErr := insertOHLCVSeriesPgTx(tx, timeFrame, rows)
+		committed := false
+		defer func() {
+			if !committed {
+				rollbackOHLCVTransaction(ctx, tx)
+			}
+		}()
+		n, insertErr := insertOHLCVSeriesPgTxContext(ctx, tx, timeFrame, rows)
 		if insertErr != nil {
-			_ = tx.Rollback(ctx)
 			return n, insertErr
+		}
+		if err := ctx.Err(); err != nil {
+			return n, NewDbErr(core.ErrDbExecFail, err)
 		}
 		if commitErr := tx.Commit(ctx); commitErr != nil {
 			return n, NewDbErr(core.ErrDbExecFail, commitErr)
 		}
+		committed = true
 		return n, nil
 	}
-	return insertOHLCVSeriesPgTx(q.db, timeFrame, rows)
+	return insertOHLCVSeriesPgTxContext(ctx, q.db, timeFrame, rows)
 }
 
 func insertOHLCVSeriesPgTx(db DBTX, timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
+	return insertOHLCVSeriesPgTxContext(context.Background(), db, timeFrame, rows)
+}
+
+func insertOHLCVSeriesPgTxContext(ctx context.Context, db DBTX, timeFrame string, rows []*DataSeries) (int64, *errs.Error) {
 	tblName := "kline_" + timeFrame
 	fields := klineExtraFields(rows)
 	cols := klineInsertColumns("time", fields)
 	newSrc := func() *iterForAddOHLCVSeriesPg { return &iterForAddOHLCVSeriesPg{rows: rows, fields: fields} }
-	ctx := context.Background()
 	const savepoint = "banbot_kline_copy"
 	if _, err := db.Exec(ctx, "SAVEPOINT "+savepoint); err != nil {
 		return 0, NewDbErr(core.ErrDbExecFail, err)
 	}
+	success := false
+	defer func() {
+		if !success {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if _, err := db.Exec(cleanup, "ROLLBACK TO SAVEPOINT "+savepoint); err == nil {
+				_, _ = db.Exec(cleanup, "RELEASE SAVEPOINT "+savepoint)
+			}
+		}
+	}()
 	n, err := db.CopyFrom(ctx, pgx.Identifier{tblName}, cols, newSrc())
 	if err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return 0, NewDbErr(core.ErrDbExecFail, canceled)
+		}
 		if _, rollbackErr := db.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepoint); rollbackErr != nil {
 			return 0, NewDbErr(core.ErrDbExecFail, rollbackErr)
 		}
 		tfMSecs := int64(utils2.TFToSecs(timeFrame) * 1000)
 		startMS := rows[0].TimeMS
 		endMS := rows[len(rows)-1].TimeMS + tfMSecs
-		if delErr := delKLinesPg(New(db), timeFrame, rows[0].Sid, startMS, endMS); delErr != nil {
-			return 0, delErr
+		sql := fmt.Sprintf("DELETE FROM %s WHERE sid = $1 AND time >= $2 AND time < $3", tblName)
+		if _, delErr := db.Exec(ctx, sql, rows[0].Sid, startMS, endMS); delErr != nil {
+			return 0, NewDbErr(core.ErrDbExecFail, delErr)
 		}
 		n, err = db.CopyFrom(ctx, pgx.Identifier{tblName}, cols, newSrc())
 		if err != nil {
 			return 0, NewDbErr(core.ErrDbExecFail, err)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, NewDbErr(core.ErrDbExecFail, err)
+	}
 	if _, releaseErr := db.Exec(ctx, "RELEASE SAVEPOINT "+savepoint); releaseErr != nil {
 		return 0, NewDbErr(core.ErrDbExecFail, releaseErr)
 	}
+	success = true
 	return n, nil
 }
 

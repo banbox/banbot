@@ -53,7 +53,7 @@ Two types of data files will be exported: `exInfo1.dat` and `kline[num].dat`. Th
 
 > Note: Do not modify the exported file names, as this will prevent recognition during import
 
-This format exports fixed K-line fields and accompanying metadata. It does not include arbitrary custom columns or independent series tables. Read and save those separately through `SeriesStore` or field queries; this command is not a complete time-series database backup.
+This format preserves all supported physical K-line columns, scalar types, NULLs, timestamp gaps, and symbol Combined/AggRules metadata through a versioned generic payload. It reads storage directly without exchange requests. Keep the `complete` checksum manifest with all files and use a fresh output directory. Incomplete or empty archives are rejected before symbol writes. Legacy fixed-field archives remain readable but cannot recover omitted fields; new archives require an updated importer. Independent series tables are not included. Existing target column types/nullability and symbol aggregation metadata must be compatible. Imports are not atomic across files. Import cancellation reaches active writes and transactions; a canceled COPY does not trigger DELETE retries. Rollback cleanup survives caller cancellation with a five-second bound per stage (at most ten seconds for an owned root transaction). Earlier successful batches remain committed.
 
 ## Exporting Candlesticks (csv.zip)
 When you need to export candlesticks for further reading by other programs, it's recommended to export as zip-compressed csv format. This can be easily accessed programmatically.

@@ -1,6 +1,6 @@
 # banbot 项目总览
 
-> 本文由 `doc/project/01~08` 各模块文档提炼而成，基于 v0.7.3（`core.Version`）、main 分支源码整理。
+> 本文由 `doc/project/01~08` 各模块文档提炼而成，基于 v0.7.4（`core.Version`）、main 分支源码整理。
 > 先读本文了解全貌，改动具体模块时再读对应的详细文档。行号和细节以源码为准。**修改本目录文档前先读第 8 节维护规约。**
 
 ## 1. 项目是什么
@@ -11,6 +11,7 @@ banbot 是一个 Go 编写的量化交易系统，覆盖：策略配置、交易
   - `time_series`：时序策略，每个「策略 × 周期 × 品种」一个 `StratJob`，由 `biz.Trader` 分发 K 线/数据并产生进出场请求。
   - `factor`：截面因子 / 多因子组合策略，含统计套利（配对），用 DAG 计算因子，由组合策略（portfolio policy）生成目标持仓。
   - 两者可混合（mixed），在 `execution.SharedAccount` 中按归属与预算净额执行。
+- **K 线跨库归档**：物理表全部受支持字段经版本化通用值载荷传输，保留类型、NULL、时间间隙和品种聚合元数据；导入先检查完成清单并映射 SID，取消信号贯穿活动 SQL，回滚清理有时限；独立时序表不包含在内。
 - **任意时序数据**：`orm.DataSeries`（`Values map[string]any`）是统一运行时数据模型，K 线与自定义字段走同一条路径，不得移除或收窄为固定 OHLCV 字段。
 - **交易所对接**由外部库 `banexg` 负责，banbot 内禁止写交易所专属分支（见 `AGENTS.md`）。
 - **存储**：QuestDB / TimescaleDB 双后端存时序数据；SQLite 存订单、钱包、UI 任务、执行账本。

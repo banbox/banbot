@@ -91,6 +91,9 @@ func ExportKDataWithDeps(configFile string, outputDir string, numWorkers int, de
 	if err != nil {
 		return err
 	}
+	if _, statErr := os.Stat(filepath.Join(outputDir, "exInfo1.dat")); statErr == nil {
+		return errs.NewMsg(core.ErrBadConfig, "export output already contains an archive; use a fresh directory")
+	}
 	task, err := genExportTaskWithDeps(deps, cfg, pb)
 	if err != nil {
 		return err
@@ -106,13 +109,28 @@ func ExportKDataWithDeps(configFile string, outputDir string, numWorkers int, de
 		return errs.New(errs.CodeIOWriteFail, err_)
 	}
 	err = dumpProto(task.exInfo, file)
-	file.Close()
+	closeErr := file.Close()
+	if err == nil && closeErr != nil {
+		err = errs.New(errs.CodeIOWriteFail, closeErr)
+	}
 	if err != nil {
 		return err
 	}
 	deps.logger().Info("export basic info ok")
 
-	return runExportKlinesWithDeps(deps, task.jobs, outputDir, numWorkers, pb)
+	if err := runExportKlinesWithDeps(deps, task.jobs, outputDir, numWorkers, pb); err != nil {
+		return err
+	}
+	files, _ := filepath.Glob(filepath.Join(outputDir, "kline*.dat"))
+	// No marker is published for an empty or failed export.
+	legacyInfo := EXInfo{Symbols: task.exInfo.Symbols}
+	if err := validateTransferArchive(outputDir, &legacyInfo, files); err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
+	if err := writeTransferManifest(outputDir, files); err != nil {
+		return errs.New(errs.CodeIOWriteFail, err)
+	}
+	return nil
 }
 
 func genExpAdjFactors(deps KDataTransferDeps, items []*config.MarketSymbolsRange) ([]*AdjFactorBlock, *errs.Error) {
@@ -247,6 +265,8 @@ func genExportTaskWithDeps(deps KDataTransferDeps, cfg *config.ExportConfig, pb 
 			Symbol:   exs.Symbol,
 			ListMs:   exs.ListMs,
 			DelistMs: exs.DelistMs,
+			Combined: exs.Combined,
+			AggRules: exs.AggRules,
 		})
 	}
 
@@ -259,10 +279,11 @@ func genExportTaskWithDeps(deps KDataTransferDeps, cfg *config.ExportConfig, pb 
 	return &ExportTask{
 		jobs: jobs,
 		exInfo: &EXInfo{
-			Symbols:    symbols,
-			KHoles:     kHoles,
-			AdjFactors: adjFactors,
-			Calendars:  calendars,
+			ArchiveVersion: transferArchiveVersion,
+			Symbols:        symbols,
+			KHoles:         kHoles,
+			AdjFactors:     adjFactors,
+			Calendars:      calendars,
 		},
 	}, nil
 }
@@ -457,70 +478,57 @@ func expandWildcard(val string, allVals []string) []string {
 }
 
 func exportKlines(sess *Queries, ctx context.Context, task *ExportKlineJob, outDir string, file *os.File, pBar *utils2.PrgBar) (*os.File, *errs.Error) {
-	exs := task.ExSymbol
-	tfMSecs := int64(utils.TFToSecs(task.TimeFrame) * 1000)
-	totalKLineNum := int((task.StopMS - task.StartMS) / tfMSecs)
-	pJob := pBar.NewJob(totalKLineNum)
+	tfMS := int64(utils.TFToSecs(task.TimeFrame)) * 1000
+	if tfMS <= 0 {
+		return file, errs.NewMsg(core.ErrBadConfig, "invalid export timeframe %s", task.TimeFrame)
+	}
+	pJob := pBar.NewJob(int((task.StopMS - task.StartMS) / tfMS))
 	defer pJob.Done()
-	if totalKLineNum <= 0 {
-		return file, nil
+	fields, err_ := transferColumns(ctx, sess, task.TimeFrame)
+	if err_ != nil {
+		return file, errs.New(core.ErrDbReadFail, err_)
 	}
-
-	// 分批获取数据，每批最多5000条
-	var err_ error
-	var err *errs.Error
-	var klines []*banexg.Kline
-	const batchSize, maxKlineSize = 5000, 655360
-	startMS := task.StartMS
-	block := newKlineBlock(exs.ID, task.TimeFrame, min(batchSize, totalKLineNum))
-	hasInfo := task.HasInfo
-	if file == nil {
-		file, err_ = utils2.CreateNumFile(outDir, "kline", "dat")
-		if err_ != nil {
-			return nil, errs.New(errs.CodeIOWriteFail, err_)
+	for start := task.StartMS; start < task.StopMS; {
+		if err := ctx.Err(); err != nil {
+			return file, errs.New(errs.CodeRunTime, err)
 		}
-	}
-
-	for startMS < task.StopMS {
-		select {
-		case <-ctx.Done():
-			return file, errs.New(errs.CodeRunTime, ctx.Err())
-		default:
-		}
-
-		_, klines, err = sess.GetOHLCV(exs, task.TimeFrame, startMS, task.StopMS, batchSize, false)
+		rows, err := readTransferRows(ctx, sess, task, fields, start, 5000)
 		if err != nil {
 			return file, err
 		}
-		if len(klines) == 0 {
+		if len(rows) == 0 {
 			break
 		}
-		curEnd := klines[len(klines)-1].Time + tfMSecs
-		pJob.Add(int((curEnd - startMS) / tfMSecs))
-		startMS = curEnd
-
-		for len(klines) > 0 {
-			klines = block.Append(klines, tfMSecs, hasInfo)
-			if len(klines) > 0 || len(block.Open) > maxKlineSize {
-				err = block.Dump(file)
-				if err != nil {
-					return file, err
-				}
-				if info, err_ := file.Stat(); err_ != nil || info.Size() > maxOutFSize {
-					file.Close()
-					file, err_ = utils2.CreateNumFile(outDir, "kline", "dat")
-					if err_ != nil {
-						return nil, errs.New(errs.CodeIOWriteFail, err_)
-					}
-				}
+		block := &KlineBlock{ExsId: task.ID, Timeframe: task.TimeFrame}
+		if err_ := encodeTransferBlock(block, fields, rows, sess.isQuestDB()); err_ != nil {
+			return file, errs.New(core.ErrMarshalFail, err_)
+		}
+		if file == nil {
+			file, err_ = utils2.CreateNumFile(outDir, "kline", "dat")
+			if err_ != nil {
+				return nil, errs.New(errs.CodeIOWriteFail, err_)
 			}
 		}
+		if err := dumpProto(block, file); err != nil {
+			return file, err
+		}
+		pJob.Add(len(rows))
+		next := rows[len(rows)-1].EndMS
+		if next <= start {
+			return file, errs.NewMsg(core.ErrBadConfig, "export made no progress")
+		}
+		start = next
+		stat, err_ := file.Stat()
+		if err_ != nil {
+			return file, errs.New(errs.CodeIOWriteFail, err_)
+		}
+		if stat.Size() > maxOutFSize {
+			if err_ := file.Close(); err_ != nil {
+				return nil, errs.New(errs.CodeIOWriteFail, err_)
+			}
+			file = nil
+		}
 	}
-	err = block.Dump(file)
-	if err != nil {
-		return file, err
-	}
-
 	return file, nil
 }
 
@@ -589,7 +597,7 @@ func (b *KlineBlock) Dump(file *os.File) *errs.Error {
 	return err
 }
 
-func dumpProto(b proto.Message, file *os.File) *errs.Error {
+func dumpProto(b proto.Message, file io.Writer) *errs.Error {
 	var err2 *errs.Error
 	data, err := proto.Marshal(b)
 	if err != nil {
@@ -599,10 +607,18 @@ func dumpProto(b proto.Message, file *os.File) *errs.Error {
 		if err != nil {
 			err2 = errs.New(core.ErrRunTime, err)
 		} else {
-			if _, err = file.Write(sizeBuf); err != nil {
+			if n, writeErr := file.Write(sizeBuf); writeErr != nil || n != len(sizeBuf) {
+				err = writeErr
+				if err == nil {
+					err = io.ErrShortWrite
+				}
 				err2 = errs.New(errs.CodeIOWriteFail, err)
 			} else {
-				if _, err = file.Write(data); err != nil {
+				if n, writeErr := file.Write(data); writeErr != nil || n != len(data) {
+					err = writeErr
+					if err == nil {
+						err = io.ErrShortWrite
+					}
 					err2 = errs.New(errs.CodeIOWriteFail, err)
 				}
 			}
@@ -619,7 +635,7 @@ func runExportKlinesWithDeps(deps KDataTransferDeps, jobs []*ExportKlineJob, out
 	// Create worker pool
 	var wg sync.WaitGroup
 	jobCh := make(chan *ExportKlineJob)
-	errCh := make(chan error, numWorkers+2)
+	errCh := make(chan error, 2*numWorkers+2)
 	pBar := utils2.NewPrgBar(len(jobs)*core.StepTotal, "kline")
 	if pb != nil {
 		pBar.PrgCbs = append(pBar.PrgCbs, func(done int, total int) {
@@ -642,7 +658,10 @@ func runExportKlinesWithDeps(deps KDataTransferDeps, jobs []*ExportKlineJob, out
 			defer func() {
 				release()
 				if file != nil {
-					_ = file.Close()
+					if closeErr := file.Close(); closeErr != nil {
+						errCh <- closeErr
+						cancel()
+					}
 				}
 			}()
 
@@ -659,6 +678,7 @@ func runExportKlinesWithDeps(deps KDataTransferDeps, jobs []*ExportKlineJob, out
 
 	// Send jobs to workers
 	go func() {
+		defer close(jobCh)
 		for _, job := range jobs {
 			select {
 			case <-ctx.Done():
@@ -666,7 +686,6 @@ func runExportKlinesWithDeps(deps KDataTransferDeps, jobs []*ExportKlineJob, out
 			case jobCh <- job:
 			}
 		}
-		close(jobCh)
 	}()
 
 	wg.Wait()
@@ -677,6 +696,9 @@ func runExportKlinesWithDeps(deps KDataTransferDeps, jobs []*ExportKlineJob, out
 	case err_ := <-errCh:
 		return errs.New(errs.CodeRunTime, err_)
 	default:
+		if ctx.Err() != nil {
+			return errs.New(errs.CodeRunTime, ctx.Err())
+		}
 		return nil
 	}
 }
@@ -703,6 +725,21 @@ func ImportDataWithDeps(dataDir string, numWorkers int, deps KDataTransferDeps, 
 		return err
 	}
 
+	files, globErr := filepath.Glob(filepath.Join(dataDir, "kline*.dat"))
+	if globErr != nil {
+		return errs.New(errs.CodeIOReadFail, globErr)
+	}
+	if err := validateTransferArchive(dataDir, exInfo, files); err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
+
+	if exInfo.ArchiveVersion > 0 {
+		for _, item := range exInfo.Symbols {
+			if old := deps.Symbols.GetExSymbol2(item.Exchange, item.Market, item.Symbol); old != nil && (old.Combined != item.Combined || old.AggRules != item.AggRules) {
+				return errs.NewMsg(core.ErrBadConfig, "symbol metadata conflict for %s", item.Symbol)
+			}
+		}
+	}
 	idMap, err := importSymbolsWithDeps(deps, exInfo.Symbols)
 	if err != nil {
 		return err
@@ -716,7 +753,7 @@ func ImportDataWithDeps(dataDir string, numWorkers int, deps KDataTransferDeps, 
 	}
 
 	// Get all .dat files in the directory
-	files, err_ := filepath.Glob(filepath.Join(dataDir, "kline*.dat"))
+	files, err_ = filepath.Glob(filepath.Join(dataDir, "kline*.dat"))
 	if err_ != nil {
 		return errs.New(errs.CodeIOReadFail, err_)
 	}
@@ -781,18 +818,31 @@ func ImportDataWithDeps(dataDir string, numWorkers int, deps KDataTransferDeps, 
 				cancel()
 				return
 			}
-			if len(block.Open) == 0 {
+			if len(block.Open) == 0 && len(block.Series) == 0 {
 				break
 			}
 			pJob.Add(1)
-			sid := idMap[block.ExsId]
-			updateRange(sid, block.Timeframe, block.Start, block.End)
+			sid, mapped := idMap[block.ExsId]
+			if !mapped || sid <= 0 {
+				errCh <- fmt.Errorf("unknown archive symbol id %d", block.ExsId)
+				cancel()
+				return
+			}
 			if err := importKlines(sess2, ctx, sid, &block); err != nil {
 				errCh <- fmt.Errorf("error importing klines for symbol %d: %v", block.ExsId, err)
 				cancel()
 				return
 			}
 
+			rows, _, _, decodeErr := decodeTransferBlock(&block, sid)
+			if decodeErr != nil {
+				errCh <- decodeErr
+				cancel()
+				return
+			}
+			for _, row := range rows {
+				updateRange(sid, block.Timeframe, row.TimeMS, row.EndMS)
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -806,6 +856,9 @@ func ImportDataWithDeps(dataDir string, numWorkers int, deps KDataTransferDeps, 
 		go func() {
 			defer wg.Done()
 			for path := range taskCh {
+				if ctx.Err() != nil {
+					return
+				}
 				runFile(path)
 			}
 		}()
@@ -813,6 +866,7 @@ func ImportDataWithDeps(dataDir string, numWorkers int, deps KDataTransferDeps, 
 
 	// Read blocks from all files and send to workers
 	go func() {
+		defer close(taskCh)
 		for _, filePath := range files {
 			select {
 			case <-ctx.Done():
@@ -820,11 +874,18 @@ func ImportDataWithDeps(dataDir string, numWorkers int, deps KDataTransferDeps, 
 			case taskCh <- filePath:
 			}
 		}
-		close(taskCh)
 	}()
 
 	wg.Wait()
 
+	select {
+	case workerErr := <-errCh:
+		return errs.New(errs.CodeRunTime, workerErr)
+	default:
+	}
+	if ctx.Err() != nil {
+		return errs.New(errs.CodeRunTime, ctx.Err())
+	}
 	// Large imports can outlive a server-side connection. Acquire a fresh
 	// connection for range metadata after all worker writes have completed.
 	sess, release, err := deps.conn()
@@ -858,7 +919,7 @@ func ImportDataWithDeps(dataDir string, numWorkers int, deps KDataTransferDeps, 
 
 			// sranges replaces kinfo/khole: record imported data ranges (non-contiguous allowed).
 			for _, r := range newRanges {
-				if err := sess.UpdateSRanges(context.Background(), sid, "kline_"+tf, tf, r.Start, r.Stop, true); err != nil {
+				if err := sess.UpdateSRanges(ctx, sid, "kline_"+tf, tf, r.Start, r.Stop, true); err != nil {
 					return errs.New(core.ErrDbExecFail, err)
 				}
 			}
@@ -896,6 +957,9 @@ func readProtoMessage(file *os.File, msg proto.Message) *errs.Error {
 		return errs.New(errs.CodeIOReadFail, err)
 	}
 	size := binary.LittleEndian.Uint32(sizeBuf)
+	if size == 0 {
+		return errs.NewMsg(errs.CodeIOReadFail, "zero-length archive frame")
+	}
 
 	// 读取消息内容
 	msgBuf := make([]byte, size)
@@ -921,43 +985,31 @@ func tryInsertKlines(sess *Queries, tf string, sid int32, klines []*banexg.Kline
 }
 
 func importKlines(sess *Queries, ctx context.Context, sid int32, block *KlineBlock) *errs.Error {
-	const batchSize = 1000
-	klines := make([]*banexg.Kline, 0, batchSize)
-	startMS := block.Start
-	var tfMSecs = int64(utils.TFToSecs(block.Timeframe) * 1000)
-	for i := 0; i < len(block.Open); i++ {
-		bar := &banexg.Kline{
-			Time:   startMS,
-			Open:   block.Open[i],
-			High:   block.High[i],
-			Low:    block.Low[i],
-			Close:  block.Close[i],
-			Volume: block.Volume[i],
-		}
-		if len(block.Info) > i {
-			bar.BuyVolume = block.Info[i]
-		}
-		klines = append(klines, bar)
-		if len(klines) >= batchSize {
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-			}
-			err := tryInsertKlines(sess, block.Timeframe, sid, klines)
-			if err != nil {
-				return err
-			}
-			klines = make([]*banexg.Kline, 0, batchSize)
-		}
-		startMS += tfMSecs
+	if sid <= 0 {
+		return errs.NewMsg(core.ErrBadConfig, "import target sid must be positive")
 	}
-	// 处理剩余的K线数据
-	if len(klines) > 0 {
-		err := tryInsertKlines(sess, block.Timeframe, sid, klines)
-		if err != nil {
+	rows, fields, quest, err := decodeTransferBlock(block, sid)
+	if err != nil {
+		return errs.New(core.ErrBadConfig, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return errs.New(errs.CodeRunTime, err)
+	}
+	if err := ensureTransferColumns(ctx, sess, block.Timeframe, fields, quest); err != nil {
+		return errs.New(core.ErrDbExecFail, err)
+	}
+	for start := 0; start < len(rows); {
+		end := start + 1
+		for end < len(rows) && end-start < 1000 && rows[end].TimeMS == rows[end-1].EndMS {
+			end++
+		}
+		if err := ctx.Err(); err != nil {
+			return errs.New(errs.CodeRunTime, err)
+		}
+		if _, err := sess.InsertOHLCVSeriesContext(ctx, block.Timeframe, sid, rows[start:end]); err != nil {
 			return err
 		}
+		start = end
 	}
 	return nil
 }
@@ -975,6 +1027,9 @@ func importSymbolsWithDeps(deps KDataTransferDeps, items []*ExSymbolBlock) (map[
 	for _, it := range items {
 		key := fmt.Sprintf("%s_%s_%s", it.Exchange, it.Market, it.Symbol)
 		if old, ok := oldMap[key]; ok {
+			if it.Combined != old.Combined || it.AggRules != old.AggRules {
+				return nil, errs.NewMsg(core.ErrBadConfig, "symbol metadata conflict for %s", it.Symbol)
+			}
 			idMap[it.Id] = old.ID
 		} else {
 			addItems = append(addItems, it)
@@ -985,6 +1040,8 @@ func importSymbolsWithDeps(deps KDataTransferDeps, items []*ExSymbolBlock) (map[
 				Symbol:   it.Symbol,
 				ListMs:   it.ListMs,
 				DelistMs: it.DelistMs,
+				Combined: it.Combined,
+				AggRules: it.AggRules,
 			})
 		}
 	}
@@ -996,7 +1053,7 @@ func importSymbolsWithDeps(deps KDataTransferDeps, items []*ExSymbolBlock) (map[
 		defer release()
 		adds := make([]AddSymbolsParams, 0, len(addExs))
 		for _, item := range addExs {
-			adds = append(adds, AddSymbolsParams{Exchange: item.Exchange, ExgReal: item.ExgReal, Market: item.Market, Symbol: item.Symbol, ListMs: item.ListMs, DelistMs: item.DelistMs})
+			adds = append(adds, AddSymbolsParams{Exchange: item.Exchange, ExgReal: item.ExgReal, Market: item.Market, Symbol: item.Symbol, ListMs: item.ListMs, DelistMs: item.DelistMs, Combined: item.Combined, AggRules: item.AggRules})
 		}
 		if _, err := q.AddSymbols(deps.context(), adds); err != nil {
 			return nil, errs.New(core.ErrDbExecFail, err)

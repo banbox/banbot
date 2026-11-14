@@ -1136,6 +1136,9 @@ func (c *RunPolicyConfig) Def(k string, dv float64, p *core.Param) float64 {
 
 func (c *RunPolicyConfig) DefInt(k string, dv int, p *core.Param) int {
 	val := c.Param(k, float64(dv))
+	if p == nil {
+		return int(math.Round(val))
+	}
 	if p.Mean == 0 {
 		p.Mean = float64(dv)
 	}
