@@ -1,15 +1,21 @@
-您可能希望在交易过程中使用机器学习/深度学习等AI工具，banbot对此提供了grpc支持。
+# AI 与外部模型
 
-结合ai的常见流程如下：
-1. golang端定义好特征，启动banbot通过`data_server`提供grpc服务
-2. python端请求得到特征数据，保存为训练/测试数据。
-3. python端训练ML/DL等模型。
-4. python端部署模型提供grpc预测服务。
-5. golang端实现交易策略，准备特征请求模型得到预测结果，用于交易决策。
+## ML/DL 与 gRPC
 
-banbot已为上面流程提供了完整的golang端[代码示例](https://github.com/banbox/banstrats/tree/main/rpc_ai)。
+Banbot 提供 gRPC 数据服务入口：
 
-## LLM大模型接口
-除传统ML/DL工作流外，banbot也内置LLM集成能力，允许在策略或工具中调用大模型接口完成文本分析、报告生成等辅助工作。
+```shell
+bot tool data-server --config strategy.yml
+```
 
-LLM模块提供了统一的模型配置与管理能力（多模型故障转移、并发控制、统计追踪、自动禁用等），便于在实盘环境中稳定使用。
+在 Go 策略项目中定义特征，由 Python 等客户端获取数据并训练模型；自行部署预测服务后，由 Go 策略准备特征、调用模型并生成交易意图。特征、训练、模型服务和策略决策需要由您的项目实现。可参考示例策略项目的 `rpc_ai` 目录。
+
+历史训练与在线推理应使用相同字段、预热、缺失值和数据可见时间规则。自定义数据接入见[自定义时序数据](../guide/custom_data.md)。
+
+## LLM 模型管理库
+
+`llm` 包提供模型配置继承、环境变量替换、并发限制、超时、统计和失败回退。配置位于 `llm_models`，完整字段见[配置](../guide/configuration.md)。
+
+当前普通回测和实盘入口不会自动调用 LLM；仅添加配置不会让策略自动获得预测或交易信号。策略项目或工具需要显式调用 `llm.NewLLMManager(configProvider, getModels)`，再调用 `manager.Call(ctx, systemPrompt, userPrompt, options)`。`*config.Config` 实现模型配置访问接口，模型顺序由调用方提供。
+
+模型缓存是进程级资源，不提供不同任务同名模型配置的完全隔离。外部请求存在耗时和失败，应由调用方决定超时、重试及如何将结果传回策略；不要假定回测重跑会从外部模型得到相同结果。

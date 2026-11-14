@@ -28,7 +28,7 @@ Main methods:
 - `EnterOrder`: Process entry orders
 - `ExitOpenOrders`: Process exit orders
 - `ExitOrder`: Process single order exit
-- `UpdateByBar`: Update order status based on candlestick
+- `UpdateByDataSeries`: Update order status based on candlestick
 - `OnEnvEnd`: Handle environment end
 - `CleanUp`: Clean up resources
 
@@ -62,12 +62,8 @@ Main fields:
 - `IsWatch`: Whether balance changes are being monitored
 
 ### Trader
-交易管理器,负责处理交易策略和订单执行。
 
-主要方法:
-- `OnEnvJobs`: 处理环境任务
-- `FeedKline`: 处理K线数据
-- `ExecOrders`: 执行订单
+`NewTraderWithRuntimeDeps(deps RuntimeDeps) (Trader, *errs.Error)` constructs a trader. `FeedDataSeries(evt *orm.DataSeries) *errs.Error` drives strategy, indicators and order handling; `FeedSeries` is a compatibility alias. Preserve extension fields and NULL/types in DataSeries.Values rather than reducing events to fixed OHLCV.
 
 ## Public Methods
 
@@ -119,16 +115,18 @@ Parameters:
 - `account`: string - Account name
 - `tf`: string - Time frame
 - `job`: *strat.StratJob - Strategy job
-- `isInfo`: bool - Whether it's an information type
+- `infoEnv`: *ta.BarEnv - Auxiliary environment; nil for main data
 
 ### TryFireBatches
+
+`TryFireBatches(currMS int64, isWarmUp bool) int`
 Try to trigger batch jobs.
 
 Parameters:
 - `currMS`: int64 - Current timestamp in milliseconds
 
 Returns:
-- `int` - Number of triggered jobs
+- `int` - Number of jobs still waiting
 
 ### InitDataDir
 Initialize data directory.
@@ -190,6 +188,15 @@ Verify trigger orders.
 ### StartLiveOdMgr
 Start live order manager.
 
+### InitFakeWallets
+Initialize simulation wallets: `InitFakeWallets(symbols ...string)`.
+
+### GetWallets
+`GetWallets(account string) *BanWallets` reads the compatibility registry. For an explicit task use `rt.Trading.Wallet(account)`.
+
+### WatchLiveBalances
+`WatchLiveBalances(lifecycles ...WalletRuntimeLifecycle)` monitors live balance updates; standard live assembly supplies its owning lifecycle.
+
 ## Factor-engine integration
 
 Trader.FeedDataSeries drives time-series jobs. Shared-account bridges project execution state rather than implementing another account; AccountSink submits Full/Patch targets.
@@ -197,21 +204,24 @@ Trader.FeedDataSeries drives time-series jobs. Shared-account bridges project ex
 [Factor API](factor.md) / [Guide](../guide/factor.md)
 
 
-## Current construction, tools and state boundaries
+## Strategy orders and account state
 
-The old names below are no longer callable same-name public entries. Use the actual RuntimeDeps/explicit store/clock/logger APIs rather than nonexistent compatibility aliases:
+Strategies normally call only `job.OpenOrder`/`CloseOrders`. They queue requests; the manager validates, matches or sends them. Use `job.ProcessRuntimeOrders()` for explicit handling, rather than finding a package-level manager by account name in an independent Runtime.
 
-| Prior documentation name | Current entry |
-| --- | --- |
-| LoadRefreshPairs / AutoRefreshPairs | RefreshPairsWithRuntimeDeps, RefreshJobsWithRuntimeDeps |
-| RunDataServer | entry spider command |
-| LoadZipKline | LoadZipSeriesWithRuntimeDeps |
-| LoadCalendars | LoadCalendarsWithDeps |
-| ExportKlines / PurgeKlines | ExportKlinesWithRuntimeDeps / PurgeKlinesWithRuntimeDeps |
-| ExportAdjFactors | ExportAdjFactorsWithRuntimeDeps |
-| CalcCorrelation | CalcCorrelationWithRuntimeDeps |
-| RunHistKline | RunHistSeries / RunHistSeriesWithRuntimeDeps |
+```go
+// IOrderMgr method signatures:
+ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
+EnterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder, *errs.Error)
+ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error)
+ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error)
+UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error
+OnEnvEnd(evt *orm.DataSeries) *errs.Error
+```
 
-Trader, wallets and jobs use the same Runtime.Accounts/AccountsMu. Shared-account bridges preserve TS projections; execution owns physical sends/ledger. Manager/wallet facades are legacy only; explicit business paths fail on missing dependencies rather than falling back to globals.
+Embedded applications use `GetOdMgrWithState(rt.Trading, account)`, `GetAllOdMgrWithState(rt.Trading)`, `GetLiveOdMgrWithState(rt.Trading, account)` and `rt.Trading.Wallet(account)` for task state. Check nil: disabled accounts may have no manager. Package-level versions without State query only compatibility registries.
 
-See [runtime](runtime.md).
+InitOdSubs, InitLiveOrderMgr, InitLocalOrderMgr, InitFakeWallets and StartLiveOdMgr have WithRuntimeDeps variants for new assembly paths. WatchLiveBalances accepts WalletRuntimeLifecycle; standard live entry assembly binds the owning Runtime and manages stop/join. InitLocalOrderMgr also accepts `stops ...func()`. Runtime.Accounts/AccountsMu provides mutable execution configuration shared by manager, wallet and job; the Config snapshot is read-only.
+
+Live wallet balances come from the exchange; simulation/backtest balances do not certify real available funds. Only the compatibility `LiveOrderMgr` direct-send branch closes an order locally on CreateOrder errors, including timeouts; later reconciliation may recover the actual order. This does not describe the default Hub/shared-account execution path: shared execution retains `Unknown` or other unresolved states, blocks ordinary position changes and rejects blind retries with new commands. Recover with the original command ID and identical content, then verify exchange evidence. See [Shared accounts and Hub](../guide/execution.md).
+
+See [Runtime API](runtime.md) and the [strategy guide](../guide/strat_custom.md).

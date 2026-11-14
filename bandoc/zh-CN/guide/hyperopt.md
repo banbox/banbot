@@ -1,121 +1,56 @@
-> 引擎范围：本页 optimize / bt-opt 及参数定义、滚动选择流程属于时序 TradeStrat 引擎。当前 entry.runExplicitOptimization 使用时序 Snapshot 和 opt.BacktestFactory，没有将 factor policies 装配到 factor runner；不能把 run_policy 的泛称解释为因子/混合超参搜索已提供。因子参数实验请使用[因子研究/回测](./factor.md)分别运行显式参数配置，并管理 PIT 与成熟标签。
+# 超参数优化
 
-```shell
-bot optimize -out PATH [-opt-rounds 30] [-sampler bayes] 
+`bot optimize` 搜索时序 `TradeStrat` 策略通过 `pol.Def` / `pol.DefInt` 声明的参数范围。它不提供 factor 或混合策略的超参搜索；因子实验请使用不同显式参数配置分别运行[研究/回测](./factor.md)。
+
+## 运行搜索
+
+先确认策略已编译注册，配置了 `run_policy`、标的、历史时间范围和回测钱包。确保数据覆盖训练区间及预热区间，再创建输出文件的父目录：
+
+```bash
+mkdir -p /path/to/results
+bot optimize --datadir /path/to/data --config experiment.yml --out /path/to/results/opt.log --opt-rounds 30 --sampler bayes --picker good3
 ```
 
-您在策略中使用`pol.Def`定义好超参数及其范围后，您可以对其进行超参数调优。
+`--out` 是日志文件，不是报告目录，必须提供；当前省略它仅告警并返回，不能据此认定已完成搜索。配置分层见[配置指南](./configuration.md)。
 
-启动时您需要指定一个输出文件，超参数搜索结果将写入到此文件中，一般形如`opt1.log`。
-您可通过`-opt-rounds`指定调优的执行次数，以及`-sampler`指定采样优化器。
+| 参数 | 含义与默认值 |
+| --- | --- |
+| `--opt-rounds` | 每个优化任务的轮数，默认 30；实际次数可能因采样器收敛或搜索空间而提前结束 |
+| `--sampler` | `bayes`（默认）、`tpe`、`random`、`cmaes`、`ipop-cmaes`、`bipop-cmaes` |
+| `--picker` | 结果挑选方法，默认 `good3` |
+| `--each-pairs` | 按品种分别搜索 |
+| `--concur` | 并发任务数，默认 1；多策略组可通过编译后的可执行文件启动子进程并行，不是单组内每轮并发 |
+| `--bt-strict` | 覆盖严格回测设置；覆盖证据要求见[回测指南](./backtest.md) |
 
-如果您有多组策略需要优化（即run_policy配置了多个策略），默认情况下banbot将逐个搜索每个策略；如果您希望提高并发，可编译为可执行文件后，传入`-concur`参数控制并发数量（仅对多个策略时启用并发）。
+优化命令没有 `--timerange` / `--pairs` 参数；通过 YAML 或 `--config-data` 设置训练区间和标的。`run_policy[].dirt` 为空时多空一起运行，`long` / `short` 限定方向；`any` 会分别搜索多、空、双向情况，最终可能生成多个策略条目。
 
-`run_policy`下的`dirt`可选值为空、any、long、short；默认为空表示多空双开，为long/short时分别表示只开多/空，为any时，banbot会将此任务拆分为long/short/空三种情况分别调优。
+## 读取与应用结果
 
-您可使用`-picker`指定一个挑选器名称，用于从搜索结果中选择一组参数。未指定时，默认使用`good3`
+日志包含参数、`loss`、订单数、收益、回撤及其他指标。`loss = -score`，因此较低 loss 对应较高分数，分数并非收益百分比。搜索结果的 YAML 策略片段会打印到标准输出；手工核对后，将完整 `run_policy` 列表写入独立覆盖配置，使用未参与搜索的区间执行 `bot backtest`。
 
-```text
-Usage of optimize:
-  -concur int
-        Concurrent Number (default 1)
-  -config value
-        config path to use, Multiple -config options may be used
-  -config-data string
-        yaml config string
-  -cpu-profile
-        enable cpu profile
-  -datadir string
-        Path to data dir.
-  -dlock
-        enable dead-lock detect
-  -each-pairs
-        run for each pairs
-  -level string
-        set logging level to debug (default "info")
-  -logfile string
-        Log to the file specified
-  -max-pool-size int
-        max pool size for db
-  -mem-profile
-        enable memory profile
-  -net-off
-        disable network request
-  -no-default
-        ignore default: config.yml, config.local.yml
-  -opt-rounds int
-        rounds num for single optimize job (default 30)
-  -out string
-        output file or directory
-  -picker string
-        Method for selecting targets from multiple hyperparameter optimization results (default "good3")
-  -sampler string
-        hyper optimize method, tpe/bayes/random/cmaes/ipop-cmaes/bipop-cmaes (default "bayes")
+顺序搜索写入 `--out` 文件；多组子进程并发时写入 `<out>.1`、`<out>.2` 等日志。试验明细写入日志同级的 `detail/` JSON；不要把搜索日志当作完整的普通回测报告。
+
+可重新排序文件或收集目录：
+
+```bash
+bot tool collect-opt --datadir /path/to/data --config experiment.yml --in /path/to/results/opt.log
+bot tool collect-opt --datadir /path/to/data --config experiment.yml --in /path/to/results --picker good3
 ```
 
-完成超参数优化后，您打开输出文件可看到日志：
+文件输入仅对该文件排序并写回；目录输入递归收集以 `.log` 结尾的文件，输出所选策略 YAML。并发日志名若以 `.log.1` 等结尾，不会被目录扫描自动收集。此工具不是只读命令；保留需要归档的原日志副本。
 
-```text
-# run hyper optimize: bayes, rounds: 20
-# date range: 2021-01-01 00:00:00 - 2021-12-27 00:00:00
+## 挑选器与过拟合
 
-============== freqtrade:Strategy001/5m/ =============
-loss:  -81.15 	bigRate: 2.02, lenSml: 19.49, midRate: 2.38 	odNum: 195, profit: 109.7%, drawDown: 18.2%, sharpe: 6.89
-loss:  -86.14 	bigRate: 2.00, lenSml: 20.71, midRate: 3.72 	odNum: 292, profit: 107.8%, drawDown: 13.9%, sharpe: 7.69
-loss: -118.02 	bigRate: 2.15, lenSml: 20.92, midRate: 2.71 	odNum: 210, profit: 167.9%, drawDown: 20.9%, sharpe: 7.49
-loss:  -72.20 	bigRate: 1.90, lenSml: 20.89, midRate: 2.52 	odNum: 220, profit: 100.6%, drawDown: 19.8%, sharpe: 6.73
-loss:  -80.40 	bigRate: 2.17, lenSml: 22.64, midRate: 1.96 	odNum: 148, profit: 115.2%, drawDown: 21.3%, sharpe: 6.66
-loss:  -90.39 	bigRate: 1.88, lenSml: 23.61, midRate: 2.79 	odNum: 183, profit: 164.5%, drawDown: 32.9%, sharpe: 5.15
-loss:  -93.75 	bigRate: 1.84, lenSml: 16.12, midRate: 2.43 	odNum: 247, profit: 126.3%, drawDown: 18.0%, sharpe: 7.04
-loss:  -72.83 	bigRate: 1.98, lenSml: 19.76, midRate: 3.77 	odNum: 293, profit: 91.1%, drawDown: 13.9%, sharpe: 6.80
-loss:  -71.02 	bigRate: 1.93, lenSml: 19.75, midRate: 3.89 	odNum: 304, profit: 97.6%, drawDown: 19.1%, sharpe: 6.64
-loss: -140.38 	bigRate: 2.61, lenSml: 27.93, midRate: 3.90 	odNum: 192, profit: 191.3%, drawDown: 18.6%, sharpe: 8.48
-loss:  -95.02 	bigRate: 2.88, lenSml: 23.35, midRate: 2.77 	odNum: 192, profit: 165.0%, drawDown: 30.8%, sharpe: 8.92
-loss:  -78.63 	bigRate: 2.02, lenSml: 29.28, midRate: 3.28 	odNum: 212, profit: 109.3%, drawDown: 19.7%, sharpe: 6.81
-loss:  -81.46 	bigRate: 2.69, lenSml: 21.28, midRate: 3.71 	odNum: 258, profit: 109.1%, drawDown: 17.7%, sharpe: 7.20
+候选按分数降序处理。`good*` 使用非负分数组；若没有非负分数，则回退到负分数组，不保证结果盈利。
 
-  # score: 140.38
-  - name: freqtrade:Strategy001
-    run_timeframes: [ 5m ]
-    params: {bigRate: 2.61, lenSml: 27.93, midRate: 3.90}
-```
+| 挑选器 | 行为 |
+| --- | --- |
+| `score` | 选择最高分候选 |
+| `good2` / `good3` / `good4` / `good5` / `good7` | 取候选序列约 20% / 30% / 40% / 50% / 70% 位置 |
+| `goodAvg` | 对整个候选序列取参数平均 |
+| `good0t3` / `good1t4` / `good2t5` | 对前 0–30% / 10–40% / 20–50% 区间取参数平均 |
+| `good3t7` / `good0t7` / `good3t10` | 对前 30–70% / 0–70% / 30–100% 区间取参数平均 |
 
-## 过拟合陷阱
+平均参数不一定是搜索中实际评估过的参数组，应重新回测。默认 `good3` 不是普遍最优的承诺；比较样本外收益、回撤和交易量，不要只挑训练分数最高的结果。
 
-超参数优化不是魔法，它本质上是在一段时间的数据上测试策略的不同参数，找出收益较好的参数。
-
-我们都知道基于机器学习和神经网络的交易策略非常容易过拟合，即在训练数据上表现优异，但在测试数据上收益很差。
-
-超参数优化和上面过程类似，用于搜索参数的数据可以看做训练数据，我们选择训练数据上表现最好的一组参数，它很难说在未来一段时间继续有较好的收益（事实上，反而亏损）。
-
-这就是因为训练数据表现最好的这组参数出现了过拟合。
-
-为了避免过拟合，我们需要某种方式从搜索记录中得到在未来一段时间表现最好的参数，banbot提供了`-picker`参数实现这一目的。
-
-banbot内置的`picker`有：
-
-- score: 选择分数最高的(loss最低的)
-- good3: 筛选盈利的组按分数降序，取从前往后位置在30%的一组参数。
-- good0t3: 筛选盈利的组按分数降序，对前30%的所有组，取平均值得到一组参数。
-- goodAvg: 队所有盈利的组取平均值得到一组参数。
-- good1t4: 筛选盈利的组按分数降序，对前10%~40%的所有组，取平均值得到一组参数。
-- good4: 筛选盈利的组按分数降序，取从前往后位置在40%的一组参数。
-- good2: 筛选盈利的组按分数降序，取从前往后位置在20%的一组参数。
-- good5: 筛选盈利的组按分数降序，取从前往后位置在50%的一组参数。
-- good7: 筛选盈利的组按分数降序，取从前往后位置在70%的一组参数。
-- good2t5: 筛选盈利的组按分数降序，对前20%~50%的所有组，取平均值得到一组参数。
-- good3t7: 筛选盈利的组按分数降序，对前30%~70%的所有组，取平均值得到一组参数。
-- good0t7: 筛选盈利的组按分数降序，对前70%的所有组，取平均值得到一组参数。
-- good3t10: 筛选盈利的组按分数降序，对前30%之后的所有组，取平均值得到一组参数。
-
-您可以使用`bot tool test_pickers`测试所有picker在未来回测时的分数。  
-
-我们经过多次测试后发现`good3`在大多数情况下略好于其他挑选器。
-比`good3`略差一点的是：`good0t3/goodAvg/good1t4/good4`；
-其他挑选器大多数情况下效果一般或较差。
-
-这是在某组策略上通过`tool test_pickers`测试得到的不同picker表现：
-
-![image](https://miro.medium.com/v2/resize:fit:1100/format:webp/1*lADeuVcb6PdPYYgvxw4nRw.png)
-
-如果您不确定您的回测报告是否过拟合，强烈推荐您使用[滚动优化回测](./roll_btopt)！
+滚动比较使用 `bot tool test-pickers --picker score,good3,goodAvg`。默认只测 `good3`；要测试所有已注册挑选器，显式传入 `--picker ''`。具体窗口和输出见[滚动回测](./roll_btopt.md)。反复按同一留出区间挑选方法仍可能造成过拟合。

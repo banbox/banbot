@@ -23,6 +23,22 @@ You can create these two configuration files directly. You don't need to pass th
 `config.yml` is recommended to store relatively complete default configurations that do not need to be modified frequently.
 It is recommended to store local related configurations in `config.local.yml`, such as exchange api/secret, api_server and other configurations.
 
+
+## Layers and overrides
+
+Loading order is: data-directory `config.yml` → `config.local.yml` → repeated `--config` files in argument order → inline `--config-data` YAML → supported, explicitly supplied CLI overrides. `--no-default` skips only the first two files. Unspecified flag defaults must not be relied on to override YAML.
+
+```bash
+bot backtest --datadir /path/to/data --config base.yml --config experiment.yml --pairs BTC/USDT
+bot backtest --datadir /path/to/data --no-default --config experiment.yml
+```
+
+Mappings normally merge by field; later lists replace earlier lists. `run_policy`, `wallet_amounts`, `fatal_stop`, `watch_jobs`, and `historical_coverage` are replaced as whole blocks. Supply the complete policy list when overriding `run_policy`. A later `timerange` replaces earlier `time_start/time_end`, and vice versa.
+
+Configuration accepts single-document YAML with a mapping root and no duplicate keys; JSON configuration is unsupported. `${VAR}` / `$VAR` expands before YAML decoding. Unset variables may become empty values, so set credential variables first. Normal loading does not migrate, back up, or rewrite files.
+
+An `@` / `$` prefix on configuration-file paths denotes the data directory; quote `$` in the shell. Relative paths for factor archives and execution storage follow the file supplying the final field, rather than the last configuration file as a whole.
+
 ## Complete Yaml configuration
 > You can use environment variables to replace sensitive content in the configuration, such as `${bnb_user1_key}`
 
@@ -30,10 +46,10 @@ This is a field reference template. Register `Demo` in your application and repl
 
 ```yaml
 name: local  # Bot name, used to distinguish different bots in message notifications
-env: prod  # Running environment, prod represents production network, test represents test network (Binance testnet), dry_run represents simulation
+env: dry_run  # Field reference; see live environment/market restrictions below this template
 leverage: 2  # Leverage ratio, only valid in the futures market
 limit_vol_secs: 5  # The expiration time for the order book price based on trading volume, in seconds, default is 10
-put_limit_secs: 120  # Limit order submission time to the exchange within which it is expected to be filled, in seconds, default is 120
+put_limit_secs: 120  # Expected fill horizon for submitting limit orders, seconds; runtime default is 180
 account_pull_secs: 60  # The interval in seconds for regularly updating account balance and positions, default is 60 seconds.
 market_type: spot  # Market type: spot for spot trading, linear for USDT-margined contracts, inverse for coin-margined contracts, option for options contracts
 contract_type: swap  # swap for perpetual contracts, future for expiring contracts
@@ -55,7 +71,7 @@ min_open_rate: 0.5  # Minimum open order ratio, allows order if balance / per or
 low_cost_action: ignore # Action when stake amount < the minimum amount: ignore/keepBig/keepAll
 max_simul_open: 0 # Maximum number of simultaneously open orders on one candlestick
 bt_net_cost: 15  # Order delay in backtest, can be used to simulate slippage, in seconds, default is 15
-bt_strict: false  # Enable strict backtest mode; canonicalizes key execution order for strictly reproducible results, execution cost depends on the workload
+bt_strict: false  # Strict historical checks; ordinary backtests also use stable ordering
 relay_sim_unfinish: false  # When trading a new symbol (backtesting/live trading), whether to trading from the open order relay at the beginning time
 order_bar_max: 500  # Find the maximum number of bars for forward simulation from the open orders at the start time.
 ntp_lang_code: none  # NTP (Network Time Protocol) real-time synchronization. The default is `none`(disabled). Supported codes: zh-CN, zh-HK, zh-TW, ja-JP, ko-KR, zh-SG, and global (indicating global NTP servers such as Google, Apple, Facebook, etc.).
@@ -89,7 +105,7 @@ run_policy:  # The strategy to run, multiple strategies can run simultaneously o
     pairs: [BTC]
     params: {atr: 15}
     pair_params:
-      BTC: {atr:14}
+      BTC: {atr: 14}
     strat_perf:  # Same as root-level strat_perf configuration
       enable: false
 strat_perf:
@@ -112,7 +128,7 @@ pairlists:  # Filters for trading pairs, applied sequentially in top-down order
     limit: 100  # Take the top 100 pairs
     limit_rate: 1 # Cut limit by the rate
     min_value: 100000  # Minimum trading volume value
-    cache_secs: 7200  # Cache duration
+    cache_secs: 7200  # Reserved; currently inactive
     back_period: 3d  # TimePeriod for calculating trading volume
   - name: PriceFilter  # Price filter
     max_unit_value: 100  # Max allowed unit price change value (based on quote currency, usually USDT)
@@ -123,8 +139,8 @@ pairlists:  # Filters for trading pairs, applied sequentially in top-down order
     back_days: 5  # Number of days to review for candle data
     min: 0.03  # Minimum price change ratio
     max: 10  # Maximum price change ratio
-    cache_secs: 1440  # Cache duration, in seconds
-  - name: SpreadFilter  # Liquidity filter
+    cache_secs: 1440  # Reserved; currently inactive
+  - name: SpreadFilter  # Currently passes through without filtering
     max_ratio: 0.005  # Formula: 1 - bid/ask, max price spread ratio allowed
   - name: CorrelationFilter  # Correlation filter
     min: -1  # Filter symbols based on correlation to the market average; default is 0 (disabled)
@@ -139,8 +155,6 @@ pairlists:  # Filters for trading pairs, applied sequentially in top-down order
     min: 0.05  # Minimum volatility score, lower values allow symbols with less volatility on the daily level
   - name: AgeFilter  # Filter symbols based on listing days
     min: 5
-  - name: BlockFilter  # disable specified pairs
-    pairs: [BTC]
   - name: OffsetFilter  # Offset limit filter, typically used last
     reverse: false  # reverse array
     offset: 10  # Start from the 10th item
@@ -203,7 +217,7 @@ rpc_channels:  # RPC channels for sending message notifications
     msg_types: [exception]  # Message types: exception
     accounts: []  # Specified accounts (empty means all accounts)
     keywords: []  # Keyword filtering (empty means no filtering)
-    retry_delay: 1000  # Retry delay (milliseconds)
+    retry_delay: 5  # Retry interval in seconds (current sender behavior)
     min_intv_secs: 300  # Minimum sending interval (seconds)
     touser: 'recipient@abc.com'  # Recipient email address
   # WeWork notification channel
@@ -216,7 +230,7 @@ rpc_channels:  # RPC channels for sending message notifications
     msg_types: [exception]  # Allowed message types to send
     accounts: []  # Allowed accounts, allows all if empty
     keywords: []  # Message filter keywords
-    retry_delay: 1000  # Retry delay
+    retry_delay: 5  # Retry interval in seconds (current sender behavior)
     disable: true  # Whether to disable
 webhook:  # Message types that can be sent via RPC
   entry:
@@ -234,7 +248,7 @@ mail:  # Email notification configuration
   username: user1@example.com  # Email username
   password: your_password  # Email password or app password
 bt_in_live:  # Live trading scheduled backtest comparison feature
-  cron: "0 0 * * *"  # Cron expression, execute at 0:00 daily
+  cron: "0 0 0 * * *"  # Cron expression, execute at 0:00 daily
   account: "account1"  # Specify the account to execute backtest
   mail_to:  # Email notification recipient list
     - "trader1@example.com"
@@ -254,28 +268,31 @@ api_server:  # For external control of the bot or access to dashboard via API
 
 ```
 
+The block above is a field reference, not a runnable live configuration. Default Hub live entry does not support `market_type: spot`, `env: test`, or inverse contracts. Ordinary `trade`, including pure time-series, uses the shared Hub and requires `prod` / `dry_run` linear perpetuals plus complete account execution declarations. Legacy `fatal_stop` and dynamic leverage settings are unsupported on this default path. Changing only `env: prod` does not make this template runnable. Follow [shared accounts and Hub](./execution.md) for instruments, funding, risk, store, sender leases, and accounts, then start Hub first.
+
+
 ## Important details configuration
 #### Configure single order amount
 The minimum order amount depends on the exchange and currency pair, and is usually listed on the exchange support page.
 
-When the robot starts, it will automatically load the exchange market information, which includes the order amount and other restrictions for all varieties. Banbot also limits the minimum single transaction amount to 10USD.
+When the robot starts, it will automatically load the exchange market information, which includes the order amount and other restrictions for all varieties. BanBot uses an internal minimum stake constant of 5.5; exchange-specific quantity, precision, and notional limits still apply.
 
 You can configure the single transaction amount through `stake_pct` or `stake_amount`. Note that for futures contracts, these two parameters refer to the nominal value, not the occupied margin.
 
-If you need to use different transaction amounts for different accounts, you can configure the amount multiplier in `exchange.[exg_name].account_prods.user1.stake_rate`. The default is 1; changing it to `<1` will reduce the order amount of this account. `>1` will increase the order amount of this account
+If you need to use different transaction amounts for different accounts, you can configure the amount multiplier in `accounts.user1.stake_rate`. The default is 1; changing it to `<1` will reduce the order amount of this account. `>1` will increase the order amount of this account
 
-Similarly, you can also set different order amount multipliers for different strategies `TradeStrat.StakeRate`
+Set per-policy sizing multipliers with `run_policy[].stake_rate`.
 
 #### Global stop loss
-You can use `fatal_stop` to set the robot to stop trading for `fatal_stop_hours` hours when the robot's combined loss of all strategy tasks reaches a certain percentage within x minutes.
+On the legacy time-series path, `fatal_stop` pauses entries for `fatal_stop_hours` when combined loss reaches the threshold within x minutes. Default Hub live execution rejects this mechanism; use the account risk declarations supported by the [execution guide](./execution.md).
 
 #### Environment
 The optional values for `env` are:
 - `prod`: Production network
-- `test`: Test network
-- `dry_run`: Simulated live trading, with local matching and no submission to the exchange. This is only effective when running `trade` for real-time trading.
+- `test`: Legacy adapter test-network semantics; unsupported by default Hub live entry
+- `dry_run`: Hub paper live simulation without venue orders when running `trade`; start Hub and provide its required execution declarations.
 
-**Note**: Currently, the product IDs are not distinguished between `prod` and `test`. If you have already downloaded the K-line data, you need to delete the existing K-line data before switching environments, otherwise, there will be confusion.
+Changing `env` is not historical-data isolation. Check database and market identities before switching networks; retain existing data and verify using separate configuration/databases.
 
 #### Product Filtering and Periodic Refresh
 In addition to configuring fixed products through `pairs`, you can also use `pairlists` to dynamically filter and determine trading products. If you want to enable this, make sure `pairs` is empty.
@@ -284,7 +301,7 @@ In addition to configuring fixed products through `pairs`, you can also use `pai
 
 If you need to periodically recalculate the product list, you can configure `pairmgr.cron`. When `force_filters` is set to `true`, the `pairlists` filters will be forcibly applied to `pairs`.
 
-Both `pairmgr` and `pairlists` support live trading and backtesting. If you enable them during backtesting, historical data will be used for filtering. This ensures that the dynamically calculated product list will be exactly the same when you start backtesting/live trading at different times with the same configuration.
+Both `pairmgr` and `pairlists` support live trading and backtesting. If you enable them during backtesting, historical data will be used for filtering. Results still depend on historical coverage, market metadata, and configuration; equality with later live selections is not guaranteed.
 
 #### Real-Time Synchronization Settings
 When requesting authenticated exchange interfaces, a timestamp is generally required. If the local computer's time has a large deviation from the network time, it may cause the request to fail.
@@ -306,13 +323,13 @@ You can configure multiple accounts in `accounts`, and each account can have dif
 
 The parameters that can be configured for each account are:
 - `no_trade`: Whether to prohibit trading for this account
-- `stake_rate`: Order amount multiplier, the actual order amount multiplier is the global `stake_rate` multiplied by the account's `stake_rate`
+- `stake_rate`: Account sizing multiplier relative to the baseline; policy sizing uses `run_policy[].stake_rate`
 - `leverage`: Contract leverage
 - `max_stake_amt`: Maximum allowed single order amount
 - `max_pair`: Maximum number of products allowed for this account
 - `max_open_orders`: Maximum number of open orders allowed for this account
 
-During backtesting or simulated trading, only the configuration of the first account will be used for trading.
+Legacy time-series simulation defaults must not be generalized to all engines. Explicit-engine policies bind accounts through `run_policy[].account`. Factor/mixed execution groups by account; multiple policies sharing an account need explicit `capital_weight` values totaling at most 1.
 
 #### Relay Unfinished Order
 For strategies with long holding periods in large cycles, where an order may hold for one or two months, you may already have some positions according to the trading signals when you start the robot. To fully follow the signals, you should enter the positions immediately and hold the corresponding positions instead of waiting for the next signal to be issued.
@@ -353,7 +370,7 @@ rpc_channels:
     msg_types: [exception]       # Message types: exception
     accounts: []                 # Specified accounts (empty means all accounts)
     keywords: []                 # Keyword filtering (empty means no filtering)
-    retry_delay: 1000           # Retry delay (milliseconds)
+    retry_delay: 5  # Retry interval in seconds (current sender behavior)
     min_intv_secs: 300          # Minimum sending interval (seconds)
     touser: 'recipient@abc.com'  # Recipient email address
 ```
@@ -392,7 +409,7 @@ Configuration keeps the v0.5 root keys and run_policy list without requiring con
 | run_policy[].research | labels, label_wait_ms, panel (all/none) |
 | run_policy[].prices | source, timeframe, field |
 
-accounts.&lt;account&gt; overrides account settings; risk limits are absolute settlement-currency amounts. archive/store/history/sender_lease_dir follow the field's originating file, including multi-file overrides. Latest-value storage needs static-approximation. page_bytes bounds logical payload, not RSS. See [factor examples](./factor.md).
+accounts.&lt;account&gt; overrides account settings; margin and gross risk limits are ratio constraints; choose values for the execution mode and account NAV. archive/store/history/sender_lease_dir follow the field's originating file, including multi-file overrides. Latest-value storage needs static-approximation. page_bytes bounds logical payload, not RSS. See [factor examples](./factor.md).
 
 
 Keep credentials and existing stake/leverage fields in root accounts.&lt;name&gt;. Put account-specific mode/store/history/funding_policy/instruments and risk overrides there too; execution retains shared defaults. Factor fields live directly under run_policy[], with cohesive expressions, snapshot, portfolio, decision and research groups. Legacy config_version: 1/2, factor wrappers and execution.accounts remain readable; current examples and canonical exports use the shallow structure.
@@ -407,10 +424,10 @@ accounts:
     stake_rate: 0.1
     leverage: 2
     history: cold/default-history.sqlite
-    max_virtual_gross: "20000"
+    max_virtual_gross: "2"
 ```
 
-This is an account overlay fragment; retain existing credentials. Account history and risk limits override shared defaults; omitted execution fields inherit execution.
+This is an account overlay fragment; retain credentials. `history` is cold history for memory paper only: it cannot be combined with durable `store` or real trade and is not a recovery snapshot. Omitted execution fields inherit `execution`; account `mode` is reserved, and ordinary factor backtests read root `execution.mode`.
 
 Use one spelling per field in each configuration file: declaring both `run_policy[].factor.archive` and `run_policy[].archive`, or the same account execution field in both root `accounts` and legacy `execution.accounts`, is a conflict. Across files, later layers still override earlier ones after aliases are normalized. Relative paths follow the file that supplied the final field. Canonical exports omit `config_version` and legacy wrappers.
 
@@ -418,4 +435,8 @@ Existing v0.5 `timeframes` and `run_timeframes` keep their names. The v0.6-only 
 
 ## Historical replay fields
 
-`bt_strict` controls execution ordering; `bt_no_kline_download` disables implicit K-line downloads during backtests. Valid `historical_coverage` and both flags form the strict historical replay contract. See the [backtest guide](./backtest.md#strict-replay-and-historical-coverage) for coverage fields and preparation/replay boundaries. Snapshot configuration is read-only; Runtime manages execution accounts separately. Do not switch active tasks by mutating global configuration.
+Ordinary backtests already use stable ordering; `bt_bar_order_seed` changes the deterministic per-bar symbol ordering. `bt_strict` enables strict historical checks. `bt_no_kline_download` independently disables implicit K-line downloads, but alone does not prove data completeness. Valid `historical_coverage` and both flags form the strict historical replay contract. See the [backtest guide](./backtest.md#strict-replay-and-historical-coverage) for coverage fields and preparation/replay boundaries. Snapshot configuration is read-only; Runtime manages execution accounts separately. Do not switch active tasks by mutating global configuration.
+
+Notification channel `type` currently supports only `wework`, `mail`/`email`, and `telegram`. Root `webhook` configures message templates; it does not enable a generic HTTP channel with `type: webhook`.
+
+Both `retry_delay` and `min_intv_secs` are seconds in the current sender. Retries use the greater interval, minus elapsed time since the last send. `retry_delay: 1000` means about 1000 seconds, not one second. See [notifications](./notifications.md) for complete examples.

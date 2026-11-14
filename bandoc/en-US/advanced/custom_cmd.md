@@ -1,66 +1,66 @@
-In addition to using the built-in terminal commands of banbot, you can also register and execute your own terminal commands.
+# Custom terminal commands
 
-### Registering a Command
+Besides [built-in commands](../guide/bot_usage.md), strategy applications can register Cobra commands. Keep command flags in local closure variables; no changes to `config.CmdArgs` or a central flag registry are needed.
 
-Banbot uses Cobra. Register a `*cobra.Command` with `entry.AddCommand` and keep command-specific options local to the command:
+## Register and run
+
+This is a minimal entry point. When integrating into a strategy project, retain its strategy registrations and add command registration before `entry.RunCmd()`:
 
 ```go
-var greeting string
+package main
 
-helloCmd := &cobra.Command{
-    Use:   "hello",
-    Short: "show a greeting",
-    Args:  cobra.NoArgs,
-    RunE: func(cmd *cobra.Command, args []string) error {
-        fmt.Println(greeting)
-        return nil
-    },
+import (
+    "fmt"
+
+    "github.com/banbox/banbot/entry"
+    "github.com/spf13/cobra"
+)
+
+func main() {
+    entry.AddGroup("custom", "custom tools")
+    entry.AddCommandFactory("custom", func() *cobra.Command {
+        var greeting string
+        cmd := &cobra.Command{
+            Use:   "hello",
+            Short: "Print a greeting",
+            Args:  cobra.NoArgs,
+            RunE: func(cmd *cobra.Command, args []string) error {
+                _, err := fmt.Fprintln(cmd.OutOrStdout(), greeting)
+                return err
+            },
+        }
+        cmd.Flags().StringVar(&greeting, "greeting", "hello", "greeting text")
+        return cmd
+    })
+    entry.RunCmd()
 }
-helloCmd.Flags().StringVar(&greeting, "greeting", "hello", "greeting text")
-entry.AddCommand("", helloCmd)
 ```
-
-The first argument to `AddCommand` is the parent group; use an empty string for a root command. Register new groups first with `entry.AddGroup`. Cobra handles help, validation, flag parsing, and errors. Adding a command or flag does not require changing `config.CmdArgs` or a central option registry.
-
-## Built-in Tool Commands
-
-banbot provides several built-in tool commands for data validation, analysis, and management:
-
-### K-line Data Consistency Check
-
-Check the correctness of K-line data dumped from live trading:
 
 ```bash
-# Check K-line data consistency
-bot tool test_live_bars /path/to/dump/file.gob
+go build -o bot
+./bot custom hello --greeting "hello BanBot"
+./bot custom hello --help
 ```
 
-The input gob file is generated when executing live trading with `bot trade -out @file.gob` by adding the -out parameter.
+An empty parent registers at the root; register new groups with `entry.AddGroup` first. `AddCommand(parent, *cobra.Command)` suits applications building one tree. For repeated or concurrent `entry.NewRootCommand()` calls, use `AddCommandFactory` and return a fresh command with fresh flag variables each time. One Cobra command cannot attach to two trees.
 
-Executing this command will compare the K-line data dumped from live trading with the K-line data in the local database to check that the live K-line data is correct and complete.
+Custom commands do not automatically inherit built-in configuration flags. Declare needed `--config` / `--datadir` flags and call `config.LoadRunSpec`; do not treat unparsed arguments as effective configuration or mutate configuration globals for a local flag. Propagate cancellation with `cmd.Context()` and return errors to the entry point.
 
-**Output example:**
-```
-BTCUSDT_1m 2025-01-01 00:00:00 - 2025-01-01 23:59:00, live: [5, 10], local: [3, 8]
-ETHUSDT_1m 2025-01-01 00:00:00 - 2025-01-01 23:59:00, live: [], local: [15]
-total: 2880, pairs: 2
-```
-
-### Backtest Report Generation
-
-Generate backtest reports from order gob files:
+## Compare live bars with local data
 
 ```bash
-# Generate backtest report from order file
-bot tool bt_result /path/to/orders.gob
+bot trade --datadir /path/to/data --out /path/to/live-bars.gob
+bot tool test-live-bars --datadir /path/to/data /path/to/live-bars.gob
 ```
 
-**Features:**
-- Support regenerating reports from historical order data
-- Can be used for offline analysis and report generation
-- Support multiple output formats
+The `trade` command above requires a complete runnable Hub configuration; see [execution](../guide/execution.md). This tool takes one positional `DUMP_FILE` and compares a time-series live bar dump with the configured market's local storage. It needs the matching exchange, market, and database. It is neither a generic Gob validator nor proof that a strategy avoids lookahead.
 
-### Example of Reading Data to Generate a Candlestick Chart
-By using the custom terminal commands described above, you can freely call the relevant interfaces provided by banbot to implement various complex tasks, not just the built-in backtesting, trading, etc.
+## Rebuild a report from orders
 
-For example, you can read the K-line data of a specified instrument and generate a static HTML candlestick chart: [demo](https://github.com/banbox/banstrats/tree/main/adv)
+```bash
+bot tool bt-result --datadir /path/to/data --config report-config.yml --in /path/to/orders.gob --out /path/to/rebuilt
+```
+
+`bt-result` uses `--in`, not a positional file argument. Supply configuration, market, wallet, and required historical data matching the original orders to generate reports such as `assets.html`, `enters.html`, `detail.json`, and `orders.csv`. It does not guarantee offline operation without database/market data and does not rebuild factor `events.jsonl` / account-ledger reports.
+
+See [entry API](../api/entry.md) for extension and cancellation interfaces and [opt API](../api/opt.md) for backtest dependencies.

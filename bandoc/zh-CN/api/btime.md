@@ -8,10 +8,23 @@ btime 包提供了时间处理相关的功能。
 
 下方的包级时间函数保留给旧调用链；它们不能作为多个 Runtime 并行运行时的任务时钟。
 
+## ClockState 方法与回测示例
+
+`NewClockState(backtest bool, loc *time.Location) *ClockState` 创建时钟。`TimeMS()` 返回毫秒，`Time()` 返回浮点秒，`Now()` 返回 *time.Time。SetTimeMS 设置模拟时间，AdvanceMS 返回推进后的毫秒时间。未设置回测时间时首次读取会用真实时间初始化，因此手动回放前应先设置起点。下面为宿主/测试示例，正常策略不要自行推进框架时钟。
+
+```go
+clock := btime.NewClockState(true, time.UTC)
+startMS, err := btime.ParseTimeMS("2025-01-01 00:00:00")
+if err != nil { panic(err) }
+clock.SetTimeMS(startMS)
+nextMS := clock.AdvanceMS(60_000)
+fmt.Println(nextMS - startMS) // 60000
+```
+
 ## 公开方法
 
 ### TimeMS
-获取当前时间戳(13位毫秒)。
+获取兼容调用链当前时间戳（毫秒）；回测取兼容模拟时钟，实盘取真实时间。
 
 返回：
 - `int64` - 当前时间戳
@@ -89,7 +102,7 @@ btime 包提供了时间处理相关的功能。
 - `string` - 格式化后的时间字符串
 
 ### ToDateStrLoc
-将时间戳转换为指定时区的时间字符串。
+将时间戳转换为包级 LocShow 显示时区的字符串；未设置时使用 UTC。此函数不接受 location 参数，需显式时区时使用 ToTime(ts).In(loc).Format(layout)。
 
 参数：
 - `timestamp int64` - 时间戳(支持10位秒级或13位毫秒)

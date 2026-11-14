@@ -33,9 +33,22 @@ info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{
 
 原始字段用 `DataFields.RawValue(name)` 的值和存在标记读取；数值历史 `Series(name)` 是派生视图，NULL/缺失点为 NaN。显式把大整数选入 Series 会转成 float64，可能丢精度。数据库只存已声明字段，缺键写入固定列后可能成为 NULL；JSON 网络传输也不能自动保持 Go 整数宽度，不能把这些边界当成原始 map 的无损复制。
 
+```go
+value, exists := fields.RawValue("rate") // fields: *strat.DataFields
+if !exists {
+    // 字段未出现在当前事件中。
+} else if value == nil {
+    // 字段存在，但值为 NULL。
+}
+```
+
+数据库读出的 NULL 会保留为存在的键和值 nil；不要用数值转换把它当作零。K 线整行写入中，缺少 `quote`/`buy_volume` 时默认 0.0，缺少 `trade_num` 时默认 0，其他缺少字段写 NULL；显式 nil 不等同于省略这些默认字段。
+
 ## 注册数据源
 
 最简单的方式是使用函数式数据源。历史抓取函数负责返回指定时间范围的数据；实时订阅函数可选，未提供时该数据源仍可用于回测和启动时回填。
+
+下面假定您已实现供应商适配器 `fetchFundingRecords(ctx, sub, startMS, endMS)`，返回 `([]*orm.DataRecord, error)`。示例只注册历史读取，不会生成实时数据：
 
 ```go
 func init() {
@@ -44,19 +57,9 @@ func init() {
     })
     err := data.RegisterFuncDataSource(info,
         func(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error) {
-            // 从供应商拉取数据，并转换为毫秒时间戳。
-            return []*orm.DataRecord{{
-                TimeMS: startMS,
-                EndMS:  startMS + 8*60*60*1000,
-                Closed: true,
-                Values: map[string]any{"rate": 0.0001},
-            }}, nil
+            return fetchFundingRecords(ctx, sub, startMS, endMS)
         },
-        func(ctx context.Context, subs []*strat.DataSub, sink data.DataSink) error {
-            // 收到实时数据后，向对应订阅发送一批 DataRecord。
-            // return sink.Emit(subs[0], rows)
-            return nil
-        },
+        nil,
     )
     if err != nil {
         panic(err)
@@ -64,7 +67,9 @@ func init() {
 }
 ```
 
-示例函数体只是接入骨架：实际实现必须抓取请求范围内的数据，并在实时函数中启动由 ctx 取消的生产者；不能以 `return nil` 代替实际订阅。`RegisterFuncDataSource` 已注册实例工厂。复杂源应使用 `data.RegisterDataSourceFactory(name, factory)`，每次返回独立实例；仅注册共享实例不能满足显式 Runtime 的隔离要求。
+适配器必须查询 `[startMS,endMS)`，使用毫秒时间戳并返回真实区间、`Closed` 和 `Values`；Sid 为 0 时由框架补上。供应商失败应返回 error；只有确实查询过且无观测时才返回空结果和 nil，否则可能将失败区间记为已确认无数据，阻止再次回填。大范围历史可实现 `PagedHistorySource`，限制单次抓取量。
+
+`RegisterFuncDataSource` 自动注册工厂。复杂源使用 `data.RegisterDataSourceFactory(name, factory)`，每次返回独立实例；仅注册共享实例不能用于独立 Runtime。实时源需要提供真实的订阅函数、响应 ctx 取消，并发送 `sink.Emit(sub, rows)`；省略函数不会自动轮询供应商，也不能用于要求受管理实盘句柄的安装。
 
 历史数据会由 banbot 自动按缺口补齐并写入数据库。实时数据源必须对收到的每条订阅调用 `sink.Emit(sub, rows)`；不要绕过该入口直接向策略发送数据。注册发生在策略包初始化期间，因此运行机器人前，包含注册代码的策略包必须已被编译进可执行文件。
 
@@ -119,7 +124,24 @@ func init() {
 
 ## K 线扩展字段
 
-若数据严格与 K 线时间戳对齐，可使用 `orm.NewKLineSeriesInfo(...)` 和 `orm.NewKLineSeriesStore(...)` 写入扩展列。策略仍通过相同的订阅入口读取：
+若数据严格与 K 线时间戳对齐，可使用 `orm.NewKLineSeriesInfo(...)` 和 `orm.NewKLineSeriesStore(...)` 写入扩展列，并通过同一订阅入口读取。
+
+先下载或写入目标 K 线；扩展写入只 UPDATE 已有 `(sid,time)` 行，缺少目标行会报错，不会新建 K 线。使用 `NewKLineSeriesInfo`，不要用独立序列的 `NewSeriesInfo("kline", ...)` 绑定物理 K 线表：
+
+```go
+info := orm.NewKLineSeriesInfo("open_interest", "1h", []orm.SeriesField{
+    {Name: "open_interest", Type: "float"},
+})
+store := orm.NewKLineSeriesStoreWithStorage(info, storage)
+if err := store.Write(ctx, target, []*orm.DataRecord{{
+    TimeMS: barStartMS,
+    Values: map[string]any{"open_interest": 12345.0},
+}}); err != nil {
+    return err
+}
+```
+
+示例假定 `storage`、`target`、`ctx` 和 K 线起始毫秒时间 `barStartMS` 已准备好。订阅的 source 始终为 `kline`，不是扩展定义的 Name：
 
 ```go
 &strat.DataSub{
@@ -130,6 +152,15 @@ func init() {
 
 K 线默认 OHLCV 字段会保留，扩展字段可从 `data.Series("open_interest")` 或 `data.Float64("open_interest")` 读取。扩展列不能使用 `sid`、`time`、`ts`、`open`、`high`、`low`、`close`、`volume`、`quote`、`buy_volume` 或 `trade_num` 等内置字段名。
 
+## 手动回填与检查
+
+```shell
+bot series list
+bot series down --tables funding_rate --pairs BTC --timerange 20240101-20250101
+```
+
+先确认 `list` 的 JSON 中包含 source 定义；它只列出编译进可执行文件的源，不扫描数据库。`down --tables` 按 source 名筛选，不是 `funding_rate_8h` 物理表名；省略时处理所有自定义源。当前 CLI 仅支持规则周期，会将结束时间裁到不晚于当前时间的已闭合边界；`event` 需使用具备相应能力的数据源/运行时接口。
+
 ## 查看数据
 
 已注册的自定义数据可在 WebUI/Dashboard 的“数据”页面查看。查看器只读，支持按 source、sid、timeframe、时间范围和字段筛选；写入、补齐和删除应继续使用 `SeriesStore` 或数据源运行时。
@@ -138,7 +169,7 @@ K 线默认 OHLCV 字段会保留，扩展字段可从 `data.Series("open_intere
 
 自定义列随 Values 经过 feeder 和序列化，不应先缩成 K 线再恢复。`ExSymbol.AggRules` 配置列级 first/last/min/max/sum/avg/mid，扩展列默认 last；可用 `orm.RegisterAggRule` 注册规则。first/last 保留选中的原始值，数值规则有转换与 NULL 校验，业务应按字段语义选择。复权只调整支持的 open/high/low/close/volume/buy_volume，自定义字段原值仍保留，不自动使用价格倍率。
 
-双引擎通过 SubscriptionPlan 合并数据需求。实盘准备新代时先预热并暂存实时批次，启动缓冲深复制 Values 与元数据；预算不足或校验失败时回滚候选代。受管理源返回 Stop/Join 句柄，所属 owner 封闭输入并等待已接纳回调；不要让一个源实例的 Stop 关闭其他任务。
+实盘源必须为自己的订阅管理资源；要求受管理生命周期时实现 `ManagedLiveSource`，返回独立的 `Stop()`/`Join() error` 句柄。取消订阅时停止生产并等待退出，不能让一个实例的 Stop 关闭其他任务。预热或实时启动失败会阻止新订阅生效。
 
 QuestDB WAL 写入异步可见：写后需要读取时等待目标行/范围可见，表替换先验证新表快照，超时保留恢复标记。数据库部署和配置请参阅[数据库](./database.md)。
 

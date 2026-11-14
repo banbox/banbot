@@ -1,308 +1,77 @@
-# config Package
+# config package
 
-The config package provides system configuration-related structures and methods.
+See [configuration](../guide/configuration.md) for user workflows. Embedded programs should load unified configuration with `LoadRunSpec` and then assemble the selected engines. Legacy package globals are not configuration containers for concurrent tasks.
 
-## Runtime Configuration
+## Load unified configuration
 
-Normal entry points parse configuration and then create a task-owned `config.Snapshot`. A Snapshot deep-copies the configuration and keeps explicit data and strategy directories; a Runtime treats it as read-only, so command-line overrides and account configuration from separate tasks cannot overwrite each other. Normal entries first use LoadRunSpec for the single policy list and field origins, then RunSpec.RuntimeSnapshot for common runtime settings. LoadRuntimeSnapshot retains time-series configuration assembly rather than replacing unified TS/CS routing.
+```go
+args := &config.CmdArgs{
+    DataDir: "/path/to/data",
+    Configs: config.ArrString{"experiment.yml"},
+}
+spec, err := config.LoadRunSpec(args, false)
+if err != nil {
+    return err
+}
+effective, yamlErr := spec.EffectiveYAML(true)
+if yamlErr != nil {
+    return yamlErr
+}
+_ = effective
+```
 
-## Important Structures
+`LoadRunSpec(args *CmdArgs, showLog bool) (*RunSpec, *errs.Error)` reads default files, explicit files, inline YAML, and explicit CLI overrides. `LoadUnifiedConfigs(paths []string, showLog bool)` loads a known list of YAML files; it does not replace CLI layering or task assembly. Ordinary loading does not migrate, back up, or rewrite user files.
 
-### CmdArgs
-Command line argument structure, containing the following fields:
-- `Configs`: []string - List of configuration file paths
-- `ConfigData`: string - YAML configuration content passed directly
-- `Logfile`: string - Log file path
-- `DataDir`: string - Data directory path
-- `NoCompress`: bool - Whether to disable compression
-- `NoDefault`: bool - Whether to disable default configuration
-- `LogLevel`: string - Log level
-- `TimeRange`: string - Time range in "YYYYMMDD-YYYYMMDD" format
-- `TimeFrames`: []string - List of time frames
-- `StakeAmount`: float64 - Single order amount
-- `StakePct`: float64 - Single order amount percentage
-- `Pairs`: []string - List of trading pairs
-- `Force`: bool - Whether to force execution
-- `WithSpider`: bool - Whether to use crawler
-- `MaxPoolSize`: int - Maximum connection pool size
-- `RawTables` / `Tables`: string / []string - Data table filters
-- `Medium`: string - K-line data medium: `db` or `file`
-- `InPath` / `InType`: string - Input path and input type
-- `OutPath` / `OutType`: string - Output path and output type
-- `AdjType`: string - K-line adjustment type: `pre`, `post`, or `none`
-- `ExgReal`: string - Actual exchange identifier
-- `Picker` / `PairPicker`: string - Optimization result and symbol selectors
-- `RunEveryTF`: string - Run at the specified timeframe
-- `BatchSize`: int - Task batch size
-- `DeadLock`: bool - Whether to enable deadlock detection
-- `TimeZone`: string - Time zone
-- `OptRounds`: int - Number of rounds for hyperparameter optimization single task
-- `Concur`: int - Number of concurrent processes for hyperparameter optimization
-- `Sampler`: string - Hyperparameter optimization method (tpe/bayes/random/cmaes etc.)
-- `EachPairs`: bool - Whether to execute for each trading pair individually
-- `ReviewPeriod`: string - Review period for continuous parameter optimization backtesting
-- `RunPeriod`: string - Effective running period after parameter optimization
-- `Alpha`: float64 - Smoothing factor for EMA calculation
-- `Separate`: bool - Whether to test strategy combinations separately during backtesting
+| Type | Contract |
+| --- | --- |
+| `CmdArgs` | CLI inputs including `Configs`, `ConfigData`, `DataDir`, `NoDefault`, time/symbol and optimization options; a field does not imply every subcommand exposes its flag |
+| `UnifiedConfig` | `Root *Config` holds shared root fields; the single policy list is `RunPolicy []*PolicyV2`, not `Root.RunPolicy` |
+| `PolicyV2` | Embeds `RunPolicyConfig`, with `Engine`, `ID`, `Account`, `CapitalWeight *float64`, `Factor`, and `ExplicitEngine` |
+| `RunPolicyConfig` | Time-series name, timeframes, `refine_tf`, direction, pairs, `Params map[string]float64`, `PairParams`, sizing/filter options; `Def` / `DefInt` declare search parameters |
+| `RunSpec` | Merged values, origins, and path bases; exported configuration/origin accessors return copies |
+| `Snapshot` | Task-owned read-only configuration and explicit directories; `View()` is read-only, `Clone()` copies mutable containers |
 
-### Config
-Root configuration structure, containing the following fields:
-- `Name`: string - Configuration name
-- `Env`: string - Running environment
-- `Leverage`: float64 - Leverage multiplier
-- `LimitVolSecs`: int - Expected waiting time for limit orders (seconds)
-- `PutLimitSecs`: int - Expected time for submitting limit orders to exchange
-- `MarketType`: string - Market type
-- `ContractType`: string - Contract type
-- `OdBookTtl`: int64 - Order book time to live
-- `StopEnterBars`: int - Number of candles after which to cancel unfilled entry limit orders
-- `ConcurNum`: int - Concurrency number
-- `OrderType`: string - Order type
-- `PreFire`: float64 - Pre-firing
-- `MarginAddRate`: float64 - Margin addition rate
-- `ChargeOnBomb`: bool - Whether to charge on liquidation
-- `TakeOverStrat`: string - Takeover strategy
-- `StakeAmount`: float64 - Single order amount
-- `StakePct`: float64 - Single order amount percentage
-- `MaxStakeAmt`: float64 - Maximum single order amount
-- `OpenVolRate`: float64 - Open position volume rate
-- `MinOpenRate`: float64 - Minimum open position rate
-- `BTNetCost`: float64 - Backtesting network delay (seconds)
-- `RelaySimUnFinish`: bool - Whether to relay unfinished orders from the start time
-- `NTPLangCode`: string - NTP time synchronization region code
-- `ShowLangCode`: string - UI display language code
-- `BTInLive`: *BtInLiveConfig - Scheduled live-trading backtest comparison configuration
-- `OrderBarMax`: int - Maximum number of bars to search backward for unfinished orders
-- `MaxOpenOrders`: int - Maximum number of open orders
-- `MaxSimulOpen`: int - Maximum number of simultaneous open orders
-- `WalletAmounts`: map[string]float64 - Wallet amounts
-- `DrawBalanceOver`: float64 - Balance withdrawal threshold
-- `StakeCurrency`: []string - Order currencies
-- `FatalStop`: map[string]float64 - Fatal stop conditions
-- `FatalStopHours`: int - Fatal stop hours
-- `TimeRange`: *TimeTuple - Time range
-- `RunTimeframes`: []string - Running time frames
-- `KlineSource`: string - Kline data source
-- `WatchJobs`: map[string][]string - Monitoring jobs
-- `RunPolicy`: []*RunPolicyConfig - Running policy configuration
-- `StratPerf`: *StratPerfConfig - Strategy performance configuration
-- `Pairs`: []string - Trading pairs list
-- `PairMgr`: *PairMgrConfig - Pair manager configuration
-- `PairFilters`: []*CommonPairFilter - Pair filters
-- `Exchange`: *ExchangeConfig - Exchange configuration
-- `Database`: *DatabaseConfig - Database configuration
-- `APIServer`: *APIServerConfig - API server configuration
-- `RPCChannels`: map[string]map[string]interface{} - RPC channel configuration
-- `Webhook`: map[string]map[string]string - Webhook configuration
-- `Mail`: *MailConfig - SMTP email configuration
-- `LLMModels`: map[string]*llm.LLMModelConfig - LLM model configuration
+`CmdArgs.ExplicitFlags` records flags actually supplied. Go callers overriding YAML with zero/empty values must also set the relevant marker. `RawPairs` and `RawTimeFrames` are comma-separated CLI strings corresponding to parsed `Pairs` and `TimeFrames`.
 
-### RunPolicyConfig
-Running policy configuration, allowing multiple strategies to run simultaneously, containing the following fields:
-- `Name`: string - Strategy name
-- `Filters`: []*CommonPairFilter - Pair filters
-- `RunTimeframes`: []string - Running time frames
-- `MaxPair`: int - Maximum number of trading pairs
-- `MaxOpen`: int - Maximum number of open orders
-- `MaxSimulOpen`: int - Maximum number of simultaneous open orders
-- `Dirt`: string - Trading direction (long/short)
-- `StratPerf`: *StratPerfConfig - Strategy performance configuration
-- `Pairs`: []string - Trading pairs list
-- `Params`: map[string]float64 - Strategy parameters
-- `PairParams`: map[string]map[string]float64 - Pair parameters
+## RunSpec API
 
-### StratPerfConfig
-Strategy performance configuration, containing the following fields:
-- `Enable`: bool - Whether to enable
-- `MinOdNum`: int - Minimum number of orders
-- `MaxOdNum`: int - Maximum number of orders
-- `MinJobNum`: int - Minimum number of tasks
-- `MidWeight`: float64 - Medium weight
-- `BadWeight`: float64 - Bad weight
+| API | Result/purpose |
+| --- | --- |
+| `Config() *UnifiedConfig` | Return an owned configuration copy |
+| `Engines() []string` | Engines required by current policies |
+| `Origin(field) (FieldOrigin, bool)` / `Origins()` | Field origins including `Source` and `Kind` |
+| `EffectiveYAML(redact bool) ([]byte, error)` | Effective YAML; true redacts secrets, and advanced paths resolve for independently loadable output |
+| `Hash() (string, error)` | Effective configuration identity hash |
+| `ResolvePath(field string) (string, error)` | Resolve relative to the final supplying file; `@` / `$` needs a data directory, `:memory:` keeps its meaning |
+| `WithExecutionMode(mode, source string) *RunSpec` | Return a copy recording execution-mode override and origin |
+| `RuntimeSnapshot() (*Snapshot, *errs.Error)` | Normalize common settings and project only time-series policies; does not run factor tasks |
 
-### DatabaseConfig
-Database configuration, containing the following fields:
-- `Url`: string - Database connection URL
-- `Retention`: string - Data retention time
-- `MaxPoolSize`: int - Maximum connection pool size
-- `AutoCreate`: bool - Whether to initialize or upgrade the banbot schema after connecting
-- `DbType`: string - Database type: `questdb` or `timescale`; inferred from the connection port when empty
-- `QdbMemPct`: float64 - QuestDB memory usage ratio, range 0 to 1; QuestDB only
-- `QdbMaxMemMB`: int - QuestDB maximum memory usage in MB; QuestDB only
+For example, `spec.ResolvePath("data.archive")` follows the file actually supplying that field. Inline/CLI layers use the data directory or, when absent, the working directory. Missing fields, empty paths, or required path bases return errors.
 
-### APIServerConfig
-API server configuration, containing the following fields:
-- `Enable`: bool - Whether to enable
-- `BindIPAddr`: string - Binding IP address
-- `Port`: int - Listening port
-- `Verbosity`: string - Log verbosity
-- `JWTSecretKey`: string - JWT secret key
-- `CORSOrigins`: []string - CORS allowed sources
-- `Users`: []*UserConfig - User configurations
+`LoadRuntimeSnapshot(args *CmdArgs)` retains time-series loading. `UnifiedConfig.TimeSeriesConfig()` is a restricted legacy projection: it rejects factors, advanced overrides, and new account/identity/budget fields. It is not the unified engine entry point.
 
-### UserConfig
-User configuration, containing the following fields:
-- `Username`: string - Username
-- `Password`: string - Password
-- `AllowIPs`: []string - List of allowed IP addresses
-- `AccRoles`: map[string]string - Account role permissions
-- `ExpireHours`: float64 - Token expiration time (hours)
+## Structure and validation
 
-### RPCChannels
-Notification channels are configured with `RPCChannels map[string]map[string]interface{}`. The keys are custom channel names, and the values provide channel-specific fields according to `type` (such as `mail`, `wework`, or `telegram`). See the examples in the [Configuration Guide](../guide/configuration.md).
+Omitting `engine` retains legacy time-series `More` parameters. Explicit `time_series` / `factor` enables strategy identity, account, and capital allocation. Referenced accounts must exist, IDs must be unique within an account, and multiple strategies need explicit budgets totaling at most 1. `CapitalWeight` is distinct from `stake_rate` sizing.
 
-### PairMgrConfig
-Pair manager configuration, containing the following fields:
-- `Cron`: string - Cron task expression
-- `Offset`: int - Offset
-- `Limit`: int - Limit
-- `ForceFilters`: bool - Whether to force filtering
-- `PosOnRotation`: string - Position handling during symbol rotation: `hold` or `close`
-- `UseLatest`: bool - Whether to use the latest date for the symbol list when cron is disabled in backtesting
+Canonical YAML puts factor fields directly in `run_policy[]`, shared execution defaults in `execution`, and account overrides in `accounts.<name>`. `config_version` is optional; old 1/2 markers, `factor` wrappers, and `execution.accounts` remain readable. Duplicate spellings for the same field within one layer conflict. Advanced fields validate allowed keys and types.
 
-### AccountConfig
-Account configuration, containing the following fields:
-- `APIKey`: string - API key
-- `APISecret`: string - API secret
-- `NoTrade`: bool - Whether to prohibit trading
-- `MaxStakeAmt`: float64 - Maximum single order amount
-- `StakeRate`: float64 - Open position amount multiplier
-- `StakePctAmt`: float64 - Amount when opening positions based on percentage
-- `Leverage`: float64 - Leverage multiplier
+Configuration must be single-document YAML with a mapping root and no duplicate keys. Later layers wholly replace `run_policy`, `wallet_amounts`, `fatal_stop`, `watch_jobs`, and `historical_coverage`; other mappings normally deep-merge. See [configuration](../guide/configuration.md) for time representation changes and environment expansion.
 
-## Public Methods
+Common root structures include `DatabaseConfig` (`DbType`, `Url`, `SIDRegistryURL`, etc.), `APIServerConfig`, `UserConfig`, `PairMgrConfig`, `StratPerfConfig`, and `AccountConfig`. The configuration template is the complete YAML reference. Credentials remain in root `accounts`; execution settings do not replace actual trading authorization. `RPCChannels` maps channel configuration and supports `wework`, `mail`/`email`, and `telegram`; root `Webhook` holds message templates. See [notifications](../guide/notifications.md).
 
-### GetDataDir
-Get data directory path.
+## Compatibility APIs and writing
 
-Returns:
-- `string` - Absolute path of the data directory. A configuration error is raised when neither `BanDataDir` nor `-datadir` is provided; use `GetDataDirSafe` when an empty result is acceptable.
+| API | Boundary |
+| --- | --- |
+| `GetConfig(args, showLog)` / `ParseConfig(path)` / `ParseConfigs(paths, showLog)` | Return legacy time-series `Config`; not unified factor/mixed dispatch |
+| `LoadConfig(args)` / `ApplyConfig(args, cfg)` | Install legacy process globals; unsuitable for switching concurrent tasks; `LoadConfig` does not reinstall after Loaded |
+| `GetDataDir()` / `GetDataDirSafe()` | Legacy global directory access; the former raises a configuration error when absent, the latter allows empty |
+| `ResolveDataDir(explicit)` / `GetStratDir()` | Explicit data directory precedes `BanDataDir`; strategy directory comes from `BanStratDir` |
+| `ParsePath(path)` | Legacy data-directory prefix resolution; new fields use `RunSpec.ResolvePath` |
+| `GetTakeOverTF(pair, defTF)` / `GetAccLeverage(account)` / `GetStakeAmount(account)` | Compatibility lookups depending on legacy state |
+| `DumpYaml(desensitize bool)` / `(*Config).DumpYaml()` | Export legacy configuration; the package function requires a redaction argument |
+| `ParseTimeRange(raw)` | Return start/end milliseconds and an error |
+| `GetExportConfig(path)` / `LoadPerfs(inDir)` | Export configuration / legacy performance loading |
 
-### GetStratDir
-Get strategy directory path.
-
-Returns:
-- `string` - Absolute path of the strategy directory. Returns empty string if environment variable `BanStratDir` is not set.
-
-### LoadConfig
-
-Compatibility method: loads and applies package-level configuration; it is not an isolated multi-task entry. Normal entries use LoadRunSpec / RunSpec.RuntimeSnapshot. Snapshot.View is read-only, Snapshot.Clone owns copied containers, and execution accounts are copied separately with one shared lock.
-
-Argument args *CmdArgs; returns *errs.Error.
-
-### GetConfig
-Get configuration based on command line arguments.
-
-Parameters:
-- `args`: *CmdArgs - Command line argument object
-- `showLog`: bool - Whether to display logs
-
-Returns:
-- `*Config` - Configuration object
-- `*errs.Error` - Error information
-
-### ParseConfig
-Parse configuration file at specified path.
-
-Parameters:
-- `path`: string - Configuration file path
-
-Returns:
-- `*Config` - Configuration object
-- `*errs.Error` - Error information
-
-### ApplyConfig
-Install configuration into the legacy package-level compatibility facade.
-
-Normal Runtime entry points do not use this function to carry task state; it remains for call chains that have not yet migrated.
-
-Parameters:
-- `args`: *CmdArgs - Command line argument object
-- `c`: *Config - Configuration object
-
-Returns:
-- `*errs.Error` - Error information
-
-### GetTakeOverTF
-Get takeover time frame for specified trading pair.
-
-Parameters:
-- `pair`: string - Trading pair name
-- `defTF`: string - Default time frame
-
-Returns:
-- `string` - Time frame
-
-### GetAccLeverage
-Get leverage multiplier for specified account.
-
-Parameters:
-- `account`: string - Account name
-
-Returns:
-- `float64` - Leverage multiplier
-
-### ParsePath
-Parse path, replacing paths starting with `$` or `@` with absolute path of data directory.
-
-Parameters:
-- `path`: string - Original path
-
-Returns:
-- `string` - Parsed path
-
-### GetStakeAmount
-Get stake amount for specified account.
-
-Parameters:
-- `accName`: string - Account name
-
-Returns:
-- `float64` - Stake amount
-
-### DumpYaml
-Export current configuration in YAML format.
-
-Returns:
-- `[]byte` - Configuration data in YAML format
-- `*errs.Error` - Error information
-
-### LoadPerfs
-Load strategy performance data from specified directory.
-
-Parameters:
-- `inDir`: string - Input directory path
-
-### ParseTimeRange
-Parse time range string.
-
-Parameters:
-- `timeRange`: string - Time range string in format "YYYYMMDD-YYYYMMDD"
-
-Returns:
-- `int64` - Start timestamp (milliseconds)
-- `int64` - End timestamp (milliseconds)
-- `error` - Error information
-
-### GetExportConfig
-Get export configuration.
-
-Parameters:
-- `path`: string - Configuration file path
-
-Returns:
-- `*ExportConfig` - Export configuration object
-- `*errs.Error` - Error information
-
-## Factor-engine integration
-
-RunSpec retains one policy list and field origins; Snapshot is read-only and runtime accounts are copied separately. capital_weight is distinct from stake_rate.
-
-[Factor API](factor.md) / [Guide](../guide/factor.md)
-
-
-## Configuration ownership
-
-GetExgConfig is no longer an exported API; explicit sessions use Snapshot.View().Exchange. RPCChannels is a Config mapping (also retained as a compatibility variable), not a Runtime constructor. rpc.Session binds notifications to its snapshot/accounts. RunSpec.Config/Origins return owned copies; Snapshot.View is read-only by contract.
-
-LoadRunSpec/LoadUnifiedConfigs read YAML without automatically upgrading, backing up or rewriting it. config_version is optional; existing 1/2 markers remain accepted. Omitted engine retains legacy time-series More parameters; explicit engine enables new identity, account and budget fields. Factor fields live directly under run_policy[]; root accounts.&lt;name&gt; holds account execution overrides, while execution keeps shared defaults. Legacy nested input is readable; canonical output uses the shallow layout.
+Editors use `WriteConfigAtomic(path string, expected, candidate []byte) *errs.Error`. `expected` is the original read bytes; concurrent changes reject the write. Validated atomic replacement preserves permissions. Loading does not automatically write. `GetExgConfig` is no longer exported; use read-only `Snapshot.View().Exchange`. See [Runtime API](./runtime.md) for lifecycle contracts.

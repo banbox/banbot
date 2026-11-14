@@ -1,68 +1,66 @@
-除了使用banbot的[内置终端命令](../guide/bot_usage.md)，您也可以注册并执行自己的终端命令。
+# 自定义终端命令
 
-### 注册命令
+除[内置命令](../guide/bot_usage.md)外，策略应用可以注册 Cobra 命令。命令参数保存在闭包的局部变量中，无需修改 `config.CmdArgs` 或中央注册表。
 
-Banbot 使用 Cobra。通过 `entry.AddCommand` 注册 `*cobra.Command`，命令专属参数直接保存在命令自己的局部变量中：
+## 注册并执行
+
+下面是最小入口；合入现有策略项目时保留原有策略注册，只在 `entry.RunCmd()` 前添加命令注册：
 
 ```go
-var greeting string
+package main
 
-helloCmd := &cobra.Command{
-    Use:   "hello",
-    Short: "显示问候语",
-    Args:  cobra.NoArgs,
-    RunE: func(cmd *cobra.Command, args []string) error {
-        fmt.Println(greeting)
-        return nil
-    },
+import (
+    "fmt"
+
+    "github.com/banbox/banbot/entry"
+    "github.com/spf13/cobra"
+)
+
+func main() {
+    entry.AddGroup("custom", "custom tools")
+    entry.AddCommandFactory("custom", func() *cobra.Command {
+        var greeting string
+        cmd := &cobra.Command{
+            Use:   "hello",
+            Short: "Print a greeting",
+            Args:  cobra.NoArgs,
+            RunE: func(cmd *cobra.Command, args []string) error {
+                _, err := fmt.Fprintln(cmd.OutOrStdout(), greeting)
+                return err
+            },
+        }
+        cmd.Flags().StringVar(&greeting, "greeting", "hello", "greeting text")
+        return cmd
+    })
+    entry.RunCmd()
 }
-helloCmd.Flags().StringVar(&greeting, "greeting", "hello", "问候语")
-entry.AddCommand("", helloCmd)
 ```
-
-`AddCommand` 的第一个参数是父命令组；根命令使用空字符串。需要新命令组时，先调用 `entry.AddGroup`。帮助、参数校验、flag 解析和错误输出由 Cobra 统一处理。新增命令或参数不再需要修改 `config.CmdArgs` 或中央参数注册表。
-
-## 内置工具命令
-
-banbot提供了一些内置的工具命令，用于数据验证、分析和管理：
-
-### K线数据一致性检查
-
-检查实盘dump的K线数据正确性：
 
 ```bash
-# 检查K线数据一致性
-bot tool test_live_bars /path/to/dump/file.gob
+go build -o bot
+./bot custom hello --greeting "hello BanBot"
+./bot custom hello --help
 ```
 
-输入的gob文件是执行实盘`bot trade -out @file.gob`时附加-out参数生成的。
+父命令组为空字符串时注册到根；新组须先调用 `entry.AddGroup`。`AddCommand(parent, *cobra.Command)` 适合仅构造一棵命令树的应用。重复或并发构造 `entry.NewRootCommand()` 时使用 `AddCommandFactory`，每次返回全新命令和参数变量；同一个 Cobra 命令不能挂到两棵树。
 
-执行此命令会将实盘dump的K线与本地数据库中的K线进行对比，检查实盘K线正确且无遗漏。
+自定义命令不会自动获得内置配置参数。需要 YAML 时自行声明 `--config` / `--datadir` 等并调用 `config.LoadRunSpec`，不要把未解析的参数当成已生效配置，也不要为了单个命令参数改写配置全局变量。使用 `cmd.Context()` 传递取消，返回错误交由入口处理。
 
-**输出示例：**
-```
-BTCUSDT_1m 2025-01-01 00:00:00 - 2025-01-01 23:59:00, live: [5, 10], local: [3, 8]
-ETHUSDT_1m 2025-01-01 00:00:00 - 2025-01-01 23:59:00, live: [], local: [15]
-total: 2880, pairs: 2
-```
-
-### 回测报告生成
-
-从订单gob文件输出回测报告：
+## 实盘 K 线一致性检查
 
 ```bash
-# 从订单文件生成回测报告
-bot tool bt_result /path/to/orders.gob
+bot trade --datadir /path/to/data --out /path/to/live-bars.gob
+bot tool test-live-bars --datadir /path/to/data /path/to/live-bars.gob
 ```
 
-**功能特性：**
-- 支持从历史订单数据重新生成报告
-- 可用于离线分析和报告生成
-- 支持多种输出格式
+上面的 `trade` 命令以完整可运行的 Hub 配置为前提，见[执行指南](../guide/execution.md)。此工具接收一个位置参数 `DUMP_FILE`，将时序实盘 dump 的 K 线与配置市场的本地存储比较。需要同一交易所、市场及可用数据库；它不是任意 Gob 文件的格式验证器，也不能证明策略无未来信息。
 
-### 读取数据生成K线图示例
-您可以通过上面自定义终端命令，自由调用banbot提供的相关接口，实现各种各样的复杂任务，而不仅仅是内置的回测、交易等。
+## 从订单重建报告
 
-比如，您可以读取指定品种的K线，然后生成静态html的K线图：[参考代码](https://github.com/banbox/banstrats/tree/main/adv)
+```bash
+bot tool bt-result --datadir /path/to/data --config report-config.yml --in /path/to/orders.gob --out /path/to/rebuilt
+```
 
+`bt-result` 使用 `--in`，不接受位置文件参数。提供与原订单一致的配置、市场、钱包及所需历史数据，可生成 `assets.html`、`enters.html`、`detail.json`、`orders.csv` 等报告。它不是保证无需数据库/行情的离线工具，也不用于重建因子 `events.jsonl` / 账户账本报告。
 
+其他扩展接口和取消上下文见 [entry API](../api/entry.md)，回测依赖见 [opt API](../api/opt.md)。

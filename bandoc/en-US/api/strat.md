@@ -11,7 +11,7 @@ Public fields:
 - `Name string` - Strategy name
 - `Version int` - Strategy version number
 - `WarmupNum int` - Number of candlesticks needed for warmup
-- `MinTfScore float64` - Minimum time frame quality, default 0.8
+- `MinTfScore float64` - Minimum time frame quality, default 0.75
 - `WsSubs map[string]string` - WsSubs        map[string]string    // websocket subscription: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 - `DrawDownExit bool` - Whether to enable drawdown exit
 - `HedgeOff bool` - turn off future hedge mode
@@ -56,8 +56,8 @@ Public fields:
 - `LongSLPrice float64` - Default long stop loss price when opening position
 - `ShortSLPrice float64` - Default short stop loss price when opening position
 - `ExgTakeProfit bool` - Whether to allow exchange take profit
-- `LongTPPrice float64` - Default long take profit price when opening position
-- `ShortTPPrice float64` - Default short take profit price when opening position
+- `LongTPPrice float64` - Compatibility field; the entry path does not read it. Use EnterReq.TakeProfit/TakeProfitVal.
+- `ShortTPPrice float64` - Compatibility field; the entry path does not read it. Use EnterReq.TakeProfit/TakeProfitVal.
 - `IsWarmUp bool` - Whether currently in warmup state
 - `More interface{}` - Additional information for strategy customization
 - `DataHub` - Caches the latest events and window data by `(source, sid, timeframe)`
@@ -87,7 +87,7 @@ Public fields:
 
 ### BatchState / BatchMap
 
-`BatchState` owns one trader’s batch queue and backtest batch timestamp. Create it with `NewBatchState`, enqueue with `AddTask`, consume ready batches with `TakeReady(currMS, deterministic)`, query `PendingCount`, and clear with `Reset`. Strict backtests use deterministic ordering; ordinary mode does not promise order. `LegacyBatchState` serves package compatibility calls only.
+Use `NewBatchState`, `AddTask`, `TakeReady(currMS, deterministic)`, `PendingCount` and `Reset`. All backtests use deterministic batches; main jobs are sorted by symbol key. `LegacyBatchState` serves compatibility calls only.
 
 `BatchMap` represents one timeframe task group inside the queue, rather than process-shared market state.
 
@@ -108,8 +108,9 @@ Public fields:
 Open position request structure.
 
 Public fields:
-- `Tag string` - Entry signal
-- `StgyName string` - Strategy name
+- `CommandID string` - Stable request identity; callback events can derive it. Idempotent execution depends on the order manager.
+- `Tag string` - Entry signal (required)
+- `StratName string` - Strategy name
 - `Short bool` - Whether to short sell
 - `OrderType int` - Order type
 - `Limit float64` - Entry price for limit order, order will be submitted as limit order when specified
@@ -132,12 +133,16 @@ Public fields:
 - `ClientID string` - Used to set the trailing part of the ClientOrderID submitted to the exchange.
 - `Infos map[string]string` - Used to store additional information for the order.
 
-### ExitReq
+`Stop` and `Limit` are mutually exclusive. `ActivationPrice float64` and `CallbackPct float64` configure trailing stops; nonzero CallbackPct must be 0.1–10 (percent), subject to exchange support. `Log bool` enables validation-error logging. Warmup does not enqueue requests; nil does not mean a fill.
+
+#`CommandID string` identifies the request and `Log bool` enables error logging. `CloseOrders` queues an intent; an exit limit on the favorable side is converted to an order stop-loss limit rather than filled immediately.
+
+## ExitReq
 Close position request structure.
 
 Public fields:
 - `Tag string` - Exit signal
-- `StgyName string` - Strategy name
+- `StratName string` - Strategy name
 - `EnterTag string` - Only exit orders with EnterTag as entry signal
 - `Dirt int` - Direction (core.OdDirt*), long/short/both
 - `OrderType int` - Order type
@@ -274,3 +279,27 @@ Exit all strategy jobs.
 TradeStrat is time-series; graphs and combination live in factor/runner. DataHub rawMap NULL/missing semantics coexist with numerical views.
 
 [Factor API](factor.md) / [Guide](../guide/factor.md)
+
+## Callbacks and job methods
+
+```go
+OnStartUp     func(s *StratJob)
+OnDataSubs    func(s *StratJob) []*DataSub
+OnData        func(s *StratJob, data DataEvent)
+OnSymbols     func(items []string) []string
+OnOrderChange func(s *StratJob, od *ormo.InOutOrder, chgType int)
+OnBatchJobs   func(jobs []*StratJob)
+OnBatchInfos  func(tf string, jobs map[string]*JobEnv)
+OnWsData      func(s *StratJob, evt *orm.DataSeries)
+OnPostApi     FnOnPostApi
+OnShutDown    func(s *StratJob)
+OnStratExit   func()
+```
+
+These are callback field signatures; other configuration fields are omitted. `OnData` cannot coexist with `OnBar`/`OnInfoBar`: construction panics. Use `RouteData(DataHandlers{Main: ..., Info: ..., Custom: ...})` to route events whose `DataFields` are already updated. `DataSub` aliases `orm.Subscription`.
+
+`job.Data(sub)` returns a subscription view; `DataHub.Get(tf, source, sid)` addresses the same identity. Check for nil before data arrives. `RawValue(name) (any, bool)` distinguishes missing from explicit NULL; `Series(name)` provides numeric indicator windows. Preserve custom field types instead of converting everything to float64.
+
+`job.OpenOrder(req)`, `CloseOrders(req)`, `SetAllStopLoss(dirt, trigger)` and `SetAllTakeProfit(dirt, trigger)` return `*errs.Error`. `ProcessRuntimeOrders()` returns `(entered, exited []*ormo.InOutOrder, err *errs.Error, bound bool)` and handles only this job; bound=false means no explicit Runtime is bound. Do not append to Entrys/Exits directly. `ExecutionSnapshot()` supports reads across event boundaries; its order pointers remain borrowed.
+
+`RegisterStrategy(name, factory)` registers a full name; `AddStratGroup` registers a group. Get running jobs from `rt.Strategies.CollectJobs()` or `LookupJob(account, pairTF, strategy)`. Package-level `New/Get/GetJobs/GetInfoJobs/AddOdSub/FireOdChange/LoadStratJobs/ExitStratJobs` are compatibility APIs and do not query independent Runtimes. For dynamic pairs pass the owning `rt.Strategies` in `PairUpdateReq.StrategyState`; see the [strategy guide](../guide/strat_custom.md).

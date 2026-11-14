@@ -17,3 +17,11 @@ Slow-client WebSocket monitoring is bounded and does not block trading callbacks
 OrderArgs, ForceExitArgs, CloseArgs, JobItem and LoginRequest belong to web/live, not the live strategy package. Routes and validation follow the actual server registration.
 
 See [entry](entry.md), [runtime](runtime.md) and [live trading](../guide/live_trading.md).
+
+## Access and authentication
+
+- Development WebUI: `bot web --host 127.0.0.1 --port 8000`. Binding to `0.0.0.0` or `::` requires `--password`; Basic Auth uses username `banbot`. The UI can edit strategy files and build code.
+- Live Dashboard: enabled by `api_server`, with users and account roles configured there. Its authentication is separate from development Basic Auth.
+- Live `/api/kline`, `/api/kline/csv/upload` and `/api/ws` routes sit outside the JWT group. Restrict listening or authenticate through a reverse proxy for remote access; Dashboard login does not protect every route.
+
+See [Quick start](../guide/quick_local.md) and [Live trading](../guide/live_trading.md) for setup. Development backtest tasks launch child processes; task arguments currently split on spaces, so avoid spaces in associated input/output paths.

@@ -26,8 +26,8 @@ RuntimeDeps 直接持有 Core、Clock、Config、DataDir、Symbols、Storage、E
 
 ### PriceFilter
 价格过滤器配置结构体。
-- `MaxUnitValue float64` - 最大允许的单位价格变动对应的价值(针对定价货币，一般是USDT)
-- `Precision float64` - 价格精度，默认要求价格变动最小单位是0.1%
+- `MaxUnitValue float64` - 最小下单数量步长乘价格的最大值（计价币）
+- `Precision float64` - 最大 tick/price 比率，0 禁用
 - `Min float64` - 最低价格
 - `Max float64` - 最高价格
 
@@ -36,7 +36,7 @@ RuntimeDeps 直接持有 Core、Clock、Config、DataDir、Symbols、Storage、E
 字段为 BaseFilter、BackDays int、Min/Max float64、CacheSecs int；缓存秒数使用 CacheSecs，不是 RefreshPeriod。
 
 ### SpreadFilter
-流动性过滤器。
+占位过滤器，当前原样返回输入；MaxRatio 不产生过滤效果。
 - `MaxRatio float32` - 买卖价差占价格的最大比率，公式：1-bid/ask
 
 ### CorrelationFilter
@@ -56,7 +56,7 @@ RuntimeDeps 直接持有 Core、Clock、Config、DataDir、Symbols、Storage、E
 
 ### BlockFilter
 品种黑名单过滤器，用于过滤指定品种。
-- `Pairs string[]` - 需要过滤的品种
+- `Pairs []string` - 需要过滤的品种
 
 ### AgeFilter
 上市时间过滤器。
@@ -85,15 +85,53 @@ RuntimeDeps 直接持有 Core、Clock、Config、DataDir、Symbols、Storage、E
 
 参数：
 - `items []*config.CommonPairFilter` - 过滤器配置列表
-- `withInvalid bool` - 是否包含无效的过滤器
+- `withInvalid bool` - 是否包含 disable=true 的过滤器
 
 返回：
 - `[]IFilter` - 过滤器接口列表
 - `*errs.Error` - 创建过程中的错误信息
 
 ### RefreshPairList
+
+`RefreshPairList(timeMS int64) ([]string, *errs.Error)`
 刷新交易对列表，获取最新的有效交易对。
 
 返回：
 - `[]string` - 有效的交易对列表
 - `*errs.Error` - 刷新过程中的错误信息
+
+## 注册与显式调用
+
+以下完整示例注册一个按符号列表过滤的过滤器；在策略项目中导入此包后，用 pairlists 的 name: KeepBTC 引用。第一个过滤器仍必须是 producer。
+
+```go
+package filters
+
+import (
+    "strings"
+    "github.com/banbox/banbot/goods"
+    "github.com/banbox/banexg/errs"
+)
+
+type KeepBTC struct { goods.BaseFilter }
+
+func (f *KeepBTC) Filter(pairs []string, timeMS int64) ([]string, *errs.Error) {
+    result := make([]string, 0, len(pairs))
+    for _, pair := range pairs {
+        if strings.HasPrefix(pair, "BTC/") { result = append(result, pair) }
+    }
+    return result, nil
+}
+
+func init() {
+    goods.RegisterFilter("KeepBTC", func(base goods.BaseFilter) goods.IFilter {
+        return &KeepBTC{BaseFilter: base}
+    })
+}
+```
+
+`RegisterFilter(name, factory)` 重名会覆盖；`CreateFilter(cfg, allowEmpty)` 返回 `(IFilter, *errs.Error)` 并将配置解码到实例。`GetPairFiltersWithConfig(items, withInvalid, cfg)` 按给定配置构造过滤器。withInvalid 表示包含已禁用过滤器，不是容忍未知名称。
+
+嵌入程序用 `RefreshPairListWithRuntimeDeps(deps *RuntimeDeps, timeMS int64)`，返回 `([]string, *errs.Error)`。必须提供同一任务的 Core/Clock/Config/Symbols/Storage/Exchange 等依赖；仅有 SymbolState 不能代替完整依赖。自定义过滤器可实现 `FilterWithRuntimeDeps(deps *RuntimeDeps, pairs []string, timeMS int64) ([]string, *errs.Error)`；它优先于 SymbolStateFilter 和旧 Filter。
+
+VolumePairFilter 的 MinValue 是每根 bar 平均 close*volume，CacheSecs 当前不控制缓存。CorrelationFilter 另有 `TopRate float64`，Sort 仅识别 asc/desc，少于四个可用序列时跳过过滤。详见[筛选指南](../guide/pair_filters.md)。

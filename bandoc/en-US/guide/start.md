@@ -1,3 +1,5 @@
+# Banbot user guide
+
 Banbot is a high-performance, easy-to-use, multi-variety, multi-strategy, multi-period, multi-account event-driven trading robot. It supports backtesting, hyperparameter tuning, and real-time trading.
 Currently supports Binance, OKX, and Bybit Exchange, and the robot can be viewed through the WebUI.
 ::: danger Disclaimer
@@ -8,20 +10,33 @@ Please conduct sufficient backtesting, rolling testing, and simulated real-time 
 We strongly recommend that you have basic golang programming knowledge and understand the robot's operating mechanism by reading the source code.
 :::
 
+## Choose a workflow
+
+| Goal | Start here |
+| --- | --- |
+| Install and run a first backtest | [Quick start](./quick_local.md), [Configuration](./configuration.md), [Backtesting](./backtest.md) |
+| Write Go strategies or add data | [Initialize a project](./init_project.md), [Custom strategy](./strat_custom.md), [Custom time-series data](./custom_data.md) |
+| Research factors, pairs and portfolios | [Multi-factor strategies](./factor.md) |
+| Run simulated/live trading and shared accounts | [Live trading](./live_trading.md) |
+| Manage storage and historical data | [Database](./database.md), [Data tools](../advanced/kline_tools.md) |
+| Look up commands and developer APIs | [Commands](./bot_usage.md), [API](../api/index.md) |
+
 ## Main features
-* High performance: 1 second backtesting 1 year of data (based on 5m test, the specific time depends on the characteristics of the strategy)
+* High performance: Go and banta cache indicator state; runtime depends on strategies, data, timeframes and universe size
 * Easy to use: one version of the strategy, supporting backtesting, simulated real-time trading and real trading at the same time
 * Flexible: Freely combine different symbols, strategies and time periods
-* Event-driven: No lookahead and implement your strategy logic more freely
+* Event-driven: processing follows data visibility; custom data must supply correct publication/revision information to avoid lookahead
 * Scalability: A batch of strategies can be applied to multiple exchange accounts at the same time
 * Hyperparameter tuning: Support bayes/tpe/random/cmaes/ipop-cmaes/bipop-cmaes
 * Dynamic symbols: Add or remove trading symbols on the fly during strategy execution, no restart required
 * Websocket: Exchange transaction by transaction + order book data
 * Indicator library: Built-in [banta](https://github.com/banbox/banta) high-performance indicator library, you can quickly develop custom indicators based on it
-* LLM Integration: Built-in large language model invocation and management capabilities (multi-model failover, concurrency control, statistics tracking, etc.)
+* Arbitrary time-series data: preserve K-line extension columns, external series, types and NULL values; see [Custom data](./custom_data.md)
+* Two engines: time-series callbacks, cross-sectional portfolios, statistical pairs and mixed events replay; see [Factor guide](./factor.md)
+* LLM extension: an application-invoked model management library; see [AI](../advanced/ai.md)
 
 ## WebUI
-For strategy research backtesting, it is recommended to start locally only, without a password.
+For strategy editing, data management and backtesting. `bot web` defaults to `127.0.0.1:8000`, where a password is optional. Binding to `0.0.0.0` or `::` requires `--password` (Basic Auth username: `banbot`).
 
 ![image](https://docs.banbot.site/uidev.gif)
 
@@ -35,11 +50,13 @@ Based on the unified interface provided by [banexg](https://github.com/banbox/ba
 
 > We support [agent workflow script](https://github.com/banbox/banexg/blob/main/docs/dev_exg.py), which enables automated exchange integration based on codex/claude code. If you need support for other exchanges and have some development experience, you can use this script to quickly complete the development.
 
-| logo                                                                                                            | id      | name              | ver | websocket |
-|-----------------------------------------------------------------------------------------------------------------|---------|-------------------|-----|-----------|
-| ![binance](https://user-images.githubusercontent.com/1294454/29604020-d5483cdc-87ee-11e7-94c7-d1a8d9169293.jpg) | binance | spot/usd-m/coin-m | *   | Y         |
-| ![okx](https://user-images.githubusercontent.com/1294454/152485636-38b19e4a-bece-4dec-979a-5982859ffc04.jpg) | okx | spot/usd-m/coin-m | *   | Y         |
-| ![bybit](https://private-user-images.githubusercontent.com/81727607/382500134-97a5d0b3-de10-423d-90e1-6620960025ed.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NjkyNTM1NjgsIm5iZiI6MTc2OTI1MzI2OCwicGF0aCI6Ii84MTcyNzYwNy8zODI1MDAxMzQtOTdhNWQwYjMtZGUxMC00MjNkLTkwZTEtNjYyMDk2MDAyNWVkLnBuZz9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNjAxMjQlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjYwMTI0VDExMTQyOFomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTQwODM4YThmMTU2ZmIyMGI1YjRmYWU0MGVkYzJhN2YyMmYzYzhmNTJjZDM1YzFmYzdjNGRlMGY4OTlmM2RmODMmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0In0.3I9CvGTqWpZcZaDBV0_tFQFbOoPyCOxaZ1c6o7q6tMQ) | bybit | spot/usd-m/coin-m | *   | Y         |
+| id | Exchange |
+| --- | --- |
+| `binance` | Binance |
+| `okx` | OKX |
+| `bybit` | Bybit |
+
+Market-data and historical replay capabilities depend on the banexg adapter. Default Hub live execution currently accepts only linear perpetual accounts in `prod`/`dry_run`; adapter spot, inverse, testnet or options capabilities do not establish default live support. See [Shared accounts and Hub](./execution.md). Symbol naming examples do not imply support on every exchange. The China-market documents describe designs, not delivered exchange integrations.
 
 ## Skill Requirements
 * Basic Linux/Windows operations (environment variables, command line, editing configuration files)
@@ -61,7 +78,7 @@ It is recommended that you quickly learn the relevant basics through DeepSeek
 **Live Deployment** is recommended to directly use the Linux cloud server with the configuration mentioned above.
 
 ::: tip tip
-This configuration allows for the simultaneous deployment of both the database and the bot. Each bot account occupies minimal resources, enabling you to configure hundreds of accounts within a single bot process.
+Use this as a starting point for small trials. Multiple symbols/accounts, factor panels and long replays have memory and storage requirements that depend on the actual workload.
 :::
 
 ## Q & A

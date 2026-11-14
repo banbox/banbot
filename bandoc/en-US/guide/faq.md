@@ -1,68 +1,79 @@
-## How to upgrade banbot to the latest version?
-**Docker**  
-```bash
-docker compose pull banbot
-docker compose up -d banbot
+# Frequently asked questions
+
+## How do I upgrade Banbot?
+
+Choose a target version in your strategy project, update dependencies and rebuild:
+
+```shell
+go get github.com/banbox/banbot@VERSION
+go mod tidy
+go build -o bot
 ```
 
-**Local Installation**  
-In your strategy code project (the directory pointed to by the environment variable `BanStratDir`), edit the `go.mod` file, update the version number after `github.com/banbox/banbot` to the latest one;  
-Then open a terminal in the current directory and execute `go mod tidy` to apply the changes and load the dependencies.
+Replace `VERSION` with the version you intend to use. Editing `go.mod` or running `go mod tidy` does not replace an already deployed executable. Preserve configuration, databases and execution ledgers, and check [Configuration](./configuration.md) and strategy API compatibility. The current source requires Go 1.26.0 and declares toolchain Go 1.26.8.
 
-::: tip tip  
-You can check the latest available versions on [github](https://github.com/banbox/banbot/releases) or [gitee](https://gitee.com/banbox/banbot/releases).  
-If you like to test the latest features, you can use the unstable version with the suffix `-beta.?`. Most people may prefer to use the latest stable version such as `v{a}.{b}.{c}`.  
-:::
+For Docker, update containers using your selected image version while retaining data volumes. Follow that deployment project's build and startup instructions.
 
-## Why not provided precompiled installation packages?
-Most quantitative strategies require writing code independently. To balance development efficiency and maximize performance, banbot chooses golang as the unified language for both the system and strategies, which also provides users with the greatest freedom.  
-The philosophy of golang is to compile everything (banbot and your strategy code) into a single executable file, which you can easily distribute to anyone and run directly.  
-So you only need to [pull the example strategy project](./init_project.md), use the built-in strategies or implement your own, and after compilation, you can experience all functions such as backtesting and live trading.
+## Why do I need a strategy project?
 
-## What types of quantitative strategies are supported, and which types are not supported?
-**Supported Strategies**: Time-series strategies of 1-minute and above (multi-asset/multi-timeframe); multi-factor/cross-sectional research, weights/events backtests and mixed time-series/factor events replay.
+Go strategies compile together with Banbot into one executable. Use an example project or [initialize your own](./init_project.md). Rebuild after changing Go strategies. Factor expressions and portfolio settings may also be defined in YAML; see [Multi-factor strategies](./factor.md).
 
-Real factor/mixed live requires a verified session binding, current data/execution capabilities and account reconciliation. Missing evidence fails startup without paper fallback. See [Multi-factor strategies](./factor.md). AI-driven strategies still need application-supplied models and strategy logic.
+## Which strategies and markets are supported?
 
-**Not Currently Supported**: High-frequency trading, arbitrage trading (including triangular arbitrage, cross-exchange arbitrage, and term arbitrage, etc.), pair trading, statistical arbitrage.
+- Time-series strategies: main/auxiliary timeframe and custom-series events across symbols, timeframes and accounts.
+- Factor strategies: cross-sectional factors, portfolio research, weights/events backtests, statistical pairs and mixed time-series/factor events replay.
+- Live trading: ordinary time-series and factor/mixed paths have different setup requirements. Real factor/mixed trading requires current-session data, execution and reconciliation verification; see [Live trading](./live_trading.md).
 
-## Supported markets
-Banbot supports Binance, OKX, and Bybit's spot, U-margined contracts, and coin-margined contracts. You are welcome to submit pull requests to support more exchanges and markets.
+Built-in exchange entry points are Binance, OKX and Bybit. Market-data and historical replay capabilities come from banexg adapters. Default Hub live execution currently accepts only linear perpetual accounts in `prod`/`dry_run`; see [Shared accounts and Hub](./execution.md). Statistical pairs do not imply ready-made triangular, cross-exchange or high-frequency strategies. China-market design documents do not constitute delivered stock/futures integration.
 
-Not currently supported: Stocks, futures, foreign exchange, bonds, decentralized cryptocurrency exchanges, etc.
+## Do backtests and downloads require API keys?
 
-## Is it stable? Can it be used for real trading in a production environment?
+Public-market-data backtests and downloads do not require trading credentials. Real trading requires credentials for the chosen account/environment. Complete a [first backtest](./quick_local.md) before configuring live credentials.
 
-We have used Banbot time-series strategies live since December 1, 2024 and resolved many bugs. This historical usage concerns those time-series paths; it does not certify real-venue acceptance of the new factor/mixed engine, which still requires current-session verification and reconciliation. The user base remains limited, and uncovered issues may cause capital losses.
+## Why does WebUI require a password in Docker?
 
-If you want to test the strategy with a small amount of capital, you can consider starting to use Banbot immediately. If you have a large amount of capital, we suggest that you first run a trial with a small amount of capital for a few months to observe the results.
+`bot web` defaults to `127.0.0.1:8000` locally and `0.0.0.0` in Docker. Binding to `0.0.0.0` or `::` requires `--password`; the Basic Auth username is always `banbot`. Development UI credentials are separate from live Dashboard users.
 
-## Can I open a short position?
-Banbot supports opening a short position. Just set `Short` to true in `OpenOrders(&strat.EnterReq{Tag: "short", Short: true})`.
+## Can I open shorts or limit order counts?
 
-## How many orders can be opened at the same time?
-Banbot does not limit the number of orders you can open. You can open any number of orders in long or short positions.
+Use `s.OpenOrder(&strat.EnterReq{Tag: "short", Short: true})` on a contract market that supports shorts. The spot path rejects short entries.
 
-## Can I exit only part of the position?
-Banbot supports partial exit of positions or orders. Just `CloseOrders(&strat.ExitReq{Tag: "close", ExitRate: 0.5, FilledOnly: true})` to close half of the entered position.
-You can also pass in the `OrderID` parameter to exit only half of the position of a specified order.
+Orders are constrained by available funds, `max_open_orders`, account limits and strategy `EachMaxLong`/`EachMaxShort` settings. Accepting a signal does not mean the order has filled; the order manager and exchange determine execution.
 
-## Do I need to restart the robot after changing the configuration?
-Currently, after you change the configuration, you need to restart the robot for it to take effect. However, after the robot restarts, it will automatically detect the relevant positions and orders and will not be lost.
+## Can I exit only part of a position?
 
-## The orders in the live trading and backtest do not match?
-* Check the live trading log for errors
-* Check whether the time zones of the backtest and real market orders are consistent
-* Check whether the configurations are consistent: market, leverage, strategy and time period, order amount, etc.
+Inside a strategy callback:
 
-## During backtesting, it shows "bulk down xx xxx pairs 2024-10-31 ..." and then hangs with no response
-The database connection pool size may be too small, preventing database sessions from being acquired during bulk downloads. Please set `database.max_pool_size` to 50 or larger and try again.
+```go
+s.CloseOrders(&strat.ExitReq{Tag: "close", ExitRate: 0.5, FilledOnly: true})
+```
 
-## ormo or ormu reports an error: constraint failed: NOT NULL constraint failed, the corresponding field is float64
-If a field type in golang is float64, and the value is nan or inf, it will be treated as null when written to sqlite. If this column is not null, the above error will occur. Solution: Replace utils.NanInfTo(v, 0) with 0 before writing
+Use `OrderID` to restrict the request to one order. See [Strategy API](../api/strat.md) for fields and return values.
 
-## Get "https://xxx": unexpected EOF  
-This is an error that occurs when the download from the Go repository fails. There could be two possible reasons: the Go repository pointed to by `GOPROXY` is unavailable, or the VPN proxy node is not working. Try switching to resolve the issue.
+## Do configuration changes require a restart?
 
-## More other questions?
-We recommend that you ask [DeepWiki](https://deepwiki.com/banbox/banbot), which will read the source code of banbot and accurately answer your relevant questions. 
+YAML is not an automatic hot-reload interface; edits normally require a restart. Dynamic symbol changes and remote controls use their own APIs. Order synchronization, shared-account recovery and takeover have different requirements. Retain configuration, order databases, execution ledgers and checkpoints; current exchange positions alone cannot identify every strategy's ownership. See [Live trading](./live_trading.md).
+
+## How do backtests, real-time simulation and historical replay differ?
+
+For ordinary time-series strategies, `env: dry_run` consumes real-time data and simulates fills locally. For factor/mixed configurations, `trade --dry-run` runs historical events replay. Factor `backtest --mode weights` is for weight research; mixed replay requires events. See [Backtesting](./backtest.md).
+
+## Why do live and backtest orders differ?
+
+Check logs, effective configuration, universe, timezone, timeframes, leverage and stake. Then compare market data, fees, slippage, funding and fill conditions. OHLCV matching cannot reproduce every order-book detail, network delay or real fill sequence. For external data, also check historical availability times and revisions.
+
+## Why is downloaded or written data not immediately visible?
+
+Check database connectivity, logs and `database.max_pool_size`. QuestDB WAL writes become visible asynchronously; successful writes do not imply immediate reads. Do not clear data or replace tables because of one empty read. To repair K-line coverage metadata, use `kline repair-ranges` from [Data tools](../advanced/kline_tools.md) after checking stored ranges.
+
+## Why does SQLite report NOT NULL for a float64 field?
+
+NaN/Inf may become NULL when written to SQLite. Validate fields that require finite numbers, or apply `utils.NanInfTo(v, 0)` before writing. Explicit NULL and missing values in custom time-series fields have distinct meanings; do not replace all of them with zero.
+
+## Why do Go dependency downloads fail with unexpected EOF?
+
+Check `GOPROXY`, connectivity and proxy nodes; retry with a reachable source or node. Distinguish dependency download failures from exchange connectivity at runtime.
+
+## What information helps with other questions?
+
+Check [Commands](./bot_usage.md) and [API](../api/index.md). For issues or community questions, include the version, command, redacted configuration, error logs and a minimal reproduction. Do not publish API keys, passwords or tokens.

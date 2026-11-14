@@ -19,7 +19,7 @@ Universe 分别声明 investable、reference、tradable、evaluation 和 tracked
 
 因子诊断使用根命令 `research --config strategy.yml`，版本归档使用 `data archive --input records.jsonl --out chunk.gob`，独立表达式使用根命令 `validate --spec formula.yml` / `explain --spec formula.yml`。策略配置统一使用 YAML。
 
-因子或混合配置的 `trade --dry-run` 启动历史 `events` 回放，不是实时行情模拟。纯时序的实时模拟继续使用 YAML `env: dry_run`，不要用历史回放标志启动该流程。真实因子或混合交易可传 `--live-provider`，且必须具备当前会话已验证的 binding。策略配置使用 YAML `run_policy`。
+因子或混合配置的 `trade --dry-run` 启动历史 `events` 回放，不是实时行情模拟。所有引擎的实时模拟使用 YAML `env: dry_run`，经 Hub 的持久化 paper 账户执行，并要求 `funding_policy: explicit-zero`。`--live-provider` 仅供含因子策略的 `trade` 覆盖执行来源；纯时序配置通过 YAML 选择。启动步骤见[共享账户与 Hub](./execution.md)。
 
 每个任务拥有显式 `runtime.Runtime`、配置快照、时钟、策略状态和取消上下文。运行态隔离不意味着交易所余额隔离：主动绑定同一账户的策略共享账户执行协调器，保留各自的持仓归因和资本预算。要求交易执行也互不影响的任务应使用不同账户及资源身份。取消时先停止接收，再等待在途回调和计算结束后释放资源；释放一个消费者不会停止仍在借用共享服务的其他消费者。
 
@@ -114,7 +114,7 @@ cohort 的入场窗口结束后不再补足原计划，迟到真实 fill 按原�
 
 ## 用 Go 写策略：三种入口
 
-先选引擎，再选最短入口。三者共用同一份 YAML 与 `DataSeries.Values`，差别只在“信号如何变成仓位”：
+将注册函数放入已被项目导入的 Go 包，再重新编译机器人；按示例需要导入 `github.com/banbox/banbot/factor`、`factor/runner` 和 `factor/statistics`（后两者同属 banbot 模块）。先选引擎，再选最短入口。三者共用同一份 YAML 与 `DataSeries.Values`，差别只在“信号如何变成仓位”：
 
 | 需求 | 引擎 | 入口 |
 | --- | --- | --- |
@@ -127,12 +127,14 @@ cohort 的入场窗口结束后不再补足原计划，迟到真实 fill 按原�
 
 ```go
 func init() {
-	runner.RegisterFactor("my-mom", func(c runner.FactorContext) (runner.FactorSpec, error) {
+	if err := runner.RegisterFactor("my-mom", func(c runner.FactorContext) (runner.FactorSpec, error) {
 		w := c.Params.Int("window", 24)
 		return runner.FactorSpec{Outputs: map[string]*factor.Node{
 			"mom": factor.ZScore(factor.Return(c.Close(), w)),
 		}}, c.Params.Err()
-	})
+	}); err != nil {
+		panic(err)
+	}
 }
 ```
 
@@ -147,7 +149,7 @@ run_policy:
 
 ```go
 func init() {
-	runner.RegisterPairs("eth-btc", func(p *runner.Params) (runner.PairsSpec, error) {
+	if err := runner.RegisterPairs("eth-btc", func(p *runner.Params) (runner.PairsSpec, error) {
 		return runner.PairsSpec{
 			Pairs:  []runner.Pair{{Y: "ETH/USDT:USDT", X: "BTC/USDT:USDT"}},
 			Window: p.Int("window", 120),
@@ -156,7 +158,9 @@ func init() {
 				Stop: p.Float("stop", 4), MaxHold: p.Int("maxHold", 0),
 			},
 		}, p.Err()
-	})
+	}); err != nil {
+		panic(err)
+	}
 }
 ```
 
@@ -167,10 +171,11 @@ run_policy:
 ```
 
 行为约定：
-- 对 `ln(Y) = α + β·ln(X)` 做滚动回归，z = 残差 / 残差标准差。`z ≤ -Entry` 做多价差（买 Y 卖 X），`z ≥ Entry` 做空价差，`|z| ≤ Exit` 平仓。
+
+- 对 `ln(Y) = α + β·ln(X)` 做滚动回归，z = 残差 / 残差标准差。`z ≤ -Entry` 做多价差（β 为正时买 Y 卖 X），`z ≥ Entry` 做空价差，`|z| ≤ Exit` 平仓。
 - `Stop`（可选）在 `|z| ≥ Stop` 时平仓，并且在 z 回到 `Exit` 内之前不再入场；`MaxHold`（可选）同理。`LongOnly`/`ShortOnly` 限制方向。
 - 对冲比 β 在持仓期间固定为入场时的值，避免 β 漂移引起反复调仓；下一次入场刷新。单对总敞口为 `Gross`（默认 `1/配对数`）占策略 NAV，Y 腿 `s·G/(1+|β|)`，X 腿 `-s·G·β/(1+|β|)`。
-- 配对的两个品种必须都在本次运行的 universe 与可交易集合内，否则构造时报错。每次运行拥有独立的滚动窗口与状态机；窗口未满或输入缺失时保持上一目标，不产生交易。
+- 正常参与交易的配对双腿必须在本次运行的 universe 与可交易集合内。每次运行拥有独立的滚动窗口与状态机。窗口未满时不生成新信号；已开配对的任一腿缺失时请求平仓并暂停，数据恢复后可重新入场。回测窗口内完全无数据、由引擎标记不可用的腿会使该对整次跳过，其他配对不放大预算；全部配对不可用时权益保持初始值、交易数为零。未声明或不在允许集合的腿仍报错。
 - 策略自动绑定自己的组合构造器，YAML 中只需 `name`；显式指定 `portfolio.builder` 时以显式为准。
 
 `statistics.BandTrader`（滞回状态机）与 `statistics.RollingSpread`（O(1) 更新的滚动价差 z-score）不依赖任何引擎，时序策略也可直接在 `OnBar` 中使用：把两个品种的对数价格喂给 `RollingSpread.Observe`，再把 `Z` 交给 `BandTrader.Step`，用返回的 -1/0/+1 决定 `EnterReq`/`ExitReq`。
@@ -216,7 +221,7 @@ outputs:
   band_width: 'ts.bbands_upper(kline.close,20,2,2)-ts.bbands_lower(kline.close,20,2,2)'
 ```
 
-新增 18 类指标、22 个标量函数全部支持 Batch 与 Session。完整列表、参数、公式及预热长度见[常见技术指标](https://github.com/banbox/banbot/blob/v0.6.0-beta.7/doc/factor_indicators.md)和[API](../api/factor.md#常见技术指标)。周期按完整有效元组计数，缺字段或 NULL 保留原始无效原因并暂停本指标状态。`ts.roc` 使用百分比单位，`ts.return` 使用比例；历史分块保持同一个 Session，混合源周期使用显式 asof binding。
+新增 18 类指标、22 个标量函数全部支持 Batch 与 Session。完整列表、参数、公式及预热长度见[常见技术指标](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md)和[API](../api/factor.md#常见技术指标)。周期按完整有效元组计数，缺字段或 NULL 保留原始无效原因并暂停本指标状态。`ts.roc` 使用百分比单位，`ts.return` 使用比例；历史分块保持同一个 Session，混合源周期使用显式 asof binding。
 
 ## 稳健表达式与研究扩展
 
@@ -301,25 +306,33 @@ run_policy:
 
 ## 实盘接入
 
-verified-session 是用户工厂的示例注册名，不是内置 provider。先注册 entry.RegisterFactorLiveBinding("verified-session", factory)，factory 必须实现真实会话验证；省略 provider 或 banexg 走内置适配，缺能力仍拒绝启动。
+默认 `trade`（`env: prod` 或 `dry_run`）通过本机 Hub 执行；`execution.live_provider` 省略、`banexg` 或 `hub` 都选择 Hub。先启动 `./bot hub --datadir /ban/data --config hub.yml`，再运行 `./bot trade --datadir /ban/data --config live.yml`。Hub 不可用会报错，不会回退本地发送。共享账户配置、持久化和重启步骤见[共享账户与 Hub](./execution.md)。
 
-provider 选择顺序为显式 CLI 参数、`accounts.<账户名>.live_provider`、`execution.live_provider`、内置默认。账户覆盖直接放在根 `accounts`，可为不同账户选择各自已注册的 binding；启动在打开会话前验证所有 provider。
+provider 选择顺序为 `--live-provider`、`accounts.<账户名>.live_provider`、`execution.live_provider`、默认 Hub。自定义进程内 provider 仅供显式生产嵌入：先用 `entry.RegisterFactorLiveBinding("verified-session", factory)` 注册，工厂提供会话 transport、标准元数据、publication/revision、funding 与账户证据。`verified-session` 只是示例名。同一机器人不能混用 Hub 和进程内 provider；`env: dry_run` 禁止进程内真实执行适配器。
 
-真实实盘配置移除 archive，使用 `execution.live_provider: verified-session`，以 `./bot trade --config live.yml` 启动。嵌入程序必须通过 `entry.RegisterFactorLiveBinding` 接入当前会话已验证的 banexg transport、标准 symbol metadata、publication/revision 映射和 funding-policy 验证。
+移除历史 `archive` 输入，为每个 SID 配置与市场一致的 instrument 单位、风险限额和资金费政策。当前默认路径限线性永续；生产资金费要求 `required-stream` 及权威现金/结算证据，实时模拟显式使用 `explicit-zero`。预算来自已对账账户，`InitialNAV` 不向真实账户充值。已有现金和仓位须明确归属；不能靠改 `env` 或 provider 名获得真实交易能力。**当前文档不代表真实交易所端到端生产验收已完成。**
 
-**当前普通 banexg 会话缺少完整 verified binding 时会明确拒绝启动，不能仅凭 YAML 获得真实截面交易能力，也不会降级为 paper。本文没有宣称真实交易所端到端已验收。** 干运行使用独立的 `trade --dry-run` 历史 paper 回放，不是 verified live 的自动替代。
+启动编译数据需求，预热历史并安装当前订阅，对账后才接纳策略执行。轮次使用闭合且当时可见的记录；外部数据源驱动 `Observe` 与 `Flush`/`FlushAt`，计算器没有独立行情定时器。候选代失败保留原代，停止时先 Stop 再 Join。全部 history 合成方法当前被 live 拒绝，使用 equal 或 fixed；source-event 决策、期权到期和终止结算回放能力不能直接用于 live。
 
-启动先编译数据需求与决策计划，安装历史 warmup 和当前源订阅，对账账户后提交代际。轮次只接受闭合/当轮可见记录；barrier 达成或超时后 Flush，缺失数据按节点政策处理。候选代失败保留原代，取消时先 Stop 再 Join，等待回调/计算完成才释放共享资源。
-
-预算来自对账后的账户，InitialNAV 不向真实账户充值。已有现金/仓位需要 ledger 归属和启动对账。required-stream 实盘记录包含精确十进制字符串 `mark`、`rate`、`account_amount` 和稳定 `settlement_id`；重复结算幂等，迟到且跨持仓变更的结算需要历史对账。`explicit-zero` 需要会话确证没有 funding 义务。
+`required-stream` 的实盘记录包含精确十进制字符串 `mark`、`rate`、`account_amount` 和稳定 `settlement_id`。重复结算幂等，跨持仓变更的迟到结算需要历史对账。`trade --dry-run` 仍是历史 paper 回放，与上述实时模拟不同。
 
 ## 读取结果与排障
 
 因子引擎输出 JSON lines：panel、decision、成熟 diagnostics 和最终标量 summary。普通回测另写 resolved.json（最终默认值和配置来源）、account-&lt;account&gt;/manifest.json 与版本化 event/posting Gob 块。成功必须在输出 sync/close 与资源 cleanup 之后判定，失败保留主错误和清理错误。
 
+### 统计套利与多空归因结果
+
+先检查 `run.json` 的完成状态，再看 `Results[]`；同一结果也出现在 `run-completed` 事件中，字段使用 Go 名称（首字母大写）。`Result.Pairs` 仅由 `RegisterPairs` 的历史回放汇总，包含各对的 PnL、Trades、WinRate、持仓长度、Turnover 和 Episodes。Episodes 有截断上限，完整次数看 `EpisodeCount`；出场原因包含 `exit`、`stop`、`maxhold`、`leg_missing` 和 `end`。`Unavailable`/`UnavailableLeg` 标明整次跳过的配对；`AllPairsUnavailable` 为真表示没有可运行配对，不能把平直净值当作有效策略表现。
+
+逐对 `PnL` 是基于决策价与各对目标权重的收益比例，未分摊成本，不等于成交盈亏。`PairsGrossPnL` 为各对合计，`PairsNAVReturn` 为账本收益率，`PairsResidual = PairsNAVReturn - PairsGrossPnL` 包含成本和延迟、权重漂移、共享品种净额成交的近似差异。
+
+`Result.Attribution` 仅在 weights 账本提供多/空腿价格盈亏、平均敞口、费用、滑点、资金费、PIT 成本与至多 20 个 `TopSymbols`。它不在 events/live 输出，也不是独立逐批成交报告。weights 的近似 `funding_apr` 以账户净多头名义额计费，净空头不收取也不获得资金费；资金费只记账户 `Funding`，不摊入 `TopSymbols[].Net`。
+
+大池研究可在因子策略下设置 `research: {panel: none}`，省去逐品种逐列 panel 行；决策事件、summary 和账本数值保持不变。
+
 大型模拟可用 `execution.history: cold/history.sqlite` 归档已结算记录；必须新路径，不是恢复快照，真实 trade 和 durable store 不接受。小回测默认 MemoryStore；page_bytes 限制解码逻辑载荷，不是进程 RSS 上限。
 
-遇到启动失败先检查引擎选择、单周期、定义注册、Universe/SID/schema、价格周期、funding 政策和账户单位。预检本身不创建交易所、存储、账户或输出目录。`bot tool bt_factor` 仍是 orders.gob 的旧滚动筛选工具，不是新 factor runner。
+遇到启动失败先检查引擎选择、单周期、定义注册、Universe/SID/schema、价格周期、funding 政策和账户单位。预检本身不创建交易所、存储、账户或输出目录。`bot tool bt-factor` 仍是 orders.gob 的旧滚动筛选工具，不是新 factor runner。
 
 继续阅读：[配置](./configuration.md)、[回测](./backtest.md)、[实盘](./live_trading.md)、[自定义数据](./custom_data.md)。
 

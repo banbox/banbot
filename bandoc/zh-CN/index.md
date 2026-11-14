@@ -17,15 +17,15 @@ hero:
 
 features:
   - title: 高性能
-    details: 采用支持状态缓存的指标库，1秒轻松回测1年的数据
+    details: Go 与 banta 状态缓存指标库；耗时取决于策略、数据和品种规模
   - title: 更易用
     details: 一个版本的策略，同时支持回测、模拟实时交易和实盘
-  - title: 更灵活
-    details: 自由组合不同的品种、策略和时间周期
+  - title: 双策略引擎
+    details: 时序策略、多因子截面、配对统计套利与混合 events 回放
   - title: 规模化
     details: 可将一批策略同时应用到多个交易所账户
-  - title: LLM集成
-    details: 内置大模型调用与管理能力，支持多模型故障转移与并发控制
+  - title: 任意时序数据
+    details: 统一读取 K 线、自定义字段与第三方序列，保留字段类型和 NULL
   - title: 超参数调优
     details: 支持bayes/tpe/random/cmaes/ipop-cmaes/bipop-cmaes
 ---

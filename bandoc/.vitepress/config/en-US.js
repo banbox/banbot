@@ -28,6 +28,8 @@ export default defineConfig({
                         { text: 'Backtesting', link: '/en-US/guide/backtest' },
                         { text: 'Symbol Manager', link: '/en-US/guide/pair_filters' },
                         { text: 'Live Trading', link: '/en-US/guide/live_trading' },
+                        { text: 'Shared accounts and Hub', link: '/en-US/guide/execution' },
+                        { text: 'Notifications', link: '/en-US/guide/notifications' },
                         { text: 'Q & A', link: '/en-US/guide/faq' }
                     ]
                 },{
@@ -39,13 +41,6 @@ export default defineConfig({
                         { text: 'Hyperparameter optimization', link: '/en-US/guide/hyperopt' },
                         { text: 'Rolling optimization backtesting', link: '/en-US/guide/roll_btopt' },
                         {text: 'AI', link: '/en-US/advanced/ai'}
-                    ]
-                },{
-                    text: 'DeepWiki',
-                    items: [
-                        {text: 'banbot', link: 'https://deepwiki.com/banbox/banbot'},
-                        {text: 'banexg', link: 'https://deepwiki.com/banbox/banexg'},
-                        {text: 'banta', link: 'https://deepwiki.com/banbox/banta'},
                     ]
                 }
             ],

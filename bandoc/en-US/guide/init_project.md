@@ -39,7 +39,10 @@ func init() {
 func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	return &strat.TradeStrat{
 		WarmupNum: 100,
-		OnBar: func(s *strat.StratJob) {
+		OnData: func(s *strat.StratJob, event strat.DataEvent) {
+			if !event.IsMain() {
+				return
+			}
 			e := s.Env
 			ma5 := ta.SMA(e.Close, 5)
 			ma20 := ta.SMA(e.Close, 20)
@@ -72,3 +75,17 @@ To maintain the maintainability of various strategies, we recommend placing simi
 
 When backtesting, banbot will automatically back up the strategy source code for this backtest, making it easier to trace the effects of different versions of strategies.
 :::
+
+## Build and run
+
+The current source requires Go 1.26.0 and declares toolchain Go 1.26.8. After creating the files, run:
+
+```shell
+go mod tidy
+go build -o bot
+./bot init --datadir /path/to/bandata
+```
+
+In the generated `config.local.yml`, set `run_policy` to `name: ma:demo`, `engine: time_series` and `run_timeframes: [15m]`. Configure the wallet, symbols and backtest range, then run `./bot backtest --datadir /path/to/bandata`. On Windows, compile with `go build -o bot.exe` and replace `./bot` with `.\bot.exe` in PowerShell.
+
+`OnData` receives main, auxiliary and custom-series events; this example handles only main events. Do not also set `OnBar` or `OnInfoBar`. `OpenOrder`/`CloseOrders` enqueue requests for the order manager; success does not mean a fill. See [Custom strategy](./strat_custom.md) for subscriptions and error handling.

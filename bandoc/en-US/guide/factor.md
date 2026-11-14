@@ -19,7 +19,7 @@ All input travels through `orm.DataSeries.Values map[string]any`, retaining cust
 
 Use root `research --config strategy.yml` for factor diagnostics, `data archive --input records.jsonl --out chunk.gob` for version archives, and root `validate --spec formula.yml` / `explain --spec formula.yml` for standalone expressions. Strategy configuration uses unified YAML only.
 
-For factor or mixed configurations, `trade --dry-run` selects historical `events` replay, not live paper trading. Time-series-only live simulation continues to use YAML `env: dry_run`; do not use the historical replay flag for that workflow. Real factor or mixed trading accepts `--live-provider` and requires a verified current-session binding. Strategy configuration uses YAML `run_policy`.
+For factor or mixed configurations, `trade --dry-run` selects historical `events` replay, not live paper trading. Live simulation for all engines uses YAML `env: dry_run`, a durable Hub paper account and `funding_policy: explicit-zero`. `--live-provider` overrides execution only for `trade` configurations containing factors; time-series-only configurations select it through YAML. See [Shared accounts and Hub](./execution.md).
 
 Each task owns its explicit `runtime.Runtime`, configuration snapshot, clock, strategy state and cancellation context. Runtime isolation does not create an independent exchange balance: strategies intentionally bound to the same account share its execution coordinator and retain strategy-level attribution and capital budgets. Independent tasks should use distinct account/resource identities when they must not share execution. Cancellation stops intake, then joins in-flight callbacks and computation before releasing resources; releasing one consumer preserves other active borrowers.
 
@@ -114,7 +114,7 @@ Multi-horizon, robust neutralization, model and risk builders are documented in 
 
 ## Writing strategies in Go: three entry points
 
-Pick the engine first. All three share the same YAML and `DataSeries.Values`; they differ in how a signal becomes a position:
+Place registration functions in a Go package imported by your project, then rebuild the robot. Import `github.com/banbox/banbot/factor`, `factor/runner` and `factor/statistics` as needed (the latter two share the banbot module prefix). Pick the engine first. All three share the same YAML and `DataSeries.Values`; they differ in how a signal becomes a position:
 
 | Need | Engine | Entry point |
 | --- | --- | --- |
@@ -127,12 +127,14 @@ Pick the engine first. All three share the same YAML and `DataSeries.Values`; th
 
 ```go
 func init() {
-	runner.RegisterFactor("my-mom", func(c runner.FactorContext) (runner.FactorSpec, error) {
+	if err := runner.RegisterFactor("my-mom", func(c runner.FactorContext) (runner.FactorSpec, error) {
 		w := c.Params.Int("window", 24)
 		return runner.FactorSpec{Outputs: map[string]*factor.Node{
 			"mom": factor.ZScore(factor.Return(c.Close(), w)),
 		}}, c.Params.Err()
-	})
+	}); err != nil {
+		panic(err)
+	}
 }
 ```
 
@@ -147,7 +149,7 @@ run_policy:
 
 ```go
 func init() {
-	runner.RegisterPairs("eth-btc", func(p *runner.Params) (runner.PairsSpec, error) {
+	if err := runner.RegisterPairs("eth-btc", func(p *runner.Params) (runner.PairsSpec, error) {
 		return runner.PairsSpec{
 			Pairs:  []runner.Pair{{Y: "ETH/USDT:USDT", X: "BTC/USDT:USDT"}},
 			Window: p.Int("window", 120),
@@ -156,7 +158,9 @@ func init() {
 				Stop: p.Float("stop", 4), MaxHold: p.Int("maxHold", 0),
 			},
 		}, p.Err()
-	})
+	}); err != nil {
+		panic(err)
+	}
 }
 ```
 
@@ -167,10 +171,11 @@ run_policy:
 ```
 
 Behavior:
-- A rolling regression of `ln(Y) = α + β·ln(X)`; z = residual / residual std. `z ≤ -Entry` goes long the spread (buy Y, sell X), `z ≥ Entry` short, `|z| ≤ Exit` flat.
+
+- A rolling regression of `ln(Y) = α + β·ln(X)`; z = residual / residual std. `z ≤ -Entry` goes long the spread (buy Y, sell X when β is positive), `z ≥ Entry` short, `|z| ≤ Exit` flat.
 - Optional `Stop` closes at `|z| ≥ Stop` and blocks re-entry until z is back inside `Exit`; `MaxHold` behaves the same. `LongOnly`/`ShortOnly` restrict direction.
 - β is frozen at entry while a pair is open (no churn from β drift) and refreshed on the next entry. One pair's gross is `Gross` (default `1/pairs`) of strategy NAV: Y leg `s·G/(1+|β|)`, X leg `-s·G·β/(1+|β|)`.
-- Both symbols must be in the run's universe and tradable set, otherwise construction fails. Each run owns its own windows and state machines; with an incomplete window or missing input the previous target is kept and nothing trades.
+- Both legs of an actively traded pair must be in the run's universe and tradable set. Each run owns its windows and state machines. An incomplete window produces no new signal. If an open pair loses either leg, it requests a close and pauses; it can reopen when data returns. A leg with no data throughout the backtest window, explicitly marked unavailable by the engine, skips that pair for the entire run without increasing other pairs' budgets. If all pairs are unavailable, equity stays at its initial value with zero trades. Undeclared or disallowed legs still fail.
 - The strategy binds its own portfolio builder, so YAML needs only `name`; an explicit `portfolio.builder` still wins.
 
 `statistics.BandTrader` (hysteresis state machine) and `statistics.RollingSpread` (O(1) rolling spread z-score) are engine independent. A time-series strategy can use them in `OnBar`: feed both log prices to `RollingSpread.Observe`, pass `Z` to `BandTrader.Step`, and map the returned -1/0/+1 to `EnterReq`/`ExitReq`.
@@ -216,7 +221,7 @@ outputs:
   band_width: 'ts.bbands_upper(kline.close,20,2,2)-ts.bbands_lower(kline.close,20,2,2)'
 ```
 
-The [API table](../api/factor.md#technical-indicators) lists 22 new functions across 18 indicator families. They support batch and incremental execution. Periods count complete valid input tuples; missing or NULL fields preserve their validity and pause indicator state. `ts.roc` uses percentage units; `ts.return` uses fractional units. Reuse one Session across historical chunks, and use explicit asof bindings for mixed source timeframes. The [indicator guide](https://github.com/banbox/banbot/blob/v0.6.0-beta.7/doc/factor_indicators.md) gives lookback, retention and edge-case rules.
+The [API table](../api/factor.md#technical-indicators) lists 22 new functions across 18 indicator families. They support batch and incremental execution. Periods count complete valid input tuples; missing or NULL fields preserve their validity and pause indicator state. `ts.roc` uses percentage units; `ts.return` uses fractional units. Reuse one Session across historical chunks, and use explicit asof bindings for mixed source timeframes. The [indicator guide](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md) gives lookback, retention and edge-case rules.
 
 ## Robust expressions and research extensions
 
@@ -301,25 +306,33 @@ Replace YourRegisteredTS with a registered project strategy. Net execution retai
 
 ## Live integration and limits
 
-verified-session is an application example name, not a built-in provider. Register entry.RegisterFactorLiveBinding("verified-session", factory) with real session verification first. Empty/banexg selects the built-in adapter, which still fails on missing capabilities.
+Default `trade` in `env: prod` or `dry_run` executes through the local Hub. An omitted `execution.live_provider`, `banexg` or `hub` all select Hub. Start `./bot hub --datadir /ban/data --config hub.yml`, then `./bot trade --datadir /ban/data --config live.yml`. A missing Hub fails without a local-sender fallback. See [Shared accounts and Hub](./execution.md) for account configuration, persistence and restart steps.
 
-Provider precedence is explicit CLI selection, `accounts.<name>.live_provider`, `execution.live_provider`, then the built-in default. Keep account overrides in root `accounts`; each account can select its own registered binding. Startup validates every provider before opening sessions.
+Provider precedence is `--live-provider`, `accounts.<name>.live_provider`, `execution.live_provider`, then Hub. Custom in-process providers are explicit production embedding options: register `entry.RegisterFactorLiveBinding("verified-session", factory)` and supply session transport, canonical metadata, publication/revision, funding and account evidence. `verified-session` is only an example name. One robot cannot mix Hub and embedded providers; `env: dry_run` rejects embedded real-execution adapters.
 
-Remove archive input and select execution.live_provider: verified-session. Start with `./bot trade --config live.yml`. An embedding program registers entry.RegisterFactorLiveBinding using the current session's verified banexg transport, canonical symbol metadata, publication/revision mapping and funding-policy verification.
+Remove historical `archive` input and configure market-matching instrument units for every SID, risk limits and funding policy. The default path currently supports linear perpetuals. Production requires `required-stream` funding and authoritative cash/settlement evidence; live simulation requires `explicit-zero`. Budgets come from reconciled accounts; `InitialNAV` deposits no live funds. Existing cash and positions require explicit attribution. Changing `env` or a provider name cannot establish execution readiness. **This documentation does not establish completed end-to-end real-venue production acceptance.**
 
-**A stock session without this verified binding fails startup explicitly. YAML alone does not enable real factor trading; there is no automatic paper fallback. This guide does not claim end-to-end real-venue acceptance.** trade --dry-run is a separate historical paper replay.
+Startup compiles data requirements, warms history and installs current subscriptions; execution admission follows reconciliation. Rounds use closed, decision-visible records. An external source drives `Observe` and `Flush`/`FlushAt`; the calculator has no independent market timer. Failed candidates preserve the old generation; shutdown uses Stop then Join. Live rejects every history combination method; use equal or fixed. Source-event decisions, option expiry and terminal-settlement replay features do not establish live support.
 
-Startup compiles requirements/plans, prepares history warmup and current subscriptions, reconciles the account and commits the generation. Round barriers consume closed and locally visible records, then Flush after completion/timeout according to missing-data policies. A failed candidate preserves the old generation. Stop cancels intake; Join waits for callbacks/computation before shared services are released.
-
-Budgets come from reconciled account state; InitialNAV deposits no live funds. Existing cash/positions need ledger attribution and startup reconciliation. Required live funding records contain exact decimal strings mark, rate, account_amount and stable settlement_id. Duplicate settlements are idempotent; settlements arriving after position changes need historical reconciliation. explicit-zero requires verified absence of funding obligations.
+Required live funding records contain exact decimal strings `mark`, `rate`, `account_amount` and stable `settlement_id`. Duplicate settlements are idempotent; settlements arriving across position changes need historical reconciliation. `trade --dry-run` remains historical paper replay, distinct from live simulation.
 
 ## Results and troubleshooting
 
 Factor-engine runs stream panels, decisions, matured diagnostics and final scalar summaries as JSON lines. Ordinary backtests also write resolved.json with defaults/origins, account-&lt;account&gt;/manifest.json and versioned event/posting Gob chunks. Completion follows output sync/close and resource cleanup; primary and cleanup errors remain visible.
 
+### Statistical arbitrage and long and short attribution
+
+Check the completion status in `run.json` before reading `Results[]`. The same result appears in `run-completed` events, using capitalized Go field names. `Result.Pairs` is collected only by historical `RegisterPairs` runs and includes each pair's PnL, Trades, WinRate, holding duration, Turnover and Episodes. Episodes are capped; `EpisodeCount` retains the full count. Exit reasons include `exit`, `stop`, `maxhold`, `leg_missing` and `end`. `Unavailable`/`UnavailableLeg` identify pairs skipped for the whole run. `AllPairsUnavailable` means no pair could run; a flat NAV is not evidence of strategy performance.
+
+Pair `PnL` is a return fraction based on decision prices and each pair's own target weights, without allocated costs. It is not fill PnL. `PairsGrossPnL` sums pair returns, `PairsNAVReturn` is the book return, and `PairsResidual = PairsNAVReturn - PairsGrossPnL` includes costs and approximations from delay, weight drift and netting shared symbols.
+
+`Result.Attribution` is available only with the weights book: long/short price PnL, average exposure, fees, slippage, funding, PIT costs and up to 20 `TopSymbols`. Events/live do not output it, and it is not a per-batch fill report. The weights `funding_apr` approximation charges account net-long notional; net shorts neither pay nor receive funding. Funding is account-level `Funding`, excluded from `TopSymbols[].Net`.
+
+For large research pools set `research: {panel: none}` on the factor policy to omit per-symbol/column panel rows. Decision events, summaries and book values remain unchanged.
+
 execution.history: cold/history.sqlite optionally archives settled simulated history. The path must be new; it is not a resume snapshot and is refused for real trade/durable execution. Small replays default to MemoryStore. page_bytes bounds decoded logical payload rather than process RSS.
 
-Check version, single timeframe, registered definition, Universe/SID/schema, price timeframe, funding and account units when startup fails. Preflight creates no exchange, storage, account or output directory. bot tool bt_factor is the legacy orders.gob rolling-selection tool, separate from the factor runner.
+Check version, single timeframe, registered definition, Universe/SID/schema, price timeframe, funding and account units when startup fails. Preflight creates no exchange, storage, account or output directory. bot tool bt-factor is the legacy orders.gob rolling-selection tool, separate from the factor runner.
 
 See [Configuration](./configuration.md), [Backtesting](./backtest.md), [Live Trading](./live_trading.md) and [Custom Data](./custom_data.md).
 

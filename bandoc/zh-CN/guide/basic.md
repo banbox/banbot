@@ -95,82 +95,61 @@ pairs: [BTC/USDT, ETH/USDT, DASH/USDT]
 ```
 
 ## 主要组件
-回测和实盘交易的执行涉及方方面面，为使项目结构始终灵活清晰，banbot中主要涉及下面一些组件：
 
-* 爬虫进程(spider)：banbot使用单独的爬虫进程监听交易所的公共 K 线等数据，写入数据库，并通过TCP实时推送给多个监听的机器人，这允许banbot支持多个账户同时运行一组策略。
-* 数据提供器(DataProvider)：整合回测/实盘涉及的所有品种(每个品种对应一个Feeder，一个Feeder支持多个时间周期)，将收到的 K 线以统一的时序事件执行。第三方时序数据由注册的数据源回填和实时推送给策略，不经过 Spider。
-* 订单管理器(OrderMgr)：回测时对订单请求根据K线撮合成交；实盘时提交到交易所并监听成交进度实时更新。
-* 钱包(Wallets)：回测时根据订单成交模拟钱包的可用余额、冻结金额、未实现盈亏等；实盘时监听交易所账户钱包状态实时更新。
-* 交易所(Exchange)：基于banexg支持币安、欧易、bybit交易所的rest/websocket，用于下载K线、查询市场信息、订单处理、监听ws等。
-* 品种管理器(PairFilters)：支持基于所有品种，按给定的过滤器筛选并排序。也可使用硬编码的品种列表。
-* 消息通知(Notify)：在机器人开单、出现信号时发送通知，目前仅支持微信。
-* Rest Api：实盘交易时可启用rest api，然后通过web ui查看和管理机器人。
+| 组件 | 用户需要了解的行为 |
+| --- | --- |
+| Hub（`bot hub`，别名 `spider`） | 采集交易所公共行情、写库并通过 TCP 分发；还可通过本机 Unix socket 承载账户执行服务 |
+| 数据提供器 | 历史数据按时间回放，实时数据通过订阅送达；第三方序列使用注册的数据源 |
+| 策略 | `time_series` 按 Job 接收事件；`factor` 对多标的快照计算因子并生成目标持仓 |
+| 订单管理器 | 时序策略的开平仓请求先入队；回测本地撮合，实盘提交并跟踪成交 |
+| 共享账户执行 | 多个策略的逻辑仓位按归属与预算管理，合并为物理账户执行计划 |
+| 钱包 | 回测模拟可用余额、冻结和盈亏；实盘读取账户状态，并受执行与对账约束 |
+| 品种管理器 | 使用显式 `pairs` 或过滤器流水线生成和更新品种池 |
+| 通知与界面 | 企业微信、Telegram、邮件；开发 WebUI 和实盘 Dashboard 是两个不同入口 |
 
-## 关键约定
-**策略任务(StratJob)**\
+## 两种策略引擎
 
-某个品种+某个策略+某个多空(both/long/short)+任意时间周期，只允许存在一个策略任务。\
+`run_policy.engine` 省略时为 `time_series`。同一个 YAML 可以包含时序和因子策略；混合运行使用 events 执行路径。
 
-以一个简单均线策略`ma:demo`为例，可设置支持从`yml`配置传入长短周期参数：
+时序策略通过 `strat.AddStratGroup` 注册，再由 `run_policy.name` 引用。每个账户下的策略、品种与所选周期形成 `StratJob`。`run_timeframes` 是候选周期列表，由质量评分或 `PickTimeFrame` 选出周期，不表示自动对列表内每个周期都创建 Job；需要辅助周期时应声明订阅。
+
 ```yaml
 run_policy:
   - name: ma:demo
-    run_timeframes: [5m]
-    dirt: long
-    params: {smlLen: 5, bigLen: 20}
-    pairs: [BTC/USDT, ETH/USDT]
-  - name: ma:demo
-    run_timeframes: [5m, 15m]
-    dirt: short
-    params: {smlLen: 7, bigLen: 30}
-    pairs: [BTC/USDT, ETH/USDT]
-  - name: ma:demo
+    engine: time_series
     run_timeframes: [15m]
     dirt: long
-    params: {smlLen: 4, bigLen: 15}
-    pairs: [BCH/USDT, ETC/USDT, BTC/USDT]
-  - name: ma:demo
-    run_timeframes: [5m]
-    dirt: long
-    params: {smlLen: 5, bigLen: 20}
-    pairs: [BCH/USDT, ETC/USDT]
+    pairs: [BTC/USDT, ETH/USDT]
 ```
-如上配置了四组策略任务，全部使用`ma:demo`策略，每组都只能生成2个有效的策略任务(StratJob)，共计8个策略任务。
 
-第二组提供了`[5m 15m]`两个时间周期，则会计算每个时间周期的K线质量分数，选择符合分数的最小周期。
+`ma:demo` 必须在策略项目中注册。`dirt` 可为 `long`、`short`、`any`，省略时允许双向，但现货不允许开空。策略同时运行的订单数还受钱包、账户与策略限制。
 
-第三组配置的`BTC/USDT`和第一组中重合了，会被忽略。\
+因子引擎按决策轮次冻结 Universe 和当前可见数据，区分 reference、investable、tradable 等集合，再计算因子和目标持仓；它不为每个标的调用时序 `OnBar`。配对统计套利使用因子/组合策略能力。详见[多因子与截面](./factor.md)。
 
-注意：dirt参数忽略时，默认允许多空双开
+## 时序数据与回调
 
-## 回测时执行逻辑
-* 加载配置，初始化：数据库会话、交易所、数据提供器、订单管理器、钱包、标的管理器等
-* 根据标的管理器筛选此次要交易的品种列表
-* 加载策略列表，结合品种列表、时间周期生成策略任务列表
-* 从数据提供器订阅相关的品种及其时间周期K线
-* 调用数据提供器的LoopMain按时间循环K线，对每个K线重复执行下面逻辑：
-  * 检查是否需要触发批量入场回调(K线时间戳增加时触发)
-  * 更新指标计算环境
-  * 订单管理器根据K线更新订单（触发入场、止盈止损、计算利润等）
-  * 触发所有策略任务的`OnBar`,`OnCheckExit`,`GetDrawDownExitRate`,`OnInfoBar`方法，并收集入场/离场请求
-  * 提交订单入场/离场请求到订单管理器执行
-  * 检查是否需要刷新品种列表(回测时可设置每隔一段时间刷新，模拟实时交易)
+`orm.DataSeries.Values` 同时传递标准 K 线字段和任意扩展字段。自定义字段保留类型、缺失与显式 NULL；指标使用的数值视图不代替原始数据。
 
-## 实时交易执行逻辑
-* 加载配置，初始化：数据库会话、交易所、数据提供器、订单管理器、钱包、标的管理器、消息通知、Rest Api等
-* 根据标的管理器筛选此次要交易的品种列表
-* 加载策略列表，结合品种列表、时间周期生成策略任务列表
-* 数据提供器连接爬虫进程，订阅相关的品种及其时间周期K线
-* 启动后台任务：监听余额、监听个人订单、定时刷新交易对、定时更新市场信息、定时检查全局止损等
-* 调用数据提供器的LoopMain循环等待爬虫推送的K线，对每个K线重复执行下面逻辑：
-  * 更新指标计算环境
-  * 订单管理器根据K线更新订单利润
-  * 触发所有策略任务的`OnBar`,`OnCheckExit`,`GetDrawDownExitRate`,`OnInfoBar`方法，并收集入场/离场请求
-  * 提交订单入场/离场请求到订单管理器执行
-  * 推迟3s执行批量入场/离场（如3s内收到新品种K线，则取消执行再推迟3s）
+新策略可使用 `OnData(s, event)`，按 `event.IsMain()` 或角色区分主周期、辅助周期和自定义序列。兼容回调 `OnBar`/`OnInfoBar` 仍保留，但不能和 `OnData` 同时设置。预热阶段可计算指标，不提交交易。详见[自定义策略](./strat_custom.md)和[自定义数据](./custom_data.md)。
 
-## 多因子与截面引擎
+## 从数据到订单
 
-决策周期不等于单个品种 OnBar：因子轮次使用已闭合且当前可见的多标的数据，区分 reference/investable/tradable。原始输入保留 DataSeries.Values 任意字段及 NULL，不由数值视图替代。
+1. 加载并合并配置，选择引擎、品种和周期，为本次任务创建独立 Runtime。
+2. 订阅数据并预热；回测按历史时间推进，实盘等待实时事件。
+3. 主周期事件更新指标环境与数据视图，调用策略，再检查自定义退出并处理订单请求；辅助和自定义事件按订阅路由。
+4. `OpenOrder`/`CloseOrders` 产生意图，订单管理器负责撮合或提交；`OnOrderChange` 用于跟踪订单变化。共享账户路径还会合并策略目标并保存执行账本。
+5. 更新钱包、报告、通知和监控；停止时按当前任务释放订阅及资源。
 
-参见[多因子与截面指南](./factor.md)和[因子 API](../api/factor.md)。
+批量策略通过 `BatchInOut`/`BatchInfo` 和批回调处理同轮多个任务。回测与实盘批次就绪条件不同，不应假设任意事件到达时就已收齐全部标的数据。
+
+## 选择运行方式
+
+| 目的 | 入口与含义 |
+| --- | --- |
+| 历史验证 | `bot backtest`；因子支持 weights/events，混合要求 events |
+| 优化时序策略参数 | `bot optimize` 或 `bot bt-opt` |
+| 时序实时模拟 | `env: dry_run` 配合 `bot trade`，消费实时行情、本地撮合 |
+| 因子/混合历史 events 模拟 | `bot trade --dry-run`，不是实时模拟盘 |
+| 真实交易 | `bot trade`；配置账户、数据与执行依赖，按引擎完成启动校验 |
+
+默认实时入口通过 Hub 执行，当前只接受 `prod`/`dry_run` 线性永续账户。详细约束和恢复步骤见[共享账户与 Hub](./execution.md)。参见[命令行](./bot_usage.md)、[回测](./backtest.md)和[实时交易](./live_trading.md)。

@@ -166,20 +166,12 @@ Parameters:
 - `text string` - String to split
 - `sep string` - Separator
 
+- `unique bool` - Remove duplicates when true
+
 Returns:
 - `[]string` - Array of non-empty strings after splitting
 
 ## Slice and Map Operations
-
-### SplitSolid
-String splitting, ignoring empty strings in the result.
-
-Parameters:
-- `text string` - String to split
-- `sep string` - Separator
-
-Returns:
-- `[]string` - Array of strings after splitting
 
 ### KeysOfMap
 Get all keys of a map.
@@ -273,14 +265,12 @@ Parameters:
 - `src map[string]interface{}` - Source map
 
 ### MapToStr
-Convert a map to string representation.
 
-Parameters:
-- `m map[string]float64` - Map to convert
+```go
+func MapToStr[T any](m map[string]T, value bool, precFlt int) string
+```
 
-Returns:
-- `string` - Converted string
-- `int` - Total length of numeric parts
+formats a map sorted by key. value=false prints keys only; true includes values. precFlt controls float precision; a negative value uses the shortest round-trippable representation. There is only one return value.
 
 ## Network Operations
 
@@ -301,7 +291,7 @@ Create a new BanServer instance for TCP network communication.
 
 Parameters:
 - `addr string` - Server listening address (e.g., "127.0.0.1:6789")
-- `name string` - Server name
+- `aesKey string` - Transport AES key; empty disables encryption
 
 Returns:
 - `*ServerIO` - Server instance
@@ -311,6 +301,8 @@ Create a new BanClient instance to connect to BanServer.
 
 Parameters:
 - `addr string` - Server address (e.g., "127.0.0.1:6789")
+
+- `aesKey string` - Must match the server; empty disables encryption
 
 Returns:
 - `*ClientIO` - Client instance
@@ -624,15 +616,6 @@ Returns:
 - `[]byte` - Converted byte array
 - `error` - Error during conversion
 
-### MD5
-Calculate MD5 hash of data.
-
-Parameters:
-- `data []byte` - Data to hash
-
-Returns:
-- `string` - Hexadecimal string of MD5 hash
-
 ### ReadInput
 Read user input from standard input.
 
@@ -675,25 +658,12 @@ Parameters:
 Returns:
 - `*StagedPrg` - Multi-stage progress bar object
 
-## System-Related Functions
-
-### GetSystemLanguage
-Get current system language code.
-
-Returns:
-- `string` - ISO 639-1 language code (optionally with ISO 3166-1 country code), such as:
-  - en-US: English (United States)
-  - zh-CN: Chinese (Simplified)
-  - zh-TW: Chinese (Traditional)
-  - ja-JP: Japanese
-  - ko-KR: Korean
-  - fr-FR: French
-  - de-DE: German
-  - es-ES: Spanish
-  etc.
-
-
-
 ## Utility ownership corrections
 
 CountDigit(text string) int and GroupByPairQuotes(items map[string][]string, doSort bool) string belong to core. ReadLastNLines is no longer a public utils API; use actual exported file helpers.
+
+## Strategy calculation notes
+
+`CalcCorrMat(arrLen, dataArr, useChgRate)` requires a window length and at least two series. Short series are padded with leading zeros; check history length first to avoid distorted correlations. Auxiliary batch calculations should read `JobEnv.Env`, rather than the main `Job.Env`.
+
+`SharpeRatio`/`SortinoRatio` default to periods=252 and annualization; inputs are per-period simple returns and an annual risk-free rate. For other sampling frequencies use `SharpeRatioBy`/`SortinoRatioBy(returns, riskFree, periods, annualize)`.

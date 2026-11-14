@@ -1,15 +1,21 @@
-You may want to use AI tools such as machine learning/deep learning during trading, and banbot provides grpc support for this.
+# AI and external models
 
-The common process of combining AI is as follows:
-1. Define the features on the golang side and start banbot to provide grpc services through `data_server`
-2. Request feature data on the python side and save it as training/test data.
-3. Train ML/DL and other models on the python side.
-4. Deploy the model on the python side to provide grpc prediction services.
-5. Implement the trading strategy on the golang side, prepare the feature request model to obtain the prediction results for trading decisions.
+## ML/DL through gRPC
 
-banbot has provided a complete golang side [code example](https://github.com/banbox/banstrats/tree/main/rpc_ai) for the above process.
+Banbot exposes a gRPC data service:
 
-## LLM API Integration
-In addition to traditional ML/DL workflows, banbot also has built-in LLM integration capabilities, allowing you to call large language model APIs in strategies or tools for tasks such as text analysis, report generation, and other auxiliary work.
+```shell
+bot tool data-server --config strategy.yml
+```
 
-The LLM module provides unified model configuration and management capabilities (multi-model failover, concurrency control, statistics tracking, automatic disabling, etc.), making it easy to use stably in live trading environments.
+Define features in the Go strategy project, fetch them from a Python or other client and train a model. Deploy a prediction service, then have the Go strategy prepare features, call the model and generate trading intents. Your application supplies features, training, model serving and trading logic. See the example strategy project's `rpc_ai` directory for a reference.
+
+Keep field definitions, warmup, missing values and data availability rules consistent between historical training and online inference. See [Custom time-series data](../guide/custom_data.md).
+
+## LLM management library
+
+The `llm` package provides configuration inheritance, environment substitution, concurrency limits, timeouts, statistics and model fallback. Model settings live under `llm_models`; see [Configuration](../guide/configuration.md).
+
+Ordinary backtest and live entry points do not automatically call LLMs. Adding configuration alone does not create predictions or trading signals. A strategy application or tool must call `llm.NewLLMManager(configProvider, getModels)` and then `manager.Call(ctx, systemPrompt, userPrompt, options)`. `*config.Config` implements model configuration access; the caller supplies model ordering.
+
+The model cache is process-wide and does not fully isolate same-name model configurations across tasks. External requests have latency and may fail. The caller controls timeouts, retries and delivery of results to strategies; do not assume external model responses repeat identically in a backtest rerun.

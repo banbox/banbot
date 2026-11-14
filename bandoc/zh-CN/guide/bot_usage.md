@@ -1,363 +1,83 @@
-编写好策略后，您可以将策略和banbot打包为单个可执行文件（注意需在策略项目根目录下执行）：
+# 使用 bot 命令
 
-```shell
-# for linux/macos
-go build -o bot
+在策略项目根目录执行 `go build -o bot`（Windows 使用 `go build -o bot.exe`），将已注册策略与 BanBot 编译为同一可执行文件。下文 `bot` 表示该文件；当前目录运行时使用 `./bot`。
 
-# for windows
-go build -o bot.exe
+```bash
+bot --help
+bot backtest --help
+bot tool --help
 ```
 
-然后您可将此可执行文件直接用于启动UI、回测、超参数优化、实盘交易等！
+命令采用连字符，如 `bt-opt`、`collect-opt`。部分旧下划线命令仍作为兼容别名；新脚本使用本页规范名称和 `--flag` 双横线长参数。参数由各子命令声明，不能把一个子命令的参数直接用于另一个。
 
-您直接执行`bot`将启动WebUI界面，您可访问`http://localhost:8000`进行策略管理、回测、分析交易等。
+## 配置与公共参数
 
-使用 `bot --help` 查看当前版本的命令组；常用根命令包括 `trade`、`backtest`、`spider`、`optimize`、`bt-opt`、`web` 和 `init`，数据工具位于 `data`、`kline`、`tick`、`tool`、`live` 命令组中。旧的下划线命令名仍作为别名可用。
+配置型命令通常先读数据目录中的 `config.yml`、`config.local.yml`，再读重复的 `--config` 和内联 `--config-data`，最后应用显式 CLI 覆盖。`--datadir` 优先于环境变量 `BanDataDir`。默认文件不存在时跳过；`--no-default` 禁用默认文件。仅加载显式文件可不设数据目录，但实际存储和输出仍可能需要它。详见[配置指南](./configuration.md)。
 
-## 通用命令参数
-
-**数据目录(-datadir)**
-
-您通过命令行启动时，除非设置了环境变量`BanDataDir`，否则每次启动时，都务必传入参数`-datadir`指定数据目录。
-
-**默认配置文件**
-
-在读取您传入的额外的配置文件前，banbot会从数据目录下，尝试读取两个默认配置文件：`config.yml`和`config.local.yml`。
-如果这两个里面已经覆盖了您本次所需的参数，则不需要再通过`-config`额外传入配置文件路径。
-
-**命令帮助信息**
-
-您可以通过在命令后面添加 `--help` 或 `-h` 参数显示帮助信息。
-
-所有配置型命令都支持 `--datadir`、重复的 `--config`、`--no-default`、`--config-data`、`--logfile`、`--level` 和 `--max-pool-size`。`--dlock` 用于启用死锁检测；`--cpu-profile`、`--mem-profile` 和 `--net-off` 为运行诊断选项。各子命令仅接受其声明的额外参数，请以 `bot <command> --help` 的输出为准。旧的单横线长参数仍兼容。
-
-## 启动WebUI研究&amp;回测
-
-为方便您的策略研究和回测，我们提供了WebUI可视化。您可通过WebUI在线编辑策略、开始回测、查看盈亏曲线、分析订单等。
-
-这是仅针对策略研究阶段的WebUI，默认只允许您本地计算机访问，故无需鉴权即可访问，如需外网访问，请设置`-host 0.0.0.0`。
-
-如果您需要在banbot实时交易时访问Dashboard UI，请参考[实时交易](#启动实时交易模拟交易实盘)。
-
-Web UI 使用独立的开发服务器参数；执行 `bot web -help` 查看当前的监听地址、端口和资源路径选项。
-
-```text
-Usage of web:
-  -config value
-        config path to use, Multiple -config options may be used
-  -config-data string
-        yaml config string
-  -datadir string
-        Path to data dir.
-  -host string
-        bind host ip (default "127.0.0.1")
-  -level string
-        log level (default "info")
-  -logfile string
-        log file path, default: system temp dir
-  -password string
-        password required to access WebUI
-  -port int
-        port to listen (default 8000)
-  -tz string
-        timezone
+```bash
+bot backtest --datadir /path/to/data --config experiment.yml
+bot backtest --datadir /path/to/data --no-default --config experiment.yml
 ```
 
-## 启动爬虫进程
+常见参数为 `--logfile`、`--level`、`--max-pool-size`；诊断参数包括 `--cpu-profile`、`--mem-profile`、`--net-off`。支持的命令还提供 `--dlock`。`--net-off` 不等于数据覆盖校验，也不补齐缺失历史数据。
 
-```shell
-bot spider [-datadir PATH] [-config PATH]
+## 开发 WebUI 与 Hub
+
+```bash
+bot web --datadir /path/to/data
+bot hub --datadir /path/to/data
 ```
 
-当您要启动实时交易时，需要先启动爬虫进程。爬虫进程默认监听`6789`端口，只接受本地的请求。您可以将yml配置`spider_addr`改为`0.0.0.0:6789`，以便接受来自外部的监听请求。
+直接执行 `bot` 也会启动开发 WebUI，默认地址为 `http://127.0.0.1:8000`。开发 Web 使用自己的 `--host`、`--port`、`--password`、`--tz` 参数；它与交易时 `api_server` 配置的 Dashboard 不同。
 
-爬虫进程启动后，默认不监听任何交易所、市场、品种。它会根据收到的客户端请求，自动连接到指定交易所，市场，并监听需要的信息。
+`hub`（兼容别名 `spider`）提供公共行情和本地账户执行服务。公共行情地址由 `spider_addr` 控制，默认 `127.0.0.1:6789`；私有执行 socket 默认位于 `<datadir>/execution/hub.sock`，可用 `--execution-socket` 覆盖。Hub 只接受 `prod` / `dry_run` 环境；回测在进程内运行。配置公共行情监听地址不能代替私有账户授权。
 
-```text
-Usage of spider:
-  -config value
-        config path to use, Multiple -config options may be used
-  -config-data string
-        yaml config string
-  -cpu-profile
-        enable cpu profile
-  -datadir string
-        Path to data dir.
-  -level string
-        set logging level to debug (default "info")
-  -logfile string
-        Log to the file specified
-  -max-pool-size int
-        max pool size for db
-  -mem-profile
-        enable memory profile
-  -net-off
-        disable network request
-  -no-default
-        ignore default: config.yml, config.local.yml
+## 交易、回测与研究
+
+```bash
+bot trade --datadir /path/to/data
+bot backtest --datadir /path/to/data --out /path/to/report
+bot backtest --datadir /path/to/data --separate
+bot research --datadir /path/to/data --config factor.yml
 ```
 
-## 启动实时交易(模拟交易/实盘)
+`backtest` / `trade` 按 `run_policy[].engine` 分派时序、因子或混合策略。省略 `engine` 为旧时序语义；新配置建议明确声明。
 
-```shell
-bot trade [-spider] [-pairs PAIRS] ...
+时序、因子和混合策略的默认实时入口均使用共享 Hub。先启动 `hub`，再使用 `env: dry_run` 进行 Hub paper 实时模拟，或用 `env: prod` 生产交易。默认入口只接受线性永续、明确结算币及完整执行声明，不支持 `test`、现货或反向合约；适配器具有测试网络/现货能力不代表普通 `trade` 支持。`--spider` 不能替代私有执行 Hub，Hub 缺失会失败而不回退本地发送。完整配置、限制和恢复步骤见[共享账户与 Hub](./execution.md)。交易 Dashboard 另需 `api_server` 用户和账户角色，见[实盘指南](./live_trading.md)。
+
+因子回测的 `--mode weights|events` 覆盖根 `execution.mode`，都未设置时默认 `events`。混合回测只支持 `events`。因子/混合 `trade --dry-run` 是历史 events 回放；它不是时序实时模拟开关。真实因子/混合交易可使用 `--live-provider`，缺少经过验证的会话能力会预检失败，不回退为模拟交易。
+
+`--separate` 只用于纯时序回测；因子任务请拆分配置。回测数据与报告见[回测指南](./backtest.md)，参数搜索见[超参优化](./hyperopt.md)和[滚动回测](./roll_btopt.md)。`optimize` / `bt-opt` 是时序策略工具，不提供因子/混合超参搜索。
+
+## 数据与维护工具
+
+先运行 `bot <组> <命令> --help` 核对输入格式。除明确声明的位置参数外，输入文件使用 `--in`，输出使用 `--out`。
+
+| 命令 | 用途 |
+| --- | --- |
+| `data export` / `data import` | 数据库与 protobuf 文件之间导出/导入 |
+| `data archive` | 版本数据归档，见[因子指南](./factor.md) |
+| `kline down` / `load` / `agg` | 下载、导入、聚合 K 线 |
+| `kline export` / `purge` | 导出 CSV / 删除指定 K 线 |
+| `kline repair-ranges` / `verify` / `correct` | 重建范围元数据、校验覆盖、同步周期间 K 线 |
+| `kline adj-calc` / `adj-export` | 复权因子计算/导出 |
+| `series down` / `list` | 注册的自定义时序数据下载/范围查询 |
+| `tick convert` / `to-kline` | Tick 格式转换 / 聚合为 K 线 |
+| `tool list-strats` | 查看编译进程序的策略 |
+| `tool collect-opt` / `test-pickers` | 收集搜索结果 / 滚动比较挑选器 |
+| `tool sim-bt` / `bt-result` | 从报告模拟 / 从订单重建报告 |
+| `tool test-live-bars DUMP_FILE` | 将实盘 K 线 dump 与本地数据比较 |
+| `tool cmp-orders` | 对比交易所订单和回测订单 |
+| `tool calc-perfs` / `corr` / `merge-assets` | 收益指标、相关矩阵、资产曲线合并 |
+| `tool load-cal` / `data-server` | 导入交易日历 / 启动 gRPC 数据服务 |
+| `tool bt-factor` | 对既有 `orders.gob` 做滚动标的筛选，非原生 factor runner |
+| `live down-order` / `close-order` | 下载账户订单 / 按账户、标的或策略平仓 |
+
+```bash
+bot live down-order --datadir /path/to/data --account user1 --timestart 20250401 --timeend 20250405 --pairs BTC/USDT:USDT
+bot tool bt-result --datadir /path/to/data --config report-config.yml --in /path/to/orders.gob --out /path/to/rebuilt
 ```
 
-当您在yml配置文件指定`env`为`dry_run`时，订单不会提交到交易所，而是在本地模拟撮合。
+`live close-order` 的 `--account`、`--pair`、`--strat` 为空表示不限制相应维度；`--exg` 表示直接平交易所持仓。执行前明确筛选范围。`tool bt-factor` 的自定义因子注册接口是 `opt.RegisterFactor`，不能使用不存在的 `strat.FactorMap`。
 
-当`env`设置为`prod`或`test`时，会分别提交到交易所的生产环境或者测试网络（部分交易所不支持测试网络）。
-
-您可以在yml配置`spider_addr`，机器人启动时会自动尝试连接爬虫，并订阅当前交易所、市场和相关品种数据。
-您也可以添加`-spider`参数，启动机器人时自动在本进程中启动爬虫。
-
-当您在`yml`配置文件中启用`api_server`，且设置访问账号密码时，即可通过Dashboard UI查看并管理您的实时交易机器人。
-
-```yaml
-api_server:
-  enable: true  # enable here
-  bind_ip: 0.0.0.0
-  port: 8001
-  jwt_secret_key: '123456789'  # This should be complicated enough
-  users:
-    - user: ban
-      pwd: '123'
-      acc_roles: {user1: admin}  # allow bot accounts and role
-```
-
-```text
-Usage of trade:
-  -config value
-        config path to use, Multiple -config options may be used
-  -config-data string
-        yaml config string
-  -cpu-profile
-        enable cpu profile
-  -datadir string
-        Path to data dir.
-  -level string
-        set logging level to debug (default "info")
-  -logfile string
-        Log to the file specified
-  -max-pool-size int
-        max pool size for db
-  -mem-profile
-        enable memory profile
-  -net-off
-        disable network request
-  -no-default
-        ignore default: config.yml, config.local.yml
-  -out string
-        output file or directory
-  -pairs string
-        comma-separated pairs
-  -spider
-        start spider if not running
-  -stake-amount stake_amount
-        Override stake_amount in config
-```
-
-## 回测
-
-```shell
-bot backtest [-separate] ...
-```
-
-这将按 yml 配置中的 `run_policy` 启动回测。可使用 `-out` 指定报告目录。
-
-默认回测是将`run_policy`配置的多个策略组同时运行，得到一个组合的回测报表。如果您希望单独测试`run_policy`中每一个策略组，请启用`-separate`选项。
-
-回测时，如果相关品种的K线不存在，则会自动下载保存到数据库。
-
-回测结束后，未指定 `-out` 时报告默认保存到 `[数据目录]/backtest/<配置哈希>`。
-
-```txt
-Usage of backtest:
-  -config value
-        config path to use, Multiple -config options may be used
-  -config-data string
-        yaml config string
-  -cpu-profile
-        enable cpu profile
-  -datadir string
-        Path to data dir.
-  -dlock
-        enable dead-lock detect
-  -level string
-        set logging level to debug (default "info")
-  -logfile string
-        Log to the file specified
-  -max-pool-size int
-        max pool size for db
-  -mem-profile
-        enable memory profile
-  -net-off
-        disable network request
-  -no-default
-        ignore default: config.yml, config.local.yml
-  -out string
-        output file or directory
-  -pairs string
-        comma-separated pairs
-  -prg string
-        prefix for progress in stdout
-  -separate
-        run policy separately for backtest
-  -stake-amount stake_amount
-        Override stake_amount in config
-  -timeend string
-        set end time, timestart is required
-  -timerange string
-        set timerange
-  -timestart string
-        set start time, allow multiple formats
-```
-
-## K线相关工具
-
-[详细介绍](/zh-CN/advanced/kline_tools.md)
-
-**bot kline down**  
-从交易所下载K线保存到数据库
-
-**bot kline load**  
-从csv/zip文件中导入K线到数据库
-
-**bot kline agg**
-按指定 `-pairs` 和 `-timeframes` 聚合大周期 K 线。
-
-**bot kline export**  
-从数据库导出K线到csv文件
-
-**bot kline purge**  
-从数据库中清空K线。
-
-**bot kline correct**  
-检查数据库K线是否有错误并自动纠正。
-
-**bot kline verify**
-校验 K 线数据与覆盖范围元数据是否一致；可使用 `-pairs`、`-tables` 和 `-batch-size` 缩小检查范围。
-
-**bot kline adj_calc**  
-重新计算复权因子（用于中国期货市场）
-
-**bot kline adj_export**  
-导出复权因子到csv文件.
-
-```text
-banbot kline:
-    down:       download kline data from exchange
-    load:       load kline data from zip/csv files
-    agg:        agg kline for big timeframes
-    export:     export kline to csv files from db
-    purge:      purge/delete kline data with args
-    correct:    sync klines between timeframes
-    verify:     verify kline data matches sranges metadata
-    adj_calc:   recalculate adjust factors
-    adj_export: export adjust factors to csv
-```
-
-## Tick相关工具
-
-**bot tick convert**  
-对中国期货市场的csv格式tick进行转换，然后输出csv格式文件。
-
-**bot tick to_kline**  
-对中国期货市场的tick文件聚合为1m周期的K线csv格式文件。
-
-```text
-banbot tick:
-    convert:        convert tick data format
-    to_kline:       build kline from ticks
-```
-
-## 实盘交易工具
-
-**bot live down_order**  
-`-account user1 -exchange binance -market linear -timestart 20250401 -timeend 20250405 -pairs BTC,ETH`
-下载指定账户的订单到`@exgOrders/`目录下，保存的文件格式为`[exchange]_[market]_[account]_[apiKeyPrefix].gob`，如`binance_linear_user1_C1uMI.gob`。可用于`bot tool cmp_orders`对比回测订单。
-
-**bot live close_order**  
-`-account user1 -pair BTC,ETH -strat ma:demo1,ma:demo2 -exg true`
-对指定用户的符合订单进行平仓。
-
-## 其他工具
-
-**bot tool collect_opt**  
-收集超参数调优结果，并按顺序显示到控制台。
-
-**bot bt_opt**
-按时间滚动进行超参数调优，然后回测。比如对于最近3年的数据。每1年的数据用于超参数调优，然后用调优后的参数自动回测接下来的3个月；然后推迟3个月重复进行调优；如此反复，模拟真实场景下回测结果。
-
-**bot tool load_cal**  
-加载交易日历（针对中国期货市场）
-
-**bot tool cmp_orders**  
-将从币安导出的订单与本地回测订单记录进行对比，检查回测和实盘是否一致。
-
-**bot tool list_strats**  
-输出已注册的策略列表。
-
-**bot tool data_server**  
-启动一个grpc服务器，供其他语言端访问数据和指标结果等。可用于AI机器学习等。
-
-**bot tool calc_perfs**  
-传入一个csv/xlsx文件，每行表示一天，每列表示一个品种的累计收益。为每列计算Shape/Sortino
-
-**bot tool corr**  
-为yaml筛选后的一组品种计算相关系数，可以每隔一段时间输出一个相关矩阵图片，也可以输出平均相关系数csv文件。
-
-**bot tool sim_bt**  
-执行滚动模拟回测，从日志文件中提取每个区间的交易品种，并进行回测；导出订单记录和enters2.html
-
-**bot tool merge_assets**  
-将多个回测报告中的assets.html合并为一个，方便对比
-
-**bot tool bt_factor**  
-此命令用于测试截面轮动因子，您可针对所有品种使用某策略进行全量全周期回测，然后使用此命令，根据前面2年一些品种表现筛选一些品种用于后续几个月交易，如此滚动直至最新，组合并输出筛选品种的回测报告。
-
-您可在yml中进行下面设置来进行全量回测：
-
-```yaml
-pairmgr:
-  cron: ''
-  use_latest: true  # 这会使用最新日期确定品种列表
-pairlists:
-  - name: VolumePairList
-    back_period: 30d
-```
-
-然后实现您的因子并注册到`strat.FactorMap`中。
-
-然后执行：
-
-```shell
-bot tool bt_factor -factor name -interval 4M -in @backtest\abc\orders.gob -out @backtest\abc_name
-```
-
-**bot tool bt_result**  
-从回测结果的orders.gob文件重建回测报告。可输出：assets.html, enters.html, detail.json, orders.csv等。
-
-```text
-banbot tool:
-    collect_opt:    collect result of optimize, and print in order
-    load_cal:       load calenders
-    cmp_orders:     compare backTest orders with exchange orders
-    data_server:    serve a grpc server as data feeder
-    calc_perfs:     calculate sharpe/sortino ratio for input data
-    corr:           calculate correlation matrix for symbols
-    sim_bt:         run backtest simulation from report
-    list_strats:    list registered strategies
-    merge_assets:   merge multiple assets.html files into one
-    bt_factor:      backtest factors with orders
-    bt_result:      build backtest result from orders.gob and config
-```
-
-## 多因子与截面引擎
-
-`bot backtest` 和 `bot trade` 从同一 YAML `run_policy` 调度时序、因子或混合策略。因子回测的 `backtest --mode weights|events` 覆盖 `execution.mode`，两者均省略时默认 `events`；混合回放必须 `events`。因子/混合配置的 `trade --dry-run` 是历史 events 回放，纯时序实时模拟继续使用 `env: dry_run`。真实因子/混合交易可指定 `--live-provider`，且需要已验证的 binding。
-
-因子研究使用根命令 `bot research --config strategy.yml`，归档转换使用 `bot data archive`，独立表达式使用根命令 `bot validate --spec formula.yml` / `bot explain --spec formula.yml`。策略配置统一使用 YAML，路径按字段来源文件解析。各类引擎统一使用默认配置、`--datadir` 和 `--no-default` 规则。
-
-本页 bot tool bt_factor 是 orders.gob / strat.FactorMap 旧滚动筛选工具，与新 factor runner 不同。
-
-参见[多因子与截面指南](./factor.md)和[因子 API](../api/factor.md)。
+独立表达式检查使用根命令 `bot validate --spec formula.yml` / `bot explain --spec formula.yml`。更多因子配置和数据要求见[因子指南](./factor.md)。

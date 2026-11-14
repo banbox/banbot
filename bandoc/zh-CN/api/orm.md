@@ -136,17 +136,31 @@ type DataSeries struct {
 
 DataRecord 是持久行，DataSeries 是回测/实盘事件。时间单位为毫秒，区间为 `[TimeMS,EndMS)`。Values 保留 Go 具体类型和显式 nil；直接 map 查找可区分 NULL 与缺键。存储只写 schema 声明列：`int` 规范化为 int64，`float` 为 float64，JSON 经数据库编码；固定列往返不能恢复原始缺键或所有 Go 类型。
 
+读取数据库 NULL 时对应键仍存在，值为 nil。K 线整行写入仅对缺键的 `quote`/`buy_volume` 使用 0.0、`trade_num` 使用 0；其他缺键写 NULL，显式 nil 不触发这些缺键默认值。通用序列的未声明字段不写入数据库。
+
 ### Subscription
 
-`orm.Subscription` 是引擎无关的数据依赖，`strat.DataSub` 为其 alias。除 Source/ExSymbol/TimeFrame/WarmupNum/Fields/SeriesFields 外，还包含 Frequency（bar/event）和 Projection（default/all/selected）。`NormalizeSubscription` 验证声明；合法 event 声明不代表每个 reader 都能读取它。`StreamKey{Source,SID,TimeFrame}` 不包含 consumer 或账户，隔离由所属 catalog/repository 负责。
+`orm.Subscription` 是引擎无关的数据依赖，`strat.DataSub` 为其别名。Source、ExSymbol、TimeFrame 指定数据流，WarmupNum 指定预热观测量，Fields 控制原始字段投影，SeriesFields 选择派生数值历史。
+
+- Frequency 默认 `FrequencyBar`；不规则数据使用 `FrequencyEvent` 和 `TimeFrame: "event"`，K 线不能使用 event。
+- Projection 默认 `ProjectionDefault`；给出 Fields 时自动为 `ProjectionSelected`；`ProjectionAll` 请求全部字段。default/all 不能同时携带 Fields，selected 必须有字段。
+- `NormalizeSubscription` 校验声明，要求有效 ExSymbol/SID；event 仍需 reader 支持，计数预热需数据源实现 `ObservationWarmupSource`。
+
+`StreamKey{Source,SID,TimeFrame}` 标识流，不含 consumer 或账户。策略侧省略 ExSymbol 的订阅模板由 job 补齐后再规范化。
 
 ### SeriesStore 与 BoundSeriesStore
 
 ```go
 store := orm.NewSeriesStore(orm.NewSeriesRepo(storage))
 rates := store.Bind(info, target)
-err := rates.WriteBatch(ctx, rows) // []*orm.DataRecord
+if err := rates.WriteBatch(ctx, rows); err != nil { // []*orm.DataRecord
+    return err
+}
 events, err := rates.Read(ctx, startMS, endMS, limit) // []*orm.DataSeries
+if err != nil {
+    return err
+}
+_ = events
 ```
 
 示例假定已初始化 Storage、schema、target、ctx 和时间范围。`Bind` 保留定义和标的引用，不执行 I/O。下列方法可在 SeriesStore 上传入 info/target，或在绑定后的 store 上省略它们：
@@ -167,7 +181,18 @@ events, err := rates.Read(ctx, startMS, endMS, limit) // []*orm.DataSeries
 
 独立 SeriesStore 写完整记录。`NewKLineSeriesInfo` / `NewKLineSeriesStoreWithStorage(info, storage)` 定义并写既有 K 线的扩展列，`Write(ctx,target,rows)` 更新已有 `(sid,time)` 行；缺少目标 K 线时失败。不要把扩展标签 Name 当成独立 source，策略订阅仍使用 `Source: "kline"`。
 
-`GetSeries/AutoFetchSeries` 返回 `[]*DataSeries`；显式 Queries 提供 `GetSeriesFields`、`QuerySeriesFields` 和批量字段投影接口。字段读取包含默认 OHLCV 与所需扩展列，后续 feeder/回调保留 Values。下文 GetOHLCV/AutoFetchOHLCV 是默认 K 线兼容视图，不应通过这些固定字段 API 传递任意自定义列。
+`GetSeries/AutoFetchSeries` 返回 `[]*DataSeries`；显式 Queries 提供 `GetSeriesFields`、`QuerySeriesFields` 和批量字段投影接口。未指定字段时读取默认 K 线字段；指定时按投影读取，后续 feeder/回调保留 Values。下文 GetOHLCV/AutoFetchOHLCV 是默认 K 线兼容视图，不应通过这些固定字段 API 传递任意自定义列。
+
+常用字段读取签名如下（`q` 为所属 Storage 的 Queries，并通过 `WithKlineRuntimeOptions` 绑定任务选项；`limit=0` 不限制行数，应自行按窗口分页）：
+
+```go
+func (q *Queries) QuerySeriesFields(exs *ExSymbol, timeframe string, fields []string,
+    startMS, endMS int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error)
+func (q *Queries) GetSeriesFields(exs *ExSymbol, timeframe string, fields []string,
+    startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error)
+```
+
+传入所需字段列表以读取扩展列。DataSeries 查询返回原始价格并附带 Adj；不会自动应用复权。需要完整自定义字段时，不要转换为 `banexg.Kline` 再转回。
 
 ### 聚合与复权
 
@@ -274,6 +299,8 @@ INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须�
 - `*errs.Error` - 错误信息
 
 ## 交易对相关
+
+下列包级函数保留用于兼容。显式 Runtime 使用所属 `SymbolState` 上的相应方法；`GetExSymbols` 等返回的共享快照不要修改。`EnsureCurSymbols` 只接受当前交易所市场表中的品种；自定义抽象标的可用 `EnsureExSymbol(exchange, market, symbol, exgReal...)` 创建或复用。
 
 ### GetExSymbols
 获取指定交易所和市场的所有交易对信息。
@@ -408,6 +435,9 @@ INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须�
 ## K线数据相关
 
 ### AutoFetchOHLCV
+
+以下 OHLCV 接口是固定字段兼容视图；任意扩展字段使用上文 DataSeries/字段查询接口。通用序列存取应使用统一时序接口。
+
 自动获取K线数据，支持数据补全和未完成K线。
 
 参数：
@@ -540,6 +570,7 @@ INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须�
 
 参数：
 - `args *config.CmdArgs` - 命令行参数
+- `calculators ...AdjFactorCalculator` - 可选复权因子计算器
 
 返回：
 - `*errs.Error` - 错误信息
@@ -547,7 +578,7 @@ INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须�
 ## 数据导入导出
 
 ### ExportKData
-导出K线数据。
+导出固定 K 线字段和配套元数据到 protobuf；不导出任意扩展列或独立时序表。
 
 参数：
 - `configFile string` - 配置文件路径
@@ -559,7 +590,7 @@ INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须�
 - `*errs.Error` - 错误信息
 
 ### ImportData
-导入K线数据。
+导入 protobuf K 线，将导出标的 ID 映射到目标库 ID。显式任务使用 `ExportKDataWithDeps`/`ImportDataWithDeps`，通过 `KDataTransferDeps` 传入所属存储与符号状态。
 
 参数：
 - `dataDir string` - 数据目录
@@ -572,7 +603,7 @@ INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须�
 ## 工具函数
 
 ### GetDownTF
-获取下一级别的时间周期。
+选择请求周期所对应的物理下载/存储周期。
 
 参数：
 - `timeFrame string` - 时间周期

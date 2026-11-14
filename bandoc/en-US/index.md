@@ -17,15 +17,15 @@ hero:
 
 features:
   - title: High Performance
-    details: Use an indicator library that supports state caching, 1 second backtesting 1 year of data
+    details: Go and banta cache indicator state; runtime depends on strategies, data and universe size
   - title: Easy to use
     details: one version of the strategy, supporting backtesting, simulated real-time trading and real trading at the same time
-  - title: Flexible
-    details: Freely combine different symbols, strategies and time periods
+  - title: Two strategy engines
+    details: Time-series strategies, factor portfolios, statistical pairs and mixed events replay
   - title: Scalability
     details: A batch of strategies can be applied to multiple exchange accounts at the same time
-  - title: LLM Integration
-    details: Built-in large language model invocation and management, with multi-model failover and concurrency control
+  - title: Arbitrary time-series data
+    details: Read K-lines, extension fields and external series while preserving types and NULL
   - title: Hyperparameter tuning
     details: Support bayes/tpe/random/cmaes/ipop-cmaes/bipop-cmaes
 ---

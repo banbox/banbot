@@ -94,84 +94,62 @@ Options:
 'ETH/USDT:USDT-210625-5000-C'  // ETH/USDT linear contract settled in USDT, with the right to buy at 5000 on 2021-06-25
 ```
 
-## Main Components
-The execution of backtesting and live trading involves various aspects. To ensure the project's structure remains flexible and clear, the main components involved in banbot include:
+## Main components
 
-* Spider Process: banbot uses a separate spider process to monitor public exchange data such as K-lines, write it into the database, and push it in real time via TCP to multiple listening bots. This allows banbot to support running a set of strategies across multiple accounts simultaneously.
-* DataProvider: Integrates all the symbols involved in backtesting/live trading (each symbol corresponds to a Feeder, and each Feeder supports multiple timeframes), and executes received K-lines as unified time-series events. Third-party time-series data is backfilled and pushed to strategies in real time by registered data sources, without going through Spider.
-* Order Manager (OrderMgr): In backtesting, it matches the order request based on candlesticks; in live trading, it submits the order to the exchange and monitors the execution progress for real-time updates.
-* Wallets: During backtesting, it simulates the available balance, frozen amount, unrealized P&L, etc., based on order execution; in live trading, it monitors the exchange's account wallet status for real-time updates.
-* Exchange: Based on banexg, it supports Binance, OKX, and Bybit's REST/websocket, used for downloading candlesticks, querying market information, order processing, and listening to websocket streams.
-* PairFilters: Supports filtering and sorting all symbols based on given filters. Hardcoded symbol lists can also be used.
-* Notifications (Notify): Sends notifications when bots open positions or signals appear. Currently, only WeChat is supported.
-* Rest API: The rest API can be enabled during live trading, allowing users to view and manage bots via a web UI.
+| Component | User-facing behavior |
+| --- | --- |
+| Hub (`bot hub`, alias `spider`) | Collects exchange data, stores it and distributes it over TCP; may also host account execution over a local Unix socket |
+| Data provider | Replays history in time order or delivers subscribed live events; registered sources provide external series |
+| Strategy | `time_series` dispatches events to Jobs; `factor` computes factors and portfolio targets from multi-symbol snapshots |
+| Order manager | Time-series requests enqueue first, then match locally in backtests or submit/track real orders |
+| Shared-account execution | Tracks strategy ownership and budgets, combining logical positions into physical-account plans |
+| Wallet | Simulates balances, reservations and P&L in backtests; live balances follow account execution/reconciliation |
+| Symbol manager | Uses explicit `pairs` or a filter pipeline to build and refresh the universe |
+| Notifications and UI | WeCom, Telegram and email; development WebUI and live Dashboard have separate entry points |
 
-## Key Conventions
-**Strategy Job (StratJob)**
+## Two strategy engines
 
-A specific symbol + a specific strategy + a specific direction (both/long/short) + any timeframe is only allowed to exist as one strategy job.
+Omitting `run_policy.engine` selects `time_series`. A YAML file may contain both time-series and factor policies; mixed runs use events execution.
 
-For example, with a simple moving average strategy `ma:demo`, you can set parameters for long and short periods passed from the `yml` configuration:
+Register time-series factories through `strat.AddStratGroup`, then reference them by `run_policy.name`. A strategy, symbol and selected timeframe form a `StratJob` in each account. `run_timeframes` contains candidate timeframes: quality scoring or `PickTimeFrame` chooses one. It does not automatically create a Job for every listed timeframe; declare auxiliary subscriptions separately.
 
 ```yaml
 run_policy:
   - name: ma:demo
-    run_timeframes: [5m]
-    dirt: long
-    params: {smlLen: 5, bigLen: 20}
-    pairs: [BTC/USDT, ETH/USDT]
-  - name: ma:demo
-    run_timeframes: [5m, 15m]
-    dirt: short
-    params: {smlLen: 7, bigLen: 30}
-    pairs: [BTC/USDT, ETH/USDT]
-  - name: ma:demo
+    engine: time_series
     run_timeframes: [15m]
     dirt: long
-    params: {smlLen: 4, bigLen: 15}
-    pairs: [BCH/USDT, ETC/USDT, BTC/USDT]
-  - name: ma:demo
-    run_timeframes: [5m]
-    dirt: long
-    params: {smlLen: 5, bigLen: 20}
-    pairs: [BCH/USDT, ETC/USDT]
+    pairs: [BTC/USDT, ETH/USDT]
 ```
-The configuration above sets four groups of strategy jobs, all using the `ma:demo` strategy. Each group can only generate 2 valid strategy jobs (StratJob), for a total of 8 strategy jobs.
 
-The second group provides two timeframes, `[5m 15m]`, and will calculate the candlestick quality score for each timeframe, selecting the smallest timeframe that meets the score criteria.
+Register `ma:demo` in the strategy project first. `dirt` accepts `long`, `short` or `any`; omission allows both directions, but spot rejects shorts. Wallet, account and strategy limits also constrain orders.
 
-The `BTC/USDT` in the third group overlaps with the first group, so it will be ignored.
+Factor rounds freeze the Universe and currently visible data, distinguish reference/investable/tradable sets, then compute factors and target positions. They do not invoke a time-series `OnBar` for every symbol. Statistical pairs use factor/portfolio capabilities. See [Multi-factor strategies](./factor.md).
 
-Note: When the dirt parameter is omitted, it means both long/short orders are allowed.
+## Time-series data and callbacks
 
-## Backtesting Execution Logic
-* Load the configuration and initialize: database session, exchange, data provider, order manager, wallets, pair manager, etc.
-* Filter the symbol list to be traded based on the pair manager.
-* Load the strategy list, and generate the strategy job list by combining symbols and timeframes.
-* Subscribe to relevant symbols and their timeframes from the data provider.
-* Call the LoopMain of the data provider to loop through candlesticks over time, and repeat the following logic for each candlestick:
-     * Check if the batch entry callback needs to be triggered (triggered when the candlestick timestamp increases).
-     * Update the indicator calculation environment.
-     * The order manager updates the order based on the candlestick (triggering entry, take profit, stop loss, calculating profit, etc.).
-     * Trigger the OnBar, OnCheckExit, GetDrawDownExitRate, OnInfoBar methods for all strategy jobs, and collect entry/exit requests.
-     * Submit the entry/exit requests to the order manager for execution.
-* Check if the symbol list needs to be refreshed (can be set to refresh periodically during backtesting to simulate live trading).
+`orm.DataSeries.Values` carries standard K-line fields and arbitrary extension fields together. Types, missing fields and explicit NULL remain distinct; numerical indicator views do not replace original values.
 
-## Live Trading Execution Logic
-* Load the configuration and initialize: database session, exchange, data provider, order manager, wallets, pair manager, notifications, Rest API, etc.
-* Filter the symbol list to be traded based on the pair manager.
-* Load the strategy list, and generate the strategy job list by combining symbols and timeframes.
-* The data provider connects to the spider process and subscribes to relevant symbols and their timeframes.
-* Start background tasks: monitor balance, monitor personal orders, periodically refresh trading pairs, periodically update market information, periodically check global stop-loss, etc.
-* Call the LoopMain of the data provider to wait for candlestick updates pushed by the spider, and repeat the following logic for each candlestick:
-    * Update the indicator calculation environment.
-    * The order manager updates order profit based on the candlestick.
-    * Trigger the OnBar, OnCheckExit, GetDrawDownExitRate, OnInfoBar methods for all strategy jobs, and collect entry/exit requests.
-    * Submit the entry/exit requests to the order manager for execution.
-    * Delay execution of batch entry/exit by 3 seconds (if new candlestick data is received within 3 seconds, cancel execution and delay another 3 seconds).
+New strategies can use `OnData(s, event)` and route main, auxiliary and custom events using `event.IsMain()` or the role. Legacy `OnBar`/`OnInfoBar` callbacks remain supported but cannot coexist with `OnData`. Warmup computes indicators without submitting trades. See [Custom strategy](./strat_custom.md) and [Custom data](./custom_data.md).
 
-## Factor and cross-sectional engine
+## From data to orders
 
-A decision interval is distinct from per-symbol OnBar. Factor rounds use closed, currently visible multi-symbol data and distinguish reference/investable/tradable membership. DataSeries.Values retains arbitrary typed fields and NULL alongside numerical indicator views.
+1. Merge configuration, choose engines/symbols/timeframes and create a Runtime for the task.
+2. Subscribe and warm up. Backtests advance historical time; live tasks wait for events.
+3. Main events update indicators/data views, invoke the strategy, check custom exits and process order requests. Auxiliary/custom events follow subscriptions.
+4. `OpenOrder`/`CloseOrders` create intents; the order manager matches or submits them. Track updates with `OnOrderChange`. Shared accounts also combine strategy targets and persist the execution ledger.
+5. Update wallets, reports, notifications and monitoring; release subscriptions/resources when the task stops.
 
-See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
+Batch strategies use `BatchInOut`/`BatchInfo` and batch callbacks. Historical and live batch readiness differ: one arriving event does not guarantee all symbols are ready.
+
+## Choose a run mode
+
+| Goal | Entry point and meaning |
+| --- | --- |
+| Historical validation | `bot backtest`; factor supports weights/events, mixed requires events |
+| Time-series parameter optimization | `bot optimize` or `bot bt-opt` |
+| Time-series real-time simulation | `env: dry_run` with `bot trade`, live data and local matching |
+| Factor/mixed historical events simulation | `bot trade --dry-run`, not real-time paper trading |
+| Real trading | `bot trade`; configure account/data/execution dependencies and pass engine-specific startup checks |
+
+Default live entry points execute through Hub and currently accept only linear perpetual accounts in `prod`/`dry_run`. See [Shared accounts and Hub](./execution.md) for restrictions and recovery, plus [Commands](./bot_usage.md), [Backtesting](./backtest.md) and [Live trading](./live_trading.md).

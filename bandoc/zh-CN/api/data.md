@@ -17,7 +17,20 @@ type DataSource interface {
 }
 ```
 
-`strat.DataSub` 是 `orm.Subscription` 的 alias，旧函数式 source 签名仍可使用它。`FetchHistory` 按 `[startMS,endMS)` 返回有真实时间区间的记录；不应伪造数据来覆盖未查询的区间。实时推送用 `sink.Emit`，省略实时函数不会自动轮询。
+`strat.DataSub` 是 `orm.Subscription` 的别名，函数式 source 可使用它。`FetchHistory` 按 `[startMS,endMS)` 返回有真实时间区间的记录；不应伪造数据来覆盖未查询的区间。实时推送用 `sink.Emit`，省略实时函数不会自动轮询。
+
+抓取失败必须返回 error；返回空结果和 nil 表示确实查询过且无数据，可能被记录为覆盖区间。两者不能混用，否则后续不会再回填该缺口。`Info` 定义与基础周期应在注册后保持稳定。
+
+### PagedHistorySource
+
+```go
+type PagedHistorySource interface {
+    FetchHistoryPage(ctx context.Context, sub *orm.Subscription,
+        startMS, endMS int64, limit int) ([]*orm.DataRecord, error)
+}
+```
+
+每页时间戳必须严格递增、位于 `[startMS,endMS)` 且不超过 limit；空页表示该范围结束。`ReadSourceHistory` 校验后逐页传给消费函数。启用 PageBytes 时，未实现分页的源会在整段抓取前失败；未启用时可以退回整段 `FetchHistory`。源适配器仍需自行限制网络响应和解码缓冲，不应将页预算视为进程内存上限。
 
 ### DataSourceCatalog
 
@@ -51,7 +64,7 @@ type SubscriptionPlanOptions struct {
 
 `PrepareLivePlan` 准备独立订阅、预热和启动缓冲；`SubscriptionInstallation.Activate` 激活，`CommitPrepared` 提供提交回调边界；`InstallLivePlan` 是准备并激活的入口。需要受管理的实盘源必须实现 `ManagedLiveSource.SubscribeManaged`，返回具有 `Stop()` 和 `Join() error` 的独立句柄；可用 `LiveSourceErrors` 报告异步失败。
 
-启动队列递归复制 Values，保留具体类型、typed nil、NULL、缺失键、时间信息和复权元数据。达到预算、源失败或取消会报错。`Stop` 先封闭接收，所属 owner 再调用 `Join` 等待已接纳回调和生产者；不要在回调中等待自己退出。候选代准备失败不能关闭仍在服务的旧代。
+启动缓冲保留 Values 的字段、类型和 NULL/缺键区别；不要在交给 sink 后并发改写输入。必需源失败、预算不足或取消会导致安装失败；可选源失败可表现为降级，应检查安装状态。停止受管理订阅时先 `Stop`，再 `Join` 等待生产者和已接纳回调退出，不能在回调内等待自身退出。具体句柄签名为 `Stop()` / `Join() error`，与 `LiveProvider.Stop() *errs.Error` / `Join()` 不同。
 
 ## Provider 和 Feeder
 
@@ -64,7 +77,7 @@ type SubscriptionPlanOptions struct {
 | `HistProvider` | 管理历史 feeder，按结束时间推进 |
 | `LiveProvider` | 管理实时 feeder 与 `SeriesWatcher` |
 
-接口为 `IDataFeeder`、`IHistFeeder` 和 `IHistDataFeeder`，不是旧的 IKlineFeeder/IHistKlineFeeder。主要构造器：
+接口为 `IDataFeeder`、`IHistFeeder` 和 `IHistDataFeeder`。主要构造器：
 
 ```go
 NewSeriesFeeder(exs *orm.ExSymbol, callback FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error)
@@ -75,14 +88,26 @@ NewLiveProvider(callback FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.
 
 这些类型提供 `WithRuntimeDeps` 构造入口；显式任务应提供 Runtime 的配置、符号、存储、时钟、策略与回调边界。Provider 支持 `SubWarmPairs/UnSubPairs/LoopMain`，实盘资源支持 `Stop/Join`。公开回调 `Feeder.CallBack`、`Feeder.OnEnvEnd` 的输入均是 DataSeries，待处理值是 `WaitData`。
 
+```go
+func NewHistProviderWithRuntimeDeps(deps *RuntimeDeps, callback FnDataSeries,
+    envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool,
+    progress *utils.StagedPrg) (*HistProvider, *errs.Error)
+func NewLiveProviderWithRuntimeDeps(deps *RuntimeDeps, callback FnDataSeries,
+    envEnd FuncEnvEnd) (*LiveProvider, *errs.Error)
+```
+
+`NewHistProviderWithRuntimeDeps` 与包级兼容构造器不同，会返回初始化错误；调用方必须处理。策略作者通常只需声明 `OnDataSubs` 和 `OnData`，无需手动创建 Provider。`DataHub` 位于 `strat` 包，由 job 持有，`data` 包没有 `DataHub` 类型。
+
 内置 K 线读取最小物理周期，再聚合派生周期；投影合并后扩展列经相同 Values 传递，存储补充只补缺键，显式 NULL 不被覆盖。聚合按字段规则执行；复权只修改框架支持的字段，自定义字段不被丢弃。分别需要不同起止范围时，可单独创建 Provider 或使用 SeriesStore/Queries.GetSeriesFields 等存取接口。
 
 ## Spider 与 Watcher
 
-`LiveSpider` 管理每个交易所/市场的 `Miner`，负责采集、存储与广播。当前消息为 `NotifySeries{TFSecs, Interval, Rows []*orm.DataSeries}`；`SeriesMsg` 嵌入它并增加 `ExgName/Market/Pair`。存储任务是 `SaveSeries`。旧 NotifyKLines/KLineMsg/SaveKline 文档字段已由这些结构替代。
+`LiveSpider` 管理每个交易所/市场的 `Miner`，负责采集、存储与广播。当前消息为 `NotifySeries{TFSecs, Interval, Rows []*orm.DataSeries}`；`SeriesMsg` 嵌入它并增加 `ExgName/Market/Pair`。存储任务是 `SaveSeries`。
 
 `NewSeriesWatcherWithRuntimeDeps(deps, addr)` 创建所属任务的 TCP 客户端，`OnDataMsg func(*SeriesMsg)` 接收序列。`WatchJobs` 声明交易所、市场、类型和标的周期；`UnWatchJobs` 取消。Spider/Watcher 通过 BanIO 发送完整 Rows；网络 payload 使用 JSON，不能据此保证 map 内整数宽度或自定义 Go 类型自动往返，严格类型源必须有 schema 和解码校验。
 
 ## 数据工具
 
 `FindPathNames`、`ReadZipCSVs` 处理文件，`RunFormatTick/Build1mWithTicks` 处理逐笔数据，`CalcFilePerfs` 分析文件。普通数据读取与数据源注册见[自定义时序数据](../guide/custom_data.md)，多因子原生图和回测/实盘组合见[因子 API](factor.md)。
+
+`bot series list` 查看已注册定义，`bot series down --tables funding_rate --pairs BTC --timerange 20240101-20250101` 主动回填。这里的 `--tables` 是 source 名，CLI 不支持 event 周期；K 线和范围修复命令见[序列工具](../advanced/kline_tools.md)。

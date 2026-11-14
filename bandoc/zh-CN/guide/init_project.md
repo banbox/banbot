@@ -37,7 +37,10 @@ func init() {
 func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	return &strat.TradeStrat{
 		WarmupNum: 100,
-		OnBar: func(s *strat.StratJob) {
+		OnData: func(s *strat.StratJob, event strat.DataEvent) {
+			if !event.IsMain() {
+				return
+			}
 			e := s.Env
 			ma5 := ta.SMA(e.Close, 5)
 			ma20 := ta.SMA(e.Close, 20)
@@ -70,3 +73,17 @@ func main() {
 
 在进行回测时，banbot会自动备份此次回测的策略源代码，方便追溯不同版本策略的效果。
 :::
+
+## 编译与运行
+
+当前源码要求 Go 1.26.0，并声明 Go 1.26.8 工具链。完成文件后执行：
+
+```shell
+go mod tidy
+go build -o bot
+./bot init --datadir /path/to/bandata
+```
+
+将生成的 `config.local.yml` 中 `run_policy` 设置为 `name: ma:demo`、`engine: time_series` 和 `run_timeframes: [15m]`，并配置钱包、品种与回测时间范围，再执行 `./bot backtest --datadir /path/to/bandata`。Windows 使用 `go build -o bot.exe` 编译，并在 PowerShell 中将 `./bot` 替换为 `.\bot.exe`。
+
+`OnData` 统一接收主周期、辅助周期和自定义序列事件；此示例仅处理主周期。它不能与 `OnBar` 或 `OnInfoBar` 同时设置。`OpenOrder`/`CloseOrders` 将请求入队，由订单管理器处理；返回成功不代表已成交。更多订阅与错误处理见[自定义策略](./strat_custom.md)。

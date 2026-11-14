@@ -1,308 +1,77 @@
 # config 包
 
-config 包提供了系统配置相关的结构体和方法。
+配置文件的用户操作见[配置指南](../guide/configuration.md)。嵌入程序推荐通过 `LoadRunSpec` 加载统一配置，再按引擎装配；旧包级变量不是并行任务的配置容器。
 
-## 运行时配置
+## 读取统一配置
 
-常规入口会先解析配置，再创建一份属于任务的 `config.Snapshot`。Snapshot 深拷贝配置并保存显式的数据/策略目录；Runtime 将其视为只读配置，因此不同任务的命令行覆盖和账户配置不会彼此改写。普通入口先使用 LoadRunSpec 解析唯一 policy 列表和字段来源，再由 RunSpec.RuntimeSnapshot 取得运行配置；单独 LoadRuntimeSnapshot 保留时序配置装配，不替代完整 TS/CS 路由。
+```go
+args := &config.CmdArgs{
+    DataDir: "/path/to/data",
+    Configs: config.ArrString{"experiment.yml"},
+}
+spec, err := config.LoadRunSpec(args, false)
+if err != nil {
+    return err
+}
+effective, yamlErr := spec.EffectiveYAML(true)
+if yamlErr != nil {
+    return yamlErr
+}
+_ = effective
+```
 
-## 重要结构体
+`LoadRunSpec(args *CmdArgs, showLog bool) (*RunSpec, *errs.Error)` 读取默认文件、显式文件、内联 YAML 和显式 CLI 覆盖。`LoadUnifiedConfigs(paths []string, showLog bool)` 适合加载已知 YAML 文件列表；它不代替 CLI 分层和任务装配。普通读取不会迁移、备份或写回用户文件。
 
-### CmdArgs
-命令行参数结构体,包含以下字段:
-- `Configs`: []string - 配置文件路径列表
-- `ConfigData`: string - 直接传入的 YAML 配置内容
-- `Logfile`: string - 日志文件路径
-- `DataDir`: string - 数据目录路径
-- `NoCompress`: bool - 是否不压缩
-- `NoDefault`: bool - 是否不使用默认配置
-- `LogLevel`: string - 日志级别
-- `TimeRange`: string - 时间范围,格式为"YYYYMMDD-YYYYMMDD"
-- `TimeFrames`: []string - 时间周期列表
-- `StakeAmount`: float64 - 单笔开单金额
-- `StakePct`: float64 - 单笔开单金额百分比
-- `Pairs`: []string - 交易对列表
-- `Force`: bool - 是否强制执行
-- `WithSpider`: bool - 是否使用爬虫
-- `MaxPoolSize`: int - 最大连接池大小
-- `RawTables` / `Tables`: string / []string - 数据表筛选条件
-- `Medium`: string - K 线数据介质：`db` 或 `file`
-- `InPath` / `InType`: string - 输入路径和输入类型
-- `OutPath` / `OutType`: string - 输出路径和输出类型
-- `AdjType`: string - K 线复权类型：`pre`、`post` 或 `none`
-- `ExgReal`: string - 实际交易所标识
-- `Picker` / `PairPicker`: string - 优化结果和品种选择器
-- `RunEveryTF`: string - 按指定周期运行
-- `BatchSize`: int - 任务批量大小
-- `DeadLock`: bool - 是否启用死锁检测
-- `TimeZone`: string - 时区
-- `OptRounds`: int - 超参数优化单任务执行轮次
-- `Concur`: int - 超参数优化多进程并发数量
-- `Sampler`: string - 超参数优化方法(tpe/bayes/random/cmaes等)
-- `EachPairs`: bool - 是否逐个标的执行
-- `ReviewPeriod`: string - 持续调参回测时,调参回顾的周期
-- `RunPeriod`: string - 持续调参回测时,调参后有效运行周期
-- `Alpha`: float64 - 计算EMA的平滑因子
-- `Separate`: bool - 回测时是否策略组合单独测试
+| 类型 | 使用约定 |
+| --- | --- |
+| `CmdArgs` | CLI 输入，含 `Configs`、`ConfigData`、`DataDir`、`NoDefault`、时间/标的及优化参数；字段存在不表示每个子命令都绑定相应 flag |
+| `UnifiedConfig` | `Root *Config` 保存公共根字段；唯一策略列表在 `RunPolicy []*PolicyV2`，而不是 `Root.RunPolicy` |
+| `PolicyV2` | 内嵌 `RunPolicyConfig`，另含 `Engine`、`ID`、`Account`、`CapitalWeight *float64`、`Factor`、`ExplicitEngine` |
+| `RunPolicyConfig` | 时序名称、周期、`refine_tf`、方向、pairs、`Params map[string]float64`、`PairParams` 及开单/筛选参数；`Def` / `DefInt` 声明搜索参数 |
+| `RunSpec` | 保留合并结果、字段来源和路径基准；导出配置/来源方法返回副本 |
+| `Snapshot` | 任务只读配置及显式目录，`View()` 只读，`Clone()` 复制可变容器 |
 
-### Config
-根配置结构体,包含以下字段:
-- `Name`: string - 配置名称
-- `Env`: string - 运行环境
-- `Leverage`: float64 - 杠杆倍数
-- `LimitVolSecs`: int - 限价单预期等待成交时间(秒)
-- `PutLimitSecs`: int - 限价单提交到交易所的预期时间
-- `MarketType`: string - 市场类型
-- `ContractType`: string - 合约类型
-- `OdBookTtl`: int64 - 订单簿生存时间
-- `StopEnterBars`: int - 入场限价单超过多少个蜡烛未成交则取消
-- `ConcurNum`: int - 并发数量
-- `OrderType`: string - 订单类型
-- `PreFire`: float64 - 预发射
-- `MarginAddRate`: float64 - 追加保证金比率
-- `ChargeOnBomb`: bool - 是否在爆仓时收费
-- `TakeOverStrat`: string - 接管策略
-- `StakeAmount`: float64 - 单笔开单金额
-- `StakePct`: float64 - 单笔开单金额百分比
-- `MaxStakeAmt`: float64 - 单笔最大开单金额
-- `OpenVolRate`: float64 - 开单数量倍率
-- `MinOpenRate`: float64 - 最小开单比率
-- `BTNetCost`: float64 - 回测网络延迟(秒)
-- `RelaySimUnFinish`: bool - 是否接力开始时间的未完成订单
-- `NTPLangCode`: string - NTP 时间同步区域代码
-- `ShowLangCode`: string - 界面显示语言代码
-- `BTInLive`: *BtInLiveConfig - 实盘定时回测对比配置
-- `OrderBarMax`: int - 查找未完成订单的最大回溯 bar 数
-- `MaxOpenOrders`: int - 最大开单数量
-- `MaxSimulOpen`: int - 最大同时开单数量
-- `WalletAmounts`: map[string]float64 - 钱包金额
-- `DrawBalanceOver`: float64 - 提取余额阈值
-- `StakeCurrency`: []string - 开单币种
-- `FatalStop`: map[string]float64 - 致命停止条件
-- `FatalStopHours`: int - 致命停止小时数
-- `TimeRange`: *TimeTuple - 时间范围
-- `RunTimeframes`: []string - 运行时间周期
-- `KlineSource`: string - K线数据源
-- `WatchJobs`: map[string][]string - 监控任务
-- `RunPolicy`: []*RunPolicyConfig - 运行策略配置
-- `StratPerf`: *StratPerfConfig - 策略性能配置
-- `Pairs`: []string - 交易对列表
-- `PairMgr`: *PairMgrConfig - 交易对管理配置
-- `PairFilters`: []*CommonPairFilter - 交易对过滤器
-- `Exchange`: *ExchangeConfig - 交易所配置
-- `Database`: *DatabaseConfig - 数据库配置
-- `APIServer`: *APIServerConfig - API服务器配置
-- `RPCChannels`: map[string]map[string]interface{} - RPC通道配置
-- `Webhook`: map[string]map[string]string - Webhook配置
-- `Mail`: *MailConfig - SMTP 邮件配置
-- `LLMModels`: map[string]*llm.LLMModelConfig - LLM 模型配置
+`CmdArgs.ExplicitFlags` 标记调用方真正传入的 flag；直接以 Go 构造参数时，如需用零值/空值覆盖 YAML，也要提供相应标记。`RawPairs`、`RawTimeFrames` 为逗号分隔的 CLI 原文，对应解析后的 `Pairs`、`TimeFrames`。
 
-### RunPolicyConfig
-运行策略配置,可以同时运行多个策略,包含以下字段:
-- `Name`: string - 策略名称
-- `Filters`: []*CommonPairFilter - 交易对过滤器
-- `RunTimeframes`: []string - 运行时间周期
-- `MaxPair`: int - 最大交易对数量
-- `MaxOpen`: int - 最大开单数量
-- `MaxSimulOpen`: int - 最大同时开单数量
-- `Dirt`: string - 交易方向(long/short)
-- `StratPerf`: *StratPerfConfig - 策略性能配置
-- `Pairs`: []string - 交易对列表
-- `Params`: map[string]float64 - 策略参数
-- `PairParams`: map[string]map[string]float64 - 交易对参数
+## RunSpec API
 
-### StratPerfConfig
-策略性能配置,包含以下字段:
-- `Enable`: bool - 是否启用
-- `MinOdNum`: int - 最小订单数量
-- `MaxOdNum`: int - 最大订单数量
-- `MinJobNum`: int - 最小任务数量
-- `MidWeight`: float64 - 中等权重
-- `BadWeight`: float64 - 差权重
+| API | 结果/用途 |
+| --- | --- |
+| `Config() *UnifiedConfig` | 返回统一配置副本 |
+| `Engines() []string` | 当前策略所需引擎 |
+| `Origin(field) (FieldOrigin, bool)` / `Origins()` | 字段来源，包含 `Source`、`Kind` |
+| `EffectiveYAML(redact bool) ([]byte, error)` | 生效 YAML；true 时脱敏，高级路径解析为可独立加载的输出 |
+| `Hash() (string, error)` | 生效配置身份哈希 |
+| `ResolvePath(field string) (string, error)` | 按最终字段来源文件解析相对路径；`@` / `$` 依赖数据目录，`:memory:` 保留原义 |
+| `WithExecutionMode(mode, source string) *RunSpec` | 返回记录执行模式覆盖及来源的新副本 |
+| `RuntimeSnapshot() (*Snapshot, *errs.Error)` | 归一化公共配置并仅投影时序策略；不执行因子任务 |
 
-### DatabaseConfig
-数据库配置,包含以下字段:
-- `Url`: string - 数据库连接URL
-- `Retention`: string - 数据保留时间
-- `MaxPoolSize`: int - 最大连接池大小
-- `AutoCreate`: bool - 连接成功后是否初始化或升级 banbot schema
-- `DbType`: string - 数据库类型：`questdb` 或 `timescale`；留空时按连接端口自动识别
-- `QdbMemPct`: float64 - QuestDB 内存使用比例，范围 0~1，仅 QuestDB 生效
-- `QdbMaxMemMB`: int - QuestDB 最大内存使用量（MB），仅 QuestDB 生效
+例如 `spec.ResolvePath("data.archive")` 按实际提供该字段的文件定位。内联/CLI 层按数据目录定位；没有目录时使用当前工作目录。缺少字段、路径为空或缺少必要基准时返回错误。
 
-### APIServerConfig
-API服务器配置,包含以下字段:
-- `Enable`: bool - 是否启用
-- `BindIPAddr`: string - 绑定IP地址
-- `Port`: int - 监听端口
-- `Verbosity`: string - 日志详细程度
-- `JWTSecretKey`: string - JWT密钥
-- `CORSOrigins`: []string - CORS允许的源
-- `Users`: []*UserConfig - 用户配置
+`LoadRuntimeSnapshot(args *CmdArgs)` 保留时序加载入口。`UnifiedConfig.TimeSeriesConfig()` 是受限的旧配置投影：拒绝因子、高级覆盖及新账户/身份/预算字段；不要把它当成统一引擎入口。
 
-### UserConfig
-用户配置,包含以下字段:
-- `Username`: string - 用户名
-- `Password`: string - 密码
-- `AllowIPs`: []string - 允许访问的 IP 列表
-- `AccRoles`: map[string]string - 账户角色权限
-- `ExpireHours`: float64 - Token过期时间(小时)
+## 配置结构与验证
 
-### RPCChannels
-通知渠道由 `RPCChannels map[string]map[string]interface{}` 配置。键是自定义渠道名称，值按 `type`（如 `mail`、`wework`、`telegram`）提供该渠道所需的字段；请参阅[配置指南](../guide/configuration.md)中的示例。
+省略 `engine` 保留旧时序策略开放参数 `More`；显式 `time_series` / `factor` 启用新策略身份、账户和资本份额语义。引用的账户必须存在，同账户 ID 不可重复，多策略预算需明确且合计不得超过 1。`CapitalWeight` 与开单倍率 `stake_rate` 不同。
 
-### PairMgrConfig
-交易对管理配置,包含以下字段:
-- `Cron`: string - 定时任务表达式
-- `Offset`: int - 偏移量
-- `Limit`: int - 限制数量
-- `ForceFilters`: bool - 是否强制过滤
-- `PosOnRotation`: string - 品种轮换时处理仓位：`hold` 或 `close`
-- `UseLatest`: bool - 回测未启用 cron 时是否按最新日期确定品种列表
+规范 YAML 把因子字段直接放在 `run_policy[]`，公共执行默认值放 `execution`，账户覆盖放 `accounts.<name>`。`config_version` 非必需；旧 1/2、`factor` 包装和 `execution.accounts` 仍可读，但同层同字段双路径冲突会被拒绝。高级字段按允许键和类型校验。
 
-### AccountConfig
-账户配置,包含以下字段:
-- `APIKey`: string - API密钥
-- `APISecret`: string - API密钥
-- `NoTrade`: bool - 是否禁止交易
-- `MaxStakeAmt`: float64 - 单笔最大开单金额
-- `StakeRate`: float64 - 开单金额倍数
-- `StakePctAmt`: float64 - 按百分比开单时的金额
-- `Leverage`: float64 - 杠杆倍数
+配置必须是无重复键的单文档 YAML mapping。`run_policy`、`wallet_amounts`、`fatal_stop`、`watch_jobs`、`historical_coverage` 后层整块替换，其他映射通常深合并。时间表示切换及环境变量展开见[配置指南](../guide/configuration.md)。
 
-## 公开方法
+常用根结构包括 `DatabaseConfig`（`DbType`、`Url`、`SIDRegistryURL` 等）、`APIServerConfig`、`UserConfig`、`PairMgrConfig`、`StratPerfConfig` 和 `AccountConfig`。完整 YAML 字段以配置模板为准；凭据在根 `accounts`，不能用执行账户配置替代真实交易授权。`RPCChannels` 是类型配置映射，支持 `wework`、`mail`/`email`、`telegram`；根 `Webhook` 是消息模板。通知参数见[通知指南](../guide/notifications.md)。
 
-### GetDataDir
-获取数据目录路径。
+## 兼容接口与写回
 
-返回：
-- `string` - 数据目录的绝对路径。未提供 `BanDataDir` 或 `-datadir` 时会触发配置错误；需要可空结果时使用 `GetDataDirSafe`。
+| API | 边界 |
+| --- | --- |
+| `GetConfig(args, showLog)` / `ParseConfig(path)` / `ParseConfigs(paths, showLog)` | 返回旧时序 `Config`；不支持统一 factor/mixed 分派 |
+| `LoadConfig(args)` / `ApplyConfig(args, cfg)` | 安装旧进程全局配置；不能用来切换并行任务；已 Loaded 后 `LoadConfig` 不重新安装 |
+| `GetDataDir()` / `GetDataDirSafe()` | 旧全局数据目录访问；前者无目录时报配置错误，后者允许空 |
+| `ResolveDataDir(explicit)` / `GetStratDir()` | 前者显式值优先于 `BanDataDir`，后者读取 `BanStratDir` |
+| `ParsePath(path)` | 旧数据目录前缀路径解析；新字段使用 `RunSpec.ResolvePath` |
+| `GetTakeOverTF(pair, defTF)` / `GetAccLeverage(account)` / `GetStakeAmount(account)` | 依赖旧配置状态的兼容查询 |
+| `DumpYaml(desensitize bool)` / `(*Config).DumpYaml()` | 导出旧配置，注意包级函数需传脱敏参数 |
+| `ParseTimeRange(raw)` | 返回起止毫秒时间戳和 error |
+| `GetExportConfig(path)` / `LoadPerfs(inDir)` | 数据导出配置 / 旧性能加载 |
 
-### GetStratDir 
-获取策略目录路径。
-
-返回：
-- `string` - 策略目录的绝对路径。如果环境变量 `BanStratDir` 未设置,返回空字符串。
-
-### LoadConfig
-
-兼容方法：加载后应用包级配置，不能用于新多任务运行器的状态隔离。普通入口使用 LoadRunSpec / RunSpec.RuntimeSnapshot；Snapshot.View 只读，Snapshot.Clone 取得独立容器副本，执行账户另行复制并使用同一锁。
-
-参数 args *CmdArgs；返回 *errs.Error。
-
-### GetConfig
-根据命令行参数获取配置。
-
-参数：
-- `args`: *CmdArgs - 命令行参数对象
-- `showLog`: bool - 是否显示日志
-
-返回：
-- `*Config` - 配置对象
-- `*errs.Error` - 错误信息
-
-### ParseConfig
-解析指定路径的配置文件。
-
-参数：
-- `path`: string - 配置文件路径
-
-返回：
-- `*Config` - 配置对象
-- `*errs.Error` - 错误信息
-
-### ApplyConfig
-将配置安装到旧的包级兼容 facade。
-
-常规的 Runtime 入口不依赖此函数来传递任务状态；它保留给尚未迁移的旧调用链。
-
-参数：
-- `args`: *CmdArgs - 命令行参数对象
-- `c`: *Config - 配置对象
-
-返回：
-- `*errs.Error` - 错误信息
-
-### GetTakeOverTF
-获取指定交易对的接管时间周期。
-
-参数：
-- `pair`: string - 交易对名称
-- `defTF`: string - 默认时间周期
-
-返回：
-- `string` - 时间周期
-
-### GetAccLeverage
-获取指定账户的杠杆倍数。
-
-参数：
-- `account`: string - 账户名称
-
-返回：
-- `float64` - 杠杆倍数
-
-### ParsePath
-解析路径,将 `$` 或 `@` 开头的路径替换为数据目录的绝对路径。
-
-参数：
-- `path`: string - 原始路径
-
-返回：
-- `string` - 解析后的路径
-
-### GetStakeAmount
-获取指定账户的下注金额。
-
-参数：
-- `accName`: string - 账户名称
-
-返回：
-- `float64` - 下注金额
-
-### DumpYaml
-将当前配置导出为 YAML 格式。
-
-返回：
-- `[]byte` - YAML 格式的配置数据
-- `*errs.Error` - 错误信息
-
-### LoadPerfs
-从指定目录加载策略性能数据。
-
-参数：
-- `inDir`: string - 输入目录路径
-
-### ParseTimeRange
-解析时间范围字符串。
-
-参数：
-- `timeRange`: string - 时间范围字符串,格式为 "YYYYMMDD-YYYYMMDD"
-
-返回：
-- `int64` - 开始时间戳(毫秒)
-- `int64` - 结束时间戳(毫秒)
-- `error` - 错误信息
-
-### GetExportConfig
-获取导出配置。
-
-参数：
-- `path`: string - 配置文件路径
-
-返回：
-- `*ExportConfig` - 导出配置对象
-- `*errs.Error` - 错误信息
-
-## 因子引擎集成
-
-RunSpec 保存唯一 policy 列表和字段来源；Snapshot 只读，执行账户另复制；capital_weight 不等于 stake_rate。
-
-[因子 API](factor.md) / [指南](../guide/factor.md)
-
-
-## 配置读取归属
-
-GetExgConfig 已不是当前导出 API；显式会话使用 Snapshot.View().Exchange。RPCChannels 是 Config 的配置映射（同时有旧 facade 变量），不是构造 Runtime 的方法；通知运行时由 rpc.Session 使用其 Snapshot 和账户配置。RunSpec.Config/Origins 返回所有权副本，Snapshot.View 按约定只读。
-
-统一入口 LoadRunSpec/LoadUnifiedConfigs 只读 YAML，不自动升级、备份或写回，config_version 不必填写；已有 1/2 标记仍接受。省略 engine 保留旧时序 More 参数语义，显式 engine 才启用新增身份、账户与预算字段。因子字段直接位于 run_policy[]；账户执行覆盖位于根 accounts.&lt;name&gt;，公共 execution 默认值仍保留。旧嵌套输入可解析，规范输出只使用浅层布局。
+编辑器写回使用 `WriteConfigAtomic(path string, expected, candidate []byte) *errs.Error`：`expected` 是读取时原始字节，并发修改会拒绝写入；内部校验后原子替换，保留权限。加载不自动触发写回。`GetExgConfig` 已不是导出 API；使用只读 `Snapshot.View().Exchange`。更多生命周期约定见 [Runtime API](./runtime.md)。

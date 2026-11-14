@@ -21,11 +21,15 @@ database:
   url: postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable
   max_pool_size: 50
   auto_create: true
-  qdb_mem_pct: 0.3       # Usage ratio of available memory, range 0 to 1
+  qdb_mem_pct: 0.3       # Allocation ratio of total system memory, valid range (0,1]
   qdb_max_mem_mb: 16384  # Maximum memory usage in MB
 ```
 
-When no QuestDB is reachable locally, banbot attempts to install and start it. `qdb_mem_pct` and `qdb_max_mem_mb` apply only to this backend. QuestDB WAL writes become visible asynchronously: relevant framework read-after-write paths use targeted visibility waits or owner-local caches/locks. Successful INSERT or CTAS does not guarantee an immediate read sees it. Wait for expected rows, timestamps, ranges, or counts. Before DROP/RENAME, verify the replacement matches its expected snapshot. Timeouts retain recovery markers; an empty read is not evidence that recovery is unnecessary. External SQL tools must follow the same rules.
+When a connection fails and the backend is identified as QuestDB, banbot attempts to install and start QuestDB on the machine running the bot; it does not deploy a remote server. Automatic installation supports macOS, Linux, and Windows and requires network access on first use. Preinstall the database for offline use. The automatically started database uses `<BanDataDir>/qdbdata`. For remote failures, check the target service, address, port, and credentials first; local startup cannot recover a remote service.
+
+`qdb_mem_pct` defaults to 0.3 and `qdb_max_mem_mb` to 16384. They tune locally started QuestDB, rather than imposing a hard limit on an existing remote service or the whole process. The ratio uses total system memory; zero or invalid ratios fall back to the default.
+
+QuestDB WAL writes become visible asynchronously; a successful write does not guarantee the next query sees it. When maintaining data through SQL, wait for expected data, verify replacement tables before swapping, and retain recovery markers on timeout. A single empty query must not trigger deletion of the old table or recovery state.
 
 ## TimescaleDB Configuration
 
@@ -39,7 +43,7 @@ database:
   auto_create: true
 ```
 
-With `auto_create: true`, every command (such as `kline down`, `backtest`, `trade`, and `web`) initializes or upgrades the banbot schema (tables, hypertables, and migration versions) after a successful connection. This is idempotent and safe to repeat; it does not create a PostgreSQL service, user, or database. With `false`, make sure the schema was already initialized by another instance with `auto_create` enabled; otherwise you will see errors such as `relation "exsymbol" does not exist`. In production, use a dedicated database account for banbot and configure TLS, passwords, and network access controls according to your deployment requirements.
+With `auto_create: true`, commands that connect to the market-data database (such as `kline down`, `backtest`, `trade`, and `web`) initializes or upgrades the banbot schema (tables, hypertables, and migration versions) after a successful connection. This is idempotent and safe to repeat; it does not create a PostgreSQL service, user, or database. With `false`, make sure the schema was already initialized by another instance with `auto_create` enabled; otherwise you will see errors such as `relation "exsymbol" does not exist`. In production, use a dedicated database account for banbot and configure TLS, passwords, and network access controls according to your deployment requirements.
 
 ### Deploying TimescaleDB
 
@@ -49,22 +53,14 @@ Whichever installation method you use, make sure that:
 2. a user and a database have been created for banbot;
 3. a superuser has run `CREATE EXTENSION IF NOT EXISTS timescaledb;` in the target database. banbot also runs this statement when initializing the schema, but regular accounts usually lack the privilege to create this extension, so creating it in advance avoids initialization failures.
 
-::: code-group
-```shell [MacOS (Homebrew)]
-brew tap timescale/tap
-brew install timescale/tap/timescaledb   # also installs the required PostgreSQL
-timescaledb_move.sh                       # copy extension files into PostgreSQL
-# tune settings and add shared_preload_libraries; use the PostgreSQL version printed by brew
-timescaledb-tune --quiet --yes --conf-path=/opt/homebrew/var/postgresql@18/postgresql.conf
-brew services restart postgresql@18
-```
-```shell [Docker]
+The Docker example below persists data under `/opt/tsdb`; select an image compatible with your chosen PostgreSQL/TimescaleDB version. For a native macOS installation, use the service name and configuration path printed by your installer instead of copying another machine's PostgreSQL version or Homebrew path.
+
+```shell
 docker run -d --name timescaledb -p 5432:5432 \
   -e POSTGRES_PASSWORD=your-password \
   -v /opt/tsdb:/var/lib/postgresql/data \
   timescale/timescaledb:latest-pg17
 ```
-:::
 
 Then create the user, database, and extension (for Docker, run these via `docker exec -it timescaledb psql -U postgres`):
 
@@ -77,6 +73,12 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 The `config.yml` generated by `bot init` uses QuestDB by default. To use TimescaleDB, override `database` in `config.local.yml` as shown above.
 
+## Connection Pools and Multiple Writers
+
+If `max_pool_size` is omitted, the default is `max(40, CPU count × 4)`. Values below 30 produce a warning because bulk downloads can exhaust connections.
+
+When multiple processes register new symbols in the same QuestDB, configure `database.sid_registry_url` to use a separate PostgreSQL SID registry, for example `postgresql://banbot:your-password@127.0.0.1:5432/sid_registry?sslmode=disable`. All participating processes should share the registry. Create its service, user, and database first; `auto_create` only initializes the registry schema. This registry does not store market data or switch QuestDB to TimescaleDB. Symbol identity is exchange, market, and symbol; `exg_real` is metadata only.
+
 ## Automatic Detection
 
 When `db_type` is not set, banbot detects the backend from the connection port: `8812` is treated as QuestDB, and `5432` as PostgreSQL/TimescaleDB; other ports are probed further. New configurations should always set `db_type` for readable and stable behavior.
@@ -87,6 +89,6 @@ Regardless of the backend, banbot uses a unified time-series interface to manage
 
 Time-series schemas store fixed float/int/string/bool/json columns; default K-lines and extensions use the same DataSeries.Values runtime map. Database integers are 64-bit. Database JSON encoding is not the same contract as arbitrary Go values; fixed-column round trips cannot restore absent-key versus explicit-NULL distinctions.
 
-QuestDB custom-series deletion updates effective sranges coverage first, then rewrites physical data only when the current compaction threshold is reached, verifying the replacement snapshot. TimescaleDB uses transactions and physical deletion. Do not bypass the repository to alter coverage metadata. ormo order state and ormu UI tasks use separate SQLite files; shared execution ledgers/stores also have their own persistence responsibility, separate from time-series tables.
+Use data commands or `SeriesStore` for deletion, backfill, and coverage updates instead of editing coverage metadata directly. Order state and UI tasks use separate SQLite files and are independent of the market-data backend selected here.
 
 See [Custom Time-Series Data](./custom_data.md) for integration, storage, and consumption.

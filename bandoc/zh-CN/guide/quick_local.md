@@ -1,5 +1,5 @@
 ## docker一键启动
-推荐使用[runbanbot(docker)](https://gitee.com/banbox/runbanbot/)一键启动，无需配置，开箱即用；
+推荐使用[runbanbot(docker)](https://gitee.com/banbox/runbanbot/)启动示例环境；请按项目说明检查数据目录、数据库和访问密码。
 
 启动成功后，浏览器访问[127.0.0.1:8000/zh-CN](http://127.0.0.1:8000/zh-CN)即可打开Web UI；
 
@@ -10,7 +10,7 @@
 如果希望本地安装启动，您可按照下面步骤快速在本地配置并运行banbot：
 
 ## Step 1. 本地安装
-您需要安装Golang开发环境，建议使用最新版本。banbot 支持 QuestDB 和 TimescaleDB 存储 K 线及其他时序数据：`bot init` 生成的默认配置使用 QuestDB，本机连接失败时 banbot 会自动下载安装并启动它；使用 TimescaleDB 时请先自行部署 PostgreSQL 和 TimescaleDB 扩展，并在配置中切换数据库。详细配置请参阅[数据库](./database.md)。
+当前源码的 `go.mod` 要求 Go 1.26.0，并声明 Go 1.26.8 工具链；请安装匹配的工具链，或允许 Go 自动下载项目声明的版本。banbot 支持 QuestDB 和 TimescaleDB 存储 K 线及其他时序数据：`bot init` 生成的默认配置使用 QuestDB，本机连接失败时 banbot 会自动下载安装并启动它；使用 TimescaleDB 时请先自行部署 PostgreSQL 和 TimescaleDB 扩展，并在配置中切换数据库。详细配置请参阅[数据库](./database.md)。
 
 您也可以查看B站的[安装教程视频](https://www.bilibili.com/video/BV1QuLozqEzg/)
 
@@ -48,7 +48,7 @@ go build -o bot.exe
 当您在策略项目下执行`go build`时，您的策略将和banbot源码一起打包为单个可执行文件，您可使用此文件回测、实盘、或启动WebUI等。
 
 ## Step 3. 配置环境变量
-为方便后续使用，您需要设置环境变量`BanDataDir`和`BanStratDir`。
+为方便后续使用，建议设置环境变量 `BanDataDir` 和 `BanStratDir`。也可使用 `--datadir` 指定数据目录，显式参数优先。
 
 `BanDataDir`建议设置为一个空目录。是banbot运行过程中回测结果、前端UI资源文件保存的目录。不建议设置为策略项目的子目录。
 
@@ -84,10 +84,10 @@ BanStratDir=E:\quant\banstrats
 注意一般修改后需要打开新的终端窗口才会生效。
 
 ## Step 4. 修改配置文件
-在策略项目下，只需执行`bot.exe init`即可在`BanDataDir`下自动初始化配置文件`config.yml`和`config.local.yml`
+在策略项目下，Linux/macOS 执行 `./bot init`，Windows PowerShell 执行 `.\bot.exe init`，即可在 `BanDataDir` 下初始化 `config.yml` 和 `config.local.yml`。未设置环境变量时，可用 `./bot init --datadir /path/to/bandata`
 <img style="width:780px;margin-top:10px" src="/img/init_config.jpg"/>
 
-然后编辑`config.local.yml`文件，设置交易所密钥、单笔金额、交易策略和周期等。
+然后编辑 `config.local.yml`，设置单笔金额、虚拟钱包、策略和周期。下面是时序回测示例；`ma:demo` 必须已注册到所编译的策略项目中。
 
 示例：
 ```yaml
@@ -100,16 +100,7 @@ pairs: ['ETH']
 run_policy:
   - name: ma:demo
     run_timeframes: [15m]
-accounts:
-  user1:
-    binance: # or okx/bybit
-      prod:
-        api_key: vvv
-        api_secret: vvv
-# 中国大陆不能直接访问币安api，请设置vpn代理，或设置HTTP_PROXY/HTTPS_PROXY，以及系统代理配置
-exchange:
-  binance:
-    proxy: http://127.0.0.1:10808  # 设置为no，禁用系统代理
+
 ```
 
 ::: tip TIP
@@ -125,7 +116,7 @@ database:
 ```
 
 ## Step 5. 启动WebUI
-在策略项目下，只需执行`bot.exe`即可启动WebUI并自动打开浏览器。
+在策略项目下，Linux/macOS 执行 `./bot web --datadir /path/to/bandata`，Windows PowerShell 执行 `.\bot.exe web --datadir E:\quant\bandata`。默认监听 `127.0.0.1:8000`；不带子命令也会进入 WebUI。
 
 您也可以访问`http://127.0.0.1:8000/zh-CN` 体验。
 
@@ -134,3 +125,7 @@ database:
 接下来您可能希望了解[banbot从入门到进阶](https://www.bilibili.com/video/BV1b72CBXEQu/)
 
 管理策略项目时，我们推荐使用AI IDE；您也可以使用`Visual Studio Code`或`GoLand`
+
+绑定 `0.0.0.0` 或 `::` 时必须提供 `--password`，包括容器中的默认通配监听地址；Basic Auth 用户名固定为 `banbot`。例如 `./bot web --datadir /path/to/bandata --host 0.0.0.0 --password YOUR_PASSWORD`。开发 WebUI 有文件管理和编译能力，建议仅供可信用户访问；实盘 Dashboard 使用独立的 `api_server` 配置，见[实盘交易](./live_trading.md)。
+
+安装后，可先运行 `./bot backtest --datadir /path/to/bandata` 验证示例配置，再阅读[自定义策略](./strat_custom.md)或[多因子与截面指南](./factor.md)。

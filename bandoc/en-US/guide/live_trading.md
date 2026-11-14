@@ -1,14 +1,9 @@
-banbot allows you to perform real-time simulated trading or live trading without modifying your strategies. This document helps you deploy a trading bot to a production environment.  
-Binance's servers are located in Tokyo, Japan. To ensure network stability during long-term real-time operation, it is recommended that you deploy the robot on a server close to the exchange servers.
+# Live simulation and production deployment
 
-::: warning Risk Warning
-Banbot currently does not have a large number of live trading users. Although common live trading use cases have passed testing, there is still a possibility that undiscovered bugs may cause financial losses. Use of this software is at your own risk. The author and all related parties assume no responsibility for your trading results.
+`bot trade` starts time-series, factor or mixed strategies from one `run_policy`. Default production and live simulation use a local Hub for shared-account execution: configure and start Hub before the robot. The default path currently supports linear perpetuals and does not establish completed end-to-end real-venue acceptance. See [Shared accounts and Hub](./execution.md) for account declarations and recovery.
 
-If you are planning to start live trading, please ensure that your strategy or yml configuration includes appropriate stop-loss settings to avoid significant losses, and test with a small amount of capital for a period of time first.
-:::
-
-::: tip Technical Support
-We offer preferential live trading servers and provide live trading technical support services, Singapore 4C8G only 60 yuan per month, Japan 4C6G 85 yuan per month. [Go to Purchase](https://banbot.site/en-US/services)
+::: warning Before running
+Verify strategy, data, instrument units, funding and risk limits, then validate operation in live simulation. Production requires real-session capability checks and startup reconciliation. Software protection depends on Hub and market-data availability. Changing an environment name or API key cannot replace acceptance testing.
 :::
 
 ## 1. Compilation
@@ -57,181 +52,64 @@ go build -o bot
 ```
 :::
 
-## 2. Editing Configuration
-Upload the compiled executable file to the `/ban` directory on the target server. Create a directory `/ban/data` as the data directory and set the environment variable `BanDataDir=/ban/data`.
+## 2. Editing configuration
 
-Then execute `/ban/bot init` to generate a YML configuration file in `/ban/data`.
+Upload the executable containing registered strategies to `/ban/bot` and prepare `/ban/data`:
 
-Next, edit the `/ban/data/config.local.yml` file to set the exchange keys, single transaction amount, trading strategy, and cycle, etc.
-
-You can configure multiple strategies and accounts. If you need to run multiple strategies on different accounts, you can create multiple YML configuration files and start multiple bot processes accordingly.
-
-For detailed configuration, refer to the [Configuration File](./configuration.md).
-
-::: tip Note
-It is recommended to use a sub-account for live trading and only transfer the necessary funds. If you use `stake_pct` and there are other assets in the account, it will calculate the order amount using all assets, which may lead to calculation errors.  
-`config.local.yml` takes precedence over `config.yml`. You can modify your configuration in either of these files. There is no need to specify these configuration file paths during startup; they will be automatically read.  
-Dry-run mode uses 1-minute K-line matching for local orders, so order status will have a 1-minute delay.
-:::
-
-## 3. Starting the Trading Bot
-You need to start both the spider process and the bot process. The spider process is used to subscribe to and update public exchange data such as K-lines and order books, saving them to the database. Registered custom time-series data sources automatically backfill historical data when the bot starts and may provide their own live subscriptions; they do not depend on Spider.
-The bot process subscribes to candlestick data and other information from the spider process and executes trading strategies. You can start multiple bot processes to run different strategies.
-
-Strategies and trading accounts consume minimal resources. On a 2-core, 2GB VPS, you can start multiple bot processes, and a single bot process can be configured with hundreds of strategies and hundreds of trading accounts.
-
-**Starting the Spider**  
-Execute `bot spider` to start the spider process immediately. It is recommended to start it in the background and dump the logs:
-```shell
-nohup /ban/bot spider > /tmp/spider.log 2>&1 &
+```sh
+mkdir -p /ban/data
+export BanDataDir=/ban/data
+/ban/bot init
 ```
-**Starting the Trading Bot**  
-Execute `bot trade` to start the real-time trading bot. It is recommended to start it in the background and dump the logs:
-```shell
-nohup /ban/bot trade -config @demo.yml > /tmp/trade.log 2>&1 &
-```
-::: tip Tip
-The logs for the spider process will be automatically saved to `@logs/spider.log`; the logs for the bot process will be automatically saved to `@logs/[bot_name].log`. Log files will be rotated automatically when they exceed 300MB in size.
 
-However, these files can only record the log output during normal operation. If the robot terminates unexpectedly, the panic error log at the time of exit cannot be recorded. Therefore, it is recommended that when you start the spider and the robot, you redirect the stdout and stderr outputs to a certain file.  
-:::
+Edit market, database and strategy settings in `config.local.yml`. Defaults load `config.yml` followed by `config.local.yml`, with the latter taking precedence. Repeat `--config` for additional overlays. Keep account credentials in robot configuration; Hub configuration supplies public-market/database settings and the sender lease.
+
+For live simulation select `env: dry_run` and `execution.funding_policy: explicit-zero`. For production select `env: prod`, real credentials and `required-stream`. Both require instrument units, capital and risk declarations. Time-series-only entries additionally require `execution.store` and `sender_lease_dir`. Legacy `fatal_stop` and dynamic `leverage` (including account-level settings) have not migrated to shared live execution and are rejected. Do not simply switch an old configuration to prod. See [Configuration](./configuration.md) and [Shared account setup](./execution.md#configure-and-start).
+
+Several strategies/robots can share one physical account through one Hub while retaining strategy budgets and attribution. Do not run independent senders for that account. Use separate subaccounts for independent capital boundaries. Keep strategy IDs stable and distinct across robots, and check attribution and budgets after startup.
+
+## 3. Starting Hub and the robot
+
+`hub` hosts public market data and private account execution; `spider` is its alias. Registered custom time-series sources can backfill and subscribe independently of the public Spider. Account execution still follows the selected Hub/provider route. Public data defaults to `127.0.0.1:6789`; the private socket defaults to `/ban/data/execution/hub.sock`. They are not interchangeable.
+
+Prepare complete `hub.yml` and `live.yml` files using the shared-account guide. Check Hub listening, account registration, recovery/reconciliation and strategy warmup in the foreground first. After verification, use a process manager or background execution while retaining stdout/stderr:
+
+```sh
+nohup /ban/bot hub --datadir /ban/data --config /ban/hub.yml > /ban/data/hub-console.log 2>&1 &
+# Run only after Hub is listening
+nohup /ban/bot trade --datadir /ban/data --config /ban/live.yml > /ban/data/trade-console.log 2>&1 &
+```
+
+Do not start hub and spider on the same socket. Address errors from a missing Hub, incomplete capabilities, conflicting declarations or failed reconciliation; startup does not fall back to local sending or paper. `trade --dry-run` requires a factor policy and runs historical events replay. Use `env: dry_run` without that flag for live simulation.
+
+Stopping one robot does not automatically close positions. Hub continues existing pending orders and protection. After Hub restart, accounts await robot reauthentication and local protection is inactive until authentication. Preserve the execution directory and journals, and follow [Recovery](./execution.md#restart-and-recovery). A running process alone does not prove account recovery.
 
 ## 4. Notifications, DashBoard, and Monitoring
-### Notifications
-You can configure `rpc_channels` in the YML file for notifications. Messages will be sent to your social apps when the bot starts, stops, enters a position, or exits a position. Currently supported:
-- **WeWork**: Send messages through WeWork bot
-- **Email Notifications**: Send email notifications via SMTP
+### Notifications and remote control
 
-**WeWork Notification Setup**
+Configure WeCom, email or Telegram through `rpc_channels`. See [Notifications](./notifications.md) for templates, filtering and SMTP examples. Both `min_intv_secs` and `retry_delay` use seconds. Delivery is asynchronous: receiving a message does not establish a new fill; check account state and logs during deployment.
 
-You can follow the WeCom plugin in WeChat (scan the QR code from the WeCom PC management console) to receive these messages in WeChat.
+Custom Telegram mode uses `token` and `chat_id`. Dashboard relay mode without a token provides a binding link in startup logs. An empty `secret` is generated; a manually supplied secret must be UUID v4. Relay mode needs outbound HTTPS and TCP 6788 to `www.banbot.site`; custom mode needs Telegram API access and can use a channel `proxy`.
 
-**Email Notification Setup**
-
-Configure email notifications to receive timely email alerts when system exceptions occur:
-
-```yaml
-# Email service configuration
-mail:
-  enable: true
-  host: smtp.qq.com
-  port: 465
-  username: your_email@qq.com
-  password: your_authorization_code
-
-# Email notification channel
-rpc_channels:
-  mail_exception:
-    type: mail
-    disable: false
-    msg_types: [exception]
-    min_intv_secs: 300  # Send at most once every 5 minutes
-    touser: 'alert@company.com'
-```
-
-**Telegram Notification Setup**
-
-banbot supports two Telegram notification methods: official bot and custom bot.
-
-**Method 1: Official Bot (Recommended)**
-
-Use banbot's official Telegram bot, no need to apply for Bot Token, simplest configuration:
-
-```yaml
-rpc_channels:
-  telegram_bot:
-    type: telegram
-    disable: false
-    secret: ""  # Optional: custom UUID v4 format secret, auto-generated if empty
-    msg_types: [entry, exit, status, exception]
-    min_intv_secs: 5
-```
-
-After starting the bot, the log will output information similar to:
-```
-Manage Your Bot On https://t.me/trade_banbot?start=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-```
-
-Click the link or search for `@trade_banbot` in Telegram, send `/start xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` to bind.
-
-::: tip Tip
-The official bot method connects through an encrypted relay. Network-restricted deployments must allow outbound HTTPS to `www.banbot.site` and TCP connections to `www.banbot.site:6788`.
-:::
-
-**Method 2: Custom Bot**
-
-Create your own Telegram bot with full control:
-
-```yaml
-rpc_channels:
-  telegram_bot:
-    type: telegram
-    disable: false
-    token: "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"  # Required: Bot Token
-    chat_id: "987654321"                           # Required: Chat ID
-    proxy: "http://127.0.0.1:7897"                 # Optional: Proxy address
-    msg_types: [entry, exit, status, exception]
-    min_intv_secs: 5
-```
-
-Obtaining Bot Token and Chat ID:
-1. Find `@BotFather` in Telegram, send `/newbot` to create a bot and get the Token
-2. Add the bot to your chat, send any message, then visit:
-   ```
-   https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
-   ```
-   Find the `chat.id` field value in the returned JSON
-
-::: warning Note
-Custom bot requires access to Telegram API. If network is restricted, configure `proxy` address.
-:::
-
-**Common Configuration**
-
-| Parameter | Description | Default |
-|-----------|-------------|----------|
-| `type` | Channel type, must be `telegram` | - |
-| `disable` | Whether to disable this notification channel | `false` |
-| `msg_types` | Message types: `entry` for entry, `exit` for exit, `status` for status, `exception` for exceptions | `[]` |
-| `min_intv_secs` | Minimum send interval (seconds), avoid too frequent messages | `0` |
-| `retry_delay` | Retry delay after send failure (seconds) | `30` |
-
-**Telegram Control Commands**
-
-After configuration, you can remotely control the bot with the following commands:
-
-| Command | Function |
-|---------|----------|
-| `/menu` | Display interactive operation menu (recommended) |
-| `/account` | View account list and switch accounts |
-| `/switch [account]` | Switch to specified account |
-| `/orders` | View current account's order list |
-| `/close [orderID\|all]` | Close specified order or all orders |
-| `/status` | View current account's trading status |
-| `/disable [hours]` | Disable current account from opening positions (default 1 hour) |
-| `/enable` | Re-enable current account to open positions |
-| `/wallet` | View current account's wallet balance |
-| `/help` | Display help information |
-
-::: tip Multi-Account Management
-If multiple trading accounts are configured, use `/account` to view all accounts, switch accounts via `/switch`, and all operations (view orders, close positions, disable opening, etc.) apply to the currently active account.
-:::
+Commands including `/orders`, `/close`, `/status`, `/disable` and `/enable` can affect trading. Confirm the selected account in multi-account operation. Channel authorization differs from Dashboard account roles; test delivery and control scope with a test account first. See [Notifications](./notifications.md) and [RPC API](../api/rpc.md) for configuration.
 
 ### DashBoard UI
 You can configure `api_server` in the yml file. This will start a web service simultaneously when the bot is launched. After the bot is started, you can access the bot's DashBoard using the configured username and password to view the trading overview and manage the bot.
 ```yaml
 api_server:
-  enable: enable
+  enable: true
   bind_ip: 127.0.0.1
   port: 8001  # Needs to be allowed in firewall or through nginx reverse proxy
   jwt_secret_key: '[very_strong_secret]'
   users:
     - user: ban
-      pwd: '123'
+      pwd: 'replace-with-a-strong-password'
       allow_ips: []  # Allowed client IPs
       acc_roles:
         user1: admin  # user1 corresponds to the user key in accounts
 ```
+`api_server` is hosted by the time-series CryptoTrader startup path; do not assume a pure-factor Hub run starts the same Dashboard. `/api/bot` uses JWT and account operations require roles. `/api/kline`, `/api/kline/csv/upload` and `/api/ws` are outside the JWT group; protect these paths at the reverse proxy for public deployment.
+
 The web service mentioned above is started with HTTP. It is recommended that you set the `bind_ip` to the local or intranet IP of the server to prevent unauthorized access.
 
 If you need to access the server's Dashboard from your local machine, you can connect to the server running the bot via SSH and then use port forwarding to forward requests from a local port to the server port:
@@ -263,6 +141,8 @@ mail:  # You also need to set up the email sender; for details, refer to the ema
 ```
 
 ### Monitoring
+`check_bot.sh` checks only for a configuration filename in process arguments. The `live` argument below matches `live.yml`, not the `trade` subcommand. Also monitor Hub recovery warnings, account freezes and market-data availability; process liveness does not prove protection is active.
+
 You can use `crontab` to periodically execute the [check_bot.sh](https://github.com/banbox/banbot/blob/main/doc/check_bot.sh) script to check the bot's status and send email notifications.
 ```shell
 # for centos 8
@@ -276,7 +156,7 @@ set smtp-auth=login
 set smtp-auth-user=your_email@gmail.com
 set from=your_email@gmail.com
 set smtp-auth-password=your_email_password
-set ssl-verify=ignore
+set ssl-verify=strict
 ```
 Test the email sending function:
 ```shell
@@ -288,7 +168,7 @@ crontab -e
 ```
 Add a line:
 ```text
-*/5 * * * * /ban/check_bot.sh trade user1@example.com user2@example.com
+*/5 * * * * /ban/check_bot.sh live user1@example.com user2@example.com
 ```
 Grant execution permissions to the script:
 ```shell
@@ -297,11 +177,9 @@ chmod +x /ban/check_bot.sh
 
 ## Factor and cross-sectional engine
 
-bot trade assembles factor/mixed policies only with verified entry.RegisterFactorLiveBinding evidence: transport, symbol metadata, revision/publication mapping, funding and startup reconciliation. execution.live_provider selects a registered name; verified-session is an application example, not a built-in accepted venue. Missing capabilities fail startup without paper fallback.
+Factor/mixed live strategies also default to Hub. They do not require a factory named `verified-session`; that name is a custom production embedding example. Missing real execution, normalized metadata, data visibility/funding or reconciliation evidence fails startup. Provider registration and YAML validation do not establish real-venue acceptance.
 
-Remove archive, Prepare/Warmup, reconcile and Commit a generation. Observe current records and Flush complete/timed-out barriers. Stop then Join before releasing resources; failed candidates preserve the old generation. Live rejects history-ic; InitialNAV deposits no funds. trade --dry-run is separate historical paper replay.
-
-See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
+Remove historical archive input, warm up and install current subscriptions, then admit targets after reconciliation. Live rejects every history combination method. `InitialNAV` deposits no live funds. See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md) for behavior, pair registration, results and limits.
 
 ## Resource and control boundaries
 

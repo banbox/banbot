@@ -15,7 +15,7 @@ CLI 启动已统一：根命令 `backtest` / `trade` 从同一 YAML `RunSpec` �
 
 ## 常见技术指标
 
-Go 构造函数与 DSL 新增 18 类指标、22 个标量算子，均支持 `Plan.Batch` 与持续推进的 `Session`：`SMA/RMA/WMA/VWMA/RSI/ROC/MOM/TR/ATR/CCI/Stoch/WillR/OBV/MFI/Highest/Lowest`，以及各返回三个 `*Node` 的 `MACD`、`BBands`。完整函数签名、公式和有效性规则见[常见技术指标](https://github.com/banbox/banbot/blob/v0.6.0-beta.7/doc/factor_indicators.md)。
+Go 构造函数与 DSL 新增 18 类指标、22 个标量算子，均支持 `Plan.Batch` 与持续推进的 `Session`：`SMA/RMA/WMA/VWMA/RSI/ROC/MOM/TR/ATR/CCI/Stoch/WillR/OBV/MFI/Highest/Lowest`，以及各返回三个 `*Node` 的 `MACD`、`BBands`。完整函数签名、公式和有效性规则见[常见技术指标](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md)。
 
 `MACD(price,12,26,9)` 返回 line、signal、hist；DSL 分别写 `ts.macd`、`ts.macd_signal`、`ts.macd_hist`，每次显式传入四个参数。`BBands(price,20,2,2)` 返回 upper、middle、lower；DSL 的 `ts.bbands_upper/middle/lower` 均显式提供四个参数。周期为 `[1,10000]` 的整数，MACD 要求 fast < slow，布林带倍数为有限非负数。
 
@@ -80,6 +80,16 @@ run_policy:
     params: {window: 24, k: 1}
     definition: CodeMomentumV1
 ```
+
+## 简化注册与统计套利
+
+`runner.RegisterFactor(name string, build func(runner.FactorContext) (runner.FactorSpec, error)) error` 注册简单截面因子。`FactorContext.Close()` 提供价格节点，`Params` 读取参数；注册调用和 builder 中的 `Params.Err()` 都需检查。`FactorSpec.Outputs` 为命名节点，省略 Combine 时等权合成。
+
+`runner.RegisterPairs(name string, build func(*runner.Params) (runner.PairsSpec, error)) error` 注册滚动对数回归配对策略，并为每次运行创建独立 builder/统计状态。`PairsSpec` 声明 `Pairs []runner.Pair`（Y、X 为标准 symbol）、Field（默认 close）、Window（至少 3）、Band 和 Gross（默认 1/配对数，总预算不超过 1）。入场 β 在持仓中固定；Band 的 Stop/MaxHold 出场后必须回到 Exit 区间才重新入场。
+
+`statistics.NewRollingSpread(window)` 的 `Observe(x, y float64) (statistics.SpreadPoint, bool)` 消费两个对数价格；`statistics.NewBandTrader(config)` 的 `Step(z float64) int` 返回 -1/0/+1。每个价差使用独立实例。它们只计算统计量/方向，不会自动创建订单或证明协整、成交同步及盈利。注册示例见[统计套利指南](../guide/factor.md#统计套利-声明配对即可)。
+
+`RegisterPortfolioFactory(name, factory, validator)` 用于带可变状态的自定义组合。validator 只校验配置，不能借用账户或启动工作；`PreparePortfolioConfig` 在预检后为一次运行创建实例，不能把实例复用到另一轮回测。配对缺腿时会请求平仓并暂停；窗口内完全无数据且被标记不可用的配对会整次跳过，预算不转给其他配对。
 
 ## 配置所有权
 
@@ -149,12 +159,24 @@ Full 将遗漏的旧资产目标归零；Patch 保留遗漏目标。身份包含
 
 ## replay 与 live
 
-Run 是历史驱动；NewLive 创建实时时钟/已对账 sink 驱动，Observe 接收当前数据，Flush 排空决策 barrier。Stop 禁止新输入，Join 等待已接纳回调和计算后释放共享 Session。共享计算不会共享目标、预算或研究状态。
+`runner.Run` 是历史驱动；`runner.NewLive(c Config, sink Sink, clock func() int64, out Output) (*Live, error)` 使用调用者注入的时钟与已对账账户 sink，不创建行情定时器。`Observe(ctx, record)` 接收当前版本记录并同步推进处理；`Flush(ctx, decision)` / `FlushAt(ctx, decision, cutoff)` 由外部源驱动轮次完成。`Stop` 禁止新输入，`Join` 等待已接纳回调和计算后释放共享 Session。共享计算不合并目标、预算或研究状态。
 
-嵌入式实时装配使用 runtime.CompileFactorsLivePlan、SubscribeFactorsLive、InstallFactorsLive、BindFactorsLive；入口以 entry.RegisterFactorLiveBinding 注册已验证会话证据。它不是单纯的 YAML 开关；缺 transport、metadata、revision/funding 或账户证据会失败。当前无完整真实 venue 验收。
+嵌入式数据装配使用 `runtime.CompileFactorsLivePlan`、`SubscribeFactorsLive`、`InstallFactorsLive`、`BindFactorsLive`。CLI 默认通过 Hub：`execution.live_provider` 省略、`banexg` 或 `hub` 均走本机私有 socket；`runner.NewHubAccountSink` 使用 Hub 的账户应用接口，账户所有权不在机器人。
+
+自定义生产嵌入才使用 `entry.RegisterFactorLiveBinding` 提供 transport、metadata、revision/funding 与账户证据；不能同机器人混用 Hub。实时 `env: dry_run` 只允许 Hub paper；`trade --dry-run` 是历史回放。live 拒绝全部 history 合成、source-event 决策及回放专用期权/终止结算能力。当前没有完整真实 venue 生产验收保证。运行与恢复见[共享账户指南](../guide/execution.md)。
 
 ## 数据与输出
 
 VersionRecord 保存事件、可见性/接收时间、修订和有类型 Values。Snapshot getter 的复制是所有权边界，禁止以性能优化移除任意字段和 NULL。Session 与 Batch 的递归历史语义不同，不互相替代。
 
 Manifest 记录代码、图、Universe、可见性、输入引用、标签和执行假设；它不同于原始记录。Result.Unresolved 保留未成熟标签。事件/posting Gob 是账户审计输出，时序 orders.gob 是兼容报告，两者不互换。
+
+## 结果字段与报告边界
+
+`runner.Result` 在 `run.json` 的 `Results[]` 与 `run-completed` 中以 Go 字段名序列化。`Pairs` 仅在 `RegisterPairs` 回放收尾汇总；`PairResult` 提供 Y/X、Episodes、EpisodeCount、PnL、Trades、Wins、WinRate、InMarketBars、Bars、PausedBars、AvgHoldBars、LastBeta、Turnover、Unavailable 和 UnavailableLeg。Episodes 的预算为各对均分 400 条、每对至少 10 条，保留最早记录，可能不含完整历史。`PairEpisode` 含 StartMS、EndMS、Dir、EntryZ、ExitZ、Beta、Bars、Reason、PnL；Reason 为 exit/stop/maxhold/leg_missing/end。
+
+逐对 PnL 按各对决策权重和价格计算，占初始 NAV 的比例，不分摊成本。`PairsGrossPnL` 为合计；`PairsResidual = PairsNAVReturn - PairsGrossPnL` 还含延迟价格、权重漂移和共享品种净额成交的差异。`AllPairsUnavailable` 标识全无可交易配对，不能将其零交易净值解释为有效策略结果。
+
+`Attribution` 仅 weights 账本生成，events/live 不输出。价格变动产生 LongPnL/ShortPnL；成本含 Fees、Slippage、Funding、PITCost，满足 `FinalNAV - InitialNAV = LongPnL + ShortPnL - Fees - Slippage - Funding - PITCost + Residual`。至多 20 个 TopSymbols 按绝对 Net 排序，Net 不含账户级资金费，所以所有品种 Net 的合计等于 NAV 变化加 Funding。运行出错提前返回时 Pairs/Attribution 可能缺失。
+
+在策略的 `research` 下设 `panel: none` 只关闭输出 panel 行，不改变事件、内存 summary 或账本；默认 all。实际示例与排障见[结果指南](../guide/factor.md#统计套利与多空归因结果)。

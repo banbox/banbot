@@ -8,6 +8,21 @@ MarketState 组合 PriceState 和 PairCopiedState。价格缓存、bar 价格与
 
 独立 Runtime 使用自己的 Market.Prices；兼容价格 facade 保留历史调用，不能用于从另一个任务获取实时业务状态。
 
+## 价格读取接口
+
+在嵌入宿主中，令 prices := rt.Market.Prices，nowMS := rt.Clock.TimeMS()，使用：
+
+| Call | Result |
+| --- | --- |
+| `prices.GetPriceSafeExpAt(nowMS, symbol, side, expMS)` | `float64` |
+| `prices.GetLastBarPriceAt(symbol)` | `float64` |
+| `prices.GetLastBarTimeAt(symbol)` | `int64` |
+| `prices.SetPriceAt(nowMS, symbol, ask, bid)` | — |
+| `prices.SetBarPriceAt(nowMS, symbol, price)` | — |
+| `prices.RefreshLatestPriceAt(nowMS, rt.Exchange, symbol)` | `*errs.Error` |
+
+side 使用 buy/sell；价格过期或不存在可能返回 0，使用前应检查。真实最新价刷新访问网络，不能代替回测价格。策略 K 线回调可直接读当前 s.Env 或 DataEvent。
+
 ## Scheduler
 
 Scheduler 接口为 AddFunc(spec, callback)、Start() 和 Stop() context.Context。NewSchedulerWithConfig(location, lang) 在构造时固定时区/NTP 配置，不读写进程级设置。
@@ -15,3 +30,5 @@ Scheduler 接口为 AddFunc(spec, callback)、Start() 和 Stop() context.Context
 NewScheduler() 与 Cron() 保留旧调用形式；显式任务通过 Runtime.Cron 使用实例 scheduler。owned scheduler 由唯一 owner 停止并等待；borrowed scheduler 由外部 owner 关闭，某 Runtime 的关闭不能停掉其他任务。
 
 见[runtime](runtime.md)与[实时交易](../guide/live_trading.md)。
+
+`AddFunc(spec string, callback func()) (cron.EntryID, error)` 返回注册结果，必须检查 error。调度器使用含秒的六字段 cron（如 `0 */5 * * * *`）；Start 后才执行。外部 owner 停止时调用 ctx := scheduler.Stop()，再等待 <-ctx.Done()，不要在同一调度回调内等待自身。

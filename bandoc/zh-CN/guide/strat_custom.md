@@ -15,7 +15,7 @@ AI助手虽然很方便，但依然会犯错，您必须检查并理解AI输出�
 :::
 
 ::: tip 统计套利与截面策略
-时序策略也可复用引擎无关的原语：`statistics.RollingSpread`/`statistics.BandTrader`（配对价差 z-score 与入场/离场/止损滞回）。全市场截面和配对策略的最短入口见[多因子与截面策略](./factor.md#用-go-写策略三种入口)。
+时序策略也可复用引擎无关的原语：`statistics.RollingSpread`/`statistics.BandTrader`（配对价差 z-score 与入场/离场/止损滞回）。全市场截面和配对策略的最短入口见[多因子与截面策略](./factor.md)。
 :::
 
 ## 策略命名
@@ -66,11 +66,8 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
     atrLen1 := pol.Def("atrLen1", 9, core.PNorm(3, 20))
     atrLen2 := pol.Def("atrLen2", 9, core.PNormF(3, 20, 12, 1))
     atrLen3 := pol.Def("atrLen3", 9, core.PUniform(3, 20))
-    other1 := pol.More["other1"].(string)
-    other2 := pol.More["other2"].(int)
-    other3 := pol.More["other3"].(float64)
     return &strat.TradeStrat{
-		// 更多内容
+        WarmupNum: max(int(atrLen), int(atrLen1), int(atrLen2), int(atrLen3)),
     }
 }
 ```
@@ -89,7 +86,7 @@ run_policy:
 ```
 ::: warning 提示
 yaml配置`run_policy`中的每一项对应一次对策略函数的调用，生成一个特定参数的策略。  
-同一个策略可以在多个`run_poolicy`项中出现，即同一个策略函数可能会执行多次。  
+同一个策略可以在多个`run_policy`项中出现，即同一个策略函数可能会执行多次。
 策略函数返回的`*strat.TradeStrat`会应用到多个品种上，对应多个`*strat.StratJob`。
 所以任何单个品种相关的变量都不要保存在策略函数内，而应当通过`*strat.StratJob.More`保存。  
 策略函数中的变量应保持不被修改。否则会导致意外的状态。
@@ -97,9 +94,9 @@ yaml配置`run_policy`中的每一项对应一次对策略函数的调用，生�
 
 ## strat.TradeStrat 策略对象
 
-`TradeStrat`提供了丰富的属性配置和回调函数。最常用的是`OnBar`。
+`TradeStrat`提供了丰富的属性配置和回调函数。新策略推荐使用 `OnData`；`OnBar` 仍是可用的 K 线兼容回调。
 
-下面是`TradeStrat`的完整定义：
+下面是 `TradeStrat` 常用的公开字段（省略其他配置字段）：
 ```go
 type TradeStrat struct {
 	Name          string // 策略名称，无需设置，会自动设置为注册时的名称
@@ -120,6 +117,11 @@ type TradeStrat struct {
 	Outputs       []string // 策略输出的文本文件内容，每个字符串是一行
 	Policy        *config.RunPolicyConfig // 运行时配置
 
+	OnDataSubs          func(s *StratJob) []*DataSub
+	OnData              func(s *StratJob, data DataEvent)
+	OnWsData            func(s *StratJob, evt *orm.DataSeries)
+	OnSymbols           func(items []string) []string
+	OnPostApi           FnOnPostApi
 	OnPairInfos         func(s *StratJob) []*PairSub // 策略额外需要的品种或其他周期的数据
 	OnStartUp           func(s *StratJob) // 启动时回调。初次执行前调用
 	OnBar               func(s *StratJob) // 每个K线的回调函数
@@ -138,10 +140,44 @@ type TradeStrat struct {
 }
 ```
 :::tip tip
-`MinTfScore`是针对每个品种在指定周期k线通过价格变动、bar实体占比等计算的分数，用于淘汰变动太小，波动不足的交易对；或计算交易对的最佳周期。阈值默认取0.75，小于此阈值的交易所将会被过滤，如需禁用，可设为非零较小值0.0001
+`MinTfScore`是针对每个品种在指定周期k线通过价格变动、bar实体占比等计算的分数，用于淘汰变动太小，波动不足的交易对；或计算交易对的最佳周期。阈值默认取0.75，小于此阈值的品种将会被过滤，如需禁用，可设为非零较小值0.0001
 :::
 
 ## 简单策略示例
+
+新策略使用统一回调，下面是可直接注册为 `data:demo` 的完整示例。`OnData` 不能与 `OnBar` 或 `OnInfoBar` 同时设置，否则构造时 panic；本页后续 OnBar 示例仍可单独使用。辅助或自定义事件请用 RouteData 分流。
+
+```go
+package dataexample
+
+import (
+    "github.com/banbox/banbot/config"
+    "github.com/banbox/banbot/strat"
+    ta "github.com/banbox/banta"
+)
+
+func init() { strat.RegisterStrategy("data:demo", Demo) }
+
+func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+    return &strat.TradeStrat{
+        WarmupNum: 100,
+        OnData: strat.RouteData(strat.DataHandlers{
+            Main: func(s *strat.StratJob, data strat.DataEvent) {
+                fast, slow := ta.SMA(s.Env.Close, 5), ta.SMA(s.Env.Close, 20)
+                cross := ta.Cross(fast, slow)
+                if s.IsWarmUpState() { return }
+                if cross == 1 {
+                    _ = s.OpenOrder(&strat.EnterReq{Tag: "cross_up", Log: true})
+                } else if cross == -1 {
+                    _ = s.CloseOrders(&strat.ExitReq{Tag: "cross_down", Log: true})
+                }
+            },
+        }),
+    }
+}
+```
+
+
 ```go
 package ma
 
@@ -183,22 +219,22 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 > 您可在任意回调函数中使用指标，但注意，**所有指标都必须先在主周期 `OnData` 处理器中无条件调用一遍**；否则指标计算会出现错误。
 
 ## 技术指标库banta
-banbot使用高性能指标库[banta](https://github.com/banbox/banta)，它会对每个bar的指标计算状态进行缓存，这是banbot高性能的关键，您可访问[DeepWiki](https://deepwiki.com/banbox/banta)了解关于banta的更多信息。
+banbot使用高性能指标库[banta](https://github.com/banbox/banta)，它会对每个bar的指标计算状态进行缓存，这是banbot高性能的关键，指标与调用签名请查阅 [banta 上游仓库](https://github.com/banbox/banta)及 [Go API](https://pkg.go.dev/github.com/banbox/banta)。
 
 `banta.BarEnv` 和 `banta.Series`是banta中的两个关键结构体。
 
 `banta.BarEnv`是某个技术指标的运行环境，其中存储了当前交易所、市场、品种、时间周期等信息。
 一个策略任务至少会需要一个`banta.BarEnv`，如果通过`OnPairInfos`订阅了其他品种或时间周期，则需要多个运行环境。
-但需要注意的是，每个交易所、每个市场、每个品种、每个时间周期，只会创建一个运行环境`BarEnv`。
+在同一个 Runtime 中，相同交易所、市场、品种和周期可共享 BarEnv；不同 Runtime 的环境相互独立。
 
 `banta.BarEnv`中内置了几个原始的`Series`，即：`Open`,`High`,`Low`,`Close`,`Volume`，分别保存了开盘价、最高价、最低价、收盘价、成交量的序列信息。
 
 `Series`是`banta`中用于存储序列化数据的特殊结构体。`banta`中的所有技术指标函数，都是接收一个或多个`Series`，经过运算后，返回一个`Series`。
 
-当前可用指标还包括：`VWMA/VWAP`、`DEMA/T3/TEMA/MAMA/SSF/SWMA/TRIMA/VIDYA/ZLMA`、`DMI/ADX/AROONOSC/DX/SAR/PSAR/Ichimoku/KST`、`StochF/STOCHF/ULTOSC/Fisher/ROCR/TRIX/TSI/DPO/MOM/WilliamsPercent`、`Squeeze/NATR/Supertrend/Donchian/KeltnerChannel/PMAX`、`CMF/ADL/ADOSC/EFI/OBV/VPCI/MFI`、`LinReg/Slope/Correlation/LINEARREG_ANGLE`、`PivotHigh/PivotLow` 和 `CDL*` K线形态。多返回值函数须按知识库中注明的顺序接收。
+当前可用指标还包括：`VWMA/VWAP`、`DEMA/T3/TEMA/MAMA/SSF/SWMA/TRIMA/VIDYA/ZLMA`、`DMI/ADX/AROONOSC/DX/SAR/PSAR/Ichimoku/KST`、`StochF/STOCHF/ULTOSC/Fisher/ROCR/TRIX/TSI/DPO/MOM/WilliamsPercent`、`Squeeze/NATR/Supertrend/Donchian/KeltnerChannel/PMAX`、`CMF/ADL/ADOSC/EFI/OBV/VPCI/MFI`、`LinReg/Slope/Correlation/LINEARREG_ANGLE`、`PivotHigh/PivotLow` 和 `CDL*` K线形态。多返回值函数按当前依赖版本的 Go API 顺序接收。
 
 您可通过`Series.Get(0)`获取某个序列的最新值，比如`e.Close.Get(0)`获取最新收盘价；
-也可通过`Series.Range(0,5)`获取某个序列最近的5个值，返回长度为5的`[]float64`数组。
+也可通过`Series.Range(0,5)`获取某个序列最近的5个值，返回至多 5 个值的 `[]float64` 切片；历史不足时更短。
 
 当在同一个bar时间执行多次重复的计算时（如实盘多个账号运行同一批策略），`Series`会自动使用缓存的结果，避免重复计算。
 
@@ -219,7 +255,7 @@ banbot使用高性能指标库[banta](https://github.com/banbox/banta)，它会�
 
 您可以简单快速地实现您的自定义指标逻辑，以`Highest`为例：
 ```go:line-numbers {1}
-func Highest(obj *Series, period int) *Series {
+func Highest(obj *ta.Series, period int) *ta.Series {
 	res := obj.To("_hh", period)
 	if res.Cached() {
 		return res
@@ -236,7 +272,7 @@ func Highest(obj *Series, period int) *Series {
 
 实际上`Series`有一个成员属性：
 ```go
-Subs  map[string]map[int]*Series
+Subs  map[string]map[int]*ta.Series
 ```
 它保存了从该`Series`派生的所有`Series`，本质上策略中所有的`Series`都是由最初的`Open/High/Low/Close/Volume`派生出来的。
 
@@ -251,7 +287,7 @@ type sumState struct {
 	addLen int
 }
 
-func Sum(obj *Series, period int) *Series {
+func Sum(obj *ta.Series, period int) *ta.Series {
 	res := obj.To("_sum", period)
 	if res.Cached() {
 		return res
@@ -383,13 +419,14 @@ m, _ := s.More.(*Demo2Sta)
 
 发出入场信号只需要调用`StratJob.OpenOrder`方法，并传递一个`*strat.EnterReq`参数即可。
 
-最简单的情况是只对`EnterReq`的`Tag`属性赋值，其他全部使用默认参数。即按默认开单金额和杠杆倍数，打开一个做多订单。没有止盈止损。
+最简单的情况是只对`EnterReq`的`Tag`属性赋值，其他全部使用默认参数。即按默认开单金额和杠杆倍数请求做多；策略默认 StopLoss 仍可能生成止损。
 
-下面是`EnterReq`的全部参数：
+下面是 `EnterReq` 的常用策略参数（完整字段见 strat API）：
 ```go
 type EnterReq struct {
+    CommandID string // Stable request identity
 	Tag             string  // 入场信号
-	StgyName        string  // 策略名称
+	StratName        string  // 策略名称
 	Short           bool    // 是否做空
 	OrderType       int     // 订单类型, core.OrderType*
 	Limit           float64 // 限价单入场价格，指定时订单将作为限价单提交
@@ -403,6 +440,8 @@ type EnterReq struct {
 	StopLossLimit   float64 // 止损限制价格，不提供使用StopLoss
 	StopLossRate    float64 // 止损退出比例，0表示全部退出，需介于(0,1]之间
 	StopLossTag     string  // 止损原因
+	ActivationPrice float64 // Trailing stop activation price
+	CallbackPct float64 // Trailing stop callback percent, nonzero: 0.1–10
 	TakeProfitVal   float64 // 入场价格到止盈价格的距离，用于计算TakeProfit
 	TakeProfit      float64 // 止盈触发价格，不为空时在交易所提交一个止盈单。
 	TakeProfitLimit float64 // 止盈限制价格，不提供使用TakeProfit
@@ -421,16 +460,14 @@ type EnterReq struct {
 
 `Stop`是触发订单（止损），做多订单可设置更高的价格等待突破后入场，做空订单可设置更低的价格挂单等待跌破后入场。
 
-比如当前价格100，希望在价格上涨到120时限价122入场做多，可设置`{Stop: 120, Limit: 122}`
+例如当前价格为 100，等待突破 120 做多可设置 `&strat.EnterReq{Tag: "breakout", Stop: 120}`。`Stop` 与 `Limit` 互斥，同时设置会返回错误。
 
 当`OpenOrder`返回错误时，表示开单失败，您可`log.Error`记录错误信息，也可在`EnterReq`中设置`Log`为true，让系统自动记录错误日志。
 
-:::tip tip
-并非策略的任意位置调用OpenOrder均能开单，默认只有在`OnBar`, `OnOrderChange`, `OnBatchJobs`, `OnPostApi`这几个回调函数中调用开平仓会即刻执行。
+:::tip
+`OpenOrder`/`CloseOrders` 只校验并排队，不保证成交。主周期 `OnData`/`OnBar`、`OnBatchJobs`、订单回调和成功返回的 `OnPostApi` 有框架处理路径；辅助和高频回调不要假设自动提交。
 
-如果您需要在其他回调中也即刻入场，可自行调用`_, _, err := biz.GetOdMgr(s.Account).ProcessOrders(nil, s)`提交处理
-
-注意`OnOrderChange`默认只处理当前品种的开平仓信号，如需触发其他品种的开平仓，需自行对其他job调用`ProcessOrders(nil, job)`。
+需要显式提交时调用当前 job 的 `_, _, err, bound := s.ProcessRuntimeOrders()`，检查 err 和 bound；bound=false 表示未绑定显式 Runtime，不能用全局同名账户替代。其他品种的请求要通过其所属 job 处理。预热期间 OpenOrder 可能返回 nil，但不会入队。
 :::
 
 ## 发出离场信号
@@ -439,11 +476,12 @@ type EnterReq struct {
 
 最简单的情况是只对`ExitReq`的`Tag`属性赋值，其他全部使用默认参数。即以市价单关闭全部订单，包含做多订单和做空订单。
 
-下面是`ExitReq`的全部参数：
+下面是 `ExitReq` 的常用策略参数：
 ```go
 type ExitReq struct {
+    CommandID string // Stable request identity
 	Tag        string  // 退出信号
-	StgyName   string  // 策略名称
+	StratName   string  // 策略名称
 	EnterTag   string  // 只退出入场信号为EnterTag的订单
 	Dirt       int     // core.OdDirt* long/short/both
 	OrderType  int     // 订单类型, core.OrderType*
@@ -451,7 +489,7 @@ type ExitReq struct {
 	ExitRate   float64 // 退出比率，默认100%即所有订单全部退出
 	Amount     float64 // 要退出的标的数量。指定时ExitRate无效
 	OrderID    int64   // 只退出指定订单
-	UnOpenOnly bool    // True时只退出尚未入场的订单
+	UnFillOnly bool    // True时只退出尚未入场的订单
 	FilledOnly bool    // True时只退出已入场的订单
 	Force      bool    // 是否强制退出
 	Log        bool    // 是否自动记录错误日志
@@ -502,85 +540,82 @@ if len(s.LongOrders) > 0 {
 ma5Val := ma5.Get(0)
 s.SetAllStopLoss(core.OdDirtLong, &ormo.ExitTrigger{
     Price: ma5Val * 0.97,
-    Limit: ma5Val * 0.975,
+    Limit: ma5Val * 0.965,
     Rate:  0.5,
     Tag:   "stop half",
 })
 ```
-上面针对所有打开的做多订单，设置50%仓位的止损，价格触发5周期均线的0.97倍时，以0.975倍的限价单止损平仓一半。
+上面针对所有打开的做多订单，设置50%仓位的止损，价格触发5周期均线的0.97倍时，以0.965倍的限价单止损平仓一半。
 
 ## 批量任务处理
 有时候您可能需要针对当前策略的所有品种一起进行某些计算（比如相关系数），得到一些中间状态保存，或者一起进行开单或平仓。
 这时候您可以使用`OnBatchJobs`或`OnBatchInfos`回调函数。
 其中，`OnBatchJobs`仅在主周期`OnData(RoleMain)`/`OnBar`后触发，`OnBatchInfos`仅在辅助周期`OnData(RoleInfo)`/`OnInfoBar`后触发；分别由`BatchInOut`和`BatchInfo`开启。
-> 普通模式不保证 `OnBatchJobs` 的 jobs 顺序；严格回测由实例 `BatchState` 提供确定性排序。
+> 所有回测使用确定性批次顺序。主批次按品种键排序；若同时入场会竞争资金，请先按策略得分排序。下面保存的相关性供后续主周期使用，不假设同一时间戳主辅回调的先后。
 ```go
-func calcCorrs(jobs []*strat.StratJob, isBig bool) {
-	// 计算各个品种与其他品种的平均相关系数，并保存到More中
-	dataArr := make([][]float64, 0, len(jobs))
-	for _, j := range jobs {
-		dataArr = append(dataArr, j.Env.Close.Range(0, 70))
-	}
-	_, arr, err := utils.CalcCorrMat(dataArr, true)
-	if err != nil {
-		log.Error("calc corr mat fail", zap.Error(err))
-		return
-	}
-	for i, j := range jobs {
-		m, _ := j.More.(*BatchSta)
-		if isBig {
-			m.bigCorr = arr[i]
-		} else {
-			m.smlCorr = arr[i]
-		}
-	}
+// Imports: slices, config, strat, utils, banexg/log, banta as ta, zap.
+type BatchSta struct {
+    smlCorr, bigCorr float64
+    smlReady, bigReady bool
 }
 
-type BatchSta struct {
-	smlCorr float64
-	bigCorr float64
+func calcCorrs(jobs []*strat.StratJob, envs []*ta.BarEnv, isBig bool) {
+    if len(jobs) < 2 { return }
+    dataArr := make([][]float64, 0, len(envs))
+    for _, env := range envs {
+        values := env.Close.Range(0, 70)
+        if len(values) < 70 { return }
+        dataArr = append(dataArr, values)
+    }
+    _, values, err := utils.CalcCorrMat(70, dataArr, true)
+    if err != nil {
+        log.Error("calc corr mat fail", zap.Error(err))
+        return
+    }
+    for i, job := range jobs {
+        state := job.More.(*BatchSta)
+        if isBig { state.bigCorr, state.bigReady = values[i], true
+        } else { state.smlCorr, state.smlReady = values[i], true }
+    }
 }
 
 func BatchDemo(pol *config.RunPolicyConfig) *strat.TradeStrat {
-	return &strat.TradeStrat{
-		WarmupNum:  100,
-		BatchInOut: true,
-		BatchInfo:  true,
-		OnPairInfos: func(s *strat.StratJob) []*strat.PairSub {
-			return []*strat.PairSub{
-				{"_cur_", "1h", 100},
-			}
-		},
-		OnStartUp: func(s *strat.StratJob) {
-			s.More = &BatchSta{}
-		},
-		OnBar: func(s *strat.StratJob) {
-			m, _ := s.More.(*BatchSta)
-			if m.bigCorr < 0.5 && m.smlCorr < 0.5 {
-				// 当大小周期的相关度均低于50%时开单。
-				s.OpenOrder(&strat.EnterReq{Tag: "open"})
-			} else if m.smlCorr > 0.9 {
-				// 当前品种小周期相关度高于90%，平仓
-				s.CloseOrders(&strat.ExitReq{Tag: "close"})
-			}
-		},
-		OnBatchJobs: func(jobs []*strat.StratJob) {
-			if jobs[0].IsWarmUp {
-				return
-			}
-			calcCorrs(jobs, false)
-		},
-		OnBatchInfos: func(tf string, jobs map[string]*JobEnv) {
-			jobList := utils.ValsOfMap(jobs)
-			if jobList[0].IsWarmUp {
-				return
-			}
-			calcCorrs(jobList, true)
-		},
-	}
+    return &strat.TradeStrat{
+        WarmupNum: 100, BatchInOut: true, BatchInfo: true,
+        OnPairInfos: func(s *strat.StratJob) []*strat.PairSub {
+            return []*strat.PairSub{{Pair: "_cur_", TimeFrame: "1h", WarmupNum: 100}}
+        },
+        OnStartUp: func(s *strat.StratJob) { s.More = &BatchSta{} },
+        OnBar: func(s *strat.StratJob) {
+            state := s.More.(*BatchSta)
+            if !state.smlReady || !state.bigReady { return }
+            if state.bigCorr < 0.5 && state.smlCorr < 0.5 {
+                _ = s.OpenOrder(&strat.EnterReq{Tag: "open", Log: true})
+            } else if state.smlCorr > 0.9 {
+                _ = s.CloseOrders(&strat.ExitReq{Tag: "close", Log: true})
+            }
+        },
+        OnBatchJobs: func(jobs []*strat.StratJob) {
+            envs := make([]*ta.BarEnv, 0, len(jobs))
+            for _, job := range jobs { envs = append(envs, job.Env) }
+            calcCorrs(jobs, envs, false)
+        },
+        OnBatchInfos: func(tf string, items map[string]*strat.JobEnv) {
+            keys := utils.KeysOfMap(items)
+            slices.Sort(keys)
+            jobs := make([]*strat.StratJob, 0, len(keys))
+            envs := make([]*ta.BarEnv, 0, len(keys))
+            for _, key := range keys {
+                item := items[key]
+                jobs = append(jobs, item.Job)
+                envs = append(envs, item.Env)
+            }
+            calcCorrs(jobs, envs, true)
+        },
+    }
 }
 ```
-> 注意所有在OnBatchJobs或OnBatchInfos中使用的指标，都必须也在OnBar中调用一次；否则指标计算不正确。
+> 有状态指标必须在对应数据每次更新时计算：主周期使用 OnData(Main)/OnBar，辅助周期使用 OnData(Info)/OnInfoBar。批量回调读取已更新结果，不能仅靠批量调用推进指标。
 
 ## 自定义退出逻辑
 您可以在每个K线，为每个打开的订单，执行自定义的退出逻辑检查：
@@ -628,7 +663,7 @@ func DrawDown(pol *config.RunPolicyConfig) *strat.TradeStrat {
 }
 ```
 ## 订阅品种动态修改
-您在yml中可直接指定`pairs`品种列表或通过`pairlist`动态筛选。但您也可在策略中通过`OnSymbols`回调函数监听品种列表并修改返回：
+您在yml中可直接指定`pairs`品种列表或通过`pairlists`动态筛选。但您也可在策略中通过`OnSymbols`回调函数监听品种列表并修改返回：
 ```go
 func editPairs(p *config.RunPolicyConfig) *strat.TradeStrat {
 	return &strat.TradeStrat{
@@ -656,19 +691,28 @@ func editPairs(p *config.RunPolicyConfig) *strat.TradeStrat {
 您可在策略运行过程中通过`UpdatePairs`方法动态添加或移除交易品种，无需重启机器人。
 
 ```go
-// 移除/移除品种并平仓
-s.Strat.UpdatePairs(strat.PairUpdateReq{
-	Add:    []string{"BTC", "ETH"},
-	Remove:        []string{s.Symbol.Symbol},
-	CloseOnRemove: true,
-})
+// botruntime aliases github.com/banbox/banbot/runtime; errs is banexg/errs.
+// rt must be the Runtime that owns s, supplied by your embedding application.
+func updatePairs(rt *botruntime.Runtime, s *strat.StratJob) (*strat.PairUpdateResult, *errs.Error) {
+    return s.Strat.UpdatePairs(strat.PairUpdateReq{
+        StrategyState: rt.Strategies,
+        Core: rt.Core,
+        Exchange: rt.Exchange,
+        Add: []string{"BTC", "ETH"},
+        Remove: []string{s.Symbol.Symbol},
+        CloseOnRemove: true,
+    })
+}
 ```
+
+普通策略回调没有公开的 Runtime 状态 getter；未由宿主注入 rt 时，优先使用配置轮换或 OnSymbols。动态更新要求加载器安装 SubWarmPairs，CloseOnRemove 还要求 ExitOrders。检查返回的错误、Added/Removed/Skipped 和 Warnings；有未决订单的移除任务会保留至订单终态。ForceAdd 跳过常规品种准入限制，不保证行情、评分或下单成功。
+
 
 **参数说明：**
 - `Add`: 要添加的品种列表
 - `Remove`: 要移除的品种列表
 - `CloseOnRemove`: 移除时是否关闭订单
-- `ForceAdd`: 是否强制添加（跳过pairlist过滤）
+- `ForceAdd`: 跳过常规品种准入限制；不保证数据、评分或交易所校验通过
 - `Reason`: 更新原因（可选）
 
 ## 策略退出回调
@@ -740,8 +784,8 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 :::
 
 ## Websocket高频数据订阅
-您可在策略中订阅交易所通过Websocket推送的高频数据，包括：未完成K线，逐笔交易、订单簿深度。支持实时交易和回测。
-注意从spider发送到机器人进程目前约有1ms延迟，另外交易所到您本地视网络情况也有一定延迟。
+您可在策略中订阅交易所通过Websocket推送的高频数据，包括：未完成K线，逐笔交易、订单簿深度。实盘订阅取决于交易所及数据源能力；普通 K 线回测不包含逐笔和深度历史，不能据此复现这些回调。
+实际延迟取决于数据源、网络和运行负载，没有固定毫秒级保证。
 
 下面是一个示例：
 ```go
@@ -752,6 +796,7 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/log"
+    "go.uber.org/zap"
 )
 
 func ws(p *config.RunPolicyConfig) *strat.TradeStrat {
@@ -768,16 +813,20 @@ func ws(p *config.RunPolicyConfig) *strat.TradeStrat {
 		OnWsKline: func(s *strat.StratJob, pair string, k *banexg.Kline) {
 			log.Info(fmt.Sprintf("OnWsKline %v: %v", k.Time, k.Close))
             s.OpenOrder(&strat.EnterReq{Tag: "long"})
-            _, _, err := biz.GetOdMgr(s.Account).ProcessOrders(nil, s)
+            _, _, err, bound := s.ProcessRuntimeOrders()
             if err != nil {
                 log.Error("process order fail", zap.Error(err))
+            } else if !bound {
+                log.Warn("runtime order processor is not bound")
             }
 		},
 		OnWsTrades: func(s *strat.StratJob, pair string, trades []*banexg.Trade) {
+			if len(trades) == 0 { return }
 			last := trades[len(trades)-1]
 			log.Info(fmt.Sprintf("OnWsTrades %v %v, %v", last.Timestamp, last.Price, last.Amount))
 		},
 		OnWsDepth: func(s *strat.StratJob, dep *banexg.OrderBook) {
+			if dep == nil || dep.Bids == nil || dep.Asks == nil || len(dep.Bids.Price) == 0 || len(dep.Asks.Price) == 0 { return }
 			bp1, bm1 := dep.Bids.Price[0], dep.Bids.Size[0]
 			ap1, am1 := dep.Asks.Price[0], dep.Asks.Size[0]
 			log.Info(fmt.Sprintf("OnWsDepth %v %v, %v,, %v, %v", dep.TimeStamp, bp1, bm1, ap1, am1))
@@ -787,7 +836,7 @@ func ws(p *config.RunPolicyConfig) *strat.TradeStrat {
 ```
 如上，您可通过`WsSubs`订阅所需的数据，值可默认为空或`_cur_`表示当前品种，也可使用其他品种，或同时订阅多个品种：`BTC,_cur_`，多个品种应当以逗号隔开。
 
-这三个高频回调中默认未支持开平仓，如果需要您可仿照上面示例代码，自行调用`ProcessOrders`提交处理订单。
+这三个高频回调中默认未支持开平仓，如果需要您可仿照上面示例代码，调用当前 job 的 `ProcessRuntimeOrders`，检查返回错误和 bound。
 
 ## HTTP Post接口回调
 您可从外部通过http post请求对您的策略发起回调，仅支持实盘交易&模拟实盘，当您启用`api_server`时才可生效。
@@ -803,7 +852,7 @@ func PostApi(p *config.RunPolicyConfig) *strat.TradeStrat {
         },
         OnPostApi: func(client *core.ApiClient, msg map[string]interface{}, jobs map[string]map[string]*strat.StratJob) error {
 			// 您可自行解析收到的请求，下面仅做示例参考
-            action := utils.PopMapVal(msg, "action", "")
+            action, _ := msg["action"].(string)
             for acc, pairMap := range jobs {
                 for pairTF, job := range pairMap {
                     if action == "openLong" {
@@ -839,11 +888,10 @@ api_server:  # 供外部通过api控制机器人
 然后Post api http://127.0.0.1:8001/api/strat_call
 ```json
 {
-    "token": "very_strong_password", // 这是api_server中的密码
-    "strategy": "ma:postApi", // 这是请求策略的名称
-    // 前两个是固定必填的，下面字段均可选，可在策略中自行解析
+    "token": "very_strong_password",
+    "strategy": "ma:postApi",
     "action": "openLong",
-    "data1": 123, // 其他任意需要发送到策略的数据
+    "data1": 123,
     "data2": "hello"
 }
 ```
@@ -867,10 +915,10 @@ api_server:  # 供外部通过api控制机器人
 **Position(dirt float64, enterTag string) float64**  
 获取当前策略任务的仓位大小，返回基于基准金额的倍数。比如默认开单金额30U，返回2表示已花费60U开单。
 
-**SetAllStopLoss(dirt float64, args \*ormo.ExitTrigger)**  
+**SetAllStopLoss(dirt float64, args \*ormo.ExitTrigger) \*errs.Error**
 对当前策略任务的所有指定方向订单设置止损，参数dirt的值可为`core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth`。
 
-**SetAllTakeProfit(dirt float64, args \*ormo.ExitTrigger)**  
+**SetAllTakeProfit(dirt float64, args \*ormo.ExitTrigger) \*errs.Error**
 对当前策略任务的所有指定方向订单设置止盈，参数dirt的值可为`core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth`。
 
 ## 多因子与截面引擎
@@ -883,4 +931,4 @@ api_server:  # 供外部通过api控制机器人
 
 普通命令由 entry 创建并关闭任务级 Runtime。配置快照只读；账户、时钟、策略作业、价格及批量队列属于本次运行。嵌入运行或同进程多任务时，使用显式 Runtime 依赖，避免在回调内读写包级 config/core/btime 兼容状态。`StratJob` 的运行上下文和数据事件应来自当前任务；实盘时间与回测推进时间不能混用。
 
-`BatchInOut`/`BatchInfo` 使用 trader 实例的 `BatchState`；严格回测固定就绪批次和作业顺序，普通运行不承诺 map 顺序。因子截面计算则冻结整个 Universe 后生成目标组合；时序批量回调不等于因子引擎。参见 [Runtime API](../api/runtime.md) 和[因子指南](./factor.md)。
+`BatchInOut`/`BatchInfo` 使用 trader 实例的 `BatchState`；所有回测固定就绪批次和作业顺序，实盘不承诺 map 顺序。因子截面计算则冻结整个 Universe 后生成目标组合；时序批量回调不等于因子引擎。参见 [Runtime API](../api/runtime.md) 和[因子指南](./factor.md)。

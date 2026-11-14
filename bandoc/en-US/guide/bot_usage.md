@@ -1,345 +1,83 @@
-After writing the strategy, you can package the strategy and banbot into a single executable file (Please ensure that you execute the command in the root directory of your strategy project):
-```shell
-# for linux/macos
-go build -o bot
+# Using the bot CLI
 
-# for windows
-go build -o bot.exe
-```
-Then you can use this executable file directly to start the UI, backtest, hyperparameter optimization, real trading, etc.!
+Run `go build -o bot` in your strategy project root (`go build -o bot.exe` on Windows) to compile registered strategies and BanBot into one executable. Here `bot` denotes that binary; use `./bot` when running from the current directory.
 
-Directly executing `bot` will start the WebUI interface at `http://localhost:8000`, through which you can manage strategies, backtest, analyze transactions, etc.
-
-Use `bot --help` to see the command groups for the current version. Common root commands include `trade`, `backtest`, `spider`, `optimize`, `bt-opt`, `web`, and `init`; data tools are grouped under `data`, `kline`, `tick`, `tool`, and `live`. Legacy underscore command names remain available as aliases.
-## Common command parameters
-
-**Data directory (-datadir)**
-
-When you start through the command line, unless the environment variable `BanDataDir` is set, you must pass in the parameter `-datadir` to specify the data directory each time you start.
-
-**Default configuration file**
-
-Before reading the additional configuration files you passed in, banbot will try to read two default configuration files from the data directory: `config.yml` and `config.local.yml`.
-
-If these two have already covered the parameters you need this time, you do not need to pass in the configuration file path through `-config`.
-
-**Command help information**
-
-You can display help information by adding `--help` or `-h` after the command.
-
-All configuration-based commands support `--datadir`, repeated `--config`, `--no-default`, `--config-data`, `--logfile`, `--level`, and `--max-pool-size`. Use `--dlock` to enable deadlock detection; `--cpu-profile`, `--mem-profile`, and `--net-off` are runtime diagnostic options. Each subcommand accepts only the additional parameters it declares; use `bot <command> --help` as the source of truth. Legacy single-dash long options remain accepted for compatibility.
-
-## Start WebUI Research & Backtesting
-To facilitate your strategy research and backtesting, we provide WebUI visualization. You can edit strategies online, start backtesting, view profit and loss curves, analyze orders, etc. through WebUI.
-
-This is a WebUI only for the strategy research stage. By default, only your local computer is allowed to access it, so you can access it without authentication. If you need to access it from the external network, please set `-host 0.0.0.0`.
-
-If you need to access the Dashboard UI during real-time trading in banbot, please refer to [Real-time Trading](#start-real-time-trading-simulated-tradingreal-trading)。
-
-The Web UI uses separate development-server options; run `bot web -help` to see the current bind address, port, and resource path options.
-
-```text
-Usage of web:
-  -config value
-        config path to use, Multiple -config options may be used
-  -config-data string
-        yaml config string
-  -datadir string
-        Path to data dir.
-  -host string
-        bind host ip (default "127.0.0.1")
-  -level string
-        log level (default "info")
-  -logfile string
-        log file path, default: system temp dir
-  -password string
-        password required to access WebUI
-  -port int
-        port to listen (default 8000)
-  -tz string
-        timezone
+```bash
+bot --help
+bot backtest --help
+bot tool --help
 ```
 
-## Start the crawler process
-```shell
-bot spider [-datadir PATH] [-config PATH]
-```
-When you want to start real-time trading, you need to start the crawler process first. The crawler process listens to the `6789` port by default and only accepts local requests. You can change the yml configuration `spider_addr` to `0.0.0.0:6789` to accept external listening requests.
+Commands use hyphens, such as `bt-opt` and `collect-opt`. Some underscore names remain compatibility aliases; use canonical names and double-dash `--flag` options in new scripts. Each subcommand declares its own flags; flags from one command are not automatically supported by another.
 
-After the crawler process is started, it does not listen to any exchange, market, or symbol by default. It will automatically connect to the specified exchange, market, and listen to the required information based on the client request received.
-```text
-Usage of spider:
-  -config value
-        config path to use, Multiple -config options may be used
-  -config-data string
-        yaml config string
-  -cpu-profile
-        enable cpu profile
-  -datadir string
-        Path to data dir.
-  -level string
-        set logging level to debug (default "info")
-  -logfile string
-        Log to the file specified
-  -max-pool-size int
-        max pool size for db
-  -mem-profile
-        enable memory profile
-  -net-off
-        disable network request
-  -no-default
-        ignore default: config.yml, config.local.yml
-```
-## Start real-time trading (simulated trading/real trading)
-```shell
-bot trade [-spider] [-pairs PAIRS] ...
-```
-When you specify `env` as `dry_run` in the yml configuration file, the order will not be submitted to the exchange, but simulated matching locally.
+## Configuration and common flags
 
-When `env` is set to `prod` or `test`, it will be submitted to the production environment or test network of the exchange respectively (some exchanges do not support test networks).
+Configuration commands normally load data-directory `config.yml`, then `config.local.yml`, repeated `--config` files, inline `--config-data`, and explicit CLI overrides. `--datadir` takes precedence over `BanDataDir`. Missing default files are skipped; `--no-default` disables them. Explicit-file loading can work without a data directory, but storage and output may still require one. See [configuration](./configuration.md).
 
-You can configure `spider_addr` in yml, and the robot will automatically try to connect to the crawler when it starts, and subscribe to the current exchange, market and related symbol data.
-
-You can also add the `-spider` parameter to automatically start the crawler in this process when starting the robot.
-
-When you enable `api_server` in the `yml` configuration file and set the access account and password, you can view and manage your real-time trading robot with the Dashboard UI.
-
-```yaml
-api_server:
-  enable: true  # enable here
-  bind_ip: 0.0.0.0
-  port: 8001
-  jwt_secret_key: '123456789'  # This should be complicated enough
-  users:
-    - user: ban
-      pwd: '123'
-      acc_roles: {user1: admin}  # allow bot accounts and role
+```bash
+bot backtest --datadir /path/to/data --config experiment.yml
+bot backtest --datadir /path/to/data --no-default --config experiment.yml
 ```
 
-```text 
-Usage of trade:
-  -config value
-        config path to use, Multiple -config options may be used
-  -config-data string
-        yaml config string
-  -cpu-profile
-        enable cpu profile
-  -datadir string
-        Path to data dir.
-  -level string
-        set logging level to debug (default "info")
-  -logfile string
-        Log to the file specified
-  -max-pool-size int
-        max pool size for db
-  -mem-profile
-        enable memory profile
-  -net-off
-        disable network request
-  -no-default
-        ignore default: config.yml, config.local.yml
-  -out string
-        output file or directory
-  -pairs string
-        comma-separated pairs
-  -spider
-        start spider if not running
-  -stake-amount stake_amount
-        Override stake_amount in config
-```
-## Backtesting
-```shell
-bot backtest [-separate] ...
-```
-This will start the backtest according to the `run_policy` in the yml configuration. Use `-out` to specify the report directory.
+Common flags include `--logfile`, `--level`, and `--max-pool-size`; diagnostic flags include `--cpu-profile`, `--mem-profile`, and `--net-off`. Supporting commands also expose `--dlock`. `--net-off` neither validates data coverage nor supplies missing history.
 
-The default backtest is to run multiple strategy groups configured by `run_policy` at the same time to get a combined backtest report. If you want to test each strategy group in `run_policy` separately, please enable the `-separate` option.
+## Development WebUI and Hub
 
-During the backtest, if the candle of the relevant symbol does not exist, it will be automatically downloaded and saved to the database.
-
-After the backtest is completed, when `-out` is not specified, the report is saved in `[data directory]/backtest/<config-hash>` by default.
-```text
-Usage of backtest:
-  -config value
-        config path to use, Multiple -config options may be used
-  -config-data string
-        yaml config string
-  -cpu-profile
-        enable cpu profile
-  -datadir string
-        Path to data dir.
-  -dlock
-        enable dead-lock detect
-  -level string
-        set logging level to debug (default "info")
-  -logfile string
-        Log to the file specified
-  -max-pool-size int
-        max pool size for db
-  -mem-profile
-        enable memory profile
-  -net-off
-        disable network request
-  -no-default
-        ignore default: config.yml, config.local.yml
-  -out string
-        output file or directory
-  -pairs string
-        comma-separated pairs
-  -prg string
-        prefix for progress in stdout
-  -separate
-        run policy separately for backtest
-  -stake-amount stake_amount
-        Override stake_amount in config
-  -timeend string
-        set end time, timestart is required
-  -timerange string
-        set timerange
-  -timestart string
-        set start time, allow multiple formats
+```bash
+bot web --datadir /path/to/data
+bot hub --datadir /path/to/data
 ```
 
-## CandleStick related tools
-[Detail Document](/en-US/advanced/kline_tools.md)
+Running `bot` without a subcommand also opens the development WebUI, at `http://127.0.0.1:8000` by default. Development Web has its own `--host`, `--port`, `--password`, and `--tz` flags; it is separate from the trading Dashboard configured through `api_server`.
 
-**bot kline down**  
-Download candle from the exchange and save to the database
+`hub` (compatibility alias `spider`) provides public market data and local account execution. `spider_addr` controls public market-data listening, default `127.0.0.1:6789`. The private execution socket defaults to `<datadir>/execution/hub.sock`, overridable with `--execution-socket`. Hub accepts only `prod` / `dry_run`; backtests run in process. A public listening address does not grant private account authorization.
 
-**bot kline load**  
-Import candle from csv/zip file to database
+## Trading, backtesting, and research
 
-**bot kline agg**
-
-Aggregate larger-timeframe K-lines for the specified `-pairs` and `-timeframes`.
-
-**bot kline export**  
-Export candle from database to csv file
-
-**bot kline purge**  
-Purge candle from database.
-
-**bot kline correct**  
-Check if there is any error in database candle and correct it automatically.
-
-**bot kline verify**
-
-Verify that K-line data matches the coverage metadata; use `-pairs`, `-tables`, and `-batch-size` to narrow the check.
-
-**bot kline adj_calc**  
-Recalculate the adjust factor (for the Chinese futures market)
-
-**bot kline adj_export**  
-Export the adjust factor to a CSV file
-```text
-banbot kline:
-    down:   download kline data from exchange
-    load:   load kline data from zip/csv files
-    agg:    agg kline for big timeframes
-    export: export kline to csv files from db
-    purge:  purge/delete kline data with args
-    correct: sync klines between timeframes
-    verify: verify kline data matches sranges metadata
-    adj_calc: recalculate adjust factors
-```
-## Tick related tools
-**bot tick convert**  
-Convert the csv format ticks of the Chinese futures market and then output a csv format file.
-
-**bot tick to_kline**  
-Aggregate the tick files of the Chinese futures market into 1m period candle csv format files.
-
-```text
-banbot tick:
-    convert:        convert tick data format
-    to_kline:       build kline from ticks
+```bash
+bot trade --datadir /path/to/data
+bot backtest --datadir /path/to/data --out /path/to/report
+bot backtest --datadir /path/to/data --separate
+bot research --datadir /path/to/data --config factor.yml
 ```
 
-## Live Trading Tools
-**bot live down_order**  
-`-account user1 -exchange binance -market linear -timestart 20250401 -timeend 20250405 -pairs BTC,ETH`
-Download orders for the specified account to the `@exgOrders/` directory. The saved file format is `[exchange]_[market]_[account]_[apiKeyPrefix].gob`, such as `binance_linear_user1_C1uMI.gob`. This can be used with `bot tool cmp_orders` to compare backtest orders.
+`backtest` / `trade` dispatch time-series, factor, or mixed policies using `run_policy[].engine`. Omitting `engine` retains legacy time-series semantics; declare it explicitly in new configurations.
 
-**bot live close_order**  
-`-account user1 -pair BTC,ETH -strat ma:demo1,ma:demo2 -exg true`
-Close positions for the specified user's eligible orders.
+Default live time-series, factor, and mixed entries all use the shared Hub. Start `hub` first, then use `env: dry_run` for Hub paper live simulation or `env: prod` for production. The default entry requires linear perpetuals, an explicit settlement currency, and complete execution declarations; it does not support `test`, spot, or inverse contracts. Adapter support for testnets/spot does not make them supported by ordinary `trade`. `--spider` cannot replace the private execution Hub; a missing Hub fails without falling back to a local sender. See [shared accounts and Hub](./execution.md) for configuration, limitations, and recovery. The trading Dashboard separately needs `api_server` users and account roles; see [live trading](./live_trading.md).
 
-## Other tools
-**bot tool collect_opt**  
-Collect hyperparameter tuning results and display them to the console in order.
+For factor backtests, `--mode weights|events` overrides root `execution.mode`, defaulting to `events` when both are absent. Mixed backtests require `events`. Factor/mixed `trade --dry-run` replays historical events; it is not the time-series live-simulation switch. Real factor/mixed trading can select `--live-provider`; missing verified session capabilities fail preflight without falling back to paper execution.
 
-**bot bt_opt**
+`--separate` supports pure time-series backtests only; split factor tasks into separate configurations. See [backtesting](./backtest.md), [optimization](./hyperopt.md), and [rolling backtests](./roll_btopt.md). `optimize` / `bt-opt` are time-series tools, not factor/mixed hyperparameter search.
 
-Tuning hyperparameters in time rolling, and then backtesting. For example, for the data of the last three years. Each year's data is used for hyperparameter tuning, and then the tuned parameters are automatically backtested for the next three months; then the tuning is postponed for three months and repeated; this is repeated to simulate the backtest results in real scenarios.
+## Data and maintenance tools
 
-**bot tool load_cal**  
-Load trading calendar (for Chinese futures market)
+Check `bot <group> <command> --help` for input formats. Unless a positional argument is explicitly declared, files use `--in` and output uses `--out`.
 
-**bot tool cmp_orders**  
-Compare the orders exported from Binance with the local backtest order records to check whether the backtest and the real market are consistent.
+| Command | Purpose |
+| --- | --- |
+| `data export` / `data import` | Export/import database data as protobuf files |
+| `data archive` | Versioned archives; see the [factor guide](./factor.md) |
+| `kline down` / `load` / `agg` | Download, import, or aggregate bars |
+| `kline export` / `purge` | Export CSV / delete matching bars |
+| `kline repair-ranges` / `verify` / `correct` | Rebuild range metadata, verify coverage, synchronize timeframes |
+| `kline adj-calc` / `adj-export` | Calculate/export adjustment factors |
+| `series down` / `list` | Download registered custom series / inspect ranges |
+| `tick convert` / `to-kline` | Convert ticks / aggregate bars |
+| `tool list-strats` | List strategies compiled into the binary |
+| `tool collect-opt` / `test-pickers` | Collect optimization results / compare pickers over rolling windows |
+| `tool sim-bt` / `bt-result` | Simulate from a report / rebuild a report from orders |
+| `tool test-live-bars DUMP_FILE` | Compare live bar dumps with local data |
+| `tool cmp-orders` | Compare venue and backtest orders |
+| `tool calc-perfs` / `corr` / `merge-assets` | Performance metrics, correlation matrices, combined asset curves |
+| `tool load-cal` / `data-server` | Import calendars / serve gRPC data |
+| `tool bt-factor` | Rolling symbol selection over existing `orders.gob`, separate from native factor runner |
+| `live down-order` / `close-order` | Download account orders / close by account, symbol, or strategy |
 
-**bot tool list_strats**  
-print registered strategies.
-
-**bot tool data_server**  
-Start a gRPC server to provide access to data and metric results for clients written in other languages. It can be used for AI machine learning and other purposes.
-
-**bot tool calc_perfs**  
-Input in a CSV/XLSX file, where each row represents one day and each column represents the cumulative income of a variety. Calculate Shape/Sortino for each column
-
-**bot tool corr**  
-Calculate the correlation coefficient for a group of varieties selected by YAML, a correlation matrix image can be output at regular intervals, or an average correlation coefficient CSV file can be output.
-
-**Bot Tool sim_bt**
-Execute rolling simulation backtesting, extract trading varieties in each interval from the log file, and conduct backtesting; export the order records and enters2.html.
-
-**Bot Tool merge_assets**
-Merge the assets.html in multiple backtesting reports into one for convenient comparison.
-
-**Bot Tool bt_factor**
-This command is used to test the cross-sectional rotation factor. You can conduct full-volume and full-period backtesting for all varieties using a certain strategy. Then, use this command to filter some varieties based on the performance of some varieties in the previous two years for trading in the following months. Repeat this process until the latest data, combine and output the backtesting report of the filtered varieties.
-
-You can make the following settings in the yml file for full-volume backtesting:
-```yaml
-pairmgr:
-  cron: ''
-  use_latest: true  # This will use the latest date to determine the list of varieties
-pairlists:
-  - name: VolumePairList
-    back_period: 30d
+```bash
+bot live down-order --datadir /path/to/data --account user1 --timestart 20250401 --timeend 20250405 --pairs BTC/USDT:USDT
+bot tool bt-result --datadir /path/to/data --config report-config.yml --in /path/to/orders.gob --out /path/to/rebuilt
 ```
 
-Then implement your factor and register it in `strat.FactorMap`.
+Empty `--account`, `--pair`, or `--strat` on `live close-order` leaves that dimension unrestricted; `--exg` closes venue positions directly. Select the scope explicitly before execution. Custom factors for `tool bt-factor` register in `opt.RegisterFactor`, not the nonexistent `strat.FactorMap`.
 
-Then execute:
-```shell
-bot tool bt_factor -factor name -interval 4M -in @backtest\abc\orders.gob -out @backtest\abc_name
-```
-
-**Bot Tool bt_result**
-Reconstruct the backtesting report from the orders.gob file of the backtesting result. It can output assets.html, enters.html, detail.json, orders.csv, etc.
-
-```text
-banbot tool:
-    collect_opt:    collect result of optimize, and print in order
-    load_cal:       load calenders
-    cmp_orders:     compare backTest orders with exchange orders
-    data_server:    serve a grpc server as data feeder
-    calc_perfs:     calculate sharpe/sortino ratio for input data
-    corr:           calculate correlation matrix for symbols
-    sim_bt:         run backtest simulation from report
-    list_strats:    list registered strategies
-    merge_assets:   merge multiple assets.html files into one
-    bt_factor:      backtest factors with orders
-    bt_result:      build backtest result from orders.gob and config
-```
-
-## Factor and cross-sectional engine
-
-`bot backtest` and `bot trade` load one YAML `run_policy` and dispatch time-series, factor or mixed strategies. For factor replay, `backtest --mode weights|events` overrides `execution.mode`; absent both, the default is `events`. Mixed replay requires `events`. Factor/mixed `trade --dry-run` runs historical events replay; time-series live simulation continues to use `env: dry_run`. Real factor/mixed trading accepts `--live-provider` and requires a verified binding.
-
-Factor research is root `bot research --config strategy.yml`, archive conversion is `bot data archive`, and standalone expressions use root `bot validate --spec formula.yml` / `bot explain --spec formula.yml`. Strategy configuration uses unified YAML only; paths follow originating fields. Default files, `--datadir` and `--no-default` work the same for all engine types.
-
-bot tool bt_factor on this page is the legacy orders.gob / strat.FactorMap rolling-selection tool, separate from the native factor runner.
-
-See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
+Standalone expressions use root `bot validate --spec formula.yml` / `bot explain --spec formula.yml`. See the [factor guide](./factor.md) for configuration and data requirements.

@@ -1,138 +1,66 @@
 # opt 包
 
-opt 包提供了策略优化相关的功能。
+`opt` 提供时序回测、超参优化、滚动优化和报告工具。因子/混合 `backtest` 由统一入口另行装配，不能直接复用此处的时序优化 API 搜索因子参数。使用命令行时参见[回测](../guide/backtest.md)、[优化](../guide/hyperopt.md)及[滚动回测](../guide/roll_btopt.md)。
 
-回测和优化运行器通过 `NewBackTestLiteWithRuntimeDeps`、`NewBackTestWithRuntimeDeps` 接收一个 Runtime 的依赖。每个运行器使用自己的时钟、策略、订单、钱包和数据投影；优化过程中的每轮执行也按 Runtime 生命周期创建和释放。
+## 回测实例
 
-## 主要结构体
+```go
+func NewBackTestWithRuntimeDeps(
+    deps biz.RuntimeDeps, isOpt bool, outDir string,
+) (*BackTest, *errs.Error)
 
-### BackTest
-回测实例结构体。
+func NewBackTestLiteWithRuntimeDeps(
+    deps biz.RuntimeDeps, isOpt bool, onBar data.FnDataSeries,
+    getEnd data.FnGetInt64, pBar *utils.StagedPrg,
+) (*BackTestLite, *errs.Error)
+```
 
-字段：
-- `Trader biz.Trader` - 交易者接口实现
-- `BTResult *BTResult` - 回测结果
-- `lastDumpMs int64` - 上一次保存回测状态的时间戳
-- `dp *data.HistProvider` - 历史数据提供者
-- `isOpt bool` - 是否为超参数优化模式
-- `PBar *utils.StagedPrg` - 进度条
+使用同一 Runtime 的完整依赖；缺少必要状态时报错。旧 `NewBackTest` 已删除。`BackTest` 公开 `Init()`、`Run()`、`RunContext(context.Context)` 和 `FeedDataSeries(*orm.DataSeries)`；轻量 `FeedDataSeries` 返回 bool。不要把私有历史 provider、进度字段当作可构造参数。
 
-### BTResult
-回测结果结构体。
+每个运行器绑定自己的时钟、订单、钱包和数据。`orm.DataSeries.Values map[string]any` 传递扩展字段及类型/NULL 语义，不能将输入收窄为固定 OHLCV 结构。
 
-字段：
-- `MaxOpenOrders int` - 最大同时持仓订单数
-- `MinReal float64` - 最小资产
-- `MaxReal float64` - 最大资产
-- `MaxDrawDownPct float64` - 最大回撤百分比
-- `ShowDrawDownPct float64` - 显示的最大回撤百分比
-- `MaxDrawDownVal float64` - 最大回撤金额
-- `ShowDrawDownVal float64` - 显示的最大回撤金额
-- `BarNum int` - K线数量
-- `TimeNum int` - 时间周期数
-- `OrderNum int` - 订单数量
-- `Plots *PlotData` - 绘图数据
-- `StartMS int64` - 开始时间戳(毫秒)
-- `EndMS int64` - 结束时间戳(毫秒)
-- `PlotEvery int` - 绘图间隔
-- `TotalInvest float64` - 总投资金额
-- `OutDir string` - 输出目录
-- `TotProfit float64` - 总盈利
-- `TotCost float64` - 总成本
-- `TotFee float64` - 总手续费
-- `TotProfitPct float64` - 总收益率
-- `WinRatePct float64` - 胜率
-- `SharpeRatio float64` - 夏普比率
-- `SortinoRatio float64` - 索提诺比率
+## 优化与工厂
 
-### PlotData
-绘图数据结构体。
+```go
+type BacktestFactory func(
+    snapshot *config.Snapshot, isOpt bool, outDir string,
+) (*BackTest, func(), *errs.Error)
 
-字段：
-- `Labels []string` - 时间标签
-- `OdNum []int` - 订单数量
-- `JobNum []int` - 任务数量
-- `Real []float64` - 实际资产
-- `Available []float64` - 可用资产
-- `Profit []float64` - 已实现盈利
-- `UnrealizedPOL []float64` - 未实现盈亏
-- `WithDraw []float64` - 提现金额
+func RunOptimize(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error
+func RunBTOverOpt(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error
+func RunRollBTPicker(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error
+func CollectOptLog(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error
+```
 
-### RowPart
-回测统计行数据结构体。
+四个入口均需注入 Snapshot 和隔离工厂，不支持只传 `CmdArgs` 的旧调用。工厂为每轮创建独立 Runtime，返回 cleanup；运行器完成后调用 cleanup，失败也必须释放资源。派生 Snapshot 复制时间范围、pairs 和 policies，不能让不同试验共享可变账户/钱包状态。
 
-字段：
-- `WinCount int` - 盈利订单数
-- `OrderNum int` - 订单总数
-- `ProfitSum float64` - 总盈利金额
-- `ProfitPctSum float64` - 总盈利率
-- `CostSum float64` - 总成本
-- `Durations []int` - 持仓时长列表
-- `Orders []*InOutOrder` - 订单列表
-- `Sharpe float64` - 夏普比率
-- `Sortino float64` - 索提诺比率
+`RunOptimize` 使用 `OutPath` 日志文件并打印所选策略 YAML；`RunBTOverOpt` 结转窗口间余额并积累报告；`RunRollBTPicker` 输出各窗口挑选器分数与排名。`CollectOptLog` 单文件排序写回，目录递归收集 `.log`；见[优化指南](../guide/hyperopt.md)的文件边界和输出细节。
 
-## 主要功能
+`OptInfo` 保存 `Params`、`Score`、方向、试验 ID 和 `BTResult`；`OptGroup` 关联来源策略、周期和品种。`DescGroups(items)` 按分数分为非负与负数组；`AvgGoodDesc(items, startRate, endRate)` 对所选排名区间平均参数，无非负分数时回退负分数组。它们不是按原始收益率分位筛选。
 
-### NewBackTestWithRuntimeDeps
+## 报告与结果字段
 
-实际签名为 NewBackTestWithRuntimeDeps(deps biz.RuntimeDeps, isOpt bool, outDir string) (*BackTest, *errs.Error)。NewBackTest 已删除；传入同一 Runtime 的完整依赖，缺失状态报错。轻量事件回放使用 NewBackTestLiteWithRuntimeDeps。
+`NewBTResult() *BTResult` 创建结果结构；报告依赖通过 `NewReportDeps(deps biz.RuntimeDeps) *ReportDeps` 绑定同一任务的配置、订单、钱包、时钟、存储与日志，不能靠安装全局配置补齐。`DumpLineGraph` 已不是公开 opt API。
 
-### RunBTOverOpt
+| Go 字段 / JSON 字段 | 含义 |
+| --- | --- |
+| `TotProfit` / `totProfit`、`TotProfitPct` / `totProfitPct` | 总收益金额、百分比 |
+| `WinRatePct` / `winRatePct` | 交易胜率百分数，不是 0–1 比例 |
+| `MaxDrawDownPct` / `maxDrawDownPct` | 全过程权益最大回撤百分比 |
+| `ShowDrawDownPct` / `showDrawDownPct` | 图表采样口径回撤，可能与全过程不同 |
+| `SharpeRatio`、`SortinoRatio` | 收益风险比率 |
+| `UlcerIndex`、`UlcerPerformanceIndex` | 指针指标，无法定义时可为 null |
+| `DailyEquity` / `dailyEquity` | `[UTC 日末毫秒, 权益]`，逐日不抽样 |
+| `GapExits`、`DelistExits` | 数据空洞/退市强平单数 |
+| `GapExitPnlShare`、`DelistExitPnlShare` | 对应退出的绝对利润和占全部订单绝对利润和的比例 |
+| `Liquidated` 等 | 爆仓/破产时的可选证据字段，见[回测指南](../guide/backtest.md) |
 
-实际签名：RunBTOverOpt(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. 入口注入配置快照和隔离回测工厂，不能仅传 CmdArgs 调用；该路径是 TS 优化/报告，不是 factor/mixed 超参搜索。
+`PlotData` 包含 `Labels`、`OdNum`、`JobNum`、`Real`、`Available`、`Profit`、`UnrealizedPOL`、`WithDraw` 和 `More`。`RowPart` 保存分组订单计数、收益、成本和风险指标；`Orders` 类型为 `[]*ormo.InOutOrder`，不序列化到 JSON。
 
-### RunRollBTPicker
+`BTResult.Score()` 用总收益百分比与展示回撤计算优化分数；`loss` 是其负值。普通回测写不出 `detail.json` 会返回错误并令命令非零退出；不可将缺失报告当成成功。爆仓按正常回测终止输出结果，不能只看退出码判断收益。
 
-实际签名：RunRollBTPicker(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. 入口注入配置快照和隔离回测工厂，不能仅传 CmdArgs 调用；该路径是 TS 优化/报告，不是 factor/mixed 超参搜索。
+## 工具接口边界
 
-### RunOptimize
+订单对比优先用 CLI `tool cmp-orders` 或 `CompareExgBTOrdersWithRuntimeDeps(options CompareOrdersOptions, deps CompareOrdersDeps) error`；旧 `CompareExgBTOrders(args []string)` 不是当前 CLI 装配入口。`RegisterFactor(name string, factor FactorFunc)` / `GetFactor` / `SnapshotFactors` 管理 `tool bt-factor` 的滚动筛选函数，与原生 factor runner 不同。
 
-实际签名：RunOptimize(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. 入口注入配置快照和隔离回测工厂，不能仅传 CmdArgs 调用；该路径是 TS 优化/报告，不是 factor/mixed 超参搜索。
-
-### CollectOptLog
-
-实际签名：CollectOptLog(args *config.CmdArgs, snapshot *config.Snapshot, factory BacktestFactory) *errs.Error. 入口注入配置快照和隔离回测工厂，不能仅传 CmdArgs 调用；该路径是 TS 优化/报告，不是 factor/mixed 超参搜索。
-
-### NewBTResult
-创建新的回测结果实例。
-
-返回：
-- `*BTResult` - 回测结果实例指针
-
-### AvgGoodDesc
-计算指定收益率范围内的优化结果平均值。
-
-参数：
-- `items []*OptInfo` - 优化信息列表
-- `startRate float64` - 起始收益率
-- `endRate float64` - 结束收益率
-
-返回：
-- `*OptInfo` - 平均优化信息
-
-### DescGroups
-将优化结果按照收益率分组。
-
-参数：
-- `items []*OptInfo` - 优化信息列表
-
-返回：
-- `[]*OptInfo, []*OptInfo` - 好组和坏组的优化信息列表
-
-### CompareExgBTOrders
-比较交易所回测订单。
-
-参数：
-- `args []string` - 命令行参数列表
-
-## 因子引擎集成
-
-优化工厂保持独立 Runtime；因子研究 JSON lines/账户审计 Gob 不等同旧 orders.gob。
-
-[因子 API](factor.md) / [指南](../guide/factor.md)
-
-
-## 工厂、报告与资源
-
-BacktestFactory 的签名是 func(snapshot *config.Snapshot, isOpt bool, outDir string) (*BackTest, func(), *errs.Error)，cleanup 只释放本轮拥有状态。派生 Snapshot 复制时间范围、pairs、policies，账户/钱包不能与另一轮共享可变配置。报告通过 NewReportDeps(biz.RuntimeDeps) 绑定订单、clock、symbols、storage 和 logger，不安装 globals；DumpLineGraph 已不是公共 opt API。见[runtime](runtime.md)。
+因子回测的 `events.jsonl`、`resolved.json`、`run.json` 和账户审计文件不是时序 `orders.gob`，不能据后者是否存在判断因子任务成败。见[因子 API](./factor.md)与 [Runtime API](./runtime.md)。

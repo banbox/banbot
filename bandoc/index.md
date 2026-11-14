@@ -16,13 +16,13 @@ hero:
 
 features:
   - title: High Performance
-    details: Use an indicator library that supports state caching, 1 second backtesting 1 year of data
+    details: Go and banta cache indicator state; runtime depends on strategies, data and universe size
   - title: Easy to use
     details: one version of the strategy, supporting backtesting, simulated real-time trading and real trading at the same time
-  - title: Flexible
-    details: Freely combine different products, strategies and time periods
+  - title: Two strategy engines
+    details: Time-series strategies, factor portfolios, statistical pairs and mixed events replay
   - title: Event-driven
-    details: No lookahead and implement your strategy logic more freely
+    details: Process data by visibility time; external data must carry correct publication and revision information
   - title: Scalability
     details: A batch of strategies can be applied to multiple exchange accounts at the same time
   - title: Hyperparameter tuning

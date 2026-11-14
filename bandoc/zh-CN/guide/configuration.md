@@ -21,6 +21,22 @@ banbot会尝试从数据目录下默认读取两个配置文件：`config.yml`�
 `config.yml`中建议存放比较全的不需要经常修改的默认配置。  
 `config.local.yml`中建议存放本地相关的配置，如交易所api/secret，api_server等配置。
 
+
+## 配置分层与覆盖
+
+加载顺序为：数据目录的 `config.yml` → `config.local.yml` → 按出现顺序重复传入的 `--config` → `--config-data` 内联 YAML → 命令支持且显式传入的 CLI 覆盖。`--no-default` 只跳过前两个文件。不要依赖未传入的 flag 默认值覆盖 YAML。
+
+```bash
+bot backtest --datadir /path/to/data --config base.yml --config experiment.yml --pairs BTC/USDT
+bot backtest --datadir /path/to/data --no-default --config experiment.yml
+```
+
+映射通常按字段合并；列表由后层替换。`run_policy`、`wallet_amounts`、`fatal_stop`、`watch_jobs`、`historical_coverage` 整块替换，因此覆盖 `run_policy` 时要提供完整策略列表。后层声明 `timerange` 会取代前层 `time_start/time_end`，反之亦然。
+
+配置只接受单文档、根为 mapping、无重复键的 YAML，不支持 JSON 配置。`${VAR}` / `$VAR` 在 YAML 解码前展开；未设置的变量可能变成空值，请先设置凭据环境变量。普通加载不会迁移、备份或改写文件。
+
+配置文件路径的 `@` / `$` 前缀表示数据目录；在 shell 中使用引号保护 `$`。因子归档和执行存储等配置字段的相对路径按最终提供该字段的配置文件定位，不统一按最后一个文件定位。
+
 ## 完整Yaml配置
 > 您可使用环境变量替换配置中的敏感内容，比如`${bnb_user1_key}`
 
@@ -28,13 +44,13 @@ banbot会尝试从数据目录下默认读取两个配置文件：`config.yml`�
 
 ```yaml
 name: local  # 机器人名称，用于在消息通知中区分不同机器人
-env: prod  # 运行环境，prod表示生产网络，test表示测试网络，dry_run表示模拟实盘交易
+env: dry_run  # 字段参考；默认实时入口的环境/市场限制见模板后的说明
 leverage: 2  # 杠杆倍数，仅期货合约市场有效
 limit_vol_secs: 5  # 按成交量取订单簿价格的过期时间，单位：秒，默认10
-put_limit_secs: 120  # 在此预期时间内能成交的限价单，才提交到交易所，单位：秒，默认120
+put_limit_secs: 120  # 在此预期时间内能成交的限价单，才提交到交易所，单位：秒，默认180
 account_pull_secs: 60  # 定期更新账户余额和持仓的间隔秒数，默认60秒
 market_type: spot  # 市场：spot现货，linear：U本位合约，inverse：币本位合约，option：期权合约
-contract_type: swap # swao永续合约，future到期合约
+contract_type: swap # swap永续合约，future到期合约
 odbook_ttl: 1000  # 订单簿过期时间，单位毫秒，默认500
 concur_num: 2  # 标的K线并发下载数，默认2个标的
 order_type: market  # 下单类型：market市价单  limit限价单
@@ -53,7 +69,7 @@ min_open_rate: 0.5 # 最小开单比率，余额不足单笔金额时，余额/�
 low_cost_action: ignore # 开单金额不足最小金额时的动作：ignore/keepBig/keepAll
 max_simul_open: 0 # 在一个bar上最大同时打开订单数量
 bt_net_cost: 15 # 回测时下单延迟，可用于模拟滑点，单位：秒，默认15
-bt_strict: false # 是否启用严格回测模式；启用后固定关键执行顺序，确保回测结果可严格复现，耗时取决于任务和数据
+bt_strict: false # 严格历史回放校验；普通回测也使用稳定的执行顺序
 relay_sim_unfinish: false  # 交易新品种时(回测/实盘)，是否从开始时间未平仓订单接力开始交易
 order_bar_max: 500  # 查找开始时间未平仓订单向前模拟最大bar数量
 ntp_lang_code: none  # ntp真实时间同步，默认none不启用，支持的代码：zh-CN, zh-HK, zh-TW, ja-JP, ko-KR, zh-SG, global(表示全球ntp服务器：google、apple、facebook...)
@@ -87,7 +103,7 @@ run_policy:  # 运行的策略，可以多个策略同时运行；也可以一�
     pairs: [BTC]
     params: {atr: 15}
     pair_params:
-      BTC: {atr:14}
+      BTC: {atr: 14}
     strat_perf: # 和根strat_perf配置相同
       enable: false
 strat_perf:
@@ -110,7 +126,7 @@ pairlists:  # 交易对过滤器，按从上到下的顺序逐个过滤应用。
     limit: 100  # 取前100个
     limit_rate: 1 # 按比例截取
     min_value: 100000  # 最低成交量价值
-    cache_secs: 7200  # 缓存时间
+    cache_secs: 7200  # 保留字段，当前不生效
     back_period: 3d  # 计算成交量时间周期
   - name: PriceFilter  # 价格过滤器
     max_unit_value: 100  # 最大允许的单位价格变动对应的价值(针对定价货币，一般是USDT)。
@@ -121,8 +137,8 @@ pairlists:  # 交易对过滤器，按从上到下的顺序逐个过滤应用。
     back_days: 5  # 回顾的K线天数
     min: 0.03  # 最小价格变动比率
     max: 10  # 最大价格变动比率
-    cache_secs: 1440  # 缓存时间，秒
-  - name: SpreadFilter  # 流动性过滤器
+    cache_secs: 1440  # 保留字段，当前不生效
+  - name: SpreadFilter  # 当前直接放行，不做过滤
     max_ratio: 0.005  # 公式：1-bid/ask，买卖价差占价格的最大比率
   - name: CorrelationFilter  # 相关性过滤器
     min: -1  # 用于过滤当前币种与全市场平均相关性；默认0，表示不启用
@@ -137,8 +153,6 @@ pairlists:  # 交易对过滤器，按从上到下的顺序逐个过滤应用。
     min: 0.05  # 波动分数最小值，此值越小，允许一些在1d级别上变化非常小的标的
   - name: AgeFilter  # 按标的的上市天数过滤
     min: 5
-  - name: BlockFilter
-    pairs: [BTC]
   - name: OffsetFilter  # 偏移限定数量选择。一般用在最后
     reverse: false  # reverse array
     offset: 10  # 从第10个开始取
@@ -201,7 +215,7 @@ rpc_channels:  # 支持的全部rpc渠道
     msg_types: [exception]  # 消息类型：exception（异常）
     accounts: []  # 指定账户（空表示所有账户）
     keywords: []  # 关键词过滤（空表示不过滤）
-    retry_delay: 1000  # 重试延迟（毫秒）
+    retry_delay: 5  # 重试间隔，秒（按当前发送实现）
     min_intv_secs: 300  # 最小发送间隔（秒）
     touser: 'recipient@abc.com'  # 收件人邮箱地址
   # 企业微信通知渠道
@@ -214,7 +228,7 @@ rpc_channels:  # 支持的全部rpc渠道
     msg_types: [exception]  # 允许发送的消息类型
     accounts: []  # 允许的账户，为空允许所有
     keywords: []  # 消息过滤关键词
-    retry_delay: 1000  # 重试间隔
+    retry_delay: 5  # 重试间隔，秒（按当前发送实现）
     disable: true  # 是否禁用
 webhook:  # 发送消息的配置
   entry:  # 入场消息
@@ -232,7 +246,7 @@ mail:  # 邮件通知配置
   username: user1@example.com  # 邮箱用户名
   password: your_password  # 邮箱密码或应用密码
 bt_in_live:  # 实盘定时回测对比功能
-  cron: "0 0 * * *"  # Cron表达式，每天0点执行
+  cron: "0 0 0 * * *"  # Cron表达式，每天0点执行
   account: "account1"  # 指定执行回测的账户
   mail_to:  # 邮件通知收件人列表
     - "trader1@example.com"
@@ -252,28 +266,31 @@ api_server:  # 供外部通过api控制机器人
 
 ```
 
+上方是字段参考，不是可启动的实时配置：`market_type: spot`、`env: test`、反向合约不受默认 Hub 实时入口支持。普通 `trade`（含纯时序）默认共享 Hub，只接受 `prod` / `dry_run` 的线性永续及完整账户执行声明。旧 `fatal_stop` 和动态 leverage 等配置不受该默认路径支持；切勿仅改 `env: prod` 就执行模板。先按[共享账户与 Hub](./execution.md)准备 instrument、资金费、风险、store、发送租约及账户配置，并先启动 Hub。
+
+
 ## 重要细节配置
 #### 配置单笔订单金额
 最低开单金额取决于交易所和货币对，通常会列在交易所支持页面上。
 
-机器人启动时会自动加载交易所市场信息，即包含所有品种的开单金额等限制。banbot内部同时限制了最小单笔交易金额是10USD。
+机器人启动时会自动加载交易所市场信息，即包含所有品种的开单金额等限制。banbot 的内部最小开单金额常量为 5.5；仍需满足交易所对具体品种的数量、精度和名义金额限制。
 
 您可通过`stake_pct`或`stake_amount`配置单笔交易金额，注意对于期货合约，这两个参数指的是名义价值，而非占用的保证金。
 
-如果您需要对不同的账户使用不同的交易金额，您可在`exchange.[exg_name].account_prods.user1.stake_rate`配置金额倍率，默认为1；改为`<1`则会减少此账户的开单金额。`>1`会增加此账号开单金额
+如果您需要对不同的账户使用不同的交易金额，您可在`accounts.user1.stake_rate`配置金额倍率，默认为1；改为`<1`则会减少此账户的开单金额。`>1`会增加此账号开单金额
 
-同样，您也可以对不同策略设置不同的开单金额倍率`TradeStrat.StakeRate`
+同样，可通过 `run_policy[].stake_rate` 设置策略开单倍率。
 
 #### 全局止损
-您可通过`fatal_stop`设置当机器人在所有策略任务综合x分钟内损失达到百分之多少时，停止交易`fatal_stop_hours`个小时
+旧时序路径的 `fatal_stop` 表示综合 x 分钟损失达到阈值时停止开仓 `fatal_stop_hours` 小时。默认 Hub 实时路径不接受此机制；请使用[执行指南](./execution.md)支持的账户风险声明。
 
 #### 运行环境
 `env`的可选值：
 - `prod`：生产网络
-- `test`：测试网络
-- `dry_run`：模拟实盘交易，本地模拟撮合，不会提交到交易所，仅当运行`trade`进行实时交易时有效
+- `test`：旧适配器测试网络语义，默认 Hub 实时入口不支持
+- `dry_run`：`trade` 的 Hub paper 实时模拟，不向交易所发单；仍需启动 Hub 并提供完整执行声明。
 
-注意目前prod和test环境下品种ID并未区分，如已下载了K线，切换env时需要先删除已有K线数据，否则会出现混淆
+不要把切换 `env` 当作历史数据隔离；切换网络前核对数据库及市场标识，保留已有数据并使用独立配置/数据库进行验证。
 
 #### 品种过滤和定期刷新
 您除了通过`pairs`配置固定品种外，还可以配置`pairlists`来动态过滤并确定交易品种。如需启用，请确保`pairs`为空。
@@ -282,7 +299,7 @@ api_server:  # 供外部通过api控制机器人
 
 如果您需要定期重新计算品种列表，可以配置`pairmgr.cron`，当`force_filters`设置为`true`时，会强制应用`pairlists`过滤器到`pairs`中。
 
-`pairmgr`和`pairlists`都同时支持实盘和回测，如果您在回测中启用时，会使用历史数据进行过滤，这可以确保您在不同时间按同样配置启动回测/实盘交易时，动态计算的品种列表完全一致。
+`pairmgr`和`pairlists`都同时支持实盘和回测，如果您在回测中启用时，会使用历史数据进行过滤，结果仍取决于历史数据覆盖、品种元数据和配置，不能保证与后来实盘筛选完全一致。
 
 #### 真实时间同步设置
 请求交易所的需要鉴权的接口时一般需要带时间戳，如果本地计算机的时间与网络时间误差过大，可能会导致请求失败。
@@ -304,13 +321,13 @@ banbot提供了`ntp_lang_code`配置项，可用于自动检测本地时间误�
 
 每个账户可以配置的参数：
 - `no_trade`：是否禁止此账户交易
-- `stake_rate`：开单金额倍率，全局`stake_rate`乘以账户`stake_rate`为实际开单金额倍率
+- `stake_rate`：账户相对基准的开单倍率；策略倍率使用 `run_policy[].stake_rate`
 - `leverage`：合约杠杆
 - `max_stake_amt`：允许的单笔最大金额
 - `max_pair`：此账户允许的最大品种数量
 - `max_open_orders`：此账户允许的最大同时持仓订单数
 
-回测或模拟实盘时，只会取第一个账户的配置进行交易。
+旧时序模拟配置的默认账户选择不能推广到所有引擎；显式引擎配置通过 `run_policy[].account` 绑定账户。因子和混合策略按账户执行，同账户多策略需明确 `capital_weight`，合计不能超过 1。
 
 #### 订单接力入场
 对于大周期持仓时间较长的策略，可能一个订单持仓一两个月，您启动机器人时可能按交易信号应该已经有一些持仓了，要完全按信号交易您应该立即入场并持有对应的持仓而不是等待下一个信号发出才入场。
@@ -351,7 +368,7 @@ rpc_channels:
     msg_types: [exception]       # 消息类型：exception（异常）
     accounts: []                 # 指定账户（空表示所有账户）
     keywords: []                 # 关键词过滤（空表示不过滤）
-    retry_delay: 1000           # 重试延迟（毫秒）
+    retry_delay: 5  # 重试间隔，秒（按当前发送实现）
     min_intv_secs: 300          # 最小发送间隔（秒）
     touser: 'recipient@abc.com'  # 收件人邮箱地址
 ```
@@ -390,7 +407,7 @@ bt_in_live:
 | run_policy[].research | labels, label_wait_ms, panel (all/none) |
 | run_policy[].prices | source, timeframe, field |
 
-accounts.&lt;account&gt; 覆盖账户设置；风险额度为结算货币绝对金额。archive/store/history/sender_lease_dir 相对字段来源文件定位，多 --config 不以最后一文件统一定位。最新值存储需 static-approximation；page_bytes 是逻辑载荷，不是 RSS。见[因子示例](./factor.md)。
+accounts.&lt;account&gt; 覆盖账户设置；保证金和 gross 风险额度为比例约束，具体取值应与执行模式及账户净值匹配。archive/store/history/sender_lease_dir 相对字段来源文件定位，多 --config 不以最后一文件统一定位。最新值存储需 static-approximation；page_bytes 是逻辑载荷，不是 RSS。见[因子示例](./factor.md)。
 
 
 账户凭据、stake、leverage 等旧字段继续放在根 accounts.&lt;name&gt;；该账户的 mode/store/history/funding_policy/instruments 和风险覆盖也直接放在此处，公共默认值保留在 execution。因子字段直接放在 run_policy[]，无需 factor 包装层；expressions、snapshot、portfolio、decision、research 等具有内聚含义的分组继续保留。旧 config_version: 1/2、嵌套 factor 与 execution.accounts 输入仍可读取，但新文档及规范导出采用浅层结构。
@@ -405,10 +422,10 @@ accounts:
     stake_rate: 0.1
     leverage: 2
     history: cold/default-history.sqlite
-    max_virtual_gross: "20000"
+    max_virtual_gross: "2"
 ```
 
-这是合并到账户配置的结构片段；保留原账户凭据。账户 history 和风险上限覆盖公共默认值，未设置的执行项继承 execution。
+这是账户覆盖片段；保留原账户凭据。`history` 仅供 memory paper 冷历史归档，不可与 durable `store` 或真实 trade 合用，也不是恢复快照。未设置的执行项继承 `execution`；账户 `mode` 为保留字段，普通因子回测读取根 `execution.mode`。
 
 同一配置文件中的每个字段只使用一种路径：同时写 `run_policy[].factor.archive` 与 `run_policy[].archive`，或在根 `accounts` 与旧 `execution.accounts` 重复写同一账户执行字段，会报冲突。跨文件先规范别名，再按后层覆盖规则合并；相对路径跟随最终字段的来源文件。规范导出不输出 `config_version` 或旧包装层。
 
@@ -416,4 +433,8 @@ v0.5 的 `timeframes`、`run_timeframes` 保持原名；仅 v0.6 新增的 `freq
 
 ## 历史回放字段
 
-`bt_strict` 控制执行顺序；`bt_no_kline_download` 禁止回测隐式 K 线下载。有效 `historical_coverage` 与这两个开关一起构成严格历史回放合同；覆盖字段和准备/回放边界见[回测指南](./backtest.md#严格回放与历史覆盖)。配置快照只读，执行账户由 Runtime 单独管理；不要通过修改配置全局变量切换活动任务。
+普通回测已使用稳定顺序；`bt_bar_order_seed` 可改变同一 bar 内多品种的确定性哈希顺序。`bt_strict` 启用严格历史校验；`bt_no_kline_download` 可独立禁止回测隐式 K 线下载，但单独使用不证明数据完整。有效 `historical_coverage` 与这两个开关一起构成严格历史回放合同；覆盖字段和准备/回放边界见[回测指南](./backtest.md#严格回放与历史覆盖)。配置快照只读，执行账户由 Runtime 单独管理；不要通过修改配置全局变量切换活动任务。
+
+通知渠道的 `type` 当前只支持 `wework`、`mail`/`email`、`telegram`。根 `webhook` 是消息模板配置，不表示支持 `type: webhook` 的通用 HTTP 渠道。
+
+`retry_delay` 和 `min_intv_secs` 的实际单位均为秒；失败重试时等待间隔取二者较大值，并扣除距上次发送已过时间。`retry_delay: 1000` 表示约 1000 秒，不是 1 秒。完整示例见[通知指南](./notifications.md)。

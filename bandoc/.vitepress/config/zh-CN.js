@@ -30,6 +30,8 @@ export default defineConfig({
                         { text: '回测', link: '/zh-CN/guide/backtest' },
                         { text: '品种管理器', link: '/zh-CN/guide/pair_filters' },
                         { text: '实时交易', link: '/zh-CN/guide/live_trading' },
+                        { text: '共享账户与 Hub', link: '/zh-CN/guide/execution' },
+                        { text: '消息通知', link: '/zh-CN/guide/notifications' },
                         { text: '常见问题', link: '/zh-CN/guide/faq' }
                     ]
                 },{
@@ -41,13 +43,6 @@ export default defineConfig({
                         { text: '超参数优化', link: '/zh-CN/guide/hyperopt' },
                         { text: '滚动优化回测', link: '/zh-CN/guide/roll_btopt' },
                         {text: 'AI', link: '/zh-CN/advanced/ai'}
-                    ]
-                },{
-                    text: 'DeepWiki',
-                    items: [
-                        {text: 'banbot', link: 'https://deepwiki.com/banbox/banbot'},
-                        {text: 'banexg', link: 'https://deepwiki.com/banbox/banexg'},
-                        {text: 'banta', link: 'https://deepwiki.com/banbox/banta'},
                     ]
                 }
             ],

@@ -28,7 +28,7 @@ biz 包提供了业务逻辑层的功能实现。
 - `EnterOrder`: 处理入场订单
 - `ExitOpenOrders`: 处理退出订单
 - `ExitOrder`: 处理单个订单的退出
-- `UpdateByBar`: 根据K线更新订单状态
+- `UpdateByDataSeries`: 根据K线更新订单状态
 - `OnEnvEnd`: 环境结束时的处理
 - `CleanUp`: 清理资源
 
@@ -62,12 +62,8 @@ biz 包提供了业务逻辑层的功能实现。
 - `IsWatch`: 是否正在监听余额变化
 
 ### Trader
-交易管理器,负责处理交易策略和订单执行。
 
-主要方法:
-- `OnEnvJobs`: 处理环境任务
-- `FeedKline`: 处理K线数据
-- `ExecOrders`: 执行订单
+`NewTraderWithRuntimeDeps(deps RuntimeDeps) (Trader, *errs.Error)` 构造交易器。`FeedDataSeries(evt *orm.DataSeries) *errs.Error` 驱动策略、指标与订单处理，`FeedSeries` 是兼容别名。DataSeries.Values 保留扩展字段及 NULL/类型；不要转换成固定 OHLCV 再喂入。
 
 ## 公开方法
 
@@ -119,16 +115,18 @@ biz 包提供了业务逻辑层的功能实现。
 - `account`: string - 账户名
 - `tf`: string - 时间周期
 - `job`: *strat.StratJob - 策略任务
-- `isInfo`: bool - 是否为信息类型
+- `infoEnv`: *ta.BarEnv - 辅助周期环境；主周期传 nil
 
 ### TryFireBatches
+
+`TryFireBatches(currMS int64, isWarmUp bool) int`
 尝试触发批量任务。
 
 参数：
 - `currMS`: int64 - 当前毫秒时间戳
 
 返回：
-- `int` - 触发的任务数量
+- `int` - 尚待处理的任务数量
 
 ### InitDataDir
 初始化数据目录。
@@ -215,21 +213,24 @@ Trader.FeedDataSeries 驱动时序 jobs；共享账户桥接是 execution 投影
 [因子 API](factor.md) / [指南](../guide/factor.md)
 
 
-## 当前构造、工具和状态边界
+## 策略订单处理与账户状态
 
-旧文档中下列方法不再是可直接调用的同名公共入口。采用实际 RuntimeDeps/显式 store/clock/logger，不添加不存在的兼容别名：
+策略通常只调用 `job.OpenOrder`/`CloseOrders`。它们排队请求，订单管理器负责校验、撮合或发送。显式处理使用 `job.ProcessRuntimeOrders()`，不要在独立 Runtime 中按账户名查询包级 manager。
 
-| Prior documentation name | Current entry |
-| --- | --- |
-| LoadRefreshPairs / AutoRefreshPairs | RefreshPairsWithRuntimeDeps, RefreshJobsWithRuntimeDeps |
-| RunDataServer | entry spider command |
-| LoadZipKline | LoadZipSeriesWithRuntimeDeps |
-| LoadCalendars | LoadCalendarsWithDeps |
-| ExportKlines / PurgeKlines | ExportKlinesWithRuntimeDeps / PurgeKlinesWithRuntimeDeps |
-| ExportAdjFactors | ExportAdjFactorsWithRuntimeDeps |
-| CalcCorrelation | CalcCorrelationWithRuntimeDeps |
-| RunHistKline | RunHistSeries / RunHistSeriesWithRuntimeDeps |
+```go
+// IOrderMgr method signatures:
+ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
+EnterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder, *errs.Error)
+ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error)
+ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error)
+UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error
+OnEnvEnd(evt *orm.DataSeries) *errs.Error
+```
 
-Trader、wallet、StratJob 的可变账户配置来自同一 Runtime.Accounts/AccountsMu；共享账户桥接保存 TS 投影，而 execution 是物理账户发送/账本 owner。获取 manager/wallet 的无 deps facade 仅用于旧调用，显式业务路径不缺字段后回退到 globals。
+嵌入程序用 `GetOdMgrWithState(rt.Trading, account)`、`GetAllOdMgrWithState(rt.Trading)`、`GetLiveOdMgrWithState(rt.Trading, account)` 和 `rt.Trading.Wallet(account)` 获取所属任务状态。检查 nil；禁用的账户不保证有 manager。包级同名无 State 函数只读兼容注册表。
 
-见[runtime](runtime.md)。
+InitOdSubs、InitLiveOrderMgr、InitLocalOrderMgr、InitFakeWallets 和 StartLiveOdMgr 是装配用的兼容入口，新增执行流程使用对应 WithRuntimeDeps 入口。WatchLiveBalances 接受 WalletRuntimeLifecycle；标准 live 入口负责绑定所属 Runtime 并管理停止和等待。InitLocalOrderMgr 还接受 `stops ...func()`。Runtime.Accounts/AccountsMu 是 manager、wallet、job 共用的可变执行配置，Config 快照只读。
+
+实盘钱包以交易所余额为准；本地回测/模拟钱包不能证明真实可成交余额。仅在兼容 `LiveOrderMgr` 直接发送分支中，CreateOrder 错误（包括超时）会触发本地失败关单，后续对账可能恢复实际订单。这不代表默认 Hub/共享账户执行路径：共享执行对结果不明确的发送保留 `Unknown` 等状态并阻止普通增减仓，不允许用新命令乱重试；应使用原命令 ID 与一致内容恢复并核实交易所证据。详见[共享账户与 Hub](../guide/execution.md)。
+
+见 [Runtime API](runtime.md) 与[策略指南](../guide/strat_custom.md)。

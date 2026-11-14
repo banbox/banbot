@@ -23,7 +23,6 @@ Field descriptions:
 - `Mean float64` - Mean value (effective for normal distribution type)
 - `IsInt bool` - Whether it's an integer type
 - `Rate float64` - Normal distribution rate parameter, default is 1. Higher values make random values tend towards Mean
-- `edgeY float64` - Cache for normal distribution edge y-value calculation
 
 ### PerfSta
 Strategy performance statistics structure, used to record statistical information for a strategy across all trading targets.
@@ -77,7 +76,7 @@ Returns:
 Get value from cache for specified key, supports generics.
 
 Parameters:
-- `key string` - Cache key name
+- `key interface{}` - Cache key name
 - `defVal T` - Default value
 
 Returns:
@@ -99,8 +98,6 @@ Export performance statistics data to file.
 
 Parameters:
 - `outDir string` - Output directory path
-
-## Price Related Methods
 
 ## Utility Methods
 
@@ -140,20 +137,14 @@ Group by trading pairs and quotes.
 Parameters:
 - `items map[string][]string` - Items to group
 
+- `doSort bool` - Sort values (sorts input slices in place)
+
 Returns:
 - `string` - String representation of grouped results
 
 ### SplitSymbol
-Split trading pair symbol into base currency and quote currency.
 
-Parameters:
-- `pair string` - Trading pair name
-
-Returns:
-- `string` - Base currency
-- `string` - Quote currency
-- `string` - Base currency code
-- `string` - Quote currency code
+`SplitSymbol(pair string) (base, quote, settle, identifier string)` splits generic `/`, `:`, `-` symbols such as `BTC/USDT:USDT`. Use the bound exchange capability for special symbols; this helper does not infer exchange identity.
 
 ## Parameter Generation Methods
 

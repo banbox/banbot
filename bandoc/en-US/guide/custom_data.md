@@ -33,9 +33,22 @@ The core runtime event fields are:
 
 Read original values with `DataFields.RawValue(name)` and its presence flag. `Series(name)` is a derived numeric history with NaN for NULL/missing points. Explicitly selecting large integers for Series converts them to float64 and may lose precision. Databases store declared columns only and can turn absent keys into NULL. JSON network transport also cannot preserve Go integer widths automatically; these boundaries are not lossless copies of the original map.
 
+```go
+value, exists := fields.RawValue("rate") // fields: *strat.DataFields
+if !exists {
+    // The field is absent from this event.
+} else if value == nil {
+    // The field is present with a NULL value.
+}
+```
+
+Database NULL values are read as present keys with nil values; do not convert them to zero. For full K-line row writes, missing `quote`/`buy_volume` default to 0.0, missing `trade_num` defaults to 0, and other missing fields become NULL. Explicit nil differs from omitting these defaulted fields.
+
 ## Registering a Data Source
 
 The simplest method is a function-based data source. The historical fetch function returns data for a specified time range; the optional live subscription function can be omitted when the source is only used for backtesting and startup backfill.
+
+This example assumes you implement a provider adapter named `fetchFundingRecords(ctx, sub, startMS, endMS)` returning `([]*orm.DataRecord, error)`. It registers historical access only and does not generate live data:
 
 ```go
 func init() {
@@ -44,19 +57,9 @@ func init() {
     })
     err := data.RegisterFuncDataSource(info,
         func(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error) {
-            // Fetch data from the provider and convert timestamps to milliseconds.
-            return []*orm.DataRecord{{
-                TimeMS: startMS,
-                EndMS:  startMS + 8*60*60*1000,
-                Closed: true,
-                Values: map[string]any{"rate": 0.0001},
-            }}, nil
+            return fetchFundingRecords(ctx, sub, startMS, endMS)
         },
-        func(ctx context.Context, subs []*strat.DataSub, sink data.DataSink) error {
-            // Send a batch of DataRecord values to the matching subscription.
-            // return sink.Emit(subs[0], rows)
-            return nil
-        },
+        nil,
     )
     if err != nil {
         panic(err)
@@ -64,7 +67,9 @@ func init() {
 }
 ```
 
-The function bodies above are integration scaffolding: fetch the requested range and start a producer canceled by ctx in the live function. Returning nil alone does not create a subscription. `RegisterFuncDataSource` already registers an instance factory. Complex sources should use `data.RegisterDataSourceFactory(name, factory)` to return independent instances; registering a shared instance alone does not meet explicit Runtime isolation requirements.
+The adapter must query `[startMS,endMS)` and return real intervals, millisecond timestamps, `Closed`, and `Values`. The framework fills a zero Sid. Return an error for provider failures; return empty rows with nil only for genuinely queried intervals with no observations. Otherwise failures may be recorded as confirmed no-data coverage and prevent later backfill. Implement `PagedHistorySource` to bound fetches for large ranges.
+
+`RegisterFuncDataSource` registers a factory automatically. For complex sources, use `data.RegisterDataSourceFactory(name, factory)` and return an independent instance each time. A shared instance alone cannot serve independent runtimes. Live sources need a real subscription function that responds to ctx cancellation and calls `sink.Emit(sub, rows)`. Omitting it does not poll the provider and cannot satisfy installations requiring managed live handles.
 
 Historical data is automatically filled and written to the database by banbot. A live data source must call `sink.Emit(sub, rows)` for every received subscription; do not bypass this entry point to send data directly to strategies. Registration occurs while the strategy package is initialized, so the strategy package containing the registration code must be compiled into the executable before starting the bot.
 
@@ -119,7 +124,24 @@ Use `job.DataHub.Get(timeframe, source, sid)` to obtain the corresponding `DataF
 
 ## K-Line Extension Fields
 
-When data is strictly aligned with K-line timestamps, use `orm.NewKLineSeriesInfo(...)` and `orm.NewKLineSeriesStore(...)` to write extension columns. Strategies still read them through the same subscription entry point:
+When data is strictly aligned with K-line timestamps, use `orm.NewKLineSeriesInfo(...)` and `orm.NewKLineSeriesStore(...)` to write extension columns and read them through the same subscription entry point.
+
+Download or write the target K-lines first. Extension writes only UPDATE existing `(sid,time)` rows and fail when a target row is missing; they never create K-lines. Use `NewKLineSeriesInfo` rather than binding a physical K-line table with the independent-series `NewSeriesInfo("kline", ...)`:
+
+```go
+info := orm.NewKLineSeriesInfo("open_interest", "1h", []orm.SeriesField{
+    {Name: "open_interest", Type: "float"},
+})
+store := orm.NewKLineSeriesStoreWithStorage(info, storage)
+if err := store.Write(ctx, target, []*orm.DataRecord{{
+    TimeMS: barStartMS,
+    Values: map[string]any{"open_interest": 12345.0},
+}}); err != nil {
+    return err
+}
+```
+
+The example assumes `storage`, `target`, `ctx`, and the K-line start timestamp `barStartMS` are already available. The subscription source remains `kline`, rather than the extension definition Name:
 
 ```go
 &strat.DataSub{
@@ -130,6 +152,15 @@ When data is strictly aligned with K-line timestamps, use `orm.NewKLineSeriesInf
 
 The default OHLCV fields are preserved. Extension fields can be read with `data.Series("open_interest")` or `data.Float64("open_interest")`. Extension columns cannot use built-in field names such as `sid`, `time`, `ts`, `open`, `high`, `low`, `close`, `volume`, `quote`, `buy_volume`, or `trade_num`.
 
+## Manual Backfill and Inspection
+
+```shell
+bot series list
+bot series down --tables funding_rate --pairs BTC --timerange 20240101-20250101
+```
+
+First check that the JSON from `list` contains your source definition. It lists compiled-in sources without scanning the database. `down --tables` selects source names, not physical tables such as `funding_rate_8h`; omitting it selects all custom sources. The current CLI supports regular periods only and clips the end to a closed boundary no later than now. Use a capable source/runtime interface for `event` streams.
+
 ## Viewing Data
 
 Registered custom data can be viewed on the Data page in WebUI/Dashboard. The viewer is read-only and supports filtering by source, sid, timeframe, time range, and fields. Continue to use `SeriesStore` or the data-source runtime for writing, backfilling, and deleting data.
@@ -138,7 +169,7 @@ Registered custom data can be viewed on the Data page in WebUI/Dashboard. The vi
 
 Custom fields travel through feeders and serialization in Values; do not reduce them to K-lines and reconstruct them later. `ExSymbol.AggRules` configures first/last/min/max/sum/avg/mid per column, with last as the extension default; register custom rules through `orm.RegisterAggRule`. first/last preserve the selected original value; numeric rules convert and validate NULL according to their semantics. Adjustment changes supported open/high/low/close/volume/buy_volume fields only. Custom values remain present without automatic price-factor scaling.
 
-Both engines merge requirements through SubscriptionPlan. A live candidate generation warms history and buffers live batches, recursively cloning Values and metadata. Budget or validation failures roll back the candidate. Managed sources return Stop/Join handles; the owner seals intake and waits for admitted callbacks. Stopping one source instance must not stop another task.
+Live sources must own their subscription resources. When managed lifecycle is required, implement `ManagedLiveSource` and return independent `Stop()`/`Join() error` handles. Stop production and wait for shutdown on cancellation; stopping one instance must not close another task. Warmup or live startup failure prevents the new subscription from activating.
 
 QuestDB WAL writes are asynchronously visible. Wait for expected rows/ranges before dependent reads, verify replacement snapshots before swapping tables, and retain recovery markers on timeout. See [Database](./database.md) for backend deployment and configuration.
 

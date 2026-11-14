@@ -62,11 +62,8 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
     atrLen1 := pol.Def("atrLen1", 9, core.PNorm(3, 20))
     atrLen2 := pol.Def("atrLen2", 9, core.PNormF(3, 20, 12, 1))
     atrLen3 := pol.Def("atrLen3", 9, core.PUniform(3, 20))
-    other1 := pol.More["other1"].(string)
-    other2 := pol.More["other2"].(int)
-    other3 := pol.More["other3"].(float64)
     return &strat.TradeStrat{
-		// more
+        WarmupNum: max(int(atrLen), int(atrLen1), int(atrLen2), int(atrLen3)),
     }
 }
 ```
@@ -85,7 +82,7 @@ run_policy:
 ```
 ::: warning Tips
 Each item in the yaml configuration `run_policy` corresponds to a call to the strategy function, generating a strategy with specific parameters.
-The same strategy can appear in multiple `run_poolicy` items, that is, the same strategy function may be executed multiple times.
+The same strategy can appear in multiple `run_policy` items, that is, the same strategy function may be executed multiple times.
 The `*strat.TradeStrat` returned by the strategy function will be applied to multiple varieties, corresponding to multiple `*strat.StratJob`.
 Therefore, any variables related to a single symbol should not be saved in the strategy function, but should be saved through `*strat.StratJob.More`.
 The variables in the strategy function should remain unchanged. Otherwise, it will lead to unexpected states.
@@ -93,9 +90,9 @@ The variables in the strategy function should remain unchanged. Otherwise, it wi
 
 ## strat.TradeStrat Strategy Object
 
-`TradeStrat` provides a wealth of property configurations and callback functions. The most commonly used is `OnBar`.
+`TradeStrat` provides a wealth of property configurations and callback functions. Use `OnData` for new strategies; `OnBar` remains a supported K-line compatibility callback.
 
-The following is the complete definition of `TradeStrat`:
+Common public fields of `TradeStrat` (other configuration fields omitted):
 ```go
 type TradeStrat struct {
 	Name          string  // The strategy name does not need to be set and will be automatically set to the name used during registration
@@ -116,6 +113,11 @@ type TradeStrat struct {
 	Outputs       []string // The content of the text file output by the strategy, where each string is one line
 	Policy        *config.RunPolicyConfig
 
+	OnDataSubs          func(s *StratJob) []*DataSub
+	OnData              func(s *StratJob, data DataEvent)
+	OnWsData            func(s *StratJob, evt *orm.DataSeries)
+	OnSymbols           func(items []string) []string
+	OnPostApi           FnOnPostApi
 	OnPairInfos         func(s *StratJob) []*PairSub                        // The strategy requires additional data on other types or periods
 	OnStartUp           func(s *StratJob)                                   // Callback at startup. Called before the first execution
 	OnBar               func(s *StratJob)                                   // Callback function for each K line
@@ -138,6 +140,40 @@ type TradeStrat struct {
 :::
 
 ## Simple strategy example
+
+Use the unified callback for new strategies. This complete example registers as `data:demo`. Setting OnData together with OnBar or OnInfoBar panics during construction; later OnBar examples remain valid when used separately. Route auxiliary and custom events with RouteData.
+
+```go
+package dataexample
+
+import (
+    "github.com/banbox/banbot/config"
+    "github.com/banbox/banbot/strat"
+    ta "github.com/banbox/banta"
+)
+
+func init() { strat.RegisterStrategy("data:demo", Demo) }
+
+func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+    return &strat.TradeStrat{
+        WarmupNum: 100,
+        OnData: strat.RouteData(strat.DataHandlers{
+            Main: func(s *strat.StratJob, data strat.DataEvent) {
+                fast, slow := ta.SMA(s.Env.Close, 5), ta.SMA(s.Env.Close, 20)
+                cross := ta.Cross(fast, slow)
+                if s.IsWarmUpState() { return }
+                if cross == 1 {
+                    _ = s.OpenOrder(&strat.EnterReq{Tag: "cross_up", Log: true})
+                } else if cross == -1 {
+                    _ = s.CloseOrders(&strat.ExitReq{Tag: "cross_down", Log: true})
+                }
+            },
+        }),
+    }
+}
+```
+
+
 ```go
 package ma
 
@@ -179,13 +215,13 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 > You can use indicators in any callback function, but note that **all indicators must be called unconditionally once in the primary `OnData` handler**; otherwise, indicator calculations may be incorrect.
 
 ## banta: Technical Analysis Library
-The high-performance indicator library [banta](https://github.com/banbox/banta) is used in banbot. It caches the calculation state of indicators for each bar, which is the key to the high performance of banbot. You can visit [DeepWiki](https://deepwiki.com/banbox/banta) to learn more information about banta.
+The high-performance indicator library [banta](https://github.com/banbox/banta) is used in banbot. It caches the calculation state of indicators for each bar, which is the key to the high performance of banbot. See the [banta upstream repository](https://github.com/banbox/banta) and [Go API](https://pkg.go.dev/github.com/banbox/banta) for indicators and call signatures.
 
 `banta.BarEnv` and `banta.Series` are two key structures in banta.
 
 `banta.BarEnv` is the operating environment of a technical indicator, which stores information such as the current exchange, market, symbol, time period, etc.
 A strategy task will require at least one `banta.BarEnv`. If other symbols or time periods are subscribed through `OnPairInfos`, multiple operating environments will be required.
-But it should be noted that only one operating environment `BarEnv` will be created for each exchange, each market, each symbol, and each time period.
+Within one Runtime, jobs can share a BarEnv for the same exchange, market, symbol and timeframe; different Runtimes have independent environments.
 
 `banta.BarEnv` has several built-in original `Series`, namely: `Open`, `High`, `Low`, `Close`, `Volume`, which respectively save the sequence information of opening price, highest price, lowest price, closing price, and trading volume.
 
@@ -194,7 +230,7 @@ But it should be noted that only one operating environment `BarEnv` will be crea
 Current exports also include: `VWMA/VWAP`, `DEMA/T3/TEMA/MAMA/SSF/SWMA/TRIMA/VIDYA/ZLMA`, `DMI/ADX/AROONOSC/DX/SAR/PSAR/Ichimoku/KST`, `StochF/STOCHF/ULTOSC/Fisher/ROCR/TRIX/TSI/DPO/MOM/WilliamsPercent`, `Squeeze/NATR/Supertrend/Donchian/KeltnerChannel/PMAX`, `CMF/ADL/ADOSC/EFI/OBV/VPCI/MFI`, `LinReg/Slope/Correlation/LINEARREG_ANGLE`, `PivotHigh/PivotLow`, and `CDL*` candlestick patterns. Multi-return functions must receive values in the documented order.
 
 You can use `Series.Get(0)` to get the latest value of a series, such as `e.Close.Get(0)` to get the latest closing price;
-You can also use `Series.Range(0,5)` to get the 5 most recent values ​​of a series, which returns a `[]float64` array of length 5.
+You can also use `Series.Range(0,5)` to get the 5 most recent values ​​of a series, which returns up to five values as a `[]float64` slice; insufficient history produces fewer.
 
 When performing multiple repeated calculations at the same bar time (such as running the same batch of strategies on multiple accounts in real trading), `Series` will automatically use cached results to avoid repeated calculations.
 
@@ -215,7 +251,7 @@ For example, `banta.EMA` requires the previous moving average value when calcula
 
 You can implement your custom indicator logic quickly and easily, taking `Highest` as an example:
 ```go:line-numbers {1}
-func Highest(obj *Series, period int) *Series {
+func Highest(obj *ta.Series, period int) *ta.Series {
 	res := obj.To("_hh", period)
 	if res.Cached() {
 		return res
@@ -232,7 +268,7 @@ The `_hh` and `period` parameters are used as hashes here.
 
 In fact, `Series` has a member attribute:
 ```go
-Subs  map[string]map[int]*Series
+Subs  map[string]map[int]*ta.Series
 ```
 It saves all `Series` derived from this `Series`. In essence, all `Series` in the strategy are derived from the original `Open/High/Low/Close/Volume`.
 
@@ -247,7 +283,7 @@ type sumState struct {
 	addLen int
 }
 
-func Sum(obj *Series, period int) *Series {
+func Sum(obj *ta.Series, period int) *ta.Series {
 	res := obj.To("_sum", period)
 	if res.Cached() {
 		return res
@@ -380,13 +416,14 @@ m, _ := s.More.(*Demo2Sta)
 
 To Send an entry signal, you only need to call the `StratJob.OpenOrder` method and pass a `*strat.EnterReq` parameter.
 
-The simplest case is to only assign a value to the `Tag` property of `EnterReq`, and use the default parameters for all others. That is, open a long order according to the default order amount and leverage multiple. There is no stop profit or stop loss.
+The simplest case is to only assign a value to the `Tag` property of `EnterReq`, and use the default parameters for all others. This requests a long entry using configured stake and leverage. The strategy default StopLoss can still supply a stop loss.
 
-The following are all the parameters of `EnterReq`:
+Common strategy parameters of `EnterReq` (see the strat API for the full reference):
 ```go
 type EnterReq struct {
+    CommandID string // Stable request identity
 	Tag             string  // Entry signal
-	StgyName        string  // Strategy Name
+	StratName        string  // Strategy Name
 	Short           bool    // Whether to short sell
 	OrderType       int     // Order type, core.OrderType*
 	Limit           float64 // Limit order entry price, submitted as limit order when specified
@@ -400,6 +437,8 @@ type EnterReq struct {
 	StopLossLimit   float64 // Stop loss limit price. If not provided, uses StopLoss
 	StopLossRate    float64 // Stop loss exit ratio. 0 means 100%. Must be (0,1]
 	StopLossTag     string  // Reason for Stop Loss
+	ActivationPrice float64 // Trailing stop activation price
+	CallbackPct float64 // Trailing stop callback percent, nonzero: 0.1–10
 	TakeProfitVal   float64 // Distance from entry price to take profit price, used to calculate TakeProfit
 	TakeProfit      float64 // Take profit trigger price. Submits take profit order if not empty
 	TakeProfitLimit float64 // Take profit limit price. If not provided, uses TakeProfit
@@ -417,16 +456,14 @@ To trigger an entry at a specific price, you can set the `Limit` or `Stop` param
 
 `Stop` would put a trigger order (stop order). For a long order, you can set a higher price to enter after a breakout. For a short order, you can set a lower price to enter after a breakdown.
 
-For example, if the current price is 100 and you want to enter a long position with a limit price of 122 when the price rises to 120, you can set `{Stop: 120, Limit: 122}`.
+For a long breakout above 120 when the price is 100, use `&strat.EnterReq{Tag: "breakout", Stop: 120}`. `Stop` and `Limit` are mutually exclusive; setting both returns an error.
 
 When `OpenOrder` returns an error, it indicates that opening the order failed. You can use `log.Error` to record error information, or set `Log` to true in `EnterReq` to let the system automatically log error messages.
 
-:::tip tip
-Calls to `OpenOrder` do not guarantee order execution at arbitrary positions within the strategy. By default, opening and closing positions will only be executed immediately when called within the following callback functions: `OnBar`, `OnOrderChange`, `OnBatchJobs`, and `OnPostApi`.
+:::tip
+`OpenOrder`/`CloseOrders` validate and enqueue intents; they do not guarantee fills. Main `OnData`/`OnBar`, `OnBatchJobs`, order callbacks and successful `OnPostApi` callbacks have framework processing paths. Do not assume automatic submission from auxiliary or high-frequency callbacks.
 
-If you need to submit enter order immediately in other callbacks as well, you can call `_, _, err := biz.GetOdMgr(s.Account).ProcessOrders(nil, s)` on your own to submit and process the order.
-
-Note that `OnOrderChange` by default only processes open/close signals for the current symbol. If you need to trigger open/close positions for other symbols, you need to manually call `ProcessOrders(nil, job)` for other jobs.
+For explicit submission use `_, _, err, bound := s.ProcessRuntimeOrders()` and check err and bound. bound=false means no explicit Runtime is bound; do not substitute a global account of the same name. Process another symbol through its own job. During warmup OpenOrder may return nil without enqueuing anything.
 :::
 ## Send an exit signal
 
@@ -434,11 +471,12 @@ To send an exit signal, just call the `StratJob.CloseOrders` method and pass a `
 
 The simplest case is to only assign a value to the `Tag` property of `ExitReq` and use the default parameters for all other parameters. That is, close all orders with market orders, including long orders and short orders.
 
-The following are all the parameters of `ExitReq`:
+Common strategy parameters of `ExitReq`:
 ```go
 type ExitReq struct {
+    CommandID string // Stable request identity
 	Tag        string  // Exit signal
-	StgyName   string  // Strategy Name
+	StratName   string  // Strategy Name
 	EnterTag   string  // Only exit orders with EnterTag as the entry signal
 	Dirt       int     // core.OdDirt* long/short/both
 	OrderType  int     // Order type, core.OrderType*
@@ -446,7 +484,7 @@ type ExitReq struct {
 	ExitRate   float64 // Exit rate, default 100% (all orders)
 	Amount     float64 // Amount to exit. ExitRate is invalid when specified
 	OrderID    int64   // Only exit specified order
-	UnOpenOnly bool    // If true, only exit orders that have not yet entered
+	UnFillOnly bool    // If true, only exit orders that have not yet entered
 	FilledOnly bool    // If true, only exit orders that have already entered
 	Force      bool    // Whether to force exit
 	Log        bool    // Whether to automatically log error messages
@@ -497,85 +535,82 @@ You can also set stop loss and take profit for all orders:
 ma5Val := ma5.Get(0)
 s.SetAllStopLoss(core.OdDirtLong, &ormo.ExitTrigger{
     Price: ma5Val * 0.97,
-    Limit: ma5Val * 0.975,
+    Limit: ma5Val * 0.965,
     Rate:  0.5,
     Tag:   "stop half",
 })
 ```
-For all open long orders, a stop loss of 50% of the position is set. When the price triggers 0.97 times the 5-period moving average, half of the position is closed with a limit order stop loss of 0.975 times.
+For all open long orders, a stop loss of 50% of the position is set. When the price triggers 0.97 times the 5-period moving average, half of the position is closed with a limit order stop loss of 0.965 times.
 
 ## Batch task processing
 Sometimes you may need to perform some calculations (such as correlation coefficients) for all symbols of the current strategy together, get some intermediate states to save, or open or close orders together.
 In this case, you can use the `OnBatchJobs` or `OnBatchInfos` callback function.
 `OnBatchJobs` is triggered only after main `OnData(RoleMain)`/`OnBar`; `OnBatchInfos` is triggered only after auxiliary `OnData(RoleInfo)`/`OnInfoBar`. They are enabled by `BatchInOut` and `BatchInfo`, respectively.
-> Ordinary mode does not promise `OnBatchJobs` job order; strict backtests use deterministic ordering from the instance `BatchState`.
+> All backtests use deterministic batches. Main jobs are sorted by symbol key; sort by strategy score when entries compete for funds. The example stores correlations for subsequent callbacks without assuming main/auxiliary callback order at the same timestamp.
 ```go
-func calcCorrs(jobs []*strat.StratJob, isBig bool) {
-	// Calculate the average correlation coefficient between each symbol and other varieties, and save it to More
-	dataArr := make([][]float64, 0, len(jobs))
-	for _, j := range jobs {
-		dataArr = append(dataArr, j.Env.Close.Range(0, 70))
-	}
-	_, arr, err := utils.CalcCorrMat(dataArr, true)
-	if err != nil {
-		log.Error("calc corr mat fail", zap.Error(err))
-		return
-	}
-	for i, j := range jobs {
-		m, _ := j.More.(*BatchSta)
-		if isBig {
-			m.bigCorr = arr[i]
-		} else {
-			m.smlCorr = arr[i]
-		}
-	}
+// Imports: slices, config, strat, utils, banexg/log, banta as ta, zap.
+type BatchSta struct {
+    smlCorr, bigCorr float64
+    smlReady, bigReady bool
 }
 
-type BatchSta struct {
-	smlCorr float64
-	bigCorr float64
+func calcCorrs(jobs []*strat.StratJob, envs []*ta.BarEnv, isBig bool) {
+    if len(jobs) < 2 { return }
+    dataArr := make([][]float64, 0, len(envs))
+    for _, env := range envs {
+        values := env.Close.Range(0, 70)
+        if len(values) < 70 { return }
+        dataArr = append(dataArr, values)
+    }
+    _, values, err := utils.CalcCorrMat(70, dataArr, true)
+    if err != nil {
+        log.Error("calc corr mat fail", zap.Error(err))
+        return
+    }
+    for i, job := range jobs {
+        state := job.More.(*BatchSta)
+        if isBig { state.bigCorr, state.bigReady = values[i], true
+        } else { state.smlCorr, state.smlReady = values[i], true }
+    }
 }
 
 func BatchDemo(pol *config.RunPolicyConfig) *strat.TradeStrat {
-	return &strat.TradeStrat{
-		WarmupNum:  100,
-		BatchInOut: true,
-		BatchInfo:  true,
-		OnPairInfos: func(s *strat.StratJob) []*strat.PairSub {
-			return []*strat.PairSub{
-				{"_cur_", "1h", 100},
-			}
-		},
-		OnStartUp: func(s *strat.StratJob) {
-			s.More = &BatchSta{}
-		},
-		OnBar: func(s *strat.StratJob) {
-			m, _ := s.More.(*BatchSta)
-			if m.bigCorr < 0.5 && m.smlCorr < 0.5 {
-				// When the correlation between the large and small cycles is less than 50%, the order will be opened.
-				s.OpenOrder(&strat.EnterReq{Tag: "open"})
-			} else if m.smlCorr > 0.9 {
-				// The current small cycle correlation of the symbol is higher than 90%, close the position
-				s.CloseOrders(&strat.ExitReq{Tag: "close"})
-			}
-		},
-		OnBatchJobs: func(jobs []*strat.StratJob) {
-			if jobs[0].IsWarmUp {
-				return
-			}
-			calcCorrs(jobs, false)
-		},
-		OnBatchInfos: func(tf string, jobs map[string]*JobEnv) {
-			jobList := utils.ValsOfMap(jobs)
-			if jobList[0].IsWarmUp {
-				return
-			}
-			calcCorrs(jobList, true)
-		},
-	}
+    return &strat.TradeStrat{
+        WarmupNum: 100, BatchInOut: true, BatchInfo: true,
+        OnPairInfos: func(s *strat.StratJob) []*strat.PairSub {
+            return []*strat.PairSub{{Pair: "_cur_", TimeFrame: "1h", WarmupNum: 100}}
+        },
+        OnStartUp: func(s *strat.StratJob) { s.More = &BatchSta{} },
+        OnBar: func(s *strat.StratJob) {
+            state := s.More.(*BatchSta)
+            if !state.smlReady || !state.bigReady { return }
+            if state.bigCorr < 0.5 && state.smlCorr < 0.5 {
+                _ = s.OpenOrder(&strat.EnterReq{Tag: "open", Log: true})
+            } else if state.smlCorr > 0.9 {
+                _ = s.CloseOrders(&strat.ExitReq{Tag: "close", Log: true})
+            }
+        },
+        OnBatchJobs: func(jobs []*strat.StratJob) {
+            envs := make([]*ta.BarEnv, 0, len(jobs))
+            for _, job := range jobs { envs = append(envs, job.Env) }
+            calcCorrs(jobs, envs, false)
+        },
+        OnBatchInfos: func(tf string, items map[string]*strat.JobEnv) {
+            keys := utils.KeysOfMap(items)
+            slices.Sort(keys)
+            jobs := make([]*strat.StratJob, 0, len(keys))
+            envs := make([]*ta.BarEnv, 0, len(keys))
+            for _, key := range keys {
+                item := items[key]
+                jobs = append(jobs, item.Job)
+                envs = append(envs, item.Env)
+            }
+            calcCorrs(jobs, envs, true)
+        },
+    }
 }
 ```
-> Note that all indicators used in OnBatchJobs or OnBatchInfos must also be called once in OnBar; otherwise, the indicator calculation will be incorrect.
+> Update stateful indicators on every event for their own environment: main OnData/OnBar or auxiliary OnData/OnInfoBar. Batch callbacks should read updated results, not be the only place that advances an indicator.
 
 ## Custom exit logic
 You can perform custom exit logic checks on each candlestick, for each open order:
@@ -623,7 +658,7 @@ func DrawDown(pol *config.RunPolicyConfig) *strat.TradeStrat {
 }
 ```
 ## Dynamic Modification the Subscription Symbols 
-You can directly specify the `pairs` symbol list in the yml or perform dynamic filtering through `pairlist`. However, you can also listen to the symbol list and modify the return through the `OnSymbols` callback function in the strategy:
+You can directly specify the `pairs` symbol list in the yml or perform dynamic filtering through `pairlists`. However, you can also listen to the symbol list and modify the return through the `OnSymbols` callback function in the strategy:
 ```go
 func editPairs(p *config.RunPolicyConfig) *strat.TradeStrat {
 	return &strat.TradeStrat{
@@ -651,19 +686,28 @@ You need to return the modified symbol list. Not all these varieties will be tra
 You can dynamically add or remove trading pairs during strategy execution using the `UpdatePairs` method without restarting the bot.
 
 ```go
-// Add/Remove pairs and close positions
-s.Strat.UpdatePairs(strat.PairUpdateReq{
-	Add:    []string{"BTC", "ETH"},
-	Remove:        []string{s.Symbol.Symbol},
-	CloseOnRemove: true,
-})
+// botruntime aliases github.com/banbox/banbot/runtime; errs is banexg/errs.
+// rt must be the Runtime that owns s, supplied by your embedding application.
+func updatePairs(rt *botruntime.Runtime, s *strat.StratJob) (*strat.PairUpdateResult, *errs.Error) {
+    return s.Strat.UpdatePairs(strat.PairUpdateReq{
+        StrategyState: rt.Strategies,
+        Core: rt.Core,
+        Exchange: rt.Exchange,
+        Add: []string{"BTC", "ETH"},
+        Remove: []string{s.Symbol.Symbol},
+        CloseOnRemove: true,
+    })
+}
 ```
+
+Ordinary strategy callbacks have no public Runtime state getter. Without an rt supplied by the host, prefer configured rotation or OnSymbols. Updates require SubWarmPairs hooks; CloseOnRemove also requires ExitOrders. Check the error, Added/Removed/Skipped and Warnings. Removed jobs with pending orders remain until terminal order events. ForceAdd bypasses normal symbol admission restrictions, not data, scoring or execution requirements.
+
 
 **Parameters:**
 - `Add`: List of pairs to add
 - `Remove`: List of pairs to remove
 - `CloseOnRemove`: Whether to close orders when removing
-- `ForceAdd`: Force add (bypass pairlist filters)
+- `ForceAdd`: Bypass normal symbol admission restrictions; data, scores and exchange checks can still fail
 - `Reason`: Reason for update (optional)
 
 ## Strategy Exit Callbacks
@@ -735,9 +779,9 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 :::
 
 ## Websocket High-Frequency Data Subscription
-You can subscribe to high-frequency data pushed by exchanges via Websocket in the strategy, including: incomplete K-lines, tick-by-tick trades, and order book depth. Supports both live trading and backtesting.
+You can subscribe to high-frequency data pushed by exchanges via Websocket in the strategy, including: incomplete K-lines, tick-by-tick trades, and order book depth. Live subscriptions depend on exchange and data-source support. Ordinary K-line backtests do not include historical trades or depth and cannot reproduce these callbacks.
 
-**Note**: There is approximately a 1ms delay from the spider sending data to the robot process. Additionally, there is a certain delay from the exchange to your local system depending on network conditions.
+Actual latency depends on the source, network and workload; there is no fixed millisecond guarantee.
 
 Here is an example:
 ```go
@@ -748,6 +792,7 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/log"
+    "go.uber.org/zap"
 )
 
 func ws(p *config.RunPolicyConfig) *strat.TradeStrat {
@@ -764,16 +809,20 @@ func ws(p *config.RunPolicyConfig) *strat.TradeStrat {
 		OnWsKline: func(s *strat.StratJob, pair string, k *banexg.Kline) {
 			log.Info(fmt.Sprintf("OnWsKline %v: %v", k.Time, k.Close))
             s.OpenOrder(&strat.EnterReq{Tag: "long"})
-            _, _, err := biz.GetOdMgr(s.Account).ProcessOrders(nil, s)
+            _, _, err, bound := s.ProcessRuntimeOrders()
             if err != nil {
                 log.Error("process order fail", zap.Error(err))
+            } else if !bound {
+                log.Warn("runtime order processor is not bound")
             }
 		},
 		OnWsTrades: func(s *strat.StratJob, pair string, trades []*banexg.Trade) {
+			if len(trades) == 0 { return }
 			last := trades[len(trades)-1]
 			log.Info(fmt.Sprintf("OnWsTrades %v %v, %v", last.Timestamp, last.Price, last.Amount))
 		},
 		OnWsDepth: func(s *strat.StratJob, dep *banexg.OrderBook) {
+			if dep == nil || dep.Bids == nil || dep.Asks == nil || len(dep.Bids.Price) == 0 || len(dep.Asks.Price) == 0 { return }
 			bp1, bm1 := dep.Bids.Price[0], dep.Bids.Size[0]
 			ap1, am1 := dep.Asks.Price[0], dep.Asks.Size[0]
 			log.Info(fmt.Sprintf("OnWsDepth %v %v, %v,, %v, %v", dep.TimeStamp, bp1, bm1, ap1, am1))
@@ -783,7 +832,7 @@ func ws(p *config.RunPolicyConfig) *strat.TradeStrat {
 ```
 As above, you can subscribe to the required data through `WsSubs`. The value can be left empty by default, or use `_cur_` to represent the current variety. You can also use other varieties or subscribe to multiple varieties simultaneously, such as `BTC,_cur_`. Multiple varieties should be separated by commas.
 
-In these three high-frequency callbacks, opening and closing positions are not supported by default. If needed, you can follow the example code above and call `ProcessOrders` on your own to submit and process orders.
+In these three high-frequency callbacks, opening and closing positions are not supported by default. If needed, you can follow the example code above and call the current job’s `ProcessRuntimeOrders` and check both the error and bound.
 
 ## HTTP Post Interface Callback
 You can initiate a callback to your strategy through an HTTP POST request from an external source. This is only supported for live trading and simulated live trading, and it will only take effect when you enable the `api_server`.
@@ -799,7 +848,7 @@ func PostApi(p *config.RunPolicyConfig) *strat.TradeStrat {
         },
         OnPostApi: func(client *core.ApiClient, msg map[string]interface{}, jobs map[string]map[string]*strat.StratJob) error {
 			// You can parse the received request by yourself. The following is just an example for reference.
-            action := utils.PopMapVal(msg, "action", "")
+            action, _ := msg["action"].(string)
             for acc, pairMap := range jobs {
                 for pairTF, job := range pairMap {
                     if action == "openLong" {
@@ -833,11 +882,10 @@ api_server:  # For controlling the robot through the api from an external source
 Then make a POST request to the api at http://127.0.0.1:8001/api/strat_call
 ```json
 {
-    "token": "very_strong_password", // This is the password in the api_server
-    "strategy": "ma:postApi", // This is the name of the requested strategy
-    // The first two are fixed and required. The following fields are optional, and you can parse them in the strategy by yourself.
+    "token": "very_strong_password",
+    "strategy": "ma:postApi",
     "action": "openLong",
-    "data1": 123, // Other arbitrary data to be sent to the strategy
+    "data1": 123,
     "data2": "hello"
 }
 ``` 
@@ -860,10 +908,10 @@ Return all orders for the current strategy task in the specified direction. The 
 **Position(dirt float64, enterTag string) float64**  
 Get the position size of the current strategy task, returning a multiple of the base amount. For example, if the default order amount is 30U, a return value of 2 indicates that 60U has been spent on orders.
 
-**SetAllStopLoss(dirt float64, args \*ormo.ExitTrigger)**  
+**SetAllStopLoss(dirt float64, args \*ormo.ExitTrigger) \*errs.Error**
 Set stop-loss for all orders in the specified direction for the current strategy task. The parameter `dirt` can be `core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth`.
 
-**SetAllTakeProfit(dirt float64, args \*ormo.ExitTrigger)**  
+**SetAllTakeProfit(dirt float64, args \*ormo.ExitTrigger) \*errs.Error**
 Set take-profit for all orders in the specified direction for the current strategy task. The parameter `dirt` can be `core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth`.
 
 ## Factor and cross-sectional engine

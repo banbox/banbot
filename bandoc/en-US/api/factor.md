@@ -101,7 +101,17 @@ Every DSL call is scalar. MACD calls all take `(x,fast,slow,signal)`; every Boll
 
 New indicators advance only on complete valid input tuples. An invalid dependency propagates its original validity and skips that observation without resetting state. ROC/MOM periods count valid tuples; existing Return/Lag keep their original observation-position behavior. Flat Stoch is 50; flat RSI follows tav at 100; zero negative MFI flow remains undefined. Undefined NaN results retain `Warmup` validity; infinite results have `NonFinite` validity.
 
-Lookback is n-1 for rolling averages/extremes/bands, CCI, Stoch, WillR and MFI; n for RSI/ROC/MOM/ATR; 1 for TR; 0 for OBV; slow-1 for MACD line; slow+signal-2 for signal/hist. Upstream lookbacks accumulate, and missing observations can extend elapsed warmup. Continue the same Session across chunks for recursive state. See the repository [indicator guide](https://github.com/banbox/banbot/blob/v0.6.0-beta.7/doc/factor_indicators.md) for examples and retention formulas.
+Lookback is n-1 for rolling averages/extremes/bands, CCI, Stoch, WillR and MFI; n for RSI/ROC/MOM/ATR; 1 for TR; 0 for OBV; slow-1 for MACD line; slow+signal-2 for signal/hist. Upstream lookbacks accumulate, and missing observations can extend elapsed warmup. Continue the same Session across chunks for recursive state. See the repository [indicator guide](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md) for examples and retention formulas.
+
+## Simple registration and statistical arbitrage
+
+`runner.RegisterFactor(name string, build func(runner.FactorContext) (runner.FactorSpec, error)) error` registers a simple cross-sectional factor. `FactorContext.Close()` supplies a price node and `Params` reads parameters. Check both the registration error and `Params.Err()` in the builder. `FactorSpec.Outputs` contains named nodes; omitted Combine uses equal weights.
+
+`runner.RegisterPairs(name string, build func(*runner.Params) (runner.PairsSpec, error)) error` registers rolling log-regression pairs and creates private builder/statistics state for each run. `PairsSpec` contains `Pairs []runner.Pair` (canonical Y/X symbols), Field (default close), Window (at least 3), Band and Gross (default 1/pair count, total budget at most 1). Entry β stays fixed while holding. After a Band Stop/MaxHold exit, re-entry waits until the Exit band is reached.
+
+`statistics.NewRollingSpread(window)` exposes `Observe(x, y float64) (statistics.SpreadPoint, bool)` for two log prices. `statistics.NewBandTrader(config)` exposes `Step(z float64) int` returning -1/0/+1. Use separate instances per spread. These compute statistics/direction; they do not place orders or prove cointegration, synchronized fills or profitability. See the [pairs example](../guide/factor.md#statistical-arbitrage-declare-the-pairs).
+
+`RegisterPortfolioFactory(name, factory, validator)` supports mutable custom portfolio state. The validator only checks configuration and must not borrow accounts or start work. `PreparePortfolioConfig` creates a single-run instance after preflight; do not reuse it in another backtest. A missing leg requests pair closure and pauses it. Pairs explicitly marked unavailable for the entire window are skipped without reallocating their budgets.
 
 ## Configuration ownership
 
@@ -171,12 +181,24 @@ Fuller Go examples are in `doc/factor_research_extensions.md`. Costs, capacity a
 
 ## Replay and live
 
-Run drives history. NewLive requires a real clock and reconciled sink; Observe accepts current records and Flush drains decision barriers. Stop rejects intake; Join waits for accepted callbacks/computation and releases its session borrow. Shared computation does not share portfolios, budgets or research state.
+`runner.Run` drives historical input. `runner.NewLive(c Config, sink Sink, clock func() int64, out Output) (*Live, error)` uses a caller-injected clock and reconciled account sink; it creates no market timer. `Observe(ctx, record)` accepts current versioned records and advances processing synchronously. An external source drives `Flush(ctx, decision)` / `FlushAt(ctx, decision, cutoff)` to complete rounds. `Stop` prevents new input; `Join` waits for accepted callbacks/computation before releasing shared Sessions. Shared computation does not merge targets, budgets or research state.
 
-Embedding uses runtime.CompileFactorsLivePlan, SubscribeFactorsLive, InstallFactorsLive and BindFactorsLive. entry.RegisterFactorLiveBinding registers verified current-session evidence. A missing transport, metadata, revision/funding or account capability fails startup; a YAML flag does not supply it. Full real-venue acceptance remains unverified.
+Embedded data assembly uses `runtime.CompileFactorsLivePlan`, `SubscribeFactorsLive`, `InstallFactorsLive` and `BindFactorsLive`. CLI defaults to Hub: omitted `execution.live_provider`, `banexg` or `hub` selects the local private socket. `runner.NewHubAccountSink` uses the Hub account application interface; robots do not own accounts.
+
+Custom production embedding uses `entry.RegisterFactorLiveBinding` to provide transport, metadata, revision/funding and account evidence, and cannot mix with Hub in one robot. Live `env: dry_run` permits only Hub paper; `trade --dry-run` is historical replay. Live rejects all history combinations, source-event decisions and replay-only option/terminal settlement features. There is no completed real-venue production acceptance guarantee. See [Shared accounts](../guide/execution.md) for operation and recovery.
 
 ## Data and output
 
 VersionRecord retains event/visibility/reception times, revisions and typed Values. Snapshot getter copies are ownership boundaries; arbitrary columns and NULL must remain. Session and Batch differ in recursive-history semantics.
 
 Manifest records code, plan, Universe, visibility, input references, labels and execution assumptions. It is not a raw-record clone. Result.Unresolved retains immature labels. Account event/posting Gob and legacy time-series orders.gob have different audit/report contracts.
+
+## Result fields and report boundaries
+
+`runner.Result` uses Go field names in `run.json` `Results[]` and `run-completed`. `Pairs` is collected at the end of `RegisterPairs` replay only. `PairResult` contains Y/X, Episodes, EpisodeCount, PnL, Trades, Wins, WinRate, InMarketBars, Bars, PausedBars, AvgHoldBars, LastBeta, Turnover, Unavailable and UnavailableLeg. Episodes share a 400-record budget with at least 10 per pair, retaining earliest records; they may omit later history. `PairEpisode` contains StartMS, EndMS, Dir, EntryZ, ExitZ, Beta, Bars, Reason and PnL; Reason is exit/stop/maxhold/leg_missing/end.
+
+Pair PnL uses each pair's decision weights and prices as a fraction of initial NAV, without allocated costs. `PairsGrossPnL` sums it. `PairsResidual = PairsNAVReturn - PairsGrossPnL` also includes delayed prices, weight drift and netting shared symbols. `AllPairsUnavailable` identifies a run with no tradable pairs; its flat zero-trade NAV is not valid strategy evidence.
+
+`Attribution` is generated only by the weights book, not events/live. Price changes produce LongPnL/ShortPnL; costs include Fees, Slippage, Funding and PITCost, with `FinalNAV - InitialNAV = LongPnL + ShortPnL - Fees - Slippage - Funding - PITCost + Residual`. Up to 20 TopSymbols are sorted by absolute Net. Net excludes account-level funding, so all symbol Net values sum to NAV change plus Funding. Pairs/Attribution can be absent when a run returns early with an error.
+
+Setting `panel: none` under the policy's `research` only suppresses panel output, preserving events, in-memory summaries and book values; the default is all. See [Results](../guide/factor.md#statistical-arbitrage-and-long-and-short-attribution) for examples and interpretation.

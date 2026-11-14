@@ -17,7 +17,20 @@ type DataSource interface {
 }
 ```
 
-`strat.DataSub` is an alias of `orm.Subscription`, so existing function-source signatures remain valid. `FetchHistory` returns records with real intervals for `[startMS,endMS)`; do not invent records to cover unqueried ranges. Emit live batches through `sink.Emit`. Omitting a live function does not enable automatic polling.
+`strat.DataSub` is an alias of `orm.Subscription`; function-source callbacks may use it. `FetchHistory` returns records with real intervals for `[startMS,endMS)`; do not invent records to cover unqueried ranges. Emit live batches through `sink.Emit`. Omitting a live function does not enable automatic polling.
+
+Return an error when a fetch fails. Empty rows with nil mean the interval was genuinely queried and contains no data; it may be recorded as covered. Confusing these outcomes prevents later backfill. Keep the Info definition and base timeframe stable after registration.
+
+### PagedHistorySource
+
+```go
+type PagedHistorySource interface {
+    FetchHistoryPage(ctx context.Context, sub *orm.Subscription,
+        startMS, endMS int64, limit int) ([]*orm.DataRecord, error)
+}
+```
+
+Each page must have strictly increasing timestamps within `[startMS,endMS)` and at most limit rows. An empty page ends the range. `ReadSourceHistory` validates pages before passing them to the consumer. With PageBytes enabled, a source without this interface fails before fetching the entire range; without it, full-range `FetchHistory` remains available. Adapters must still bound network responses and decoder buffers themselves; a page budget is not a process memory limit.
 
 ### DataSourceCatalog
 
@@ -51,7 +64,7 @@ type SubscriptionPlanOptions struct {
 
 `PrepareLivePlan` prepares independent subscriptions, warmup, and startup buffering. `SubscriptionInstallation.Activate` activates them; `CommitPrepared` supplies a commit callback boundary. `InstallLivePlan` prepares and activates. Sources requiring managed live operation implement `ManagedLiveSource.SubscribeManaged` and return an independent handle with `Stop()` and `Join() error`; `LiveSourceErrors` can report asynchronous failure.
 
-Startup buffering recursively clones Values, preserving concrete types, typed nil, NULL, missing keys, timestamps, and adjustment metadata. Budget overflow, source failure, and cancellation return errors. `Stop` seals intake; the owner then calls `Join` to wait for admitted callbacks and producers. A callback must not wait for itself. Failure to prepare a candidate generation must not close the serving generation.
+Startup buffering preserves Values fields, types, and NULL/absent-key distinctions. Do not mutate inputs concurrently after passing them to the sink. Required-source failure, budget overflow, or cancellation fails installation; optional-source failure can instead degrade the installation, so inspect its status. Stop managed subscriptions with `Stop`, then `Join` to wait for producers and admitted callbacks; a callback must not wait for itself. Managed handles use `Stop()` / `Join() error`, unlike `LiveProvider.Stop() *errs.Error` / `Join()`.
 
 ## Providers and Feeders
 
@@ -64,7 +77,7 @@ Startup buffering recursively clones Values, preserving concrete types, typed ni
 | `HistProvider` | Owns historical feeders and advances by end time |
 | `LiveProvider` | Owns live feeders and a `SeriesWatcher` |
 
-Interfaces are `IDataFeeder`, `IHistFeeder`, and `IHistDataFeeder`, replacing the old IKlineFeeder/IHistKlineFeeder names. Main constructors:
+Interfaces are `IDataFeeder`, `IHistFeeder`, and `IHistDataFeeder`. Main constructors:
 
 ```go
 NewSeriesFeeder(exs *orm.ExSymbol, callback FnDataSeries, showLog bool) (*SeriesFeeder, *errs.Error)
@@ -75,14 +88,26 @@ NewLiveProvider(callback FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.
 
 Use `WithRuntimeDeps` constructors for explicit tasks, supplying the Runtime's configuration, symbols, storage, clock, strategies, and callback boundary. Providers support `SubWarmPairs/UnSubPairs/LoopMain`; live resources support `Stop/Join`. `Feeder.CallBack` and `Feeder.OnEnvEnd` both receive DataSeries; the pending value is `WaitData`.
 
+```go
+func NewHistProviderWithRuntimeDeps(deps *RuntimeDeps, callback FnDataSeries,
+    envEnd FuncEnvEnd, getEnd FnGetInt64, showLog bool,
+    progress *utils.StagedPrg) (*HistProvider, *errs.Error)
+func NewLiveProviderWithRuntimeDeps(deps *RuntimeDeps, callback FnDataSeries,
+    envEnd FuncEnvEnd) (*LiveProvider, *errs.Error)
+```
+
+`NewHistProviderWithRuntimeDeps` returns initialization errors, unlike the package-level compatibility constructor; callers must handle them. Strategy authors normally declare `OnDataSubs` and `OnData` without creating providers manually. `DataHub` belongs to the `strat` package and is owned by the job; there is no `data.DataHub` type.
+
 Built-in K-lines read the smallest physical period and aggregate derived periods. Merged projections pass extension fields through the same Values map. Storage enrichment fills absent keys without overwriting explicit NULL. Aggregation follows field rules, and adjustment changes only supported fields without dropping custom fields. For different time ranges, create separate providers or read through SeriesStore/Queries.GetSeriesFields.
 
 ## Spider and Watcher
 
-`LiveSpider` manages a `Miner` for each exchange/market, collecting, storing, and broadcasting data. The current message is `NotifySeries{TFSecs, Interval, Rows []*orm.DataSeries}`; `SeriesMsg` embeds it and adds `ExgName/Market/Pair`. The storage task is `SaveSeries`. These replace the documented NotifyKLines/KLineMsg/SaveKline structures.
+`LiveSpider` manages a `Miner` for each exchange/market, collecting, storing, and broadcasting data. The current message is `NotifySeries{TFSecs, Interval, Rows []*orm.DataSeries}`; `SeriesMsg` embeds it and adds `ExgName/Market/Pair`. The storage task is `SaveSeries`.
 
 `NewSeriesWatcherWithRuntimeDeps(deps, addr)` creates the task's TCP client, with `OnDataMsg func(*SeriesMsg)` receiving series. `WatchJobs` declares exchange, market, type, symbol, and timeframe; `UnWatchJobs` cancels them. Spider/Watcher send complete Rows through BanIO. Network payloads use JSON, which does not guarantee integer widths or arbitrary Go types inside maps survive automatically. Strictly typed sources need a schema and decode validation.
 
 ## Data Tools
 
 `FindPathNames` and `ReadZipCSVs` handle files; `RunFormatTick/Build1mWithTicks` handle trades; `CalcFilePerfs` analyzes files. See [Custom Time-Series Data](../guide/custom_data.md) for storage and registration and [Factor API](factor.md) for native factor graphs and backtest/live composition.
+
+Use `bot series list` to inspect registered definitions and `bot series down --tables funding_rate --pairs BTC --timerange 20240101-20250101` for explicit backfill. Here `--tables` selects source names; this CLI does not support event timeframes. See [Series Tools](../advanced/kline_tools.md) for K-lines and coverage repair.

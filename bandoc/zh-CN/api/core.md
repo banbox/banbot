@@ -23,7 +23,6 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 - `Mean float64` - 均值（在正态分布类型时有效）
 - `IsInt bool` - 是否为整数类型
 - `Rate float64` - 正态分布的比率参数，默认为1。值越大，随机值越趋向于Mean
-- `edgeY float64` - 正态分布边缘y值的计算缓存
 
 ### PerfSta
 策略性能统计结构体，用于记录某个策略针对所有交易标的的统计信息。
@@ -77,7 +76,7 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 从缓存中获取指定键的值，支持泛型。
 
 参数：
-- `key string` - 缓存键名
+- `key interface{}` - 缓存键名
 - `defVal T` - 默认值
 
 返回：
@@ -99,8 +98,6 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 
 参数：
 - `outDir string` - 输出目录路径
-
-## 价格相关方法
 
 ## 工具方法
 
@@ -140,20 +137,14 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 参数：
 - `items map[string][]string` - 待分组的项目
 
+- `doSort bool` - 是否排序（会原地排序输入切片）
+
 返回：
 - `string` - 分组结果的字符串表示
 
 ### SplitSymbol
-分割交易对符号为基础货币和计价货币。
 
-参数：
-- `pair string` - 交易对名称
-
-返回：
-- `string` - 基础货币
-- `string` - 计价货币
-- `string` - 基础货币代码
-- `string` - 计价货币代码
+`SplitSymbol(pair string) (base, quote, settle, identifier string)` 按 `/`、`:`、`-` 解析通用符号，例如 `BTC/USDT:USDT`。交易所特殊符号使用绑定的交易所解析能力，不要据此推断交易所身份。
 
 ## 参数生成方法
 

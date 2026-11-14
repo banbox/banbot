@@ -17,3 +17,11 @@ web.StartApiWithRuntimeDeps(lifecycle, deps biz.RuntimeDeps) 与 web/live.StartA
 OrderArgs、ForceExitArgs、CloseArgs、JobItem、LoginRequest 等 API 请求/响应类型属于 web/live，不是 live 包公共策略 API。具体路由和验证以该服务器实际注册为准。
 
 见[entry](entry.md)、[runtime](runtime.md)、[实盘](../guide/live_trading.md)。
+
+## 访问与认证
+
+- 开发 WebUI：`bot web --host 127.0.0.1 --port 8000`；绑定 `0.0.0.0` 或 `::` 必须传 `--password`，Basic Auth 用户名为 `banbot`。界面包含策略文件编辑与构建能力。
+- 实盘 Dashboard：由 `api_server` 启用，登录和账户角色通过 `users` 配置。它与开发 WebUI 的 Basic Auth 相互独立。
+- 实盘 `/api/kline`、`/api/kline/csv/upload`、`/api/ws` 不在 JWT 分组内；远程部署应限制监听或通过反向代理认证，不能仅凭 Dashboard 登录认为所有路由已受保护。
+
+普通用户通过[快速开始](../guide/quick_local.md)和[实时交易](../guide/live_trading.md)配置服务。开发 API 的回测任务启动子进程，当前任务参数按空格拆分，相关输入/输出路径应避免空格。

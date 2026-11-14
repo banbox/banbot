@@ -21,7 +21,7 @@ pairmgr:
 * VolumePairList
 * PriceFilter
 * RateOfChangeFilter
-* SpreadFilter
+* SpreadFilter (placeholder; does not filter)
 * CorrelationFilter
 * VolatilityFilter
 * AgeFilter
@@ -35,8 +35,7 @@ Sort/filter currency pairs by volume. When it is the first, it will calculate th
 ```yaml
 - name: VolumePairList # Sort all trading pairs by volume value in descending order
   limit: 100 # Take the first 100
-  min_value: 100000 # Minimum volume value
-  cache_secs: 7200 # Cache time
+  min_value: 100000 # Minimum mean(close*volume) per bar
   back_period: 3d # TimePeriod for calculating trading volume
 ```
 ## PriceFilter
@@ -44,7 +43,7 @@ Allows filtering instrument lists by price.
 ```yaml
 - name: PriceFilter # Price filter
   max_unit_value: 100 # The value corresponding to the maximum allowed unit price change (for the pricing currency, usually USDT).
-  precision: 0.0015 # Filter trading pairs by price precision, the default minimum price change unit is 0.1%
+  precision: 0.0015 # Filter trading pairs by price precision, maximum tick/price ratio; 0 disables this check
   min: 0.001 # Minimum price
   max: 100000 # Maximum price
 ```
@@ -55,10 +54,9 @@ Volatility filter.
   back_days: 5 # Number of days to review the candle
   min: 0.03 # Minimum price change ratio
   max: 10 # Maximum price change ratio
-  cache_secs: 1440 # Cache time, seconds
 ```
 ## SpreadFilter
-Liquidity filter. Formula: 1-bid/ask, the maximum ratio of bid-ask spread to price
+Currently a configuration placeholder: Filter returns its input unchanged and `max_ratio` has no effect. Do not rely on it for liquidity protection.
 ```yaml
 - name: SpreadFilter # Liquidity filter
   max_ratio: 0.005 # Formula: 1-bid/ask, the maximum ratio of bid-ask spread to price
@@ -71,7 +69,8 @@ Correlation coefficient filter.
   max: 1 # Used to filter the average correlation between the current currency and the entire market; the default is 0, which means it is not enabled
   timeframe: 5m # Data period used to calculate correlation
   back_num: 70 # Length of data for calculating correlation review
-  top_n: 50 # Only return the top n currencies with the lowest correlation, the default is 0 and there is no limit
+  sort: asc # Greedily prefer low correlation with already selected symbols
+  top_n: 50 # Maximum result count; 0 is unlimited
 ```
 ## VolatilityFilter
 Volatility filter. Formula: std(log(c/c1)) * sqrt(back_days)
@@ -97,7 +96,7 @@ A variety blacklist filter used to filter specified varieties.
 According to the given offset, take the specified number of symbols. Usually used at the end
 ```yaml
 - name: OffsetFilter # Offset limit selection. Usually used at the end
-  offset: 10 # Start from the 10th
+  offset: 10 # Skip the first 10
   limit: 30 # Take up to 30
 ```
 ## ShuffleFilter
@@ -106,3 +105,35 @@ Random shuffle
 - name: ShuffleFilter # Random shuffle
   seed: 42 # Random number seed, optional
 ```
+
+## Configuration and data limits
+
+Place filters in the root `pairlists` list. They run in order, followed by `pairmgr.offset`/`limit`. For example:
+
+```yaml
+stake_currency: [USDT]
+pairmgr:
+  cron: "0 0 */6 * * *"
+  pos_on_rotation: hold
+pairlists:
+  - name: VolumePairList
+    back_period: 3d
+    limit: 100
+    min_value: 100000
+  - name: AgeFilter
+    min: 30
+  - name: PriceFilter
+    precision: 0.0015
+  - name: OffsetFilter
+    limit: 20
+```
+
+`VolumePairList` ranks historical mean(close*volume) per bar and checks minimum order cost. This is not exchange 24-hour turnover; min_value depends on the calculation timeframe. `limit_rate` truncates by proportion before limit caps the count. VolumePairList/RateOfChangeFilter accept `cache_secs` but currently do not implement caching with it; use cron to schedule refreshes.
+
+Static `pairs` bypass configured filters by default, but still undergo market/minimum-order validation. Even with force_filters, the first configured filter must be a producer; subsequent filters process the static pool. Short BTC names expand using market_type and stake_currency; full spot symbols look like BTC/USDT and linear perpetuals like BTC/USDT:USDT.
+
+PriceFilter uses the latest 1h close; `max_unit_value` checks the minimum amount step times price, not the value of a price tick. RateOfChangeFilter uses daily `(highest-lowest)/lowest`; VolatilityFilter uses a daily return volatility score. Missing history affects selection. Without cron, allow-empty mode may retain symbols; AgeFilter can ban entries until listing age is reached instead of immediately removing young symbols.
+
+CorrelationFilter requires back_num≥10; fewer than four usable series returns the original list. Without sort: asc/desc it preserves input order, so top_n does not automatically choose the lowest correlations. Sorting is greedy, not cluster optimization. Setting only min does not activate filtering: also set max, top_n or top_rate.
+
+ShuffleFilter accepts a reproducible fixed seed. OffsetFilter applies reverse, offset, then rate/limit; offset is zero-based and an out-of-range offset returns an empty list. See [goods API](../api/goods.md) for custom registration.

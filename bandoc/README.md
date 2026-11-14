@@ -17,8 +17,24 @@ python scripts/check_documentation_links.py
 ```
 
 The link check supports VitePress language roots, extensionless pages and public assets;
-it does not fetch external links or validate fragment anchors. Live provider examples
-require an application-registered verified factory and do not certify real-venue readiness.
+it does not fetch external links or validate fragment anchors. Live examples must meet the documented Hub/provider and current-session verification
+requirements; configuration examples do not certify real-venue readiness.
+
+## Documentation scope
+
+The user guides describe supported workflows, configuration, public strategy/data APIs,
+report interpretation, and operational limits. Internal module inventories, ownership
+implementation details and contributor procedures belong in `doc/project/`.
+Update both language trees when those contracts change; revise existing examples and
+navigation alongside new features. Shared-account operations and notifications have
+separate guides:
+
+- [Shared accounts and Hub](en-US/guide/execution.md) / [共享账户与 Hub](zh-CN/guide/execution.md)
+- [Notifications](en-US/guide/notifications.md) / [消息通知](zh-CN/guide/notifications.md)
+
+用户文档以 `doc/project/` 和当前源码为依据，保留用户需要的操作、示例、API 与限制；
+内部模块清单和开发维护流程留在项目文档。涉及用户行为变化时，同步修订中英文正文、
+示例和导航，直接描述当前实现。
 
 ## Compilation and Deployment
 To compile the bot documentation:

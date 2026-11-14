@@ -12,10 +12,29 @@ Runtime 拥有 Core、Clock、Market、Symbols、Batch、Strategies、Orders、T
 
 - NewProcess() *Process 创建进程协调 owner。
 - (*Process).NewRuntime(opts Options) (*Runtime, error) 创建任务；构造失败释放本次取得的资源和 claims。
-- Runtime.BizDeps() 投影为 biz.RuntimeDeps，交易器、provider、wallet、报告与过滤器直接使用同一 owner 的具体状态。
+- Runtime.BizDeps() 返回 biz.RuntimeDeps；Runtime.DataDeps() 返回 data.RuntimeDeps。给交易器、数据提供者和钱包使用同一任务的依赖；goods.RuntimeDeps 是另一个显式结构，不能把 BizDeps 直接当作过滤器入参。
 - 因子配置安装使用 runner.CloneConfig；共享 Plan/ComputationGroup 与回调等保持借用身份，配置容器独立复制。
 
 嵌入程序优先复用 entry 的标准命令装配；手工构造必须提供一致的 config、clock、symbols、storage、exchange、callback owner 和账户配置，不得缺字段后回退查 globals。
+
+## 嵌入程序生命周期示例
+
+opts 必须由宿主填入一致的配置、存储和交易所；这个函数只展示所有者负责的生命周期，不会自动加载策略或启动 trader。不要从任务自身的退出回调中调用 Join。
+
+```go
+package embedding
+
+import botruntime "github.com/banbox/banbot/runtime"
+
+func RunTask(opts botruntime.Options, run func(*botruntime.Runtime) error) error {
+    process := botruntime.NewProcess()
+    defer process.Close()
+    task, err := process.NewRuntime(opts)
+    if err != nil { return err }
+    defer func() { task.Close(); task.Join() }()
+    return run(task)
+}
+```
 
 ## 停止、关闭与等待
 

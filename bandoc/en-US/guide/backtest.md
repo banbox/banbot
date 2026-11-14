@@ -2,7 +2,7 @@
 
 Backtesting is the process of simulating a trading strategy on historical data. It is an important step for strategy optimization and evaluation. The BanBot backtesting engine has the following features:
 
-- Event-driven backtesting engine to prevent lookahead bias and ensure the reliability of backtesting results.
+- Event-driven historical replay; strategy logic, data visibility, and universe selection still need checks for lookahead.
 - Supports time-series strategies of any complexity, without modification for live trading.
 - High-performance indicator library `banta` for faster backtesting speed.
 - Flexible combination of different trading pairs, strategies, and timeframes.
@@ -15,7 +15,7 @@ BanBot provides a WebUI for backtesting research. You can write strategies, conf
 Just compile your Go project into an executable file and start it to run the WebUI:
 ```bash
 go build -o bot
-./bot web
+./bot web --datadir /path/to/data
 ```
 
 The WebUI has four options at the top: [Strategy]/[Backtest]/[Data]/[Live Trading].
@@ -30,7 +30,9 @@ After the backtest is finished, you can go to the backtest report page to view t
 Open `config.local.yml` (or `config.yml`) in the directory pointed to by the `BanDataDir` environment variable, and configure the important backtesting parameters:
 
 ```yaml
+exchange: {name: binance}
 market_type: linear
+contract_type: swap
 leverage: 10
 time_start: "20251101"
 time_end: "20251112"
@@ -40,17 +42,31 @@ stake_currency: [USDT]
 wallet_amounts:
   USDT: 1000
 run_policy:
-  - name: ma:demo
+  - engine: time_series
+    name: ma:demo
     run_timeframes: [1h]
 ```
 
-Then compile your Go project into an executable file and run the backtest command:
+This is a backtest fragment. `ma:demo` must be registered in the binary; prepare database and shared settings separately. Leverage is illustrative and should match your experiment. This is not a Hub live configuration; see the [execution guide](./execution.md) before live use. Then compile and run:
 ```bash
 go build -o bot
-./bot backtest
+./bot backtest --datadir /path/to/data --out /path/to/report
 ```
 
-After the backtest is complete, when `-out` is not specified, you can find the detailed report in `BanDataDir/backtest/<config-hash>`. You can also use `-out` to specify the output directory.
+Pure time-series reports default to `<datadir>/backtest/<config-hash>/`; `--out` selects a directory. See [configuration](./configuration.md) for layering.
+
+```bash
+bot backtest --datadir /path/to/data --config experiment.yml --timerange 20250101-20250401 --pairs BTC/USDT:USDT
+bot backtest --datadir /path/to/data --config experiment.yml --separate
+```
+
+`--separate` runs pure time-series policy entries separately; by default they run together as a combined report. Other flags include `--timestart` / `--timeend` (the latter requires the former), `--stake-amount`, `--prg`, and `--bt-strict`. Check `bot backtest --help`; flags declared by other commands are not interchangeable.
+
+## Data preparation and download limits
+
+Ordinary time-series backtests can fill required bars and write them to the database, given available data sources and network access. Prepare strategy, `refine_tf`, and warmup coverage first. `bt_no_kline_download: true` independently disables implicit K-line downloads, including static symbol filtering/timeframe scoring reads. Used alone it may simply use incomplete stored data; it does not prove completeness. `--net-off` is not a coverage check either.
+
+Recheck coverage after changing symbols, timeframes, fields, or intervals. Unknown listing times may only warn outside strict mode. Existing rows do not prove historical decision-time visibility. See the strict historical contract below.
 
 ## Backtesting Notes
 
@@ -67,7 +83,8 @@ Add `refine_tf` for the specified `job` in the `run_policy` of `config.yml`:
 
 ```yaml
 run_policy:
-  - name: ma:demo
+  - engine: time_series
+    name: ma:demo
     run_timeframes: [1h]
     refine_tf: "1m" # or 4, "3-6"
 ```
@@ -92,21 +109,41 @@ Rolling Backtesting is a more rigorous backtesting method that divides the data 
 
 `bot backtest` loads one `run_policy` and dispatches time-series, factor or mixed engines. Factor replay mode comes from `--mode weights|events`, then `execution.mode`, then `events`. Root `bot research` emits matured labels/diagnostics. Weights is an approximate quantity book; mixed replay requires events, observable tick/event or 1m prices, instrument units and risk limits. Latest-value storage requires explicit data.pit_policy: static-approximation; strict PIT needs version archives/attested providers.
 
-Factor JSON lines contain panels/decisions/diagnostics/summaries. Ordinary replay adds resolved.json and account-&lt;account&gt;/manifest.json plus event/posting Gob. Legacy orders.gob alone is not the factor report. Result.Unresolved retains labels beyond available history. Completion follows output closure and resource cleanup.
+Ordinary factor backtests write `config.yml`, `resolved.json`, `events.jsonl`, `run.json`, and account-directory manifests plus event/posting Gob files. The default base is `<datadir>/backtest/factor`; collisions add numbered suffixes, and `--out` selects the base. Check the actual path printed in logs. `events.jsonl` contains panel/decision/diagnostics/summary records; `run.json` summarizes completion. Labels that have not matured at the data tail count as `Unresolved`; check status and unresolved counts even without an execution error. Time-series `orders.gob` alone cannot establish factor success.
 
 See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
 
 ## Strict replay and historical coverage
 
-`bt_strict: true` canonicalizes key execution order. It does not freeze database contents or imply a fixed overhead percentage. A backtest also needs `bt_no_kline_download: true` and valid `historical_coverage` to enable strict historical replay with a coverage contract. Prepare missing data before replay instead of relying on implicit downloads.
+Ordinary backtests, including optimization trials, already use stable ordering. Within a bar, symbols follow a deterministic hash of time, symbol, and `bt_bar_order_seed` (default 0). Change the seed to examine capital-competition sensitivity. Stable ordering does not prove unbiased or lookahead-free results. `bt_strict: true` enables strict historical coverage checks; it is not required for deterministic ordering and does not freeze database contents. Strict historical replay also requires `bt_no_kline_download: true` and valid `historical_coverage`. Prepare missing data before replay.
+
 
 `historical_coverage` records `baseline_end_ms`, optional `historical_result_end_ms`, and symbol/timeframe maps named `bars`, `physical_bars` and `listing_prefixes`. Ranges are `[start_ms, stop_ms)`. Baseline must follow the run start and be no later than its end; result end must be between baseline and run end. Rows physically present today are not automatically authorized coverage at a historical cutoff.
 
 Strict reads validate the current task’s fields, ranges and coverage contract; this is not a database-wide read-only switch. Preparation, source bootstrap and replay are separate phases. Refreshing symbols/subscriptions prepares requirements and initializes loaders again; it must not bypass coverage authorization through implicit backfill. Factor providers also need archive-version and visibility/PIT evidence; K-line switches do not establish that evidence.
 
-### Inspecting a data plan
+## Costs, equity, and checking results
 
-The internal command `bot internal inspect-data-plan --request request.json --output output.json` lets integration tools inspect a compiled strategy’s data requirements. The request must follow `runtimeplan.RequestV1`, including configuration, market snapshot/Universe, initial symbols, time range and compilation/source/configuration hashes. It does not accept ordinary config.yml as a download or backtest request. Use a complete generated request instead of placeholder hashes. The output file must already exist and is truncated before writing. Unsupported requirements can produce diagnostics and an error exit. Inspect uses local state without installing globals. Passing inspection proves plan inspection, not database coverage or venue readiness.
+These fields apply to time-series backtests. See [factor strategies](./factor.md) for factor costs; the two models are not interchangeable.
+
+```yaml
+bt_net_cost: 15
+bt_slippage_bps: 5
+bt_funding_apr: 10
+bt_delist_penalty_bps: 20
+bt_fresh_equity: true
+charge_on_bomb: false
+```
+
+These values illustrate sensitivity experiments, not recommendations or market estimates. `bt_net_cost` is order latency in seconds, not a replacement for slippage. `bt_slippage_bps` is one-sided adverse market/stop-fill slippage in basis points. `bt_funding_apr` approximates annualized funding percentage for long contract positions, not actual historical venue settlements. `bt_delist_penalty_bps` adds adverse basis points beyond base slippage on delisting exits. Exchange configuration can override trading fees.
+
+Configure data-gap guards with `bt_gap_bars` / `bt_gap_min_hours`, and inspect `gapExits` / `delistExits` and their absolute-profit shares. Gaps and delistings can force exits at the last valid bar; do not interpret missing-data exits as strategy signals. See the configuration template for defaults and full fields.
+
+`bt_fresh_equity` defaults on: equity curves, daily equity, drawdown, and risk metrics use balances plus current open-order unrealized P&L. Spot base assets are already marked in wallet value, without adding contract P&L twice. Set false only to compare the older cached-P&L curve; bankruptcy detection still uses fresh equity. Record this setting and the data version when comparing builds.
+
+With `charge_on_bomb: false`, margin liquidation or depleted equity ends normally and may exit 0. Final return is −100%, maximum drawdown 100%, later equity zero, and no further entries occur. `detail.json` may contain `liquidated`, `liquidated_at_ms`, `liquidated_symbol`, `liquidated_reason`, and `liquidated_cause` (`margin_liquidation` / `equity_depleted`). `charge_on_bomb: true` resets balances and continues, equivalent to additional capital; that is not a fixed-capital result.
+
+Ordinary time-series reports include `detail.json`, order CSV/Gob, and asset/entry HTML files. `orders.csv` field `funding` is approximate funding and is excluded from `exitFee`. Failure to write final `detail.json` returns a nonzero error. Undefined floating-point metrics may serialize as JSON null, not zero. Factor/mixed outputs have their own status, NAV, and ledger fields; not all time-series fields apply.
 
 ### Metric sample units
 

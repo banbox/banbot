@@ -166,20 +166,12 @@
 - `text string` - 要分割的字符串
 - `sep string` - 分隔符
 
+- `unique bool` - 是否去重
+
 返回:
 - `[]string` - 分割后的非空字符串数组
 
 ## 切片和映射操作
-
-### SplitSolid
-字符串分割，忽略返回结果中的空字符串。
-
-参数:
-- `text string` - 要分割的字符串
-- `sep string` - 分隔符
-
-返回:
-- `[]string` - 分割后的字符串数组
 
 ### KeysOfMap
 获取map的所有键。
@@ -273,14 +265,12 @@
 - `src map[string]interface{}` - 源map
 
 ### MapToStr
-将map转换为字符串表示。
 
-参数:
-- `m map[string]float64` - 要转换的map
+```go
+func MapToStr[T any](m map[string]T, value bool, precFlt int) string
+```
 
-返回:
-- `string` - 转换后的字符串
-- `int` - 数值部分的总长度
+按键排序后格式化 map。value=false 时只输出键；true 时输出键值。precFlt 控制浮点精度，负数使用可往返的最短表示；只返回一个字符串。
 
 ## 网络操作
 
@@ -301,7 +291,7 @@
 
 参数:
 - `addr string` - 服务器监听地址(如:"127.0.0.1:6789")
-- `name string` - 服务器名称
+- `aesKey string` - 通信 AES 密钥；空字符串禁用加密
 
 返回:
 - `*ServerIO` - 服务器实例
@@ -311,6 +301,8 @@
 
 参数:
 - `addr string` - 服务器地址(如:"127.0.0.1:6789")
+
+- `aesKey string` - 必须与服务端一致；空字符串禁用加密
 
 返回:
 - `*ClientIO` - 客户端实例
@@ -624,15 +616,6 @@
 - `[]byte` - 转换后的字节数组
 - `error` - 转换过程中的错误
 
-### MD5
-计算数据的MD5哈希值。
-
-参数:
-- `data []byte` - 要计算哈希的数据
-
-返回:
-- `string` - MD5哈希值的十六进制字符串
-
 ### ReadInput
 从标准输入读取用户输入。
 
@@ -676,25 +659,12 @@
 返回:
 - `*StagedPrg` - 多阶段进度条对象
 
-## 系统相关函数
-
-### GetSystemLanguage
-获取当前系统语言代码。
-
-返回:
-- `string` - ISO 639-1语言代码(可选带ISO 3166-1国家代码)，如:
-  - en-US: 英语(美国)
-  - zh-CN: 中文(简体)
-  - zh-TW: 中文(繁体)
-  - ja-JP: 日语
-  - ko-KR: 韩语
-  - fr-FR: 法语
-  - de-DE: 德语
-  - es-ES: 西班牙语
-  等
-
-
-
 ## 工具归属校正
 
 CountDigit(text string) int 和 GroupByPairQuotes(items map[string][]string, doSort bool) string 均属于 core。ReadLastNLines 已不是 utils 公共接口，文件工具应以实际导出方法为准。
+
+## 策略计算注意事项
+
+`CalcCorrMat(arrLen, dataArr, useChgRate)` 必须传入窗口长度，至少需要两个序列。序列短于 arrLen 时会在前方补零；实际策略应先确认历史长度充足，避免补零扭曲相关性。辅助周期批量计算应读取 `JobEnv.Env`，而不是主周期 `Job.Env`。
+
+`SharpeRatio`/`SortinoRatio` 默认 periods=252 且年化；输入为逐期简单收益率，riskFree 为年化利率。非日频数据使用 `SharpeRatioBy`/`SortinoRatioBy(returns, riskFree, periods, annualize)` 明确采样频率。

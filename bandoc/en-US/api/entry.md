@@ -1,20 +1,42 @@
-# entry Package
+# entry package
 
-The entry package provides system entry points and command-line interface.
+Strategy applications use `entry` to build their CLI. See the [command guide](../guide/bot_usage.md) for ordinary use and [custom commands](../advanced/custom_cmd.md) for extensions.
 
-Configuration-based commands parse a `config.Snapshot`, open explicit storage and exchange dependencies, and create a `runtime.Process` and `runtime.Runtime` for that execution. Backtests, live runs, and optimizations obtain their own configuration, clock, strategies, orders, and lifecycle from the Runtime; callers should close and join it when the task finishes. A small number of maintenance APIs still use compatibility paths.
+## Entry points and registration
 
-## Public Methods
+| API | Purpose |
+| --- | --- |
+| `RunCmd()` | Process entry: arguments, signals, and error exit handling |
+| `ExecuteContext(ctx context.Context, args []string) error` | Embedded execution; arguments exclude the executable name, and errors return to the caller |
+| `NewRootCommand() *cobra.Command` | Build a fresh Cobra tree |
+| `AddGroup(name, help string)` | Register a parent group |
+| `AddCommand(parent string, command *cobra.Command)` | Register a command; empty parent means root |
+| `AddCommandFactory(parent string, factory CommandFactory)` | Create fresh commands for repeated/concurrent tree construction |
 
-### RunCmd
-This is the command-line entry method for banbot. You can call this method in your strategy project's entry file to access various banbot subcommands from the terminal.
+`type CommandFactory func() *cobra.Command`. Register groups and commands before creating a root or calling `RunCmd`. Each command owns its flags and local variables. Reusing one `*cobra.Command` for a second tree fails; use a factory instead.
 
-## Factor-engine integration
+`ExecuteContext` accepts canonical double-dash long options and normalizes legacy single-dash long options. No subcommand starts development Web; passing only ordinary options may also select implicit Web. Integrations should specify a subcommand, such as `[]string{"backtest", "--datadir", dataDir}`, and check the returned error.
 
-ValidateBacktestRunSpec and execution share resource-free checks; mixed replay requires events. RegisterFactorLiveBinding supplies verified current-session evidence.
+## Unified strategy dispatch
 
-Root `backtest` and `trade` use the same configuration loader and dispatch time-series, factor or mixed `run_policy` entries. `--mode` overrides factor-engine backtest `execution.mode` (default `events`); `trade --dry-run` is historical replay for factor/mixed runs, while time-series live simulation uses `env: dry_run`. Root `research` uses the same YAML loader, default files, `--datadir` and `--no-default` rules. Root `validate --spec`, `explain --spec` and `data archive` handle standalone expressions and version-data archives.
+`config.LoadRunSpec` loads configuration first. `backtest` / `trade` select time-series, factor, or mixed execution from `run_policy[].engine`. The time-series subset in `RuntimeSnapshot` cannot replace the full policy list.
 
-Explicit task Runtime state is separate from its cancellation context. Multiple tasks retain their own configuration, clock, strategies and orders; same-account engine consumers deliberately share account execution and strategy attribution. Stop intake and join work before releasing resources, including on cancellation or startup failure. A shared account borrow must not shut down other consumers.
+| Command/option | Contract |
+| --- | --- |
+| `backtest --mode weights\|events` | Override factor `execution.mode`; otherwise YAML, then default `events` |
+| Mixed `backtest` | Requires events; `--separate` supports pure time-series only |
+| Pure time-series `trade` | `env: dry_run` for Hub live simulation; factor-only `--dry-run` / `--live-provider` are rejected |
+| Factor/mixed `trade --dry-run` | Historical-input events replay |
+| Real factor/mixed `trade` | Requires verified live bindings; insufficient capabilities fail rather than fall back to paper |
+| `research` | Factor research with mature labels and diagnostics, using the same YAML loading rules |
+| `optimize` / `bt-opt` | Time-series optimization, not factor-runner hyperparameter search |
 
-[Factor API](factor.md) / [Guide](../guide/factor.md)
+`ValidateBacktestRunSpec(spec *config.RunSpec) error` shares resource-free preflight with execution. `InspectBacktestRunSpec` provides Web preflight information; successful preflight does not prove database coverage or venue readiness. `RegisterFactorLiveBinding` registers custom live-binding factories; an unregistered configured name fails. See [factor API](./factor.md).
+
+## Resources and cancellation
+
+Configuration entries assemble task-owned Process/Runtime, storage, exchange, clock, and order dependencies. Embedded callers propagate cancellation and wait for execution to return so output flushing and cleanup finish. Release directly owned Runtimes with `Close` followed by `Join`. Do not switch concurrent tasks by mutating `config` / `core` globals.
+
+Consumers of the same account may share execution and strategy attribution; releasing one borrower must not stop other consumers. See [Runtime API](./runtime.md) for ownership contracts.
+
+Default live entry, including pure time-series, uses the shared Hub with `prod` / `dry_run` linear perpetual accounts and complete execution declarations. `test` / spot / inverse, legacy dynamic leverage, and `fatal_stop` are unsupported on this path; missing Hub never falls back to a local sender. See [shared accounts and Hub](../guide/execution.md) for deployment and recovery.

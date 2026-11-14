@@ -136,17 +136,31 @@ type DataSeries struct {
 
 DataRecord stores rows; DataSeries carries backtest/live events. Times are milliseconds with `[TimeMS,EndMS)` intervals. Values retain concrete Go types and explicit nil; map lookup distinguishes NULL from an absent key. Storage writes declared schema columns only: int normalizes to int64, float to float64, and JSON uses database encoding. Fixed-column round trips cannot reconstruct original absent keys or every Go type.
 
+Database NULL is read as a present key with a nil value. Full K-line row writes default absent `quote`/`buy_volume` to 0.0 and absent `trade_num` to 0; other absent fields become NULL. Explicit nil does not trigger these missing-key defaults. Undeclared generic-series fields are not persisted.
+
 ### Subscription
 
-`orm.Subscription` declares engine-independent data dependencies; `strat.DataSub` is its alias. Besides Source/ExSymbol/TimeFrame/WarmupNum/Fields/SeriesFields, it has Frequency (bar/event) and Projection (default/all/selected). `NormalizeSubscription` validates declarations; a valid event declaration does not mean every reader supports it. `StreamKey{Source,SID,TimeFrame}` excludes consumer/account; isolation belongs to its catalog/repository.
+`orm.Subscription` is an engine-independent dependency; `strat.DataSub` is its alias. Source, ExSymbol, and TimeFrame identify the stream, WarmupNum sets warmup observations, Fields selects raw columns, and SeriesFields selects derived numeric history.
+
+- Frequency defaults to `FrequencyBar`. Irregular data uses `FrequencyEvent` with `TimeFrame: "event"`; K-lines cannot use event frequency.
+- Projection defaults to `ProjectionDefault`, or `ProjectionSelected` when Fields are provided. `ProjectionAll` requests all fields. default/all cannot include Fields, and selected requires fields.
+- `NormalizeSubscription` validates declarations and requires a valid ExSymbol/SID. Events still need a capable reader, and count-based warmup requires the source to implement `ObservationWarmupSource`.
+
+`StreamKey{Source,SID,TimeFrame}` identifies a stream without a consumer or account. A strategy subscription template can omit ExSymbol; the job fills it before normalization.
 
 ### SeriesStore and BoundSeriesStore
 
 ```go
 store := orm.NewSeriesStore(orm.NewSeriesRepo(storage))
 rates := store.Bind(info, target)
-err := rates.WriteBatch(ctx, rows) // []*orm.DataRecord
+if err := rates.WriteBatch(ctx, rows); err != nil { // []*orm.DataRecord
+    return err
+}
 events, err := rates.Read(ctx, startMS, endMS, limit) // []*orm.DataSeries
+if err != nil {
+    return err
+}
+_ = events
 ```
 
 The snippet assumes initialized Storage, schema, target, ctx, and time bounds. `Bind` retains definition/target pointers without I/O. Supply info/target on SeriesStore, or omit them on the bound store:
@@ -167,7 +181,18 @@ The snippet assumes initialized Storage, schema, target, ctx, and time bounds. `
 
 Independent SeriesStore writes complete records. `NewKLineSeriesInfo` / `NewKLineSeriesStoreWithStorage(info, storage)` define/write extension columns on existing K-lines. `Write(ctx,target,rows)` updates existing `(sid,time)` rows and fails when a target K-line is missing. An extension's Name is a label, not an independent source; subscribe with `Source: "kline"`.
 
-`GetSeries/AutoFetchSeries` return `[]*DataSeries`; explicit Queries provide `GetSeriesFields`, `QuerySeriesFields`, and batched projections. Requested extensions travel with standard OHLCV through Values, feeders, and callbacks. GetOHLCV/AutoFetchOHLCV below are default K-line compatibility views and cannot transport arbitrary extension columns.
+`GetSeries/AutoFetchSeries` return `[]*DataSeries`; explicit Queries provide `GetSeriesFields`, `QuerySeriesFields`, and batched projections. Omitting fields reads the default K-line fields; an explicit field list selects the projection. Feeders and callbacks retain Values. GetOHLCV/AutoFetchOHLCV below are default K-line compatibility views and cannot transport arbitrary extension columns.
+
+Common field-read signatures are below (`q` belongs to the selected Storage and binds task options through `WithKlineRuntimeOptions`; `limit=0` does not bound rows, so page large requests by time window):
+
+```go
+func (q *Queries) QuerySeriesFields(exs *ExSymbol, timeframe string, fields []string,
+    startMS, endMS int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error)
+func (q *Queries) GetSeriesFields(exs *ExSymbol, timeframe string, fields []string,
+    startMS, endMS int64, limit int, withUnFinish bool) ([]*AdjInfo, []*DataSeries, *errs.Error)
+```
+
+Pass the required field list to read extension columns. DataSeries queries return raw prices with Adj metadata; they do not apply adjustment automatically. Do not convert to `banexg.Kline` and back when custom fields must be retained.
 
 ### Aggregation and Adjustment
 
@@ -274,6 +299,8 @@ Returns:
 - `*errs.Error` - Error information
 
 ## Trading Pair Related
+
+The package-level functions below are compatibility APIs. Explicit Runtimes use methods on their own `SymbolState`; do not mutate shared snapshots returned by `GetExSymbols` and related methods. `EnsureCurSymbols` accepts symbols in the current exchange market table. For abstract custom symbols, use `EnsureExSymbol(exchange, market, symbol, exgReal...)` to create or reuse an identity.
 
 ### GetExSymbols
 Get all trading pair information for specified exchange and market.
@@ -408,6 +435,8 @@ Returns:
 ## candlestick Data Related
 
 ### AutoFetchOHLCV
+
+The following OHLCV APIs expose fixed-field compatibility views. Use the DataSeries/field queries above for arbitrary extensions and generic series.
 Automatically fetch candlestick data, supporting data completion and unfinished candlesticks.
 
 Parameters:
@@ -449,6 +478,54 @@ Parameters:
 - `exsList map[int32]*ExSymbol` - Trading pair list
 - `timeFrame string` - Time frame
 - `startMS int64` - Start time (milliseconds)
+
+### FetchApiOHLCV
+
+`FetchApiOHLCV(ctx, exchange, pair, timeframe, startMS, endMS, out)` downloads exchange K-lines into `chan []*banexg.Kline` and returns `*errs.Error`.
+
+### ApplyAdj
+
+`ApplyAdj(adjs []*AdjInfo, klines []*banexg.Kline, adj int, cutEnd int64, limit int) []*banexg.Kline` applies adjustment to a fixed-field K-line view.
+
+### FastBulkOHLCV
+
+`FastBulkOHLCV(exchange, symbols, timeframe, startMS, endMS, limit, handler)` downloads missing data and reads matching windows in bulk. `handler` has signature `func(string, string, []*banexg.Kline, []*AdjInfo)`; the function returns `*errs.Error`. Combined symbols return raw prices and factors; apply adjustment explicitly.
+
+### GetAlignOff
+
+`GetAlignOff(sid int32, toTfMSecs int64) int64` returns the alignment offset in milliseconds.
+
+### NewKlineAgg
+
+`NewKlineAgg(TimeFrame, Table, AggFrom, AggStart, AggEnd, AggEvery, CpsBefore, Retention string) *KlineAgg` creates a K-line aggregation definition.
+
+### SyncKlineTFs
+
+`SyncKlineTFs(args *config.CmdArgs, pb *utils.StagedPrg) *errs.Error` synchronizes stored timeframes. Use the dependency-aware variant for explicit storage ownership.
+
+### CalcAdjFactors
+
+`CalcAdjFactors(args *config.CmdArgs, calculators ...AdjFactorCalculator) *errs.Error` recalculates adjustment factors.
+
+## Data Import and Export
+
+### ExportKData
+
+`ExportKData(configFile, outputDir string, numWorkers int, pb *utils.StagedPrg) *errs.Error` exports fixed K-line fields and accompanying metadata to protobuf, without arbitrary extension columns or independent series tables.
+
+### ImportData
+
+`ImportData(dataDir string, numWorkers int, pb *utils.StagedPrg) *errs.Error` imports protobuf K-lines and maps source symbol IDs to destination IDs. Explicit tasks use `ExportKDataWithDeps`/`ImportDataWithDeps` with `KDataTransferDeps`.
+
+## Utility Functions
+
+### GetDownTF
+
+`GetDownTF(timeFrame string) (string, *errs.Error)` chooses the physical download/storage timeframe for a requested timeframe.
+
+### GetKlineAggs
+
+`GetKlineAggs() []*KlineAgg` returns the configured physical aggregation definitions.
 
 ## Factor-engine integration
 

@@ -12,10 +12,29 @@ Runtime owns Core, Clock, Market, Symbols, Batch, Strategies, Orders, Trading, C
 
 - NewProcess() *Process constructs the coordination owner.
 - (*Process).NewRuntime(opts Options) (*Runtime, error) creates a task and releases newly acquired resources/claims on construction failure.
-- Runtime.BizDeps() projects biz.RuntimeDeps so traders, providers, wallets, reports and filters use the same owner's concrete state.
+- Runtime.BizDeps() returns biz.RuntimeDeps; Runtime.DataDeps() returns data.RuntimeDeps. Use dependencies from the same task for traders, providers and wallets. goods.RuntimeDeps is a separate explicit structure; BizDeps cannot be passed directly to a filter.
 - Factor installation uses runner.CloneConfig: configuration containers are copied while Plan/ComputationGroup and callbacks remain borrowed.
 
 Embedding should reuse normal entry assembly. Manual construction needs consistent configuration, clock, symbols, storage, exchange, callback owner and accounts; missing fields must not fall back to package globals.
+
+## Embedded lifecycle example
+
+The host supplies consistent configuration, storage and exchange in opts. This function demonstrates ownership and shutdown; it does not load strategies or start a trader automatically. Do not call Join from the task’s own shutdown callback.
+
+```go
+package embedding
+
+import botruntime "github.com/banbox/banbot/runtime"
+
+func RunTask(opts botruntime.Options, run func(*botruntime.Runtime) error) error {
+    process := botruntime.NewProcess()
+    defer process.Close()
+    task, err := process.NewRuntime(opts)
+    if err != nil { return err }
+    defer func() { task.Close(); task.Join() }()
+    return run(task)
+}
+```
 
 ## Stop, Close and Join
 

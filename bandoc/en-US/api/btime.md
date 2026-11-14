@@ -8,10 +8,23 @@ Each `runtime.Runtime` owns an independent `btime.ClockState`: a backtest advanc
 
 The package-level time functions below remain for legacy call chains; they are not a task clock for several Runtimes running in parallel.
 
+## ClockState methods and replay example
+
+`NewClockState(backtest bool, loc *time.Location) *ClockState` constructs a clock. `TimeMS()` returns milliseconds, `Time()` floating-point seconds, and `Now()` *time.Time. SetTimeMS sets simulation time; AdvanceMS returns the advanced millisecond timestamp. An unset replay clock initializes from real time on its first read, so set the start first. This is a host/test example; normal strategies must not advance the framework clock themselves.
+
+```go
+clock := btime.NewClockState(true, time.UTC)
+startMS, err := btime.ParseTimeMS("2025-01-01 00:00:00")
+if err != nil { panic(err) }
+clock.SetTimeMS(startMS)
+nextMS := clock.AdvanceMS(60_000)
+fmt.Println(nextMS - startMS) // 60000
+```
+
 ## Public Methods
 
 ### TimeMS
-Get current timestamp (13-digit milliseconds).
+Get the compatibility clock timestamp in milliseconds: simulation time in backtests, real time in live mode.
 
 Returns:
 - `int64` - Current timestamp
@@ -89,7 +102,7 @@ Returns:
 - `string` - Formatted time string
 
 ### ToDateStrLoc
-Convert timestamp to time string in specified timezone.
+Format in package-level LocShow (UTC when unset). This function does not accept a location argument; for an explicit timezone use ToTime(ts).In(loc).Format(layout).
 
 Parameters:
 - `timestamp int64` - Timestamp (supports 10-digit seconds or 13-digit milliseconds)
