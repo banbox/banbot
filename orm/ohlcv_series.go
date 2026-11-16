@@ -333,6 +333,85 @@ func keepOHLCVBucket(row *DataSeries, count, expected int) bool {
 	return err == nil && (volume > 0 || count*5 > expected)
 }
 
+// klineAggregateCoreFields are the columns the K-line aggregation needs on every
+// source row: bucket validity (volume > 0) and the open/high/low/close merge
+// depend on all of them, whatever subset the consumer projects.
+var klineAggregateCoreFields = []string{"open", "high", "low", "close", "volume"}
+
+// IsStoredKlineTimeframe reports whether the timeframe has its own physical table.
+func IsStoredKlineTimeframe(timeframe string) bool {
+	_, ok := aggMap[timeframe]
+	return ok
+}
+
+// StoredKlineTimeframes lists the physically stored K-line timeframes in ascending order.
+func StoredKlineTimeframes() []string {
+	out := make([]string, 0, len(aggList))
+	for _, agg := range aggList {
+		out = append(out, agg.TimeFrame)
+	}
+	return out
+}
+
+// ValidateKlineTimeframe accepts the stored timeframes and every timeframe that a
+// stored one divides exactly (queried by aggregation, the same rule as the
+// time-series engine: queryHyper/getSubTf). Anything else is rejected with the
+// supported set spelled out.
+func ValidateKlineTimeframe(timeframe string) error {
+	secs, err := utils2.TFToSecSafe(timeframe)
+	if err != nil || secs <= 0 {
+		return fmt.Errorf("invalid K-line timeframe %q", timeframe)
+	}
+	if IsStoredKlineTimeframe(timeframe) {
+		return nil
+	}
+	if subTF, _, _ := getSubTf(timeframe); subTF != "" {
+		return nil
+	}
+	return fmt.Errorf("K-line timeframe %q is neither stored (%s) nor an exact multiple of a stored one (aggregated at query time, e.g. 30m 2h 4h 8h 12h 3d)",
+		timeframe, strings.Join(StoredKlineTimeframes(), ", "))
+}
+
+// aggregationQueryFields widens a projection with the aggregation core fields
+// when the timeframe is built by aggregation. widened is true when the result
+// carries columns the caller did not ask for (removed again after resampling).
+func aggregationQueryFields(timeframe string, fields []string) (query []string, widened bool) {
+	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
+	if IsStoredKlineTimeframe(timeframe) {
+		return fields, false
+	}
+	have := make(map[string]bool, len(fields))
+	for _, f := range fields {
+		have[f] = true
+	}
+	query = append([]string(nil), fields...)
+	for _, f := range klineAggregateCoreFields {
+		if !have[f] {
+			query = append(query, f)
+			widened = true
+		}
+	}
+	return query, widened
+}
+
+// projectSeriesFields drops the helper columns added by aggregationQueryFields.
+func projectSeriesFields(rows []*DataSeries, fields []string) {
+	keep := make(map[string]bool, len(fields))
+	for _, f := range fields {
+		keep[f] = true
+	}
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		for key := range row.Values {
+			if !keep[key] {
+				delete(row.Values, key)
+			}
+		}
+	}
+}
+
 func (q *Queries) QuerySeries(exs *ExSymbol, timeframe string, startMs, endMs int64, limit int, withUnFinish bool) ([]*DataSeries, *errs.Error) {
 	return q.QuerySeriesFields(exs, timeframe, nil, startMs, endMs, limit, withUnFinish)
 }
@@ -373,7 +452,22 @@ func (q *Queries) querySeriesFieldsRaw(exs *ExSymbol, timeframe string, fields [
 		startMs == 0 && limit > 0)
 }
 
+// querySeriesFieldsRawMode reads the raw (pre-coverage-adjustment) series. An
+// aggregated timeframe is resampled from its stored sub-timeframe, which needs
+// the full OHLCV columns even when the caller projects only some of them.
 func (q *Queries) querySeriesFieldsRawMode(exs *ExSymbol, timeframe string, fields []string,
+	startMs, endMs int64, limit int, withUnFinish, revRead bool,
+) ([]*DataSeries, *errs.Error) {
+	requested := NormalizeSeriesFields(SeriesSourceKline, fields)
+	queryFields, widened := aggregationQueryFields(timeframe, fields)
+	rows, err := q.querySeriesFieldsRawCore(exs, timeframe, queryFields, startMs, endMs, limit, withUnFinish, revRead)
+	if err == nil && widened {
+		projectSeriesFields(rows, requested)
+	}
+	return rows, err
+}
+
+func (q *Queries) querySeriesFieldsRawCore(exs *ExSymbol, timeframe string, fields []string,
 	startMs, endMs int64, limit int, withUnFinish, revRead bool,
 ) ([]*DataSeries, *errs.Error) {
 	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
@@ -529,7 +623,15 @@ func (q *Queries) QuerySeriesBatchFields(exsMap map[int32]*ExSymbol, timeframe s
 }
 
 func (q *Queries) querySeriesBatchFieldsRaw(exsMap map[int32]*ExSymbol, timeframe string, fields []string, startMs, endMs int64, limit int, handle func(int32, []*DataSeries)) *errs.Error {
-	fields = NormalizeSeriesFields(SeriesSourceKline, fields)
+	requested := NormalizeSeriesFields(SeriesSourceKline, fields)
+	fields, widened := aggregationQueryFields(timeframe, fields)
+	if widened {
+		inner := handle
+		handle = func(sid int32, rows []*DataSeries) {
+			projectSeriesFields(rows, requested)
+			inner(sid, rows)
+		}
+	}
 	tfMSecs := int64(utils2.TFToSecs(timeframe) * 1000)
 	options := q.klineRuntimeOptions()
 	startMs, endMs = parseDownArgsAt(tfMSecs, startMs, endMs, limit, false, options.nowMS())

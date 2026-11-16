@@ -144,7 +144,7 @@
 ### 2. K 线写入与覆盖
 
 - 新 DataSeries 写入：`InsertOHLCVSeriesAuto`（orm/ohlcv_series.go:1119）→ `normalizeOHLCVSeries`（:1488）→ `AddInsKline`（orm/pub_meta_queries.go:328）→ `insertOHLCVRowsLocked`（:1211）→ `finalizeKlineInsert`（orm/kline.go:822）→ `UpdateKRange`（kline.go:858）→ `updateKLineRange` / `updateKHoles`（kline.go:146）→ `UpdateSRanges`（orm/srange.go:551）→ `DelInsKline`。旧接口 `InsertKLinesAuto`（kline.go:769）流程相同。
-- K 线读取：`Queries.QuerySeriesFields`（ohlcv_series.go:339）；带覆盖的入口为 `GetSeriesFields`（:742）。旧接口 `QueryOHLCV`（kline.go:50）经 `SeriesToKLines`（ohlcv_series.go:32）转换。
+- K 线读取：`Queries.QuerySeriesFields`（ohlcv_series.go:339）；非存储周期（4h/8h/3d 等，`IsStoredKlineTimeframe` 为假）由 `queryHyper`/`getSubTf` 取最近的整除子周期并在读取时重采样。重采样需要完整 OHLCV，因此 `querySeriesFieldsRawMode`/`querySeriesBatchFieldsRaw` 在聚合周期上把投影补全为 open/high/low/close/volume，结束后去掉未请求的列（`aggregationQueryFields`/`projectSeriesFields`）；`ValidateKlineTimeframe` 校验周期能否由已存周期读取；带覆盖的入口为 `GetSeriesFields`（:742）。旧接口 `QueryOHLCV`（kline.go:50）经 `SeriesToKLines`（ohlcv_series.go:32）转换。
 - 写入 NULL 语义（`klineWriteValue`，ohlcv_series.go:1352）：缺失的 quote、buy_volume 写 0.0，缺失的 trade_num 写 0，其他缺失字段写 NULL。读取时 NULL 以 key 存在、值为 nil 的形式保留（kline_series_store.go:450）。
 
 ### 3. 复权与聚合

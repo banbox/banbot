@@ -12,6 +12,7 @@ import (
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
+	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/runner"
 	"github.com/banbox/banbot/orm"
 	runtimectx "github.com/banbox/banbot/runtime"
@@ -238,5 +239,22 @@ func TestStorageEntryAssemblyPagesTypedRowsAndExtendsActualTSNeeds(t *testing.T)
 	cancel()
 	if _, err = input.Open(ctx, prepared[0], input.Ranges()[0]); err == nil || !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "changed") {
 		t.Fatal("canceled input accepted")
+	}
+}
+
+func TestValidateFactorKlineTimeframesAcceptsAggregatedAndExplainsTheRest(t *testing.T) {
+	prices := runner.PriceStream{Source: orm.SeriesSourceKline, TimeFrame: "1m", Field: "close"}
+	for _, tf := range []string{"15m", "1h", "1d", "2h", "4h", "8h", "12h", "3d"} {
+		if err := validateFactorKlineTimeframes([]factor.InputSpec{{Source: orm.SeriesSourceKline, TimeFrame: tf, Fields: []string{"close"}}}, prices); err != nil {
+			t.Fatalf("%s must be accepted (stored or aggregated at read time): %v", tf, err)
+		}
+	}
+	err := validateFactorKlineTimeframes([]factor.InputSpec{{Source: orm.SeriesSourceKline, TimeFrame: "90s", Fields: []string{"close"}}}, prices)
+	if err == nil || !strings.Contains(err.Error(), "1m, 5m, 15m, 1h, 1d") {
+		t.Fatalf("an unsupported timeframe must name the supported set, got %v", err)
+	}
+	// non-kline sources and event streams are not K-line timeframes
+	if err := validateFactorKlineTimeframes([]factor.InputSpec{{Source: "funding", TimeFrame: "event"}}, runner.PriceStream{Source: orm.SeriesSourceKline, TimeFrame: "1m"}); err != nil {
+		t.Fatal(err)
 	}
 }

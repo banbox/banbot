@@ -68,4 +68,9 @@ package core
 //	   unchanged, a fully hedged book pays 0, a net short book pays 0 (no credit). Orders and fills are unchanged, only
 //	   Funding / NAV / curves of books with shorts differ from level 12; ts (order engine) bt_funding_apr is unchanged
 //	   (long positions only). Level 12 has no separate release; v0.7.90-trend.19 is level 13
-const BtFeatureLevel = 13
+//	14 factor / stat-arb decision timeframes that are not stored (K-line tables are 1m/5m/15m/1h/1d): any timeframe that a stored
+//	   one divides exactly (30m, 2h, 4h, 8h, 12h, 3d, 1w ...) is built at read time by the same aggregation as the time-series
+//	   engine (UTC buckets, 3d/1w anchored like the engine, incomplete trailing bucket dropped, bar visible at bucket close);
+//	   builds < 14 fail such runs with `series event missing field "open"`. An unsupported timeframe is rejected up front with
+//	   the supported set. Stored timeframes (15m/1h/1d/5m) and the time-series engine are byte-identical to level 13
+const BtFeatureLevel = 14

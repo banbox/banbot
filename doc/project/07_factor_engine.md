@@ -188,6 +188,8 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 
 **存储输入的 1m 价格流**：`StorageInputOptions.OwnedPages`（仅 `entry/factor_storage.go` 对数据库 K 线读取器打开，默认 false）声明 `QueryPage` 返回的是新解码、无他处引用的行：`fill` 用 `AdoptVersionRecord` 接管其 Values，`Next` 给保留历史用 `CloneScalarRecord`。约定：`QueryPage` 返回的行不得被别处引用或复用；给读取器加缓存时必须返回新建的 map，或关闭该开关。批次按 (Sid, Source, TimeFrame) 序访问游标组装（`fill` 顺序不变），`sortHistoricalRecords` 在批次已严格有序时跳过排序（无并列，结果同排序）。以上不改变记录内容、`MaxRawRecords` 与各摘要。`BenchmarkStorageReplay1m` 度量该路径。
 
+**聚合决策周期**（BtFeatureLevel 14）：因子/统计套利的 K 线决策周期（`run_timeframes`、`factor.Field(...)` 的周期）可以是已存周期（1m/5m/15m/1h/1d）或被其整除的任意周期（30m、2h、4h、8h、12h、3d、1w 等）。分页输入对聚合周期仍调用同一个 `QueryPage`→`QuerySeriesFields`，由 `orm` 读取层在读取时从最近的子周期合成（`querySeriesFieldsRawMode`：聚合周期自动把投影补全为 open/high/low/close/volume 再重采样，结束后只保留所请求的列；批量路径 `querySeriesBatchFieldsRaw` 同理），与时序引擎的 `QuerySeries` 走同一套 `ResampleDataSeries`，两条路径对同一品种同一周期读到的 bar 序列逐根相同。语义：桶按 UTC 对齐（3d/1w 沿用 `GetTfAlignOrigin` 的 1970-01-02/01-05 锚点），`TimeMS` 为桶起点、`EndMS=TimeMS+周期` 为事件时间，桶收盘前不可见（无前视），在其后的 1m 价格 bar 成交；末尾不完整的桶丢弃；分页起点向上对齐到桶边界，下一页从 `lastTime+1` 续读，不会读到半个桶；warmup 仍是 `锚点 - WarmupNum×周期`，读取起点向上对齐后恰有 WarmupNum 个桶先于首个范围内的桶；`every_bars`、窗口与 `Lag` 都以聚合后的 bar 计数。不被已存周期整除的周期由 `entry/factor_storage.go:validateFactorKlineTimeframes`（经 `orm.ValidateKlineTimeframe`）在打开数据库前报错并列出已存周期；预检同样覆盖 `prices.timeframe`。
+
 ### 5. 组合策略（lifecycle-v1）提案
 
 `LifecyclePolicy.Propose`（`policy.go`）：

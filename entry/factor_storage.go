@@ -89,8 +89,32 @@ func preflightFactorStorageConfig(spec *config.RunSpec, c *runner.Config) error 
 			c.Execution.StrategyGrossLimit = decimal.NewFromFloat(c.InitialNAV * leverage)
 		}
 	}
-	_, _, compileErr := runner.CompileDefinition(*c)
-	return compileErr
+	plan, _, compileErr := runner.CompileDefinition(*c)
+	if compileErr != nil {
+		return compileErr
+	}
+	return validateFactorKlineTimeframes(plan.Inputs(), c.Prices)
+}
+
+// validateFactorKlineTimeframes rejects K-line timeframes the storage cannot
+// serve before any database is opened. Stored timeframes and exact multiples of
+// them (resampled at read time, as in the time-series engine) are accepted.
+func validateFactorKlineTimeframes(inputs []factor.InputSpec, prices runner.PriceStream) error {
+	check := func(source, timeframe, what string) error {
+		if source != orm.SeriesSourceKline || timeframe == "" || timeframe == "event" {
+			return nil
+		}
+		if err := orm.ValidateKlineTimeframe(timeframe); err != nil {
+			return fmt.Errorf("factor: %s: %w", what, err)
+		}
+		return nil
+	}
+	for _, input := range inputs {
+		if err := check(input.Source, input.TimeFrame, "decision/input timeframe"); err != nil {
+			return err
+		}
+	}
+	return check(prices.Source, prices.TimeFrame, "prices.timeframe")
 }
 
 type factorStorageInput struct {

@@ -15,6 +15,7 @@ import (
 	"github.com/banbox/banbot/factor/backtest"
 	"github.com/banbox/banbot/factor/expr"
 	"github.com/banbox/banbot/factor/research"
+	"github.com/banbox/banexg/utils"
 	"io"
 	"os"
 	"sort"
@@ -795,6 +796,10 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if policy != nil {
 				gridOffset = 0
 			}
+			if origin := barGridOrigin(c.DecisionInterval); origin != 0 {
+				// multi-day bars (3d, 1w ...) close on the engine's own origin (1970-01-02 / 01-05), not on epoch multiples
+				gridOffset = origin
+			}
 			decisionBatch := grid > 0 && (grid-gridOffset)%c.DecisionInterval == 0
 			if c.SourceEventDecisions {
 				grid = sourceGrid
@@ -1277,4 +1282,15 @@ func copyQuotes(src map[int32]backtest.Quote) map[int32]backtest.Quote {
 		dst[k] = v
 	}
 	return dst
+}
+
+// barGridOrigin is the offset (ms) at which bars of the given length close, relative to the epoch. It is 0 for every
+// timeframe up to 1d and for hour/day multiples that divide the epoch evenly; multi-day buckets use the time-series
+// engine's alignment origins (utils.GetTfAlignOrigin), so decision grids land on the aggregated bars' close times.
+func barGridOrigin(intervalMS int64) int64 {
+	if intervalMS < 1000 || intervalMS%1000 != 0 {
+		return 0
+	}
+	_, offsetSecs := utils.GetTfAlignOrigin(int(intervalMS / 1000))
+	return int64(offsetSecs) * 1000
 }
