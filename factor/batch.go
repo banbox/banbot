@@ -215,6 +215,13 @@ func evaluateBatchTSSpan(node compiledNode, sp sidSpan, snapshots []*Snapshot, c
 		}
 		return nil
 	}
+	if node.spec.Operator == "sector-code" {
+		for offset := 0; offset < spanLen; offset++ {
+			t := sp.start + offset
+			columns[index][t][sid] = evaluateSectorCode(snapshots[t], sid)
+		}
+		return nil
+	}
 	_, isPointwise := pointwiseArity(node.spec.Operator)
 	if node.evaluate != nil || isPointwise || node.spec.Operator == "linear" {
 		inputs := make([]Numeric, len(node.inputs))

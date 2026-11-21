@@ -37,6 +37,9 @@ func (p *LifecyclePolicy) applyRetention(c PortfolioContext, s LifecycleState, d
 	retained := map[int32]bool{}
 	for _, sid := range mapSIDs(s.Assets) {
 		a := s.Assets[sid]
+		if a == nil || c.GridTime < a.CooldownUntil || a.Forced {
+			continue
+		}
 		rank := rankLong[sid]
 		budget := cfg.LongNotional
 		k := cfg.Selection.LongK
@@ -66,6 +69,9 @@ func (p *LifecyclePolicy) applyRetention(c PortfolioContext, s LifecycleState, d
 			}
 			for _, sid := range mapSIDs(s.Assets) {
 				a := s.Assets[sid]
+				if a == nil || c.GridTime < a.CooldownUntil || a.Forced {
+					continue
+				}
 				if _, ok := desired[sid]; ok || a.Direction != side || a.Last.Value == "0" || a.Exiting || rank[sid] == 0 || !passesGate(sid, side) {
 					continue
 				}

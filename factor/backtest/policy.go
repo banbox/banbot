@@ -23,12 +23,34 @@ type bookFillFact struct {
 	at               int64
 }
 
-func (b *Book) recordFirstFill(sid int32, qty float64, at int64) {
+func (b *Book) recordFirstFill(sid int32, qty float64, at int64, fillPrices ...float64) {
 	old := b.quantities[sid]
+	fillPrice := 0.0
+	if len(fillPrices) > 0 {
+		fillPrice = fillPrices[0]
+	}
 	if qty == 0 {
 		delete(b.firstFill, sid)
+		delete(b.entryPrices, sid)
 	} else if old == 0 || old > 0 && qty < 0 || old < 0 && qty > 0 {
 		b.firstFill[sid] = at
+		if fillPrice > 0 && finite(fillPrice) {
+			if b.entryPrices == nil {
+				b.entryPrices = map[int32]float64{}
+			}
+			b.entryPrices[sid] = fillPrice
+		}
+	} else if fillPrice > 0 && finite(fillPrice) && math.Abs(qty) > math.Abs(old) {
+		if b.entryPrices == nil {
+			b.entryPrices = map[int32]float64{}
+		}
+		prevEntry := b.entryPrices[sid]
+		if prevEntry > 0 {
+			added := math.Abs(qty) - math.Abs(old)
+			b.entryPrices[sid] = (math.Abs(old)*prevEntry + added*fillPrice) / math.Abs(qty)
+		} else {
+			b.entryPrices[sid] = fillPrice
+		}
 	}
 }
 
@@ -59,6 +81,7 @@ func (b *Book) ExecuteAllocation(p *factor.PortfolioTarget, quotes map[int32]Quo
 	if spec.Mode == factor.Patch {
 		targets = p.Allocations()
 	}
+	valNAV := b.executionValuationNAV(quotes, spec.Budget.NAV)
 	quantities := map[int32]float64{}
 	for sid, a := range targets {
 		if done, err := b.TerminalQuoteExempt(sid, a.Value == "0"); err != nil {
@@ -78,6 +101,9 @@ func (b *Book) ExecuteAllocation(p *factor.PortfolioTarget, quotes map[int32]Quo
 		switch a.Basis {
 		case factor.NAVFraction:
 			qty = value * spec.Budget.NAV / q.Price
+			if b.withinDriftBand(sid, value, q.Price, valNAV) {
+				qty = b.quantities[sid]
+			}
 		case factor.AbsoluteQuantity:
 		default:
 			return errors.New("backtest: unsupported allocation basis")
@@ -116,7 +142,7 @@ func (b *Book) ExecuteAllocation(p *factor.PortfolioTarget, quotes map[int32]Quo
 		b.slippage += math.Abs(delta * (price - q.Price))
 		b.turnover += math.Abs(delta * q.Price)
 		b.attr.trade(sid, b.quantities[sid], qty, q.Price, cost, math.Abs(delta*(price-q.Price)))
-		b.recordFirstFill(sid, qty, q.AtMS)
+		b.recordFirstFill(sid, qty, q.AtMS, q.Price)
 		b.quantities[sid] = qty
 		b.marks[sid] = q
 	}
@@ -129,7 +155,11 @@ func (b *Book) PolicyEvidence(now int64) (factor.PortfolioEvidence, error) {
 	b.settleFunding()
 	e := factor.PortfolioEvidence{Positions: map[int32]factor.PositionEvidence{}, Marks: map[int32]string{}, StateVersion: b.stateVersion, LedgerCursor: b.ledgerCursor, State: append(json.RawMessage(nil), b.policyState...)}
 	for sid, qty := range b.quantities {
-		e.Positions[sid] = factor.PositionEvidence{Quantity: strconv.FormatFloat(qty, 'f', -1, 64), PendingQuantity: "0", FirstFillTime: b.firstFill[sid]}
+		ep := ""
+		if qty != 0 && b.entryPrices[sid] > 0 {
+			ep = strconv.FormatFloat(b.entryPrices[sid], 'f', -1, 64)
+		}
+		e.Positions[sid] = factor.PositionEvidence{Quantity: strconv.FormatFloat(qty, 'f', -1, 64), PendingQuantity: "0", FirstFillTime: b.firstFill[sid], EntryPrice: ep}
 	}
 	for sid, q := range b.marks {
 		if q.AvailableAt > now || q.AtMS > now {

@@ -38,6 +38,10 @@ func SelectPortfolio(frame Frame, universe Universe, spec PortfolioSpec, c Portf
 	return SelectPortfolioScore(frame, universe, spec, c, "score", nil)
 }
 func SelectPortfolioScore(frame Frame, universe Universe, spec PortfolioSpec, c PortfolioPolicyConfig, scoreName string, groups map[int32]string) (*TargetPortfolio, []Diagnostic, error) {
+	return SelectPortfolioScoreCooldown(frame, universe, spec, c, scoreName, groups, nil)
+}
+
+func SelectPortfolioScoreCooldown(frame Frame, universe Universe, spec PortfolioSpec, c PortfolioPolicyConfig, scoreName string, groups map[int32]string, cooldown map[int32]bool) (*TargetPortfolio, []Diagnostic, error) {
 	if c.Selection.MissingScores == "" {
 		c.Selection.MissingScores = "skip"
 	}
@@ -104,7 +108,7 @@ func SelectPortfolioScore(frame Frame, universe Universe, spec PortfolioSpec, c 
 			if reverse && maxScore != nil && score > *maxScore {
 				break
 			}
-			if used[sid] {
+			if used[sid] || cooldown[sid] {
 				continue
 			}
 			group := groups[sid]

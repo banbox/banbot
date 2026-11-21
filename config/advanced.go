@@ -34,21 +34,21 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.HasSuffix(path, ".combo"), strings.HasSuffix(path, ".expressions.combine"):
 		allowed = "method columns weights min_samples min_pairs min_confidence decay direction fallback label"
 	case strings.HasSuffix(path, ".portfolio"):
-		allowed = "builder k long_notional short_notional long_min_score short_max_score unfilled_slot_policy asset_cap mode policy policy_params rebalance selection holding transition allocation"
+		allowed = "builder k long_notional short_notional long_min_score short_max_score unfilled_slot_policy asset_cap drift_threshold mode policy policy_params rebalance selection holding transition allocation"
 	case strings.HasSuffix(path, ".rebalance"):
-		allowed = "every_bars anchor phase duration calendar calendar_version timezone"
+		allowed = "every_bars anchor phase duration calendar calendar_version timezone drift_threshold"
 	case strings.HasSuffix(path, ".selection"):
 		allowed = "long_k short_k long_quantile short_quantile long_min_score short_max_score unfilled_slot_policy retain_rank dropout group_quota missing_scores"
 	case strings.HasSuffix(path, ".holding"):
-		allowed = "min_bars max_bars min_duration max_duration by_asset adopt cooldown_bars"
+		allowed = "min_bars max_bars min_duration max_duration stop_loss_pct trailing_stop_pct by_asset adopt cooldown_bars"
 	case strings.Contains(path, ".holding.by_asset."):
-		allowed = "min_bars max_bars min_duration max_duration"
+		allowed = "min_bars max_bars min_duration max_duration stop_loss_pct trailing_stop_pct"
 	case strings.HasSuffix(path, ".transition"):
 		allowed = "mode exit_steps basis period_bars startup sizing on_reselect ratio final_threshold alpha entry_window_bars by_asset"
 	case strings.Contains(path, ".transition.by_asset."):
 		allowed = "exit_steps ratio"
 	case strings.HasSuffix(path, ".allocation"):
-		allowed = "method volatility_column beta_column risk_window shrinkage risk_aversion reserve_ratio fixed_notional vol_target asset_cap group_caps turnover_limit net_cap beta_cap"
+		allowed = "method volatility_column beta_column risk_window shrinkage risk_aversion reserve_ratio fixed_notional vol_target asset_cap group_caps turnover_limit drift_threshold net_cap beta_cap"
 	case strings.HasSuffix(path, ".research"):
 		allowed = "labels label_wait_ms panel"
 	case strings.HasSuffix(path, ".snapshot"):
@@ -154,6 +154,11 @@ func validateAdvanced(path string, fields map[string]any) error {
 			number := numeric(value)
 			if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
 				return fmt.Errorf("%s must be a finite nonnegative number", field)
+			}
+		case "drift_threshold", "stop_loss_pct", "trailing_stop_pct":
+			number := numeric(value)
+			if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || number >= 1 {
+				return fmt.Errorf("%s must be a finite number in [0, 1)", field)
 			}
 		case "long_min_score", "short_max_score":
 			number := numeric(value)

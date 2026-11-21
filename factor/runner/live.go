@@ -80,6 +80,13 @@ func NewLive(c Config, sink Sink, clock func() int64, out Output) (*Live, error)
 		engine.close()
 		return nil, err
 	}
+	if policy == nil {
+		if d := c.Manifest.Portfolio.EffectiveDriftThreshold(); d > 0 {
+			if account, ok := sink.(*AccountSink); ok {
+				account.DriftThreshold = d
+			}
+		}
+	}
 	if policy != nil {
 		if _, ok := sink.(PolicySink); !ok {
 			engine.close()
@@ -157,6 +164,10 @@ func (l *Live) InheritAdmission(previous *Live) error {
 		l.policy.sequence = previous.policy.sequence
 		l.policy.riskTracker = previous.policy.riskTracker.clone()
 		l.policy.lastBeta = maps.Clone(previous.policy.lastBeta)
+		l.policy.lastBarGrid = previous.policy.lastBarGrid
+		l.policy.lastBarClose = maps.Clone(previous.policy.lastBarClose)
+		l.policy.lastBarHigh = maps.Clone(previous.policy.lastBarHigh)
+		l.policy.lastBarLow = maps.Clone(previous.policy.lastBarLow)
 	}
 	if previous.previous != nil {
 		targets := previous.previous.Targets()

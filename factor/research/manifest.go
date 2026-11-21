@@ -23,6 +23,7 @@ type PortfolioDefinition struct {
 	ShortMaxScore               *float64             `json:",omitempty"`
 	UnfilledSlotPolicy          string               `json:",omitempty"`
 	AssetCap                    float64              `json:",omitempty"`
+	DriftThreshold              float64              `json:",omitempty"`
 	Mode                        factor.PortfolioMode
 	Policy                      string                   `json:",omitempty"`
 	PolicyParams                json.RawMessage          `json:",omitempty"`

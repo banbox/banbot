@@ -368,6 +368,16 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	if err != nil {
 		return result, err
 	}
+	if policy == nil {
+		if d := c.Manifest.Portfolio.EffectiveDriftThreshold(); d > 0 {
+			if book != nil {
+				book.SetDriftThreshold(d)
+			}
+			if account, ok := sink.(*AccountSink); ok {
+				account.DriftThreshold = d
+			}
+		}
+	}
 	if policy != nil && book == nil {
 		if _, ok := sink.(PolicySink); !ok {
 			return result, errors.New("runner: lifecycle policy requires an allocation-capable sink and explicit position evidence")

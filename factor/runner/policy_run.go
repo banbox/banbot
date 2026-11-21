@@ -27,15 +27,19 @@ type AllocationOutput interface {
 }
 
 type policyRun struct {
-	policy      factor.PortfolioPolicy
-	allocCfg    factor.AllocationConfig
-	comboCols   []string
-	riskTracker *riskHistoryTracker
-	lastBeta    map[int32]float64
-	state       json.RawMessage
-	version     uint64
-	previous    *factor.PortfolioTarget
-	sequence    uint64
+	policy       factor.PortfolioPolicy
+	allocCfg     factor.AllocationConfig
+	comboCols    []string
+	riskTracker  *riskHistoryTracker
+	lastBeta     map[int32]float64
+	lastBarGrid  int64
+	lastBarClose map[int32]float64
+	lastBarHigh  map[int32]float64
+	lastBarLow   map[int32]float64
+	state        json.RawMessage
+	version      uint64
+	previous     *factor.PortfolioTarget
+	sequence     uint64
 }
 type pendingProposal struct {
 	proposal        factor.PortfolioProposal
@@ -116,6 +120,11 @@ func (p *policyRun) propose(ctx context.Context, c Config, frame factor.Frame, u
 		mappingVersion = "sid-v1"
 	}
 	context := factor.PortfolioContext{Frame: factor.CloneFrame(frame), Universe: factor.CloneUniverse(universe), Ideal: ideal, Spec: spec, GridTime: grid, BarMillis: c.DecisionInterval, ScoreName: "score", Positions: factor.ClonePositionEvidence(evidence.Positions), Marks: marks, AssetNames: names, SIDMappingVersion: mappingVersion, StateVersion: evidence.StateVersion, LedgerCursor: evidence.LedgerCursor, Previous: p.previous}
+	if !riskOnly && p.lastBarGrid == grid {
+		context.BarClose = maps.Clone(p.lastBarClose)
+		context.BarHigh = maps.Clone(p.lastBarHigh)
+		context.BarLow = maps.Clone(p.lastBarLow)
+	}
 	if c.PortfolioBuilder != nil || (c.Manifest.Portfolio.Builder != "" && c.Manifest.Portfolio.Builder != "top-bottom-k-v1") {
 		context.PreserveIdealWeights = c.Manifest.Portfolio.Allocation == nil
 	} else {

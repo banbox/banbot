@@ -3,6 +3,7 @@ package factor
 import (
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/banbox/banbot/orm"
 )
@@ -38,6 +39,9 @@ func percentile(points []point, q float64) float64 {
 func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Numeric) map[int32]Numeric {
 	input := columns[node.inputs[0]]
 	active := activeFactorSIDs(snapshot.spec)
+	if strings.HasPrefix(node.spec.Operator, "quantile-group-") {
+		return evaluateQuantileGroupCS(node, snapshot, columns, active)
+	}
 	result := make(map[int32]Numeric, len(active))
 	targets := make([]point, 0, len(active))
 	for _, sid := range active {
@@ -56,6 +60,9 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 			result[p.sid] = Numeric{math.NaN(), Missing}
 		}
 		return result
+	}
+	if res, ok := evaluateSectorOrQuantileCS(node, snapshot, columns, active, points, targets, result); ok {
+		return res
 	}
 	switch node.spec.Operator {
 	case "rank", "pct-rank":

@@ -368,8 +368,15 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 			}
 			return nil
 		}
+		needStopOHLC := c.Manifest.Portfolio.Holding != nil && c.Manifest.Portfolio.Holding.HasStopProtection()
 		for _, input := range plan.Inputs() {
-			if err := add(input.Source, input.TimeFrame, input.Fields, input.WarmupLength, factorIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
+			fields := input.Fields
+			if needStopOHLC && input.Source == "kline" && input.TimeFrame == plan.TimeFrame() {
+				fields = append(slices.Clone(fields), "high", "low", "close")
+				sort.Strings(fields)
+				fields = slices.Compact(fields)
+			}
+			if err := add(input.Source, input.TimeFrame, fields, input.WarmupLength, factorIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
 				return nil, err
 			}
 		}

@@ -321,6 +321,9 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	if n, handled, err := c.indicatorCall(path, e); handled {
 		return n, err
 	}
+	if n, handled, err := c.sectorOrQuantileCall(path, e); handled {
+		return n, err
+	}
 	arities := map[string]int{
 		"field": 2, "positive": 1, "sign": 1, "clip": 3,
 		"abs": 1, "log": 1, "sqrt": 1, "pow": 2, "min": 2, "max": 2,

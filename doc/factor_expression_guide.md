@@ -133,6 +133,8 @@ param.window      本定义集 params 中的编译期参数
 | `group.wls(y,weight,x1,x2,...)` | 正权重的多暴露加权回归残差 |
 | `group.demean(x,"source","field")` | 按原始分组字段计算组内去均值 |
 | `group.zscore(x,"source","field")` | 按原始分组字段计算组内标准化 |
+| `cs.sector_demean(x)` / `cs.sector_zscore(x)` | 按内置加密赛道分类（`L1`/`L2`/`DeFi`/`AI_DePin`/`Meme`/`Gaming`/`Infra`/`Other`，自动归一化 `1000PEPE/USDT:USDT`→`PEPE`，无需外部数据表）做赛道内去均值 / 标准化；等价别名 `group.sector_demean(x)`、`group.sector_zscore(x)`、`group.demean(x, sector)`、`group.zscore(x, sector)`；`sector_code()` 输出数值赛道编码 `0..7` |
+| `group.quantile_demean(x,metric,n)` / `group.quantile_zscore(x,metric,n)` | 每期按连续指标 `metric`（如成交额/市值代理 `ts.sma(kline.quote,30)`）在参考池做确定性排名分位分层（整数 `n ∈ [2,1000]`），在各分位桶内对 `x` 做去均值 / 标准化；另提供桶内排名 `group.quantile_rank(x,metric,n)` 与 `group.quantile_pct_rank(x,metric,n)` |
 
 分位点使用排序值间的线性插值。例如 `[10,10,30]` 的 rank 为 `[0.5,0.5,2]`，中位数为 `10`。三项全相同时 rank 均为 `1`，z-score 均为 `0`。
 

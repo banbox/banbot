@@ -234,13 +234,19 @@ func (p *LifecyclePolicy) proposeCohort(c PortfolioContext, s LifecycleState, du
 		}
 	}
 	cfg := p.effectiveConfig(c)
+	cooldownSIDs := map[int32]bool{}
+	for sid, a := range s.Assets {
+		if a != nil && c.GridTime < a.CooldownUntil {
+			cooldownSIDs[sid] = true
+		}
+	}
 	selected := map[int32]float64{}
 	selectionValid := !c.RiskOnly
 	if c.RiskOnly {
 	} else if c.Ideal != nil {
 		selected = c.Ideal.Targets()
 	} else {
-		ideal, diag, err := SelectPortfolioScore(c.Frame, c.Universe, c.Spec, cfg, c.ScoreName, c.Groups)
+		ideal, diag, err := SelectPortfolioScoreCooldown(c.Frame, c.Universe, c.Spec, cfg, c.ScoreName, c.Groups, cooldownSIDs)
 		if err != nil {
 			return PortfolioProposal{}, err
 		}
@@ -289,7 +295,7 @@ func (p *LifecyclePolicy) proposeCohort(c PortfolioContext, s LifecycleState, du
 			}
 			batch := PortfolioCohort{ID: fmt.Sprintf("%d-%d", c.Spec.PlanSequence, index), Created: c.GridTime, Expires: expiry, EntryUntil: c.GridTime + int64(p.config.Transition.EntryWindowBars)*c.BarMillis, PlanSequence: c.Spec.PlanSequence}
 			for _, sid := range mapSIDs(selected) {
-				if c.ForceExit[sid] != "" {
+				if c.ForceExit[sid] != "" || cooldownSIDs[sid] {
 					continue
 				}
 				mark := c.Marks[sid]
