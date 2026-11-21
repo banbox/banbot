@@ -79,6 +79,20 @@ func ensurePagedSeriesRange(catalog *DataSourceCatalog, ctx context.Context, sto
 	if ctx == nil {
 		return errs.NewMsg(core.ErrBadConfig, "history context is required")
 	}
+	if ctrl, ok := source.(HistoryDownloadController); ok && !ctrl.AllowHistoryDownload() {
+		if catalog != nil {
+			catalog.markDataSourceBackfill(source.Info().Name, DataSourceOpStatus{
+				State:     "ok",
+				AtMS:      time.Now().UnixMilli(),
+				Sid:       sub.ExSymbol.ID,
+				TimeFrame: source.Info().TimeFrame,
+				StartMS:   start,
+				EndMS:     end,
+				Rows:      0,
+			}, "")
+		}
+		return nil
+	}
 	rowsWritten := 0
 	defer func() {
 		if catalog == nil {

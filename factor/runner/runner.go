@@ -286,7 +286,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			return result, errors.New("runner: account execution requires reconciled strategy state")
 		}
 	}
-	if (c.Mode == Trade || c.Mode == Events) && c.Manifest.Costs.FundingPolicy == "required-stream" {
+	if (c.Mode == Trade || c.Mode == Events) && isStreamFundingPolicy(c.Manifest.Costs.FundingPolicy) {
 		if _, ok := sink.(FundingObserver); !ok {
 			return result, errors.New("runner: account execution requires funding reconciliation")
 		}
@@ -344,7 +344,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		if err != nil {
 			return result, err
 		}
-		book.SetFundingApr(c.Manifest.Costs.FundingApr)
+		if !isStreamFundingPolicy(c.Manifest.Costs.FundingPolicy) {
+			book.SetFundingApr(c.Manifest.Costs.FundingApr)
+		}
 		book.EnableAttribution()
 		switch {
 		case c.PITDelistPenaltyBps == 0:
@@ -585,7 +587,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				}
 			}
 			for _, r := range batch.Records {
-				if r.Series.Source == c.FundingSource && c.Manifest.Costs.FundingPolicy == "required-stream" {
+				if r.Series.Source == c.FundingSource && isStreamFundingPolicy(c.Manifest.Costs.FundingPolicy) {
 					if r.AvailableAt > now || r.IngestedAt > now || r.EventTime != now {
 						return result, errors.New("runner: funding settlement unavailable or delivered late")
 					}
@@ -600,6 +602,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 						}
 					}
 					if book != nil && !warming {
+						if (c.HistoricalInput != nil || c.Manifest.Costs.FundingPolicy == "storage") && !book.HasMark(r.Series.Sid) && book.State().Quantities[r.Series.Sid] == 0 {
+							continue
+						}
 						if err = book.ApplyFunding(f, now); err != nil {
 							return result, err
 						}

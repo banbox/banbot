@@ -16,7 +16,11 @@ type SeriesField struct {
 	Role string
 }
 
-const SeriesSourceKline = "kline"
+const (
+	SeriesSourceKline       = "kline"
+	SeriesSourceFundingRate = "funding_rate"
+	DefaultFundingRateTF    = "8h"
+)
 
 var klineDefaultFields = []string{
 	"open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num",
@@ -24,6 +28,20 @@ var klineDefaultFields = []string{
 
 func DefaultKlineFields() []string {
 	return append([]string(nil), klineDefaultFields...)
+}
+
+func DefaultFundingRateFields() []string {
+	return []string{"rate"}
+}
+
+func NewFundingRateSeriesInfo(timeFrame string) *SeriesInfo {
+	tf := strings.TrimSpace(timeFrame)
+	if tf == "" {
+		tf = DefaultFundingRateTF
+	}
+	return NewSeriesInfo(SeriesSourceFundingRate, tf, []SeriesField{
+		{Name: "rate", Type: "float"},
+	})
 }
 
 func NormalizeSeriesFields(source string, fields []string) []string {

@@ -20,6 +20,7 @@ import (
 	"github.com/banbox/banbot/goods"
 	"github.com/banbox/banbot/orm"
 	runtimectx "github.com/banbox/banbot/runtime"
+	"github.com/banbox/banexg/utils"
 	"github.com/shopspring/decimal"
 )
 
@@ -45,10 +46,13 @@ func preflightFactorStorageConfig(spec *config.RunSpec, c *runner.Config) error 
 	if c.MaxRecords <= 0 || c.MaxPending <= 0 || c.DecisionInterval <= 0 || c.LatencyMS <= 0 || c.ExpiryMS <= c.LatencyMS {
 		return errors.New("factor: positive bounded historical replay configuration required")
 	}
-	if c.Manifest.Costs.FundingPolicy != "explicit-zero" && c.Manifest.Costs.FundingPolicy != "required-stream" {
-		return errors.New("factor: execution.funding_policy must explicitly declare explicit-zero or required-stream")
+	if c.Manifest.Costs.FundingPolicy != "explicit-zero" && c.Manifest.Costs.FundingPolicy != "required-stream" && c.Manifest.Costs.FundingPolicy != "storage" {
+		return errors.New("factor: execution.funding_policy must explicitly declare explicit-zero, required-stream or storage")
 	}
-	if c.Manifest.Costs.FundingPolicy == "required-stream" && c.FundingSource == "" {
+	if c.Manifest.Costs.FundingPolicy == "storage" && c.FundingSource == "" {
+		c.FundingSource = orm.SeriesSourceFundingRate
+	}
+	if (c.Manifest.Costs.FundingPolicy == "required-stream" || c.Manifest.Costs.FundingPolicy == "storage") && c.FundingSource == "" {
 		return errors.New("factor: required funding source must be declared")
 	}
 	c.Snapshot.VisibilityPolicy = pit
@@ -369,7 +373,21 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 			return nil
 		}
 		for _, input := range plan.Inputs() {
-			if err := add(input.Source, input.TimeFrame, input.Fields, input.WarmupLength, factorIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
+			warm := input.WarmupLength
+			if input.AsOfLatest && input.TimeFrame != "" && input.TimeFrame != "event" {
+				if stepSecs, tfErr := utils.TFToSecSafe(input.TimeFrame); tfErr == nil && stepSecs > 0 {
+					stepMS := int64(stepSecs) * 1000
+					lookbackMS := int64(plan.WarmupLength()) * c.DecisionInterval
+					if input.MaxAge > 0 && input.MaxAge > stepMS {
+						lookbackMS += input.MaxAge
+					}
+					needed := int((lookbackMS+stepMS-1)/stepMS) + 1
+					if needed > warm {
+						warm = needed
+					}
+				}
+			}
+			if err := add(input.Source, input.TimeFrame, input.Fields, warm, factorIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
 				return nil, err
 			}
 		}
@@ -377,8 +395,16 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 		if err := add(c.Prices.Source, c.Prices.TimeFrame, []string{c.Prices.Field}, 0, executionIDs, "price:"+c.StrategyID, 0); err != nil {
 			return nil, err
 		}
-		if c.Manifest.Costs.FundingPolicy == "required-stream" {
-			if err := add(c.FundingSource, "event", []string{"rate"}, 0, executionIDs, "funding:"+c.StrategyID, 0); err != nil {
+		if c.Manifest.Costs.FundingPolicy == "required-stream" || c.Manifest.Costs.FundingPolicy == "storage" {
+			fundingTF := "event"
+			fundingWarm := 0
+			if src := task.Catalog.GetDataSource(c.FundingSource); src != nil && src.Info() != nil && src.Info().TimeFrame != "" {
+				fundingTF = src.Info().TimeFrame
+				if fundingTF != "event" {
+					fundingWarm = 1
+				}
+			}
+			if err := add(c.FundingSource, fundingTF, []string{"rate"}, fundingWarm, executionIDs, "funding:"+c.StrategyID, 0); err != nil {
 				return nil, err
 			}
 		}

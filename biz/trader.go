@@ -601,6 +601,21 @@ func (t *Trader) feedDataOnlySeries(evt *orm.DataSeries, resolved ...*orm.ExSymb
 		exs = evt.EnsureExSymbol()
 	}
 	subKey := strat.DataSubKey(evt.Source, evt.Sid, evt.TimeFrame)
+	if !evt.IsWarmUp && orm.NormalizeSeriesSource(evt.Source) == orm.SeriesSourceFundingRate {
+		symbol := ""
+		if exs != nil {
+			symbol = exs.Symbol
+		} else {
+			symbol = evt.Symbol()
+		}
+		if symbol != "" {
+			for _, mgr := range t.allOrderManagers() {
+				if recorder, ok := mgr.(interface{ RecordFundingSeries(string, *orm.DataSeries) }); ok {
+					recorder.RecordFundingSeries(symbol, evt)
+				}
+			}
+		}
+	}
 	dispatched := false
 	accounts := executionAccountConfigs(t.runtime)
 	for account := range executionAccountNames(t.runtime) {

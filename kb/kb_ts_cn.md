@@ -491,16 +491,18 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 ### 4.3 多空限制
 - `MaxOpenLong/Short`（job 级，由 `EachMaxLong/Short` 初始化）决定能否开新单；现货不能开空。反手：同一回调调 `CloseOrders` 与 `OpenOrder`，本事件末统一处理。
 
-## 5. 自定义时序数据
+## 5. 内置 `funding_rate` 与自定义时序数据
 
-### 5.1 写入（数据源/导入器/应用层，勿在策略回调中写库）
+- **内置 `funding_rate` 数据源**：框架默认注册 `orm.SeriesSourceFundingRate`（`"funding_rate"`，默认周期 `"8h"`，表 `funding_rate_8h`，字段 `"rate"` 单次结算费率，如 `0.0001` 表示 +0.01%），时间语义 `EndMS = 结算时刻`（无前视）。支持 `./bot series list`、`./bot series down -tables funding_rate ...` 预下载；策略直接在 `OnDataSubs` 返回 `&strat.DataSub{Source: orm.SeriesSourceFundingRate, TimeFrame: "8h", WarmupNum: 10}` 即可在 `Custom` 分支用 `d.Float64("rate")` / `d.Series("rate")` 读取信号。线性永续合约回测在存在 `funding_rate` 数据时自动按持仓跨越的结算点双向计入订单资金费（多头正费率付、负费率收；空头正费率收、负费率付），无数据时回退 `bt_funding_apr`。
+
+### 5.1 自定义表写入（数据源/导入器/应用层，勿在策略回调中写库）
 ```go
-info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{{Name: "rate", Type: "float"}})
+info := orm.NewSeriesInfo("open_interest", "1h", []orm.SeriesField{{Name: "oi", Type: "float"}})
 store := orm.NewSeriesStore(orm.NewSeriesRepo(storage)) // storage: 当前 Runtime 的 *orm.Storage
 _ = store.Ensure(ctx, info)
-_ = store.Write(ctx, info, exs, &orm.DataRecord{TimeMS: startMS, EndMS: endMS, Values: map[string]any{"rate": rate}})
+_ = store.Write(ctx, info, exs, &orm.DataRecord{TimeMS: startMS, EndMS: endMS, Values: map[string]any{"oi": oi}})
 rows, _ := store.Read(ctx, info, exs, startMS, endMS, 0) // []*orm.DataSeries
-v, err := rows[0].FloatValue("rate")
+v, err := rows[0].FloatValue("oi")
 ```
 - `SeriesField.Type`：`float int string bool json`。`SeriesStore`：`Ensure/Write/WriteBatch/WriteSeries/Read/Delete/Missing/FillMissing(ctx,info,exs,start,end,fetch)/Coverage`。
 - K线扩展列（逐 `(sid,time)`）：`orm.NewKLineSeriesInfo` + `orm.NewKLineSeriesStoreWithStorage`（只更新已存在的K线行）。

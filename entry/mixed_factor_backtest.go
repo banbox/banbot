@@ -14,6 +14,7 @@ import (
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/factor"
@@ -331,6 +332,13 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 	}
 	// Every factor reader consumes the immutable union stream. Its execution
 	// sink must recognize TS quotes/funding, while its DAG universe stays intact.
+	var storageCatalog *data.DataSourceCatalog
+	for _, c := range configs {
+		if input, ok := c.HistoricalInput.(*factorStorageInput); ok && input.assembly != nil && input.assembly.runtime != nil {
+			storageCatalog = input.assembly.runtime.Catalog
+			break
+		}
+	}
 	for i := range configs {
 		units, err := mergeMixedReplayUnits(configs[i].Execution.Instruments, tsUnits)
 		if err != nil {
@@ -343,7 +351,7 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 			return nil, err
 		}
 		for _, symbol := range tsSymbols {
-			subscriptions = append(subscriptions, mixedReplayExecutionSubscriptions(configs[i], symbol)...)
+			subscriptions = append(subscriptions, mixedReplayExecutionSubscriptions(configs[i], storageCatalog, symbol)...)
 		}
 	}
 	for _, consumer := range consumers {
@@ -359,8 +367,12 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 		if err := owner.paperSink.RegisterExecution(); err != nil {
 			return nil, err
 		}
+		cat := storageCatalog
+		if cat == nil && consumer.task != nil {
+			cat = consumer.task.Catalog
+		}
 		for _, symbol := range tsSymbols {
-			subscriptions = append(subscriptions, mixedReplayExecutionSubscriptions(consumer.base, symbol)...)
+			subscriptions = append(subscriptions, mixedReplayExecutionSubscriptions(consumer.base, cat, symbol)...)
 		}
 	}
 	configs, err = extendFactorStorageInputs(ctx, configs, subscriptions)
@@ -560,10 +572,20 @@ func mergeMixedReplayUnits(base, extra map[int32]execution.Instrument) (map[int3
 	return units, nil
 }
 
-func mixedReplayExecutionSubscriptions(c runner.Config, symbol *orm.ExSymbol) []*orm.Subscription {
+func mixedReplayExecutionSubscriptions(c runner.Config, catalog *data.DataSourceCatalog, symbol *orm.ExSymbol) []*orm.Subscription {
 	subs := []*orm.Subscription{{Source: c.Prices.Source, TimeFrame: c.Prices.TimeFrame, Fields: []string{c.Prices.Field}, ExSymbol: symbol}}
-	if c.Manifest.Costs.FundingPolicy == "required-stream" {
-		subs = append(subs, &orm.Subscription{Source: c.FundingSource, TimeFrame: "event", Fields: []string{"rate"}, ExSymbol: symbol})
+	if c.Manifest.Costs.FundingPolicy == "required-stream" || c.Manifest.Costs.FundingPolicy == "storage" {
+		fundingTF := "event"
+		fundingWarm := 0
+		if catalog != nil {
+			if src := catalog.GetDataSource(c.FundingSource); src != nil && src.Info() != nil && src.Info().TimeFrame != "" {
+				fundingTF = src.Info().TimeFrame
+				if fundingTF != "event" {
+					fundingWarm = 1
+				}
+			}
+		}
+		subs = append(subs, &orm.Subscription{Source: c.FundingSource, TimeFrame: fundingTF, WarmupNum: fundingWarm, Fields: []string{"rate"}, ExSymbol: symbol})
 	}
 	return subs
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/research"
 	"github.com/banbox/banbot/factor/runner"
+	"github.com/banbox/banbot/orm"
 	runtimectx "github.com/banbox/banbot/runtime"
 	"github.com/banbox/banexg/utils"
 	"github.com/go-viper/mapstructure/v2"
@@ -280,6 +281,16 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 		}
 		if pit, ok := u.Data["pit_policy"].(string); ok && len(c.Chunks) > 0 && pit != "available-at" && pit != "strict" {
 			return nil, fmt.Errorf("data.pit_policy: unsupported archive visibility policy %q", pit)
+		}
+		explicitFundingSource := false
+		for key := range policy.Factor {
+			if strings.EqualFold(strings.ReplaceAll(key, "_", ""), "fundingsource") {
+				explicitFundingSource = true
+				break
+			}
+		}
+		if mode != runner.Trade && len(c.Chunks) == 0 && (c.Manifest.Costs.FundingPolicy == "required-stream" || c.Manifest.Costs.FundingPolicy == "storage") && c.FundingSource == "" && !explicitFundingSource {
+			c.FundingSource = orm.SeriesSourceFundingRate
 		}
 		if mode != runner.Trade && len(c.Chunks) > 0 && inspectArchive {
 			if err := deriveArchiveIdentity(&c); err != nil {

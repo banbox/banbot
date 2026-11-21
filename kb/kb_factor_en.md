@@ -27,7 +27,7 @@ Entry points: cross-symbol ranking/neutralization/multi-factor/unified rebalanci
 | `chunks` | `[{path, from, to}]`, `from/to` in ms, 0 = use the EventTime range within the archive; batches whose `max(EventTime, AvailableAt)` (for receive-type sources such as price/funding, also IngestedAt) falls in `[from,to]` are replayed; multiple chunks must be strictly increasing and non-overlapping |
 | `definition` | Registered Go definition name; mutually exclusive with `expressions`/`Plan` (explicitly writing both reports `mutually exclusive`) |
 | `prices` | `{source, timeframe, field}` fill/valuation price stream, see 1.7 |
-| `funding_source` | Funding stream source name (required for `required-stream`; storage replay subscribes `{funding_source, event, rate}`) |
+| `funding_source` | Funding stream source name (in storage replay, `storage`/`required-stream` defaults to built-in `"funding_rate"` when omitted and subscribes `rate` at its configured timeframe; archive `required-stream` requires an explicit source or auto-derives `funding`) |
 | `option_expiry_source` `terminal_settlement_source` | Option expiry / terminal settlement stream sources, see 7.2 |
 | `pit_min_universe_ratio` `pit_delist_penalty_bps` | Backtest PIT parameters: `pit_min_universe_ratio` (<= 1, 0 = default 0.5, < 0 disables the PIT reduction) is the share of Investable symbols that must remain in one round, relative to the survivors at the last accepted decision (rolling, nominal pool for the first one); `pit_delist_penalty_bps` (finite, 0 = default 100, < 0 off) is the extra adverse penalty in bp when a held symbol is closed by a drop, refunded and replaced by the worse-of-gap price if its data returns |
 | `initial_nav` | Strategy initial NAV (positive); defaults to `wallet_amounts[manifest.currency]`, else 10000; then multiplied by `capital_weight` |
@@ -55,7 +55,7 @@ Validation behavior:
 
 `execution`:
 - `mode`: backtest only accepts `weights`/`events` (default `events`; CLI `--mode` overrides; mixed time-series/factor must use events).
-- `funding_policy`: `explicit-zero` (explicitly ignore funding) or `required-stream` (requires `funding_source`), written to `manifest.costs.funding_policy`; for archive replay when undeclared, if the archive contains a `funding` source it automatically becomes `required-stream` + `funding_source=funding`, otherwise `explicit-zero` must be declared; storage replay must declare explicitly.
+- `funding_policy`: `explicit-zero` (explicitly ignore funding), `required-stream`, or `storage` (storage replay only; reads settled funding records from built-in `funding_rate_8h` by default to settle bilateral long/short funding), written to `manifest.costs.funding_policy`; for archive replay when undeclared, if the archive contains a `funding` source it automatically becomes `required-stream` + `funding_source=funding`, otherwise `explicit-zero` must be declared; storage replay must explicitly declare `explicit-zero`, `required-stream`, or `storage`.
 - `paper_fill_model`: `midpoint` (default), `bid-ask`, `mid-entry-market-exit`; Events only; strategies on the same account must agree. `midpoint` takes the midpoint of `bid`/`ask` (default = price) rounded down to `price_tick`, which must lie within the bid/ask, so with no spread the price must be an integer multiple of `price_tick` (otherwise `no quote-compatible midpoint tick`); `bid-ask` types require visible finite `bid`/`ask`, rejected if missing.
 - `order_mode`: `local` (default) | `exchange_first`; `protection_mode`: `software` | `native_preferred` (by default only `exchange_first` prefers native); `near_limit_bps` in [0,10000], 0 is treated as 10.
 - `store` + `sender_lease_dir`: Events persistent paper ledger (SQLite), must be paired; `history` see 7.3; `live_provider`, `hub_socket` see 7.4.
@@ -343,7 +343,7 @@ The entry program must `import _` this package.
 type Numeric struct { Value float64; Validity Validity }  // Valid, Missing, Null, NotNumeric, NonFinite, Warmup
 func Number(values map[string]any, field string) Numeric
 func Field(source, field, timeframe string) *Node
-func AsOfField(source, field, sourceTF, decisionTF string, maxAge int64) *Node
+func AsOfField(source, field, sourceTF, decisionTF string, maxAge int64) *Node // e.g. AsOfField("funding_rate", "rate", "8h", c.TimeFrame, 12*3600*1000)
 func Constant(v float64, tf string) *Node
 func Add/Sub/Mul/Div/Pow/Min/Max(a, b *Node) *Node
 func Neg/Abs/Log/Sqrt/Positive(x *Node) *Node

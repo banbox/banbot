@@ -20,7 +20,7 @@
 |------|------|
 | `data.go` | 全局 `Default` 交易所、`exgMap` 缓存、`allowedExgIDs`（binance/okx/bybit/china）与 `IsAllowedExgID` |
 | `biz.go` | `Setup`、`NewForRuntime`、`createConfigured`（config→options）、`GetWith`（缓存）、`Prec*`、`GetLeverage`、`GetOdBook`、`GetTickers24Hr` |
-| `ext.go` | `BotExchange` 包装类型、`getExchangeCapability[T]` 泛型解包、下单回调（`SetOrderCallback` / 旧全局 `AfterCreateOrder`）、`FetchOHLCVArchive` 转发 |
+| `ext.go` | `BotExchange` 包装类型、`getExchangeCapability[T]` 泛型解包、下单回调（`SetOrderCallback` / 旧全局 `AfterCreateOrder`）、`FetchOHLCVArchive` 与 `FetchFundingRateArchive` 转发 |
 | `symbol.go` | 符号解析：`ResolvePriceSymbol`、`ResolveRuntimePriceSymbol`、`NewPriceSymbolParser*`、`NewLegacyPriceSymbolParser` |
 | `client_order.go` | client order id：`BuildClientOrderID`（兼容，失败回落 banexg 旧格式）、`BuildClientOrderIDChecked`（严格） |
 | `order_events.go` | `OrderEventCapability` 获取与 `RequireOrderEventCapability`（实盘严格模式） |
@@ -59,6 +59,7 @@
 | `ClientOrderCapability` | banexg/client_order.go，exg/client_order.go 别名 | 生成 client order id | `binance`、`okx`、`bybit` |
 | `OrderEventCapability` | exg/order_events.go（banexg/order_event.go 提供默认实现） | 解析 client id、订单事件 id、订单时间戳 | `binance`、`okx`、`bybit` 提供 Parse/Build 等方法 |
 | `OHLCVArchiveFetcher` | banexg/intf.go:13 | 按归档读取 K 线 | `binance`（binance/vision.go） |
+| `FundingRateArchiveFetcher` | banexg/intf.go:21 | 按归档读取永续合约历史资金费率 | `binance`（binance/vision.go，月度 `fundingRate` zip） |
 | `AccountDownloadCapability` | exg/account_download.go:12 | 异步账户导出 | **未见任何实现** |
 | `ArchiveURLCapability` | exg/account_download.go:71 | 构造归档下载 URL | **未见任何实现** |
 

@@ -525,6 +525,9 @@ func (r *dbSeriesRepo) QuerySeriesRange(ctx context.Context, info *SeriesInfo, s
 	}
 	rows, err_ := q.db.Query(ctx, sqlText, args...)
 	if err_ != nil {
+		if !q.isQuestDB() && strings.Contains(err_.Error(), "SQLSTATE 42P01") {
+			return nil, nil
+		}
 		return nil, NewDbErr(core.ErrDbReadFail, err_)
 	}
 	defer rows.Close()

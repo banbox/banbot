@@ -68,7 +68,8 @@
 | 文件 | 作用 |
 |---|---|
 | series_source.go | `DataSource` 接口、`SeriesRuntime` / `SeriesPlan`、覆盖范围补齐（`EnsureSeriesRange`）、数据源激活 |
-| source_catalog.go | `DataSourceCatalog`：数据源注册、工厂、状态；按 Runtime 生成独立实例 |
+| source_catalog.go | `DataSourceCatalog`：数据源注册、工厂、状态；按 Runtime 生成独立实例并绑定 `RuntimeDeps`（`RuntimeDepsBinder`、`HistoryDownloadController`） |
+| funding_rate_source.go | 内置永续合约资金费率数据源 `FundingRateDataSource`（`funding_rate`，默认 `8h`，表 `funding_rate_8h`，字段 `rate`）：优先通过 `exg.FetchFundingRateArchive` 拉取月度归档、近月回退 `FetchFundingRateHistory`，以 `EndMS=结算时刻` 落库避免前视，遵循 `NetDisable` 与 `bt_no_kline_download` |
 | func_source.go | 用函数回调注册数据源（`FuncDataSource`，`RegisterFuncDataSource`） |
 | source_helpers.go | 订阅字段规范化、JSON 数值解析 |
 | history_page.go | 分页历史读取（`PagedHistorySource`、`ReadSourceHistory`、`ensurePagedSeriesRange`） |
@@ -96,7 +97,7 @@
 
 | 名称 | 位置 | 要点 |
 |---|---|---|
-| `SeriesField` / `SeriesBinding` / `SeriesInfo` | orm/series.go:13 / :62 / :70 | 字段名、类型（float/int/string/bool/json）；`SeriesInfo` 含 Name、TimeFrame、Binding。`NewSeriesInfo(name,tf,fields)` 默认表名 `name_tf`，列 ts/end_ms/sid |
+| `SeriesField` / `SeriesBinding` / `SeriesInfo` | orm/series.go:13 / :62 / :70 | 字段名、类型（float/int/string/bool/json）；`SeriesInfo` 含 Name、TimeFrame、Binding。`NewSeriesInfo(name,tf,fields)` 默认表名 `name_tf`，列 ts/end_ms/sid；内置常量 `SeriesSourceKline`（`kline`）与 `SeriesSourceFundingRate`（`funding_rate`，默认 `DefaultFundingRateTF="8h"`，`NewFundingRateSeriesInfo`） |
 | `DataRecord` | orm/series.go:97 | 持久行：Sid、TimeMS、EndMS、Closed、Values。时间为毫秒，区间 `[TimeMS, EndMS)` |
 | `DataSeries` | orm/series.go:105 | 运行时事件：Source、Sid、时间区间、TimeFrame、Closed、IsWarmUp、`Values map[string]any`、ExSymbol、Adj |
 | `SeriesStore` | orm/series_store.go:12 | 通用门面：Write/WriteBatch、WriteSeries/WriteSeriesBatch、Read、Missing、FillMissing、Coverage、UpdateCoverage、Delete |
@@ -157,8 +158,9 @@
 
 ### 4. 历史补齐（data 侧）
 
-- `EnsureRuntimeSeriesRange` / `ensureSeriesSubsRange`（data/series_source.go:583）：有分页或字节预算时走 `ensurePagedSeriesRange`（history_page.go:78），即 `ReadSourceHistory` 分页、`store.WriteBatch`、`UpdateCoverage`；否则走 `FillMissing`。
+- `EnsureRuntimeSeriesRange` / `ensureSeriesSubsRange`（data/series_source.go:583）：当数据源实现 `HistoryDownloadController` 且 `AllowHistoryDownload()` 为假（如 `NetDisable` 或 `bt_no_kline_download`）时跳过远端拉取与空覆盖写入，仅读本地已存数据；有分页或字节预算时走 `ensurePagedSeriesRange`（history_page.go:78），即 `ReadSourceHistory` 分页、`store.WriteBatch`、`UpdateCoverage`；否则走 `FillMissing`。
 - `EnsureSeriesRange`（series_source.go:701）：校验 source 与 TF、计算缺口、`FetchHistory`、归一化 Sid、写入、更新覆盖。
+- 内置 `funding_rate` 数据源（data/funding_rate_source.go）：进程启动时默认通过 `RegisterDataSourceFactory` 注册到目录，每个 `Runtime` 获得独立实例并绑定 `RuntimeDeps`；支持 `./bot series list` 与 `./bot series down -tables funding_rate ...`。每条结算记录的区间为 `[TimeMS, EndMS)`，`EndMS` 等于交易所结算时间戳 `Timestamp`，仅在结算时刻及之后对回测与因子快照可见。
 - 显式补齐 CLI：`./bot series list`、`./bot series down -pairs ... -tables ... -timestart ... -timeend ...`（data 的 `series down` 按 source 名过滤）。
 
 ### 5. 回测回放

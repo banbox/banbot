@@ -25,6 +25,10 @@ func ValidateStaticConfig(c Config) error {
 	return validateReplayConfig(c, false, false)
 }
 
+func isStreamFundingPolicy(policy string) bool {
+	return policy == "required-stream" || policy == "storage"
+}
+
 func validateReplayConfig(c Config, requireExecutionMetadata, checkInputs bool) error {
 	if err := c.Execution.PaperFillModel.Validate(); err != nil {
 		return err
@@ -45,10 +49,13 @@ func validateReplayConfig(c Config, requireExecutionMetadata, checkInputs bool) 
 		return errors.New("runner: events/trade require tick or 1m observable prices")
 	}
 	archiveFundingPending := !checkInputs && len(c.Chunks) > 0 && c.Manifest.Costs.FundingPolicy == ""
-	if !archiveFundingPending && c.Manifest.Costs.FundingPolicy != "explicit-zero" && c.Manifest.Costs.FundingPolicy != "required-stream" {
-		return errors.New("runner: funding must be required-stream or explicit-zero")
+	if !archiveFundingPending && c.Manifest.Costs.FundingPolicy != "explicit-zero" && !isStreamFundingPolicy(c.Manifest.Costs.FundingPolicy) {
+		return errors.New("runner: funding must be required-stream, storage or explicit-zero")
 	}
-	if c.Manifest.Costs.FundingPolicy == "required-stream" && c.FundingSource == "" {
+	if c.Manifest.Costs.FundingPolicy == "storage" && len(c.Chunks) > 0 && c.HistoricalInput == nil {
+		return errors.New("runner: storage funding policy requires historical storage input")
+	}
+	if isStreamFundingPolicy(c.Manifest.Costs.FundingPolicy) && c.FundingSource == "" {
 		return errors.New("runner: required funding stream absent")
 	}
 	for _, label := range c.Manifest.Labels {

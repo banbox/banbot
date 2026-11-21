@@ -2,11 +2,14 @@ package biz
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"maps"
 	"math"
 	"slices"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
@@ -77,6 +80,11 @@ type runtimeOrderConfig struct {
 	accountMaxOpenOrders int
 }
 
+type fundingRatePoint struct {
+	atMS int64
+	rate float64
+}
+
 type OrderMgr struct {
 	callBack    func(order *ormo.InOutOrder, isEnter bool)
 	afterEnter  FuncHandleIOrder
@@ -95,6 +103,12 @@ type OrderMgr struct {
 	BarMS       int64
 	simulOpen   int // Simultaneously open number in the current bar
 	simulOpenSt map[string]int
+
+	fundingMu       sync.Mutex
+	fundingRepo     orm.SeriesRepo
+	fundingLoaded   map[string]bool
+	fundingStored   map[string][]fundingRatePoint
+	fundingStreamed map[string][]fundingRatePoint
 }
 
 func accountMaxOpenOrders(accounts map[string]*config.AccountConfig, account string) int {
@@ -464,7 +478,7 @@ func (o *OrderMgr) updateOrderFee(od *ormo.InOutOrder, price float64, forEnter b
 	if o == nil || !o.runtimeDeps {
 		err := od.UpdateFee(price, forEnter)
 		if err == nil && !forEnter && od.Exit != nil && o != nil && core.BackTestMode {
-			addApproxFunding(od, config.Data.BTFundingApr, core.IsContract, core.Market == banexg.MarketInverse, o.priceNow())
+			o.settleBacktestFunding(od, config.Data.BTFundingApr, core.IsContract, core.Market == banexg.MarketInverse, o.priceNow())
 		}
 		return err
 	}
@@ -495,10 +509,214 @@ func (o *OrderMgr) updateOrderFee(od *ormo.InOutOrder, price float64, forEnter b
 	} else {
 		od.DirtyExit = true
 		if o.isBacktest() {
-			addApproxFunding(od, o.runtimeCfg.fundingApr, o.isContract(), o.marketType() == banexg.MarketInverse, o.priceNow())
+			o.settleBacktestFunding(od, o.runtimeCfg.fundingApr, o.isContract(), o.marketType() == banexg.MarketInverse, o.priceNow())
 		}
 	}
 	return nil
+}
+
+// RecordFundingSeries records a non-warmup settled funding_rate event observed
+// during backtest replay so OrderMgr can settle exact bilateral funding even
+// when series events are fed directly without a backing database.
+func (o *OrderMgr) RecordFundingSeries(symbol string, evt *orm.DataSeries) {
+	if o == nil || !o.isBacktest() || evt == nil || evt.IsWarmUp || symbol == "" {
+		return
+	}
+	rate, ok := evt.FloatValueDefault("rate")
+	if !ok || math.IsNaN(rate) || math.IsInf(rate, 0) {
+		return
+	}
+	atMS := evt.EndMS
+	if atMS <= 0 {
+		atMS = evt.TimeMS
+	}
+	if atMS <= 0 {
+		return
+	}
+	o.fundingMu.Lock()
+	defer o.fundingMu.Unlock()
+	if o.fundingStreamed == nil {
+		o.fundingStreamed = make(map[string][]fundingRatePoint)
+	}
+	pts := o.fundingStreamed[symbol]
+	if n := len(pts); n > 0 && pts[n-1].atMS == atMS {
+		pts[n-1].rate = rate
+		return
+	}
+	o.fundingStreamed[symbol] = append(pts, fundingRatePoint{atMS: atMS, rate: rate})
+}
+
+func (o *OrderMgr) symbolFundingPoints(symbol string) ([]fundingRatePoint, bool) {
+	if o == nil || symbol == "" {
+		return nil, false
+	}
+	o.fundingMu.Lock()
+	if o.fundingLoaded == nil {
+		o.fundingLoaded = make(map[string]bool)
+	}
+	if o.fundingStored == nil {
+		o.fundingStored = make(map[string][]fundingRatePoint)
+	}
+	loaded := o.fundingLoaded[symbol]
+	repo := o.fundingRepo
+	o.fundingMu.Unlock()
+
+	if !loaded {
+		var stored []fundingRatePoint
+		if repo == nil && o.runtimeDeps && o.walletDeps.Storage != nil {
+			repo = orm.NewSeriesRepo(o.walletDeps.Storage)
+		}
+		if repo != nil {
+			if exs, err := o.exSymbolCur(symbol); err == nil && exs != nil && exs.ID > 0 {
+				var startMS int64 = 0
+				var endMS int64 = math.MaxInt64 / 2
+				if cfg := o.walletDeps.ConfigView(); cfg != nil && cfg.TimeRange != nil {
+					if cfg.TimeRange.StartMS > 8*3600*1000 {
+						startMS = cfg.TimeRange.StartMS - 8*3600*1000
+					}
+					if cfg.TimeRange.EndMS > 0 {
+						endMS = cfg.TimeRange.EndMS + 8*3600*1000
+					}
+				}
+				info := orm.NewFundingRateSeriesInfo(orm.DefaultFundingRateTF)
+				if rows, qErr := repo.QuerySeriesRange(context.Background(), info, exs.ID, startMS, endMS, 0); qErr == nil && len(rows) > 0 {
+					stored = make([]fundingRatePoint, 0, len(rows))
+					for _, row := range rows {
+						if row == nil {
+							continue
+						}
+						rate, ok := extractFundingRateFloat(row.Values["rate"])
+						if !ok {
+							continue
+						}
+						atMS := row.EndMS
+						if atMS <= 0 {
+							atMS = row.TimeMS
+						}
+						if atMS > 0 {
+							stored = append(stored, fundingRatePoint{atMS: atMS, rate: rate})
+						}
+					}
+				}
+			}
+		}
+		o.fundingMu.Lock()
+		o.fundingLoaded[symbol] = true
+		o.fundingStored[symbol] = stored
+		o.fundingMu.Unlock()
+	}
+
+	o.fundingMu.Lock()
+	stored := o.fundingStored[symbol]
+	streamed := o.fundingStreamed[symbol]
+	if len(stored) == 0 && len(streamed) == 0 {
+		o.fundingMu.Unlock()
+		return nil, false
+	}
+	merged := mergeFundingRatePoints(stored, streamed)
+	o.fundingMu.Unlock()
+	return merged, len(merged) > 0
+}
+
+func extractFundingRateFloat(raw any) (float64, bool) {
+	switch v := raw.(type) {
+	case float64:
+		return v, !math.IsNaN(v) && !math.IsInf(v, 0)
+	case float32:
+		f := float64(v)
+		return f, !math.IsNaN(f) && !math.IsInf(f, 0)
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	default:
+		return 0, false
+	}
+}
+
+func mergeFundingRatePoints(a, b []fundingRatePoint) []fundingRatePoint {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		cp := append([]fundingRatePoint(nil), b...)
+		sort.SliceStable(cp, func(i, j int) bool { return cp[i].atMS < cp[j].atMS })
+		return dedupeFundingRatePoints(cp)
+	}
+	cp := make([]fundingRatePoint, 0, len(a)+len(b))
+	cp = append(cp, a...)
+	cp = append(cp, b...)
+	sort.SliceStable(cp, func(i, j int) bool { return cp[i].atMS < cp[j].atMS })
+	return dedupeFundingRatePoints(cp)
+}
+
+func dedupeFundingRatePoints(pts []fundingRatePoint) []fundingRatePoint {
+	out := pts[:0]
+	for _, pt := range pts {
+		if len(out) > 0 && out[len(out)-1].atMS == pt.atMS {
+			out[len(out)-1] = pt
+			continue
+		}
+		out = append(out, pt)
+	}
+	return out
+}
+
+// settleBacktestFunding settles bilateral perpetual funding over (enterMS, exitMS]
+// when real funding_rate data is available for od.Symbol (long pays positive rate
+// and receives negative rate; short receives positive rate and pays negative rate).
+// When no funding_rate series exists for the symbol, it falls back to addApproxFunding.
+func (o *OrderMgr) settleBacktestFunding(od *ormo.InOutOrder, aprPct float64, contract, inverse bool, nowMS int64) {
+	if !contract || od == nil || od.Enter == nil || od.Exit == nil {
+		return
+	}
+	if inverse {
+		if pts, ok := o.symbolFundingPoints(od.Symbol); ok && len(pts) > 0 || aprPct > 0 && !od.Short {
+			od.SetInfo("funding_skipped", "inverse")
+		}
+		return
+	}
+	pts, hasReal := o.symbolFundingPoints(od.Symbol)
+	if !hasReal {
+		addApproxFunding(od, aprPct, contract, inverse, nowMS)
+		return
+	}
+	enterMS := od.RealEnterMS()
+	exitMS := od.Exit.UpdateAt
+	if exitMS <= enterMS {
+		exitMS = nowMS
+	}
+	if exitMS <= enterMS {
+		return
+	}
+	entryPrice := od.Enter.Average
+	if entryPrice <= 0 {
+		entryPrice = od.InitPrice
+	}
+	notional := entryPrice * od.Enter.Filled
+	if notional <= 0 {
+		return
+	}
+	signedNotional := notional
+	if od.Short {
+		signedNotional = -notional
+	}
+	startIdx := sort.Search(len(pts), func(i int) bool { return pts[i].atMS > enterMS })
+	var totalCost float64
+	crossed := 0
+	for i := startIdx; i < len(pts) && pts[i].atMS <= exitMS; i++ {
+		totalCost += signedNotional * pts[i].rate
+		crossed++
+	}
+	od.SetInfo("funding_mode", "real")
+	if crossed == 0 || totalCost == 0 {
+		od.SetInfo("funding", 0.0)
+		return
+	}
+	od.Exit.Fee += totalCost
+	od.Exit.FeeQuote += totalCost
+	od.DirtyExit = true
+	od.SetInfo("funding", totalCost)
 }
 
 // addApproxFunding (055) charges a constant-rate funding cost on the exit leg of a LONG contract order:

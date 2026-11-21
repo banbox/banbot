@@ -122,6 +122,14 @@ func (e *LegacyExchange) FetchOHLCVArchive(ctx context.Context, symbol, timefram
 	return fetcher.FetchOHLCVArchive(ctx, symbol, timeframe, startMS, endMS)
 }
 
+func (e *LegacyExchange) FetchFundingRateArchive(ctx context.Context, symbol string, startMS, endMS int64) ([]*banexg.FundingRate, bool, *errs.Error) {
+	fetcher, ok := e.BanExchange.(banexg.FundingRateArchiveFetcher)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchFundingRateArchive(ctx, symbol, startMS, endMS)
+}
+
 func IsLegacyExchange(exchange banexg.BanExchange) bool {
 	_, ok := exchange.(*LegacyExchange)
 	return ok

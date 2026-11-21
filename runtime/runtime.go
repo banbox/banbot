@@ -978,6 +978,9 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		schedulerClaimReleased = true
 		return nil, fmt.Errorf("runtime: bind dependencies: %w", bindErr)
 	}
+	if runtime.Catalog != nil {
+		runtime.Catalog.BindRuntimeDeps(runtime.DataDeps())
+	}
 	runtime.Notifications = biz.NewRuntimeNotifications(runtime.BizDeps())
 	runtime.OnClose(runtime.Notifications.Stop)
 	runtime.OnCloseWait(runtime.Notifications.Join)

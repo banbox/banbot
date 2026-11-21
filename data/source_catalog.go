@@ -21,6 +21,19 @@ type DataSourceCatalog struct {
 // Use it for stateful providers; direct registrations are legacy-only.
 type DataSourceFactory func() DataSource
 
+// RuntimeDepsBinder allows runtime-scoped built-in data sources to bind
+// explicit Runtime dependencies without consulting process-global state.
+type RuntimeDepsBinder interface {
+	BindRuntimeDeps(deps *RuntimeDeps)
+}
+
+// HistoryDownloadController allows a DataSource to report whether remote
+// history backfill is currently disabled (for example NetDisable or
+// bt_no_kline_download), so storage readers use existing local data only.
+type HistoryDownloadController interface {
+	AllowHistoryDownload() bool
+}
+
 func NewDataSourceCatalog() *DataSourceCatalog {
 	return &DataSourceCatalog{
 		sources:   make(map[string]DataSource),
@@ -134,6 +147,25 @@ func (c *DataSourceCatalog) GetDataSource(name string) DataSource {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.sources[name]
+}
+
+// BindRuntimeDeps binds explicit Runtime dependencies to every registered
+// source in this catalog that implements RuntimeDepsBinder.
+func (c *DataSourceCatalog) BindRuntimeDeps(deps *RuntimeDeps) {
+	if c == nil {
+		return
+	}
+	c.mu.RLock()
+	sources := make([]DataSource, 0, len(c.sources))
+	for _, src := range c.sources {
+		sources = append(sources, src)
+	}
+	c.mu.RUnlock()
+	for _, src := range sources {
+		if binder, ok := src.(RuntimeDepsBinder); ok {
+			binder.BindRuntimeDeps(deps)
+		}
+	}
 }
 
 func (c *DataSourceCatalog) ListDataSources() []string {

@@ -27,7 +27,7 @@
 | `chunks` | `[{path, from, to}]`，`from/to` 毫秒，0=取档内 EventTime 范围；按 `max(EventTime, AvailableAt)`（价格/资金费等接收型源再取 IngestedAt）落入 `[from,to]` 的批次重放；多 chunk 须严格递增不重叠 |
 | `definition` | 已注册 Go 定义名；与 `expressions`/`Plan` 互斥（显式写出则报 `mutually exclusive`） |
 | `prices` | `{source, timeframe, field}` 成交/估值价格流，见 1.7 |
-| `funding_source` | 资金费流 source 名（`required-stream` 必填；存储回放订阅 `{funding_source, event, rate}`） |
+| `funding_source` | 资金费流 source 名（存储回放下 `storage`/`required-stream` 未显式指定时默认内置 `"funding_rate"`，按对应周期订阅 `rate` 字段；归档 `required-stream` 必填或自动推导 `funding`） |
 | `option_expiry_source` `terminal_settlement_source` | 期权到期 / 终局结算流 source，见 7.2 |
 | `pit_min_universe_ratio` `pit_delist_penalty_bps` | 回测 PIT 参数：`pit_min_universe_ratio`（≤1，0=默认 0.5，<0 关闭 PIT 缩减）为一轮内至少保留的 Investable 比例，分母是上一次被接受决策时的存活数（滚动，首个决策用名义池）；`pit_delist_penalty_bps`（有限数，0=默认 100，<0 关）为被剔持仓平仓时额外的不利惩罚 bp，数据恢复则退回并改按缺口前后更差价计价 |
 | `initial_nav` | 策略初始 NAV（正数）；缺省 `wallet_amounts[manifest.currency]`，无则 10000；再乘 `capital_weight` |
@@ -55,7 +55,7 @@
 
 `execution`：
 - `mode`：回测只接受 `weights`/`events`（缺省 `events`；CLI `--mode` 覆盖；混合时序/因子必须 events）。
-- `funding_policy`：`explicit-zero`（显式忽略资金费）或 `required-stream`（需 `funding_source`），写入 `manifest.costs.funding_policy`；归档回放未声明时档内有 `funding` source 则自动 `required-stream`+`funding_source=funding`，否则须声明 `explicit-zero`；存储回放必须显式声明。
+- `funding_policy`：`explicit-zero`（显式忽略资金费）、`required-stream` 或 `storage`（仅存储回放，默认从内置 `funding_rate_8h` 表读取结算记录驱动多空双向资金费结算），写入 `manifest.costs.funding_policy`；归档回放未声明时档内有 `funding` source 则自动 `required-stream`+`funding_source=funding`，否则须声明 `explicit-zero`；存储回放须显式声明 `explicit-zero`、`required-stream` 或 `storage`。
 - `paper_fill_model`：`midpoint`（默认）、`bid-ask`、`mid-entry-market-exit`；仅 Events；同账户策略须一致。`midpoint` 取 `bid`/`ask`（缺省=price）中点向下取整到 `price_tick`，须在买卖价内，故无价差时价格须是 `price_tick` 整数倍（否则 `no quote-compatible midpoint tick`）；`bid-ask` 类须有可见有限的 `bid`/`ask`，缺失则拒绝。
 - `order_mode`：`local`（默认）|`exchange_first`；`protection_mode`：`software`|`native_preferred`（缺省仅 `exchange_first` 偏向 native）；`near_limit_bps`∈[0,10000]，0 视为 10。
 - `store` + `sender_lease_dir`：Events 持久化纸面账本（SQLite），必须成对；`history` 见 7.3；`live_provider`、`hub_socket` 见 7.4。
@@ -343,7 +343,7 @@ func init() {
 type Numeric struct { Value float64; Validity Validity }  // Valid, Missing, Null, NotNumeric, NonFinite, Warmup
 func Number(values map[string]any, field string) Numeric
 func Field(source, field, timeframe string) *Node
-func AsOfField(source, field, sourceTF, decisionTF string, maxAge int64) *Node
+func AsOfField(source, field, sourceTF, decisionTF string, maxAge int64) *Node // 例：AsOfField("funding_rate", "rate", "8h", c.TimeFrame, 12*3600*1000)
 func Constant(v float64, tf string) *Node
 func Add/Sub/Mul/Div/Pow/Min/Max(a, b *Node) *Node
 func Neg/Abs/Log/Sqrt/Positive(x *Node) *Node

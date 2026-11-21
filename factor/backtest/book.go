@@ -191,6 +191,15 @@ func (b *Book) ApplyFunding(f Funding, now int64) error {
 // settlements in an immutable, non-overlapping chunk.
 func (b *Book) EndChunk() { clear(b.fundingIDs) }
 
+// HasMark reports whether a valuation quote has been recorded for sid.
+func (b *Book) HasMark(sid int32) bool {
+	if b == nil {
+		return false
+	}
+	_, ok := b.marks[sid]
+	return ok
+}
+
 // Liquidate closes every position at its last mark and writes the account off: NAV is 0 from here on (the part of a
 // negative NAV below zero is not carried: limited liability, same as the single-account liquidation). It returns the
 // NAV before the write-off. Nothing is traded afterwards; the runner stops deciding. Fees and slippage of the forced

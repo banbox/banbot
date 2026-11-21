@@ -122,7 +122,7 @@
 - 限价超时：:396-412 按 `OdInfoStopAfter` 调 `localExit`（`ExitTagEntExp`）。
 - 回调三处触发：fillPendingEnter、fillPendingExit、tryFillTriggers → `callBack(od, isEnter)` 与 `strat.FireOdChange`（odmgr.go:619）。
 - 滑点：`LocalOrderMgr.ohlcProfile()` 按 `bt_slippage_bps` 构造 `OHLCProfile.SlippageBps`；市价单、市价止损入场、止损/止盈出场及强平类出场（`ExitAndFill`）按不利方向加滑点，止损不优于开盘跳空价；限价单不加滑点。
-- 资金费：`updateOrderFee` 在回测出场腿调用 `addApproxFunding`，对多头合约单按 `bt_funding_apr` 计 入场名义 × 年化 × 持仓年数，加入 `Exit.Fee/FeeQuote`，并写入订单 info `funding`；反向合约不计，标 `funding_skipped=inverse`，空头不计。
+- 资金费：`updateOrderFee` 在回测出场腿调用 `settleBacktestFunding`。当标的在存储表 `funding_rate_8h` 或回放流中存在真实 `funding_rate` 结算记录时，按持仓跨越的 `(RealEnterMS, ExitMS]` 结算点双向计费（多头正费率扣款、负费率收款；空头正费率收款、负费率扣款），计入 `Exit.Fee/FeeQuote` 并写订单 info `funding` 与 `funding_mode=real`；当无 `funding_rate` 数据时回退 `addApproxFunding`，对多头合约单按 `bt_funding_apr` 计 入场名义 × 年化 × 持仓年数，空头不计；反向合约一律跳过并标 `funding_skipped=inverse`。
 - 数据空洞与退市（`bt_gap_bars>0` 且非实盘）：`Trader.feedClosedSeries` 在登记新 bar 价格前调用 `guardBarGap`——上一根 bar 结束到新 bar 开始的缺口同时超过 `bt_gap_bars` 个周期与 `bt_gap_min_hours`（默认 48）小时时，该标的未平订单以最后已知价格强平（tag `data_gap`）；`sweepDelistedAll` 每 6 小时模拟时间扫描一次，按同一规则把数据已终止的标的强平（tag `delist`），`CleanUp` 开头也会执行。`delist` 成交时间取该标的最后有效 bar 的时间（`PriceState.GetLastBarTimeAt`），保证金、持仓时长与 `max_open_orders` 槽位随之释放；`data_gap` 在数据恢复时触发，成交时间为 `min(最后 bar + 确认延迟, 恢复时间)`（`gapFillTime`；确认延迟 = `max(bt_gap_bars×周期, bt_gap_min_hours)`），不早于最后 bar。成交价由 `applyExitPolicy` 决定：`data_gap` 取最后收盘价与缺口后首根开盘价中对持仓更差者（`ExitReq.GapNextOpen/GapRecoverMS`），`delist` 取最后收盘价再按 `bt_delist_penalty_bps` 向不利方向偏移；之后仍叠加 `bt_slippage_bps`。
 - 入场后伪时间 +1ms（`makeLocalAfterEnter`，:919-931），防止同 key 钱包扣款冲突。
 

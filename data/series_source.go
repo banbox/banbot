@@ -733,6 +733,20 @@ func ensureSeriesRangeWithRepo(catalog *DataSourceCatalog, ctx context.Context, 
 	if sub.Source != "" && sub.Source != info.Name {
 		return errs.NewMsg(core.ErrBadConfig, "sub source %s does not match data source %s", sub.Source, info.Name)
 	}
+	if ctrl, ok := src.(HistoryDownloadController); ok && !ctrl.AllowHistoryDownload() {
+		if catalog != nil {
+			catalog.markDataSourceBackfill(info.Name, DataSourceOpStatus{
+				State:     "ok",
+				AtMS:      time.Now().UnixMilli(),
+				Sid:       sub.ExSymbol.ID,
+				TimeFrame: tf,
+				StartMS:   startMS,
+				EndMS:     endMS,
+				Rows:      0,
+			}, "")
+		}
+		return nil
+	}
 	store := orm.NewSeriesStore(repo)
 	if _, paged := src.(PagedHistorySource); paged || orm.SeriesReadByteLimit(ctx) > 0 {
 		return ensurePagedSeriesRange(catalog, ctx, store, src, sub, startMS, endMS)

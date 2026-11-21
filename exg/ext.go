@@ -119,3 +119,23 @@ func (e *BotExchange) FetchOHLCVArchive(ctx context.Context, symbol, timeframe s
 	}
 	return fetcher.FetchOHLCVArchive(ctx, symbol, timeframe, startMS, endMS)
 }
+
+func (e *BotExchange) FetchFundingRateArchive(ctx context.Context, symbol string, startMS, endMS int64) (
+	[]*banexg.FundingRate, bool, *errs.Error) {
+	fetcher, ok := e.BanExchange.(banexg.FundingRateArchiveFetcher)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchFundingRateArchive(ctx, symbol, startMS, endMS)
+}
+
+// FetchFundingRateArchive invokes the optional archive capability when the
+// underlying exchange adapter supports immutable historical funding files.
+func FetchFundingRateArchive(ctx context.Context, exchange banexg.BanExchange, symbol string, startMS, endMS int64) (
+	[]*banexg.FundingRate, bool, *errs.Error) {
+	fetcher, ok := getExchangeCapability[banexg.FundingRateArchiveFetcher](exchange)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchFundingRateArchive(ctx, symbol, startMS, endMS)
+}
