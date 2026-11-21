@@ -11,7 +11,7 @@ The single pipeline: **visible data → training (offline, frozen) → current-p
 | Training (caller Go code, reads training interval only) | β/α, residual scale, thresholds, holding period, candidate parameters |
 | Freeze (write YAML `params`, enters manifest hash; or ParameterArtifact/ModelArtifact) | Immutable parameters |
 | Signal (runner computes online each decision round) | Per-pair z-score, stateful position ±1/0 |
-| Target (`RegisterPairs` / `RegisterRollingPairs` builder outputs an immutable `factor.TargetPortfolio`: `ID()` is a content hash, `Targets()` returns a SID→NAV-fraction copy) | Target weights, diagnostic codes |
+| Target (`RegisterPairs` / `RegisterRollingPairs` / `RegisterBaskets` / `RegisterResidualStatArb` builder outputs an immutable `factor.TargetPortfolio`: `ID()` is a content hash, `Targets()` returns a SID→NAV-fraction copy) | Target weights, diagnostic codes |
 | Evidence (Weights/Events ledger and its output files) | Fills, fees, funding |
 
 Terms: `Y` is the explained leg (bought when going long the spread); `X` is the explanatory leg (sold when going long the spread); `z` = spread residual / residual standard deviation; `β` is the log-regression slope (elasticity); decision bar = the closed K-line corresponding to `run_timeframes`. Statistical functions do not read the clock, account, or exchange; data is passed in via `DataSeries.Values`, preserving type and NULL; missing values must be explicitly excluded and must not be treated as 0.
@@ -188,9 +188,9 @@ run_policy:
 
 **The Weights ledger charges for drift**: each time the ledger executes a target it recomputes quantity as `qty = w × spec.Budget.NAV / price` (NAV = ledger NAV at decision time, compounding with PnL), and charges `fee_rate`+`slippage_rate` on the difference from existing quantity. With `DriftBand == 0`, pairs output constant target weights every decision round, so **price drift during the holding period is rebalanced back to target weights every round and charged**; setting `DriftBand > 0` emits naturally drifted weights while inside the band to avoid unnecessary friction cost. Gross is a fraction of current NAV, not initial NAV. `research.Evaluate`'s `Costs = CostRate × Σ|w−w_prev|` counts only weight differences and excludes drift, a different basis from the ledger (`Result.Book` is the ledger basis). Whether the Events path also generates drift-rebalance fills is untested.
 
-### 2.7 Custom Paths (static β, multi-leg baskets)
+### 2.7 Custom Paths (external static β)
 
-Two-leg dynamic OLS, orthogonal TLS, Kalman filtering, price ratio, and return-difference models are supported natively via `SpreadModel` on `RegisterPairs` and `RegisterRollingPairs`; use the general interfaces only when injecting an **external static β** or trading **3+ leg Johansen baskets**:
+Online two-leg models are supported via `RegisterPairs` / `RegisterRollingPairs` (`SpreadModel`), 2..12 leg cointegrated baskets via `RegisterBaskets` (2.9), and cross-sectional PCA / benchmark-residual OU `s-score` portfolios via `RegisterResidualStatArb` (2.10); use the low-level interfaces only when injecting a custom state machine or offline static parameters:
 1. `runner.RegisterDefinition(name, func(c runner.Config) (*factor.Plan, research.ComboSpec, error))`: `factor.New().Add(name, node).Compile()` compiles log-price nodes (`factor.Field("kline", field, c.Factor.TimeFrame)` + `factor.Custom(version, inputs, fn)`, same form as `pairs-log-v1`), combined as `research.ComboSpec{Method: research.Equal, Columns: [...]}`.
 2. `runner.RegisterPortfolioFactory(name, func(c runner.Config) (runner.PortfolioBuilder, error), validator)`: the name must contain `-v`; the validator does pure parameter checks only and does not construct state.
 3. Builder: `func(frame factor.Frame, universe factor.Universe, spec factor.PortfolioSpec, def research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error)`; output `factor.NewTargetPortfolio(spec, weights)`, using the incoming `spec`.
@@ -275,6 +275,81 @@ runner.RegisterRollingPairs("rolling-coint", func(p *runner.Params) (runner.Roll
 })
 ```
 
+### 2.9 Multi-Leg Cointegrated Basket Strategy: `runner.RegisterBaskets`
+
+Declaratively trades 2..12 leg cointegrated baskets under definition `<name>` and bound portfolio factory `<name>-baskets-v1` (`BuildBasketsRegistration` constructs a pure `Registration` without mutating the global registry).
+
+```go
+type Registration struct {
+    Name, BuilderName string
+    Definition        DefinitionBuilder
+    Factory           PortfolioFactory
+    Validator         PortfolioValidator
+}
+func (r Registration) Register() error
+
+type BasketDef struct {
+    Name    string
+    Symbols []string  // 2..12 distinct non-empty symbols
+    Weights []float64 // explicit weights for WeightMethod "fixed" (normalized so sum_i |w_i| == 1)
+}
+type BasketsSpec struct {
+    Baskets              []BasketDef
+    Field                string                // kline field, default "close"
+    Window               int                   // rolling window in bars (>= d*(DifferenceLags+1)+3 for johansen)
+    WeightMethod         string                // "" ("fixed" when Weights non-empty else "johansen"), "fixed", "johansen", "multivariate_ols"
+    UseRawPrice          bool                  // true fits on raw prices and converts coefficients to dollar weights via beta_i*price_i
+    DifferenceLags       int                   // Johansen VECM difference lags (>=0, default 0)
+    RequireCointegration bool                  // true gates "johansen" entries via IsCointegrated(spec, Confidence)
+    Confidence           float64               // Johansen significance confidence {0.90, 0.95, 0.99}; 0 defaults to 0.95
+    MinHalfLife          float64               // optional entry FitOU DiscreteHalfLife floor (>=0)
+    MaxHalfLife          float64               // optional entry FitOU DiscreteHalfLife ceiling (>=0, 0 disables)
+    Band                 statistics.BandConfig // supports "reversion" and "momentum"
+    MaxHoldBars          int                   // sets Band.MaxHold when Band.MaxHold == 0 (>=0)
+    DynamicWeights       bool                  // default false (freeze entry weights and evaluate exit z on frozen combination); true updates dynamically
+    DriftBand            float64               // per-basket holding L1 weight drift buffer (>=0)
+    WeightMode           string                // ""/"equal" or "inverse_vol" (water-filling by 1/unitScaleStd)
+    GrossPerBasket       float64               // notional per open basket; 0 defaults to MaxGross/len(Baskets)
+    MaxGross             float64               // aggregate gross cap in (0,1]; 0 defaults to 1.0
+}
+func BuildBasketsRegistration(name string, spec BasketsSpec) (Registration, error)
+func RegisterBaskets(name string, spec BasketsSpec) error
+```
+
+- `"johansen"` uses `CointegratingVectors[0]` sign-stabilized so its first non-zero loading `beta[0] > 0`; `"multivariate_ols"` regresses centered leg `0` on centered legs `1..k-1` via `factor.LeastSquares` (with tiny ridge fallback when collinear) giving `[+1, -b_1, ..., -b_{k-1}]`.
+- Per-basket multi-leg returns and turnover report into `Result.Pairs` and reconcile with `PairsGrossPnL` / `PairsNAVReturn` / `PairsResidual`; missing legs mid-run close immediately with `leg_missing`, while `UnavailableSymbols` skip gracefully.
+
+### 2.10 Cross-Sectional PCA / Benchmark-Residual `s-score` Strategy: `runner.RegisterResidualStatArb`
+
+Implements Avellaneda & Lee (2010) cross-sectional residual mean-reversion over the point-in-time `Universe.Investable` with dollar-neutral and factor-beta-neutral portfolio construction under definition `<name>` and factory `<name>-residual-statarb-v1`.
+
+```go
+type ResidualStatArbSpec struct {
+    Field             string   // kline field, default "close"
+    FactorModel       string   // ""/"pca" (default) or "benchmarks"
+    Benchmarks        []string // explicit benchmark symbols (1..16, e.g. BTC/ETH) for FactorModel "benchmarks"
+    NumFactors        int      // principal components under "pca"; 0 defaults to 3
+    Window            int      // rolling 1-bar simple return regression window (>= max(6, factors+3); needs Window+1 prices)
+    OUWindow          int      // trailing cumulative residual FitOU window; 0 defaults to Window, in [4, Window]
+    MinHalfLife       float64  // FitOU DiscreteHalfLife floor on entry (>=0)
+    MaxHalfLife       float64  // FitOU DiscreteHalfLife ceiling on entry (>=0, 0 disables)
+    EntryS            float64  // enter long (+1) at s_i <= -EntryS, short (-1) at s_i >= +EntryS; 0 defaults to 1.25
+    ExitLongS         float64  // exit long at s_i >= -ExitLongS; 0 defaults to min(0.50, 0.5*EntryS)
+    ExitShortS        float64  // exit short at s_i <= +ExitShortS; 0 defaults to min(0.50, 0.5*EntryS)
+    StopS             float64  // stop-out at |s_i| >= StopS (0 disables, > EntryS when set)
+    MaxHoldBars       int      // max holding bars (0 disables)
+    WeightMode        string   // ""/"equal" (±1 desires) or "inverse_vol"/"inverse_sigma" (±1/sigma_eq desires)
+    TargetGross       float64  // target gross exposure in (0,1]; 0 defaults to 1.0
+    MaxWeightPerAsset float64  // per-asset |w_i| cap in [0,1] (alternating projection preserves neutrality; 0 disables)
+    DriftBand         float64  // portfolio L1 weight drift buffer when active positions are unchanged (>=0)
+}
+func BuildResidualStatArbRegistration(name string, spec ResidualStatArbSpec) (Registration, error)
+func RegisterResidualStatArb(name string, spec ResidualStatArbSpec) error
+```
+
+- **Signal Generation**: `"pca"` fits standardized `statistics.FitPCA` to form eigenportfolio returns and regresses each coin's returns via `factor.LeastSquares`; `"benchmarks"` regresses each coin's returns on benchmark returns. Cumulative residuals `X_i` over `OUWindow` are fit with `statistics.FitOU` (`sigma_eq = InnovationStd / sqrt(1 - (1+Slope)^2)`) and cross-sectionally centered to form `s_i = (X_{i,last} - m_eq_centered) / sigma_eq`.
+- **Dual-Neutral Projection and PIT**: `statistics.FactorNeutralWeights` (expanding with `Benchmarks` or passive tradable universe hedges when the active set has fewer degrees of freedom than `1 + K`) enforces `|Σ w_i| < 1e-9` (dollar neutrality) and `|B^T w| < 1e-9` (factor-beta neutrality); assets leaving `Investable` or missing prices are immediately exited while keeping remaining weights neutral.
+
 ## 3. Numerical API (`factor/statistics`)
 
 Conventions: observations in ascending time order; matrix rows = observations, columns = variables, with column order identical for fitting and prediction. Non-finite input, non-identifiable models, dimension mismatch, and exceeding budget all return an error.
@@ -304,10 +379,15 @@ type JohansenResult struct {
     Samples, NuisanceRank int
 }
 func Johansen(levels [][]float64, spec JohansenSpec) (JohansenResult, error)   // 2<=assets<=64
+func JohansenTraceCriticalValues(d int, spec JohansenSpec, confidence float64) ([]float64, error)
+func JohansenMaxEigCriticalValues(d int, spec JohansenSpec, confidence float64) ([]float64, error)
 func (j JohansenResult) TraceRank(criticalValues []float64) (int, error)       // length must equal len(Trace) (= number of assets), values>0; sequential rejection, stops at the first non-rejection
+func (j JohansenResult) MaxEigRank(criticalValues []float64) (int, error)
+func (j JohansenResult) CointegrationRank(spec JohansenSpec, confidence float64) (int, error)
+func (j JohansenResult) IsCointegrated(spec JohansenSpec, confidence float64) (bool, error)
 ```
 
-- **Critical values (the code is authoritative)**: `statistics` has **no critical-value table, interpolation function, or p-value**; `AugmentedDickeyFuller`/`EngleGranger` return only `TStatistic`, and `TraceRank` takes caller-supplied critical values with no default table.
+- **Critical values (the code is authoritative)**: `AugmentedDickeyFuller`/`EngleGranger` return only `TStatistic` (no built-in ADF table or p-value); Johansen provides asymptotic Osterwald-Lenum / MacKinnon-Haug-Michelis critical values for the three valid `JohansenSpec{Intercept, Trend}` deterministic cases and `confidence ∈ {0.90, 0.95, 0.99}` (exact tables for `m = d - r ≤ 12` and quadratic Brownian-moment extrapolation for `13..64`) via `JohansenTraceCriticalValues`, `JohansenMaxEigCriticalValues`, `CointegrationRank`, and `IsCointegrated`.
 - **EngleGranger**: after `Regress(y,x,intercept)`, runs `ADFSpec{Lags: lags}` on the residual (**residual test has no intercept, no trend**). The more negative the statistic, the more it favors rejecting "no cointegration"; it must be compared with Engle–Granger/MacKinnon critical values matching the deterministic terms/number of regressors. External reference (**not provided by the code**): MacKinnon asymptotic values, N=2 with constant approx. 1%:-3.90, 5%:-3.34, 10%:-3.04; with trend, more regressors, or finite samples they differ, so use response surfaces or simulate your own.
 - **FitOU**: when counting in bars use `DiscreteHalfLife`.
 - **Johansen** eigenvectors must be normalized by one leg before deriving leg weights; `TraceRank` critical values must correspond to the same lags, deterministic terms, and significance level.
@@ -503,7 +583,7 @@ AFML labels/CPCV, order flow and PIN/VPIN, VID risk pricing, HMM (`FitBinaryHMM`
 4. Standardize the residual to z (training mean/std), choose Entry with `EmpiricalThreshold`+`RegularizationHeel`; Exit/Stop are chosen by the caller (e.g. 1/2 and 2 times Entry), satisfying `Stop > Entry > Exit >= 0`.
 5. Quantiles from `CrossingDurations`+`BootstrapDurations` are used to estimate the order of magnitude of `MaxHold`, not as a hard deadline.
 6. Cost gate: per 7.1, confirm `(|Entry|-|Exit|)·σ/(1+|β|)` covers round-trip cost, otherwise raise Entry or abandon.
-7. Multi-leg baskets: `Johansen` (needs matching critical values); `RegisterPairs` has only two legs, multi-leg goes through 2.7.
+7. Multi-leg baskets and cross-sectional residuals: `Johansen` with `IsCointegrated` / `CointegrationRank`; use `RegisterBaskets` (2.9) for multi-leg baskets and `RegisterResidualStatArb` (2.10) for cross-sectional residual mean-reversion.
 
 ### 4.2 Frozen Artifacts
 

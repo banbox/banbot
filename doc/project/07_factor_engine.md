@@ -15,7 +15,7 @@
 - **回测账本**（`factor/backtest`）：数量型账本 `Book`，支持权重模式与绝对数量分配（allocation）两条执行路径。
 - **研究**（`factor/research`）：标签、IC 合成、诊断、实验台账、模型训练与发布、风险优化、生命周期统计。
 - **运行装配**（`factor/runner`）：回放 `Run`、实盘 `Live`、决策引擎、输入（归档/分页存储）、账户接纳（sink）、纸面账户、组合策略运行时。
-- **统计工具箱**（`factor/statistics`）：AFML 系列（标签、权重、特征、集成、验证、HRP 等）、Chan 系列（ARIMA/GARCH/HMM/SVM/订单簿等）、协整与配对（Johansen、Vidyamurthy、Kalman、带状交易器）、期权与订单流等。其中仅随机森林与配对 builder 被生产代码直接调用。
+- **统计工具箱**（`factor/statistics`）：AFML 系列（标签、权重、特征、集成、验证、HRP 等）、Chan 系列（ARIMA/GARCH/HMM/SVM/订单簿等）、协整与配对（Johansen 含渐近临界值与秩判定、Vidyamurthy、Kalman、带状交易器）、PCA 与因子中性权重分配（`FitPCA`、`FactorNeutralWeights`）、期权与订单流等。其中随机森林、配对/多腿篮子与截面残差套利 builder 被生产运行路径直接调用。
 
 不负责：数据采集与数据库写入（由 `orm`/数据源层完成）、交易所对接（由 `banexg`/`execution` 层完成，见 AGENTS.md 开发规约）、配置文件的 YAML 解析（由 `entry/` 完成）。
 
@@ -99,7 +99,7 @@
 | `paper.go` / `paper_sink.go` / `paper_group.go` | 本地纸面账户；同账户多策略共享 borrow 与 paperMarket |
 | `validate.go` / `live_validate.go` | 回放/实盘配置校验，`resolveDecisionPortfolio` |
 | `risk_builder.go` / `model_builder.go` | 自定义风险优化与模型组合 builder 的配置与构造 |
-| `pairs.go` / `rolling_pairs.go` / `simple.go` | 固定配对 builder（`RegisterPairs`/`PairsSpec`）、周期性“形成期+交易期”滚动重选配对 builder（`RegisterRollingPairs`/`RollingPairsSpec`：支持 7 类在线价差估计器 `SpreadModel`〔含 Copula 条件概率模型〕、协整 `EngleGranger`+`FitOU` 与 Gatev 最小距离法 `distance`、`graceful`/`immediate` 换期交接、正 Beta 守卫、OU 半衰期/滚动收益相关/Hurst 指数/价差 Wilder RSI 在线入场门控、逐腿自定义因子特征 `ExtraFeatures`/`FeatureExprs` 与可编程入场过滤钩子 `EntryFilter`、均值回归/顺势突破 `BandConfig.Mode`、冻结对冲比退出 Z / `DynamicHedge`、`DriftBand`、`WeightMode: "inverse_vol"`）及简单因子注册 |
+| `pairs.go` / `rolling_pairs.go` / `baskets.go` / `pca_statarb.go` / `simple.go` | 固定配对 builder（`RegisterPairs`/`PairsSpec`）、周期性“形成期+交易期”滚动重选配对 builder（`RegisterRollingPairs`/`RollingPairsSpec`：支持 7 类在线价差估计器 `SpreadModel`〔含 Copula 条件概率模型〕、协整 `EngleGranger`+`FitOU` 与 Gatev 最小距离法 `distance`、`graceful`/`immediate` 换期交接、正 Beta 守卫、OU 半衰期/滚动收益相关/Hurst 指数/价差 Wilder RSI 在线入场门控、逐腿自定义因子特征 `ExtraFeatures`/`FeatureExprs` 与可编程入场过滤钩子 `EntryFilter`、均值回归/顺势突破 `BandConfig.Mode`、冻结对冲比退出 Z / `DynamicHedge`、`DriftBand`、`WeightMode: "inverse_vol"`）、多腿协整篮子 builder（`RegisterBaskets`/`BuildBasketsRegistration`/`BasketsSpec`：支持 2..12 腿 `"fixed"` / `"johansen"` / `"multivariate_ols"` 权重估计、Johansen 临界值在线协整门控与 OU 半衰期门控、冻结篮子退出 Z、`DriftBand`、`WeightMode: "inverse_vol"`）、截面 PCA / 基准残差 OU `s-score` 套利 builder（`RegisterResidualStatArb`/`BuildResidualStatArbRegistration`/`ResidualStatArbSpec`：支持 `"pca"` 与 `"benchmarks"` 因子抽离、中心化 Avellaneda-Lee `s-score` 状态机、经 `FactorNeutralWeights` 的美元中性与因子 Beta 中性投影）及简单因子注册 |
 | `pairs_report.go` / `report.go` | 每对独立结果的记账（`pairStats`、`pairsTracker`/`rollingPairsTracker`、`buildPairResult`）与结果类型（`PairResult`、`PairEpisode`、`Attribution`、`SymbolContribution`、`buildAttribution`）；`runObservers` 把 factory 内创建的配对状态带回 `Result` |
 | `params.go` / `scan.go` / `config.go` | 参数容器（`Params`，`Unused` 校验）、参数扫描、运行配置辅助 |
 | `terminal.go` / `option_expiry.go` | 终止标的与期权到期结算相关处理 |
@@ -110,7 +110,7 @@
 
 按主题分组（括号内为代表文件，共约 99 个非测试文件）：
 
-- **统计套利/协整**：`johansen.go`（Johansen VECM，临界值需外部给入）、`stationarity.go`（ADF 统计量与 EngleGranger，非 p 值）、`vidyamurthy.go`（滞后价差滤波、Bootstrap 持续期、正则化选择）、`spreads.go`（阈值经验估计、穿越持续时间）、`pairs.go`（`Regress`、`FitOU`、`KalmanPair` 等基础件，内含 `finite` 副本）。
+- **统计套利/协整**：`johansen.go`（`Johansen` VECM，及匹配确定性项 `Intercept`/`Trend` 的 Osterwald-Lenum / MacKinnon-Haug-Michelis 90%/95%/99% 渐近临界值 `JohansenTraceCriticalValues`、`JohansenMaxEigCriticalValues`、顺序秩检验 `TraceRank`/`MaxEigRank`/`CointegrationRank` 与 `IsCointegrated`）、`stationarity.go`（ADF 统计量与 EngleGranger，非 p 值）、`vidyamurthy.go`（滞后价差滤波、Bootstrap 持续期、正则化选择）、`spreads.go`（阈值经验估计、穿越持续时间）、`pairs.go`（`Regress`、`FitOU`、`KalmanPair` 等基础件，内含 `finite` 副本）。
 - **配对信号**：`pair_signal.go`（`BandTrader` z 分数滞回状态机，支持均值回归 `reversion` 与顺势突破 `momentum`；`RollingSpread`）、`spread_model.go`（统一在线价差估计器 `SpreadEstimator`：`log_ols`、`raw_ols`、`tls`、`kalman`、`ratio`、`return_diff`、`copula`，以及方差比尺度 `HurstExponent`、`WilderRSI` 与 1-bar 对数收益相关 `RollingReturnCorr`）、`copula.go`（确定性无前视滚动中位秩变换 `RankUniforms`、二元 Copula 解析条件概率与密度 `CopulaConditionalCDF`/`EmpiricalCopulaConditionalCDF`、`RollingCopula`、`CopulaTrader`，覆盖 `empirical`/`gaussian`/`clayton`/`gumbel`/`frank`/`auto`）、`kalman_fit.go`（Q/R 的 MLE 拟合）、`vid_*.go`（滞后选择、配对成交校验、二部图流、动态 AR(1)、合并失败概率）。
 - **Chan 系列**（`chan_*.go`，24 个）：时序（arima/arma/garch/var/vec/trend/locallevel/hmm）、机器学习（svm/nn/tree/classification/stepwise）、组合与风险（frontier/umd/multisort/calmar）、微观结构（orderbook/displayed_sweep/trade_classification/implied_quotes/crossvenue/moving_volume）。
 - **AFML 系列**（`afml*.go`，49 个）：CUSUM 与三重屏障标签、活动/信息 bar、序贯 bootstrap 与随机森林、PurgedKFold/CPCV/PBO、PSR/DSR、HRP 与最小方差、双高斯仓位、熵特征、VPIN/PIN、流式协方差与 PCA。
@@ -215,9 +215,9 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 - 实验：`TrialLedger.Append`（`experiment.go:188`）追加 JSONL 并 fsync；`SelectParameters`（`experiment.go:310`）→ `ResolveParameters`（`:438`）按 PIT 选择。
 - 落盘只发生在 `TrialLedger`、`PublishModel` 与 `WritePanel`（任意 writer）三处；Manifest 本身不在本包落盘。
 
-### 9. 统计套利（配对）
+### 9. 统计套利（配对、多腿篮子与截面残差套利）
 
-`runner/pairs.go`（固定配对 `RegisterPairs`）与 `runner/rolling_pairs.go`（滚动重选配对 `RegisterRollingPairs`）共用 `compilePairsPlan`（未挂载自定义特征时等价于 `compilePairsLogPlan` 的 `pairs-log-v1` 单输出计划，保持 CSE 与 `Plan.Hash()` 不变）、`statistics.NewBandTrader`/`statistics.NewCopulaTrader` 与统一在线价差估计器 `statistics.NewSpreadEstimator`；状态机每个实例只能服务一个价差，Stop / MaxHold 平仓后阻塞再入场直到回到回归带。
+`runner/pairs.go`（固定配对 `RegisterPairs`）、`runner/rolling_pairs.go`（滚动重选配对 `RegisterRollingPairs`）、`runner/baskets.go`（多腿协整篮子 `RegisterBaskets` / `BuildBasketsRegistration`）与 `runner/pca_statarb.go`（截面残差 `RegisterResidualStatArb` / `BuildResidualStatArbRegistration`）共用 `compilePairsPlan` / `compilePairsLogPlan`（未挂载自定义特征时统一为 `pairs-log-v1` 对数价格节点，满足 CSE 与 `ComputationGroup` 共享计算要求）；两腿与多腿篮子共用 `statistics.NewBandTrader`/`statistics.NewCopulaTrader` 与统一在线价差估计器 `statistics.NewSpreadEstimator`（每个实例服务单一价差/篮子，Stop / MaxHold 平仓后阻塞再入场直到回到回归带）。`Registration`（`runner/baskets.go:Registration.Register`）封装定义编译、每运行私有组合工厂与校验器，便于在不改动全局注册表的前提下检查或单测策略装配。
 
 - **在线两腿价差估计器**（`SpreadModel`、`Copula`、`KalmanDelta`、`KalmanVe`、`DynamicHedge`）：
   - `""` / `"log_ols"`（默认）：对数价格滚动窗口 OLS `ln(Y) = α + β·ln(X)`，名义对冲比 `NotionalBeta = β`。
@@ -243,6 +243,13 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
     - `"cointegration"`（默认）：要求形成期对齐有效覆盖率 `≥ MinCoverage`（默认 `0.9`）且对数收益相关系数 `≥ MinCorr`（默认 `0.5`），双向运行 `statistics.EngleGranger`（含截距，`ADFLags`）与 `statistics.FitOU`，筛选斜率通过 Beta 守卫、残差 `ADF.TStatistic ≤ MaxADF`（默认 `-2.86`）且 `DiscreteHalfLife ∈ [MinHalfLife, MaxHalfLife]`（`MaxHalfLife` 默认 `FormationBars`）的候选方向（双向通过取 ADF 更负者），按 ADF 升序贪心选取。
     - `"distance"`（Gatev 最小距离法）：覆盖率达标且对数收益正相关（`MinCorr == 0` 时要求 `> 0`，否则 `≥ MinCorr`），将形成期首根共同有效价归一化为 `1.0` 计算归一化价格平方偏差之和（按覆盖率折算到 `FormationBars`），选斜率合法且距离最小者（双向均合法时取 `|β − 1|` 更小者）。
   - **预热与换期交接（`HandoffMode`）**：新入选配对用 `t` 之前的可见历史观测预热 `RollingSpread`（`Window` 默认 `FormationBars`），当轮即可产生信号，已连任配对保留原状态机与持仓。`HandoffMode` 为 `""`/`"graceful"`（默认）时，未连任但仍持仓的旧配对转入只退不进池（保留冻结 `Beta` 与 `BandTrader` 直至止盈/止损/到期退出，绝不再开仓）并占用配对槽位，新配对按排名使用剩余槽位（同品种对反向亦阻塞至退场完成），任意时刻总开仓对数 `≤ PairCount`、总名义敞口 `≤ 1`；为 `"immediate"` 时换期当根直接平掉未连任持仓配对（`Episode.Reason = "reselect"`）。
+- **多腿协整篮子**（`runner/baskets.go:RegisterBaskets`、`BuildBasketsRegistration`、`BasketsSpec`）：注册定义名 `<name>` 与组合工厂 `<name>-baskets-v1`，每个 `BasketDef` 声明 2..12 个互异标的。
+  - **篮子权重估计（`WeightMethod`、`UseRawPrice`）**：`"fixed"`（当显式给出 `BasketDef.Weights` 且 `WeightMethod == ""` 时自动选用，按单位篮子总敞口 `Σ|w_i| = 1` 归一化）；`"johansen"`（`Weights` 为空时的默认方式，在滚动 `Window` 对数价格或 `UseRawPrice: true` 原始价格上运行 `statistics.Johansen(levels, JohansenSpec{Intercept: true, DifferenceLags})`，取首特征向量 `CointegratingVectors[0]` 并固定符号使首个非零分量 `beta[0] > 0`，可选开启 `RequireCointegration` 按 `Confidence ∈ {0.90, 0.95, 0.99}` 执行 `IsCointegrated` 入场门控）；`"multivariate_ols"`（以 `factor.LeastSquares` 将第 0 腿对 `[1, leg_1, ..., leg_{k-1}]` 中心化回归，共线退化时启用微幅岭回归回退，取 `[+1, -b_1, ..., -b_{k-1}]`）。`UseRawPrice: true` 时自动按 `beta_i · price_i` 换算为美元名义单位权重。
+  - **持仓与风控**：入场前支持 `FitOU` 半衰期门控 `[MinHalfLife, MaxHalfLife]`；默认（`!DynamicWeights`）持仓期冻结入场单位权重并在滚动窗口上按冻结向量评估退出/止损 Z-Score（`evalBasketCombinationZ`），`DynamicWeights: true` 时随每轮重估连续更新；支持 `BandConfig`（`"reversion"` 与 `"momentum"`）及 `MaxHoldBars`、`DriftBand`、`WeightMode`（`"equal"` / `"inverse_vol"` 按无量纲单位名义波动率分配）、`GrossPerBasket` 与 `MaxGross`。PIT 缺腿时当轮立即以 `leg_missing` 平仓并暂停，`UnavailableSymbols` 整轮优雅跳过；多腿记账器 `basketStats` 写入 `Result.Pairs` 并与 `PairsGrossPnL`/`PairsNAVReturn`/`PairsResidual` 精确对账。
+- **截面 PCA / 基准残差 `s-score` 统计套利**（`runner/pca_statarb.go:RegisterResidualStatArb`、`BuildResidualStatArbRegistration`、`ResidualStatArbSpec`）：注册定义名 `<name>` 与组合工厂 `<name>-residual-statarb-v1`，直接作用于时点可投资池 `Universe.Investable`。
+  - **公共因子抽离（`FactorModel`）**：`"pca"`（默认，在滚动 `Window` 根 1-bar 简单收益率上运行标准化 `statistics.FitPCA` 提取前 `NumFactors`〔默认 3〕个特征组合收益率，再用 `factor.LeastSquares` 逐币种回归提取特质收益残差 `eps_{i,t}`）；`"benchmarks"`（显式指定 `Benchmarks` 如 BTC/ETH，将各币种收益率对基准收益率做多元 OLS 提取残差与基准 Beta）。
+  - **OU 拟合与中心化 Avellaneda-Lee `s-score`**：在尾部 `OUWindow`（默认 `Window`）上累加残差序列 `X_i` 并运行 `statistics.FitOU(X_i)`，计算平稳标准差 `sigma_eq = InnovationStd / sqrt(1 - (1+b)^2)`；跨截面存在至少 2 个有效 OU 资产时对偏离 `X_{i,last} - Equilibrium` 去截面均值得到中心化 `s_i = (X_{i,last} - m_eq_centered) / sigma_eq`，入场要求离散半衰期落入 `[MinHalfLife, MaxHalfLife]`。
+  - **单资产状态机与中性化组合构造**：`s_i ≤ -EntryS`（默认 1.25）开多残差（`+1`），`s_i ≥ +EntryS` 开空残差（`-1`），多头 `s_i ≥ -ExitLongS`（默认 0.50）平仓，空头 `s_i ≤ +ExitShortS`（默认 0.50）平仓，`|s_i| ≥ StopS` 或达到 `MaxHoldBars` 止损并阻塞至回归带内，标的离开 `Investable` 或数据缺失时立即强制平仓。活跃意愿（`"equal"` 下 `±1` 或 `"inverse_vol"` 下 `±1/sigma_eq`）经 `statistics.FactorNeutralWeights`（活跃标的较少时自动引入基准或宇宙内可交易被动对冲腿）投影到严格美元中性（`Σ w_i = 0`）与因子 Beta 中性（`B^T w = 0`）子空间，缩放到 `TargetGross`（默认 1.0），在保持双中性约束下交替投影施加单币上限 `MaxWeightPerAsset`，并支持 `DriftBand` 免漂移缓冲。
 
 ### 10. 结果统计（`Result.Attribution` / `Result.Pairs`）
 
@@ -258,7 +265,7 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 - `TopSymbols`（至多 20 个，按 `|Net|` 降序）：`Symbol`、`PnL`、`Costs`（该标的的费用+滑点+PIT 成本，不含资金费：资金费是账户级一项，只在 `Funding`）、`Net = PnL − Costs`、`NetPct`（占初始 NAV）、`Share = Net / Σ|Net|`（范围 [-1,1]，接近 ±1 表示单一标的决定结果）；所有标的的 `Net` 之和等于 NAV 变化加 `Funding`（`Share` 与集中度只看品种 `Net`）。
 - 累加器是账本的纯旁路观察者，开启前后 NAV 序列逐位一致（`attribution_test.go`）。
 
-**配对独立结果 `Result.Pairs`**（`RegisterPairs` 与 `RegisterRollingPairs` 策略；后者按运行中曾入选的不同有向配对 `Pair{Y, X}` 首次入选顺序汇总）：`PairResult{Y, X, Episodes, EpisodeCount, PnL, Trades, Wins, WinRate, InMarketBars, Bars, PausedBars, AvgHoldBars, LastBeta, Turnover, Unavailable, UnavailableLeg}`（后两项仅整次运行被跳过的配对有值，见上“不可用的腿”）。
+**配对与篮子独立结果 `Result.Pairs`**（`RegisterPairs`、`RegisterRollingPairs` 与 `RegisterBaskets` 策略；滚动配对按运行中曾入选的不同有向配对 `Pair{Y, X}` 首次入选顺序汇总，多腿篮子以 `Y=篮子名, X=对冲腿拼接` 汇总）：`PairResult{Y, X, Episodes, EpisodeCount, PnL, Trades, Wins, WinRate, InMarketBars, Bars, PausedBars, AvgHoldBars, LastBeta, Turnover, Unavailable, UnavailableLeg}`（后两项仅整次运行被跳过的配对/篮子有值，见上“不可用的腿”）。
 
 - `Episodes[]` 为 `PairEpisode{StartMS, EndMS, Dir(+1 做多价差/-1 做空), EntryZ, ExitZ, Beta(入场冻结), Bars, Reason, PnL}`；总量上限 400 条在各对间均分（每对至少 10 条，保留最早的），真实数量见 `EpisodeCount`；`run-completed` 事件行整体序列化 `Result`，体量受该上限约束。`Reason`：`exit`（|z| ≤ Exit）、`stop`（|z| ≥ Stop）、`maxhold`、`reselect`（`RegisterRollingPairs` 在 `HandoffMode: "immediate"` 换期平仓）、`leg_missing`（腿缺数据被平仓并暂停，`ExitZ=0`）、`end`（运行结束时仍持仓，`EndMS` 为最后一次决策时间）。`Bars` 为持仓决策数（含入场当期，不含平仓当期）。
 - 记账：`pairsTracker` 随 builder 一起由 portfolio factory 创建（`Config.observe` 经 `runObservers` 在运行结束时汇总；`PreparePortfolioConfig` 在其为空时创建，`Run` 只在为空时创建，所以入口先 Prepare 再 Run 的路径同样有效；`Run` 开始时调用 `reset` 清空记账，同一已 Prepare 的 Config 再次运行也不会累计，但 builder 自身的交易状态按既有约定仍应只用于一次运行），只写不读，不改变 builder 输出的权重。每个决策，该对上一次决策的目标权重（`wY`、`wX`，即叠加进净权重之前的两项）持有到本次决策，收益为 `wY·rY + wX·rX`（`rY/rX` 为两腿在相邻决策之间的简单收益，取自 builder 输入的对数价字段）乘以上一次决策的 `Budget.NAV`；`PnL` 为累计值占初始 NAV 的比例，持仓期的收益同时累加到当前 `Episode.PnL`。同一品种出现在多对时按各对权重自然拆分。
