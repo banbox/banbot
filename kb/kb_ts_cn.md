@@ -30,7 +30,7 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 
 ### 1.3 数值与单位约定
 - 价格/数量 `float64`；未就绪 `NaN`；
-- 比例类：`TradeStrat.StopLoss`、`EnterReq.RiskRate/StopLossRate/TakeProfitRate`、`ExitRate`、`CallbackPct`（百分数，[0.1,10]）；`0.05`=5%（`RiskRate: 0.01`=1% 账户权益风险），不带杠杆。
+- 比例类：`TradeStrat.StopLoss`、`EnterReq.RiskRate/StopLossRate/TakeProfitRate`、`TakeProfitTarget.Rate/ExitRate`、`ExitRate`、`CallbackPct`（百分数，[0.05,50]）；`0.05`=5%（`RiskRate: 0.01`=1% 账户权益风险），不带杠杆。
 - 距离类：`StopLossVal`/`TakeProfitVal` 是**价格距离**（绝对值，非倍率），如 `atr*2`；`StopLoss`/`TakeProfit`/`ActivationPrice` 是**价格**。
 - `InOutOrder.ProfitRate` **不含杠杆**（盈亏/入场名义价值）；`Profit` 为扣费后计价货币金额。
 - `core.AmtDust=1e-8`；`core.MinStakeAmount=5.5`（最小开单金额，法币）。`LegalCost` 法币金额，`Amount` 标的数量。
@@ -346,9 +346,9 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `CheckMS`、`LastBarMS int64`：上次处理时间、上一根K线结束时间
 - `MaxOpenLong`、`MaxOpenShort int`：0 不限，-1 禁止，>0 上限（由 EachMaxLong/Short 初始化，回调中可改）
 - `CloseLong`、`CloseShort bool`：是否允许平多/平空（false 时对应方向平仓报错 `close order disabled`）
-- `ExgStopLoss`、`ExgTakeProfit bool`：默认 true。**false 时 `EnterReq` 的止损/止盈（含 LongSLPrice/Strat.StopLoss 默认止损）整个被丢弃，既不挂交易所也不由框架监控**（实盘仅 WARN），并跳过方向校验；不影响 `SetAllStopLoss/od.SetStopLoss` 等运行中设置
+- `ExgStopLoss`、`ExgTakeProfit bool`：默认 true。为 false 时实盘**不在远端交易所订单簿预挂止损/止盈条件单，但回测与实盘均继续在本地价格监控并触发止损/止盈**（`StopLoss==0` 仍表示不设止损）
 - `LongSLPrice`、`ShortSLPrice`：任务级默认止损价（开单时请求未指定则采用）
-- `LongTPPrice`、`ShortTPPrice`：**不生效**，止盈写在 `EnterReq`
+- `LongTPPrice`、`ShortTPPrice`：任务级默认止盈价（开单时请求未指定 `TakeProfit/TakeProfitVal/TakeProfits` 则采用）
 - `More interface{}`：每个 job 独立的可变状态（在 OnStartUp 初始化）
 
 方法：
@@ -401,20 +401,22 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 - `Tag string`：**必填**，入场信号名
 - `Short bool`：true 做空，默认做多
 - `OrderType int`：`core.OrderType*`；`Limit>0` 且未指定时自动为限价
-- `Limit float64`：限价入场价（指定即限价单）；与 `Stop` 互斥
-- `Stop float64`：触发价：做多价格涨到才入场（做空相反）；已越过按限价处理（`Limit=Stop`）；回测 `bt_legacy_intrabar` 下已越过的突破单按当前价入场
+- `Limit float64`：限价入场价（仅设 `Limit>0` 为限价单；与 `Stop>0` 同设为 `Stop-Limit` 触发限价单：价格触及 `Stop` 后以 `Limit` 挂限价单）
+- `Stop float64`：触发价：做多价格涨到才触发（做空相反）；未设 `Limit` 且已越过时按限价处理（`Limit=Stop`）；回测 `bt_legacy_intrabar` 下已越过的纯突破单按当前价入场
+- `OCOGroup string`：OCO（One-Cancels-the-Other）挂单组名；同一 `(Account, Symbol, Strategy, OCOGroup)` 内任一待入场挂单成交后，自动撤销同组其余未成交挂单（同一 bar 内多空双向突破挂单按 OHLC 路径先后触发）
 - `CostRate float64`：开单倍率，默认 1（乘基准金额）
 - `RiskRate float64`：单笔账户权益风险比例 `[0, 1]`（如 `0.01` 表示触发止损最多亏损当前 `AccountEquity()` 的 1%）；未指定 `Amount`/`LegalCost` 且解析出有效止损时自动按止损距离计算 `LegalCost`
 - `LegalCost float64`：法币金额；指定则忽略 CostRate/RiskRate
 - `Amount float64`：标的数量；指定则不按金额计算
 - `Leverage float64`：杠杆；非 0 覆盖账户杠杆
 - `StopLossVal float64`：止损距离（价格差），换算为止损价；优先于 StopLoss
-- `StopLoss float64`：止损触发价；>0 时作为交易所侧止损（`ExgStopLoss` 为 true）
+- `StopLoss float64`：止损触发价；>0 时生效（`ExgStopLoss=true` 实盘预挂交易所止损单，`false` 仅本地监控）
 - `StopLossLimit float64`：止损限价；仅设 StopLossLimit 而 StopLoss=0 时，StopLoss 取该值
 - `StopLossRate float64`：止损退出比例 (0,1]，0=全部
 - `StopLossTag string`：止损原因
-- `ActivationPrice`、`CallbackPct float64`：追踪止损：激活价、回撤百分比（[0.1,10]）
+- `ActivationPrice`、`CallbackPct float64`：追踪止损：激活价、回撤百分比（`[0.05, 50]`；实盘超出交易所原生回调率上限时自动降级为本地价格监控追踪止损）
 - `TakeProfitVal/TakeProfit/TakeProfitLimit/TakeProfitRate/TakeProfitTag`：同止损（距离/价格/限价/比例/原因）
+- `TakeProfits []TakeProfitTarget`：多级阶梯止盈（与单级 `TakeProfit*` 互斥）；每项 `TakeProfitTarget{Price, Val, Rate, Limit, ExitRate float64; MoveSLToBreakeven bool; Tag string}` 在入场成交后按实际入场均价解析 `Val`（价差）/`Rate`（比例，如 `0.02`=+2%）并按盈利方向由近及远排序，逐级按初始仓位比例 `ExitRate`（总和 `<=1`）分批止盈；`MoveSLToBreakeven=true` 时将该单剩余仓位止损收紧至不差于入场均价
 - `StopBars int`：限价单超过多少根K线未成交则撤单（0 用 `StopEnterBars`）
 - `ClientID string`：交易所 ClientOrderID 后缀
 - `Infos map[string]string`：附加信息（写入订单 Info）
@@ -422,11 +424,11 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 - `CommandID string`：框架幂等 ID（留空）
 
 `OpenOrder` 校验：
-1. `Tag` 空、`CanOpen` 假、任何数值 NaN、`RiskRate` 超 [0,1]、`CallbackPct` 超 [0.1,10]、`Stop` 与 `Limit` 同设→错误。
-2. 入场价：当前价（预热期 `Env.Close`）；限价按方向取更优价。
+1. `Tag` 空、`CanOpen` 假、任何数值 NaN、`RiskRate` 超 [0,1]、`CallbackPct` 超 [0.05,50]、显式 `OrderTypeMarket` 时设 `Limit>0`→错误。
+2. 入场价：当前价（预热期 `Env.Close`）；限价按方向取更优价；`Stop>0 && Limit>0` 按 `Stop-Limit` 计算参考入场价。
 3. 金额（未指定 Amount/LegalCost）：若 `RiskRate>0` 且解析出有效止损价（`|enterPrice-slPrice|>0`），`LegalCost=(s.AccountEquity()*RiskRate)/(|enterPrice-slPrice|/enterPrice)`，并受最大杠杆（`AccountEquity()*leverage`）与 `max_stake_amt` 封顶；否则 `LegalCost=基准金额×StakeRate×CostRate`；数量超近 5 根平均成交量×`open_vol_rate` 则截断；低于 `MinStakeAmount`(5.5)：`ignore` 报错；`keepBig` 仅当成本 >5.5 的 40% 时提升到 5.5×1.1，否则报错；`keepAll` 一律提升到 5.5×1.1。
-4. 止损优先级：`StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss`（入场价×(1∓比例)）；方向不对（做多止损≥入场价等）→错误；受 `ExgStopLoss` 控制。
-5. 止盈：`TakeProfitVal` > `TakeProfit`（`TakeProfitLimit` 同 StopLossLimit 规则）；方向不对→错误；不采用 `LongTPPrice`。
+4. 止损优先级：`StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss`（入场价×(1∓比例)）；方向不对（做多止损≥入场价等）→错误；`ExgStopLoss=false` 时仅禁止远端预挂单，仍保留本地止损监控。
+5. 止盈：设 `TakeProfits` 时校验各级目标与 `ExitRate` 总和 `<=1`；否则按 `TakeProfitVal` > `TakeProfit` > `LongTPPrice/ShortTPPrice` 解析（`TakeProfitLimit` 同 StopLossLimit 规则），方向不对→错误。
 6. 入队返回 nil（`s.Entrys`、`OrderNum++`）；`Log=true` 时错误写日志。
 
 ### 3.6 ExitReq（平仓请求）
@@ -484,15 +486,15 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 - 平仓：默认全平市价；`ExitRate=0.5` 平一半（每订单按比例）；`EnterTag`/`OrderID` 过滤；`Limit` 限价。部分平仓后剩余订单仍在 `GetOrders`。
 
 ### 4.2 止损与止盈
-- `StopLossVal/TakeProfitVal`（距离）最常用，`StopLoss/TakeProfit` 为绝对价；优先级见 §3.5。`*Rate` 触发后退出比例（0=全部），`*Limit` 触发后挂限价单（否则市价）。
-- 追踪止损：`ActivationPrice`（达到后激活）+ `CallbackPct`（从最高点回撤%，[0.1,10]）。运行中修改：`s.SetAllStopLoss(dirt, &ormo.ExitTrigger{Price: …})` 或 `od.SetStopLoss(...)`。
+- `StopLossVal/TakeProfitVal`（距离）最常用，`StopLoss/TakeProfit` 为绝对价；优先级见 §3.5。`*Rate` 触发后退出比例（0=全部），`*Limit` 触发后挂限价单（否则市价）。多级阶梯止盈用 `TakeProfits []TakeProfitTarget`（可配 `MoveSLToBreakeven: true` 在首级止盈后自动移损保本）。
+- 追踪止损：`ActivationPrice`（达到后激活）+ `CallbackPct`（从最高点回撤%，[0.05,50]）。运行中修改：`s.SetAllStopLoss(dirt, &ormo.ExitTrigger{Price: …})` 或 `od.SetStopLoss(...)`。
 
 **交易所侧挂单**：
 - 回测、`dry_run`：本地模拟触发，不访问交易所。
-- 实盘（`prod`）：订单**完全入场后**（`InOutStatusFullEnter`，部分成交期间不挂）为止损、止盈各单独调用 `CreateOrder` 挂条件单：止损 `stop_loss`（有 Limit 为 `stop_loss_limit`），止盈 `take_profit_market`（有 Limit 为 `take_profit_limit`），数量=当前持仓×Rate（0<Rate<1 时）；不用 ClosePosition（避免多订单互相覆盖），双向持仓靠 positionSide。追踪止损（`CallbackPct`）挂 `trailing_stop_market`（callbackRate、可选 activationPrice）；框架 tag 为 `trailing_stop` 的止损不另挂止损单。
+- 实盘（`prod`）：订单**完全入场后**（`InOutStatusFullEnter`，部分成交期间不挂）为止损、止盈各单独调用 `CreateOrder` 挂条件单：止损 `stop_loss`（有 Limit 为 `stop_loss_limit`），止盈 `take_profit_market`（有 Limit 为 `take_profit_limit`），数量=当前持仓×Rate（0<Rate<1 时）；不用 ClosePosition（避免多订单互相覆盖），双向持仓靠 positionSide。追踪止损（`CallbackPct`）挂 `trailing_stop_market`（callbackRate、可选 activationPrice）；若 `CallbackPct` 超出交易所原生上限或被拒单，自动降级为 `LiveOrderMgr` 本地价格监控追踪止损，不会使订单失败；框架 tag 为 `trailing_stop` 的止损不另挂止损单。
 - banexg 适配：币安（现货/杠杆 STOP_LOSS(_LIMIT)/TAKE_PROFIT(_LIMIT)；合约 STOP_MARKET/STOP/TAKE_PROFIT_MARKET/TAKE_PROFIT/TRAILING_STOP_MARKET）、OKX（algo）、Bybit（conditional）均实现；不支持的品类/类型下单报错。
 - 失败：报"会立即触发"→立即市价平仓；其它失败只记 ERROR，更新失败不撤旧单，**无自动重试**，仅同步/重启时补挂缺失触发单。`SetAll*`/`od.SetStopLoss` 修改后实盘重编辑/重挂条件单。
-- `ExgStopLoss/ExgTakeProfit=false` 见 §3.3（回测同样）；要保留监控而不挂单，需自行在 `OnData`/`OnCheckExit` 检查平仓。
+- `ExgStopLoss/ExgTakeProfit=false` 仅跳过实盘远端交易所条件单预挂，回测与实盘本地价格监控依然生效（见 §3.3）。
 - 回撤平仓（`DrawDownExit=true`）：框架跟踪最大浮盈比例 maxChg；r 取 `GetDrawDownExitRate`（`>0` 采用、`0` 不设置、`<0`/未设用默认表）：maxChg >10%→r=0.15，>4%→0.17，>2.5%→0.25，>1.5%→0.37，>0.7%→0.5，否则不启用。回撤价=入场价×(1+maxChg×(1−r)×方向)，当前收盘越过则 tag `draw_down` 市价平仓，否则**用该价覆盖订单的止损触发器**（会替换你设置的止损，实盘同步到交易所）。仅在 `OnCheckExit` 返回 nil 时检查。
 
 ### 4.3 多空限制
@@ -562,7 +564,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 14. 多输入指标缓存只挂一个输入，组合须固定；标 (全) 指标勿在循环里多次调用（§2.3）。
 16. 对 `Series.Get` 的 NaN 做判断（`math.IsNaN(atr)`），尤其 `WarmupNum` 不够大时。
 17. 同品种不同周期的 job 是独立 Env；跨周期数据用 `DataSub`。
-18. `DrawDownExit` 覆盖订单止损触发器（§4.2）；`ExgStopLoss=false` 丢弃入场止损（§3.3）；`MAMA/VPCI/DX/Fisher` 与标准定义不同；旧 API 新代码不用。
+18. `DrawDownExit` 覆盖订单止损触发器（§4.2）；`ExgStopLoss=false` 仅隐藏远端挂单仍保留本地止损监控（§3.3）；`MAMA/VPCI/DX/Fisher` 与标准定义不同；旧 API 新代码不用。
 19. **`TradeStrat` 被该策略的所有品种共用**（工厂每个 policy 只调用一次，除非配置了 `pair_params`）：工厂函数体内的闭包变量和包级变量对所有品种共享。逐品种变化的状态（上一根信号、峰值、追踪止损位、计数器）定义成结构体，在 `OnStartUp` 赋给 `s.More`，回调里 `s.More.(*T)` 读取；不要用闭包变量或按品种做键的 map。
 20. 常见编译错误：品种名字符串是 `s.Symbol.Symbol`（`s.Symbol` 是 `*orm.ExSymbol`，不能当字符串或 map 键）；`pol.Params` 是 `map[string]float64`，超参只有数值（开关用 0/1），用 `pol.Def/DefInt` 读取，没有 `DefBool/DefStr/core.PInt`；方向参数 `dirt` 是 `float64`；K线时间用 `e.TimeStart/TimeStop`、周期用 `e.TFMSecs`（没有 `e.Time/TFSecs`）；订单类型在 `github.com/banbox/banbot/orm/ormo`（`*ormo.InOutOrder`、`*ormo.ExitTrigger`）；`EnterReq` 没有 `Qty/Dirt` 字段（数量 `Amount`、金额 `LegalCost`/`CostRate`、按风险比例定仓 `RiskRate`、做空 `Short: true`）；查询账户权益/可用余额/峰值回撤用 `s.AccountEquity()` / `s.AvailableBalance()` / `s.AccountDrawdown()`（无 `GetEquity`），单笔基准金额用 `s.Strat.GetStakeAmount(s)`。
 

@@ -38,6 +38,7 @@ type InOutOrder struct {
 	Enter      *ExOrder               `json:"enter"`
 	Exit       *ExOrder               `json:"exit"`
 	Info       map[string]interface{} `json:"info"`
+	OCOGroup   string                 `json:"oco_group,omitempty"`
 	DirtyMain  bool                   `json:"-"` // IOrder has unsaved temporary changes 有未保存的临时修改
 	DirtyEnter bool                   `json:"-"` // Enter has unsaved temporary changes 有未保存的临时修改
 	DirtyExit  bool                   `json:"-"` // Exit has unsaved temporary changes 有未保存的临时修改
@@ -145,10 +146,14 @@ func (i *InOutOrder) SetInfo(key string, val interface{}) {
 }
 
 func (i *InOutOrder) loadInfo() {
-	if i.Info != nil {
-		return
+	if i.Info == nil {
+		i.Info = decodeIOrderInfo(i.IOrder.Info)
 	}
-	i.Info = decodeIOrderInfo(i.IOrder.Info)
+	if i.OCOGroup == "" {
+		if g, ok := i.Info[OdInfoOCOGroup].(string); ok && g != "" {
+			i.OCOGroup = g
+		}
+	}
 }
 
 func (i *InOutOrder) GetInfoFloat64(key string) float64 {
@@ -497,6 +502,7 @@ func (i *InOutOrder) CutPart(enterAmt, exitAmt float64) *InOutOrder {
 			Info:      i.IOrder.Info,
 		},
 		Info:       make(map[string]interface{}),
+		OCOGroup:   i.OCOGroup,
 		DirtyMain:  true,
 		DirtyEnter: true,
 		DirtyInfo:  true,
@@ -504,7 +510,7 @@ func (i *InOutOrder) CutPart(enterAmt, exitAmt float64) *InOutOrder {
 		state:      i.state,
 	}
 	for key, val := range i.Info {
-		part.Info[key] = val
+		part.Info[key] = cloneOrderInfoVal(val)
 	}
 	// The enter.at of the original order needs to be+1 to prevent conflicts with sub orders that have been split.
 	// 原来订单的enter_at需要+1，防止和拆分的子订单冲突。
@@ -767,6 +773,13 @@ func (i *InOutOrder) saveToDb() *errs.Error {
 }
 
 func (i *InOutOrder) GetInfoText() (string, *errs.Error) {
+	if i.OCOGroup != "" {
+		i.loadInfo()
+		if cur, _ := i.Info[OdInfoOCOGroup].(string); cur != i.OCOGroup {
+			i.Info[OdInfoOCOGroup] = i.OCOGroup
+			i.DirtyInfo = true
+		}
+	}
 	if !i.DirtyInfo {
 		return i.IOrder.Info, nil
 	}
@@ -871,16 +884,207 @@ func (i *InOutOrder) GetTakeProfit() *TriggerState {
 	return i.GetExitTrigger(OdInfoTakeProfit)
 }
 
+func (i *InOutOrder) IsLocalStopLoss() bool {
+	return i != nil && i.GetInfoString(OdInfoLocalStopLoss) == "1"
+}
+
+func (i *InOutOrder) IsLocalTakeProfit() bool {
+	return i != nil && i.GetInfoString(OdInfoLocalTakeProfit) == "1"
+}
+
+func (i *InOutOrder) SetTakeProfits(rungs []*TPLadderRung) {
+	if len(rungs) == 0 {
+		i.SetInfo(OdInfoTakeProfits, nil)
+		return
+	}
+	cloned := make([]*TPLadderRung, len(rungs))
+	for idx, r := range rungs {
+		cloned[idx] = r.Clone()
+	}
+	i.SetInfo(OdInfoTakeProfits, &TPLadderState{
+		Rungs:          cloned,
+		RemainingShare: 1.0,
+	})
+}
+
+func (i *InOutOrder) GetTakeProfits() *TPLadderState {
+	i.loadInfo()
+	var empty *TPLadderState
+	return utils2.GetMapVal(i.Info, OdInfoTakeProfits, empty)
+}
+
+// ResolveTakeProfits resolves target prices from actual entry fill price for Val/Rate
+// offsets when Price == 0 and sorts rungs from nearest to farthest in profit direction.
+func (i *InOutOrder) ResolveTakeProfits(entryPrice float64) {
+	ladder := i.GetTakeProfits()
+	if ladder == nil || len(ladder.Rungs) == 0 {
+		return
+	}
+	if entryPrice <= 0 {
+		if i.Enter != nil && i.Enter.Average > 0 {
+			entryPrice = i.Enter.Average
+		} else {
+			entryPrice = i.InitPrice
+		}
+	}
+	if entryPrice <= 0 {
+		return
+	}
+	dirFlag := 1.0
+	if i.Short {
+		dirFlag = -1.0
+	}
+	for _, r := range ladder.Rungs {
+		if r == nil || r.Done {
+			continue
+		}
+		if r.Price <= 0 {
+			if r.Val > 0 {
+				r.Price = entryPrice + r.Val*dirFlag
+			} else if r.Rate > 0 {
+				r.Price = entryPrice * (1 + r.Rate*dirFlag)
+			}
+			if r.Price <= 0 {
+				r.Price = entryPrice * 0.001
+			}
+		}
+	}
+	sort.SliceStable(ladder.Rungs, func(a, b int) bool {
+		if i.Short {
+			return ladder.Rungs[a].Price > ladder.Rungs[b].Price
+		}
+		return ladder.Rungs[a].Price < ladder.Rungs[b].Price
+	})
+	if ladder.RemainingShare <= 0 {
+		ladder.RemainingShare = 1.0
+	}
+	ladder.Resolved = true
+	i.DirtyInfo = true
+}
+
+// NextTakeProfitRung returns the index, rung, and fraction of the current remaining
+// position to close for the next unexecuted take-profit rung.
+func (i *InOutOrder) NextTakeProfitRung() (int, *TPLadderRung, float64) {
+	ladder := i.GetTakeProfits()
+	if ladder == nil || len(ladder.Rungs) == 0 {
+		return -1, nil, 0
+	}
+	if !ladder.Resolved {
+		i.ResolveTakeProfits(0)
+	}
+	remShare := ladder.RemainingShare
+	if remShare <= 1e-9 {
+		return -1, nil, 0
+	}
+	totalConfigured := 0.0
+	undoneCount := 0
+	nextIdx := -1
+	for idx, r := range ladder.Rungs {
+		if r == nil {
+			continue
+		}
+		totalConfigured += r.ExitRate
+		if !r.Done {
+			undoneCount++
+			if nextIdx < 0 {
+				nextIdx = idx
+			}
+		}
+	}
+	if nextIdx < 0 {
+		return -1, nil, 0
+	}
+	rung := ladder.Rungs[nextIdx]
+	cutFrac := rung.ExitRate / remShare
+	if cutFrac >= 0.999 || (undoneCount == 1 && totalConfigured >= 0.999) {
+		cutFrac = 1.0
+	}
+	return nextIdx, rung, cutFrac
+}
+
+func (i *InOutOrder) CompleteTakeProfitRung(idx int) {
+	ladder := i.GetTakeProfits()
+	if ladder == nil || idx < 0 || idx >= len(ladder.Rungs) || ladder.Rungs[idx] == nil {
+		return
+	}
+	rung := ladder.Rungs[idx]
+	if rung.Done {
+		return
+	}
+	rung.Done = true
+	ladder.RemainingShare = max(0, ladder.RemainingShare-rung.ExitRate)
+	i.DirtyInfo = true
+}
+
+// TightenSLToBreakeven moves the order's StopLoss to at least entryPrice in the
+// protective direction without loosening an already tighter stop-loss.
+func (i *InOutOrder) TightenSLToBreakeven(entryPrice float64) bool {
+	if entryPrice <= 0 {
+		if i.Enter != nil && i.Enter.Average > 0 {
+			entryPrice = i.Enter.Average
+		} else {
+			entryPrice = i.InitPrice
+		}
+	}
+	if entryPrice <= 0 {
+		return false
+	}
+	sl := i.GetStopLoss()
+	var curSL float64
+	var oldTag string
+	var oldLimit float64
+	if sl != nil && sl.ExitTrigger != nil {
+		curSL = sl.Price
+		oldTag = sl.Tag
+		oldLimit = sl.Limit
+	}
+	newSL := entryPrice
+	if i.Short {
+		if curSL > 0 && curSL < newSL {
+			newSL = curSL
+		}
+	} else {
+		if curSL > newSL {
+			newSL = curSL
+		}
+	}
+	if curSL > 0 && math.Abs(newSL-curSL) <= 1e-12 {
+		return false
+	}
+	newLimit := oldLimit
+	if newLimit > 0 {
+		if i.Short && newLimit < newSL || !i.Short && newLimit > newSL {
+			newLimit = newSL
+		}
+	}
+	if sl == nil {
+		sl = &TriggerState{}
+	}
+	sl.ExitTrigger = &ExitTrigger{
+		Price: newSL,
+		Limit: newLimit,
+		Tag:   oldTag,
+	}
+	sl.Hit = false
+	sl.Range = math.Abs(i.InitPrice - newSL)
+	i.SetInfo(OdInfoStopLoss, sl)
+	i.DirtyInfo = true
+	if !i.IsLocalStopLoss() {
+		fireOdEdit(i, OdInfoStopLoss)
+	}
+	return true
+}
+
 // SetTrailingStop 设置跟踪止损
-// callbackPct回撤百分比；0取消，有效值[0.1, 10]
+// callbackPct回撤百分比；0取消，有效值[0.05, 50]
 // activationPrice：0立即生效，-1不修改，>0具体激活价格
 func (i *InOutOrder) SetTrailingStop(callbackPct, activationPrice float64) *errs.Error {
 	callPct := i.GetInfoFloat64(OdInfoCallbackPct)
 	if callPct == callbackPct {
 		return nil
 	}
-	if callbackPct > 0 && (callbackPct < 0.1 || callbackPct > 10) {
-		return errs.NewMsg(errs.CodeParamInvalid, "callbackPct should be in [0.1, 10]")
+	if callbackPct < 0 || (callbackPct > 0 && (callbackPct < 0.05 || callbackPct > 50)) {
+		return errs.NewMsg(errs.CodeParamInvalid, "callbackPct should be in [0.05, 50]")
 	}
 	i.SetInfo(OdInfoCallbackPct, callbackPct)
 	if activationPrice >= 0 {
@@ -1048,15 +1252,28 @@ func (i *InOutOrder) RealExitMS() int64 {
 	return i.ExitAt
 }
 
+func cloneOrderInfoVal(v interface{}) interface{} {
+	switch tv := v.(type) {
+	case *TriggerState:
+		return tv.Clone()
+	case *TPLadderState:
+		return tv.Clone()
+	default:
+		return v
+	}
+}
+
 func (i *InOutOrder) Clone() *InOutOrder {
 	if i == nil {
 		return nil
 	}
+	i.loadInfo()
 	clone := &InOutOrder{
 		IOrder:     i.IOrder.Clone(),
 		Enter:      i.Enter.Clone(),
 		Exit:       i.Exit.Clone(),
-		Info:       make(map[string]interface{}),
+		Info:       make(map[string]interface{}, len(i.Info)),
+		OCOGroup:   i.OCOGroup,
 		DirtyMain:  i.DirtyMain,
 		DirtyEnter: i.DirtyEnter,
 		DirtyExit:  i.DirtyExit,
@@ -1064,10 +1281,8 @@ func (i *InOutOrder) Clone() *InOutOrder {
 		idKey:      i.idKey,
 		state:      i.state,
 	}
-	if i.Info != nil {
-		for k, v := range i.Info {
-			clone.Info[k] = v
-		}
+	for k, v := range i.Info {
+		clone.Info[k] = cloneOrderInfoVal(v)
 	}
 	return clone
 }
@@ -1658,17 +1873,17 @@ func (s *TriggerState) Clone() *TriggerState {
 	if s == nil {
 		return nil
 	}
+	var et *ExitTrigger
+	if s.ExitTrigger != nil {
+		et = s.ExitTrigger.Clone()
+	}
 	return &TriggerState{
-		ExitTrigger: &ExitTrigger{
-			Price: s.Price,
-			Limit: s.Limit,
-			Rate:  s.Rate,
-			Tag:   s.Tag,
-		},
-		Range:    s.Rate,
-		Hit:      s.Hit,
-		OrderId:  s.OrderId,
-		ClientId: s.ClientId,
+		ExitTrigger: et,
+		Range:       s.Range,
+		Hit:         s.Hit,
+		OrderId:     s.OrderId,
+		ClientId:    s.ClientId,
+		Old:         s.Old.Clone(),
 	}
 }
 

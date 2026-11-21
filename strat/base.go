@@ -310,17 +310,29 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		return errs.NewMsg(errs.CodeParamInvalid, "open order disabled")
 	}
 
-	if math.IsNaN(req.Limit+req.Amount+req.Leverage+req.CostRate+req.RiskRate+req.LegalCost) ||
-		math.IsNaN(req.StopLoss+req.StopLossVal+req.StopLossLimit+req.StopLossRate) ||
+	if math.IsNaN(req.Limit+req.Stop+req.Amount+req.Leverage+req.CostRate+req.RiskRate+req.LegalCost) ||
+		math.IsNaN(req.StopLoss+req.StopLossVal+req.StopLossLimit+req.StopLossRate+req.ActivationPrice+req.CallbackPct) ||
 		math.IsNaN(req.TakeProfit+req.TakeProfitVal+req.TakeProfitLimit+req.TakeProfitRate) {
 		s.addFailOpen(FailOpenNanNum)
 		return errs.NewMsg(errs.CodeParamInvalid, "nan in EnterReq")
 	}
+	for _, tp := range req.TakeProfits {
+		if math.IsNaN(tp.Price + tp.Val + tp.Rate + tp.Limit + tp.ExitRate) {
+			s.addFailOpen(FailOpenNanNum)
+			return errs.NewMsg(errs.CodeParamInvalid, "nan in EnterReq.TakeProfits")
+		}
+	}
 	if math.IsInf(req.RiskRate, 0) || req.RiskRate < 0 || req.RiskRate > 1 {
 		return errs.NewMsg(errs.CodeParamInvalid, "RiskRate should be in [0, 1]")
 	}
-	if req.CallbackPct > 0 && (req.CallbackPct < 0.1 || req.CallbackPct > 10) {
-		return errs.NewMsg(errs.CodeParamInvalid, "CallbackPct should be in [0.1, 10]")
+	if math.IsInf(req.CallbackPct, 0) || req.CallbackPct < 0 || (req.CallbackPct > 0 && (req.CallbackPct < 0.05 || req.CallbackPct > 50)) {
+		return errs.NewMsg(errs.CodeParamInvalid, "CallbackPct should be in [0.05, 50]")
+	}
+	if math.IsInf(req.Limit, 0) || math.IsInf(req.Stop, 0) || req.Limit < 0 || req.Stop < 0 {
+		return errs.NewMsg(errs.CodeParamInvalid, "Stop/Limit must be finite and >= 0")
+	}
+	if req.Limit > 0 && req.OrderType == core.OrderTypeMarket {
+		return errs.NewMsg(errs.CodeParamInvalid, "`EnterReq.Limit` is invalid for Market order")
 	}
 	// 检查价格是否有效
 	dirFlag := 1.0
@@ -348,18 +360,31 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 	}
 	enterPrice := curPrice
 	isLimit := core.IsLimitOrder(req.OrderType)
-	if isLimit && req.Limit == 0 {
+	if isLimit && req.Limit == 0 && req.Stop == 0 {
 		req.Limit = enterPrice
 	}
-	if req.Limit > 0 {
-		if req.Stop > 0 {
-			return errs.NewMsg(errs.CodeParamInvalid, "Stop/Limit can not be used together")
+	if req.Limit > 0 && req.Stop > 0 {
+		// Stop-Limit entry: once Stop is reached, rests as a Limit order at req.Limit.
+		stopCrossed := req.Stop < curPrice
+		if req.Short {
+			stopCrossed = req.Stop > curPrice
 		}
+		if stopCrossed {
+			req.Stop = 0
+			if (req.Limit-enterPrice)*dirFlag < 0 {
+				enterPrice = req.Limit
+			}
+		} else {
+			enterPrice = req.Stop
+			if (req.Limit-req.Stop)*dirFlag < 0 {
+				enterPrice = req.Limit
+			}
+		}
+	} else if req.Limit > 0 {
 		if (req.Limit-enterPrice)*dirFlag < 0 {
 			enterPrice = req.Limit
 		}
-	}
-	if req.Stop > 0 {
+	} else if req.Stop > 0 {
 		legacyIntrabar := false
 		if !s.Strat.runtimeExplicit {
 			legacyIntrabar = config.Data.BTLegacyIntrabar
@@ -376,28 +401,25 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 		if req.RiskRate > 0 && curSLPrice > 0 {
 			if (curSLPrice-enterPrice)*dirFlag >= 0 {
-				if s.ExgStopLoss {
-					rel := "<"
-					if req.Short {
-						rel = ">"
-					}
-					s.addFailOpen(FailOpenBadStopLoss)
-					return errs.NewMsg(errs.CodeParamInvalid, "%s stopLoss %f must %s %f for %v order",
-						symbol, curSLPrice, rel, enterPrice, dirType)
+				rel := "<"
+				if req.Short {
+					rel = ">"
 				}
-			} else {
-				slDistRate := math.Abs(enterPrice-curSLPrice) / enterPrice
-				if slDistRate > 0 {
-					equity := s.AccountEquity()
-					req.LegalCost = (equity * req.RiskRate) / slDistRate
-					if maxLvg := s.effectiveMaxLeverage(req); maxLvg > 0 {
-						if maxCost := equity * maxLvg; maxCost > 0 && req.LegalCost > maxCost {
-							req.LegalCost = maxCost
-						}
+				s.addFailOpen(FailOpenBadStopLoss)
+				return errs.NewMsg(errs.CodeParamInvalid, "%s stopLoss %f must %s %f for %v order",
+					symbol, curSLPrice, rel, enterPrice, dirType)
+			}
+			slDistRate := math.Abs(enterPrice-curSLPrice) / enterPrice
+			if slDistRate > 0 {
+				equity := s.AccountEquity()
+				req.LegalCost = (equity * req.RiskRate) / slDistRate
+				if maxLvg := s.effectiveMaxLeverage(req); maxLvg > 0 {
+					if maxCost := equity * maxLvg; maxCost > 0 && req.LegalCost > maxCost {
+						req.LegalCost = maxCost
 					}
-					if maxStake := s.maxStakeAmount(); maxStake > 0 && req.LegalCost > maxStake {
-						req.LegalCost = maxStake
-					}
+				}
+				if maxStake := s.maxStakeAmount(); maxStake > 0 && req.LegalCost > maxStake {
+					req.LegalCost = maxStake
 				}
 			}
 		}
@@ -442,44 +464,74 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 			}
 		}
 	}
-	// 检查止损
+	// 检查止损（ExgStopLoss=false 仅禁止在远端交易所预先挂止损单，仍保留本地价格监控止损）
 	req.StopLossVal = 0
 	req.StopLoss = 0
 	if curSLPrice > 0 {
-		if s.ExgStopLoss {
-			if (curSLPrice-enterPrice)*dirFlag >= 0 {
-				rel := "<"
-				if req.Short {
-					rel = ">"
-				}
-				s.addFailOpen(FailOpenBadStopLoss)
-				return errs.NewMsg(errs.CodeParamInvalid, "%s stopLoss %f must %s %f for %v order",
-					symbol, curSLPrice, rel, enterPrice, dirType)
+		if (curSLPrice-enterPrice)*dirFlag >= 0 {
+			rel := "<"
+			if req.Short {
+				rel = ">"
 			}
-			req.StopLoss = curSLPrice
-		} else if isLiveMode {
-			s.runtimeCore.Log().Warn("stopLoss disabled",
-				zap.String("strategy", s.Strat.Name),
-				zap.String("pair", symbol))
+			s.addFailOpen(FailOpenBadStopLoss)
+			return errs.NewMsg(errs.CodeParamInvalid, "%s stopLoss %f must %s %f for %v order",
+				symbol, curSLPrice, rel, enterPrice, dirType)
 		}
+		req.StopLoss = curSLPrice
 	}
-	// 检查止盈
-	var curTPPrice float64
-	if req.TakeProfitLimit > 0 && req.TakeProfit == 0 {
-		req.TakeProfit = req.TakeProfitLimit
+	if !s.ExgStopLoss && (req.StopLoss > 0 || req.CallbackPct > 0) {
+		if req.Infos == nil {
+			req.Infos = make(map[string]string, 1)
+		}
+		req.Infos[ormo.OdInfoLocalStopLoss] = "1"
 	}
-	if req.TakeProfitVal > 0 {
-		curTPPrice = enterPrice + req.TakeProfitVal*dirFlag
+	// 检查止盈（支持多级阶梯止盈 TakeProfits 或单级止盈 / LongTPPrice / ShortTPPrice）
+	if len(req.TakeProfits) > 0 {
+		if req.TakeProfit != 0 || req.TakeProfitVal != 0 || req.TakeProfitLimit != 0 {
+			return errs.NewMsg(errs.CodeParamInvalid, "TakeProfit and TakeProfits cannot be used together")
+		}
+		var sumExitRate float64
+		for i := range req.TakeProfits {
+			tp := &req.TakeProfits[i]
+			if math.IsInf(tp.Price, 0) || math.IsInf(tp.Val, 0) || math.IsInf(tp.Rate, 0) ||
+				math.IsInf(tp.Limit, 0) || math.IsInf(tp.ExitRate, 0) ||
+				tp.Price < 0 || tp.Val < 0 || tp.Rate < 0 || tp.Limit < 0 || tp.ExitRate < 0 {
+				return errs.NewMsg(errs.CodeParamInvalid, "TakeProfits[%d] values must be finite and >= 0", i)
+			}
+			if tp.Price <= 0 && tp.Val <= 0 && tp.Rate <= 0 {
+				return errs.NewMsg(errs.CodeParamInvalid, "TakeProfits[%d] requires Price, Val, or Rate > 0", i)
+			}
+			if tp.Price > 0 && (tp.Price-enterPrice)*dirFlag <= 0 {
+				rel := ">"
+				if req.Short {
+					rel = "<"
+				}
+				s.addFailOpen(FailOpenBadTakeProfit)
+				return errs.NewMsg(errs.CodeParamInvalid, "%s TakeProfits[%d] price %f must %s %f for %v order",
+					symbol, i, tp.Price, rel, enterPrice, dirType)
+			}
+			if tp.ExitRate == 0 && len(req.TakeProfits) == 1 {
+				tp.ExitRate = 1
+			}
+			if tp.ExitRate <= 0 || tp.ExitRate > 1 {
+				return errs.NewMsg(errs.CodeParamInvalid, "TakeProfits[%d].ExitRate should be in (0, 1]", i)
+			}
+			sumExitRate += tp.ExitRate
+		}
+		if sumExitRate > 1+1e-6 {
+			return errs.NewMsg(errs.CodeParamInvalid, "TakeProfits total ExitRate %f cannot exceed 1", sumExitRate)
+		}
+		if !s.ExgTakeProfit {
+			if req.Infos == nil {
+				req.Infos = make(map[string]string, 1)
+			}
+			req.Infos[ormo.OdInfoLocalTakeProfit] = "1"
+		}
 	} else {
-		curTPPrice = req.TakeProfit
-	}
-	if curTPPrice < 0 {
-		curTPPrice = enterPrice * 0.001
-	}
-	req.TakeProfitVal = 0
-	req.TakeProfit = 0
-	if curTPPrice > 0 {
-		if s.ExgTakeProfit {
+		curTPPrice := s.resolveTakeProfitPrice(req, enterPrice, dirFlag)
+		req.TakeProfitVal = 0
+		req.TakeProfit = 0
+		if curTPPrice > 0 {
 			if (curTPPrice-enterPrice)*dirFlag <= 0 {
 				rel := ">"
 				if req.Short {
@@ -490,27 +542,35 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 					symbol, curTPPrice, rel, enterPrice, dirType)
 			}
 			req.TakeProfit = curTPPrice
-		} else if isLiveMode {
-			s.runtimeCore.Log().Warn("takeProfit disabled", zap.String("stagy", s.Strat.Name), zap.String("pair", symbol))
+			if !s.ExgTakeProfit {
+				if req.Infos == nil {
+					req.Infos = make(map[string]string, 1)
+				}
+				req.Infos[ormo.OdInfoLocalTakeProfit] = "1"
+			}
 		}
 	}
 	if req.Limit > 0 && req.OrderType == 0 {
 		req.OrderType = core.OrderTypeLimit
 	}
 	if req.Limit > 0 {
-		// 是限价入场单
+		// 是限价入场单（或Stop-Limit入场单）
 		if req.StopBars == 0 {
 			req.StopBars = s.Strat.StopEnterBars
 		}
 		if req.OrderType == core.OrderTypeLimitMaker {
+			refPrice := curPrice
+			if req.Stop > 0 {
+				refPrice = req.Stop
+			}
 			if req.Short {
-				if req.Limit < curPrice {
+				if req.Limit < refPrice {
 					// 做空卖出，价格更低，立刻成交，maker不满足退出
-					return errs.NewMsg(errs.CodeParamInvalid, "[short] Limit %f must >= market price %f", req.Limit, curPrice)
+					return errs.NewMsg(errs.CodeParamInvalid, "[short] Limit %f must >= ref price %f", req.Limit, refPrice)
 				}
-			} else if req.Limit > curPrice {
+			} else if req.Limit > refPrice {
 				// 做多买入，价格更高，立刻成交，maker不满足退出
-				return errs.NewMsg(errs.CodeParamInvalid, "[long] Limit %f must <= market price %f", req.Limit, curPrice)
+				return errs.NewMsg(errs.CodeParamInvalid, "[long] Limit %f must <= ref price %f", req.Limit, refPrice)
 			}
 		}
 	}
@@ -562,6 +622,26 @@ func (s *StratJob) resolveStopLossPrice(req *EnterReq, enterPrice, dirFlag float
 		curSLPrice = enterPrice * 0.001
 	}
 	return curSLPrice
+}
+
+func (s *StratJob) resolveTakeProfitPrice(req *EnterReq, enterPrice, dirFlag float64) float64 {
+	curTPPrice := s.LongTPPrice
+	if req.Short {
+		curTPPrice = s.ShortTPPrice
+	}
+	takeProfit := req.TakeProfit
+	if req.TakeProfitLimit > 0 && takeProfit == 0 {
+		takeProfit = req.TakeProfitLimit
+	}
+	if req.TakeProfitVal > 0 {
+		curTPPrice = enterPrice + req.TakeProfitVal*dirFlag
+	} else if takeProfit != 0 {
+		curTPPrice = takeProfit
+	}
+	if curTPPrice < 0 {
+		curTPPrice = enterPrice * 0.001
+	}
+	return curTPPrice
 }
 
 func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error {
@@ -992,9 +1072,17 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 	var entOds = make([]*ormo.InOutOrder, 0, len(odList))
 	var position float64
 	setAll := args.Rate <= 0 || args.Rate >= 1
+	markLocal := func(od *ormo.InOutOrder) {
+		if key == ormo.OdInfoStopLoss && !s.ExgStopLoss {
+			od.SetInfo(ormo.OdInfoLocalStopLoss, "1")
+		} else if key == ormo.OdInfoTakeProfit && !s.ExgTakeProfit {
+			od.SetInfo(ormo.OdInfoLocalTakeProfit, "1")
+		}
+	}
 	for _, od := range odList {
 		if od.Status >= ormo.InOutStatusPartEnter && od.Status <= ormo.InOutStatusPartExit {
 			if setAll {
+				markLocal(od)
 				err := od.SetExitTrigger(key, args, 0)
 				if err != nil {
 					return err
@@ -1017,6 +1105,7 @@ func (s *StratJob) setAllExitTrigger(dirt float64, key string, args *ormo.ExitTr
 		if setPos < core.AmtDust {
 			_ = od.SetExitTrigger(key, nil, 0)
 		} else {
+			markLocal(od)
 			if setPos >= size+core.AmtDust {
 				err := od.SetExitTrigger(key, &ormo.ExitTrigger{
 					Price: args.Price,

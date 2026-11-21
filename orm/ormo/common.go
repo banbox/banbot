@@ -68,10 +68,71 @@ func decodeIOrderInfo(text string) map[string]interface{} {
 						result[key] = state
 					}
 				}
+			} else if key == OdInfoTakeProfits {
+				if mapVal, ok := val.(map[string]interface{}); ok {
+					ladder := decodeTPLadderState(mapVal)
+					if ladder == nil {
+						delete(result, key)
+					} else {
+						result[key] = ladder
+					}
+				}
 			}
 		}
 	}
 	return result
+}
+
+func decodeTPLadderState(data map[string]interface{}) *TPLadderState {
+	if len(data) == 0 {
+		return nil
+	}
+	st := &TPLadderState{}
+	if v, ok := data["remaining_share"].(float64); ok {
+		st.RemainingShare = v
+	}
+	if v, ok := data["resolved"].(bool); ok {
+		st.Resolved = v
+	}
+	if rawList, ok := data["rungs"].([]interface{}); ok {
+		st.Rungs = make([]*TPLadderRung, 0, len(rawList))
+		for _, item := range rawList {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			r := &TPLadderRung{}
+			if v, ok := m["price"].(float64); ok {
+				r.Price = v
+			}
+			if v, ok := m["val"].(float64); ok {
+				r.Val = v
+			}
+			if v, ok := m["rate"].(float64); ok {
+				r.Rate = v
+			}
+			if v, ok := m["limit"].(float64); ok {
+				r.Limit = v
+			}
+			if v, ok := m["exit_rate"].(float64); ok {
+				r.ExitRate = v
+			}
+			if v, ok := m["move_sl_to_breakeven"].(bool); ok {
+				r.MoveSLToBreakeven = v
+			}
+			if v, ok := m["tag"].(string); ok {
+				r.Tag = v
+			}
+			if v, ok := m["done"].(bool); ok {
+				r.Done = v
+			}
+			st.Rungs = append(st.Rungs, r)
+		}
+	}
+	if len(st.Rungs) == 0 {
+		return nil
+	}
+	return st
 }
 
 func decodeTriggerState(data map[string]interface{}) *TriggerState {

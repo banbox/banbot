@@ -251,6 +251,7 @@ func (q *EnterReq) Clone() *EnterReq {
 		OrderType:       q.OrderType,
 		Limit:           q.Limit,
 		Stop:            q.Stop,
+		OCOGroup:        q.OCOGroup,
 		CostRate:        q.CostRate,
 		RiskRate:        q.RiskRate,
 		LegalCost:       q.LegalCost,
@@ -271,6 +272,10 @@ func (q *EnterReq) Clone() *EnterReq {
 		StopBars:        q.StopBars,
 		ClientID:        q.ClientID,
 		Log:             q.Log,
+	}
+	if q.TakeProfits != nil {
+		res.TakeProfits = make([]TakeProfitTarget, len(q.TakeProfits))
+		copy(res.TakeProfits, q.TakeProfits)
 	}
 
 	// 深度复制map字段Infos
@@ -310,6 +315,9 @@ func (q *EnterReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 	if q.Stop != 0 {
 		fields = append(fields, zap.Float64("trigger", q.Stop))
 	}
+	if q.OCOGroup != "" {
+		fields = append(fields, zap.String("ocoGroup", q.OCOGroup))
+	}
 	if q.CostRate > 0 && q.CostRate < 1 {
 		fields = append(fields, zap.Float64("costRate", q.CostRate))
 	}
@@ -330,10 +338,16 @@ func (q *EnterReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 	} else if q.StopLoss > 0 {
 		fields = append(fields, zap.Float64("sl", q.StopLoss))
 	}
+	if q.CallbackPct > 0 {
+		fields = append(fields, zap.Float64("callbackPct", q.CallbackPct))
+	}
 	if q.TakeProfitVal > 0 {
 		fields = append(fields, zap.Float64("tpVal", q.TakeProfitVal))
 	} else if q.TakeProfit > 0 {
 		fields = append(fields, zap.Float64("tp", q.TakeProfit))
+	}
+	if len(q.TakeProfits) > 0 {
+		fields = append(fields, zap.Any("tps", q.TakeProfits))
 	}
 	if q.StopBars > 0 {
 		fields = append(fields, zap.Int("stopBars", q.StopBars))

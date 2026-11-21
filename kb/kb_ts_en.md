@@ -30,7 +30,7 @@ Command `banbot <cmd> --config x.yml` (`--config` is repeatable; `--config-data`
 
 ### 1.3 Numeric and Unit Conventions
 - Prices/amounts are `float64`; not ready = `NaN`;
-- Ratio fields: `TradeStrat.StopLoss`, `EnterReq.RiskRate/StopLossRate/TakeProfitRate`, `ExitRate`, `CallbackPct` (percentage, [0.1,10]); `0.05` = 5% (`RiskRate: 0.01` = 1% account equity risk), leverage not applied.
+- Ratio fields: `TradeStrat.StopLoss`, `EnterReq.RiskRate/StopLossRate/TakeProfitRate`, `TakeProfitTarget.Rate/ExitRate`, `ExitRate`, `CallbackPct` (percentage, [0.05,50]); `0.05` = 5% (`RiskRate: 0.01` = 1% account equity risk), leverage not applied.
 - Distance fields: `StopLossVal`/`TakeProfitVal` are **price distances** (absolute values, not multiples), e.g. `atr*2`; `StopLoss`/`TakeProfit`/`ActivationPrice` are **prices**.
 - `InOutOrder.ProfitRate` **excludes leverage** (PnL / entry notional value); `Profit` is the quote-currency amount after fees.
 - `core.AmtDust=1e-8`; `core.MinStakeAmount=5.5` (minimum order size, fiat). `LegalCost` is a fiat amount, `Amount` is the quantity of the asset.
@@ -346,9 +346,9 @@ Registration: `strat.RegisterStrategy(name, fn)`, `strat.AddStratGroup(group, ma
 - `CheckMS`, `LastBarMS int64`: last processing time, end time of the previous bar
 - `MaxOpenLong`, `MaxOpenShort int`: 0 unlimited, -1 forbidden, >0 upper limit (initialized from EachMaxLong/Short, modifiable in callbacks)
 - `CloseLong`, `CloseShort bool`: whether closing longs/shorts is allowed (when false, closing in that direction errors with `close order disabled`)
-- `ExgStopLoss`, `ExgTakeProfit bool`: default true. **When false, the `EnterReq` stop-loss/take-profit (including LongSLPrice/Strat.StopLoss default stop-loss) is dropped entirely, neither placed on the exchange nor monitored by the framework** (live only WARN), and direction validation is skipped; does not affect runtime settings such as `SetAllStopLoss/od.SetStopLoss`
+- `ExgStopLoss`, `ExgTakeProfit bool`: default true. When false, live trading **does not pre-post conditional stop-loss/take-profit orders on the remote exchange order book, while still enforcing local price-monitored stop-loss/take-profit in both backtest and live** (`StopLoss==0` still means no stop-loss)
 - `LongSLPrice`, `ShortSLPrice`: job-level default stop-loss price (used when the request doesn't specify one at order time)
-- `LongTPPrice`, `ShortTPPrice`: **no effect**, put take-profit in `EnterReq`
+- `LongTPPrice`, `ShortTPPrice`: job-level default take-profit price (used when the request doesn't specify `TakeProfit/TakeProfitVal/TakeProfits` at order time)
 - `More interface{}`: mutable state independent per job (initialize in OnStartUp)
 
 Methods:
@@ -401,20 +401,22 @@ func RouteData(h DataHandlers) FnOnData // at most one handler is called per eve
 - `Tag string`: **required**, entry signal name
 - `Short bool`: true to short, default long
 - `OrderType int`: `core.OrderType*`; automatically a limit order when `Limit>0` and unspecified
-- `Limit float64`: limit entry price (specifying makes it a limit order); mutually exclusive with `Stop`
-- `Stop float64`: trigger price: for longs enter only after price rises to it (shorts the opposite); if already crossed it is treated as a limit order (`Limit=Stop`); in backtest under `bt_legacy_intrabar`, an already-crossed breakout order enters at the current price
+- `Limit float64`: limit entry price (`Limit>0` alone submits a limit order; combining `Stop>0` and `Limit>0` submits a `Stop-Limit` entry that triggers at `Stop` and rests as a limit order at `Limit`)
+- `Stop float64`: trigger price: for longs triggers once price rises to it (shorts the opposite); when `Limit==0` and already crossed it is treated as a limit order (`Limit=Stop`); in backtest under `bt_legacy_intrabar`, an already-crossed pure breakout stop enters at the current price
+- `OCOGroup string`: One-Cancels-the-Other pending entry group identifier; when any pending entry in the same `(Account, Symbol, Strategy, OCOGroup)` fills, all other still-unfilled orders in the group are automatically canceled (same-bar straddles trigger the earlier leg along the intrabar OHLC path first)
 - `CostRate float64`: order multiplier, default 1 (multiplied onto base amount)
 - `RiskRate float64`: per-trade account equity risk ratio `[0, 1]` (e.g. `0.01` risks at most 1% of current `AccountEquity()` if stop-loss triggers); automatically computes `LegalCost` from stop-loss distance when `Amount`/`LegalCost` are unset and a valid stop-loss is resolved
 - `LegalCost float64`: fiat amount; if specified CostRate/RiskRate are ignored
 - `Amount float64`: asset quantity; if specified, not computed from amount
 - `Leverage float64`: leverage; non-zero overrides account leverage
 - `StopLossVal float64`: stop-loss distance (price difference), converted to a stop price; takes precedence over StopLoss
-- `StopLoss float64`: stop-loss trigger price; when >0 used as the exchange-side stop (`ExgStopLoss` true)
+- `StopLoss float64`: stop-loss trigger price; active when >0 (pre-posted on the exchange in live when `ExgStopLoss=true`, or locally price-monitored when `ExgStopLoss=false`)
 - `StopLossLimit float64`: stop-loss limit price; when only StopLossLimit is set and StopLoss=0, StopLoss takes this value
 - `StopLossRate float64`: stop-loss exit ratio (0,1], 0=all
 - `StopLossTag string`: stop-loss reason
-- `ActivationPrice`, `CallbackPct float64`: trailing stop: activation price, drawdown percentage ([0.1,10])
+- `ActivationPrice`, `CallbackPct float64`: trailing stop: activation price, drawdown percentage (`[0.05, 50]`; in live trading, if `CallbackPct` exceeds the venue's native callback cap, it automatically falls back to local price-monitored trailing stop)
 - `TakeProfitVal/TakeProfit/TakeProfitLimit/TakeProfitRate/TakeProfitTag`: same as stop-loss (distance/price/limit/ratio/reason)
+- `TakeProfits []TakeProfitTarget`: multi-stage take-profit ladder (mutually exclusive with single `TakeProfit*`); each `TakeProfitTarget{Price, Val, Rate, Limit, ExitRate float64; MoveSLToBreakeven bool; Tag string}` resolves `Val` (distance) / `Rate` (ratio, e.g. `0.02` = +2%) from the actual entry fill price, sorts rungs from nearest to farthest in the profit direction, and partial-exits `ExitRate` of the initial position (total `<= 1`); when `MoveSLToBreakeven=true`, tightens the remaining position's `StopLoss` to at least the entry fill price
 - `StopBars int`: cancel a limit order not filled after this many bars (0 uses `StopEnterBars`)
 - `ClientID string`: exchange ClientOrderID suffix
 - `Infos map[string]string`: extra info (written to the order Info)
@@ -422,11 +424,11 @@ func RouteData(h DataHandlers) FnOnData // at most one handler is called per eve
 - `CommandID string`: framework idempotency ID (leave empty)
 
 `OpenOrder` validation:
-1. Error if `Tag` is empty, `CanOpen` is false, any numeric is NaN, `RiskRate` is outside [0,1], `CallbackPct` is outside [0.1,10], or both `Stop` and `Limit` are set.
-2. Entry price: current price (`Env.Close` during warmup); for limit orders take the better price by direction.
+1. Error if `Tag` is empty, `CanOpen` is false, any numeric is NaN, `RiskRate` is outside [0,1], `CallbackPct` is outside [0.05,50], or `Limit>0` is set with explicit `OrderTypeMarket`.
+2. Entry price: current price (`Env.Close` during warmup); for limit orders take the better price by direction; for `Stop>0 && Limit>0` compute the `Stop-Limit` reference entry price.
 3. Amount (when neither Amount nor LegalCost is specified): if `RiskRate>0` and a valid stop-loss is resolved (`|enterPrice-slPrice|>0`), `LegalCost=(s.AccountEquity()*RiskRate)/(|enterPrice-slPrice|/enterPrice)`, capped by max leverage (`AccountEquity()*leverage`) and `max_stake_amt`; otherwise `LegalCost=base amount×StakeRate×CostRate`; quantity exceeding the last-5-bar average volume×`open_vol_rate` is truncated; below `MinStakeAmount`(5.5): `ignore` errors; `keepBig` raises to 5.5×1.1 only when cost is >40% of 5.5, otherwise errors; `keepAll` always raises to 5.5×1.1.
-4. Stop-loss priority: `StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss` (entry price×(1∓ratio)); wrong direction (long stop ≥ entry price, etc.) → error; controlled by `ExgStopLoss`.
-5. Take-profit: `TakeProfitVal` > `TakeProfit` (`TakeProfitLimit` follows the same rule as StopLossLimit); wrong direction → error; `LongTPPrice` is not used.
+4. Stop-loss priority: `StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss` (entry price×(1∓ratio)); wrong direction (long stop ≥ entry price, etc.) → error; `ExgStopLoss=false` skips remote pre-posting while keeping local stop-loss monitoring active.
+5. Take-profit: when `TakeProfits` is set, validates each rung and total `ExitRate <= 1`; otherwise resolves `TakeProfitVal` > `TakeProfit` > `LongTPPrice/ShortTPPrice` (`TakeProfitLimit` follows the same rule as StopLossLimit), wrong direction → error.
 6. Returns nil on enqueue (`s.Entrys`, `OrderNum++`); with `Log=true` errors are written to the log.
 
 ### 3.6 ExitReq (close request)
@@ -484,15 +486,15 @@ Order events (chgType of `OnOrderChange`, `strat.OdChg*`): `OdChgNew`(0) new ord
 - Closing: default full close at market; `ExitRate=0.5` closes half (proportionally per order); filter via `EnterTag`/`OrderID`; `Limit` for limit orders. After a partial close the remaining order is still in `GetOrders`.
 
 ### 4.2 Stop-Loss and Take-Profit
-- `StopLossVal/TakeProfitVal` (distance) are most commonly used, `StopLoss/TakeProfit` are absolute prices; priority see §3.5. `*Rate` is the exit ratio after triggering (0=all), `*Limit` places a limit order after triggering (otherwise market).
-- Trailing stop: `ActivationPrice` (activates once reached) + `CallbackPct` (drawdown % from the peak, [0.1,10]). Modify at runtime: `s.SetAllStopLoss(dirt, &ormo.ExitTrigger{Price: …})` or `od.SetStopLoss(...)`.
+- `StopLossVal/TakeProfitVal` (distance) are most commonly used, `StopLoss/TakeProfit` are absolute prices; priority see §3.5. `*Rate` is the exit ratio after triggering (0=all), `*Limit` places a limit order after triggering (otherwise market). Multi-stage take-profit ladders use `TakeProfits []TakeProfitTarget` (with optional `MoveSLToBreakeven: true` to move the remaining stop-loss to entry price).
+- Trailing stop: `ActivationPrice` (activates once reached) + `CallbackPct` (drawdown % from the peak, [0.05,50]). Modify at runtime: `s.SetAllStopLoss(dirt, &ormo.ExitTrigger{Price: …})` or `od.SetStopLoss(...)`.
 
 **Exchange-side conditional orders**:
 - Backtest, `dry_run`: triggered by local simulation, no exchange access.
-- Live (`prod`): **after the order is fully entered** (`InOutStatusFullEnter`; not placed during partial fills), stop-loss and take-profit each call `CreateOrder` separately to place conditional orders: stop-loss `stop_loss` (with Limit it is `stop_loss_limit`), take-profit `take_profit_market` (with Limit it is `take_profit_limit`), quantity = current position×Rate (when 0<Rate<1); ClosePosition is not used (to avoid multiple orders overwriting each other), hedge mode relies on positionSide. Trailing stop (`CallbackPct`) places `trailing_stop_market` (callbackRate, optional activationPrice); a stop-loss with framework tag `trailing_stop` does not place a separate stop order.
+- Live (`prod`): **after the order is fully entered** (`InOutStatusFullEnter`; not placed during partial fills), stop-loss and take-profit each call `CreateOrder` separately to place conditional orders: stop-loss `stop_loss` (with Limit it is `stop_loss_limit`), take-profit `take_profit_market` (with Limit it is `take_profit_limit`), quantity = current position×Rate (when 0<Rate<1); ClosePosition is not used (to avoid multiple orders overwriting each other), hedge mode relies on positionSide. Trailing stop (`CallbackPct`) places `trailing_stop_market` (callbackRate, optional activationPrice); if `CallbackPct` exceeds the exchange's native cap or is rejected, it automatically falls back to `LiveOrderMgr` local price-monitored trailing stop without failing the order; a stop-loss with framework tag `trailing_stop` does not place a separate stop order.
 - banexg adaptation: Binance (spot/margin STOP_LOSS(_LIMIT)/TAKE_PROFIT(_LIMIT); futures STOP_MARKET/STOP/TAKE_PROFIT_MARKET/TAKE_PROFIT/TRAILING_STOP_MARKET), OKX (algo), Bybit (conditional) are all implemented; unsupported categories/types error on order placement.
 - Failure: if the error is "would trigger immediately" → close immediately at market; other failures only log ERROR, a failed update does not cancel the old order, **no automatic retry**, missing trigger orders are only re-placed on sync/restart. After `SetAll*`/`od.SetStopLoss` modifications, live re-edits/re-places the conditional orders.
-- For `ExgStopLoss/ExgTakeProfit=false` see §3.3 (also applies in backtest); to keep monitoring without placing orders, check and close yourself in `OnData`/`OnCheckExit`.
+- `ExgStopLoss/ExgTakeProfit=false` skips remote conditional order pre-posting in live trading while preserving local price-monitored triggers in both backtest and live (see §3.3).
 - Drawdown exit (`DrawDownExit=true`): the framework tracks the max floating-profit ratio maxChg; r comes from `GetDrawDownExitRate` (`>0` used, `0` not set, `<0`/unset uses the default table): maxChg >10% → r=0.15, >4% → 0.17, >2.5% → 0.25, >1.5% → 0.37, >0.7% → 0.5, otherwise disabled. Drawdown price = entry price×(1+maxChg×(1−r)×direction); if the current close has crossed it, close at market with tag `draw_down`, otherwise **override the order's stop-loss trigger with this price** (this replaces the stop-loss you set, and is synced to the exchange in live). Checked only when `OnCheckExit` returns nil.
 
 ### 4.3 Long/Short Restrictions
@@ -562,7 +564,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 14. Multi-input indicator caches attach to only one input, the combination must stay fixed; do not call indicators marked (full) multiple times in a loop (§2.3).
 16. Check NaN from `Series.Get` (`math.IsNaN(atr)`), especially when `WarmupNum` is not large enough.
 17. Jobs of the same symbol with different timeframes are independent Envs; use `DataSub` for cross-timeframe data.
-18. `DrawDownExit` overrides the order's stop-loss trigger (§4.2); `ExgStopLoss=false` discards the entry stop-loss (§3.3); `MAMA/VPCI/DX/Fisher` differ from standard definitions; do not use legacy APIs in new code.
+18. `DrawDownExit` overrides the order's stop-loss trigger (§4.2); `ExgStopLoss=false` hides remote pre-posting while keeping local stop-loss monitoring active (§3.3); `MAMA/VPCI/DX/Fisher` differ from standard definitions; do not use legacy APIs in new code.
 19. **A `TradeStrat` is shared by every symbol of the strategy** (the factory runs once per policy unless `pair_params` is configured): closure variables of the factory body and package-level variables are shared by all symbols. Keep state that changes per symbol (previous signal, peaks, trailing stop level, counters) in a struct assigned to `s.More` in `OnStartUp` and read it with `s.More.(*T)` in the callbacks; never use closure variables or a map keyed by symbol for it.
 20. Common compile errors: the symbol name string is `s.Symbol.Symbol` (`s.Symbol` is `*orm.ExSymbol`, not a string or map key); `pol.Params` is `map[string]float64`, hyperparameters are numeric only (0/1 switches), read with `pol.Def/DefInt`, there is no `DefBool/DefStr/core.PInt`; the direction argument `dirt` is a `float64`; bar times are `e.TimeStart/TimeStop` and the period is `e.TFMSecs` (no `e.Time/TFSecs`); order types live in `github.com/banbox/banbot/orm/ormo` (`*ormo.InOutOrder`, `*ormo.ExitTrigger`); `EnterReq` has no `Qty/Dirt` field (quantity `Amount`, amount `LegalCost`/`CostRate`, risk-fractional sizing `RiskRate`, short `Short: true`); read account equity/available balance/peak drawdown via `s.AccountEquity()` / `s.AvailableBalance()` / `s.AccountDrawdown()` (no `GetEquity`), and the base stake is `s.Strat.GetStakeAmount(s)`.
 

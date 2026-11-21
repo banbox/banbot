@@ -1665,6 +1665,9 @@ func (o *LiveOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.
 	if err := o.OrderMgr.UpdateByDataSeries(allOpens, evt); err != nil {
 		return err
 	}
+	if err := o.checkLocalProtectionsBySeries(allOpens, evt); err != nil {
+		return err
+	}
 	// Enforce StopBars for submitted limit entry orders in live mode.
 	curMS := o.priceNow()
 	for _, od := range allOpens {
@@ -1684,6 +1687,251 @@ func (o *LiveOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.
 		}
 	}
 	return nil
+}
+
+// CheckLocalTriggersByPrice evaluates locally monitored protections (ExgStopLoss=false,
+// ExgTakeProfit=false, multi-TP ladder local rungs, and local-fallback trailing stops)
+// against an observed real-time price.
+func (o *LiveOrderMgr) CheckLocalTriggersByPrice(symbol string, price float64) *errs.Error {
+	if o == nil || price <= 0 {
+		return nil
+	}
+	ods := o.openOrdersSnapshot()
+	for _, od := range ods {
+		if od == nil || od.Symbol != symbol || od.Status < ormo.InOutStatusPartEnter || od.Status >= ormo.InOutStatusFullExit {
+			continue
+		}
+		if err := o.evalLiveLocalOrderProtection(od, price, price, price); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *LiveOrderMgr) checkLocalProtectionsBySeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
+	if evt == nil {
+		return nil
+	}
+	closeVal, err := evt.CloseValue()
+	if err != nil || closeVal <= 0 {
+		return nil
+	}
+	highVal, err := evt.HighValue()
+	if err != nil || highVal <= 0 {
+		highVal = closeVal
+	}
+	lowVal, err := evt.LowValue()
+	if err != nil || lowVal <= 0 {
+		lowVal = closeVal
+	}
+	symbol := evt.Symbol()
+	tf := evt.TimeFrame
+	for _, od := range allOpens {
+		if od == nil || od.Symbol != symbol || od.Status < ormo.InOutStatusPartEnter || od.Status >= ormo.InOutStatusFullExit {
+			continue
+		}
+		matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
+		if tf != matchTf {
+			continue
+		}
+		if err := o.evalLiveLocalOrderProtection(od, highVal, lowVal, closeVal); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *LiveOrderMgr) evalLiveLocalOrderProtection(od *ormo.InOutOrder, highVal, lowVal, closeVal float64) *errs.Error {
+	lock := od.Lock()
+	if od.Status < ormo.InOutStatusPartEnter || od.Status >= ormo.InOutStatusFullExit ||
+		od.Exit != nil || od.ExitTag != "" || od.HoldAmount() <= AmtDust {
+		lock.Unlock()
+		return nil
+	}
+	od.UpdateProfits(closeVal)
+	// Advance local trailing stop when no remote TrailingID is active.
+	if od.GetInfoFloat64(ormo.OdInfoCallbackPct) > 0 && od.GetInfoString(ormo.OdInfoTrailingID) == "" {
+		bestRef := highVal
+		if od.Short {
+			bestRef = lowVal
+		}
+		_ = od.UpdateTrailing(bestRef)
+		_ = od.UpdateTrailing(closeVal)
+	}
+	sl := od.GetStopLoss()
+	localSL := sl != nil && sl.ExitTrigger != nil && sl.Price > 0 && sl.OrderId == "" &&
+		(od.IsLocalStopLoss() || sl.Tag == core.ExitTagTrailingStop || od.GetInfoInt64(ormo.OdInfoLocalTrailing) > 0)
+	hitSL := localSL && (od.Short && highVal >= sl.Price || !od.Short && lowVal <= sl.Price)
+	if hitSL {
+		exitTag := sl.Tag
+		if exitTag == "" {
+			exitTag = core.ExitTagStopLoss
+			if od.ProfitRate >= 0 {
+				exitTag = core.ExitTagSLTake
+			}
+		}
+		odType := banexg.OdTypeMarket
+		limit := 0.0
+		if sl.Limit > 0 {
+			odType = banexg.OdTypeLimit
+			limit = sl.Limit
+		}
+		targetOd := od
+		if sl.Rate > 0 && sl.Rate < 0.99 && od.HoldAmount()*(1-sl.Rate) > AmtDust {
+			part := o.CutOrder(od, sl.Rate, 0)
+			clearSplitPartProtections(part)
+			_ = od.SetStopLoss(nil)
+			_ = od.Save()
+			targetOd = part
+		}
+		o.setExit(targetOd, o.priceNow(), exitTag, odType, limit)
+		lock.Unlock()
+		return o.dispatchLiveLocalExit(targetOd)
+	}
+
+	// Check local multi-stage TakeProfits ladder or single local TakeProfit.
+	rungIdx, rung, cutFrac := od.NextTakeProfitRung()
+	if rung != nil {
+		tpActive := od.GetTakeProfit()
+		localRung := od.IsLocalTakeProfit() || tpActive == nil || tpActive.OrderId == ""
+		hitRung := localRung && (od.Short && lowVal <= rung.Price || !od.Short && highVal >= rung.Price)
+		if hitRung {
+			exitTag := rung.Tag
+			if exitTag == "" {
+				exitTag = core.ExitTagTakeProfit
+			}
+			odType := banexg.OdTypeMarket
+			limit := 0.0
+			if rung.Limit > 0 {
+				odType = banexg.OdTypeLimit
+				limit = rung.Limit
+			}
+			moveBE := rung.MoveSLToBreakeven
+			od.CompleteTakeProfitRung(rungIdx)
+			isPartial := cutFrac > 0 && cutFrac < 0.99 && od.HoldAmount()*(1-cutFrac) > AmtDust
+			if isPartial {
+				part := o.CutOrder(od, cutFrac, 0)
+				clearSplitPartProtections(part)
+				if moveBE {
+					od.TightenSLToBreakeven(0)
+				}
+				syncActiveLadderTakeProfit(od)
+				resetTriggerOldForResize(od)
+				if !od.IsLocalStopLoss() {
+					o.editTriggerOd(od, ormo.OdActionStopLoss)
+				}
+				if !od.IsLocalTakeProfit() {
+					o.editTriggerOd(od, ormo.OdActionTakeProfit)
+				}
+				_ = od.Save()
+				o.setExit(part, o.priceNow(), exitTag, odType, limit)
+				lock.Unlock()
+				return o.dispatchLiveLocalExit(part)
+			}
+			o.setExit(od, o.priceNow(), exitTag, odType, limit)
+			lock.Unlock()
+			return o.dispatchLiveLocalExit(od)
+		}
+		lock.Unlock()
+		return nil
+	}
+
+	tp := od.GetTakeProfit()
+	localTP := tp != nil && tp.ExitTrigger != nil && tp.Price > 0 && tp.OrderId == "" && od.IsLocalTakeProfit()
+	hitTP := localTP && (od.Short && lowVal <= tp.Price || !od.Short && highVal >= tp.Price)
+	if hitTP {
+		exitTag := tp.Tag
+		if exitTag == "" {
+			exitTag = core.ExitTagTakeProfit
+		}
+		odType := banexg.OdTypeMarket
+		limit := 0.0
+		if tp.Limit > 0 {
+			odType = banexg.OdTypeLimit
+			limit = tp.Limit
+		}
+		targetOd := od
+		if tp.Rate > 0 && tp.Rate < 0.99 && od.HoldAmount()*(1-tp.Rate) > AmtDust {
+			part := o.CutOrder(od, tp.Rate, 0)
+			clearSplitPartProtections(part)
+			_ = od.SetTakeProfit(nil)
+			_ = od.Save()
+			targetOd = part
+		}
+		o.setExit(targetOd, o.priceNow(), exitTag, odType, limit)
+		lock.Unlock()
+		return o.dispatchLiveLocalExit(targetOd)
+	}
+	lock.Unlock()
+	return nil
+}
+
+func (o *LiveOrderMgr) dispatchLiveLocalExit(targetOd *ormo.InOutOrder) *errs.Error {
+	if targetOd == nil {
+		return nil
+	}
+	if atomic.LoadInt32(&o.isConsumeOrderQ) == 1 {
+		if err := targetOd.Save(); err != nil {
+			o.Logger().Error("save local trigger exit fail", zap.String("key", targetOd.Key()), zap.Error(err))
+		}
+		o.queue <- &OdQItem{Order: targetOd, Action: ormo.OdActionExit}
+		return nil
+	}
+	lock := targetOd.Lock()
+	defer lock.Unlock()
+	err := o.execOrderExit(targetOd)
+	if targetOd.IsDirty() {
+		_ = targetOd.Save()
+	}
+	return err
+}
+
+func syncActiveLadderTakeProfit(od *ormo.InOutOrder) {
+	if od == nil || od.GetTakeProfits() == nil {
+		return
+	}
+	_, rung, cutFrac := od.NextTakeProfitRung()
+	if rung == nil {
+		if tp := od.GetTakeProfit(); tp != nil {
+			tp.ExitTrigger = &ormo.ExitTrigger{}
+			od.DirtyInfo = true
+		}
+		return
+	}
+	tag := rung.Tag
+	if tag == "" {
+		tag = core.ExitTagTakeProfit
+	}
+	rate := cutFrac
+	if rate >= 0.999 {
+		rate = 0
+	}
+	tp := od.GetTakeProfit()
+	if tp == nil {
+		tp = &ormo.TriggerState{}
+	}
+	tp.ExitTrigger = &ormo.ExitTrigger{
+		Price: rung.Price,
+		Limit: rung.Limit,
+		Rate:  rate,
+		Tag:   tag,
+	}
+	tp.Hit = false
+	tp.Range = math.Abs(od.InitPrice - rung.Price)
+	od.SetInfo(ormo.OdInfoTakeProfit, tp)
+	od.DirtyInfo = true
+}
+
+func resetTriggerOldForResize(od *ormo.InOutOrder) {
+	if od == nil {
+		return
+	}
+	if sl := od.GetStopLoss(); sl != nil {
+		sl.Old = nil
+	}
+	if tp := od.GetTakeProfit(); tp != nil {
+		tp.Old = nil
+	}
 }
 
 func (o *LiveOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
@@ -1785,10 +2033,11 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 		}
 	}
 	lock := od.Lock()
-	defer lock.Unlock()
+	entered := false
 	switch action {
 	case ormo.OdActionEnter:
 		err = o.execOrderEnter(od)
+		entered = od.Status >= ormo.InOutStatusPartEnter && od.Status < ormo.InOutStatusFullExit
 	case ormo.OdActionExit:
 		err = o.execOrderExit(od)
 	case ormo.OdActionStopLoss, ormo.OdActionTakeProfit:
@@ -1798,6 +2047,7 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 	case ormo.OdActionTrailing:
 		o.setTrailingStop(od)
 	default:
+		lock.Unlock()
 		o.Logger().Error("unknown od action", zap.String("action", action), zap.String("key", od.Key()))
 		return
 	}
@@ -1833,6 +2083,10 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 			logFields = append(logFields, zap.String("exitTag", od.ExitTag))
 			o.Logger().Info("Exit Order Closed", logFields...)
 		}
+	}
+	lock.Unlock()
+	if entered && od.OCOGroup != "" {
+		o.cancelOCOSiblings(od)
 	}
 }
 
@@ -2052,7 +2306,6 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 		}
 	}
 	lock := iod.Lock()
-	defer lock.Unlock()
 	if isTriggerTrade(trade) {
 		// A triggered Binance futures order may have a new order ID. In that case
 		// the client ID and trigger type must still identify this exact exit.
@@ -2066,6 +2319,7 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 		}
 		_, matchedTrigger := o.matchTriggerExitTrade(iod, trade)
 		if trade.Order == "" || trade.Order != enterID && trade.Order != exitID && !matchedTrigger {
+			lock.Unlock()
 			return
 		}
 	}
@@ -2089,10 +2343,13 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 			zap.String("trade", trade.ID), zap.String("side", trade.Side),
 			zap.String("clientId", trade.ClientID), zap.String("order", trade.Order))
 	}
+	entered := iod.Status >= ormo.InOutStatusPartEnter && iod.Status < ormo.InOutStatusFullExit
 	if iod.IsDirty() {
 		if iod.Status == ormo.InOutStatusFullEnter {
 			// Place stop loss and take profit orders only after full entry
 			// 仅在完全入场后，下止损止盈单
+			iod.ResolveTakeProfits(iod.Enter.Average)
+			syncActiveLadderTakeProfit(iod)
 			o.setTrailingStop(iod)
 			o.editTriggerOd(iod, ormo.OdActionStopLoss)
 			o.editTriggerOd(iod, ormo.OdActionTakeProfit)
@@ -2102,6 +2359,10 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 			o.Logger().Error("save od from myTrade fail", zap.String("acc", o.Account),
 				zap.String("key", iod.Key()), zap.Error(err))
 		}
+	}
+	lock.Unlock()
+	if entered && iod.OCOGroup != "" {
+		o.cancelOCOSiblings(iod)
 	}
 }
 
@@ -2295,6 +2556,9 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 	triggerTag, matchedTrigger := o.matchTriggerExitTrade(od, trade)
 	isStopLoss := matchedTrigger && triggerTag == core.ExitTagStopLoss
 	isTakeProfit := matchedTrigger && triggerTag == core.ExitTagTakeProfit
+	if !isEnter && isTakeProfit && subOd == nil && stateIsPartialLadderFill(od, trade) {
+		return o.applyLadderTakeProfitTrade(od, trade)
+	}
 	if isEnter {
 		subOd = od.Enter
 		dirtTag = "exit"
@@ -2768,6 +3032,8 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		if od.Status == ormo.InOutStatusFullEnter {
 			// Place stop loss and take profit orders only after full entry
 			// 仅在完全入场后，下止损止盈单
+			od.ResolveTakeProfits(od.Enter.Average)
+			syncActiveLadderTakeProfit(od)
 			o.setTrailingStop(od)
 			o.editTriggerOd(od, ormo.OdActionStopLoss)
 			o.editTriggerOd(od, ormo.OdActionTakeProfit)
@@ -3369,6 +3635,9 @@ func isMissingFullEnterTrigger(od *ormo.InOutOrder, key string) bool {
 	if od == nil || od.Status != ormo.InOutStatusFullEnter || od.Exit != nil || od.HoldAmount() <= AmtDust {
 		return false
 	}
+	if key == ormo.OdInfoStopLoss && od.IsLocalStopLoss() || key == ormo.OdInfoTakeProfit && od.IsLocalTakeProfit() {
+		return false
+	}
 	tg := od.GetExitTrigger(key)
 	return tg != nil && tg.ExitTrigger != nil && tg.Price > 0 && tg.OrderId == "" &&
 		!(key == ormo.OdInfoStopLoss && tg.Tag == core.ExitTagTrailingStop)
@@ -3860,6 +4129,8 @@ func (o *LiveOrderMgr) applyAuthoritativeEnterOrder(od *ormo.InOutOrder, res *ba
 		return err
 	}
 	if od.Status == ormo.InOutStatusFullEnter && !wasFullEnter {
+		od.ResolveTakeProfits(od.Enter.Average)
+		syncActiveLadderTakeProfit(od)
 		o.setTrailingStop(od)
 		o.editTriggerOd(od, ormo.OdActionStopLoss)
 		o.editTriggerOd(od, ormo.OdActionTakeProfit)
@@ -4074,20 +4345,38 @@ func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 			if err != nil {
 				o.Logger().Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
-			od.SetInfo(ormo.OdInfoCallbackPct, 0.0)
-			od.SetInfo(ormo.OdInfoActivePrice, nil)
-			od.SetInfo(ormo.OdInfoTrailingID, "")
-			od.SetInfo(ormo.OdInfoTrailingBest, nil)
+		}
+		od.SetInfo(ormo.OdInfoCallbackPct, 0.0)
+		od.SetInfo(ormo.OdInfoActivePrice, nil)
+		od.SetInfo(ormo.OdInfoTrailingID, "")
+		od.SetInfo(ormo.OdInfoTrailingBest, nil)
+		od.SetInfo(ormo.OdInfoLocalTrailing, nil)
+		return
+	}
+	entryRef := od.InitPrice
+	if od.Enter != nil && od.Enter.Average > 0 {
+		entryRef = od.Enter.Average
+	}
+	if od.IsLocalStopLoss() {
+		od.SetInfo(ormo.OdInfoTrailingID, "")
+		od.SetInfo(ormo.OdInfoLocalTrailing, int64(1))
+		_ = od.UpdateTrailing(entryRef)
+		if err := od.Save(); err != nil {
+			o.Logger().Error("save local trailing order fail", zap.String("key", od.Key()), zap.Error(err))
 		}
 		return
 	}
 	exchange := o.exchangeClient()
 	if exchange == nil {
+		od.SetInfo(ormo.OdInfoLocalTrailing, int64(1))
+		_ = od.UpdateTrailing(entryRef)
 		return
 	}
 	clientID, clientErr := o.buildClientOrderID(od, true)
 	if clientErr != nil {
 		o.Logger().Error("build trailing client order id fail", zap.String("key", od.Key()), zap.Error(clientErr))
+		od.SetInfo(ormo.OdInfoLocalTrailing, int64(1))
+		_ = od.UpdateTrailing(entryRef)
 		return
 	}
 	params := map[string]interface{}{
@@ -4125,10 +4414,15 @@ func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 		zap.Float64("activePrice", activePrice))
 	res, err := exchange.CreateOrder(od.Symbol, odType, side, amt, 0, params)
 	if err != nil {
-		o.Logger().Error("put trigger fail", zap.String("key", od.Key()), zap.Error(err))
+		// Exchange rejected native trailing stop (e.g. CallbackPct outside venue cap): fallback to local price-monitored trailing stop.
+		o.Logger().Warn("exchange trailing trigger rejected, fallback to local trailing stop",
+			zap.String("key", od.Key()), zap.Float64("callbackRate", callRate), zap.Error(err))
+		od.SetInfo(ormo.OdInfoTrailingID, "")
+		od.SetInfo(ormo.OdInfoLocalTrailing, int64(1))
+		_ = od.UpdateTrailing(entryRef)
 	} else {
 		oldID := od.GetInfoString(ormo.OdInfoTrailingID)
-		if oldID != "" {
+		if oldID != "" && (res == nil || oldID != res.ID) {
 			_, err = exchange.CancelOrder(oldID, od.Symbol, map[string]interface{}{
 				banexg.ParamAccount: o.Account,
 			})
@@ -4136,7 +4430,10 @@ func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 				o.Logger().Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
 		}
-		od.SetInfo(ormo.OdInfoTrailingID, res.ID)
+		od.SetInfo(ormo.OdInfoLocalTrailing, nil)
+		if res != nil {
+			od.SetInfo(ormo.OdInfoTrailingID, res.ID)
+		}
 	}
 	err = od.Save()
 	if err != nil {
@@ -4149,7 +4446,26 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		return
 	}
 	tg := od.GetExitTrigger(prefix)
-	if tg == nil || tg.OrderId != "" && tg.Old != nil && tg.Old.Equal(tg.ExitTrigger) {
+	if tg == nil {
+		return
+	}
+	if prefix == ormo.OdActionStopLoss && od.IsLocalStopLoss() || prefix == ormo.OdActionTakeProfit && od.IsLocalTakeProfit() {
+		if tg.OrderId != "" {
+			if exchange := o.exchangeClient(); exchange != nil {
+				_, err := exchange.CancelOrder(tg.OrderId, od.Symbol, map[string]interface{}{
+					banexg.ParamAccount: o.Account,
+				})
+				if err != nil {
+					o.Logger().Error("cancel remote trigger for local-only mode fail", zap.String("key", od.Key()), zap.Error(err))
+				}
+			}
+			tg.OrderId = ""
+			tg.ClientId = ""
+			od.DirtyInfo = true
+		}
+		return
+	}
+	if tg.OrderId != "" && tg.Old != nil && tg.Old.Equal(tg.ExitTrigger) {
 		return
 	}
 	tg.SaveOld()
@@ -4342,6 +4658,119 @@ cancelTriggerOds
 Cancel the associated order of the order. When the order is closed, the associated stop loss order and take profit order will not be automatically exited, and this method needs to be called to exit
 取消订单的关联订单。订单在平仓时，关联的止损单止盈单不会自动退出，需要调用此方法退出
 */
+func stateIsPartialLadderFill(od *ormo.InOutOrder, trade *banexg.MyTrade) bool {
+	if od == nil || trade == nil || trade.State != banexg.OdStatusFilled || od.GetTakeProfits() == nil {
+		return false
+	}
+	return trade.Filled > AmtDust && trade.Filled < od.HoldAmount()-AmtDust
+}
+
+func (o *LiveOrderMgr) applyLadderTakeProfitTrade(od *ormo.InOutOrder, trade *banexg.MyTrade) *errs.Error {
+	rungIdx, rung, _ := od.NextTakeProfitRung()
+	exitTag := core.ExitTagTakeProfit
+	moveBE := false
+	if rung != nil {
+		if rung.Tag != "" {
+			exitTag = rung.Tag
+		}
+		moveBE = rung.MoveSLToBreakeven
+		od.CompleteTakeProfitRung(rungIdx)
+	}
+	cutRate := trade.Filled / od.Enter.Amount
+	part := o.CutOrder(od, cutRate, 0)
+	clearSplitPartProtections(part)
+	o.setExit(part, trade.Timestamp, exitTag, trade.Type, trade.Average)
+	part.Exit.OrderID = trade.Order
+	part.Exit.Amount = trade.Filled
+	part.Exit.Filled = trade.Filled
+	part.Exit.Average = trade.Average
+	part.Exit.Price = trade.Average
+	part.Exit.UpdateAt = trade.Timestamp
+	part.Exit.Status = ormo.OdStatusClosed
+	if trade.Fee != nil {
+		part.Exit.FeeType = trade.Fee.Currency
+		part.Exit.Fee = trade.Fee.Cost
+		part.Exit.FeeQuote = trade.Fee.QuoteCost
+	}
+	part.Status = ormo.InOutStatusFullExit
+	part.DirtyMain = true
+	part.DirtyExit = true
+	if err := o.finishOrder(part); err != nil {
+		return err
+	}
+	if tp := od.GetTakeProfit(); tp != nil {
+		tp.OrderId = ""
+		tp.ClientId = ""
+	}
+	if moveBE {
+		od.TightenSLToBreakeven(0)
+	}
+	syncActiveLadderTakeProfit(od)
+	resetTriggerOldForResize(od)
+	if od.GetInfoString(ormo.OdInfoTrailingID) != "" {
+		o.setTrailingStop(od)
+	}
+	if !od.IsLocalStopLoss() {
+		o.editTriggerOd(od, ormo.OdActionStopLoss)
+	}
+	if !od.IsLocalTakeProfit() {
+		o.editTriggerOd(od, ormo.OdActionTakeProfit)
+	}
+	od.DirtyMain = true
+	od.DirtyEnter = true
+	od.DirtyInfo = true
+	o.callBack(part, false)
+	o.fireOdChange(part, strat.OdChgExitFill)
+	return nil
+}
+
+func (o *LiveOrderMgr) cancelOCOSiblings(od *ormo.InOutOrder) {
+	if o == nil || od == nil || od.OCOGroup == "" {
+		return
+	}
+	allOds := o.openOrdersSnapshot()
+	var siblings []*ormo.InOutOrder
+	for _, other := range allOds {
+		if other == nil || other.ID == od.ID || other.OCOGroup != od.OCOGroup ||
+			other.Symbol != od.Symbol || other.Strategy != od.Strategy {
+			continue
+		}
+		if other.Status == ormo.InOutStatusInit && other.ExitTag == "" && (other.Enter == nil || other.Enter.Filled == 0) {
+			siblings = append(siblings, other)
+		}
+	}
+	for _, sib := range siblings {
+		lock := sib.Lock()
+		if sib.Status != ormo.InOutStatusInit || sib.ExitTag != "" || (sib.Enter != nil && sib.Enter.Filled > 0) {
+			lock.Unlock()
+			continue
+		}
+		sib.SetInfo(odInfoLocalTrigger, nil)
+		triggerOds, trigLock := o.triggerOrders()
+		trigLock.Lock()
+		if pairMap := triggerOds[sib.Symbol]; pairMap != nil {
+			delete(pairMap, sib.ID)
+		}
+		trigLock.Unlock()
+		if sib.Enter != nil && sib.Enter.OrderID != "" {
+			sib.ExitTag = ExitTagOCOCancel
+			_ = o.tryExitPendingEnter(sib)
+			if sib.ExitTag == core.ExitTagForceExit {
+				sib.ExitTag = ExitTagOCOCancel
+			}
+		} else {
+			if sib.QuoteCost > 0 {
+				_, quote, _, _ := core.SplitSymbol(sib.Symbol)
+				o.walletsForOrder().Cancel(sib.Key(), quote, 0, true)
+			}
+			_ = o.localExit(sib, o.priceNow(), ExitTagOCOCancel, sib.InitPrice, "oco_cancel", "")
+			o.fireOdChange(sib, strat.OdChgExitFill)
+			o.forceDelOd(sib, nil)
+		}
+		lock.Unlock()
+	}
+}
+
 func cancelTriggerOds(od *ormo.InOutOrder, account string) {
 	cancelTriggerOdsWithExchange(exg.Default, od, account)
 }

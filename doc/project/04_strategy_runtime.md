@@ -46,7 +46,7 @@
 
 - **`TradeStrat`**（`strat/types.go:24`）：策略定义。配置字段（`WarmupNum`、`MinTfScore`、`StopLoss`、`StakeRate`、`EachMaxLong/Short`、`OrderOnRotation`、`BatchInOut/BatchInfo`、`RunTimeFrames`、`RefineTF`、`WsSubs` 等）与回调（`OnStartUp`、`OnDataSubs`、`OnSymbols`、`OnData`、`OnCheckExit`、`OnOrderChange`、`OnBatchJobs/OnBatchInfos`、`OnWs*`、`PickTimeFrame`、`GetDrawDownExitRate`、`OnShutDown`、`OnStratExit`）。`OnBar`/`OnInfoBar` 为旧接口，与 `OnData` 同设会在构造时 panic（`data_event.go:50`）。运行期实例按 policy 克隆（`state.go:821 NewStrategy` → `cloneTradeStrat`）。
 - **`StratJob`**（`types.go:114`）：运行上下文。公开字段（`Env`、`DataHub`、`Entrys/Exits`、`LongOrders/ShortOrders`、`OrderNum/EnteredNum`、`MaxOpenLong/Short`、`CloseLong/Short`、`ExgStopLoss/ExgTakeProfit`、`LongSLPrice` 等、`More`）保持策略兼容；私有字段绑定 `symbols`、`strategyState`、`runtimeCore`、`runtimePrices`、`runtimeClock`，并通过原子指针懒创建 `executionStateMu`（每 Job 一把细粒度锁，`execution_state.go:92`）。读写可变执行状态应走 `ExecutionSnapshot()` 与 typed 方法；只读账户资金与风控状态通过 `AccountEquity()`、`AvailableBalance()`、`AccountDrawdown()` 查询（`account_state.go`）。
-- **`EnterReq` / `ExitReq`**（`types.go:197,231`）：信号意图。`Tag` 必填（入场；有订单时的平仓），`EnterReq.RiskRate` 支持按账户权益风险比例自动定仓。`Clone()` 与 `GetZapFields()` 在 `common.go:189/227/288/307`，新增字段必须同步。`CommandID` 为幂等键：空时由 `WithOrderEvent` 上下文派生为 `<事件ID>/entry/<序号>`（`execution_state.go:270-311`）。
+- **`EnterReq` / `ExitReq`**（`strat/types.go`）：信号意图。`Tag` 必填（入场；有订单时的平仓），`EnterReq.RiskRate` 支持按账户权益风险比例自动定仓；支持同时指定 `Stop > 0` 与 `Limit > 0`（`Stop-Limit` 触发限价入场）、多级阶梯止盈 `TakeProfits []TakeProfitTarget`（含 `MoveSLToBreakeven` 保本移损）以及 `OCOGroup` 挂单互斥取消组。`Clone()` 与 `GetZapFields()` 在 `strat/common.go`，新增字段必须同步。`CommandID` 为幂等键：空时由 `WithOrderEvent` 上下文派生为 `<事件ID>/entry/<序号>`（`strat/execution_state.go`）。
 - **`DataEvent` / `DataRole` / `RouteData`**（`data_event.go`）：`DataRoleMain=1`（主 K 线）、`DataRoleInfo=2`（辅助）、`DataRoleCustom=3`（自定义序列）。`RouteData` 每个事件至多调用一个角色处理器。
 - **`DataHub` / `DataFields`**（`datahub.go`）：`timeframe → source → sid` 三级视图，默认历史截断上限与主周期 `BarEnv` 对齐（`max(1500, NumTaCache)`，绑定 `StratJob` 时取 `max(1500, NumTaCache, WarmupNum+100)`，亦可通过 `DataHub.SetMaxCache`/`DataFields.SetMaxCache` 显式调整）。当事件为 K 线源（`source == "kline"`）或含标准 OHLCV 字段时，`DataFields` 内部维护并同步推进完整的 `*ta.BarEnv`（`Open/High/Low/Close/Volume/Quote/BuyVolume/TradeNum` 全非 nil，可通过 `df.BarEnv()` 或 `df.Series("close").Env` 直接用于 `ta.MFI`/`ta.WillR`/`ta.HeikinAshi`/`ta.ATR` 等指标），同时完整保留 `DataSeries.Values` 自定义扩展列与 `rawMap` 显式 nil（区分缺失与 NULL）语义。`StratJob.RefKlineSub(symbol, tf, warmupNum...)` 按当前任务交易所与市场自动规范化符号并在 `SymbolState` 中解析/Ensure 只读 `*orm.ExSymbol`（仅注册 `accInfoJobs` 辅助行情源，不创建交易 `StratJob`），配合 `StratJob.RefEnv(symbol, tf)` 直接读取对应 `*ta.BarEnv`（未到达首根 bar 前返回 nil）。`AllReady()` 只检查当前时间会收盘的周期。
 - **`State`**（`state.go:29`）：策略域 typed 状态。绑定 `Core/Clock/Config/Symbols/Exchange`、账户与订单状态（`runtimeAccounts`、`runtimeOrders`、`orderProcessor`、`accountMetrics` 及按账户维护的净值峰值 `accountPeakEquities`）；注册表 `accJobs`（账户 → envKey → 策略名 → Job）、`accInfoJobs`（辅助订阅）、`pairStrats`、`envs`、`versions`、`forbidJobs`、`wsSubJobs`；并维护不可变快照与 dirty bit。`legacyState`（`state.go:515`）是包级全局变量的兼容视图，`IsLegacyState` 用于分支。
@@ -79,13 +79,13 @@
 4. 辅助周期：`onAccountInfoSeries`（`biz/trader.go:883`）对订阅该 key 的 Job 调用 `SetData` 与 `OnData(DataRoleInfo)`（或旧接口 `OnInfoBar`），已在主路径处理过的 Job 通过 `handledJobs` 去重。
 5. 批量：`BatchState.TakeReady` 就绪后调用 `OnBatchJobs`/`OnBatchInfos`（`biz/biz.go:541`）。
 
-### 4. 开单意图（`strat/base.go:270 OpenOrder` → `openOrder:287`）
-1. 基础校验：`Tag` 非空；`CanOpen(short)`（`MaxOpenLong/Short`、现货禁止开空，`base.go:235`）；NaN、`RiskRate`（`[0, 1]`）与 `CallbackPct` 范围；`Stop` 与 `Limit` 互斥（`base.go:352`）。
-2. 价格：预热期用 `Env.Close`，否则 `currentPrice(side)`；限价取更优价。
+### 4. 开单意图（`strat/base.go:OpenOrder` → `strat/base.go:openOrder`）
+1. 基础校验：`Tag` 非空；`CanOpen(short)`（`MaxOpenLong/Short`、现货禁止开空，`strat/base.go:CanOpen`）；NaN、`RiskRate`（`[0, 1]`）与 `CallbackPct`（`[0.05, 50]`）范围；显式 `OrderTypeMarket` 时拒绝 `Limit > 0`。
+2. 价格：预热期用 `Env.Close`，否则 `currentPrice(side)`；限价取更优价；同时设置 `Stop > 0` 与 `Limit > 0` 时保留 `Stop-Limit` 双参数（触发价已越过时退化为限价挂单）。
 3. 金额：未显式指定 `Amount` 与 `LegalCost` 时，若 `RiskRate > 0` 且解析出有效止损价（`|enterPrice - slPrice| > 0`），按 `LegalCost = (s.AccountEquity() * req.RiskRate) / (|enterPrice - slPrice| / enterPrice)` 计算并受账户/请求最大杠杆与 `max_stake_amt` 封顶；否则按 `LegalCost = 基准金额 × StakeRate × CostRate` 计算；随后统一经 `open_vol_rate` 与 `MinStakeAmount` 约束。
-4. 止损：`StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss`；方向错误返回错误。受 `ExgStopLoss` 控制（为 false 时整体丢弃并跳过校验，`base.go:429`）。
-5. 止盈：`TakeProfitVal` > `TakeProfit`；`LongTPPrice/ShortTPPrice` 不生效。
-6. `enqueueEntry`（`execution_state.go:270`）：预热期返回 false（调用方仍得到 nil）；否则追加 `s.Entrys` 并 `OrderNum++`。
+4. 止损：`StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss`（`strat/base.go:resolveStopLossPrice`）；方向错误返回错误。`ExgStopLoss=false` 时写入 `ormo.OdInfoLocalStopLoss` 标记，实盘不在远端交易所预挂止损/追踪条件单，但回测与实盘均继续保留本地价格监控止损。
+5. 止盈：指定 `TakeProfits` 时校验各级 `Price/Val/Rate` 与 `ExitRate`（总和不超过 1，且与单级 `TakeProfit` 互斥）；未指定 `TakeProfits` 时按 `TakeProfitVal` > `TakeProfit` > `LongTPPrice/ShortTPPrice`（`strat/base.go:resolveTakeProfitPrice`）解析并校验方向；`ExgTakeProfit=false` 时写入 `ormo.OdInfoLocalTakeProfit` 标记仅本地监控止盈。
+6. `enqueueEntry`（`strat/execution_state.go:enqueueEntry`）：预热期返回 false（调用方仍得到 nil）；否则追加 `s.Entrys` 并 `OrderNum++`。
 
 ### 5. 平仓意图（`base.go:527 CloseOrders` → `closeOrders:544`）
 1. 同向无订单直接返回 nil；`Tag` 必填；`CloseLong/CloseShort` 为 false 时报错。

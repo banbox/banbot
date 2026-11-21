@@ -326,7 +326,11 @@ func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *or
 	o.beginSimOrderMatch()
 	defer func() { newOrderCount = o.endSimOrderMatch() }()
 	bar := seriesOHLCVCompat(evt)
+	var handledOCO map[string]bool
 	for _, od := range orders {
+		if od == nil || od.Status >= ormo.InOutStatusFullExit {
+			continue
+		}
 		matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
 		if evt != nil && evt.TimeFrame != matchTf {
 			continue
@@ -334,12 +338,28 @@ func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *or
 		exOrder := getPendingSub(od)
 		if exOrder == nil {
 			if od.ExitTag == "" && evt != nil {
-				// 已入场完成，尚未出现出场信号，检查是否触发止损The entry has been completed, but the exit signal has not yet appeared. Check whether the stop loss is triggered.
+				// 已入场完成，尚未出现出场信号，检查是否触发止损/止盈
 				err := o.tryFillTriggers(od, bar, matchTf, 0)
 				if err != nil {
 					return 0, 0, err
 				}
 			}
+			continue
+		}
+		if exOrder.Enter && evt != nil && od.OCOGroup != "" {
+			ocoKey := od.Symbol + "\x00" + od.Strategy + "\x00" + od.OCOGroup
+			if handledOCO[ocoKey] {
+				continue
+			}
+			if handledOCO == nil {
+				handledOCO = make(map[string]bool)
+			}
+			handledOCO[ocoKey] = true
+			filled, err := o.matchOCOPendingGroup(orders, od.Symbol, od.Strategy, od.OCOGroup, bar, evt.TimeFrame)
+			if err != nil {
+				return 0, 0, err
+			}
+			affectNum += filled
 			continue
 		}
 		odType := o.orderType()
@@ -504,6 +524,8 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	od.Status = ormo.InOutStatusFullEnter
 	od.DirtyEnter = true
 	od.DirtyMain = true
+	od.ResolveTakeProfits(entPrice)
+	o.cancelOCOSiblings(od, fillMS)
 	err = od.UpdateTrailing(entPrice)
 	if err != nil {
 		return err
@@ -518,6 +540,131 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	o.callBack(od, true)
 	o.fireOdChange(od, strat.OdChgEnterFill)
 	return nil
+}
+
+func (o *LocalOrderMgr) matchOCOPendingGroup(orders []*ormo.InOutOrder, symbol, strategy, ocoGroup string,
+	bar *orm.SeriesOHLCV, tf string,
+) (int, *errs.Error) {
+	type ocoCandidate struct {
+		od      *ormo.InOutOrder
+		matchTf string
+		tfSecs  int
+		fill    execution.OHLCFill
+		matched bool
+	}
+	profile := o.ohlcProfile()
+	netCost := o.backtestNetCost()
+	var candidates []ocoCandidate
+	for _, od := range orders {
+		if od == nil || od.Status != ormo.InOutStatusInit || od.ExitTag != "" ||
+			od.Symbol != symbol || od.Strategy != strategy || od.OCOGroup != ocoGroup {
+			continue
+		}
+		matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
+		if matchTf != tf {
+			continue
+		}
+		exOrder := getPendingSub(od)
+		if exOrder == nil || !exOrder.Enter {
+			continue
+		}
+		odType := o.orderType()
+		if exOrder.OrderType != "" {
+			odType = exOrder.OrderType
+		}
+		tfSecs := utils.TFToSecs(matchTf)
+		fill, matched := profile.MatchPending(bar, execution.OHLCOrder{
+			OrderType: odType, IsBuy: exOrder.Side == banexg.OdSideBuy,
+			Enter: true, Short: od.Short, Price: exOrder.Price,
+			Stop: od.Stop, CreateAt: exOrder.CreateAt,
+		}, tfSecs, netCost)
+		candidates = append(candidates, ocoCandidate{
+			od: od, matchTf: matchTf, tfSecs: tfSecs, fill: fill, matched: matched,
+		})
+	}
+	bestIdx := -1
+	for idx, c := range candidates {
+		if !c.matched {
+			continue
+		}
+		if bestIdx < 0 {
+			bestIdx = idx
+			continue
+		}
+		best := candidates[bestIdx]
+		if c.fill.Rate < best.fill.Rate-1e-12 ||
+			math.Abs(c.fill.Rate-best.fill.Rate) <= 1e-12 && (c.fill.TimeMS < best.fill.TimeMS ||
+				c.fill.TimeMS == best.fill.TimeMS && c.od.ID < best.od.ID) {
+			bestIdx = idx
+		}
+	}
+	if bestIdx < 0 {
+		for _, c := range candidates {
+			if c.fill.StopTriggered {
+				c.od.Stop = 0
+			}
+		}
+		return 0, nil
+	}
+	winner := candidates[bestIdx]
+	for idx, c := range candidates {
+		if idx != bestIdx && c.fill.StopTriggered && c.fill.Rate < winner.fill.Rate-1e-12 {
+			c.od.Stop = 0
+		}
+	}
+	if winner.fill.StopTriggered {
+		winner.od.Stop = 0
+	}
+	err := o.fillPendingEnter(winner.od, winner.fill.Price, winner.fill.TimeMS)
+	if err != nil {
+		return 0, err
+	}
+	if o.legacyIntrabarEnabled() {
+		err = o.tryFillTriggers(winner.od, bar, winner.matchTf, winner.fill.Rate)
+	} else {
+		endBar := o.cutSeriesFromRate(bar, int64(winner.tfSecs*1000), winner.fill.Rate)
+		err = o.tryFillTriggers(winner.od, endBar, winner.matchTf, 0)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return 1, nil
+}
+
+func (o *LocalOrderMgr) cancelOCOSiblings(od *ormo.InOutOrder, cancelMS int64) {
+	if od == nil || od.OCOGroup == "" {
+		return
+	}
+	openOds, lock := o.openOrders()
+	lock.Lock()
+	var siblings []*ormo.InOutOrder
+	for _, other := range openOds {
+		if other == nil || other.ID == od.ID || other.OCOGroup != od.OCOGroup ||
+			other.Symbol != od.Symbol || other.Strategy != od.Strategy {
+			continue
+		}
+		if other.Status == ormo.InOutStatusInit && other.ExitTag == "" && (other.Enter == nil || other.Enter.Filled == 0) {
+			siblings = append(siblings, other)
+		}
+	}
+	lock.Unlock()
+	if len(siblings) == 0 {
+		return
+	}
+	o.sortMapOrdersForBacktest(siblings)
+	for _, sib := range siblings {
+		if sib.Status != ormo.InOutStatusInit || sib.ExitTag != "" || (sib.Enter != nil && sib.Enter.Filled > 0) {
+			continue
+		}
+		if cancelMS <= 0 {
+			cancelMS = o.priceNow()
+		}
+		err := o.localExit(sib, cancelMS, ExitTagOCOCancel, sib.InitPrice, "oco_cancel", "")
+		o.fireOdChange(sib, strat.OdChgExitFill)
+		if err != nil {
+			o.Logger().Error("cancel OCO sibling fail", zap.String("key", sib.Key()), zap.Error(err))
+		}
+	}
 }
 
 func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fillMS int64) *errs.Error {
@@ -557,82 +704,170 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLCV, tf string,
 	afterRate float64,
 ) *errs.Error {
-	if bar == nil {
+	if bar == nil || od == nil {
 		return nil
 	}
-	sl := od.GetStopLoss()
-	tp := od.GetTakeProfit()
-	if sl == nil && tp == nil {
-		return nil
-	}
-	fill := o.ohlcProfile().MatchProtection(
-		bar, od.Short, ohlcProtectionView(sl), ohlcProtectionView(tp), afterRate,
-		float64(utils.TFToSecs(tf)), o.priceNow())
-	if sl != nil {
-		sl.Hit = fill.HitSL
-	}
-	if tp != nil {
-		tp.Hit = fill.HitTP
-	}
-	hitSL, hitTP := fill.HitSL, fill.HitTP
-	if !hitSL && !hitTP {
-		return nil
-	}
-	od.DirtyInfo = true
-	var amtRate float64
-	var exitTag string
-	if hitSL {
-		amtRate = sl.Rate
-		if sl.Tag != "" {
-			exitTag = sl.Tag
+	tfSecs := float64(utils.TFToSecs(tf))
+	tfMSecs := int64(tfSecs * 1000)
+	origBar := bar
+	curBar := bar
+	curAfterRate := afterRate
+	origProgressRate := afterRate
+
+	for step := 0; step < 32 && od != nil && od.Status < ormo.InOutStatusFullExit && od.ExitTag == ""; step++ {
+		sl := od.GetStopLoss()
+		rungIdx, rung, cutFrac := od.NextTakeProfitRung()
+		var tp *ormo.TriggerState
+		var tpView *execution.OHLCProtection
+		if rung != nil {
+			tpView = &execution.OHLCProtection{Price: rung.Price, Limit: rung.Limit}
 		} else {
-			exitTag = core.ExitTagStopLoss
-			od.UpdateProfits(fill.CandidatePrice)
-			if od.ProfitRate >= 0 {
-				exitTag = core.ExitTagSLTake
+			tp = od.GetTakeProfit()
+			tpView = ohlcProtectionView(tp)
+		}
+		if sl == nil && tpView == nil {
+			return nil
+		}
+		profile := o.ohlcProfile()
+		fill := profile.MatchProtection(
+			curBar, od.Short, ohlcProtectionView(sl), tpView, curAfterRate,
+			tfSecs, o.priceNow())
+		if sl != nil {
+			sl.Hit = fill.HitSL
+		}
+		if rung == nil && tp != nil {
+			tp.Hit = fill.HitTP
+		}
+		hitSL, hitTP := fill.HitSL, fill.HitTP
+		if !hitSL && !hitTP {
+			return nil
+		}
+		od.DirtyInfo = true
+		if !fill.Ready {
+			return nil
+		}
+		if !hitSL && rung != nil {
+			// Multi-stage take-profit ladder rung hit.
+			exitTag := rung.Tag
+			if exitTag == "" {
+				exitTag = core.ExitTagTakeProfit
+			}
+			moveBE := rung.MoveSLToBreakeven
+			od.CompleteTakeProfitRung(rungIdx)
+			isPartial := cutFrac > 0 && cutFrac < 0.99 && od.Enter != nil && od.Enter.Amount*(1-cutFrac) > core.AmtDust
+			if isPartial {
+				part := o.CutOrder(od, cutFrac, 0)
+				clearSplitPartProtections(part)
+				if moveBE {
+					od.TightenSLToBreakeven(0)
+				}
+				if err := od.Save(); err != nil {
+					o.Logger().Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
+				}
+				err := o.localExit(part, fill.TimeMS, exitTag, fill.Price, "", fill.OrderType)
+				if err != nil && part.Exit == nil {
+					return err
+				}
+				wallets := o.walletsForOrder()
+				wallets.ExitOd(part, part.Exit.Amount)
+				_ = o.finishOrder(part)
+				wallets.ConfirmOdExit(part, part.Exit.Price)
+				o.callBack(part, false)
+				o.fireOdChange(part, strat.OdChgExitFill)
+				if err != nil {
+					return err
+				}
+				if o.legacyIntrabarEnabled() {
+					curAfterRate = fill.Rate
+				} else {
+					origProgressRate = profile.MarketRate(origBar, fill.TriggerPrice, od.Short, true, origProgressRate)
+					curBar = o.cutSeriesFromRate(origBar, tfMSecs, origProgressRate)
+					curAfterRate = 0
+				}
+				continue
+			}
+			err := o.localExit(od, fill.TimeMS, exitTag, fill.Price, "", fill.OrderType)
+			if err != nil && od.Exit == nil {
+				return err
+			}
+			wallets := o.walletsForOrder()
+			wallets.ExitOd(od, od.Exit.Amount)
+			_ = o.finishOrder(od)
+			wallets.ConfirmOdExit(od, od.Exit.Price)
+			o.callBack(od, false)
+			o.fireOdChange(od, strat.OdChgExitFill)
+			return err
+		}
+
+		var amtRate float64
+		var exitTag string
+		if hitSL {
+			amtRate = sl.Rate
+			if sl.Tag != "" {
+				exitTag = sl.Tag
+			} else {
+				exitTag = core.ExitTagStopLoss
+				od.UpdateProfits(fill.CandidatePrice)
+				if od.ProfitRate >= 0 {
+					exitTag = core.ExitTagSLTake
+				}
+			}
+		} else {
+			amtRate = tp.Rate
+			if tp.Tag != "" {
+				exitTag = tp.Tag
+			} else {
+				exitTag = core.ExitTagTakeProfit
 			}
 		}
-	} else {
-		amtRate = tp.Rate
-		if tp.Tag != "" {
-			exitTag = tp.Tag
-		} else {
-			exitTag = core.ExitTagTakeProfit
+		targetOd := od
+		if amtRate > 0 && amtRate <= 0.99 {
+			// Partial withdrawal
+			// 部分退出
+			part := o.CutOrder(od, amtRate, 0)
+			clearSplitPartProtections(part)
+			if sl != nil && sl.Hit {
+				_ = od.SetStopLoss(nil)
+			} else {
+				_ = od.SetTakeProfit(nil)
+			}
+			err := od.Save()
+			if err != nil {
+				o.Logger().Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
+			}
+			targetOd = part
 		}
-	}
-	if !fill.Ready {
-		return nil
-	}
-	if amtRate > 0 && amtRate <= 0.99 {
-		// Partial withdrawal
-		// 部分退出
-		part := o.CutOrder(od, amtRate, 0)
-		if sl != nil && sl.Hit {
-			_ = od.SetStopLoss(nil)
-		} else {
-			_ = od.SetTakeProfit(nil)
+		if hitSL && hitTP {
+			targetOd.SetInfo(ormo.OdInfoSLTP, "yes")
 		}
-		err := od.Save()
-		if err != nil {
-			o.Logger().Error("save cutPart parent order fail", zap.String("key", od.Key()), zap.Error(err))
+		err := o.localExit(targetOd, fill.TimeMS, exitTag, fill.Price, "", fill.OrderType)
+		if err != nil && targetOd.Exit == nil {
+			// localExit failed before the exit leg was built; continuing would panic on od.Exit
+			return err
 		}
-		od = part
-	}
-	if hitSL && hitTP {
-		od.SetInfo(ormo.OdInfoSLTP, "yes")
-	}
-	err := o.localExit(od, fill.TimeMS, exitTag, fill.Price, "", fill.OrderType)
-	if err != nil && od.Exit == nil {
-		// localExit failed before the exit leg was built; continuing would panic on od.Exit
+		wallets := o.walletsForOrder()
+		wallets.ExitOd(targetOd, targetOd.Exit.Amount)
+		_ = o.finishOrder(targetOd)
+		wallets.ConfirmOdExit(targetOd, targetOd.Exit.Price)
+		o.callBack(targetOd, false)
+		o.fireOdChange(targetOd, strat.OdChgExitFill)
 		return err
 	}
-	wallets := o.walletsForOrder()
-	wallets.ExitOd(od, od.Exit.Amount)
-	_ = o.finishOrder(od)
-	wallets.ConfirmOdExit(od, od.Exit.Price)
-	o.callBack(od, false)
-	o.fireOdChange(od, strat.OdChgExitFill)
-	return err
+	return nil
+}
+
+func clearSplitPartProtections(part *ormo.InOutOrder) {
+	if part == nil {
+		return
+	}
+	part.SetInfo(ormo.OdInfoStopLoss, nil)
+	part.SetInfo(ormo.OdInfoTakeProfit, nil)
+	part.SetInfo(ormo.OdInfoTakeProfits, nil)
+	part.SetInfo(ormo.OdInfoCallbackPct, nil)
+	part.SetInfo(ormo.OdInfoActivePrice, nil)
+	part.SetInfo(ormo.OdInfoTrailingBest, nil)
+	part.SetInfo(ormo.OdInfoTrailingID, nil)
+	part.SetInfo(ormo.OdInfoLocalTrailing, nil)
 }
 
 func ohlcProtectionView(trigger *ormo.TriggerState) *execution.OHLCProtection {

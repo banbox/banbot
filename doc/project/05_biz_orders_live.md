@@ -118,9 +118,9 @@
 
 ### 5. 回测/模拟撮合（LocalOrderMgr）
 
-- `odmgr_local.go:UpdateByDataSeries`（:150）→ `fillPendingOrdersAll`（:213，回调中新开单，最多 30 轮，超出报错 :249）→ `fillPendingOrdersPass`（:321，经 `execution.OHLCProfile.MatchPending`）→ `fillPendingEnter`（:436，`wallets.EnterOd`/`ConfirmOdEnter`）或 `fillPendingExit`（:517，`wallets.ExitOd`/`ConfirmOdExit`、`finishOrder`）。
-- 止损止盈：`tryFillTriggers`（:551）→ `MatchProtection`，部分平仓先 `CutOrder`（odmgr.go:1648）。
-- 限价超时：:396-412 按 `OdInfoStopAfter` 调 `localExit`（`ExitTagEntExp`）。
+- `odmgr_local.go:UpdateByDataSeries` → `fillPendingOrdersAll`（回调中新开单，最多 30 轮）→ `fillPendingOrdersPass`（经 `execution.OHLCProfile.MatchPending`，支持 `Stop-Limit` 先按触发价激活再按限价成交或转为挂单；对同一 `(Account, Symbol, Strategy, OCOGroup)` 的待入场挂单组由 `matchOCOPendingGroup` 按 bar 内 OHLC 路径触发先后选出最早成交腿并由 `cancelOCOSiblings` 立即撤销其余未成交兄弟单）→ `fillPendingEnter`（`wallets.EnterOd`/`ConfirmOdEnter`、`od.ResolveTakeProfits`）或 `fillPendingExit`（`wallets.ExitOd`/`ConfirmOdExit`、`finishOrder`）。
+- 止损止盈与阶梯止盈：`tryFillTriggers` → `MatchProtection`；若配置多级 `TakeProfits`（`ormo.TPLadderState`），按入场成交均价解析 `Val/Rate` 并按盈利方向由近及远逐级触发，部分平仓经 `CutOrder` 切分退出并在 `MoveSLToBreakeven` 为真时调用 `InOutOrder.TightenSLToBreakeven` 将剩余仓位止损收紧至不差于入场均价，随后在同一 bar 剩余价格路径上继续评估后续止盈级或保本止损。
+- 限价超时：按 `OdInfoStopAfter` 调 `localExit`（`ExitTagEntExp`）。
 - 回调三处触发：fillPendingEnter、fillPendingExit、tryFillTriggers → `callBack(od, isEnter)` 与 `strat.FireOdChange`（odmgr.go:619）。
 - 滑点：`LocalOrderMgr.ohlcProfile()` 按 `bt_slippage_bps` 构造 `OHLCProfile.SlippageBps`；市价单、市价止损入场、止损/止盈出场及强平类出场（`ExitAndFill`）按不利方向加滑点，止损不优于开盘跳空价；限价单不加滑点。
 - 资金费：`updateOrderFee` 在回测出场腿调用 `addApproxFunding`，对多头合约单按 `bt_funding_apr` 计 入场名义 × 年化 × 持仓年数，加入 `Exit.Fee/FeeQuote`，并写入订单 info `funding`；反向合约不计，标 `funding_skipped=inverse`，空头不计。
@@ -137,8 +137,8 @@
 2. 入队：`makeAfterEnter`（:1698）判断 `isFarEnter`；远离成交的限价单打 `odInfoLocalTrigger` 并 `addTriggerOd`，不提交交易所；否则 `o.queue <- Enter`。`makeAfterExit`（:1721）同理。
 3. 消费：`ConsumeOrderQueue`（:1743）单 worker goroutine → `handleOrderQueue`（:1768）→ `od.Lock()` → `execOrderEnter`（:2456）。
 4. 提交：Amount 为 0 时 `wallets.EnterOd`（`biz/wallet.go:1099`）算量，`exg.PrecAmount`；`submitExgOrder`（:2606）依次：杠杆设置（超上限截断并按比例缩放数量，:2623-2648）、限价计算（`getLimitPrice`，:2984）、止损价参数（:2703）、`buildClientOrderID`（:2115，入场每次随机，:2689）、`exchange.CreateOrder`（:2736）。
-5. 失败：入场失败 `localExit(FatalErr)`（:2513-2518）；reduceOnly 被拒 `localExit(NoMatch)`（:2738-2746）。
-6. 回报：`updateOdByExgRes`（:2772）更新成交、`callBack`、`fireOdChange`。完全入场后 `setTrailingStop`（:4050）与 `editTriggerOd`（:4136）挂 SL/TP。退出完成则 `finishOrder`（:4398）→ odmgr.go:1671。
+5. 失败：入场失败 `localExit(FatalErr)`；reduceOnly 被拒 `localExit(NoMatch)`。
+6. 回报：`updateOdByExgRes` 更新成交、`callBack`、`fireOdChange`；带 `OCOGroup` 的入场单成交后在锁外调用 `cancelOCOSiblings` 撤销同组未成交挂单。完全入场后解析多级 `TakeProfits` 并同步当前级至触发器（`syncActiveLadderTakeProfit`），再由 `setTrailingStop` 与 `editTriggerOd` 挂载条件单：若 `ExgStopLoss=false`（`OdInfoLocalStopLoss`）或 `ExgTakeProfit=false`（`OdInfoLocalTakeProfit`），跳过远端条件单挂载并保留本地价格监控；若交易所拒绝原生追踪止损（如 `CallbackPct` 超出交易所上限），`setTrailingStop` 自动标记 `OdInfoLocalTrailing` 降级为 `LiveOrderMgr` 本地价格监控（`UpdateByDataSeries` / `CheckLocalTriggersByPrice`），不使订单失败。阶梯止盈某级在交易所或本地部分成交后（`applyLadderTakeProfitTrade` / `evalLiveLocalOrderProtection`），按需执行保本移损并续挂下一级止盈。退出完成则 `finishOrder`。
 7. 异步回报：`WatchMyTrades`（:1831）→ `handleMyTrade`（:1992）→ `updateByMyTrade`（:2269）。无匹配者入 `unMatchTrades`，由 `TrialUnMatchesForever`（:2161，约 3s 周期）交 `exitByMyOrder` 或 `traceExgOrder`（`odmgr_live_exgs.go:11/110`）。
 8. 触发单：`VerifyTriggerOds` 由 `live/runtime_cron.go:363` 注册为 cron；`verifyAccountTriggerOds`（:3609-3774）依订单簿估算等待量；远离成交（`waitSecs > putLimitSecs*5`）则 `cancelEnterToLocalTrigger`（:3905）撤回本地。
 

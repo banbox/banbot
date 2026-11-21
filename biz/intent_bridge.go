@@ -87,8 +87,35 @@ func BridgeEntryReq(c IntentBridgeContext, req *strat.EnterReq) (*EntryIntentBri
 	if req.OrderType != core.OrderTypeEmpty && req.OrderType != core.OrderTypeMarket && req.OrderType != core.OrderTypeLimit && req.OrderType != core.OrderTypeLimitMaker {
 		return nil, errors.New("biz: unsupported entry order style")
 	}
-	if core.IsLimitOrder(req.OrderType) && req.Limit <= 0 || req.StopBars < 0 || req.StopLossRate > 1 || req.TakeProfitRate > 1 || req.CallbackPct >= 100 {
+	if core.IsLimitOrder(req.OrderType) && req.Limit <= 0 || req.StopBars < 0 || req.StopLossRate > 1 || req.TakeProfitRate > 1 ||
+		req.CallbackPct > 0 && (req.CallbackPct < 0.05 || req.CallbackPct > 50) {
 		return nil, errors.New("biz: invalid entry condition")
+	}
+	if len(req.TakeProfits) > 0 {
+		if req.TakeProfit != 0 || req.TakeProfitVal != 0 || req.TakeProfitLimit != 0 {
+			return nil, errors.New("biz: TakeProfit and TakeProfits cannot be combined")
+		}
+		var sumRate float64
+		for i := range req.TakeProfits {
+			tp := &req.TakeProfits[i]
+			if err := validateLegacyNumbers(tp); err != nil {
+				return nil, err
+			}
+			if tp.Price <= 0 && tp.Val <= 0 && tp.Rate <= 0 {
+				return nil, errors.New("biz: TakeProfitTarget requires Price, Val, or Rate > 0")
+			}
+			exitRate := tp.ExitRate
+			if exitRate == 0 && len(req.TakeProfits) == 1 {
+				exitRate = 1
+			}
+			if exitRate <= 0 || exitRate > 1 {
+				return nil, errors.New("biz: invalid TakeProfitTarget.ExitRate")
+			}
+			sumRate += exitRate
+		}
+		if sumRate > 1+1e-6 {
+			return nil, errors.New("biz: TakeProfits total ExitRate exceeds 1")
+		}
 	}
 	amount := decimal.NewFromFloat(req.Amount)
 	var steps int64
@@ -119,17 +146,11 @@ func BridgeEntryReq(c IntentBridgeContext, req *strat.EnterReq) (*EntryIntentBri
 		side = execution.Sell
 	}
 	conditions := execution.IntentConditions{Limit: decimal.NewFromFloat(req.Limit), PostOnly: req.OrderType == core.OrderTypeLimitMaker, Stop: decimal.NewFromFloat(req.Stop), CreatedBar: c.Bar, StopBars: int64(req.StopBars)}
-	result := &EntryIntentBridge{Intent: c.intent(execution.EntryIntent, side, steps, conditions), Original: *req}
-	if req.Infos != nil {
-		result.Original.Infos = make(map[string]string, len(req.Infos))
-		for k, v := range req.Infos {
-			result.Original.Infos[k] = v
-		}
-	}
+	result := &EntryIntentBridge{Intent: c.intent(execution.EntryIntent, side, steps, conditions), Original: *req.Clone()}
 	if req.StopLoss != 0 || req.StopLossVal != 0 || req.StopLossLimit != 0 || req.StopLossRate != 0 || req.StopLossTag != "" {
 		result.DeferredProtections = append(result.DeferredProtections, "stop_loss")
 	}
-	if req.TakeProfit != 0 || req.TakeProfitVal != 0 || req.TakeProfitLimit != 0 || req.TakeProfitRate != 0 || req.TakeProfitTag != "" {
+	if req.TakeProfit != 0 || req.TakeProfitVal != 0 || req.TakeProfitLimit != 0 || req.TakeProfitRate != 0 || req.TakeProfitTag != "" || len(req.TakeProfits) > 0 {
 		result.DeferredProtections = append(result.DeferredProtections, "take_profit")
 	}
 	if req.CallbackPct != 0 || req.ActivationPrice != 0 {

@@ -48,18 +48,23 @@ const (
 )
 
 const (
-	OdInfoLegalCost    = "LegalCost"
-	OdInfoStopAfter    = "StopAfter"
-	OdInfoStopBars     = "StopBars"
-	OdInfoStopLoss     = "StopLoss"
-	OdInfoCallbackPct  = "CallbackPct"  // 跟踪止损回撤幅度，单位:百分之
-	OdInfoActivePrice  = "ActivePrice"  // 跟踪止损激活价格
-	OdInfoTrailingBest = "TrailingBest" // 跟踪止损利润最大时价格
-	OdInfoTrailingID   = "TrailingID"   // 跟踪止损ID
-	OdInfoTakeProfit   = "TakeProfit"
-	OdInfoClientID     = "ClientID"
-	OdInfoRetry        = "Retry"
-	OdInfoSLTP         = "SL_TP"
+	OdInfoLegalCost       = "LegalCost"
+	OdInfoStopAfter       = "StopAfter"
+	OdInfoStopBars        = "StopBars"
+	OdInfoStopLoss        = "StopLoss"
+	OdInfoCallbackPct     = "CallbackPct"     // 跟踪止损回撤幅度，单位:百分之
+	OdInfoActivePrice     = "ActivePrice"     // 跟踪止损激活价格
+	OdInfoTrailingBest    = "TrailingBest"    // 跟踪止损利润最大时价格
+	OdInfoTrailingID      = "TrailingID"      // 跟踪止损ID
+	OdInfoLocalTrailing   = "LocalTrailing"   // 本地跟踪止损降级标记
+	OdInfoTakeProfit      = "TakeProfit"      // 单级止盈触发器
+	OdInfoTakeProfits     = "TakeProfits"     // 多级阶梯止盈状态
+	OdInfoOCOGroup        = "OCOGroup"        // OCO挂单组标识
+	OdInfoLocalStopLoss   = "LocalStopLoss"   // 仅本地监控止损，不预先挂交易所条件单
+	OdInfoLocalTakeProfit = "LocalTakeProfit" // 仅本地监控止盈，不预先挂交易所条件单
+	OdInfoClientID        = "ClientID"
+	OdInfoRetry           = "Retry"
+	OdInfoSLTP            = "SL_TP"
 )
 
 const (

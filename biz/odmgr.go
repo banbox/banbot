@@ -30,6 +30,8 @@ var (
 	accLiveOdMgrs = make(map[string]*LiveOrderMgr)
 )
 
+const ExitTagOCOCancel = "oco_cancel"
+
 type IOrderMgr interface {
 	ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
 	EditOrder(od *ormo.InOutOrder, action string)
@@ -1172,6 +1174,7 @@ func (o *OrderMgr) RelayOrders(orders []*ormo.InOutOrder) *errs.Error {
 				Status:   ormo.OdStatusInit,
 			},
 			Info:       make(map[string]interface{}),
+			OCOGroup:   odr.OCOGroup,
 			DirtyMain:  true,
 			DirtyEnter: true,
 		}
@@ -1284,17 +1287,23 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 			UpdateAt:  curTimeMS,
 		},
 		Info:       map[string]interface{}{},
+		OCOGroup:   req.OCOGroup,
 		DirtyMain:  true,
 		DirtyEnter: true,
 	}
 	if state := o.orderState(); state != nil {
 		od.BindState(state)
 	}
+	if req.Limit > 0 && req.OrderType == core.OrderTypeEmpty {
+		od.Enter.OrderType = banexg.OdTypeLimit
+	}
 	if od.Enter.OrderType == "" {
 		od.Enter.OrderType = o.orderType()
 	}
 	if req.Limit > 0 {
-		od.InitPrice = req.Limit
+		if req.Stop == 0 {
+			od.InitPrice = req.Limit
+		}
 		if req.StopBars == 0 {
 			req.StopBars = o.stopEnterBars()
 		}
@@ -1303,6 +1312,9 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 			od.SetInfo(ormo.OdInfoStopAfter, stopAfter)
 			od.SetInfo(ormo.OdInfoStopBars, req.StopBars)
 		}
+	}
+	if req.OCOGroup != "" {
+		od.SetInfo(ormo.OdInfoOCOGroup, req.OCOGroup)
 	}
 	od.SetInfo(ormo.OdInfoLegalCost, req.LegalCost)
 	if req.CallbackPct > 0 {
@@ -1322,7 +1334,25 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 			return od, err
 		}
 	}
-	if req.TakeProfit > 0 {
+	if len(req.TakeProfits) > 0 {
+		rungs := make([]*ormo.TPLadderRung, len(req.TakeProfits))
+		for idx, tp := range req.TakeProfits {
+			exitRate := tp.ExitRate
+			if exitRate == 0 && len(req.TakeProfits) == 1 {
+				exitRate = 1
+			}
+			rungs[idx] = &ormo.TPLadderRung{
+				Price:             tp.Price,
+				Val:               tp.Val,
+				Rate:              tp.Rate,
+				Limit:             tp.Limit,
+				ExitRate:          exitRate,
+				MoveSLToBreakeven: tp.MoveSLToBreakeven,
+				Tag:               tp.Tag,
+			}
+		}
+		od.SetTakeProfits(rungs)
+	} else if req.TakeProfit > 0 {
 		err := od.SetExitTrigger(ormo.OdInfoTakeProfit, &ormo.ExitTrigger{
 			Price: req.TakeProfit,
 			Limit: req.TakeProfitLimit,
@@ -1372,9 +1402,15 @@ func entryInitPrice(short bool, stop, limit, price float64) float64 {
 func entryInitPriceWith(short bool, stop, limit, price float64, legacyIntrabar bool) float64 {
 	if !legacyIntrabar {
 		if short && stop > 0 && stop < price {
+			if limit > stop {
+				return limit
+			}
 			return stop
 		}
 		if !short && stop > price {
+			if limit > 0 && limit < stop {
+				return limit
+			}
 			return stop
 		}
 	}
@@ -1673,6 +1709,10 @@ func (o *OrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.Data
 	if err != nil {
 		return errs.New(core.ErrInvalidBars, err)
 	}
+	lowVal, lowErr := evt.LowValue()
+	if lowErr != nil {
+		lowVal = closeVal
+	}
 	symbol := evt.Symbol()
 	tf := evt.TimeFrame
 	for _, od := range allOpens {
@@ -1686,10 +1726,19 @@ func (o *OrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.Data
 		od.UpdateProfits(closeVal)
 		activePrice := od.GetInfoFloat64(ormo.OdInfoActivePrice)
 		if activePrice > 0 {
-			if od.Short && activePrice >= closeVal || !od.Short && activePrice <= highVal {
+			if od.Short && activePrice >= min(lowVal, closeVal) || !od.Short && activePrice <= max(highVal, closeVal) {
 				od.SetInfo(ormo.OdInfoActivePrice, 0)
 			} else {
 				continue
+			}
+		}
+		bestRef := highVal
+		if od.Short {
+			bestRef = lowVal
+		}
+		if bestRef > 0 {
+			if err := od.UpdateTrailing(bestRef); err != nil {
+				return err
 			}
 		}
 		err := od.UpdateTrailing(closeVal)

@@ -24,6 +24,7 @@ func TestEnterReqCloneAndZapFieldsCompleteness(t *testing.T) {
 		OrderType:       core.OrderTypeLimit,
 		Limit:           1950.5,
 		Stop:            1960.0,
+		OCOGroup:        "straddle-1",
 		CostRate:        0.75,
 		RiskRate:        0.015,
 		LegalCost:       1200.0,
@@ -41,10 +42,13 @@ func TestEnterReqCloneAndZapFieldsCompleteness(t *testing.T) {
 		TakeProfitLimit: 1845.0,
 		TakeProfitRate:  0.8,
 		TakeProfitTag:   "atr_tp",
-		StopBars:        6,
-		ClientID:        "cli-9",
-		Infos:           map[string]string{"regime": "trend"},
-		Log:             true,
+		TakeProfits: []TakeProfitTarget{
+			{Price: 1880.0, Val: 70.0, Rate: 0.035, Limit: 1882.0, ExitRate: 0.5, MoveSLToBreakeven: true, Tag: "tp1"},
+		},
+		StopBars: 6,
+		ClientID: "cli-9",
+		Infos:    map[string]string{"regime": "trend"},
+		Log:      true,
 	}
 
 	rv := reflect.ValueOf(orig).Elem()
@@ -62,6 +66,10 @@ func TestEnterReqCloneAndZapFieldsCompleteness(t *testing.T) {
 	cloned.Infos["regime"] = "mutated"
 	if orig.Infos["regime"] != "trend" {
 		t.Fatal("Clone() shared Infos map with original")
+	}
+	cloned.TakeProfits[0].Tag = "mutated"
+	if orig.TakeProfits[0].Tag != "tp1" {
+		t.Fatal("Clone() shared TakeProfits slice with original")
 	}
 
 	fields := orig.GetZapFields(nil)

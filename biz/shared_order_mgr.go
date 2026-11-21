@@ -98,6 +98,9 @@ type sharedTSOrder struct {
 	ExitTag          string
 	FeedExpiry       bool
 	CreatedFeedBar   int64
+	TPLadderIndex    int     `json:",omitempty"`
+	TPRemainingShare float64 `json:",omitempty"`
+	TPResolved       bool    `json:",omitempty"`
 }
 type sharedTSCheckpoint struct {
 	Version        string
@@ -176,6 +179,74 @@ type sharedFeedProgress struct {
 type sharedJobIdentity struct{ Strategy, Symbol, TimeFrame string }
 
 func sharedFeedKey(sid int32, tf string) string { return fmt.Sprintf("%d/%s", sid, tf) }
+
+func sharedProtectionSpecsForOrder(od *sharedTSOrder, fillPrice float64) []execution.PositionProtection {
+	if od == nil {
+		return nil
+	}
+	req := od.Request
+	if len(req.TakeProfits) > 0 {
+		resolveSharedTPLadder(od, fillPrice)
+		if od.TPLadderIndex >= 0 && od.TPLadderIndex < len(od.Request.TakeProfits) && od.TPRemainingShare > 1e-9 {
+			rung := od.Request.TakeProfits[od.TPLadderIndex]
+			cutFrac := rung.ExitRate / od.TPRemainingShare
+			if cutFrac >= 0.999 || od.TPLadderIndex == len(od.Request.TakeProfits)-1 && sharedTPTotalRate(od.Request.TakeProfits) >= 0.999 {
+				cutFrac = 1.0
+			}
+			req.TakeProfit = rung.Price
+			req.TakeProfitVal = 0
+			req.TakeProfitLimit = rung.Limit
+			req.TakeProfitRate = cutFrac
+			req.TakeProfitTag = rung.Tag
+		}
+	}
+	return sharedProtectionSpecs(req)
+}
+
+func sharedTPTotalRate(tps []strat.TakeProfitTarget) float64 {
+	total := 0.0
+	for _, tp := range tps {
+		if tp.ExitRate == 0 && len(tps) == 1 {
+			total += 1
+		} else {
+			total += tp.ExitRate
+		}
+	}
+	return total
+}
+
+func resolveSharedTPLadder(od *sharedTSOrder, fillPrice float64) {
+	if od == nil || len(od.Request.TakeProfits) == 0 || od.TPResolved || fillPrice <= 0 {
+		return
+	}
+	dirFlag := 1.0
+	if od.Request.Short {
+		dirFlag = -1.0
+	}
+	for i := range od.Request.TakeProfits {
+		tp := &od.Request.TakeProfits[i]
+		if tp.ExitRate == 0 && len(od.Request.TakeProfits) == 1 {
+			tp.ExitRate = 1
+		}
+		if tp.Price <= 0 {
+			if tp.Val > 0 {
+				tp.Price = fillPrice + tp.Val*dirFlag
+			} else if tp.Rate > 0 {
+				tp.Price = fillPrice * (1 + tp.Rate*dirFlag)
+			}
+		}
+	}
+	sort.SliceStable(od.Request.TakeProfits, func(a, b int) bool {
+		if od.Request.Short {
+			return od.Request.TakeProfits[a].Price > od.Request.TakeProfits[b].Price
+		}
+		return od.Request.TakeProfits[a].Price < od.Request.TakeProfits[b].Price
+	})
+	if od.TPRemainingShare <= 0 {
+		od.TPRemainingShare = 1.0
+	}
+	od.TPResolved = true
+}
 
 func sharedProtectionSpecs(req strat.EnterReq) []execution.PositionProtection {
 	return []execution.PositionProtection{
@@ -485,6 +556,9 @@ func (m *SharedOrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.Ent
 			return err
 		}
 		defaults := makeRuntimeOrderConfig(m.deps, m.deps.DefaultAccount)
+		if copy.Limit > 0 && copy.OrderType == core.OrderTypeEmpty {
+			copy.OrderType = core.OrderTypeLimit
+		}
 		defaultStyle := copy.OrderType == core.OrderTypeEmpty && defaults.orderType != ""
 		if defaultStyle {
 			copy.OrderType = slices.Index(core.OrderTypeEnums, defaults.orderType)
@@ -509,7 +583,7 @@ func (m *SharedOrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.Ent
 		if err != nil {
 			return err
 		}
-		if core.IsLimitOrder(copy.OrderType) && (relay || defaultStyle && copy.Limit == 0) {
+		if core.IsLimitOrder(copy.OrderType) && (relay && copy.Limit == 0 || defaultStyle && copy.Limit == 0) {
 			// Relay and omitted configured limits use the current passive side.
 			// Observe inside the owner and after the command replay check so a
 			// retry retains the first committed limit and request identity.
@@ -1051,14 +1125,24 @@ func (m *SharedOrderMgr) RelayOrders(orders []*ormo.InOutOrder) *errs.Error {
 		if style < core.OrderTypeEmpty || style > core.OrderTypeLimitMaker {
 			return sharedBridgeError(errors.New("biz: unsupported relay order style"))
 		}
-		req := &strat.EnterReq{CommandID: fmt.Sprintf("relay/%d/%d", source.TaskID, source.ID), Tag: source.EnterTag, StratName: source.Strategy, Short: source.Short, Amount: amount, Leverage: source.Leverage, OrderType: style}
+		req := &strat.EnterReq{CommandID: fmt.Sprintf("relay/%d/%d", source.TaskID, source.ID), Tag: source.EnterTag, StratName: source.Strategy, Short: source.Short, Amount: amount, Leverage: source.Leverage, OrderType: style, Stop: source.Stop, OCOGroup: source.OCOGroup}
 		if core.IsLimitOrder(style) {
 			req.Limit = source.Enter.Price
 		}
 		if trigger := source.GetStopLoss(); trigger != nil && trigger.ExitTrigger != nil {
 			req.StopLoss, req.StopLossLimit, req.StopLossRate, req.StopLossTag = trigger.Price, trigger.Limit, trigger.Rate, trigger.Tag
 		}
-		if trigger := source.GetTakeProfit(); trigger != nil && trigger.ExitTrigger != nil {
+		if ladder := source.GetTakeProfits(); ladder != nil && len(ladder.Rungs) > 0 {
+			for _, r := range ladder.Rungs {
+				if r == nil || r.Done {
+					continue
+				}
+				req.TakeProfits = append(req.TakeProfits, strat.TakeProfitTarget{
+					Price: r.Price, Val: r.Val, Rate: r.Rate, Limit: r.Limit,
+					ExitRate: r.ExitRate, MoveSLToBreakeven: r.MoveSLToBreakeven, Tag: r.Tag,
+				})
+			}
+		} else if trigger := source.GetTakeProfit(); trigger != nil && trigger.ExitTrigger != nil {
 			req.TakeProfit, req.TakeProfitLimit, req.TakeProfitRate, req.TakeProfitTag = trigger.Price, trigger.Limit, trigger.Rate, trigger.Tag
 		}
 		req.CallbackPct, req.ActivationPrice = source.GetInfoFloat64(ormo.OdInfoCallbackPct), source.GetInfoFloat64(ormo.OdInfoActivePrice)
@@ -1217,11 +1301,47 @@ func (m *SharedOrderMgr) UpdateByDataSeries(_ []*ormo.InOutOrder, evt *orm.DataS
 		return sharedBridgeError(err)
 	}
 	err := m.mutate(func(s *SharedAccount, state *sharedTSCheckpoint, snapshot execution.AccountSnapshot, now, serial int64) error {
+		if err := m.cancelFilledOCOSiblings(s, state, snapshot); err != nil {
+			return err
+		}
+		snapshot, err := s.Store().Snapshot(context.Background())
+		if err != nil {
+			return err
+		}
 		quotes := make(map[string]execution.VisibleQuote)
 		var requests []execution.PendingProtectionRequest
+		lotFillPrices := make(map[sharedPendingKey]float64)
+		for _, lot := range snapshot.Lots {
+			if lot.SignedSteps == 0 {
+				continue
+			}
+			abs := lot.SignedSteps
+			if abs < 0 {
+				abs = -abs
+			}
+			denom := decimal.NewFromInt(abs).Mul(lot.Instrument.QuantityStep).Mul(lot.Instrument.ContractSize)
+			if denom.IsPositive() {
+				lotFillPrices[sharedPendingKey{lot.Strategy, lot.ID}] = lot.CostBasis.Div(denom).InexactFloat64()
+			}
+		}
 		for _, od := range state.Orders {
 			if od.SID != evt.Sid {
 				continue
+			}
+			// Rearm next ladder rung once prior partial TP reduction has settled.
+			if len(od.Request.TakeProfits) > 0 && od.TPLadderIndex < len(od.Request.TakeProfits) && od.ProtectionDone["take_profit"] {
+				var held int64
+				for _, lot := range snapshot.Lots {
+					if lot.Strategy == od.Strategy && lot.ID == od.Lot {
+						held = lot.SignedSteps
+					}
+				}
+				if held != 0 && held == od.Desired {
+					od.Exit = nil
+					delete(od.Protections, "take_profit")
+					delete(od.ProtectionLevels, "take_profit")
+					delete(od.ProtectionDone, "take_profit")
+				}
 			}
 			instrument, ok := m.config.Instruments[od.Symbol]
 			if !ok {
@@ -1233,7 +1353,8 @@ func (m *SharedOrderMgr) UpdateByDataSeries(_ []*ormo.InOutOrder, evt *orm.DataS
 			}
 			now = s.SendTime(now)
 			quotes[instrument.ID] = q
-			requests = append(requests, execution.PendingProtectionRequest{Order: &od.PendingOrder, Instrument: instrument, Specs: sharedProtectionSpecs(od.Request), Policy: m.config.OrderPolicy})
+			fillPrice := lotFillPrices[sharedPendingKey{od.Strategy, od.Lot}]
+			requests = append(requests, execution.PendingProtectionRequest{Order: &od.PendingOrder, Instrument: instrument, Specs: sharedProtectionSpecsForOrder(od, fillPrice), Policy: m.config.OrderPolicy})
 		}
 		triggered, err := s.AdvancePendingProtections(m.account.Context(), requests, quotes, now)
 		if err != nil {
@@ -1249,8 +1370,39 @@ func (m *SharedOrderMgr) UpdateByDataSeries(_ []*ormo.InOutOrder, evt *orm.DataS
 				if trigger.Kind == execution.StopLossProtection && od.Request.StopLossTag != "" {
 					od.ExitTag = od.Request.StopLossTag
 				}
-				if trigger.Kind == execution.TakeProfitProtection && od.Request.TakeProfitTag != "" {
-					od.ExitTag = od.Request.TakeProfitTag
+				if trigger.Kind == execution.TakeProfitProtection {
+					if len(od.Request.TakeProfits) > 0 && od.TPLadderIndex < len(od.Request.TakeProfits) {
+						rung := od.Request.TakeProfits[od.TPLadderIndex]
+						if rung.Tag != "" {
+							od.ExitTag = rung.Tag
+						} else {
+							od.ExitTag = core.ExitTagTakeProfit
+						}
+						if rung.MoveSLToBreakeven {
+							entryRef := lotFillPrices[sharedPendingKey{od.Strategy, od.Lot}]
+							if entryRef > 0 {
+								if od.Request.Short {
+									if od.Request.StopLoss <= 0 || entryRef < od.Request.StopLoss {
+										od.Request.StopLoss = entryRef
+									}
+								} else if entryRef > od.Request.StopLoss {
+									od.Request.StopLoss = entryRef
+								}
+								od.Request.StopLossVal = 0
+								delete(od.Protections, "stop_loss")
+								delete(od.ProtectionLevels, "stop_loss")
+								delete(od.ProtectionDone, "stop_loss")
+							}
+						}
+						od.TPRemainingShare = max(0, od.TPRemainingShare-rung.ExitRate)
+						od.TPLadderIndex++
+						if od.Desired != 0 {
+							// Partial TP rung: keep lot active for remaining rungs/protections.
+							od.ExitTag = ""
+						}
+					} else if od.Request.TakeProfitTag != "" {
+						od.ExitTag = od.Request.TakeProfitTag
+					}
 				}
 			}
 		}
@@ -1494,7 +1646,7 @@ func (m *SharedOrderMgr) projectSnapshot(restore bool, orderID int64) error {
 			}
 			entered = max(entered, filled)
 			quantity := decimal.NewFromInt(entered).Mul(lot.Instrument.QuantityStep).InexactFloat64()
-			od := &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: record.ID, TaskID: m.deps.Orders.GetTaskID(m.deps.DefaultAccount), Symbol: record.Symbol, Sid: int64(record.SID), Timeframe: record.TimeFrame, Short: record.Request.Short, Strategy: record.StrategyName, EnterTag: record.Request.Tag, ExitTag: record.ExitTag, Leverage: record.Request.Leverage, Profit: lot.RealizedPnL.Sub(lot.Fees).InexactFloat64()}, Enter: &ormo.ExOrder{Enter: true, Symbol: record.Symbol, Amount: amount, Filled: quantity, Fee: lot.Fees.InexactFloat64(), FeeQuote: lot.Fees.InexactFloat64()}, Info: map[string]interface{}{"shared_lot": string(record.Lot), "shared_checkpoint": snapshot.Checkpoint}}
+			od := &ormo.InOutOrder{IOrder: &ormo.IOrder{ID: record.ID, TaskID: m.deps.Orders.GetTaskID(m.deps.DefaultAccount), Symbol: record.Symbol, Sid: int64(record.SID), Timeframe: record.TimeFrame, Short: record.Request.Short, Strategy: record.StrategyName, EnterTag: record.Request.Tag, ExitTag: record.ExitTag, Leverage: record.Request.Leverage, Profit: lot.RealizedPnL.Sub(lot.Fees).InexactFloat64()}, Enter: &ormo.ExOrder{Enter: true, Symbol: record.Symbol, Amount: amount, Filled: quantity, Fee: lot.Fees.InexactFloat64(), FeeQuote: lot.Fees.InexactFloat64()}, Info: map[string]interface{}{"shared_lot": string(record.Lot), "shared_checkpoint": snapshot.Checkpoint}, OCOGroup: record.Request.OCOGroup}
 			od.Enter.Side = banexg.OdSideBuy
 			od.InitPrice, od.EnterAt, od.Enter.CreateAt, od.Enter.Price = record.InitPrice, record.CreatedMS, record.CreatedMS, record.Request.Limit
 			if entered > 0 {
@@ -1905,6 +2057,16 @@ func (m *SharedOrderMgr) coordinate(s *SharedAccount, state *sharedTSCheckpoint,
 	for id, request := range requests {
 		quotes[id] = request.Quote
 	}
+	if err := m.cancelFilledOCOSiblings(s, state, snapshot); err != nil {
+		return result, err
+	}
+	if err := m.cancelSimultaneousOCOSiblings(s, state, snapshot, quotes, now); err != nil {
+		return result, err
+	}
+	snapshot, err := s.Store().Snapshot(context.Background())
+	if err != nil {
+		return result, err
+	}
 	definitions, err := m.pendingDefinitions(state)
 	if err != nil {
 		return result, err
@@ -1981,12 +2143,127 @@ func (m *SharedOrderMgr) pendingDefinitions(state *sharedTSCheckpoint) ([]execut
 		if !ok {
 			return nil, fmt.Errorf("biz: pending instrument %s is not configured", order.Symbol)
 		}
-		definitions = append(definitions, execution.PendingDefinition{Order: order.PendingOrder, Instrument: instrument, Specs: sharedProtectionSpecs(order.Request), Policy: m.config.OrderPolicy})
+		definitions = append(definitions, execution.PendingDefinition{Order: order.PendingOrder, Instrument: instrument, Specs: sharedProtectionSpecsForOrder(order, 0), Policy: m.config.OrderPolicy})
 	}
 	for _, definition := range state.carriedPending {
 		definitions = append(definitions, definition)
 	}
 	return definitions, nil
+}
+
+func (m *SharedOrderMgr) cancelFilledOCOSiblings(s *SharedAccount, state *sharedTSCheckpoint, snapshot execution.AccountSnapshot) error {
+	if state == nil || len(state.Orders) == 0 {
+		return nil
+	}
+	lotSteps := make(map[sharedPendingKey]int64, len(snapshot.Lots))
+	for _, lot := range snapshot.Lots {
+		if lot.SignedSteps != 0 {
+			lotSteps[sharedPendingKey{lot.Strategy, lot.ID}] = lot.SignedSteps
+		}
+	}
+	type ocoKey struct{ strategy, symbol, group string }
+	filledGroups := make(map[ocoKey]int64)
+	for _, od := range state.Orders {
+		if od == nil || od.Request.OCOGroup == "" {
+			continue
+		}
+		if lotSteps[sharedPendingKey{od.Strategy, od.Lot}] != 0 || od.Entry.FilledSteps > 0 {
+			k := ocoKey{od.StrategyName, od.Symbol, od.Request.OCOGroup}
+			if cur, exists := filledGroups[k]; !exists || od.ID < cur {
+				filledGroups[k] = od.ID
+			}
+		}
+	}
+	if len(filledGroups) == 0 {
+		return nil
+	}
+	for _, sib := range state.Orders {
+		if sib == nil || sib.Canceled || sib.Request.OCOGroup == "" {
+			continue
+		}
+		winnerID, ok := filledGroups[ocoKey{sib.StrategyName, sib.Symbol, sib.Request.OCOGroup}]
+		if !ok || sib.ID == winnerID {
+			continue
+		}
+		if lotSteps[sharedPendingKey{sib.Strategy, sib.Lot}] != 0 || sib.Entry.FilledSteps > 0 {
+			continue
+		}
+		if err := m.cancelPending(s, snapshot, sib); err != nil {
+			return err
+		}
+		refreshed, err := s.Store().Snapshot(context.Background())
+		if err != nil {
+			return err
+		}
+		snapshot = refreshed
+		var filled int64
+		for _, lot := range refreshed.Lots {
+			if lot.Strategy == sib.Strategy && lot.ID == sib.Lot {
+				filled = lot.SignedSteps
+			}
+		}
+		if filled == 0 {
+			sib.Canceled = true
+			sib.Entry.State = execution.Canceled
+			sib.Desired = 0
+			sib.ExitTag = ExitTagOCOCancel
+		}
+	}
+	return nil
+}
+
+func (m *SharedOrderMgr) cancelSimultaneousOCOSiblings(s *SharedAccount, state *sharedTSCheckpoint, snapshot execution.AccountSnapshot, quotes map[string]execution.VisibleQuote, now int64) error {
+	if state == nil || len(state.Orders) == 0 {
+		return nil
+	}
+	type ocoKey struct{ strategy, symbol, group string }
+	groups := make(map[ocoKey][]*sharedTSOrder)
+	for _, od := range state.Orders {
+		if od == nil || od.Canceled || od.Request.OCOGroup == "" || od.Entry.State == execution.Filled || od.Entry.State == execution.Canceled || od.Entry.State == execution.Expired {
+			continue
+		}
+		groups[ocoKey{od.StrategyName, od.Symbol, od.Request.OCOGroup}] = append(groups[ocoKey{od.StrategyName, od.Symbol, od.Request.OCOGroup}], od)
+	}
+	for _, list := range groups {
+		if len(list) < 2 {
+			continue
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
+		var winner *sharedTSOrder
+		for _, od := range list {
+			instrument, ok := m.config.Instruments[od.Symbol]
+			if !ok {
+				continue
+			}
+			q, ok := quotes[instrument.ID]
+			if !ok {
+				continue
+			}
+			mid := q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2))
+			preview := od.Entry
+			avail, err := preview.Evaluate(mid, now, q.Bar)
+			if err == nil && avail > 0 {
+				winner = od
+				break
+			}
+		}
+		if winner == nil {
+			continue
+		}
+		for _, sib := range list {
+			if sib.ID == winner.ID {
+				continue
+			}
+			if err := m.cancelPending(s, snapshot, sib); err != nil {
+				return err
+			}
+			sib.Canceled = true
+			sib.Entry.State = execution.Canceled
+			sib.Desired = 0
+			sib.ExitTag = ExitTagOCOCancel
+		}
+	}
+	return nil
 }
 
 // Older facade checkpoints could retain a zero-sized source after an entirely

@@ -84,6 +84,59 @@ func (p OHLCProfile) MatchPending(bar *orm.SeriesOHLCV, order OHLCOrder, tfSecs 
 		fill.TimeMS = bar.Time + int64(float64(tfSecs)*minRate)*1000
 	}
 	if strings.Contains(order.OrderType, "limit") && order.Price > 0 {
+		if fill.StopTriggered {
+			if p.LegacyIntrabar {
+				trigOpen := order.Stop
+				if order.IsBuy && bar.Open > trigOpen || !order.IsBuy && bar.Open < trigOpen {
+					trigOpen = bar.Open
+				}
+				if order.IsBuy {
+					if order.Price < bar.Low {
+						return fill, false
+					}
+					if trigOpen <= order.Price {
+						fill.Price = trigOpen
+						return fill, true
+					}
+					fill.Price = order.Price
+				} else {
+					if order.Price > bar.High {
+						return fill, false
+					}
+					if trigOpen >= order.Price {
+						fill.Price = trigOpen
+						return fill, true
+					}
+					fill.Price = order.Price
+				}
+				fill.Rate = p.MarketRate(bar, order.Price, order.IsBuy, false, minRate)
+				fill.TimeMS = bar.Time + int64(float64(tfSecs)*fill.Rate)*1000
+				return fill, true
+			}
+			remOpen, remHigh, remLow := p.PriceRange(bar, minRate)
+			if order.IsBuy {
+				if order.Price < remLow-1e-12 {
+					return fill, false
+				}
+				if remOpen <= order.Price+1e-12 {
+					fill.Price = min(order.Price, max(remOpen, order.Stop))
+					return fill, true
+				}
+				fill.Price = order.Price
+			} else {
+				if order.Price > remHigh+1e-12 {
+					return fill, false
+				}
+				if remOpen >= order.Price-1e-12 {
+					fill.Price = max(order.Price, min(remOpen, order.Stop))
+					return fill, true
+				}
+				fill.Price = order.Price
+			}
+			fill.Rate = p.MarketRate(bar, order.Price, order.IsBuy, false, minRate)
+			fill.TimeMS = bar.Time + int64(float64(tfSecs)*fill.Rate)*1000
+			return fill, true
+		}
 		if order.IsBuy {
 			if fill.Price < bar.Low {
 				return fill, false
