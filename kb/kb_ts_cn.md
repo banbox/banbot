@@ -21,6 +21,10 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 - 时间戳 **毫秒 int64**。`TimeStart` 本根开始；`TimeStop`/`EndMS` 本根结束（=下一根开始）。
 - 周期 `ta.ParseTimeFrame`：`<正整数><单位>`，单位 `s m h d w M(月,大写) q y`，`m`≠`M`。例 `1m 5m 1h 4h 1d 1w 1M`。
 - `BarEnv.TFMSecs` 周期毫秒数；`s.Env.BarCount(ms)`：ms 到当前 bar 结束的 bar 数（float64）。
+- **UTC 虚拟交易时段原语（`github.com/banbox/banbot/btime`）**：
+  - 锚点常量（距 `00:00 UTC` 分钟数）：`UTC0Minutes=0`、`AsiaOpenMinutes=0`、`AsiaCloseMinutes=480`(`08:00`)、`LondonOpenMinutes=420`(`07:00`)、`LondonCashOpenMinutes=480`(`08:00`)、`LondonCloseMinutes=960`(`16:00`)、`NYKillzoneOpenMinutes=720`(`12:00`)、`NewYorkOpenMinutes=810`(`13:30`)、`USCashCloseMinutes=1200`(`20:00`)、`NewYorkCloseMinutes=1260`(`21:00`)、`CMEOpenMinutes=1380`(`23:00`)、`CMECloseMinutes=1320`(`22:00`)。
+  - 预定义窗口（`btime.UTCSessionWindow{Name, StartMin, EndMin}`，方法 `.Contains(ms)`/`.DurationMinutes()`）：`SessionUTC0`、`SessionAsia`(`00:00–08:00`)、`SessionLondon`(`07:00–16:00`)、`SessionNewYork`(`13:30–21:00`)、`SessionUSCash`(`13:30–20:00`)、`SessionCME`(`23:00–22:00` 跨午夜)、`KillzoneAsia`(`00:00–04:00`)、`KillzoneLondon`(`07:00–10:00`)、`KillzoneNewYork`(`12:00–15:00`)、`KillzoneLondonExit`(`15:00–17:00`)。
+  - 函数：`btime.InUTCWindow(ms, startMin, endMin) bool`（半开区间 `[startMin, endMin)`，`startMin > endMin` 自动按跨午夜窗口判定）；`btime.SessionDayIndex(ms, anchorMinutesUTC) int64`（欧几里得向下整除切分任意锚点交易日）；`btime.SessionStartMS(ms, anchorMinutesUTC) int64`；`btime.MinutesIntoSession(ms, anchorMinutesUTC) int`（`[0, 1439]`）；`btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, closeMinutesUTC) bool`（自适应任意 `<1d` 周期判定本根 bar 到达或跨过日终清仓时刻，支持负偏移如 `-15`=`23:45 UTC`；`>=1d` 安全返回 `false`）。
 
 ### 1.2 品种与市场
 - 品种：现货 `BASE/QUOTE`，合约 `BASE/QUOTE:SETTLE`（交割另带标识段）。`core.SplitSymbol(pair) (base, quote, settle, id)`。
@@ -365,6 +369,13 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `AvailableBalance() float64`：当前账户可用余额/可用保证金（计价法币）
 - `AccountDrawdown() float64`：当前账户净值相对运行以来峰值净值（High-Water Mark）的回撤比例 `[0, 1]`（无回撤为 0）
 - `GetStakeAmount`：`s.Strat.GetStakeAmount(s)` 单笔基准金额（法币）；`OrderCounts() (orderNum, enteredNum int)` 同 OrderNum/EnteredNum
+- **无前视日内区间与前日极值组件（按 `StratJob` 自动隔离、自动回放预热期历史，多品种零串味）**：
+  - `OpeningRange(anchorMinutesUTC, rangeMinutes int) OpeningRangeSnapshot`（及 `OpeningRangeWithOpts(..., OpeningRangeOptions{AllowSingleBarFallback})`）：跟踪锚点交易日开盘前 `rangeMinutes` 分钟 ORB（`Open/High/Low/Close/Mid/Width/Volume/BarCount`）。形成过程中 `Forming=true, Ready=false`；仅当 `TimeStop >= RangeEndMS` 且至少有 1 根有效 bar 时 `Ready=true`（首次完成当根 `JustCompleted=true`，区间外后续 bar `InPostRange=true`）；`TFMSecs >= 1d`、`TFMSecs > rangeMinutes*60000` 或网格与锚点不对齐时安全返回 `Applicable=false, Ready=false`。
+  - `SessionRange(startMinUTC, endMinUTC int) SessionRangeSnapshot`：统计周期性 UTC 会话窗口（如 `0, 480` 亚盘 `00:00–08:00 UTC`，或跨午夜窗口 `1320, 120`）完整高低点；窗口内 `InSession=true, Completed=false`，窗口收盘后锁定 `High/Low/Open/Close/Mid/Width/Volume` 且 `Completed=true` 直至下一周期窗口开启。
+  - `PrevDayOHLC(anchorMinutesUTC int) (PrevOHLC, bool)`：返回上一**完整结束**锚点交易日的 `Open/High/Low/Close/Pivot/Range/Volume`（PDO/PDH/PDL/PDC 菲阿里四价），当日全程恒定无前视；非零锚点下的首日残缺片段自动丢弃。
+  - `PrevNDaysStats(anchorMinutesUTC, nDays int) (PrevNDaysSummary, bool)`：滚动汇总过去 `nDays` 个完整交易日的 `HH, HC, LC, LL, DualThrustRange, AvgRange(ADR), TotalVolume, AvgVolume, History`。
+  - `DualThrustBands(anchorMinutesUTC, nDays int, k1, k2 float64) (upper, lower, dayOpen float64, ok bool)`：`Range = max(HH-LC, HC-LL)`，输出今日锚点开盘价 `dayOpen` 及 `dayOpen + k1*Range`、`dayOpen - k2*Range`（仅 `<1d` 周期生效）。
+  - `RBreakerLevels(anchorMinutesUTC int) (RBreakerSnap, bool)`（及参数化版 `RBreakerLevelsBy(anchor, f1, f2, f3)`）：基于昨日完整 `(H, L, C)` 输出六档价位 `BBreak > SSetup > SEnter > Pivot > BEnter > BSetup > SBreak` 及今日盘中已走出的 `TodayOpen/TodayHigh/TodayLow`（仅 `<1d` 周期生效）。也可独立实例化 `NewOpeningRangeTracker` / `NewSessionRangeTracker` / `NewPrevPeriodTracker`。
 
 ### 3.4 DataEvent / DataFields / DataHub / DataSub
 ```go
@@ -625,6 +636,61 @@ run_policy:
 ```
 
 示例 A、§2.1 `MyMax`、§5 代码已通过 `go vet`；其余为接口片段。辅助周期：Info 处理器 `!data.Closed||data.IsWarmUp` 则 return，用 `data.Series("close")`（§3.4/§5.3/§10）。超时平仓：`OnCheckExit` 判断 `s.Env.BarCount(od.EnterAt)>=N` 返回 `&strat.ExitReq{Tag:"timeout"}`。
+
+### 示例 B：日内会话突破片段（ORB / Asian Range 伦敦突破 / Dual Thrust / R-Breaker）
+
+```go
+// 1) ORB 美股开盘区间突破（13:30 UTC 前 30m 锁定区间，20:00 UTC 日终平仓）
+orb := s.OpeningRange(btime.NewYorkOpenMinutes, 30)
+if btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, btime.USCashCloseMinutes) {
+	s.CloseOrders(&strat.ExitReq{Tag: "ny_eod"})
+	return
+}
+if orb.Ready && orb.InPostRange && btime.SessionUSCash.Contains(e.TimeStart) && len(s.Entrys) == 0 && s.GetOrderNum(0) == 0 {
+	if c := e.Close.Get(0); c > orb.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_long", StopLoss: orb.Mid, RiskRate: 0.01})
+	} else if c < orb.Low {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_short", Short: true, StopLoss: orb.Mid, RiskRate: 0.01})
+	}
+}
+
+// 2) Asian Range（00:00–08:00 UTC）伦敦 Killzone（08:00–10:00 UTC）突破
+asia := s.SessionRange(btime.AsiaOpenMinutes, btime.AsiaCloseMinutes)
+if asia.Completed && btime.InUTCWindow(e.TimeStart, btime.LondonCashOpenMinutes, 10*60) && s.GetOrderNum(0) == 0 {
+	if e.Close.Get(0) > asia.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "ldn_brk_long", StopLoss: asia.Low})
+	}
+}
+
+// 3) Dual Thrust（00:00 UTC 日切，过去 4 个完整日计算 Range）
+if upper, lower, _, ok := s.DualThrustBands(btime.UTC0Minutes, 4, 0.5, 0.5); ok {
+	if c := e.Close.Get(0); c > upper && s.GetOrderNum(1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_short", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_long", StopLoss: lower})
+	} else if c < lower && s.GetOrderNum(-1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_long", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_short", Short: true, StopLoss: upper})
+	}
+}
+
+// 4) R-Breaker 六档趋势突破 + 日内观察位反转
+if rb, ok := s.RBreakerLevels(btime.UTC0Minutes); ok {
+	c := e.Close.Get(0)
+	if s.GetOrderNum(0) == 0 {
+		if c > rb.BBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_long", StopLoss: rb.Pivot})
+		} else if c < rb.SBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_short", Short: true, StopLoss: rb.Pivot})
+		}
+	} else if s.GetOrderNum(1) > 0 && rb.TodayHigh >= rb.SSetup && c < rb.SEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_short", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_short", Short: true, StopLoss: rb.BBreak})
+	} else if s.GetOrderNum(-1) > 0 && rb.TodayLow <= rb.BSetup && c > rb.BEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_long", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_long", StopLoss: rb.SBreak})
+	}
+}
+```
 
 ## 10. 旧接口迁移（OnBar → OnData）
 - 旧 `OnBar(s)`：改为 `OnData: strat.RouteData(strat.DataHandlers{Main: func(s, _ strat.DataEvent){…}})`。

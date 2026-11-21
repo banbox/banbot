@@ -443,6 +443,7 @@ func (s *StratJob) InitBar(curOrders []*ormo.InOutOrder) {
 	if s.recordInspectEffect("InitBar") {
 		return
 	}
+	s.observeIntradayEnvBar()
 	checkMS := s.runtimeTimeMS()
 	lastBarMS := s.Env.TimeStop
 	state := s.executionState()

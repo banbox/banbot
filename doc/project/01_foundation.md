@@ -53,6 +53,7 @@
 | `config/*_test.go` | 配置行为回归测试（含 `testdata/v0.5.7.yml` 旧版样例） |
 | `btime/state.go` | `ClockState`：每 Runtime 时钟（回测为原子递增的模拟时间，实盘为 NTP 校正时间） |
 | `btime/main.go` | 旧包级时间函数（`Time/TimeMS/Now`，读写全局 `CurTimeMS`）、`ParseTimeMS`、`ToDateStr*`、`ToTime`、`init()` 设置 `time.Local=UTC` |
+| `btime/session_helpers.go` | UTC 虚拟交易日切与会话/Killzone 纯函数原语（`UTCSessionWindow`、`SessionUTC0/Asia/London/NewYork/USCash/CME`、`Killzone*`、`InUTCWindow`、`SessionDayIndex`、`SessionStartMS`、`MinutesIntoSession`、`IsNearSessionEnd`） |
 | `btime/common.go` | `RetryWaits`：按 key 的指数退避等待表 |
 | `com/price_state.go` | `PriceState`：bid/ask/bar 价格表、过期判断、基于 `SymbolParser` 的基础币映射 |
 | `com/price.go` | 旧版价格门面（`GetPrice/SetPrice/...`）：按 exchange 懒绑定 `PriceState`，`init()` 初始化 |
@@ -114,6 +115,7 @@
 ### btime
 
 - **`ClockState`**（`btime/state.go`）：字段 `backtest`、`curTimeMS`（原子）、`locShow`。方法：`SetTimeMS`、`TimeMS`、`AdvanceMS`、`Time`、`Now`。非回测模式下 `TimeMS()` 返回 `UTCStamp()`（经 bntp 校正）。
+- **`UTCSessionWindow` 与日内会话原语**（`btime/session_helpers.go`）：预定义锚点分钟常量（`UTC0Minutes`、`AsiaOpenMinutes/AsiaCloseMinutes`、`LondonOpenMinutes/LondonCashOpenMinutes/LondonCloseMinutes`、`NYKillzoneOpenMinutes/NewYorkOpenMinutes/USCashCloseMinutes/NewYorkCloseMinutes`、`CMEOpenMinutes/CMECloseMinutes`）及会话窗口（`SessionUTC0`、`SessionAsia`、`SessionLondon`、`SessionNewYork`、`SessionUSCash`、`SessionCME`、`KillzoneAsia/London/NewYork/LondonExit`）。函数：`NormalizeDayMinutes`、`InUTCWindow(ms, startMin, endMin)`（半开区间，支持 `startMin > endMin` 跨午夜窗口）、`SessionDayIndex(ms, anchorMinutesUTC)`（欧几里得向下整除切分锚点交易日）、`SessionStartMS`、`MinutesIntoSession`、`MinutesOfDayUTC`、`IsNearSessionEnd(barStartMS, barStopMS, closeMinutesUTC)`（自适应小于 1d 的任意 K 线周期判定 `(barStartMS, barStopMS]` 跨越日终时刻，`>= 1d` 返回 false）。
 - **`RetryWaits`**（`btime/common.go`）：`SetFail(key)` 返回下次可重试时间戳；`NextRetry`、`Reset`。等待表默认 `3s, 6s, 12s, 30s`。
 
 ### com

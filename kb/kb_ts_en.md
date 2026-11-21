@@ -21,6 +21,10 @@ Command `banbot <cmd> --config x.yml` (`--config` is repeatable; `--config-data`
 - Timestamps are **int64 milliseconds**. `TimeStart` = start of the current bar; `TimeStop`/`EndMS` = end of the current bar (= start of the next bar).
 - Timeframes via `ta.ParseTimeFrame`: `<positive integer><unit>`, units `s m h d w M(month, uppercase) q y`; `m` != `M`. E.g. `1m 5m 1h 4h 1d 1w 1M`.
 - `BarEnv.TFMSecs` is the timeframe in milliseconds; `s.Env.BarCount(ms)`: number of bars from ms to the end of the current bar (float64).
+- **UTC Virtual Trading Session Primitives (`github.com/banbox/banbot/btime`)**:
+  - Anchor constants (minutes from `00:00 UTC`): `UTC0Minutes=0`, `AsiaOpenMinutes=0`, `AsiaCloseMinutes=480`(`08:00`), `LondonOpenMinutes=420`(`07:00`), `LondonCashOpenMinutes=480`(`08:00`), `LondonCloseMinutes=960`(`16:00`), `NYKillzoneOpenMinutes=720`(`12:00`), `NewYorkOpenMinutes=810`(`13:30`), `USCashCloseMinutes=1200`(`20:00`), `NewYorkCloseMinutes=1260`(`21:00`), `CMEOpenMinutes=1380`(`23:00`), `CMECloseMinutes=1320`(`22:00`).
+  - Predefined windows (`btime.UTCSessionWindow{Name, StartMin, EndMin}`, methods `.Contains(ms)`/`.DurationMinutes()`): `SessionUTC0`, `SessionAsia`(`00:00–08:00`), `SessionLondon`(`07:00–16:00`), `SessionNewYork`(`13:30–21:00`), `SessionUSCash`(`13:30–20:00`), `SessionCME`(`23:00–22:00` cross-midnight), `KillzoneAsia`(`00:00–04:00`), `KillzoneLondon`(`07:00–10:00`), `KillzoneNewYork`(`12:00–15:00`), `KillzoneLondonExit`(`15:00–17:00`).
+  - Functions: `btime.InUTCWindow(ms, startMin, endMin) bool` (half-open `[startMin, endMin)`, wraps across midnight when `startMin > endMin`); `btime.SessionDayIndex(ms, anchorMinutesUTC) int64` (Euclidean floor division for any anchor trading day); `btime.SessionStartMS(ms, anchorMinutesUTC) int64`; `btime.MinutesIntoSession(ms, anchorMinutesUTC) int` (`[0, 1439]`); `btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, closeMinutesUTC) bool` (timeframe-adaptive EOD flatten check across `<1d` bars, supporting negative buffers like `-15`=`23:45 UTC`; returns `false` for `>=1d`).
 
 ### 1.2 Symbols and Markets
 - Symbols: spot `BASE/QUOTE`, contract `BASE/QUOTE:SETTLE` (delivery contracts carry an extra identifier segment). `core.SplitSymbol(pair) (base, quote, settle, id)`.
@@ -365,6 +369,13 @@ Methods:
 - `AvailableBalance() float64`: current available balance / available margin of the owning account (pricing fiat)
 - `AccountDrawdown() float64`: current drawdown ratio in `[0, 1]` relative to the account's run-to-date peak equity (High-Water Mark; 0 when no drawdown)
 - `GetStakeAmount`: `s.Strat.GetStakeAmount(s)` base stake amount (fiat); `OrderCounts() (orderNum, enteredNum int)` same as OrderNum/EnteredNum
+- **No-Lookahead Intraday Session & Previous-Day Range Components (automatically isolated per `StratJob` with automatic warmup replay, zero cross-symbol contamination)**:
+  - `OpeningRange(anchorMinutesUTC, rangeMinutes int) OpeningRangeSnapshot` (and `OpeningRangeWithOpts(..., OpeningRangeOptions{AllowSingleBarFallback})`): tracks the opening `rangeMinutes` ORB (`Open/High/Low/Close/Mid/Width/Volume/BarCount`) of each anchor-aligned day. While forming, `Forming=true, Ready=false`; `Ready=true` ONLY when `TimeStop >= RangeEndMS` and `BarCount >= 1` (`JustCompleted=true` on the completion bar, `InPostRange=true` on subsequent bars); safely returns `Applicable=false, Ready=false` when `TFMSecs >= 1d`, `TFMSecs > rangeMinutes*60000`, or the grid is misaligned with the anchor.
+  - `SessionRange(startMinUTC, endMinUTC int) SessionRangeSnapshot`: tracks recurring UTC session windows (e.g. `0, 480` Asian Range `00:00–08:00 UTC`, or cross-midnight `1320, 120`); `InSession=true, Completed=false` during the window, then locks `High/Low/Open/Close/Mid/Width/Volume` with `Completed=true` until the next cycle's window starts.
+  - `PrevDayOHLC(anchorMinutesUTC int) (PrevOHLC, bool)`: returns the previous **fully completed** anchor-aligned trading day's `Open/High/Low/Close/Pivot/Range/Volume` (PDO/PDH/PDL/PDC — Fairy Four Prices), constant throughout the active day with zero lookahead; partial initial day fragments on non-zero anchors are automatically discarded.
+  - `PrevNDaysStats(anchorMinutesUTC, nDays int) (PrevNDaysSummary, bool)`: rolling statistics (`HH, HC, LC, LL, DualThrustRange, AvgRange(ADR), TotalVolume, AvgVolume, History`) over the past `nDays` completed trading days.
+  - `DualThrustBands(anchorMinutesUTC, nDays int, k1, k2 float64) (upper, lower, dayOpen float64, ok bool)`: computes `Range = max(HH-LC, HC-LL)` over the past `nDays` completed trading days and outputs today's `dayOpen`, `dayOpen + k1*Range`, `dayOpen - k2*Range` (`<1d` timeframes only).
+  - `RBreakerLevels(anchorMinutesUTC int) (RBreakerSnap, bool)` (and parameterized `RBreakerLevelsBy(anchor, f1, f2, f3)`): outputs the six standard R-Breaker levels `BBreak > SSetup > SEnter > Pivot > BEnter > BSetup > SBreak` from yesterday's completed `(H, L, C)` plus today's running `TodayOpen/TodayHigh/TodayLow` (`<1d` timeframes only). Standalone `NewOpeningRangeTracker` / `NewSessionRangeTracker` / `NewPrevPeriodTracker` are also exported.
 
 ### 3.4 DataEvent / DataFields / DataHub / DataSub
 ```go
@@ -625,6 +636,61 @@ run_policy:
 ```
 
 Example A, `MyMax` in §2.1, and the §5 code have passed `go vet`; the rest are interface fragments. Auxiliary timeframes: in the Info handler `return` if `!data.Closed||data.IsWarmUp`, and use `data.Series("close")` (§3.4/§5.3/§10). Timeout exit: in `OnCheckExit` check `s.Env.BarCount(od.EnterAt)>=N` and return `&strat.ExitReq{Tag:"timeout"}`.
+
+### Example B: Intraday Session Breakout Snippets (ORB / Asian Range London Breakout / Dual Thrust / R-Breaker)
+
+```go
+// 1) US Cash ORB (30m opening range from 13:30 UTC, EOD flatten at 20:00 UTC)
+orb := s.OpeningRange(btime.NewYorkOpenMinutes, 30)
+if btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, btime.USCashCloseMinutes) {
+	s.CloseOrders(&strat.ExitReq{Tag: "ny_eod"})
+	return
+}
+if orb.Ready && orb.InPostRange && btime.SessionUSCash.Contains(e.TimeStart) && len(s.Entrys) == 0 && s.GetOrderNum(0) == 0 {
+	if c := e.Close.Get(0); c > orb.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_long", StopLoss: orb.Mid, RiskRate: 0.01})
+	} else if c < orb.Low {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_short", Short: true, StopLoss: orb.Mid, RiskRate: 0.01})
+	}
+}
+
+// 2) Asian Range (00:00–08:00 UTC) London Killzone (08:00–10:00 UTC) Breakout
+asia := s.SessionRange(btime.AsiaOpenMinutes, btime.AsiaCloseMinutes)
+if asia.Completed && btime.InUTCWindow(e.TimeStart, btime.LondonCashOpenMinutes, 10*60) && s.GetOrderNum(0) == 0 {
+	if e.Close.Get(0) > asia.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "ldn_brk_long", StopLoss: asia.Low})
+	}
+}
+
+// 3) Dual Thrust (00:00 UTC rollover, 4 completed days for Range)
+if upper, lower, _, ok := s.DualThrustBands(btime.UTC0Minutes, 4, 0.5, 0.5); ok {
+	if c := e.Close.Get(0); c > upper && s.GetOrderNum(1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_short", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_long", StopLoss: lower})
+	} else if c < lower && s.GetOrderNum(-1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_long", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_short", Short: true, StopLoss: upper})
+	}
+}
+
+// 4) R-Breaker Six-Level Trend Breakout + Intraday Setup Reversal
+if rb, ok := s.RBreakerLevels(btime.UTC0Minutes); ok {
+	c := e.Close.Get(0)
+	if s.GetOrderNum(0) == 0 {
+		if c > rb.BBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_long", StopLoss: rb.Pivot})
+		} else if c < rb.SBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_short", Short: true, StopLoss: rb.Pivot})
+		}
+	} else if s.GetOrderNum(1) > 0 && rb.TodayHigh >= rb.SSetup && c < rb.SEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_short", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_short", Short: true, StopLoss: rb.BBreak})
+	} else if s.GetOrderNum(-1) > 0 && rb.TodayLow <= rb.BSetup && c > rb.BEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_long", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_long", StopLoss: rb.SBreak})
+	}
+}
+```
 
 ## 10. Legacy Interface Migration (OnBar → OnData)
 - Legacy `OnBar(s)`: change to `OnData: strat.RouteData(strat.DataHandlers{Main: func(s, _ strat.DataEvent){…}})`.
