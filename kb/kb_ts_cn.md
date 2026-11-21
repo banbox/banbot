@@ -556,6 +556,8 @@ OnData: strat.RouteData(strat.DataHandlers{
 16. 对 `Series.Get` 的 NaN 做判断（`math.IsNaN(atr)`），尤其 `WarmupNum` 不够大时。
 17. 同品种不同周期的 job 是独立 Env；跨周期数据用 `DataSub`。
 18. `DrawDownExit` 覆盖订单止损触发器（§4.2）；`ExgStopLoss=false` 丢弃入场止损（§3.3）；`MAMA/VPCI/DX/Fisher` 与标准定义不同；旧 API 新代码不用。
+19. **`TradeStrat` 被该策略的所有品种共用**（工厂每个 policy 只调用一次，除非配置了 `pair_params`）：工厂函数体内的闭包变量和包级变量对所有品种共享。逐品种变化的状态（上一根信号、峰值、追踪止损位、计数器）定义成结构体，在 `OnStartUp` 赋给 `s.More`，回调里 `s.More.(*T)` 读取；不要用闭包变量或按品种做键的 map。
+20. 常见编译错误：品种名字符串是 `s.Symbol.Symbol`（`s.Symbol` 是 `*orm.ExSymbol`，不能当字符串或 map 键）；`pol.Params` 是 `map[string]float64`，超参只有数值（开关用 0/1），用 `pol.Def/DefInt` 读取，没有 `DefBool/DefStr/core.PInt`；方向参数 `dirt` 是 `float64`；K线时间用 `e.TimeStart/TimeStop`、周期用 `e.TFMSecs`（没有 `e.Time/TFSecs`）；订单类型在 `github.com/banbox/banbot/orm/ormo`（`*ormo.InOutOrder`、`*ormo.ExitTrigger`）；`EnterReq` 没有 `Qty/Dirt` 字段（数量 `Amount`、金额 `LegalCost`/`CostRate`、做空 `Short: true`）；策略里取不到账户权益（无 `GetEquity`），单笔基准金额用 `s.Strat.GetStakeAmount(s)`。
 
 ## 8. 超参与优化
 超参用 `pol.Def/DefInt` 声明（分布见 §1.5；`DefInt` 自动取整）。`banbot optimize --config x.yml`（另有 `bt-opt` 滚动回测）；`--sampler tpe|bayes|random|cmaes|ipop-cmaes|bipop-cmaes`（默认 bayes），`--opt-rounds`（默认 30）。
