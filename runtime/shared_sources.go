@@ -77,9 +77,29 @@ func (r *Runtime) factorLiveRequests(engine *runner.Live, cfg runner.Config) ([]
 		sids     []int32
 		consumer string
 	}
+	baseDataSIDs := append(append([]int32(nil), cfg.Snapshot.Universe.Investable...), cfg.Snapshot.Universe.Reference...)
+	sort.Slice(baseDataSIDs, func(i, j int) bool { return baseDataSIDs[i] < baseDataSIDs[j] })
 	var inputs []scopedInput
-	for _, input := range engine.Inputs() {
-		inputs = append(inputs, scopedInput{input, engine.DataSIDs(), "factor:" + cfg.StrategyID})
+	for _, input := range engine.ScopedInputs() {
+		sids := make([]int32, 0, len(baseDataSIDs)+len(input.RefSymbols))
+		if input.AllAssets {
+			sids = append(sids, baseDataSIDs...)
+		}
+		for _, sym := range input.RefSymbols {
+			refSID, ok := cfg.Snapshot.ResolveSymbolSID(sym)
+			if !ok {
+				return nil, fmt.Errorf("runtime: factor live reference symbol %q missing from SIDMap", sym)
+			}
+			sids = append(sids, refSID)
+		}
+		sort.Slice(sids, func(i, j int) bool { return sids[i] < sids[j] })
+		dedup := sids[:0]
+		for _, sid := range sids {
+			if len(dedup) == 0 || dedup[len(dedup)-1] != sid {
+				dedup = append(dedup, sid)
+			}
+		}
+		inputs = append(inputs, scopedInput{input.InputSpec, dedup, "factor:" + cfg.StrategyID})
 	}
 	inputs = append(inputs, scopedInput{factor.InputSpec{Source: cfg.Prices.Source, TimeFrame: cfg.Prices.TimeFrame, Fields: []string{cfg.Prices.Field}}, engine.ExecutionSIDs(), "execution-price:" + cfg.StrategyID})
 	if cfg.Manifest.Costs.FundingPolicy == "required-stream" && !engine.ExecutionOwnsFunding() {

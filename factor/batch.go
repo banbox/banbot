@@ -119,7 +119,7 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 		if stage.kind == StageTS {
 			for _, sp := range spans {
 				for _, index := range stage.nodes {
-					if err := evaluateBatchTSSpan(p.nodes[index], sp, snapshots, columns, index); err != nil {
+					if err := p.evaluateBatchTSSpan(p.nodes[index], sp, snapshots, columns, index); err != nil {
 						return nil, err
 					}
 				}
@@ -205,13 +205,31 @@ func buildActiveSIDSpans(activeAt [][]int32, dynamic bool) []sidSpan {
 	return spans
 }
 
-func evaluateBatchTSSpan(node compiledNode, sp sidSpan, snapshots []*Snapshot, columns [][]map[int32]Numeric, index int) error {
+func (p *Plan) evaluateBatchTSSpan(node compiledNode, sp sidSpan, snapshots []*Snapshot, columns [][]map[int32]Numeric, index int) error {
+	if p.isSubTFNode(index) {
+		return p.evaluateBatchSubTFTSSpan(node, sp, snapshots, columns, index)
+	}
+	if node.spec.Operator == opAsOfNode {
+		p.evaluateBatchAsOfNodeSpan(node, sp, snapshots, columns, index)
+		return nil
+	}
+	return evaluateBatchTSSpanCore(node, sp, snapshots, columns, index)
+}
+
+func evaluateBatchTSSpanCore(node compiledNode, sp sidSpan, snapshots []*Snapshot, columns [][]map[int32]Numeric, index int) error {
 	sid := sp.sid
 	spanLen := sp.end - sp.start
 	if node.spec.Operator == "field" {
 		for offset := 0; offset < spanLen; offset++ {
 			t := sp.start + offset
 			columns[index][t][sid] = snapshots[t].Numeric(sid, node.spec.Source, node.spec.SourceTimeFrame, node.spec.Field)
+		}
+		return nil
+	}
+	if node.spec.Operator == opRefField {
+		for offset := 0; offset < spanLen; offset++ {
+			t := sp.start + offset
+			columns[index][t][sid] = snapshots[t].RefNumeric(node.spec.RefSymbol, node.spec.Source, node.spec.SourceTimeFrame, node.spec.Field)
 		}
 		return nil
 	}

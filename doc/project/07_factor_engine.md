@@ -25,9 +25,10 @@
 
 | 文件 | 作用 |
 |---|---|
-| `dag.go` | `NodeSpec`/`Node`/`Builder`/`Stage`；`Compile` 生成 `Plan`（循环检测、拓扑排序、`StageTS`/`StageCS` 分阶段拓扑划分、公共子表达式去重、跨阶段 warmup/retention 推导、`Inputs()`） |
-| `session.go` | 有状态增量计算 `Session`（`NewSession`、`Warmup`、`Evaluate`、`fork`/`commit`，按 `Plan` 拓扑阶段交替推进逐资产时序与截面状态）；`Frame` |
-| `batch.go` | `Plan.Batch` 整段历史计算；按拓扑阶段交替求值，`StageTS` 按标的连续活跃区间调用 `banta/tav` 向量化算子（覆盖静态与动态 PIT 宇宙），`StageCS` 在各时刻跨参考池求值 |
+| `dag.go` | `NodeSpec`/`Node`/`Builder`/`Stage`；`Compile` 生成 `Plan`（循环检测、按作用域周期校验、拓扑排序、`StageTS`/`StageCS` 分阶段拓扑划分、公共子表达式去重、跨阶段与跨周期 warmup/retention 推导、`Inputs()`/`ScopedInputs()`/`ReferenceSymbols()`） |
+| `mtf_ref.go` | 真多周期源级求值（`AsOfNode`/`SubTF`/`SubTFContext`，源周期子图仅在新闭合 bar `barEnd <= GridTime` 到达时推进时序窗口再因果 `AsOf` 投影至目标周期，含可选 `MaxAge` 超龄判定）与特定参考标的广播（`RefAssetField`/`AsOfRefAssetField`、`Snapshot.ResolveSymbolSID`/`RefNumeric`、`ScopedInputSpec`） |
+| `session.go` | 有状态增量计算 `Session`（`NewSession`、`Warmup`、`Evaluate`、`fork`/`commit`，按 `Plan` 拓扑阶段与子周期状态槽交替推进逐资产时序与截面状态）；`Frame` |
+| `batch.go` | `Plan.Batch` 整段历史计算；按拓扑阶段交替求值，`StageTS` 在主周期与压缩子周期闭合步序列上按标的连续活跃区间调用 `banta/tav` 向量化算子（覆盖静态与动态 PIT 宇宙），`StageCS` 在各时刻跨参考池求值 |
 | `value.go` | `Numeric`（值 + `Validity`）、`Number()`、`contentHash`（按位哈希，`-0` 与 `+0` 不同；`map[string]any` 标量行走无 fmt 的快速编码，输出字节与反射路径一致）、`cloneValues`（标量行直接拷贝 map，其余走反射深拷贝） |
 | `pointwise.go` | 逐点算子：算术、`sign`、`clip`、比较（`gt`/`ge`/`lt`/`le`）与条件选择 `where`（`cond` 有效时仅要求被选中的分支有效） |
 | `operators.go` | 截面算子：rank、pct-rank（`[0, 1]` 归一化，`M == 1` 为 `0.5`）、zscore、robust-zscore、winsorize、quantile、cs-mean / cs-sum（全池算术均值 / 求和截面广播）、group 系列、residual |
@@ -51,6 +52,7 @@
 |---|---|
 | `parser.go` | `text/scanner` 词法 + 递归下降解析为 AST（支持算术 `+ - * /` 与比较 `> >= < <=`）；定义上限常量（maxText/maxNodes/maxDepth/maxWindow/maxDefinitions，约 `parser.go:11-18`） |
 | `compile.go` | `Spec`/`Binding`/`compiler`；名称绑定、参数检查、`lower` 为 `factor.Node`；每个定义先单独 `factor.Compile` 校验，再整体编译 |
+| `mtf_ref.go` | `mtf.asof`/`asof_tf` 源周期作用域切换（内部字段、常量、`lets` 与 `ts.*` 自动绑定至源周期）及 `ref.field` 特定参考标的字段解析 |
 
 ### factor/backtest（回测账本）
 
@@ -156,9 +158,9 @@
 
 ### 1. 因子定义 → 计算计划（编译）
 
-1. 表达式路径：`expr.Compile`（`expr/compile.go:Compile`）调用 `parse`（`expr/parser.go:parse`）→ `compiler.named` → `compiler.lower` → `compiler.call` 或 `compiler.indicatorCall`，产出原生 `factor.Node`（支持任意无环 `TS ↔ CS/GROUP` 多阶段嵌套）。
-2. Go builder 路径：直接调用 `factor.Field`/`EMA`/`Rank`/`Residual` 等 builder（`dag.go:node`）。
-3. 两条路径汇合于 `factor.Compile`（`dag.go:Compile`）：递归访问依赖并调用 `validateNode` 与 `indicatorLookback`（`indicators.go:indicatorLookback`），做循环检测、公共子表达式去重与跨阶段预热累加（`上游预热 + 下游窗口预热`），再由 `buildPlanStages` 划分为交替的 `StageTS`（逐资产时序/逐点阶段）与 `StageCS`（跨参考池截面/分组回归阶段）屏障，输出 `*Plan`（指纹包含节点序列、阶段划分与输出映射）。
+1. 表达式路径：`expr.Compile`（`expr/compile.go:Compile`）调用 `parse`（`expr/parser.go:parse`）→ `compiler.named` → `compiler.lower` → `compiler.mtfOrRefCall`（`expr/mtf_ref.go:mtfOrRefCall`）、`compiler.call` 或 `compiler.indicatorCall`，产出原生 `factor.Node`（支持任意无环 `TS ↔ CS/GROUP` 多阶段嵌套、跨周期 `mtf.asof`/`asof_tf` 子图及 `ref.field` 基准资产广播）。
+2. Go builder 路径：直接调用 `factor.Field`/`RefAssetField`/`AsOfNode`/`SubTF`/`EMA`/`Rank`/`Residual` 等 builder（`dag.go:node`、`mtf_ref.go:AsOfNode`、`mtf_ref.go:RefAssetField`）。
+3. 两条路径汇合于 `factor.Compile`（`dag.go:Compile`）：递归访问依赖并调用 `validateNode` 与 `indicatorLookback`（`indicators.go:indicatorLookback`），做循环检测、按作用域周期校验、公共子表达式去重、跨阶段预热累加与子周期预热换算（`mtf_ref.go:asofNodeWarmup`，`Plan.Inputs`/`ScopedInputs` 对子周期流按源周期 bar 数输出预热长度），再由 `buildPlanStages` 与 `compileSubTFMeta`（`mtf_ref.go:compileSubTFMeta`）划分为交替的 `StageTS`/`StageCS` 屏障与子周期步进域，输出 `*Plan`。存储装配（`entry/factor_storage.go:assembleFactorStorageInputs`）与运行器需求屏障（`runner/runner.go:requirements`）通过 `Plan.ReferenceSymbols`/`Plan.ScopedInputs` 自动解析并预加载非 `Investable` 的参考标的流。
 4. 计划是只读可复用的；会话状态由具体运行拥有。当前没有跨任务的表达式编译缓存。
 
 ### 2. 在线增量计算（实盘与逐步回放）

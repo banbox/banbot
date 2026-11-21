@@ -61,7 +61,7 @@ param.window      本定义集 params 中的编译期参数
 
 源别名不必与真实源名相同，例如 `prices: {source: kline, timeframe: 1h}` 对应 `prices.close`。自定义数据源和字段同样适用，不要求固定 OHLCV 模型；原始数据继续通过 `orm.DataSeries.Values map[string]any` 提供。字段名包含连字符、空格等字符时写 `field("prices", "adjusted-close")`，参数是两个双引号字符串。
 
-参数名、因子名、绑定别名使用字母或下划线开头，后续可包含数字。绑定别名不能占用 `factor`、`param`、`label`、`ts`、`cs`、`group`。`lets` 和 `outputs` 共享因子名称空间，不能重名；可以前向引用，但不能成环。未使用的 `lets` 不增加最终计算和订阅，仍会接受语法、参数与引用校验。
+参数名、因子名、绑定别名使用字母或下划线开头，后续可包含数字。绑定别名不能占用 `factor`、`param`、`label`、`ts`、`cs`、`group`、`mtf`、`ref`。声明 `kline` 绑定时支持 `open`、`high`、`low`、`close`、`volume`、`buy_volume` 裸字段简写。`lets` 和 `outputs` 共享因子名称空间，不能重名；可以前向引用，但不能成环。未使用的 `lets` 不增加最终计算和订阅，仍会接受语法、参数与引用校验。
 
 `factor.name` 只引用当前定义集，不查找其他策略或全局注册的因子。输出建议采用 `momentum`、`risk_adjusted` 等名字；runner 会将组合结果写入 `score`，因此组合场景应避免将原始因子输出命名为 `score`。
 
@@ -92,7 +92,9 @@ param.window      本定义集 params 中的编译期参数
 | 写法 | 语义与参数 |
 |---|---|
 | `ts.lag(x,n)` | 读取过去 `n` 个观察的值；`n=0` 返回原值 |
-| `ts.return(x,n)` | `x[t] / x[t-n] - 1` |
+| `ts.return(x,n)` / `ts.ret(x,n)` | `x[t] / x[t-n] - 1` |
+| `mtf.asof("1d", expr[, max_stale_ms])` / `asof_tf(...)` | 在不细于目标周期的源周期（如 `"1d"`、`"4h"`）上仅随已闭合源 bar 推进内部指标，再因果 `AsOf` 对齐到当前周期 |
+| `ref.field("BTC/USDT:USDT", "close")` / `ref.field(sym, src, field)` | 读取指定基准品种字段并向全池广播（两参默认 `kline` 源） |
 | `ts.ema(x,n)` | 沿用现有 banta EMA 初始化和递推口径 |
 | `ts.std(x,n,ddof)` | 标准差；必须显式传入 `ddof` |
 | `ts.corr(x,y,n)` | 两序列最近 `n` 个同时有效配对的 Pearson 相关系数；任一方差为 0 时返回 `0` |
@@ -402,7 +404,7 @@ combine:
 
 `sampling: asof` 与 `asof-latest` 等效。它在决策网格取当时可见且未超过 `max_age_ms` 的观测；发布、接收、事件时间与屏障仍由数据输入和快照负责。超龄或缺少所需流会阻止求值，不会自动读取未来观测。
 
-asof 后的时序窗口计数为决策观察次数。在小时决策上重复采样日频数据后计算 24 个观察的窗口，不等于 24 个交易日。需要原生日频指标时，先在日频数据源生成指标，再显式采样该输出。
+叶节点 `sampling: asof` 后的时序窗口计数为决策观察次数：在小时决策上对 `asof` 字段计算 24 个观察的窗口，不等于 24 个交易日。需要原生日频/4 小时指标时，使用 `mtf.asof("1d", ts.ema(close, 20))`（Go 侧对应 `factor.AsOfNode` / `factor.SubTF`），使内部时序窗口仅在源周期已闭合 bar（`barEnd <= GridTime`）到达时步进一次，再因果 `AsOf` 投影到决策网格。需要引用特定基准品种（如 `"BTC/USDT:USDT"`）计算滚动 Beta/相关系数或市场状态门控时，使用 `ref.field("BTC/USDT:USDT", "close")`（Go 侧 `factor.RefAssetField`）。
 
 ## 9. 检查数值、有效性和因子效果
 

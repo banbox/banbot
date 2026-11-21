@@ -817,8 +817,24 @@ func factorLiveKlineSubscriptions(engine *runner.Live, c runner.Config, symbols 
 		}
 		return nil
 	}
-	for _, input := range engine.Inputs() {
-		if err := add(input, engine.DataSIDs()); err != nil {
+	baseDataSIDs := slices.Compact(append(append([]int32(nil), c.Snapshot.Universe.Investable...), c.Snapshot.Universe.Reference...))
+	slices.Sort(baseDataSIDs)
+	baseDataSIDs = slices.Compact(baseDataSIDs)
+	for _, input := range engine.ScopedInputs() {
+		var sids []int32
+		if input.AllAssets {
+			sids = append(sids, baseDataSIDs...)
+		}
+		for _, sym := range input.RefSymbols {
+			refSID, ok := c.Snapshot.ResolveSymbolSID(sym)
+			if !ok {
+				return nil, fmt.Errorf("factor: live reference symbol %q missing from SIDMap", sym)
+			}
+			sids = append(sids, refSID)
+		}
+		slices.Sort(sids)
+		sids = slices.Compact(sids)
+		if err := add(input.InputSpec, sids); err != nil {
 			return nil, err
 		}
 	}

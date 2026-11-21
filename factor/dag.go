@@ -45,6 +45,7 @@ type NodeSpec struct {
 	SourceTimeFrame          string
 	Field                    string
 	GroupField               string
+	RefSymbol                string
 	TimeFrame                string
 	Parameters               map[string]float64
 	OutputType               string
@@ -258,6 +259,7 @@ type Plan struct {
 	timeframe string
 	retention int
 	warmup    int
+	subMeta   *subTFPlanMeta
 }
 
 func (p *Plan) Hash() string        { return p.hash }
@@ -293,40 +295,8 @@ type InputSpec struct {
 // Inputs exposes the actual raw subscription union without importing data or
 // strategies. Fields are sorted and independent copies, suitable for runners.
 func (p *Plan) Inputs() []InputSpec {
-	inputs := make(map[string]*InputSpec)
-	for _, node := range p.nodes {
-		if node.spec.Source == "" {
-			continue
-		}
-		key := node.spec.Source + "\x00" + node.spec.SourceTimeFrame
-		input := inputs[key]
-		if input == nil {
-			input = &InputSpec{Source: node.spec.Source, TimeFrame: node.spec.SourceTimeFrame, AsOfLatest: node.spec.AvailabilityPolicy == "asof-latest", MaxAge: node.spec.MaxAge}
-			inputs[key] = input
-		}
-		field := node.spec.Field
-		if field == "" {
-			field = node.spec.GroupField
-		}
-		input.Fields = append(input.Fields, field)
-		input.WarmupLength = max(input.WarmupLength, p.warmup)
-		if node.spec.AvailabilityPolicy != "asof-latest" {
-			input.AsOfLatest = false
-		}
-		if input.MaxAge == 0 || (node.spec.MaxAge > 0 && node.spec.MaxAge < input.MaxAge) {
-			input.MaxAge = node.spec.MaxAge
-		}
-	}
-	keys := slices.Collect(maps.Keys(inputs))
-	sort.Strings(keys)
-	result := make([]InputSpec, 0, len(keys))
-	for _, key := range keys {
-		input := *inputs[key]
-		sort.Strings(input.Fields)
-		input.Fields = slices.Compact(input.Fields)
-		result = append(result, input)
-	}
-	return result
+	plain, _ := p.buildInputs()
+	return plain
 }
 func (p *Plan) Outputs() []string {
 	names := slices.Collect(maps.Keys(p.outputs))
@@ -339,18 +309,23 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 		return nil, errors.New("factor: empty inference plan")
 	}
 	plan := &Plan{outputs: make(map[string]int), retention: 2}
+	type nodeVisitKey struct {
+		node       *Node
+		expectedTF string
+	}
 	visiting := make(map[*Node]bool)
-	visited := make(map[*Node]int)
+	visited := make(map[nodeVisitKey]int)
 	canonicalNodes := make(map[string]int)
-	var visitNode func(*Node) (int, error)
-	visitNode = func(n *Node) (int, error) {
+	var visitNode func(*Node, string) (int, error)
+	visitNode = func(n *Node, expectedTF string) (int, error) {
 		if n == nil {
 			return 0, errors.New("factor: nil dependency")
 		}
 		if visiting[n] {
 			return 0, errors.New("factor: cyclic dependency")
 		}
-		if index, ok := visited[n]; ok {
+		vKey := nodeVisitKey{n, expectedTF}
+		if index, ok := visited[vKey]; ok {
 			return index, nil
 		}
 		visiting[n] = true
@@ -359,22 +334,34 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 		if spec.Source != "" && spec.SourceTimeFrame == "" {
 			spec.SourceTimeFrame = spec.TimeFrame
 		}
+		if spec.Operator == opAsOfNode && spec.SourceTimeFrame == "" && len(n.Inputs) == 1 && n.Inputs[0] != nil {
+			spec.SourceTimeFrame = n.Inputs[0].Spec.TimeFrame
+		}
 		if spec.Operator == "label" {
 			return 0, errors.New("factor: inference cannot depend on label namespace")
 		}
 		if err := validateNode(spec, len(n.Inputs), n.Evaluate != nil); err != nil {
 			return 0, err
 		}
-		if plan.timeframe == "" {
-			plan.timeframe = spec.TimeFrame
-		} else if plan.timeframe != spec.TimeFrame {
+		if expectedTF == "" {
+			if plan.timeframe == "" {
+				plan.timeframe = spec.TimeFrame
+			} else if plan.timeframe != spec.TimeFrame {
+				return 0, errors.New("factor: mixed timeframes require explicitly resampled input")
+			}
+			expectedTF = plan.timeframe
+		} else if spec.TimeFrame != expectedTF {
 			return 0, errors.New("factor: mixed timeframes require explicitly resampled input")
+		}
+		childTF := spec.TimeFrame
+		if spec.Operator == opAsOfNode {
+			childTF = spec.SourceTimeFrame
 		}
 		inputs := make([]int, len(n.Inputs))
 		dependencyIDs := make([]string, len(inputs))
 		dependencyWarmup := 0
 		for i, input := range n.Inputs {
-			index, err := visitNode(input)
+			index, err := visitNode(input, childTF)
 			if err != nil {
 				return 0, err
 			}
@@ -389,6 +376,13 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 			spec.StateRetention = max(spec.StateRetention, retention)
 		} else {
 			switch spec.Operator {
+			case opAsOfNode:
+				warm, err := asofNodeWarmup(spec, dependencyWarmup)
+				if err != nil {
+					return 0, err
+				}
+				spec.WarmupLength = warm
+				spec.StateRetention = max(spec.StateRetention, 1)
 			case "lag", "return":
 				spec.WarmupLength = dependencyWarmup + period
 				spec.StateRetention = max(spec.StateRetention, period+1)
@@ -408,17 +402,19 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 			return 0, err
 		}
 		if index, exists := canonicalNodes[id]; exists {
-			visited[n] = index
+			visited[vKey] = index
 			delete(visiting, n)
 			return index, nil
 		}
 		index := len(plan.nodes)
 		plan.nodes = append(plan.nodes, compiledNode{id, spec, inputs, n.Evaluate})
 		canonicalNodes[id] = index
-		visited[n] = index
+		visited[vKey] = index
 		delete(visiting, n)
-		plan.retention = max(plan.retention, spec.StateRetention)
-		plan.warmup = max(plan.warmup, spec.WarmupLength)
+		if spec.TimeFrame == plan.timeframe {
+			plan.retention = max(plan.retention, spec.StateRetention)
+			plan.warmup = max(plan.warmup, spec.WarmupLength)
+		}
 		return index, nil
 	}
 	names := slices.Collect(maps.Keys(outputs))
@@ -427,13 +423,14 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 		if name == "" {
 			return nil, errors.New("factor: empty output name")
 		}
-		index, err := visitNode(outputs[name])
+		index, err := visitNode(outputs[name], plan.timeframe)
 		if err != nil {
 			return nil, err
 		}
 		plan.outputs[name] = index
 	}
 	plan.stages = buildPlanStages(plan.nodes)
+	plan.subMeta = compileSubTFMeta(plan)
 	ids := make([]string, len(plan.nodes))
 	for i, n := range plan.nodes {
 		ids[i] = n.id
@@ -498,13 +495,17 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 		return errors.New("factor: explicit sampling policy required")
 	}
 	groupField := spec.Operator == "group-demean" || spec.Operator == "group-zscore"
-	// Legacy Go group builders permit unlimited-age latest classifications.
+	allowZeroAsOfAge := groupField || spec.Operator == opAsOfNode
+	// Legacy Go group builders and AsOfNode permit unlimited-age latest values.
 	// Explicit ByField builders validate the Field contract before copying it.
-	if spec.AvailabilityPolicy == "asof-latest" && (spec.SamplingPolicy != "decision-grid" || spec.MaxAge < 0 || (spec.MaxAge == 0 && !groupField)) {
+	if spec.AvailabilityPolicy == "asof-latest" && (spec.SamplingPolicy != "decision-grid" || spec.MaxAge < 0 || (spec.MaxAge == 0 && !allowZeroAsOfAge)) {
 		return errors.New("factor: asof source requires decision-grid sampling and positive max age (legacy groups permit zero)")
 	}
-	if (spec.Operator == "field" || groupField) && spec.SourceTimeFrame != spec.TimeFrame && spec.AvailabilityPolicy != "asof-latest" {
+	if (spec.Operator == "field" || spec.Operator == opRefField || groupField) && spec.SourceTimeFrame != spec.TimeFrame && spec.AvailabilityPolicy != "asof-latest" {
 		return errors.New("factor: mixed source timeframe requires explicit asof sampling")
+	}
+	if spec.RefSymbol != "" && spec.Operator != opRefField {
+		return errors.New("factor: reference symbol is only valid on ref-field")
 	}
 	if spec.Kind != TS && spec.Kind != CS && spec.Kind != GROUP {
 		return errors.New("factor: invalid node kind")
@@ -572,6 +573,9 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 			}
 		}
 		return nil
+	}
+	if handled, err := validateMTFOrRefNode(spec, count); handled {
+		return err
 	}
 	if spec.Operator == "field" {
 		if count != 0 || spec.Source == "" || spec.Field == "" {

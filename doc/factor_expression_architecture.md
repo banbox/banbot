@@ -88,7 +88,7 @@ Session 和 Batch 共用 `evaluatePointwise`：普通多输入算子按声明顺
 
 `GridTime` 是逻辑观察时间，`DecisionTime` 是实际可见性截止时间，两者允许不同。屏障检查每个要求的流是否到达、是否为目标已闭合事件或满足 asof 时效；数据流已到达但字段 NULL 与整个数据流未到达是两种情况。只有 Ready 快照可以执行。
 
-同周期默认字段使用 source-events，要求当前网格的已闭合事件。不同周期源必须显式绑定 `asof`/`asof-latest` 和正 `max_age_ms`，转换为决策周期的 `AsOfField`。asof 读取网格之前、截止时间已可见且未超龄的最新记录；之后的窗口每个决策观察推进一次，重复读取同一个源事件也算一次观察。
+同周期默认字段使用 source-events，要求当前网格的已闭合事件。不同周期或事件源可通过叶节点 `asof`/`asof-latest`（`AsOfField`，其后窗口按决策观察推进），或通过源周期求值节点 `mtf.asof`/`asof_tf`（`AsOfNode`/`SubTF`，子图在源周期独立 `ta.BarEnv` / 压缩闭合步序列上仅随新闭合源 bar 步进后再做因果 `AsOf` 投影）；特定参考标的通过 `ref.field`（`RefAssetField`/`AsOfRefAssetField`）经快照 `SIDMap` 解析并向活跃截面广播。
 
 ### Session 与 Batch
 

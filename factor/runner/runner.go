@@ -817,7 +817,10 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if spec.ReplayTime != 0 {
 				spec.ReplayTime = now
 			}
-			req := requirements(plan, spec.Universe, grid)
+			req, reqErr := requirements(plan, spec, grid)
+			if reqErr != nil {
+				return result, reqErr
+			}
 			requested := map[factor.StreamKey]bool{}
 			for _, r := range req {
 				requested[factor.StreamKey{SID: r.SID, Source: r.Source, TimeFrame: r.TimeFrame}] = true
@@ -918,12 +921,16 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 						}
 						pitSpec := spec
 						pitSpec.Universe = reduced
-						pitToken, beginErr := barrier.Begin(plan.Hash(), pitSpec, requirements(plan, reduced, grid), now+c.ExpiryMS)
+						pitReqs, pitReqErr := requirements(plan, pitSpec, grid)
+						if pitReqErr != nil {
+							return result, pitReqErr
+						}
+						pitToken, beginErr := barrier.Begin(plan.Hash(), pitSpec, pitReqs, now+c.ExpiryMS)
 						if beginErr != nil {
 							return result, beginErr
 						}
 						pitRequested := map[factor.StreamKey]bool{}
-						for _, r := range requirements(plan, reduced, grid) {
+						for _, r := range pitReqs {
 							pitRequested[factor.StreamKey{SID: r.SID, Source: r.Source, TimeFrame: r.TimeFrame}] = true
 						}
 						for _, r := range visible {
@@ -1263,21 +1270,41 @@ func runAssumptions(c Config) (string, error) {
 	hash := sha256.Sum256(body)
 	return hex.EncodeToString(hash[:]), nil
 }
-func requirements(plan *factor.Plan, u factor.Universe, at int64) []factor.Requirement {
-	ids := append(append([]int32{}, u.Reference...), u.Investable...)
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	seen := map[int32]bool{}
+func requirements(plan *factor.Plan, spec factor.SnapshotSpec, at int64) ([]factor.Requirement, error) {
+	u := spec.Universe
+	baseIDs := append(append([]int32{}, u.Reference...), u.Investable...)
+	sort.Slice(baseIDs, func(i, j int) bool { return baseIDs[i] < baseIDs[j] })
 	out := []factor.Requirement{}
-	for _, sid := range ids {
-		if seen[sid] {
-			continue
+	for _, in := range plan.ScopedInputs() {
+		sids := make([]int32, 0, len(baseIDs)+len(in.RefSymbols))
+		if in.AllAssets {
+			sids = append(sids, baseIDs...)
 		}
-		seen[sid] = true
-		for _, in := range plan.Inputs() {
-			out = append(out, factor.Requirement{SID: sid, Source: in.Source, TimeFrame: in.TimeFrame, EventTime: at, AsOfLatest: in.AsOfLatest, MaxAge: in.MaxAge})
+		for _, sym := range in.RefSymbols {
+			refSID, ok := spec.ResolveSymbolSID(sym)
+			if !ok {
+				return nil, fmt.Errorf("factor: reference symbol %q missing from snapshot SIDMap", sym)
+			}
+			sids = append(sids, refSID)
+		}
+		sort.Slice(sids, func(i, j int) bool { return sids[i] < sids[j] })
+		seen := map[int32]bool{}
+		for _, sid := range sids {
+			if seen[sid] {
+				continue
+			}
+			seen[sid] = true
+			out = append(out, factor.Requirement{
+				SID:        sid,
+				Source:     in.Source,
+				TimeFrame:  in.TimeFrame,
+				EventTime:  at,
+				AsOfLatest: in.AsOfLatest,
+				MaxAge:     in.MaxAge,
+			})
 		}
 	}
-	return out
+	return out, nil
 }
 func copyQuotes(src map[int32]backtest.Quote) map[int32]backtest.Quote {
 	dst := make(map[int32]backtest.Quote, len(src))

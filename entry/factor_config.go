@@ -446,13 +446,13 @@ func deriveArchivePrice(c *runner.Config) error {
 }
 
 func inspectArchiveChunk(c *runner.Config, index int, sids map[int32]bool, schemas map[string]map[string]string) error {
-	var inputs []factor.InputSpec
+	var inputs []factor.ScopedInputSpec
 	if sids != nil {
 		plan, _, err := runner.CompileDefinition(*c)
 		if err != nil {
 			return err
 		}
-		inputs = plan.Inputs()
+		inputs = plan.ScopedInputs()
 	}
 	store, err := factor.OpenVersionStore(c.Chunks[index].Path, c.MaxRecords)
 	if err != nil {
@@ -470,14 +470,18 @@ func inspectArchiveChunk(c *runner.Config, index int, sids map[int32]bool, schem
 		from = min(from, row.EventTime)
 		to = max(to, row.EventTime)
 		if sids != nil {
+			if c.Snapshot.SIDMap[row.Series.Sid] == "" {
+				if row.Series.ExSymbol != nil && row.Series.ExSymbol.Symbol != "" {
+					c.Snapshot.SIDMap[row.Series.Sid] = row.Series.ExSymbol.Symbol
+				} else {
+					c.Snapshot.SIDMap[row.Series.Sid] = fmt.Sprintf("sid:%d", row.Series.Sid)
+				}
+			}
 			for _, input := range inputs {
-				if input.Source == row.Series.Source && input.TimeFrame == row.Series.TimeFrame {
+				if input.AllAssets && input.Source == row.Series.Source && input.TimeFrame == row.Series.TimeFrame {
 					sids[row.Series.Sid] = true
 					break
 				}
-			}
-			if c.Snapshot.SIDMap[row.Series.Sid] == "" {
-				c.Snapshot.SIDMap[row.Series.Sid] = fmt.Sprintf("sid:%d", row.Series.Sid)
 			}
 			if version := c.Snapshot.SourceVersions[row.Series.Source]; version != "" && version != row.SourceVersion {
 				return fmt.Errorf("factor: source version changes require explicit PIT schema: %s", row.Series.Source)

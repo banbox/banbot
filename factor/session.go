@@ -50,6 +50,7 @@ type Session struct {
 	universeVersion string
 	revision        uint64
 	assets          map[int32]*assetState
+	subAssets       map[int32][]*subAssetScopeState
 	latest          Frame
 	lastGrid        int64
 	warmSnapshot    string
@@ -77,6 +78,7 @@ func (s *Session) RetainedValues() int {
 			total += len(series.Data)
 		}
 	}
+	total += s.retainedSubAssetValues()
 	return total
 }
 
@@ -148,6 +150,7 @@ func (s *Session) evaluate(snapshot *Snapshot, warmup bool) (Frame, error) {
 		s.assets[sid].env.TimeStop = snapshot.spec.GridTime
 		s.assets[sid].env.BarNum++
 	}
+	s.syncSubAssets(allSIDs, snapshot.spec.SIDMap)
 	columns := make([]map[int32]Numeric, len(s.plan.nodes))
 	for _, stage := range s.plan.stages {
 		if stage.kind == StageTS {
@@ -157,8 +160,17 @@ func (s *Session) evaluate(snapshot *Snapshot, warmup bool) (Frame, error) {
 			for _, sid := range allSIDs {
 				asset := s.assets[sid]
 				for _, index := range stage.nodes {
+					if s.plan.isSubTFNode(index) {
+						columns[index][sid] = s.evaluateSubTFNode(index, sid, snapshot, columns)
+						continue
+					}
 					node := s.plan.nodes[index]
-					value := s.evaluateTS(node, asset, sid, snapshot, columns)
+					var value Numeric
+					if node.spec.Operator == opAsOfNode {
+						value = s.evaluateAsOfNode(index, node, sid, snapshot, columns, snapshot.spec.GridTime)
+					} else {
+						value = s.evaluateTS(node, asset, sid, snapshot, columns)
+					}
 					columns[index][sid] = value
 					asset.nodes[index].Append(value.Value)
 					s.updates[node.id]++
@@ -168,13 +180,18 @@ func (s *Session) evaluate(snapshot *Snapshot, warmup bool) (Frame, error) {
 			for _, index := range stage.nodes {
 				node := s.plan.nodes[index]
 				columns[index] = crossSection(node, snapshot, columns)
+				isSubTF := s.plan.isSubTFNode(index)
 				for _, sid := range allSIDs {
 					value, exists := columns[index][sid]
 					if !exists {
 						value = Numeric{math.NaN(), Missing}
 						columns[index][sid] = value
 					}
-					s.assets[sid].nodes[index].Append(value.Value)
+					if isSubTF {
+						s.appendSubTFCS(index, sid, snapshot, value)
+					} else {
+						s.assets[sid].nodes[index].Append(value.Value)
+					}
 				}
 				s.updates[node.id]++
 			}
@@ -190,6 +207,7 @@ func (s *Session) evaluate(snapshot *Snapshot, warmup bool) (Frame, error) {
 			}
 		}
 	}
+	s.trimSubAssets()
 	frame := Frame{SnapshotID: snapshot.id, PlanHash: s.plan.hash, GridTime: snapshot.spec.GridTime, DecisionTime: snapshot.spec.DecisionTime, Values: make(map[string]map[int32]Numeric)}
 	for name, index := range s.plan.outputs {
 		frame.Values[name] = maps.Clone(columns[index])
@@ -247,6 +265,11 @@ func (s *Session) fork() (*Session, uint64, error) {
 		}
 		copy.assets[sid] = &assetState{env: env, nodes: nodes, technical: technical}
 	}
+	subAssets, err := s.forkSubAssets()
+	if err != nil {
+		return nil, 0, err
+	}
+	copy.subAssets = subAssets
 	return copy, s.revision, nil
 }
 
@@ -261,6 +284,7 @@ func (s *Session) commit(candidate *Session, baseRevision uint64) error {
 	s.universeVersion = candidate.universeVersion
 	s.revision = candidate.revision
 	s.assets = candidate.assets
+	s.subAssets = candidate.subAssets
 	s.latest = candidate.latest
 	s.lastGrid = candidate.lastGrid
 	s.warmSnapshot = candidate.warmSnapshot
@@ -272,11 +296,28 @@ func (p *Plan) snapshotIdentity(snapshot *Snapshot) (string, error) {
 	if snapshot == nil || !snapshot.status.Ready {
 		return "", ErrSnapshotIncomplete
 	}
-	contextHash, err := contentHash(struct {
-		Schemas, SourceVersions map[string]string
-		Adjustment, Visibility  string
-		TrackedQuotesOnly       bool
-	}{snapshot.spec.Schemas, snapshot.spec.SourceVersions, snapshot.spec.AdjustmentVersion, snapshot.spec.VisibilityPolicy, snapshot.spec.TrackedQuotesOnly})
+	var contextHash string
+	var err error
+	if refs := p.ReferenceSymbols(); len(refs) > 0 {
+		refSIDs := make(map[string]int32, len(refs))
+		for _, sym := range refs {
+			if sid, ok := snapshot.ResolveSymbolSID(sym); ok {
+				refSIDs[sym] = sid
+			}
+		}
+		contextHash, err = contentHash(struct {
+			Schemas, SourceVersions map[string]string
+			Adjustment, Visibility  string
+			TrackedQuotesOnly       bool
+			ReferenceSIDs           map[string]int32
+		}{snapshot.spec.Schemas, snapshot.spec.SourceVersions, snapshot.spec.AdjustmentVersion, snapshot.spec.VisibilityPolicy, snapshot.spec.TrackedQuotesOnly, refSIDs})
+	} else {
+		contextHash, err = contentHash(struct {
+			Schemas, SourceVersions map[string]string
+			Adjustment, Visibility  string
+			TrackedQuotesOnly       bool
+		}{snapshot.spec.Schemas, snapshot.spec.SourceVersions, snapshot.spec.AdjustmentVersion, snapshot.spec.VisibilityPolicy, snapshot.spec.TrackedQuotesOnly})
+	}
 	if err != nil {
 		return "", err
 	}
@@ -284,31 +325,8 @@ func (p *Plan) snapshotIdentity(snapshot *Snapshot) (string, error) {
 	for _, key := range snapshot.status.Expected {
 		expected[key] = true
 	}
-	var active []int32
-	for _, node := range p.nodes {
-		if node.spec.Source == "" {
-			continue
-		}
-		if active == nil {
-			active = activeFactorSIDs(snapshot.spec)
-		}
-		for _, sid := range active {
-			key := StreamKey{sid, node.spec.Source, node.spec.SourceTimeFrame}
-			if !expected[key] {
-				return "", fmt.Errorf("factor: active stream %d/%s/%s absent from declared barrier", sid, node.spec.Source, node.spec.SourceTimeFrame)
-			}
-			if node.spec.AvailabilityPolicy == "asof-latest" {
-				row := snapshot.rows[key]
-				if row.EventTime > snapshot.spec.GridTime || (node.spec.MaxAge > 0 && snapshot.spec.GridTime-row.EventTime > node.spec.MaxAge) {
-					return "", fmt.Errorf("factor: asof stream %d/%s exceeds declared max age", sid, node.spec.Source)
-				}
-			} else {
-				row := snapshot.rows[key]
-				if !row.Series.Closed || row.EventTime != snapshot.spec.GridTime {
-					return "", fmt.Errorf("factor: stream %d/%s lacks current closed event", sid, node.spec.Source)
-				}
-			}
-		}
+	if err := p.validateSnapshotStreams(snapshot, expected); err != nil {
+		return "", err
 	}
 	return contextHash, nil
 }
@@ -316,6 +334,9 @@ func (p *Plan) snapshotIdentity(snapshot *Snapshot) (string, error) {
 func (s *Session) evaluateTS(node compiledNode, asset *assetState, sid int32, snapshot *Snapshot, columns []map[int32]Numeric) Numeric {
 	if node.spec.Operator == "field" {
 		return snapshot.Numeric(sid, node.spec.Source, node.spec.SourceTimeFrame, node.spec.Field)
+	}
+	if node.spec.Operator == opRefField {
+		return snapshot.RefNumeric(node.spec.RefSymbol, node.spec.Source, node.spec.SourceTimeFrame, node.spec.Field)
 	}
 	inputs := make([]Numeric, len(node.inputs))
 	for i, index := range node.inputs {

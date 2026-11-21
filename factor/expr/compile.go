@@ -47,6 +47,7 @@ type compiler struct {
 	visiting    map[string]bool
 	depth       int
 	heights     map[*factor.Node]int
+	tfOverride  string
 }
 
 func names[V any](items map[string]V) []string {
@@ -87,7 +88,7 @@ func Compile(spec Spec) (*factor.Plan, error) {
 	}
 	for _, name := range names(spec.Bindings) {
 		b := spec.Bindings[name]
-		if !identifier(name) || name == "factor" || name == "param" || name == "label" || name == "ts" || name == "cs" || name == "group" {
+		if !identifier(name) || name == "factor" || name == "param" || name == "label" || name == "ts" || name == "cs" || name == "group" || name == "mtf" || name == "ref" {
 			return nil, fmt.Errorf("bindings.%s: invalid or reserved alias", name)
 		}
 		if strings.TrimSpace(b.Source) == "" || strings.TrimSpace(b.TimeFrame) == "" {
@@ -162,24 +163,25 @@ func (c *compiler) error(path string, e *expression, format string, args ...any)
 	return fmt.Errorf("%s:%d:%d: %s", path, pos.Line, pos.Column, fmt.Sprintf(format, args...))
 }
 func (c *compiler) named(name string) (*factor.Node, error) {
-	if c.visiting[name] {
+	key := c.scopedFactorKey(name)
+	if c.visiting[key] {
 		return nil, c.error(c.paths[name], c.definitions[name], "cyclic factor reference %q", name)
 	}
-	if n := c.nodes[name]; n != nil {
+	if n := c.nodes[key]; n != nil {
 		return n, nil
 	}
 	e, ok := c.definitions[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown factor %q", name)
 	}
-	c.visiting[name] = true
+	c.visiting[key] = true
 	n, err := c.lower(c.paths[name], e)
-	delete(c.visiting, name)
+	delete(c.visiting, key)
 	if err == nil && c.height(n) > maxDepth {
 		return nil, c.error(c.paths[name], e, "expanded factor DAG exceeds depth %d", maxDepth)
 	}
 	if err == nil {
-		c.nodes[name] = n
+		c.nodes[key] = n
 	}
 	return n, err
 }
@@ -234,10 +236,15 @@ func (c *compiler) field(path string, e *expression, alias, name string) (*facto
 	if name == "" {
 		return nil, c.error(path, e, "field name must not be empty")
 	}
+	activeTF := c.currentTF()
 	if b.Sampling == "asof" || b.Sampling == "asof-latest" {
-		return factor.AsOfField(b.Source, name, b.TimeFrame, c.spec.TimeFrame, b.MaxAgeMS), nil
+		return factor.AsOfField(b.Source, name, b.TimeFrame, activeTF, b.MaxAgeMS), nil
 	}
-	return factor.Field(b.Source, name, b.TimeFrame), nil
+	tf := b.TimeFrame
+	if c.tfOverride != "" {
+		tf = activeTF
+	}
+	return factor.Field(b.Source, name, tf), nil
 }
 func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 	c.depth++
@@ -251,8 +258,17 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		return factor.Constant(v, c.spec.TimeFrame), nil
+		return factor.Constant(v, c.currentTF()), nil
 	case 'r':
+		if !strings.Contains(e.text, ".") && isDefaultKlineField(e.text) {
+			if _, ok := c.spec.Bindings["kline"]; ok {
+				return c.field(path, e, "kline", e.text)
+			}
+			if len(c.spec.Bindings) == 0 {
+				return factor.Field("kline", e.text, c.currentTF()), nil
+			}
+			return nil, c.error(path, e, "%s shorthand requires a \"kline\" binding", e.text)
+		}
 		parts := strings.Split(e.text, ".")
 		if len(parts) != 2 {
 			return nil, c.error(path, e, "expected alias.field, factor.name or param.name")
@@ -270,7 +286,7 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 			if err != nil {
 				return nil, err
 			}
-			return factor.Constant(v, c.spec.TimeFrame), nil
+			return factor.Constant(v, c.currentTF()), nil
 		default:
 			return c.field(path, e, parts[0], parts[1])
 		}
@@ -318,6 +334,9 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 }
 
 func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
+	if n, handled, err := c.mtfOrRefCall(path, e); handled {
+		return n, err
+	}
 	if n, handled, err := c.indicatorCall(path, e); handled {
 		return n, err
 	}
@@ -325,7 +344,7 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 		"field": 2, "positive": 1, "sign": 1, "clip": 3,
 		"abs": 1, "log": 1, "sqrt": 1, "pow": 2, "min": 2, "max": 2,
 		"gt": 2, "ge": 2, "lt": 2, "le": 2, "where": 3, "if_else": 3,
-		"ts.lag": 2, "ts.return": 2, "ts.ema": 2, "ts.std": 3,
+		"ts.lag": 2, "ts.return": 2, "ts.ret": 2, "ts.ema": 2, "ts.std": 3,
 		"cs.rank": 1, "cs.pct_rank": 1, "cs.zscore": 1, "cs.robust_zscore": 1,
 		"cs.mean": 1, "cs.sum": 1,
 		"cs.mad_winsorize": 2, "cs.winsorize": 2, "cs.quantile": 2,
@@ -483,7 +502,7 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	switch e.text {
 	case "ts.lag":
 		return factor.Lag(a, period), nil
-	case "ts.return":
+	case "ts.return", "ts.ret":
 		return factor.Return(a, period), nil
 	case "ts.ema":
 		return factor.EMA(a, period), nil
