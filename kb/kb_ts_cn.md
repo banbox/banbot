@@ -7,7 +7,7 @@ banbot 时序策略（`engine: time_series`，默认）：接口、回调、下�
 ```go
 // 1) 注册：注册名 = 组名:策略名；YAML run_policy[].name 必须完全一致
 func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": MaFn}) } // 或 strat.RegisterStrategy("demo:ma", MaFn)
-// 2) 工厂：每个 run_policy 调用一次，返回 *strat.TradeStrat；超参用 pol.Def/DefInt
+// 2) 工厂：每个 run_policy 调用一次，返回 *strat.TradeStrat；超参用 pol.Def/DefInt，跨参数约束用 pol.Require/Requiref
 // 3) 入口：package main 匿名 import 策略包，然后 entry.RunCmd()
 ```
 
@@ -89,7 +89,7 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 - `strat_perf`：策略-品种绩效自动降权：`enable min_od_num max_od_num min_job_num mid_weight bad_weight`
 - 其它未知键：进入 `Policy.More`，用 `pol.More[...]` 读取
 
-超参：`pol.Def("name", dv, core.PNorm(lo,hi)) float64`、`pol.DefInt(...) int`。名称须为合法标识符；值取自 `params`，未配置取 `dv`。`pol` 只读且被所有 job 共享，**超参勿存进结构体或 `More`**。
+超参：`pol.Def("name", dv, core.PNorm(lo,hi)) float64`、`pol.DefInt(...) int`。名称须为合法标识符；值取自 `params`，未配置取 `dv`。跨参数约束在工厂函数内用 `pol.Require(cond, msg)` 或 `pol.Requiref(cond, format, args...)` 断言（如 `pol.Require(fast < slow, "require fast < slow")`），条件不满足时以 `Error: [BadConfig] <msg>` 拒绝该组参数（参数搜索将其标为无效试验跳过，勿手写普通 `panic`）。`pol` 只读且被所有 job 共享，**超参勿存进结构体或 `More`**。
 
 ### 1.7 运行时隔离（v0.5+）
 - 工厂签名固定 `func(pol *config.RunPolicyConfig) *strat.TradeStrat`。不得在包级变量保存订单、指标、逐品种状态（放 `StratJob.More`），不得自行保存 Runtime/State 对象。
@@ -564,7 +564,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 20. 常见编译错误：品种名字符串是 `s.Symbol.Symbol`（`s.Symbol` 是 `*orm.ExSymbol`，不能当字符串或 map 键）；`pol.Params` 是 `map[string]float64`，超参只有数值（开关用 0/1），用 `pol.Def/DefInt` 读取，没有 `DefBool/DefStr/core.PInt`；方向参数 `dirt` 是 `float64`；K线时间用 `e.TimeStart/TimeStop`、周期用 `e.TFMSecs`（没有 `e.Time/TFSecs`）；订单类型在 `github.com/banbox/banbot/orm/ormo`（`*ormo.InOutOrder`、`*ormo.ExitTrigger`）；`EnterReq` 没有 `Qty/Dirt` 字段（数量 `Amount`、金额 `LegalCost`/`CostRate`、按风险比例定仓 `RiskRate`、做空 `Short: true`）；查询账户权益/可用余额/峰值回撤用 `s.AccountEquity()` / `s.AvailableBalance()` / `s.AccountDrawdown()`（无 `GetEquity`），单笔基准金额用 `s.Strat.GetStakeAmount(s)`。
 
 ## 8. 超参与优化
-超参用 `pol.Def/DefInt` 声明（分布见 §1.5；`DefInt` 自动取整）。`banbot optimize --config x.yml`（另有 `bt-opt` 滚动回测）；`--sampler tpe|bayes|random|cmaes|ipop-cmaes|bipop-cmaes`（默认 bayes），`--opt-rounds`（默认 30）。
+超参用 `pol.Def/DefInt` 声明（分布见 §1.5；`DefInt` 自动取整）；存在跨参数合法性关系（如 `fast < slow`、`maFast < maMid && maMid < maSlow`、`callbackMin <= callbackMax`）时，必须在工厂函数内调用 `pol.Require(cond, "require ...")` / `pol.Requiref(...)` 显式校验，使非法参数组合以 `[BadConfig]` 快速返回而非触发崩溃重试。`banbot optimize --config x.yml`（另有 `bt-opt` 滚动回测）；`--sampler tpe|bayes|random|cmaes|ipop-cmaes|bipop-cmaes`（默认 bayes），`--opt-rounds`（默认 30）。
 
 ## 9. 完整示例
 ### 示例 A：单周期 EMA 交叉 + ATR 止损止盈
@@ -587,6 +587,7 @@ func init() {
 func MaAtr(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	fast := pol.DefInt("fast", 10, core.PNorm(5, 30))
 	slow := pol.DefInt("slow", 30, core.PNorm(20, 100))
+	pol.Require(fast < slow, "require fast < slow")
 	atrLen := pol.DefInt("atrLen", 14, core.PNorm(7, 30))
 	slMul := pol.Def("slMul", 2, core.PNorm(1, 4))
 	tpMul := pol.Def("tpMul", 4, core.PNorm(2, 8))

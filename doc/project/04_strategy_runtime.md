@@ -15,9 +15,9 @@
 | 文件 | 作用 |
 | --- | --- |
 | `strat/types.go` | `TradeStrat`、`StratJob`、`EnterReq`、`ExitReq`、`JobEnv`、`BatchMap`、`OdChg*` 常量 |
-| `strat/state.go` | `State`（策略域 typed 状态）、`NewState`/`BindRuntime*`、`Reset`、`NewStrategy`、legacy 包级全局视图 `legacyState` |
+| `strat/state.go` | `State`（策略域 typed 状态）、`NewState`/`BindRuntime*`、`Reset`、`NewStrategy`/`NewStrategyChecked`、legacy 包级全局视图 `legacyState` |
 | `strat/state_accessors.go` | `State` 的 job 注册表读写、快照（`CollectJobs`、`LookupJob`、`SetJobMap`）、env/version 访问 |
-| `strat/common.go` | 策略注册表（`RegisterStrategy`/`GetStrategyFactory`）、`New`（legacy 实例化）、`UpdateOrders`/`InitBar`、`CheckCustomExits`、订单事件 `FireOdChange`、历史订单与 Job 评分、fail-open 计数 |
+| `strat/common.go` | 策略注册表（`RegisterStrategy`/`GetStrategyFactory`）、`New`/`NewChecked`（legacy 实例化与工厂参数错误包装）、`UpdateOrders`/`InitBar`、`CheckCustomExits`、订单事件 `FireOdChange`、历史订单与 Job 评分、fail-open 计数 |
 | `strat/base.go` | `StratJob` 开单/平仓校验与入队（`OpenOrder`/`openOrder`、`CloseOrders`/`closeOrders`）、仓位查询、`SetAllStopLoss`、回撤平仓 `drawDownExit`、自定义退出 `customExit` |
 | `strat/account_state.go` | `StratJob` 只读账户状态（`AccountEquity`、`AvailableBalance`、`AccountDrawdown`）、`FuncAccountMetrics` 绑定与峰值净值（HWM）跟踪 |
 | `strat/execution_state.go` | Job 执行状态（`executionStateMu`）、请求队列（`enqueueEntry/Exit`、`DrainOrderRequests`）、订单处理互斥（`Begin/FinishOrderProcessing`）、`ProcessRuntimeOrders`、`WithOrderEvent`（CommandID 派生） |
@@ -60,8 +60,9 @@
 
 ### 1. 策略注册与实例化
 1. 工厂注册：`RegisterStrategy` / `AddStratGroup`（`strat/common.go:945-958`），快照用 `snapshotStratFactories`。
-2. 运行期 `State.NewStrategy`（`state.go:821`）：按 `pol.ID()+ToYaml` 缓存；调用工厂 → `cloneTradeStrat` → `validateDataCallbacks` → 默认值（`MinTfScore=0.75`、`StopLoss`、`RunTimeFrames`、`OdBarMax`）→ 绑定 runtime 依赖（`runtimeConfig/Accounts/Core/Clock/runtimeExplicit`）。
-3. legacy 路径使用 `common.go:31 New`，缓存在包级 `cacheStrats`；两套实现的默认值逻辑重复。
+2. 运行期 `State.NewStrategy` / `State.NewStrategyChecked`（`state.go`）：按 `pol.ID()+ToYaml` 缓存；经 `invokeStratFactory` 调用工厂 → `cloneTradeStrat` → `validateDataCallbacks` → 默认值（`MinTfScore=0.75`、`StopLoss`、`RunTimeFrames`、`OdBarMax`）→ 绑定 runtime 依赖（`runtimeConfig/Accounts/Core/Clock/runtimeExplicit`）。当工厂通过 `pol.Require`/`Requiref` 或显式非 `runtime.Error` panic 拒绝参数时，归一为 `*config.BadParamError`（`core.ErrBadConfig`）：`*Checked` 直接返回 `*errs.Error` 且不写入策略缓存，无后缀 `NewStrategy`/`New` 继续抛出 `*config.BadParamError`；真正的 Go `runtime.Error`（空指针、越界、除零、类型断言失败等）原样向上 panic，不会伪装成 `BadConfig`。
+3. legacy 路径使用 `common.go` 的 `New` / `NewChecked`，缓存在包级 `cacheStrats`；两套实现的默认值逻辑重复。
+4. `CalcPairTfScores*`（`goods.go:allAllowTFsForStateChecked`）与 `LoadStratJobs*`（`main.go:loadStratJobsWithExchange`，含 `PairDup` 专属参数）均调用 `NewStrategyChecked` 向上透传 `core.ErrBadConfig`；`runtimeplan/inspect.go:makeStrategy` 调用 `NewStrategyChecked`，参数约束错误以 `[BadConfig] <msg>` 记入 `Unsupported`（`constructor_panic`），真实 `runtime.Error` 仍由 `recover` 保留原始 `runtime error:` 文本。
 
 ### 2. 加载 Job（`strat/main.go:57 LoadStratJobsWithState` → `loadStratJobsWithExchange` `main.go:90`）
 1. 显式状态下整体持有 `lockJobsWriteForState`，结束后再回调 `OnShutDown` 与 WS 退订（`main.go:105-120` 附近的 defer），避免回调在锁内执行。

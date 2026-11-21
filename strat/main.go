@@ -170,7 +170,10 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		policies = cfg.RunPolicy
 	}
 	for _, pol := range policies {
-		stgy := strategyState.NewStrategy(pol)
+		stgy, err := strategyState.NewStrategyChecked(pol)
+		if err != nil {
+			return nil, nil, err
+		}
 		polID := pol.ID()
 		if stgy == nil {
 			return nil, nil, errs.NewMsg(core.ErrRunTime, "strategy %s load fail", polID)
@@ -182,7 +185,7 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		}
 		holdNum := 0
 		failTfScores := make(map[string]map[string]float64)
-		var curPairs, err = getPolicyPairsWithStrategyState(strategyState, state, symbols, exchange, pol, pairs)
+		curPairs, err := getPolicyPairsWithStrategyState(strategyState, state, symbols, exchange, pol, pairs)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -267,7 +270,13 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 			// Check for proprietary parameters of the current target and reinitialize the strategy
 			// 检查有当前标的专有参数，重新初始化策略
 			if curPol, isDiff := pol.PairDup(exs.Symbol); isDiff {
-				curStgy = strategyState.NewStrategy(curPol)
+				curStgy, err = strategyState.NewStrategyChecked(curPol)
+				if err != nil {
+					return nil, nil, err
+				}
+				if curStgy == nil {
+					return nil, nil, errs.NewMsg(core.ErrRunTime, "strategy %s load fail", polID)
+				}
 			}
 			items[polID] = curStgy
 			holdNum += 1

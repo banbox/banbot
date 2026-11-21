@@ -17,6 +17,7 @@ import (
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 	utils2 "github.com/banbox/banexg/utils"
 	ta "github.com/banbox/banta"
 	"go.uber.org/zap"
@@ -837,9 +838,31 @@ func (state *State) NewStrategy(pol *config.RunPolicyConfig) *TradeStrat {
 	if state == nil || state == legacyState {
 		return New(pol)
 	}
+	stgy, badParam := state.newStrategy(pol)
+	if badParam != nil {
+		panic(badParam)
+	}
+	return stgy
+}
+
+// NewStrategyChecked constructs a strategy in state's isolated cache and returns
+// a BadConfig error when the strategy constructor rejects its policy parameters.
+// Genuine Go runtime.Error panics still propagate unchanged.
+func (state *State) NewStrategyChecked(pol *config.RunPolicyConfig) (*TradeStrat, *errs.Error) {
+	if state == nil || state == legacyState {
+		return NewChecked(pol)
+	}
+	stgy, badParam := state.newStrategy(pol)
+	if badParam != nil {
+		return nil, badParam.BanError()
+	}
+	return stgy, nil
+}
+
+func (state *State) newStrategy(pol *config.RunPolicyConfig) (*TradeStrat, *config.BadParamError) {
 	key := pol.ID() + "\n" + pol.ToYaml()
 	if stgy, ok := state.GetCachedStrategy(key); ok {
-		return stgy
+		return stgy, nil
 	}
 
 	localPol := pol.Clone()
@@ -848,7 +871,11 @@ func (state *State) NewStrategy(pol *config.RunPolicyConfig) *TradeStrat {
 	if !ok {
 		panic("strategy not found: " + localPol.Name)
 	}
-	stgy := cloneTradeStrat(makeFn(localPol), localPol)
+	raw, badParam := invokeStratFactory(makeFn, localPol)
+	if badParam != nil || raw == nil {
+		return raw, badParam
+	}
+	stgy := cloneTradeStrat(raw, localPol)
 	stgy.Name = localPol.ID()
 	validateDataCallbacks(stgy)
 	if stgy.MinTfScore == 0 {
@@ -909,7 +936,7 @@ func (state *State) NewStrategy(pol *config.RunPolicyConfig) *TradeStrat {
 		}
 	}
 	state.SetCachedStrategy(key, stgy)
-	return stgy
+	return stgy, nil
 }
 
 func cloneTradeStrat(stgy *TradeStrat, pol *config.RunPolicyConfig) *TradeStrat {

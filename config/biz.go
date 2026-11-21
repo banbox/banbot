@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -1157,6 +1158,134 @@ func (c *RunPolicyConfig) DefInt(k string, dv int, p *core.Param) int {
 	}
 	c.defs[k] = p
 	return int(math.Round(val))
+}
+
+func normalizeBadParamMessage(msg string) string {
+	msg = strings.TrimSpace(msg)
+	for strings.HasPrefix(msg, "[BadConfig]") {
+		msg = strings.TrimSpace(strings.TrimPrefix(msg, "[BadConfig]"))
+	}
+	if msg == "" {
+		return "strategy parameter constraint failed"
+	}
+	return msg
+}
+
+// NewBadParamError builds a typed BadConfig error for a strategy parameter constraint failure.
+func NewBadParamError(policy, msg string) *BadParamError {
+	clean := normalizeBadParamMessage(msg)
+	return &BadParamError{
+		Policy:  policy,
+		Message: clean,
+		Err:     errs.NewMsg(core.ErrBadConfig, "%s", clean),
+	}
+}
+
+func (e *BadParamError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Err != nil {
+		return e.Err.Short()
+	}
+	return "[BadConfig] " + normalizeBadParamMessage(e.Message)
+}
+
+func (e *BadParamError) Unwrap() error {
+	if e == nil || e.Err == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// BanError returns the underlying *errs.Error with code core.ErrBadConfig.
+func (e *BadParamError) BanError() *errs.Error {
+	if e == nil {
+		return nil
+	}
+	if e.Err != nil && e.Err.Code == core.ErrBadConfig {
+		return e.Err
+	}
+	return errs.NewMsg(core.ErrBadConfig, "%s", normalizeBadParamMessage(e.Message))
+}
+
+// AsBadParamError extracts a *BadParamError from a recovered value or wrapped error.
+func AsBadParamError(value any) (*BadParamError, bool) {
+	if value == nil {
+		return nil, false
+	}
+	if bpe, ok := value.(*BadParamError); ok && bpe != nil {
+		return bpe, true
+	}
+	if err, ok := value.(error); ok {
+		var bpe *BadParamError
+		if errors.As(err, &bpe) && bpe != nil {
+			return bpe, true
+		}
+	}
+	return nil, false
+}
+
+// CoerceBadParamError converts a non-runtime strategy constructor panic into a *BadParamError.
+func CoerceBadParamError(pol *RunPolicyConfig, recovered any) *BadParamError {
+	var polID string
+	if pol != nil {
+		polID = pol.ID()
+	}
+	if bpe, ok := AsBadParamError(recovered); ok {
+		if bpe.Policy == "" && polID != "" {
+			copied := *bpe
+			copied.Policy = polID
+			return &copied
+		}
+		return bpe
+	}
+	if banErr, ok := recovered.(*errs.Error); ok && banErr != nil {
+		if banErr.Code == core.ErrBadConfig {
+			return &BadParamError{
+				Policy:  polID,
+				Message: normalizeBadParamMessage(banErr.Message()),
+				Err:     banErr,
+			}
+		}
+		return NewBadParamError(polID, banErr.Message())
+	}
+	if err, ok := recovered.(error); ok {
+		var banErr *errs.Error
+		if errors.As(err, &banErr) && banErr != nil {
+			if banErr.Code == core.ErrBadConfig {
+				return &BadParamError{
+					Policy:  polID,
+					Message: normalizeBadParamMessage(banErr.Message()),
+					Err:     banErr,
+				}
+			}
+			return NewBadParamError(polID, banErr.Message())
+		}
+		return NewBadParamError(polID, err.Error())
+	}
+	return NewBadParamError(polID, fmt.Sprint(recovered))
+}
+
+// Require asserts a parameter constraint inside a strategy constructor.
+// When cond is false, it panics with *BadParamError (core.ErrBadConfig).
+func (c *RunPolicyConfig) Require(cond bool, msg string) {
+	if cond {
+		return
+	}
+	var policy string
+	if c != nil {
+		policy = c.ID()
+	}
+	panic(NewBadParamError(policy, msg))
+}
+
+// Requiref asserts a parameter constraint with printf-style formatting.
+func (c *RunPolicyConfig) Requiref(cond bool, format string, args ...any) {
+	if cond {
+		return
+	}
+	c.Require(false, fmt.Sprintf(format, args...))
 }
 
 func (c *RunPolicyConfig) IsInt(k string) bool {

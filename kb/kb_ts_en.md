@@ -7,7 +7,7 @@ Each `(run_policy, timeframe, symbol)` maps to one `*strat.StratJob`, and every 
 ```go
 // 1) Register: registered name = group:strategy; YAML run_policy[].name must match exactly
 func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": MaFn}) } // or strat.RegisterStrategy("demo:ma", MaFn)
-// 2) Factory: called once per run_policy, returns *strat.TradeStrat; use pol.Def/DefInt for hyperparameters
+// 2) Factory: called once per run_policy, returns *strat.TradeStrat; use pol.Def/DefInt for hyperparameters and pol.Require/Requiref for cross-parameter constraints
 // 3) Entry: package main blank-imports the strategy package, then entry.RunCmd()
 ```
 
@@ -89,7 +89,7 @@ Layering: data-dir `config.yml` + `config.local.yml`, then overlaid by `--config
 - `strat_perf`: automatic strategy-symbol performance down-weighting: `enable min_od_num max_od_num min_job_num mid_weight bad_weight`
 - Other unknown keys: go into `Policy.More`, read via `pol.More[...]`
 
-Hyperparameters: `pol.Def("name", dv, core.PNorm(lo,hi)) float64`, `pol.DefInt(...) int`. Names must be valid identifiers; values come from `params`, falling back to `dv` when not configured. `pol` is read-only and shared by all jobs; **do not store hyperparameters in structs or `More`**.
+Hyperparameters: `pol.Def("name", dv, core.PNorm(lo,hi)) float64`, `pol.DefInt(...) int`. Names must be valid identifiers; values come from `params`, falling back to `dv` when not configured. Validate cross-parameter constraints inside the factory with `pol.Require(cond, msg)` or `pol.Requiref(cond, format, args...)` (e.g. `pol.Require(fast < slow, "require fast < slow")`); when false, the process exits with `Error: [BadConfig] <msg>` so parameter search marks the trial invalid and skips it instead of crashing (do not write ad-hoc `panic(...)`). `pol` is read-only and shared by all jobs; **do not store hyperparameters in structs or `More`**.
 
 ### 1.7 Runtime Isolation (v0.5+)
 - The factory signature is fixed: `func(pol *config.RunPolicyConfig) *strat.TradeStrat`. Do not keep orders, indicators, or per-symbol state in package-level variables (put them in `StratJob.More`), and do not store Runtime/State objects yourself.
@@ -564,7 +564,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 20. Common compile errors: the symbol name string is `s.Symbol.Symbol` (`s.Symbol` is `*orm.ExSymbol`, not a string or map key); `pol.Params` is `map[string]float64`, hyperparameters are numeric only (0/1 switches), read with `pol.Def/DefInt`, there is no `DefBool/DefStr/core.PInt`; the direction argument `dirt` is a `float64`; bar times are `e.TimeStart/TimeStop` and the period is `e.TFMSecs` (no `e.Time/TFSecs`); order types live in `github.com/banbox/banbot/orm/ormo` (`*ormo.InOutOrder`, `*ormo.ExitTrigger`); `EnterReq` has no `Qty/Dirt` field (quantity `Amount`, amount `LegalCost`/`CostRate`, risk-fractional sizing `RiskRate`, short `Short: true`); read account equity/available balance/peak drawdown via `s.AccountEquity()` / `s.AvailableBalance()` / `s.AccountDrawdown()` (no `GetEquity`), and the base stake is `s.Strat.GetStakeAmount(s)`.
 
 ## 8. Hyperparameters and Optimization
-Declare hyperparameters with `pol.Def/DefInt` (distributions see §1.5; `DefInt` rounds automatically). `banbot optimize --config x.yml` (there is also `bt-opt` rolling backtest); `--sampler tpe|bayes|random|cmaes|ipop-cmaes|bipop-cmaes` (default bayes), `--opt-rounds` (default 30).
+Declare hyperparameters with `pol.Def/DefInt` (distributions see §1.5; `DefInt` rounds automatically). Enforce cross-parameter constraints (such as `fast < slow`, `maFast < maMid && maMid < maSlow`, `callbackMin <= callbackMax`) inside the factory with `pol.Require(cond, "require ...")` / `pol.Requiref(...)` so invalid sampled combinations exit cleanly with `[BadConfig]` rather than consuming crash retries. `banbot optimize --config x.yml` (there is also `bt-opt` rolling backtest); `--sampler tpe|bayes|random|cmaes|ipop-cmaes|bipop-cmaes` (default bayes), `--opt-rounds` (default 30).
 
 ## 9. Complete Examples
 ### Example A: Single-timeframe EMA Cross + ATR Stop-Loss/Take-Profit
@@ -587,6 +587,7 @@ func init() {
 func MaAtr(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	fast := pol.DefInt("fast", 10, core.PNorm(5, 30))
 	slow := pol.DefInt("slow", 30, core.PNorm(20, 100))
+	pol.Require(fast < slow, "require fast < slow")
 	atrLen := pol.DefInt("atrLen", 14, core.PNorm(7, 30))
 	slMul := pol.Def("slMul", 2, core.PNorm(1, 4))
 	tpMul := pol.Def("tpMul", 4, core.PNorm(2, 8))

@@ -174,7 +174,10 @@ func calcPairTfScoresWithConfig(strategyState *State, cfg *config.Config, symbol
 		exchange = exg.Default
 	}
 	pairTfScores := make(map[string]map[string]float64)
-	allowTfs := allAllowTFsForState(strategyState, cfg)
+	allowTfs, allowErr := allAllowTFsForStateChecked(strategyState, cfg)
+	if allowErr != nil {
+		return pairTfScores, allowErr
+	}
 	if len(allowTfs) == 0 {
 		return pairTfScores, errs.NewMsg(core.ErrBadConfig, "run_timeframes is required in config")
 	}
@@ -304,6 +307,14 @@ func allAllowTFsForConfig(cfg *config.Config) []string {
 }
 
 func allAllowTFsForState(strategyState *State, cfg *config.Config) []string {
+	tfs, err := allAllowTFsForStateChecked(strategyState, cfg)
+	if err != nil {
+		panic(config.CoerceBadParamError(nil, err))
+	}
+	return tfs
+}
+
+func allAllowTFsForStateChecked(strategyState *State, cfg *config.Config) ([]string, *errs.Error) {
 	runTimeframes := config.RunTimeframes
 	policies := config.RunPolicy
 	if cfg != nil {
@@ -320,7 +331,10 @@ func allAllowTFsForState(strategyState *State, cfg *config.Config) []string {
 			policy = pol.Clone()
 			policy.Dirt = ""
 		}
-		stagy := strategyState.NewStrategy(policy)
+		stagy, err := strategyState.NewStrategyChecked(policy)
+		if err != nil {
+			return nil, err
+		}
 		if stagy == nil {
 			continue
 		}
@@ -332,5 +346,5 @@ func allAllowTFsForState(strategyState *State, cfg *config.Config) []string {
 			groups = append(groups, stagy.RunTimeFrames)
 		}
 	}
-	return utils.UnionArr(groups...)
+	return utils.UnionArr(groups...), nil
 }

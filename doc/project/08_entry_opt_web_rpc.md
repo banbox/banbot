@@ -135,8 +135,8 @@
 ## 4. 关键流程（调用链）
 
 ### 4.1 CLI 启动与分派
-1. `entry/main.go:30` `RunCmd` 安装信号处理，调用 `ExecuteContext`（:70）。
-2. 若首参数是非帮助/版本的 `-xxx`，`isImplicitWebInvocation`（:87）把请求交给 `web.NewDevCommandWithFactory(newDevWebServer)`，即默认启动开发 Web。
+1. `entry/main.go:30` `RunCmd` 安装信号处理，调用 `ExecuteContext`。命令返回错误（含策略构造参数约束违反透传的 `core.ErrBadConfig`）或未捕获的 `*config.BadParamError` 统一经 `writeCommandError` 向 `os.Stderr` 输出 `Error: <err>`（参数约束错误即 `Error: [BadConfig] <msg>`）并以退出码 1 结束；真正的运行时 panic 则输出 `banbot panic raw stack:`。`ExecuteContext` 仅将未捕获的 `*config.BadParamError` 转为 `*errs.Error` 返回，其余 panic（含 `runtime.Error`）保持原样抛出。
+2. 若首参数是非帮助/版本的 `-xxx`，`isImplicitWebInvocation` 把请求交给 `web.NewDevCommandWithFactory(newDevWebServer)`，即默认启动开发 Web。
 3. `NewRootCommand`（:100）先注册命令组（`commandGroups` 与扩展组），再由 `registerBuiltInCommands`（`common.go:122`）和 `registerExtraCommands` 挂载命令。`AddCommand`/`AddCommandFactory`（`common.go:65/72`）供外部嵌入注册。
 4. `normalizeLegacyFlags`（`main.go:321`）把单横线长参数（如 `-datadir`）改写为双横线。
 

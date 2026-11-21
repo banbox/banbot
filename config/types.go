@@ -3,6 +3,7 @@ package config
 import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/llm"
+	"github.com/banbox/banexg/errs"
 )
 
 var (
@@ -181,6 +182,14 @@ type RunPolicyConfig struct {
 	defs          map[string]*core.Param
 	Score         float64 `yaml:"-" mapstructure:"-"`
 	Index         int     `yaml:"-" mapstructure:"-"` // index in run_policy array
+}
+
+// BadParamError represents a strategy parameter constraint violation raised via
+// RunPolicyConfig.Require or RunPolicyConfig.Requiref.
+type BadParamError struct {
+	Policy  string
+	Message string
+	Err     *errs.Error
 }
 
 type BtInLiveConfig struct {

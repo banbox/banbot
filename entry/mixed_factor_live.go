@@ -184,7 +184,10 @@ func loadMixedLiveJobs(rt *runtimepkg.Runtime, binding *FactorLiveBinding) error
 	}
 	sort.Strings(pairs)
 	pairs = slices.Compact(pairs)
-	scores := mixedTimeFrameScores(rt, pairs)
+	scores, err := mixedTimeFrameScores(rt, pairs)
+	if err != nil {
+		return err
+	}
 	biz.InitLocalOrderMgrWithRuntimeDeps(rt.BizDeps(), nil, false)
 	if _, _, err := strat.LoadStratJobsWithState(rt.Strategies, rt.Core, rt.Symbols, pairs, scores, rt.Orders); err != nil {
 		return err

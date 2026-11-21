@@ -1,8 +1,10 @@
 package strat
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -28,24 +30,78 @@ var (
 	stratMakeMu    sync.RWMutex
 )
 
+func isRuntimePanic(recovered any) bool {
+	if _, ok := recovered.(runtime.Error); ok {
+		return true
+	}
+	if err, ok := recovered.(error); ok {
+		var rtErr runtime.Error
+		if errors.As(err, &rtErr) {
+			return true
+		}
+	}
+	if text, ok := recovered.(string); ok {
+		trimmed := strings.TrimSpace(text)
+		if strings.HasPrefix(trimmed, "runtime error:") || strings.HasPrefix(trimmed, "sync:") {
+			return true
+		}
+	}
+	return false
+}
+
+func invokeStratFactory(makeFn FuncMakeStrat, pol *config.RunPolicyConfig) (stgy *TradeStrat, badParam *config.BadParamError) {
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+		if isRuntimePanic(recovered) {
+			panic(recovered)
+		}
+		badParam = config.CoerceBadParamError(pol, recovered)
+	}()
+	stgy = makeFn(pol)
+	return
+}
+
 func New(pol *config.RunPolicyConfig) *TradeStrat {
+	stgy, badParam := newLegacyStrategy(pol)
+	if badParam != nil {
+		panic(badParam)
+	}
+	return stgy
+}
+
+// NewChecked constructs a strategy via the legacy package cache, returning a
+// BadConfig error when the strategy constructor rejects its policy parameters.
+// Genuine Go runtime.Error panics still propagate unchanged.
+func NewChecked(pol *config.RunPolicyConfig) (*TradeStrat, *errs.Error) {
+	stgy, badParam := newLegacyStrategy(pol)
+	if badParam != nil {
+		return nil, badParam.BanError()
+	}
+	return stgy, nil
+}
+
+func newLegacyStrategy(pol *config.RunPolicyConfig) (*TradeStrat, *config.BadParamError) {
 	polID := pol.ID()
 	cacheKey := utils.MD5([]byte(polID + "\n" + pol.ToYaml()))
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 	if obj, ok := cacheStrats[cacheKey]; ok {
 		obj.Policy = pol
-		return obj
+		return obj, nil
 	}
 	stratMakeMu.RLock()
 	makeFn, ok := stratFactories[pol.Name]
 	stratMakeMu.RUnlock()
-	var stgy *TradeStrat
-	if ok {
-		stgy = makeFn(pol)
-	} else {
+	if !ok {
 		panic("strategy not found: " + pol.Name)
 		// stgy = loadNative(pol.Name)
+	}
+	stgy, badParam := invokeStratFactory(makeFn, pol)
+	if badParam != nil || stgy == nil {
+		return stgy, badParam
 	}
 	stgy.Name = polID
 	validateDataCallbacks(stgy)
@@ -100,7 +156,7 @@ func New(pol *config.RunPolicyConfig) *TradeStrat {
 				zap.String("type", fmt.Sprintf("%T", pol.StopLoss)))
 		}
 	}
-	return stgy
+	return stgy, nil
 }
 
 func Get(pair, stratID string) *TradeStrat {
