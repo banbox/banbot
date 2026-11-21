@@ -11,7 +11,7 @@
 | 训练（调用方 Go 代码，只读训练区间） | β/α、残差尺度、阈值、持有期、候选参数 |
 | 冻结（写 YAML `params`，进 manifest hash；或 ParameterArtifact/ModelArtifact） | 不可变参数 |
 | 信号（runner 每决策轮在线算） | 每对 z-score、带状态仓位 ±1/0 |
-| 目标（`RegisterPairs` builder 输出不可变 `factor.TargetPortfolio`：`ID()` 内容哈希，`Targets()` 返回 SID→NAV 比例副本） | 目标权重、诊断码 |
+| 目标（`RegisterPairs` / `RegisterRollingPairs` builder 输出不可变 `factor.TargetPortfolio`：`ID()` 内容哈希，`Targets()` 返回 SID→NAV 比例副本） | 目标权重、诊断码 |
 | 证据（Weights/Events 账本及其输出文件） | 成交、费用、资金费 |
 
 术语：`Y` 被解释腿（做多价差时买入）；`X` 解释腿（做多价差时卖出）；`z` = 价差残差/残差标准差；`β` 对数回归斜率（弹性）；决策 bar = `run_timeframes` 对应已收盘 K 线。统计函数不读时钟、账户、交易所；数据经 `DataSeries.Values` 传入，保留类型与 NULL，缺失须显式排除，不得当 0。
@@ -151,6 +151,68 @@ run_policy:
 4. YAML：`portfolio: {builder: <name>-v1}`（显式值优先）。
 
 有状态构造器每决策轮只能调用一次（重复会重复推进滤波状态），状态须每次运行私有。
+
+### 2.8 滚动重选配对策略：`runner.RegisterRollingPairs`
+
+无需在 Go 代码硬编码交易对字面量，直接以运行宇宙（YAML `pairs`）为候选池，按“形成期 + 交易期”周期性无前视重选配对。占用定义名 `<name>` 与组合工厂名 `<name>-rolling-pairs-v1`。
+
+```go
+func RegisterRollingPairs(name string, build func(*Params) (RollingPairsSpec, error)) error
+type RollingPairsSpec struct {
+    Candidates        []string              // 可选候选子集；为空时默认使用 Universe.Investable 全部品种
+    Field             string                // kline 字段，缺省 "close"
+    FormationBars     int                   // 形成期窗口（决策 bar 数），>= 20
+    ReselectBars      int                   // 重选间隔/交易期长度（决策 bar 数），>= 1
+    PairCount         int                   // 每期最多入选配对数，缺省 5（>0）
+    MaxPerSymbol      int                   // 同一品种当期入选配对最多出现次数，缺省 2（>0）
+    SelectionMethod   string                // ""/"cointegration"（默认）或 "distance"（Gatev 最小距离法）
+    MinCoverage       float64               // 形成期双腿同时有效比例下限，缺省 0.9，范围 (0,1]
+    MinCorr           float64               // 形成期对数收益 Pearson 相关下限 [0,1]；cointegration 缺省 0.5，distance 为 0 时要求 >0
+    MaxADF            float64               // cointegration 残差 ADF t 统计量上限（<0），0 缺省 -2.86
+    ADFLags           int                   // EngleGranger 残差 ADF 滞后阶数（>=0，且 FormationBars >= ADFLags+6）
+    MinHalfLife       float64               // FitOU DiscreteHalfLife 下限（>=0，bar 数）
+    MaxHalfLife       float64               // FitOU DiscreteHalfLife 上限；0 缺省 float64(FormationBars)
+    Window            int                   // 在线 RollingSpread 窗口；0 缺省 FormationBars（>=3）
+    Band              statistics.BandConfig // 进出场与止损/最大持仓阈值（2.3）
+    Gross             float64               // 单槽位名义敞口比例；0 缺省 1/PairCount，须 Gross*PairCount <= 1
+    MinBeta           float64               // 形成期与在线入场 β 下限（>=0）
+    AllowNegativeBeta bool                  // 默认 false（要求 β > max(0, MinBeta)）
+    DynamicExitZ      bool                  // 默认 false（持仓退出用 EvalWithBeta 冻结 β）
+    DriftBand         float64               // 持仓期免调仓漂移缓冲带（>=0）
+    WeightMode        string                // ""/"equal" 或 "inverse_vol"
+    MaxPairGross      float64               // inverse_vol 单对上限 [0,1]；0 缺省 min(TotalGross, 2*Gross)
+    HandoffMode       string                // ""/"graceful"（默认优雅退场）或 "immediate"（换期立即平仓）
+}
+```
+
+- **严格 PIT 筛选与确定性**：第 `t` 根决策 bar 重选只读 `<= t` 已收盘的最近 `FormationBars` 个网格，仅在当轮 `Tradable` 且观测有效的品种中筛选；候选与并列得分严格按 `(score, Y符号, X符号, SID)` 升序打破并列，同输入重复运行逐位一致。
+  - `"cointegration"`：对齐覆盖率与对数收益相关达标后，双向运行 `EngleGranger(..., intercept=true, ADFLags)` 与 `FitOU(Residuals)`，保留斜率合法、`TStatistic <= MaxADF` 且 `DiscreteHalfLife ∈ [MinHalfLife, MaxHalfLife]` 的方向（双向通过取 `TStatistic` 更小者），按 `TStatistic` 升序贪心选至多 `PairCount` 对（受 `MaxPerSymbol` 限制）。
+  - `"distance"`：覆盖率达标且对数收益正相关，形成期首根共同有效价归一为 `1.0`，按归一化价格平方偏差和（按有效覆盖率折算到 `FormationBars`）升序贪心选取（方向取 OLS 斜率合法且 `|β-1|` 更小者）。
+- **在线预热与换期交接（`HandoffMode`）**：
+  - 首次满 `FormationBars` 前返回 `nil`（`pairs-not-ready`）；新入选配对用 `t` 之前的可见历史观测预热 `RollingSpread`，当轮即可交易；连任配对保留既有 `RollingSpread`/`BandTrader`/冻结 `β`/持仓。当期 0 对入选时附诊断 `rolling-pairs-empty-selection`（无退场仓位时输出显式空 `map[int32]float64{}`）。
+  - `"graceful"`（默认）：未连任但仍持仓的旧配对进入只退不进池（保持冻结 `β` 与 `BandTrader` 直至 `exit`/`stop`/`maxhold` 平仓，平仓后移除且绝不再开仓）并占用槽位，新配对按排名使用剩余槽位（同品种对反向亦等待退场完成），任意时刻总开仓对数 `<= PairCount`、总敞口严格 `<= 1`。
+  - `"immediate"`：换期当根直接平掉未连任持仓配对（`PairEpisode.Reason = "reselect"`），立即释放全部槽位给新配对。
+- **PIT 缺数据与报告**：Weights 回测走 `pitReduceUniverse`——中途退市/缺数据的品种从当轮宇宙剔除，含该腿的持仓配对立即平仓（`leg_missing`），且自动从重选候选中排除，其余配对照常运行不跳过整轮；`Candidates` 中属 `UnavailableSymbols` 的品种自动跳过。`Result.Pairs` 按运行中曾入选的不同有向 `Pair{Y, X}` 汇总 `Trades`、`Wins`、`Episodes`、`PnL`、`Turnover`，与 `PairsGrossPnL`/`PairsNAVReturn`/`PairsResidual` 对账。
+
+示例（YAML `pairs` 给候选池，Go 代码零品种字面量）：
+
+```go
+runner.RegisterRollingPairs("rolling-coint", func(p *runner.Params) (runner.RollingPairsSpec, error) {
+    return runner.RollingPairsSpec{
+        FormationBars: p.Int("formation", 240),
+        ReselectBars:  p.Int("reselect", 120),
+        PairCount:     p.Int("pairCount", 5),
+        MaxPerSymbol:  p.Int("maxPerSymbol", 2),
+        Window:        p.Int("window", 120),
+        DriftBand:     p.Float("driftBand", 0.02),
+        WeightMode:    "inverse_vol",
+        Band: statistics.BandConfig{
+            Entry: p.Float("entry", 2.0), Exit: p.Float("exit", 0.5),
+            Stop: p.Float("stop", 4.0), MaxHold: p.Int("maxHold", 60),
+        },
+    }, p.Err()
+})
+```
 
 ## 3. 数值 API（`factor/statistics`）
 
@@ -464,7 +526,7 @@ func (s CrossVenueSnapshot) Equity(mark decimal.Decimal) (decimal.Decimal, error
 - **无组合级波动率目标**：`WeightMode: "inverse_vol"` 按各对 `1/Std` 做跨配对相对风险分配，但总名义预算 `TotalGross` 仍为固定比例，不会随市场整体波动率自动缩减总仓位。
 - **止损=平仓而非保护**：`|z|>=Stop` 实现亏损并阻止再入场，不限单笔亏损。
 - **无默认时间止损**：`MaxHold:0` 时不回归的价差一直占用敞口。
-- **结构性断裂**（并购、退市等）：需外部失效检测，库不提供。
+- **结构性断裂**（并购、退市、制度切换）：`RegisterRollingPairs` 通过周期性重选缓解协整慢性衰减，但交易期内的突发断裂仍依赖 `Stop`/`MaxHold`/PIT 退市平仓或外部失效检测。
 - **再平衡成本**：见 2.6；Events 需单独核对。
 - **容量**：`research.EstimateCapacityCost(spec CapacityCostSpec{FeeRate, SlippageRate, ImpactCoefficient, MaxParticipation}, tradedNotional, adv, volatility, heldNotional, fundingRate) (CapacityCost{Participation, Fee, Slippage, Impact, Funding, Total, Feasible}, error)`：`Impact = traded·coef·vol·√(traded/adv)`；`adv>0`，`MaxParticipation∈[0,1]`（0=不限）；仅为估计。
 - **账户风险限额**：Gross、保证金限额为**结算币绝对金额**，非杠杆倍数；与策略 NAV 比例 `Gross` 不互替。

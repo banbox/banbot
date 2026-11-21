@@ -27,14 +27,14 @@ type PairEpisode struct {
 	EntryZ, ExitZ  float64 // z-score at entry / at the closing decision (0 for leg_missing and end)
 	Beta           float64 // hedge ratio frozen at entry
 	Bars           int     // decisions the pair was held (entry bar included, closing bar excluded)
-	// Reason: exit (|z| <= exit band), stop (|z| >= stop), maxhold, leg_missing (a leg had no data and the pair
-	// was closed and paused), end (still open when the run ended).
+	// Reason: exit (|z| <= exit band), stop (|z| >= stop), maxhold, reselect (closed on immediate rolling-pairs
+	// handoff), leg_missing (a leg had no data and the pair was closed and paused), end (still open when the run ended).
 	Reason string
 	// PnL is the episode's gross contribution to strategy NAV as a fraction of the initial NAV (see PairResult).
 	PnL float64
 }
 
-// PairResult is the stand-alone result of one pair of a RegisterPairs strategy.
+// PairResult is the stand-alone result of one pair of a RegisterPairs or RegisterRollingPairs strategy.
 //
 // Attribution basis: at every decision the pair's own target weights (wY, wX: the two terms the builder adds to
 // the net portfolio) are held until the next decision and earn wY*rY + wX*rX, with rY / rX the simple return of

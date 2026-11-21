@@ -11,7 +11,7 @@ The single pipeline: **visible data → training (offline, frozen) → current-p
 | Training (caller Go code, reads training interval only) | β/α, residual scale, thresholds, holding period, candidate parameters |
 | Freeze (write YAML `params`, enters manifest hash; or ParameterArtifact/ModelArtifact) | Immutable parameters |
 | Signal (runner computes online each decision round) | Per-pair z-score, stateful position ±1/0 |
-| Target (`RegisterPairs` builder outputs an immutable `factor.TargetPortfolio`: `ID()` is a content hash, `Targets()` returns a SID→NAV-fraction copy) | Target weights, diagnostic codes |
+| Target (`RegisterPairs` / `RegisterRollingPairs` builder outputs an immutable `factor.TargetPortfolio`: `ID()` is a content hash, `Targets()` returns a SID→NAV-fraction copy) | Target weights, diagnostic codes |
 | Evidence (Weights/Events ledger and its output files) | Fills, fees, funding |
 
 Terms: `Y` is the explained leg (bought when going long the spread); `X` is the explanatory leg (sold when going long the spread); `z` = spread residual / residual standard deviation; `β` is the log-regression slope (elasticity); decision bar = the closed K-line corresponding to `run_timeframes`. Statistical functions do not read the clock, account, or exchange; data is passed in via `DataSeries.Values`, preserving type and NULL; missing values must be explicitly excluded and must not be treated as 0.
@@ -151,6 +151,68 @@ run_policy:
 4. YAML: `portfolio: {builder: <name>-v1}` (explicit value takes precedence).
 
 A stateful builder may be called only once per decision round (repeats would advance the filter state again), and state must be private to each run.
+
+### 2.8 Rolling Pair Reselection Strategy: `runner.RegisterRollingPairs`
+
+Screens candidate pairs directly from the run's universe (YAML `pairs`, without hardcoding symbol literals in Go code) on a periodic "formation + trading" schedule without lookahead. Occupies definition name `<name>` and portfolio factory `<name>-rolling-pairs-v1`.
+
+```go
+func RegisterRollingPairs(name string, build func(*Params) (RollingPairsSpec, error)) error
+type RollingPairsSpec struct {
+    Candidates        []string              // optional subset; empty defaults to all symbols in Universe.Investable
+    Field             string                // kline field, default "close"
+    FormationBars     int                   // formation lookback (decision bars), >= 20
+    ReselectBars      int                   // trading period between reselections (decision bars), >= 1
+    PairCount         int                   // max selected pairs per period, default 5 (>0)
+    MaxPerSymbol      int                   // max appearances of one symbol per period, default 2 (>0)
+    SelectionMethod   string                // ""/"cointegration" (default) or "distance" (Gatev minimum SSD)
+    MinCoverage       float64               // minimum aligned valid bar fraction in formation window, default 0.9, in (0,1]
+    MinCorr           float64               // minimum log-return Pearson correlation [0,1]; default 0.5 for cointegration, >0 when 0 for distance
+    MaxADF            float64               // max residual ADF t-statistic (<0) for cointegration; 0 defaults to -2.86
+    ADFLags           int                   // EngleGranger residual ADF lag count (>=0, FormationBars >= ADFLags+6)
+    MinHalfLife       float64               // FitOU DiscreteHalfLife floor (>=0, in bars)
+    MaxHalfLife       float64               // FitOU DiscreteHalfLife ceiling; 0 defaults to float64(FormationBars)
+    Window            int                   // online RollingSpread window; 0 defaults to FormationBars (>=3)
+    Band              statistics.BandConfig // entry/exit/stop/max-hold thresholds (2.3)
+    Gross             float64               // gross notional per pair slot; 0 defaults to 1/PairCount, Gross*PairCount <= 1
+    MinBeta           float64               // formation and online entry β floor (>=0)
+    AllowNegativeBeta bool                  // default false (requires β > max(0, MinBeta))
+    DynamicExitZ      bool                  // default false (holding exit z uses frozen β via EvalWithBeta)
+    DriftBand         float64               // holding-period L1 weight drift buffer (>=0)
+    WeightMode        string                // ""/"equal" or "inverse_vol"
+    MaxPairGross      float64               // per-pair cap [0,1] under inverse_vol; 0 defaults to min(TotalGross, 2*Gross)
+    HandoffMode       string                // ""/"graceful" (default exit-only handoff) or "immediate"
+}
+```
+
+- **Strict PIT Screening and Determinism**: Reselection at decision bar `t` reads only the trailing `FormationBars` closed observations `<= t` across symbols currently `Tradable` and valid at `t`; ties are broken deterministically by `(score, Y symbol, X symbol, SID)` ascending for bit-identical repeated runs.
+  - `"cointegration"`: after passing coverage and log-return correlation filters, runs bidirectional `EngleGranger(..., intercept=true, ADFLags)` and `FitOU(Residuals)`, keeping directions that pass the β guard, `TStatistic <= MaxADF`, and `DiscreteHalfLife ∈ [MinHalfLife, MaxHalfLife]` (picking the more negative `TStatistic` when both pass), then greedily selects up to `PairCount` pairs ascending by `TStatistic` subject to `MaxPerSymbol`.
+  - `"distance"`: among coverage-passing, positively correlated pairs, normalizes each leg's first jointly valid formation price to `1.0` and greedily selects pairs with minimum coverage-scaled sum of squared deviations (choosing the valid OLS slope direction with smaller `|β-1|`).
+- **Online Pre-warming and Handoff (`HandoffMode`)**:
+  - Returns `nil` (`pairs-not-ready`) before `FormationBars` decisions accumulate; newly selected pairs pre-warm `RollingSpread` from prior visible observations `< t` so trading is active immediately; re-elected pairs keep their live `RollingSpread`, `BandTrader`, frozen `β`, and position. When 0 pairs pass selection, emits diagnostic `rolling-pairs-empty-selection` (and an explicit empty `map[int32]float64{}` when no retiring position remains).
+  - `"graceful"` (default): unselected open pairs move into an exit-only pool (tracking frozen `β` and `BandTrader` until `exit`/`stop`/`maxhold`, never re-entering) and reserve slots while newly selected pairs fill remaining slots in rank order (blocking reversed counterparts until exit completes), keeping open pairs `<= PairCount` and total gross strictly `<= 1` at every bar.
+  - `"immediate"`: closes unselected open pairs immediately at the reselection bar (`PairEpisode.Reason = "reselect"`), freeing all slots at once.
+- **PIT Missing Data and Reporting**: Weights backtests use `pitReduceUniverse`—an instrument delisting or missing data mid-run is dropped from that round's universe, any open pair containing it closes immediately (`leg_missing`), and it is excluded from candidate screening while remaining pairs keep trading without skipping the round; `Candidates` in `UnavailableSymbols` are skipped gracefully. `Result.Pairs` aggregates `Trades`, `Wins`, `Episodes`, `PnL`, and `Turnover` per distinct selected `Pair{Y, X}`, reconciling with `PairsGrossPnL`/`PairsNAVReturn`/`PairsResidual`.
+
+Example (YAML `pairs` defines the candidate universe; zero hardcoded symbols in Go):
+
+```go
+runner.RegisterRollingPairs("rolling-coint", func(p *runner.Params) (runner.RollingPairsSpec, error) {
+    return runner.RollingPairsSpec{
+        FormationBars: p.Int("formation", 240),
+        ReselectBars:  p.Int("reselect", 120),
+        PairCount:     p.Int("pairCount", 5),
+        MaxPerSymbol:  p.Int("maxPerSymbol", 2),
+        Window:        p.Int("window", 120),
+        DriftBand:     p.Float("driftBand", 0.02),
+        WeightMode:    "inverse_vol",
+        Band: statistics.BandConfig{
+            Entry: p.Float("entry", 2.0), Exit: p.Float("exit", 0.5),
+            Stop: p.Float("stop", 4.0), MaxHold: p.Int("maxHold", 60),
+        },
+    }, p.Err()
+})
+```
 
 ## 3. Numerical API (`factor/statistics`)
 
@@ -464,7 +526,7 @@ Ignores β drift, funding, impact cost, exit spread deviation, and drift-rebalan
 - **No portfolio-level volatility targeting**: `WeightMode: "inverse_vol"` sizes open pairs relative to `1/Std`, but `TotalGross` remains a fixed NAV fraction and does not scale down aggregate exposure when market-wide volatility spikes.
 - **Stop = closing, not protection**: `|z|>=Stop` realizes the loss and blocks re-entry; it does not cap single-trade loss.
 - **No default time stop**: with `MaxHold:0` a spread that does not revert occupies exposure indefinitely.
-- **Structural breaks** (mergers, delistings, etc.): need external invalidation detection, which the library does not provide.
+- **Structural breaks** (mergers, delistings, regime shifts): `RegisterRollingPairs` mitigates gradual cointegration decay via periodic reselection, while abrupt in-period breaks still rely on `Stop`/`MaxHold`/PIT delist exits or external invalidation checks.
 - **Rebalancing cost**: see 2.6; Events must be verified separately.
 - **Capacity**: `research.EstimateCapacityCost(spec CapacityCostSpec{FeeRate, SlippageRate, ImpactCoefficient, MaxParticipation}, tradedNotional, adv, volatility, heldNotional, fundingRate) (CapacityCost{Participation, Fee, Slippage, Impact, Funding, Total, Feasible}, error)`: `Impact = traded·coef·vol·√(traded/adv)`; `adv>0`, `MaxParticipation∈[0,1]` (0 = unlimited); estimate only.
 - **Account risk limits**: Gross and margin limits are **absolute amounts in the settlement currency**, not leverage multiples; they do not substitute for the strategy NAV fraction `Gross`.

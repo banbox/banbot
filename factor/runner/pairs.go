@@ -83,18 +83,7 @@ func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error {
 		if err != nil {
 			return nil, research.ComboSpec{}, err
 		}
-		field := factor.Field("kline", spec.Field, c.Factor.TimeFrame)
-		logp := factor.Custom("pairs-log-v1", []*factor.Node{field}, func(v []factor.Numeric) factor.Numeric {
-			if v[0].Validity != factor.Valid {
-				return v[0]
-			}
-			if v[0].Value <= 0 {
-				return factor.Numeric{Value: math.NaN(), Validity: factor.NonFinite}
-			}
-			return factor.Numeric{Value: math.Log(v[0].Value), Validity: factor.Valid}
-		})
-		plan, err := factor.New().Add(pairsLogOutput, logp).Compile()
-		return plan, research.ComboSpec{Method: research.Equal, Columns: []string{pairsLogOutput}}, err
+		return compilePairsLogPlan(spec.Field, c.Factor.TimeFrame)
 	})
 	if err != nil {
 		return err
@@ -177,17 +166,36 @@ func normalizePairsSpec(spec PairsSpec) (PairsSpec, error) {
 	return spec, nil
 }
 
-func entryBetaAllowed(spec PairsSpec, beta float64) bool {
+func compilePairsLogPlan(fieldName, timeframe string) (*factor.Plan, research.ComboSpec, error) {
+	field := factor.Field("kline", fieldName, timeframe)
+	logp := factor.Custom("pairs-log-v1", []*factor.Node{field}, func(v []factor.Numeric) factor.Numeric {
+		if v[0].Validity != factor.Valid {
+			return v[0]
+		}
+		if v[0].Value <= 0 {
+			return factor.Numeric{Value: math.NaN(), Validity: factor.NonFinite}
+		}
+		return factor.Numeric{Value: math.Log(v[0].Value), Validity: factor.Valid}
+	})
+	plan, err := factor.New().Add(pairsLogOutput, logp).Compile()
+	return plan, research.ComboSpec{Method: research.Equal, Columns: []string{pairsLogOutput}}, err
+}
+
+func betaAllowed(minBeta float64, allowNegative bool, beta float64) bool {
 	if !finitePairFloat(beta) {
 		return false
 	}
-	if !spec.AllowNegativeBeta {
-		return beta > math.Max(0, spec.MinBeta)
+	if !allowNegative {
+		return beta > math.Max(0, minBeta)
 	}
-	if spec.MinBeta > 0 {
-		return math.Abs(beta) > spec.MinBeta
+	if minBeta > 0 {
+		return math.Abs(beta) > minBeta
 	}
 	return true
+}
+
+func entryBetaAllowed(spec PairsSpec, beta float64) bool {
+	return betaAllowed(spec.MinBeta, spec.AllowNegativeBeta, beta)
 }
 
 // allocateInverseVolGross distributes totalGross across open pairs inversely proportional

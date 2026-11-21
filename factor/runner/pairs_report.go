@@ -110,41 +110,47 @@ func (t *pairsTracker) resetStats() {
 // decision with reason "end". PnL values become fractions of initialNAV. It does not mutate the tracker.
 func (t *pairsTracker) report(initialNAV float64) []PairResult {
 	out := make([]PairResult, len(t.states))
+	for i, st := range t.states {
+		out[i] = buildPairResult(t.names[i], &st.stats, st.unavailable, st.stats.episodeCap, t.lastMS, initialNAV)
+	}
+	return out
+}
+
+func buildPairResult(name Pair, s *pairStats, unavailable string, epCap int, lastMS int64, initialNAV float64) PairResult {
 	scale := func(v float64) float64 {
 		if initialNAV > 0 {
 			return fin(v / initialNAV)
 		}
 		return 0
 	}
-	for i, st := range t.states {
-		s := &st.stats
-		r := PairResult{Y: t.names[i].Y, X: t.names[i].X, EpisodeCount: s.episodeCount, Trades: s.trades, Wins: s.wins,
-			InMarketBars: s.inMarket, Bars: s.bars, PausedBars: s.paused, LastBeta: fin(s.lastBeta), Turnover: fin(s.turnover), PnL: scale(s.pnl)}
-		for _, ep := range s.episodes {
-			ep.PnL, ep.EntryZ, ep.ExitZ, ep.Beta = scale(ep.PnL), fin(ep.EntryZ), fin(ep.ExitZ), fin(ep.Beta)
-			r.Episodes = append(r.Episodes, ep)
+	r := PairResult{Y: name.Y, X: name.X, EpisodeCount: s.episodeCount, Trades: s.trades, Wins: s.wins,
+		InMarketBars: s.inMarket, Bars: s.bars, PausedBars: s.paused, LastBeta: fin(s.lastBeta), Turnover: fin(s.turnover), PnL: scale(s.pnl)}
+	for _, ep := range s.episodes {
+		if len(r.Episodes) >= epCap {
+			break
 		}
-		if ep := s.open; ep != nil {
-			r.Trades++
-			r.EpisodeCount++
-			if ep.PnL > 0 {
-				r.Wins++
-			}
-			if len(r.Episodes) < s.episodeCap {
-				o := *ep
-				o.EndMS, o.Reason = t.lastMS, "end"
-				o.PnL, o.EntryZ, o.Beta = scale(o.PnL), fin(o.EntryZ), fin(o.Beta)
-				r.Episodes = append(r.Episodes, o)
-			}
-		}
-		if r.Trades > 0 {
-			r.WinRate = float64(r.Wins) / float64(r.Trades)
-			r.AvgHoldBars = float64(r.InMarketBars) / float64(r.Trades)
-		}
-		if st.unavailable != "" {
-			r.Unavailable, r.UnavailableLeg = "leg_unavailable", st.unavailable
-		}
-		out[i] = r
+		ep.PnL, ep.EntryZ, ep.ExitZ, ep.Beta = scale(ep.PnL), fin(ep.EntryZ), fin(ep.ExitZ), fin(ep.Beta)
+		r.Episodes = append(r.Episodes, ep)
 	}
-	return out
+	if ep := s.open; ep != nil {
+		r.Trades++
+		r.EpisodeCount++
+		if ep.PnL > 0 {
+			r.Wins++
+		}
+		if len(r.Episodes) < epCap {
+			o := *ep
+			o.EndMS, o.Reason = lastMS, "end"
+			o.PnL, o.EntryZ, o.Beta = scale(o.PnL), fin(o.EntryZ), fin(o.Beta)
+			r.Episodes = append(r.Episodes, o)
+		}
+	}
+	if r.Trades > 0 {
+		r.WinRate = float64(r.Wins) / float64(r.Trades)
+		r.AvgHoldBars = float64(r.InMarketBars) / float64(r.Trades)
+	}
+	if unavailable != "" {
+		r.Unavailable, r.UnavailableLeg = "leg_unavailable", unavailable
+	}
+	return r
 }

@@ -99,8 +99,8 @@
 | `paper.go` / `paper_sink.go` / `paper_group.go` | 本地纸面账户；同账户多策略共享 borrow 与 paperMarket |
 | `validate.go` / `live_validate.go` | 回放/实盘配置校验，`resolveDecisionPortfolio` |
 | `risk_builder.go` / `model_builder.go` | 自定义风险优化与模型组合 builder 的配置与构造 |
-| `pairs.go` / `simple.go` | 统计套利配对 builder（`PairsSpec`：正 Beta 入场守卫、冻结对冲比退出 Z 一致性、持仓漂移缓冲带 `DriftBand`、跨配对波动率风险平价 `WeightMode: "inverse_vol"`，使用 `statistics.BandTrader`）、简单因子注册 |
-| `pairs_report.go` / `report.go` | 每对独立结果的记账（`pairStats`、`pairsTracker.report`）与结果类型（`PairResult`、`PairEpisode`、`Attribution`、`SymbolContribution`、`buildAttribution`）；`runObservers` 把 factory 内创建的配对状态带回 `Result` |
+| `pairs.go` / `rolling_pairs.go` / `simple.go` | 固定配对 builder（`RegisterPairs`/`PairsSpec`）、周期性“形成期+交易期”滚动重选配对 builder（`RegisterRollingPairs`/`RollingPairsSpec`：支持协整 `EngleGranger`+`FitOU` 与 Gatev 最小距离法 `distance`、`graceful`/`immediate` 换期交接、正 Beta 守卫、冻结对冲比退出 Z、`DriftBand`、`WeightMode: "inverse_vol"`）及简单因子注册 |
+| `pairs_report.go` / `report.go` | 每对独立结果的记账（`pairStats`、`pairsTracker`/`rollingPairsTracker`、`buildPairResult`）与结果类型（`PairResult`、`PairEpisode`、`Attribution`、`SymbolContribution`、`buildAttribution`）；`runObservers` 把 factory 内创建的配对状态带回 `Result` |
 | `params.go` / `scan.go` / `config.go` | 参数容器（`Params`，`Unused` 校验）、参数扫描、运行配置辅助 |
 | `terminal.go` / `option_expiry.go` | 终止标的与期权到期结算相关处理 |
 | `source_events.go` / `timeline.go` / `incomplete.go` | 数据源事件、同账户回放时间线排序、未完整数据处理（`IncompleteStream` 汇总；`pitReduceUniverse` 推导决策网格的时点宇宙） |
@@ -217,12 +217,18 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 
 ### 9. 统计套利（配对）
 
-`runner/pairs.go` 构造 `PairsSpec` 与带状交易器：`statistics.NewBandTrader` + `NewRollingSpread`，逐 bar 调用 `Observe` 与 `Step`；闭包捕获为空（满足 `Custom` 节点的 CSE 安全要求）。`BandTrader` 每个实例只能服务一个价差；Stop / MaxHold 平仓后阻塞再入场直到 `|z| ≤ Exit`。
+`runner/pairs.go`（固定配对 `RegisterPairs`）与 `runner/rolling_pairs.go`（滚动重选配对 `RegisterRollingPairs`）共用 `compilePairsLogPlan`（`pairs-log-v1` 对数价格节点，闭包无状态满足 CSE 安全要求）、`statistics.NewBandTrader` 与 `NewRollingSpread`；`BandTrader` 每个实例只能服务一个价差，Stop / MaxHold 平仓后阻塞再入场直到 `|z| ≤ Exit`。
 
 - **入场 Beta 守卫**（`MinBeta`、`AllowNegativeBeta`）：默认（`!AllowNegativeBeta`）仅当滚动回归 `point.Beta > max(0, MinBeta)` 时才允许开新仓（或反手）；若 `AllowNegativeBeta` 为真且 `MinBeta > 0`，要求 `|point.Beta| > MinBeta`。空仓不满足条件时不开仓（若 `|point.Z| ≤ Exit` 仍推进状态机以解除止损阻塞）；已有持仓不受 Beta 守卫阻拦，照常按规则平仓。
 - **持仓期冻结对冲比退出 Z 一致性**（`RollingSpread.EvalWithBeta`、`DynamicExitZ`）：入场后对冲比 `st.beta` 冻结；默认（`!DynamicExitZ`）持仓期的退出/止损 Z-Score 由 `RollingSpread.EvalWithBeta(lx, ly, st.beta)` 按当前有效滚动窗口内固定斜率残差 `r_i = y_i − st.beta·x_i` 的均值与样本标准差（`ddof=1`）计算，使退出信号与实际持仓盈亏严格一致（设 `DynamicExitZ: true` 可改回每轮重拟合的 `SpreadPoint.Z`）。
 - **持仓期免漂移调仓缓冲带**（`DriftBand`）：当 `DriftBand > 0` 且某配对本轮未发生开平仓或方向切换（`st.pos == prev`）时，按上一轮输出权重随两腿价格和策略 `Budget.NAV` 自然漂移后的交易前权重 `(preWY, preWX)` 与本轮理论目标权重比较；若 L1 偏离 `|idealWY − preWY| + |idealWX − preWX| < DriftBand`，保持 `(preWY, preWX)` 不触发微调（若所有配对总敞口因漂移超 `1` 则将超额的缓冲配对回退到理论权重，保证总敞口严格 `≤ 1`）。`pairStats` 以 `(preWY, preWX)` 为换手基准记账（缓冲轮次主动换手为 0），与账本成交和 `PairsResidual` 精确对账。
-- **跨配对风险平价分配**（`WeightMode`、`MaxPairGross`）：`WeightMode` 为 `""`/`"equal"`（默认）时每对开仓固定分配 `Gross`；为 `"inverse_vol"` 时将可用配对总预算 `TotalGross = Gross × 可用配对数` 按当前持仓配对价差残差标准差 `point.Std` 的倒数归一化分配（注水法裁剪单对上限 `MaxPairGross`，未设时默认 `min(TotalGross, 2×Gross)`，被不可用跳过的配对仍不放大总预算），总敞口严格 `≤ 1`。
+- **跨配对风险平价分配**（`WeightMode`、`MaxPairGross`）：`WeightMode` 为 `""`/`"equal"`（默认）时每对开仓固定分配 `Gross`；为 `"inverse_vol"` 时将可用配对总预算 `TotalGross = Gross × 可用配对槽位数` 按当前持仓配对价差残差标准差 `point.Std` 的倒数归一化分配（注水法裁剪单对上限 `MaxPairGross`，未设时默认 `min(TotalGross, 2×Gross)`，被不可用跳过的配对仍不放大总预算），总敞口严格 `≤ 1`。
+- **周期性滚动重选配对**（`RegisterRollingPairs`、`RollingPairsSpec`）：注册定义名 `<name>` 与组合工厂 `<name>-rolling-pairs-v1`。
+  - **候选池与 PIT 交互**：`Candidates` 为空时默认取运行宇宙 `Universe.Investable` 全部品种（由 YAML `pairs` 提供，无需在 Go 代码硬编码符号），非空时取子集（在 `UnavailableSymbols` 中的缺数据品种自动跳过，其余缺失品种报错；有效候选不足 2 个且因 `UnavailableSymbols` 缩减时输出 `pairs-all-unavailable` 空仓）。因不静态绑定 `PITPairs`，Weights 回测走通用 `pitReduceUniverse`：中途退市/缺数据的品种从当轮宇宙剔除，含该品种的持仓配对立即以 `leg_missing` 平仓，且重选仅在当轮可交易且观测有效的品种中筛选，其余配对继续交易不跳过决策轮。
+  - **形成期与筛选规则**：维护有界环形历史缓冲区 `max(FormationBars, Window)`，满 `FormationBars`（`≥ 20`）起每隔 `ReselectBars`（`≥ 1`）根决策 bar 严格使用 `≤ t` 已收盘观测无前视重选至多 `PairCount`（默认 `5`）对，且同一品种当期最多入选 `MaxPerSymbol`（默认 `2`）次；并列得分严格按 `(Y 符号, X 符号, SID)` 确定性打破，保证重复运行逐位一致；当期 0 对通过筛选时附诊断 `rolling-pairs-empty-selection`（无退场仓位时输出显式空 `map[int32]float64{}`）。支持两种 `SelectionMethod`：
+    - `"cointegration"`（默认）：要求形成期对齐有效覆盖率 `≥ MinCoverage`（默认 `0.9`）且对数收益相关系数 `≥ MinCorr`（默认 `0.5`），双向运行 `statistics.EngleGranger`（含截距，`ADFLags`）与 `statistics.FitOU`，筛选斜率通过 Beta 守卫、残差 `ADF.TStatistic ≤ MaxADF`（默认 `-2.86`）且 `DiscreteHalfLife ∈ [MinHalfLife, MaxHalfLife]`（`MaxHalfLife` 默认 `FormationBars`）的候选方向（双向通过取 ADF 更负者），按 ADF 升序贪心选取。
+    - `"distance"`（Gatev 最小距离法）：覆盖率达标且对数收益正相关（`MinCorr == 0` 时要求 `> 0`，否则 `≥ MinCorr`），将形成期首根共同有效价归一化为 `1.0` 计算归一化价格平方偏差之和（按覆盖率折算到 `FormationBars`），选斜率合法且距离最小者（双向均合法时取 `|β − 1|` 更小者）。
+  - **预热与换期交接（`HandoffMode`）**：新入选配对用 `t` 之前的可见历史观测预热 `RollingSpread`（`Window` 默认 `FormationBars`），当轮即可产生信号，已连任配对保留原状态机与持仓。`HandoffMode` 为 `""`/`"graceful"`（默认）时，未连任但仍持仓的旧配对转入只退不进池（保留冻结 `Beta` 与 `BandTrader` 直至止盈/止损/到期退出，绝不再开仓）并占用配对槽位，新配对按排名使用剩余槽位（同品种对反向亦阻塞至退场完成），任意时刻总开仓对数 `≤ PairCount`、总名义敞口 `≤ 1`；为 `"immediate"` 时换期当根直接平掉未连任持仓配对（`Episode.Reason = "reselect"`）。
 
 ### 10. 结果统计（`Result.Attribution` / `Result.Pairs`）
 
@@ -238,9 +244,9 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 - `TopSymbols`（至多 20 个，按 `|Net|` 降序）：`Symbol`、`PnL`、`Costs`（该标的的费用+滑点+PIT 成本，不含资金费：资金费是账户级一项，只在 `Funding`）、`Net = PnL − Costs`、`NetPct`（占初始 NAV）、`Share = Net / Σ|Net|`（范围 [-1,1]，接近 ±1 表示单一标的决定结果）；所有标的的 `Net` 之和等于 NAV 变化加 `Funding`（`Share` 与集中度只看品种 `Net`）。
 - 累加器是账本的纯旁路观察者，开启前后 NAV 序列逐位一致（`attribution_test.go`）。
 
-**配对独立结果 `Result.Pairs`**（仅 `RegisterPairs` 策略）：`PairResult{Y, X, Episodes, EpisodeCount, PnL, Trades, Wins, WinRate, InMarketBars, Bars, PausedBars, AvgHoldBars, LastBeta, Turnover, Unavailable, UnavailableLeg}`（后两项仅整次运行被跳过的配对有值，见下“不可用的腿”）。
+**配对独立结果 `Result.Pairs`**（`RegisterPairs` 与 `RegisterRollingPairs` 策略；后者按运行中曾入选的不同有向配对 `Pair{Y, X}` 首次入选顺序汇总）：`PairResult{Y, X, Episodes, EpisodeCount, PnL, Trades, Wins, WinRate, InMarketBars, Bars, PausedBars, AvgHoldBars, LastBeta, Turnover, Unavailable, UnavailableLeg}`（后两项仅整次运行被跳过的配对有值，见上“不可用的腿”）。
 
-- `Episodes[]` 为 `PairEpisode{StartMS, EndMS, Dir(+1 做多价差/-1 做空), EntryZ, ExitZ, Beta(入场冻结), Bars, Reason, PnL}`；总量上限 400 条在各对间均分（每对至少 10 条，保留最早的），真实数量见 `EpisodeCount`；`run-completed` 事件行整体序列化 `Result`，体量受该上限约束。`Reason`：`exit`（|z| ≤ Exit）、`stop`（|z| ≥ Stop）、`maxhold`、`leg_missing`（腿缺数据被平仓并暂停，`ExitZ=0`）、`end`（运行结束时仍持仓，`EndMS` 为最后一次决策时间）。`Bars` 为持仓决策数（含入场当期，不含平仓当期）。
+- `Episodes[]` 为 `PairEpisode{StartMS, EndMS, Dir(+1 做多价差/-1 做空), EntryZ, ExitZ, Beta(入场冻结), Bars, Reason, PnL}`；总量上限 400 条在各对间均分（每对至少 10 条，保留最早的），真实数量见 `EpisodeCount`；`run-completed` 事件行整体序列化 `Result`，体量受该上限约束。`Reason`：`exit`（|z| ≤ Exit）、`stop`（|z| ≥ Stop）、`maxhold`、`reselect`（`RegisterRollingPairs` 在 `HandoffMode: "immediate"` 换期平仓）、`leg_missing`（腿缺数据被平仓并暂停，`ExitZ=0`）、`end`（运行结束时仍持仓，`EndMS` 为最后一次决策时间）。`Bars` 为持仓决策数（含入场当期，不含平仓当期）。
 - 记账：`pairsTracker` 随 builder 一起由 portfolio factory 创建（`Config.observe` 经 `runObservers` 在运行结束时汇总；`PreparePortfolioConfig` 在其为空时创建，`Run` 只在为空时创建，所以入口先 Prepare 再 Run 的路径同样有效；`Run` 开始时调用 `reset` 清空记账，同一已 Prepare 的 Config 再次运行也不会累计，但 builder 自身的交易状态按既有约定仍应只用于一次运行），只写不读，不改变 builder 输出的权重。每个决策，该对上一次决策的目标权重（`wY`、`wX`，即叠加进净权重之前的两项）持有到本次决策，收益为 `wY·rY + wX·rX`（`rY/rX` 为两腿在相邻决策之间的简单收益，取自 builder 输入的对数价字段）乘以上一次决策的 `Budget.NAV`；`PnL` 为累计值占初始 NAV 的比例，持仓期的收益同时累加到当前 `Episode.PnL`。同一品种出现在多对时按各对权重自然拆分。
 - `Bars` = 双腿有效且回归窗口已满的决策数；`PausedBars` = 因某腿缺数据暂停的决策数；`InMarketBars` = 持仓决策数；`AvgHoldBars = InMarketBars / Trades`（运行结束时仍持仓的一次计入 `Trades`，`Wins` 以 `PnL>0` 计）；`LastBeta` 为最近一次入场冻结的 Beta；`Turnover` 为决策时刻 `|Δ wY| + |Δ wX|` 的累计（NAV 比例，是成本的代理，成本不分摊到各对）。
 - 对账（`Result` 上）：`PairsGrossPnL` = 各对 `PnL` 之和，`PairsNAVReturn` = `Book.NAV / InitialNAV − 1`，`PairsResidual = PairsNAVReturn − PairsGrossPnL`，即成本（费用、滑点、资金费、PIT 成本）加执行近似残差（账本按延迟后的价格成交、权重在决策之间随价格漂移、各对共享品种时账本按净权重成交）。成交价与决策价一致且无延迟差时残差等于成本的相反数。

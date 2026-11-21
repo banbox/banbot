@@ -153,7 +153,7 @@ type Result struct {
 
 	// Attribution (weights mode): long / short leg PnL, costs, exposure and top instruments, see Attribution.
 	Attribution *Attribution `json:",omitempty"`
-	// Pairs (RegisterPairs strategies): one result per pair, see PairResult. PairsGrossPnL is the sum of the
+	// Pairs (RegisterPairs / RegisterRollingPairs strategies): one result per pair, see PairResult. PairsGrossPnL is the sum of the
 	// pairs' PnL (fraction of the initial NAV, no costs, decision-time prices); PairsNAVReturn is the Book's
 	// NAV change over the initial NAV; PairsResidual = PairsNAVReturn - PairsGrossPnL, i.e. costs (fees, slippage,
 	// funding, PIT exits) plus the execution approximation (later fill prices, weight drift between decisions).
