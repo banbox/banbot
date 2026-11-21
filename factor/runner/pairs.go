@@ -23,9 +23,31 @@ type PairsSpec struct {
 	Field  string                // kline field, default "close"
 	Window int                   // regression window in decision bars, at least 3
 	Band   statistics.BandConfig // entry/exit/stop/max-hold thresholds
-	// Gross is the gross notional of one open pair as a fraction of strategy NAV.
+	// Gross is the gross notional of one open pair as a fraction of strategy NAV
+	// (or per-pair budget unit under WeightMode "inverse_vol").
 	// Default 1/len(Pairs), so all pairs open at once never exceed 100% gross.
 	Gross float64
+	// MinBeta is the minimum rolling OLS slope required when opening a new position.
+	// By default (!AllowNegativeBeta) entry requires point.Beta > max(0, MinBeta);
+	// when AllowNegativeBeta is true and MinBeta > 0, entry requires |point.Beta| > MinBeta.
+	MinBeta float64
+	// AllowNegativeBeta disables the default positive-beta entry guard (point.Beta > 0).
+	AllowNegativeBeta bool
+	// DynamicExitZ opts out of frozen-beta exit/stop evaluation: by default (false),
+	// while a position is open its exit/stop z-score is evaluated against the entry-frozen
+	// hedge ratio via RollingSpread.EvalWithBeta so exit signals match held PnL.
+	DynamicExitZ bool
+	// DriftBand buffers minor weight drift while holding: when > 0 and a pair stays open
+	// in the same direction, its pre-trade drifted weights are kept if their L1 distance
+	// to this round's ideal target weights is strictly below DriftBand (subject to total gross <= 1).
+	DriftBand float64
+	// WeightMode selects cross-pair sizing: "" or "equal" (default) assigns fixed Gross per open pair;
+	// "inverse_vol" allocates TotalGross = Gross * availablePairs across open pairs inversely
+	// proportional to each pair's spread residual Std, capped per pair by MaxPairGross.
+	WeightMode string
+	// MaxPairGross caps any single pair's gross notional under WeightMode "inverse_vol".
+	// Default 0 uses min(TotalGross, 2*Gross). Must be in [0, 1].
+	MaxPairGross float64
 }
 
 const pairsLogOutput = "logp"
@@ -107,6 +129,12 @@ func resolvePairsSpec(build func(*Params) (PairsSpec, error), c Config) (PairsSp
 	if err := p.Err(); err != nil {
 		return spec, err
 	}
+	return normalizePairsSpec(spec)
+}
+
+func finitePairFloat(x float64) bool { return !math.IsNaN(x) && !math.IsInf(x, 0) }
+
+func normalizePairsSpec(spec PairsSpec) (PairsSpec, error) {
 	if spec.Field == "" {
 		spec.Field = "close"
 	}
@@ -122,8 +150,24 @@ func resolvePairsSpec(build func(*Params) (PairsSpec, error), c Config) (PairsSp
 	if spec.Gross == 0 {
 		spec.Gross = 1 / float64(len(spec.Pairs))
 	}
-	if !(spec.Gross > 0) || spec.Gross*float64(len(spec.Pairs)) > 1+1e-9 {
+	if !finitePairFloat(spec.Gross) || !(spec.Gross > 0) || spec.Gross*float64(len(spec.Pairs)) > 1+1e-9 {
 		return spec, errors.New("runner: pairs gross per pair must be positive and keep total gross within 1")
+	}
+	if !finitePairFloat(spec.MinBeta) || spec.MinBeta < 0 {
+		return spec, errors.New("runner: pairs min beta must be finite and non-negative")
+	}
+	if !finitePairFloat(spec.DriftBand) || spec.DriftBand < 0 {
+		return spec, errors.New("runner: pairs drift band must be finite and non-negative")
+	}
+	switch spec.WeightMode {
+	case "", "equal":
+		spec.WeightMode = "equal"
+	case "inverse_vol":
+	default:
+		return spec, fmt.Errorf("runner: unknown pairs weight mode %q", spec.WeightMode)
+	}
+	if !finitePairFloat(spec.MaxPairGross) || spec.MaxPairGross < 0 || spec.MaxPairGross > 1+1e-9 {
+		return spec, errors.New("runner: pairs max pair gross must be in [0, 1]")
 	}
 	for _, pair := range spec.Pairs {
 		if pair.Y == "" || pair.X == "" || pair.Y == pair.X {
@@ -133,16 +177,93 @@ func resolvePairsSpec(build func(*Params) (PairsSpec, error), c Config) (PairsSp
 	return spec, nil
 }
 
+func entryBetaAllowed(spec PairsSpec, beta float64) bool {
+	if !finitePairFloat(beta) {
+		return false
+	}
+	if !spec.AllowNegativeBeta {
+		return beta > math.Max(0, spec.MinBeta)
+	}
+	if spec.MinBeta > 0 {
+		return math.Abs(beta) > spec.MinBeta
+	}
+	return true
+}
+
+// allocateInverseVolGross distributes totalGross across open pairs inversely proportional
+// to each pair's spread residual Std, applying water-filling caps at maxPairGross while
+// keeping total gross strictly within 1.
+func allocateInverseVolGross(states []*pairState, totalGross, maxPairGross float64) []float64 {
+	out := make([]float64, len(states))
+	active := make([]int, 0, len(states))
+	inv := make([]float64, len(states))
+	for i, st := range states {
+		if st.pos == 0 {
+			continue
+		}
+		if st.lastStd > 1e-12 && finitePairFloat(st.lastStd) {
+			inv[i] = 1 / st.lastStd
+			active = append(active, i)
+		}
+	}
+	remaining := math.Min(1.0, totalGross)
+	capPerPair := math.Min(1.0, maxPairGross)
+	if len(active) == 0 || remaining <= 0 || capPerPair <= 0 {
+		return out
+	}
+	capped := make([]bool, len(states))
+	for remaining > 1e-15 {
+		sumInv := 0.0
+		for _, idx := range active {
+			if !capped[idx] {
+				sumInv += inv[idx]
+			}
+		}
+		if sumInv <= 0 {
+			break
+		}
+		iterRem := remaining
+		clipped := false
+		for _, idx := range active {
+			if capped[idx] {
+				continue
+			}
+			if iterRem*(inv[idx]/sumInv) > capPerPair+1e-15 {
+				out[idx] = capPerPair
+				remaining -= capPerPair
+				capped[idx] = true
+				clipped = true
+			}
+		}
+		if !clipped {
+			for _, idx := range active {
+				if !capped[idx] {
+					out[idx] = remaining * (inv[idx] / sumInv)
+				}
+			}
+			break
+		}
+	}
+	return out
+}
+
 type pairState struct {
 	y, x int32
 	// unavailable is the leg (symbol) that has no data at all inside this run's window and was left out of its
 	// universe by the engine (BtFeatureLevel 11); the pair is skipped for the whole run: never traded, no spread.
-	unavailable string
-	spread      *statistics.RollingSpread
-	trader      *statistics.BandTrader
-	beta        float64 // hedge ratio frozen at entry
-	pos         int
-	stats       pairStats // result bookkeeping only; never read by the trading logic
+	unavailable    string
+	spread         *statistics.RollingSpread
+	trader         *statistics.BandTrader
+	beta           float64 // hedge ratio frozen at entry
+	lastStd        float64 // latest valid spread residual Std
+	pos            int
+	prevPos        int
+	curLY, curLX   float64
+	curOK          bool
+	holdWY, holdWX float64
+	holdLY, holdLX float64
+	hasHold        bool
+	stats          pairStats // result bookkeeping only; never read by the trading logic
 }
 
 func newPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioBuilder, error) {
@@ -163,6 +284,11 @@ func newTrackedPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioB
 // unavailable is still an error. Every pair keeps its Gross share: skipped pairs leave their exposure idle, the
 // remaining pairs are never scaled up (no hidden leverage when pairs drop out).
 func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, unavailable map[string]string) (PortfolioBuilder, *pairsTracker, error) {
+	var err error
+	spec, err = normalizePairsSpec(spec)
+	if err != nil {
+		return nil, nil, err
+	}
 	sids := make(map[string]int32, len(sidMap))
 	for sid, symbol := range sidMap {
 		sids[symbol] = sid
@@ -199,13 +325,14 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 	}
 	tracker := &pairsTracker{states: states, names: spec.Pairs}
 	tracker.resetStats()
-	allUnavailable := true
+	availCount := 0
 	for _, st := range states {
 		if st.unavailable == "" {
-			allUnavailable = false
-			break
+			availCount++
 		}
 	}
+	allUnavailable := availCount == 0
+	var prevDecisionNAV float64
 	build := func(frame factor.Frame, universe factor.Universe, target factor.PortfolioSpec, _ research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error) {
 		tradable := make(map[int32]bool, len(universe.Tradable))
 		for _, sid := range universe.Tradable {
@@ -215,7 +342,8 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 		var diags []factor.Diagnostic
 		ready := false
 		navPrev := tracker.lastNAV
-		tracker.lastNAV = target.Budget.NAV
+		navNow := target.Budget.NAV
+		tracker.lastNAV = navNow
 		tracker.lastMS = frame.DecisionTime
 		if allUnavailable {
 			// No pair can trade in this run: an explicit flat target at every decision (equity stays at the initial value).
@@ -224,6 +352,8 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 			return p, nil, err
 		}
 		for _, st := range states {
+			st.prevPos = st.pos
+			st.curOK = false
 			if st.unavailable != "" {
 				continue
 			}
@@ -244,6 +374,7 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 				}
 				continue
 			}
+			st.curLY, st.curLX, st.curOK = ly.Value, lx.Value, true
 			st.stats.accrue(ly.Value, lx.Value, navPrev)
 			point, ok := st.spread.Observe(lx.Value, ly.Value)
 			if !ok {
@@ -251,6 +382,7 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 				continue
 			}
 			ready = true
+			st.lastStd = point.Std
 			st.stats.bars++
 			if !tradable[st.y] || !tradable[st.x] {
 				// Never open on an untradable leg; an existing position keeps its state
@@ -260,27 +392,126 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 				}
 			}
 			prev := st.pos
-			st.pos = st.trader.Step(point.Z)
-			if st.pos != 0 && (prev == 0 || prev != st.pos) {
-				st.beta = point.Beta
+			if prev == 0 {
+				if !entryBetaAllowed(spec, point.Beta) {
+					if math.Abs(point.Z) <= spec.Band.Exit {
+						st.pos = st.trader.Step(point.Z)
+					}
+					continue
+				}
+				st.pos = st.trader.Step(point.Z)
+				if st.pos != 0 {
+					st.beta = point.Beta
+				}
+				st.stats.observeStep(prev, st.pos, point.Z, st.beta, frame.DecisionTime, spec.Band)
+			} else {
+				stepZ := point.Z
+				if !spec.DynamicExitZ {
+					if fz, okZ := st.spread.EvalWithBeta(lx.Value, ly.Value, st.beta); okZ {
+						stepZ = fz
+					} else {
+						stepZ = math.NaN()
+					}
+				}
+				st.pos = st.trader.Step(stepZ)
+				if st.pos != 0 && st.pos != prev {
+					if !entryBetaAllowed(spec, point.Beta) {
+						st.pos, st.beta = 0, 0
+						st.trader.Reset()
+					} else {
+						st.beta = point.Beta
+					}
+				} else if st.pos == 0 {
+					st.beta = 0
+				}
+				st.stats.observeStep(prev, st.pos, stepZ, st.beta, frame.DecisionTime, spec.Band)
 			}
-			st.stats.observeStep(prev, st.pos, point.Z, st.beta, frame.DecisionTime, spec.Band)
 		}
 		if !ready {
 			return nil, append(diags, factor.Diagnostic{Code: "pairs-not-ready", Detail: "no pair has a full window; keep previous portfolio"}), nil
 		}
+		var pairGross []float64
+		if spec.WeightMode == "inverse_vol" {
+			totalGross := math.Min(1.0, spec.Gross*float64(availCount))
+			capPerPair := spec.MaxPairGross
+			if capPerPair == 0 {
+				capPerPair = math.Min(totalGross, 2*spec.Gross)
+			}
+			pairGross = allocateInverseVolGross(states, totalGross, capPerPair)
+		}
+		wyList := make([]float64, len(states))
+		wxList := make([]float64, len(states))
+		idealWY := make([]float64, len(states))
+		idealWX := make([]float64, len(states))
+		preWY := make([]float64, len(states))
+		preWX := make([]float64, len(states))
+		buffered := make([]bool, len(states))
+		for i, st := range states {
+			if st.hasHold && st.curOK && prevDecisionNAV > 0 && navNow > 0 {
+				ry := math.Exp(st.curLY - st.holdLY)
+				rx := math.Exp(st.curLX - st.holdLX)
+				if finitePairFloat(ry) && finitePairFloat(rx) {
+					preWY[i] = st.holdWY * (prevDecisionNAV / navNow) * ry
+					preWX[i] = st.holdWX * (prevDecisionNAV / navNow) * rx
+				} else {
+					preWY[i], preWX[i] = st.holdWY, st.holdWX
+				}
+			} else if st.hasHold {
+				preWY[i], preWX[i] = st.holdWY, st.holdWX
+			}
+			if st.pos == 0 {
+				continue
+			}
+			g := spec.Gross
+			if pairGross != nil {
+				g = pairGross[i]
+			}
+			norm := 1 + math.Abs(st.beta)
+			s := float64(st.pos) * g / norm
+			iwY, iwX := s, -s*st.beta
+			idealWY[i], idealWX[i] = iwY, iwX
+			wy, wx := iwY, iwX
+			if spec.DriftBand > 0 && st.prevPos == st.pos && st.hasHold && st.curOK {
+				if math.Abs(iwY-preWY[i])+math.Abs(iwX-preWX[i]) < spec.DriftBand {
+					wy, wx = preWY[i], preWX[i]
+					buffered[i] = true
+				}
+			}
+			wyList[i], wxList[i] = wy, wx
+		}
+		totalG := 0.0
+		for i := range states {
+			totalG += math.Abs(wyList[i]) + math.Abs(wxList[i])
+		}
+		if totalG > 1+1e-12 {
+			for i := range states {
+				if buffered[i] && math.Abs(wyList[i])+math.Abs(wxList[i]) > math.Abs(idealWY[i])+math.Abs(idealWX[i]) {
+					wyList[i], wxList[i] = idealWY[i], idealWX[i]
+					buffered[i] = false
+				}
+			}
+		}
 		weights := map[int32]float64{}
-		for _, st := range states {
-			var wy, wx float64
-			if st.pos != 0 {
-				norm := 1 + math.Abs(st.beta)
-				s := float64(st.pos) * spec.Gross / norm
-				wy, wx = s, -s*st.beta
+		for i, st := range states {
+			wy, wx := wyList[i], wxList[i]
+			if wy != 0 || wx != 0 {
 				weights[st.y] += wy
 				weights[st.x] += wx
 			}
-			st.stats.setWeights(wy, wx)
+			if spec.DriftBand > 0 {
+				st.stats.setWeightsFrom(wy, wx, preWY[i], preWX[i])
+			} else {
+				st.stats.setWeights(wy, wx)
+			}
+			if st.pos != 0 && st.curOK {
+				st.holdWY, st.holdWX = wy, wx
+				st.holdLY, st.holdLX = st.curLY, st.curLX
+				st.hasHold = true
+			} else if st.pos == 0 {
+				st.holdWY, st.holdWX, st.hasHold = 0, 0, false
+			}
 		}
+		prevDecisionNAV = navNow
 		for sid, w := range weights {
 			if w == 0 {
 				delete(weights, sid)

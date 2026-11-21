@@ -99,7 +99,7 @@
 | `paper.go` / `paper_sink.go` / `paper_group.go` | 本地纸面账户；同账户多策略共享 borrow 与 paperMarket |
 | `validate.go` / `live_validate.go` | 回放/实盘配置校验，`resolveDecisionPortfolio` |
 | `risk_builder.go` / `model_builder.go` | 自定义风险优化与模型组合 builder 的配置与构造 |
-| `pairs.go` / `simple.go` | 统计套利配对 builder（`PairsSpec`，使用 `statistics.BandTrader`）、简单因子注册 |
+| `pairs.go` / `simple.go` | 统计套利配对 builder（`PairsSpec`：正 Beta 入场守卫、冻结对冲比退出 Z 一致性、持仓漂移缓冲带 `DriftBand`、跨配对波动率风险平价 `WeightMode: "inverse_vol"`，使用 `statistics.BandTrader`）、简单因子注册 |
 | `pairs_report.go` / `report.go` | 每对独立结果的记账（`pairStats`、`pairsTracker.report`）与结果类型（`PairResult`、`PairEpisode`、`Attribution`、`SymbolContribution`、`buildAttribution`）；`runObservers` 把 factory 内创建的配对状态带回 `Result` |
 | `params.go` / `scan.go` / `config.go` | 参数容器（`Params`，`Unused` 校验）、参数扫描、运行配置辅助 |
 | `terminal.go` / `option_expiry.go` | 终止标的与期权到期结算相关处理 |
@@ -149,7 +149,7 @@
 | `policySinkCheckpoint` | `runner/account_policy_sink.go:19` | 组合策略接纳的原子 checkpoint（Version、State、Target、Sequence 等） |
 | `HistoricalInput` / `storageInput` | `runner/input.go:42` / `runner/storage_input.go:150` | 回放输入抽象与分页存储实现 |
 | `BandConfig` / `BandTrader` | `statistics/pair_signal.go:15` / `:44` | 价差 z 分数滞回交易器，+1 多价差，-1 空价差 |
-| `RollingSpread` / `KalmanPair` | `statistics/pair_signal.go:133` / `statistics/pairs.go:135` | 滚动 OLS 价差；Kalman 新息（预更新） |
+| `RollingSpread` / `KalmanPair` | `statistics/pair_signal.go` / `statistics/pairs.go` | 滚动 OLS 价差（`Observe` 重拟合与 `EvalWithBeta` 固定对冲比窗口 Z-Score）；Kalman 新息（预更新） |
 
 ## 关键流程
 
@@ -217,7 +217,12 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 
 ### 9. 统计套利（配对）
 
-`runner/pairs.go` 构造 `PairsSpec` 与带状交易器：`statistics.NewBandTrader` + `NewRollingSpread`，逐 bar 调用 `Observe`（`pairs.go:174`）与 `Step`（`:188`）；闭包捕获为空（满足 `Custom` 节点的 CSE 安全要求，`pairs.go:62`）。`BandTrader` 每个实例只能服务一个价差；Stop 之后阻塞再入场直到 |z| ≤ Exit。
+`runner/pairs.go` 构造 `PairsSpec` 与带状交易器：`statistics.NewBandTrader` + `NewRollingSpread`，逐 bar 调用 `Observe` 与 `Step`；闭包捕获为空（满足 `Custom` 节点的 CSE 安全要求）。`BandTrader` 每个实例只能服务一个价差；Stop / MaxHold 平仓后阻塞再入场直到 `|z| ≤ Exit`。
+
+- **入场 Beta 守卫**（`MinBeta`、`AllowNegativeBeta`）：默认（`!AllowNegativeBeta`）仅当滚动回归 `point.Beta > max(0, MinBeta)` 时才允许开新仓（或反手）；若 `AllowNegativeBeta` 为真且 `MinBeta > 0`，要求 `|point.Beta| > MinBeta`。空仓不满足条件时不开仓（若 `|point.Z| ≤ Exit` 仍推进状态机以解除止损阻塞）；已有持仓不受 Beta 守卫阻拦，照常按规则平仓。
+- **持仓期冻结对冲比退出 Z 一致性**（`RollingSpread.EvalWithBeta`、`DynamicExitZ`）：入场后对冲比 `st.beta` 冻结；默认（`!DynamicExitZ`）持仓期的退出/止损 Z-Score 由 `RollingSpread.EvalWithBeta(lx, ly, st.beta)` 按当前有效滚动窗口内固定斜率残差 `r_i = y_i − st.beta·x_i` 的均值与样本标准差（`ddof=1`）计算，使退出信号与实际持仓盈亏严格一致（设 `DynamicExitZ: true` 可改回每轮重拟合的 `SpreadPoint.Z`）。
+- **持仓期免漂移调仓缓冲带**（`DriftBand`）：当 `DriftBand > 0` 且某配对本轮未发生开平仓或方向切换（`st.pos == prev`）时，按上一轮输出权重随两腿价格和策略 `Budget.NAV` 自然漂移后的交易前权重 `(preWY, preWX)` 与本轮理论目标权重比较；若 L1 偏离 `|idealWY − preWY| + |idealWX − preWX| < DriftBand`，保持 `(preWY, preWX)` 不触发微调（若所有配对总敞口因漂移超 `1` 则将超额的缓冲配对回退到理论权重，保证总敞口严格 `≤ 1`）。`pairStats` 以 `(preWY, preWX)` 为换手基准记账（缓冲轮次主动换手为 0），与账本成交和 `PairsResidual` 精确对账。
+- **跨配对风险平价分配**（`WeightMode`、`MaxPairGross`）：`WeightMode` 为 `""`/`"equal"`（默认）时每对开仓固定分配 `Gross`；为 `"inverse_vol"` 时将可用配对总预算 `TotalGross = Gross × 可用配对数` 按当前持仓配对价差残差标准差 `point.Std` 的倒数归一化分配（注水法裁剪单对上限 `MaxPairGross`，未设时默认 `min(TotalGross, 2×Gross)`，被不可用跳过的配对仍不放大总预算），总敞口严格 `≤ 1`。
 
 ### 10. 结果统计（`Result.Attribution` / `Result.Pairs`）
 

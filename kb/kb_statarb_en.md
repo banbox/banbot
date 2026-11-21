@@ -37,11 +37,17 @@ Terms: `Y` is the explained leg (bought when going long the spread); `X` is the 
 func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error
 type Pair struct{ Y, X string }          // exactly the symbol in the run SIDMap, e.g. "ETH/USDT:USDT"
 type PairsSpec struct {
-    Pairs  []Pair
-    Field  string                        // kline field, default "close"
-    Window int                           // regression window (decision bars), >= 3
-    Band   statistics.BandConfig         // see 2.3
-    Gross  float64                       // total notional per pair as fraction of strategy NAV; 0 = 1/len(Pairs)
+    Pairs             []Pair
+    Field             string                // kline field, default "close"
+    Window            int                   // regression window (decision bars), >= 3
+    Band              statistics.BandConfig // see 2.3
+    Gross             float64               // base notional per pair as fraction of strategy NAV; 0 = 1/len(Pairs)
+    MinBeta           float64               // minimum entry β floor (>=0), see 2.4
+    AllowNegativeBeta bool                  // default false (requires entry β > max(0, MinBeta))
+    DynamicExitZ      bool                  // default false (holding exit/stop z uses frozen β via EvalWithBeta)
+    DriftBand         float64               // holding-period L1 weight drift buffer (>=0, 0 disables)
+    WeightMode        string                // ""/"equal" (default fixed Gross) or "inverse_vol" (1/Std risk parity)
+    MaxPairGross      float64               // per-pair gross cap [0,1] under inverse_vol; 0 defaults to min(TotalGross, 2*Gross)
 }
 ```
 
@@ -53,7 +59,7 @@ Registration occupies the definition name `name` and the factory name `name-pair
 
 ### 2.2 Validation (after build returns)
 
-Empty `build`/`name` → registration fails; non-empty `Params.Err()` → that error is returned; `Field==""` → `"close"`; `len(Pairs)==0`, `Window<3`, `Band.Validate()` failure → error; `Gross==0` → `1/len(Pairs)`; `Gross<=0` or `Gross*len(Pairs) > 1+1e-9` → error (total exposure must not exceed NAV); `Y==""`/`X==""`/`Y==X` → error; Y/X not in the run `SIDMap` → error when constructing the portfolio builder (`PreparePortfolioConfig`, before resource assembly).
+Empty `build`/`name` → registration fails; non-empty `Params.Err()` → that error is returned; `Field==""` → `"close"`; `len(Pairs)==0`, `Window<3`, `Band.Validate()` failure → error; `Gross==0` → `1/len(Pairs)`; `Gross<=0` or `Gross*len(Pairs) > 1+1e-9` → error (total exposure must not exceed NAV); `MinBeta<0`, `DriftBand<0`, or non-finite → error; `WeightMode` other than `""`/`"equal"`/`"inverse_vol"` → error; `MaxPairGross` outside `[0,1]` or non-finite → error; `Y==""`/`X==""`/`Y==X` → error; Y/X not in the run `SIDMap` (and not in `UnavailableSymbols`) → error when constructing the portfolio builder (`PreparePortfolioConfig`, before resource assembly).
 
 Tradability is not checked at construction time (see 2.4).
 
@@ -84,22 +90,26 @@ State transitions:
 
 ### 2.4 Runtime Semantics (each decision round)
 
-Each pair holds a private `RollingSpread`, `BandTrader`, frozen β, and position. Each round:
+Each pair holds a private `RollingSpread`, `BandTrader`, frozen β, latest valid residual `Std`, position, and prior held-weight baseline. Each round:
 
 | Step | Condition | Behavior | Diagnostic code |
 | --- | --- | --- | --- |
-| a | Y/X `pairs-log-v1` value missing or not Valid (including price<=0) | Skip the pair; do not advance window or state machine; existing position is kept | `pair-input-missing` |
+| a | Y/X `pairs-log-v1` value missing or not Valid (including price<=0) | Pause the pair; close any open position immediately and reset state machine (`leg_missing`) | `pair-input-missing` / `pair-closed-missing-leg` |
 | b | `RollingSpread.Observe` not ready (window not full, x variance<=1e-12, residual std<=1e-12, non-finite) | Skip; do not advance BandTrader | `pair-warmup` |
 | c | Ready, a leg is not tradable, current position 0 | Do not open; do not advance BandTrader | none |
-| d | Ready, a leg is not tradable, current position non-zero | Still advance BandTrader (may close per rules) | none |
-| e | After `Step(z)` position≠0 and previous position was 0 or direction changed | Freeze β = this period's `SpreadPoint.Beta` | none |
-| f | No pair is ready (all in a or b) | Return nil target + `pairs-not-ready` | `pairs-not-ready` |
-| g | Otherwise | Compute weight output for every pair with position≠0 (including those with missing input this round, using their state); non-empty diagnostics attach to the target | this round's diagnostics |
+| c2 | Ready, current position 0, entry β fails guard (`Beta <= max(0, MinBeta)` under default `!AllowNegativeBeta`; `|Beta| <= MinBeta` when `AllowNegativeBeta && MinBeta>0`) | Do not open (only advances BandTrader when `|z|<=Exit` to clear `blocked`) | none |
+| d | Ready, current position non-zero (including untradable leg or current rolling β<=0) | Advance BandTrader using frozen-β z from `EvalWithBeta(lx, ly, frozenβ)` by default (`point.Z` when `DynamicExitZ: true`); may close per rules | none |
+| e | After `Step` position≠0 and previous position was 0 (or flipped and passed β guard) | Freeze β = this period's `SpreadPoint.Beta` | none |
+| f | No pair is ready (and none closed for a missing leg) | Return nil target + `pairs-not-ready` | `pairs-not-ready` |
+| g | Otherwise | Compute target weights for every pair with position≠0 using `WeightMode` and `DriftBand`; non-empty diagnostics attach to the target | this round's diagnostics |
 
-Weights (`pos∈{-1,0,+1}`, `G` = that pair's Gross, `β` the frozen value, `N=1+|β|`): `w_Y += pos·G/N`, `w_X += -pos·G·β/N`. When the same SID appears in several pairs the weights **accumulate**, nets can offset, and zero weights are deleted. For a single pair |w_Y|+|w_X| is exactly G, and total exposure ≤ ΣG ≤ NAV. `pos=+1` buys Y and sells X; X notional = β × Y notional (elasticity hedge under the log model).
+Weights (`pos∈{-1,0,+1}`, `G` = allocated notional for that pair, `β` the frozen value, `N=1+|β|`): ideal weights `idealW_Y = pos·G/N`, `idealW_X = -pos·G·β/N`.
+- **Cross-pair sizing (`WeightMode`)**: `""`/`"equal"` gives each open pair fixed `G = Gross`; `"inverse_vol"` allocates `TotalGross = Gross × availablePairs` across open pairs inversely proportional to `point.Std`, water-filling per-pair caps at `MaxPairGross` (default `min(TotalGross, 2*Gross)` when 0) and keeping total exposure strictly `<= 1`.
+- **Holding drift buffer (`DriftBand > 0`)**: when `pos == prevPos != 0` and the prior round's weights naturally drifted by current prices and `Budget.NAV` to `(preWY, preWX)` satisfy `|idealW_Y - preWY| + |idealW_X - preWX| < DriftBand`, `(preWY, preWX)` is kept to avoid micro-rebalance churn (reverting buffered pairs that grew if total gross would exceed `1`); `pairStats.Turnover` measures active turnover against `(preWY, preWX)` (0 on buffered rounds).
+- When the same SID appears in several pairs the weights **accumulate**, nets can offset, and zero weights are deleted. `pos=+1` buys Y and sells X; X notional = |β| × Y notional (elasticity hedge under the log model).
 
-- **When β is negative both legs go the same direction**: the code does not reject it; filter it at the training/parameter layer.
-- **Signal/hedge inconsistency**: z uses the rolling α/β each round, while held-position weights use the β **frozen at entry**; β drift during the holding period changes z but not the hedge ratio.
+- **Positive-β entry guard**: `Beta <= 0` entries (both legs same direction, unhedged) are rejected by default; set `AllowNegativeBeta: true` only when negative slopes are intended.
+- **Exit signal / frozen hedge consistency**: by default (`!DynamicExitZ`), holding-period exit/stop z is evaluated on the entry-frozen β over the current window (`EvalWithBeta`, `ddof=1`), preventing rolling β drift from triggering false mean-reversion exits; set `DynamicExitZ: true` to use refit OLS `point.Z`.
 - **Window** = the most recent N **usable observations**, not calendar bars; a bar with an invalid leg does not enter the window, so the covered time stretches.
 - **Full/Patch**: the target is a NAV fraction; under Full, SIDs not in the target are treated as 0. Closed pairs are removed from the target, so **`portfolio.mode: patch` must not be set** (Patch only changes SIDs inside the target; unlisted positions are never closed); default is full.
 - **nil target vs empty target**: nil (f) = no new target this round; the engine does not replace the pending target, the Weights ledger count is unchanged (prior holdings carry on), `Result.Skipped++`, and evaluation weights are not updated; an already-submitted unfilled target still executes within its window or expires. A non-nil empty map (all pairs closed) = under Full, everything is zeroed, and it executes without needing a quote. The warm-up period (window not full) is nil; once ready, having no positions yields an empty target.
@@ -130,7 +140,7 @@ run_policy:
 
 **Observable timing**: a target executes only at a quote with `AtMS > DecisionTime`, `AtMS >= DecisionTime+latency_ms`, `AvailableAt <= now`, and within `expiry_ms` (default 60000). Hence **1h decision + default 1h close price stream + default expiry**: the next quote is 1h later, every non-empty target expires, and there are zero fills (measured: no positions in the ledger, fees 0). Fix: configure `prices: {source: tick, timeframe: event, field: price}` or `kline/1m/close` (measured: the tick stream fills 1ms after the decision). Merely raising `expiry_ms` so it fills at the next K-line is untested, and the fill price would be the next close.
 
-**The Weights ledger charges for drift**: each time the ledger executes a target it recomputes quantity as `qty = w × spec.Budget.NAV / price` (NAV = ledger NAV at decision time, compounding with PnL), and charges `fee_rate`+`slippage_rate` on the difference from existing quantity. Pairs output a target every decision round, so **price drift during the holding period is rebalanced back to target weights every round and charged** (measured: fees still accumulate round by round when weights are constant). Gross is a fraction of current NAV, not initial NAV. `research.Evaluate`'s `Costs = CostRate × Σ|w−w_prev|` counts only weight differences and excludes drift, a different basis from the ledger (`Result.Book` is the ledger basis). Whether the Events path also generates drift-rebalance fills is untested.
+**The Weights ledger charges for drift**: each time the ledger executes a target it recomputes quantity as `qty = w × spec.Budget.NAV / price` (NAV = ledger NAV at decision time, compounding with PnL), and charges `fee_rate`+`slippage_rate` on the difference from existing quantity. With `DriftBand == 0`, pairs output constant target weights every decision round, so **price drift during the holding period is rebalanced back to target weights every round and charged**; setting `DriftBand > 0` emits naturally drifted weights while inside the band to avoid unnecessary friction cost. Gross is a fraction of current NAV, not initial NAV. `research.Evaluate`'s `Costs = CostRate × Σ|w−w_prev|` counts only weight differences and excludes drift, a different basis from the ledger (`Result.Book` is the ledger basis). Whether the Events path also generates drift-rebalance fills is untested.
 
 ### 2.7 Custom Paths (static β, Kalman, multi-leg baskets)
 
@@ -188,12 +198,13 @@ type SpreadPoint struct {
     Std         float64   // window residual standard deviation, ddof=2
     Z           float64   // Residual / Std
 }
-func NewRollingSpread(window int) (*RollingSpread, error)  // window >= 3
+func NewRollingSpread(window int) (*RollingSpread, error)                       // window >= 3
 func (r *RollingSpread) Window() int
-func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)   // x is the X leg, y the Y leg (log prices)
+func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)               // x is the X leg, y the Y leg (log prices)
+func (r *RollingSpread) EvalWithBeta(x, y, frozenBeta float64) (float64, bool)  // fixed-slope window residual z (ddof=1), read-only
 ```
 
-`ok=false`: window not full, non-finite input (sample skipped), x window variance<=1e-12, residual std<=1e-12. Each call runs a full OLS on the current window (not frozen); under log prices β is an elasticity.
+`Observe` returns `ok=false`: window not full, non-finite input (sample skipped), x window variance<=1e-12, residual std<=1e-12; each call runs a full OLS on the current window, and under log prices β is an elasticity. `EvalWithBeta` computes the z-score of `y - frozenBeta*x` against the window's `r_i = y_i - frozenBeta*x_i` sample mean and std (`ddof=1`, `ok=false` when window not full, non-finite input, or `std<=1e-12`) without mutating the ring buffer.
 
 ### 3.3 Kalman Filter (random-walk β and intercept)
 
@@ -450,7 +461,7 @@ Ignores β drift, funding, impact cost, exit spread deviation, and drift-rebalan
 
 ### 7.2 Key Risks
 
-- **No volatility targeting**: each pair's notional is a fixed `G`.
+- **No portfolio-level volatility targeting**: `WeightMode: "inverse_vol"` sizes open pairs relative to `1/Std`, but `TotalGross` remains a fixed NAV fraction and does not scale down aggregate exposure when market-wide volatility spikes.
 - **Stop = closing, not protection**: `|z|>=Stop` realizes the loss and blocks re-entry; it does not cap single-trade loss.
 - **No default time stop**: with `MaxHold:0` a spread that does not revert occupies exposure indefinitely.
 - **Structural breaks** (mergers, delistings, etc.): need external invalidation detection, which the library does not provide.

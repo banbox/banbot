@@ -11,7 +11,8 @@ import (
 // 067: a pair with a leg that loses its data is closed and paused (weights empty), and reopens when the leg is
 // back and the band says so.
 func TestPairsBuilderClosesAndPausesPairOnMissingLeg(t *testing.T) {
-	builder, err := newPairsBuilder(PairsSpec{Pairs: []Pair{{Y: "Y", X: "X"}}, Window: 5, Gross: 1, Band: statistics.BandConfig{Entry: 1, Exit: .2}}, map[int32]string{1: "Y", 2: "X"})
+	// Window=5 synthetic spike at x=1.0 (< window mean 1.01) flips 5-bar OLS beta negative; opt out of beta sign guard to test missing-leg reopen.
+	builder, err := newPairsBuilder(PairsSpec{Pairs: []Pair{{Y: "Y", X: "X"}}, Window: 5, Gross: 1, AllowNegativeBeta: true, Band: statistics.BandConfig{Entry: 1, Exit: .2}}, map[int32]string{1: "Y", 2: "X"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -80,7 +80,13 @@ func (s *pairStats) closeEpisode(at int64, z float64, reason string) {
 
 // setWeights records the pair's own target weights of this decision and their turnover.
 func (s *pairStats) setWeights(wy, wx float64) {
-	s.turnover += math.Abs(wy-s.wY) + math.Abs(wx-s.wX)
+	s.setWeightsFrom(wy, wx, s.wY, s.wX)
+}
+
+// setWeightsFrom records turnover relative to pre-trade drifted weights (refWY, refWX)
+// so buffered non-rebalance rounds accrue zero active turnover while keeping PnL exact.
+func (s *pairStats) setWeightsFrom(wy, wx, refWY, refWX float64) {
+	s.turnover += math.Abs(wy-refWY) + math.Abs(wx-refWX)
 	s.wY, s.wX = wy, wx
 }
 

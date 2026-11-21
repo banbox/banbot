@@ -188,3 +188,33 @@ func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool) {
 	}
 	return p, true
 }
+
+// EvalWithBeta evaluates (x, y) against the current full window using a fixed
+// hedge ratio frozenBeta instead of the refit OLS slope: it computes the sample
+// mean and standard deviation (ddof 1) of r_i = y_i - frozenBeta*x_i across the
+// window and returns the z-score of y - frozenBeta*x. It does not mutate r.
+func (r *RollingSpread) EvalWithBeta(x, y, frozenBeta float64) (z float64, ok bool) {
+	if r.count < r.n || !finite(x) || !finite(y) || !finite(frozenBeta) {
+		return 0, false
+	}
+	var mean, m2 float64
+	for i := 0; i < r.n; i++ {
+		v := r.ys[i] - frozenBeta*r.xs[i]
+		if !finite(v) {
+			return 0, false
+		}
+		delta := v - mean
+		mean += delta / float64(i+1)
+		m2 += delta * (v - mean)
+	}
+	std := math.Sqrt(math.Max(0, m2) / float64(r.n-1))
+	if std <= 1e-12 || !finite(std) {
+		return 0, false
+	}
+	resid := (y - r.oy) - frozenBeta*(x - r.ox) - mean
+	z = resid / std
+	if !finite(z) {
+		return 0, false
+	}
+	return z, true
+}

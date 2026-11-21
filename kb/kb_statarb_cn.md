@@ -37,11 +37,17 @@
 func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error
 type Pair struct{ Y, X string }          // 与运行 SIDMap 中符号完全一致，如 "ETH/USDT:USDT"
 type PairsSpec struct {
-    Pairs  []Pair
-    Field  string                        // kline 字段，缺省 "close"
-    Window int                           // 回归窗口（决策 bar 数），>= 3
-    Band   statistics.BandConfig         // 见 2.3
-    Gross  float64                       // 单对总名义占策略 NAV；0 = 1/len(Pairs)
+    Pairs             []Pair
+    Field             string                // kline 字段，缺省 "close"
+    Window            int                   // 回归窗口（决策 bar 数），>= 3
+    Band              statistics.BandConfig // 见 2.3
+    Gross             float64               // 单对基础总名义占策略 NAV；0 = 1/len(Pairs)
+    MinBeta           float64               // 入场最小 β 下限（>=0），见 2.4
+    AllowNegativeBeta bool                  // 默认 false（要求入场 β > max(0, MinBeta)）
+    DynamicExitZ      bool                  // 默认 false（持仓期用冻结 β 的 EvalWithBeta 计算退出/止损 z）
+    DriftBand         float64               // 持仓期免调仓 L1 权重漂移缓冲带（>=0，0 关闭）
+    WeightMode        string                // ""/"equal"（默认固定 Gross）或 "inverse_vol"（按 1/Std 风险平价）
+    MaxPairGross      float64               // inverse_vol 下单对敞口上限 [0,1]；0 默认 min(TotalGross, 2*Gross)
 }
 ```
 
@@ -53,7 +59,7 @@ type PairsSpec struct {
 
 ### 2.2 校验（build 返回后）
 
-`build`/`name` 为空→注册失败；`Params.Err()` 非空→返回该错误；`Field==""`→`"close"`；`len(Pairs)==0`、`Window<3`、`Band.Validate()` 失败→错误；`Gross==0`→`1/len(Pairs)`；`Gross<=0` 或 `Gross*len(Pairs) > 1+1e-9`→错误（总敞口不得超 NAV）；`Y==""`/`X==""`/`Y==X`→错误；Y/X 不在运行 `SIDMap`→构造组合构造器时报错（`PreparePortfolioConfig`，资源装配前）。
+`build`/`name` 为空→注册失败；`Params.Err()` 非空→返回该错误；`Field==""`→`"close"`；`len(Pairs)==0`、`Window<3`、`Band.Validate()` 失败→错误；`Gross==0`→`1/len(Pairs)`；`Gross<=0` 或 `Gross*len(Pairs) > 1+1e-9`→错误（总敞口不得超 NAV）；`MinBeta<0`、`DriftBand<0` 或非有限→错误；`WeightMode` 非 `""`/`"equal"`/`"inverse_vol"`→错误；`MaxPairGross` 不在 `[0,1]` 或非有限→错误；`Y==""`/`X==""`/`Y==X`→错误；Y/X 不在运行 `SIDMap`（且不在 `UnavailableSymbols`）→构造组合构造器时报错（`PreparePortfolioConfig`，资源装配前）。
 
 构造期不检查可交易性（见 2.4）。
 
@@ -84,22 +90,26 @@ func (b *BandTrader) Position() int
 
 ### 2.4 运行时语义（每个决策轮）
 
-每对持有私有 `RollingSpread`、`BandTrader`、冻结 β、仓位。每轮：
+每对持有私有 `RollingSpread`、`BandTrader`、冻结 β、最近有效残差 `Std`、仓位与上一轮持仓基准。每轮：
 
 | 步骤 | 条件 | 行为 | 诊断码 |
 | --- | --- | --- | --- |
-| a | Y/X 的 `pairs-log-v1` 值缺失或非 Valid（含价格<=0） | 跳过该对；不推进窗口与状态机；已有仓位保持 | `pair-input-missing` |
+| a | Y/X 的 `pairs-log-v1` 值缺失或非 Valid（含价格<=0） | 暂停该对；已有仓位立即平仓并重置状态机（`leg_missing`） | `pair-input-missing` / `pair-closed-missing-leg` |
 | b | `RollingSpread.Observe` 未就绪（窗口未满、x 方差<=1e-12、残差 std<=1e-12、非有限） | 跳过；不推进 BandTrader | `pair-warmup` |
 | c | 就绪，某腿不可交易，当前仓位 0 | 不开仓，不推进 BandTrader | 无 |
-| d | 就绪，某腿不可交易，当前有仓位 | 仍推进 BandTrader（可按规则平仓） | 无 |
-| e | `Step(z)` 后仓位≠0 且原仓位为 0 或方向变化 | 冻结 β = 本期 `SpreadPoint.Beta` | 无 |
-| f | 所有对都未就绪（均在 a 或 b） | 返回 nil 目标 + `pairs-not-ready` | `pairs-not-ready` |
-| g | 其他 | 对每个仓位≠0 的对（含本轮输入缺失者，用其状态）计算权重输出；非空诊断附到目标 | 本轮诊断 |
+| c2 | 就绪，当前仓位 0，入场 β 不满足守卫（默认 `!AllowNegativeBeta` 时 `Beta <= max(0, MinBeta)`；`AllowNegativeBeta && MinBeta>0` 时 `|Beta| <= MinBeta`） | 不开新仓（仅当 `|z|<=Exit` 时推进状态机以解除 `blocked`） | 无 |
+| d | 就绪，当前有仓位（含某腿不可交易或当前滚动 β<=0） | 默认用 `EvalWithBeta(lx, ly, 冻结β)` 的 z（`DynamicExitZ: true` 时用重拟合 `point.Z`）推进 BandTrader，可按规则平仓 | 无 |
+| e | `Step` 后仓位≠0 且原仓位为 0（或方向变化且通过 β 守卫） | 冻结 β = 本期 `SpreadPoint.Beta` | 无 |
+| f | 所有对都未就绪（且无因缺失平仓的对） | 返回 nil 目标 + `pairs-not-ready` | `pairs-not-ready` |
+| g | 其他 | 按 `WeightMode` 与 `DriftBand` 为每个仓位≠0 的对计算目标权重输出；非空诊断附到目标 | 本轮诊断 |
 
-权重（`pos∈{-1,0,+1}`，`G`=该对 Gross，`β` 冻结值，`N=1+|β|`）：`w_Y += pos·G/N`，`w_X += -pos·G·β/N`。同一 SID 出现在多对时**叠加**，净额可对消，零权重删除。单对 |w_Y|+|w_X| 恰为 G，总敞口 ≤ ΣG ≤ NAV。`pos=+1` 买 Y 卖 X；X 名义 = β×Y 名义（对数模型弹性对冲）。
+权重（`pos∈{-1,0,+1}`，`G`=该对分配名义，`β` 冻结值，`N=1+|β|`）：理论权重 `idealW_Y = pos·G/N`，`idealW_X = -pos·G·β/N`。
+- **跨配对分配（`WeightMode`）**：`""`/`"equal"` 时每对固定 `G = Gross`；`"inverse_vol"` 时将 `TotalGross = Gross × 可用配对数` 按当前持仓配对 `1/point.Std` 归一化分配，并用注水法限制单对 `G <= MaxPairGross`（未设时默认 `min(TotalGross, 2*Gross)`），总敞口始终 `<= 1`。
+- **持仓漂移缓冲（`DriftBand > 0`）**：若本轮 `pos == prevPos != 0` 且上一轮持仓按当期价格与 `Budget.NAV` 自然漂移后的权重 `(preWY, preWX)` 满足 `|idealW_Y - preWY| + |idealW_X - preWX| < DriftBand`，则保持 `(preWY, preWX)` 避免频繁微调再平衡（若总敞口因漂移超 `1` 则超额缓冲对回退至理论权重）；`pairStats.Turnover` 以 `(preWY, preWX)` 为基准，缓冲轮次记 0 主动换手。
+- 同一 SID 出现在多对时**叠加**，净额可对消，零权重删除。`pos=+1` 买 Y 卖 X；X 名义 = |β|×Y 名义（对数模型弹性对冲）。
 
-- **β 为负时两腿同向**：代码不拒绝，须在训练/参数层过滤。
-- **信号/对冲不一致**：z 用每轮滚动 α/β，持仓权重用**入场时冻结**β；持仓期间 β 漂移改变 z 而不改对冲比例。
+- **入场正 β 守卫**：默认拒绝 `Beta <= 0` 入场（避免两腿同向失去对冲），需允许负斜率时显式设 `AllowNegativeBeta: true`。
+- **退出信号与冻结对冲比一致**：默认（`!DynamicExitZ`）持仓期退出/止损 z 基于入场冻结 β 在当前窗口上的残差均值与标准差（`EvalWithBeta`，`ddof=1`），避免滚动 β 漂移造成虚假回归平仓；设 `DynamicExitZ: true` 则使用每轮重拟合 OLS 的 `point.Z`。
 - **窗口**=最近 N 个**可用观测**，非日历 bar；某腿无效的 bar 不进窗口，覆盖时间会拉长。
 - **Full/Patch**：目标为 NAV 比例；Full 下未入目标的 SID 视为 0。平仓对被从目标删除，故**不得设 `portfolio.mode: patch`**（Patch 只改目标内 SID，未列出的仓位永不平仓）；缺省 full。
 - **nil 目标 vs 空目标**：nil（f）= 本轮无新目标；引擎不替换待执行目标，Weights 账本数量不变（沿用此前持仓），`Result.Skipped++`，评估权重不更新；已提交未成交目标仍按窗口执行或过期。非 nil 空 map（所有对平仓）= Full 下全部清零，无需报价即可执行。预热期（窗口未满）为 nil，就绪后无仓位即为空目标。
@@ -130,7 +140,7 @@ run_policy:
 
 **可观察时点**：目标须在报价 `AtMS > DecisionTime`、`AtMS >= DecisionTime+latency_ms`、`AvailableAt <= now` 且在 `expiry_ms`（默认 60000）内的价格执行。故 **1h 决策 + 默认 1h close 价格流 + 默认 expiry**：下一根报价在 1h 后，非空目标全部过期，零成交（实测：账本无持仓、费用 0）。解决：配 `prices: {source: tick, timeframe: event, field: price}` 或 `kline/1m/close`（实测 tick 流在决策后 1ms 成交）。仅提高 `expiry_ms` 让其在下一根 K 线成交未实测，且成交价为下一根收盘。
 
-**Weights 账本对漂移计费**：账本每次执行目标都按 `qty = w × spec.Budget.NAV / price` 重算数量（NAV=决策时账本 NAV，随盈亏复利），与现有数量之差按 `fee_rate`+`slippage_rate` 计费。配对每个决策轮都输出目标，所以**持仓期间价格漂移每轮被再平衡回目标权重并计费**（实测权重恒定时费用仍逐轮累计）。Gross 是当前 NAV 比例而非初始 NAV。`research.Evaluate` 的 `Costs = CostRate × Σ|w−w_prev|` 只计权重差、不含漂移，与账本口径不同（`Result.Book` 为账本口径）。Events 路径是否同样产生漂移再平衡成交未实测。
+**Weights 账本对漂移计费**：账本每次执行目标都按 `qty = w × spec.Budget.NAV / price` 重算数量（NAV=决策时账本 NAV，随盈亏复利），与现有数量之差按 `fee_rate`+`slippage_rate` 计费。`DriftBand == 0` 时配对每个决策轮都输出恒定目标权重，**持仓期间价格漂移每轮被再平衡回目标权重并计费**；设置 `DriftBand > 0` 可在偏离未超阈值时输出自然漂移权重以省去无谓摩擦成本。Gross 是当前 NAV 比例而非初始 NAV。`research.Evaluate` 的 `Costs = CostRate × Σ|w−w_prev|` 只计权重差、不含漂移，与账本口径不同（`Result.Book` 为账本口径）。Events 路径是否同样产生漂移再平衡成交未实测。
 
 ### 2.7 自定义路径（静态 β、Kalman、多腿篮子）
 
@@ -188,12 +198,13 @@ type SpreadPoint struct {
     Std         float64   // 窗口残差标准差，ddof=2
     Z           float64   // Residual / Std
 }
-func NewRollingSpread(window int) (*RollingSpread, error)  // window >= 3
+func NewRollingSpread(window int) (*RollingSpread, error)                    // window >= 3
 func (r *RollingSpread) Window() int
-func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)   // x 为 X 腿、y 为 Y 腿（对数价格）
+func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)            // x 为 X 腿、y 为 Y 腿（对数价格）
+func (r *RollingSpread) EvalWithBeta(x, y, frozenBeta float64) (float64, bool) // 固定斜率窗口残差 z（ddof=1），不修改状态
 ```
 
-`ok=false`：窗口未满、输入非有限（样本被跳过）、x 窗口方差<=1e-12、残差 std<=1e-12。每次为当前窗口完整 OLS（非冻结）；对数价格下 β 为弹性。
+`Observe` 返回 `ok=false`：窗口未满、输入非有限（样本被跳过）、x 窗口方差<=1e-12、残差 std<=1e-12；每次为当前窗口完整 OLS，对数价格下 β 为弹性。`EvalWithBeta` 在窗口已满且输入有限时，按窗口内 `r_i = y_i - frozenBeta*x_i` 的均值与标准差（`ddof=1`，`std<=1e-12` 时 `ok=false`）返回 `y - frozenBeta*x` 的 z-score，不改变环形缓冲区。
 
 ### 3.3 Kalman 滤波（随机游走 β 与截距）
 
@@ -450,7 +461,7 @@ func (s CrossVenueSnapshot) Equity(mark decimal.Decimal) (decimal.Decimal, error
 
 ### 7.2 风险要点
 
-- **无波动率目标**：每对名义固定 `G`。
+- **无组合级波动率目标**：`WeightMode: "inverse_vol"` 按各对 `1/Std` 做跨配对相对风险分配，但总名义预算 `TotalGross` 仍为固定比例，不会随市场整体波动率自动缩减总仓位。
 - **止损=平仓而非保护**：`|z|>=Stop` 实现亏损并阻止再入场，不限单笔亏损。
 - **无默认时间止损**：`MaxHold:0` 时不回归的价差一直占用敞口。
 - **结构性断裂**（并购、退市等）：需外部失效检测，库不提供。
