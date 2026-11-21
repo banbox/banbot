@@ -50,6 +50,7 @@ func (b *Book) ExitAtLastMark(sids []int32, fee, slip float64) []int32 {
 		b.attr.trade(sid, qty, 0, mark.Price, cost, math.Abs(qty*(price-mark.Price)))
 		delete(b.quantities, sid)
 		delete(b.firstFill, sid)
+		delete(b.entryPrices, sid)
 		closed = append(closed, sid)
 	}
 	if len(closed) > 0 {

@@ -53,6 +53,11 @@ func (f FactorContext) SubTF(sourceTimeFrame string, build func(FactorContext) *
 	return factor.AsOfNode(inner, f.TimeFrame, age)
 }
 
+// SectorCode returns the built-in per-asset numeric crypto sector ID node on the decision timeframe.
+func (f FactorContext) SectorCode() *factor.Node {
+	return factor.SectorCode(f.TimeFrame)
+}
+
 // RegisterFactor registers a cross-section strategy in one call:
 //
 //	runner.RegisterFactor("my-mom", func(c runner.FactorContext) (runner.FactorSpec, error) {

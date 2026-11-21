@@ -416,6 +416,7 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 			}
 			return nil
 		}
+		needStopOHLC := c.Manifest.Portfolio.Holding != nil && c.Manifest.Portfolio.Holding.HasStopProtection()
 		scopedInputs := plan.ScopedInputs()
 		hasAsOfLookback := false
 		for _, input := range scopedInputs {
@@ -425,6 +426,12 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 			}
 		}
 		for _, input := range scopedInputs {
+			fields := input.Fields
+			if needStopOHLC && input.Source == orm.SeriesSourceKline && input.TimeFrame == plan.TimeFrame() {
+				fields = append(slices.Clone(fields), "high", "low", "close")
+				sort.Strings(fields)
+				fields = slices.Compact(fields)
+			}
 			warm := input.WarmupLength
 			if hasAsOfLookback && !input.AsOfLatest && warm == 0 && input.TimeFrame != "" && input.TimeFrame != "event" {
 				warm = 1
@@ -453,7 +460,7 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 			}
 			sort.Slice(targetSIDs, func(i, j int) bool { return targetSIDs[i] < targetSIDs[j] })
 			targetSIDs = slices.Compact(targetSIDs)
-			if err := add(input.Source, input.TimeFrame, input.Fields, warm, targetSIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
+			if err := add(input.Source, input.TimeFrame, fields, warm, targetSIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
 				return nil, err
 			}
 		}

@@ -583,7 +583,7 @@ func (m *SharedOrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.Ent
 		if err != nil {
 			return err
 		}
-		if core.IsLimitOrder(copy.OrderType) && (relay && copy.Limit == 0 || defaultStyle && copy.Limit == 0) {
+		if core.IsLimitOrder(copy.OrderType) && (relay && (copy.Stop == 0 || copy.Limit == 0) || defaultStyle && copy.Limit == 0) {
 			// Relay and omitted configured limits use the current passive side.
 			// Observe inside the owner and after the command replay check so a
 			// retry retains the first committed limit and request identity.

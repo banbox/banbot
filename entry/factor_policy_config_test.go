@@ -177,3 +177,71 @@ func TestYAMLRiskAllocationMethodsWithoutExplicitPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestYAMLDriftBufferHybridStopsAndSectorQuantileExpressions(t *testing.T) {
+	_, path := factorYAMLFixture(t)
+	raw, _ := os.ReadFile(path)
+	yamlText := strings.Replace(string(raw), "      archive: data.gob", `      archive: data.gob
+      portfolio:
+        long_notional: 1
+        short_notional: 0
+        drift_threshold: 0.02
+        rebalance: {every_bars: 2}
+        selection: {long_k: 2}
+        holding: {stop_loss_pct: 0.08, trailing_stop_pct: 0.12, cooldown_bars: 2}
+      expressions:
+        schema_version: 1
+        timeframe: 1h
+        bindings:
+          kline: {source: kline, timeframe: 1h}
+        outputs:
+          sec_mom: 'cs.sector_demean(ts.return(positive(kline.close), 1))'
+          tier_mom: 'group.quantile_demean(ts.return(positive(kline.close), 1), ts.sma(kline.close, 2), 2)'`, 1)
+	if err := os.WriteFile(path, []byte(yamlText), 0600); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := loadFactorYAMLSpec([]string{path})
+	if err != nil {
+		t.Fatalf("loadFactorYAMLSpec failed: %v", err)
+	}
+	configs, err := buildFactorConfigs(spec, runner.Weights)
+	if err != nil {
+		t.Fatalf("buildFactorConfigs failed: %v", err)
+	}
+	pc, err := configs[0].Manifest.Portfolio.PolicyConfig()
+	if err != nil {
+		t.Fatalf("PolicyConfig failed: %v", err)
+	}
+	if pc.Policy != "lifecycle-v1" || pc.EffectiveDriftThreshold() != 0.02 || pc.Holding.StopLossPct != 0.08 || pc.Holding.TrailingStopPct != 0.12 || pc.Holding.CooldownBars != 2 {
+		t.Fatalf("unexpected decoded YAML policy config: %+v", pc)
+	}
+	res, err := runner.Run(context.Background(), configs[0], nil, nil)
+	if err != nil || res.TargetsAccepted == 0 {
+		t.Fatalf("YAML hybrid stop + sector/quantile run failed: res=%+v err=%v", res, err)
+	}
+
+	for _, invalid := range []string{
+		"drift_threshold: 1.0",
+		"drift_threshold: -0.01",
+		"rebalance: {drift_threshold: 1.2}",
+		"holding: {stop_loss_pct: 1.0}",
+		"holding: {stop_loss_pct: -0.05}",
+		"holding: {trailing_stop_pct: 1.5}",
+	} {
+		t.Run("invalid_"+invalid, func(t *testing.T) {
+			_, p := factorYAMLFixture(t)
+			r, _ := os.ReadFile(p)
+			badYAML := strings.Replace(string(r), "      archive: data.gob", "      archive: data.gob\n      portfolio:\n        long_notional: 1\n        short_notional: 0\n        "+invalid, 1)
+			if err := os.WriteFile(p, []byte(badYAML), 0600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := loadFactorYAMLSpec([]string{p})
+			if err == nil {
+				_, err = buildFactorConfigs(s, runner.Weights)
+			}
+			if err == nil {
+				t.Fatalf("expected invalid YAML %q to fail", invalid)
+			}
+		})
+	}
+}

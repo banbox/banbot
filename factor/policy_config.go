@@ -11,13 +11,14 @@ import (
 )
 
 type RebalanceConfig struct {
-	EveryBars       int    `json:"every_bars,omitempty" yaml:"every_bars,omitempty"`
-	Anchor          int64  `json:"anchor,omitempty" yaml:"anchor,omitempty"`
-	Phase           int    `json:"phase,omitempty" yaml:"phase,omitempty"`
-	Duration        string `json:"duration,omitempty" yaml:"duration,omitempty"`
-	Calendar        string `json:"calendar,omitempty" yaml:"calendar,omitempty"`
-	CalendarVersion string `json:"calendar_version,omitempty" yaml:"calendar_version,omitempty"`
-	Timezone        string `json:"timezone,omitempty" yaml:"timezone,omitempty"`
+	EveryBars       int     `json:"every_bars,omitempty" yaml:"every_bars,omitempty"`
+	Anchor          int64   `json:"anchor,omitempty" yaml:"anchor,omitempty"`
+	Phase           int     `json:"phase,omitempty" yaml:"phase,omitempty"`
+	Duration        string  `json:"duration,omitempty" yaml:"duration,omitempty"`
+	Calendar        string  `json:"calendar,omitempty" yaml:"calendar,omitempty"`
+	CalendarVersion string  `json:"calendar_version,omitempty" yaml:"calendar_version,omitempty"`
+	Timezone        string  `json:"timezone,omitempty" yaml:"timezone,omitempty"`
+	DriftThreshold  float64 `json:"drift_threshold,omitempty" yaml:"drift_threshold,omitempty"`
 }
 type SelectionConfig struct {
 	LongK              int            `json:"long_k,omitempty" yaml:"long_k,omitempty"`
@@ -33,27 +34,45 @@ type SelectionConfig struct {
 	MissingScores      string         `json:"missing_scores,omitempty" yaml:"missing_scores,omitempty"`
 }
 type HoldingRule struct {
-	MinBars     int    `json:"min_bars,omitempty" yaml:"min_bars,omitempty"`
-	MaxBars     int    `json:"max_bars,omitempty" yaml:"max_bars,omitempty"`
-	MinDuration string `json:"min_duration,omitempty" yaml:"min_duration,omitempty"`
-	MaxDuration string `json:"max_duration,omitempty" yaml:"max_duration,omitempty"`
+	MinBars         int     `json:"min_bars,omitempty" yaml:"min_bars,omitempty"`
+	MaxBars         int     `json:"max_bars,omitempty" yaml:"max_bars,omitempty"`
+	MinDuration     string  `json:"min_duration,omitempty" yaml:"min_duration,omitempty"`
+	MaxDuration     string  `json:"max_duration,omitempty" yaml:"max_duration,omitempty"`
+	StopLossPct     float64 `json:"stop_loss_pct,omitempty" yaml:"stop_loss_pct,omitempty"`
+	TrailingStopPct float64 `json:"trailing_stop_pct,omitempty" yaml:"trailing_stop_pct,omitempty"`
 }
 
 // Pointer overrides distinguish an omitted value from an explicit zero.
 type HoldingOverride struct {
-	MinBars     *int    `json:"min_bars,omitempty" yaml:"min_bars,omitempty"`
-	MaxBars     *int    `json:"max_bars,omitempty" yaml:"max_bars,omitempty"`
-	MinDuration *string `json:"min_duration,omitempty" yaml:"min_duration,omitempty"`
-	MaxDuration *string `json:"max_duration,omitempty" yaml:"max_duration,omitempty"`
+	MinBars         *int     `json:"min_bars,omitempty" yaml:"min_bars,omitempty"`
+	MaxBars         *int     `json:"max_bars,omitempty" yaml:"max_bars,omitempty"`
+	MinDuration     *string  `json:"min_duration,omitempty" yaml:"min_duration,omitempty"`
+	MaxDuration     *string  `json:"max_duration,omitempty" yaml:"max_duration,omitempty"`
+	StopLossPct     *float64 `json:"stop_loss_pct,omitempty" yaml:"stop_loss_pct,omitempty"`
+	TrailingStopPct *float64 `json:"trailing_stop_pct,omitempty" yaml:"trailing_stop_pct,omitempty"`
 }
 type HoldingConfig struct {
-	MinBars      int                        `json:"min_bars,omitempty" yaml:"min_bars,omitempty"`
-	MaxBars      int                        `json:"max_bars,omitempty" yaml:"max_bars,omitempty"`
-	MinDuration  string                     `json:"min_duration,omitempty" yaml:"min_duration,omitempty"`
-	MaxDuration  string                     `json:"max_duration,omitempty" yaml:"max_duration,omitempty"`
-	ByAsset      map[string]HoldingOverride `json:"by_asset,omitempty" yaml:"by_asset,omitempty"`
-	Adopt        string                     `json:"adopt,omitempty" yaml:"adopt,omitempty"`
-	CooldownBars int                        `json:"cooldown_bars,omitempty" yaml:"cooldown_bars,omitempty"`
+	MinBars         int                        `json:"min_bars,omitempty" yaml:"min_bars,omitempty"`
+	MaxBars         int                        `json:"max_bars,omitempty" yaml:"max_bars,omitempty"`
+	MinDuration     string                     `json:"min_duration,omitempty" yaml:"min_duration,omitempty"`
+	MaxDuration     string                     `json:"max_duration,omitempty" yaml:"max_duration,omitempty"`
+	StopLossPct     float64                    `json:"stop_loss_pct,omitempty" yaml:"stop_loss_pct,omitempty"`
+	TrailingStopPct float64                    `json:"trailing_stop_pct,omitempty" yaml:"trailing_stop_pct,omitempty"`
+	ByAsset         map[string]HoldingOverride `json:"by_asset,omitempty" yaml:"by_asset,omitempty"`
+	Adopt           string                     `json:"adopt,omitempty" yaml:"adopt,omitempty"`
+	CooldownBars    int                        `json:"cooldown_bars,omitempty" yaml:"cooldown_bars,omitempty"`
+}
+
+func (h HoldingConfig) HasStopProtection() bool {
+	if h.StopLossPct > 0 || h.TrailingStopPct > 0 {
+		return true
+	}
+	for _, o := range h.ByAsset {
+		if (o.StopLossPct != nil && *o.StopLossPct > 0) || (o.TrailingStopPct != nil && *o.TrailingStopPct > 0) {
+			return true
+		}
+	}
+	return false
 }
 type TransitionRule struct {
 	ExitSteps int     `json:"exit_steps,omitempty" yaml:"exit_steps,omitempty"`
@@ -88,6 +107,7 @@ type AllocationConfig struct {
 	AssetCap         float64            `json:"asset_cap,omitempty" yaml:"asset_cap,omitempty"`
 	GroupCaps        map[string]float64 `json:"group_caps,omitempty" yaml:"group_caps,omitempty"`
 	TurnoverLimit    float64            `json:"turnover_limit,omitempty" yaml:"turnover_limit,omitempty"`
+	DriftThreshold   float64            `json:"drift_threshold,omitempty" yaml:"drift_threshold,omitempty"`
 	NetCap           float64            `json:"net_cap,omitempty" yaml:"net_cap,omitempty"`
 	BetaCap          float64            `json:"beta_cap,omitempty" yaml:"beta_cap,omitempty"`
 }
@@ -129,6 +149,13 @@ type PortfolioPolicyConfig struct {
 	ShortNotional float64          `json:"short_notional"`
 }
 
+func (c PortfolioPolicyConfig) EffectiveDriftThreshold() float64 {
+	if c.Allocation.DriftThreshold > 0 {
+		return c.Allocation.DriftThreshold
+	}
+	return c.Rebalance.DriftThreshold
+}
+
 func ClonePortfolioPolicyConfig(c PortfolioPolicyConfig) PortfolioPolicyConfig {
 	c.PolicyParams = append(json.RawMessage(nil), c.PolicyParams...)
 	if c.Selection.LongMinScore != nil {
@@ -157,6 +184,14 @@ func ClonePortfolioPolicyConfig(c PortfolioPolicyConfig) PortfolioPolicyConfig {
 		if o.MaxDuration != nil {
 			v := *o.MaxDuration
 			o.MaxDuration = &v
+		}
+		if o.StopLossPct != nil {
+			v := *o.StopLossPct
+			o.StopLossPct = &v
+		}
+		if o.TrailingStopPct != nil {
+			v := *o.TrailingStopPct
+			o.TrailingStopPct = &v
 		}
 		c.Holding.ByAsset[name] = o
 	}
@@ -194,6 +229,12 @@ func validateHolding(r HoldingRule) error {
 			return errors.New("factor: minimum holding exceeds maximum")
 		}
 	}
+	if math.IsNaN(r.StopLossPct) || math.IsInf(r.StopLossPct, 0) || r.StopLossPct < 0 || r.StopLossPct >= 1 {
+		return errors.New("factor: stop_loss_pct must be in [0,1)")
+	}
+	if math.IsNaN(r.TrailingStopPct) || math.IsInf(r.TrailingStopPct, 0) || r.TrailingStopPct < 0 || r.TrailingStopPct >= 1 {
+		return errors.New("factor: trailing_stop_pct must be in [0,1)")
+	}
 	return nil
 }
 func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyConfig, error) {
@@ -213,6 +254,9 @@ func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyCon
 	r := &c.Rebalance
 	if r.EveryBars < 0 || r.Phase < 0 {
 		return c, errors.New("factor: negative rebalance interval/phase")
+	}
+	if math.IsNaN(r.DriftThreshold) || math.IsInf(r.DriftThreshold, 0) || r.DriftThreshold < 0 || r.DriftThreshold >= 1 {
+		return c, errors.New("factor: rebalance drift_threshold must be in [0,1)")
 	}
 	count := 0
 	for _, v := range []bool{r.EveryBars > 0, r.Duration != "", r.Calendar != ""} {
@@ -274,7 +318,15 @@ func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyCon
 		return c, errors.New("factor: unknown unfilled slot policy")
 	}
 	h := &c.Holding
-	if err := validateHolding(HoldingRule{h.MinBars, h.MaxBars, h.MinDuration, h.MaxDuration}); err != nil {
+	baseRule := HoldingRule{
+		MinBars:         h.MinBars,
+		MaxBars:         h.MaxBars,
+		MinDuration:     h.MinDuration,
+		MaxDuration:     h.MaxDuration,
+		StopLossPct:     h.StopLossPct,
+		TrailingStopPct: h.TrailingStopPct,
+	}
+	if err := validateHolding(baseRule); err != nil {
 		return c, err
 	}
 	if h.CooldownBars < 0 || h.Adopt != "" && h.Adopt != "adopt" && h.Adopt != "reject" {
@@ -284,7 +336,7 @@ func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyCon
 		if name == "" {
 			return c, errors.New("factor: empty asset override")
 		}
-		rule := HoldingRule{h.MinBars, h.MaxBars, h.MinDuration, h.MaxDuration}
+		rule := baseRule
 		if override.MinBars != nil {
 			rule.MinBars = *override.MinBars
 			rule.MinDuration = ""
@@ -300,6 +352,12 @@ func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyCon
 		if override.MaxDuration != nil {
 			rule.MaxDuration = *override.MaxDuration
 			rule.MaxBars = 0
+		}
+		if override.StopLossPct != nil {
+			rule.StopLossPct = *override.StopLossPct
+		}
+		if override.TrailingStopPct != nil {
+			rule.TrailingStopPct = *override.TrailingStopPct
 		}
 		if override.MinBars != nil && override.MinDuration != nil || override.MaxBars != nil && override.MaxDuration != nil {
 			return c, errors.New("factor: asset override bars and duration conflict")
@@ -420,6 +478,15 @@ func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyCon
 	}
 	if a.ReserveRatio < 0 || a.ReserveRatio >= 1 || a.AssetCap < 0 || a.TurnoverLimit < 0 || a.NetCap < 0 || a.BetaCap < 0 {
 		return c, errors.New("factor: invalid allocation constraints")
+	}
+	if math.IsNaN(a.DriftThreshold) || math.IsInf(a.DriftThreshold, 0) || a.DriftThreshold < 0 || a.DriftThreshold >= 1 {
+		return c, errors.New("factor: allocation drift_threshold must be in [0,1)")
+	}
+	if r.DriftThreshold > 0 && a.DriftThreshold > 0 && r.DriftThreshold != a.DriftThreshold {
+		return c, errors.New("factor: conflicting rebalance and allocation drift_threshold")
+	}
+	if a.DriftThreshold == 0 && r.DriftThreshold > 0 {
+		a.DriftThreshold = r.DriftThreshold
 	}
 	for _, v := range a.GroupCaps {
 		if v < 0 {

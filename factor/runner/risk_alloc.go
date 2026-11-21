@@ -208,8 +208,17 @@ func (p *policyRun) observeSnapshot(c Config, plan *factor.Plan, snapshot *facto
 	sids = slices.Compact(sids)
 	src, tf, fld := candidatePriceField(c, plan)
 	prices := make(map[int32]float64, len(sids))
+	barHigh := make(map[int32]float64, len(sids))
+	barLow := make(map[int32]float64, len(sids))
 	fromSnapshot := make(map[int32]bool, len(sids))
+	planTF := plan.TimeFrame()
 	for _, sid := range sids {
+		if h := snapshot.Numeric(sid, "kline", planTF, "high"); h.Validity == factor.Valid && h.Value > 0 && !math.IsNaN(h.Value) && !math.IsInf(h.Value, 0) {
+			barHigh[sid] = h.Value
+		}
+		if l := snapshot.Numeric(sid, "kline", planTF, "low"); l.Validity == factor.Valid && l.Value > 0 && !math.IsNaN(l.Value) && !math.IsInf(l.Value, 0) {
+			barLow[sid] = l.Value
+		}
 		if src != "" {
 			n := snapshot.Numeric(sid, src, tf, fld)
 			if n.Validity == factor.Valid && n.Value > 0 && !math.IsNaN(n.Value) && !math.IsInf(n.Value, 0) {
@@ -241,6 +250,10 @@ func (p *policyRun) observeSnapshot(c Config, plan *factor.Plan, snapshot *facto
 			}
 		}
 	}
+	p.lastBarGrid = grid
+	p.lastBarClose = maps.Clone(prices)
+	p.lastBarHigh = barHigh
+	p.lastBarLow = barLow
 	p.riskTracker.observePrices(grid, prices)
 }
 
@@ -249,11 +262,22 @@ func (p *policyRun) observeLiveRows(c Config, plan *factor.Plan, rows map[factor
 		return
 	}
 	src, tf, fld := candidatePriceField(c, plan)
+	planTF := plan.TimeFrame()
 	sids := append(append([]int32(nil), c.Snapshot.Universe.Investable...), c.Snapshot.Universe.Reference...)
 	prices := make(map[int32]float64, len(sids))
+	barHigh := make(map[int32]float64, len(sids))
+	barLow := make(map[int32]float64, len(sids))
 	for _, sid := range sids {
 		if _, done := prices[sid]; done {
 			continue
+		}
+		if krow, ok := rows[factor.StreamKey{SID: sid, Source: "kline", TimeFrame: planTF}]; ok && krow.EventTime <= grid && krow.AvailableAt <= cutoff {
+			if h := factor.Number(krow.Series.Values, "high"); h.Validity == factor.Valid && h.Value > 0 && !math.IsNaN(h.Value) && !math.IsInf(h.Value, 0) {
+				barHigh[sid] = h.Value
+			}
+			if l := factor.Number(krow.Series.Values, "low"); l.Validity == factor.Valid && l.Value > 0 && !math.IsNaN(l.Value) && !math.IsInf(l.Value, 0) {
+				barLow[sid] = l.Value
+			}
 		}
 		if src != "" {
 			if row, ok := rows[factor.StreamKey{SID: sid, Source: src, TimeFrame: tf}]; ok && row.EventTime <= grid && row.AvailableAt <= cutoff {
@@ -268,6 +292,10 @@ func (p *policyRun) observeLiveRows(c Config, plan *factor.Plan, rows map[factor
 			prices[sid] = q.Price
 		}
 	}
+	p.lastBarGrid = grid
+	p.lastBarClose = maps.Clone(prices)
+	p.lastBarHigh = barHigh
+	p.lastBarLow = barLow
 	p.riskTracker.observePrices(grid, prices)
 }
 

@@ -193,6 +193,12 @@ func groupByField(operator string, input, field *Node) *Node {
 		return n // Compile reports the missing classification declaration.
 	}
 	spec := field.Spec
+	if spec.Operator == "sector-code" && spec.TimeFrame == n.Spec.TimeFrame && len(field.Inputs) == 0 && field.Evaluate == nil {
+		if operator == "group-demean" {
+			return SectorDemean(input)
+		}
+		return SectorZScore(input)
+	}
 	if spec.SourceTimeFrame == "" {
 		spec.SourceTimeFrame = spec.TimeFrame
 	}
@@ -517,7 +523,8 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 	switch spec.Operator {
 	case "rank", "pct-rank", "zscore", "winsorize", "quantile", "robust-zscore", "mad-winsorize", "cs-mean", "cs-sum":
 		expectedKind = CS
-	case "group-demean", "group-zscore", "residual", "multi-residual", "weighted-residual":
+	case "group-demean", "group-zscore", "residual", "multi-residual", "weighted-residual",
+		"sector-demean", "sector-zscore", "quantile-group-demean", "quantile-group-zscore", "quantile-group-rank", "quantile-group-pct-rank":
 		expectedKind = GROUP
 	}
 	if spec.Kind != expectedKind {
@@ -548,6 +555,9 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 	}
 	if contract, exists := indicatorDefinition(spec.Operator); exists {
 		return validateIndicator(spec, count, contract)
+	}
+	if isSectorOrQuantileOperator(spec.Operator) {
+		return validateSectorOrQuantileNode(spec, count)
 	}
 	if arity, ok := pointwiseArity(spec.Operator); ok {
 		if count != arity {

@@ -14,6 +14,7 @@ type PositionEvidence struct {
 	Quantity          string                 `json:"quantity"`
 	PendingQuantity   string                 `json:"pending_quantity,omitempty"`
 	FirstFillTime     int64                  `json:"first_fill_time,omitempty"`
+	EntryPrice        string                 `json:"entry_price,omitempty"`
 	IncreasingPending bool                   `json:"increasing_pending,omitempty"`
 	PendingUnknown    bool                   `json:"pending_unknown,omitempty"`
 	Quantum           string                 `json:"quantum,omitempty"`
@@ -60,6 +61,9 @@ type PortfolioContext struct {
 	ScoreName              string
 	Positions              map[int32]PositionEvidence
 	Marks                  map[int32]float64
+	BarClose               map[int32]float64
+	BarHigh                map[int32]float64
+	BarLow                 map[int32]float64
 	Groups                 map[int32]string
 	Volatility             map[int32]float64
 	Beta                   map[int32]float64
@@ -125,6 +129,9 @@ func ClonePortfolioContext(c PortfolioContext) PortfolioContext {
 	c.Universe = CloneUniverse(c.Universe)
 	c.Positions = ClonePositionEvidence(c.Positions)
 	c.Marks = maps.Clone(c.Marks)
+	c.BarClose = maps.Clone(c.BarClose)
+	c.BarHigh = maps.Clone(c.BarHigh)
+	c.BarLow = maps.Clone(c.BarLow)
 	c.Groups = maps.Clone(c.Groups)
 	c.Volatility = maps.Clone(c.Volatility)
 	c.Beta = maps.Clone(c.Beta)
@@ -172,6 +179,10 @@ func NewLifecyclePolicy(config PortfolioPolicyConfig) (PortfolioPolicy, error) {
 
 type AssetLifecycle struct {
 	FirstFillTime  int64      `json:"first_fill_time,omitempty"`
+	EntryGrid      int64      `json:"entry_grid,omitempty"`
+	EntryPrice     float64    `json:"entry_price,omitempty"`
+	PeakPrice      float64    `json:"peak_price,omitempty"`
+	RealizedEntry  bool       `json:"realized_entry,omitempty"`
 	Direction      int        `json:"direction"`
 	Exiting        bool       `json:"exiting,omitempty"`
 	ExitStep       int        `json:"exit_step,omitempty"`
@@ -371,7 +382,14 @@ func allocationWeight(a Allocation, c PortfolioContext, sid int32) (float64, err
 }
 func (p *LifecyclePolicy) holding(c PortfolioContext, sid int32) HoldingRule {
 	h := p.config.Holding
-	r := HoldingRule{h.MinBars, h.MaxBars, h.MinDuration, h.MaxDuration}
+	r := HoldingRule{
+		MinBars:         h.MinBars,
+		MaxBars:         h.MaxBars,
+		MinDuration:     h.MinDuration,
+		MaxDuration:     h.MaxDuration,
+		StopLossPct:     h.StopLossPct,
+		TrailingStopPct: h.TrailingStopPct,
+	}
 	if rule, ok := c.HoldingRules[sid]; ok {
 		r = rule
 	}
@@ -391,6 +409,12 @@ func (p *LifecyclePolicy) holding(c PortfolioContext, sid int32) HoldingRule {
 		if o.MaxDuration != nil {
 			r.MaxDuration = *o.MaxDuration
 			r.MaxBars = 0
+		}
+		if o.StopLossPct != nil {
+			r.StopLossPct = *o.StopLossPct
+		}
+		if o.TrailingStopPct != nil {
+			r.TrailingStopPct = *o.TrailingStopPct
 		}
 	}
 	return r
@@ -447,7 +471,7 @@ func pruneReleasedLifecycle(c PortfolioContext, s *LifecycleState) []int32 {
 	}
 	return removed
 }
-func (p *LifecyclePolicy) finish(c PortfolioContext, s LifecycleState, target map[int32]Allocation, reasons []Diagnostic, emit bool) (PortfolioProposal, error) {
+func (p *LifecyclePolicy) finish(c PortfolioContext, s LifecycleState, target map[int32]Allocation, reasons []Diagnostic, emit bool, patchOverride ...bool) (PortfolioProposal, error) {
 	for sid := range s.AssetIdentities {
 		if _, active := s.Assets[sid]; !active {
 			delete(s.AssetIdentities, sid)
@@ -488,7 +512,8 @@ func (p *LifecyclePolicy) finish(c PortfolioContext, s LifecycleState, target ma
 	if emit {
 		spec := c.Spec
 		spec.Mode = Full
-		if c.RiskOnly && p.config.Transition.Mode != "cohort" {
+		usePatch := c.RiskOnly || (len(patchOverride) > 0 && patchOverride[0])
+		if usePatch && p.config.Transition.Mode != "cohort" {
 			spec.Mode = Patch
 		}
 		spec.Diagnostics = append(slices.Clone(spec.Diagnostics), reasons...)
@@ -598,6 +623,29 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 			}
 		}
 	}
+	for _, sid := range mapSIDs(s.Assets) {
+		a := s.Assets[sid]
+		if a == nil || a.Last.Value != "0" {
+			continue
+		}
+		e := c.Positions[sid]
+		q, errQ := positionQuantity(e)
+		pending, errP := pendingQuantity(e)
+		if errQ == nil && errP == nil && q == 0 && pending == 0 && !e.PendingUnknown && !e.IncreasingPending {
+			a.FirstFillTime = 0
+			a.EntryGrid = 0
+			a.EntryPrice = 0
+			a.PeakPrice = 0
+			a.RealizedEntry = false
+			a.Direction = 0
+			a.Exiting = false
+			a.ExitStep = 0
+			a.Forced = false
+			a.Paused = false
+			a.AnchorQuantity = ""
+			a.AnchorWeight = 0
+		}
+	}
 	for _, sid := range mapSIDs(c.Positions) {
 		e := c.Positions[sid]
 		q, err := positionQuantity(e)
@@ -632,6 +680,55 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 		if a.Direction == 0 {
 			a.Direction = signed(q)
 		}
+		if q != 0 {
+			if e.EntryPrice != "" {
+				if ep, epErr := decimalFloat(e.EntryPrice); epErr == nil && ep > 0 {
+					if !a.RealizedEntry || a.EntryPrice <= 0 {
+						a.EntryPrice = ep
+						a.PeakPrice = ep
+						a.RealizedEntry = true
+					} else if math.Abs(ep-a.EntryPrice) > 1e-12 {
+						a.EntryPrice = ep
+						if a.Direction > 0 && ep > a.PeakPrice {
+							a.PeakPrice = ep
+						} else if a.Direction < 0 && (a.PeakPrice <= 0 || ep < a.PeakPrice) {
+							a.PeakPrice = ep
+						}
+					}
+				}
+			} else if a.EntryPrice <= 0 {
+				ref := c.BarClose[sid]
+				if ref <= 0 {
+					ref = c.Marks[sid]
+				}
+				if ref > 0 {
+					a.EntryPrice = ref
+					a.PeakPrice = ref
+				}
+			}
+		}
+	}
+	investable := map[int32]bool{}
+	for _, sid := range c.Universe.Investable {
+		investable[sid] = true
+	}
+	stopReasons := map[int32]Diagnostic{}
+	cooldownSIDs := map[int32]bool{}
+	for _, sid := range mapSIDs(s.Assets) {
+		a := s.Assets[sid]
+		if a == nil {
+			continue
+		}
+		if c.GridTime < a.CooldownUntil {
+			cooldownSIDs[sid] = true
+		}
+		e := c.Positions[sid]
+		q, _ := positionQuantity(e)
+		h := p.holding(c, sid)
+		if code, detail := p.evaluateAssetStop(c, sid, a, q, h); code != "" {
+			stopReasons[sid] = Diagnostic{code, detail}
+			cooldownSIDs[sid] = true
+		}
 	}
 	if p.config.Transition.Mode == "cohort" {
 		return p.proposeCohort(c, s, due, round)
@@ -644,7 +741,7 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 	} else if c.Ideal != nil {
 		desired = c.Ideal.Targets()
 	} else {
-		ideal, diag, e := SelectPortfolioScore(c.Frame, c.Universe, c.Spec, cfg, c.ScoreName, c.Groups)
+		ideal, diag, e := SelectPortfolioScoreCooldown(c.Frame, c.Universe, c.Spec, cfg, c.ScoreName, c.Groups, cooldownSIDs)
 		if e != nil {
 			return PortfolioProposal{}, e
 		}
@@ -684,10 +781,6 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 	}
 	hard := map[int32]bool{}
 	protected := map[int32]bool{}
-	investable := map[int32]bool{}
-	for _, sid := range c.Universe.Investable {
-		investable[sid] = true
-	}
 	for _, sid := range mapSIDs(s.Assets) {
 		a := s.Assets[sid]
 		e := c.Positions[sid]
@@ -698,10 +791,15 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 		}
 		h := p.holding(c, sid)
 		maximum := holdingMillis(h.MaxBars, h.MaxDuration, c.BarMillis)
-		forced := c.ForceExit[sid] != "" || !investable[sid] || maximum > 0 && a.FirstFillTime > 0 && age >= maximum
+		stopDiag, stopped := stopReasons[sid]
+		forced := stopped || c.ForceExit[sid] != "" || !investable[sid] || maximum > 0 && a.FirstFillTime > 0 && age >= maximum
 		if forced {
 			if !a.Forced {
-				a.CooldownUntil = c.GridTime + int64(p.config.Holding.CooldownBars+1)*c.BarMillis
+				if p.config.Holding.CooldownBars > 0 {
+					a.CooldownUntil = c.GridTime + int64(p.config.Holding.CooldownBars+1)*c.BarMillis
+				} else {
+					a.CooldownUntil = c.GridTime
+				}
 			}
 			a.Forced = true
 			a.Exiting = true
@@ -709,7 +807,11 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 			targets[sid] = a.Last
 			delete(desired, sid)
 			hard[sid] = true
-			reasons = append(reasons, Diagnostic{"forced-exit", fmt.Sprintf("SID %d: risk, universe removal or maximum age", sid)})
+			if stopped {
+				reasons = append(reasons, stopDiag)
+			} else {
+				reasons = append(reasons, Diagnostic{"forced-exit", fmt.Sprintf("SID %d: risk, universe removal or maximum age", sid)})
+			}
 			continue
 		}
 		if a.Forced && (q != 0 || e.PendingUnknown) {
@@ -893,7 +995,8 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 		s.LastRound = round
 		s.HasRound = true
 	}
-	if c.RiskOnly {
+	offScheduleHardOnly := !(due && selectionValid) && len(hard) > 0
+	if c.RiskOnly || offScheduleHardOnly {
 		riskTargets := map[int32]Allocation{}
 		for sid := range hard {
 			riskTargets[sid] = targets[sid]
@@ -904,17 +1007,125 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 		if err := p.constrain(c, s, targets, hard, &reasons, cfg); err != nil {
 			return PortfolioProposal{}, err
 		}
+		if due && selectionValid {
+			p.applyDriftThreshold(c, targets, hard, &reasons, cfg)
+		}
 		for sid, a := range targets {
 			life := s.Assets[sid]
+			val := mustQuantity(a.Value)
+			newDir := signed(val)
 			if life == nil {
-				value := mustQuantity(a.Value)
-				life = &AssetLifecycle{Direction: signed(value)}
+				life = &AssetLifecycle{Direction: newDir}
 				s.Assets[sid] = life
+			}
+			if newDir != 0 && (life.Direction == 0 || life.EntryPrice <= 0) {
+				life.Direction = newDir
+				life.EntryGrid = c.GridTime
+				ref := c.BarClose[sid]
+				if ref <= 0 {
+					ref = c.Marks[sid]
+				}
+				if ref > 0 {
+					life.EntryPrice = ref
+					life.PeakPrice = ref
+					life.RealizedEntry = false
+				}
 			}
 			life.Last = a
 		}
 	}
-	return p.finish(c, s, targets, reasons, emit)
+	return p.finish(c, s, targets, reasons, emit, offScheduleHardOnly)
+}
+
+func (p *LifecyclePolicy) evaluateAssetStop(c PortfolioContext, sid int32, a *AssetLifecycle, q float64, h HoldingRule) (string, string) {
+	if q == 0 || a.Direction == 0 || signed(q) != a.Direction || a.Forced {
+		return "", ""
+	}
+	postEntry := (a.FirstFillTime > 0 && a.FirstFillTime < c.GridTime) || (a.EntryGrid > 0 && c.GridTime > a.EntryGrid)
+	if !postEntry || a.EntryPrice <= 0 {
+		return "", ""
+	}
+	curPrice := c.BarClose[sid]
+	if curPrice <= 0 {
+		curPrice = c.Marks[sid]
+	}
+	if curPrice <= 0 || math.IsNaN(curPrice) || math.IsInf(curPrice, 0) {
+		return "", ""
+	}
+	if a.PeakPrice <= 0 {
+		a.PeakPrice = a.EntryPrice
+	}
+	useBarExtreme := false
+	if a.FirstFillTime > 0 {
+		useBarExtreme = a.FirstFillTime <= c.GridTime-c.BarMillis
+	} else if a.EntryGrid > 0 {
+		useBarExtreme = c.GridTime-c.BarMillis >= a.EntryGrid
+	}
+	if a.Direction > 0 {
+		fav := curPrice
+		if useBarExtreme && c.BarHigh[sid] > fav && !math.IsNaN(c.BarHigh[sid]) && !math.IsInf(c.BarHigh[sid], 0) {
+			fav = c.BarHigh[sid]
+		}
+		if fav > a.PeakPrice {
+			a.PeakPrice = fav
+		}
+		if h.StopLossPct > 0 && (a.EntryPrice-curPrice)/a.EntryPrice >= h.StopLossPct-1e-12 {
+			return "stop-loss-exit", fmt.Sprintf("SID %d long stop-loss: entry=%.6g price=%.6g", sid, a.EntryPrice, curPrice)
+		}
+		if h.TrailingStopPct > 0 && a.PeakPrice > 0 && (a.PeakPrice-curPrice)/a.PeakPrice >= h.TrailingStopPct-1e-12 {
+			return "trailing-stop-exit", fmt.Sprintf("SID %d long trailing-stop: peak=%.6g price=%.6g", sid, a.PeakPrice, curPrice)
+		}
+	} else {
+		fav := curPrice
+		if useBarExtreme && c.BarLow[sid] > 0 && c.BarLow[sid] < fav && !math.IsNaN(c.BarLow[sid]) && !math.IsInf(c.BarLow[sid], 0) {
+			fav = c.BarLow[sid]
+		}
+		if fav < a.PeakPrice {
+			a.PeakPrice = fav
+		}
+		if h.StopLossPct > 0 && (curPrice-a.EntryPrice)/a.EntryPrice >= h.StopLossPct-1e-12 {
+			return "stop-loss-exit", fmt.Sprintf("SID %d short stop-loss: entry=%.6g price=%.6g", sid, a.EntryPrice, curPrice)
+		}
+		if h.TrailingStopPct > 0 && a.PeakPrice > 0 && (curPrice-a.PeakPrice)/a.PeakPrice >= h.TrailingStopPct-1e-12 {
+			return "trailing-stop-exit", fmt.Sprintf("SID %d short trailing-stop: trough=%.6g price=%.6g", sid, a.PeakPrice, curPrice)
+		}
+	}
+	return "", ""
+}
+
+func (p *LifecyclePolicy) applyDriftThreshold(c PortfolioContext, targets map[int32]Allocation, hard map[int32]bool, reasons *[]Diagnostic, cfg PortfolioPolicyConfig) {
+	drift := cfg.EffectiveDriftThreshold()
+	if drift <= 0 || c.Spec.Budget.NAV <= 0 {
+		return
+	}
+	for _, sid := range mapSIDs(targets) {
+		if hard[sid] {
+			continue
+		}
+		a := targets[sid]
+		if a.Basis != NAVFraction || a.Value == "0" {
+			continue
+		}
+		wTarget, err := decimalFloat(a.Value)
+		if err != nil || wTarget == 0 {
+			continue
+		}
+		e := c.Positions[sid]
+		curQty, qErr := positionQuantity(e)
+		pendingQty, pErr := pendingQuantity(e)
+		mark := c.Marks[sid]
+		if qErr != nil || pErr != nil || curQty == 0 || pendingQty != 0 || e.PendingUnknown || e.IncreasingPending || mark <= 0 {
+			continue
+		}
+		wCur := curQty * mark / c.Spec.Budget.NAV
+		if wCur*wTarget > 0 && math.Abs(wTarget-wCur) < drift {
+			canonQty, cErr := CanonicalDecimal(e.Quantity)
+			if cErr == nil && canonQty != "0" {
+				targets[sid] = Allocation{AbsoluteQuantity, canonQty}
+				*reasons = append(*reasons, Diagnostic{"drift-buffer", fmt.Sprintf("SID %d |%.6g - %.6g| < %.6g preserves held units", sid, wTarget, wCur, drift)})
+			}
+		}
+	}
 }
 func mustQuantity(value string) float64 {
 	if value == "" {

@@ -41,6 +41,7 @@ type AccountSink struct {
 	Clock                           func() int64
 	AuthoritativeFunding            bool
 	QuoteTTLMS                      int64
+	DriftThreshold                  float64
 	observed                        map[string]execution.VisibleQuote
 	marks                           map[string]decimal.Decimal
 	previous                        *factor.TargetPortfolio
@@ -206,6 +207,25 @@ func (s *AccountSink) ProcessSnapshot(ctx context.Context, p *factor.TargetPortf
 		sids = append(sids, sid)
 	}
 	sort.Slice(sids, func(i, j int) bool { return sids[i] < sids[j] })
+	var heldSteps map[int32]int64
+	var driftValNAV float64
+	if s.DriftThreshold > 0 && sp.Budget.NAV > 0 {
+		driftValNAV = sp.Budget.NAV
+		if snap, snapErr := s.application().Snapshot(ctx); snapErr == nil {
+			heldSteps = map[int32]int64{}
+			byID := map[string]int32{}
+			for sid, inst := range s.Instruments {
+				byID[inst.ID] = sid
+			}
+			for _, lot := range snap.Lots {
+				if lot.Strategy == execution.StrategyID(s.StrategyID) {
+					if sid, ok := byID[lot.Instrument.ID]; ok {
+						heldSteps[sid] += lot.SignedSteps
+					}
+				}
+			}
+		}
+	}
 	for _, sid := range sids {
 		i, ok := s.Instruments[sid]
 		if !ok || i.SettlementCurrency != s.Currency {
@@ -251,10 +271,20 @@ func (s *AccountSink) ProcessSnapshot(ctx context.Context, p *factor.TargetPortf
 			}
 			request.DecisionMS = now
 		}
-		qty := decimal.NewFromFloat(targetsToExecute[sid]).Mul(decimal.NewFromFloat(sp.Budget.NAV)).Div(price).Div(i.ContractSize)
+		wTarget := targetsToExecute[sid]
+		qty := decimal.NewFromFloat(wTarget).Mul(decimal.NewFromFloat(sp.Budget.NAV)).Div(price).Div(i.ContractSize)
 		steps, err := execution.QuantitySteps(qty, i.QuantityStep)
 		if err != nil {
 			return err
+		}
+		if heldSteps != nil && wTarget != 0 {
+			if curSteps := heldSteps[sid]; curSteps != 0 {
+				curQty := decimal.NewFromInt(curSteps).Mul(i.QuantityStep).Mul(i.ContractSize).InexactFloat64()
+				wCur := curQty * price.InexactFloat64() / driftValNAV
+				if wCur*wTarget > 0 && math.Abs(wTarget-wCur) < s.DriftThreshold {
+					steps = curSteps
+				}
+			}
 		}
 		request.Requests = append(request.Requests, execution.InstrumentRebalance{Instrument: i, Targets: []execution.ExecutableTarget{{Strategy: execution.StrategyID(s.StrategyID), Lot: execution.VirtualLotID(fmt.Sprintf("factor:%d", sid)), SignedSteps: steps}}, Quote: visible})
 	}

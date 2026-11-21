@@ -338,6 +338,9 @@ func (s *Session) evaluateTS(node compiledNode, asset *assetState, sid int32, sn
 	if node.spec.Operator == opRefField {
 		return snapshot.RefNumeric(node.spec.RefSymbol, node.spec.Source, node.spec.SourceTimeFrame, node.spec.Field)
 	}
+	if node.spec.Operator == "sector-code" {
+		return evaluateSectorCode(snapshot, sid)
+	}
 	inputs := make([]Numeric, len(node.inputs))
 	for i, index := range node.inputs {
 		inputs[i] = columns[index][sid]

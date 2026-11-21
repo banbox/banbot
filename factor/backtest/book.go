@@ -28,6 +28,8 @@ type Book struct {
 	fundingIDs                              map[string]bool
 	previousAllocation                      *factor.PortfolioTarget
 	firstFill                               map[int32]int64
+	entryPrices                             map[int32]float64
+	driftThreshold                          float64
 	policyState                             json.RawMessage
 	stateVersion, ledgerCursor              uint64
 	policySequence                          uint64
@@ -56,7 +58,7 @@ func NewBook(nav float64) (*Book, error) {
 	if nav <= 0 || !finite(nav) {
 		return nil, errors.New("backtest: invalid initial strategy NAV")
 	}
-	return &Book{initNAV: nav, cash: nav, spots: map[int32]bool{}, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingMarked: map[int32]int64{}, fundingBilled: map[int32]int64{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
+	return &Book{initNAV: nav, cash: nav, spots: map[int32]bool{}, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingMarked: map[int32]int64{}, fundingBilled: map[int32]int64{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, entryPrices: map[int32]float64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
 }
 
 // SetSpotSIDs marks SIDs whose valuation contract is unleveraged spot: short
@@ -78,6 +80,53 @@ func (b *Book) SetSpotSIDs(sids ...int32) {
 // IsSpot reports whether sid is registered as an unleveraged spot instrument.
 func (b *Book) IsSpot(sid int32) bool {
 	return b != nil && b.spots[sid]
+}
+
+// SetDriftThreshold configures the no-trade mark-to-market weight buffer [0, 1).
+// When both current weight w_cur and target weight w_target are non-zero with the
+// same sign and |w_target - w_cur| < d, held units are preserved without trading.
+// Zero (default) disables buffering.
+func (b *Book) SetDriftThreshold(d float64) {
+	if d > 0 && d < 1 && finite(d) {
+		b.driftThreshold = d
+	} else {
+		b.driftThreshold = 0
+	}
+}
+
+func (b *Book) DriftThreshold() float64 { return b.driftThreshold }
+
+func (b *Book) executionValuationNAV(quotes map[int32]Quote, fallback float64) float64 {
+	nav := b.cash
+	for sid, qty := range b.quantities {
+		if qty == 0 {
+			continue
+		}
+		price := b.marks[sid].Price
+		if q, ok := quotes[sid]; ok && q.Price > 0 && finite(q.Price) {
+			price = q.Price
+		}
+		if price <= 0 || !finite(price) {
+			return fallback
+		}
+		nav += qty * price
+	}
+	if nav <= 0 || !finite(nav) {
+		return fallback
+	}
+	return nav
+}
+
+func (b *Book) withinDriftBand(sid int32, targetWeight, price, nav float64) bool {
+	if b.driftThreshold <= 0 || targetWeight == 0 || price <= 0 || nav <= 0 {
+		return false
+	}
+	curQty := b.quantities[sid]
+	if curQty == 0 || curQty*targetWeight <= 0 {
+		return false
+	}
+	wCur := curQty * price / nav
+	return wCur*targetWeight > 0 && math.Abs(targetWeight-wCur) < b.driftThreshold
 }
 func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	if _, ok := b.terminals[sid]; ok {
@@ -157,6 +206,7 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 			return errors.New("backtest: unrepresentable executable quantity")
 		}
 	}
+	valNAV := b.executionValuationNAV(quotes, spec.Budget.NAV)
 	for _, sid := range sortedKeys(targets) {
 		w := targets[sid]
 		if done, err := b.TerminalQuoteExempt(sid, w == 0); err != nil {
@@ -167,6 +217,9 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 		q := quotes[sid]
 		b.attrRevalue(sid, q.Price)
 		qty := w * spec.Budget.NAV / q.Price
+		if b.withinDriftBand(sid, w, q.Price, valNAV) {
+			qty = b.quantities[sid]
+		}
 		delta := qty - b.quantities[sid]
 		price := q.Price
 		if delta > 0 {
@@ -181,7 +234,7 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 		b.slippage += math.Abs(delta * (price - q.Price))
 		b.turnover += notional
 		b.attr.trade(sid, b.quantities[sid], qty, q.Price, cost, math.Abs(delta*(price-q.Price)))
-		b.recordFirstFill(sid, qty, q.AtMS)
+		b.recordFirstFill(sid, qty, q.AtMS, q.Price)
 		b.quantities[sid] = qty
 		b.marks[sid] = q
 	}
@@ -239,6 +292,7 @@ func (b *Book) Liquidate() float64 {
 		b.attrRevalue(sid, b.marks[sid].Price)
 	}
 	b.quantities = map[int32]float64{}
+	b.entryPrices = map[int32]float64{}
 	b.cash = 0
 	b.liquidated = true
 	return before

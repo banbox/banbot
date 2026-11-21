@@ -93,7 +93,20 @@ func (d PortfolioDefinition) PolicyConfig() (factor.PortfolioPolicyConfig, error
 	if c.Allocation.AssetCap == 0 && d.AssetCap > 0 {
 		c.Allocation.AssetCap = d.AssetCap
 	}
+	if c.Allocation.DriftThreshold == 0 && c.Rebalance.DriftThreshold == 0 && d.DriftThreshold > 0 {
+		c.Allocation.DriftThreshold = d.DriftThreshold
+	}
 	return factor.NormalizePortfolioPolicyConfig(c)
+}
+
+func (d PortfolioDefinition) EffectiveDriftThreshold() float64 {
+	if d.Allocation != nil && d.Allocation.DriftThreshold > 0 {
+		return d.Allocation.DriftThreshold
+	}
+	if d.Rebalance != nil && d.Rebalance.DriftThreshold > 0 {
+		return d.Rebalance.DriftThreshold
+	}
+	return d.DriftThreshold
 }
 
 func (d PortfolioDefinition) ValidatePolicy() error {
@@ -113,6 +126,9 @@ func (d PortfolioDefinition) ValidatePolicy() error {
 		if _, err := factor.NormalizeRollingUniverseConfig(*d.Universe); err != nil {
 			return err
 		}
+	}
+	if d.DriftThreshold < 0 || d.DriftThreshold >= 1 || math.IsNaN(d.DriftThreshold) || math.IsInf(d.DriftThreshold, 0) {
+		return errors.New("research: portfolio drift_threshold must be in [0,1)")
 	}
 	if d.EffectivePolicy() == "" {
 		if d.PolicyParams != nil {

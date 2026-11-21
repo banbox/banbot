@@ -46,7 +46,7 @@ target-step 对新旧资产统一插值，新资产从零权重开始。例如�
 
 quantity 锚定退出开始时的已确认标准资产数量并向零取整；价格和 NAV 上涨不会补回退出仓，外部风险已减得更低时继续保持更低数量。weight 锚定权重，每轮乘最新冻结 NAV，可能因净值变化形成数量回补。第 N 个线性目标显式为零；最低交易额、在途和部分成交可能延迟真正清仓。
 
-`holding.max_bars/max_duration` 在到期后第一个监控网格直接形成零目标，绕过调仓门与普通退出曲线；想“满期后才开始渐退”使用 min。缺 score 不推进普通退出步骤，但仍检查最大期限和批次到期。反手默认等待原方向实际归零，未知在途不被当作已释放资金。
+`holding.max_bars/max_duration` 在到期后第一个监控网格直接形成零目标，绕过调仓门与普通退出曲线；想“满期后才开始渐退”使用 min。`holding.stop_loss_pct`（如 `0.08` 表示建仓后不利变动 8% 止损）与 `holding.trailing_stop_pct`（如 `0.12` 表示建仓后相对可见有利极值 `high`/`low`/`close` 回撤 12% 追踪止盈，严格排除建仓决策当根 K 线极值以消除同根前视）在每个决策网格（含 `every_bars > 1` 的非调仓步）逐持仓检查：触发标的立即形成零目标（非调仓步以 `Patch` 模式仅平仓触发标的，其余持仓自然随市价漂移、零换手零手续费），并按 `holding.cooldown_bars` 冻结后续 `N` 根决策 bar 禁止重入该标的。`drift_threshold`（`[0, 1)`，可配在 `portfolio.drift_threshold`、`rebalance.drift_threshold` 或 `allocation.drift_threshold`）提供免调仓权重漂移缓冲带：当现有市值权重 `w_cur` 与目标权重 `w_target` 同号非零且 `|w_target - w_cur| < drift_threshold` 时保留精确持仓数量，不产生微调手续费，而清仓（`w_target == 0`）、方向翻转与新开仓始终正常执行。缺 score 不推进普通退出步骤，但仍检查最大期限、止损/追踪止盈和批次到期。反手默认等待原方向实际归零，未知在途不被当作已释放资金。
 
 重入可用 `on_reselect: restore|resume|finish|new-cohort`；默认 restore 补回理想份额，resume 保留当前较小份额，finish 继续原退出。持仓清零后再次入场建立新生命周期；加仓不重置首次成交年龄。
 
@@ -79,10 +79,12 @@ Weights 回测的 `Result.Attribution` 把 NAV 变化拆为多头腿盈亏、空
 holding:
   min_bars: 16
   max_bars: 48
+  stop_loss_pct: 0.08
+  trailing_stop_pct: 0.12
   cooldown_bars: 2
   by_asset:
-    'BTC/USDT:USDT': {min_bars: 24}
-    'FAST/USDT:USDT': {min_bars: 4, max_bars: 12}
+    'BTC/USDT:USDT': {min_bars: 24, trailing_stop_pct: 0}
+    'FAST/USDT:USDT': {min_bars: 4, max_bars: 12, stop_loss_pct: 0.05}
 transition:
   mode: linear-exit
   basis: quantity
