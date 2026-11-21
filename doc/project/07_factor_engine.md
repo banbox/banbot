@@ -29,8 +29,9 @@
 | `session.go` | 有状态增量计算 `Session`（`NewSession`、`Warmup`、`Evaluate`、`fork`/`commit`）；`Frame` |
 | `batch.go` | `Plan.Batch` 整段历史计算；静态 universe 走 `banta/tav`，动态 universe 退化为 `Session` |
 | `value.go` | `Numeric`（值 + `Validity`）、`Number()`、`contentHash`（按位哈希，`-0` 与 `+0` 不同；`map[string]any` 标量行走无 fmt 的快速编码，输出字节与反射路径一致）、`cloneValues`（标量行直接拷贝 map，其余走反射深拷贝） |
-| `operators.go` | 截面算子：rank、zscore、robust-zscore、winsorize、quantile、group 系列、residual |
-| `indicators.go` / `indicators_runtime.go` | 技术指标声明、参数校验、lookback；增量与批量实现（含 RSI 的 Wilder 状态） |
+| `pointwise.go` | 逐点算子：算术、`sign`、`clip`、比较（`gt`/`ge`/`lt`/`le`）与条件选择 `where`（`cond` 有效时仅要求被选中的分支有效） |
+| `operators.go` | 截面算子：rank、pct-rank（`[0, 1]` 归一化，`M == 1` 为 `0.5`）、zscore、robust-zscore、winsorize、quantile、group 系列、residual |
+| `indicators.go` / `indicators_runtime.go` / `rolling.go` | 技术指标与时序滚动统计算子（`ts-corr`/`ts-cov`/`ts-beta`/`ts-sum`/`ts-product`/`ts-rank`/`ts-zscore`/`ts-argmax`/`ts-argmin`/`ts-skew`/`ts-kurt`/`ts-slope`/`ts-rsquare`、`DecayLinear` 复用 `WMA`）声明、参数校验、lookback、增量与批量实现（含 RSI 的 Wilder 状态） |
 | `snapshot.go` | `Universe`、`SnapshotSpec`、`Freeze` 冻结输入（PIT 视图）、`Requirement`/`StreamKey`/`SnapshotStatus` |
 | `allocation.go` | `PortfolioTarget`、`Allocation`；十进制精确数量运算（`big.Rat`）、默认量子 1e-18 |
 | `portfolio.go` | `PortfolioSpec`、`FrozenBudget`、`TargetPortfolio`（Full/Patch 生效目标）、`TopBottomK*` |
@@ -48,7 +49,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `parser.go` | `text/scanner` 词法 + 递归下降解析为 AST；定义上限常量（maxText/maxNodes/maxDepth/maxWindow/maxDefinitions，约 `parser.go:11-18`） |
+| `parser.go` | `text/scanner` 词法 + 递归下降解析为 AST（支持算术 `+ - * /` 与比较 `> >= < <=`）；定义上限常量（maxText/maxNodes/maxDepth/maxWindow/maxDefinitions，约 `parser.go:11-18`） |
 | `compile.go` | `Spec`/`Binding`/`compiler`；名称绑定、参数检查、`lower` 为 `factor.Node`；每个定义先单独 `factor.Compile` 校验，再整体编译 |
 
 ### factor/backtest（回测账本）
@@ -283,12 +284,12 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 
 ### 新增原子算子或函数（表达式可用）
 
-1. `factor/dag.go` 或 `factor/operators.go` 增加节点 builder，并实现 `validateNode` 分支。
-2. `factor/operators.go`（截面）或 `factor/indicators.go` + `indicators_runtime.go`（指标）补齐 **Session 增量** 与 **Batch 整段** 两条实现，两条路径必须语义一致。
-3. `factor/expr/compile.go`：在 `arities` 表（约 `:334`）加名字，并在 `call` 显式分支（`:386-436`）或 `indicatorCall` 中处理；指标类还需同步三处：指标名单（`:470-482`）、参数规则（`:501-516`）、switch（`:523-578`）。
-4. 若修改了语义，升级 `dag.go:55` 或 `indicators.go:13` 的版本常量，否则 CSE 与历史计划哈希会误合并。
+1. `factor/dag.go`、`factor/pointwise.go` 或 `factor/operators.go` 增加节点 builder，并实现 `validateNode` 分支。
+2. `factor/pointwise.go`（逐点）、`factor/operators.go`（截面）或 `factor/indicators.go` + `indicators_runtime.go` + `rolling.go`（指标与滚动统计）补齐 **Session 增量** 与 **Batch 整段** 两条实现，两条路径必须语义一致。
+3. `factor/expr/compile.go`：在 `arities` 表加名字并在 `call` 显式分支中处理，或在 `indicatorCall` 中同步三处（指标名单与最小窗口、参数规则、switch）。
+4. 若修改了既有算子语义，升级 `dag.go:55` 或 `indicators.go:13` 的版本常量，否则 CSE 与历史计划哈希会误合并。
 
-易踩坑：只加 `arities` 而漏写分支，会落入 `compile.go:448` 的 default 被当作 `ts.std` 静默编译。窗口上限有两套常量（`expr/compile.go:17` 的 `maxWindow` 与 `factor.MaxIndicatorPeriod`），需保持一致。
+易踩坑：窗口上限有两套常量（`expr/parser.go` 的 `maxWindow` 与 `factor.MaxIndicatorPeriod`），需保持一致；带更高最小窗口的统计量（如 `ts.skew` ≥ 3、`ts.kurt` ≥ 4）须在 `validateIndicator` 与 `expr/compile.go` 同步校验。
 
 ### 新增 Custom 节点
 

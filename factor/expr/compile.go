@@ -301,7 +301,7 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 			return factor.Neg(n), nil
 		}
 		return n, nil
-	case '+', '-', '*', '/':
+	case '+', '-', '*', '/', '>', '<', tokGe, tokLe:
 		a, err := c.lower(path, e.args[0])
 		if err != nil {
 			return nil, err
@@ -317,8 +317,16 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 			return factor.Sub(a, b), nil
 		case '*':
 			return factor.Mul(a, b), nil
-		default:
+		case '/':
 			return factor.Div(a, b), nil
+		case '>':
+			return factor.Gt(a, b), nil
+		case '<':
+			return factor.Lt(a, b), nil
+		case tokGe:
+			return factor.Ge(a, b), nil
+		default:
+			return factor.Le(a, b), nil
 		}
 	case 'c':
 		return c.call(path, e)
@@ -331,7 +339,15 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	if n, handled, err := c.indicatorCall(path, e); handled {
 		return n, err
 	}
-	arities := map[string]int{"field": 2, "positive": 1, "abs": 1, "log": 1, "sqrt": 1, "pow": 2, "min": 2, "max": 2, "ts.lag": 2, "ts.return": 2, "ts.ema": 2, "ts.std": 3, "cs.rank": 1, "cs.zscore": 1, "cs.robust_zscore": 1, "cs.mad_winsorize": 2, "cs.winsorize": 2, "cs.quantile": 2, "group.residual": 2, "group.demean": 3, "group.zscore": 3}
+	arities := map[string]int{
+		"field": 2, "positive": 1, "sign": 1, "clip": 3,
+		"abs": 1, "log": 1, "sqrt": 1, "pow": 2, "min": 2, "max": 2,
+		"gt": 2, "ge": 2, "lt": 2, "le": 2, "where": 3, "if_else": 3,
+		"ts.lag": 2, "ts.return": 2, "ts.ema": 2, "ts.std": 3,
+		"cs.rank": 1, "cs.pct_rank": 1, "cs.zscore": 1, "cs.robust_zscore": 1,
+		"cs.mad_winsorize": 2, "cs.winsorize": 2, "cs.quantile": 2,
+		"group.residual": 2, "group.demean": 3, "group.zscore": 3,
+	}
 	if e.text == "group.ols" || e.text == "group.wls" {
 		minimum := 2
 		if e.text == "group.wls" {
@@ -386,6 +402,8 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	switch e.text {
 	case "positive":
 		return factor.Positive(a), nil
+	case "sign":
+		return factor.Sign(a), nil
 	case "abs":
 		return factor.Abs(a), nil
 	case "log":
@@ -394,11 +412,36 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 		return factor.Sqrt(a), nil
 	case "cs.rank":
 		return factor.Rank(a), nil
+	case "cs.pct_rank":
+		return factor.PctRank(a), nil
 	case "cs.zscore":
 		return factor.ZScore(a), nil
 	case "cs.robust_zscore":
 		return factor.RobustZScore(a), nil
-	case "pow", "min", "max", "group.residual":
+	case "clip":
+		lo, err := c.number(path, e.args[1])
+		if err != nil {
+			return nil, err
+		}
+		hi, err := c.number(path, e.args[2])
+		if err != nil {
+			return nil, err
+		}
+		if lo > hi {
+			return nil, c.error(path, e.args[1], "clip requires lo <= hi")
+		}
+		return factor.Clip(a, lo, hi), nil
+	case "where", "if_else":
+		b, err := c.lower(path, e.args[1])
+		if err != nil {
+			return nil, err
+		}
+		d, err := c.lower(path, e.args[2])
+		if err != nil {
+			return nil, err
+		}
+		return factor.Where(a, b, d), nil
+	case "pow", "min", "max", "gt", "ge", "lt", "le", "group.residual":
 		b, err := c.lower(path, e.args[1])
 		if err != nil {
 			return nil, err
@@ -410,6 +453,14 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 			return factor.Min(a, b), nil
 		case "max":
 			return factor.Max(a, b), nil
+		case "gt":
+			return factor.Gt(a, b), nil
+		case "ge":
+			return factor.Ge(a, b), nil
+		case "lt":
+			return factor.Lt(a, b), nil
+		case "le":
+			return factor.Le(a, b), nil
 		default:
 			return factor.Residual(a, b), nil
 		}
@@ -452,7 +503,7 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 		return factor.Return(a, period), nil
 	case "ts.ema":
 		return factor.EMA(a, period), nil
-	default:
+	case "ts.std":
 		ddof, err := c.number(path, e.args[2])
 		if err != nil {
 			return nil, err
@@ -461,14 +512,21 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 			return nil, c.error(path, e.args[2], "ddof must be an integer in [0,window)")
 		}
 		return factor.StdDev(a, period, int(ddof)), nil
+	default:
+		return nil, c.error(path, e, "unknown function %q", e.text)
 	}
 }
 
 func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool, error) {
-	inputCount, parameterCount := 1, 1
+	inputCount, parameterCount, minPeriod := 1, 1, 1
 	switch e.text {
-	case "ts.sma", "ts.rma", "ts.wma", "ts.rsi", "ts.roc", "ts.mom", "ts.cci", "ts.highest", "ts.lowest":
-	case "ts.vwma":
+	case "ts.sma", "ts.rma", "ts.wma", "ts.decay_linear", "ts.rsi", "ts.roc", "ts.mom", "ts.cci", "ts.highest", "ts.lowest",
+		"ts.sum", "ts.product", "ts.rank", "ts.zscore", "ts.argmax", "ts.argmin", "ts.slope", "ts.rsquare":
+	case "ts.skew":
+		minPeriod = 3
+	case "ts.kurt":
+		minPeriod = 4
+	case "ts.vwma", "ts.corr", "ts.cov", "ts.beta":
 		inputCount = 2
 	case "ts.tr":
 		inputCount, parameterCount = 3, 0
@@ -509,8 +567,8 @@ func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool
 			if value < 0 {
 				return nil, true, c.error(path, arg, "standard deviation multiplier must be nonnegative")
 			}
-		} else if value < 1 || value > factor.MaxIndicatorPeriod || value != math.Trunc(value) {
-			return nil, true, c.error(path, arg, "window must be an integer in [1,%d]", factor.MaxIndicatorPeriod)
+		} else if value < float64(minPeriod) || value > factor.MaxIndicatorPeriod || value != math.Trunc(value) {
+			return nil, true, c.error(path, arg, "window must be an integer in [%d,%d]", minPeriod, factor.MaxIndicatorPeriod)
 		}
 		parameters[i] = value
 	}
@@ -527,8 +585,36 @@ func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool
 		result = factor.RMA(a, period)
 	case "ts.wma":
 		result = factor.WMA(a, period)
+	case "ts.decay_linear":
+		result = factor.DecayLinear(a, period)
 	case "ts.vwma":
 		result = factor.VWMA(a, inputs[1], period)
+	case "ts.corr":
+		result = factor.TsCorr(a, inputs[1], period)
+	case "ts.cov":
+		result = factor.TsCov(a, inputs[1], period)
+	case "ts.beta":
+		result = factor.TsBeta(a, inputs[1], period)
+	case "ts.sum":
+		result = factor.TsSum(a, period)
+	case "ts.product":
+		result = factor.TsProduct(a, period)
+	case "ts.rank":
+		result = factor.TsRank(a, period)
+	case "ts.zscore":
+		result = factor.TsZScore(a, period)
+	case "ts.argmax":
+		result = factor.TsArgMax(a, period)
+	case "ts.argmin":
+		result = factor.TsArgMin(a, period)
+	case "ts.skew":
+		result = factor.TsSkew(a, period)
+	case "ts.kurt":
+		result = factor.TsKurt(a, period)
+	case "ts.slope":
+		result = factor.TsSlope(a, period)
+	case "ts.rsquare":
+		result = factor.TsRSquare(a, period)
 	case "ts.rsi":
 		result = factor.RSI(a, period)
 	case "ts.roc":
@@ -576,6 +662,8 @@ func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool
 		default:
 			result = lower
 		}
+	default:
+		return nil, true, c.error(path, e, "unknown indicator %q", e.text)
 	}
 	return result, true, nil
 }

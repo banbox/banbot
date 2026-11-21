@@ -76,6 +76,54 @@ func MFI(high, low, close, volume *Node, period int) *Node {
 func Highest(input *Node, period int) *Node { return periodIndicator("highest", period, input) }
 func Lowest(input *Node, period int) *Node  { return periodIndicator("lowest", period, input) }
 
+// DecayLinear is a semantic alias for WMA (linearly decaying weights 1..period).
+func DecayLinear(input *Node, period int) *Node { return WMA(input, period) }
+
+// TsCorr computes rolling Pearson correlation over complete valid (x, y) pairs.
+// Zero variance on either series yields 0.
+func TsCorr(x, y *Node, period int) *Node { return periodIndicator("ts-corr", period, x, y) }
+
+// TsCov computes rolling population covariance over complete valid (x, y) pairs.
+func TsCov(x, y *Node, period int) *Node { return periodIndicator("ts-cov", period, x, y) }
+
+// TsBeta computes rolling OLS slope Cov(y, x) / Var(x) over complete valid pairs.
+// Zero variance on x yields 0.
+func TsBeta(y, x *Node, period int) *Node { return periodIndicator("ts-beta", period, y, x) }
+
+// TsSum computes the rolling sum of the last period valid observations.
+func TsSum(input *Node, period int) *Node { return periodIndicator("ts-sum", period, input) }
+
+// TsProduct computes the rolling product of the last period valid observations.
+func TsProduct(input *Node, period int) *Node { return periodIndicator("ts-product", period, input) }
+
+// TsRank computes the normalized rank in [0, 1] of the latest observation within
+// the last period valid observations (average ties; period == 1 yields 0.5).
+func TsRank(input *Node, period int) *Node { return periodIndicator("ts-rank", period, input) }
+
+// TsZScore standardizes the latest observation by the rolling mean and population
+// standard deviation over period valid observations (zero std yields 0).
+func TsZScore(input *Node, period int) *Node { return periodIndicator("ts-zscore", period, input) }
+
+// TsArgMax returns the offset in 0..period-1 from the latest valid observation
+// to the window maximum (0 when the latest observation is the maximum).
+func TsArgMax(input *Node, period int) *Node { return periodIndicator("ts-argmax", period, input) }
+
+// TsArgMin returns the offset in 0..period-1 from the latest valid observation
+// to the window minimum (0 when the latest observation is the minimum).
+func TsArgMin(input *Node, period int) *Node { return periodIndicator("ts-argmin", period, input) }
+
+// TsSkew computes rolling unbiased sample skewness (requires period >= 3; zero std yields 0).
+func TsSkew(input *Node, period int) *Node { return periodIndicator("ts-skew", period, input) }
+
+// TsKurt computes rolling unbiased sample excess kurtosis (requires period >= 4; zero std yields 0).
+func TsKurt(input *Node, period int) *Node { return periodIndicator("ts-kurt", period, input) }
+
+// TsSlope computes the OLS slope against equally spaced time index 0..period-1.
+func TsSlope(input *Node, period int) *Node { return periodIndicator("ts-slope", period, input) }
+
+// TsRSquare computes the OLS R-squared in [0, 1] against time index 0..period-1 (zero variance yields 0).
+func TsRSquare(input *Node, period int) *Node { return periodIndicator("ts-rsquare", period, input) }
+
 // MACD returns the fast-minus-slow EMA line, its signal EMA, and line-minus-
 // signal histogram. Each output is an independently usable scalar DAG node.
 func MACD(input *Node, fast, slow, signal int) (line, signalLine, hist *Node) {
@@ -101,26 +149,32 @@ func BBands(input *Node, period int, stdUp, stdDown float64) (upper, middle, low
 type indicatorContract struct {
 	arity      int
 	parameters []string
+	minPeriod  int
 }
 
 func indicatorDefinition(operator string) (indicatorContract, bool) {
 	switch operator {
-	case "sma", "rma", "wma", "rsi", "roc", "mom", "cci", "highest", "lowest":
-		return indicatorContract{1, []string{"period"}}, true
-	case "vwma":
-		return indicatorContract{2, []string{"period"}}, true
+	case "sma", "rma", "wma", "rsi", "roc", "mom", "cci", "highest", "lowest",
+		"ts-sum", "ts-product", "ts-rank", "ts-zscore", "ts-argmax", "ts-argmin", "ts-slope", "ts-rsquare":
+		return indicatorContract{1, []string{"period"}, 1}, true
+	case "ts-skew":
+		return indicatorContract{1, []string{"period"}, 3}, true
+	case "ts-kurt":
+		return indicatorContract{1, []string{"period"}, 4}, true
+	case "vwma", "ts-corr", "ts-cov", "ts-beta":
+		return indicatorContract{2, []string{"period"}, 1}, true
 	case "tr":
-		return indicatorContract{3, nil}, true
+		return indicatorContract{3, nil, 0}, true
 	case "atr", "stoch", "willr":
-		return indicatorContract{3, []string{"period"}}, true
+		return indicatorContract{3, []string{"period"}, 1}, true
 	case "obv":
-		return indicatorContract{2, nil}, true
+		return indicatorContract{2, nil, 0}, true
 	case "mfi":
-		return indicatorContract{4, []string{"period"}}, true
+		return indicatorContract{4, []string{"period"}, 1}, true
 	case "macd", "macd-signal", "macd-hist":
-		return indicatorContract{1, []string{"fast", "slow", "signal"}}, true
+		return indicatorContract{1, []string{"fast", "slow", "signal"}, 1}, true
 	case "bbands-upper", "bbands-middle", "bbands-lower":
-		return indicatorContract{1, []string{"period", "std_up", "std_down"}}, true
+		return indicatorContract{1, []string{"period", "std_up", "std_down"}, 1}, true
 	default:
 		return indicatorContract{}, false
 	}
@@ -136,6 +190,7 @@ func validateIndicator(spec NodeSpec, count int, contract indicatorContract) err
 	if len(spec.Parameters) != len(contract.parameters) {
 		return fmt.Errorf("factor: %s requires exactly parameters %v", spec.Operator, contract.parameters)
 	}
+	minPeriod := max(1, contract.minPeriod)
 	for _, name := range contract.parameters {
 		value, exists := spec.Parameters[name]
 		if !exists {
@@ -145,8 +200,8 @@ func validateIndicator(spec NodeSpec, count int, contract indicatorContract) err
 			if value < 0 {
 				return fmt.Errorf("factor: %s must be nonnegative", name)
 			}
-		} else if value < 1 || value > MaxIndicatorPeriod || value != math.Trunc(value) {
-			return fmt.Errorf("factor: %s must be an integer in [1,%d]", name, MaxIndicatorPeriod)
+		} else if value < float64(minPeriod) || value > MaxIndicatorPeriod || value != math.Trunc(value) {
+			return fmt.Errorf("factor: %s must be an integer in [%d,%d]", name, minPeriod, MaxIndicatorPeriod)
 		}
 	}
 	if _, exists := spec.Parameters["fast"]; exists && spec.Parameters["fast"] >= spec.Parameters["slow"] {

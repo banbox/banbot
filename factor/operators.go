@@ -58,11 +58,26 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		return result
 	}
 	switch node.spec.Operator {
-	case "rank":
+	case "rank", "pct-rank":
+		denom := float64(len(points) - 1)
 		for _, p := range targets {
 			lower := sort.Search(len(points), func(i int) bool { return points[i].value >= p.value })
 			upper := sort.Search(len(points), func(i int) bool { return points[i].value > p.value })
-			result[p.sid] = Numeric{float64(lower+upper-1) / 2, Valid}
+			r := float64(lower+upper-1) / 2
+			if node.spec.Operator == "pct-rank" {
+				if len(points) == 1 {
+					if p.value < points[0].value {
+						r = 0
+					} else if p.value > points[0].value {
+						r = 1
+					} else {
+						r = 0.5
+					}
+				} else {
+					r = max(0.0, min(1.0, r/denom))
+				}
+			}
+			result[p.sid] = Numeric{r, Valid}
 		}
 	case "zscore":
 		standardize(points, targets, result, true)

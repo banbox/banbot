@@ -8,8 +8,20 @@
 | --- | --- | --- |
 | `SMA(x,n)` | `ts.sma(x,n)` | 最近 n 个有效观察的算术均值 |
 | `RMA(x,n)` | `ts.rma(x,n)` | Wilder 平滑；以 n 个观察的均值初始化，`alpha=1/n` |
-| `WMA(x,n)` | `ts.wma(x,n)` | 最旧到最新的权重为 `1..n` |
+| `WMA(x,n)` / `DecayLinear(x,n)` | `ts.wma(x,n)` / `ts.decay_linear(x,n)` | 最旧到最新的权重为 `1..n`（两者为同一节点身份） |
 | `VWMA(c,v,n)` | `ts.vwma(c,v,n)` | `sum(c*v)/sum(v)` |
+| `TsCorr(x,y,n)` | `ts.corr(x,y,n)` | 最近 n 个同时有效配对的 Pearson 相关系数；方差为 0 返回 `0` |
+| `TsCov(x,y,n)` | `ts.cov(x,y,n)` | 最近 n 个同时有效配对的总体协方差 |
+| `TsBeta(y,x,n)` | `ts.beta(y,x,n)` | `Cov(y,x)/Var(x)`；`Var(x)==0` 返回 `0` |
+| `TsSum(x,n)` | `ts.sum(x,n)` | 最近 n 个有效观察的累加和 |
+| `TsProduct(x,n)` | `ts.product(x,n)` | 最近 n 个有效观察的连乘积 |
+| `TsRank(x,n)` | `ts.rank(x,n)` | 最新值在最近 n 个有效观察中的 `[0,1]` 归一化平均名次（`n==1` 返回 `0.5`） |
+| `TsZScore(x,n)` | `ts.zscore(x,n)` | `(x-SMA(x,n))/StdDev(x,n,0)`；标准差为 0 返回 `0` |
+| `TsArgMax(x,n)` / `TsArgMin(x,n)` | `ts.argmax(x,n)` / `ts.argmin(x,n)` | 极值距当前的偏移 `0..n-1`（`0` 为当前最新观察，对齐 `banta.HighestBar/LowestBar`） |
+| `TsSkew(x,n)` | `ts.skew(x,n)` | 无偏样本偏度（要求 `n >= 3`；标准差为 0 返回 `0`） |
+| `TsKurt(x,n)` | `ts.kurt(x,n)` | 无偏样本超额峰度（要求 `n >= 4`；标准差为 0 返回 `0`） |
+| `TsSlope(x,n)` | `ts.slope(x,n)` | 对时间索引 `0..n-1` 的 OLS 斜率 |
+| `TsRSquare(x,n)` | `ts.rsquare(x,n)` | 对时间索引 `0..n-1` 的 OLS 拟合优度 `R² ∈ [0,1]`（方差为 0 返回 `0`） |
 | `RSI(x,n)` | `ts.rsi(x,n)` | `100*平均涨幅/(平均涨幅+平均跌幅)`，涨跌幅使用 Wilder 平滑 |
 | `ROC(x,n)` | `ts.roc(x,n)` | `100*(x[t]-x[t-n])/x[t-n]`，单位为百分比 |
 | `MOM(x,n)` | `ts.mom(x,n)` | `x[t]-x[t-n]`，单位与原字段相同 |

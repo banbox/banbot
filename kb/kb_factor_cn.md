@@ -146,11 +146,11 @@ expressions:
 
 ### 2.2 语法与函数
 
-运算 `+ - * /`（`*/` 优先，左结合）、一元 `+ -`、括号；数字十进制（可科学计数法 `1e-8`），无下划线/十六进制；无比较、条件、`%`、`**`；字符串仅用于 `field`/`group.demean/zscore`。窗口参数为整数常数（可带符号）或 `param.name`（不能写 `param.window+1`），范围 [1,10000]，`ts.lag` 另允许 0。
+运算 `+ - * /`、比较 `> >= < <=`（优先级 `* /` > `+ -` > `> >= < <=`，左结合）、一元 `+ -`、括号；数字十进制（可科学计数法 `1e-8`），无下划线/十六进制；无 `%`、`**`、`&&`/`||`；字符串仅用于 `field`/`group.demean/zscore`。窗口参数为整数常数（可带符号）或 `param.name`（不能写 `param.window+1`），范围 [1,10000]（`ts.skew` 为 [3,10000]，`ts.kurt` 为 [4,10000]），`ts.lag` 另允许 0。
 
-- 逐点：`positive(x)`（x>0 取 x 否则无效，**不做下界截断**）、`abs log sqrt (x)`、`pow min max (a,b)`。
-- 时序（x 为输入；n 窗口）：`ts.lag(x,n)`（n=0 原样返回，不计入窗口规则）、`ts.return(x,n)`=x_t/x_{t-n}-1、`ts.ema/sma/rma/wma(x,n)`（指数/简单/Wilder/加权，wma 最新权重 n）、`ts.std(x,n,ddof)`（整数 `0≤ddof<n`）、`ts.rsi(x,n)`（Wilder，0–100）、`ts.roc(x,n)`（百分比，×100）、`ts.mom(x,n)`（与 n 个有效样本前的差）、`ts.cci(x,n)`、`ts.highest/lowest(x,n)`、`ts.vwma(c,v,n)`、`ts.tr(h,l,c)`（首个有效前收为预热）、`ts.atr(h,l,c,n)`（Wilder）、`ts.stoch(h,l,c,n)`（原始 %K 无 D 平滑）、`ts.willr(h,l,c,n)`（-100–0）、`ts.obv(c,v)`（首值取首个有效 volume，相等收盘不变）、`ts.mfi(h,l,c,v,n)`、`ts.macd/macd_signal/macd_hist(x,f,s,g)`（f<s，f/s/g∈[1,10000]）、`ts.bbands_upper/middle/lower(x,n,up,down)`（总体标准差，倍数非负且显式）。
-- 截面：`cs.rank(x)`（升序名次，0 起，并列平均，非百分位）、`cs.zscore(x)`（总体标准差；全同输出 0）、`cs.robust_zscore(x)`=(x−中位数)/(1.4826·MAD)（MAD=0 输出 0）、`cs.winsorize(x,tail)`（tail∈[0,0.5)，上下界为参考池插值分位数）、`cs.mad_winsorize(x,k)`（中位数 ± k·1.4826·MAD，k>0；MAD=0 全截到中位数）、`cs.quantile(x,q)`（q∈[0,1]；**输出截面常数**，参考池 q 分位广播，只适合阈值/分组，不能排名）。
+- 逐点：`positive(x)`（x>0 取 x 否则无效，**不做下界截断**）、`sign(x)`（>0→1，<0→-1，==0→0）、`clip(x,lo,hi)`（有限常数或 `param.name` 且 `lo<=hi`，钳制有效值到 `[lo,hi]`）、`abs log sqrt (x)`、`pow min max (a,b)`、比较 `a > b`/`a >= b`/`a < b`/`a <= b` 或 `gt ge lt le (a,b)`（真输出 `1.0`，假输出 `0.0`）、条件选择 `where(cond,a,b)` / `if_else(cond,a,b)`（`cond` 有效且 `cond > 0` 时取 `a`，否则取 `b`；**`cond` 有效时仅要求被选中的分支有效**，故 `where(x > 0, log(x), 0)` 在 `x <= 0` 时安全返回 `0`；`cond` 无效则传播 `cond` 的无效原因）。
+- 时序（x,y 为输入；n 窗口）：`ts.lag(x,n)`（n=0 原样返回，不计入窗口规则）、`ts.return(x,n)`=x_t/x_{t-n}-1、`ts.ema/sma/rma/wma(x,n)`（指数/简单/Wilder/加权，wma 最新权重 n）、`ts.decay_linear(x,n)`（`ts.wma(x,n)` 别名）、`ts.std(x,n,ddof)`（整数 `0≤ddof<n`）、`ts.corr(x,y,n)`（Pearson 滚动相关，任一方差为 0 输出 0）、`ts.cov(x,y,n)`（滚动总体协方差）、`ts.beta(y,x,n)`（`Cov(y,x)/Var(x)`，Var(x)=0 输出 0）、`ts.sum(x,n)`、`ts.product(x,n)`、`ts.rank(x,n)`（过去 n 个有效样本内的 `[0,1]` 归一化平均分位排名，n=1 返回 `0.5`）、`ts.zscore(x,n)`（`(x-SMA)/StdDev(x,n,0)`，标准差为 0 输出 0）、`ts.argmax/argmin(x,n)`（极值距当前的偏移 `0..n-1`，0 表示当前最新值为极值，对齐 `HighestBar/LowestBar`）、`ts.skew(x,n)`（无偏样本偏度，要求 `n≥3`，标准差为 0 输出 0）、`ts.kurt(x,n)`（无偏样本超额峰度，要求 `n≥4`，标准差为 0 输出 0）、`ts.slope(x,n)`（对 `0..n-1` 的 OLS 斜率）、`ts.rsquare(x,n)`（拟合优度 `R²∈[0,1]`，方差为 0 输出 0）、`ts.rsi(x,n)`（Wilder，0–100）、`ts.roc(x,n)`（百分比，×100）、`ts.mom(x,n)`（与 n 个有效样本前的差）、`ts.cci(x,n)`、`ts.highest/lowest(x,n)`、`ts.vwma(c,v,n)`、`ts.tr(h,l,c)`（首个有效前收为预热）、`ts.atr(h,l,c,n)`（Wilder）、`ts.stoch(h,l,c,n)`（原始 %K 无 D 平滑）、`ts.willr(h,l,c,n)`（-100–0）、`ts.obv(c,v)`（首值取首个有效 volume，相等收盘不变）、`ts.mfi(h,l,c,v,n)`、`ts.macd/macd_signal/macd_hist(x,f,s,g)`（f<s，f/s/g∈[1,10000]）、`ts.bbands_upper/middle/lower(x,n,up,down)`（总体标准差，倍数非负且显式）。
+- 截面：`cs.rank(x)`（升序名次，0 起，并列平均，非百分位）、`cs.pct_rank(x)`（归一化截面排名 `[0,1]`：有效参考标的数 `M>1` 时为 `rank/(M-1)`，`M==1` 时为 `0.5`）、`cs.zscore(x)`（总体标准差；全同输出 0）、`cs.robust_zscore(x)`=(x−中位数)/(1.4826·MAD)（MAD=0 输出 0）、`cs.winsorize(x,tail)`（tail∈[0,0.5)，上下界为参考池插值分位数）、`cs.mad_winsorize(x,k)`（中位数 ± k·1.4826·MAD，k>0；MAD=0 全截到中位数）、`cs.quantile(x,q)`（q∈[0,1]；**输出截面常数**，参考池 q 分位广播，只适合阈值/分组，不能排名）。
 - 回归/分组：`group.residual(y,x)`（单变量截面 OLS 残差含截距，参考池拟合，需 ≥2 个有效对）、`group.ols(y,x1,...)`（多元，至少一个暴露）、`group.wls(y,w,x1,...)`（权重须正且有效）、`group.demean(x,"alias","field")` / `group.zscore(...)`（按分类字段组内去均值/z-score（总体标准差）；字段原始类型/NULL 保留，经 binding 采样；缺字段=Missing，NULL=Null）。
 
 - Go 同名：`ts.x`/`cs.x`→`factor.X`（MACD/BBands 返回三节点；`group.ols/wls`→`MultiResidual/WeightedResidual`；`group.demean/zscore`→`...ByField`），见第 6 节。
@@ -345,15 +345,18 @@ func Number(values map[string]any, field string) Numeric
 func Field(source, field, timeframe string) *Node
 func AsOfField(source, field, sourceTF, decisionTF string, maxAge int64) *Node
 func Constant(v float64, tf string) *Node
-func Add/Sub/Mul/Div/Pow/Min/Max(a, b *Node) *Node
-func Neg/Abs/Log/Sqrt/Positive(x *Node) *Node
-func Lag/Return/EMA/SMA/RMA/WMA/RSI/ROC/MOM/CCI/Highest/Lowest(x *Node, period int) *Node
+func Add/Sub/Mul/Div/Pow/Min/Max/Gt/Ge/Lt/Le(a, b *Node) *Node
+func Neg/Abs/Log/Sqrt/Positive/Sign(x *Node) *Node; Clip(x *Node, lo, hi float64) *Node
+func Where(cond, thenNode, elseNode *Node) *Node
+func Lag/Return/EMA/SMA/RMA/WMA/DecayLinear/RSI/ROC/MOM/CCI/Highest/Lowest(x *Node, period int) *Node
+func TsSum/TsProduct/TsRank/TsZScore/TsArgMax/TsArgMin/TsSkew/TsKurt/TsSlope/TsRSquare(x *Node, period int) *Node
+func TsCorr/TsCov(x, y *Node, period int) *Node; TsBeta(y, x *Node, period int) *Node
 func StdDev(x *Node, period, ddof int) *Node
 func VWMA(p, v *Node, period int) *Node; ATR(h,l,c *Node, period int); Stoch/WillR(h,l,c *Node, period int)
 func TR(h,l,c *Node) *Node; OBV(c,v *Node) *Node; MFI(h,l,c,v *Node, period int) *Node
 func MACD(x *Node, fast, slow, signal int) (line, signalLine, hist *Node)
 func BBands(x *Node, period int, stdUp, stdDown float64) (upper, middle, lower *Node)
-func Rank/ZScore/RobustZScore(x *Node) *Node
+func Rank/PctRank/ZScore/RobustZScore(x *Node) *Node
 func Winsorize(x *Node, tail float64) *Node; MADWinsorize(x *Node, k float64) *Node; Quantile(x *Node, q float64) *Node
 func GroupDemeanByField(x, field *Node) *Node; GroupZScoreByField(x, field *Node) *Node
 func Residual(y, x *Node) *Node; MultiResidual(y *Node, xs ...*Node) *Node; WeightedResidual(y, w *Node, xs ...*Node) *Node

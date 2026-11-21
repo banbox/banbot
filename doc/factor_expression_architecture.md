@@ -45,7 +45,7 @@ flowchart TD
 
 `expr.Spec` 包含 schema 版本、决策周期、数据源绑定、数值参数、`lets`、`outputs` 和组合配置。绑定别名与数据源名称可以不同；例如 `kline.close` 中的 `kline` 是绑定别名，最终节点保存绑定的真实 source、field 与周期。
 
-解析器使用 Go 标准库 `text/scanner`，按优先级生成包含位置的 AST。`* /` 高于 `+ -`，二元运算左结合，支持一元正负号和嵌套函数。名称必须显式属于 `alias.field`、`factor.name` 或 `param.name`；特殊字段名通过 `field("alias", "some-key")` 表达。参数在编译时绑定为有限数值，窗口参数还必须满足整数和范围限制。
+解析器使用 Go 标准库 `text/scanner`，按优先级生成包含位置的 AST。`* /` 高于 `+ -`，`+ -` 高于比较 `> >= < <=`，二元运算左结合，支持一元正负号和嵌套函数。名称必须显式属于 `alias.field`、`factor.name` 或 `param.name`；特殊字段名通过 `field("alias", "some-key")` 表达。参数在编译时绑定为有限数值，窗口参数还必须满足整数和范围限制。
 
 `lets` 和 `outputs` 属于同一个定义集合，可以前向引用，不能同名或形成循环。编译器会解析和校验所有声明，包括未使用的中间项；最终只将输出可达的节点交给完整计划。因此，一个未使用但非法的 `let` 仍会报错，一个未使用的合法字段引用不会增加最终订阅。`Plan.Inputs()` 汇总实际可达节点的 source、timeframe、字段和采样要求。
 
@@ -76,7 +76,7 @@ flowchart TD
 
 原始整数类型仍被保留，但转成 float64 的派生视图可能损失大整数精度，不能用它替代 SID 或精确标识。字符串和布尔值不自动转数值。当前 `Null` 的判定是接口值为 `nil`，不要将任意 typed nil 都理解为同一数值状态。
 
-Session 和 Batch 共用 `evaluatePointwise`：多输入按声明顺序传播第一个无效输入；除零、非法对数/平方根、非正值经 `positive` 过滤及计算溢出产生 `NonFinite`。`max(x, epsilon)` 不填补 NULL，也不会改变缺失原因。派生 JSON 对无效数值编码为 `null` 并保留 validity。
+Session 和 Batch 共用 `evaluatePointwise`：普通多输入算子按声明顺序传播第一个无效输入；`where(cond, a, b)`（及别名 `if_else`）先检查 `cond` 是否有效，当 `cond > 0` 为真时只要求 `a` 有效、否则只要求 `b` 有效，未选中分支的域错误（如 `log(x)` 在 `x <= 0` 时的 `NonFinite`）不会污染输出；除零、非法对数/平方根、非正值经 `positive` 过滤及计算溢出产生 `NonFinite`。`max(x, epsilon)` 与 `clip` 不填补 NULL，也不会改变缺失原因。派生 JSON 对无效数值编码为 `null` 并保留 validity。
 
 窗口算子的缺样本和初始化规则由对应 banta 内核及适配逻辑决定，不能因为 `MissingPolicy` 标记为 `skip-invalid` 就认为所有窗口都按同一种有效样本计数。特别是 Batch 的 EMA 使用有效值压缩视图计算，再恢复原时间位置，以对齐 Session 的初始化规则。
 
@@ -128,7 +128,7 @@ Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame
 
 表达式编译有明确静态边界，见 [parser.go](../factor/expr/parser.go)：单式最多 16 KiB，总表达式文本 256 KiB，所有声明的 AST 总计最多 8192 节点，深度上限 64；lets+outputs、bindings、params 各组最多 512 项，窗口最大 10000。深度还检查展开后的引用 DAG。独立 CLI spec 文件最大 1 MiB，仅接受一个 YAML 文档并拒绝未知字段。这些是语法和结构上限，不是峰值内存 admission 或全链路吞吐保证。
 
-当前语言没有比较、条件、循环、模块导入、任意代码调用，也拒绝对含 CS/GROUP 结果的输入再做非零 TS 窗口。分类分组通过已开放的 `group.demean/zscore` 表达。Go builder/policy 的能力范围与表达式白名单不同。执行侧另有 Batch 行数、标签队列行/列、IC 历史窗口、policy checkpoint 和近期接纳缓存限制；大量输出还会增加 Frame map、标签副本和研究列间两两相关的成本，不能只看解析节点数估算资源。
+当前语言没有循环、模块导入、任意代码调用，也拒绝对含 CS/GROUP 结果的输入再做非零 TS 窗口。分类分组通过已开放的 `group.demean/zscore` 表达。Go builder/policy 的能力范围与表达式白名单不同。执行侧另有 Batch 行数、标签队列行/列、IC 历史窗口、policy checkpoint 和近期接纳缓存限制；大量输出还会增加 Frame map、标签副本和研究列间两两相关的成本，不能只看解析节点数估算资源。
 
 ## 8. 持仓状态与研究产物的边界
 

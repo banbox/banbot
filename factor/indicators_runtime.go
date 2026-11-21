@@ -92,6 +92,14 @@ func technicalBatchValues(spec NodeSpec, inputs [][]float64) []float64 {
 		return tav.Highest(data, period)
 	case "lowest":
 		return tav.Lowest(data, period)
+	case "ts-argmax":
+		return tav.HighestBar(data, period)
+	case "ts-argmin":
+		return tav.LowestBar(data, period)
+	case "ts-sum", "ts-product", "ts-rank", "ts-zscore", "ts-skew", "ts-kurt", "ts-slope", "ts-rsquare":
+		return computeRollingBatch1(spec.Operator, data, period)
+	case "ts-corr", "ts-cov", "ts-beta":
+		return computeRollingBatch2(spec.Operator, data, inputs[1], period)
 	case "macd", "macd-signal", "macd-hist":
 		line, signal := tav.MACD(data, int(spec.Parameters["fast"]), int(spec.Parameters["slow"]), int(spec.Parameters["signal"]))
 		if spec.Operator == "macd-signal" {
@@ -166,6 +174,21 @@ func computeTechnicalIncremental(spec NodeSpec, inputs []*ta.Series) (float64, b
 		return ta.Highest(data, period).Get(0), true
 	case "lowest":
 		return ta.Lowest(data, period).Get(0), true
+	case "ts-argmax":
+		return ta.HighestBar(data, period).Get(0), true
+	case "ts-argmin":
+		return ta.LowestBar(data, period).Get(0), true
+	case "ts-sum", "ts-product", "ts-rank", "ts-zscore", "ts-skew", "ts-kurt", "ts-slope", "ts-rsquare":
+		if len(data.Data) < period {
+			return math.NaN(), true
+		}
+		return evalRolling1(spec.Operator, data.Data[len(data.Data)-period:]), true
+	case "ts-corr", "ts-cov", "ts-beta":
+		second := inputs[1]
+		if len(data.Data) < period || len(second.Data) < period {
+			return math.NaN(), true
+		}
+		return evalRolling2(spec.Operator, data.Data[len(data.Data)-period:], second.Data[len(second.Data)-period:]), true
 	case "macd", "macd-signal", "macd-hist":
 		line, signal := ta.MACD(data, int(spec.Parameters["fast"]), int(spec.Parameters["slow"]), int(spec.Parameters["signal"]))
 		if spec.Operator == "macd-signal" {

@@ -17,6 +17,11 @@ const (
 	maxWindow      = 10_000
 )
 
+const (
+	tokGe rune = -100 - iota
+	tokLe
+)
+
 type expression struct {
 	kind rune
 	text string
@@ -54,7 +59,21 @@ func parse(path, source string, count *int) (*expression, error) {
 	return e, p.err
 }
 
-func (p *parser) next() { p.token = p.s.Scan(); p.text = p.s.TokenText(); p.pos = p.s.Position }
+func (p *parser) next() {
+	p.token = p.s.Scan()
+	p.text = p.s.TokenText()
+	p.pos = p.s.Position
+	if (p.token == '>' || p.token == '<') && p.s.Peek() == '=' {
+		p.s.Scan()
+		if p.token == '>' {
+			p.token = tokGe
+			p.text = ">="
+		} else {
+			p.token = tokLe
+			p.text = "<="
+		}
+	}
+}
 func (p *parser) fail(format string, args ...any) {
 	if p.err == nil {
 		p.err = fmt.Errorf("%s:%d:%d: %s", p.path, p.pos.Line, p.pos.Column, fmt.Sprintf(format, args...))
@@ -69,10 +88,12 @@ func (p *parser) make(kind rune, text string, pos scanner.Position, args ...*exp
 }
 func precedence(token rune) int {
 	switch token {
-	case '+', '-':
+	case '>', '<', tokGe, tokLe:
 		return 1
-	case '*', '/':
+	case '+', '-':
 		return 2
+	case '*', '/':
+		return 3
 	}
 	return 0
 }

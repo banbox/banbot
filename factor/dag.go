@@ -100,8 +100,9 @@ func StdDev(input *Node, period, ddof int) *Node {
 	n.Spec.Parameters["ddof"] = float64(ddof)
 	return n
 }
-func Rank(input *Node) *Node   { return node("rank", CS, input) }
-func ZScore(input *Node) *Node { return node("zscore", CS, input) }
+func Rank(input *Node) *Node    { return node("rank", CS, input) }
+func PctRank(input *Node) *Node { return node("pct-rank", CS, input) }
+func ZScore(input *Node) *Node  { return node("zscore", CS, input) }
 
 // RobustZScore centers at the reference median and scales by 1.4826*MAD.
 func RobustZScore(input *Node) *Node { return node("robust-zscore", CS, input) }
@@ -431,7 +432,7 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 	}
 	expectedKind := TS
 	switch spec.Operator {
-	case "rank", "zscore", "winsorize", "quantile", "robust-zscore", "mad-winsorize":
+	case "rank", "pct-rank", "zscore", "winsorize", "quantile", "robust-zscore", "mad-winsorize":
 		expectedKind = CS
 	case "group-demean", "group-zscore", "residual", "multi-residual", "weighted-residual":
 		expectedKind = GROUP
@@ -469,12 +470,24 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 		if count != arity {
 			return fmt.Errorf("factor: %s requires %d dependencies", spec.Operator, arity)
 		}
-		if spec.Operator == "constant" {
+		switch spec.Operator {
+		case "constant":
 			if _, exists := spec.Parameters["value"]; !exists || len(spec.Parameters) != 1 {
 				return errors.New("factor: constant requires one declared value")
 			}
-		} else if len(spec.Parameters) != 0 {
-			return fmt.Errorf("factor: %s does not accept scalar parameters", spec.Operator)
+		case "clip":
+			lo, okLo := spec.Parameters["lo"]
+			hi, okHi := spec.Parameters["hi"]
+			if !okLo || !okHi || len(spec.Parameters) != 2 {
+				return errors.New("factor: clip requires lo and hi parameters")
+			}
+			if lo > hi {
+				return errors.New("factor: clip requires lo <= hi")
+			}
+		default:
+			if len(spec.Parameters) != 0 {
+				return fmt.Errorf("factor: %s does not accept scalar parameters", spec.Operator)
+			}
 		}
 		return nil
 	}
@@ -526,7 +539,10 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 				return errors.New("factor: invalid ddof")
 			}
 		}
-	case "rank", "zscore", "robust-zscore":
+	case "rank", "pct-rank", "zscore", "robust-zscore":
+		if spec.Operator == "pct-rank" && len(spec.Parameters) != 0 {
+			return errors.New("factor: pct-rank does not accept scalar parameters")
+		}
 	case "mad-winsorize":
 		if spec.Parameters["multiple"] <= 0 {
 			return errors.New("factor: positive MAD multiple required")
