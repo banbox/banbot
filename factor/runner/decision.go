@@ -26,6 +26,16 @@ type decisionEngine struct {
 	shared                *sharedComputation
 }
 
+func defaultComboColumns(outputs []string) []string {
+	cols := make([]string, 0, len(outputs))
+	for _, name := range outputs {
+		if !factor.IsExposureScaleOutput(name) {
+			cols = append(cols, name)
+		}
+	}
+	return cols
+}
+
 func compileDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 	var plan *factor.Plan
 	var combo research.ComboSpec
@@ -43,7 +53,7 @@ func compileDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 			combo.Method = research.Equal
 		}
 		if len(combo.Columns) == 0 {
-			combo.Columns = plan.Outputs()
+			combo.Columns = defaultComboColumns(plan.Outputs())
 		}
 	} else if c.Plan != nil {
 		plan = c.Plan
@@ -194,8 +204,28 @@ func (e *decisionEngine) portfolioSpec(frame factor.Frame, universe factor.Unive
 }
 func (e *decisionEngine) buildPortfolio(frame factor.Frame, universe factor.Universe, sequence uint64, nav float64, executableAt, expireAt int64) (*factor.TargetPortfolio, []factor.Diagnostic, error) {
 	spec := e.portfolioSpec(frame, universe, sequence, nav, executableAt, expireAt)
+	longScale, shortScale, scaled := factor.ExposureScales(frame, universe)
 	if e.builder != nil {
-		return e.builder(factor.CloneFrame(frame), factor.CloneUniverse(universe), spec, e.portfolio)
+		p, diags, err := e.builder(factor.CloneFrame(frame), factor.CloneUniverse(universe), spec, e.portfolio)
+		if err != nil || p == nil || !scaled {
+			return p, diags, err
+		}
+		raw := p.Targets()
+		scaledWeights := make(map[int32]float64, len(raw))
+		pspec := p.Spec()
+		for sid, w := range raw {
+			if w > 0 {
+				w *= longScale
+			} else if w < 0 {
+				w *= shortScale
+			}
+			if w == 0 && pspec.Mode != factor.Patch {
+				continue
+			}
+			scaledWeights[sid] = w
+		}
+		out, err := factor.NewTargetPortfolio(pspec, scaledWeights)
+		return out, diags, err
 	}
 	if e.portfolio.Policy != "" && e.portfolio.Builder == "" {
 		if e.portfolio.Policy != "lifecycle-v1" {
@@ -206,7 +236,17 @@ func (e *decisionEngine) buildPortfolio(frame factor.Frame, universe factor.Univ
 		if err != nil {
 			return nil, nil, err
 		}
+		if scaled {
+			config.LongNotional *= longScale
+			config.ShortNotional *= shortScale
+		}
 		return factor.SelectPortfolio(frame, universe, spec, config)
 	}
-	return factor.TopBottomKNotional(frame, "score", universe, spec, e.portfolio.K, e.portfolio.LongNotional, e.portfolio.ShortNotional)
+	gate := factor.ScoreGate{
+		LongMinScore:       e.portfolio.LongMinScore,
+		ShortMaxScore:      e.portfolio.ShortMaxScore,
+		UnfilledSlotPolicy: e.portfolio.UnfilledSlotPolicy,
+		AssetCap:           e.portfolio.AssetCap,
+	}
+	return factor.TopBottomKDynamic(frame, "score", universe, spec, e.portfolio.K, e.portfolio.LongNotional*longScale, e.portfolio.ShortNotional*shortScale, gate, scaled)
 }

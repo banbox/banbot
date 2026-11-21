@@ -127,6 +127,7 @@ param.window      本定义集 params 中的编译期参数
 | `cs.mad_winsorize(x,k)` | 按参考中位数与缩放 MAD 截尾，k 必须为正 |
 | `cs.robust_zscore(x)` | 中位数 / `1.4826 × MAD` 稳健标准化，零 MAD 输出零 |
 | `cs.quantile(x,q)` | 参考池分位数，`0 <= q <= 1`；同一分位值广播给有有效输入的资产 |
+| `cs.mean(x)` / `cs.sum(x)` | 参考池有效值的算术均值 / 总和，作为截面常数广播给有有效输入的活跃资产（如市场宽度 `cs.mean(kline.close > ts.sma(kline.close, 200))`） |
 | `group.residual(y,x)` | 用参考池完整有效配对拟合带截距的一元截面回归，输出残差 |
 | `group.ols(y,x1,x2,...)` | 含截距的多暴露回归残差，共线暴露按声明顺序处理 |
 | `group.wls(y,weight,x1,x2,...)` | 正权重的多暴露加权回归残差 |

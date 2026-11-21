@@ -65,7 +65,7 @@ gradual 每轮建立 1/8 预算的批次；seed-all 用当前排名一次建立�
 
 ## 选股、覆盖和配置校验
 
-`selection.long_k/short_k` 独立控制两侧，或使用 long_quantile/short_quantile。retain_rank 提供持仓排名缓冲，dropout 控制普通轮次替换数量，group_quota 使用调用者提供的可见分组。分位选择不要求旧 K；完整自定义 policy 不要求未使用的 K 或 side notional。显式旧 builder 继续校验自己的合同。
+`selection.long_k/short_k` 独立控制两侧，或使用 long_quantile/short_quantile。`long_min_score` 与 `short_max_score`（可选有限浮点数，区分省略与显式 `0`）提供绝对动量/分数门控：多头候选须满足 `score >= long_min_score`，空头候选须满足 `score <= short_max_score`。当通过门控的标的数 `m < K`（含 `m == 0` 全市场负动量）时，`unfilled_slot_policy` 默认 `cash`（每个入选标的分配固定单槽位预算 `side_notional / K`，剩余 `(K - m) / K` 留作空仓现金，`m == 0` 时发出显式空组合清仓避险，不会跳过调仓保留旧仓）；设为 `rescale` 时将预算集中在通过门控的标的（受 `asset_cap` 约束）。未启用 `policy` 的默认 `top-bottom-k-v1` 路径也可直接在 `portfolio` 块配置 `long_min_score`、`short_max_score`、`unfilled_slot_policy` 与 `asset_cap`。此外，因子输出若包含保留列 `exposure_scale`、`long_scale` 或 `short_scale`（如 `cs.mean(kline.close > ts.sma(kline.close, 200))` 市场宽度），默认合成自动忽略该列，并将其有效截面均值钳制在 `[0, 1]` 后动态缩放当期多空总敞口（不改变 `lifecycle-v1` 的 `ConfigHash`）。retain_rank 提供持仓排名缓冲（不会保留未通过分数门控的持仓），dropout 控制普通轮次替换数量，group_quota 使用调用者提供的可见分组。分位选择不要求旧 K；完整自定义 policy 不要求未使用的 K 或 side notional。显式旧 builder 继续校验自己的合同。
 
 long_k/short_k 是当轮选择数量，不是实际持仓总数上限。最短持有期保护和渐进退出会保留落选旧仓，因此实际非零持仓可能超过 K；当前没有 max_long_positions/max_short_positions 配置。降低 K 会同时缩小候选范围。若只需控制调仓金额，可使用 allocation.turnover_limit；它不限制持仓数量，强制风险退出仍绕过普通换手预算。
 

@@ -162,6 +162,18 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		for _, p := range targets {
 			result[p.sid] = numeric(value)
 		}
+	case "cs-mean", "cs-sum":
+		sum := 0.0
+		for _, p := range points {
+			sum += p.value
+		}
+		value := sum
+		if node.spec.Operator == "cs-mean" {
+			value /= float64(len(points))
+		}
+		for _, p := range targets {
+			result[p.sid] = numeric(value)
+		}
 	case "group-demean", "group-zscore":
 		groups := make(map[string][]point)
 		groupTargets := make(map[string][]point)

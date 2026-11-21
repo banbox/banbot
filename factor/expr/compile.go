@@ -345,6 +345,7 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 		"gt": 2, "ge": 2, "lt": 2, "le": 2, "where": 3, "if_else": 3,
 		"ts.lag": 2, "ts.return": 2, "ts.ema": 2, "ts.std": 3,
 		"cs.rank": 1, "cs.pct_rank": 1, "cs.zscore": 1, "cs.robust_zscore": 1,
+		"cs.mean": 1, "cs.sum": 1,
 		"cs.mad_winsorize": 2, "cs.winsorize": 2, "cs.quantile": 2,
 		"group.residual": 2, "group.demean": 3, "group.zscore": 3,
 	}
@@ -418,6 +419,10 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 		return factor.ZScore(a), nil
 	case "cs.robust_zscore":
 		return factor.RobustZScore(a), nil
+	case "cs.mean":
+		return factor.CsMean(a), nil
+	case "cs.sum":
+		return factor.CsSum(a), nil
 	case "clip":
 		lo, err := c.number(path, e.args[1])
 		if err != nil {

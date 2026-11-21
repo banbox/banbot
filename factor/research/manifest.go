@@ -19,6 +19,10 @@ type PortfolioDefinition struct {
 	BuilderConfigHash           string `json:",omitempty"`
 	K                           int
 	LongNotional, ShortNotional float64
+	LongMinScore                *float64             `json:",omitempty"`
+	ShortMaxScore               *float64             `json:",omitempty"`
+	UnfilledSlotPolicy          string               `json:",omitempty"`
+	AssetCap                    float64              `json:",omitempty"`
 	Mode                        factor.PortfolioMode
 	Policy                      string                   `json:",omitempty"`
 	PolicyParams                json.RawMessage          `json:",omitempty"`

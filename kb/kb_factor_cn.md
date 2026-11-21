@@ -72,7 +72,7 @@ Events 归档回放最小示例：`execution: {mode: events, funding_policy: exp
 
 `method`（`equal|fixed|history-ic|history-rank-ic|history-icir|history-rank-icir|history-ewma`）、`columns`、`weights`（map，`fixed` 必填且覆盖全部 columns）、`label`、`min_samples`、`min_pairs`、`min_confidence`、`decay`（EWMA alpha，[0,1]，0 视为 0.2）、`direction`（`signed|positive`）、`fallback`（`equal|fixed|error`）。
 
-- `columns` 不得重复且须是输出名；**`expressions.combine` 可省 columns（默认全部输出），外层 `combo` 必须写（缺则 `expression combine requires columns`）**（外层 `combo.method` 非空时整体覆盖内层）。
+- `columns` 不得重复且须是输出名；**`expressions.combine` 可省 columns（默认除 `exposure_scale`/`long_scale`/`short_scale` 保留敞口缩放列外的全部输出），外层 `combo` 必须写（缺则 `expression combine requires columns`）**（外层 `combo.method` 非空时整体覆盖内层）。
 - `equal`：列等权；`fixed`：权重直接线性相加，允许负数，不归一化。非零权重列对某资产无效 → 该资产分数无效，不重分配；零权重列不影响有效性。
 - 历史方法只用已成熟、决策时可见、`DecisionTime<asof` 的 IC 样本（窗口保留最近 256 个截面，样本须 ≥2 对；`min_pairs` 可提高）；`rank` 变体用 RankIC，`icir` 用 mean/std，`ewma` 用 `decay`；`min_samples` 至少 1；`min_confidence` 为 |均值|/标准误 门槛（需 ≥2 样本、均值非 0，无多重检验校正，重叠样本 ICIR 仅描述性）；`direction: positive` 把负权重截为 0；权重按 Σ|w|=1 归一；无合格历史按 `fallback`：`equal`（默认，诊断 `ic-equal-fallback`）、`fixed`（用 `weights`）、`error`。
 - 历史方法必须有标签（`research.labels` 非空）；多标签省略 `label` 取最短 horizon（同期限按名称），`label` 须已声明。
@@ -150,7 +150,7 @@ expressions:
 
 - 逐点：`positive(x)`（x>0 取 x 否则无效，**不做下界截断**）、`sign(x)`（>0→1，<0→-1，==0→0）、`clip(x,lo,hi)`（有限常数或 `param.name` 且 `lo<=hi`，钳制有效值到 `[lo,hi]`）、`abs log sqrt (x)`、`pow min max (a,b)`、比较 `a > b`/`a >= b`/`a < b`/`a <= b` 或 `gt ge lt le (a,b)`（真输出 `1.0`，假输出 `0.0`）、条件选择 `where(cond,a,b)` / `if_else(cond,a,b)`（`cond` 有效且 `cond > 0` 时取 `a`，否则取 `b`；**`cond` 有效时仅要求被选中的分支有效**，故 `where(x > 0, log(x), 0)` 在 `x <= 0` 时安全返回 `0`；`cond` 无效则传播 `cond` 的无效原因）。
 - 时序（x,y 为输入；n 窗口）：`ts.lag(x,n)`（n=0 原样返回，不计入窗口规则）、`ts.return(x,n)`=x_t/x_{t-n}-1、`ts.ema/sma/rma/wma(x,n)`（指数/简单/Wilder/加权，wma 最新权重 n）、`ts.decay_linear(x,n)`（`ts.wma(x,n)` 别名）、`ts.std(x,n,ddof)`（整数 `0≤ddof<n`）、`ts.corr(x,y,n)`（Pearson 滚动相关，任一方差为 0 输出 0）、`ts.cov(x,y,n)`（滚动总体协方差）、`ts.beta(y,x,n)`（`Cov(y,x)/Var(x)`，Var(x)=0 输出 0）、`ts.sum(x,n)`、`ts.product(x,n)`、`ts.rank(x,n)`（过去 n 个有效样本内的 `[0,1]` 归一化平均分位排名，n=1 返回 `0.5`）、`ts.zscore(x,n)`（`(x-SMA)/StdDev(x,n,0)`，标准差为 0 输出 0）、`ts.argmax/argmin(x,n)`（极值距当前的偏移 `0..n-1`，0 表示当前最新值为极值，对齐 `HighestBar/LowestBar`）、`ts.skew(x,n)`（无偏样本偏度，要求 `n≥3`，标准差为 0 输出 0）、`ts.kurt(x,n)`（无偏样本超额峰度，要求 `n≥4`，标准差为 0 输出 0）、`ts.slope(x,n)`（对 `0..n-1` 的 OLS 斜率）、`ts.rsquare(x,n)`（拟合优度 `R²∈[0,1]`，方差为 0 输出 0）、`ts.rsi(x,n)`（Wilder，0–100）、`ts.roc(x,n)`（百分比，×100）、`ts.mom(x,n)`（与 n 个有效样本前的差）、`ts.cci(x,n)`、`ts.highest/lowest(x,n)`、`ts.vwma(c,v,n)`、`ts.tr(h,l,c)`（首个有效前收为预热）、`ts.atr(h,l,c,n)`（Wilder）、`ts.stoch(h,l,c,n)`（原始 %K 无 D 平滑）、`ts.willr(h,l,c,n)`（-100–0）、`ts.obv(c,v)`（首值取首个有效 volume，相等收盘不变）、`ts.mfi(h,l,c,v,n)`、`ts.macd/macd_signal/macd_hist(x,f,s,g)`（f<s，f/s/g∈[1,10000]）、`ts.bbands_upper/middle/lower(x,n,up,down)`（总体标准差，倍数非负且显式）。
-- 截面：`cs.rank(x)`（升序名次，0 起，并列平均，非百分位）、`cs.pct_rank(x)`（归一化截面排名 `[0,1]`：有效参考标的数 `M>1` 时为 `rank/(M-1)`，`M==1` 时为 `0.5`）、`cs.zscore(x)`（总体标准差；全同输出 0）、`cs.robust_zscore(x)`=(x−中位数)/(1.4826·MAD)（MAD=0 输出 0）、`cs.winsorize(x,tail)`（tail∈[0,0.5)，上下界为参考池插值分位数）、`cs.mad_winsorize(x,k)`（中位数 ± k·1.4826·MAD，k>0；MAD=0 全截到中位数）、`cs.quantile(x,q)`（q∈[0,1]；**输出截面常数**，参考池 q 分位广播，只适合阈值/分组，不能排名）。
+- 截面：`cs.rank(x)`（升序名次，0 起，并列平均，非百分位）、`cs.pct_rank(x)`（归一化截面排名 `[0,1]`：有效参考标的数 `M>1` 时为 `rank/(M-1)`，`M==1` 时为 `0.5`）、`cs.zscore(x)`（总体标准差；全同输出 0）、`cs.robust_zscore(x)`=(x−中位数)/(1.4826·MAD)（MAD=0 输出 0）、`cs.winsorize(x,tail)`（tail∈[0,0.5)，上下界为参考池插值分位数）、`cs.mad_winsorize(x,k)`（中位数 ± k·1.4826·MAD，k>0；MAD=0 全截到中位数）、`cs.quantile(x,q)`（q∈[0,1]；**输出截面常数**，参考池 q 分位广播，只适合阈值/分组，不能排名）、`cs.mean(x)` / `cs.sum(x)`（参考池有效样本的算术均值 / 总和广播为**截面常数**；如全市场趋势宽度 `cs.mean(kline.close > ts.sma(kline.close, 200))` ∈ `[0,1]` 或等权指数收益 `cs.mean(ts.return(kline.close, 1))`）。
 - 回归/分组：`group.residual(y,x)`（单变量截面 OLS 残差含截距，参考池拟合，需 ≥2 个有效对）、`group.ols(y,x1,...)`（多元，至少一个暴露）、`group.wls(y,w,x1,...)`（权重须正且有效）、`group.demean(x,"alias","field")` / `group.zscore(...)`（按分类字段组内去均值/z-score（总体标准差）；字段原始类型/NULL 保留，经 binding 采样；缺字段=Missing，NULL=Null）。
 
 - Go 同名：`ts.x`/`cs.x`→`factor.X`（MACD/BBands 返回三节点；`group.ols/wls`→`MultiResidual/WeightedResidual`；`group.demean/zscore`→`...ByField`），见第 6 节。
@@ -183,7 +183,9 @@ expressions:
 | --- | --- |
 | `builder` | PortfolioBuilder 名（`top-bottom-k-v1`；未注册报错） |
 | `k` | 正整数，缺省取 `params.k`，再缺省 10（`portfolio.k` 优先）；lifecycle 下可由 `selection` 替代 |
-| `long_notional` / `short_notional` | 策略 NAV 比例，非负（0.5 / 0.5） |
+| `long_notional` / `short_notional` | 策略 NAV 比例，非负（0.5 / 0.5）；可被保留输出列 `exposure_scale` / `long_scale` / `short_scale` 按期动态缩放 |
+| `long_min_score` / `short_max_score` | 可选绝对分数门控（区分未设与显式 `0`）：多头仅选 `score >= long_min_score`，空头仅选 `score <= short_max_score`（双动量常用 `long_min_score: 0`） |
+| `unfilled_slot_policy` / `asset_cap` | 通过门控数 `m < K` 时：`cash`（默认，每标的分 `notional/K`，未满槽位留现，`m==0` 清仓为空仓现金）或 `rescale`（集中分配到 `m` 个标的，单标的上限 `asset_cap`） |
 | `mode` | `full`（默认；本策略旧目标中省略的资产归零）或 `patch`（省略保留，显式 0 才清仓） |
 | `policy` | 缺省空（旧路径）；`lifecycle-v1` 或自定义 `name-vN`；`rebalance/selection/holding/transition/allocation/policy_params` **要求显式 `policy`**，否则报 `lifecycle fields require an explicit policy` |
 | `policy_params` | 自定义策略的有效 JSON（有界） |
@@ -198,7 +200,7 @@ expressions:
 
 固定寿命批次（替换 `transition`、去掉 `holding.min_bars`）：`transition: {mode: cohort, period_bars: 16, startup: gradual, sizing: entry-nav}`。gradual 每轮建 1/8 预算批次；seed-all 用当前排名一次建八个不同到期窗口的批次。同币批次先汇总净目标，到期与新建内部转移已确认贡献，不伪造成交与手续费；计划 8 单位只成交 4 单位时，首批到期后保留 3.5，不向旧批补足。
 
-**selection**：`long_k`/`short_k` 为当轮选择数（非持仓上限；缺省 `long_k=k`（long_notional>0）、`short_k=k`（short_notional>0））；或 `long_quantile`/`short_quantile`∈[0,1]（与对应 K 互斥）；`retain_rank`（≥0，持仓排名缓冲）；`dropout`（≥0，普通轮次替换数）；`group_quota`（map，值≥0，分组由调用方提供）；`missing_scores`：`skip`（默认）|`shrink`|`cash`。需 `long_notional+short_notional>0`。
+**selection**：`long_k`/`short_k` 为当轮选择数（非持仓上限；缺省 `long_k=k`（long_notional>0）、`short_k=k`（short_notional>0））；或 `long_quantile`/`short_quantile`∈[0,1]（与对应 K 互斥）；`long_min_score`/`short_max_score`（`*float64`，多头要求 `score >= *long_min_score`、空头要求 `score <= *short_max_score`，未通过门控的旧仓也不会被 `retain_rank` 保留）；`unfilled_slot_policy`：`cash`（默认，按 `notional/K` 留现，`0` 个通过时发空组合清仓）|`rescale`（集中分配，受 `allocation.asset_cap` 约束）；`retain_rank`（≥0，持仓排名缓冲）；`dropout`（≥0，普通轮次替换数）；`group_quota`（map，值≥0，分组由调用方提供）；`missing_scores`：`skip`（默认）|`shrink`|`cash`。需 `long_notional+short_notional>0`。
 
 **rebalance**：`every_bars`（正整数，默认 1）、`phase`（<every_bars，单位 bar）、`anchor`（绝对毫秒锚点，默认 0）、`duration`（如 `4h`）、`calendar`（`daily|weekly|monthly`，需 `calendar_version`，禁止 anchor/phase，`timezone` 默认 UTC；按时区日期/ISO 周/月换轮）。三者选一。轮号=`floor((grid−anchor−phase×bar)/interval)`，增大才调仓，首个决策总触发；节假日/分数变化触发需 Go 回调。
 
@@ -263,7 +265,8 @@ func (f FactorContext) Field(name string) *factor.Node
 type FactorSpec struct { Outputs map[string]*factor.Node; Combine research.ComboSpec }
 func RegisterFactor(name string, build func(FactorContext) (FactorSpec, error)) error
 ```
-- `Outputs` 非空；默认 `equal`+全部输出，可由 `Combine` 指定（YAML `combo` 覆盖）。
+- `Outputs` 非空；默认 `equal`+除保留缩放列外的全部输出，可由 `Combine` 指定（YAML `combo` 覆盖）。
+- **动态市场状态敞口缩放保留列**：`Outputs`（或 YAML `expressions.outputs`）可额外输出 `"exposure_scale"`（同时缩放多空）、`"long_scale"`（缩放 `LongNotional`）、`"short_scale"`（缩放 `ShortNotional`）。运行时自动从默认 `Combine.Columns` 排除它们，对当期有效标的取算术均值并钳制到 `[0, 1]`（全无效时按 `1.0`），乘到当期多/空目标总敞口（兼容默认 `TopBottomK` 与 `lifecycle-v1`）。例如 `Outputs{"score": mom, "exposure_scale": factor.CsMean(factor.Gt(close, factor.SMA(close, 200)))}` 即可按全市场均线宽度动态调节仓位。
 
 ### 5.2 `runner.RegisterDefinition`
 
@@ -356,7 +359,7 @@ func VWMA(p, v *Node, period int) *Node; ATR(h,l,c *Node, period int); Stoch/Wil
 func TR(h,l,c *Node) *Node; OBV(c,v *Node) *Node; MFI(h,l,c,v *Node, period int) *Node
 func MACD(x *Node, fast, slow, signal int) (line, signalLine, hist *Node)
 func BBands(x *Node, period int, stdUp, stdDown float64) (upper, middle, lower *Node)
-func Rank/PctRank/ZScore/RobustZScore(x *Node) *Node
+func Rank/PctRank/ZScore/RobustZScore/CsMean/CsSum(x *Node) *Node
 func Winsorize(x *Node, tail float64) *Node; MADWinsorize(x *Node, k float64) *Node; Quantile(x *Node, q float64) *Node
 func GroupDemeanByField(x, field *Node) *Node; GroupZScoreByField(x, field *Node) *Node
 func Residual(y, x *Node) *Node; MultiResidual(y *Node, xs ...*Node) *Node; WeightedResidual(y, w *Node, xs ...*Node) *Node

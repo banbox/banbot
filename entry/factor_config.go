@@ -39,6 +39,20 @@ func decodeFactorFields(fields map[string]any, target any) error {
 			if from != nil && (from.Kind() == reflect.Float32 || from.Kind() == reflect.Float64) && to.Kind() >= reflect.Int && to.Kind() <= reflect.Int64 {
 				return nil, fmt.Errorf("integer configuration field cannot accept a floating point value")
 			}
+			if to == reflect.TypeOf((*float64)(nil)) && value != nil {
+				v := reflect.ValueOf(value)
+				switch v.Kind() {
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					f := float64(v.Int())
+					return &f, nil
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					f := float64(v.Uint())
+					return &f, nil
+				case reflect.Float32, reflect.Float64:
+					f := v.Float()
+					return &f, nil
+				}
+			}
 			if to == reflect.TypeOf(decimal.Decimal{}) {
 				switch n := value.(type) {
 				case string:

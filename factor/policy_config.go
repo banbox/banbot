@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"strings"
 	"time"
 )
@@ -19,14 +20,17 @@ type RebalanceConfig struct {
 	Timezone        string `json:"timezone,omitempty" yaml:"timezone,omitempty"`
 }
 type SelectionConfig struct {
-	LongK         int            `json:"long_k,omitempty" yaml:"long_k,omitempty"`
-	ShortK        int            `json:"short_k,omitempty" yaml:"short_k,omitempty"`
-	LongQuantile  float64        `json:"long_quantile,omitempty" yaml:"long_quantile,omitempty"`
-	ShortQuantile float64        `json:"short_quantile,omitempty" yaml:"short_quantile,omitempty"`
-	RetainRank    int            `json:"retain_rank,omitempty" yaml:"retain_rank,omitempty"`
-	Dropout       int            `json:"dropout,omitempty" yaml:"dropout,omitempty"`
-	GroupQuota    map[string]int `json:"group_quota,omitempty" yaml:"group_quota,omitempty"`
-	MissingScores string         `json:"missing_scores,omitempty" yaml:"missing_scores,omitempty"`
+	LongK              int            `json:"long_k,omitempty" yaml:"long_k,omitempty"`
+	ShortK             int            `json:"short_k,omitempty" yaml:"short_k,omitempty"`
+	LongQuantile       float64        `json:"long_quantile,omitempty" yaml:"long_quantile,omitempty"`
+	ShortQuantile      float64        `json:"short_quantile,omitempty" yaml:"short_quantile,omitempty"`
+	LongMinScore       *float64       `json:"long_min_score,omitempty" yaml:"long_min_score,omitempty"`
+	ShortMaxScore      *float64       `json:"short_max_score,omitempty" yaml:"short_max_score,omitempty"`
+	UnfilledSlotPolicy string         `json:"unfilled_slot_policy,omitempty" yaml:"unfilled_slot_policy,omitempty"`
+	RetainRank         int            `json:"retain_rank,omitempty" yaml:"retain_rank,omitempty"`
+	Dropout            int            `json:"dropout,omitempty" yaml:"dropout,omitempty"`
+	GroupQuota         map[string]int `json:"group_quota,omitempty" yaml:"group_quota,omitempty"`
+	MissingScores      string         `json:"missing_scores,omitempty" yaml:"missing_scores,omitempty"`
 }
 type HoldingRule struct {
 	MinBars     int    `json:"min_bars,omitempty" yaml:"min_bars,omitempty"`
@@ -94,6 +98,14 @@ type PortfolioPolicyConfig struct {
 
 func ClonePortfolioPolicyConfig(c PortfolioPolicyConfig) PortfolioPolicyConfig {
 	c.PolicyParams = append(json.RawMessage(nil), c.PolicyParams...)
+	if c.Selection.LongMinScore != nil {
+		v := *c.Selection.LongMinScore
+		c.Selection.LongMinScore = &v
+	}
+	if c.Selection.ShortMaxScore != nil {
+		v := *c.Selection.ShortMaxScore
+		c.Selection.ShortMaxScore = &v
+	}
 	c.Selection.GroupQuota = maps.Clone(c.Selection.GroupQuota)
 	c.Holding.ByAsset = maps.Clone(c.Holding.ByAsset)
 	for name, o := range c.Holding.ByAsset {
@@ -218,6 +230,15 @@ func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyCon
 	}
 	if s.MissingScores != "skip" && s.MissingScores != "shrink" && s.MissingScores != "cash" {
 		return c, errors.New("factor: unknown missing score behavior")
+	}
+	if s.LongMinScore != nil && (math.IsNaN(*s.LongMinScore) || math.IsInf(*s.LongMinScore, 0)) {
+		return c, errors.New("factor: non-finite long_min_score")
+	}
+	if s.ShortMaxScore != nil && (math.IsNaN(*s.ShortMaxScore) || math.IsInf(*s.ShortMaxScore, 0)) {
+		return c, errors.New("factor: non-finite short_max_score")
+	}
+	if s.UnfilledSlotPolicy != "" && s.UnfilledSlotPolicy != "cash" && s.UnfilledSlotPolicy != "rescale" {
+		return c, errors.New("factor: unknown unfilled slot policy")
 	}
 	h := &c.Holding
 	if err := validateHolding(HoldingRule{h.MinBars, h.MaxBars, h.MinDuration, h.MaxDuration}); err != nil {

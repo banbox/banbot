@@ -121,6 +121,8 @@ func Quantile(input *Node, q float64) *Node {
 	n.Spec.Parameters["q"] = q
 	return n
 }
+func CsMean(input *Node) *Node { return node("cs-mean", CS, input) }
+func CsSum(input *Node) *Node  { return node("cs-sum", CS, input) }
 
 // GroupDemean samples the latest classification without an age limit for
 // compatibility. Use GroupDemeanByField to declare an explicit sampling contract.
@@ -432,7 +434,7 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 	}
 	expectedKind := TS
 	switch spec.Operator {
-	case "rank", "pct-rank", "zscore", "winsorize", "quantile", "robust-zscore", "mad-winsorize":
+	case "rank", "pct-rank", "zscore", "winsorize", "quantile", "robust-zscore", "mad-winsorize", "cs-mean", "cs-sum":
 		expectedKind = CS
 	case "group-demean", "group-zscore", "residual", "multi-residual", "weighted-residual":
 		expectedKind = GROUP
@@ -539,9 +541,9 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 				return errors.New("factor: invalid ddof")
 			}
 		}
-	case "rank", "pct-rank", "zscore", "robust-zscore":
-		if spec.Operator == "pct-rank" && len(spec.Parameters) != 0 {
-			return errors.New("factor: pct-rank does not accept scalar parameters")
+	case "rank", "pct-rank", "zscore", "robust-zscore", "cs-mean", "cs-sum":
+		if (spec.Operator == "pct-rank" || spec.Operator == "cs-mean" || spec.Operator == "cs-sum") && len(spec.Parameters) != 0 {
+			return fmt.Errorf("factor: %s does not accept scalar parameters", spec.Operator)
 		}
 	case "mad-winsorize":
 		if spec.Parameters["multiple"] <= 0 {

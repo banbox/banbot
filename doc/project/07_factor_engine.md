@@ -30,11 +30,11 @@
 | `batch.go` | `Plan.Batch` 整段历史计算；静态 universe 走 `banta/tav`，动态 universe 退化为 `Session` |
 | `value.go` | `Numeric`（值 + `Validity`）、`Number()`、`contentHash`（按位哈希，`-0` 与 `+0` 不同；`map[string]any` 标量行走无 fmt 的快速编码，输出字节与反射路径一致）、`cloneValues`（标量行直接拷贝 map，其余走反射深拷贝） |
 | `pointwise.go` | 逐点算子：算术、`sign`、`clip`、比较（`gt`/`ge`/`lt`/`le`）与条件选择 `where`（`cond` 有效时仅要求被选中的分支有效） |
-| `operators.go` | 截面算子：rank、pct-rank（`[0, 1]` 归一化，`M == 1` 为 `0.5`）、zscore、robust-zscore、winsorize、quantile、group 系列、residual |
+| `operators.go` | 截面算子：rank、pct-rank（`[0, 1]` 归一化，`M == 1` 为 `0.5`）、zscore、robust-zscore、winsorize、quantile、cs-mean / cs-sum（全池算术均值 / 求和截面广播）、group 系列、residual |
 | `indicators.go` / `indicators_runtime.go` / `rolling.go` | 技术指标与时序滚动统计算子（`ts-corr`/`ts-cov`/`ts-beta`/`ts-sum`/`ts-product`/`ts-rank`/`ts-zscore`/`ts-argmax`/`ts-argmin`/`ts-skew`/`ts-kurt`/`ts-slope`/`ts-rsquare`、`DecayLinear` 复用 `WMA`）声明、参数校验、lookback、增量与批量实现（含 RSI 的 Wilder 状态） |
 | `snapshot.go` | `Universe`、`SnapshotSpec`、`Freeze` 冻结输入（PIT 视图）、`Requirement`/`StreamKey`/`SnapshotStatus` |
 | `allocation.go` | `PortfolioTarget`、`Allocation`；十进制精确数量运算（`big.Rat`）、默认量子 1e-18 |
-| `portfolio.go` | `PortfolioSpec`、`FrozenBudget`、`TargetPortfolio`（Full/Patch 生效目标）、`TopBottomK*` |
+| `portfolio.go` | `PortfolioSpec`、`FrozenBudget`、`TargetPortfolio`（Full/Patch 生效目标）、`TopBottomK*` / `ScoreGate`（含 `long_min_score`/`short_max_score` 绝对分数门控与 `unfilled_slot_policy`）、`ExposureScales`（动态多空敞口缩放保留列解析） |
 | `policy.go` | `LifecyclePolicy.Propose` 主流程；`LifecycleState`、`AssetLifecycle`、`PortfolioCohort`；checkpoint 编解码；`AssetForgetter`/`LifecyclePolicy.ForgetAssets`（PIT 剔除时清洗 checkpoint） |
 | `policy_config.go` | 组合策略 JSON 配置结构（Rebalance/Selection/Holding/Transition/Allocation）与 `NormalizePortfolioPolicyConfig` |
 | `policy_cohort.go` | cohort 模式：批次创建、成交对账、过期与内部转移 |
@@ -90,7 +90,7 @@
 | `policy_registry.go` | 组合策略注册表（内置 `lifecycle-v1` → `NewLifecyclePolicy`） |
 | `definition.go` | 全局 definition 注册表、builder 与 portfolio factory 注册；`PreparePortfolioConfig` |
 | `computation.go` | 共享计算：`ComputationGroup`、`sharedComputation`、`computationKey`、`RunMany`（多消费者 lockstep） |
-| `decision.go` | `compileDecision`、`decisionEngine`（`evaluate`→`combine`→`buildPortfolio`） |
+| `decision.go` | `compileDecision`（默认合成列自动剔除 `exposure_scale`/`long_scale`/`short_scale` 保留列）、`decisionEngine`（`evaluate`→`combine`→`buildPortfolio`，支持动态敞口缩放与绝对分数门控） |
 | `input.go` | 归档输入 `archiveInput`（`OpenVersionStore` 全量加载后分批）与 `replayInput` |
 | `storage_input.go` | 分页存储输入：strict（需 `VersionPageFactory`）与 static-approximation（`QueryPage`）两种可见性策略；static 路径对 K 线流在后台预读下一页（页内容与顺序不变，`QueryPage` 对 K 线流须可并发调用）。后台并发由 `data.prefetch_concurrency`（缺省 4，范围 1..32，不进入输入身份）限制，且在同一 factory 的所有输入间共享：**每个回测进程额外占用的 Postgres 连接 ≤ `prefetch_concurrency`（缺省 4），另加每个正在回放的输入同步读取的 1 个**。已预读但未消费的页（每流至多一页，≤ `prefetch_rows` = 页大小×流数 ≤ `max_records/2` 行）不计入保留预算，常驻行数上界为 1.5×`max_records`；`pctx` 派生自首次 `Next` 的 ctx，调用方须全程传同一个运行级 ctx。页大小 = `prefetch_rows / 流数`，`prefetch_rows` 缺省取 `max_records / 2`，`max_records` 缺省 500000（`entry/factor_config.go:defaultFactorMaxRecords`；它进入输入身份哈希，因此改默认值会改变 ManifestID，不影响指标与事件） |
 | `account_sink.go` | `AccountSink`：`RegisterExecution`、`ObserveQuote`、`StrategyState`（NAV）、`ProcessSnapshot`、资金费观测 |
@@ -196,7 +196,7 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 `LifecyclePolicy.Propose`（`policy.go`）：
 - 先 `NormalizePortfolioPolicyConfig`（构造时）与 `DecodeLifecycleState`，再 `pruneReleasedLifecycle`；
 - cohort 分支 `proposeCohort`（`policy_cohort.go`）：`ReconcileCohortContributions`、`TransferCohortContributions`；
-- 普通分支：`SelectPortfolioScore` → `AllocateSelected`（`policy_selection.go`）→ `applyRetention`（`policy_constraints.go`）→ 逐资产过渡循环 → `allocateRemainder` → `constrain` → `finish` → `NewPortfolioTarget`（`portfolio.go`）。
+- 普通分支：`effectiveConfig`（按当期 `Frame` 中可选 `exposure_scale` / `long_scale` / `short_scale` 动态缩放多空预算，不修改静态 `ConfigHash`）→ `SelectPortfolioScore`（含 `long_min_score` / `short_max_score` 阈值门控与 `unfilled_slot_policy`）→ `AllocateSelected`（`policy_selection.go`）→ `applyRetention`（`policy_constraints.go`，阈值门控不通过的持仓不被 `retain_rank`/`dropout` 保留）→ 逐资产过渡循环 → `allocateRemainder` → `constrain` → `finish` → `NewPortfolioTarget`（`portfolio.go`）。
 
 运行态在 `runner/policy_run.go`：`policyRun.propose`（`:73`）与 `refresh`（`:151`）产出 `pendingProposal`（`:36`），版本号递增（`:194`）。
 
@@ -250,7 +250,8 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 - YAML 由 `entry/factor_config.go` 解析为结构体，本包的 `PortfolioPolicyConfig` 只有 JSON 标签（`policy_config.go`）。YAML 键到字段的映射在调用方完成。
 - 组合策略主要键（`policy_config.go`）：
   - `rebalance`：`every_bars`、`anchor`、`phase`、`duration`、`calendar`（daily/weekly/monthly）、`calendar_version`、`timezone`。
-  - `selection`：`long_k`、`short_k`、`long/short_quantile`、`retain_rank`、`dropout`、`group_quota`、`missing_scores`（skip/shrink/cash）。
+  - `selection`：`long_k`、`short_k`、`long/short_quantile`、`long_min_score` / `short_max_score`（`*float64`，区分未设 `nil` 与显式 `0`，多头要求 `score >= *long_min_score`、空头要求 `score <= *short_max_score`）、`unfilled_slot_policy`（`cash` 默认按固定槽位留现 / `rescale` 集中分配并受 `asset_cap` 约束）、`retain_rank`、`dropout`、`group_quota`、`missing_scores`（skip/shrink/cash）。无 `policy` 的默认 `TopBottomK` 路径同样可在 `portfolio` 下直接配置 `long_min_score`、`short_max_score`、`unfilled_slot_policy`、`asset_cap`。
+  - 动态敞口缩放列：因子 `Outputs`（`RegisterFactor` 或 `expressions.outputs`）若声明保留列名 `exposure_scale`、`long_scale`、`short_scale`，默认合成列自动排除它们，决策时跨有效标的取算术均值并钳制到 `[0, 1]`（全无效按 `1.0`），动态乘到当期 `LongNotional` / `ShortNotional`。
   - `holding`：`min/max_bars`、`min/max_duration`、`by_asset`、`adopt`（adopt/reject）、`cooldown_bars`。
   - `transition`：`mode`（direct/target-step/linear-exit/geometric/cohort）、`basis`、`exit_steps`、`ratio`、`final_threshold`、`alpha`、`period_bars`、`startup`、`sizing`、`on_reselect`、`entry_window_bars`、`by_asset`。
   - `allocation`：`method`、`reserve_ratio`、`fixed_notional`、`vol_target`、`asset_cap`、`group_caps`、`turnover_limit`、`net_cap`、`beta_cap`。

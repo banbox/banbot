@@ -245,6 +245,17 @@ func (p *LifecyclePolicy) ForgetAssets(raw json.RawMessage, sids []int32) (json.
 	return json.Marshal(s)
 }
 func (p *LifecyclePolicy) Config() PortfolioPolicyConfig { return ClonePortfolioPolicyConfig(p.config) }
+func (p *LifecyclePolicy) effectiveConfig(c PortfolioContext) PortfolioPolicyConfig {
+	cfg := ClonePortfolioPolicyConfig(p.config)
+	if !c.RiskOnly {
+		longScale, shortScale, active := ExposureScales(c.Frame, c.Universe)
+		if active {
+			cfg.LongNotional *= longScale
+			cfg.ShortNotional *= shortScale
+		}
+	}
+	return cfg
+}
 func scheduleRound(c RebalanceConfig, grid, bar int64) (int64, error) {
 	if bar <= 0 {
 		return 0, errors.New("factor: positive policy base bar required")
@@ -588,6 +599,7 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 	if p.config.Transition.Mode == "cohort" {
 		return p.proposeCohort(c, s, due, round)
 	}
+	cfg := p.effectiveConfig(c)
 	var reasons []Diagnostic
 	desired := map[int32]float64{}
 	selectionValid := !c.RiskOnly
@@ -595,7 +607,7 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 	} else if c.Ideal != nil {
 		desired = c.Ideal.Targets()
 	} else {
-		ideal, diag, e := SelectPortfolioScore(c.Frame, c.Universe, c.Spec, p.config, c.ScoreName, c.Groups)
+		ideal, diag, e := SelectPortfolioScore(c.Frame, c.Universe, c.Spec, cfg, c.ScoreName, c.Groups)
 		if e != nil {
 			return PortfolioProposal{}, e
 		}
@@ -612,12 +624,12 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 			scores[v.sid] = v.score
 		}
 		if !c.PreserveIdealWeights {
-			desired, err = AllocateSelected(desired, p.config, c.Spec.Budget.NAV, scores, c.Volatility)
+			desired, err = AllocateSelected(desired, cfg, c.Spec.Budget.NAV, scores, c.Volatility)
 			if err != nil {
 				return PortfolioProposal{}, err
 			}
 		}
-		p.applyRetention(c, s, desired)
+		p.applyRetention(c, s, desired, cfg)
 	}
 	targets := map[int32]Allocation{}
 	for sid, a := range s.Assets {
@@ -830,7 +842,7 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 				}
 			}
 		}
-		p.allocateRemainder(c, s, desired, targets, hard, &reasons)
+		p.allocateRemainder(c, s, desired, targets, hard, &reasons, cfg)
 		s.LastRound = round
 		s.HasRound = true
 	}
@@ -842,7 +854,7 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 		targets = riskTargets
 	}
 	if emit {
-		if err := p.constrain(c, s, targets, hard, &reasons); err != nil {
+		if err := p.constrain(c, s, targets, hard, &reasons, cfg); err != nil {
 			return PortfolioProposal{}, err
 		}
 		for sid, a := range targets {

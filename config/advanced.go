@@ -34,11 +34,11 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.HasSuffix(path, ".combo"), strings.HasSuffix(path, ".expressions.combine"):
 		allowed = "method columns weights min_samples min_pairs min_confidence decay direction fallback label"
 	case strings.HasSuffix(path, ".portfolio"):
-		allowed = "builder k long_notional short_notional mode policy policy_params rebalance selection holding transition allocation"
+		allowed = "builder k long_notional short_notional long_min_score short_max_score unfilled_slot_policy asset_cap mode policy policy_params rebalance selection holding transition allocation"
 	case strings.HasSuffix(path, ".rebalance"):
 		allowed = "every_bars anchor phase duration calendar calendar_version timezone"
 	case strings.HasSuffix(path, ".selection"):
-		allowed = "long_k short_k long_quantile short_quantile retain_rank dropout group_quota missing_scores"
+		allowed = "long_k short_k long_quantile short_quantile long_min_score short_max_score unfilled_slot_policy retain_rank dropout group_quota missing_scores"
 	case strings.HasSuffix(path, ".holding"):
 		allowed = "min_bars max_bars min_duration max_duration by_asset adopt cooldown_bars"
 	case strings.Contains(path, ".holding.by_asset."):
@@ -131,10 +131,19 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if !nonnegativeInteger(value) {
 				return fmt.Errorf("%s must be a nonnegative integer", field)
 			}
-		case "initial_nav", "long_notional", "short_notional", "fee_rate", "slippage_rate", "funding_apr", "periods_per_year":
+		case "initial_nav", "long_notional", "short_notional", "asset_cap", "fee_rate", "slippage_rate", "funding_apr", "periods_per_year":
 			number := numeric(value)
 			if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
 				return fmt.Errorf("%s must be a finite nonnegative number", field)
+			}
+		case "long_min_score", "short_max_score":
+			number := numeric(value)
+			if math.IsNaN(number) || math.IsInf(number, 0) {
+				return fmt.Errorf("%s must be a finite number", field)
+			}
+		case "unfilled_slot_policy":
+			if text, ok := value.(string); !ok || (text != "cash" && text != "rescale") {
+				return fmt.Errorf("%s must be cash or rescale", field)
 			}
 		case "pit_min_universe_ratio", "pit_delist_penalty_bps":
 			// 0 = default; pit_min_universe_ratio < 0 disables the PIT reduction (and must not exceed 1),

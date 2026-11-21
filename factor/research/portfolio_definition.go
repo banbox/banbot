@@ -3,12 +3,22 @@ package research
 import (
 	"encoding/json"
 	"errors"
+	"math"
+
 	"github.com/banbox/banbot/factor"
 )
 
 // ClonePortfolioDefinition preserves legacy JSON identity when policy is absent.
 func ClonePortfolioDefinition(d PortfolioDefinition) PortfolioDefinition {
 	d.PolicyParams = append(json.RawMessage(nil), d.PolicyParams...)
+	if d.LongMinScore != nil {
+		v := *d.LongMinScore
+		d.LongMinScore = &v
+	}
+	if d.ShortMaxScore != nil {
+		v := *d.ShortMaxScore
+		d.ShortMaxScore = &v
+	}
 	if d.Rebalance != nil {
 		value := *d.Rebalance
 		d.Rebalance = &value
@@ -47,6 +57,17 @@ func (d PortfolioDefinition) PolicyConfig() (factor.PortfolioPolicyConfig, error
 			c.Selection.ShortK = d.K
 		}
 	}
+	if c.Selection.LongMinScore == nil && d.LongMinScore != nil {
+		v := *d.LongMinScore
+		c.Selection.LongMinScore = &v
+	}
+	if c.Selection.ShortMaxScore == nil && d.ShortMaxScore != nil {
+		v := *d.ShortMaxScore
+		c.Selection.ShortMaxScore = &v
+	}
+	if c.Selection.UnfilledSlotPolicy == "" && d.UnfilledSlotPolicy != "" {
+		c.Selection.UnfilledSlotPolicy = d.UnfilledSlotPolicy
+	}
 	if d.Holding != nil {
 		c.Holding = *d.Holding
 	}
@@ -56,10 +77,25 @@ func (d PortfolioDefinition) PolicyConfig() (factor.PortfolioPolicyConfig, error
 	if d.Allocation != nil {
 		c.Allocation = *d.Allocation
 	}
+	if c.Allocation.AssetCap == 0 && d.AssetCap > 0 {
+		c.Allocation.AssetCap = d.AssetCap
+	}
 	return factor.NormalizePortfolioPolicyConfig(c)
 }
 
 func (d PortfolioDefinition) ValidatePolicy() error {
+	if d.LongMinScore != nil && (math.IsNaN(*d.LongMinScore) || math.IsInf(*d.LongMinScore, 0)) {
+		return errors.New("research: non-finite portfolio long_min_score")
+	}
+	if d.ShortMaxScore != nil && (math.IsNaN(*d.ShortMaxScore) || math.IsInf(*d.ShortMaxScore, 0)) {
+		return errors.New("research: non-finite portfolio short_max_score")
+	}
+	if d.UnfilledSlotPolicy != "" && d.UnfilledSlotPolicy != "cash" && d.UnfilledSlotPolicy != "rescale" {
+		return errors.New("research: unknown portfolio unfilled_slot_policy")
+	}
+	if d.AssetCap < 0 || math.IsNaN(d.AssetCap) || math.IsInf(d.AssetCap, 0) {
+		return errors.New("research: invalid portfolio asset_cap")
+	}
 	if d.Policy == "" {
 		if d.PolicyParams != nil || d.Rebalance != nil || d.Selection != nil || d.Holding != nil || d.Transition != nil || d.Allocation != nil {
 			return errors.New("research: portfolio lifecycle fields require an explicit policy")

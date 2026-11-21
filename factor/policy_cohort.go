@@ -233,13 +233,14 @@ func (p *LifecyclePolicy) proposeCohort(c PortfolioContext, s LifecycleState, du
 			expired = true
 		}
 	}
+	cfg := p.effectiveConfig(c)
 	selected := map[int32]float64{}
 	selectionValid := !c.RiskOnly
 	if c.RiskOnly {
 	} else if c.Ideal != nil {
 		selected = c.Ideal.Targets()
 	} else {
-		ideal, diag, err := SelectPortfolioScore(c.Frame, c.Universe, c.Spec, p.config, c.ScoreName, c.Groups)
+		ideal, diag, err := SelectPortfolioScore(c.Frame, c.Universe, c.Spec, cfg, c.ScoreName, c.Groups)
 		if err != nil {
 			return PortfolioProposal{}, err
 		}
@@ -267,7 +268,7 @@ func (p *LifecyclePolicy) proposeCohort(c PortfolioContext, s LifecycleState, du
 		}
 		var err error
 		if !c.PreserveIdealWeights {
-			selected, err = AllocateSelected(selected, p.config, c.Spec.Budget.NAV, scores, c.Volatility)
+			selected, err = AllocateSelected(selected, cfg, c.Spec.Budget.NAV, scores, c.Volatility)
 			if err != nil {
 				return PortfolioProposal{}, err
 			}
@@ -394,7 +395,7 @@ func (p *LifecyclePolicy) proposeCohort(c PortfolioContext, s LifecycleState, du
 	}
 	emit := expired || due && selectionValid
 	if emit {
-		if err := p.constrain(c, s, targets, hard, &reasons); err != nil {
+		if err := p.constrain(c, s, targets, hard, &reasons, cfg); err != nil {
 			return PortfolioProposal{}, err
 		}
 		for sid, target := range targets {

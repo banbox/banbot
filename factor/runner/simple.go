@@ -68,7 +68,10 @@ func RegisterFactor(name string, build func(FactorContext) (FactorSpec, error)) 
 			combo.Method = research.Equal
 		}
 		if len(combo.Columns) == 0 {
-			combo.Columns = plan.Outputs()
+			combo.Columns = defaultComboColumns(plan.Outputs())
+			if len(combo.Columns) == 0 {
+				return nil, research.ComboSpec{}, fmt.Errorf("runner: factor %q declares no score outputs", name)
+			}
 		}
 		return plan, combo, nil
 	})
