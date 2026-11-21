@@ -77,8 +77,9 @@ type State struct {
 	infoJobsMu    sync.RWMutex
 	policyMu      sync.Mutex
 	policyFilters map[string][]goods.IFilter
-	refineMu      sync.RWMutex
-	refineTF      map[string]map[string]string
+	refineMu       sync.RWMutex
+	refineTF       map[string]map[string]string
+	strategyRefine map[string]any
 	// Registry snapshots are rebuilt only after a registry write. Readers on
 	// the bar path borrow these immutable maps instead of cloning them for
 	// every event. The underlying StratJob pointers remain state-owned; only
@@ -107,6 +108,7 @@ func NewState() *State {
 		cacheStrats:         make(map[string]*TradeStrat),
 		policyFilters:       make(map[string][]goods.IFilter),
 		refineTF:            make(map[string]map[string]string),
+		strategyRefine:      make(map[string]any),
 		accountPeakEquities: make(map[string]float64),
 	}
 }
@@ -368,6 +370,54 @@ func runtimePoliciesFor(state *State) []*config.RunPolicyConfig {
 	return nil
 }
 
+func (s *State) clearRefineCache() {
+	if s == nil || s == legacyState {
+		return
+	}
+	s.refineMu.Lock()
+	s.refineTF = make(map[string]map[string]string)
+	s.strategyRefine = make(map[string]any)
+	s.refineMu.Unlock()
+}
+
+// SetStrategyRefineTF records a strategy-level refine_tf selector on this runtime state
+// (used when RunPolicyConfig.RefineTF in the outer config snapshot is unset) and clears
+// any cached mapping for strategyName.
+func (s *State) SetStrategyRefineTF(strategyName string, refine any) {
+	if s == nil || s == legacyState || strategyName == "" {
+		return
+	}
+	s.refineMu.Lock()
+	if s.strategyRefine == nil {
+		s.strategyRefine = make(map[string]any)
+	}
+	if refine == nil {
+		delete(s.strategyRefine, strategyName)
+	} else {
+		s.strategyRefine[strategyName] = refine
+	}
+	if s.refineTF != nil {
+		delete(s.refineTF, strategyName)
+	}
+	s.refineMu.Unlock()
+}
+
+func (s *State) setStrategyRefineDefault(strategyName string, refine any) {
+	if s == nil || s == legacyState || strategyName == "" || refine == nil {
+		return
+	}
+	s.refineMu.Lock()
+	if s.strategyRefine == nil {
+		s.strategyRefine = make(map[string]any)
+	}
+	prev, exists := s.strategyRefine[strategyName]
+	s.strategyRefine[strategyName] = refine
+	if (!exists || fmt.Sprintf("%v", prev) != fmt.Sprintf("%v", refine)) && s.refineTF != nil {
+		delete(s.refineTF, strategyName)
+	}
+	s.refineMu.Unlock()
+}
+
 func (s *State) refineTimeFrame(strategyName, timeframe string) string {
 	if s == nil || s == legacyState {
 		return config.EnsureStratRefineTF(strategyName, timeframe)
@@ -379,6 +429,7 @@ func (s *State) refineTimeFrame(strategyName, timeframe string) string {
 			return refined
 		}
 	}
+	fallbackRefine := s.strategyRefine[strategyName]
 	s.refineMu.RUnlock()
 
 	var refine any
@@ -388,10 +439,16 @@ func (s *State) refineTimeFrame(strategyName, timeframe string) string {
 			break
 		}
 	}
+	if refine == nil {
+		refine = fallbackRefine
+	}
 	refined := runtimeRefineTimeFrame(refine, timeframe)
 	s.refineMu.Lock()
 	if s.refineTF == nil {
 		s.refineTF = make(map[string]map[string]string)
+	}
+	if s.strategyRefine == nil {
+		s.strategyRefine = make(map[string]any)
 	}
 	if s.refineTF[strategyName] == nil {
 		s.refineTF[strategyName] = make(map[string]string)
@@ -526,6 +583,9 @@ func (s *State) ensureMaps() {
 	if s.refineTF == nil {
 		s.refineTF = make(map[string]map[string]string)
 	}
+	if s.strategyRefine == nil {
+		s.strategyRefine = make(map[string]any)
+	}
 	s.accountMetricsMu.Lock()
 	if s.accountPeakEquities == nil {
 		s.accountPeakEquities = make(map[string]float64)
@@ -619,6 +679,7 @@ func (s *State) Reset() {
 	s.policyMu.Unlock()
 	s.refineMu.Lock()
 	s.refineTF = make(map[string]map[string]string)
+	s.strategyRefine = make(map[string]any)
 	s.refineMu.Unlock()
 	s.infoJobsMu.Unlock()
 	s.SetWsSubUnWatch(nil)
@@ -862,6 +923,13 @@ func (state *State) NewStrategyChecked(pol *config.RunPolicyConfig) (*TradeStrat
 func (state *State) newStrategy(pol *config.RunPolicyConfig) (*TradeStrat, *config.BadParamError) {
 	key := pol.ID() + "\n" + pol.ToYaml()
 	if stgy, ok := state.GetCachedStrategy(key); ok {
+		if stgy != nil {
+			if stgy.Policy != nil && stgy.Policy.RefineTF != nil {
+				state.setStrategyRefineDefault(stgy.Name, stgy.Policy.RefineTF)
+			} else if stgy.RefineTF != nil {
+				state.setStrategyRefineDefault(stgy.Name, stgy.RefineTF)
+			}
+		}
 		return stgy, nil
 	}
 
@@ -881,7 +949,13 @@ func (state *State) newStrategy(pol *config.RunPolicyConfig) (*TradeStrat, *conf
 	if stgy.MinTfScore == 0 {
 		stgy.MinTfScore = 0.75
 	}
+	if localPol.RefineTF == nil && stgy.RefineTF != nil {
+		localPol.RefineTF = stgy.RefineTF
+	}
 	stgy.Policy = localPol
+	if localPol.RefineTF != nil {
+		state.setStrategyRefineDefault(stgy.Name, localPol.RefineTF)
+	}
 	runtimeCfg := runtimeConfigFor(state)
 	stgy.runtimeConfig = runtimeCfg
 	stgy.runtimeAccounts = state.runtimeAccounts

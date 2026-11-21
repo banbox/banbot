@@ -309,7 +309,7 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `EachMaxLong`/`EachMaxShort`（int）：单品种同向最大订单数；0 不限，-1 禁止该向
 - `TimeFrames`（string）：旧写法：逗号分隔周期
 - `RunTimeFrames`（[]string）：允许的周期（空则取 `run_policy.run_timeframes`，再 `TimeFrames`，再根配置）
-- `RefineTF`（interface{}）：撮合周期（同 `refine_tf`）
+- `RefineTF`（interface{}）：策略默认子周期撮合粒度（如 `"5m"`、`"1m"`、`12`、`"3-6"`；YAML `run_policy[].refine_tf` 未设置时自动生效，显式配置优先覆盖）
 - `WsSubs`（map[string]string）：实盘 Ws 订阅配置（`OnWs*` 需要）
 - `Outputs`（[]string）：策略输出文本
 - `OnStartUp`（`func(*StratJob)`）：每个 job 创建时调用一次；在此初始化 `s.More`
@@ -510,6 +510,30 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
   - 输入各品种方向/强度信号 `signals`（如 `+1`/`-1`/`0` 或连续打分）、`atrPeriod`（`<=0` 默认 `14`）及目标总绝对敞口 `targetGross`（如 `0.8`）。
   - 内部对每个 `job` **无条件计算** `ta.NATR(e.High, e.Low, e.Close, atrPeriod)`（保证 `signal==0` 时增量 RMA 序列缓存不错位），按 `signal / NATR` 波动率倒数赋予低波动品种更高权重、高波动品种更低权重，并精确归一化使 `Σ|w| == targetGross`。
 - **`strat.BarPriority(barMS int64, symbol string, seed uint64) uint64`**：同 bar 多品种中性可复现 64 位哈希优先级（数值越小越优先）。
+
+### 3.10 粗周期 K 线网格与双边限价做市（`RefineTF` + `OnOrderChange` 因果补单）
+适用于 `1h`/`4h`/`1d` 等中粗周期上同时挂多层买/卖限价单（网格、通道回归、ATR 阶梯挂单）并在某档成交后立刻挂出反向止盈/补单的策略：
+- **声明子周期撮合**：在 `TradeStrat` 设置 `RefineTF: "5m"`（或 `"1m"` / 整数等分倍数如 `12`；YAML `run_policy[].refine_tf` 可覆盖），并保持 `EachMaxLong: 0, EachMaxShort: 0`（或设为网格档位数上限），同时确保全局 `max_open_orders` / `max_simul_open` 足够容纳挂单档位数。
+- **子 K 线时序推进与 `OnOrderChange` 即时补单**：主周期 `OnData(Main)` 挂出的多档 `Limit` / `Stop-Limit` / 止盈止损单在回测中按 `RefineTF` 子 K 线逐根推进，同一子 K 线内触发的多档挂单按模拟成交时间先后顺序依次成交并触发 `OnOrderChange(s, od, strat.OdChgEnterFill)` / `OdChgExitFill`。
+- **快照同步与严格无前视**：进入 `OnOrderChange` 前框架已同步刷新 `s.GetOrders` / `s.GetOrderNum` / `s.Position`；在 `OnOrderChange` 内调用 `s.OpenOrder`（反向对冲限价单或下一档补单）或 `s.CloseOrders`（如指定 `OrderID: od.ID, Limit: tpPrice` 挂限价平仓单）会被立即排空激活，且严格从当前成交时刻 + `bt_net_cost` 之后的剩余子 K 线及后续子 K 线开始匹配（绝不回看成交前的历史极值）。
+- **回测近似资金费对称结算**：线性永续合约在未加载历史 `funding_rate` 序列时，`bt_funding_apr` 双边对称计费（正费率下多头支付 `+cost`、空头获得 `-cost` 补贴，1:1 多空对冲净资金费为 `0`）。
+
+```go
+// TradeStrat 设 RefineTF: "5m", EachMaxLong: 0, EachMaxShort: 0：
+// 1) OnData(Main) 在 1h 收盘按中枢布设上下网格限价单（或直接给每笔买单附带 TakeProfit: buyPx + step）；
+// 2) OnOrderChange 在 5m 子 K 线某档买单成交时立即补挂高一档限价平仓/反向单，同一小时内后续 5m 子 K 线冲高即可成交：
+OnOrderChange: func(s *strat.StratJob, od *ormo.InOutOrder, chgType int) {
+	st := s.More.(*gridState)
+	if chgType == strat.OdChgEnterFill && strings.HasPrefix(od.EnterTag, "grid_buy_") {
+		_ = s.CloseOrders(&strat.ExitReq{
+			Tag:     "grid_tp_" + od.EnterTag,
+			OrderID: od.ID,
+			Dirt:    core.OdDirtLong,
+			Limit:   od.Enter.Average + st.step,
+		})
+	}
+},
+```
 
 ## 4. 下单、止损止盈与仓位细则
 ### 4.1 开仓与平仓

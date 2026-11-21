@@ -73,4 +73,8 @@ package core
 //	   engine (UTC buckets, 3d/1w anchored like the engine, incomplete trailing bucket dropped, bar visible at bucket close);
 //	   builds < 14 fail such runs with `series event missing field "open"`. An unsupported timeframe is rejected up front with
 //	   the supported set. Stored timeframes (15m/1h/1d/5m) and the time-series engine are byte-identical to level 13
-const BtFeatureLevel = 14
+//	15 time-series bilateral symmetric approximate funding (bt_funding_apr): linear perpetual contract shorts receive the same
+//	   baseline rate that longs pay (negative exit-leg funding cost, zero net funding drift on equal-notional long+short hedges;
+//	   bt_legacy_approx_funding: true restores pre-level-15 unilateral long-only charging); strategy-level TradeStrat.RefineTF
+//	   defaults and causal refine_tf sub-bar OnOrderChange replenishment
+const BtFeatureLevel = 15

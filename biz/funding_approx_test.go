@@ -39,14 +39,22 @@ func TestAddApproxFunding055(t *testing.T) {
 		t.Fatalf("inverse must be skipped and tagged")
 	}
 	sh := mk(true)
-	addApproxFunding(sh, 36.5, true, false, 0)
+	addApproxFunding(sh, 36.5, true, false, 0) // bilateral symmetric: short receives +10 credit (FeeQuote = 1 - 10 = -9)
+	if math.Abs(sh.Exit.FeeQuote-(-9)) > 1e-9 || math.Abs(sh.Exit.Fee-(-9)) > 1e-9 {
+		t.Fatalf("short bilateral fee %v %v, want -9", sh.Exit.Fee, sh.Exit.FeeQuote)
+	}
+	if f := sh.GetInfoFloat64("funding"); math.Abs(f-(-10)) > 1e-9 {
+		t.Fatalf("short bilateral funding info %v, want -10", f)
+	}
+	shLegacy := mk(true)
+	addApproxFundingWithMode(shLegacy, 36.5, true, false, true, 0)
 	spot := mk(false)
 	addApproxFunding(spot, 36.5, false, false, 0)
 	off := mk(false)
 	addApproxFunding(off, 0, true, false, 0)
-	for _, od := range []*ormo.InOutOrder{sh, spot, off} {
-		if od.Exit.FeeQuote != 1 {
-			t.Fatalf("must not charge: %v", od.Exit.FeeQuote)
+	for _, od := range []*ormo.InOutOrder{shLegacy, spot, off} {
+		if od.Exit.FeeQuote != 1 || od.GetInfoFloat64("funding") != 0 {
+			t.Fatalf("must not charge: fee=%v funding=%v", od.Exit.FeeQuote, od.GetInfoFloat64("funding"))
 		}
 	}
 }

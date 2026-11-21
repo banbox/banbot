@@ -176,6 +176,13 @@ func (s *StratJob) BindRuntimeState(state *State, coreState *core.State, clock *
 		if s.runtimeExchange == nil {
 			s.runtimeExchange = state.Exchange
 		}
+		if s.Strat != nil && s.Strat.Name != "" {
+			if s.Strat.Policy != nil && s.Strat.Policy.RefineTF != nil {
+				state.setStrategyRefineDefault(s.Strat.Name, s.Strat.Policy.RefineTF)
+			} else if s.Strat.RefineTF != nil {
+				state.setStrategyRefineDefault(s.Strat.Name, s.Strat.RefineTF)
+			}
+		}
 	}
 	s.runtimeCore = coreState
 	s.runtimeClock = clock

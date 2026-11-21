@@ -89,6 +89,9 @@ func newLegacyStrategy(pol *config.RunPolicyConfig) (*TradeStrat, *config.BadPar
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 	if obj, ok := cacheStrats[cacheKey]; ok {
+		if pol.RefineTF == nil && obj.RefineTF != nil {
+			pol.RefineTF = obj.RefineTF
+		}
 		obj.Policy = pol
 		return obj, nil
 	}
@@ -108,6 +111,9 @@ func newLegacyStrategy(pol *config.RunPolicyConfig) (*TradeStrat, *config.BadPar
 	cacheStrats[cacheKey] = stgy
 	if stgy.MinTfScore == 0 {
 		stgy.MinTfScore = 0.75
+	}
+	if pol.RefineTF == nil && stgy.RefineTF != nil {
+		pol.RefineTF = stgy.RefineTF
 	}
 	stgy.Policy = pol
 	if pol.StakeRate > 0 {

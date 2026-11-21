@@ -309,7 +309,7 @@ The Chan-theory graph structures in `chanlun.go` (CGraph/CPoint/CPen/CSeg/CCentr
 - `EachMaxLong`/`EachMaxShort` (int): max same-direction orders per symbol; 0 unlimited, -1 forbids that direction
 - `TimeFrames` (string): legacy form: comma-separated timeframes
 - `RunTimeFrames` ([]string): allowed timeframes (if empty use `run_policy.run_timeframes`, then `TimeFrames`, then root config)
-- `RefineTF` (interface{}): matching timeframe (same as `refine_tf`)
+- `RefineTF` (interface{}): strategy-level default sub-bar matching timeframe (e.g. `"5m"`, `"1m"`, `12`, `"3-6"`; takes effect automatically when YAML `run_policy[].refine_tf` is unset, and overridden when explicitly configured)
 - `WsSubs` (map[string]string): live Ws subscription config (required by `OnWs*`)
 - `Outputs` ([]string): strategy output text
 - `OnStartUp` (`func(*StratJob)`): called once when each job is created; initialize `s.More` here
@@ -509,6 +509,30 @@ Designed for multi-asset risk-parity trend CTA, cross-sectional selection + per-
 - **`strat.InverseVolWeights(jobs []*strat.StratJob, signals map[string]float64, atrPeriod int, targetGross float64) map[string]float64`**:
   - Given directional/strength `signals` (e.g. `+1`/`-1`/`0` or continuous scores), `atrPeriod` (`<=0` defaults to `14`), and `targetGross` (e.g. `0.8`), unconditionally evaluates `ta.NATR(e.High, e.Low, e.Close, atrPeriod)` across every job in `jobs` (preserving incremental RMA cache alignment even when `signal == 0`), weights active legs by `signal / NATR`, and normalizes so `Σ|w| == targetGross`.
 - **`strat.BarPriority(barMS int64, symbol string, seed uint64) uint64`**: neutral, reproducible 64-bit per-bar symbol hash priority (lower runs first).
+
+### 3.10 Coarse-Timeframe K-Line Grid & Two-Sided Limit Strategies (`RefineTF` + Causal `OnOrderChange` Replenishment)
+Designed for K-line grid, range-reversion, and multi-rung limit ladder strategies on coarse timeframes (`1h`/`4h`/`1d`) that maintain simultaneous buy/sell limit orders and replenish counter-orders immediately upon intrabar fills:
+- **Sub-bar matching declaration**: Set `RefineTF: "5m"` (or `"1m"` / integer divisor such as `12`; YAML `run_policy[].refine_tf` overrides when set) on `TradeStrat`, keep `EachMaxLong: 0, EachMaxShort: 0` (or set to the grid rung cap), and ensure `max_open_orders` / `max_simul_open` accommodate all resting rungs.
+- **Chronological sub-bar progression & `OnOrderChange` replenishment**: Resting `Limit`, `Stop-Limit`, and TP/SL orders submitted in `OnData(Main)` advance sub-bar by sub-bar (`5m`/`1m`) in backtests; multiple rungs triggered within the same sub-bar fill in chronological intrabar timestamp order and fire `OnOrderChange(s, od, strat.OdChgEnterFill)` / `OdChgExitFill`.
+- **Synchronized order snapshots & strict causality**: `s.GetOrders`, `s.GetOrderNum`, and `s.Position` are refreshed before `OnOrderChange` runs; counter-orders queued via `s.OpenOrder` or `s.CloseOrders` (e.g. `OrderID: od.ID, Limit: tpPrice`) inside `OnOrderChange` are drained immediately and matched strictly after `fillTime + bt_net_cost` on the remaining sub-bar path and subsequent sub-bars (zero lookahead into pre-fill highs/lows).
+- **Bilateral symmetric approximate funding**: On linear perpetual contracts without a loaded `funding_rate` series, `bt_funding_apr` settles symmetrically (under a positive baseline rate, longs pay `+cost` and shorts receive `-cost`, yielding zero net funding drift on equal-notional 1:1 long+short hedges).
+
+```go
+// Set RefineTF: "5m", EachMaxLong: 0, EachMaxShort: 0 on TradeStrat:
+// 1) OnData(Main) posts multi-level buy/sell limit rungs on 1h closes (or attaches TakeProfit: buyPx + step);
+// 2) OnOrderChange immediately submits a counter limit exit / replenishment order when a 5m sub-bar fills a rung:
+OnOrderChange: func(s *strat.StratJob, od *ormo.InOutOrder, chgType int) {
+	st := s.More.(*gridState)
+	if chgType == strat.OdChgEnterFill && strings.HasPrefix(od.EnterTag, "grid_buy_") {
+		_ = s.CloseOrders(&strat.ExitReq{
+			Tag:     "grid_tp_" + od.EnterTag,
+			OrderID: od.ID,
+			Dirt:    core.OdDirtLong,
+			Limit:   od.Enter.Average + st.step,
+		})
+	}
+},
+```
 
 ## 4. Order, Stop-Loss/Take-Profit and Position Details
 ### 4.1 Opening and Closing

@@ -150,13 +150,16 @@ func (o *LocalOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, 
 }
 
 func (o *LocalOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
-	if len(allOpens) == 0 || o.isEnvReal() || o.isLive() {
-		return nil
-	}
-	if evt == nil {
+	if o.isEnvReal() || o.isLive() || evt == nil {
 		return nil
 	}
 	symbol := evt.Symbol()
+	if !evt.IsWarmUp {
+		o.recordSeriesObserved(symbol, evt.TimeFrame, seriesEndMSForMatch(evt))
+	}
+	if len(allOpens) == 0 {
+		return nil
+	}
 	// Simulate order entry and exit, which are usually executed at the beginning of the bar
 	// 模拟订单入场出场，入场出场一般在bar开始时执行
 	var curOrders []*ormo.InOutOrder
@@ -320,28 +323,74 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 	return affectNum, err
 }
 
+func (o *LocalOrderMgr) peekProtectionMatch(od *ormo.InOutOrder, bar *orm.SeriesOHLCV, tf string) (execution.OHLCProtectionFill, bool) {
+	if bar == nil || od == nil {
+		return execution.OHLCProtectionFill{}, false
+	}
+	sl := od.GetStopLoss()
+	_, rung, _ := od.NextTakeProfitRung()
+	var tpView *execution.OHLCProtection
+	if rung != nil {
+		tpView = &execution.OHLCProtection{Price: rung.Price, Limit: rung.Limit}
+	} else {
+		tpView = ohlcProtectionView(od.GetTakeProfit())
+	}
+	if sl == nil && tpView == nil {
+		return execution.OHLCProtectionFill{}, false
+	}
+	tfSecs := float64(utils.TFToSecs(tf))
+	fill := o.ohlcProfile().MatchProtection(bar, od.Short, ohlcProtectionView(sl), tpView, 0, tfSecs, o.priceNow())
+	if !fill.HitSL && !fill.HitTP {
+		return fill, false
+	}
+	return fill, true
+}
+
 func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *orm.DataSeries) (affectNum int,
 	newOrderCount int, resultErr *errs.Error) {
 	orders = executionOrderView(orders, o.executionDeps())
 	o.beginSimOrderMatch()
 	defer func() { newOrderCount = o.endSimOrderMatch() }()
 	bar := seriesOHLCVCompat(evt)
+	const (
+		actTrigger = 1
+		actPending = 2
+		actOCO     = 3
+	)
+	type barActionItem struct {
+		kind        int
+		origIdx     int
+		od          *ormo.InOutOrder
+		exOrder     *ormo.ExOrder
+		matchTf     string
+		odTFSecs    int
+		price       float64
+		fillMS      int64
+		fillBarRate float64
+		ocoGroup    string
+	}
+	var actions []barActionItem
 	var handledOCO map[string]bool
-	for _, od := range orders {
+	for origIdx, od := range orders {
 		if od == nil || od.Status >= ormo.InOutStatusFullExit {
 			continue
 		}
-		matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
+		matchTf := o.effectiveMatchTimeFrame(od, evt)
 		if evt != nil && evt.TimeFrame != matchTf {
 			continue
 		}
 		exOrder := getPendingSub(od)
 		if exOrder == nil {
 			if od.ExitTag == "" && evt != nil {
-				// 已入场完成，尚未出现出场信号，检查是否触发止损/止盈
-				err := o.tryFillTriggers(od, bar, matchTf, 0)
-				if err != nil {
-					return 0, 0, err
+				if pFill, hit := o.peekProtectionMatch(od, bar, matchTf); hit {
+					sortMS := pFill.TimeMS
+					if !pFill.Ready {
+						sortMS = bar.Time
+					}
+					actions = append(actions, barActionItem{
+						kind: actTrigger, origIdx: origIdx, od: od, matchTf: matchTf,
+						fillMS: sortMS, fillBarRate: pFill.Rate,
+					})
 				}
 			}
 			continue
@@ -355,11 +404,20 @@ func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *or
 				handledOCO = make(map[string]bool)
 			}
 			handledOCO[ocoKey] = true
-			filled, err := o.matchOCOPendingGroup(orders, od.Symbol, od.Strategy, od.OCOGroup, bar, evt.TimeFrame)
-			if err != nil {
-				return 0, 0, err
+			odTFSecs := utils.TFToSecs(matchTf)
+			odType := o.orderType()
+			if exOrder.OrderType != "" {
+				odType = exOrder.OrderType
 			}
-			affectNum += filled
+			pFill, _ := o.ohlcProfile().MatchPending(bar, execution.OHLCOrder{
+				OrderType: odType, IsBuy: exOrder.Side == banexg.OdSideBuy,
+				Enter: true, Short: od.Short, Price: exOrder.Price,
+				Stop: od.Stop, CreateAt: exOrder.CreateAt,
+			}, odTFSecs, o.backtestNetCost())
+			actions = append(actions, barActionItem{
+				kind: actOCO, origIdx: origIdx, od: od, ocoGroup: od.OCOGroup,
+				matchTf: matchTf, fillMS: pFill.TimeMS, fillBarRate: pFill.Rate,
+			})
 			continue
 		}
 		odType := o.orderType()
@@ -393,25 +451,65 @@ func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *or
 			}
 			price, fillMS, fillBarRate = fill.Price, fill.TimeMS, fill.Rate
 		}
-		var err *errs.Error
-		if exOrder.Enter {
-			err = o.fillPendingEnter(od, price, fillMS)
-			if err == nil && evt != nil {
-				// 入场后可能立刻触发止损/止盈
-				if o.legacyIntrabarEnabled() {
-					err = o.tryFillTriggers(od, bar, matchTf, fillBarRate)
-				} else {
-					endBar := o.cutSeriesFromRate(bar, int64(odTFSecs*1000), fillBarRate)
-					err = o.tryFillTriggers(od, endBar, matchTf, 0)
+		actions = append(actions, barActionItem{
+			kind: actPending, origIdx: origIdx, od: od, exOrder: exOrder, matchTf: matchTf,
+			odTFSecs: odTFSecs, price: price, fillMS: fillMS, fillBarRate: fillBarRate,
+		})
+	}
+	if evt != nil && len(actions) > 1 && !preserveFrozenReplayExecutionOrder(o.executionDeps()) {
+		sort.SliceStable(actions, func(i, j int) bool {
+			a, b := actions[i], actions[j]
+			if math.Abs(a.fillBarRate-b.fillBarRate) > 1e-12 {
+				return a.fillBarRate < b.fillBarRate
+			}
+			if a.fillMS != b.fillMS {
+				return a.fillMS < b.fillMS
+			}
+			return a.origIdx < b.origIdx
+		})
+	}
+	for _, act := range actions {
+		od := act.od
+		if od == nil || od.Status >= ormo.InOutStatusFullExit {
+			continue
+		}
+		switch act.kind {
+		case actTrigger:
+			if od.ExitTag == "" && getPendingSub(od) == nil {
+				if err := o.tryFillTriggers(od, bar, act.matchTf, 0); err != nil {
+					return 0, 0, err
 				}
 			}
-		} else {
-			err = o.fillPendingExit(od, price, fillMS)
+		case actOCO:
+			filled, err := o.matchOCOPendingGroup(orders, od.Symbol, od.Strategy, act.ocoGroup, evt, bar, evt.TimeFrame)
+			if err != nil {
+				return 0, 0, err
+			}
+			affectNum += filled
+		case actPending:
+			if getPendingSub(od) != act.exOrder {
+				continue
+			}
+			var err *errs.Error
+			if act.exOrder.Enter {
+				err = o.fillPendingEnterWithBar(od, act.price, act.fillMS, bar, act.fillBarRate)
+				if err == nil && evt != nil {
+					// 入场后可能立刻触发止损/止盈
+					if o.legacyIntrabarEnabled() {
+						err = o.tryFillTriggers(od, bar, act.matchTf, act.fillBarRate)
+					} else {
+						endBar := o.cutSeriesFromRate(bar, int64(act.odTFSecs*1000), act.fillBarRate)
+						err = o.tryFillTriggers(od, endBar, act.matchTf, 0)
+					}
+				}
+			} else {
+				err = o.fillPendingExitWithBar(od, act.price, act.fillMS, bar, act.fillBarRate)
+			}
+			if err != nil {
+				return 0, 0, err
+			}
+			affectNum += 1
 		}
-		if err != nil {
-			return 0, 0, err
-		}
-		affectNum += 1
 	}
 	// Forced liquidation of limit entry orders that have not been executed within a timeout period
 	// 强制平仓超时未成交的限价入场单
@@ -455,7 +553,61 @@ func (o *LocalOrderMgr) cutSeriesFromRate(bar *orm.SeriesOHLCV, tfMSecs int64, r
 	return cutSeriesFromRateWithLegacy(bar, tfMSecs, rate, o.legacyIntrabarEnabled())
 }
 
+func (o *LocalOrderMgr) withSimFillContext(symbol string, fillPrice float64, fillMS int64, bar *orm.SeriesOHLCV, fillBarRate float64, fn func()) {
+	if o == nil || !o.isBacktest() || bar == nil || fillMS <= 0 {
+		fn()
+		return
+	}
+	oldClockMS := o.priceNow()
+	cbMS := fillMS
+	tfMSecs := bar.EndMS - bar.Time
+	if tfMSecs <= 0 && bar.TimeFrame != "" {
+		tfMSecs = int64(utils.TFToSecs(bar.TimeFrame)) * 1000
+	}
+	if fillBarRate > 0 && bar.Time > 0 && tfMSecs > 1000 && cbMS < bar.Time+1000 {
+		cbMS = bar.Time + 1000
+	}
+	if cbMS >= oldClockMS {
+		fn()
+		return
+	}
+	oldBarPrice := o.lastBarPrice(symbol)
+	oldBarTime := o.lastBarTime(symbol)
+	if o.clock != nil {
+		o.clock.SetTimeMS(cbMS)
+	} else {
+		btime.SetTimeMS(cbMS)
+	}
+	if symbol != "" && fillPrice > 0 {
+		if o.prices != nil {
+			o.prices.SetBarPriceAt(cbMS, symbol, fillPrice)
+		} else if !o.runtimeDeps {
+			com.SetBarPrice(symbol, fillPrice)
+		}
+	}
+	defer func() {
+		restoreMS := max(oldClockMS, o.priceNow())
+		if o.clock != nil {
+			o.clock.SetTimeMS(restoreMS)
+		} else {
+			btime.SetTimeMS(restoreMS)
+		}
+		if symbol != "" && oldBarPrice > 0 && oldBarTime >= cbMS {
+			if o.prices != nil {
+				o.prices.SetBarPriceAt(oldBarTime, symbol, oldBarPrice)
+			} else if !o.runtimeDeps {
+				com.SetBarPrice(symbol, oldBarPrice)
+			}
+		}
+	}()
+	fn()
+}
+
 func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fillMS int64) *errs.Error {
+	return o.fillPendingEnterWithBar(od, price, fillMS, nil, 0)
+}
+
+func (o *LocalOrderMgr) fillPendingEnterWithBar(od *ormo.InOutOrder, price float64, fillMS int64, bar *orm.SeriesOHLCV, fillBarRate float64) *errs.Error {
 	wallets := o.walletsForOrder()
 	_, err := wallets.EnterOd(od)
 	if err != nil {
@@ -537,13 +689,15 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 				zap.String("key", od.Key()), zap.Error(err))
 		}
 	}
-	o.callBack(od, true)
-	o.fireOdChange(od, strat.OdChgEnterFill)
+	o.withSimFillContext(od.Symbol, entPrice, fillMS, bar, fillBarRate, func() {
+		o.callBack(od, true)
+		o.fireOdChange(od, strat.OdChgEnterFill)
+	})
 	return nil
 }
 
 func (o *LocalOrderMgr) matchOCOPendingGroup(orders []*ormo.InOutOrder, symbol, strategy, ocoGroup string,
-	bar *orm.SeriesOHLCV, tf string,
+	evt *orm.DataSeries, bar *orm.SeriesOHLCV, tf string,
 ) (int, *errs.Error) {
 	type ocoCandidate struct {
 		od      *ormo.InOutOrder
@@ -560,7 +714,7 @@ func (o *LocalOrderMgr) matchOCOPendingGroup(orders []*ormo.InOutOrder, symbol, 
 			od.Symbol != symbol || od.Strategy != strategy || od.OCOGroup != ocoGroup {
 			continue
 		}
-		matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
+		matchTf := o.effectiveMatchTimeFrame(od, evt)
 		if matchTf != tf {
 			continue
 		}
@@ -615,7 +769,7 @@ func (o *LocalOrderMgr) matchOCOPendingGroup(orders []*ormo.InOutOrder, symbol, 
 	if winner.fill.StopTriggered {
 		winner.od.Stop = 0
 	}
-	err := o.fillPendingEnter(winner.od, winner.fill.Price, winner.fill.TimeMS)
+	err := o.fillPendingEnterWithBar(winner.od, winner.fill.Price, winner.fill.TimeMS, bar, winner.fill.Rate)
 	if err != nil {
 		return 0, err
 	}
@@ -668,6 +822,10 @@ func (o *LocalOrderMgr) cancelOCOSiblings(od *ormo.InOutOrder, cancelMS int64) {
 }
 
 func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fillMS int64) *errs.Error {
+	return o.fillPendingExitWithBar(od, price, fillMS, nil, 0)
+}
+
+func (o *LocalOrderMgr) fillPendingExitWithBar(od *ormo.InOutOrder, price float64, fillMS int64, bar *orm.SeriesOHLCV, fillBarRate float64) *errs.Error {
 	wallets := o.walletsForOrder()
 	exOrder := od.Exit
 	wallets.ExitOd(od, exOrder.Amount)
@@ -696,8 +854,10 @@ func (o *LocalOrderMgr) fillPendingExit(od *ormo.InOutOrder, price float64, fill
 				zap.String("key", od.Key()), zap.Error(err))
 		}
 	}
-	o.callBack(od, false)
-	o.fireOdChange(od, strat.OdChgExitFill)
+	o.withSimFillContext(od.Symbol, price, fillMS, bar, fillBarRate, func() {
+		o.callBack(od, false)
+		o.fireOdChange(od, strat.OdChgExitFill)
+	})
 	return nil
 }
 
@@ -772,8 +932,10 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 				wallets.ExitOd(part, part.Exit.Amount)
 				_ = o.finishOrder(part)
 				wallets.ConfirmOdExit(part, part.Exit.Price)
-				o.callBack(part, false)
-				o.fireOdChange(part, strat.OdChgExitFill)
+				o.withSimFillContext(part.Symbol, part.Exit.Price, fill.TimeMS, origBar, fill.Rate, func() {
+					o.callBack(part, false)
+					o.fireOdChange(part, strat.OdChgExitFill)
+				})
 				if err != nil {
 					return err
 				}
@@ -794,8 +956,10 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 			wallets.ExitOd(od, od.Exit.Amount)
 			_ = o.finishOrder(od)
 			wallets.ConfirmOdExit(od, od.Exit.Price)
-			o.callBack(od, false)
-			o.fireOdChange(od, strat.OdChgExitFill)
+			o.withSimFillContext(od.Symbol, od.Exit.Price, fill.TimeMS, origBar, fill.Rate, func() {
+				o.callBack(od, false)
+				o.fireOdChange(od, strat.OdChgExitFill)
+			})
 			return err
 		}
 
@@ -849,8 +1013,10 @@ func (o *LocalOrderMgr) tryFillTriggers(od *ormo.InOutOrder, bar *orm.SeriesOHLC
 		wallets.ExitOd(targetOd, targetOd.Exit.Amount)
 		_ = o.finishOrder(targetOd)
 		wallets.ConfirmOdExit(targetOd, targetOd.Exit.Price)
-		o.callBack(targetOd, false)
-		o.fireOdChange(targetOd, strat.OdChgExitFill)
+		o.withSimFillContext(targetOd.Symbol, targetOd.Exit.Price, fill.TimeMS, origBar, fill.Rate, func() {
+			o.callBack(targetOd, false)
+			o.fireOdChange(targetOd, strat.OdChgExitFill)
+		})
 		return err
 	}
 	return nil

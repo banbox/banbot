@@ -46,7 +46,7 @@
 
 ## 核心类型与接口
 
-- **`TradeStrat`**（`strat/types.go:24`）：策略定义。配置字段（`WarmupNum`、`MinTfScore`、`StopLoss`、`StakeRate`、`EachMaxLong/Short`、`OrderOnRotation`、`BatchInOut/BatchInfo`、`RunTimeFrames`、`RefineTF`、`WsSubs` 等）与回调（`OnStartUp`、`OnDataSubs`、`OnSymbols`、`OnData`、`OnCheckExit`、`OnOrderChange`、`OnBatchJobs/OnBatchInfos`、`OnWs*`、`PickTimeFrame`、`GetDrawDownExitRate`、`OnShutDown`、`OnStratExit`）。`OnBar`/`OnInfoBar` 为旧接口，与 `OnData` 同设会在构造时 panic（`data_event.go:50`）。运行期实例按 policy 克隆（`state.go:821 NewStrategy` → `cloneTradeStrat`）。
+- **`TradeStrat`**（`strat/types.go`）：策略定义。配置字段（`WarmupNum`、`MinTfScore`、`StopLoss`、`StakeRate`、`EachMaxLong/Short`、`OrderOnRotation`、`BatchInOut/BatchInfo`、`RunTimeFrames`、`RefineTF`、`WsSubs` 等）与回调（`OnStartUp`、`OnDataSubs`、`OnSymbols`、`OnData`、`OnCheckExit`、`OnOrderChange`、`OnBatchJobs/OnBatchInfos`、`OnWs*`、`PickTimeFrame`、`GetDrawDownExitRate`、`OnShutDown`、`OnStratExit`）。当 YAML `run_policy[i].refine_tf` 未设置时，策略声明的 `TradeStrat.RefineTF`（如 `"5m"`、`12`、`"3-6"`）在 `State.newStrategy`、`ensureStratJobWithExchange` 与 `StratJob.BindRuntimeState` 中自动写入策略级默认撮合周期并由 `State.RefineTimeFrame` 解析（显式 `run_policy[i].refine_tf` 优先覆盖）。`OnBar`/`OnInfoBar` 为旧接口，与 `OnData` 同设会在构造时 panic（`strat/data_event.go:validateDataCallbacks`）。运行期实例按 policy 克隆（`strat/state.go:NewStrategy` → `cloneTradeStrat`）。
 - **`StratJob`**（`strat/types.go`）：运行上下文。公开字段（`Env`、`DataHub`、`Entrys/Exits`、`LongOrders/ShortOrders`、`OrderNum/EnteredNum`、`MaxOpenLong/Short`、`CloseLong/Short`、`ExgStopLoss/ExgTakeProfit`、`LongSLPrice/ShortSLPrice`、`LongTPPrice/ShortTPPrice` 等、`More`）保持策略兼容；私有字段绑定 `symbols`、`strategyState`、`runtimeCore`、`runtimePrices`、`runtimeClock`，并通过原子指针懒创建 `executionStateMu`（每 Job 一把细粒度锁，`strat/execution_state.go`）。读写可变执行状态应走 `ExecutionSnapshot()` 与 typed 方法；只读账户资金与风控状态通过 `AccountEquity()`、`AvailableBalance()`、`AccountDrawdown()` 查询（`strat/account_state.go`）；无前视日内区间与历史日线极值通过按 Job 隔离的 `OpeningRange`、`SessionRange`、`PrevDayOHLC`、`PrevNDaysStats`、`DualThrustBands`、`RBreakerLevels` 访问（`strat/intraday_session.go`，`InitBar` 自动记录预热期 bar 时间跨度以支持预热后首根即就绪）。
 - **`EnterReq` / `ExitReq`**（`strat/types.go`）：信号意图。`Tag` 必填（入场；有订单时的平仓），`EnterReq.RiskRate` 支持按账户权益风险比例自动定仓；支持同时指定 `Stop > 0` 与 `Limit > 0`（`Stop-Limit` 触发限价入场）、多级阶梯止盈 `TakeProfits []TakeProfitTarget`（含 `MoveSLToBreakeven` 保本移损）以及 `OCOGroup` 挂单互斥取消组。`Clone()` 与 `GetZapFields()` 在 `strat/common.go`，新增字段必须同步。`CommandID` 为幂等键：空时由 `WithOrderEvent` 上下文派生为 `<事件ID>/entry/<序号>`（`strat/execution_state.go`）。
 - **`DataEvent` / `DataRole` / `RouteData`**（`data_event.go`）：`DataRoleMain=1`（主 K 线）、`DataRoleInfo=2`（辅助）、`DataRoleCustom=3`（自定义序列）。`RouteData` 每个事件至多调用一个角色处理器。
@@ -96,8 +96,9 @@
 3. 其余 `enqueueExit`（`execution_state.go:291`）。
 
 ### 6. 订单事件与回调
-- 订单状态变化经 `FireOdChange`/`FireOdChangeWithState`（`common.go:885/895`）广播到 `AccOdSubs`；`OrderEventTime` 决定事件时间戳（`common.go:910`）。
-- `OdChg*` 常量（`types.go`）：`OdChgNew/Enter/EnterFill/Exit/ExitFill/OrderChanged`。
+- 订单状态变化经 `FireOdChange`/`FireOdChangeWithState`（`strat/common.go:FireOdChange` / `FireOdChangeWithState`）广播到 `AccOdSubs`；`OrderEventTime` 决定事件时间戳（`strat/common.go:OrderEventTime`）。
+- `biz.InitOdSubs` / `biz.InitOdSubsWithRuntimeDeps` 在触发 `HedgeOff` 与 `OnOrderChange` 前刷新 `StratJob.UpdateOrders`，并在回调后调用 `ProcessOrders(job)`（`OrderMgr.ProcessOrders` 完成入单/出单后同步刷新 `StratJob` 订单快照），支持 `refine_tf` 子周期成交时在 `OnOrderChange` 中读取最新持仓快照并即时入队反向网格限价单或止盈单。
+- `OdChg*` 常量（`strat/types.go`）：`OdChgNew/Enter/EnterFill/Exit/ExitFill/OrderChanged`。
 
 ### 7. 动态增删品种（`TradeStrat.UpdatePairs` → `PairUpdateManager.Apply`，`pair_update.go:166`）
 1. 解析 hooks（显式状态用 `State.PairUpdateHooks()`，否则全局 `pairUpdateMgr`）；校验 `SubWarmPairs`。

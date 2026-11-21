@@ -67,7 +67,23 @@ type OHLCFill struct {
 func (p OHLCProfile) MatchPending(bar *orm.SeriesOHLCV, order OHLCOrder, tfSecs int, netCost float64) (fill OHLCFill, matched bool) {
 	fill.Price = order.Price
 	fill.TimeMS = order.CreateAt + int64(netCost*1000)
+	if bar == nil {
+		return fill, false
+	}
+	tfMSecs := int64(tfSecs) * 1000
+	if bar.Time > 0 && tfMSecs > 0 {
+		barEndMS := bar.Time + tfMSecs
+		if order.CreateAt >= barEndMS {
+			return fill, false
+		}
+		if order.CreateAt-bar.Time >= 1000 {
+			return p.matchMidBarPending(bar, order, tfSecs, tfMSecs, netCost)
+		}
+	}
 	barStartMS := utils.AlignTfMSecs(fill.TimeMS, int64(tfSecs*1000))
+	if bar.Time > 0 && fill.TimeMS <= bar.Time {
+		barStartMS = bar.Time
+	}
 	var minRate float64
 	if order.Enter && order.Stop > 0 {
 		if !p.StopEntryTriggered(order.IsBuy, order.Stop, bar.Low, bar.High) {
@@ -171,6 +187,102 @@ func (p OHLCProfile) MatchPending(bar *orm.SeriesOHLCV, order OHLCOrder, tfSecs 
 		}
 		fill.Price = p.Slip(ref, order.IsBuy)
 	}
+	return fill, true
+}
+
+// matchMidBarPending evaluates an order created strictly inside [bar.Time+1s, barEndMS)
+// (such as a counter-order submitted from OnOrderChange on a sub-bar fill) against ONLY
+// the causal post-activation remainder of bar, never matching pre-creation price extremes.
+func (p OHLCProfile) matchMidBarPending(bar *orm.SeriesOHLCV, order OHLCOrder, tfSecs int, tfMSecs int64, netCost float64) (fill OHLCFill, matched bool) {
+	activeMS := order.CreateAt + int64(netCost*1000)
+	fill.Price = order.Price
+	fill.TimeMS = activeMS
+	barEndMS := bar.Time + tfMSecs
+	if activeMS >= barEndMS {
+		return fill, false
+	}
+	activeRate := float64(activeMS-bar.Time) / float64(tfMSecs)
+	remOpen, remHigh, remLow := p.PriceRange(bar, activeRate)
+	isLimit := strings.Contains(order.OrderType, "limit") && order.Price > 0
+
+	if order.Enter && order.Stop > 0 {
+		if !p.StopEntryTriggered(order.IsBuy, order.Stop, remLow, remHigh) {
+			return fill, false
+		}
+		fill.Price = order.Stop
+		fill.StopTriggered = true
+		stopRate := max(activeRate, p.MarketRate(bar, order.Stop, order.IsBuy, true, activeRate))
+		fill.Rate = stopRate
+		fill.TimeMS = max(activeMS, bar.Time+int64(float64(tfSecs)*stopRate)*1000)
+		if isLimit {
+			postOpen, postHigh, postLow := p.PriceRange(bar, stopRate)
+			if order.IsBuy {
+				if order.Price < postLow-1e-12 {
+					return fill, false
+				}
+				if postOpen <= order.Price+1e-12 {
+					fill.Price = min(order.Price, max(postOpen, order.Stop))
+					return fill, true
+				}
+				fill.Price = order.Price
+			} else {
+				if order.Price > postHigh+1e-12 {
+					return fill, false
+				}
+				if postOpen >= order.Price-1e-12 {
+					fill.Price = max(order.Price, min(postOpen, order.Stop))
+					return fill, true
+				}
+				fill.Price = order.Price
+			}
+			limRate := max(stopRate, p.MarketRate(bar, order.Price, order.IsBuy, false, stopRate))
+			fill.Rate = limRate
+			fill.TimeMS = max(activeMS, bar.Time+int64(float64(tfSecs)*limRate)*1000)
+			return fill, true
+		}
+		if p.SlippageBps > 0 {
+			ref := fill.Price
+			if order.IsBuy && remOpen > ref || !order.IsBuy && remOpen < ref {
+				ref = remOpen
+			}
+			fill.Price = p.Slip(ref, order.IsBuy)
+		}
+		return fill, true
+	}
+
+	if isLimit {
+		if order.IsBuy {
+			if order.Price < remLow-1e-12 {
+				return fill, false
+			}
+			if remOpen <= order.Price+1e-12 {
+				fill.Price = remOpen
+				fill.Rate = activeRate
+				fill.TimeMS = activeMS
+				return fill, true
+			}
+			fill.Price = order.Price
+		} else {
+			if order.Price > remHigh+1e-12 {
+				return fill, false
+			}
+			if remOpen >= order.Price-1e-12 {
+				fill.Price = remOpen
+				fill.Rate = activeRate
+				fill.TimeMS = activeMS
+				return fill, true
+			}
+			fill.Price = order.Price
+		}
+		limRate := max(activeRate, p.MarketRate(bar, order.Price, order.IsBuy, false, activeRate))
+		fill.Rate = limRate
+		fill.TimeMS = max(activeMS, bar.Time+int64(float64(tfSecs)*limRate)*1000)
+		return fill, true
+	}
+
+	fill.Rate = activeRate
+	fill.Price = p.Slip(remOpen, order.IsBuy)
+	fill.TimeMS = activeMS
 	return fill, true
 }
 

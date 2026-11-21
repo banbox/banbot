@@ -151,6 +151,8 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 	}
 	if strategyState == legacyState {
 		config.ClearRefineMap()
+	} else if strategyState != nil {
+		strategyState.clearRefineCache()
 	}
 	if strategyState == legacyState {
 		resetJobsWithState(strategyState, state, orderStates...)
@@ -720,8 +722,15 @@ func ensureStratJobWithExchange(strategyState *State, state *core.State, exchang
 	}
 	strategyState.ensureMaps()
 	logWarm(exs.Symbol, tf, stgy.WarmupNum)
-	if stgy.Policy.RefineTF == nil && stgy.RefineTF != nil {
+	if stgy.Policy != nil && stgy.Policy.RefineTF == nil && stgy.RefineTF != nil {
 		stgy.Policy.RefineTF = stgy.RefineTF
+	}
+	if strategyState != legacyState && stgy != nil {
+		if stgy.Policy != nil && stgy.Policy.RefineTF != nil {
+			strategyState.setStrategyRefineDefault(stgy.Name, stgy.Policy.RefineTF)
+		} else if stgy.RefineTF != nil {
+			strategyState.setStrategyRefineDefault(stgy.Name, stgy.RefineTF)
+		}
 	}
 	matchTf := strategyState.refineTimeFrame(stgy.Name, tf)
 	if matchTf != tf {
