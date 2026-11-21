@@ -163,13 +163,13 @@
 
 ### 10. 最小下单额过滤
 
-`filterByMinCostWithRuntime`（filters.go）：取所有非 NoTrade 账户的 `stakeAmount` 最大值（若为 0 则用 default 账户的 stake），对每个标的 `minCost = Limits.Amount.Min * Price`，超过则跳过并记录。无市场或无 `Limits.Amount` 的标的同样不进入结果（`AllowRetiredPairs` 时库内有窗口内数据的由 `keepRetiredStaticPairs` 放回）。
+`filterByMinCostWithRuntime`（`goods/filters.go:filterByMinCostWithRuntime`，经 `orm/exsymbol.go:LookupExchangeMarketForConfig` 解析多市场元数据）：取所有非 NoTrade 账户的 `stakeAmount` 最大值（若为 0 则用 default 账户的 stake），对每个标的 `minCost = Limits.Amount.Min * Price`，超过则跳过并记录。无市场或无 `Limits.Amount` 的标的同样不进入结果（`AllowRetiredPairs` 时库内有窗口内数据的由 `goods/biz.go:keepRetiredStaticPairs` 放回）。
 
 ## 配置项与外部依赖
 
 ### 配置（doc/config.yml 为权威模板）
 
-- 交易所：`exchange.name`、`exchange.items.<name>`（传给 banexg 的选项，key 自动转驼峰；`fees` 为嵌套 map）、`market_type`、`contract_type`、`env`。
+- 交易所：`exchange.name`、`exchange.items.<name>`（传给 banexg 的选项，key 自动转驼峰；`fees` 为嵌套 map）、`market_type`、`extra_markets`（可选，同交易所附加市场列表，如 `[spot]`）、`contract_type`、`env`。
 - 账户：`accounts.<name>` 的 `api_key` / `api_secret` / `password`、`no_trade`、`stake_rate`、`max_stake_amt`、`max_pair` 等（凭证由 `GetApiSecretFor(exchange, env)` 按环境取）。
 - 品种：`pairs`（非空则 pairlists 忽略，除非 `pairmgr.force_filters`）、`pairmgr`（`cron`、`offset`、`limit`、`force_filters`、`use_latest`）、`pairlists`（过滤器列表，字段见 types.go 的 `yaml` tag）、`stake_currency`、`stake_amount`、`max_stake_amt`。
 - 策略级：`run_policy[].filters`（同样的过滤器配置，经 `strat/main.go:1234` 调用 `GetPairFiltersWithConfig`）、`run_policy[].pairs`。

@@ -406,7 +406,7 @@ func filterByMinCostWithRuntime(exchange banexg.BanExchange, symbols []*SymbolVo
 		accCost = stakeAmount(cfg, "default", nil)
 	}
 	for _, item := range symbols {
-		mar, err := exchange.GetMarket(item.Symbol)
+		mar, err := orm.LookupExchangeMarketForConfig(exchange, item.Symbol, cfg)
 		if err != nil {
 			if showLog {
 				log.Warn("no market found", zap.String("symbol", item.Symbol))

@@ -235,6 +235,9 @@ const fundingYearMS = 365.25 * 24 * 3600 * 1000
 // next mark does not bill it again). A book without shorts never adds such terms: every long leg is charged at its own
 // marks over its own interval, bit for bit as before the net basis.
 func (b *Book) accrueFunding(sid int32, old Quote, atMS, now int64) {
+	if b.IsSpot(sid) {
+		return
+	}
 	qty := b.quantities[sid]
 	if qty == 0 {
 		return
@@ -282,6 +285,9 @@ func (b *Book) settleFunding() {
 	var missing []int32
 	short := false
 	for sid, qty := range b.quantities {
+		if b.IsSpot(sid) {
+			continue
+		}
 		if qty < 0 {
 			short = true
 		}

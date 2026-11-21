@@ -37,7 +37,7 @@
 | `banexg_transport.go` | `BanexgExecutionTransport`：把整次 SDK 调用绑定到 owner 上下文 |
 | `banexg_external.go` | 外部（非本策略）订单的恢复 `RecoverExternal`、`RecoverExternalReport` |
 | `banexg_funding.go` | 资金费与现金恢复 `RecoverCash` |
-| `banexg_instrument.go` | `InstrumentFromBanexgMarket`：从 SDK 市场元数据生成 `Instrument` |
+| `banexg_instrument.go` | `InstrumentFromBanexgMarket`：从 SDK 市场元数据生成 `Instrument`（支持规范化 `linear_perpetual` 与无杠杆 `spot`） |
 | `banexg_limit_price.go` | `DefaultLimitPrice`：基于分钟成交量与盘口的被动限价 |
 | `legacy_sender.go` | `LegacySender`/`LegacyExchange`：旧 TS 实现的 SDK 写操作门控（OS 租约 + owner） |
 | `market_stream.go` | `StartBanexgMarketStream`：账户级盘口订阅，驱动报价与模拟成交 |
@@ -105,7 +105,7 @@
 | `external_attribution.go` | `AttributeExternal`：把隔离的外部持仓明确归属给策略（不自动解冻） |
 | `auto_takeover.go` | `AutoTakeoverExternal`：仅对有完整成交证据的隔离账本做接管 |
 | `terminal_settlement.go` | `ApplyTerminalSettlement`：永久现金结清（无成交报价） |
-| `option.go` / `option_expiry.go` | 现金欧式期权的 payoff、抵押与到期结算（仅研究/模拟） |
+| `option.go` / `option_expiry.go` | `Instrument` 估值契约辅助（`IsSpot`/`IsOption`/`IsCashSettled`/`ShortAllowed`/`HasPerpetualFunding`、`Collateral`、`tradeCash`）：`spot` 按 `1.0 * Notional` 全额占用抵押且按买卖成交额增减结算现金、禁止裸卖空、不收付永续资金费；现金欧式期权的 payoff、抵押与到期结算（仅研究/模拟） |
 
 ### 模拟盘与跨场（`paper*.go`、`crossvenue.go`）
 | 文件 | 作用 |

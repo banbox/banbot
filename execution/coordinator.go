@@ -193,6 +193,9 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 		if !canonicalID(string(target.Strategy)) || !canonicalID(string(target.Lot)) || seen[key] || target.SignedSteps == -1<<63 || target.Instrument != "" && target.Instrument != instrument.ID {
 			return result, errors.New("execution: invalid/duplicate executable target")
 		}
+		if !instrument.ShortAllowed() && target.SignedSteps < 0 {
+			return result, errors.New("execution: short positions are not allowed on spot instrument")
+		}
 		seen[key] = true
 		result.DesiredSteps, err = checkedSteps(result.DesiredSteps, target.SignedSteps)
 		if err != nil {

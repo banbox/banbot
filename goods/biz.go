@@ -484,7 +484,7 @@ func keepRetiredStaticPairs(deps *RuntimeDeps, vols []*SymbolVol, kept []string)
 			out = append(out, item.Symbol)
 			continue
 		}
-		if _, err := deps.Exchange.GetMarket(item.Symbol); err == nil {
+		if _, err := orm.LookupExchangeMarket(deps.Exchange, item.Symbol, deps.Symbols); err == nil {
 			continue // listed, dropped by the cost filter
 		}
 		if orm.RetiredSymbolReplayable(deps.Symbols, info.ID, info.MarketType, item.Symbol, deps.Config) {

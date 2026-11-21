@@ -111,6 +111,11 @@ func (c *Config) NormalizeRuntime() *errs.Error {
 	} else if c.ContractType == "" {
 		c.ContractType = banexg.MarketSwap
 	}
+	normalizedExtra, extraErr := NormalizeExtraMarkets(c.MarketType, c.ExtraMarkets)
+	if extraErr != nil {
+		return extraErr
+	}
+	c.ExtraMarkets = normalizedExtra
 	for _, item := range []struct {
 		value    *int
 		fallback int
@@ -166,6 +171,36 @@ func (c *Config) NormalizeRuntime() *errs.Error {
 		return err
 	}
 	return c.NormalizeRunPolicies()
+}
+
+// NormalizeExtraMarkets validates and canonicalizes opt-in auxiliary market
+// types on the runtime's primary exchange.
+func NormalizeExtraMarkets(primary string, extras []string) ([]string, *errs.Error) {
+	if len(extras) == 0 {
+		return nil, nil
+	}
+	primary = strings.ToLower(strings.TrimSpace(primary))
+	seen := make(map[string]bool, len(extras))
+	out := make([]string, 0, len(extras))
+	for _, raw := range extras {
+		m := strings.ToLower(strings.TrimSpace(raw))
+		if m == "" || m == primary {
+			continue
+		}
+		switch m {
+		case banexg.MarketSpot, banexg.MarketLinear, banexg.MarketInverse, banexg.MarketMargin, banexg.MarketOption:
+		default:
+			return nil, errs.NewMsg(core.ErrBadConfig, "invalid extra_markets entry: %s", raw)
+		}
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // NormalizeRunPolicies prepares policy fields for an explicit runtime without

@@ -26,6 +26,10 @@ type PairsSpec struct {
 	// Gross is the gross notional of one open pair as a fraction of strategy NAV.
 	// Default 1/len(Pairs), so all pairs open at once never exceed 100% gross.
 	Gross float64
+	// LongOnlySpot blocks spread entries that would short a spot leg (identified
+	// via Config.SpotSIDs or Execution.Instruments), enabling one-sided spot-perp
+	// cash-and-carry without triggering spot short-sale rejection.
+	LongOnlySpot bool
 }
 
 const pairsLogOutput = "logp"
@@ -82,7 +86,11 @@ func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error {
 		if err != nil {
 			return nil, err
 		}
-		builder, tracker, err := newTrackedPairsBuilderSkipping(spec, c.Snapshot.SIDMap, c.UnavailableSymbols)
+		spotSet := make(map[int32]bool)
+		for _, sid := range c.spotSIDList() {
+			spotSet[sid] = true
+		}
+		builder, tracker, err := newTrackedPairsBuilderWithSpots(spec, c.Snapshot.SIDMap, c.UnavailableSymbols, spotSet)
 		if err == nil && c.observe != nil {
 			c.observe.pairs, c.observe.reset = tracker.report, tracker.resetStats
 		}
@@ -163,6 +171,10 @@ func newTrackedPairsBuilder(spec PairsSpec, sidMap map[int32]string) (PortfolioB
 // unavailable is still an error. Every pair keeps its Gross share: skipped pairs leave their exposure idle, the
 // remaining pairs are never scaled up (no hidden leverage when pairs drop out).
 func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, unavailable map[string]string) (PortfolioBuilder, *pairsTracker, error) {
+	return newTrackedPairsBuilderWithSpots(spec, sidMap, unavailable, nil)
+}
+
+func newTrackedPairsBuilderWithSpots(spec PairsSpec, sidMap map[int32]string, unavailable map[string]string, spotSIDs map[int32]bool) (PortfolioBuilder, *pairsTracker, error) {
 	sids := make(map[string]int32, len(sidMap))
 	for sid, symbol := range sidMap {
 		sids[symbol] = sid
@@ -263,6 +275,14 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 			st.pos = st.trader.Step(point.Z)
 			if st.pos != 0 && (prev == 0 || prev != st.pos) {
 				st.beta = point.Beta
+				if spec.LongOnlySpot && len(spotSIDs) > 0 {
+					wy, wx := float64(st.pos), -float64(st.pos)*st.beta
+					if (spotSIDs[st.y] && wy < 0) || (spotSIDs[st.x] && wx < 0) {
+						st.trader.Reset()
+						st.pos, st.beta = 0, 0
+						diags = append(diags, factor.Diagnostic{Code: "pair-spot-short-blocked", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
+					}
+				}
 			}
 			st.stats.observeStep(prev, st.pos, point.Z, st.beta, frame.DecisionTime, spec.Band)
 		}

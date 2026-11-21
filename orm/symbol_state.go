@@ -2,6 +2,7 @@ package orm
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -225,6 +226,7 @@ type SymbolState struct {
 	identitySet      bool
 	identityExchange string
 	identityMarket   string
+	extraMarkets     atomic.Pointer[map[string]bool]
 	recoveryMu       sync.RWMutex
 	recoveryRoot     string
 
@@ -354,7 +356,77 @@ func (s *SymbolState) SIDAllocator() *SIDAllocator {
 }
 
 func (s *SymbolState) acceptsIdentity(exchange, market string) bool {
-	return s == nil || !s.identitySet || exchange == s.identityExchange && market == s.identityMarket
+	if s == nil || !s.identitySet {
+		return true
+	}
+	if exchange != s.identityExchange {
+		return false
+	}
+	if market == s.identityMarket {
+		return true
+	}
+	extra := s.extraMarkets.Load()
+	return extra != nil && (*extra)[market]
+}
+
+// AcceptsIdentity reports whether this symbol state admits the supplied
+// exchange and market identity (primary market or an explicitly opted-in extra
+// market on the same exchange).
+func (s *SymbolState) AcceptsIdentity(exchange, market string) bool {
+	return s.acceptsIdentity(exchange, market)
+}
+
+// AllowExtraMarkets opts this symbol state into additional market types on its
+// bound exchange (for example allowing "spot" alongside primary "linear").
+// Single-exchange isolation remains enforced.
+func (s *SymbolState) AllowExtraMarkets(markets ...string) {
+	if s == nil || len(markets) == 0 {
+		return
+	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	next := make(map[string]bool)
+	if cur := s.extraMarkets.Load(); cur != nil {
+		for k, v := range *cur {
+			if v {
+				next[k] = true
+			}
+		}
+	}
+	changed := false
+	for _, raw := range markets {
+		m := strings.TrimSpace(raw)
+		if m == "" || (s.identitySet && m == s.identityMarket) {
+			continue
+		}
+		if !next[m] {
+			next[m] = true
+			changed = true
+		}
+	}
+	if changed {
+		s.extraMarkets.Store(&next)
+	}
+}
+
+// ExtraMarkets returns the sorted auxiliary market types opted into on this
+// symbol state. An empty slice indicates strict single-market isolation.
+func (s *SymbolState) ExtraMarkets() []string {
+	if s == nil {
+		return nil
+	}
+	cur := s.extraMarkets.Load()
+	if cur == nil || len(*cur) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(*cur))
+	for m, ok := range *cur {
+		if ok {
+			out = append(out, m)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 func loadDefaultSymbolState() *SymbolState {

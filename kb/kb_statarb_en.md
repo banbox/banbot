@@ -35,13 +35,14 @@ Terms: `Y` is the explained leg (bought when going long the spread); `X` is the 
 
 ```go
 func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error
-type Pair struct{ Y, X string }          // exactly the symbol in the run SIDMap, e.g. "ETH/USDT:USDT"
+type Pair struct{ Y, X string }          // exactly the symbol in the run SIDMap, e.g. "ETH/USDT:USDT" or spot "BTC/USDT"
 type PairsSpec struct {
-    Pairs  []Pair
-    Field  string                        // kline field, default "close"
-    Window int                           // regression window (decision bars), >= 3
-    Band   statistics.BandConfig         // see 2.3
-    Gross  float64                       // total notional per pair as fraction of strategy NAV; 0 = 1/len(Pairs)
+    Pairs        []Pair
+    Field        string                  // kline field, default "close"
+    Window       int                     // regression window (decision bars), >= 3
+    Band         statistics.BandConfig   // see 2.3
+    Gross        float64                 // total notional per pair as fraction of strategy NAV; 0 = 1/len(Pairs)
+    LongOnlySpot bool                    // block spread entries that would short a spot leg (SpotSIDs / Valuation=="spot")
 }
 ```
 
@@ -98,6 +99,7 @@ Each pair holds a private `RollingSpread`, `BandTrader`, frozen β, and position
 
 Weights (`pos∈{-1,0,+1}`, `G` = that pair's Gross, `β` the frozen value, `N=1+|β|`): `w_Y += pos·G/N`, `w_X += -pos·G·β/N`. When the same SID appears in several pairs the weights **accumulate**, nets can offset, and zero weights are deleted. For a single pair |w_Y|+|w_X| is exactly G, and total exposure ≤ ΣG ≤ NAV. `pos=+1` buys Y and sells X; X notional = β × Y notional (elasticity hedge under the log model).
 
+- **Spot-Perp Cash-and-Carry (`spot` + `linear` mixed universe)**: declaring `market_type: linear` with `extra_markets: [spot]` at root lets `pairs` mix spot `BTC/USDT` and linear perpetual `BTC/USDT:USDT` on the same exchange. Spot legs reject negative target weights/quantities (no naked shorting) and accrue 0 perpetual funding under `funding_policy: storage`, `required-stream`, or constant `funding_apr` (only `linear` perpetual legs settle funding). With `Pair{Y: "BTC/USDT:USDT", X: "BTC/USDT"}` (β>0), shorting the spread (`pos=-1`) goes Short Perp Y + Long Spot X; set `BandConfig{ShortOnly: true}` or `PairsSpec{LongOnlySpot: true}` (diagnostic `pair-spot-short-blocked`) to prevent reverse entries from shorting the spot leg.
 - **When β is negative both legs go the same direction**: the code does not reject it; filter it at the training/parameter layer.
 - **Signal/hedge inconsistency**: z uses the rolling α/β each round, while held-position weights use the β **frozen at entry**; β drift during the holding period changes z but not the hedge ratio.
 - **Window** = the most recent N **usable observations**, not calendar bars; a bar with an invalid leg does not enter the window, so the covered time stretches.

@@ -35,13 +35,14 @@
 
 ```go
 func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error
-type Pair struct{ Y, X string }          // 与运行 SIDMap 中符号完全一致，如 "ETH/USDT:USDT"
+type Pair struct{ Y, X string }          // 与运行 SIDMap 中符号完全一致，如 "ETH/USDT:USDT" 或现货 "BTC/USDT"
 type PairsSpec struct {
-    Pairs  []Pair
-    Field  string                        // kline 字段，缺省 "close"
-    Window int                           // 回归窗口（决策 bar 数），>= 3
-    Band   statistics.BandConfig         // 见 2.3
-    Gross  float64                       // 单对总名义占策略 NAV；0 = 1/len(Pairs)
+    Pairs        []Pair
+    Field        string                  // kline 字段，缺省 "close"
+    Window       int                     // 回归窗口（决策 bar 数），>= 3
+    Band         statistics.BandConfig   // 见 2.3
+    Gross        float64                 // 单对总名义占策略 NAV；0 = 1/len(Pairs)
+    LongOnlySpot bool                    // 禁止开出会做空现货腿（SpotSIDs / Valuation=="spot"）的价差仓位
 }
 ```
 
@@ -98,6 +99,7 @@ func (b *BandTrader) Position() int
 
 权重（`pos∈{-1,0,+1}`，`G`=该对 Gross，`β` 冻结值，`N=1+|β|`）：`w_Y += pos·G/N`，`w_X += -pos·G·β/N`。同一 SID 出现在多对时**叠加**，净额可对消，零权重删除。单对 |w_Y|+|w_X| 恰为 G，总敞口 ≤ ΣG ≤ NAV。`pos=+1` 买 Y 卖 X；X 名义 = β×Y 名义（对数模型弹性对冲）。
 
+- **期现套利（Spot + Linear 混合池）**：根配置声明 `market_type: linear` 与 `extra_markets: [spot]` 后，`pairs` 可同时包含现货 `BTC/USDT` 与永续 `BTC/USDT:USDT`。账本禁止裸做空现货（负目标权重/数量直接报错），且 `funding_policy: storage` / `required-stream` / `funding_apr` 下仅永续腿结算资金费、现货腿资金费恒为 0。若 `Pair{Y: "BTC/USDT:USDT", X: "BTC/USDT"}`（β>0），做空价差（`pos=-1`）即做空永续 Y + 做多现货 X，可配 `BandConfig{ShortOnly: true}` 或 `PairsSpec{LongOnlySpot: true}`（诊断 `pair-spot-short-blocked`）避免反向做空现货腿。
 - **β 为负时两腿同向**：代码不拒绝，须在训练/参数层过滤。
 - **信号/对冲不一致**：z 用每轮滚动 α/β，持仓权重用**入场时冻结**β；持仓期间 β 漂移改变 z 而不改对冲比例。
 - **窗口**=最近 N 个**可用观测**，非日历 bar；某腿无效的 bar 不进窗口，覆盖时间会拉长。

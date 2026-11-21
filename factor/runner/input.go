@@ -134,8 +134,13 @@ func openArchiveInput(ctx context.Context, c Config, chunk Chunk) (HistoricalInp
 	funding := map[int32]bool{}
 	all := c.ObserveBatch != nil || c.timeline != nil && c.timeline.allSourceEvents
 	for _, r := range rows {
-		if r.Series.Source == c.FundingSource && c.Manifest.Costs.FundingPolicy == "required-stream" && c.Execution.Instruments[r.Series.Sid].IsOption() {
-			return nil, errors.New("runner: option SID cannot have a perpetual funding stream")
+		if r.Series.Source == c.FundingSource && c.Manifest.Costs.FundingPolicy == "required-stream" {
+			if c.Execution.Instruments[r.Series.Sid].IsOption() {
+				return nil, errors.New("runner: option SID cannot have a perpetual funding stream")
+			}
+			if c.isSpotSID(r.Series.Sid) {
+				return nil, errors.New("runner: spot SID cannot have a perpetual funding stream")
+			}
 		}
 		clockSource := c.SourceEventDecisions && r.Series.Source == c.Factor.Source && r.Series.TimeFrame == c.Factor.TimeFrame
 		if !all && !clockSource && r.Series.Source != c.Prices.Source && r.Series.Source != c.FundingSource && r.Series.Source != c.OptionExpirySource && r.Series.Source != c.TerminalSettlementSource {
@@ -155,7 +160,7 @@ func openArchiveInput(ctx context.Context, c Config, chunk Chunk) (HistoricalInp
 	}
 	if c.Manifest.Costs.FundingPolicy == "required-stream" {
 		for _, sid := range c.Snapshot.Universe.Investable {
-			if c.Execution.Instruments[sid].IsOption() {
+			if c.Execution.Instruments[sid].IsOption() || c.isSpotSID(sid) {
 				continue
 			}
 			if !funding[sid] {

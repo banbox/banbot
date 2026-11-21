@@ -20,6 +20,7 @@ import (
 	"github.com/banbox/banbot/goods"
 	"github.com/banbox/banbot/orm"
 	runtimectx "github.com/banbox/banbot/runtime"
+	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/utils"
 	"github.com/shopspring/decimal"
 )
@@ -266,13 +267,17 @@ func prepareFactorStorageInputsReport(ctx context.Context, args *config.CmdArgs,
 				continue
 			}
 			symbol := task.Symbols.GetSymbolByID(sid)
-			market, marketErr := task.Exchange.GetMarket(symbol.Symbol)
+			market, marketErr := orm.LookupExchangeMarket(task.Exchange, symbol.Symbol, task.Symbols)
 			if marketErr != nil {
 				return nil, nil, nil, errors.Join(marketErr, cleanup())
 			}
 			info := task.Exchange.Info()
+			settleCode := market.Settle
+			if market.Spot && settleCode == "" {
+				settleCode = market.Quote
+			}
 			info.CurrByCodeLock.Lock()
-			currency := info.CurrenciesByCode[market.Settle]
+			currency := info.CurrenciesByCode[settleCode]
 			info.CurrByCodeLock.Unlock()
 			unit, unitErr := execution.InstrumentFromBanexgMarket(symbol.Symbol, market, currency)
 			if unitErr != nil {
@@ -356,6 +361,10 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 		requiredIDs = append(requiredIDs, c.Snapshot.Universe.Investable...)
 		requiredIDs = append(requiredIDs, c.Snapshot.Universe.Reference...)
 		requiredIDs = append(requiredIDs, c.Snapshot.Universe.Evaluation...)
+		spotSet := make(map[int32]bool)
+		for _, sid := range c.SpotSIDs {
+			spotSet[sid] = true
+		}
 		for _, sid := range requiredIDs {
 			symbol := task.Symbols.GetSymbolByID(sid)
 			if symbol == nil {
@@ -365,6 +374,17 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 				return nil, fmt.Errorf("factor: storage SID %d identity mismatch", sid)
 			}
 			c.Snapshot.SIDMap[sid] = symbol.Symbol
+			if symbol.Market == banexg.MarketSpot {
+				spotSet[sid] = true
+			}
+		}
+		if len(spotSet) > 0 {
+			spotIDs := make([]int32, 0, len(spotSet))
+			for sid := range spotSet {
+				spotIDs = append(spotIDs, sid)
+			}
+			sort.Slice(spotIDs, func(i, j int) bool { return spotIDs[i] < spotIDs[j] })
+			c.SpotSIDs = spotIDs
 		}
 		plan, _, err := runner.CompileDefinition(*c)
 		if err != nil {
@@ -423,8 +443,21 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 					fundingWarm = 1
 				}
 			}
-			if err := add(c.FundingSource, fundingTF, []string{"rate"}, fundingWarm, executionIDs, "funding:"+c.StrategyID, 0); err != nil {
-				return nil, err
+			fundingIDs := make([]int32, 0, len(executionIDs))
+			for _, sid := range executionIDs {
+				symbol := task.Symbols.GetSymbolByID(sid)
+				if symbol != nil && symbol.Market == banexg.MarketSpot {
+					continue
+				}
+				if unit, ok := c.Execution.Instruments[sid]; ok && !unit.HasPerpetualFunding() {
+					continue
+				}
+				fundingIDs = append(fundingIDs, sid)
+			}
+			if len(fundingIDs) > 0 {
+				if err := add(c.FundingSource, fundingTF, []string{"rate"}, fundingWarm, fundingIDs, "funding:"+c.StrategyID, 0); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}

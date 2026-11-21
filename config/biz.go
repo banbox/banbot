@@ -892,6 +892,7 @@ func (c *Config) Clone() *Config {
 		PutLimitSecs:         c.PutLimitSecs,
 		AccountPullSecs:      c.AccountPullSecs,
 		MarketType:           c.MarketType,
+		ExtraMarkets:         slices.Clone(c.ExtraMarkets),
 		ContractType:         c.ContractType,
 		OdBookTtl:            c.OdBookTtl,
 		StopEnterBars:        c.StopEnterBars,

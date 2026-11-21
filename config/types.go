@@ -93,6 +93,7 @@ type Config struct {
 	PutLimitSecs         int                               `yaml:"put_limit_secs,omitempty" mapstructure:"put_limit_secs"`
 	AccountPullSecs      int                               `yaml:"account_pull_secs,omitempty" mapstructure:"account_pull_secs"`
 	MarketType           string                            `yaml:"market_type,omitempty" mapstructure:"market_type"`
+	ExtraMarkets         []string                          `yaml:"extra_markets,omitempty,flow" mapstructure:"extra_markets"`
 	ContractType         string                            `yaml:"contract_type,omitempty" mapstructure:"contract_type"`
 	OdBookTtl            int64                             `yaml:"odbook_ttl,omitempty" mapstructure:"odbook_ttl"`
 	StopEnterBars        int                               `yaml:"stop_enter_bars,omitempty" mapstructure:"stop_enter_bars"`

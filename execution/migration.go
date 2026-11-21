@@ -367,7 +367,7 @@ func (s *Store) validateLegacyMigration(request LegacyMigration) error {
 			return errors.New("execution: legacy instrument units/version mismatch")
 		}
 		unitsByID[lot.Instrument.ID] = units
-		if !canonicalID(string(lot.Strategy)) || !canonicalID(string(lot.ID)) || lot.SignedSteps == -1<<63 || lot.CostBasis.IsNegative() || lot.SignedSteps == 0 && !lot.CostBasis.IsZero() {
+		if !canonicalID(string(lot.Strategy)) || !canonicalID(string(lot.ID)) || lot.SignedSteps == -1<<63 || !lot.Instrument.ShortAllowed() && lot.SignedSteps < 0 || lot.CostBasis.IsNegative() || lot.SignedSteps == 0 && !lot.CostBasis.IsZero() {
 			return errors.New("execution: invalid legacy virtual lot")
 		}
 		if _, ok := lots[key]; ok {
@@ -385,7 +385,7 @@ func (s *Store) validateLegacyMigration(request LegacyMigration) error {
 		if lot.SignedSteps < 0 {
 			basis = basis.Neg()
 		}
-		if !lot.Instrument.IsOption() {
+		if !lot.Instrument.IsCashSettled() {
 			virtualBasis = virtualBasis.Add(basis)
 		}
 	}
@@ -427,7 +427,7 @@ func (s *Store) validateLegacyMigration(request LegacyMigration) error {
 		if position.SignedSteps < 0 {
 			basis = basis.Neg()
 		}
-		if !position.Instrument.IsOption() {
+		if !position.Instrument.IsCashSettled() {
 			actualBasis = actualBasis.Add(basis)
 		}
 	}
@@ -534,7 +534,7 @@ func migrationPositions(positions []VirtualLot) (map[string]VirtualLot, error) {
 		if err := position.Instrument.Validate(); err != nil {
 			return nil, err
 		}
-		if position.SignedSteps == -1<<63 || position.CostBasis.IsNegative() || position.SignedSteps == 0 && !position.CostBasis.IsZero() {
+		if position.SignedSteps == -1<<63 || !position.Instrument.ShortAllowed() && position.SignedSteps < 0 || position.CostBasis.IsNegative() || position.SignedSteps == 0 && !position.CostBasis.IsZero() {
 			return nil, errors.New("execution: invalid migration actual position")
 		}
 		if _, ok := result[position.Instrument.ID]; ok {

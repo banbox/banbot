@@ -536,6 +536,7 @@ type Options struct {
 	Exchange         banexg.BanExchange
 	ExchangeName     string
 	Market           string
+	ExtraMarkets     []string
 	ContractType     string
 	DisplayLocation  *time.Location
 	SchedulerLang    string
@@ -650,6 +651,9 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		if opts.Market == "" {
 			opts.Market = snapshotConfig.MarketType
 		}
+		if len(opts.ExtraMarkets) == 0 && len(snapshotConfig.ExtraMarkets) > 0 {
+			opts.ExtraMarkets = slices.Clone(snapshotConfig.ExtraMarkets)
+		}
 		if opts.ContractType == "" {
 			opts.ContractType = snapshotConfig.ContractType
 		}
@@ -662,6 +666,13 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	}
 	if (opts.ExchangeName == "") != (opts.Market == "") {
 		return nil, fmt.Errorf("runtime: exchange and market must be provided together")
+	}
+	if len(opts.ExtraMarkets) > 0 {
+		normalizedExtra, extraErr := config.NormalizeExtraMarkets(opts.Market, opts.ExtraMarkets)
+		if extraErr != nil {
+			return nil, fmt.Errorf("runtime: %w", extraErr)
+		}
+		opts.ExtraMarkets = normalizedExtra
 	}
 	if opts.HubOrderBridge != nil {
 		if opts.SharedExecution != nil || opts.SharedOrderBridge != nil || opts.LegacyExecution != nil || opts.AccountOwnerKey != nil || opts.SharedMarketData || (opts.Env != core.RunEnvProd && opts.Env != core.RunEnvDryRun) || opts.Mode != core.RunModeLive && opts.Mode != core.RunModeData {
@@ -843,6 +854,9 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		return closeCoreOnError(allocatorErr)
 	}
 	symbols := orm.NewSymbolStateWithAllocatorAndIdentity(allocator, symbolExchange, symbolMarket)
+	if symbolExchange != unconfiguredIdentity && len(opts.ExtraMarkets) > 0 {
+		symbols.AllowExtraMarkets(opts.ExtraMarkets...)
+	}
 	if err := symbols.BindStorage(opts.Storage); err != nil {
 		return closeCoreOnError(fmt.Errorf("runtime: bind storage: %w", err))
 	}

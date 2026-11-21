@@ -99,7 +99,7 @@
 | `paper.go` / `paper_sink.go` / `paper_group.go` | 本地纸面账户；同账户多策略共享 borrow 与 paperMarket |
 | `validate.go` / `live_validate.go` | 回放/实盘配置校验，`resolveDecisionPortfolio` |
 | `risk_builder.go` / `model_builder.go` | 自定义风险优化与模型组合 builder 的配置与构造 |
-| `pairs.go` / `simple.go` | 统计套利配对 builder（`PairsSpec`，使用 `statistics.BandTrader`）、简单因子注册 |
+| `pairs.go` / `simple.go` | 统计套利配对 builder（`PairsSpec`，使用 `statistics.BandTrader`，支持 `LongOnlySpot` 在期现套利下拦截会做空现货腿的入场）、简单因子注册 |
 | `pairs_report.go` / `report.go` | 每对独立结果的记账（`pairStats`、`pairsTracker.report`）与结果类型（`PairResult`、`PairEpisode`、`Attribution`、`SymbolContribution`、`buildAttribution`）；`runObservers` 把 factory 内创建的配对状态带回 `Result` |
 | `params.go` / `scan.go` / `config.go` | 参数容器（`Params`，`Unused` 校验）、参数扫描、运行配置辅助 |
 | `terminal.go` / `option_expiry.go` | 终止标的与期权到期结算相关处理 |
@@ -135,7 +135,7 @@
 | `LifecycleState` / `AssetLifecycle` / `PortfolioCohort` | `policy.go:160` / `:131` / `:152` | 跨轮次状态，经 checkpoint 持久化；需 `ConfigHash`、`SIDMappingVersion`、`AssetIdentities` 兼容 |
 | `RoundBarrier` / `RoundKey` / `RoundToken` | `barrier.go:55` / `:28` / `:34` | 一个决策代的并发屏障，保证同一轮只计算一次 |
 | `VersionRecord` / `VersionStore` | `version_store.go:17` / `:62` | 版本化数据记录的有界存储与不可变归档 |
-| `Book` | `backtest/book.go` | 回测账本；`Mark`、`ApplyFunding`、`Execute`、`ApplyTerminalSettlement` |
+| `Book` | `backtest/book.go` | 回测账本；`Mark`、`ApplyFunding`、`Execute`、`ExecuteAllocation`、`ApplyTerminalSettlement`；`SetSpotSIDs` 登记现货 SID（拒绝负权重/负数量做空，且在 `ApplyFunding` 与常值 `SetFundingApr` 下资金费恒为 0） |
 | `expr.Spec` / `expr.Binding` | `expr/compile.go:22` / `:16` | 表达式规格与绑定别名（`kline.close` 中 `kline` 为绑定别名） |
 | `ComboSpec` / `ICHistory` | `research/combine.go:25` / `:48` | 合成方法（等权、IC 加权、质量加权等）与滚动 IC 窗口 |
 | `Manifest` / `ManifestSpec` | `research/manifest.go:52` / `:40` | 研究产物身份；strategy hash 排除部分字段 |

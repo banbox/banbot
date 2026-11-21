@@ -24,7 +24,7 @@ func (b *SharedAccountBorrow) ApplyPaperFunding(callerCtx context.Context, event
 	if err := event.Instrument.Validate(); err != nil {
 		return false, err
 	}
-	if !canonicalID(event.ID) || event.Instrument.IsOption() || !event.Mark.IsPositive() || event.AtMS < 0 || event.AtMS != now || event.AvailableAt < event.AtMS || event.AvailableAt > now {
+	if !canonicalID(event.ID) || !event.Instrument.HasPerpetualFunding() || !event.Mark.IsPositive() || event.AtMS < 0 || event.AtMS != now || event.AvailableAt < event.AtMS || event.AvailableAt > now {
 		return false, errors.New("execution: invalid/unavailable paper funding observation")
 	}
 	applied := false

@@ -18,7 +18,11 @@ type EuropeanOption struct {
 	UnderlyingStressMax decimal.Decimal
 }
 
-func (i Instrument) IsOption() bool { return i.Valuation == "cash_european_option" }
+func (i Instrument) IsOption() bool            { return i.Valuation == ValuationCashOption }
+func (i Instrument) IsSpot() bool              { return i.Valuation == ValuationSpot }
+func (i Instrument) IsCashSettled() bool       { return i.IsSpot() || i.IsOption() }
+func (i Instrument) ShortAllowed() bool        { return !i.IsSpot() }
+func (i Instrument) HasPerpetualFunding() bool { return i.Valuation == ValuationLinearPerpetual }
 
 // Clone owns the optional descriptor; decimal values themselves are immutable.
 func (i Instrument) Clone() Instrument {
@@ -45,10 +49,13 @@ func (i Instrument) OptionPayoff(fixing decimal.Decimal) decimal.Decimal {
 	return decimal.Max(decimal.Zero, payoff)
 }
 
-// Collateral reserves premium for longs and the entire stress payoff for shorts,
-// independently of premium and perpetual margin rate. Across option contracts
-// no payoff netting is assumed. Netted identical account contracts are exact.
+// Collateral reserves 100% notional for unleveraged spot, premium for long
+// options and the entire stress payoff for short options, independently of
+// perpetual margin rate. Across option contracts no payoff netting is assumed.
 func (i Instrument) Collateral(steps int64, mark, perpetualRate decimal.Decimal) decimal.Decimal {
+	if i.IsSpot() {
+		return i.Notional(absSteps(steps), mark)
+	}
 	if !i.IsOption() {
 		return i.Notional(absSteps(steps), mark).Mul(perpetualRate)
 	}
@@ -63,7 +70,7 @@ func (i Instrument) Collateral(steps int64, mark, perpetualRate decimal.Decimal)
 }
 
 func tradeCash(i Instrument, side OrderSide, cost, realized, fee decimal.Decimal) decimal.Decimal {
-	if !i.IsOption() {
+	if !i.IsCashSettled() {
 		return realized.Sub(fee)
 	}
 	if side == Buy {

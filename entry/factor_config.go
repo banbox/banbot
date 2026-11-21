@@ -306,7 +306,7 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 			// rejection of replay-only capabilities before the legacy assembly.
 			replayOnly := c.SourceEventDecisions || c.OptionExpirySource != "" || c.TerminalSettlementSource != "" || c.Execution.PaperFillModel != ""
 			for _, instrument := range c.Execution.Instruments {
-				replayOnly = replayOnly || instrument.IsOption() || instrument.Option != nil
+				replayOnly = replayOnly || instrument.IsOption() || instrument.Option != nil || instrument.IsSpot()
 			}
 			if replayOnly {
 				if err := runner.ValidateLiveConfig(c); err != nil {

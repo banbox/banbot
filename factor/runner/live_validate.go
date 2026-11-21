@@ -42,6 +42,9 @@ func compileLiveDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 		if instrument.IsOption() || instrument.Option != nil {
 			return nil, combo, errors.New("runner: live cash options require a venue-specific exercise and settlement adapter")
 		}
+		if instrument.IsSpot() {
+			return nil, combo, errors.New("runner: live spot execution requires a spot balance reconciliation adapter")
+		}
 	}
 	if c.SourceEventDecisions {
 		return nil, combo, errors.New("runner: source-event decisions are historical only")

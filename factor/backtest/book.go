@@ -20,6 +20,7 @@ type State struct {
 }
 type Book struct {
 	terminals                               map[int32]TerminalSettlement
+	spots                                   map[int32]bool
 	cash, fees, slippage, funding, turnover float64
 	quantities                              map[int32]float64
 	marks                                   map[int32]Quote
@@ -55,7 +56,28 @@ func NewBook(nav float64) (*Book, error) {
 	if nav <= 0 || !finite(nav) {
 		return nil, errors.New("backtest: invalid initial strategy NAV")
 	}
-	return &Book{initNAV: nav, cash: nav, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingMarked: map[int32]int64{}, fundingBilled: map[int32]int64{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
+	return &Book{initNAV: nav, cash: nav, spots: map[int32]bool{}, quantities: map[int32]float64{}, marks: map[int32]Quote{}, fundingMarked: map[int32]int64{}, fundingBilled: map[int32]int64{}, fundingIDs: map[string]bool{}, firstFill: map[int32]int64{}, acceptedProposals: map[string]bookAcceptance{}}, nil
+}
+
+// SetSpotSIDs marks SIDs whose valuation contract is unleveraged spot: short
+// target weights/quantities are rejected and perpetual funding never accrues.
+func (b *Book) SetSpotSIDs(sids ...int32) {
+	if b == nil || len(sids) == 0 {
+		return
+	}
+	if b.spots == nil {
+		b.spots = make(map[int32]bool, len(sids))
+	}
+	for _, sid := range sids {
+		if sid > 0 {
+			b.spots[sid] = true
+		}
+	}
+}
+
+// IsSpot reports whether sid is registered as an unleveraged spot instrument.
+func (b *Book) IsSpot(sid int32) bool {
+	return b != nil && b.spots[sid]
 }
 func (b *Book) Mark(sid int32, q Quote, now int64) error {
 	if _, ok := b.terminals[sid]; ok {
@@ -119,6 +141,9 @@ func (b *Book) Execute(p *factor.TargetPortfolio, quotes map[int32]Quote, now in
 	}
 	// Validate the whole portfolio before changing any cash or quantities.
 	for sid := range targets {
+		if b.IsSpot(sid) && targets[sid] < 0 {
+			return errors.New("backtest: shorting is not allowed on spot instrument")
+		}
 		if done, err := b.TerminalQuoteExempt(sid, targets[sid] == 0); err != nil {
 			return err
 		} else if done {
@@ -174,6 +199,10 @@ func (b *Book) ApplyFunding(f Funding, now int64) error {
 	}
 	if b.fundingIDs[f.ID] {
 		return errors.New("backtest: duplicate funding settlement")
+	}
+	if b.IsSpot(f.SID) {
+		b.fundingIDs[f.ID] = true
+		return nil
 	}
 	q, ok := b.marks[f.SID]
 	if !ok {

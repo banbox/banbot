@@ -92,7 +92,7 @@ func (s *Store) AttributeExternal(ctx context.Context, request ExternalAttributi
 			// Transfer only the cash flows represented by this book, not unrelated
 			// capital or reconciliation balances held in unassigned cash.
 			cash := external.RealizedPnL.Sub(external.Fees).Add(external.Funding)
-			if external.Instrument.IsOption() {
+			if external.Instrument.IsCashSettled() {
 				if external.SignedSteps > 0 {
 					cash = cash.Sub(external.CostBasis)
 				} else {

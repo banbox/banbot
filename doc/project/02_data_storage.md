@@ -107,7 +107,7 @@
 | `KLineSeriesStore` | orm/kline_series_store.go:19 | 向已有 K 线行写扩展列；缺少对应 K 线行时失败 |
 | `Storage` | orm/storage.go:18 | 显式连接依赖；`OpenStorage`（:37）、`EnsureSchema`（:66）。创建者负责 Close |
 | `Queries` / `DBTX` | orm/db.go:36 / :18 | 查询句柄，绑定到连接或事务 |
-| `SymbolState` / `SIDAllocator` | orm/symbol_state.go:219 / :15 | 符号索引（逻辑键 → 快照、SID → 快照）与 SID 分配、reservation 围栏 |
+| `SymbolState` / `SIDAllocator` | orm/symbol_state.go | 符号索引（逻辑键 → 快照、SID → 快照）与 SID 分配、reservation 围栏；默认严格单 `(exchange, market)` 隔离，调用 `SymbolState.AllowExtraMarkets`（或配置 `extra_markets`）可在同一交易所准入附加市场（如主 `linear` + 附加 `spot`），按 CCXT 统一符号格式（`BASE/QUOTE` → `spot`、`BASE/QUOTE:SETTLE` → `linear`/`inverse`，见 `orm/exsymbol.go:InferUnifiedSymbolMarket` 与 `LookupExchangeMarket`）消歧并各自路由到独立 SID 与 K 线下载（`orm/kdata.go:fetchApiOHLCVWithMarketOptions`） |
 | `SymbolSIDRegistry` | orm/sid_registry.go:34 | PG 侧 SID 权威注册表 |
 | `Subscription` / `StreamKey` | orm/subscription.go:29 / :43 | 订阅规范化与去重键 |
 | `AdjInfo` / `SRange` | orm/types.go:19 / orm/models.go:38 | 复权段信息 / 覆盖区间记录 |
@@ -124,7 +124,7 @@
 | `DataSourceCatalog` / `DataSourceFactory` | data/source_catalog.go:13 / :22 | 数据源注册表；工厂为每个 Runtime 生成独立实例 |
 | `RuntimeDeps` | data/runtime_deps.go:37 | Runtime 依赖集合（Catalog、Storage、Symbols、Config、Clock 等） |
 | `FuncDataSource` | data/func_source.go:15 | 用函数回调实现 DataSource |
-| `IDataFeeder` / `SeriesFeeder` / `DBSeriesFeeder` | data/feeder.go:674 / :711 / :1163 | 单交易对回放与多周期聚合 |
+| `IDataFeeder` / `SeriesFeeder` / `DBSeriesFeeder` | data/feeder.go | 单交易对回放与多周期聚合；`validateFeederRuntimeIdentity` 默认校验单一主市场，当 `SymbolState.ExtraMarkets` / `Config.ExtraMarkets` 显式启用时放行同交易所的附加市场标的 |
 | `HistSeriesFeeder` | data/hist_series_feeder.go:14 | 独立时序分页回放 |
 | `Provider[T]` / `HistProvider` / `LiveProvider` | data/provider.go:88 / :303 / :997 | 回测堆调度与实盘 ingress |
 | `TradeFeeder` / `WsDataLoader` | data/ws_feeder.go:17 / data/ws_loader.go:41 | 逐笔回放与归档缓存 |

@@ -58,6 +58,9 @@ type Config struct {
 	// pairs mode the PIT decision is per pair: a pair with a missing leg is closed and paused, the others go on,
 	// and the "universe too small" fallback does not apply.
 	PITPairs [][2]int32 `json:",omitempty"`
+	// SpotSIDs identifies unleveraged spot SIDs when Execution.Instruments is omitted (e.g. Weights mode).
+	// Spot SIDs prohibit short positions and never accrue perpetual funding.
+	SpotSIDs []int32 `json:",omitempty"`
 	// UnavailableSymbols (BtFeatureLevel 11): pool symbols the engine left out of this run because they have no stored
 	// data inside its window (symbol -> reason). A pairs strategy skips the pairs that use them instead of failing.
 	UnavailableSymbols                                 map[string]string `json:"-"`
@@ -191,6 +194,37 @@ type evaluation struct {
 	weights, previous map[int32]float64
 	deadline          int64
 	previousColumns   map[string]map[int32]factor.Numeric
+}
+
+func (c Config) isSpotSID(sid int32) bool {
+	if inst, ok := c.Execution.Instruments[sid]; ok && inst.IsSpot() {
+		return true
+	}
+	for _, s := range c.SpotSIDs {
+		if s == sid {
+			return true
+		}
+	}
+	return false
+}
+
+func (c Config) spotSIDList() []int32 {
+	seen := make(map[int32]bool, len(c.SpotSIDs))
+	var out []int32
+	for _, sid := range c.SpotSIDs {
+		if sid > 0 && !seen[sid] {
+			seen[sid] = true
+			out = append(out, sid)
+		}
+	}
+	for sid, inst := range c.Execution.Instruments {
+		if sid > 0 && inst.IsSpot() && !seen[sid] {
+			seen[sid] = true
+			out = append(out, sid)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, runErr error) {
@@ -344,6 +378,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		if err != nil {
 			return result, err
 		}
+		book.SetSpotSIDs(c.spotSIDList()...)
 		if !isStreamFundingPolicy(c.Manifest.Costs.FundingPolicy) {
 			book.SetFundingApr(c.Manifest.Costs.FundingApr)
 		}
@@ -588,6 +623,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			}
 			for _, r := range batch.Records {
 				if r.Series.Source == c.FundingSource && isStreamFundingPolicy(c.Manifest.Costs.FundingPolicy) {
+					if c.isSpotSID(r.Series.Sid) {
+						continue
+					}
 					if r.AvailableAt > now || r.IngestedAt > now || r.EventTime != now {
 						return result, errors.New("runner: funding settlement unavailable or delivered late")
 					}
@@ -597,8 +635,20 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 					}
 					f := backtest.Funding{ID: fmt.Sprintf("%s:%d:%d", r.Series.Source, r.Series.Sid, r.EventTime), SID: r.Series.Sid, AtMS: r.EventTime, AvailableAt: max(r.AvailableAt, r.IngestedAt), Rate: n.Value}
 					if observer, ok := sink.(FundingObserver); ok && !warming {
-						if err = observer.ObserveFunding(ctx, f, now); err != nil {
-							return result, err
+						skipFlatUnmarked := false
+						if (c.HistoricalInput != nil || c.Manifest.Costs.FundingPolicy == "storage") {
+							if accSink, isAcc := sink.(*AccountSink); isAcc {
+								ready, readyErr := accSink.HasMarkOrActiveExposure(ctx, r.Series.Sid)
+								if readyErr != nil {
+									return result, readyErr
+								}
+								skipFlatUnmarked = !ready
+							}
+						}
+						if !skipFlatUnmarked {
+							if err = observer.ObserveFunding(ctx, f, now); err != nil {
+								return result, err
+							}
 						}
 					}
 					if book != nil && !warming {

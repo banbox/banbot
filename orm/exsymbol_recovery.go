@@ -477,7 +477,7 @@ func reconcileSharedSIDReservations(ctx context.Context, q *Queries, state *Symb
 		if !expected.matches(item) {
 			return fmt.Errorf("reconcile shared SID reservation marker %s sid %d: metadata conflict", path, expected.ID)
 		}
-		if state.identitySet && (item.Exchange != state.identityExchange || item.Market != state.identityMarket) {
+		if !state.acceptsIdentity(item.Exchange, item.Market) {
 			// The shared ledger is storage-scoped, so a foreign runtime must
 			// still verify WAL visibility before allowing the ledger to clear.
 			if err := allocator.markSIDConfirmed(exSymbolKey(item.Exchange, item.Market, item.Symbol), item.ID); err != nil {
@@ -944,7 +944,7 @@ func reconcilePendingExSymbolMarkersLocked(ctx context.Context, q *Queries, stat
 		unresolved := make([]exSymbolRecoveryRow, 0, len(marker.Rows))
 		replayable := make([]exSymbolRecoveryRow, 0, len(marker.Rows))
 		for _, expected := range marker.Rows {
-			if state.identitySet && (expected.Exchange != state.identityExchange || expected.Market != state.identityMarket) {
+			if !state.acceptsIdentity(expected.Exchange, expected.Market) {
 				confirmed = false
 				foreign = true
 				continue

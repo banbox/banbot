@@ -205,6 +205,9 @@ func updateLot(lot *VirtualLot, side OrderSide, kind IntentKind, steps int64, no
 	if err != nil {
 		return decimal.Zero, err
 	}
+	if !lot.Instrument.ShortAllowed() && next < 0 {
+		return decimal.Zero, errors.New("execution: spot position cannot be short")
+	}
 	realized := decimal.Zero
 	if old == 0 || old > 0 && delta > 0 || old < 0 && delta < 0 {
 		lot.CostBasis = lot.CostBasis.Add(notional)
@@ -394,7 +397,7 @@ func (s *Store) ApplyFill(ctx context.Context, report FillReport) (bool, error) 
 				return err
 			}
 			postingCash := partFee.Neg()
-			if lot.Instrument.IsOption() {
+			if lot.Instrument.IsCashSettled() {
 				postingCash = cash
 			}
 			if err := s.ledger(tx, LedgerEntry{EventID: report.EventID, Kind: "ExchangeFill", Strategy: a.Strategy, Lot: a.Lot, QuantityDelta: delta, CashDelta: postingCash, RealizedPnL: realized, Fee: partFee, AtMS: report.AtMS}); err != nil {
@@ -440,7 +443,7 @@ func (s *Store) ApplyFill(ctx context.Context, report FillReport) (bool, error) 
 			return err
 		}
 		reclassification := realizedTotal.Sub(actualRealized)
-		if order.Intent.Instrument.IsOption() {
+		if order.Intent.Instrument.IsCashSettled() {
 			reclassification = decimal.Zero
 		}
 		if err := s.reclassify(tx, report.EventID, reclassification, report.AtMS); err != nil {

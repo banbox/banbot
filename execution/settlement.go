@@ -154,7 +154,7 @@ func (s *Store) ApplyInternalMatch(ctx context.Context, match InternalMatch) (bo
 				delta = -delta
 			}
 			postingCash := decimal.Zero
-			if match.Instrument.IsOption() {
+			if match.Instrument.IsCashSettled() {
 				postingCash = cash
 			}
 			if err := s.ledger(tx, LedgerEntry{EventID: match.ID, Kind: "InternalFill", Strategy: intent.Strategy, Lot: intent.Lot, QuantityDelta: delta, CashDelta: postingCash, RealizedPnL: realized, AtMS: match.AtMS}); err != nil {
@@ -192,6 +192,9 @@ func (s *Store) ApplyFunding(ctx context.Context, event FundingSettlement) (bool
 	}
 	if event.Instrument.IsOption() {
 		return false, errors.New("execution: options have no perpetual funding")
+	}
+	if !event.Instrument.HasPerpetualFunding() {
+		return false, errors.New("execution: spot instruments have no perpetual funding")
 	}
 	if !canonicalID(event.ID) || !event.Mark.IsPositive() || event.AtMS < 0 {
 		return false, errors.New("execution: invalid funding settlement")
@@ -385,14 +388,14 @@ func (s *Store) ApplyExternalPosition(ctx context.Context, event ExternalPositio
 			delta = -delta
 		}
 		postingCash := event.Fee.Neg()
-		if event.Instrument.IsOption() {
+		if event.Instrument.IsCashSettled() {
 			postingCash = tradeCash(event.Instrument, event.Side, notional, virtualRealized, event.Fee)
 		}
 		if err := s.ledger(tx, LedgerEntry{EventID: event.ID, Kind: string(event.Kind), QuantityDelta: delta, CashDelta: postingCash, RealizedPnL: virtualRealized, Fee: event.Fee, AtMS: event.AtMS}); err != nil {
 			return err
 		}
 		reclassification := virtualRealized.Sub(realized)
-		if event.Instrument.IsOption() {
+		if event.Instrument.IsCashSettled() {
 			reclassification = decimal.Zero
 		}
 		if err := s.reclassify(tx, event.ID, reclassification, event.AtMS); err != nil {

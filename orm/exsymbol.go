@@ -182,6 +182,82 @@ func GetExSymbol(exchange banexg.BanExchange, symbol string) (*ExSymbol, *errs.E
 	return item, nil
 }
 
+// InferUnifiedSymbolMarket classifies a canonical CCXT symbol into its market
+// type ("spot", "linear", or "inverse"). Non-slash symbols return fallback.
+func InferUnifiedSymbolMarket(symbol, fallback string) string {
+	slashIdx := strings.IndexByte(symbol, '/')
+	if slashIdx <= 0 || slashIdx+1 >= len(symbol) {
+		return fallback
+	}
+	rest := symbol[slashIdx+1:]
+	colonIdx := strings.IndexByte(rest, ':')
+	if colonIdx < 0 {
+		if dotIdx := strings.IndexByte(rest, '.'); dotIdx > 0 {
+			return banexg.MarketLinear
+		}
+		return banexg.MarketSpot
+	}
+	quote := rest[:colonIdx]
+	settle := rest[colonIdx+1:]
+	if dashIdx := strings.IndexByte(settle, '-'); dashIdx > 0 {
+		settle = settle[:dashIdx]
+	}
+	if quote != "" && strings.HasPrefix(settle, quote) {
+		return banexg.MarketLinear
+	}
+	return banexg.MarketInverse
+}
+
+// LookupExchangeMarket resolves symbol metadata without letting a contract-mode
+// exchange rewrite a spot BASE/QUOTE symbol into BASE/QUOTE:SETTLE when the
+// symbol state explicitly permits multi-market resolution.
+func LookupExchangeMarket(exchange banexg.BanExchange, symbol string, state *SymbolState) (*banexg.Market, *errs.Error) {
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	if state != nil && len(state.ExtraMarkets()) > 0 {
+		if info := exchange.Info(); info != nil && info.Markets != nil {
+			if mar := info.Markets[symbol]; mar != nil && mar.Type != "" && state.acceptsIdentity(info.ID, mar.Type) {
+				return mar, nil
+			}
+		}
+	}
+	return exchange.GetMarket(symbol)
+}
+
+// LookupExchangeMarketForConfig resolves symbol metadata honoring explicit
+// cfg.ExtraMarkets when no SymbolState pointer is threaded into a filter helper.
+func LookupExchangeMarketForConfig(exchange banexg.BanExchange, symbol string, cfg *config.Config) (*banexg.Market, *errs.Error) {
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
+	}
+	if cfg != nil && len(cfg.ExtraMarkets) > 0 {
+		if info := exchange.Info(); info != nil && info.Markets != nil {
+			if mar := info.Markets[symbol]; mar != nil && mar.Type != "" {
+				if mar.Type == cfg.MarketType {
+					return mar, nil
+				}
+				for _, extra := range cfg.ExtraMarkets {
+					if mar.Type == extra {
+						return mar, nil
+					}
+				}
+			}
+		}
+	}
+	return exchange.GetMarket(symbol)
+}
+
+func resolveStateMarketForSymbol(state *SymbolState, exchangeName, defaultMarket, symbol string) string {
+	if state != nil && len(state.ExtraMarkets()) > 0 {
+		inferred := InferUnifiedSymbolMarket(symbol, defaultMarket)
+		if inferred != "" && state.acceptsIdentity(exchangeName, inferred) {
+			return inferred
+		}
+	}
+	return defaultMarket
+}
+
 // GetExSymbolCur resolves a symbol from this state without consulting the
 // package-level legacy cache. It is intentionally a low-frequency lookup used
 // while constructing feeders; event processing keeps the resolved pointer.
@@ -190,11 +266,29 @@ func (s *SymbolState) GetExSymbolCur(symbol string) (*ExSymbol, *errs.Error) {
 		return GetExSymbolCur(symbol)
 	}
 	if s.identitySet {
-		item := s.GetExSymbol2(s.identityExchange, s.identityMarket, symbol)
-		if item == nil {
-			return nil, errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, s.SymbolCount())
+		extra := s.extraMarkets.Load()
+		if extra == nil || len(*extra) == 0 {
+			item := s.GetExSymbol2(s.identityExchange, s.identityMarket, symbol)
+			if item == nil {
+				return nil, errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, s.SymbolCount())
+			}
+			return item, nil
 		}
-		return item, nil
+		inferred := InferUnifiedSymbolMarket(symbol, s.identityMarket)
+		if s.acceptsIdentity(s.identityExchange, inferred) {
+			if item := s.GetExSymbol2(s.identityExchange, inferred, symbol); item != nil {
+				return item, nil
+			}
+		}
+		if item := s.GetExSymbol2(s.identityExchange, s.identityMarket, symbol); item != nil {
+			return item, nil
+		}
+		for _, m := range s.ExtraMarkets() {
+			if item := s.GetExSymbol2(s.identityExchange, m, symbol); item != nil {
+				return item, nil
+			}
+		}
+		return nil, errs.NewMsg(core.ErrInvalidSymbol, "%s not exist in %d cache", symbol, s.SymbolCount())
 	}
 	if exg.Default == nil {
 		item := s.GetExSymbol2(core.ExgName, core.Market, symbol)
@@ -216,10 +310,10 @@ func (s *SymbolState) GetExSymbol(exchange banexg.BanExchange, symbol string) (*
 	if exchange == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
 	}
-	market, err := exchange.GetMarket(symbol)
+	market, err := LookupExchangeMarket(exchange, symbol, s)
 	exgInfo := exchange.Info()
-	marketType := exgInfo.MarketType
-	if market != nil {
+	marketType := resolveStateMarketForSymbol(s, exgInfo.ID, exgInfo.MarketType, symbol)
+	if market != nil && market.Type != "" {
 		marketType = market.Type
 	}
 	if !s.acceptsIdentity(exgInfo.ID, marketType) {
@@ -463,6 +557,7 @@ type SkippedPair struct {
 
 // retiredWindowReason says why a catalog-known symbol has no stored data inside cfg.TimeRange.
 func retiredWindowReason(state *SymbolState, exchangeName, marketType, symbol string, cfg *config.Config) string {
+	marketType = resolveStateMarketForSymbol(state, exchangeName, marketType, symbol)
 	item := state.GetExSymbol2(exchangeName, marketType, symbol)
 	if item == nil {
 		var err error
@@ -524,9 +619,13 @@ func resolveEnsureList(state *SymbolState, marMap banexg.MarketMap, exchangeName
 			exsList = append(exsList, stored)
 			continue
 		}
+		symMarket := resolveStateMarketForSymbol(state, exchangeName, marketType, symbol)
+		if mar != nil && mar.Type != "" {
+			symMarket = mar.Type
+		}
 		exsList = append(exsList, &ExSymbol{
 			Exchange: exchangeName,
-			Market:   marketType,
+			Market:   symMarket,
 			Symbol:   symbol,
 			Combined: mar.Combined,
 			ListMs:   mar.Created,
@@ -621,6 +720,7 @@ func storedRetiredLookup(state *SymbolState, exchangeName, marketType, symbol st
 	if state == nil || cfg == nil || cfg.TimeRange == nil || cfg.TimeRange.StartMS <= 0 {
 		return nil, false, nil
 	}
+	marketType = resolveStateMarketForSymbol(state, exchangeName, marketType, symbol)
 	if state.SymbolCount() == 0 {
 		// load the stored catalog without inserting anything
 		if err := state.EnsureSymbols(nil, exchangeName); err != nil {

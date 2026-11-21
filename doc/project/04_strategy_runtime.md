@@ -52,7 +52,7 @@
 - **`BatchState` / `JobEnv` / `BatchMap`**（`batch_state.go`、`types.go:89,100`）：批量执行池，键为时间戳+市场组；`TakeReady(currMS, deterministic)` 返回就绪组（确定性模式下等待所有有效任务后按 key 排序输出）；组内 `MainJobs` 按品种键字典序交给 `OnBatchJobs`，不经同 bar 多品种的哈希优先级，批策略若按到达顺序依次开仓，资金竞争仍偏向字母靠前的品种，应自行按得分排序。
 - **`PairUpdateReq` / `PairUpdateResult` / `PairUpdateHooks`**（`pair_update.go:19,31,39`）：动态品种更新的入参、结果与外部钩子（`SubWarmPairs` 必需；`ExitOrders` 在 `CloseOnRemove` 时必需；`LookupSymbol`）。
 - **`FuncProcessOrders` / `BindOrderProcessor`**（`execution_state.go:14,17`）：订单处理器由 `biz/job_orders.go:30` 在组装阶段绑定一次（owner 必须是同一 `Trading` 指针）。
-- **`Process` / `Options` / `Runtime`**（`runtime/runtime.go:47,504,559`）：`Process` 为资源 owner（`runtimes`、`sharedAccounts`、`symbolAllocators`、`sidRegistries`、`schedulerClaims`）；`Options` 为构造参数（Storage、Exchange、Config、Scheduler、AccountOwnerKey、SharedExecution、LegacyExecution 等）；`Runtime` 字段见 `doc/runtime_context.md` §2 表格，关键的有 `Core`、`Clock`、`Market`、`Symbols`、`Storage`（借用）、`Batch`、`Strategies`、`Orders`、`Trading`、`Cron`、`Exchange`（借用）。
+- **`Process` / `Options` / `Runtime`**（`runtime/runtime.go:Process`、`Options`、`Runtime`）：`Process` 为资源 owner（`runtimes`、`sharedAccounts`、`symbolAllocators`、`sidRegistries`、`schedulerClaims`）；`Options` 为构造参数（Storage、Exchange、Market、ExtraMarkets、Config、Scheduler、AccountOwnerKey、SharedExecution、LegacyExecution 等，`Process.NewRuntime` 在配置了 `ExtraMarkets` 时向 `Symbols.AllowExtraMarkets` 注入同交易所附加市场身份）；`Runtime` 字段见 `doc/runtime_context.md` §2 表格，关键的有 `Core`、`Clock`、`Market`、`Symbols`、`Storage`（借用）、`Batch`、`Strategies`、`Orders`、`Trading`、`Cron`、`Exchange`（借用）。
 - **`runtimeplan.RequestV1` / `OutputV1`**（`runtimeplan/types.go`）：JSON 严格解码（`DisallowUnknownFields`，拒绝尾随内容）。输出的 `SemanticPlanSHA256` 为版本化域分隔哈希。
 
 ## 关键流程

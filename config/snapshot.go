@@ -59,6 +59,7 @@ func cloneSnapshotConfig(c *Config) *Config {
 	}
 	res.WalletAmounts = maps.Clone(c.WalletAmounts)
 	res.StakeCurrency = slices.Clone(c.StakeCurrency)
+	res.ExtraMarkets = slices.Clone(c.ExtraMarkets)
 	res.FatalStop = maps.Clone(c.FatalStop)
 	res.RunTimeframes = slices.Clone(c.RunTimeframes)
 	res.Pairs = slices.Clone(c.Pairs)

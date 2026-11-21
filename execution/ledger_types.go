@@ -8,12 +8,18 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+const (
+	ValuationLinearPerpetual = "linear_perpetual"
+	ValuationSpot            = "spot"
+	ValuationCashOption      = "cash_european_option"
+)
+
 // Instrument fixes venue-independent units and valuation. Inverse contracts
 // require a different valuation contract. Cash options are paper/research only.
 type Instrument struct {
 	ID                 string
 	Version            string
-	Valuation          string          // linear_perpetual or cash_european_option
+	Valuation          string          // linear_perpetual, spot, or cash_european_option
 	Option             *EuropeanOption `json:",omitempty"`
 	SettlementCurrency string
 	QuantityStep       decimal.Decimal
@@ -28,11 +34,16 @@ func (i Instrument) Validate() error {
 	if !canonicalID(i.ID) || !canonicalID(i.Version) || !canonicalID(i.SettlementCurrency) || !i.QuantityStep.IsPositive() || !i.ContractSize.IsPositive() || !i.PriceTick.IsPositive() || i.MoneyScale < 0 || i.MoneyScale > 18 || i.MinSteps < 0 || i.MinNotional.IsNegative() {
 		return errors.New("execution: invalid instrument units/version/scale")
 	}
-	if i.Valuation == "cash_european_option" {
+	switch i.Valuation {
+	case ValuationCashOption:
 		if i.Option == nil || !canonicalID(i.Option.UnderlyingID) || i.Option.UnderlyingID == i.ID || (i.Option.Right != "call" && i.Option.Right != "put") || !i.Option.Strike.IsPositive() || i.Option.ExpiryMS <= 0 || !i.Option.UnderlyingStressMax.IsPositive() {
 			return errors.New("execution: option requires European cash payoff identity and declared research stress bound")
 		}
-	} else if i.Valuation != "linear_perpetual" || i.Option != nil {
+	case ValuationLinearPerpetual, ValuationSpot:
+		if i.Option != nil {
+			return errors.New("execution: unsupported valuation contract")
+		}
+	default:
 		return errors.New("execution: unsupported valuation contract")
 	}
 	return nil
@@ -154,10 +165,11 @@ func (l VirtualLot) Unrealized(mark decimal.Decimal) decimal.Decimal {
 	return value.Sub(l.CostBasis)
 }
 
-// EquityValue is the contribution added to settled cash. Option premiums have
-// already changed cash, so their contribution is signed market value, not PnL.
+// EquityValue is the contribution added to settled cash. Cash-settled assets
+// (spot inventory and option premiums) have already moved cash by trade cost,
+// so their contribution is signed market value rather than unrealized PnL.
 func (l VirtualLot) EquityValue(mark decimal.Decimal) decimal.Decimal {
-	if l.Instrument.IsOption() {
+	if l.Instrument.IsCashSettled() {
 		return l.Instrument.Notional(l.SignedSteps, mark)
 	}
 	return l.Unrealized(mark)

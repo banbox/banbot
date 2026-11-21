@@ -141,6 +141,9 @@ func (a *PaperAdapter) submitLocked(ctx context.Context, o OrderIntent, client s
 	if !canonicalID(client) || !canonicalID(o.ID) || o.Steps <= 0 || o.Side != Buy && o.Side != Sell || o.Limit.IsNegative() || !o.Observation.Price.IsPositive() {
 		return SubmitReceipt{}, errors.New("execution: invalid paper order")
 	}
+	if !o.Instrument.ShortAllowed() && o.Side == Sell && o.Steps > a.positions[o.Instrument.ID].steps {
+		return SubmitReceipt{}, errors.New("execution: short orders are not allowed on spot instrument")
+	}
 	if o.SubmitAtMS < o.Observation.AtMS {
 		return SubmitReceipt{}, errors.New("execution: paper submission clock precedes observable quote")
 	}

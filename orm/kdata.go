@@ -55,6 +55,12 @@ func fetchApiOHLCV(ctx context.Context, exchange banexg.BanExchange, pair, timeF
 func fetchApiOHLCVWithOptions(ctx context.Context, exchange banexg.BanExchange, pair, timeFrame string, startMS, endMS int64,
 	out chan []*banexg.Kline, useArchive bool, options KlineRuntimeOptions,
 ) *errs.Error {
+	return fetchApiOHLCVWithMarketOptions(ctx, exchange, pair, "", timeFrame, startMS, endMS, out, useArchive, options)
+}
+
+func fetchApiOHLCVWithMarketOptions(ctx context.Context, exchange banexg.BanExchange, pair, marketType, timeFrame string, startMS, endMS int64,
+	out chan []*banexg.Kline, useArchive bool, options KlineRuntimeOptions,
+) *errs.Error {
 	if err := validateKlineRuntimeOptions(options); err != nil {
 		return err
 	}
@@ -81,10 +87,16 @@ func fetchApiOHLCVWithOptions(ctx context.Context, exchange banexg.BanExchange, 
 	if batchSize <= 0 {
 		batchSize = 1
 	}
+	crossMarketFetch := false
+	if marketType != "" && exchange != nil {
+		if info := exchange.Info(); info != nil && info.MarketType != "" && info.MarketType != marketType {
+			crossMarketFetch = true
+		}
+	}
 	curSince := startMS
 	archiveEnd := utils2.AlignTfMSecs(options.nowMS()-int64(48*time.Hour/time.Millisecond), tfMSecs)
 	archiveEnd = min(archiveEnd, endMS)
-	if useArchive && archiveEnd > curSince {
+	if useArchive && !crossMarketFetch && archiveEnd > curSince {
 		if archive, ok := exchange.(banexg.OHLCVArchiveFetcher); ok {
 			data, available, err := archive.FetchOHLCVArchive(ctx, pair, timeFrame, curSince, archiveEnd)
 			if err != nil {
@@ -106,9 +118,13 @@ func fetchApiOHLCVWithOptions(ctx context.Context, exchange banexg.BanExchange, 
 			break
 		}
 		curSize := int(min(batchSize, leftNum))
-		data, err := exchange.FetchOHLCV(pair, timeFrame, curSince, curSize, map[string]interface{}{
+		params := map[string]interface{}{
 			banexg.ParamDebug: DebugDownKLine,
-		})
+		}
+		if crossMarketFetch {
+			params[banexg.ParamMarket] = marketType
+		}
+		data, err := exchange.FetchOHLCV(pair, timeFrame, curSince, curSize, params)
 		if err != nil {
 			return contextualKlineOperationError("fetch", pair, timeFrame, curSince, 0, curSize, err)
 		}
@@ -482,7 +498,7 @@ func downOHLCV2DBRangeWithOptions(sess *Queries, exchange banexg.BanExchange, ex
 				if job.Reverse {
 					start, stop = job.End, job.Start
 				}
-				err := fetchApiOHLCVWithOptions(ctx, exchange, exs.Symbol, timeFrame, start, stop, chanKline, useArchive, options)
+				err := fetchApiOHLCVWithMarketOptions(ctx, exchange, exs.Symbol, exs.Market, timeFrame, start, stop, chanKline, useArchive, options)
 				if err != nil {
 					setOutErr(err)
 					cancel()
@@ -1435,9 +1451,18 @@ func GetExSHoles(exchange banexg.BanExchange, exs *ExSymbol, start, stop int64, 
 		// 365天全年无休，且24小时可交易，不存在休息时间段
 		return nil, nil
 	}
-	mar, err := exchange.GetMarket(exs.Symbol)
-	if err != nil {
-		return nil, err
+	var mar *banexg.Market
+	var err *errs.Error
+	if exs.Market != "" && exInfo != nil && exInfo.Markets != nil && exs.Market != exInfo.MarketType {
+		if candidate := exInfo.Markets[exs.Symbol]; candidate != nil && candidate.Type == exs.Market {
+			mar = candidate
+		}
+	}
+	if mar == nil {
+		mar, err = exchange.GetMarket(exs.Symbol)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var dtList [][2]int64
 	if full {

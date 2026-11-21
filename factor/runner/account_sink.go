@@ -276,6 +276,43 @@ func (s *AccountSink) ProcessSnapshot(ctx context.Context, p *factor.TargetPortf
 	return nil
 }
 
+// HasMarkOrActiveExposure reports whether sid already has an observed valuation
+// mark or any non-zero account/lot/external position, allowing historical
+// storage replays to skip zero-exposure chunk-boundary funding settlements that
+// precede the first price bar in the chunk.
+func (s *AccountSink) HasMarkOrActiveExposure(ctx context.Context, sid int32) (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	i, ok := s.Instruments[sid]
+	if !ok {
+		return true, nil
+	}
+	if _, hasMark := s.marks[i.ID]; hasMark {
+		return true, nil
+	}
+	snap, err := s.application().Snapshot(ctx)
+	if err != nil {
+		return true, err
+	}
+	for _, p := range snap.ActualPositions {
+		if p.Instrument.ID == i.ID && p.SignedSteps != 0 {
+			return true, nil
+		}
+	}
+	for _, l := range snap.Lots {
+		if l.Instrument.ID == i.ID && l.SignedSteps != 0 {
+			return true, nil
+		}
+	}
+	for _, ex := range snap.ExternalPositions {
+		if ex.Instrument.ID == i.ID && ex.SignedSteps != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *AccountSink) ObserveFunding(ctx context.Context, f backtest.Funding, now int64) error {
 	if s.Application != nil {
 		return errors.New("runner: funding observations are owned by the execution hub")
@@ -292,6 +329,9 @@ func (s *AccountSink) ObserveFunding(ctx context.Context, f backtest.Funding, no
 	}
 	if i.IsOption() {
 		return errors.New("runner: cash-settled options do not accrue perpetual funding")
+	}
+	if !i.HasPerpetualFunding() {
+		return errors.New("runner: spot instruments do not accrue perpetual funding")
 	}
 	mark, ok := s.marks[i.ID]
 	if !ok {
@@ -323,6 +363,9 @@ func (s *AccountSink) ObserveFundingRecord(ctx context.Context, r factor.Version
 	}
 	if i.IsOption() {
 		return errors.New("runner: cash-settled options do not accrue perpetual funding")
+	}
+	if !i.HasPerpetualFunding() {
+		return errors.New("runner: spot instruments do not accrue perpetual funding")
 	}
 	id, ok := r.Series.Values["settlement_id"].(string)
 	if !ok || id == "" || r.EventTime < 0 || r.EventTime > now || r.AvailableAt > now || r.IngestedAt > now {

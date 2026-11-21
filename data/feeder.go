@@ -747,8 +747,22 @@ func validateFeederRuntimeIdentity(deps *RuntimeDeps, exs *orm.ExSymbol) *errs.E
 	if err != nil {
 		return errs.New(core.ErrRunTime, err)
 	}
-	if exs.Exchange != exchange || exs.Market != market {
+	if exs.Exchange != exchange {
 		return errs.NewMsg(core.ErrBadConfig, "feeder symbol identity %q/%q does not match runtime %q/%q", exs.Exchange, exs.Market, exchange, market)
+	}
+	if exs.Market != market {
+		allowed := deps != nil && deps.Symbols != nil && len(deps.Symbols.ExtraMarkets()) > 0 && deps.Symbols.AcceptsIdentity(exs.Exchange, exs.Market)
+		if !allowed && deps != nil && deps.Config != nil && deps.Config.View() != nil {
+			for _, extra := range deps.Config.View().ExtraMarkets {
+				if extra == exs.Market {
+					allowed = true
+					break
+				}
+			}
+		}
+		if !allowed {
+			return errs.NewMsg(core.ErrBadConfig, "feeder symbol identity %q/%q does not match runtime %q/%q", exs.Exchange, exs.Market, exchange, market)
+		}
 	}
 	return nil
 }
@@ -1380,8 +1394,8 @@ func newDBSeriesFeeder(deps *RuntimeDeps, symbols *orm.SymbolState, exs *orm.ExS
 		return nil, errs.NewMsg(core.ErrBadConfig, "exchange is required")
 	}
 	var tradeTimes [][2]int64
-	market, err := exchange.GetMarket(exs.Symbol)
-	if err == nil {
+	market, err := orm.LookupExchangeMarket(exchange, exs.Symbol, symbols)
+	if err == nil && market != nil {
 		tradeTimes = market.GetTradeTimes()
 	}
 	var feeder *SeriesFeeder

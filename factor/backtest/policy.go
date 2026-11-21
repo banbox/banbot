@@ -85,6 +85,9 @@ func (b *Book) ExecuteAllocation(p *factor.PortfolioTarget, quotes map[int32]Quo
 		if !finite(qty) {
 			return errors.New("backtest: unrepresentable executable quantity")
 		}
+		if b.IsSpot(sid) && qty < 0 {
+			return errors.New("backtest: shorting is not allowed on spot instrument")
+		}
 		quantities[sid] = qty
 	}
 	next, err := factor.NewPortfolioTarget(spec, effective)
