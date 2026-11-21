@@ -118,7 +118,7 @@ func MyMax(obj *ta.Series, period int) *ta.Series {
 
 ### 2.2 BarEnv 与 Series
 ```go
-type BarEnv struct { // s.Env 主周期；辅助/自定义用 DataFields.Series()
+type BarEnv struct { // s.Env 主周期；辅助/跨品种K线用 s.RefEnv(symbol, tf) 或 DataFields.BarEnv()
     TimeStart, TimeStop int64; Exchange, MarketType, Symbol, TimeFrame string; TFMSecs int64
     BarNum, MaxCache, VNum int
     Open, High, Low, Close, Volume, Quote, BuyVolume, TradeNum *Series
@@ -361,6 +361,8 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `CanOpen(short bool) bool`：按 MaxOpenLong/Short 与现货限制（现货不能开空）判断
 - `SetAllStopLoss(dirt float64, args *ormo.ExitTrigger) *errs.Error` / `SetAllTakeProfit(...)`：对方向内订单设置止损/止盈触发；`args=nil` 取消；仅作用于状态在部分入场~部分出场间的订单；`args.Rate∈(0,1)` 时按总持仓×Rate 在订单间分配；`dirt=0` 且多空并存时 panic
 - `Data(sub *DataSub) *DataFields`：取订阅视图；`ExSymbol==nil` 为当前品种
+- `RefKlineSub(symbol, timeframe string, warmupNum ...int) *DataSub`（或 `strat.NewRefKlineSub(s, symbol, tf, warmupNum...)`）：构造只读跨周期/跨品种 K 线订阅（用于 `OnDataSubs`）。`symbol==""` 或 `"_cur_"` 表示当前 `s.Symbol` 的辅助周期；非空如 `"BTC"` 或 `"BTC/USDT:USDT"` 自动按当前任务交易所与市场规范化并在 `SymbolState` 解析/登记只读 `*orm.ExSymbol`（即使不在交易 `pairs` 池内也会预热并推送，且**不创建交易任务、不下单**）；省略 `warmupNum` 时默认取 `s.Strat.WarmupNum`
+- `RefEnv(symbol, timeframe string) *ta.BarEnv`：直接从 `s.DataHub` 读取对应辅助周期或参考品种 K 线的完整 `*ta.BarEnv`；尚未收到首根 bar 时返回 `nil`，非 `nil` 时 `Open/High/Low/Close/Volume/Quote/BuyVolume/TradeNum` 均已就绪，可直接传给 `ta.SMA(env.Close, ...)`、`ta.ATR(env.High, env.Low, env.Close, ...)`、`ta.MFI(env, 14)`、`ta.WillR(env, 14)`、`ta.HeikinAshi(env)`
 - `AccountEquity() float64`：当前账户实时总权益（计价法币，现金余额+未实现盈亏）；预热期或尚未初始化钱包时回退初始配置资金或 `GetStakeAmount(s)` 有限正值，不会除零
 - `AvailableBalance() float64`：当前账户可用余额/可用保证金（计价法币）
 - `AccountDrawdown() float64`：当前账户净值相对运行以来峰值净值（High-Water Mark）的回撤比例 `[0, 1]`（无回撤为 0）
@@ -377,21 +379,22 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 ```
 
 `DataFields`（内嵌于 DataEvent）：
-- 字段：`DoneMS, TimeMS int64`、`Source string`、`Sid int32`、`TimeFrame string`、`Closed, IsWarmUp bool`。
-- 方法：`Series(name) *ta.Series`（数值历史序列，无则 nil）、`Float64(name)`（最新值；缺失/无法转换为 0，要区分缺失用 `RawValue`/`Has`）、`Int64(name)`、`String(name)`、`Raw(name) any`、`RawValue(name) (any, bool)`（区分缺失与显式 nil）、`Has(name) bool`。
-- 浮点字段默认全部成为 Series；`DataSub.SeriesFields` 非空时仅列出的字段成为 Series；原始值始终可读。
+- 字段：`DoneMS, TimeMS int64`、`Source string`、`Sid int32`、`Symbol string`、`TimeFrame string`、`Closed, IsWarmUp bool`。
+- 方法：`BarEnv() *ta.BarEnv`（K线/OHLCV 流完整同步的 `*ta.BarEnv`，未到首根 bar 或非 OHLCV 流返回 `nil`）、`Series(name) *ta.Series`（数值历史序列，K线流 `Series("close")` 与 `BarEnv().Close` 同一指针，`Series("close").Env.High` 始终非 nil；无则 nil）、`SetMaxCache(limit int)`/`MaxCache() int`（默认缓存上限 `max(1500, NumTaCache, WarmupNum+100)`，长周期均线如 `SMA(1000)` 不会因截断返回 NaN）、`Float64(name)`（最新值；缺失/无法转换为 0，要区分缺失用 `RawValue`/`Has`）、`Int64(name)`、`String(name)`、`Raw(name) any`、`RawValue(name) (any, bool)`（区分缺失与显式 nil）、`Has(name) bool`。
+- 浮点字段默认全部成为 Series；`DataSub.SeriesFields` 非空时仅列出的字段（及 K 线标准 OHLCV 字段）成为 Series；自定义扩展列与原始值/NULL 语义始终保留可读。
 
 `DataSub`（即 `orm.Subscription`）：
 - `Source string`：数据源名；K线 `"kline"`（`orm.SeriesSourceKline`）；自定义序列为注册名
-- `ExSymbol *orm.ExSymbol`：nil=当前品种；可指定其他品种（须在品种集合内）
+- `ExSymbol *orm.ExSymbol`：nil=当前品种；跨品种只读参考 K 线推荐用 `s.RefKlineSub("BTC/USDT:USDT", "1d")`（或 `"BTC"`）自动解析，无需手工查 `SymbolState`
 - `TimeFrame string`：周期
 - `WarmupNum int`：该订阅预热数量
 - `Fields []string`：原始字段投影（K线默认 `open high low close volume quote buy_volume trade_num`）
 - `SeriesFields []string`：需要数值历史序列的字段
 - `Frequency`/`Projection`（高级，一般留空）：`bar/event`、`default/all/selected`
 
+- `s.RefKlineSub(symbol, tf, warmupNum...)` + `s.RefEnv(symbol, tf)`：跨品种大盘过滤（如山寨币策略读 `BTC/USDT:USDT` 日线）与多周期共振首选写法。注意 `banta` 增量指标每根参考 bar 推进一次：回测预热按品种串行，若希望参考品种指标在预热结束即就绪，应在 `Info` 处理器（或 `OnData` 入口 `if !d.IsMain()` 之前，满足 `d.Closed` 时）对 `s.RefEnv(...)` 调用相同指标推进缓存，再在 `Main` 中读取 `.Get(0)`。
 - `strat.NewDataSub(info *orm.SeriesInfo) *DataSub`：由自定义序列信息派生订阅（`Source`=序列名）。
-- `s.DataHub.Get(tf, source, sid)` 取视图；`DataHub.AllReady()` 判断所有订阅是否推进到当前时间。
+- `s.DataHub.Get(tf, source, sid)` 取视图；`DataHub.SetMaxCache(limit)` 调整保留上限；`DataHub.AllReady()` 判断所有订阅是否推进到当前时间。
 - 辅助K线信号应基于 `Closed==true`（实盘 WebSocket 数据可能未收盘）。
 
 ### 3.5 EnterReq（开仓请求）
@@ -551,7 +554,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 3. **派生序列用 `Series.To`**，别在回调反复 `NewSeries`，否则序列数增长触发致命错误 `series too many … try replace NewSeries with Series.To` 并停机。
 4. 浮点常量缓存冲突、`Cross` 用 `== 1`（§2.2）。
 6. **比较 Close 与 Highest/Lowest 前先 `Back(1)`**，否则当前收盘永远无法突破含自身的最高价：`e.Close.Get(0) > ta.Highest(e.High, n).Back(1).Get(0)`。
-7. `s.Env` 是主周期，读辅助/自定义数据用 `data.Series(...)`。
+7. `s.Env` 是主周期；读辅助周期或跨品种参考 K 线优先用 `s.RefKlineSub(symbol, tf)` + `s.RefEnv(symbol, tf)`（或 `data.BarEnv()`/`data.Series(...)`），读自定义序列用 `data.Series(...)`/`data.Float64(...)`。
 9. `OpenOrder` 的 `Tag` 必填；`CloseOrders` 有订单时 `Tag` 必填。`ExitReq{}` 的 `Dirt` 零值是 Both，只平多/空须显式设 `core.OdDirtLong/OdDirtShort`。
 10. 超参只读共享：不要写入 `More`；按品种不同用 `pair_params`。`More` 只存每品种会变化的数据。
 11. `GetOrders/GetOrderNum` 基于快照：同回调内刚 `OpenOrder` 不会出现；切片不要跨事件复用。

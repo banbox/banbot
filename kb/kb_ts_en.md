@@ -118,7 +118,7 @@ func MyMax(obj *ta.Series, period int) *ta.Series {
 
 ### 2.2 BarEnv and Series
 ```go
-type BarEnv struct { // s.Env is the main timeframe; for auxiliary/custom use DataFields.Series()
+type BarEnv struct { // s.Env is the main timeframe; for auxiliary/cross-symbol bars use s.RefEnv(symbol, tf) or DataFields.BarEnv()
     TimeStart, TimeStop int64; Exchange, MarketType, Symbol, TimeFrame string; TFMSecs int64
     BarNum, MaxCache, VNum int
     Open, High, Low, Close, Volume, Quote, BuyVolume, TradeNum *Series
@@ -361,6 +361,8 @@ Methods:
 - `CanOpen(short bool) bool`: judged by MaxOpenLong/Short and spot restrictions (spot cannot short)
 - `SetAllStopLoss(dirt float64, args *ormo.ExitTrigger) *errs.Error` / `SetAllTakeProfit(...)`: set stop-loss/take-profit triggers for orders in a direction; `args=nil` cancels; only applies to orders whose status is between partially-entered and partially-exited; when `args.Rate∈(0,1)`, allocated across orders by total position×Rate; panics when `dirt=0` and both long and short exist
 - `Data(sub *DataSub) *DataFields`: get a subscription view; `ExSymbol==nil` means the current symbol
+- `RefKlineSub(symbol, timeframe string, warmupNum ...int) *DataSub` (or `strat.NewRefKlineSub(s, symbol, tf, warmupNum...)`): build a read-only auxiliary-timeframe or cross-symbol K-line subscription for `OnDataSubs`. `symbol==""` or `"_cur_"` targets the current `s.Symbol`; non-empty symbols such as `"BTC"` or `"BTC/USDT:USDT"` are normalized to the job's exchange/market and resolved/ensured as read-only `*orm.ExSymbol` in `SymbolState` (warmed up and delivered even when absent from trading `pairs`, **without creating a trading StratJob or placing orders on it**); when `warmupNum` is omitted it defaults to `s.Strat.WarmupNum`
+- `RefEnv(symbol, timeframe string) *ta.BarEnv`: read the synchronized `*ta.BarEnv` of an auxiliary timeframe or reference symbol directly from `s.DataHub`; returns `nil` before the first bar arrives, and once non-`nil` guarantees `Open/High/Low/Close/Volume/Quote/BuyVolume/TradeNum` are all non-`nil` for `ta.SMA(env.Close, ...)`, `ta.ATR(env.High, env.Low, env.Close, ...)`, `ta.MFI(env, 14)`, `ta.WillR(env, 14)`, `ta.HeikinAshi(env)`
 - `AccountEquity() float64`: real-time total equity of the owning account (pricing fiat, cash balance + unrealized PnL); during warmup or before wallet initialization, falls back to configured initial capital or a finite positive `GetStakeAmount(s)` value (never 0)
 - `AvailableBalance() float64`: current available balance / available margin of the owning account (pricing fiat)
 - `AccountDrawdown() float64`: current drawdown ratio in `[0, 1]` relative to the account's run-to-date peak equity (High-Water Mark; 0 when no drawdown)
@@ -377,21 +379,22 @@ func RouteData(h DataHandlers) FnOnData // at most one handler is called per eve
 ```
 
 `DataFields` (embedded in DataEvent):
-- Fields: `DoneMS, TimeMS int64`, `Source string`, `Sid int32`, `TimeFrame string`, `Closed, IsWarmUp bool`.
-- Methods: `Series(name) *ta.Series` (numeric history series, nil if absent), `Float64(name)` (latest value; missing/unconvertible gives 0, use `RawValue`/`Has` to distinguish missing), `Int64(name)`, `String(name)`, `Raw(name) any`, `RawValue(name) (any, bool)` (distinguishes missing from explicit nil), `Has(name) bool`.
-- Float fields all become Series by default; when `DataSub.SeriesFields` is non-empty only the listed fields become Series; raw values are always readable.
+- Fields: `DoneMS, TimeMS int64`, `Source string`, `Sid int32`, `Symbol string`, `TimeFrame string`, `Closed, IsWarmUp bool`.
+- Methods: `BarEnv() *ta.BarEnv` (complete synchronized `*ta.BarEnv` for K-line/OHLCV streams; `nil` before the first bar or for non-OHLCV streams), `Series(name) *ta.Series` (numeric history series; on K-line streams `Series("close")` is the exact `BarEnv().Close` pointer and `Series("close").Env.High` is always non-nil; nil if absent), `SetMaxCache(limit int)`/`MaxCache() int` (default cache limit `max(1500, NumTaCache, WarmupNum+100)`, so long-period indicators like `SMA(1000)` never get truncated to NaN), `Float64(name)` (latest value; missing/unconvertible gives 0, use `RawValue`/`Has` to distinguish missing), `Int64(name)`, `String(name)`, `Raw(name) any`, `RawValue(name) (any, bool)` (distinguishes missing from explicit nil), `Has(name) bool`.
+- Float fields all become Series by default; when `DataSub.SeriesFields` is non-empty only the listed fields (plus standard OHLCV fields on K-line streams) become Series; custom extension columns and raw/NULL semantics remain readable.
 
 `DataSub` (i.e. `orm.Subscription`):
 - `Source string`: data source name; bars `"kline"` (`orm.SeriesSourceKline`); custom series use the registered name
-- `ExSymbol *orm.ExSymbol`: nil = current symbol; may specify another symbol (must be within the symbol set)
+- `ExSymbol *orm.ExSymbol`: nil = current symbol; for cross-symbol read-only reference bars prefer `s.RefKlineSub("BTC/USDT:USDT", "1d")` (or `"BTC"`) instead of manual `SymbolState` lookups
 - `TimeFrame string`: timeframe
 - `WarmupNum int`: warmup count for this subscription
 - `Fields []string`: raw field projection (bar default `open high low close volume quote buy_volume trade_num`)
 - `SeriesFields []string`: fields that need numeric history series
 - `Frequency`/`Projection` (advanced, normally leave empty): `bar/event`, `default/all/selected`
 
+- `s.RefKlineSub(symbol, tf, warmupNum...)` + `s.RefEnv(symbol, tf)`: preferred idiom for cross-symbol market regime filters (e.g. reading `BTC/USDT:USDT` `1d` while trading altcoins) and multi-timeframe alignment. Note that `banta` incremental indicators advance once per reference bar: since backtest warmup runs sequentially per symbol, call the `s.RefEnv(...)` indicators in the `Info` handler (or at the top of `OnData` before `if !d.IsMain()`, when `d.Closed`) so warmup bars advance the indicator cache, then read `.Get(0)` in `Main`.
 - `strat.NewDataSub(info *orm.SeriesInfo) *DataSub`: derive a subscription from custom series info (`Source` = series name).
-- `s.DataHub.Get(tf, source, sid)` gets a view; `DataHub.AllReady()` checks whether all subscriptions have advanced to the current time.
+- `s.DataHub.Get(tf, source, sid)` gets a view; `DataHub.SetMaxCache(limit)` adjusts retained history; `DataHub.AllReady()` checks whether all subscriptions have advanced to the current time.
 - Auxiliary-bar signals should be based on `Closed==true` (live WebSocket data may be unclosed).
 
 ### 3.5 EnterReq (open request)
@@ -551,7 +554,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 3. **Use `Series.To` for derived series**; do not repeatedly `NewSeries` in callbacks, otherwise the series count grows and triggers the fatal error `series too many … try replace NewSeries with Series.To` and stops the bot.
 4. Float-constant cache collision, and use `== 1` for `Cross` (§2.2).
 6. **Before comparing Close with Highest/Lowest, apply `Back(1)` first**, otherwise the current close can never break a highest price that includes itself: `e.Close.Get(0) > ta.Highest(e.High, n).Back(1).Get(0)`.
-7. `s.Env` is the main timeframe; read auxiliary/custom data with `data.Series(...)`.
+7. `s.Env` is the main timeframe; read auxiliary-timeframe or cross-symbol reference bars via `s.RefKlineSub(symbol, tf)` + `s.RefEnv(symbol, tf)` (or `data.BarEnv()`/`data.Series(...)`), and custom series via `data.Series(...)`/`data.Float64(...)`.
 9. `Tag` is required in `OpenOrder`; `CloseOrders` requires `Tag` when there are orders. The zero value of `ExitReq{}` `Dirt` is Both; to close only longs/shorts you must explicitly set `core.OdDirtLong/OdDirtShort`.
 10. Hyperparameters are read-only shared: do not write them into `More`; use `pair_params` for per-symbol differences. `More` only stores per-symbol data that changes.
 11. `GetOrders/GetOrderNum` are snapshot-based: an order just opened with `OpenOrder` in the same callback will not appear; do not reuse slices across events.

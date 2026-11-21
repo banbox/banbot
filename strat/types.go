@@ -145,6 +145,7 @@ type StratJob struct {
 	runtimeCore        *core.State
 	runtimePrices      *com.PriceState
 	runtimeClock       *btime.ClockState
+	runtimeExchange    banexg.BanExchange
 	inspectEffect      func(string)
 	dataHubConfigured  bool
 	pairRemovalPending bool
@@ -168,6 +169,14 @@ func (s *StratJob) BindRuntimeState(state *State, coreState *core.State, clock *
 		return
 	}
 	s.strategyState = state
+	if state != nil && state != legacyState {
+		if s.symbols == nil {
+			s.symbols = state.Symbols
+		}
+		if s.runtimeExchange == nil {
+			s.runtimeExchange = state.Exchange
+		}
+	}
 	s.runtimeCore = coreState
 	s.runtimeClock = clock
 }
@@ -183,11 +192,13 @@ func (s *StratJob) OpenOrdersSnapshot() ([]*ormo.InOutOrder, bool) {
 // NewInspectionJob creates the inert job state passed to startup-time
 // callbacks while keeping the effect hook outside strategy-facing fields.
 func NewInspectionJob(strategy *TradeStrat, env *ta.BarEnv, symbol *orm.ExSymbol, tf, account string, effect func(string)) *StratJob {
-	return &StratJob{
-		Strat: strategy, Env: env, DataHub: NewDataHub(), Symbol: symbol, TimeFrame: tf, Account: account,
+	job := &StratJob{
+		Strat: strategy, Env: env, Symbol: symbol, TimeFrame: tf, Account: account,
 		TPMaxs: make(map[int64]float64), CloseLong: true, CloseShort: true,
 		ExgStopLoss: true, ExgTakeProfit: true, inspectEffect: effect,
 	}
+	job.DataHub = newJobDataHub(job)
+	return job
 }
 
 /*

@@ -25,9 +25,9 @@
 | `strat/pair_update.go` | 运行中增删品种：`TradeStrat.UpdatePairs` → `PairUpdateManager.Apply`，含 `PairUpdateHooks`（外部注入的 SubWarmPairs/ExitOrders/LookupSymbol） |
 | `strat/data.go` | 实盘 WS 订阅的 Job 注册表（`WsSubJobRegistry`，不可变快照）及 legacy 包级入口 |
 | `strat/data_event.go` | `DataRole`、`DataEvent`、`FnOnData`、`RouteData`、`validateDataCallbacks`（OnData 与 OnBar/OnInfoBar 互斥） |
-| `strat/data_access.go` | `NewDataSub(info)`、`StratJob.Data(sub)` |
+| `strat/data_access.go` | `NewDataSub(info)`、`StratJob.Data(sub)`、只读跨品种/跨周期 K 线参考订阅 `RefKlineSub`/`NewRefKlineSub` 与环境读取 `RefEnv` |
 | `strat/data_subs.go` | 订阅收集 `CollectDataSubs*`（合并 `OnPairInfos` 与 `OnDataSubs`）、K 线字段并集 `CollectKlineSubFields*`、订阅 key 编解码 |
-| `strat/datahub.go` | `DataHub`（timeframe:source:sid 三级视图）、`DataFields`（序列/原始值/NULL 语义）、`AllReady` |
+| `strat/datahub.go` | `DataHub`（timeframe:source:sid 三级视图，默认保留长度对齐 `max(1500, NumTaCache, WarmupNum+100)`）、`DataFields`（K 线/OHLCV 完整 `*ta.BarEnv` 同步、序列/原始值/NULL 语义、`SetMaxCache`）、`AllReady` |
 | `strat/batch_state.go` | `BatchState`：同一时间戳的主/辅 Job 批量池，`TakeReady` 决定何时批量执行 |
 | `strat/goods.go` | 品种周期评分（`CalcPairTfScores*`、`calcKlineScore`）与 policy 品种组（`RelayPolicyGroups*`） |
 | `strat/output_state.go` | 策略文本输出缓冲（`WriteOutput` 的 Snapshot/Drain） |
@@ -48,7 +48,7 @@
 - **`StratJob`**（`types.go:114`）：运行上下文。公开字段（`Env`、`DataHub`、`Entrys/Exits`、`LongOrders/ShortOrders`、`OrderNum/EnteredNum`、`MaxOpenLong/Short`、`CloseLong/Short`、`ExgStopLoss/ExgTakeProfit`、`LongSLPrice` 等、`More`）保持策略兼容；私有字段绑定 `symbols`、`strategyState`、`runtimeCore`、`runtimePrices`、`runtimeClock`，并通过原子指针懒创建 `executionStateMu`（每 Job 一把细粒度锁，`execution_state.go:92`）。读写可变执行状态应走 `ExecutionSnapshot()` 与 typed 方法；只读账户资金与风控状态通过 `AccountEquity()`、`AvailableBalance()`、`AccountDrawdown()` 查询（`account_state.go`）。
 - **`EnterReq` / `ExitReq`**（`types.go:197,231`）：信号意图。`Tag` 必填（入场；有订单时的平仓），`EnterReq.RiskRate` 支持按账户权益风险比例自动定仓。`Clone()` 与 `GetZapFields()` 在 `common.go:189/227/288/307`，新增字段必须同步。`CommandID` 为幂等键：空时由 `WithOrderEvent` 上下文派生为 `<事件ID>/entry/<序号>`（`execution_state.go:270-311`）。
 - **`DataEvent` / `DataRole` / `RouteData`**（`data_event.go`）：`DataRoleMain=1`（主 K 线）、`DataRoleInfo=2`（辅助）、`DataRoleCustom=3`（自定义序列）。`RouteData` 每个事件至多调用一个角色处理器。
-- **`DataHub` / `DataFields`**（`datahub.go:15,22`）：`timeframe → source → sid` 三级视图。`DataFields` 同时保留浮点 Series（用于指标）与原始值（`rawMap`，保留显式 nil，区分缺失与 NULL）。`AllReady()` 只检查当前时间会收盘的周期。
+- **`DataHub` / `DataFields`**（`datahub.go`）：`timeframe → source → sid` 三级视图，默认历史截断上限与主周期 `BarEnv` 对齐（`max(1500, NumTaCache)`，绑定 `StratJob` 时取 `max(1500, NumTaCache, WarmupNum+100)`，亦可通过 `DataHub.SetMaxCache`/`DataFields.SetMaxCache` 显式调整）。当事件为 K 线源（`source == "kline"`）或含标准 OHLCV 字段时，`DataFields` 内部维护并同步推进完整的 `*ta.BarEnv`（`Open/High/Low/Close/Volume/Quote/BuyVolume/TradeNum` 全非 nil，可通过 `df.BarEnv()` 或 `df.Series("close").Env` 直接用于 `ta.MFI`/`ta.WillR`/`ta.HeikinAshi`/`ta.ATR` 等指标），同时完整保留 `DataSeries.Values` 自定义扩展列与 `rawMap` 显式 nil（区分缺失与 NULL）语义。`StratJob.RefKlineSub(symbol, tf, warmupNum...)` 按当前任务交易所与市场自动规范化符号并在 `SymbolState` 中解析/Ensure 只读 `*orm.ExSymbol`（仅注册 `accInfoJobs` 辅助行情源，不创建交易 `StratJob`），配合 `StratJob.RefEnv(symbol, tf)` 直接读取对应 `*ta.BarEnv`（未到达首根 bar 前返回 nil）。`AllReady()` 只检查当前时间会收盘的周期。
 - **`State`**（`state.go:29`）：策略域 typed 状态。绑定 `Core/Clock/Config/Symbols/Exchange`、账户与订单状态（`runtimeAccounts`、`runtimeOrders`、`orderProcessor`、`accountMetrics` 及按账户维护的净值峰值 `accountPeakEquities`）；注册表 `accJobs`（账户 → envKey → 策略名 → Job）、`accInfoJobs`（辅助订阅）、`pairStrats`、`envs`、`versions`、`forbidJobs`、`wsSubJobs`；并维护不可变快照与 dirty bit。`legacyState`（`state.go:515`）是包级全局变量的兼容视图，`IsLegacyState` 用于分支。
 - **`BatchState` / `JobEnv` / `BatchMap`**（`batch_state.go`、`types.go:89,100`）：批量执行池，键为时间戳+市场组；`TakeReady(currMS, deterministic)` 返回就绪组（确定性模式下等待所有有效任务后按 key 排序输出）；组内 `MainJobs` 按品种键字典序交给 `OnBatchJobs`，不经同 bar 多品种的哈希优先级，批策略若按到达顺序依次开仓，资金竞争仍偏向字母靠前的品种，应自行按得分排序。
 - **`PairUpdateReq` / `PairUpdateResult` / `PairUpdateHooks`**（`pair_update.go:19,31,39`）：动态品种更新的入参、结果与外部钩子（`SubWarmPairs` 必需；`ExitOrders` 在 `CloseOnRemove` 时必需；`LookupSymbol`）。
@@ -68,7 +68,7 @@
 1. 显式状态下整体持有 `lockJobsWriteForState`，结束后再回调 `OnShutDown` 与 WS 退订（`main.go:105-120` 附近的 defer），避免回调在锁内执行。
 2. 备份并重建 `TimeFrame` 与 `OrderMatch` 映射；`resetJobsWithStateLocked` 将旧 Job 设为禁开。
 3. 对每个 `RunPolicy`：`NewStrategy` → `getPolicyPairsWithStrategyState`（品种解析） → `callStratSymbolsWithExchange`（`OnSymbols`） → 对每个品种 `pickTimeFrame` 选周期 → 若 `pair_dup` 有专属参数则重新 `NewStrategy` → `ensureStratJobWithRuntimeState`（`main.go:728`）。
-4. `ensureStratJobWithRuntimeState`：为每个允许开单的账户创建 `StratJob`，调用 `OnStartUp`，然后 `CollectDataSubs` 注册辅助订阅到 `accInfoJobs`，并为 K 线订阅初始化 `BarEnv`。若有辅助订阅但没有 `OnData`/`OnInfoBar`/（`BatchInfo`+`OnBatchInfos`），直接 panic。
+4. `ensureStratJobWithRuntimeState` / `ensureStratJobWithExchange`：为每个允许开单的账户创建 `StratJob`（绑定 `symbols`/`strategyState`/`runtimeCore`/`runtimeExchange`），调用 `OnStartUp`，然后 `CollectDataSubs` 注册辅助订阅到 `accInfoJobs`，并为 K 线订阅初始化 `BarEnv`。若有自定义非 K 线辅助订阅但没有 `OnData`/`OnInfoBar`/（`BatchInfo`+`OnBatchInfos`），或完全没有消费回调，直接 panic。
 5. 轮换清理（`main.go:281-` 起，`exitOds` 于 `:293`）：`MaxOpenLong==MaxOpenShort==-1` 的旧 Job 若仍有入场则保留并跟踪，否则 `SetPairRemovalPending` 并进入待清理列表；`accInfoJobs` 中已移除的项被剔除。
 6. 返回 `pairTfs`（供数据订阅端使用）与 `accExitOds`（需要外部平仓的订单）。
 

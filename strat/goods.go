@@ -77,11 +77,12 @@ func relayPolicyGroupsWithConfig(strategyState *State, cfg *config.Config, symbo
 		minTfSecs := utils2.TFToSecs(tf)
 		if stgy.OnPairInfos != nil || stgy.OnDataSubs != nil {
 			job := &StratJob{
-				Strat:     stgy,
-				DataHub:   NewDataHub(),
-				TimeFrame: tf,
-				symbols:   symbols,
+				Strat:         stgy,
+				TimeFrame:     tf,
+				symbols:       symbols,
+				strategyState: strategyState,
 			}
+			job.DataHub = newJobDataHub(job)
 			infos := CollectDataSubs(job)
 			for _, it := range infos {
 				curSecs := utils2.TFToSecs(it.TimeFrame)
