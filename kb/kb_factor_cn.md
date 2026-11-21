@@ -154,7 +154,7 @@ expressions:
 - 回归/分组：`group.residual(y,x)`（单变量截面 OLS 残差含截距，参考池拟合，需 ≥2 个有效对）、`group.ols(y,x1,...)`（多元，至少一个暴露）、`group.wls(y,w,x1,...)`（权重须正且有效）、`group.demean(x,"alias","field")` / `group.zscore(...)`（按分类字段组内去均值/z-score（总体标准差）；字段原始类型/NULL 保留，经 binding 采样；缺字段=Missing，NULL=Null）。
 
 - Go 同名：`ts.x`/`cs.x`→`factor.X`（MACD/BBands 返回三节点；`group.ols/wls`→`MultiResidual/WeightedResidual`；`group.demean/zscore`→`...ByField`），见第 6 节。
-- 时序算子（含指标）不能作用于截面/回归输出：`TS windows over cross-section results are not supported`（`ts.lag(x,0)` 例外）；需要时先时序后截面：`cs.rank(ts.rsi(kline.close,14))`。
+- 支持任意无环多阶段 `TS ↔ CS/GROUP` 管道（`factor.Compile` 自动按 `StageTS`/`StageCS` 拓扑阶段交替划分求值）：标量时序窗口、技术指标与逐点算子均可直接作用于截面或分组回归输出，例如特质波动率 `cs.zscore(ts.std(group.residual(ts.return(kline.close,1), kline.open), 20, 0))`、残差动量 `ts.sum(group.demean(ts.return(kline.close,1), "info", "sector"), 20)`、降换手平滑排名 `ts.sma(cs.pct_rank(kline.volume), 5)`、双截面滚动相关 `ts.corr(cs.pct_rank(kline.close), cs.pct_rank(kline.volume), 10)`；跨阶段预热长度自动按依赖链累加（`上游预热 + 下游窗口预热`），`ts.lag(x,0)` 原样返回。
 - `max(x,1e-8)` 等下界只对有效值生效，不补 NULL/缺字段/预热不足。
 - 截面/回归统计在冻结的 `Universe.Reference` 上拟合，输出仅对 `Investable` 有效资产有意义。
 - 预热例：`ts.macd_hist(..,12,26,9)`=33；缺失输入元组延长预热但不推进状态。
@@ -368,7 +368,8 @@ func Linear(inputs []*Node, weights []float64) *Node
 func Custom(version string, inputs []*Node, evaluate func([]Numeric) Numeric) *Node   // 纯逐点，须传播无效原因
 func New() *Builder; (*Builder).Add(name string, n *Node) *Builder; (*Builder).Compile() (*Plan, error)
 func Compile(outputs map[string]*Node) (*Plan, error)
-func (p *Plan) Hash/TimeFrame/Outputs/Inputs/WarmupLength/StateRetention/NodeCount
+type StageKind string; type Stage struct { Index int; Kind StageKind; Nodes []string } // StageTS="TS", StageCS="CS"
+func (p *Plan) Hash/TimeFrame/Outputs/Inputs/WarmupLength/StateRetention/NodeCount/StageCount/Stages
 ```
 - `GroupDemean`/`GroupZScore`（不带 ByField）为旧接口，无年龄限制；新代码用 `...ByField`，分类字段须为 `factor.Field` 或 `AsOfField`。
 - `Custom` 不得在闭包里保存滚动状态；需要历史算子须扩展内核。

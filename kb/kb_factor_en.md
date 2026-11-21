@@ -154,7 +154,7 @@ Operators `+ - * /` and comparisons `> >= < <=` (precedence `* /` > `+ -` > `> >
 - Regression/grouping: `group.residual(y,x)` (univariate cross-sectional OLS residual with intercept, fitted on the reference pool, needs >=2 valid pairs), `group.ols(y,x1,...)` (multivariate, at least one exposure), `group.wls(y,w,x1,...)` (weights must be positive and valid), `group.demean(x,"alias","field")` / `group.zscore(...)` (within-group demean/z-score (population std) by a categorical field; field original type/NULL preserved, sampled via binding; missing field = Missing, NULL = Null).
 
 - Go equivalents: `ts.x`/`cs.x` -> `factor.X` (MACD/BBands return three nodes; `group.ols/wls` -> `MultiResidual/WeightedResidual`; `group.demean/zscore` -> `...ByField`), see section 6.
-- Time-series operators (including indicators) cannot act on cross-sectional/regression outputs: `TS windows over cross-section results are not supported` (exception `ts.lag(x,0)`); when needed, do time-series first then cross-section: `cs.rank(ts.rsi(kline.close,14))`.
+- Arbitrary acyclic multi-stage `TS <-> CS/GROUP` pipelines are supported (`factor.Compile` partitions execution into alternating `StageTS`/`StageCS` topological barriers): scalar time-series windows, technical indicators, and pointwise operators can directly consume cross-sectional or group/regression outputs, e.g. idiosyncratic volatility `cs.zscore(ts.std(group.residual(ts.return(kline.close,1), kline.open), 20, 0))`, residual momentum `ts.sum(group.demean(ts.return(kline.close,1), "info", "sector"), 20)`, turnover-smoothed rank `ts.sma(cs.pct_rank(kline.volume), 5)`, and dual-rank rolling correlation `ts.corr(cs.pct_rank(kline.close), cs.pct_rank(kline.volume), 10)`; warmup length accumulates across stage boundaries (`upstream warmup + downstream window warmup`), and `ts.lag(x,0)` returns the input as is.
 - Lower bounds such as `max(x,1e-8)` only apply to valid values, they do not fill NULL/missing fields/insufficient warmup.
 - Cross-sectional/regression statistics are fitted on the frozen `Universe.Reference`; outputs are only meaningful for `Investable` valid assets.
 - Warmup example: `ts.macd_hist(..,12,26,9)`=33; missing input tuples extend warmup but do not advance state.
@@ -368,7 +368,8 @@ func Linear(inputs []*Node, weights []float64) *Node
 func Custom(version string, inputs []*Node, evaluate func([]Numeric) Numeric) *Node   // purely pointwise, must propagate invalid reasons
 func New() *Builder; (*Builder).Add(name string, n *Node) *Builder; (*Builder).Compile() (*Plan, error)
 func Compile(outputs map[string]*Node) (*Plan, error)
-func (p *Plan) Hash/TimeFrame/Outputs/Inputs/WarmupLength/StateRetention/NodeCount
+type StageKind string; type Stage struct { Index int; Kind StageKind; Nodes []string } // StageTS="TS", StageCS="CS"
+func (p *Plan) Hash/TimeFrame/Outputs/Inputs/WarmupLength/StateRetention/NodeCount/StageCount/Stages
 ```
 - `GroupDemean`/`GroupZScore` (without ByField) are legacy interfaces with no age limit; new code uses `...ByField`, and the categorical field must be `factor.Field` or `AsOfField`.
 - `Custom` must not keep rolling state in the closure; history-dependent operators require extending the kernel.

@@ -3,15 +3,26 @@ package factor
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
+	"sort"
 
 	"github.com/banbox/banta/tav"
 )
 
-// Batch computes one explicitly bounded history from its known starting point.
-// It calls tav for validated TS operators. For arbitrary time chunks with an
-// EMA continuing from earlier history, reuse Session instead of reseeding EMA.
-// Snapshot input archives and returned panels are caller-owned, never cached.
+type sidSpan struct {
+	sid   int32
+	start int
+	end   int
+}
+
+// Batch computes one explicitly bounded history from its known starting point
+// across topological stages (StageTS per-asset contiguous spans via tav and
+// StageCS cross-sectional barriers across the PIT universe at each step).
+// For arbitrary time chunks with an EMA continuing from earlier history, reuse
+// Session instead of reseeding EMA. Snapshot input archives and returned panels
+// are caller-owned, never cached.
 func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 	if maxRows <= 0 || len(snapshots) > maxRows {
 		return nil, errors.New("factor: batch requires explicit row bound")
@@ -27,13 +38,16 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 			return nil, err
 		}
 	}
-	// Validate the same immutable context/barrier contract before computation.
+	// Validate the same immutable context, time monotonicity, versioned universe,
+	// and active SID symbol continuity contract as incremental Session.
 	identity := ""
 	lastTime := int64(0)
 	lastGrid := int64(0)
-	universe := ""
+	universeHash := ""
+	universeVersion := ""
 	dynamic := false
-	for _, snapshot := range snapshots {
+	activeAt := make([][]int32, len(snapshots))
+	for t, snapshot := range snapshots {
 		current, err := p.snapshotIdentity(snapshot)
 		if err != nil {
 			return nil, err
@@ -44,36 +58,34 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 		if snapshot.spec.DecisionTime <= lastTime || snapshot.spec.GridTime <= lastGrid {
 			return nil, errors.New("factor: batch times must strictly increase")
 		}
-		identity = current
-		lastTime = snapshot.spec.DecisionTime
-		lastGrid = snapshot.spec.GridTime
 		currentUniverse, err := contentHash(snapshot.spec.Universe)
 		if err != nil {
 			return nil, err
 		}
-		if universe != "" && universe != currentUniverse {
+		if universeHash != "" && universeHash != currentUniverse {
+			if universeVersion == snapshot.spec.Universe.Version {
+				return nil, errors.New("factor: universe changed without a new version")
+			}
 			dynamic = true
 		}
-		universe = currentUniverse
-	}
-	if dynamic {
-		// Explicit cached replay handles tracked asset continuity and removal/
-		// re-entry. tav arrays do not encode dynamic membership lifecycle.
-		session, err := NewSession(p)
-		if err != nil {
-			return nil, err
-		}
-		frames := make([]Frame, 0, len(snapshots))
-		for _, snapshot := range snapshots {
-			frame, err := session.Evaluate(snapshot)
-			if err != nil {
-				return nil, err
+		identity = current
+		lastTime = snapshot.spec.DecisionTime
+		lastGrid = snapshot.spec.GridTime
+		universeHash = currentUniverse
+		universeVersion = snapshot.spec.Universe.Version
+		activeAt[t] = activeFactorSIDs(snapshot.spec)
+		if t > 0 {
+			for _, sid := range activeAt[t] {
+				if _, stillActive := slices.BinarySearch(activeAt[t-1], sid); stillActive {
+					if snapshots[t-1].spec.SIDMap[sid] != snapshot.spec.SIDMap[sid] {
+						return nil, fmt.Errorf("factor: SID %d identity changed", sid)
+					}
+				}
 			}
-			frames = append(frames, frame)
 		}
-		return frames, nil
 	}
-	sids := activeFactorSIDs(snapshots[0].spec)
+
+	spans := buildActiveSIDSpans(activeAt, dynamic)
 	columns := make([][]map[int32]Numeric, len(p.nodes))
 	consumers := make([]int, len(p.nodes))
 	for _, node := range p.nodes {
@@ -81,162 +93,248 @@ func (p *Plan) Batch(snapshots []*Snapshot, maxRows int) ([]Frame, error) {
 			consumers[input]++
 		}
 	}
-	frames := make([]Frame, len(snapshots))
-	for time, snapshot := range snapshots {
-		frames[time] = Frame{SnapshotID: snapshot.id, PlanHash: p.hash, GridTime: snapshot.spec.GridTime, DecisionTime: snapshot.spec.DecisionTime, Values: make(map[string]map[int32]Numeric)}
+	outputsByNode := make([][]string, len(p.nodes))
+	for _, name := range p.Outputs() {
+		index := p.outputs[name]
+		outputsByNode[index] = append(outputsByNode[index], name)
 	}
-	for index, node := range p.nodes {
-		columns[index] = make([]map[int32]Numeric, len(snapshots))
-		for time := range snapshots {
-			columns[index][time] = make(map[int32]Numeric, len(sids))
+	frames := make([]Frame, len(snapshots))
+	for t, snapshot := range snapshots {
+		frames[t] = Frame{
+			SnapshotID:   snapshot.id,
+			PlanHash:     p.hash,
+			GridTime:     snapshot.spec.GridTime,
+			DecisionTime: snapshot.spec.DecisionTime,
+			Values:       make(map[string]map[int32]Numeric, len(p.outputs)),
 		}
-		if node.spec.Kind != TS {
-			for time, snapshot := range snapshots {
-				slice := make([]map[int32]Numeric, len(p.nodes))
-				for _, input := range node.inputs {
-					slice[input] = columns[input][time]
-				}
-				columns[index][time] = crossSection(node, snapshot, slice)
-				for _, sid := range sids {
-					if _, exists := columns[index][time][sid]; !exists {
-						columns[index][time][sid] = Numeric{math.NaN(), Missing}
+	}
+
+	for _, stage := range p.stages {
+		for _, index := range stage.nodes {
+			columns[index] = make([]map[int32]Numeric, len(snapshots))
+			for t := range snapshots {
+				columns[index][t] = make(map[int32]Numeric, len(activeAt[t]))
+			}
+		}
+		if stage.kind == StageTS {
+			for _, sp := range spans {
+				for _, index := range stage.nodes {
+					if err := evaluateBatchTSSpan(p.nodes[index], sp, snapshots, columns, index); err != nil {
+						return nil, err
 					}
 				}
 			}
 		} else {
-			for _, sid := range sids {
-				data := make([]float64, len(snapshots))
-				if len(node.inputs) > 0 {
-					for time := range snapshots {
-						data[time] = columns[node.inputs[0]][time][sid].Value
+			slice := make([]map[int32]Numeric, len(p.nodes))
+			for t, snapshot := range snapshots {
+				clear(slice)
+				for _, index := range stage.nodes {
+					node := p.nodes[index]
+					for _, dep := range node.inputs {
+						slice[dep] = columns[dep][t]
 					}
+					res := crossSection(node, snapshot, slice)
+					for _, sid := range activeAt[t] {
+						if _, exists := res[sid]; !exists {
+							res[sid] = Numeric{math.NaN(), Missing}
+						}
+					}
+					columns[index][t] = res
+					slice[index] = res
 				}
-				var values []float64
-				period := int(node.spec.Parameters["period"])
-				switch node.spec.Operator {
-				case "ema":
-					// v0.4.1 tav seeds from a contiguous window, while cached
-					// EMA seeds from the first period valid observations. The
-					// declared skip-invalid policy uses a compact numeric view
-					// and restores invalid timestamps, never filling raw values.
-					compact := make([]float64, 0, len(data))
-					for _, value := range data {
-						if !math.IsNaN(value) {
-							compact = append(compact, value)
-						}
-					}
-					computed := tav.EMA(compact, period)
-					values = make([]float64, len(data))
-					next := 0
-					for i, value := range data {
-						values[i] = math.NaN()
-						if !math.IsNaN(value) {
-							values[i] = computed[next]
-							next++
-						}
-					}
-				case "stddev":
-					values, _ = tav.StdDevBy(data, period, int(node.spec.Parameters["ddof"]))
-				case "return":
-					values = tav.ROCR(data, period)
-					for i := range values {
-						values[i] -= 1
-					}
-				case "lag":
-					values = make([]float64, len(data))
-					for i := range values {
-						values[i] = math.NaN()
-						if i >= period {
-							values[i] = data[i-period]
-						}
-					}
-				default:
-					if _, ok := technicalOperatorArity(node.spec.Operator); ok {
-						inputs := make([][]float64, len(node.inputs))
-						for i, input := range node.inputs {
-							inputs[i] = make([]float64, len(snapshots))
-							for time := range snapshots {
-								value := columns[input][time][sid]
-								inputs[i][time] = math.NaN()
-								if value.Validity == Valid {
-									inputs[i][time] = value.Value
-								}
-							}
-						}
-						var computed bool
-						values, computed = computeTechnicalBatch(node.spec, inputs)
-						if !computed {
-							return nil, fmt.Errorf("factor: invalid batch dependencies for %s", node.spec.Operator)
-						}
-					}
-				}
-				for time, snapshot := range snapshots {
-					var value Numeric
-					if node.spec.Operator == "field" {
-						value = snapshot.Numeric(sid, node.spec.Source, node.spec.SourceTimeFrame, node.spec.Field)
+			}
+		}
+		for _, index := range stage.nodes {
+			outNames := outputsByNode[index]
+			for i, name := range outNames {
+				soleOwner := i == 0 && len(outNames) == 1 && consumers[index] == 0
+				for t := range snapshots {
+					if soleOwner {
+						frames[t].Values[name] = columns[index][t]
 					} else {
-						inputs := make([]Numeric, len(node.inputs))
-						for i, input := range node.inputs {
-							inputs[i] = columns[input][time][sid]
-						}
-						if node.evaluate != nil {
-							value = normalized(node.evaluate(inputs))
-						} else if pointwise, ok := evaluatePointwise(node.spec, inputs); ok {
-							value = pointwise
-						} else if node.spec.Operator == "linear" {
-							sum := 0.0
-							value = Numeric{0, Valid}
-							for i, input := range inputs {
-								if input.Validity != Valid {
-									value = input
-									break
-								}
-								sum += input.Value * node.spec.Parameters[fmt.Sprintf("weight%d", i)]
-							}
-							if value.Validity == Valid {
-								value = numeric(sum)
-							}
-						} else {
-							if len(values) != len(snapshots) {
-								return nil, fmt.Errorf("factor: unregistered batch operator %s", node.spec.Operator)
-							}
-							value = numeric(values[time])
-							if value.Validity != Valid {
-								_, technical := technicalOperatorArity(node.spec.Operator)
-								if !technical || math.IsNaN(values[time]) {
-									value.Validity = Warmup
-								}
-							}
-							if node.spec.Operator != "lag" {
-								for _, input := range inputs {
-									if input.Validity != Valid {
-										value = Numeric{math.NaN(), input.Validity}
-										break
-									}
-								}
-							}
-						}
+						frames[t].Values[name] = maps.Clone(columns[index][t])
 					}
-					columns[index][time][sid] = value
 				}
 			}
-		}
-		for name, output := range p.outputs {
-			if output == index {
-				for time := range snapshots {
-					frames[time].Values[name] = columns[index][time]
+			for _, dep := range p.nodes[index].inputs {
+				consumers[dep]--
+				if consumers[dep] == 0 {
+					columns[dep] = nil
 				}
 			}
-		}
-		for _, input := range node.inputs {
-			consumers[input]--
-			if consumers[input] == 0 {
-				columns[input] = nil
+			if consumers[index] == 0 {
+				columns[index] = nil
 			}
-		}
-		if consumers[index] == 0 {
-			columns[index] = nil
 		}
 	}
 	return frames, nil
+}
+
+func buildActiveSIDSpans(activeAt [][]int32, dynamic bool) []sidSpan {
+	if !dynamic {
+		spans := make([]sidSpan, len(activeAt[0]))
+		for i, sid := range activeAt[0] {
+			spans[i] = sidSpan{sid: sid, start: 0, end: len(activeAt)}
+		}
+		return spans
+	}
+	openStart := make(map[int32]int, len(activeAt[0]))
+	var spans []sidSpan
+	for t, sids := range activeAt {
+		for sid, start := range openStart {
+			if _, present := slices.BinarySearch(sids, sid); !present {
+				spans = append(spans, sidSpan{sid: sid, start: start, end: t})
+				delete(openStart, sid)
+			}
+		}
+		for _, sid := range sids {
+			if _, exists := openStart[sid]; !exists {
+				openStart[sid] = t
+			}
+		}
+	}
+	for sid, start := range openStart {
+		spans = append(spans, sidSpan{sid: sid, start: start, end: len(activeAt)})
+	}
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].sid != spans[j].sid {
+			return spans[i].sid < spans[j].sid
+		}
+		return spans[i].start < spans[j].start
+	})
+	return spans
+}
+
+func evaluateBatchTSSpan(node compiledNode, sp sidSpan, snapshots []*Snapshot, columns [][]map[int32]Numeric, index int) error {
+	sid := sp.sid
+	spanLen := sp.end - sp.start
+	if node.spec.Operator == "field" {
+		for offset := 0; offset < spanLen; offset++ {
+			t := sp.start + offset
+			columns[index][t][sid] = snapshots[t].Numeric(sid, node.spec.Source, node.spec.SourceTimeFrame, node.spec.Field)
+		}
+		return nil
+	}
+	_, isPointwise := pointwiseArity(node.spec.Operator)
+	if node.evaluate != nil || isPointwise || node.spec.Operator == "linear" {
+		inputs := make([]Numeric, len(node.inputs))
+		for offset := 0; offset < spanLen; offset++ {
+			t := sp.start + offset
+			for i, dep := range node.inputs {
+				inputs[i] = columns[dep][t][sid]
+			}
+			var value Numeric
+			if node.evaluate != nil {
+				value = normalized(node.evaluate(inputs))
+			} else if isPointwise {
+				value, _ = evaluatePointwise(node.spec, inputs)
+			} else {
+				sum := 0.0
+				value = Numeric{0, Valid}
+				for i, input := range inputs {
+					if input.Validity != Valid {
+						value = input
+						break
+					}
+					sum += input.Value * node.spec.Parameters[fmt.Sprintf("weight%d", i)]
+				}
+				if value.Validity == Valid {
+					value = numeric(sum)
+				}
+			}
+			columns[index][t][sid] = value
+		}
+		return nil
+	}
+
+	var values []float64
+	_, technical := technicalOperatorArity(node.spec.Operator)
+	if technical {
+		inputs := make([][]float64, len(node.inputs))
+		for i, dep := range node.inputs {
+			inputs[i] = make([]float64, spanLen)
+			for offset := 0; offset < spanLen; offset++ {
+				v := columns[dep][sp.start+offset][sid]
+				inputs[i][offset] = math.NaN()
+				if v.Validity == Valid {
+					inputs[i][offset] = v.Value
+				}
+			}
+		}
+		var computed bool
+		values, computed = computeTechnicalBatch(node.spec, inputs)
+		if !computed {
+			return fmt.Errorf("factor: invalid batch dependencies for %s", node.spec.Operator)
+		}
+	} else {
+		data := make([]float64, spanLen)
+		if len(node.inputs) > 0 {
+			dep := node.inputs[0]
+			for offset := 0; offset < spanLen; offset++ {
+				data[offset] = columns[dep][sp.start+offset][sid].Value
+			}
+		}
+		period := int(node.spec.Parameters["period"])
+		switch node.spec.Operator {
+		case "ema":
+			// v0.4.1 tav seeds from a contiguous window, while cached EMA seeds
+			// from the first period valid observations. The declared skip-invalid
+			// policy uses a compact numeric view and restores invalid timestamps.
+			compact := make([]float64, 0, spanLen)
+			for _, v := range data {
+				if !math.IsNaN(v) {
+					compact = append(compact, v)
+				}
+			}
+			computed := tav.EMA(compact, period)
+			values = make([]float64, spanLen)
+			next := 0
+			for i, v := range data {
+				values[i] = math.NaN()
+				if !math.IsNaN(v) {
+					values[i] = computed[next]
+					next++
+				}
+			}
+		case "stddev":
+			values, _ = tav.StdDevBy(data, period, int(node.spec.Parameters["ddof"]))
+		case "return":
+			values = tav.ROCR(data, period)
+			for i := range values {
+				values[i] -= 1
+			}
+		case "lag":
+			values = make([]float64, spanLen)
+			for i := range values {
+				values[i] = math.NaN()
+				if i >= period {
+					values[i] = data[i-period]
+				}
+			}
+		default:
+			return fmt.Errorf("factor: unregistered batch operator %s", node.spec.Operator)
+		}
+	}
+
+	inputs := make([]Numeric, len(node.inputs))
+	for offset := 0; offset < spanLen; offset++ {
+		t := sp.start + offset
+		for i, dep := range node.inputs {
+			inputs[i] = columns[dep][t][sid]
+		}
+		value := numeric(values[offset])
+		if value.Validity != Valid && (!technical || math.IsNaN(values[offset])) {
+			value.Validity = Warmup
+		}
+		if node.spec.Operator != "lag" {
+			for _, input := range inputs {
+				if input.Validity != Valid {
+					value = Numeric{math.NaN(), input.Validity}
+					break
+				}
+			}
+		}
+		columns[index][t][sid] = value
+	}
+	return nil
 }

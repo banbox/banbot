@@ -82,11 +82,17 @@ func TestFA05CsMeanAndCsSumExpressions(t *testing.T) {
 		"cs.mean(kline.close, 2)",
 		"cs.sum()",
 		"cs.sum(kline.close, 2)",
-		"ts.sma(cs.mean(kline.close), 3)",
-		"ts.ema(cs.sum(kline.close), 3)",
 	} {
 		if _, err := Compile(specFor(bad)); err == nil {
 			t.Fatalf("accepted invalid expression %q", bad)
+		}
+	}
+	for _, validCS2TS := range []string{
+		"ts.sma(cs.mean(kline.close), 3)",
+		"ts.ema(cs.sum(kline.close), 3)",
+	} {
+		if p := mustCompile(t, specFor(validCS2TS)); p.StageCount() != 3 || p.WarmupLength() != 2 {
+			t.Fatalf("%s unexpected stages=%d warmup=%d", validCS2TS, p.StageCount(), p.WarmupLength())
 		}
 	}
 }

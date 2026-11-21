@@ -196,24 +196,6 @@ func (c *compiler) height(n *factor.Node) int {
 	return depth
 }
 
-func hasCrossSection(n *factor.Node) bool {
-	seen := map[*factor.Node]bool{}
-	queue := []*factor.Node{n}
-	for len(queue) > 0 {
-		last := len(queue) - 1
-		n = queue[last]
-		queue = queue[:last]
-		if seen[n] {
-			continue
-		}
-		seen[n] = true
-		if n.Spec.Kind == factor.CS || n.Spec.Kind == factor.GROUP {
-			return true
-		}
-		queue = append(queue, n.Inputs...)
-	}
-	return false
-}
 func (c *compiler) number(path string, e *expression) (float64, error) {
 	if e == nil {
 		return 0, c.error(path, e, "numeric constant or parameter required")
@@ -494,9 +476,6 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	if e.text == "ts.lag" && v == 0 {
 		return a, nil
 	}
-	if hasCrossSection(a) {
-		return nil, c.error(path, e, "TS windows over cross-section results are not supported")
-	}
 	if v < 1 || v > maxWindow || v != math.Trunc(v) {
 		return nil, c.error(path, e.args[1], "window must be an integer in [1,%d] (lag also permits zero)", maxWindow)
 	}
@@ -555,9 +534,6 @@ func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool
 		n, err := c.lower(path, e.args[i])
 		if err != nil {
 			return nil, true, err
-		}
-		if hasCrossSection(n) {
-			return nil, true, c.error(path, e.args[i], "TS indicators over cross-section results are not supported")
 		}
 		inputs[i] = n
 	}

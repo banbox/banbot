@@ -25,9 +25,9 @@
 
 | 文件 | 作用 |
 |---|---|
-| `dag.go` | `NodeSpec`/`Node`/`Builder`；`Compile` 生成 `Plan`（循环检测、拓扑排序、公共子表达式去重、warmup/retention 推导、`Inputs()`） |
-| `session.go` | 有状态增量计算 `Session`（`NewSession`、`Warmup`、`Evaluate`、`fork`/`commit`）；`Frame` |
-| `batch.go` | `Plan.Batch` 整段历史计算；静态 universe 走 `banta/tav`，动态 universe 退化为 `Session` |
+| `dag.go` | `NodeSpec`/`Node`/`Builder`/`Stage`；`Compile` 生成 `Plan`（循环检测、拓扑排序、`StageTS`/`StageCS` 分阶段拓扑划分、公共子表达式去重、跨阶段 warmup/retention 推导、`Inputs()`） |
+| `session.go` | 有状态增量计算 `Session`（`NewSession`、`Warmup`、`Evaluate`、`fork`/`commit`，按 `Plan` 拓扑阶段交替推进逐资产时序与截面状态）；`Frame` |
+| `batch.go` | `Plan.Batch` 整段历史计算；按拓扑阶段交替求值，`StageTS` 按标的连续活跃区间调用 `banta/tav` 向量化算子（覆盖静态与动态 PIT 宇宙），`StageCS` 在各时刻跨参考池求值 |
 | `value.go` | `Numeric`（值 + `Validity`）、`Number()`、`contentHash`（按位哈希，`-0` 与 `+0` 不同；`map[string]any` 标量行走无 fmt 的快速编码，输出字节与反射路径一致）、`cloneValues`（标量行直接拷贝 map，其余走反射深拷贝） |
 | `pointwise.go` | 逐点算子：算术、`sign`、`clip`、比较（`gt`/`ge`/`lt`/`le`）与条件选择 `where`（`cond` 有效时仅要求被选中的分支有效） |
 | `operators.go` | 截面算子：rank、pct-rank（`[0, 1]` 归一化，`M == 1` 为 `0.5`）、zscore、robust-zscore、winsorize、quantile、cs-mean / cs-sum（全池算术均值 / 求和截面广播）、group 系列、residual |
@@ -123,9 +123,9 @@
 
 | 类型 | 位置 | 要点 |
 |---|---|---|
-| `Node` / `NodeSpec` | `dag.go:44` / `dag.go:19` | 节点身份 = 规范化 NodeSpec 与有序依赖 ID 的内容哈希；相同 ID 合并 |
-| `Plan` | `dag.go:229` | 拓扑排序后的节点、输出映射、`Inputs()`（实际可达的 source/timeframe/字段）、warmup 与 retention |
-| `Session` | `session.go:45` | 有状态增量计算；按资产维护 `assetState`（`session.go:36`）；`Warmup`/`Evaluate`；`fork`/`commit` 支持屏障试算 |
+| `Node` / `NodeSpec` | `dag.go:node` | 节点身份 = 规范化 NodeSpec 与有序依赖 ID 的内容哈希；相同 ID 合并 |
+| `Plan` / `Stage` | `dag.go:Compile` / `Plan.Stages` | 拓扑排序节点、交替 `StageTS`/`StageCS` 拓扑执行阶段、输出映射、`Inputs()`（实际可达的 source/timeframe/字段与预热长度）、warmup 与 retention |
+| `Session` | `session.go:NewSession` | 有状态增量计算；按资产维护 `assetState`；按拓扑阶段推进 `Warmup`/`Evaluate`；`fork`/`commit` 完整深拷贝跨阶段时序与指标状态 |
 | `Frame` | `session.go:16` | 一个决策网格上的因子列结果 |
 | `Numeric` / `Validity` | `value.go:27` / `value.go:15` | 值 + 有效性（如 Missing、NonFinite、Warmup）；无效值不参与截面统计 |
 | `Universe` / `SnapshotSpec` / `Snapshot` | `snapshot.go:11` / `:36` / `:94` | 冻结的输入视图；`Freeze` 按 Requirement 选取可见数据 |
@@ -156,18 +156,18 @@
 
 ### 1. 因子定义 → 计算计划（编译）
 
-1. 表达式路径：`expr.Compile`（`expr/compile.go:75`）调用 `parse`（`parser.go:37`）→ `named`（`compile.go:164`）→ `lower`（`compile.go:260`）→ `call`（`:330`）或 `indicatorCall`（`:467`），产出原生 `factor.Node`。
-2. Go builder 路径：直接调用 `factor.Field`/`EMA`/`Rank` 等 builder（`dag.go` 内 `node()`，`dag.go:50`）。
-3. 两条路径汇合于 `factor.Compile`（`dag.go:299`）：`visitNode` 递归，调用 `validateNode`（`dag.go:410`）与 `indicatorLookback`（`indicators.go:160`），做循环检测与公共子表达式去重，输出 `*Plan`。
+1. 表达式路径：`expr.Compile`（`expr/compile.go:Compile`）调用 `parse`（`expr/parser.go:parse`）→ `compiler.named` → `compiler.lower` → `compiler.call` 或 `compiler.indicatorCall`，产出原生 `factor.Node`（支持任意无环 `TS ↔ CS/GROUP` 多阶段嵌套）。
+2. Go builder 路径：直接调用 `factor.Field`/`EMA`/`Rank`/`Residual` 等 builder（`dag.go:node`）。
+3. 两条路径汇合于 `factor.Compile`（`dag.go:Compile`）：递归访问依赖并调用 `validateNode` 与 `indicatorLookback`（`indicators.go:indicatorLookback`），做循环检测、公共子表达式去重与跨阶段预热累加（`上游预热 + 下游窗口预热`），再由 `buildPlanStages` 划分为交替的 `StageTS`（逐资产时序/逐点阶段）与 `StageCS`（跨参考池截面/分组回归阶段）屏障，输出 `*Plan`（指纹包含节点序列、阶段划分与输出映射）。
 4. 计划是只读可复用的；会话状态由具体运行拥有。当前没有跨任务的表达式编译缓存。
 
 ### 2. 在线增量计算（实盘与逐步回放）
 
-`NewSession`（`session.go:59`）→ `Freeze`（`snapshot.go:101`）→ `Warmup`（`session.go:90`）→ 每个决策网格 `Evaluate`（`session.go:83`）→ `evaluate`（`session.go:95`）→ `snapshotIdentity`（`session.go:263`）→ `evaluateTS`（`session.go:308`）。截面部分走 `crossSection`（`operators.go:38`），技术指标走 `computeTechnicalIncremental`/`asset.evaluateTechnical`（`indicators_runtime.go:250`）。
+`NewSession`（`session.go:NewSession`）→ `Freeze`（`snapshot.go:Freeze`）→ `Warmup`（`session.go:Session.Warmup`）→ 每个决策网格 `Evaluate`（`session.go:Session.Evaluate`）→ `Session.evaluate` → `Plan.snapshotIdentity`：按 `Plan` 的拓扑阶段依次求值——`StageTS` 对每个活跃标的推进 `Session.evaluateTS` 与技术指标 `assetState.evaluateTechnical`（`indicators_runtime.go:computeTechnicalIncremental`），`StageCS` 调用 `crossSection`（`operators.go:crossSection`）并将各标的结果写入其 `assetState.nodes` 历史缓冲供下游 `StageTS` 阶段消费；`Session.fork`/`Session.commit` 完整克隆各阶段序列与指标内部状态。
 
 ### 3. 整段历史计算
 
-`Plan.Batch`（`batch.go:15`）：静态 universe 调用 `banta/tav` 的向量化实现；动态 universe 退化为逐步 `Session`。两者都校验时间单调（`batch.go:44`），但 `Session` 路径在 `Warmup` 之后不再记录上一个 DecisionTime。
+`Plan.Batch`（`batch.go:Plan.Batch`）：校验上下文一致性、时间单调递增、宇宙版本与活跃标的身份连续性（与 `Session` 一致），提取各标的连续活跃时间区间（`buildActiveSIDSpans`），再按相同的拓扑阶段交替求值：`StageTS` 在每个标的连续活跃区间上调用 `banta/tav` 向量化算子与逐点求值器，`StageCS` 在每个时刻跨时点参考池调用 `crossSection` 产出二维结果矩阵供后续阶段继续按资产向量化求值。`Session` 路径在 `Warmup` 之后不再记录上一个 DecisionTime。
 
 ### 4. 回放运行（archival / storage 输入）
 

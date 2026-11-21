@@ -100,7 +100,7 @@ Session 为每个活跃 SID 保存 banta 环境及各节点 Series，通过锁�
 
 beta.7 新增的技术指标使用独立版本及完整有效输入元组：多输入的任意一项无效时不推进该节点，恢复有效后继续。每个节点保存自己的有界输入 Series，避免 banta 底层缓存省略辅助输入身份而串扰；候选 Session 复制时同时重映射这些 Series。MACD 与布林带按输出分别建标量节点，预热及单位详见 [指标指南](factor_indicators.md)。旧 lag/return/EMA/std 的节点身份与数值规则保持兼容。
 
-Batch 必须给出显式 `maxRows`，从已知起点计算一段完整历史，静态池使用 tav 时序内核和同一截面/逐点实现。它按消费者计数释放不再需要的中间列，返回的历史 Frames 仍由调用者持有。动态 Universe 会回退到同一新 Session 连续回放。跨块延续 EMA 等状态应复用 Session，不能对每块重新调用 Batch 并期待与整段结果一致。
+Batch 必须给出显式 `maxRows`，从已知起点计算一段完整历史，按 `Plan` 的拓扑阶段（`StageTS`/`StageCS`）交替求值：`StageTS` 按各标的连续活跃区间使用 `tav` 时序内核与共用逐点求值器，`StageCS` 在各时刻调用同一截面/分组实现（同时支持静态与动态 PIT Universe）。它按消费者计数释放不再需要的中间列，返回的历史 Frames 仍由调用者持有。跨块延续 EMA 等状态应复用 Session，不能对每块重新调用 Batch 并期待与整段结果一致。
 
 实盘通过 [`RoundBarrier`](../factor/barrier.go) 处理 generation、冻结、取消及发布。候选计算 fork 有界 Session 状态，只有当前有效回合才能 commit；克隆失败、过期或取消不得推进 live owner。新增递归状态必须满足安全克隆契约。
 
@@ -128,7 +128,7 @@ Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame
 
 表达式编译有明确静态边界，见 [parser.go](../factor/expr/parser.go)：单式最多 16 KiB，总表达式文本 256 KiB，所有声明的 AST 总计最多 8192 节点，深度上限 64；lets+outputs、bindings、params 各组最多 512 项，窗口最大 10000。深度还检查展开后的引用 DAG。独立 CLI spec 文件最大 1 MiB，仅接受一个 YAML 文档并拒绝未知字段。这些是语法和结构上限，不是峰值内存 admission 或全链路吞吐保证。
 
-当前语言没有循环、模块导入、任意代码调用，也拒绝对含 CS/GROUP 结果的输入再做非零 TS 窗口。分类分组通过已开放的 `group.demean/zscore` 表达。Go builder/policy 的能力范围与表达式白名单不同。执行侧另有 Batch 行数、标签队列行/列、IC 历史窗口、policy checkpoint 和近期接纳缓存限制；大量输出还会增加 Frame map、标签副本和研究列间两两相关的成本，不能只看解析节点数估算资源。
+当前语言没有循环、模块导入或任意代码调用；允许任意无环多阶段 `TS ↔ CS/GROUP` 嵌套（按 `StageTS`/`StageCS` 拓扑阶段交替求值）。分类分组通过已开放的 `group.demean/zscore` 表达。Go builder/policy 的能力范围与表达式白名单不同。执行侧另有 Batch 行数、标签队列行/列、IC 历史窗口、policy checkpoint 和近期接纳缓存限制；大量输出还会增加 Frame map、标签副本和研究列间两两相关的成本，不能只看解析节点数估算资源。
 
 ## 8. 持仓状态与研究产物的边界
 

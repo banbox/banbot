@@ -516,7 +516,6 @@ go test ./examples/crosssection -run '^$' -bench '^BenchmarkFactorVersions$' -be
 | `unknown function` / 参数数量错误 | 使用上面的函数表；`ts.std` 必须提供第三个参数 |
 | 窗口或 `ddof` 超界 | 使用编译期整数参数；`ts.return(...,0)` 无效，零 lag 有效 |
 | `cyclic factor reference` | 将相互引用的 lets/outputs 改为无环依赖 |
-| `TS windows over cross-section results` | 先做时序窗口，再做截面变换 |
 | 周期不匹配或缺少 asof | 同周期源用当前事件，不同周期/event 源显式配置采样和正最大年龄 |
 | 组合列或权重错误 | 核对 outputs、columns、weights，以及外层 combo 覆盖 |
 | 源码位置错误 | `outputs.name:行:列` 指公式字符串中的位置，不是 YAML 文件物理行号 |

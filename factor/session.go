@@ -149,27 +149,35 @@ func (s *Session) evaluate(snapshot *Snapshot, warmup bool) (Frame, error) {
 		s.assets[sid].env.BarNum++
 	}
 	columns := make([]map[int32]Numeric, len(s.plan.nodes))
-	for index, node := range s.plan.nodes {
-		if node.spec.Kind == TS {
-			columns[index] = make(map[int32]Numeric, len(allSIDs))
+	for _, stage := range s.plan.stages {
+		if stage.kind == StageTS {
+			for _, index := range stage.nodes {
+				columns[index] = make(map[int32]Numeric, len(allSIDs))
+			}
 			for _, sid := range allSIDs {
 				asset := s.assets[sid]
-				value := s.evaluateTS(node, asset, sid, snapshot, columns)
-				columns[index][sid] = value
-				asset.nodes[index].Append(value.Value)
-				s.updates[node.id]++
+				for _, index := range stage.nodes {
+					node := s.plan.nodes[index]
+					value := s.evaluateTS(node, asset, sid, snapshot, columns)
+					columns[index][sid] = value
+					asset.nodes[index].Append(value.Value)
+					s.updates[node.id]++
+				}
 			}
 		} else {
-			columns[index] = crossSection(node, snapshot, columns)
-			for _, sid := range allSIDs {
-				value, exists := columns[index][sid]
-				if !exists {
-					value = Numeric{math.NaN(), Missing}
-					columns[index][sid] = value
+			for _, index := range stage.nodes {
+				node := s.plan.nodes[index]
+				columns[index] = crossSection(node, snapshot, columns)
+				for _, sid := range allSIDs {
+					value, exists := columns[index][sid]
+					if !exists {
+						value = Numeric{math.NaN(), Missing}
+						columns[index][sid] = value
+					}
+					s.assets[sid].nodes[index].Append(value.Value)
 				}
-				s.assets[sid].nodes[index].Append(value.Value)
+				s.updates[node.id]++
 			}
-			s.updates[node.id]++
 		}
 	}
 	// BarEnv.TrimOverflow only cuts selected OHLC roots and Series.Cut does
@@ -347,7 +355,23 @@ func (s *Session) evaluateTS(node compiledNode, asset *assetState, sid int32, sn
 	case "ema":
 		value = ta.EMA(series, period).Get(0)
 	case "stddev":
-		result, _ := ta.StdDevBy(series, period, int(node.spec.Parameters["ddof"]))
+		ddof := int(node.spec.Parameters["ddof"])
+		stdInput := series
+		if ddof >= 10 {
+			// banta.StdDevBy keys its sub-series cache on period*10+ddof, which
+			// collides across distinct (period, ddof) pairs when ddof >= 10.
+			if asset.technical == nil {
+				asset.technical = make(map[string][]*ta.Series)
+			}
+			dedicated := asset.technical[node.id]
+			if dedicated == nil {
+				dedicated = []*ta.Series{asset.env.NewSeries(nil)}
+				asset.technical[node.id] = dedicated
+			}
+			dedicated[0].Append(input.Value)
+			stdInput = dedicated[0]
+		}
+		result, _ := ta.StdDevBy(stdInput, period, ddof)
 		value = result.Get(0)
 	default:
 		return Numeric{math.NaN(), NotNumeric}
