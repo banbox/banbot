@@ -31,7 +31,7 @@
 | `value.go` | `Numeric`（值 + `Validity`）、`Number()`、`contentHash`（按位哈希，`-0` 与 `+0` 不同；`map[string]any` 标量行走无 fmt 的快速编码，输出字节与反射路径一致）、`cloneValues`（标量行直接拷贝 map，其余走反射深拷贝） |
 | `pointwise.go` | 逐点算子：算术、`sign`、`clip`、比较（`gt`/`ge`/`lt`/`le`）与条件选择 `where`（`cond` 有效时仅要求被选中的分支有效） |
 | `operators.go` | 截面算子：rank、pct-rank（`[0, 1]` 归一化，`M == 1` 为 `0.5`）、zscore、robust-zscore、winsorize、quantile、cs-mean / cs-sum（全池算术均值 / 求和截面广播）、group 系列、residual |
-| `indicators.go` / `indicators_runtime.go` / `rolling.go` | 技术指标与时序滚动统计算子（`ts-corr`/`ts-cov`/`ts-beta`/`ts-sum`/`ts-product`/`ts-rank`/`ts-zscore`/`ts-argmax`/`ts-argmin`/`ts-skew`/`ts-kurt`/`ts-slope`/`ts-rsquare`、`DecayLinear` 复用 `WMA`）声明、参数校验、lookback、增量与批量实现（含 RSI 的 Wilder 状态） |
+| `indicators.go` / `indicators_runtime.go` / `rolling.go` | 技术指标与时序滚动统计算子声明、参数校验、lookback、增量与批量双运行时实现：覆盖均线与自适应滤波（`SMA`/`RMA`/`WMA`/`DecayLinear`/`DEMA`/`TEMA`/`HMA`/`KAMA`/`KAMABy`/`ALMA`/`TRIMA`/`ER`/`Kalman1D`/`Hurst`）、趋势/方向/通道（`TR`/`ATR`/`NATR`/`ADX`/`PlusDI`/`MinusDI`/`DMI`/`CHOP`/`Aroon*`/`Vortex*`/`Donchian*`/`Keltner*`/`Supertrend`/`SupertrendDir`/`SAR`/`STC`/`IchimokuConversion`/`IchimokuBase`/`MACD*`/`BBands*`）、动量/成交量/原生订单流（`RSI`/`ROC`/`MOM`/`CCI`/`Stoch`/`WillR`/`OBV`/`MFI`/`CMF`/`ADL`/`ChaikinOsc`(`ADOSC`)/`VWMA`/`VolumeDelta`/`CVD`/`RollingCVD`/`TakerBuyRatio`/`Highest`/`Lowest`）、OHLC 极值波动率估计（`ParkinsonVol`/`GarmanKlassVol`/`YangZhangVol`）及时序滚动统计（`ts-corr`/`ts-cov`/`ts-beta`/`ts-sum`/`ts-product`/`ts-rank`/`ts-zscore`/`ts-argmax`/`ts-argmin`/`ts-skew`/`ts-kurt`/`ts-slope`/`ts-rsquare`） |
 | `snapshot.go` | `Universe`、`SnapshotSpec`、`Freeze` 冻结输入（PIT 视图）、`Requirement`/`StreamKey`/`SnapshotStatus` |
 | `allocation.go` | `PortfolioTarget`、`Allocation`；十进制精确数量运算（`big.Rat`）、默认量子 1e-18 |
 | `portfolio.go` | `PortfolioSpec`、`FrozenBudget`、`TargetPortfolio`（Full/Patch 生效目标）、`TopBottomK*` / `ScoreGate`（含 `long_min_score`/`short_max_score` 绝对分数门控与 `unfilled_slot_policy`）、`ExposureScales` 与保留输出列判定（`IsExposureScaleOutput`/`IsRiskOutput`/`IsReservedOutput`） |
@@ -290,7 +290,7 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 3. `factor/expr/compile.go`：在 `arities` 表加名字并在 `call` 显式分支中处理，或在 `indicatorCall` 中同步三处（指标名单与最小窗口、参数规则、switch）。
 4. 若修改了既有算子语义，升级 `dag.go:55` 或 `indicators.go:13` 的版本常量，否则 CSE 与历史计划哈希会误合并。
 
-易踩坑：窗口上限有两套常量（`expr/parser.go` 的 `maxWindow` 与 `factor.MaxIndicatorPeriod`），需保持一致；带更高最小窗口的统计量（如 `ts.skew` ≥ 3、`ts.kurt` ≥ 4）须在 `validateIndicator` 与 `expr/compile.go` 同步校验。
+易踩坑：窗口上限有两套常量（`expr/parser.go` 的 `maxWindow` 与 `factor.MaxIndicatorPeriod`），需保持一致；带更高最小窗口的统计量与指标（如 `HMA`/`CHOP`/`YangZhangVol` ≥ 2、`TsSkew` ≥ 3、`TsKurt` ≥ 4、`Hurst` ≥ 8）须在 `validateIndicator`（`indicators.go:validateIndicator`）与 `expr/compile.go:indicatorCall` 同步校验；在 `Session` 内维护自定义状态（`Series.More`）的指标必须注册 `Series.DupMore` 以满足 `Session.fork` 深拷贝契约。
 
 ### 新增 Custom 节点
 

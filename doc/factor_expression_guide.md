@@ -106,13 +106,13 @@ param.window      本定义集 params 中的编译期参数
 | `ts.slope(x,n)` / `ts.rsquare(x,n)` | 对等间距时间索引 `0..n-1` 的 OLS 斜率 / 拟合优度 `R² ∈ [0,1]`（方差为 0 时返回 `0`） |
 | `ts.decay_linear(x,n)` | 线性衰减加权均值，等价于 `ts.wma(x,n)`（最旧到最新权重 `1..n`） |
 
-还支持 18 类常见技术指标、22 个标量函数：`ts.sma/rma/wma/vwma/rsi/roc/mom/tr/atr/cci/stoch/willr/obv/mfi/highest/lowest`，以及 `ts.macd/macd_signal/macd_hist`、`ts.bbands_upper/bbands_middle/bbands_lower`。完整参数表、Go 构造方式、公式、缺失数据与预热规则见[常见技术指标](factor_indicators.md)。全部支持 Batch 与持续推进的 Session。
+还支持完整的高频技术指标、订单流与波动率估计函数：自适应与均线 `ts.sma/rma/wma/dema/tema/hma/kama/alma/trima/er/kalman1d/hurst`，方向/趋势/通道 `ts.tr/atr/natr/adx/dmi_plus(plus_di)/dmi_minus(minus_di)/chop/aroon_up/aroon_down/aroon_osc/vortex_plus/vortex_minus/donchian_upper/donchian_mid/donchian_lower/keltner_upper/keltner_mid/keltner_lower/supertrend/supertrend_dir/sar/stc/ichimoku_conversion/ichimoku_base`、`ts.macd/macd_signal/macd_hist`、`ts.bbands_upper/bbands_middle/bbands_lower`，动量/成交量/订单流 `ts.rsi/roc/mom/cci/stoch/willr/highest/lowest/vwma/obv/mfi/cmf/adl/adosc(chaikin_osc)/volume_delta/cvd/rolling_cvd/taker_buy_ratio`，以及 OHLC 极差波动率 `ts.parkinson_vol/garman_klass_vol/yang_zhang_vol`（当 `bindings` 中声明 `kline` 时，多字段 OHLC/OHLCV/订单流指标可省略字段节点直接写如 `ts.adx(14)`、`ts.parkinson_vol(20)`、`ts.volume_delta()`）。完整参数表、Go 构造方式、公式、缺失数据与预热规则见[常见技术指标](factor_indicators.md)。全部支持 Batch 与持续推进的 Session。
 
-例如 `ts.cci((kline.high+kline.low+kline.close)/3,20)` 显式构造典型价格，`ts.atr(kline.high,kline.low,kline.close,14)` 提供三个输入，`ts.macd_hist(kline.close,12,26,9)` 选择 MACD 柱。`ts.roc` 返回百分比，`ts.return` 返回比例：100 到 110 分别为 `10` 与 `0.1`。技术指标与新增滚动统计函数均按完整有效元组推进，遇到无效字段不推进状态；原有 `ts.return/lag/ema/std` 保持原合同。
+例如 `ts.cci((kline.high+kline.low+kline.close)/3,20)` 显式构造典型价格，`ts.atr(kline.high,kline.low,kline.close,14)`（或 `ts.atr(14)`）计算真实波幅，`ts.macd_hist(kline.close,12,26,9)` 选择 MACD 柱。`ts.roc` 返回百分比，`ts.return` 返回比例：100 到 110 分别为 `10` 与 `0.1`。技术指标与滚动统计函数均按完整有效元组推进，遇到无效字段不推进状态；原有 `ts.return/lag/ema/std` 保持原合同。
 
-窗口必须为整数常量或已绑定数值参数，范围为 1–10000（`ts.skew` 为 3–10000，`ts.kurt` 为 4–10000）；`ts.lag` 额外允许 0。`ddof` 必须是整数且满足 `0 <= ddof < n`，其中 `ddof=0` 是总体标准差。窗口参数不接受逐行字段，也不接受 `param.window + 1` 等计算表达式；先在 `params` 中给出最终数值。
+窗口必须为整数常量或已绑定数值参数，范围为 1–10000（`ts.hma/chop/yang_zhang_vol` 为 2–10000，`ts.skew` 为 3–10000，`ts.kurt` 为 4–10000，`ts.hurst` 为 8–10000）；`ts.lag` 额外允许 0。`ddof` 必须是整数且满足 `0 <= ddof < n`，其中 `ddof=0` 是总体标准差。窗口参数不接受逐行字段，也不接受 `param.window + 1` 等计算表达式；先在 `params` 中给出最终数值。
 
-先时序再截面是受支持的组合，例如 `cs.zscore(ts.return(kline.close,24))`。当前不支持对截面或回归结果再做时序窗口，即使中间包裹了逐点函数，也会拒绝 `ts.ema(abs(cs.rank(kline.close)),24)`；零 lag 原值例外。
+支持任意无环多阶段 `TS ↔ CS/GROUP` 嵌套（按 `StageTS`/`StageCS` 拓扑阶段交替求值），例如 `cs.zscore(ts.return(kline.close,24))`、`ts.kama(cs.pct_rank(kline.volume)+1,10)` 或 `cs.zscore(ts.std(group.residual(ts.return(kline.close,1),kline.open),20,0))`；跨阶段预热自动累加，零 lag 返回原值。
 
 ### 截面和回归函数
 

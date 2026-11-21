@@ -501,55 +501,178 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	}
 }
 
+func (c *compiler) resolveDefaultKlineFields(path string, e *expression, fields ...string) ([]*factor.Node, error) {
+	if _, ok := c.spec.Bindings["kline"]; !ok {
+		return nil, c.error(path, e, "%s shorthand requires a \"kline\" binding or explicit field arguments", e.text)
+	}
+	nodes := make([]*factor.Node, len(fields))
+	for i, name := range fields {
+		n, err := c.field(path, e, "kline", name)
+		if err != nil {
+			return nil, err
+		}
+		nodes[i] = n
+	}
+	return nodes, nil
+}
+
+type indicatorParamKind uint8
+
+const (
+	paramPeriod indicatorParamKind = iota
+	paramNonNegative
+	paramPositive
+	paramUnitInterval
+)
+
 func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool, error) {
-	inputCount, parameterCount, minPeriod := 1, 1, 1
+	inputCount, minPeriod := 1, 1
+	paramKinds := []indicatorParamKind{paramPeriod}
+	var defaultKlineFields []string
+
 	switch e.text {
 	case "ts.sma", "ts.rma", "ts.wma", "ts.decay_linear", "ts.rsi", "ts.roc", "ts.mom", "ts.cci", "ts.highest", "ts.lowest",
+		"ts.dema", "ts.tema", "ts.trima", "ts.er",
 		"ts.sum", "ts.product", "ts.rank", "ts.zscore", "ts.argmax", "ts.argmin", "ts.slope", "ts.rsquare":
+	case "ts.hma":
+		minPeriod = 2
 	case "ts.skew":
 		minPeriod = 3
 	case "ts.kurt":
 		minPeriod = 4
-	case "ts.vwma", "ts.corr", "ts.cov", "ts.beta":
+	case "ts.hurst":
+		minPeriod = 8
+	case "ts.kama":
+		if len(e.args) == 4 {
+			paramKinds = []indicatorParamKind{paramPeriod, paramPeriod, paramPeriod}
+		}
+	case "ts.alma":
+		if len(e.args) != 2 {
+			paramKinds = []indicatorParamKind{paramPeriod, paramUnitInterval, paramPositive}
+		}
+	case "ts.kalman1d":
+		paramKinds = []indicatorParamKind{paramPositive, paramPositive}
+	case "ts.stc":
+		paramKinds = []indicatorParamKind{paramPeriod, paramPeriod, paramPeriod}
+	case "ts.corr", "ts.cov", "ts.beta":
 		inputCount = 2
-	case "ts.tr":
-		inputCount, parameterCount = 3, 0
-	case "ts.atr", "ts.stoch", "ts.willr":
-		inputCount = 3
+	case "ts.vwma":
+		inputCount = 2
+		defaultKlineFields = []string{"close", "volume"}
 	case "ts.obv":
-		inputCount, parameterCount = 2, 0
-	case "ts.mfi":
+		inputCount, paramKinds = 2, nil
+		defaultKlineFields = []string{"close", "volume"}
+	case "ts.volume_delta", "ts.cvd":
+		inputCount, paramKinds = 2, nil
+		defaultKlineFields = []string{"volume", "buy_volume"}
+	case "ts.rolling_cvd", "ts.taker_buy_ratio":
+		inputCount = 2
+		defaultKlineFields = []string{"volume", "buy_volume"}
+	case "ts.aroon_up", "ts.aroon_down", "ts.aroon_osc",
+		"ts.donchian_upper", "ts.donchian_mid", "ts.donchian_middle", "ts.donchian_lower",
+		"ts.ichimoku_conversion", "ts.ichimoku_base", "ts.parkinson_vol":
+		inputCount = 2
+		defaultKlineFields = []string{"high", "low"}
+	case "ts.sar":
+		inputCount = 2
+		defaultKlineFields = []string{"high", "low"}
+		if len(e.args) == 0 || len(e.args) == 2 {
+			paramKinds = nil
+		} else {
+			paramKinds = []indicatorParamKind{paramPositive, paramPositive, paramPositive}
+		}
+	case "ts.tr":
+		inputCount, paramKinds = 3, nil
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.atr", "ts.stoch", "ts.willr",
+		"ts.adx", "ts.dmi_plus", "ts.plus_di", "ts.dmi_minus", "ts.minus_di",
+		"ts.natr", "ts.vortex_plus", "ts.vortex_minus":
+		inputCount = 3
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.chop":
+		inputCount, minPeriod = 3, 2
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.keltner_upper", "ts.keltner_mid", "ts.keltner_middle", "ts.keltner_lower":
+		inputCount = 3
+		paramKinds = []indicatorParamKind{paramPeriod, paramNonNegative}
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.supertrend", "ts.supertrend_dir":
+		inputCount = 3
+		paramKinds = []indicatorParamKind{paramPeriod, paramPositive}
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.adl":
+		inputCount, paramKinds = 4, nil
+		defaultKlineFields = []string{"high", "low", "close", "volume"}
+	case "ts.mfi", "ts.cmf":
 		inputCount = 4
-	case "ts.macd", "ts.macd_signal", "ts.macd_hist", "ts.bbands_upper", "ts.bbands_middle", "ts.bbands_lower":
-		parameterCount = 3
+		defaultKlineFields = []string{"high", "low", "close", "volume"}
+	case "ts.adosc", "ts.chaikin_osc":
+		inputCount = 4
+		paramKinds = []indicatorParamKind{paramPeriod, paramPeriod}
+		defaultKlineFields = []string{"high", "low", "close", "volume"}
+	case "ts.garman_klass_vol":
+		inputCount = 4
+		defaultKlineFields = []string{"open", "high", "low", "close"}
+	case "ts.yang_zhang_vol":
+		inputCount, minPeriod = 4, 2
+		defaultKlineFields = []string{"open", "high", "low", "close"}
+	case "ts.macd", "ts.macd_signal", "ts.macd_hist":
+		paramKinds = []indicatorParamKind{paramPeriod, paramPeriod, paramPeriod}
+	case "ts.bbands_upper", "ts.bbands_middle", "ts.bbands_lower":
+		paramKinds = []indicatorParamKind{paramPeriod, paramNonNegative, paramNonNegative}
 	default:
 		return nil, false, nil
 	}
+
+	parameterCount := len(paramKinds)
 	count := inputCount + parameterCount
-	if len(e.args) != count {
+	useDefaultFields := len(defaultKlineFields) > 0 && len(e.args) == parameterCount
+	if !useDefaultFields && len(e.args) != count {
 		return nil, true, c.error(path, e, "%s expects %d arguments, got %d", e.text, count, len(e.args))
 	}
-	inputs := make([]*factor.Node, inputCount)
-	for i := range inputs {
-		n, err := c.lower(path, e.args[i])
+	var inputs []*factor.Node
+	paramOffset := inputCount
+	if useDefaultFields {
+		var err error
+		inputs, err = c.resolveDefaultKlineFields(path, e, defaultKlineFields...)
 		if err != nil {
 			return nil, true, err
 		}
-		inputs[i] = n
+		paramOffset = 0
+	} else {
+		inputs = make([]*factor.Node, inputCount)
+		for i := range inputs {
+			n, err := c.lower(path, e.args[i])
+			if err != nil {
+				return nil, true, err
+			}
+			inputs[i] = n
+		}
 	}
 	parameters := make([]float64, parameterCount)
-	for i := range parameters {
-		arg := e.args[inputCount+i]
+	for i, kind := range paramKinds {
+		arg := e.args[paramOffset+i]
 		value, err := c.number(path, arg)
 		if err != nil {
 			return nil, true, err
 		}
-		if strings.HasPrefix(e.text, "ts.bbands_") && i > 0 {
+		switch kind {
+		case paramNonNegative:
 			if value < 0 {
-				return nil, true, c.error(path, arg, "standard deviation multiplier must be nonnegative")
+				return nil, true, c.error(path, arg, "multiplier must be nonnegative")
 			}
-		} else if value < float64(minPeriod) || value > factor.MaxIndicatorPeriod || value != math.Trunc(value) {
-			return nil, true, c.error(path, arg, "window must be an integer in [%d,%d]", minPeriod, factor.MaxIndicatorPeriod)
+		case paramPositive:
+			if value <= 0 {
+				return nil, true, c.error(path, arg, "parameter must be positive")
+			}
+		case paramUnitInterval:
+			if value < 0 || value > 1 {
+				return nil, true, c.error(path, arg, "offset must be in [0,1]")
+			}
+		default:
+			if value < float64(minPeriod) || value > factor.MaxIndicatorPeriod || value != math.Trunc(value) {
+				return nil, true, c.error(path, arg, "window must be an integer in [%d,%d]", minPeriod, factor.MaxIndicatorPeriod)
+			}
 		}
 		parameters[i] = value
 	}
@@ -568,6 +691,35 @@ func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool
 		result = factor.WMA(a, period)
 	case "ts.decay_linear":
 		result = factor.DecayLinear(a, period)
+	case "ts.dema":
+		result = factor.DEMA(a, period)
+	case "ts.tema":
+		result = factor.TEMA(a, period)
+	case "ts.hma":
+		result = factor.HMA(a, period)
+	case "ts.kama":
+		if len(parameters) == 3 {
+			if parameters[1] >= parameters[2] {
+				return nil, true, c.error(path, e, "KAMA requires fast < slow")
+			}
+			result = factor.KAMABy(a, period, int(parameters[1]), int(parameters[2]))
+		} else {
+			result = factor.KAMA(a, period)
+		}
+	case "ts.alma":
+		if len(parameters) == 1 {
+			result = factor.ALMA(a, period, 0.85, 6.0)
+		} else {
+			result = factor.ALMA(a, period, parameters[1], parameters[2])
+		}
+	case "ts.trima":
+		result = factor.TRIMA(a, period)
+	case "ts.er":
+		result = factor.ER(a, period)
+	case "ts.kalman1d":
+		result = factor.Kalman1D(a, parameters[0], parameters[1])
+	case "ts.hurst":
+		result = factor.Hurst(a, period)
 	case "ts.vwma":
 		result = factor.VWMA(a, inputs[1], period)
 	case "ts.corr":
@@ -612,10 +764,87 @@ func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool
 		result = factor.Stoch(a, inputs[1], inputs[2], period)
 	case "ts.willr":
 		result = factor.WillR(a, inputs[1], inputs[2], period)
+	case "ts.adx":
+		result = factor.ADX(a, inputs[1], inputs[2], period)
+	case "ts.dmi_plus", "ts.plus_di":
+		result = factor.PlusDI(a, inputs[1], inputs[2], period)
+	case "ts.dmi_minus", "ts.minus_di":
+		result = factor.MinusDI(a, inputs[1], inputs[2], period)
+	case "ts.natr":
+		result = factor.NATR(a, inputs[1], inputs[2], period)
+	case "ts.chop":
+		result = factor.CHOP(a, inputs[1], inputs[2], period)
+	case "ts.aroon_up":
+		result = factor.AroonUp(a, inputs[1], period)
+	case "ts.aroon_down":
+		result = factor.AroonDown(a, inputs[1], period)
+	case "ts.aroon_osc":
+		result = factor.AroonOsc(a, inputs[1], period)
+	case "ts.vortex_plus":
+		result = factor.VortexPlus(a, inputs[1], inputs[2], period)
+	case "ts.vortex_minus":
+		result = factor.VortexMinus(a, inputs[1], inputs[2], period)
+	case "ts.donchian_upper":
+		result = factor.DonchianUpper(a, inputs[1], period)
+	case "ts.donchian_mid", "ts.donchian_middle":
+		result = factor.DonchianMid(a, inputs[1], period)
+	case "ts.donchian_lower":
+		result = factor.DonchianLower(a, inputs[1], period)
+	case "ts.keltner_upper":
+		result = factor.KeltnerUpper(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.keltner_mid", "ts.keltner_middle":
+		result = factor.KeltnerMid(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.keltner_lower":
+		result = factor.KeltnerLower(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.supertrend":
+		result = factor.Supertrend(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.supertrend_dir":
+		result = factor.SupertrendDir(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.sar":
+		if len(parameters) == 0 {
+			result = factor.SAR(a, inputs[1], 0.02, 0.02, 0.2)
+		} else {
+			if parameters[2] < parameters[0] {
+				return nil, true, c.error(path, e, "SAR requires max >= start")
+			}
+			result = factor.SAR(a, inputs[1], parameters[0], parameters[1], parameters[2])
+		}
+	case "ts.stc":
+		if parameters[0] >= parameters[1] {
+			return nil, true, c.error(path, e, "STC requires fast < slow")
+		}
+		result = factor.STC(a, period, int(parameters[1]), int(parameters[2]))
+	case "ts.ichimoku_conversion":
+		result = factor.IchimokuConversion(a, inputs[1], period)
+	case "ts.ichimoku_base":
+		result = factor.IchimokuBase(a, inputs[1], period)
 	case "ts.obv":
 		result = factor.OBV(a, inputs[1])
 	case "ts.mfi":
 		result = factor.MFI(a, inputs[1], inputs[2], inputs[3], period)
+	case "ts.cmf":
+		result = factor.CMF(a, inputs[1], inputs[2], inputs[3], period)
+	case "ts.adl":
+		result = factor.ADL(a, inputs[1], inputs[2], inputs[3])
+	case "ts.adosc", "ts.chaikin_osc":
+		if parameters[0] >= parameters[1] {
+			return nil, true, c.error(path, e, "ADOSC requires fast < slow")
+		}
+		result = factor.ChaikinOsc(a, inputs[1], inputs[2], inputs[3], period, int(parameters[1]))
+	case "ts.volume_delta":
+		result = factor.VolumeDelta(a, inputs[1])
+	case "ts.cvd":
+		result = factor.CVD(a, inputs[1])
+	case "ts.rolling_cvd":
+		result = factor.RollingCVD(a, inputs[1], period)
+	case "ts.taker_buy_ratio":
+		result = factor.TakerBuyRatio(a, inputs[1], period)
+	case "ts.parkinson_vol":
+		result = factor.ParkinsonVol(a, inputs[1], period)
+	case "ts.garman_klass_vol":
+		result = factor.GarmanKlassVol(a, inputs[1], inputs[2], inputs[3], period)
+	case "ts.yang_zhang_vol":
+		result = factor.YangZhangVol(a, inputs[1], inputs[2], inputs[3], period)
 	case "ts.highest":
 		result = factor.Highest(a, period)
 	case "ts.lowest":

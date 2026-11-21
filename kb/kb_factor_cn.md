@@ -146,10 +146,14 @@ expressions:
 
 ### 2.2 语法与函数
 
-运算 `+ - * /`、比较 `> >= < <=`（优先级 `* /` > `+ -` > `> >= < <=`，左结合）、一元 `+ -`、括号；数字十进制（可科学计数法 `1e-8`），无下划线/十六进制；无 `%`、`**`、`&&`/`||`；字符串仅用于 `field`/`group.demean/zscore`。窗口参数为整数常数（可带符号）或 `param.name`（不能写 `param.window+1`），范围 [1,10000]（`ts.skew` 为 [3,10000]，`ts.kurt` 为 [4,10000]），`ts.lag` 另允许 0。
+运算 `+ - * /`、比较 `> >= < <=`（优先级 `* /` > `+ -` > `> >= < <=`，左结合）、一元 `+ -`、括号；数字十进制（可科学计数法 `1e-8`），无下划线/十六进制；无 `%`、`**`、`&&`/`||`；字符串仅用于 `field`/`group.demean/zscore`。窗口参数为整数常数（可带符号）或 `param.name`（不能写 `param.window+1`），范围 [1,10000]（`ts.hma`/`ts.chop`/`ts.yang_zhang_vol` 为 [2,10000]，`ts.skew` 为 [3,10000]，`ts.kurt` 为 [4,10000]，`ts.hurst` 为 [8,10000]），`ts.lag` 另允许 0。
 
 - 逐点：`positive(x)`（x>0 取 x 否则无效，**不做下界截断**）、`sign(x)`（>0→1，<0→-1，==0→0）、`clip(x,lo,hi)`（有限常数或 `param.name` 且 `lo<=hi`，钳制有效值到 `[lo,hi]`）、`abs log sqrt (x)`、`pow min max (a,b)`、比较 `a > b`/`a >= b`/`a < b`/`a <= b` 或 `gt ge lt le (a,b)`（真输出 `1.0`，假输出 `0.0`）、条件选择 `where(cond,a,b)` / `if_else(cond,a,b)`（`cond` 有效且 `cond > 0` 时取 `a`，否则取 `b`；**`cond` 有效时仅要求被选中的分支有效**，故 `where(x > 0, log(x), 0)` 在 `x <= 0` 时安全返回 `0`；`cond` 无效则传播 `cond` 的无效原因）。
-- 时序（x,y 为输入；n 窗口）：`ts.lag(x,n)`（n=0 原样返回，不计入窗口规则）、`ts.return(x,n)`=x_t/x_{t-n}-1、`ts.ema/sma/rma/wma(x,n)`（指数/简单/Wilder/加权，wma 最新权重 n）、`ts.decay_linear(x,n)`（`ts.wma(x,n)` 别名）、`ts.std(x,n,ddof)`（整数 `0≤ddof<n`）、`ts.corr(x,y,n)`（Pearson 滚动相关，任一方差为 0 输出 0）、`ts.cov(x,y,n)`（滚动总体协方差）、`ts.beta(y,x,n)`（`Cov(y,x)/Var(x)`，Var(x)=0 输出 0）、`ts.sum(x,n)`、`ts.product(x,n)`、`ts.rank(x,n)`（过去 n 个有效样本内的 `[0,1]` 归一化平均分位排名，n=1 返回 `0.5`）、`ts.zscore(x,n)`（`(x-SMA)/StdDev(x,n,0)`，标准差为 0 输出 0）、`ts.argmax/argmin(x,n)`（极值距当前的偏移 `0..n-1`，0 表示当前最新值为极值，对齐 `HighestBar/LowestBar`）、`ts.skew(x,n)`（无偏样本偏度，要求 `n≥3`，标准差为 0 输出 0）、`ts.kurt(x,n)`（无偏样本超额峰度，要求 `n≥4`，标准差为 0 输出 0）、`ts.slope(x,n)`（对 `0..n-1` 的 OLS 斜率）、`ts.rsquare(x,n)`（拟合优度 `R²∈[0,1]`，方差为 0 输出 0）、`ts.rsi(x,n)`（Wilder，0–100）、`ts.roc(x,n)`（百分比，×100）、`ts.mom(x,n)`（与 n 个有效样本前的差）、`ts.cci(x,n)`、`ts.highest/lowest(x,n)`、`ts.vwma(c,v,n)`、`ts.tr(h,l,c)`（首个有效前收为预热）、`ts.atr(h,l,c,n)`（Wilder）、`ts.stoch(h,l,c,n)`（原始 %K 无 D 平滑）、`ts.willr(h,l,c,n)`（-100–0）、`ts.obv(c,v)`（首值取首个有效 volume，相等收盘不变）、`ts.mfi(h,l,c,v,n)`、`ts.macd/macd_signal/macd_hist(x,f,s,g)`（f<s，f/s/g∈[1,10000]）、`ts.bbands_upper/middle/lower(x,n,up,down)`（总体标准差，倍数非负且显式）。
+- 时序（x,y 为任意标量节点，包含 `cs.*`/`group.*` 阶段输出；n 窗口；多字段 OHLC/OHLCV/订单流函数既可显式传字段节点，也可在存在 `kline` 绑定时省略字段参数自动读取 `kline.{open,high,low,close,volume,buy_volume}`）：
+  - 基础与滚动统计：`ts.lag(x,n)`（n=0 原样返回）、`ts.return(x,n)`=x_t/x_{t-n}-1、`ts.std(x,n,ddof)`（整数 `0≤ddof<n`）、`ts.corr(x,y,n)`（Pearson 相关，任一方差为 0 输出 0）、`ts.cov(x,y,n)`（总体协方差）、`ts.beta(y,x,n)`（`Cov(y,x)/Var(x)`，Var(x)=0 输出 0）、`ts.sum(x,n)`、`ts.product(x,n)`、`ts.rank(x,n)`（`[0,1]` 归一化分位排名，n=1 返回 `0.5`）、`ts.zscore(x,n)`（标准差为 0 输出 0）、`ts.argmax/argmin(x,n)`（极值距当前偏移 `0..n-1`，0 为当前最新值）、`ts.skew(x,n)`（`n≥3`）、`ts.kurt(x,n)`（`n≥4`）、`ts.slope(x,n)`、`ts.rsquare(x,n)`（`R²∈[0,1]`）、`ts.highest/lowest(x,n)`。
+  - 均线、自适应滤波与分形：`ts.ema/sma/rma/wma(x,n)`、`ts.decay_linear(x,n)`（同 `ts.wma`）、`ts.dema(x,n)`、`ts.tema(x,n)`、`ts.hma(x,n)`（`n≥2`）、`ts.trima(x,n)`、`ts.er(x,n)`（Kaufman 效率比）、`ts.kama(x,n)` 或 `ts.kama(x,n,fast,slow)`（`fast<slow`）、`ts.alma(x,n)`（缺省 `offset=0.85, sigma=6.0`）或 `ts.alma(x,n,offset,sigma)`（`offset∈[0,1], sigma>0`）、`ts.kalman1d(x,process_noise,meas_noise)`（噪声参数 `>0`）、`ts.hurst(x,n)`（R/S Hurst 指数 `∈[0,1]`，`n≥8`）。
+  - 动量、方向、趋势与通道：`ts.rsi(x,n)`（Wilder，0–100）、`ts.roc(x,n)`（百分比 ×100）、`ts.mom(x,n)`、`ts.cci(x,n)`、`ts.macd/macd_signal/macd_hist(x,f,s,g)`（`f<s`）、`ts.stc(x,fast,slow,cycle)`（`fast<slow`）、`ts.bbands_upper/middle/lower(x,n,up,down)`（`up,down≥0`）、`ts.tr(h,l,c)`、`ts.atr(h,l,c,n)`、`ts.natr(h,l,c,n)`（`100*ATR/c`）、`ts.stoch(h,l,c,n)`、`ts.willr(h,l,c,n)`（-100–0）、`ts.adx(h,l,c,n)`、`ts.dmi_plus/dmi_minus(h,l,c,n)`（别名 `ts.plus_di/minus_di`）、`ts.chop(h,l,c,n)`（Choppiness，`n≥2`）、`ts.aroon_up/aroon_down/aroon_osc(h,l,n)`、`ts.vortex_plus/vortex_minus(h,l,c,n)`、`ts.donchian_upper/donchian_mid/donchian_lower(h,l,n)`（`donchian_middle` 别名）、`ts.keltner_upper/keltner_mid/keltner_lower(h,l,c,n,mult)`（`mult≥0`，`keltner_middle` 别名）、`ts.supertrend/supertrend_dir(h,l,c,n,mult)`（`mult>0`，方向 `+1/-1`）、`ts.sar(h,l,start,inc,max)` 或 `ts.sar(h,l)`（缺省 `0.02,0.02,0.2`，`max≥start>0, inc>0`）、`ts.ichimoku_conversion/ichimoku_base(h,l,n)`（Tenkan/Kijun）。
+  - 成交量、K 线原生订单流与 OHLC 波动率：`ts.vwma(c,v,n)`、`ts.obv(c,v)`、`ts.mfi(h,l,c,v,n)`、`ts.cmf(h,l,c,v,n)`、`ts.adl(h,l,c,v)`、`ts.adosc(h,l,c,v,fast,slow)`（别名 `ts.chaikin_osc`，`fast<slow`）、`ts.volume_delta(v,buy_v)`（`2*buy_volume - volume`）、`ts.cvd(v,buy_v)`（累计净主动买量）、`ts.rolling_cvd(v,buy_v,n)`、`ts.taker_buy_ratio(v,buy_v,n)`（`sum(buy_volume)/sum(volume)∈[0,1]`；`kline` 绑定下可直接写 `ts.volume_delta()` / `ts.rolling_cvd(n)` / `ts.taker_buy_ratio(n)`）、`ts.parkinson_vol(h,l,n)`、`ts.garman_klass_vol(o,h,l,c,n)`、`ts.yang_zhang_vol(o,h,l,c,n)`（`n≥2`）。
 - 截面：`cs.rank(x)`（升序名次，0 起，并列平均，非百分位）、`cs.pct_rank(x)`（归一化截面排名 `[0,1]`：有效参考标的数 `M>1` 时为 `rank/(M-1)`，`M==1` 时为 `0.5`）、`cs.zscore(x)`（总体标准差；全同输出 0）、`cs.robust_zscore(x)`=(x−中位数)/(1.4826·MAD)（MAD=0 输出 0）、`cs.winsorize(x,tail)`（tail∈[0,0.5)，上下界为参考池插值分位数）、`cs.mad_winsorize(x,k)`（中位数 ± k·1.4826·MAD，k>0；MAD=0 全截到中位数）、`cs.quantile(x,q)`（q∈[0,1]；**输出截面常数**，参考池 q 分位广播，只适合阈值/分组，不能排名）、`cs.mean(x)` / `cs.sum(x)`（参考池有效样本的算术均值 / 总和广播为**截面常数**；如全市场趋势宽度 `cs.mean(kline.close > ts.sma(kline.close, 200))` ∈ `[0,1]` 或等权指数收益 `cs.mean(ts.return(kline.close, 1))`）。
 - 回归/分组：`group.residual(y,x)`（单变量截面 OLS 残差含截距，参考池拟合，需 ≥2 个有效对）、`group.ols(y,x1,...)`（多元，至少一个暴露）、`group.wls(y,w,x1,...)`（权重须正且有效）、`group.demean(x,"alias","field")` / `group.zscore(...)`（按分类字段组内去均值/z-score（总体标准差）；字段原始类型/NULL 保留，经 binding 采样；缺字段=Missing，NULL=Null）。
 
@@ -352,12 +356,23 @@ func Constant(v float64, tf string) *Node
 func Add/Sub/Mul/Div/Pow/Min/Max/Gt/Ge/Lt/Le(a, b *Node) *Node
 func Neg/Abs/Log/Sqrt/Positive/Sign(x *Node) *Node; Clip(x *Node, lo, hi float64) *Node
 func Where(cond, thenNode, elseNode *Node) *Node
-func Lag/Return/EMA/SMA/RMA/WMA/DecayLinear/RSI/ROC/MOM/CCI/Highest/Lowest(x *Node, period int) *Node
+func Lag/Return/EMA/SMA/RMA/WMA/DecayLinear/DEMA/TEMA/HMA/KAMA/TRIMA/ER/Hurst/RSI/ROC/MOM/CCI/Highest/Lowest(x *Node, period int) *Node
+func KAMABy(x *Node, period, fast, slow int) *Node; ALMA(x *Node, period int, offset, sigma float64) *Node
+func Kalman1D(x *Node, processNoise, measNoise float64) *Node; STC(x *Node, fast, slow, cycle int) *Node
 func TsSum/TsProduct/TsRank/TsZScore/TsArgMax/TsArgMin/TsSkew/TsKurt/TsSlope/TsRSquare(x *Node, period int) *Node
 func TsCorr/TsCov(x, y *Node, period int) *Node; TsBeta(y, x *Node, period int) *Node
 func StdDev(x *Node, period, ddof int) *Node
-func VWMA(p, v *Node, period int) *Node; ATR(h,l,c *Node, period int); Stoch/WillR(h,l,c *Node, period int)
-func TR(h,l,c *Node) *Node; OBV(c,v *Node) *Node; MFI(h,l,c,v *Node, period int) *Node
+func VWMA(p, v *Node, period int) *Node; OBV(c, v *Node) *Node
+func VolumeDelta/CVD(v, buyV *Node) *Node; RollingCVD/TakerBuyRatio(v, buyV *Node, period int) *Node
+func TR(h, l, c *Node) *Node; ATR/NATR/Stoch/WillR/ADX/PlusDI/MinusDI/CHOP/VortexPlus/VortexMinus(h, l, c *Node, period int) *Node
+func DMI(h, l, c *Node, period int) (plusDI, minusDI, adx *Node); Vortex(h, l, c *Node, period int) (plus, minus *Node)
+func AroonUp/AroonDown/AroonOsc/DonchianUpper/DonchianMid/DonchianLower/IchimokuConversion/IchimokuBase/ParkinsonVol(h, l *Node, period int) *Node
+func Aroon(h, l *Node, period int) (up, down, osc *Node); Donchian(h, l *Node, period int) (upper, middle, lower *Node)
+func KeltnerUpper/KeltnerMid/KeltnerLower/Supertrend/SupertrendDir(h, l, c *Node, period int, mult float64) *Node
+func Keltner(h, l, c *Node, period int, mult float64) (upper, middle, lower *Node)
+func SAR(h, l *Node, start, inc, max float64) *Node
+func ADL(h, l, c, v *Node) *Node; MFI/CMF(h, l, c, v *Node, period int) *Node; ChaikinOsc/ADOSC(h, l, c, v *Node, fast, slow int) *Node
+func GarmanKlassVol/YangZhangVol(o, h, l, c *Node, period int) *Node
 func MACD(x *Node, fast, slow, signal int) (line, signalLine, hist *Node)
 func BBands(x *Node, period int, stdUp, stdDown float64) (upper, middle, lower *Node)
 func Rank/PctRank/ZScore/RobustZScore/CsMean/CsSum(x *Node) *Node
