@@ -25,6 +25,10 @@ Command `banbot <cmd> --config x.yml` (`--config` is repeatable; `--config-data`
   - Anchor constants (minutes from `00:00 UTC`): `UTC0Minutes=0`, `AsiaOpenMinutes=0`, `AsiaCloseMinutes=480`(`08:00`), `LondonOpenMinutes=420`(`07:00`), `LondonCashOpenMinutes=480`(`08:00`), `LondonCloseMinutes=960`(`16:00`), `NYKillzoneOpenMinutes=720`(`12:00`), `NewYorkOpenMinutes=810`(`13:30`), `USCashCloseMinutes=1200`(`20:00`), `NewYorkCloseMinutes=1260`(`21:00`), `CMEOpenMinutes=1380`(`23:00`), `CMECloseMinutes=1320`(`22:00`).
   - Predefined windows (`btime.UTCSessionWindow{Name, StartMin, EndMin}`, methods `.Contains(ms)`/`.DurationMinutes()`): `SessionUTC0`, `SessionAsia`(`00:00–08:00`), `SessionLondon`(`07:00–16:00`), `SessionNewYork`(`13:30–21:00`), `SessionUSCash`(`13:30–20:00`), `SessionCME`(`23:00–22:00` cross-midnight), `KillzoneAsia`(`00:00–04:00`), `KillzoneLondon`(`07:00–10:00`), `KillzoneNewYork`(`12:00–15:00`), `KillzoneLondonExit`(`15:00–17:00`).
   - Functions: `btime.InUTCWindow(ms, startMin, endMin) bool` (half-open `[startMin, endMin)`, wraps across midnight when `startMin > endMin`); `btime.SessionDayIndex(ms, anchorMinutesUTC) int64` (Euclidean floor division for any anchor trading day); `btime.SessionStartMS(ms, anchorMinutesUTC) int64`; `btime.MinutesIntoSession(ms, anchorMinutesUTC) int` (`[0, 1439]`); `btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, closeMinutesUTC) bool` (timeframe-adaptive EOD flatten check across `<1d` bars, supporting negative buffers like `-15`=`23:45 UTC`; returns `false` for `>=1d`).
+- **UTC Calendar, Seasonality, Turn-of-Month, Expiry & Cross-Timeframe DCA Primitives (`github.com/banbox/banbot/btime`)**:
+  - Calendar decomposition & month boundaries (zero-allocation, leap-year aware): `btime.UTCCalendarParts(ms) (year int, month time.Month, day int, weekday time.Weekday, hour, minute int)`, `btime.IsLeapYearUTC(year) bool`, `btime.DaysInMonthUTC(year, month) int`, `btime.DaysFromMonthStartUTC(ms) int` (`0` on the 1st), `btime.DaysBeforeMonthEndUTC(ms) int` (`0` on the last day of the month, e.g. Feb 28/29 or Mar 31), `btime.IsTurnOfMonthUTC(ms, lastNDays, firstMDays) bool` (Turn-of-Month window covering the last `lastNDays` or first `firstMDays` calendar days).
+  - Weekdays, week-of-month & monthly settlement/expiry: `btime.DayOfWeekUTC(ms) int` (`0=Sunday..6=Saturday`), `btime.ISODayOfWeekUTC(ms) int` (ISO `1=Monday..7=Sunday`), `btime.WeekOfMonthUTC(ms) int` (`1..5` via `(day-1)/7+1`), `btime.NthWeekdayOfMonthUTC(year, month, weekday, n) int` & `btime.IsNthWeekdayOfMonthUTC(ms, weekday, n) bool` (e.g. `n=3, time.Friday` for US equity/CME monthly OPEX; returns `0`/`false` if absent), `btime.LastWeekdayOfMonthUTC(year, month, weekday) int` & `btime.IsMonthlyExpiryDayUTC(ms, weekday) bool` (e.g. `btime.IsMonthlyExpiryDayUTC(ms, time.Friday)` for crypto monthly/quarterly options & futures settlement on the last Friday).
+  - Seasonal month windows & timeframe-agnostic periodic triggers: `btime.InMonthRangeUTC(ms, startMonth, endMonth) bool` (`1..12` inclusive; wraps across year-end when `startMonth > endMonth`, e.g. `InMonthRangeUTC(ms, 11, 4)` for the Nov–Apr Halloween / "Sell in May" window); `btime.IsFirstBarOfPeriodUTC(prevBarMS, curBarMS, period) bool` (`period` supports `"day"`/`"week"`[UTC Monday]/`"month"`/`"quarter"`/`"year"`; track the previous `e.TimeStart` unconditionally in `s.More`, safely returns `false` when `prevBarMS <= 0` or out-of-order, and guarantees exactly one trigger per period across `5m/15m/1h/4h/1d/3d` without missing coarse bars that skip `day == 1` or `hour == 0`).
 
 ### 1.2 Symbols and Markets
 - Symbols: spot `BASE/QUOTE`, contract `BASE/QUOTE:SETTLE` (delivery contracts carry an extra identifier segment). `core.SplitSymbol(pair) (base, quote, settle, id)`.
@@ -689,6 +693,13 @@ if rb, ok := s.RBreakerLevels(btime.UTC0Minutes); ok {
 		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_long", Dirt: core.OdDirtShort})
 		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_long", StopLoss: rb.SBreak})
 	}
+}
+
+// 5) Timeframe-safe Monthly DCA + Halloween Seasonal Filter (track prevMS unconditionally in s.More)
+prevMS := st.prevMS
+st.prevMS = e.TimeStart
+if !s.IsWarmUp && btime.IsFirstBarOfPeriodUTC(prevMS, e.TimeStart, "month") && btime.InMonthRangeUTC(e.TimeStart, 11, 4) {
+	s.OpenOrder(&strat.EnterReq{Tag: "monthly_dca_halloween"})
 }
 ```
 

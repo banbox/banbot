@@ -54,6 +54,7 @@
 | `btime/state.go` | `ClockState`：每 Runtime 时钟（回测为原子递增的模拟时间，实盘为 NTP 校正时间） |
 | `btime/main.go` | 旧包级时间函数（`Time/TimeMS/Now`，读写全局 `CurTimeMS`）、`ParseTimeMS`、`ToDateStr*`、`ToTime`、`init()` 设置 `time.Local=UTC` |
 | `btime/session_helpers.go` | UTC 虚拟交易日切与会话/Killzone 纯函数原语（`UTCSessionWindow`、`SessionUTC0/Asia/London/NewYork/USCash/CME`、`Killzone*`、`InUTCWindow`、`SessionDayIndex`、`SessionStartMS`、`MinutesIntoSession`、`IsNearSessionEnd`） |
+| `btime/calendar_helpers.go` | UTC 日历分解、闰年/月末月初（TOM）、周内/月内第 N 个星期几、月度交割日、季节性月份窗口与跨周期定投触发原语（`UTCCalendarParts`、`IsLeapYearUTC`、`DaysInMonthUTC`、`DaysFromMonthStartUTC`、`DaysBeforeMonthEndUTC`、`IsTurnOfMonthUTC`、`DayOfWeekUTC`、`ISODayOfWeekUTC`、`NthWeekdayOfMonthUTC`、`LastWeekdayOfMonthUTC`、`IsNthWeekdayOfMonthUTC`、`IsMonthlyExpiryDayUTC`、`WeekOfMonthUTC`、`InMonthRangeUTC`、`IsFirstBarOfPeriodUTC`） |
 | `btime/common.go` | `RetryWaits`：按 key 的指数退避等待表 |
 | `com/price_state.go` | `PriceState`：bid/ask/bar 价格表、过期判断、基于 `SymbolParser` 的基础币映射 |
 | `com/price.go` | 旧版价格门面（`GetPrice/SetPrice/...`）：按 exchange 懒绑定 `PriceState`，`init()` 初始化 |
@@ -116,6 +117,7 @@
 
 - **`ClockState`**（`btime/state.go`）：字段 `backtest`、`curTimeMS`（原子）、`locShow`。方法：`SetTimeMS`、`TimeMS`、`AdvanceMS`、`Time`、`Now`。非回测模式下 `TimeMS()` 返回 `UTCStamp()`（经 bntp 校正）。
 - **`UTCSessionWindow` 与日内会话原语**（`btime/session_helpers.go`）：预定义锚点分钟常量（`UTC0Minutes`、`AsiaOpenMinutes/AsiaCloseMinutes`、`LondonOpenMinutes/LondonCashOpenMinutes/LondonCloseMinutes`、`NYKillzoneOpenMinutes/NewYorkOpenMinutes/USCashCloseMinutes/NewYorkCloseMinutes`、`CMEOpenMinutes/CMECloseMinutes`）及会话窗口（`SessionUTC0`、`SessionAsia`、`SessionLondon`、`SessionNewYork`、`SessionUSCash`、`SessionCME`、`KillzoneAsia/London/NewYork/LondonExit`）。函数：`NormalizeDayMinutes`、`InUTCWindow(ms, startMin, endMin)`（半开区间，支持 `startMin > endMin` 跨午夜窗口）、`SessionDayIndex(ms, anchorMinutesUTC)`（欧几里得向下整除切分锚点交易日）、`SessionStartMS`、`MinutesIntoSession`、`MinutesOfDayUTC`、`IsNearSessionEnd(barStartMS, barStopMS, closeMinutesUTC)`（自适应小于 1d 的任意 K 线周期判定 `(barStartMS, barStopMS]` 跨越日终时刻，`>= 1d` 返回 false）。
+- **UTC 日历、季节性与跨周期定投原语**（`btime/calendar_helpers.go`）：基于外推格里高利历整数算术的零堆分配纯函数：`UTCCalendarParts(ms)`、`IsLeapYearUTC(year)`、`DaysInMonthUTC(year, month)`、`DaysFromMonthStartUTC(ms)`（1 日为 `0`）、`DaysBeforeMonthEndUTC(ms)`（当月最后一天为 `0`）、`IsTurnOfMonthUTC(ms, lastNDays, firstMDays)`、`DayOfWeekUTC(ms)`（`0=Sun..6=Sat`）、`ISODayOfWeekUTC(ms)`（`1=Mon..7=Sun`）、`WeekOfMonthUTC(ms)`（`1..5`）、`NthWeekdayOfMonthUTC(year, month, weekday, n)` / `IsNthWeekdayOfMonthUTC(ms, weekday, n)`、`LastWeekdayOfMonthUTC(year, month, weekday)` / `IsMonthlyExpiryDayUTC(ms, weekday)`、`InMonthRangeUTC(ms, startMonth, endMonth)`（`1..12` 闭区间，`startMonth > endMonth` 支持跨年季节窗口）、`IsFirstBarOfPeriodUTC(prevBarMS, curBarMS, period)`（支持 `"day"`/`"week"`[UTC 周一]/`"month"`/`"quarter"`/`"year"` 及其 `1d/1w/1M/1q/1y` 别名；`prevBarMS <= 0` 或非递增时间戳返回 `false`，跨周期精确每期触发一次）。
 - **`RetryWaits`**（`btime/common.go`）：`SetFail(key)` 返回下次可重试时间戳；`NextRetry`、`Reset`。等待表默认 `3s, 6s, 12s, 30s`。
 
 ### com

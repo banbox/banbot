@@ -25,6 +25,10 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
   - 锚点常量（距 `00:00 UTC` 分钟数）：`UTC0Minutes=0`、`AsiaOpenMinutes=0`、`AsiaCloseMinutes=480`(`08:00`)、`LondonOpenMinutes=420`(`07:00`)、`LondonCashOpenMinutes=480`(`08:00`)、`LondonCloseMinutes=960`(`16:00`)、`NYKillzoneOpenMinutes=720`(`12:00`)、`NewYorkOpenMinutes=810`(`13:30`)、`USCashCloseMinutes=1200`(`20:00`)、`NewYorkCloseMinutes=1260`(`21:00`)、`CMEOpenMinutes=1380`(`23:00`)、`CMECloseMinutes=1320`(`22:00`)。
   - 预定义窗口（`btime.UTCSessionWindow{Name, StartMin, EndMin}`，方法 `.Contains(ms)`/`.DurationMinutes()`）：`SessionUTC0`、`SessionAsia`(`00:00–08:00`)、`SessionLondon`(`07:00–16:00`)、`SessionNewYork`(`13:30–21:00`)、`SessionUSCash`(`13:30–20:00`)、`SessionCME`(`23:00–22:00` 跨午夜)、`KillzoneAsia`(`00:00–04:00`)、`KillzoneLondon`(`07:00–10:00`)、`KillzoneNewYork`(`12:00–15:00`)、`KillzoneLondonExit`(`15:00–17:00`)。
   - 函数：`btime.InUTCWindow(ms, startMin, endMin) bool`（半开区间 `[startMin, endMin)`，`startMin > endMin` 自动按跨午夜窗口判定）；`btime.SessionDayIndex(ms, anchorMinutesUTC) int64`（欧几里得向下整除切分任意锚点交易日）；`btime.SessionStartMS(ms, anchorMinutesUTC) int64`；`btime.MinutesIntoSession(ms, anchorMinutesUTC) int`（`[0, 1439]`）；`btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, closeMinutesUTC) bool`（自适应任意 `<1d` 周期判定本根 bar 到达或跨过日终清仓时刻，支持负偏移如 `-15`=`23:45 UTC`；`>=1d` 安全返回 `false`）。
+- **UTC 日历、季节性、月末月初、交割日与跨周期定投原语（`github.com/banbox/banbot/btime`）**：
+  - 日历分解与月末月初（零分配，自动兼容平/闰年与大小月）：`btime.UTCCalendarParts(ms) (year int, month time.Month, day int, weekday time.Weekday, hour, minute int)`、`btime.IsLeapYearUTC(year) bool`、`btime.DaysInMonthUTC(year, month) int`、`btime.DaysFromMonthStartUTC(ms) int`（当月 1 日为 `0`）、`btime.DaysBeforeMonthEndUTC(ms) int`（当月最后一天如 2 月 28/29 日或 3 月 31 日为 `0`）、`btime.IsTurnOfMonthUTC(ms, lastNDays, firstMDays) bool`（判断处于月末最后 `lastNDays` 天或月初前 `firstMDays` 天的 Turn-of-Month 窗口）。
+  - 星期、月内周次与月度交割日：`btime.DayOfWeekUTC(ms) int`（`0=Sunday..6=Saturday`）、`btime.ISODayOfWeekUTC(ms) int`（ISO `1=Monday..7=Sunday`）、`btime.WeekOfMonthUTC(ms) int`（`1..5`，按 `(day-1)/7+1`）、`btime.NthWeekdayOfMonthUTC(year, month, weekday, n) int` 与 `btime.IsNthWeekdayOfMonthUTC(ms, weekday, n) bool`（如 `n=3, time.Friday` 美股/CME 月度期权交割日；不存在返 `0`/`false`）、`btime.LastWeekdayOfMonthUTC(year, month, weekday) int` 与 `btime.IsMonthlyExpiryDayUTC(ms, weekday) bool`（如 `btime.IsMonthlyExpiryDayUTC(ms, time.Friday)` 判定加密市场每月最后一个周五期权/季度交割日）。
+  - 季节性月份窗口与跨周期定投触发：`btime.InMonthRangeUTC(ms, startMonth, endMonth) bool`（`1..12` 闭区间，`startMonth > endMonth` 自动跨年如 `InMonthRangeUTC(ms, 11, 4)` 表示 11 月至次年 4 月 Halloween 效应）；`btime.IsFirstBarOfPeriodUTC(prevBarMS, curBarMS, period) bool`（`period` 支持 `"day"`/`"week"`[UTC 周一]/`"month"`/`"quarter"`/`"year"`；在 `s.More` 中无条件维护上一根 `e.TimeStart` 传入，首根 `prevBarMS <= 0` 或乱序安全返回 `false`，在 `5m/15m/1h/4h/1d/3d` 任意周期上均保证每期精确触发一次，避免写死 `day == 1 && hour == 0` 在粗周期或非零点偏移时漏触发）。
 
 ### 1.2 品种与市场
 - 品种：现货 `BASE/QUOTE`，合约 `BASE/QUOTE:SETTLE`（交割另带标识段）。`core.SplitSymbol(pair) (base, quote, settle, id)`。
@@ -689,6 +693,13 @@ if rb, ok := s.RBreakerLevels(btime.UTC0Minutes); ok {
 		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_long", Dirt: core.OdDirtShort})
 		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_long", StopLoss: rb.SBreak})
 	}
+}
+
+// 5) 跨周期安全每月定投 + 月末月初(TOM) + 季节性窗口（st := s.More.(*jobState) 无条件维护 prevMS）
+prevMS := st.prevMS
+st.prevMS = e.TimeStart
+if !s.IsWarmUp && btime.IsFirstBarOfPeriodUTC(prevMS, e.TimeStart, "month") && btime.InMonthRangeUTC(e.TimeStart, 11, 4) {
+	s.OpenOrder(&strat.EnterReq{Tag: "monthly_dca_halloween"})
 }
 ```
 
