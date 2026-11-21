@@ -364,7 +364,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		}
 		return backtest.State{}
 	}
-	policy, err := newPolicyRun(c)
+	policy, err := newPolicyRun(c, combo.Columns...)
 	if err != nil {
 		return result, err
 	}
@@ -1027,6 +1027,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			frame, err := engine.evaluate(ctx, snapshot)
 			if err != nil {
 				return result, err
+			}
+			if policy != nil {
+				policy.observeSnapshot(c, plan, snapshot, visible, quotes, grid, now)
 			}
 			if c.SourceEventDecisions {
 				lastSourceGrid = grid

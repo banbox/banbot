@@ -158,7 +158,7 @@ func resolveDecisionPortfolio(c Config) (Config, error) {
 	if err := c.Manifest.Portfolio.ValidatePolicy(); err != nil {
 		return c, err
 	}
-	if c.Manifest.Portfolio.Policy != "" {
+	if c.Manifest.Portfolio.EffectivePolicy() != "" {
 		policyConfig, err := c.Manifest.Portfolio.PolicyConfig()
 		if err != nil {
 			return c, err
@@ -184,14 +184,14 @@ func resolveDecisionPortfolio(c Config) (Config, error) {
 		}
 		customBuilder = true
 	}
-	legacyBuilder := c.Manifest.Portfolio.Policy == "" || c.Manifest.Portfolio.Builder == "top-bottom-k-v1"
+	legacyBuilder := c.Manifest.Portfolio.EffectivePolicy() == "" || c.Manifest.Portfolio.Builder == "top-bottom-k-v1"
 	if !customBuilder && legacyBuilder && (c.Manifest.Portfolio.K <= 0 || c.Manifest.Portfolio.LongNotional+c.Manifest.Portfolio.ShortNotional <= 0) {
 		return c, errors.New("runner: top/bottom builder needs positive K and notional")
 	}
 	if c.PortfolioBuilder != nil && c.Manifest.Portfolio.Builder == "" {
 		return c, errors.New("runner: custom portfolio builder needs versioned manifest identity")
 	}
-	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Builder == "" && c.Manifest.Portfolio.Policy == "" {
+	if c.PortfolioBuilder == nil && c.Manifest.Portfolio.Builder == "" && c.Manifest.Portfolio.EffectivePolicy() == "" {
 		c.Manifest.Portfolio.Builder = "top-bottom-k-v1"
 	}
 	if !customBuilder && c.Manifest.Portfolio.Mode != factor.Full && c.Manifest.Portfolio.Mode != factor.Patch {

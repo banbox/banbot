@@ -119,12 +119,25 @@ const (
 	ExposureScaleOutput = "exposure_scale"
 	LongScaleOutput     = "long_scale"
 	ShortScaleOutput    = "short_scale"
+	VolatilityOutput    = "volatility"
+	BetaOutput          = "beta"
 )
 
 // IsExposureScaleOutput reports whether name is one of the reserved dynamic
 // regime exposure scaling columns ("exposure_scale", "long_scale", "short_scale").
 func IsExposureScaleOutput(name string) bool {
 	return name == ExposureScaleOutput || name == LongScaleOutput || name == ShortScaleOutput
+}
+
+// IsRiskOutput reports whether name is one of the default reserved risk columns
+// ("volatility", "beta") excluded from implicit equal-weight score combination.
+func IsRiskOutput(name string) bool {
+	return name == VolatilityOutput || name == BetaOutput
+}
+
+// IsReservedOutput reports whether name is a reserved exposure-scaling or risk column.
+func IsReservedOutput(name string) bool {
+	return IsExposureScaleOutput(name) || IsRiskOutput(name)
 }
 
 func frameScaleValue(frame Frame, universe Universe, name string) (float64, bool) {

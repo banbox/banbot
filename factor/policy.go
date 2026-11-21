@@ -34,26 +34,46 @@ type PortfolioEvidence struct {
 	PlanSequence uint64
 	Previous     *PortfolioTarget
 }
+// RiskReturnRow is one chronological cross-sectional return observation aligned across SIDs.
+type RiskReturnRow struct {
+	GridTime int64
+	Returns  map[int32]float64
+}
+
+// CovarianceMatrix supplies a point-in-time symmetric PSD covariance matrix for declared SIDs.
+type CovarianceMatrix struct {
+	SIDs   []int32
+	Matrix [][]float64
+}
+
+// SideRiskOptimizer computes nonnegative unit-sum weights (sum = 1, w_i >= 0) for one side's
+// ordered chosen SIDs given a positive-diagonal PSD covariance matrix and side-aligned scores.
+type SideRiskOptimizer func(method string, cov [][]float64, sideScores []float64, cfg AllocationConfig) ([]float64, error)
+
 type PortfolioContext struct {
-	Frame                Frame
-	Universe             Universe
-	Ideal                *TargetPortfolio
-	Spec                 PortfolioSpec
-	GridTime             int64
-	BarMillis            int64
-	ScoreName            string
-	Positions            map[int32]PositionEvidence
-	Marks                map[int32]float64
-	Groups               map[int32]string
-	Volatility           map[int32]float64
-	Beta                 map[int32]float64
-	AssetNames           map[int32]string
-	SIDMappingVersion    string
-	StateVersion         uint64
-	LedgerCursor         uint64
-	ForceExit            map[int32]string
-	Previous             *PortfolioTarget
-	PreserveIdealWeights bool
+	Frame                  Frame
+	Universe               Universe
+	Ideal                  *TargetPortfolio
+	Spec                   PortfolioSpec
+	GridTime               int64
+	BarMillis              int64
+	ScoreName              string
+	Positions              map[int32]PositionEvidence
+	Marks                  map[int32]float64
+	Groups                 map[int32]string
+	Volatility             map[int32]float64
+	Beta                   map[int32]float64
+	ReturnHistory          []RiskReturnRow
+	Covariance             *CovarianceMatrix
+	AutoVolatilityFallback bool
+	RiskOptimizer          SideRiskOptimizer
+	AssetNames             map[int32]string
+	SIDMappingVersion      string
+	StateVersion           uint64
+	LedgerCursor           uint64
+	ForceExit              map[int32]string
+	Previous               *PortfolioTarget
+	PreserveIdealWeights   bool
 	// Visible rule products are below explicit by_asset overrides. Callers
 	// must freeze only PIT-visible versions in this read-only context.
 	HoldingRules        map[int32]HoldingRule
@@ -108,6 +128,20 @@ func ClonePortfolioContext(c PortfolioContext) PortfolioContext {
 	c.Groups = maps.Clone(c.Groups)
 	c.Volatility = maps.Clone(c.Volatility)
 	c.Beta = maps.Clone(c.Beta)
+	if len(c.ReturnHistory) > 0 {
+		rows := make([]RiskReturnRow, len(c.ReturnHistory))
+		for i, r := range c.ReturnHistory {
+			rows[i] = RiskReturnRow{GridTime: r.GridTime, Returns: maps.Clone(r.Returns)}
+		}
+		c.ReturnHistory = rows
+	}
+	if c.Covariance != nil {
+		mat := make([][]float64, len(c.Covariance.Matrix))
+		for i, row := range c.Covariance.Matrix {
+			mat[i] = slices.Clone(row)
+		}
+		c.Covariance = &CovarianceMatrix{SIDs: slices.Clone(c.Covariance.SIDs), Matrix: mat}
+	}
 	c.AssetNames = maps.Clone(c.AssetNames)
 	c.ForceExit = maps.Clone(c.ForceExit)
 	c.HoldingRules = maps.Clone(c.HoldingRules)
@@ -482,6 +516,9 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 	if c.BarMillis <= 0 {
 		return PortfolioProposal{}, errors.New("factor: positive base bar required")
 	}
+	if !c.RiskOnly {
+		PopulateContextRiskFromFrame(&c, p.config.Allocation)
+	}
 	for _, rule := range c.HoldingRules {
 		if err := validateHolding(rule); err != nil {
 			return PortfolioProposal{}, err
@@ -624,12 +661,22 @@ func (p *LifecyclePolicy) Propose(c PortfolioContext, raw json.RawMessage) (Port
 			scores[v.sid] = v.score
 		}
 		if !c.PreserveIdealWeights {
-			desired, err = AllocateSelected(desired, cfg, c.Spec.Budget.NAV, scores, c.Volatility)
+			desired, err = AllocateSelectedContext(desired, cfg, c, scores)
 			if err != nil {
 				return PortfolioProposal{}, err
 			}
 		}
+		var beforeSIDs []int32
+		if !c.PreserveIdealWeights && cfg.Allocation.Method != "equal" && (cfg.Selection.RetainRank > 0 || cfg.Selection.Dropout > 0) {
+			beforeSIDs = mapSIDs(desired)
+		}
 		p.applyRetention(c, s, desired, cfg)
+		if beforeSIDs != nil && !slices.Equal(beforeSIDs, mapSIDs(desired)) {
+			desired, err = AllocateSelectedContext(desired, cfg, c, scores)
+			if err != nil {
+				return PortfolioProposal{}, err
+			}
+		}
 	}
 	targets := map[int32]Allocation{}
 	for sid, a := range s.Assets {

@@ -268,7 +268,7 @@ func (p *LifecyclePolicy) proposeCohort(c PortfolioContext, s LifecycleState, du
 		}
 		var err error
 		if !c.PreserveIdealWeights {
-			selected, err = AllocateSelected(selected, cfg, c.Spec.Budget.NAV, scores, c.Volatility)
+			selected, err = AllocateSelectedContext(selected, cfg, c, scores)
 			if err != nil {
 				return PortfolioProposal{}, err
 			}

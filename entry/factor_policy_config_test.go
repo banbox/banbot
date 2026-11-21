@@ -121,3 +121,59 @@ func TestYAMLScoreGateZeroPointerAndBreadthExpressions(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestYAMLRiskAllocationMethodsWithoutExplicitPolicy(t *testing.T) {
+	for _, allocBlock := range []string{
+		"allocation: {method: inverse-volatility, risk_window: 4}",
+		"allocation: {method: erc, risk_window: 4}",
+		"allocation: {method: risk-parity, risk_window: 4, shrinkage: 0.1}",
+		"allocation: {method: hrp, risk_window: 4}",
+		"allocation: {method: min-variance, risk_window: 4}",
+		"allocation: {method: mean-variance, risk_window: 4, risk_aversion: 1.5}",
+	} {
+		t.Run(allocBlock, func(t *testing.T) {
+			_, path := factorYAMLFixture(t)
+			raw, _ := os.ReadFile(path)
+			yamlText := strings.Replace(string(raw), "      archive: data.gob", "      archive: data.gob\n      portfolio:\n        long_notional: 1\n        short_notional: 0\n        "+allocBlock, 1)
+			if err := os.WriteFile(path, []byte(yamlText), 0600); err != nil {
+				t.Fatal(err)
+			}
+			spec, err := loadFactorYAMLSpec([]string{path})
+			if err != nil {
+				t.Fatalf("loadFactorYAMLSpec failed: %v", err)
+			}
+			configs, err := buildFactorConfigs(spec, runner.Weights)
+			if err != nil {
+				t.Fatalf("buildFactorConfigs failed: %v", err)
+			}
+			res, err := runner.Run(context.Background(), configs[0], nil, nil)
+			if err != nil || res.TargetsAccepted == 0 {
+				t.Fatalf("YAML risk allocation run failed: res=%+v err=%v", res, err)
+			}
+		})
+	}
+
+	for _, invalidAlloc := range []string{
+		"allocation: {method: bogus}",
+		"allocation: {method: hrp, risk_window: 1}",
+		"allocation: {method: hrp, shrinkage: 1.5}",
+		"allocation: {method: mean-variance, risk_aversion: -0.5}",
+		"allocation: {method: hrp, risk_aversion: 2.0}",
+	} {
+		t.Run("invalid_"+invalidAlloc, func(t *testing.T) {
+			_, path := factorYAMLFixture(t)
+			raw, _ := os.ReadFile(path)
+			yamlText := strings.Replace(string(raw), "      archive: data.gob", "      archive: data.gob\n      portfolio:\n        "+invalidAlloc, 1)
+			if err := os.WriteFile(path, []byte(yamlText), 0600); err != nil {
+				t.Fatal(err)
+			}
+			spec, err := loadFactorYAMLSpec([]string{path})
+			if err == nil {
+				_, err = buildFactorConfigs(spec, runner.Weights)
+			}
+			if err == nil {
+				t.Fatalf("expected invalid YAML allocation %q to fail", invalidAlloc)
+			}
+		})
+	}
+}

@@ -72,7 +72,7 @@ Events 归档回放最小示例：`execution: {mode: events, funding_policy: exp
 
 `method`（`equal|fixed|history-ic|history-rank-ic|history-icir|history-rank-icir|history-ewma`）、`columns`、`weights`（map，`fixed` 必填且覆盖全部 columns）、`label`、`min_samples`、`min_pairs`、`min_confidence`、`decay`（EWMA alpha，[0,1]，0 视为 0.2）、`direction`（`signed|positive`）、`fallback`（`equal|fixed|error`）。
 
-- `columns` 不得重复且须是输出名；**`expressions.combine` 可省 columns（默认除 `exposure_scale`/`long_scale`/`short_scale` 保留敞口缩放列外的全部输出），外层 `combo` 必须写（缺则 `expression combine requires columns`）**（外层 `combo.method` 非空时整体覆盖内层）。
+- `columns` 不得重复且须是输出名；**`expressions.combine` 可省 columns（默认除 `exposure_scale`/`long_scale`/`short_scale`/`volatility`/`beta` 及 `allocation.volatility_column`/`beta_column` 保留列外的全部输出），外层 `combo` 必须写（缺则 `expression combine requires columns`）**（外层 `combo.method` 非空时整体覆盖内层）。
 - `equal`：列等权；`fixed`：权重直接线性相加，允许负数，不归一化。非零权重列对某资产无效 → 该资产分数无效，不重分配；零权重列不影响有效性。
 - 历史方法只用已成熟、决策时可见、`DecisionTime<asof` 的 IC 样本（窗口保留最近 256 个截面，样本须 ≥2 对；`min_pairs` 可提高）；`rank` 变体用 RankIC，`icir` 用 mean/std，`ewma` 用 `decay`；`min_samples` 至少 1；`min_confidence` 为 |均值|/标准误 门槛（需 ≥2 样本、均值非 0，无多重检验校正，重叠样本 ICIR 仅描述性）；`direction: positive` 把负权重截为 0；权重按 Σ|w|=1 归一；无合格历史按 `fallback`：`equal`（默认，诊断 `ic-equal-fallback`）、`fixed`（用 `weights`）、`error`。
 - 历史方法必须有标签（`research.labels` 非空）；多标签省略 `label` 取最短 horizon（同期限按名称），`label` 须已声明。
@@ -187,7 +187,7 @@ expressions:
 | `long_min_score` / `short_max_score` | 可选绝对分数门控（区分未设与显式 `0`）：多头仅选 `score >= long_min_score`，空头仅选 `score <= short_max_score`（双动量常用 `long_min_score: 0`） |
 | `unfilled_slot_policy` / `asset_cap` | 通过门控数 `m < K` 时：`cash`（默认，每标的分 `notional/K`，未满槽位留现，`m==0` 清仓为空仓现金）或 `rescale`（集中分配到 `m` 个标的，单标的上限 `asset_cap`） |
 | `mode` | `full`（默认；本策略旧目标中省略的资产归零）或 `patch`（省略保留，显式 0 才清仓） |
-| `policy` | 缺省空（旧路径）；`lifecycle-v1` 或自定义 `name-vN`；`rebalance/selection/holding/transition/allocation/policy_params` **要求显式 `policy`**，否则报 `lifecycle fields require an explicit policy` |
+| `policy` | 缺省空（纯 top/bottom-K 路径）；配置 `rebalance/selection/holding/transition/allocation` 子块且无 `policy_params` 时自动提升为 `lifecycle-v1`；自定义 `name-vN`（配 `policy_params` 须显式声明 `policy`） |
 | `policy_params` | 自定义策略的有效 JSON（有界） |
 
 `TargetPortfolio` 是理想权重；`PortfolioTarget` 可混合 NAV 权重和绝对数量（`AbsoluteQuantity`，标准资产数量非合约张数，有符号十进制字符串）。
@@ -222,7 +222,8 @@ expressions:
 - `on_reselect`：`restore`（补回理想份额）|`resume`（保留当前较小份额）|`finish`（继续原退出）|`new-cohort`；仅 linear-exit/geometric 可写。`by_asset`：`exit_steps`（linear-exit）或 `ratio`（geometric，[0,1)）的每资产覆盖，其它模式不允许。
 - 字段与 mode 不匹配（如 `alpha` 用于 linear-exit、`basis` 用于 direct/cohort/target-step）预检失败。
 
-**allocation**：`method`：`equal`（缺省）|`score`|`fixed-notional`（`fixed_notional>0`，仅此可写）|`inverse-volatility`|`vol-target`（`vol_target>0`，仅此可写）。通用：`reserve_ratio∈[0,1)`、`asset_cap`、`group_caps`（分组需 `Config.PolicyContext` 注入）、`turnover_limit`（限调仓金额不限持仓数，强制风险退出绕过）、`net_cap`、`beta_cap`（后两者需 beta/分组证据，均 ≥0）。inverse-volatility 与 vol-target 需注入 `Volatility`（不取同名因子列）。
+**allocation**：`method`：`equal`（缺省）|`score`|`fixed-notional`（`fixed_notional>0`，仅此可写）|`inverse-volatility`|`vol-target`（`vol_target>0`，仅此可写）|`erc`（别名 `risk-parity`，等风险贡献 Equal Risk Contribution）|`hrp`（层次风险平价 Hierarchical Risk Parity）|`min-variance`（多头入选集最小方差，空头同构取负）|`mean-variance`（Markowitz 均值-方差，以入选集标准化分数为预期收益、`risk_aversion` 默认 `1.0` 仅此可写）。风险/协方差参数：`volatility_column`（默认 `volatility`）、`beta_column`（默认 `beta`）、`risk_window`（滚动收益窗口，整数 `[2,10000]`，缺省 `20`）、`shrinkage`（协方差非对角收缩率 `[0,1]`，缺省 `0`，秩亏时自动 `0.05` 正定化）。通用：`reserve_ratio∈[0,1)`、`asset_cap`、`group_caps`（分组需 `Config.PolicyContext` 注入）、`turnover_limit`（限调仓金额不限持仓数，强制风险退出绕过）、`net_cap`、`beta_cap`（均 ≥0）。
+- 风险数据自动绑定与零代码兜底：若策略输出含保留列 `volatility` / `beta`（或 `volatility_column` / `beta_column`），自动从默认 `Combine.Columns` 排除并绑定到 `PortfolioContext.Volatility` / `Beta`（`Config.PolicyContext` 可覆盖）；若未显式输出风险列，`runner` 自动基于严格 PIT 决策网格收盘价回看 `risk_window` 计算滚动波动率、市场 Beta 与对齐收益率矩阵，协方差样本不足 `risk_window` 预热时优雅回退为 `inverse-volatility` 或 `equal`。
 
 ### 4.3 生命周期语义要点
 
@@ -251,7 +252,7 @@ func RegisterRiskPortfolioBuilder(name string, config RiskBuilderConfig) error
 - 类型：`Frame{GridTime, SnapshotID, PlanHash, DecisionTime, Values map[列名]map[SID]Numeric}`（含输出列与合成列 `score`）；`Universe{Version, Investable, Reference, Tradable, Evaluation, Tracked []int32, Static}`；`Numeric{Value, Validity}`（`valid missing null not-numeric non-finite warmup`）；`Diagnostic{Code, Detail}`；`PortfolioSpec` 含 StrategyID/AccountID/DecisionTime/ExecutableAt/ExpireAt/Budget{Version,Currency,NAV}/Mode 等。
 - `PortfolioContext` 含 Frame、Universe、Ideal、Spec、ScoreName、Positions(`map[SID]PositionEvidence{Quantity,PendingQuantity,FirstFillTime,FillEvents..}`)、Marks、Groups、Volatility、Beta、AssetNames、ForceExit、Previous、HoldingRules、TransitionRules、RebalanceDue、CapitalLimit 等；`PortfolioProposal{Target, NextState, Reasons, AcceptanceID, ReconcileSIDs, PlanSequence, DecisionTime, ExpireAt}`。
 - `TargetPortfolio`：`NewTargetPortfolio(spec, targets)`、`Spec/ID/Targets/EffectiveTargets(prev)/Notional(sid)`。`PortfolioTarget`：`NewPortfolioTarget(spec, map[SID]Allocation)`；`Allocation{Basis: nav-fraction|absolute-quantity, Value string}`；`Allocations()`、`AsWeightPortfolio()`（数量目标报错）、`PortfolioTargetFromWeights`、`EffectiveAllocations(prev)`。
-- 生命周期：`factor.SelectPortfolio(frame, universe, spec, cfg)`、`SelectPortfolioScore(..., scoreName, groups)`、`AllocateSelected(selected, cfg, nav, scores, vol)`、`NewLifecyclePolicy`。
+- 生命周期：`factor.SelectPortfolio(frame, universe, spec, cfg)`、`SelectPortfolioScore(..., scoreName, groups)`、`AllocateSelected(selected, cfg, nav, scores, vol)`、`AllocateSelectedContext(selected, cfg, ctx, scores)`、`EqualRiskContribution(cov)`、`NewLifecyclePolicy`。
 - 注册名须带版本（如 `rotation-v1`），参数/实现变化须升版本或改 identity hash。
 
 ## 5. Go 注册入口与接口
@@ -265,8 +266,8 @@ func (f FactorContext) Field(name string) *factor.Node
 type FactorSpec struct { Outputs map[string]*factor.Node; Combine research.ComboSpec }
 func RegisterFactor(name string, build func(FactorContext) (FactorSpec, error)) error
 ```
-- `Outputs` 非空；默认 `equal`+除保留缩放列外的全部输出，可由 `Combine` 指定（YAML `combo` 覆盖）。
-- **动态市场状态敞口缩放保留列**：`Outputs`（或 YAML `expressions.outputs`）可额外输出 `"exposure_scale"`（同时缩放多空）、`"long_scale"`（缩放 `LongNotional`）、`"short_scale"`（缩放 `ShortNotional`）。运行时自动从默认 `Combine.Columns` 排除它们，对当期有效标的取算术均值并钳制到 `[0, 1]`（全无效时按 `1.0`），乘到当期多/空目标总敞口（兼容默认 `TopBottomK` 与 `lifecycle-v1`）。例如 `Outputs{"score": mom, "exposure_scale": factor.CsMean(factor.Gt(close, factor.SMA(close, 200)))}` 即可按全市场均线宽度动态调节仓位。
+- `Outputs` 非空；默认 `equal`+除保留列（`exposure_scale`/`long_scale`/`short_scale`/`volatility`/`beta` 及 `allocation.volatility_column`/`beta_column`）外的全部输出，可由 `Combine` 指定（YAML `combo` 覆盖）。
+- **保留辅助输出列**：`Outputs`（或 YAML `expressions.outputs`）可额外输出敞口缩放列 `"exposure_scale"`（同时缩放多空）、`"long_scale"`（缩放 `LongNotional`）、`"short_scale"`（缩放 `ShortNotional`），以及风险列 `"volatility"`（驱动 `inverse-volatility`/`vol-target`）与 `"beta"`（驱动 `beta_cap`）。它们自动从默认 `Combine.Columns` 排除；敞口列按有效标的算术均值钳制到 `[0, 1]`（全无效按 `1.0`）动态缩放当期多/空预算；只输出 `"score"` 的普通策略也可直接在 YAML 配 `portfolio: {allocation: {method: hrp}}`（或 `erc`/`min-variance`/`mean-variance`/`inverse-volatility`），由 `runner` 自动计算 PIT 滚动收益协方差与波动率。
 
 ### 5.2 `runner.RegisterDefinition`
 

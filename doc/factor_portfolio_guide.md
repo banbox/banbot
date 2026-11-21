@@ -99,7 +99,7 @@ transition:
 
 无状态 `RegisterPortfolioBuilder` 产生理想权重；显式 builder 优先，未配置 allocation 时保留其权重。`RegisterPortfolioPolicy(versionedName, factory)` 每 run 创建实例，`policy_params` 由工厂验证。policy 消费只读 `PortfolioContext` 和已接纳 JSON 状态，返回目标/下一状态/诊断；不能直接写账户或提交订单。
 
-`Config.PolicyContext` 可注入可见分组、波动率、beta、ForceExit、HoldingRules/TransitionRules 和 RebalanceDue。inverse-volatility/vol-target、分组/beta 规则需相应证据，普通 YAML 不会自动把同名因子列当风险输入。参数 resolver 应使用 `ResolveParameters` 检查 manifest、hash、训练结束和发布时间。自定义完整 policy 可返回有界 opaque JSON，并遵守冻结目标身份、版本及账户风险合同。
+`Config.PolicyContext` 可注入或覆盖可见分组、波动率、beta、ForceExit、HoldingRules/TransitionRules 和 RebalanceDue。对于 `inverse-volatility`、`vol-target`、`beta_cap` 以及协方差优化加权（`erc`/`risk-parity`、`hrp`、`min-variance`、`mean-variance`），运行时会自动从 `Frame.Values` 提取保留输出列 `volatility` / `beta`（或 `allocation.volatility_column` / `beta_column`，默认合成自动忽略这些保留列）；若策略未显式输出风险列，`runner` 基于严格 PIT 可见的决策网格收盘价自动维护回看 `allocation.risk_window`（默认 20）的滚动收益率矩阵、波动率与市场 Beta（协方差预热不足 `risk_window` 时平滑回退为 `inverse-volatility` 或 `equal`）。`portfolio` 块配置了 `rebalance`/`selection`/`holding`/`transition`/`allocation` 且未指定 `policy` 时自动启用 `lifecycle-v1`；分组上限/配额仍需 `Config.PolicyContext` 提供可见分组。参数 resolver 应使用 `ResolveParameters` 检查 manifest、hash、训练结束和发布时间。自定义完整 policy 可返回有界 opaque JSON，并遵守冻结目标身份、版本及账户风险合同。
 
 新 `PortfolioTarget` allocation 明确区分 NAVFraction 与 AbsoluteQuantity，标准资产单位使用精确十进制。旧 `TargetPortfolio` 和旧 builder 仍为纯权重；数量目标不能通过旧 output/sink 丢失单位。JSON 输出使用版本化 allocation-decision/allocation-accepted，消费端需支持该合同。
 

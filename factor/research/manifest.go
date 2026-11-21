@@ -90,7 +90,7 @@ func BuildManifest(spec ManifestSpec) (*Manifest, error) {
 	if err := spec.Portfolio.ValidatePolicy(); err != nil {
 		return nil, err
 	}
-	legacyBuilder := spec.Portfolio.Policy == "" || spec.Portfolio.Builder == "top-bottom-k-v1"
+	legacyBuilder := spec.Portfolio.EffectivePolicy() == "" || spec.Portfolio.Builder == "top-bottom-k-v1"
 	if spec.Currency == "" || spec.CodeRevision == "" || spec.FactorPlanHash == "" || spec.UniverseVersion == "" || spec.VisibilityPolicy == "" || spec.ExecutionMode == "" || spec.LatencyAssumption == "" || (legacyBuilder && spec.Portfolio.K <= 0 && spec.Portfolio.Builder == "") || spec.Costs.FundingPolicy == "" {
 		return nil, errors.New("research: incomplete reproducibility manifest")
 	}

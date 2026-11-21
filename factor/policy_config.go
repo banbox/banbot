@@ -73,16 +73,49 @@ type TransitionConfig struct {
 	EntryWindowBars int                       `json:"entry_window_bars,omitempty" yaml:"entry_window_bars,omitempty"`
 	ByAsset         map[string]TransitionRule `json:"by_asset,omitempty" yaml:"by_asset,omitempty"`
 }
+const DefaultAllocationRiskWindow = 20
+
 type AllocationConfig struct {
-	Method        string             `json:"method,omitempty" yaml:"method,omitempty"`
-	ReserveRatio  float64            `json:"reserve_ratio,omitempty" yaml:"reserve_ratio,omitempty"`
-	FixedNotional float64            `json:"fixed_notional,omitempty" yaml:"fixed_notional,omitempty"`
-	VolTarget     float64            `json:"vol_target,omitempty" yaml:"vol_target,omitempty"`
-	AssetCap      float64            `json:"asset_cap,omitempty" yaml:"asset_cap,omitempty"`
-	GroupCaps     map[string]float64 `json:"group_caps,omitempty" yaml:"group_caps,omitempty"`
-	TurnoverLimit float64            `json:"turnover_limit,omitempty" yaml:"turnover_limit,omitempty"`
-	NetCap        float64            `json:"net_cap,omitempty" yaml:"net_cap,omitempty"`
-	BetaCap       float64            `json:"beta_cap,omitempty" yaml:"beta_cap,omitempty"`
+	Method           string             `json:"method,omitempty" yaml:"method,omitempty"`
+	VolatilityColumn string             `json:"volatility_column,omitempty" yaml:"volatility_column,omitempty"`
+	BetaColumn       string             `json:"beta_column,omitempty" yaml:"beta_column,omitempty"`
+	RiskWindow       int                `json:"risk_window,omitempty" yaml:"risk_window,omitempty"`
+	Shrinkage        float64            `json:"shrinkage,omitempty" yaml:"shrinkage,omitempty"`
+	RiskAversion     float64            `json:"risk_aversion,omitempty" yaml:"risk_aversion,omitempty"`
+	ReserveRatio     float64            `json:"reserve_ratio,omitempty" yaml:"reserve_ratio,omitempty"`
+	FixedNotional    float64            `json:"fixed_notional,omitempty" yaml:"fixed_notional,omitempty"`
+	VolTarget        float64            `json:"vol_target,omitempty" yaml:"vol_target,omitempty"`
+	AssetCap         float64            `json:"asset_cap,omitempty" yaml:"asset_cap,omitempty"`
+	GroupCaps        map[string]float64 `json:"group_caps,omitempty" yaml:"group_caps,omitempty"`
+	TurnoverLimit    float64            `json:"turnover_limit,omitempty" yaml:"turnover_limit,omitempty"`
+	NetCap           float64            `json:"net_cap,omitempty" yaml:"net_cap,omitempty"`
+	BetaCap          float64            `json:"beta_cap,omitempty" yaml:"beta_cap,omitempty"`
+}
+
+func (a AllocationConfig) EffectiveRiskWindow() int {
+	if a.RiskWindow >= 2 {
+		return a.RiskWindow
+	}
+	return DefaultAllocationRiskWindow
+}
+
+func (a AllocationConfig) EffectiveRiskAversion() float64 {
+	if a.RiskAversion > 0 && !math.IsNaN(a.RiskAversion) && !math.IsInf(a.RiskAversion, 0) {
+		return a.RiskAversion
+	}
+	return 1.0
+}
+
+func (a AllocationConfig) IsCovarianceMethod() bool {
+	switch a.Method {
+	case "erc", "risk-parity", "hrp", "min-variance", "mean-variance":
+		return true
+	}
+	return false
+}
+
+func (a AllocationConfig) NeedsRiskInput() bool {
+	return a.Method == "inverse-volatility" || a.Method == "vol-target" || a.IsCovarianceMethod()
 }
 type PortfolioPolicyConfig struct {
 	Policy        string           `json:"policy"`
@@ -352,11 +385,28 @@ func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyCon
 	if a.Method == "" {
 		a.Method = "equal"
 	}
-	if a.Method != "fixed-notional" && a.FixedNotional != 0 || a.Method != "vol-target" && a.VolTarget != 0 {
+	if a.Method == "risk-parity" {
+		a.Method = "erc"
+	}
+	if a.VolatilityColumn != "" && strings.TrimSpace(a.VolatilityColumn) == "" || a.BetaColumn != "" && strings.TrimSpace(a.BetaColumn) == "" {
+		return c, errors.New("factor: allocation column name cannot be blank")
+	}
+	a.VolatilityColumn = strings.TrimSpace(a.VolatilityColumn)
+	a.BetaColumn = strings.TrimSpace(a.BetaColumn)
+	if a.Method != "fixed-notional" && a.FixedNotional != 0 || a.Method != "vol-target" && a.VolTarget != 0 || a.Method != "mean-variance" && a.RiskAversion != 0 {
 		return c, errors.New("factor: allocation sizing field unused by selected method")
 	}
+	if a.RiskWindow < 0 || a.RiskWindow == 1 || a.RiskWindow > 10000 {
+		return c, errors.New("factor: invalid allocation risk_window")
+	}
+	if math.IsNaN(a.Shrinkage) || math.IsInf(a.Shrinkage, 0) || a.Shrinkage < 0 || a.Shrinkage > 1 {
+		return c, errors.New("factor: invalid allocation shrinkage")
+	}
+	if math.IsNaN(a.RiskAversion) || math.IsInf(a.RiskAversion, 0) || a.RiskAversion < 0 {
+		return c, errors.New("factor: invalid allocation risk_aversion")
+	}
 	switch a.Method {
-	case "equal", "score", "inverse-volatility":
+	case "equal", "score", "inverse-volatility", "erc", "hrp", "min-variance", "mean-variance":
 	case "fixed-notional":
 		if a.FixedNotional <= 0 {
 			return c, errors.New("factor: fixed notional must be positive")

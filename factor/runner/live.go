@@ -7,6 +7,7 @@ import (
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/backtest"
+	"maps"
 	"slices"
 	"sort"
 	"sync"
@@ -74,7 +75,7 @@ func NewLive(c Config, sink Sink, clock func() int64, out Output) (*Live, error)
 	if err != nil {
 		return nil, err
 	}
-	policy, err := newPolicyRun(c)
+	policy, err := newPolicyRun(c, combo.Columns...)
 	if err != nil {
 		engine.close()
 		return nil, err
@@ -154,6 +155,8 @@ func (l *Live) InheritAdmission(previous *Live) error {
 		l.policy.version = previous.policy.version
 		l.policy.previous = previous.policy.previous
 		l.policy.sequence = previous.policy.sequence
+		l.policy.riskTracker = previous.policy.riskTracker.clone()
+		l.policy.lastBeta = maps.Clone(previous.policy.lastBeta)
 	}
 	if previous.previous != nil {
 		targets := previous.previous.Targets()
@@ -336,6 +339,9 @@ func (l *Live) Warmup(ctx context.Context, r factor.VersionRecord) error {
 		}
 		if err != nil {
 			return err
+		}
+		if l.policy != nil {
+			l.policy.observeSnapshot(l.c, l.engine.plan, snapshot, nil, nil, grid, now)
 		}
 		l.lastWarmGrid = grid
 		l.warmGridCount++

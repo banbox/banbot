@@ -26,12 +26,27 @@ type decisionEngine struct {
 	shared                *sharedComputation
 }
 
-func defaultComboColumns(outputs []string) []string {
+func defaultComboColumns(outputs []string, extraReserved ...string) []string {
 	cols := make([]string, 0, len(outputs))
 	for _, name := range outputs {
-		if !factor.IsExposureScaleOutput(name) {
+		if !factor.IsReservedOutput(name) && !slices.Contains(extraReserved, name) {
 			cols = append(cols, name)
 		}
+	}
+	return cols
+}
+
+func allocationReservedColumns(c Config) []string {
+	a := c.Manifest.Portfolio.Allocation
+	if a == nil {
+		return nil
+	}
+	var cols []string
+	if a.VolatilityColumn != "" {
+		cols = append(cols, a.VolatilityColumn)
+	}
+	if a.BetaColumn != "" {
+		cols = append(cols, a.BetaColumn)
 	}
 	return cols
 }
@@ -53,7 +68,7 @@ func compileDecision(c Config) (*factor.Plan, research.ComboSpec, error) {
 			combo.Method = research.Equal
 		}
 		if len(combo.Columns) == 0 {
-			combo.Columns = defaultComboColumns(plan.Outputs())
+			combo.Columns = defaultComboColumns(plan.Outputs(), allocationReservedColumns(c)...)
 		}
 	} else if c.Plan != nil {
 		plan = c.Plan
@@ -227,8 +242,8 @@ func (e *decisionEngine) buildPortfolio(frame factor.Frame, universe factor.Univ
 		out, err := factor.NewTargetPortfolio(pspec, scaledWeights)
 		return out, diags, err
 	}
-	if e.portfolio.Policy != "" && e.portfolio.Builder == "" {
-		if e.portfolio.Policy != "lifecycle-v1" {
+	if ep := e.portfolio.EffectivePolicy(); ep != "" && e.portfolio.Builder == "" {
+		if ep != "lifecycle-v1" {
 			// A complete custom policy owns selection and allocation itself.
 			return nil, nil, nil
 		}

@@ -42,8 +42,20 @@ func ClonePortfolioDefinition(d PortfolioDefinition) PortfolioDefinition {
 	return d
 }
 
+// EffectivePolicy returns the explicit policy name, or promotes to "lifecycle-v1"
+// when lifecycle/allocation sub-blocks are configured without custom policy_params.
+func (d PortfolioDefinition) EffectivePolicy() string {
+	if d.Policy != "" {
+		return d.Policy
+	}
+	if d.PolicyParams == nil && (d.Rebalance != nil || d.Selection != nil || d.Holding != nil || d.Transition != nil || d.Allocation != nil) {
+		return "lifecycle-v1"
+	}
+	return ""
+}
+
 func (d PortfolioDefinition) PolicyConfig() (factor.PortfolioPolicyConfig, error) {
-	c := factor.PortfolioPolicyConfig{Policy: d.Policy, PolicyParams: d.PolicyParams, LongNotional: d.LongNotional, ShortNotional: d.ShortNotional}
+	c := factor.PortfolioPolicyConfig{Policy: d.EffectivePolicy(), PolicyParams: d.PolicyParams, LongNotional: d.LongNotional, ShortNotional: d.ShortNotional}
 	if d.Rebalance != nil {
 		c.Rebalance = *d.Rebalance
 	}
@@ -96,9 +108,9 @@ func (d PortfolioDefinition) ValidatePolicy() error {
 	if d.AssetCap < 0 || math.IsNaN(d.AssetCap) || math.IsInf(d.AssetCap, 0) {
 		return errors.New("research: invalid portfolio asset_cap")
 	}
-	if d.Policy == "" {
-		if d.PolicyParams != nil || d.Rebalance != nil || d.Selection != nil || d.Holding != nil || d.Transition != nil || d.Allocation != nil {
-			return errors.New("research: portfolio lifecycle fields require an explicit policy")
+	if d.EffectivePolicy() == "" {
+		if d.PolicyParams != nil {
+			return errors.New("research: portfolio policy_params requires an explicit policy")
 		}
 		return nil
 	}
@@ -107,9 +119,10 @@ func (d PortfolioDefinition) ValidatePolicy() error {
 }
 
 // ResolvePolicy makes defaults part of reproducible strategy identity only for
-// strategies that explicitly opt into the new policy contract.
+// strategies that opt into the policy contract (explicitly or via sub-blocks).
 func (d PortfolioDefinition) ResolvePolicy() (PortfolioDefinition, error) {
-	if d.Policy == "" {
+	ep := d.EffectivePolicy()
+	if ep == "" {
 		return ClonePortfolioDefinition(d), d.ValidatePolicy()
 	}
 	c, err := d.PolicyConfig()
@@ -117,6 +130,7 @@ func (d PortfolioDefinition) ResolvePolicy() (PortfolioDefinition, error) {
 		return d, err
 	}
 	d = ClonePortfolioDefinition(d)
+	d.Policy = ep
 	if d.Policy == "lifecycle-v1" {
 		d.Rebalance = &c.Rebalance
 		d.Selection = &c.Selection

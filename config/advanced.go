@@ -48,7 +48,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.Contains(path, ".transition.by_asset."):
 		allowed = "exit_steps ratio"
 	case strings.HasSuffix(path, ".allocation"):
-		allowed = "method reserve_ratio fixed_notional vol_target asset_cap group_caps turnover_limit net_cap beta_cap"
+		allowed = "method volatility_column beta_column risk_window shrinkage risk_aversion reserve_ratio fixed_notional vol_target asset_cap group_caps turnover_limit net_cap beta_cap"
 	case strings.HasSuffix(path, ".research"):
 		allowed = "labels label_wait_ms panel"
 	case strings.HasSuffix(path, ".snapshot"):
@@ -83,7 +83,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if value != "software" && value != "native_preferred" {
 				return fmt.Errorf("%s must be software or native_preferred", field)
 			}
-		case "archive", "store", "history", "sender_lease_dir", "hub_socket", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "timeframe", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder", "definition", "sampling", "option_expiry_source", "terminal_settlement_source", "paper_fill_model":
+		case "archive", "store", "history", "sender_lease_dir", "hub_socket", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "timeframe", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder", "definition", "sampling", "option_expiry_source", "terminal_settlement_source", "paper_fill_model", "volatility_column", "beta_column":
 			if text, ok := value.(string); !ok || strings.TrimSpace(text) == "" {
 				return fmt.Errorf("%s must be a nonempty string", field)
 			}
@@ -100,8 +100,27 @@ func validateAdvanced(path string, fields map[string]any) error {
 				return fmt.Errorf("%s has unsupported mode %v", field, value)
 			}
 		case "method":
-			if text, ok := value.(string); (!strings.HasSuffix(path, ".allocation")) && (!ok || !strings.Contains(" equal fixed history-ic history-rank-ic history-icir history-rank-icir history-ewma ", " "+text+" ")) {
+			text, ok := value.(string)
+			if strings.HasSuffix(path, ".allocation") {
+				if !ok || !strings.Contains(" equal score fixed-notional inverse-volatility vol-target erc risk-parity hrp min-variance mean-variance ", " "+text+" ") {
+					return fmt.Errorf("%s has unsupported allocation method %v", field, value)
+				}
+			} else if !ok || !strings.Contains(" equal fixed history-ic history-rank-ic history-icir history-rank-icir history-ewma ", " "+text+" ") {
 				return fmt.Errorf("%s has unsupported combo method %v", field, value)
+			}
+		case "risk_window":
+			if !nonnegativeInteger(value) || numeric(value) < 2 || numeric(value) > 10000 {
+				return fmt.Errorf("%s must be an integer in [2, 10000]", field)
+			}
+		case "shrinkage":
+			number := numeric(value)
+			if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || number > 1 {
+				return fmt.Errorf("%s must be a finite number in [0, 1]", field)
+			}
+		case "risk_aversion":
+			number := numeric(value)
+			if math.IsNaN(number) || math.IsInf(number, 0) || number <= 0 {
+				return fmt.Errorf("%s must be a finite positive number", field)
 			}
 		case "page_bytes":
 			if !nonnegativeInteger(value) {
