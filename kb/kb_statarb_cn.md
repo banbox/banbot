@@ -39,15 +39,21 @@ type Pair struct{ Y, X string }          // 与运行 SIDMap 中符号完全一�
 type PairsSpec struct {
     Pairs             []Pair
     Field             string                // kline 字段，缺省 "close"
-    Window            int                   // 回归窗口（决策 bar 数），>= 3
-    Band              statistics.BandConfig // 见 2.3
+    Window            int                   // 回归/预热窗口（决策 bar 数），>= 3（启用半衰期门控时 >= 4）
+    Band              statistics.BandConfig // 见 2.3（支持 Mode: ""/"reversion" 或 "momentum"）
     Gross             float64               // 单对基础总名义占策略 NAV；0 = 1/len(Pairs)
-    MinBeta           float64               // 入场最小 β 下限（>=0），见 2.4
-    AllowNegativeBeta bool                  // 默认 false（要求入场 β > max(0, MinBeta)）
-    DynamicExitZ      bool                  // 默认 false（持仓期用冻结 β 的 EvalWithBeta 计算退出/止损 z）
+    MinBeta           float64               // 入场最小名义 β 下限（>=0），见 2.4
+    AllowNegativeBeta bool                  // 默认 false（要求入场名义 β > max(0, MinBeta)）
+    DynamicExitZ      bool                  // 默认 false（线性回归模型持仓期用冻结斜率计算退出/止损 z）
     DriftBand         float64               // 持仓期免调仓 L1 权重漂移缓冲带（>=0，0 关闭）
-    WeightMode        string                // ""/"equal"（默认固定 Gross）或 "inverse_vol"（按 1/Std 风险平价）
+    WeightMode        string                // ""/"equal"（默认固定 Gross）或 "inverse_vol"（按 1/ScaleStd 风险平价）
     MaxPairGross      float64               // inverse_vol 下单对敞口上限 [0,1]；0 默认 min(TotalGross, 2*Gross)
+    SpreadModel       string                // ""/"log_ols"（默认）、"raw_ols"、"tls"、"kalman"、"ratio"、"return_diff"
+    KalmanDelta       float64               // SpreadModel=="kalman" 状态转移噪声比例 (0,1)，0 缺省 1e-4
+    KalmanVe          float64               // SpreadModel=="kalman" 观测噪声方差 (>0)，0 缺省 1e-3
+    DynamicHedge      bool                  // 默认 false（入场冻结 β）；true 时持仓对冲比随当期在线估计动态更新
+    MinHalfLife       float64               // 可选在线入场 FitOU DiscreteHalfLife 下限（>=0，bar 数）
+    MaxHalfLife       float64               // 可选在线入场 FitOU DiscreteHalfLife 上限（>=0，0 关闭）
 }
 ```
 
@@ -59,7 +65,7 @@ type PairsSpec struct {
 
 ### 2.2 校验（build 返回后）
 
-`build`/`name` 为空→注册失败；`Params.Err()` 非空→返回该错误；`Field==""`→`"close"`；`len(Pairs)==0`、`Window<3`、`Band.Validate()` 失败→错误；`Gross==0`→`1/len(Pairs)`；`Gross<=0` 或 `Gross*len(Pairs) > 1+1e-9`→错误（总敞口不得超 NAV）；`MinBeta<0`、`DriftBand<0` 或非有限→错误；`WeightMode` 非 `""`/`"equal"`/`"inverse_vol"`→错误；`MaxPairGross` 不在 `[0,1]` 或非有限→错误；`Y==""`/`X==""`/`Y==X`→错误；Y/X 不在运行 `SIDMap`（且不在 `UnavailableSymbols`）→构造组合构造器时报错（`PreparePortfolioConfig`，资源装配前）。
+`build`/`name` 为空→注册失败；`Params.Err()` 非空→返回该错误；`Field==""`→`"close"`；`len(Pairs)==0`、`Window<3`（或启用 `MinHalfLife/MaxHalfLife` 时 `Window<4`）、`Band.Validate()` 失败→错误；`Gross==0`→`1/len(Pairs)`；`Gross<=0` 或 `Gross*len(Pairs) > 1+1e-9`→错误（总敞口不得超 NAV）；`MinBeta<0`、`DriftBand<0`、`MinHalfLife<0`、`MaxHalfLife<0`（或 `0<MaxHalfLife<MinHalfLife`）或非有限→错误；`SpreadModel` 非 `""`/`"log_ols"`/`"raw_ols"`/`"tls"`/`"kalman"`/`"ratio"`/`"return_diff"`→错误；`KalmanDelta` 不在 `(0,1)`（0 缺省 `1e-4`）或 `KalmanVe<=0`（0 缺省 `1e-3`）→错误；`WeightMode` 非 `""`/`"equal"`/`"inverse_vol"`→错误；`MaxPairGross` 不在 `[0,1]` 或非有限→错误；`Y==""`/`X==""`/`Y==X`→错误；Y/X 不在运行 `SIDMap`（且不在 `UnavailableSymbols`）→构造组合构造器时报错（`PreparePortfolioConfig`，资源装配前）。
 
 构造期不检查可交易性（见 2.4）。
 
@@ -68,38 +74,54 @@ type PairsSpec struct {
 ```go
 type BandConfig struct {
     Entry, Exit, Stop float64
-    MaxHold           int   // 决策轮数，0 关闭
-    LongOnly          bool  // 禁止做空价差 (z >= Entry)
-    ShortOnly         bool  // 禁止做多价差 (z <= -Entry)
+    MaxHold           int    // 决策轮数，0 关闭
+    LongOnly          bool   // 禁止做空价差 (-1)
+    ShortOnly         bool   // 禁止做多价差 (+1)
+    Mode              string // ""/"reversion"（默认均值回归）或 "momentum"（顺势突破跟随）
 }
 func (c BandConfig) Validate() error
+func (c BandConfig) CloseReason(prevPos int, z float64) string
 func NewBandTrader(cfg BandConfig) (*BandTrader, error)   // 每个价差一个实例
 func (b *BandTrader) Step(z float64) int                  // -1/0/+1
 func (b *BandTrader) Position() int
 ```
 
-校验：阈值有限；`Entry>0`；`0<=Exit<Entry`；`Stop==0 或 Stop>Entry`；`MaxHold>=0`；LongOnly 与 ShortOnly 互斥。**无内置阈值默认值**（`p.Float("entry", 2)` 的 2 是调用方选择）。
+校验：`Mode` 为 `""`/`"reversion"`/`"momentum"`；阈值有限；`Entry>0`；`0<=Exit<Entry`；`"reversion"` 下 `Stop==0 或 Stop>Entry`，`"momentum"` 下 `Stop==0 或 Stop>Exit`；`MaxHold>=0`；LongOnly 与 ShortOnly 互斥。**无内置阈值默认值**（`p.Float("entry", 2)` 的 2 是调用方选择）。
 
 状态转移：
 1. 每次 `Step` 先：`blocked` 且 `|z|<=Exit` → 清除。
 2. 非有限 z：返回当前仓位，状态不变。
-3. 持仓：`held++`，按优先级：`Stop>0 且 |z|>=Stop` → 平仓并置 `blocked`；`|z|<=Exit` → 平仓（不置 blocked）；`MaxHold>0 且 held>=MaxHold` → 平仓并置 `blocked`。
-4. 空仓：`blocked` 或 `|z|>=Stop`（Stop>0）→ 保持 0；否则 `z<=-Entry` → +1（做多价差），`z>=Entry` → -1（做空价差），受 LongOnly/ShortOnly 限制；入场 `held=0`；持仓不会单步翻向。
+3. `"reversion"`（默认均值回归）：
+   - 持仓：`held++`，按优先级：`Stop>0 且 |z|>=Stop` → 平仓并置 `blocked`；`|z|<=Exit` → 平仓（不置 blocked）；`MaxHold>0 且 held>=MaxHold` → 平仓并置 `blocked`。
+   - 空仓：`blocked` 或 `|z|>=Stop`（Stop>0）→ 保持 0；否则 `z<=-Entry` → +1（做多价差），`z>=Entry` → -1（做空价差），受 LongOnly/ShortOnly 限制。
+4. `"momentum"`（相对强弱顺势突破）：
+   - 持仓：`held++`，按优先级：`Stop>0` 且反向跌破（`pos>0 && z<=-Stop` 或 `pos<0 && z>=Stop`）→ 平仓并置 `blocked`（`stop`）；回落至均线带（`pos>0 && z<=Exit` 或 `pos<0 && z>=-Exit`）→ 止盈平仓（`exit`，不置 blocked）；`MaxHold>0 且 held>=MaxHold` → 平仓并置 `blocked`（`maxhold`）。
+   - 空仓：`blocked` → 保持 0；否则 `z>=Entry` → +1（顺势做多价差），`z<=-Entry` → -1（顺势做空价差），受 LongOnly/ShortOnly 限制；持仓不会单步翻向。
 
 `blocked`：止损/到期平仓后，z 回到 `[-Exit,Exit]` 才允许再入场。
 
 ### 2.4 运行时语义（每个决策轮）
 
-每对持有私有 `RollingSpread`、`BandTrader`、冻结 β、最近有效残差 `Std`、仓位与上一轮持仓基准。每轮：
+每对持有私有 `SpreadEstimator`（6 类 `SpreadModel`）、`BandTrader`、冻结名义 β 与模型斜率、最近无量纲 `ScaleStd`、仓位与上一轮持仓基准。
+
+**支持的 `SpreadModel`**：
+- `""` / `"log_ols"`（默认）：对数价格 `ln(Y) = α + β·ln(X)` 滚动窗口 OLS，名义对冲比 `NotionalBeta = β`。
+- `"raw_ols"`：原始价格 `Y = α + β_raw·X` 滚动窗口 OLS，1 股 Y 对冲 `-β_raw` 股 X，自动换算为美元名义对冲比 `NotionalBeta = β_raw · (priceX / priceY)`，`ScaleStd = Std / priceY`。
+- `"tls"`：对数价格二维正交回归（Deming / Total Least Squares），满足交换 Y/X 的倒数对称性 `β_YX · β_XY = 1` 与 `Z_YX = -Z_XY`。
+- `"kalman"`：状态空间随机游走配对（复用 `statistics.KalmanPair`，`ProcessVariance = KalmanDelta/(1-KalmanDelta)`，`ObservationVariance = KalmanVe`），预热满 `Window` 步后以更新前一步预测新息 `Z = Error / sqrt(Variance)` 作为无前视在线 Z-Score；支持 `DynamicHedge: true` 随在线斜率连续更新持仓对冲比。
+- `"ratio"`：价格比值 `R = Y/X` 滚动布林带 `Z = (R - mean)/std`，固定等额美元中性 `NotionalBeta = 1.0`（`wY = +0.5·pos·G, wX = -0.5·pos·G`）。
+- `"return_diff"`：滚动窗口累计收益率差 `(Y/Y_0) - (X/X_0)` 的 Z-Score，固定等额美元中性 `NotionalBeta = 1.0`。
+
+每轮：
 
 | 步骤 | 条件 | 行为 | 诊断码 |
 | --- | --- | --- | --- |
 | a | Y/X 的 `pairs-log-v1` 值缺失或非 Valid（含价格<=0） | 暂停该对；已有仓位立即平仓并重置状态机（`leg_missing`） | `pair-input-missing` / `pair-closed-missing-leg` |
-| b | `RollingSpread.Observe` 未就绪（窗口未满、x 方差<=1e-12、残差 std<=1e-12、非有限） | 跳过；不推进 BandTrader | `pair-warmup` |
+| b | `SpreadEstimator.ObserveLog` 未就绪（窗口/预热未满、零方差、非有限） | 跳过；不推进 BandTrader | `pair-warmup` |
 | c | 就绪，某腿不可交易，当前仓位 0 | 不开仓，不推进 BandTrader | 无 |
-| c2 | 就绪，当前仓位 0，入场 β 不满足守卫（默认 `!AllowNegativeBeta` 时 `Beta <= max(0, MinBeta)`；`AllowNegativeBeta && MinBeta>0` 时 `|Beta| <= MinBeta`） | 不开新仓（仅当 `|z|<=Exit` 时推进状态机以解除 `blocked`） | 无 |
-| d | 就绪，当前有仓位（含某腿不可交易或当前滚动 β<=0） | 默认用 `EvalWithBeta(lx, ly, 冻结β)` 的 z（`DynamicExitZ: true` 时用重拟合 `point.Z`）推进 BandTrader，可按规则平仓 | 无 |
-| e | `Step` 后仓位≠0 且原仓位为 0（或方向变化且通过 β 守卫） | 冻结 β = 本期 `SpreadPoint.Beta` | 无 |
+| c2 | 就绪，当前仓位 0，`|z| >= Entry` 时名义 β 不满足守卫或在线 `FitOU` 半衰期门控不通过（启用 `MinHalfLife`/`MaxHalfLife` 时窗口非均值回归或 `DiscreteHalfLife` 越界） | 拦截本次入场（`|z| < Entry` 时仍照常推进状态机解除 `blocked`） | 无 |
+| d | 就绪，当前有仓位 | 默认用 `EvalFrozenZ`（线性模型用入场冻结斜率窗口 z；`DynamicExitZ: true` 或 `DynamicHedge: true` 时用当期 `est.Z`）推进 BandTrader，可按规则平仓 | 无 |
+| e | `Step` 后开仓（或持仓且 `DynamicHedge: true` 并通过 β 守卫） | 记录/更新名义 `β = est.NotionalBeta` | 无 |
 | f | 所有对都未就绪（且无因缺失平仓的对） | 返回 nil 目标 + `pairs-not-ready` | `pairs-not-ready` |
 | g | 其他 | 按 `WeightMode` 与 `DriftBand` 为每个仓位≠0 的对计算目标权重输出；非空诊断附到目标 | 本轮诊断 |
 
@@ -142,9 +164,9 @@ run_policy:
 
 **Weights 账本对漂移计费**：账本每次执行目标都按 `qty = w × spec.Budget.NAV / price` 重算数量（NAV=决策时账本 NAV，随盈亏复利），与现有数量之差按 `fee_rate`+`slippage_rate` 计费。`DriftBand == 0` 时配对每个决策轮都输出恒定目标权重，**持仓期间价格漂移每轮被再平衡回目标权重并计费**；设置 `DriftBand > 0` 可在偏离未超阈值时输出自然漂移权重以省去无谓摩擦成本。Gross 是当前 NAV 比例而非初始 NAV。`research.Evaluate` 的 `Costs = CostRate × Σ|w−w_prev|` 只计权重差、不含漂移，与账本口径不同（`Result.Book` 为账本口径）。Events 路径是否同样产生漂移再平衡成交未实测。
 
-### 2.7 自定义路径（静态 β、Kalman、多腿篮子）
+### 2.7 自定义路径（静态 β、多腿篮子）
 
-`RegisterPairs` 的 β 来自滚动 OLS，**无法注入静态 β 或 Kalman 状态**，需用通用接口：
+两腿动态 OLS / 正交 TLS / Kalman 滤波 / 比值 / 累计收益差可直接由 `RegisterPairs` 或 `RegisterRollingPairs` 的 `SpreadModel` 声明；仅当需要**外部静态 β** 或 **3 腿及以上 Johansen 篮子**时才需通用接口：
 1. `runner.RegisterDefinition(name, func(c runner.Config) (*factor.Plan, research.ComboSpec, error))`：`factor.New().Add(name, node).Compile()` 编译对数价格节点（`factor.Field("kline", field, c.Factor.TimeFrame)` + `factor.Custom(version, inputs, fn)`，同 `pairs-log-v1` 形式），组合为 `research.ComboSpec{Method: research.Equal, Columns: [...]}`。
 2. `runner.RegisterPortfolioFactory(name, func(c runner.Config) (runner.PortfolioBuilder, error), validator)`：名字须含 `-v`；validator 只做纯参数检查，不构造状态。
 3. 构造器：`func(frame factor.Frame, universe factor.Universe, spec factor.PortfolioSpec, def research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error)`；输出 `factor.NewTargetPortfolio(spec, weights)`，`spec` 用入参。
@@ -179,9 +201,14 @@ type RollingPairsSpec struct {
     AllowNegativeBeta bool                  // 默认 false（要求 β > max(0, MinBeta)）
     DynamicExitZ      bool                  // 默认 false（持仓退出用 EvalWithBeta 冻结 β）
     DriftBand         float64               // 持仓期免调仓漂移缓冲带（>=0）
-    WeightMode        string                // ""/"equal" 或 "inverse_vol"
-    MaxPairGross      float64               // inverse_vol 单对上限 [0,1]；0 缺省 min(TotalGross, 2*Gross)
-    HandoffMode       string                // ""/"graceful"（默认优雅退场）或 "immediate"（换期立即平仓）
+    WeightMode         string                // ""/"equal" 或 "inverse_vol"
+    MaxPairGross       float64               // inverse_vol 单对上限 [0,1]；0 缺省 min(TotalGross, 2*Gross)
+    SpreadModel        string                // ""/"log_ols"（默认）、"raw_ols"、"tls"、"kalman"、"ratio"、"return_diff"
+    KalmanDelta        float64               // SpreadModel=="kalman" 状态转移噪声比例 (0,1)，0 缺省 1e-4
+    KalmanVe           float64               // SpreadModel=="kalman" 观测噪声方差 (>0)，0 缺省 1e-3
+    DynamicHedge       bool                  // true 时持仓期动态更新名义对冲比
+    OnlineHalfLifeGate bool                  // true 时交易期开仓前额外校验在线窗口 FitOU 半衰期落入 [MinHalfLife, MaxHalfLife]
+    HandoffMode        string                // ""/"graceful"（默认优雅退场）或 "immediate"（换期立即平仓）
 }
 ```
 
@@ -251,19 +278,35 @@ func (j JohansenResult) TraceRank(criticalValues []float64) (int, error)       /
 - **FitOU**：按 bar 计数用 `DiscreteHalfLife`。
 - **Johansen** 特征向量须先按某一腿归一再做腿权重；`TraceRank` 临界值须对应相同滞后、确定性项、显著性水平。
 
-### 3.2 在线滚动价差（`RegisterPairs` 所用）
+### 3.2 在线滚动价差与统一价差估计器（`RegisterPairs` / `RegisterRollingPairs` 所用）
 
 ```go
 type SpreadPoint struct {
-    Alpha, Beta float64   // 当前窗口 OLS: y = alpha + beta*x
-    Residual    float64   // 当前观测 y - alpha - beta*x
-    Std         float64   // 窗口残差标准差，ddof=2
+    Alpha, Beta float64   // 当前窗口拟合: y = alpha + beta*x
+    Residual    float64   // 当前残差（或 Kalman 更新前新息）
+    Std         float64   // 窗口残差标准差（OLS/TLS ddof=2；ratio/return_diff ddof=1；kalman sqrt(Variance)）
     Z           float64   // Residual / Std
 }
 func NewRollingSpread(window int) (*RollingSpread, error)                    // window >= 3
 func (r *RollingSpread) Window() int
-func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)            // x 为 X 腿、y 为 Y 腿（对数价格）
+func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)            // x 为 X 腿、y 为 Y 腿
 func (r *RollingSpread) EvalWithBeta(x, y, frozenBeta float64) (float64, bool) // 固定斜率窗口残差 z（ddof=1），不修改状态
+
+type SpreadModelConfig struct {
+    Model       string  // ""/"log_ols"、"raw_ols"、"tls"、"kalman"、"ratio"、"return_diff"
+    Window      int     // >= 3
+    KalmanDelta float64 // (0,1)，0 缺省 1e-4
+    KalmanVe    float64 // >0，0 缺省 1e-3
+}
+type SpreadEstimate struct {
+    SpreadPoint
+    NotionalBeta float64 // 目标组合美元名义对冲比（raw_ols 为 Beta*(priceX/priceY)；ratio/return_diff 为 1.0）
+    ScaleStd     float64 // 无量纲波动尺度（供 WeightMode: "inverse_vol" 跨配对分配）
+}
+func NewSpreadEstimator(cfg SpreadModelConfig) (*SpreadEstimator, error)
+func (e *SpreadEstimator) ObserveLog(lx, ly float64) (SpreadEstimate, bool)
+func (e *SpreadEstimator) EvalFrozenZ(lx, ly, frozenModelBeta float64) (float64, bool)
+func (e *SpreadEstimator) WindowSeries(dst []float64) ([]float64, bool)
 ```
 
 `Observe` 返回 `ok=false`：窗口未满、输入非有限（样本被跳过）、x 窗口方差<=1e-12、残差 std<=1e-12；每次为当前窗口完整 OLS，对数价格下 β 为弹性。`EvalWithBeta` 在窗口已满且输入有限时，按窗口内 `r_i = y_i - frozenBeta*x_i` 的均值与标准差（`ddof=1`，`std<=1e-12` 时 `ok=false`）返回 `y - frozenBeta*x` 的 z-score，不改变环形缓冲区。

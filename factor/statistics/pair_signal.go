@@ -2,25 +2,45 @@ package statistics
 
 import (
 	"errors"
+	"fmt"
 	"math"
+)
+
+const (
+	BandModeReversion = "reversion"
+	BandModeMomentum  = "momentum"
 )
 
 // BandConfig describes a z-score hysteresis rule shared by every engine.
 //
-// Position convention: +1 is long the spread (z <= -Entry), -1 is short the
-// spread (z >= Entry). Exit closes when |z| <= Exit. Stop (optional) closes
-// when |z| >= Stop and blocks re-entry until |z| falls back inside Exit, so a
-// diverging spread is never re-bought on the next bar. MaxHold (optional)
-// closes after that many bars with the same block rule.
+// Mode selects directional semantics:
+//   - "" or "reversion" (default): +1 is long the spread (z <= -Entry), -1 is short the
+//     spread (z >= Entry). Exit closes when |z| <= Exit. Stop (optional, > Entry) closes
+//     when |z| >= Stop and blocks re-entry until |z| falls back inside Exit, so a diverging
+//     spread is never re-bought on the next bar.
+//   - "momentum": breakout/relative-strength mode where z >= Entry goes long the spread (+1)
+//     and z <= -Entry goes short the spread (-1). Positions take profit when reverting back
+//     to z <= Exit (long) or z >= -Exit (short), and if Stop > 0 (> Exit) stop out with
+//     re-entry block on reverse breakdown z <= -Stop (long) or z >= Stop (short).
+//
+// MaxHold (optional) closes after that many bars with the same re-entry block rule.
 type BandConfig struct {
 	Entry, Exit, Stop float64
 	MaxHold           int
-	LongOnly          bool // never short the spread
-	ShortOnly         bool // never long the spread
+	LongOnly          bool   // never short the spread (-1)
+	ShortOnly         bool   // never long the spread (+1)
+	Mode              string // ""/"reversion" (default) or "momentum"
 }
+
+func (c BandConfig) isMomentum() bool { return c.Mode == BandModeMomentum }
 
 // Validate rejects ambiguous thresholds instead of silently trading them.
 func (c BandConfig) Validate() error {
+	switch c.Mode {
+	case "", BandModeReversion, BandModeMomentum:
+	default:
+		return fmt.Errorf("statistics: unknown band mode %q", c.Mode)
+	}
 	switch {
 	case !finite(c.Entry) || !finite(c.Exit) || !finite(c.Stop):
 		return errors.New("statistics: band thresholds must be finite")
@@ -28,14 +48,39 @@ func (c BandConfig) Validate() error {
 		return errors.New("statistics: band entry must be positive")
 	case c.Exit < 0 || c.Exit >= c.Entry:
 		return errors.New("statistics: band exit must be in [0, entry)")
-	case c.Stop != 0 && c.Stop <= c.Entry:
+	case !c.isMomentum() && c.Stop != 0 && c.Stop <= c.Entry:
 		return errors.New("statistics: band stop must exceed entry (0 disables)")
+	case c.isMomentum() && c.Stop != 0 && c.Stop <= c.Exit:
+		return errors.New("statistics: momentum band stop must exceed exit (0 disables)")
 	case c.MaxHold < 0:
 		return errors.New("statistics: band max hold must not be negative")
 	case c.LongOnly && c.ShortOnly:
 		return errors.New("statistics: long-only and short-only are exclusive")
 	}
 	return nil
+}
+
+// CloseReason classifies why a previously open position prevPos (-1 or +1) closed at z.
+func (c BandConfig) CloseReason(prevPos int, z float64) string {
+	if c.isMomentum() {
+		switch {
+		case c.Stop > 0 && ((prevPos > 0 && z <= -c.Stop) || (prevPos < 0 && z >= c.Stop)):
+			return "stop"
+		case (prevPos > 0 && z <= c.Exit) || (prevPos < 0 && z >= -c.Exit):
+			return "exit"
+		default:
+			return "maxhold"
+		}
+	}
+	abs := math.Abs(z)
+	switch {
+	case c.Stop > 0 && abs >= c.Stop:
+		return "stop"
+	case abs <= c.Exit:
+		return "exit"
+	default:
+		return "maxhold"
+	}
 }
 
 // BandTrader is a tiny deterministic state machine; it owns no clock and no
@@ -70,6 +115,17 @@ func (b *BandTrader) Step(z float64) int {
 	}
 	if b.pos != 0 {
 		b.held++
+		if b.cfg.isMomentum() {
+			switch {
+			case b.cfg.Stop > 0 && ((b.pos > 0 && z <= -b.cfg.Stop) || (b.pos < 0 && z >= b.cfg.Stop)):
+				b.close(true)
+			case (b.pos > 0 && z <= b.cfg.Exit) || (b.pos < 0 && z >= -b.cfg.Exit):
+				b.close(false)
+			case b.cfg.MaxHold > 0 && b.held >= b.cfg.MaxHold:
+				b.close(true)
+			}
+			return b.pos
+		}
 		switch {
 		case b.cfg.Stop > 0 && abs >= b.cfg.Stop:
 			b.close(true)
@@ -77,6 +133,18 @@ func (b *BandTrader) Step(z float64) int {
 			b.close(false)
 		case b.cfg.MaxHold > 0 && b.held >= b.cfg.MaxHold:
 			b.close(true)
+		}
+		return b.pos
+	}
+	if b.cfg.isMomentum() {
+		if b.blocked {
+			return 0
+		}
+		switch {
+		case z >= b.cfg.Entry && !b.cfg.ShortOnly:
+			b.pos, b.held = 1, 0
+		case z <= -b.cfg.Entry && !b.cfg.LongOnly:
+			b.pos, b.held = -1, 0
 		}
 		return b.pos
 	}

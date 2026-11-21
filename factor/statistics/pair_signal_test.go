@@ -50,11 +50,66 @@ func TestBandConfigValidateRejectsAmbiguousRules(t *testing.T) {
 		{}, {Entry: 2, Exit: 2}, {Entry: 2, Exit: -1}, {Entry: 2, Exit: 0.5, Stop: 2},
 		{Entry: 2, Exit: 0.5, MaxHold: -1}, {Entry: 2, LongOnly: true, ShortOnly: true},
 		{Entry: math.NaN()},
+		{Entry: 2, Exit: 0.5, Mode: "trend"},
+		{Entry: 2, Exit: 0.5, Stop: 0.5, Mode: BandModeMomentum},
+		{Entry: 2, Exit: 0.5, Stop: 0.3, Mode: BandModeMomentum},
 	}
 	for i, c := range bad {
 		if _, err := NewBandTrader(c); err == nil {
 			t.Fatalf("case %d accepted: %+v", i, c)
 		}
+	}
+}
+
+func TestBandTraderMomentumMode(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  BandConfig
+		zs   []float64
+		want []int
+	}{
+		{
+			name: "momentum breakout long and short with mean-band take profit",
+			cfg:  BandConfig{Entry: 2.0, Exit: 0.5, Mode: BandModeMomentum},
+			zs:   []float64{0, 1.8, 2.2, 3.5, 1.1, 0.4, -2.3, -3.1, -0.8, -0.5},
+			want: []int{0, 0, 1, 1, 1, 0, -1, -1, -1, 0},
+		},
+		{
+			name: "momentum reverse stop blocks whipsaw until return inside exit",
+			cfg:  BandConfig{Entry: 2.0, Exit: 0.5, Stop: 1.2, Mode: BandModeMomentum},
+			zs:   []float64{2.4, 3.8, -1.5, -2.5, -0.8, 0.3, -2.4, 1.5, 2.6, 0.0, 2.2},
+			want: []int{1, 1, 0, 0, 0, 0, -1, 0, 0, 0, 1},
+		},
+		{
+			name: "momentum long-only and short-only",
+			cfg:  BandConfig{Entry: 2.0, Exit: 0.5, LongOnly: true, Mode: BandModeMomentum},
+			zs:   []float64{-2.5, 2.5, 0.2},
+			want: []int{0, 1, 0},
+		},
+	}
+	for _, tc := range cases {
+		bt, err := NewBandTrader(tc.cfg)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		for i, z := range tc.zs {
+			if got := bt.Step(z); got != tc.want[i] {
+				t.Fatalf("%s step %d z=%v: got %d want %d", tc.name, i, z, got, tc.want[i])
+			}
+		}
+	}
+	cfg := BandConfig{Entry: 2.0, Exit: 0.5, Stop: 1.2, MaxHold: 3, Mode: BandModeMomentum}
+	if r := cfg.CloseReason(1, 0.4); r != "exit" {
+		t.Fatalf("got %s want exit", r)
+	}
+	if r := cfg.CloseReason(1, -1.3); r != "stop" {
+		t.Fatalf("got %s want stop", r)
+	}
+	if r := cfg.CloseReason(1, 2.8); r != "maxhold" {
+		t.Fatalf("got %s want maxhold", r)
+	}
+	if r := cfg.CloseReason(-1, 1.3); r != "stop" {
+		t.Fatalf("got %s want stop", r)
 	}
 }
 

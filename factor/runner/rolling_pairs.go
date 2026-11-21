@@ -71,6 +71,18 @@ type RollingPairsSpec struct {
 	WeightMode string
 	// MaxPairGross caps any single pair's gross notional under WeightMode "inverse_vol" ([0, 1]).
 	MaxPairGross float64
+	// SpreadModel selects the online trading-period spread estimator:
+	// "" or "log_ols" (default), "raw_ols", "tls", "kalman", "ratio", or "return_diff".
+	SpreadModel string
+	// KalmanDelta is the state-transition noise ratio in (0, 1) under SpreadModel "kalman" (default 1e-4 when 0).
+	KalmanDelta float64
+	// KalmanVe is the observation noise variance (> 0) under SpreadModel "kalman" (default 1e-3 when 0).
+	KalmanVe float64
+	// DynamicHedge continuously updates an open position's hedge ratio to the latest online estimate.
+	DynamicHedge bool
+	// OnlineHalfLifeGate additionally enforces [MinHalfLife, MaxHalfLife] via statistics.FitOU
+	// on the online spread window before opening a new trade during the trading period.
+	OnlineHalfLifeGate bool
 
 	// HandoffMode controls how unselected open positions transition at reselection boundaries:
 	// "" or "graceful" (default): unselected open pairs remain in an exit-only pool (tracking their frozen Beta
@@ -237,6 +249,19 @@ func normalizeRollingPairsSpec(spec RollingPairsSpec) (RollingPairsSpec, error) 
 	}
 	if !finitePairFloat(spec.MaxPairGross) || spec.MaxPairGross < 0 || spec.MaxPairGross > 1+1e-9 {
 		return spec, errors.New("runner: rolling pairs max pair gross must be in [0, 1]")
+	}
+	smCfg, err := (statistics.SpreadModelConfig{
+		Model:       spec.SpreadModel,
+		Window:      spec.Window,
+		KalmanDelta: spec.KalmanDelta,
+		KalmanVe:    spec.KalmanVe,
+	}).Normalize()
+	if err != nil {
+		return spec, err
+	}
+	spec.SpreadModel, spec.KalmanDelta, spec.KalmanVe = smCfg.Model, smCfg.KalmanDelta, smCfg.KalmanVe
+	if spec.OnlineHalfLifeGate && spec.Window < 4 {
+		return spec, errors.New("runner: rolling pairs window must be at least 4 when online half-life gate is enabled")
 	}
 	switch spec.HandoffMode {
 	case "", "graceful":
@@ -467,7 +492,7 @@ func newTrackedRollingPairsBuilder(spec RollingPairsSpec, u factor.Universe, sid
 	)
 
 	// prewarmSpread feeds up to Window-1 aligned valid observations strictly prior to lastSlot in chronological order.
-	prewarmSpread := func(rs *statistics.RollingSpread, yIdx, xIdx, lastSlot int) {
+	prewarmSpread := func(rs *statistics.SpreadEstimator, yIdx, xIdx, lastSlot int) {
 		need := spec.Window - 1
 		if need <= 0 || histCount <= 1 {
 			return
@@ -483,7 +508,7 @@ func newTrackedRollingPairsBuilder(spec RollingPairsSpec, u factor.Universe, sid
 			}
 		}
 		for i := len(buf) - 1; i >= 0; i-- {
-			rs.Observe(buf[i].lx, buf[i].ly)
+			rs.ObserveLog(buf[i].lx, buf[i].ly)
 		}
 	}
 
@@ -553,7 +578,7 @@ func newTrackedRollingPairsBuilder(spec RollingPairsSpec, u factor.Universe, sid
 				ap.rec.stats.prevOK = false
 				if st.pos != 0 {
 					ap.rec.stats.closeEpisode(frame.DecisionTime, 0, "leg_missing")
-					st.pos, st.beta = 0, 0
+					st.pos, st.beta, st.modelBeta = 0, 0, 0
 					st.trader.Reset()
 					diags = append(diags, factor.Diagnostic{Code: "pair-closed-missing-leg", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
 				}
@@ -577,17 +602,17 @@ func newTrackedRollingPairsBuilder(spec RollingPairsSpec, u factor.Universe, sid
 			if st.pos == 0 {
 				return
 			}
-			point, ok := st.spread.Observe(st.curLX, st.curLY)
+			est, ok := st.spread.ObserveLog(st.curLX, st.curLY)
 			ap.observedThisBar = true
 			if !ok {
 				diags = append(diags, factor.Diagnostic{Code: "pair-warmup", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
 				return
 			}
-			st.lastStd = point.Std
+			st.lastStd = est.ScaleStd
 			ap.rec.stats.bars++
-			stepZ := point.Z
-			if !spec.DynamicExitZ {
-				if fz, okZ := st.spread.EvalWithBeta(st.curLX, st.curLY, st.beta); okZ {
+			stepZ := est.Z
+			if !spec.DynamicExitZ && !spec.DynamicHedge {
+				if fz, okZ := st.spread.EvalFrozenZ(st.curLX, st.curLY, st.modelBeta); okZ {
 					stepZ = fz
 				} else {
 					stepZ = math.NaN()
@@ -597,7 +622,9 @@ func newTrackedRollingPairsBuilder(spec RollingPairsSpec, u factor.Universe, sid
 			prev := st.pos
 			st.pos = st.trader.Step(stepZ)
 			if st.pos == 0 {
-				st.beta = 0
+				st.beta, st.modelBeta = 0, 0
+			} else if spec.DynamicHedge && !ap.exitOnly && betaAllowed(spec.MinBeta, spec.AllowNegativeBeta, est.NotionalBeta) {
+				st.beta, st.modelBeta = est.NotionalBeta, est.Beta
 			}
 			ap.rec.stats.observeStep(prev, st.pos, stepZ, st.beta, frame.DecisionTime, spec.Band)
 		}
@@ -632,7 +659,7 @@ func newTrackedRollingPairsBuilder(spec RollingPairsSpec, u factor.Universe, sid
 				}
 				if spec.HandoffMode == "immediate" {
 					ap.rec.stats.closeEpisode(frame.DecisionTime, fin(ap.stepZ), "reselect")
-					ap.state.pos, ap.state.beta = 0, 0
+					ap.state.pos, ap.state.beta, ap.state.modelBeta = 0, 0, 0
 					ap.state.trader.Reset()
 					recordZeroWeight(ap)
 					return
@@ -654,7 +681,12 @@ func newTrackedRollingPairsBuilder(spec RollingPairsSpec, u factor.Universe, sid
 					nextCurrent = append(nextCurrent, ap)
 					continue
 				}
-				rs, err := statistics.NewRollingSpread(spec.Window)
+				rs, err := statistics.NewSpreadEstimator(statistics.SpreadModelConfig{
+					Model:       spec.SpreadModel,
+					Window:      spec.Window,
+					KalmanDelta: spec.KalmanDelta,
+					KalmanVe:    spec.KalmanVe,
+				})
 				if err != nil {
 					return nil, nil, err
 				}
@@ -709,32 +741,36 @@ func newTrackedRollingPairsBuilder(spec RollingPairsSpec, u factor.Universe, sid
 				st.curLY, st.curLX, st.curOK = ly.Value, lx.Value, true
 				ap.rec.stats.accrue(ly.Value, lx.Value, navPrev)
 			}
-			point, ok := st.spread.Observe(st.curLX, st.curLY)
+			est, ok := st.spread.ObserveLog(st.curLX, st.curLY)
 			ap.observedThisBar = true
 			if !ok {
 				diags = append(diags, factor.Diagnostic{Code: "pair-warmup", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
 				continue
 			}
-			st.lastStd = point.Std
+			st.lastStd = est.ScaleStd
 			ap.rec.stats.bars++
 			if !tradable[st.y] || !tradable[st.x] {
 				continue
 			}
+			if math.Abs(est.Z) < spec.Band.Entry {
+				st.pos = st.trader.Step(est.Z)
+				continue
+			}
 			lo, hi := min(st.y, st.x), max(st.y, st.x)
-			canOpen := usedSlots < spec.PairCount && !retiringUnordered[[2]int32{lo, hi}] && betaAllowed(spec.MinBeta, spec.AllowNegativeBeta, point.Beta)
+			canOpen := usedSlots < spec.PairCount &&
+				!retiringUnordered[[2]int32{lo, hi}] &&
+				betaAllowed(spec.MinBeta, spec.AllowNegativeBeta, est.NotionalBeta) &&
+				(!spec.OnlineHalfLifeGate || entryHalfLifeAllowed(st.spread, &st.ouBuf, spec.MinHalfLife, spec.MaxHalfLife))
 			if !canOpen {
-				if math.Abs(point.Z) <= spec.Band.Exit {
-					st.pos = st.trader.Step(point.Z)
-				}
 				continue
 			}
 			prev := st.pos
-			st.pos = st.trader.Step(point.Z)
+			st.pos = st.trader.Step(est.Z)
 			if st.pos != 0 {
-				st.beta = point.Beta
+				st.beta, st.modelBeta = est.NotionalBeta, est.Beta
 				usedSlots++
 			}
-			ap.rec.stats.observeStep(prev, st.pos, point.Z, st.beta, frame.DecisionTime, spec.Band)
+			ap.rec.stats.observeStep(prev, st.pos, est.Z, st.beta, frame.DecisionTime, spec.Band)
 		}
 
 		combined := make([]*activeRollingPair, 0, len(retiring)+len(current))

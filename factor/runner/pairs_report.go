@@ -41,21 +41,13 @@ func (s *pairStats) accrue(ly, lx, navPrev float64) {
 // observeStep records the band transition of one decision: prev -> pos at z-score z.
 func (s *pairStats) observeStep(prev, pos int, z, beta float64, at int64, band statistics.BandConfig) {
 	if prev != 0 && pos != prev {
-		abs := math.Abs(z)
-		reason := "maxhold"
-		switch {
-		case band.Stop > 0 && abs >= band.Stop:
-			reason = "stop"
-		case abs <= band.Exit:
-			reason = "exit"
-		}
-		s.closeEpisode(at, z, reason)
+		s.closeEpisode(at, z, band.CloseReason(prev, z))
 	}
 	if pos != 0 && s.open == nil {
 		s.open = &PairEpisode{StartMS: at, Dir: pos, EntryZ: z, Beta: beta}
-		s.lastBeta = beta
 	}
 	if pos != 0 {
+		s.lastBeta = beta
 		s.inMarket++
 		s.open.Bars++
 	}

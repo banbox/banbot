@@ -39,15 +39,21 @@ type Pair struct{ Y, X string }          // exactly the symbol in the run SIDMap
 type PairsSpec struct {
     Pairs             []Pair
     Field             string                // kline field, default "close"
-    Window            int                   // regression window (decision bars), >= 3
-    Band              statistics.BandConfig // see 2.3
+    Window            int                   // regression/warmup window (decision bars), >= 3 (>= 4 with half-life gate)
+    Band              statistics.BandConfig // see 2.3 (supports Mode: ""/"reversion" or "momentum")
     Gross             float64               // base notional per pair as fraction of strategy NAV; 0 = 1/len(Pairs)
-    MinBeta           float64               // minimum entry β floor (>=0), see 2.4
-    AllowNegativeBeta bool                  // default false (requires entry β > max(0, MinBeta))
-    DynamicExitZ      bool                  // default false (holding exit/stop z uses frozen β via EvalWithBeta)
+    MinBeta           float64               // minimum entry notional β floor (>=0), see 2.4
+    AllowNegativeBeta bool                  // default false (requires entry notional β > max(0, MinBeta))
+    DynamicExitZ      bool                  // default false (linear models evaluate holding exit/stop z on frozen slope)
     DriftBand         float64               // holding-period L1 weight drift buffer (>=0, 0 disables)
-    WeightMode        string                // ""/"equal" (default fixed Gross) or "inverse_vol" (1/Std risk parity)
+    WeightMode        string                // ""/"equal" (default fixed Gross) or "inverse_vol" (1/ScaleStd risk parity)
     MaxPairGross      float64               // per-pair gross cap [0,1] under inverse_vol; 0 defaults to min(TotalGross, 2*Gross)
+    SpreadModel       string                // ""/"log_ols" (default), "raw_ols", "tls", "kalman", "ratio", "return_diff"
+    KalmanDelta       float64               // state-transition noise ratio in (0,1) for "kalman"; 0 defaults to 1e-4
+    KalmanVe          float64               // observation noise variance (>0) for "kalman"; 0 defaults to 1e-3
+    DynamicHedge      bool                  // default false (freeze entry β); true updates open hedge ratio online
+    MinHalfLife       float64               // optional online entry FitOU DiscreteHalfLife floor (>=0, in bars)
+    MaxHalfLife       float64               // optional online entry FitOU DiscreteHalfLife ceiling (>=0, 0 disables)
 }
 ```
 
@@ -59,7 +65,7 @@ Registration occupies the definition name `name` and the factory name `name-pair
 
 ### 2.2 Validation (after build returns)
 
-Empty `build`/`name` → registration fails; non-empty `Params.Err()` → that error is returned; `Field==""` → `"close"`; `len(Pairs)==0`, `Window<3`, `Band.Validate()` failure → error; `Gross==0` → `1/len(Pairs)`; `Gross<=0` or `Gross*len(Pairs) > 1+1e-9` → error (total exposure must not exceed NAV); `MinBeta<0`, `DriftBand<0`, or non-finite → error; `WeightMode` other than `""`/`"equal"`/`"inverse_vol"` → error; `MaxPairGross` outside `[0,1]` or non-finite → error; `Y==""`/`X==""`/`Y==X` → error; Y/X not in the run `SIDMap` (and not in `UnavailableSymbols`) → error when constructing the portfolio builder (`PreparePortfolioConfig`, before resource assembly).
+Empty `build`/`name` → registration fails; non-empty `Params.Err()` → that error is returned; `Field==""` → `"close"`; `len(Pairs)==0`, `Window<3` (or `Window<4` when `MinHalfLife`/`MaxHalfLife` is enabled), `Band.Validate()` failure → error; `Gross==0` → `1/len(Pairs)`; `Gross<=0` or `Gross*len(Pairs) > 1+1e-9` → error (total exposure must not exceed NAV); `MinBeta<0`, `DriftBand<0`, `MinHalfLife<0`, `MaxHalfLife<0` (or `0<MaxHalfLife<MinHalfLife`), or non-finite → error; `SpreadModel` other than `""`/`"log_ols"`/`"raw_ols"`/`"tls"`/`"kalman"`/`"ratio"`/`"return_diff"` → error; `KalmanDelta` outside `(0,1)` (0 defaults to `1e-4`) or `KalmanVe<=0` (0 defaults to `1e-3`) → error; `WeightMode` other than `""`/`"equal"`/`"inverse_vol"` → error; `MaxPairGross` outside `[0,1]` or non-finite → error; `Y==""`/`X==""`/`Y==X` → error; Y/X not in the run `SIDMap` (and not in `UnavailableSymbols`) → error when constructing the portfolio builder (`PreparePortfolioConfig`, before resource assembly).
 
 Tradability is not checked at construction time (see 2.4).
 
@@ -68,38 +74,54 @@ Tradability is not checked at construction time (see 2.4).
 ```go
 type BandConfig struct {
     Entry, Exit, Stop float64
-    MaxHold           int   // decision rounds, 0 disables
-    LongOnly          bool  // forbid shorting the spread (z >= Entry)
-    ShortOnly         bool  // forbid going long the spread (z <= -Entry)
+    MaxHold           int    // decision rounds, 0 disables
+    LongOnly          bool   // forbid shorting the spread (-1)
+    ShortOnly         bool   // forbid going long the spread (+1)
+    Mode              string // ""/"reversion" (default mean-reversion) or "momentum" (breakout trend-following)
 }
 func (c BandConfig) Validate() error
+func (c BandConfig) CloseReason(prevPos int, z float64) string
 func NewBandTrader(cfg BandConfig) (*BandTrader, error)   // one instance per spread
 func (b *BandTrader) Step(z float64) int                  // -1/0/+1
 func (b *BandTrader) Position() int
 ```
 
-Validation: thresholds finite; `Entry>0`; `0<=Exit<Entry`; `Stop==0 or Stop>Entry`; `MaxHold>=0`; LongOnly and ShortOnly mutually exclusive. **No built-in threshold defaults** (the 2 in `p.Float("entry", 2)` is the caller's choice).
+Validation: `Mode` in `""`/`"reversion"`/`"momentum"`; thresholds finite; `Entry>0`; `0<=Exit<Entry`; `Stop==0 or Stop>Entry` under `"reversion"`, `Stop==0 or Stop>Exit` under `"momentum"`; `MaxHold>=0`; LongOnly and ShortOnly mutually exclusive. **No built-in threshold defaults** (the 2 in `p.Float("entry", 2)` is the caller's choice).
 
 State transitions:
 1. Each `Step` first: if `blocked` and `|z|<=Exit` → clear it.
 2. Non-finite z: return the current position, state unchanged.
-3. Holding: `held++`, then by priority: `Stop>0 and |z|>=Stop` → close and set `blocked`; `|z|<=Exit` → close (does not set blocked); `MaxHold>0 and held>=MaxHold` → close and set `blocked`.
-4. Flat: `blocked` or `|z|>=Stop` (Stop>0) → stay 0; otherwise `z<=-Entry` → +1 (long spread), `z>=Entry` → -1 (short spread), subject to LongOnly/ShortOnly; on entry `held=0`; a position never flips direction in a single step.
+3. `"reversion"` (default mean-reversion):
+   - Holding: `held++`, then by priority: `Stop>0 and |z|>=Stop` → close and set `blocked`; `|z|<=Exit` → close (does not set blocked); `MaxHold>0 and held>=MaxHold` → close and set `blocked`.
+   - Flat: `blocked` or `|z|>=Stop` (Stop>0) → stay 0; otherwise `z<=-Entry` → +1 (long spread), `z>=Entry` → -1 (short spread), subject to LongOnly/ShortOnly.
+4. `"momentum"` (relative-strength breakout):
+   - Holding: `held++`, then by priority: `Stop>0` and reverse breakdown (`pos>0 && z<=-Stop` or `pos<0 && z>=Stop`) → close and set `blocked` (`stop`); pullback to mean band (`pos>0 && z<=Exit` or `pos<0 && z>=-Exit`) → take-profit close (`exit`, not blocked); `MaxHold>0 and held>=MaxHold` → close and set `blocked` (`maxhold`).
+   - Flat: `blocked` → stay 0; otherwise `z>=Entry` → +1 (long spread breakout), `z<=-Entry` → -1 (short spread breakdown), subject to LongOnly/ShortOnly; a position never flips direction in a single step.
 
 `blocked`: after a stop-loss/expiry close, re-entry is allowed only once z returns to `[-Exit,Exit]`.
 
 ### 2.4 Runtime Semantics (each decision round)
 
-Each pair holds a private `RollingSpread`, `BandTrader`, frozen β, latest valid residual `Std`, position, and prior held-weight baseline. Each round:
+Each pair holds a private `SpreadEstimator` (6 `SpreadModel` modes), `BandTrader`, frozen notional β and model slope, latest dimensionless `ScaleStd`, position, and prior held-weight baseline.
+
+**Supported `SpreadModel` values**:
+- `""` / `"log_ols"` (default): rolling OLS on log prices `ln(Y) = α + β·ln(X)`, `NotionalBeta = β`.
+- `"raw_ols"`: rolling OLS on raw prices `Y = α + β_raw·X` (1 unit of Y hedged by `-β_raw` units of X), converted to dollar-notional hedge ratio `NotionalBeta = β_raw · (priceX / priceY)` with `ScaleStd = Std / priceY`.
+- `"tls"`: symmetric orthogonal (Deming / Total Least Squares) regression on log prices satisfying `β_YX · β_XY = 1` and `Z_YX = -Z_XY` when Y and X are swapped.
+- `"kalman"`: state-space random-walk filter (`statistics.KalmanPair`, `ProcessVariance = KalmanDelta/(1-KalmanDelta)`, `ObservationVariance = KalmanVe`), activated after `Window` warmup bars using pre-update one-step innovation `Z = Error / sqrt(Variance)`; supports `DynamicHedge: true` to update open hedge ratios continuously.
+- `"ratio"`: rolling price ratio `R = Y/X` Bollinger z-score `(R - mean)/std` with fixed equal dollar-neutral `NotionalBeta = 1.0` (`wY = +0.5·pos·G, wX = -0.5·pos·G`).
+- `"return_diff"`: rolling cumulative return difference `(Y/Y_0) - (X/X_0)` z-score with fixed equal dollar-neutral `NotionalBeta = 1.0`.
+
+Each round:
 
 | Step | Condition | Behavior | Diagnostic code |
 | --- | --- | --- | --- |
 | a | Y/X `pairs-log-v1` value missing or not Valid (including price<=0) | Pause the pair; close any open position immediately and reset state machine (`leg_missing`) | `pair-input-missing` / `pair-closed-missing-leg` |
-| b | `RollingSpread.Observe` not ready (window not full, x variance<=1e-12, residual std<=1e-12, non-finite) | Skip; do not advance BandTrader | `pair-warmup` |
+| b | `SpreadEstimator.ObserveLog` not ready (window/warmup incomplete, zero variance, non-finite) | Skip; do not advance BandTrader | `pair-warmup` |
 | c | Ready, a leg is not tradable, current position 0 | Do not open; do not advance BandTrader | none |
-| c2 | Ready, current position 0, entry β fails guard (`Beta <= max(0, MinBeta)` under default `!AllowNegativeBeta`; `|Beta| <= MinBeta` when `AllowNegativeBeta && MinBeta>0`) | Do not open (only advances BandTrader when `|z|<=Exit` to clear `blocked`) | none |
-| d | Ready, current position non-zero (including untradable leg or current rolling β<=0) | Advance BandTrader using frozen-β z from `EvalWithBeta(lx, ly, frozenβ)` by default (`point.Z` when `DynamicExitZ: true`); may close per rules | none |
-| e | After `Step` position≠0 and previous position was 0 (or flipped and passed β guard) | Freeze β = this period's `SpreadPoint.Beta` | none |
+| c2 | Ready, current position 0, at `|z| >= Entry` notional β fails guard or online `FitOU` half-life gate fails (non-reverting or `DiscreteHalfLife` outside `[MinHalfLife, MaxHalfLife]`) | Block entry (`|z| < Entry` still advances state machine to clear `blocked`) | none |
+| d | Ready, current position non-zero | Advance BandTrader using `EvalFrozenZ` (frozen-slope window z on linear models; `est.Z` when `DynamicExitZ: true` or `DynamicHedge: true`); may close per rules | none |
+| e | After `Step` opens a position (or holds with `DynamicHedge: true` passing β guard) | Record/update notional `β = est.NotionalBeta` | none |
 | f | No pair is ready (and none closed for a missing leg) | Return nil target + `pairs-not-ready` | `pairs-not-ready` |
 | g | Otherwise | Compute target weights for every pair with position≠0 using `WeightMode` and `DriftBand`; non-empty diagnostics attach to the target | this round's diagnostics |
 
@@ -142,9 +164,9 @@ run_policy:
 
 **The Weights ledger charges for drift**: each time the ledger executes a target it recomputes quantity as `qty = w × spec.Budget.NAV / price` (NAV = ledger NAV at decision time, compounding with PnL), and charges `fee_rate`+`slippage_rate` on the difference from existing quantity. With `DriftBand == 0`, pairs output constant target weights every decision round, so **price drift during the holding period is rebalanced back to target weights every round and charged**; setting `DriftBand > 0` emits naturally drifted weights while inside the band to avoid unnecessary friction cost. Gross is a fraction of current NAV, not initial NAV. `research.Evaluate`'s `Costs = CostRate × Σ|w−w_prev|` counts only weight differences and excludes drift, a different basis from the ledger (`Result.Book` is the ledger basis). Whether the Events path also generates drift-rebalance fills is untested.
 
-### 2.7 Custom Paths (static β, Kalman, multi-leg baskets)
+### 2.7 Custom Paths (static β, multi-leg baskets)
 
-`RegisterPairs` takes β from rolling OLS and **cannot inject a static β or Kalman state**; use the general interfaces:
+Two-leg dynamic OLS, orthogonal TLS, Kalman filtering, price ratio, and return-difference models are supported natively via `SpreadModel` on `RegisterPairs` and `RegisterRollingPairs`; use the general interfaces only when injecting an **external static β** or trading **3+ leg Johansen baskets**:
 1. `runner.RegisterDefinition(name, func(c runner.Config) (*factor.Plan, research.ComboSpec, error))`: `factor.New().Add(name, node).Compile()` compiles log-price nodes (`factor.Field("kline", field, c.Factor.TimeFrame)` + `factor.Custom(version, inputs, fn)`, same form as `pairs-log-v1`), combined as `research.ComboSpec{Method: research.Equal, Columns: [...]}`.
 2. `runner.RegisterPortfolioFactory(name, func(c runner.Config) (runner.PortfolioBuilder, error), validator)`: the name must contain `-v`; the validator does pure parameter checks only and does not construct state.
 3. Builder: `func(frame factor.Frame, universe factor.Universe, spec factor.PortfolioSpec, def research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error)`; output `factor.NewTargetPortfolio(spec, weights)`, using the incoming `spec`.
@@ -179,9 +201,14 @@ type RollingPairsSpec struct {
     AllowNegativeBeta bool                  // default false (requires β > max(0, MinBeta))
     DynamicExitZ      bool                  // default false (holding exit z uses frozen β via EvalWithBeta)
     DriftBand         float64               // holding-period L1 weight drift buffer (>=0)
-    WeightMode        string                // ""/"equal" or "inverse_vol"
-    MaxPairGross      float64               // per-pair cap [0,1] under inverse_vol; 0 defaults to min(TotalGross, 2*Gross)
-    HandoffMode       string                // ""/"graceful" (default exit-only handoff) or "immediate"
+    WeightMode         string                // ""/"equal" or "inverse_vol"
+    MaxPairGross       float64               // per-pair cap [0,1] under inverse_vol; 0 defaults to min(TotalGross, 2*Gross)
+    SpreadModel        string                // ""/"log_ols" (default), "raw_ols", "tls", "kalman", "ratio", "return_diff"
+    KalmanDelta        float64               // state-transition noise ratio in (0,1) for "kalman"; 0 defaults to 1e-4
+    KalmanVe           float64               // observation noise variance (>0) for "kalman"; 0 defaults to 1e-3
+    DynamicHedge       bool                  // true updates open notional hedge ratios online
+    OnlineHalfLifeGate bool                  // true enforces FitOU DiscreteHalfLife in [MinHalfLife, MaxHalfLife] before online entry
+    HandoffMode        string                // ""/"graceful" (default exit-only handoff) or "immediate"
 }
 ```
 
@@ -251,19 +278,35 @@ func (j JohansenResult) TraceRank(criticalValues []float64) (int, error)       /
 - **FitOU**: when counting in bars use `DiscreteHalfLife`.
 - **Johansen** eigenvectors must be normalized by one leg before deriving leg weights; `TraceRank` critical values must correspond to the same lags, deterministic terms, and significance level.
 
-### 3.2 Online Rolling Spread (used by `RegisterPairs`)
+### 3.2 Online Rolling Spread and Unified Spread Estimator (used by `RegisterPairs` / `RegisterRollingPairs`)
 
 ```go
 type SpreadPoint struct {
-    Alpha, Beta float64   // current-window OLS: y = alpha + beta*x
-    Residual    float64   // current observation y - alpha - beta*x
-    Std         float64   // window residual standard deviation, ddof=2
+    Alpha, Beta float64   // current-window fit: y = alpha + beta*x
+    Residual    float64   // current residual (or Kalman pre-update innovation)
+    Std         float64   // residual scale (OLS/TLS ddof=2; ratio/return_diff ddof=1; kalman sqrt(Variance))
     Z           float64   // Residual / Std
 }
 func NewRollingSpread(window int) (*RollingSpread, error)                       // window >= 3
 func (r *RollingSpread) Window() int
-func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)               // x is the X leg, y the Y leg (log prices)
+func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)               // x is the X leg, y the Y leg
 func (r *RollingSpread) EvalWithBeta(x, y, frozenBeta float64) (float64, bool)  // fixed-slope window residual z (ddof=1), read-only
+
+type SpreadModelConfig struct {
+    Model       string  // ""/"log_ols", "raw_ols", "tls", "kalman", "ratio", "return_diff"
+    Window      int     // >= 3
+    KalmanDelta float64 // (0,1), 0 defaults to 1e-4
+    KalmanVe    float64 // >0, 0 defaults to 1e-3
+}
+type SpreadEstimate struct {
+    SpreadPoint
+    NotionalBeta float64 // dollar-notional hedge ratio (Beta*(priceX/priceY) for raw_ols; 1.0 for ratio/return_diff)
+    ScaleStd     float64 // dimensionless spread volatility for cross-pair "inverse_vol" sizing
+}
+func NewSpreadEstimator(cfg SpreadModelConfig) (*SpreadEstimator, error)
+func (e *SpreadEstimator) ObserveLog(lx, ly float64) (SpreadEstimate, bool)
+func (e *SpreadEstimator) EvalFrozenZ(lx, ly, frozenModelBeta float64) (float64, bool)
+func (e *SpreadEstimator) WindowSeries(dst []float64) ([]float64, bool)
 ```
 
 `Observe` returns `ok=false`: window not full, non-finite input (sample skipped), x window variance<=1e-12, residual std<=1e-12; each call runs a full OLS on the current window, and under log prices β is an elasticity. `EvalWithBeta` computes the z-score of `y - frozenBeta*x` against the window's `r_i = y_i - frozenBeta*x_i` sample mean and std (`ddof=1`, `ok=false` when window not full, non-finite input, or `std<=1e-12`) without mutating the ring buffer.

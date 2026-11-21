@@ -99,7 +99,7 @@
 | `paper.go` / `paper_sink.go` / `paper_group.go` | 本地纸面账户；同账户多策略共享 borrow 与 paperMarket |
 | `validate.go` / `live_validate.go` | 回放/实盘配置校验，`resolveDecisionPortfolio` |
 | `risk_builder.go` / `model_builder.go` | 自定义风险优化与模型组合 builder 的配置与构造 |
-| `pairs.go` / `rolling_pairs.go` / `simple.go` | 固定配对 builder（`RegisterPairs`/`PairsSpec`）、周期性“形成期+交易期”滚动重选配对 builder（`RegisterRollingPairs`/`RollingPairsSpec`：支持协整 `EngleGranger`+`FitOU` 与 Gatev 最小距离法 `distance`、`graceful`/`immediate` 换期交接、正 Beta 守卫、冻结对冲比退出 Z、`DriftBand`、`WeightMode: "inverse_vol"`）及简单因子注册 |
+| `pairs.go` / `rolling_pairs.go` / `simple.go` | 固定配对 builder（`RegisterPairs`/`PairsSpec`）、周期性“形成期+交易期”滚动重选配对 builder（`RegisterRollingPairs`/`RollingPairsSpec`：支持 6 类在线价差估计器 `SpreadModel`、协整 `EngleGranger`+`FitOU` 与 Gatev 最小距离法 `distance`、`graceful`/`immediate` 换期交接、正 Beta 守卫、OU 半衰期在线门控、均值回归/顺势突破 `BandConfig.Mode`、冻结对冲比退出 Z / `DynamicHedge`、`DriftBand`、`WeightMode: "inverse_vol"`）及简单因子注册 |
 | `pairs_report.go` / `report.go` | 每对独立结果的记账（`pairStats`、`pairsTracker`/`rollingPairsTracker`、`buildPairResult`）与结果类型（`PairResult`、`PairEpisode`、`Attribution`、`SymbolContribution`、`buildAttribution`）；`runObservers` 把 factory 内创建的配对状态带回 `Result` |
 | `params.go` / `scan.go` / `config.go` | 参数容器（`Params`，`Unused` 校验）、参数扫描、运行配置辅助 |
 | `terminal.go` / `option_expiry.go` | 终止标的与期权到期结算相关处理 |
@@ -111,7 +111,7 @@
 按主题分组（括号内为代表文件，共约 99 个非测试文件）：
 
 - **统计套利/协整**：`johansen.go`（Johansen VECM，临界值需外部给入）、`stationarity.go`（ADF 统计量与 EngleGranger，非 p 值）、`vidyamurthy.go`（滞后价差滤波、Bootstrap 持续期、正则化选择）、`spreads.go`（阈值经验估计、穿越持续时间）、`pairs.go`（`Regress`、`FitOU`、`KalmanPair` 等基础件，内含 `finite` 副本）。
-- **配对信号**：`pair_signal.go`（`BandTrader` z 分数滞回状态机、`RollingSpread`）、`kalman_fit.go`（Q/R 的 MLE 拟合）、`vid_*.go`（滞后选择、配对成交校验、二部图流、动态 AR(1)、合并失败概率）。
+- **配对信号**：`pair_signal.go`（`BandTrader` z 分数滞回状态机，支持均值回归 `reversion` 与顺势突破 `momentum`；`RollingSpread`）、`spread_model.go`（统一在线价差估计器 `SpreadEstimator`：`log_ols`、`raw_ols`、`tls`、`kalman`、`ratio`、`return_diff`）、`kalman_fit.go`（Q/R 的 MLE 拟合）、`vid_*.go`（滞后选择、配对成交校验、二部图流、动态 AR(1)、合并失败概率）。
 - **Chan 系列**（`chan_*.go`，24 个）：时序（arima/arma/garch/var/vec/trend/locallevel/hmm）、机器学习（svm/nn/tree/classification/stepwise）、组合与风险（frontier/umd/multisort/calmar）、微观结构（orderbook/displayed_sweep/trade_classification/implied_quotes/crossvenue/moving_volume）。
 - **AFML 系列**（`afml*.go`，49 个）：CUSUM 与三重屏障标签、活动/信息 bar、序贯 bootstrap 与随机森林、PurgedKFold/CPCV/PBO、PSR/DSR、HRP 与最小方差、双高斯仓位、熵特征、VPIN/PIN、流式协方差与 PCA。
 - **因子分析与组合**：`factor_analysis.go`（EM）、`factor_rotation.go`（varimax）、`pca.go`、`neutral_allocation.go`。
@@ -148,8 +148,8 @@
 | `AccountApplication` | `runner/account_application.go:30` | 查询 + 命令接口；本地与 hub 两种实现 |
 | `policySinkCheckpoint` | `runner/account_policy_sink.go:19` | 组合策略接纳的原子 checkpoint（Version、State、Target、Sequence 等） |
 | `HistoricalInput` / `storageInput` | `runner/input.go:42` / `runner/storage_input.go:150` | 回放输入抽象与分页存储实现 |
-| `BandConfig` / `BandTrader` | `statistics/pair_signal.go:15` / `:44` | 价差 z 分数滞回交易器，+1 多价差，-1 空价差 |
-| `RollingSpread` / `KalmanPair` | `statistics/pair_signal.go` / `statistics/pairs.go` | 滚动 OLS 价差（`Observe` 重拟合与 `EvalWithBeta` 固定对冲比窗口 Z-Score）；Kalman 新息（预更新） |
+| `BandConfig` / `BandTrader` | `statistics/pair_signal.go` | 价差 z 分数滞回状态机（`Mode`: `""`/`"reversion"` 均值回归或 `"momentum"` 顺势突破），+1 多价差，-1 空价差 |
+| `RollingSpread` / `SpreadEstimator` / `KalmanPair` | `statistics/pair_signal.go` / `spread_model.go` / `pairs.go` | 滚动 OLS 价差、统一两腿在线价差估计器（`log_ols`/`raw_ols`/`tls`/`kalman`/`ratio`/`return_diff`）与 Kalman 预更新新息状态空间模型 |
 
 ## 关键流程
 
@@ -217,10 +217,18 @@ lifecycle policy 下的 PIT：被剔标的若已有标记/持仓/policy 状态�
 
 ### 9. 统计套利（配对）
 
-`runner/pairs.go`（固定配对 `RegisterPairs`）与 `runner/rolling_pairs.go`（滚动重选配对 `RegisterRollingPairs`）共用 `compilePairsLogPlan`（`pairs-log-v1` 对数价格节点，闭包无状态满足 CSE 安全要求）、`statistics.NewBandTrader` 与 `NewRollingSpread`；`BandTrader` 每个实例只能服务一个价差，Stop / MaxHold 平仓后阻塞再入场直到 `|z| ≤ Exit`。
+`runner/pairs.go`（固定配对 `RegisterPairs`）与 `runner/rolling_pairs.go`（滚动重选配对 `RegisterRollingPairs`）共用 `compilePairsLogPlan`（`pairs-log-v1` 对数价格节点，闭包无状态满足 CSE 安全要求）、`statistics.NewBandTrader` 与统一在线价差估计器 `statistics.NewSpreadEstimator`；`BandTrader` 每个实例只能服务一个价差，Stop / MaxHold 平仓后阻塞再入场直到 `|z| ≤ Exit`。
 
-- **入场 Beta 守卫**（`MinBeta`、`AllowNegativeBeta`）：默认（`!AllowNegativeBeta`）仅当滚动回归 `point.Beta > max(0, MinBeta)` 时才允许开新仓（或反手）；若 `AllowNegativeBeta` 为真且 `MinBeta > 0`，要求 `|point.Beta| > MinBeta`。空仓不满足条件时不开仓（若 `|point.Z| ≤ Exit` 仍推进状态机以解除止损阻塞）；已有持仓不受 Beta 守卫阻拦，照常按规则平仓。
-- **持仓期冻结对冲比退出 Z 一致性**（`RollingSpread.EvalWithBeta`、`DynamicExitZ`）：入场后对冲比 `st.beta` 冻结；默认（`!DynamicExitZ`）持仓期的退出/止损 Z-Score 由 `RollingSpread.EvalWithBeta(lx, ly, st.beta)` 按当前有效滚动窗口内固定斜率残差 `r_i = y_i − st.beta·x_i` 的均值与样本标准差（`ddof=1`）计算，使退出信号与实际持仓盈亏严格一致（设 `DynamicExitZ: true` 可改回每轮重拟合的 `SpreadPoint.Z`）。
+- **在线两腿价差估计器**（`SpreadModel`、`KalmanDelta`、`KalmanVe`、`DynamicHedge`）：
+  - `""` / `"log_ols"`（默认）：对数价格滚动窗口 OLS `ln(Y) = α + β·ln(X)`，名义对冲比 `NotionalBeta = β`。
+  - `"raw_ols"`：原始价格滚动窗口 OLS `Y = α + β_raw·X`，1 单位 Y 配 `-β_raw` 单位 X，换算为美元名义对冲比 `NotionalBeta = β_raw · (priceX / priceY)` 输出至 `TargetPortfolio`，跨配对风险平价使用无量纲 `Std / priceY`，`pairsTracker` 仍按精确简单收益率记账。
+  - `"tls"`：对数价格二维对称正交回归（Deming / Total Least Squares），满足交换 Y/X 时斜率严格互为倒数 `β_YX · β_XY = 1` 且 `Z_YX = −Z_XY`，消除因变量选择偏差。
+  - `"kalman"`：复用 `statistics.KalmanPair`（中心化对数坐标下随机游走斜率/截距，`KalmanDelta` 默认 `1e-4` 对应 `ProcessVariance = δ/(1−δ)`，`KalmanVe` 默认 `1e-3`），预热满 `Window` 步后激活，以更新前一步预测新息 `Z = Error / sqrt(Variance)` 作为无前视在线 Z-Score；设 `DynamicHedge: true` 时持仓对冲比随在线斜率连续更新，默认（`false`）入场冻结。
+  - `"ratio"`：价格比值 `R = Y / X` 滚动均值与标准差布林带 `Z = (R − mean) / std`，固定等额美元中性对冲 `NotionalBeta = 1.0`（`wY = +0.5·pos·G, wX = −0.5·pos·G`）。
+  - `"return_diff"`：滚动窗口累计收益率差 `(Y/Y_0) − (X/X_0)` 的 Z-Score，固定等额美元中性对冲 `NotionalBeta = 1.0`。
+- **交易方向模式**（`BandConfig.Mode`）：`""` / `"reversion"`（默认均值回归：`z ≤ −Entry` 做多价差 `+1`、`z ≥ Entry` 做空价差 `−1`，`|z| ≤ Exit` 平仓，`|z| ≥ Stop` 止损并阻塞）；`"momentum"`（顺势突破：`z ≥ Entry` 追多价差 `+1`、`z ≤ −Entry` 追空价差 `−1`，回落至 `z ≤ Exit`〔多〕或 `z ≥ −Exit`〔空〕平仓，`Stop > Exit` 时反向跌破 `z ≤ −Stop`〔多〕或 `z ≥ Stop`〔空〕止损并阻塞直至 `|z| ≤ Exit`）。
+- **入场 Beta 守卫与 OU 半衰期在线门控**（`MinBeta`、`AllowNegativeBeta`、`MinHalfLife`、`MaxHalfLife`、`RollingPairsSpec.OnlineHalfLifeGate`）：默认（`!AllowNegativeBeta`）仅当 `NotionalBeta > max(0, MinBeta)` 时允许开新仓（`AllowNegativeBeta && MinBeta > 0` 时要求 `|NotionalBeta| > MinBeta`）。当 `PairsSpec` 配置了 `MinHalfLife > 0` 或 `MaxHalfLife > 0`（或 `RollingPairsSpec` 开启 `OnlineHalfLifeGate: true`）时，空仓拟入场前对当前窗口价差序列调用 `statistics.FitOU` 校验 `DiscreteHalfLife` 落在合法区间内，拦截已发散成趋势或回归过慢的窗口；已有持仓不受阻拦，照常平仓。
+- **持仓期冻结对冲比退出 Z 一致性**（`SpreadEstimator.EvalFrozenZ`、`DynamicExitZ`）：入场后模型斜率与名义对冲比冻结（除非 `DynamicHedge: true`）；默认（`!DynamicExitZ && !DynamicHedge`）在线性回归模型（`log_ols`/`raw_ols`/`tls`）下按当前滚动窗口与入场冻结斜率计算退出/止损 Z-Score（`ddof=1`），在 `kalman`/`ratio`/`return_diff` 下保持与入场同尺度的当期模型 Z-Score。
 - **持仓期免漂移调仓缓冲带**（`DriftBand`）：当 `DriftBand > 0` 且某配对本轮未发生开平仓或方向切换（`st.pos == prev`）时，按上一轮输出权重随两腿价格和策略 `Budget.NAV` 自然漂移后的交易前权重 `(preWY, preWX)` 与本轮理论目标权重比较；若 L1 偏离 `|idealWY − preWY| + |idealWX − preWX| < DriftBand`，保持 `(preWY, preWX)` 不触发微调（若所有配对总敞口因漂移超 `1` 则将超额的缓冲配对回退到理论权重，保证总敞口严格 `≤ 1`）。`pairStats` 以 `(preWY, preWX)` 为换手基准记账（缓冲轮次主动换手为 0），与账本成交和 `PairsResidual` 精确对账。
 - **跨配对风险平价分配**（`WeightMode`、`MaxPairGross`）：`WeightMode` 为 `""`/`"equal"`（默认）时每对开仓固定分配 `Gross`；为 `"inverse_vol"` 时将可用配对总预算 `TotalGross = Gross × 可用配对槽位数` 按当前持仓配对价差残差标准差 `point.Std` 的倒数归一化分配（注水法裁剪单对上限 `MaxPairGross`，未设时默认 `min(TotalGross, 2×Gross)`，被不可用跳过的配对仍不放大总预算），总敞口严格 `≤ 1`。
 - **周期性滚动重选配对**（`RegisterRollingPairs`、`RollingPairsSpec`）：注册定义名 `<name>` 与组合工厂 `<name>-rolling-pairs-v1`。

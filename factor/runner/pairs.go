@@ -48,6 +48,26 @@ type PairsSpec struct {
 	// MaxPairGross caps any single pair's gross notional under WeightMode "inverse_vol".
 	// Default 0 uses min(TotalGross, 2*Gross). Must be in [0, 1].
 	MaxPairGross float64
+	// SpreadModel selects the online two-leg spread estimator:
+	// "" or "log_ols" (default): rolling OLS on log prices ln(Y) = alpha + beta*ln(X).
+	// "raw_ols": rolling OLS on raw prices Y = alpha + beta*X with notional hedge beta*(X/Y).
+	// "tls": symmetric orthogonal (Deming / Total Least Squares) regression on log prices.
+	// "kalman": state-space random-walk slope/intercept filter (statistics.KalmanPair) with pre-update innovation Z.
+	// "ratio": rolling price ratio R = Y/X Bollinger z-score with equal dollar-neutral hedge (beta = 1).
+	// "return_diff": rolling cumulative return spread (Y/Y_0) - (X/X_0) z-score with equal dollar-neutral hedge (beta = 1).
+	SpreadModel string
+	// KalmanDelta is the state-transition noise ratio in (0, 1) under SpreadModel "kalman" (default 1e-4 when 0).
+	KalmanDelta float64
+	// KalmanVe is the observation noise variance (> 0) under SpreadModel "kalman" (default 1e-3 when 0).
+	KalmanVe float64
+	// DynamicHedge continuously updates an open position's hedge ratio to the latest online estimate
+	// instead of freezing it at entry.
+	DynamicHedge bool
+	// MinHalfLife and MaxHalfLife optionally gate new entries online using statistics.FitOU
+	// DiscreteHalfLife (in decision bars) on the current rolling spread window.
+	// When either is > 0, non-reverting windows (FitOU error or DiscreteHalfLife out of range) block entry.
+	MinHalfLife float64
+	MaxHalfLife float64
 }
 
 const pairsLogOutput = "logp"
@@ -158,6 +178,25 @@ func normalizePairsSpec(spec PairsSpec) (PairsSpec, error) {
 	if !finitePairFloat(spec.MaxPairGross) || spec.MaxPairGross < 0 || spec.MaxPairGross > 1+1e-9 {
 		return spec, errors.New("runner: pairs max pair gross must be in [0, 1]")
 	}
+	smCfg, err := (statistics.SpreadModelConfig{
+		Model:       spec.SpreadModel,
+		Window:      spec.Window,
+		KalmanDelta: spec.KalmanDelta,
+		KalmanVe:    spec.KalmanVe,
+	}).Normalize()
+	if err != nil {
+		return spec, err
+	}
+	spec.SpreadModel, spec.KalmanDelta, spec.KalmanVe = smCfg.Model, smCfg.KalmanDelta, smCfg.KalmanVe
+	if !finitePairFloat(spec.MinHalfLife) || spec.MinHalfLife < 0 {
+		return spec, errors.New("runner: pairs min half-life must be finite and non-negative")
+	}
+	if !finitePairFloat(spec.MaxHalfLife) || spec.MaxHalfLife < 0 || (spec.MaxHalfLife > 0 && spec.MaxHalfLife < spec.MinHalfLife) {
+		return spec, errors.New("runner: pairs max half-life must be finite, non-negative, and >= min half-life")
+	}
+	if (spec.MinHalfLife > 0 || spec.MaxHalfLife > 0) && spec.Window < 4 {
+		return spec, errors.New("runner: pairs window must be at least 4 when half-life gate is enabled")
+	}
 	for _, pair := range spec.Pairs {
 		if pair.Y == "" || pair.X == "" || pair.Y == pair.X {
 			return spec, errors.New("runner: each pair needs two distinct symbols")
@@ -196,6 +235,28 @@ func betaAllowed(minBeta float64, allowNegative bool, beta float64) bool {
 
 func entryBetaAllowed(spec PairsSpec, beta float64) bool {
 	return betaAllowed(spec.MinBeta, spec.AllowNegativeBeta, beta)
+}
+
+func entryHalfLifeAllowed(est *statistics.SpreadEstimator, buf *[]float64, minHL, maxHL float64) bool {
+	if minHL <= 0 && maxHL <= 0 {
+		return true
+	}
+	series, ok := est.WindowSeries((*buf)[:0])
+	if !ok {
+		return false
+	}
+	*buf = series
+	ou, err := statistics.FitOU(series)
+	if err != nil || !finitePairFloat(ou.DiscreteHalfLife) || ou.DiscreteHalfLife <= 0 {
+		return false
+	}
+	if minHL > 0 && ou.DiscreteHalfLife < minHL {
+		return false
+	}
+	if maxHL > 0 && ou.DiscreteHalfLife > maxHL {
+		return false
+	}
+	return true
 }
 
 // allocateInverseVolGross distributes totalGross across open pairs inversely proportional
@@ -260,10 +321,12 @@ type pairState struct {
 	// unavailable is the leg (symbol) that has no data at all inside this run's window and was left out of its
 	// universe by the engine (BtFeatureLevel 11); the pair is skipped for the whole run: never traded, no spread.
 	unavailable    string
-	spread         *statistics.RollingSpread
+	spread         *statistics.SpreadEstimator
 	trader         *statistics.BandTrader
-	beta           float64 // hedge ratio frozen at entry
-	lastStd        float64 // latest valid spread residual Std
+	beta           float64 // notional hedge ratio (-wX / wY) frozen at entry (or updated under DynamicHedge)
+	modelBeta      float64 // model-coordinate slope frozen at entry for EvalFrozenZ
+	lastStd        float64 // latest valid dimensionless spread residual Std
+	ouBuf          []float64
 	pos            int
 	prevPos        int
 	curLY, curLX   float64
@@ -321,7 +384,12 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 			states[i] = &pairState{y: -1, x: -1, unavailable: strings.Join(missing, ",")}
 			continue
 		}
-		rs, err := statistics.NewRollingSpread(spec.Window)
+		rs, err := statistics.NewSpreadEstimator(statistics.SpreadModelConfig{
+			Model:       spec.SpreadModel,
+			Window:      spec.Window,
+			KalmanDelta: spec.KalmanDelta,
+			KalmanVe:    spec.KalmanVe,
+		})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -375,7 +443,7 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 					st.stats.closeEpisode(frame.DecisionTime, 0, "leg_missing")
 					// 067: a leg has no data this period (PIT universe drop / delisting): close the pair and pause it;
 					// it may reopen when both legs are back
-					st.pos, st.beta = 0, 0
+					st.pos, st.beta, st.modelBeta = 0, 0, 0
 					st.trader.Reset()
 					ready = true // the closed pair must reach the ledger even if no other pair is ready
 					diags = append(diags, factor.Diagnostic{Code: "pair-closed-missing-leg", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
@@ -384,13 +452,13 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 			}
 			st.curLY, st.curLX, st.curOK = ly.Value, lx.Value, true
 			st.stats.accrue(ly.Value, lx.Value, navPrev)
-			point, ok := st.spread.Observe(lx.Value, ly.Value)
+			est, ok := st.spread.ObserveLog(lx.Value, ly.Value)
 			if !ok {
 				diags = append(diags, factor.Diagnostic{Code: "pair-warmup", Detail: fmt.Sprintf("%d/%d", st.y, st.x)})
 				continue
 			}
 			ready = true
-			st.lastStd = point.Std
+			st.lastStd = est.ScaleStd
 			st.stats.bars++
 			if !tradable[st.y] || !tradable[st.x] {
 				// Never open on an untradable leg; an existing position keeps its state
@@ -401,21 +469,22 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 			}
 			prev := st.pos
 			if prev == 0 {
-				if !entryBetaAllowed(spec, point.Beta) {
-					if math.Abs(point.Z) <= spec.Band.Exit {
-						st.pos = st.trader.Step(point.Z)
-					}
+				if math.Abs(est.Z) < spec.Band.Entry {
+					st.pos = st.trader.Step(est.Z)
 					continue
 				}
-				st.pos = st.trader.Step(point.Z)
-				if st.pos != 0 {
-					st.beta = point.Beta
+				if !entryBetaAllowed(spec, est.NotionalBeta) || !entryHalfLifeAllowed(st.spread, &st.ouBuf, spec.MinHalfLife, spec.MaxHalfLife) {
+					continue
 				}
-				st.stats.observeStep(prev, st.pos, point.Z, st.beta, frame.DecisionTime, spec.Band)
+				st.pos = st.trader.Step(est.Z)
+				if st.pos != 0 {
+					st.beta, st.modelBeta = est.NotionalBeta, est.Beta
+				}
+				st.stats.observeStep(prev, st.pos, est.Z, st.beta, frame.DecisionTime, spec.Band)
 			} else {
-				stepZ := point.Z
-				if !spec.DynamicExitZ {
-					if fz, okZ := st.spread.EvalWithBeta(lx.Value, ly.Value, st.beta); okZ {
+				stepZ := est.Z
+				if !spec.DynamicExitZ && !spec.DynamicHedge {
+					if fz, okZ := st.spread.EvalFrozenZ(lx.Value, ly.Value, st.modelBeta); okZ {
 						stepZ = fz
 					} else {
 						stepZ = math.NaN()
@@ -423,14 +492,18 @@ func newTrackedPairsBuilderSkipping(spec PairsSpec, sidMap map[int32]string, una
 				}
 				st.pos = st.trader.Step(stepZ)
 				if st.pos != 0 && st.pos != prev {
-					if !entryBetaAllowed(spec, point.Beta) {
-						st.pos, st.beta = 0, 0
+					if !entryBetaAllowed(spec, est.NotionalBeta) || !entryHalfLifeAllowed(st.spread, &st.ouBuf, spec.MinHalfLife, spec.MaxHalfLife) {
+						st.pos, st.beta, st.modelBeta = 0, 0, 0
 						st.trader.Reset()
 					} else {
-						st.beta = point.Beta
+						st.beta, st.modelBeta = est.NotionalBeta, est.Beta
+					}
+				} else if st.pos != 0 && spec.DynamicHedge {
+					if entryBetaAllowed(spec, est.NotionalBeta) {
+						st.beta, st.modelBeta = est.NotionalBeta, est.Beta
 					}
 				} else if st.pos == 0 {
-					st.beta = 0
+					st.beta, st.modelBeta = 0, 0
 				}
 				st.stats.observeStep(prev, st.pos, stepZ, st.beta, frame.DecisionTime, spec.Band)
 			}
