@@ -20,7 +20,7 @@
 |------|------|
 | `data.go` | 全局 `Default` 交易所、`exgMap` 缓存、`allowedExgIDs`（binance/okx/bybit/china）与 `IsAllowedExgID` |
 | `biz.go` | `Setup`、`NewForRuntime`、`createConfigured`（config→options）、`GetWith`（缓存）、`Prec*`、`GetLeverage`、`GetOdBook`、`GetTickers24Hr` |
-| `ext.go` | `BotExchange` 包装类型、`getExchangeCapability[T]` 泛型解包、下单回调（`SetOrderCallback` / 旧全局 `AfterCreateOrder`）、`FetchOHLCVArchive`、`FetchFundingRateArchive`、`FetchDerivativesMetricsArchive` 与 `FetchDerivativesMetrics` 转发 |
+| `ext.go` | `BotExchange` 包装类型、`getExchangeCapability[T]` 泛型解包、下单回调（`SetOrderCallback` / 旧全局 `AfterCreateOrder`）、`FetchOHLCVArchive`、`FetchPriceOHLCVArchive`、`FetchFundingRateArchive`、`FetchDerivativesMetricsArchive` 与 `FetchDerivativesMetrics` 转发 |
 | `symbol.go` | 符号解析：`ResolvePriceSymbol`、`ResolveRuntimePriceSymbol`、`NewPriceSymbolParser*`、`NewLegacyPriceSymbolParser` |
 | `client_order.go` | client order id：`BuildClientOrderID`（兼容，失败回落 banexg 旧格式）、`BuildClientOrderIDChecked`（严格） |
 | `order_events.go` | `OrderEventCapability` 获取与 `RequireOrderEventCapability`（实盘严格模式） |
@@ -59,6 +59,7 @@
 | `ClientOrderCapability` | banexg/client_order.go，exg/client_order.go 别名 | 生成 client order id | `binance`、`okx`、`bybit` |
 | `OrderEventCapability` | exg/order_events.go（banexg/order_event.go 提供默认实现） | 解析 client id、订单事件 id、订单时间戳 | `binance`、`okx`、`bybit` 提供 Parse/Build 等方法 |
 | `OHLCVArchiveFetcher` | banexg/intf.go:13 | 按归档读取 K 线 | `binance`（binance/vision.go） |
+| `PriceOHLCVArchiveFetcher` | banexg/intf.go:21 | 按归档读取合约 `mark`/`index`/`premiumIndex` 价格 K 线 | `binance`（binance/vision.go，月度/日度 `markPriceKlines`/`indexPriceKlines`/`premiumIndexKlines` zip） |
 | `FundingRateArchiveFetcher` | banexg/intf.go:21 | 按归档读取永续合约历史资金费率 | `binance`（binance/vision.go，月度 `fundingRate` zip） |
 | `DerivativesMetricsArchiveFetcher` | banexg/intf.go:29 | 按归档读取永续合约 5m `metrics` 历史持仓量与多空比并按 `last` 重采样 | `binance`（binance/vision.go，日度 `metrics` zip） |
 | `DerivativesMetricsFetcher` | banexg/intf.go:36 | 读取合约持仓量与多空比历史快照（归档 + 近端 REST 衔接） | `binance`（Vision 日度 `metrics` + `fapiData`/`dapiData` 近 30 天 REST）、`bybit`（V5 `open-interest` + `account-ratio`） |

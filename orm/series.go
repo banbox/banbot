@@ -18,8 +18,12 @@ type SeriesField struct {
 
 const (
 	SeriesSourceKline        = "kline"
+	SeriesSourceMarkKline    = "mark_kline"
+	SeriesSourceIndexKline   = "index_kline"
+	SeriesSourcePremiumKline = "premium_kline"
 	SeriesSourceFundingRate  = "funding_rate"
 	SeriesSourceOpenInterest = "open_interest"
+	DefaultPriceKlineTF      = "1m"
 	DefaultFundingRateTF     = "8h"
 	DefaultOpenInterestTF    = "5m"
 )
@@ -44,6 +48,14 @@ var openInterestDefaultFields = []string{
 
 var openInterestSupportedTFs = []string{
 	"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d",
+}
+
+var priceKlineDefaultFields = []string{
+	"open", "high", "low", "close",
+}
+
+var priceKlineSupportedTFs = []string{
+	"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M",
 }
 
 func init() {
@@ -107,6 +119,66 @@ func NewOpenInterestSeriesInfo(timeFrame string) *SeriesInfo {
 		tf = DefaultOpenInterestTF
 	}
 	return NewSeriesInfo(SeriesSourceOpenInterest, tf, OpenInterestSeriesFields())
+}
+
+func DefaultPriceKlineFields() []string {
+	return append([]string(nil), priceKlineDefaultFields...)
+}
+
+func PriceKlineSeriesFields() []SeriesField {
+	fields := make([]SeriesField, len(priceKlineDefaultFields))
+	for i, name := range priceKlineDefaultFields {
+		fields[i] = SeriesField{Name: name, Type: "float"}
+	}
+	return fields
+}
+
+func PriceKlineTimeFrames() []string {
+	return append([]string(nil), priceKlineSupportedTFs...)
+}
+
+func IsPriceKlineTimeFrame(timeFrame string) bool {
+	tf := strings.TrimSpace(timeFrame)
+	for _, item := range priceKlineSupportedTFs {
+		if item == tf {
+			return true
+		}
+	}
+	return false
+}
+
+func IsPriceKlineSource(source string) bool {
+	switch strings.TrimSpace(source) {
+	case SeriesSourceMarkKline, SeriesSourceIndexKline, SeriesSourcePremiumKline:
+		return true
+	default:
+		return false
+	}
+}
+
+func IsOHLCSeriesSource(source string) bool {
+	normalized := NormalizeSeriesSource(strings.TrimSpace(source))
+	return normalized == SeriesSourceKline || IsPriceKlineSource(normalized)
+}
+
+func NewPriceKlineSeriesInfo(source, timeFrame string) *SeriesInfo {
+	tf := strings.TrimSpace(timeFrame)
+	if tf == "" {
+		tf = DefaultPriceKlineTF
+	}
+	return NewSeriesInfo(strings.TrimSpace(source), tf, PriceKlineSeriesFields())
+}
+
+func NewMarkKlineSeriesInfo(timeFrame string) *SeriesInfo {
+	return NewPriceKlineSeriesInfo(SeriesSourceMarkKline, timeFrame)
+}
+
+func NewIndexKlineSeriesInfo(timeFrame string) *SeriesInfo {
+	return NewPriceKlineSeriesInfo(SeriesSourceIndexKline, timeFrame)
+}
+
+func NewPremiumKlineSeriesInfo(timeFrame string) *SeriesInfo {
+	return NewPriceKlineSeriesInfo(SeriesSourcePremiumKline, timeFrame)
 }
 
 func NormalizeSeriesFields(source string, fields []string) []string {
@@ -792,7 +864,7 @@ func seriesAggRule(info *SeriesInfo, exs *ExSymbol, field string) string {
 	if rule, ok := GetFieldAggRule(field); ok {
 		return rule
 	}
-	if info != nil && NormalizeSeriesSource(info.Name) == SeriesSourceKline {
+	if info != nil && IsOHLCSeriesSource(info.Name) {
 		switch field {
 		case "open":
 			return "first"

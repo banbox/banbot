@@ -120,6 +120,26 @@ func (e *BotExchange) FetchOHLCVArchive(ctx context.Context, symbol, timeframe s
 	return fetcher.FetchOHLCVArchive(ctx, symbol, timeframe, startMS, endMS)
 }
 
+func (e *BotExchange) FetchPriceOHLCVArchive(ctx context.Context, priceType, symbol, timeframe string, startMS, endMS int64) (
+	[]*banexg.Kline, bool, *errs.Error) {
+	fetcher, ok := e.BanExchange.(banexg.PriceOHLCVArchiveFetcher)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchPriceOHLCVArchive(ctx, priceType, symbol, timeframe, startMS, endMS)
+}
+
+// FetchPriceOHLCVArchive invokes the optional archive capability when the
+// underlying exchange adapter supports immutable mark/index/premiumIndex files.
+func FetchPriceOHLCVArchive(ctx context.Context, exchange banexg.BanExchange, priceType, symbol, timeframe string, startMS, endMS int64) (
+	[]*banexg.Kline, bool, *errs.Error) {
+	fetcher, ok := getExchangeCapability[banexg.PriceOHLCVArchiveFetcher](exchange)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchPriceOHLCVArchive(ctx, priceType, symbol, timeframe, startMS, endMS)
+}
+
 func (e *BotExchange) FetchFundingRateArchive(ctx context.Context, symbol string, startMS, endMS int64) (
 	[]*banexg.FundingRate, bool, *errs.Error) {
 	fetcher, ok := e.BanExchange.(banexg.FundingRateArchiveFetcher)

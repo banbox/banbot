@@ -105,7 +105,16 @@ func preflightFactorStorageConfig(spec *config.RunSpec, c *runner.Config) error 
 // them (resampled at read time, as in the time-series engine) are accepted.
 func validateFactorKlineTimeframes(inputs []factor.InputSpec, prices runner.PriceStream) error {
 	check := func(source, timeframe, what string) error {
-		if source != orm.SeriesSourceKline || timeframe == "" || timeframe == "event" {
+		if timeframe == "" || timeframe == "event" {
+			return nil
+		}
+		if orm.IsPriceKlineSource(source) {
+			if !orm.IsPriceKlineTimeFrame(timeframe) {
+				return fmt.Errorf("factor: %s: unsupported %s timeframe %q", what, source, timeframe)
+			}
+			return nil
+		}
+		if source != orm.SeriesSourceKline {
 			return nil
 		}
 		if err := orm.ValidateKlineTimeframe(timeframe); err != nil {
