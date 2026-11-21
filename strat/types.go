@@ -145,6 +145,7 @@ type StratJob struct {
 	runtimeCore        *core.State
 	runtimePrices      *com.PriceState
 	runtimeClock       *btime.ClockState
+	runtimeExchange    banexg.BanExchange
 	inspectEffect      func(string)
 	dataHubConfigured  bool
 	pairRemovalPending bool
@@ -168,6 +169,21 @@ func (s *StratJob) BindRuntimeState(state *State, coreState *core.State, clock *
 		return
 	}
 	s.strategyState = state
+	if state != nil && state != legacyState {
+		if s.symbols == nil {
+			s.symbols = state.Symbols
+		}
+		if s.runtimeExchange == nil {
+			s.runtimeExchange = state.Exchange
+		}
+		if s.Strat != nil && s.Strat.Name != "" {
+			if s.Strat.Policy != nil && s.Strat.Policy.RefineTF != nil {
+				state.setStrategyRefineDefault(s.Strat.Name, s.Strat.Policy.RefineTF)
+			} else if s.Strat.RefineTF != nil {
+				state.setStrategyRefineDefault(s.Strat.Name, s.Strat.RefineTF)
+			}
+		}
+	}
 	s.runtimeCore = coreState
 	s.runtimeClock = clock
 }
@@ -183,11 +199,24 @@ func (s *StratJob) OpenOrdersSnapshot() ([]*ormo.InOutOrder, bool) {
 // NewInspectionJob creates the inert job state passed to startup-time
 // callbacks while keeping the effect hook outside strategy-facing fields.
 func NewInspectionJob(strategy *TradeStrat, env *ta.BarEnv, symbol *orm.ExSymbol, tf, account string, effect func(string)) *StratJob {
-	return &StratJob{
-		Strat: strategy, Env: env, DataHub: NewDataHub(), Symbol: symbol, TimeFrame: tf, Account: account,
+	job := &StratJob{
+		Strat: strategy, Env: env, Symbol: symbol, TimeFrame: tf, Account: account,
 		TPMaxs: make(map[int64]float64), CloseLong: true, CloseShort: true,
 		ExgStopLoss: true, ExgTakeProfit: true, inspectEffect: effect,
 	}
+	job.DataHub = newJobDataHub(job)
+	return job
+}
+
+// TakeProfitTarget defines one rung in a multi-stage take-profit ladder.
+type TakeProfitTarget struct {
+	Price             float64 `json:"price,omitempty"`                // Target trigger price (computed from Val/Rate on entry fill if 0) 止盈触发价格（为0时入场成交后按Val/Rate计算）
+	Val               float64 `json:"val,omitempty"`                  // Absolute price distance from entry fill price 入场成交均价到止盈价的距离
+	Rate              float64 `json:"rate,omitempty"`                 // Relative profit ratio from entry fill price (e.g. 0.02 = 2%) 相对入场成交均价的止盈比例（如0.02表示2%）
+	Limit             float64 `json:"limit,omitempty"`                // Limit exit price after trigger (0 = market) 触发后限价单价格，0为市价
+	ExitRate          float64 `json:"exit_rate,omitempty"`            // Fraction of initial position to close at this rung, in (0, 1] 本级退出占初始仓位比例，(0, 1]
+	MoveSLToBreakeven bool    `json:"move_sl_to_breakeven,omitempty"` // Tighten remaining StopLoss to at least entry fill price 触发后是否将剩余仓位止损收紧至保本价
+	Tag               string  `json:"tag,omitempty"`                  // Exit reason tag for this rung 止盈原因标签
 }
 
 /*
@@ -195,31 +224,34 @@ EnterReq
 打开一个订单。默认开多。如需开空short=False
 */
 type EnterReq struct {
-	CommandID       string  // Stable request identity; callback actions derive it from their source event.
-	Tag             string  // Entry signal 入场信号
-	StratName       string  // Strategy Name 策略名称
-	Short           bool    // Whether to short sell or not 是否做空
-	OrderType       int     // 订单类型, core.OrderType*
-	Limit           float64 // The entry price of a limit order will be submitted as a limit order when specified 限价单入场价格，指定时订单将作为限价单提交
-	Stop            float64 // Stop price, buy orders enter when the price rises to the trigger price (vice versa for sell orders). 止损(触发价格)，做多订单时价格上涨到触发价格才入场（做空相反）
-	CostRate        float64 // The opening ratio is set to 1 times by default according to the configuration. Used for calculating LegalList 开仓倍率、默认按配置1倍。用于计算LegalCost
-	LegalCost       float64 // Spend the amount in fiat currency. Ignore CostRate when specified 花费法币金额。指定时忽略CostRate
-	Leverage        float64 // Leverage ratio 杠杆倍数
-	Amount          float64 // The number of admission targets is calculated by LegalList and price 入场标的数量，由LegalCost和price计算
-	StopLossVal     float64 // The distance from the entry price to the stop loss price is used to calculate StopLoss 入场价格到止损价格的距离，用于计算StopLoss
-	StopLoss        float64 // Stop loss trigger price, submit a stop loss order on the exchange when it is not empty 止损触发价格，不为空时在交易所提交一个止损单
-	StopLossLimit   float64 // Stop loss limit price, does not provide the use of StopLoss 止损限制价格，不提供使用StopLoss
-	StopLossRate    float64 // Stop loss exit ratio, 0 means all exits, needs to be between (0,1) 止损退出比例，0表示全部退出，需介于(0,1]之间
-	StopLossTag     string  // Reason for Stop Loss 止损原因
-	ActivationPrice float64 // Activation Price for Trailing Stop 追踪止损激活价格
-	CallbackPct     float64 // Callback Percentage for Trailing Stop 追踪止损回调百分比, [0.1, 10]
-	TakeProfitVal   float64 // The distance from the entry price to the take profit price is used to calculate TakeProfit 入场价格到止盈价格的距离，用于计算TakeProfit
-	TakeProfit      float64 // When the take profit trigger price is not empty, submit a take profit order on the exchange. 止盈触发价格，不为空时在交易所提交一个止盈单。
-	TakeProfitLimit float64 // Profit taking limit price, TakeProfit is not available for use 止盈限制价格，不提供使用TakeProfit
-	TakeProfitRate  float64 // Take profit exit ratio, 0 indicates full exit, needs to be between (0,1) 止盈退出比率，0表示全部退出，需介于(0,1]之间
-	TakeProfitTag   string  // Reason for profit taking 止盈原因
-	StopBars        int     // If the entry limit order exceeds how many bars and is not executed, it will be cancelled 入场限价单超过多少个bar未成交则取消
-	ClientID        string  // used as suffix of ClientOrderID to exchange
+	CommandID       string             // Stable request identity; callback actions derive it from their source event.
+	Tag             string             // Entry signal 入场信号
+	StratName       string             // Strategy Name 策略名称
+	Short           bool               // Whether to short sell or not 是否做空
+	OrderType       int                // 订单类型, core.OrderType*
+	Limit           float64            // Limit price (with Stop > 0 submits a Stop-Limit entry) 限价单入场价格（同时设置Stop>0时为触发限价单Stop-Limit）
+	Stop            float64            // Stop trigger price, buy orders enter when the price rises to the trigger price (vice versa for sell orders). 触发价格，做多订单时价格上涨到触发价格才触发（做空相反）
+	OCOGroup        string             // One-Cancels-the-Other pending entry group identifier OCO挂单组标识（组内任一挂单入场成交后自动撤销其余未成交挂单）
+	CostRate        float64            // The opening ratio is set to 1 times by default according to the configuration. Used for calculating LegalList 开仓倍率、默认按配置1倍。用于计算LegalCost
+	RiskRate        float64            // Account equity risk ratio per trade (e.g. 0.01 = 1%); auto-computes LegalCost from stop-loss distance when Amount and LegalCost are unset 单笔止损最大亏损占当前AccountEquity的比例（如0.01表示1%），未指定Amount和LegalCost时结合止损距离自动计算LegalCost
+	LegalCost       float64            // Spend the amount in fiat currency. Ignore CostRate when specified 花费法币金额。指定时忽略CostRate
+	Leverage        float64            // Leverage ratio 杠杆倍数
+	Amount          float64            // The number of admission targets is calculated by LegalList and price 入场标的数量，由LegalCost和price计算
+	StopLossVal     float64            // The distance from the entry price to the stop loss price is used to calculate StopLoss 入场价格到止损价格的距离，用于计算StopLoss
+	StopLoss        float64            // Stop loss trigger price 止损触发价格
+	StopLossLimit   float64            // Stop loss limit price, does not provide the use of StopLoss 止损限制价格，不提供使用StopLoss
+	StopLossRate    float64            // Stop loss exit ratio, 0 means all exits, needs to be between (0,1] 止损退出比例，0表示全部退出，需介于(0,1]之间
+	StopLossTag     string             // Reason for Stop Loss 止损原因
+	ActivationPrice float64            // Activation Price for Trailing Stop 追踪止损激活价格
+	CallbackPct     float64            // Callback Percentage for Trailing Stop 追踪止损回调百分比, [0.05, 50]
+	TakeProfitVal   float64            // The distance from the entry price to the take profit price is used to calculate TakeProfit 入场价格到止盈价格的距离，用于计算TakeProfit
+	TakeProfit      float64            // Take profit trigger price 止盈触发价格
+	TakeProfitLimit float64            // Profit taking limit price, TakeProfit is not available for use 止盈限制价格，不提供使用TakeProfit
+	TakeProfitRate  float64            // Take profit exit ratio, 0 indicates full exit, needs to be between (0,1] 止盈退出比率，0表示全部退出，需介于(0,1]之间
+	TakeProfitTag   string             // Reason for profit taking 止盈原因
+	TakeProfits     []TakeProfitTarget // Multi-stage take-profit ladder 多级阶梯止盈目标列表
+	StopBars        int                // If the entry limit order exceeds how many bars and is not executed, it will be cancelled 入场限价单超过多少个bar未成交则取消
+	ClientID        string             // used as suffix of ClientOrderID to exchange
 	Infos           map[string]string
 	Log             bool // 是否自动记录错误日志
 }

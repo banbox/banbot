@@ -38,19 +38,26 @@ type replayAccount struct {
 	paperSink      *runner.AccountSink
 }
 
-func mixedTimeFrameScores(rt *runtimepkg.Runtime, pairs []string) map[string]map[string]float64 {
+func mixedTimeFrameScores(rt *runtimepkg.Runtime, pairs []string) (map[string]map[string]float64, error) {
 	scores := make(map[string]map[string]float64, len(pairs))
 	for _, pair := range pairs {
 		scores[pair] = map[string]float64{}
 	}
 	for _, policy := range rt.Config.View().RunPolicy {
-		for _, tf := range rt.Strategies.NewStrategy(policy).RunTimeFrames {
+		stgy, err := rt.Strategies.NewStrategyChecked(policy)
+		if err != nil {
+			return nil, err
+		}
+		if stgy == nil {
+			continue
+		}
+		for _, tf := range stgy.RunTimeFrames {
 			for _, pair := range pairs {
 				scores[pair][tf] = 1
 			}
 		}
 	}
-	return scores
+	return scores, nil
 }
 
 // Mixed replay keeps the ordinary TS jobs and their callbacks. The historical
@@ -296,7 +303,10 @@ func replayMixedEngines(ctx context.Context, spec *config.RunSpec, snapshot *con
 				}
 			}
 		}
-		scores := mixedTimeFrameScores(rt, pairs)
+		scores, err := mixedTimeFrameScores(rt, pairs)
+		if err != nil {
+			return nil, err
+		}
 		biz.InitFakeWalletsWithRuntimeDeps(rt.BizDeps())
 		biz.InitLocalOrderMgrWithRuntimeDeps(rt.BizDeps(), nil, false)
 		if _, _, err := strat.LoadStratJobsWithState(rt.Strategies, rt.Core, rt.Symbols, pairs, scores, rt.Orders); err != nil {

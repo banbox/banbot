@@ -79,6 +79,8 @@ type BanWallets struct {
 	// skipWarned records coins already reported by calcLegal as having no valid
 	// mark price, so the (per-bar, high frequency) warning is emitted once per coin.
 	skipWarned sync.Map
+	peakMu     sync.Mutex
+	peakEquity float64
 }
 
 // WalletStaleMS is the max age of exchange balances before they are fetched
@@ -178,6 +180,7 @@ func InitFakeWallets(symbols ...string) {
 	wallets := GetWallets(config.DefAcc)
 	wallets.SetWallets(updates)
 	wallets.TryUpdateStakePctAmt()
+	resetLegacyWalletPeaks()
 }
 
 // InitFakeWalletsWithRuntimeDeps initializes the wallet owned by an explicit
@@ -887,6 +890,7 @@ func (iw *ItemWallet) Reset() {
 }
 
 func (w *BanWallets) SetWallets(data map[string]float64) {
+	var initFiat float64
 	for k, v := range data {
 		item, ok := w.Items[k]
 		if !ok {
@@ -902,7 +906,13 @@ func (w *BanWallets) SetWallets(data map[string]float64) {
 		item.lock.Lock()
 		item.Available = v
 		item.lock.Unlock()
+		if v > 0 && core.IsFiat(k) && !strings.Contains(k, "/") {
+			initFiat += v
+		}
 	}
+	w.peakMu.Lock()
+	w.peakEquity = initFiat
+	w.peakMu.Unlock()
 }
 
 func (w *BanWallets) DumpAvas() map[string]float64 {
@@ -1916,6 +1926,7 @@ func UpdateWalletByBalances(wallets *BanWallets, item *banexg.Balances) {
 	// Update single billing amount
 	// 更新单笔开单金额
 	wallets.TryUpdateStakePctAmt()
+	wallets.observeWalletMetrics(nil, false)
 	slices.SortFunc(items, func(a, b *banexg.Asset) int {
 		return -int((a.Total - b.Total) * 100)
 	})

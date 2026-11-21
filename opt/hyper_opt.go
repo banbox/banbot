@@ -773,7 +773,9 @@ func optForPol(pol *config.RunPolicyConfig, snapshot *config.Snapshot, factory B
 	// 重置PairParams，避免影响传入参数
 	pol.PairParams = make(map[string]map[string]float64)
 	pol.Score = -998
-	_ = strat.New(pol)
+	if _, err := strat.NewChecked(pol); err != nil {
+		return 0, err
+	}
 	params := pol.HyperParams()
 	if len(params) == 0 {
 		log.Warn("no hyper params, skip optimize", zap.String("strat", title))

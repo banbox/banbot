@@ -3,6 +3,7 @@ package config
 import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/llm"
+	"github.com/banbox/banexg/errs"
 )
 
 var (
@@ -116,9 +117,10 @@ type Config struct {
 	BTLegacyWallet       bool                              `yaml:"bt_legacy_wallet_price,omitempty" mapstructure:"bt_legacy_wallet_price"`
 	BTNoKlineDownload    bool                              `yaml:"bt_no_kline_download,omitempty" mapstructure:"bt_no_kline_download"`
 	BTStrict             bool                              `yaml:"bt_strict,omitempty" mapstructure:"bt_strict"`
-	BTSlippageBps        float64                           `yaml:"bt_slippage_bps,omitempty" mapstructure:"bt_slippage_bps"`             // 053: one-sided adverse slippage (bp) on market/stop fills in backtests, 0=off
-	BTFundingApr         float64                           `yaml:"bt_funding_apr,omitempty" mapstructure:"bt_funding_apr"`               // 055: approximate funding cost of LONG contract positions in backtests, percent per year (10 = 10%/y); shorts get no credit (order engine only; factor/statarb books pay on net long notional since level 13); 0=off
-	BTBarOrderSeed       uint64                            `yaml:"bt_bar_order_seed,omitempty" mapstructure:"bt_bar_order_seed"`         // 112: salt of the neutral per-bar symbol priority hash(bar time, symbol, seed) used by every backtest when several symbols are due on the same bar (default 0)
+	BTSlippageBps         float64                           `yaml:"bt_slippage_bps,omitempty" mapstructure:"bt_slippage_bps"`                         // 053: one-sided adverse slippage (bp) on market/stop fills in backtests, 0=off
+	BTFundingApr          float64                           `yaml:"bt_funding_apr,omitempty" mapstructure:"bt_funding_apr"`                           // 055/level 15: bilateral symmetric approximate funding rate for linear contract positions in backtests, percent per year (10 = +10%/y: longs pay, shorts receive; inverse skipped); 0=off
+	BTLegacyApproxFunding bool                              `yaml:"bt_legacy_approx_funding,omitempty" mapstructure:"bt_legacy_approx_funding"`       // level 15: true restores pre-level-15 unilateral long-only bt_funding_apr charging (shorts neither pay nor receive)
+	BTBarOrderSeed        uint64                            `yaml:"bt_bar_order_seed,omitempty" mapstructure:"bt_bar_order_seed"`                     // 112: salt of the neutral per-bar symbol priority hash(bar time, symbol, seed) used by every backtest when several symbols are due on the same bar (default 0)
 	BTGapBars            int                               `yaml:"bt_gap_bars,omitempty" mapstructure:"bt_gap_bars"`                     // backtest data-gap guard: >N missing bars between two bars of a symbol force-closes its open orders at the last known price (0=off)
 	BTDelistPenaltyBps   float64                           `yaml:"bt_delist_penalty_bps,omitempty" mapstructure:"bt_delist_penalty_bps"` // 071: extra adverse bp on a delist exit (data never resumes), on top of bt_slippage_bps; 0=off
 	BTFreshEquity        *bool                             `yaml:"bt_fresh_equity,omitempty" mapstructure:"bt_fresh_equity"`             // 162/12: the logged equity curve (plots, daily equity, drawdown, Ulcer) and the bankruptcy check sum the open orders' profit now instead of the wallet's cached UnrealizedPOL (which keeps orders closed after its last refresh). Default on (nil=true); false only reproduces the pre-level-12 curve metrics for comparison
@@ -182,6 +184,14 @@ type RunPolicyConfig struct {
 	defs          map[string]*core.Param
 	Score         float64 `yaml:"-" mapstructure:"-"`
 	Index         int     `yaml:"-" mapstructure:"-"` // index in run_policy array
+}
+
+// BadParamError represents a strategy parameter constraint violation raised via
+// RunPolicyConfig.Require or RunPolicyConfig.Requiref.
+type BadParamError struct {
+	Policy  string
+	Message string
+	Err     *errs.Error
 }
 
 type BtInLiveConfig struct {

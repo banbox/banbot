@@ -332,17 +332,20 @@ func InitOdSubs() {
 						log.Warn("refresh latest price fail", zap.String("pair", job.Symbol.Symbol), zap.Error(err))
 					}
 				}
+				openOds, lock := ormo.GetOpenODs(acc)
+				lock.Lock()
+				curOpens := executionOpenOrders(openOds)
+				lock.Unlock()
+				pending := job.PendingEntryCount()
+				job.UpdateOrders(curOpens)
+				if pending > 0 {
+					job.AddOrderCount(pending)
+				}
 				if stgy.HedgeOff && evt == strat.OdChgEnterFill {
 					// 策略为单向持仓，成交时尝试关闭另一侧订单
 					closeSideOrders(job, !od.Short)
 				}
 				if stgy.OnOrderChange != nil {
-					if evt == strat.OdChgExitFill {
-						openOds, lock := ormo.GetOpenODs(acc)
-						lock.Lock()
-						job.UpdateOrders(executionOpenOrders(openOds))
-						lock.Unlock()
-					}
 					stgy.OnOrderChange(job, od, evt)
 				}
 				requests := job.ExecutionSnapshot()
@@ -406,20 +409,23 @@ func InitOdSubsWithRuntimeDeps(deps *RuntimeDeps) {
 					log.Warn("refresh latest price fail", zap.String("pair", job.Symbol.Symbol), zap.Error(err))
 				}
 			}
+			pending := job.PendingEntryCount()
+			if deps.Orders != nil {
+				openOds, lock := deps.Orders.GetOpenODs(account)
+				lock.Lock()
+				curOpens := executionOpenOrders(openOds, deps)
+				lock.Unlock()
+				job.UpdateOrders(curOpens)
+			} else {
+				job.UpdateOrders(nil)
+			}
+			if pending > 0 {
+				job.AddOrderCount(pending)
+			}
 			if stgy.HedgeOff && evt == strat.OdChgEnterFill {
 				closeSideOrders(job, !od.Short)
 			}
 			if stgy.OnOrderChange != nil {
-				if evt == strat.OdChgExitFill {
-					if deps.Orders != nil {
-						openOds, lock := deps.Orders.GetOpenODs(account)
-						lock.Lock()
-						job.UpdateOrders(executionOpenOrders(openOds, deps))
-						lock.Unlock()
-					} else {
-						job.UpdateOrders(nil)
-					}
-				}
 				stgy.OnOrderChange(job, od, evt)
 			}
 			requests := job.ExecutionSnapshot()

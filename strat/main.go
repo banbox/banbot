@@ -151,6 +151,8 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 	}
 	if strategyState == legacyState {
 		config.ClearRefineMap()
+	} else if strategyState != nil {
+		strategyState.clearRefineCache()
 	}
 	if strategyState == legacyState {
 		resetJobsWithState(strategyState, state, orderStates...)
@@ -170,7 +172,10 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		policies = cfg.RunPolicy
 	}
 	for _, pol := range policies {
-		stgy := strategyState.NewStrategy(pol)
+		stgy, err := strategyState.NewStrategyChecked(pol)
+		if err != nil {
+			return nil, nil, err
+		}
 		polID := pol.ID()
 		if stgy == nil {
 			return nil, nil, errs.NewMsg(core.ErrRunTime, "strategy %s load fail", polID)
@@ -182,7 +187,7 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 		}
 		holdNum := 0
 		failTfScores := make(map[string]map[string]float64)
-		var curPairs, err = getPolicyPairsWithStrategyState(strategyState, state, symbols, exchange, pol, pairs)
+		curPairs, err := getPolicyPairsWithStrategyState(strategyState, state, symbols, exchange, pol, pairs)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -267,13 +272,19 @@ func loadStratJobsWithExchange(strategyState *State, state *core.State, symbols 
 			// Check for proprietary parameters of the current target and reinitialize the strategy
 			// 检查有当前标的专有参数，重新初始化策略
 			if curPol, isDiff := pol.PairDup(exs.Symbol); isDiff {
-				curStgy = strategyState.NewStrategy(curPol)
+				curStgy, err = strategyState.NewStrategyChecked(curPol)
+				if err != nil {
+					return nil, nil, err
+				}
+				if curStgy == nil {
+					return nil, nil, errs.NewMsg(core.ErrRunTime, "strategy %s load fail", polID)
+				}
 			}
 			items[polID] = curStgy
 			holdNum += 1
 			// 初始化BarEnv
 			env := initBarEnvWithState(strategyState, state, exs, tf)
-			ensureStratJobWithRuntimeState(strategyState, state, curStgy, tf, exs, env, dirt, pairTfWarms.Update, accLimits, symbols)
+			ensureStratJobWithExchange(strategyState, state, exchange, curStgy, tf, exs, env, dirt, pairTfWarms.Update, accLimits, symbols)
 		}
 		printFailTfScores(polID, failTfScores)
 	}
@@ -689,6 +700,15 @@ func ensureStratJobWithSymbolState(stgy *TradeStrat, tf string, exs *orm.ExSymbo
 
 func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarEnv, dirt int,
 	logWarm func(pair, tf string, num int), accLimits accStratLimits, symbols *orm.SymbolState) {
+	var exchange banexg.BanExchange
+	if strategyState != nil && strategyState != legacyState {
+		exchange = strategyState.Exchange
+	}
+	ensureStratJobWithExchange(strategyState, state, exchange, stgy, tf, exs, env, dirt, logWarm, accLimits, symbols)
+}
+
+func ensureStratJobWithExchange(strategyState *State, state *core.State, exchange banexg.BanExchange, stgy *TradeStrat, tf string, exs *orm.ExSymbol, env *ta.BarEnv, dirt int,
+	logWarm func(pair, tf string, num int), accLimits accStratLimits, symbols *orm.SymbolState) {
 	if strategyState == nil {
 		strategyState = legacyStateView()
 	}
@@ -696,11 +716,21 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 	runtimeClock := (*btime.ClockState)(nil)
 	if strategyState != legacyState {
 		runtimeClock = strategyState.Clock
+		if exchange == nil {
+			exchange = strategyState.Exchange
+		}
 	}
 	strategyState.ensureMaps()
 	logWarm(exs.Symbol, tf, stgy.WarmupNum)
-	if stgy.Policy.RefineTF == nil && stgy.RefineTF != nil {
+	if stgy.Policy != nil && stgy.Policy.RefineTF == nil && stgy.RefineTF != nil {
 		stgy.Policy.RefineTF = stgy.RefineTF
+	}
+	if strategyState != legacyState && stgy != nil {
+		if stgy.Policy != nil && stgy.Policy.RefineTF != nil {
+			strategyState.setStrategyRefineDefault(stgy.Name, stgy.Policy.RefineTF)
+		} else if stgy.RefineTF != nil {
+			strategyState.setStrategyRefineDefault(stgy.Name, stgy.RefineTF)
+		}
 	}
 	matchTf := strategyState.refineTimeFrame(stgy.Name, tf)
 	if matchTf != tf {
@@ -727,22 +757,23 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 				continue
 			}
 			job = &StratJob{
-				Strat:         stgy,
-				Env:           env,
-				DataHub:       NewDataHub(),
-				Symbol:        exs,
-				TimeFrame:     tf,
-				Account:       account,
-				TPMaxs:        make(map[int64]float64),
-				CloseLong:     true,
-				CloseShort:    true,
-				ExgStopLoss:   true,
-				ExgTakeProfit: true,
-				symbols:       symbols,
-				strategyState: strategyState,
-				runtimeCore:   runtimeCore,
-				runtimeClock:  runtimeClock,
+				Strat:           stgy,
+				Env:             env,
+				Symbol:          exs,
+				TimeFrame:       tf,
+				Account:         account,
+				TPMaxs:          make(map[int64]float64),
+				CloseLong:       true,
+				CloseShort:      true,
+				ExgStopLoss:     true,
+				ExgTakeProfit:   true,
+				symbols:         symbols,
+				strategyState:   strategyState,
+				runtimeCore:     runtimeCore,
+				runtimeClock:    runtimeClock,
+				runtimeExchange: exchange,
 			}
+			job.DataHub = newJobDataHub(job)
 			if stgy.OnStartUp != nil {
 				stgy.OnStartUp(job)
 			}
@@ -752,6 +783,10 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 			job.strategyState = strategyState
 			job.runtimeCore = runtimeCore
 			job.runtimeClock = runtimeClock
+			job.runtimeExchange = exchange
+			if job.DataHub != nil {
+				job.DataHub.raiseMinCache(job.defaultDataHubLimit())
+			}
 		}
 		if allowOpen {
 			maxLong, maxShort := stgy.EachMaxLong, stgy.EachMaxShort
@@ -766,15 +801,22 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 		// 加载订阅其他标的信息
 		if stgy.OnPairInfos != nil || stgy.OnDataSubs != nil {
 			subs := CollectDataSubs(job)
+			if job.DataHub != nil {
+				job.DataHub.Configure(subs)
+			}
 			hasInfoSubs := false
+			hasCustomInfoSubs := false
 			for _, sub := range subs {
-				if sub != nil && sub.ExSymbol != nil {
+				if sub != nil && sub.ExSymbol != nil && sub.ExSymbol.ID > 0 {
 					hasInfoSubs = true
-					break
+					if orm.NormalizeSeriesSource(sub.Source) != orm.SeriesSourceKline {
+						hasCustomInfoSubs = true
+					}
 				}
 			}
 			hasSideInputHandler := stgy.OnData != nil || stgy.OnInfoBar != nil ||
-				stgy.BatchInfo && stgy.OnBatchInfos != nil
+				stgy.BatchInfo && stgy.OnBatchInfos != nil ||
+				(!hasCustomInfoSubs && (stgy.OnBar != nil || stgy.BatchInOut && stgy.OnBatchJobs != nil))
 			if hasInfoSubs && !hasSideInputHandler {
 				panic(fmt.Sprintf("%s: side-input subscriptions require `OnData`, `OnInfoBar`, or `BatchInfo` + `OnBatchInfos`", stgy.Name))
 			}
@@ -783,7 +825,7 @@ func ensureStratJobWithRuntimeState(strategyState *State, state *core.State, stg
 				defer unlockInfoJobsWrite(strategyState)
 				infoJobs := strategyState.infoJobsLocked(account)
 				for _, s := range subs {
-					if s == nil || s.ExSymbol == nil {
+					if s == nil || s.ExSymbol == nil || s.ExSymbol.ID <= 0 {
 						continue
 					}
 					hasInfoSubs = true

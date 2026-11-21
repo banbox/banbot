@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm/ormo"
@@ -94,6 +95,8 @@ type executionStateMu struct {
 	orderProcessing bool
 	callbackEvent   string
 	callbackOrdinal int
+	peakEquity      float64
+	intraday        atomic.Pointer[intradayJobState]
 }
 
 // WithOrderEvent supplies stable provenance for actions queued by a callback.

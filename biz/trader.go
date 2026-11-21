@@ -713,6 +713,12 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 	} else {
 		com.SetBarPrice(symbol, closeVal)
 	}
+	if !evt.IsWarmUp {
+		t.recordAccountSeriesObserved(symbol, evt)
+	}
+	if !odMatch && !evt.IsWarmUp && t.backtestMode() && t.hasCoarseFallbackOrders(symbol, evt) {
+		odMatch = true
+	}
 	if odMatch && !evt.IsWarmUp {
 		accOrders = make(map[string][]*ormo.InOutOrder)
 		accounts := executionAccountConfigs(t.runtime)
@@ -742,6 +748,9 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 				accOrders[account] = newOpens
 			}
 		}
+	}
+	if !evt.IsWarmUp {
+		t.observeAccountsEquity(odMatch, accOrders)
 	}
 	env, errEnv := t.OnEnvSeries(evt)
 	if errEnv != nil {
@@ -808,6 +817,62 @@ func (t *Trader) feedClosedSeriesSerial(evt *orm.DataSeries, env *ta.BarEnv, sym
 			zap.Strings("accOdNums", accOdArr))
 	}
 	return runErr
+}
+
+func (t *Trader) backtestMode() bool {
+	if state := t.coreState(); state != nil {
+		return state.BackTestMode
+	}
+	return core.BackTestMode
+}
+
+func (t *Trader) recordAccountSeriesObserved(symbol string, evt *orm.DataSeries) {
+	if evt == nil || symbol == "" || evt.TimeFrame == "" {
+		return
+	}
+	endMS := seriesEndMSForMatch(evt)
+	accounts := executionAccountConfigs(t.runtime)
+	for account := range executionAccountNames(t.runtime) {
+		cfg := accounts[account]
+		if cfg == nil || cfg.NoTrade {
+			continue
+		}
+		if localMgr, ok := t.orderManager(account).(*LocalOrderMgr); ok && localMgr != nil {
+			localMgr.recordSeriesObserved(symbol, evt.TimeFrame, endMS)
+		}
+	}
+}
+
+func (t *Trader) hasCoarseFallbackOrders(symbol string, evt *orm.DataSeries) bool {
+	if evt == nil || symbol == "" || evt.TimeFrame == "" {
+		return false
+	}
+	accounts := executionAccountConfigs(t.runtime)
+	for account := range executionAccountNames(t.runtime) {
+		cfg := accounts[account]
+		if cfg == nil || cfg.NoTrade {
+			continue
+		}
+		localMgr, ok := t.orderManager(account).(*LocalOrderMgr)
+		if !ok || localMgr == nil {
+			continue
+		}
+		openOds, lock := t.openOrders(account)
+		lock.Lock()
+		matched := false
+		for _, od := range openOds {
+			if od != nil && od.Status < ormo.InOutStatusFullExit && od.Symbol == symbol &&
+				od.Timeframe == evt.TimeFrame && localMgr.effectiveMatchTimeFrame(od, evt) == evt.TimeFrame {
+				matched = true
+				break
+			}
+		}
+		lock.Unlock()
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Trader) feedClosedSeriesParallel(evt *orm.DataSeries, env *ta.BarEnv, symbol string,

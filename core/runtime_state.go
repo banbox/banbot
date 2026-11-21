@@ -126,6 +126,12 @@ func (s *State) NewSimOrderCount() int {
 	return int(s.newNumInSim.Load())
 }
 
+// InSimOrderMatch reports whether this runtime is currently inside a simulated
+// bar/sub-bar order-matching pass (including synchronous OnOrderChange callbacks).
+func (s *State) InSimOrderMatch() bool {
+	return s != nil && s.simOrderMatch.Load()
+}
+
 // NewState creates a self-contained core state and derives a private
 // cancellation context from parent.
 func NewState(parent context.Context) (*State, *errs.Error) {

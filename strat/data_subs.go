@@ -53,11 +53,19 @@ func CollectDataSubs(job *StratJob) []*DataSub {
 }
 
 func canonicalDataSubSymbol(symbols *orm.SymbolState, exs *orm.ExSymbol) *orm.ExSymbol {
-	if symbols == nil || exs == nil {
+	if exs == nil {
+		return nil
+	}
+	if symbols == nil {
+		if exs.ID <= 0 && exs.Exchange != "" && exs.Market != "" && exs.Symbol != "" {
+			if resolved := orm.GetExSymbol2(exs.Exchange, exs.Market, exs.Symbol); resolved != nil {
+				return resolved
+			}
+		}
 		return exs
 	}
 	canonical := symbols.GetExSymbol2(exs.Exchange, exs.Market, exs.Symbol)
-	if canonical == nil || canonical.ID != exs.ID {
+	if canonical == nil || (exs.ID > 0 && canonical.ID != exs.ID) {
 		return nil
 	}
 	return canonical

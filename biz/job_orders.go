@@ -27,6 +27,9 @@ func bindRuntimeOrderProcessor(deps RuntimeDeps) *errs.Error {
 	if deps.Trading == nil || deps.DefaultAccount == "" {
 		return nil
 	}
+	if err := bindRuntimeAccountMetrics(deps); err != nil {
+		return err
+	}
 	return deps.Strategies.BindOrderProcessor(deps.Trading, deps.DefaultAccount, func(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
 		account := job.Account
 		if account == "" {

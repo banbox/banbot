@@ -33,6 +33,8 @@ var (
 	accLiveOdMgrs = make(map[string]*LiveOrderMgr)
 )
 
+const ExitTagOCOCancel = "oco_cancel"
+
 type IOrderMgr interface {
 	ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
 	EditOrder(od *ormo.InOutOrder, action string)
@@ -76,6 +78,7 @@ type runtimeOrderConfig struct {
 	gapMinHours          float64 // bt_gap_min_hours
 	delistPenaltyBps     float64 // bt_delist_penalty_bps (071)
 	fundingApr           float64
+	legacyApproxFunding  bool
 	accountLeverage      float64
 	accountMaxOpenOrders int
 }
@@ -86,23 +89,25 @@ type fundingRatePoint struct {
 }
 
 type OrderMgr struct {
-	callBack    func(order *ormo.InOutOrder, isEnter bool)
-	afterEnter  FuncHandleIOrder
-	afterExit   FuncHandleIOrder
-	prices      *com.PriceState
-	clock       *btime.ClockState
-	exchange    banexg.BanExchange
-	dump        *orm.DumpSink
-	runtimeCore *core.State
-	symbols     *orm.SymbolState
-	wallet      *BanWallets
-	runtimeDeps bool
-	walletDeps  RuntimeDeps
-	runtimeCfg  runtimeOrderConfig
-	Account     string
-	BarMS       int64
-	simulOpen   int // Simultaneously open number in the current bar
-	simulOpenSt map[string]int
+	callBack        func(order *ormo.InOutOrder, isEnter bool)
+	afterEnter      FuncHandleIOrder
+	afterExit       FuncHandleIOrder
+	prices          *com.PriceState
+	clock           *btime.ClockState
+	exchange        banexg.BanExchange
+	dump            *orm.DumpSink
+	runtimeCore     *core.State
+	symbols         *orm.SymbolState
+	wallet          *BanWallets
+	runtimeDeps     bool
+	walletDeps      RuntimeDeps
+	runtimeCfg      runtimeOrderConfig
+	Account         string
+	BarMS           int64
+	simulOpen       int // Simultaneously open number in the current bar
+	simulOpenSt     map[string]int
+	seenSeriesMu    sync.RWMutex
+	seenSeriesEndMS map[string]int64
 
 	fundingMu       sync.Mutex
 	fundingRepo     orm.SeriesRepo
@@ -460,17 +465,38 @@ func (o *OrderMgr) setExit(od *ormo.InOutOrder, exitAt int64, tag, orderType str
 	}
 }
 
-func (o *OrderMgr) canClose(od *ormo.InOutOrder) bool {
-	if o == nil || !o.runtimeDeps {
-		return od.CanClose()
+func (o *OrderMgr) inSimOrderMatch() bool {
+	if o != nil && o.runtimeDeps {
+		return o.runtimeCore != nil && o.runtimeCore.InSimOrderMatch()
 	}
-	if od.ExitTag != "" {
+	return core.SimOrderMatch
+}
+
+func (o *OrderMgr) canClose(od *ormo.InOutOrder) bool {
+	if od == nil || od.ExitTag != "" {
 		return false
 	}
-	if od.Timeframe == "ws" {
+	if od.Timeframe == "ws" || o.inSimOrderMatch() {
 		return true
 	}
-	tfMSecs := int64(utils.TFToSecs(od.Timeframe) * 1000)
+	if o == nil || !o.runtimeDeps {
+		matchTf := od.Timeframe
+		if o != nil {
+			if refined := o.refineTimeFrame(od.Strategy, od.Timeframe); refined != "" {
+				matchTf = refined
+			}
+		}
+		if matchTf != od.Timeframe {
+			tfMSecs := int64(utils.TFToSecs(matchTf) * 1000)
+			return float64(btime.TimeMS()-od.RealEnterMS()) > float64(tfMSecs)*0.9
+		}
+		return od.CanClose()
+	}
+	matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
+	if matchTf == "" {
+		matchTf = od.Timeframe
+	}
+	tfMSecs := int64(utils.TFToSecs(matchTf) * 1000)
 	return float64(o.priceNow()-od.RealEnterMS()) > float64(tfMSecs)*0.9
 }
 
@@ -478,7 +504,7 @@ func (o *OrderMgr) updateOrderFee(od *ormo.InOutOrder, price float64, forEnter b
 	if o == nil || !o.runtimeDeps {
 		err := od.UpdateFee(price, forEnter)
 		if err == nil && !forEnter && od.Exit != nil && o != nil && core.BackTestMode {
-			o.settleBacktestFunding(od, config.Data.BTFundingApr, core.IsContract, core.Market == banexg.MarketInverse, o.priceNow())
+			o.settleBacktestFundingWithMode(od, config.Data.BTFundingApr, core.IsContract, core.Market == banexg.MarketInverse, config.Data.BTLegacyApproxFunding, o.priceNow())
 		}
 		return err
 	}
@@ -509,7 +535,7 @@ func (o *OrderMgr) updateOrderFee(od *ormo.InOutOrder, price float64, forEnter b
 	} else {
 		od.DirtyExit = true
 		if o.isBacktest() {
-			o.settleBacktestFunding(od, o.runtimeCfg.fundingApr, o.isContract(), o.marketType() == banexg.MarketInverse, o.priceNow())
+			o.settleBacktestFundingWithMode(od, o.runtimeCfg.fundingApr, o.isContract(), o.marketType() == banexg.MarketInverse, o.runtimeCfg.legacyApproxFunding, o.priceNow())
 		}
 	}
 	return nil
@@ -665,20 +691,26 @@ func dedupeFundingRatePoints(pts []fundingRatePoint) []fundingRatePoint {
 // settleBacktestFunding settles bilateral perpetual funding over (enterMS, exitMS]
 // when real funding_rate data is available for od.Symbol (long pays positive rate
 // and receives negative rate; short receives positive rate and pays negative rate).
-// When no funding_rate series exists for the symbol, it falls back to addApproxFunding.
+// When no funding_rate series exists for the symbol, it falls back to addApproxFundingWithMode.
 func (o *OrderMgr) settleBacktestFunding(od *ormo.InOutOrder, aprPct float64, contract, inverse bool, nowMS int64) {
+	o.settleBacktestFundingWithMode(od, aprPct, contract, inverse, false, nowMS)
+}
+
+func (o *OrderMgr) settleBacktestFundingWithMode(od *ormo.InOutOrder, aprPct float64, contract, inverse, legacyUnilateral bool, nowMS int64) {
 	if !contract || od == nil || od.Enter == nil || od.Exit == nil {
 		return
 	}
 	if inverse {
-		if pts, ok := o.symbolFundingPoints(od.Symbol); ok && len(pts) > 0 || aprPct > 0 && !od.Short {
+		if pts, ok := o.symbolFundingPoints(od.Symbol); ok && len(pts) > 0 {
 			od.SetInfo("funding_skipped", "inverse")
+			return
 		}
+		addApproxFundingWithMode(od, aprPct, contract, inverse, legacyUnilateral, nowMS)
 		return
 	}
 	pts, hasReal := o.symbolFundingPoints(od.Symbol)
 	if !hasReal {
-		addApproxFunding(od, aprPct, contract, inverse, nowMS)
+		addApproxFundingWithMode(od, aprPct, contract, inverse, legacyUnilateral, nowMS)
 		return
 	}
 	enterMS := od.RealEnterMS()
@@ -719,16 +751,20 @@ func (o *OrderMgr) settleBacktestFunding(od *ormo.InOutOrder, aprPct float64, co
 	od.SetInfo("funding", totalCost)
 }
 
-// addApproxFunding (055) charges a constant-rate funding cost on the exit leg of a LONG contract order:
-// entry notional x apr% x holding years. The backtest has no historical funding series, so this is a
-// conservative approximation (shorts are not credited). Fee and FeeQuote are both raised so the wallet and the
-// order profit stay consistent (contract fees are quote-denominated).
-//
-// The cost is also stored in the order info as "funding" (orders.csv writes it in its own column and reports
-// exitFee without it). Inverse contracts are coin-margined: the notional here would be wrong, so they get no
-// funding charge and are tagged funding_skipped=inverse.
+// addApproxFunding (055, bilateral symmetric since BtFeatureLevel 15) settles a constant-rate approximate
+// funding transfer on the exit leg of a linear contract order: entry notional x apr% x holding years.
+// Under positive aprPct, longs pay (+cost added to Exit.Fee/FeeQuote) and shorts receive (-cost added to
+// Exit.Fee/FeeQuote, increasing order profit), so an equal-notional 1:1 long+short hedge incurs zero net
+// funding distortion. Inverse coin-margined contracts are skipped and tagged funding_skipped=inverse.
 func addApproxFunding(od *ormo.InOutOrder, aprPct float64, contract, inverse bool, nowMS int64) {
-	if aprPct <= 0 || !contract || od == nil || od.Short || od.Enter == nil || od.Exit == nil {
+	addApproxFundingWithMode(od, aprPct, contract, inverse, false, nowMS)
+}
+
+func addApproxFundingWithMode(od *ormo.InOutOrder, aprPct float64, contract, inverse, legacyUnilateral bool, nowMS int64) {
+	if aprPct == 0 || !contract || od == nil || od.Enter == nil || od.Exit == nil {
+		return
+	}
+	if legacyUnilateral && (aprPct < 0 || od.Short) {
 		return
 	}
 	if inverse {
@@ -740,7 +776,10 @@ func addApproxFunding(od *ormo.InOutOrder, aprPct float64, contract, inverse boo
 		exitMS = nowMS
 	}
 	cost := fundingApproxCost(od.Enter.Average*od.Enter.Filled, aprPct, exitMS-od.EnterAt)
-	if cost <= 0 {
+	if od.Short {
+		cost = -cost
+	}
+	if cost == 0 {
 		return
 	}
 	od.Exit.Fee += cost
@@ -751,7 +790,7 @@ func addApproxFunding(od *ormo.InOutOrder, aprPct float64, contract, inverse boo
 
 // fundingApproxCost is notional x apr% x (holdMS in years).
 func fundingApproxCost(notional, aprPct float64, holdMS int64) float64 {
-	if aprPct <= 0 || notional <= 0 || holdMS <= 0 {
+	if aprPct == 0 || math.IsNaN(aprPct) || math.IsInf(aprPct, 0) || notional <= 0 || holdMS <= 0 {
 		return 0
 	}
 	return notional * aprPct / 100 * float64(holdMS) / (365 * 86400000)
@@ -881,6 +920,7 @@ func makeRuntimeOrderConfig(deps RuntimeDeps, account string) runtimeOrderConfig
 	result.gapMinHours = cfg.BTGapMinHours
 	result.delistPenaltyBps = cfg.BTDelistPenaltyBps
 	result.fundingApr = cfg.BTFundingApr
+	result.legacyApproxFunding = cfg.BTLegacyApproxFunding
 	result.accountLeverage = cfg.Leverage
 	if acc := cfg.Accounts[account]; acc != nil {
 		if acc.Leverage > 0 {
@@ -992,6 +1032,84 @@ func (o *OrderMgr) refineTimeFrame(strategy, timeframe string) string {
 	}
 	refined, _ := config.GetStratRefineTF(strategy, timeframe)
 	return refined
+}
+
+func seriesEndMSForMatch(evt *orm.DataSeries) int64 {
+	if evt == nil {
+		return 0
+	}
+	if evt.EndMS > evt.TimeMS {
+		return evt.EndMS
+	}
+	if evt.TimeFrame != "" {
+		return evt.TimeMS + int64(utils.TFToSecs(evt.TimeFrame))*1000
+	}
+	return evt.TimeMS
+}
+
+func (o *OrderMgr) recordSeriesObserved(symbol, tf string, endMS int64) {
+	if o == nil || symbol == "" || tf == "" || endMS <= 0 {
+		return
+	}
+	key := symbol + "\x00" + tf
+	o.seenSeriesMu.Lock()
+	if o.seenSeriesEndMS == nil {
+		o.seenSeriesEndMS = make(map[string]int64)
+	}
+	if endMS > o.seenSeriesEndMS[key] {
+		o.seenSeriesEndMS[key] = endMS
+	}
+	o.seenSeriesMu.Unlock()
+}
+
+func (o *OrderMgr) lastObservedSeriesEndMS(symbol, tf string) int64 {
+	if o == nil || symbol == "" || tf == "" {
+		return 0
+	}
+	key := symbol + "\x00" + tf
+	o.seenSeriesMu.RLock()
+	endMS := o.seenSeriesEndMS[key]
+	o.seenSeriesMu.RUnlock()
+	return endMS
+}
+
+// effectiveMatchTimeFrame resolves the sub-bar matching timeframe for od, gracefully
+// degrading to od.Timeframe on a coarse bar in backtests ONLY when no finer refine_tf
+// sub-bar was delivered inside (evt.TimeMS, evtEndMS] (e.g. synthetic coarse-only tests).
+func (o *OrderMgr) effectiveMatchTimeFrame(od *ormo.InOutOrder, evt *orm.DataSeries) string {
+	if od == nil {
+		return ""
+	}
+	matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
+	if matchTf == "" {
+		matchTf = od.Timeframe
+	}
+	if evt == nil || matchTf == od.Timeframe || evt.TimeFrame == matchTf {
+		return matchTf
+	}
+	if evt.TimeFrame == od.Timeframe && o.isBacktest() {
+		subSecs := utils.TFToSecs(matchTf)
+		mainSecs := utils.TFToSecs(od.Timeframe)
+		if subSecs > 0 && subSecs < mainSecs && o.lastObservedSeriesEndMS(od.Symbol, matchTf) <= evt.TimeMS {
+			return od.Timeframe
+		}
+	}
+	return matchTf
+}
+
+func (o *OrderMgr) syncJobOrders(job *strat.StratJob) {
+	if o == nil || job == nil {
+		return
+	}
+	openOds, lock := o.openOrders()
+	lock.Lock()
+	curOrders := executionOpenOrders(openOds, o.executionDeps())
+	lock.Unlock()
+	pending := job.PendingEntryCount()
+	job.UpdateOrders(curOrders)
+	if pending > 0 {
+		job.AddOrderCount(pending)
+	}
 }
 
 func (o *OrderMgr) ensureLatestPrice(symbol string) *errs.Error {
@@ -1329,6 +1447,9 @@ func (o *OrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*or
 				extOrders = append(extOrders, iorders...)
 			}
 		}
+		if len(batchEntOrders) > 0 || len(batchExtOrders) > 0 {
+			o.syncJobOrders(job)
+		}
 		if job.Strat.OnOrderChange != nil && (len(batchEntOrders) > 0 || len(batchExtOrders) > 0) {
 			for _, od := range batchEntOrders {
 				job.Strat.OnOrderChange(job, od, strat.OdChgEnter)
@@ -1337,6 +1458,9 @@ func (o *OrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*or
 				job.Strat.OnOrderChange(job, od, strat.OdChgExit)
 			}
 		}
+	}
+	if len(entOrders) > 0 || len(extOrders) > 0 {
+		o.syncJobOrders(job)
 	}
 	return entOrders, extOrders, nil
 }
@@ -1390,6 +1514,7 @@ func (o *OrderMgr) RelayOrders(orders []*ormo.InOutOrder) *errs.Error {
 				Status:   ormo.OdStatusInit,
 			},
 			Info:       make(map[string]interface{}),
+			OCOGroup:   odr.OCOGroup,
 			DirtyMain:  true,
 			DirtyEnter: true,
 		}
@@ -1502,17 +1627,23 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 			UpdateAt:  curTimeMS,
 		},
 		Info:       map[string]interface{}{},
+		OCOGroup:   req.OCOGroup,
 		DirtyMain:  true,
 		DirtyEnter: true,
 	}
 	if state := o.orderState(); state != nil {
 		od.BindState(state)
 	}
+	if req.Limit > 0 && req.OrderType == core.OrderTypeEmpty {
+		od.Enter.OrderType = banexg.OdTypeLimit
+	}
 	if od.Enter.OrderType == "" {
 		od.Enter.OrderType = o.orderType()
 	}
 	if req.Limit > 0 {
-		od.InitPrice = req.Limit
+		if req.Stop == 0 {
+			od.InitPrice = req.Limit
+		}
 		if req.StopBars == 0 {
 			req.StopBars = o.stopEnterBars()
 		}
@@ -1521,6 +1652,9 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 			od.SetInfo(ormo.OdInfoStopAfter, stopAfter)
 			od.SetInfo(ormo.OdInfoStopBars, req.StopBars)
 		}
+	}
+	if req.OCOGroup != "" {
+		od.SetInfo(ormo.OdInfoOCOGroup, req.OCOGroup)
 	}
 	od.SetInfo(ormo.OdInfoLegalCost, req.LegalCost)
 	if req.CallbackPct > 0 {
@@ -1540,7 +1674,25 @@ func (o *OrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq,
 			return od, err
 		}
 	}
-	if req.TakeProfit > 0 {
+	if len(req.TakeProfits) > 0 {
+		rungs := make([]*ormo.TPLadderRung, len(req.TakeProfits))
+		for idx, tp := range req.TakeProfits {
+			exitRate := tp.ExitRate
+			if exitRate == 0 && len(req.TakeProfits) == 1 {
+				exitRate = 1
+			}
+			rungs[idx] = &ormo.TPLadderRung{
+				Price:             tp.Price,
+				Val:               tp.Val,
+				Rate:              tp.Rate,
+				Limit:             tp.Limit,
+				ExitRate:          exitRate,
+				MoveSLToBreakeven: tp.MoveSLToBreakeven,
+				Tag:               tp.Tag,
+			}
+		}
+		od.SetTakeProfits(rungs)
+	} else if req.TakeProfit > 0 {
 		err := od.SetExitTrigger(ormo.OdInfoTakeProfit, &ormo.ExitTrigger{
 			Price: req.TakeProfit,
 			Limit: req.TakeProfitLimit,
@@ -1590,9 +1742,15 @@ func entryInitPrice(short bool, stop, limit, price float64) float64 {
 func entryInitPriceWith(short bool, stop, limit, price float64, legacyIntrabar bool) float64 {
 	if !legacyIntrabar {
 		if short && stop > 0 && stop < price {
+			if limit > stop {
+				return limit
+			}
 			return stop
 		}
 		if !short && stop > price {
+			if limit > 0 && limit < stop {
+				return limit
+			}
 			return stop
 		}
 	}
@@ -1891,23 +2049,36 @@ func (o *OrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.Data
 	if err != nil {
 		return errs.New(core.ErrInvalidBars, err)
 	}
+	lowVal, lowErr := evt.LowValue()
+	if lowErr != nil {
+		lowVal = closeVal
+	}
 	symbol := evt.Symbol()
 	tf := evt.TimeFrame
 	for _, od := range allOpens {
 		if od.Symbol != symbol || od.Status >= ormo.InOutStatusFullExit {
 			continue
 		}
-		matchTf := o.refineTimeFrame(od.Strategy, od.Timeframe)
+		matchTf := o.effectiveMatchTimeFrame(od, evt)
 		if tf != matchTf {
 			continue
 		}
 		od.UpdateProfits(closeVal)
 		activePrice := od.GetInfoFloat64(ormo.OdInfoActivePrice)
 		if activePrice > 0 {
-			if od.Short && activePrice >= closeVal || !od.Short && activePrice <= highVal {
+			if od.Short && activePrice >= min(lowVal, closeVal) || !od.Short && activePrice <= max(highVal, closeVal) {
 				od.SetInfo(ormo.OdInfoActivePrice, 0)
 			} else {
 				continue
+			}
+		}
+		bestRef := highVal
+		if od.Short {
+			bestRef = lowVal
+		}
+		if bestRef > 0 {
+			if err := od.UpdateTrailing(bestRef); err != nil {
+				return err
 			}
 		}
 		err := od.UpdateTrailing(closeVal)

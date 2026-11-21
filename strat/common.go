@@ -1,8 +1,10 @@
 package strat
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -28,30 +30,90 @@ var (
 	stratMakeMu    sync.RWMutex
 )
 
+func isRuntimePanic(recovered any) bool {
+	if _, ok := recovered.(runtime.Error); ok {
+		return true
+	}
+	if err, ok := recovered.(error); ok {
+		var rtErr runtime.Error
+		if errors.As(err, &rtErr) {
+			return true
+		}
+	}
+	if text, ok := recovered.(string); ok {
+		trimmed := strings.TrimSpace(text)
+		if strings.HasPrefix(trimmed, "runtime error:") || strings.HasPrefix(trimmed, "sync:") {
+			return true
+		}
+	}
+	return false
+}
+
+func invokeStratFactory(makeFn FuncMakeStrat, pol *config.RunPolicyConfig) (stgy *TradeStrat, badParam *config.BadParamError) {
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+		if isRuntimePanic(recovered) {
+			panic(recovered)
+		}
+		badParam = config.CoerceBadParamError(pol, recovered)
+	}()
+	stgy = makeFn(pol)
+	return
+}
+
 func New(pol *config.RunPolicyConfig) *TradeStrat {
+	stgy, badParam := newLegacyStrategy(pol)
+	if badParam != nil {
+		panic(badParam)
+	}
+	return stgy
+}
+
+// NewChecked constructs a strategy via the legacy package cache, returning a
+// BadConfig error when the strategy constructor rejects its policy parameters.
+// Genuine Go runtime.Error panics still propagate unchanged.
+func NewChecked(pol *config.RunPolicyConfig) (*TradeStrat, *errs.Error) {
+	stgy, badParam := newLegacyStrategy(pol)
+	if badParam != nil {
+		return nil, badParam.BanError()
+	}
+	return stgy, nil
+}
+
+func newLegacyStrategy(pol *config.RunPolicyConfig) (*TradeStrat, *config.BadParamError) {
 	polID := pol.ID()
 	cacheKey := utils.MD5([]byte(polID + "\n" + pol.ToYaml()))
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 	if obj, ok := cacheStrats[cacheKey]; ok {
+		if pol.RefineTF == nil && obj.RefineTF != nil {
+			pol.RefineTF = obj.RefineTF
+		}
 		obj.Policy = pol
-		return obj
+		return obj, nil
 	}
 	stratMakeMu.RLock()
 	makeFn, ok := stratFactories[pol.Name]
 	stratMakeMu.RUnlock()
-	var stgy *TradeStrat
-	if ok {
-		stgy = makeFn(pol)
-	} else {
+	if !ok {
 		panic("strategy not found: " + pol.Name)
 		// stgy = loadNative(pol.Name)
+	}
+	stgy, badParam := invokeStratFactory(makeFn, pol)
+	if badParam != nil || stgy == nil {
+		return stgy, badParam
 	}
 	stgy.Name = polID
 	validateDataCallbacks(stgy)
 	cacheStrats[cacheKey] = stgy
 	if stgy.MinTfScore == 0 {
 		stgy.MinTfScore = 0.75
+	}
+	if pol.RefineTF == nil && stgy.RefineTF != nil {
+		pol.RefineTF = stgy.RefineTF
 	}
 	stgy.Policy = pol
 	if pol.StakeRate > 0 {
@@ -100,7 +162,7 @@ func New(pol *config.RunPolicyConfig) *TradeStrat {
 				zap.String("type", fmt.Sprintf("%T", pol.StopLoss)))
 		}
 	}
-	return stgy
+	return stgy, nil
 }
 
 func Get(pair, stratID string) *TradeStrat {
@@ -195,7 +257,9 @@ func (q *EnterReq) Clone() *EnterReq {
 		OrderType:       q.OrderType,
 		Limit:           q.Limit,
 		Stop:            q.Stop,
+		OCOGroup:        q.OCOGroup,
 		CostRate:        q.CostRate,
+		RiskRate:        q.RiskRate,
 		LegalCost:       q.LegalCost,
 		Leverage:        q.Leverage,
 		Amount:          q.Amount,
@@ -204,6 +268,8 @@ func (q *EnterReq) Clone() *EnterReq {
 		StopLossLimit:   q.StopLossLimit,
 		StopLossRate:    q.StopLossRate,
 		StopLossTag:     q.StopLossTag,
+		ActivationPrice: q.ActivationPrice,
+		CallbackPct:     q.CallbackPct,
 		TakeProfitVal:   q.TakeProfitVal,
 		TakeProfit:      q.TakeProfit,
 		TakeProfitLimit: q.TakeProfitLimit,
@@ -212,6 +278,10 @@ func (q *EnterReq) Clone() *EnterReq {
 		StopBars:        q.StopBars,
 		ClientID:        q.ClientID,
 		Log:             q.Log,
+	}
+	if q.TakeProfits != nil {
+		res.TakeProfits = make([]TakeProfitTarget, len(q.TakeProfits))
+		copy(res.TakeProfits, q.TakeProfits)
 	}
 
 	// 深度复制map字段Infos
@@ -251,8 +321,14 @@ func (q *EnterReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 	if q.Stop != 0 {
 		fields = append(fields, zap.Float64("trigger", q.Stop))
 	}
+	if q.OCOGroup != "" {
+		fields = append(fields, zap.String("ocoGroup", q.OCOGroup))
+	}
 	if q.CostRate > 0 && q.CostRate < 1 {
 		fields = append(fields, zap.Float64("costRate", q.CostRate))
+	}
+	if q.RiskRate > 0 {
+		fields = append(fields, zap.Float64("riskRate", q.RiskRate))
 	}
 	if q.LegalCost > 0 {
 		fields = append(fields, zap.Float64("cost", q.LegalCost))
@@ -268,10 +344,16 @@ func (q *EnterReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 	} else if q.StopLoss > 0 {
 		fields = append(fields, zap.Float64("sl", q.StopLoss))
 	}
+	if q.CallbackPct > 0 {
+		fields = append(fields, zap.Float64("callbackPct", q.CallbackPct))
+	}
 	if q.TakeProfitVal > 0 {
 		fields = append(fields, zap.Float64("tpVal", q.TakeProfitVal))
 	} else if q.TakeProfit > 0 {
 		fields = append(fields, zap.Float64("tp", q.TakeProfit))
+	}
+	if len(q.TakeProfits) > 0 {
+		fields = append(fields, zap.Any("tps", q.TakeProfits))
 	}
 	if q.StopBars > 0 {
 		fields = append(fields, zap.Int("stopBars", q.StopBars))
@@ -381,6 +463,7 @@ func (s *StratJob) InitBar(curOrders []*ormo.InOutOrder) {
 	if s.recordInspectEffect("InitBar") {
 		return
 	}
+	s.observeIntradayEnvBar()
 	checkMS := s.runtimeTimeMS()
 	lastBarMS := s.Env.TimeStop
 	state := s.executionState()

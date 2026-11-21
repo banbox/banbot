@@ -593,7 +593,10 @@ func makeStrategy(strategyState *strat.State, policy *config.RunPolicyConfig) (r
 			panicText = fmt.Sprint(value)
 		}
 	}()
-	result = strategyState.NewStrategy(policy)
+	result, err := strategyState.NewStrategyChecked(policy)
+	if err != nil {
+		return nil, err.Short()
+	}
 	if result == nil {
 		panicText = "strategy constructor returned nil"
 	}

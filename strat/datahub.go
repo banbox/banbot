@@ -6,17 +6,25 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/utils"
 	utils2 "github.com/banbox/banexg/utils"
 	ta "github.com/banbox/banta"
 )
 
+const DefaultDataHubCache = 1500
+
+var klineBarEnvFields = [...]string{
+	"open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num",
+}
+
 type DataHub struct {
-	mu        sync.RWMutex
-	sourceMap map[string]map[string]map[int32]*DataFields // timeframe:source:sid
-	curMS     int64
-	limit     int
+	mu            sync.RWMutex
+	sourceMap     map[string]map[string]map[int32]*DataFields // timeframe:source:sid
+	curMS         int64
+	limit         int
+	explicitLimit bool
 }
 
 type DataFields struct {
@@ -28,26 +36,93 @@ type DataFields struct {
 	TimeMS        int64
 	Source        string
 	Sid           int32
+	Symbol        string
 	TimeFrame     string
 	Closed        bool
 	IsWarmUp      bool
 	env           *ta.BarEnv
+	isKlineEnv    bool
 	seriesFields  map[string]bool
 	seriesNames   []string
 	seriesNameSet map[string]struct{}
 	autoSeries    bool
 	configured    bool
 	limit         int
+	explicitLimit bool
 }
 
 func NewDataHub(limit ...int) *DataHub {
-	curLimit := 512
+	curLimit := max(DefaultDataHubCache, core.NumTaCache)
+	explicit := false
 	if len(limit) > 0 && limit[0] > 0 {
 		curLimit = limit[0]
+		explicit = true
 	}
 	return &DataHub{
-		sourceMap: make(map[string]map[string]map[int32]*DataFields),
-		limit:     curLimit,
+		sourceMap:     make(map[string]map[string]map[int32]*DataFields),
+		limit:         curLimit,
+		explicitLimit: explicit,
+	}
+}
+
+func (d *DataHub) MaxCache() int {
+	if d == nil {
+		return 0
+	}
+	d.mu.RLock()
+	limit := d.limit
+	d.mu.RUnlock()
+	return limit
+}
+
+// SetMaxCache overrides the maximum retained history length for this DataHub
+// and every non-explicitly-sized DataFields view it owns.
+func (d *DataHub) SetMaxCache(limit int) {
+	if d == nil || limit <= 0 {
+		return
+	}
+	d.mu.Lock()
+	d.limit = limit
+	d.explicitLimit = true
+	var list []*DataFields
+	for _, bySource := range d.sourceMap {
+		for _, bySID := range bySource {
+			for _, fields := range bySID {
+				if fields != nil {
+					list = append(list, fields)
+				}
+			}
+		}
+	}
+	d.mu.Unlock()
+	for _, fields := range list {
+		fields.setHubLimit(limit)
+	}
+}
+
+func (d *DataHub) raiseMinCache(limit int) {
+	if d == nil || limit <= 0 {
+		return
+	}
+	d.mu.Lock()
+	if d.explicitLimit || limit <= d.limit {
+		d.mu.Unlock()
+		return
+	}
+	d.limit = limit
+	var list []*DataFields
+	for _, bySource := range d.sourceMap {
+		for _, bySID := range bySource {
+			for _, fields := range bySID {
+				if fields != nil {
+					list = append(list, fields)
+				}
+			}
+		}
+	}
+	d.mu.Unlock()
+	for _, fields := range list {
+		fields.raiseMinCache(limit)
 	}
 }
 
@@ -58,14 +133,50 @@ func (d *DataHub) Configure(subs []*DataSub) {
 		return
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	explicitHub := d.explicitLimit
+	type pending struct {
+		fields *DataFields
+		sub    *DataSub
+	}
+	items := make([]pending, 0, len(subs))
 	for _, sub := range subs {
 		if sub == nil || sub.ExSymbol == nil || sub.TimeFrame == "" {
 			continue
 		}
 		fields := d.ensureLocked(sub.TimeFrame, sub.Source, sub.ExSymbol.ID)
-		fields.configure(sub.SeriesFields)
+		items = append(items, pending{fields: fields, sub: sub})
 	}
+	d.mu.Unlock()
+	for _, item := range items {
+		item.fields.configureSub(item.sub, !explicitHub)
+	}
+}
+
+func (d *DataHub) findKlineBySymbol(tf string, symbols ...string) *DataFields {
+	if d == nil || tf == "" || len(symbols) == 0 {
+		return nil
+	}
+	d.mu.RLock()
+	bySource := d.sourceMap[tf]
+	bySID := bySource[orm.SeriesSourceKline]
+	var candidates []*DataFields
+	for _, fields := range bySID {
+		if fields != nil {
+			candidates = append(candidates, fields)
+		}
+	}
+	d.mu.RUnlock()
+	for _, sym := range symbols {
+		if sym == "" {
+			continue
+		}
+		for _, fields := range candidates {
+			if fields.symbolName() == sym {
+				return fields
+			}
+		}
+	}
+	return nil
 }
 
 func (d *DataHub) Get(tf string, source string, sid int32) *DataFields {
@@ -156,9 +267,36 @@ func (d *DataHub) ensureLocked(tf, source string, sid int32) *DataFields {
 	return fields
 }
 
+func (d *DataFields) configureSub(sub *DataSub, raiseWarmup bool) {
+	if sub == nil {
+		return
+	}
+	d.mu.Lock()
+	if sub.ExSymbol != nil && sub.ExSymbol.Symbol != "" && d.Symbol == "" {
+		d.Symbol = sub.ExSymbol.Symbol
+	}
+	if orm.NormalizeSeriesSource(sub.Source) == orm.SeriesSourceKline {
+		d.isKlineEnv = true
+	}
+	if raiseWarmup && !d.explicitLimit && sub.WarmupNum > 0 {
+		if target := sub.WarmupNum + 100; target > d.limit {
+			d.limit = target
+			if d.env != nil {
+				d.env.MaxCache = target
+			}
+		}
+	}
+	d.configureLocked(sub.SeriesFields)
+	d.mu.Unlock()
+}
+
 func (d *DataFields) configure(names []string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.configureLocked(names)
+}
+
+func (d *DataFields) configureLocked(names []string) {
 	d.configured = true
 	if len(names) == 0 {
 		d.autoSeries = true
@@ -186,6 +324,95 @@ func (d *DataFields) configureDefault() {
 	d.mu.Unlock()
 }
 
+func (d *DataFields) MaxCache() int {
+	if d == nil {
+		return 0
+	}
+	d.mu.RLock()
+	limit := d.limit
+	d.mu.RUnlock()
+	return limit
+}
+
+// SetMaxCache overrides the maximum retained history length for this stream's
+// Series and underlying BarEnv.
+func (d *DataFields) SetMaxCache(limit int) {
+	if d == nil || limit <= 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.limit = limit
+	d.explicitLimit = true
+	if d.env != nil {
+		d.env.MaxCache = limit
+	}
+	for _, s := range d.seriesMap {
+		if s != nil {
+			s.Cut(limit)
+		}
+	}
+}
+
+func (d *DataFields) setHubLimit(limit int) {
+	if d == nil || limit <= 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.explicitLimit {
+		return
+	}
+	d.limit = limit
+	if d.env != nil {
+		d.env.MaxCache = limit
+	}
+	for _, s := range d.seriesMap {
+		if s != nil {
+			s.Cut(limit)
+		}
+	}
+}
+
+func (d *DataFields) raiseMinCache(limit int) {
+	if d == nil || limit <= 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.explicitLimit || limit <= d.limit {
+		return
+	}
+	d.limit = limit
+	if d.env != nil {
+		d.env.MaxCache = limit
+	}
+}
+
+func (d *DataFields) symbolName() string {
+	if d == nil {
+		return ""
+	}
+	d.mu.RLock()
+	sym := d.Symbol
+	d.mu.RUnlock()
+	return sym
+}
+
+// BarEnv returns the synchronized K-line *ta.BarEnv for K-line or OHLCV streams
+// once at least one bar has arrived, or nil when not yet ready or non-OHLCV.
+func (d *DataFields) BarEnv() *ta.BarEnv {
+	if d == nil {
+		return nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if !d.isKlineEnv || d.env == nil || d.env.Close == nil {
+		return nil
+	}
+	return d.env
+}
+
 func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -196,6 +423,9 @@ func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 	d.DoneMS = endMS
 	d.Source = orm.NormalizeSeriesSource(evt.Source)
 	d.Sid = evt.Sid
+	if evt.ExSymbol != nil && evt.ExSymbol.Symbol != "" {
+		d.Symbol = evt.ExSymbol.Symbol
+	}
 	d.TimeFrame = evt.TimeFrame
 	d.Closed = evt.Closed
 	d.IsWarmUp = evt.IsWarmUp
@@ -209,7 +439,15 @@ func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 		}
 	}
 
+	if !d.isKlineEnv && (d.Source == orm.SeriesSourceKline || evt.HasOHLCV()) {
+		d.isKlineEnv = true
+	}
 	changed := false
+	if d.isKlineEnv {
+		for _, name := range klineBarEnvFields {
+			changed = d.addSeriesNameLocked(name) || changed
+		}
+	}
 	for name, value := range evt.Values {
 		_, selected := d.seriesNameSet[name]
 		if !selected && d.autoSeries && isFloatValue(value) {
@@ -229,18 +467,40 @@ func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 		return
 	}
 	if d.env == nil {
-		d.env, _ = ta.NewBarEnv("", "", fmt.Sprintf("%s:%d", evt.Source, evt.Sid), evt.TimeFrame)
-		if d.env == nil {
-			return
+		exgName, market, symName := "", "", fmt.Sprintf("%s:%d", d.Source, evt.Sid)
+		if evt.ExSymbol != nil {
+			exgName = evt.ExSymbol.Exchange
+			market = evt.ExSymbol.Market
+			if evt.ExSymbol.Symbol != "" {
+				symName = evt.ExSymbol.Symbol
+			}
+		} else if d.Symbol != "" {
+			symName = d.Symbol
 		}
-		d.env.MaxCache = d.limit
+		d.env, _ = ta.NewBarEnv(exgName, market, symName, evt.TimeFrame)
+		if d.env == nil {
+			d.env = &ta.BarEnv{
+				Exchange:   exgName,
+				MarketType: market,
+				Symbol:     symName,
+				TimeFrame:  evt.TimeFrame,
+				MaxCache:   d.limit,
+				Items:      make(map[int]*ta.Series),
+			}
+		}
+		if d.limit > 0 {
+			d.env.MaxCache = d.limit
+		}
+		if evt.Sid > 0 {
+			d.env.Data.Store("sid", int64(evt.Sid))
+		}
 	}
 	d.env.TimeStart = evt.TimeMS
 	d.env.TimeStop = endMS
 	d.env.BarNum++
 	for _, name := range d.seriesNames {
 		value := math.NaN()
-		if raw, ok := evt.Values[name]; ok {
+		if raw, ok := evt.Values[name]; ok && raw != nil {
 			if num, err := utils.ToFloat64(raw); err == nil {
 				value = num
 			}
@@ -257,6 +517,16 @@ func (d *DataFields) update(evt *orm.DataSeries, endMS int64) {
 			}
 		}
 		delete(d.valMap, name)
+	}
+	if d.isKlineEnv && d.env.Open == nil {
+		d.env.Open = d.seriesMap["open"]
+		d.env.High = d.seriesMap["high"]
+		d.env.Low = d.seriesMap["low"]
+		d.env.Close = d.seriesMap["close"]
+		d.env.Volume = d.seriesMap["volume"]
+		d.env.Quote = d.seriesMap["quote"]
+		d.env.BuyVolume = d.seriesMap["buy_volume"]
+		d.env.TradeNum = d.seriesMap["trade_num"]
 	}
 }
 
@@ -355,13 +625,36 @@ func (d *DataFields) Has(name string) bool {
 	return ok
 }
 
+func (s *StratJob) defaultDataHubLimit() int {
+	limit := DefaultDataHubCache
+	if s != nil {
+		if s.runtimeCore != nil && s.runtimeCore.NumTaCache > limit {
+			limit = s.runtimeCore.NumTaCache
+		} else if (s.strategyState == nil || s.strategyState == legacyState) && s.runtimeCore == nil && core.NumTaCache > limit {
+			limit = core.NumTaCache
+		}
+		if s.Strat != nil && s.Strat.WarmupNum > 0 {
+			limit = max(limit, s.Strat.WarmupNum+100)
+		}
+	}
+	return limit
+}
+
+func newJobDataHub(job *StratJob) *DataHub {
+	hub := NewDataHub()
+	hub.raiseMinCache(job.defaultDataHubLimit())
+	return hub
+}
+
 func (s *StratJob) SetData(evt *orm.DataSeries) *DataFields {
 	if s == nil || evt == nil {
 		return nil
 	}
+	minLimit := s.defaultDataHubLimit()
 	if s.DataHub == nil {
 		s.DataHub = NewDataHub()
 	}
+	s.DataHub.raiseMinCache(minLimit)
 	if !s.dataHubConfigured {
 		subs := CollectDataSubs(s)
 		if s.Symbol != nil && s.TimeFrame != "" {

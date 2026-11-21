@@ -373,7 +373,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		curMap[pair] = tf
 		enableAdmissionPair(admissionState, pair)
 		env := initBarEnvWithState(strategyState, admissionState, exs, tf)
-		ensureStratJobWithRuntimeState(strategyState, admissionState, req.Strat, tf, exs, env, dirt, logWarm, accLimits, hooks.SymbolState)
+		ensureStratJobWithExchange(strategyState, admissionState, exchange, req.Strat, tf, exs, env, dirt, logWarm, accLimits, hooks.SymbolState)
 		if len(req.Strat.WsSubs) > 0 {
 			envKey := pair + "_" + tf
 			for acc := range utils.MapKeys(strategyState.accJobs, strictBacktestFor(strategyState, admissionState)) {

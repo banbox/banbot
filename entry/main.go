@@ -3,6 +3,7 @@ package entry
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -30,6 +31,11 @@ import (
 func RunCmd() {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			if badParam, ok := config.AsBadParamError(recovered); ok {
+				writeCommandError(os.Stderr, badParam.BanError())
+				core.RunExitCalls()
+				os.Exit(1)
+			}
 			_, _ = fmt.Fprintf(os.Stderr, "banbot panic raw stack:\n%s", panicStack())
 			if err, ok := recovered.(*errs.Error); ok {
 				log.Error("banbot panic", zap.Any("error", err))
@@ -49,10 +55,17 @@ func RunCmd() {
 	deadlock.Opts.Disable = true
 	cobra.MousetrapHelpText = ""
 	if err := ExecuteContext(ctx, os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
+		writeCommandError(os.Stderr, err)
 		core.RunExitCalls()
 		os.Exit(1)
 	}
+}
+
+func writeCommandError(w io.Writer, err error) {
+	if w == nil || err == nil {
+		return
+	}
+	_, _ = fmt.Fprintln(w, "Error:", err)
 }
 
 func panicStack() []byte {
@@ -67,13 +80,22 @@ func Execute(args []string) error {
 
 // ExecuteContext carries caller cancellation to explicit task/session owners,
 // including archive-only tasks that never register a database Runtime.
-func ExecuteContext(ctx context.Context, args []string) error {
+func ExecuteContext(ctx context.Context, args []string) (execErr error) {
 	if ctx == nil {
 		return fmt.Errorf("command context is required")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if badParam, ok := config.AsBadParamError(recovered); ok {
+				execErr = badParam.BanError()
+				return
+			}
+			panic(recovered)
+		}
+	}()
 	command := NewRootCommand()
 	if isImplicitWebInvocation(args) {
 		command = web.NewDevCommandWithFactory(newDevWebServer)

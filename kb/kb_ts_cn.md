@@ -7,7 +7,7 @@ banbot 时序策略（`engine: time_series`，默认）：接口、回调、下�
 ```go
 // 1) 注册：注册名 = 组名:策略名；YAML run_policy[].name 必须完全一致
 func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": MaFn}) } // 或 strat.RegisterStrategy("demo:ma", MaFn)
-// 2) 工厂：每个 run_policy 调用一次，返回 *strat.TradeStrat；超参用 pol.Def/DefInt
+// 2) 工厂：每个 run_policy 调用一次，返回 *strat.TradeStrat；超参用 pol.Def/DefInt，跨参数约束用 pol.Require/Requiref
 // 3) 入口：package main 匿名 import 策略包，然后 entry.RunCmd()
 ```
 
@@ -21,6 +21,14 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 - 时间戳 **毫秒 int64**。`TimeStart` 本根开始；`TimeStop`/`EndMS` 本根结束（=下一根开始）。
 - 周期 `ta.ParseTimeFrame`：`<正整数><单位>`，单位 `s m h d w M(月,大写) q y`，`m`≠`M`。例 `1m 5m 1h 4h 1d 1w 1M`。
 - `BarEnv.TFMSecs` 周期毫秒数；`s.Env.BarCount(ms)`：ms 到当前 bar 结束的 bar 数（float64）。
+- **UTC 虚拟交易时段原语（`github.com/banbox/banbot/btime`）**：
+  - 锚点常量（距 `00:00 UTC` 分钟数）：`UTC0Minutes=0`、`AsiaOpenMinutes=0`、`AsiaCloseMinutes=480`(`08:00`)、`LondonOpenMinutes=420`(`07:00`)、`LondonCashOpenMinutes=480`(`08:00`)、`LondonCloseMinutes=960`(`16:00`)、`NYKillzoneOpenMinutes=720`(`12:00`)、`NewYorkOpenMinutes=810`(`13:30`)、`USCashCloseMinutes=1200`(`20:00`)、`NewYorkCloseMinutes=1260`(`21:00`)、`CMEOpenMinutes=1380`(`23:00`)、`CMECloseMinutes=1320`(`22:00`)。
+  - 预定义窗口（`btime.UTCSessionWindow{Name, StartMin, EndMin}`，方法 `.Contains(ms)`/`.DurationMinutes()`）：`SessionUTC0`、`SessionAsia`(`00:00–08:00`)、`SessionLondon`(`07:00–16:00`)、`SessionNewYork`(`13:30–21:00`)、`SessionUSCash`(`13:30–20:00`)、`SessionCME`(`23:00–22:00` 跨午夜)、`KillzoneAsia`(`00:00–04:00`)、`KillzoneLondon`(`07:00–10:00`)、`KillzoneNewYork`(`12:00–15:00`)、`KillzoneLondonExit`(`15:00–17:00`)。
+  - 函数：`btime.InUTCWindow(ms, startMin, endMin) bool`（半开区间 `[startMin, endMin)`，`startMin > endMin` 自动按跨午夜窗口判定）；`btime.SessionDayIndex(ms, anchorMinutesUTC) int64`（欧几里得向下整除切分任意锚点交易日）；`btime.SessionStartMS(ms, anchorMinutesUTC) int64`；`btime.MinutesIntoSession(ms, anchorMinutesUTC) int`（`[0, 1439]`）；`btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, closeMinutesUTC) bool`（自适应任意 `<1d` 周期判定本根 bar 到达或跨过日终清仓时刻，支持负偏移如 `-15`=`23:45 UTC`；`>=1d` 安全返回 `false`）。
+- **UTC 日历、季节性、月末月初、交割日与跨周期定投原语（`github.com/banbox/banbot/btime`）**：
+  - 日历分解与月末月初（零分配，自动兼容平/闰年与大小月）：`btime.UTCCalendarParts(ms) (year int, month time.Month, day int, weekday time.Weekday, hour, minute int)`、`btime.IsLeapYearUTC(year) bool`、`btime.DaysInMonthUTC(year, month) int`、`btime.DaysFromMonthStartUTC(ms) int`（当月 1 日为 `0`）、`btime.DaysBeforeMonthEndUTC(ms) int`（当月最后一天如 2 月 28/29 日或 3 月 31 日为 `0`）、`btime.IsTurnOfMonthUTC(ms, lastNDays, firstMDays) bool`（判断处于月末最后 `lastNDays` 天或月初前 `firstMDays` 天的 Turn-of-Month 窗口）。
+  - 星期、月内周次与月度交割日：`btime.DayOfWeekUTC(ms) int`（`0=Sunday..6=Saturday`）、`btime.ISODayOfWeekUTC(ms) int`（ISO `1=Monday..7=Sunday`）、`btime.WeekOfMonthUTC(ms) int`（`1..5`，按 `(day-1)/7+1`）、`btime.NthWeekdayOfMonthUTC(year, month, weekday, n) int` 与 `btime.IsNthWeekdayOfMonthUTC(ms, weekday, n) bool`（如 `n=3, time.Friday` 美股/CME 月度期权交割日；不存在返 `0`/`false`）、`btime.LastWeekdayOfMonthUTC(year, month, weekday) int` 与 `btime.IsMonthlyExpiryDayUTC(ms, weekday) bool`（如 `btime.IsMonthlyExpiryDayUTC(ms, time.Friday)` 判定加密市场每月最后一个周五期权/季度交割日）。
+  - 季节性月份窗口与跨周期定投触发：`btime.InMonthRangeUTC(ms, startMonth, endMonth) bool`（`1..12` 闭区间，`startMonth > endMonth` 自动跨年如 `InMonthRangeUTC(ms, 11, 4)` 表示 11 月至次年 4 月 Halloween 效应）；`btime.IsFirstBarOfPeriodUTC(prevBarMS, curBarMS, period) bool`（`period` 支持 `"day"`/`"week"`[UTC 周一]/`"month"`/`"quarter"`/`"year"`；在 `s.More` 中无条件维护上一根 `e.TimeStart` 传入，首根 `prevBarMS <= 0` 或乱序安全返回 `false`，在 `5m/15m/1h/4h/1d/3d` 任意周期上均保证每期精确触发一次，避免写死 `day == 1 && hour == 0` 在粗周期或非零点偏移时漏触发）。
 
 ### 1.2 品种与市场
 - 品种：现货 `BASE/QUOTE`，合约 `BASE/QUOTE:SETTLE`（交割另带标识段）。`core.SplitSymbol(pair) (base, quote, settle, id)`。
@@ -30,7 +38,7 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 
 ### 1.3 数值与单位约定
 - 价格/数量 `float64`；未就绪 `NaN`；
-- 比例类：`TradeStrat.StopLoss`、`EnterReq.StopLossRate/TakeProfitRate`、`ExitRate`、`CallbackPct`（百分数，[0.1,10]）；`0.05`=5%，不带杠杆。
+- 比例类：`TradeStrat.StopLoss`、`EnterReq.RiskRate/StopLossRate/TakeProfitRate`、`TakeProfitTarget.Rate/ExitRate`、`ExitRate`、`CallbackPct`（百分数，[0.05,50]）；`0.05`=5%（`RiskRate: 0.01`=1% 账户权益风险），不带杠杆。
 - 距离类：`StopLossVal`/`TakeProfitVal` 是**价格距离**（绝对值，非倍率），如 `atr*2`；`StopLoss`/`TakeProfit`/`ActivationPrice` 是**价格**。
 - `InOutOrder.ProfitRate` **不含杠杆**（盈亏/入场名义价值）；`Profit` 为扣费后计价货币金额。
 - `core.AmtDust=1e-8`；`core.MinStakeAmount=5.5`（最小开单金额，法币）。`LegalCost` 法币金额，`Amount` 标的数量。
@@ -89,7 +97,7 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 - `strat_perf`：策略-品种绩效自动降权：`enable min_od_num max_od_num min_job_num mid_weight bad_weight`
 - 其它未知键：进入 `Policy.More`，用 `pol.More[...]` 读取
 
-超参：`pol.Def("name", dv, core.PNorm(lo,hi)) float64`、`pol.DefInt(...) int`。名称须为合法标识符；值取自 `params`，未配置取 `dv`。`pol` 只读且被所有 job 共享，**超参勿存进结构体或 `More`**。
+超参：`pol.Def("name", dv, core.PNorm(lo,hi)) float64`、`pol.DefInt(...) int`。名称须为合法标识符；值取自 `params`，未配置取 `dv`。跨参数约束在工厂函数内用 `pol.Require(cond, msg)` 或 `pol.Requiref(cond, format, args...)` 断言（如 `pol.Require(fast < slow, "require fast < slow")`），条件不满足时以 `Error: [BadConfig] <msg>` 拒绝该组参数（参数搜索将其标为无效试验跳过，勿手写普通 `panic`）。`pol` 只读且被所有 job 共享，**超参勿存进结构体或 `More`**。
 
 ### 1.7 运行时隔离（v0.5+）
 - 工厂签名固定 `func(pol *config.RunPolicyConfig) *strat.TradeStrat`。不得在包级变量保存订单、指标、逐品种状态（放 `StratJob.More`），不得自行保存 Runtime/State 对象。
@@ -118,7 +126,7 @@ func MyMax(obj *ta.Series, period int) *ta.Series {
 
 ### 2.2 BarEnv 与 Series
 ```go
-type BarEnv struct { // s.Env 主周期；辅助/自定义用 DataFields.Series()
+type BarEnv struct { // s.Env 主周期；辅助/跨品种K线用 s.RefEnv(symbol, tf) 或 DataFields.BarEnv()
     TimeStart, TimeStop int64; Exchange, MarketType, Symbol, TimeFrame string; TFMSecs int64
     BarNum, MaxCache, VNum int
     Open, High, Low, Close, Volume, Quote, BuyVolume, TradeNum *Series
@@ -301,7 +309,7 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `EachMaxLong`/`EachMaxShort`（int）：单品种同向最大订单数；0 不限，-1 禁止该向
 - `TimeFrames`（string）：旧写法：逗号分隔周期
 - `RunTimeFrames`（[]string）：允许的周期（空则取 `run_policy.run_timeframes`，再 `TimeFrames`，再根配置）
-- `RefineTF`（interface{}）：撮合周期（同 `refine_tf`）
+- `RefineTF`（interface{}）：策略默认子周期撮合粒度（如 `"5m"`、`"1m"`、`12`、`"3-6"`；YAML `run_policy[].refine_tf` 未设置时自动生效，显式配置优先覆盖）
 - `WsSubs`（map[string]string）：实盘 Ws 订阅配置（`OnWs*` 需要）
 - `Outputs`（[]string）：策略输出文本
 - `OnStartUp`（`func(*StratJob)`）：每个 job 创建时调用一次；在此初始化 `s.More`
@@ -312,7 +320,7 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `OnCheckExit`（`func(*StratJob,*ormo.InOutOrder) *ExitReq`）：每根主K线（非预热）对每个已完全入场且 `CanClose()` 的订单调用；返回非 nil 即平仓，框架强制把返回值的 `OrderID`=该订单、`Dirt`=该订单方向
 - `GetDrawDownExitRate`（`func(*StratJob,*ormo.InOutOrder,maxChg float64) float64`）：回撤比例 r；`>0` 采用，`0` 不设置，`<0`/未设回调用默认表
 - `OnOrderChange`（`func(*StratJob,*ormo.InOutOrder,chgType int)`）：§3.7
-- `OnBatchJobs`（`func([]*StratJob)`）：同一时间戳所有主周期 job（需 `BatchInOut`）
+- `OnBatchJobs`（`func([]*StratJob)`）：同一时间戳所有主周期 job（需 `BatchInOut`；确定性回测下按 `strat.BarPriority(barMS, symbol, bt_bar_order_seed)` 中性哈希序排列，不偏向字母靠前品种）
 - `OnBatchInfos`（`func(tf string, jobs map[string]*JobEnv)`）：同一时间戳所有辅助 job（需 `BatchInfo`）
 - `OnWsTrades(s,pair,[]*banexg.Trade)`/`OnWsDepth(s,*banexg.OrderBook)`/`OnWsKline(s,pair,*banexg.Kline)`/`OnWsData(s,*orm.DataSeries)`（实盘）：逐笔、盘口、实时K线（可能未收盘）、通用时序事件
 - `PickTimeFrame`（`func(symbol string, tfScores []*core.TfScore) string`）：为品种选周期（默认取第一个 Score≥MinTfScore 的）
@@ -346,9 +354,9 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `CheckMS`、`LastBarMS int64`：上次处理时间、上一根K线结束时间
 - `MaxOpenLong`、`MaxOpenShort int`：0 不限，-1 禁止，>0 上限（由 EachMaxLong/Short 初始化，回调中可改）
 - `CloseLong`、`CloseShort bool`：是否允许平多/平空（false 时对应方向平仓报错 `close order disabled`）
-- `ExgStopLoss`、`ExgTakeProfit bool`：默认 true。**false 时 `EnterReq` 的止损/止盈（含 LongSLPrice/Strat.StopLoss 默认止损）整个被丢弃，既不挂交易所也不由框架监控**（实盘仅 WARN），并跳过方向校验；不影响 `SetAllStopLoss/od.SetStopLoss` 等运行中设置
+- `ExgStopLoss`、`ExgTakeProfit bool`：默认 true。为 false 时实盘**不在远端交易所订单簿预挂止损/止盈条件单，但回测与实盘均继续在本地价格监控并触发止损/止盈**（`StopLoss==0` 仍表示不设止损）
 - `LongSLPrice`、`ShortSLPrice`：任务级默认止损价（开单时请求未指定则采用）
-- `LongTPPrice`、`ShortTPPrice`：**不生效**，止盈写在 `EnterReq`
+- `LongTPPrice`、`ShortTPPrice`：任务级默认止盈价（开单时请求未指定 `TakeProfit/TakeProfitVal/TakeProfits` 则采用）
 - `More interface{}`：每个 job 独立的可变状态（在 OnStartUp 初始化）
 
 方法：
@@ -361,7 +369,19 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `CanOpen(short bool) bool`：按 MaxOpenLong/Short 与现货限制（现货不能开空）判断
 - `SetAllStopLoss(dirt float64, args *ormo.ExitTrigger) *errs.Error` / `SetAllTakeProfit(...)`：对方向内订单设置止损/止盈触发；`args=nil` 取消；仅作用于状态在部分入场~部分出场间的订单；`args.Rate∈(0,1)` 时按总持仓×Rate 在订单间分配；`dirt=0` 且多空并存时 panic
 - `Data(sub *DataSub) *DataFields`：取订阅视图；`ExSymbol==nil` 为当前品种
+- `RefKlineSub(symbol, timeframe string, warmupNum ...int) *DataSub`（或 `strat.NewRefKlineSub(s, symbol, tf, warmupNum...)`）：构造只读跨周期/跨品种 K 线订阅（用于 `OnDataSubs`）。`symbol==""` 或 `"_cur_"` 表示当前 `s.Symbol` 的辅助周期；非空如 `"BTC"` 或 `"BTC/USDT:USDT"` 自动按当前任务交易所与市场规范化并在 `SymbolState` 解析/登记只读 `*orm.ExSymbol`（即使不在交易 `pairs` 池内也会预热并推送，且**不创建交易任务、不下单**）；省略 `warmupNum` 时默认取 `s.Strat.WarmupNum`
+- `RefEnv(symbol, timeframe string) *ta.BarEnv`：直接从 `s.DataHub` 读取对应辅助周期或参考品种 K 线的完整 `*ta.BarEnv`；尚未收到首根 bar 时返回 `nil`，非 `nil` 时 `Open/High/Low/Close/Volume/Quote/BuyVolume/TradeNum` 均已就绪，可直接传给 `ta.SMA(env.Close, ...)`、`ta.ATR(env.High, env.Low, env.Close, ...)`、`ta.MFI(env, 14)`、`ta.WillR(env, 14)`、`ta.HeikinAshi(env)`
+- `AccountEquity() float64`：当前账户实时总权益（计价法币，现金余额+未实现盈亏）；预热期或尚未初始化钱包时回退初始配置资金或 `GetStakeAmount(s)` 有限正值，不会除零
+- `AvailableBalance() float64`：当前账户可用余额/可用保证金（计价法币）
+- `AccountDrawdown() float64`：当前账户净值相对运行以来峰值净值（High-Water Mark）的回撤比例 `[0, 1]`（无回撤为 0）
 - `GetStakeAmount`：`s.Strat.GetStakeAmount(s)` 单笔基准金额（法币）；`OrderCounts() (orderNum, enteredNum int)` 同 OrderNum/EnteredNum
+- **无前视日内区间与前日极值组件（按 `StratJob` 自动隔离、自动回放预热期历史，多品种零串味）**：
+  - `OpeningRange(anchorMinutesUTC, rangeMinutes int) OpeningRangeSnapshot`（及 `OpeningRangeWithOpts(..., OpeningRangeOptions{AllowSingleBarFallback})`）：跟踪锚点交易日开盘前 `rangeMinutes` 分钟 ORB（`Open/High/Low/Close/Mid/Width/Volume/BarCount`）。形成过程中 `Forming=true, Ready=false`；仅当 `TimeStop >= RangeEndMS` 且至少有 1 根有效 bar 时 `Ready=true`（首次完成当根 `JustCompleted=true`，区间外后续 bar `InPostRange=true`）；`TFMSecs >= 1d`、`TFMSecs > rangeMinutes*60000` 或网格与锚点不对齐时安全返回 `Applicable=false, Ready=false`。
+  - `SessionRange(startMinUTC, endMinUTC int) SessionRangeSnapshot`：统计周期性 UTC 会话窗口（如 `0, 480` 亚盘 `00:00–08:00 UTC`，或跨午夜窗口 `1320, 120`）完整高低点；窗口内 `InSession=true, Completed=false`，窗口收盘后锁定 `High/Low/Open/Close/Mid/Width/Volume` 且 `Completed=true` 直至下一周期窗口开启。
+  - `PrevDayOHLC(anchorMinutesUTC int) (PrevOHLC, bool)`：返回上一**完整结束**锚点交易日的 `Open/High/Low/Close/Pivot/Range/Volume`（PDO/PDH/PDL/PDC 菲阿里四价），当日全程恒定无前视；非零锚点下的首日残缺片段自动丢弃。
+  - `PrevNDaysStats(anchorMinutesUTC, nDays int) (PrevNDaysSummary, bool)`：滚动汇总过去 `nDays` 个完整交易日的 `HH, HC, LC, LL, DualThrustRange, AvgRange(ADR), TotalVolume, AvgVolume, History`。
+  - `DualThrustBands(anchorMinutesUTC, nDays int, k1, k2 float64) (upper, lower, dayOpen float64, ok bool)`：`Range = max(HH-LC, HC-LL)`，输出今日锚点开盘价 `dayOpen` 及 `dayOpen + k1*Range`、`dayOpen - k2*Range`（仅 `<1d` 周期生效）。
+  - `RBreakerLevels(anchorMinutesUTC int) (RBreakerSnap, bool)`（及参数化版 `RBreakerLevelsBy(anchor, f1, f2, f3)`）：基于昨日完整 `(H, L, C)` 输出六档价位 `BBreak > SSetup > SEnter > Pivot > BEnter > BSetup > SBreak` 及今日盘中已走出的 `TodayOpen/TodayHigh/TodayLow`（仅 `<1d` 周期生效）。也可独立实例化 `NewOpeningRangeTracker` / `NewSessionRangeTracker` / `NewPrevPeriodTracker`。
 
 ### 3.4 DataEvent / DataFields / DataHub / DataSub
 ```go
@@ -374,40 +394,44 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 ```
 
 `DataFields`（内嵌于 DataEvent）：
-- 字段：`DoneMS, TimeMS int64`、`Source string`、`Sid int32`、`TimeFrame string`、`Closed, IsWarmUp bool`。
-- 方法：`Series(name) *ta.Series`（数值历史序列，无则 nil）、`Float64(name)`（最新值；缺失/无法转换为 0，要区分缺失用 `RawValue`/`Has`）、`Int64(name)`、`String(name)`、`Raw(name) any`、`RawValue(name) (any, bool)`（区分缺失与显式 nil）、`Has(name) bool`。
-- 浮点字段默认全部成为 Series；`DataSub.SeriesFields` 非空时仅列出的字段成为 Series；原始值始终可读。
+- 字段：`DoneMS, TimeMS int64`、`Source string`、`Sid int32`、`Symbol string`、`TimeFrame string`、`Closed, IsWarmUp bool`。
+- 方法：`BarEnv() *ta.BarEnv`（K线/OHLCV 流完整同步的 `*ta.BarEnv`，未到首根 bar 或非 OHLCV 流返回 `nil`）、`Series(name) *ta.Series`（数值历史序列，K线流 `Series("close")` 与 `BarEnv().Close` 同一指针，`Series("close").Env.High` 始终非 nil；无则 nil）、`SetMaxCache(limit int)`/`MaxCache() int`（默认缓存上限 `max(1500, NumTaCache, WarmupNum+100)`，长周期均线如 `SMA(1000)` 不会因截断返回 NaN）、`Float64(name)`（最新值；缺失/无法转换为 0，要区分缺失用 `RawValue`/`Has`）、`Int64(name)`、`String(name)`、`Raw(name) any`、`RawValue(name) (any, bool)`（区分缺失与显式 nil）、`Has(name) bool`。
+- 浮点字段默认全部成为 Series；`DataSub.SeriesFields` 非空时仅列出的字段（及 K 线标准 OHLCV 字段）成为 Series；自定义扩展列与原始值/NULL 语义始终保留可读。
 
 `DataSub`（即 `orm.Subscription`）：
 - `Source string`：数据源名；K线 `"kline"`（`orm.SeriesSourceKline`）；自定义序列为注册名
-- `ExSymbol *orm.ExSymbol`：nil=当前品种；可指定其他品种（须在品种集合内）
+- `ExSymbol *orm.ExSymbol`：nil=当前品种；跨品种只读参考 K 线推荐用 `s.RefKlineSub("BTC/USDT:USDT", "1d")`（或 `"BTC"`）自动解析，无需手工查 `SymbolState`
 - `TimeFrame string`：周期
 - `WarmupNum int`：该订阅预热数量
 - `Fields []string`：原始字段投影（K线默认 `open high low close volume quote buy_volume trade_num`）
 - `SeriesFields []string`：需要数值历史序列的字段
 - `Frequency`/`Projection`（高级，一般留空）：`bar/event`、`default/all/selected`
 
+- `s.RefKlineSub(symbol, tf, warmupNum...)` + `s.RefEnv(symbol, tf)`：跨品种大盘过滤（如山寨币策略读 `BTC/USDT:USDT` 日线）与多周期共振首选写法。注意 `banta` 增量指标每根参考 bar 推进一次：回测预热按品种串行，若希望参考品种指标在预热结束即就绪，应在 `Info` 处理器（或 `OnData` 入口 `if !d.IsMain()` 之前，满足 `d.Closed` 时）对 `s.RefEnv(...)` 调用相同指标推进缓存，再在 `Main` 中读取 `.Get(0)`。
 - `strat.NewDataSub(info *orm.SeriesInfo) *DataSub`：由自定义序列信息派生订阅（`Source`=序列名）。
-- `s.DataHub.Get(tf, source, sid)` 取视图；`DataHub.AllReady()` 判断所有订阅是否推进到当前时间。
+- `s.DataHub.Get(tf, source, sid)` 取视图；`DataHub.SetMaxCache(limit)` 调整保留上限；`DataHub.AllReady()` 判断所有订阅是否推进到当前时间。
 - 辅助K线信号应基于 `Closed==true`（实盘 WebSocket 数据可能未收盘）。
 
 ### 3.5 EnterReq（开仓请求）
 - `Tag string`：**必填**，入场信号名
 - `Short bool`：true 做空，默认做多
 - `OrderType int`：`core.OrderType*`；`Limit>0` 且未指定时自动为限价
-- `Limit float64`：限价入场价（指定即限价单）；与 `Stop` 互斥
-- `Stop float64`：触发价：做多价格涨到才入场（做空相反）；已越过按限价处理（`Limit=Stop`）；回测 `bt_legacy_intrabar` 下已越过的突破单按当前价入场
+- `Limit float64`：限价入场价（仅设 `Limit>0` 为限价单；与 `Stop>0` 同设为 `Stop-Limit` 触发限价单：价格触及 `Stop` 后以 `Limit` 挂限价单）
+- `Stop float64`：触发价：做多价格涨到才触发（做空相反）；未设 `Limit` 且已越过时按限价处理（`Limit=Stop`）；回测 `bt_legacy_intrabar` 下已越过的纯突破单按当前价入场
+- `OCOGroup string`：OCO（One-Cancels-the-Other）挂单组名；同一 `(Account, Symbol, Strategy, OCOGroup)` 内任一待入场挂单成交后，自动撤销同组其余未成交挂单（同一 bar 内多空双向突破挂单按 OHLC 路径先后触发）
 - `CostRate float64`：开单倍率，默认 1（乘基准金额）
-- `LegalCost float64`：法币金额；指定则忽略 CostRate
+- `RiskRate float64`：单笔账户权益风险比例 `[0, 1]`（如 `0.01` 表示触发止损最多亏损当前 `AccountEquity()` 的 1%）；未指定 `Amount`/`LegalCost` 且解析出有效止损时自动按止损距离计算 `LegalCost`
+- `LegalCost float64`：法币金额；指定则忽略 CostRate/RiskRate
 - `Amount float64`：标的数量；指定则不按金额计算
 - `Leverage float64`：杠杆；非 0 覆盖账户杠杆
 - `StopLossVal float64`：止损距离（价格差），换算为止损价；优先于 StopLoss
-- `StopLoss float64`：止损触发价；>0 时作为交易所侧止损（`ExgStopLoss` 为 true）
+- `StopLoss float64`：止损触发价；>0 时生效（`ExgStopLoss=true` 实盘预挂交易所止损单，`false` 仅本地监控）
 - `StopLossLimit float64`：止损限价；仅设 StopLossLimit 而 StopLoss=0 时，StopLoss 取该值
 - `StopLossRate float64`：止损退出比例 (0,1]，0=全部
 - `StopLossTag string`：止损原因
-- `ActivationPrice`、`CallbackPct float64`：追踪止损：激活价、回撤百分比（[0.1,10]）
+- `ActivationPrice`、`CallbackPct float64`：追踪止损：激活价、回撤百分比（`[0.05, 50]`；实盘超出交易所原生回调率上限时自动降级为本地价格监控追踪止损）
 - `TakeProfitVal/TakeProfit/TakeProfitLimit/TakeProfitRate/TakeProfitTag`：同止损（距离/价格/限价/比例/原因）
+- `TakeProfits []TakeProfitTarget`：多级阶梯止盈（与单级 `TakeProfit*` 互斥）；每项 `TakeProfitTarget{Price, Val, Rate, Limit, ExitRate float64; MoveSLToBreakeven bool; Tag string}` 在入场成交后按实际入场均价解析 `Val`（价差）/`Rate`（比例，如 `0.02`=+2%）并按盈利方向由近及远排序，逐级按初始仓位比例 `ExitRate`（总和 `<=1`）分批止盈；`MoveSLToBreakeven=true` 时将该单剩余仓位止损收紧至不差于入场均价
 - `StopBars int`：限价单超过多少根K线未成交则撤单（0 用 `StopEnterBars`）
 - `ClientID string`：交易所 ClientOrderID 后缀
 - `Infos map[string]string`：附加信息（写入订单 Info）
@@ -415,11 +439,11 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 - `CommandID string`：框架幂等 ID（留空）
 
 `OpenOrder` 校验：
-1. `Tag` 空、`CanOpen` 假、任何数值 NaN、`CallbackPct` 超 [0.1,10]、`Stop` 与 `Limit` 同设→错误。
-2. 入场价：当前价（预热期 `Env.Close`）；限价按方向取更优价。
-3. 金额（未指定 Amount/LegalCost）：`LegalCost=基准金额×StakeRate×CostRate`；数量超近 5 根平均成交量×`open_vol_rate` 则截断；低于 `MinStakeAmount`(5.5)：`ignore` 报错；`keepBig` 仅当成本 >5.5 的 40% 时提升到 5.5×1.1，否则报错；`keepAll` 一律提升到 5.5×1.1。
-4. 止损优先级：`StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss`（入场价×(1∓比例)）；方向不对（做多止损≥入场价等）→错误；受 `ExgStopLoss` 控制。
-5. 止盈：`TakeProfitVal` > `TakeProfit`（`TakeProfitLimit` 同 StopLossLimit 规则）；方向不对→错误；不采用 `LongTPPrice`。
+1. `Tag` 空、`CanOpen` 假、任何数值 NaN、`RiskRate` 超 [0,1]、`CallbackPct` 超 [0.05,50]、显式 `OrderTypeMarket` 时设 `Limit>0`→错误。
+2. 入场价：当前价（预热期 `Env.Close`）；限价按方向取更优价；`Stop>0 && Limit>0` 按 `Stop-Limit` 计算参考入场价。
+3. 金额（未指定 Amount/LegalCost）：若 `RiskRate>0` 且解析出有效止损价（`|enterPrice-slPrice|>0`），`LegalCost=(s.AccountEquity()*RiskRate)/(|enterPrice-slPrice|/enterPrice)`，并受最大杠杆（`AccountEquity()*leverage`）与 `max_stake_amt` 封顶；否则 `LegalCost=基准金额×StakeRate×CostRate`；数量超近 5 根平均成交量×`open_vol_rate` 则截断；低于 `MinStakeAmount`(5.5)：`ignore` 报错；`keepBig` 仅当成本 >5.5 的 40% 时提升到 5.5×1.1，否则报错；`keepAll` 一律提升到 5.5×1.1。
+4. 止损优先级：`StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss`（入场价×(1∓比例)）；方向不对（做多止损≥入场价等）→错误；`ExgStopLoss=false` 时仅禁止远端预挂单，仍保留本地止损监控。
+5. 止盈：设 `TakeProfits` 时校验各级目标与 `ExitRate` 总和 `<=1`；否则按 `TakeProfitVal` > `TakeProfit` > `LongTPPrice/ShortTPPrice` 解析（`TakeProfitLimit` 同 StopLossLimit 规则），方向不对→错误。
 6. 入队返回 nil（`s.Entrys`、`OrderNum++`）；`Log=true` 时错误写日志。
 
 ### 3.6 ExitReq（平仓请求）
@@ -468,24 +492,67 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 - 同 bar 只开一次：`len(s.Entrys)==0 && s.GetOrderNum(0)==0`。
 - 空单移动止损：`s.SetAllStopLoss(core.OdDirtShort, &ormo.ExitTrigger{Price: s.Env.Close.Get(0)+1.5*atr})`。
 
+### 3.9 批量截面目标权重调仓与波动率倒数配权（`OnBatchJobs` 专用）
+适用于多品种趋势风险平价 CTA、横截面强弱选币 + 个币止损混血、龙头（如 BTC）突破带动滞涨高 Beta 山寨币（Lead-Lag）等需在 `TradeStrat{BatchInOut: true, OnBatchJobs: ...}` 中统一分配账户总权益名义权重的策略（注意：若需支持同向分批补仓，请保持 `EachMaxLong: 0, EachMaxShort: 0` 不限同向单数）：
+
+- **`strat.RebalanceBatchWeights(jobs []*strat.StratJob, targetWeights map[string]float64, opts strat.BatchRebalanceOpts) strat.BatchRebalanceResult`**：
+  - `targetWeights`：`symbol -> 目标有符号名义权重`（相对 `AccountEquity()` 的比例，如 `0.4` 做多 40% 名义敞口，`-0.3` 做空 30%，`0` 或未出现表示清仓）。
+  - `BatchRebalanceOpts`：
+    - `Tag string`：入场/平仓信号标签（默认 `"rebalance"`）。
+    - `DriftThreshold float64`：免调仓偏离缓冲带（默认 `0.02` 即 2% 权益；仅当当前持仓与目标权重**同号**且 `|target - cur| < DriftThreshold` 时跳过微调以节省手续费；从空仓新建仓不受缓冲带阻挡；传 `< 0` 禁用缓冲带）。
+    - `MaxGrossExposure float64`：总绝对敞口上限（`> 0` 且 `Σ|w| > MaxGrossExposure` 时自动将所有目标权重等比缩放到上限）。
+    - `StopLossRate` / `TakeProfitRate` / `CallbackPct` / `Leverage float64`：新开仓与同向补仓单自动附带的个币止损比例（`enterPrice * StopLossRate` 换算为 `StopLossVal`）、止盈比例、追踪止损回撤百分比 `[0.1, 10]` 与杠杆倍数，打通“横截面组合配权 + 个币实时保护单”。
+  - **两阶段执行顺序**：
+    1. 第一遍扫描全部 `jobs`：目标为 `0` 的全平；方向相反（多翻空/空翻多）的先 `CloseOrders` 平掉旧向持仓并将全额目标记入待开队列；同向超配（`|target| < |cur| - DriftThreshold`）的按 `ExitRate = (|cur| - |target|) / |cur|` 部分减仓，优先释放保证金。
+    2. 第二遍对待开新仓与同向补仓（`|target| > |cur| + DriftThreshold`）按 `LegalCost = AccountEquity() * deltaWeight` **从大到小**排序（同额按 `strat.BarPriority(barMS, symbol, seed)` 中性哈希与品种名确定性决胜）依次调用 `OpenOrder`，低于 `core.MinStakeAmount`（`5.5`）的碎单自动静默跳过（计入 `SkippedDustCount`）。
+  - 返回 `BatchRebalanceResult`（含 `Equity`、`RawGrossExposure`、`EffectiveGrossExposure`、`ScaleFactor`、`ClosedCount`、`ReducedCount`、`ReversedCount`、`OpenedCount`、`ScaledInCount`、`SkippedDriftCount`、`SkippedDustCount`、`ErrorCount` 及按实际执行序排列的 `Actions []BatchRebalanceAction`）。
+- **`strat.InverseVolWeights(jobs []*strat.StratJob, signals map[string]float64, atrPeriod int, targetGross float64) map[string]float64`**：
+  - 输入各品种方向/强度信号 `signals`（如 `+1`/`-1`/`0` 或连续打分）、`atrPeriod`（`<=0` 默认 `14`）及目标总绝对敞口 `targetGross`（如 `0.8`）。
+  - 内部对每个 `job` **无条件计算** `ta.NATR(e.High, e.Low, e.Close, atrPeriod)`（保证 `signal==0` 时增量 RMA 序列缓存不错位），按 `signal / NATR` 波动率倒数赋予低波动品种更高权重、高波动品种更低权重，并精确归一化使 `Σ|w| == targetGross`。
+- **`strat.BarPriority(barMS int64, symbol string, seed uint64) uint64`**：同 bar 多品种中性可复现 64 位哈希优先级（数值越小越优先）。
+
+### 3.10 粗周期 K 线网格与双边限价做市（`RefineTF` + `OnOrderChange` 因果补单）
+适用于 `1h`/`4h`/`1d` 等中粗周期上同时挂多层买/卖限价单（网格、通道回归、ATR 阶梯挂单）并在某档成交后立刻挂出反向止盈/补单的策略：
+- **声明子周期撮合**：在 `TradeStrat` 设置 `RefineTF: "5m"`（或 `"1m"` / 整数等分倍数如 `12`；YAML `run_policy[].refine_tf` 可覆盖），并保持 `EachMaxLong: 0, EachMaxShort: 0`（或设为网格档位数上限），同时确保全局 `max_open_orders` / `max_simul_open` 足够容纳挂单档位数。
+- **子 K 线时序推进与 `OnOrderChange` 即时补单**：主周期 `OnData(Main)` 挂出的多档 `Limit` / `Stop-Limit` / 止盈止损单在回测中按 `RefineTF` 子 K 线逐根推进，同一子 K 线内触发的多档挂单按模拟成交时间先后顺序依次成交并触发 `OnOrderChange(s, od, strat.OdChgEnterFill)` / `OdChgExitFill`。
+- **快照同步与严格无前视**：进入 `OnOrderChange` 前框架已同步刷新 `s.GetOrders` / `s.GetOrderNum` / `s.Position`；在 `OnOrderChange` 内调用 `s.OpenOrder`（反向对冲限价单或下一档补单）或 `s.CloseOrders`（如指定 `OrderID: od.ID, Limit: tpPrice` 挂限价平仓单）会被立即排空激活，且严格从当前成交时刻 + `bt_net_cost` 之后的剩余子 K 线及后续子 K 线开始匹配（绝不回看成交前的历史极值）。
+- **回测近似资金费对称结算**：线性永续合约在未加载历史 `funding_rate` 序列时，`bt_funding_apr` 双边对称计费（正费率下多头支付 `+cost`、空头获得 `-cost` 补贴，1:1 多空对冲净资金费为 `0`）。
+
+```go
+// TradeStrat 设 RefineTF: "5m", EachMaxLong: 0, EachMaxShort: 0：
+// 1) OnData(Main) 在 1h 收盘按中枢布设上下网格限价单（或直接给每笔买单附带 TakeProfit: buyPx + step）；
+// 2) OnOrderChange 在 5m 子 K 线某档买单成交时立即补挂高一档限价平仓/反向单，同一小时内后续 5m 子 K 线冲高即可成交：
+OnOrderChange: func(s *strat.StratJob, od *ormo.InOutOrder, chgType int) {
+	st := s.More.(*gridState)
+	if chgType == strat.OdChgEnterFill && strings.HasPrefix(od.EnterTag, "grid_buy_") {
+		_ = s.CloseOrders(&strat.ExitReq{
+			Tag:     "grid_tp_" + od.EnterTag,
+			OrderID: od.ID,
+			Dirt:    core.OdDirtLong,
+			Limit:   od.Enter.Average + st.step,
+		})
+	}
+},
+```
+
 ## 4. 下单、止损止盈与仓位细则
 ### 4.1 开仓与平仓
 - 回测成交时间=下单时间+`bt_net_cost` 秒，价格取其后价格路径（§6）。
 - 默认市价（`OrderTypeEmpty` 同）。`Limit` 限价单可配 `StopBars`；`OrderTypeLimitMaker` 要求挂单侧（做多限价≤市价，做空≥市价），否则报错（币安合约无 limit_maker，banexg 转 limit+GTX）。
 - 杠杆：`EnterReq.Leverage` 优先，其次账户 `leverage`。
-- 仓位大小：`stake_amount`/`stake_pct`（账户）× `accounts.<acc>.stake_rate` × `run_policy.stake_rate` × `TradeStrat.StakeRate` × `CostRate`；`max_stake_amt` 封顶；`strat_perf` 降权再乘系数。
+- 仓位大小：固定基准路径为 `stake_amount`/`stake_pct`（账户）× `accounts.<acc>.stake_rate` × `run_policy.stake_rate` × `TradeStrat.StakeRate` × `CostRate`（`max_stake_amt` 封顶，`strat_perf` 降权再乘系数）；也可在 `EnterReq` 设 `RiskRate`（如 `0.01`）配合止损距离按 `AccountEquity()` 风险百分比自动定仓。
 - 平仓：默认全平市价；`ExitRate=0.5` 平一半（每订单按比例）；`EnterTag`/`OrderID` 过滤；`Limit` 限价。部分平仓后剩余订单仍在 `GetOrders`。
 
 ### 4.2 止损与止盈
-- `StopLossVal/TakeProfitVal`（距离）最常用，`StopLoss/TakeProfit` 为绝对价；优先级见 §3.5。`*Rate` 触发后退出比例（0=全部），`*Limit` 触发后挂限价单（否则市价）。
-- 追踪止损：`ActivationPrice`（达到后激活）+ `CallbackPct`（从最高点回撤%，[0.1,10]）。运行中修改：`s.SetAllStopLoss(dirt, &ormo.ExitTrigger{Price: …})` 或 `od.SetStopLoss(...)`。
+- `StopLossVal/TakeProfitVal`（距离）最常用，`StopLoss/TakeProfit` 为绝对价；优先级见 §3.5。`*Rate` 触发后退出比例（0=全部），`*Limit` 触发后挂限价单（否则市价）。多级阶梯止盈用 `TakeProfits []TakeProfitTarget`（可配 `MoveSLToBreakeven: true` 在首级止盈后自动移损保本）。
+- 追踪止损：`ActivationPrice`（达到后激活）+ `CallbackPct`（从最高点回撤%，[0.05,50]）。运行中修改：`s.SetAllStopLoss(dirt, &ormo.ExitTrigger{Price: …})` 或 `od.SetStopLoss(...)`。
 
 **交易所侧挂单**：
 - 回测、`dry_run`：本地模拟触发，不访问交易所。
-- 实盘（`prod`）：订单**完全入场后**（`InOutStatusFullEnter`，部分成交期间不挂）为止损、止盈各单独调用 `CreateOrder` 挂条件单：止损 `stop_loss`（有 Limit 为 `stop_loss_limit`），止盈 `take_profit_market`（有 Limit 为 `take_profit_limit`），数量=当前持仓×Rate（0<Rate<1 时）；不用 ClosePosition（避免多订单互相覆盖），双向持仓靠 positionSide。追踪止损（`CallbackPct`）挂 `trailing_stop_market`（callbackRate、可选 activationPrice）；框架 tag 为 `trailing_stop` 的止损不另挂止损单。
+- 实盘（`prod`）：订单**完全入场后**（`InOutStatusFullEnter`，部分成交期间不挂）为止损、止盈各单独调用 `CreateOrder` 挂条件单：止损 `stop_loss`（有 Limit 为 `stop_loss_limit`），止盈 `take_profit_market`（有 Limit 为 `take_profit_limit`），数量=当前持仓×Rate（0<Rate<1 时）；不用 ClosePosition（避免多订单互相覆盖），双向持仓靠 positionSide。追踪止损（`CallbackPct`）挂 `trailing_stop_market`（callbackRate、可选 activationPrice）；若 `CallbackPct` 超出交易所原生上限或被拒单，自动降级为 `LiveOrderMgr` 本地价格监控追踪止损，不会使订单失败；框架 tag 为 `trailing_stop` 的止损不另挂止损单。
 - banexg 适配：币安（现货/杠杆 STOP_LOSS(_LIMIT)/TAKE_PROFIT(_LIMIT)；合约 STOP_MARKET/STOP/TAKE_PROFIT_MARKET/TAKE_PROFIT/TRAILING_STOP_MARKET）、OKX（algo）、Bybit（conditional）均实现；不支持的品类/类型下单报错。
 - 失败：报"会立即触发"→立即市价平仓；其它失败只记 ERROR，更新失败不撤旧单，**无自动重试**，仅同步/重启时补挂缺失触发单。`SetAll*`/`od.SetStopLoss` 修改后实盘重编辑/重挂条件单。
-- `ExgStopLoss/ExgTakeProfit=false` 见 §3.3（回测同样）；要保留监控而不挂单，需自行在 `OnData`/`OnCheckExit` 检查平仓。
+- `ExgStopLoss/ExgTakeProfit=false` 仅跳过实盘远端交易所条件单预挂，回测与实盘本地价格监控依然生效（见 §3.3）。
 - 回撤平仓（`DrawDownExit=true`）：框架跟踪最大浮盈比例 maxChg；r 取 `GetDrawDownExitRate`（`>0` 采用、`0` 不设置、`<0`/未设用默认表）：maxChg >10%→r=0.15，>4%→0.17，>2.5%→0.25，>1.5%→0.37，>0.7%→0.5，否则不启用。回撤价=入场价×(1+maxChg×(1−r)×方向)，当前收盘越过则 tag `draw_down` 市价平仓，否则**用该价覆盖订单的止损触发器**（会替换你设置的止损，实盘同步到交易所）。仅在 `OnCheckExit` 返回 nil 时检查。
 
 ### 4.3 多空限制
@@ -551,7 +618,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 3. **派生序列用 `Series.To`**，别在回调反复 `NewSeries`，否则序列数增长触发致命错误 `series too many … try replace NewSeries with Series.To` 并停机。
 4. 浮点常量缓存冲突、`Cross` 用 `== 1`（§2.2）。
 6. **比较 Close 与 Highest/Lowest 前先 `Back(1)`**，否则当前收盘永远无法突破含自身的最高价：`e.Close.Get(0) > ta.Highest(e.High, n).Back(1).Get(0)`。
-7. `s.Env` 是主周期，读辅助/自定义数据用 `data.Series(...)`。
+7. `s.Env` 是主周期；读辅助周期或跨品种参考 K 线优先用 `s.RefKlineSub(symbol, tf)` + `s.RefEnv(symbol, tf)`（或 `data.BarEnv()`/`data.Series(...)`），读自定义序列用 `data.Series(...)`/`data.Float64(...)`。
 9. `OpenOrder` 的 `Tag` 必填；`CloseOrders` 有订单时 `Tag` 必填。`ExitReq{}` 的 `Dirt` 零值是 Both，只平多/空须显式设 `core.OdDirtLong/OdDirtShort`。
 10. 超参只读共享：不要写入 `More`；按品种不同用 `pair_params`。`More` 只存每品种会变化的数据。
 11. `GetOrders/GetOrderNum` 基于快照：同回调内刚 `OpenOrder` 不会出现；切片不要跨事件复用。
@@ -559,12 +626,12 @@ OnData: strat.RouteData(strat.DataHandlers{
 14. 多输入指标缓存只挂一个输入，组合须固定；标 (全) 指标勿在循环里多次调用（§2.3）。
 16. 对 `Series.Get` 的 NaN 做判断（`math.IsNaN(atr)`），尤其 `WarmupNum` 不够大时。
 17. 同品种不同周期的 job 是独立 Env；跨周期数据用 `DataSub`。
-18. `DrawDownExit` 覆盖订单止损触发器（§4.2）；`ExgStopLoss=false` 丢弃入场止损（§3.3）；`MAMA/VPCI/DX/Fisher` 与标准定义不同；旧 API 新代码不用。
+18. `DrawDownExit` 覆盖订单止损触发器（§4.2）；`ExgStopLoss=false` 仅隐藏远端挂单仍保留本地止损监控（§3.3）；`MAMA/VPCI/DX/Fisher` 与标准定义不同；旧 API 新代码不用。
 19. **`TradeStrat` 被该策略的所有品种共用**（工厂每个 policy 只调用一次，除非配置了 `pair_params`）：工厂函数体内的闭包变量和包级变量对所有品种共享。逐品种变化的状态（上一根信号、峰值、追踪止损位、计数器）定义成结构体，在 `OnStartUp` 赋给 `s.More`，回调里 `s.More.(*T)` 读取；不要用闭包变量或按品种做键的 map。
-20. 常见编译错误：品种名字符串是 `s.Symbol.Symbol`（`s.Symbol` 是 `*orm.ExSymbol`，不能当字符串或 map 键）；`pol.Params` 是 `map[string]float64`，超参只有数值（开关用 0/1），用 `pol.Def/DefInt` 读取，没有 `DefBool/DefStr/core.PInt`；方向参数 `dirt` 是 `float64`；K线时间用 `e.TimeStart/TimeStop`、周期用 `e.TFMSecs`（没有 `e.Time/TFSecs`）；订单类型在 `github.com/banbox/banbot/orm/ormo`（`*ormo.InOutOrder`、`*ormo.ExitTrigger`）；`EnterReq` 没有 `Qty/Dirt` 字段（数量 `Amount`、金额 `LegalCost`/`CostRate`、做空 `Short: true`）；策略里取不到账户权益（无 `GetEquity`），单笔基准金额用 `s.Strat.GetStakeAmount(s)`。
+20. 常见编译错误：品种名字符串是 `s.Symbol.Symbol`（`s.Symbol` 是 `*orm.ExSymbol`，不能当字符串或 map 键）；`pol.Params` 是 `map[string]float64`，超参只有数值（开关用 0/1），用 `pol.Def/DefInt` 读取，没有 `DefBool/DefStr/core.PInt`；方向参数 `dirt` 是 `float64`；K线时间用 `e.TimeStart/TimeStop`、周期用 `e.TFMSecs`（没有 `e.Time/TFSecs`）；订单类型在 `github.com/banbox/banbot/orm/ormo`（`*ormo.InOutOrder`、`*ormo.ExitTrigger`）；`EnterReq` 没有 `Qty/Dirt` 字段（数量 `Amount`、金额 `LegalCost`/`CostRate`、按风险比例定仓 `RiskRate`、做空 `Short: true`）；查询账户权益/可用余额/峰值回撤用 `s.AccountEquity()` / `s.AvailableBalance()` / `s.AccountDrawdown()`（无 `GetEquity`），单笔基准金额用 `s.Strat.GetStakeAmount(s)`。
 
 ## 8. 超参与优化
-超参用 `pol.Def/DefInt` 声明（分布见 §1.5；`DefInt` 自动取整）。`banbot optimize --config x.yml`（另有 `bt-opt` 滚动回测）；`--sampler tpe|bayes|random|cmaes|ipop-cmaes|bipop-cmaes`（默认 bayes），`--opt-rounds`（默认 30）。
+超参用 `pol.Def/DefInt` 声明（分布见 §1.5；`DefInt` 自动取整）；存在跨参数合法性关系（如 `fast < slow`、`maFast < maMid && maMid < maSlow`、`callbackMin <= callbackMax`）时，必须在工厂函数内调用 `pol.Require(cond, "require ...")` / `pol.Requiref(...)` 显式校验，使非法参数组合以 `[BadConfig]` 快速返回而非触发崩溃重试。`banbot optimize --config x.yml`（另有 `bt-opt` 滚动回测）；`--sampler tpe|bayes|random|cmaes|ipop-cmaes|bipop-cmaes`（默认 bayes），`--opt-rounds`（默认 30）。
 
 ## 9. 完整示例
 ### 示例 A：单周期 EMA 交叉 + ATR 止损止盈
@@ -587,6 +654,7 @@ func init() {
 func MaAtr(pol *config.RunPolicyConfig) *strat.TradeStrat {
 	fast := pol.DefInt("fast", 10, core.PNorm(5, 30))
 	slow := pol.DefInt("slow", 30, core.PNorm(20, 100))
+	pol.Require(fast < slow, "require fast < slow")
 	atrLen := pol.DefInt("atrLen", 14, core.PNorm(7, 30))
 	slMul := pol.Def("slMul", 2, core.PNorm(1, 4))
 	tpMul := pol.Def("tpMul", 4, core.PNorm(2, 8))
@@ -624,6 +692,91 @@ run_policy:
 ```
 
 示例 A、§2.1 `MyMax`、§5 代码已通过 `go vet`；其余为接口片段。辅助周期：Info 处理器 `!data.Closed||data.IsWarmUp` 则 return，用 `data.Series("close")`（§3.4/§5.3/§10）。超时平仓：`OnCheckExit` 判断 `s.Env.BarCount(od.EnterAt)>=N` 返回 `&strat.ExitReq{Tag:"timeout"}`。
+
+### 示例 B：日内会话突破片段（ORB / Asian Range 伦敦突破 / Dual Thrust / R-Breaker）
+
+```go
+// 1) ORB 美股开盘区间突破（13:30 UTC 前 30m 锁定区间，20:00 UTC 日终平仓）
+orb := s.OpeningRange(btime.NewYorkOpenMinutes, 30)
+if btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, btime.USCashCloseMinutes) {
+	s.CloseOrders(&strat.ExitReq{Tag: "ny_eod"})
+	return
+}
+if orb.Ready && orb.InPostRange && btime.SessionUSCash.Contains(e.TimeStart) && len(s.Entrys) == 0 && s.GetOrderNum(0) == 0 {
+	if c := e.Close.Get(0); c > orb.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_long", StopLoss: orb.Mid, RiskRate: 0.01})
+	} else if c < orb.Low {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_short", Short: true, StopLoss: orb.Mid, RiskRate: 0.01})
+	}
+}
+
+// 2) Asian Range（00:00–08:00 UTC）伦敦 Killzone（08:00–10:00 UTC）突破
+asia := s.SessionRange(btime.AsiaOpenMinutes, btime.AsiaCloseMinutes)
+if asia.Completed && btime.InUTCWindow(e.TimeStart, btime.LondonCashOpenMinutes, 10*60) && s.GetOrderNum(0) == 0 {
+	if e.Close.Get(0) > asia.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "ldn_brk_long", StopLoss: asia.Low})
+	}
+}
+
+// 3) Dual Thrust（00:00 UTC 日切，过去 4 个完整日计算 Range）
+if upper, lower, _, ok := s.DualThrustBands(btime.UTC0Minutes, 4, 0.5, 0.5); ok {
+	if c := e.Close.Get(0); c > upper && s.GetOrderNum(1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_short", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_long", StopLoss: lower})
+	} else if c < lower && s.GetOrderNum(-1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_long", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_short", Short: true, StopLoss: upper})
+	}
+}
+
+// 4) R-Breaker 六档趋势突破 + 日内观察位反转
+if rb, ok := s.RBreakerLevels(btime.UTC0Minutes); ok {
+	c := e.Close.Get(0)
+	if s.GetOrderNum(0) == 0 {
+		if c > rb.BBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_long", StopLoss: rb.Pivot})
+		} else if c < rb.SBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_short", Short: true, StopLoss: rb.Pivot})
+		}
+	} else if s.GetOrderNum(1) > 0 && rb.TodayHigh >= rb.SSetup && c < rb.SEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_short", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_short", Short: true, StopLoss: rb.BBreak})
+	} else if s.GetOrderNum(-1) > 0 && rb.TodayLow <= rb.BSetup && c > rb.BEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_long", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_long", StopLoss: rb.SBreak})
+	}
+}
+
+// 5) 跨周期安全每月定投 + 月末月初(TOM) + 季节性窗口（st := s.More.(*jobState) 无条件维护 prevMS）
+prevMS := st.prevMS
+st.prevMS = e.TimeStart
+if !s.IsWarmUp && btime.IsFirstBarOfPeriodUTC(prevMS, e.TimeStart, "month") && btime.InMonthRangeUTC(e.TimeStart, 11, 4) {
+	s.OpenOrder(&strat.EnterReq{Tag: "monthly_dca_halloween"})
+}
+```
+
+### 示例 C：多品种风险平价 CTA / Lead-Lag 批量目标权重调仓（`BatchInOut` + `OnBatchJobs`）
+
+```go
+// TradeStrat 设 BatchInOut: true，保持 EachMaxLong: 0, EachMaxShort: 0 以允许同向动态补仓；
+// OnData(Main) 每根 bar 无条件更新各品种指标并存入 s.More.(*symState)，随后在 OnBatchJobs 统一截面配权与调仓：
+OnBatchJobs: func(jobs []*strat.StratJob) {
+	signals := make(map[string]float64, len(jobs))
+	for _, j := range jobs {
+		st := j.More.(*symState)
+		if st.ready {
+			signals[j.Symbol.Symbol] = st.signal // 如趋势突破 +1/-1/0，或 BTC 突破时给滞涨高 Beta 币赋 +1
+		}
+	}
+	weights := strat.InverseVolWeights(jobs, signals, 14, 1.0) // 按 1/NATR(14) 归一化至总敞口 1.0x
+	strat.RebalanceBatchWeights(jobs, weights, strat.BatchRebalanceOpts{
+		Tag:              "rp_cta",
+		DriftThreshold:   0.03,
+		MaxGrossExposure: 1.2,
+		StopLossRate:     0.06, // 每笔附带 6% 个币保护止损
+	})
+},
+```
 
 ## 10. 旧接口迁移（OnBar → OnData）
 - 旧 `OnBar(s)`：改为 `OnData: strat.RouteData(strat.DataHandlers{Main: func(s, _ strat.DataEvent){…}})`。

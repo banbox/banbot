@@ -15,3 +15,45 @@ type TriggerState struct {
 	ClientId string       `json:"client_id,omitempty"`
 	Old      *ExitTrigger `json:"old,omitempty"`
 }
+
+type TPLadderRung struct {
+	Price             float64 `json:"price,omitempty"`
+	Val               float64 `json:"val,omitempty"`
+	Rate              float64 `json:"rate,omitempty"`
+	Limit             float64 `json:"limit,omitempty"`
+	ExitRate          float64 `json:"exit_rate,omitempty"`
+	MoveSLToBreakeven bool    `json:"move_sl_to_breakeven,omitempty"`
+	Tag               string  `json:"tag,omitempty"`
+	Done              bool    `json:"done,omitempty"`
+}
+
+func (r *TPLadderRung) Clone() *TPLadderRung {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	return &cp
+}
+
+type TPLadderState struct {
+	Rungs          []*TPLadderRung `json:"rungs,omitempty"`
+	RemainingShare float64         `json:"remaining_share,omitempty"`
+	Resolved       bool            `json:"resolved,omitempty"`
+}
+
+func (s *TPLadderState) Clone() *TPLadderState {
+	if s == nil {
+		return nil
+	}
+	res := &TPLadderState{
+		RemainingShare: s.RemainingShare,
+		Resolved:       s.Resolved,
+	}
+	if s.Rungs != nil {
+		res.Rungs = make([]*TPLadderRung, len(s.Rungs))
+		for i, r := range s.Rungs {
+			res.Rungs[i] = r.Clone()
+		}
+	}
+	return res
+}
