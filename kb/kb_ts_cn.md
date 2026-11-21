@@ -21,6 +21,14 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 - 时间戳 **毫秒 int64**。`TimeStart` 本根开始；`TimeStop`/`EndMS` 本根结束（=下一根开始）。
 - 周期 `ta.ParseTimeFrame`：`<正整数><单位>`，单位 `s m h d w M(月,大写) q y`，`m`≠`M`。例 `1m 5m 1h 4h 1d 1w 1M`。
 - `BarEnv.TFMSecs` 周期毫秒数；`s.Env.BarCount(ms)`：ms 到当前 bar 结束的 bar 数（float64）。
+- **UTC 虚拟交易时段原语（`github.com/banbox/banbot/btime`）**：
+  - 锚点常量（距 `00:00 UTC` 分钟数）：`UTC0Minutes=0`、`AsiaOpenMinutes=0`、`AsiaCloseMinutes=480`(`08:00`)、`LondonOpenMinutes=420`(`07:00`)、`LondonCashOpenMinutes=480`(`08:00`)、`LondonCloseMinutes=960`(`16:00`)、`NYKillzoneOpenMinutes=720`(`12:00`)、`NewYorkOpenMinutes=810`(`13:30`)、`USCashCloseMinutes=1200`(`20:00`)、`NewYorkCloseMinutes=1260`(`21:00`)、`CMEOpenMinutes=1380`(`23:00`)、`CMECloseMinutes=1320`(`22:00`)。
+  - 预定义窗口（`btime.UTCSessionWindow{Name, StartMin, EndMin}`，方法 `.Contains(ms)`/`.DurationMinutes()`）：`SessionUTC0`、`SessionAsia`(`00:00–08:00`)、`SessionLondon`(`07:00–16:00`)、`SessionNewYork`(`13:30–21:00`)、`SessionUSCash`(`13:30–20:00`)、`SessionCME`(`23:00–22:00` 跨午夜)、`KillzoneAsia`(`00:00–04:00`)、`KillzoneLondon`(`07:00–10:00`)、`KillzoneNewYork`(`12:00–15:00`)、`KillzoneLondonExit`(`15:00–17:00`)。
+  - 函数：`btime.InUTCWindow(ms, startMin, endMin) bool`（半开区间 `[startMin, endMin)`，`startMin > endMin` 自动按跨午夜窗口判定）；`btime.SessionDayIndex(ms, anchorMinutesUTC) int64`（欧几里得向下整除切分任意锚点交易日）；`btime.SessionStartMS(ms, anchorMinutesUTC) int64`；`btime.MinutesIntoSession(ms, anchorMinutesUTC) int`（`[0, 1439]`）；`btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, closeMinutesUTC) bool`（自适应任意 `<1d` 周期判定本根 bar 到达或跨过日终清仓时刻，支持负偏移如 `-15`=`23:45 UTC`；`>=1d` 安全返回 `false`）。
+- **UTC 日历、季节性、月末月初、交割日与跨周期定投原语（`github.com/banbox/banbot/btime`）**：
+  - 日历分解与月末月初（零分配，自动兼容平/闰年与大小月）：`btime.UTCCalendarParts(ms) (year int, month time.Month, day int, weekday time.Weekday, hour, minute int)`、`btime.IsLeapYearUTC(year) bool`、`btime.DaysInMonthUTC(year, month) int`、`btime.DaysFromMonthStartUTC(ms) int`（当月 1 日为 `0`）、`btime.DaysBeforeMonthEndUTC(ms) int`（当月最后一天如 2 月 28/29 日或 3 月 31 日为 `0`）、`btime.IsTurnOfMonthUTC(ms, lastNDays, firstMDays) bool`（判断处于月末最后 `lastNDays` 天或月初前 `firstMDays` 天的 Turn-of-Month 窗口）。
+  - 星期、月内周次与月度交割日：`btime.DayOfWeekUTC(ms) int`（`0=Sunday..6=Saturday`）、`btime.ISODayOfWeekUTC(ms) int`（ISO `1=Monday..7=Sunday`）、`btime.WeekOfMonthUTC(ms) int`（`1..5`，按 `(day-1)/7+1`）、`btime.NthWeekdayOfMonthUTC(year, month, weekday, n) int` 与 `btime.IsNthWeekdayOfMonthUTC(ms, weekday, n) bool`（如 `n=3, time.Friday` 美股/CME 月度期权交割日；不存在返 `0`/`false`）、`btime.LastWeekdayOfMonthUTC(year, month, weekday) int` 与 `btime.IsMonthlyExpiryDayUTC(ms, weekday) bool`（如 `btime.IsMonthlyExpiryDayUTC(ms, time.Friday)` 判定加密市场每月最后一个周五期权/季度交割日）。
+  - 季节性月份窗口与跨周期定投触发：`btime.InMonthRangeUTC(ms, startMonth, endMonth) bool`（`1..12` 闭区间，`startMonth > endMonth` 自动跨年如 `InMonthRangeUTC(ms, 11, 4)` 表示 11 月至次年 4 月 Halloween 效应）；`btime.IsFirstBarOfPeriodUTC(prevBarMS, curBarMS, period) bool`（`period` 支持 `"day"`/`"week"`[UTC 周一]/`"month"`/`"quarter"`/`"year"`；在 `s.More` 中无条件维护上一根 `e.TimeStart` 传入，首根 `prevBarMS <= 0` 或乱序安全返回 `false`，在 `5m/15m/1h/4h/1d/3d` 任意周期上均保证每期精确触发一次，避免写死 `day == 1 && hour == 0` 在粗周期或非零点偏移时漏触发）。
 
 ### 1.2 品种与市场
 - 品种：现货 `BASE/QUOTE`，合约 `BASE/QUOTE:SETTLE`（交割另带标识段）。`core.SplitSymbol(pair) (base, quote, settle, id)`。
@@ -312,7 +320,7 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `OnCheckExit`（`func(*StratJob,*ormo.InOutOrder) *ExitReq`）：每根主K线（非预热）对每个已完全入场且 `CanClose()` 的订单调用；返回非 nil 即平仓，框架强制把返回值的 `OrderID`=该订单、`Dirt`=该订单方向
 - `GetDrawDownExitRate`（`func(*StratJob,*ormo.InOutOrder,maxChg float64) float64`）：回撤比例 r；`>0` 采用，`0` 不设置，`<0`/未设回调用默认表
 - `OnOrderChange`（`func(*StratJob,*ormo.InOutOrder,chgType int)`）：§3.7
-- `OnBatchJobs`（`func([]*StratJob)`）：同一时间戳所有主周期 job（需 `BatchInOut`）
+- `OnBatchJobs`（`func([]*StratJob)`）：同一时间戳所有主周期 job（需 `BatchInOut`；确定性回测下按 `strat.BarPriority(barMS, symbol, bt_bar_order_seed)` 中性哈希序排列，不偏向字母靠前品种）
 - `OnBatchInfos`（`func(tf string, jobs map[string]*JobEnv)`）：同一时间戳所有辅助 job（需 `BatchInfo`）
 - `OnWsTrades(s,pair,[]*banexg.Trade)`/`OnWsDepth(s,*banexg.OrderBook)`/`OnWsKline(s,pair,*banexg.Kline)`/`OnWsData(s,*orm.DataSeries)`（实盘）：逐笔、盘口、实时K线（可能未收盘）、通用时序事件
 - `PickTimeFrame`（`func(symbol string, tfScores []*core.TfScore) string`）：为品种选周期（默认取第一个 Score≥MinTfScore 的）
@@ -367,6 +375,13 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `AvailableBalance() float64`：当前账户可用余额/可用保证金（计价法币）
 - `AccountDrawdown() float64`：当前账户净值相对运行以来峰值净值（High-Water Mark）的回撤比例 `[0, 1]`（无回撤为 0）
 - `GetStakeAmount`：`s.Strat.GetStakeAmount(s)` 单笔基准金额（法币）；`OrderCounts() (orderNum, enteredNum int)` 同 OrderNum/EnteredNum
+- **无前视日内区间与前日极值组件（按 `StratJob` 自动隔离、自动回放预热期历史，多品种零串味）**：
+  - `OpeningRange(anchorMinutesUTC, rangeMinutes int) OpeningRangeSnapshot`（及 `OpeningRangeWithOpts(..., OpeningRangeOptions{AllowSingleBarFallback})`）：跟踪锚点交易日开盘前 `rangeMinutes` 分钟 ORB（`Open/High/Low/Close/Mid/Width/Volume/BarCount`）。形成过程中 `Forming=true, Ready=false`；仅当 `TimeStop >= RangeEndMS` 且至少有 1 根有效 bar 时 `Ready=true`（首次完成当根 `JustCompleted=true`，区间外后续 bar `InPostRange=true`）；`TFMSecs >= 1d`、`TFMSecs > rangeMinutes*60000` 或网格与锚点不对齐时安全返回 `Applicable=false, Ready=false`。
+  - `SessionRange(startMinUTC, endMinUTC int) SessionRangeSnapshot`：统计周期性 UTC 会话窗口（如 `0, 480` 亚盘 `00:00–08:00 UTC`，或跨午夜窗口 `1320, 120`）完整高低点；窗口内 `InSession=true, Completed=false`，窗口收盘后锁定 `High/Low/Open/Close/Mid/Width/Volume` 且 `Completed=true` 直至下一周期窗口开启。
+  - `PrevDayOHLC(anchorMinutesUTC int) (PrevOHLC, bool)`：返回上一**完整结束**锚点交易日的 `Open/High/Low/Close/Pivot/Range/Volume`（PDO/PDH/PDL/PDC 菲阿里四价），当日全程恒定无前视；非零锚点下的首日残缺片段自动丢弃。
+  - `PrevNDaysStats(anchorMinutesUTC, nDays int) (PrevNDaysSummary, bool)`：滚动汇总过去 `nDays` 个完整交易日的 `HH, HC, LC, LL, DualThrustRange, AvgRange(ADR), TotalVolume, AvgVolume, History`。
+  - `DualThrustBands(anchorMinutesUTC, nDays int, k1, k2 float64) (upper, lower, dayOpen float64, ok bool)`：`Range = max(HH-LC, HC-LL)`，输出今日锚点开盘价 `dayOpen` 及 `dayOpen + k1*Range`、`dayOpen - k2*Range`（仅 `<1d` 周期生效）。
+  - `RBreakerLevels(anchorMinutesUTC int) (RBreakerSnap, bool)`（及参数化版 `RBreakerLevelsBy(anchor, f1, f2, f3)`）：基于昨日完整 `(H, L, C)` 输出六档价位 `BBreak > SSetup > SEnter > Pivot > BEnter > BSetup > SBreak` 及今日盘中已走出的 `TodayOpen/TodayHigh/TodayLow`（仅 `<1d` 周期生效）。也可独立实例化 `NewOpeningRangeTracker` / `NewSessionRangeTracker` / `NewPrevPeriodTracker`。
 
 ### 3.4 DataEvent / DataFields / DataHub / DataSub
 ```go
@@ -476,6 +491,25 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 ### 3.8 常用模式
 - 同 bar 只开一次：`len(s.Entrys)==0 && s.GetOrderNum(0)==0`。
 - 空单移动止损：`s.SetAllStopLoss(core.OdDirtShort, &ormo.ExitTrigger{Price: s.Env.Close.Get(0)+1.5*atr})`。
+
+### 3.9 批量截面目标权重调仓与波动率倒数配权（`OnBatchJobs` 专用）
+适用于多品种趋势风险平价 CTA、横截面强弱选币 + 个币止损混血、龙头（如 BTC）突破带动滞涨高 Beta 山寨币（Lead-Lag）等需在 `TradeStrat{BatchInOut: true, OnBatchJobs: ...}` 中统一分配账户总权益名义权重的策略（注意：若需支持同向分批补仓，请保持 `EachMaxLong: 0, EachMaxShort: 0` 不限同向单数）：
+
+- **`strat.RebalanceBatchWeights(jobs []*strat.StratJob, targetWeights map[string]float64, opts strat.BatchRebalanceOpts) strat.BatchRebalanceResult`**：
+  - `targetWeights`：`symbol -> 目标有符号名义权重`（相对 `AccountEquity()` 的比例，如 `0.4` 做多 40% 名义敞口，`-0.3` 做空 30%，`0` 或未出现表示清仓）。
+  - `BatchRebalanceOpts`：
+    - `Tag string`：入场/平仓信号标签（默认 `"rebalance"`）。
+    - `DriftThreshold float64`：免调仓偏离缓冲带（默认 `0.02` 即 2% 权益；仅当当前持仓与目标权重**同号**且 `|target - cur| < DriftThreshold` 时跳过微调以节省手续费；从空仓新建仓不受缓冲带阻挡；传 `< 0` 禁用缓冲带）。
+    - `MaxGrossExposure float64`：总绝对敞口上限（`> 0` 且 `Σ|w| > MaxGrossExposure` 时自动将所有目标权重等比缩放到上限）。
+    - `StopLossRate` / `TakeProfitRate` / `CallbackPct` / `Leverage float64`：新开仓与同向补仓单自动附带的个币止损比例（`enterPrice * StopLossRate` 换算为 `StopLossVal`）、止盈比例、追踪止损回撤百分比 `[0.1, 10]` 与杠杆倍数，打通“横截面组合配权 + 个币实时保护单”。
+  - **两阶段执行顺序**：
+    1. 第一遍扫描全部 `jobs`：目标为 `0` 的全平；方向相反（多翻空/空翻多）的先 `CloseOrders` 平掉旧向持仓并将全额目标记入待开队列；同向超配（`|target| < |cur| - DriftThreshold`）的按 `ExitRate = (|cur| - |target|) / |cur|` 部分减仓，优先释放保证金。
+    2. 第二遍对待开新仓与同向补仓（`|target| > |cur| + DriftThreshold`）按 `LegalCost = AccountEquity() * deltaWeight` **从大到小**排序（同额按 `strat.BarPriority(barMS, symbol, seed)` 中性哈希与品种名确定性决胜）依次调用 `OpenOrder`，低于 `core.MinStakeAmount`（`5.5`）的碎单自动静默跳过（计入 `SkippedDustCount`）。
+  - 返回 `BatchRebalanceResult`（含 `Equity`、`RawGrossExposure`、`EffectiveGrossExposure`、`ScaleFactor`、`ClosedCount`、`ReducedCount`、`ReversedCount`、`OpenedCount`、`ScaledInCount`、`SkippedDriftCount`、`SkippedDustCount`、`ErrorCount` 及按实际执行序排列的 `Actions []BatchRebalanceAction`）。
+- **`strat.InverseVolWeights(jobs []*strat.StratJob, signals map[string]float64, atrPeriod int, targetGross float64) map[string]float64`**：
+  - 输入各品种方向/强度信号 `signals`（如 `+1`/`-1`/`0` 或连续打分）、`atrPeriod`（`<=0` 默认 `14`）及目标总绝对敞口 `targetGross`（如 `0.8`）。
+  - 内部对每个 `job` **无条件计算** `ta.NATR(e.High, e.Low, e.Close, atrPeriod)`（保证 `signal==0` 时增量 RMA 序列缓存不错位），按 `signal / NATR` 波动率倒数赋予低波动品种更高权重、高波动品种更低权重，并精确归一化使 `Σ|w| == targetGross`。
+- **`strat.BarPriority(barMS int64, symbol string, seed uint64) uint64`**：同 bar 多品种中性可复现 64 位哈希优先级（数值越小越优先）。
 
 ## 4. 下单、止损止盈与仓位细则
 ### 4.1 开仓与平仓
@@ -630,6 +664,91 @@ run_policy:
 ```
 
 示例 A、§2.1 `MyMax`、§5 代码已通过 `go vet`；其余为接口片段。辅助周期：Info 处理器 `!data.Closed||data.IsWarmUp` 则 return，用 `data.Series("close")`（§3.4/§5.3/§10）。超时平仓：`OnCheckExit` 判断 `s.Env.BarCount(od.EnterAt)>=N` 返回 `&strat.ExitReq{Tag:"timeout"}`。
+
+### 示例 B：日内会话突破片段（ORB / Asian Range 伦敦突破 / Dual Thrust / R-Breaker）
+
+```go
+// 1) ORB 美股开盘区间突破（13:30 UTC 前 30m 锁定区间，20:00 UTC 日终平仓）
+orb := s.OpeningRange(btime.NewYorkOpenMinutes, 30)
+if btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, btime.USCashCloseMinutes) {
+	s.CloseOrders(&strat.ExitReq{Tag: "ny_eod"})
+	return
+}
+if orb.Ready && orb.InPostRange && btime.SessionUSCash.Contains(e.TimeStart) && len(s.Entrys) == 0 && s.GetOrderNum(0) == 0 {
+	if c := e.Close.Get(0); c > orb.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_long", StopLoss: orb.Mid, RiskRate: 0.01})
+	} else if c < orb.Low {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_short", Short: true, StopLoss: orb.Mid, RiskRate: 0.01})
+	}
+}
+
+// 2) Asian Range（00:00–08:00 UTC）伦敦 Killzone（08:00–10:00 UTC）突破
+asia := s.SessionRange(btime.AsiaOpenMinutes, btime.AsiaCloseMinutes)
+if asia.Completed && btime.InUTCWindow(e.TimeStart, btime.LondonCashOpenMinutes, 10*60) && s.GetOrderNum(0) == 0 {
+	if e.Close.Get(0) > asia.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "ldn_brk_long", StopLoss: asia.Low})
+	}
+}
+
+// 3) Dual Thrust（00:00 UTC 日切，过去 4 个完整日计算 Range）
+if upper, lower, _, ok := s.DualThrustBands(btime.UTC0Minutes, 4, 0.5, 0.5); ok {
+	if c := e.Close.Get(0); c > upper && s.GetOrderNum(1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_short", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_long", StopLoss: lower})
+	} else if c < lower && s.GetOrderNum(-1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_long", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_short", Short: true, StopLoss: upper})
+	}
+}
+
+// 4) R-Breaker 六档趋势突破 + 日内观察位反转
+if rb, ok := s.RBreakerLevels(btime.UTC0Minutes); ok {
+	c := e.Close.Get(0)
+	if s.GetOrderNum(0) == 0 {
+		if c > rb.BBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_long", StopLoss: rb.Pivot})
+		} else if c < rb.SBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_short", Short: true, StopLoss: rb.Pivot})
+		}
+	} else if s.GetOrderNum(1) > 0 && rb.TodayHigh >= rb.SSetup && c < rb.SEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_short", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_short", Short: true, StopLoss: rb.BBreak})
+	} else if s.GetOrderNum(-1) > 0 && rb.TodayLow <= rb.BSetup && c > rb.BEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_long", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_long", StopLoss: rb.SBreak})
+	}
+}
+
+// 5) 跨周期安全每月定投 + 月末月初(TOM) + 季节性窗口（st := s.More.(*jobState) 无条件维护 prevMS）
+prevMS := st.prevMS
+st.prevMS = e.TimeStart
+if !s.IsWarmUp && btime.IsFirstBarOfPeriodUTC(prevMS, e.TimeStart, "month") && btime.InMonthRangeUTC(e.TimeStart, 11, 4) {
+	s.OpenOrder(&strat.EnterReq{Tag: "monthly_dca_halloween"})
+}
+```
+
+### 示例 C：多品种风险平价 CTA / Lead-Lag 批量目标权重调仓（`BatchInOut` + `OnBatchJobs`）
+
+```go
+// TradeStrat 设 BatchInOut: true，保持 EachMaxLong: 0, EachMaxShort: 0 以允许同向动态补仓；
+// OnData(Main) 每根 bar 无条件更新各品种指标并存入 s.More.(*symState)，随后在 OnBatchJobs 统一截面配权与调仓：
+OnBatchJobs: func(jobs []*strat.StratJob) {
+	signals := make(map[string]float64, len(jobs))
+	for _, j := range jobs {
+		st := j.More.(*symState)
+		if st.ready {
+			signals[j.Symbol.Symbol] = st.signal // 如趋势突破 +1/-1/0，或 BTC 突破时给滞涨高 Beta 币赋 +1
+		}
+	}
+	weights := strat.InverseVolWeights(jobs, signals, 14, 1.0) // 按 1/NATR(14) 归一化至总敞口 1.0x
+	strat.RebalanceBatchWeights(jobs, weights, strat.BatchRebalanceOpts{
+		Tag:              "rp_cta",
+		DriftThreshold:   0.03,
+		MaxGrossExposure: 1.2,
+		StopLossRate:     0.06, // 每笔附带 6% 个币保护止损
+	})
+},
+```
 
 ## 10. 旧接口迁移（OnBar → OnData）
 - 旧 `OnBar(s)`：改为 `OnData: strat.RouteData(strat.DataHandlers{Main: func(s, _ strat.DataEvent){…}})`。

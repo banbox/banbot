@@ -21,6 +21,14 @@ Command `banbot <cmd> --config x.yml` (`--config` is repeatable; `--config-data`
 - Timestamps are **int64 milliseconds**. `TimeStart` = start of the current bar; `TimeStop`/`EndMS` = end of the current bar (= start of the next bar).
 - Timeframes via `ta.ParseTimeFrame`: `<positive integer><unit>`, units `s m h d w M(month, uppercase) q y`; `m` != `M`. E.g. `1m 5m 1h 4h 1d 1w 1M`.
 - `BarEnv.TFMSecs` is the timeframe in milliseconds; `s.Env.BarCount(ms)`: number of bars from ms to the end of the current bar (float64).
+- **UTC Virtual Trading Session Primitives (`github.com/banbox/banbot/btime`)**:
+  - Anchor constants (minutes from `00:00 UTC`): `UTC0Minutes=0`, `AsiaOpenMinutes=0`, `AsiaCloseMinutes=480`(`08:00`), `LondonOpenMinutes=420`(`07:00`), `LondonCashOpenMinutes=480`(`08:00`), `LondonCloseMinutes=960`(`16:00`), `NYKillzoneOpenMinutes=720`(`12:00`), `NewYorkOpenMinutes=810`(`13:30`), `USCashCloseMinutes=1200`(`20:00`), `NewYorkCloseMinutes=1260`(`21:00`), `CMEOpenMinutes=1380`(`23:00`), `CMECloseMinutes=1320`(`22:00`).
+  - Predefined windows (`btime.UTCSessionWindow{Name, StartMin, EndMin}`, methods `.Contains(ms)`/`.DurationMinutes()`): `SessionUTC0`, `SessionAsia`(`00:00–08:00`), `SessionLondon`(`07:00–16:00`), `SessionNewYork`(`13:30–21:00`), `SessionUSCash`(`13:30–20:00`), `SessionCME`(`23:00–22:00` cross-midnight), `KillzoneAsia`(`00:00–04:00`), `KillzoneLondon`(`07:00–10:00`), `KillzoneNewYork`(`12:00–15:00`), `KillzoneLondonExit`(`15:00–17:00`).
+  - Functions: `btime.InUTCWindow(ms, startMin, endMin) bool` (half-open `[startMin, endMin)`, wraps across midnight when `startMin > endMin`); `btime.SessionDayIndex(ms, anchorMinutesUTC) int64` (Euclidean floor division for any anchor trading day); `btime.SessionStartMS(ms, anchorMinutesUTC) int64`; `btime.MinutesIntoSession(ms, anchorMinutesUTC) int` (`[0, 1439]`); `btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, closeMinutesUTC) bool` (timeframe-adaptive EOD flatten check across `<1d` bars, supporting negative buffers like `-15`=`23:45 UTC`; returns `false` for `>=1d`).
+- **UTC Calendar, Seasonality, Turn-of-Month, Expiry & Cross-Timeframe DCA Primitives (`github.com/banbox/banbot/btime`)**:
+  - Calendar decomposition & month boundaries (zero-allocation, leap-year aware): `btime.UTCCalendarParts(ms) (year int, month time.Month, day int, weekday time.Weekday, hour, minute int)`, `btime.IsLeapYearUTC(year) bool`, `btime.DaysInMonthUTC(year, month) int`, `btime.DaysFromMonthStartUTC(ms) int` (`0` on the 1st), `btime.DaysBeforeMonthEndUTC(ms) int` (`0` on the last day of the month, e.g. Feb 28/29 or Mar 31), `btime.IsTurnOfMonthUTC(ms, lastNDays, firstMDays) bool` (Turn-of-Month window covering the last `lastNDays` or first `firstMDays` calendar days).
+  - Weekdays, week-of-month & monthly settlement/expiry: `btime.DayOfWeekUTC(ms) int` (`0=Sunday..6=Saturday`), `btime.ISODayOfWeekUTC(ms) int` (ISO `1=Monday..7=Sunday`), `btime.WeekOfMonthUTC(ms) int` (`1..5` via `(day-1)/7+1`), `btime.NthWeekdayOfMonthUTC(year, month, weekday, n) int` & `btime.IsNthWeekdayOfMonthUTC(ms, weekday, n) bool` (e.g. `n=3, time.Friday` for US equity/CME monthly OPEX; returns `0`/`false` if absent), `btime.LastWeekdayOfMonthUTC(year, month, weekday) int` & `btime.IsMonthlyExpiryDayUTC(ms, weekday) bool` (e.g. `btime.IsMonthlyExpiryDayUTC(ms, time.Friday)` for crypto monthly/quarterly options & futures settlement on the last Friday).
+  - Seasonal month windows & timeframe-agnostic periodic triggers: `btime.InMonthRangeUTC(ms, startMonth, endMonth) bool` (`1..12` inclusive; wraps across year-end when `startMonth > endMonth`, e.g. `InMonthRangeUTC(ms, 11, 4)` for the Nov–Apr Halloween / "Sell in May" window); `btime.IsFirstBarOfPeriodUTC(prevBarMS, curBarMS, period) bool` (`period` supports `"day"`/`"week"`[UTC Monday]/`"month"`/`"quarter"`/`"year"`; track the previous `e.TimeStart` unconditionally in `s.More`, safely returns `false` when `prevBarMS <= 0` or out-of-order, and guarantees exactly one trigger per period across `5m/15m/1h/4h/1d/3d` without missing coarse bars that skip `day == 1` or `hour == 0`).
 
 ### 1.2 Symbols and Markets
 - Symbols: spot `BASE/QUOTE`, contract `BASE/QUOTE:SETTLE` (delivery contracts carry an extra identifier segment). `core.SplitSymbol(pair) (base, quote, settle, id)`.
@@ -312,7 +320,7 @@ The Chan-theory graph structures in `chanlun.go` (CGraph/CPoint/CPen/CSeg/CCentr
 - `OnCheckExit` (`func(*StratJob,*ormo.InOutOrder) *ExitReq`): called on every main bar (non-warmup) for each fully-entered order with `CanClose()`; a non-nil return closes it, and the framework forcibly sets the returned `OrderID` = that order and `Dirt` = that order's direction
 - `GetDrawDownExitRate` (`func(*StratJob,*ormo.InOutOrder,maxChg float64) float64`): drawdown ratio r; `>0` is used, `0` means not set, `<0`/callback unset uses the default table
 - `OnOrderChange` (`func(*StratJob,*ormo.InOutOrder,chgType int)`): §3.7
-- `OnBatchJobs` (`func([]*StratJob)`): all main-timeframe jobs at the same timestamp (requires `BatchInOut`)
+- `OnBatchJobs` (`func([]*StratJob)`): all main-timeframe jobs at the same timestamp (requires `BatchInOut`; ordered in deterministic backtests by neutral `strat.BarPriority(barMS, symbol, bt_bar_order_seed)` hash priority rather than alphabetical order)
 - `OnBatchInfos` (`func(tf string, jobs map[string]*JobEnv)`): all auxiliary jobs at the same timestamp (requires `BatchInfo`)
 - `OnWsTrades(s,pair,[]*banexg.Trade)`/`OnWsDepth(s,*banexg.OrderBook)`/`OnWsKline(s,pair,*banexg.Kline)`/`OnWsData(s,*orm.DataSeries)` (live): tick trades, order book, real-time bars (may be unclosed), generic time-series events
 - `PickTimeFrame` (`func(symbol string, tfScores []*core.TfScore) string`): choose a timeframe for a symbol (default: the first with Score≥MinTfScore)
@@ -367,6 +375,13 @@ Methods:
 - `AvailableBalance() float64`: current available balance / available margin of the owning account (pricing fiat)
 - `AccountDrawdown() float64`: current drawdown ratio in `[0, 1]` relative to the account's run-to-date peak equity (High-Water Mark; 0 when no drawdown)
 - `GetStakeAmount`: `s.Strat.GetStakeAmount(s)` base stake amount (fiat); `OrderCounts() (orderNum, enteredNum int)` same as OrderNum/EnteredNum
+- **No-Lookahead Intraday Session & Previous-Day Range Components (automatically isolated per `StratJob` with automatic warmup replay, zero cross-symbol contamination)**:
+  - `OpeningRange(anchorMinutesUTC, rangeMinutes int) OpeningRangeSnapshot` (and `OpeningRangeWithOpts(..., OpeningRangeOptions{AllowSingleBarFallback})`): tracks the opening `rangeMinutes` ORB (`Open/High/Low/Close/Mid/Width/Volume/BarCount`) of each anchor-aligned day. While forming, `Forming=true, Ready=false`; `Ready=true` ONLY when `TimeStop >= RangeEndMS` and `BarCount >= 1` (`JustCompleted=true` on the completion bar, `InPostRange=true` on subsequent bars); safely returns `Applicable=false, Ready=false` when `TFMSecs >= 1d`, `TFMSecs > rangeMinutes*60000`, or the grid is misaligned with the anchor.
+  - `SessionRange(startMinUTC, endMinUTC int) SessionRangeSnapshot`: tracks recurring UTC session windows (e.g. `0, 480` Asian Range `00:00–08:00 UTC`, or cross-midnight `1320, 120`); `InSession=true, Completed=false` during the window, then locks `High/Low/Open/Close/Mid/Width/Volume` with `Completed=true` until the next cycle's window starts.
+  - `PrevDayOHLC(anchorMinutesUTC int) (PrevOHLC, bool)`: returns the previous **fully completed** anchor-aligned trading day's `Open/High/Low/Close/Pivot/Range/Volume` (PDO/PDH/PDL/PDC — Fairy Four Prices), constant throughout the active day with zero lookahead; partial initial day fragments on non-zero anchors are automatically discarded.
+  - `PrevNDaysStats(anchorMinutesUTC, nDays int) (PrevNDaysSummary, bool)`: rolling statistics (`HH, HC, LC, LL, DualThrustRange, AvgRange(ADR), TotalVolume, AvgVolume, History`) over the past `nDays` completed trading days.
+  - `DualThrustBands(anchorMinutesUTC, nDays int, k1, k2 float64) (upper, lower, dayOpen float64, ok bool)`: computes `Range = max(HH-LC, HC-LL)` over the past `nDays` completed trading days and outputs today's `dayOpen`, `dayOpen + k1*Range`, `dayOpen - k2*Range` (`<1d` timeframes only).
+  - `RBreakerLevels(anchorMinutesUTC int) (RBreakerSnap, bool)` (and parameterized `RBreakerLevelsBy(anchor, f1, f2, f3)`): outputs the six standard R-Breaker levels `BBreak > SSetup > SEnter > Pivot > BEnter > BSetup > SBreak` from yesterday's completed `(H, L, C)` plus today's running `TodayOpen/TodayHigh/TodayLow` (`<1d` timeframes only). Standalone `NewOpeningRangeTracker` / `NewSessionRangeTracker` / `NewPrevPeriodTracker` are also exported.
 
 ### 3.4 DataEvent / DataFields / DataHub / DataSub
 ```go
@@ -476,6 +491,24 @@ Order events (chgType of `OnOrderChange`, `strat.OdChg*`): `OdChgNew`(0) new ord
 ### 3.8 Common Patterns
 - Open only once per bar: `len(s.Entrys)==0 && s.GetOrderNum(0)==0`.
 - Trailing stop for shorts: `s.SetAllStopLoss(core.OdDirtShort, &ormo.ExitTrigger{Price: s.Env.Close.Get(0)+1.5*atr})`.
+
+### 3.9 Cross-Symbol Target-Weight Rebalancing & Inverse-Volatility Sizing (`OnBatchJobs`)
+Designed for multi-asset risk-parity trend CTA, cross-sectional selection + per-coin stop-loss hybrids, and leader-laggard (e.g. BTC breakout driving lagging high-beta altcoins) strategies running inside `TradeStrat{BatchInOut: true, OnBatchJobs: ...}` (keep `EachMaxLong: 0, EachMaxShort: 0` when enabling same-direction scale-in orders):
+
+- **`strat.RebalanceBatchWeights(jobs []*strat.StratJob, targetWeights map[string]float64, opts strat.BatchRebalanceOpts) strat.BatchRebalanceResult`**:
+  - `targetWeights`: `symbol -> signed target notional fraction of AccountEquity()` (e.g. `0.4` = 40% long notional, `-0.3` = 30% short notional, `0` or omitted = flat).
+  - `BatchRebalanceOpts`:
+    - `Tag string`: entry/exit signal tag (default `"rebalance"`).
+    - `DriftThreshold float64`: no-trade weight drift buffer (default `0.02` = 2% of equity; skips micro-adjustments when current and target weights share the **same non-zero sign** and `|target - cur| < DriftThreshold`; opening from flat is never blocked by the drift buffer; pass `< 0` to disable).
+    - `MaxGrossExposure float64`: gross exposure cap (`> 0` proportionally scales all target weights down whenever `Σ|w| > MaxGrossExposure`).
+    - `StopLossRate` / `TakeProfitRate` / `CallbackPct` / `Leverage float64`: automatically attaches per-symbol protective stop-loss distance (`enterPrice * StopLossRate` via `StopLossVal`), take-profit distance, trailing callback percentage `[0.1, 10]`, and leverage to newly opened / scaled-in orders.
+  - **Two-pass execution order**:
+    1. Pass 1 scans all `jobs`: closes flat targets (`0`), closes opposite-direction positions on reversals before queueing the full new-side target, and partially closes overweight same-direction positions (`|target| < |cur| - DriftThreshold`) with `ExitRate = (|cur| - |target|) / |cur|` so margin is released first.
+    2. Pass 2 sorts new entries and same-direction top-ups (`|target| > |cur| + DriftThreshold`) by `LegalCost = AccountEquity() * deltaWeight` **descending** (tie-broken deterministically by neutral `strat.BarPriority(barMS, symbol, seed)` then symbol) before calling `OpenOrder`, silently skipping sub-`core.MinStakeAmount` (`5.5`) dust orders (`SkippedDustCount`).
+  - Returns `BatchRebalanceResult` (`Equity`, `RawGrossExposure`, `EffectiveGrossExposure`, `ScaleFactor`, `ClosedCount`, `ReducedCount`, `ReversedCount`, `OpenedCount`, `ScaledInCount`, `SkippedDriftCount`, `SkippedDustCount`, `ErrorCount`, and chronological `Actions []BatchRebalanceAction`).
+- **`strat.InverseVolWeights(jobs []*strat.StratJob, signals map[string]float64, atrPeriod int, targetGross float64) map[string]float64`**:
+  - Given directional/strength `signals` (e.g. `+1`/`-1`/`0` or continuous scores), `atrPeriod` (`<=0` defaults to `14`), and `targetGross` (e.g. `0.8`), unconditionally evaluates `ta.NATR(e.High, e.Low, e.Close, atrPeriod)` across every job in `jobs` (preserving incremental RMA cache alignment even when `signal == 0`), weights active legs by `signal / NATR`, and normalizes so `Σ|w| == targetGross`.
+- **`strat.BarPriority(barMS int64, symbol string, seed uint64) uint64`**: neutral, reproducible 64-bit per-bar symbol hash priority (lower runs first).
 
 ## 4. Order, Stop-Loss/Take-Profit and Position Details
 ### 4.1 Opening and Closing
@@ -630,6 +663,91 @@ run_policy:
 ```
 
 Example A, `MyMax` in §2.1, and the §5 code have passed `go vet`; the rest are interface fragments. Auxiliary timeframes: in the Info handler `return` if `!data.Closed||data.IsWarmUp`, and use `data.Series("close")` (§3.4/§5.3/§10). Timeout exit: in `OnCheckExit` check `s.Env.BarCount(od.EnterAt)>=N` and return `&strat.ExitReq{Tag:"timeout"}`.
+
+### Example B: Intraday Session Breakout Snippets (ORB / Asian Range London Breakout / Dual Thrust / R-Breaker)
+
+```go
+// 1) US Cash ORB (30m opening range from 13:30 UTC, EOD flatten at 20:00 UTC)
+orb := s.OpeningRange(btime.NewYorkOpenMinutes, 30)
+if btime.IsNearSessionEnd(e.TimeStart, e.TimeStop, btime.USCashCloseMinutes) {
+	s.CloseOrders(&strat.ExitReq{Tag: "ny_eod"})
+	return
+}
+if orb.Ready && orb.InPostRange && btime.SessionUSCash.Contains(e.TimeStart) && len(s.Entrys) == 0 && s.GetOrderNum(0) == 0 {
+	if c := e.Close.Get(0); c > orb.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_long", StopLoss: orb.Mid, RiskRate: 0.01})
+	} else if c < orb.Low {
+		s.OpenOrder(&strat.EnterReq{Tag: "orb_short", Short: true, StopLoss: orb.Mid, RiskRate: 0.01})
+	}
+}
+
+// 2) Asian Range (00:00–08:00 UTC) London Killzone (08:00–10:00 UTC) Breakout
+asia := s.SessionRange(btime.AsiaOpenMinutes, btime.AsiaCloseMinutes)
+if asia.Completed && btime.InUTCWindow(e.TimeStart, btime.LondonCashOpenMinutes, 10*60) && s.GetOrderNum(0) == 0 {
+	if e.Close.Get(0) > asia.High {
+		s.OpenOrder(&strat.EnterReq{Tag: "ldn_brk_long", StopLoss: asia.Low})
+	}
+}
+
+// 3) Dual Thrust (00:00 UTC rollover, 4 completed days for Range)
+if upper, lower, _, ok := s.DualThrustBands(btime.UTC0Minutes, 4, 0.5, 0.5); ok {
+	if c := e.Close.Get(0); c > upper && s.GetOrderNum(1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_short", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_long", StopLoss: lower})
+	} else if c < lower && s.GetOrderNum(-1) == 0 {
+		s.CloseOrders(&strat.ExitReq{Tag: "dt_rev_long", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "dt_short", Short: true, StopLoss: upper})
+	}
+}
+
+// 4) R-Breaker Six-Level Trend Breakout + Intraday Setup Reversal
+if rb, ok := s.RBreakerLevels(btime.UTC0Minutes); ok {
+	c := e.Close.Get(0)
+	if s.GetOrderNum(0) == 0 {
+		if c > rb.BBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_long", StopLoss: rb.Pivot})
+		} else if c < rb.SBreak {
+			s.OpenOrder(&strat.EnterReq{Tag: "rb_trend_short", Short: true, StopLoss: rb.Pivot})
+		}
+	} else if s.GetOrderNum(1) > 0 && rb.TodayHigh >= rb.SSetup && c < rb.SEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_short", Dirt: core.OdDirtLong})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_short", Short: true, StopLoss: rb.BBreak})
+	} else if s.GetOrderNum(-1) > 0 && rb.TodayLow <= rb.BSetup && c > rb.BEnter {
+		s.CloseOrders(&strat.ExitReq{Tag: "rb_rev_to_long", Dirt: core.OdDirtShort})
+		s.OpenOrder(&strat.EnterReq{Tag: "rb_rev_long", StopLoss: rb.SBreak})
+	}
+}
+
+// 5) Timeframe-safe Monthly DCA + Halloween Seasonal Filter (track prevMS unconditionally in s.More)
+prevMS := st.prevMS
+st.prevMS = e.TimeStart
+if !s.IsWarmUp && btime.IsFirstBarOfPeriodUTC(prevMS, e.TimeStart, "month") && btime.InMonthRangeUTC(e.TimeStart, 11, 4) {
+	s.OpenOrder(&strat.EnterReq{Tag: "monthly_dca_halloween"})
+}
+```
+
+### Example C: Multi-Symbol Risk-Parity CTA / Lead-Lag Batch Rebalancing (`BatchInOut` + `OnBatchJobs`)
+
+```go
+// Set BatchInOut: true on TradeStrat and keep EachMaxLong: 0, EachMaxShort: 0 to allow same-side scale-ins;
+// update per-symbol indicators unconditionally in OnData(Main) into s.More.(*symState), then rebalance in OnBatchJobs:
+OnBatchJobs: func(jobs []*strat.StratJob) {
+	signals := make(map[string]float64, len(jobs))
+	for _, j := range jobs {
+		st := j.More.(*symState)
+		if st.ready {
+			signals[j.Symbol.Symbol] = st.signal // e.g. +1/-1/0 trend breakout, or +1 on lagging beta alts after BTC breakout
+		}
+	}
+	weights := strat.InverseVolWeights(jobs, signals, 14, 1.0) // 1/NATR(14) normalized to 1.0x gross exposure
+	strat.RebalanceBatchWeights(jobs, weights, strat.BatchRebalanceOpts{
+		Tag:              "rp_cta",
+		DriftThreshold:   0.03,
+		MaxGrossExposure: 1.2,
+		StopLossRate:     0.06, // attach 6% per-symbol protective stop-loss to entries
+	})
+},
+```
 
 ## 10. Legacy Interface Migration (OnBar → OnData)
 - Legacy `OnBar(s)`: change to `OnData: strat.RouteData(strat.DataHandlers{Main: func(s, _ strat.DataEvent){…}})`.
