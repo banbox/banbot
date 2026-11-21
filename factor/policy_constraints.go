@@ -7,11 +7,13 @@ import (
 	"sort"
 )
 
-func (p *LifecyclePolicy) applyRetention(c PortfolioContext, s LifecycleState, desired map[int32]float64) {
+func (p *LifecyclePolicy) applyRetention(c PortfolioContext, s LifecycleState, desired map[int32]float64, cfg PortfolioPolicyConfig) {
 	points := policyScores(c.Frame, c.Universe, c.ScoreName)
 	rankLong, rankShort := map[int32]int{}, map[int32]int{}
+	scoreBySID := map[int32]float64{}
 	for i, v := range points {
 		rankLong[v.sid] = i + 1
+		scoreBySID[v.sid] = v.score
 	}
 	shortPoints := slices.Clone(points)
 	sort.Slice(shortPoints, func(i, j int) bool {
@@ -23,34 +25,48 @@ func (p *LifecyclePolicy) applyRetention(c PortfolioContext, s LifecycleState, d
 	for i, v := range shortPoints {
 		rankShort[v.sid] = i + 1
 	}
+	passesGate := func(sid int32, direction int) bool {
+		if direction > 0 && cfg.Selection.LongMinScore != nil {
+			return scoreBySID[sid] >= *cfg.Selection.LongMinScore
+		}
+		if direction < 0 && cfg.Selection.ShortMaxScore != nil {
+			return scoreBySID[sid] <= *cfg.Selection.ShortMaxScore
+		}
+		return true
+	}
 	retained := map[int32]bool{}
 	for _, sid := range mapSIDs(s.Assets) {
 		a := s.Assets[sid]
 		rank := rankLong[sid]
-		budget := p.config.LongNotional
-		k := p.config.Selection.LongK
+		budget := cfg.LongNotional
+		k := cfg.Selection.LongK
 		if a.Direction < 0 {
 			rank = rankShort[sid]
-			budget = p.config.ShortNotional
-			k = p.config.Selection.ShortK
+			budget = cfg.ShortNotional
+			k = cfg.Selection.ShortK
 		}
-		if rank > 0 && p.config.Selection.RetainRank > 0 && rank <= p.config.Selection.RetainRank && !a.Exiting && a.Last.Value != "0" {
+		if rank > 0 && budget > 0 && passesGate(sid, a.Direction) && cfg.Selection.RetainRank > 0 && rank <= cfg.Selection.RetainRank && !a.Exiting && a.Last.Value != "0" {
 			if _, ok := desired[sid]; !ok && k > 0 {
 				desired[sid] = float64(a.Direction) * budget / float64(k)
 				retained[sid] = true
 			}
 		}
 	}
-	if p.config.Selection.Dropout > 0 {
+	if cfg.Selection.Dropout > 0 {
 		for _, side := range []int{1, -1} {
 			var excluded []int32
 			rank := rankLong
+			sideBudget := cfg.LongNotional
 			if side < 0 {
 				rank = rankShort
+				sideBudget = cfg.ShortNotional
+			}
+			if sideBudget <= 0 {
+				continue
 			}
 			for _, sid := range mapSIDs(s.Assets) {
 				a := s.Assets[sid]
-				if _, ok := desired[sid]; ok || a.Direction != side || a.Last.Value == "0" || a.Exiting || rank[sid] == 0 {
+				if _, ok := desired[sid]; ok || a.Direction != side || a.Last.Value == "0" || a.Exiting || rank[sid] == 0 || !passesGate(sid, side) {
 					continue
 				}
 				excluded = append(excluded, sid)
@@ -63,7 +79,7 @@ func (p *LifecyclePolicy) applyRetention(c PortfolioContext, s LifecycleState, d
 			})
 			for index, sid := range excluded {
 				a := s.Assets[sid]
-				if index < p.config.Selection.Dropout {
+				if index < cfg.Selection.Dropout {
 					continue
 				}
 				w, e := allocationWeight(a.Last, c, sid)
@@ -76,9 +92,9 @@ func (p *LifecyclePolicy) applyRetention(c PortfolioContext, s LifecycleState, d
 	}
 	// Retained incumbents consume selector slots, replacing the weakest new SID.
 	for _, side := range []int{1, -1} {
-		limit := p.config.Selection.LongK
+		limit := cfg.Selection.LongK
 		if side < 0 {
-			limit = p.config.Selection.ShortK
+			limit = cfg.Selection.ShortK
 		}
 		if limit <= 0 {
 			continue
@@ -113,13 +129,13 @@ func (p *LifecyclePolicy) applyRetention(c PortfolioContext, s LifecycleState, d
 		}
 	}
 }
-func (p *LifecyclePolicy) allocateRemainder(c PortfolioContext, s LifecycleState, desired map[int32]float64, targets map[int32]Allocation, hard map[int32]bool, reasons *[]Diagnostic) {
+func (p *LifecyclePolicy) allocateRemainder(c PortfolioContext, s LifecycleState, desired map[int32]float64, targets map[int32]Allocation, hard map[int32]bool, reasons *[]Diagnostic, cfg PortfolioPolicyConfig) {
 	for _, side := range []int{1, -1} {
-		budget := p.config.LongNotional
+		budget := cfg.LongNotional
 		if side < 0 {
-			budget = p.config.ShortNotional
+			budget = cfg.ShortNotional
 		}
-		budget *= 1 - p.config.Allocation.ReserveRatio
+		budget *= 1 - cfg.Allocation.ReserveRatio
 		tail := 0.0
 		for _, sid := range mapSIDs(targets) {
 			if _, selected := desired[sid]; selected {
@@ -155,7 +171,7 @@ func (p *LifecyclePolicy) allocateRemainder(c PortfolioContext, s LifecycleState
 		}
 	}
 }
-func (p *LifecyclePolicy) constrain(c PortfolioContext, s LifecycleState, targets map[int32]Allocation, hard map[int32]bool, reasons *[]Diagnostic) error {
+func (p *LifecyclePolicy) constrain(c PortfolioContext, s LifecycleState, targets map[int32]Allocation, hard map[int32]bool, reasons *[]Diagnostic, cfg PortfolioPolicyConfig) error {
 	weights := map[int32]float64{}
 	for _, sid := range mapSIDs(targets) {
 		w, err := allocationWeight(targets[sid], c, sid)
@@ -163,12 +179,12 @@ func (p *LifecyclePolicy) constrain(c PortfolioContext, s LifecycleState, target
 			return err
 		}
 		weights[sid] = w
-		if w != 0 && len(p.config.Allocation.GroupCaps) > 0 {
+		if w != 0 && len(cfg.Allocation.GroupCaps) > 0 {
 			if _, ok := c.Groups[sid]; !ok {
 				return fmt.Errorf("factor: group caps require visible group for SID %d", sid)
 			}
 		}
-		if w != 0 && p.config.Allocation.BetaCap > 0 {
+		if w != 0 && cfg.Allocation.BetaCap > 0 {
 			beta, ok := c.Beta[sid]
 			if !ok || math.IsNaN(beta) || math.IsInf(beta, 0) {
 				return fmt.Errorf("factor: beta cap requires visible finite beta for SID %d", sid)
@@ -196,7 +212,7 @@ func (p *LifecyclePolicy) constrain(c PortfolioContext, s LifecycleState, target
 		*reasons = append(*reasons, Diagnostic{"constraint-scale", reason})
 		return nil
 	}
-	if cap := p.config.Allocation.AssetCap; cap > 0 {
+	if cap := cfg.Allocation.AssetCap; cap > 0 {
 		for _, sid := range mapSIDs(weights) {
 			if math.Abs(weights[sid]) > cap {
 				if err := applyScale([]int32{sid}, cap/math.Abs(weights[sid]), fmt.Sprintf("SID %d asset cap", sid)); err != nil {
@@ -206,11 +222,11 @@ func (p *LifecyclePolicy) constrain(c PortfolioContext, s LifecycleState, target
 		}
 	}
 	for _, side := range []int{1, -1} {
-		limit := p.config.LongNotional
+		limit := cfg.LongNotional
 		if side < 0 {
-			limit = p.config.ShortNotional
+			limit = cfg.ShortNotional
 		}
-		limit *= 1 - p.config.Allocation.ReserveRatio
+		limit *= 1 - cfg.Allocation.ReserveRatio
 		total := 0.0
 		var ids []int32
 		for _, sid := range mapSIDs(weights) {
@@ -225,13 +241,13 @@ func (p *LifecyclePolicy) constrain(c PortfolioContext, s LifecycleState, target
 			}
 		}
 	}
-	groupNames := make([]string, 0, len(p.config.Allocation.GroupCaps))
-	for group := range p.config.Allocation.GroupCaps {
+	groupNames := make([]string, 0, len(cfg.Allocation.GroupCaps))
+	for group := range cfg.Allocation.GroupCaps {
 		groupNames = append(groupNames, group)
 	}
 	slices.Sort(groupNames)
 	for _, group := range groupNames {
-		cap := p.config.Allocation.GroupCaps[group]
+		cap := cfg.Allocation.GroupCaps[group]
 		total := 0.0
 		var ids []int32
 		for _, sid := range mapSIDs(weights) {
@@ -252,11 +268,11 @@ func (p *LifecyclePolicy) constrain(c PortfolioContext, s LifecycleState, target
 		beta += weights[sid] * c.Beta[sid]
 	}
 	scale := 1.0
-	if p.config.Allocation.NetCap > 0 && math.Abs(net) > p.config.Allocation.NetCap {
-		scale = math.Min(scale, p.config.Allocation.NetCap/math.Abs(net))
+	if cfg.Allocation.NetCap > 0 && math.Abs(net) > cfg.Allocation.NetCap {
+		scale = math.Min(scale, cfg.Allocation.NetCap/math.Abs(net))
 	}
-	if p.config.Allocation.BetaCap > 0 && math.Abs(beta) > p.config.Allocation.BetaCap {
-		scale = math.Min(scale, p.config.Allocation.BetaCap/math.Abs(beta))
+	if cfg.Allocation.BetaCap > 0 && math.Abs(beta) > cfg.Allocation.BetaCap {
+		scale = math.Min(scale, cfg.Allocation.BetaCap/math.Abs(beta))
 	}
 	if err := applyScale(mapSIDs(weights), scale, "net/beta cap"); err != nil {
 		return err
@@ -273,7 +289,7 @@ func (p *LifecyclePolicy) constrain(c PortfolioContext, s LifecycleState, target
 			}
 		}
 	}
-	if limit := p.config.Allocation.TurnoverLimit; limit > 0 {
+	if limit := cfg.Allocation.TurnoverLimit; limit > 0 {
 		previous := map[int32]float64{}
 		previousAllocations := c.previousAllocations
 		if c.Previous != nil {
@@ -326,10 +342,9 @@ func (p *LifecyclePolicy) constrain(c PortfolioContext, s LifecycleState, target
 			// Turnover interpolation can revive a previously over-budget position.
 			// Recheck risk limits after smoothing, with explicit conflict reporting.
 			before := len(*reasons)
-			riskOnly := *p
-			riskOnly.config = ClonePortfolioPolicyConfig(p.config)
-			riskOnly.config.Allocation.TurnoverLimit = 0
-			if err := riskOnly.constrain(c, s, targets, hard, reasons); err != nil {
+			riskCfg := ClonePortfolioPolicyConfig(cfg)
+			riskCfg.Allocation.TurnoverLimit = 0
+			if err := p.constrain(c, s, targets, hard, reasons, riskCfg); err != nil {
 				return err
 			}
 			if len(*reasons) > before {

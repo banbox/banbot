@@ -19,14 +19,19 @@ type PortfolioDefinition struct {
 	BuilderConfigHash           string `json:",omitempty"`
 	K                           int
 	LongNotional, ShortNotional float64
+	LongMinScore                *float64             `json:",omitempty"`
+	ShortMaxScore               *float64             `json:",omitempty"`
+	UnfilledSlotPolicy          string               `json:",omitempty"`
+	AssetCap                    float64              `json:",omitempty"`
 	Mode                        factor.PortfolioMode
 	Policy                      string                   `json:",omitempty"`
 	PolicyParams                json.RawMessage          `json:",omitempty"`
-	Rebalance                   *factor.RebalanceConfig  `json:",omitempty"`
-	Selection                   *factor.SelectionConfig  `json:",omitempty"`
-	Holding                     *factor.HoldingConfig    `json:",omitempty"`
-	Transition                  *factor.TransitionConfig `json:",omitempty"`
-	Allocation                  *factor.AllocationConfig `json:",omitempty"`
+	Rebalance                   *factor.RebalanceConfig       `json:",omitempty"`
+	Selection                   *factor.SelectionConfig       `json:",omitempty"`
+	Holding                     *factor.HoldingConfig         `json:",omitempty"`
+	Transition                  *factor.TransitionConfig      `json:",omitempty"`
+	Allocation                  *factor.AllocationConfig      `json:",omitempty"`
+	Universe                    *factor.RollingUniverseConfig `json:",omitempty"`
 }
 type CostSpec struct {
 	FeeRate, SlippageRate float64
@@ -86,7 +91,7 @@ func BuildManifest(spec ManifestSpec) (*Manifest, error) {
 	if err := spec.Portfolio.ValidatePolicy(); err != nil {
 		return nil, err
 	}
-	legacyBuilder := spec.Portfolio.Policy == "" || spec.Portfolio.Builder == "top-bottom-k-v1"
+	legacyBuilder := spec.Portfolio.EffectivePolicy() == "" || spec.Portfolio.Builder == "top-bottom-k-v1"
 	if spec.Currency == "" || spec.CodeRevision == "" || spec.FactorPlanHash == "" || spec.UniverseVersion == "" || spec.VisibilityPolicy == "" || spec.ExecutionMode == "" || spec.LatencyAssumption == "" || (legacyBuilder && spec.Portfolio.K <= 0 && spec.Portfolio.Builder == "") || spec.Costs.FundingPolicy == "" {
 		return nil, errors.New("research: incomplete reproducibility manifest")
 	}

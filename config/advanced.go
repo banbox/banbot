@@ -34,11 +34,11 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.HasSuffix(path, ".combo"), strings.HasSuffix(path, ".expressions.combine"):
 		allowed = "method columns weights min_samples min_pairs min_confidence decay direction fallback label"
 	case strings.HasSuffix(path, ".portfolio"):
-		allowed = "builder k long_notional short_notional mode policy policy_params rebalance selection holding transition allocation"
+		allowed = "builder k long_notional short_notional long_min_score short_max_score unfilled_slot_policy asset_cap mode policy policy_params rebalance selection holding transition allocation universe rolling_universe"
 	case strings.HasSuffix(path, ".rebalance"):
 		allowed = "every_bars anchor phase duration calendar calendar_version timezone"
 	case strings.HasSuffix(path, ".selection"):
-		allowed = "long_k short_k long_quantile short_quantile retain_rank dropout group_quota missing_scores"
+		allowed = "long_k short_k long_quantile short_quantile long_min_score short_max_score unfilled_slot_policy retain_rank dropout group_quota missing_scores"
 	case strings.HasSuffix(path, ".holding"):
 		allowed = "min_bars max_bars min_duration max_duration by_asset adopt cooldown_bars"
 	case strings.Contains(path, ".holding.by_asset."):
@@ -48,13 +48,15 @@ func validateAdvanced(path string, fields map[string]any) error {
 	case strings.Contains(path, ".transition.by_asset."):
 		allowed = "exit_steps ratio"
 	case strings.HasSuffix(path, ".allocation"):
-		allowed = "method reserve_ratio fixed_notional vol_target asset_cap group_caps turnover_limit net_cap beta_cap"
+		allowed = "method volatility_column beta_column risk_window shrinkage risk_aversion reserve_ratio fixed_notional vol_target asset_cap group_caps turnover_limit net_cap beta_cap"
 	case strings.HasSuffix(path, ".research"):
 		allowed = "labels label_wait_ms panel"
 	case strings.HasSuffix(path, ".snapshot"):
 		allowed = "grid_time decision_time replay_time universe sid_map schemas source_versions adjustment_version visibility_policy"
-	case strings.HasSuffix(path, ".universe"):
+	case strings.HasSuffix(path, ".snapshot.universe"):
 		allowed = "version investable reference tradable evaluation tracked static"
+	case strings.HasSuffix(path, ".universe"), strings.HasSuffix(path, ".rolling_universe"):
+		allowed = "mode top_n lookback_days lookback_bars min_listing_days min_age_bars reconstitute_days reconstitute_bars schedule always_include"
 	case strings.HasSuffix(path, ".manifest"):
 		allowed = "currency code_revision factor_plan_hash universe_version visibility_policy execution_mode latency_assumption static_universe combo portfolio labels parameters costs snapshots"
 	case strings.HasSuffix(path, ".costs"):
@@ -83,7 +85,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if value != "software" && value != "native_preferred" {
 				return fmt.Errorf("%s must be software or native_preferred", field)
 			}
-		case "archive", "store", "history", "sender_lease_dir", "hub_socket", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "timeframe", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder", "definition", "sampling", "option_expiry_source", "terminal_settlement_source", "paper_fill_model":
+		case "archive", "store", "history", "sender_lease_dir", "hub_socket", "path", "namespace", "live_provider", "funding_policy", "pit_policy", "source", "timeframe", "field", "version", "adjustment_version", "visibility_policy", "currency", "code_revision", "factor_plan_hash", "universe_version", "execution_mode", "latency_assumption", "name", "kind", "builder", "definition", "sampling", "option_expiry_source", "terminal_settlement_source", "paper_fill_model", "volatility_column", "beta_column":
 			if text, ok := value.(string); !ok || strings.TrimSpace(text) == "" {
 				return fmt.Errorf("%s must be a nonempty string", field)
 			}
@@ -96,12 +98,57 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if strings.HasSuffix(path, ".transition") {
 				valid = "direct linear-exit cohort geometric target-step"
 			}
+			if strings.HasSuffix(path, ".universe") || strings.HasSuffix(path, ".rolling_universe") {
+				valid = "rolling_liquid_top liquid_top static"
+			}
 			if !ok || !strings.Contains(" "+valid+" ", " "+text+" ") {
 				return fmt.Errorf("%s has unsupported mode %v", field, value)
 			}
+		case "schedule":
+			text, ok := value.(string)
+			if !ok || !strings.Contains(" daily weekly monthly ", " "+strings.ToLower(strings.TrimSpace(text))+" ") {
+				return fmt.Errorf("%s has unsupported schedule %v", field, value)
+			}
+		case "top_n", "lookback_days", "lookback_bars", "reconstitute_days", "reconstitute_bars":
+			if !nonnegativeInteger(value) || numeric(value) <= 0 || numeric(value) > 10000 {
+				return fmt.Errorf("%s must be an integer in [1, 10000]", field)
+			}
+		case "min_listing_days", "min_age_bars":
+			if !signedIntegerInRange(value, -1, 10000) {
+				return fmt.Errorf("%s must be an integer in [-1, 10000]", field)
+			}
+		case "always_include":
+			if reflect.TypeOf(value).Kind() != reflect.Slice {
+				return fmt.Errorf("%s must be a list", field)
+			}
+			list := reflect.ValueOf(value)
+			for i := 0; i < list.Len(); i++ {
+				if text, ok := list.Index(i).Interface().(string); !ok || strings.TrimSpace(text) == "" {
+					return fmt.Errorf("%s[%d] must be a nonempty string", field, i)
+				}
+			}
 		case "method":
-			if text, ok := value.(string); (!strings.HasSuffix(path, ".allocation")) && (!ok || !strings.Contains(" equal fixed history-ic history-rank-ic history-icir history-rank-icir history-ewma ", " "+text+" ")) {
+			text, ok := value.(string)
+			if strings.HasSuffix(path, ".allocation") {
+				if !ok || !strings.Contains(" equal score fixed-notional inverse-volatility vol-target erc risk-parity hrp min-variance mean-variance ", " "+text+" ") {
+					return fmt.Errorf("%s has unsupported allocation method %v", field, value)
+				}
+			} else if !ok || !strings.Contains(" equal fixed history-ic history-rank-ic history-icir history-rank-icir history-ewma ", " "+text+" ") {
 				return fmt.Errorf("%s has unsupported combo method %v", field, value)
+			}
+		case "risk_window":
+			if !nonnegativeInteger(value) || numeric(value) < 2 || numeric(value) > 10000 {
+				return fmt.Errorf("%s must be an integer in [2, 10000]", field)
+			}
+		case "shrinkage":
+			number := numeric(value)
+			if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || number > 1 {
+				return fmt.Errorf("%s must be a finite number in [0, 1]", field)
+			}
+		case "risk_aversion":
+			number := numeric(value)
+			if math.IsNaN(number) || math.IsInf(number, 0) || number <= 0 {
+				return fmt.Errorf("%s must be a finite positive number", field)
 			}
 		case "page_bytes":
 			if !nonnegativeInteger(value) {
@@ -131,10 +178,19 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if !nonnegativeInteger(value) {
 				return fmt.Errorf("%s must be a nonnegative integer", field)
 			}
-		case "initial_nav", "long_notional", "short_notional", "fee_rate", "slippage_rate", "funding_apr", "periods_per_year":
+		case "initial_nav", "long_notional", "short_notional", "asset_cap", "fee_rate", "slippage_rate", "funding_apr", "periods_per_year":
 			number := numeric(value)
 			if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
 				return fmt.Errorf("%s must be a finite nonnegative number", field)
+			}
+		case "long_min_score", "short_max_score":
+			number := numeric(value)
+			if math.IsNaN(number) || math.IsInf(number, 0) {
+				return fmt.Errorf("%s must be a finite number", field)
+			}
+		case "unfilled_slot_policy":
+			if text, ok := value.(string); !ok || (text != "cash" && text != "rescale") {
+				return fmt.Errorf("%s must be cash or rescale", field)
 			}
 		case "pit_min_universe_ratio", "pit_delist_penalty_bps":
 			// 0 = default; pit_min_universe_ratio < 0 disables the PIT reduction (and must not exceed 1),
@@ -174,7 +230,7 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if reflect.TypeOf(value).Kind() != reflect.Slice {
 				return fmt.Errorf("%s must be a list", field)
 			}
-		case "snapshot", "combo", "portfolio", "decision", "research", "manifest", "prices", "universe", "costs", "accounts", "weights", "parameters", "schemas", "source_versions", "sid_map", "instruments", "expressions", "bindings", "params", "lets", "outputs", "combine", "policy_params", "rebalance", "selection", "holding", "transition", "allocation", "by_asset":
+		case "snapshot", "combo", "portfolio", "decision", "research", "manifest", "prices", "universe", "rolling_universe", "costs", "accounts", "weights", "parameters", "schemas", "source_versions", "sid_map", "instruments", "expressions", "bindings", "params", "lets", "outputs", "combine", "policy_params", "rebalance", "selection", "holding", "transition", "allocation", "by_asset":
 			if reflect.TypeOf(value).Kind() != reflect.Map {
 				return fmt.Errorf("%s must be a mapping", field)
 			}
@@ -231,6 +287,18 @@ func nonnegativeInteger(value any) bool {
 	switch reflect.TypeOf(value).Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return numeric(value) >= 0
+	}
+	return false
+}
+
+func signedIntegerInRange(value any, lo, hi float64) bool {
+	if value == nil {
+		return false
+	}
+	switch reflect.TypeOf(value).Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		n := numeric(value)
+		return n >= lo && n <= hi
 	}
 	return false
 }

@@ -61,19 +61,23 @@ param.window      本定义集 params 中的编译期参数
 
 源别名不必与真实源名相同，例如 `prices: {source: kline, timeframe: 1h}` 对应 `prices.close`。自定义数据源和字段同样适用，不要求固定 OHLCV 模型；原始数据继续通过 `orm.DataSeries.Values map[string]any` 提供。字段名包含连字符、空格等字符时写 `field("prices", "adjusted-close")`，参数是两个双引号字符串。
 
-参数名、因子名、绑定别名使用字母或下划线开头，后续可包含数字。绑定别名不能占用 `factor`、`param`、`label`、`ts`、`cs`、`group`。`lets` 和 `outputs` 共享因子名称空间，不能重名；可以前向引用，但不能成环。未使用的 `lets` 不增加最终计算和订阅，仍会接受语法、参数与引用校验。
+参数名、因子名、绑定别名使用字母或下划线开头，后续可包含数字。绑定别名不能占用 `factor`、`param`、`label`、`ts`、`cs`、`group`、`mtf`、`ref`。声明 `kline` 绑定时支持 `open`、`high`、`low`、`close`、`volume`、`buy_volume` 裸字段简写。`lets` 和 `outputs` 共享因子名称空间，不能重名；可以前向引用，但不能成环。未使用的 `lets` 不增加最终计算和订阅，仍会接受语法、参数与引用校验。
 
 `factor.name` 只引用当前定义集，不查找其他策略或全局注册的因子。输出建议采用 `momentum`、`risk_adjusted` 等名字；runner 会将组合结果写入 `score`，因此组合场景应避免将原始因子输出命名为 `score`。
 
 ## 3. 表达式语法和函数
 
-支持十进制数字、科学计数法、括号、一元 `+`/`-`、四则运算及嵌套函数。`*`/`/` 优先于 `+`/`-`；同级运算左结合，例如 `8 / 4 / 2` 等于 `1`。幂使用 `pow(x,y)`。
+支持十进制数字、科学计数法、括号、一元 `+`/`-`、四则运算、大小比较 `> >= < <=` 及嵌套函数。优先级从高到低为 `*`/`/`、`+`/`-`、`> >= < <=`；同级运算左结合，例如 `8 / 4 / 2` 等于 `1`，`kline.close + 1 > kline.open * 2` 先算加乘再比较。幂使用 `pow(x,y)`。
 
 ### 逐点函数
 
 | 写法 | 语义 |
 |---|---|
 | `x + y`、`x - y`、`x * y`、`x / y` | 同资产、同时点逐点计算；除法不自动添加 epsilon |
+| `x > y`、`x >= y`、`x < y`、`x <= y`（或 `gt/ge/lt/le(x,y)`） | 有效数值比较，真返回 `1`，假返回 `0` |
+| `where(cond,a,b)` / `if_else(cond,a,b)` | `cond` 有效且 `cond > 0` 时取 `a`，否则取 `b`；`cond` 有效时仅要求被选中的分支有效 |
+| `sign(x)` | `x > 0` 返回 `1`，`x < 0` 返回 `-1`，`x == 0` 返回 `0` |
+| `clip(x,lo,hi)` | 将有效值钳制在 `[lo,hi]`；`lo`、`hi` 为有限常量或 `param.name` 且满足 `lo <= hi` |
 | `positive(x)` | `x > 0` 时保留值，非正数记为 NonFinite |
 | `abs(x)` | 绝对值 |
 | `log(x)` | 自然对数；非正数产生 NonFinite |
@@ -81,24 +85,36 @@ param.window      本定义集 params 中的编译期参数
 | `pow(x,y)` | 幂运算，非法结果或溢出产生 NonFinite |
 | `min(x,y)`、`max(x,y)` | 两个有效数值的最小值、最大值 |
 
-例如 `log(positive(kline.close)) + log(positive(kline.volume))` 表示对数成交额代理值，可避免先相乘造成的溢出。`max(volatility,1e-8)` 是有效数值的分母下界，不填补 NULL、缺失或预热不足。
+例如 `log(positive(kline.close)) + log(positive(kline.volume))` 表示对数成交额代理值，可避免先相乘造成的溢出；`where(x > 0, log(x), 0)` 在 `x <= 0` 时即使未选中的 `log(x)` 为 NonFinite 也能安全返回 `0`（而 `x` 自身为 Missing/Null 时 `cond` 无效，仍原样传播缺失原因）。`max(volatility,1e-8)` 与 `clip` 只作用于有效数值，不填补 NULL、缺失或预热不足。
 
 ### 时序函数
 
 | 写法 | 语义与参数 |
 |---|---|
 | `ts.lag(x,n)` | 读取过去 `n` 个观察的值；`n=0` 返回原值 |
-| `ts.return(x,n)` | `x[t] / x[t-n] - 1` |
+| `ts.return(x,n)` / `ts.ret(x,n)` | `x[t] / x[t-n] - 1` |
+| `mtf.asof("1d", expr[, max_stale_ms])` / `asof_tf(...)` | 在不细于目标周期的源周期（如 `"1d"`、`"4h"`）上仅随已闭合源 bar 推进内部指标，再因果 `AsOf` 对齐到当前周期 |
+| `ref.field("BTC/USDT:USDT", "close")` / `ref.field(sym, src, field)` | 读取指定基准品种字段并向全池广播（两参默认 `kline` 源） |
 | `ts.ema(x,n)` | 沿用现有 banta EMA 初始化和递推口径 |
 | `ts.std(x,n,ddof)` | 标准差；必须显式传入 `ddof` |
+| `ts.corr(x,y,n)` | 两序列最近 `n` 个同时有效配对的 Pearson 相关系数；任一方差为 0 时返回 `0` |
+| `ts.cov(x,y,n)` | 两序列最近 `n` 个同时有效配对的滚动总体协方差 |
+| `ts.beta(y,x,n)` | 滚动回归斜率 `Cov(y,x) / Var(x)`；`Var(x) == 0` 时返回 `0` |
+| `ts.sum(x,n)` / `ts.product(x,n)` | 最近 `n` 个有效观察的滚动求和 / 滚动连乘 |
+| `ts.rank(x,n)` | 当前值在最近 `n` 个有效观察中的 `[0,1]` 归一化分位排名（并列取平均，`n==1` 返回 `0.5`） |
+| `ts.zscore(x,n)` | `(x - SMA(x,n)) / StdDev(x,n,0)`；标准差为 0 时返回 `0` |
+| `ts.argmax(x,n)` / `ts.argmin(x,n)` | 窗口最大/最小值距当前的偏移量 `0..n-1`（`0` 表示当前最新值为极值，对齐 `HighestBar/LowestBar`） |
+| `ts.skew(x,n)` / `ts.kurt(x,n)` | 无偏样本偏度（要求 `n >= 3`）/ 无偏样本超额峰度（要求 `n >= 4`）；标准差为 0 时返回 `0` |
+| `ts.slope(x,n)` / `ts.rsquare(x,n)` | 对等间距时间索引 `0..n-1` 的 OLS 斜率 / 拟合优度 `R² ∈ [0,1]`（方差为 0 时返回 `0`） |
+| `ts.decay_linear(x,n)` | 线性衰减加权均值，等价于 `ts.wma(x,n)`（最旧到最新权重 `1..n`） |
 
-还支持 18 类常见技术指标、22 个标量函数：`ts.sma/rma/wma/vwma/rsi/roc/mom/tr/atr/cci/stoch/willr/obv/mfi/highest/lowest`，以及 `ts.macd/macd_signal/macd_hist`、`ts.bbands_upper/bbands_middle/bbands_lower`。完整参数表、Go 构造方式、公式、缺失数据与预热规则见[常见技术指标](factor_indicators.md)。全部支持 Batch 与持续推进的 Session。
+还支持完整的高频技术指标、订单流与波动率估计函数：自适应与均线 `ts.sma/rma/wma/dema/tema/hma/kama/alma/trima/er/kalman1d/hurst`，方向/趋势/通道 `ts.tr/atr/natr/adx/dmi_plus(plus_di)/dmi_minus(minus_di)/chop/aroon_up/aroon_down/aroon_osc/vortex_plus/vortex_minus/donchian_upper/donchian_mid/donchian_lower/keltner_upper/keltner_mid/keltner_lower/supertrend/supertrend_dir/sar/stc/ichimoku_conversion/ichimoku_base`、`ts.macd/macd_signal/macd_hist`、`ts.bbands_upper/bbands_middle/bbands_lower`，动量/成交量/订单流 `ts.rsi/roc/mom/cci/stoch/willr/highest/lowest/vwma/obv/mfi/cmf/adl/adosc(chaikin_osc)/volume_delta/cvd/rolling_cvd/taker_buy_ratio`，以及 OHLC 极差波动率 `ts.parkinson_vol/garman_klass_vol/yang_zhang_vol`（当 `bindings` 中声明 `kline` 时，多字段 OHLC/OHLCV/订单流指标可省略字段节点直接写如 `ts.adx(14)`、`ts.parkinson_vol(20)`、`ts.volume_delta()`）。完整参数表、Go 构造方式、公式、缺失数据与预热规则见[常见技术指标](factor_indicators.md)。全部支持 Batch 与持续推进的 Session。
 
-例如 `ts.cci((kline.high+kline.low+kline.close)/3,20)` 显式构造典型价格，`ts.atr(kline.high,kline.low,kline.close,14)` 提供三个输入，`ts.macd_hist(kline.close,12,26,9)` 选择 MACD 柱。`ts.roc` 返回百分比，`ts.return` 返回比例：100 到 110 分别为 `10` 与 `0.1`。新指标按完整有效元组推进，遇到无效字段不推进状态；原有 `ts.return/lag/ema/std` 保持原合同。
+例如 `ts.cci((kline.high+kline.low+kline.close)/3,20)` 显式构造典型价格，`ts.atr(kline.high,kline.low,kline.close,14)`（或 `ts.atr(14)`）计算真实波幅，`ts.macd_hist(kline.close,12,26,9)` 选择 MACD 柱。`ts.roc` 返回百分比，`ts.return` 返回比例：100 到 110 分别为 `10` 与 `0.1`。技术指标与滚动统计函数均按完整有效元组推进，遇到无效字段不推进状态；原有 `ts.return/lag/ema/std` 保持原合同。
 
-窗口必须为整数常量或已绑定数值参数，范围为 1–10000；`ts.lag` 额外允许 0。`ddof` 必须是整数且满足 `0 <= ddof < n`，其中 `ddof=0` 是总体标准差。窗口参数不接受逐行字段，也不接受 `param.window + 1` 等计算表达式；先在 `params` 中给出最终数值。
+窗口必须为整数常量或已绑定数值参数，范围为 1–10000（`ts.hma/chop/yang_zhang_vol` 为 2–10000，`ts.skew` 为 3–10000，`ts.kurt` 为 4–10000，`ts.hurst` 为 8–10000）；`ts.lag` 额外允许 0。`ddof` 必须是整数且满足 `0 <= ddof < n`，其中 `ddof=0` 是总体标准差。窗口参数不接受逐行字段，也不接受 `param.window + 1` 等计算表达式；先在 `params` 中给出最终数值。
 
-先时序再截面是受支持的组合，例如 `cs.zscore(ts.return(kline.close,24))`。当前不支持对截面或回归结果再做时序窗口，即使中间包裹了逐点函数，也会拒绝 `ts.ema(abs(cs.rank(kline.close)),24)`；零 lag 原值例外。
+支持任意无环多阶段 `TS ↔ CS/GROUP` 嵌套（按 `StageTS`/`StageCS` 拓扑阶段交替求值），例如 `cs.zscore(ts.return(kline.close,24))`、`ts.kama(cs.pct_rank(kline.volume)+1,10)` 或 `cs.zscore(ts.std(group.residual(ts.return(kline.close,1),kline.open),20,0))`；跨阶段预热自动累加，零 lag 返回原值。
 
 ### 截面和回归函数
 
@@ -107,11 +123,13 @@ param.window      本定义集 params 中的编译期参数
 | 写法 | 语义与参数 |
 |---|---|
 | `cs.rank(x)` | 升序、0 起始名次，并列取平均名次；不是百分位 |
+| `cs.pct_rank(x)` | 归一化截面分位排名 `[0,1]`：有效参考标的数 `M > 1` 时为 `rank / (M - 1)`，`M == 1` 时为 `0.5` |
 | `cs.zscore(x)` | 使用参考池均值和总体标准差标准化；标准差为 0 时有效输出为 0 |
 | `cs.winsorize(x,tail)` | 将有效值限制在参考池两端分位点内，`0 <= tail < 0.5` |
 | `cs.mad_winsorize(x,k)` | 按参考中位数与缩放 MAD 截尾，k 必须为正 |
 | `cs.robust_zscore(x)` | 中位数 / `1.4826 × MAD` 稳健标准化，零 MAD 输出零 |
 | `cs.quantile(x,q)` | 参考池分位数，`0 <= q <= 1`；同一分位值广播给有有效输入的资产 |
+| `cs.mean(x)` / `cs.sum(x)` | 参考池有效值的算术均值 / 总和，作为截面常数广播给有有效输入的活跃资产（如市场宽度 `cs.mean(kline.close > ts.sma(kline.close, 200))`） |
 | `group.residual(y,x)` | 用参考池完整有效配对拟合带截距的一元截面回归，输出残差 |
 | `group.ols(y,x1,x2,...)` | 含截距的多暴露回归残差，共线暴露按声明顺序处理 |
 | `group.wls(y,weight,x1,x2,...)` | 正权重的多暴露加权回归残差 |
@@ -386,7 +404,7 @@ combine:
 
 `sampling: asof` 与 `asof-latest` 等效。它在决策网格取当时可见且未超过 `max_age_ms` 的观测；发布、接收、事件时间与屏障仍由数据输入和快照负责。超龄或缺少所需流会阻止求值，不会自动读取未来观测。
 
-asof 后的时序窗口计数为决策观察次数。在小时决策上重复采样日频数据后计算 24 个观察的窗口，不等于 24 个交易日。需要原生日频指标时，先在日频数据源生成指标，再显式采样该输出。
+叶节点 `sampling: asof` 后的时序窗口计数为决策观察次数：在小时决策上对 `asof` 字段计算 24 个观察的窗口，不等于 24 个交易日。需要原生日频/4 小时指标时，使用 `mtf.asof("1d", ts.ema(close, 20))`（Go 侧对应 `factor.AsOfNode` / `factor.SubTF`），使内部时序窗口仅在源周期已闭合 bar（`barEnd <= GridTime`）到达时步进一次，再因果 `AsOf` 投影到决策网格。需要引用特定基准品种（如 `"BTC/USDT:USDT"`）计算滚动 Beta/相关系数或市场状态门控时，使用 `ref.field("BTC/USDT:USDT", "close")`（Go 侧 `factor.RefAssetField`）。
 
 ## 9. 检查数值、有效性和因子效果
 
@@ -500,7 +518,6 @@ go test ./examples/crosssection -run '^$' -bench '^BenchmarkFactorVersions$' -be
 | `unknown function` / 参数数量错误 | 使用上面的函数表；`ts.std` 必须提供第三个参数 |
 | 窗口或 `ddof` 超界 | 使用编译期整数参数；`ts.return(...,0)` 无效，零 lag 有效 |
 | `cyclic factor reference` | 将相互引用的 lets/outputs 改为无环依赖 |
-| `TS windows over cross-section results` | 先做时序窗口，再做截面变换 |
 | 周期不匹配或缺少 asof | 同周期源用当前事件，不同周期/event 源显式配置采样和正最大年龄 |
 | 组合列或权重错误 | 核对 outputs、columns、weights，以及外层 combo 覆盖 |
 | 源码位置错误 | `outputs.name:行:列` 指公式字符串中的位置，不是 YAML 文件物理行号 |
@@ -509,4 +526,4 @@ go test ./examples/crosssection -run '^$' -bench '^BenchmarkFactorVersions$' -be
 
 资源限制为单公式 16 KiB、全部公式文本 256 KiB、AST 节点 8192、解析/展开深度预算 64；`lets + outputs`、bindings 和 params 的声明数量分别不超过 512。解析器对内部递归层数也计数，因此嵌套括号/函数未必能达到 64 个。限制是编译边界，不是对任意资产数量下内存使用的保证。
 
-当前没有赋值、比较、逻辑条件、三元/`where`、自动填补、数组索引、注释或任意 Go/Python 调用；不支持 `^`、十六进制浮点及数字下划线。也没有跨定义库引用、自动候选生成或 `factor operators/generate/test` 命令。需要新的原子算法时按照架构文档中的扩展步骤修改 Go 内核，并补充独立数值和 Session/Batch 测试。
+当前没有赋值、布尔逻辑运算符（`&&`/`||`）、自动填补、数组索引、注释或任意 Go/Python 调用；不支持 `^`、十六进制浮点及数字下划线。也没有跨定义库引用、自动候选生成或 `factor operators/generate/test` 命令。需要新的原子算法时按照架构文档中的扩展步骤修改 Go 内核，并补充独立数值和 Session/Batch 测试。

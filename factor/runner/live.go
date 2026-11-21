@@ -7,6 +7,7 @@ import (
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/backtest"
+	"maps"
 	"slices"
 	"sort"
 	"sync"
@@ -74,7 +75,7 @@ func NewLive(c Config, sink Sink, clock func() int64, out Output) (*Live, error)
 	if err != nil {
 		return nil, err
 	}
-	policy, err := newPolicyRun(c)
+	policy, err := newPolicyRun(c, combo.Columns...)
 	if err != nil {
 		engine.close()
 		return nil, err
@@ -88,7 +89,8 @@ func NewLive(c Config, sink Sink, clock func() int64, out Output) (*Live, error)
 	life, cancel := context.WithCancel(context.Background())
 	return &Live{c: c, sink: sink, out: out, clock: clock, engine: engine, policy: policy, rows: map[factor.StreamKey]factor.VersionRecord{}, quotes: map[int32]backtest.Quote{}, ctx: life, cancel: cancel, joined: make(chan struct{})}, nil
 }
-func (l *Live) Inputs() []factor.InputSpec { return l.engine.plan.Inputs() }
+func (l *Live) Inputs() []factor.InputSpec             { return l.engine.plan.Inputs() }
+func (l *Live) ScopedInputs() []factor.ScopedInputSpec { return l.engine.plan.ScopedInputs() }
 
 // ExecutionOwnsFunding separates account settlement from model inputs. A hub
 // strategy may still explicitly subscribe to funding data in its factor DAG.
@@ -154,6 +156,8 @@ func (l *Live) InheritAdmission(previous *Live) error {
 		l.policy.version = previous.policy.version
 		l.policy.previous = previous.policy.previous
 		l.policy.sequence = previous.policy.sequence
+		l.policy.riskTracker = previous.policy.riskTracker.clone()
+		l.policy.lastBeta = maps.Clone(previous.policy.lastBeta)
 	}
 	if previous.previous != nil {
 		targets := previous.previous.Targets()
@@ -223,6 +227,11 @@ func (l *Live) InstrumentForSID(sid int32) (execution.Instrument, bool) {
 func (l *Live) DataSIDs() []int32 {
 	u := l.c.Snapshot.Universe
 	ids := append(append([]int32{}, u.Investable...), u.Reference...)
+	for _, sym := range l.engine.plan.ReferenceSymbols() {
+		if sid, ok := l.c.Snapshot.ResolveSymbolSID(sym); ok {
+			ids = append(ids, sid)
+		}
+	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return slices.Compact(ids)
 }
@@ -275,6 +284,9 @@ func (l *Live) Warmup(ctx context.Context, r factor.VersionRecord) error {
 	if input == nil {
 		return nil
 	}
+	if input.AsOfLatest && input.TimeFrame != "event" && !r.Series.Closed {
+		return nil
+	}
 	r, err := factor.CloneVersionRecord(r)
 	if err != nil {
 		return err
@@ -312,7 +324,11 @@ func (l *Live) Warmup(ctx context.Context, r factor.VersionRecord) error {
 		spec.GridTime = grid
 		spec.DecisionTime = now
 		spec.ReplayTime = now
-		snapshot, err := factor.Freeze(spec, all, requirements(l.engine.plan, spec.Universe, grid))
+		reqs, err := requirements(l.engine.plan, spec, grid)
+		if err != nil {
+			return err
+		}
+		snapshot, err := factor.Freeze(spec, all, reqs)
 		if err != nil {
 			return err
 		}
@@ -336,6 +352,9 @@ func (l *Live) Warmup(ctx context.Context, r factor.VersionRecord) error {
 		}
 		if err != nil {
 			return err
+		}
+		if l.policy != nil {
+			l.policy.observeSnapshot(l.c, l.engine.plan, snapshot, nil, nil, grid, now)
 		}
 		l.lastWarmGrid = grid
 		l.warmGridCount++
@@ -418,6 +437,9 @@ func (l *Live) Observe(ctx context.Context, r factor.VersionRecord) error {
 	}
 	for _, in := range l.engine.plan.Inputs() {
 		if l.HasSID(r.Series.Sid) && r.Series.Source == in.Source && r.Series.TimeFrame == in.TimeFrame {
+			if in.AsOfLatest && in.TimeFrame != "event" && !r.Series.Closed {
+				continue
+			}
 			key := factor.StreamKey{SID: r.Series.Sid, Source: r.Series.Source, TimeFrame: r.Series.TimeFrame}
 			old, ok := l.rows[key]
 			if !ok || r.EventTime > old.EventTime || r.EventTime == old.EventTime && r.Revision > old.Revision {
@@ -613,8 +635,10 @@ func (l *Live) prepareRound(decision, cutoff int64) (factor.SnapshotSpec, factor
 	spec.GridTime = decision
 	spec.DecisionTime = cutoff
 	spec.ReplayTime = cutoff
-	needs := requirements(l.engine.plan, spec.Universe, decision)
-	var err error
+	needs, err := requirements(l.engine.plan, spec, decision)
+	if err != nil {
+		return spec, token, err
+	}
 	token, err = l.barrier.Begin(l.engine.plan.Hash(), spec, needs, decision+l.c.ExpiryMS)
 	if err != nil {
 		return spec, token, err

@@ -16,6 +16,27 @@ const (
 	GROUP NodeKind = "GROUP"
 )
 
+type StageKind string
+
+const (
+	StageTS StageKind = "TS"
+	StageCS StageKind = "CS"
+)
+
+// Stage describes one topological evaluation barrier in a compiled Plan.
+// Execution alternates per-asset time-series/pointwise evaluation (StageTS)
+// and cross-sectional/group evaluation across the active universe (StageCS).
+type Stage struct {
+	Index int
+	Kind  StageKind
+	Nodes []string
+}
+
+type planStage struct {
+	kind  StageKind
+	nodes []int
+}
+
 type NodeSpec struct {
 	Operator                 string
 	Version                  string
@@ -24,6 +45,7 @@ type NodeSpec struct {
 	SourceTimeFrame          string
 	Field                    string
 	GroupField               string
+	RefSymbol                string
 	TimeFrame                string
 	Parameters               map[string]float64
 	OutputType               string
@@ -100,8 +122,9 @@ func StdDev(input *Node, period, ddof int) *Node {
 	n.Spec.Parameters["ddof"] = float64(ddof)
 	return n
 }
-func Rank(input *Node) *Node   { return node("rank", CS, input) }
-func ZScore(input *Node) *Node { return node("zscore", CS, input) }
+func Rank(input *Node) *Node    { return node("rank", CS, input) }
+func PctRank(input *Node) *Node { return node("pct-rank", CS, input) }
+func ZScore(input *Node) *Node  { return node("zscore", CS, input) }
 
 // RobustZScore centers at the reference median and scales by 1.4826*MAD.
 func RobustZScore(input *Node) *Node { return node("robust-zscore", CS, input) }
@@ -120,6 +143,8 @@ func Quantile(input *Node, q float64) *Node {
 	n.Spec.Parameters["q"] = q
 	return n
 }
+func CsMean(input *Node) *Node { return node("cs-mean", CS, input) }
+func CsSum(input *Node) *Node  { return node("cs-sum", CS, input) }
 
 // GroupDemean samples the latest classification without an age limit for
 // compatibility. Use GroupDemeanByField to declare an explicit sampling contract.
@@ -229,17 +254,34 @@ type compiledNode struct {
 type Plan struct {
 	hash      string
 	nodes     []compiledNode
+	stages    []planStage
 	outputs   map[string]int
 	timeframe string
 	retention int
 	warmup    int
+	subMeta   *subTFPlanMeta
 }
 
 func (p *Plan) Hash() string        { return p.hash }
 func (p *Plan) NodeCount() int      { return len(p.nodes) }
+func (p *Plan) StageCount() int     { return len(p.stages) }
 func (p *Plan) WarmupLength() int   { return p.warmup }
 func (p *Plan) StateRetention() int { return p.retention }
 func (p *Plan) TimeFrame() string   { return p.timeframe }
+
+// Stages returns an independent copy of the compiled topological evaluation
+// stages alternating StageTS and StageCS barriers.
+func (p *Plan) Stages() []Stage {
+	out := make([]Stage, len(p.stages))
+	for i, s := range p.stages {
+		ids := make([]string, len(s.nodes))
+		for j, nodeIdx := range s.nodes {
+			ids[j] = p.nodes[nodeIdx].id
+		}
+		out[i] = Stage{Index: i, Kind: s.kind, Nodes: ids}
+	}
+	return out
+}
 
 type InputSpec struct {
 	Source       string
@@ -253,42 +295,8 @@ type InputSpec struct {
 // Inputs exposes the actual raw subscription union without importing data or
 // strategies. Fields are sorted and independent copies, suitable for runners.
 func (p *Plan) Inputs() []InputSpec {
-	inputs := make(map[string]*InputSpec)
-	for _, node := range p.nodes {
-		if node.spec.Source == "" {
-			continue
-		}
-		key := node.spec.Source + "\x00" + node.spec.SourceTimeFrame
-		input := inputs[key]
-		if input == nil {
-			input = &InputSpec{Source: node.spec.Source, TimeFrame: node.spec.SourceTimeFrame, AsOfLatest: node.spec.AvailabilityPolicy == "asof-latest", MaxAge: node.spec.MaxAge}
-			inputs[key] = input
-		}
-		field := node.spec.Field
-		if field == "" {
-			field = node.spec.GroupField
-		}
-		input.Fields = append(input.Fields, field)
-		if node.spec.Operator == "field" {
-			input.WarmupLength = max(input.WarmupLength, p.warmup)
-		}
-		if node.spec.AvailabilityPolicy != "asof-latest" {
-			input.AsOfLatest = false
-		}
-		if input.MaxAge == 0 || (node.spec.MaxAge > 0 && node.spec.MaxAge < input.MaxAge) {
-			input.MaxAge = node.spec.MaxAge
-		}
-	}
-	keys := slices.Collect(maps.Keys(inputs))
-	sort.Strings(keys)
-	result := make([]InputSpec, 0, len(keys))
-	for _, key := range keys {
-		input := *inputs[key]
-		sort.Strings(input.Fields)
-		input.Fields = slices.Compact(input.Fields)
-		result = append(result, input)
-	}
-	return result
+	plain, _ := p.buildInputs()
+	return plain
 }
 func (p *Plan) Outputs() []string {
 	names := slices.Collect(maps.Keys(p.outputs))
@@ -301,18 +309,23 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 		return nil, errors.New("factor: empty inference plan")
 	}
 	plan := &Plan{outputs: make(map[string]int), retention: 2}
+	type nodeVisitKey struct {
+		node       *Node
+		expectedTF string
+	}
 	visiting := make(map[*Node]bool)
-	visited := make(map[*Node]int)
+	visited := make(map[nodeVisitKey]int)
 	canonicalNodes := make(map[string]int)
-	var visitNode func(*Node) (int, error)
-	visitNode = func(n *Node) (int, error) {
+	var visitNode func(*Node, string) (int, error)
+	visitNode = func(n *Node, expectedTF string) (int, error) {
 		if n == nil {
 			return 0, errors.New("factor: nil dependency")
 		}
 		if visiting[n] {
 			return 0, errors.New("factor: cyclic dependency")
 		}
-		if index, ok := visited[n]; ok {
+		vKey := nodeVisitKey{n, expectedTF}
+		if index, ok := visited[vKey]; ok {
 			return index, nil
 		}
 		visiting[n] = true
@@ -321,22 +334,34 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 		if spec.Source != "" && spec.SourceTimeFrame == "" {
 			spec.SourceTimeFrame = spec.TimeFrame
 		}
+		if spec.Operator == opAsOfNode && spec.SourceTimeFrame == "" && len(n.Inputs) == 1 && n.Inputs[0] != nil {
+			spec.SourceTimeFrame = n.Inputs[0].Spec.TimeFrame
+		}
 		if spec.Operator == "label" {
 			return 0, errors.New("factor: inference cannot depend on label namespace")
 		}
 		if err := validateNode(spec, len(n.Inputs), n.Evaluate != nil); err != nil {
 			return 0, err
 		}
-		if plan.timeframe == "" {
-			plan.timeframe = spec.TimeFrame
-		} else if plan.timeframe != spec.TimeFrame {
+		if expectedTF == "" {
+			if plan.timeframe == "" {
+				plan.timeframe = spec.TimeFrame
+			} else if plan.timeframe != spec.TimeFrame {
+				return 0, errors.New("factor: mixed timeframes require explicitly resampled input")
+			}
+			expectedTF = plan.timeframe
+		} else if spec.TimeFrame != expectedTF {
 			return 0, errors.New("factor: mixed timeframes require explicitly resampled input")
+		}
+		childTF := spec.TimeFrame
+		if spec.Operator == opAsOfNode {
+			childTF = spec.SourceTimeFrame
 		}
 		inputs := make([]int, len(n.Inputs))
 		dependencyIDs := make([]string, len(inputs))
 		dependencyWarmup := 0
 		for i, input := range n.Inputs {
-			index, err := visitNode(input)
+			index, err := visitNode(input, childTF)
 			if err != nil {
 				return 0, err
 			}
@@ -351,6 +376,13 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 			spec.StateRetention = max(spec.StateRetention, retention)
 		} else {
 			switch spec.Operator {
+			case opAsOfNode:
+				warm, err := asofNodeWarmup(spec, dependencyWarmup)
+				if err != nil {
+					return 0, err
+				}
+				spec.WarmupLength = warm
+				spec.StateRetention = max(spec.StateRetention, 1)
 			case "lag", "return":
 				spec.WarmupLength = dependencyWarmup + period
 				spec.StateRetention = max(spec.StateRetention, period+1)
@@ -370,17 +402,19 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 			return 0, err
 		}
 		if index, exists := canonicalNodes[id]; exists {
-			visited[n] = index
+			visited[vKey] = index
 			delete(visiting, n)
 			return index, nil
 		}
 		index := len(plan.nodes)
 		plan.nodes = append(plan.nodes, compiledNode{id, spec, inputs, n.Evaluate})
 		canonicalNodes[id] = index
-		visited[n] = index
+		visited[vKey] = index
 		delete(visiting, n)
-		plan.retention = max(plan.retention, spec.StateRetention)
-		plan.warmup = max(plan.warmup, spec.WarmupLength)
+		if spec.TimeFrame == plan.timeframe {
+			plan.retention = max(plan.retention, spec.StateRetention)
+			plan.warmup = max(plan.warmup, spec.WarmupLength)
+		}
 		return index, nil
 	}
 	names := slices.Collect(maps.Keys(outputs))
@@ -389,22 +423,68 @@ func Compile(outputs map[string]*Node) (*Plan, error) {
 		if name == "" {
 			return nil, errors.New("factor: empty output name")
 		}
-		index, err := visitNode(outputs[name])
+		index, err := visitNode(outputs[name], plan.timeframe)
 		if err != nil {
 			return nil, err
 		}
 		plan.outputs[name] = index
 	}
+	plan.stages = buildPlanStages(plan.nodes)
+	plan.subMeta = compileSubTFMeta(plan)
 	ids := make([]string, len(plan.nodes))
 	for i, n := range plan.nodes {
 		ids[i] = n.id
 	}
+	stageNodes := make([][]int, len(plan.stages))
+	for i, s := range plan.stages {
+		stageNodes[i] = s.nodes
+	}
 	var err error
 	plan.hash, err = contentHash(struct {
 		Nodes   []string
+		Stages  [][]int
 		Outputs map[string]int
-	}{ids, plan.outputs})
+	}{ids, stageNodes, plan.outputs})
 	return plan, err
+}
+
+func buildPlanStages(nodes []compiledNode) []planStage {
+	if len(nodes) == 0 {
+		return nil
+	}
+	nodeStage := make([]int, len(nodes))
+	maxStage := 0
+	for i, n := range nodes {
+		wantKind := StageTS
+		if n.spec.Kind != TS {
+			wantKind = StageCS
+		}
+		s := 0
+		for _, dep := range n.inputs {
+			s = max(s, nodeStage[dep])
+		}
+		stageKind := StageTS
+		if s%2 == 1 {
+			stageKind = StageCS
+		}
+		if stageKind != wantKind {
+			s++
+		}
+		nodeStage[i] = s
+		maxStage = max(maxStage, s)
+	}
+	stages := make([]planStage, maxStage+1)
+	for s := range stages {
+		kind := StageTS
+		if s%2 == 1 {
+			kind = StageCS
+		}
+		stages[s].kind = kind
+	}
+	for i, s := range nodeStage {
+		stages[s].nodes = append(stages[s].nodes, i)
+	}
+	return stages
 }
 
 func validateNode(spec NodeSpec, count int, custom bool) error {
@@ -415,13 +495,17 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 		return errors.New("factor: explicit sampling policy required")
 	}
 	groupField := spec.Operator == "group-demean" || spec.Operator == "group-zscore"
-	// Legacy Go group builders permit unlimited-age latest classifications.
+	allowZeroAsOfAge := groupField || spec.Operator == opAsOfNode
+	// Legacy Go group builders and AsOfNode permit unlimited-age latest values.
 	// Explicit ByField builders validate the Field contract before copying it.
-	if spec.AvailabilityPolicy == "asof-latest" && (spec.SamplingPolicy != "decision-grid" || spec.MaxAge < 0 || (spec.MaxAge == 0 && !groupField)) {
+	if spec.AvailabilityPolicy == "asof-latest" && (spec.SamplingPolicy != "decision-grid" || spec.MaxAge < 0 || (spec.MaxAge == 0 && !allowZeroAsOfAge)) {
 		return errors.New("factor: asof source requires decision-grid sampling and positive max age (legacy groups permit zero)")
 	}
-	if (spec.Operator == "field" || groupField) && spec.SourceTimeFrame != spec.TimeFrame && spec.AvailabilityPolicy != "asof-latest" {
+	if (spec.Operator == "field" || spec.Operator == opRefField || groupField) && spec.SourceTimeFrame != spec.TimeFrame && spec.AvailabilityPolicy != "asof-latest" {
 		return errors.New("factor: mixed source timeframe requires explicit asof sampling")
+	}
+	if spec.RefSymbol != "" && spec.Operator != opRefField {
+		return errors.New("factor: reference symbol is only valid on ref-field")
 	}
 	if spec.Kind != TS && spec.Kind != CS && spec.Kind != GROUP {
 		return errors.New("factor: invalid node kind")
@@ -431,7 +515,7 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 	}
 	expectedKind := TS
 	switch spec.Operator {
-	case "rank", "zscore", "winsorize", "quantile", "robust-zscore", "mad-winsorize":
+	case "rank", "pct-rank", "zscore", "winsorize", "quantile", "robust-zscore", "mad-winsorize", "cs-mean", "cs-sum":
 		expectedKind = CS
 	case "group-demean", "group-zscore", "residual", "multi-residual", "weighted-residual":
 		expectedKind = GROUP
@@ -469,14 +553,29 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 		if count != arity {
 			return fmt.Errorf("factor: %s requires %d dependencies", spec.Operator, arity)
 		}
-		if spec.Operator == "constant" {
+		switch spec.Operator {
+		case "constant":
 			if _, exists := spec.Parameters["value"]; !exists || len(spec.Parameters) != 1 {
 				return errors.New("factor: constant requires one declared value")
 			}
-		} else if len(spec.Parameters) != 0 {
-			return fmt.Errorf("factor: %s does not accept scalar parameters", spec.Operator)
+		case "clip":
+			lo, okLo := spec.Parameters["lo"]
+			hi, okHi := spec.Parameters["hi"]
+			if !okLo || !okHi || len(spec.Parameters) != 2 {
+				return errors.New("factor: clip requires lo and hi parameters")
+			}
+			if lo > hi {
+				return errors.New("factor: clip requires lo <= hi")
+			}
+		default:
+			if len(spec.Parameters) != 0 {
+				return fmt.Errorf("factor: %s does not accept scalar parameters", spec.Operator)
+			}
 		}
 		return nil
+	}
+	if handled, err := validateMTFOrRefNode(spec, count); handled {
+		return err
 	}
 	if spec.Operator == "field" {
 		if count != 0 || spec.Source == "" || spec.Field == "" {
@@ -526,7 +625,10 @@ func validateNode(spec NodeSpec, count int, custom bool) error {
 				return errors.New("factor: invalid ddof")
 			}
 		}
-	case "rank", "zscore", "robust-zscore":
+	case "rank", "pct-rank", "zscore", "robust-zscore", "cs-mean", "cs-sum":
+		if (spec.Operator == "pct-rank" || spec.Operator == "cs-mean" || spec.Operator == "cs-sum") && len(spec.Parameters) != 0 {
+			return fmt.Errorf("factor: %s does not accept scalar parameters", spec.Operator)
+		}
 	case "mad-winsorize":
 		if spec.Parameters["multiple"] <= 0 {
 			return errors.New("factor: positive MAD multiple required")

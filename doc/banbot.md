@@ -827,9 +827,14 @@ For research, remove `research: {labels: []}` from the example; the default labe
 | `Pow/Min/Max(a,b)` | `pow/min/max(a,b)` |
 | `Lag/Return/EMA(x,n)` | `ts.lag/return/ema(x,n)` |
 | `StdDev(x,n,ddof)` | `ts.std(x,n,ddof)` |
-| `SMA/RMA/WMA/RSI/ROC/MOM/CCI/Highest/Lowest(x,n)` | `ts.sma/rma/wma/rsi/roc/mom/cci/highest/lowest(x,n)` |
-| `VWMA(c,v,n)`, `TR(h,l,c)`, `ATR(h,l,c,n)` | `ts.vwma(c,v,n)`, `ts.tr(h,l,c)`, `ts.atr(h,l,c,n)` |
-| `Stoch/WillR(h,l,c,n)`, `OBV(c,v)`, `MFI(h,l,c,v,n)` | `ts.stoch/willr(h,l,c,n)`, `ts.obv(c,v)`, `ts.mfi(h,l,c,v,n)` |
+| `SMA/RMA/WMA/DecayLinear/DEMA/TEMA/HMA/KAMA/TRIMA/ER/Hurst/RSI/ROC/MOM/CCI/Highest/Lowest(x,n)` | `ts.sma/rma/wma/decay_linear/dema/tema/hma/kama/trima/er/hurst/rsi/roc/mom/cci/highest/lowest(x,n)` |
+| `ALMA(x,n,offset,sigma)`, `Kalman1D(x,q,r)`, `STC(x,f,s,c)` | `ts.alma(x,n[,offset,sigma])`, `ts.kalman1d(x,q,r)`, `ts.stc(x,f,s,c)` |
+| `VWMA(c,v,n)`, `TR(h,l,c)`, `ATR/NATR/ADX/PlusDI/MinusDI/CHOP(h,l,c,n)` | `ts.vwma([c,v,]n)`, `ts.tr([h,l,c])`, `ts.atr/natr/adx/dmi_plus/dmi_minus/chop([h,l,c,]n)` |
+| `AroonUp/Down/Osc(h,l,n)`, `VortexPlus/Minus(h,l,c,n)`, `DonchianUpper/Mid/Lower(h,l,n)` | `ts.aroon_up/aroon_down/aroon_osc([h,l,]n)`, `ts.vortex_plus/vortex_minus([h,l,c,]n)`, `ts.donchian_upper/donchian_mid/donchian_lower([h,l,]n)` |
+| `KeltnerUpper/Mid/Lower(h,l,c,n,m)`, `Supertrend/SupertrendDir(h,l,c,n,m)`, `SAR(h,l,s,i,m)`, `IchimokuConversion/Base(h,l,n)` | `ts.keltner_upper/keltner_mid/keltner_lower([h,l,c,]n,m)`, `ts.supertrend/supertrend_dir([h,l,c,]n,m)`, `ts.sar([h,l][,s,i,m])`, `ts.ichimoku_conversion/ichimoku_base([h,l,]n)` |
+| `Stoch/WillR(h,l,c,n)`, `OBV(c,v)`, `ADL(h,l,c,v)`, `MFI/CMF(h,l,c,v,n)`, `ChaikinOsc(h,l,c,v,f,s)` | `ts.stoch/willr([h,l,c,]n)`, `ts.obv([c,v])`, `ts.adl([h,l,c,v])`, `ts.mfi/cmf([h,l,c,v,]n)`, `ts.adosc([h,l,c,v,]f,s)` |
+| `VolumeDelta/CVD(v,bv)`, `RollingCVD/TakerBuyRatio(v,bv,n)` | `ts.volume_delta([v,bv])`, `ts.cvd([v,bv])`, `ts.rolling_cvd/taker_buy_ratio([v,bv,]n)` |
+| `ParkinsonVol(h,l,n)`, `GarmanKlassVol/YangZhangVol(o,h,l,c,n)` | `ts.parkinson_vol([h,l,]n)`, `ts.garman_klass_vol/yang_zhang_vol([o,h,l,c,]n)` |
 | `MACD(x,fast,slow,signal)` | `ts.macd/macd_signal/macd_hist(x,fast,slow,signal)` |
 | `BBands(x,n,up,down)` | `ts.bbands_upper/bbands_middle/bbands_lower(x,n,up,down)` |
 | `Rank/ZScore/RobustZScore(x)` | `cs.rank/zscore/robust_zscore(x)` |
@@ -840,7 +845,7 @@ For research, remove `research: {labels: []}` from the example; the default labe
 * Window arguments are integer constants or direct `param.name` references in [1,10000]; lag also permits 0. Expressions such as `param.window+1` are not window arguments. `ddof` must satisfy `0 <= ddof < n`; MACD requires `fast < slow`. Both nonnegative Bollinger multipliers are explicit.
 * `cs.rank` returns ascending, zero-based average ranks for ties, not percentiles. `cs.zscore` uses population standard deviation and returns zero for constant sections. `tail` is in [0,0.5), `q` in [0,1], and the MAD multiplier is positive. Robust z-score scales by `1.4826*MAD`.
 * Cross-sectional/regression statistics fit on frozen `Universe.Reference`. OLS/WLS include an intercept; WLS needs positive weights. Group fields retain raw types/NULL; the formula source argument is a binding alias.
-* Time series may precede cross-sectional transforms, e.g. `cs.rank(ts.rsi(kline.close,14))`. TS windows over CS/regression results are rejected, including through pointwise wrappers; zero lag is the identity exception.
+* Arbitrary acyclic multi-stage `TS <-> CS/GROUP` pipelines are supported (e.g. `cs.rank(ts.rsi(kline.close,14))`, `ts.sma(cs.pct_rank(kline.volume),5)`, `cs.zscore(ts.std(group.residual(ts.return(kline.close,1),kline.open),20,0))`); warmup accumulates across stages and zero lag is the identity.
 * `ts.return` is a ratio; `ts.roc` is a percentage. `max(x,1e-8)` bounds valid values and does not fill NULL, missing or warmup inputs. New technical indicators advance on complete valid tuples; lag/return/ema/std retain their individual contracts. `factor.MACD/BBands` return three nodes; distinguish them from the preceding banta signatures.
 
 Slow/event sources require explicit `asof` sampling onto the decision grid with a positive age bound. For example, add `funding: {source: funding, timeframe: event, sampling: asof, max_age_ms: 28800000}` to bindings and use `cs.zscore(-funding.rate)`; the input must provide that stream. Downstream windows count decision observations: 24 hourly samples are not 24 trading days.

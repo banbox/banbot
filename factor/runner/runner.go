@@ -87,6 +87,8 @@ type Config struct {
 	// Panel selects the research panel rows ("" or "all": one row per instrument and column at every decision,
 	// "none": no panel rows; events, run.json Summary and every ledger number are unaffected).
 	Panel string `json:",omitempty"`
+	// RollingUniverse configures point-in-time rolling liquidity universe reconstitution over the candidate superset.
+	RollingUniverse *factor.RollingUniverseConfig `json:",omitempty"`
 	// observe collects state of strategy builders created for this run (see runObservers).
 	observe *runObservers
 }
@@ -190,6 +192,7 @@ const maxUniverseDropLog = 2000
 type evaluation struct {
 	label             research.LabelSpec
 	frame             factor.Frame
+	universe          factor.Universe
 	begin, end        map[int32]backtest.Quote
 	weights, previous map[int32]float64
 	deadline          int64
@@ -372,6 +375,10 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 	result.ManifestID = engine.manifest.ID()
 	result.StrategyHash = engine.manifest.StrategyHash()
 	result.Manifest = engine.manifest.Spec()
+	rolling, err := newRunnerRollingUniverse(c, plan)
+	if err != nil {
+		return result, err
+	}
 	var book *backtest.Book
 	if c.Mode == Weights {
 		book, err = backtest.NewBook(c.InitialNAV)
@@ -390,6 +397,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			book.SetPITDelistPenaltyBps(c.PITDelistPenaltyBps)
 		}
 		result.UniverseNominal = len(c.Snapshot.Universe.Investable)
+		if rolling != nil {
+			result.UniverseNominal = min(len(rolling.Candidates()), rolling.Config().TopN)
+		}
 	}
 	pairLegs := c.PITPairs
 	if len(pairLegs) == 0 {
@@ -401,7 +411,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 		}
 		return backtest.State{}
 	}
-	policy, err := newPolicyRun(c)
+	policy, err := newPolicyRun(c, combo.Columns...)
 	if err != nil {
 		return result, err
 	}
@@ -479,8 +489,12 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				i++
 				continue
 			}
-			labels := make([]research.Label, 0, len(c.Snapshot.Universe.Evaluation))
-			for _, sid := range c.Snapshot.Universe.Evaluation {
+			evalUniv := e.universe
+			if evalUniv.Version == "" {
+				evalUniv = c.Snapshot.Universe
+			}
+			labels := make([]research.Label, 0, len(evalUniv.Evaluation))
+			for _, sid := range evalUniv.Evaluation {
 				begin := e.begin[sid]
 				end := e.end[sid]
 				bAt := begin.AtMS
@@ -500,7 +514,7 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				}
 				labels = append(labels, l)
 			}
-			report, err := research.Evaluate(e.frame, c.Snapshot.Universe, labels, research.EvaluationSpec{AsOf: now, PrimaryLabel: e.label.Name, CostRate: c.Manifest.Costs.FeeRate + c.Manifest.Costs.SlippageRate, CurrentWeights: e.weights, PreviousWeights: e.previous, PreviousColumns: e.previousColumns})
+			report, err := research.Evaluate(e.frame, evalUniv, labels, research.EvaluationSpec{AsOf: now, PrimaryLabel: e.label.Name, CostRate: c.Manifest.Costs.FeeRate + c.Manifest.Costs.SlippageRate, CurrentWeights: e.weights, PreviousWeights: e.previous, PreviousColumns: e.previousColumns})
 			if err != nil {
 				return err
 			}
@@ -539,6 +553,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			return result, err
 		}
 		defer func() { runErr = errors.Join(runErr, input.Close()) }()
+		if err = seedArchiveRollingUniverse(c, chunk, rolling); err != nil {
+			return result, err
+		}
 		driver := newReplayInput(input, c, chunk)
 		for {
 			batch, nextErr := driver.Next(ctx)
@@ -580,6 +597,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				return result, err
 			}
 			lastTime = now
+			if rolling != nil && len(batch.Records) > 0 {
+				rolling.Observe(batch.Records, now-c.DecisionDelayMS, now, c.Snapshot.ReplayTime)
+			}
 			// Price availability and explicit funding settlements precede decisions at
 			// equal timestamps. Such prices cannot execute that new decision.
 			for _, r := range batch.Records {
@@ -872,16 +892,99 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if spec.ReplayTime != 0 {
 				spec.ReplayTime = now
 			}
-			req := requirements(plan, spec.Universe, grid)
+			visible, err := input.Visible(ctx, grid, now, spec.ReplayTime)
+			if err != nil {
+				return result, err
+			}
+			var rollingDiag *factor.Diagnostic
+			if rolling != nil {
+				rolling.Observe(visible, grid, now, spec.ReplayTime)
+				alive := rollingAliveSIDs(plan, rolling.Candidates(), visible, grid, now, spec.ReplayTime)
+				rolledUniv, reconstituted := rolling.Select(grid, alive, decisionWarming)
+				spec.Universe = rolledUniv
+				spec.TrackedQuotesOnly = false
+				if !decisionWarming {
+					if deadHeld := rollingDeadHeldSIDs(book, pending, executed, policy, rolledUniv.Investable, alive); len(deadHeld) > 0 {
+						exited := book.ExitAtLastMark(deadHeld, c.Manifest.Costs.FeeRate, c.Manifest.Costs.SlippageRate)
+						if pending, err = backtest.DropTargets(pending, deadHeld); err != nil {
+							return result, err
+						}
+						if executed, err = backtest.DropTargets(executed, deadHeld); err != nil {
+							return result, err
+						}
+						result.DelistExits += len(exited)
+						if policy != nil {
+							if forgetter, ok := policy.policy.(factor.AssetForgetter); ok {
+								if _, external := sink.(PolicySink); !external {
+									if policyPending != nil {
+										result.Skipped++
+										policyPending = nil
+									}
+									if err = book.ForgetPolicyAssets(deadHeld, forgetter.ForgetAssets); err != nil {
+										return result, err
+									}
+								}
+							}
+						}
+					}
+					if reconstituted {
+						pitAlive = len(rolledUniv.Investable)
+						rollingDiag = &factor.Diagnostic{Code: "rolling-universe-reconstitute", Detail: "reconstituted point-in-time liquid universe"}
+					}
+					if len(rolledUniv.Investable) < 2 {
+						if len(rolledUniv.Tracked) > 0 {
+							warmSpec := spec
+							warmSpec.Universe = factor.Universe{
+								Version:    rolledUniv.Version + "#warm",
+								Investable: rolledUniv.Tracked,
+								Reference:  rolledUniv.Tracked,
+								Tradable:   rolledUniv.Tracked,
+								Evaluation: rolledUniv.Tracked,
+								Tracked:    rolledUniv.Tracked,
+								Static:     false,
+							}
+							warmReq, reqErr := requirements(plan, warmSpec, grid)
+							if reqErr != nil {
+								return result, reqErr
+							}
+							warmToken, wErr := barrier.Begin(plan.Hash(), warmSpec, warmReq, now+c.ExpiryMS)
+							if wErr == nil {
+								warmReqSet := make(map[factor.StreamKey]bool, len(warmReq))
+								for _, r := range warmReq {
+									warmReqSet[factor.StreamKey{SID: r.SID, Source: r.Source, TimeFrame: r.TimeFrame}] = true
+								}
+								for _, r := range visible {
+									if warmReqSet[factor.StreamKey{SID: r.Series.Sid, Source: r.Series.Source, TimeFrame: r.Series.TimeFrame}] {
+										_ = barrier.Observe(warmToken, r, now)
+									}
+								}
+								if warmSnap, fErr := barrier.Freeze(warmToken, now); fErr == nil {
+									_, _ = engine.evaluate(ctx, warmSnap)
+								}
+							}
+						}
+						result.PausedPeriods++
+						if c.timeline != nil {
+							c.timeline.leave()
+						}
+						continue
+					}
+				} else if len(rolledUniv.Investable) == 0 {
+					if c.timeline != nil {
+						c.timeline.leave()
+					}
+					continue
+				}
+			}
+			req, reqErr := requirements(plan, spec, grid)
+			if reqErr != nil {
+				return result, reqErr
+			}
 			requested := map[factor.StreamKey]bool{}
 			for _, r := range req {
 				requested[factor.StreamKey{SID: r.SID, Source: r.Source, TimeFrame: r.TimeFrame}] = true
 			}
 			token, err := barrier.Begin(plan.Hash(), spec, req, now+c.ExpiryMS)
-			if err != nil {
-				return result, err
-			}
-			visible, err := input.Visible(ctx, grid, now, spec.ReplayTime)
 			if err != nil {
 				return result, err
 			}
@@ -973,12 +1076,16 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 						}
 						pitSpec := spec
 						pitSpec.Universe = reduced
-						pitToken, beginErr := barrier.Begin(plan.Hash(), pitSpec, requirements(plan, reduced, grid), now+c.ExpiryMS)
+						pitReqs, pitReqErr := requirements(plan, pitSpec, grid)
+						if pitReqErr != nil {
+							return result, pitReqErr
+						}
+						pitToken, beginErr := barrier.Begin(plan.Hash(), pitSpec, pitReqs, now+c.ExpiryMS)
 						if beginErr != nil {
 							return result, beginErr
 						}
 						pitRequested := map[factor.StreamKey]bool{}
-						for _, r := range requirements(plan, reduced, grid) {
+						for _, r := range pitReqs {
 							pitRequested[factor.StreamKey{SID: r.SID, Source: r.Source, TimeFrame: r.TimeFrame}] = true
 						}
 						for _, r := range visible {
@@ -1083,6 +1190,9 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 			if err != nil {
 				return result, err
 			}
+			if policy != nil {
+				policy.observeSnapshot(c, plan, snapshot, visible, quotes, grid, now)
+			}
 			if c.SourceEventDecisions {
 				lastSourceGrid = grid
 			}
@@ -1129,6 +1239,18 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				return result, err
 			}
 			diags = append(diags, pdiag...)
+			if rolling != nil && policy == nil {
+				var rdiag []factor.Diagnostic
+				pSpec := engine.portfolioSpec(frame, spec.Universe, sequence, nav, now+c.LatencyMS, now+c.ExpiryMS)
+				p, rdiag, err = ensureRollingGracefulExit(p, executed, book, spec.Universe, pSpec)
+				if err != nil {
+					return result, err
+				}
+				diags = append(diags, rdiag...)
+			}
+			if rollingDiag != nil {
+				diags = append(diags, *rollingDiag)
+			}
 			if pitDiag != nil {
 				diags = append(diags, *pitDiag)
 			}
@@ -1192,8 +1314,12 @@ func Run(ctx context.Context, c Config, sink Sink, out Output) (result Result, r
 				if policy != nil {
 					weights = policyWeights
 				}
+				evalUniv := c.Snapshot.Universe
+				if rolling != nil {
+					evalUniv = spec.Universe
+				}
 				for _, label := range c.Manifest.Labels {
-					e := &evaluation{label: label, frame: frame, begin: map[int32]backtest.Quote{}, end: map[int32]backtest.Quote{}, previous: previousWeights, weights: weights, deadline: now + c.ExpiryMS + label.Horizon + c.LabelWaitMS, previousColumns: previousColumns}
+					e := &evaluation{label: label, frame: frame, universe: evalUniv, begin: map[int32]backtest.Quote{}, end: map[int32]backtest.Quote{}, previous: previousWeights, weights: weights, deadline: now + c.ExpiryMS + label.Horizon + c.LabelWaitMS, previousColumns: previousColumns}
 					evaluations = append(evaluations, e)
 				}
 				if weights != nil {
@@ -1315,21 +1441,44 @@ func runAssumptions(c Config) (string, error) {
 	hash := sha256.Sum256(body)
 	return hex.EncodeToString(hash[:]), nil
 }
-func requirements(plan *factor.Plan, u factor.Universe, at int64) []factor.Requirement {
-	ids := append(append([]int32{}, u.Reference...), u.Investable...)
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	seen := map[int32]bool{}
+func requirements(plan *factor.Plan, spec factor.SnapshotSpec, at int64) ([]factor.Requirement, error) {
+	u := spec.Universe
+	baseIDs := append(append([]int32{}, u.Reference...), u.Investable...)
+	if !spec.TrackedQuotesOnly && len(u.Tracked) > 0 {
+		baseIDs = append(baseIDs, u.Tracked...)
+	}
+	sort.Slice(baseIDs, func(i, j int) bool { return baseIDs[i] < baseIDs[j] })
 	out := []factor.Requirement{}
-	for _, sid := range ids {
-		if seen[sid] {
-			continue
+	for _, in := range plan.ScopedInputs() {
+		sids := make([]int32, 0, len(baseIDs)+len(in.RefSymbols))
+		if in.AllAssets {
+			sids = append(sids, baseIDs...)
 		}
-		seen[sid] = true
-		for _, in := range plan.Inputs() {
-			out = append(out, factor.Requirement{SID: sid, Source: in.Source, TimeFrame: in.TimeFrame, EventTime: at, AsOfLatest: in.AsOfLatest, MaxAge: in.MaxAge})
+		for _, sym := range in.RefSymbols {
+			refSID, ok := spec.ResolveSymbolSID(sym)
+			if !ok {
+				return nil, fmt.Errorf("factor: reference symbol %q missing from snapshot SIDMap", sym)
+			}
+			sids = append(sids, refSID)
+		}
+		sort.Slice(sids, func(i, j int) bool { return sids[i] < sids[j] })
+		seen := map[int32]bool{}
+		for _, sid := range sids {
+			if seen[sid] {
+				continue
+			}
+			seen[sid] = true
+			out = append(out, factor.Requirement{
+				SID:        sid,
+				Source:     in.Source,
+				TimeFrame:  in.TimeFrame,
+				EventTime:  at,
+				AsOfLatest: in.AsOfLatest,
+				MaxAge:     in.MaxAge,
+			})
 		}
 	}
-	return out
+	return out, nil
 }
 func copyQuotes(src map[int32]backtest.Quote) map[int32]backtest.Quote {
 	dst := make(map[int32]backtest.Quote, len(src))

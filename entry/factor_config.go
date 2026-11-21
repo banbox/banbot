@@ -40,6 +40,20 @@ func decodeFactorFields(fields map[string]any, target any) error {
 			if from != nil && (from.Kind() == reflect.Float32 || from.Kind() == reflect.Float64) && to.Kind() >= reflect.Int && to.Kind() <= reflect.Int64 {
 				return nil, fmt.Errorf("integer configuration field cannot accept a floating point value")
 			}
+			if to == reflect.TypeOf((*float64)(nil)) && value != nil {
+				v := reflect.ValueOf(value)
+				switch v.Kind() {
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					f := float64(v.Int())
+					return &f, nil
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					f := float64(v.Uint())
+					return &f, nil
+				case reflect.Float32, reflect.Float64:
+					f := v.Float()
+					return &f, nil
+				}
+			}
 			if to == reflect.TypeOf(decimal.Decimal{}) {
 				switch n := value.(type) {
 				case string:
@@ -128,7 +142,7 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 		fields := make(map[string]any)
 		for key, value := range policy.Factor {
 			switch key {
-			case "archive", "portfolio", "decision", "research":
+			case "archive", "portfolio", "decision", "research", "universe", "rolling_universe":
 			default:
 				fields[key] = value
 			}
@@ -136,8 +150,31 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 		if err := decodeFactorFields(fields, &c); err != nil {
 			return nil, fmt.Errorf("factor %s: %w", policy.Name, err)
 		}
+		if policy.Factor["universe"] != nil && policy.Factor["rolling_universe"] != nil {
+			return nil, fmt.Errorf("factor %s: universe and rolling_universe cannot both be set", policy.Name)
+		}
+		for _, uKey := range []string{"universe", "rolling_universe"} {
+			if rawUniv, ok := policy.Factor[uKey].(map[string]any); ok {
+				var rc factor.RollingUniverseConfig
+				if err := decodeFactorFields(rawUniv, &rc); err != nil {
+					return nil, fmt.Errorf("factor %s %s: %w", policy.Name, uKey, err)
+				}
+				c.RollingUniverse = &rc
+			}
+		}
 		if portfolio, ok := policy.Factor["portfolio"].(map[string]any); ok {
-			if err := decodeFactorFields(portfolio, &c.Manifest.Portfolio); err != nil {
+			if portfolio["universe"] != nil && portfolio["rolling_universe"] != nil {
+				return nil, fmt.Errorf("factor %s: portfolio.universe and portfolio.rolling_universe cannot both be set", policy.Name)
+			}
+			portfolioCopy := make(map[string]any, len(portfolio))
+			for k, v := range portfolio {
+				if k == "rolling_universe" {
+					portfolioCopy["universe"] = v
+				} else {
+					portfolioCopy[k] = v
+				}
+			}
+			if err := decodeFactorFields(portfolioCopy, &c.Manifest.Portfolio); err != nil {
 				return nil, err
 			}
 			if err := c.Manifest.Portfolio.ValidatePolicy(); err != nil {
@@ -443,13 +480,13 @@ func deriveArchivePrice(c *runner.Config) error {
 }
 
 func inspectArchiveChunk(c *runner.Config, index int, sids map[int32]bool, schemas map[string]map[string]string) error {
-	var inputs []factor.InputSpec
+	var inputs []factor.ScopedInputSpec
 	if sids != nil {
 		plan, _, err := runner.CompileDefinition(*c)
 		if err != nil {
 			return err
 		}
-		inputs = plan.Inputs()
+		inputs = plan.ScopedInputs()
 	}
 	store, err := factor.OpenVersionStore(c.Chunks[index].Path, c.MaxRecords)
 	if err != nil {
@@ -467,14 +504,18 @@ func inspectArchiveChunk(c *runner.Config, index int, sids map[int32]bool, schem
 		from = min(from, row.EventTime)
 		to = max(to, row.EventTime)
 		if sids != nil {
+			if c.Snapshot.SIDMap[row.Series.Sid] == "" {
+				if row.Series.ExSymbol != nil && row.Series.ExSymbol.Symbol != "" {
+					c.Snapshot.SIDMap[row.Series.Sid] = row.Series.ExSymbol.Symbol
+				} else {
+					c.Snapshot.SIDMap[row.Series.Sid] = fmt.Sprintf("sid:%d", row.Series.Sid)
+				}
+			}
 			for _, input := range inputs {
-				if input.Source == row.Series.Source && input.TimeFrame == row.Series.TimeFrame {
+				if input.AllAssets && input.Source == row.Series.Source && input.TimeFrame == row.Series.TimeFrame {
 					sids[row.Series.Sid] = true
 					break
 				}
-			}
-			if c.Snapshot.SIDMap[row.Series.Sid] == "" {
-				c.Snapshot.SIDMap[row.Series.Sid] = fmt.Sprintf("sid:%d", row.Series.Sid)
 			}
 			if version := c.Snapshot.SourceVersions[row.Series.Source]; version != "" && version != row.SourceVersion {
 				return fmt.Errorf("factor: source version changes require explicit PIT schema: %s", row.Series.Source)

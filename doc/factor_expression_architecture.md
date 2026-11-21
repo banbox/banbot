@@ -45,7 +45,7 @@ flowchart TD
 
 `expr.Spec` 包含 schema 版本、决策周期、数据源绑定、数值参数、`lets`、`outputs` 和组合配置。绑定别名与数据源名称可以不同；例如 `kline.close` 中的 `kline` 是绑定别名，最终节点保存绑定的真实 source、field 与周期。
 
-解析器使用 Go 标准库 `text/scanner`，按优先级生成包含位置的 AST。`* /` 高于 `+ -`，二元运算左结合，支持一元正负号和嵌套函数。名称必须显式属于 `alias.field`、`factor.name` 或 `param.name`；特殊字段名通过 `field("alias", "some-key")` 表达。参数在编译时绑定为有限数值，窗口参数还必须满足整数和范围限制。
+解析器使用 Go 标准库 `text/scanner`，按优先级生成包含位置的 AST。`* /` 高于 `+ -`，`+ -` 高于比较 `> >= < <=`，二元运算左结合，支持一元正负号和嵌套函数。名称必须显式属于 `alias.field`、`factor.name` 或 `param.name`；特殊字段名通过 `field("alias", "some-key")` 表达。参数在编译时绑定为有限数值，窗口参数还必须满足整数和范围限制。
 
 `lets` 和 `outputs` 属于同一个定义集合，可以前向引用，不能同名或形成循环。编译器会解析和校验所有声明，包括未使用的中间项；最终只将输出可达的节点交给完整计划。因此，一个未使用但非法的 `let` 仍会报错，一个未使用的合法字段引用不会增加最终订阅。`Plan.Inputs()` 汇总实际可达节点的 source、timeframe、字段和采样要求。
 
@@ -76,7 +76,7 @@ flowchart TD
 
 原始整数类型仍被保留，但转成 float64 的派生视图可能损失大整数精度，不能用它替代 SID 或精确标识。字符串和布尔值不自动转数值。当前 `Null` 的判定是接口值为 `nil`，不要将任意 typed nil 都理解为同一数值状态。
 
-Session 和 Batch 共用 `evaluatePointwise`：多输入按声明顺序传播第一个无效输入；除零、非法对数/平方根、非正值经 `positive` 过滤及计算溢出产生 `NonFinite`。`max(x, epsilon)` 不填补 NULL，也不会改变缺失原因。派生 JSON 对无效数值编码为 `null` 并保留 validity。
+Session 和 Batch 共用 `evaluatePointwise`：普通多输入算子按声明顺序传播第一个无效输入；`where(cond, a, b)`（及别名 `if_else`）先检查 `cond` 是否有效，当 `cond > 0` 为真时只要求 `a` 有效、否则只要求 `b` 有效，未选中分支的域错误（如 `log(x)` 在 `x <= 0` 时的 `NonFinite`）不会污染输出；除零、非法对数/平方根、非正值经 `positive` 过滤及计算溢出产生 `NonFinite`。`max(x, epsilon)` 与 `clip` 不填补 NULL，也不会改变缺失原因。派生 JSON 对无效数值编码为 `null` 并保留 validity。
 
 窗口算子的缺样本和初始化规则由对应 banta 内核及适配逻辑决定，不能因为 `MissingPolicy` 标记为 `skip-invalid` 就认为所有窗口都按同一种有效样本计数。特别是 Batch 的 EMA 使用有效值压缩视图计算，再恢复原时间位置，以对齐 Session 的初始化规则。
 
@@ -88,7 +88,7 @@ Session 和 Batch 共用 `evaluatePointwise`：多输入按声明顺序传播第
 
 `GridTime` 是逻辑观察时间，`DecisionTime` 是实际可见性截止时间，两者允许不同。屏障检查每个要求的流是否到达、是否为目标已闭合事件或满足 asof 时效；数据流已到达但字段 NULL 与整个数据流未到达是两种情况。只有 Ready 快照可以执行。
 
-同周期默认字段使用 source-events，要求当前网格的已闭合事件。不同周期源必须显式绑定 `asof`/`asof-latest` 和正 `max_age_ms`，转换为决策周期的 `AsOfField`。asof 读取网格之前、截止时间已可见且未超龄的最新记录；之后的窗口每个决策观察推进一次，重复读取同一个源事件也算一次观察。
+同周期默认字段使用 source-events，要求当前网格的已闭合事件。不同周期或事件源可通过叶节点 `asof`/`asof-latest`（`AsOfField`，其后窗口按决策观察推进），或通过源周期求值节点 `mtf.asof`/`asof_tf`（`AsOfNode`/`SubTF`，子图在源周期独立 `ta.BarEnv` / 压缩闭合步序列上仅随新闭合源 bar 步进后再做因果 `AsOf` 投影）；特定参考标的通过 `ref.field`（`RefAssetField`/`AsOfRefAssetField`）经快照 `SIDMap` 解析并向活跃截面广播。
 
 ### Session 与 Batch
 
@@ -100,7 +100,7 @@ Session 为每个活跃 SID 保存 banta 环境及各节点 Series，通过锁�
 
 beta.7 新增的技术指标使用独立版本及完整有效输入元组：多输入的任意一项无效时不推进该节点，恢复有效后继续。每个节点保存自己的有界输入 Series，避免 banta 底层缓存省略辅助输入身份而串扰；候选 Session 复制时同时重映射这些 Series。MACD 与布林带按输出分别建标量节点，预热及单位详见 [指标指南](factor_indicators.md)。旧 lag/return/EMA/std 的节点身份与数值规则保持兼容。
 
-Batch 必须给出显式 `maxRows`，从已知起点计算一段完整历史，静态池使用 tav 时序内核和同一截面/逐点实现。它按消费者计数释放不再需要的中间列，返回的历史 Frames 仍由调用者持有。动态 Universe 会回退到同一新 Session 连续回放。跨块延续 EMA 等状态应复用 Session，不能对每块重新调用 Batch 并期待与整段结果一致。
+Batch 必须给出显式 `maxRows`，从已知起点计算一段完整历史，按 `Plan` 的拓扑阶段（`StageTS`/`StageCS`）交替求值：`StageTS` 按各标的连续活跃区间使用 `tav` 时序内核与共用逐点求值器，`StageCS` 在各时刻调用同一截面/分组实现（同时支持静态与动态 PIT Universe）。它按消费者计数释放不再需要的中间列，返回的历史 Frames 仍由调用者持有。跨块延续 EMA 等状态应复用 Session，不能对每块重新调用 Batch 并期待与整段结果一致。
 
 实盘通过 [`RoundBarrier`](../factor/barrier.go) 处理 generation、冻结、取消及发布。候选计算 fork 有界 Session 状态，只有当前有效回合才能 commit；克隆失败、过期或取消不得推进 live owner。新增递归状态必须满足安全克隆契约。
 
@@ -128,7 +128,7 @@ Frame 保存时间、SnapshotID、PlanHash 及命名因子列。runner 在 Frame
 
 表达式编译有明确静态边界，见 [parser.go](../factor/expr/parser.go)：单式最多 16 KiB，总表达式文本 256 KiB，所有声明的 AST 总计最多 8192 节点，深度上限 64；lets+outputs、bindings、params 各组最多 512 项，窗口最大 10000。深度还检查展开后的引用 DAG。独立 CLI spec 文件最大 1 MiB，仅接受一个 YAML 文档并拒绝未知字段。这些是语法和结构上限，不是峰值内存 admission 或全链路吞吐保证。
 
-当前语言没有比较、条件、循环、模块导入、任意代码调用，也拒绝对含 CS/GROUP 结果的输入再做非零 TS 窗口。分类分组通过已开放的 `group.demean/zscore` 表达。Go builder/policy 的能力范围与表达式白名单不同。执行侧另有 Batch 行数、标签队列行/列、IC 历史窗口、policy checkpoint 和近期接纳缓存限制；大量输出还会增加 Frame map、标签副本和研究列间两两相关的成本，不能只看解析节点数估算资源。
+当前语言没有循环、模块导入或任意代码调用；允许任意无环多阶段 `TS ↔ CS/GROUP` 嵌套（按 `StageTS`/`StageCS` 拓扑阶段交替求值）。分类分组通过已开放的 `group.demean/zscore` 表达。Go builder/policy 的能力范围与表达式白名单不同。执行侧另有 Batch 行数、标签队列行/列、IC 历史窗口、policy checkpoint 和近期接纳缓存限制；大量输出还会增加 Frame map、标签副本和研究列间两两相关的成本，不能只看解析节点数估算资源。
 
 ## 8. 持仓状态与研究产物的边界
 

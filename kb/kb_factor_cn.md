@@ -30,6 +30,7 @@
 | `funding_source` | 资金费流 source 名（存储回放下 `storage`/`required-stream` 未显式指定时默认内置 `"funding_rate"`，按对应周期订阅 `rate` 字段；归档 `required-stream` 必填或自动推导 `funding`） |
 | `option_expiry_source` `terminal_settlement_source` | 期权到期 / 终局结算流 source，见 7.2 |
 | `pit_min_universe_ratio` `pit_delist_penalty_bps` | 回测 PIT 参数：`pit_min_universe_ratio`（≤1，0=默认 0.5，<0 关闭 PIT 缩减）为一轮内至少保留的 Investable 比例，分母是上一次被接受决策时的存活数（滚动，首个决策用名义池）；`pit_delist_penalty_bps`（有限数，0=默认 100，<0 关）为被剔持仓平仓时额外的不利惩罚 bp，数据恢复则退回并改按缺口前后更差价计价 |
+| `universe`（别名 `rolling_universe`，也可写在 `portfolio.universe`） | 时点滚动流动性宇宙重组：`{mode: rolling_liquid_top, top_n, lookback_days|lookback_bars, min_listing_days|min_age_bars, reconstitute_days|reconstitute_bars|schedule, always_include}`；默认 `lookback_days: 30`（优先 `quote`，回退 `close*volume`）、`min_listing_days: 14`（`<0` 关闭）、`reconstitute_days: 30`（或 `schedule: daily|weekly|monthly` UTC），在候选超集 `pairs` 上严格按 `≤ t` 可见 K 线定时重选前 `top_n` 进入 `Investable`，未入选但已上市候选后台预热时序指标，退池持仓在下一步自动平仓至 0 |
 | `initial_nav` | 策略初始 NAV（正数）；缺省 `wallet_amounts[manifest.currency]`，无则 10000；再乘 `capital_weight` |
 | `max_records` | 每批最大记录数，缺省 100000；被 `data.max_records` 覆盖 |
 | `expressions` `combo` `decision` `research` `portfolio` `manifest` `snapshot` | 见第 2 节、1.4–1.6、4.2、1.9 |
@@ -72,7 +73,7 @@ Events 归档回放最小示例：`execution: {mode: events, funding_policy: exp
 
 `method`（`equal|fixed|history-ic|history-rank-ic|history-icir|history-rank-icir|history-ewma`）、`columns`、`weights`（map，`fixed` 必填且覆盖全部 columns）、`label`、`min_samples`、`min_pairs`、`min_confidence`、`decay`（EWMA alpha，[0,1]，0 视为 0.2）、`direction`（`signed|positive`）、`fallback`（`equal|fixed|error`）。
 
-- `columns` 不得重复且须是输出名；**`expressions.combine` 可省 columns（默认全部输出），外层 `combo` 必须写（缺则 `expression combine requires columns`）**（外层 `combo.method` 非空时整体覆盖内层）。
+- `columns` 不得重复且须是输出名；**`expressions.combine` 可省 columns（默认除 `exposure_scale`/`long_scale`/`short_scale`/`volatility`/`beta` 及 `allocation.volatility_column`/`beta_column` 保留列外的全部输出），外层 `combo` 必须写（缺则 `expression combine requires columns`）**（外层 `combo.method` 非空时整体覆盖内层）。
 - `equal`：列等权；`fixed`：权重直接线性相加，允许负数，不归一化。非零权重列对某资产无效 → 该资产分数无效，不重分配；零权重列不影响有效性。
 - 历史方法只用已成熟、决策时可见、`DecisionTime<asof` 的 IC 样本（窗口保留最近 256 个截面，样本须 ≥2 对；`min_pairs` 可提高）；`rank` 变体用 RankIC，`icir` 用 mean/std，`ewma` 用 `decay`；`min_samples` 至少 1；`min_confidence` 为 |均值|/标准误 门槛（需 ≥2 样本、均值非 0，无多重检验校正，重叠样本 ICIR 仅描述性）；`direction: positive` 把负权重截为 0；权重按 Σ|w|=1 归一；无合格历史按 `fallback`：`equal`（默认，诊断 `ic-equal-fallback`）、`fixed`（用 `weights`）、`error`。
 - 历史方法必须有标签（`research.labels` 非空）；多标签省略 `label` 取最短 horizon（同期限按名称），`label` 须已声明。
@@ -139,22 +140,29 @@ expressions:
 ```
 
 - `banbot validate|explain --spec f.yml` 输出相同，JSON 键 `hash timeframe outputs nodes warmup retention inputs combine`；不验数据/账户。文件须单 YAML 文档、≤1 MiB、未知顶层键报错。
-- 标识符 `[A-Za-z_][A-Za-z0-9_]*`；binding 名不得用 `factor param label ts cs group`。名字可前向引用，不允许环；未使用的声明也校验；禁用 `label.*`。
+- 标识符 `[A-Za-z_][A-Za-z0-9_]*`；binding 名不得用 `factor param label ts cs group mtf ref`。名字可前向引用，不允许环；未使用的声明也校验；禁用 `label.*`。
 - 限制：单表达式 ≤16 KiB，总 ≤256 KiB，AST ≤8192 节点，深度 ≤64，声明 ≤512，窗口 ≤10000。含 `"` 的表达式用 YAML 单引号：`'group.demean(x, "info", "sector")'`。
-- binding：`sampling` 缺省或 `source-events` 时 `timeframe` 须等于决策周期且 `max_age_ms=0`；`asof`/`asof-latest` 须 `max_age_ms>0`，慢频/event 源必须用它采样到决策网格；`asof` 后窗口按**决策观察次数**计（24 个小时观察≠24 个交易日）。跨周期未 asof 报 `cross-timeframe data requires asof sampling and positive max_age_ms`。
-- `alias.field` 读字段；`field("alias","name")` 用于特殊字段名（两参数须字符串字面量）。
+- binding：`sampling` 缺省或 `source-events` 时 `timeframe` 须等于决策周期且 `max_age_ms=0`；`asof`/`asof-latest` 须 `max_age_ms>0`，慢频/event 源用它在字段叶节点采样到决策网格（叶节点 `asof` 后的窗口按**决策观察次数**计）；若需在慢频 K 线（如 `1d`、`4h`）上按原生源周期闭合 bar 推进指标再因果对齐到决策网格，用 `mtf.asof("1d", expr[, max_stale_ms])`（无需额外声明 `1d` binding）。跨周期未走 `asof` 或 `mtf.asof` 报 `cross-timeframe data requires asof sampling and positive max_age_ms`。
+- `alias.field` 读字段；声明 `kline` 绑定时支持裸字段简写 `open high low close volume buy_volume`（自动跟随当前周期作用域）；`field("alias","name")` 用于特殊字段名（两参数须字符串字面量）。
 
 ### 2.2 语法与函数
 
-运算 `+ - * /`（`*/` 优先，左结合）、一元 `+ -`、括号；数字十进制（可科学计数法 `1e-8`），无下划线/十六进制；无比较、条件、`%`、`**`；字符串仅用于 `field`/`group.demean/zscore`。窗口参数为整数常数（可带符号）或 `param.name`（不能写 `param.window+1`），范围 [1,10000]，`ts.lag` 另允许 0。
+运算 `+ - * /`、比较 `> >= < <=`（优先级 `* /` > `+ -` > `> >= < <=`，左结合）、一元 `+ -`、括号；数字十进制（可科学计数法 `1e-8`），无下划线/十六进制；无 `%`、`**`、`&&`/`||`；字符串仅用于 `field`/`group.demean/zscore`。窗口参数为整数常数（可带符号）或 `param.name`（不能写 `param.window+1`），范围 [1,10000]（`ts.hma`/`ts.chop`/`ts.yang_zhang_vol` 为 [2,10000]，`ts.skew` 为 [3,10000]，`ts.kurt` 为 [4,10000]，`ts.hurst` 为 [8,10000]），`ts.lag` 另允许 0。
 
-- 逐点：`positive(x)`（x>0 取 x 否则无效，**不做下界截断**）、`abs log sqrt (x)`、`pow min max (a,b)`。
-- 时序（x 为输入；n 窗口）：`ts.lag(x,n)`（n=0 原样返回，不计入窗口规则）、`ts.return(x,n)`=x_t/x_{t-n}-1、`ts.ema/sma/rma/wma(x,n)`（指数/简单/Wilder/加权，wma 最新权重 n）、`ts.std(x,n,ddof)`（整数 `0≤ddof<n`）、`ts.rsi(x,n)`（Wilder，0–100）、`ts.roc(x,n)`（百分比，×100）、`ts.mom(x,n)`（与 n 个有效样本前的差）、`ts.cci(x,n)`、`ts.highest/lowest(x,n)`、`ts.vwma(c,v,n)`、`ts.tr(h,l,c)`（首个有效前收为预热）、`ts.atr(h,l,c,n)`（Wilder）、`ts.stoch(h,l,c,n)`（原始 %K 无 D 平滑）、`ts.willr(h,l,c,n)`（-100–0）、`ts.obv(c,v)`（首值取首个有效 volume，相等收盘不变）、`ts.mfi(h,l,c,v,n)`、`ts.macd/macd_signal/macd_hist(x,f,s,g)`（f<s，f/s/g∈[1,10000]）、`ts.bbands_upper/middle/lower(x,n,up,down)`（总体标准差，倍数非负且显式）。
-- 截面：`cs.rank(x)`（升序名次，0 起，并列平均，非百分位）、`cs.zscore(x)`（总体标准差；全同输出 0）、`cs.robust_zscore(x)`=(x−中位数)/(1.4826·MAD)（MAD=0 输出 0）、`cs.winsorize(x,tail)`（tail∈[0,0.5)，上下界为参考池插值分位数）、`cs.mad_winsorize(x,k)`（中位数 ± k·1.4826·MAD，k>0；MAD=0 全截到中位数）、`cs.quantile(x,q)`（q∈[0,1]；**输出截面常数**，参考池 q 分位广播，只适合阈值/分组，不能排名）。
+- 逐点：`positive(x)`（x>0 取 x 否则无效，**不做下界截断**）、`sign(x)`（>0→1，<0→-1，==0→0）、`clip(x,lo,hi)`（有限常数或 `param.name` 且 `lo<=hi`，钳制有效值到 `[lo,hi]`）、`abs log sqrt (x)`、`pow min max (a,b)`、比较 `a > b`/`a >= b`/`a < b`/`a <= b` 或 `gt ge lt le (a,b)`（真输出 `1.0`，假输出 `0.0`）、条件选择 `where(cond,a,b)` / `if_else(cond,a,b)`（`cond` 有效且 `cond > 0` 时取 `a`，否则取 `b`；**`cond` 有效时仅要求被选中的分支有效**，故 `where(x > 0, log(x), 0)` 在 `x <= 0` 时安全返回 `0`；`cond` 无效则传播 `cond` 的无效原因）。
+- 时序（x,y 为任意标量节点，包含 `cs.*`/`group.*` 阶段输出；n 窗口；多字段 OHLC/OHLCV/订单流函数既可显式传字段节点，也可在存在 `kline` 绑定时省略字段参数自动读取 `kline.{open,high,low,close,volume,buy_volume}`）：
+  - 基础与滚动统计：`ts.lag(x,n)`（n=0 原样返回）、`ts.return(x,n)`（别名 `ts.ret(x,n)`）=x_t/x_{t-n}-1、`ts.std(x,n,ddof)`（整数 `0≤ddof<n`）、`ts.corr(x,y,n)`（Pearson 相关，任一方差为 0 输出 0）、`ts.cov(x,y,n)`（总体协方差）、`ts.beta(y,x,n)`（`Cov(y,x)/Var(x)`，Var(x)=0 输出 0）、`ts.sum(x,n)`、`ts.product(x,n)`、`ts.rank(x,n)`（`[0,1]` 归一化分位排名，n=1 返回 `0.5`）、`ts.zscore(x,n)`（标准差为 0 输出 0）、`ts.argmax/argmin(x,n)`（极值距当前偏移 `0..n-1`，0 为当前最新值）、`ts.skew(x,n)`（`n≥3`）、`ts.kurt(x,n)`（`n≥4`）、`ts.slope(x,n)`、`ts.rsquare(x,n)`（`R²∈[0,1]`）、`ts.highest/lowest(x,n)`。
+  - 均线、自适应滤波与分形：`ts.ema/sma/rma/wma(x,n)`、`ts.decay_linear(x,n)`（同 `ts.wma`）、`ts.dema(x,n)`、`ts.tema(x,n)`、`ts.hma(x,n)`（`n≥2`）、`ts.trima(x,n)`、`ts.er(x,n)`（Kaufman 效率比）、`ts.kama(x,n)` 或 `ts.kama(x,n,fast,slow)`（`fast<slow`）、`ts.alma(x,n)`（缺省 `offset=0.85, sigma=6.0`）或 `ts.alma(x,n,offset,sigma)`（`offset∈[0,1], sigma>0`）、`ts.kalman1d(x,process_noise,meas_noise)`（噪声参数 `>0`）、`ts.hurst(x,n)`（R/S Hurst 指数 `∈[0,1]`，`n≥8`）。
+  - 动量、方向、趋势与通道：`ts.rsi(x,n)`（Wilder，0–100）、`ts.roc(x,n)`（百分比 ×100）、`ts.mom(x,n)`、`ts.cci(x,n)`、`ts.macd/macd_signal/macd_hist(x,f,s,g)`（`f<s`）、`ts.stc(x,fast,slow,cycle)`（`fast<slow`）、`ts.bbands_upper/middle/lower(x,n,up,down)`（`up,down≥0`）、`ts.tr(h,l,c)`、`ts.atr(h,l,c,n)`、`ts.natr(h,l,c,n)`（`100*ATR/c`）、`ts.stoch(h,l,c,n)`、`ts.willr(h,l,c,n)`（-100–0）、`ts.adx(h,l,c,n)`、`ts.dmi_plus/dmi_minus(h,l,c,n)`（别名 `ts.plus_di/minus_di`）、`ts.chop(h,l,c,n)`（Choppiness，`n≥2`）、`ts.aroon_up/aroon_down/aroon_osc(h,l,n)`、`ts.vortex_plus/vortex_minus(h,l,c,n)`、`ts.donchian_upper/donchian_mid/donchian_lower(h,l,n)`（`donchian_middle` 别名）、`ts.keltner_upper/keltner_mid/keltner_lower(h,l,c,n,mult)`（`mult≥0`，`keltner_middle` 别名）、`ts.supertrend/supertrend_dir(h,l,c,n,mult)`（`mult>0`，方向 `+1/-1`）、`ts.sar(h,l,start,inc,max)` 或 `ts.sar(h,l)`（缺省 `0.02,0.02,0.2`，`max≥start>0, inc>0`）、`ts.ichimoku_conversion/ichimoku_base(h,l,n)`（Tenkan/Kijun）。
+  - 成交量、K 线原生订单流与 OHLC 波动率：`ts.vwma(c,v,n)`、`ts.obv(c,v)`、`ts.mfi(h,l,c,v,n)`、`ts.cmf(h,l,c,v,n)`、`ts.adl(h,l,c,v)`、`ts.adosc(h,l,c,v,fast,slow)`（别名 `ts.chaikin_osc`，`fast<slow`）、`ts.volume_delta(v,buy_v)`（`2*buy_volume - volume`）、`ts.cvd(v,buy_v)`（累计净主动买量）、`ts.rolling_cvd(v,buy_v,n)`、`ts.taker_buy_ratio(v,buy_v,n)`（`sum(buy_volume)/sum(volume)∈[0,1]`；`kline` 绑定下可直接写 `ts.volume_delta()` / `ts.rolling_cvd(n)` / `ts.taker_buy_ratio(n)`）、`ts.parkinson_vol(h,l,n)`、`ts.garman_klass_vol(o,h,l,c,n)`、`ts.yang_zhang_vol(o,h,l,c,n)`（`n≥2`）。
+- 截面：`cs.rank(x)`（升序名次，0 起，并列平均，非百分位）、`cs.pct_rank(x)`（归一化截面排名 `[0,1]`：有效参考标的数 `M>1` 时为 `rank/(M-1)`，`M==1` 时为 `0.5`）、`cs.zscore(x)`（总体标准差；全同输出 0）、`cs.robust_zscore(x)`=(x−中位数)/(1.4826·MAD)（MAD=0 输出 0）、`cs.winsorize(x,tail)`（tail∈[0,0.5)，上下界为参考池插值分位数）、`cs.mad_winsorize(x,k)`（中位数 ± k·1.4826·MAD，k>0；MAD=0 全截到中位数）、`cs.quantile(x,q)`（q∈[0,1]；**输出截面常数**，参考池 q 分位广播，只适合阈值/分组，不能排名）、`cs.mean(x)` / `cs.sum(x)`（参考池有效样本的算术均值 / 总和广播为**截面常数**；如全市场趋势宽度 `cs.mean(kline.close > ts.sma(kline.close, 200))` ∈ `[0,1]` 或等权指数收益 `cs.mean(ts.return(kline.close, 1))`）。
+- 跨周期源级求值与特定基准标的广播：
+  - `mtf.asof("1d", expr)` / `mtf.asof("1d", expr, max_stale_ms)`（别名 `asof_tf`）：在源周期 `"1d"`（须为不细于外层目标周期的 bar 周期，如 `1h` 决策下取 `"4h"`/`"1d"`/`"1w"`）上求值 `expr`——内部的裸字段/`kline.*`、`factor.let`、无参指标简写与 `ts.*` 均绑定到源周期，**仅在新闭合源 bar（`Closed=true` 且 `barEnd <= GridTime`，严格无未收盘前视）到达时推进一次时序窗口状态**，再将标量结果因果 `AsOf` 投影回外层周期；可选非负整数或 `param.name` 的 `max_stale_ms`（`>0` 时 `GridTime - EventTime > max_stale_ms` 输出 `Missing`，省省或 `0` 不限年龄）。例：`mtf.asof("1d", ts.ema(close, 20))` 计算真实 20 日均线并对齐到 `1h`。
+  - `ref.field("BTC/USDT:USDT", "close")` / `ref.field("BTC/USDT:USDT", "funding_rate", "rate")`：读取指定基准/参考品种的字段并广播到当期所有活跃标的（两参形式默认 `kline` 源；三参形式第 2 参数可为已声明 binding 别名或直接源名）。可与 `ts.corr`/`ts.beta` 或 `mtf.asof` 直接组合，如山寨币对 BTC 滚动 Beta `ts.beta(ts.ret(close, 1), ts.ret(ref.field("BTC/USDT:USDT", "close"), 1), 20)` 或 BTC 日线牛熊门控 `mtf.asof("1d", ref.field("BTC/USDT:USDT", "close") > ts.sma(ref.field("BTC/USDT:USDT", "close"), 200))`；即使 `"BTC/USDT:USDT"` 不在 `pairs`/`Investable` 中，存储回放也会经 `SIDMap` 自动解析并预加载其所需周期流，且不会将其纳入交易池。
 - 回归/分组：`group.residual(y,x)`（单变量截面 OLS 残差含截距，参考池拟合，需 ≥2 个有效对）、`group.ols(y,x1,...)`（多元，至少一个暴露）、`group.wls(y,w,x1,...)`（权重须正且有效）、`group.demean(x,"alias","field")` / `group.zscore(...)`（按分类字段组内去均值/z-score（总体标准差）；字段原始类型/NULL 保留，经 binding 采样；缺字段=Missing，NULL=Null）。
 
 - Go 同名：`ts.x`/`cs.x`→`factor.X`（MACD/BBands 返回三节点；`group.ols/wls`→`MultiResidual/WeightedResidual`；`group.demean/zscore`→`...ByField`），见第 6 节。
-- 时序算子（含指标）不能作用于截面/回归输出：`TS windows over cross-section results are not supported`（`ts.lag(x,0)` 例外）；需要时先时序后截面：`cs.rank(ts.rsi(kline.close,14))`。
+- 支持任意无环多阶段 `TS ↔ CS/GROUP` 管道（`factor.Compile` 自动按 `StageTS`/`StageCS` 拓扑阶段交替划分求值）：标量时序窗口、技术指标与逐点算子均可直接作用于截面或分组回归输出，例如特质波动率 `cs.zscore(ts.std(group.residual(ts.return(kline.close,1), kline.open), 20, 0))`、残差动量 `ts.sum(group.demean(ts.return(kline.close,1), "info", "sector"), 20)`、降换手平滑排名 `ts.sma(cs.pct_rank(kline.volume), 5)`、双截面滚动相关 `ts.corr(cs.pct_rank(kline.close), cs.pct_rank(kline.volume), 10)`；跨阶段预热长度自动按依赖链累加（`上游预热 + 下游窗口预热`），`ts.lag(x,0)` 原样返回。
 - `max(x,1e-8)` 等下界只对有效值生效，不补 NULL/缺字段/预热不足。
 - 截面/回归统计在冻结的 `Universe.Reference` 上拟合，输出仅对 `Investable` 有效资产有意义。
 - 预热例：`ts.macd_hist(..,12,26,9)`=33；缺失输入元组延长预热但不推进状态。
@@ -183,9 +191,11 @@ expressions:
 | --- | --- |
 | `builder` | PortfolioBuilder 名（`top-bottom-k-v1`；未注册报错） |
 | `k` | 正整数，缺省取 `params.k`，再缺省 10（`portfolio.k` 优先）；lifecycle 下可由 `selection` 替代 |
-| `long_notional` / `short_notional` | 策略 NAV 比例，非负（0.5 / 0.5） |
+| `long_notional` / `short_notional` | 策略 NAV 比例，非负（0.5 / 0.5）；可被保留输出列 `exposure_scale` / `long_scale` / `short_scale` 按期动态缩放 |
+| `long_min_score` / `short_max_score` | 可选绝对分数门控（区分未设与显式 `0`）：多头仅选 `score >= long_min_score`，空头仅选 `score <= short_max_score`（双动量常用 `long_min_score: 0`） |
+| `unfilled_slot_policy` / `asset_cap` | 通过门控数 `m < K` 时：`cash`（默认，每标的分 `notional/K`，未满槽位留现，`m==0` 清仓为空仓现金）或 `rescale`（集中分配到 `m` 个标的，单标的上限 `asset_cap`） |
 | `mode` | `full`（默认；本策略旧目标中省略的资产归零）或 `patch`（省略保留，显式 0 才清仓） |
-| `policy` | 缺省空（旧路径）；`lifecycle-v1` 或自定义 `name-vN`；`rebalance/selection/holding/transition/allocation/policy_params` **要求显式 `policy`**，否则报 `lifecycle fields require an explicit policy` |
+| `policy` | 缺省空（纯 top/bottom-K 路径）；配置 `rebalance/selection/holding/transition/allocation` 子块且无 `policy_params` 时自动提升为 `lifecycle-v1`；自定义 `name-vN`（配 `policy_params` 须显式声明 `policy`） |
 | `policy_params` | 自定义策略的有效 JSON（有界） |
 
 `TargetPortfolio` 是理想权重；`PortfolioTarget` 可混合 NAV 权重和绝对数量（`AbsoluteQuantity`，标准资产数量非合约张数，有符号十进制字符串）。
@@ -198,7 +208,7 @@ expressions:
 
 固定寿命批次（替换 `transition`、去掉 `holding.min_bars`）：`transition: {mode: cohort, period_bars: 16, startup: gradual, sizing: entry-nav}`。gradual 每轮建 1/8 预算批次；seed-all 用当前排名一次建八个不同到期窗口的批次。同币批次先汇总净目标，到期与新建内部转移已确认贡献，不伪造成交与手续费；计划 8 单位只成交 4 单位时，首批到期后保留 3.5，不向旧批补足。
 
-**selection**：`long_k`/`short_k` 为当轮选择数（非持仓上限；缺省 `long_k=k`（long_notional>0）、`short_k=k`（short_notional>0））；或 `long_quantile`/`short_quantile`∈[0,1]（与对应 K 互斥）；`retain_rank`（≥0，持仓排名缓冲）；`dropout`（≥0，普通轮次替换数）；`group_quota`（map，值≥0，分组由调用方提供）；`missing_scores`：`skip`（默认）|`shrink`|`cash`。需 `long_notional+short_notional>0`。
+**selection**：`long_k`/`short_k` 为当轮选择数（非持仓上限；缺省 `long_k=k`（long_notional>0）、`short_k=k`（short_notional>0））；或 `long_quantile`/`short_quantile`∈[0,1]（与对应 K 互斥）；`long_min_score`/`short_max_score`（`*float64`，多头要求 `score >= *long_min_score`、空头要求 `score <= *short_max_score`，未通过门控的旧仓也不会被 `retain_rank` 保留）；`unfilled_slot_policy`：`cash`（默认，按 `notional/K` 留现，`0` 个通过时发空组合清仓）|`rescale`（集中分配，受 `allocation.asset_cap` 约束）；`retain_rank`（≥0，持仓排名缓冲）；`dropout`（≥0，普通轮次替换数）；`group_quota`（map，值≥0，分组由调用方提供）；`missing_scores`：`skip`（默认）|`shrink`|`cash`。需 `long_notional+short_notional>0`。
 
 **rebalance**：`every_bars`（正整数，默认 1）、`phase`（<every_bars，单位 bar）、`anchor`（绝对毫秒锚点，默认 0）、`duration`（如 `4h`）、`calendar`（`daily|weekly|monthly`，需 `calendar_version`，禁止 anchor/phase，`timezone` 默认 UTC；按时区日期/ISO 周/月换轮）。三者选一。轮号=`floor((grid−anchor−phase×bar)/interval)`，增大才调仓，首个决策总触发；节假日/分数变化触发需 Go 回调。
 
@@ -220,7 +230,8 @@ expressions:
 - `on_reselect`：`restore`（补回理想份额）|`resume`（保留当前较小份额）|`finish`（继续原退出）|`new-cohort`；仅 linear-exit/geometric 可写。`by_asset`：`exit_steps`（linear-exit）或 `ratio`（geometric，[0,1)）的每资产覆盖，其它模式不允许。
 - 字段与 mode 不匹配（如 `alpha` 用于 linear-exit、`basis` 用于 direct/cohort/target-step）预检失败。
 
-**allocation**：`method`：`equal`（缺省）|`score`|`fixed-notional`（`fixed_notional>0`，仅此可写）|`inverse-volatility`|`vol-target`（`vol_target>0`，仅此可写）。通用：`reserve_ratio∈[0,1)`、`asset_cap`、`group_caps`（分组需 `Config.PolicyContext` 注入）、`turnover_limit`（限调仓金额不限持仓数，强制风险退出绕过）、`net_cap`、`beta_cap`（后两者需 beta/分组证据，均 ≥0）。inverse-volatility 与 vol-target 需注入 `Volatility`（不取同名因子列）。
+**allocation**：`method`：`equal`（缺省）|`score`|`fixed-notional`（`fixed_notional>0`，仅此可写）|`inverse-volatility`|`vol-target`（`vol_target>0`，仅此可写）|`erc`（别名 `risk-parity`，等风险贡献 Equal Risk Contribution）|`hrp`（层次风险平价 Hierarchical Risk Parity）|`min-variance`（多头入选集最小方差，空头同构取负）|`mean-variance`（Markowitz 均值-方差，以入选集标准化分数为预期收益、`risk_aversion` 默认 `1.0` 仅此可写）。风险/协方差参数：`volatility_column`（默认 `volatility`）、`beta_column`（默认 `beta`）、`risk_window`（滚动收益窗口，整数 `[2,10000]`，缺省 `20`）、`shrinkage`（协方差非对角收缩率 `[0,1]`，缺省 `0`，秩亏时自动 `0.05` 正定化）。通用：`reserve_ratio∈[0,1)`、`asset_cap`、`group_caps`（分组需 `Config.PolicyContext` 注入）、`turnover_limit`（限调仓金额不限持仓数，强制风险退出绕过）、`net_cap`、`beta_cap`（均 ≥0）。
+- 风险数据自动绑定与零代码兜底：若策略输出含保留列 `volatility` / `beta`（或 `volatility_column` / `beta_column`），自动从默认 `Combine.Columns` 排除并绑定到 `PortfolioContext.Volatility` / `Beta`（`Config.PolicyContext` 可覆盖）；若未显式输出风险列，`runner` 自动基于严格 PIT 决策网格收盘价回看 `risk_window` 计算滚动波动率、市场 Beta 与对齐收益率矩阵，协方差样本不足 `risk_window` 预热时优雅回退为 `inverse-volatility` 或 `equal`。
 
 ### 4.3 生命周期语义要点
 
@@ -249,7 +260,7 @@ func RegisterRiskPortfolioBuilder(name string, config RiskBuilderConfig) error
 - 类型：`Frame{GridTime, SnapshotID, PlanHash, DecisionTime, Values map[列名]map[SID]Numeric}`（含输出列与合成列 `score`）；`Universe{Version, Investable, Reference, Tradable, Evaluation, Tracked []int32, Static}`；`Numeric{Value, Validity}`（`valid missing null not-numeric non-finite warmup`）；`Diagnostic{Code, Detail}`；`PortfolioSpec` 含 StrategyID/AccountID/DecisionTime/ExecutableAt/ExpireAt/Budget{Version,Currency,NAV}/Mode 等。
 - `PortfolioContext` 含 Frame、Universe、Ideal、Spec、ScoreName、Positions(`map[SID]PositionEvidence{Quantity,PendingQuantity,FirstFillTime,FillEvents..}`)、Marks、Groups、Volatility、Beta、AssetNames、ForceExit、Previous、HoldingRules、TransitionRules、RebalanceDue、CapitalLimit 等；`PortfolioProposal{Target, NextState, Reasons, AcceptanceID, ReconcileSIDs, PlanSequence, DecisionTime, ExpireAt}`。
 - `TargetPortfolio`：`NewTargetPortfolio(spec, targets)`、`Spec/ID/Targets/EffectiveTargets(prev)/Notional(sid)`。`PortfolioTarget`：`NewPortfolioTarget(spec, map[SID]Allocation)`；`Allocation{Basis: nav-fraction|absolute-quantity, Value string}`；`Allocations()`、`AsWeightPortfolio()`（数量目标报错）、`PortfolioTargetFromWeights`、`EffectiveAllocations(prev)`。
-- 生命周期：`factor.SelectPortfolio(frame, universe, spec, cfg)`、`SelectPortfolioScore(..., scoreName, groups)`、`AllocateSelected(selected, cfg, nav, scores, vol)`、`NewLifecyclePolicy`。
+- 生命周期：`factor.SelectPortfolio(frame, universe, spec, cfg)`、`SelectPortfolioScore(..., scoreName, groups)`、`AllocateSelected(selected, cfg, nav, scores, vol)`、`AllocateSelectedContext(selected, cfg, ctx, scores)`、`EqualRiskContribution(cov)`、`NewLifecyclePolicy`。
 - 注册名须带版本（如 `rotation-v1`），参数/实现变化须升版本或改 identity hash。
 
 ## 5. Go 注册入口与接口
@@ -260,10 +271,14 @@ func RegisterRiskPortfolioBuilder(name string, config RiskBuilderConfig) error
 type FactorContext struct { TimeFrame string; Params *Params }
 func (f FactorContext) Close() *factor.Node          // factor.Field("kline","close", TimeFrame)
 func (f FactorContext) Field(name string) *factor.Node
+func (f FactorContext) RefField(symbol, name string) *factor.Node
+func (f FactorContext) RefSourceField(symbol, source, name string) *factor.Node
+func (f FactorContext) SubTF(sourceTF string, build func(FactorContext) *factor.Node, maxAge ...int64) *factor.Node
 type FactorSpec struct { Outputs map[string]*factor.Node; Combine research.ComboSpec }
 func RegisterFactor(name string, build func(FactorContext) (FactorSpec, error)) error
 ```
-- `Outputs` 非空；默认 `equal`+全部输出，可由 `Combine` 指定（YAML `combo` 覆盖）。
+- `Outputs` 非空；默认 `equal`+除保留列（`exposure_scale`/`long_scale`/`short_scale`/`volatility`/`beta` 及 `allocation.volatility_column`/`beta_column`）外的全部输出，可由 `Combine` 指定（YAML `combo` 覆盖）。
+- **保留辅助输出列**：`Outputs`（或 YAML `expressions.outputs`）可额外输出敞口缩放列 `"exposure_scale"`（同时缩放多空）、`"long_scale"`（缩放 `LongNotional`）、`"short_scale"`（缩放 `ShortNotional`），以及风险列 `"volatility"`（驱动 `inverse-volatility`/`vol-target`）与 `"beta"`（驱动 `beta_cap`）。它们自动从默认 `Combine.Columns` 排除；敞口列按有效标的算术均值钳制到 `[0, 1]`（全无效按 `1.0`）动态缩放当期多/空预算；只输出 `"score"` 的普通策略也可直接在 YAML 配 `portfolio: {allocation: {method: hrp}}`（或 `erc`/`min-variance`/`mean-variance`/`inverse-volatility`），由 `runner` 自动计算 PIT 滚动收益协方差与波动率。
 
 ### 5.2 `runner.RegisterDefinition`
 
@@ -344,16 +359,34 @@ type Numeric struct { Value float64; Validity Validity }  // Valid, Missing, Nul
 func Number(values map[string]any, field string) Numeric
 func Field(source, field, timeframe string) *Node // 例：Field("open_interest", "oi_value", c.TimeFrame) 或 Field("premium_kline", "close", c.TimeFrame)（内置 premium_kline / index_kline / mark_kline 含 open/high/low/close；open_interest 含 oi/oi_value/top_ls_pos_ratio/top_ls_acc_ratio/global_ls_ratio/taker_ls_vol_ratio）
 func AsOfField(source, field, sourceTF, decisionTF string, maxAge int64) *Node // 例：AsOfField("funding_rate", "rate", "8h", c.TimeFrame, 12*3600*1000)、AsOfField("open_interest", "top_ls_pos_ratio", "5m", c.TimeFrame, 2*3600*1000) 或 AsOfField("mark_kline", "close", "5m", c.TimeFrame, 2*3600*1000)
+func RefAssetField(symbol, source, field, timeframe string) *Node
+func AsOfRefAssetField(symbol, source, field, sourceTF, decisionTF string, maxAge int64) *Node
+func AsOfNode(input *Node, decisionTF string, maxAge int64) *Node
+func SubTF(sourceTF, decisionTF string, build func(SubTFContext) *Node, maxAge ...int64) *Node
 func Constant(v float64, tf string) *Node
-func Add/Sub/Mul/Div/Pow/Min/Max(a, b *Node) *Node
-func Neg/Abs/Log/Sqrt/Positive(x *Node) *Node
-func Lag/Return/EMA/SMA/RMA/WMA/RSI/ROC/MOM/CCI/Highest/Lowest(x *Node, period int) *Node
+func Add/Sub/Mul/Div/Pow/Min/Max/Gt/Ge/Lt/Le(a, b *Node) *Node
+func Neg/Abs/Log/Sqrt/Positive/Sign(x *Node) *Node; Clip(x *Node, lo, hi float64) *Node
+func Where(cond, thenNode, elseNode *Node) *Node
+func Lag/Return/EMA/SMA/RMA/WMA/DecayLinear/DEMA/TEMA/HMA/KAMA/TRIMA/ER/Hurst/RSI/ROC/MOM/CCI/Highest/Lowest(x *Node, period int) *Node
+func KAMABy(x *Node, period, fast, slow int) *Node; ALMA(x *Node, period int, offset, sigma float64) *Node
+func Kalman1D(x *Node, processNoise, measNoise float64) *Node; STC(x *Node, fast, slow, cycle int) *Node
+func TsSum/TsProduct/TsRank/TsZScore/TsArgMax/TsArgMin/TsSkew/TsKurt/TsSlope/TsRSquare(x *Node, period int) *Node
+func TsCorr/TsCov(x, y *Node, period int) *Node; TsBeta(y, x *Node, period int) *Node
 func StdDev(x *Node, period, ddof int) *Node
-func VWMA(p, v *Node, period int) *Node; ATR(h,l,c *Node, period int); Stoch/WillR(h,l,c *Node, period int)
-func TR(h,l,c *Node) *Node; OBV(c,v *Node) *Node; MFI(h,l,c,v *Node, period int) *Node
+func VWMA(p, v *Node, period int) *Node; OBV(c, v *Node) *Node
+func VolumeDelta/CVD(v, buyV *Node) *Node; RollingCVD/TakerBuyRatio(v, buyV *Node, period int) *Node
+func TR(h, l, c *Node) *Node; ATR/NATR/Stoch/WillR/ADX/PlusDI/MinusDI/CHOP/VortexPlus/VortexMinus(h, l, c *Node, period int) *Node
+func DMI(h, l, c *Node, period int) (plusDI, minusDI, adx *Node); Vortex(h, l, c *Node, period int) (plus, minus *Node)
+func AroonUp/AroonDown/AroonOsc/DonchianUpper/DonchianMid/DonchianLower/IchimokuConversion/IchimokuBase/ParkinsonVol(h, l *Node, period int) *Node
+func Aroon(h, l *Node, period int) (up, down, osc *Node); Donchian(h, l *Node, period int) (upper, middle, lower *Node)
+func KeltnerUpper/KeltnerMid/KeltnerLower/Supertrend/SupertrendDir(h, l, c *Node, period int, mult float64) *Node
+func Keltner(h, l, c *Node, period int, mult float64) (upper, middle, lower *Node)
+func SAR(h, l *Node, start, inc, max float64) *Node
+func ADL(h, l, c, v *Node) *Node; MFI/CMF(h, l, c, v *Node, period int) *Node; ChaikinOsc/ADOSC(h, l, c, v *Node, fast, slow int) *Node
+func GarmanKlassVol/YangZhangVol(o, h, l, c *Node, period int) *Node
 func MACD(x *Node, fast, slow, signal int) (line, signalLine, hist *Node)
 func BBands(x *Node, period int, stdUp, stdDown float64) (upper, middle, lower *Node)
-func Rank/ZScore/RobustZScore(x *Node) *Node
+func Rank/PctRank/ZScore/RobustZScore/CsMean/CsSum(x *Node) *Node
 func Winsorize(x *Node, tail float64) *Node; MADWinsorize(x *Node, k float64) *Node; Quantile(x *Node, q float64) *Node
 func GroupDemeanByField(x, field *Node) *Node; GroupZScoreByField(x, field *Node) *Node
 func Residual(y, x *Node) *Node; MultiResidual(y *Node, xs ...*Node) *Node; WeightedResidual(y, w *Node, xs ...*Node) *Node
@@ -361,7 +394,8 @@ func Linear(inputs []*Node, weights []float64) *Node
 func Custom(version string, inputs []*Node, evaluate func([]Numeric) Numeric) *Node   // 纯逐点，须传播无效原因
 func New() *Builder; (*Builder).Add(name string, n *Node) *Builder; (*Builder).Compile() (*Plan, error)
 func Compile(outputs map[string]*Node) (*Plan, error)
-func (p *Plan) Hash/TimeFrame/Outputs/Inputs/WarmupLength/StateRetention/NodeCount
+type StageKind string; type Stage struct { Index int; Kind StageKind; Nodes []string } // StageTS="TS", StageCS="CS"
+func (p *Plan) Hash/TimeFrame/Outputs/Inputs/ScopedInputs/ReferenceSymbols/WarmupLength/StateRetention/NodeCount/StageCount/Stages
 ```
 - `GroupDemean`/`GroupZScore`（不带 ByField）为旧接口，无年龄限制；新代码用 `...ByField`，分类字段须为 `factor.Field` 或 `AsOfField`。
 - `Custom` 不得在闭包里保存滚动状态；需要历史算子须扩展内核。

@@ -21,7 +21,12 @@ func (l *Live) proposePolicyRound(ctx context.Context, frame factor.Frame, unive
 	sp := l.engine.portfolioSpec(frame, universe, sequence, nav, completed+l.c.LatencyMS, decision+l.c.ExpiryMS)
 	l.mu.Lock()
 	quotes := copyQuotes(l.quotes)
+	rowsCopy := make(map[factor.StreamKey]factor.VersionRecord, len(l.rows))
+	for k, v := range l.rows {
+		rowsCopy[k] = v
+	}
 	l.mu.Unlock()
+	l.policy.observeLiveRows(l.c, l.engine.plan, rowsCopy, quotes, decision, completed)
 	pending, err := l.policy.propose(ctx, l.c, frame, universe, ideal, sp, decision, evidence, quotes, false)
 	if err != nil {
 		return err

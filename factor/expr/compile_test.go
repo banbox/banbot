@@ -247,9 +247,15 @@ func TestASTAndDeclarationBudgets(t *testing.T) {
 }
 
 func TestRestrictedWindowDomainsAndDecimalLiterals(t *testing.T) {
-	for _, formula := range []string{"ts.ema(cs.rank(kline.close),2)", "ts.return(abs(cs.zscore(kline.close))+1,2)", "ts.std(group.residual(kline.close,kline.open),3,0)", "group.demean(kline.close,kline.sector)", "group.zscore(kline.close,kline.sector)", "0x1p2", "1_000"} {
+	for _, formula := range []string{"group.demean(kline.close,kline.sector)", "group.zscore(kline.close,kline.sector)", "0x1p2", "1_000"} {
 		if _, err := Compile(specFor(formula)); err == nil {
 			t.Fatalf("accepted %q", formula)
+		}
+	}
+	for _, formula := range []string{"ts.ema(cs.rank(kline.close),2)", "ts.return(abs(cs.zscore(kline.close))+1,2)", "ts.std(group.residual(kline.close,kline.open),3,0)"} {
+		p := mustCompile(t, specFor(formula))
+		if p.StageCount() < 3 {
+			t.Fatalf("%q expected multi-stage plan, got %d stages", formula, p.StageCount())
 		}
 	}
 	if p := mustCompile(t, specFor("ts.lag(cs.rank(kline.close),0)")); p.NodeCount() != 2 {

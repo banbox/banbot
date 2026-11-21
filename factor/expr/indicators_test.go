@@ -67,7 +67,7 @@ func TestIndicatorDSLGoEquivalence(t *testing.T) {
 	}
 }
 
-func TestIndicatorDSLRejectsArityParametersAndCrossSectionInputs(t *testing.T) {
+func TestIndicatorDSLRejectsArityParametersAndAcceptsCrossSectionInputs(t *testing.T) {
 	for _, test := range indicatorExpressionCases() {
 		t.Run(test.name, func(t *testing.T) {
 			formulas := []string{
@@ -77,7 +77,13 @@ func TestIndicatorDSLRejectsArityParametersAndCrossSectionInputs(t *testing.T) {
 			for i, arg := range test.args {
 				args := append([]string(nil), test.args...)
 				if strings.HasPrefix(arg, "kline.") {
-					args[i] = "abs(cs.rank(" + arg + "))"
+					csArgs := append([]string(nil), test.args...)
+					csArgs[i] = "abs(cs.rank(" + arg + "))"
+					csPlan := mustCompile(t, specFor("ts."+test.name+"("+strings.Join(csArgs, ",")+")"))
+					if csPlan.StageCount() < 3 {
+						t.Fatalf("expected >=3 stages for CS->TS indicator %s, got %d", test.name, csPlan.StageCount())
+					}
+					args[i] = "missing.close"
 					formulas = append(formulas, "ts."+test.name+"("+strings.Join(args, ",")+")")
 					continue
 				}

@@ -58,11 +58,26 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		return result
 	}
 	switch node.spec.Operator {
-	case "rank":
+	case "rank", "pct-rank":
+		denom := float64(len(points) - 1)
 		for _, p := range targets {
 			lower := sort.Search(len(points), func(i int) bool { return points[i].value >= p.value })
 			upper := sort.Search(len(points), func(i int) bool { return points[i].value > p.value })
-			result[p.sid] = Numeric{float64(lower+upper-1) / 2, Valid}
+			r := float64(lower+upper-1) / 2
+			if node.spec.Operator == "pct-rank" {
+				if len(points) == 1 {
+					if p.value < points[0].value {
+						r = 0
+					} else if p.value > points[0].value {
+						r = 1
+					} else {
+						r = 0.5
+					}
+				} else {
+					r = max(0.0, min(1.0, r/denom))
+				}
+			}
+			result[p.sid] = Numeric{r, Valid}
 		}
 	case "zscore":
 		standardize(points, targets, result, true)
@@ -91,21 +106,24 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		if node.spec.Operator == "weighted-residual" {
 			first = 2
 		}
-		rowFor := func(sid int32) ([]float64, bool) {
+		rowFor := func(sid int32) ([]float64, Validity, bool) {
 			row := []float64{1}
 			for _, id := range node.inputs[first:] {
 				x, exists := columns[id][sid]
-				if !exists || x.Validity != Valid {
-					return nil, false
+				if !exists {
+					return nil, Missing, false
+				}
+				if x.Validity != Valid {
+					return nil, x.Validity, false
 				}
 				row = append(row, x.Value)
 			}
-			return row, true
+			return row, Valid, true
 		}
 		var x [][]float64
 		var y, weights []float64
 		for _, p := range points {
-			row, ok := rowFor(p.sid)
+			row, _, ok := rowFor(p.sid)
 			if !ok {
 				continue
 			}
@@ -121,9 +139,9 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		}
 		coef, _, err := LeastSquares(x, y, weights)
 		for _, p := range targets {
-			row, ok := rowFor(p.sid)
+			row, reason, ok := rowFor(p.sid)
 			if !ok {
-				result[p.sid] = Numeric{math.NaN(), Missing}
+				result[p.sid] = Numeric{math.NaN(), reason}
 				continue
 			}
 			if err != nil || len(x) < len(row) {
@@ -144,6 +162,18 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		}
 	case "quantile":
 		value := percentile(points, node.spec.Parameters["q"])
+		for _, p := range targets {
+			result[p.sid] = numeric(value)
+		}
+	case "cs-mean", "cs-sum":
+		sum := 0.0
+		for _, p := range points {
+			sum += p.value
+		}
+		value := sum
+		if node.spec.Operator == "cs-mean" {
+			value /= float64(len(points))
+		}
 		for _, p := range targets {
 			result[p.sid] = numeric(value)
 		}
@@ -195,8 +225,12 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		meanX, meanY := 0.0, 0.0
 		for _, p := range points {
 			x, ok := xValues[p.sid]
-			if !ok || x.Validity != Valid {
+			if !ok {
 				result[p.sid] = Numeric{math.NaN(), Missing}
+				continue
+			}
+			if x.Validity != Valid {
+				result[p.sid] = Numeric{math.NaN(), x.Validity}
 				continue
 			}
 			paired = append(paired, p)
@@ -206,8 +240,10 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		if len(paired) < 2 {
 			for _, p := range targets {
 				status := Warmup
-				if x, ok := xValues[p.sid]; !ok || x.Validity != Valid {
+				if x, ok := xValues[p.sid]; !ok {
 					status = Missing
+				} else if x.Validity != Valid {
+					status = x.Validity
 				}
 				result[p.sid] = Numeric{math.NaN(), status}
 			}
@@ -227,8 +263,12 @@ func crossSection(node compiledNode, snapshot *Snapshot, columns []map[int32]Num
 		}
 		for _, p := range targets {
 			x, ok := xValues[p.sid]
-			if !ok || x.Validity != Valid {
+			if !ok {
 				result[p.sid] = Numeric{math.NaN(), Missing}
+				continue
+			}
+			if x.Validity != Valid {
+				result[p.sid] = Numeric{math.NaN(), x.Validity}
 				continue
 			}
 			result[p.sid] = numeric(p.value - meanY - beta*(x.Value-meanX))

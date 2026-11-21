@@ -27,11 +27,15 @@ type AllocationOutput interface {
 }
 
 type policyRun struct {
-	policy   factor.PortfolioPolicy
-	state    json.RawMessage
-	version  uint64
-	previous *factor.PortfolioTarget
-	sequence uint64
+	policy      factor.PortfolioPolicy
+	allocCfg    factor.AllocationConfig
+	comboCols   []string
+	riskTracker *riskHistoryTracker
+	lastBeta    map[int32]float64
+	state       json.RawMessage
+	version     uint64
+	previous    *factor.PortfolioTarget
+	sequence    uint64
 }
 type pendingProposal struct {
 	proposal        factor.PortfolioProposal
@@ -45,8 +49,8 @@ type pendingProposal struct {
 	riskOnly        bool
 }
 
-func newPolicyRun(c Config) (*policyRun, error) {
-	if c.Manifest.Portfolio.Policy == "" {
+func newPolicyRun(c Config, comboCols ...string) (*policyRun, error) {
+	if c.Manifest.Portfolio.EffectivePolicy() == "" {
 		return nil, nil
 	}
 	config, err := c.Manifest.Portfolio.PolicyConfig()
@@ -57,7 +61,13 @@ func newPolicyRun(c Config) (*policyRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &policyRun{policy: policy}, nil
+	return &policyRun{
+		policy:      policy,
+		allocCfg:    config.Allocation,
+		comboCols:   append([]string(nil), comboCols...),
+		riskTracker: newRiskHistoryTracker(config.Allocation.EffectiveRiskWindow()),
+		lastBeta:    map[int32]float64{},
+	}, nil
 }
 
 func policyEvidence(ctx context.Context, sink Sink, book *backtest.Book, now int64) (factor.PortfolioEvidence, error) {
@@ -106,11 +116,12 @@ func (p *policyRun) propose(ctx context.Context, c Config, frame factor.Frame, u
 		mappingVersion = "sid-v1"
 	}
 	context := factor.PortfolioContext{Frame: factor.CloneFrame(frame), Universe: factor.CloneUniverse(universe), Ideal: ideal, Spec: spec, GridTime: grid, BarMillis: c.DecisionInterval, ScoreName: "score", Positions: factor.ClonePositionEvidence(evidence.Positions), Marks: marks, AssetNames: names, SIDMappingVersion: mappingVersion, StateVersion: evidence.StateVersion, LedgerCursor: evidence.LedgerCursor, Previous: p.previous}
-	if c.PortfolioBuilder != nil || c.Manifest.Portfolio.Builder != "" {
+	if c.PortfolioBuilder != nil || (c.Manifest.Portfolio.Builder != "" && c.Manifest.Portfolio.Builder != "top-bottom-k-v1") {
 		context.PreserveIdealWeights = c.Manifest.Portfolio.Allocation == nil
 	} else {
 		context.Ideal = nil
 	}
+	p.populateRiskContext(&context, frame, riskOnly)
 	if c.PolicyContext != nil {
 		if err := c.PolicyContext(ctx, &context); err != nil {
 			return nil, err

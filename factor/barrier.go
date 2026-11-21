@@ -148,14 +148,19 @@ func (b *RoundBarrier) Observe(token RoundToken, record VersionRecord, nowMS int
 	// Keep at most the currently visible event/revision per expected stream.
 	// Unrequested/future streams do not expand an unbounded pending buffer.
 	requested := false
+	var matchedNeed Requirement
 	for _, need := range round.requirements {
 		if need.SID == record.Series.Sid && need.Source == record.Series.Source && need.TimeFrame == record.Series.TimeFrame {
 			requested = true
+			matchedNeed = need
 			break
 		}
 	}
 	if !requested {
 		return errors.New("factor: unrequested round stream")
+	}
+	if matchedNeed.AsOfLatest && isUnclosedAsOfBar(copy, token.Key.GridTime) {
+		return nil
 	}
 	if copy.EventTime > token.Key.GridTime || copy.AvailableAt > round.spec.DecisionTime || copy.AvailableAt > nowMS || copy.IngestedAt > nowMS || (round.spec.ReplayTime != 0 && copy.IngestedAt > round.spec.ReplayTime) {
 		return nil

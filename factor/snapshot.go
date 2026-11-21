@@ -92,10 +92,11 @@ type SnapshotStatus struct {
 // Snapshot keeps all mutable contents private. Accessors return independent
 // copies; late observations require a new snapshot/research run.
 type Snapshot struct {
-	id     string
-	spec   SnapshotSpec
-	rows   map[StreamKey]VersionRecord
-	status SnapshotStatus
+	id         string
+	spec       SnapshotSpec
+	rows       map[StreamKey]VersionRecord
+	symbolSIDs map[string]int32
+	status     SnapshotStatus
 }
 
 func Freeze(spec SnapshotSpec, records []VersionRecord, requirements []Requirement) (*Snapshot, error) {
@@ -126,7 +127,17 @@ func Freeze(spec SnapshotSpec, records []VersionRecord, requirements []Requireme
 			return nil, fmt.Errorf("factor: SID %d missing stable symbol mapping", sid)
 		}
 	}
-	snapshot := &Snapshot{spec: spec, rows: make(map[StreamKey]VersionRecord)}
+	symbolSIDs, err := buildSymbolSIDMap(spec.SIDMap)
+	if err != nil {
+		return nil, err
+	}
+	asofBarKeys := make(map[StreamKey]bool)
+	for _, req := range requirements {
+		if req.AsOfLatest && req.TimeFrame != "" && req.TimeFrame != "event" {
+			asofBarKeys[StreamKey{req.SID, req.Source, req.TimeFrame}] = true
+		}
+	}
+	snapshot := &Snapshot{spec: spec, rows: make(map[StreamKey]VersionRecord), symbolSIDs: symbolSIDs}
 	for _, row := range records {
 		if row.Series.TimeFrame == "" || row.Series.Sid <= 0 || row.Revision == 0 {
 			return nil, errors.New("factor: invalid snapshot stream identity; non-periodic sources must declare timeframe=event")
@@ -138,6 +149,9 @@ func Freeze(spec SnapshotSpec, records []VersionRecord, requirements []Requireme
 			return nil, fmt.Errorf("factor: undeclared source/schema version %s", row.Series.Source)
 		}
 		key := StreamKey{row.Series.Sid, row.Series.Source, row.Series.TimeFrame}
+		if asofBarKeys[key] && isUnclosedAsOfBar(row, spec.GridTime) {
+			continue
+		}
 		previous, exists := snapshot.rows[key]
 		if exists && (previous.EventTime > row.EventTime || (previous.EventTime == row.EventTime && previous.Revision > row.Revision)) {
 			continue
@@ -197,7 +211,6 @@ func Freeze(spec SnapshotSpec, records []VersionRecord, requirements []Requireme
 	sortStreams(snapshot.status.Arrived)
 	sortStreams(snapshot.status.Invalid)
 	snapshot.status.Ready = len(requirements) > 0 && len(snapshot.status.Expected) == len(snapshot.status.Arrived) && len(snapshot.status.Invalid) == 0
-	var err error
 	snapshot.id, err = contentHash(struct {
 		Spec         SnapshotSpec
 		Rows         map[StreamKey]VersionRecord

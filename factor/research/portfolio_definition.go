@@ -3,12 +3,22 @@ package research
 import (
 	"encoding/json"
 	"errors"
+	"math"
+
 	"github.com/banbox/banbot/factor"
 )
 
 // ClonePortfolioDefinition preserves legacy JSON identity when policy is absent.
 func ClonePortfolioDefinition(d PortfolioDefinition) PortfolioDefinition {
 	d.PolicyParams = append(json.RawMessage(nil), d.PolicyParams...)
+	if d.LongMinScore != nil {
+		v := *d.LongMinScore
+		d.LongMinScore = &v
+	}
+	if d.ShortMaxScore != nil {
+		v := *d.ShortMaxScore
+		d.ShortMaxScore = &v
+	}
 	if d.Rebalance != nil {
 		value := *d.Rebalance
 		d.Rebalance = &value
@@ -29,11 +39,24 @@ func ClonePortfolioDefinition(d PortfolioDefinition) PortfolioDefinition {
 		value := factor.ClonePortfolioPolicyConfig(factor.PortfolioPolicyConfig{Allocation: *d.Allocation}).Allocation
 		d.Allocation = &value
 	}
+	d.Universe = factor.CloneRollingUniverseConfig(d.Universe)
 	return d
 }
 
+// EffectivePolicy returns the explicit policy name, or promotes to "lifecycle-v1"
+// when lifecycle/allocation sub-blocks are configured without custom policy_params.
+func (d PortfolioDefinition) EffectivePolicy() string {
+	if d.Policy != "" {
+		return d.Policy
+	}
+	if d.PolicyParams == nil && (d.Rebalance != nil || d.Selection != nil || d.Holding != nil || d.Transition != nil || d.Allocation != nil) {
+		return "lifecycle-v1"
+	}
+	return ""
+}
+
 func (d PortfolioDefinition) PolicyConfig() (factor.PortfolioPolicyConfig, error) {
-	c := factor.PortfolioPolicyConfig{Policy: d.Policy, PolicyParams: d.PolicyParams, LongNotional: d.LongNotional, ShortNotional: d.ShortNotional}
+	c := factor.PortfolioPolicyConfig{Policy: d.EffectivePolicy(), PolicyParams: d.PolicyParams, LongNotional: d.LongNotional, ShortNotional: d.ShortNotional}
 	if d.Rebalance != nil {
 		c.Rebalance = *d.Rebalance
 	}
@@ -47,6 +70,17 @@ func (d PortfolioDefinition) PolicyConfig() (factor.PortfolioPolicyConfig, error
 			c.Selection.ShortK = d.K
 		}
 	}
+	if c.Selection.LongMinScore == nil && d.LongMinScore != nil {
+		v := *d.LongMinScore
+		c.Selection.LongMinScore = &v
+	}
+	if c.Selection.ShortMaxScore == nil && d.ShortMaxScore != nil {
+		v := *d.ShortMaxScore
+		c.Selection.ShortMaxScore = &v
+	}
+	if c.Selection.UnfilledSlotPolicy == "" && d.UnfilledSlotPolicy != "" {
+		c.Selection.UnfilledSlotPolicy = d.UnfilledSlotPolicy
+	}
 	if d.Holding != nil {
 		c.Holding = *d.Holding
 	}
@@ -56,13 +90,33 @@ func (d PortfolioDefinition) PolicyConfig() (factor.PortfolioPolicyConfig, error
 	if d.Allocation != nil {
 		c.Allocation = *d.Allocation
 	}
+	if c.Allocation.AssetCap == 0 && d.AssetCap > 0 {
+		c.Allocation.AssetCap = d.AssetCap
+	}
 	return factor.NormalizePortfolioPolicyConfig(c)
 }
 
 func (d PortfolioDefinition) ValidatePolicy() error {
-	if d.Policy == "" {
-		if d.PolicyParams != nil || d.Rebalance != nil || d.Selection != nil || d.Holding != nil || d.Transition != nil || d.Allocation != nil {
-			return errors.New("research: portfolio lifecycle fields require an explicit policy")
+	if d.LongMinScore != nil && (math.IsNaN(*d.LongMinScore) || math.IsInf(*d.LongMinScore, 0)) {
+		return errors.New("research: non-finite portfolio long_min_score")
+	}
+	if d.ShortMaxScore != nil && (math.IsNaN(*d.ShortMaxScore) || math.IsInf(*d.ShortMaxScore, 0)) {
+		return errors.New("research: non-finite portfolio short_max_score")
+	}
+	if d.UnfilledSlotPolicy != "" && d.UnfilledSlotPolicy != "cash" && d.UnfilledSlotPolicy != "rescale" {
+		return errors.New("research: unknown portfolio unfilled_slot_policy")
+	}
+	if d.AssetCap < 0 || math.IsNaN(d.AssetCap) || math.IsInf(d.AssetCap, 0) {
+		return errors.New("research: invalid portfolio asset_cap")
+	}
+	if d.Universe != nil {
+		if _, err := factor.NormalizeRollingUniverseConfig(*d.Universe); err != nil {
+			return err
+		}
+	}
+	if d.EffectivePolicy() == "" {
+		if d.PolicyParams != nil {
+			return errors.New("research: portfolio policy_params requires an explicit policy")
 		}
 		return nil
 	}
@@ -71,16 +125,44 @@ func (d PortfolioDefinition) ValidatePolicy() error {
 }
 
 // ResolvePolicy makes defaults part of reproducible strategy identity only for
-// strategies that explicitly opt into the new policy contract.
+// strategies that opt into the policy contract (explicitly or via sub-blocks).
 func (d PortfolioDefinition) ResolvePolicy() (PortfolioDefinition, error) {
-	if d.Policy == "" {
-		return ClonePortfolioDefinition(d), d.ValidatePolicy()
+	if err := d.ValidatePolicy(); err != nil {
+		return d, err
+	}
+	ep := d.EffectivePolicy()
+	if ep == "" {
+		cp := ClonePortfolioDefinition(d)
+		if cp.Universe != nil {
+			norm, err := factor.NormalizeRollingUniverseConfig(*cp.Universe)
+			if err != nil {
+				return d, err
+			}
+			if norm.Enabled() {
+				cp.Universe = &norm
+			} else {
+				cp.Universe = nil
+			}
+		}
+		return cp, nil
 	}
 	c, err := d.PolicyConfig()
 	if err != nil {
 		return d, err
 	}
 	d = ClonePortfolioDefinition(d)
+	if d.Universe != nil {
+		norm, err := factor.NormalizeRollingUniverseConfig(*d.Universe)
+		if err != nil {
+			return d, err
+		}
+		if norm.Enabled() {
+			d.Universe = &norm
+		} else {
+			d.Universe = nil
+		}
+	}
+	d.Policy = ep
 	if d.Policy == "lifecycle-v1" {
 		d.Rebalance = &c.Rebalance
 		d.Selection = &c.Selection

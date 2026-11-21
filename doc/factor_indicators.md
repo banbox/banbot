@@ -1,33 +1,64 @@
 # 因子图常见技术指标
 
-`factor` 新增 18 类常见技术指标，共 22 个标量算子。全部支持 `Plan.Batch`、持续推进的 `Session` 和 `factor/expr` 表达式；它们可以接自定义字段或价格表达式，再传给截面变换。实现沿用 banta/tav v0.4.1 数值口径，新增节点版本为 `indicators-1/banta-0.4.1`。原有 `Lag`、`Return`、`EMA`、`StdDev` 的版本和行为保留。
+`factor` 内置均线与自适应滤波、趋势/方向/通道、动量/成交量/K 线原生订单流、OHLC 极值波动率与滚动统计等全部高频技术算子，均支持 `Plan.Batch`、持续推进且可 `fork`/`commit` 隔离的 `Session` 与 `factor/expr` 表达式；它们可以消费任意字段、算术表达式或上游截面/分组输出（`StageCS -> StageTS`），再传给下游截面变换。节点版本为 `indicators-1/banta-0.4.1`，原有 `Lag`、`Return`、`EMA`、`StdDev` 的版本和行为保留。
 
-下表中 `x` 为任意数值节点，`h/l/c/v` 是显式提供的 high/low/close/volume 节点，不要求来自固定 K 线结构。`n`、`fast`、`slow`、`signal` 都必须为 `[1,10000]` 的整数；MACD 还要求 `fast < slow`。布林带的 `up/down` 是有限非负数，允许为零。所有参数都必须显式提供。
+下表中 `x/y` 为任意数值标量节点，`o/h/l/c/v/bv` 是显式提供的 open/high/low/close/volume/buy_volume 节点（不要求来自固定 K 线结构；当表达式 `bindings` 中声明了 `kline` 时，多字段 OHLC/OHLCV/订单流函数还支持省略字段节点的简写形式，如 `ts.adx(14)`、`ts.parkinson_vol(20)`、`ts.volume_delta()`）。窗口参数为 `[1,10000]` 的整数（`HMA`/`CHOP`/`YangZhangVol` 要求 `>=2`，`TsSkew` 要求 `>=3`，`TsKurt` 要求 `>=4`，`Hurst` 要求 `>=8`）；`MACD`/`KAMABy`/`STC`/`ChaikinOsc` 要求 `fast < slow`。
 
 | Go builder | 表达式函数 | 公式或含义 |
 | --- | --- | --- |
 | `SMA(x,n)` | `ts.sma(x,n)` | 最近 n 个有效观察的算术均值 |
 | `RMA(x,n)` | `ts.rma(x,n)` | Wilder 平滑；以 n 个观察的均值初始化，`alpha=1/n` |
-| `WMA(x,n)` | `ts.wma(x,n)` | 最旧到最新的权重为 `1..n` |
-| `VWMA(c,v,n)` | `ts.vwma(c,v,n)` | `sum(c*v)/sum(v)` |
+| `WMA(x,n)` / `DecayLinear(x,n)` | `ts.wma(x,n)` / `ts.decay_linear(x,n)` | 最旧到最新的权重为 `1..n`（两者为同一节点身份） |
+| `DEMA(x,n)` / `TEMA(x,n)` | `ts.dema(x,n)` / `ts.tema(x,n)` | 双重 / 三重指数移动平均 |
+| `HMA(x,n)` | `ts.hma(x,n)` | Hull 均线 `WMA(2*WMA(x,n/2)-WMA(x,n), floor(sqrt(n)))`（`n>=2`） |
+| `TRIMA(x,n)` | `ts.trima(x,n)` | 三角加权移动平均 `SMA(SMA(x, ceil(n/2)), floor(n/2)+1)` |
+| `ER(x,n)` | `ts.er(x,n)` | Kaufman 效率比 `|x[t]-x[t-n]| / sum(|Δx|, n)` |
+| `KAMA(x,n)` / `KAMABy(x,n,f,s)` | `ts.kama(x,n)` / `ts.kama(x,n,f,s)` | Kaufman 自适应均线（缺省 `fast=2, slow=30`；自定义要求 `f<s`） |
+| `ALMA(x,n,offset,sigma)` | `ts.alma(x,n[,offset,sigma])` | Arnaud Legoux 高斯均线（`offset∈[0,1]` 缺省 `0.85`，`sigma>0` 缺省 `6.0`） |
+| `Kalman1D(x,q,r)` | `ts.kalman1d(x,q,r)` | 一维随机游走卡尔曼滤波状态估计（`q>0, r>0`） |
+| `Hurst(x,n)` | `ts.hurst(x,n)` | 滚动重标极差 R/S Hurst 指数 `∈[0,1]`（要求 `n>=8`） |
+| `VWMA(c,v,n)` | `ts.vwma([c,v,]n)` | `sum(c*v)/sum(v)` |
+| `TsCorr(x,y,n)` | `ts.corr(x,y,n)` | 最近 n 个同时有效配对的 Pearson 相关系数；方差为 0 返回 `0` |
+| `TsCov(x,y,n)` | `ts.cov(x,y,n)` | 最近 n 个同时有效配对的总体协方差 |
+| `TsBeta(y,x,n)` | `ts.beta(y,x,n)` | `Cov(y,x)/Var(x)`；`Var(x)==0` 返回 `0` |
+| `TsSum(x,n)` | `ts.sum(x,n)` | 最近 n 个有效观察的累加和 |
+| `TsProduct(x,n)` | `ts.product(x,n)` | 最近 n 个有效观察的连乘积 |
+| `TsRank(x,n)` | `ts.rank(x,n)` | 最新值在最近 n 个有效观察中的 `[0,1]` 归一化平均名次（`n==1` 返回 `0.5`） |
+| `TsZScore(x,n)` | `ts.zscore(x,n)` | `(x-SMA(x,n))/StdDev(x,n,0)`；标准差为 0 返回 `0` |
+| `TsArgMax(x,n)` / `TsArgMin(x,n)` | `ts.argmax(x,n)` / `ts.argmin(x,n)` | 极值距当前的偏移 `0..n-1`（`0` 为当前最新观察，对齐 `banta.HighestBar/LowestBar`） |
+| `TsSkew(x,n)` | `ts.skew(x,n)` | 无偏样本偏度（要求 `n >= 3`；标准差为 0 返回 `0`） |
+| `TsKurt(x,n)` | `ts.kurt(x,n)` | 无偏样本超额峰度（要求 `n >= 4`；标准差为 0 返回 `0`） |
+| `TsSlope(x,n)` | `ts.slope(x,n)` | 对时间索引 `0..n-1` 的 OLS 斜率 |
+| `TsRSquare(x,n)` | `ts.rsquare(x,n)` | 对时间索引 `0..n-1` 的 OLS 拟合优度 `R² ∈ [0,1]`（方差为 0 返回 `0`） |
 | `RSI(x,n)` | `ts.rsi(x,n)` | `100*平均涨幅/(平均涨幅+平均跌幅)`，涨跌幅使用 Wilder 平滑 |
 | `ROC(x,n)` | `ts.roc(x,n)` | `100*(x[t]-x[t-n])/x[t-n]`，单位为百分比 |
 | `MOM(x,n)` | `ts.mom(x,n)` | `x[t]-x[t-n]`，单位与原字段相同 |
-| `TR(h,l,c)` | `ts.tr(h,l,c)` | `max(h-l, abs(h-prevClose), abs(l-prevClose))` |
-| `ATR(h,l,c,n)` | `ts.atr(h,l,c,n)` | 对 TR 做 n 期 RMA |
+| `TR(h,l,c)` | `ts.tr([h,l,c])` | `max(h-l, abs(h-prevClose), abs(l-prevClose))` |
+| `ATR(h,l,c,n)` / `NATR(h,l,c,n)` | `ts.atr([h,l,c,]n)` / `ts.natr([h,l,c,]n)` | 对 TR 做 n 期 RMA / 归一化波动率 `100*ATR/c` |
+| `ADX(h,l,c,n)` / `PlusDI` / `MinusDI`（`DMI`） | `ts.adx` / `ts.dmi_plus`(`ts.plus_di`) / `ts.dmi_minus`(`ts.minus_di`)`([h,l,c,]n)` | Wilder 方向运动指标 `+DI`、`-DI` 与 `ADX`（0–100） |
+| `CHOP(h,l,c,n)` | `ts.chop([h,l,c,]n)` | Choppiness 指数 `100*log10(sum(ATR(1),n)/(hh-ll))/log10(n)`（`n>=2`） |
+| `AroonUp/AroonDown/AroonOsc`（`Aroon`） | `ts.aroon_up/aroon_down/aroon_osc([h,l,]n)` | `n+1` 观察窗口内极值距今位置百分比及差值 |
+| `VortexPlus/VortexMinus`（`Vortex`） | `ts.vortex_plus/vortex_minus([h,l,c,]n)` | 涡旋指标 `VI+` / `VI-` |
+| `DonchianUpper/Mid/Lower`（`Donchian`） | `ts.donchian_upper/donchian_mid/donchian_lower([h,l,]n)` | 唐奇安通道上轨、中轨、下轨 |
+| `KeltnerUpper/Mid/Lower`（`Keltner`） | `ts.keltner_upper/keltner_mid/keltner_lower([h,l,c,]n,mult)` | 肯特纳通道 `EMA(c,n) ± mult*ATR(n)`（`mult>=0`） |
+| `Supertrend` / `SupertrendDir` | `ts.supertrend` / `ts.supertrend_dir([h,l,c,]n,mult)` | ATR 棘轮趋势线与多空方向 `+1/-1`（`mult>0`） |
+| `SAR(h,l,start,inc,max)` | `ts.sar([h,l][,start,inc,max])` | 抛物线转向指标（缺省 `0.02, 0.02, 0.2`，要求 `max>=start>0, inc>0`） |
+| `STC(x,fast,slow,cycle)` | `ts.stc(x,fast,slow,cycle)` | Schaff 趋势周期（0–100，要求 `fast<slow`） |
+| `IchimokuConversion` / `IchimokuBase` | `ts.ichimoku_conversion` / `ts.ichimoku_base([h,l,]n)` | 一目均衡表转换线 Tenkan / 基准线 Kijun |
 | `CCI(x,n)` | `ts.cci(x,n)` | `(x-SMA(x,n))/(0.015*平均绝对偏差)`；典型价格需显式构造 |
-| `Stoch(h,l,c,n)` | `ts.stoch(h,l,c,n)` | 原始 `%K=100*(c-lowest(l,n))/(highest(h,n)-lowest(l,n))` |
-| `WillR(h,l,c,n)` | `ts.willr(h,l,c,n)` | `100*(c-highest(h,n))/(highest(h,n)-lowest(l,n))`，通常在 -100 到 0 之间 |
-| `OBV(c,v)` | `ts.obv(c,v)` | 初值为第一条有效成交量；上涨加 v、下跌减 v、持平不变 |
-| `MFI(h,l,c,v,n)` | `ts.mfi(h,l,c,v,n)` | 使用 `(h+l+c)/3` 与成交量，按典型价格涨跌累计正/负资金流 |
-| `Highest(x,n)` | `ts.highest(x,n)` | 最近 n 个有效观察的最大值 |
-| `Lowest(x,n)` | `ts.lowest(x,n)` | 最近 n 个有效观察的最小值 |
-| `MACD(x,fast,slow,signal)` 的 line | `ts.macd(x,fast,slow,signal)` | `EMA(x,fast)-EMA(x,slow)` |
-| 同上 signalLine | `ts.macd_signal(x,fast,slow,signal)` | MACD line 的 signal 期 EMA |
-| 同上 hist | `ts.macd_hist(x,fast,slow,signal)` | `line-signalLine`，不乘 2 |
-| `BBands(x,n,up,down)` 的 upper | `ts.bbands_upper(x,n,up,down)` | `SMA(x,n)+up*StdDev(x,n,0)` |
-| 同上 middle | `ts.bbands_middle(x,n,up,down)` | `SMA(x,n)` |
-| 同上 lower | `ts.bbands_lower(x,n,up,down)` | `SMA(x,n)-down*StdDev(x,n,0)` |
+| `Stoch(h,l,c,n)` | `ts.stoch([h,l,c,]n)` | 原始 `%K=100*(c-lowest(l,n))/(highest(h,n)-lowest(l,n))` |
+| `WillR(h,l,c,n)` | `ts.willr([h,l,c,]n)` | `100*(c-highest(h,n))/(highest(h,n)-lowest(l,n))`，通常在 -100 到 0 之间 |
+| `OBV(c,v)` / `ADL(h,l,c,v)` | `ts.obv([c,v])` / `ts.adl([h,l,c,v])` | 能量潮 / 累积派发线 |
+| `MFI(h,l,c,v,n)` / `CMF(h,l,c,v,n)` | `ts.mfi([h,l,c,v,]n)` / `ts.cmf([h,l,c,v,]n)` | 资金流量指数 / 佳庆资金流 |
+| `ChaikinOsc(h,l,c,v,fast,slow)` / `ADOSC` | `ts.adosc` / `ts.chaikin_osc([h,l,c,v,]fast,slow)` | 佳庆振荡器 `EMA(ADL,fast)-EMA(ADL,slow)`（`fast<slow`） |
+| `VolumeDelta(v,bv)` / `CVD(v,bv)` | `ts.volume_delta([v,bv])` / `ts.cvd([v,bv])` | 单根 K 线净主动买量 `2*bv-v` / 累计净主动买量 |
+| `RollingCVD(v,bv,n)` / `TakerBuyRatio(v,bv,n)` | `ts.rolling_cvd([v,bv,]n)` / `ts.taker_buy_ratio([v,bv,]n)` | 滚动净主动买量 / 主动买入成交占比 `sum(bv)/sum(v)∈[0,1]` |
+| `ParkinsonVol(h,l,n)` | `ts.parkinson_vol([h,l,]n)` | Parkinson 高低极差波动率估计 |
+| `GarmanKlassVol(o,h,l,c,n)` | `ts.garman_klass_vol([o,h,l,c,]n)` | Garman-Klass OHLC 波动率估计 |
+| `YangZhangVol(o,h,l,c,n)` | `ts.yang_zhang_vol([o,h,l,c,]n)` | Yang-Zhang 漂移无关隔夜+日内波动率估计（`n>=2`） |
+| `Highest(x,n)` / `Lowest(x,n)` | `ts.highest(x,n)` / `ts.lowest(x,n)` | 最近 n 个有效观察的最大值 / 最小值 |
+| `MACD(x,fast,slow,signal)` 的 line/signal/hist | `ts.macd` / `ts.macd_signal` / `ts.macd_hist(x,fast,slow,signal)` | MACD 差离值、信号线与柱状图 |
+| `BBands(x,n,up,down)` 的 upper/middle/lower | `ts.bbands_upper` / `ts.bbands_middle` / `ts.bbands_lower(x,n,up,down)` | `SMA(x,n)+up*StdDev` / `SMA` / `SMA-down*StdDev` |
 
 `ROC` 与原有 `Return` 的单位不同：价格从 100 变到 110 时，`ROC(...,1)` 得到 `10`，`Return(...,1)` 得到 `0.1`。新 `ROC/MOM` 的 n 按有效观察计数；原有 `Return/Lag` 保留原有观察位置语义，遇到缺失时不保证 `ROC == 100*Return`。
 
@@ -70,7 +101,7 @@ outputs:
   rsi_rank: 'cs.rank(ts.rsi(prices.close,param.rsi_period))'
 ```
 
-窗口参数只接受数值常量或 `param.name`，不接受字段或 `param.period+1` 等计算表达式。函数严格校验输入数量、参数名、整数范围、有限性及参数关系；无效且未被引用的 `lets` 也会报错。表达式允许先时序后截面；对任意输入包含截面/回归结果的时序指标会报错，包括多输入函数的非首个输入。
+窗口参数只接受数值常量或 `param.name`，不接受字段或 `param.period+1` 等计算表达式。函数严格校验输入数量、参数名、整数范围、有限性及参数关系；无效且未被引用的 `lets` 也会报错。支持任意无环 `TS ↔ CS/GROUP` 多阶段组合，标量与多输入技术指标均可消费截面或分组回归输出。
 
 ## 缺失、预热与历史保留
 
@@ -82,11 +113,14 @@ outputs:
 
 | 指标 | 前置有效元组数 | 节点保留长度下界 |
 | --- | --- | --- |
-| SMA/RMA/WMA/VWMA/CCI/Stoch/WillR/Highest/Lowest/BBands/MFI | `n-1` | `n` |
-| RSI/ROC/MOM/ATR | `n` | `n+1` |
-| TR | `1` | `2` |
-| OBV | `0` | `2` |
-| MACD line | `slow-1` | `slow` |
+| SMA/RMA/WMA/TRIMA/ALMA/Hurst/VWMA/CCI/Stoch/WillR/Highest/Lowest/BBands/MFI/CMF/Donchian/KeltnerMid/Ichimoku/RollingCVD/TakerBuyRatio/ParkinsonVol/GarmanKlassVol | `n-1` | `n` |
+| RSI/ROC/MOM/ATR/NATR/KAMA/ER/PlusDI/MinusDI/CHOP/Aroon/Vortex/KeltnerUpper/KeltnerLower/Supertrend/YangZhangVol | `n` | `n+1` |
+| DEMA / TEMA | `2(n-1)` / `3(n-1)` | `2n-1` / `3n-2` |
+| HMA | `n + floor(sqrt(n)) - 2` | `n + floor(sqrt(n)) - 1` |
+| ADX | `2n-1` | `2n` |
+| TR / SAR | `1` | `2` |
+| OBV / ADL / Kalman1D / VolumeDelta / CVD | `0` | `2` |
+| MACD line / STC / ChaikinOsc(ADOSC) | `slow-1` | `slow` |
 | MACD signal/hist | `slow+signal-2` | `slow+signal-1` |
 
 缺失会延长经过的时钟时间；预热数不是保证有效输出的日历长度。达到 lookback 后仍可能遇到数学上无定义的结果：VWMA 总成交量为零、ROC 历史价格为零、CCI 平均偏差为零、WillR 高低价范围为零。Stoch 在平坦区间返回 `50`，RSI 在平坦序列按 tav 口径返回 `100`。MFI 在负资金流为零时沿用 banta/tav 的无定义结果，不强行输出 `100`。产生 NaN 的计算结果沿用现有 `Warmup` 有效性，产生无穷大的结果为 `NonFinite`；这些结果不会变成可交易的有限分数。

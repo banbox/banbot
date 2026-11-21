@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"strings"
 	"time"
 )
@@ -19,14 +20,17 @@ type RebalanceConfig struct {
 	Timezone        string `json:"timezone,omitempty" yaml:"timezone,omitempty"`
 }
 type SelectionConfig struct {
-	LongK         int            `json:"long_k,omitempty" yaml:"long_k,omitempty"`
-	ShortK        int            `json:"short_k,omitempty" yaml:"short_k,omitempty"`
-	LongQuantile  float64        `json:"long_quantile,omitempty" yaml:"long_quantile,omitempty"`
-	ShortQuantile float64        `json:"short_quantile,omitempty" yaml:"short_quantile,omitempty"`
-	RetainRank    int            `json:"retain_rank,omitempty" yaml:"retain_rank,omitempty"`
-	Dropout       int            `json:"dropout,omitempty" yaml:"dropout,omitempty"`
-	GroupQuota    map[string]int `json:"group_quota,omitempty" yaml:"group_quota,omitempty"`
-	MissingScores string         `json:"missing_scores,omitempty" yaml:"missing_scores,omitempty"`
+	LongK              int            `json:"long_k,omitempty" yaml:"long_k,omitempty"`
+	ShortK             int            `json:"short_k,omitempty" yaml:"short_k,omitempty"`
+	LongQuantile       float64        `json:"long_quantile,omitempty" yaml:"long_quantile,omitempty"`
+	ShortQuantile      float64        `json:"short_quantile,omitempty" yaml:"short_quantile,omitempty"`
+	LongMinScore       *float64       `json:"long_min_score,omitempty" yaml:"long_min_score,omitempty"`
+	ShortMaxScore      *float64       `json:"short_max_score,omitempty" yaml:"short_max_score,omitempty"`
+	UnfilledSlotPolicy string         `json:"unfilled_slot_policy,omitempty" yaml:"unfilled_slot_policy,omitempty"`
+	RetainRank         int            `json:"retain_rank,omitempty" yaml:"retain_rank,omitempty"`
+	Dropout            int            `json:"dropout,omitempty" yaml:"dropout,omitempty"`
+	GroupQuota         map[string]int `json:"group_quota,omitempty" yaml:"group_quota,omitempty"`
+	MissingScores      string         `json:"missing_scores,omitempty" yaml:"missing_scores,omitempty"`
 }
 type HoldingRule struct {
 	MinBars     int    `json:"min_bars,omitempty" yaml:"min_bars,omitempty"`
@@ -69,16 +73,49 @@ type TransitionConfig struct {
 	EntryWindowBars int                       `json:"entry_window_bars,omitempty" yaml:"entry_window_bars,omitempty"`
 	ByAsset         map[string]TransitionRule `json:"by_asset,omitempty" yaml:"by_asset,omitempty"`
 }
+const DefaultAllocationRiskWindow = 20
+
 type AllocationConfig struct {
-	Method        string             `json:"method,omitempty" yaml:"method,omitempty"`
-	ReserveRatio  float64            `json:"reserve_ratio,omitempty" yaml:"reserve_ratio,omitempty"`
-	FixedNotional float64            `json:"fixed_notional,omitempty" yaml:"fixed_notional,omitempty"`
-	VolTarget     float64            `json:"vol_target,omitempty" yaml:"vol_target,omitempty"`
-	AssetCap      float64            `json:"asset_cap,omitempty" yaml:"asset_cap,omitempty"`
-	GroupCaps     map[string]float64 `json:"group_caps,omitempty" yaml:"group_caps,omitempty"`
-	TurnoverLimit float64            `json:"turnover_limit,omitempty" yaml:"turnover_limit,omitempty"`
-	NetCap        float64            `json:"net_cap,omitempty" yaml:"net_cap,omitempty"`
-	BetaCap       float64            `json:"beta_cap,omitempty" yaml:"beta_cap,omitempty"`
+	Method           string             `json:"method,omitempty" yaml:"method,omitempty"`
+	VolatilityColumn string             `json:"volatility_column,omitempty" yaml:"volatility_column,omitempty"`
+	BetaColumn       string             `json:"beta_column,omitempty" yaml:"beta_column,omitempty"`
+	RiskWindow       int                `json:"risk_window,omitempty" yaml:"risk_window,omitempty"`
+	Shrinkage        float64            `json:"shrinkage,omitempty" yaml:"shrinkage,omitempty"`
+	RiskAversion     float64            `json:"risk_aversion,omitempty" yaml:"risk_aversion,omitempty"`
+	ReserveRatio     float64            `json:"reserve_ratio,omitempty" yaml:"reserve_ratio,omitempty"`
+	FixedNotional    float64            `json:"fixed_notional,omitempty" yaml:"fixed_notional,omitempty"`
+	VolTarget        float64            `json:"vol_target,omitempty" yaml:"vol_target,omitempty"`
+	AssetCap         float64            `json:"asset_cap,omitempty" yaml:"asset_cap,omitempty"`
+	GroupCaps        map[string]float64 `json:"group_caps,omitempty" yaml:"group_caps,omitempty"`
+	TurnoverLimit    float64            `json:"turnover_limit,omitempty" yaml:"turnover_limit,omitempty"`
+	NetCap           float64            `json:"net_cap,omitempty" yaml:"net_cap,omitempty"`
+	BetaCap          float64            `json:"beta_cap,omitempty" yaml:"beta_cap,omitempty"`
+}
+
+func (a AllocationConfig) EffectiveRiskWindow() int {
+	if a.RiskWindow >= 2 {
+		return a.RiskWindow
+	}
+	return DefaultAllocationRiskWindow
+}
+
+func (a AllocationConfig) EffectiveRiskAversion() float64 {
+	if a.RiskAversion > 0 && !math.IsNaN(a.RiskAversion) && !math.IsInf(a.RiskAversion, 0) {
+		return a.RiskAversion
+	}
+	return 1.0
+}
+
+func (a AllocationConfig) IsCovarianceMethod() bool {
+	switch a.Method {
+	case "erc", "risk-parity", "hrp", "min-variance", "mean-variance":
+		return true
+	}
+	return false
+}
+
+func (a AllocationConfig) NeedsRiskInput() bool {
+	return a.Method == "inverse-volatility" || a.Method == "vol-target" || a.IsCovarianceMethod()
 }
 type PortfolioPolicyConfig struct {
 	Policy        string           `json:"policy"`
@@ -94,6 +131,14 @@ type PortfolioPolicyConfig struct {
 
 func ClonePortfolioPolicyConfig(c PortfolioPolicyConfig) PortfolioPolicyConfig {
 	c.PolicyParams = append(json.RawMessage(nil), c.PolicyParams...)
+	if c.Selection.LongMinScore != nil {
+		v := *c.Selection.LongMinScore
+		c.Selection.LongMinScore = &v
+	}
+	if c.Selection.ShortMaxScore != nil {
+		v := *c.Selection.ShortMaxScore
+		c.Selection.ShortMaxScore = &v
+	}
 	c.Selection.GroupQuota = maps.Clone(c.Selection.GroupQuota)
 	c.Holding.ByAsset = maps.Clone(c.Holding.ByAsset)
 	for name, o := range c.Holding.ByAsset {
@@ -219,6 +264,15 @@ func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyCon
 	if s.MissingScores != "skip" && s.MissingScores != "shrink" && s.MissingScores != "cash" {
 		return c, errors.New("factor: unknown missing score behavior")
 	}
+	if s.LongMinScore != nil && (math.IsNaN(*s.LongMinScore) || math.IsInf(*s.LongMinScore, 0)) {
+		return c, errors.New("factor: non-finite long_min_score")
+	}
+	if s.ShortMaxScore != nil && (math.IsNaN(*s.ShortMaxScore) || math.IsInf(*s.ShortMaxScore, 0)) {
+		return c, errors.New("factor: non-finite short_max_score")
+	}
+	if s.UnfilledSlotPolicy != "" && s.UnfilledSlotPolicy != "cash" && s.UnfilledSlotPolicy != "rescale" {
+		return c, errors.New("factor: unknown unfilled slot policy")
+	}
 	h := &c.Holding
 	if err := validateHolding(HoldingRule{h.MinBars, h.MaxBars, h.MinDuration, h.MaxDuration}); err != nil {
 		return c, err
@@ -331,11 +385,28 @@ func NormalizePortfolioPolicyConfig(c PortfolioPolicyConfig) (PortfolioPolicyCon
 	if a.Method == "" {
 		a.Method = "equal"
 	}
-	if a.Method != "fixed-notional" && a.FixedNotional != 0 || a.Method != "vol-target" && a.VolTarget != 0 {
+	if a.Method == "risk-parity" {
+		a.Method = "erc"
+	}
+	if a.VolatilityColumn != "" && strings.TrimSpace(a.VolatilityColumn) == "" || a.BetaColumn != "" && strings.TrimSpace(a.BetaColumn) == "" {
+		return c, errors.New("factor: allocation column name cannot be blank")
+	}
+	a.VolatilityColumn = strings.TrimSpace(a.VolatilityColumn)
+	a.BetaColumn = strings.TrimSpace(a.BetaColumn)
+	if a.Method != "fixed-notional" && a.FixedNotional != 0 || a.Method != "vol-target" && a.VolTarget != 0 || a.Method != "mean-variance" && a.RiskAversion != 0 {
 		return c, errors.New("factor: allocation sizing field unused by selected method")
 	}
+	if a.RiskWindow < 0 || a.RiskWindow == 1 || a.RiskWindow > 10000 {
+		return c, errors.New("factor: invalid allocation risk_window")
+	}
+	if math.IsNaN(a.Shrinkage) || math.IsInf(a.Shrinkage, 0) || a.Shrinkage < 0 || a.Shrinkage > 1 {
+		return c, errors.New("factor: invalid allocation shrinkage")
+	}
+	if math.IsNaN(a.RiskAversion) || math.IsInf(a.RiskAversion, 0) || a.RiskAversion < 0 {
+		return c, errors.New("factor: invalid allocation risk_aversion")
+	}
 	switch a.Method {
-	case "equal", "score", "inverse-volatility":
+	case "equal", "score", "inverse-volatility", "erc", "hrp", "min-variance", "mean-variance":
 	case "fixed-notional":
 		if a.FixedNotional <= 0 {
 			return c, errors.New("factor: fixed notional must be positive")

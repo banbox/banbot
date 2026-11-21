@@ -30,6 +30,29 @@ func (f FactorContext) Field(name string) *factor.Node {
 	return factor.Field("kline", name, f.TimeFrame)
 }
 
+// RefField reads a kline field of a specific benchmark symbol on f.TimeFrame.
+func (f FactorContext) RefField(symbol, name string) *factor.Node {
+	return factor.RefAssetField(symbol, "kline", name, f.TimeFrame)
+}
+
+// RefSourceField reads any source field of a specific benchmark symbol on f.TimeFrame.
+func (f FactorContext) RefSourceField(symbol, source, name string) *factor.Node {
+	return factor.RefAssetField(symbol, source, name, f.TimeFrame)
+}
+
+// SubTF evaluates a source-timeframe subgraph and causally aligns it onto f.TimeFrame.
+func (f FactorContext) SubTF(sourceTimeFrame string, build func(FactorContext) *factor.Node, maxAge ...int64) *factor.Node {
+	var age int64
+	if len(maxAge) > 0 {
+		age = maxAge[0]
+	}
+	var inner *factor.Node
+	if build != nil {
+		inner = build(FactorContext{TimeFrame: sourceTimeFrame, Params: f.Params})
+	}
+	return factor.AsOfNode(inner, f.TimeFrame, age)
+}
+
 // RegisterFactor registers a cross-section strategy in one call:
 //
 //	runner.RegisterFactor("my-mom", func(c runner.FactorContext) (runner.FactorSpec, error) {
@@ -68,7 +91,10 @@ func RegisterFactor(name string, build func(FactorContext) (FactorSpec, error)) 
 			combo.Method = research.Equal
 		}
 		if len(combo.Columns) == 0 {
-			combo.Columns = plan.Outputs()
+			combo.Columns = defaultComboColumns(plan.Outputs(), allocationReservedColumns(c)...)
+			if len(combo.Columns) == 0 {
+				return nil, research.ComboSpec{}, fmt.Errorf("runner: factor %q declares no score outputs", name)
+			}
 		}
 		return plan, combo, nil
 	})

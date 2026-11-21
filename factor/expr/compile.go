@@ -47,6 +47,7 @@ type compiler struct {
 	visiting    map[string]bool
 	depth       int
 	heights     map[*factor.Node]int
+	tfOverride  string
 }
 
 func names[V any](items map[string]V) []string {
@@ -96,7 +97,7 @@ func CompileNodes(spec Spec) (map[string]*factor.Node, error) {
 	}
 	for _, name := range names(spec.Bindings) {
 		b := spec.Bindings[name]
-		if !identifier(name) || name == "factor" || name == "param" || name == "label" || name == "ts" || name == "cs" || name == "group" {
+		if !identifier(name) || name == "factor" || name == "param" || name == "label" || name == "ts" || name == "cs" || name == "group" || name == "mtf" || name == "ref" {
 			return nil, fmt.Errorf("bindings.%s: invalid or reserved alias", name)
 		}
 		if strings.TrimSpace(b.Source) == "" || strings.TrimSpace(b.TimeFrame) == "" {
@@ -171,24 +172,25 @@ func (c *compiler) error(path string, e *expression, format string, args ...any)
 	return fmt.Errorf("%s:%d:%d: %s", path, pos.Line, pos.Column, fmt.Sprintf(format, args...))
 }
 func (c *compiler) named(name string) (*factor.Node, error) {
-	if c.visiting[name] {
+	key := c.scopedFactorKey(name)
+	if c.visiting[key] {
 		return nil, c.error(c.paths[name], c.definitions[name], "cyclic factor reference %q", name)
 	}
-	if n := c.nodes[name]; n != nil {
+	if n := c.nodes[key]; n != nil {
 		return n, nil
 	}
 	e, ok := c.definitions[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown factor %q", name)
 	}
-	c.visiting[name] = true
+	c.visiting[key] = true
 	n, err := c.lower(c.paths[name], e)
-	delete(c.visiting, name)
+	delete(c.visiting, key)
 	if err == nil && c.height(n) > maxDepth {
 		return nil, c.error(c.paths[name], e, "expanded factor DAG exceeds depth %d", maxDepth)
 	}
 	if err == nil {
-		c.nodes[name] = n
+		c.nodes[key] = n
 	}
 	return n, err
 }
@@ -205,24 +207,6 @@ func (c *compiler) height(n *factor.Node) int {
 	return depth
 }
 
-func hasCrossSection(n *factor.Node) bool {
-	seen := map[*factor.Node]bool{}
-	queue := []*factor.Node{n}
-	for len(queue) > 0 {
-		last := len(queue) - 1
-		n = queue[last]
-		queue = queue[:last]
-		if seen[n] {
-			continue
-		}
-		seen[n] = true
-		if n.Spec.Kind == factor.CS || n.Spec.Kind == factor.GROUP {
-			return true
-		}
-		queue = append(queue, n.Inputs...)
-	}
-	return false
-}
 func (c *compiler) number(path string, e *expression) (float64, error) {
 	if e == nil {
 		return 0, c.error(path, e, "numeric constant or parameter required")
@@ -261,10 +245,15 @@ func (c *compiler) field(path string, e *expression, alias, name string) (*facto
 	if name == "" {
 		return nil, c.error(path, e, "field name must not be empty")
 	}
+	activeTF := c.currentTF()
 	if b.Sampling == "asof" || b.Sampling == "asof-latest" {
-		return factor.AsOfField(b.Source, name, b.TimeFrame, c.spec.TimeFrame, b.MaxAgeMS), nil
+		return factor.AsOfField(b.Source, name, b.TimeFrame, activeTF, b.MaxAgeMS), nil
 	}
-	return factor.Field(b.Source, name, b.TimeFrame), nil
+	tf := b.TimeFrame
+	if c.tfOverride != "" {
+		tf = activeTF
+	}
+	return factor.Field(b.Source, name, tf), nil
 }
 func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 	c.depth++
@@ -278,8 +267,17 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		return factor.Constant(v, c.spec.TimeFrame), nil
+		return factor.Constant(v, c.currentTF()), nil
 	case 'r':
+		if !strings.Contains(e.text, ".") && isDefaultKlineField(e.text) {
+			if _, ok := c.spec.Bindings["kline"]; ok {
+				return c.field(path, e, "kline", e.text)
+			}
+			if len(c.spec.Bindings) == 0 {
+				return factor.Field("kline", e.text, c.currentTF()), nil
+			}
+			return nil, c.error(path, e, "%s shorthand requires a \"kline\" binding", e.text)
+		}
 		parts := strings.Split(e.text, ".")
 		if len(parts) != 2 {
 			return nil, c.error(path, e, "expected alias.field, factor.name or param.name")
@@ -297,7 +295,7 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 			if err != nil {
 				return nil, err
 			}
-			return factor.Constant(v, c.spec.TimeFrame), nil
+			return factor.Constant(v, c.currentTF()), nil
 		default:
 			return c.field(path, e, parts[0], parts[1])
 		}
@@ -310,7 +308,7 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 			return factor.Neg(n), nil
 		}
 		return n, nil
-	case '+', '-', '*', '/':
+	case '+', '-', '*', '/', '>', '<', tokGe, tokLe:
 		a, err := c.lower(path, e.args[0])
 		if err != nil {
 			return nil, err
@@ -326,8 +324,16 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 			return factor.Sub(a, b), nil
 		case '*':
 			return factor.Mul(a, b), nil
-		default:
+		case '/':
 			return factor.Div(a, b), nil
+		case '>':
+			return factor.Gt(a, b), nil
+		case '<':
+			return factor.Lt(a, b), nil
+		case tokGe:
+			return factor.Ge(a, b), nil
+		default:
+			return factor.Le(a, b), nil
 		}
 	case 'c':
 		return c.call(path, e)
@@ -337,10 +343,22 @@ func (c *compiler) lower(path string, e *expression) (*factor.Node, error) {
 }
 
 func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
+	if n, handled, err := c.mtfOrRefCall(path, e); handled {
+		return n, err
+	}
 	if n, handled, err := c.indicatorCall(path, e); handled {
 		return n, err
 	}
-	arities := map[string]int{"field": 2, "positive": 1, "abs": 1, "log": 1, "sqrt": 1, "pow": 2, "min": 2, "max": 2, "ts.lag": 2, "ts.return": 2, "ts.ema": 2, "ts.std": 3, "cs.rank": 1, "cs.zscore": 1, "cs.robust_zscore": 1, "cs.mad_winsorize": 2, "cs.winsorize": 2, "cs.quantile": 2, "group.residual": 2, "group.demean": 3, "group.zscore": 3}
+	arities := map[string]int{
+		"field": 2, "positive": 1, "sign": 1, "clip": 3,
+		"abs": 1, "log": 1, "sqrt": 1, "pow": 2, "min": 2, "max": 2,
+		"gt": 2, "ge": 2, "lt": 2, "le": 2, "where": 3, "if_else": 3,
+		"ts.lag": 2, "ts.return": 2, "ts.ret": 2, "ts.ema": 2, "ts.std": 3,
+		"cs.rank": 1, "cs.pct_rank": 1, "cs.zscore": 1, "cs.robust_zscore": 1,
+		"cs.mean": 1, "cs.sum": 1,
+		"cs.mad_winsorize": 2, "cs.winsorize": 2, "cs.quantile": 2,
+		"group.residual": 2, "group.demean": 3, "group.zscore": 3,
+	}
 	if e.text == "group.ols" || e.text == "group.wls" {
 		minimum := 2
 		if e.text == "group.wls" {
@@ -395,6 +413,8 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	switch e.text {
 	case "positive":
 		return factor.Positive(a), nil
+	case "sign":
+		return factor.Sign(a), nil
 	case "abs":
 		return factor.Abs(a), nil
 	case "log":
@@ -403,11 +423,40 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 		return factor.Sqrt(a), nil
 	case "cs.rank":
 		return factor.Rank(a), nil
+	case "cs.pct_rank":
+		return factor.PctRank(a), nil
 	case "cs.zscore":
 		return factor.ZScore(a), nil
 	case "cs.robust_zscore":
 		return factor.RobustZScore(a), nil
-	case "pow", "min", "max", "group.residual":
+	case "cs.mean":
+		return factor.CsMean(a), nil
+	case "cs.sum":
+		return factor.CsSum(a), nil
+	case "clip":
+		lo, err := c.number(path, e.args[1])
+		if err != nil {
+			return nil, err
+		}
+		hi, err := c.number(path, e.args[2])
+		if err != nil {
+			return nil, err
+		}
+		if lo > hi {
+			return nil, c.error(path, e.args[1], "clip requires lo <= hi")
+		}
+		return factor.Clip(a, lo, hi), nil
+	case "where", "if_else":
+		b, err := c.lower(path, e.args[1])
+		if err != nil {
+			return nil, err
+		}
+		d, err := c.lower(path, e.args[2])
+		if err != nil {
+			return nil, err
+		}
+		return factor.Where(a, b, d), nil
+	case "pow", "min", "max", "gt", "ge", "lt", "le", "group.residual":
 		b, err := c.lower(path, e.args[1])
 		if err != nil {
 			return nil, err
@@ -419,6 +468,14 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 			return factor.Min(a, b), nil
 		case "max":
 			return factor.Max(a, b), nil
+		case "gt":
+			return factor.Gt(a, b), nil
+		case "ge":
+			return factor.Ge(a, b), nil
+		case "lt":
+			return factor.Lt(a, b), nil
+		case "le":
+			return factor.Le(a, b), nil
 		default:
 			return factor.Residual(a, b), nil
 		}
@@ -447,9 +504,6 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	if e.text == "ts.lag" && v == 0 {
 		return a, nil
 	}
-	if hasCrossSection(a) {
-		return nil, c.error(path, e, "TS windows over cross-section results are not supported")
-	}
 	if v < 1 || v > maxWindow || v != math.Trunc(v) {
 		return nil, c.error(path, e.args[1], "window must be an integer in [1,%d] (lag also permits zero)", maxWindow)
 	}
@@ -457,11 +511,11 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 	switch e.text {
 	case "ts.lag":
 		return factor.Lag(a, period), nil
-	case "ts.return":
+	case "ts.return", "ts.ret":
 		return factor.Return(a, period), nil
 	case "ts.ema":
 		return factor.EMA(a, period), nil
-	default:
+	case "ts.std":
 		ddof, err := c.number(path, e.args[2])
 		if err != nil {
 			return nil, err
@@ -470,56 +524,183 @@ func (c *compiler) call(path string, e *expression) (*factor.Node, error) {
 			return nil, c.error(path, e.args[2], "ddof must be an integer in [0,window)")
 		}
 		return factor.StdDev(a, period, int(ddof)), nil
+	default:
+		return nil, c.error(path, e, "unknown function %q", e.text)
 	}
 }
 
+func (c *compiler) resolveDefaultKlineFields(path string, e *expression, fields ...string) ([]*factor.Node, error) {
+	if _, ok := c.spec.Bindings["kline"]; !ok {
+		return nil, c.error(path, e, "%s shorthand requires a \"kline\" binding or explicit field arguments", e.text)
+	}
+	nodes := make([]*factor.Node, len(fields))
+	for i, name := range fields {
+		n, err := c.field(path, e, "kline", name)
+		if err != nil {
+			return nil, err
+		}
+		nodes[i] = n
+	}
+	return nodes, nil
+}
+
+type indicatorParamKind uint8
+
+const (
+	paramPeriod indicatorParamKind = iota
+	paramNonNegative
+	paramPositive
+	paramUnitInterval
+)
+
 func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool, error) {
-	inputCount, parameterCount := 1, 1
+	inputCount, minPeriod := 1, 1
+	paramKinds := []indicatorParamKind{paramPeriod}
+	var defaultKlineFields []string
+
 	switch e.text {
-	case "ts.sma", "ts.rma", "ts.wma", "ts.rsi", "ts.roc", "ts.mom", "ts.cci", "ts.highest", "ts.lowest":
+	case "ts.sma", "ts.rma", "ts.wma", "ts.decay_linear", "ts.rsi", "ts.roc", "ts.mom", "ts.cci", "ts.highest", "ts.lowest",
+		"ts.dema", "ts.tema", "ts.trima", "ts.er",
+		"ts.sum", "ts.product", "ts.rank", "ts.zscore", "ts.argmax", "ts.argmin", "ts.slope", "ts.rsquare":
+	case "ts.hma":
+		minPeriod = 2
+	case "ts.skew":
+		minPeriod = 3
+	case "ts.kurt":
+		minPeriod = 4
+	case "ts.hurst":
+		minPeriod = 8
+	case "ts.kama":
+		if len(e.args) == 4 {
+			paramKinds = []indicatorParamKind{paramPeriod, paramPeriod, paramPeriod}
+		}
+	case "ts.alma":
+		if len(e.args) != 2 {
+			paramKinds = []indicatorParamKind{paramPeriod, paramUnitInterval, paramPositive}
+		}
+	case "ts.kalman1d":
+		paramKinds = []indicatorParamKind{paramPositive, paramPositive}
+	case "ts.stc":
+		paramKinds = []indicatorParamKind{paramPeriod, paramPeriod, paramPeriod}
+	case "ts.corr", "ts.cov", "ts.beta":
+		inputCount = 2
 	case "ts.vwma":
 		inputCount = 2
-	case "ts.tr":
-		inputCount, parameterCount = 3, 0
-	case "ts.atr", "ts.stoch", "ts.willr":
-		inputCount = 3
+		defaultKlineFields = []string{"close", "volume"}
 	case "ts.obv":
-		inputCount, parameterCount = 2, 0
-	case "ts.mfi":
+		inputCount, paramKinds = 2, nil
+		defaultKlineFields = []string{"close", "volume"}
+	case "ts.volume_delta", "ts.cvd":
+		inputCount, paramKinds = 2, nil
+		defaultKlineFields = []string{"volume", "buy_volume"}
+	case "ts.rolling_cvd", "ts.taker_buy_ratio":
+		inputCount = 2
+		defaultKlineFields = []string{"volume", "buy_volume"}
+	case "ts.aroon_up", "ts.aroon_down", "ts.aroon_osc",
+		"ts.donchian_upper", "ts.donchian_mid", "ts.donchian_middle", "ts.donchian_lower",
+		"ts.ichimoku_conversion", "ts.ichimoku_base", "ts.parkinson_vol":
+		inputCount = 2
+		defaultKlineFields = []string{"high", "low"}
+	case "ts.sar":
+		inputCount = 2
+		defaultKlineFields = []string{"high", "low"}
+		if len(e.args) == 0 || len(e.args) == 2 {
+			paramKinds = nil
+		} else {
+			paramKinds = []indicatorParamKind{paramPositive, paramPositive, paramPositive}
+		}
+	case "ts.tr":
+		inputCount, paramKinds = 3, nil
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.atr", "ts.stoch", "ts.willr",
+		"ts.adx", "ts.dmi_plus", "ts.plus_di", "ts.dmi_minus", "ts.minus_di",
+		"ts.natr", "ts.vortex_plus", "ts.vortex_minus":
+		inputCount = 3
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.chop":
+		inputCount, minPeriod = 3, 2
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.keltner_upper", "ts.keltner_mid", "ts.keltner_middle", "ts.keltner_lower":
+		inputCount = 3
+		paramKinds = []indicatorParamKind{paramPeriod, paramNonNegative}
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.supertrend", "ts.supertrend_dir":
+		inputCount = 3
+		paramKinds = []indicatorParamKind{paramPeriod, paramPositive}
+		defaultKlineFields = []string{"high", "low", "close"}
+	case "ts.adl":
+		inputCount, paramKinds = 4, nil
+		defaultKlineFields = []string{"high", "low", "close", "volume"}
+	case "ts.mfi", "ts.cmf":
 		inputCount = 4
-	case "ts.macd", "ts.macd_signal", "ts.macd_hist", "ts.bbands_upper", "ts.bbands_middle", "ts.bbands_lower":
-		parameterCount = 3
+		defaultKlineFields = []string{"high", "low", "close", "volume"}
+	case "ts.adosc", "ts.chaikin_osc":
+		inputCount = 4
+		paramKinds = []indicatorParamKind{paramPeriod, paramPeriod}
+		defaultKlineFields = []string{"high", "low", "close", "volume"}
+	case "ts.garman_klass_vol":
+		inputCount = 4
+		defaultKlineFields = []string{"open", "high", "low", "close"}
+	case "ts.yang_zhang_vol":
+		inputCount, minPeriod = 4, 2
+		defaultKlineFields = []string{"open", "high", "low", "close"}
+	case "ts.macd", "ts.macd_signal", "ts.macd_hist":
+		paramKinds = []indicatorParamKind{paramPeriod, paramPeriod, paramPeriod}
+	case "ts.bbands_upper", "ts.bbands_middle", "ts.bbands_lower":
+		paramKinds = []indicatorParamKind{paramPeriod, paramNonNegative, paramNonNegative}
 	default:
 		return nil, false, nil
 	}
+
+	parameterCount := len(paramKinds)
 	count := inputCount + parameterCount
-	if len(e.args) != count {
+	useDefaultFields := len(defaultKlineFields) > 0 && len(e.args) == parameterCount
+	if !useDefaultFields && len(e.args) != count {
 		return nil, true, c.error(path, e, "%s expects %d arguments, got %d", e.text, count, len(e.args))
 	}
-	inputs := make([]*factor.Node, inputCount)
-	for i := range inputs {
-		n, err := c.lower(path, e.args[i])
+	var inputs []*factor.Node
+	paramOffset := inputCount
+	if useDefaultFields {
+		var err error
+		inputs, err = c.resolveDefaultKlineFields(path, e, defaultKlineFields...)
 		if err != nil {
 			return nil, true, err
 		}
-		if hasCrossSection(n) {
-			return nil, true, c.error(path, e.args[i], "TS indicators over cross-section results are not supported")
+		paramOffset = 0
+	} else {
+		inputs = make([]*factor.Node, inputCount)
+		for i := range inputs {
+			n, err := c.lower(path, e.args[i])
+			if err != nil {
+				return nil, true, err
+			}
+			inputs[i] = n
 		}
-		inputs[i] = n
 	}
 	parameters := make([]float64, parameterCount)
-	for i := range parameters {
-		arg := e.args[inputCount+i]
+	for i, kind := range paramKinds {
+		arg := e.args[paramOffset+i]
 		value, err := c.number(path, arg)
 		if err != nil {
 			return nil, true, err
 		}
-		if strings.HasPrefix(e.text, "ts.bbands_") && i > 0 {
+		switch kind {
+		case paramNonNegative:
 			if value < 0 {
-				return nil, true, c.error(path, arg, "standard deviation multiplier must be nonnegative")
+				return nil, true, c.error(path, arg, "multiplier must be nonnegative")
 			}
-		} else if value < 1 || value > factor.MaxIndicatorPeriod || value != math.Trunc(value) {
-			return nil, true, c.error(path, arg, "window must be an integer in [1,%d]", factor.MaxIndicatorPeriod)
+		case paramPositive:
+			if value <= 0 {
+				return nil, true, c.error(path, arg, "parameter must be positive")
+			}
+		case paramUnitInterval:
+			if value < 0 || value > 1 {
+				return nil, true, c.error(path, arg, "offset must be in [0,1]")
+			}
+		default:
+			if value < float64(minPeriod) || value > factor.MaxIndicatorPeriod || value != math.Trunc(value) {
+				return nil, true, c.error(path, arg, "window must be an integer in [%d,%d]", minPeriod, factor.MaxIndicatorPeriod)
+			}
 		}
 		parameters[i] = value
 	}
@@ -536,8 +717,65 @@ func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool
 		result = factor.RMA(a, period)
 	case "ts.wma":
 		result = factor.WMA(a, period)
+	case "ts.decay_linear":
+		result = factor.DecayLinear(a, period)
+	case "ts.dema":
+		result = factor.DEMA(a, period)
+	case "ts.tema":
+		result = factor.TEMA(a, period)
+	case "ts.hma":
+		result = factor.HMA(a, period)
+	case "ts.kama":
+		if len(parameters) == 3 {
+			if parameters[1] >= parameters[2] {
+				return nil, true, c.error(path, e, "KAMA requires fast < slow")
+			}
+			result = factor.KAMABy(a, period, int(parameters[1]), int(parameters[2]))
+		} else {
+			result = factor.KAMA(a, period)
+		}
+	case "ts.alma":
+		if len(parameters) == 1 {
+			result = factor.ALMA(a, period, 0.85, 6.0)
+		} else {
+			result = factor.ALMA(a, period, parameters[1], parameters[2])
+		}
+	case "ts.trima":
+		result = factor.TRIMA(a, period)
+	case "ts.er":
+		result = factor.ER(a, period)
+	case "ts.kalman1d":
+		result = factor.Kalman1D(a, parameters[0], parameters[1])
+	case "ts.hurst":
+		result = factor.Hurst(a, period)
 	case "ts.vwma":
 		result = factor.VWMA(a, inputs[1], period)
+	case "ts.corr":
+		result = factor.TsCorr(a, inputs[1], period)
+	case "ts.cov":
+		result = factor.TsCov(a, inputs[1], period)
+	case "ts.beta":
+		result = factor.TsBeta(a, inputs[1], period)
+	case "ts.sum":
+		result = factor.TsSum(a, period)
+	case "ts.product":
+		result = factor.TsProduct(a, period)
+	case "ts.rank":
+		result = factor.TsRank(a, period)
+	case "ts.zscore":
+		result = factor.TsZScore(a, period)
+	case "ts.argmax":
+		result = factor.TsArgMax(a, period)
+	case "ts.argmin":
+		result = factor.TsArgMin(a, period)
+	case "ts.skew":
+		result = factor.TsSkew(a, period)
+	case "ts.kurt":
+		result = factor.TsKurt(a, period)
+	case "ts.slope":
+		result = factor.TsSlope(a, period)
+	case "ts.rsquare":
+		result = factor.TsRSquare(a, period)
 	case "ts.rsi":
 		result = factor.RSI(a, period)
 	case "ts.roc":
@@ -554,10 +792,87 @@ func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool
 		result = factor.Stoch(a, inputs[1], inputs[2], period)
 	case "ts.willr":
 		result = factor.WillR(a, inputs[1], inputs[2], period)
+	case "ts.adx":
+		result = factor.ADX(a, inputs[1], inputs[2], period)
+	case "ts.dmi_plus", "ts.plus_di":
+		result = factor.PlusDI(a, inputs[1], inputs[2], period)
+	case "ts.dmi_minus", "ts.minus_di":
+		result = factor.MinusDI(a, inputs[1], inputs[2], period)
+	case "ts.natr":
+		result = factor.NATR(a, inputs[1], inputs[2], period)
+	case "ts.chop":
+		result = factor.CHOP(a, inputs[1], inputs[2], period)
+	case "ts.aroon_up":
+		result = factor.AroonUp(a, inputs[1], period)
+	case "ts.aroon_down":
+		result = factor.AroonDown(a, inputs[1], period)
+	case "ts.aroon_osc":
+		result = factor.AroonOsc(a, inputs[1], period)
+	case "ts.vortex_plus":
+		result = factor.VortexPlus(a, inputs[1], inputs[2], period)
+	case "ts.vortex_minus":
+		result = factor.VortexMinus(a, inputs[1], inputs[2], period)
+	case "ts.donchian_upper":
+		result = factor.DonchianUpper(a, inputs[1], period)
+	case "ts.donchian_mid", "ts.donchian_middle":
+		result = factor.DonchianMid(a, inputs[1], period)
+	case "ts.donchian_lower":
+		result = factor.DonchianLower(a, inputs[1], period)
+	case "ts.keltner_upper":
+		result = factor.KeltnerUpper(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.keltner_mid", "ts.keltner_middle":
+		result = factor.KeltnerMid(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.keltner_lower":
+		result = factor.KeltnerLower(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.supertrend":
+		result = factor.Supertrend(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.supertrend_dir":
+		result = factor.SupertrendDir(a, inputs[1], inputs[2], period, parameters[1])
+	case "ts.sar":
+		if len(parameters) == 0 {
+			result = factor.SAR(a, inputs[1], 0.02, 0.02, 0.2)
+		} else {
+			if parameters[2] < parameters[0] {
+				return nil, true, c.error(path, e, "SAR requires max >= start")
+			}
+			result = factor.SAR(a, inputs[1], parameters[0], parameters[1], parameters[2])
+		}
+	case "ts.stc":
+		if parameters[0] >= parameters[1] {
+			return nil, true, c.error(path, e, "STC requires fast < slow")
+		}
+		result = factor.STC(a, period, int(parameters[1]), int(parameters[2]))
+	case "ts.ichimoku_conversion":
+		result = factor.IchimokuConversion(a, inputs[1], period)
+	case "ts.ichimoku_base":
+		result = factor.IchimokuBase(a, inputs[1], period)
 	case "ts.obv":
 		result = factor.OBV(a, inputs[1])
 	case "ts.mfi":
 		result = factor.MFI(a, inputs[1], inputs[2], inputs[3], period)
+	case "ts.cmf":
+		result = factor.CMF(a, inputs[1], inputs[2], inputs[3], period)
+	case "ts.adl":
+		result = factor.ADL(a, inputs[1], inputs[2], inputs[3])
+	case "ts.adosc", "ts.chaikin_osc":
+		if parameters[0] >= parameters[1] {
+			return nil, true, c.error(path, e, "ADOSC requires fast < slow")
+		}
+		result = factor.ChaikinOsc(a, inputs[1], inputs[2], inputs[3], period, int(parameters[1]))
+	case "ts.volume_delta":
+		result = factor.VolumeDelta(a, inputs[1])
+	case "ts.cvd":
+		result = factor.CVD(a, inputs[1])
+	case "ts.rolling_cvd":
+		result = factor.RollingCVD(a, inputs[1], period)
+	case "ts.taker_buy_ratio":
+		result = factor.TakerBuyRatio(a, inputs[1], period)
+	case "ts.parkinson_vol":
+		result = factor.ParkinsonVol(a, inputs[1], period)
+	case "ts.garman_klass_vol":
+		result = factor.GarmanKlassVol(a, inputs[1], inputs[2], inputs[3], period)
+	case "ts.yang_zhang_vol":
+		result = factor.YangZhangVol(a, inputs[1], inputs[2], inputs[3], period)
 	case "ts.highest":
 		result = factor.Highest(a, period)
 	case "ts.lowest":
@@ -585,6 +900,8 @@ func (c *compiler) indicatorCall(path string, e *expression) (*factor.Node, bool
 		default:
 			result = lower
 		}
+	default:
+		return nil, true, c.error(path, e, "unknown indicator %q", e.text)
 	}
 	return result, true, nil
 }

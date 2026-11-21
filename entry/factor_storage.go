@@ -352,7 +352,12 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 		if c.Snapshot.Universe.Version == "" {
 			raw, _ := json.Marshal(ids)
 			digest := sha256.Sum256(raw)
-			c.Snapshot.Universe = factor.Universe{Version: "storage-static:" + hex.EncodeToString(digest[:]), Investable: ids, Reference: ids, Tradable: ids, Evaluation: ids, Tracked: ids, Static: true}
+			isStatic := !c.EffectiveRollingUniverse().Enabled()
+			prefix := "storage-static:"
+			if !isStatic {
+				prefix = "storage-rolling:"
+			}
+			c.Snapshot.Universe = factor.Universe{Version: prefix + hex.EncodeToString(digest[:]), Investable: ids, Reference: ids, Tradable: ids, Evaluation: ids, Tracked: ids, Static: isStatic}
 		}
 		if c.Snapshot.SIDMap == nil {
 			c.Snapshot.SIDMap = map[int32]string{}
@@ -390,6 +395,16 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 		if err != nil {
 			return nil, err
 		}
+		for _, refSym := range plan.ReferenceSymbols() {
+			symbol, refErr := task.Symbols.GetExSymbolCur(refSym)
+			if refErr != nil {
+				return nil, fmt.Errorf("factor: storage reference symbol %q: %w", refSym, refErr)
+			}
+			if declared := c.Snapshot.SIDMap[symbol.ID]; declared != "" && declared != symbol.Symbol {
+				return nil, fmt.Errorf("factor: storage SID %d identity mismatch", symbol.ID)
+			}
+			c.Snapshot.SIDMap[symbol.ID] = symbol.Symbol
+		}
 		factorIDs := slices.Compact(append(slices.Clone(c.Snapshot.Universe.Reference), c.Snapshot.Universe.Investable...))
 		add := func(source, freq string, fields []string, warm int, sids []int32, consumer string, maxAge int64) error {
 			for _, sid := range sids {
@@ -401,14 +416,15 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 			}
 			return nil
 		}
+		scopedInputs := plan.ScopedInputs()
 		hasAsOfLookback := false
-		for _, input := range plan.Inputs() {
+		for _, input := range scopedInputs {
 			if input.AsOfLatest && input.TimeFrame != "" && input.TimeFrame != "event" {
 				hasAsOfLookback = true
 				break
 			}
 		}
-		for _, input := range plan.Inputs() {
+		for _, input := range scopedInputs {
 			warm := input.WarmupLength
 			if hasAsOfLookback && !input.AsOfLatest && warm == 0 && input.TimeFrame != "" && input.TimeFrame != "event" {
 				warm = 1
@@ -426,8 +442,37 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 					}
 				}
 			}
-			if err := add(input.Source, input.TimeFrame, input.Fields, warm, factorIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
+			var targetSIDs []int32
+			if input.AllAssets {
+				targetSIDs = append(targetSIDs, factorIDs...)
+			}
+			for _, refSym := range input.RefSymbols {
+				if refSID, ok := c.Snapshot.ResolveSymbolSID(refSym); ok {
+					targetSIDs = append(targetSIDs, refSID)
+				}
+			}
+			sort.Slice(targetSIDs, func(i, j int) bool { return targetSIDs[i] < targetSIDs[j] })
+			targetSIDs = slices.Compact(targetSIDs)
+			if err := add(input.Source, input.TimeFrame, input.Fields, warm, targetSIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
 				return nil, err
+			}
+		}
+		if roll := c.EffectiveRollingUniverse(); roll != nil && roll.Enabled() {
+			norm, err := factor.NormalizeRollingUniverseConfig(*roll)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := factor.ResolveAlwaysIncludeSIDs(norm.AlwaysInclude, factorIDs, c.Snapshot.SIDMap); err != nil {
+				return nil, err
+			}
+			volTF := plan.TimeFrame()
+			if volTF == "" {
+				volTF = c.Factor.TimeFrame
+			}
+			if volTF != "" && volTF != "event" {
+				if err := add(orm.SeriesSourceKline, volTF, []string{"close", "volume", "quote"}, norm.RequiredWarmupBars(c.DecisionInterval), factorIDs, "universe:"+c.StrategyID, 0); err != nil {
+					return nil, err
+				}
 			}
 		}
 		executionIDs := append(slices.Clone(c.Snapshot.Universe.Investable), c.Snapshot.Universe.Tracked...)
