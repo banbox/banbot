@@ -40,8 +40,20 @@ func (s *pairStats) accrue(ly, lx, navPrev float64) {
 
 // observeStep records the band transition of one decision: prev -> pos at z-score z.
 func (s *pairStats) observeStep(prev, pos int, z, beta float64, at int64, band statistics.BandConfig) {
+	var reason string
 	if prev != 0 && pos != prev {
-		s.closeEpisode(at, z, band.CloseReason(prev, z))
+		reason = band.CloseReason(prev, z)
+	}
+	s.observeStepWithReason(prev, pos, z, beta, at, reason)
+}
+
+// observeStepWithReason records a position transition with an explicit close reason when prev != 0 && pos != prev.
+func (s *pairStats) observeStepWithReason(prev, pos int, z, beta float64, at int64, closeReason string) {
+	if prev != 0 && pos != prev {
+		if closeReason == "" {
+			closeReason = "exit"
+		}
+		s.closeEpisode(at, z, closeReason)
 	}
 	if pos != 0 && s.open == nil {
 		s.open = &PairEpisode{StartMS: at, Dir: pos, EntryZ: z, Beta: beta}

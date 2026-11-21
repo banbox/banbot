@@ -36,24 +36,47 @@ Terms: `Y` is the explained leg (bought when going long the spread); `X` is the 
 ```go
 func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error
 type Pair struct{ Y, X string }          // exactly the symbol in the run SIDMap, e.g. "ETH/USDT:USDT"
+type PairFilterContext struct {
+    DecisionTime      int64
+    Pair              Pair
+    ProposedSide      int                // +1 (long Y / short X) or -1 (short Y / long X)
+    Z, Beta, HalfLife float64            // current spread z (or copula probit score), notional β, FitOU half-life (NaN if unavailable)
+    RollingCorr       float64            // 1-bar log-return Pearson correlation over CorrWindow (NaN if unavailable)
+    Hurst, SpreadRSI  float64            // current spread window Hurst in [0,1] and Wilder RSI in [0,100] (NaN if unavailable)
+    CopulaProbYGivenX float64            // P(U<=u | V=v) when SpreadModel=="copula" (NaN otherwise)
+    CopulaProbXGivenY float64            // P(V<=v | U=u) when SpreadModel=="copula" (NaN otherwise)
+    FeaturesY         map[string]float64 // valid finite feature values for leg Y at step t (helper ctx.FeatureY(name))
+    FeaturesX         map[string]float64 // valid finite feature values for leg X at step t (helper ctx.FeatureX(name))
+}
 type PairsSpec struct {
     Pairs             []Pair
-    Field             string                // kline field, default "close"
-    Window            int                   // regression/warmup window (decision bars), >= 3 (>= 4 with half-life gate)
-    Band              statistics.BandConfig // see 2.3 (supports Mode: ""/"reversion" or "momentum")
-    Gross             float64               // base notional per pair as fraction of strategy NAV; 0 = 1/len(Pairs)
-    MinBeta           float64               // minimum entry notional β floor (>=0), see 2.4
-    AllowNegativeBeta bool                  // default false (requires entry notional β > max(0, MinBeta))
-    DynamicExitZ      bool                  // default false (linear models evaluate holding exit/stop z on frozen slope)
-    DriftBand         float64               // holding-period L1 weight drift buffer (>=0, 0 disables)
-    WeightMode        string                // ""/"equal" (default fixed Gross) or "inverse_vol" (1/ScaleStd risk parity)
-    MaxPairGross      float64               // per-pair gross cap [0,1] under inverse_vol; 0 defaults to min(TotalGross, 2*Gross)
-    SpreadModel       string                // ""/"log_ols" (default), "raw_ols", "tls", "kalman", "ratio", "return_diff"
-    KalmanDelta       float64               // state-transition noise ratio in (0,1) for "kalman"; 0 defaults to 1e-4
-    KalmanVe          float64               // observation noise variance (>0) for "kalman"; 0 defaults to 1e-3
-    DynamicHedge      bool                  // default false (freeze entry β); true updates open hedge ratio online
-    MinHalfLife       float64               // optional online entry FitOU DiscreteHalfLife floor (>=0, in bars)
-    MaxHalfLife       float64               // optional online entry FitOU DiscreteHalfLife ceiling (>=0, 0 disables)
+    Field             string                                      // kline field, default "close"
+    Window            int                                         // regression/copula/warmup window (decision bars), >= 3
+    Band              statistics.BandConfig                       // see 2.3 (Entry/Exit may be 0 when SpreadModel=="copula")
+    Gross             float64                                     // base notional per pair as fraction of strategy NAV; 0 = 1/len(Pairs)
+    MinBeta           float64                                     // minimum entry notional β floor (>=0), see 2.4
+    AllowNegativeBeta bool                                        // default false (requires entry notional β > max(0, MinBeta))
+    DynamicExitZ      bool                                        // default false (linear models evaluate holding exit/stop z on frozen slope)
+    DriftBand         float64                                     // holding-period L1 weight drift buffer (>=0, 0 disables)
+    WeightMode        string                                      // ""/"equal" (default fixed Gross) or "inverse_vol" (1/ScaleStd risk parity)
+    MaxPairGross      float64                                     // per-pair gross cap [0,1] under inverse_vol; 0 defaults to min(TotalGross, 2*Gross)
+    SpreadModel       string                                      // ""/"log_ols" (default), "raw_ols", "tls", "kalman", "ratio", "return_diff", "copula"
+    Copula            statistics.CopulaConfig                     // copula family & probability thresholds for "copula" (see 3.2)
+    KalmanDelta       float64                                     // state-transition noise ratio in (0,1) for "kalman"; 0 defaults to 1e-4
+    KalmanVe          float64                                     // observation noise variance (>0) for "kalman"; 0 defaults to 1e-3
+    DynamicHedge      bool                                        // default false (freeze entry β); true updates open hedge ratio online
+    MinHalfLife       float64                                     // optional online entry FitOU DiscreteHalfLife floor (>=0, in bars)
+    MaxHalfLife       float64                                     // optional online entry FitOU DiscreteHalfLife ceiling (>=0, 0 disables)
+    MinRollingCorr    float64                                     // optional online entry 1-bar log-return correlation floor [0,1] (0 disables)
+    CorrWindow        int                                         // correlation window in bars (>=4); defaults to Window when MinRollingCorr>0 and 0
+    MinHurst          float64                                     // optional online entry spread Hurst floor [0,1] (requires Window>=8)
+    MaxHurst          float64                                     // optional online entry spread Hurst ceiling [0,1] (e.g. 0.5 for reversion)
+    SpreadRSIPeriod   int                                         // optional spread Wilder RSI period (>=2, Window >= Period+1)
+    SpreadRSIUpper    float64                                     // short-spread (reversion) RSI floor in (0,100), defaults to 70 when Period>0
+    SpreadRSILower    float64                                     // long-spread (reversion) RSI ceiling in (0,100), defaults to 30 when Period>0
+    ExtraFeatures     func(FactorContext) map[string]*factor.Node // optional per-leg custom factor DAG feature columns
+    FeatureExprs      map[string]string                           // optional per-leg expression feature columns (binding alias kline)
+    EntryFilter       func(PairFilterContext) bool                // optional zero-lookahead entry hook (never blocks open exits/stops)
 }
 ```
 
@@ -65,7 +88,7 @@ Registration occupies the definition name `name` and the factory name `name-pair
 
 ### 2.2 Validation (after build returns)
 
-Empty `build`/`name` → registration fails; non-empty `Params.Err()` → that error is returned; `Field==""` → `"close"`; `len(Pairs)==0`, `Window<3` (or `Window<4` when `MinHalfLife`/`MaxHalfLife` is enabled), `Band.Validate()` failure → error; `Gross==0` → `1/len(Pairs)`; `Gross<=0` or `Gross*len(Pairs) > 1+1e-9` → error (total exposure must not exceed NAV); `MinBeta<0`, `DriftBand<0`, `MinHalfLife<0`, `MaxHalfLife<0` (or `0<MaxHalfLife<MinHalfLife`), or non-finite → error; `SpreadModel` other than `""`/`"log_ols"`/`"raw_ols"`/`"tls"`/`"kalman"`/`"ratio"`/`"return_diff"` → error; `KalmanDelta` outside `(0,1)` (0 defaults to `1e-4`) or `KalmanVe<=0` (0 defaults to `1e-3`) → error; `WeightMode` other than `""`/`"equal"`/`"inverse_vol"` → error; `MaxPairGross` outside `[0,1]` or non-finite → error; `Y==""`/`X==""`/`Y==X` → error; Y/X not in the run `SIDMap` (and not in `UnavailableSymbols`) → error when constructing the portfolio builder (`PreparePortfolioConfig`, before resource assembly).
+Empty `build`/`name` → registration fails; non-empty `Params.Err()` → that error is returned; `Field==""` → `"close"`; `len(Pairs)==0`, `Window<3` (`Window>=4` with half-life gate, `Window>=8` with Hurst gate, `Window>=SpreadRSIPeriod+1` with spread RSI gate), `Band.Validate()` failure (under `SpreadModel=="copula"`, `Band.Entry/Exit` may be 0 and are derived from `Copula` probabilities) → error; `Gross==0` → `1/len(Pairs)`; `Gross<=0` or `Gross*len(Pairs) > 1+1e-9` → error (total exposure must not exceed NAV); `MinBeta<0`, `DriftBand<0`, `MinHalfLife<0`, `MaxHalfLife<0` (or `0<MaxHalfLife<MinHalfLife`), or non-finite → error; `MinRollingCorr` outside `[0,1]` or invalid `CorrWindow` (`>=4` when enabled) → error; `MinHurst/MaxHurst` outside `[0,1]` or `0<MaxHurst<MinHurst` → error; `SpreadRSIPeriod==1` or `<0`, `SpreadRSIUpper/Lower` outside `[0,100)` or `Lower>=Upper` → error; `SpreadModel` other than `""`/`"log_ols"`/`"raw_ols"`/`"tls"`/`"kalman"`/`"ratio"`/`"return_diff"`/`"copula"` or invalid `Copula` → error; `KalmanDelta` outside `(0,1)` (0 defaults to `1e-4`) or `KalmanVe<=0` (0 defaults to `1e-3`) → error; `WeightMode` other than `""`/`"equal"`/`"inverse_vol"` → error; `MaxPairGross` outside `[0,1]` or non-finite → error; empty/nil/duplicate `ExtraFeatures`/`FeatureExprs` → compile error; `Y==""`/`X==""`/`Y==X` → error; Y/X not in the run `SIDMap` (and not in `UnavailableSymbols`) → error when constructing the portfolio builder (`PreparePortfolioConfig`, before resource assembly).
 
 Tradability is not checked at construction time (see 2.4).
 
@@ -102,7 +125,7 @@ State transitions:
 
 ### 2.4 Runtime Semantics (each decision round)
 
-Each pair holds a private `SpreadEstimator` (6 `SpreadModel` modes), `BandTrader`, frozen notional β and model slope, latest dimensionless `ScaleStd`, position, and prior held-weight baseline.
+Each pair holds a private `SpreadEstimator` (7 `SpreadModel` modes), `BandTrader` (or `CopulaTrader`), rolling return-correlation tracker, frozen notional β and model slope, latest dimensionless `ScaleStd`, position, and prior held-weight baseline.
 
 **Supported `SpreadModel` values**:
 - `""` / `"log_ols"` (default): rolling OLS on log prices `ln(Y) = α + β·ln(X)`, `NotionalBeta = β`.
@@ -111,16 +134,17 @@ Each pair holds a private `SpreadEstimator` (6 `SpreadModel` modes), `BandTrader
 - `"kalman"`: state-space random-walk filter (`statistics.KalmanPair`, `ProcessVariance = KalmanDelta/(1-KalmanDelta)`, `ObservationVariance = KalmanVe`), activated after `Window` warmup bars using pre-update one-step innovation `Z = Error / sqrt(Variance)`; supports `DynamicHedge: true` to update open hedge ratios continuously.
 - `"ratio"`: rolling price ratio `R = Y/X` Bollinger z-score `(R - mean)/std` with fixed equal dollar-neutral `NotionalBeta = 1.0` (`wY = +0.5·pos·G, wX = -0.5·pos·G`).
 - `"return_diff"`: rolling cumulative return difference `(Y/Y_0) - (X/X_0)` z-score with fixed equal dollar-neutral `NotionalBeta = 1.0`.
+- `"copula"`: zero-lookahead rolling mid-rank marginals `u_t = (less + 0.5·eq)/N ∈ (0,1)` (`u` for Y, `v` for X) over `Window`, supporting `Copula.Family` in `""`/`"auto"` (default log-likelihood/AIC selection with clean fallback to `gaussian`/`frank` when `τ<=0`), `"empirical"`, `"gaussian"`, `"clayton"`, `"gumbel"`, and `"frank"`, hedged by rolling log-OLS `NotionalBeta = β`. Under reversion mode, opening long spread `+1` requires both `P(U<=u|V=v) <= LowerProb` (default `0.05`) and `P(V<=v|U=u) >= 1-LowerProb`; opening short spread `-1` requires both `P(U<=u|V=v) >= UpperProb` (default `0.95`) and `P(V<=v|U=u) <= 1-UpperProb`; open positions exit once conditional probabilities enter or cross `[0.5-ExitBand, 0.5+ExitBand]` (`ExitBand` default `0`).
 
 Each round:
 
 | Step | Condition | Behavior | Diagnostic code |
 | --- | --- | --- | --- |
-| a | Y/X `pairs-log-v1` value missing or not Valid (including price<=0) | Pause the pair; close any open position immediately and reset state machine (`leg_missing`) | `pair-input-missing` / `pair-closed-missing-leg` |
-| b | `SpreadEstimator.ObserveLog` not ready (window/warmup incomplete, zero variance, non-finite) | Skip; do not advance BandTrader | `pair-warmup` |
-| c | Ready, a leg is not tradable, current position 0 | Do not open; do not advance BandTrader | none |
-| c2 | Ready, current position 0, at `|z| >= Entry` notional β fails guard or online `FitOU` half-life gate fails (non-reverting or `DiscreteHalfLife` outside `[MinHalfLife, MaxHalfLife]`) | Block entry (`|z| < Entry` still advances state machine to clear `blocked`) | none |
-| d | Ready, current position non-zero | Advance BandTrader using `EvalFrozenZ` (frozen-slope window z on linear models; `est.Z` when `DynamicExitZ: true` or `DynamicHedge: true`); may close per rules | none |
+| a | Y/X `pairs-log-v1` value missing or not Valid (including price<=0) | Pause the pair and reset return-corr anchor; close any open position immediately and reset state machine (`leg_missing`) | `pair-input-missing` / `pair-closed-missing-leg` |
+| b | `SpreadEstimator.ObserveLog` not ready (window/warmup incomplete, zero variance, non-finite) | Skip; do not advance state machine | `pair-warmup` |
+| c | Ready, a leg is not tradable, current position 0 | Do not open; do not advance state machine | none |
+| c2 | Ready, current position 0, state machine previews an entry (`proposed = ±1`) that fails any entry gate (notional β, `MinRollingCorr`, `MinHalfLife/MaxHalfLife`, `MinHurst/MaxHurst`, `SpreadRSI`, or `EntryFilter`) | Block entry, keeping position 0 without mutating state machine (non-entry steps still advance to clear `blocked`) | none |
+| d | Ready, current position non-zero | **Never blocked by entry gates**: advance state machine using `EvalFrozenZ` (or current copula conditional probabilities) and close per rules | none |
 | e | After `Step` opens a position (or holds with `DynamicHedge: true` passing β guard) | Record/update notional `β = est.NotionalBeta` | none |
 | f | No pair is ready (and none closed for a missing leg) | Return nil target + `pairs-not-ready` | `pairs-not-ready` |
 | g | Otherwise | Compute target weights for every pair with position≠0 using `WeightMode` and `DriftBand`; non-empty diagnostics attach to the target | this round's diagnostics |
@@ -201,14 +225,24 @@ type RollingPairsSpec struct {
     AllowNegativeBeta bool                  // default false (requires β > max(0, MinBeta))
     DynamicExitZ      bool                  // default false (holding exit z uses frozen β via EvalWithBeta)
     DriftBand         float64               // holding-period L1 weight drift buffer (>=0)
-    WeightMode         string                // ""/"equal" or "inverse_vol"
-    MaxPairGross       float64               // per-pair cap [0,1] under inverse_vol; 0 defaults to min(TotalGross, 2*Gross)
-    SpreadModel        string                // ""/"log_ols" (default), "raw_ols", "tls", "kalman", "ratio", "return_diff"
-    KalmanDelta        float64               // state-transition noise ratio in (0,1) for "kalman"; 0 defaults to 1e-4
-    KalmanVe           float64               // observation noise variance (>0) for "kalman"; 0 defaults to 1e-3
-    DynamicHedge       bool                  // true updates open notional hedge ratios online
-    OnlineHalfLifeGate bool                  // true enforces FitOU DiscreteHalfLife in [MinHalfLife, MaxHalfLife] before online entry
-    HandoffMode        string                // ""/"graceful" (default exit-only handoff) or "immediate"
+    WeightMode         string                                      // ""/"equal" or "inverse_vol"
+    MaxPairGross       float64                                     // per-pair cap [0,1] under inverse_vol; 0 defaults to min(TotalGross, 2*Gross)
+    SpreadModel        string                                      // ""/"log_ols" (default), "raw_ols", "tls", "kalman", "ratio", "return_diff", "copula"
+    Copula             statistics.CopulaConfig                     // copula config when SpreadModel=="copula"
+    KalmanDelta        float64                                     // state-transition noise ratio in (0,1) for "kalman"; 0 defaults to 1e-4
+    KalmanVe           float64                                     // observation noise variance (>0) for "kalman"; 0 defaults to 1e-3
+    DynamicHedge       bool                                        // true updates open notional hedge ratios online
+    OnlineHalfLifeGate bool                                        // true enforces FitOU DiscreteHalfLife in [MinHalfLife, MaxHalfLife] before online entry
+    MinRollingCorr     float64                                     // online entry 1-bar log-return correlation floor [0,1]
+    CorrWindow         int                                         // online correlation window (>=4, 0 defaults to Window)
+    MinHurst, MaxHurst float64                                     // online spread window Hurst bounds [0,1]
+    SpreadRSIPeriod    int                                         // online spread window Wilder RSI period
+    SpreadRSIUpper     float64                                     // spread RSI upper threshold (default 70 when Period>0)
+    SpreadRSILower     float64                                     // spread RSI lower threshold (default 30 when Period>0)
+    ExtraFeatures      func(FactorContext) map[string]*factor.Node // optional per-leg custom factor DAG feature columns
+    FeatureExprs       map[string]string                           // optional per-leg expression feature columns
+    EntryFilter        func(PairFilterContext) bool                // optional online entry hook
+    HandoffMode        string                                      // ""/"graceful" (default exit-only handoff) or "immediate"
 }
 ```
 
@@ -293,20 +327,40 @@ func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)               
 func (r *RollingSpread) EvalWithBeta(x, y, frozenBeta float64) (float64, bool)  // fixed-slope window residual z (ddof=1), read-only
 
 type SpreadModelConfig struct {
-    Model       string  // ""/"log_ols", "raw_ols", "tls", "kalman", "ratio", "return_diff"
-    Window      int     // >= 3
-    KalmanDelta float64 // (0,1), 0 defaults to 1e-4
-    KalmanVe    float64 // >0, 0 defaults to 1e-3
+    Model       string       // ""/"log_ols", "raw_ols", "tls", "kalman", "ratio", "return_diff", "copula"
+    Window      int          // >= 3
+    KalmanDelta float64      // (0,1), 0 defaults to 1e-4
+    KalmanVe    float64      // >0, 0 defaults to 1e-3
+    Copula      CopulaConfig // config when Model=="copula"
 }
 type SpreadEstimate struct {
     SpreadPoint
-    NotionalBeta float64 // dollar-notional hedge ratio (Beta*(priceX/priceY) for raw_ols; 1.0 for ratio/return_diff)
-    ScaleStd     float64 // dimensionless spread volatility for cross-pair "inverse_vol" sizing
+    NotionalBeta      float64 // dollar-notional hedge ratio (Beta*(priceX/priceY) for raw_ols; 1.0 for ratio/return_diff)
+    ScaleStd          float64 // dimensionless spread volatility for cross-pair "inverse_vol" sizing
+    CopulaProbYGivenX float64 // P(U<=u | V=v) when Model=="copula" (NaN otherwise)
+    CopulaProbXGivenY float64 // P(V<=v | U=u) when Model=="copula" (NaN otherwise)
+    CopulaTau         float64 // rolling Kendall τ when Model=="copula" (NaN otherwise)
+    CopulaFamily      string  // active copula family when Model=="copula"
 }
 func NewSpreadEstimator(cfg SpreadModelConfig) (*SpreadEstimator, error)
 func (e *SpreadEstimator) ObserveLog(lx, ly float64) (SpreadEstimate, bool)
 func (e *SpreadEstimator) EvalFrozenZ(lx, ly, frozenModelBeta float64) (float64, bool)
 func (e *SpreadEstimator) WindowSeries(dst []float64) ([]float64, bool)
+
+type CopulaFamily string // "auto", "empirical", "gaussian", "clayton", "gumbel", "frank"
+type CopulaConfig struct {
+    Family    CopulaFamily // ""/"auto" (default), "empirical", "gaussian", "clayton", "gumbel", "frank"
+    LowerProb float64      // long-spread entry threshold in (0,0.5), 0 defaults to 0.05
+    UpperProb float64      // short-spread entry threshold in (0.5,1), 0 defaults to 0.95 (or 1-LowerProb)
+    ExitBand  float64      // half-band around 0.5 in [0,0.5), 0 exits upon crossing 0.5
+    StopProb  float64      // optional extreme tail stop probability in (0, min(LowerProb, 1-UpperProb)), 0 disables
+}
+func NewRollingCopula(window int, family CopulaFamily) (*RollingCopula, error)
+func (r *RollingCopula) Observe(x, y float64) (CopulaPoint, bool)
+func CopulaConditionalCDF(family CopulaFamily, param, u, v float64) (probUGivenV, probVGivenU float64, err error)
+func EmpiricalCopulaConditionalCDF(uSample, vSample []float64, u, v float64) (probUGivenV, probVGivenU float64, err error)
+func HurstExponent(values []float64) (float64, error)         // len >= 8, multi-lag variance-scaling Hurst in [0,1]
+func WilderRSI(values []float64, period int) (float64, error) // period >= 2, len >= period+1, returns [0,100]
 ```
 
 `Observe` returns `ok=false`: window not full, non-finite input (sample skipped), x window variance<=1e-12, residual std<=1e-12; each call runs a full OLS on the current window, and under log prices β is an elasticity. `EvalWithBeta` computes the z-score of `y - frozenBeta*x` against the window's `r_i = y_i - frozenBeta*x_i` sample mean and std (`ddof=1`, `ok=false` when window not full, non-finite input, or `std<=1e-12`) without mutating the ring buffer.

@@ -103,6 +103,12 @@ func NewBandTrader(cfg BandConfig) (*BandTrader, error) {
 // Position returns the current spread position: -1, 0 or +1.
 func (b *BandTrader) Position() int { return b.pos }
 
+// Preview returns the position Step(z) would produce without mutating b.
+func (b *BandTrader) Preview(z float64) int {
+	cp := *b
+	return cp.Step(z)
+}
+
 // Step consumes one z-score and returns the new position. A non-finite z
 // leaves the state untouched: missing data must not trigger trades.
 func (b *BandTrader) Step(z float64) int {
