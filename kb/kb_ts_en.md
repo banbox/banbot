@@ -491,18 +491,19 @@ Order events (chgType of `OnOrderChange`, `strat.OdChg*`): `OdChgNew`(0) new ord
 ### 4.3 Long/Short Restrictions
 - `MaxOpenLong/Short` (job level, initialized from `EachMaxLong/Short`) decides whether new orders can be opened; spot cannot short. Reversal: call `CloseOrders` and `OpenOrder` in the same callback, processed together at the end of the event.
 
-## 5. Built-in `funding_rate` and Custom Time-Series Data
+## 5. Built-in Derivatives Sources (`funding_rate` / `open_interest`) and Custom Time-Series Data
 
 - **Built-in `funding_rate` source**: `orm.SeriesSourceFundingRate` (`"funding_rate"`, default timeframe `"8h"`, table `funding_rate_8h`, float field `"rate"` for per-settlement rate such as `0.0001` = +0.01%) is registered by default with zero-lookahead `EndMS = settlement timestamp`. Supports `./bot series list` and `./bot series down -tables funding_rate ...`. Subscribe in `OnDataSubs` via `&strat.DataSub{Source: orm.SeriesSourceFundingRate, TimeFrame: "8h", WarmupNum: 10}` and read `d.Float64("rate")` / `d.Series("rate")` in `Custom`. Linear perpetual backtests automatically settle bilateral order funding across `(RealEnterMS, ExitMS]` when `funding_rate` data exists (long pays +rate / receives -rate; short receives +rate / pays -rate), falling back to `bt_funding_apr` when absent.
+- **Built-in `open_interest` source**: `orm.SeriesSourceOpenInterest` (`"open_interest"`, default timeframe `"5m"`, supporting `"5m" "15m" "30m" "1h" "2h" "4h" "6h" "12h" "1d"`, table `open_interest_<tf>`) provides 6 float fields: `"oi"` (open interest quantity/contracts), `"oi_value"` (notional value), `"top_ls_pos_ratio"` (top trader position L/S ratio), `"top_ls_acc_ratio"` (top trader account L/S ratio), `"global_ls_ratio"` (global account L/S ratio), and `"taker_ls_vol_ratio"` (taker buy/sell volume ratio). All fields use `"last"` closing-snapshot resampling, persist missing metrics as explicit `NULL` (`d.RawValue(col)` returns `(nil, true)`, `d.Series(col)` appends `NaN`), and expose `[T-tfMS, T)` with `EndMS = T` (zero lookahead). Subscribe via `&strat.DataSub{Source: orm.SeriesSourceOpenInterest, TimeFrame: "1h", WarmupNum: 20}`.
 
 ### 5.1 Writing Custom Tables (data source/importer/application layer; do not write to the DB in strategy callbacks)
 ```go
-info := orm.NewSeriesInfo("open_interest", "1h", []orm.SeriesField{{Name: "oi", Type: "float"}})
+info := orm.NewSeriesInfo("chain_flow", "1h", []orm.SeriesField{{Name: "netflow", Type: "float"}})
 store := orm.NewSeriesStore(orm.NewSeriesRepo(storage)) // storage: *orm.Storage of the current Runtime
 _ = store.Ensure(ctx, info)
-_ = store.Write(ctx, info, exs, &orm.DataRecord{TimeMS: startMS, EndMS: endMS, Values: map[string]any{"oi": oi}})
+_ = store.Write(ctx, info, exs, &orm.DataRecord{TimeMS: startMS, EndMS: endMS, Values: map[string]any{"netflow": val}})
 rows, _ := store.Read(ctx, info, exs, startMS, endMS, 0) // []*orm.DataSeries
-v, err := rows[0].FloatValue("oi")
+v, err := rows[0].FloatValue("netflow")
 ```
 - `SeriesField.Type`: `float int string bool json`. `SeriesStore`: `Ensure/Write/WriteBatch/WriteSeries/Read/Delete/Missing/FillMissing(ctx,info,exs,start,end,fetch)/Coverage`.
 - Bar extension columns (per `(sid,time)`): `orm.NewKLineSeriesInfo` + `orm.NewKLineSeriesStoreWithStorage` (only updates existing bar rows).

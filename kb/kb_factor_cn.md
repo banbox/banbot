@@ -342,8 +342,8 @@ func init() {
 ```go
 type Numeric struct { Value float64; Validity Validity }  // Valid, Missing, Null, NotNumeric, NonFinite, Warmup
 func Number(values map[string]any, field string) Numeric
-func Field(source, field, timeframe string) *Node
-func AsOfField(source, field, sourceTF, decisionTF string, maxAge int64) *Node // 例：AsOfField("funding_rate", "rate", "8h", c.TimeFrame, 12*3600*1000)
+func Field(source, field, timeframe string) *Node // 例：Field("open_interest", "oi_value", c.TimeFrame)（内置 open_interest 含 oi/oi_value/top_ls_pos_ratio/top_ls_acc_ratio/global_ls_ratio/taker_ls_vol_ratio）
+func AsOfField(source, field, sourceTF, decisionTF string, maxAge int64) *Node // 例：AsOfField("funding_rate", "rate", "8h", c.TimeFrame, 12*3600*1000) 或 AsOfField("open_interest", "top_ls_pos_ratio", "5m", c.TimeFrame, 2*3600*1000)
 func Constant(v float64, tf string) *Node
 func Add/Sub/Mul/Div/Pow/Min/Max(a, b *Node) *Node
 func Neg/Abs/Log/Sqrt/Positive(x *Node) *Node

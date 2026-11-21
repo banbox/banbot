@@ -454,9 +454,11 @@ func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
 			// An empty legacy projection means all source fields, so resolve it
 			// before unioning it with an explicit projection of the same stream.
 			if len(cp.Fields) == 0 {
-				if src := p.catalog.GetDataSource(cp.Source); src != nil && src.Info() != nil {
-					for _, field := range src.Info().Binding.Fields {
-						cp.Fields = append(cp.Fields, field.Name)
+				if src := p.catalog.GetDataSource(cp.Source); src != nil {
+					if info := sourceFieldsInfo(src, cp.TimeFrame); info != nil {
+						for _, field := range info.Binding.Fields {
+							cp.Fields = append(cp.Fields, field.Name)
+						}
 					}
 				}
 			}
@@ -487,12 +489,12 @@ func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
 		if src == nil {
 			return errs.NewMsg(core.ErrBadConfig, "data source %q is not registered", sub.Source)
 		}
-		info := src.Info()
-		if info == nil {
+		if src.Info() == nil {
 			return errs.NewMsg(core.ErrBadConfig, "data source %q has no series info", sub.Source)
 		}
-		if sub.TimeFrame != info.TimeFrame {
-			return errs.NewMsg(core.ErrBadConfig, "sub timeframe %s does not match source timeframe %s", sub.TimeFrame, info.TimeFrame)
+		info, tfErr := resolveSourceSeriesInfo(src, sub.TimeFrame)
+		if tfErr != nil {
+			return tfErr
 		}
 		key := strat.DataSubKey(info.Name, sub.ExSymbol.ID, info.TimeFrame)
 		var feeder *HistSeriesFeeder
@@ -504,6 +506,7 @@ func (p *HistProvider) SetSeriesSubs(subs []*strat.DataSub) *errs.Error {
 		if err != nil {
 			return errs.New(core.ErrBadConfig, err)
 		}
+		feeder.source = src
 		feeder.BatchRows = pageRows
 		feeder.BatchBytes = p.seriesPageBytes
 		if old := p.series[key]; old != nil && old.sameProjection(feeder) {

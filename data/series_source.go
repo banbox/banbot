@@ -29,6 +29,53 @@ type DataSourceVersioner interface {
 	Version() string
 }
 
+// TimeFrameSeriesSource allows a DataSource to serve multiple bar timeframes
+// under a single source name (for example "open_interest" across 5m/15m/1h/4h/1d),
+// returning the timeframe-specific SeriesInfo and physical table binding.
+type TimeFrameSeriesSource interface {
+	SeriesInfoForTimeFrame(timeFrame string) (*orm.SeriesInfo, bool)
+}
+
+// SubTimeFrameResampleSource declares ordered finer stored timeframes that can
+// be resampled via SeriesInfo aggregation rules when the target timeframe table
+// has no locally stored rows.
+type SubTimeFrameResampleSource interface {
+	SubTimeFrames(targetTimeFrame string) []string
+}
+
+func resolveSourceSeriesInfo(src DataSource, timeFrame string) (*orm.SeriesInfo, *errs.Error) {
+	if src == nil {
+		return nil, errs.NewMsg(core.ErrBadConfig, "data source is required")
+	}
+	baseInfo := src.Info()
+	if err := orm.ValidateSeriesInfo(baseInfo); err != nil {
+		return nil, err
+	}
+	tf := strings.TrimSpace(timeFrame)
+	if tf == "" || tf == baseInfo.TimeFrame {
+		return baseInfo, nil
+	}
+	if multi, ok := src.(TimeFrameSeriesSource); ok {
+		if tfInfo, supported := multi.SeriesInfoForTimeFrame(tf); supported && tfInfo != nil {
+			if err := orm.ValidateSeriesInfo(tfInfo); err != nil {
+				return nil, err
+			}
+			return tfInfo, nil
+		}
+	}
+	return nil, errs.NewMsg(core.ErrBadConfig, "sub timeframe %s does not match source timeframe %s", tf, baseInfo.TimeFrame)
+}
+
+func sourceFieldsInfo(src DataSource, timeFrame string) *orm.SeriesInfo {
+	if src == nil {
+		return nil
+	}
+	if info, err := resolveSourceSeriesInfo(src, timeFrame); err == nil && info != nil {
+		return info
+	}
+	return src.Info()
+}
+
 // ObservationWarmupSource resolves an irregular stream's lookback from actual
 // observations. It must fail when the requested visible history is incomplete.
 // A bar count is never multiplied by an invented event interval.
@@ -387,12 +434,9 @@ func (c *DataSourceCatalog) ActivateDataSources(ctx context.Context, subs []*orm
 		if src == nil {
 			return nil, fmt.Errorf("data source %q is not registered", normalized.Source)
 		}
-		info := src.Info()
-		if err := orm.ValidateSeriesInfo(info); err != nil {
-			return nil, err
-		}
-		if normalized.TimeFrame != info.TimeFrame {
-			return nil, fmt.Errorf("sub timeframe %s does not match source timeframe %s", normalized.TimeFrame, info.TimeFrame)
+		info, tfErr := resolveSourceSeriesInfo(src, normalized.TimeFrame)
+		if tfErr != nil {
+			return nil, fmt.Errorf("%s", tfErr.Short())
 		}
 		if err = normalizeDataSubFields(info, normalized); err != nil {
 			return nil, err
@@ -459,7 +503,7 @@ func validateBootstrapSubWithCatalog(catalog *DataSourceCatalog, sub *orm.Subscr
 					return nil, fmt.Errorf("source %s: event count warmup requires an observation-based source bootstrap", normalized.Source)
 				}
 			}
-			info := src.Info()
+			info := sourceFieldsInfo(src, normalized.TimeFrame)
 			if err := orm.ValidateSeriesInfo(info); err != nil {
 				return nil, err
 			}
@@ -719,17 +763,11 @@ func ensureSeriesRangeWithRepo(catalog *DataSourceCatalog, ctx context.Context, 
 	if sub == nil || sub.ExSymbol == nil || sub.ExSymbol.ID <= 0 {
 		return errs.NewMsg(core.ErrBadConfig, "data sub exsymbol is required")
 	}
-	info := src.Info()
-	if err := orm.ValidateSeriesInfo(info); err != nil {
-		return err
+	info, tfErr := resolveSourceSeriesInfo(src, sub.TimeFrame)
+	if tfErr != nil {
+		return tfErr
 	}
-	tf := sub.TimeFrame
-	if tf == "" {
-		tf = info.TimeFrame
-	}
-	if tf != info.TimeFrame {
-		return errs.NewMsg(core.ErrBadConfig, "sub timeframe %s does not match source timeframe %s", tf, info.TimeFrame)
-	}
+	tf := info.TimeFrame
 	if sub.Source != "" && sub.Source != info.Name {
 		return errs.NewMsg(core.ErrBadConfig, "sub source %s does not match data source %s", sub.Source, info.Name)
 	}
@@ -749,7 +787,7 @@ func ensureSeriesRangeWithRepo(catalog *DataSourceCatalog, ctx context.Context, 
 	}
 	store := orm.NewSeriesStore(repo)
 	if _, paged := src.(PagedHistorySource); paged || orm.SeriesReadByteLimit(ctx) > 0 {
-		return ensurePagedSeriesRange(catalog, ctx, store, src, sub, startMS, endMS)
+		return ensurePagedSeriesRange(catalog, ctx, store, src, info, sub, startMS, endMS)
 	}
 	if tf == "event" {
 		// Sparse rows do not describe coverage between observations. Fetch the

@@ -19,6 +19,7 @@ type HistSeriesFeeder struct {
 	target     *orm.ExSymbol
 	callback   FnDataSeries
 	store      *orm.SeriesStore
+	source     DataSource
 	deps       *RuntimeDeps
 	warmEndMS  int64
 	endMS      int64
@@ -64,9 +65,15 @@ func newHistSeriesFeeder(deps *RuntimeDeps, repo orm.SeriesRepo, info *orm.Serie
 	if err != nil {
 		return nil, err
 	}
+	var src DataSource
+	if deps != nil && deps.Catalog != nil {
+		src = deps.Catalog.GetDataSource(info.Name)
+	} else {
+		src = GetDataSource(info.Name)
+	}
 	return &HistSeriesFeeder{
 		info: projected, target: sub.ExSymbol, callback: callback,
-		store: orm.NewSeriesStore(repo), deps: deps, warmEndMS: warmEndMS,
+		store: orm.NewSeriesStore(repo), source: src, deps: deps, warmEndMS: warmEndMS,
 	}, nil
 }
 
@@ -175,7 +182,7 @@ func (f *HistSeriesFeeder) CallNext() {
 	if pageRows <= 0 {
 		pageRows = 20_000
 	}
-	rows, err := f.store.Read(ctx, f.info, f.target, f.offsetMS, endMS, pageRows)
+	rows, err := readSeriesStoreOrResample(ctx, f.store, f.source, f.info, f.target, f.offsetMS, endMS, pageRows)
 	if err == nil {
 		if budgetErr := orm.CheckDataSeriesBytes(ctx, rows); budgetErr != nil {
 			err = errs.New(core.ErrDbReadFail, budgetErr)

@@ -139,3 +139,43 @@ func FetchFundingRateArchive(ctx context.Context, exchange banexg.BanExchange, s
 	}
 	return fetcher.FetchFundingRateArchive(ctx, symbol, startMS, endMS)
 }
+
+func (e *BotExchange) FetchDerivativesMetricsArchive(ctx context.Context, symbol, timeframe string, startMS, endMS int64) (
+	[]*banexg.DerivativesMetric, bool, *errs.Error) {
+	fetcher, ok := e.BanExchange.(banexg.DerivativesMetricsArchiveFetcher)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchDerivativesMetricsArchive(ctx, symbol, timeframe, startMS, endMS)
+}
+
+// FetchDerivativesMetricsArchive invokes the optional archive capability when
+// the underlying exchange adapter supports historical derivatives metrics files.
+func FetchDerivativesMetricsArchive(ctx context.Context, exchange banexg.BanExchange, symbol, timeframe string, startMS, endMS int64) (
+	[]*banexg.DerivativesMetric, bool, *errs.Error) {
+	fetcher, ok := getExchangeCapability[banexg.DerivativesMetricsArchiveFetcher](exchange)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchDerivativesMetricsArchive(ctx, symbol, timeframe, startMS, endMS)
+}
+
+func (e *BotExchange) FetchDerivativesMetrics(ctx context.Context, symbol, timeframe string, startMS, endMS int64, limit int, params map[string]interface{}) (
+	[]*banexg.DerivativesMetric, bool, *errs.Error) {
+	fetcher, ok := e.BanExchange.(banexg.DerivativesMetricsFetcher)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchDerivativesMetrics(ctx, symbol, timeframe, startMS, endMS, limit, params)
+}
+
+// FetchDerivativesMetrics invokes the optional derivatives metrics capability
+// (combining historical archives and recent REST endpoints when supported).
+func FetchDerivativesMetrics(ctx context.Context, exchange banexg.BanExchange, symbol, timeframe string, startMS, endMS int64, limit int, params map[string]interface{}) (
+	[]*banexg.DerivativesMetric, bool, *errs.Error) {
+	fetcher, ok := getExchangeCapability[banexg.DerivativesMetricsFetcher](exchange)
+	if !ok {
+		return nil, false, nil
+	}
+	return fetcher.FetchDerivativesMetrics(ctx, symbol, timeframe, startMS, endMS, limit, params)
+}

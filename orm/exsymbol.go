@@ -31,9 +31,35 @@ var (
 		"avg":   aggAvg,
 		"mid":   aggMid,
 	}
+	fieldAggRulesMu sync.RWMutex
+	fieldAggRules   = map[string]string{}
 )
 
 type AggRuleFunc func(rows []*DataRecord, field SeriesField) (any, error)
+
+// RegisterFieldAggRule registers the default resampling aggregation rule name
+// (such as "last") for a series field when ExSymbol.AggRules has no override.
+func RegisterFieldAggRule(field, rule string) bool {
+	field = strings.TrimSpace(field)
+	rule = strings.ToLower(strings.TrimSpace(rule))
+	if field == "" || rule == "" {
+		return false
+	}
+	if _, ok := GetAggRuleFunc(rule); !ok {
+		return false
+	}
+	fieldAggRulesMu.Lock()
+	fieldAggRules[field] = rule
+	fieldAggRulesMu.Unlock()
+	return true
+}
+
+func GetFieldAggRule(field string) (string, bool) {
+	fieldAggRulesMu.RLock()
+	rule, ok := fieldAggRules[strings.TrimSpace(field)]
+	fieldAggRulesMu.RUnlock()
+	return rule, ok
+}
 
 func cacheExSymbol(exs *ExSymbol) {
 	loadDefaultSymbolState().CacheExSymbol(exs)

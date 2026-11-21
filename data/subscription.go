@@ -28,8 +28,8 @@ func (c *DataSourceCatalog) NormalizeSubscriptions(subs []Subscription) ([]Subsc
 			if src == nil {
 				return nil, fmt.Errorf("data source %q is not registered", normalized.Source)
 			}
-			if normalized.TimeFrame != src.Info().TimeFrame {
-				return nil, fmt.Errorf("sub timeframe %s does not match source timeframe %s", normalized.TimeFrame, src.Info().TimeFrame)
+			if _, tfErr := resolveSourceSeriesInfo(src, normalized.TimeFrame); tfErr != nil {
+				return nil, fmt.Errorf("%s", tfErr.Short())
 			}
 		}
 		if normalized.Frequency != orm.FrequencyEvent {

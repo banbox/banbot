@@ -17,10 +17,41 @@ type SeriesField struct {
 }
 
 const (
-	SeriesSourceKline       = "kline"
-	SeriesSourceFundingRate = "funding_rate"
-	DefaultFundingRateTF    = "8h"
+	SeriesSourceKline        = "kline"
+	SeriesSourceFundingRate  = "funding_rate"
+	SeriesSourceOpenInterest = "open_interest"
+	DefaultFundingRateTF     = "8h"
+	DefaultOpenInterestTF    = "5m"
 )
+
+const (
+	FieldOpenInterest      = "oi"
+	FieldOpenInterestValue = "oi_value"
+	FieldTopLSPosRatio     = "top_ls_pos_ratio"
+	FieldTopLSAccRatio     = "top_ls_acc_ratio"
+	FieldGlobalLSRatio     = "global_ls_ratio"
+	FieldTakerLSVolRatio   = "taker_ls_vol_ratio"
+)
+
+var openInterestDefaultFields = []string{
+	FieldOpenInterest,
+	FieldOpenInterestValue,
+	FieldTopLSPosRatio,
+	FieldTopLSAccRatio,
+	FieldGlobalLSRatio,
+	FieldTakerLSVolRatio,
+}
+
+var openInterestSupportedTFs = []string{
+	"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d",
+}
+
+func init() {
+	RegisterAggRule("last", aggLast)
+	for _, field := range openInterestDefaultFields {
+		RegisterFieldAggRule(field, "last")
+	}
+}
 
 var klineDefaultFields = []string{
 	"open", "high", "low", "close", "volume", "quote", "buy_volume", "trade_num",
@@ -34,6 +65,32 @@ func DefaultFundingRateFields() []string {
 	return []string{"rate"}
 }
 
+func DefaultOpenInterestFields() []string {
+	return append([]string(nil), openInterestDefaultFields...)
+}
+
+func OpenInterestTimeFrames() []string {
+	return append([]string(nil), openInterestSupportedTFs...)
+}
+
+func IsOpenInterestTimeFrame(timeFrame string) bool {
+	tf := strings.TrimSpace(timeFrame)
+	for _, item := range openInterestSupportedTFs {
+		if item == tf {
+			return true
+		}
+	}
+	return false
+}
+
+func OpenInterestSeriesFields() []SeriesField {
+	fields := make([]SeriesField, len(openInterestDefaultFields))
+	for i, name := range openInterestDefaultFields {
+		fields[i] = SeriesField{Name: name, Type: "float"}
+	}
+	return fields
+}
+
 func NewFundingRateSeriesInfo(timeFrame string) *SeriesInfo {
 	tf := strings.TrimSpace(timeFrame)
 	if tf == "" {
@@ -42,6 +99,14 @@ func NewFundingRateSeriesInfo(timeFrame string) *SeriesInfo {
 	return NewSeriesInfo(SeriesSourceFundingRate, tf, []SeriesField{
 		{Name: "rate", Type: "float"},
 	})
+}
+
+func NewOpenInterestSeriesInfo(timeFrame string) *SeriesInfo {
+	tf := strings.TrimSpace(timeFrame)
+	if tf == "" {
+		tf = DefaultOpenInterestTF
+	}
+	return NewSeriesInfo(SeriesSourceOpenInterest, tf, OpenInterestSeriesFields())
 }
 
 func NormalizeSeriesFields(source string, fields []string) []string {
@@ -723,6 +788,9 @@ func seriesAggRule(info *SeriesInfo, exs *ExSymbol, field string) string {
 		if rule, ok := exs.AggRuleMap()[field]; ok {
 			return rule
 		}
+	}
+	if rule, ok := GetFieldAggRule(field); ok {
+		return rule
 	}
 	if info != nil && NormalizeSeriesSource(info.Name) == SeriesSourceKline {
 		switch field {

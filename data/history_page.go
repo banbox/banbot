@@ -75,17 +75,23 @@ func ReadSourceHistory(ctx context.Context, source DataSource, sub *orm.Subscrip
 	return ctx.Err()
 }
 
-func ensurePagedSeriesRange(catalog *DataSourceCatalog, ctx context.Context, store *orm.SeriesStore, source DataSource, sub *orm.Subscription, start, end int64) (result *errs.Error) {
+func ensurePagedSeriesRange(catalog *DataSourceCatalog, ctx context.Context, store *orm.SeriesStore, source DataSource, info *orm.SeriesInfo, sub *orm.Subscription, start, end int64) (result *errs.Error) {
 	if ctx == nil {
 		return errs.NewMsg(core.ErrBadConfig, "history context is required")
 	}
+	if info == nil && source != nil {
+		info = source.Info()
+	}
+	if err := orm.ValidateSeriesInfo(info); err != nil {
+		return err
+	}
 	if ctrl, ok := source.(HistoryDownloadController); ok && !ctrl.AllowHistoryDownload() {
 		if catalog != nil {
-			catalog.markDataSourceBackfill(source.Info().Name, DataSourceOpStatus{
+			catalog.markDataSourceBackfill(info.Name, DataSourceOpStatus{
 				State:     "ok",
 				AtMS:      time.Now().UnixMilli(),
 				Sid:       sub.ExSymbol.ID,
-				TimeFrame: source.Info().TimeFrame,
+				TimeFrame: info.TimeFrame,
 				StartMS:   start,
 				EndMS:     end,
 				Rows:      0,
@@ -98,16 +104,16 @@ func ensurePagedSeriesRange(catalog *DataSourceCatalog, ctx context.Context, sto
 		if catalog == nil {
 			return
 		}
-		status := DataSourceOpStatus{State: "ok", AtMS: time.Now().UnixMilli(), Sid: sub.ExSymbol.ID, TimeFrame: source.Info().TimeFrame, StartMS: start, EndMS: end, Rows: rowsWritten}
+		status := DataSourceOpStatus{State: "ok", AtMS: time.Now().UnixMilli(), Sid: sub.ExSymbol.ID, TimeFrame: info.TimeFrame, StartMS: start, EndMS: end, Rows: rowsWritten}
 		if result != nil {
 			status.State, status.Error = "error", result.Short()
 		}
-		catalog.markDataSourceBackfill(source.Info().Name, status, status.Error)
+		catalog.markDataSourceBackfill(info.Name, status, status.Error)
 	}()
 	gaps := []orm.MSRange{{Start: start, Stop: end}}
-	if source.Info().TimeFrame != "event" {
+	if info.TimeFrame != "event" {
 		var err *errs.Error
-		gaps, err = store.Missing(ctx, source.Info(), sub.ExSymbol, start, end)
+		gaps, err = store.Missing(ctx, info, sub.ExSymbol, start, end)
 		if err != nil {
 			return err
 		}
@@ -122,7 +128,7 @@ func ensurePagedSeriesRange(catalog *DataSourceCatalog, ctx context.Context, sto
 			if len(rows) == 0 {
 				return nil
 			}
-			if err := store.WriteBatch(ctx, source.Info(), sub.ExSymbol, rows); err != nil {
+			if err := store.WriteBatch(ctx, info, sub.ExSymbol, rows); err != nil {
 				return err
 			}
 			rowsWritten += len(rows)
@@ -132,8 +138,8 @@ func ensurePagedSeriesRange(catalog *DataSourceCatalog, ctx context.Context, sto
 		if err != nil {
 			return errs.New(core.ErrDbReadFail, err)
 		}
-		if gapRows == 0 && source.Info().TimeFrame != "event" {
-			if err := store.UpdateCoverage(ctx, source.Info(), sub.ExSymbol, gap.Start, gap.Stop, nil); err != nil {
+		if gapRows == 0 && info.TimeFrame != "event" {
+			if err := store.UpdateCoverage(ctx, info, sub.ExSymbol, gap.Start, gap.Stop, nil); err != nil {
 				return err
 			}
 		}

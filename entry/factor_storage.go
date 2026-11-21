@@ -372,8 +372,18 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 			}
 			return nil
 		}
+		hasAsOfLookback := false
+		for _, input := range plan.Inputs() {
+			if input.AsOfLatest && input.TimeFrame != "" && input.TimeFrame != "event" {
+				hasAsOfLookback = true
+				break
+			}
+		}
 		for _, input := range plan.Inputs() {
 			warm := input.WarmupLength
+			if hasAsOfLookback && !input.AsOfLatest && warm == 0 && input.TimeFrame != "" && input.TimeFrame != "event" {
+				warm = 1
+			}
 			if input.AsOfLatest && input.TimeFrame != "" && input.TimeFrame != "event" {
 				if stepSecs, tfErr := utils.TFToSecSafe(input.TimeFrame); tfErr == nil && stepSecs > 0 {
 					stepMS := int64(stepSecs) * 1000
