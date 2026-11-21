@@ -79,7 +79,8 @@ func computationKey(c Config, plan *factor.Plan) (string, error) {
 		Interval, Delay                   int64
 		SourceEventDecisions              bool
 		DecisionSource, DecisionTimeFrame string
-	}{c.ComputationContext, chunks, inputIdentity, plan.Hash(), spec, c.DecisionInterval, c.DecisionDelayMS, c.SourceEventDecisions, c.Factor.Source, c.Factor.TimeFrame})
+		RollingUniverse                   *factor.RollingUniverseConfig `json:",omitempty"`
+	}{c.ComputationContext, chunks, inputIdentity, plan.Hash(), spec, c.DecisionInterval, c.DecisionDelayMS, c.SourceEventDecisions, c.Factor.Source, c.Factor.TimeFrame, c.EffectiveRollingUniverse()})
 	return string(raw), err
 }
 func (g *ComputationGroup) acquire(c Config, plan *factor.Plan) (*sharedComputation, error) {

@@ -30,6 +30,7 @@
 | `funding_source` | 资金费流 source 名（`required-stream` 必填；存储回放订阅 `{funding_source, event, rate}`） |
 | `option_expiry_source` `terminal_settlement_source` | 期权到期 / 终局结算流 source，见 7.2 |
 | `pit_min_universe_ratio` `pit_delist_penalty_bps` | 回测 PIT 参数：`pit_min_universe_ratio`（≤1，0=默认 0.5，<0 关闭 PIT 缩减）为一轮内至少保留的 Investable 比例，分母是上一次被接受决策时的存活数（滚动，首个决策用名义池）；`pit_delist_penalty_bps`（有限数，0=默认 100，<0 关）为被剔持仓平仓时额外的不利惩罚 bp，数据恢复则退回并改按缺口前后更差价计价 |
+| `universe`（别名 `rolling_universe`，也可写在 `portfolio.universe`） | 时点滚动流动性宇宙重组：`{mode: rolling_liquid_top, top_n, lookback_days|lookback_bars, min_listing_days|min_age_bars, reconstitute_days|reconstitute_bars|schedule, always_include}`；默认 `lookback_days: 30`（优先 `quote`，回退 `close*volume`）、`min_listing_days: 14`（`<0` 关闭）、`reconstitute_days: 30`（或 `schedule: daily|weekly|monthly` UTC），在候选超集 `pairs` 上严格按 `≤ t` 可见 K 线定时重选前 `top_n` 进入 `Investable`，未入选但已上市候选后台预热时序指标，退池持仓在下一步自动平仓至 0 |
 | `initial_nav` | 策略初始 NAV（正数）；缺省 `wallet_amounts[manifest.currency]`，无则 10000；再乘 `capital_weight` |
 | `max_records` | 每批最大记录数，缺省 100000；被 `data.max_records` 覆盖 |
 | `expressions` `combo` `decision` `research` `portfolio` `manifest` `snapshot` | 见第 2 节、1.4–1.6、4.2、1.9 |

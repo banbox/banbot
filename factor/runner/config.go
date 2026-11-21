@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/expr"
 	"github.com/banbox/banbot/factor/research"
 )
@@ -37,6 +38,7 @@ func CloneConfig(c Config) (Config, error) {
 	}
 	c.Combo = research.CloneComboSpec(c.Combo)
 	c.Manifest = research.CloneManifestSpec(c.Manifest)
+	c.RollingUniverse = factor.CloneRollingUniverseConfig(c.RollingUniverse)
 	c.Execution.Instruments = maps.Clone(c.Execution.Instruments)
 	for sid, i := range c.Execution.Instruments {
 		if i.Option != nil {

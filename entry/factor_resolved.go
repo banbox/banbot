@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/factor"
 	"github.com/banbox/banbot/factor/runner"
 	"github.com/banbox/banbot/web/dev"
 )
@@ -120,6 +121,13 @@ func resolvedFactorValues(spec *config.RunSpec, configs []runner.Config) ([]map[
 		set("terminal_settlement_source", c.TerminalSettlementSource, "no terminal settlement stream", prefix+"terminal_settlement_source")
 		set("pit_min_universe_ratio", c.PITMinUniverseRatio, "0 = default 0.5 (<0 disables the PIT universe reduction)", prefix+"pit_min_universe_ratio")
 		set("pit_delist_penalty_bps", c.PITDelistPenaltyBps, "0 = default 100bp (<0 disables the delist penalty)", prefix+"pit_delist_penalty_bps")
+		if roll := c.EffectiveRollingUniverse(); roll != nil && roll.Enabled() {
+			norm, err := factor.NormalizeRollingUniverseConfig(*roll)
+			if err != nil {
+				return nil, err
+			}
+			set("rolling_universe", norm, "point-in-time rolling liquidity universe reconstitution", prefix+"universe", prefix+"rolling_universe", prefix+"portfolio.universe", prefix+"portfolio.rolling_universe")
+		}
 		set("paper_fill_model", c.Execution.PaperFillModel, "midpoint paper default", "accounts."+c.AccountID+".paper_fill_model", "execution.paper_fill_model")
 		set("funding_source", c.FundingSource, "explicit required funding source", prefix+"funding_source")
 		set("funding_policy", c.Manifest.Costs.FundingPolicy, "explicit simulation policy", "accounts."+c.AccountID+".funding_policy", "execution.funding_policy", prefix+"manifest.costs.funding_policy")

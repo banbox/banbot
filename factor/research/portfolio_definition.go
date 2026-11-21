@@ -39,6 +39,7 @@ func ClonePortfolioDefinition(d PortfolioDefinition) PortfolioDefinition {
 		value := factor.ClonePortfolioPolicyConfig(factor.PortfolioPolicyConfig{Allocation: *d.Allocation}).Allocation
 		d.Allocation = &value
 	}
+	d.Universe = factor.CloneRollingUniverseConfig(d.Universe)
 	return d
 }
 
@@ -108,6 +109,11 @@ func (d PortfolioDefinition) ValidatePolicy() error {
 	if d.AssetCap < 0 || math.IsNaN(d.AssetCap) || math.IsInf(d.AssetCap, 0) {
 		return errors.New("research: invalid portfolio asset_cap")
 	}
+	if d.Universe != nil {
+		if _, err := factor.NormalizeRollingUniverseConfig(*d.Universe); err != nil {
+			return err
+		}
+	}
 	if d.EffectivePolicy() == "" {
 		if d.PolicyParams != nil {
 			return errors.New("research: portfolio policy_params requires an explicit policy")
@@ -121,15 +127,41 @@ func (d PortfolioDefinition) ValidatePolicy() error {
 // ResolvePolicy makes defaults part of reproducible strategy identity only for
 // strategies that opt into the policy contract (explicitly or via sub-blocks).
 func (d PortfolioDefinition) ResolvePolicy() (PortfolioDefinition, error) {
+	if err := d.ValidatePolicy(); err != nil {
+		return d, err
+	}
 	ep := d.EffectivePolicy()
 	if ep == "" {
-		return ClonePortfolioDefinition(d), d.ValidatePolicy()
+		cp := ClonePortfolioDefinition(d)
+		if cp.Universe != nil {
+			norm, err := factor.NormalizeRollingUniverseConfig(*cp.Universe)
+			if err != nil {
+				return d, err
+			}
+			if norm.Enabled() {
+				cp.Universe = &norm
+			} else {
+				cp.Universe = nil
+			}
+		}
+		return cp, nil
 	}
 	c, err := d.PolicyConfig()
 	if err != nil {
 		return d, err
 	}
 	d = ClonePortfolioDefinition(d)
+	if d.Universe != nil {
+		norm, err := factor.NormalizeRollingUniverseConfig(*d.Universe)
+		if err != nil {
+			return d, err
+		}
+		if norm.Enabled() {
+			d.Universe = &norm
+		} else {
+			d.Universe = nil
+		}
+	}
 	d.Policy = ep
 	if d.Policy == "lifecycle-v1" {
 		d.Rebalance = &c.Rebalance
