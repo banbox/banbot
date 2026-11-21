@@ -29,7 +29,8 @@
 | `strat/data_access.go` | `NewDataSub(info)`、`StratJob.Data(sub)` |
 | `strat/data_subs.go` | 订阅收集 `CollectDataSubs*`（合并 `OnPairInfos` 与 `OnDataSubs`）、K 线字段并集 `CollectKlineSubFields*`、订阅 key 编解码 |
 | `strat/datahub.go` | `DataHub`（timeframe:source:sid 三级视图）、`DataFields`（序列/原始值/NULL 语义）、`AllReady` |
-| `strat/batch_state.go` | `BatchState`：同一时间戳的主/辅 Job 批量池，`TakeReady` 决定何时批量执行 |
+| `strat/batch_state.go` | `BatchState`：同一时间戳的主/辅 Job 批量池，`TakeReady` 决定何时批量执行并在确定性回测下按 `BarPriority(barMS, symbol, seed)` 中性哈希序排列 `MainJobs` |
+| `strat/batch_rebalance.go` | `RebalanceBatchWeights`、`InverseVolWeights`：`OnBatchJobs` 跨品种目标名义权重两阶段调仓器（先平/减释放保证金、后按金额降序开/补仓并附带个币止损止盈）与 `NATR` 波动率倒数风险平价配权 |
 | `strat/goods.go` | 品种周期评分（`CalcPairTfScores*`、`calcKlineScore`）与 policy 品种组（`RelayPolicyGroups*`） |
 | `strat/output_state.go` | 策略文本输出缓冲（`WriteOutput` 的 Snapshot/Drain） |
 | `runtime/runtime.go` | `Process`、`Options`、`Runtime`、`NewProcess`/`NewRuntime`、`Stop`/`Close`/`Join`、`OnClose`/`OnCloseWait`、`EnterCallback`/`LeaveCallback`、`BizDeps`/`DataDeps` 投影 |
@@ -51,7 +52,8 @@
 - **`DataEvent` / `DataRole` / `RouteData`**（`data_event.go`）：`DataRoleMain=1`（主 K 线）、`DataRoleInfo=2`（辅助）、`DataRoleCustom=3`（自定义序列）。`RouteData` 每个事件至多调用一个角色处理器。
 - **`DataHub` / `DataFields`**（`datahub.go:15,22`）：`timeframe → source → sid` 三级视图。`DataFields` 同时保留浮点 Series（用于指标）与原始值（`rawMap`，保留显式 nil，区分缺失与 NULL）。`AllReady()` 只检查当前时间会收盘的周期。
 - **`State`**（`state.go:29`）：策略域 typed 状态。绑定 `Core/Clock/Config/Symbols/Exchange`、账户与订单状态（`runtimeAccounts`、`runtimeOrders`、`orderProcessor`、`accountMetrics` 及按账户维护的净值峰值 `accountPeakEquities`）；注册表 `accJobs`（账户 → envKey → 策略名 → Job）、`accInfoJobs`（辅助订阅）、`pairStrats`、`envs`、`versions`、`forbidJobs`、`wsSubJobs`；并维护不可变快照与 dirty bit。`legacyState`（`state.go:515`）是包级全局变量的兼容视图，`IsLegacyState` 用于分支。
-- **`BatchState` / `JobEnv` / `BatchMap`**（`batch_state.go`、`types.go:89,100`）：批量执行池，键为时间戳+市场组；`TakeReady(currMS, deterministic)` 返回就绪组（确定性模式下等待所有有效任务后按 key 排序输出）；组内 `MainJobs` 按品种键字典序交给 `OnBatchJobs`，不经同 bar 多品种的哈希优先级，批策略若按到达顺序依次开仓，资金竞争仍偏向字母靠前的品种，应自行按得分排序。
+- **`BatchState` / `JobEnv` / `BatchMap` / `BarPriority`**（`batch_state.go`、`types.go:89,100`）：批量执行池，键为时间戳+市场组；`TakeReady(currMS, deterministic)` 返回就绪组（确定性模式下等待所有有效任务后按组 key 排序输出）。存在有效 K 线时间戳时，组内任务按与 `data.BarPriority` 一致的 64 位 FNV-1a+avalanche 中性哈希优先级 `(BarPriority(barMS, symbol, bt_bar_order_seed), taskKey)` 排列交给 `OnBatchJobs`（可通过 `BatchState.SetBarOrderSeed` 或运行时配置 `BTBarOrderSeed` 指定种子，无 K 线时间戳的纯合成桩回退字典序），消除字母靠前品种在资金受限时的系统性优先偏差。
+- **`RebalanceBatchWeights` / `BatchRebalanceOpts` / `BatchRebalanceResult` / `InverseVolWeights`**（`batch_rebalance.go`）：`OnBatchJobs` 跨品种组合调仓与风险平价工具。`RebalanceBatchWeights` 以 `AccountEquity()` 为分母按市价名义敞口对比 `targetWeights`（支持 `MaxGrossExposure` 超限等比缩放与同号 `DriftThreshold` 免调仓缓冲带，默认 `0.02`），严格分两阶段执行：第一遍全平清零项、全平反手旧仓并按 `ExitRate` 部分减仓超配项以先行释放保证金；第二遍按待开 `LegalCost` 降序（同额以 `BarPriority` 及品种名决胜）调用 `OpenOrder` 开新仓或同向补仓，自动跳过 `< core.MinStakeAmount` 的碎单并可挂载 `StopLossRate`/`TakeProfitRate`/`CallbackPct`/`Leverage` 个币保护单。`InverseVolWeights` 每根 bar 无条件推进各品种 `ta.NATR` 缓存并以 `signal / NATR` 归一化至 `targetGross`。
 - **`PairUpdateReq` / `PairUpdateResult` / `PairUpdateHooks`**（`pair_update.go:19,31,39`）：动态品种更新的入参、结果与外部钩子（`SubWarmPairs` 必需；`ExitOrders` 在 `CloseOnRemove` 时必需；`LookupSymbol`）。
 - **`FuncProcessOrders` / `BindOrderProcessor`、`FuncAccountMetrics` / `BindAccountMetrics`**（`execution_state.go`、`account_state.go`）：订单处理器与账户资金读取器由 `biz/job_orders.go` 在组装阶段一次性绑定（owner 必须是同一 `Trading` 指针）。
 - **`Process` / `Options` / `Runtime`**（`runtime/runtime.go:47,504,559`）：`Process` 为资源 owner（`runtimes`、`sharedAccounts`、`symbolAllocators`、`sidRegistries`、`schedulerClaims`）；`Options` 为构造参数（Storage、Exchange、Config、Scheduler、AccountOwnerKey、SharedExecution、LegacyExecution 等）；`Runtime` 字段见 `doc/runtime_context.md` §2 表格，关键的有 `Core`、`Clock`、`Market`、`Symbols`、`Storage`（借用）、`Batch`、`Strategies`、`Orders`、`Trading`、`Cron`、`Exchange`（借用）。

@@ -320,7 +320,7 @@ The Chan-theory graph structures in `chanlun.go` (CGraph/CPoint/CPen/CSeg/CCentr
 - `OnCheckExit` (`func(*StratJob,*ormo.InOutOrder) *ExitReq`): called on every main bar (non-warmup) for each fully-entered order with `CanClose()`; a non-nil return closes it, and the framework forcibly sets the returned `OrderID` = that order and `Dirt` = that order's direction
 - `GetDrawDownExitRate` (`func(*StratJob,*ormo.InOutOrder,maxChg float64) float64`): drawdown ratio r; `>0` is used, `0` means not set, `<0`/callback unset uses the default table
 - `OnOrderChange` (`func(*StratJob,*ormo.InOutOrder,chgType int)`): §3.7
-- `OnBatchJobs` (`func([]*StratJob)`): all main-timeframe jobs at the same timestamp (requires `BatchInOut`)
+- `OnBatchJobs` (`func([]*StratJob)`): all main-timeframe jobs at the same timestamp (requires `BatchInOut`; ordered in deterministic backtests by neutral `strat.BarPriority(barMS, symbol, bt_bar_order_seed)` hash priority rather than alphabetical order)
 - `OnBatchInfos` (`func(tf string, jobs map[string]*JobEnv)`): all auxiliary jobs at the same timestamp (requires `BatchInfo`)
 - `OnWsTrades(s,pair,[]*banexg.Trade)`/`OnWsDepth(s,*banexg.OrderBook)`/`OnWsKline(s,pair,*banexg.Kline)`/`OnWsData(s,*orm.DataSeries)` (live): tick trades, order book, real-time bars (may be unclosed), generic time-series events
 - `PickTimeFrame` (`func(symbol string, tfScores []*core.TfScore) string`): choose a timeframe for a symbol (default: the first with Score≥MinTfScore)
@@ -486,6 +486,24 @@ Order events (chgType of `OnOrderChange`, `strat.OdChg*`): `OdChgNew`(0) new ord
 ### 3.8 Common Patterns
 - Open only once per bar: `len(s.Entrys)==0 && s.GetOrderNum(0)==0`.
 - Trailing stop for shorts: `s.SetAllStopLoss(core.OdDirtShort, &ormo.ExitTrigger{Price: s.Env.Close.Get(0)+1.5*atr})`.
+
+### 3.9 Cross-Symbol Target-Weight Rebalancing & Inverse-Volatility Sizing (`OnBatchJobs`)
+Designed for multi-asset risk-parity trend CTA, cross-sectional selection + per-coin stop-loss hybrids, and leader-laggard (e.g. BTC breakout driving lagging high-beta altcoins) strategies running inside `TradeStrat{BatchInOut: true, OnBatchJobs: ...}` (keep `EachMaxLong: 0, EachMaxShort: 0` when enabling same-direction scale-in orders):
+
+- **`strat.RebalanceBatchWeights(jobs []*strat.StratJob, targetWeights map[string]float64, opts strat.BatchRebalanceOpts) strat.BatchRebalanceResult`**:
+  - `targetWeights`: `symbol -> signed target notional fraction of AccountEquity()` (e.g. `0.4` = 40% long notional, `-0.3` = 30% short notional, `0` or omitted = flat).
+  - `BatchRebalanceOpts`:
+    - `Tag string`: entry/exit signal tag (default `"rebalance"`).
+    - `DriftThreshold float64`: no-trade weight drift buffer (default `0.02` = 2% of equity; skips micro-adjustments when current and target weights share the **same non-zero sign** and `|target - cur| < DriftThreshold`; opening from flat is never blocked by the drift buffer; pass `< 0` to disable).
+    - `MaxGrossExposure float64`: gross exposure cap (`> 0` proportionally scales all target weights down whenever `Σ|w| > MaxGrossExposure`).
+    - `StopLossRate` / `TakeProfitRate` / `CallbackPct` / `Leverage float64`: automatically attaches per-symbol protective stop-loss distance (`enterPrice * StopLossRate` via `StopLossVal`), take-profit distance, trailing callback percentage `[0.1, 10]`, and leverage to newly opened / scaled-in orders.
+  - **Two-pass execution order**:
+    1. Pass 1 scans all `jobs`: closes flat targets (`0`), closes opposite-direction positions on reversals before queueing the full new-side target, and partially closes overweight same-direction positions (`|target| < |cur| - DriftThreshold`) with `ExitRate = (|cur| - |target|) / |cur|` so margin is released first.
+    2. Pass 2 sorts new entries and same-direction top-ups (`|target| > |cur| + DriftThreshold`) by `LegalCost = AccountEquity() * deltaWeight` **descending** (tie-broken deterministically by neutral `strat.BarPriority(barMS, symbol, seed)` then symbol) before calling `OpenOrder`, silently skipping sub-`core.MinStakeAmount` (`5.5`) dust orders (`SkippedDustCount`).
+  - Returns `BatchRebalanceResult` (`Equity`, `RawGrossExposure`, `EffectiveGrossExposure`, `ScaleFactor`, `ClosedCount`, `ReducedCount`, `ReversedCount`, `OpenedCount`, `ScaledInCount`, `SkippedDriftCount`, `SkippedDustCount`, `ErrorCount`, and chronological `Actions []BatchRebalanceAction`).
+- **`strat.InverseVolWeights(jobs []*strat.StratJob, signals map[string]float64, atrPeriod int, targetGross float64) map[string]float64`**:
+  - Given directional/strength `signals` (e.g. `+1`/`-1`/`0` or continuous scores), `atrPeriod` (`<=0` defaults to `14`), and `targetGross` (e.g. `0.8`), unconditionally evaluates `ta.NATR(e.High, e.Low, e.Close, atrPeriod)` across every job in `jobs` (preserving incremental RMA cache alignment even when `signal == 0`), weights active legs by `signal / NATR`, and normalizes so `Σ|w| == targetGross`.
+- **`strat.BarPriority(barMS int64, symbol string, seed uint64) uint64`**: neutral, reproducible 64-bit per-bar symbol hash priority (lower runs first).
 
 ## 4. Order, Stop-Loss/Take-Profit and Position Details
 ### 4.1 Opening and Closing
@@ -701,6 +719,29 @@ st.prevMS = e.TimeStart
 if !s.IsWarmUp && btime.IsFirstBarOfPeriodUTC(prevMS, e.TimeStart, "month") && btime.InMonthRangeUTC(e.TimeStart, 11, 4) {
 	s.OpenOrder(&strat.EnterReq{Tag: "monthly_dca_halloween"})
 }
+```
+
+### Example C: Multi-Symbol Risk-Parity CTA / Lead-Lag Batch Rebalancing (`BatchInOut` + `OnBatchJobs`)
+
+```go
+// Set BatchInOut: true on TradeStrat and keep EachMaxLong: 0, EachMaxShort: 0 to allow same-side scale-ins;
+// update per-symbol indicators unconditionally in OnData(Main) into s.More.(*symState), then rebalance in OnBatchJobs:
+OnBatchJobs: func(jobs []*strat.StratJob) {
+	signals := make(map[string]float64, len(jobs))
+	for _, j := range jobs {
+		st := j.More.(*symState)
+		if st.ready {
+			signals[j.Symbol.Symbol] = st.signal // e.g. +1/-1/0 trend breakout, or +1 on lagging beta alts after BTC breakout
+		}
+	}
+	weights := strat.InverseVolWeights(jobs, signals, 14, 1.0) // 1/NATR(14) normalized to 1.0x gross exposure
+	strat.RebalanceBatchWeights(jobs, weights, strat.BatchRebalanceOpts{
+		Tag:              "rp_cta",
+		DriftThreshold:   0.03,
+		MaxGrossExposure: 1.2,
+		StopLossRate:     0.06, // attach 6% per-symbol protective stop-loss to entries
+	})
+},
 ```
 
 ## 10. Legacy Interface Migration (OnBar → OnData)

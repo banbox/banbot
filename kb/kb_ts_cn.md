@@ -320,7 +320,7 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `OnCheckExit`（`func(*StratJob,*ormo.InOutOrder) *ExitReq`）：每根主K线（非预热）对每个已完全入场且 `CanClose()` 的订单调用；返回非 nil 即平仓，框架强制把返回值的 `OrderID`=该订单、`Dirt`=该订单方向
 - `GetDrawDownExitRate`（`func(*StratJob,*ormo.InOutOrder,maxChg float64) float64`）：回撤比例 r；`>0` 采用，`0` 不设置，`<0`/未设回调用默认表
 - `OnOrderChange`（`func(*StratJob,*ormo.InOutOrder,chgType int)`）：§3.7
-- `OnBatchJobs`（`func([]*StratJob)`）：同一时间戳所有主周期 job（需 `BatchInOut`）
+- `OnBatchJobs`（`func([]*StratJob)`）：同一时间戳所有主周期 job（需 `BatchInOut`；确定性回测下按 `strat.BarPriority(barMS, symbol, bt_bar_order_seed)` 中性哈希序排列，不偏向字母靠前品种）
 - `OnBatchInfos`（`func(tf string, jobs map[string]*JobEnv)`）：同一时间戳所有辅助 job（需 `BatchInfo`）
 - `OnWsTrades(s,pair,[]*banexg.Trade)`/`OnWsDepth(s,*banexg.OrderBook)`/`OnWsKline(s,pair,*banexg.Kline)`/`OnWsData(s,*orm.DataSeries)`（实盘）：逐笔、盘口、实时K线（可能未收盘）、通用时序事件
 - `PickTimeFrame`（`func(symbol string, tfScores []*core.TfScore) string`）：为品种选周期（默认取第一个 Score≥MinTfScore 的）
@@ -486,6 +486,25 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 ### 3.8 常用模式
 - 同 bar 只开一次：`len(s.Entrys)==0 && s.GetOrderNum(0)==0`。
 - 空单移动止损：`s.SetAllStopLoss(core.OdDirtShort, &ormo.ExitTrigger{Price: s.Env.Close.Get(0)+1.5*atr})`。
+
+### 3.9 批量截面目标权重调仓与波动率倒数配权（`OnBatchJobs` 专用）
+适用于多品种趋势风险平价 CTA、横截面强弱选币 + 个币止损混血、龙头（如 BTC）突破带动滞涨高 Beta 山寨币（Lead-Lag）等需在 `TradeStrat{BatchInOut: true, OnBatchJobs: ...}` 中统一分配账户总权益名义权重的策略（注意：若需支持同向分批补仓，请保持 `EachMaxLong: 0, EachMaxShort: 0` 不限同向单数）：
+
+- **`strat.RebalanceBatchWeights(jobs []*strat.StratJob, targetWeights map[string]float64, opts strat.BatchRebalanceOpts) strat.BatchRebalanceResult`**：
+  - `targetWeights`：`symbol -> 目标有符号名义权重`（相对 `AccountEquity()` 的比例，如 `0.4` 做多 40% 名义敞口，`-0.3` 做空 30%，`0` 或未出现表示清仓）。
+  - `BatchRebalanceOpts`：
+    - `Tag string`：入场/平仓信号标签（默认 `"rebalance"`）。
+    - `DriftThreshold float64`：免调仓偏离缓冲带（默认 `0.02` 即 2% 权益；仅当当前持仓与目标权重**同号**且 `|target - cur| < DriftThreshold` 时跳过微调以节省手续费；从空仓新建仓不受缓冲带阻挡；传 `< 0` 禁用缓冲带）。
+    - `MaxGrossExposure float64`：总绝对敞口上限（`> 0` 且 `Σ|w| > MaxGrossExposure` 时自动将所有目标权重等比缩放到上限）。
+    - `StopLossRate` / `TakeProfitRate` / `CallbackPct` / `Leverage float64`：新开仓与同向补仓单自动附带的个币止损比例（`enterPrice * StopLossRate` 换算为 `StopLossVal`）、止盈比例、追踪止损回撤百分比 `[0.1, 10]` 与杠杆倍数，打通“横截面组合配权 + 个币实时保护单”。
+  - **两阶段执行顺序**：
+    1. 第一遍扫描全部 `jobs`：目标为 `0` 的全平；方向相反（多翻空/空翻多）的先 `CloseOrders` 平掉旧向持仓并将全额目标记入待开队列；同向超配（`|target| < |cur| - DriftThreshold`）的按 `ExitRate = (|cur| - |target|) / |cur|` 部分减仓，优先释放保证金。
+    2. 第二遍对待开新仓与同向补仓（`|target| > |cur| + DriftThreshold`）按 `LegalCost = AccountEquity() * deltaWeight` **从大到小**排序（同额按 `strat.BarPriority(barMS, symbol, seed)` 中性哈希与品种名确定性决胜）依次调用 `OpenOrder`，低于 `core.MinStakeAmount`（`5.5`）的碎单自动静默跳过（计入 `SkippedDustCount`）。
+  - 返回 `BatchRebalanceResult`（含 `Equity`、`RawGrossExposure`、`EffectiveGrossExposure`、`ScaleFactor`、`ClosedCount`、`ReducedCount`、`ReversedCount`、`OpenedCount`、`ScaledInCount`、`SkippedDriftCount`、`SkippedDustCount`、`ErrorCount` 及按实际执行序排列的 `Actions []BatchRebalanceAction`）。
+- **`strat.InverseVolWeights(jobs []*strat.StratJob, signals map[string]float64, atrPeriod int, targetGross float64) map[string]float64`**：
+  - 输入各品种方向/强度信号 `signals`（如 `+1`/`-1`/`0` 或连续打分）、`atrPeriod`（`<=0` 默认 `14`）及目标总绝对敞口 `targetGross`（如 `0.8`）。
+  - 内部对每个 `job` **无条件计算** `ta.NATR(e.High, e.Low, e.Close, atrPeriod)`（保证 `signal==0` 时增量 RMA 序列缓存不错位），按 `signal / NATR` 波动率倒数赋予低波动品种更高权重、高波动品种更低权重，并精确归一化使 `Σ|w| == targetGross`。
+- **`strat.BarPriority(barMS int64, symbol string, seed uint64) uint64`**：同 bar 多品种中性可复现 64 位哈希优先级（数值越小越优先）。
 
 ## 4. 下单、止损止盈与仓位细则
 ### 4.1 开仓与平仓
@@ -701,6 +720,29 @@ st.prevMS = e.TimeStart
 if !s.IsWarmUp && btime.IsFirstBarOfPeriodUTC(prevMS, e.TimeStart, "month") && btime.InMonthRangeUTC(e.TimeStart, 11, 4) {
 	s.OpenOrder(&strat.EnterReq{Tag: "monthly_dca_halloween"})
 }
+```
+
+### 示例 C：多品种风险平价 CTA / Lead-Lag 批量目标权重调仓（`BatchInOut` + `OnBatchJobs`）
+
+```go
+// TradeStrat 设 BatchInOut: true，保持 EachMaxLong: 0, EachMaxShort: 0 以允许同向动态补仓；
+// OnData(Main) 每根 bar 无条件更新各品种指标并存入 s.More.(*symState)，随后在 OnBatchJobs 统一截面配权与调仓：
+OnBatchJobs: func(jobs []*strat.StratJob) {
+	signals := make(map[string]float64, len(jobs))
+	for _, j := range jobs {
+		st := j.More.(*symState)
+		if st.ready {
+			signals[j.Symbol.Symbol] = st.signal // 如趋势突破 +1/-1/0，或 BTC 突破时给滞涨高 Beta 币赋 +1
+		}
+	}
+	weights := strat.InverseVolWeights(jobs, signals, 14, 1.0) // 按 1/NATR(14) 归一化至总敞口 1.0x
+	strat.RebalanceBatchWeights(jobs, weights, strat.BatchRebalanceOpts{
+		Tag:              "rp_cta",
+		DriftThreshold:   0.03,
+		MaxGrossExposure: 1.2,
+		StopLossRate:     0.06, // 每笔附带 6% 个币保护止损
+	})
+},
 ```
 
 ## 10. 旧接口迁移（OnBar → OnData）

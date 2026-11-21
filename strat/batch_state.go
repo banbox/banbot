@@ -1,17 +1,63 @@
 package strat
 
 import (
+	"cmp"
+	"encoding/binary"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/banbox/banbot/config"
 )
 
 // BatchState owns the mutable batch queue and its backtest timestamp for one trader.
 type BatchState struct {
-	lock   sync.Mutex
-	tasks  map[string]*BatchMap
-	lastMS atomic.Int64
+	lock    sync.Mutex
+	tasks   map[string]*BatchMap
+	lastMS  atomic.Int64
+	seed    atomic.Uint64
+	hasSeed atomic.Bool
+}
+
+// BarPriority returns the neutral, reproducible priority of a symbol within one bar time:
+// 64-bit FNV-1a over (seed, barMS, symbol) with a final avalanche mix. Lower value runs first.
+func BarPriority(barMS int64, symbol string, seed uint64) uint64 {
+	const offset, prime = 14695981039346656037, 1099511628211
+	h := uint64(offset)
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[:8], seed)
+	binary.LittleEndian.PutUint64(buf[8:], uint64(barMS))
+	for _, c := range buf {
+		h ^= uint64(c)
+		h *= prime
+	}
+	for i := 0; i < len(symbol); i++ {
+		h ^= uint64(symbol[i])
+		h *= prime
+	}
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	return h
+}
+
+// SetBarOrderSeed pins an explicit neutral bar-order hash seed on this BatchState.
+func (s *BatchState) SetBarOrderSeed(seed uint64) {
+	if s == nil {
+		return
+	}
+	s.seed.Store(seed)
+	s.hasSeed.Store(true)
+}
+
+// BarOrderSeed returns any explicit bar-order hash seed set on this BatchState.
+func (s *BatchState) BarOrderSeed() (uint64, bool) {
+	if s == nil || !s.hasSeed.Load() {
+		return 0, false
+	}
+	return s.seed.Load(), true
 }
 
 type BatchReady struct {
@@ -95,7 +141,8 @@ func (s *BatchState) TakeReady(currMS int64, deterministic bool) ([]BatchReady, 
 			return nil, waitNum
 		}
 		for _, key := range sortedBatchKeys(s.tasks) {
-			item, isReady, _ := takeBatchReady(key, s.tasks[key], currMS, deterministic)
+			tasks := s.tasks[key]
+			item, isReady, _ := s.takeBatchReady(key, tasks, currMS, deterministic)
 			if !isReady {
 				continue
 			}
@@ -104,7 +151,7 @@ func (s *BatchState) TakeReady(currMS int64, deterministic bool) ([]BatchReady, 
 		}
 	} else {
 		for key, tasks := range s.tasks {
-			item, isReady, shouldWait := takeBatchReady(key, tasks, currMS, deterministic)
+			item, isReady, shouldWait := s.takeBatchReady(key, tasks, currMS, deterministic)
 			if shouldWait {
 				waitNum++
 			}
@@ -160,7 +207,7 @@ func isValidBatchTask(task *JobEnv) bool {
 	return task != nil && task.Job != nil && task.Job.Strat != nil
 }
 
-func takeBatchReady(key string, tasks *BatchMap, currMS int64, deterministic bool) (BatchReady, bool, bool) {
+func (s *BatchState) takeBatchReady(key string, tasks *BatchMap, currMS int64, deterministic bool) (BatchReady, bool, bool) {
 	var item BatchReady
 	isReady, shouldWait := batchReadyStatus(key, tasks, currMS)
 	if !isReady {
@@ -171,7 +218,8 @@ func takeBatchReady(key string, tasks *BatchMap, currMS int64, deterministic boo
 	}
 	first, second, _ := batchKeyParts(key)
 	if deterministic {
-		for _, taskKey := range sortedBatchJobKeys(tasks.Map) {
+		seed := s.resolveBarOrderSeed(tasks)
+		for _, taskKey := range sortedBatchJobKeysWithSeed(tasks, seed) {
 			addBatchTask(&item, tasks.Map[taskKey])
 		}
 	} else {
@@ -224,7 +272,38 @@ func (s *BatchState) restore(tasks map[string]*BatchMap, lastMS int64) {
 }
 
 func (s *BatchState) Reset() {
+	if s == nil {
+		return
+	}
 	s.restore(make(map[string]*BatchMap), 0)
+	s.seed.Store(0)
+	s.hasSeed.Store(false)
+}
+
+func (s *BatchState) resolveBarOrderSeed(tasks *BatchMap) uint64 {
+	if s != nil && s.hasSeed.Load() {
+		return s.seed.Load()
+	}
+	if tasks == nil {
+		return 0
+	}
+	var fallbackLegacy bool
+	for _, task := range tasks.Map {
+		if !isValidBatchTask(task) {
+			continue
+		}
+		job := task.Job
+		if cfg := job.Strat.runtimeConfigFor(job); cfg != nil {
+			return cfg.BTBarOrderSeed
+		}
+		if !job.isExplicitRuntimeJob() {
+			fallbackLegacy = true
+		}
+	}
+	if fallbackLegacy {
+		return config.Data.BTBarOrderSeed
+	}
+	return 0
 }
 
 func sortedBatchKeys(tasks map[string]*BatchMap) []string {
@@ -233,6 +312,101 @@ func sortedBatchKeys(tasks map[string]*BatchMap) []string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	return keys
+}
+
+func batchTaskBarMS(task *JobEnv) int64 {
+	if task == nil {
+		return 0
+	}
+	if task.Env != nil {
+		if task.Env.TimeStop > 0 {
+			return task.Env.TimeStop
+		}
+		if task.Env.TimeStart > 0 {
+			return task.Env.TimeStart
+		}
+	}
+	if task.Job != nil {
+		if task.Job.Env != nil {
+			if task.Job.Env.TimeStop > 0 {
+				return task.Job.Env.TimeStop
+			}
+			if task.Job.Env.TimeStart > 0 {
+				return task.Job.Env.TimeStart
+			}
+		}
+		if task.Job.LastBarMS > 0 {
+			return task.Job.LastBarMS
+		}
+	}
+	return 0
+}
+
+func batchBarMS(tasks *BatchMap) int64 {
+	if tasks == nil {
+		return 0
+	}
+	var barMS int64
+	for _, task := range tasks.Map {
+		if !isValidBatchTask(task) {
+			continue
+		}
+		if ms := batchTaskBarMS(task); ms > barMS {
+			barMS = ms
+		}
+	}
+	return barMS
+}
+
+func batchTaskSymbol(taskKey string, task *JobEnv) string {
+	if task != nil {
+		if task.Symbol != "" {
+			return task.Symbol
+		}
+		if task.Job != nil && task.Job.Symbol != nil && task.Job.Symbol.Symbol != "" {
+			return task.Job.Symbol.Symbol
+		}
+	}
+	if strings.HasSuffix(taskKey, "_main") {
+		return strings.TrimSuffix(taskKey, "_main")
+	}
+	if strings.HasSuffix(taskKey, "_info") {
+		return strings.TrimSuffix(taskKey, "_info")
+	}
+	return taskKey
+}
+
+type batchKeyedPriority struct {
+	key  string
+	prio uint64
+}
+
+func sortedBatchJobKeysWithSeed(tasks *BatchMap, seed uint64) []string {
+	if tasks == nil {
+		return nil
+	}
+	barMS := batchBarMS(tasks)
+	if barMS <= 0 {
+		return sortedBatchJobKeys(tasks.Map)
+	}
+	ordered := make([]batchKeyedPriority, 0, len(tasks.Map))
+	for key, task := range tasks.Map {
+		ordered = append(ordered, batchKeyedPriority{
+			key:  key,
+			prio: BarPriority(barMS, batchTaskSymbol(key, task), seed),
+		})
+	}
+	slices.SortFunc(ordered, func(a, b batchKeyedPriority) int {
+		if c := cmp.Compare(a.prio, b.prio); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.key, b.key)
+	})
+	keys := make([]string, len(ordered))
+	for i, item := range ordered {
+		keys[i] = item.key
+	}
 	return keys
 }
 
