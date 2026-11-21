@@ -73,6 +73,15 @@ func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 // Compile validates every declaration, including unused lets. Only dependencies
 // reachable from Outputs are retained in the resulting execution plan.
 func Compile(spec Spec) (*factor.Plan, error) {
+	outputs, err := CompileNodes(spec)
+	if err != nil {
+		return nil, err
+	}
+	return factor.Compile(outputs)
+}
+
+// CompileNodes validates and lowers Spec into named *factor.Node outputs before plan compilation.
+func CompileNodes(spec Spec) (map[string]*factor.Node, error) {
 	if spec.SchemaVersion != 1 {
 		return nil, fmt.Errorf("schema_version: expected 1, got %d", spec.SchemaVersion)
 	}
@@ -152,7 +161,7 @@ func Compile(spec Spec) (*factor.Plan, error) {
 	for _, name := range names(spec.Outputs) {
 		outputs[name] = c.nodes[name]
 	}
-	return factor.Compile(outputs)
+	return outputs, nil
 }
 func (c *compiler) error(path string, e *expression, format string, args ...any) error {
 	pos := scanner.Position{Line: 1, Column: 1}

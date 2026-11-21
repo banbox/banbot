@@ -97,7 +97,12 @@ func TestPairsReportEpisodesAndPnL(t *testing.T) {
 // A leg that loses data closes the pair (leg_missing), counts paused bars and does not accrue a bogus return when
 // the data comes back; an open position at report time is reported with reason end.
 func TestPairsReportLegMissingPausedAndOpenAtEnd(t *testing.T) {
-	h := newPairsHarness(t, statistics.BandConfig{Entry: 1, Exit: .2}, Pair{Y: "Y", X: "X"})
+	// Window=5 synthetic spike at x=1.0 (< window mean 1.01) flips 5-bar OLS beta negative; opt out of beta sign guard to test missing-leg reopen.
+	builder, tracker, err := newTrackedPairsBuilder(PairsSpec{Pairs: []Pair{{Y: "Y", X: "X"}}, Window: 5, Gross: 1, AllowNegativeBeta: true, Band: statistics.BandConfig{Entry: 1, Exit: .2}}, map[int32]string{1: "Y", 2: "X", 3: "Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &pairsHarness{t: t, build: builder, tracker: tracker}
 	for _, x := range []float64{1.00, 1.03, 0.98, 1.05, 1.01} {
 		h.step(x*1.001, x)
 	}

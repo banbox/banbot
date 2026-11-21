@@ -11,7 +11,7 @@
 | 训练（调用方 Go 代码，只读训练区间） | β/α、残差尺度、阈值、持有期、候选参数 |
 | 冻结（写 YAML `params`，进 manifest hash；或 ParameterArtifact/ModelArtifact） | 不可变参数 |
 | 信号（runner 每决策轮在线算） | 每对 z-score、带状态仓位 ±1/0 |
-| 目标（`RegisterPairs` builder 输出不可变 `factor.TargetPortfolio`：`ID()` 内容哈希，`Targets()` 返回 SID→NAV 比例副本） | 目标权重、诊断码 |
+| 目标（`RegisterPairs` / `RegisterRollingPairs` / `RegisterBaskets` / `RegisterResidualStatArb` builder 输出不可变 `factor.TargetPortfolio`：`ID()` 内容哈希，`Targets()` 返回 SID→NAV 比例副本） | 目标权重、诊断码 |
 | 证据（Weights/Events 账本及其输出文件） | 成交、费用、资金费 |
 
 术语：`Y` 被解释腿（做多价差时买入）；`X` 解释腿（做多价差时卖出）；`z` = 价差残差/残差标准差；`β` 对数回归斜率（弹性）；决策 bar = `run_timeframes` 对应已收盘 K 线。统计函数不读时钟、账户、交易所；数据经 `DataSeries.Values` 传入，保留类型与 NULL，缺失须显式排除，不得当 0。
@@ -36,13 +36,48 @@
 ```go
 func RegisterPairs(name string, build func(*Params) (PairsSpec, error)) error
 type Pair struct{ Y, X string }          // 与运行 SIDMap 中符号完全一致，如 "ETH/USDT:USDT" 或现货 "BTC/USDT"
+type PairFilterContext struct {
+    DecisionTime      int64
+    Pair              Pair
+    ProposedSide      int                // +1（做多 Y / 做空 X）或 -1（做空 Y / 做多 X）
+    Z, Beta, HalfLife float64            // 当期价差 z（或 copula 分位分）、名义 β、FitOU 半衰期（不可用为 NaN）
+    RollingCorr       float64            // CorrWindow 内 1-bar 对数收益相关系数（不可用为 NaN）
+    Hurst, SpreadRSI  float64            // 当前窗口价差 Hurst ∈ [0,1] 与 Wilder RSI ∈ [0,100]（不可用为 NaN）
+    CopulaProbYGivenX float64            // SpreadModel=="copula" 时 P(U<=u | V=v)，否则 NaN
+    CopulaProbXGivenY float64            // SpreadModel=="copula" 时 P(V<=v | U=u)，否则 NaN
+    FeaturesY         map[string]float64 // Y 腿当期有效特征值（辅助读取 ctx.FeatureY(name)）
+    FeaturesX         map[string]float64 // X 腿当期有效特征值（辅助读取 ctx.FeatureX(name)）
+}
 type PairsSpec struct {
-    Pairs        []Pair
-    Field        string                  // kline 字段，缺省 "close"
-    Window       int                     // 回归窗口（决策 bar 数），>= 3
-    Band         statistics.BandConfig   // 见 2.3
-    Gross        float64                 // 单对总名义占策略 NAV；0 = 1/len(Pairs)
-    LongOnlySpot bool                    // 禁止开出会做空现货腿（SpotSIDs / Valuation=="spot"）的价差仓位
+    Pairs             []Pair
+    Field             string                                      // kline 字段，缺省 "close"
+    Window            int                                         // 回归/Copula/预热窗口（决策 bar 数），>= 3
+    Band              statistics.BandConfig                       // 见 2.3（SpreadModel=="copula" 时 Entry/Exit 可留 0）
+    Gross             float64                                     // 单对基础总名义占策略 NAV；0 = 1/len(Pairs)
+    LongOnlySpot      bool                                        // 禁止开出会做空现货腿（SpotSIDs / Valuation=="spot"）的价差仓位
+    MinBeta           float64                                     // 入场最小名义 β 下限（>=0），见 2.4
+    AllowNegativeBeta bool                                        // 默认 false（要求入场名义 β > max(0, MinBeta)）
+    DynamicExitZ      bool                                        // 默认 false（线性回归模型持仓期用冻结斜率计算退出/止损 z）
+    DriftBand         float64                                     // 持仓期免调仓 L1 权重漂移缓冲带（>=0，0 关闭）
+    WeightMode        string                                      // ""/"equal"（默认固定 Gross）或 "inverse_vol"（按 1/ScaleStd 风险平价）
+    MaxPairGross      float64                                     // inverse_vol 下单对敞口上限 [0,1]；0 默认 min(TotalGross, 2*Gross)
+    SpreadModel       string                                      // ""/"log_ols"（默认）、"raw_ols"、"tls"、"kalman"、"ratio"、"return_diff"、"copula"
+    Copula            statistics.CopulaConfig                     // SpreadModel=="copula" 的族与条件概率阈值（见 3.2）
+    KalmanDelta       float64                                     // SpreadModel=="kalman" 状态转移噪声比例 (0,1)，0 缺省 1e-4
+    KalmanVe          float64                                     // SpreadModel=="kalman" 观测噪声方差 (>0)，0 缺省 1e-3
+    DynamicHedge      bool                                        // 默认 false（入场冻结 β）；true 时持仓对冲比随当期在线估计动态更新
+    MinHalfLife       float64                                     // 可选在线入场 FitOU DiscreteHalfLife 下限（>=0，bar 数）
+    MaxHalfLife       float64                                     // 可选在线入场 FitOU DiscreteHalfLife 上限（>=0，0 关闭）
+    MinRollingCorr    float64                                     // 可选在线入场 1-bar 对数收益相关下限 [0,1]（0 关闭）
+    CorrWindow        int                                         // 相关性窗口（bar 数，>=4）；MinRollingCorr>0 且为 0 时默认 Window
+    MinHurst          float64                                     // 可选在线入场价差窗口 Hurst 下限 [0,1]（启用时 Window>=8）
+    MaxHurst          float64                                     // 可选在线入场价差窗口 Hurst 上限 [0,1]（如均值回归设 0.5）
+    SpreadRSIPeriod   int                                         // 可选价差窗口 Wilder RSI 周期（>=2，Window >= Period+1）
+    SpreadRSIUpper    float64                                     // 做空价差（reversion）RSI 下限 (0,100)，仅设周期时默认 70
+    SpreadRSILower    float64                                     // 做多价差（reversion）RSI 上限 (0,100)，仅设周期时默认 30
+    ExtraFeatures     func(FactorContext) map[string]*factor.Node // 可选逐腿自定义 factor DAG 特征列
+    FeatureExprs      map[string]string                           // 可选逐腿表达式特征列（绑定别名 kline）
+    EntryFilter       func(PairFilterContext) bool                // 可选无前视可编程入场过滤钩子（仅拦截新开仓，绝不阻塞平仓）
 }
 ```
 
@@ -54,7 +89,7 @@ type PairsSpec struct {
 
 ### 2.2 校验（build 返回后）
 
-`build`/`name` 为空→注册失败；`Params.Err()` 非空→返回该错误；`Field==""`→`"close"`；`len(Pairs)==0`、`Window<3`、`Band.Validate()` 失败→错误；`Gross==0`→`1/len(Pairs)`；`Gross<=0` 或 `Gross*len(Pairs) > 1+1e-9`→错误（总敞口不得超 NAV）；`Y==""`/`X==""`/`Y==X`→错误；Y/X 不在运行 `SIDMap`→构造组合构造器时报错（`PreparePortfolioConfig`，资源装配前）。
+`build`/`name` 为空→注册失败；`Params.Err()` 非空→返回该错误；`Field==""`→`"close"`；`len(Pairs)==0`、`Window<3`（启用半衰期门控需 `Window>=4`、Hurst 门控需 `Window>=8`、`SpreadRSIPeriod>0` 需 `Window>=SpreadRSIPeriod+1`）、`Band.Validate()` 失败（`SpreadModel=="copula"` 时 `Band.Entry/Exit` 可留 0 自动按 `Copula` 概率映射）→错误；`Gross==0`→`1/len(Pairs)`；`Gross<=0` 或 `Gross*len(Pairs) > 1+1e-9`→错误（总敞口不得超 NAV）；`MinBeta<0`、`DriftBand<0`、`MinHalfLife<0`、`MaxHalfLife<0`（或 `0<MaxHalfLife<MinHalfLife`）或非有限→错误；`MinRollingCorr` 不在 `[0,1]` 或 `CorrWindow` 非法（`MinRollingCorr>0` 或 `CorrWindow>0` 时需 `>=4`）→错误；`MinHurst/MaxHurst` 不在 `[0,1]` 或 `0<MaxHurst<MinHurst`→错误；`SpreadRSIPeriod==1` 或 `<0`、`SpreadRSIUpper/Lower` 不在 `[0,100)` 或 `Lower>=Upper`→错误；`SpreadModel` 非 `""`/`"log_ols"`/`"raw_ols"`/`"tls"`/`"kalman"`/`"ratio"`/`"return_diff"`/`"copula"` 或 `Copula.Normalize()` 失败→错误；`KalmanDelta` 不在 `(0,1)`（0 缺省 `1e-4`）或 `KalmanVe<=0`（0 缺省 `1e-3`）→错误；`WeightMode` 非 `""`/`"equal"`/`"inverse_vol"`→错误；`MaxPairGross` 不在 `[0,1]` 或非有限→错误；`ExtraFeatures`/`FeatureExprs` 空名、nil 节点或重名→编译失败；`Y==""`/`X==""`/`Y==X`→错误；Y/X 不在运行 `SIDMap`（且不在 `UnavailableSymbols`）→构造组合构造器时报错（`PreparePortfolioConfig`，资源装配前）。
 
 构造期不检查可交易性（见 2.4）。
 
@@ -63,45 +98,66 @@ type PairsSpec struct {
 ```go
 type BandConfig struct {
     Entry, Exit, Stop float64
-    MaxHold           int   // 决策轮数，0 关闭
-    LongOnly          bool  // 禁止做空价差 (z >= Entry)
-    ShortOnly         bool  // 禁止做多价差 (z <= -Entry)
+    MaxHold           int    // 决策轮数，0 关闭
+    LongOnly          bool   // 禁止做空价差 (-1)
+    ShortOnly         bool   // 禁止做多价差 (+1)
+    Mode              string // ""/"reversion"（默认均值回归）或 "momentum"（顺势突破跟随）
 }
 func (c BandConfig) Validate() error
+func (c BandConfig) CloseReason(prevPos int, z float64) string
 func NewBandTrader(cfg BandConfig) (*BandTrader, error)   // 每个价差一个实例
 func (b *BandTrader) Step(z float64) int                  // -1/0/+1
 func (b *BandTrader) Position() int
 ```
 
-校验：阈值有限；`Entry>0`；`0<=Exit<Entry`；`Stop==0 或 Stop>Entry`；`MaxHold>=0`；LongOnly 与 ShortOnly 互斥。**无内置阈值默认值**（`p.Float("entry", 2)` 的 2 是调用方选择）。
+校验：`Mode` 为 `""`/`"reversion"`/`"momentum"`；阈值有限；`Entry>0`；`0<=Exit<Entry`；`"reversion"` 下 `Stop==0 或 Stop>Entry`，`"momentum"` 下 `Stop==0 或 Stop>Exit`；`MaxHold>=0`；LongOnly 与 ShortOnly 互斥。**无内置阈值默认值**（`p.Float("entry", 2)` 的 2 是调用方选择）。
 
 状态转移：
 1. 每次 `Step` 先：`blocked` 且 `|z|<=Exit` → 清除。
 2. 非有限 z：返回当前仓位，状态不变。
-3. 持仓：`held++`，按优先级：`Stop>0 且 |z|>=Stop` → 平仓并置 `blocked`；`|z|<=Exit` → 平仓（不置 blocked）；`MaxHold>0 且 held>=MaxHold` → 平仓并置 `blocked`。
-4. 空仓：`blocked` 或 `|z|>=Stop`（Stop>0）→ 保持 0；否则 `z<=-Entry` → +1（做多价差），`z>=Entry` → -1（做空价差），受 LongOnly/ShortOnly 限制；入场 `held=0`；持仓不会单步翻向。
+3. `"reversion"`（默认均值回归）：
+   - 持仓：`held++`，按优先级：`Stop>0 且 |z|>=Stop` → 平仓并置 `blocked`；`|z|<=Exit` → 平仓（不置 blocked）；`MaxHold>0 且 held>=MaxHold` → 平仓并置 `blocked`。
+   - 空仓：`blocked` 或 `|z|>=Stop`（Stop>0）→ 保持 0；否则 `z<=-Entry` → +1（做多价差），`z>=Entry` → -1（做空价差），受 LongOnly/ShortOnly 限制。
+4. `"momentum"`（相对强弱顺势突破）：
+   - 持仓：`held++`，按优先级：`Stop>0` 且反向跌破（`pos>0 && z<=-Stop` 或 `pos<0 && z>=Stop`）→ 平仓并置 `blocked`（`stop`）；回落至均线带（`pos>0 && z<=Exit` 或 `pos<0 && z>=-Exit`）→ 止盈平仓（`exit`，不置 blocked）；`MaxHold>0 且 held>=MaxHold` → 平仓并置 `blocked`（`maxhold`）。
+   - 空仓：`blocked` → 保持 0；否则 `z>=Entry` → +1（顺势做多价差），`z<=-Entry` → -1（顺势做空价差），受 LongOnly/ShortOnly 限制；持仓不会单步翻向。
 
 `blocked`：止损/到期平仓后，z 回到 `[-Exit,Exit]` 才允许再入场。
 
 ### 2.4 运行时语义（每个决策轮）
 
-每对持有私有 `RollingSpread`、`BandTrader`、冻结 β、仓位。每轮：
+每对持有私有 `SpreadEstimator`（7 类 `SpreadModel`）、`BandTrader`（或 `CopulaTrader`）、滚动收益相关跟踪器、冻结名义 β 与模型斜率、最近无量纲 `ScaleStd`、仓位与上一轮持仓基准。
+
+**支持的 `SpreadModel`**：
+- `""` / `"log_ols"`（默认）：对数价格 `ln(Y) = α + β·ln(X)` 滚动窗口 OLS，名义对冲比 `NotionalBeta = β`。
+- `"raw_ols"`：原始价格 `Y = α + β_raw·X` 滚动窗口 OLS，1 股 Y 对冲 `-β_raw` 股 X，自动换算为美元名义对冲比 `NotionalBeta = β_raw · (priceX / priceY)`，`ScaleStd = Std / priceY`。
+- `"tls"`：对数价格二维正交回归（Deming / Total Least Squares），满足交换 Y/X 的倒数对称性 `β_YX · β_XY = 1` 与 `Z_YX = -Z_XY`。
+- `"kalman"`：状态空间随机游走配对（复用 `statistics.KalmanPair`，`ProcessVariance = KalmanDelta/(1-KalmanDelta)`，`ObservationVariance = KalmanVe`），预热满 `Window` 步后以更新前一步预测新息 `Z = Error / sqrt(Variance)` 作为无前视在线 Z-Score；支持 `DynamicHedge: true` 随在线斜率连续更新持仓对冲比。
+- `"ratio"`：价格比值 `R = Y/X` 滚动布林带 `Z = (R - mean)/std`，固定等额美元中性 `NotionalBeta = 1.0`（`wY = +0.5·pos·G, wX = -0.5·pos·G`）。
+- `"return_diff"`：滚动窗口累计收益率差 `(Y/Y_0) - (X/X_0)` 的 Z-Score，固定等额美元中性 `NotionalBeta = 1.0`。
+- `"copula"`：滑动 `Window` 内无前视中位秩变换 `u_t = (less + 0.5·eq)/N ∈ (0,1)`（`u` 为 Y、`v` 为 X），支持 `Copula.Family` 为 `""`/`"auto"`（默认按最大对数似然/AIC 自动选族，`τ<=0` 回退 `gaussian`/`frank`）、`"empirical"`、`"gaussian"`、`"clayton"`、`"gumbel"`、`"frank"`；对冲比取同窗口对数 OLS 斜率 `NotionalBeta = β`。均值回归入场要求双向条件概率同时触发：`P(U<=u|V=v) <= LowerProb`（默认 `0.05`）且 `P(V<=v|U=u) >= 1-LowerProb` 开多价差 `+1`，`P(U<=u|V=v) >= UpperProb`（默认 `0.95`）且 `P(V<=v|U=u) <= 1-UpperProb` 开空价差 `-1`；当双向条件概率回到或穿越 `[0.5-ExitBand, 0.5+ExitBand]`（`ExitBand` 默认 `0`）时平仓。
+
+每轮：
 
 | 步骤 | 条件 | 行为 | 诊断码 |
 | --- | --- | --- | --- |
-| a | Y/X 的 `pairs-log-v1` 值缺失或非 Valid（含价格<=0） | 跳过该对；不推进窗口与状态机；已有仓位保持 | `pair-input-missing` |
-| b | `RollingSpread.Observe` 未就绪（窗口未满、x 方差<=1e-12、残差 std<=1e-12、非有限） | 跳过；不推进 BandTrader | `pair-warmup` |
-| c | 就绪，某腿不可交易，当前仓位 0 | 不开仓，不推进 BandTrader | 无 |
-| d | 就绪，某腿不可交易，当前有仓位 | 仍推进 BandTrader（可按规则平仓） | 无 |
-| e | `Step(z)` 后仓位≠0 且原仓位为 0 或方向变化 | 冻结 β = 本期 `SpreadPoint.Beta` | 无 |
-| f | 所有对都未就绪（均在 a 或 b） | 返回 nil 目标 + `pairs-not-ready` | `pairs-not-ready` |
-| g | 其他 | 对每个仓位≠0 的对（含本轮输入缺失者，用其状态）计算权重输出；非空诊断附到目标 | 本轮诊断 |
+| a | Y/X 的 `pairs-log-v1` 值缺失或非 Valid（含价格<=0） | 暂停该对并重置相关性前值锚点；已有仓位立即平仓并重置状态机（`leg_missing`） | `pair-input-missing` / `pair-closed-missing-leg` |
+| b | `SpreadEstimator.ObserveLog` 未就绪（窗口/预热未满、零方差、非有限） | 跳过；不推进状态机 | `pair-warmup` |
+| c | 就绪，某腿不可交易，当前仓位 0 | 不开仓，不推进状态机 | 无 |
+| c2 | 就绪，当前仓位 0，状态机预览拟开仓（`proposed = ±1`）但未通过任一入场门控（名义 β、`MinRollingCorr`、`MinHalfLife/MaxHalfLife`、`MinHurst/MaxHurst`、`SpreadRSI` 或 `EntryFilter`） | 拦截本次入场，保持空仓且不改变状态机（未触发入场信号时仍正常推进状态机以解除 `blocked`） | 无 |
+| d | 就绪，当前有仓位 | **不受任何入场门控阻拦**：默认用 `EvalFrozenZ`（或 `CopulaTrader` 当期双向条件概率）推进状态机，按规则止盈/止损/到期平仓 | 无 |
+| e | `Step` 后开仓（或持仓且 `DynamicHedge: true` 并通过 β 守卫） | 记录/更新名义 `β = est.NotionalBeta` | 无 |
+| f | 所有对都未就绪（且无因缺失平仓的对） | 返回 nil 目标 + `pairs-not-ready` | `pairs-not-ready` |
+| g | 其他 | 按 `WeightMode` 与 `DriftBand` 为每个仓位≠0 的对计算目标权重输出；非空诊断附到目标 | 本轮诊断 |
 
-权重（`pos∈{-1,0,+1}`，`G`=该对 Gross，`β` 冻结值，`N=1+|β|`）：`w_Y += pos·G/N`，`w_X += -pos·G·β/N`。同一 SID 出现在多对时**叠加**，净额可对消，零权重删除。单对 |w_Y|+|w_X| 恰为 G，总敞口 ≤ ΣG ≤ NAV。`pos=+1` 买 Y 卖 X；X 名义 = β×Y 名义（对数模型弹性对冲）。
+权重（`pos∈{-1,0,+1}`，`G`=该对分配名义，`β` 冻结值，`N=1+|β|`）：理论权重 `idealW_Y = pos·G/N`，`idealW_X = -pos·G·β/N`。
+- **跨配对分配（`WeightMode`）**：`""`/`"equal"` 时每对固定 `G = Gross`；`"inverse_vol"` 时将 `TotalGross = Gross × 可用配对数` 按当前持仓配对 `1/point.Std` 归一化分配，并用注水法限制单对 `G <= MaxPairGross`（未设时默认 `min(TotalGross, 2*Gross)`），总敞口始终 `<= 1`。
+- **持仓漂移缓冲（`DriftBand > 0`）**：若本轮 `pos == prevPos != 0` 且上一轮持仓按当期价格与 `Budget.NAV` 自然漂移后的权重 `(preWY, preWX)` 满足 `|idealW_Y - preWY| + |idealW_X - preWX| < DriftBand`，则保持 `(preWY, preWX)` 避免频繁微调再平衡（若总敞口因漂移超 `1` 则超额缓冲对回退至理论权重）；`pairStats.Turnover` 以 `(preWY, preWX)` 为基准，缓冲轮次记 0 主动换手。
+- 同一 SID 出现在多对时**叠加**，净额可对消，零权重删除。`pos=+1` 买 Y 卖 X；X 名义 = |β|×Y 名义（对数模型弹性对冲）。
 
 - **期现套利（Spot + Linear 混合池）**：根配置声明 `market_type: linear` 与 `extra_markets: [spot]` 后，`pairs` 可同时包含现货 `BTC/USDT` 与永续 `BTC/USDT:USDT`。账本禁止裸做空现货（负目标权重/数量直接报错），且 `funding_policy: storage` / `required-stream` / `funding_apr` 下仅永续腿结算资金费、现货腿资金费恒为 0。若 `Pair{Y: "BTC/USDT:USDT", X: "BTC/USDT"}`（β>0），做空价差（`pos=-1`）即做空永续 Y + 做多现货 X，可配 `BandConfig{ShortOnly: true}` 或 `PairsSpec{LongOnlySpot: true}`（诊断 `pair-spot-short-blocked`）避免反向做空现货腿。
-- **β 为负时两腿同向**：代码不拒绝，须在训练/参数层过滤。
-- **信号/对冲不一致**：z 用每轮滚动 α/β，持仓权重用**入场时冻结**β；持仓期间 β 漂移改变 z 而不改对冲比例。
+- **入场正 β 守卫**：默认拒绝 `Beta <= 0` 入场（避免两腿同向失去对冲），需允许负斜率时显式设 `AllowNegativeBeta: true`。
+- **退出信号与冻结对冲比一致**：默认（`!DynamicExitZ`）持仓期退出/止损 z 基于入场冻结 β 在当前窗口上的残差均值与标准差（`EvalWithBeta`，`ddof=1`），避免滚动 β 漂移造成虚假回归平仓；设 `DynamicExitZ: true` 则使用每轮重拟合 OLS 的 `point.Z`。
 - **窗口**=最近 N 个**可用观测**，非日历 bar；某腿无效的 bar 不进窗口，覆盖时间会拉长。
 - **Full/Patch**：目标为 NAV 比例；Full 下未入目标的 SID 视为 0。平仓对被从目标删除，故**不得设 `portfolio.mode: patch`**（Patch 只改目标内 SID，未列出的仓位永不平仓）；缺省 full。
 - **nil 目标 vs 空目标**：nil（f）= 本轮无新目标；引擎不替换待执行目标，Weights 账本数量不变（沿用此前持仓），`Result.Skipped++`，评估权重不更新；已提交未成交目标仍按窗口执行或过期。非 nil 空 map（所有对平仓）= Full 下全部清零，无需报价即可执行。预热期（窗口未满）为 nil，就绪后无仓位即为空目标。
@@ -132,17 +188,169 @@ run_policy:
 
 **可观察时点**：目标须在报价 `AtMS > DecisionTime`、`AtMS >= DecisionTime+latency_ms`、`AvailableAt <= now` 且在 `expiry_ms`（默认 60000）内的价格执行。故 **1h 决策 + 默认 1h close 价格流 + 默认 expiry**：下一根报价在 1h 后，非空目标全部过期，零成交（实测：账本无持仓、费用 0）。解决：配 `prices: {source: tick, timeframe: event, field: price}` 或 `kline/1m/close`（实测 tick 流在决策后 1ms 成交）。仅提高 `expiry_ms` 让其在下一根 K 线成交未实测，且成交价为下一根收盘。
 
-**Weights 账本对漂移计费**：账本每次执行目标都按 `qty = w × spec.Budget.NAV / price` 重算数量（NAV=决策时账本 NAV，随盈亏复利），与现有数量之差按 `fee_rate`+`slippage_rate` 计费。配对每个决策轮都输出目标，所以**持仓期间价格漂移每轮被再平衡回目标权重并计费**（实测权重恒定时费用仍逐轮累计）。Gross 是当前 NAV 比例而非初始 NAV。`research.Evaluate` 的 `Costs = CostRate × Σ|w−w_prev|` 只计权重差、不含漂移，与账本口径不同（`Result.Book` 为账本口径）。Events 路径是否同样产生漂移再平衡成交未实测。
+**Weights 账本对漂移计费**：账本每次执行目标都按 `qty = w × spec.Budget.NAV / price` 重算数量（NAV=决策时账本 NAV，随盈亏复利），与现有数量之差按 `fee_rate`+`slippage_rate` 计费。`DriftBand == 0` 时配对每个决策轮都输出恒定目标权重，**持仓期间价格漂移每轮被再平衡回目标权重并计费**；设置 `DriftBand > 0` 可在偏离未超阈值时输出自然漂移权重以省去无谓摩擦成本。Gross 是当前 NAV 比例而非初始 NAV。`research.Evaluate` 的 `Costs = CostRate × Σ|w−w_prev|` 只计权重差、不含漂移，与账本口径不同（`Result.Book` 为账本口径）。Events 路径是否同样产生漂移再平衡成交未实测。
 
-### 2.7 自定义路径（静态 β、Kalman、多腿篮子）
+### 2.7 自定义路径（外部静态 β）
 
-`RegisterPairs` 的 β 来自滚动 OLS，**无法注入静态 β 或 Kalman 状态**，需用通用接口：
+两腿在线模型见 `RegisterPairs` / `RegisterRollingPairs`（`SpreadModel`），3 腿及以上协整篮子直接用 `RegisterBaskets`（2.9），截面 PCA / 基准残差 OU `s-score` 直接用 `RegisterResidualStatArb`（2.10）；仅当需要注入自定义状态机或外部离线静态模型时才需底层通用接口：
 1. `runner.RegisterDefinition(name, func(c runner.Config) (*factor.Plan, research.ComboSpec, error))`：`factor.New().Add(name, node).Compile()` 编译对数价格节点（`factor.Field("kline", field, c.Factor.TimeFrame)` + `factor.Custom(version, inputs, fn)`，同 `pairs-log-v1` 形式），组合为 `research.ComboSpec{Method: research.Equal, Columns: [...]}`。
 2. `runner.RegisterPortfolioFactory(name, func(c runner.Config) (runner.PortfolioBuilder, error), validator)`：名字须含 `-v`；validator 只做纯参数检查，不构造状态。
 3. 构造器：`func(frame factor.Frame, universe factor.Universe, spec factor.PortfolioSpec, def research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error)`；输出 `factor.NewTargetPortfolio(spec, weights)`，`spec` 用入参。
 4. YAML：`portfolio: {builder: <name>-v1}`（显式值优先）。
 
 有状态构造器每决策轮只能调用一次（重复会重复推进滤波状态），状态须每次运行私有。
+
+### 2.8 滚动重选配对策略：`runner.RegisterRollingPairs`
+
+无需在 Go 代码硬编码交易对字面量，直接以运行宇宙（YAML `pairs`）为候选池，按“形成期 + 交易期”周期性无前视重选配对。占用定义名 `<name>` 与组合工厂名 `<name>-rolling-pairs-v1`。
+
+```go
+func RegisterRollingPairs(name string, build func(*Params) (RollingPairsSpec, error)) error
+type RollingPairsSpec struct {
+    Candidates        []string              // 可选候选子集；为空时默认使用 Universe.Investable 全部品种
+    Field             string                // kline 字段，缺省 "close"
+    FormationBars     int                   // 形成期窗口（决策 bar 数），>= 20
+    ReselectBars      int                   // 重选间隔/交易期长度（决策 bar 数），>= 1
+    PairCount         int                   // 每期最多入选配对数，缺省 5（>0）
+    MaxPerSymbol      int                   // 同一品种当期入选配对最多出现次数，缺省 2（>0）
+    SelectionMethod   string                // ""/"cointegration"（默认）或 "distance"（Gatev 最小距离法）
+    MinCoverage       float64               // 形成期双腿同时有效比例下限，缺省 0.9，范围 (0,1]
+    MinCorr           float64               // 形成期对数收益 Pearson 相关下限 [0,1]；cointegration 缺省 0.5，distance 为 0 时要求 >0
+    MaxADF            float64               // cointegration 残差 ADF t 统计量上限（<0），0 缺省 -2.86
+    ADFLags           int                   // EngleGranger 残差 ADF 滞后阶数（>=0，且 FormationBars >= ADFLags+6）
+    MinHalfLife       float64               // FitOU DiscreteHalfLife 下限（>=0，bar 数）
+    MaxHalfLife       float64               // FitOU DiscreteHalfLife 上限；0 缺省 float64(FormationBars)
+    Window            int                   // 在线 RollingSpread 窗口；0 缺省 FormationBars（>=3）
+    Band              statistics.BandConfig // 进出场与止损/最大持仓阈值（2.3）
+    Gross             float64               // 单槽位名义敞口比例；0 缺省 1/PairCount，须 Gross*PairCount <= 1
+    MinBeta           float64               // 形成期与在线入场 β 下限（>=0）
+    AllowNegativeBeta bool                  // 默认 false（要求 β > max(0, MinBeta)）
+    DynamicExitZ      bool                  // 默认 false（持仓退出用 EvalWithBeta 冻结 β）
+    DriftBand         float64               // 持仓期免调仓漂移缓冲带（>=0）
+    WeightMode         string                                      // ""/"equal" 或 "inverse_vol"
+    MaxPairGross       float64                                     // inverse_vol 单对上限 [0,1]；0 缺省 min(TotalGross, 2*Gross)
+    SpreadModel        string                                      // ""/"log_ols"（默认）、"raw_ols"、"tls"、"kalman"、"ratio"、"return_diff"、"copula"
+    Copula             statistics.CopulaConfig                     // SpreadModel=="copula" 配置
+    KalmanDelta        float64                                     // SpreadModel=="kalman" 状态转移噪声比例 (0,1)，0 缺省 1e-4
+    KalmanVe           float64                                     // SpreadModel=="kalman" 观测噪声方差 (>0)，0 缺省 1e-3
+    DynamicHedge       bool                                        // true 时持仓期动态更新名义对冲比
+    OnlineHalfLifeGate bool                                        // true 时交易期开仓前额外校验在线窗口 FitOU 半衰期落入 [MinHalfLife, MaxHalfLife]
+    MinRollingCorr     float64                                     // 交易期在线入场 1-bar 对数收益相关下限 [0,1]
+    CorrWindow         int                                         // 在线相关性窗口（>=4，0 缺省 Window）
+    MinHurst, MaxHurst float64                                     // 交易期在线价差窗口 Hurst 门控 [0,1]
+    SpreadRSIPeriod    int                                         // 交易期在线价差窗口 Wilder RSI 周期
+    SpreadRSIUpper     float64                                     // 价差 RSI 上阈值（reversion 做空下限，缺省 70）
+    SpreadRSILower     float64                                     // 价差 RSI 下阈值（reversion 做多上限，缺省 30）
+    ExtraFeatures      func(FactorContext) map[string]*factor.Node // 可选逐腿自定义 factor DAG 特征列
+    FeatureExprs       map[string]string                           // 可选逐腿表达式特征列
+    EntryFilter        func(PairFilterContext) bool                // 可选在线开仓过滤钩子
+    HandoffMode        string                                      // ""/"graceful"（默认优雅退场）或 "immediate"（换期立即平仓）
+}
+```
+
+- **严格 PIT 筛选与确定性**：第 `t` 根决策 bar 重选只读 `<= t` 已收盘的最近 `FormationBars` 个网格，仅在当轮 `Tradable` 且观测有效的品种中筛选；候选与并列得分严格按 `(score, Y符号, X符号, SID)` 升序打破并列，同输入重复运行逐位一致。
+  - `"cointegration"`：对齐覆盖率与对数收益相关达标后，双向运行 `EngleGranger(..., intercept=true, ADFLags)` 与 `FitOU(Residuals)`，保留斜率合法、`TStatistic <= MaxADF` 且 `DiscreteHalfLife ∈ [MinHalfLife, MaxHalfLife]` 的方向（双向通过取 `TStatistic` 更小者），按 `TStatistic` 升序贪心选至多 `PairCount` 对（受 `MaxPerSymbol` 限制）。
+  - `"distance"`：覆盖率达标且对数收益正相关，形成期首根共同有效价归一为 `1.0`，按归一化价格平方偏差和（按有效覆盖率折算到 `FormationBars`）升序贪心选取（方向取 OLS 斜率合法且 `|β-1|` 更小者）。
+- **在线预热与换期交接（`HandoffMode`）**：
+  - 首次满 `FormationBars` 前返回 `nil`（`pairs-not-ready`）；新入选配对用 `t` 之前的可见历史观测预热 `RollingSpread`，当轮即可交易；连任配对保留既有 `RollingSpread`/`BandTrader`/冻结 `β`/持仓。当期 0 对入选时附诊断 `rolling-pairs-empty-selection`（无退场仓位时输出显式空 `map[int32]float64{}`）。
+  - `"graceful"`（默认）：未连任但仍持仓的旧配对进入只退不进池（保持冻结 `β` 与 `BandTrader` 直至 `exit`/`stop`/`maxhold` 平仓，平仓后移除且绝不再开仓）并占用槽位，新配对按排名使用剩余槽位（同品种对反向亦等待退场完成），任意时刻总开仓对数 `<= PairCount`、总敞口严格 `<= 1`。
+  - `"immediate"`：换期当根直接平掉未连任持仓配对（`PairEpisode.Reason = "reselect"`），立即释放全部槽位给新配对。
+- **PIT 缺数据与报告**：Weights 回测走 `pitReduceUniverse`——中途退市/缺数据的品种从当轮宇宙剔除，含该腿的持仓配对立即平仓（`leg_missing`），且自动从重选候选中排除，其余配对照常运行不跳过整轮；`Candidates` 中属 `UnavailableSymbols` 的品种自动跳过。`Result.Pairs` 按运行中曾入选的不同有向 `Pair{Y, X}` 汇总 `Trades`、`Wins`、`Episodes`、`PnL`、`Turnover`，与 `PairsGrossPnL`/`PairsNAVReturn`/`PairsResidual` 对账。
+
+示例（YAML `pairs` 给候选池，Go 代码零品种字面量）：
+
+```go
+runner.RegisterRollingPairs("rolling-coint", func(p *runner.Params) (runner.RollingPairsSpec, error) {
+    return runner.RollingPairsSpec{
+        FormationBars: p.Int("formation", 240),
+        ReselectBars:  p.Int("reselect", 120),
+        PairCount:     p.Int("pairCount", 5),
+        MaxPerSymbol:  p.Int("maxPerSymbol", 2),
+        Window:        p.Int("window", 120),
+        DriftBand:     p.Float("driftBand", 0.02),
+        WeightMode:    "inverse_vol",
+        Band: statistics.BandConfig{
+            Entry: p.Float("entry", 2.0), Exit: p.Float("exit", 0.5),
+            Stop: p.Float("stop", 4.0), MaxHold: p.Int("maxHold", 60),
+        },
+    }, p.Err()
+})
+```
+
+### 2.9 多腿协整篮子策略：`runner.RegisterBaskets`
+
+声明式构建 2..12 腿协整篮子，占用定义名 `<name>` 与组合工厂名 `<name>-baskets-v1`（`BuildBasketsRegistration` 可在不写全局注册表的前提下构造 `Registration` 并单测）。
+
+```go
+type Registration struct {
+    Name, BuilderName string
+    Definition        DefinitionBuilder
+    Factory           PortfolioFactory
+    Validator         PortfolioValidator
+}
+func (r Registration) Register() error
+
+type BasketDef struct {
+    Name    string
+    Symbols []string  // 2..12 个互异非空符号
+    Weights []float64 // WeightMethod=="fixed" 时显式给定（自动按 Σ|w_i|=1 归一）
+}
+type BasketsSpec struct {
+    Baskets              []BasketDef
+    Field                string                // kline 字段，缺省 "close"
+    Window               int                   // 滚动窗口 bar 数（johansen 须 >= d*(DifferenceLags+1)+3）
+    WeightMethod         string                // ""（Weights 非空取 "fixed"，否则 "johansen"）、"fixed"、"johansen"、"multivariate_ols"
+    UseRawPrice          bool                  // true 时在原始价格上拟合并按 beta_i*price_i 换算美元名义权重
+    DifferenceLags       int                   // Johansen VECM 差分滞后阶数（>=0，缺省 0）
+    RequireCointegration bool                  // true 时在 "johansen" 下要求 IsCointegrated(spec, Confidence) 才允许开新仓
+    Confidence           float64               // Johansen 显著性置信水平 {0.90, 0.95, 0.99}，0 缺省 0.95
+    MinHalfLife          float64               // 可选入场 FitOU DiscreteHalfLife 下限（>=0）
+    MaxHalfLife          float64               // 可选入场 FitOU DiscreteHalfLife 上限（>=0，0 关闭）
+    Band                 statistics.BandConfig // 支持 "reversion" 与 "momentum"
+    MaxHoldBars          int                   // Band.MaxHold==0 时的最大持仓 bar 数（>=0）
+    DynamicWeights       bool                  // 默认 false（入场冻结单位权重并在窗口上评估冻结组合退出 z）；true 动态更新
+    DriftBand            float64               // 持仓期单篮子 L1 漂移免调仓缓冲带（>=0）
+    WeightMode           string                // ""/"equal" 或 "inverse_vol"（按单位名义无量纲波动率倒数注水分配）
+    GrossPerBasket       float64               // 单篮子名义敞口比例；0 缺省 MaxGross/len(Baskets)
+    MaxGross             float64               // 组合总敞口上限 (0,1]；0 缺省 1.0
+}
+func BuildBasketsRegistration(name string, spec BasketsSpec) (Registration, error)
+func RegisterBaskets(name string, spec BasketsSpec) error
+```
+
+- `"johansen"` 取首协整向量 `CointegratingVectors[0]` 并固定符号使首个非零分量 `beta[0] > 0`；`"multivariate_ols"` 将第 0 腿对 `[1, leg_1..leg_{k-1}]` 中心化最小二乘回归（秩亏时启用微幅岭回归回退），系数取 `[+1, -b_1, ..., -b_{k-1}]`。
+- 逐篮子多腿收益与换手写入 `Result.Pairs`，与 `PairsGrossPnL` / `PairsNAVReturn` / `PairsResidual` 对账一致；中途缺腿当轮以 `leg_missing` 平仓并暂停，`UnavailableSymbols` 整次优雅跳过。
+
+### 2.10 截面 PCA / 基准残差 `s-score` 策略：`runner.RegisterResidualStatArb`
+
+在时点可投资池 `Universe.Investable` 上实现 Avellaneda & Lee (2010) 截面残差均值回归与严格美元中性 + 因子 Beta 中性组合构造，占用定义名 `<name>` 与组合工厂 `<name>-residual-statarb-v1`。
+
+```go
+type ResidualStatArbSpec struct {
+    Field             string   // kline 字段，缺省 "close"
+    FactorModel       string   // ""/"pca"（默认）或 "benchmarks"
+    Benchmarks        []string // FactorModel=="benchmarks" 时的显式基准符号（1..16 个，如 BTC/ETH）
+    NumFactors        int      // FactorModel=="pca" 提取主成分个数，0 缺省 3
+    Window            int      // 滚动 1-bar 简单收益率回归窗口（>= max(6, 因子数+3)，需 Window+1 根价格）
+    OUWindow          int      // 累计残差 FitOU 窗口；0 缺省 Window，范围 [4, Window]
+    MinHalfLife       float64  // FitOU DiscreteHalfLife 入场下限（>=0）
+    MaxHalfLife       float64  // FitOU DiscreteHalfLife 入场上限（>=0，0 不限）
+    EntryS            float64  // 开仓阈值：s_i <= -EntryS 做多(+1)，s_i >= +EntryS 做空(-1)；0 缺省 1.25
+    ExitLongS         float64  // 多头平仓阈值 s_i >= -ExitLongS；0 缺省 min(0.50, 0.5*EntryS)
+    ExitShortS        float64  // 空头平仓阈值 s_i <= +ExitShortS；0 缺省 min(0.50, 0.5*EntryS)
+    StopS             float64  // 止损阈值 |s_i| >= StopS（0 关闭，启用须 > EntryS）
+    MaxHoldBars       int      // 最大持仓 bar 数（0 关闭）
+    WeightMode        string   // ""/"equal"（±1 意愿）或 "inverse_vol"/"inverse_sigma"（±1/sigma_eq 意愿）
+    TargetGross       float64  // 目标总名义敞口 (0,1]，0 缺省 1.0
+    MaxWeightPerAsset float64  // 单币绝对权重上限 [0,1]（交替投影保持双中性，0 不限）
+    DriftBand         float64  // 活跃仓位未变时的组合 L1 权重漂移缓冲带（>=0）
+}
+func BuildResidualStatArbRegistration(name string, spec ResidualStatArbSpec) (Registration, error)
+func RegisterResidualStatArb(name string, spec ResidualStatArbSpec) error
+```
+
+- **信号生成**：`"pca"` 对标准化收益率运行 `statistics.FitPCA` 构造特征组合收益率并逐币种 OLS 提取残差；`"benchmarks"` 对显式基准收益率做多元 OLS 提取残差。在 `OUWindow` 累计残差 `X_i` 上运行 `FitOU`，计算 `sigma_eq = InnovationStd / sqrt(1 - (1+Slope)^2)` 并去截面偏离均值得到中心化 `s_i = (X_{i,last} - m_eq_centered) / sigma_eq`。
+- **双中性投影与 PIT**：经 `statistics.FactorNeutralWeights`（活跃币种不足以张成约束核空间时自动引入基准或宇宙内可交易被动对冲腿）严格满足 `|Σ w_i| < 1e-9`（美元中性）与 `|B^T w| < 1e-9`（因子 Beta 中性）；品种离开 `Investable` 或缺失数据时当轮立即清零该腿并保持其余组合双中性。
 
 ## 3. 数值 API（`factor/statistics`）
 
@@ -173,29 +381,71 @@ type JohansenResult struct {
     Samples, NuisanceRank int
 }
 func Johansen(levels [][]float64, spec JohansenSpec) (JohansenResult, error)   // 2<=资产<=64
+func JohansenTraceCriticalValues(d int, spec JohansenSpec, confidence float64) ([]float64, error)
+func JohansenMaxEigCriticalValues(d int, spec JohansenSpec, confidence float64) ([]float64, error)
 func (j JohansenResult) TraceRank(criticalValues []float64) (int, error)       // 长度须等于 len(Trace)(=资产数)，值>0；顺序拒绝，首个不拒绝处停止
+func (j JohansenResult) MaxEigRank(criticalValues []float64) (int, error)
+func (j JohansenResult) CointegrationRank(spec JohansenSpec, confidence float64) (int, error)
+func (j JohansenResult) IsCointegrated(spec JohansenSpec, confidence float64) (bool, error)
 ```
 
-- **临界值（以代码为准）**：`statistics` **没有任何临界值表、插值函数或 p 值**；`AugmentedDickeyFuller`/`EngleGranger` 只返回 `TStatistic`，`TraceRank` 由调用方提供临界值，无默认表。
+- **临界值（以代码为准）**：`AugmentedDickeyFuller`/`EngleGranger` 只返回 `TStatistic`（不含内置 ADF 临界值表或 p 值）；Johansen 提供匹配 `JohansenSpec{Intercept, Trend}` 三种确定性项与 `confidence ∈ {0.90, 0.95, 0.99}` 的 Osterwald-Lenum / MacKinnon-Haug-Michelis 渐近临界值（`m = d - r ≤ 12` 查精确表，`13..64` 用二次布朗矩渐近外推），经 `JohansenTraceCriticalValues`、`JohansenMaxEigCriticalValues`、`CointegrationRank` 与 `IsCointegrated` 调用。
 - **EngleGranger**：`Regress(y,x,intercept)` 后对残差做 `ADFSpec{Lags: lags}`（**残差检验无截距、无趋势**）。统计量越负越倾向拒绝“无协整”，须与匹配确定性项/回归元个数的 Engle–Granger/MacKinnon 临界值比较。外部参考（**非代码提供**）：MacKinnon 渐近值，N=2 含常数项约 1%:-3.90、5%:-3.34、10%:-3.04；加趋势、更多回归元、有限样本均不同，应取响应面或自行模拟。
 - **FitOU**：按 bar 计数用 `DiscreteHalfLife`。
 - **Johansen** 特征向量须先按某一腿归一再做腿权重；`TraceRank` 临界值须对应相同滞后、确定性项、显著性水平。
 
-### 3.2 在线滚动价差（`RegisterPairs` 所用）
+### 3.2 在线滚动价差与统一价差估计器（`RegisterPairs` / `RegisterRollingPairs` 所用）
 
 ```go
 type SpreadPoint struct {
-    Alpha, Beta float64   // 当前窗口 OLS: y = alpha + beta*x
-    Residual    float64   // 当前观测 y - alpha - beta*x
-    Std         float64   // 窗口残差标准差，ddof=2
+    Alpha, Beta float64   // 当前窗口拟合: y = alpha + beta*x
+    Residual    float64   // 当前残差（或 Kalman 更新前新息）
+    Std         float64   // 窗口残差标准差（OLS/TLS ddof=2；ratio/return_diff ddof=1；kalman sqrt(Variance)）
     Z           float64   // Residual / Std
 }
-func NewRollingSpread(window int) (*RollingSpread, error)  // window >= 3
+func NewRollingSpread(window int) (*RollingSpread, error)                    // window >= 3
 func (r *RollingSpread) Window() int
-func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)   // x 为 X 腿、y 为 Y 腿（对数价格）
+func (r *RollingSpread) Observe(x, y float64) (SpreadPoint, bool)            // x 为 X 腿、y 为 Y 腿
+func (r *RollingSpread) EvalWithBeta(x, y, frozenBeta float64) (float64, bool) // 固定斜率窗口残差 z（ddof=1），不修改状态
+
+type SpreadModelConfig struct {
+    Model       string       // ""/"log_ols"、"raw_ols"、"tls"、"kalman"、"ratio"、"return_diff"、"copula"
+    Window      int          // >= 3
+    KalmanDelta float64      // (0,1)，0 缺省 1e-4
+    KalmanVe    float64      // >0，0 缺省 1e-3
+    Copula      CopulaConfig // Model=="copula" 配置
+}
+type SpreadEstimate struct {
+    SpreadPoint
+    NotionalBeta      float64 // 目标组合美元名义对冲比（raw_ols 为 Beta*(priceX/priceY)；ratio/return_diff 为 1.0）
+    ScaleStd          float64 // 无量纲波动尺度（供 WeightMode: "inverse_vol" 跨配对分配）
+    CopulaProbYGivenX float64 // Model=="copula" 时 P(U<=u | V=v)，否则 NaN
+    CopulaProbXGivenY float64 // Model=="copula" 时 P(V<=v | U=u)，否则 NaN
+    CopulaTau         float64 // Model=="copula" 时滚动 Kendall τ，否则 NaN
+    CopulaFamily      string  // Model=="copula" 时当期生效 Copula 族
+}
+func NewSpreadEstimator(cfg SpreadModelConfig) (*SpreadEstimator, error)
+func (e *SpreadEstimator) ObserveLog(lx, ly float64) (SpreadEstimate, bool)
+func (e *SpreadEstimator) EvalFrozenZ(lx, ly, frozenModelBeta float64) (float64, bool)
+func (e *SpreadEstimator) WindowSeries(dst []float64) ([]float64, bool)
+
+type CopulaFamily string // "auto"、"empirical"、"gaussian"、"clayton"、"gumbel"、"frank"
+type CopulaConfig struct {
+    Family    CopulaFamily // ""/"auto"（默认）、"empirical"、"gaussian"、"clayton"、"gumbel"、"frank"
+    LowerProb float64      // 多价差入场阈值 (0,0.5)，0 缺省 0.05
+    UpperProb float64      // 空价差入场阈值 (0.5,1)，0 缺省 0.95（或 1-LowerProb）
+    ExitBand  float64      // 围绕 0.5 的退场半带宽 [0,0.5)，缺省 0（穿越 0.5 平仓）
+    StopProb  float64      // 可选极端尾部止损概率 (0, min(LowerProb, 1-UpperProb))，0 关闭
+}
+func NewRollingCopula(window int, family CopulaFamily) (*RollingCopula, error)
+func (r *RollingCopula) Observe(x, y float64) (CopulaPoint, bool)
+func CopulaConditionalCDF(family CopulaFamily, param, u, v float64) (probUGivenV, probVGivenU float64, err error)
+func EmpiricalCopulaConditionalCDF(uSample, vSample []float64, u, v float64) (probUGivenV, probVGivenU float64, err error)
+func HurstExponent(values []float64) (float64, error)         // len >= 8，多滞后方差尺度广义 Hurst ∈ [0,1]
+func WilderRSI(values []float64, period int) (float64, error) // period >= 2, len >= period+1，输出 [0,100]
 ```
 
-`ok=false`：窗口未满、输入非有限（样本被跳过）、x 窗口方差<=1e-12、残差 std<=1e-12。每次为当前窗口完整 OLS（非冻结）；对数价格下 β 为弹性。
+`Observe` 返回 `ok=false`：窗口未满、输入非有限（样本被跳过）、x 窗口方差<=1e-12、残差 std<=1e-12；每次为当前窗口完整 OLS，对数价格下 β 为弹性。`EvalWithBeta` 在窗口已满且输入有限时，按窗口内 `r_i = y_i - frozenBeta*x_i` 的均值与标准差（`ddof=1`，`std<=1e-12` 时 `ok=false`）返回 `y - frozenBeta*x` 的 z-score，不改变环形缓冲区。
 
 ### 3.3 Kalman 滤波（随机游走 β 与截距）
 
@@ -335,7 +585,7 @@ AFML 标签/CPCV、订单流与 PIN/VPIN、VID 风险定价、HMM（`FitBinaryHM
 4. 残差标准化为 z（训练均值/标准差），`EmpiricalThreshold`+`RegularizationHeel` 选 Entry；Exit/Stop 由调用方选（如 Entry 的 1/2 与 2 倍），满足 `Stop > Entry > Exit >= 0`。
 5. `CrossingDurations`+`BootstrapDurations` 的分位数用于估 `MaxHold` 量级，非确定截止时间。
 6. 成本门槛：按 7.1 确认 `(|Entry|-|Exit|)·σ/(1+|β|)` 覆盖往返成本，否则提高 Entry 或放弃。
-7. 多腿篮子：`Johansen`（需对应临界值）；`RegisterPairs` 仅两腿，多腿走 2.7。
+7. 多腿篮子与截面残差：`Johansen` 配合 `IsCointegrated` / `CointegrationRank`；多腿篮子使用 `RegisterBaskets`（2.9），全市场残差回归使用 `RegisterResidualStatArb`（2.10）。
 
 ### 4.2 冻结产物
 
@@ -452,10 +702,10 @@ func (s CrossVenueSnapshot) Equity(mark decimal.Decimal) (decimal.Decimal, error
 
 ### 7.2 风险要点
 
-- **无波动率目标**：每对名义固定 `G`。
+- **无组合级波动率目标**：`WeightMode: "inverse_vol"` 按各对 `1/Std` 做跨配对相对风险分配，但总名义预算 `TotalGross` 仍为固定比例，不会随市场整体波动率自动缩减总仓位。
 - **止损=平仓而非保护**：`|z|>=Stop` 实现亏损并阻止再入场，不限单笔亏损。
 - **无默认时间止损**：`MaxHold:0` 时不回归的价差一直占用敞口。
-- **结构性断裂**（并购、退市等）：需外部失效检测，库不提供。
+- **结构性断裂**（并购、退市、制度切换）：`RegisterRollingPairs` 通过周期性重选缓解协整慢性衰减，但交易期内的突发断裂仍依赖 `Stop`/`MaxHold`/PIT 退市平仓或外部失效检测。
 - **再平衡成本**：见 2.6；Events 需单独核对。
 - **容量**：`research.EstimateCapacityCost(spec CapacityCostSpec{FeeRate, SlippageRate, ImpactCoefficient, MaxParticipation}, tradedNotional, adv, volatility, heldNotional, fundingRate) (CapacityCost{Participation, Fee, Slippage, Impact, Funding, Total, Feasible}, error)`：`Impact = traded·coef·vol·√(traded/adv)`；`adv>0`，`MaxParticipation∈[0,1]`（0=不限）；仅为估计。
 - **账户风险限额**：Gross、保证金限额为**结算币绝对金额**，非杠杆倍数；与策略 NAV 比例 `Gross` 不互替。

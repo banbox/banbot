@@ -50,11 +50,66 @@ func TestBandConfigValidateRejectsAmbiguousRules(t *testing.T) {
 		{}, {Entry: 2, Exit: 2}, {Entry: 2, Exit: -1}, {Entry: 2, Exit: 0.5, Stop: 2},
 		{Entry: 2, Exit: 0.5, MaxHold: -1}, {Entry: 2, LongOnly: true, ShortOnly: true},
 		{Entry: math.NaN()},
+		{Entry: 2, Exit: 0.5, Mode: "trend"},
+		{Entry: 2, Exit: 0.5, Stop: 0.5, Mode: BandModeMomentum},
+		{Entry: 2, Exit: 0.5, Stop: 0.3, Mode: BandModeMomentum},
 	}
 	for i, c := range bad {
 		if _, err := NewBandTrader(c); err == nil {
 			t.Fatalf("case %d accepted: %+v", i, c)
 		}
+	}
+}
+
+func TestBandTraderMomentumMode(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  BandConfig
+		zs   []float64
+		want []int
+	}{
+		{
+			name: "momentum breakout long and short with mean-band take profit",
+			cfg:  BandConfig{Entry: 2.0, Exit: 0.5, Mode: BandModeMomentum},
+			zs:   []float64{0, 1.8, 2.2, 3.5, 1.1, 0.4, -2.3, -3.1, -0.8, -0.5},
+			want: []int{0, 0, 1, 1, 1, 0, -1, -1, -1, 0},
+		},
+		{
+			name: "momentum reverse stop blocks whipsaw until return inside exit",
+			cfg:  BandConfig{Entry: 2.0, Exit: 0.5, Stop: 1.2, Mode: BandModeMomentum},
+			zs:   []float64{2.4, 3.8, -1.5, -2.5, -0.8, 0.3, -2.4, 1.5, 2.6, 0.0, 2.2},
+			want: []int{1, 1, 0, 0, 0, 0, -1, 0, 0, 0, 1},
+		},
+		{
+			name: "momentum long-only and short-only",
+			cfg:  BandConfig{Entry: 2.0, Exit: 0.5, LongOnly: true, Mode: BandModeMomentum},
+			zs:   []float64{-2.5, 2.5, 0.2},
+			want: []int{0, 1, 0},
+		},
+	}
+	for _, tc := range cases {
+		bt, err := NewBandTrader(tc.cfg)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		for i, z := range tc.zs {
+			if got := bt.Step(z); got != tc.want[i] {
+				t.Fatalf("%s step %d z=%v: got %d want %d", tc.name, i, z, got, tc.want[i])
+			}
+		}
+	}
+	cfg := BandConfig{Entry: 2.0, Exit: 0.5, Stop: 1.2, MaxHold: 3, Mode: BandModeMomentum}
+	if r := cfg.CloseReason(1, 0.4); r != "exit" {
+		t.Fatalf("got %s want exit", r)
+	}
+	if r := cfg.CloseReason(1, -1.3); r != "stop" {
+		t.Fatalf("got %s want stop", r)
+	}
+	if r := cfg.CloseReason(1, 2.8); r != "maxhold" {
+		t.Fatalf("got %s want maxhold", r)
+	}
+	if r := cfg.CloseReason(-1, 1.3); r != "stop" {
+		t.Fatalf("got %s want stop", r)
 	}
 }
 
@@ -110,5 +165,68 @@ func TestRollingSpreadSkipsInvalidAndConstantInputs(t *testing.T) {
 		if _, ok := rs.Observe(3, float64(i)); ok {
 			t.Fatal("constant x must have no beta")
 		}
+	}
+}
+
+func TestRollingSpreadEvalWithBetaMatchesSampleZAndPreservesState(t *testing.T) {
+	const window = 20
+	rng := rand.New(rand.NewSource(19))
+	rs, err := NewRollingSpread(window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rs.EvalWithBeta(1, 2, 1.1); ok {
+		t.Fatal("ready before full window")
+	}
+	const frozenBeta = 1.35
+	var xs, ys []float64
+	x := 5.2
+	for i := 0; i < 80; i++ {
+		x += rng.NormFloat64() * 0.015
+		// Simulate regime drift in slope while evaluating against fixed frozenBeta.
+		slope := 1.1 + 0.01*float64(i)
+		y := 0.8 + slope*x + rng.NormFloat64()*0.02
+		xs, ys = append(xs, x), append(ys, y)
+		p1, ok := rs.Observe(x, y)
+		if i < window-1 {
+			if _, okZ := rs.EvalWithBeta(x, y, frozenBeta); okZ {
+				t.Fatalf("EvalWithBeta ready early at %d", i)
+			}
+			continue
+		}
+		if !ok {
+			t.Fatalf("Observe not ready at %d", i)
+		}
+		gotZ, okZ := rs.EvalWithBeta(x, y, frozenBeta)
+		if !okZ {
+			t.Fatalf("EvalWithBeta failed at %d", i)
+		}
+		resids := make([]float64, window)
+		for j := 0; j < window; j++ {
+			idx := i - window + 1 + j
+			resids[j] = ys[idx] - frozenBeta*xs[idx]
+		}
+		mean, std, err := MeanStd(resids, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantZ := (resids[window-1] - mean) / std
+		if math.Abs(gotZ-wantZ) > 1e-10 {
+			t.Fatalf("step %d EvalWithBeta z=%v want %v (refit p.Z=%v)", i, gotZ, wantZ, p1.Z)
+		}
+		if _, bad := rs.EvalWithBeta(math.NaN(), y, frozenBeta); bad {
+			t.Fatal("NaN x accepted")
+		}
+		if _, bad := rs.EvalWithBeta(x, y, math.Inf(1)); bad {
+			t.Fatal("Inf beta accepted")
+		}
+	}
+	// Constant fixed-beta residual has zero std -> ok=false.
+	flat, _ := NewRollingSpread(5)
+	for i := 1; i <= 5; i++ {
+		flat.Observe(float64(i), 2.0+1.5*float64(i))
+	}
+	if _, ok := flat.EvalWithBeta(5, 9.5, 1.5); ok {
+		t.Fatal("zero residual variance must return ok=false")
 	}
 }
