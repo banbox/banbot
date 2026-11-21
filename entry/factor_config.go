@@ -141,7 +141,7 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 		fields := make(map[string]any)
 		for key, value := range policy.Factor {
 			switch key {
-			case "archive", "portfolio", "decision", "research":
+			case "archive", "portfolio", "decision", "research", "universe", "rolling_universe":
 			default:
 				fields[key] = value
 			}
@@ -149,8 +149,31 @@ func buildFactorConfigsWithArchiveInspection(spec *config.RunSpec, mode runner.M
 		if err := decodeFactorFields(fields, &c); err != nil {
 			return nil, fmt.Errorf("factor %s: %w", policy.Name, err)
 		}
+		if policy.Factor["universe"] != nil && policy.Factor["rolling_universe"] != nil {
+			return nil, fmt.Errorf("factor %s: universe and rolling_universe cannot both be set", policy.Name)
+		}
+		for _, uKey := range []string{"universe", "rolling_universe"} {
+			if rawUniv, ok := policy.Factor[uKey].(map[string]any); ok {
+				var rc factor.RollingUniverseConfig
+				if err := decodeFactorFields(rawUniv, &rc); err != nil {
+					return nil, fmt.Errorf("factor %s %s: %w", policy.Name, uKey, err)
+				}
+				c.RollingUniverse = &rc
+			}
+		}
 		if portfolio, ok := policy.Factor["portfolio"].(map[string]any); ok {
-			if err := decodeFactorFields(portfolio, &c.Manifest.Portfolio); err != nil {
+			if portfolio["universe"] != nil && portfolio["rolling_universe"] != nil {
+				return nil, fmt.Errorf("factor %s: portfolio.universe and portfolio.rolling_universe cannot both be set", policy.Name)
+			}
+			portfolioCopy := make(map[string]any, len(portfolio))
+			for k, v := range portfolio {
+				if k == "rolling_universe" {
+					portfolioCopy["universe"] = v
+				} else {
+					portfolioCopy[k] = v
+				}
+			}
+			if err := decodeFactorFields(portfolioCopy, &c.Manifest.Portfolio); err != nil {
 				return nil, err
 			}
 			if err := c.Manifest.Portfolio.ValidatePolicy(); err != nil {

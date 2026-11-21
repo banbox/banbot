@@ -35,7 +35,7 @@
 | 因子路径 | `factor_config.go` | RunSpec → `[]runner.Config`（`buildFactorConfigs`），含 archive 身份推导、价格推导、账户权重。 |
 | | `factor_live.go` | 因子实盘：`FactorLiveBinding`、绑定工厂注册表、`runFactorLiveSpecWithArgs`、`runFactorsLiveWithStartup`（组装 SharedAccount、AccountSink、runner.Live）。 |
 | | `factor_banexg_live.go` | 基于 banexg 的默认因子实盘绑定与 funding 能力探测。 |
-| | `factor_storage.go`、`factor_history.go`、`factor_resolved.go`、`factor_archive_types.go` | 存储输入装配（K 线/归档输入）、历史路径校验、解析后配置输出、归档字段类型恢复。 |
+| | `factor_storage.go`、`factor_history.go`、`factor_resolved.go`、`factor_archive_types.go` | 存储输入装配（K 线/归档输入；启用滚动品种池重排时自动为候选超集订阅决策 K 线的 `close`/`volume`/`quote` 及重排回看预热根数）、历史路径校验、解析后配置输出（含 `rolling_universe`）、归档字段类型恢复。 |
 | | `factor_hub.go`、`factor.go`、`factor_expression_commands.go`、`source_plan.go`、`execution_config.go`、`execution_takeover.go` | Hub 账户分组执行、归档命令、表达式子命令、数据源计划选项、账户执行字段、执行接管所有者。 |
 | 混合策略 | `mixed_factor_backtest.go` | 因子 + 时序混合回测回放（`replayMixedEngines`，事件模式）。 |
 | | `mixed_factor_live.go` | 混合实盘：时序策略通过 `prepareMixedLiveBinding` 挂到因子账户的 SharedAccount。 |

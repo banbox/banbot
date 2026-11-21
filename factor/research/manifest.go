@@ -26,11 +26,12 @@ type PortfolioDefinition struct {
 	Mode                        factor.PortfolioMode
 	Policy                      string                   `json:",omitempty"`
 	PolicyParams                json.RawMessage          `json:",omitempty"`
-	Rebalance                   *factor.RebalanceConfig  `json:",omitempty"`
-	Selection                   *factor.SelectionConfig  `json:",omitempty"`
-	Holding                     *factor.HoldingConfig    `json:",omitempty"`
-	Transition                  *factor.TransitionConfig `json:",omitempty"`
-	Allocation                  *factor.AllocationConfig `json:",omitempty"`
+	Rebalance                   *factor.RebalanceConfig       `json:",omitempty"`
+	Selection                   *factor.SelectionConfig       `json:",omitempty"`
+	Holding                     *factor.HoldingConfig         `json:",omitempty"`
+	Transition                  *factor.TransitionConfig      `json:",omitempty"`
+	Allocation                  *factor.AllocationConfig      `json:",omitempty"`
+	Universe                    *factor.RollingUniverseConfig `json:",omitempty"`
 }
 type CostSpec struct {
 	FeeRate, SlippageRate float64

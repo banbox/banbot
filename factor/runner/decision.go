@@ -164,7 +164,7 @@ func decisionManifestSpec(c Config, plan *factor.Plan, combo research.ComboSpec)
 	spec.FactorPlanHash = plan.Hash()
 	spec.UniverseVersion = c.Snapshot.Universe.Version
 	spec.VisibilityPolicy = c.Snapshot.VisibilityPolicy
-	spec.StaticUniverse = c.Snapshot.Universe.Static
+	spec.StaticUniverse = c.Snapshot.Universe.Static && !c.EffectiveRollingUniverse().Enabled()
 	return spec
 }
 

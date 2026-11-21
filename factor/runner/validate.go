@@ -155,6 +155,39 @@ func resolveDecisionPortfolio(c Config) (Config, error) {
 		}
 		c.Manifest.Portfolio.BuilderConfigHash = identity
 	}
+	if c.RollingUniverse != nil {
+		norm, err := factor.NormalizeRollingUniverseConfig(*c.RollingUniverse)
+		if err != nil {
+			return c, err
+		}
+		if c.Manifest.Portfolio.Universe != nil {
+			other, err := factor.NormalizeRollingUniverseConfig(*c.Manifest.Portfolio.Universe)
+			if err != nil {
+				return c, err
+			}
+			if norm.Enabled() != other.Enabled() || norm.TopN != other.TopN || norm.LookbackDays != other.LookbackDays || norm.LookbackBars != other.LookbackBars || norm.MinListingDays != other.MinListingDays || norm.MinAgeBars != other.MinAgeBars || norm.ReconstituteDays != other.ReconstituteDays || norm.ReconstituteBars != other.ReconstituteBars || norm.Schedule != other.Schedule || !sameSIDStrings(norm.AlwaysInclude, other.AlwaysInclude) {
+				return c, errors.New("runner: conflicting rolling universe configuration between runner and portfolio")
+			}
+		}
+		if norm.Enabled() {
+			c.RollingUniverse = &norm
+			c.Manifest.Portfolio.Universe = factor.CloneRollingUniverseConfig(&norm)
+		} else {
+			c.RollingUniverse = nil
+			c.Manifest.Portfolio.Universe = nil
+		}
+	} else if c.Manifest.Portfolio.Universe != nil {
+		norm, err := factor.NormalizeRollingUniverseConfig(*c.Manifest.Portfolio.Universe)
+		if err != nil {
+			return c, err
+		}
+		if norm.Enabled() {
+			c.Manifest.Portfolio.Universe = &norm
+			c.RollingUniverse = factor.CloneRollingUniverseConfig(&norm)
+		} else {
+			c.Manifest.Portfolio.Universe = nil
+		}
+	}
 	if err := c.Manifest.Portfolio.ValidatePolicy(); err != nil {
 		return c, err
 	}
@@ -201,4 +234,16 @@ func resolveDecisionPortfolio(c Config) (Config, error) {
 		return c, errors.New("runner: invalid portfolio notional fractions")
 	}
 	return c, nil
+}
+
+func sameSIDStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

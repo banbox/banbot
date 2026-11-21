@@ -37,8 +37,8 @@
 | `config/types.go` | 旧 TS 视图的数据结构（`Config`、`RunPolicyConfig`、`AccountConfig`、`DatabaseConfig`、`APIServerConfig`…）；以及大量包级全局（`Accounts`、`Pairs`、`StakeAmount`…） |
 | `config/unified.go` | `UnifiedConfig`、`PolicyV2`；`parseUnifiedLayers`、`decodeUnified`、`Validate`、`TimeSeriesConfig`、`MarshalYAML`；引擎常量 `time_series` / `factor` |
 | `config/run_spec.go` | `RunSpec`（只读、不可变）、`FieldOrigin`（字段来源）、`LoadRunSpec`、`EffectiveYAML`、`Hash`、`ResolvePath`、CLI 覆盖记录 |
-| `config/shallow.go` | v2 扁平化：`normalizeConfigLayer`（处理 `engine`、`factor` 块展开、`execution.accounts` 别名、密码规范化） |
-| `config/advanced.go` | `validateAdvanced`：data/execution/accounts/run_policy.factor 的允许键白名单与类型校验 |
+| `config/shallow.go` | v2 扁平化：`normalizeConfigLayer`（处理 `engine`、`factor` 块展开含 `universe`/`rolling_universe`、`execution.accounts` 别名、密码规范化） |
+| `config/advanced.go` | `validateAdvanced`：data/execution/accounts/run_policy.factor（含 `.universe`/`.rolling_universe` 滚动池配置与 `.snapshot.universe` 分离校验）的允许键白名单与类型校验 |
 | `config/migration.go` | 配置文件读取校验（`loadUnifiedSources`）与原子写回（`WriteConfigAtomic`，带路径锁、过期字节校验、临时文件 + rename） |
 | `config/migration_unix.go` / `migration_windows.go` | 文件锁（unix 为 `flock`，windows 为 `LockFileEx` 独占锁，锁文件为 `<path>.migration.lock`）、权限保留、目录 fsync 的平台实现 |
 | `config/runtime_config.go` | `LoadRuntimeSnapshot`（旧式直接构造 Snapshot）、`(*Config).NormalizeRuntime`（运行默认值与校验）、`NormalizeRunPolicies` |

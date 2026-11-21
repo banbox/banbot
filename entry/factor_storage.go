@@ -334,7 +334,12 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 		if c.Snapshot.Universe.Version == "" {
 			raw, _ := json.Marshal(ids)
 			digest := sha256.Sum256(raw)
-			c.Snapshot.Universe = factor.Universe{Version: "storage-static:" + hex.EncodeToString(digest[:]), Investable: ids, Reference: ids, Tradable: ids, Evaluation: ids, Tracked: ids, Static: true}
+			isStatic := !c.EffectiveRollingUniverse().Enabled()
+			prefix := "storage-static:"
+			if !isStatic {
+				prefix = "storage-rolling:"
+			}
+			c.Snapshot.Universe = factor.Universe{Version: prefix + hex.EncodeToString(digest[:]), Investable: ids, Reference: ids, Tradable: ids, Evaluation: ids, Tracked: ids, Static: isStatic}
 		}
 		if c.Snapshot.SIDMap == nil {
 			c.Snapshot.SIDMap = map[int32]string{}
@@ -371,6 +376,24 @@ func assembleFactorStorageInputs(ctx context.Context, spec *config.RunSpec, task
 		for _, input := range plan.Inputs() {
 			if err := add(input.Source, input.TimeFrame, input.Fields, input.WarmupLength, factorIDs, "factor:"+c.StrategyID, input.MaxAge); err != nil {
 				return nil, err
+			}
+		}
+		if roll := c.EffectiveRollingUniverse(); roll != nil && roll.Enabled() {
+			norm, err := factor.NormalizeRollingUniverseConfig(*roll)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := factor.ResolveAlwaysIncludeSIDs(norm.AlwaysInclude, factorIDs, c.Snapshot.SIDMap); err != nil {
+				return nil, err
+			}
+			volTF := plan.TimeFrame()
+			if volTF == "" {
+				volTF = c.Factor.TimeFrame
+			}
+			if volTF != "" && volTF != "event" {
+				if err := add(orm.SeriesSourceKline, volTF, []string{"close", "volume", "quote"}, norm.RequiredWarmupBars(c.DecisionInterval), factorIDs, "universe:"+c.StrategyID, 0); err != nil {
+					return nil, err
+				}
 			}
 		}
 		executionIDs := append(slices.Clone(c.Snapshot.Universe.Investable), c.Snapshot.Universe.Tracked...)
