@@ -94,6 +94,7 @@ type executionStateMu struct {
 	orderProcessing bool
 	callbackEvent   string
 	callbackOrdinal int
+	peakEquity      float64
 }
 
 // WithOrderEvent supplies stable provenance for actions queued by a callback.

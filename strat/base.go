@@ -310,11 +310,14 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		return errs.NewMsg(errs.CodeParamInvalid, "open order disabled")
 	}
 
-	if math.IsNaN(req.Limit+req.Amount+req.Leverage+req.CostRate+req.LegalCost) ||
+	if math.IsNaN(req.Limit+req.Amount+req.Leverage+req.CostRate+req.RiskRate+req.LegalCost) ||
 		math.IsNaN(req.StopLoss+req.StopLossVal+req.StopLossLimit+req.StopLossRate) ||
 		math.IsNaN(req.TakeProfit+req.TakeProfitVal+req.TakeProfitLimit+req.TakeProfitRate) {
 		s.addFailOpen(FailOpenNanNum)
 		return errs.NewMsg(errs.CodeParamInvalid, "nan in EnterReq")
+	}
+	if math.IsInf(req.RiskRate, 0) || req.RiskRate < 0 || req.RiskRate > 1 {
+		return errs.NewMsg(errs.CodeParamInvalid, "RiskRate should be in [0, 1]")
 	}
 	if req.CallbackPct > 0 && (req.CallbackPct < 0.1 || req.CallbackPct > 10) {
 		return errs.NewMsg(errs.CodeParamInvalid, "CallbackPct should be in [0.1, 10]")
@@ -366,25 +369,60 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 		enterPrice = normalizeEntryStop(req, curPrice, isLimit, s.runtimeBacktest(), legacyIntrabar)
 	}
+	curSLPrice := s.resolveStopLossPrice(req, enterPrice, dirFlag)
 	if req.Amount == 0 && req.LegalCost == 0 {
-		if req.CostRate == 0 {
-			req.CostRate = 1
+		if math.IsNaN(enterPrice) || math.IsInf(enterPrice, 0) || enterPrice <= 0 {
+			return errs.NewMsg(errs.CodeParamInvalid, "invalid enter price: %f", enterPrice)
 		}
-		req.LegalCost = s.Strat.GetStakeAmount(s) * req.CostRate
+		if req.RiskRate > 0 && curSLPrice > 0 {
+			if (curSLPrice-enterPrice)*dirFlag >= 0 {
+				if s.ExgStopLoss {
+					rel := "<"
+					if req.Short {
+						rel = ">"
+					}
+					s.addFailOpen(FailOpenBadStopLoss)
+					return errs.NewMsg(errs.CodeParamInvalid, "%s stopLoss %f must %s %f for %v order",
+						symbol, curSLPrice, rel, enterPrice, dirType)
+				}
+			} else {
+				slDistRate := math.Abs(enterPrice-curSLPrice) / enterPrice
+				if slDistRate > 0 {
+					equity := s.AccountEquity()
+					req.LegalCost = (equity * req.RiskRate) / slDistRate
+					if maxLvg := s.effectiveMaxLeverage(req); maxLvg > 0 {
+						if maxCost := equity * maxLvg; maxCost > 0 && req.LegalCost > maxCost {
+							req.LegalCost = maxCost
+						}
+					}
+					if maxStake := s.maxStakeAmount(); maxStake > 0 && req.LegalCost > maxStake {
+						req.LegalCost = maxStake
+					}
+				}
+			}
+		}
+		if req.LegalCost == 0 {
+			if req.CostRate == 0 {
+				req.CostRate = 1
+			}
+			req.LegalCost = s.Strat.GetStakeAmount(s) * req.CostRate
+		}
 		avgVol := s.avgVolume(5) // 最近5个蜡烛成交量
 		reqAmt := req.LegalCost / enterPrice
 		openVolRate := 1.0
 		lowCostAction := ""
-		if !s.Strat.runtimeExplicit {
-			openVolRate = config.OpenVolRate
-			lowCostAction = config.LowCostAction
-		}
-		if s.Strat.runtimeConfig != nil {
-			openVolRate = s.Strat.runtimeConfig.OpenVolRate
+		if cfg := s.Strat.runtimeConfigFor(s); cfg != nil {
+			openVolRate = cfg.OpenVolRate
 			if openVolRate == 0 {
 				openVolRate = 1
 			}
-			lowCostAction = s.Strat.runtimeConfig.LowCostAction
+			lowCostAction = cfg.LowCostAction
+		} else if !s.Strat.runtimeExplicit {
+			openVolRate = config.OpenVolRate
+			if openVolRate == 0 {
+				openVolRate = 1
+			}
+			lowCostAction = config.LowCostAction
 		}
 		if avgVol > 0 && reqAmt/avgVol > openVolRate {
 			req.LegalCost = avgVol * openVolRate * enterPrice
@@ -405,24 +443,6 @@ func (s *StratJob) openOrder(req *EnterReq) *errs.Error {
 		}
 	}
 	// 检查止损
-	curSLPrice := s.LongSLPrice
-	if req.Short {
-		curSLPrice = s.ShortSLPrice
-	}
-	if curSLPrice == 0 && s.Strat.StopLoss > 0 {
-		curSLPrice = enterPrice * (1 - s.Strat.StopLoss*dirFlag)
-	}
-	if req.StopLossLimit > 0 && req.StopLoss == 0 {
-		req.StopLoss = req.StopLossLimit
-	}
-	if req.StopLossVal > 0 {
-		curSLPrice = enterPrice - req.StopLossVal*dirFlag
-	} else if req.StopLoss != 0 {
-		curSLPrice = req.StopLoss
-	}
-	if curSLPrice < 0 {
-		curSLPrice = enterPrice * 0.001
-	}
 	req.StopLossVal = 0
 	req.StopLoss = 0
 	if curSLPrice > 0 {
@@ -519,6 +539,29 @@ func normalizeEntryStop(req *EnterReq, curPrice float64, isLimit, backtest, lega
 		req.Stop = 0
 	}
 	return stopPrice
+}
+
+func (s *StratJob) resolveStopLossPrice(req *EnterReq, enterPrice, dirFlag float64) float64 {
+	curSLPrice := s.LongSLPrice
+	if req.Short {
+		curSLPrice = s.ShortSLPrice
+	}
+	if curSLPrice == 0 && s.Strat != nil && s.Strat.StopLoss > 0 {
+		curSLPrice = enterPrice * (1 - s.Strat.StopLoss*dirFlag)
+	}
+	stopLoss := req.StopLoss
+	if req.StopLossLimit > 0 && stopLoss == 0 {
+		stopLoss = req.StopLossLimit
+	}
+	if req.StopLossVal > 0 {
+		curSLPrice = enterPrice - req.StopLossVal*dirFlag
+	} else if stopLoss != 0 {
+		curSLPrice = stopLoss
+	}
+	if curSLPrice < 0 {
+		curSLPrice = enterPrice * 0.001
+	}
+	return curSLPrice
 }
 
 func (s *StratJob) CloseOrders(req *ExitReq) *errs.Error {

@@ -196,6 +196,7 @@ func (q *EnterReq) Clone() *EnterReq {
 		Limit:           q.Limit,
 		Stop:            q.Stop,
 		CostRate:        q.CostRate,
+		RiskRate:        q.RiskRate,
 		LegalCost:       q.LegalCost,
 		Leverage:        q.Leverage,
 		Amount:          q.Amount,
@@ -204,6 +205,8 @@ func (q *EnterReq) Clone() *EnterReq {
 		StopLossLimit:   q.StopLossLimit,
 		StopLossRate:    q.StopLossRate,
 		StopLossTag:     q.StopLossTag,
+		ActivationPrice: q.ActivationPrice,
+		CallbackPct:     q.CallbackPct,
 		TakeProfitVal:   q.TakeProfitVal,
 		TakeProfit:      q.TakeProfit,
 		TakeProfitLimit: q.TakeProfitLimit,
@@ -253,6 +256,9 @@ func (q *EnterReq) GetZapFields(s *StratJob, fields ...zap.Field) []zap.Field {
 	}
 	if q.CostRate > 0 && q.CostRate < 1 {
 		fields = append(fields, zap.Float64("costRate", q.CostRate))
+	}
+	if q.RiskRate > 0 {
+		fields = append(fields, zap.Float64("riskRate", q.RiskRate))
 	}
 	if q.LegalCost > 0 {
 		fields = append(fields, zap.Float64("cost", q.LegalCost))

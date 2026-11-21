@@ -203,6 +203,7 @@ type EnterReq struct {
 	Limit           float64 // The entry price of a limit order will be submitted as a limit order when specified 限价单入场价格，指定时订单将作为限价单提交
 	Stop            float64 // Stop price, buy orders enter when the price rises to the trigger price (vice versa for sell orders). 止损(触发价格)，做多订单时价格上涨到触发价格才入场（做空相反）
 	CostRate        float64 // The opening ratio is set to 1 times by default according to the configuration. Used for calculating LegalList 开仓倍率、默认按配置1倍。用于计算LegalCost
+	RiskRate        float64 // Account equity risk ratio per trade (e.g. 0.01 = 1%); auto-computes LegalCost from stop-loss distance when Amount and LegalCost are unset 单笔止损最大亏损占当前AccountEquity的比例（如0.01表示1%），未指定Amount和LegalCost时结合止损距离自动计算LegalCost
 	LegalCost       float64 // Spend the amount in fiat currency. Ignore CostRate when specified 花费法币金额。指定时忽略CostRate
 	Leverage        float64 // Leverage ratio 杠杆倍数
 	Amount          float64 // The number of admission targets is calculated by LegalList and price 入场标的数量，由LegalCost和price计算

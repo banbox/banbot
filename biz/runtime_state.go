@@ -81,6 +81,18 @@ func (s *TradingState) Wallet(account string) *BanWallets {
 	return wallet
 }
 
+// LookupWallet returns the registered wallet for account without lazily
+// allocating an unbound empty wallet when none exists.
+func (s *TradingState) LookupWallet(account string) *BanWallets {
+	if s == nil {
+		return nil
+	}
+	s.registryMu.RLock()
+	wallet := s.wallets[account]
+	s.registryMu.RUnlock()
+	return wallet
+}
+
 // SetOrderManager binds one account manager while preserving the concrete
 // registry used by the hot path. A nil manager removes the account entry.
 func (s *TradingState) SetOrderManager(account string, manager IOrderMgr) {

@@ -25,7 +25,8 @@
 | `biz/determinism.go` | 回测确定性：**所有**回测（`config.OrderedBacktest()` / `RuntimeDeps.OrderedBacktest()`，与 `bt_strict` 无关）按稳定键（账户名/job key/开仓时间+ID）遍历 map；品种间同 bar 先后由 `data/provider.go` 回放堆的哈希序决定（`bt_bar_order_seed`，issue 112，BtFeatureLevel 6），本文件只负责单品种内部的稳定顺序（`executionOpenOrders` 先抽取（开仓时间, ID）键再排序，避免比较器内重复取值）；`bt_strict` 仅再控制重放覆盖与兼容钱包语义（`strictBacktestFor`） |
 | `biz/data_server.go` | gRPC FeaFeeder 服务（默认 `:6789`，收发上限 100MB 硬编码） |
 | `biz/remote_command.go` | `RemoteCommandService`：校验、幂等、1 秒限频、审计；平仓与交易开关 |
-| `biz/job_orders.go` | `ProcessJobOrders`：策略异步回调发起下单（几乎无非测试调用方） |
+| `biz/job_orders.go` | `ProcessJobOrders`：策略异步回调发起下单；绑定订单处理器与账户资金读取器 |
+| `biz/account_metrics.go` | 账户实时权益、可用余额与峰值回撤读取（兼容 `BanWallets`、`SharedAccount`、`HubOrderMgr`），注入 `strat.State` 并在非预热 K 线推进时更新账户 HWM |
 | `biz/odmgr.go` | `IOrderMgr`/`IOrderMgrLive` 接口；`OrderMgr` 基类（入单、出单、利润、追踪止损、注册表、`CloseAccOrders`） |
 | `biz/odmgr_local.go` | `LocalOrderMgr`：回测/模拟撮合（挂单、止损止盈、限价超时、清仓） |
 | `biz/bar_gap.go` | 回测 K 线空洞守卫 `guardBarGap`（`ExitTagDataGap`）与退市平仓 `exitDelisted`/`sweepDelisted`（`ExitTagDelist`） |
@@ -67,7 +68,7 @@
 
 - **`Trader`**（`biz/trader.go:31`）：持有 batchState 与 `runtime *RuntimeDeps`。构造 `NewTraderWithRuntimeDeps`（:131）只校验绑定，不补齐依赖；`BindRuntimeDeps`（:151）由组合根一次性绑定。
 - **`RuntimeDeps`**（`biz/trader.go:46`）：单个 runtime 的全部可变状态：Core、Clock、Market、Batch、Strategies、Orders、Trading、Config、Accounts、Symbols、Storage、Exchange、Notifications、DefaultAccount。
-- **`TradingState`**（`biz/runtime_state.go:9`）：`orderManagers` / `liveManagers` / `wallets` 三张按账户注册表。`Reset`（:174）不关闭管理器，调用方须先等回调结束。
+- **`TradingState`**（`biz/runtime_state.go:9`）：`orderManagers` / `liveManagers` / `wallets` 三张按账户注册表（`Wallet` 懒创建，`LookupWallet` 只读不分配）。`Reset`（:174）不关闭管理器，调用方须先等回调结束。
 - **`IOrderMgr`**（`biz/odmgr.go:33`）：`ProcessOrders`、`EditOrder`、`RelayOrders`、`EnterOrder`、`ExitOpenOrders`、`ExitOrder`、`UpdateByDataSeries`、`ExitAndFill`、`OnEnvEnd`、`CleanUp`。
 - **`IOrderMgrLive`**（`biz/odmgr.go:46`）：增加 `SyncExgOrders`、`WatchMyTrades`、`TrialUnMatchesForever`、`ConsumeOrderQueue`。
 - **`runtimeOrderConfig`**（`biz/odmgr.go:59`）：绑定时从 `RuntimeDeps.Config` 拷贝的不可变快照；`makeRuntimeOrderConfig`（:568）填默认值（LimitVolSecs=10、PutLimitSecs=180、OdBookTtl=500、BTNetCost=15）。
@@ -160,7 +161,7 @@
 - 回测/模拟：`EnterOd`（wallet.go:1099）→ 成交后 `ConfirmOdEnter`（:1199）；出场 `ExitOd`（:1235）→ `ConfirmOdExit`（:1287）；部分平仓 `CutPart`（:1344）；保证金与爆仓 `UpdateOds`（:1378，`marginRatio > 0.99` 返回 `ErrLiquidation` 并 Reset）。
 - 实盘（`w.envReal()`）：Confirm/Exit 直接返回，不做本地记账，余额以交易所为准。
 - 同步：`SyncBalancesWith`（:1868）→ `FetchBalance` → `UpdateWalletByBalances`（:1766）；下单前 `odmgr_live.go:2468` 调 `RefreshIfStale`（`WalletStaleMS=1h`）；WebSocket 推送 `WatchLiveBalances`（:1953）。
-- 估值：`calcLegal` 以 `valuationPrice` 取价。标记价在最后一根 bar 后 60 秒过期；回测中（`bt_legacy_wallet_price`/`bt_strict` 的兼容钱包除外，保持旧行为）过期后回退到最后一根 bar 价，且持有的基础币（如 `BNB`）无同名 key 时依次尝试 `BNB/{USDT,USDC,FDUSD,BUSD,USD}` 及其永续 `:{quote}`（`lastBarPriceOfCoin`）。仍无价的币被跳过，`skipWarned` 保证每币只打一次 Info，之后降为 Debug。
+- 估值：`calcLegal` 以 `valuationPrice` 取价。标记价在最后一根 bar 后 60 秒过期；回测中（`bt_legacy_wallet_price`/`bt_strict` 的兼容钱包除外，保持旧行为）过期后回退到最后一根 bar 价，且持有的基础币（如 `BNB`）无同名 key 时依次尝试 `BNB/{USDT,USDC,FDUSD,BUSD,USD}` 及其永续 `:{quote}`（`lastBarPriceOfCoin`）。仍无价的币被跳过，`skipWarned` 保证每币只打一次 Info，之后降为 Debug。策略侧只读查询走 `BanWallets.AccountMetrics`（`account_metrics.go`）：模拟/回测合约以结清余额加当前未平订单 `Profit` 计算实时净值，不读取 `ItemWallet.UnrealizedPOL` 缓存以避免同时间步平仓后双计；现货可用余额扣除未平多单持有的基础币。
 - 快照：实盘 `live/crypto_trader.go:1604-1608` 启动 `StartLiveWalletSnapshots`，5 分钟写 `ormo.SaveWalletSnapshot`，超 7 天按小时压缩。
 
 ### 12. 共享检查点、接管与迁移

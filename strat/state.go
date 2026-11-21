@@ -42,6 +42,11 @@ type State struct {
 	orderProcessor        FuncProcessOrders
 	orderProcessorOwner   any
 	orderProcessorAccount string
+	accountMetrics        FuncAccountMetrics
+	accountMetricsOwner   any
+	accountMetricsAccount string
+	accountMetricsMu      sync.Mutex
+	accountPeakEquities   map[string]float64
 	Symbols               *orm.SymbolState
 	Exchange              banexg.BanExchange
 	factories             map[string]FuncMakeStrat
@@ -98,9 +103,10 @@ func NewState() *State {
 		wsSubJobs:     make(map[string]map[string]map[*StratJob]bool),
 		AccOdSubs:     make(map[string][]FnOdChange),
 		AccFailOpens:  make(map[string]map[string]int),
-		cacheStrats:   make(map[string]*TradeStrat),
-		policyFilters: make(map[string][]goods.IFilter),
-		refineTF:      make(map[string]map[string]string),
+		cacheStrats:         make(map[string]*TradeStrat),
+		policyFilters:       make(map[string][]goods.IFilter),
+		refineTF:            make(map[string]map[string]string),
+		accountPeakEquities: make(map[string]float64),
 	}
 }
 
@@ -519,6 +525,11 @@ func (s *State) ensureMaps() {
 	if s.refineTF == nil {
 		s.refineTF = make(map[string]map[string]string)
 	}
+	s.accountMetricsMu.Lock()
+	if s.accountPeakEquities == nil {
+		s.accountPeakEquities = make(map[string]float64)
+	}
+	s.accountMetricsMu.Unlock()
 }
 
 // legacyState is a typed view over the package globals. The globals remain
@@ -613,6 +624,9 @@ func (s *State) Reset() {
 	s.pairHooksMu.Lock()
 	s.pairHooks = PairUpdateHooks{}
 	s.pairHooksMu.Unlock()
+	s.accountMetricsMu.Lock()
+	s.accountPeakEquities = make(map[string]float64)
+	s.accountMetricsMu.Unlock()
 
 	if s == legacyState {
 		Versions = s.versions

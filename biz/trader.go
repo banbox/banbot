@@ -728,6 +728,9 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries, resolved ...*orm.ExSymbol
 			}
 		}
 	}
+	if !evt.IsWarmUp {
+		t.observeAccountsEquity(odMatch, accOrders)
+	}
 	env, errEnv := t.OnEnvSeries(evt)
 	if errEnv != nil {
 		t.Logger().Error(fmt.Sprintf("%s/%s OnEnvSeries fail", symbol, evt.TimeFrame), zap.Error(errEnv))

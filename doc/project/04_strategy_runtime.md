@@ -19,6 +19,7 @@
 | `strat/state_accessors.go` | `State` 的 job 注册表读写、快照（`CollectJobs`、`LookupJob`、`SetJobMap`）、env/version 访问 |
 | `strat/common.go` | 策略注册表（`RegisterStrategy`/`GetStrategyFactory`）、`New`（legacy 实例化）、`UpdateOrders`/`InitBar`、`CheckCustomExits`、订单事件 `FireOdChange`、历史订单与 Job 评分、fail-open 计数 |
 | `strat/base.go` | `StratJob` 开单/平仓校验与入队（`OpenOrder`/`openOrder`、`CloseOrders`/`closeOrders`）、仓位查询、`SetAllStopLoss`、回撤平仓 `drawDownExit`、自定义退出 `customExit` |
+| `strat/account_state.go` | `StratJob` 只读账户状态（`AccountEquity`、`AvailableBalance`、`AccountDrawdown`）、`FuncAccountMetrics` 绑定与峰值净值（HWM）跟踪 |
 | `strat/execution_state.go` | Job 执行状态（`executionStateMu`）、请求队列（`enqueueEntry/Exit`、`DrainOrderRequests`）、订单处理互斥（`Begin/FinishOrderProcessing`）、`ProcessRuntimeOrders`、`WithOrderEvent`（CommandID 派生） |
 | `strat/main.go` | Job 生命周期：`LoadStratJobs*`（加载、轮换、info 订阅注册）、`ExitStratJobs*`、`ensureStratJob*`、`resetJobs*`、`FinalizePairRotation`、WS 订阅注册（`regWsJob*`） |
 | `strat/pair_update.go` | 运行中增删品种：`TradeStrat.UpdatePairs` → `PairUpdateManager.Apply`，含 `PairUpdateHooks`（外部注入的 SubWarmPairs/ExitOrders/LookupSymbol） |
@@ -44,14 +45,14 @@
 ## 核心类型与接口
 
 - **`TradeStrat`**（`strat/types.go:24`）：策略定义。配置字段（`WarmupNum`、`MinTfScore`、`StopLoss`、`StakeRate`、`EachMaxLong/Short`、`OrderOnRotation`、`BatchInOut/BatchInfo`、`RunTimeFrames`、`RefineTF`、`WsSubs` 等）与回调（`OnStartUp`、`OnDataSubs`、`OnSymbols`、`OnData`、`OnCheckExit`、`OnOrderChange`、`OnBatchJobs/OnBatchInfos`、`OnWs*`、`PickTimeFrame`、`GetDrawDownExitRate`、`OnShutDown`、`OnStratExit`）。`OnBar`/`OnInfoBar` 为旧接口，与 `OnData` 同设会在构造时 panic（`data_event.go:50`）。运行期实例按 policy 克隆（`state.go:821 NewStrategy` → `cloneTradeStrat`）。
-- **`StratJob`**（`types.go:114`）：运行上下文。公开字段（`Env`、`DataHub`、`Entrys/Exits`、`LongOrders/ShortOrders`、`OrderNum/EnteredNum`、`MaxOpenLong/Short`、`CloseLong/Short`、`ExgStopLoss/ExgTakeProfit`、`LongSLPrice` 等、`More`）保持策略兼容；私有字段绑定 `symbols`、`strategyState`、`runtimeCore`、`runtimePrices`、`runtimeClock`，并通过原子指针懒创建 `executionStateMu`（每 Job 一把细粒度锁，`execution_state.go:92`）。读写可变执行状态应走 `ExecutionSnapshot()` 与 typed 方法。
-- **`EnterReq` / `ExitReq`**（`types.go:197,231`）：信号意图。`Tag` 必填（入场；有订单时的平仓）。`Clone()` 与 `GetZapFields()` 在 `common.go:189/227/288/307`，新增字段必须同步。`CommandID` 为幂等键：空时由 `WithOrderEvent` 上下文派生为 `<事件ID>/entry/<序号>`（`execution_state.go:270-311`）。
+- **`StratJob`**（`types.go:114`）：运行上下文。公开字段（`Env`、`DataHub`、`Entrys/Exits`、`LongOrders/ShortOrders`、`OrderNum/EnteredNum`、`MaxOpenLong/Short`、`CloseLong/Short`、`ExgStopLoss/ExgTakeProfit`、`LongSLPrice` 等、`More`）保持策略兼容；私有字段绑定 `symbols`、`strategyState`、`runtimeCore`、`runtimePrices`、`runtimeClock`，并通过原子指针懒创建 `executionStateMu`（每 Job 一把细粒度锁，`execution_state.go:92`）。读写可变执行状态应走 `ExecutionSnapshot()` 与 typed 方法；只读账户资金与风控状态通过 `AccountEquity()`、`AvailableBalance()`、`AccountDrawdown()` 查询（`account_state.go`）。
+- **`EnterReq` / `ExitReq`**（`types.go:197,231`）：信号意图。`Tag` 必填（入场；有订单时的平仓），`EnterReq.RiskRate` 支持按账户权益风险比例自动定仓。`Clone()` 与 `GetZapFields()` 在 `common.go:189/227/288/307`，新增字段必须同步。`CommandID` 为幂等键：空时由 `WithOrderEvent` 上下文派生为 `<事件ID>/entry/<序号>`（`execution_state.go:270-311`）。
 - **`DataEvent` / `DataRole` / `RouteData`**（`data_event.go`）：`DataRoleMain=1`（主 K 线）、`DataRoleInfo=2`（辅助）、`DataRoleCustom=3`（自定义序列）。`RouteData` 每个事件至多调用一个角色处理器。
 - **`DataHub` / `DataFields`**（`datahub.go:15,22`）：`timeframe → source → sid` 三级视图。`DataFields` 同时保留浮点 Series（用于指标）与原始值（`rawMap`，保留显式 nil，区分缺失与 NULL）。`AllReady()` 只检查当前时间会收盘的周期。
-- **`State`**（`state.go:29`）：策略域 typed 状态。绑定 `Core/Clock/Config/Symbols/Exchange`、账户与订单状态（`runtimeAccounts`、`runtimeOrders`、`orderProcessor`）；注册表 `accJobs`（账户 → envKey → 策略名 → Job）、`accInfoJobs`（辅助订阅）、`pairStrats`、`envs`、`versions`、`forbidJobs`、`wsSubJobs`；并维护不可变快照与 dirty bit。`legacyState`（`state.go:515`）是包级全局变量的兼容视图，`IsLegacyState` 用于分支。
+- **`State`**（`state.go:29`）：策略域 typed 状态。绑定 `Core/Clock/Config/Symbols/Exchange`、账户与订单状态（`runtimeAccounts`、`runtimeOrders`、`orderProcessor`、`accountMetrics` 及按账户维护的净值峰值 `accountPeakEquities`）；注册表 `accJobs`（账户 → envKey → 策略名 → Job）、`accInfoJobs`（辅助订阅）、`pairStrats`、`envs`、`versions`、`forbidJobs`、`wsSubJobs`；并维护不可变快照与 dirty bit。`legacyState`（`state.go:515`）是包级全局变量的兼容视图，`IsLegacyState` 用于分支。
 - **`BatchState` / `JobEnv` / `BatchMap`**（`batch_state.go`、`types.go:89,100`）：批量执行池，键为时间戳+市场组；`TakeReady(currMS, deterministic)` 返回就绪组（确定性模式下等待所有有效任务后按 key 排序输出）；组内 `MainJobs` 按品种键字典序交给 `OnBatchJobs`，不经同 bar 多品种的哈希优先级，批策略若按到达顺序依次开仓，资金竞争仍偏向字母靠前的品种，应自行按得分排序。
 - **`PairUpdateReq` / `PairUpdateResult` / `PairUpdateHooks`**（`pair_update.go:19,31,39`）：动态品种更新的入参、结果与外部钩子（`SubWarmPairs` 必需；`ExitOrders` 在 `CloseOnRemove` 时必需；`LookupSymbol`）。
-- **`FuncProcessOrders` / `BindOrderProcessor`**（`execution_state.go:14,17`）：订单处理器由 `biz/job_orders.go:30` 在组装阶段绑定一次（owner 必须是同一 `Trading` 指针）。
+- **`FuncProcessOrders` / `BindOrderProcessor`、`FuncAccountMetrics` / `BindAccountMetrics`**（`execution_state.go`、`account_state.go`）：订单处理器与账户资金读取器由 `biz/job_orders.go` 在组装阶段一次性绑定（owner 必须是同一 `Trading` 指针）。
 - **`Process` / `Options` / `Runtime`**（`runtime/runtime.go:47,504,559`）：`Process` 为资源 owner（`runtimes`、`sharedAccounts`、`symbolAllocators`、`sidRegistries`、`schedulerClaims`）；`Options` 为构造参数（Storage、Exchange、Config、Scheduler、AccountOwnerKey、SharedExecution、LegacyExecution 等）；`Runtime` 字段见 `doc/runtime_context.md` §2 表格，关键的有 `Core`、`Clock`、`Market`、`Symbols`、`Storage`（借用）、`Batch`、`Strategies`、`Orders`、`Trading`、`Cron`、`Exchange`（借用）。
 - **`runtimeplan.RequestV1` / `OutputV1`**（`runtimeplan/types.go`）：JSON 严格解码（`DisallowUnknownFields`，拒绝尾随内容）。输出的 `SemanticPlanSHA256` 为版本化域分隔哈希。
 
@@ -78,9 +79,9 @@
 5. 批量：`BatchState.TakeReady` 就绪后调用 `OnBatchJobs`/`OnBatchInfos`（`biz/biz.go:541`）。
 
 ### 4. 开单意图（`strat/base.go:270 OpenOrder` → `openOrder:287`）
-1. 基础校验：`Tag` 非空；`CanOpen(short)`（`MaxOpenLong/Short`、现货禁止开空，`base.go:235`）；NaN 与 `CallbackPct` 范围；`Stop` 与 `Limit` 互斥（`base.go:352`）。
+1. 基础校验：`Tag` 非空；`CanOpen(short)`（`MaxOpenLong/Short`、现货禁止开空，`base.go:235`）；NaN、`RiskRate`（`[0, 1]`）与 `CallbackPct` 范围；`Stop` 与 `Limit` 互斥（`base.go:352`）。
 2. 价格：预热期用 `Env.Close`，否则 `currentPrice(side)`；限价取更优价。
-3. 金额：`LegalCost = 基准金额 × StakeRate × CostRate`，受 `open_vol_rate` 与 `MinStakeAmount` 约束。
+3. 金额：未显式指定 `Amount` 与 `LegalCost` 时，若 `RiskRate > 0` 且解析出有效止损价（`|enterPrice - slPrice| > 0`），按 `LegalCost = (s.AccountEquity() * req.RiskRate) / (|enterPrice - slPrice| / enterPrice)` 计算并受账户/请求最大杠杆与 `max_stake_amt` 封顶；否则按 `LegalCost = 基准金额 × StakeRate × CostRate` 计算；随后统一经 `open_vol_rate` 与 `MinStakeAmount` 约束。
 4. 止损：`StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss`；方向错误返回错误。受 `ExgStopLoss` 控制（为 false 时整体丢弃并跳过校验，`base.go:429`）。
 5. 止盈：`TakeProfitVal` > `TakeProfit`；`LongTPPrice/ShortTPPrice` 不生效。
 6. `enqueueEntry`（`execution_state.go:270`）：预热期返回 false（调用方仍得到 nil）；否则追加 `s.Entrys` 并 `OrderNum++`。

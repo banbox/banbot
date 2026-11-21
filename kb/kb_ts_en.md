@@ -30,7 +30,7 @@ Command `banbot <cmd> --config x.yml` (`--config` is repeatable; `--config-data`
 
 ### 1.3 Numeric and Unit Conventions
 - Prices/amounts are `float64`; not ready = `NaN`;
-- Ratio fields: `TradeStrat.StopLoss`, `EnterReq.StopLossRate/TakeProfitRate`, `ExitRate`, `CallbackPct` (percentage, [0.1,10]); `0.05` = 5%, leverage not applied.
+- Ratio fields: `TradeStrat.StopLoss`, `EnterReq.RiskRate/StopLossRate/TakeProfitRate`, `ExitRate`, `CallbackPct` (percentage, [0.1,10]); `0.05` = 5% (`RiskRate: 0.01` = 1% account equity risk), leverage not applied.
 - Distance fields: `StopLossVal`/`TakeProfitVal` are **price distances** (absolute values, not multiples), e.g. `atr*2`; `StopLoss`/`TakeProfit`/`ActivationPrice` are **prices**.
 - `InOutOrder.ProfitRate` **excludes leverage** (PnL / entry notional value); `Profit` is the quote-currency amount after fees.
 - `core.AmtDust=1e-8`; `core.MinStakeAmount=5.5` (minimum order size, fiat). `LegalCost` is a fiat amount, `Amount` is the quantity of the asset.
@@ -361,6 +361,9 @@ Methods:
 - `CanOpen(short bool) bool`: judged by MaxOpenLong/Short and spot restrictions (spot cannot short)
 - `SetAllStopLoss(dirt float64, args *ormo.ExitTrigger) *errs.Error` / `SetAllTakeProfit(...)`: set stop-loss/take-profit triggers for orders in a direction; `args=nil` cancels; only applies to orders whose status is between partially-entered and partially-exited; when `args.Rate∈(0,1)`, allocated across orders by total position×Rate; panics when `dirt=0` and both long and short exist
 - `Data(sub *DataSub) *DataFields`: get a subscription view; `ExSymbol==nil` means the current symbol
+- `AccountEquity() float64`: real-time total equity of the owning account (pricing fiat, cash balance + unrealized PnL); during warmup or before wallet initialization, falls back to configured initial capital or a finite positive `GetStakeAmount(s)` value (never 0)
+- `AvailableBalance() float64`: current available balance / available margin of the owning account (pricing fiat)
+- `AccountDrawdown() float64`: current drawdown ratio in `[0, 1]` relative to the account's run-to-date peak equity (High-Water Mark; 0 when no drawdown)
 - `GetStakeAmount`: `s.Strat.GetStakeAmount(s)` base stake amount (fiat); `OrderCounts() (orderNum, enteredNum int)` same as OrderNum/EnteredNum
 
 ### 3.4 DataEvent / DataFields / DataHub / DataSub
@@ -398,7 +401,8 @@ func RouteData(h DataHandlers) FnOnData // at most one handler is called per eve
 - `Limit float64`: limit entry price (specifying makes it a limit order); mutually exclusive with `Stop`
 - `Stop float64`: trigger price: for longs enter only after price rises to it (shorts the opposite); if already crossed it is treated as a limit order (`Limit=Stop`); in backtest under `bt_legacy_intrabar`, an already-crossed breakout order enters at the current price
 - `CostRate float64`: order multiplier, default 1 (multiplied onto base amount)
-- `LegalCost float64`: fiat amount; if specified CostRate is ignored
+- `RiskRate float64`: per-trade account equity risk ratio `[0, 1]` (e.g. `0.01` risks at most 1% of current `AccountEquity()` if stop-loss triggers); automatically computes `LegalCost` from stop-loss distance when `Amount`/`LegalCost` are unset and a valid stop-loss is resolved
+- `LegalCost float64`: fiat amount; if specified CostRate/RiskRate are ignored
 - `Amount float64`: asset quantity; if specified, not computed from amount
 - `Leverage float64`: leverage; non-zero overrides account leverage
 - `StopLossVal float64`: stop-loss distance (price difference), converted to a stop price; takes precedence over StopLoss
@@ -415,9 +419,9 @@ func RouteData(h DataHandlers) FnOnData // at most one handler is called per eve
 - `CommandID string`: framework idempotency ID (leave empty)
 
 `OpenOrder` validation:
-1. Error if `Tag` is empty, `CanOpen` is false, any numeric is NaN, `CallbackPct` is outside [0.1,10], or both `Stop` and `Limit` are set.
+1. Error if `Tag` is empty, `CanOpen` is false, any numeric is NaN, `RiskRate` is outside [0,1], `CallbackPct` is outside [0.1,10], or both `Stop` and `Limit` are set.
 2. Entry price: current price (`Env.Close` during warmup); for limit orders take the better price by direction.
-3. Amount (when neither Amount nor LegalCost is specified): `LegalCost=base amount×StakeRate×CostRate`; quantity exceeding the last-5-bar average volume×`open_vol_rate` is truncated; below `MinStakeAmount`(5.5): `ignore` errors; `keepBig` raises to 5.5×1.1 only when cost is >40% of 5.5, otherwise errors; `keepAll` always raises to 5.5×1.1.
+3. Amount (when neither Amount nor LegalCost is specified): if `RiskRate>0` and a valid stop-loss is resolved (`|enterPrice-slPrice|>0`), `LegalCost=(s.AccountEquity()*RiskRate)/(|enterPrice-slPrice|/enterPrice)`, capped by max leverage (`AccountEquity()*leverage`) and `max_stake_amt`; otherwise `LegalCost=base amount×StakeRate×CostRate`; quantity exceeding the last-5-bar average volume×`open_vol_rate` is truncated; below `MinStakeAmount`(5.5): `ignore` errors; `keepBig` raises to 5.5×1.1 only when cost is >40% of 5.5, otherwise errors; `keepAll` always raises to 5.5×1.1.
 4. Stop-loss priority: `StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss` (entry price×(1∓ratio)); wrong direction (long stop ≥ entry price, etc.) → error; controlled by `ExgStopLoss`.
 5. Take-profit: `TakeProfitVal` > `TakeProfit` (`TakeProfitLimit` follows the same rule as StopLossLimit); wrong direction → error; `LongTPPrice` is not used.
 6. Returns nil on enqueue (`s.Entrys`, `OrderNum++`); with `Log=true` errors are written to the log.
@@ -473,7 +477,7 @@ Order events (chgType of `OnOrderChange`, `strat.OdChg*`): `OdChgNew`(0) new ord
 - Backtest fill time = order time + `bt_net_cost` seconds, price taken from the subsequent price path (§6).
 - Default is market (`OrderTypeEmpty` is the same). `Limit` orders can be combined with `StopBars`; `OrderTypeLimitMaker` requires the resting side (long limit ≤ market, short ≥ market), otherwise errors (Binance futures has no limit_maker, banexg converts to limit+GTX).
 - Leverage: `EnterReq.Leverage` first, then account `leverage`.
-- Position size: `stake_amount`/`stake_pct` (account) × `accounts.<acc>.stake_rate` × `run_policy.stake_rate` × `TradeStrat.StakeRate` × `CostRate`; capped by `max_stake_amt`; `strat_perf` down-weighting multiplies by a coefficient.
+- Position size: fixed base sizing is `stake_amount`/`stake_pct` (account) × `accounts.<acc>.stake_rate` × `run_policy.stake_rate` × `TradeStrat.StakeRate` × `CostRate` (capped by `max_stake_amt`, multiplied by `strat_perf` down-weighting); alternatively set `EnterReq.RiskRate` (e.g. `0.01`) with a stop-loss distance for automatic fixed-fractional sizing by `AccountEquity()`.
 - Closing: default full close at market; `ExitRate=0.5` closes half (proportionally per order); filter via `EnterTag`/`OrderID`; `Limit` for limit orders. After a partial close the remaining order is still in `GetOrders`.
 
 ### 4.2 Stop-Loss and Take-Profit
@@ -557,7 +561,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 17. Jobs of the same symbol with different timeframes are independent Envs; use `DataSub` for cross-timeframe data.
 18. `DrawDownExit` overrides the order's stop-loss trigger (§4.2); `ExgStopLoss=false` discards the entry stop-loss (§3.3); `MAMA/VPCI/DX/Fisher` differ from standard definitions; do not use legacy APIs in new code.
 19. **A `TradeStrat` is shared by every symbol of the strategy** (the factory runs once per policy unless `pair_params` is configured): closure variables of the factory body and package-level variables are shared by all symbols. Keep state that changes per symbol (previous signal, peaks, trailing stop level, counters) in a struct assigned to `s.More` in `OnStartUp` and read it with `s.More.(*T)` in the callbacks; never use closure variables or a map keyed by symbol for it.
-20. Common compile errors: the symbol name string is `s.Symbol.Symbol` (`s.Symbol` is `*orm.ExSymbol`, not a string or map key); `pol.Params` is `map[string]float64`, hyperparameters are numeric only (0/1 switches), read with `pol.Def/DefInt`, there is no `DefBool/DefStr/core.PInt`; the direction argument `dirt` is a `float64`; bar times are `e.TimeStart/TimeStop` and the period is `e.TFMSecs` (no `e.Time/TFSecs`); order types live in `github.com/banbox/banbot/orm/ormo` (`*ormo.InOutOrder`, `*ormo.ExitTrigger`); `EnterReq` has no `Qty/Dirt` field (quantity `Amount`, amount `LegalCost`/`CostRate`, short `Short: true`); account equity is not available in a strategy (no `GetEquity`), the base stake is `s.Strat.GetStakeAmount(s)`.
+20. Common compile errors: the symbol name string is `s.Symbol.Symbol` (`s.Symbol` is `*orm.ExSymbol`, not a string or map key); `pol.Params` is `map[string]float64`, hyperparameters are numeric only (0/1 switches), read with `pol.Def/DefInt`, there is no `DefBool/DefStr/core.PInt`; the direction argument `dirt` is a `float64`; bar times are `e.TimeStart/TimeStop` and the period is `e.TFMSecs` (no `e.Time/TFSecs`); order types live in `github.com/banbox/banbot/orm/ormo` (`*ormo.InOutOrder`, `*ormo.ExitTrigger`); `EnterReq` has no `Qty/Dirt` field (quantity `Amount`, amount `LegalCost`/`CostRate`, risk-fractional sizing `RiskRate`, short `Short: true`); read account equity/available balance/peak drawdown via `s.AccountEquity()` / `s.AvailableBalance()` / `s.AccountDrawdown()` (no `GetEquity`), and the base stake is `s.Strat.GetStakeAmount(s)`.
 
 ## 8. Hyperparameters and Optimization
 Declare hyperparameters with `pol.Def/DefInt` (distributions see §1.5; `DefInt` rounds automatically). `banbot optimize --config x.yml` (there is also `bt-opt` rolling backtest); `--sampler tpe|bayes|random|cmaes|ipop-cmaes|bipop-cmaes` (default bayes), `--opt-rounds` (default 30).

@@ -30,7 +30,7 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 
 ### 1.3 数值与单位约定
 - 价格/数量 `float64`；未就绪 `NaN`；
-- 比例类：`TradeStrat.StopLoss`、`EnterReq.StopLossRate/TakeProfitRate`、`ExitRate`、`CallbackPct`（百分数，[0.1,10]）；`0.05`=5%，不带杠杆。
+- 比例类：`TradeStrat.StopLoss`、`EnterReq.RiskRate/StopLossRate/TakeProfitRate`、`ExitRate`、`CallbackPct`（百分数，[0.1,10]）；`0.05`=5%（`RiskRate: 0.01`=1% 账户权益风险），不带杠杆。
 - 距离类：`StopLossVal`/`TakeProfitVal` 是**价格距离**（绝对值，非倍率），如 `atr*2`；`StopLoss`/`TakeProfit`/`ActivationPrice` 是**价格**。
 - `InOutOrder.ProfitRate` **不含杠杆**（盈亏/入场名义价值）；`Profit` 为扣费后计价货币金额。
 - `core.AmtDust=1e-8`；`core.MinStakeAmount=5.5`（最小开单金额，法币）。`LegalCost` 法币金额，`Amount` 标的数量。
@@ -361,6 +361,9 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `CanOpen(short bool) bool`：按 MaxOpenLong/Short 与现货限制（现货不能开空）判断
 - `SetAllStopLoss(dirt float64, args *ormo.ExitTrigger) *errs.Error` / `SetAllTakeProfit(...)`：对方向内订单设置止损/止盈触发；`args=nil` 取消；仅作用于状态在部分入场~部分出场间的订单；`args.Rate∈(0,1)` 时按总持仓×Rate 在订单间分配；`dirt=0` 且多空并存时 panic
 - `Data(sub *DataSub) *DataFields`：取订阅视图；`ExSymbol==nil` 为当前品种
+- `AccountEquity() float64`：当前账户实时总权益（计价法币，现金余额+未实现盈亏）；预热期或尚未初始化钱包时回退初始配置资金或 `GetStakeAmount(s)` 有限正值，不会除零
+- `AvailableBalance() float64`：当前账户可用余额/可用保证金（计价法币）
+- `AccountDrawdown() float64`：当前账户净值相对运行以来峰值净值（High-Water Mark）的回撤比例 `[0, 1]`（无回撤为 0）
 - `GetStakeAmount`：`s.Strat.GetStakeAmount(s)` 单笔基准金额（法币）；`OrderCounts() (orderNum, enteredNum int)` 同 OrderNum/EnteredNum
 
 ### 3.4 DataEvent / DataFields / DataHub / DataSub
@@ -398,7 +401,8 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 - `Limit float64`：限价入场价（指定即限价单）；与 `Stop` 互斥
 - `Stop float64`：触发价：做多价格涨到才入场（做空相反）；已越过按限价处理（`Limit=Stop`）；回测 `bt_legacy_intrabar` 下已越过的突破单按当前价入场
 - `CostRate float64`：开单倍率，默认 1（乘基准金额）
-- `LegalCost float64`：法币金额；指定则忽略 CostRate
+- `RiskRate float64`：单笔账户权益风险比例 `[0, 1]`（如 `0.01` 表示触发止损最多亏损当前 `AccountEquity()` 的 1%）；未指定 `Amount`/`LegalCost` 且解析出有效止损时自动按止损距离计算 `LegalCost`
+- `LegalCost float64`：法币金额；指定则忽略 CostRate/RiskRate
 - `Amount float64`：标的数量；指定则不按金额计算
 - `Leverage float64`：杠杆；非 0 覆盖账户杠杆
 - `StopLossVal float64`：止损距离（价格差），换算为止损价；优先于 StopLoss
@@ -415,9 +419,9 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 - `CommandID string`：框架幂等 ID（留空）
 
 `OpenOrder` 校验：
-1. `Tag` 空、`CanOpen` 假、任何数值 NaN、`CallbackPct` 超 [0.1,10]、`Stop` 与 `Limit` 同设→错误。
+1. `Tag` 空、`CanOpen` 假、任何数值 NaN、`RiskRate` 超 [0,1]、`CallbackPct` 超 [0.1,10]、`Stop` 与 `Limit` 同设→错误。
 2. 入场价：当前价（预热期 `Env.Close`）；限价按方向取更优价。
-3. 金额（未指定 Amount/LegalCost）：`LegalCost=基准金额×StakeRate×CostRate`；数量超近 5 根平均成交量×`open_vol_rate` 则截断；低于 `MinStakeAmount`(5.5)：`ignore` 报错；`keepBig` 仅当成本 >5.5 的 40% 时提升到 5.5×1.1，否则报错；`keepAll` 一律提升到 5.5×1.1。
+3. 金额（未指定 Amount/LegalCost）：若 `RiskRate>0` 且解析出有效止损价（`|enterPrice-slPrice|>0`），`LegalCost=(s.AccountEquity()*RiskRate)/(|enterPrice-slPrice|/enterPrice)`，并受最大杠杆（`AccountEquity()*leverage`）与 `max_stake_amt` 封顶；否则 `LegalCost=基准金额×StakeRate×CostRate`；数量超近 5 根平均成交量×`open_vol_rate` 则截断；低于 `MinStakeAmount`(5.5)：`ignore` 报错；`keepBig` 仅当成本 >5.5 的 40% 时提升到 5.5×1.1，否则报错；`keepAll` 一律提升到 5.5×1.1。
 4. 止损优先级：`StopLossVal` > `StopLoss` > `LongSLPrice/ShortSLPrice` > `TradeStrat.StopLoss`（入场价×(1∓比例)）；方向不对（做多止损≥入场价等）→错误；受 `ExgStopLoss` 控制。
 5. 止盈：`TakeProfitVal` > `TakeProfit`（`TakeProfitLimit` 同 StopLossLimit 规则）；方向不对→错误；不采用 `LongTPPrice`。
 6. 入队返回 nil（`s.Entrys`、`OrderNum++`）；`Log=true` 时错误写日志。
@@ -473,7 +477,7 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
 - 回测成交时间=下单时间+`bt_net_cost` 秒，价格取其后价格路径（§6）。
 - 默认市价（`OrderTypeEmpty` 同）。`Limit` 限价单可配 `StopBars`；`OrderTypeLimitMaker` 要求挂单侧（做多限价≤市价，做空≥市价），否则报错（币安合约无 limit_maker，banexg 转 limit+GTX）。
 - 杠杆：`EnterReq.Leverage` 优先，其次账户 `leverage`。
-- 仓位大小：`stake_amount`/`stake_pct`（账户）× `accounts.<acc>.stake_rate` × `run_policy.stake_rate` × `TradeStrat.StakeRate` × `CostRate`；`max_stake_amt` 封顶；`strat_perf` 降权再乘系数。
+- 仓位大小：固定基准路径为 `stake_amount`/`stake_pct`（账户）× `accounts.<acc>.stake_rate` × `run_policy.stake_rate` × `TradeStrat.StakeRate` × `CostRate`（`max_stake_amt` 封顶，`strat_perf` 降权再乘系数）；也可在 `EnterReq` 设 `RiskRate`（如 `0.01`）配合止损距离按 `AccountEquity()` 风险百分比自动定仓。
 - 平仓：默认全平市价；`ExitRate=0.5` 平一半（每订单按比例）；`EnterTag`/`OrderID` 过滤；`Limit` 限价。部分平仓后剩余订单仍在 `GetOrders`。
 
 ### 4.2 止损与止盈
@@ -557,7 +561,7 @@ OnData: strat.RouteData(strat.DataHandlers{
 17. 同品种不同周期的 job 是独立 Env；跨周期数据用 `DataSub`。
 18. `DrawDownExit` 覆盖订单止损触发器（§4.2）；`ExgStopLoss=false` 丢弃入场止损（§3.3）；`MAMA/VPCI/DX/Fisher` 与标准定义不同；旧 API 新代码不用。
 19. **`TradeStrat` 被该策略的所有品种共用**（工厂每个 policy 只调用一次，除非配置了 `pair_params`）：工厂函数体内的闭包变量和包级变量对所有品种共享。逐品种变化的状态（上一根信号、峰值、追踪止损位、计数器）定义成结构体，在 `OnStartUp` 赋给 `s.More`，回调里 `s.More.(*T)` 读取；不要用闭包变量或按品种做键的 map。
-20. 常见编译错误：品种名字符串是 `s.Symbol.Symbol`（`s.Symbol` 是 `*orm.ExSymbol`，不能当字符串或 map 键）；`pol.Params` 是 `map[string]float64`，超参只有数值（开关用 0/1），用 `pol.Def/DefInt` 读取，没有 `DefBool/DefStr/core.PInt`；方向参数 `dirt` 是 `float64`；K线时间用 `e.TimeStart/TimeStop`、周期用 `e.TFMSecs`（没有 `e.Time/TFSecs`）；订单类型在 `github.com/banbox/banbot/orm/ormo`（`*ormo.InOutOrder`、`*ormo.ExitTrigger`）；`EnterReq` 没有 `Qty/Dirt` 字段（数量 `Amount`、金额 `LegalCost`/`CostRate`、做空 `Short: true`）；策略里取不到账户权益（无 `GetEquity`），单笔基准金额用 `s.Strat.GetStakeAmount(s)`。
+20. 常见编译错误：品种名字符串是 `s.Symbol.Symbol`（`s.Symbol` 是 `*orm.ExSymbol`，不能当字符串或 map 键）；`pol.Params` 是 `map[string]float64`，超参只有数值（开关用 0/1），用 `pol.Def/DefInt` 读取，没有 `DefBool/DefStr/core.PInt`；方向参数 `dirt` 是 `float64`；K线时间用 `e.TimeStart/TimeStop`、周期用 `e.TFMSecs`（没有 `e.Time/TFSecs`）；订单类型在 `github.com/banbox/banbot/orm/ormo`（`*ormo.InOutOrder`、`*ormo.ExitTrigger`）；`EnterReq` 没有 `Qty/Dirt` 字段（数量 `Amount`、金额 `LegalCost`/`CostRate`、按风险比例定仓 `RiskRate`、做空 `Short: true`）；查询账户权益/可用余额/峰值回撤用 `s.AccountEquity()` / `s.AvailableBalance()` / `s.AccountDrawdown()`（无 `GetEquity`），单笔基准金额用 `s.Strat.GetStakeAmount(s)`。
 
 ## 8. 超参与优化
 超参用 `pol.Def/DefInt` 声明（分布见 §1.5；`DefInt` 自动取整）。`banbot optimize --config x.yml`（另有 `bt-opt` 滚动回测）；`--sampler tpe|bayes|random|cmaes|ipop-cmaes|bipop-cmaes`（默认 bayes），`--opt-rounds`（默认 30）。
