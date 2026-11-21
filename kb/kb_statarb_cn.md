@@ -11,7 +11,7 @@
 | 训练（调用方 Go 代码，只读训练区间） | β/α、残差尺度、阈值、持有期、候选参数 |
 | 冻结（写 YAML `params`，进 manifest hash；或 ParameterArtifact/ModelArtifact） | 不可变参数 |
 | 信号（runner 每决策轮在线算） | 每对 z-score、带状态仓位 ±1/0 |
-| 目标（`RegisterPairs` / `RegisterRollingPairs` builder 输出不可变 `factor.TargetPortfolio`：`ID()` 内容哈希，`Targets()` 返回 SID→NAV 比例副本） | 目标权重、诊断码 |
+| 目标（`RegisterPairs` / `RegisterRollingPairs` / `RegisterBaskets` / `RegisterResidualStatArb` builder 输出不可变 `factor.TargetPortfolio`：`ID()` 内容哈希，`Targets()` 返回 SID→NAV 比例副本） | 目标权重、诊断码 |
 | 证据（Weights/Events 账本及其输出文件） | 成交、费用、资金费 |
 
 术语：`Y` 被解释腿（做多价差时买入）；`X` 解释腿（做多价差时卖出）；`z` = 价差残差/残差标准差；`β` 对数回归斜率（弹性）；决策 bar = `run_timeframes` 对应已收盘 K 线。统计函数不读时钟、账户、交易所；数据经 `DataSeries.Values` 传入，保留类型与 NULL，缺失须显式排除，不得当 0。
@@ -164,9 +164,9 @@ run_policy:
 
 **Weights 账本对漂移计费**：账本每次执行目标都按 `qty = w × spec.Budget.NAV / price` 重算数量（NAV=决策时账本 NAV，随盈亏复利），与现有数量之差按 `fee_rate`+`slippage_rate` 计费。`DriftBand == 0` 时配对每个决策轮都输出恒定目标权重，**持仓期间价格漂移每轮被再平衡回目标权重并计费**；设置 `DriftBand > 0` 可在偏离未超阈值时输出自然漂移权重以省去无谓摩擦成本。Gross 是当前 NAV 比例而非初始 NAV。`research.Evaluate` 的 `Costs = CostRate × Σ|w−w_prev|` 只计权重差、不含漂移，与账本口径不同（`Result.Book` 为账本口径）。Events 路径是否同样产生漂移再平衡成交未实测。
 
-### 2.7 自定义路径（静态 β、多腿篮子）
+### 2.7 自定义路径（外部静态 β）
 
-两腿动态 OLS / 正交 TLS / Kalman 滤波 / 比值 / 累计收益差可直接由 `RegisterPairs` 或 `RegisterRollingPairs` 的 `SpreadModel` 声明；仅当需要**外部静态 β** 或 **3 腿及以上 Johansen 篮子**时才需通用接口：
+两腿在线模型见 `RegisterPairs` / `RegisterRollingPairs`（`SpreadModel`），3 腿及以上协整篮子直接用 `RegisterBaskets`（2.9），截面 PCA / 基准残差 OU `s-score` 直接用 `RegisterResidualStatArb`（2.10）；仅当需要注入自定义状态机或外部离线静态模型时才需底层通用接口：
 1. `runner.RegisterDefinition(name, func(c runner.Config) (*factor.Plan, research.ComboSpec, error))`：`factor.New().Add(name, node).Compile()` 编译对数价格节点（`factor.Field("kline", field, c.Factor.TimeFrame)` + `factor.Custom(version, inputs, fn)`，同 `pairs-log-v1` 形式），组合为 `research.ComboSpec{Method: research.Equal, Columns: [...]}`。
 2. `runner.RegisterPortfolioFactory(name, func(c runner.Config) (runner.PortfolioBuilder, error), validator)`：名字须含 `-v`；validator 只做纯参数检查，不构造状态。
 3. 构造器：`func(frame factor.Frame, universe factor.Universe, spec factor.PortfolioSpec, def research.PortfolioDefinition) (*factor.TargetPortfolio, []factor.Diagnostic, error)`；输出 `factor.NewTargetPortfolio(spec, weights)`，`spec` 用入参。
@@ -241,6 +241,81 @@ runner.RegisterRollingPairs("rolling-coint", func(p *runner.Params) (runner.Roll
 })
 ```
 
+### 2.9 多腿协整篮子策略：`runner.RegisterBaskets`
+
+声明式构建 2..12 腿协整篮子，占用定义名 `<name>` 与组合工厂名 `<name>-baskets-v1`（`BuildBasketsRegistration` 可在不写全局注册表的前提下构造 `Registration` 并单测）。
+
+```go
+type Registration struct {
+    Name, BuilderName string
+    Definition        DefinitionBuilder
+    Factory           PortfolioFactory
+    Validator         PortfolioValidator
+}
+func (r Registration) Register() error
+
+type BasketDef struct {
+    Name    string
+    Symbols []string  // 2..12 个互异非空符号
+    Weights []float64 // WeightMethod=="fixed" 时显式给定（自动按 Σ|w_i|=1 归一）
+}
+type BasketsSpec struct {
+    Baskets              []BasketDef
+    Field                string                // kline 字段，缺省 "close"
+    Window               int                   // 滚动窗口 bar 数（johansen 须 >= d*(DifferenceLags+1)+3）
+    WeightMethod         string                // ""（Weights 非空取 "fixed"，否则 "johansen"）、"fixed"、"johansen"、"multivariate_ols"
+    UseRawPrice          bool                  // true 时在原始价格上拟合并按 beta_i*price_i 换算美元名义权重
+    DifferenceLags       int                   // Johansen VECM 差分滞后阶数（>=0，缺省 0）
+    RequireCointegration bool                  // true 时在 "johansen" 下要求 IsCointegrated(spec, Confidence) 才允许开新仓
+    Confidence           float64               // Johansen 显著性置信水平 {0.90, 0.95, 0.99}，0 缺省 0.95
+    MinHalfLife          float64               // 可选入场 FitOU DiscreteHalfLife 下限（>=0）
+    MaxHalfLife          float64               // 可选入场 FitOU DiscreteHalfLife 上限（>=0，0 关闭）
+    Band                 statistics.BandConfig // 支持 "reversion" 与 "momentum"
+    MaxHoldBars          int                   // Band.MaxHold==0 时的最大持仓 bar 数（>=0）
+    DynamicWeights       bool                  // 默认 false（入场冻结单位权重并在窗口上评估冻结组合退出 z）；true 动态更新
+    DriftBand            float64               // 持仓期单篮子 L1 漂移免调仓缓冲带（>=0）
+    WeightMode           string                // ""/"equal" 或 "inverse_vol"（按单位名义无量纲波动率倒数注水分配）
+    GrossPerBasket       float64               // 单篮子名义敞口比例；0 缺省 MaxGross/len(Baskets)
+    MaxGross             float64               // 组合总敞口上限 (0,1]；0 缺省 1.0
+}
+func BuildBasketsRegistration(name string, spec BasketsSpec) (Registration, error)
+func RegisterBaskets(name string, spec BasketsSpec) error
+```
+
+- `"johansen"` 取首协整向量 `CointegratingVectors[0]` 并固定符号使首个非零分量 `beta[0] > 0`；`"multivariate_ols"` 将第 0 腿对 `[1, leg_1..leg_{k-1}]` 中心化最小二乘回归（秩亏时启用微幅岭回归回退），系数取 `[+1, -b_1, ..., -b_{k-1}]`。
+- 逐篮子多腿收益与换手写入 `Result.Pairs`，与 `PairsGrossPnL` / `PairsNAVReturn` / `PairsResidual` 对账一致；中途缺腿当轮以 `leg_missing` 平仓并暂停，`UnavailableSymbols` 整次优雅跳过。
+
+### 2.10 截面 PCA / 基准残差 `s-score` 策略：`runner.RegisterResidualStatArb`
+
+在时点可投资池 `Universe.Investable` 上实现 Avellaneda & Lee (2010) 截面残差均值回归与严格美元中性 + 因子 Beta 中性组合构造，占用定义名 `<name>` 与组合工厂 `<name>-residual-statarb-v1`。
+
+```go
+type ResidualStatArbSpec struct {
+    Field             string   // kline 字段，缺省 "close"
+    FactorModel       string   // ""/"pca"（默认）或 "benchmarks"
+    Benchmarks        []string // FactorModel=="benchmarks" 时的显式基准符号（1..16 个，如 BTC/ETH）
+    NumFactors        int      // FactorModel=="pca" 提取主成分个数，0 缺省 3
+    Window            int      // 滚动 1-bar 简单收益率回归窗口（>= max(6, 因子数+3)，需 Window+1 根价格）
+    OUWindow          int      // 累计残差 FitOU 窗口；0 缺省 Window，范围 [4, Window]
+    MinHalfLife       float64  // FitOU DiscreteHalfLife 入场下限（>=0）
+    MaxHalfLife       float64  // FitOU DiscreteHalfLife 入场上限（>=0，0 不限）
+    EntryS            float64  // 开仓阈值：s_i <= -EntryS 做多(+1)，s_i >= +EntryS 做空(-1)；0 缺省 1.25
+    ExitLongS         float64  // 多头平仓阈值 s_i >= -ExitLongS；0 缺省 min(0.50, 0.5*EntryS)
+    ExitShortS        float64  // 空头平仓阈值 s_i <= +ExitShortS；0 缺省 min(0.50, 0.5*EntryS)
+    StopS             float64  // 止损阈值 |s_i| >= StopS（0 关闭，启用须 > EntryS）
+    MaxHoldBars       int      // 最大持仓 bar 数（0 关闭）
+    WeightMode        string   // ""/"equal"（±1 意愿）或 "inverse_vol"/"inverse_sigma"（±1/sigma_eq 意愿）
+    TargetGross       float64  // 目标总名义敞口 (0,1]，0 缺省 1.0
+    MaxWeightPerAsset float64  // 单币绝对权重上限 [0,1]（交替投影保持双中性，0 不限）
+    DriftBand         float64  // 活跃仓位未变时的组合 L1 权重漂移缓冲带（>=0）
+}
+func BuildResidualStatArbRegistration(name string, spec ResidualStatArbSpec) (Registration, error)
+func RegisterResidualStatArb(name string, spec ResidualStatArbSpec) error
+```
+
+- **信号生成**：`"pca"` 对标准化收益率运行 `statistics.FitPCA` 构造特征组合收益率并逐币种 OLS 提取残差；`"benchmarks"` 对显式基准收益率做多元 OLS 提取残差。在 `OUWindow` 累计残差 `X_i` 上运行 `FitOU`，计算 `sigma_eq = InnovationStd / sqrt(1 - (1+Slope)^2)` 并去截面偏离均值得到中心化 `s_i = (X_{i,last} - m_eq_centered) / sigma_eq`。
+- **双中性投影与 PIT**：经 `statistics.FactorNeutralWeights`（活跃币种不足以张成约束核空间时自动引入基准或宇宙内可交易被动对冲腿）严格满足 `|Σ w_i| < 1e-9`（美元中性）与 `|B^T w| < 1e-9`（因子 Beta 中性）；品种离开 `Investable` 或缺失数据时当轮立即清零该腿并保持其余组合双中性。
+
 ## 3. 数值 API（`factor/statistics`）
 
 约定：观测按时间升序；矩阵行=观测、列=变量，列序拟合与预测一致。非有限输入、不可识别、维度不符、超预算均返回 error。
@@ -270,10 +345,15 @@ type JohansenResult struct {
     Samples, NuisanceRank int
 }
 func Johansen(levels [][]float64, spec JohansenSpec) (JohansenResult, error)   // 2<=资产<=64
+func JohansenTraceCriticalValues(d int, spec JohansenSpec, confidence float64) ([]float64, error)
+func JohansenMaxEigCriticalValues(d int, spec JohansenSpec, confidence float64) ([]float64, error)
 func (j JohansenResult) TraceRank(criticalValues []float64) (int, error)       // 长度须等于 len(Trace)(=资产数)，值>0；顺序拒绝，首个不拒绝处停止
+func (j JohansenResult) MaxEigRank(criticalValues []float64) (int, error)
+func (j JohansenResult) CointegrationRank(spec JohansenSpec, confidence float64) (int, error)
+func (j JohansenResult) IsCointegrated(spec JohansenSpec, confidence float64) (bool, error)
 ```
 
-- **临界值（以代码为准）**：`statistics` **没有任何临界值表、插值函数或 p 值**；`AugmentedDickeyFuller`/`EngleGranger` 只返回 `TStatistic`，`TraceRank` 由调用方提供临界值，无默认表。
+- **临界值（以代码为准）**：`AugmentedDickeyFuller`/`EngleGranger` 只返回 `TStatistic`（不含内置 ADF 临界值表或 p 值）；Johansen 提供匹配 `JohansenSpec{Intercept, Trend}` 三种确定性项与 `confidence ∈ {0.90, 0.95, 0.99}` 的 Osterwald-Lenum / MacKinnon-Haug-Michelis 渐近临界值（`m = d - r ≤ 12` 查精确表，`13..64` 用二次布朗矩渐近外推），经 `JohansenTraceCriticalValues`、`JohansenMaxEigCriticalValues`、`CointegrationRank` 与 `IsCointegrated` 调用。
 - **EngleGranger**：`Regress(y,x,intercept)` 后对残差做 `ADFSpec{Lags: lags}`（**残差检验无截距、无趋势**）。统计量越负越倾向拒绝“无协整”，须与匹配确定性项/回归元个数的 Engle–Granger/MacKinnon 临界值比较。外部参考（**非代码提供**）：MacKinnon 渐近值，N=2 含常数项约 1%:-3.90、5%:-3.34、10%:-3.04；加趋势、更多回归元、有限样本均不同，应取响应面或自行模拟。
 - **FitOU**：按 bar 计数用 `DiscreteHalfLife`。
 - **Johansen** 特征向量须先按某一腿归一再做腿权重；`TraceRank` 临界值须对应相同滞后、确定性项、显著性水平。
@@ -449,7 +529,7 @@ AFML 标签/CPCV、订单流与 PIN/VPIN、VID 风险定价、HMM（`FitBinaryHM
 4. 残差标准化为 z（训练均值/标准差），`EmpiricalThreshold`+`RegularizationHeel` 选 Entry；Exit/Stop 由调用方选（如 Entry 的 1/2 与 2 倍），满足 `Stop > Entry > Exit >= 0`。
 5. `CrossingDurations`+`BootstrapDurations` 的分位数用于估 `MaxHold` 量级，非确定截止时间。
 6. 成本门槛：按 7.1 确认 `(|Entry|-|Exit|)·σ/(1+|β|)` 覆盖往返成本，否则提高 Entry 或放弃。
-7. 多腿篮子：`Johansen`（需对应临界值）；`RegisterPairs` 仅两腿，多腿走 2.7。
+7. 多腿篮子与截面残差：`Johansen` 配合 `IsCointegrated` / `CointegrationRank`；多腿篮子使用 `RegisterBaskets`（2.9），全市场残差回归使用 `RegisterResidualStatArb`（2.10）。
 
 ### 4.2 冻结产物
 
