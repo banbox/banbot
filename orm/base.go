@@ -1153,7 +1153,7 @@ func runPgMigrations(ctx context.Context, pool *pgxpool.Pool) *errs.Error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	log.Warn("running database migrations (timescaledb) ...")
+	log.Info("running database migrations (timescaledb) ...")
 
 	// Check if sranges table already exists (base schema was applied).
 	var tblCount int

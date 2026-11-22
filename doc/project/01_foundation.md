@@ -45,8 +45,8 @@
 | `config/snapshot.go` | `Snapshot`：运行时不可变配置视图（DataDir/StrategyDir/location），`cloneSnapshotConfig` 深拷贝 |
 | `config/biz.go` | 旧全局安装器：`LoadConfig`、`GetConfig`、`ApplyConfig`（写 ~60 个包级全局 + `core.*` + `banexg.SetProxy`）、`SetRunPolicy`、`StaticPairs`、账户初始化、`Clone/Desensitize`、perf 加载、语言包、`ParsePairs` |
 | `config/historical_coverage.go` | `HistoricalCoverageConfig`（回测历史覆盖声明的归一化与查询） |
-| `config/common.go` | 代理解析 `GetExchangeProxy`、`refine_tf` 解析与缓存（`EnsureStratRefineTF`） |
-| `config/exchange_capabilities.go` | 通过 banexg 适配器查询能力：`ExchangeUsesOpaqueSymbols`、`ExchangeDefaultLocation` |
+| `config/common.go` | 代理解析 `GetExchangeProxy` / `ExchangeProxyOption`（进程内只解析一次；macOS 读 `scutil --proxy`；无代理时返回显式 `"no"`）、`refine_tf` 解析与缓存（`EnsureStratRefineTF`） |
+| `config/exchange_capabilities.go` | 通过 banexg 适配器查询能力：`ExchangeUsesOpaqueSymbols`、`ExchangeDefaultLocation`；每个交易所名只创建一次适配器并缓存结果，且固定传 `Proxy="no"`（仅元数据，不发请求） |
 | `config/output_dir.go` | `AllocateOutputDir`：用 `Mkdir` 作为原子占位，冲突时加 `_N` 后缀 |
 | `config/cmd_types.go` | `CmdArgs`（CLI 参数集合）、`ArrString` |
 | `config/cmd_biz.go` | `CmdArgs.Init`（会写全局 `DataDir`）、`parseTimeZone`、`SetLog`（安装 banexg 全局 logger） |
@@ -176,7 +176,7 @@
 - 设置 `Loaded=true` 并把配置写入约 60 个包级变量（`Accounts`、`Pairs`、`StakeAmount`、`Database`、`APIServer`…）。
 - 调用 `core.SetRunEnv`、写 `core.ExgName/Market/ContractType/ConcurNum`。
 - 调用 `initExgAccs`，写 `btime.LocShow`（时区）。
-- 调用 `GetExchangeProxy` 并 `banexg.SetProxy`（进程级 HTTP 代理，所有后续 `NewHttpClient` 继承）。
+- 调用 `GetExchangeProxy` 并 `banexg.SetProxy`（进程级 HTTP 代理，所有后续 `NewHttpClient` 继承）；无代理时调用 `SetProxy("no")`。所有 `bex.New` 调用（`exg/biz.go` `createConfigured`、`config/exchange_capabilities.go`）都显式传 `Proxy` 选项，避免 banexg 在 `Init` 中再次探测系统代理并报错。
 - 调用 `SetRunPolicy` 写 `RunPolicy` 全局。
 
 唯一的业务调用方是 `biz/biz.go:60`。`LoadConfig` 在 `Loaded==true` 时直接返回，不会用新参数重新安装。

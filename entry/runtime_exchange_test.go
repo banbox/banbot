@@ -117,7 +117,7 @@ func TestInitializeExplicitExchangeUsesSnapshotBracketsAndLogsFallback(t *testin
 	}
 }
 
-func TestInitializeExplicitExchangeMissingCredsIsWarning(t *testing.T) {
+func TestInitializeExplicitExchangeMissingCredsIsDebug(t *testing.T) {
 	var output bytes.Buffer
 	logger := zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewProductionEncoderConfig()), zapcore.AddSync(&output), zap.DebugLevel))
 	stub := &explicitExchangeStub{info: &banexg.ExgInfo{MarketType: banexg.MarketLinear}, contract: true}
@@ -129,8 +129,8 @@ func TestInitializeExplicitExchangeMissingCredsIsWarning(t *testing.T) {
 		t.Fatalf("default brackets not initialized, init=%d", stub.initCalls)
 	}
 	text := output.String()
-	if !strings.Contains(text, "warn") || strings.Contains(text, "error") {
-		t.Fatalf("missing creds should log a warning only: %s", text)
+	if !strings.Contains(text, "debug") || strings.Contains(text, "warn") || strings.Contains(text, "error") {
+		t.Fatalf("missing creds should log at debug level only: %s", text)
 	}
 }
 

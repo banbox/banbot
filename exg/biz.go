@@ -127,6 +127,9 @@ func createConfigured(name, market, contractType string, exchangeConfig *config.
 	if env == core.RunEnvTest {
 		options[banexg.OptEnv] = env
 	}
+	if _, ok := options[banexg.OptProxy]; !ok {
+		options[banexg.OptProxy] = config.ExchangeProxyOption(exgOpts)
+	}
 	exchange, err := bex.New(name, options)
 	if err != nil {
 		return exchange, err

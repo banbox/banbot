@@ -526,8 +526,11 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 		}
 	}
 	// 解析交易所代理配置，设置全局代理，后续所有banexg.NewHttpClient()自动继承
-	if proxyUrl, proxyErr := GetExchangeProxy(Exchange.Name); proxyErr == nil && proxyUrl != "" {
-		if setErr := banexg.SetProxy(proxyUrl); setErr != nil {
+	if proxyUrl, proxyErr := GetExchangeProxy(Exchange.Name); proxyErr == nil {
+		if proxyUrl == "" {
+			// Explicitly no proxy: stops banexg from probing the system proxy again.
+			_ = banexg.SetProxy("no")
+		} else if setErr := banexg.SetProxy(proxyUrl); setErr != nil {
 			return setErr
 		}
 	}

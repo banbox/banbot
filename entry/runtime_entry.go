@@ -170,8 +170,8 @@ func initializeExplicitExchange(exchange banexg.BanExchange, snapshot *config.Sn
 		return nil
 	} else if logger != nil {
 		if err.Code == errs.CodeCredsRequired {
-			// Backtests and data commands normally run without API keys.
-			logger.Warn("no API credentials, use default leverage brackets for maint margin", zap.String("err", err.Short()))
+			// Backtests and data commands normally run without API keys; the default brackets are expected there.
+			logger.Debug("no API credentials, use default leverage brackets for maint margin", zap.String("err", err.Short()))
 		} else {
 			logger.Error("LoadLeverageBrackets fail, maint margin calculation may have large deviation", zap.String("err", err.Short()))
 		}

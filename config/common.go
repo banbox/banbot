@@ -1,15 +1,19 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
 	"math"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 func GetExchangeProxy(exgId string) (string, *errs.Error) {
@@ -17,21 +21,92 @@ func GetExchangeProxy(exgId string) (string, *errs.Error) {
 	if !ok {
 		return "", errs.NewMsg(errs.CodeParamInvalid, "no exchange found: %v", exgId)
 	}
-	proxyUrl := utils.GetMapVal(params, "proxy", "")
-	if proxyUrl == "" {
-		proxyUrl = utils.GetSystemEnvProxy()
-		if proxyUrl == "" {
-			prx, err := utils.GetSystemProxy()
-			if err != nil {
-				log.Error("GetSystemProxy fail, skip", zap.Error(err))
-			} else if prx != nil {
-				proxyUrl = fmt.Sprintf("%s://%s:%s", prx.Protocol, prx.Host, prx.Port)
-			}
-		}
-	} else if proxyUrl == "no" {
-		proxyUrl = ""
+	proxyUrl := ExchangeProxyOption(params)
+	if proxyUrl == "no" {
+		return "", nil
 	}
 	return proxyUrl, nil
+}
+
+// ExchangeProxyOption returns the value to pass as banexg's Proxy option.
+// It is always explicit: a proxy URL, or "no" when none applies. banexg treats
+// an empty Proxy as "probe the system proxy", and that probe logs an error on
+// machines where it fails, so banbot never leaves the option empty.
+func ExchangeProxyOption(params map[string]interface{}) string {
+	proxyUrl := utils.GetMapVal(params, "proxy", "")
+	if proxyUrl == "no" {
+		return "no"
+	}
+	if proxyUrl != "" {
+		return proxyUrl
+	}
+	if proxyUrl = detectSystemProxy(); proxyUrl != "" {
+		return proxyUrl
+	}
+	return "no"
+}
+
+var (
+	systemProxyOnce sync.Once
+	systemProxyURL  string
+)
+
+// detectSystemProxy resolves the system proxy once per process.
+func detectSystemProxy() string {
+	systemProxyOnce.Do(func() {
+		systemProxyURL = resolveSystemProxy()
+	})
+	return systemProxyURL
+}
+
+func resolveSystemProxy() string {
+	if proxyUrl := utils.GetSystemEnvProxy(); proxyUrl != "" {
+		return proxyUrl
+	}
+	if runtime.GOOS == "darwin" {
+		return macSystemProxy()
+	}
+	prx, err := utils.GetSystemProxy()
+	if err != nil {
+		log.Debug("read system proxy fail, skip", zap.Error(err))
+		return ""
+	}
+	if prx != nil {
+		return fmt.Sprintf("%s://%s:%s", prx.Protocol, prx.Host, prx.Port)
+	}
+	return ""
+}
+
+// macSystemProxy reads `scutil --proxy`. Unlike banexg's osascript probe it
+// needs no automation permission and does not depend on a GUI session.
+func macSystemProxy() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "scutil", "--proxy").Output()
+	if err != nil {
+		log.Debug("scutil --proxy fail, skip", zap.Error(err))
+		return ""
+	}
+	return parseScutilProxy(string(out))
+}
+
+// parseScutilProxy extracts the enabled HTTPS (preferred) or HTTP proxy from
+// `scutil --proxy` output, whose lines look like "HTTPSProxy : 127.0.0.1".
+func parseScutilProxy(out string) string {
+	values := make(map[string]string)
+	for _, line := range strings.Split(out, "\n") {
+		key, val, ok := strings.Cut(strings.TrimSpace(line), " : ")
+		if ok {
+			values[strings.TrimSpace(key)] = strings.TrimSpace(val)
+		}
+	}
+	for _, prefix := range []string{"HTTPS", "HTTP"} {
+		host, port := values[prefix+"Proxy"], values[prefix+"Port"]
+		if values[prefix+"Enable"] == "1" && host != "" && port != "" {
+			return fmt.Sprintf("http://%s:%s", host, port)
+		}
+	}
+	return ""
 }
 
 var (
