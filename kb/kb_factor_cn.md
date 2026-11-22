@@ -1,6 +1,6 @@
 # banbot 截面因子 / 多因子策略知识库
 
-范围：`engine: factor` 的截面因子、多因子合成、组合构建、研究、回放、实盘、结算。前提：已读时序策略文档（DataSeries/Kline、banexg 类型、通用配置、banta），本文不重复；配对统计套利见统计套利文档。基准 banbot v0.7.1。
+范围：`engine: factor` 的截面因子、多因子合成、组合构建、研究、回放、实盘、结算。前提：已读时序策略文档（DataSeries/Kline、banexg 类型、通用配置、banta），本文不重复；配对统计套利见统计套利文档。基准 banbot v0.7.6。
 
 ## 0. 总览
 
@@ -270,12 +270,13 @@ func RegisterRiskPortfolioBuilder(name string, config RiskBuilderConfig) error
 
 ```go
 type FactorContext struct { TimeFrame string; Params *Params }
-func (f FactorContext) Close() *factor.Node          // factor.Field("kline","close", TimeFrame)
-func (f FactorContext) Field(name string) *factor.Node
+func (f FactorContext) Open() / High() / Low() / Close() / Volume() / Quote() / BuyVolume() *factor.Node
+func (f FactorContext) Field(name string) *factor.Node               // factor.Field("kline", name, TimeFrame)
+func (f FactorContext) SourceField(source, name string) *factor.Node // 非 kline 数据源（如 "funding_rate"/"rate"、"open_interest"/"oi_value"、"premium_kline"/"close"；跨周期源自动无前视 AsOf 对齐）
 func (f FactorContext) RefField(symbol, name string) *factor.Node
 func (f FactorContext) RefSourceField(symbol, source, name string) *factor.Node
 func (f FactorContext) SubTF(sourceTF string, build func(FactorContext) *factor.Node, maxAge ...int64) *factor.Node
-func (f FactorContext) SectorCode() *factor.Node     // factor.SectorCode(TimeFrame)
+func (f FactorContext) SectorCode() *factor.Node                     // factor.SectorCode(TimeFrame)
 type FactorSpec struct { Outputs map[string]*factor.Node; Combine research.ComboSpec }
 func RegisterFactor(name string, build func(FactorContext) (FactorSpec, error)) error
 ```
@@ -486,6 +487,6 @@ run_policy:
 - 存储回放：去掉 `archive`，加 `exchange: {name: binance}`、`pairs`、`timerange: 20240101-20240601`、`data: {pit_policy: static-approximation}`。
 - 研究：去掉 `research: {labels: []}`；生命周期/批次：替换 `portfolio` 为 4.2 示例。
 
-## 10. 未确认点
+## 10. 边界说明
 
-仅代码核对、未实测：存储回放与 Hub 实盘（Hub 对资金费策略的限制未知）、嵌入式 banexg 绑定与自定义 provider、终局/期权到期记录格式、`retain_rank`/`dropout`/`group_quota`/`on_reselect`/`adopt`/`cooldown_bars`/`geometric`/`target-step` 数值行为、历史 IC 方法（仅验配置校验）；实盘只验到会话初始化。
+欧式期权现金结算与 `execution.history` 冷归档仅适用于 Events 纸面回放；实盘嵌入式绑定与自定义 `live_provider` 的传输/资金费能力见 §7.4。

@@ -1,6 +1,6 @@
 # banbot Time-Series Strategy Engine Reference (AI Edition)
 
-banbot time-series strategy (`engine: time_series`, default): interfaces, callbacks, order/position APIs, configuration, backtest vs live differences, pitfalls, examples. Baseline: banbot v0.7.1, banta v0.4.1, banexg v0.2.66. Cross-sectional factor and statistical arbitrage are separate engines.
+banbot time-series strategy (`engine: time_series`, default): interfaces, callbacks, order/position APIs, configuration, backtest vs live differences, pitfalls, examples. Baseline: banbot v0.7.6, banta v0.5.0, banexg v0.2.67. Cross-sectional factor and statistical arbitrage are separate engines.
 Each `(run_policy, timeframe, symbol)` maps to one `*strat.StratJob`, and every bar (or custom data event) triggers one callback.
 
 ## 0. Quick Start
@@ -32,7 +32,7 @@ Command `banbot <cmd> --config x.yml` (`--config` is repeatable; `--config-data`
 
 ### 1.2 Symbols and Markets
 - Symbols: spot `BASE/QUOTE`, contract `BASE/QUOTE:SETTLE` (delivery contracts carry an extra identifier segment). `core.SplitSymbol(pair) (base, quote, settle, id)`.
-- Market constants (banexg): `MarketSpot="spot" MarketMargin MarketLinear MarketInverse MarketOption MarketSwap MarketFuture`; config `market_type: spot|linear|inverse|option`, `contract_type: swap|future`.
+- Market constants (banexg): `MarketSpot="spot" MarketMargin MarketLinear MarketInverse MarketOption MarketSwap MarketFuture`; config `market_type: spot|linear|inverse|option`, `contract_type: swap|future`; to subscribe or trade same-exchange spot legs alongside linear perpetuals (e.g. `BTC/USDT` spot + `BTC/USDT:USDT` perp Cash-and-Carry), add root `extra_markets: [spot]` (spot legs are long-only with zero funding).
 - `*orm.ExSymbol`: `ID int32` (i.e. Sid), `Exchange`, `ExgReal`, `Market`, `Symbol`, `Combined bool`, `ListMs`, `DelistMs int64`, `AggRules string`. `s.Symbol` is the current job's symbol.
 - Strategies must not contain per-exchange special-case branches.
 
@@ -62,7 +62,7 @@ Constants: side `OdSideBuy="buy" OdSideSell="sell"`; order types `OdTypeMarket O
 ### 1.6 Configuration (common YAML parts)
 Layering: data-dir `config.yml` + `config.local.yml`, then overlaid by `--config`. Root keys (all optional):
 - `name`, `env`: bot name; prod/test/dry_run
-- `market_type`, `contract_type`, `leverage`: market, contract type, default leverage
+- `market_type`, `contract_type`, `leverage`, `extra_markets`: market, contract type, default leverage, extra markets (e.g. `[spot]`)
 - `stake_amount` / `stake_pct` / `max_stake_amt`: base amount per order (fiat); percentage (takes precedence over stake_amount); upper limit
 - `open_vol_rate`(1): upper ratio of order volume / average volume of the last 5 bars
 - `min_open_rate`(0.5), `low_cost_action`: order policy when the balance is insufficient
@@ -152,22 +152,23 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - Signed integer: positive = cross up, negative = cross down, 0 = no record; |value|−1 = number of bars since the latest cross. **A cross up on this bar is `1`, then `2,3,…`; cross down `-1,-2,…`**.
 - For events use `== 1`/`== -1`; `CrossUp()/CrossDown()` = `Cross>0/<0` is a **state** of "direction of the latest cross".
 - Recording starts **from the first time Cross is called on that Series**, history is not replayed; it must be called unconditionally on every bar.
-- Comparison target: `Series` (compares `Get(0)`, cache key is the other series' ID) or a constant (`int`/`float`, cache key `int(v*100)`; two constants differing by <0.01 may collide).
-
-**Float-constant cache collision**: when `Add/Sub/Mul/Div/Min/Max` receive a `float64` constant, the derived key is `int(v*10)`, so on the same series and bar `Add(0.11)` and `Add(0.14)` return the same cache. Workarounds: compute the scalar directly in Go, or use `int`/different derived names.
+- Comparison target: `Series` (compares `Get(0)`) or a numeric constant (`int`/`float64`, cache key hashes exact `math.Float64bits`, so distinct float constants never collide).
+- **Synthetic Bars (Renko / Range / Volume / Dollar Bars)**: store the builder (e.g. `ta.NewRenkoATR(14, 1.0)`, `ta.NewRangeBarPct(0.005)`, `ta.NewDollarBarBuilder(quoteThresh)`) inside `s.More`, and feed `1m`/`5m` main bars via `builder.UpdateFromEnv(e, func(renkoEnv *ta.BarEnv) { ... })`; `onBrick` fires causally for each completed synthetic bar where any `ta.*` indicator can be evaluated on `renkoEnv`.
 
 ### 2.3 Indicator List
 Conventions: signatures omit the package name. **Go has no default parameters, so you must pass them explicitly** (only the variadic params of `CCI`, `ADX`, `DMI`, `StochF/STOCHF` have implicit defaults); `〔…〕` denotes default/common parameter values.
-**(full)** = on every new bar, copies the entire Series history (1500~2249 bars) and fully recomputes with the `tav` vector version to take the last value: O(history) with allocations (at ~2000 bars Fisher ≈ 32µs/call, SMA < 0.1µs/call); overhead is bounded, but control it for many symbols × many timeframes × many calls; repeated calls on the same bar are still computed only once. Window-type ones (Fisher, WilliamsPercent, KST, Ichimoku, DonchianPBand, Correlation) are unaffected by Cut; **recursive ones (Supertrend, PMAX, Keltner*, VIDYA, SSF, MAMA, DX, etc.) have values that depend on the window start**, so after Cut they differ slightly from full-history computation.
+All standard recursive and sliding-window indicators are O(1)/O(W) incremental state machines, and multi-input caches hash every input `*Series` identity plus exact `math.Float64bits` parameter values (distinct input combinations or float constants never collide); only a few legacy compatibility wrappers marked **(full)** recompute over history (prefer their standard incremental counterparts).
 
-**Price and Composite**
+**Price, Composite and Synthetic Bars**
 
 - `AvgPrice(e *BarEnv)`: (H+L+C)/3
 - `HL2(h,l)`, `HLC3(h,l,c)`, `HLCC4(h,l,c)`, `OHLC4(o,h,l,c)`: (H+L)/2, (H+L+C)/3, (H+L+2C)/4, (O+H+L+C)/4
 - `Abs(a)`, `Change(a)`, `Sub(a,b)`: \|a\|, a−a[1], a−b
 - `HeikinAshi(e) (ho,hh,hl,hc *Series)`: Heikin-Ashi candles
+- `NewRenkoFixed(brickSize float64)`, `NewRenkoPct(pct float64)`, `NewRenkoATR(atrPeriod int, atrMult float64) *RenkoBuilder`: fixed, percentage, or dynamic ATR Renko builders (feed via `.UpdateFromEnv(srcEnv, onBrick)`)
+- `NewRangeBarBuilder(rangeSize float64)`, `NewRangeBarPct(pct float64) *RangeBarBuilder`, `NewVolumeBarBuilder(volumeThreshold float64) *VolumeBarBuilder`, `NewDollarBarBuilder(quoteThreshold float64) *DollarBarBuilder`: causal Range, Volume, and Dollar synthetic bar builders
 
-**Moving Averages**
+**Moving Averages and Online Filters**
 
 - `SMA(obj, period)`: simple mean; NaN when valid values are fewer than period
 - `EMA(obj, period)`: = `EMABy(obj,period,0)`, α=2/(n+1)
@@ -180,30 +181,35 @@ Conventions: signatures omit the package name. **Go has no default parameters, s
 - `T3(obj, period)`: Tillson T3, vFactor fixed at 0.7
 - `TRIMA(obj, period)`: SMA(SMA(obj,(p+1)/2), p/2+1)
 - `ZLMA(obj, period)`: zero-lag EMA: EMA(obj+obj−obj[(p−1)/2])
-- `VIDYA(obj, period)`: variable-length EMA with α=2/(p+1) modulated by \|CMO\|, first value SMA (full)
+- `VIDYA(obj, period)`: variable-length EMA with α=2/(p+1) modulated by \|CMO\|, first value SMA
 - `KAMA(obj, period)` 〔10〕: = `KAMABy(obj,period,2,30)`
 - `KAMABy(obj, period, fast, slow int)` 〔10, 2, 30〕: adaptive by efficiency ratio ER; NaN when ER is not ready
 - `ALMA(obj, period int, sigma, distOff float64)` 〔10, 6.0, 0.85〕: Arnaud Legoux Gaussian-weighted MA
-- `SSF(obj, period)`: Ehlers two-pole super smoother filter (full)
+- `McGinleyDynamic(src, period)`: McGinley adaptive dynamic moving average
+- `SSF(obj, period)`: Ehlers two-pole SuperSmoother filter
+- `Butterworth2(src, period)`, `GaussianFilter(src, period, poles int)`〔poles 1..4〕, `LaguerreFilter(src, gamma float64)`〔0..1〕: 2-pole Butterworth, multi-pole Gaussian, and Ehlers Laguerre low-lag filters
+- `Kalman1D(src, processNoise, measNoise float64)`, `KalmanTrend(src, processNoise, measNoise float64) (level, velocity)` 〔common 0.01, 0.1〕: 1D random-walk and 2D local linear trend (level + velocity) online Kalman filters
 - `SWMA(obj)`: fixed 4-point weights (1,2,2,1)/6
-- `MAMA(obj, fast, slow float64) (m, f)`: **not Ehlers MAMA/FAMA**: p=max(1,round((fast+slow)/2)); m=EMA(obj,p), f=EMA(m,p) (full). With fast/slow=0.5/0.05, p=1 and m is the original series
+- `EhlersMAMA(obj, fastLimit, slowLimit float64) (mama, fama)` 〔0.5, 0.05〕: standard Ehlers Hilbert-phase adaptive MAMA/FAMA (legacy `MAMA(obj, fast, slow)` is a simplified compatibility helper (full); prefer `EhlersMAMA`)
 - `VWMA(price, vol, period)` 〔20〕: Σ(price·vol)/Σvol, rolling window
-- `VWAP(first, second *Series, rest ...*Series)`: cumulative VWAP, no period, no intraday reset; 2 args (close, volume), 4 args (high, low, close, volume)
+- `VWAP(first, second *Series, rest ...*Series)`: cumulative unanchored VWAP; for session-anchored daily/weekly resets use `SessionVWAP`/`SessionVWAPBands`/`WeeklyVWAP` below
 - `Sum(obj, period)`: rolling sum, skips NaN; NaN when valid values are fewer than period
 
 **Momentum and Oscillators**
 
 - `RSI(obj, period)` 〔14〕: Wilder RSI 0~100; the first period deltas are initialized with a simple mean
 - `RSI50(obj, period)`: RSI−50
+- `LaguerreRSI(src, gamma float64)` 〔0.5〕: Ehlers 4-stage Laguerre RSI (`0~100`)
 - `ROC(obj, period)` 〔9〕: (close−close[n])/close[n]×100
 - `ROCR(obj, period)`: close/close[n] (ratio, not percentage); NaN when the denominator is 0/NaN
 - `MOM(obj, period)`: close−close[period]
+- `PPO(src, fast, slow, signal int) (ppo, sig, hist)` 〔12, 26, 9〕: Percentage Price Oscillator
 - `CMO(obj, period)` 〔9〕: = `CMOBy(obj,period,0)`
 - `CMOBy(obj, period, maType int)` 〔9, 0〕: Chande momentum oscillator −100~100; 0 = TA-Lib Wilder smoothing, 1 = TradingView simple sum
 - `RMI(obj, period, montLen int)` 〔14, 3〕: relative momentum index 0~100 (RMA smoothing of montLen up/down moves)
 - `CRSI(obj, period, upDn, roc int)` 〔3, 2, 100〕: Connors RSI = `CRSIBy(...,0)`
 - `CRSIBy(obj, period, upDn, roc, vtype int)` 〔3, 2, 100, 0〕: (RSI + RSI of UpDown + rank)/3; vtype 0 = PercentRank of ROC(1), 1 = ROC(roc)
-- `PercentRank(obj, period)`: within the window (period bars, including current), the count of values **excluding current** that are ≤ the current value ×100/**period** (max (period−1)/period×100); NaN if the window is insufficient
+- `PercentRank(obj, period)`: within the window (period bars, including current), count of prior values ≤ current ×100/period; NaN if insufficient
 - `TD(obj)`: DeMark sequential count (compares with 4 bars ago, accumulates in the same direction, resets on reversal), first 4 bars NaN
 - `UpDown(obj, vtype int)`: consecutive up/down count; 0 = TradingView convention, 1 = classic ±1 only
 - `KDJ(high, low, close, period, sm1, sm2 int) (K, D, RSV)` 〔9, 3, 3〕: RMA smoothing
@@ -213,17 +219,18 @@ Conventions: signatures omit the package name. **Go has no default parameters, s
 - `StochF(high, low, close, period int, smooth ...int) (fastK, fastD)` 〔smooth omitted or ≤0 = 3〕: fastK raw value, fastD=SMA(K,smooth)
 - `STOCHF(close, high, low, period int, smooth ...int)` 〔same as StochF〕: parameter order close,high,low
 - `StochRSI(obj, rsiLen, stochLen, maK, maD int) (fastK, fastD)` 〔14,14,3,3〕: RSI→Stoch→SMA(maK)→SMA(maD)
-- `WillR(e *BarEnv, period)` 〔14〕: Williams %R −100~0; reads High/Low/Close of e, does not accept Series
-- `WilliamsPercent(high, low, close, period)`: same %R: −100·(HH−close)/(HH−LL), window includes current (full)
+- `WillR(e *BarEnv, period)`, `WillRHL(high, low, close *Series, period int)`, `WilliamsPercent(high, low, close, period)` 〔14〕: Williams %R −100~0 (`WillR` reads `BarEnv`; `WillRHL`/`WilliamsPercent` accept `*Series`)
 - `CCI(obj, args ...interface{})` 〔period 20〕: `CCI(close, period)`; `CCI(high, low, close, period)` uses HLC3; (src−SMA)/(0.015·AvgDev)
 - `AO(high, low, fast, slow int)`: SMA(HL2,fast)−SMA(HL2,slow)
 - `DPO(obj, period)`, `Dpo`: pandas-ta non-centered: close−SMA(close,period) lagged by floor(period/2)+1 bars
-- `Fisher(high, low, period)`: x=2·((H+L)/2−LL)/(HH−LL)−1 (window includes current) clipped to ±0.999, outputs 0.5·ln((1+x)/(1−x)). **No 0.33/0.67 recursive smoothing, no signal line**; NaN when HH==LL or for the first period−1 bars (full)
+- `FisherTransform(high, low, period) (fisher, trigger)` 〔9〕: standard Ehlers 0.33/0.67 smoothed Fisher Transform with 1-bar `trigger` signal line (legacy `Fisher(high, low, period)` is unsmoothed single-line)
+- `WaveTrend(high, low, close, chLen, avgLen, maLen int) (wt1, wt2)` 〔10, 21, 4〕: LazyBear WaveTrend oscillator
+- `QQE(src, rsiPeriod, sf int, wp float64) (rsiMA, trailing, dir)` 〔14, 5, 4.236〕: Quantitative Qualitative Estimation smoothed RSI trailing bands & direction `±1`
 - `ULTOSC(high, low, close, short, medium, long int)` 〔7, 14, 28〕: ultimate oscillator, weights 4/2/1
 - `TRIX(obj, period)`: single-bar percentage change of the triple EMA, no signal line
 - `TSI(obj, short, long int)`: EMA(EMA(Δ,short),long)/EMA(EMA(\|Δ\|,short),long)×100
-- `STC(obj, period, fast, slow int, alpha float64)` 〔12, 26, 50, 0.5〕: Schaff trend cycle 0~100: MACD→period-window percentile→α smoothing→period-window percentile→α smoothing; 0 when the window is flat; NaN input resets state; incremental
-- `KST(obj, r1,r2,r3,r4, s1,s2,s3,s4 int)` 〔common 10,15,20,30,10,10,10,15〕: Σ wᵢ·SMA(ROC(rᵢ)%, sᵢ), weights 1,2,3,4; **no signal line**; first valid value at max(rᵢ+sᵢ)−1 (full)
+- `STC(obj, period, fast, slow int, alpha float64)` 〔12, 26, 50, 0.5〕: Schaff trend cycle 0~100
+- `KST(obj, r1,r2,r3,r4, s1,s2,s3,s4 int)` 〔common 10,15,20,30,10,10,10,15〕: Σ wᵢ·SMA(ROC(rᵢ)%, sᵢ), weights 1,2,3,4; **no signal line**
 - `CTI(obj, period)` 〔20〕: correlation trend indicator −1~1 (linear-regression correlation)
 - `Stiffness(obj, maLen, stiffLen, stiffMa int)` 〔100, 60, 3〕: 0~100: bound=SMA−0.2·StdDev, count bars within stiffLen where close>bound, then EMA(stiffMa)
 - `DV2(h, l, c, period, maLen int)` 〔252, 2〕: bounded DV2 0~100, percentile rank of the maLen average (not the backtrader version)
@@ -235,60 +242,63 @@ Conventions: signatures omit the package name. **Go has no default parameters, s
 - `MACDBy(obj, fast, slow, smooth, initType int)` 〔initType 0〕: 0 = SMA initialization (international convention), 1 = first valid value (Chinese/MyTT convention)
 - `ADX(high, low, close, period int, smoothing ...int)` 〔14; smoothing omitted/0 = period〕: classic ADX
 - `ADXBy(high, low, close, period, smoothing, method int)` 〔14, 0, 0〕: method 0: RMA-smoothed DX; 1: SMA-smoothed DX
-- `DX(high, low, close, period)`: **non-standard**: per-bar \|+DM−(−DM)\|/(+DM+(−DM))×100, raw DM unsmoothed, noisy; for the smoothed version use `ADX`/`DMI` (full)
+- `WilderDX(high, low, close, period)` 〔14〕: standard Wilder RMA-smoothed directional index DX (legacy `DX` is unsmoothed single-bar (full); prefer `WilderDX`/`ADX`/`DMI`)
 - `DMI(high, low, close, period int, smoothing ...int) (+DI, −DI, ADX)` 〔smoothing omitted = period〕: smoothing applies only to ADX, DI uses period
-- `PluMinDI(high, low, close, period) (+DI, −DI)` 〔14〕: Wilder convention
-- `PluMinDM(high, low, close, period) (+DM, −DM)` 〔14〕: Wilder smoothed sums
-- `Aroon(high, low, period) (Up, Osc, Dn)`: Up=(period−HighestBar(period+1))/period×100, Dn likewise using LowestBar; Osc=Up−Dn
-- `AroonOsc(high, low, period)`, `AROONOSC`: Up−Dn, −100~100
-- `SAR(high, low, step, max float64)`, `PSAR` 〔0.02, 0.2〕: parabolic SAR (TA-Lib convention): AF starts at step, +step on each new extreme, capped at max; first bar NaN, from the second bar the low of that bar is the initial SAR (initially rising); on reversal SAR takes the previous extreme point; returns a **price**
-- `Supertrend(high, low, close, period int, multiplier float64)` 〔common 10, 3〕: returns the **trend line price, not direction**: lower band in an uptrend, upper band in a downtrend; (H+L)/2±mult·ATR ratchet, flips when close crosses the opposite band; initially up if close≥(H+L)/2. Determine direction via `line < close` (bullish) (full)
-- `PMAX(high, low, close, period int, multiplier float64) (line, dir)` 〔common 10, 3〕: EMA(close,period)±mult·ATR(period) ratchet line (MA period = ATR period, cannot be specified separately), flips when MA crosses the line; dir=+1 up (line is the lower band) / −1 down (upper band) (full)
-- `Ichimoku(high, low, close, conversion, base, span int) (conv, base, spanA, spanB, lag)` 〔9, 26, 52〕: conv/base = window (HH+LL)/2; spanA=(conv+base)/2; spanB = span-window (HH+LL)/2; lag=**close[i−base]** (`Close.Get(base)`). **spanA/spanB are not shifted forward by base bars** (to compare against the "current cloud" take `Back(base)` yourself); conv is NaN for the first conversion−1 bars, spanB for the first span−1 bars (full)
-- `UTBot(c, atr *Series, rate float64)` 〔rate commonly 1〕: signal (**event, non-zero only on the breakout bar**): 1=buy, −1=sell, 0=none; fires when the trailing stop line c±atr·rate is crossed, the line is not exposed. atr must be passed in by yourself (e.g. `ta.ATR(...)`); cache and state are attached to atr, keyed by rate
-- `LinReg(obj, period)`: linear regression endpoint value
-- `LinRegAdv(obj, period int, angle, intercept, degrees, r, slope, tsf bool)` 〔all false = endpoint value〕: flags choose the output, priority slope>intercept>angle>r>tsf>endpoint value
-- `LinearRegAngle(obj, period)`, `LINEARREG_ANGLE`: atan of the regression slope, in degrees; first period−1 bars NaN
-- `Slope(obj, period)`: least-squares slope
-- `Correlation(a, b, period)`: Pearson correlation (full)
-- `CHOP(e *BarEnv, period)` 〔14〕: choppiness index; reads High/Low/Close of e; higher = choppier, lower = more trending
+- `PluMinDI(high, low, close, period) (+DI, −DI)`, `PluMinDM(high, low, close, period) (+DM, −DM)` 〔14〕: Wilder convention
+- `Vortex(high, low, close, period) (viPlus, viMinus)` 〔14〕: Vortex indicator VI+/VI−
+- `Aroon(high, low, period) (Up, Osc, Dn)`, `AroonOsc(high, low, period)`, `AROONOSC`: Up−Dn, −100~100
+- `SAR(high, low, step, max float64)`, `PSAR` 〔0.02, 0.2〕: parabolic SAR (TA-Lib convention); returns a **price**
+- `Supertrend(high, low, close, period int, multiplier float64)`, `SupertrendDir(high, low, close, period int, multiplier float64) (line, dir)` 〔common 10, 3〕: `Supertrend` returns trend line price; `SupertrendDir` also returns direction (`+1` long / `-1` short)
+- `ChandelierExit(high, low, close, period int, mult float64) (longStop, shortStop, dir)` 〔22, 3.0〕: Chandelier trailing stops and ratchet direction `±1`
+- `SSLChannel(high, low, close, period) (sslUp, sslDown)` 〔10〕: high/low SMA channel flip lines
+- `Alligator(src, jawLen, teethLen, lipsLen, jawOff, teethOff, lipsOff int) (jaw, teeth, lips)` 〔13, 8, 5, 8, 5, 3〕, `Fractals(high, low, n int) (upFractal, downFractal)` 〔2, right-confirmed causal〕: Bill Williams Alligator and Fractals
+- `ElderRay(high, low, close, period) (bullPower, bearPower)` 〔13〕, `WaddahAttar(close, fast, slow, bbLen int, bbMult, mult float64) (trend, explosion)` 〔20, 40, 20, 2.0, 150〕: Elder-Ray bull/bear power and Waddah Attar Explosion
+- `PMAX(high, low, close, period int, multiplier float64) (line, dir)` 〔common 10, 3〕: EMA(close,period)±mult·ATR(period) ratchet line and direction `±1`
+- `Ichimoku(high, low, close, conversion, base, span int) (conv, base, spanA, spanB, lag)` 〔9, 26, 52〕: **spanA/spanB are not shifted forward by base bars** (take `Back(base)` to compare against the current cloud)
+- `UTBot(c, atr *Series, rate float64)` 〔rate commonly 1〕: breakout event signal (1=buy, −1=sell, 0=none)
+- `LinReg(obj, period)`, `LinRegAdv(obj, period int, angle, intercept, degrees, r, slope, tsf bool)`, `LinearRegAngle(obj, period)`/`LINEARREG_ANGLE`, `Slope(obj, period)`, `RSquare(src, period)`: linear regression endpoint, slope, angle, and R²
+- `Correlation(a, b, period)`, `RollingBeta(y, x, period) (beta, alpha)`: rolling Pearson correlation and OLS beta/alpha
+- `CHOP(e *BarEnv, period)`, `CHOPHLC(high, low, close *Series, period int)` 〔14〕: Choppiness Index (higher = choppier, lower = trending)
 
-**Volatility and Channels**
+**Volatility, Channels and Session-Anchored VWAP/Pivots**
 
-- `TR(high, low, close)`: true range, first bar NaN
-- `ATR(high, low, close, period)` 〔14〕: = RMA(TR, period)
-- `NATR(high, low, close, period)`: 100·ATR/close
-- `StdDev(obj, period)`, `STDDEV` 〔20〕: = `StdDevBy(obj,period,0)` population standard deviation
-- `StdDevBy(obj, period, ddof int) (stddev, mean)` 〔ddof 0〕: variance divided by (period−ddof)
-- `AvgDev(obj, period)`: Σ\|x−SMA\|/period
-- `BBANDS(obj, period int, stdUp, stdDn float64) (upper, mid, lower)` 〔20, 2, 2〕: mid=SMA
-- `Donchian(high, low, period) (upper, middle, lower)`: window includes the current bar
-- `DonchianPBand(high, low, close, period)`: (close−lower)/(upper−lower), position within the channel, NaN when width is 0; cache attached only to close (full)
-- `KeltnerChannel(high, low, close, period int, multiplier float64) (upper, mid, lower)`: EMA(close,period) ± mult·ATR(period) (full)
-- `KeltnerWBand(high, low, close, period int, mult float64)`: (upper−lower)/mid relative bandwidth (full)
-- `Squeeze(high, low, close, period)`: TTM squeeze: 1 if BB (SMA±2σ population) is fully inside KC, else 0; KC=SMA±1.5×window-average TR (SMA convention); NaN when history is insufficient
-- `Highest/Lowest(obj, period)`: highest/lowest over the period including the current bar
-- `HighestBar/LowestBar(obj, period)`: offset of the highest/lowest value from the current bar (0 = current)
+- `TR(high, low, close)`, `ATR(high, low, close, period)` 〔14〕, `NATR(high, low, close, period)`: true range, Wilder ATR, and percentage ATR
+- `StdDev(obj, period)`/`STDDEV` 〔20〕, `StdDevBy(obj, period, ddof int) (stddev, mean)`, `AvgDev(obj, period)`: standard deviation and mean absolute deviation
+- `ParkinsonVol(high, low, period)`, `GarmanKlassVol(open, high, low, close, period)`, `YangZhangVol(open, high, low, close, period)`: range-based and jump-adjusted OHLC historical volatility estimators
+- `BBANDS(obj, period int, stdUp, stdDn float64) (upper, mid, lower)` 〔20, 2, 2〕: Bollinger Bands
+- `Donchian(high, low, period) (upper, middle, lower)`, `DonchianPBand(high, low, close, period)`: Donchian channel and relative band position
+- `KeltnerChannel(high, low, close, period int, multiplier float64) (upper, mid, lower)`, `KeltnerWBand(high, low, close, period int, mult float64)`: Keltner channel and relative bandwidth
+- `Squeeze(high, low, close, period)`, `SqueezeMomentum(high, low, close, bbLen int, bbMult float64, kcLen int, kcMult float64) (val, squeezeOn)` 〔20, 2.0, 20, 1.5〕: TTM Squeeze flag and LazyBear momentum histogram (`squeezeOn`: `1`=on / `0`=off)
+- `SessionVWAP(e *BarEnv, anchorMinutesUTC int)`, `SessionVWAPBands(e *BarEnv, anchorMinutesUTC int, mult float64) (vwap, upper, lower)`, `WeeklyVWAP(e *BarEnv)`: UTC session-anchored daily VWAP / std bands (e.g. `0`, `480`, `810`) and UTC-Monday weekly VWAP (safely degrades to typical price on `>=1d` bars)
+- `DailyPivotPoints(e *BarEnv, method string, anchorMinutesUTC int) (p, r1, s1, r2, s2, r3, s3)`: zero-lookahead daily pivots from the prior completed anchored session (`method`: `"classic"`/`"fibonacci"`/`"camarilla"`/`"woodie"`/`"demark"`)
+- `Highest/Lowest(obj, period)`, `HighestBar/LowestBar(obj, period)`: highest/lowest over period (including current) and bar offset
 
-**Volume**
+**Volume, OrderFlow / CVD and Volume Profile**
 
-- `OBV(close, volume)`: cumulative on-balance volume: add on up, subtract on down
-- `ADL(env)`: cumulative A/D line, reads env.Volume
-- `ADOSC(env, fast, slow int)`: EMA(ADL,fast)−EMA(ADL,slow)
-- `ChaikinOsc(env, shortLen, longLen int)` 〔3, 10〕: same convention as ADOSC
-- `CMF(env, period)` 〔20〕: Σ(MFV)/Σvolume −1~1; bars with volume≤0 output NaN
-- `MFI(e, period)` 〔14〕: money flow index 0~100, typical price × env.Volume
-- `EFI(env, period)`: Elder force index: EMA(period) of (per-bar close change × volume), first bar NaN
-- `VPCI(close, volume, period)`: **misnamed**: only VWMA(close,volume,period)−SMA(close,period) (price-volume MA difference), not the full VPCI (full)
+- `OBV(close, volume)`: cumulative on-balance volume
+- `ADL(env)`, `ADLHLCV(high, low, close, volume *Series)`, `ADOSC(env, fast, slow int)`, `ChaikinOsc(env, shortLen, longLen int)` 〔3, 10〕: Accumulation/Distribution line and Chaikin oscillator
+- `CMF(env, period)`, `CMFHLCV(high, low, close, volume *Series, period int)` 〔20〕: Chaikin Money Flow −1~1
+- `MFI(e, period)`, `MFIHLCV(high, low, close, volume *Series, period int)` 〔14〕: Money Flow Index 0~100
+- `EFI(env, period)`, `EFICV(close, volume *Series, period int)`: Elder Force Index
+- `StandardVPCI(close, volume, shortPeriod, longPeriod int)` 〔5, 20〕: standard Buff Dormeier Volume Price Confirmation Indicator (legacy `VPCI(close, volume, period)` is a simplified MA diff (full))
+- `RollingVolumeProfile(high, low, close, volume, period, numBins int, valueAreaPct float64) (poc, vah, val)` 〔100, 24, 0.70〕: rolling Volume Profile Point of Control (POC) and Value Area High/Low (VAH/VAL)
+- `VolumeDelta(volume, buyVolume)` / `EnvVolumeDelta(e)`, `CVD(volume, buyVolume)` / `EnvCVD(e)`, `RollingCVD(volume, buyVolume, period)` / `EnvRollingCVD(e, period)`, `SessionCVD(e, anchorMinutesUTC int)`: taker net volume delta (`2*BuyVolume - Volume`) and cumulative/rolling/session-anchored CVD
+- `TakerBuyRatio(volume, buyVolume, period)` / `EnvTakerBuyRatio(e, period)`, `AvgTradeQuote(quote, tradeNum, period)` / `EnvAvgTradeQuote(e, period)`, `AvgTradeSize(volume, tradeNum, period)` / `EnvAvgTradeSize(e, period)`: rolling taker buy ratio and average trade quote/size
+
+**Rolling Statistics, Fractals/Entropy, Regime Classifiers and Pine State Helpers**
+
+- `ZScore(src, period)`, `Skew(src, period)`, `Kurt(src, period)`, `RollingQuantile(src, period int, q float64)`: rolling z-score, sample skewness, excess kurtosis, and exact quantile (`q=0.5` median)
+- `Hurst(src, period)`, `FDI(src, period)`, `ShannonEntropy(src, period, numBins int)` 〔numBins commonly 10〕: rescaled-range Hurst exponent (`<0.5` mean-reverting, `>0.5` trending), Fractal Dimension Index (`1~2`), and normalized 1st-diff Shannon entropy (`0~1`)
+- `LorentzianKNN(close, f1, f2, f3, f4 *Series, lookback, k, horizon, stride int)` 〔common 200, 8, 4, 1〕, `RollingKMeans3(src, period, maxIter int) (cluster, lowC, midC, highC)` 〔common 100, 15〕: causal rolling Lorentzian distance k-NN vote and 1D 3-regime k-Means clustering (`cluster`: `0/1/2` low/mid/high)
+- `BarsSince(cond)`, `ValueWhen(cond, src, occurrence int)`〔`0` = most recent non-zero non-NaN〕, `Cum(src)`, `Rising(src, length int)`, `Falling(src, length int)`: Pine `ta.barssince` / `ta.valuewhen` / `ta.cum` / `ta.rising` / `ta.falling` stateful primitives
 
 **Patterns and Pivots**
 
-- `PivotHigh/PivotLow(src, left, right int)`: outputs the pivot high/low after confirmation by the right-side `right` bars, otherwise NaN, lagging by right bars
-- `CDL3INSIDE/CDL3LINESTRIKE/CDL3OUTSIDE/CDLENGULFING(open, high, low, close)`: three inside / three-line strike / three outside / engulfing; 100/−100/0
-- `CDLDRAGONFLYDOJI/CDLGRAVESTONEDOJI(open, high, low, close)`: dragonfly / gravestone doji; 100/0
-- `CDLHAMMER/CDLHANGINGMAN/CDLMORNINGSTAR/CDLSHOOTINGSTAR(open, high, low, close)`: hammer / hanging man / morning star / shooting star; only 100/0, no trend-context check (morning star does not check gap and penetration)
+- `PivotHigh/PivotLow(src, left, right int)`: outputs the pivot high/low after confirmation by `right` bars, otherwise NaN, lagging by `right` bars
+- `CDL3INSIDE/CDL3LINESTRIKE/CDL3OUTSIDE/CDLENGULFING/CDLHARAMI(open, high, low, close)`: three inside / three-line strike / three outside / engulfing / harami; `100`/`−100`/`0`
+- `CDLMARUBOZU(o, h, l, c)`, `CDL3WHITESOLDIERS(o, h, l, c)`, `CDL3BLACKCROWS(o, h, l, c)`, `CDLPIERCING(o, h, l, c)`, `CDLDARKCLOUDCOVER(o, h, l, c)`, `CDLEVENINGSTAR(o, h, l, c)`: marubozu / three white soldiers / three black crows / piercing / dark cloud cover / evening star
+- `CDLDOJI(o, h, l, c)`, `CDLDRAGONFLYDOJI(o, h, l, c)`, `CDLGRAVESTONEDOJI(o, h, l, c)`, `CDLHAMMER(o, h, l, c)`, `CDLHANGINGMAN(o, h, l, c)`, `CDLMORNINGSTAR(o, h, l, c)`, `CDLSHOOTINGSTAR(o, h, l, c)`: doji / dragonfly / gravestone / hammer / hanging man / morning star / shooting star
 
-Multi-input indicators attach their cache to only one of the inputs (`HLC3`/`AvgPrice`/`DonchianPBand`/`Supertrend`/`Fisher` (attached to high)/`UTBot` (attached to atr), etc.): the same attached series paired with different other inputs hits stale values, so the input combination must stay fixed.
 The Chan-theory graph structures in `chanlun.go` (CGraph/CPoint/CPen/CSeg/CCentre/CTrend) are not numeric indicators and are not expanded here.
 
 ## 3. Strategy Structure and Callbacks
@@ -501,7 +511,7 @@ Designed for multi-asset risk-parity trend CTA, cross-sectional selection + per-
     - `Tag string`: entry/exit signal tag (default `"rebalance"`).
     - `DriftThreshold float64`: no-trade weight drift buffer (default `0.02` = 2% of equity; skips micro-adjustments when current and target weights share the **same non-zero sign** and `|target - cur| < DriftThreshold`; opening from flat is never blocked by the drift buffer; pass `< 0` to disable).
     - `MaxGrossExposure float64`: gross exposure cap (`> 0` proportionally scales all target weights down whenever `Σ|w| > MaxGrossExposure`).
-    - `StopLossRate` / `TakeProfitRate` / `CallbackPct` / `Leverage float64`: automatically attaches per-symbol protective stop-loss distance (`enterPrice * StopLossRate` via `StopLossVal`), take-profit distance, trailing callback percentage `[0.1, 10]`, and leverage to newly opened / scaled-in orders.
+    - `StopLossRate` / `TakeProfitRate` / `CallbackPct` / `Leverage float64`: automatically attaches per-symbol protective stop-loss distance (`enterPrice * StopLossRate` via `StopLossVal`), take-profit distance, trailing callback percentage `[0.05, 50]`, and leverage to newly opened / scaled-in orders.
   - **Two-pass execution order**:
     1. Pass 1 scans all `jobs`: closes flat targets (`0`), closes opposite-direction positions on reversals before queueing the full new-side target, and partially closes overweight same-direction positions (`|target| < |cur| - DriftThreshold`) with `ExitRate = (|cur| - |target|) / |cur|` so margin is released first.
     2. Pass 2 sorts new entries and same-direction top-ups (`|target| > |cur| + DriftThreshold`) by `LegalCost = AccountEquity() * deltaWeight` **descending** (tie-broken deterministically by neutral `strat.BarPriority(barMS, symbol, seed)` then symbol) before calling `OpenOrder`, silently skipping sub-`core.MinStakeAmount` (`5.5`) dust orders (`SkippedDustCount`).
@@ -615,14 +625,14 @@ OnData: strat.RouteData(strat.DataHandlers{
 1. **OnData and OnBar/OnInfoBar cannot be set together** (build panic); new strategies use only `OnData`+`RouteData`; do not simply rename `OnBar` to `OnData` (Main and Info must be distinguished).
 2. **Compute indicators unconditionally on every bar** and then use `if` to judge (putting them inside a branch misaligns the cached series).
 3. **Use `Series.To` for derived series**; do not repeatedly `NewSeries` in callbacks, otherwise the series count grows and triggers the fatal error `series too many … try replace NewSeries with Series.To` and stops the bot.
-4. Float-constant cache collision, and use `== 1` for `Cross` (§2.2).
+4. Use `== 1` / `== -1` for `Cross` events (`CrossUp()`/`CrossDown()` is persistent state, see §2.2).
 6. **Before comparing Close with Highest/Lowest, apply `Back(1)` first**, otherwise the current close can never break a highest price that includes itself: `e.Close.Get(0) > ta.Highest(e.High, n).Back(1).Get(0)`.
 7. `s.Env` is the main timeframe; read auxiliary-timeframe or cross-symbol reference bars via `s.RefKlineSub(symbol, tf)` + `s.RefEnv(symbol, tf)` (or `data.BarEnv()`/`data.Series(...)`), and custom series via `data.Series(...)`/`data.Float64(...)`.
 9. `Tag` is required in `OpenOrder`; `CloseOrders` requires `Tag` when there are orders. The zero value of `ExitReq{}` `Dirt` is Both; to close only longs/shorts you must explicitly set `core.OdDirtLong/OdDirtShort`.
 10. Hyperparameters are read-only shared: do not write them into `More`; use `pair_params` for per-symbol differences. `More` only stores per-symbol data that changes.
 11. `GetOrders/GetOrderNum` are snapshot-based: an order just opened with `OpenOrder` in the same callback will not appear; do not reuse slices across events.
 13. Do not call exchange APIs/blocking IO in callbacks (use §5 custom series for external data); do not iterate symbols/other jobs via package-level globals (use `OnBatchJobs/OnBatchInfos` for cross-symbol aggregation).
-14. Multi-input indicator caches attach to only one input, the combination must stay fixed; do not call indicators marked (full) multiple times in a loop (§2.3).
+14. Synthetic bar builders (`RenkoBuilder`/`RangeBarBuilder`/`VolumeBarBuilder`/`DollarBarBuilder`) are per-symbol stateful objects: instantiate them once in `OnStartUp` inside `s.More`, never call `New*` on every bar.
 16. Check NaN from `Series.Get` (`math.IsNaN(atr)`), especially when `WarmupNum` is not large enough.
 17. Jobs of the same symbol with different timeframes are independent Envs; use `DataSub` for cross-timeframe data.
 18. `DrawDownExit` overrides the order's stop-loss trigger (§4.2); `ExgStopLoss=false` hides remote pre-posting while keeping local stop-loss monitoring active (§3.3); `MAMA/VPCI/DX/Fisher` differ from standard definitions; do not use legacy APIs in new code.

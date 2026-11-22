@@ -1,6 +1,6 @@
 # banbot Cross-Sectional Factor / Multi-Factor Strategy Knowledge Base
 
-Scope: `engine: factor` cross-sectional factors, multi-factor combination, portfolio construction, research, replay, live trading, settlement. Prerequisite: the time-series strategy doc has been read (DataSeries/Kline, banexg types, common config, banta); not repeated here. For pairs statistical arbitrage see the statarb doc. Baseline: banbot v0.7.1.
+Scope: `engine: factor` cross-sectional factors, multi-factor combination, portfolio construction, research, replay, live trading, settlement. Prerequisite: the time-series strategy doc has been read (DataSeries/Kline, banexg types, common config, banta); not repeated here. For pairs statistical arbitrage see the statarb doc. Baseline: banbot v0.7.6.
 
 ## 0. Overview
 
@@ -270,12 +270,13 @@ func RegisterRiskPortfolioBuilder(name string, config RiskBuilderConfig) error
 
 ```go
 type FactorContext struct { TimeFrame string; Params *Params }
-func (f FactorContext) Close() *factor.Node          // factor.Field("kline","close", TimeFrame)
-func (f FactorContext) Field(name string) *factor.Node
+func (f FactorContext) Open() / High() / Low() / Close() / Volume() / Quote() / BuyVolume() *factor.Node
+func (f FactorContext) Field(name string) *factor.Node               // factor.Field("kline", name, TimeFrame)
+func (f FactorContext) SourceField(source, name string) *factor.Node // non-kline source (e.g. "funding_rate"/"rate", "open_interest"/"oi_value", "premium_kline"/"close"; auto causal AsOf alignment across cadences)
 func (f FactorContext) RefField(symbol, name string) *factor.Node
 func (f FactorContext) RefSourceField(symbol, source, name string) *factor.Node
 func (f FactorContext) SubTF(sourceTF string, build func(FactorContext) *factor.Node, maxAge ...int64) *factor.Node
-func (f FactorContext) SectorCode() *factor.Node     // factor.SectorCode(TimeFrame)
+func (f FactorContext) SectorCode() *factor.Node                     // factor.SectorCode(TimeFrame)
 type FactorSpec struct { Outputs map[string]*factor.Node; Combine research.ComboSpec }
 func RegisterFactor(name string, build func(FactorContext) (FactorSpec, error)) error
 ```
@@ -486,6 +487,6 @@ run_policy:
 - Storage replay: remove `archive`, add `exchange: {name: binance}`, `pairs`, `timerange: 20240101-20240601`, `data: {pit_policy: static-approximation}`.
 - Research: remove `research: {labels: []}`; lifecycle/cohorts: replace `portfolio` with the 4.2 example.
 
-## 10. Unconfirmed Points
+## 10. Capability Boundaries
 
-Verified by code reading only, not tested live: storage replay and Hub live (Hub's restrictions on funding strategies unknown), embedded banexg binding and custom providers, terminal/option-expiry record formats, numeric behavior of `retain_rank`/`dropout`/`group_quota`/`on_reselect`/`adopt`/`cooldown_bars`/`geometric`/`target-step`, history IC methods (only config validation checked); live was verified only up to session initialization.
+Cash-settled European options and `execution.history` cold SQLite archives apply to Events paper replay only; embedded live transport and custom `live_provider` constraints are detailed in §7.4.

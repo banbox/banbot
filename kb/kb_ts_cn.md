@@ -1,6 +1,6 @@
 # banbot 时序策略引擎参考（AI 版）
 
-banbot 时序策略（`engine: time_series`，默认）：接口、回调、下单/仓位 API、配置、回测实盘差异、坑、示例。基准 banbot v0.7.1，banta v0.4.1，banexg v0.2.66。截面因子、统计套利是另外的引擎。
+banbot 时序策略（`engine: time_series`，默认）：接口、回调、下单/仓位 API、配置、回测实盘差异、坑、示例。基准 banbot v0.7.6，banta v0.5.0，banexg v0.2.67。截面因子、统计套利是另外的引擎。
 每个 `(run_policy, 周期, 品种)` 对应一个 `*strat.StratJob`，每根K线（或自定义数据事件）触发一次回调。
 
 ## 0. 快速上手
@@ -32,7 +32,7 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 
 ### 1.2 品种与市场
 - 品种：现货 `BASE/QUOTE`，合约 `BASE/QUOTE:SETTLE`（交割另带标识段）。`core.SplitSymbol(pair) (base, quote, settle, id)`。
-- 市场常量（banexg）：`MarketSpot="spot" MarketMargin MarketLinear MarketInverse MarketOption MarketSwap MarketFuture`；配置 `market_type: spot|linear|inverse|option`，`contract_type: swap|future`。
+- 市场常量（banexg）：`MarketSpot="spot" MarketMargin MarketLinear MarketInverse MarketOption MarketSwap MarketFuture`；配置 `market_type: spot|linear|inverse|option`，`contract_type: swap|future`；线性永续策略若需同时订阅或交易同交易所现货标的（如 `BTC/USDT` 现货 + `BTC/USDT:USDT` 永续做期现基差/资金费套利），可在根配置加 `extra_markets: [spot]`（现货腿仅支持做多、无资金费）。
 - `*orm.ExSymbol`：`ID int32`（即 Sid）、`Exchange`、`ExgReal`、`Market`、`Symbol`、`Combined bool`、`ListMs`、`DelistMs int64`、`AggRules string`。`s.Symbol` 为当前任务品种。
 - 策略禁止为某交易所写特判分支。
 
@@ -62,7 +62,7 @@ func init() { strat.AddStratGroup("demo", map[string]strat.FuncMakeStrat{"ma": M
 ### 1.6 配置（YAML 通用部分）
 分层：数据目录 `config.yml` + `config.local.yml`，再叠加 `--config`。根键（全部可选）：
 - `name`、`env`：机器人名；prod/test/dry_run
-- `market_type`、`contract_type`、`leverage`：市场、合约类型、默认杠杆
+- `market_type`、`contract_type`、`leverage`、`extra_markets`：市场、合约类型、默认杠杆、额外挂载市场（如 `[spot]`）
 - `stake_amount` / `stake_pct` / `max_stake_amt`：单笔基准金额（法币）；百分比（优先于 stake_amount）；上限
 - `open_vol_rate`(1)：开单量/近5根平均成交量 上限比
 - `min_open_rate`(0.5)、`low_cost_action`：余额不足时开单策略
@@ -152,22 +152,23 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - 有符号整数：正=上穿，负=下穿，0=无记录；|值|−1=距最近交叉的 bar 数。**本根刚上穿 `1`，之后 `2,3,…`；下穿 `-1,-2,…`**。
 - 事件用 `== 1`/`== -1`；`CrossUp()/CrossDown()`=`Cross>0/<0` 是"最近交叉方向"**状态**。
 - 记录从**该 Series 首次调用 Cross 起**，不回放历史；须每根K线无条件调用。
-- 比较对象：`Series`（比 `Get(0)`，缓存键为另一序列 ID）或常量（`int`/`float`，缓存键 `int(v*100)`，相差<0.01 的两个常量可能冲突）。
-
-**浮点常量缓存冲突**：`Add/Sub/Mul/Div/Min/Max` 传 `float64` 常量时派生键为 `int(v*10)`，同序列同 bar 内 `Add(0.11)` 与 `Add(0.14)` 返回同一缓存。规避：在 Go 里直接算标量，或用 `int`/不同派生名。
+- 比较对象：`Series`（比 `Get(0)`）或数值常量（`int`/`float64`，缓存键基于完整位模式 `math.Float64bits`，任意精度常量互不冲突）。
+- **合成砖图（Renko / Range / Volume / Dollar Bars）**：在 `s.More` 持有构建器（如 `ta.NewRenkoATR(14, 1.0)`、`ta.NewRangeBarPct(0.005)`、`ta.NewDollarBarBuilder(quoteThresh)`），在 `1m`/`5m` 主回调中调用 `builder.UpdateFromEnv(e, func(renkoEnv *ta.BarEnv) { ... })`：每当闭合一根或多根合成砖时按因果时间顺序回调 `renkoEnv`，内部可直接调用全部 `ta.*` 指标。
 
 ### 2.3 指标清单
 约定：签名省略包名。**Go 无默认参数，必须显式传**（仅 `CCI`、`ADX`、`DMI`、`StochF/STOCHF` 的可变参数有隐式默认）；`〔…〕`为默认/常用参数值。
-**(全)** = 每个新 bar 复制整个 Series 历史（1500~2249 根）后用 `tav` 向量版全量重算取末值：O(历史) 且有分配（约 2000 根时 Fisher≈32µs/次，SMA<0.1µs/次），开销有界，多品种×多周期×多次调用要控制；同 bar 重复调用仍只算一次。窗口型（Fisher、WilliamsPercent、KST、Ichimoku、DonchianPBand、Correlation）不受 Cut 影响；**递归型（Supertrend、PMAX、Keltner*、VIDYA、SSF、MAMA、DX 等）值依赖窗口起点**，Cut 后与全历史计算略有差异。
+所有常用递推与滑窗指标均为 O(1)/O(W) 增量状态机，且多输入指标的缓存键包含全部输入 `*Series` 身份与精确浮点参数位模式（不同输入组合或浮点参数互不串缓存）；仅极少数遗留兼容包装标 **(全)**（有标准增量替代版）。
 
-**价格与组合**
+**价格、组合与合成砖**
 
 - `AvgPrice(e *BarEnv)`：(H+L+C)/3
 - `HL2(h,l)`、`HLC3(h,l,c)`、`HLCC4(h,l,c)`、`OHLC4(o,h,l,c)`：(H+L)/2、(H+L+C)/3、(H+L+2C)/4、(O+H+L+C)/4
 - `Abs(a)`、`Change(a)`、`Sub(a,b)`：\|a\|、a−a[1]、a−b
 - `HeikinAshi(e) (ho,hh,hl,hc *Series)`：平均K线
+- `NewRenkoFixed(brickSize float64)`、`NewRenkoPct(pct float64)`、`NewRenkoATR(atrPeriod int, atrMult float64) *RenkoBuilder`：固定点差/百分比/动态 ATR 砖形图构建器（支持 `.UpdateFromEnv(srcEnv, onBrick)`）
+- `NewRangeBarBuilder(rangeSize float64)`、`NewRangeBarPct(pct float64) *RangeBarBuilder`、`NewVolumeBarBuilder(volumeThreshold float64) *VolumeBarBuilder`、`NewDollarBarBuilder(quoteThreshold float64) *DollarBarBuilder`：等波幅 Range / 等量 / 等成交额合成 K 线构建器
 
-**移动平均**
+**移动平均与在线滤波**
 
 - `SMA(obj, period)`：简单均值；有效值不足 period 为 NaN
 - `EMA(obj, period)`：=`EMABy(obj,period,0)`，α=2/(n+1)
@@ -180,30 +181,35 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `T3(obj, period)`：Tillson T3，vFactor 固定 0.7
 - `TRIMA(obj, period)`：SMA(SMA(obj,(p+1)/2), p/2+1)
 - `ZLMA(obj, period)`：零延迟 EMA：EMA(obj+obj−obj[(p−1)/2])
-- `VIDYA(obj, period)`：\|CMO\| 调节 α=2/(p+1) 的变长 EMA，首值 SMA (全)
+- `VIDYA(obj, period)`：\|CMO\| 调节 α=2/(p+1) 的变长 EMA，首值 SMA
 - `KAMA(obj, period)` 〔10〕：=`KAMABy(obj,period,2,30)`
 - `KAMABy(obj, period, fast, slow int)` 〔10, 2, 30〕：效率比 ER 自适应；ER 未就绪 NaN
 - `ALMA(obj, period int, sigma, distOff float64)` 〔10, 6.0, 0.85〕：Arnaud Legoux 高斯加权均线
-- `SSF(obj, period)`：Ehlers 双极超平滑滤波 (全)
+- `McGinleyDynamic(src, period)`：McGinley 自适应动态均线
+- `SSF(obj, period)`：Ehlers 双极超平滑滤波（SuperSmoother）
+- `Butterworth2(src, period)`、`GaussianFilter(src, period, poles int)`〔poles 1..4〕、`LaguerreFilter(src, gamma float64)`〔0..1〕：二阶巴特沃斯 / 多极高斯 / Ehlers Laguerre 低延迟滤波器
+- `Kalman1D(src, processNoise, measNoise float64)`、`KalmanTrend(src, processNoise, measNoise float64) (level, velocity)` 〔常用 0.01, 0.1〕：一维随机游走与二维局部线性趋势（位置+速度）在线卡尔曼滤波
 - `SWMA(obj)`：固定 4 点权重 (1,2,2,1)/6
-- `MAMA(obj, fast, slow float64) (m, f)`：**非 Ehlers MAMA/FAMA**：p=max(1,round((fast+slow)/2))；m=EMA(obj,p)，f=EMA(m,p) (全)。fast/slow=0.5/0.05 时 p=1，m 即原序列
+- `EhlersMAMA(obj, fastLimit, slowLimit float64) (mama, fama)` 〔0.5, 0.05〕：标准 Ehlers Hilbert 相位自适应 MAMA/FAMA（旧 `MAMA(obj, fast, slow)` 为简化兼容函数 (全)，新代码用 `EhlersMAMA`）
 - `VWMA(price, vol, period)` 〔20〕：Σ(价·量)/Σ量，滚动窗口
-- `VWAP(first, second *Series, rest ...*Series)`：累计 VWAP，无周期、无日内重置；2 参 (close, volume)，4 参 (high, low, close, volume)
+- `VWAP(first, second *Series, rest ...*Series)`：累计不重置 VWAP；按 UTC 时段锚点重置用下文的 `SessionVWAP`/`SessionVWAPBands`/`WeeklyVWAP`
 - `Sum(obj, period)`：滚动和，跳过 NaN；有效值不足 period 为 NaN
 
 **动量与震荡**
 
 - `RSI(obj, period)` 〔14〕：Wilder RSI 0~100；前 period 个增量用简单均值初始化
 - `RSI50(obj, period)`：RSI−50
+- `LaguerreRSI(src, gamma float64)` 〔0.5〕：Ehlers 四阶 Laguerre RSI（`0~100`）
 - `ROC(obj, period)` 〔9〕：(close−close[n])/close[n]×100
 - `ROCR(obj, period)`：close/close[n]（比值，非百分比）；分母为 0/NaN 时 NaN
 - `MOM(obj, period)`：close−close[period]
+- `PPO(src, fast, slow, signal int) (ppo, sig, hist)` 〔12, 26, 9〕：百分比价格振荡器
 - `CMO(obj, period)` 〔9〕：=`CMOBy(obj,period,0)`
 - `CMOBy(obj, period, maType int)` 〔9, 0〕：Chande 动量震荡 −100~100；0=TA-Lib Wilder 平滑，1=TradingView 简单求和
 - `RMI(obj, period, montLen int)` 〔14, 3〕：相对动量指数 0~100（RMA 平滑 montLen 涨跌幅）
 - `CRSI(obj, period, upDn, roc int)` 〔3, 2, 100〕：Connors RSI =`CRSIBy(...,0)`
 - `CRSIBy(obj, period, upDn, roc, vtype int)` 〔3, 2, 100, 0〕：(RSI + UpDown 的 RSI + 排名)/3；vtype 0=ROC(1) 的 PercentRank，1=ROC(roc)
-- `PercentRank(obj, period)`：窗口（period 根，含当前）中**不含当前**且 ≤当前值的个数×100/**period**（最大 (period−1)/period×100）；窗口不足 NaN
+- `PercentRank(obj, period)`：窗口（period 根，含当前）中**不含当前**且 ≤当前值的个数×100/**period**；窗口不足 NaN
 - `TD(obj)`：DeMark 连续计数（与 4 根前比较，同向累加，反向重置），前 4 根 NaN
 - `UpDown(obj, vtype int)`：连续涨跌计数；0=TradingView 口径，1=经典仅 ±1
 - `KDJ(high, low, close, period, sm1, sm2 int) (K, D, RSV)` 〔9, 3, 3〕：RMA 平滑
@@ -213,17 +219,18 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `StochF(high, low, close, period int, smooth ...int) (fastK, fastD)` 〔smooth 省略或≤0=3〕：fastK 原始值，fastD=SMA(K,smooth)
 - `STOCHF(close, high, low, period int, smooth ...int)` 〔同 StochF〕：参数顺序 close,high,low
 - `StochRSI(obj, rsiLen, stochLen, maK, maD int) (fastK, fastD)` 〔14,14,3,3〕：RSI→Stoch→SMA(maK)→SMA(maD)
-- `WillR(e *BarEnv, period)` 〔14〕：Williams %R −100~0；读 e 的 High/Low/Close，不收 Series
-- `WilliamsPercent(high, low, close, period)`：同 %R：−100·(HH−close)/(HH−LL)，窗口含当前 (全)
+- `WillR(e *BarEnv, period)`、`WillRHL(high, low, close *Series, period int)`、`WilliamsPercent(high, low, close, period)` 〔14〕：Williams %R −100~0（`WillR` 读 `BarEnv`，`WillRHL`/`WilliamsPercent` 直接收 `Series`）
 - `CCI(obj, args ...interface{})` 〔周期 20〕：`CCI(close, period)`；`CCI(high, low, close, period)` 用 HLC3；(src−SMA)/(0.015·AvgDev)
 - `AO(high, low, fast, slow int)`：SMA(HL2,fast)−SMA(HL2,slow)
 - `DPO(obj, period)`、`Dpo`：pandas-ta 非居中：close−SMA(close,period) 滞后 floor(period/2)+1 根
-- `Fisher(high, low, period)`：x=2·((H+L)/2−LL)/(HH−LL)−1（窗口含当前）截断 ±0.999，输出 0.5·ln((1+x)/(1−x))。**无 0.33/0.67 递推平滑、无信号线**；HH==LL 或前 period−1 根为 NaN (全)
+- `FisherTransform(high, low, period) (fisher, trigger)` 〔9〕：标准 Ehlers 0.33/0.67 递推平滑 Fisher 变换及上一根 `trigger` 信号线（旧 `Fisher(high, low, period)` 为无递推单线版）
+- `WaveTrend(high, low, close, chLen, avgLen, maLen int) (wt1, wt2)` 〔10, 21, 4〕：LazyBear WaveTrend 振荡器
+- `QQE(src, rsiPeriod, sf int, wp float64) (rsiMA, trailing, dir)` 〔14, 5, 4.236〕：Quantitative Qualitative Estimation 平滑 RSI 动态追踪线与方向 `±1`
 - `ULTOSC(high, low, close, short, medium, long int)` 〔7, 14, 28〕：终极振荡器，权重 4/2/1
 - `TRIX(obj, period)`：三重 EMA 的单根百分比变化，无信号线
 - `TSI(obj, short, long int)`：EMA(EMA(Δ,short),long)/EMA(EMA(\|Δ\|,short),long)×100
-- `STC(obj, period, fast, slow int, alpha float64)` 〔12, 26, 50, 0.5〕：Schaff 趋势周期 0~100：MACD→period 窗口百分位→α 平滑→period 窗口百分位→α 平滑；窗口全平为 0；输入 NaN 重置状态；增量
-- `KST(obj, r1,r2,r3,r4, s1,s2,s3,s4 int)` 〔常用 10,15,20,30,10,10,10,15〕：Σ wᵢ·SMA(ROC(rᵢ)%, sᵢ)，权重 1,2,3,4；**无信号线**；首个有效值在 max(rᵢ+sᵢ)−1 (全)
+- `STC(obj, period, fast, slow int, alpha float64)` 〔12, 26, 50, 0.5〕：Schaff 趋势周期 0~100
+- `KST(obj, r1,r2,r3,r4, s1,s2,s3,s4 int)` 〔常用 10,15,20,30,10,10,10,15〕：Σ wᵢ·SMA(ROC(rᵢ)%, sᵢ)，权重 1,2,3,4；**无信号线**
 - `CTI(obj, period)` 〔20〕：相关趋势指标 −1~1（线性回归相关）
 - `Stiffness(obj, maLen, stiffLen, stiffMa int)` 〔100, 60, 3〕：0~100：bound=SMA−0.2·StdDev，统计 stiffLen 内收盘>bound 的根数，再 EMA(stiffMa)
 - `DV2(h, l, c, period, maLen int)` 〔252, 2〕：有界 DV2 0~100，maLen 均值的百分位排名（非 backtrader 版）
@@ -235,60 +242,63 @@ type Series struct { ID int; Env *BarEnv; Data []float64; Cols []*Series; Time i
 - `MACDBy(obj, fast, slow, smooth, initType int)` 〔initType 0〕：0=SMA 初始化（国外口径），1=首个有效值（国内/MyTT 口径）
 - `ADX(high, low, close, period int, smoothing ...int)` 〔14；smoothing 省略/0=period〕：经典 ADX
 - `ADXBy(high, low, close, period, smoothing, method int)` 〔14, 0, 0〕：method 0：RMA 平滑 DX；1：SMA 平滑 DX
-- `DX(high, low, close, period)`：**非标准**：单根 \|+DM−(−DM)\|/(+DM+(−DM))×100，原始 DM 未平滑，噪声大；要平滑版用 `ADX`/`DMI` (全)
+- `WilderDX(high, low, close, period)` 〔14〕：标准 Wilder RMA 平滑方向指数 DX（旧 `DX` 为未平滑单根版 (全)，新代码用 `WilderDX`/`ADX`/`DMI`）
 - `DMI(high, low, close, period int, smoothing ...int) (+DI, −DI, ADX)` 〔smoothing 省略=period〕：smoothing 只作用于 ADX，DI 用 period
-- `PluMinDI(high, low, close, period) (+DI, −DI)` 〔14〕：Wilder 口径
-- `PluMinDM(high, low, close, period) (+DM, −DM)` 〔14〕：Wilder 平滑和
-- `Aroon(high, low, period) (Up, Osc, Dn)`：Up=(period−HighestBar(period+1))/period×100，Dn 同理用 LowestBar；Osc=Up−Dn
-- `AroonOsc(high, low, period)`、`AROONOSC`：Up−Dn，−100~100
-- `SAR(high, low, step, max float64)`、`PSAR` 〔0.02, 0.2〕：抛物线转向（TA-Lib 口径）：AF 从 step 起、每创新极值 +step、封顶 max；首根 NaN，第二根起以该根最低价为初始 SAR（初始上升）；反转时 SAR 取前极值点；返回**价格**
-- `Supertrend(high, low, close, period int, multiplier float64)` 〔常用 10, 3〕：返回**趋势线价格，非方向**：上升段为下轨，下降段为上轨；(H+L)/2±mult·ATR 棘轮，close 穿越对侧轨道翻转；初始 close≥(H+L)/2 为上升。方向用 `line < close`（多头）判断 (全)
-- `PMAX(high, low, close, period int, multiplier float64) (line, dir)` 〔常用 10, 3〕：EMA(close,period)±mult·ATR(period) 棘轮线（MA 周期=ATR 周期，不可单独指定），MA 与线交叉翻转；dir=+1 上升（line 为下轨）/−1 下降（上轨）(全)
-- `Ichimoku(high, low, close, conversion, base, span int) (conv, base, spanA, spanB, lag)` 〔9, 26, 52〕：conv/base=窗口 (HH+LL)/2；spanA=(conv+base)/2；spanB=span 窗口 (HH+LL)/2；lag=**close[i−base]**（`Close.Get(base)`）。**spanA/spanB 未向前平移 base 根**（比较"当前云层"需自取 `Back(base)`）；conv 前 conversion−1 根、spanB 前 span−1 根 NaN (全)
-- `UTBot(c, atr *Series, rate float64)` 〔rate 常用 1〕：信号（**事件，仅突破当根非零**）：1=买，−1=卖，0=无；移动止损线 c±atr·rate 被穿越时触发，线不对外暴露。atr 须自己传入（如 `ta.ATR(...)`）；缓存与状态挂在 atr 上，键为 rate
-- `LinReg(obj, period)`：线性回归终点值
-- `LinRegAdv(obj, period int, angle, intercept, degrees, r, slope, tsf bool)` 〔全 false=终点值〕：标志选输出，优先级 slope>intercept>angle>r>tsf>终点值
-- `LinearRegAngle(obj, period)`、`LINEARREG_ANGLE`：回归斜率的 atan，单位度；前 period−1 根 NaN
-- `Slope(obj, period)`：最小二乘斜率
-- `Correlation(a, b, period)`：Pearson 相关 (全)
-- `CHOP(e *BarEnv, period)` 〔14〕：波动指数；读 e 的 High/Low/Close；越高越震荡，越低越趋势
+- `PluMinDI(high, low, close, period) (+DI, −DI)`、`PluMinDM(high, low, close, period) (+DM, −DM)` 〔14〕：Wilder 口径
+- `Vortex(high, low, close, period) (viPlus, viMinus)` 〔14〕：涡旋趋势指标 VI+/VI−
+- `Aroon(high, low, period) (Up, Osc, Dn)`、`AroonOsc(high, low, period)`、`AROONOSC`：Up−Dn，−100~100
+- `SAR(high, low, step, max float64)`、`PSAR` 〔0.02, 0.2〕：抛物线转向（TA-Lib 口径），返回**价格**
+- `Supertrend(high, low, close, period int, multiplier float64)`、`SupertrendDir(high, low, close, period int, multiplier float64) (line, dir)` 〔常用 10, 3〕：`Supertrend` 返回趋势线价格；`SupertrendDir` 同时返回方向（`dir`：`+1` 多 / `-1` 空）
+- `ChandelierExit(high, low, close, period int, mult float64) (longStop, shortStop, dir)` 〔22, 3.0〕：吊灯止损线与棘轮方向 `±1`
+- `SSLChannel(high, low, close, period) (sslUp, sslDown)` 〔10〕：高低 SMA 通道翻转线
+- `Alligator(src, jawLen, teethLen, lipsLen, jawOff, teethOff, lipsOff int) (jaw, teeth, lips)` 〔13, 8, 5, 8, 5, 3〕、`Fractals(high, low, n int) (upFractal, downFractal)` 〔2，右侧确认无前视〕：比尔·威廉姆斯鳄鱼线与分形
+- `ElderRay(high, low, close, period) (bullPower, bearPower)` 〔13〕、`WaddahAttar(close, fast, slow, bbLen int, bbMult, mult float64) (trend, explosion)` 〔20, 40, 20, 2.0, 150〕：Elder 多空力量与 Waddah Attar 爆发力
+- `PMAX(high, low, close, period int, multiplier float64) (line, dir)` 〔常用 10, 3〕：EMA(close,period)±mult·ATR(period) 棘轮线与方向 `±1`
+- `Ichimoku(high, low, close, conversion, base, span int) (conv, base, spanA, spanB, lag)` 〔9, 26, 52〕：**spanA/spanB 未向前平移 base 根**（比较"当前云层"需自取 `Back(base)`）
+- `UTBot(c, atr *Series, rate float64)` 〔rate 常用 1〕：突破事件信号（1=买，−1=卖，0=无）
+- `LinReg(obj, period)`、`LinRegAdv(obj, period int, angle, intercept, degrees, r, slope, tsf bool)`、`LinearRegAngle(obj, period)`/`LINEARREG_ANGLE`、`Slope(obj, period)`、`RSquare(src, period)`：线性回归终点/斜率/角度/决定系数 R²
+- `Correlation(a, b, period)`、`RollingBeta(y, x, period) (beta, alpha)`：滚动 Pearson 相关系数与 OLS 回归斜率/截距
+- `CHOP(e *BarEnv, period)`、`CHOPHLC(high, low, close *Series, period int)` 〔14〕：Choppiness 震荡指数（越高越震荡，越低越趋势）
 
-**波动率与通道**
+**波动率、通道与时段锚点 VWAP/枢轴**
 
-- `TR(high, low, close)`：真实波幅，首根 NaN
-- `ATR(high, low, close, period)` 〔14〕：=RMA(TR, period)
-- `NATR(high, low, close, period)`：100·ATR/close
-- `StdDev(obj, period)`、`STDDEV` 〔20〕：=`StdDevBy(obj,period,0)` 总体标准差
-- `StdDevBy(obj, period, ddof int) (stddev, mean)` 〔ddof 0〕：方差除以 (period−ddof)
-- `AvgDev(obj, period)`：Σ\|x−SMA\|/period
-- `BBANDS(obj, period int, stdUp, stdDn float64) (upper, mid, lower)` 〔20, 2, 2〕：mid=SMA
-- `Donchian(high, low, period) (upper, middle, lower)`：窗口含当前根
-- `DonchianPBand(high, low, close, period)`：(close−lower)/(upper−lower)，通道内位置，宽度 0 为 NaN；缓存只挂 close (全)
-- `KeltnerChannel(high, low, close, period int, multiplier float64) (upper, mid, lower)`：EMA(close,period) ± mult·ATR(period) (全)
-- `KeltnerWBand(high, low, close, period int, mult float64)`：(upper−lower)/mid 相对带宽 (全)
-- `Squeeze(high, low, close, period)`：TTM 挤压：BB（SMA±2σ 总体）完全在 KC 内为 1 否则 0；KC=SMA±1.5×窗口平均 TR（SMA 口径）；历史不足 NaN
-- `Highest/Lowest(obj, period)`：含当前根的周期最高/最低
-- `HighestBar/LowestBar(obj, period)`：最高/最低值距当前的偏移（0=当前）
+- `TR(high, low, close)`、`ATR(high, low, close, period)` 〔14〕、`NATR(high, low, close, period)`：真实波幅、Wilder ATR 与百分比 ATR
+- `StdDev(obj, period)`/`STDDEV` 〔20〕、`StdDevBy(obj, period, ddof int) (stddev, mean)`、`AvgDev(obj, period)`：标准差与平均绝对偏差
+- `ParkinsonVol(high, low, period)`、`GarmanKlassVol(open, high, low, close, period)`、`YangZhangVol(open, high, low, close, period)`：高低价 / OHLC 跳空修正历史波动率估计器（每 bar 对数波动率）
+- `BBANDS(obj, period int, stdUp, stdDn float64) (upper, mid, lower)` 〔20, 2, 2〕：布林带
+- `Donchian(high, low, period) (upper, middle, lower)`、`DonchianPBand(high, low, close, period)`：唐奇安通道与通道内相对位置
+- `KeltnerChannel(high, low, close, period int, multiplier float64) (upper, mid, lower)`、`KeltnerWBand(high, low, close, period int, mult float64)`：肯特纳通道与相对带宽
+- `Squeeze(high, low, close, period)`、`SqueezeMomentum(high, low, close, bbLen int, bbMult float64, kcLen int, kcMult float64) (val, squeezeOn)` 〔20, 2.0, 20, 1.5〕：TTM Squeeze 挤压标志与 LazyBear 线性回归动量柱（`squeezeOn`：`1`=挤压/`0`=释放）
+- `SessionVWAP(e *BarEnv, anchorMinutesUTC int)`、`SessionVWAPBands(e *BarEnv, anchorMinutesUTC int, mult float64) (vwap, upper, lower)`、`WeeklyVWAP(e *BarEnv)`：按 UTC 时段锚点（如 `0`、`480`、`810`）每日重置的日内 VWAP / 加权标准差上下轨及 UTC 周一重置的周度 VWAP（`>=1d` 周期上安全回退典型价）
+- `DailyPivotPoints(e *BarEnv, method string, anchorMinutesUTC int) (p, r1, s1, r2, s2, r3, s3)`：基于上一完整锚点交易日 OHLC 计算的无前视枢轴点（`method`: `"classic"`/`"fibonacci"`/`"camarilla"`/`"woodie"`/`"demark"`）
+- `Highest/Lowest(obj, period)`、`HighestBar/LowestBar(obj, period)`：含当前根的周期最高/最低及偏移
 
-**成交量**
+**成交量、成交流（OrderFlow / CVD）与筹码分布**
 
-- `OBV(close, volume)`：累计能量潮：涨加跌减
-- `ADL(env)`：累计 A/D 线，读 env.Volume
-- `ADOSC(env, fast, slow int)`：EMA(ADL,fast)−EMA(ADL,slow)
-- `ChaikinOsc(env, shortLen, longLen int)` 〔3, 10〕：同 ADOSC 口径
-- `CMF(env, period)` 〔20〕：Σ(MFV)/Σ量 −1~1；volume≤0 的根输出 NaN
-- `MFI(e, period)` 〔14〕：资金流量指数 0~100，典型价×env.Volume
-- `EFI(env, period)`：Elder 力量指数：EMA(period) of (close 逐根变化 × volume)，首根 NaN
-- `VPCI(close, volume, period)`：**名不副实**：仅 VWMA(close,volume,period)−SMA(close,period)（价量均线差），非完整 VPCI (全)
+- `OBV(close, volume)`：累计能量潮
+- `ADL(env)`、`ADLHLCV(high, low, close, volume *Series)`、`ADOSC(env, fast, slow int)`、`ChaikinOsc(env, shortLen, longLen int)` 〔3, 10〕：累积派发线与佳庆振荡器
+- `CMF(env, period)`、`CMFHLCV(high, low, close, volume *Series, period int)` 〔20〕：佳庆资金流 −1~1
+- `MFI(e, period)`、`MFIHLCV(high, low, close, volume *Series, period int)` 〔14〕：资金流量指数 0~100
+- `EFI(env, period)`、`EFICV(close, volume *Series, period int)`：Elder 力量指数
+- `StandardVPCI(close, volume, shortPeriod, longPeriod int)` 〔5, 20〕：标准 Buff Dormeier 量价确认指标（旧 `VPCI(close, volume, period)` 为简化差值 (全)）
+- `RollingVolumeProfile(high, low, close, volume, period, numBins int, valueAreaPct float64) (poc, vah, val)` 〔100, 24, 0.70〕：滚动成交量筹码分布控制点 POC 与价值区上下沿 VAH/VAL
+- `VolumeDelta(volume, buyVolume)` / `EnvVolumeDelta(e)`、`CVD(volume, buyVolume)` / `EnvCVD(e)`、`RollingCVD(volume, buyVolume, period)` / `EnvRollingCVD(e, period)`、`SessionCVD(e, anchorMinutesUTC int)`：K 线主动买卖净成交量 Delta（`2*BuyVolume - Volume`）及累计/滚动/日内重置 CVD
+- `TakerBuyRatio(volume, buyVolume, period)` / `EnvTakerBuyRatio(e, period)`、`AvgTradeQuote(quote, tradeNum, period)` / `EnvAvgTradeQuote(e, period)`、`AvgTradeSize(volume, tradeNum, period)` / `EnvAvgTradeSize(e, period)`：滚动主动买入占比与笔均成交额/笔均成交量
+
+**滚动统计、分形熵、轻量状态分类与 Pine 状态工具**
+
+- `ZScore(src, period)`、`Skew(src, period)`、`Kurt(src, period)`、`RollingQuantile(src, period int, q float64)`：滚动标准分、样本偏度、超额峰度与精确分位数（`q=0.5` 中位数）
+- `Hurst(src, period)`、`FDI(src, period)`、`ShannonEntropy(src, period, numBins int)` 〔numBins 常用 10〕：重标极差 Hurst 指数（`<0.5` 均值回归、`>0.5` 趋势）、分形维数指标（`1~2`）与一阶差分香农信息熵（归一化 `0~1`）
+- `LorentzianKNN(close, f1, f2, f3, f4 *Series, lookback, k, horizon, stride int)` 〔常用 200, 8, 4, 1〕、`RollingKMeans3(src, period, maxIter int) (cluster, lowC, midC, highC)` 〔常用 100, 15〕：严格无前视历史窗口洛伦兹距离 k-NN 投票信号与一维滚动三态 k-Means 聚类（`cluster`：`0/1/2` 低/中/高态）
+- `BarsSince(cond)`、`ValueWhen(cond, src, occurrence int)`〔`0` 为最近一次非零且非 NaN〕、`Cum(src)`、`Rising(src, length int)`、`Falling(src, length int)`：Pine `ta.barssince` / `ta.valuewhen` / `ta.cum` / `ta.rising` / `ta.falling` 等价状态原语
 
 **形态与枢轴**
 
 - `PivotHigh/PivotLow(src, left, right int)`：右侧 right 根确认后输出枢轴高/低点，否则 NaN，滞后 right 根
-- `CDL3INSIDE/CDL3LINESTRIKE/CDL3OUTSIDE/CDLENGULFING(open, high, low, close)`：三内包/三线打击/三外包/吞没；100/−100/0
-- `CDLDRAGONFLYDOJI/CDLGRAVESTONEDOJI(open, high, low, close)`：蜻蜓/墓碑十字；100/0
-- `CDLHAMMER/CDLHANGINGMAN/CDLMORNINGSTAR/CDLSHOOTINGSTAR(open, high, low, close)`：锤子/上吊/启明星/流星；仅 100/0，不做趋势上下文判断（启明星未判缺口与穿透）
+- `CDL3INSIDE/CDL3LINESTRIKE/CDL3OUTSIDE/CDLENGULFING/CDLHARAMI(open, high, low, close)`：三内包/三线打击/三外包/吞没/孕线；`100`/`−100`/`0`
+- `CDLMARUBOZU(o, h, l, c)`、`CDL3WHITESOLDIERS(o, h, l, c)`、`CDL3BLACKCROWS(o, h, l, c)`、`CDLPIERCING(o, h, l, c)`、`CDLDARKCLOUDCOVER(o, h, l, c)`、`CDLEVENINGSTAR(o, h, l, c)`：光头光脚/红三兵/三只乌鸦/刺透/乌云盖顶/黄昏星
+- `CDLDOJI(o, h, l, c)`、`CDLDRAGONFLYDOJI(o, h, l, c)`、`CDLGRAVESTONEDOJI(o, h, l, c)`、`CDLHAMMER(o, h, l, c)`、`CDLHANGINGMAN(o, h, l, c)`、`CDLMORNINGSTAR(o, h, l, c)`、`CDLSHOOTINGSTAR(o, h, l, c)`：十字星/蜻蜓/墓碑/锤子/上吊/启明星/流星
 
-多输入指标缓存只挂在某一输入上（`HLC3`/`AvgPrice`/`DonchianPBand`/`Supertrend`/`Fisher`(挂 high)/`UTBot`(挂 atr) 等）：同一挂载序列配不同其余输入会命中旧值，输入组合必须固定。
 `chanlun.go` 的缠论图结构（CGraph/CPoint/CPen/CSeg/CCentre/CTrend）非数值指标，不展开。
 
 ## 3. 策略结构与回调
@@ -501,7 +511,7 @@ func RouteData(h DataHandlers) FnOnData // 每个事件至多调用一个 handle
     - `Tag string`：入场/平仓信号标签（默认 `"rebalance"`）。
     - `DriftThreshold float64`：免调仓偏离缓冲带（默认 `0.02` 即 2% 权益；仅当当前持仓与目标权重**同号**且 `|target - cur| < DriftThreshold` 时跳过微调以节省手续费；从空仓新建仓不受缓冲带阻挡；传 `< 0` 禁用缓冲带）。
     - `MaxGrossExposure float64`：总绝对敞口上限（`> 0` 且 `Σ|w| > MaxGrossExposure` 时自动将所有目标权重等比缩放到上限）。
-    - `StopLossRate` / `TakeProfitRate` / `CallbackPct` / `Leverage float64`：新开仓与同向补仓单自动附带的个币止损比例（`enterPrice * StopLossRate` 换算为 `StopLossVal`）、止盈比例、追踪止损回撤百分比 `[0.1, 10]` 与杠杆倍数，打通“横截面组合配权 + 个币实时保护单”。
+    - `StopLossRate` / `TakeProfitRate` / `CallbackPct` / `Leverage float64`：新开仓与同向补仓单自动附带的个币止损比例（`enterPrice * StopLossRate` 换算为 `StopLossVal`）、止盈比例、追踪止损回撤百分比 `[0.05, 50]` 与杠杆倍数，打通“横截面组合配权 + 个币实时保护单”。
   - **两阶段执行顺序**：
     1. 第一遍扫描全部 `jobs`：目标为 `0` 的全平；方向相反（多翻空/空翻多）的先 `CloseOrders` 平掉旧向持仓并将全额目标记入待开队列；同向超配（`|target| < |cur| - DriftThreshold`）的按 `ExitRate = (|cur| - |target|) / |cur|` 部分减仓，优先释放保证金。
     2. 第二遍对待开新仓与同向补仓（`|target| > |cur| + DriftThreshold`）按 `LegalCost = AccountEquity() * deltaWeight` **从大到小**排序（同额按 `strat.BarPriority(barMS, symbol, seed)` 中性哈希与品种名确定性决胜）依次调用 `OpenOrder`，低于 `core.MinStakeAmount`（`5.5`）的碎单自动静默跳过（计入 `SkippedDustCount`）。
@@ -616,14 +626,14 @@ OnData: strat.RouteData(strat.DataHandlers{
 1. **OnData 与 OnBar/OnInfoBar 不能同时设置**（构建 panic）；新策略只用 `OnData`+`RouteData`，别把 `OnBar` 直接改名为 `OnData`（须区分 Main 与 Info）。
 2. **指标每根K线无条件计算**再用 `if` 判断（放进分支会使缓存序列错位）。
 3. **派生序列用 `Series.To`**，别在回调反复 `NewSeries`，否则序列数增长触发致命错误 `series too many … try replace NewSeries with Series.To` 并停机。
-4. 浮点常量缓存冲突、`Cross` 用 `== 1`（§2.2）。
+4. `Cross` 交叉事件判断用 `== 1` / `== -1`（`CrossUp()`/`CrossDown()` 为方向持续状态，见 §2.2）。
 6. **比较 Close 与 Highest/Lowest 前先 `Back(1)`**，否则当前收盘永远无法突破含自身的最高价：`e.Close.Get(0) > ta.Highest(e.High, n).Back(1).Get(0)`。
 7. `s.Env` 是主周期；读辅助周期或跨品种参考 K 线优先用 `s.RefKlineSub(symbol, tf)` + `s.RefEnv(symbol, tf)`（或 `data.BarEnv()`/`data.Series(...)`），读自定义序列用 `data.Series(...)`/`data.Float64(...)`。
 9. `OpenOrder` 的 `Tag` 必填；`CloseOrders` 有订单时 `Tag` 必填。`ExitReq{}` 的 `Dirt` 零值是 Both，只平多/空须显式设 `core.OdDirtLong/OdDirtShort`。
 10. 超参只读共享：不要写入 `More`；按品种不同用 `pair_params`。`More` 只存每品种会变化的数据。
 11. `GetOrders/GetOrderNum` 基于快照：同回调内刚 `OpenOrder` 不会出现；切片不要跨事件复用。
 13. 回调里不调交易所接口/阻塞 IO（外部数据用 §5 自定义序列）；不用包级全局遍历品种/其他 job（跨品种汇总用 `OnBatchJobs/OnBatchInfos`）。
-14. 多输入指标缓存只挂一个输入，组合须固定；标 (全) 指标勿在循环里多次调用（§2.3）。
+14. 合成砖构建器（`RenkoBuilder`/`RangeBarBuilder`/`VolumeBarBuilder`/`DollarBarBuilder`）属于逐品种有状态对象，必须在 `OnStartUp` 放入 `s.More` 中持有，切勿每根 K 线重新 `New*`。
 16. 对 `Series.Get` 的 NaN 做判断（`math.IsNaN(atr)`），尤其 `WarmupNum` 不够大时。
 17. 同品种不同周期的 job 是独立 Env；跨周期数据用 `DataSub`。
 18. `DrawDownExit` 覆盖订单止损触发器（§4.2）；`ExgStopLoss=false` 仅隐藏远端挂单仍保留本地止损监控（§3.3）；`MAMA/VPCI/DX/Fisher` 与标准定义不同；旧 API 新代码不用。

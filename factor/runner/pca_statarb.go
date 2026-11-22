@@ -99,6 +99,62 @@ func RegisterResidualStatArb(name string, spec ResidualStatArbSpec) error {
 	return reg.Register()
 }
 
+func resolveResidualStatArbSpec(build func(*Params) (ResidualStatArbSpec, error), c Config) (ResidualStatArbSpec, error) {
+	params := c.Params()
+	spec, err := build(params)
+	if err != nil {
+		return ResidualStatArbSpec{}, err
+	}
+	if err = params.Err(); err != nil {
+		return ResidualStatArbSpec{}, err
+	}
+	return normalizeResidualStatArbSpec(spec)
+}
+
+// BuildResidualStatArbParamsRegistration builds a parameterized cross-sectional PCA or
+// benchmark-residual stat-arb Registration resolved per run from Config.Params().
+func BuildResidualStatArbParamsRegistration(name string, build func(*Params) (ResidualStatArbSpec, error)) (Registration, error) {
+	if name == "" || build == nil {
+		return Registration{}, errors.New("runner: residual statarb strategy needs name and build function")
+	}
+	if _, err := resolveResidualStatArbSpec(build, Config{}); err != nil {
+		return Registration{}, err
+	}
+	builderName := name + "-residual-statarb-v1"
+	return Registration{
+		Name:        name,
+		BuilderName: builderName,
+		Definition: func(c Config) (*factor.Plan, research.ComboSpec, error) {
+			norm, err := resolveResidualStatArbSpec(build, c)
+			if err != nil {
+				return nil, research.ComboSpec{}, err
+			}
+			return compilePairsLogPlan(norm.Field, c.Factor.TimeFrame)
+		},
+		Factory: func(c Config) (PortfolioBuilder, error) {
+			norm, err := resolveResidualStatArbSpec(build, c)
+			if err != nil {
+				return nil, err
+			}
+			return newResidualStatArbBuilder(norm, c.Snapshot.Universe, c.Snapshot.SIDMap, c.UnavailableSymbols)
+		},
+		Validator: func(c Config) error {
+			_, err := resolveResidualStatArbSpec(build, c)
+			return err
+		},
+	}, nil
+}
+
+// RegisterResidualStatArbParams validates default parameters and registers a parameterized
+// cross-sectional PCA or benchmark-residual stat-arb strategy under `<name>` and `<name>-residual-statarb-v1`.
+func RegisterResidualStatArbParams(name string, build func(*Params) (ResidualStatArbSpec, error)) error {
+	reg, err := BuildResidualStatArbParamsRegistration(name, build)
+	if err != nil {
+		return err
+	}
+	return reg.Register()
+}
+
 func normalizeResidualStatArbSpec(spec ResidualStatArbSpec) (ResidualStatArbSpec, error) {
 	if spec.Field == "" {
 		spec.Field = "close"

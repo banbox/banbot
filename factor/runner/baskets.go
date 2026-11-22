@@ -136,6 +136,66 @@ func RegisterBaskets(name string, spec BasketsSpec) error {
 	return reg.Register()
 }
 
+func resolveBasketsSpec(build func(*Params) (BasketsSpec, error), c Config) (BasketsSpec, error) {
+	params := c.Params()
+	spec, err := build(params)
+	if err != nil {
+		return BasketsSpec{}, err
+	}
+	if err = params.Err(); err != nil {
+		return BasketsSpec{}, err
+	}
+	return normalizeBasketsSpec(spec)
+}
+
+// BuildBasketsParamsRegistration builds a parameterized multi-leg cointegrated basket
+// Registration whose BasketsSpec is resolved per run from Config.Params().
+func BuildBasketsParamsRegistration(name string, build func(*Params) (BasketsSpec, error)) (Registration, error) {
+	if name == "" || build == nil {
+		return Registration{}, errors.New("runner: baskets strategy needs name and build function")
+	}
+	if _, err := resolveBasketsSpec(build, Config{}); err != nil {
+		return Registration{}, err
+	}
+	builderName := name + "-baskets-v1"
+	return Registration{
+		Name:        name,
+		BuilderName: builderName,
+		Definition: func(c Config) (*factor.Plan, research.ComboSpec, error) {
+			norm, err := resolveBasketsSpec(build, c)
+			if err != nil {
+				return nil, research.ComboSpec{}, err
+			}
+			return compilePairsLogPlan(norm.Field, c.Factor.TimeFrame)
+		},
+		Factory: func(c Config) (PortfolioBuilder, error) {
+			norm, err := resolveBasketsSpec(build, c)
+			if err != nil {
+				return nil, err
+			}
+			builder, tracker, err := newTrackedBasketsBuilder(norm, c.Snapshot.SIDMap, c.UnavailableSymbols)
+			if err == nil && c.observe != nil {
+				c.observe.pairs, c.observe.reset = tracker.report, tracker.resetStats
+			}
+			return builder, err
+		},
+		Validator: func(c Config) error {
+			_, err := resolveBasketsSpec(build, c)
+			return err
+		},
+	}, nil
+}
+
+// RegisterBasketsParams validates default parameters and registers a parameterized
+// multi-leg cointegrated basket strategy under `<name>` and `<name>-baskets-v1`.
+func RegisterBasketsParams(name string, build func(*Params) (BasketsSpec, error)) error {
+	reg, err := BuildBasketsParamsRegistration(name, build)
+	if err != nil {
+		return err
+	}
+	return reg.Register()
+}
+
 func normalizeBasketsSpec(spec BasketsSpec) (BasketsSpec, error) {
 	if spec.Field == "" {
 		spec.Field = "close"

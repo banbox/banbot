@@ -315,7 +315,9 @@ type BasketsSpec struct {
     MaxGross             float64               // aggregate gross cap in (0,1]; 0 defaults to 1.0
 }
 func BuildBasketsRegistration(name string, spec BasketsSpec) (Registration, error)
+func BuildBasketsParamsRegistration(name string, build func(*Params) (BasketsSpec, error)) (Registration, error)
 func RegisterBaskets(name string, spec BasketsSpec) error
+func RegisterBasketsParams(name string, build func(*Params) (BasketsSpec, error)) error
 ```
 
 - `"johansen"` uses `CointegratingVectors[0]` sign-stabilized so its first non-zero loading `beta[0] > 0`; `"multivariate_ols"` regresses centered leg `0` on centered legs `1..k-1` via `factor.LeastSquares` (with tiny ridge fallback when collinear) giving `[+1, -b_1, ..., -b_{k-1}]`.
@@ -346,7 +348,9 @@ type ResidualStatArbSpec struct {
     DriftBand         float64  // portfolio L1 weight drift buffer when active positions are unchanged (>=0)
 }
 func BuildResidualStatArbRegistration(name string, spec ResidualStatArbSpec) (Registration, error)
+func BuildResidualStatArbParamsRegistration(name string, build func(*Params) (ResidualStatArbSpec, error)) (Registration, error)
 func RegisterResidualStatArb(name string, spec ResidualStatArbSpec) error
+func RegisterResidualStatArbParams(name string, build func(*Params) (ResidualStatArbSpec, error)) error
 ```
 
 - **Signal Generation**: `"pca"` fits standardized `statistics.FitPCA` to form eigenportfolio returns and regresses each coin's returns via `factor.LeastSquares`; `"benchmarks"` regresses each coin's returns on benchmark returns. Cumulative residuals `X_i` over `OUWindow` are fit with `statistics.FitOU` (`sigma_eq = InnovationStd / sqrt(1 - (1+Slope)^2)`) and cross-sectionally centered to form `s_i = (X_{i,last} - m_eq_centered) / sigma_eq`.
@@ -678,7 +682,7 @@ For common live-trading constraints and Hub/embedded-mode details see the cross-
 
 | Item | Backtest / paper | Live |
 | --- | --- | --- |
-| Contract | `linear_perpetual` (execution valuation supports only this class and cash European options) | Linear perpetuals only (`Contract/Linear/Swap`, consistent settlement currency); spot/inverse/delivery/options rejected; hedge-mode positions rejected |
+| Contract | `linear_perpetual`, `spot` (same-exchange Cash-and-Carry via `extra_markets: [spot]`, long-only spot leg with zero funding), and Events paper cash European options | Linear perpetuals only (`Contract/Linear/Swap`, consistent settlement currency); spot/inverse/delivery/options rejected; hedge-mode positions rejected |
 | Shorting | Linear perpetual, open both directions | Same as left |
 | Funding | `explicit-zero` or `required-stream` | Default/`banexg`/`hub` use Hub mode: the strategy side accepts `explicit-zero` and `required-stream` (the latter needs `funding_source`), and one must be declared explicitly; `dry_run` Hub forces `explicit-zero`; **embedded banexg binding only (non-Hub) must use `required-stream` with authoritative funding cash capability** |
 | Price | Events: tick or 1m stream; spread-type fill models need bid/ask | Real-time subscription, requires startup reconciliation |

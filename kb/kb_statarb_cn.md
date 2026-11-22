@@ -315,7 +315,9 @@ type BasketsSpec struct {
     MaxGross             float64               // 组合总敞口上限 (0,1]；0 缺省 1.0
 }
 func BuildBasketsRegistration(name string, spec BasketsSpec) (Registration, error)
+func BuildBasketsParamsRegistration(name string, build func(*Params) (BasketsSpec, error)) (Registration, error)
 func RegisterBaskets(name string, spec BasketsSpec) error
+func RegisterBasketsParams(name string, build func(*Params) (BasketsSpec, error)) error
 ```
 
 - `"johansen"` 取首协整向量 `CointegratingVectors[0]` 并固定符号使首个非零分量 `beta[0] > 0`；`"multivariate_ols"` 将第 0 腿对 `[1, leg_1..leg_{k-1}]` 中心化最小二乘回归（秩亏时启用微幅岭回归回退），系数取 `[+1, -b_1, ..., -b_{k-1}]`。
@@ -346,7 +348,9 @@ type ResidualStatArbSpec struct {
     DriftBand         float64  // 活跃仓位未变时的组合 L1 权重漂移缓冲带（>=0）
 }
 func BuildResidualStatArbRegistration(name string, spec ResidualStatArbSpec) (Registration, error)
+func BuildResidualStatArbParamsRegistration(name string, build func(*Params) (ResidualStatArbSpec, error)) (Registration, error)
 func RegisterResidualStatArb(name string, spec ResidualStatArbSpec) error
+func RegisterResidualStatArbParams(name string, build func(*Params) (ResidualStatArbSpec, error)) error
 ```
 
 - **信号生成**：`"pca"` 对标准化收益率运行 `statistics.FitPCA` 构造特征组合收益率并逐币种 OLS 提取残差；`"benchmarks"` 对显式基准收益率做多元 OLS 提取残差。在 `OUWindow` 累计残差 `X_i` 上运行 `FitOU`，计算 `sigma_eq = InnovationStd / sqrt(1 - (1+Slope)^2)` 并去截面偏离均值得到中心化 `s_i = (X_{i,last} - m_eq_centered) / sigma_eq`。
@@ -678,7 +682,7 @@ func (s CrossVenueSnapshot) Equity(mark decimal.Decimal) (decimal.Decimal, error
 
 | 项 | 回测 / paper | 实盘 |
 | --- | --- | --- |
-| 合约 | `linear_perpetual`（执行估值仅此类与 cash 欧式期权） | 仅线性永续（`Contract/Linear/Swap`、结算币一致）；现货/反向/交割/期权拒绝；hedge 持仓拒绝 |
+| 合约 | `linear_perpetual`、`spot`（同所期现套利 `extra_markets: [spot]`，现货腿只做多、零资金费）及 Events 纸面 cash 欧式期权 | 仅线性永续（`Contract/Linear/Swap`、结算币一致）；现货/反向/交割/期权拒绝；hedge 持仓拒绝 |
 | 做空 | 线性永续双向开仓 | 同左 |
 | 资金费 | `explicit-zero` 或 `required-stream` | 缺省/`banexg`/`hub` 走 Hub 模式：策略侧接受 `explicit-zero` 与 `required-stream`（需 `funding_source`），须显式声明；`dry_run` Hub 强制 `explicit-zero`；**仅嵌入式 banexg 绑定（非 Hub）必须 `required-stream` 且有权威资金费现金能力** |
 | 价格 | Events：tick 或 1m 流；spread 类成交模型需 bid/ask | 实时订阅，需启动对账 |
