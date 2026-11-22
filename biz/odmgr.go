@@ -2064,6 +2064,10 @@ func (o *OrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.Data
 			continue
 		}
 		od.UpdateProfits(closeVal)
+		if od.Status < ormo.InOutStatusPartEnter {
+			// Wait until entry fills before arming activePrice or advancing trailing stops.
+			continue
+		}
 		activePrice := od.GetInfoFloat64(ormo.OdInfoActivePrice)
 		if activePrice > 0 {
 			if od.Short && activePrice >= min(lowVal, closeVal) || !od.Short && activePrice <= max(highVal, closeVal) {

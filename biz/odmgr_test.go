@@ -180,3 +180,72 @@ func runOrmoTest() (int64, *errs.Error) {
 	conn.Close()
 	return elapsed, nil
 }
+
+func TestUpdateByDataSeriesSkipsTrailingBeforeEntryFill(t *testing.T) {
+	const symbol = "TRAIL/USDT:USDT"
+	mgr := &setupLocalCleanupTest(t, false, false).OrderMgr
+	mgr.orderState().SetTask(mgr.Account, &ormo.BotTask{ID: 1})
+
+	od := &ormo.InOutOrder{
+		IOrder: &ormo.IOrder{
+			ID:        201,
+			TaskID:    1,
+			Symbol:    symbol,
+			Timeframe: "1m",
+			Strategy:  "stgy",
+			InitPrice: 100,
+			Status:    ormo.InOutStatusInit,
+		},
+		Enter: &ormo.ExOrder{
+			Enter:     true,
+			Symbol:    symbol,
+			OrderType: banexg.OdTypeMarket,
+			Side:      banexg.OdSideBuy,
+			Amount:    1,
+			Status:    ormo.OdStatusInit,
+		},
+	}
+	od.BindState(mgr.orderState())
+	od.SetInfo(ormo.OdInfoCallbackPct, 5.0)
+	od.SetInfo(ormo.OdInfoActivePrice, 105.0)
+
+	sym := &orm.ExSymbol{ID: 1, Symbol: symbol}
+	signalBar := orm.NewDataSeriesFromKline(sym, "1m", &banexg.Kline{
+		Time: 1_700_000_040_000, Open: 100, High: 110, Low: 95, Close: 108,
+	}, nil, true, true)
+	if err := mgr.UpdateByDataSeries([]*ormo.InOutOrder{od}, signalBar); err != nil {
+		t.Fatal(err)
+	}
+	if got := od.GetInfoFloat64(ormo.OdInfoActivePrice); got != 105.0 {
+		t.Fatalf("unfilled entry cleared/changed ActivePrice: got %v, want 105", got)
+	}
+	if got := od.GetInfoFloat64(ormo.OdInfoTrailingBest); got != 0 {
+		t.Fatalf("unfilled entry updated TrailingBest: got %v, want 0", got)
+	}
+	if sl := od.GetStopLoss(); sl != nil {
+		t.Fatalf("unfilled entry created trailing stop loss: %+v", sl)
+	}
+
+	// Once the entry fills, UpdateByDataSeries should activate and advance trailing.
+	od.Status = ormo.InOutStatusFullEnter
+	od.Enter.Average = 100
+	od.Enter.Filled = 1
+	od.Enter.Status = ormo.OdStatusClosed
+
+	postFillBar := orm.NewDataSeriesFromKline(sym, "1m", &banexg.Kline{
+		Time: 1_700_000_100_000, Open: 100, High: 106, Low: 99, Close: 102,
+	}, nil, true, true)
+	if err := mgr.UpdateByDataSeries([]*ormo.InOutOrder{od}, postFillBar); err != nil {
+		t.Fatal(err)
+	}
+	if got := od.GetInfoFloat64(ormo.OdInfoActivePrice); got != 0 {
+		t.Fatalf("expected ActivePrice to clear after fill bar hit 105, got %v", got)
+	}
+	if got := od.GetInfoFloat64(ormo.OdInfoTrailingBest); got != 106.0 {
+		t.Fatalf("expected TrailingBest=106, got %v", got)
+	}
+	sl := od.GetStopLoss()
+	if sl == nil || math.Abs(sl.Price-100.7) > 1e-9 {
+		t.Fatalf("expected trailing stop at 100.7, got %+v", sl)
+	}
+}
