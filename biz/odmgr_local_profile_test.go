@@ -4,6 +4,9 @@ import (
 	"math"
 	"testing"
 
+	"github.com/banbox/banbot/btime"
+	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banexg"
@@ -167,5 +170,95 @@ func BenchmarkTSOHLCProfile(b *testing.B) {
 	}
 	if result == 0 {
 		b.Fatal("profile not evaluated")
+	}
+}
+
+func TestFillPendingOrdersSkipsRefineBarBeforeCreateAt(t *testing.T) {
+	const decisionMS = int64(1_700_000_040_000)
+
+	state, err := core.NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	state.BackTestMode, state.EnvReal = true, true
+	state.Market = banexg.MarketLinear
+
+	sym := &orm.ExSymbol{ID: 1, Exchange: "binance", Market: banexg.MarketLinear, Symbol: "OHLC/USDT:USDT"}
+	symbols := orm.NewSymbolState()
+	if setErr := symbols.SetExSymbols([]*orm.ExSymbol{sym}); setErr != nil {
+		t.Fatal(setErr)
+	}
+
+	cfg := config.NewSnapshotWithDirs(&config.Config{
+		MarketType:    banexg.MarketLinear,
+		WalletAmounts: map[string]float64{"USDT": 100_000},
+		Accounts:      map[string]*config.AccountConfig{"cleanup-test": {Leverage: 1}},
+		BTNetCost:     15,
+	}, t.TempDir(), "")
+	clock := btime.NewClockState(true, nil)
+	clock.SetTimeMS(decisionMS)
+	trader := newCompleteTraderForTest(t, RuntimeDeps{
+		Core: state, Clock: clock, Config: cfg, Symbols: symbols,
+		Exchange: newTSCapsMockExchange(sym.Symbol), DefaultAccount: "cleanup-test",
+	})
+	deps := *trader.RuntimeDependencies()
+	InitFakeWalletsWithRuntimeDeps(deps)
+	deps.Market.Prices.SetBarPriceAt(decisionMS, sym.Symbol, 100)
+	mgr := &LocalOrderMgr{OrderMgr: OrderMgr{Account: "cleanup-test", callBack: func(*ormo.InOutOrder, bool) {}}, zeroAmts: make(map[string]int)}
+	mgr.bindRuntimeDeps(deps)
+
+	entryOrder := &ormo.InOutOrder{
+		IOrder: &ormo.IOrder{
+			ID:        101,
+			TaskID:    1,
+			Sid:       1,
+			Symbol:    sym.Symbol,
+			Timeframe: "1m",
+			Strategy:  "stgy",
+			Leverage:  1,
+			InitPrice: 100,
+			Status:    ormo.InOutStatusInit,
+		},
+		Enter: &ormo.ExOrder{
+			Enter:     true,
+			Symbol:    sym.Symbol,
+			CreateAt:  decisionMS,
+			OrderType: banexg.OdTypeMarket,
+			Side:      banexg.OdSideBuy,
+			Amount:    1,
+			Status:    ormo.OdStatusInit,
+		},
+	}
+
+	exitOrder := cleanupPendingExit(102, sym.Symbol)
+	exitOrder.Sid = 1
+	exitOrder.Exit.CreateAt = decisionMS
+
+	// Bar [T-1m, T) closes at decisionMS: neither order existed before T.
+	priorBar := orm.NewDataSeriesFromKline(sym, "1m", &banexg.Kline{
+		Time: decisionMS - 60_000, Open: 90, High: 92, Low: 89, Close: 91,
+	}, nil, true, true)
+	count, _, fillErr := mgr.fillPendingOrdersPass([]*ormo.InOutOrder{entryOrder, exitOrder}, priorBar)
+	if fillErr != nil {
+		t.Fatal(fillErr)
+	}
+	if count != 0 || entryOrder.Status != ormo.InOutStatusInit || exitOrder.Status != ormo.InOutStatusFullEnter {
+		t.Fatalf("expected prior bar ending at decisionMS to skip fills, got count=%d entryStatus=%d exitStatus=%d",
+			count, entryOrder.Status, exitOrder.Status)
+	}
+
+	// Next bar [T, T+1m) begins at decisionMS: both orders should now fill from it.
+	clock.SetTimeMS(decisionMS + 60_000)
+	nextBar := orm.NewDataSeriesFromKline(sym, "1m", &banexg.Kline{
+		Time: decisionMS, Open: 100, High: 104, Low: 99, Close: 103,
+	}, nil, true, true)
+	count, _, fillErr = mgr.fillPendingOrdersPass([]*ormo.InOutOrder{entryOrder, exitOrder}, nextBar)
+	if fillErr != nil {
+		t.Fatal(fillErr)
+	}
+	if count != 2 || entryOrder.Status != ormo.InOutStatusFullEnter || exitOrder.Status != ormo.InOutStatusFullExit {
+		t.Fatalf("expected next bar to fill both orders, got count=%d entryStatus=%d exitStatus=%d",
+			count, entryOrder.Status, exitOrder.Status)
 	}
 }
