@@ -47,7 +47,30 @@ webhook:
 | `retry_delay` | 失败重试间隔，秒 |
 | `proxy` | 渠道代理配置 |
 
-消息异步排队，可能合并发送；不能用收到通知的时刻代替交易所成交时间。异常通知还受聚合与限速控制。模板字段随消息类型而变，入场/出场可使用 `pair`、`strategy`、`price`、`value` 等对应字段。
+消息异步排队，可能合并发送；不能用收到通知的时刻代替交易所成交时间。发送受 `min_intv_secs` 限速，失败后按 `retry_delay` 重试；停止时尚未发出的消息会被丢弃。模板字段随消息类型而变，入场/出场可使用 `pair`、`strategy`、`price`、`value` 等对应字段。
+
+## 按账户绑定渠道
+
+多账户时，可在 `accounts.<账户名>.rpc_channels` 中引用全局渠道并覆盖部分字段，为该账户生成专属渠道：
+
+```yaml
+rpc_channels:
+  tg_main:
+    type: telegram
+    token: "BOT_TOKEN"
+    chat_id: 123456
+accounts:
+  acc1:
+    rpc_channels:
+      - name: tg_main
+        msg_types: [entry, exit]
+```
+
+- 每项必须含 `name`，且须是全局 `rpc_channels` 中已有的渠道名，否则启动报错；其余字段覆盖该渠道的同名配置。
+- 未写 `accounts` 字段时，默认只发送该账户的消息。
+- 生成的渠道名为 `<name>_<账户名>`；全局渠道本身仍然保留，不受影响。
+- `no_trade: true` 的账户会跳过。
+- 未配置全局 `rpc_channels` 时不会创建任何渠道。
 
 ## 企业微信与 Telegram
 

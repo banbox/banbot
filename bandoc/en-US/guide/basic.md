@@ -7,6 +7,7 @@ This page introduces some basic principles and concepts of banbot.
 * Timeframe: The time interval of the trading candlestick (e.g., `5m`, `1h`).
 * Indicator: Technical indicators (such as SMA, EMA, RSI, etc.).
 * Leverage: Used in futures contracts, Margin = Nominal Value / Leverage.
+* Stop (entry trigger): the entry only happens once price reaches the trigger price; setting a limit price as well makes a Stop-Limit entry
 * TakeProfit: Submitting a limit exit order to the exchange for the current order (e.g., entering a long position at $10, when the price reaches $11, a limit take profit can be set above $11 and wait for execution).
 * StopLoss: Setting a stop loss for the current order at the exchange. There are market stop losses and limit stop losses (e.g., entering a long position at $10, when the price reaches $11, a stop loss can be set below $11 as the trigger price).
 
@@ -140,7 +141,7 @@ New strategies can use `OnData(s, event)` and route main, auxiliary and custom e
 4. `OpenOrder`/`CloseOrders` create intents; the order manager matches or submits them. Track updates with `OnOrderChange`. Shared accounts also combine strategy targets and persist the execution ledger.
 5. Update wallets, reports, notifications and monitoring; release subscriptions/resources when the task stops.
 
-Batch strategies use `BatchInOut`/`BatchInfo` and batch callbacks. Historical and live batch readiness differ: one arriving event does not guarantee all symbols are ready.
+Batch strategies use `BatchInOut`/`BatchInfo` and batch callbacks. Open/close requests made in the main-timeframe batch callback `OnBatchJobs` are submitted automatically after the callback; those made in the auxiliary batch callback `OnBatchInfos` are not. Historical and live batch readiness differ: one arriving event does not guarantee all symbols are ready.
 
 ## Choose a run mode
 

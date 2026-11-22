@@ -10,7 +10,7 @@
 
 ```yaml
 pairmgr:
-  pos_on_rotation: hold  # hold 或 close
+  pos_on_rotation: hold  # hold 或 close，省略时为 hold
   use_latest: false      # 回测未启用 cron 时，是否按最新日期确定品种列表
 ```
 
@@ -26,7 +26,7 @@ pairmgr:
 * OffsetFilter
 * ShuffleFilter
 
-yaml的品种过滤器列表的第一个必须是`VolumePairList`，它可以从市场所有品种返回一个品种列表。
+yaml的品种过滤器列表的第一个必须是能产出品种的过滤器，内置的只有`VolumePairList`，它可以从市场所有品种返回一个品种列表（自定义产出器需实现`IProducer`）。每个过滤器都可设置`disable: true`临时停用而不必删除配置。
 
 ## VolumePairList
 根据交易量对货币对进行排序/过滤。当其处于第一个时，会计算由`back_period`指定的周期内，所有品种的交易量，并降序返回。
@@ -69,11 +69,13 @@ yaml的品种过滤器列表的第一个必须是`VolumePairList`，它可以从
     back_num: 70  # 计算相关性回顾数据长度
     sort: asc  # 贪心优先选择与已选品种低相关的品种
     top_n: 50  # 最大返回数量，0 不限制
+    top_rate: 0.1  # 最大返回数量占全部品种的比例，0 不限制
 ```
+需要设置`timeframe`、非零`back_num`，且`max`、`top_n`、`top_rate`至少一个非零，过滤器才会生效。
 ## VolatilityFilter
-波动性过滤器。公式：std(log(c/c1)) * sqrt(back_days)
+波动性过滤器。公式：StdDev(ln(c_t/c_{t-1})) * sqrt(收益率个数)，收益率个数为 back_days-1（历史不足时更少）
 ```yaml
-  - name: VolatilityFilter  # 波动性过滤器，公式：std(log(c/c1)) * sqrt(back_days)
+  - name: VolatilityFilter  # 波动性过滤器，公式：StdDev(ln(c_t/c_{t-1})) * sqrt(收益率个数)
     back_days: 10  # 回顾的K线天数
     max: 1  # 波动分数最大值，此值越大，允许一些在1d级别上变化非常剧烈的标的
     min: 0.05  # 波动分数最小值，此值越小，允许一些在1d级别上变化非常小的标的
@@ -82,7 +84,8 @@ yaml的品种过滤器列表的第一个必须是`VolumePairList`，它可以从
 按品种上市时间过滤。
 ```yaml
   - name: AgeFilter  # 按标的的上市天数过滤
-    min: 5
+    min: 5  # 最小上市天数
+    max: 0  # 最大上市天数，0 不限制
 ```
 ## BlockFilter
 品种黑名单过滤器，用于过滤指定品种。

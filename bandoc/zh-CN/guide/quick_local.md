@@ -122,6 +122,8 @@ database:
 
 <img style="width:780px;margin-top:10px" src="/img/run_webui.jpg"/>
 
+WebUI 设置页的“主题”可切换亮色、暗色或跟随系统，偏好保存在浏览器本地。
+
 接下来您可能希望了解[banbot从入门到进阶](https://www.bilibili.com/video/BV1b72CBXEQu/)
 
 管理策略项目时，我们推荐使用AI IDE；您也可以使用`Visual Studio Code`或`GoLand`

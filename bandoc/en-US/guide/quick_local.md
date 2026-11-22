@@ -131,6 +131,8 @@ For more usage of the command line, [please refer to](./bot_usage.md).
 
 <img style="width:780px;margin-top:10px" src="/img/run_webui.jpg"/>
 
+The Settings page has a "Theme" option for light, dark or follow-system; the preference is stored in the browser.
+
 Next, you might want to check out [banbot from beginner to advanced](https://www.bilibili.com/video/BV1b72CBXEQu/)
 
 When managing strategy projects, we recommend using AI IDE; you can also use `Visual Studio Code` or `GoLand`.

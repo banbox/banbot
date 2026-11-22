@@ -14,6 +14,10 @@ We strongly recommend that you use our online AI assistant to aid in development
 While the AI assistant is very convenient, it can still make mistakes. You must check and understand the strategy code output by the AI to ensure it aligns with your logic; otherwise, the subsequent backtesting and live trading will be meaningless.
 :::
 
+::: tip Statistical arbitrage and cross-sectional strategies
+Time-series strategies can also reuse engine-independent primitives: `NewRollingSpread`/`NewBandTrader` in `github.com/banbox/banbot/factor/statistics` (pair-spread z-score with entry/exit/stop hysteresis). For the shortest path to cross-sectional and pairs strategies, see [Multi-factor strategies](./factor.md).
+:::
+
 ## Strategy Naming
 The recommended naming format is `folder:strategy_name`. You may have many different categories of trading strategies. For easy long-term maintenance, it is recommended to put similar strategies in the same folder. The depth is not limited.
 
@@ -85,8 +89,21 @@ Each item in the yaml configuration `run_policy` corresponds to a call to the st
 The same strategy can appear in multiple `run_policy` items, that is, the same strategy function may be executed multiple times.
 The `*strat.TradeStrat` returned by the strategy function will be applied to multiple varieties, corresponding to multiple `*strat.StratJob`.
 Therefore, any variables related to a single symbol should not be saved in the strategy function, but should be saved through `*strat.StratJob.More`.
+The `TradeStrat` and its closures are shared by all symbols and accounts of the strategy, so counters or flags kept in a closure are overwritten by different symbols.
 The variables in the strategy function should remain unchanged. Otherwise, it will lead to unexpected states.
 :::
+
+### Parameter validation {#require}
+
+Validate parameters in the constructor with `pol.Require(cond, msg)` or `pol.Requiref(cond, format, args...)`. When the condition fails, construction of that strategy fails and is reported as a configuration error (BadConfig) instead of a runtime crash; genuine runtime errors (such as a nil dereference) are not reclassified as configuration errors.
+```go
+func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+    fast := pol.DefInt("fast", 10, core.PNorm(5, 30))
+    slow := pol.DefInt("slow", 30, core.PNorm(20, 100))
+    pol.Require(fast < slow, "require fast < slow")
+    return &strat.TradeStrat{WarmupNum: slow * 3}
+}
+```
 
 ## strat.TradeStrat Strategy Object
 
@@ -98,6 +115,7 @@ type TradeStrat struct {
 	Name          string  // The strategy name does not need to be set and will be automatically set to the name used during registration
 	Version       int     
 	WarmupNum     int     // candle preheating length
+	OdBarMax      int     // Max bars a backtest simulates forward to find unfinished positions, default 500; run_policy.order_bar_max takes precedence
 	MinTfScore    float64 // Minimum time cycle quality, default 0.75
     WsSubs        map[string]string    // websocket subscription: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 	DrawDownExit  bool    // Whether to enable retracement stop loss (i.e. trailing stop loss)
@@ -107,9 +125,11 @@ type TradeStrat struct {
 	StakeRate     float64 // Relative basic amount billing rate
     StopLoss      float64 // Default stop loss rate for all orders opened by this strategy (without leverage).
 	StopEnterBars int     // If the limit order exceeds the given K line and still does not enter the market, it will be cancelled
+	OrderOnRotation string // Old job after its symbol is rotated out: "open" keeps allowing new orders while it holds orders; whether positions are closed is set by pairmgr.pos_on_rotation
 	EachMaxLong   int      // max number of long open orders for one pair
 	EachMaxShort  int      // max number of short open orders for one pair
 	RunTimeFrames []string // Allowed running periods; when omitted, use the current Runtime configuration snapshot default
+	RefineTF      interface{} // Strategy default order-matching timeframe, e.g. "5m", 12, "3-6"; an explicit run_policy.refine_tf takes precedence
 	Outputs       []string // The content of the text file output by the strategy, where each string is one line
 	Policy        *config.RunPolicyConfig
 
@@ -126,7 +146,7 @@ type TradeStrat struct {
     OnWsDepth           func(s *StratJob, dep *banexg.OrderBook)               // Websocket order book
     OnWsKline           func(s *StratJob, pair string, k *banexg.Kline)        // websocket real-time kline(may unfinish)
 	OnBatchJobs         func(jobs []*StratJob)                             // All target jobs at the current time, used for bulk opening/closing of orders
-	OnBatchInfos        func(tf string, jobs map[string]*JobEnv)            // All info marked jobs at the current time, used for batch processing
+	OnBatchInfos        func(tf string, jobs map[string]*JobEnv)            // All info marked jobs at the current time, used for batch processing (open/close requests here are not submitted automatically)
 	OnCheckExit         func(s *StratJob, od *ormo.InOutOrder) *ExitReq     // Custom order exit logic
 	OnOrderChange       func(s *StratJob, od *ormo.InOutOrder, chgType int) // Order update callback
 	GetDrawDownExitRate CalcDDExitRate                                     // Calculate the ratio of tracking profit taking, drawdown, and exit
@@ -394,11 +414,100 @@ func Demo2(pol *config.RunPolicyConfig) *strat.TradeStrat {
 ```
 The above is a moving average crossover strategy that combines both large and small timeframes. It enters the market only when the short moving average is above the long moving average on the larger timeframe, and the short moving average crosses above the long moving average on the smaller timeframe.
 
-This strategy can be configured in the YML file to run on a `5m` small timeframe, while internally it specifies the subscription to `1h` large timeframe data. In `OnPairInfos`, `_cur_` represents the current trading pair. If other trading pairs are needed, you can hardcode the value in this section.
+This strategy can be configured in the YML file to run on a `5m` small timeframe, while internally it specifies the subscription to `1h` large timeframe data. In `OnPairInfos`, `_cur_` represents the current trading pair. If other trading pairs are needed, you can hardcode the value in this section. A symbol that cannot be found in the current exchange and market is skipped silently.
 
 ::: tip Tip
 `OnInfoBar` is solely intended for the consumption of additional candlestick data. Please refrain from executing logic related to opening/closing positions or updating stop-loss orders within this function.
 :::
+
+## Reference data: other symbols or timeframes {#ref_kline}
+
+Strategies that use `OnData` can declare read-only K-line reference subscriptions with `RefKlineSub`; no trading job is created for the referenced symbol.
+
+| Method | Description |
+| --- | --- |
+| `s.RefKlineSub(symbol, timeframe string, warmupNum ...int) *DataSub` | An empty `symbol` or `_cur_` means another timeframe of the current symbol; `BTC` or `BTC/USDT:USDT` are also accepted and normalized to the current exchange and market. When `warmupNum` is omitted, `TradeStrat.WarmupNum` is used |
+| `s.RefEnv(symbol, timeframe string) *ta.BarEnv` | The synchronized K-line environment of that subscription; `nil` until its first bar arrives, after which `Open/High/Low/Close/Volume/Quote/BuyVolume/TradeNum` are all available |
+| `s.Data(sub *DataSub) *DataFields` | The data view of a subscription; a nil `sub.ExSymbol` means the current symbol |
+
+Each reference bar arrives as an auxiliary (`Info`) event. Calculate indicators in that event and let the main callback only read the result:
+
+```go
+type refState struct{ btcUp bool }
+
+func RefDemo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+    return &strat.TradeStrat{
+        WarmupNum: 100,
+        OnStartUp: func(s *strat.StratJob) { s.More = &refState{} },
+        OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+            return []*strat.DataSub{s.RefKlineSub("BTC/USDT:USDT", "1h", 100)}
+        },
+        OnData: strat.RouteData(strat.DataHandlers{
+            Info: func(s *strat.StratJob, d strat.DataEvent) {
+                env := s.RefEnv("BTC/USDT:USDT", "1h")
+                if env == nil { return }
+                s.More.(*refState).btcUp = env.Close.Get(0) > ta.SMA(env.Close, 20).Get(0)
+            },
+            Main: func(s *strat.StratJob, d strat.DataEvent) {
+                if s.IsWarmUpState() || !s.More.(*refState).btcUp { return }
+                _ = s.OpenOrder(&strat.EnterReq{Tag: "btc_trend", Log: true})
+            },
+        }),
+    }
+}
+```
+For K-line subscriptions, `DataFields.BarEnv()` returns a full `*ta.BarEnv` (likewise non-`nil` only after the first bar, and always `nil` for non-K-line sources), so indicators that need full OHLCV such as `ta.MFI(env, 14)`, `ta.WillR(env, 14)` and `ta.HeikinAshi(env)` can be used directly on reference data.
+
+### Built-in derivatives data
+
+Built-in sources such as funding rate, open interest and mark/index/premium K-lines are subscribed by name in `OnDataSubs` and arrive as `Custom` events; download the data first:
+```go
+OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+    return []*strat.DataSub{
+        {Source: orm.SeriesSourceFundingRate, TimeFrame: "8h", WarmupNum: 3},
+        {Source: orm.SeriesSourcePremiumKline, TimeFrame: "1h", WarmupNum: 3},
+    }
+},
+OnData: strat.RouteData(strat.DataHandlers{
+    Custom: func(s *strat.StratJob, d strat.DataEvent) {
+        if d.Source == orm.SeriesSourceFundingRate { s.More.(*derivState).funding = d.Float64("rate") }
+    },
+    Main: func(s *strat.StratJob, d strat.DataEvent) { /* ... */ },
+}),
+```
+Fields, default timeframes, downloading and backtest semantics of each source are covered in [Custom time-series data](./custom_data); a complete strategy is `derivatives.go` in [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures).
+
+## Intraday session helpers {#intraday}
+
+`StratJob` has built-in intraday/session statistics without lookahead; their state is kept per job (symbol). Anchor arguments are UTC minutes of the day (`0`-`1439`, taken modulo 1440); the `btime` package provides common anchors such as `btime.NewYorkOpenMinutes` (13:30 UTC), `btime.LondonCashOpenMinutes` (08:00 UTC) and `btime.AsiaCloseMinutes` (08:00 UTC).
+
+| Method | Description |
+| --- | --- |
+| `OpeningRange(anchorMinutesUTC, rangeMinutes int) OpeningRangeSnapshot` | Opening range over `[anchor, anchor+rangeMinutes)`: `Open/High/Low/Close/Mid/Width/Volume` |
+| `OpeningRangeWithOpts(anchorMinutesUTC, rangeMinutes int, opts OpeningRangeOptions) OpeningRangeSnapshot` | Same; `AllowSingleBarFallback` lets a timeframe coarser than the range fall back to a single bar (`DegradedSingleBar=true`) |
+| `SessionRange(startMinUTC, endMinUTC int) SessionRangeSnapshot` | Range of a recurring session window (may cross midnight, e.g. 22:00-02:00); fields include `Completed/JustCompleted/InSession/InPostSession` |
+| `PrevDayOHLC(anchorMinutesUTC int) (PrevOHLC, bool)` | `Open/High/Low/Close/Pivot/Range/Volume` of the previous complete trading day |
+| `PrevNDaysStats(anchorMinutesUTC, nDays int) (PrevNDaysSummary, bool)` | Statistics over the last `nDays` (1-366) complete trading days: `HH/HC/LC/LL/AvgRange/DualThrustRange/History`, etc. |
+| `DualThrustBands(anchorMinutesUTC, nDays int, k1, k2 float64) (upper, lower, dayOpen float64, ok bool)` | Dual Thrust bands: `dayOpen +/- k x Range` |
+| `RBreakerLevels(anchorMinutesUTC int) (RBreakerSnap, bool)` / `RBreakerLevelsBy(anchorMinutesUTC int, f1, f2, f3 float64)` | The six R-Breaker levels plus today's running open/high/low |
+
+Notes:
+- Before `Ready` (`Completed` for `SessionRange`) the range values such as `High/Low` are 0, so an unfinished range never leaks; `Applicable=false` means the current timeframe does not fit (1d or coarser, range not aligned to the timeframe, or timeframe coarser than the range without single-bar fallback), and no result will appear.
+- With a non-zero anchor, `PrevDayOHLC` and related methods do not treat an incomplete leading day as the previous day; warmup should cover at least one full trading day, and do not trade while `ok` is `false`.
+- Call them on every bar in the main callback so their state advances with the bars; repeated calls within one bar return the same result.
+- Without an environment (`s.Env==nil`) they return zero values and `false`.
+
+```go
+Main: func(s *strat.StratJob, _ strat.DataEvent) {
+    orb := s.OpeningRange(btime.NewYorkOpenMinutes, 30) // call on every bar
+    if !orb.Ready || !orb.InPostRange || s.GetOrderNum(0) > 0 { return }
+    if c := s.Env.Close.Get(0); c > orb.High {
+        // Stop at the range midpoint, size by risk rate
+        _ = s.OpenOrder(&strat.EnterReq{Tag: "orb_long", StopLoss: orb.Mid, TakeProfitVal: orb.Width * 2, RiskRate: 0.005})
+    }
+},
+```
+The run timeframe must not be larger than the range (e.g. `run_timeframes: [15m]` with a 30-minute range). See `orb.go` in [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) for a complete example.
 
 ## Save temp variables
 
@@ -412,7 +521,7 @@ Then perform type conversion in `OnBar` and `OnInfoBar` and assign it to the `m`
 m, _ := s.More.(*Demo2Sta)
 ```
 
-## Send an entry signal
+## Send an entry signal {#send_entry}
 
 To Send an entry signal, you only need to call the `StratJob.OpenOrder` method and pass a `*strat.EnterReq` parameter.
 
@@ -426,24 +535,27 @@ type EnterReq struct {
 	StratName        string  // Strategy Name
 	Short           bool    // Whether to short sell
 	OrderType       int     // Order type, core.OrderType*
-	Limit           float64 // Limit order entry price, submitted as limit order when specified
-    Stop            float64 // Stop price, buy orders enter when price rises to trigger, sell when falls.
+	Limit           float64 // Limit order entry price, submitted as limit order when specified; with Stop it makes a Stop-Limit entry
+    Stop            float64 // Entry trigger price (not a stop loss): a long enters when price rises to it, a short when price falls to it
+	OCOGroup        string  // OCO pending-entry group: when one entry in the group fills, the other unfilled entries are cancelled
 	CostRate        float64 // Opening ratio, default 1 times. Used for calculating LegalCost
+	RiskRate        float64 // Share of account equity risked at the stop loss, [0,1]; sizes the position from the stop distance when Amount/LegalCost are unset
 	LegalCost       float64 // Spend amount in fiat. Ignores CostRate when specified
 	Leverage        float64 // Leverage ratio
 	Amount          float64 // Amount of target asset, calculated from LegalCost or CostRate
-	StopLossVal     float64 // Distance from entry price to stop loss price, used to calculate StopLoss
-	StopLoss        float64 // Stop loss trigger price. Submits stop loss order if not empty
-	StopLossLimit   float64 // Stop loss limit price. If not provided, uses StopLoss
+	StopLossVal     float64 // Distance (price difference, not a ratio) from entry price to stop loss price, used to calculate StopLoss
+	StopLoss        float64 // Stop loss trigger price; submitted as an exchange conditional order, or only monitored locally when StratJob.ExgStopLoss=false
+	StopLossLimit   float64 // Limit price used after the stop triggers (0 = market); also the trigger price when StopLoss is 0
 	StopLossRate    float64 // Stop loss exit ratio. 0 means 100%. Must be (0,1]
 	StopLossTag     string  // Reason for Stop Loss
-	ActivationPrice float64 // Trailing stop activation price
-	CallbackPct float64 // Trailing stop callback percent, nonzero: 0.1–10
+	ActivationPrice float64 // Trailing stop activation price, 0 = active immediately; only used when CallbackPct>0
+	CallbackPct     float64 // Trailing stop callback percent (unit %, 1.5 means 1.5%), 0 = off, valid range [0.05, 50]
 	TakeProfitVal   float64 // Distance from entry price to take profit price, used to calculate TakeProfit
-	TakeProfit      float64 // Take profit trigger price. Submits take profit order if not empty
-	TakeProfitLimit float64 // Take profit limit price. If not provided, uses TakeProfit
+	TakeProfit      float64 // Take profit trigger price; submitted as an exchange order, or only monitored locally when StratJob.ExgTakeProfit=false
+	TakeProfitLimit float64 // Limit price used after the take profit triggers (0 = market); also the trigger price when TakeProfit is 0
 	TakeProfitRate  float64 // Take profit exit ratio. 0 means 100%. Must be (0,1]
 	TakeProfitTag   string  // Reason for profit taking
+	TakeProfits     []strat.TakeProfitTarget // Multi-stage take-profit ladder; cannot be combined with TakeProfit/TakeProfitVal/TakeProfitLimit
 	StopBars        int     // Cancel entry limit order if not filled after N bars
     ClientID        string  // Used to set the trailing part of the ClientOrderID submitted to the exchange.
     Infos           map[string]string // Used to set additional information saved in the order.
@@ -454,11 +566,46 @@ To trigger an entry at a specific price, you can set the `Limit` or `Stop` param
 
 `Limit` would put a limit order. For a long order, you can set a lower price to enter the position. For a short order, you can set a higher price to enter the position.
 
-`Stop` would put a trigger order (stop order). For a long order, you can set a higher price to enter after a breakout. For a short order, you can set a lower price to enter after a breakdown.
+`Stop` is the entry trigger price (not a stop loss; use `StopLoss` for that). For a long order, you can set a higher price to enter after a breakout. For a short order, you can set a lower price to enter after a breakdown.
 
-For a long breakout above 120 when the price is 100, use `&strat.EnterReq{Tag: "breakout", Stop: 120}`. `Stop` and `Limit` are mutually exclusive; setting both returns an error.
+Setting both `Stop` and `Limit` makes a Stop-Limit entry: once price reaches `Stop`, a limit order rests at `Limit`; if `Stop` has already been crossed by the current price, the limit order is placed directly. `Limit` cannot be set when `OrderType` is `core.OrderTypeMarket`.
+
+For a long breakout above 120 when the price is 100, use `&strat.EnterReq{Tag: "breakout", Stop: 120}`. To buy after the breakout at no more than 121, with a stop loss:
+```go
+_ = s.OpenOrder(&strat.EnterReq{Tag: "breakout", Stop: 120, Limit: 121, StopLoss: 110, StopBars: 3})
+```
 
 When `OpenOrder` returns an error, it indicates that opening the order failed. You can use `log.Error` to record error information, or set `Log` to true in `EnterReq` to let the system automatically log error messages.
+
+### Position sizing by risk {#risk_rate}
+
+With `RiskRate` set, the position is derived from the stop distance. It applies when `Amount` and `LegalCost` are unset, `RiskRate>0`, and a stop price can be resolved (`StopLoss`/`StopLossVal`, `StratJob.LongSLPrice/ShortSLPrice`, or `TradeStrat.StopLoss`):
+
+```text
+LegalCost = AccountEquity() x RiskRate / (|entry price - stop price| / entry price)
+```
+The result is capped by leverage (1x for spot) and the account's `max_stake_amt`; without a stop it falls back to the default stake amount x `CostRate`. `open_vol_rate` and the minimum order amount still apply afterwards. `RiskRate` must be within `[0, 1]` and is ignored when `Amount` or `LegalCost` is given.
+
+`StratJob` provides three account-state methods for sizing and risk checks:
+
+| Method | Meaning |
+| --- | --- |
+| `AccountEquity() float64` | Account equity (balance + unrealized PnL, in the pricing currency); during warmup or before the wallet is ready it falls back to the initial capital / default stake amount, and never returns 0 or NaN |
+| `AvailableBalance() float64` | Available balance / margin; 0 when unavailable |
+| `AccountDrawdown() float64` | Drawdown ratio versus the equity peak since the run started, in `[0,1]`; 0 during warmup. Shared by all symbols of the account |
+
+```go
+Main: func(s *strat.StratJob, _ strat.DataEvent) {
+    e := s.Env
+    cross := ta.EMA(e.Close, 10).Cross(ta.EMA(e.Close, 30))
+    atr := ta.ATR(e.High, e.Low, e.Close, 14).Get(0)
+    if cross != 1 || math.IsNaN(atr) || atr <= 0 { return }
+    if s.AccountDrawdown() >= 0.10 || s.AvailableBalance() < s.AccountEquity()*0.2 { return }
+    // Risk at most 1% of equity per trade: the stop distance is 2 ATR
+    _ = s.OpenOrder(&strat.EnterReq{Tag: "ema_long", StopLossVal: 2 * atr, RiskRate: 0.01})
+},
+```
+See [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) for complete examples.
 
 :::tip
 `OpenOrder`/`CloseOrders` validate and enqueue intents; they do not guarantee fills. Main `OnData`/`OnBar`, `OnBatchJobs`, order callbacks and successful `OnPostApi` callbacks have framework processing paths. Do not assume automatic submission from auxiliary or high-frequency callbacks.
@@ -478,7 +625,7 @@ type ExitReq struct {
 	Tag        string  // Exit signal
 	StratName   string  // Strategy Name
 	EnterTag   string  // Only exit orders with EnterTag as the entry signal
-	Dirt       int     // core.OdDirt* long/short/both
+	Dirt       int     // core.OdDirt* long/short/both; the zero value means both
 	OrderType  int     // Order type, core.OrderType*
 	Limit      float64 // Limit order exit price. Submitted as limit order when specified
 	ExitRate   float64 // Exit rate, default 100% (all orders)
@@ -493,12 +640,15 @@ type ExitReq struct {
 
 When `CloseOrders` returns an error, it indicates that closing the position failed. You can use `log.Error` to record error information, or set `Log` to true in `ExitReq` to let the system automatically log error messages.
 
+The zero value of `Dirt` equals `core.OdDirtBoth`; when both long and short orders exist and `Limit` is set, `Dirt` must be specified explicitly or an error is returned.
+
 For `ExitReq.Tag`, you can pass in a fixed string to distinguish different exit reasons. The `core` package has built-in common tags:
 
 ```go
 const (
     ExitTagUnknown     = "unknown"      // Unknown reason
     ExitTagCancel      = "cancel"       // User cancel
+    ExitTagHedgeOff    = "hedge_off"    // Hedge close when two-way positions are turned off
     ExitTagBotStop     = "bot_stop"     // Bot stop
     ExitTagForceExit   = "force_exit"   // Force exit
     ExitTagNoMatch     = "no_match"     // No matching orders
@@ -509,6 +659,7 @@ const (
     ExitTagPairDel     = "pair_del"     // Symbol deleted
     ExitTagStopLoss    = "stop_loss"    // Stop loss triggered with loss
     ExitTagSLTake      = "sl_take"      // Stop loss triggered with profit
+    ExitTagTrailingStop = "trailing_stop" // Trailing stop triggered
     ExitTagTakeProfit  = "take_profit"  // Take profit triggered
     ExitTagDrawDown    = "draw_down"    // Drawdown stop loss
     ExitTagDataStuck   = "data_stuck"   // Auto close due to no K-line data for extended period
@@ -518,6 +669,7 @@ const (
     ExitTagExitDelay   = "exit_delay"   // Orders that should have exited earlier during live trading restart
 )
 ```
+Backtests can also produce two more exit tags: `data_gap` (forced close after a hole in the K-line data) and `delist` (forced close at the end of a backtest for a symbol whose data ended long before). They only apply to backtests; see the [backtest guide](./backtest.md).
 
 ## Stop Loss and Take Profit
 
@@ -542,11 +694,63 @@ s.SetAllStopLoss(core.OdDirtLong, &ormo.ExitTrigger{
 ```
 For all open long orders, a stop loss of 50% of the position is set. When the price triggers 0.97 times the 5-period moving average, half of the position is closed with a limit order stop loss of 0.965 times.
 
+Passing `nil` as `args` cancels all stop losses (take profits) in that direction. Passing `core.OdDirtBoth` (0) as `dirt` panics if long and short orders exist at the same time; call it separately with `core.OdDirtLong` and `core.OdDirtShort` in that case.
+
+### Exchange conditional orders versus local monitoring
+
+`StratJob.ExgStopLoss` and `StratJob.ExgTakeProfit` default to true, so stop loss / take profit are submitted to the exchange as conditional orders. When set to false, no conditional order is placed in advance and the trigger is monitored locally by price (in both backtest and live). A `CallbackPct` trailing stop is also monitored locally when `ExgStopLoss=false`.
+
+### Trailing stop
+
+`CallbackPct` (unit %, range `[0.05, 50]`) closes the position when price pulls back from its best level by that percentage; when `ActivationPrice` is greater than 0, tracking only starts after price reaches the activation price. In live trading the exchange's native trailing order is preferred; if the exchange does not support it or rejects it, it falls back to local price monitoring and the order does not fail.
+```go
+_ = s.OpenOrder(&strat.EnterReq{Tag: "trail", StopLossVal: atr * 2, ActivationPrice: price + atr, CallbackPct: 1.5})
+```
+
+### Take-profit ladder {#take_profits}
+
+`EnterReq.TakeProfits` sets several take-profit stages; each is a `strat.TakeProfitTarget`:
+
+| Field | Description |
+| --- | --- |
+| `Price` / `Val` / `Rate` | Exactly one is needed (must be greater than 0): absolute trigger price; price distance from the entry fill average; ratio relative to the entry fill average (0.02 = 2%). When several are given `Price` wins, then `Val`. `Price` must be on the profit side |
+| `Limit` | Limit price after the trigger, 0 = market |
+| `ExitRate` | Share of the initial position closed at this stage, `(0,1]`; 0 is treated as 1 when there is a single stage; the stages must sum to at most 1 |
+| `MoveSLToBreakeven` | After this stage fills, tighten the remaining position's stop loss to no worse than the entry price (an already tighter stop is never loosened) |
+| `Tag` | Exit reason for this stage |
+
+Stages trigger from nearest to farthest from the entry price, and cannot be combined with `TakeProfit`, `TakeProfitVal` or `TakeProfitLimit`; once `TakeProfits` is set, `LongTPPrice/ShortTPPrice` no longer apply.
+```go
+_ = s.OpenOrder(&strat.EnterReq{
+    Tag: "ladder", StopLossVal: atr * 2,
+    TakeProfits: []strat.TakeProfitTarget{
+        {Val: atr * 1.5, ExitRate: 0.4, MoveSLToBreakeven: true, Tag: "tp1"},
+        {Val: atr * 3, ExitRate: 0.3, Tag: "tp2"},
+    },
+    ActivationPrice: price + atr*1.5, CallbackPct: 1.5, // the remaining 30% is trailed
+})
+```
+
+### Default stop-loss and take-profit prices
+
+`StratJob.LongSLPrice/ShortSLPrice` and `LongTPPrice/ShortTPPrice` are default stop-loss / take-profit prices applied when an entry is opened: they are used when `EnterReq` does not specify the corresponding stop loss (take profit), and the default take-profit price is ignored when `TakeProfits` is set. A long stop must be below the entry price and a take profit above it (reversed for shorts); otherwise `OpenOrder` returns an error.
+
+### OCO pending-entry groups
+
+Give several pending entries the same `OCOGroup`; when one of them fills, the other unfilled entries in the group are cancelled automatically. This is typically used for breakout orders on both sides of a range:
+```go
+_ = s.OpenOrder(&strat.EnterReq{Tag: "brk_long", Stop: hi, Limit: hi + slip, OCOGroup: "donchian", StopBars: 2, StopLossVal: atr * 2})
+_ = s.OpenOrder(&strat.EnterReq{Tag: "brk_short", Short: true, Stop: lo, Limit: lo - slip, OCOGroup: "donchian", StopBars: 2, StopLossVal: atr * 2})
+```
+Groups are identified by (symbol, strategy, `OCOGroup`) and are meant for pending entries (with `Stop` or `Limit` set). In backtests, pair it with `refine_tf` so the order in which the two sides trigger within one bar is judged more accurately. Pending entries occupy open-order slots, so `max_simul_open` must be large enough. See `bracket.go` in [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) for a complete example.
+
 ## Batch task processing
 Sometimes you may need to perform some calculations (such as correlation coefficients) for all symbols of the current strategy together, get some intermediate states to save, or open or close orders together.
 In this case, you can use the `OnBatchJobs` or `OnBatchInfos` callback function.
 `OnBatchJobs` is triggered only after main `OnData(RoleMain)`/`OnBar`; `OnBatchInfos` is triggered only after auxiliary `OnData(RoleInfo)`/`OnInfoBar`. They are enabled by `BatchInOut` and `BatchInfo`, respectively.
-> All backtests use deterministic batches. Main jobs are sorted by symbol key; sort by strategy score when entries compete for funds. The example stores correlations for subsequent callbacks without assuming main/auxiliary callback order at the same timestamp.
+> In backtests, within the same bar the main-batch symbols are handed to `OnBatchJobs` in the neutral hash order of `strat.BarPriority(barMS, symbol, seed)` (not alphabetical), so alphabetically early symbols do not systematically claim funds first; the seed is the `bt_bar_order_seed` setting (default 0), and changing it changes multi-symbol backtest results. Live batch order is not guaranteed. If simultaneous entries compete for funds, sort by strategy score inside the callback. The example stores correlations for subsequent callbacks without assuming main/auxiliary callback order at the same timestamp.
+>
+> Open/close requests made in `OnBatchJobs` are submitted automatically by the framework after the callback (except during warmup); requests made in `OnBatchInfos` are **not** submitted automatically and only log a WARN, so do not place orders there.
 ```go
 // Imports: slices, config, strat, utils, banexg/log, banta as ta, zap.
 type BatchSta struct {
@@ -611,6 +815,37 @@ func BatchDemo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 }
 ```
 > Update stateful indicators on every event for their own environment: main OnData/OnBar or auxiliary OnData/OnInfoBar. Batch callbacks should read updated results, not be the only place that advances an indicator.
+
+### Rebalancing to target weights
+
+For cross-symbol portfolio rebalancing, use `strat.RebalanceBatchWeights` inside `OnBatchJobs`: pass each symbol's target weight (a signed notional share of `AccountEquity()`; positive = long, negative = short, missing or 0 = flat). It first closes/reduces positions to free margin, then opens/scales in from the largest required amount down; orders below the minimum order amount are skipped silently.
+
+```go
+func RebalanceBatchWeights(jobs []*StratJob, targetWeights map[string]float64, opts BatchRebalanceOpts) BatchRebalanceResult
+func InverseVolWeights(jobs []*StratJob, signals map[string]float64, atrPeriod int, targetGross float64) map[string]float64
+```
+
+| `BatchRebalanceOpts` field | Description |
+| --- | --- |
+| `Tag` | Tag of the open/close signals, default `rebalance` |
+| `DriftThreshold` | No rebalancing when a same-direction position's weight differs by no more than this, default 0.02, negative disables |
+| `MaxGrossExposure` | Cap on the sum of absolute target weights; targets are scaled down proportionally when exceeded |
+| `StopLossRate` / `TakeProfitRate` | Stop-loss / take-profit distance attached to newly opened or scaled-in orders (as a ratio of the entry price) |
+| `CallbackPct` | Trailing-stop callback percent attached to new orders, range `[0.05, 50]` |
+| `Leverage` | Overrides the leverage of new orders when greater than 0 |
+
+The returned `BatchRebalanceResult` carries the raw and effective gross exposure, action counts (`ClosedCount/ReducedCount/OpenedCount/ScaledInCount/ErrorCount`, etc.) and the per-order `Actions`. `InverseVolWeights` turns directional signals (e.g. +1/-1/0) into risk-parity weights using `1/NATR`, normalized to `targetGross`; it must be called on every bar (`atrPeriod<=0` means 14) to keep its internal indicator caches in sync.
+
+```go
+OnBatchJobs: func(jobs []*strat.StratJob) {
+    weights := map[string]float64{} // symbol -> target weight, built from your ranking/signals
+    // ...
+    strat.RebalanceBatchWeights(jobs, weights, strat.BatchRebalanceOpts{
+        Tag: "mom_rebalance", DriftThreshold: 0.03, MaxGrossExposure: 1.0, StopLossRate: 0.15,
+    })
+},
+```
+`BatchInOut` must be on, and `EachMaxLong/EachMaxShort` set to 0 so positions can be scaled into. See `rebalance.go` in [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) for a complete example.
 
 ## Custom exit logic
 You can perform custom exit logic checks on each candlestick, for each open order:
@@ -914,6 +1149,27 @@ Set stop-loss for all orders in the specified direction for the current strategy
 **SetAllTakeProfit(dirt float64, args \*ormo.ExitTrigger) \*errs.Error**
 Set take-profit for all orders in the specified direction for the current strategy task. The parameter `dirt` can be `core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth`.
 
+**PositionAvgPrice(dirt float64, enterTag string) float64**  
+Return the average entry price of the current task's positions in the given direction (and entry tag).
+
+**AccountEquity() float64 / AvailableBalance() float64 / AccountDrawdown() float64**  
+Account equity, available balance and drawdown ratio; see [Position sizing by risk](#risk_rate).
+
+**RefKlineSub(symbol, timeframe string, warmupNum ...int) \*DataSub / RefEnv(symbol, timeframe string) \*ta.BarEnv / Data(sub \*DataSub) \*DataFields**  
+Reference-data subscription, environment and data view; see [Reference data](#ref_kline).
+
+**OpeningRange / SessionRange / PrevDayOHLC / PrevNDaysStats / DualThrustBands / RBreakerLevels**  
+Intraday session statistics; see [Intraday session helpers](#intraday).
+
+**ProcessRuntimeOrders() (entered, exited []\*ormo.InOutOrder, err \*errs.Error, bound bool)**  
+Explicitly submit the open/close requests queued by the current task; see [Send an entry signal](#send_entry).
+
+**ExecutionSnapshot() ExecutionSnapshot**  
+Return a snapshot of the current task's orders and counts; order pointers are borrowed, so do not hold them across events.
+
+**IsWarmUpState() bool**  
+Whether the task is currently warming up; indicators may be updated during warmup, but open/close requests are not enqueued.
+
 ## Factor and cross-sectional engine
 
 TradeStrat/OnBar belongs to time_series. Factors register native Plan/ComboSpec through runner.RegisterDefinition or declare multiple expressions outputs instead of per-symbol callbacks. Portfolio builders consume frozen Frame/Universe, never future labels. Mixed same-account policies declare id/account/capital_weight while state and lifecycle borrows remain independent.
@@ -924,4 +1180,4 @@ See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
 
 Ordinary commands let entry create and close a task Runtime. Its configuration snapshot is read-only; accounts, clock, strategy jobs, prices and batch queue belong to that run. Embedded or concurrent tasks should use explicit Runtime dependencies instead of reading or writing package-level config/core/btime compatibility state inside callbacks. Job context and data events must come from the current task; live time and the advancing backtest clock are distinct.
 
-`BatchInOut`/`BatchInfo` use the trader’s `BatchState`. Strict replay orders ready batches and jobs deterministically; ordinary execution does not promise map order. Factor decisions freeze the entire Universe and produce target portfolios, which is a separate contract from time-series batch callbacks. See [Runtime API](../api/runtime.md) and the [factor guide](./factor.md).
+`BatchInOut`/`BatchInfo` use the trader’s `BatchState`. All backtests order ready batches and jobs deterministically; live execution does not promise map order. Factor decisions freeze the entire Universe and produce target portfolios, which is a separate contract from time-series batch callbacks. See [Runtime API](../api/runtime.md) and the [factor guide](./factor.md).

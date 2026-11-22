@@ -40,6 +40,10 @@ Explicit Runtimes use `RuntimeCatalogFromRegisteredSources()` to create local in
 
 `GetDataSource`, `ListDataSources`, and `ListDataSourceStatus` have catalog methods and package-level compatibility entry points. The latter cannot retrieve another Runtime's state.
 
+### Built-in Sources
+
+`funding_rate`, `open_interest`, `mark_kline`, `index_kline`, and `premium_kline` are registered by the data package through `RegisterDataSourceFactory` at process initialization; custom sources cannot use these names. Constructors are `NewFundingRateDataSource(deps *RuntimeDeps) *FundingRateDataSource`, `NewOpenInterestDataSource(deps) *OpenInterestDataSource`, and `NewMarkKlineDataSource`, `NewIndexKlineDataSource`, `NewPremiumKlineDataSource`, which return `*PriceKlineDataSource`. `deps` supplies the network switch, exchange, and configuration, and may be nil. See [Custom Time-Series Data](../guide/custom_data.md#built-in-data-sources) for fields, timeframes, and markets.
+
 ### SeriesRuntime / SeriesPlan
 
 Traditional TS tasks use `NewSeriesRuntimeWithRuntimeDeps(deps, sink)` and `Plan/Ensure/Apply/ActivateNew` to collect non-primary K-line subscriptions, fill coverage, and activate new sources. `HistSeriesFeeder` replays independent series with K-lines in visibility order. `ThirdPartySeriesBootstrap` is a compatibility alias of `SeriesPlan`.
@@ -62,7 +66,7 @@ type SubscriptionPlanOptions struct {
 
 ### Live Installation
 
-`PrepareLivePlan` prepares independent subscriptions, warmup, and startup buffering. `SubscriptionInstallation.Activate` activates them; `CommitPrepared` supplies a commit callback boundary. `InstallLivePlan` prepares and activates. Sources requiring managed live operation implement `ManagedLiveSource.SubscribeManaged` and return an independent handle with `Stop()` and `Join() error`; `LiveSourceErrors` can report asynchronous failure.
+`(*DataSourceCatalog).PrepareLivePlan(ctx, plan, sink)` prepares independent subscriptions, warmup, and startup buffering and returns a `*SubscriptionInstallation`; its methods `Activate() error` activates them and `CommitPrepared(commit func() error) error` supplies a commit callback boundary. `(*DataSourceCatalog).InstallLivePlan(ctx, plan, sink)` prepares and activates. Sources requiring managed live operation implement `ManagedLiveSource.SubscribeManaged` and return an independent handle with `Stop()` and `Join() error`; `LiveSourceErrors` can report asynchronous failure.
 
 Startup buffering preserves Values fields, types, and NULL/absent-key distinctions. Do not mutate inputs concurrently after passing them to the sink. Required-source failure, budget overflow, or cancellation fails installation; optional-source failure can instead degrade the installation, so inspect its status. Stop managed subscriptions with `Stop`, then `Join` to wait for producers and admitted callbacks; a callback must not wait for itself. Managed handles use `Stop()` / `Join() error`, unlike `LiveProvider.Stop() *errs.Error` / `Join()`.
 
@@ -86,7 +90,7 @@ NewHistProvider(callback FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64, sho
 NewLiveProvider(callback FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error)
 ```
 
-Use `WithRuntimeDeps` constructors for explicit tasks, supplying the Runtime's configuration, symbols, storage, clock, strategies, and callback boundary. Providers support `SubWarmPairs/UnSubPairs/LoopMain`; live resources support `Stop/Join`. `Feeder.CallBack` and `Feeder.OnEnvEnd` both receive DataSeries; the pending value is `WaitData`.
+Use `WithRuntimeDeps` constructors for explicit tasks, supplying the Runtime's configuration, symbols, storage, clock, strategies, and callback boundary. Providers support `SubWarmPairs/UnSubPairs/LoopMain`; live resources support `Stop/Join`. `Feeder.CallBack` and `Feeder.OnEnvEnd` both receive DataSeries; the pending value is kept in the `Feeder.WaitData` field (`*orm.DataSeries`).
 
 ```go
 func NewHistProviderWithRuntimeDeps(deps *RuntimeDeps, callback FnDataSeries,

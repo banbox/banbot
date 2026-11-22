@@ -58,7 +58,29 @@ _ = effective
 
 配置必须是无重复键的单文档 YAML mapping。`run_policy`、`wallet_amounts`、`fatal_stop`、`watch_jobs`、`historical_coverage` 后层整块替换，其他映射通常深合并。时间表示切换及环境变量展开见[配置指南](../guide/configuration.md)。
 
-常用根结构包括 `DatabaseConfig`（`DbType`、`Url`、`SIDRegistryURL` 等）、`APIServerConfig`、`UserConfig`、`PairMgrConfig`、`StratPerfConfig` 和 `AccountConfig`。完整 YAML 字段以配置模板为准；凭据在根 `accounts`，不能用执行账户配置替代真实交易授权。`RPCChannels` 是类型配置映射，支持 `wework`、`mail`/`email`、`telegram`；根 `Webhook` 是消息模板。通知参数见[通知指南](../guide/notifications.md)。
+常用根结构包括 `DatabaseConfig`（`DbType`、`Url`、`SIDRegistryURL` 等）、`APIServerConfig`、`UserConfig`、`PairMgrConfig`、`StratPerfConfig` 和 `AccountConfig`。完整 YAML 字段以配置模板为准；凭据在根 `accounts`，不能用执行账户配置替代真实交易授权。`Config.ExtraMarkets` 对应根 `extra_markets`，`NormalizeExtraMarkets(primary string, extras []string) ([]string, *errs.Error)` 去重、剔除与主市场相同的项并拒绝非法取值；`Config.LLMModels` 对应 `llm_models`，`GetLLMModel(name) (*llm.LLMModelConfig, error)` 按名读取，`GetLLMModelNames() []string` 返回升序模型名。`RPCChannels` 是类型配置映射，支持 `wework`、`mail`/`email`、`telegram`；根 `Webhook` 是消息模板。通知参数见[通知指南](../guide/notifications.md)。
+
+## 策略参数约束
+
+策略工厂内可用 `RunPolicyConfig.Require` / `Requiref` 声明跨参数约束，条件不成立时 panic 为 `*BadParamError`（错误码 `core.ErrBadConfig`）。
+
+```go
+func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+    fast := pol.Def("fast", 5, nil)
+    slow := pol.Def("slow", 20, nil)
+    pol.Require(fast < slow, "fast must be less than slow")
+    pol.Requiref(slow >= 2, "slow=%v is too small", slow)
+    // ...
+}
+```
+
+| API | 说明 |
+| --- | --- |
+| `(*RunPolicyConfig).Require(cond bool, msg string)` | `cond` 为假时 panic |
+| `(*RunPolicyConfig).Requiref(cond bool, format string, args ...any)` | 同上，printf 风格消息 |
+| `NewBadParamError(policy, msg string) *BadParamError` | 构造错误；含 `Policy`、`Message` 字段，`BanError()` 返回底层 `*errs.Error` |
+| `AsBadParamError(value any) (*BadParamError, bool)` | 从 `recover()` 值或被包装的 error 中取出 |
+| `CoerceBadParamError(pol *RunPolicyConfig, recovered any) *BadParamError` | 把策略构造函数的任意 panic 值转为 `*BadParamError` |
 
 ## 兼容接口与写回
 
@@ -66,7 +88,7 @@ _ = effective
 | --- | --- |
 | `GetConfig(args, showLog)` / `ParseConfig(path)` / `ParseConfigs(paths, showLog)` | 返回旧时序 `Config`；不支持统一 factor/mixed 分派 |
 | `LoadConfig(args)` / `ApplyConfig(args, cfg)` | 安装旧进程全局配置；不能用来切换并行任务；已 Loaded 后 `LoadConfig` 不重新安装 |
-| `GetDataDir()` / `GetDataDirSafe()` | 旧全局数据目录访问；前者无目录时报配置错误，后者允许空 |
+| `GetDataDir()` / `GetDataDirSafe()` | 旧全局数据目录访问；前者无目录时 panic（提示需 `BanDataDir` 或 `-datadir`），后者允许返回空字符串 |
 | `ResolveDataDir(explicit)` / `GetStratDir()` | 前者显式值优先于 `BanDataDir`，后者读取 `BanStratDir` |
 | `ParsePath(path)` | 旧数据目录前缀路径解析；新字段使用 `RunSpec.ResolvePath` |
 | `GetTakeOverTF(pair, defTF)` / `GetAccLeverage(account)` / `GetStakeAmount(account)` | 依赖旧配置状态的兼容查询 |

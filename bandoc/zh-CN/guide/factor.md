@@ -45,6 +45,69 @@ run_policy:
 
 无需版本标记，普通加载不改写原文件。显式 `engine: time_series` 或 `engine: factor` 选择新引擎语义；未声明引擎的旧策略保留原自定义参数。`id` 是稳定策略身份，`account` 选择账户，`capital_weight` 分配同账户策略资本，不等同于 `stake_rate`。不要把非投资集合的参考资产分配成可交易持仓。
 
+## 策略条目键、价格流与成交有效期
+
+以下键直接写在 `run_policy[]` 条目下（与 `name`、`engine`、`id`、`account`、`capital_weight`、`run_timeframes`、`params`、`pairs` 并列）：
+
+| 键 | 用途 |
+| --- | --- |
+| `expressions` / `definition` | 表达式或已注册 Go definition，二选一 |
+| `portfolio` | 选股、名义额、调仓、持仓、退出与资金分配，见下文 |
+| `combo` | 外层合成配置；设置 `method` 时整体覆盖 `expressions.combine` |
+| `prices` | 成交价流 `{source, timeframe, field}` |
+| `decision` | 决策与成交时点：`latency_ms`（默认 1）、`expiry_ms`（默认 60000，须大于 `latency_ms`）、`max_pending`（默认 64）、`interval_ms`、`delay_ms`、`source_event_decisions`/`source`/`timeframe` |
+| `universe`（别名 `rolling_universe`） | 时点滚动流动性宇宙，见下文 |
+| `research` | `labels`、`label_wait_ms`、`panel` |
+| `manifest.costs` | `fee_rate`、`slippage_rate`、`funding_policy`、`funding_apr` |
+| `funding_source`、`initial_nav`、`max_records`、`archive` | 资金费流、初始净值、记录上限、不可变归档输入 |
+| `pit_min_universe_ratio`、`pit_delist_penalty_bps` | 缺数据品种的时点剔除阈值与退市惩罚，见下文 |
+
+未知键会在启动时报错。`funding_policy`（写在 `execution` 或 `manifest.costs`）取 `explicit-zero`、`required-stream` 或 `storage`；存储回放必须显式声明，`storage` 默认读取内置 `funding_rate` 数据源，只对合约腿结算。
+
+内置 `momentum-vol` 的分数是 `z(动量) - z(波动率)`：动量为 `window` 期收益，波动率为 1 期收益的 `window` 期标准差，两者各做 1% 缩尾后标准化，默认 `window: 24`。它是带低波倾向的动量，不是纯动量。
+
+### 零成交陷阱
+
+Weights 回测在未写 `prices` 时使用决策周期收盘价流。目标只在决策时间加 `latency_ms` 之后、`expiry_ms` 之内的报价上成交：1h 决策配 1h 收盘价流时，下一个报价晚于默认 60 秒有效期，所有非空目标过期，成交为 0。请为 1h 及更粗周期的策略声明 1m 或 tick 价格流：
+
+```yaml
+prices: {source: kline, timeframe: 1m, field: close}
+decision: {latency_ms: 1, expiry_ms: 120000}
+```
+
+Events 回放和实盘只接受 `event`（tick）或 `1m` 价格流。仅调大 `expiry_ms` 会让成交发生在下一根 K 线收盘价，通常不是预期口径。
+
+### 聚合决策周期
+
+`run_timeframes`（以及表达式 `timeframe`、`kline` 绑定的 `timeframe`）可以是已存周期（1m、5m、15m、1h、1d）或被它们整除的任意周期，例如 30m、2h、4h、8h、12h、3d、1w。聚合 K 线在读取时由较细周期合成，按 UTC 对齐，3d/1w 沿用与时序引擎相同的对齐锚点；桶收盘前不可见，末尾不完整的桶丢弃。`every_bars`、窗口和 `ts.lag` 都以聚合后的 bar 计数。不能被已存周期整除的周期会在打开数据库前报错并列出已存周期；`prices.timeframe` 同样受检。
+
+### 时点滚动流动性宇宙
+
+用根配置 `pairs` 作为候选超集，按已可见的成交额定期重选进入可投资集合的品种：
+
+```yaml
+universe:
+  mode: rolling_liquid_top
+  top_n: 20
+  lookback_days: 30
+  min_listing_days: 14
+  reconstitute_days: 30
+  always_include: ['BTC/USDT:USDT', 'ETH/USDT:USDT']
+```
+
+| 键 | 说明 |
+| --- | --- |
+| `mode` | `rolling_liquid_top`（别名 `liquid_top`）或 `static`（关闭） |
+| `top_n` | 每次入选数量，1–10000 |
+| `lookback_days` / `lookback_bars` | 成交额回看窗口，二选一；默认 30 天，使用 `quote`，缺失时回退 `close * volume` |
+| `min_listing_days` / `min_age_bars` | 最短可见上市跨度，二选一；默认 14 天，`-1` 关闭 |
+| `reconstitute_days` / `reconstitute_bars` / `schedule` | 重选间隔，三选一；默认 30 天，`schedule` 取 `daily`、`weekly`、`monthly`（UTC 日历边界） |
+| `always_include` | 常驻品种，可写完整符号 |
+
+每个重选边界只使用该时刻已可见的 K 线；成交额降序，同额按符号排序。已上市但未入选的候选在后台预热指标，但不进入截面参考池。退出宇宙且仍有报价的持仓在下一个可执行步平仓。`universe` 与 `rolling_universe` 不能同时设置，也可写在 `portfolio` 下。
+
+缺数据处理：Weights 回测中，某个可投资品种在决策网格上缺输入（退市、未上市、空洞）时，该品种被剔除并平仓，决策继续在缩减后的宇宙上进行；剩余可投资品种少于上次接受决策存活数的 `pit_min_universe_ratio`（默认 0.5，`< 0` 关闭剔除）时整轮跳过。被剔除持仓按最后有效价平仓，并额外扣除 `pit_delist_penalty_bps`（默认 100，`< 0` 关闭）。
+
 ## 独立调仓与持仓生命周期
 
 在已有因子策略的 `portfolio` 中显式启用 `lifecycle-v1`，可分别控制调仓、选股、持仓、退出与资金分配。省略 policy 时继续使用原有 builder 和纯权重目标。
@@ -94,9 +157,9 @@ transition: {mode: cohort, period_bars: 16, startup: gradual, sizing: entry-nav}
 | --- | --- |
 | rebalance | every_bars、anchor/phase、duration，日/周/月民用日历与时区/version |
 | selection | long_k/short_k、long_quantile/short_quantile、retain_rank、dropout、group_quota、缺分数处理 |
-| holding | min/max bars 或 duration、by_asset、cooldown_bars、显式接管 adopt |
+| holding | min/max bars 或 duration、by_asset、cooldown_bars、stop_loss_pct、trailing_stop_pct、显式接管 adopt |
 | transition | direct、linear-exit、cohort、geometric、target-step，适用模式的重入及每资产规则 |
-| allocation | equal、score、inverse-volatility、fixed-notional、vol-target，reserve、asset/group/net/beta cap、turnover_limit |
+| allocation | equal、score、inverse-volatility、fixed-notional、vol-target、erc、hrp、min-variance、mean-variance，risk_window、shrinkage、reserve、asset/group/net/beta cap、turnover_limit |
 
 direct 在允许退出时直接归零；geometric 每轮乘 ratio，低于 final_threshold 后归零，两者参数须在 (0,1)。target-step 按 alpha 向新目标靠近，alpha 须在 (0,1]。linear-exit/geometric 的 on_reselect 可选 restore（恢复理想目标）、resume（保留当前退出水平，之后再落选时继续）、finish/new-cohort（先完成退出）；反向入场先等待归零。风险强制退出不受普通换手预算阻挡。
 
@@ -112,6 +175,57 @@ cohort 的入场窗口结束后不再补足原计划，迟到真实 fill 按原�
 
 多期限、稳健中性化、历史合成、参数扫描、模型与风险 builder 见 `doc/factor_research_extensions.md`。研究报告与高级插件提供原生 Go API；当前 CLI 不自动生成完整逐批成交归因。历史 IC 系列在 live 未接成熟历史 provider 前仍禁用。
 
+### 绝对分数门控与动态敞口
+
+`portfolio`（默认 top/bottom-k 路径）和 `selection`（`lifecycle-v1`）都支持：
+
+| 键 | 说明 |
+| --- | --- |
+| `long_min_score` / `short_max_score` | 可选有限数值，区分省略与显式 `0`。多头候选须 `score >= long_min_score`，空头候选须 `score <= short_max_score`；`retain_rank` 不会保留未通过门控的持仓 |
+| `unfilled_slot_policy` | 通过门控的标的数 `m < K` 时：`cash`（默认）每个入选标的分配 `side_notional / K`，其余留作现金，`m == 0` 输出显式空组合清仓；`rescale` 把预算集中到通过门控的标的，受 `asset_cap` 约束 |
+| `asset_cap` | 单标的权重上限 |
+| `drift_threshold` | `[0,1)` 的免调仓漂移缓冲，见下 |
+
+因子输出若包含保留列 `exposure_scale`、`long_scale` 或 `short_scale`，默认合成会自动忽略该列；它的有效截面均值被钳制到 `[0,1]`（全部无效按 1）后，动态缩放当期多空总名义额（`long_scale`/`short_scale` 只缩放对应一侧）。例如以市场宽度控制总敞口：
+
+```yaml
+outputs:
+  score: 'cs.pct_rank(ts.return(positive(kline.close), 42)) - 0.5'
+  exposure_scale: 'cs.mean(kline.close > ts.sma(kline.close, 50))'
+```
+
+完整示例见 [regime-gate.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/regime-gate.yml)，其中还用 `mtf.asof` 与 `ref.field` 加入 BTC 日线趋势门控。
+
+### 风险列与资金分配
+
+`allocation.method` 取 `equal`（默认）、`score`、`fixed-notional`（须 `fixed_notional`）、`inverse-volatility`、`vol-target`（须 `vol_target`）、`erc`（别名 `risk-parity`）、`hrp`、`min-variance`、`mean-variance`（可设 `risk_aversion`）。相关键：
+
+| 键 | 说明 |
+| --- | --- |
+| `risk_window` | 滚动收益窗口，默认 20 |
+| `shrinkage` | 协方差非对角收缩率 `[0,1]` |
+| `reserve_ratio`、`asset_cap`、`group_caps`、`turnover_limit` | 现金预留与各类上限 |
+| `net_cap` / `beta_cap` | 组合净敞口 / 市场 beta 上限 |
+| `volatility_column` / `beta_column` | 风险列名，默认 `volatility` / `beta` |
+
+`inverse-volatility`、`vol-target`、`beta_cap` 与协方差类方法读取因子输出中的保留列 `volatility` / `beta`（默认合成自动忽略它们）。未输出时，运行器用决策网格上当时可见的收盘价自动维护 `risk_window` 窗口的收益矩阵、波动率与市场 beta；协方差预热不足时平滑回退为 `inverse-volatility` 或 `equal`。分组上限仍需 Go `Config.PolicyContext` 提供分组。在 `portfolio` 中写了 `rebalance`/`selection`/`holding`/`transition`/`allocation` 且未指定 `policy` 时自动启用 `lifecycle-v1`。示例：[risk-hrp-exits.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/risk-hrp-exits.yml)、[risk-minvar-beta.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/risk-minvar-beta.yml)、[liquid-top-erc.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/liquid-top-erc.yml)。
+
+### 止损、追踪止盈与漂移缓冲
+
+```yaml
+portfolio:
+  policy: lifecycle-v1
+  rebalance: {every_bars: 5, drift_threshold: 0.03}
+  holding:
+    stop_loss_pct: 0.1        # 建仓后不利变动 10% 止损
+    trailing_stop_pct: 0.15   # 相对建仓后可见有利极值回撤 15% 止盈
+    cooldown_bars: 2          # 触发后 2 根决策 bar 内禁止重入
+    by_asset:
+      'BTC/USDT:USDT': {trailing_stop_pct: 0}   # 显式 0 取消该资产的限制
+```
+
+`stop_loss_pct`、`trailing_stop_pct` 取值 `[0,1)`，在每个决策网格（含 `every_bars > 1` 的非调仓步）逐持仓检查；追踪极值排除建仓当根 K 线。触发的标的立即归零，非调仓步只平触发标的，其余持仓随市价漂移、不产生换手。`drift_threshold`（可写在 `portfolio`、`rebalance` 或 `allocation` 下）：现有权重与目标权重同号非零且差小于阈值时保留原持仓，清仓、反手和新开仓照常执行。
+
 ## 用 Go 写策略：三种入口
 
 将注册函数放入已被项目导入的 Go 包，再重新编译机器人；按示例需要导入 `github.com/banbox/banbot/factor`、`factor/runner` 和 `factor/statistics`（后两者同属 banbot 模块）。先选引擎，再选最短入口。三者共用同一份 YAML 与 `DataSeries.Values`，差别只在“信号如何变成仓位”：
@@ -120,7 +234,7 @@ cohort 的入场窗口结束后不再补足原计划，迟到真实 fill 按原�
 | --- | --- | --- |
 | 每个品种独立择时 | 时序 | `strat.AddStratGroup` + `TradeStrat`（见[自定义策略](./strat_custom.md)） |
 | 全市场打分后多空 top/bottom-k | 因子 | `runner.RegisterFactor`（下例） |
-| 两个及以上品种的价差回归（统计套利） | 因子 | `runner.RegisterPairs`（下例） |
+| 两个及以上品种的价差回归（统计套利） | 因子 | `runner.RegisterPairs` 等，见[统计套利与期现](./statarb.md) |
 | 需要自定义组合/生命周期 | 因子 | `RegisterDefinition` + `RegisterPortfolioFactory`（本页上文） |
 
 ### 截面因子：一次注册
@@ -145,40 +259,20 @@ run_policy:
 
 `c.Params` 与时序策略的 `pol.Param` 作用一致：读取 `params`，缺省用默认值。`Int` 遇到小数、`Bool` 遇到非 0/1 会通过 `Err()` 报错而不是截断；`Unused()` 可列出拼错、从未被读取的参数名。多个输出默认等权合成，需要其他方式时设置 `FactorSpec.Combine`。
 
-### 统计套利：声明配对即可
+`FactorContext` 还提供以下辅助方法：
 
-```go
-func init() {
-	if err := runner.RegisterPairs("eth-btc", func(p *runner.Params) (runner.PairsSpec, error) {
-		return runner.PairsSpec{
-			Pairs:  []runner.Pair{{Y: "ETH/USDT:USDT", X: "BTC/USDT:USDT"}},
-			Window: p.Int("window", 120),
-			Band: statistics.BandConfig{
-				Entry: p.Float("entry", 2), Exit: p.Float("exit", 0.5),
-				Stop: p.Float("stop", 4), MaxHold: p.Int("maxHold", 0),
-			},
-		}, p.Err()
-	}); err != nil {
-		panic(err)
-	}
-}
-```
+| 方法 | 说明 |
+| --- | --- |
+| `Open/High/Low/Close/Volume/Quote/BuyVolume()` | 决策周期上的 K 线字段节点（`Quote` 为计价成交额） |
+| `Field(name)` | 任意 K 线字段 |
+| `SourceField(source, name)` | 非 K 线数据源（`funding_rate`、`open_interest`、`premium_kline`、`index_kline`、`mark_kline`）；原生周期与决策周期不同时自动做无前视 AsOf 对齐 |
+| `RefField(symbol, name)` / `RefSourceField(symbol, source, name)` | 指定基准品种的字段 |
+| `SubTF(sourceTF, build, maxAge...)` | 在源周期子图上求值再对齐到决策周期 |
+| `SectorCode()` | 内置赛道编码 |
 
-```yaml
-pairs: ['ETH/USDT:USDT', 'BTC/USDT:USDT']
-run_policy:
-  - {name: eth-btc, id: pair1, engine: factor, run_timeframes: [1h], params: {window: 120, entry: 2}}
-```
+### 统计套利
 
-行为约定：
-
-- 对 `ln(Y) = α + β·ln(X)` 做滚动回归，z = 残差 / 残差标准差。`z ≤ -Entry` 做多价差（β 为正时买 Y 卖 X），`z ≥ Entry` 做空价差，`|z| ≤ Exit` 平仓。
-- `Stop`（可选）在 `|z| ≥ Stop` 时平仓，并且在 z 回到 `Exit` 内之前不再入场；`MaxHold`（可选）同理。`LongOnly`/`ShortOnly` 限制方向。
-- 对冲比 β 在持仓期间固定为入场时的值，避免 β 漂移引起反复调仓；下一次入场刷新。单对总敞口为 `Gross`（默认 `1/配对数`）占策略 NAV，Y 腿 `s·G/(1+|β|)`，X 腿 `-s·G·β/(1+|β|)`。
-- 正常参与交易的配对双腿必须在本次运行的 universe 与可交易集合内。每次运行拥有独立的滚动窗口与状态机。窗口未满时不生成新信号；已开配对的任一腿缺失时请求平仓并暂停，数据恢复后可重新入场。回测窗口内完全无数据、由引擎标记不可用的腿会使该对整次跳过，其他配对不放大预算；全部配对不可用时权益保持初始值、交易数为零。未声明或不在允许集合的腿仍报错。
-- 策略自动绑定自己的组合构造器，YAML 中只需 `name`；显式指定 `portfolio.builder` 时以显式为准。
-
-`statistics.BandTrader`（滞回状态机）与 `statistics.RollingSpread`（O(1) 更新的滚动价差 z-score）不依赖任何引擎，时序策略也可直接在 `OnBar` 中使用：把两个品种的对数价格喂给 `RollingSpread.Observe`，再把 `Z` 交给 `BandTrader.Step`，用返回的 -1/0/+1 决定 `EnterReq`/`ExitReq`。
+配对、滚动配对、协整篮子、残差 s-score 和期现 carry 使用 `RegisterPairs` 等专用注册接口，一次声明即可运行，详见[统计套利与期现](./statarb.md)。
 
 ## 用表达式编写多因子
 
@@ -208,6 +302,24 @@ run_policy:
 
 自定义 Go 策略通过 `runner.RegisterDefinition(name, builder)` 注册，builder 签名为 `func(runner.Config) (*factor.Plan, research.ComboSpec, error)`。自定义组合通过 `runner.RegisterPortfolioBuilder` 注册唯一版本名。字段节点、缺失策略和算子版本都应显式声明。详细接口见 [因子 API](../api/factor.md)。
 
+### 表达式算子速查
+
+| 类别 | 算子 |
+| --- | --- |
+| 逐点 | `+ - * /`，比较 `> >= < <=`（或 `gt/ge/lt/le`，真为 1、假为 0），`where(cond,a,b)`（别名 `if_else`；`cond` 有效时只要求被选中分支有效），`sign`、`clip(x,lo,hi)`、`positive`、`abs`、`log`、`sqrt`、`pow`、`min`、`max` |
+| 时序基础 | `ts.lag`、`ts.return`（`ts.ret`）、`ts.ema`、`ts.std(x,n,ddof)`、`ts.sum`、`ts.product`、`ts.rank`、`ts.zscore`、`ts.argmax`、`ts.argmin`、`ts.corr`、`ts.cov`、`ts.beta` |
+| 滚动统计 | `ts.skew`（n≥3）、`ts.kurt`（n≥4）、`ts.slope`、`ts.rsquare`、`ts.decay_linear` |
+| 截面 | `cs.rank`、`cs.pct_rank`（`[0,1]`）、`cs.zscore`、`cs.robust_zscore`、`cs.winsorize`、`cs.mad_winsorize`、`cs.quantile`、`cs.mean`、`cs.sum`（后三者输出截面常数） |
+| 回归与分组 | `group.residual`、`group.ols`、`group.wls`、`group.demean`、`group.zscore` |
+| 加密赛道 | `cs.sector_demean`、`cs.sector_zscore`（别名 `group.sector_*`），按内置 8 类赛道（`L1`、`L2`、`DeFi`、`AI_DePin`、`Meme`、`Gaming`、`Infra`、`Other`）由符号推导，无需外部表；`sector_code()` 输出 0–7 编码 |
+| 分位分层 | `group.quantile_demean/zscore/rank/pct_rank(x, metric, n)`：每期按连续指标 `metric`（如 `ts.sma(kline.quote,30)`）在参考池分成 `n`（2–1000）个等频桶，桶内处理 `x` |
+| 跨周期与基准 | `mtf.asof("1d", expr[, max_stale_ms])`（别名 `asof_tf`）；`ref.field("BTC/USDT:USDT", "close")`（可选第三参数指定数据源） |
+| 技术指标 | `ts.sma/rma/wma/dema/tema/hma/kama/alma/trima/er/kalman1d/hurst`、`ts.rsi/roc/mom/cci/macd*/bbands_*/stoch/willr`、`ts.tr/atr/natr/adx/dmi_*/chop/aroon_*/vortex_*/donchian_*/keltner_*/supertrend*/sar/stc/ichimoku_*`、`ts.highest/lowest/vwma/obv/mfi/cmf/adl/adosc`，订单流 `ts.volume_delta/cvd/rolling_cvd/taker_buy_ratio`，波动率 `ts.parkinson_vol/garman_klass_vol/yang_zhang_vol` |
+
+声明 `kline` 绑定后可直接写 `open`、`high`、`low`、`close`、`volume`、`buy_volume`，OHLC 类指标可省略字段参数，如 `ts.adx(14)`、`ts.volume_delta()`。绑定别名不能使用 `factor`、`param`、`label`、`ts`、`cs`、`group`、`mtf`、`ref`。窗口必须是整数常量或 `param.name`，范围 1–10000。
+
+`mtf.asof` 的源周期不得细于外层决策周期；内部指标只随已闭合的源 bar 推进，再因果对齐到决策网格，所以 4h 决策可以使用真正的日线均线。`ref.field` 读取指定基准品种字段并广播到全池，基准不必在可交易集合内。表达式支持任意无环的 CS→TS→CS 多阶段嵌套，例如 `cs.zscore(ts.sma(cs.pct_rank(ts.return(kline.close, 30)), 5))`（先排名再时间平滑再标准化，以降低换手），预热长度自动累加。完整示例：[operators.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/operators.yml)、[neutral-sector-quantile.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/neutral-sector-quantile.yml)。
+
 ## 使用常见技术指标
 
 可将以下内容替换或加入 `expressions.outputs`，时序结果还可传给截面排名或组合：
@@ -221,7 +333,7 @@ outputs:
   band_width: 'ts.bbands_upper(kline.close,20,2,2)-ts.bbands_lower(kline.close,20,2,2)'
 ```
 
-新增 18 类指标、22 个标量函数全部支持 Batch 与 Session。完整列表、参数、公式及预热长度见[常见技术指标](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md)和[API](../api/factor.md#常见技术指标)。周期按完整有效元组计数，缺字段或 NULL 保留原始无效原因并暂停本指标状态。`ts.roc` 使用百分比单位，`ts.return` 使用比例；历史分块保持同一个 Session，混合源周期使用显式 asof binding。
+技术指标、订单流和波动率估计函数（见上文算子速查）全部支持 Batch 与 Session。完整列表、参数、公式及预热长度见[常见技术指标](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md)和[API](../api/factor.md#常见技术指标)。周期按完整有效元组计数，缺字段或 NULL 保留原始无效原因并暂停本指标状态。`ts.roc` 使用百分比单位，`ts.return` 使用比例；历史分块保持同一个 Session，混合源周期使用显式 asof binding。
 
 ## 稳健表达式与研究扩展
 
@@ -274,8 +386,8 @@ FactorRegistry、JSONL TrialLedger、样本外比较、随机基线和有界 LRU
 ```yaml
 research:
   labels:
-    - {Name: 2h, Kind: executable-return, Horizon: 7200000, PeriodsPerYear: 4383}
-    - {Name: 16h, Kind: executable-return, Horizon: 57600000, PeriodsPerYear: 547.875}
+    - {name: 2h, kind: executable-return, horizon: 7200000, periods_per_year: 4383}
+    - {name: 16h, kind: executable-return, horizon: 57600000, periods_per_year: 547.875}
 ```
 
 标签成熟后才进入 IC/诊断，未来收益不能进入当期推理。历史组合省略 Label 时，多标签选最短期限（同期限按名称排序）并纳入 manifest；单标签隐式身份保持兼容。`Result.Unresolved` 记录超出数据终点的标签。固定/等权纯交易可设置 `research: {labels: []}`，research 和全部 history 方法不能关闭标签。
@@ -320,11 +432,9 @@ provider 选择顺序为 `--live-provider`、`accounts.<账户名>.live_provider
 
 因子引擎输出 JSON lines：panel、decision、成熟 diagnostics 和最终标量 summary。普通回测另写 resolved.json（最终默认值和配置来源）、account-&lt;account&gt;/manifest.json 与版本化 event/posting Gob 块。成功必须在输出 sync/close 与资源 cleanup 之后判定，失败保留主错误和清理错误。
 
-### 统计套利与多空归因结果
+### 多空归因与大池输出
 
-先检查 `run.json` 的完成状态，再看 `Results[]`；同一结果也出现在 `run-completed` 事件中，字段使用 Go 名称（首字母大写）。`Result.Pairs` 仅由 `RegisterPairs` 的历史回放汇总，包含各对的 PnL、Trades、WinRate、持仓长度、Turnover 和 Episodes。Episodes 有截断上限，完整次数看 `EpisodeCount`；出场原因包含 `exit`、`stop`、`maxhold`、`leg_missing` 和 `end`。`Unavailable`/`UnavailableLeg` 标明整次跳过的配对；`AllPairsUnavailable` 为真表示没有可运行配对，不能把平直净值当作有效策略表现。
-
-逐对 `PnL` 是基于决策价与各对目标权重的收益比例，未分摊成本，不等于成交盈亏。`PairsGrossPnL` 为各对合计，`PairsNAVReturn` 为账本收益率，`PairsResidual = PairsNAVReturn - PairsGrossPnL` 包含成本和延迟、权重漂移、共享品种净额成交的近似差异。
+统计套利的逐对结果、对账字段与 `Result.Pairs` 见[统计套利与期现](./statarb.md#结果解读)。
 
 `Result.Attribution` 仅在 weights 账本提供多/空腿价格盈亏、平均敞口、费用、滑点、资金费、PIT 成本与至多 20 个 `TopSymbols`。它不在 events/live 输出，也不是独立逐批成交报告。weights 的近似 `funding_apr` 以账户净多头名义额计费，净空头不收取也不获得资金费；资金费只记账户 `Funding`，不摊入 `TopSymbols[].Net`。
 

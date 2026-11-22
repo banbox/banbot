@@ -33,15 +33,22 @@ banbot是一个高性能、易用、多品种、多策略、多周期、多账�
 * 指标库：内置[banta](https://github.com/banbox/banta)高性能指标库，您可基于其快速开发自定义指标
 * 任意时序数据：K 线扩展列、第三方序列及类型/NULL 语义统一传递，见[自定义数据](./custom_data.md)
 * 双策略引擎：时序回调、多因子截面组合、配对统计套利及混合 events 回放，见[因子指南](./factor.md)
+* 时序策略：按品种的主/辅助周期事件回调，见[自定义策略](./strat_custom.md)
+* 多因子与截面：多因子排序、组合构建与研究，见[多因子与截面](./factor.md)
+* 统计套利与 carry：配对/价差策略，含同交易所现货-永续 carry，见[统计套利](./statarb.md)
+* 内置衍生品数据：`funding_rate`（资金费率）、`open_interest`（持仓量与多空比）及标记/指数/溢价 K 线，见[自定义数据](./custom_data.md)
+* 高级订单：限价/触发入场、交易所端止损止盈、跟踪止损，见[自定义策略](./strat_custom.md)
 * LLM 扩展：提供可由策略项目主动调用的模型管理库，见[AI](../advanced/ai.md)
 
 ## WebUI
 用于策略编辑、数据管理和回测。`bot web` 默认本机 `127.0.0.1:8000`，可不设密码；绑定 `0.0.0.0` 或 `::` 必须传 `--password`（Basic Auth 用户名为 `banbot`）。
 
+在设置页的“主题”中可切换亮色、暗色或跟随系统，偏好保存在浏览器本地。
+
 ![image](https://docs.banbot.site/uidev.gif)
 
 ## Dashboard UI
-用于管理实盘机器人，推荐部署在离交易所更近的服务器，需密码访问
+用于管理实盘机器人，推荐部署在离交易所更近的服务器，需密码访问。启用 `api_server` 时必须设置非空的 `api_server.jwt_secret_key`，否则拒绝启动；顶部栏可切换主题。
 
 ![image](https://docs.banbot.site/dashboard.gif)
 

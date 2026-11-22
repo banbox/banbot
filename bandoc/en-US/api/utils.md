@@ -658,6 +658,57 @@ Parameters:
 Returns:
 - `*StagedPrg` - Multi-stage progress bar object
 
+## More Common Functions
+
+### Math and Statistics
+
+| Function | Description |
+| --- | --- |
+| `SharpeRatioBy(moReturns []float64, riskFree float64, periods int, annualize bool) (float64, error)` | Sharpe ratio with explicit periods per year and annualization |
+| `SharpeRatioSmart(moReturns []float64, riskFree float64, periods int, annualize bool) (float64, error)` | Sharpe ratio with autocorrelation penalty |
+| `SharpeRatioAdv(moReturns []float64, riskFree float64, periods int, annualize, smart bool) (float64, error)` | Common entry of both above; `smart` toggles the penalty |
+| `SortinoRatioBy` / `SortinoRatioSmart` / `SortinoRatioAdv` | Sortino ratio; same parameters as the matching Sharpe functions |
+| `CalcUlcerPerformance(nav []float64, elapsedYears, annualRiskFree float64) (*float64, *float64, error)` | Ulcer Index and Ulcer Performance Index from a NAV series; NAV must be finite and positive |
+| `CalcUlcerPerformanceByReturns(returns []float64, elapsedYears, annualRiskFree float64) (*float64, *float64, error)` | Same, from per-period returns (initial NAV taken as 1) |
+| `CalcDrawDown(reals []float64, viewNum int) (float64, float64)` | Max drawdown rate and value of an equity series; long series are sampled when `viewNum>0` |
+| `CalcAssetStabilityScore(values []float64, method int) float64` | Equity-curve stability score in [-1,1]; `method` 0 auto, 1 drawdown only, 2 linear fit only |
+| `CalcAssetLinearScore(values []float64) float64` / `CalcAssetDrawDownScore(values []float64) float64` | Linear-fit and drawdown components of the stability score, in [-1,1] |
+| `CalcAssetActivityScore(data []float64) float64` | Activity score; low for few orders or long idle periods |
+| `NormalizeFloat64(values []float64, minBtm float64) []float64` | Normalize into the range `minBtm`..1 |
+
+### Numeric Helpers
+
+| Function | Description |
+| --- | --- |
+| `ToFloat64(value any) (float64, error)` / `ToInt64(value any) (int64, error)` | Convert common numeric types to float64/int64; unsupported types return an error |
+| `ConvertFloat64(i any) float64` / `ConvertInt64(i any) int64` | Same, returning 0 for unsupported types |
+| `NumSign(obj any) int` | Sign 1/-1/0; only int/float types, otherwise panics |
+| `EqualNearly(a, b float64) bool` / `EqualIn(a, b, thres float64) bool` | Approximate float equality; two NaNs are equal |
+| `NanInfTo(v, to float64) float64` | Replace NaN/Inf with `to` |
+| `GcdInts(numbers []int) int` | GCD of all elements; 0 for an empty slice |
+| `ArgSortDesc[T cmp.Ordered](values []T) []int` | Original indices after sorting in descending order |
+
+### Collections and Text
+
+| Function | Description |
+| --- | --- |
+| `MapKeys(m M, sorted bool) iter.Seq[K]` | Key iterator of a map; ascending when `sorted` is true |
+| `GetAddsRemoves[T comparable](news, olds []T) ([]T, []T)` | Elements added and removed in `news` relative to `olds` |
+| `SplitToMap(text, sep string) map[string]bool` | Split by separator, trim, drop empty items and return a set |
+| `Check(err error)` | Panics if `err` is non-nil |
+| `ArrToStr[T any](arr []T, precFlt int) string` | Join with commas; floats use `precFlt` decimals |
+| `SplitLines(text string) []string` | Split into lines, handling `\r\n` and `\r` |
+
+### Scheduling, Config and Mail
+
+| Function | Description |
+| --- | --- |
+| `NewCronScheduler(exp string) (cron.Schedule, error)` | Parse a six-field (with seconds) cron expression in the package display timezone |
+| `NewCronSchedulerWithLocation(exp string, location *time.Location) (cron.Schedule, error)` | Same with an explicit location (nil means UTC) |
+| `CronAlign(scd cron.Schedule, stamp time.Time) time.Time` | The latest scheduled time not after `stamp` |
+| `MergeYamlStr(paths []string, skips ...string) (string, error)` | Merge several YAML files preserving key order; later files override earlier ones |
+| `SendEmailTo(subject, body string, toList ...string) error` | Send mail to recipients; the mail sender must be configured first |
+
 ## Utility ownership corrections
 
 CountDigit(text string) int and GroupByPairQuotes(items map[string][]string, doSort bool) string belong to core. ReadLastNLines is no longer a public utils API; use actual exported file helpers.

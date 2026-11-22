@@ -659,6 +659,57 @@ func MapToStr[T any](m map[string]T, value bool, precFlt int) string
 返回:
 - `*StagedPrg` - 多阶段进度条对象
 
+## 更多常用函数
+
+### 数学与统计
+
+| 函数 | 说明 |
+| --- | --- |
+| `SharpeRatioBy(moReturns []float64, riskFree float64, periods int, annualize bool) (float64, error)` | 指定每年周期数 `periods` 与是否年化的夏普比率 |
+| `SharpeRatioSmart(moReturns []float64, riskFree float64, periods int, annualize bool) (float64, error)` | 带相关性惩罚的夏普比率 |
+| `SharpeRatioAdv(moReturns []float64, riskFree float64, periods int, annualize, smart bool) (float64, error)` | 上述两者的统一入口，`smart` 控制惩罚 |
+| `SortinoRatioBy` / `SortinoRatioSmart` / `SortinoRatioAdv` | 索提诺比率，参数形式与对应的 Sharpe 函数相同 |
+| `CalcUlcerPerformance(nav []float64, elapsedYears, annualRiskFree float64) (*float64, *float64, error)` | 由净值序列计算 Ulcer Index 与 Ulcer Performance Index；净值需为有限正数 |
+| `CalcUlcerPerformanceByReturns(returns []float64, elapsedYears, annualRiskFree float64) (*float64, *float64, error)` | 同上，输入为逐期收益率（初始净值按 1） |
+| `CalcDrawDown(reals []float64, viewNum int) (float64, float64)` | 净值序列的最大回撤比率与回撤金额；`viewNum>0` 时序列过长会抽样 |
+| `CalcAssetStabilityScore(values []float64, method int) float64` | 净值曲线稳定性分数 [-1,1]；`method` 0 自动、1 仅回撤、2 仅线性拟合 |
+| `CalcAssetLinearScore(values []float64) float64` / `CalcAssetDrawDownScore(values []float64) float64` | 稳定性分数的线性拟合/回撤分量，[-1,1] |
+| `CalcAssetActivityScore(data []float64) float64` | 活跃度分数，订单太少或长时间无订单得分低 |
+| `NormalizeFloat64(values []float64, minBtm float64) []float64` | 归一化到 `minBtm`~1 范围 |
+
+### 数值工具
+
+| 函数 | 说明 |
+| --- | --- |
+| `ToFloat64(value any) (float64, error)` / `ToInt64(value any) (int64, error)` | 把常见数值类型转为 float64/int64，不支持的类型返回 error |
+| `ConvertFloat64(i any) float64` / `ConvertInt64(i any) int64` | 同上，不支持的类型返回 0 |
+| `NumSign(obj any) int` | 符号 1/-1/0，仅支持 int/float 类型，否则 panic |
+| `EqualNearly(a, b float64) bool` / `EqualIn(a, b, thres float64) bool` | 浮点近似相等；两者同为 NaN 视为相等 |
+| `NanInfTo(v, to float64) float64` | NaN/Inf 替换为 `to` |
+| `GcdInts(numbers []int) int` | 切片所有元素的最大公约数，空切片返回 0 |
+| `ArgSortDesc[T cmp.Ordered](values []T) []int` | 降序排序后对应的原始下标 |
+
+### 集合与文本
+
+| 函数 | 说明 |
+| --- | --- |
+| `MapKeys(m M, sorted bool) iter.Seq[K]` | map 的键迭代器，`sorted` 为 true 时升序 |
+| `GetAddsRemoves[T comparable](news, olds []T) ([]T, []T)` | 返回 `news` 相对 `olds` 新增与移除的元素 |
+| `SplitToMap(text, sep string) map[string]bool` | 按分隔符拆分，去空白并忽略空项，返回集合 |
+| `Check(err error)` | `err` 非 nil 时 panic |
+| `ArrToStr[T any](arr []T, precFlt int) string` | 用逗号连接，浮点数保留 `precFlt` 位小数 |
+| `SplitLines(text string) []string` | 按行拆分，兼容 `\r\n` 与 `\r` |
+
+### 调度、配置与邮件
+
+| 函数 | 说明 |
+| --- | --- |
+| `NewCronScheduler(exp string) (cron.Schedule, error)` | 解析六字段（含秒）cron 表达式，使用包级显示时区 |
+| `NewCronSchedulerWithLocation(exp string, location *time.Location) (cron.Schedule, error)` | 同上，显式指定时区（nil 为 UTC） |
+| `CronAlign(scd cron.Schedule, stamp time.Time) time.Time` | 返回不晚于 `stamp` 的最近一次触发时刻 |
+| `MergeYamlStr(paths []string, skips ...string) (string, error)` | 合并多个 YAML 文件内容，保持键顺序，后者覆盖前者 |
+| `SendEmailTo(subject, body string, toList ...string) error` | 向收件人发送邮件；需先配置邮件发送器 |
+
 ## 工具归属校正
 
 CountDigit(text string) int 和 GroupByPairQuotes(items map[string][]string, doSort bool) string 均属于 core。ReadLastNLines 已不是 utils 公共接口，文件工具应以实际导出方法为准。

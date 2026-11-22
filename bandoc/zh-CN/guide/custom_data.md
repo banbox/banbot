@@ -13,12 +13,12 @@ banbot 不只支持 K 线。资金费率、持仓量、链上指标、宏观数�
 
 ## 数据模型
 
-每个独立序列由 `orm.SeriesInfo` 描述。`name + timeframe` 默认生成表名，例如 `funding_rate_8h`；每条数据都关联一个 `ExSymbol` 的 `sid`，并有开始、结束时间和字段值。
+每个独立序列由 `orm.SeriesInfo` 描述。`name + timeframe` 默认生成表名，例如 `my_metric_8h`；每条数据都关联一个 `ExSymbol` 的 `sid`，并有开始、结束时间和字段值。
 
 ```go
-info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{
-    {Name: "rate", Type: "float", Role: "value"},
-    {Name: "next_rate", Type: "float", Role: "value"},
+info := orm.NewSeriesInfo("my_metric", "8h", []orm.SeriesField{
+    {Name: "value", Type: "float", Role: "value"},
+    {Name: "extra", Type: "float", Role: "value"},
 })
 ```
 
@@ -26,7 +26,7 @@ info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{
 
 运行时事件的核心字段为：
 
-- `Source`：数据源名称，例如 `funding_rate`
+- `Source`：数据源名称，例如 `my_metric`
 - `Sid` / `ExSymbol`：数据绑定的标的
 - `TimeMS`、`EndMS`、`TimeFrame`：数据覆盖的时间区间和基础周期
 - `Values map[string]any`：按字段名保存的原始值；整数、字符串、布尔、JSON、显式 nil 与缺键都可进入运行时，不限于 OHLCV
@@ -34,7 +34,7 @@ info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{
 原始字段用 `DataFields.RawValue(name)` 的值和存在标记读取；数值历史 `Series(name)` 是派生视图，NULL/缺失点为 NaN。显式把大整数选入 Series 会转成 float64，可能丢精度。数据库只存已声明字段，缺键写入固定列后可能成为 NULL；JSON 网络传输也不能自动保持 Go 整数宽度，不能把这些边界当成原始 map 的无损复制。
 
 ```go
-value, exists := fields.RawValue("rate") // fields: *strat.DataFields
+value, exists := fields.RawValue("value") // fields: *strat.DataFields
 if !exists {
     // 字段未出现在当前事件中。
 } else if value == nil {
@@ -44,20 +44,76 @@ if !exists {
 
 数据库读出的 NULL 会保留为存在的键和值 nil；不要用数值转换把它当作零。K 线整行写入中，缺少 `quote`/`buy_volume` 时默认 0.0，缺少 `trade_num` 时默认 0，其他缺少字段写 NULL；显式 nil 不等同于省略这些默认字段。
 
+## 内置数据源
+
+以下 5 个数据源随 banbot 提供，无需注册，策略直接按名称订阅即可。`bot series list` 会列出它们；自定义数据源不能使用这些名称，否则注册会报 `already registered`。
+
+| source | 默认周期 | 可订阅周期 | 字段（均为 float） | 适用市场 |
+| --- | --- | --- | --- | --- |
+| `funding_rate` | `8h` | 仅 `8h` | `rate` | 永续合约；不含现货、交割合约、期权 |
+| `open_interest` | `5m` | `5m` `15m` `30m` `1h` `2h` `4h` `6h` `12h` `1d` | `oi`、`oi_value`、`top_ls_pos_ratio`、`top_ls_acc_ratio`、`global_ls_ratio`、`taker_ls_vol_ratio` | 同 `funding_rate` |
+| `mark_kline` | `1m` | `1m` `3m` `5m` `15m` `30m` `1h` `2h` `4h` `6h` `8h` `12h` `1d` `3d` `1w` `1M` | `open`、`high`、`low`、`close` | 合约（含交割、期权）；不含现货 |
+| `index_kline` | `1m` | 同 `mark_kline` | 同 `mark_kline` | 永续与交割合约；不含现货、期权 |
+| `premium_kline` | `1m` | 同 `mark_kline` | 同 `mark_kline`（基差可为负） | 永续合约；不含现货、交割合约、期权 |
+
+- 订阅时 `TimeFrame` 必须是该源支持的周期，否则启动失败。对不适用市场的标的，这些源不返回数据。
+- 每条记录按闭合时刻对策略可见：资金费率在结算时刻可见；`open_interest` 缺失的指标以 NULL 保存，`Series()` 中为 NaN。
+- 实盘先补齐历史，再按固定间隔轮询交易所：`funding_rate` 和 `open_interest` 每 5 分钟，三个价格 K 线源每 1 分钟。
+- 历史数据优先使用交易所归档，近期部分走 REST；开启 `--net-off` 或 `bt_no_kline_download` 后不会发起远程下载，只读本地数据。
+
+订阅示例，更完整的可运行策略见 [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures)（`derivatives.go`）：
+
+```go
+OnDataSubs: func(job *strat.StratJob) []*strat.DataSub {
+    // ExSymbol 省略时使用当前 job 的标的
+    return []*strat.DataSub{
+        {Source: orm.SeriesSourceFundingRate, TimeFrame: "8h", WarmupNum: 3},
+        {Source: orm.SeriesSourceOpenInterest, TimeFrame: "1h", WarmupNum: 25,
+            SeriesFields: []string{orm.FieldOpenInterest}},
+    }
+},
+OnData: strat.RouteData(strat.DataHandlers{
+    Custom: func(job *strat.StratJob, d strat.DataEvent) {
+        switch d.Source {
+        case orm.SeriesSourceFundingRate:
+            rate := d.Float64("rate")
+            _ = rate
+        case orm.SeriesSourceOpenInterest:
+            if oi := d.Series(orm.FieldOpenInterest); oi != nil {
+                _ = oi.Get(0) // 最新持仓量，缺失为 NaN
+            }
+        }
+    },
+    Main: func(job *strat.StratJob, _ strat.DataEvent) { /* 主 K 线逻辑 */ },
+}),
+```
+
+回测会按缺口自动回填已订阅的数据并写入数据库。也可提前下载：
+
+```shell
+bot series down --tables funding_rate,open_interest --pairs BTC --timerange 20240101-20250101
+```
+
+`series down` 对每个源只下载其默认周期（`funding_rate` 8h、`open_interest` 5m、价格 K 线 1m）；省略 `--tables` 会处理所有已注册源，包括全部内置源。其他周期在策略订阅时回填。
+
+### 回测资金费结算
+
+回测平仓时，若数据库中有该标的的 `funding_rate` 记录（或回放中已收到该源事件），按持仓名义价值与持仓期间每个结算点的真实费率双向结算：正费率多头支付、空头收取，负费率相反；该结算不要求策略订阅 `funding_rate`，但数据需已入库（先执行上面的 `series down`）。没有任何费率记录时，回退到配置项 `bt_funding_apr` 的年化近似；反向合约在有真实记录时跳过结算，无记录时同样使用近似值。参见[回测指南](./backtest.md)和[配置指南](./configuration.md)。
+
 ## 注册数据源
 
 最简单的方式是使用函数式数据源。历史抓取函数负责返回指定时间范围的数据；实时订阅函数可选，未提供时该数据源仍可用于回测和启动时回填。
 
-下面假定您已实现供应商适配器 `fetchFundingRecords(ctx, sub, startMS, endMS)`，返回 `([]*orm.DataRecord, error)`。示例只注册历史读取，不会生成实时数据：
+下面假定您已实现供应商适配器 `fetchMetricRecords(ctx, sub, startMS, endMS)`，返回 `([]*orm.DataRecord, error)`。示例只注册历史读取，不会生成实时数据：
 
 ```go
 func init() {
-    info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{
-        {Name: "rate", Type: "float", Role: "value"},
+    info := orm.NewSeriesInfo("my_metric", "8h", []orm.SeriesField{
+        {Name: "value", Type: "float", Role: "value"},
     })
     err := data.RegisterFuncDataSource(info,
         func(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error) {
-            return fetchFundingRecords(ctx, sub, startMS, endMS)
+            return fetchMetricRecords(ctx, sub, startMS, endMS)
         },
         nil,
     )
@@ -83,30 +139,30 @@ func init() {
 
 ```go
 func init() {
-	strat.RegisterStrategy("funding_demo", func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy("metric_demo", func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
-			Name: "funding_demo",
+			Name: "metric_demo",
 			OnDataSubs: func(job *strat.StratJob) []*strat.DataSub {
 				return []*strat.DataSub{{
-					Source:       "funding_rate",
+					Source:       "my_metric",
 					ExSymbol:     job.Symbol,
 					TimeFrame:    "8h",
 					WarmupNum:    30,
-					Fields:       []string{"rate"},
-					SeriesFields: []string{"rate"},
+					Fields:       []string{"value"},
+					SeriesFields: []string{"value"},
 				}}
 			},
 			OnData: strat.RouteData(strat.DataHandlers{
 				Custom: func(job *strat.StratJob, data strat.DataEvent) {
-					if data.Source != "funding_rate" {
+					if data.Source != "my_metric" {
 						return
 					}
-					rate := data.Float64("rate")
+					value := data.Float64("value")
 					if !job.DataHub.AllReady() {
 						return
 					}
 					latest := job.DataHub.Get(data.TimeFrame, data.Source, data.Sid)
-					_, _ = rate, latest
+					_, _ = value, latest
 				},
 			}),
 		}
@@ -129,13 +185,13 @@ func init() {
 先下载或写入目标 K 线；扩展写入只 UPDATE 已有 `(sid,time)` 行，缺少目标行会报错，不会新建 K 线。使用 `NewKLineSeriesInfo`，不要用独立序列的 `NewSeriesInfo("kline", ...)` 绑定物理 K 线表：
 
 ```go
-info := orm.NewKLineSeriesInfo("open_interest", "1h", []orm.SeriesField{
-    {Name: "open_interest", Type: "float"},
+info := orm.NewKLineSeriesInfo("oi_ext", "1h", []orm.SeriesField{
+    {Name: "oi_ext", Type: "float"},
 })
 store := orm.NewKLineSeriesStoreWithStorage(info, storage)
 if err := store.Write(ctx, target, []*orm.DataRecord{{
     TimeMS: barStartMS,
-    Values: map[string]any{"open_interest": 12345.0},
+    Values: map[string]any{"oi_ext": 12345.0},
 }}); err != nil {
     return err
 }
@@ -146,24 +202,24 @@ if err := store.Write(ctx, target, []*orm.DataRecord{{
 ```go
 &strat.DataSub{
     Source: "kline", ExSymbol: job.Symbol, TimeFrame: "1h",
-    SeriesFields: []string{"open_interest"},
+    SeriesFields: []string{"oi_ext"},
 }
 ```
 
-K 线默认 OHLCV 字段会保留，扩展字段可从 `data.Series("open_interest")` 或 `data.Float64("open_interest")` 读取。扩展列不能使用 `sid`、`time`、`ts`、`open`、`high`、`low`、`close`、`volume`、`quote`、`buy_volume` 或 `trade_num` 等内置字段名。
+K 线默认 OHLCV 字段会保留，扩展字段可从 `data.Series("oi_ext")` 或 `data.Float64("oi_ext")` 读取。扩展列不能使用 `sid`、`time`、`ts`、`open`、`high`、`low`、`close`、`volume`、`quote`、`buy_volume` 或 `trade_num` 等内置字段名。
 
 ## 手动回填与检查
 
 ```shell
 bot series list
-bot series down --tables funding_rate --pairs BTC --timerange 20240101-20250101
+bot series down --tables funding_rate,open_interest --pairs BTC --timerange 20240101-20250101
 ```
 
-先确认 `list` 的 JSON 中包含 source 定义；它只列出编译进可执行文件的源，不扫描数据库。`down --tables` 按 source 名筛选，不是 `funding_rate_8h` 物理表名；省略时处理所有自定义源。当前 CLI 仅支持规则周期，会将结束时间裁到不晚于当前时间的已闭合边界；`event` 需使用具备相应能力的数据源/运行时接口。
+先确认 `list` 的 JSON 中包含 source 定义；它只列出编译进可执行文件的源，不扫描数据库。`down --tables` 按 source 名（逗号分隔）筛选，不是 `funding_rate_8h` 物理表名；省略时处理所有已注册源，包括内置的 `funding_rate`、`open_interest`、`mark_kline`、`index_kline`、`premium_kline`，需要限定范围时请指定 `--tables`。每个源只下载其默认周期。当前 CLI 仅支持规则周期，会将结束时间裁到不晚于当前时间的已闭合边界；`event` 需使用具备相应能力的数据源/运行时接口。
 
 ## 查看数据
 
-已注册的自定义数据可在 WebUI/Dashboard 的“数据”页面查看。查看器只读，支持按 source、sid、timeframe、时间范围和字段筛选；写入、补齐和删除应继续使用 `SeriesStore` 或数据源运行时。
+已注册的自定义数据可在 WebUI/Dashboard 的“数据”页面查看。查看器只读，支持按 source、sid、timeframe、时间范围和字段筛选，未指定起始时间时读取最近 30 天，单次默认返回 100 行、最多 1000 行；写入、补齐和删除应继续使用 `SeriesStore` 或数据源运行时。
 
 ## 聚合、复权和生命周期
 

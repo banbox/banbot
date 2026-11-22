@@ -74,7 +74,7 @@ Recheck coverage after changing symbols, timeframes, fields, or intervals. Unkno
 
 By default, BanBot matches orders on the strategy's K-line timeframe (`run_timeframes`). For example, if the strategy runs on a `1h` timeframe, the order's execution price will be matched based on the `1h` K-line. However, this may not be consistent with live trading in some scenarios, for example:
 
-- **High-frequency volatility**: When the K-line price fluctuates violently, it may meet both take-profit and stop-loss conditions at the same time. A single K-line loses internal details. To avoid deviation, BanBot will trigger the stop-loss first.
+- **High-frequency volatility**: When the K-line price fluctuates violently, it may meet both take-profit and stop-loss conditions at the same time. A single K-line loses internal details. To avoid deviation, BanBot will trigger the stop-loss first (this applies only within one matching bar; the finer the matching timeframe, the smaller this bias).
 - **Drawdown analysis**: It is impossible to observe the more granular capital drawdown within a large-period K-line.
 
 To solve this problem, BanBot introduces the `refine_tf` configuration item, which allows order matching on a smaller timeframe to simulate more realistic market behavior.
@@ -94,6 +94,35 @@ run_policy:
 - **Fixed timeframe (string)**: Such as `"1m"`, `"5m"`. Directly specify a precise matching timeframe.
 - **Relative multiple (integer)**: Such as `4`. It means that the `run_timeframes` period is divided into N equal parts. For example, if `run_timeframes` is `1h` and `refine_tf` is `4`, the matching timeframe is `15m`.
 - **Relative multiple range (string)**: Such as `"3-6"`. The program will automatically select a common timeframe within the range. For example, if `run_timeframes` is `1d` and `refine_tf` is `"3-6"`, it will choose `4h` (24h / 6) as the matching timeframe.
+
+`refine_tf` in `run_policy` takes precedence; when unset, the strategy's own `TradeStrat.RefineTF` (same formats) is used. A `1m` run timeframe is not refined. An unparsable value logs an error and falls back to the main timeframe.
+
+Notes:
+
+- Prepare K-lines for the matching timeframe in advance, including the warmup range; nothing is downloaded when `bt_no_kline_download: true`.
+- If the matching-timeframe bar has not arrived yet at a given moment, matching falls back to the main timeframe automatically.
+- Pending orders created inside an order callback (`OnOrderChange`) are matched only on the remaining price path after their creation time (including the `bt_net_cost` delay), so they never fill at prices before the callback.
+- Finer granularity only reduces cases where the order of events inside one bar is undecidable; it is not tick-by-tick execution.
+
+### Matching semantics
+
+Orders are matched along each bar's O→H→L→C price path; ordering inside one bar (main timeframe or `refine_tf` sub-bar) follows that path.
+
+| Order type | Backtest behavior |
+| --- | --- |
+| Limit / market | Limit orders fill when touched, without slippage; market orders get adverse slippage from `bt_slippage_bps` |
+| Stop-Limit entry (`Stop` + `Limit`) | Armed when price touches `Stop`, then fills at `Limit` or becomes a resting order; market stop entries also get slippage |
+| Local stop-loss / take-profit (`ExgStopLoss` / `ExgTakeProfit` set to `false`) | No exchange conditional order is placed; a local price monitor triggers it, in both backtest and live |
+| Stop-loss / take-profit | If both are hit within one bar, the stop-loss wins; stop fills are never better than the opening gap price |
+| Multi-level take-profit (`TakeProfits`) | Each target is resolved from the average entry price and closed partially from nearest to farthest; once a level with `MoveSLToBreakeven` fires, the remaining stop-loss tightens to no worse than the entry average, and later levels continue on the rest of the same bar |
+| Trailing stop (`CallbackPct` / `ActivationPrice`) | Tracking starts once price reaches the activation price; exit triggers on a `CallbackPct`% pullback from the best price, tagged `trailing_stop` |
+| OCO group (`OCOGroup`) | Among pending entries with the same account, symbol, strategy and group name, the one triggered earliest on the bar's price path fills and the others are cancelled immediately, tagged `oco_cancel` |
+
+See [custom strategies](./strat_custom.md) for field meaning and validation. Slippage applies only to market-style entries, stop/take-profit exits and forced exits; limit orders get none.
+
+### Data gaps and delisting exits
+
+Enabled when `bt_gap_bars > 0`: if the gap between two consecutive bars of a symbol exceeds both `bt_gap_bars` periods and `bt_gap_min_hours` hours (default 48), its open orders are force-closed with exit tag `data_gap`. Symbols whose data has ended are swept every 6 hours of simulated time and force-closed with tag `delist` at the last valid bar's close, shifted adversely by `bt_delist_penalty_bps`. Backtest only; live trading ignores it. These exits are caused by missing data and should not be read as strategy signals.
 
 ## Advanced Backtesting Features
 
@@ -115,7 +144,7 @@ See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
 
 ## Strict replay and historical coverage
 
-Ordinary backtests, including optimization trials, already use stable ordering. Within a bar, symbols follow a deterministic hash of time, symbol, and `bt_bar_order_seed` (default 0). Change the seed to examine capital-competition sensitivity. Stable ordering does not prove unbiased or lookahead-free results. `bt_strict: true` enables strict historical coverage checks; it is not required for deterministic ordering and does not freeze database contents. Strict historical replay also requires `bt_no_kline_download: true` and valid `historical_coverage`. Prepare missing data before replay.
+Ordinary backtests, including optimization trials, already use stable ordering. Within a bar, symbols follow a deterministic hash of time, symbol, and `bt_bar_order_seed` (default 0). Change the seed to examine capital-competition sensitivity. `bt_legacy_intrabar`, `bt_legacy_wallet_price` and `bt_legacy_order_metrics` only reproduce older backtest results. Stable ordering does not prove unbiased or lookahead-free results. `bt_strict: true` enables strict historical coverage checks; it is not required for deterministic ordering and does not freeze database contents. Strict historical replay also requires `bt_no_kline_download: true` and valid `historical_coverage`. Prepare missing data before replay.
 
 
 `historical_coverage` records `baseline_end_ms`, optional `historical_result_end_ms`, and symbol/timeframe maps named `bars`, `physical_bars` and `listing_prefixes`. Ranges are `[start_ms, stop_ms)`. Baseline must follow the run start and be no later than its end; result end must be between baseline and run end. Rows physically present today are not automatically authorized coverage at a historical cutoff.
@@ -135,9 +164,11 @@ bt_fresh_equity: true
 charge_on_bomb: false
 ```
 
-These values illustrate sensitivity experiments, not recommendations or market estimates. `bt_net_cost` is order latency in seconds, not a replacement for slippage. `bt_slippage_bps` is one-sided adverse market/stop-fill slippage in basis points. `bt_funding_apr` approximates annualized funding percentage for long contract positions, not actual historical venue settlements. `bt_delist_penalty_bps` adds adverse basis points beyond base slippage on delisting exits. Exchange configuration can override trading fees.
+These values illustrate sensitivity experiments, not recommendations or market estimates. `bt_net_cost` is order latency in seconds (default 15), not a replacement for slippage. `bt_slippage_bps` is one-sided adverse slippage in basis points on market fills, stop/take-profit exits and forced exits; limit orders get none. `bt_delist_penalty_bps` adds adverse basis points beyond base slippage on delisting exits. Exchange configuration can override trading fees.
 
-Configure data-gap guards with `bt_gap_bars` / `bt_gap_min_hours`, and inspect `gapExits` / `delistExits` and their absolute-profit shares. Gaps and delistings can force exits at the last valid bar; do not interpret missing-data exits as strategy signals. See the configuration template for defaults and full fields.
+`bt_funding_apr` approximates annualized funding on linear contracts, in percent per year (`10` means 10%/year), symmetric for both sides: with a positive value longs pay and shorts receive, and a 1:1 hedge nets to zero; inverse contracts are skipped. When real funding-rate settlement records exist in the backtest data (stored table `funding_rate_8h`, or a replay stream), the real settlement points crossed during the holding period are charged instead and this approximation is not used. `bt_legacy_approx_funding: true` restores the old long-only charging, for reproducing old results only.
+
+For the data-gap guard see "Data gaps and delisting exits" above, and inspect `gapExits` / `delistExits` and their absolute-profit shares. See the [configuration guide](./configuration.md) for the defaults of each `bt_*` key.
 
 `bt_fresh_equity` defaults on: equity curves, daily equity, drawdown, and risk metrics use balances plus current open-order unrealized P&L. Spot base assets are already marked in wallet value, without adding contract P&L twice. Set false only to compare the older cached-P&L curve; bankruptcy detection still uses fresh equity. Record this setting and the data version when comparing builds.
 

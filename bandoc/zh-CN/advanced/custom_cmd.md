@@ -53,7 +53,7 @@ bot trade --datadir /path/to/data --out /path/to/live-bars.gob
 bot tool test-live-bars --datadir /path/to/data /path/to/live-bars.gob
 ```
 
-上面的 `trade` 命令以完整可运行的 Hub 配置为前提，见[执行指南](../guide/execution.md)。此工具接收一个位置参数 `DUMP_FILE`，将时序实盘 dump 的 K 线与配置市场的本地存储比较。需要同一交易所、市场及可用数据库；它不是任意 Gob 文件的格式验证器，也不能证明策略无未来信息。
+`--out` 同时生成 `<out>.ws`（WebSocket 回放流），请勿用同一路径覆盖。上面的 `trade` 命令以完整可运行的 Hub 配置为前提，见[执行指南](../guide/execution.md)。此工具接收一个位置参数 `DUMP_FILE`，将时序实盘 dump 的 K 线与配置市场的本地存储比较。需要同一交易所、市场及可用数据库；它不是任意 Gob 文件的格式验证器，也不能证明策略无未来信息。
 
 ## 从订单重建报告
 

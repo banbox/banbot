@@ -13,12 +13,12 @@ Both methods use `DataSeries` at runtime. New strategies should declare requirem
 
 ## Data Model
 
-Each independent series is described by `orm.SeriesInfo`. `name + timeframe` generates a table name by default, such as `funding_rate_8h`. Each row is associated with the `sid` of an `ExSymbol` and has start and end times plus field values.
+Each independent series is described by `orm.SeriesInfo`. `name + timeframe` generates a table name by default, such as `my_metric_8h`. Each row is associated with the `sid` of an `ExSymbol` and has start and end times plus field values.
 
 ```go
-info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{
-    {Name: "rate", Type: "float", Role: "value"},
-    {Name: "next_rate", Type: "float", Role: "value"},
+info := orm.NewSeriesInfo("my_metric", "8h", []orm.SeriesField{
+    {Name: "value", Type: "float", Role: "value"},
+    {Name: "extra", Type: "float", Role: "value"},
 })
 ```
 
@@ -26,7 +26,7 @@ Field types include `float`, `int`, `string`, `bool`, and `json`. TimescaleDB st
 
 The core runtime event fields are:
 
-- `Source`: Data source name, such as `funding_rate`
+- `Source`: Data source name, such as `my_metric`
 - `Sid` / `ExSymbol`: Bound trading symbol
 - `TimeMS`, `EndMS`, `TimeFrame`: Data coverage interval and base timeframe
 - `Values map[string]any`: Raw values by field name, including integers, strings, booleans, JSON, explicit nil, and absent keys; not limited to OHLCV
@@ -34,7 +34,7 @@ The core runtime event fields are:
 Read original values with `DataFields.RawValue(name)` and its presence flag. `Series(name)` is a derived numeric history with NaN for NULL/missing points. Explicitly selecting large integers for Series converts them to float64 and may lose precision. Databases store declared columns only and can turn absent keys into NULL. JSON network transport also cannot preserve Go integer widths automatically; these boundaries are not lossless copies of the original map.
 
 ```go
-value, exists := fields.RawValue("rate") // fields: *strat.DataFields
+value, exists := fields.RawValue("value") // fields: *strat.DataFields
 if !exists {
     // The field is absent from this event.
 } else if value == nil {
@@ -44,20 +44,76 @@ if !exists {
 
 Database NULL values are read as present keys with nil values; do not convert them to zero. For full K-line row writes, missing `quote`/`buy_volume` default to 0.0, missing `trade_num` defaults to 0, and other missing fields become NULL. Explicit nil differs from omitting these defaulted fields.
 
+## Built-in Data Sources
+
+banbot ships the five sources below. They need no registration; strategies subscribe to them by name. `bot series list` lists them. A custom source cannot reuse these names; registering one fails with `already registered`.
+
+| source | Default timeframe | Supported timeframes | Fields (all float) | Markets |
+| --- | --- | --- | --- | --- |
+| `funding_rate` | `8h` | `8h` only | `rate` | Perpetual contracts; not spot, delivery futures, or options |
+| `open_interest` | `5m` | `5m` `15m` `30m` `1h` `2h` `4h` `6h` `12h` `1d` | `oi`, `oi_value`, `top_ls_pos_ratio`, `top_ls_acc_ratio`, `global_ls_ratio`, `taker_ls_vol_ratio` | Same as `funding_rate` |
+| `mark_kline` | `1m` | `1m` `3m` `5m` `15m` `30m` `1h` `2h` `4h` `6h` `8h` `12h` `1d` `3d` `1w` `1M` | `open`, `high`, `low`, `close` | Contracts (including delivery futures and options); not spot |
+| `index_kline` | `1m` | Same as `mark_kline` | Same as `mark_kline` | Perpetual and delivery contracts; not spot or options |
+| `premium_kline` | `1m` | Same as `mark_kline` | Same as `mark_kline` (basis can be negative) | Perpetual contracts; not spot, delivery futures, or options |
+
+- The subscription `TimeFrame` must be one the source supports, otherwise startup fails. Symbols in unsupported markets return no data.
+- Each record becomes visible to strategies at its closing time: a funding rate is visible from its settlement time. Missing `open_interest` metrics are stored as NULL and appear as NaN in `Series()`.
+- Live trading backfills history first, then polls the exchange: every 5 minutes for `funding_rate` and `open_interest`, every 1 minute for the three price K-line sources.
+- History comes from exchange archives first, with recent data fetched over REST. With `--net-off` or `bt_no_kline_download`, no remote download is made and only local data is read.
+
+Subscription example. A complete runnable strategy is in [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) (`derivatives.go`):
+
+```go
+OnDataSubs: func(job *strat.StratJob) []*strat.DataSub {
+    // An omitted ExSymbol means the current job's symbol
+    return []*strat.DataSub{
+        {Source: orm.SeriesSourceFundingRate, TimeFrame: "8h", WarmupNum: 3},
+        {Source: orm.SeriesSourceOpenInterest, TimeFrame: "1h", WarmupNum: 25,
+            SeriesFields: []string{orm.FieldOpenInterest}},
+    }
+},
+OnData: strat.RouteData(strat.DataHandlers{
+    Custom: func(job *strat.StratJob, d strat.DataEvent) {
+        switch d.Source {
+        case orm.SeriesSourceFundingRate:
+            rate := d.Float64("rate")
+            _ = rate
+        case orm.SeriesSourceOpenInterest:
+            if oi := d.Series(orm.FieldOpenInterest); oi != nil {
+                _ = oi.Get(0) // latest open interest; NaN when missing
+            }
+        }
+    },
+    Main: func(job *strat.StratJob, _ strat.DataEvent) { /* main K-line logic */ },
+}),
+```
+
+Backtests backfill subscribed data automatically by gap and write it to the database. You can also download it beforehand:
+
+```shell
+bot series down --tables funding_rate,open_interest --pairs BTC --timerange 20240101-20250101
+```
+
+`series down` downloads each source only at its default timeframe (`funding_rate` 8h, `open_interest` 5m, price K-lines 1m). Omitting `--tables` processes every registered source, including all built-in ones. Other timeframes are backfilled when a strategy subscribes to them.
+
+### Backtest Funding Settlement
+
+When a backtest order closes, if the database holds `funding_rate` records for the symbol (or the source's events were received during replay), funding is settled both ways from the position notional and the real rate at each settlement time held through: with a positive rate longs pay and shorts receive, and the reverse for a negative rate. Settlement does not require the strategy to subscribe to `funding_rate`, but the data must already be stored (run `series down` above first). With no rate records, it falls back to the annualized approximation from `bt_funding_apr`. Inverse contracts skip settlement when real records exist and use the approximation otherwise. See the [Backtest guide](./backtest.md) and [Configuration guide](./configuration.md).
+
 ## Registering a Data Source
 
 The simplest method is a function-based data source. The historical fetch function returns data for a specified time range; the optional live subscription function can be omitted when the source is only used for backtesting and startup backfill.
 
-This example assumes you implement a provider adapter named `fetchFundingRecords(ctx, sub, startMS, endMS)` returning `([]*orm.DataRecord, error)`. It registers historical access only and does not generate live data:
+This example assumes you implement a provider adapter named `fetchMetricRecords(ctx, sub, startMS, endMS)` returning `([]*orm.DataRecord, error)`. It registers historical access only and does not generate live data:
 
 ```go
 func init() {
-    info := orm.NewSeriesInfo("funding_rate", "8h", []orm.SeriesField{
-        {Name: "rate", Type: "float", Role: "value"},
+    info := orm.NewSeriesInfo("my_metric", "8h", []orm.SeriesField{
+        {Name: "value", Type: "float", Role: "value"},
     })
     err := data.RegisterFuncDataSource(info,
         func(ctx context.Context, sub *strat.DataSub, startMS, endMS int64) ([]*orm.DataRecord, error) {
-            return fetchFundingRecords(ctx, sub, startMS, endMS)
+            return fetchMetricRecords(ctx, sub, startMS, endMS)
         },
         nil,
     )
@@ -83,30 +139,30 @@ Return subscriptions from `OnDataSubs` and process the fields in `OnData`:
 
 ```go
 func init() {
-	strat.RegisterStrategy("funding_demo", func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+	strat.RegisterStrategy("metric_demo", func(_ *config.RunPolicyConfig) *strat.TradeStrat {
 		return &strat.TradeStrat{
-			Name: "funding_demo",
+			Name: "metric_demo",
 			OnDataSubs: func(job *strat.StratJob) []*strat.DataSub {
 				return []*strat.DataSub{{
-					Source:       "funding_rate",
+					Source:       "my_metric",
 					ExSymbol:     job.Symbol,
 					TimeFrame:    "8h",
 					WarmupNum:    30,
-					Fields:       []string{"rate"},
-					SeriesFields: []string{"rate"},
+					Fields:       []string{"value"},
+					SeriesFields: []string{"value"},
 				}}
 			},
 			OnData: strat.RouteData(strat.DataHandlers{
 				Custom: func(job *strat.StratJob, data strat.DataEvent) {
-					if data.Source != "funding_rate" {
+					if data.Source != "my_metric" {
 						return
 					}
-					rate := data.Float64("rate")
+					value := data.Float64("value")
 					if !job.DataHub.AllReady() {
 						return
 					}
 					latest := job.DataHub.Get(data.TimeFrame, data.Source, data.Sid)
-					_, _ = rate, latest
+					_, _ = value, latest
 				},
 			}),
 		}
@@ -129,13 +185,13 @@ When data is strictly aligned with K-line timestamps, use `orm.NewKLineSeriesInf
 Download or write the target K-lines first. Extension writes only UPDATE existing `(sid,time)` rows and fail when a target row is missing; they never create K-lines. Use `NewKLineSeriesInfo` rather than binding a physical K-line table with the independent-series `NewSeriesInfo("kline", ...)`:
 
 ```go
-info := orm.NewKLineSeriesInfo("open_interest", "1h", []orm.SeriesField{
-    {Name: "open_interest", Type: "float"},
+info := orm.NewKLineSeriesInfo("oi_ext", "1h", []orm.SeriesField{
+    {Name: "oi_ext", Type: "float"},
 })
 store := orm.NewKLineSeriesStoreWithStorage(info, storage)
 if err := store.Write(ctx, target, []*orm.DataRecord{{
     TimeMS: barStartMS,
-    Values: map[string]any{"open_interest": 12345.0},
+    Values: map[string]any{"oi_ext": 12345.0},
 }}); err != nil {
     return err
 }
@@ -146,24 +202,24 @@ The example assumes `storage`, `target`, `ctx`, and the K-line start timestamp `
 ```go
 &strat.DataSub{
     Source: "kline", ExSymbol: job.Symbol, TimeFrame: "1h",
-    SeriesFields: []string{"open_interest"},
+    SeriesFields: []string{"oi_ext"},
 }
 ```
 
-The default OHLCV fields are preserved. Extension fields can be read with `data.Series("open_interest")` or `data.Float64("open_interest")`. Extension columns cannot use built-in field names such as `sid`, `time`, `ts`, `open`, `high`, `low`, `close`, `volume`, `quote`, `buy_volume`, or `trade_num`.
+The default OHLCV fields are preserved. Extension fields can be read with `data.Series("oi_ext")` or `data.Float64("oi_ext")`. Extension columns cannot use built-in field names such as `sid`, `time`, `ts`, `open`, `high`, `low`, `close`, `volume`, `quote`, `buy_volume`, or `trade_num`.
 
 ## Manual Backfill and Inspection
 
 ```shell
 bot series list
-bot series down --tables funding_rate --pairs BTC --timerange 20240101-20250101
+bot series down --tables funding_rate,open_interest --pairs BTC --timerange 20240101-20250101
 ```
 
-First check that the JSON from `list` contains your source definition. It lists compiled-in sources without scanning the database. `down --tables` selects source names, not physical tables such as `funding_rate_8h`; omitting it selects all custom sources. The current CLI supports regular periods only and clips the end to a closed boundary no later than now. Use a capable source/runtime interface for `event` streams.
+First check that the JSON from `list` contains your source definition. It lists compiled-in sources without scanning the database. `down --tables` selects source names (comma-separated), not physical tables such as `funding_rate_8h`; omitting it selects all registered sources, including the built-in `funding_rate`, `open_interest`, `mark_kline`, `index_kline`, and `premium_kline`, so pass `--tables` to limit the scope. Each source is downloaded at its default timeframe only. The current CLI supports regular periods only and clips the end to a closed boundary no later than now. Use a capable source/runtime interface for `event` streams.
 
 ## Viewing Data
 
-Registered custom data can be viewed on the Data page in WebUI/Dashboard. The viewer is read-only and supports filtering by source, sid, timeframe, time range, and fields. Continue to use `SeriesStore` or the data-source runtime for writing, backfilling, and deleting data.
+Registered custom data can be viewed on the Data page in WebUI/Dashboard. The viewer is read-only and supports filtering by source, sid, timeframe, time range, and fields. Without a start time it reads the last 30 days, returning 100 rows by default and at most 1000. Continue to use `SeriesStore` or the data-source runtime for writing, backfilling, and deleting data.
 
 ## Aggregation, Adjustment, and Lifecycle
 

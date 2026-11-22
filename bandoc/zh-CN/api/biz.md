@@ -26,9 +26,12 @@ biz 包提供了业务逻辑层的功能实现。
 主要方法:
 - `ProcessOrders`: 处理订单请求
 - `EnterOrder`: 处理入场订单
+- `EditOrder`: 提交订单修改（如止损止盈、追踪止损变更）；实盘排入订单队列，回测本地管理器中无操作
+- `RelayOrders`: 把已有订单复制为当前管理器下的新订单（接力/接管）
 - `ExitOpenOrders`: 处理退出订单
 - `ExitOrder`: 处理单个订单的退出
 - `UpdateByDataSeries`: 根据K线更新订单状态
+- `ExitAndFill`: 对指定订单提交退出请求；本地（回测/模拟）管理器随即按最新价成交（回测为最后一根K线价），实盘管理器仅提交退出
 - `OnEnvEnd`: 环境结束时的处理
 - `CleanUp`: 清理资源
 
@@ -124,6 +127,7 @@ biz 包提供了业务逻辑层的功能实现。
 
 参数：
 - `currMS`: int64 - 当前毫秒时间戳
+- `isWarmUp`: bool - 是否处于预热阶段；预热中批量回调仍执行，但不处理其产生的订单请求
 
 返回：
 - `int` - 尚待处理的任务数量
@@ -181,6 +185,7 @@ biz 包提供了业务逻辑层的功能实现。
 参数：
 - `callBack`: func(od *ormo.InOutOrder, isEnter bool) - 订单回调函数
 - `showLog`: bool - 是否显示日志
+- `stops`: ...func() - 可选的停止回调
 
 ### VerifyTriggerOds
 验证触发订单。
@@ -224,7 +229,11 @@ EnterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder,
 ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error)
 ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error)
 UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error
+EditOrder(od *ormo.InOutOrder, action string)
+RelayOrders(orders []*ormo.InOutOrder) *errs.Error
+ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error
 OnEnvEnd(evt *orm.DataSeries) *errs.Error
+CleanUp() *errs.Error
 ```
 
 嵌入程序用 `GetOdMgrWithState(rt.Trading, account)`、`GetAllOdMgrWithState(rt.Trading)`、`GetLiveOdMgrWithState(rt.Trading, account)` 和 `rt.Trading.Wallet(account)` 获取所属任务状态。检查 nil；禁用的账户不保证有 manager。包级同名无 State 函数只读兼容注册表。

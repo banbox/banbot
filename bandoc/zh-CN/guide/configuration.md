@@ -50,6 +50,7 @@ limit_vol_secs: 5  # 按成交量取订单簿价格的过期时间，单位：�
 put_limit_secs: 120  # 在此预期时间内能成交的限价单，才提交到交易所，单位：秒，默认180
 account_pull_secs: 60  # 定期更新账户余额和持仓的间隔秒数，默认60秒
 market_type: spot  # 市场：spot现货，linear：U本位合约，inverse：币本位合约，option：期权合约
+extra_markets: [spot]  # 同一交易所额外准入的市场类型，可选 spot/linear/inverse/margin/option；与 market_type 相同的项被忽略，默认不启用
 contract_type: swap # swap永续合约，future到期合约
 odbook_ttl: 1000  # 订单簿过期时间，单位毫秒，默认500
 concur_num: 2  # 标的K线并发下载数，默认2个标的
@@ -70,6 +71,11 @@ low_cost_action: ignore # 开单金额不足最小金额时的动作：ignore/ke
 max_simul_open: 0 # 在一个bar上最大同时打开订单数量
 bt_net_cost: 15 # 回测时下单延迟，可用于模拟滑点，单位：秒，默认15
 bt_strict: false # 严格历史回放校验；普通回测也使用稳定的执行顺序
+bt_slippage_bps: 0 # 市价/止损成交的单边不利滑点，单位bp，默认0不启用
+bt_funding_apr: 0 # 线性合约近似资金费，百分比/年，多空双边对称，默认0不启用
+bt_gap_bars: 0 # K线空洞守卫：品种两根K线间缺失超过N根时，按最后已知价强平其未平仓订单，默认0不启用
+bt_gap_min_hours: 48 # 空洞同时需超过的小时数，默认48
+bt_delist_penalty_bps: 0 # 退市出场在滑点之外额外的不利bp，默认0不启用
 relay_sim_unfinish: false  # 交易新品种时(回测/实盘)，是否从开始时间未平仓订单接力开始交易
 order_bar_max: 500  # 查找开始时间未平仓订单向前模拟最大bar数量
 ntp_lang_code: none  # ntp真实时间同步，默认none不启用，支持的代码：zh-CN, zh-HK, zh-TW, ja-JP, ko-KR, zh-SG, global(表示全球ntp服务器：google、apple、facebook...)
@@ -111,8 +117,8 @@ strat_perf:
   min_od_num: 5 # 最小5，默认5，少于5个不计算性能
   max_od_num: 30 # 最大job订单数，最小8，默认30
   min_job_num: 10 # 最小标的数量，默认10，最小7
-  mid_weight: 0.2 # 收益中间档的开单权重
-  bad_weight: 0.1 # 收益较差档开单权重
+  mid_weight: 0.2 # 收益中间档的开单权重，默认0.3
+  bad_weight: 0.1 # 收益较差档开单权重，默认0.15
 pairs: [SOL, UNFI, SFP]  # 给定交易币种，如不为空，pairlists会被忽略
 pairmgr:
   cron: '25 1 0 */2 * *' # 秒 分钟 小时 天 月 星期
@@ -193,7 +199,7 @@ accounts:
 exchange:  # 交易所配置
   name: binance  # 当前使用的交易所
   binance:  # 这里传入banexg初始化交易所的参数，key会自动从蛇形转为驼峰。
-    # proxy: http://127.0.0.1:10808
+    # proxy: http://127.0.0.1:10808  # 代理地址；no 表示不使用代理；不配置则自动探测，见下文网络代理
     fees:
       linear:  # 键可以是：linear/inverse/main(spot or margin)
         taker: 0.0005
@@ -203,6 +209,7 @@ database:  # 数据库配置，支持 QuestDB 和 TimescaleDB
   max_pool_size: 50  # 连接池最大大小
   auto_create: true  # 连接成功后是否初始化/升级 banbot schema
   db_type: questdb  # questdb 或 timescale
+  # sid_registry_url: postgresql://...  # 仅 QuestDB 多写入方：用于分配 SID 的 PostgreSQL 注册表地址
   url: postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable
   qdb_mem_pct: 0.3 # 仅 QuestDB：内存使用占比，范围0~1
   qdb_max_mem_mb: 16384 # 仅 QuestDB：数据库最大内存使用量，单位MB
@@ -257,12 +264,26 @@ api_server:  # 供外部通过api控制机器人
   bind_ip: 0.0.0.0
   port: 8081
   jwt_secret_key: bnlkrehnt40uyvjgnb234ro97gvb24
+  verbosity: ""  # 详细程度
+  CORS_origins: []  # 通过 banweb 访问时，需在此加入其来源地址
   users:
     - user: ban
       pwd: "123"
       allow_ips: []
+      exp_hours: 168  # token 过期小时数，默认168
       acc_roles:
         user1: admin  # 这里的键对应accounts，值可选admin/guest
+llm_models:  # LLM 模型配置，键为模型名；需由策略项目或工具显式调用，见 advanced/ai
+  base:
+    api_type: openai  # API 类型
+    api_key: ${LLM_API_KEY}
+    base_url: https://api.example.com/v1
+    timeout: 60  # 单次调用超时，秒
+    concurrency: 10  # 并发上限，默认10
+  fast:
+    extend: base  # 继承其它模型配置，字符串或列表
+    name: model-name  # 上游模型名
+    temperature: 0.2
 
 ```
 
@@ -332,9 +353,13 @@ banbot提供了`ntp_lang_code`配置项，可用于自动检测本地时间误�
 #### 订单接力入场
 对于大周期持仓时间较长的策略，可能一个订单持仓一两个月，您启动机器人时可能按交易信号应该已经有一些持仓了，要完全按信号交易您应该立即入场并持有对应的持仓而不是等待下一个信号发出才入场。
 
-`relay_sim_unfinish`配置为`true`时，会在开始交易某个品种时，自动回测前面500根K线，得到未平仓订单，然后按这些订单立即入场。
+`relay_sim_unfinish`配置为`true`时，会在开始交易某个品种时，自动向前回测至多`order_bar_max`（默认500，可被`run_policy[].order_bar_max`覆盖）根K线，得到未平仓订单，然后按这些订单立即入场。
 
 此配置项在回测和实盘中都有效。
+
+## LLM 模型配置
+
+根 `llm_models` 是以模型名为键的映射，每项支持：`name`、`extend`（字符串或列表，继承其它模型配置）、`api_type`、`api_key`、`base_url`、`timeout`（秒）、`timeout_rate`、`temperature`、`concurrency`（默认10）、`prompt_price`、`completion_price`、`cache_price`、`payload`（附加请求字段）。仅添加配置不会让普通回测或实盘自动调用 LLM，用法见 [AI 与外部模型](../advanced/ai.md)。
 
 ## 邮件通知配置
 
@@ -396,14 +421,21 @@ bt_in_live:
 
 | Path | Fields |
 | --- | --- |
-| data | namespace, page_rows, prefetch_rows, page_bytes, archive, max_records, pit_policy |
-| execution / accounts.&lt;name&gt; | mode, store, history, sender_lease_dir, live_provider, funding_policy, instruments, margin_rate, max_account_margin, max_virtual_gross, strategy_gross_limit |
-| run_policy[] | archive/chunks, snapshot, definition or expressions, combo, portfolio, decision, research, manifest, prices, funding_source, initial_nav, max_records |
-| run_policy[].decision | interval_ms, delay_ms, latency_ms, expiry_ms, max_pending |
+| data | namespace, page_rows, prefetch_rows, prefetch_concurrency, page_bytes, archive, max_records, pit_policy |
+| execution / accounts.&lt;name&gt; | mode, store, history, sender_lease_dir, hub_socket, live_provider, funding_policy, protection_mode, order_mode, near_limit_bps, paper_fill_model, instruments, margin_rate, max_account_margin, max_virtual_gross, strategy_gross_limit |
+| run_policy[] | archive/chunks, snapshot, definition or expressions, combo, portfolio, decision, research, manifest, prices, funding_source, initial_nav, max_records, option_expiry_source, terminal_settlement_source, pit_min_universe_ratio, pit_delist_penalty_bps, universe, rolling_universe |
+| run_policy[].decision | interval_ms, delay_ms, latency_ms, expiry_ms, max_pending, source_event_decisions, source, timeframe |
 | run_policy[].snapshot | universe, sid_map, schemas, source_versions, adjustment_version, visibility_policy, grid_time, decision_time, replay_time |
 | run_policy[].expressions | schema_version, timeframe, bindings, params, lets, outputs, combine |
-| run_policy[].combo / run_policy[].expressions.combine | method: equal/fixed/history-ic, columns, weights |
-| run_policy[].portfolio | builder, k, long_notional, short_notional, mode: full/patch |
+| run_policy[].expressions.bindings.&lt;name&gt; | source, timeframe, sampling, max_age_ms |
+| run_policy[].combo / run_policy[].expressions.combine | method: equal/fixed/history-ic/history-rank-ic/history-icir/history-rank-icir/history-ewma, columns, weights, min_samples, min_pairs, min_confidence, decay, direction, fallback, label |
+| run_policy[].portfolio | builder, k, long_notional, short_notional, long_min_score, short_max_score, unfilled_slot_policy (cash/rescale), asset_cap, drift_threshold, mode (full/patch), policy, policy_params, rebalance, selection, holding, transition, allocation, universe, rolling_universe |
+| run_policy[].portfolio.rebalance | every_bars, anchor, phase, duration, calendar, calendar_version, timezone, drift_threshold |
+| run_policy[].portfolio.selection | long_k, short_k, long_quantile, short_quantile, long_min_score, short_max_score, unfilled_slot_policy, retain_rank, dropout, group_quota, missing_scores |
+| run_policy[].portfolio.holding | min_bars, max_bars, min_duration, max_duration, stop_loss_pct, trailing_stop_pct, by_asset, adopt, cooldown_bars |
+| run_policy[].portfolio.transition | mode: direct/linear-exit/cohort/geometric/target-step, exit_steps, basis, period_bars, startup, sizing, on_reselect, ratio, final_threshold, alpha, entry_window_bars, by_asset |
+| run_policy[].portfolio.allocation | method: equal/score/fixed-notional/inverse-volatility/vol-target/erc/risk-parity/hrp/min-variance/mean-variance, volatility_column, beta_column, risk_window, shrinkage, risk_aversion, reserve_ratio, fixed_notional, vol_target, asset_cap, group_caps, turnover_limit, drift_threshold, net_cap, beta_cap |
+| run_policy[].universe / rolling_universe (also under portfolio) | mode: rolling_liquid_top/liquid_top/static, top_n, lookback_days, lookback_bars, min_listing_days, min_age_bars, reconstitute_days, reconstitute_bars, schedule: daily/weekly/monthly, always_include |
 | run_policy[].research | labels, label_wait_ms, panel (all/none) |
 | run_policy[].prices | source, timeframe, field |
 
@@ -430,6 +462,27 @@ accounts:
 同一配置文件中的每个字段只使用一种路径：同时写 `run_policy[].factor.archive` 与 `run_policy[].archive`，或在根 `accounts` 与旧 `execution.accounts` 重复写同一账户执行字段，会报冲突。跨文件先规范别名，再按后层覆盖规则合并；相对路径跟随最终字段的来源文件。规范导出不输出 `config_version` 或旧包装层。
 
 v0.5 的 `timeframes`、`run_timeframes` 保持原名；仅 v0.6 新增的 `frequency` 统一为 `timeframe`，不保留别名。未显式声明引擎的旧策略继续保留 More，包括 `id`、`account`、`archive`、`factor` 等同名自定义参数。如果旧参数已使用 `engine: factor` 或 `engine: time_series`，升级前需核对该同名冲突。
+
+## 网络代理
+
+交易所代理读取`exchange.<name>.proxy`：
+- 非空 URL：使用该地址。
+- `no`：不使用代理。
+- 未配置：依次尝试环境变量代理、系统代理（macOS 读取`scutil --proxy`）；都没有则不使用代理。自动探测结果在进程内只解析一次。
+
+## 回测成本与撮合字段
+
+| Key | 说明 |
+| --- | --- |
+| `bt_net_cost` | 回测下单延迟，秒，默认15；不能代替滑点 |
+| `bt_slippage_bps` | 市价/止损成交的单边不利滑点，bp，默认0不启用 |
+| `bt_funding_apr` | 线性合约近似资金费，百分比/年；正值时多头支付、空头收取，反向合约跳过，默认0不启用。不能代替交易所真实历史结算 |
+| `bt_legacy_approx_funding` | `true` 时 `bt_funding_apr` 仅对多头计费（空头不付不收） |
+| `bt_gap_bars` / `bt_gap_min_hours` | K线空洞守卫：同一品种两根K线间缺失超过 `bt_gap_bars` 根且超过 `bt_gap_min_hours` 小时（默认48）时，按最后已知价强平其未平仓订单；`bt_gap_bars` 为0不启用 |
+| `bt_delist_penalty_bps` | 退市出场在 `bt_slippage_bps` 之外额外的不利bp，默认0不启用 |
+| `bt_fresh_equity` | 默认开启：权益曲线、日权益、回撤与爆仓检查按当前未平仓订单盈亏计算；仅显式 `false` 使用钱包缓存的未实现盈亏（用于与旧结果对比） |
+| `bt_legacy_intrabar` / `bt_legacy_order_metrics` / `bt_legacy_wallet_price` | `true` 时恢复对应的旧版回测行为，仅用于与旧结果对比 |
+| `bt_bar_order_seed` | 同一 bar 上多个品种的确定性排序盐值，默认0 |
 
 ## 历史回放字段
 

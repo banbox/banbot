@@ -22,11 +22,16 @@ banbot is a high-performance, easy-to-use, multi-symbol, multi-strategy, multi-p
 * event-driven: no lookahead, more freedom to implement your trade ideas.
 * scalable: trade multiple exchange accounts simultaneously.
 * hyper opt: support bayes/tpe/random/cmaes/ipop-cmaes/bipop-cmaes
+* time-series strategies: per-symbol Go callbacks over main/auxiliary timeframes, see [Custom strategy](bandoc/en-US/guide/strat_custom.md).
+* factor / cross-sectional engine: multi-factor ranking, portfolios and research, see [Multi-factor strategies](bandoc/en-US/guide/factor.md).
+* statistical arbitrage and carry: pairs/spread strategies, including same-exchange spot-perpetual carry, see [Statistical arbitrage](bandoc/en-US/guide/statarb.md).
+* arbitrary time-series data: K-line extension columns and third-party series; built-in sources include `funding_rate`, `open_interest` and mark/index/premium klines, see [Custom data](bandoc/en-US/guide/custom_data.md).
+* order types: limit/stop entries, exchange-side stop-loss and take-profit, trailing stop, see [Custom strategy](bandoc/en-US/guide/strat_custom.md).
 
 ![image](https://docs.banbot.site/uidev.gif)
 
 ### Supported Exchanges
-banbot support exchanges powered by [banexg](https://github.com/banbox/banexg):
+banbot supports exchanges powered by [banexg](https://github.com/banbox/banexg). The markets below are what the adapters provide for market data and backtesting; default live execution (shared Hub, `prod`/`dry_run`) currently accepts linear perpetual accounts only, see the [Shared accounts and Hub](bandoc/en-US/guide/execution.md) guide.
 
 | logo                                                                                                            | id      | name              | ver | websocket | 
 |-----------------------------------------------------------------------------------------------------------------|---------|-------------------|-----|-----------|
@@ -39,9 +44,7 @@ banbot support exchanges powered by [banexg](https://github.com/banbox/banexg):
 go [runbanbot](https://github.com/banbox/runbanbot) to get started with Docker in minutes!
 
 ### Work with AI
-Download the [banbot.md](doc/banbot.md) file, then attach this file to any AI conversation to tell it the strategy you want to test.
-
-Per-engine knowledge bases (Chinese / English), attach whichever matches your strategy:
+Attach the knowledge base that matches your strategy engine (Chinese / English) to any AI conversation to tell it the strategy you want to test:
 
 | Engine | 中文 | English |
 |--------|------|---------|

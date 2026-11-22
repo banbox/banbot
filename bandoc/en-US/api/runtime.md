@@ -12,8 +12,10 @@ Runtime owns Core, Clock, Market, Symbols, Batch, Strategies, Orders, Trading, C
 
 - NewProcess() *Process constructs the coordination owner.
 - (*Process).NewRuntime(opts Options) (*Runtime, error) creates a task and releases newly acquired resources/claims on construction failure.
-- Runtime.BizDeps() returns biz.RuntimeDeps; Runtime.DataDeps() returns data.RuntimeDeps. Use dependencies from the same task for traders, providers and wallets. goods.RuntimeDeps is a separate explicit structure; BizDeps cannot be passed directly to a filter.
+- Runtime.BizDeps() returns biz.RuntimeDeps; Runtime.DataDeps() returns *data.RuntimeDeps. Use dependencies from the same task for traders, providers and wallets. goods.RuntimeDeps is a separate explicit structure; BizDeps cannot be passed directly to a filter.
 - Factor installation uses runner.CloneConfig: configuration containers are copied while Plan/ComputationGroup and callbacks remain borrowed.
+
+`Options.ExtraMarkets` corresponds to root `extra_markets` and inherits the config snapshot's value when unset. `Runtime` also provides `Context()`, `Done() <-chan struct{}` and `Scheduler() com.Scheduler` (equivalent to `Runtime.Cron`). `(*Process).BorrowAccount(key execution.AccountKey, opts execution.SharedExecutionOptions)` borrows a shared account; releasing the borrower does not close the physical account.
 
 Embedding should reuse normal entry assembly. Manual construction needs consistent configuration, clock, symbols, storage, exchange, callback owner and accounts; missing fields must not fall back to package globals.
 
@@ -38,7 +40,7 @@ func RunTask(opts botruntime.Options, run func(*botruntime.Runtime) error) error
 
 ## Stop, Close and Join
 
-`Stop` closes admission and propagates cancellation only; it does not fully release resources. The resource owner requests shutdown with `Close`, then waits with `Join`. `Join` is a no-op until `Close` is requested. Calling `Close` inside a callback completes shutdown asynchronously; an external owner must call `Join` to avoid waiting on that callback itself. `Close` coordinates stop, registered work, reset and borrow release. `OnClose` registers stop work and `OnCloseWait` registers join work. Application goroutines are included only through callback/lifecycle registration. Web/RPC servers have their own Stop/Join contracts, distinct from Runtime shutdown.
+`Stop` closes admission and propagates cancellation only; it does not fully release resources. `(*Process).Stop()` does this for all its Runtimes, package-level `StopProcesses()` for all active Processes, and `StopAndWaitProcesses()` additionally waits for their cleanup (for process exit). The resource owner requests shutdown with `Close`, then waits with `Join`. `Join` is a no-op until `Close` is requested. Calling `Close` inside a callback completes shutdown asynchronously; an external owner must call `Join` to avoid waiting on that callback itself. `Close` coordinates stop, registered work, reset and borrow release. `OnClose` registers stop work and `OnCloseWait` registers join work. Application goroutines are included only through callback/lifecycle registration. Web/RPC servers have their own Stop/Join contracts, distinct from Runtime shutdown.
 
 Process.Close waits for tasks/construction and releases shared accounts/registries; the entry then closes its own Storage/Exchange. Borrowed schedulers are not stopped. Owned schedulers have one ownership claim. Releasing one account borrower must preserve other strategies' physical-account service.
 

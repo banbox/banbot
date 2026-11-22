@@ -15,7 +15,7 @@ AI助手虽然很方便，但依然会犯错，您必须检查并理解AI输出�
 :::
 
 ::: tip 统计套利与截面策略
-时序策略也可复用引擎无关的原语：`statistics.RollingSpread`/`statistics.BandTrader`（配对价差 z-score 与入场/离场/止损滞回）。全市场截面和配对策略的最短入口见[多因子与截面策略](./factor.md)。
+时序策略也可复用引擎无关的原语：`github.com/banbox/banbot/factor/statistics` 中的 `NewRollingSpread`/`NewBandTrader`（配对价差 z-score 与入场/离场/止损滞回）。全市场截面和配对策略的最短入口见[多因子与截面策略](./factor.md)。
 :::
 
 ## 策略命名
@@ -89,8 +89,21 @@ yaml配置`run_policy`中的每一项对应一次对策略函数的调用，生�
 同一个策略可以在多个`run_policy`项中出现，即同一个策略函数可能会执行多次。
 策略函数返回的`*strat.TradeStrat`会应用到多个品种上，对应多个`*strat.StratJob`。
 所以任何单个品种相关的变量都不要保存在策略函数内，而应当通过`*strat.StratJob.More`保存。  
+`TradeStrat`及其闭包由该策略的所有品种、账户共享，在闭包中保存的计数、标志位会被不同品种互相覆盖。  
 策略函数中的变量应保持不被修改。否则会导致意外的状态。
 :::
+
+### 参数校验 {#require}
+
+构造函数中可用`pol.Require(cond, msg)`或`pol.Requiref(cond, format, args...)`校验参数。条件不满足时该策略构造失败，并作为配置错误（BadConfig）报告，而不是被当作运行时崩溃；真正的运行时错误（如空指针）不会被改写为配置错误。
+```go
+func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+    fast := pol.DefInt("fast", 10, core.PNorm(5, 30))
+    slow := pol.DefInt("slow", 30, core.PNorm(20, 100))
+    pol.Require(fast < slow, "require fast < slow")
+    return &strat.TradeStrat{WarmupNum: slow * 3}
+}
+```
 
 ## strat.TradeStrat 策略对象
 
@@ -102,6 +115,7 @@ type TradeStrat struct {
 	Name          string // 策略名称，无需设置，会自动设置为注册时的名称
 	Version       int // 策略版本号
 	WarmupNum     int // K线预热的长度
+	OdBarMax      int // 回测查找未完成持仓最多向前模拟的bar数，默认500；run_policy.order_bar_max优先
 	MinTfScore    float64 // 最小时间周期质量，默认0.75
     WsSubs        map[string]string    // websocket订阅: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 	DrawDownExit  bool // 是否启用回撤止损（即跟踪止损）
@@ -111,9 +125,11 @@ type TradeStrat struct {
 	StakeRate     float64 // 相对基础金额开单倍率
     StopLoss      float64 // 此策略打开所有订单的默认止损比率（不带杠杆）
 	StopEnterBars int // 限价单如果超过给定K线仍未入场则取消
+	OrderOnRotation string // 品种被轮换移出后的旧任务：open表示有订单时仍允许继续开单；平仓与否见pairmgr.pos_on_rotation
 	EachMaxLong   int      // 单个品种最大同时开多数量，默认0不限制
 	EachMaxShort  int      // 单个品种最大同时开空数量，默认0不限制
 	RunTimeFrames []string // 允许运行的时间周期，不提供时使用当前 Runtime 配置快照中的默认周期
+	RefineTF      interface{} // 策略默认的订单撮合周期，如"5m"、12、"3-6"；run_policy.refine_tf显式配置时优先
 	Outputs       []string // 策略输出的文本文件内容，每个字符串是一行
 	Policy        *config.RunPolicyConfig // 运行时配置
 
@@ -130,7 +146,7 @@ type TradeStrat struct {
     OnWsDepth           func(s *StratJob, dep *banexg.OrderBook)               // 推送深度信息
     OnWsKline           func(s *StratJob, pair string, k *banexg.Kline)        // Websocket推送的实时K线(可能未完成)
 	OnBatchJobs         func(jobs []*StratJob)                             // 当前时间所有标的job，用于批量开单/平仓
-	OnBatchInfos        func(tf string, jobs map[string]*JobEnv)            // 当前时间所有info标的job，用于批量处理
+	OnBatchInfos        func(tf string, jobs map[string]*JobEnv)            // 当前时间所有info标的job，用于批量处理（其中的开平仓不会自动提交）
 	OnCheckExit         func(s *StratJob, od *ormo.InOutOrder) *ExitReq     // 自定义订单退出逻辑
 	OnOrderChange       func(s *StratJob, od *ormo.InOutOrder, chgType int) // 订单更新回调
 	GetDrawDownExitRate CalcDDExitRate                                     // 计算跟踪止盈回撤退出的比率
@@ -397,11 +413,100 @@ func Demo2(pol *config.RunPolicyConfig) *strat.TradeStrat {
 ```
 如上是一个大小周期结合的均线交叉策略，当大周期短均线位于长均线上方，且小周期短均线上穿长均线时，才入场。
 
-此策略可在yml配置中指定运行在`5m`小周期，同时策略内部指定了订阅`1h`大周期的数据。`OnPairInfos`中`_cur_`表示当前品种，如需要其他品种，可硬编码替换此处的值。
+此策略可在yml配置中指定运行在`5m`小周期，同时策略内部指定了订阅`1h`大周期的数据。`OnPairInfos`中`_cur_`表示当前品种，如需要其他品种，可硬编码替换此处的值。在当前交易所和市场中找不到的品种，该订阅会被静默跳过。
 
 ::: tip 注意
 `OnInfoBar`仅用于额外K线消费，请勿在此函数中执行开平仓或更新止损等逻辑。
 :::
+
+## 参考行情：其他品种或周期 {#ref_kline}
+
+使用`OnData`的策略可通过`RefKlineSub`声明只读的K线参考订阅，不会为该品种创建交易任务。
+
+| 方法 | 说明 |
+| --- | --- |
+| `s.RefKlineSub(symbol, timeframe string, warmupNum ...int) *DataSub` | `symbol`为空或`_cur_`表示当前品种的其他周期；也可写`BTC`或`BTC/USDT:USDT`，自动归一到当前交易所和市场。省略`warmupNum`时取`TradeStrat.WarmupNum` |
+| `s.RefEnv(symbol, timeframe string) *ta.BarEnv` | 返回该订阅同步更新的K线环境；首根K线到达前为`nil`，非`nil`后`Open/High/Low/Close/Volume/Quote/BuyVolume/TradeNum`均可用 |
+| `s.Data(sub *DataSub) *DataFields` | 返回订阅对应的数据视图；`sub.ExSymbol`为空时取当前品种 |
+
+参考行情的每根K线以辅助事件（`Info`）送达，指标应在对应事件中计算，主回调只读取结果：
+
+```go
+type refState struct{ btcUp bool }
+
+func RefDemo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+    return &strat.TradeStrat{
+        WarmupNum: 100,
+        OnStartUp: func(s *strat.StratJob) { s.More = &refState{} },
+        OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+            return []*strat.DataSub{s.RefKlineSub("BTC/USDT:USDT", "1h", 100)}
+        },
+        OnData: strat.RouteData(strat.DataHandlers{
+            Info: func(s *strat.StratJob, d strat.DataEvent) {
+                env := s.RefEnv("BTC/USDT:USDT", "1h")
+                if env == nil { return }
+                s.More.(*refState).btcUp = env.Close.Get(0) > ta.SMA(env.Close, 20).Get(0)
+            },
+            Main: func(s *strat.StratJob, d strat.DataEvent) {
+                if s.IsWarmUpState() || !s.More.(*refState).btcUp { return }
+                _ = s.OpenOrder(&strat.EnterReq{Tag: "btc_trend", Log: true})
+            },
+        }),
+    }
+}
+```
+K线订阅的`DataFields.BarEnv()`返回完整的`*ta.BarEnv`（同样仅在首根K线到达后非`nil`；非K线数据源始终为`nil`），因此`ta.MFI(env, 14)`、`ta.WillR(env, 14)`、`ta.HeikinAshi(env)`这类需要完整OHLCV的指标可直接用于参考行情。
+
+### 内置衍生品数据
+
+资金费率、持仓量、标记/指数/溢价K线等内置数据源通过`OnDataSubs`按名称订阅，以`Custom`事件送达，需先下载数据：
+```go
+OnDataSubs: func(s *strat.StratJob) []*strat.DataSub {
+    return []*strat.DataSub{
+        {Source: orm.SeriesSourceFundingRate, TimeFrame: "8h", WarmupNum: 3},
+        {Source: orm.SeriesSourcePremiumKline, TimeFrame: "1h", WarmupNum: 3},
+    }
+},
+OnData: strat.RouteData(strat.DataHandlers{
+    Custom: func(s *strat.StratJob, d strat.DataEvent) {
+        if d.Source == orm.SeriesSourceFundingRate { s.More.(*derivState).funding = d.Float64("rate") }
+    },
+    Main: func(s *strat.StratJob, d strat.DataEvent) { /* ... */ },
+}),
+```
+各数据源的字段、默认周期、下载与回测语义见[自定义时序数据](./custom_data)，完整策略见 [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) 的`derivatives.go`。
+
+## 日内时段工具 {#intraday}
+
+`StratJob`内置了一组无未来函数的日内/时段统计，状态按任务（品种）独立保存。锚点参数均为UTC当日分钟数（`0`~`1439`，自动取模），`btime`包提供常用锚点，如`btime.NewYorkOpenMinutes`（13:30 UTC）、`btime.LondonCashOpenMinutes`（08:00 UTC）、`btime.AsiaCloseMinutes`（08:00 UTC）。
+
+| 方法 | 说明 |
+| --- | --- |
+| `OpeningRange(anchorMinutesUTC, rangeMinutes int) OpeningRangeSnapshot` | 开盘区间：`[锚点, 锚点+rangeMinutes)`内的`Open/High/Low/Close/Mid/Width/Volume` |
+| `OpeningRangeWithOpts(anchorMinutesUTC, rangeMinutes int, opts OpeningRangeOptions) OpeningRangeSnapshot` | 同上；`AllowSingleBarFallback`允许周期粗于区间时退化为单根K线（`DegradedSingleBar=true`） |
+| `SessionRange(startMinUTC, endMinUTC int) SessionRangeSnapshot` | 循环时段区间（可跨午夜，如22:00-02:00），字段含`Completed/JustCompleted/InSession/InPostSession` |
+| `PrevDayOHLC(anchorMinutesUTC int) (PrevOHLC, bool)` | 前一个完整交易日的`Open/High/Low/Close/Pivot/Range/Volume` |
+| `PrevNDaysStats(anchorMinutesUTC, nDays int) (PrevNDaysSummary, bool)` | 最近`nDays`（1~366）个完整交易日的`HH/HC/LC/LL/AvgRange/DualThrustRange/History`等统计 |
+| `DualThrustBands(anchorMinutesUTC, nDays int, k1, k2 float64) (upper, lower, dayOpen float64, ok bool)` | Dual Thrust上下轨：`dayOpen ± k × Range` |
+| `RBreakerLevels(anchorMinutesUTC int) (RBreakerSnap, bool)` / `RBreakerLevelsBy(anchorMinutesUTC int, f1, f2, f3 float64)` | R-Breaker六个价位及当日已出现的开盘/最高/最低价 |
+
+使用要点：
+- 区间快照在`Ready`（`SessionRange`为`Completed`）之前，`High/Low`等值为0，不会提前泄露未完成区间；`Applicable=false`表示当前周期不适用（周期为1d及以上、区间与周期未对齐，或周期粗于区间且未开启单根退化），此时不会有结果。
+- `PrevDayOHLC`等方法在锚点不是0点时，开头不完整的交易日不会被当作前一日；预热长度应覆盖至少一个完整交易日，且`ok`为`false`时不要交易。
+- 在主回调里每根K线都调用，状态才会随K线推进；对同一根K线重复调用结果一致。
+- 无环境（`s.Env==nil`）时返回零值和`false`。
+
+```go
+Main: func(s *strat.StratJob, _ strat.DataEvent) {
+    orb := s.OpeningRange(btime.NewYorkOpenMinutes, 30) // 每根K线都调用
+    if !orb.Ready || !orb.InPostRange || s.GetOrderNum(0) > 0 { return }
+    if c := s.Env.Close.Get(0); c > orb.High {
+        // 止损放在区间中点，按风险比例定仓
+        _ = s.OpenOrder(&strat.EnterReq{Tag: "orb_long", StopLoss: orb.Mid, TakeProfitVal: orb.Width * 2, RiskRate: 0.005})
+    }
+},
+```
+运行周期须不大于区间长度（如`run_timeframes: [15m]`配30分钟区间）。完整示例见 [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) 的`orb.go`。
 
 ## 保存临时变量
 
@@ -415,7 +520,7 @@ func Demo2(pol *config.RunPolicyConfig) *strat.TradeStrat {
 m, _ := s.More.(*Demo2Sta)
 ```
 
-## 发出入场信号
+## 发出入场信号 {#send_entry}
 
 发出入场信号只需要调用`StratJob.OpenOrder`方法，并传递一个`*strat.EnterReq`参数即可。
 
@@ -429,24 +534,27 @@ type EnterReq struct {
 	StratName        string  // 策略名称
 	Short           bool    // 是否做空
 	OrderType       int     // 订单类型, core.OrderType*
-	Limit           float64 // 限价单入场价格，指定时订单将作为限价单提交
-    Stop            float64 // 止损(触发价格)，做多订单时价格上涨到触发价格才入场（做空相反）
+	Limit           float64 // 限价入场价格，指定时订单将作为限价单提交；与Stop同时设置时为Stop-Limit入场
+    Stop            float64 // 入场触发价（不是止损）：做多时价格上涨到触发价才入场（做空相反）
+	OCOGroup        string  // OCO挂单组：组内任一挂单入场成交后，自动撤销其余未成交挂单
 	CostRate        float64 // 开仓倍率、默认按配置1倍。用于计算LegalCost
+	RiskRate        float64 // 单笔止损亏损占账户权益的比例，[0,1]；未指定Amount/LegalCost且有止损时按止损距离计算仓位
 	LegalCost       float64 // 花费法币金额。指定时忽略CostRate
 	Leverage        float64 // 杠杆倍数
 	Amount          float64 // 入场标的数量，由LegalCost和price计算
-	StopLossVal     float64 // 入场价格到止损价格的距离，用于计算StopLoss
-	StopLoss        float64 // 止损触发价格，不为空时在交易所提交一个止损单
-	StopLossLimit   float64 // 止损限制价格，不提供使用StopLoss
+	StopLossVal     float64 // 入场价格到止损价格的距离（价格差，不是比例），用于计算StopLoss
+	StopLoss        float64 // 止损触发价格；默认在交易所提交止损条件单，StratJob.ExgStopLoss=false时仅本地监控
+	StopLossLimit   float64 // 止损触发后的限价（0为市价）；StopLoss为0时同时作为触发价
 	StopLossRate    float64 // 止损退出比例，0表示全部退出，需介于(0,1]之间
 	StopLossTag     string  // 止损原因
-	ActivationPrice float64 // Trailing stop activation price
-	CallbackPct float64 // Trailing stop callback percent, nonzero: 0.1–10
+	ActivationPrice float64 // 追踪止损激活价格，0表示立即生效；仅CallbackPct>0时有效
+	CallbackPct     float64 // 追踪止损回撤百分比（单位%，1.5即1.5%），0关闭，有效范围[0.05, 50]
 	TakeProfitVal   float64 // 入场价格到止盈价格的距离，用于计算TakeProfit
-	TakeProfit      float64 // 止盈触发价格，不为空时在交易所提交一个止盈单。
-	TakeProfitLimit float64 // 止盈限制价格，不提供使用TakeProfit
+	TakeProfit      float64 // 止盈触发价格；默认在交易所提交止盈单，StratJob.ExgTakeProfit=false时仅本地监控
+	TakeProfitLimit float64 // 止盈触发后的限价（0为市价）；TakeProfit为0时同时作为触发价
 	TakeProfitRate  float64 // 止盈退出比率，0表示全部退出，需介于(0,1]之间
 	TakeProfitTag   string  // 止盈原因
+	TakeProfits     []strat.TakeProfitTarget // 多级阶梯止盈，不能与TakeProfit/TakeProfitVal/TakeProfitLimit同时使用
 	StopBars        int     // 入场限价单超过多少个bar未成交则取消
     ClientID        string  // 用于设置提交到交易所的ClientOrderID尾部部分。
     Infos           map[string]string // 设置保存到订单的额外信息
@@ -458,11 +566,46 @@ type EnterReq struct {
 
 `Limit`是限价订单，做多订单可设置更低的价格挂单等待成交，做空订单可设置更高的价格挂单等待成交。
 
-`Stop`是触发订单（止损），做多订单可设置更高的价格等待突破后入场，做空订单可设置更低的价格挂单等待跌破后入场。
+`Stop`是入场触发价（不是止损，止损请用`StopLoss`），做多订单可设置更高的价格等待突破后入场，做空订单可设置更低的价格挂单等待跌破后入场。
 
-例如当前价格为 100，等待突破 120 做多可设置 `&strat.EnterReq{Tag: "breakout", Stop: 120}`。`Stop` 与 `Limit` 互斥，同时设置会返回错误。
+同时设置`Stop`和`Limit`即为Stop-Limit入场：价格触及`Stop`后才以`Limit`挂限价单；若`Stop`已被当前价越过，则直接按`Limit`挂限价单。`OrderType`为`core.OrderTypeMarket`时不能设置`Limit`。
+
+例如当前价格为 100，等待突破 120 做多可设置 `&strat.EnterReq{Tag: "breakout", Stop: 120}`；突破 120 后最多愿意以 121 买入，并带止损：
+```go
+_ = s.OpenOrder(&strat.EnterReq{Tag: "breakout", Stop: 120, Limit: 121, StopLoss: 110, StopBars: 3})
+```
 
 当`OpenOrder`返回错误时，表示开单失败，您可`log.Error`记录错误信息，也可在`EnterReq`中设置`Log`为true，让系统自动记录错误日志。
+
+### 按风险比例定仓 {#risk_rate}
+
+设置`RiskRate`后，仓位由止损距离反推：当未指定`Amount`和`LegalCost`、`RiskRate>0`，且能得到止损价（`StopLoss`/`StopLossVal`、`StratJob.LongSLPrice/ShortSLPrice`或`TradeStrat.StopLoss`）时：
+
+```text
+LegalCost = AccountEquity() × RiskRate ÷ (|入场价 - 止损价| ÷ 入场价)
+```
+结果受杠杆（现货按1倍）和账户`max_stake_amt`封顶；没有止损时退回默认开单金额×`CostRate`。之后仍受`open_vol_rate`和最小开单金额限制。`RiskRate`须在`[0, 1]`内，指定`Amount`或`LegalCost`时被忽略。
+
+`StratJob`提供三个账户状态方法，可用于仓位和风控判断：
+
+| 方法 | 含义 |
+| --- | --- |
+| `AccountEquity() float64` | 账户权益（余额+未平仓浮动盈亏，计价币）；预热或钱包未就绪时回退为初始资金/默认开单金额，不会返回0或NaN |
+| `AvailableBalance() float64` | 可用余额/可用保证金；不可用时为0 |
+| `AccountDrawdown() float64` | 相对运行以来权益峰值的回撤比例，`[0,1]`；预热期为0。同一账户下所有品种共享 |
+
+```go
+Main: func(s *strat.StratJob, _ strat.DataEvent) {
+    e := s.Env
+    cross := ta.EMA(e.Close, 10).Cross(ta.EMA(e.Close, 30))
+    atr := ta.ATR(e.High, e.Low, e.Close, 14).Get(0)
+    if cross != 1 || math.IsNaN(atr) || atr <= 0 { return }
+    if s.AccountDrawdown() >= 0.10 || s.AvailableBalance() < s.AccountEquity()*0.2 { return }
+    // 每笔最多亏损权益的1%：止损距离为2倍ATR
+    _ = s.OpenOrder(&strat.EnterReq{Tag: "ema_long", StopLossVal: 2 * atr, RiskRate: 0.01})
+},
+```
+完整示例见 [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures)。
 
 :::tip
 `OpenOrder`/`CloseOrders` 只校验并排队，不保证成交。主周期 `OnData`/`OnBar`、`OnBatchJobs`、订单回调和成功返回的 `OnPostApi` 有框架处理路径；辅助和高频回调不要假设自动提交。
@@ -483,7 +626,7 @@ type ExitReq struct {
 	Tag        string  // 退出信号
 	StratName   string  // 策略名称
 	EnterTag   string  // 只退出入场信号为EnterTag的订单
-	Dirt       int     // core.OdDirt* long/short/both
+	Dirt       int     // core.OdDirt* long/short/both，零值即both
 	OrderType  int     // 订单类型, core.OrderType*
 	Limit      float64 // 限价单退出价格，指定时订单将作为限价单提交
 	ExitRate   float64 // 退出比率，默认100%即所有订单全部退出
@@ -498,12 +641,15 @@ type ExitReq struct {
 
 当`CloseOrders`返回错误时，表示平仓失败，您可`log.Error`记录错误信息，也可在`ExitReq`中设置`Log`为true，让系统自动记录错误日志。
 
+`Dirt`零值等同于`core.OdDirtBoth`；同时持有多单和空单且设置了`Limit`时必须显式指定`Dirt`，否则返回错误。
+
 对于`ExitReq.Tag`，您可传入固定的字符串区分不同的退出原因，`core`包内置了以下常用标签：
 
 ```go
 const (
     ExitTagUnknown     = "unknown"      // 未知原因
     ExitTagCancel      = "cancel"       // 用户取消
+    ExitTagHedgeOff    = "hedge_off"    // 关闭双向持仓时对冲平仓
     ExitTagBotStop     = "bot_stop"     // 机器人停止
     ExitTagForceExit   = "force_exit"   // 强制退出
     ExitTagNoMatch     = "no_match"     // 无匹配订单
@@ -514,6 +660,7 @@ const (
     ExitTagPairDel     = "pair_del"     // 品种删除
     ExitTagStopLoss    = "stop_loss"    // 止损触发且亏损
     ExitTagSLTake      = "sl_take"      // 止损触发且盈利
+    ExitTagTrailingStop = "trailing_stop" // 追踪止损触发
     ExitTagTakeProfit  = "take_profit"  // 止盈触发
     ExitTagDrawDown    = "draw_down"    // 回撤止损
     ExitTagDataStuck   = "data_stuck"   // 长时间未收到K线数据自动平仓
@@ -523,6 +670,7 @@ const (
     ExitTagExitDelay   = "exit_delay"   // 实盘重启时平仓应该更早退出的订单
 )
 ```
+回测中还会出现`data_gap`（K线数据空洞导致强平）和`delist`（数据已长期中断的品种在回测结束时强平）两种退出标签，仅回测生效，见[回测指南](./backtest.md)。
 
 ## 止损和止盈
 
@@ -547,11 +695,63 @@ s.SetAllStopLoss(core.OdDirtLong, &ormo.ExitTrigger{
 ```
 上面针对所有打开的做多订单，设置50%仓位的止损，价格触发5周期均线的0.97倍时，以0.965倍的限价单止损平仓一半。
 
+`args`传`nil`表示取消该方向全部止损（止盈）。`dirt`传`core.OdDirtBoth`（0）时，如果同时存在多单和空单会直接panic，此时须分别用`core.OdDirtLong`和`core.OdDirtShort`调用。
+
+### 交易所条件单与本地监控
+
+`StratJob.ExgStopLoss`、`StratJob.ExgTakeProfit`默认为true，止损/止盈会作为条件单提交到交易所。设为false后不再预挂条件单，改由本地按价格监控触发（回测与实盘均生效）；`CallbackPct`追踪止损在`ExgStopLoss=false`时同样本地监控。
+
+### 追踪止损
+
+`CallbackPct`（单位%，范围`[0.05, 50]`）从最优价回撤到该比例时平仓；`ActivationPrice`大于0时，价格先到达激活价才开始跟踪。实盘优先使用交易所原生追踪单，交易所不支持或拒绝时降级为本地价格监控，不会使开单失败。
+```go
+_ = s.OpenOrder(&strat.EnterReq{Tag: "trail", StopLossVal: atr * 2, ActivationPrice: price + atr, CallbackPct: 1.5})
+```
+
+### 阶梯止盈 {#take_profits}
+
+`EnterReq.TakeProfits`可设置多级止盈，每级是一个`strat.TakeProfitTarget`：
+
+| 字段 | 说明 |
+| --- | --- |
+| `Price` / `Val` / `Rate` | 三选一（必须大于0）：绝对触发价；距离入场成交均价的价差；相对入场成交均价的比例（0.02即2%）。同时给出时`Price`优先，其次`Val`。`Price`须位于盈利方向 |
+| `Limit` | 触发后的限价，0为市价 |
+| `ExitRate` | 本级平掉初始仓位的比例，`(0,1]`；仅一级且为0时按1处理；各级之和不得超过1 |
+| `MoveSLToBreakeven` | 本级成交后，把剩余仓位的止损收紧到不差于入场价（不会放宽已更紧的止损） |
+| `Tag` | 本级退出原因 |
+
+各级按距离入场价由近到远依次触发，且不能与`TakeProfit`、`TakeProfitVal`、`TakeProfitLimit`同时使用；设置`TakeProfits`后`LongTPPrice/ShortTPPrice`不再生效。
+```go
+_ = s.OpenOrder(&strat.EnterReq{
+    Tag: "ladder", StopLossVal: atr * 2,
+    TakeProfits: []strat.TakeProfitTarget{
+        {Val: atr * 1.5, ExitRate: 0.4, MoveSLToBreakeven: true, Tag: "tp1"},
+        {Val: atr * 3, ExitRate: 0.3, Tag: "tp2"},
+    },
+    ActivationPrice: price + atr*1.5, CallbackPct: 1.5, // 剩余30%用追踪止损
+})
+```
+
+### 默认止损止盈价
+
+`StratJob.LongSLPrice/ShortSLPrice`和`LongTPPrice/ShortTPPrice`是开仓时的默认止损/止盈价：未在`EnterReq`中指定对应止损（止盈）时使用，止盈默认价在设置了`TakeProfits`时忽略。价格需满足做多止损低于入场价、止盈高于入场价（做空相反），否则`OpenOrder`返回错误。
+
+### OCO挂单组
+
+给多个入场挂单设置相同的`OCOGroup`，组内任一挂单入场成交后，其余未成交的挂单自动撤销，常用于区间两侧的突破单：
+```go
+_ = s.OpenOrder(&strat.EnterReq{Tag: "brk_long", Stop: hi, Limit: hi + slip, OCOGroup: "donchian", StopBars: 2, StopLossVal: atr * 2})
+_ = s.OpenOrder(&strat.EnterReq{Tag: "brk_short", Short: true, Stop: lo, Limit: lo - slip, OCOGroup: "donchian", StopBars: 2, StopLossVal: atr * 2})
+```
+分组按（品种、策略、`OCOGroup`）区分，用于挂单（设置了`Stop`或`Limit`）；回测中建议配合`refine_tf`，以便在同一根K线内更准确地判断两侧触发的先后。挂单占用开单名额，`max_simul_open`须足够。完整示例见 [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) 的`bracket.go`。
+
 ## 批量任务处理
 有时候您可能需要针对当前策略的所有品种一起进行某些计算（比如相关系数），得到一些中间状态保存，或者一起进行开单或平仓。
 这时候您可以使用`OnBatchJobs`或`OnBatchInfos`回调函数。
 其中，`OnBatchJobs`仅在主周期`OnData(RoleMain)`/`OnBar`后触发，`OnBatchInfos`仅在辅助周期`OnData(RoleInfo)`/`OnInfoBar`后触发；分别由`BatchInOut`和`BatchInfo`开启。
-> 所有回测使用确定性批次顺序。主批次按品种键排序；若同时入场会竞争资金，请先按策略得分排序。下面保存的相关性供后续主周期使用，不假设同一时间戳主辅回调的先后。
+> 回测中同一根K线内，主批次的品种按`strat.BarPriority(barMS, symbol, seed)`的中性哈希顺序交给`OnBatchJobs`（不是字母序），避免字母靠前的品种系统性优先占用资金；种子为配置`bt_bar_order_seed`（默认0），修改它会改变多品种回测结果。实盘批次顺序不作保证。若同时入场会竞争资金，请在回调内自行按策略得分排序。下面保存的相关性供后续主周期使用，不假设同一时间戳主辅回调的先后。
+>
+> `OnBatchJobs`中的开平仓请求在回调后由框架自动提交（预热期除外）；`OnBatchInfos`中的开平仓请求**不会**自动提交，只会记录WARN日志，不要在其中下单。
 ```go
 // Imports: slices, config, strat, utils, banexg/log, banta as ta, zap.
 type BatchSta struct {
@@ -616,6 +816,37 @@ func BatchDemo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 }
 ```
 > 有状态指标必须在对应数据每次更新时计算：主周期使用 OnData(Main)/OnBar，辅助周期使用 OnData(Info)/OnInfoBar。批量回调读取已更新结果，不能仅靠批量调用推进指标。
+
+### 按目标权重调仓
+
+跨品种的组合调仓可在`OnBatchJobs`中使用`strat.RebalanceBatchWeights`：传入每个品种的目标权重（相对`AccountEquity()`的带符号名义占比，正为多、负为空，缺省或0为空仓），它会先平仓/减仓腾出保证金，再按所需金额从大到小开仓/加仓，低于最小开单金额的订单会被静默跳过。
+
+```go
+func RebalanceBatchWeights(jobs []*StratJob, targetWeights map[string]float64, opts BatchRebalanceOpts) BatchRebalanceResult
+func InverseVolWeights(jobs []*StratJob, signals map[string]float64, atrPeriod int, targetGross float64) map[string]float64
+```
+
+| `BatchRebalanceOpts`字段 | 说明 |
+| --- | --- |
+| `Tag` | 开平仓信号标签，默认`rebalance` |
+| `DriftThreshold` | 同向持仓权重偏离不超过该值时不调仓，默认0.02，负数表示关闭 |
+| `MaxGrossExposure` | 目标权重绝对值之和的上限，超出时按比例缩放 |
+| `StopLossRate` / `TakeProfitRate` | 为新开仓/加仓单附带的止损/止盈距离（入场价的比例） |
+| `CallbackPct` | 为新开仓单附带的追踪止损回撤百分比，范围`[0.05, 50]` |
+| `Leverage` | 大于0时覆盖新开仓单的杠杆 |
+
+返回的`BatchRebalanceResult`包含调仓前后的总敞口、各类动作计数（`ClosedCount/ReducedCount/OpenedCount/ScaledInCount/ErrorCount`等）和逐笔`Actions`。`InverseVolWeights`按`1/NATR`把方向信号（如+1/-1/0）转为风险平价权重，并归一到`targetGross`；它须在每根K线都被调用（`atrPeriod<=0`取14），以保持内部指标缓存同步。
+
+```go
+OnBatchJobs: func(jobs []*strat.StratJob) {
+    weights := map[string]float64{} // symbol -> 目标权重，按你的排名/信号生成
+    // ...
+    strat.RebalanceBatchWeights(jobs, weights, strat.BatchRebalanceOpts{
+        Tag: "mom_rebalance", DriftThreshold: 0.03, MaxGrossExposure: 1.0, StopLossRate: 0.15,
+    })
+},
+```
+需要开启`BatchInOut`，且`EachMaxLong/EachMaxShort`设为0以便加仓。完整示例见 [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) 的`rebalance.go`。
 
 ## 自定义退出逻辑
 您可以在每个K线，为每个打开的订单，执行自定义的退出逻辑检查：
@@ -920,6 +1151,27 @@ api_server:  # 供外部通过api控制机器人
 
 **SetAllTakeProfit(dirt float64, args \*ormo.ExitTrigger) \*errs.Error**
 对当前策略任务的所有指定方向订单设置止盈，参数dirt的值可为`core.OdDirtLong/core.OdDirtShort/core.OdDirtBoth`。
+
+**PositionAvgPrice(dirt float64, enterTag string) float64**  
+返回当前策略任务指定方向（及入场标签）持仓的平均入场价。
+
+**AccountEquity() float64 / AvailableBalance() float64 / AccountDrawdown() float64**  
+账户权益、可用余额、回撤比例，见[按风险比例定仓](#risk_rate)。
+
+**RefKlineSub(symbol, timeframe string, warmupNum ...int) \*DataSub / RefEnv(symbol, timeframe string) \*ta.BarEnv / Data(sub \*DataSub) \*DataFields**  
+参考行情订阅、环境与数据视图，见[参考行情](#ref_kline)。
+
+**OpeningRange / SessionRange / PrevDayOHLC / PrevNDaysStats / DualThrustBands / RBreakerLevels**  
+日内时段统计，见[日内时段工具](#intraday)。
+
+**ProcessRuntimeOrders() (entered, exited []\*ormo.InOutOrder, err \*errs.Error, bound bool)**  
+显式提交当前任务排队的开平仓请求，见[发出入场信号](#send_entry)。
+
+**ExecutionSnapshot() ExecutionSnapshot**  
+返回当前任务订单与计数的快照，订单指针为借用，不要跨事件长期持有。
+
+**IsWarmUpState() bool**  
+当前是否处于预热状态；预热期间可更新指标，但开平仓请求不会入队。
 
 ## 多因子与截面引擎
 

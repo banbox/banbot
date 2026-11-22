@@ -15,7 +15,7 @@ Strategy applications use `entry` to build their CLI. See the [command guide](..
 
 `type CommandFactory func() *cobra.Command`. Register groups and commands before creating a root or calling `RunCmd`. Each command owns its flags and local variables. Reusing one `*cobra.Command` for a second tree fails; use a factory instead.
 
-`ExecuteContext` accepts canonical double-dash long options and normalizes legacy single-dash long options. No subcommand starts development Web; passing only ordinary options may also select implicit Web. Integrations should specify a subcommand, such as `[]string{"backtest", "--datadir", dataDir}`, and check the returned error.
+`ExecuteContext` accepts canonical double-dash long options and normalizes legacy single-dash long options. No subcommand starts development Web; passing only ordinary options may also select implicit Web. Integrations should specify a subcommand, such as `[]string{"backtest", "--datadir", dataDir}`, and check the returned error. Unhandled parameter-constraint errors (`*config.BadParamError`) are converted into the returned error; other panics propagate unchanged. `RunCmd` writes errors to stderr as `Error: <msg>` and exits with code 1.
 
 ## Unified strategy dispatch
 

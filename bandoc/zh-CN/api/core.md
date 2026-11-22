@@ -146,6 +146,21 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 
 `SplitSymbol(pair string) (base, quote, settle, identifier string)` 按 `/`、`:`、`-` 解析通用符号，例如 `BTC/USDT:USDT`。交易所特殊符号使用绑定的交易所解析能力，不要据此推断交易所身份。
 
+### SplitDigits
+`SplitDigits(s string) []string` 按非数字字符切分，返回其中连续数字段，如 `"2006-01-02"` 得到 `["2006","01","02"]`。
+
+## 数值工具
+
+### Ema
+指数移动平均。`NewEMA(alpha float64) *Ema` 创建；`Update(val float64) float64` 更新并返回当前值：当前值为 0 时直接取 `val` 作为首值，否则 `Val = Val*(1-alpha) + val*alpha`；输入为 NaN/Inf 时返回 NaN 且不更新。`Reset()` 清零。
+
+### NumSet
+按时间桶收集多个 key 的数值。`NewNumSet(alignUnit int64, callback func(int64, map[string]float64)) *NumSet` 创建；`Update(stamp int64, key string, val float64)` 把 `stamp` 按 `alignUnit` 对齐，进入新的时间桶时用上一桶的时间戳和数据调用 `callback`。
+
+## 符号解析
+
+`NewSymbolParser(exgName string) *SymbolParser` 创建通用符号解析器（参数仅为兼容保留，被忽略）；`NewSymbolParserWithStrategy` / `NewSymbolParserWithErrorStrategy` 可绑定由交易所提供的解析函数。`Split(pair string) (base, quote, settle, identifier string)` 解析并缓存结果。
+
 ## 参数生成方法
 
 ### PNorm
@@ -193,8 +208,8 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 
 ## 系统控制方法
 
-### RunExitCalls
-执行退出时的回调函数。
+### AddExitCall / RunExitCalls
+`AddExitCall(method func())` 注册进程级退出回调（nil 被忽略）；`RunExitCalls()` 执行已注册的退出回调。
 
 
 
@@ -202,4 +217,4 @@ core 包提供了系统核心的数据结构、常量和错误定义。
 
 价格函数现在属于 com，不属于 core；显式任务优先使用 Runtime.Market.Prices 的 PriceState 方法（GetPriceSafeExpAt/SetPriceAt/SetPricesAt，明确 nowMS），com 包级 GetPrice/SetPrice 等只为兼容。SetPairMs 也属于 com；PrintStratGroups 属于 strat，新任务使用 PrintStratGroupsWithState。SnapMem 已不是当前公共函数。CountDigit(text string) int 在 core，统计字符串中的 Unicode 数字字符。
 
-State 管理 admission/performance/cancel；Runtime 注入具体 state，包级 Setup/SetRunMode 等不提供多任务隔离。见[com](com.md)、[runtime](runtime.md)。
+State 管理 admission/performance/cancel；Runtime 注入具体 state，包级 Setup/SetRunMode 等不提供多任务隔离。见[com](com.md)、[runtime](runtime.md)。嵌入式宿主可用 `NewState(parent context.Context) (*State, *errs.Error)` 创建独立状态，`State` 提供 `Context()`、`Done()`、`Sleep(d)`、`Stop()`、`Close()`。

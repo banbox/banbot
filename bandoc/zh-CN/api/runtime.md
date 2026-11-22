@@ -12,8 +12,10 @@ Runtime 拥有 Core、Clock、Market、Symbols、Batch、Strategies、Orders、T
 
 - NewProcess() *Process 创建进程协调 owner。
 - (*Process).NewRuntime(opts Options) (*Runtime, error) 创建任务；构造失败释放本次取得的资源和 claims。
-- Runtime.BizDeps() 返回 biz.RuntimeDeps；Runtime.DataDeps() 返回 data.RuntimeDeps。给交易器、数据提供者和钱包使用同一任务的依赖；goods.RuntimeDeps 是另一个显式结构，不能把 BizDeps 直接当作过滤器入参。
+- Runtime.BizDeps() 返回 biz.RuntimeDeps；Runtime.DataDeps() 返回 *data.RuntimeDeps。给交易器、数据提供者和钱包使用同一任务的依赖；goods.RuntimeDeps 是另一个显式结构，不能把 BizDeps 直接当作过滤器入参。
 - 因子配置安装使用 runner.CloneConfig；共享 Plan/ComputationGroup 与回调等保持借用身份，配置容器独立复制。
+
+`Options.ExtraMarkets` 对应根 `extra_markets`，未指定时继承配置快照中的值。`Runtime` 另提供 `Context()`、`Done() <-chan struct{}` 和 `Scheduler() com.Scheduler`（等价于 `Runtime.Cron`）。`(*Process).BorrowAccount(key execution.AccountKey, opts execution.SharedExecutionOptions)` 借用共享账户，借用者释放不会关闭物理账户。
 
 嵌入程序优先复用 entry 的标准命令装配；手工构造必须提供一致的 config、clock、symbols、storage、exchange、callback owner 和账户配置，不得缺字段后回退查 globals。
 
@@ -38,7 +40,7 @@ func RunTask(opts botruntime.Options, run func(*botruntime.Runtime) error) error
 
 ## 停止、关闭与等待
 
-`Stop` 只关闭接纳并传播取消，不执行完整资源关闭。资源所有者调用 `Close` 请求关闭，再调用 `Join` 等待关闭完成；没有请求 `Close` 时，`Join` 是 no-op。回调内调用 `Close` 会异步完成关闭，须由外部 owner 调用 `Join`，避免等待自身。`Close` 协调 stop、已注册工作等待、reset 与借用释放；`OnClose` 注册 stop，`OnCloseWait` 注册 join。自建 goroutine 只有接入 callback/lifecycle 才在此范围内。Web/RPC server 的 Stop/Join 是各自组件生命周期，不能套用为 Runtime 的关闭顺序。
+`Stop` 只关闭接纳并传播取消，不执行完整资源关闭；`(*Process).Stop()` 对其全部 Runtime 如此，包级 `StopProcesses()` 对全部活动 Process 如此，`StopAndWaitProcesses()` 另外等待其清理完成（用于进程退出）。资源所有者调用 `Close` 请求关闭，再调用 `Join` 等待关闭完成；没有请求 `Close` 时，`Join` 是 no-op。回调内调用 `Close` 会异步完成关闭，须由外部 owner 调用 `Join`，避免等待自身。`Close` 协调 stop、已注册工作等待、reset 与借用释放；`OnClose` 注册 stop，`OnCloseWait` 注册 join。自建 goroutine 只有接入 callback/lifecycle 才在此范围内。Web/RPC server 的 Stop/Join 是各自组件生命周期，不能套用为 Runtime 的关闭顺序。
 
 Process.Close 等待其任务/构造并释放共享账户和 registry；入口随后关闭自己创建的 Storage/Exchange。borrowed scheduler 不 Stop，owned scheduler 的唯一 claim 防止多 owner 双重关闭。共享账户 borrower 退出不能关闭其他策略仍使用的物理账户。
 

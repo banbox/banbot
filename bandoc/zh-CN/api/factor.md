@@ -15,11 +15,11 @@ CLI 启动已统一：根命令 `backtest` / `trade` 从同一 YAML `RunSpec` �
 
 ## 常见技术指标
 
-Go 构造函数与 DSL 新增 18 类指标、22 个标量算子，均支持 `Plan.Batch` 与持续推进的 `Session`：`SMA/RMA/WMA/VWMA/RSI/ROC/MOM/TR/ATR/CCI/Stoch/WillR/OBV/MFI/Highest/Lowest`，以及各返回三个 `*Node` 的 `MACD`、`BBands`。完整函数签名、公式和有效性规则见[常见技术指标](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md)。
+技术指标、订单流和波动率估计函数在 Go 构造函数与表达式 DSL 中同名对应（如 `ATR` 对 `ts.atr`），都支持 `Plan.Batch` 与持续推进的 `Session`。覆盖均线与自适应滤波（SMA/RMA/WMA/DEMA/TEMA/HMA/KAMA/ALMA/TRIMA/ER/Kalman1D/Hurst）、动量与通道（RSI/ROC/MOM/CCI/MACD/BBands/Stoch/WillR/ATR/ADX/DMI/Aroon/Vortex/Donchian/Keltner/Supertrend/SAR/STC/Ichimoku）、成交量与订单流（VWMA/OBV/MFI/CMF/ADL/ADOSC/VolumeDelta/CVD/RollingCVD/TakerBuyRatio）以及 OHLC 波动率（ParkinsonVol/GarmanKlassVol/YangZhangVol）。算子名与参数见[指南的算子速查](../guide/factor.md#表达式算子速查)，公式、预热长度和缺失数据规则见[常见技术指标](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md)。
 
-`MACD(price,12,26,9)` 返回 line、signal、hist；DSL 分别写 `ts.macd`、`ts.macd_signal`、`ts.macd_hist`，每次显式传入四个参数。`BBands(price,20,2,2)` 返回 upper、middle、lower；DSL 的 `ts.bbands_upper/middle/lower` 均显式提供四个参数。周期为 `[1,10000]` 的整数，MACD 要求 fast < slow，布林带倍数为有限非负数。
+`MACD(price,12,26,9)` 返回 line、signal、hist，DSL 分别写 `ts.macd`、`ts.macd_signal`、`ts.macd_hist`，每次显式传入四个参数；`BBands(price,20,2,2)` 返回 upper、middle、lower。周期为 `[1,10000]` 的整数，MACD 要求 fast < slow，布林带倍数为有限非负数。`ROC` 返回百分比，`Return` 返回比例。指标仅在全部输入有效时推进一次，无效原因和原始 `DataSeries.Values` 的字段类型/NULL 语义继续保留；窗口按有效元组计数，跨周期需显式 asof 采样。
 
-例如 `ts.atr(kline.high,kline.low,kline.close,14)` 显式声明多个输入，CCI 的典型价格写作 `ts.cci((kline.high+kline.low+kline.close)/3,20)`。`ROC` 返回百分比，原有 `Return` 返回比例。新指标仅在全部输入有效时推进一次；无效原因和原始 `DataSeries.Values` 的字段类型/NULL 语义继续保留。窗口按有效元组计数，跨周期需显式 asof 采样；缺失会延长实际预热时间。
+其他逐点与截面构造函数包括 `Where`、`Clip`、`Sign`、`Gt/Ge/Lt/Le`、`TsSum/TsRank/TsSkew/TsKurt/TsSlope/TsRSquare/TsCorr/TsCov/TsBeta`、`PctRank`、`CsMean/CsSum`、`SectorDemean/SectorZScore`、`QuantileGroupDemean/ZScore/Rank/PctRank`，以及跨周期与基准读取 `AsOfNode`、`SubTF`、`RefAssetField`、`AsOfRefAssetField`、`AsOfField`。
 
 ## 注册与编译
 
@@ -83,11 +83,21 @@ run_policy:
 
 ## 简化注册与统计套利
 
-`runner.RegisterFactor(name string, build func(runner.FactorContext) (runner.FactorSpec, error)) error` 注册简单截面因子。`FactorContext.Close()` 提供价格节点，`Params` 读取参数；注册调用和 builder 中的 `Params.Err()` 都需检查。`FactorSpec.Outputs` 为命名节点，省略 Combine 时等权合成。
+`runner.RegisterFactor(name string, build func(runner.FactorContext) (runner.FactorSpec, error)) error` 注册简单截面因子。`FactorContext` 提供 `Open/High/Low/Close/Volume/Quote/BuyVolume`、`Field`、`SourceField`、`RefField`、`RefSourceField`、`SubTF`、`SectorCode` 等节点构造方法（说明见[指南](../guide/factor.md#截面因子一次注册)），`Params` 读取参数；注册调用和 builder 中的 `Params.Err()` 都需检查。`FactorSpec.Outputs` 为命名节点，省略 Combine 时等权合成。
 
-`runner.RegisterPairs(name string, build func(*runner.Params) (runner.PairsSpec, error)) error` 注册滚动对数回归配对策略，并为每次运行创建独立 builder/统计状态。`PairsSpec` 声明 `Pairs []runner.Pair`（Y、X 为标准 symbol）、Field（默认 close）、Window（至少 3）、Band 和 Gross（默认 1/配对数，总预算不超过 1）。入场 β 在持仓中固定；Band 的 Stop/MaxHold 出场后必须回到 Exit 区间才重新入场。
+统计套利注册函数（详见[统计套利与期现](../guide/statarb.md)）：
 
-`statistics.NewRollingSpread(window)` 的 `Observe(x, y float64) (statistics.SpreadPoint, bool)` 消费两个对数价格；`statistics.NewBandTrader(config)` 的 `Step(z float64) int` 返回 -1/0/+1。每个价差使用独立实例。它们只计算统计量/方向，不会自动创建订单或证明协整、成交同步及盈利。注册示例见[统计套利指南](../guide/factor.md#统计套利-声明配对即可)。
+| 函数 | 说明 |
+| --- | --- |
+| `RegisterPairs(name string, build func(*runner.Params) (runner.PairsSpec, error)) error` | 固定配对；每次运行创建独立 builder 与统计状态 |
+| `RegisterRollingPairs(name string, build func(*runner.Params) (runner.RollingPairsSpec, error)) error` | 形成期加交易期的滚动重选配对 |
+| `RegisterBaskets(name string, spec runner.BasketsSpec) error` / `RegisterBasketsParams(name string, build func(*runner.Params) (runner.BasketsSpec, error)) error` | 2 到 12 腿协整篮子 |
+| `RegisterResidualStatArb(name string, spec runner.ResidualStatArbSpec) error` / `RegisterResidualStatArbParams(...)` | PCA / 基准残差 s-score |
+| `BuildBasketsRegistration`、`BuildBasketsParamsRegistration`、`BuildResidualStatArbRegistration`、`BuildResidualStatArbParamsRegistration` | 返回 `runner.Registration`，可在不写全局注册表时构造并测试 |
+
+`Params` 提供 `Float`、`Int`、`Bool`、`Err`、`Unused`，没有字符串读取方法。`runner.Pair{Y, X}` 使用与运行时一致的标准 symbol。
+
+`statistics.NewRollingSpread(window int) (*RollingSpread, error)` 的 `Observe(x, y float64) (statistics.SpreadPoint, bool)` 消费两个对数价格；`statistics.NewBandTrader(cfg BandConfig) (*BandTrader, error)` 的 `Step(z float64) int` 返回 -1/0/+1。每个价差使用独立实例。它们不依赖任何引擎，只计算统计量与方向，不会创建订单，也不证明协整、成交同步或盈利。
 
 `RegisterPortfolioFactory(name, factory, validator)` 用于带可变状态的自定义组合。validator 只校验配置，不能借用账户或启动工作；`PreparePortfolioConfig` 在预检后为一次运行创建实例，不能把实例复用到另一轮回测。配对缺腿时会请求平仓并暂停；窗口内完全无数据且被标记不可用的配对会整次跳过，预算不转给其他配对。
 
@@ -173,10 +183,10 @@ Manifest 记录代码、图、Universe、可见性、输入引用、标签和执
 
 ## 结果字段与报告边界
 
-`runner.Result` 在 `run.json` 的 `Results[]` 与 `run-completed` 中以 Go 字段名序列化。`Pairs` 仅在 `RegisterPairs` 回放收尾汇总；`PairResult` 提供 Y/X、Episodes、EpisodeCount、PnL、Trades、Wins、WinRate、InMarketBars、Bars、PausedBars、AvgHoldBars、LastBeta、Turnover、Unavailable 和 UnavailableLeg。Episodes 的预算为各对均分 400 条、每对至少 10 条，保留最早记录，可能不含完整历史。`PairEpisode` 含 StartMS、EndMS、Dir、EntryZ、ExitZ、Beta、Bars、Reason、PnL；Reason 为 exit/stop/maxhold/leg_missing/end。
+`runner.Result` 在 `run.json` 的 `Results[]` 与 `run-completed` 中以 Go 字段名序列化。`Pairs` 仅在配对、滚动配对与篮子的回放收尾汇总；`PairResult` 提供 Y/X、Episodes、EpisodeCount、PnL、Trades、Wins、WinRate、InMarketBars、Bars、PausedBars、AvgHoldBars、LastBeta、Turnover、Unavailable 和 UnavailableLeg。Episodes 的预算为各对均分 400 条、每对至少 10 条，保留最早记录，可能不含完整历史。`PairEpisode` 含 StartMS、EndMS、Dir、EntryZ、ExitZ、Beta、Bars、Reason、PnL；Reason 为 exit/stop/maxhold/leg_missing/end。
 
-逐对 PnL 按各对决策权重和价格计算，占初始 NAV 的比例，不分摊成本。`PairsGrossPnL` 为合计；`PairsResidual = PairsNAVReturn - PairsGrossPnL` 还含延迟价格、权重漂移和共享品种净额成交的差异。`AllPairsUnavailable` 标识全无可交易配对，不能将其零交易净值解释为有效策略结果。
+逐对 PnL 按各对决策权重和价格计算，占初始 NAV 的比例，不分摊成本。`PairsGrossPnL` 为合计；`PairsResidual = PairsNAVReturn - PairsGrossPnL` 还含延迟价格、权重漂移和共享品种净额成交的差异。`PausedPeriods` 统计所有配对同期暂停的轮次，`IncompleteStreams` 列出输入不完整的数据流；`AllPairsUnavailable` 标识全无可交易配对，不能将其零交易净值解释为有效策略结果。
 
 `Attribution` 仅 weights 账本生成，events/live 不输出。价格变动产生 LongPnL/ShortPnL；成本含 Fees、Slippage、Funding、PITCost，满足 `FinalNAV - InitialNAV = LongPnL + ShortPnL - Fees - Slippage - Funding - PITCost + Residual`。至多 20 个 TopSymbols 按绝对 Net 排序，Net 不含账户级资金费，所以所有品种 Net 的合计等于 NAV 变化加 Funding。运行出错提前返回时 Pairs/Attribution 可能缺失。
 
-在策略的 `research` 下设 `panel: none` 只关闭输出 panel 行，不改变事件、内存 summary 或账本；默认 all。实际示例与排障见[结果指南](../guide/factor.md#统计套利与多空归因结果)。
+在策略的 `research` 下设 `panel: none` 只关闭输出 panel 行，不改变事件、内存 summary 或账本；默认 all。实际示例与排障见[结果指南](../guide/statarb.md#结果解读)。

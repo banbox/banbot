@@ -26,9 +26,12 @@ Order manager interface that defines basic order management methods.
 Main methods:
 - `ProcessOrders`: Process order requests
 - `EnterOrder`: Process entry orders
+- `EditOrder`: Submit an order modification (e.g. stop-loss/take-profit or trailing-stop change); queued in live, a no-op in the local backtest manager
+- `RelayOrders`: Copy existing orders into new orders under this manager (relay/takeover)
 - `ExitOpenOrders`: Process exit orders
 - `ExitOrder`: Process single order exit
 - `UpdateByDataSeries`: Update order status based on candlestick
+- `ExitAndFill`: Submit an exit request for the given orders; the local (backtest/simulation) manager then fills it at the latest price (the last bar price in backtests), while the live manager only submits the exit
 - `OnEnvEnd`: Handle environment end
 - `CleanUp`: Clean up resources
 
@@ -124,6 +127,7 @@ Try to trigger batch jobs.
 
 Parameters:
 - `currMS`: int64 - Current timestamp in milliseconds
+- `isWarmUp`: bool - Whether warmup is in progress; batch callbacks still run during warmup, but the order requests they produce are not processed
 
 Returns:
 - `int` - Number of jobs still waiting
@@ -181,6 +185,7 @@ Initialize local order manager.
 Parameters:
 - `callBack`: func(od *ormo.InOutOrder, isEnter bool) - Order callback function
 - `showLog`: bool - Whether to display logs
+- `stops`: ...func() - Optional stop callbacks
 
 ### VerifyTriggerOds
 Verify trigger orders.
@@ -215,7 +220,11 @@ EnterOrder(exs *orm.ExSymbol, tf string, req *strat.EnterReq) (*ormo.InOutOrder,
 ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error)
 ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error)
 UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error
+EditOrder(od *ormo.InOutOrder, action string)
+RelayOrders(orders []*ormo.InOutOrder) *errs.Error
+ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq) *errs.Error
 OnEnvEnd(evt *orm.DataSeries) *errs.Error
+CleanUp() *errs.Error
 ```
 
 Embedded applications use `GetOdMgrWithState(rt.Trading, account)`, `GetAllOdMgrWithState(rt.Trading)`, `GetLiveOdMgrWithState(rt.Trading, account)` and `rt.Trading.Wallet(account)` for task state. Check nil: disabled accounts may have no manager. Package-level versions without State query only compatibility registries.

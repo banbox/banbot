@@ -25,6 +25,7 @@ export default defineConfig({
                         { text: 'Custom Time-Series Data', link: '/en-US/guide/custom_data' },
                         { text: 'Custom Strategy', link: '/en-US/guide/strat_custom' },
                         { text: 'Multi-factor strategies', link: '/en-US/guide/factor' },
+                        { text: 'Statistical Arbitrage & Carry', link: '/en-US/guide/statarb' },
                         { text: 'Backtesting', link: '/en-US/guide/backtest' },
                         { text: 'Symbol Manager', link: '/en-US/guide/pair_filters' },
                         { text: 'Live Trading', link: '/en-US/guide/live_trading' },

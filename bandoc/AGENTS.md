@@ -33,14 +33,20 @@ BanBot文档项目旨在为BanBot量化交易机器人的用户和开发者提�
 ### `zh-CN/guide/` (使用指南)
 - basic.md: 介绍BanBot的基本概念、术语、核心组件和执行逻辑。
 - bot_usage.md: 指导如何使用编译后的`bot`可执行文件，涵盖了WebUI、回测、实盘交易和各种子命令的用法。
+- backtest.md: 回测指南：回测引擎特点、运行方式与结果解读。
 - configuration.md: 详细介绍了 `banbot` 的 `yaml` 配置文件结构和所有可用选项。
+- custom_data.md: 自定义时序数据：K线之外的资金费率、持仓量、指标等数据的存储与策略消费。
+- execution.md: 共享账户与 Hub：时序、因子及混合策略的默认实时入口、账户账本与净额下单。
+- factor.md: 多因子与截面策略：因子引擎、表达式算子、组合与持仓生命周期、回测研究与实盘接入。
 - faq.md: 提供了常见问题解答。
 - hyperopt.md: 介绍了如何使用超参数优化功能。
 - init_project.md: 指导用户如何初始化一个新的 BanBot 策略项目。
 - database.md: 介绍 QuestDB/TimescaleDB 两种存储后端的选择、配置、TimescaleDB 部署步骤和 schema 自动初始化。
 - live_trading.md: 详细介绍了如何部署 BanBot 进行实盘交易，包括编译、配置和启动机器人。
+- notifications.md: 消息通知：企业微信、Telegram 和邮件等 rpc_channels 配置。
 - pair_filters.md: 介绍了所有可用的交易对过滤器及其配置。
 - quick_local.md: 提供了在本地环境中快速配置和运行 BanBot 的分步指南。
 - roll_btopt.md: 介绍了如何使用滚动回测功能。
 - start.md: 介绍了banbot：主要特性、UI支持、支持交易所、Q&A等。
+- statarb.md: 统计套利与期现：配对、滚动配对、协整篮子、残差 s-score、现货永续 carry 的注册接口、配置与结果解读。
 - strat_custom.md: 自定义策略：创建、实现、技术指标、自定义指标、K线预热、订阅其他时间周期K线、入场和离场、批量任务、止盈止损、高频数据订阅、http接口回调；

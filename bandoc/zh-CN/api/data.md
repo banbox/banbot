@@ -40,6 +40,10 @@ type PagedHistorySource interface {
 
 `GetDataSource`、`ListDataSources`、`ListDataSourceStatus` 有 catalog 方法和包级兼容入口。包级入口不是另一个 Runtime 的状态访问器。
 
+### 内置数据源
+
+`funding_rate`、`open_interest`、`mark_kline`、`index_kline`、`premium_kline` 由 data 包在进程初始化时通过 `RegisterDataSourceFactory` 注册，自定义源不能使用这些名称。构造函数为 `NewFundingRateDataSource(deps *RuntimeDeps) *FundingRateDataSource`、`NewOpenInterestDataSource(deps) *OpenInterestDataSource`，以及返回 `*PriceKlineDataSource` 的 `NewMarkKlineDataSource`、`NewIndexKlineDataSource`、`NewPremiumKlineDataSource`；`deps` 提供网络开关、交易所与配置，可为 nil。字段、周期和市场范围见[自定义时序数据](../guide/custom_data.md#内置数据源)。
+
 ### SeriesRuntime / SeriesPlan
 
 传统 TS 任务使用 `NewSeriesRuntimeWithRuntimeDeps(deps, sink)`、`Plan/Ensure/Apply/ActivateNew`，从 job 收集非主 K 线订阅，补齐覆盖范围并激活新增 source。`HistSeriesFeeder` 将独立历史序列与 K 线按可见时间一起回放。`ThirdPartySeriesBootstrap` 是 `SeriesPlan` 的兼容 alias。
@@ -62,7 +66,7 @@ type SubscriptionPlanOptions struct {
 
 ### 实盘安装
 
-`PrepareLivePlan` 准备独立订阅、预热和启动缓冲；`SubscriptionInstallation.Activate` 激活，`CommitPrepared` 提供提交回调边界；`InstallLivePlan` 是准备并激活的入口。需要受管理的实盘源必须实现 `ManagedLiveSource.SubscribeManaged`，返回具有 `Stop()` 和 `Join() error` 的独立句柄；可用 `LiveSourceErrors` 报告异步失败。
+`(*DataSourceCatalog).PrepareLivePlan(ctx, plan, sink)` 准备独立订阅、预热和启动缓冲，返回 `*SubscriptionInstallation`；其方法 `Activate() error` 激活，`CommitPrepared(commit func() error) error` 提供提交回调边界；`(*DataSourceCatalog).InstallLivePlan(ctx, plan, sink)` 是准备并激活的入口。需要受管理的实盘源必须实现 `ManagedLiveSource.SubscribeManaged`，返回具有 `Stop()` 和 `Join() error` 的独立句柄；可用 `LiveSourceErrors` 报告异步失败。
 
 启动缓冲保留 Values 的字段、类型和 NULL/缺键区别；不要在交给 sink 后并发改写输入。必需源失败、预算不足或取消会导致安装失败；可选源失败可表现为降级，应检查安装状态。停止受管理订阅时先 `Stop`，再 `Join` 等待生产者和已接纳回调退出，不能在回调内等待自身退出。具体句柄签名为 `Stop()` / `Join() error`，与 `LiveProvider.Stop() *errs.Error` / `Join()` 不同。
 
@@ -86,7 +90,7 @@ NewHistProvider(callback FnDataSeries, envEnd FuncEnvEnd, getEnd FnGetInt64, sho
 NewLiveProvider(callback FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *errs.Error)
 ```
 
-这些类型提供 `WithRuntimeDeps` 构造入口；显式任务应提供 Runtime 的配置、符号、存储、时钟、策略与回调边界。Provider 支持 `SubWarmPairs/UnSubPairs/LoopMain`，实盘资源支持 `Stop/Join`。公开回调 `Feeder.CallBack`、`Feeder.OnEnvEnd` 的输入均是 DataSeries，待处理值是 `WaitData`。
+这些类型提供 `WithRuntimeDeps` 构造入口；显式任务应提供 Runtime 的配置、符号、存储、时钟、策略与回调边界。Provider 支持 `SubWarmPairs/UnSubPairs/LoopMain`，实盘资源支持 `Stop/Join`。公开回调 `Feeder.CallBack`、`Feeder.OnEnvEnd` 的输入均是 DataSeries，待处理值保存在 `Feeder.WaitData`（`*orm.DataSeries`）字段中。
 
 ```go
 func NewHistProviderWithRuntimeDeps(deps *RuntimeDeps, callback FnDataSeries,

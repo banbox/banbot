@@ -34,6 +34,10 @@ Go 策略与 Banbot 一起编译成单个可执行文件。您可使用示例策
 
 `bot web` 在本机默认监听 `127.0.0.1:8000`，容器中默认监听 `0.0.0.0`。绑定 `0.0.0.0` 或 `::` 时必须传 `--password`，Basic Auth 用户名固定为 `banbot`。开发 WebUI 与实盘 Dashboard 的账号配置相互独立。
 
+## 命令报错如何定位？
+
+命令失败时错误以 `Error: <信息>` 写入 stderr，退出码为 1；参数约束错误形如 `Error: [BadConfig] ...`。先按信息核对配置和参数，再提高 `--level` 查看日志；报告问题时附上完整错误行。
+
 ## 可以开空头仓位或限制订单数吗？
 
 在支持做空的合约市场使用 `s.OpenOrder(&strat.EnterReq{Tag: "short", Short: true})`。现货路径不允许开空。

@@ -58,7 +58,29 @@ Canonical YAML puts factor fields directly in `run_policy[]`, shared execution d
 
 Configuration must be single-document YAML with a mapping root and no duplicate keys. Later layers wholly replace `run_policy`, `wallet_amounts`, `fatal_stop`, `watch_jobs`, and `historical_coverage`; other mappings normally deep-merge. See [configuration](../guide/configuration.md) for time representation changes and environment expansion.
 
-Common root structures include `DatabaseConfig` (`DbType`, `Url`, `SIDRegistryURL`, etc.), `APIServerConfig`, `UserConfig`, `PairMgrConfig`, `StratPerfConfig`, and `AccountConfig`. The configuration template is the complete YAML reference. Credentials remain in root `accounts`; execution settings do not replace actual trading authorization. `RPCChannels` maps channel configuration and supports `wework`, `mail`/`email`, and `telegram`; root `Webhook` holds message templates. See [notifications](../guide/notifications.md).
+Common root structures include `DatabaseConfig` (`DbType`, `Url`, `SIDRegistryURL`, etc.), `APIServerConfig`, `UserConfig`, `PairMgrConfig`, `StratPerfConfig`, and `AccountConfig`. The configuration template is the complete YAML reference. Credentials remain in root `accounts`; execution settings do not replace actual trading authorization. `Config.ExtraMarkets` backs root `extra_markets`; `NormalizeExtraMarkets(primary string, extras []string) ([]string, *errs.Error)` de-duplicates, drops entries equal to the primary market and rejects invalid values. `Config.LLMModels` backs `llm_models`; `GetLLMModel(name) (*llm.LLMModelConfig, error)` reads one by name and `GetLLMModelNames() []string` returns the names in ascending order. `RPCChannels` maps channel configuration and supports `wework`, `mail`/`email`, and `telegram`; root `Webhook` holds message templates. See [notifications](../guide/notifications.md).
+
+## Strategy parameter constraints
+
+A strategy factory can declare cross-parameter constraints with `RunPolicyConfig.Require` / `Requiref`; when the condition is false they panic with a `*BadParamError` (error code `core.ErrBadConfig`).
+
+```go
+func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
+    fast := pol.Def("fast", 5, nil)
+    slow := pol.Def("slow", 20, nil)
+    pol.Require(fast < slow, "fast must be less than slow")
+    pol.Requiref(slow >= 2, "slow=%v is too small", slow)
+    // ...
+}
+```
+
+| API | Description |
+| --- | --- |
+| `(*RunPolicyConfig).Require(cond bool, msg string)` | Panics when `cond` is false |
+| `(*RunPolicyConfig).Requiref(cond bool, format string, args ...any)` | Same, with a printf-style message |
+| `NewBadParamError(policy, msg string) *BadParamError` | Build the error; it has `Policy` and `Message` fields, and `BanError()` returns the underlying `*errs.Error` |
+| `AsBadParamError(value any) (*BadParamError, bool)` | Extract it from a `recover()` value or a wrapped error |
+| `CoerceBadParamError(pol *RunPolicyConfig, recovered any) *BadParamError` | Convert any panic value from a strategy constructor into a `*BadParamError` |
 
 ## Compatibility APIs and writing
 
@@ -66,7 +88,7 @@ Common root structures include `DatabaseConfig` (`DbType`, `Url`, `SIDRegistryUR
 | --- | --- |
 | `GetConfig(args, showLog)` / `ParseConfig(path)` / `ParseConfigs(paths, showLog)` | Return legacy time-series `Config`; not unified factor/mixed dispatch |
 | `LoadConfig(args)` / `ApplyConfig(args, cfg)` | Install legacy process globals; unsuitable for switching concurrent tasks; `LoadConfig` does not reinstall after Loaded |
-| `GetDataDir()` / `GetDataDirSafe()` | Legacy global directory access; the former raises a configuration error when absent, the latter allows empty |
+| `GetDataDir()` / `GetDataDirSafe()` | Legacy global directory access; the former panics when absent (asking for `BanDataDir` or `-datadir`), the latter may return an empty string |
 | `ResolveDataDir(explicit)` / `GetStratDir()` | Explicit data directory precedes `BanDataDir`; strategy directory comes from `BanStratDir` |
 | `ParsePath(path)` | Legacy data-directory prefix resolution; new fields use `RunSpec.ResolvePath` |
 | `GetTakeOverTF(pair, defTF)` / `GetAccLeverage(account)` / `GetStakeAmount(account)` | Compatibility lookups depending on legacy state |

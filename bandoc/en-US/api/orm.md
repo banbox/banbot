@@ -181,7 +181,7 @@ The snippet assumes initialized Storage, schema, target, ctx, and time bounds. `
 
 Independent SeriesStore writes complete records. `NewKLineSeriesInfo` / `NewKLineSeriesStoreWithStorage(info, storage)` define/write extension columns on existing K-lines. `Write(ctx,target,rows)` updates existing `(sid,time)` rows and fails when a target K-line is missing. An extension's Name is a label, not an independent source; subscribe with `Source: "kline"`.
 
-`GetSeries/AutoFetchSeries` return `[]*DataSeries`; explicit Queries provide `GetSeriesFields`, `QuerySeriesFields`, and batched projections. Omitting fields reads the default K-line fields; an explicit field list selects the projection. Feeders and callbacks retain Values. GetOHLCV/AutoFetchOHLCV below are default K-line compatibility views and cannot transport arbitrary extension columns.
+`GetSeries/AutoFetchSeries` return `([]*AdjInfo, []*DataSeries, *errs.Error)`: adjustment info plus unadjusted raw-price series; explicit Queries provide `GetSeriesFields`, `QuerySeriesFields`, and batched projections. Omitting fields reads the default K-line fields; an explicit field list selects the projection. Feeders and callbacks retain Values. GetOHLCV/AutoFetchOHLCV below are default K-line compatibility views and cannot transport arbitrary extension columns.
 
 Common field-read signatures are below (`q` belongs to the selected Storage and binds task options through `WithKlineRuntimeOptions`; `limit=0` does not bound rows, so page large requests by time window):
 
@@ -193,6 +193,31 @@ func (q *Queries) GetSeriesFields(exs *ExSymbol, timeframe string, fields []stri
 ```
 
 Pass the required field list to read extension columns. DataSeries queries return raw prices with Adj metadata; they do not apply adjustment automatically. Do not convert to `banexg.Kline` and back when custom fields must be retained.
+
+### Built-in Series Definitions and Constants
+
+The built-in sources expose their source names, default timeframes, and fields as exported constants and constructors for subscriptions and direct reads/writes:
+
+| Name | Description |
+| --- | --- |
+| `SeriesSourceKline`, `SeriesSourceMarkKline`, `SeriesSourceIndexKline`, `SeriesSourcePremiumKline`, `SeriesSourceFundingRate`, `SeriesSourceOpenInterest` | Source names: `kline`, `mark_kline`, `index_kline`, `premium_kline`, `funding_rate`, `open_interest` |
+| `DefaultPriceKlineTF`, `DefaultFundingRateTF`, `DefaultOpenInterestTF` | Default timeframes `1m`, `8h`, `5m` |
+| `FieldOpenInterest`, `FieldOpenInterestValue`, `FieldTopLSPosRatio`, `FieldTopLSAccRatio`, `FieldGlobalLSRatio`, `FieldTakerLSVolRatio` | `open_interest` field names `oi`, `oi_value`, `top_ls_pos_ratio`, `top_ls_acc_ratio`, `global_ls_ratio`, `taker_ls_vol_ratio` |
+
+```go
+NewSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
+NewKLineSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
+NewFundingRateSeriesInfo(timeFrame string) *SeriesInfo
+NewOpenInterestSeriesInfo(timeFrame string) *SeriesInfo
+NewPriceKlineSeriesInfo(source, timeFrame string) *SeriesInfo
+NewMarkKlineSeriesInfo(timeFrame string) *SeriesInfo
+NewIndexKlineSeriesInfo(timeFrame string) *SeriesInfo
+NewPremiumKlineSeriesInfo(timeFrame string) *SeriesInfo
+```
+
+The `New*SeriesInfo` constructors use the source's default timeframe when given an empty one. Timeframe and field helpers: `OpenInterestTimeFrames()`, `IsOpenInterestTimeFrame(tf)`, `PriceKlineTimeFrames()`, `IsPriceKlineTimeFrame(tf)`, `IsPriceKlineSource(source)`, plus `DefaultFundingRateFields()`, `DefaultOpenInterestFields()`, `DefaultPriceKlineFields()` returning default field names and `OpenInterestSeriesFields()`, `PriceKlineSeriesFields()` returning field definitions.
+
+`RegisterFieldAggRule(field, rule string) bool` registers a default aggregation rule name for a field (used when `ExSymbol.AggRules` has no override); `RegisterAggRule(name string, fn AggRuleFunc) bool` registers a custom rule. Both return false for empty arguments or, for the former, an unknown rule.
 
 ### Aggregation and Adjustment
 
@@ -261,9 +286,10 @@ Parameters:
 - `src string` - Data source name
 - `path string` - Database file path
 - `write bool` - Whether writable
+- `timeoutMs int64` - Connection hold timeout in milliseconds; an error is logged if it is not `Close()`d in time. 0 disables monitoring
 
 Returns:
-- `*sql.DB` - Database connection object
+- `*TrackedDB` - A tracked connection handle embedding `*sql.DB`; call `Close()` when done (it does not close the shared underlying pool)
 - `*errs.Error` - Error information
 
 ### NewDbErr
@@ -511,7 +537,7 @@ Parameters:
 
 ### ExportKData
 
-`ExportKData(configFile, outputDir string, numWorkers int, pb *utils.StagedPrg) *errs.Error` exports fixed K-line fields and accompanying metadata to protobuf, without arbitrary extension columns or independent series tables.
+`ExportKData(configFile, outputDir string, numWorkers int, pb *utils.StagedPrg) *errs.Error` exports all columns of the physical K-line tables (including extension columns written by `KLineSeriesStore`) with their types, NULLs, time gaps, and symbol `Combined`/`AggRules` to protobuf. Independent series tables are not included. Archives in the older fixed-field format can still be imported.
 
 ### ImportData
 

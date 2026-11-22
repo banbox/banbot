@@ -47,7 +47,30 @@ webhook:
 | `retry_delay` | Retry interval, seconds |
 | `proxy` | Channel proxy configuration |
 
-Messages queue asynchronously and may be combined. Notification arrival time is not exchange fill time. Exception notifications also aggregate and rate-limit. Template fields depend on message type; entry/exit payloads include relevant fields such as `pair`, `strategy`, `price` and `value`.
+Messages queue asynchronously and may be combined. Notification arrival time is not exchange fill time. Sending is rate-limited by `min_intv_secs` and retried after `retry_delay` on failure; messages not yet sent when the task stops are discarded. Template fields depend on message type; entry/exit payloads include relevant fields such as `pair`, `strategy`, `price` and `value`.
+
+## Per-account channels
+
+With multiple accounts, `accounts.<account>.rpc_channels` can reference a global channel and override some of its fields to create a channel dedicated to that account:
+
+```yaml
+rpc_channels:
+  tg_main:
+    type: telegram
+    token: "BOT_TOKEN"
+    chat_id: 123456
+accounts:
+  acc1:
+    rpc_channels:
+      - name: tg_main
+        msg_types: [entry, exit]
+```
+
+- Each item must contain `name`, which must be an existing global `rpc_channels` name, otherwise startup fails; the other fields override the same-named settings of that channel.
+- When `accounts` is not set in the item, the channel only sends that account's messages.
+- The generated channel is named `<name>_<account>`; the global channel itself stays in place unchanged.
+- Accounts with `no_trade: true` are skipped.
+- Without a global `rpc_channels`, no channel is created.
 
 ## WeCom and Telegram
 

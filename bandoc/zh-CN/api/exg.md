@@ -24,4 +24,25 @@ BotExchange 包装底层 session 并转发统一接口。不要绕过策略订�
 
 `SetOrderCallback(exchange, func(*PutOrderRes) *errs.Error) bool` 安装实例级回调，返回是否支持。BotExchange 对下单成功和失败均调用回调；回调错误可覆盖原错误，即使返回 error 仍可能有非 nil Order，需同时检查。显式设置 nil 会禁用旧全局 AfterCreateOrder 回退。
 
-`GetAlignOffForExchangeChecked` 的 offset 单位为秒，基于品种交易时段，仅日线及以上需要非零偏移。无能力的账户导出或归档 URL 返回不支持错误；存在封装函数并不代表当前交易所实现了它。精度函数只做舍入/合约数量单位处理，不保证余额、最小下单额或成交。
+`GetAlignOffForMarket(market *banexg.Market, tfSecs int) int` 是纯函数版本，直接按品种元数据计算偏移（秒）。`GetAlignOffForExchangeChecked` 的 offset 单位为秒，基于品种交易时段，仅日线及以上需要非零偏移。无能力的账户导出（`StartAccountDownload`/`GetAccountDownload`）或归档 URL（`BuildArchiveURL`）返回不支持错误，目前没有适配器实现这些能力；存在封装函数并不代表当前交易所实现了它。精度函数只做舍入/合约数量单位处理，不保证余额、最小下单额或成交。
+
+## 归档与衍生品数据
+
+适配器可选实现以下能力，`BotExchange` 提供同名方法，包级函数以 `exchange banexg.BanExchange` 为首参数。第二个返回值 `bool` 表示适配器是否支持：`false` 且错误为 nil 表示不支持，调用方应回退到普通 REST 拉取。
+
+- `FetchOHLCVArchive(ctx, symbol, timeframe string, startMS, endMS int64) ([]*banexg.Kline, bool, *errs.Error)`
+- `FetchPriceOHLCVArchive(ctx, priceType, symbol, timeframe string, startMS, endMS int64) ([]*banexg.Kline, bool, *errs.Error)`：`priceType` 为 `mark`/`index`/`premiumIndex`
+- `FetchFundingRateArchive(ctx, symbol string, startMS, endMS int64) ([]*banexg.FundingRate, bool, *errs.Error)`
+- `FetchDerivativesMetricsArchive(ctx, symbol, timeframe string, startMS, endMS int64) ([]*banexg.DerivativesMetric, bool, *errs.Error)`
+- `FetchDerivativesMetrics(ctx, symbol, timeframe string, startMS, endMS int64, limit int, params map[string]interface{}) ([]*banexg.DerivativesMetric, bool, *errs.Error)`
+
+```go
+kl, ok, err := exg.FetchPriceOHLCVArchive(ctx, exchange, "mark", "BTC/USDT:USDT", "1h", startMS, endMS)
+if err != nil { return err }
+if !ok { /* 适配器不支持，回退到普通拉取 */ }
+```
+
+## 附加市场与代理
+
+根配置 `exchange` 之外，`extra_markets: [spot]` 可在同一交易所额外准入其他市场类型（`spot/linear/inverse/margin/option`，与 `market_type` 相同的项被忽略，非法值报配置错误），用于同时订阅或交易如线性永续与现货标的；见[配置指南](../guide/configuration.md)。交易所代理读取 `exchange.<name>.proxy`：URL、`no` 或留空；留空时按系统代理探测（进程内只探测一次），都没有则为 `no`，创建会话时始终显式传入。
+

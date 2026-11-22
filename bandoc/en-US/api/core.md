@@ -146,6 +146,21 @@ Returns:
 
 `SplitSymbol(pair string) (base, quote, settle, identifier string)` splits generic `/`, `:`, `-` symbols such as `BTC/USDT:USDT`. Use the bound exchange capability for special symbols; this helper does not infer exchange identity.
 
+### SplitDigits
+`SplitDigits(s string) []string` splits on non-digit characters and returns the runs of digits, e.g. `"2006-01-02"` gives `["2006","01","02"]`.
+
+## Numeric Utilities
+
+### Ema
+Exponential moving average. `NewEMA(alpha float64) *Ema` creates one; `Update(val float64) float64` updates and returns the current value: when the current value is 0 it takes `val` as the first value, otherwise `Val = Val*(1-alpha) + val*alpha`; a NaN/Inf input returns NaN and leaves the state unchanged. `Reset()` clears it.
+
+### NumSet
+Collects values of several keys per time bucket. `NewNumSet(alignUnit int64, callback func(int64, map[string]float64)) *NumSet` creates one; `Update(stamp int64, key string, val float64)` aligns `stamp` to `alignUnit` and, when a new bucket starts, calls `callback` with the previous bucket's timestamp and data.
+
+## Symbol Parsing
+
+`NewSymbolParser(exgName string) *SymbolParser` creates a common symbol parser (the argument is kept for compatibility and ignored); `NewSymbolParserWithStrategy` / `NewSymbolParserWithErrorStrategy` bind an exchange-supplied parse function. `Split(pair string) (base, quote, settle, identifier string)` parses and caches results.
+
 ## Parameter Generation Methods
 
 ### PNorm
@@ -193,8 +208,8 @@ Returns:
 
 ## System Control Methods
 
-### RunExitCalls
-Execute callback functions on exit.
+### AddExitCall / RunExitCalls
+`AddExitCall(method func())` registers a process-level exit callback (nil is ignored); `RunExitCalls()` runs the registered callbacks.
 
 
 
@@ -202,4 +217,4 @@ Execute callback functions on exit.
 
 Price helpers belong to com, not core. Explicit tasks use Runtime.Market.Prices PriceState methods (GetPriceSafeExpAt/SetPriceAt/SetPricesAt with explicit nowMS). Package-level com GetPrice/SetPrice helpers are compatibility facades. SetPairMs is also in com. PrintStratGroups belongs to strat; explicit tasks use PrintStratGroupsWithState. SnapMem is no longer a public function. core.CountDigit(text string) int counts Unicode digit characters.
 
-State owns admission/performance/cancellation. Runtime injects concrete state; package Setup/SetRunMode does not provide multi-task isolation. See [com](com.md), [runtime](runtime.md).
+State owns admission/performance/cancellation. Runtime injects concrete state; package Setup/SetRunMode does not provide multi-task isolation. See [com](com.md), [runtime](runtime.md). Embedding hosts can create an independent state with `NewState(parent context.Context) (*State, *errs.Error)`; `State` offers `Context()`, `Done()`, `Sleep(d)`, `Stop()` and `Close()`.

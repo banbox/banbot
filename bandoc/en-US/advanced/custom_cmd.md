@@ -53,7 +53,7 @@ bot trade --datadir /path/to/data --out /path/to/live-bars.gob
 bot tool test-live-bars --datadir /path/to/data /path/to/live-bars.gob
 ```
 
-The `trade` command above requires a complete runnable Hub configuration; see [execution](../guide/execution.md). This tool takes one positional `DUMP_FILE` and compares a time-series live bar dump with the configured market's local storage. It needs the matching exchange, market, and database. It is neither a generic Gob validator nor proof that a strategy avoids lookahead.
+`--out` also writes `<out>.ws` (the WebSocket replay stream); do not reuse that path. The `trade` command above requires a complete runnable Hub configuration; see [execution](../guide/execution.md). This tool takes one positional `DUMP_FILE` and compares a time-series live bar dump with the configured market's local storage. It needs the matching exchange, market, and database. It is neither a generic Gob validator nor proof that a strategy avoids lookahead.
 
 ## Rebuild a report from orders
 

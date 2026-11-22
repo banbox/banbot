@@ -64,6 +64,8 @@ export BanDataDir=/ban/data
 
 编辑 `config.local.yml` 的市场、数据库和策略设置。默认依次加载 `config.yml` 与 `config.local.yml`，后者优先；额外覆盖文件可重复传 `--config`。账户凭据仅放在机器人配置中，Hub 自身配置提供公共市场、数据库与发送租约。
 
+交易所网络代理读取 `exchange.<name>.proxy`：写 `no` 表示不使用代理；留空时启动阶段自动探测一次环境变量/系统代理，之后各交易所共用该结果，探测后修改系统代理需重启才生效。详见[网络代理](./configuration.md#网络代理)。
+
 实时模拟选 `env: dry_run` 并声明 `execution.funding_policy: explicit-zero`；生产选 `env: prod`、真实账户凭据与 `required-stream`。两者都需执行单位、资本与风险声明。纯时序还要求 `execution.store` 和 `sender_lease_dir`；旧配置的 `fatal_stop`、动态 `leverage`（含账户级）尚不能用于共享实盘入口，会被拒绝。不要把旧配置直接改成 prod。详见[配置文件](./configuration.md)及[共享账户配置步骤](./execution.md#配置与启动)。
 
 同一物理账户可由多个策略/机器人共享一个 Hub，保留各策略预算与持仓归属；不要让独立发送进程争用同一账户。独立资金边界使用不同子账户。多个机器人使用稳定、互不冲突的策略 ID，启动后核实归属和预算。
@@ -83,6 +85,17 @@ nohup /ban/bot trade --datadir /ban/data --config /ban/live.yml > /ban/data/trad
 不要同时启动相同 socket 的 hub 和 spider。Hub 不可用、能力不完整、声明冲突或对账失败时应处理报错，不会回退本地发送或自动改用 paper。`trade --dry-run` 只对含因子的配置有效，执行历史 events 回放；实时模拟使用 `env: dry_run`，不传该标志。
 
 停止单个机器人不会自动平仓，Hub 继续处理账户已有挂单和保护。Hub 重启后等待机器人重新认证，认证前本地保护未激活；保留执行目录和 journal，按[恢复步骤](./execution.md#重启与恢复)操作。不能把进程存在当作账户已恢复。
+
+## 订单类型的实盘行为
+
+Stop-Limit 入场、OCO 组、多级止盈和追踪止损在回测与实盘（含实时模拟）均可用，字段见[自定义策略](./strat_custom.md)，回测撮合方式见[回测指南](./backtest.md#撮合语义)。实盘需注意：
+
+- 止损、止盈和追踪止损在订单**完全入场后**才挂载；部分成交期间不挂。
+- `ExgStopLoss` / `ExgTakeProfit` 为 `false` 时不预挂交易所条件单，由本地价格监控触发；程序停止或行情不可用期间不提供保护。
+- 追踪止损优先使用交易所原生追踪单，回撤百分比超出交易所上限或被拒绝时，会降级为本地价格监控而不是让订单失败。
+- OCO 组内某挂单入场成交后，同组其余未成交挂单被撤销，出场标签 `oco_cancel`。
+- 多级止盈在某级成交后才挂下一级；`MoveSLToBreakeven` 在该级成交后移动剩余仓位止损。
+- 回测专用的 `data_gap` / `delist` 强平标签与 `bt_*` 成本键在实盘不生效。
 
 ## 4. 消息通知、DashBoard和监控
 ### 消息通知与远程控制

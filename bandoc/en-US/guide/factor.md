@@ -45,6 +45,69 @@ A factor policy accepts one decision timeframe. A 24-period momentum window need
 
 No version marker is required; ordinary loading leaves the original file unchanged. Explicit `engine: time_series` or `engine: factor` selects the new engine semantics; legacy policies without an engine retain custom parameters. id is a stable strategy identity; account chooses an account; capital_weight allocates capital among same-account strategies and is independent of stake_rate.
 
+## Policy keys, price stream and fill expiry
+
+These keys sit directly under a `run_policy[]` entry, next to `name`, `engine`, `id`, `account`, `capital_weight`, `run_timeframes`, `params` and `pairs`:
+
+| Key | Purpose |
+| --- | --- |
+| `expressions` / `definition` | Expression or registered Go definition; choose one |
+| `portfolio` | Selection, notionals, rebalancing, holding, exits and allocation; see below |
+| `combo` | Outer combination config; a non-empty `method` replaces `expressions.combine` entirely |
+| `prices` | Fill price stream `{source, timeframe, field}` |
+| `decision` | Decision and fill timing: `latency_ms` (default 1), `expiry_ms` (default 60000, must exceed `latency_ms`), `max_pending` (default 64), `interval_ms`, `delay_ms`, `source_event_decisions`/`source`/`timeframe` |
+| `universe` (alias `rolling_universe`) | Point-in-time rolling liquidity universe; see below |
+| `research` | `labels`, `label_wait_ms`, `panel` |
+| `manifest.costs` | `fee_rate`, `slippage_rate`, `funding_policy`, `funding_apr` |
+| `funding_source`, `initial_nav`, `max_records`, `archive` | Funding stream, initial NAV, record cap, immutable archive input |
+| `pit_min_universe_ratio`, `pit_delist_penalty_bps` | Point-in-time removal threshold and delisting penalty; see below |
+
+Unknown keys are rejected at startup. `funding_policy` (under `execution` or `manifest.costs`) is `explicit-zero`, `required-stream` or `storage`; storage replay requires an explicit choice. `storage` reads the built-in `funding_rate` source by default and settles contract legs only.
+
+The built-in `momentum-vol` scores `z(momentum) - z(volatility)`: momentum is the `window`-period return, volatility is the `window`-period standard deviation of 1-period returns, each winsorized at 1% and standardized; the default `window` is 24. It is momentum with a low-volatility tilt, not pure momentum.
+
+### The zero-trade trap
+
+Without `prices`, weights replay uses the decision-timeframe close stream. A target fills only on a quote after the decision time plus `latency_ms` and within `expiry_ms`. With a 1h decision and a 1h close stream the next quote arrives after the default 60 s expiry, so every non-empty target expires and nothing executes. For 1h and coarser strategies declare a 1m or tick price stream:
+
+```yaml
+prices: {source: kline, timeframe: 1m, field: close}
+decision: {latency_ms: 1, expiry_ms: 120000}
+```
+
+Events replay and live accept only `event` (tick) or `1m` price streams. Raising `expiry_ms` alone fills at the next bar's close, which is usually not what you want.
+
+### Aggregated decision timeframes
+
+`run_timeframes` (and the expression `timeframe` and `kline` binding `timeframe`) may be a stored timeframe (1m, 5m, 15m, 1h, 1d) or any timeframe divisible by one of them, such as 30m, 2h, 4h, 8h, 12h, 3d or 1w. Aggregated bars are built from finer bars at read time, aligned in UTC (3d/1w use the same alignment anchors as the time-series engine). A bucket is invisible before it closes and an incomplete trailing bucket is dropped. `every_bars`, windows and `ts.lag` count aggregated bars. A timeframe not divisible by a stored one fails before the database opens and the error lists the stored timeframes; `prices.timeframe` is checked as well.
+
+### Point-in-time rolling liquidity universe
+
+The root `pairs` list is the candidate superset; the investable set is re-selected periodically from turnover visible at that time:
+
+```yaml
+universe:
+  mode: rolling_liquid_top
+  top_n: 20
+  lookback_days: 30
+  min_listing_days: 14
+  reconstitute_days: 30
+  always_include: ['BTC/USDT:USDT', 'ETH/USDT:USDT']
+```
+
+| Key | Description |
+| --- | --- |
+| `mode` | `rolling_liquid_top` (alias `liquid_top`) or `static` (off) |
+| `top_n` | Names selected each time, 1-10000 |
+| `lookback_days` / `lookback_bars` | Turnover lookback, choose one; default 30 days, using `quote` and falling back to `close * volume` |
+| `min_listing_days` / `min_age_bars` | Minimum visible listing span, choose one; default 14 days, `-1` disables |
+| `reconstitute_days` / `reconstitute_bars` / `schedule` | Reselection interval, choose one; default 30 days; `schedule` is `daily`, `weekly` or `monthly` (UTC calendar boundaries) |
+| `always_include` | Permanent members; full symbols |
+
+At each boundary only bars visible at that instant are used; ranking is by turnover descending, ties by symbol. Listed candidates that are not selected keep warming up indicators in the background but stay out of the cross-sectional reference pool. A held name that leaves the universe and still has quotes is closed at the next executable step. `universe` and `rolling_universe` cannot both be set; either may also sit under `portfolio`.
+
+Missing data: in weights replay, an investable symbol with missing or invalid input on the grid (delisted, not yet listed, gap) is removed and closed, and the decision continues on the reduced universe. If the remaining investable names fall below `pit_min_universe_ratio` (default 0.5; `< 0` disables removal) of the survivors at the last accepted decision, the whole round is skipped. Removed positions close at the last valid price plus a `pit_delist_penalty_bps` penalty (default 100; `< 0` disables).
+
 ## Independent rebalancing and holding lifecycle
 
 Enable `portfolio.policy: lifecycle-v1` to configure rebalancing, selection, holding, transitions and allocation independently. Omitting policy retains the original builder and weight targets.
@@ -94,9 +157,9 @@ gradual initially funds one cohort; seed-all creates all initial cohorts from cu
 | --- | --- |
 | rebalance | every_bars, anchor/phase, duration; daily/weekly/monthly civil calendars with timezone/version |
 | selection | Independent long/short K or quantile, retain_rank, dropout, group_quota and missing scores |
-| holding | Minimum/maximum bars or duration, by_asset, cooldown_bars and explicit adopt |
+| holding | Minimum/maximum bars or duration, by_asset, cooldown_bars, stop_loss_pct, trailing_stop_pct and explicit adopt |
 | transition | direct, linear-exit, cohort, geometric, target-step; mode-specific reselection and asset rules |
-| allocation | equal, score, inverse-volatility, fixed-notional, vol-target; reserve, asset/group/net/beta caps and turnover_limit |
+| allocation | equal, score, inverse-volatility, fixed-notional, vol-target, erc, hrp, min-variance, mean-variance; risk_window, shrinkage, reserve, asset/group/net/beta caps and turnover_limit |
 
 direct requests zero once exit is allowed. geometric multiplies the exit anchor by ratio each round and zeros it at final_threshold; both parameters must be in (0,1). target-step moves toward the new target using alpha in (0,1]. For linear-exit/geometric, on_reselect accepts restore (return to the ideal), resume (hold the current exit level, then continue on later dropout), or finish/new-cohort (finish exiting first). Reversal waits for flat. Forced risk exits bypass ordinary turnover budgets.
 
@@ -112,6 +175,57 @@ swapPerBars/holdBars are not global aliases: use every_bars, min/max_bars or per
 
 Multi-horizon, robust neutralization, model and risk builders are documented in `doc/factor_research_extensions.md`. Holidays and custom schedules use RebalanceDue callbacks; heterogeneous or fill-based cohort lifetimes require a custom policy.
 
+### Absolute score gates and dynamic exposure
+
+Both `portfolio` (the default top/bottom-k path) and `selection` (`lifecycle-v1`) accept:
+
+| Key | Description |
+| --- | --- |
+| `long_min_score` / `short_max_score` | Optional finite numbers; omitted differs from an explicit `0`. Long candidates need `score >= long_min_score`, short candidates `score <= short_max_score`; `retain_rank` never keeps a holding that fails the gate |
+| `unfilled_slot_policy` | When the number of names passing the gate `m < K`: `cash` (default) gives each selected name `side_notional / K` and leaves the rest in cash, and `m == 0` emits an explicit empty portfolio that flattens the book; `rescale` concentrates the budget on passing names, subject to `asset_cap` |
+| `asset_cap` | Per-asset weight cap |
+| `drift_threshold` | Drift buffer in `[0,1)`; see below |
+
+A factor output named `exposure_scale`, `long_scale` or `short_scale` is excluded from the default combination. Its valid cross-sectional mean, clamped to `[0,1]` (all invalid counts as 1), dynamically scales the current long and short notional (`long_scale`/`short_scale` scale one side only). For example, market breadth controlling total exposure:
+
+```yaml
+outputs:
+  score: 'cs.pct_rank(ts.return(positive(kline.close), 42)) - 0.5'
+  exposure_scale: 'cs.mean(kline.close > ts.sma(kline.close, 50))'
+```
+
+See [regime-gate.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/regime-gate.yml) for the full example, which also adds a BTC daily trend gate through `mtf.asof` and `ref.field`.
+
+### Risk columns and allocation
+
+`allocation.method` is `equal` (default), `score`, `fixed-notional` (needs `fixed_notional`), `inverse-volatility`, `vol-target` (needs `vol_target`), `erc` (alias `risk-parity`), `hrp`, `min-variance` or `mean-variance` (optional `risk_aversion`). Related keys:
+
+| Key | Description |
+| --- | --- |
+| `risk_window` | Rolling return window, default 20 |
+| `shrinkage` | Off-diagonal covariance shrinkage in `[0,1]` |
+| `reserve_ratio`, `asset_cap`, `group_caps`, `turnover_limit` | Cash reserve and caps |
+| `net_cap` / `beta_cap` | Portfolio net exposure / market beta caps |
+| `volatility_column` / `beta_column` | Risk column names, default `volatility` / `beta` |
+
+`inverse-volatility`, `vol-target`, `beta_cap` and the covariance methods read the reserved factor outputs `volatility` / `beta` (the default combination ignores them). When they are absent, the runner maintains a `risk_window` return matrix, volatility and market beta from decision-grid closes visible at decision time; while the covariance is still warming up it falls back smoothly to `inverse-volatility` or `equal`. Group caps still need Go `Config.PolicyContext` to supply groups. A `portfolio` block that sets `rebalance`/`selection`/`holding`/`transition`/`allocation` without `policy` enables `lifecycle-v1` automatically. Examples: [risk-hrp-exits.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/risk-hrp-exits.yml), [risk-minvar-beta.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/risk-minvar-beta.yml), [liquid-top-erc.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/liquid-top-erc.yml).
+
+### Stop loss, trailing stop and drift buffer
+
+```yaml
+portfolio:
+  policy: lifecycle-v1
+  rebalance: {every_bars: 5, drift_threshold: 0.03}
+  holding:
+    stop_loss_pct: 0.1        # stop after a 10% adverse move from entry
+    trailing_stop_pct: 0.15   # exit after a 15% pullback from the visible favourable extreme
+    cooldown_bars: 2          # no re-entry for 2 decision bars after a trigger
+    by_asset:
+      'BTC/USDT:USDT': {trailing_stop_pct: 0}   # explicit 0 removes the limit for this asset
+```
+
+`stop_loss_pct` and `trailing_stop_pct` take values in `[0,1)` and are checked per holding on every decision grid, including non-rebalance steps when `every_bars > 1`; the trailing extreme excludes the entry bar. A triggered asset goes to zero immediately; on non-rebalance steps only the triggered asset is closed while other holdings drift with the market without turnover. `drift_threshold` (valid under `portfolio`, `rebalance` or `allocation`): when the current weight and target weight have the same sign, are non-zero and differ by less than the threshold, the existing position is kept; exits, flips and new entries run as usual.
+
 ## Writing strategies in Go: three entry points
 
 Place registration functions in a Go package imported by your project, then rebuild the robot. Import `github.com/banbox/banbot/factor`, `factor/runner` and `factor/statistics` as needed (the latter two share the banbot module prefix). Pick the engine first. All three share the same YAML and `DataSeries.Values`; they differ in how a signal becomes a position:
@@ -120,7 +234,7 @@ Place registration functions in a Go package imported by your project, then rebu
 | --- | --- | --- |
 | Independent timing per symbol | time series | `strat.AddStratGroup` + `TradeStrat` (see [custom strategies](./strat_custom.md)) |
 | Score the whole market, long/short top/bottom-k | factor | `runner.RegisterFactor` |
-| Spread regression between two symbols (stat-arb) | factor | `runner.RegisterPairs` |
+| Spread regression between two or more symbols (stat-arb) | factor | `runner.RegisterPairs` and related; see [Statistical Arbitrage & Carry](./statarb.md) |
 | Custom portfolio or lifecycle | factor | `RegisterDefinition` + `RegisterPortfolioFactory` |
 
 ### Cross-section factor in one call
@@ -145,40 +259,20 @@ run_policy:
 
 `c.Params` works like `pol.Param` in time-series strategies: it reads `params` with defaults. `Int` with a fractional value or `Bool` with a value other than 0/1 reports through `Err()` instead of truncating; `Unused()` lists parameter names nobody read (typos). Several outputs are mixed with equal weights unless `FactorSpec.Combine` says otherwise.
 
-### Statistical arbitrage: declare the pairs
+`FactorContext` also provides these helpers:
 
-```go
-func init() {
-	if err := runner.RegisterPairs("eth-btc", func(p *runner.Params) (runner.PairsSpec, error) {
-		return runner.PairsSpec{
-			Pairs:  []runner.Pair{{Y: "ETH/USDT:USDT", X: "BTC/USDT:USDT"}},
-			Window: p.Int("window", 120),
-			Band: statistics.BandConfig{
-				Entry: p.Float("entry", 2), Exit: p.Float("exit", 0.5),
-				Stop: p.Float("stop", 4), MaxHold: p.Int("maxHold", 0),
-			},
-		}, p.Err()
-	}); err != nil {
-		panic(err)
-	}
-}
-```
+| Method | Description |
+| --- | --- |
+| `Open/High/Low/Close/Volume/Quote/BuyVolume()` | Kline field nodes on the decision timeframe (`Quote` is quote-currency turnover) |
+| `Field(name)` | Any kline field |
+| `SourceField(source, name)` | A non-kline source (`funding_rate`, `open_interest`, `premium_kline`, `index_kline`, `mark_kline`); applies causal AsOf alignment automatically when the native timeframe differs from the decision timeframe |
+| `RefField(symbol, name)` / `RefSourceField(symbol, source, name)` | A field of a named benchmark symbol |
+| `SubTF(sourceTF, build, maxAge...)` | Evaluates a source-timeframe subgraph and aligns it to the decision timeframe |
+| `SectorCode()` | Built-in sector code |
 
-```yaml
-pairs: ['ETH/USDT:USDT', 'BTC/USDT:USDT']
-run_policy:
-  - {name: eth-btc, id: pair1, engine: factor, run_timeframes: [1h], params: {window: 120, entry: 2}}
-```
+### Statistical arbitrage
 
-Behavior:
-
-- A rolling regression of `ln(Y) = α + β·ln(X)`; z = residual / residual std. `z ≤ -Entry` goes long the spread (buy Y, sell X when β is positive), `z ≥ Entry` short, `|z| ≤ Exit` flat.
-- Optional `Stop` closes at `|z| ≥ Stop` and blocks re-entry until z is back inside `Exit`; `MaxHold` behaves the same. `LongOnly`/`ShortOnly` restrict direction.
-- β is frozen at entry while a pair is open (no churn from β drift) and refreshed on the next entry. One pair's gross is `Gross` (default `1/pairs`) of strategy NAV: Y leg `s·G/(1+|β|)`, X leg `-s·G·β/(1+|β|)`.
-- Both legs of an actively traded pair must be in the run's universe and tradable set. Each run owns its windows and state machines. An incomplete window produces no new signal. If an open pair loses either leg, it requests a close and pauses; it can reopen when data returns. A leg with no data throughout the backtest window, explicitly marked unavailable by the engine, skips that pair for the entire run without increasing other pairs' budgets. If all pairs are unavailable, equity stays at its initial value with zero trades. Undeclared or disallowed legs still fail.
-- The strategy binds its own portfolio builder, so YAML needs only `name`; an explicit `portfolio.builder` still wins.
-
-`statistics.BandTrader` (hysteresis state machine) and `statistics.RollingSpread` (O(1) rolling spread z-score) are engine independent. A time-series strategy can use them in `OnBar`: feed both log prices to `RollingSpread.Observe`, pass `Z` to `BandTrader.Step`, and map the returned -1/0/+1 to `EnterReq`/`ExitReq`.
+Pairs, rolling pairs, cointegration baskets, residual s-score and spot-perpetual carry use dedicated registration functions such as `RegisterPairs`; a single declaration is enough to run them. See [Statistical Arbitrage & Carry](./statarb.md).
 
 ## Write multiple expressions
 
@@ -208,6 +302,24 @@ Policy params.k controls portfolio selection; expressions.params.window controls
 
 For Go strategies register `runner.RegisterDefinition(name, builder)`, where builder is `func(runner.Config) (*factor.Plan, research.ComboSpec, error)`. Register a uniquely versioned portfolio builder with RegisterPortfolioBuilder. Declare node versions and missing-data policies. See [Factor API](../api/factor.md).
 
+### Expression operator reference
+
+| Family | Operators |
+| --- | --- |
+| Pointwise | `+ - * /`, comparisons `> >= < <=` (or `gt/ge/lt/le`; true is 1, false is 0), `where(cond,a,b)` (alias `if_else`; when `cond` is valid only the chosen branch must be valid), `sign`, `clip(x,lo,hi)`, `positive`, `abs`, `log`, `sqrt`, `pow`, `min`, `max` |
+| Time-series basics | `ts.lag`, `ts.return` (`ts.ret`), `ts.ema`, `ts.std(x,n,ddof)`, `ts.sum`, `ts.product`, `ts.rank`, `ts.zscore`, `ts.argmax`, `ts.argmin`, `ts.corr`, `ts.cov`, `ts.beta` |
+| Rolling statistics | `ts.skew` (n>=3), `ts.kurt` (n>=4), `ts.slope`, `ts.rsquare`, `ts.decay_linear` |
+| Cross-section | `cs.rank`, `cs.pct_rank` (`[0,1]`), `cs.zscore`, `cs.robust_zscore`, `cs.winsorize`, `cs.mad_winsorize`, `cs.quantile`, `cs.mean`, `cs.sum` (the last three output a cross-sectional constant) |
+| Regression and groups | `group.residual`, `group.ols`, `group.wls`, `group.demean`, `group.zscore` |
+| Crypto sectors | `cs.sector_demean`, `cs.sector_zscore` (aliases `group.sector_*`), using 8 built-in sectors (`L1`, `L2`, `DeFi`, `AI_DePin`, `Meme`, `Gaming`, `Infra`, `Other`) derived from the symbol with no external table; `sector_code()` outputs a 0-7 code |
+| Quantile buckets | `group.quantile_demean/zscore/rank/pct_rank(x, metric, n)`: each period the reference pool is split into `n` (2-1000) equal-count buckets by a continuous `metric` (e.g. `ts.sma(kline.quote,30)`), and `x` is processed within each bucket |
+| Cross-timeframe and benchmark | `mtf.asof("1d", expr[, max_stale_ms])` (alias `asof_tf`); `ref.field("BTC/USDT:USDT", "close")` (an optional third argument names the source) |
+| Technical indicators | `ts.sma/rma/wma/dema/tema/hma/kama/alma/trima/er/kalman1d/hurst`, `ts.rsi/roc/mom/cci/macd*/bbands_*/stoch/willr`, `ts.tr/atr/natr/adx/dmi_*/chop/aroon_*/vortex_*/donchian_*/keltner_*/supertrend*/sar/stc/ichimoku_*`, `ts.highest/lowest/vwma/obv/mfi/cmf/adl/adosc`, order flow `ts.volume_delta/cvd/rolling_cvd/taker_buy_ratio`, volatility `ts.parkinson_vol/garman_klass_vol/yang_zhang_vol` |
+
+With a `kline` binding you can write `open`, `high`, `low`, `close`, `volume` and `buy_volume` directly, and OHLC indicators may omit field arguments, as in `ts.adx(14)` or `ts.volume_delta()`. Binding aliases cannot be `factor`, `param`, `label`, `ts`, `cs`, `group`, `mtf` or `ref`. Windows must be integer constants or `param.name`, in the range 1-10000.
+
+The source timeframe of `mtf.asof` must not be finer than the outer decision timeframe. Inner indicators advance only on closed source bars and are then causally aligned to the decision grid, so a 4h decision can use a true daily moving average. `ref.field` reads a named benchmark symbol and broadcasts it across the pool; the benchmark need not be tradable. Expressions allow any acyclic CS→TS→CS nesting, for example `cs.zscore(ts.sma(cs.pct_rank(ts.return(kline.close, 30)), 5))` (rank, smooth over time, standardize to cut turnover); warm-up lengths accumulate automatically. Full examples: [operators.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/operators.yml), [neutral-sector-quantile.yml](https://github.com/banbox/banstrats/blob/main/examples/crosssection/advanced/neutral-sector-quantile.yml).
+
 ## Add common technical indicators
 
 Replace or extend `expressions.outputs` with explicit scalar indicators, then combine or rank their results:
@@ -221,7 +333,7 @@ outputs:
   band_width: 'ts.bbands_upper(kline.close,20,2,2)-ts.bbands_lower(kline.close,20,2,2)'
 ```
 
-The [API table](../api/factor.md#technical-indicators) lists 22 new functions across 18 indicator families. They support batch and incremental execution. Periods count complete valid input tuples; missing or NULL fields preserve their validity and pause indicator state. `ts.roc` uses percentage units; `ts.return` uses fractional units. Reuse one Session across historical chunks, and use explicit asof bindings for mixed source timeframes. The [indicator guide](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md) gives lookback, retention and edge-case rules.
+Technical, order-flow and volatility-estimator functions (see the operator reference above) support batch and incremental execution. Periods count complete valid input tuples; missing or NULL fields preserve their validity and pause indicator state. `ts.roc` uses percentage units; `ts.return` uses fractional units. Reuse one Session across historical chunks, and use explicit asof bindings for mixed source timeframes. The [indicator guide](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md) gives lookback, retention and edge-case rules.
 
 ## Robust expressions and research extensions
 
@@ -274,8 +386,8 @@ The default executable-return label spans one decision interval. research.labels
 ```yaml
 research:
   labels:
-    - {Name: 2h, Kind: executable-return, Horizon: 7200000, PeriodsPerYear: 4383}
-    - {Name: 16h, Kind: executable-return, Horizon: 57600000, PeriodsPerYear: 547.875}
+    - {name: 2h, kind: executable-return, horizon: 7200000, periods_per_year: 4383}
+    - {name: 16h, kind: executable-return, horizon: 57600000, periods_per_year: 547.875}
 ```
 
 Only mature labels enter IC/diagnostics. Future returns cannot enter current inference. Omitting historical ComboSpec.Label selects the shortest horizon, breaking ties by name, and records this choice in the manifest. Single-label implicit identity remains compatible. Result.Unresolved counts labels beyond available data. Fixed/equal trading may disable labels with research: {labels: []}; research and every history method require labels.
@@ -320,11 +432,9 @@ Required live funding records contain exact decimal strings `mark`, `rate`, `acc
 
 Factor-engine runs stream panels, decisions, matured diagnostics and final scalar summaries as JSON lines. Ordinary backtests also write resolved.json with defaults/origins, account-&lt;account&gt;/manifest.json and versioned event/posting Gob chunks. Completion follows output sync/close and resource cleanup; primary and cleanup errors remain visible.
 
-### Statistical arbitrage and long and short attribution
+### Long/short attribution and large-pool output
 
-Check the completion status in `run.json` before reading `Results[]`. The same result appears in `run-completed` events, using capitalized Go field names. `Result.Pairs` is collected only by historical `RegisterPairs` runs and includes each pair's PnL, Trades, WinRate, holding duration, Turnover and Episodes. Episodes are capped; `EpisodeCount` retains the full count. Exit reasons include `exit`, `stop`, `maxhold`, `leg_missing` and `end`. `Unavailable`/`UnavailableLeg` identify pairs skipped for the whole run. `AllPairsUnavailable` means no pair could run; a flat NAV is not evidence of strategy performance.
-
-Pair `PnL` is a return fraction based on decision prices and each pair's own target weights, without allocated costs. It is not fill PnL. `PairsGrossPnL` sums pair returns, `PairsNAVReturn` is the book return, and `PairsResidual = PairsNAVReturn - PairsGrossPnL` includes costs and approximations from delay, weight drift and netting shared symbols.
+Per-pair results, reconciliation fields and `Result.Pairs` for statistical arbitrage are described in [Statistical Arbitrage & Carry](./statarb.md#reading-the-results).
 
 `Result.Attribution` is available only with the weights book: long/short price PnL, average exposure, fees, slippage, funding, PIT costs and up to 20 `TopSymbols`. Events/live do not output it, and it is not a per-batch fill report. The weights `funding_apr` approximation charges account net-long notional; net shorts neither pay nor receive funding. Funding is account-level `Funding`, excluded from `TopSymbols[].Net`.
 

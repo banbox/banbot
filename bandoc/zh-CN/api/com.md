@@ -6,6 +6,8 @@ com 提供 Runtime-owned 市场状态和 scheduler；兼容包级价格/cron 函
 
 MarketState 组合 PriceState 和 PairCopiedState。价格缓存、bar 价格与历史复制进度跟随所属任务，支持构造时绑定 symbol parser。默认分隔符解析只处理通用格式；交易所特殊 symbol 语义由 banexg capability 绑定，不在 banbot 按交易所名添加分支。
 
+构造入口：`NewMarketState(exgName)` / `NewMarketStateWithExchange(exgName, exchange)`，`NewPriceState(exgName)` / `NewPriceStateWithStrategy` / `NewPriceStateWithErrorStrategy` / `NewPriceStateWithExchange`，以及 `NewPairCopiedState()`。
+
 独立 Runtime 使用自己的 Market.Prices；兼容价格 facade 保留历史调用，不能用于从另一个任务获取实时业务状态。
 
 ## 价格读取接口
@@ -19,6 +21,9 @@ MarketState 组合 PriceState 和 PairCopiedState。价格缓存、bar 价格与
 | `prices.GetLastBarTimeAt(symbol)` | `int64` |
 | `prices.SetPriceAt(nowMS, symbol, ask, bid)` | — |
 | `prices.SetBarPriceAt(nowMS, symbol, price)` | — |
+| `prices.SetPricesAt(nowMS, map[symbol]price, side)` | — |
+| `prices.IsPriceEmpty()` | `bool` |
+| `prices.Reset()` | — |
 | `prices.RefreshLatestPriceAt(nowMS, rt.Exchange, symbol)` | `*errs.Error` |
 
 side 使用 buy/sell；价格过期或不存在可能返回 0，使用前应检查。真实最新价刷新访问网络，不能代替回测价格。策略 K 线回调可直接读当前 s.Env 或 DataEvent。
@@ -27,7 +32,7 @@ side 使用 buy/sell；价格过期或不存在可能返回 0，使用前应检�
 
 Scheduler 接口为 AddFunc(spec, callback)、Start() 和 Stop() context.Context。NewSchedulerWithConfig(location, lang) 在构造时固定时区/NTP 配置，不读写进程级设置。
 
-NewScheduler() 与 Cron() 保留旧调用形式；显式任务通过 Runtime.Cron 使用实例 scheduler。owned scheduler 由唯一 owner 停止并等待；borrowed scheduler 由外部 owner 关闭，某 Runtime 的关闭不能停掉其他任务。
+NewScheduler() 与 Cron() 保留旧调用形式；显式任务通过 Runtime.Cron（或 `Runtime.Scheduler()`）使用实例 scheduler。owned scheduler 由唯一 owner 停止并等待；borrowed scheduler 由外部 owner 关闭，某 Runtime 的关闭不能停掉其他任务。
 
 见[runtime](runtime.md)与[实时交易](../guide/live_trading.md)。
 

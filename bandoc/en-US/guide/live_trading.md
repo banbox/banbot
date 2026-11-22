@@ -64,6 +64,8 @@ export BanDataDir=/ban/data
 
 Edit market, database and strategy settings in `config.local.yml`. Defaults load `config.yml` followed by `config.local.yml`, with the latter taking precedence. Repeat `--config` for additional overlays. Keep account credentials in robot configuration; Hub configuration supplies public-market/database settings and the sender lease.
 
+The exchange network proxy comes from `exchange.<name>.proxy`: `no` disables the proxy; when empty, the environment/system proxy is detected once at startup and the result is shared by all exchanges, so a system proxy change after detection needs a restart. See [Network Proxy](./configuration.md#network-proxy).
+
 For live simulation select `env: dry_run` and `execution.funding_policy: explicit-zero`. For production select `env: prod`, real credentials and `required-stream`. Both require instrument units, capital and risk declarations. Time-series-only entries additionally require `execution.store` and `sender_lease_dir`. Legacy `fatal_stop` and dynamic `leverage` (including account-level settings) have not migrated to shared live execution and are rejected. Do not simply switch an old configuration to prod. See [Configuration](./configuration.md) and [Shared account setup](./execution.md#configure-and-start).
 
 Several strategies/robots can share one physical account through one Hub while retaining strategy budgets and attribution. Do not run independent senders for that account. Use separate subaccounts for independent capital boundaries. Keep strategy IDs stable and distinct across robots, and check attribution and budgets after startup.
@@ -83,6 +85,17 @@ nohup /ban/bot trade --datadir /ban/data --config /ban/live.yml > /ban/data/trad
 Do not start hub and spider on the same socket. Address errors from a missing Hub, incomplete capabilities, conflicting declarations or failed reconciliation; startup does not fall back to local sending or paper. `trade --dry-run` requires a factor policy and runs historical events replay. Use `env: dry_run` without that flag for live simulation.
 
 Stopping one robot does not automatically close positions. Hub continues existing pending orders and protection. After Hub restart, accounts await robot reauthentication and local protection is inactive until authentication. Preserve the execution directory and journals, and follow [Recovery](./execution.md#restart-and-recovery). A running process alone does not prove account recovery.
+
+## Order types in live trading
+
+Stop-Limit entries, OCO groups, multi-level take-profit and trailing stops work in both backtest and live trading (including live simulation). See [custom strategies](./strat_custom.md) for the fields and the [backtesting guide](./backtest.md#matching-semantics) for backtest matching. Live caveats:
+
+- Stop-loss, take-profit and trailing stop are attached only after the order is **fully entered**, not during partial fills.
+- With `ExgStopLoss` / `ExgTakeProfit` set to `false`, no exchange conditional order is placed and a local price monitor triggers instead; there is no protection while the program is stopped or quotes are unavailable.
+- A trailing stop prefers the exchange's native trailing order; if the callback percent exceeds the exchange limit or the order is rejected, it degrades to local price monitoring instead of failing the order.
+- When one pending entry in an OCO group fills, the unfilled siblings are cancelled with exit tag `oco_cancel`.
+- Multi-level take-profit places the next level only after the previous one fills; `MoveSLToBreakeven` moves the remaining stop-loss once that level fills.
+- The backtest-only `data_gap` / `delist` exit tags and the `bt_*` cost keys do not apply to live trading.
 
 ## 4. Notifications, DashBoard, and Monitoring
 ### Notifications and remote control

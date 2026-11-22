@@ -52,6 +52,7 @@ limit_vol_secs: 5  # The expiration time for the order book price based on tradi
 put_limit_secs: 120  # Expected fill horizon for submitting limit orders, seconds; runtime default is 180
 account_pull_secs: 60  # The interval in seconds for regularly updating account balance and positions, default is 60 seconds.
 market_type: spot  # Market type: spot for spot trading, linear for USDT-margined contracts, inverse for coin-margined contracts, option for options contracts
+extra_markets: [spot]  # Additional market types admitted on the same exchange: spot/linear/inverse/margin/option; entries equal to market_type are ignored; off by default
 contract_type: swap  # swap for perpetual contracts, future for expiring contracts
 odbook_ttl: 1000  # Order book expiration time, in milliseconds, default is 500
 concur_num: 2  # Concurrent number of symbol candle downloads, default is 2 symbols
@@ -72,6 +73,11 @@ low_cost_action: ignore # Action when stake amount < the minimum amount: ignore/
 max_simul_open: 0 # Maximum number of simultaneously open orders on one candlestick
 bt_net_cost: 15  # Order delay in backtest, can be used to simulate slippage, in seconds, default is 15
 bt_strict: false  # Strict historical checks; ordinary backtests also use stable ordering
+bt_slippage_bps: 0  # One-sided adverse slippage (bp) on market/stop fills, default 0 (off)
+bt_funding_apr: 0  # Approximate funding for linear contracts, percent per year, symmetric for longs and shorts, default 0 (off)
+bt_gap_bars: 0  # Data-gap guard: if more than N bars are missing between two bars of a symbol, its open orders are force-closed at the last known price; default 0 (off)
+bt_gap_min_hours: 48  # The gap must also exceed this many hours, default 48
+bt_delist_penalty_bps: 0  # Extra adverse bp on a delist exit, on top of slippage, default 0 (off)
 relay_sim_unfinish: false  # When trading a new symbol (backtesting/live trading), whether to trading from the open order relay at the beginning time
 order_bar_max: 500  # Find the maximum number of bars for forward simulation from the open orders at the start time.
 ntp_lang_code: none  # NTP (Network Time Protocol) real-time synchronization. The default is `none`(disabled). Supported codes: zh-CN, zh-HK, zh-TW, ja-JP, ko-KR, zh-SG, and global (indicating global NTP servers such as Google, Apple, Facebook, etc.).
@@ -113,8 +119,8 @@ strat_perf:
   min_od_num: 5  # Minimum of 5 orders, default is 5; performance will not be calculated if fewer than 5
   max_od_num: 30  # Maximum number of orders in a job, minimum is 8, default is 30
   min_job_num: 10  # Minimum number of symbols, default is 10, minimum is 7
-  mid_weight: 0.2  # Weight for orders in the middle performance range
-  bad_weight: 0.1  # Weight for orders in the poor performance range
+  mid_weight: 0.2  # Weight for orders in the middle performance range, default 0.3
+  bad_weight: 0.1  # Weight for orders in the poor performance range, default 0.15
 pairs: [SOL, UNFI, SFP] # Given trading pairs, if not empty, pairlists will be ignored
 pairmgr:
   cron: '25 1 0 */2 * *' # Second Minute Hour Day Month Weekday
@@ -195,7 +201,7 @@ accounts:
 exchange:  # Exchange configuration
   name: binance  # The exchange being used
   binance:  # Parameters for initializing the exchange via banexg, keys will be automatically converted from snake_case to CamelCase.
-    # proxy: http://127.0.0.1:10808
+    # proxy: http://127.0.0.1:10808  # Proxy URL; no disables the proxy; auto-detected when unset, see Network Proxy below
     fees:
       linear:  # linear/inverse/main(spot or margin)
         taker: 0.0005
@@ -205,6 +211,7 @@ database:  # Database configuration, supports QuestDB and TimescaleDB
   max_pool_size: 50
   auto_create: true  # Whether to initialize/upgrade the banbot schema after connecting
   db_type: questdb  # questdb or timescale
+  # sid_registry_url: postgresql://...  # QuestDB multi-writer only: PostgreSQL registry used to allocate SIDs
   url: postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable
   qdb_mem_pct: 0.3 # QuestDB only: memory usage ratio, range 0~1
   qdb_max_mem_mb: 16384 # QuestDB only: maximum database memory usage, in MB
@@ -259,12 +266,26 @@ api_server:  # For external control of the bot or access to dashboard via API
   bind_ip: 0.0.0.0
   port: 8001
   jwt_secret_key: fn234njkcu89234nbf
+  verbosity: ""  # Detail level
+  CORS_origins: []  # When accessed through banweb, add banweb's origin here
   users:
     - user: ban
       pwd: "123"
       allow_ips: []
+      exp_hours: 168  # Token expiry in hours, default 168
       acc_roles:
         user1: admin  # The key here corresponds to "accounts", and the value can be admin/guest.
+llm_models:  # LLM model configs keyed by model name; called explicitly by strategy projects or tools, see advanced/ai
+  base:
+    api_type: openai  # API type
+    api_key: ${LLM_API_KEY}
+    base_url: https://api.example.com/v1
+    timeout: 60  # Per-call timeout, in seconds
+    concurrency: 10  # Concurrency limit, default 10
+  fast:
+    extend: base  # Inherit other model configs; a string or a list
+    name: model-name  # Upstream model name
+    temperature: 0.2
 
 ```
 
@@ -334,9 +355,13 @@ Legacy time-series simulation defaults must not be generalized to all engines. E
 #### Relay Unfinished Order
 For strategies with long holding periods in large cycles, where an order may hold for one or two months, you may already have some positions according to the trading signals when you start the robot. To fully follow the signals, you should enter the positions immediately and hold the corresponding positions instead of waiting for the next signal to be issued.
 
-When `relay_sim_unfinish` is set to `true`, it will automatically backtest the previous 500 K-lines when starting to trade a product, obtain the unliquidated orders, and then enter the positions immediately according to these orders.
+When `relay_sim_unfinish` is set to `true`, it will automatically backtest up to the previous `order_bar_max` K-lines (default 500, overridable by `run_policy[].order_bar_max`) when starting to trade a product, obtain the unliquidated orders, and then enter the positions immediately according to these orders.
 
 This configuration item is effective in both backtesting and live trading.
+
+## LLM Model Configuration
+
+Root `llm_models` is a map keyed by model name. Each entry supports `name`, `extend` (a string or list inheriting other model configs), `api_type`, `api_key`, `base_url`, `timeout` (seconds), `timeout_rate`, `temperature`, `concurrency` (default 10), `prompt_price`, `completion_price`, `cache_price` and `payload` (extra request fields). Adding the configuration does not make ordinary backtests or live trading call an LLM; see [AI and external models](../advanced/ai.md).
 
 ## Email Notification Configuration
 
@@ -398,14 +423,21 @@ Configuration keeps the v0.5 root keys and run_policy list without requiring con
 
 | Path | Fields |
 | --- | --- |
-| data | namespace, page_rows, prefetch_rows, page_bytes, archive, max_records, pit_policy |
-| execution / accounts.&lt;name&gt; | mode, store, history, sender_lease_dir, live_provider, funding_policy, instruments, margin_rate, max_account_margin, max_virtual_gross, strategy_gross_limit |
-| run_policy[] | archive/chunks, snapshot, definition or expressions, combo, portfolio, decision, research, manifest, prices, funding_source, initial_nav, max_records |
-| run_policy[].decision | interval_ms, delay_ms, latency_ms, expiry_ms, max_pending |
+| data | namespace, page_rows, prefetch_rows, prefetch_concurrency, page_bytes, archive, max_records, pit_policy |
+| execution / accounts.&lt;name&gt; | mode, store, history, sender_lease_dir, hub_socket, live_provider, funding_policy, protection_mode, order_mode, near_limit_bps, paper_fill_model, instruments, margin_rate, max_account_margin, max_virtual_gross, strategy_gross_limit |
+| run_policy[] | archive/chunks, snapshot, definition or expressions, combo, portfolio, decision, research, manifest, prices, funding_source, initial_nav, max_records, option_expiry_source, terminal_settlement_source, pit_min_universe_ratio, pit_delist_penalty_bps, universe, rolling_universe |
+| run_policy[].decision | interval_ms, delay_ms, latency_ms, expiry_ms, max_pending, source_event_decisions, source, timeframe |
 | run_policy[].snapshot | universe, sid_map, schemas, source_versions, adjustment_version, visibility_policy, grid_time, decision_time, replay_time |
 | run_policy[].expressions | schema_version, timeframe, bindings, params, lets, outputs, combine |
-| run_policy[].combo / run_policy[].expressions.combine | method: equal/fixed/history-ic, columns, weights |
-| run_policy[].portfolio | builder, k, long_notional, short_notional, mode: full/patch |
+| run_policy[].expressions.bindings.&lt;name&gt; | source, timeframe, sampling, max_age_ms |
+| run_policy[].combo / run_policy[].expressions.combine | method: equal/fixed/history-ic/history-rank-ic/history-icir/history-rank-icir/history-ewma, columns, weights, min_samples, min_pairs, min_confidence, decay, direction, fallback, label |
+| run_policy[].portfolio | builder, k, long_notional, short_notional, long_min_score, short_max_score, unfilled_slot_policy (cash/rescale), asset_cap, drift_threshold, mode (full/patch), policy, policy_params, rebalance, selection, holding, transition, allocation, universe, rolling_universe |
+| run_policy[].portfolio.rebalance | every_bars, anchor, phase, duration, calendar, calendar_version, timezone, drift_threshold |
+| run_policy[].portfolio.selection | long_k, short_k, long_quantile, short_quantile, long_min_score, short_max_score, unfilled_slot_policy, retain_rank, dropout, group_quota, missing_scores |
+| run_policy[].portfolio.holding | min_bars, max_bars, min_duration, max_duration, stop_loss_pct, trailing_stop_pct, by_asset, adopt, cooldown_bars |
+| run_policy[].portfolio.transition | mode: direct/linear-exit/cohort/geometric/target-step, exit_steps, basis, period_bars, startup, sizing, on_reselect, ratio, final_threshold, alpha, entry_window_bars, by_asset |
+| run_policy[].portfolio.allocation | method: equal/score/fixed-notional/inverse-volatility/vol-target/erc/risk-parity/hrp/min-variance/mean-variance, volatility_column, beta_column, risk_window, shrinkage, risk_aversion, reserve_ratio, fixed_notional, vol_target, asset_cap, group_caps, turnover_limit, drift_threshold, net_cap, beta_cap |
+| run_policy[].universe / rolling_universe (also under portfolio) | mode: rolling_liquid_top/liquid_top/static, top_n, lookback_days, lookback_bars, min_listing_days, min_age_bars, reconstitute_days, reconstitute_bars, schedule: daily/weekly/monthly, always_include |
 | run_policy[].research | labels, label_wait_ms, panel (all/none) |
 | run_policy[].prices | source, timeframe, field |
 
@@ -432,6 +464,27 @@ This is an account overlay fragment; retain credentials. `history` is cold histo
 Use one spelling per field in each configuration file: declaring both `run_policy[].factor.archive` and `run_policy[].archive`, or the same account execution field in both root `accounts` and legacy `execution.accounts`, is a conflict. Across files, later layers still override earlier ones after aliases are normalized. Relative paths follow the file that supplied the final field. Canonical exports omit `config_version` and legacy wrappers.
 
 Existing v0.5 `timeframes` and `run_timeframes` keep their names. The v0.6-only `frequency` field uses `timeframe`; it has no alias. Legacy policies without explicit engine retain `More`, including names such as `id`, `account`, `archive` and `factor`. If a custom legacy parameter already uses `engine: factor` or `engine: time_series`, review that collision before upgrading.
+
+## Network Proxy
+
+The exchange proxy is read from `exchange.<name>.proxy`:
+- A non-empty URL: that address is used.
+- `no`: no proxy is used.
+- Unset: the environment proxy is tried first, then the system proxy (on macOS via `scutil --proxy`); if none is found, no proxy is used. Auto-detection is resolved once per process.
+
+## Backtest Cost and Matching Fields
+
+| Key | Description |
+| --- | --- |
+| `bt_net_cost` | Order delay in backtests, in seconds, default 15; not a substitute for slippage |
+| `bt_slippage_bps` | One-sided adverse slippage on market/stop fills, in bp, default 0 (off) |
+| `bt_funding_apr` | Approximate funding for linear contracts, percent per year; when positive, longs pay and shorts receive; inverse contracts are skipped; default 0 (off). Not a substitute for real exchange settlement |
+| `bt_legacy_approx_funding` | When `true`, `bt_funding_apr` charges longs only (shorts neither pay nor receive) |
+| `bt_gap_bars` / `bt_gap_min_hours` | Data-gap guard: when more than `bt_gap_bars` bars and more than `bt_gap_min_hours` hours (default 48) are missing between two bars of a symbol, its open orders are force-closed at the last known price; `bt_gap_bars` 0 disables it |
+| `bt_delist_penalty_bps` | Extra adverse bp on a delist exit, on top of `bt_slippage_bps`, default 0 (off) |
+| `bt_fresh_equity` | On by default: the equity curve, daily equity, drawdown and the bankruptcy check use the current profit of open orders; only an explicit `false` uses the wallet's cached unrealized PnL (for comparison with old results) |
+| `bt_legacy_intrabar` / `bt_legacy_order_metrics` / `bt_legacy_wallet_price` | When `true`, restore the corresponding old backtest behaviour; for comparison with old results only |
+| `bt_bar_order_seed` | Salt of the deterministic ordering of symbols due on the same bar, default 0 |
 
 ## Historical replay fields
 

@@ -75,7 +75,7 @@ run_policy:
 
 ## Technical indicators
 
-All 22 scalar operators below support `Plan.Batch`, incremental `Session` and `factor/expr`. Inputs are ordinary field/expression nodes; custom columns continue through `DataSeries.Values`. The input names h/l/c/v below mean explicit high/low/close/volume nodes.
+Technical, order-flow and volatility-estimator functions have matching Go constructors and DSL names (for example `ATR` and `ts.atr`) and all support `Plan.Batch` and incremental `Session`. Beyond the table below the set covers adaptive averages (DEMA/TEMA/HMA/KAMA/ALMA/TRIMA/ER/Kalman1D/Hurst), trend and channel indicators (ADX/DMI/Aroon/Vortex/Donchian/Keltner/Supertrend/SAR/STC/Ichimoku/CHOP/NATR), volume and order flow (CMF/ADL/ADOSC/VolumeDelta/CVD/RollingCVD/TakerBuyRatio) and OHLC volatility (ParkinsonVol/GarmanKlassVol/YangZhangVol). Operator names and arguments are in the [operator reference](../guide/factor.md#expression-operator-reference); formulas, lookbacks and missing-data rules are in the [indicator guide](https://github.com/banbox/banbot/blob/main/doc/factor_indicators.md). Other pointwise and cross-sectional constructors include `Where`, `Clip`, `Sign`, `Gt/Ge/Lt/Le`, `TsSum/TsRank/TsSkew/TsKurt/TsSlope/TsRSquare/TsCorr/TsCov/TsBeta`, `PctRank`, `CsMean/CsSum`, `SectorDemean/SectorZScore`, `QuantileGroupDemean/ZScore/Rank/PctRank`, and the cross-timeframe and benchmark readers `AsOfNode`, `SubTF`, `RefAssetField`, `AsOfRefAssetField` and `AsOfField`. The table lists the base set; inputs are ordinary field/expression nodes and custom columns continue through `DataSeries.Values`. Inputs are ordinary field/expression nodes; custom columns continue through `DataSeries.Values`. The input names h/l/c/v below mean explicit high/low/close/volume nodes.
 
 | Go constructor | DSL functions | Meaning |
 | --- | --- | --- |
@@ -105,11 +105,21 @@ Lookback is n-1 for rolling averages/extremes/bands, CCI, Stoch, WillR and MFI; 
 
 ## Simple registration and statistical arbitrage
 
-`runner.RegisterFactor(name string, build func(runner.FactorContext) (runner.FactorSpec, error)) error` registers a simple cross-sectional factor. `FactorContext.Close()` supplies a price node and `Params` reads parameters. Check both the registration error and `Params.Err()` in the builder. `FactorSpec.Outputs` contains named nodes; omitted Combine uses equal weights.
+`runner.RegisterFactor(name string, build func(runner.FactorContext) (runner.FactorSpec, error)) error` registers a simple cross-sectional factor. `FactorContext` provides node constructors such as `Open/High/Low/Close/Volume/Quote/BuyVolume`, `Field`, `SourceField`, `RefField`, `RefSourceField`, `SubTF` and `SectorCode` (described in the [guide](../guide/factor.md#cross-section-factor-in-one-call)), and `Params` reads parameters. Check both the registration error and `Params.Err()` in the builder. `FactorSpec.Outputs` contains named nodes; omitted Combine uses equal weights.
 
-`runner.RegisterPairs(name string, build func(*runner.Params) (runner.PairsSpec, error)) error` registers rolling log-regression pairs and creates private builder/statistics state for each run. `PairsSpec` contains `Pairs []runner.Pair` (canonical Y/X symbols), Field (default close), Window (at least 3), Band and Gross (default 1/pair count, total budget at most 1). Entry β stays fixed while holding. After a Band Stop/MaxHold exit, re-entry waits until the Exit band is reached.
+Statistical arbitrage registrations (see [Statistical Arbitrage & Carry](../guide/statarb.md)):
 
-`statistics.NewRollingSpread(window)` exposes `Observe(x, y float64) (statistics.SpreadPoint, bool)` for two log prices. `statistics.NewBandTrader(config)` exposes `Step(z float64) int` returning -1/0/+1. Use separate instances per spread. These compute statistics/direction; they do not place orders or prove cointegration, synchronized fills or profitability. See the [pairs example](../guide/factor.md#statistical-arbitrage-declare-the-pairs).
+| Function | Description |
+| --- | --- |
+| `RegisterPairs(name string, build func(*runner.Params) (runner.PairsSpec, error)) error` | Fixed pairs; private builder and statistics state per run |
+| `RegisterRollingPairs(name string, build func(*runner.Params) (runner.RollingPairsSpec, error)) error` | Pairs re-selected with a formation plus trading period |
+| `RegisterBaskets(name string, spec runner.BasketsSpec) error` / `RegisterBasketsParams(name string, build func(*runner.Params) (runner.BasketsSpec, error)) error` | 2 to 12-leg cointegration baskets |
+| `RegisterResidualStatArb(name string, spec runner.ResidualStatArbSpec) error` / `RegisterResidualStatArbParams(...)` | PCA / benchmark residual s-score |
+| `BuildBasketsRegistration`, `BuildBasketsParamsRegistration`, `BuildResidualStatArbRegistration`, `BuildResidualStatArbParamsRegistration` | Return a `runner.Registration` so you can construct and test without the global registry |
+
+`Params` offers `Float`, `Int`, `Bool`, `Err` and `Unused`, and no string reader. `runner.Pair{Y, X}` uses the canonical symbols of the run.
+
+`statistics.NewRollingSpread(window int) (*RollingSpread, error)` exposes `Observe(x, y float64) (statistics.SpreadPoint, bool)` for two log prices. `statistics.NewBandTrader(cfg BandConfig) (*BandTrader, error)` exposes `Step(z float64) int` returning -1/0/+1. Use separate instances per spread. They do not depend on any engine, compute only statistics and direction, place no orders, and do not prove cointegration, synchronized fills or profitability.
 
 `RegisterPortfolioFactory(name, factory, validator)` supports mutable custom portfolio state. The validator only checks configuration and must not borrow accounts or start work. `PreparePortfolioConfig` creates a single-run instance after preflight; do not reuse it in another backtest. A missing leg requests pair closure and pauses it. Pairs explicitly marked unavailable for the entire window are skipped without reallocating their budgets.
 
@@ -195,10 +205,10 @@ Manifest records code, plan, Universe, visibility, input references, labels and 
 
 ## Result fields and report boundaries
 
-`runner.Result` uses Go field names in `run.json` `Results[]` and `run-completed`. `Pairs` is collected at the end of `RegisterPairs` replay only. `PairResult` contains Y/X, Episodes, EpisodeCount, PnL, Trades, Wins, WinRate, InMarketBars, Bars, PausedBars, AvgHoldBars, LastBeta, Turnover, Unavailable and UnavailableLeg. Episodes share a 400-record budget with at least 10 per pair, retaining earliest records; they may omit later history. `PairEpisode` contains StartMS, EndMS, Dir, EntryZ, ExitZ, Beta, Bars, Reason and PnL; Reason is exit/stop/maxhold/leg_missing/end.
+`runner.Result` uses Go field names in `run.json` `Results[]` and `run-completed`. `Pairs` is collected at the end of pairs, rolling-pairs and basket replays only. `PairResult` contains Y/X, Episodes, EpisodeCount, PnL, Trades, Wins, WinRate, InMarketBars, Bars, PausedBars, AvgHoldBars, LastBeta, Turnover, Unavailable and UnavailableLeg. Episodes share a 400-record budget with at least 10 per pair, retaining earliest records; they may omit later history. `PairEpisode` contains StartMS, EndMS, Dir, EntryZ, ExitZ, Beta, Bars, Reason and PnL; Reason is exit/stop/maxhold/leg_missing/end.
 
-Pair PnL uses each pair's decision weights and prices as a fraction of initial NAV, without allocated costs. `PairsGrossPnL` sums it. `PairsResidual = PairsNAVReturn - PairsGrossPnL` also includes delayed prices, weight drift and netting shared symbols. `AllPairsUnavailable` identifies a run with no tradable pairs; its flat zero-trade NAV is not valid strategy evidence.
+Pair PnL uses each pair's decision weights and prices as a fraction of initial NAV, without allocated costs. `PairsGrossPnL` sums it. `PairsResidual = PairsNAVReturn - PairsGrossPnL` also includes delayed prices, weight drift and netting shared symbols. `PausedPeriods` counts rounds in which all pairs were paused and `IncompleteStreams` lists streams with incomplete input. `AllPairsUnavailable` identifies a run with no tradable pairs; its flat zero-trade NAV is not valid strategy evidence.
 
 `Attribution` is generated only by the weights book, not events/live. Price changes produce LongPnL/ShortPnL; costs include Fees, Slippage, Funding and PITCost, with `FinalNAV - InitialNAV = LongPnL + ShortPnL - Fees - Slippage - Funding - PITCost + Residual`. Up to 20 TopSymbols are sorted by absolute Net. Net excludes account-level funding, so all symbol Net values sum to NAV change plus Funding. Pairs/Attribution can be absent when a run returns early with an error.
 
-Setting `panel: none` under the policy's `research` only suppresses panel output, preserving events, in-memory summaries and book values; the default is all. See [Results](../guide/factor.md#statistical-arbitrage-and-long-and-short-attribution) for examples and interpretation.
+Setting `panel: none` under the policy's `research` only suppresses panel output, preserving events, in-memory summaries and book values; the default is all. See [Results](../guide/statarb.md#reading-the-results) for examples and interpretation.

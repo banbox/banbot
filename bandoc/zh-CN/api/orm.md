@@ -181,7 +181,7 @@ _ = events
 
 独立 SeriesStore 写完整记录。`NewKLineSeriesInfo` / `NewKLineSeriesStoreWithStorage(info, storage)` 定义并写既有 K 线的扩展列，`Write(ctx,target,rows)` 更新已有 `(sid,time)` 行；缺少目标 K 线时失败。不要把扩展标签 Name 当成独立 source，策略订阅仍使用 `Source: "kline"`。
 
-`GetSeries/AutoFetchSeries` 返回 `[]*DataSeries`；显式 Queries 提供 `GetSeriesFields`、`QuerySeriesFields` 和批量字段投影接口。未指定字段时读取默认 K 线字段；指定时按投影读取，后续 feeder/回调保留 Values。下文 GetOHLCV/AutoFetchOHLCV 是默认 K 线兼容视图，不应通过这些固定字段 API 传递任意自定义列。
+`GetSeries/AutoFetchSeries` 返回 `([]*AdjInfo, []*DataSeries, *errs.Error)`，前者为复权信息，后者为未复权的原始价格序列；显式 Queries 提供 `GetSeriesFields`、`QuerySeriesFields` 和批量字段投影接口。未指定字段时读取默认 K 线字段；指定时按投影读取，后续 feeder/回调保留 Values。下文 GetOHLCV/AutoFetchOHLCV 是默认 K 线兼容视图，不应通过这些固定字段 API 传递任意自定义列。
 
 常用字段读取签名如下（`q` 为所属 Storage 的 Queries，并通过 `WithKlineRuntimeOptions` 绑定任务选项；`limit=0` 不限制行数，应自行按窗口分页）：
 
@@ -193,6 +193,31 @@ func (q *Queries) GetSeriesFields(exs *ExSymbol, timeframe string, fields []stri
 ```
 
 传入所需字段列表以读取扩展列。DataSeries 查询返回原始价格并附带 Adj；不会自动应用复权。需要完整自定义字段时，不要转换为 `banexg.Kline` 再转回。
+
+### 内置序列定义与常量
+
+内置数据源的 source 名称、默认周期和字段均有导出常量与构造函数，可用于订阅和直接读写：
+
+| 名称 | 说明 |
+| --- | --- |
+| `SeriesSourceKline`、`SeriesSourceMarkKline`、`SeriesSourceIndexKline`、`SeriesSourcePremiumKline`、`SeriesSourceFundingRate`、`SeriesSourceOpenInterest` | source 名称：`kline`、`mark_kline`、`index_kline`、`premium_kline`、`funding_rate`、`open_interest` |
+| `DefaultPriceKlineTF`、`DefaultFundingRateTF`、`DefaultOpenInterestTF` | 默认周期 `1m`、`8h`、`5m` |
+| `FieldOpenInterest`、`FieldOpenInterestValue`、`FieldTopLSPosRatio`、`FieldTopLSAccRatio`、`FieldGlobalLSRatio`、`FieldTakerLSVolRatio` | `open_interest` 字段名 `oi`、`oi_value`、`top_ls_pos_ratio`、`top_ls_acc_ratio`、`global_ls_ratio`、`taker_ls_vol_ratio` |
+
+```go
+NewSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
+NewKLineSeriesInfo(name, timeFrame string, fields []SeriesField) *SeriesInfo
+NewFundingRateSeriesInfo(timeFrame string) *SeriesInfo
+NewOpenInterestSeriesInfo(timeFrame string) *SeriesInfo
+NewPriceKlineSeriesInfo(source, timeFrame string) *SeriesInfo
+NewMarkKlineSeriesInfo(timeFrame string) *SeriesInfo
+NewIndexKlineSeriesInfo(timeFrame string) *SeriesInfo
+NewPremiumKlineSeriesInfo(timeFrame string) *SeriesInfo
+```
+
+`New*SeriesInfo` 传空周期时使用该源的默认周期。周期与字段辅助函数：`OpenInterestTimeFrames()`、`IsOpenInterestTimeFrame(tf)`、`PriceKlineTimeFrames()`、`IsPriceKlineTimeFrame(tf)`、`IsPriceKlineSource(source)`，以及返回默认字段名的 `DefaultFundingRateFields()`、`DefaultOpenInterestFields()`、`DefaultPriceKlineFields()` 和返回字段定义的 `OpenInterestSeriesFields()`、`PriceKlineSeriesFields()`。
+
+`RegisterFieldAggRule(field, rule string) bool` 为字段注册默认聚合规则名（`ExSymbol.AggRules` 未覆盖时生效）；`RegisterAggRule(name string, fn AggRuleFunc) bool` 注册自定义规则。规则不存在或参数为空时返回 false。
 
 ### 聚合与复权
 
@@ -261,9 +286,10 @@ INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须�
 - `src string` - 数据源名称
 - `path string` - 数据库文件路径
 - `write bool` - 是否可写
+- `timeoutMs int64` - 连接持有超时（毫秒），超时仍未 `Close()` 时记录错误日志；0 表示不监控
 
 返回：
-- `*sql.DB` - 数据库连接对象
+- `*TrackedDB` - 内嵌 `*sql.DB` 的带跟踪连接句柄，使用完毕应调用 `Close()`（不会关闭底层共享连接池）
 - `*errs.Error` - 错误信息
 
 ### NewDbErr
@@ -578,7 +604,7 @@ INSERT/CTAS 完成后数据仍可能不可读。依赖新数据的流程必须�
 ## 数据导入导出
 
 ### ExportKData
-导出固定 K 线字段和配套元数据到 protobuf；不导出任意扩展列或独立时序表。
+导出物理 K 线表的全部列（含 `KLineSeriesStore` 写入的扩展列）及其类型、NULL、时间间隙和品种 `Combined`/`AggRules` 到 protobuf；独立时序表不在范围内。旧版固定字段归档仍可导入。
 
 参数：
 - `configFile string` - 配置文件路径

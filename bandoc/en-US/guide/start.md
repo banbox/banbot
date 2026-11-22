@@ -33,15 +33,22 @@ We strongly recommend that you have basic golang programming knowledge and under
 * Indicator library: Built-in [banta](https://github.com/banbox/banta) high-performance indicator library, you can quickly develop custom indicators based on it
 * Arbitrary time-series data: preserve K-line extension columns, external series, types and NULL values; see [Custom data](./custom_data.md)
 * Two engines: time-series callbacks, cross-sectional portfolios, statistical pairs and mixed events replay; see [Factor guide](./factor.md)
+* Time-series strategies: per-symbol callbacks over main/auxiliary timeframes; see [Custom strategy](./strat_custom.md)
+* Factor and cross-sectional: multi-factor ranking, portfolios and research; see [Multi-factor strategies](./factor.md)
+* Statistical arbitrage and carry: pairs/spread strategies, including same-exchange spot-perpetual carry; see [Statistical arbitrage](./statarb.md)
+* Built-in derivatives data: `funding_rate`, `open_interest` (with long/short ratios) and mark/index/premium klines; see [Custom data](./custom_data.md)
+* Advanced orders: limit/stop entries, exchange-side stop-loss and take-profit, trailing stop; see [Custom strategy](./strat_custom.md)
 * LLM extension: an application-invoked model management library; see [AI](../advanced/ai.md)
 
 ## WebUI
 For strategy editing, data management and backtesting. `bot web` defaults to `127.0.0.1:8000`, where a password is optional. Binding to `0.0.0.0` or `::` requires `--password` (Basic Auth username: `banbot`).
 
+The Settings page has a "Theme" option for light, dark or follow-system; the preference is stored in the browser.
+
 ![image](https://docs.banbot.site/uidev.gif)
 
 ## Dashboard UI
-For managing live trading robots, it is recommended to deploy on servers closer to the exchange, with password access required.
+For managing live trading robots, it is recommended to deploy on servers closer to the exchange, with password access required. When `api_server` is enabled, a non-empty `api_server.jwt_secret_key` is required, otherwise startup is refused. The top bar has a theme switch.
 
 ![image](https://docs.banbot.site/dashboard.gif)
 

@@ -24,7 +24,7 @@ When smaller-timeframe candlesticks already exist and you need to generate large
 
 `bot kline agg --timeframes 1h,1d --pairs BTC,ETH`
 
-`--timeframes` and `--pairs` limit the aggregation scope. Normal backtests and live trading read, download, and aggregate data on demand; run this command manually only when data needs to be prepared in advance.
+`--timeframes` and `--pairs` limit the aggregation scope. Normal backtests and live trading read, download, and aggregate data on demand; run this command manually only when data needs to be prepared in advance. Omitting `--pairs` prompts with the number of symbols to process and requires `y` to confirm.
 
 ## Exporting Candlesticks (protobuf)
 When you need to synchronize candlestick data to another banbot's database, it's recommended to export in `protobuf` format, which is optimized for both storage space and execution speed.
@@ -64,7 +64,7 @@ You can execute the following command to export:
 
 Where `--out` and `--timeframes` are required parameters. `--out` should be a directory. When `pairs` is not specified, banbot will use all symbols under the current yaml configured exchange and market.
 
-`--tz` defaults to UTC; timestamps use `YYYY-MM-DD HH:mm:ss`. Set `--adj none` for unadjusted prices, or `pre`/`post` for forward/backward adjustment; set this explicitly.
+`--tz` defaults to the exchange time zone: `Asia/Shanghai` for mainland-China exchanges, `UTC` otherwise; timestamps use `YYYY-MM-DD HH:mm:ss`. Set `--adj none` for unadjusted prices, or `pre`/`post` for forward/backward adjustment; set this explicitly.
 
 Output uses `{symbol}_{timeframe}.zip`, with `/` and `:` in symbols replaced by `_`. Each ZIP contains the matching CSV with time, open, high, low, close, volume, and buy volume, without arbitrary extension fields. The range comes from YAML; this command does not accept `--timerange`. Use a fresh output directory: an existing ZIP for a symbol currently skips all timeframes for that symbol.
 
@@ -104,7 +104,7 @@ Before starting deletion, summary information will be output, requiring you to i
 
 `bot kline correct --pairs BTC`
 
-`--pairs` is optional; omitting it processes all stored symbols and can take a long time. Back up first and use `verify` to identify the issue.
+`--pairs` is optional; omitting it processes all stored symbols, can take a long time, and requires entering `y` to confirm (`n` exits). Back up first and use `verify` to identify the issue.
 
 ## Rebuilding Coverage from Stored K-Lines
 
@@ -130,4 +130,4 @@ bot series list
 bot series down --tables funding_rate --pairs BTC --timestart 20240101 --timeend 20250101
 ```
 
-`list` emits JSON definitions of sources compiled into the executable, rather than listing database tables. For `down`, `--tables` selects registered source names, not physical tables; omitting it selects all custom sources. Downloads fill coverage gaps and stop at closed regular periods no later than the current time. The command currently does not support `event` timeframes. See [Custom Time-Series Data](../guide/custom_data.md) for integration.
+`list` emits JSON definitions of the sources registered in the executable (including the built-in `funding_rate`, `open_interest`, `mark_kline`, `index_kline` and `premium_kline`), rather than listing database tables. For `down`, `--tables` selects registered source names, not physical tables; omitting it selects all registered sources, custom and built-in. Downloads fill coverage gaps and stop at closed regular periods no later than the current time. The command currently does not support `event` timeframes. See [Custom Time-Series Data](../guide/custom_data.md) for the built-in sources and integration.

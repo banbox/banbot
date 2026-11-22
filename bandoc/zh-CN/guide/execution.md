@@ -17,7 +17,7 @@
 
 1. 准备市场/数据库基础配置和已编译策略。当前默认 Hub 只接受 `prod`/`dry_run` 的线性永续账户及明确的结算币；不支持 testnet、现货、反向合约或实盘期权。
 2. 在机器人配置中声明稳定策略 `id`、`account` 和同账户策略的 `capital_weight`。配置正的 `wallet_amounts`、`execution.margin_rate`（大于 0 且不超过 1）、`max_account_margin`、`max_virtual_gross` 和 `strategy_gross_limit`。资本分配不是向交易所充值，也不能超过可分配账户资金。
-3. 配置 `execution.instruments`，以 SID 为键，逐项提供 `id`、`version`、`valuation: linear_perpetual`、`settlement_currency`、`quantity_step`、`price_tick`、`contract_size`、`money_scale` 及市场要求的最小数量/名义额。纯时序的 instrument ID 为标准 symbol；因子的 SIDMap 必须与 instrument 对应。单位、版本和精度须与 banexg 标准市场元数据一致，不要复制其他品种的数值。
+3. 配置 `execution.instruments`，以 SID 为键，逐项提供 `id`、`version`、`valuation: linear_perpetual`、`settlement_currency`、`quantity_step`、`price_tick`、`contract_size`、`money_scale`，以及最小下单量 `min_steps`（以 `quantity_step` 为单位的步数）和最小名义额 `min_notional`。纯时序的 instrument ID 为标准 symbol；因子的 SIDMap 必须与 instrument 对应。单位、版本和精度须与 banexg 标准市场元数据一致，不要复制其他品种的数值。注册时会与公开市场元数据比对：单位和精度须一致，`min_steps`、`min_notional` 不得低于交易所要求，否则拒绝启动。
 4. 在主机和所有可能发送同一物理账户的进程中使用相同绝对 `execution.sender_lease_dir`。生产 Hub 必须显式配置；不同目录的锁不能防止重复发送。切换前先停止并迁移旧发送方，不可并行启动新 owner。
 5. 生产机器人提供账户凭据及 `funding_policy: required-stream`，并通过能力与启动对账检查。实时模拟提供正模拟现金，使用 `funding_policy: explicit-zero`；当前 Hub 未接模拟资金费流，不接受以 `required-stream` 替代。默认路径不保证所有旧配置行为已迁移。
 
@@ -60,7 +60,7 @@ Hub 配置提供数据库、公共市场及发送租约。账户凭据来自机�
 ## 重启与恢复
 
 - **仅机器人重启**：保留 Hub 与其账户，让机器人使用原配置和 journal 重连。Hub 中的账户、报告循环、公共时钟和挂单保护继续存在；客户端断开不会自动销户或平仓。
-- **Hub 重启**：保留整个执行目录、SQLite（含 WAL sidecar）、paper 日志、主机声明和机器人 journal。`accounts.json` 只保存无凭据身份，恢复后账户为 `waiting_authentication`，此时本地保护未激活。必须让机器人再次注册认证，恢复并对账成功后才能恢复账户运行；所有机器人离线时没有自动凭据恢复保证。
+- **Hub 重启**：保留整个执行目录（每个账户一个子目录，内含主机声明 `host-declaration-v1.json`）、SQLite（含 WAL sidecar）、paper 日志和机器人 journal。`accounts.json` 只保存无凭据身份，恢复后账户为 `waiting_authentication`，此时本地保护未激活。必须让机器人再次注册认证，恢复并对账成功后才能恢复账户运行；所有机器人离线时没有自动凭据恢复保证。
 - **paper 恢复**：再次注册后恢复模拟订单、现金和成本。日志缺失/损坏，或初始模拟现金、费用、滑点/模型变化会拒绝恢复。不要删库当作“重置”来规避冲突。
 - **残留 socket**：先确认旧 Hub 已停止并释放账户发送权，再处理残留路径。启动器不会自动删除已有 socket 或接管旧 owner。
 

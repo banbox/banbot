@@ -15,7 +15,7 @@
 
 `type CommandFactory func() *cobra.Command`。先注册组和命令，再创建根命令或调用 `RunCmd`；自定义参数由命令自己的 `Flags()` 和局部变量持有。复用同一 `*cobra.Command` 构造第二棵树会报错，改用工厂。
 
-`ExecuteContext` 接受规范的双横线长参数，并兼容旧单横线长参数。无子命令时启动开发 Web；只传普通选项也可能进入隐式 Web 分支。工具集成应显式提供子命令，如 `[]string{"backtest", "--datadir", dataDir}`，并检查返回错误。
+`ExecuteContext` 接受规范的双横线长参数，并兼容旧单横线长参数。无子命令时启动开发 Web；只传普通选项也可能进入隐式 Web 分支。工具集成应显式提供子命令，如 `[]string{"backtest", "--datadir", dataDir}`，并检查返回错误。未被命令处理的参数约束错误（`*config.BadParamError`）会转换为返回的错误，其他 panic 原样抛出。`RunCmd` 将错误以 `Error: <msg>` 写入 stderr 并以退出码 1 结束。
 
 ## 统一策略分派
 

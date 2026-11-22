@@ -18,7 +18,7 @@ RuntimeDeps 直接持有 Core、Clock、Config、DataDir、Symbols、Storage、E
 
 ### BaseFilter
 
-公共字段为 Name string、Disable bool、AllowEmpty bool；没有 NeedTickers 字段。
+公共字段为 Name string、Disable bool、AllowEmpty bool；没有 NeedTickers 字段。`Disable`对应yaml键`disable`，停用该条目；`AllowEmpty`不来自yaml，未配置`pairmgr.cron`时为true（允许数据为空的品种保留）。
 
 ### VolumePairFilter
 
@@ -46,10 +46,13 @@ RuntimeDeps 直接持有 Core、Clock、Config、DataDir、Symbols、Storage、E
 - `Timeframe string` - 时间周期
 - `BackNum int` - 回溯数量
 - `TopN int` - 取前N个
+- `TopRate float64` - 最大返回数量占全部品种的比例（yaml `top_rate`）
 - `Sort string` - 排序方式
 
+仅当设置了`Timeframe`、非零`BackNum`，且`Max`、`TopN`、`TopRate`至少一个非零时才过滤；`BackNum`小于10报错。
+
 ### VolatilityFilter
-波动率过滤器，使用 StdDev(ln(close / prev_close)) * sqrt(num) 计算。
+波动率过滤器，使用 StdDev(ln(close / prev_close)) * sqrt(num) 计算，`num`为日线收益率个数（BackDays-1，历史不足时更少）。
 - `BackDays int` - 回顾的K线天数
 - `Max float64` - 波动分数最大值
 - `Min float64` - 波动分数最小值
@@ -61,7 +64,7 @@ RuntimeDeps 直接持有 Core、Clock、Config、DataDir、Symbols、Storage、E
 ### AgeFilter
 上市时间过滤器。
 - `Min int` - 最小上市天数
-- `Max int` - 最大上市天数
+- `Max int` - 最大上市天数，0不限制；上市天数超过Max的品种被移除
 
 ### OffsetFilter
 偏移过滤器。
@@ -130,8 +133,12 @@ func init() {
 }
 ```
 
-`RegisterFilter(name, factory)` 重名会覆盖；`CreateFilter(cfg, allowEmpty)` 返回 `(IFilter, *errs.Error)` 并将配置解码到实例。`GetPairFiltersWithConfig(items, withInvalid, cfg)` 按给定配置构造过滤器。withInvalid 表示包含已禁用过滤器，不是容忍未知名称。
+`RegisterFilter(name, factory)` 重名会覆盖；`GetFilterFactory(name string) (FilterFactory, bool)` 按名查询已注册的工厂；`CreateFilter(cfg, allowEmpty)` 返回 `(IFilter, *errs.Error)` 并将配置解码到实例。`GetPairFiltersWithConfig(items []*config.CommonPairFilter, withInvalid bool, cfg *config.Config) ([]IFilter, *errs.Error)` 按给定配置构造过滤器；`GetPairFilters(items, withInvalid)` 等价于 cfg 为 nil（使用包级配置）。withInvalid 表示包含已禁用过滤器，不是容忍未知名称。
+
+可选扩展接口优先级：`FilterWithRuntimeDeps`（`RuntimeFilter`）> `FilterWithSymbolState`（`SymbolStateFilter`）> `Filter`；产出器同理为`GenSymbolsWithRuntimeDeps`（`RuntimeProducer`）> `GenSymbolsWithSymbolState`（`SymbolStateProducer`）> `GenSymbols`。
+
+`RuntimeDeps`另有`AllowRetiredPairs bool`和`SkippedPairs []orm.SkippedPair`：仅因子权重（Weights）回测使用，前者允许已退市但回测区间内有数据的固定品种留在池中，后者由`RefreshPairListWithRuntimeDeps`填充，记录回测区间内没有数据而被排除的固定品种。
 
 嵌入程序用 `RefreshPairListWithRuntimeDeps(deps *RuntimeDeps, timeMS int64)`，返回 `([]string, *errs.Error)`。必须提供同一任务的 Core/Clock/Config/Symbols/Storage/Exchange 等依赖；仅有 SymbolState 不能代替完整依赖。自定义过滤器可实现 `FilterWithRuntimeDeps(deps *RuntimeDeps, pairs []string, timeMS int64) ([]string, *errs.Error)`；它优先于 SymbolStateFilter 和旧 Filter。
 
-VolumePairFilter 的 MinValue 是每根 bar 平均 close*volume，CacheSecs 当前不控制缓存。CorrelationFilter 另有 `TopRate float64`，Sort 仅识别 asc/desc，少于四个可用序列时跳过过滤。详见[筛选指南](../guide/pair_filters.md)。
+VolumePairFilter 的 MinValue 是每根 bar 平均 close*volume，CacheSecs 当前不控制缓存。Sort 仅识别 asc/desc，CorrelationFilter 少于四个可用序列时跳过过滤。PriceFilter 固定使用最近1根1h K线收盘价；RateOfChangeFilter 与 VolatilityFilter 使用 1d K线（BackDays根）。详见[筛选指南](../guide/pair_filters.md)。

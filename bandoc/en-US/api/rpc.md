@@ -8,7 +8,7 @@ NewSession(snapshot *config.Snapshot, accounts map[string]*config.AccountConfig)
 
 Session.Start() constructs configured channels and starts consumers. Stop/Join participate in Runtime shutdown, close admission and wait for admitted work. SMTP senders use session mail configuration rather than another task's global settings.
 
-Channels support Telegram, WeCom and email; `webhook` configures message content templates, not a generic HTTP delivery channel. Remote trading commands use the session's order/wallet interfaces, not a CurrentRuntime lookup. Compatibility notification helpers do not prove multi-task isolation.
+Channels can be defined globally or derived per account via `accounts.<account>.rpc_channels`, which references a global channel and overrides fields; the generated name is `<name>_<account>` (`no_trade` accounts are skipped). Channels support Telegram, WeCom and email; `webhook` configures message content templates, not a generic HTTP delivery channel. Remote trading commands use the session's order/wallet interfaces, not a CurrentRuntime lookup. Compatibility notification helpers do not prove multi-task isolation.
 
 Local Session/lifecycle tests do not certify real email/platform delivery. See [runtime](runtime.md).
 

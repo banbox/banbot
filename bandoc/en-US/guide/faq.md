@@ -34,6 +34,10 @@ Public-market-data backtests and downloads do not require trading credentials. R
 
 `bot web` defaults to `127.0.0.1:8000` locally and `0.0.0.0` in Docker. Binding to `0.0.0.0` or `::` requires `--password`; the Basic Auth username is always `banbot`. Development UI credentials are separate from live Dashboard users.
 
+## How do I diagnose a command error?
+
+A failing command writes `Error: <message>` to stderr and exits with code 1; parameter-constraint errors look like `Error: [BadConfig] ...`. Check the configuration and flags named in the message, then inspect the logs (`--level`); include the full error line when reporting an issue.
+
 ## Can I open shorts or limit order counts?
 
 Use `s.OpenOrder(&strat.EnterReq{Tag: "short", Short: true})` on a contract market that supports shorts. The spot path rejects short entries.

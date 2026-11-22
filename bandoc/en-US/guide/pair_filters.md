@@ -13,7 +13,7 @@ The cron expression will also be executed during backtesting to refresh the inst
 
 ```yaml
 pairmgr:
-  pos_on_rotation: hold  # hold or close
+  pos_on_rotation: hold  # hold or close; hold when omitted
   use_latest: false      # Whether backtesting without cron uses the latest date for the symbol list
 ```
 
@@ -28,7 +28,7 @@ pairmgr:
 * BlockFilter
 * OffsetFilter
 * ShuffleFilter
-  The first of the yaml instrument filter list must be `VolumePairList`, which can return a list of instruments from all instruments in the market.
+  The first of the yaml instrument filter list must be a filter that produces symbols; the only built-in one is `VolumePairList`, which can return a list of instruments from all instruments in the market (a custom producer must implement `IProducer`). Any filter can be switched off temporarily with `disable: true` without deleting its configuration.
 
 ## VolumePairList
 Sort/filter currency pairs by volume. When it is the first, it will calculate the volume of all instruments in the period specified by `back_period` and return it in descending order.
@@ -71,11 +71,13 @@ Correlation coefficient filter.
   back_num: 70 # Length of data for calculating correlation review
   sort: asc # Greedily prefer low correlation with already selected symbols
   top_n: 50 # Maximum result count; 0 is unlimited
+  top_rate: 0.1 # Maximum result count as a fraction of all symbols; 0 is unlimited
 ```
+The filter only takes effect when `timeframe` is set, `back_num` is non-zero, and at least one of `max`, `top_n` and `top_rate` is non-zero.
 ## VolatilityFilter
-Volatility filter. Formula: std(log(c/c1)) * sqrt(back_days)
+Volatility filter. Formula: StdDev(ln(c_t/c_{t-1})) * sqrt(number of returns), where the number of returns is back_days-1 (fewer when history is short)
 ```yaml
-- name: VolatilityFilter # Volatility filter, formula: std(log(c/c1)) * sqrt(back_days)
+- name: VolatilityFilter # Volatility filter, formula: StdDev(ln(c_t/c_{t-1})) * sqrt(number of returns)
   back_days: 10 # Number of days to review the candle
   max: 1 # Maximum value of the volatility score. The larger the value, the more it allows for some targets that change very drastically at the 1d level
   min: 0.05 # Minimum value of the volatility score. The smaller the value, the more it allows for some targets that change very little at the 1d level
@@ -84,7 +86,8 @@ Volatility filter. Formula: std(log(c/c1)) * sqrt(back_days)
 Filter by the listing time of the symbol.
 ```yaml
 - name: AgeFilter # Filter by the listing days of the target
-  min: 5
+  min: 5 # Minimum listing days
+  max: 0 # Maximum listing days; 0 is unlimited
 ```
 ## BlockFilter
 A variety blacklist filter used to filter specified varieties.

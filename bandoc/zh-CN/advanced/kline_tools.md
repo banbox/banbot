@@ -24,7 +24,7 @@ banbot 通过内部覆盖范围机制记录每个品种、时间周期的已下�
 
 `bot kline agg --timeframes 1h,1d --pairs BTC,ETH`
 
-`--timeframes` 和 `--pairs` 用于限定聚合范围。常规回测和实盘会按需读取、下载与聚合数据，只有需要预先处理数据时才需要手动执行此命令。
+`--timeframes` 和 `--pairs` 用于限定聚合范围；省略 `--pairs` 时会提示将处理的标的数量，需输入 `y` 确认。常规回测和实盘会按需读取、下载与聚合数据，只有需要预先处理数据时才需要手动执行此命令。
 
 ## 导出K线(protobuf)
 当您需要同步K线数据到另一个banbot的数据库中时，建议您导出为`protobuf`格式，此导出过程进行了存储空间和执行速度的双重优化。
@@ -64,7 +64,7 @@ klines:
 
 其中`--out`和`--timeframes`是必填参数，`--out`应当是一个目录，当您未指定`pairs`时，banbot将使用当前yaml配置的交易所和市场下所有的品种。
 
-`--tz` 默认 UTC，时间输出为 `YYYY-MM-DD HH:mm:ss`。`--adj none` 导出未复权价格，`pre`/`post` 分别选择前/后复权；建议显式设置。
+`--tz` 缺省时使用交易所默认时区：中国大陆交易所为 `Asia/Shanghai`，其余为 `UTC`；时间输出为 `YYYY-MM-DD HH:mm:ss`。`--adj none` 导出未复权价格，`pre`/`post` 分别选择前/后复权；建议显式设置。
 
 输出为 `{symbol}_{timeframe}.zip`，标的中的 `/`、`:` 替换为 `_`；ZIP 内是同名 CSV，列为时间、开、高、低、收、成交量、主动买入量，不包含任意扩展字段。导出范围取 YAML 的时间范围，本命令不接受 `--timerange`。使用新的输出目录，已有该标的 ZIP 时当前实现会跳过该标的的所有周期。
 
@@ -104,7 +104,7 @@ CSV 每行至少六列：13 位毫秒时间戳、开、高、低、收、成交�
 
 `bot kline correct --pairs BTC`
 
-`--pairs` 可选，省略时处理所有已存标的，可能耗时很长。先备份，并先用 `verify` 确认问题。
+`--pairs` 可选，省略时处理所有已存标的，可能耗时很长，并要求输入 `y` 确认（`n` 退出）。先备份，并先用 `verify` 确认问题。
 
 ## 从已有 K 线重建覆盖范围
 
@@ -129,4 +129,4 @@ bot series list
 bot series down --tables funding_rate --pairs BTC --timestart 20240101 --timeend 20250101
 ```
 
-`list` 输出编译进当前可执行文件的 source 定义 JSON，不是数据库表清单。`down` 的 `--tables` 指已注册的 source 名，不是物理表名；省略时处理全部自定义源。该命令按缺口补齐，只下载不晚于当前时间的已闭合规则周期，当前不支持 `event` 周期。接入步骤见[自定义时序数据](../guide/custom_data.md)。
+`list` 输出当前可执行文件已注册的 source 定义 JSON（含内置源 `funding_rate`、`open_interest`、`mark_kline`、`index_kline`、`premium_kline`），不是数据库表清单。`down` 的 `--tables` 指已注册的 source 名，不是物理表名；省略时处理全部已注册源（自定义源与内置源）。该命令按缺口补齐，只下载不晚于当前时间的已闭合规则周期，当前不支持 `event` 周期。内置源与接入步骤见[自定义时序数据](../guide/custom_data.md)。

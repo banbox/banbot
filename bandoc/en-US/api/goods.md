@@ -18,7 +18,7 @@ Extends IFilter with GenSymbols(timeMS int64) ([]string, *errs.Error). The old t
 
 ### BaseFilter
 
-Public fields are Name string, Disable bool and AllowEmpty bool; there is no NeedTickers field.
+Public fields are Name string, Disable bool and AllowEmpty bool; there is no NeedTickers field. `Disable` is the yaml key `disable` and turns the entry off; `AllowEmpty` does not come from yaml and is true when `pairmgr.cron` is not set (symbols with empty data are kept).
 
 ### VolumePairFilter
 
@@ -46,10 +46,13 @@ Correlation filter.
 - `Timeframe string` - Time period
 - `BackNum int` - Lookback number
 - `TopN int` - Take top N
+- `TopRate float64` - Maximum result count as a fraction of all symbols (yaml `top_rate`)
 - `Sort string` - Sort method
 
+Filtering only happens when `Timeframe` is set, `BackNum` is non-zero, and at least one of `Max`, `TopN` and `TopRate` is non-zero; `BackNum` below 10 is an error.
+
 ### VolatilityFilter
-Volatility filter using StdDev(ln(close / prev_close)) * sqrt(num).
+Volatility filter using StdDev(ln(close / prev_close)) * sqrt(num), where `num` is the number of daily returns (BackDays-1, fewer when history is short).
 - `BackDays int` - Number of candlestick days to look back
 - `Max float64` - Maximum volatility score
 - `Min float64` - Minimum volatility score
@@ -57,7 +60,7 @@ Volatility filter using StdDev(ln(close / prev_close)) * sqrt(num).
 ### AgeFilter
 Listing time filter.
 - `Min int` - Minimum listing days
-- `Max int` - Maximum listing days
+- `Max int` - Maximum listing days, 0 is unlimited; symbols listed for more than Max days are removed
 
 ### BlockFilter
 A variety blacklist filter used to filter specified varieties.
@@ -132,8 +135,12 @@ func init() {
 }
 ```
 
-`RegisterFilter(name, factory)` replaces an existing registration of the same name. `CreateFilter(cfg, allowEmpty)` returns `(IFilter, *errs.Error)` and decodes configuration into the instance. `GetPairFiltersWithConfig(items, withInvalid, cfg)` uses the given configuration. withInvalid includes disabled filters; it does not tolerate unknown names.
+`RegisterFilter(name, factory)` replaces an existing registration of the same name; `GetFilterFactory(name string) (FilterFactory, bool)` looks up a registered factory by name. `CreateFilter(cfg, allowEmpty)` returns `(IFilter, *errs.Error)` and decodes configuration into the instance. `GetPairFiltersWithConfig(items []*config.CommonPairFilter, withInvalid bool, cfg *config.Config) ([]IFilter, *errs.Error)` uses the given configuration; `GetPairFilters(items, withInvalid)` is the same with a nil cfg (package-level configuration). withInvalid includes disabled filters; it does not tolerate unknown names.
+
+Precedence of the optional extension interfaces: `FilterWithRuntimeDeps` (`RuntimeFilter`) > `FilterWithSymbolState` (`SymbolStateFilter`) > `Filter`; for producers likewise `GenSymbolsWithRuntimeDeps` (`RuntimeProducer`) > `GenSymbolsWithSymbolState` (`SymbolStateProducer`) > `GenSymbols`.
+
+`RuntimeDeps` also has `AllowRetiredPairs bool` and `SkippedPairs []orm.SkippedPair`, used only by factor Weights backtests: the first keeps static pairs the exchange no longer lists in the pool when the catalog has their data inside the backtest window; the second is filled by `RefreshPairListWithRuntimeDeps` with the static pairs left out because they have no data inside the window.
 
 Embedded applications use `RefreshPairListWithRuntimeDeps(deps *RuntimeDeps, timeMS int64)`, returning `([]string, *errs.Error)`. Supply Core/Clock/Config/Symbols/Storage/Exchange and other dependencies from one task; SymbolState alone is insufficient. Custom filters can implement `FilterWithRuntimeDeps(deps *RuntimeDeps, pairs []string, timeMS int64) ([]string, *errs.Error)`, which takes priority over SymbolStateFilter and legacy Filter.
 
-VolumePairFilter.MinValue measures mean(close*volume) per bar; CacheSecs currently does not control caching. CorrelationFilter also has `TopRate float64`; Sort recognizes asc/desc only and filtering is skipped with fewer than four usable series. See the [filter guide](../guide/pair_filters.md).
+VolumePairFilter.MinValue measures mean(close*volume) per bar; CacheSecs currently does not control caching. Sort recognizes asc/desc only, and CorrelationFilter is skipped with fewer than four usable series. PriceFilter always uses the latest single 1h K-line close; RateOfChangeFilter and VolatilityFilter use 1d K-lines (BackDays bars). See the [filter guide](../guide/pair_filters.md).

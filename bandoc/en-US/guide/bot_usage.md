@@ -6,6 +6,7 @@ Run `go build -o bot` in your strategy project root (`go build -o bot.exe` on Wi
 bot --help
 bot backtest --help
 bot tool --help
+bot --version
 ```
 
 Commands use hyphens, such as `bt-opt` and `collect-opt`. Some underscore names remain compatibility aliases; use canonical names and double-dash `--flag` options in new scripts. Each subcommand declares its own flags; flags from one command are not automatically supported by another.
@@ -28,7 +29,7 @@ bot web --datadir /path/to/data
 bot hub --datadir /path/to/data
 ```
 
-Running `bot` without a subcommand also opens the development WebUI, at `http://127.0.0.1:8000` by default. Development Web has its own `--host`, `--port`, `--password`, and `--tz` flags; it is separate from the trading Dashboard configured through `api_server`.
+Running `bot` without a subcommand also opens the development WebUI, at `http://127.0.0.1:8000` by default. Development Web has its own `--host`, `--port`, `--password`, and `--tz` flags (plus `--datadir`, `--config`, `--config-data`, `--level` and `--logfile`; inside a container the default `--host` is `0.0.0.0`, which requires `--password`); it is separate from the trading Dashboard configured through `api_server`.
 
 `hub` (compatibility alias `spider`) provides public market data and local account execution. `spider_addr` controls public market-data listening, default `127.0.0.1:6789`. The private execution socket defaults to `<datadir>/execution/hub.sock`, overridable with `--execution-socket`. Hub accepts only `prod` / `dry_run`; backtests run in process. A public listening address does not grant private account authorization.
 
@@ -55,6 +56,7 @@ Check `bot <group> <command> --help` for input formats. Unless a positional argu
 
 | Command | Purpose |
 | --- | --- |
+| `init` | Create `config.yml` and `config.local.yml` in the data directory (needs `--datadir` or `BanDataDir`; if either file already exists, neither is written) |
 | `data export` / `data import` | Export/import database data as protobuf files |
 | `data archive` | Versioned archives; see the [factor guide](./factor.md) |
 | `kline down` / `load` / `agg` | Download, import, or aggregate bars |
@@ -63,11 +65,12 @@ Check `bot <group> <command> --help` for input formats. Unless a positional argu
 | `kline adj-calc` / `adj-export` | Calculate/export adjustment factors |
 | `series down` / `list` | Download registered custom series / inspect ranges |
 | `tick convert` / `to-kline` | Convert ticks / aggregate bars |
-| `tool list-strats` | List strategies compiled into the binary |
+| `tool list-strats [--prefix P]` | List strategies compiled into the binary, optionally filtered by name prefix |
 | `tool collect-opt` / `test-pickers` | Collect optimization results / compare pickers over rolling windows |
 | `tool sim-bt` / `bt-result` | Simulate from a report / rebuild a report from orders |
 | `tool test-live-bars DUMP_FILE` | Compare live bar dumps with local data |
-| `tool cmp-orders` | Compare venue and backtest orders |
+| `tool cmp-orders` | Fetch an account's venue orders and compare them with backtest orders; requires `--bot-name`, `--account` and `--bt-path`; also `--amt-rate` (default 0.1) and `--skip-unhit` (default on) |
+| `tool data-audit refresh-review` / `funding` | Read-only data audits: compare typed archives and stage a proposed refresh (`--baseline --candidate --stage`) / compare account funding snapshots with committed events (`--venue --ledger`); neither writes to the database |
 | `tool calc-perfs` / `corr` / `merge-assets` | Performance metrics, correlation matrices, combined asset curves |
 | `tool load-cal` / `data-server` | Import calendars / serve gRPC data |
 | `tool bt-factor` | Rolling symbol selection over existing `orders.gob`, separate from native factor runner |
@@ -78,6 +81,6 @@ bot live down-order --datadir /path/to/data --account user1 --timestart 20250401
 bot tool bt-result --datadir /path/to/data --config report-config.yml --in /path/to/orders.gob --out /path/to/rebuilt
 ```
 
-Empty `--account`, `--pair`, or `--strat` on `live close-order` leaves that dimension unrestricted; `--exg` closes venue positions directly. Select the scope explicitly before execution. Custom factors for `tool bt-factor` register in `opt.RegisterFactor`, not the nonexistent `strat.FactorMap`.
+`live down-order` also accepts `--exchange`, `--market` (`spot`, `linear`, `inverse`, `option`) and `--force`. Empty `--account`, `--pair`, or `--strat` on `live close-order` leaves that dimension unrestricted; `--exg` closes venue positions directly. Select the scope explicitly before execution. Custom factors for `tool bt-factor` register in `opt.RegisterFactor`, not the nonexistent `strat.FactorMap`.
 
 Standalone expressions use root `bot validate --spec formula.yml` / `bot explain --spec formula.yml`. See the [factor guide](./factor.md) for configuration and data requirements.

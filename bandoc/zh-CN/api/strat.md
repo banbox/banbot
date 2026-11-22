@@ -11,6 +11,7 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `Name string` - 策略名称
 - `Version int` - 策略版本号
 - `WarmupNum int` - 预热所需的K线数量
+- `OdBarMax int` - 回测查找未完成持仓最多向前模拟的bar数，默认500；`run_policy.order_bar_max`优先
 - `MinTfScore float64` - 最小时间周期质量，默认0.75
 - `WsSubs map[string]string` - websocket订阅: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 - `DrawDownExit bool` - 是否启用回撤退出
@@ -20,9 +21,11 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `StakeRate float64` - 相对基础金额开单倍率
 - `StopLoss float64` - 此策略打开所有订单的默认止损比率（不带杠杆）
 - `StopEnterBars int` - 限价入场单超时K线数
+- `OrderOnRotation string` - 品种被轮换移出后的旧任务：`open`表示有订单时仍允许继续开单；平仓与否见`pairmgr.pos_on_rotation`
 - `EachMaxLong int` - 每个交易对最大做多订单数，-1表示禁用
 - `EachMaxShort int` - 每个交易对最大做空订单数，-1表示禁用
 - `RunTimeFrames []string` - 允许运行的时间周期；未提供时使用当前 Runtime 配置快照中的默认周期
+- `RefineTF interface{}` - 策略默认的订单撮合周期，如`"5m"`、`12`、`"3-6"`；`run_policy[].refine_tf`显式配置时优先
 - `Outputs []string` - 策略输出的文本文件内容，每个字符串是一行
 - `Policy *config.RunPolicyConfig` - 策略运行配置
 - `OnDataSubs`: 声明 K 线扩展列或自定义时序数据订阅
@@ -52,15 +55,33 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `MaxOpenShort int` - 最大开空数量，0不限制，-1禁止开空
 - `CloseLong bool` - 是否允许平多
 - `CloseShort bool` - 是否允许平空
-- `ExgStopLoss bool` - 是否允许交易所止损
+- `ExgStopLoss bool` - 默认true，止损作为条件单提交到交易所；false时不预挂条件单，改为本地价格监控（回测与实盘均生效），`CallbackPct`追踪止损同理
 - `LongSLPrice float64` - 开仓时默认做多止损价格
 - `ShortSLPrice float64` - 开仓时默认做空止损价格
-- `ExgTakeProfit bool` - 是否允许交易所止盈
-- `LongTPPrice float64` - 兼容字段；当前开仓路径不读取，使用 EnterReq.TakeProfit/TakeProfitVal。
-- `ShortTPPrice float64` - 兼容字段；当前开仓路径不读取，使用 EnterReq.TakeProfit/TakeProfitVal。
+- `ExgTakeProfit bool` - 默认true，止盈作为条件单提交到交易所；false时改为本地价格监控
+- `LongTPPrice float64` - 开仓时默认做多止盈价格：`EnterReq`未指定`TakeProfit/TakeProfitVal`时使用，指定`TakeProfits`时忽略；须高于入场价
+- `ShortTPPrice float64` - 开仓时默认做空止盈价格，须低于入场价
 - `IsWarmUp bool` - 当前是否处于预热状态
 - `More interface{}` - 策略自定义的额外信息
 - `DataHub`: 按 `(source, sid, timeframe)` 缓存最新事件和窗口数据
+
+公开方法（开平仓与止损止盈方法的用法见[策略指南](../guide/strat_custom.md)）：
+- `CanOpen(short bool) bool`、`OpenOrder(req *EnterReq) *errs.Error`、`CloseOrders(req *ExitReq) *errs.Error`
+- `GetOrderNum(dirt float64) int`、`GetOrders(dirt float64) []*ormo.InOutOrder`、`Position(dirt float64, enterTag string) float64`、`PositionAvgPrice(dirt float64, enterTag string) float64`、`GetAvgCostPrice(odList ...*ormo.InOutOrder) float64`
+- `SetAllStopLoss(dirt float64, args *ormo.ExitTrigger) *errs.Error`、`SetAllTakeProfit(...)`：`args`为nil取消；`dirt`为0（双向）且同时持有多空订单时panic
+- `AccountEquity() float64`：账户权益（余额+浮动盈亏），预热或钱包未就绪时回退为初始资金/默认开单金额，不会为0或NaN
+- `AvailableBalance() float64`：可用余额/保证金，不可用时为0
+- `AccountDrawdown() float64`：相对运行以来权益峰值的回撤比例，`[0,1]`，预热期为0
+- `RefKlineSub(symbol, timeframe string, warmupNum ...int) *DataSub`：创建只读K线参考订阅（`symbol`为空或`_cur_`为当前品种；省略`warmupNum`取`TradeStrat.WarmupNum`）；包级`NewRefKlineSub(s, symbol, timeframe, warmupNum...)`等价
+- `RefEnv(symbol, timeframe string) *ta.BarEnv`：参考行情的同步K线环境，首根K线到达前为nil
+- `Data(sub *DataSub) *DataFields`：订阅数据视图，`sub.ExSymbol`为空时取当前品种
+- `OpeningRange(anchorMinutesUTC, rangeMinutes int) OpeningRangeSnapshot`、`OpeningRangeWithOpts(anchorMinutesUTC, rangeMinutes int, opts OpeningRangeOptions) OpeningRangeSnapshot`、`SessionRange(startMinUTC, endMinUTC int) SessionRangeSnapshot`
+- `PrevDayOHLC(anchorMinutesUTC int) (PrevOHLC, bool)`、`PrevNDaysStats(anchorMinutesUTC, nDays int) (PrevNDaysSummary, bool)`（`nDays`为1~366）
+- `DualThrustBands(anchorMinutesUTC, nDays int, k1, k2 float64) (upper, lower, dayOpen float64, ok bool)`
+- `RBreakerLevels(anchorMinutesUTC int) (RBreakerSnap, bool)`、`RBreakerLevelsBy(anchorMinutesUTC int, f1, f2, f3 float64) (RBreakerSnap, bool)`
+- `ProcessRuntimeOrders()`、`ExecutionSnapshot()`、`IsWarmUpState() bool`、`OrderCounts() (orderNum, enteredNum int)`、`PendingEntryCount() int`
+
+日内方法的锚点为UTC当日分钟数，状态按任务独立、无未来函数：区间在`Ready`/`Completed`之前`High/Low`等为0；`Applicable=false`表示周期不适用（1d及以上、与区间未对齐，或周期粗于区间且未开启`AllowSingleBarFallback`）。
 
 ### DataSub
 时序数据订阅信息。
@@ -71,6 +92,7 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `TimeFrame string` - 数据源基础周期
 - `WarmupNum int` - 初始化预热数量
 - `Fields []string` - 需要读取的字段
+- `SeriesFields []string` - 维护为`banta.Series`的字段，并自动加入读取投影；详见[自定义时序数据](../guide/custom_data.md)
 
 ### DataHub
 运行时数据缓存。`Get(tf, source, sid)` 返回处理后的 `DataFields`，`AllReady()` 判断当前事件时间上应闭合的全部订阅是否已经更新。自定义数据的订阅和消费示例请参阅[自定义时序数据](../guide/custom_data.md)。
@@ -87,7 +109,9 @@ strat 包提供了交易策略相关的功能定义和实现。
 
 ### BatchState / BatchMap
 
-`BatchState` 持有单个 trader 的批量队列和回测批次时间。使用 `NewBatchState` 创建实例，`AddTask` 入队、`TakeReady(currMS, deterministic)` 取出到期批次、`PendingCount` 查询、`Reset` 清空。所有回测均使用确定性批次顺序；主批次 jobs 按品种键排序，资金竞争时应自行按策略得分排序。`LegacyBatchState` 仅服务包级兼容调用。
+`BatchState` 持有单个 trader 的批量队列和回测批次时间。使用 `NewBatchState` 创建实例，`AddTask` 入队、`TakeReady(currMS, deterministic)` 取出到期批次、`PendingCount` 查询、`Reset` 清空。所有回测均使用确定性批次顺序：同一根K线内主批次 jobs 按 `BarPriority(barMS, symbol, seed)` 的中性哈希顺序排列（不是品种字母序；无有效K线时间时才按品种键排序），种子取配置 `bt_bar_order_seed`（默认0），也可用 `SetBarOrderSeed(seed uint64)` 在该实例上指定，`BarOrderSeed() (uint64, bool)` 读取。实盘批次不保证顺序；资金竞争时应自行按策略得分排序。`LegacyBatchState` 仅服务包级兼容调用。
+
+`func BarPriority(barMS int64, symbol string, seed uint64) uint64` 返回品种在某根K线时间下的中性、可复现优先级（越小越先），可在回调中用于排序时的平局裁决。
 
 `BatchMap` 是队列内部的一个时间周期任务组，不是进程共享的市场状态。
 
@@ -113,38 +137,55 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `StratName string` - 策略名称
 - `Short bool` - 是否做空
 - `OrderType int` - 订单类型
-- `Limit float64` - 限价单入场价格，指定时订单将作为限价单提交
-- `Stop float64` - 止损(触发价格)，做多订单时价格上涨到触发价格才入场（做空相反）
+- `Limit float64` - 限价单入场价格，指定时订单将作为限价单提交；与`Stop`同时设置时为Stop-Limit入场
+- `Stop float64` - 入场触发价（不是止损），做多订单时价格上涨到触发价才入场（做空相反）
+- `OCOGroup string` - OCO挂单组标识：组内任一挂单入场成交后，同（品种、策略、组）其余未成交挂单被撤销
 - `CostRate float64` - 开仓倍率，默认按配置1倍，用于计算LegalCost
+- `RiskRate float64` - 单笔止损亏损占`AccountEquity()`的比例，`[0,1]`；未指定`Amount`/`LegalCost`且有止损价时，`LegalCost = AccountEquity() × RiskRate ÷ (|入场价-止损价| ÷ 入场价)`，受杠杆（现货1倍）和`max_stake_amt`封顶；无止损时退回默认开单金额×`CostRate`
 - `LegalCost float64` - 花费法币金额，指定时忽略CostRate
 - `Leverage float64` - 杠杆倍数
 - `Amount float64` - 入场标的数量，由LegalCost和price计算
 - `StopLossVal float64` - 入场价格到止损价格的距离，用于计算StopLoss
-- `StopLoss float64` - 止损触发价格，不为空时在交易所提交一个止损单
-- `StopLossLimit float64` - 止损限制价格，不提供使用StopLoss
+- `StopLoss float64` - 止损触发价格；默认在交易所提交止损条件单，`ExgStopLoss=false`时仅本地监控
+- `StopLossLimit float64` - 止损触发后的限价（0为市价）；`StopLoss`为0时同时作为触发价
 - `StopLossRate float64` - 止损退出比例，0表示全部退出，需介于(0,1]之间
 - `StopLossTag string` - 止损原因
 - `TakeProfitVal float64` - 入场价格到止盈价格的距离，用于计算TakeProfit
-- `TakeProfit float64` - 止盈触发价格，不为空时在交易所提交一个止盈单
-- `TakeProfitLimit float64` - 止盈限制价格，不提供使用TakeProfit
+- `TakeProfit float64` - 止盈触发价格；默认在交易所提交止盈单，`ExgTakeProfit=false`时仅本地监控
+- `TakeProfitLimit float64` - 止盈触发后的限价（0为市价）；`TakeProfit`为0时同时作为触发价
 - `TakeProfitRate float64` - 止盈退出比率，0表示全部退出，需介于(0,1]之间
 - `TakeProfitTag string` - 止盈原因
+- `TakeProfits []TakeProfitTarget` - 多级阶梯止盈；不能与`TakeProfit`/`TakeProfitVal`/`TakeProfitLimit`同时使用，设置后`LongTPPrice/ShortTPPrice`不再生效
 - `StopBars int` - 入场限价单超过多少个bar未成交则取消
 - `ClientID string` - 用于设置提交到交易所的ClientOrderID尾部部分。
+- `ActivationPrice float64` - 追踪止损激活价格，0为立即生效；仅`CallbackPct>0`时有效
+- `CallbackPct float64` - 追踪止损回撤百分比（单位%，1.5即1.5%），0关闭，非零须在`[0.05, 50]`内；实盘优先使用交易所原生追踪单，不支持或被拒绝时降级为本地监控
 - `Infos map[string]string` - 用于保存到订单的额外信息
+- `Log bool` - 失败时自动记录日志
 
-`Stop` 与 `Limit` 互斥。`ActivationPrice float64` 与 `CallbackPct float64` 配置追踪止损；非零 CallbackPct 必须为 0.1–10（百分数），并依赖交易所支持。`Log bool` 控制校验失败日志。预热期间不会入队；返回 nil 不代表已经成交。
+`Stop` 与 `Limit` 同时设置为 Stop-Limit 入场：价格触及 `Stop` 后以 `Limit` 挂限价单，`Stop` 已被当前价越过时直接按 `Limit` 挂限价单。`OrderType` 为 `core.OrderTypeMarket` 时不能设置 `Limit`。`StopLossVal`/`TakeProfitVal` 是价格差而非比例。预热期间不会入队；返回 nil 不代表已经成交。`CloseOrders` 仅排队；特定方向的有利侧限价退出会转成订单止损限价，而不是立即成交。
 
-#`CommandID string` 为请求身份，`Log bool` 控制错误日志。`CloseOrders` 仅排队；特定方向的有利侧限价退出会转成订单止损限价，而不是立即成交。
+### TakeProfitTarget
+阶梯止盈的一级。
 
-## ExitReq
+公开字段：
+- `Price float64` / `Val float64` / `Rate float64` - 三选一（须大于0）：绝对触发价；距入场成交均价的价差；相对入场成交均价的比例。同时给出时`Price`优先，其次`Val`；`Price`须位于盈利方向
+- `Limit float64` - 触发后的限价，0为市价
+- `ExitRate float64` - 本级平掉初始仓位的比例，`(0,1]`；仅一级且为0时按1处理；各级之和不得超过1
+- `MoveSLToBreakeven bool` - 本级成交后，把剩余仓位的止损收紧到不差于入场价（不放宽更紧的止损）
+- `Tag string` - 本级退出原因
+
+各级按距入场价由近到远依次触发。
+
+### ExitReq
 平仓请求结构体。
 
 公开字段：
+- `CommandID string` - 稳定请求身份；相同ID和内容的请求重放时不会重复提交
 - `Tag string` - 退出信号
 - `StratName string` - 策略名称
 - `EnterTag string` - 只退出入场信号为EnterTag的订单
-- `Dirt int` - 方向(core.OdDirt*)，多/空/双向
+- `Dirt int` - 方向(core.OdDirt*)，多/空/双向；零值即双向。同时持有多空订单且设置`Limit`时必须显式指定
 - `OrderType int` - 订单类型
 - `Limit float64` - 限价单退出价格，指定时订单将作为限价单提交
 - `ExitRate float64` - 退出比率，默认100%即所有订单全部退出
@@ -153,6 +194,7 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `UnFillOnly bool` - True时只退出尚未入场的部分
 - `FilledOnly bool` - True时只退出已入场的订单
 - `Force bool` - 是否强制退出
+- `Log bool` - 失败时自动记录日志
 
 ## 策略管理相关方法
 
@@ -287,6 +329,7 @@ OnStartUp     func(s *StratJob)
 OnDataSubs    func(s *StratJob) []*DataSub
 OnData        func(s *StratJob, data DataEvent)
 OnSymbols     func(items []string) []string
+OnCheckExit   func(s *StratJob, od *ormo.InOutOrder) *ExitReq
 OnOrderChange func(s *StratJob, od *ormo.InOutOrder, chgType int)
 OnBatchJobs   func(jobs []*StratJob)
 OnBatchInfos  func(tf string, jobs map[string]*JobEnv)
@@ -296,10 +339,20 @@ OnShutDown    func(s *StratJob)
 OnStratExit   func()
 ```
 
+兼容回调：`OnBar func(s *StratJob)`、`OnInfoBar func(s *StratJob, e *ta.BarEnv, pair, tf string)`、`OnPairInfos func(s *StratJob) []*PairSub`、`OnWsTrades`、`OnWsDepth`、`OnWsKline`；另有`GetDrawDownExitRate CalcDDExitRate`和`PickTimeFrame PickTimeFrameFunc`。
+
 以上为回调字段签名，省略其他配置字段。`OnData` 与 `OnBar`/`OnInfoBar` 互斥，混用会 panic。用 `RouteData(DataHandlers{Main: ..., Info: ..., Custom: ...})` 区分事件；事件的 `DataFields` 已更新。`DataSub` 是 `orm.Subscription` 的别名。
 
 `job.Data(sub)` 返回订阅视图，`DataHub.Get(tf, source, sid)` 返回相同身份的数据；未到达时应检查 nil。`RawValue(name) (any, bool)` 区分缺失与显式 NULL，`Series(name)` 提供数值指标窗口。不要把自定义字段统一转成 float64。
 
 `job.OpenOrder(req)`、`CloseOrders(req)`、`SetAllStopLoss(dirt, trigger)`、`SetAllTakeProfit(dirt, trigger)` 均返回 `*errs.Error`。`ProcessRuntimeOrders()` 返回 `(entered, exited []*ormo.InOutOrder, err *errs.Error, bound bool)`，只处理当前 job 的请求；bound=false 表示未绑定显式 Runtime。不要直接追加 Entrys/Exits。跨事件读取执行状态可用 `ExecutionSnapshot()`，其中订单指针仍是借用。
 
+`OnBatchJobs` 中的开平仓请求在回调后由框架自动提交（预热期除外）；`OnBatchInfos` 中的开平仓请求不会自动提交，只记录WARN。
+
 `RegisterStrategy(name, factory)` 注册完整名称，`AddStratGroup` 注册分组。运行中任务从 `rt.Strategies.CollectJobs()` 或 `LookupJob(account, pairTF, strategy)` 获取；包级 `New/Get/GetJobs/GetInfoJobs/AddOdSub/FireOdChange/LoadStratJobs/ExitStratJobs` 是兼容入口，不能查询独立 Runtime 的状态。动态修改品种时在 `PairUpdateReq.StrategyState` 传入所属 `rt.Strategies`；参见[策略指南](../guide/strat_custom.md)。
+
+### UpdatePairs
+`func (s *TradeStrat) UpdatePairs(req PairUpdateReq) (*PairUpdateResult, *errs.Error)` 在运行中增删品种。`PairUpdateReq{Strat, StrategyState, Core, Exchange, Add, Remove, CloseOnRemove, ForceAdd, Reason}`；`Strat`为空时取接收者，不等于接收者则返回错误。`PairUpdateResult{Added, Removed, Skipped, ExitOrders, Warnings}`。
+
+### 参数校验
+策略构造函数中可用`pol.Require(cond bool, msg string)`和`pol.Requiref(cond bool, format string, args ...any)`校验参数；不满足时该策略构造失败并按BadConfig（配置错误）报告，不会被缓存，普通运行时错误不会被改写为配置错误。

@@ -75,7 +75,7 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 ## 连接池与多进程写入
 
-未设置 `max_pool_size` 时默认取 `max(40, CPU 核数 × 4)`。低于 30 会产生连接池告警，大批量下载时可能耗尽连接。
+未设置 `max_pool_size` 时默认取 `max(40, CPU 核数 × 4)`。低于 30 会产生连接池告警，大批量下载时可能耗尽连接。命令行 `--max-pool-size` 可临时覆盖配置值。
 
 多个进程共同向 QuestDB 注册新标的时，可配置 `database.sid_registry_url` 指向一个独立 PostgreSQL SID 注册库，例如 `postgresql://banbot:your-password@127.0.0.1:5432/sid_registry?sslmode=disable`。相关进程应共享同一注册库；请先创建服务、用户和数据库，`auto_create` 仅负责注册表 schema。它不存储行情，也不把 QuestDB 切换成 TimescaleDB。标的身份由 exchange、market、symbol 决定，`exg_real` 只是元数据。
 
@@ -87,7 +87,7 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 无论选用哪个后端，banbot 都通过统一的时序接口管理 K 线和自定义数据，包括建表、写入、读取、覆盖范围和缺口回填。K 线覆盖范围由内部 `sranges` 机制维护，不应依赖历史版本中的 `KInfo`、`KHole` 等表作为外部集成契约。
 
-时序字段按 schema 写入固定列，支持 float/int/string/bool/json；默认 K 线和扩展字段统一通过 DataSeries.Values 传递。数据库整数为 64 位，JSON 的数据库编码与运行时任意 Go 类型不是同一合同；缺键与显式 NULL 的差别不能在固定列往返后恢复。
+时序字段按 schema 写入固定列，支持 float/int/string/bool/json（json 在 QuestDB 中保存为字符串，在 TimescaleDB 中为 `JSONB`）；默认 K 线和扩展字段统一通过 DataSeries.Values 传递。数据库整数为 64 位，JSON 的数据库编码与运行时任意 Go 类型不是同一合同；缺键与显式 NULL 的差别不能在固定列往返后恢复。
 
 删除、回填和覆盖范围更新应通过数据工具或 `SeriesStore` 完成，不要直接改写覆盖元数据。订单状态和 UI 任务保存在独立 SQLite 文件中，不受上述行情数据库后端选择影响。
 

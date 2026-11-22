@@ -6,6 +6,7 @@
 bot --help
 bot backtest --help
 bot tool --help
+bot --version
 ```
 
 命令采用连字符，如 `bt-opt`、`collect-opt`。部分旧下划线命令仍作为兼容别名；新脚本使用本页规范名称和 `--flag` 双横线长参数。参数由各子命令声明，不能把一个子命令的参数直接用于另一个。
@@ -28,7 +29,7 @@ bot web --datadir /path/to/data
 bot hub --datadir /path/to/data
 ```
 
-直接执行 `bot` 也会启动开发 WebUI，默认地址为 `http://127.0.0.1:8000`。开发 Web 使用自己的 `--host`、`--port`、`--password`、`--tz` 参数；它与交易时 `api_server` 配置的 Dashboard 不同。
+直接执行 `bot` 也会启动开发 WebUI，默认地址为 `http://127.0.0.1:8000`。开发 Web 使用自己的 `--host`、`--port`、`--password`、`--tz` 参数（另支持 `--datadir`、`--config`、`--config-data`、`--level`、`--logfile`；容器内默认 `--host` 为 `0.0.0.0`，此时必须设置 `--password`）；它与交易时 `api_server` 配置的 Dashboard 不同。
 
 `hub`（兼容别名 `spider`）提供公共行情和本地账户执行服务。公共行情地址由 `spider_addr` 控制，默认 `127.0.0.1:6789`；私有执行 socket 默认位于 `<datadir>/execution/hub.sock`，可用 `--execution-socket` 覆盖。Hub 只接受 `prod` / `dry_run` 环境；回测在进程内运行。配置公共行情监听地址不能代替私有账户授权。
 
@@ -55,6 +56,7 @@ bot research --datadir /path/to/data --config factor.yml
 
 | 命令 | 用途 |
 | --- | --- |
+| `init` | 在数据目录生成 `config.yml` 与 `config.local.yml`（需 `--datadir` 或 `BanDataDir`；任一已存在则不生成配置文件） |
 | `data export` / `data import` | 数据库与 protobuf 文件之间导出/导入 |
 | `data archive` | 版本数据归档，见[因子指南](./factor.md) |
 | `kline down` / `load` / `agg` | 下载、导入、聚合 K 线 |
@@ -63,11 +65,12 @@ bot research --datadir /path/to/data --config factor.yml
 | `kline adj-calc` / `adj-export` | 复权因子计算/导出 |
 | `series down` / `list` | 注册的自定义时序数据下载/范围查询 |
 | `tick convert` / `to-kline` | Tick 格式转换 / 聚合为 K 线 |
-| `tool list-strats` | 查看编译进程序的策略 |
+| `tool list-strats [--prefix P]` | 查看编译进程序的策略，可按名称前缀过滤 |
 | `tool collect-opt` / `test-pickers` | 收集搜索结果 / 滚动比较挑选器 |
 | `tool sim-bt` / `bt-result` | 从报告模拟 / 从订单重建报告 |
 | `tool test-live-bars DUMP_FILE` | 将实盘 K 线 dump 与本地数据比较 |
-| `tool cmp-orders` | 对比交易所订单和回测订单 |
+| `tool cmp-orders` | 拉取账户的交易所订单并与回测订单对比，需 `--bot-name`、`--account`、`--bt-path`，另有 `--amt-rate`（默认 0.1）、`--skip-unhit`（默认开启） |
+| `tool data-audit refresh-review` / `funding` | 只读数据审计：对比类型化归档并生成待审核刷新（`--baseline --candidate --stage`）/ 对比账户资金费快照与已提交事件（`--venue --ledger`）；均不写数据库 |
 | `tool calc-perfs` / `corr` / `merge-assets` | 收益指标、相关矩阵、资产曲线合并 |
 | `tool load-cal` / `data-server` | 导入交易日历 / 启动 gRPC 数据服务 |
 | `tool bt-factor` | 对既有 `orders.gob` 做滚动标的筛选，非原生 factor runner |
@@ -78,6 +81,6 @@ bot live down-order --datadir /path/to/data --account user1 --timestart 20250401
 bot tool bt-result --datadir /path/to/data --config report-config.yml --in /path/to/orders.gob --out /path/to/rebuilt
 ```
 
-`live close-order` 的 `--account`、`--pair`、`--strat` 为空表示不限制相应维度；`--exg` 表示直接平交易所持仓。执行前明确筛选范围。`tool bt-factor` 的自定义因子注册接口是 `opt.RegisterFactor`，不能使用不存在的 `strat.FactorMap`。
+`live down-order` 另支持 `--exchange`、`--market`（`spot`、`linear`、`inverse`、`option`）和 `--force`。`live close-order` 的 `--account`、`--pair`、`--strat` 为空表示不限制相应维度；`--exg` 表示直接平交易所持仓。执行前明确筛选范围。`tool bt-factor` 的自定义因子注册接口是 `opt.RegisterFactor`，不能使用不存在的 `strat.FactorMap`。
 
 独立表达式检查使用根命令 `bot validate --spec formula.yml` / `bot explain --spec formula.yml`。更多因子配置和数据要求见[因子指南](./factor.md)。
