@@ -287,7 +287,7 @@ click={clickDuplicate} center={true} width={600}>
             </section>
           </div>
 
-          <div class="flex gap-4 fixed bottom-0 left-0 right-0 p-2 w-[100%] bg-white flex justify-center">
+          <div class="flex gap-4 fixed bottom-0 left-0 right-0 p-2 w-[100%] bg-base-100 flex justify-center">
             <button class="btn btn-primary w-[50%]" disabled={disableMainBtn} onclick={clickBacktest}>{m.start_backtest()}</button>
           </div>
         </div>

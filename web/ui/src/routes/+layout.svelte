@@ -17,7 +17,7 @@
 </script>
 
 {#if $site.loading}
-<div class="fixed inset-0 bg-white bg-opacity-20 z-50 flex items-center justify-center">
+<div class="fixed inset-0 bg-base-100/20 z-50 flex items-center justify-center">
   <span class="loading loading-spinner loading-lg"></span>
 </div>
 {/if}
@@ -68,6 +68,19 @@
 	}
 	*::-webkit-scrollbar-thumb:hover {
 			background: #a0a0a0;
+	}
+	/*深色主题下的滚动条*/
+	:root[data-theme="dark"] * {
+    scrollbar-color: #555 #1d232a;
+	}
+	:root[data-theme="dark"] *::-webkit-scrollbar-track {
+			background: #1d232a;
+	}
+	:root[data-theme="dark"] *::-webkit-scrollbar-thumb {
+			background: #4a4a4a;
+	}
+	:root[data-theme="dark"] *::-webkit-scrollbar-thumb:hover {
+			background: #666;
 	}
 
 </style>

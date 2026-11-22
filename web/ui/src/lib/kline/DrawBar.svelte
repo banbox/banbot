@@ -270,7 +270,7 @@ cloudIndLoaded.subscribe(() => {
         </svg>
       </div>
       {#if itemKey === popoverKey}
-        <ul class="absolute top-0 left-[calc(100%+1px)] whitespace-nowrap bg-white z-50 shadow-xl min-h-0">
+        <ul class="absolute top-0 left-[calc(100%+1px)] whitespace-nowrap bg-base-100 z-50 shadow-xl min-h-0">
           {#each subItems as data}
             <li class="px-4 hover:bg-primary-content/40 flex flex-row items-center h-10" 
               onclick={() => itemKey === 'mode' ? clickSubMode(data.key) : clickSubPopover(subMenu.findIndex(i => i.key === itemKey), data.key)}>

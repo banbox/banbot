@@ -212,7 +212,7 @@
 
 	.context-menu {
 		position: fixed;
-		background: white;
+		background: var(--color-base-100);
 		border-radius: var(--rounded-lg, 0.5rem);
 		padding: 0.25rem;
 		min-width: 120px;
