@@ -10,8 +10,14 @@
   import {site} from '$lib/stores/site';
   import {localizeHref} from "$lib/paraglide/runtime";
   import {onMount} from "svelte";
+  import {themeMode, setThemeMode, type ThemeMode} from '$lib/stores/theme';
 
   let { children } = $props();
+  const themeOptions: { key: ThemeMode; text: () => string }[] = [
+    { key: 'light', text: () => m.theme_light() },
+    { key: 'dark', text: () => m.theme_dark() },
+    { key: 'system', text: () => m.theme_system() },
+  ];
   let collapsed = $state(false);
   let showAddBot = $state(false);
   $site.apiReady = false;
@@ -138,6 +144,18 @@
       </div>
       
       <div class="navbar-end gap-1.5">
+        <details class="dropdown dropdown-end">
+          <summary class="btn btn-ghost btn-sm btn-circle hover:bg-base-200" aria-label={m.theme()} title={m.theme()}>
+            <Icon name="theme" class="w-4 h-4" />
+          </summary>
+          <ul class="menu p-1.5 bg-base-100 rounded-md shadow-lg z-10 mt-1 w-40 border border-base-200">
+            {#each themeOptions as option}
+              <li>
+                <a class:active={$themeMode === option.key} onclick={() => setThemeMode(option.key)}>{option.text()}</a>
+              </li>
+            {/each}
+          </ul>
+        </details>
         <a href={localizeHref("/dash")} class="btn btn-ghost btn-sm normal-case text-sm hover:bg-base-200">{m.bot_list()}</a>
         <button class="btn btn-ghost btn-sm normal-case text-sm hover:bg-base-200" onclick={() => showAddBot = true}>{m.add_bot()}</button>
       </div>

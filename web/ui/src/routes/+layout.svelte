@@ -7,10 +7,12 @@
 	import { setTimezone } from '$lib/dateutil';
 	import {site} from '$lib/stores/site';
 	import {locales, localizeHref} from "$lib/paraglide/runtime";
+	import {initTheme} from '$lib/stores/theme';
 	import "../style.css";
 
 	let { children } = $props();
 	setTimezone('UTC')
+	initTheme();
 
 </script>
 

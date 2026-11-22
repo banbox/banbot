@@ -31,6 +31,7 @@ BanBot UI 是一个为量化交易机器人 BanBot 设计的前端项目。它�
 - **src/lib/stores/site.ts**: 全站状态管理,包括API主机、加载状态、构建状态、iframe检测等。
 - **src/lib/stores/alerts.ts**: 全局警告消息管理。
 - **src/lib/stores/modals.ts**: 全局模态框（确认框、提示框）管理。
+- **src/lib/stores/theme.ts**: 界面主题（light / dark / system），存于 localStorage `banbot-theme`，设置为 `<html data-theme>`；`app.html` 首屏内联脚本与之保持一致。
 - **src/lib/dash/store.ts**: 实盘监控仪表盘状态,管理机器人账户列表、当前活动账户、持久化存储。
 
 ### 通用组件库
@@ -97,7 +98,7 @@ BanBot UI 是一个为量化交易机器人 BanBot 设计的前端项目。它�
 - **src/routes/(dev)/data/+page.svelte**: 本地数据管理页面。
 - **src/routes/(dev)/data/item/+page.svelte**: 单个品种的数据详情页。
 - **src/routes/(dev)/data/series/+page.svelte**: 开发环境中的任意时序数据查询页。
-- **src/routes/(dev)/setting/+page.svelte**: 全局配置、编译、语言等设置页面。
+- **src/routes/(dev)/setting/+page.svelte**: 全局配置、编译、语言、时区、主题等设置页面（右上角齿轮进入）。
 - **src/routes/(dev)/trade/+page.svelte**: 实盘交易指引页面。
 
 #### 实盘监控路由 `dash`

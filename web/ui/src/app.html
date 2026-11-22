@@ -5,6 +5,16 @@
 		<title>banbot</title>
 		<link rel="icon" href="%sveltekit.assets%/favicon.png" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<script>
+			// 首屏前设置主题，避免闪烁；逻辑需与 src/lib/stores/theme.ts 保持一致
+			(function () {
+				try {
+					var m = localStorage.getItem('banbot-theme');
+					var dark = m === 'dark' || (m !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+					document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+				} catch (e) {}
+			})();
+		</script>
 		<style>	
 			html {height: 100%;padding: 0;display: flex;flex-direction: column;}
 			body {height: 100%;flex: 1; display: flex;flex-direction: column;}

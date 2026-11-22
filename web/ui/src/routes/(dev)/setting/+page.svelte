@@ -13,6 +13,13 @@
   import { localizeHref, locales, getLocale } from "$lib/paraglide/runtime.js"
   import { goto } from '$app/navigation'
   import { getTimezoneSelectOptions, setTimezone, curTZ } from '$lib/dateutil';
+  import { themeMode, setThemeMode, type ThemeMode } from '$lib/stores/theme';
+
+  const themeOptions: { key: ThemeMode; text: () => string }[] = [
+    { key: 'light', text: () => m.theme_light() },
+    { key: 'dark', text: () => m.theme_dark() },
+    { key: 'system', text: () => m.theme_system() },
+  ];
 
   let activeTab = $state('config.local.yml');
   let theme: Extension | null = $state(oneDark);
@@ -243,6 +250,12 @@
             <Icon name="clock" />{m.timezone()}
           </button>
         </li>
+        <li>
+          <button class:menu-active={activePage === 'theme'}
+            onclick={() => setActivePage('theme')}>
+            <Icon name="theme" />{m.theme()}
+          </button>
+        </li>
       </ul>
     </div>
 
@@ -371,6 +384,30 @@
                       onchange={() => switchLanguage(lang)}
                     />
                     <span class="label-text ml-2">{lang}</span>
+                  </label>
+                {/each}
+              </div>
+            </div>
+          </div>
+        </div>
+      {:else if activePage === 'theme'}
+        <!-- 主题设置页面 -->
+        <div class="space-y-6">
+          <div class="flex">
+            <div class="w-[10rem]">
+              <label class="label">
+                <span class="label-text">{m.theme()}</span>
+              </label>
+            </div>
+            <div class="flex-1">
+              <div class="flex flex-wrap gap-2">
+                {#each themeOptions as option}
+                  <label class="label cursor-pointer">
+                    <input type="radio" name="theme" class="radio radio-primary"
+                      checked={$themeMode === option.key}
+                      onchange={() => setThemeMode(option.key)}
+                    />
+                    <span class="label-text ml-2">{option.text()}</span>
                   </label>
                 {/each}
               </div>
