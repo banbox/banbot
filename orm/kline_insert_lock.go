@@ -40,6 +40,10 @@ var (
 )
 
 func klineInsertLockRoot() string {
+	return dbIdentLockRoot("kline_insert", klineInsertLockRootDataDir)
+}
+
+func klineInsertLockRootDataDir() string {
 	dataDir := config.GetDataDirSafe()
 	if dataDir == "" {
 		return ""
