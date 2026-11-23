@@ -92,6 +92,11 @@ func newLegacyStrategy(pol *config.RunPolicyConfig) (*TradeStrat, *config.BadPar
 		if pol.RefineTF == nil && obj.RefineTF != nil {
 			pol.RefineTF = obj.RefineTF
 		}
+		// The factory (which registers hyper-param defs on its policy) is skipped on a hit,
+		// so propagate the defs the previous policy instance holds to the caller's pol.
+		if obj.Policy != nil && obj.Policy != pol {
+			pol.MergeDefsFrom(obj.Policy)
+		}
 		obj.Policy = pol
 		return obj, nil
 	}

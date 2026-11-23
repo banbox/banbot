@@ -219,6 +219,16 @@ func (q *Queries) loadSRangesSpans(ctx context.Context, sid int32, table, timefr
 }
 
 func (q *Queries) loadSRangesSpansFromDB(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]srangeSpan, error) {
+	spans, err := q.loadSRangeRowsFromDB(ctx, sid, table, timeframe, startMs, stopMs)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeSRangeSpans(filterSRangesSpans(spans, startMs, stopMs)), nil
+}
+
+// loadSRangeRowsFromDB returns the active stored sranges_q rows overlapping the window verbatim
+// (no normalization), so each row keeps the (start_ms) key a logical-delete marker must address.
+func (q *Queries) loadSRangeRowsFromDB(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64) ([]srangeSpan, error) {
 	rows, err := q.db.Query(ctx, `SELECT start_ms, stop_ms, has_data, ts
 FROM (
   SELECT start_ms, stop_ms, has_data, is_deleted, ts
@@ -247,7 +257,35 @@ ORDER BY start_ms, stop_ms`,
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return normalizeSRangeSpans(filterSRangesSpans(spans, startMs, stopMs)), nil
+	return spans, nil
+}
+
+// srangeDeleteList builds the logical-delete list for a rewrite: every raw stored row (those keys
+// are what actually exist, including rows normalization absorbed) plus the span view's keys, which
+// cover rows only held by the in-process cache because their WAL commit is not visible yet.
+// De-duplicated by start_ms.
+func srangeDeleteList(raw, spans []srangeSpan) []srangeSpan {
+	out := make([]srangeSpan, 0, len(raw)+len(spans))
+	seen := make(map[int64]struct{}, len(raw)+len(spans))
+	for _, list := range [][]srangeSpan{raw, spans} {
+		for _, s := range list {
+			if _, ok := seen[s.StartMs]; ok {
+				continue
+			}
+			seen[s.StartMs] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// loadSRangeDeleteList loads the raw stored rows in the window and unions them with spans.
+func (q *Queries) loadSRangeDeleteList(ctx context.Context, sid int32, table, timeframe string, startMs, stopMs int64, spans []srangeSpan) ([]srangeSpan, error) {
+	raw, err := q.loadSRangeRowsFromDB(ctx, sid, table, timeframe, startMs, stopMs)
+	if err != nil {
+		return nil, err
+	}
+	return srangeDeleteList(raw, spans), nil
 }
 
 func normalizeSRangeSpans(spans []srangeSpan) []srangeSpan {
@@ -468,9 +506,14 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 		}
 	}
 
-	// Logically delete all existing spans that overlap the window in one batch INSERT.
-	if len(spans) > 0 {
-		if err = batchInsertSrangesDeleted(ctx, q, sid, table, timeframe, spans, now, &microOff); err != nil {
+	// Logically delete all existing rows that overlap the window in one batch INSERT.
+	// Markers must address stored row keys, not the normalized span view.
+	delList, err := q.loadSRangeDeleteList(ctx, sid, table, timeframe, startMs, stopMs, spans)
+	if err != nil {
+		return err
+	}
+	if len(delList) > 0 {
+		if err = batchInsertSrangesDeleted(ctx, q, sid, table, timeframe, delList, now, &microOff); err != nil {
 			return fmt.Errorf("logical delete srange: %w", err)
 		}
 	}
@@ -502,14 +545,14 @@ func (q *Queries) UpdateSRangesWithHoles(ctx context.Context, sid int32, table, 
 			}
 		}
 		srangesCacheLock.Unlock()
-		q.MarkTableForCompact("sranges_q", len(spans))
+		q.MarkTableForCompact("sranges_q", len(delList))
 		return nil
 	}
 
 	if err = batchInsertSranges(ctx, q, sid, table, timeframe, newSpansFromWant, now, &microOff); err != nil {
 		return fmt.Errorf("insert srange seg: %w", err)
 	}
-	q.MarkTableForCompact("sranges_q", len(spans))
+	q.MarkTableForCompact("sranges_q", len(delList))
 
 	// Update in-process cache: replace the window interior while keeping spans outside.
 	key := q.srangesKey(sid, table, timeframe)
@@ -622,8 +665,12 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 	now := time.Now().UTC()
 	microOff := 0
 
-	if len(spans) > 0 {
-		if err = batchInsertSrangesDeleted(ctx, q, sid, table, timeframe, spans, now, &microOff); err != nil {
+	delList, err := q.loadSRangeDeleteList(ctx, sid, table, timeframe, startMs, stopMs, spans)
+	if err != nil {
+		return err
+	}
+	if len(delList) > 0 {
+		if err = batchInsertSrangesDeleted(ctx, q, sid, table, timeframe, delList, now, &microOff); err != nil {
 			return fmt.Errorf("logical delete srange: %w", err)
 		}
 	}
@@ -644,7 +691,7 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 			}
 		}
 		srangesCacheLock.Unlock()
-		q.MarkTableForCompact("sranges_q", len(spans))
+		q.MarkTableForCompact("sranges_q", len(delList))
 		return nil
 	}
 
@@ -655,7 +702,7 @@ func (q *Queries) UpdateSRanges(ctx context.Context, sid int32, table, timeframe
 	if err = batchInsertSranges(ctx, q, sid, table, timeframe, segSpans, now, &microOff); err != nil {
 		return fmt.Errorf("insert srange seg: %w", err)
 	}
-	q.MarkTableForCompact("sranges_q", len(spans))
+	q.MarkTableForCompact("sranges_q", len(delList))
 
 	// Synchronously update in-process cache so subsequent reads in the same
 	// process are not affected by QuestDB WAL commit lag (<100 ms).

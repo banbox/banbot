@@ -224,12 +224,15 @@ func TestGroupByProfitsHandlesEmptyKMeansClusters(t *testing.T) {
 	}
 
 	clusters := utils.KMeansVals(rates, 4)
-	hasEmptyCluster := false
 	for _, cluster := range clusters.Clusters {
-		hasEmptyCluster = hasEmptyCluster || len(cluster.Items) == 0
+		if len(cluster.Items) == 0 {
+			t.Fatal("KMeansVals must not return empty clusters")
+		}
 	}
-	if !hasEmptyCluster {
-		t.Fatal("expected duplicate profit rates to produce an empty KMeans cluster")
+	for i, gid := range clusters.RowGIds {
+		if gid < 0 || gid >= len(clusters.Clusters) {
+			t.Fatalf("RowGIds[%d]=%d out of range", i, gid)
+		}
 	}
 
 	result := &BTResult{}
@@ -495,5 +498,12 @@ func assertReportCurve(t *testing.T, dataset *ChartDs, wantLabel string, want []
 		if math.Abs(dataset.Data[i]-wantVal) > 1e-9 {
 			t.Fatalf("%s data[%d] = %v, want %v", dataset.Label, i, dataset.Data[i], wantVal)
 		}
+	}
+}
+
+func TestMeasuresByOrderCurveEmptyCurve(t *testing.T) {
+	sharpe, sortino, err := measuresByOrderCurve(nil)
+	if err != nil || sharpe != 0 || sortino != 0 {
+		t.Fatalf("empty curve = %v %v %v, want 0 0 nil", sharpe, sortino, err)
 	}
 }

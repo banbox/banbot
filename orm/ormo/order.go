@@ -736,19 +736,19 @@ func (i *InOutOrder) saveToDb() *errs.Error {
 			}
 		}
 	} else {
-		if i.DirtyMain {
+		if dirtyMain {
 			err = i.IOrder.saveUpdate(sess)
 			if err != nil {
 				return err
 			}
 		}
-		if i.DirtyEnter {
+		if dirtyEnter {
 			err = i.Enter.saveUpdate(sess)
 			if err != nil {
 				return err
 			}
 		}
-		if i.DirtyExit && i.Exit != nil && i.Exit.Symbol != "" {
+		if dirtyExit && i.Exit != nil && i.Exit.Symbol != "" {
 			if i.Exit.ID == 0 {
 				err = i.Exit.saveAdd(sess)
 			} else {
@@ -1890,7 +1890,7 @@ func (t *ExitTrigger) Equal(o *ExitTrigger) bool {
 	if t == nil || o == nil {
 		return (t != nil) == (o != nil)
 	}
-	if t.Price != o.Price || t.Limit != o.Limit || t.Rate != o.Limit {
+	if t.Price != o.Price || t.Limit != o.Limit || t.Rate != o.Rate {
 		return false
 	}
 	return true

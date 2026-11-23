@@ -303,6 +303,24 @@ func KMeansVals(vals []float64, num int) *ClusterRes {
 		resList[best].Items = append(resList[best].Items, v)
 	}
 
+	// Drop clusters that won no members (several centers converged on one value) and renumber RowGIds.
+	remap := make([]int, len(resList))
+	kept := make([]*Cluster, 0, len(resList))
+	for i, c := range resList {
+		if len(c.Items) == 0 {
+			remap[i] = -1
+			continue
+		}
+		remap[i] = len(kept)
+		kept = append(kept, c)
+	}
+	if len(kept) < len(resList) {
+		for i := range rowGids {
+			rowGids[i] = remap[rowGids[i]]
+		}
+		resList = kept
+	}
+
 	return &ClusterRes{
 		Clusters: resList,
 		RowGIds:  rowGids,

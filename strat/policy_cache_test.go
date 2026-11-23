@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/banbox/banbot/config"
+	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/goods"
 )
 
@@ -104,4 +105,32 @@ func TestLegacyPolicyFiltersAreConcurrentSafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestNewCacheHitKeepsHyperParams(t *testing.T) {
+	name := "cache_hit_hyper_probe"
+	oldCache := cacheStrats
+	cacheStrats = make(map[string]*TradeStrat)
+	t.Cleanup(func() {
+		deleteStratFactory(name)
+		cacheStrats = oldCache
+	})
+	makeCalls := 0
+	RegisterStrategy(name, func(pol *config.RunPolicyConfig) *TradeStrat {
+		makeCalls++
+		pol.Def("zEntry", 1.5, core.PNorm(0.8, 3.0))
+		pol.Def("atrMult", 2.5, core.PNorm(1.0, 5.0))
+		return &TradeStrat{}
+	})
+	initPol := &config.RunPolicyConfig{Name: name, RunTimeframes: []string{"1h"}}
+	for win := 1; win <= 3; win++ {
+		gp := initPol.Clone()
+		New(gp)
+		if n := len(gp.HyperParams()); n != 2 {
+			t.Fatalf("window %d: hyper params = %d, want 2", win, n)
+		}
+	}
+	if makeCalls != 1 {
+		t.Fatalf("factory calls = %d, want 1 (cache hits)", makeCalls)
+	}
 }

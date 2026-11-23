@@ -954,3 +954,45 @@ func TestProbeBypassDocumentsWALRisk(t *testing.T) {
 	// This test is documentation-only; it passes trivially.
 	t.Log("WAL delay probe risk documented: probe in downOHLCV2DBRange may force redownload")
 }
+
+func TestSRangeDeleteListUsesRawRowKeys(t *testing.T) {
+	// Raw rows as stored: a broad data row plus stale holes that normalization absorbs.
+	raw := []srangeSpan{
+		{StartMs: 100, StopMs: 1000, HasData: true},
+		{StartMs: 300, StopMs: 400, HasData: false},
+		{StartMs: 350, StopMs: 400, HasData: false},
+	}
+	// Span view: normalized (one span keyed on the earliest start) plus a cache-only span.
+	spans := []srangeSpan{
+		{StartMs: 100, StopMs: 1000, HasData: true},
+		{StartMs: 2000, StopMs: 3000, HasData: true},
+	}
+	got := srangeDeleteList(raw, spans)
+	keys := make([]int64, 0, len(got))
+	for _, s := range got {
+		keys = append(keys, s.StartMs)
+	}
+	want := []int64{100, 300, 350, 2000}
+	if len(keys) != len(want) {
+		t.Fatalf("delete keys = %v, want %v", keys, want)
+	}
+	for i := range want {
+		if keys[i] != want[i] {
+			t.Fatalf("delete keys = %v, want %v", keys, want)
+		}
+	}
+}
+
+func TestNormalizeSRangeSpansNewestWriteSupersedesStaleHoles(t *testing.T) {
+	base := time.Date(2026, 7, 29, 14, 0, 0, 0, time.UTC)
+	spans := []srangeSpan{
+		{StartMs: 1660704300000, StopMs: 1785542400000, HasData: true, Ts: base.Add(72 * time.Hour)},
+		{StartMs: 1785334500000, StopMs: 1785369600000, HasData: false, Ts: base},
+		{StartMs: 1785335400000, StopMs: 1785369600000, HasData: false, Ts: base.Add(time.Minute)},
+		{StartMs: 1785336300000, StopMs: 1785369600000, HasData: false, Ts: base.Add(2 * time.Minute)},
+	}
+	got := normalizeSRangeSpans(filterSRangesSpans(spans, 1660704300000, 1785542400000))
+	if len(got) != 1 || !got[0].HasData || got[0].StartMs != 1660704300000 || got[0].StopMs != 1785542400000 {
+		t.Fatalf("got %+v, want one has_data span", got)
+	}
+}

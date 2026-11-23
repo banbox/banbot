@@ -140,7 +140,7 @@
 - **进度**：`PrgBar`（终端进度）、`StagedPrg`（多阶段加权进度 + 触发回调）。
 - **并发**：`ParallelRun[T](items, concurNum, handle)`，返回出错下标最小的错误，出错后不再启动新任务。
 - **YAML**：`MergeYamlStr(paths, skips...)`（文本规则合并）。
-- **指标**：`UlcerAccumulator`、`CalcMaxDrawDown`、`CalcExpectancy`、`SharpeRatio*/SortinoRatio*`（float 与 decimal 两套）、`KMeansVals`。
+- **指标**：`UlcerAccumulator`、`CalcMaxDrawDown`、`CalcExpectancy`、`SharpeRatio*/SortinoRatio*`（float 与 decimal 两套）、`KMeansVals`（只返回非空簇，`RowGIds` 已按保留簇重编号）。
 - **周期**：`BuildOHLCV`（子周期合成，支持额外列求和）、`RoundSecsTF`、`SecsToTfNum`。
 
 ## 关键流程

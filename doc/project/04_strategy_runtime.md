@@ -66,7 +66,7 @@
 ### 1. 策略注册与实例化
 1. 工厂注册：`RegisterStrategy` / `AddStratGroup`（`strat/common.go:945-958`），快照用 `snapshotStratFactories`。
 2. 运行期 `State.NewStrategy` / `State.NewStrategyChecked`（`state.go`）：按 `pol.ID()+ToYaml` 缓存；经 `invokeStratFactory` 调用工厂 → `cloneTradeStrat` → `validateDataCallbacks` → 默认值（`MinTfScore=0.75`、`StopLoss`、`RunTimeFrames`、`OdBarMax`）→ 绑定 runtime 依赖（`runtimeConfig/Accounts/Core/Clock/runtimeExplicit`）。当工厂通过 `pol.Require`/`Requiref` 或显式非 `runtime.Error` panic 拒绝参数时，归一为 `*config.BadParamError`（`core.ErrBadConfig`）：`*Checked` 直接返回 `*errs.Error` 且不写入策略缓存，无后缀 `NewStrategy`/`New` 继续抛出 `*config.BadParamError`；真正的 Go `runtime.Error`（空指针、越界、除零、类型断言失败等）原样向上 panic，不会伪装成 `BadConfig`。
-3. legacy 路径使用 `common.go` 的 `New` / `NewChecked`，缓存在包级 `cacheStrats`；两套实现的默认值逻辑重复。
+3. legacy 路径使用 `common.go` 的 `New` / `NewChecked`，缓存在包级 `cacheStrats`（命中时跳过工厂，会把上一个 Policy 的超参定义 `MergeDefsFrom` 到调用方 pol，保证 `HyperParams()` 可用）；两套实现的默认值逻辑重复。
 4. `CalcPairTfScores*`（`goods.go:allAllowTFsForStateChecked`）与 `LoadStratJobs*`（`main.go:loadStratJobsWithExchange`，含 `PairDup` 专属参数）均调用 `NewStrategyChecked` 向上透传 `core.ErrBadConfig`；`runtimeplan/inspect.go:makeStrategy` 调用 `NewStrategyChecked`，参数约束错误以 `[BadConfig] <msg>` 记入 `Unsupported`（`constructor_panic`），真实 `runtime.Error` 仍由 `recover` 保留原始 `runtime error:` 文本。
 
 ### 2. 加载 Job（`strat/main.go:57 LoadStratJobsWithState` → `loadStratJobsWithExchange` `main.go:90`）

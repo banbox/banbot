@@ -1615,6 +1615,14 @@ func (f *TfSeriesLoader) DownIfNeed(sess *orm.Queries, exchange banexg.BanExchan
 	return err
 }
 
+// dropUnfinishedTail removes trailing rows whose EndMS is later than nowMS.
+func dropUnfinishedTail(rows []*orm.DataSeries, nowMS int64) []*orm.DataSeries {
+	for len(rows) > 0 && rows[len(rows)-1].EndMS > nowMS {
+		rows = rows[:len(rows)-1]
+	}
+	return rows
+}
+
 func (f *TfSeriesLoader) SetNext() {
 	if f.loadErr != nil {
 		return
@@ -1722,6 +1730,17 @@ func (f *TfSeriesLoader) SetNext() {
 		} else {
 			f.deps.sleep(time.Second * time.Duration(retry+1))
 		}
+	}
+	if err == nil && withUnFinish && len(rows) > 0 {
+		// Live: the query appends the unfinished current bar stamped with its full end;
+		// caching it would later serve it as the closed bar (and skip the real one).
+		var nowMS int64
+		if f.deps == nil {
+			nowMS = btime.TimeMS()
+		} else {
+			nowMS = f.deps.timeMS()
+		}
+		rows = dropUnfinishedTail(rows, nowMS)
 	}
 	if err == nil {
 		if budgetErr := orm.CheckDataSeriesBytes(f.context(), rows); budgetErr != nil {

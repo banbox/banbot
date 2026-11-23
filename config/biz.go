@@ -1301,6 +1301,22 @@ func (c *RunPolicyConfig) HyperParams() []*core.Param {
 	return res
 }
 
+// MergeDefsFrom copies hyper-param definitions from o that c does not define yet (existing defs win).
+func (c *RunPolicyConfig) MergeDefsFrom(o *RunPolicyConfig) {
+	if o == nil || len(o.defs) == 0 {
+		return
+	}
+	if c.defs == nil {
+		c.defs = make(map[string]*core.Param, len(o.defs))
+	}
+	for k, v := range o.defs {
+		if _, ok := c.defs[k]; !ok {
+			item := *v
+			c.defs[k] = &item
+		}
+	}
+}
+
 /*
 KeepHyperOnly Only keep the given hyperparameters for optimization and remove other hyperparameters
 */

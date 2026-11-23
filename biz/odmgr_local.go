@@ -396,6 +396,10 @@ func (o *LocalOrderMgr) fillPendingOrdersPass(orders []*ormo.InOutOrder, evt *or
 			}
 			continue
 		}
+		if evt != nil && evt.EndMS > 0 && evt.EndMS <= exOrder.CreateAt {
+			// Created at/after this bar closed (e.g. refine bar ending at the decision bar's close): fill from the next bar.
+			continue
+		}
 		if exOrder.Enter && evt != nil && od.OCOGroup != "" {
 			ocoKey := od.Symbol + "\x00" + od.Strategy + "\x00" + od.OCOGroup
 			if handledOCO[ocoKey] {
